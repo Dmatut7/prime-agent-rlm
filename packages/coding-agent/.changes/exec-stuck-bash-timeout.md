@@ -1,0 +1,2 @@
+- Added `tools.bashTimeoutSeconds` (default 600): bash tool calls now get a default timeout when the model passes none, so a hung command is killed (process group included) instead of wedging the turn forever.
+- Changed the bash timeout error to tell the model the command was killed and how to extend or disable the timeout (`timeout` in seconds; `timeout: 0` = no limit).

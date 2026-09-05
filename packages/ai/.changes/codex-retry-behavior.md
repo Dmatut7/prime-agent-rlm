@@ -1,0 +1,2 @@
+- Fixed OpenAI Codex SSE retries to skip non-429 4xx responses, honor `Retry-After`, and respect `maxRetries`.
+- Wired `maxRetryDelayMs` as the Codex SSE `Retry-After` cap (default 60000ms; `0` disables). Documented that Mistral, Google, and Vertex AI currently do not retry HTTP 429.

@@ -1,0 +1,1 @@
+- Changed the edit tool to write files atomically via a temp file plus rename and to re-check the abort signal before committing, so an abort during the write leaves the original file intact.

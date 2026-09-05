@@ -1,0 +1,1 @@
+- Treated two Escape presses within the sequence timeout as two `escape` keys instead of `ctrl+alt+[`, while keeping Esc+letter as `alt+letter`.

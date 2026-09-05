@@ -1,0 +1,11 @@
+- Fixed a daemon crash that terminated all sessions when an extension handler rejected after an interrupt.
+- Fixed the stall watchdog continuing to warn and abort turns after it was disabled mid-turn.
+- Fixed the stall watchdog aborting a turn that was only waiting on an extension dialog.
+- Fixed a wedged pause silencing stall protection indefinitely; escalation now resumes once the pause outlives its budget.
+- Fixed a compaction cooldown silently ending turns without compacting, disclosing, or continuing, while still burning a continuation.
+- Fixed a session deadlock when notifying a parent of a terminal error failed.
+- Fixed stale subagent terminal reports pinning a session resident when nothing polled it, and being discarded by a mere read of its activity.
+- Fixed /share scanning the wrong content for secrets, so secrets in tool definitions or export metadata are now caught before upload.
+- Fixed empty-turn retries being amplified into up to 12 full-context requests.
+- Improved kernel startup failure diagnostics so a kernel that dies before ready reports its own stderr instead of an empty tail.
+- Reduced per-turn synchronous harness-state reads that ran on the session event queue.

@@ -1,0 +1,1 @@
+- Recovered from stuck bracketed paste by discarding on Esc and emitting timeout or oversized pastes as one atomic paste instead of character-by-character input.

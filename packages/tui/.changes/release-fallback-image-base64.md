@@ -1,0 +1,1 @@
+- Stopped fallback-only image components from retaining their base64 payload after construction.

@@ -1,0 +1,1 @@
+- Fixed compaction summarization to budget its own input to the model's usable window, eliding oldest messages first, and added a cooldown so skipped or failed threshold compactions do not retry every turn until the branch grows.

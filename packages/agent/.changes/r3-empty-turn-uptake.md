@@ -1,0 +1,2 @@
+- Added `isEmptyTurnRetryExhausted()` and `EMPTY_TURN_RETRY_EXHAUSTED_STOP_REASON_RAW` so the terminal empty-turn retry is detectable by the session layer.
+- Fixed discarded empty-turn attempts losing their cost and output tokens from the reported usage.

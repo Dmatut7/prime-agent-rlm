@@ -1,0 +1,1 @@
+- Fixed input and rendering lag in long sessions written in CJK and other non-Latin scripts, where the terminal width cache was too small to hold a session's text and re-segmented it every frame.

@@ -1,0 +1,1 @@
+- Fixed private session file writes on Windows by degrading missing `O_NOFOLLOW` to 0 instead of throwing, while keeping lstat/fstat symlink checks.

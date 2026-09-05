@@ -1,0 +1,1 @@
+- Fixed aborted sessions keeping dispatched queued turns active forever, which left wait_for_idle and RLM quiescence hanging.

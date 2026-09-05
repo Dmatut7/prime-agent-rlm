@@ -1,0 +1,1 @@
+- Reattached in-flight streaming and bash components after a transcript rebuild so fullscreen restore cannot leave live output on a detached ghost component.

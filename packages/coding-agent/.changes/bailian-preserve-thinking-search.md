@@ -1,0 +1,1 @@
+- Added `preserveThinking`, `enableSearch`, `searchStrategy`, and `forcedSearch` to the model compat schema.

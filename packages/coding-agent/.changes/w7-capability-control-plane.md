@@ -1,0 +1,1 @@
+- Added server-side daemon capability enforcement and control-plane authorization for shutdown, restart, and prepare_update_restart, keeping a legacy path for undeclared connections.

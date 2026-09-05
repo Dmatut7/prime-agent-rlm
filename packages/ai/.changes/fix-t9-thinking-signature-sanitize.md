@@ -1,0 +1,1 @@
+- Fixed Anthropic and Amazon Bedrock providers replaying a stale thinking signature after surrogate sanitization modified the thinking text, which caused non-retryable 400 invalid_request errors; such blocks now degrade to plain text on the wire while the stored signature is preserved.

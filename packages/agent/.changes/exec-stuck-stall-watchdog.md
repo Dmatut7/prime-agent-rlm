@@ -1,0 +1,1 @@
+- Added optional stream stall detection to the agent loop: `AgentLoopConfig.streamStallTimeoutMs` aborts a provider stream that produces no events for the configured duration and settles the turn with a retryable `stopReason: "error"` message instead of hanging on a dead connection.

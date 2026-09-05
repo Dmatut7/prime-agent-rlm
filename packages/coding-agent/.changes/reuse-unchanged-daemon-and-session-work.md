@@ -1,0 +1,5 @@
+- Changed session list metadata to rescan only the bytes appended since the last read, instead of re-reading the whole session file every time a live session grows.
+- Changed the RLM spawn ledger to reuse its last replay while the file on disk is unchanged, instead of re-reading and re-parsing it for every query.
+- Changed the daemon to skip an agent peer sync when a worker's peer list is already up to date.
+- Changed summary refreshes driven by subagent streaming to observe a minimum interval, so a burst of child updates no longer pushes every session's in-progress message across the worker socket at token rate.
+- Changed streaming tool calls to rebuild their panel only when the arguments actually change.

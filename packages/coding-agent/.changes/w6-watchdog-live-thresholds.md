@@ -1,0 +1,1 @@
+- Made stall watchdog thresholds (warnAfterMs, abortAfterMs, enabled) accept getter functions so settings changes take effect without re-constructing the watchdog; the session now passes live getters instead of construction-time snapshot values.

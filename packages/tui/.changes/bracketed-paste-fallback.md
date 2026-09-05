@@ -1,0 +1,1 @@
+- Recovered from stuck bracketed paste mode when `201~` never arrives, by timing out, capping the paste buffer, and treating Esc as an abort that flushes buffered text as ordinary input.

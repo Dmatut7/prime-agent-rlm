@@ -1,0 +1,1 @@
+- Fixed the editor word-wrap recursing forever on a grapheme wider than the line, which crashed the TUI with a stack overflow when typing CJK characters or emoji in a narrow terminal.

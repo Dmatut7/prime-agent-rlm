@@ -1,0 +1,1 @@
+- Treated wait_for_headless_completion as a read-only daemon command so long RLM quiescence waits no longer block update-restart drains or idle eviction sweeps.

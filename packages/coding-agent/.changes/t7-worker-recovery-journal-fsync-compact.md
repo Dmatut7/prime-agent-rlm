@@ -1,0 +1,2 @@
+- Fixed the worker recovery journal fsync-ing on every record and never compacting on a busy worker, which blocked the worker event loop and grew the journal without bound.
+- Changed worker recovery appends to reach the disk through the page cache instead of a per-record fsync, so a machine-wide power loss can drop checkpoints written since the last compaction; a crashed worker or supervisor still recovers every record, and compaction still fsyncs before its atomic rename.

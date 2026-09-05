@@ -1,0 +1,1 @@
+- Fixed branch summarization to stop collecting at the newest compaction boundary so old compaction summaries are not re-summarized into branch summaries or goals.

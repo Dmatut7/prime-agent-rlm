@@ -1,0 +1,1 @@
+- Added the streaming_deltas capability: the supervisor forwards compact per-token assistant stream deltas to capable clients instead of rebuilding the full message_update payload, and daemon connections accumulate the deltas locally.

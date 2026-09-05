@@ -1,0 +1,1 @@
+- Added a per-user Windows daemon pipe name and applied an owner-only DACL after listen; the DACL is best-effort, is not verified on Windows hardware, and is not a substitute for client authentication.

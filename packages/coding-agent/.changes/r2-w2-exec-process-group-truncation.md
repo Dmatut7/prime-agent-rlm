@@ -1,0 +1,1 @@
+- Changed execCommand to kill the entire process group on abort and timeout and to bound stdout/stderr accumulation with annotated tail truncation.

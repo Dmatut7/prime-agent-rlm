@@ -1,0 +1,1 @@
+- Capped the editor undo stack at 500 snapshots and the kill ring at 60 entries, and cleared undo on an empty `setText` so session resets cannot restore the previous buffer.

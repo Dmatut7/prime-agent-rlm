@@ -1,0 +1,1 @@
+- Fixed agent messages queued into a session whose input pump was suspended by an abort: the queue now resumes the pump so the message is consumed instead of silently stalling the session.

@@ -1,0 +1,1 @@
+- Capped the TUI live chat component tree: long sessions now rebuild the transcript through the session-open render window once it grows past the cap, bounding memory use; entering fullscreen restores the full transcript for scrollback.

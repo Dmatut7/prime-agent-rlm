@@ -1,0 +1,1 @@
+- Kept the prompt draft on the undo stack when clearing the input bar with Ctrl+C or Esc.

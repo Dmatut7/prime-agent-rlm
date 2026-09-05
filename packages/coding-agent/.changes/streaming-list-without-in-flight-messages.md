@@ -1,0 +1,1 @@
+- Fixed the daemon saturating a CPU core while subagents stream, by keeping each session's in-flight assistant message out of the summary refreshes that a token burst triggers.

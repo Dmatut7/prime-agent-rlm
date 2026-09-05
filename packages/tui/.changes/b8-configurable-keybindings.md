@@ -1,0 +1,1 @@
+- Moved remaining hardcoded editor, selector, and debug key checks into configurable TUI keybindings.

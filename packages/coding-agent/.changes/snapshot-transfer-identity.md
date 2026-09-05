@@ -1,0 +1,1 @@
+- Fixed session workers being torn down and left recovering — which blanked the context/token indicator — when two snapshot transfers were taken at the same event cursor ([#1229](https://github.com/PrimeIntellect-ai/prime-agent/issues/1229)).

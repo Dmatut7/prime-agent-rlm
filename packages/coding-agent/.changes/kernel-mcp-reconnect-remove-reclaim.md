@@ -1,0 +1,3 @@
+- Fixed the kernel reusing a dead MCP session forever after the server crashed, exited, or a call timed out; failed transports are now retired and the next call reconnects.
+- Capped kernel MCP tool results at 64KiB, truncating and marking oversized payloads instead of letting them bloat the kernel namespace.
+- Fixed `/mcp remove` leaking the removed server's kernel transport (stdio child) until kernel exit; removed and force-disabled servers are now reclaimed once the agent is idle.

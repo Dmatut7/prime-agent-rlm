@@ -1,0 +1,1 @@
+- Anchored the WRITING_TOOL_PATTERN regex so the `patch` and `str_replace` alternatives match exact tool names only, preventing extension tools like `dispatch` or `my_str_replace_v2` from being misclassified as writing tools.

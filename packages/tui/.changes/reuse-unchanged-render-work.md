@@ -1,0 +1,2 @@
+- Changed the fullscreen transcript and container rendering to reuse the previous frame's lines when no component changed, so cost tracks what moved instead of how long the session is.
+- Changed the editor to reuse word-wrapped lines across frames and keystrokes, so typing re-wraps only the edited line rather than the whole input.

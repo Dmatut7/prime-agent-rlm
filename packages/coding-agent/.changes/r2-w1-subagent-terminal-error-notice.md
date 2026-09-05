@@ -1,0 +1,2 @@
+- Added a parent notification when a subagent turn ends in a terminal model/provider failure: the child session sends an agent_message with an error summary and an explicit terminal-state marker instead of parking silently in needs_input.
+- Changed delivered terminal-error notices to count as a parent reply, which suppresses the misleading "completed without sending a reply" notice for the same run.

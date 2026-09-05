@@ -1,0 +1,1 @@
+- Added actionable guidance to the stall watchdog warning message, directing users to interrupt the turn manually if a tool appears stuck and to check the daemon log for diagnostics.

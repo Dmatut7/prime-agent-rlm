@@ -1,0 +1,1 @@
+- Fixed session worker CPU and memory blowup while subagents stream, caused by unbounded concurrent session-list refreshes rescanning every child transcript on each `rlm_child_update`.

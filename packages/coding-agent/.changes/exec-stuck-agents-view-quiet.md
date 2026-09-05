@@ -1,0 +1,1 @@
+- Added a "(no activity Xm)" marker in the agents view for sessions that still look busy (thinking, running tools/bash, subagents) but have had no message activity for 5+ minutes, so wedged sessions are visibly distinct from healthy ones.

@@ -1,0 +1,1 @@
+- Discarded in-flight bracketed paste on session switch and stdin drain so a late `201~` cannot insert into the next session.

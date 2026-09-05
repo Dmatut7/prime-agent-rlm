@@ -1,0 +1,3 @@
+- Added a session stall watchdog (`stallWatchdog` settings) that warns and logs diagnostics after a running turn goes silent (default 5 min) and auto-aborts the turn if silence persists (default 15 min), so stuck sessions become usable instead of appearing busy forever.
+- Added `retry.provider.streamStallTimeoutMs` (default 300000, 0 disables) to abort dead provider streams mid-turn; the failure is retryable so auto-retry recovers it.
+- Added `stall_warning` and `stall_abort` session events surfaced in the TUI, print mode, and ACP, carrying a diagnostics snapshot (last event, in-flight tool calls, pump state, queued actions).

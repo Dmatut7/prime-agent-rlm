@@ -1,0 +1,1 @@
+- Rebased stall-watchdog activity when auto-abort fires during a paused phase, matching the warn snooze so resume does not immediately re-warn and abort.

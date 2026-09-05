@@ -1,0 +1,1 @@
+- Fixed Google and Vertex providers overwriting `length` and `error` stop reasons with `toolUse` when a response contained tool calls, so malformed or blocked responses become retryable errors instead of executing the tool call, and truncated responses are correctly marked as `length`.

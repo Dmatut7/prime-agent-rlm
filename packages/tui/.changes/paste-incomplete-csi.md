@@ -1,0 +1,1 @@
+- Recognized a Kitty Esc abort split across paste chunks, and stopped discarding in-flight paste when a chunk ended in ESC before an ANSI sequence finished.

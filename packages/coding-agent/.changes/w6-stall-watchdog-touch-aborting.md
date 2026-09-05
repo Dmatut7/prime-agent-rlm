@@ -1,0 +1,1 @@
+- Fixed stall watchdog `touch()` resetting from the `aborting` state back to `armed`, which cancelled the settle timer and could restart the warn→abort cycle, contradicting the "no infinite abort loops" guarantee.

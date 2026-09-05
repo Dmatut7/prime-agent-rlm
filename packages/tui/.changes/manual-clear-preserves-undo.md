@@ -1,0 +1,1 @@
+- Preserved editor undo across a manual empty `setText` (Ctrl+C / Esc clear) while still dropping undo on session reset and slash-command clears.

@@ -1,0 +1,1 @@
+- Broadened compaction file-operation tracking to write-style tools with path-like arguments (write, patch, str_replace variants) and documented that bash/ipython file changes are not statically attributed.

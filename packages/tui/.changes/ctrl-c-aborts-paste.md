@@ -1,0 +1,1 @@
+- Interrupted an in-flight bracketed paste with Ctrl+C so the key is not swallowed for up to 30s.

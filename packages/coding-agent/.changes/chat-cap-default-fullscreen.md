@@ -1,0 +1,1 @@
+- Trimmed the live chat component tree in default fullscreen rendering; only an unfollowed fullscreen review skips the cap.

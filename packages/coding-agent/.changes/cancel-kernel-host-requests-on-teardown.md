@@ -1,0 +1,1 @@
+- Fixed kernel teardown leaving in-flight host requests (including admitted rlm.run children) running by threading an AbortSignal through host handlers and aborting it on shutdown, kill, dispose, and kernel exit ([#1253](https://github.com/PrimeIntellect-ai/prime-agent/issues/1253)).

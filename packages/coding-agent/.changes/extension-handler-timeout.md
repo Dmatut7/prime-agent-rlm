@@ -1,0 +1,1 @@
+- Added a per-handler timeout for extension events and factory load so a hung extension cannot freeze the session or abort.

@@ -1,0 +1,1 @@
+- Kept keystrokes that follow a Kitty Esc abort inside a paste chunk, instead of discarding the rest of the chunk with the paste.
