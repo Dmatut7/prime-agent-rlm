@@ -54,14 +54,11 @@ Prime Agent is an open-source coding and research agent for general and long-run
 
 与 upstream 的协作以**单向同步**为主：定期 merge 官方 main（保留本地独有实现、逐块解冲突并记录取舍），把上游更新跟进到本线，而不向官方推送。欢迎向本仓提 PR（见 [`CONTRIBUTING.md`](CONTRIBUTING.md)）；希望回馈官方的改动，建议先在本仓验证、整理成可独立 cherry-pick 的提交，再走官方贡献流程。同步历史与取舍记录见 [`FORK_NOTES.md`](FORK_NOTES.md) 与 [`docs/fork/`](docs/fork/)。
 
-## 仓库迁移说明（fork → 独立仓）
+## 仓库说明
 
-本仓 `Dmatut7/prime-agent` 是这条开发线的**唯一主仓**，正脱离官方 fork 网络转为独立仓库（detach）：新提交、issue、release 只进这里。此前两种旧形态都不再作为主开发入口：
+本仓 [`Dmatut7/prime-agent-rlm`](https://github.com/Dmatut7/prime-agent-rlm) 是这条开发线的**唯一主仓**：全新独立仓库（非 GitHub fork 网络），新提交、issue、release 只进这里。GitHub 默认搜索 `prime-agent` **无需勾选 Include forks** 即可找到。
 
-- **fork 形式的 `Dmatut7/prime-agent`**：detach 后 URL 不变（仍是 `github.com/Dmatut7/prime-agent`），只是不再显示为官方 fork、也不再被 GitHub 默认搜索当作 fork 过滤掉。bookmark 过这个地址的，照旧有效。
-- **`Dmatut7/prime-agent-x`**（早期的 “performance-optimized iteration” 实验线，停在官方较早版本）：不再作为主开发入口、不再单独维护，本仓（已跟进官方 0.9.x 线）是这条线的唯一主仓。bookmark 过它的，请改到 `github.com/Dmatut7/prime-agent`。
-
-找不到新仓时：在 GitHub 搜索 `prime-agent`（不勾 Include forks 也能命中本独立仓），或直接访问 `github.com/Dmatut7/prime-agent`。
+旧地址不再维护：`Dmatut7/prime-agent`（上游 fork）、`Dmatut7/prime-agent-x`（早期实验线）。
 
 ## 本仓改了什么（相对官方 main）
 
@@ -95,8 +92,8 @@ Prime Agent is an open-source coding and research agent for general and long-run
 官方 `install.sh` 装的还是没有这些改动的发布版。要跑本 fork：
 
 ```bash
-git clone https://github.com/Dmatut7/prime-agent.git   # 默认分支 merge/repl-kernel(含本线全部改动)
-cd prime-agent
+git clone https://github.com/Dmatut7/prime-agent-rlm.git   # 默认分支 merge/repl-kernel(含本线全部改动)
+cd prime-agent-rlm
 ./prime-agent.sh --daemon-socket /tmp/prime-agent-test/daemon.sock
 ```
 
