@@ -1,0 +1,1 @@
+- Changed the root agent's user-facing guidance to reply in the user's language, restate the goal before non-trivial work, decide instead of offering A/B options, ask only for irreversible or product-taste decisions, and lead every reply with the outcome; removed the simplified-technical-English default.

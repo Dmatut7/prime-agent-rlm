@@ -2,7 +2,12 @@
  * System prompt construction and project context loading
  */
 
-import { buildChildAgentDoctrine, buildRlmPrompt, buildSubagentGuidance } from "./prompts/index.js";
+import {
+	buildChildAgentDoctrine,
+	buildRlmPrompt,
+	buildSubagentGuidance,
+	USER_COMMUNICATION_REMINDER,
+} from "./prompts/index.js";
 import { formatHarnessStateForPrompt, type HarnessState, REFINE_SKILL_NAME } from "./refinement/index.js";
 import { formatSkillsForPrompt, getPythonSkillRuntimeInfo, type Skill } from "./skills.js";
 
@@ -174,6 +179,10 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 
 	if (appendSection) {
 		prompt += appendSection;
+	}
+
+	if ((options.rlmDepth ?? 0) === 0) {
+		prompt += `\n\n${USER_COMMUNICATION_REMINDER}`;
 	}
 
 	return prompt;

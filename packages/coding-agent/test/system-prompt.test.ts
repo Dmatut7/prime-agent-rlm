@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { buildRlmPrompt } from "../src/core/prompts/index.js";
+import { buildRlmPrompt, USER_COMMUNICATION_REMINDER } from "../src/core/prompts/index.js";
 import type { HarnessState } from "../src/core/refinement/index.js";
 import type { Skill } from "../src/core/skills.js";
 import { buildSystemPrompt } from "../src/core/system-prompt.js";
@@ -182,6 +182,26 @@ describe("buildRlmPrompt", () => {
 		expect(prompt).toContain("Always assign read/search results to named variables");
 	});
 
+	test("gives the user communication contract to root agents only", () => {
+		const root = buildRlmPrompt({
+			cwd: "/repo",
+			messagesPath: "/repo/session.jsonl",
+			activeTools: ["ipython"],
+		});
+		expect(root).toContain("# Working with the user");
+		expect(root).toContain("Never present options A/B/C.");
+		expect(root).toContain("Reply in the user's language and register.");
+		expect(root).not.toContain("simplified technical English");
+
+		const child = buildRlmPrompt({
+			cwd: "/repo",
+			messagesPath: "/repo/session.jsonl",
+			activeTools: ["ipython"],
+			depth: 1,
+		});
+		expect(child).not.toContain("# Working with the user");
+	});
+
 	test("includes the edit skill guidance only when the edit skill is installed", () => {
 		const withEdit = buildRlmPrompt({
 			cwd: "/repo",
@@ -207,6 +227,28 @@ describe("buildRlmPrompt", () => {
 });
 
 describe("buildSystemPrompt", () => {
+	test("ends the root default prompt with the communication reminder", () => {
+		const root = buildSystemPrompt({
+			selectedTools: ["ipython"],
+			contextFiles: [{ path: "/repo/AGENTS.md", content: "project rules" }],
+			skills: [],
+			cwd: "/repo",
+			appendSystemPrompt: "appended text",
+		});
+		expect(root.trimEnd().endsWith(USER_COMMUNICATION_REMINDER)).toBe(true);
+		expect(root.indexOf("appended text")).toBeLessThan(root.indexOf(USER_COMMUNICATION_REMINDER));
+
+		const child = buildSystemPrompt({
+			selectedTools: ["ipython"],
+			contextFiles: [],
+			skills: [],
+			cwd: "/repo",
+			rlmDepth: 1,
+			rlmParentAgent: "root",
+		});
+		expect(child).not.toContain(USER_COMMUNICATION_REMINDER);
+	});
+
 	test("adds generic MCP guidance to default and custom IPython prompts", () => {
 		for (const customPrompt of [undefined, "custom body"]) {
 			const prompt = buildSystemPrompt({
