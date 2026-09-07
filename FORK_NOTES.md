@@ -1,10 +1,35 @@
 # Fork 更新记录
 
-本文件是这个 fork 的**更新日志，最新的在最上面**。每条记录写清楚：改了什么、为什么改、对用户 / AI 能力的影响。深入细节见每节末尾链接的 `docs/fork/` 文档。
+本文件是这个独立维护版本的**更新日志，最新的在最上面**。每条记录写清楚：改了什么、为什么改、对用户 / AI 能力的影响。深入细节见每节末尾链接的 `docs/fork/` 文档。
 
-- 主分支：`merge/repl-kernel`（推送到 `fork/merge/repl-kernel`，github.com/Dmatut7/prime-agent）
+- 唯一主仓：[`Dmatut7/prime-agent-rlm`](https://github.com/Dmatut7/prime-agent-rlm)（GitHub 上不是 fork；本地 remote 名 `origin`）
+- 主分支：`merge/repl-kernel`（只推 `origin/merge/repl-kernel`）
+- 上游：`PrimeIntellect-ai/prime-agent`（本地 remote 名 `upstream`，只拉不推）
+- 旧地址（路牌，不再开发）：`Dmatut7/prime-agent`（GitHub fork 网络，remote 名 `fork`）、`Dmatut7/prime-agent-x`（已归档，remote 名 `archive-x`）
 - 上游同步分支：`sync/upstream-r3`
 - 旧审计文档（R1/R2）：`docs/fork/audit-findings.md`、`docs/fork/fix-plan-r1.md`、`docs/fork/fix-plan-r2.md`
+
+---
+
+## 2026-09-07 · 主仓迁到独立仓 + 根代理对用户说话方式
+
+这一轮两件事：把远程身份从「官方 fork + 两个实验仓」收成一个独立主仓；把昨晚未提交的根代理沟通契约入仓并记在这里。
+
+### 一、远程仓库收口
+
+- **做了什么**：唯一主仓定为 [`Dmatut7/prime-agent-rlm`](https://github.com/Dmatut7/prime-agent-rlm)。把本线 `merge/repl-kernel` **完整 git 历史**推上去，替换 rlm 原先那个 1 提交 squash import（`7c3e4c1ac`）。squash 会让之后 `git merge upstream/main` 变成无关历史，不能在那上面继续开发。
+- **本地 remote**：`origin` → rlm；`upstream` → 官方；`fork` → 旧 `Dmatut7/prime-agent`（只读路牌）；原 `origin`（`prime-agent-x`）改名为 `archive-x`。
+- **旧仓**：fork 最后快照的 README 已改口指向 rlm，之后不再往 fork 推新提交。`prime-agent-x` 在 GitHub 上 Archive（它停在官方 0.7.3，本来就不是这条 0.9.1 REPL 线）。
+- **版本**：本线仍是 **0.9.1**。官方已发 **v0.9.3**，下一轮上游同步再跟。
+- **为什么改**：三个仓的 README 都在抢「唯一主仓」，本地 `origin` 还指着已停更的 x。再拖只会推错地方。
+
+### 二、根代理用户沟通契约（昨晚未提交工作，本轮入仓）
+
+- **做了什么**：根代理（`rlmDepth === 0`）的用户可见指引从「默认简化技术英语 + 进度播报」换成「Working with the user」契约：用用户的语言、先复述目标再干非琐事、自己拍板不给 A/B 菜单、只在不可逆/花钱/出机/产品口味时提问、每条回复第一句就是结果。子代理不加这段。系统提示末尾再钉一句 reminder，避免长上下文把契约冲掉。
+- **为什么改**：根代理是用户唯一在读的那层；子代理对用户不可见，不需要这套说话方式。
+- **对用户 / AI 能力**：用户能感觉到根代理怎么回话（语言、结构、少问选择题）。工具调用、REPL、子代理调度不变。
+- **验证**：`packages/coding-agent/test/system-prompt.test.ts` 27 passed。changelog 碎片 `packages/coding-agent/.changes/user-communication-contract.md`。提交 `eb03edbac`。
+- **故意不纳入**：工作区里那份手改过的 `packages/ai/src/models.generated.ts` 已还原（禁止直接改 generated）；一组 visitor/kick 截图与本线无关，仍留在工作区未提交。
 
 ---
 

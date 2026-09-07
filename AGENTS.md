@@ -1,6 +1,6 @@
 # Development Rules
 
-> **本仓 = 独立 fork（`Dmatut7/prime-agent`，REPL kernel 线），不是官方仓库。** 下面绝大多数规则是从官方 `PrimeIntellect-ai/prime-agent` 的 AGENTS.md 逐字继承的（实测：本文件相对官方仅 +4 行测试卫生规则）。凡官方规则假设「官方发布流程」、与本 fork 本地流程冲突的，以下面「Fork 覆盖」一节为准。
+> **本仓 = 独立维护版本（`Dmatut7/prime-agent-rlm`，REPL kernel 线），不是官方仓库，也不再走 GitHub fork 网络。** 下面绝大多数规则是从官方 `PrimeIntellect-ai/prime-agent` 的 AGENTS.md 逐字继承的（实测：本文件相对官方仅 +4 行测试卫生规则）。凡官方规则假设「官方发布流程」、与本仓本地流程冲突的，以下面「Fork 覆盖」一节为准。
 
 ## Fork 覆盖（优先于继承的官方规则）
 
