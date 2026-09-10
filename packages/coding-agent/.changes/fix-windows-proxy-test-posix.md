@@ -1,0 +1,1 @@
+- Fixed the Windows harness-proxy test erroring on POSIX: the sentinel Path is now created before os.name is patched, since instantiating a WindowsPath on POSIX raises.

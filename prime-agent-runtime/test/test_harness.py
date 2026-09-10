@@ -140,10 +140,13 @@ class HarnessStateTest(unittest.TestCase):
         from unittest.mock import patch
 
         harness_module = importlib.import_module("rlm.harness")
+        # Create the sentinel path before patching: os.name is patched process-wide,
+        # and on POSIX instantiating Path under os.name == "nt" raises.
+        sentinel = Path("should-not-be-read")
         with patch.object(harness_module.os, "name", "nt"), patch.object(
             harness_module, "_state_file", side_effect=AssertionError("state path must not resolve")
         ):
-            state = harness_module.get_harness_state(Path("should-not-be-read"))
+            state = harness_module.get_harness_state(sentinel)
             self.assertEqual(state.list(), [])
             with self.assertRaisesRegex(RuntimeError, "Persistent harness storage is unsupported on Windows"):
                 state.create_memory("blocked", "blocked")
