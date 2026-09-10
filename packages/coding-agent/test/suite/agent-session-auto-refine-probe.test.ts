@@ -1,6 +1,8 @@
 import { mkdirSync, rmSync, symlinkSync } from "node:fs";
-import { dirname } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { ENV_AGENT_DIR } from "../../src/config.js";
 import { getHarnessStatePath } from "../../src/core/refinement/refinement.js";
 import { createHarness, type Harness } from "./harness.js";
 
@@ -33,6 +35,21 @@ function rootSession(harness: Harness): SessionWithRefineProbe {
 describe("_autoRefineAllowedForSession probe cost", () => {
 	const harnesses: Harness[] = [];
 
+	// The session constructor reads the global harness store (startup digest,
+	// settings), so point the agent dir at a throwaway store: this machine has a
+	// populated real one that would otherwise leak into every harness created here.
+	beforeEach(() => {
+		const previousAgentDir = process.env[ENV_AGENT_DIR];
+		const agentDir = join(tmpdir(), `pi-refine-probe-agent-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(agentDir, { recursive: true });
+		process.env[ENV_AGENT_DIR] = agentDir;
+		onTestFinished(() => {
+			if (previousAgentDir === undefined) delete process.env[ENV_AGENT_DIR];
+			else process.env[ENV_AGENT_DIR] = previousAgentDir;
+			rmSync(agentDir, { recursive: true, force: true });
+		});
+	});
+
 	afterEach(() => {
 		vi.restoreAllMocks();
 		while (harnesses.length > 0) {
@@ -47,6 +64,13 @@ describe("_autoRefineAllowedForSession probe cost", () => {
 		harnesses.push(harness);
 		const internals = rootSession(harness);
 		expect(internals._localHarnessStateDir()).toBeTypeOf("string");
+
+		// Session construction already consults the probe (skill visibility, kernel
+		// host handlers), so whether the TTL cache is warm at this point depends on
+		// the runner environment (a non-zero RLM_DEPTH short-circuits those calls
+		// before they cache). Drop the verdict so the count below measures this
+		// test's calls, matching what the re-probe test already relies on.
+		await internals._invalidatePendingAutoRefineForBranchChange();
 
 		const spy = vi.spyOn(internals, "_localHarnessStateDir");
 		const first = internals._autoRefineAllowedForSession();
