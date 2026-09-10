@@ -1,0 +1,1 @@
+- Fixed HTML exports (and other user-chosen output paths) failing under symlinked parent directories such as macOS /tmp: privateParent:false no longer runs the strict no-symlink walk on ancestors, while the exported file itself keeps O_NOFOLLOW, 0600, and atomic-rename protections.

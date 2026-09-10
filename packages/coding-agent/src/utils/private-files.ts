@@ -256,10 +256,11 @@ function ensureParentDirectory(path: string, privateParent: boolean): void {
 		ensurePrivateDirectory(parent);
 		return;
 	}
-	const parentExisted = pathExistsLexical(parent);
-	ensureNoSymlinkPath(parent, PRIVATE_DIRECTORY_MODE);
-	if (!lstatSync(parent).isDirectory()) throw new Error(`Refusing to use non-directory private path: ${parent}`);
-	if (!parentExisted) chmodSync(parent, PRIVATE_DIRECTORY_MODE);
+	// User-chosen output parent (e.g. an HTML export path): no private-store
+	// hardening here — macOS /tmp is a symlink, and refusing it would break
+	// legitimate output paths. The file write itself still goes through
+	// O_NOFOLLOW + atomic rename with private modes.
+	mkdirSync(parent, { recursive: true });
 }
 
 export function writePrivateFileAtomic(
