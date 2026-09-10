@@ -1,0 +1,1 @@
+- Fixed orphan-process pid-reuse detection on non-UTC hosts: the `ps` lstart stamp is rendered with `TZ=UTC` but was parsed as local time, so hosts west of UTC judged every journaled pid "reused" and never reaped orphans; the stamp is now parsed as UTC.
