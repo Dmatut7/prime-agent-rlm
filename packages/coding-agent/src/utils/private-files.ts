@@ -79,6 +79,8 @@ function ensureNoSymlinkPath(path: string, mode: number): void {
 		if (!pathExistsLexical(current)) {
 			try {
 				mkdirSync(current, { mode });
+				// mkdir's mode is umask-masked; enforce the exact private bits.
+				chmodSync(current, mode);
 			} catch (error) {
 				if (!isAlreadyExistsError(error)) throw error;
 			}
@@ -204,6 +206,9 @@ export function ensurePrivateFile(path: string, initialContent = ""): void {
 				PRIVATE_FILE_MODE,
 			);
 			writeFileSync(fd, initialContent);
+			// open's mode is umask-masked; fix it while the writable fd is still open,
+			// before the O_RDONLY reopen below can EACCES on a mode-000 file.
+			setPrivateFileMode(fd, path, PRIVATE_FILE_MODE);
 		} catch (error) {
 			// Another process may have won the exclusive-create race. The regular-file
 			// check below validates its result without ever following a symlink.
@@ -275,6 +280,9 @@ export function writePrivateFileAtomic(
 			PRIVATE_FILE_MODE,
 		);
 		writeFileSync(fd, content);
+		// open's mode is umask-masked; enforce the exact private bits before the
+		// temp file can be renamed into place.
+		setPrivateFileMode(fd, tempPath, PRIVATE_FILE_MODE);
 		fsyncSync(fd);
 		closeSync(fd);
 		fd = undefined;
@@ -314,6 +322,9 @@ export function writePrivateFileAtomicLines(
 			}
 		}
 		if (batch.length > 0) writeFileSync(fd, batch);
+		// open's mode is umask-masked; enforce the exact private bits before the
+		// temp file can be renamed into place.
+		setPrivateFileMode(fd, tempPath, PRIVATE_FILE_MODE);
 		fsyncSync(fd);
 		if (metadata && process.platform !== "win32") fchownSync(fd, metadata.uid, metadata.gid);
 		closeSync(fd);
