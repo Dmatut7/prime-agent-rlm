@@ -172,10 +172,15 @@ describe("IpythonKernelProvisioner", () => {
 		expect(provisioner.manager).toBeUndefined();
 
 		// Once the prewarm startup settles, ensure() must launch a second attempt.
-		await vi.waitFor(async () => {
-			await expect(provisioner.ensure()).rejects.toThrow();
-			expect(countRuns()).toBeGreaterThanOrEqual(2);
-		});
+		// 5s budget: the default 1s flakes when this suite runs alongside other
+		// kernel-booting files (observed 1006ms timeouts under parallel load).
+		await vi.waitFor(
+			async () => {
+				await expect(provisioner.ensure()).rejects.toThrow();
+				expect(countRuns()).toBeGreaterThanOrEqual(2);
+			},
+			{ timeout: 5000 },
+		);
 	});
 
 	it("replays the current startup stage to listeners attaching mid-flight", async () => {
@@ -210,7 +215,8 @@ describe("IpythonKernelProvisioner", () => {
 		const provisioner = new IpythonKernelProvisioner(tempDir, { python, snapshotDir });
 
 		const started = provisioner.ensure().catch(() => undefined);
-		await vi.waitFor(() => expect(existsSync(executeStarted)).toBe(true));
+		// 5s budget: same parallel-load flake as the prewarm case above.
+		await vi.waitFor(() => expect(existsSync(executeStarted)).toBe(true), { timeout: 5000 });
 		const disposed = provisioner.dispose({ snapshot: false });
 		writeFileSync(executeGate, "1");
 		await Promise.all([disposed, started]);
