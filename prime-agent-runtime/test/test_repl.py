@@ -2192,5 +2192,123 @@ class OwnerWatchdogTest(unittest.TestCase):
         self.assertEqual(calls, [("OpenProcess", 0x00100000, False, 778)])
 
 
+# The complete protocol-3 frame vocabulary (mirrors PROTOCOL_EVENT_KINDS in
+# packages/coding-agent/src/core/kernel/repl-manager.ts). A host treats anything else as
+# protocol corruption and repairs (kills) the kernel, so a runtime that negotiated 3 must
+# never emit a kind outside this set.
+_PROTOCOL3_FRAME_KINDS = {
+    "ready",
+    "stdout",
+    "stderr",
+    "result",
+    "display",
+    "host_request",
+    "error",
+    "done",
+}
+
+
+class ProtocolNegotiationTest(unittest.TestCase):
+    """T0-4/C21: the runtime clamps what the host asks for and reports what it agreed to."""
+
+    def spawn(self, protocol_env: str | None) -> ReplProcess:
+        env = {} if protocol_env is None else {"PRIME_AGENT_KERNEL_PROTOCOL": protocol_env}
+        repl = ReplProcess(env=env)
+        self.addCleanup(repl.close)
+        return repl
+
+    def test_resolve_protocol_version_clamps_and_defaults(self):
+        import rlm.repl as repl_module
+
+        cases: list[tuple[object, int]] = [
+            (None, 3),
+            ("", 3),
+            ("   ", 3),
+            ("abc", 3),
+            ("3.7", 3),
+            ("1", 3),
+            ("2", 3),
+            ("3", 3),
+            ("4", 4),
+            ("9", 4),
+            (3, 3),
+            (4, 4),
+        ]
+        self.assertGreater(len(cases), 0)
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(repl_module.resolve_protocol_version(raw), expected)
+        # The advertised ceiling moved to 4 while the default stayed at 3: an old host that
+        # never sets the variable keeps getting the protocol it understands.
+        self.assertEqual(repl_module.PROTOCOL_VERSION, 4)
+        self.assertEqual(repl_module.MIN_PROTOCOL_VERSION, 3)
+        self.assertEqual(repl_module.DEFAULT_PROTOCOL_VERSION, 3)
+        self.assertEqual(repl_module.PROTOCOL_ENV_VAR, "PRIME_AGENT_KERNEL_PROTOCOL")
+
+    def test_ready_defaults_to_protocol_3_without_the_env(self):
+        repl = self.spawn(None)
+        ready, _ = repl.ready()
+        self.assertEqual(ready["event"], "ready")
+        self.assertEqual(ready["protocol"], 3)
+        # Nothing is announced yet (preserve_names lands with T0-5), and an empty list stays
+        # off the wire so this frame is byte-identical to the protocol-3 one.
+        self.assertEqual(ready.get("capabilities", []), [])
+        events = repl.execute("d1", "import rlm.repl as _r; _r.negotiated_protocol()")
+        self.assertEqual(one(events, "result")["text"], "3")
+        self.assertEqual(repl.shutdown(), 0)
+
+    def test_ready_reports_protocol_4_when_the_host_asks_for_it(self):
+        repl = self.spawn("4")
+        ready, _ = repl.ready()
+        self.assertEqual(ready["protocol"], 4)
+        self.assertEqual(ready.get("capabilities", []), [])
+        events = repl.execute("n1", "import rlm.repl as _r; _r.negotiated_protocol()")
+        self.assertEqual(one(events, "result")["text"], "4")
+        self.assertEqual(repl.shutdown(), 0)
+
+    def test_out_of_range_or_unparsable_request_degrades_instead_of_failing(self):
+        for requested, expected in [("9", 4), ("1", 3), ("nonsense", 3)]:
+            with self.subTest(requested=requested):
+                ready, _ = self.spawn(requested).ready()
+                self.assertEqual(ready["protocol"], expected)
+
+    def test_a_negotiated_3_session_emits_only_protocol_3_frame_kinds(self):
+        """Runtime self-proof for the reverse mixed-version direction (new runtime, old host)."""
+        repl = self.spawn("3")
+        ready, _ = repl.ready()
+        self.assertEqual(ready["protocol"], 3)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.dill")
+            manifest_path = os.path.join(tmp, "state.json")
+            cell = "\n".join(
+                [
+                    "value = 41",
+                    "print('streamed out')",
+                    "import sys",
+                    "print('streamed err', file=sys.stderr)",
+                    "value + 1",
+                ]
+            )
+            self.assertEqual(one(repl.execute("c1", cell), "done")["status"], "ok")
+            display_cell = "from rlm.repl import emit\nemit({'probe': 'display'})"
+            self.assertEqual(one(repl.execute("c2", display_cell), "done")["status"], "ok")
+            repl.send(
+                {"type": "snapshot", "id": "s1", "path": path, "manifest_path": manifest_path}
+            )
+            self.assertEqual(one(repl.until_done("s1"), "done")["status"], "ok")
+            repl.send({"type": "restore", "id": "r1", "path": path})
+            self.assertEqual(one(repl.until_done("r1"), "done")["status"], "ok")
+            self.assertEqual(one(repl.execute("c3", "value"), "result")["text"], "41")
+            self.assertEqual(repl.shutdown(), 0)
+
+        kinds = [json.loads(line)["event"] for line in repl.raw_lines if line.strip()]
+        # Positive control: the session really produced a ring worth asserting over.
+        self.assertGreater(len(kinds), 8)
+        self.assertIn("ready", kinds)
+        self.assertIn("display", kinds)
+        self.assertEqual(set(kinds) - _PROTOCOL3_FRAME_KINDS, set())
+
+
+
 if __name__ == "__main__":
     unittest.main()

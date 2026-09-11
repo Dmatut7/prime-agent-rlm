@@ -3,8 +3,30 @@
 `python -m rlm.repl` starts a CPython REPL runtime that executes code cells in
 one persistent `__main__` namespace on a single asyncio event loop. The wire
 format is newline-delimited JSON: one object per line, UTF-8, no other framing.
-The current protocol version is `3`; the runtime announces it in the `ready`
-event.
+The runtime speaks protocol versions `3` and `4`. Which one a process uses is
+negotiated at startup (see [Protocol negotiation](#protocol-negotiation)) and
+announced in the `ready` event.
+
+## Protocol negotiation
+
+The host may request a version through the `PRIME_AGENT_KERNEL_PROTOCOL`
+environment variable. The runtime clamps the request into
+`[MIN_PROTOCOL_VERSION, PROTOCOL_VERSION]` (`[3, 4]`) and reports the result in
+its `ready` frame; an unset, unparsable, or out-of-range value degrades to
+`DEFAULT_PROTOCOL_VERSION` (`3`) instead of failing, so an old host or a stale
+venv still boots. Inside the kernel, `rlm.repl.negotiated_protocol()` is the
+single source of truth for what was agreed and `rlm.repl.kernel_capabilities()`
+returns the tokens announced in the `ready` frame.
+
+Two rules follow from the host treating an unknown frame `event` as protocol
+corruption — it repairs, which means killing, the kernel:
+
+- Nothing introduced above the negotiated version may be sent: no new frame
+  kind, and no new field a host of that version cannot place.
+- A host gates a request field on the capability token the kernel announced, not
+  on the version number. A runtime built between a version bump and the change
+  that understands a field still announces the newer version, so the number
+  alone cannot tell the two apart.
 
 ## Channels
 
@@ -43,7 +65,10 @@ runtime keeps serving. Closing stdin is equivalent to `shutdown`.
 ## Events
 
 - `{"event":"ready","protocol":3,"python":"3.13.11"}` — sent once at startup;
-  the handshake. No banner precedes it.
+  the handshake. No banner precedes it. `protocol` is the negotiated version, not
+  necessarily the highest one this runtime speaks. A runtime with something to
+  announce adds `"capabilities":["token",...]`; the field is omitted while the
+  list is empty, so a protocol-3 host sees exactly the frame it always has.
 - `{"event":"stdout"|"stderr","id":str|null,"text":str}` — captured output.
   `id` is the cell whose Python execution context performed the write; asyncio
   tasks inherit the spawning cell's id (even after that cell finished). `null`

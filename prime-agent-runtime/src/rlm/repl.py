@@ -38,7 +38,48 @@ from .bash import (
     _set_current_cell,
 )
 
-PROTOCOL_VERSION = 3
+# Highest protocol version this runtime can speak. What a process actually speaks is
+# negotiated from the host's PRIME_AGENT_KERNEL_PROTOCOL request, because the host treats a
+# frame kind it does not know as protocol corruption and repairs (kills) the kernel: nothing
+# added by a later protocol may be emitted unless the host asked for it.
+PROTOCOL_VERSION = 4
+# Oldest host this runtime still serves; a request below it is raised to it.
+MIN_PROTOCOL_VERSION = 3
+# What a host that never sets the variable gets, i.e. the protocol every shipped host speaks.
+DEFAULT_PROTOCOL_VERSION = 3
+PROTOCOL_ENV_VAR = "PRIME_AGENT_KERNEL_PROTOCOL"
+
+# Set once in main(); read through negotiated_protocol() so every gated frame and request
+# field has a single source of truth.
+_negotiated_protocol = DEFAULT_PROTOCOL_VERSION
+
+
+def resolve_protocol_version(raw: object) -> int:
+    """Clamp a host's protocol request into [MIN_PROTOCOL_VERSION, PROTOCOL_VERSION].
+
+    Unset, unparsable, and out-of-range values all degrade to a version both sides speak
+    instead of failing: a stale venv or an old host must still boot.
+    """
+    try:
+        requested = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_PROTOCOL_VERSION
+    return max(MIN_PROTOCOL_VERSION, min(PROTOCOL_VERSION, requested))
+
+
+def negotiated_protocol() -> int:
+    """The protocol version agreed with the host; frames above it must never be sent."""
+    return _negotiated_protocol
+
+
+def kernel_capabilities() -> list[str]:
+    """Capability tokens announced in the ready frame.
+
+    A host gates a request field on the token, not on the version number, because a runtime
+    built between a protocol bump and the change that understands a field still announces the
+    newer version. Empty until the runtime side of that field lands (snapshot preserve_names).
+    """
+    return []
 
 DEFAULT_SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024
 DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES = 16 * 1024 * 1024
@@ -1189,7 +1230,8 @@ def _setup_fds() -> int:
 
 
 def main() -> None:
-    global _loop, _serve_task
+    global _loop, _negotiated_protocol, _serve_task
+    _negotiated_protocol = resolve_protocol_version(os.environ.get(PROTOCOL_ENV_VAR))
     stdin_fd = _setup_fds()
     _start_owner_watchdog()
 
@@ -1207,7 +1249,17 @@ def main() -> None:
     signal.signal(signal.SIGINT, _sigint_handler)
     threading.Thread(target=_read_requests, args=(stdin_fd, queue), daemon=True).start()
 
-    _send({"event": "ready", "protocol": PROTOCOL_VERSION, "python": platform.python_version()})
+    ready: dict[str, Any] = {
+        "event": "ready",
+        "protocol": _negotiated_protocol,
+        "python": platform.python_version(),
+    }
+    capabilities = kernel_capabilities()
+    if capabilities:
+        # Additive and only sent when non-empty, so a protocol-3 host sees the same frame it
+        # has always seen and an old host never meets a field it cannot place.
+        ready["capabilities"] = capabilities
+    _send(ready)
 
     _serve_task = _loop.create_task(_serve(queue, user_module.__dict__))
     # A KeyboardInterrupt escaping a cell or background task stops

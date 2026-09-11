@@ -31,7 +31,7 @@ const clamp = (raw) => {
 };
 // An out-of-range announcement simulates a runtime from another protocol generation.
 const forced = process.env.FAKE_REPL_FORCE_READY_PROTOCOL;
-const protocol = forced === undefined ? clamp(requested) : Number.parseInt(forced, 10);
+const protocol = forced === undefined ? clamp(requested) : Number(forced);
 // Capability tokens this runtime announces. The field is omitted when there are none,
 // which is exactly what a runtime predating capability announcement puts on the wire.
 const announced = (process.env.FAKE_REPL_ANNOUNCE || "").split(",").filter((token) => token.length > 0);
@@ -231,7 +231,9 @@ describe("kernel protocol negotiation", () => {
 	});
 
 	it("rejects a runtime announcing a protocol outside the supported range", async () => {
-		const outOfRange = [2, 5];
+		// 3.5 pins the integer check: a fractional announcement is a corrupt frame, not a
+		// version this host could serve.
+		const outOfRange = [2, 5, 3.5];
 		expect(outOfRange.length).toBeGreaterThan(0);
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
