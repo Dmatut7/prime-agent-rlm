@@ -32,8 +32,10 @@
  * the silence) banks the accrued exempt time instead of dropping it, and a
  * resumed exemption inherits it: evidence that blinks — a fact with a lifetime
  * that expires between two stall stages and is then re-read — cannot renew the
- * cap. Only observed activity releases the budget, so a turn that is genuinely
- * producing events never pays for the exemption of an earlier phase.
+ * cap. Only observed activity releases an *unspent* budget, so a turn that is
+ * genuinely producing events never pays for the exemption of an earlier phase;
+ * once the cap has been seen spent in an arm cycle nothing un-spends it, because
+ * a spent cap that a later event could erase is not a cap.
  *
  * Timers and the clock are injectable so tests can drive it deterministically
  * without fake global timers.
@@ -141,6 +143,14 @@ export interface StallExemptionDiagnostics {
 	tier?: StallVouchBudgetTier;
 	/** Inherited exempt time; see {@link StallExemptionSnapshot.carriedExemptMs}. */
 	carriedExemptMs?: number;
+	/**
+	 * The combined budget was seen spent at some point in this arm cycle. Reported even when no
+	 * segment is live, which is the case that matters most: an abort whose exemption segment was
+	 * already dropped by a blink would otherwise be indistinguishable from a kill that had nothing
+	 * to do with the budget, and the "activity resumed after the cap was spent" downgrade would be
+	 * unreadable in a transcript.
+	 */
+	spentThisCycle?: boolean;
 	kernel?: StallKernelDiagnostics;
 }
 
@@ -411,8 +421,9 @@ export class StallWatchdog {
 	collectExemptionDiagnostics(): StallExemptionDiagnostics {
 		const kernel = this.lastKernelFacts ? normalizeStallKernelFacts(this.lastKernelFacts) : undefined;
 		const snapshot = this.exemption;
+		const spent = this.budgetSpentThisCycle ? { spentThisCycle: true } : {};
 		if (!snapshot) {
-			return { reasons: [], ...(kernel ? { kernel } : {}) };
+			return { reasons: [], ...spent, ...(kernel ? { kernel } : {}) };
 		}
 		return {
 			reason: snapshot.reason,
@@ -423,8 +434,18 @@ export class StallWatchdog {
 			exhausted: snapshot.exhausted,
 			...(snapshot.tier ? { tier: snapshot.tier } : {}),
 			...(snapshot.carriedExemptMs ? { carriedExemptMs: snapshot.carriedExemptMs } : {}),
+			...spent,
 			...(kernel ? { kernel } : {}),
 		};
+	}
+
+	/**
+	 * Whether the combined exemption budget has been seen spent in this arm cycle. Read-only and
+	 * diagnostic: it is the fact that keeps a kill after a spent cap attributable, including the
+	 * registered case where activity resumed and the turn was aborted anyway.
+	 */
+	get exemptionBudgetSpent(): boolean {
+		return this.budgetSpentThisCycle;
 	}
 
 	private resetExemption(): void {
@@ -485,19 +506,18 @@ export class StallWatchdog {
 			const previous = this.exemptionSegment;
 			this.exemptionSegment = undefined;
 			const usedMs = previous ? Math.max(0, now - previous.since) : 0;
-			if (observedActivity) {
-				// The turn produced an event while nothing was excusing its silence: the budget is
-				// released, banked time included - unless the cap was already spent, which no event
-				// can undo. Charging a later exemption for an unspent budget would bring back the
-				// pre-consumed budget defect (a long compaction eating the next long command's cap),
-				// which is the defect this whole accounting exists to prevent.
-				if (!this.budgetSpentThisCycle) this.bankedExemptMs = 0;
-			} else if (previous) {
-				// Silence is not activity: keep what was accrued, clamped to what this segment's own
-				// reason and tier could ever have bought.
+			if (previous) {
 				const budgetMs = this.exemptionBudgetMs(previous.reason, previous.tier);
+				// A segment that reached its cap is spent whoever happened to notice it, including a
+				// touch: the cap is a fact about the arm cycle, not about the sample that sees it.
+				// Without this the exhaustion could be dropped unread, and the next event would
+				// rebase the escalation of a turn that had already used up its exemption.
 				if (usedMs >= budgetMs) this.budgetSpentThisCycle = true;
-				this.bankedExemptMs = Math.min(usedMs, budgetMs);
+				// Activity releases an *unspent* budget (a long compaction must not eat the next long
+				// command's cap); silence keeps what was accrued for a resumed segment to inherit.
+				this.bankedExemptMs = observedActivity && !this.budgetSpentThisCycle ? 0 : Math.min(usedMs, budgetMs);
+			} else if (observedActivity && !this.budgetSpentThisCycle) {
+				this.bankedExemptMs = 0;
 			}
 			if (previous) {
 				this.emitExemptionEvent(

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { KernelLivenessSample } from "../src/core/kernel/shared.js";
 import {
 	STALL_VOUCH_LIVENESS_BUDGET_MS,
+	type StallExemptionDiagnostics,
 	type StallVouchFacts,
 	StallWatchdog,
 	type StallWatchdogStageInfo,
@@ -197,7 +198,7 @@ describe("degraded vouch cannot renew the exemption budget forever (A1)", () => 
  * escalation proceeds.
  */
 describe("the exemption cap survives a self-renewing vouch (watchdog-side lock)", () => {
-	it("spends the combined budget across blinks and kills the wedge", () => {
+	it("closes the cap with the spent latch when blinks land together with activity", () => {
 		const clock = new StallFakeClock();
 		const budgetMs = 12 * MINUTE_MS;
 		const evidenceLifetimeMs = 4 * MINUTE_MS;
@@ -279,5 +280,117 @@ describe("the exemption cap survives a self-renewing vouch (watchdog-side lock)"
 		expect(watchdog.exemption?.carriedExemptMs).toBeUndefined();
 		clock.advance(budgetMs - 5 * MINUTE_MS);
 		expect(stages.filter((stage) => stage.stage === "abort")).toEqual([]);
+	});
+
+	it("makes a resumed segment pay for the blink a timer fire observed (carry)", () => {
+		// No touches after the arm, so nothing here can involve the spent latch: the only thing that
+		// can shorten this kill is the accrued time surviving a lapse the watchdog observed itself.
+		// The evidence is off across the 5-minute warning and back before the 15-minute abort check.
+		const clock = new StallFakeClock();
+		const budgetMs = 12 * MINUTE_MS;
+		const offFromMs = 4 * MINUTE_MS;
+		const offUntilMs = 10 * MINUTE_MS;
+		const events: { kind: string; carriedExemptMs?: number }[] = [];
+		const stages: StallWatchdogStageInfo[] = [];
+		let abortAtMs: number | undefined;
+		// What the abort's own logFields carry: the diagnostics a real session collects with the
+		// stage, before the give-up path resets the arm cycle.
+		let diagnosticsAtAbort: StallExemptionDiagnostics | undefined;
+		let latchAtAbort: boolean | undefined;
+		const watchdog = new StallWatchdog({
+			enabled: true,
+			warnAfterMs: WARN_AFTER_MS,
+			abortAfterMs: ABORT_AFTER_MS,
+			vouchLivenessBudgetMs: budgetMs,
+			timers: clock.timersImpl,
+			vouch: () => {
+				const off = clock.nowMs >= offFromMs && clock.nowMs < offUntilMs;
+				return off ? undefined : { active: true, tier: "liveness", reasons: ["live_bash_handles"] };
+			},
+			onExemptionEvent: (event) => {
+				events.push({
+					kind: event.kind,
+					...(event.carriedExemptMs ? { carriedExemptMs: event.carriedExemptMs } : {}),
+				});
+			},
+			onStage: (info) => {
+				stages.push(info);
+				if (info.stage === "abort" && abortAtMs === undefined) {
+					abortAtMs = clock.nowMs;
+					diagnosticsAtAbort = watchdog.collectExemptionDiagnostics();
+					latchAtAbort = watchdog.exemptionBudgetSpent;
+				}
+			},
+		});
+		watchdog.arm();
+		watchdog.touch();
+		clock.advance(60 * MINUTE_MS);
+
+		// The warning at 5min saw the lapse and banked the 5 minutes accrued before it.
+		expect(events).toContainEqual({ kind: "cleared", carriedExemptMs: 5 * MINUTE_MS });
+		// The abort check at 15min found the evidence back and resumed, inheriting those 5 minutes:
+		// the cap is reached at 10 + 12 = 22min, not at 15 + 12 = 27min.
+		const resumed = events.find((event) => event.kind === "resumed");
+		expect(resumed?.carriedExemptMs).toBe(5 * MINUTE_MS);
+		expect(abortAtMs).toBe(22 * MINUTE_MS);
+		const abort = stages.find((stage) => stage.stage === "abort");
+		expect(abort?.exemption).toMatchObject({
+			reason: "vouched",
+			exhausted: true,
+			carriedExemptMs: 5 * MINUTE_MS,
+		});
+		// The kill is still attributable to a spent budget where the post-mortem reads it (T1B's
+		// ask): the abort event's own diagnostics carry spentThisCycle, so a session log can tell
+		// this from an unrelated abort. The live latch is not the carrier - the give-up path
+		// (`fireAbortUnsettled` -> `resetExemption`) clears segment and latch alike, because give-up
+		// means the next arm cycle starts clean (T1B condition 1); the 60-minute run above has
+		// already taken that path, and the captured copy is what survives it.
+		expect(latchAtAbort).toBe(true);
+		expect(diagnosticsAtAbort).toMatchObject({ spentThisCycle: true, reason: "vouched", exhausted: true });
+		expect(watchdog.exemptionBudgetSpent).toBe(false);
+	});
+
+	it("aborts within one escalation window when activity resumes after the cap was spent", () => {
+		// The registered cost of the latch, pinned as a contract: once the combined budget has been
+		// seen spent in an arm cycle, a later event does not un-spend it. The alternative - a touch
+		// racing the next fire decides whether the cap means anything - is exactly the race that made
+		// the cap unenforceable (A1).
+		const clock = new StallFakeClock();
+		const budgetMs = 12 * MINUTE_MS;
+		let vouched = true;
+		const stages: StallWatchdogStageInfo[] = [];
+		let abortAtMs: number | undefined;
+		const watchdog = new StallWatchdog({
+			enabled: true,
+			warnAfterMs: WARN_AFTER_MS,
+			abortAfterMs: ABORT_AFTER_MS,
+			vouchLivenessBudgetMs: budgetMs,
+			timers: clock.timersImpl,
+			vouch: () => (vouched ? { active: true, tier: "liveness", reasons: ["live_bash_handles"] } : undefined),
+			onStage: (info) => {
+				stages.push(info);
+				if (info.stage === "abort" && abortAtMs === undefined) abortAtMs = clock.nowMs;
+			},
+		});
+		watchdog.arm();
+		watchdog.touch();
+
+		// Spend the cap with the vouch continuously claimed and no silence-breaking events.
+		clock.advance(budgetMs + MINUTE_MS);
+		expect(watchdog.exemption?.exhausted).toBe(true);
+		// Now the evidence disappears *and* the turn starts producing events again: without the latch
+		// each event would rebase the escalation and the wedge would survive indefinitely.
+		vouched = false;
+		for (let elapsed = 0; elapsed < 3 * 60 * MINUTE_MS; elapsed += MINUTE_MS) {
+			clock.advance(MINUTE_MS);
+			watchdog.touch();
+			if (abortAtMs !== undefined) break;
+		}
+		expect(abortAtMs, "activity after a spent cap rescued the wedge").toBeDefined();
+		expect(abortAtMs ?? Number.POSITIVE_INFINITY).toBeLessThanOrEqual(budgetMs + ABORT_AFTER_MS + WARN_AFTER_MS);
+		expect(stages.some((stage) => stage.stage === "abort")).toBe(true);
+		// A new turn is a new cycle: the latch is not a permanent stain on the session.
+		watchdog.disarm();
+		expect(watchdog.exemptionBudgetSpent).toBe(false);
 	});
 });
