@@ -1,0 +1,3 @@
+- Added the kernel runtime's snapshot `preserve_names` merge write: a snapshot request can name values that failed to revive, and their blobs are carried over verbatim from the payload on disk, so a session that restored only part of its state persists new work again instead of never writing to disk.
+- Added the `preserve_names` capability token to the kernel `ready` frame (announced only from negotiated protocol 4), which is what the host gates the request field on.
+- Added `preserved` to the snapshot manifest and to the snapshot `done` frame, reporting the names actually carried over after any size-cap drop.

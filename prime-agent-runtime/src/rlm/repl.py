@@ -72,13 +72,23 @@ def negotiated_protocol() -> int:
     return _negotiated_protocol
 
 
+# Snapshot preserve_names (a merge write that carries unrestorable blobs over) is a
+# protocol-4 request field; a session negotiated below it must neither accept nor echo it.
+PRESERVE_NAMES_MIN_PROTOCOL = 4
+CAPABILITY_PRESERVE_NAMES = "preserve_names"
+
+
 def kernel_capabilities() -> list[str]:
     """Capability tokens announced in the ready frame.
 
     A host gates a request field on the token, not on the version number, because a runtime
     built between a protocol bump and the change that understands a field still announces the
-    newer version. Empty until the runtime side of that field lands (snapshot preserve_names).
+    newer version. Tokens are announced only from the protocol that introduced them, so a
+    session negotiated down to 3 announces nothing and its frames stay byte-identical to the
+    protocol-3 ones.
     """
+    if negotiated_protocol() >= PRESERVE_NAMES_MIN_PROTOCOL:
+        return [CAPABILITY_PRESERVE_NAMES]
     return []
 
 DEFAULT_SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024
@@ -666,6 +676,89 @@ class _CappedWriter:
         return size
 
 
+def _read_previous_payload(path: str) -> dict[str, Any] | None:
+    """The previous payload's name -> blob mapping, or None when it cannot be trusted.
+
+    Only the outer mapping is deserialized (its values are plain bytes), so reading it never
+    needs the modules a broken blob refers to — that is what makes a merge write possible for
+    exactly the names that cannot be revived.
+    """
+    try:
+        import dill
+    except Exception:  # noqa: BLE001 - the caller reports dill being unavailable
+        return None
+    try:
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as fh:
+            previous = dill.load(fh)
+    except Exception:  # noqa: BLE001 - an unreadable previous payload only costs the merge
+        return None
+    return previous if isinstance(previous, dict) else None
+
+
+def _merge_preserved_blobs(
+    path: str,
+    payload: dict[str, bytes],
+    skipped: list[dict[str, str]],
+    preserve_names: list[str] | None,
+) -> list[str]:
+    """Copy the requested names' blobs from the previous payload into `payload`.
+
+    Returns the names actually carried over, in the caller's order. A previous payload that
+    cannot be read costs this snapshot its merge step only — every requested name is reported
+    in `skipped` and the write still happens, because "never write again" is the failure this
+    exists to fix.
+
+    Carried blobs go in newest-first so the aggregate-cap search below (which keeps the longest
+    fitting prefix) drops the OLDEST preserved name first. They bypass the per-variable cap on
+    purpose: preserving wins over pruning, and the aggregate cap still bounds the payload.
+    """
+    requested = [name for name in (preserve_names or []) if isinstance(name, str) and name]
+    if not requested:
+        return []
+    previous = _read_previous_payload(path)
+    if previous is None:
+        for name in requested:
+            skipped.append(
+                {
+                    "name": name,
+                    "reason": (
+                        "preserved blob unavailable: the previous snapshot payload could not be read"
+                    ),
+                }
+            )
+        return []
+    carried: list[str] = []
+    for name in reversed(requested):
+        if name not in previous:
+            skipped.append(
+                {
+                    "name": name,
+                    "reason": "preserved blob unavailable: absent from the previous snapshot payload",
+                }
+            )
+            continue
+        blob = previous[name]
+        if not isinstance(blob, (bytes, bytearray)):
+            # A payload whose values are not serialized blobs is not one this runtime wrote.
+            skipped.append(
+                {
+                    "name": name,
+                    "reason": (
+                        "preserved blob unavailable: the previous snapshot payload holds no blob for it"
+                    ),
+                }
+            )
+            continue
+        payload[name] = bytes(blob)
+        carried.append(name)
+    carried.reverse()
+    return carried
+
+
 def _snapshot_state(
     ns: dict[str, Any],
     path: str,
@@ -674,7 +767,17 @@ def _snapshot_state(
     max_variable_bytes: int,
     prune_oversized: bool,
     committed: list[dict[str, Any]] | None = None,
+    preserve_names: list[str] | None = None,
 ) -> dict[str, Any]:
+    """Serialize the namespace, carrying `preserve_names` over from the previous payload.
+
+    A restore that failed on some names leaves this namespace missing values the snapshot on
+    disk still holds. Writing the namespace alone would drop them, so the caller may name them
+    here and their blobs are copied verbatim from the previous payload (a merge write). The
+    on-disk state then only improves: new work is persisted, the unrestorable values survive
+    unchanged, and a later restore still fails on exactly those names instead of pretending
+    they came back.
+    """
     import datetime
 
     if not hasattr(os, "O_NOFOLLOW"):
@@ -719,6 +822,8 @@ def _snapshot_state(
             continue
         payload[name] = blob
         total += len(blob)
+
+    preserved = _merge_preserved_blobs(path, payload, skipped, preserve_names)
 
     out_dir = os.path.dirname(path) or "."
     if os.path.lexists(out_dir):
@@ -788,6 +893,9 @@ def _snapshot_state(
                     for name, _ in items[low:]:
                         skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
                     payload = dict(items[:low])
+                    # Report only what was actually written: the cap drops the oldest
+                    # preserved names first (see _merge_preserved_blobs).
+                    preserved = [name for name in preserved if name in payload]
                     # The search's last attempt may have overflowed the temp; rewrite the chosen prefix.
                     bytes_written = redump_to_temp(payload)
                     if bytes_written is None:
@@ -800,12 +908,19 @@ def _snapshot_state(
                 if hasattr(os, "fchmod"):
                     os.fchmod(fh.fileno(), 0o600)
             saved = sorted(payload.keys())
-            pruned = sorted(name for name in oversized if name in ns) if prune_oversized else []
+            # A name carried over from the previous payload is preserved, not pruned, even when
+            # its live value is over the per-variable cap: preserve wins over prune.
+            pruned = (
+                sorted(name for name in oversized if name in ns and name not in preserved)
+                if prune_oversized
+                else []
+            )
             manifest = {
                 "version": 1,
                 "savedNames": saved,
                 "skipped": skipped,
                 "pruned": pruned,
+                "preserved": preserved,
                 "bytes": bytes_written,
                 "pythonVersion": sys.version.split()[0],
                 "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -847,7 +962,16 @@ def _snapshot_state(
             return {"error": f"manifest write failed: {err}"}
         for name in pruned:
             ns.pop(name, None)
-        result = {"saved": saved, "skipped": skipped, "pruned": pruned, "bytes": bytes_written}
+        result: dict[str, Any] = {
+            "saved": saved,
+            "skipped": skipped,
+            "pruned": pruned,
+            "bytes": bytes_written,
+        }
+        if preserve_names is not None:
+            # A protocol-4 done-frame field: echoed only for a request that used it, so a
+            # negotiated-3 session's frames stay byte-identical to today's.
+            result["preserved"] = preserved
         # Publish while still parked: a later KeyboardInterrupt into this task finds the committed result (see _handle_state).
         if committed is not None:
             committed.append(result)
@@ -928,6 +1052,20 @@ async def _handle_state(req: dict[str, Any], ns: dict[str, Any]) -> None:
             prune = req.get("prune_oversized", False)
             if not isinstance(prune, bool):
                 return {"error": "prune_oversized must be a boolean"}
+            preserve_names = req.get("preserve_names")
+            if preserve_names is not None:
+                # A protocol-4 field. A negotiated-3 host never sends it, and accepting it
+                # there would answer with a field that protocol has no place for.
+                if negotiated_protocol() < PRESERVE_NAMES_MIN_PROTOCOL:
+                    return {
+                        "error": (
+                            f"preserve_names requires kernel protocol {PRESERVE_NAMES_MIN_PROTOCOL}"
+                        )
+                    }
+                if not isinstance(preserve_names, list) or not all(
+                    isinstance(name, str) for name in preserve_names
+                ):
+                    return {"error": "preserve_names must be a list of strings"}
             for field in ("max_bytes", "max_variable_bytes"):
                 # Any present value must be a non-negative int; a JSON null is not a valid way to ask
                 # for the default, and a negative cap would prune every user variable from ns.
@@ -946,6 +1084,7 @@ async def _handle_state(req: dict[str, Any], ns: dict[str, Any]) -> None:
                 req.get("max_variable_bytes", DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES),
                 prune,
                 committed,
+                preserve_names,
             )
         return _restore_state(ns, req["path"], committed)
 

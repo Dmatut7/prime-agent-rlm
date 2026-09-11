@@ -2250,8 +2250,8 @@ class ProtocolNegotiationTest(unittest.TestCase):
         ready, _ = repl.ready()
         self.assertEqual(ready["event"], "ready")
         self.assertEqual(ready["protocol"], 3)
-        # Nothing is announced yet (preserve_names lands with T0-5), and an empty list stays
-        # off the wire so this frame is byte-identical to the protocol-3 one.
+        # A negotiated-3 session announces nothing, and an empty list stays off the wire, so
+        # this frame is byte-identical to the protocol-3 one from before negotiation existed.
         self.assertEqual(ready.get("capabilities", []), [])
         events = repl.execute("d1", "import rlm.repl as _r; _r.negotiated_protocol()")
         self.assertEqual(one(events, "result")["text"], "3")
@@ -2261,7 +2261,9 @@ class ProtocolNegotiationTest(unittest.TestCase):
         repl = self.spawn("4")
         ready, _ = repl.ready()
         self.assertEqual(ready["protocol"], 4)
-        self.assertEqual(ready.get("capabilities", []), [])
+        # Protocol 4 is the version that introduced snapshot preserve_names, so a negotiated-4
+        # session announces it and the host may send the field (see test_repl_snapshot_preserve).
+        self.assertEqual(ready.get("capabilities", []), ["preserve_names"])
         events = repl.execute("n1", "import rlm.repl as _r; _r.negotiated_protocol()")
         self.assertEqual(one(events, "result")["text"], "4")
         self.assertEqual(repl.shutdown(), 0)

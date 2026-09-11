@@ -28,6 +28,10 @@ corruption — it repairs, which means killing, the kernel:
   that understands a field still announces the newer version, so the number
   alone cannot tell the two apart.
 
+| Token | Since | Gates |
+|---|---|---|
+| `preserve_names` | 4 | the snapshot request field `preserve_names` and the `preserved` field of its `done` frame |
+
 ## Channels
 
 - Requests arrive on fd 0 (stdin).
@@ -52,7 +56,7 @@ corruption — it repairs, which means killing, the kernel:
 | `execute` | `{"type":"execute","id":str,"code":str}` |
 | `interrupt` | `{"type":"interrupt","id"?:str}` — no reply |
 | `host_reply` | `{"type":"host_reply","id":str,"data":{"status":"ok","result":{...}}}` or an error envelope — no reply |
-| `snapshot` | `{"type":"snapshot","id":str,"path":str,"manifest_path":str,"max_bytes"?:int,"max_variable_bytes"?:int,"prune_oversized"?:bool}` |
+| `snapshot` | `{"type":"snapshot","id":str,"path":str,"manifest_path":str,"max_bytes"?:int,"max_variable_bytes"?:int,"prune_oversized"?:bool,"preserve_names"?:[str,...]}` — `preserve_names` needs the negotiated protocol 4 and the `preserve_names` capability token |
 | `restore` | `{"type":"restore","id":str,"path":str}` |
 | `list_names` | `{"type":"list_names","id":str}` |
 | `shutdown` | `{"type":"shutdown","id"?:str}` |
@@ -88,7 +92,8 @@ runtime keeps serving. Closing stdin is equivalent to `shutdown`.
 - `{"event":"error","id":str|null,"ename":str,"evalue":str,"traceback":[str,...]}`
 - `{"event":"done","id":str,"status":"ok"|"error"}` — exactly one per id'd
   request, always after all of that request's other events. A snapshot `done`
-  adds `saved`, `skipped`, `pruned`, `bytes`; a restore `done` adds `restored`,
+  adds `saved`, `skipped`, `pruned`, `bytes`, and — only for a request that sent
+  `preserve_names` — `preserved`; a restore `done` adds `restored`,
   `failed`; a `list_names` `done` adds `names`; a failed snapshot/restore adds
   `reason`. Restoring a missing file reports `status:"ok"` with empty
   `restored`/`failed` lists and `reason:"snapshot not found"`.
@@ -174,9 +179,24 @@ names exceeding the per-variable cap (`max_variable_bytes`) are also deleted
 from the namespace and listed in `pruned`; names skipped for the aggregate
 `max_bytes` cap are reported in `skipped` but kept in the namespace. The
 payload is written atomically (tmp file + `os.replace`) and a JSON manifest
-(`version`, `savedNames`, `skipped`, `pruned`, `bytes`, `pythonVersion`,
-`timestamp`) is written to `manifest_path`. A manifest write failure fails the
-snapshot (and nothing is pruned).
+(`version`, `savedNames`, `skipped`, `pruned`, `preserved`, `bytes`,
+`pythonVersion`, `timestamp`) is written to `manifest_path`. A manifest write
+failure fails the snapshot (and nothing is pruned).
+
+`preserve_names` (protocol 4, gated on the capability token) turns the write into
+a merge write: for each requested name the blob is copied verbatim from the
+payload currently on disk instead of being taken from the live namespace, and the
+names actually carried over are reported in `preserved` (and in the manifest).
+This is how a session that restored only part of its state keeps persisting — the
+new work is written, the values that could not be revived survive unchanged, and
+a later restore still reports those same names in `failed` rather than pretending
+they came back. A requested name that the previous payload does not hold, or a
+previous payload that cannot be read at all, is reported in `skipped` with a
+`preserved blob unavailable: …` reason and the write still happens; the merge step
+is never allowed to cost the snapshot. Carried blobs bypass the per-variable cap
+(preserving outranks pruning, and a preserved name is never listed in `pruned`)
+but not the aggregate `max_bytes`: when the payload has to shrink, the oldest
+requested name is dropped first and reported in `skipped`.
 
 `restore` loads the payload and revives each name independently; a missing
 file yields an ok empty restore with `reason:"snapshot not found"`, a corrupt
