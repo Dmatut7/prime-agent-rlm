@@ -190,7 +190,10 @@ names actually carried over are reported in `preserved` (and in the manifest).
 This is how a session that restored only part of its state keeps persisting — the
 new work is written, the values that could not be revived survive unchanged, and
 a later restore still reports those same names in `failed` rather than pretending
-they came back. A requested name that the previous payload does not hold, or a
+they came back. A requested name the live namespace can serialize again keeps its
+fresh value instead of the saved blob: a variable the model rebuilt after the
+failed restore is the current fact, so the stale blob is not written back over it
+(the name simply stays out of `preserved`). A requested name that the previous payload does not hold, or a
 previous payload that cannot be read at all, is reported in `skipped` with a
 `preserved blob unavailable: …` reason and the write still happens; the merge step
 is never allowed to cost the snapshot. Carried blobs bypass the per-variable cap

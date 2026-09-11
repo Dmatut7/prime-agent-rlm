@@ -92,18 +92,29 @@ class MergeWriteTest(unittest.TestCase):
         self.assertEqual(manifest["savedNames"], result["saved"])
         self.assertEqual(manifest["version"], 1)
 
-    def test_a_requested_name_keeps_its_saved_blob_over_a_rebuilt_live_value(self):
-        # Documented semantics (TASKS.md T0-5): a requested name reuses the OLD payload's blob.
-        # The host clears its request list after a fully successful restore, so the window in
-        # which a rebuilt value is not persisted is bounded by the next clean restore.
-        previous = dill.dumps("original")
-        write_payload(self.path, {"bad": previous})
+    def test_a_rebuilt_live_value_outranks_the_saved_blob(self):
+        # Ruled semantics (orchestrator, batch 0): preserve_names exists so a failed restore
+        # cannot lose the saved value, but once the namespace can serialize a requested name
+        # again the live value is the current fact — writing the older blob back over it would
+        # discard the model's work and re-persist data known to be stale.
+        write_payload(
+            self.path,
+            {"bad": dill.dumps("original"), "gone": dill.dumps("the-gone-value")},
+        )
 
-        result = snapshot({"bad": "rebuilt"}, self.path, self.manifest, preserve_names=["bad"])
+        result = snapshot(
+            {"bad": "rebuilt"}, self.path, self.manifest, preserve_names=["bad", "gone"]
+        )
 
         self.assertNoError(result)
-        self.assertEqual(result["preserved"], ["bad"])
-        self.assertEqual(dill.loads(read_payload(self.path)["bad"]), "original")
+        # "bad" serializes again, so its live value wins; "gone" still does not, so its saved
+        # blob is carried over.
+        self.assertEqual(result["preserved"], ["gone"])
+        payload = read_payload(self.path)
+        self.assertEqual(dill.loads(payload["bad"]), "rebuilt")
+        self.assertEqual(dill.loads(payload["gone"]), "the-gone-value")
+        self.assertEqual(sorted(result["saved"]), ["bad", "gone"])
+        self.assertEqual(read_manifest(self.manifest)["preserved"], ["gone"])
 
     def test_an_unreadable_previous_payload_costs_the_merge_only(self):
         good = dill.dumps(1)

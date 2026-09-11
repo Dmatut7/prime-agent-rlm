@@ -707,10 +707,11 @@ def _merge_preserved_blobs(
 ) -> list[str]:
     """Copy the requested names' blobs from the previous payload into `payload`.
 
-    Returns the names actually carried over, in the caller's order. A previous payload that
-    cannot be read costs this snapshot its merge step only — every requested name is reported
-    in `skipped` and the write still happens, because "never write again" is the failure this
-    exists to fix.
+    Returns the names actually carried over, in the caller's order. A requested name the live
+    namespace can serialize again is left alone: a rebuilt value outranks the saved blob. A
+    previous payload that cannot be read costs this snapshot its merge step only — every
+    requested name is reported in `skipped` and the write still happens, because "never write
+    again" is the failure this exists to fix.
 
     Carried blobs go in newest-first so the aggregate-cap search below (which keeps the longest
     fitting prefix) drops the OLDEST preserved name first. They bypass the per-variable cap on
@@ -733,6 +734,12 @@ def _merge_preserved_blobs(
         return []
     carried: list[str] = []
     for name in reversed(requested):
+        if name in payload:
+            # The namespace has a live value for this name again (the model rebuilt it after
+            # the failed restore), and the live value is the current fact: carrying the older
+            # blob back would discard that work and re-persist data known to be stale. The
+            # name stays in the caller's request list, so a later snapshot re-checks it.
+            continue
         if name not in previous:
             skipped.append(
                 {
@@ -776,7 +783,8 @@ def _snapshot_state(
     here and their blobs are copied verbatim from the previous payload (a merge write). The
     on-disk state then only improves: new work is persisted, the unrestorable values survive
     unchanged, and a later restore still fails on exactly those names instead of pretending
-    they came back.
+    they came back. A requested name the namespace can serialize again keeps its fresh value —
+    a rebuilt variable outranks the blob that could not be revived.
     """
     import datetime
 
