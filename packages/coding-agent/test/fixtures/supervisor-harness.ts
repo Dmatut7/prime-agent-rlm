@@ -40,6 +40,8 @@ export interface SupervisorHarnessOptions {
 	noWorkerSocket?: boolean;
 	/** The fake worker answers hello and auth only, so adoption wedges on its next request. */
 	hangAfterAuth?: boolean;
+	/** Command types the fake worker never answers, so a supervisor leg stays in flight. */
+	hangWorkerCommands?: readonly string[];
 	/** Claim a pid that is already dead, so adoption fails on identity. */
 	deadWorkerPid?: boolean;
 	descriptorLifecycle?: DaemonWorkerLifecycle;
@@ -167,6 +169,8 @@ export async function startSupervisorHarness(options: SupervisorHarnessOptions):
 			session,
 			...(options.adopt === false ? { adopt: false } : {}),
 			...(options.hangAfterAuth ? { hangAfterAuth: true } : {}),
+			...(options.hangWorkerCommands ? { hangCommands: options.hangWorkerCommands } : {}),
+			...(sessions.length > 1 ? { extraSessions: sessions.slice(1) } : {}),
 			// Mirror a real worker: an asked-for shutdown takes the process with it.
 			onShutdownRequest: () => {
 				if (standIn && standIn.child.exitCode === null && standIn.child.signalCode === null) {

@@ -501,6 +501,14 @@ export function transientRetryAfterMs(error: unknown): number | undefined {
 	return TRANSIENT_RETRY_AFTER_MS.find((entry) => entry.pattern.test(message))?.retryAfterMs;
 }
 
+/**
+ * Mutating commands whose in-flight duration must not gate the update-restart
+ * drain (P1-7c). They are tracked and drained by name instead, so the drain is
+ * not disabled — it just no longer waits on a delivery that may legitimately
+ * take as long as the 24h budget.
+ */
+const LONG_DELIVERY_DRAIN_EXEMPT_COMMANDS: ReadonlySet<string> = new Set(["send_message"]);
+
 /** Terminal commands converge on a target that is already gone instead of failing (C19/L4). */
 const TERMINAL_DAEMON_COMMANDS: ReadonlySet<string> = new Set(["kill", "abort", "cancel_rlm_child"]);
 
@@ -2336,7 +2344,13 @@ export class DaemonSupervisor {
 		// Attach is intentionally read-only and is not fence-gated. If eviction wins
 		// the race, attach fails cleanly with "Session worker is not connected" and
 		// the client retries through the saved-session path instead of mutating state.
-		if (mutation) this.mutationDrain.begin();
+		// P1-7c: a long agent-message delivery must not hold the update-restart
+		// latch — one wedged send used to be able to fail an 80s drain for
+		// everybody. Its journal entry stays pending, which is what makes a replay
+		// of the same command id answer "uncertain" instead of claiming it never
+		// happened.
+		const holdsDrainLatch = mutation && !LONG_DELIVERY_DRAIN_EXEMPT_COMMANDS.has(command.type);
+		if (holdsDrainLatch) this.mutationDrain.begin();
 		try {
 			const response = await this.handleCommand(client, command, cancellationAdmission);
 			if (response) {
@@ -2378,7 +2392,7 @@ export class DaemonSupervisor {
 			}
 			this.write(client, response);
 		} finally {
-			if (mutation) this.mutationDrain.end();
+			if (holdsDrainLatch) this.mutationDrain.end();
 		}
 	}
 

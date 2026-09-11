@@ -35,6 +35,10 @@ export interface FakeWorkerOptions {
 	adopt?: boolean;
 	/** Answer hello and worker_auth only, so adoption wedges on its next request. */
 	hangAfterAuth?: boolean;
+	/** Command types this worker never answers, so the supervisor's leg stays in flight. */
+	hangCommands?: readonly string[];
+	/** Additional sessions this worker reports from `list`, so a roster holds more than the root. */
+	extraSessions?: readonly FakeWorkerSession[];
 	/**
 	 * A real worker exits after the supervisor asks it to shut down; the stand-in
 	 * process has to do the same or a stop waits for a process that never leaves.
@@ -163,10 +167,15 @@ export async function startFakeWorker(options: FakeWorkerOptions): Promise<FakeW
 				if (options.adopt === false || options.hangAfterAuth === true) {
 					continue;
 				}
+				if (options.hangCommands?.includes(type)) {
+					continue;
+				}
 				if (type === "list") {
 					respond(frame.header.requestId, type, {
 						success: true,
-						data: { sessions: [fakeWorkerSummary(session)] },
+						data: {
+							sessions: [fakeWorkerSummary(session), ...(options.extraSessions ?? []).map(fakeWorkerSummary)],
+						},
 					});
 					continue;
 				}
