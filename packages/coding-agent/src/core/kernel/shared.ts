@@ -316,10 +316,77 @@ export interface KernelShutdownOptions {
 	drainHostRequests?: boolean;
 }
 
+/**
+ * One accepted kernel heartbeat frame (protocol 4). Every counter is monotonic on the kernel
+ * side, so the host diffs two retained samples instead of trusting a rate: a frame it never
+ * saw (throttled, rejected, lost) cannot make the next one lie.
+ */
+export interface KernelLivenessSample {
+	/** Host clock (epoch ms) when the frame was accepted. */
+	receivedAt: number;
+	/** Kernel event-loop tick counter; it stops advancing while the loop is blocked. */
+	tick: number;
+	/** The kernel's own heartbeat period, reported in the frame. */
+	intervalMs: number;
+	/** Request id the kernel says is in flight; absent when it reported none. */
+	cellId?: string;
+	/** Kernel process cpu (user + system) in ms. */
+	cpuMs: number;
+	/** Streamed stdout/stderr characters since the kernel started. */
+	streamBytes: number;
+	/** Requests finished since the kernel started. */
+	cellsDone: number;
+	/** Host requests the kernel is waiting on, from the kernel's side. */
+	hostRequests: number;
+	/** Live `bash()` handles. */
+	bashHandles: number;
+	/** Live `bash()` handles attributed to `cellId`. */
+	bashCellHandles: number;
+	/** Buffered output bytes across the probed handles. */
+	bashBufferedBytes: number;
+	/** Probed handles with bytes pending on their capture pipe. */
+	bashPipePending: number;
+}
+
+/**
+ * Retained kernel liveness state: the two newest samples plus the frame counters. Reading it
+ * is diagnostic-only; it never feeds a cell's output and never reaches the model context.
+ */
+export interface KernelLiveness {
+	/** Negotiated protocol of the kernel these samples came from; undefined before its ready frame. */
+	protocol?: number;
+	/** Newest retained sample; absent until the first frame is accepted. */
+	latest?: KernelLivenessSample;
+	/** Sample before the newest; absent until two are retained. */
+	previous?: KernelLivenessSample;
+	/** Frames rejected for a bad shape. Never fatal: one bad frame must not kill the kernel. */
+	rejectedFrames: number;
+	/** Rejections since the last accepted frame. */
+	consecutiveRejectedFrames: number;
+	/** Well-formed frames dropped for arriving inside the minimum sample gap. */
+	throttledFrames: number;
+}
+
 /** Public surface every kernel client exposes to the provisioner and session layer. */
 export interface KernelClient {
 	readonly ownerSessionId: string | undefined;
 	readonly isRunning: boolean;
+	/**
+	 * Liveness facts from protocol-4 heartbeat frames. Optional and absent for a kernel that
+	 * negotiated protocol 3: readers must treat "no facts" as "no evidence either way", never
+	 * as "dead", and never as permission to skip the stall watchdog.
+	 */
+	readonly kernelLiveness?: KernelLiveness;
+	/** Host requests currently in flight for this kernel (the host's own authoritative count). */
+	readonly hostRequestCount?: number;
+	/** Age in ms of the oldest in-flight host request; undefined when there is none. */
+	readonly hostRequestOldestAgeMs?: number;
+	/** Whether a cell is executing right now. */
+	readonly hasActiveExecution?: boolean;
+	/** Kernel process id while the child is alive. */
+	readonly kernelPid?: number;
+	/** Whether the newest heartbeat reports live bash handles; false when it reports none. */
+	readonly isKernelBashRunning?: boolean;
 	start(options?: KernelStartOptions): Promise<void>;
 	execute(code: string, opts?: ExecuteOptions): Promise<ExecuteResult>;
 	shutdown(opts?: KernelShutdownOptions): Promise<boolean>;

@@ -12,7 +12,7 @@ type AbortInternals = {
 	writeLine: (request: Record<string, unknown>) => Promise<void>;
 	handleEvent: (event: Record<string, unknown>) => void;
 	wireChild: (child: AbortInternals["child"]) => void;
-	inFlightHostRequests: Set<Promise<void>>;
+	inFlightHostRequests: Map<Promise<void>, number>;
 	kernelStderr: string;
 	child: EventEmitter & {
 		exitCode: number | null;

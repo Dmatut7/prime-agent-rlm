@@ -10,7 +10,7 @@ type ShutdownInternals = {
 	handleEvent: (event: Record<string, unknown>) => void;
 	wireChild: (child: ShutdownInternals["child"]) => void;
 	pendingDoneWaiters: Map<string, () => void>;
-	inFlightHostRequests: Set<Promise<void>>;
+	inFlightHostRequests: Map<Promise<void>, number>;
 	kernelStderr: string;
 	child: EventEmitter & {
 		exitCode: number | null;
@@ -223,7 +223,7 @@ describe("ReplKernelManager graceful shutdown", () => {
 			.mockResolvedValue(null);
 
 		internals.handleEvent({ event: "host_request", id: "hr-1", data: { type: "test.slow" } });
-		const tracked = [...internals.inFlightHostRequests];
+		const tracked = [...internals.inFlightHostRequests.keys()];
 		expect(tracked).toHaveLength(1);
 
 		await manager.shutdown();

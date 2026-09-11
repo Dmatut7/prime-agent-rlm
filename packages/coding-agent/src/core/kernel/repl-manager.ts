@@ -47,6 +47,8 @@ import {
 	KernelBusyAfterInterruptError,
 	type KernelCapabilities,
 	type KernelDiffDisplay,
+	type KernelLiveness,
+	type KernelLivenessSample,
 	type KernelManagerOptions,
 	type KernelSentAgentMessage,
 	type KernelShutdownOptions,
@@ -91,6 +93,25 @@ const KERNEL_PROTOCOL_V4 = 4;
  * feature.
  */
 const KERNEL_PROTOCOL_ENV_VAR = "PRIME_AGENT_KERNEL_PROTOCOL";
+/**
+ * Frame kinds that only a kernel which negotiated at least this protocol may send. Kept apart
+ * from PROTOCOL_EVENT_KINDS so the gate is visible at the check site: a host treats a kind it
+ * does not know as corruption and repairs (kills) the kernel, so accepting a gated kind from a
+ * kernel that negotiated below it is exactly the mixed-version failure the gate prevents.
+ */
+const GATED_EVENT_KIND_MIN_PROTOCOL: Readonly<Record<string, number>> = {
+	heartbeat: KERNEL_PROTOCOL_V4,
+};
+/** Heartbeat period the runtime uses by default; every frame carries the kernel's own value. */
+export const DEFAULT_KERNEL_HEARTBEAT_INTERVAL_MS = 5_000;
+/** A heartbeat older than this many of its own intervals is stale and stops vouching for work. */
+export const KERNEL_LIVENESS_STALE_INTERVALS = 3;
+/** Minimum gap between two retained samples, so a kernel that floods frames cannot churn the host. */
+const KERNEL_LIVENESS_MIN_SAMPLE_GAP_MS = 1_000;
+/** Retained samples: enough to diff progress, few enough to stay O(1). */
+const KERNEL_LIVENESS_MAX_SAMPLES = 2;
+/** Rejection streaks are logged at 1 and then every N, so a broken runtime cannot flood the log. */
+const KERNEL_LIVENESS_REJECT_LOG_EVERY = 50;
 const READY_TIMEOUT_MS = 30_000;
 const REPAIR_STEP_TIMEOUT_MS = 30_000;
 // Runtime-minted host-request ids never repeat; the bound only guards a
@@ -153,6 +174,7 @@ const PROTOCOL_EVENT_KINDS = new Set([
 	"host_request",
 	"error",
 	"done",
+	"heartbeat",
 ]);
 
 /**
@@ -160,10 +182,20 @@ const PROTOCOL_EVENT_KINDS = new Set([
  * `done` and `host_request` route strictly by non-empty string id (the runtime
  * mints uuid hex ids and echoes the host's uuids); silently dropping an id-less
  * one would leave the awaiting request unsettled forever.
+ *
+ * `protocol` is the version this kernel negotiated (undefined until its ready frame). A gated
+ * kind below its version is corruption: the only thing that can produce one is a runtime that
+ * ignores the negotiation gate, and continuing to trust such a runtime's other frames is worse
+ * than repairing it. Note this is the *kind* gate only - a well-formed kind carrying bad field
+ * values is rejected and counted by the handler instead, never escalated here.
  */
-function invalidProtocolFrameReason(event: Record<string, unknown>): string | undefined {
+function invalidProtocolFrameReason(event: Record<string, unknown>, protocol: number | undefined): string | undefined {
 	if (typeof event.event !== "string" || !PROTOCOL_EVENT_KINDS.has(event.event)) {
 		return "unknown protocol event";
+	}
+	const minProtocol = GATED_EVENT_KIND_MIN_PROTOCOL[event.event];
+	if (minProtocol !== undefined && (protocol === undefined || protocol < minProtocol)) {
+		return `${event.event} frame from a kernel that negotiated protocol ${protocol ?? "nothing yet"}`;
 	}
 	if (
 		(event.event === "done" || event.event === "host_request") &&
@@ -172,6 +204,83 @@ function invalidProtocolFrameReason(event: Record<string, unknown>): string | un
 		return `${event.event} frame without id`;
 	}
 	return undefined;
+}
+
+/** Heartbeat counter fields; every one must be a non-negative integer. */
+const HEARTBEAT_COUNTER_FIELDS = [
+	"tick",
+	"cpu_ms",
+	"stream_bytes",
+	"cells_done",
+	"host_requests",
+	"interval_ms",
+] as const;
+/** Heartbeat bash-fact fields, inside the frame's `bash` object. */
+const HEARTBEAT_BASH_FIELDS = ["handles", "cell_handles", "buffered_bytes", "pipe_pending"] as const;
+
+function isCounterField(value: unknown): boolean {
+	// Number.isInteger rejects NaN and Infinity, which a JSON literal (`1e999`) can still carry.
+	return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+/**
+ * Why one heartbeat frame is unacceptable, or undefined. Field validation lives here rather than
+ * in `invalidProtocolFrameReason` because the answer is different: a malformed liveness frame is
+ * rejected and counted, never escalated into killing the kernel it is describing (B8).
+ */
+function heartbeatFrameProblem(event: Record<string, unknown>): string | undefined {
+	for (const field of HEARTBEAT_COUNTER_FIELDS) {
+		if (!isCounterField(event[field])) {
+			return `heartbeat field ${field} is not a non-negative integer`;
+		}
+	}
+	if (event.interval_ms === 0) {
+		return "heartbeat field interval_ms must be positive";
+	}
+	const bash = event.bash;
+	if (!isRecord(bash)) {
+		return "heartbeat field bash is not an object";
+	}
+	for (const field of HEARTBEAT_BASH_FIELDS) {
+		if (!isCounterField(bash[field])) {
+			return `heartbeat field bash.${field} is not a non-negative integer`;
+		}
+	}
+	const id = event.id;
+	if (id !== null && id !== undefined && (typeof id !== "string" || id === "")) {
+		return "heartbeat field id is neither a non-empty string nor null";
+	}
+	return undefined;
+}
+
+/** Build the retained sample for a frame that passed {@link heartbeatFrameProblem}. */
+function heartbeatSample(event: Record<string, unknown>, receivedAt: number): KernelLivenessSample {
+	const bash = event.bash as Record<string, number>;
+	const id = event.id;
+	return {
+		receivedAt,
+		tick: event.tick as number,
+		intervalMs: event.interval_ms as number,
+		...(typeof id === "string" && id.length > 0 ? { cellId: id } : {}),
+		cpuMs: event.cpu_ms as number,
+		streamBytes: event.stream_bytes as number,
+		cellsDone: event.cells_done as number,
+		hostRequests: event.host_requests as number,
+		bashHandles: bash.handles,
+		bashCellHandles: bash.cell_handles,
+		bashBufferedBytes: bash.buffered_bytes,
+		bashPipePending: bash.pipe_pending,
+	};
+}
+
+/**
+ * Whether a raw line that failed to parse was meant to be a heartbeat. A non-finite number
+ * (`NaN`, `Infinity`) is legal Python json but not legal JSON, so a runtime that lost its strict
+ * serialization gate produces a line JSON.parse rejects: that has to cost one frame, not the
+ * kernel (B8), which means recognizing it before the corruption path can claim it.
+ */
+function isHeartbeatLine(line: string): boolean {
+	return /^\{\s*"event"\s*:\s*"heartbeat"/.test(line);
 }
 
 /**
@@ -237,7 +346,19 @@ export class ReplKernelManager {
 	/** Unattributed stream text that arrived between cells; surfaced on the next execution. */
 	private pendingBackgroundOutput = "";
 	private pendingBackgroundOutputTruncated = false;
-	private readonly inFlightHostRequests = new Set<Promise<void>>();
+	/**
+	 * In-flight host requests, valued with the epoch ms each one started at: the vouch bounds a
+	 * request's age, so a handler that wedged stops excusing silence instead of vouching for the
+	 * whole exemption budget.
+	 */
+	private readonly inFlightHostRequests = new Map<Promise<void>, number>();
+	/** Retained heartbeat samples, newest first; at most KERNEL_LIVENESS_MAX_SAMPLES of them. */
+	private readonly livenessSamples: KernelLivenessSample[] = [];
+	/** Heartbeat frames rejected for a bad shape. Counted, never fatal (B4/B8). */
+	private rejectedHeartbeatFrames = 0;
+	private consecutiveRejectedHeartbeatFrames = 0;
+	/** Well-formed frames dropped for arriving inside the minimum sample gap. */
+	private throttledHeartbeatFrames = 0;
 	/** Aborts every in-flight host request (e.g. admitted rlm.run children) on teardown. */
 	private hostRequestController = new AbortController();
 	private state: "idle" | "starting" | "running" | "shutdown" = "idle";
@@ -303,6 +424,109 @@ export class ReplKernelManager {
 	/** Protocol version the running kernel announced; undefined until ready. */
 	get negotiatedProtocol(): number | undefined {
 		return this.negotiatedCapabilities?.protocol;
+	}
+
+	/**
+	 * Liveness facts from the kernel's heartbeat frames: the two newest samples plus the frame
+	 * counters. Diagnostic and stall-watchdog only - a heartbeat never reaches a cell's output,
+	 * `onStream`, or the model context. `latest` is absent until the first frame is accepted and
+	 * forever absent for a kernel that negotiated protocol 3 (it sends none), which readers must
+	 * treat as "no facts", never as "dead" and never as "vouched".
+	 */
+	get kernelLiveness(): KernelLiveness {
+		const [latest, previous] = this.livenessSamples;
+		return {
+			...(this.negotiatedProtocol === undefined ? {} : { protocol: this.negotiatedProtocol }),
+			...(latest ? { latest } : {}),
+			...(previous ? { previous } : {}),
+			rejectedFrames: this.rejectedHeartbeatFrames,
+			consecutiveRejectedFrames: this.consecutiveRejectedHeartbeatFrames,
+			throttledFrames: this.throttledHeartbeatFrames,
+		};
+	}
+
+	/** Host requests the kernel is waiting on, counted by the side that owns answering them. */
+	get hostRequestCount(): number {
+		return this.inFlightHostRequests.size;
+	}
+
+	/**
+	 * Age in ms of the oldest in-flight host request; undefined when none is in flight. Bounds how
+	 * long one request may vouch for silence (a `run(uv)` with no timeout would otherwise hold the
+	 * whole exemption budget).
+	 */
+	get hostRequestOldestAgeMs(): number | undefined {
+		let oldest: number | undefined;
+		for (const startedAt of this.inFlightHostRequests.values()) {
+			if (oldest === undefined || startedAt < oldest) oldest = startedAt;
+		}
+		return oldest === undefined ? undefined : Math.max(0, Date.now() - oldest);
+	}
+
+	/** Whether a cell is executing right now, from the host side of the request. */
+	get hasActiveExecution(): boolean {
+		return this.activeExecution !== undefined;
+	}
+
+	/** Kernel process id while the child is alive; scopes journaled bash facts to this kernel. */
+	get kernelPid(): number | undefined {
+		return this.child?.pid;
+	}
+
+	/**
+	 * Whether the newest heartbeat reports live `bash()` handles. Deliberately not folded into the
+	 * session's `isBashRunning`, which reports the host's own bash tool: a kernel handle has a
+	 * different owner, and that field's meaning is already read by the UI.
+	 */
+	get isKernelBashRunning(): boolean {
+		return (this.livenessSamples[0]?.bashHandles ?? 0) > 0;
+	}
+
+	/**
+	 * Accept one heartbeat frame as liveness evidence, or reject and count it.
+	 *
+	 * Rejection never escalates to `failProtocolFrame`: the heartbeat describes the kernel, and
+	 * killing a kernel over one malformed diagnostic frame is the failure mode this channel exists
+	 * to prevent (B8). Rejections are counted and logged, so a runtime that lost its strict
+	 * serialization gate is loud rather than silently aging into the degraded path (B4).
+	 */
+	private recordHeartbeatFrame(event: Record<string, unknown>): void {
+		const problem = heartbeatFrameProblem(event);
+		if (problem) {
+			this.rejectHeartbeatFrame(problem);
+			return;
+		}
+		const now = Date.now();
+		const latest = this.livenessSamples[0];
+		if (latest && now - latest.receivedAt < KERNEL_LIVENESS_MIN_SAMPLE_GAP_MS) {
+			// Well-formed, but too close to the retained sample to add a fact: keeping the newer
+			// one out of the diff pair bounds the host's work no matter how fast a kernel sends.
+			// The retained sample stays under a second old, so throttling cannot age it into
+			// looking stale.
+			this.throttledHeartbeatFrames++;
+			return;
+		}
+		this.livenessSamples.unshift(heartbeatSample(event, now));
+		if (this.livenessSamples.length > KERNEL_LIVENESS_MAX_SAMPLES) {
+			this.livenessSamples.pop();
+		}
+		this.consecutiveRejectedHeartbeatFrames = 0;
+	}
+
+	private rejectHeartbeatFrame(reason: string): void {
+		this.rejectedHeartbeatFrames++;
+		this.consecutiveRejectedHeartbeatFrames++;
+		const streak = this.consecutiveRejectedHeartbeatFrames;
+		// First rejection of a streak is always logged; after that, once per N so a runtime that
+		// broke its serializer cannot bury the stall diagnostics it is supposed to inform.
+		if (streak !== 1 && streak % KERNEL_LIVENESS_REJECT_LOG_EVERY !== 0) return;
+		kernelLog.warn("kernel heartbeat frame rejected", {
+			reason,
+			consecutiveRejectedFrames: streak,
+			rejectedFrames: this.rejectedHeartbeatFrames,
+			kernelPid: this.child?.pid,
+			sessionId: this.options.sessionId,
+		});
 	}
 
 	private appendKernelDiagnostic(message: string): void {
@@ -567,6 +791,13 @@ export class ReplKernelManager {
 				try {
 					event = JSON.parse(line);
 				} catch {
+					if (isHeartbeatLine(line)) {
+						// A non-finite number is legal Python json but not legal JSON, so a runtime
+						// that lost its strict serialization gate lands here. It was describing the
+						// kernel's own health: cost one frame, never the kernel (B8).
+						this.rejectHeartbeatFrame(`unparseable heartbeat line: ${line.slice(0, 200)}`);
+						continue;
+					}
 					this.failProtocolFrame(child, `unparseable protocol line: ${line.slice(0, 200)}`);
 					return;
 				}
@@ -574,7 +805,7 @@ export class ReplKernelManager {
 					this.failProtocolFrame(child, `non-object protocol line: ${line.slice(0, 200)}`);
 					return;
 				}
-				const invalidReason = invalidProtocolFrameReason(event);
+				const invalidReason = invalidProtocolFrameReason(event, this.negotiatedProtocol);
 				if (invalidReason) {
 					this.failProtocolFrame(child, `${invalidReason}: ${line.slice(0, 200)}`);
 					return;
@@ -892,6 +1123,13 @@ export class ReplKernelManager {
 		}
 		if (type === "host_request") {
 			if (typeof event.id === "string") this.startHostRequest(event.id, event.data);
+			return;
+		}
+		if (type === "heartbeat") {
+			// Dispatched before id attribution on purpose: a heartbeat is a fact about the kernel,
+			// not about a cell, so it must never be merged into an execution's streams, handed to
+			// onStream, or buffered as background output.
+			this.recordHeartbeatFrame(event);
 			return;
 		}
 
@@ -1345,7 +1583,11 @@ export class ReplKernelManager {
 		}
 
 		const signal = this.hostRequestController.signal;
-		const task = (async () => {
+		const startedAt = Date.now();
+		// The handler starts on a microtask so the request is registered first: a handler that
+		// blocks before its first await is still counted, and still has an age, from the moment
+		// the request was accepted.
+		const task: Promise<void> = Promise.resolve().then(async () => {
 			try {
 				const result = await this.handleHostRequest(data, signal);
 				try {
@@ -1369,8 +1611,8 @@ export class ReplKernelManager {
 					);
 				}
 			}
-		})();
-		this.inFlightHostRequests.add(task);
+		});
+		this.inFlightHostRequests.set(task, startedAt);
 		void task.finally(() => {
 			this.inFlightHostRequests.delete(task);
 		});
@@ -1432,6 +1674,13 @@ export class ReplKernelManager {
 		// this list, so the clear is hygiene, not correctness — but a future reader must
 		// never be able to combine a new negotiation with a previous child's announcement.
 		this.announcedKernelCapabilities = [];
+		// Liveness facts belong to the child that reported them: a replacement kernel must earn
+		// its own first frame before anything vouches for it again, and a rejection streak from a
+		// broken predecessor must not pre-age the new episode's log throttling.
+		this.livenessSamples.length = 0;
+		this.rejectedHeartbeatFrames = 0;
+		this.consecutiveRejectedHeartbeatFrames = 0;
+		this.throttledHeartbeatFrames = 0;
 		// A replacement kernel is a new episode: its first refused write must be logged again.
 		this.reportedSnapshotSkipReason = undefined;
 		if (child) {
@@ -1532,7 +1781,7 @@ export class ReplKernelManager {
 		let performedCleanup = false;
 		try {
 			if (opts.drainHostRequests) {
-				const inFlightHostRequests = [...this.inFlightHostRequests];
+				const inFlightHostRequests = [...this.inFlightHostRequests.keys()];
 				if (inFlightHostRequests.length > 0) {
 					await this.waitForHostRequestsToSettle(inFlightHostRequests, HOST_REQUEST_SHUTDOWN_TIMEOUT_MS);
 				}
