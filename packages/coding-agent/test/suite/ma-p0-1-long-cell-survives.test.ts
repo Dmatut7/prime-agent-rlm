@@ -316,6 +316,50 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 		).toBe(true);
 	});
 
+	it("reads the journal at the stall stage when the heartbeat goes stale mid-turn", async () => {
+		const reads: (number | undefined)[] = [];
+		let heartbeatAlive = true;
+		const harness = track(
+			await createHarness({
+				tools: [hangTool],
+				settings: {
+					stallWatchdog: { enabled: true, warnAfterSeconds: 0.2, abortAfterSeconds: 0.4 },
+					retry: { enabled: false },
+				},
+				stallKernelLivenessFacts: () => ({
+					protocol: 4,
+					// Alive: fresh frames, frozen tick, no handles - nothing to vouch with.
+					// Stale: the newest frame is a minute old, i.e. twelve of its own intervals.
+					latest: sample(
+						heartbeatAlive ? { tick: 10 } : { receivedAt: Date.now() - 60_000, tick: 10, intervalMs: 5_000 },
+					),
+					previous: sample({ receivedAt: Date.now() - 5_000, tick: 10 }),
+					rejectedFrames: 0,
+					consecutiveRejectedFrames: 0,
+					hostRequestCount: 0,
+					kernelPid: 4242,
+					hasActiveExecution: true,
+				}),
+				stallJournaledBashHandles: (kernelPid) => {
+					reads.push(kernelPid);
+					return { liveBashHandles: 1 };
+				},
+			}),
+		);
+		await startHungTurn(harness);
+		// The kernel stops reporting part-way through the turn: from here the journal is the only
+		// source of bash facts, and the stage handler is the only thing left that reads it.
+		heartbeatAlive = false;
+		expect(reads).toEqual([]);
+
+		await waitForEvent(harness, (event) => event.type === "stall_warning");
+		await new Promise((resolve) => setTimeout(resolve, 1_000));
+
+		expect(reads).toContain(4242);
+		// The read landed in time for the abort check that follows the warning, so the turn lives.
+		expect(harness.eventsOfType("stall_abort")).toEqual([]);
+	});
+
 	it("honours the settings kill switch", async () => {
 		const harness = track(
 			await createHarness({
