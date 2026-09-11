@@ -31,6 +31,12 @@ export const DEFAULT_STALL_ABORT_AFTER_SECONDS = 900;
  */
 export const DEFAULT_KERNEL_BOOTSTRAP_LOCK_TIMEOUT_MS = 300_000;
 
+/**
+ * Hours a failed session-worker registration is kept before the supervisor's
+ * reaper archives it to the daemon log and removes the descriptor (C17).
+ */
+export const DEFAULT_FAILED_WORKER_REAP_HOURS = 24;
+
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
 	reserveTokens?: number; // default: 16384
@@ -79,6 +85,21 @@ export interface StallWatchdogSettings {
 }
 
 /**
+ * Whether a queued subagent message may wake a session whose input pump was
+ * suspended (a user Esc or a stall-watchdog kill).
+ * - "never": nothing wakes the pump; queued work waits for user input, an attach
+ *   or an explicit resume, and undeliverable terminal notices are persisted.
+ * - "failure_aggregated" (default): only failure-class terminal notices wake it,
+ *   as one aggregated turn per quiet window, so Esc keeps meaning "stop".
+ * - "always": every queued agent message wakes the pump (the pre-P0-3 behaviour).
+ */
+export type SubagentWakePolicy = "never" | "failure_aggregated" | "always";
+
+export interface SubagentWakeSettings {
+	policy?: SubagentWakePolicy; // default: "failure_aggregated"
+}
+
+/**
  * Kernel venv bootstrap knobs. `lockTimeoutMs` bounds how long a boot waits for
  * the machine-wide bootstrap lock; 0 disables the bound (today's unbounded
  * wait), matching the `tools.bashTimeoutSeconds` / `extensionHandlerTimeoutMs`
@@ -86,6 +107,32 @@ export interface StallWatchdogSettings {
  */
 export interface KernelBootstrapSettings {
 	lockTimeoutMs?: number; // default: 300000 (5 min); 0 waits forever
+}
+
+/**
+ * Daemon supervisor policy knobs. Every default is the shipped behaviour, so an
+ * absent `daemon` section changes nothing.
+ */
+export interface DaemonSettings {
+	/**
+	 * What a client does when it detects a gap inside one daemon event generation.
+	 * "log" records the gap only; "recover" also re-pulls the session snapshot.
+	 * Default: "log" — flipping to "recover" is gated on a zero-false-positive
+	 * observation window.
+	 */
+	eventGapRecovery?: "log" | "recover"; // default: "log"
+	/**
+	 * Exit(1) once this many unhandled rejections land inside one hour. Unset or 0
+	 * keeps the shipped log-and-isolate behaviour (C18 default: off).
+	 */
+	supervisorRejectionExitThreshold?: number; // default: off
+	/**
+	 * Hours a failed worker registration is kept before the reaper archives and
+	 * removes it. Default: 24; 0 or negative keeps failed workers forever.
+	 */
+	failedWorkerReapHours?: number; // default: 24
+	/** Set false to disable the failed-worker reaper entirely. Default: true. */
+	failedWorkerReapEnabled?: boolean; // default: true
 }
 
 export interface TerminalSettings {
@@ -201,7 +248,9 @@ export interface Settings {
 	theme?: string;
 	compaction?: CompactionSettings;
 	stallWatchdog?: StallWatchdogSettings;
+	subagentWake?: SubagentWakeSettings;
 	kernelBootstrap?: KernelBootstrapSettings;
+	daemon?: DaemonSettings;
 	autoRefine?: AutoRefineSettings;
 	agentTraces?: AgentTracesSettings;
 	telemetry?: TelemetrySettings;
@@ -1021,6 +1070,42 @@ export class SettingsManager {
 		return {
 			lockTimeoutMs: normalizeKernelBootstrapLockTimeoutMs(this.settings.kernelBootstrap?.lockTimeoutMs),
 		};
+	}
+
+	/**
+	 * Daemon supervisor policy (event-gap recovery mode, crash-handler threshold,
+	 * failed-worker reaper). `failedWorkerReapHours` is undefined when reaping is
+	 * disabled, so callers have a single value to test.
+	 */
+	getDaemonSupervisorSettings(): {
+		eventGapRecovery: "log" | "recover";
+		rejectionExitThreshold: number | undefined;
+		failedWorkerReapHours: number | undefined;
+	} {
+		const daemon = this.settings.daemon;
+		const threshold = daemon?.supervisorRejectionExitThreshold;
+		const reapHours = daemon?.failedWorkerReapHours;
+		const reapingDisabled =
+			daemon?.failedWorkerReapEnabled === false ||
+			(typeof reapHours === "number" && Number.isFinite(reapHours) && reapHours <= 0);
+		return {
+			eventGapRecovery: daemon?.eventGapRecovery === "recover" ? "recover" : "log",
+			rejectionExitThreshold:
+				typeof threshold === "number" && Number.isFinite(threshold) && threshold > 0
+					? Math.floor(threshold)
+					: undefined,
+			failedWorkerReapHours: reapingDisabled
+				? undefined
+				: typeof reapHours === "number" && Number.isFinite(reapHours)
+					? reapHours
+					: DEFAULT_FAILED_WORKER_REAP_HOURS,
+		};
+	}
+
+	/** Wake policy for agent messages queued into a session whose pump is suspended. */
+	getSubagentWakePolicy(): SubagentWakePolicy {
+		const policy = this.settings.subagentWake?.policy;
+		return policy === "never" || policy === "always" ? policy : "failure_aggregated";
 	}
 
 	getRetrySettings(): { enabled: boolean; maxRetries: number; baseDelayMs: number } {
