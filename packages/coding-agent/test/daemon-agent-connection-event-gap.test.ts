@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
+import type { AgentConnectionEvent } from "../src/modes/agent-connection/types.js";
 import type {
 	DaemonClientCloseListener,
 	DaemonClientMessageListener,
@@ -119,7 +120,9 @@ function resyncFrame(sequence: number): DaemonOutbound {
 	return { type: "session_resynced", activeSessionId, snapshot };
 }
 
-function startConnection(options: { eventGapRecovery?: "log" | "recover" } = {}) {
+function startConnection(
+	options: { eventGapRecovery?: "log" | "recover"; snapshotRecoveryRetryDelaysMs?: readonly number[] } = {},
+) {
 	const transport = new FakeTransport();
 	const connection = new DaemonAgentConnection(transport, activeSessionId, options);
 	return { transport, connection };
@@ -231,6 +234,34 @@ describe("T3-2 daemon event sequence gap detection", () => {
 		expect(repulls.length).toBeGreaterThan(0);
 		expect(repulls).toHaveLength(1);
 		expect(connection.eventGapDiagnostics.recoveryInFlight).toBe(true);
+		connection.dispose();
+	});
+
+	it("releases the single-flight flag once a bounded re-pull gives up", async () => {
+		const { transport, connection } = startConnection({
+			eventGapRecovery: "recover",
+			snapshotRecoveryRetryDelaysMs: [0, 0],
+		});
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+		transport.emit(sequencedEvent(5));
+		await settled();
+		transport.emit(sequencedEvent(9));
+		// The fixture transport fails every request, so the bounded re-pull spends its
+		// whole budget and reports the terminal close M9 reserves for that case.
+		for (let round = 0; round < 40 && connection.eventGapDiagnostics.recoveryInFlight; round++) {
+			await settled();
+		}
+		expect(connection.eventGapDiagnostics.detected).toBe(1);
+		// The re-pull is detached, so it must settle the flag itself: a flag left set
+		// would make the detector deaf to every later hole on this connection.
+		expect(connection.eventGapDiagnostics.recoveryInFlight).toBe(false);
+		const closed = events.find(
+			(event): event is Extract<AgentConnectionEvent, { type: "closed" }> => event.type === "closed",
+		);
+		expect(closed?.error).toContain("after 3 attempts");
 		connection.dispose();
 	});
 });

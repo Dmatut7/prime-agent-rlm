@@ -2552,9 +2552,17 @@ export class DaemonAgentConnection implements AgentConnection {
 			}
 			this.eventGapInFlight = true;
 			this.appendEventGapLog(`${detail}; re-pulling the session`);
-			void this.recoverFailedSnapshot("resync", new Error(detail)).finally(() => {
-				this.eventGapInFlight = false;
-			});
+			// The catch is not optional: a rejection here would be an unhandled one,
+			// which is exactly what the supervisor's crash handlers exist to isolate.
+			void this.recoverFailedSnapshot("resync", new Error(detail))
+				.catch((error: unknown) => {
+					this.appendEventGapLog(
+						`${detail}; re-pull failed: ${error instanceof Error ? error.message : String(error)}`,
+					);
+				})
+				.finally(() => {
+					this.eventGapInFlight = false;
+				});
 			return;
 		}
 		const now = Date.now();
