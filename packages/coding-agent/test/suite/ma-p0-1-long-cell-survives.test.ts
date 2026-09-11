@@ -269,6 +269,53 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 		expect(harness.eventsOfType("stall_abort")).toEqual([]);
 	});
 
+	it("falls back to the journaled bash handles when the kernel reports no heartbeat", async () => {
+		const reads: (number | undefined)[] = [];
+		const harness = track(
+			await createHarness({
+				tools: [hangTool],
+				settings: {
+					stallWatchdog: { enabled: true, warnAfterSeconds: 0.05, abortAfterSeconds: 0.1 },
+					retry: { enabled: false },
+				},
+				// A protocol-3 kernel: no frames at all, so the only bash fact left is the journal
+				// (B4's degraded path, which must engage and must not be silent).
+				stallKernelLivenessFacts: () => ({
+					protocol: 3,
+					rejectedFrames: 0,
+					consecutiveRejectedFrames: 0,
+					hostRequestCount: 0,
+					kernelPid: 4242,
+					hasActiveExecution: true,
+				}),
+				stallJournaledBashHandles: (kernelPid) => {
+					reads.push(kernelPid);
+					return { liveBashHandles: 2 };
+				},
+			}),
+		);
+		await startHungTurn(harness);
+
+		const warning = await waitForEvent(harness, (event) => event.type === "stall_warning");
+		if (warning.type !== "stall_warning") throw new Error("unreachable");
+		// The read happened when the tool started, so the first warning can already vouch instead
+		// of promising an abort that the next sampling would defer.
+		expect(reads).toContain(4242);
+		expect(warning.message).toContain("deferred");
+		expect(warning.diagnostics.exemption).toMatchObject({ reason: "vouched", tier: "liveness" });
+		expect(warning.diagnostics.exemption?.reasons).toContain("degraded_journal");
+		expect(warning.diagnostics.kernel).toMatchObject({ protocol: 3, liveBashHandles: 2 });
+		expect(warning.diagnostics.kernel?.reasons).toEqual(["no_kernel_facts"]);
+
+		await new Promise((resolve) => setTimeout(resolve, 800));
+		expect(harness.eventsOfType("stall_abort")).toEqual([]);
+		// A journal record proves existence only: the short tier, and the fallback is logged.
+		expect(
+			entries.some((entry) => entry.msg.includes("fell back to journaled bash handles")),
+			"the degraded path engaged without saying so",
+		).toBe(true);
+	});
+
 	it("honours the settings kill switch", async () => {
 		const harness = track(
 			await createHarness({
