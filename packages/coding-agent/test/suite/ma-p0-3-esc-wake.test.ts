@@ -17,7 +17,11 @@ import {
 	type AgentSessionMessagePayload,
 	createAgentSessionMessage,
 } from "../../src/core/agent-messages.js";
-import { type CustomMessage, RLM_CHILD_FAILURE_CUSTOM_TYPE } from "../../src/core/messages.js";
+import {
+	type CustomMessage,
+	createRlmChildTerminalNoticeMessage,
+	RLM_CHILD_FAILURE_CUSTOM_TYPE,
+} from "../../src/core/messages.js";
 import { createHarness, getAssistantTexts, getUserTexts, type Harness } from "./harness.js";
 
 function gateTool(released: Promise<void>): AgentTool {
@@ -254,6 +258,53 @@ describe("P0-3b Esc, failure wakes and queue pinning", () => {
 		expect(parent.session.isQueuedWorkSuspended).toBe(true);
 		expect(getAssistantTexts(parent)).toEqual([]);
 		expect(failureNotices(parent.session)).toEqual([]);
+	});
+
+	it("keeps the abandonment driver alive for a routine notice left behind by the wake", async () => {
+		const family = await createFailingFamily(1);
+		const { parent } = family;
+		parent.session.requestAbort();
+		// A routine notice sharing the queue with the failure that is about to arrive.
+		parent.session.restorePendingNextTurnMessages([
+			createRlmChildTerminalNoticeMessage({
+				kind: "completed_without_reply",
+				childId: "child-routine",
+				sessionName: "worker-routine",
+			}),
+		]);
+		expect(parent.session.deferredRlmTerminalNoticeSince).toBeTypeOf("number");
+
+		family.release();
+		// Wait for the failure to be deferred, then hold a queued-work pause inside the
+		// aggregation window: the wake folds the failure into its turn, but the pause
+		// stops the wake's flush from delivering the routine notice.
+		await vi.waitFor(
+			() => {
+				expect(parent.session.getPendingNextTurnMessageSnapshots()).toHaveLength(2);
+			},
+			{ timeout: 15_000, interval: 10 },
+		);
+		const pause = parent.session.acquireQueuedWorkPause();
+		try {
+			await vi.waitFor(() => expect(parent.session.isQueuedWorkSuspended).toBe(false), {
+				timeout: 15_000,
+				interval: 20,
+			});
+			// The invariant: a notice still in the queue keeps its deferral stamp, so its
+			// abandonment driver stays armed. Clearing the stamp on the wake path would
+			// strand it forever - pinned residency (FIX-Q2) that can never be dropped
+			// (FIX-Q4).
+			expect(parent.session.getPendingNextTurnMessageSnapshots()).toHaveLength(1);
+			expect(parent.session.deferredRlmTerminalNoticeSince).toBeTypeOf("number");
+		} finally {
+			pause.release();
+		}
+
+		parent.session.requestAbort();
+		parent.session.maybeAbandonStaleDeferredRlmTerminalNotices(Date.now() + 6 * 60_000);
+		expect(parent.session.rlmTerminalNoticeAbandonment).toMatchObject({ count: 1 });
+		expect(parent.session.getPendingNextTurnMessageSnapshots()).toEqual([]);
+		expect(parent.session.isSessionActive).toBe(false);
 	});
 
 	it("keeps queued messages across an evict/rehydrate round trip", async () => {

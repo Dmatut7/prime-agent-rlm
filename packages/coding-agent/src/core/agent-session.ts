@@ -5824,7 +5824,12 @@ export class AgentSession {
 			childIds: notices.map((notice) => (notice.details as { childId?: string } | undefined)?.childId),
 			sinceAbortMs: suspendedSince === undefined ? undefined : Date.now() - suspendedSince,
 		});
-		this._clearRlmTerminalNoticeDeferred();
+		// The folded notices left the queue, but anything still deferred (a routine
+		// completed_without_reply, say) must keep its stamp and its abandonment
+		// driver: clearing unconditionally here would strand it forever, which both
+		// pins the session (FIX-Q2) and makes it undroppable (FIX-Q4).
+		if (this._hasDeferredRlmTerminalNotices()) this._markRlmTerminalNoticeDeferred();
+		else this._clearRlmTerminalNoticeDeferred();
 		this.wakeSuspendedSessionInput();
 	}
 
