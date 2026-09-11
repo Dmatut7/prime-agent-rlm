@@ -10,8 +10,8 @@ import {
 	getGlobalHarnessStateDir,
 	getRefinementFailuresPath,
 	loadHarnessState,
-	type RefinementParseFailureRecord,
-	recordRefinementParseFailure,
+	type RefinementFailureRecord,
+	recordRefinementFailure,
 	refineHarness,
 	reviewAutoRefine,
 } from "../src/core/refinement/index.js";
@@ -65,10 +65,10 @@ function failuresPath(): string {
 	return getRefinementFailuresPath(getGlobalHarnessStateDir());
 }
 
-function readFailureRecords(): RefinementParseFailureRecord[] {
+function readFailureRecords(): RefinementFailureRecord[] {
 	const content = readFileSync(failuresPath(), "utf8");
 	const lines = content.split("\n").filter((line) => line.trim().length > 0);
-	return lines.map((line) => JSON.parse(line) as RefinementParseFailureRecord);
+	return lines.map((line) => JSON.parse(line) as RefinementFailureRecord);
 }
 
 function refineModel(): Model<"openai-completions"> {
@@ -270,8 +270,9 @@ line" },
 
 		await expect(refineWithMockedReply()).rejects.toThrow(/stopped before completing its JSON object/);
 		expect(warn).not.toHaveBeenCalled();
-		// Truncation is still a lost refinement, so the raw reply is preserved.
-		expect(readFailureRecords()[0].raw).toBe(reply);
+		// Truncation is still a lost refinement, so the raw reply is preserved and
+		// flagged as cut off even though the stop reason never said so.
+		expect(readFailureRecords()[0]).toMatchObject({ reason: "parse", truncated: true, raw: reply });
 	});
 });
 
@@ -286,9 +287,11 @@ describe("refinement parse failure evidence", () => {
 		const records = readFailureRecords();
 		expect(records).toHaveLength(1);
 		expect(records[0].source).toBe("refinement");
+		expect(records[0].reason).toBe("parse");
 		expect(records[0].raw).toBe(reply);
 		expect(records[0].rawChars).toBe(reply.length);
 		expect(records[0].truncated).toBe(false);
+		expect(records[0].rawTruncated).toBe(false);
 		expect(records[0].sha256).toBe(sha256(reply));
 		expect(records[0].error).toMatch(/did not return valid JSON/);
 		expect(Number.isNaN(Date.parse(records[0].ts))).toBe(false);
@@ -343,7 +346,8 @@ describe("refinement parse failure evidence", () => {
 		const content = readFileSync(failuresPath(), "utf8");
 		expect(content.trim().split("\n")).toHaveLength(1);
 		const [record] = readFailureRecords();
-		expect(record.truncated).toBe(true);
+		expect(record.rawTruncated).toBe(true);
+		expect(record.truncated).toBe(false);
 		expect(record.rawChars).toBe(reply.length);
 		expect(Buffer.byteLength(record.raw, "utf8")).toBeLessThanOrEqual(RAW_BYTE_LIMIT);
 		expect(reply.startsWith(record.raw)).toBe(true);
@@ -359,7 +363,7 @@ describe("refinement parse failure evidence", () => {
 		await expect(refineWithMockedReply()).rejects.toThrow(/did not return valid JSON/);
 
 		const [record] = readFailureRecords();
-		expect(record.truncated).toBe(true);
+		expect(record.rawTruncated).toBe(true);
 		expect(record.rawChars).toBe(reply.length);
 		expect(Buffer.byteLength(record.raw, "utf8")).toBeLessThanOrEqual(RAW_BYTE_LIMIT);
 		expect(reply.startsWith(record.raw)).toBe(true);
@@ -413,7 +417,7 @@ describe("refinement parse failure evidence", () => {
 		const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
 		try {
 			const harnessStateDir = join(makeTempDir(), "harness");
-			recordRefinementParseFailure('{"edits": [oops]}', new Error("boom"), { harnessStateDir });
+			recordRefinementFailure('{"edits": [oops]}', new Error("boom"), { harnessStateDir });
 			expect(existsSync(getRefinementFailuresPath(harnessStateDir))).toBe(false);
 		} finally {
 			platform.mockRestore();
@@ -424,8 +428,63 @@ describe("refinement parse failure evidence", () => {
 		const harnessStateDir = join(makeTempDir(), "harness");
 		mkdirSync(getRefinementFailuresPath(harnessStateDir), { recursive: true });
 
-		expect(() =>
-			recordRefinementParseFailure('{"edits": [oops]}', new Error("boom"), { harnessStateDir }),
-		).not.toThrow();
+		expect(() => recordRefinementFailure('{"edits": [oops]}', new Error("boom"), { harnessStateDir })).not.toThrow();
+	});
+});
+
+describe("output-budget truncation evidence", () => {
+	const cutReply = `{
+  "summary": "记录老板授权",
+  "rationale": "老板在对话里明确授权",
+  "expectedOutcome": "未来会话直接照办",
+  "edits": [
+    { "action": "create", "kind": "memory", "id": "boss_authorization", "title": "老板授权", "content": "上游反馈帖由根代理自主发`;
+
+	it("preserves the partial reply when the refinement budget is exhausted", async () => {
+		completeSimpleMock.mockResolvedValueOnce({ ...assistantText(cutReply), stopReason: "length" });
+
+		await expect(refineWithMockedReply()).rejects.toThrow(/output budget was exhausted/);
+
+		const [record] = readFailureRecords();
+		expect(record).toMatchObject({
+			source: "refinement",
+			reason: "length",
+			truncated: true,
+			rawTruncated: false,
+			rawChars: cutReply.length,
+			raw: cutReply,
+			sha256: sha256(cutReply),
+		});
+		expect(record.error).toMatch(/output budget was exhausted/);
+		expect(Number.isNaN(Date.parse(record.ts))).toBe(false);
+	});
+
+	it("preserves the partial reply when the auto-refine review budget is exhausted", async () => {
+		const cutReview = '{"shouldRefine": true, "rationale": "老板授权需要跨会话记';
+		completeSimpleMock.mockResolvedValueOnce({ ...assistantText(cutReview), stopReason: "length" });
+
+		await expect(
+			reviewAutoRefine([], loadHarnessState(makeTempDir()), [], refineModel(), "api-key", {
+				reason: "turn_interval",
+				turnsSinceLastReview: 6,
+			}),
+		).rejects.toThrow(/output budget was exhausted/);
+
+		expect(readFailureRecords()[0]).toMatchObject({
+			source: "auto-refine-review",
+			reason: "length",
+			truncated: true,
+			raw: cutReview,
+		});
+	});
+
+	it("appends a length stop and a later parse failure as separate records", async () => {
+		completeSimpleMock.mockResolvedValueOnce({ ...assistantText(cutReply), stopReason: "length" });
+		await expect(refineWithMockedReply()).rejects.toThrow(/output budget was exhausted/);
+		const malformed = '{"edits": [oops]}';
+		completeSimpleMock.mockResolvedValueOnce(assistantText(malformed));
+		await expect(refineWithMockedReply()).rejects.toThrow(/did not return valid JSON/);
+
+		expect(readFailureRecords().map((record) => record.reason)).toEqual(["length", "parse"]);
 	});
 });

@@ -451,21 +451,28 @@ export function getRefinementHistoryPath(harnessStateDir: string = getGlobalHarn
 	return join(harnessStateDir, REFINEMENT_HISTORY_FILE_NAME);
 }
 
-/** Append-only evidence log for model replies that could not be parsed into a refinement. */
+/** Append-only evidence log for model replies lost before becoming a refinement. */
 export function getRefinementFailuresPath(harnessStateDir: string = getGlobalHarnessStateDir()): string {
 	return join(harnessStateDir, REFINEMENT_FAILURES_FILE_NAME);
 }
 
-export type RefinementParseFailureSource = "refinement" | "auto-refine-review";
+export type RefinementFailureSource = "refinement" | "auto-refine-review";
 
-export interface RefinementParseFailureRecord {
+/** Why the reply was lost: it could not be parsed, or the output budget cut it off. */
+export type RefinementFailureReason = "parse" | "length";
+
+export interface RefinementFailureRecord {
 	ts: string;
-	source: RefinementParseFailureSource;
+	source: RefinementFailureSource;
+	reason: RefinementFailureReason;
 	error: string;
-	/** Digest of the full raw reply, so a truncated record still reconciles with a warn log. */
+	/** The reply was cut off: a length stop reason, or a parse diagnosed as incomplete. */
+	truncated: boolean;
+	/** Digest of the full raw reply, so a bounded record still reconciles with a warn log. */
 	sha256: string;
 	rawChars: number;
-	truncated: boolean;
+	/** `raw` is a bounded prefix rather than the whole reply. */
+	rawTruncated: boolean;
 	raw: string;
 }
 
@@ -474,7 +481,7 @@ export interface RefinementParseFailureRecord {
  * exact in UTF-8 bytes (CJK-heavy replies are the common case here) and never
  * cuts a surrogate pair or a multi-byte character in half.
  */
-function boundedRawText(text: string, byteLimit: number): { raw: string; truncated: boolean } {
+function boundedRawText(text: string, byteLimit: number): { raw: string; rawTruncated: boolean } {
 	let bytes = 0;
 	let end = 0;
 	for (const char of text) {
@@ -483,39 +490,48 @@ function boundedRawText(text: string, byteLimit: number): { raw: string; truncat
 		bytes += size;
 		end += char.length;
 	}
-	if (end >= text.length) return { raw: text, truncated: false };
-	return { raw: text.slice(0, end), truncated: true };
+	if (end >= text.length) return { raw: text, rawTruncated: false };
+	return { raw: text.slice(0, end), rawTruncated: true };
 }
 
 /**
- * A parse failure used to leave only the parser's message behind, so a dropped
- * refinement (a durable preference, an authorization) could not be recovered or
- * audited afterwards. Keep the model's own words next to the cause. Evidence is
- * best-effort: a recorder failure must never replace the parse error the caller
- * is about to surface.
+ * A lost refinement used to leave only a parser message or a stop reason behind,
+ * so a dropped durable preference or authorization could not be recovered or
+ * audited afterwards: the error arrived, but nobody could read what the model
+ * had written. Keep the model's own words next to the cause, for both an
+ * unparseable reply and one the output budget cut off. Evidence is best-effort -
+ * a recorder failure must never replace the error the caller is about to surface.
  */
-export function recordRefinementParseFailure(
+export function recordRefinementFailure(
 	rawText: string,
 	error: unknown,
-	options: { source?: RefinementParseFailureSource; harnessStateDir?: string } = {},
+	options: {
+		source?: RefinementFailureSource;
+		reason?: RefinementFailureReason;
+		harnessStateDir?: string;
+	} = {},
 ): void {
 	try {
 		if (!isPersistentHarnessStorageSupported()) return;
 		const harnessStateDir = options.harnessStateDir ?? getGlobalHarnessStateDir();
 		if (validateHarnessDirectory(harnessStateDir)) return;
-		const { raw, truncated } = boundedRawText(rawText, REFINEMENT_FAILURE_RAW_BYTE_LIMIT);
-		const record: RefinementParseFailureRecord = {
+		const message = error instanceof Error ? error.message : String(error);
+		const reason = options.reason ?? "parse";
+		const { raw, rawTruncated } = boundedRawText(rawText, REFINEMENT_FAILURE_RAW_BYTE_LIMIT);
+		const record: RefinementFailureRecord = {
 			ts: now(),
 			source: options.source ?? "refinement",
-			error: error instanceof Error ? error.message : String(error),
+			reason,
+			error: message,
+			truncated: reason === "length" || message.includes(TRUNCATED_JSON_ERROR),
 			sha256: sha256Hex(rawText),
 			rawChars: rawText.length,
-			truncated,
+			rawTruncated,
 			raw,
 		};
 		appendPrivateFile(getRefinementFailuresPath(harnessStateDir), `${JSON.stringify(record)}\n`);
 	} catch {
-		// Losing the evidence is not a reason to lose the parse error too.
+		// Losing the evidence is not a reason to lose the refinement error too.
 	}
 }
 
@@ -940,7 +956,7 @@ export function normalizeRefinementProposal(value: unknown): RefinementProposal 
  */
 function parseModelJsonObject(
 	text: string,
-	source: RefinementParseFailureSource,
+	source: RefinementFailureSource,
 	objectError: string,
 ): Record<string, unknown> {
 	let value: unknown;
@@ -950,7 +966,7 @@ function parseModelJsonObject(
 			throw new Error(objectError);
 		}
 	} catch (error) {
-		recordRefinementParseFailure(text, error, { source });
+		recordRefinementFailure(text, error, { source, reason: "parse" });
 		throw error;
 	}
 	return value as Record<string, unknown>;
@@ -1223,17 +1239,21 @@ export async function planRefinement(
 		{ maxTokens: refinementMaxOutputTokens(model), signal, apiKey, headers },
 	);
 
-	if (response.stopReason === "error") {
-		throw new Error(`Refinement failed: ${response.errorMessage || "Unknown error"}`);
-	}
-	if (response.stopReason === "length") {
-		throw new Error(`Refinement failed: ${TRUNCATED_JSON_ERROR}`);
-	}
-
 	const text = response.content
 		.filter((content): content is { type: "text"; text: string } => content.type === "text")
 		.map((content) => content.text)
 		.join("\n");
+
+	if (response.stopReason === "error") {
+		throw new Error(`Refinement failed: ${response.errorMessage || "Unknown error"}`);
+	}
+	if (response.stopReason === "length") {
+		// An exhausted budget loses the proposal exactly like a parse failure does,
+		// so keep the partial reply: it shows how far the model got.
+		const error = new Error(`Refinement failed: ${TRUNCATED_JSON_ERROR}`);
+		recordRefinementFailure(text, error, { source: "refinement", reason: "length" });
+		throw error;
+	}
 	return { proposal: parseProposal(text), id };
 }
 
@@ -1284,16 +1304,18 @@ ${conversationText}
 		},
 		{ maxTokens: autoRefineReviewMaxOutputTokens(model), signal, apiKey, headers },
 	);
-	if (response.stopReason === "error") {
-		throw new Error(`Auto-refine review failed: ${response.errorMessage || "Unknown error"}`);
-	}
-	if (response.stopReason === "length") {
-		throw new Error(`Auto-refine review failed: ${TRUNCATED_JSON_ERROR}`);
-	}
 	const text = response.content
 		.filter((content): content is { type: "text"; text: string } => content.type === "text")
 		.map((content) => content.text)
 		.join("\n");
+	if (response.stopReason === "error") {
+		throw new Error(`Auto-refine review failed: ${response.errorMessage || "Unknown error"}`);
+	}
+	if (response.stopReason === "length") {
+		const error = new Error(`Auto-refine review failed: ${TRUNCATED_JSON_ERROR}`);
+		recordRefinementFailure(text, error, { source: "auto-refine-review", reason: "length" });
+		throw error;
+	}
 	return parseAutoRefineReview(text);
 }
 
