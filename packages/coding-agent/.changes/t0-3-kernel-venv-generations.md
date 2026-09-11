@@ -1,0 +1,4 @@
+- Changed kernel bootstrap to build each runtime identity into its own versioned venv directory (`kernel-venv-<hash>`), so rebuilding after a runtime change no longer deletes the venv that other running kernels are using.
+- Added garbage collection for kernel venv generations: a generation with no live kernel reference is reclaimed (one unreferenced copy is retained), and a generation that still has references is never renamed, rebuilt, or deleted.
+- Added an explicit `venv rebuild deferred: N kernels in use` error for the rare rebuild of an in-use generation, replacing a silent `rm -rf` of a venv other sessions were running from.
+- Added a one-time bootstrap note pointing at the pre-generation `~/.prime/agent/kernel-venv` directory, which is left untouched and can be removed to reclaim disk space.
