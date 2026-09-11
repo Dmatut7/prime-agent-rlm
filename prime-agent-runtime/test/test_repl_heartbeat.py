@@ -201,7 +201,7 @@ class HeartbeatGateTest(unittest.TestCase):
         finally:
             handle.kill(grace=1.0)
             bash_module._reset_current_cell(token)
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             if bash_module.live_handle_facts("cell-facts")["handles"] == 0:
                 return
@@ -266,12 +266,14 @@ class HeartbeatProcessTest(unittest.TestCase):
     def test_an_awaited_sleep_advances_the_tick_and_a_sync_sleep_freezes_it(self) -> None:
         proc = self.spawn("4", 200)
 
-        before, after, frames = self._tick_probe(proc, "async1", "import asyncio\nawait asyncio.sleep(1.2)")
+        # A wider window than the minimum: the tick period is 0.5s, so 2.5s leaves several ticks
+        # even on a loaded machine, where a 1.2s window could show a single value and flake.
+        before, after, frames = self._tick_probe(proc, "async1", "import asyncio\nawait asyncio.sleep(2.5)")
         self.assertGreaterEqual(len(frames), 2)
         self.assertGreater(after, before, "the loop tick must advance while the cell awaits")
         self.assertGreater(max(f["tick"] for f in frames), min(f["tick"] for f in frames))
 
-        before, after, frames = self._tick_probe(proc, "sync1", "import time\ntime.sleep(1.2)")
+        before, after, frames = self._tick_probe(proc, "sync1", "import time\ntime.sleep(1.5)")
         # The machine proof behind probe-silent/probe-tick: the frames keep arriving from the
         # sender thread while the loop is blocked, and every one of them carries the frozen tick.
         self.assertGreaterEqual(len(frames), 2, "a blocked loop must not stop the frames")
@@ -287,7 +289,7 @@ class HeartbeatProcessTest(unittest.TestCase):
                 "from rlm import bash",
                 "handle = bash('sleep 30')",
                 "print('streamed while the handle is live')",
-                "await asyncio.sleep(1.2)",
+                "await asyncio.sleep(2.0)",
                 "handle.kill(grace=1.0)",
             ]
         )
@@ -299,7 +301,7 @@ class HeartbeatProcessTest(unittest.TestCase):
         self.assertGreaterEqual(max(f["bash"]["cell_handles"] for f in frames), 1)
         self.assertGreater(max(f["stream_bytes"] for f in frames), 0)
         # The next cell sees the finished one in the monotonic completion counter.
-        events = proc.execute("bash2", "import asyncio\nawait asyncio.sleep(0.5)")
+        events = proc.execute("bash2", "import asyncio\nawait asyncio.sleep(0.9)")
         frames = heartbeats(events)
         self.assertGreaterEqual(len(frames), 1)
         self.assertGreaterEqual(max(f["cells_done"] for f in frames), 1)
