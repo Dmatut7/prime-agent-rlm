@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { DaemonResponse } from "../src/modes/daemon/daemon-protocol.js";
+import { DEFAULT_PENDING_DELIVERY_CAPACITY, PendingDeliveryQueue } from "../src/modes/daemon/pending-delivery-queue.js";
 import {
 	disposeSupervisorHarnesses,
 	type SupervisorHarness,
@@ -7,20 +8,36 @@ import {
 } from "./fixtures/supervisor-harness.js";
 
 /**
- * P1-7c, first half. A `send_message` was a fence-gated mutation, so one
- * delivery whose target took a while to hydrate held the update-restart drain
- * latch and failed the whole prepare at 80s — the drain timeout, not the
- * delivery, was what the operator saw. A long delivery is exempt from the latch;
- * the second half of this change (the pending-delivery queue that tracks it and
- * receipts it at a restart) has its own cases below.
+ * P1-7c. A `send_message` was a fence-gated mutation, so one delivery whose
+ * target took a while to hydrate held the update-restart drain latch and failed
+ * the whole prepare at 80s. The delivery is now tracked in a pending-delivery
+ * queue and exempt from the latch, which means two things have to stay true: a
+ * real mutation still gates the drain (otherwise the latch is simply gone), and
+ * a delivery the supervisor owns never disappears without its sender hearing
+ * about it (B10/F10).
  */
 
 afterEach(async () => {
 	await disposeSupervisorHarnesses();
 });
 
-async function twoSessionHarness(prefix: string, hangWorkerCommands: readonly string[]): Promise<SupervisorHarness> {
-	const harness = await startSupervisorHarness({ prefix, sessionCount: 2, hangWorkerCommands });
+const DRAIN_TIMEOUT_MS = 500;
+
+async function twoSessionHarness(
+	prefix: string,
+	hangWorkerCommands: readonly string[],
+	capacity?: number,
+): Promise<SupervisorHarness> {
+	const harness = await startSupervisorHarness({
+		prefix,
+		sessionCount: 2,
+		hangWorkerCommands,
+		supervisorOptions: {
+			updateRestartDrainTimeoutMs: DRAIN_TIMEOUT_MS,
+			pendingDeliveryRetryIntervalMs: 25,
+			...(capacity === undefined ? {} : { pendingDeliveryCapacity: capacity }),
+		},
+	});
 	await harness.waitForWorkerReady();
 	return harness;
 }
@@ -48,17 +65,23 @@ describe("P1-7c send_message and the update-restart drain", () => {
 		await harness.settle(300);
 
 		const startedAt = Date.now();
-		const prepare = await harness.request({ type: "prepare_update_restart" }, 10_000);
+		const prepare = await harness.request({ type: "prepare_update_restart" }, 20_000);
 		const elapsedMs = Date.now() - startedAt;
 
-		// RED on HEAD: the delivery held the latch and the prepare died on the drain
-		// timeout instead of reaching the workers.
-		expect(elapsedMs).toBeLessThan(5_000);
+		// RED on HEAD: the send held the latch and the prepare died on the drain timeout.
+		expect(elapsedMs).toBeLessThan(DRAIN_TIMEOUT_MS * 4);
 		expect(prepare).toMatchObject({ success: false });
 		expect(failureText(prepare)).not.toContain("Timed out draining daemon mutations");
-		// It got all the way to fencing the workers, where the fixture worker's
-		// manifest-less answer stops it.
+		// The prepare got all the way to fencing the workers, which is where the
+		// fixture worker's manifest-less answer stops it.
 		expect(failureText(prepare)).toContain("invalid update manifest");
+
+		// B10: the drained delivery answers its sender instead of evaporating.
+		const sendResponse = await send;
+		expect(sendResponse).toMatchObject({ success: false });
+		expect(failureText(sendResponse)).toContain("was not delivered");
+		expect(failureText(sendResponse)).toContain("update restart");
+		expect(harness.logText()).toContain("drained 1 pending agent-message delivery");
 	});
 
 	it("still waits for a hanging mutation that is not a delivery", async () => {
@@ -67,14 +90,108 @@ describe("P1-7c send_message and the update-restart drain", () => {
 		void abort.catch(() => undefined);
 		await harness.settle(300);
 
-		// Positive control: the latch was not simply removed. The drain still waits
-		// for a real mutation, so the caller's own budget runs out first.
-		const prepare = await harness.request({ type: "prepare_update_restart" }, 1_500).then(
-			(response) => ({ kind: "response" as const, response }),
-			(error: unknown) => ({ kind: "error" as const, error: error as Error }),
-		);
+		const startedAt = Date.now();
+		const prepare = await harness.request({ type: "prepare_update_restart" }, 20_000);
+		const elapsedMs = Date.now() - startedAt;
 
-		expect(prepare.kind).toBe("error");
-		expect(prepare.kind === "error" && prepare.error.message).toContain("prepare_update_restart");
+		// Positive control: the latch was not simply removed.
+		expect(elapsedMs).toBeGreaterThanOrEqual(DRAIN_TIMEOUT_MS);
+		expect(prepare).toMatchObject({ success: false });
+		expect(failureText(prepare)).toContain("Timed out draining daemon mutations");
+	});
+
+	it("requeues a delivery whose target is unreachable and receipts it at restart", async () => {
+		const harness = await twoSessionHarness("ma-t4-3-requeue-", []);
+		// The worker drops off its socket, so the target is recovering: the state a
+		// delivery used to fail on immediately.
+		await harness.worker?.close();
+		await harness.waitForDescriptorLifecycle("recovering");
+
+		const send = harness.request(deliveryCommand(harness, "come back later"), 30_000);
+		void send.catch(() => undefined);
+		await harness.settle(300);
+		expect(harness.logText()).toContain("deliver message requeued");
+
+		const prepare = await harness.request({ type: "prepare_update_restart" }, 20_000);
+		expect(prepare.success).toBe(false);
+
+		const sendResponse = await send;
+		expect(sendResponse).toMatchObject({ success: false });
+		expect(failureText(sendResponse)).toContain("was not delivered");
+		// The retry loop stopped at the drain instead of requeueing forever.
+		expect(harness.logText()).toContain("deliver message dropped");
+	});
+
+	it("rejects a delivery past the per-session capacity with an actionable hint", async () => {
+		const harness = await twoSessionHarness("ma-t4-3-capacity-", ["worker_deliver_message"], 2);
+		for (let index = 0; index < 2; index++) {
+			const request = harness.request(deliveryCommand(harness, `held ${index}`), 5_000);
+			void request.catch(() => undefined);
+		}
+		await harness.settle(400);
+
+		// A short budget on purpose: the rejection carries a 5s retry hint, and a
+		// client with room to wait would honour it instead of surfacing the rejection.
+		const rejected = await harness
+			.request(deliveryCommand(harness, "one too many"), 1_000)
+			.then(() => undefined)
+			.catch((error: unknown) => error as Error);
+
+		expect(rejected?.name).toBe("DaemonRequestTimeoutError");
+		expect(rejected?.message).toContain("kept deferring the command");
+		expect(harness.logText()).toContain("deliver queue overflow");
+	});
+});
+
+describe("P1-7c pending delivery queue", () => {
+	it("bounds one target's pending set and counts the overflow", () => {
+		const queue = new PendingDeliveryQueue({ capacity: 2, deliveryBudgetMs: 1_000, now: () => 5_000 });
+		const first = queue.admit("target-a", "sender-a");
+		const second = queue.admit("target-a", "sender-b");
+		expect(first.ok).toBe(true);
+		expect(second.ok).toBe(true);
+		expect(queue.depth("target-a")).toBe(2);
+		// A different target has its own budget.
+		expect(queue.admit("target-b", "sender-a").ok).toBe(true);
+
+		const third = queue.admit("target-a", "sender-c");
+		expect(third.ok).toBe(false);
+		if (third.ok) throw new Error("unreachable");
+		expect(third).toMatchObject({ reason: "capacity", queueDepth: 2, capacity: 2 });
+		expect(queue.counters.overflow).toBe(1);
+		expect(queue.size()).toBe(3);
+		expect(DEFAULT_PENDING_DELIVERY_CAPACITY).toBe(100);
+	});
+
+	it("carries a deadline and aborts every entry exactly once on drain", async () => {
+		const queue = new PendingDeliveryQueue({ capacity: 5, deliveryBudgetMs: 60_000, now: () => 1_000 });
+		const admitted = queue.admit("target-a", "sender-a");
+		if (!admitted.ok) throw new Error("admission failed");
+		expect(admitted.entry.deadlineAt).toBe(61_000);
+		expect(admitted.entry.enqueuedAt).toBe(1_000);
+
+		const drained = queue.drain("update_restart");
+		expect(drained).toHaveLength(1);
+		expect(queue.size()).toBe(0);
+		expect(queue.counters.drained).toBe(1);
+		await expect(admitted.entry.aborted).resolves.toBe("update_restart");
+		// A second drain finds nothing: an entry cannot be receipted twice.
+		expect(queue.drain("shutdown")).toHaveLength(0);
+	});
+
+	it("leaves the queue empty through complete and drop", () => {
+		const queue = new PendingDeliveryQueue({ capacity: 5 });
+		const completed = queue.admit("target-a", "sender-a");
+		const dropped = queue.admit("target-b", "sender-b");
+		if (!completed.ok || !dropped.ok) throw new Error("admission failed");
+
+		queue.complete(completed.entry);
+		queue.drop(dropped.entry);
+
+		expect(queue.size()).toBe(0);
+		expect(queue.counters).toMatchObject({ admitted: 2, completed: 1, dropped: 1, drained: 0 });
+		// Counting is idempotent per entry, so a late complete cannot inflate it.
+		queue.complete(completed.entry);
+		expect(queue.counters.completed).toBe(1);
 	});
 });

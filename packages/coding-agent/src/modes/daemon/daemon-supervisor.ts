@@ -164,6 +164,7 @@ import {
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 	DAEMON_WORKER_TOKEN_ENV,
 	type DaemonCreateCommand,
+	type DaemonWorkerCommandBody,
 	type DaemonWorkerDescriptor,
 	type DaemonWorkerFrameHeader,
 	type DaemonWorkerLifecycle,
@@ -175,6 +176,14 @@ import {
 	SESSION_LEASES_ENABLED_ENV,
 } from "./daemon-worker-protocol.js";
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
+import {
+	PENDING_DELIVERY_CAPACITY_RETRY_AFTER_MS,
+	PendingDeliveryAbortedError,
+	type PendingDeliveryAbortReason,
+	PendingDeliveryCapacityError,
+	type PendingDeliveryEntry,
+	PendingDeliveryQueue,
+} from "./pending-delivery-queue.js";
 import {
 	createRlmLedgerRegistrySeedSource,
 	type RlmLedgerEdge,
@@ -215,6 +224,10 @@ const ADOPTION_CONCURRENCY = 4;
 const ADOPTION_RETRY_DELAYS_MS: readonly number[] = [30_000, 120_000, 600_000];
 const INPUT_PAUSE_CLEANUP_TIMEOUT_MS = 5_000;
 const UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS = 80_000;
+// P1-7c: how often a delivery to a target that is not reachable yet is retried.
+// Same cadence as DEFERRED_RECOVERY_RECHECK_MS below, so a retry lands about when
+// the recovery recheck can have changed the state.
+const PENDING_DELIVERY_RETRY_INTERVAL_MS = 5_000;
 const UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS = 90_000;
 // The whole pre-commit prepare (drain + worker fencing) must finish inside the
 // caller's 120s prepare_update_restart request timeout, or roll back; otherwise
@@ -497,6 +510,10 @@ const TRANSIENT_RETRY_AFTER_MS: readonly { pattern: RegExp; retryAfterMs: number
 ];
 
 export function transientRetryAfterMs(error: unknown): number | undefined {
+	// A capacity rejection is retryable by construction: nothing was queued.
+	if (error instanceof PendingDeliveryCapacityError) {
+		return error.retryAfterMs;
+	}
 	const message = error instanceof Error ? error.message : String(error);
 	return TRANSIENT_RETRY_AFTER_MS.find((entry) => entry.pattern.test(message))?.retryAfterMs;
 }
@@ -695,6 +712,12 @@ export interface DaemonSupervisorOptions {
 	failedWorkerReapIntervalMs?: number;
 	/** Overrides the backoff used to re-adopt a worker whose sessions have scheduled jobs. */
 	adoptionRetryDelaysMs?: readonly number[];
+	/** Overrides the pending agent-message delivery queue bound per target session (P1-7c). */
+	pendingDeliveryCapacity?: number;
+	/** Overrides the interval between two delivery attempts for a target that is not reachable yet. */
+	pendingDeliveryRetryIntervalMs?: number;
+	/** Overrides how long update-restart preparation waits for in-flight mutations to drain. */
+	updateRestartDrainTimeoutMs?: number;
 }
 
 interface PersistedSupervisorConfig {
@@ -1012,6 +1035,15 @@ export class DaemonSupervisor {
 	/** Checkpoint held while the phase is `prepared`, so a re-issued prepare can replay it. */
 	private preparedUpdateRestartManifest?: DaemonUpdateRestartManifest;
 	private readonly mutationDrain = new MutationDrainLatch();
+	/**
+	 * P1-7c: agent-message deliveries this supervisor owns. An entry exists from
+	 * admission until a terminal outcome, so a restart can drain it with an
+	 * explicit receipt instead of losing it (B10).
+	 */
+	private pendingDeliveries?: PendingDeliveryQueue;
+	private pendingDeliveryCapacity?: number;
+	private pendingDeliveryRetryIntervalMs?: number;
+	private updateRestartDrainTimeoutMs?: number;
 	private readonly clients = new Set<DaemonSocketClient>();
 	private readonly connectionIds = new WeakMap<DaemonSocketClient, string>();
 	private readonly sessionInputPauseEpochs = new WeakMap<DaemonSocketClient, number>();
@@ -1095,6 +1127,9 @@ export class DaemonSupervisor {
 		this.adoptionRequestTimeoutMs = options.adoptionRequestTimeoutMs ?? ADOPTION_WORKER_REQUEST_TIMEOUT_MS;
 		this.failedWorkerReapIntervalMs = options.failedWorkerReapIntervalMs ?? FAILED_WORKER_REAP_INTERVAL_MS;
 		this.adoptionRetryDelaysMs = options.adoptionRetryDelaysMs ?? ADOPTION_RETRY_DELAYS_MS;
+		this.pendingDeliveryCapacity = options.pendingDeliveryCapacity;
+		this.pendingDeliveryRetryIntervalMs = options.pendingDeliveryRetryIntervalMs;
+		this.updateRestartDrainTimeoutMs = options.updateRestartDrainTimeoutMs;
 	}
 
 	async start(): Promise<void> {
@@ -2344,7 +2379,8 @@ export class DaemonSupervisor {
 		// Attach is intentionally read-only and is not fence-gated. If eviction wins
 		// the race, attach fails cleanly with "Session worker is not connected" and
 		// the client retries through the saved-session path instead of mutating state.
-		// P1-7c: a long agent-message delivery must not hold the update-restart
+		// P1-7c: a long agent-message delivery is tracked by the pending-delivery
+		// queue and drained explicitly, so it must not hold the update-restart
 		// latch — one wedged send used to be able to fail an 80s drain for
 		// everybody. Its journal entry stays pending, which is what makes a replay
 		// of the same command id answer "uncertain" instead of claiming it never
@@ -3088,23 +3124,7 @@ export class DaemonSupervisor {
 				if ((source.summary.activeSessionId ?? source.summary.id) === targetActiveSessionId) {
 					throw new Error("Agent messaging cannot target the sending session");
 				}
-				const targetClient = this.requireAvailableWorkerClient(target.worker);
-				const response = await targetClient.requestWorker(
-					{
-						type: "worker_deliver_message",
-						targetActiveSessionId,
-						message: command.message,
-						sender: {
-							activeSessionId: source.summary.activeSessionId ?? source.summary.id,
-							sessionId: source.summary.sessionId,
-							...(source.summary.sessionName ? { sessionName: source.summary.sessionName } : {}),
-							runtimeKind: source.summary.runtimeKind ?? "top-level",
-							clientId: client.id,
-						},
-					},
-					WORKER_REQUEST_TIMEOUT_MS,
-				);
-				return { ...response, id: command.id, command: command.type };
+				return await this.deliverAgentMessage(client, command, source, target, targetActiveSessionId);
 			}
 			return this.forwardToWorker(target.worker, { ...command, targetActiveSessionId });
 		}
@@ -6097,6 +6117,158 @@ export class DaemonSupervisor {
 		return matches.values().next().value;
 	}
 
+	/**
+	 * P1-7c: one agent-message delivery, tracked from admission to a terminal
+	 * outcome.
+	 *
+	 * The first attempt keeps the long budget, because the sender is waiting on it
+	 * and hydrating a large transcript is legitimate work (C20 kept the 24h
+	 * delivery semantics on purpose). What changed is the bookkeeping: the
+	 * delivery is an entry in the pending-delivery queue instead of an anonymous
+	 * mutation holding the update-restart drain latch, so a target that is not
+	 * reachable yet requeues and retries on the deliver tier, a target with a full
+	 * pending set is rejected with an actionable hint instead of being silently
+	 * piled onto, and a restart drains every entry with an explicit receipt to the
+	 * sender that is still waiting (B10/F10: nothing evaporates).
+	 *
+	 * A retry only ever follows a failure that `requireAvailableWorkerClient`
+	 * threw before anything was written to a worker, so a retry cannot deliver the
+	 * same message twice.
+	 */
+	private async deliverAgentMessage(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "send_message" }>,
+		source: WorkerMatch,
+		target: WorkerMatch,
+		targetActiveSessionId: string,
+	): Promise<DaemonResponse> {
+		const senderKey = source.summary.activeSessionId ?? source.summary.id;
+		const payload: DaemonWorkerCommandBody = {
+			type: "worker_deliver_message",
+			targetActiveSessionId,
+			message: command.message,
+			sender: {
+				activeSessionId: senderKey,
+				sessionId: source.summary.sessionId,
+				...(source.summary.sessionName ? { sessionName: source.summary.sessionName } : {}),
+				runtimeKind: source.summary.runtimeKind ?? "top-level",
+				clientId: client.id,
+			},
+		};
+		const queue = this.pendingDeliveryQueue();
+		const admitted = queue.admit(targetActiveSessionId, senderKey);
+		if (!admitted.ok) {
+			// L6: a full pending set is a retryable rejection, never a fake "queued".
+			this.logInfo(
+				`deliver queue overflow for ${targetActiveSessionId}: ${admitted.queueDepth}/${admitted.capacity} pending, rejected a delivery from ${senderKey}`,
+			);
+			throw new PendingDeliveryCapacityError(
+				targetActiveSessionId,
+				admitted.queueDepth,
+				admitted.capacity,
+				PENDING_DELIVERY_CAPACITY_RETRY_AFTER_MS,
+			);
+		}
+		const entry = admitted.entry;
+		try {
+			for (;;) {
+				const remainingMs = entry.deadlineAt - Date.now();
+				if (remainingMs <= 0) {
+					throw new Error(
+						`Agent message delivery to ${targetActiveSessionId} was abandoned after ${entry.attempts} attempt(s): the delivery budget ran out`,
+					);
+				}
+				entry.attempts++;
+				const tierMs =
+					entry.attempts === 1 ? WORKER_REQUEST_TIMEOUT_TIERS.long : WORKER_REQUEST_TIMEOUT_TIERS.deliver;
+				const timeoutMs = Math.max(1, Math.min(tierMs, remainingMs));
+				let workerClient: DaemonWorkerClient;
+				try {
+					workerClient = this.requireAvailableWorkerClient(
+						this.deliveryTargetWorker(target, targetActiveSessionId),
+					);
+				} catch (error) {
+					if (!isExpectedWorkerAvailabilityError(error)) throw error;
+					queue.requeue(entry);
+					this.logInfo(
+						`deliver message requeued for ${targetActiveSessionId} (delivery ${entry.deliveryId}, attempt ${entry.attempts}, depth ${queue.depth(targetActiveSessionId)}, retry in ${this.pendingDeliveryRetryIntervalMs}ms): ${error instanceof Error ? error.message : String(error)}`,
+					);
+					await this.raceDeliveryAbort(
+						entry,
+						unrefDelay(this.pendingDeliveryRetryIntervalMs ?? PENDING_DELIVERY_RETRY_INTERVAL_MS),
+					);
+					continue;
+				}
+				const response = await this.raceDeliveryAbort(entry, workerClient.requestWorker(payload, timeoutMs));
+				queue.complete(entry);
+				return { ...response, id: command.id, command: command.type };
+			}
+		} catch (error) {
+			queue.drop(entry);
+			if (error instanceof PendingDeliveryAbortedError) {
+				this.log(
+					`deliver message dropped for ${targetActiveSessionId} (delivery ${entry.deliveryId}, attempts ${entry.attempts}): ${error.message}`,
+				);
+				throw new Error(
+					`Agent message to ${targetActiveSessionId} was not delivered: the daemon stopped the pending delivery (${error.reason.replaceAll("_", " ")}). Send it again once the daemon is back.`,
+				);
+			}
+			throw error;
+		}
+	}
+
+	/** A retried delivery re-resolves the target: the roster may have moved it to a replacement worker. */
+	private deliveryTargetWorker(fallback: WorkerMatch, targetActiveSessionId: string): ResidentWorker {
+		const rosterEntry = this.roster().byActiveSessionId(targetActiveSessionId);
+		const current = rosterEntry?.workerId !== undefined ? this.workers.get(rosterEntry.workerId) : undefined;
+		return current ?? fallback.worker;
+	}
+
+	/** Races the work against the queue's drain abort, so a restart answers every waiting sender. */
+	private async raceDeliveryAbort<T>(entry: PendingDeliveryEntry, work: Promise<T>): Promise<T> {
+		const abort = entry.aborted.then((reason): T => {
+			throw new PendingDeliveryAbortedError(entry.deliveryId, reason);
+		});
+		// The loser of the race has no reader left; swallow it here so an abandoned
+		// worker request cannot become an unhandled rejection.
+		void work.then(
+			() => undefined,
+			() => undefined,
+		);
+		void abort.then(
+			() => undefined,
+			() => undefined,
+		);
+		return await Promise.race([work, abort]);
+	}
+
+	/**
+	 * B10: a restart never leaves a delivery sitting in memory. Every entry is
+	 * aborted, which hands each sender still waiting an explicit terminal receipt;
+	 * the ones nobody waits for any more are logged as dropped and counted.
+	 */
+	/** Created on first use: a supervisor that never relays an agent message never allocates one. */
+	private pendingDeliveryQueue(): PendingDeliveryQueue {
+		if (!this.pendingDeliveries) {
+			this.pendingDeliveries = new PendingDeliveryQueue(
+				this.pendingDeliveryCapacity === undefined ? {} : { capacity: this.pendingDeliveryCapacity },
+			);
+		}
+		return this.pendingDeliveries;
+	}
+
+	private drainPendingDeliveries(reason: PendingDeliveryAbortReason): void {
+		const drained = this.pendingDeliveryQueue().drain(reason);
+		if (drained.length === 0) {
+			return;
+		}
+		this.log(
+			`drained ${drained.length} pending agent-message ${drained.length === 1 ? "delivery" : "deliveries"} (${reason.replaceAll("_", " ")}): ${drained
+				.map((entry) => `${entry.deliveryId}->${entry.targetActiveSessionId}`)
+				.join(", ")}`,
+		);
+	}
+
 	private async forwardToWorker(
 		worker: ResidentWorker,
 		command: DaemonCommand,
@@ -7447,9 +7619,17 @@ export class DaemonSupervisor {
 		}
 		if (this.updateRestartPhase !== undefined) throw new Error("Daemon is already preparing an update restart");
 		this.updateRestartPhase = "draining";
+		// P1-7c/B10: pending deliveries are answered before the fence, not carried
+		// across it. Each sender still waiting gets an explicit terminal receipt.
+		this.drainPendingDeliveries("update_restart");
 		try {
 			const deadline = Date.now() + UPDATE_RESTART_PREPARE_DEADLINE_MS;
-			const abort = AbortSignal.timeout(Math.min(UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS, deadline - Date.now()));
+			const abort = AbortSignal.timeout(
+				Math.min(
+					this.updateRestartDrainTimeoutMs ?? UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS,
+					deadline - Date.now(),
+				),
+			);
 			await this.mutationDrain.waitForDrain(1, abort, "Timed out draining daemon mutations for update restart");
 			this.updateRestartPhase = "fencing";
 			await this.mutationDrain.waitForDrain(1, abort, "Timed out draining daemon mutations for update restart");
@@ -8348,6 +8528,10 @@ export class DaemonSupervisor {
 			process.exit(exitCode);
 		}
 		this.shuttingDown = true;
+		// P1-7c/B10: answer every pending delivery before the workers go, so a
+		// sender still waiting learns the message was not delivered instead of
+		// watching the daemon leave with it.
+		this.drainPendingDeliveries("shutdown");
 		this.clearIdleEvictionTimer();
 		this.clearScheduledWakeTimer();
 		this.clearRosterWatchdogTimer();
