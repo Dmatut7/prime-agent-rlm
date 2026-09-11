@@ -134,6 +134,12 @@ export interface KernelLivenessVerdict {
 	ageMs?: number;
 	/** The event-loop tick advanced between the two retained samples. */
 	loopAlive: boolean;
+	/**
+	 * The tick had a delta to be judged against and did not move. False whenever only one sample is
+	 * retained: with no previous frame there is no evidence either way, and reporting a stall on a
+	 * guess would poison the one reason a residual abort is supposed to carry.
+	 */
+	loopStalled: boolean;
 	/** The kernel says a cell is in flight. */
 	cellAwaiting: boolean;
 	/** Something observably moved: streamed bytes, pipe backlog, buffered output, a finished cell. */
@@ -194,7 +200,14 @@ export function kernelVouchedAlive(
 ): KernelLivenessVerdict {
 	const latest = samples.latest;
 	if (!latest) {
-		return { state: "absent", loopAlive: false, cellAwaiting: false, progress: false, bashProgress: false };
+		return {
+			state: "absent",
+			loopAlive: false,
+			loopStalled: false,
+			cellAwaiting: false,
+			progress: false,
+			bashProgress: false,
+		};
 	}
 	const staleAfterIntervals = options.staleAfterIntervals ?? DEFAULT_STALE_AFTER_INTERVALS;
 	const intervalMs = latest.intervalMs > 0 ? latest.intervalMs : FALLBACK_HEARTBEAT_INTERVAL_MS;
@@ -212,6 +225,7 @@ export function kernelVouchedAlive(
 		state,
 		ageMs,
 		loopAlive: previous !== undefined && latest.tick > previous.tick,
+		loopStalled: previous !== undefined && latest.tick <= previous.tick,
 		cellAwaiting: latest.cellId !== undefined,
 		progress: bashProgress || cellsDelta > 0,
 		bashProgress,
@@ -318,7 +332,10 @@ export function createTurnLiveness(options: TurnLivenessOptions): TurnLiveness {
 		// The host's own fact, and the strongest one: this process is busy on the kernel's behalf.
 		// Bounded by age (B7) - a handler that wedged must stop excusing silence, which is what
 		// keeps the registered "900s becomes 50min" downgrade from being real.
-		const agedOut = hostRequestCount > 0 && oldestAgeMs !== undefined && oldestAgeMs > hostRequestMaxAgeMs;
+		// A count with no measurable age is treated as aged out: the real client derives both from
+		// one map so this cannot happen today, but a client that implemented only half of the
+		// optional API must not end up vouching with no bound at all.
+		const agedOut = hostRequestCount > 0 && (oldestAgeMs === undefined || oldestAgeMs > hostRequestMaxAgeMs);
 		if (hostRequestCount > 0 && !agedOut) {
 			reasons.push(STALL_VOUCH_REASONS.hostRequestInFlight);
 			// An in-flight host request is work in motion by definition: the host is executing it.
@@ -339,7 +356,7 @@ export function createTurnLiveness(options: TurnLivenessOptions): TurnLiveness {
 			if (verdict.loopAlive && verdict.cellAwaiting) {
 				reasons.push(STALL_VOUCH_REASONS.kernelLoopAwaitingCell);
 			}
-			if (!verdict.loopAlive && verdict.cellAwaiting) {
+			if (verdict.loopStalled && verdict.cellAwaiting) {
 				// Frames arrive but the tick is frozen: a synchronous cell is monopolizing the
 				// loop. This is the genuine-deadlock shape, and nothing about it excuses silence.
 				kernelReasons.push(TURN_LIVENESS_REASONS.loopStalled);

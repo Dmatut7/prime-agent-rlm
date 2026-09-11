@@ -128,6 +128,24 @@ describe("kernelVouchedAlive", () => {
 		);
 		expect(backwards.progress).toBe(false);
 	});
+
+	it("needs two samples before it calls the loop stalled", () => {
+		// One retained sample means the tick never had a chance to move, so "stalled" would be a
+		// guess. Reachable with a heartbeat interval near its ceiling: a 600s interval leaves a
+		// single frame before a 900s abort.
+		expect(kernelVouchedAlive({ latest: sample({ tick: 10 }) }, T0).loopStalled).toBe(false);
+		expect(kernelVouchedAlive({}, T0).loopStalled).toBe(false);
+		// Positive control: the same frozen tick, with a delta to judge it by, is a finding.
+		expect(
+			kernelVouchedAlive({ previous: sample({ tick: 10 }), latest: sample({ receivedAt: T0, tick: 10 }) }, T0)
+				.loopStalled,
+		).toBe(true);
+		// ... and a moving tick is not.
+		expect(
+			kernelVouchedAlive({ previous: sample({ tick: 10 }), latest: sample({ receivedAt: T0, tick: 11 }) }, T0)
+				.loopStalled,
+		).toBe(false);
+	});
 });
 
 describe("createTurnLiveness", () => {
@@ -363,6 +381,34 @@ describe("createTurnLiveness", () => {
 		// A new turn must not inherit the previous turn's degraded read.
 		withHandle.liveness.reset();
 		expect(withHandle.liveness.sample().vouched).toBe(false);
+	});
+
+	it("does not put a guessed loop_stalled in the reasons (N1)", () => {
+		const single = build({ kernel: facts({ latest: sample({ tick: 10, cellId: "cell-1" }), previous: undefined }) });
+		const sampled = single.liveness.sample();
+		expect(sampled.state).toBe("fresh");
+		expect(sampled.vouched).toBe(false);
+		// The batch's production signature is "an abort that still happens comes with
+		// kernel.reasons=[loop_stalled]"; a reason with no delta behind it would poison it.
+		expect(sampled.kernelReasons).toEqual([]);
+
+		const withPrevious = build({
+			kernel: facts({
+				previous: sample({ receivedAt: T0 - 5_000, tick: 10 }),
+				latest: sample({ tick: 10, cellId: "cell-1" }),
+			}),
+		});
+		expect(withPrevious.liveness.sample().kernelReasons).toEqual([TURN_LIVENESS_REASONS.loopStalled]);
+	});
+
+	it("treats a host request with no measurable age as aged out (N2)", () => {
+		// Both facts come from one map in the real client, so this is unreachable today; it is a
+		// footgun for any future KernelClient that implements the count but not the age. The
+		// fail-safe direction is "does not vouch", never "vouches without a bound".
+		const { liveness } = build({ kernel: facts({ latest: sample(), hostRequestCount: 1 }) });
+		const sampled = liveness.sample();
+		expect(sampled.vouched).toBe(false);
+		expect(sampled.kernelReasons).toContain(TURN_LIVENESS_REASONS.hostRequestAgedOut);
 	});
 
 	it("samples without a kernel at all", () => {
