@@ -68,6 +68,8 @@ export class PendingDeliveryCapacityError extends Error {
 export interface PendingDeliveryQueueOptions {
 	/** Entries per target session (fix-plan appendix A: 100, provisional). */
 	capacity?: number;
+	/** One requeue log line per target per this window; the rest are counted into the next one. */
+	requeueLogThrottleMs?: number;
 	/** Total delivery budget per entry; the C20 compromise keeps the 24h semantics. */
 	deliveryBudgetMs?: number;
 	now?: () => number;
@@ -75,6 +77,13 @@ export interface PendingDeliveryQueueOptions {
 }
 
 export const DEFAULT_PENDING_DELIVERY_CAPACITY = 100;
+/**
+ * One `deliver message requeued` line per target per window. A full queue retries
+ * every 5s per entry, so without this a 100-entry target writes 20 lines a
+ * second; the swallowed count rides along on the next line, exactly like the
+ * client catch-up retry's own throttle (`logThrottleMs`, same 60s).
+ */
+export const PENDING_DELIVERY_REQUEUE_LOG_THROTTLE_MS = 60_000;
 /** How long a caller should wait before re-issuing a capacity rejection. */
 export const PENDING_DELIVERY_CAPACITY_RETRY_AFTER_MS = 5_000;
 
@@ -82,6 +91,8 @@ export class PendingDeliveryQueue {
 	private readonly byTarget = new Map<string, Set<InternalEntry>>();
 	private readonly capacity: number;
 	private readonly deliveryBudgetMs: number;
+	private readonly requeueLogThrottleMs: number;
+	private readonly requeueLogState = new Map<string, { lastLoggedAt?: number; suppressed: number }>();
 	private readonly now: () => number;
 	private readonly idFactory: () => string;
 	private idCounter = 0;
@@ -97,6 +108,7 @@ export class PendingDeliveryQueue {
 	constructor(options: PendingDeliveryQueueOptions = {}) {
 		this.capacity = options.capacity ?? DEFAULT_PENDING_DELIVERY_CAPACITY;
 		this.deliveryBudgetMs = options.deliveryBudgetMs ?? 24 * 60 * 60 * 1000;
+		this.requeueLogThrottleMs = options.requeueLogThrottleMs ?? PENDING_DELIVERY_REQUEUE_LOG_THROTTLE_MS;
 		this.now = options.now ?? Date.now;
 		this.idFactory = options.idFactory ?? (() => `deliver_${++this.idCounter}`);
 	}
@@ -150,6 +162,35 @@ export class PendingDeliveryQueue {
 		this.counters.requeued++;
 	}
 
+	/**
+	 * Whether this requeue may be written out, and how many lines were swallowed
+	 * for this target since the last one written. The counter in `counters.requeued`
+	 * stays exact either way, so throttling the log does not throttle the metric.
+	 */
+	noteRequeueForLog(targetActiveSessionId: string): { emit: boolean; suppressed: number } {
+		const now = this.now();
+		const state = this.requeueLogState.get(targetActiveSessionId) ?? { suppressed: 0 };
+		this.requeueLogState.set(targetActiveSessionId, state);
+		if (state.lastLoggedAt !== undefined && now - state.lastLoggedAt < this.requeueLogThrottleMs) {
+			state.suppressed++;
+			return { emit: false, suppressed: state.suppressed };
+		}
+		const suppressed = state.suppressed;
+		state.suppressed = 0;
+		state.lastLoggedAt = now;
+		return { emit: true, suppressed };
+	}
+
+	/** The throttle window, so a suppressed count can name the window it covers. */
+	get requeueLogWindowMs(): number {
+		return this.requeueLogThrottleMs;
+	}
+
+	/** Live throttle rows; bounded by the number of targets with pending deliveries. */
+	throttleStateSize(): number {
+		return this.requeueLogState.size;
+	}
+
 	complete(entry: PendingDeliveryEntry): void {
 		if (this.remove(entry)) {
 			this.counters.completed++;
@@ -188,6 +229,8 @@ export class PendingDeliveryQueue {
 		entries.delete(entry as InternalEntry);
 		if (entries.size === 0) {
 			this.byTarget.delete(entry.targetActiveSessionId);
+			// A long-lived supervisor keeps no row per historical target.
+			this.requeueLogState.delete(entry.targetActiveSessionId);
 		}
 		return true;
 	}

@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { DaemonResponse } from "../src/modes/daemon/daemon-protocol.js";
-import { DEFAULT_PENDING_DELIVERY_CAPACITY, PendingDeliveryQueue } from "../src/modes/daemon/pending-delivery-queue.js";
+import { DEFAULT_CLIENT_CATCHUP_RETRY_POLICY } from "../src/modes/daemon/daemon-supervisor.js";
+import {
+	DEFAULT_PENDING_DELIVERY_CAPACITY,
+	PENDING_DELIVERY_REQUEUE_LOG_THROTTLE_MS,
+	PendingDeliveryQueue,
+} from "../src/modes/daemon/pending-delivery-queue.js";
 import {
 	disposeSupervisorHarnesses,
 	type SupervisorHarness,
@@ -193,5 +198,97 @@ describe("P1-7c pending delivery queue", () => {
 		// Counting is idempotent per entry, so a late complete cannot inflate it.
 		queue.complete(completed.entry);
 		expect(queue.counters.completed).toBe(1);
+	});
+});
+
+describe("P1-7c requeue log throttle", () => {
+	it("writes one requeue line per target per window and folds the rest into a count", () => {
+		let now = 0;
+		const queue = new PendingDeliveryQueue({
+			capacity: 5,
+			requeueLogThrottleMs: 60_000,
+			now: () => now,
+		});
+		const admitted = queue.admit("target-a", "sender-a");
+		if (!admitted.ok) throw new Error("admission failed");
+
+		// First requeue of the window is written out.
+		expect(queue.noteRequeueForLog("target-a")).toEqual({ emit: true, suppressed: 0 });
+		// A full queue retrying every 5s must not write 20 lines a second.
+		const suppressed: number[] = [];
+		for (let index = 0; index < 19; index++) {
+			queue.requeue(admitted.entry);
+			suppressed.push(queue.noteRequeueForLog("target-a").emit ? 1 : 0);
+		}
+		expect(suppressed.reduce((total, value) => total + value, 0)).toBe(0);
+		// The counter stays exact even though the log is throttled.
+		expect(queue.counters.requeued).toBe(19);
+		expect(queue.noteRequeueForLog("target-a")).toEqual({ emit: false, suppressed: 20 });
+
+		// Past the window one line comes back, carrying what was swallowed.
+		now = 60_000;
+		expect(queue.noteRequeueForLog("target-a")).toEqual({ emit: true, suppressed: 20 });
+		expect(queue.noteRequeueForLog("target-a")).toEqual({ emit: false, suppressed: 1 });
+
+		// A different target has its own window.
+		expect(queue.noteRequeueForLog("target-b")).toEqual({ emit: true, suppressed: 0 });
+	});
+
+	it("matches the client catch-up throttle window", () => {
+		// The parent's ask: the same throttle the catch-up retry already has.
+		expect(PENDING_DELIVERY_REQUEUE_LOG_THROTTLE_MS).toBe(DEFAULT_CLIENT_CATCHUP_RETRY_POLICY.logThrottleMs);
+	});
+
+	it("drops the throttle state with the target's last entry", () => {
+		const now = 0;
+		const queue = new PendingDeliveryQueue({ capacity: 5, requeueLogThrottleMs: 60_000, now: () => now });
+		const admitted = queue.admit("target-a", "sender-a");
+		if (!admitted.ok) throw new Error("admission failed");
+		expect(queue.noteRequeueForLog("target-a")).toEqual({ emit: true, suppressed: 0 });
+		expect(queue.noteRequeueForLog("target-a")).toEqual({ emit: false, suppressed: 1 });
+
+		queue.complete(admitted.entry);
+
+		// A long-lived supervisor must not keep one row per historical target.
+		expect(queue.throttleStateSize()).toBe(0);
+		expect(queue.noteRequeueForLog("target-a")).toEqual({ emit: true, suppressed: 0 });
+	});
+
+	it("bounds the requeue lines a supervisor writes while a target stays unreachable", async () => {
+		const harness = await startSupervisorHarness({
+			prefix: "ma-t4-3-requeue-throttle-",
+			sessionCount: 2,
+			supervisorOptions: {
+				pendingDeliveryRetryIntervalMs: 10,
+				pendingDeliveryLogThrottleMs: 200,
+			},
+		});
+		await harness.waitForWorkerReady();
+		await harness.worker?.close();
+		await harness.waitForDescriptorLifecycle("recovering");
+		const [source, target] = harness.sessions;
+		if (!source || !target) throw new Error("Harness did not create two sessions");
+
+		const send = harness.request(
+			{
+				type: "send_message",
+				fromActiveSessionId: source.activeSessionId,
+				targetActiveSessionId: target.activeSessionId,
+				message: "throttled",
+			},
+			10_000,
+		);
+		void send.catch(() => undefined);
+		await harness.settle(600);
+
+		// 600ms at a 10ms retry interval is dozens of requeues; RED on HEAD wrote
+		// one line for every single one of them.
+		const lines = harness
+			.logText()
+			.split("\n")
+			.filter((line) => line.includes("deliver message requeued"));
+		expect(lines.length).toBeGreaterThan(0);
+		expect(lines.length).toBeLessThanOrEqual(5);
+		expect(lines.some((line) => line.includes("suppressed"))).toBe(true);
 	});
 });

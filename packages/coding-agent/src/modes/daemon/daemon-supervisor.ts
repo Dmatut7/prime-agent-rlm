@@ -716,6 +716,8 @@ export interface DaemonSupervisorOptions {
 	pendingDeliveryCapacity?: number;
 	/** Overrides the interval between two delivery attempts for a target that is not reachable yet. */
 	pendingDeliveryRetryIntervalMs?: number;
+	/** Overrides the requeue log throttle window (one line per target session per window). */
+	pendingDeliveryLogThrottleMs?: number;
 	/** Overrides how long update-restart preparation waits for in-flight mutations to drain. */
 	updateRestartDrainTimeoutMs?: number;
 }
@@ -1043,6 +1045,7 @@ export class DaemonSupervisor {
 	private pendingDeliveries?: PendingDeliveryQueue;
 	private pendingDeliveryCapacity?: number;
 	private pendingDeliveryRetryIntervalMs?: number;
+	private pendingDeliveryLogThrottleMs?: number;
 	private updateRestartDrainTimeoutMs?: number;
 	private readonly clients = new Set<DaemonSocketClient>();
 	private readonly connectionIds = new WeakMap<DaemonSocketClient, string>();
@@ -1129,6 +1132,7 @@ export class DaemonSupervisor {
 		this.adoptionRetryDelaysMs = options.adoptionRetryDelaysMs ?? ADOPTION_RETRY_DELAYS_MS;
 		this.pendingDeliveryCapacity = options.pendingDeliveryCapacity;
 		this.pendingDeliveryRetryIntervalMs = options.pendingDeliveryRetryIntervalMs;
+		this.pendingDeliveryLogThrottleMs = options.pendingDeliveryLogThrottleMs;
 		this.updateRestartDrainTimeoutMs = options.updateRestartDrainTimeoutMs;
 	}
 
@@ -6190,9 +6194,20 @@ export class DaemonSupervisor {
 				} catch (error) {
 					if (!isExpectedWorkerAvailabilityError(error)) throw error;
 					queue.requeue(entry);
-					this.logInfo(
-						`deliver message requeued for ${targetActiveSessionId} (delivery ${entry.deliveryId}, attempt ${entry.attempts}, depth ${queue.depth(targetActiveSessionId)}, retry in ${this.pendingDeliveryRetryIntervalMs}ms): ${error instanceof Error ? error.message : String(error)}`,
-					);
+					// One line per target per window: a full queue retrying every 5s
+					// would otherwise write 20 lines a second. The swallowed count rides
+					// on the next line, and counters.requeued stays exact.
+					const requeueLog = queue.noteRequeueForLog(targetActiveSessionId);
+					if (requeueLog.emit) {
+						const retryIntervalMs = this.pendingDeliveryRetryIntervalMs ?? PENDING_DELIVERY_RETRY_INTERVAL_MS;
+						this.logInfo(
+							`deliver message requeued for ${targetActiveSessionId} (delivery ${entry.deliveryId}, attempt ${entry.attempts}, depth ${queue.depth(targetActiveSessionId)}, retry in ${retryIntervalMs}ms): ${error instanceof Error ? error.message : String(error)}${
+								requeueLog.suppressed > 0
+									? ` (+${requeueLog.suppressed} suppressed in the last ${queue.requeueLogWindowMs}ms)`
+									: ""
+							}`,
+						);
+					}
 					await this.raceDeliveryAbort(
 						entry,
 						unrefDelay(this.pendingDeliveryRetryIntervalMs ?? PENDING_DELIVERY_RETRY_INTERVAL_MS),
@@ -6250,9 +6265,12 @@ export class DaemonSupervisor {
 	/** Created on first use: a supervisor that never relays an agent message never allocates one. */
 	private pendingDeliveryQueue(): PendingDeliveryQueue {
 		if (!this.pendingDeliveries) {
-			this.pendingDeliveries = new PendingDeliveryQueue(
-				this.pendingDeliveryCapacity === undefined ? {} : { capacity: this.pendingDeliveryCapacity },
-			);
+			this.pendingDeliveries = new PendingDeliveryQueue({
+				...(this.pendingDeliveryCapacity === undefined ? {} : { capacity: this.pendingDeliveryCapacity }),
+				...(this.pendingDeliveryLogThrottleMs === undefined
+					? {}
+					: { requeueLogThrottleMs: this.pendingDeliveryLogThrottleMs }),
+			});
 		}
 		return this.pendingDeliveries;
 	}
