@@ -19,6 +19,7 @@ import { dirname } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { getLogger } from "@earendil-works/pi-ai";
 import { v4 as uuid } from "uuid";
+import { DEFAULT_SHORT_TARGET_WAIT_MS, withBound } from "../../utils/bounded-wait.js";
 import { assertRegularFileNoSymlink, ensurePrivateDirectory, requireNoFollow } from "../../utils/private-files.js";
 import { reapKernelOrphanProcesses, recordOrphanProcessState } from "../orphan-process-journal.js";
 import { ensureKernelPython, managedKernelVenvDirForPython } from "./bootstrap.js";
@@ -396,6 +397,8 @@ export class ReplKernelManager {
 		| "onUnexpectedExit"
 		| "restartPolicy"
 		| "cancellableHostRequestTypes"
+		| "readOnlyHostRequestTimeoutMs"
+		| "onLateHostReply"
 	>;
 	private readonly handledHostRequestIds = new Set<string>();
 	private child?: ChildProcess;
@@ -523,6 +526,8 @@ export class ReplKernelManager {
 			onUnexpectedExit: options.onUnexpectedExit,
 			restartPolicy: options.restartPolicy,
 			cancellableHostRequestTypes: options.cancellableHostRequestTypes,
+			readOnlyHostRequestTimeoutMs: options.readOnlyHostRequestTimeoutMs,
+			onLateHostReply: options.onLateHostReply,
 		};
 	}
 
@@ -2008,18 +2013,34 @@ export class ReplKernelManager {
 		const startedAt = Date.now();
 		const described = describeHostRequest(data);
 		const signal = this.hostRequestSignal(described.type);
+		// A read-only request is bounded too (C14 family). It cannot tear anything by being cut
+		// off, and unbounded it would hold the cell - and the vouch that excuses the cell's
+		// silence - for as long as the handler likes. A side-effecting one is never bounded here.
+		const readOnlyTimeoutMs = hostRequestTypeIsCancellable(this.options.cancellableHostRequestTypes, described.type)
+			? (this.options.readOnlyHostRequestTimeoutMs?.() ?? DEFAULT_SHORT_TARGET_WAIT_MS)
+			: undefined;
 		// The handler starts on a microtask so the request is registered first: a handler that
 		// blocks before its first await is still counted, and still has an age, from the moment
 		// the request was accepted.
 		const task: Promise<void> = Promise.resolve().then(async () => {
 			try {
-				const result = await this.handleHostRequest(data, signal);
+				const result =
+					readOnlyTimeoutMs === undefined
+						? await this.handleHostRequest(data, signal)
+						: // No signal here on purpose: the bound's job is the timeout. A handler that
+							// cares about cancellation already sees the same signal and settles on its
+							// own, and racing it here would report "the handler failed" for a request
+							// whose real outcome the host never learned.
+							await withBound(this.handleHostRequest(data, signal), {
+								timeoutMs: readOnlyTimeoutMs,
+								phase: "host_request",
+								target: described.label === undefined ? described.type : `${described.type} ${described.label}`,
+								label: "Kernel host request",
+							});
 				try {
 					await this.writeLine({ type: "host_reply", id: requestId, data: { status: "ok", result } });
 				} catch (replyError) {
-					this.appendKernelDiagnostic(
-						`failed to send host request ok reply for ${requestId}: ${errorMessage(replyError)}`,
-					);
+					this.reportLateHostReply(requestId, described, true, replyError);
 				}
 			} catch (error) {
 				this.appendKernelDiagnostic(`host request failed for ${requestId}: ${errorMessage(error)}`);
@@ -2030,9 +2051,7 @@ export class ReplKernelManager {
 						data: { status: "error", error: errorMessage(error) },
 					});
 				} catch (replyError) {
-					this.appendKernelDiagnostic(
-						`failed to send host request error reply for ${requestId}: ${errorMessage(replyError)}`,
-					);
+					this.reportLateHostReply(requestId, described, false, replyError);
 				}
 			}
 		});
@@ -2062,6 +2081,42 @@ export class ReplKernelManager {
 		const cell = this.activeExecution?.opts.signal;
 		if (!cell) return teardown;
 		return AbortSignal.any([teardown, cell]);
+	}
+
+	/**
+	 * A reply nobody can receive any more, because the kernel that asked is gone. The request
+	 * itself already ran, so this is the only chance to say so: it goes to the machine-wide log and
+	 * to the owning session, which can tell the model whether the work is already visible (I-6).
+	 */
+	private reportLateHostReply(
+		requestId: string,
+		described: { type: string; label?: string },
+		ok: boolean,
+		error: unknown,
+	): void {
+		this.appendKernelDiagnostic(
+			`failed to send host request ${ok ? "ok" : "error"} reply for ${requestId}: ${errorMessage(error)}`,
+		);
+		kernelLog.warn("late kernel host reply dropped", {
+			requestId,
+			type: described.type,
+			ok,
+			error: errorMessage(error),
+			sessionId: this.options.sessionId,
+		});
+		try {
+			this.options.onLateHostReply?.({
+				requestId,
+				type: described.type,
+				...(described.label === undefined ? {} : { label: described.label }),
+				ok,
+			});
+		} catch (callbackError) {
+			kernelLog.warn("late kernel host reply callback failed", {
+				error: errorMessage(callbackError),
+				sessionId: this.options.sessionId,
+			});
+		}
 	}
 
 	private async handleHostRequest(data: unknown, signal: AbortSignal): Promise<Record<string, unknown>> {

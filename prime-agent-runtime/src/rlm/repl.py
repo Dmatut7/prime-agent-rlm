@@ -215,13 +215,35 @@ def _fail_pending_host_requests() -> None:
 
 
 def _resolve_host_reply(rid: str, data: dict[str, Any]) -> None:
-    """Reader-thread half of the host bridge; late/unknown replies are dropped."""
+    """Reader-thread half of the host bridge.
+
+    A reply whose waiter is gone is *reported*, not dropped. The waiter disappears when the cell
+    that issued the request was cancelled or interrupted, so the host finished work nobody is
+    listening for any more: dropping it silently is how a model ends up repeating a spawn or a
+    send it believes never happened. It ships as an unattributed (id-less) stderr frame, which is
+    already the channel for output no cell owns - the host buffers it as background output and
+    shows it on the next cell. No new frame kind, so no protocol version change.
+    """
     assert _loop is not None
 
     def deliver() -> None:
         future = _pending_host.get(rid)
-        if future is not None and not future.done():
-            future.set_result(data)
+        if future is not None:
+            # Known waiter: either it is still waiting, or it already settled (a teardown failed
+            # every pending future), and in both cases there is nothing to report.
+            if not future.done():
+                future.set_result(data)
+            return
+        _send(
+            {
+                "event": "stderr",
+                "id": None,
+                "text": (
+                    f"late host_reply for {rid} arrived after the awaiting cell was cancelled; "
+                    "the host finished that request, so do not repeat it blindly\n"
+                ),
+            }
+        )
 
     _loop.call_soon_threadsafe(deliver)
 

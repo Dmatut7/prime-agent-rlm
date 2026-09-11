@@ -16,6 +16,7 @@ import {
 	type KernelClient,
 	type KernelDeathCause,
 	type KernelDiffDisplay,
+	type KernelLateHostReply,
 	type KernelRestartPolicy,
 	type KernelSentAgentMessage,
 	type KernelUnexpectedExitFacts,
@@ -340,6 +341,16 @@ export interface IpythonToolOptions {
 	 */
 	restartPolicy?: () => KernelRestartPolicy;
 	/**
+	 * Read-only host request types a cell abort may cancel, and the bound one such request gets.
+	 * See {@link KernelManagerOptions.cancellableHostRequestTypes}: a side-effecting type must
+	 * stay out of the list, or an Esc on the spawning cell kills work the model was promised would
+	 * outlive the turn.
+	 */
+	cancellableHostRequestTypes?: readonly string[];
+	readOnlyHostRequestTimeoutMs?: () => number;
+	/** A host reply that could not be delivered because the kernel that asked for it was gone. */
+	onLateHostReply?: (reply: KernelLateHostReply) => void;
+	/**
 	 * Read once per aborted cell: the host's record of why the turn was aborted
 	 * (for a session, the last stall-watchdog abort). Undefined means "no recorded
 	 * cause", and the result then only says the cell was aborted mid-flight.
@@ -530,6 +541,13 @@ export class IpythonKernelProvisioner {
 				bootstrapCode,
 				...(this.options?.onUnexpectedExit ? { onUnexpectedExit: this.options.onUnexpectedExit } : {}),
 				...(this.options?.restartPolicy ? { restartPolicy: this.options.restartPolicy } : {}),
+				...(this.options?.cancellableHostRequestTypes
+					? { cancellableHostRequestTypes: this.options.cancellableHostRequestTypes }
+					: {}),
+				...(this.options?.readOnlyHostRequestTimeoutMs
+					? { readOnlyHostRequestTimeoutMs: this.options.readOnlyHostRequestTimeoutMs }
+					: {}),
+				...(this.options?.onLateHostReply ? { onLateHostReply: this.options.onLateHostReply } : {}),
 			});
 			let pendingRestore: RestoreResult | undefined;
 			try {

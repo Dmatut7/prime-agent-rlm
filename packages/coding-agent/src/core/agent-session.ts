@@ -173,6 +173,7 @@ import {
 import type {
 	HostRequestHandlers,
 	KernelDeathCause,
+	KernelLateHostReply,
 	KernelSentAgentMessage,
 	KernelUnexpectedExitFacts,
 } from "./kernel/index.js";
@@ -351,6 +352,15 @@ export interface RlmChildStallState {
 	inFlightTools: string[];
 	/** True once the watchdog reported abort_unsettled: the abort did not stop the run. */
 	unsettled?: boolean;
+	/**
+	 * True while the silence is being excused by an unspent exemption - a host-owned phase or a
+	 * kernel/host liveness vouch. B9/I-13: healthy long work must not wear the "stalled" label, so
+	 * renderers say what it is instead and the row keeps its real activity. Never true for an
+	 * abort that did not settle: by then the budget was spent and the kill is the story.
+	 */
+	excused?: boolean;
+	/** Exemption sub-reasons behind `excused` (e.g. `live_bash_handles`), for an honest label. */
+	excusedReasons?: string[];
 }
 
 export interface RlmChildAgentSnapshot {
@@ -1102,6 +1112,28 @@ const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
 const KERNEL_DEATH_STDERR_LOG_CHARS = 1024;
 /** Two unexpected exits this close together are a crash loop, not bad luck (F2). */
 const KERNEL_FAST_RESTART_GAP_MS = 60_000;
+
+/**
+ * Kernel host request types a cell abort may cancel (P1-2a). Every entry is read-only, and the
+ * annotation is the review artifact: a wrong entry here loses admitted work, which is a
+ * rollback-level mistake rather than a bug.
+ *
+ * Deliberately absent - each has a side effect, so each keeps the teardown-only signal and stays
+ * fire-and-forget:
+ *   rlm.run              admits a child that must outlive the turn that spawned it (M7);
+ *   rlm.delete_subagent  deletes a child and its artifacts;
+ *   agent_message.send   delivers a message the recipient may already have acted on;
+ *   goal.* / compact.* / refine.* / rlm_heartbeat.*  mutate session or harness state;
+ *   mcp.*                the host cannot know what a server does with a call, so it is not
+ *                        declared read-only by default.
+ */
+export const CANCELLABLE_KERNEL_HOST_REQUEST_TYPES: readonly string[] = [
+	"rlm.find_models", // reads the authenticated model catalog
+	"rlm.list_subagents", // reads this session's own child roster
+	"agent_observe.*", // list/get/recent: reads transcripts and status
+	"model.info", // reads this session's model
+	"agent_message.list_agents", // reads the family roster
+];
 const SESSION_PERSIST_FAILURE_REPORT_BASE_MS = 30_000;
 const SESSION_PERSIST_FAILURE_REPORT_MAX_MS = 300_000;
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
@@ -3923,12 +3955,13 @@ export class AgentSession {
 	};
 
 	/**
-	 * Whether an exemption currently owns this session's silence: the watchdog
-	 * snoozes instead of escalating, and a parent must not label the child
-	 * "stalled" for it (B9/I-13 - healthy long work is not a stall). Today the
-	 * exemptions are the host-owned phases; the kernel-liveness vouch extends the
-	 * same predicate, which is why the label decision reads this getter instead of
-	 * re-deriving a pause list.
+	 * Whether a host-owned phase currently owns this session's silence, so the watchdog snoozes
+	 * instead of escalating (compaction, branch summaries, serialized refinement, a UI dialog).
+	 *
+	 * Deliberately *not* extended by the kernel-liveness vouch: a vouch only defers the abort, and
+	 * B2 requires the warning to keep firing, which merging the two here would suppress. The
+	 * "is this silence excused" question a parent needs for its label (B9/I-13) is answered by the
+	 * exemption segment on the stall event - see `RlmChildStallState.excused` - not by this getter.
 	 */
 	/** Current stall marker, if the watchdog has fired and the turn has not restarted. */
 	get stallState(): RlmChildStallState | undefined {
@@ -4226,11 +4259,17 @@ export class AgentSession {
 		};
 		// Roster marker: survives until the next agent_start so a wedged session
 		// keeps reporting its silence instead of reading as healthy progress.
+		// B9: an unspent exemption means the silence is owned work, not a wedge. The label travels
+		// with the facts so every renderer (roster row, agents view, daemon-attached parent) reads
+		// the same verdict instead of re-deriving one from `silentMs`.
+		const stageExemption = info.exemption;
+		const excused = stageExemption !== undefined && !stageExemption.exhausted;
 		this._stallState = {
 			silentMs: info.silentMs,
 			thresholdMs: info.stage === "warn" ? settings.warnAfterSeconds * 1000 : settings.abortAfterSeconds * 1000,
 			inFlightTools: diagnostics.inFlightToolCalls.map((call) => call.toolName),
 			unsettled: info.stage === "abort_unsettled" || this._stallState?.unsettled === true ? true : undefined,
+			...(excused && stageExemption ? { excused: true, excusedReasons: [...stageExemption.reasons] } : {}),
 		};
 		const kernelReasons = readStallKernelReasons(diagnostics);
 		// F3: a warn-only watchdog (abortAfterSeconds 0) has no abort channel, so an exemption
@@ -8872,6 +8911,27 @@ export class AgentSession {
 	}
 
 	/**
+	 * A host request that finished after the kernel that asked for it was gone (I-6). The reply is
+	 * lost, but the work is not: for a spawn the child exists and is on the roster, which is the
+	 * fact that stops a model from spawning the same worker twice after a kernel death.
+	 */
+	private _reportLateKernelHostReply(reply: KernelLateHostReply): void {
+		const spawnedName = reply.label?.startsWith("name=") ? reply.label.slice("name=".length) : undefined;
+		const alreadyRegistered =
+			spawnedName === undefined
+				? undefined
+				: [...this._activeRlmChildRuns.values()].some((run) => run.sessionName === spawnedName);
+		sessionLog.warn("late kernel host reply", {
+			sessionId: this.sessionId,
+			requestId: reply.requestId,
+			type: reply.type,
+			ok: reply.ok,
+			...(reply.label === undefined ? {} : { label: reply.label }),
+			...(alreadyRegistered === undefined ? {} : { childAlreadyRegistered: alreadyRegistered }),
+		});
+	}
+
+	/**
 	 * A kernel death the host did not order. The manager's stderr ring never leaves the host
 	 * process, so this line is the only per-session trace of the cause (code/signal/origin), and
 	 * the origin is what keeps a protocol-repair kill out of the crash statistics.
@@ -10869,6 +10929,12 @@ export class AgentSession {
 					const restart = this.settingsManager.getKernelRestartSettings();
 					return { maxRestarts: restart.maxUnexpectedRestarts, windowMs: restart.windowMs };
 				},
+				cancellableHostRequestTypes: CANCELLABLE_KERNEL_HOST_REQUEST_TYPES,
+				// Read-only requests borrow the short agent-message tier: they cannot tear state by
+				// being cut off, and unbounded they would hold a cell (and the vouch excusing its
+				// silence) for as long as the handler likes.
+				readOnlyHostRequestTimeoutMs: () => this.settingsManager.getAgentMessageWaitSettings().bindMs,
+				onLateHostReply: (reply) => this._reportLateKernelHostReply(reply),
 			});
 			configuredBaseToolDefinitions = createAllToolDefinitions(this._cwd, {
 				ipython: {
@@ -12029,13 +12095,21 @@ export class AgentSession {
 				settled: false,
 			};
 		}
+		// B9/I-13: label and facts stay separate. An excused stall (a host-owned phase, or kernel
+		// and host facts vouching that externally owned work is in flight) is healthy long work, so
+		// the child keeps its real activity label while the forensic record still reaches the roster
+		// row and the terminal classifier. Read from the event's own exemption segment: the watchdog
+		// measured it at the moment it fired, and re-deriving it here would race the next sample.
+		const exemption = event.diagnostics.exemption;
+		const excused = stage !== "unsettled" && exemption?.reason !== undefined && exemption.exhausted !== true;
 		run.stall = {
 			silentMs: event.silentMs,
 			thresholdMs: event.thresholdMs,
 			inFlightTools,
 			unsettled: stage === "unsettled" || run.stall?.unsettled === true ? true : undefined,
+			...(excused ? { excused: true, excusedReasons: [...exemption.reasons] } : {}),
 		};
-		if (!child.stallExempted) run.activity = { kind: "stalled" };
+		if (!child.stallExempted && !excused) run.activity = { kind: "stalled" };
 		run.emitUpdate?.();
 	}
 

@@ -101,6 +101,28 @@ export interface KernelManagerOptions {
 	 * Absent or empty: nothing is cancellable by a cell abort, which is today's behaviour.
 	 */
 	cancellableHostRequestTypes?: readonly string[];
+	/**
+	 * Bound on one read-only (whitelisted) host request, read live so a settings edit applies at
+	 * once. Default {@link DEFAULT_SHORT_TARGET_WAIT_MS}. A side-effecting request is never bounded
+	 * here: cutting one off mid-flight is exactly what the whitelist exists to prevent.
+	 */
+	readOnlyHostRequestTimeoutMs?: () => number;
+	/**
+	 * A host request finished after the kernel that asked for it was gone, so its reply could not
+	 * be delivered. The work may well have happened (a child was admitted, a message was sent),
+	 * which is why this is reported rather than dropped (I-6).
+	 */
+	onLateHostReply?: (reply: KernelLateHostReply) => void;
+}
+
+/** One host reply that could not be delivered because the kernel was already gone. */
+export interface KernelLateHostReply {
+	requestId: string;
+	type: string;
+	/** Target read off the request payload when the type carries one. */
+	label?: string;
+	/** Whether the handler succeeded; the work happened either way. */
+	ok: boolean;
 }
 
 /** How often one session may revive its kernel before it fails closed (C8). */

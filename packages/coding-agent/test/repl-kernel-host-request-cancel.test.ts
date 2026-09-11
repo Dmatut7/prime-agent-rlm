@@ -16,12 +16,34 @@ const readline = require("node:readline");
 const emit = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
 emit({ event: "ready", protocol: 3, python: process.version });
 const input = readline.createInterface({ input: process.stdin });
+const waiting = {};
 input.on("line", (line) => {
   const request = JSON.parse(line);
+  if (request.type === "host_reply") {
+    const cellId = waiting[request.id];
+    delete waiting[request.id];
+    if (cellId === undefined) return;
+    const ok = request.data && request.data.status === "ok";
+    emit({ event: "stdout", id: cellId, text: "reply:" + (ok ? "ok" : "error") });
+    if (ok) {
+      emit({ event: "done", id: cellId, status: "ok" });
+    } else {
+      emit({ event: "error", id: cellId, ename: "RuntimeError", evalue: (request.data && request.data.error) || "host error", traceback: [] });
+      emit({ event: "done", id: cellId, status: "error" });
+    }
+    return;
+  }
   if (request.type === "execute") {
     if (request.code.startsWith("ask:")) {
       const requestType = request.code.slice(4);
-      emit({ event: "host_request", id: "hr-" + request.id, data: { type: requestType, target: "worker" } });
+      const rid = "hr-" + request.id;
+      waiting[rid] = request.id;
+      emit({ event: "host_request", id: rid, data: { type: requestType, target: "worker" } });
+      return;
+    }
+    if (request.code === "emit-late-reply") {
+      emit({ event: "stderr", id: null, text: "late host_reply for hr-9 arrived after the awaiting cell was cancelled" });
+      emit({ event: "done", id: request.id, status: "ok" });
       return;
     }
     emit({ event: "done", id: request.id, status: "ok" });
@@ -61,7 +83,13 @@ interface Handler {
 	done: Promise<Record<string, unknown>>;
 }
 
-function newManager(cancellableHostRequestTypes?: readonly string[]): {
+function newManager(
+	cancellableHostRequestTypes?: readonly string[],
+	extra?: {
+		readOnlyHostRequestTimeoutMs?: () => number;
+		onLateHostReply?: (reply: { requestId: string; type: string; ok: boolean }) => void;
+	},
+): {
 	manager: ReplKernelManager;
 	handlers: Map<string, Handler>;
 } {
@@ -83,6 +111,10 @@ function newManager(cancellableHostRequestTypes?: readonly string[]): {
 		python,
 		cwd: tempDir,
 		...(cancellableHostRequestTypes ? { cancellableHostRequestTypes } : {}),
+		...(extra?.readOnlyHostRequestTimeoutMs
+			? { readOnlyHostRequestTimeoutMs: extra.readOnlyHostRequestTimeoutMs }
+			: {}),
+		...(extra?.onLateHostReply ? { onLateHostReply: extra.onLateHostReply } : {}),
 		hostHandlers: {
 			"readonly.slow": async (_payload, signal) => {
 				readOnly.signal = signal;
@@ -190,5 +222,82 @@ describe("hostRequestTypeIsCancellable", () => {
 		expect(hostRequestTypeIsCancellable(["*"], "rlm.run")).toBe(true);
 		expect(hostRequestTypeIsCancellable([], "rlm.find_models")).toBe(false);
 		expect(hostRequestTypeIsCancellable(undefined, "rlm.find_models")).toBe(false);
+	});
+});
+describe("read-only host request bound (C14 family)", () => {
+	it("cuts off a whitelisted handler that never answers and tells the cell", async () => {
+		const { manager, handlers } = newManager(["readonly.slow"], {
+			readOnlyHostRequestTimeoutMs: () => 60,
+		});
+		try {
+			const result = await manager.execute("ask:readonly.slow");
+			// The handler was abandoned, the kernel got an error reply, and the cell settled
+			// instead of riding out the stall watchdog.
+			expect(result.status).toBe("error");
+			expect(result.stdout).toContain("reply:error");
+			expect(result.error?.evalue).toContain("wait timed out");
+			expect(handlers.get("readonly.slow")?.signal).toBeDefined();
+		} finally {
+			handlers.get("readonly.slow")?.release();
+			await manager.shutdown();
+		}
+	});
+
+	it("never bounds a side-effecting handler (positive control)", async () => {
+		const { manager, handlers } = newManager(["readonly.slow"], {
+			readOnlyHostRequestTimeoutMs: () => 60,
+		});
+		try {
+			const pending = manager.execute("ask:rlm.run");
+			let settled = false;
+			void pending.then(() => {
+				settled = true;
+			});
+			await new Promise((resolve) => setTimeout(resolve, 400));
+			expect(settled).toBe(false);
+			handlers.get("rlm.run")?.release();
+			const result = await pending;
+			expect(result.status).toBe("ok");
+			expect(result.stdout).toContain("reply:ok");
+		} finally {
+			handlers.get("rlm.run")?.release();
+			await manager.shutdown();
+		}
+	});
+});
+
+describe("late host reply visibility (I-6 / P1-2a)", () => {
+	it("reports a reply that could not be delivered to the session", async () => {
+		const late: { requestId: string; type: string; ok: boolean }[] = [];
+		const { manager, handlers } = newManager(["readonly.slow"], {
+			onLateHostReply: (reply) => late.push(reply),
+		});
+		try {
+			const pending = manager.execute("ask:readonly.slow").catch(() => undefined);
+			await vi.waitFor(() => expect(handlers.get("readonly.slow")?.signal).toBeDefined(), { timeout: 15_000 });
+			// The kernel dies while the handler is still working; the revival keeps the request
+			// alive, so the handler finishes and its reply has nowhere to go.
+			await manager.kill();
+			handlers.get("readonly.slow")?.release();
+			await pending;
+			await vi.waitFor(() => expect(late.length).toBe(1), { timeout: 15_000 });
+			expect(late[0]).toMatchObject({ type: "readonly.slow", ok: true });
+		} finally {
+			handlers.get("readonly.slow")?.release();
+		}
+	});
+
+	it("shows an unattributed late-reply line on the next cell", async () => {
+		const { manager } = newManager();
+		try {
+			const first = await manager.execute("emit-late-reply");
+			// The line is emitted while the cell is active, so it belongs to that cell's own
+			// background output; the channel is what the runtime's late reply uses.
+			expect(first.backgroundOutput ?? first.stderr).toContain("late host_reply for hr-9");
+			const second = await manager.execute("1 + 1");
+			expect(second.status).toBe("ok");
+		} finally {
+			await manager.shutdown();
+		}
 	});
 });

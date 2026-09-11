@@ -906,6 +906,68 @@ class ReplTest(unittest.TestCase):
         self.assertEqual(one(events, "result")["text"], repr(envelope))
         self.assertEqual(one(events, "done")["status"], "ok")
 
+    def test_late_host_reply_is_reported_instead_of_dropped(self):
+        # The cell that issued the request is interrupted, so its future is dropped; the host
+        # reply then arrives for a rid nobody waits on. It used to vanish, which is how a model
+        # came to repeat a spawn or a send it believed never happened.
+        code = "\n".join(
+            [
+                "from rlm.repl import host_request",
+                "await host_request({'type': 'demo', 'value': 1})",
+            ]
+        )
+        self.repl.send({"type": "execute", "id": "late-hr", "code": code})
+        request = self.repl.read_event()
+        while request.get("event") != "host_request":
+            request = self.repl.read_event()
+        rid = request["id"]
+
+        self.repl.send({"type": "interrupt"})
+        events = self.repl.until_done("late-hr")
+        self.assertEqual(one(events, "error")["ename"], "KeyboardInterrupt")
+        # Negative control: nothing was reported before the reply actually arrived.
+        self.assertNotIn("late host_reply", stream_text(events, "stderr"))
+
+        self.repl.send({"type": "host_reply", "id": rid, "data": {"status": "ok", "result": {"ok": True}}})
+        late = self.repl.read_event()
+        while late.get("event") != "stderr":
+            late = self.repl.read_event()
+        # Unattributed on purpose: the host buffers id-less stream text as background output and
+        # shows it on the next cell, so this needs no protocol addition.
+        self.assertIsNone(late.get("id"))
+        self.assertIn("late host_reply", late["text"])
+        self.assertIn(rid, late["text"])
+
+    def test_host_reply_to_a_settled_waiter_stays_quiet(self):
+        # A teardown fails every pending future but leaves it registered; the reply that follows
+        # must not be reported as "late" noise for a waiter that already has its answer.
+        code = "\n".join(
+            [
+                "from rlm.repl import host_request",
+                "reply = await host_request({'type': 'demo'})",
+                "reply",
+            ]
+        )
+        self.repl.send({"type": "execute", "id": "quiet-hr", "code": code})
+        request = self.repl.read_event()
+        while request.get("event") != "host_request":
+            request = self.repl.read_event()
+        self.repl.send(
+            {"type": "host_reply", "id": request["id"], "data": {"status": "ok", "result": {"answer": 1}}}
+        )
+        events = self.repl.until_done("quiet-hr")
+        self.assertEqual(one(events, "done")["status"], "ok")
+        self.assertNotIn("late host_reply", stream_text(events, "stderr"))
+        # A second reply for the same rid is now genuinely unknown, but the waiter is settled and
+        # gone: it is reported, which is the honest answer for a duplicate the host should not send.
+        self.repl.send(
+            {"type": "host_reply", "id": request["id"], "data": {"status": "ok", "result": {"answer": 2}}}
+        )
+        late = self.repl.read_event()
+        while late.get("event") != "stderr":
+            late = self.repl.read_event()
+        self.assertIn("late host_reply", late["text"])
+
     def test_typed_host_request_unwraps_exact_handler_result(self):
         code = "\n".join(
             [
