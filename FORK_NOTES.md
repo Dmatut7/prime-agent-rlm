@@ -11,6 +11,86 @@
 
 ---
 
+## 2026-09-11 · 多代理稳定性大修（五段死亡链治理）
+
+范围：`merge/repl-kernel` `10b6b4e55..4b3399eb6`，**50 笔提交、146 文件 +26959/−821**。本节收口基准 `4b3399eb6`；工作区尚留一处未提交的 B1c 诊断 polish（`stall-watchdog.ts` 的 `spentThisCycle` 字段 + 配套测试，由后续车道接手）。运维面（可观测签名 / 回滚开关 / 部署日清单 / flaky 清单）见新建的 **`docs/fork/ma-multistability-ops.md`**；本轮新 settings 键已补进 `packages/coding-agent/docs/settings.md`。
+
+### 一、为什么改：审查实证的一条五段串联死亡链
+
+前置审查（材料在 `/tmp/ma_audit/`，缺陷总表 `FINAL.md`）：6 条只读车道（K3/0902/flash 异构分工）→ 3 个异构验证器逐条攻定级（K3↔0902 互攻 + deepseek 核量级）→ 3 个活体探针实证。主线发现：
+
+> 等一个子代理（或跑一条长命令）超过 15 分钟 → 看门狗误杀 → 误杀连带把全家子代理的回话通道焊死 → 父侧看到的却是「正常完成」→ 僵尸记账就此留下。
+
+| 段 | 机制 | 生产/活体实证 |
+|---|---|---|
+| ① 误杀 | stall 活性判据 =「当前 cell 最近写没写自己 stdout」；健康长活儿与死锁的可观测历史逐字节相同 | 43 次 abort 全部 silentMs≈900000、在飞工具 144/144 全是 ipython；37 个被砍 cell 只剩 19 字符「Request was aborted.」；活体探针 900.0 秒整被杀 |
+| ② 焊死 | requestAbort 不级联子代理、反而挂起父代理输入泵：子代理 send(parent) 一律硬抛、终态通知 5 分钟后静默丢弃、无法自愈 | 内核死后连 agent_message 都发不出（活体复现） |
+| ③ 粉饰 | 终态分类只认 `stopReason==="error"`：被误杀 ⇒ 父代理收到「completed without sending a reply」；stall_* 事件不在父代理订阅分支里，零用户可见信号 | 本轮审查自身两例逐字符合 |
+| ④ 砖化 | 内核意外死亡（OOM/崩溃/被杀）后会话永久砖化：`restart()` 全仓零调用者、每次调用抛「Kernel has been shut down」、死因只进内存环形缓冲永不落盘 | 2 会话各 7 连败其后 0 成功；kill -9 活体复现 |
+| ⑤ 僵尸 | 记账与真相发散 | 73%（94/128）会话租约指向死 pid；rlm-ledger 46%（770/1666）指向已消失子代理 |
+
+放大器（孤儿环）：abort/dispose 只沿活跃子代理走 ⇒「已完成→被追发→又派孙」的中间层下面的活孙辈杀不到，而 `hasRunningRlmChildren` 仍报忙。
+
+修法来源：双独立设计（0902 + K3）→ deepseek 中立合并（21 冲突）→ 四维异构评审（correctness/capability/complexity/engineering）→ 合修终裁 C1-C21（`FIXPLAN_FINAL.md`）→ 红队四报（59 条新风险）→ 批次重排补遗（批 0 前置保护先上）。全程总闸：**任何修复不得降低 AI 能力；降能点必须逐条登记**。
+
+### 二、改了什么：逐批次（50 笔）
+
+| 批次 | 提交 | 内容 | 用户能感觉到什么 |
+|---|---|---|---|
+| **批 0 · 前置保护**（11 笔，`46cc03254`…`c21d47a76`） | venv 治理三件：技能集就绪改**超集判定**+记录**并集写**（根除多技能集 ping-pong 重装，`dd62e6832`）；bootstrap 锁 300s 超时+可取消+settings 化（`46cc03254`）；**版本化目录** `kernel-venv-<hash12>`（每个 build identity 一个兄弟目录；有活引用的目录永不 rename/原地重建/删除，在用重建一律 `defer` 显式报错）+ `.in-use` 引用计数 + 保留 1 份无引用旧代 GC（`ca92e1b34`/`c21d47a76`）。内核协议 **env 协商**（`PRIME_AGENT_KERNEL_PROTOCOL`，宿主默认请求 4、clamp [3,4]，协商 <4 禁发一切 v4 帧；`30c726254`/`6209e1d80`）。快照 **preserve_names 合并写**：部分恢复失败不再永久封笔，坏名字按名保留旧 blob、快照单调变好（`5943aa551`/`f396cdd30`/`5172aea6e`/`33ade94b8`） | 子代理首格「Starting Python kernel...」分钟级卡顿消失；内核重建不再 rm -rf 别的会话正在用的 venv；resume 后「状态全丢且无提示」变成有名单、有日志 |
+| **批 1 · 死亡链**（9 笔，`c2a388dd6`…`0ef41c246`） | 终态**四态化**（error/aborted/stall_killed/completed_without_reply），失败类通知无条件发（解开 `_parentReplyCount` 闸）、父代理订阅补 stall_* 分支（`ef788e0db`）；Esc **不级联**杀子代理（C1 裁乙：Esc=只停当前回合），但 abort 级联**补齐孙辈**（孤儿环，settled 子树也走 cascade）；挂起泵期间 send → **queued 事实回执**（不再硬抛）+ `subagentWake.policy` 默认 `failure_aggregated`（失败类终态聚合唤醒一次，`562262c07`）+ 不可达终态通知转录直落 + sidecar 下次启动 reflow（不再 5 分钟丢弃，`780a29fec`）；豁免预算**按谓词封顶**（vouched 与 paused 单一合计预算 max(10×warn, 30min)，先修 touch 不清零的累加器缺陷，`c2a388dd6`）；19 字符谜团 → **被砍工具输出保全**（1.25s 有界收割 + 8KB 尾段，`8a6b8f1f4`）+ ipython cell abort 结构化死因（`f60529a43`） | 子代理被杀不再报「完成未回话」；被砍的 cell 能看到死因和部分输出；Esc 语义确认（杀树走 agents-view 显式入口） |
+| **批 1c · 心跳与 vouch**（13 笔，`211a16c6d`…`9a2828d33`） | 协议 4 **内核活性心跳**：线程带外帧（`KERNEL_HEARTBEAT_INTERVAL_MS` 默认 5s），带 loop_tick + 单调进展计数 + bash FIONREAD 事实族；strict JSON（NaN 拒帧不杀内核）、不进模型上下文（`be6570803`/`65dacb311`）；心跳陈旧时**降级 journal 兜底**（按 kernelPid 读盘，TTL 大于它所喂的预算，`29b18d204`/`58dc90bb8`）；看门狗 **vouch**：工具在飞 + 内核/宿主事实证明外部工作在跑 ⇒ abort 缓期（警告照发、文案改写为真实语义+剩余预算），两级预算（进展证据 50min / 仅存在性证据 20min）、宿主请求 vouch 龄上界 15min、**预算耗尽闩锁必杀**（`61a3ba890`）；`loop_stalled` 仅在 tick 差分证明时报告（`3046b0580`）、缺龄按 agedOut、`no_kernel_facts` 只对协议 ≥4 报（`d95021edd`）；**终审 A1 闭合**：vouch 闪烁（证据断档后重读）不再无限续命，断档前已积累的豁免时间结转、已见顶的 cap 保持已尽（`f307f943d`）；**B9**：被豁免的健康子代理不再对用户显示 stalled（agents view 显示 `long-running 12m`，stall 事实带 `excused` 旗标照流，`9a2828d33`） | 长 `await bash(...)`、长构建、等子代理不再 15 分钟被砍；真死锁仍必死（活句柄兜底档最坏 ~20min，合计预算封顶 50min，见登记降能） |
+| **批 2 · 砖化与等待**（5 笔，`a5179de81`…`4b3399eb6`） | 内核**死因归因**：code/signal/origin（`oom_suspect` 仅凭内存证据）、与宿主有意杀（shutdown/kill/dispose/协议修复）分账、双落盘（`a5179de81`）；**自动复活**：意外死亡由下一格复活（spawn+restore+re-bootstrap），结果头带 reset notice（回滚点、未复活名单、丢失的宿主回话、**副作用不回滚**），预算 3 次/1h 滑窗 fail-closed ⇒ `KernelUnavailableError` 带死亡链（`f18c2ba77`）；agent message 四个等待点**有界化**（`agentMessage.targetWaitSeconds` 120/60/60/60，retryable 错误带 phase/target/waitedMs，被等的操作永不取消，三连败转终态+写文件指引，`dfc3df92d`）；cell abort **只取消只读白名单**宿主请求（`rlm.find_models`/`list_subagents`、`agent_observe.*`、`model.info`、`agent_message.list_agents`），副作用类（`rlm.run`、`agent_message.send`）维持 teardown-only ⇒ Esc 不再风险杀掉刚 admit 的子代理（`ecfa71d37`）；**exactly-once 投递**：sender-minted message_id + 收端 1024 个 id 记忆，重发回执「第一次才算数」；同文本双发仍双达（有意不采内容幂等键，`4b3399eb6`）；迟到 host_reply 上报不再静默丢弃 | 内核 OOM 不再砖化整个会话；send 卡死有界、有事实回执；重试不再造出双胞胎消息 |
+| **批 3 · daemon 生命周期**（4 笔，`0ec081a26`…`16c56168f`） | 启动**收养不堵 ready**（后台化、`daemon_hello` 报收养数、启动日志列每个未起会话+原因+恢复命令）、收养请求 300s 有界、失败退避重收养（30s/2min/10min）；**kill 全生命周期可达**（recovering/failed/stopped）、已消失目标回 `alreadyTerminal`、读命令不谎称成功；catch-up **有界重试**（250ms→8s cap + 1min jitter，40 次 ≈5min）+ 客户端快照 re-pull 失败降级可见；supervisor **崩溃护栏**（uncaughtException 记栈退出；unhandledRejection log-and-isolate + 1h 计数 + `degraded` 对外可见 + 可选阈值 exit）+ 簿记写失败不再拖垮 daemon；**failed-worker reaper**（24h + 双证死 + 无 schedule 无 client ⇒ 带真实 failure reason 归档后移除，degraded 时停摆）。SCHEMA_REVISION 27→**28** | 一个坏 worker 不再拖垮整个 daemon 启动；73% 死租约 / 46% 僵尸 ledger 有了清道夫；视图残缺 708 次/期的 catch-up 单点失败变有界重试 |
+| **批 4 · 兜底与超时分层**（8 笔，`5f7354426`…`82c2340ec`） | daemon 超时**四档分层**（long 24h / adoption 300s / deliver 120s / read 30s，`5b37f330d`）+ 客户端重连预算（从收养档推导，后台重试）；长 send **移出 mutationDrain 闩**（独立可回滚，`7bf3e5f0d`）；**pending-delivery 队列**（100/会话、24h deadline、drain 显式回执、requeue 日志节流、abandoned 回执分 `undelivered|uncertain` 两种可数状态，`7406aa22d`/`dcfb7f6ea`/`82c2340ec`）；deferred 命令**瞬时重试提示**（retryAfterMs 预算内重试，`5f7354426`）；事件缺口恢复**熔断器**（3 连发或 10min 内 3 次 ⇒ 该连接余生降回 log-only；开关档案 `docs/fork/ma-p0-5c-recover-switch-archive.md`，默认仍 `"log"`，`cb749c7bc`）。SCHEMA_REVISION 28→**29** | 「双方都没错但用户看到死」的四组超时组合拳被拆档；消息不再在 drain 窗口静默蒸发 |
+
+wire 纪律实况：批 1/1c 的加法全部走能力门（`rlm_child_stall_activity` 等 additive 字段，不占 revision 号）；取号发生在批 3（28）与批 4（29），HEAD=29，digest 自检绿。内核协议走 env 协商（C21 裁甲），`PRIME_AGENT_KERNEL_PROTOCOL=3` 是 v4 全部能力的单点回滚杠杆。
+
+### 三、登记降能与行为变化（诚实清单）
+
+- **hung bash 救援窗 15→20min**：活句柄但零进展（卡在 stdin 的交互客户端）按存在性档 20min 救，比旧的 900s 晚 5min；有裁（无人值守永久挂死 > 误杀）。
+- **`time.sleep(1200)` 型同步阻塞格仍会被杀**（~20min 活性档封顶，与真死锁不可区分）——修复救的生产主形态是 `await bash(...)`/等子代理（心跳+vouch 豁免）；这是终审验收探针的既定口径，不是回归。
+- **闩锁代价**：豁免 cap 吃满后，活动恢复不再救回本回合。
+- **纯重定向命令只拿 20min 存在档**（无 stdout 进展可读）。
+- **Esc = 只停当前回合、不动子代理**（C1 裁乙，产品语义已确认）；杀树走 agents-view 显式入口。
+- **排队的子代理消息不再自动开新回合**（`subagentWake.policy` 默认 `failure_aggregated`）；要旧行为设 `"always"`。
+- **内核复活 ≠ 无损**：命名空间回滚到最后快照点，其后定义全部丢失，但副作用（文件写、提交、已发消息、已派子代理）**不回滚**；reset notice 逐格明示。
+- **bootstrap 锁 300s**：极慢机器全量装 >300s 会从「无界慢」变「显式失败+指引」（`kernelBootstrap.lockTimeoutMs` 可调）。
+- **在用 venv 拒绝重建**：有活引用的 generation 永不原地重建，启动显式报 `venv rebuild deferred: N kernels in use`（平台无关降级案——新 identity 落新兄弟目录，根本没有 rename 换入可供 Windows 失败）。
+- **有界等待新增一类 retryable 错误**（`agent message target wait timed out` 带 waitedMs），三连败转终态并指引写文件交付。
+
+### 四、三起并行施工事故与纪律沉淀
+
+多条施工车道（T0A/T0B/T1A/T1B/T3/T3b/B1c/B2/T4）同仓同工作区并行，husky pre-commit 的「重新暂存」机制（`for file in $(git diff --cached --name-only); do git add "$file"; done`，为回收 `biome --write` 的修复）使**索引级分离在本仓无效**，由此出了三起事故（同机制轻症另有一起：T0-2 的 6 行注释被 `f60529a43` 带走，commit message 已注明）：
+
+1. **`30c726254`（T0A 车道）**：钩子把 T0B 在飞的 `repl-manager.ts` 半（~200 行）卷进提交，而其依赖文件未提交 ⇒ **HEAD 一度不可编译**（纯净树 8 条 tsgo error）。
+2. **`ef788e0db`（T1A 车道）**：提交了引用 `SettingsManager.getSubagentWakePolicy` 的 `agent-session.ts`，而 `settings-manager.ts` 还在工作区 ⇒ 纯净树 6 条红。钩子查工作区所以放行——**半提交对钩子免疫，只有 `git archive` 纯净树能抓到**（由 T0B 的交付复验抓到）。
+3. **`ecfa71d37`（T2-5 车道）**：串行约定下 `git add` 前只看了 `git status` 没逐 hunk 核对，把 B1c 按约定在飞的 `agent-session.ts` B9 半卷走。处置与前两起同款：**不 amend、不 revert、双向登记归属**。
+
+沉淀为全员纪律（已写进根 `AGENTS.md`「Shared-Worktree Construction Discipline」节）：**共享文件全量提交铁律**（提交=文件粒度非 hunk 粒度；stage 前逐 hunk 核对；共享文件串行提交）；**每笔提交后 `git archive HEAD` 纯净树 tsgo=0 复验**；**测试环境净化**（`env -u` 掉 RLM_*/PRIME_AGENT_*/PI_* 泄漏变量，否则测试写真 `~/.prime/agent`、断言随机器漂移；Python 套件同样适用）；**半成品不落共享工作区的 `test/`**（一个车道的 WIP 会挡住所有车道的提交）；**等绿窗提交、禁 `--no-verify`**；**变异/纯净树验证钉 SHA 不钉 HEAD**。
+
+### 五、终审结论（四条异构车道复核，全过）
+
+交付面终审由四条独立异构车道承担，全部基于 `git archive` 纯净树 + 净化 env，复核范围 `10b6b4e55..a5179de81`（39 笔时点）：**不变量与量级核算**（final_invariants，逐条验算全部「有界」断言 + 自建时钟仿真）、**新引入问题猎手**（final_regression，逐 diff 通读全部 39 笔 + 亲跑定向套件）、**修复有效性**（final_effectiveness，HEAD 纯净树 342 例全绿 + base 树红验 27/34 红）、**集成冒烟与一致性**（final_smoke，全仓实测 + changelog/wire/文档一致性核对）。结论口径：
+
+- **HEAD 上无一条今天引入的确定性回归**；全量红 = 2 条既有红复跑同签名 + 1 条环境依赖 + 2 条负载 flake（逐条 base 树对照）。
+- 终审时点全仓实测：tsgo EXIT=0、biome 1089 files EXIT=0、coding-agent collected 5372 = 5287 passed + 5 failed（全部定性既有/环境/flake）+ 80 skipped、`npm run test:kernel` **30/30 绿**、runtime unittest **317 OK**。
+- FINAL.md 五段死亡链逐条对照：①②③⑤ 真闭环、④ 死因归因半闭环（自动复活当时在飞）——**批 2 落地后 ④ 闭合**；D2 等待点/exactly-once 同批闭合。
+- 终审发现的全部中/高级项已逐笔闭合（每笔先红后绿 + 变异 + 纯净树复验）：A1 豁免预算不闭合 ⇒ `f307f943d`；A2/B9 excused 子代理误标 stalled ⇒ `9a2828d33`；投递重复窗 ⇒ `82c2340ec` + `4b3399eb6`；reaper 归档 lastError 半盲 ⇒ `19f6f96f5`；requeue 日志放大 ⇒ `dcfb7f6ea`；心跳时序 flake ⇒ `b49556902`；catch-up 终态 close 的注释谎话 ⇒ `16c56168f`（诚实登记，行为变更留新立项）。
+- 终审点名的三处文档滞后（settings.md 缺 `kernelBootstrap.lockTimeoutMs`、AGENTS.md 缺 `test-hygiene-allow` 通道、FORK_NOTES 缺本轮入口节）⇒ 本提交补齐。
+
+### 六、遗留与待老板裁决
+
+**待裁**（不裁不动工）：① C18 daemon 崩溃策略——已先落地推荐默认形（rejection log-and-isolate + 计数 + degraded 可见，阈值 exit 可开），追认 or 改；② C12 replay 真缓冲环——缓行单独立项（推荐）；③ C21 混版窗终态——维持协商式（推荐）vs 未来硬 bump；④ catch-up「放弃→踢下线」路径彻底移除——需客户端自治重连语义，能力变更单列（`16c56168f` 已在代码处登记）；⑤ F18 两个暂认值（venv.old 保留数 1、收养 create 超时 300s）。
+
+**遗留工程项**：legacy `~/.prime/agent/kernel-venv`（523MB）不自动回收，清理命令与时机见运维手册；11 个 kernel 系测试文件仍硬编码 legacy 路径作 python fallback（收口基准实测；build 后统一改 `activeKernelVenvDir`，否则有「静默跑到旧 runtime」的假验收风险）；`ipython.ts` 的用户提示文案仍指 legacy 目录；P2 测试卫生真清债（recursion 11 条等）；既有红两条（`4600-supervisor-singleton` 上游测试与代码语义脱节、`agent-session-auto-refine-probe` 净化 env 必红）待单开小任务裁决；后台重连 timer 无 unref（低危登记）；schema digest 不覆盖 response 面（登记级）。
+
+**在飞**：B1c 诊断 polish（`spentThisCycle`）在工作区未提交，归后续车道。
+
+细节文档：运维手册 `docs/fork/ma-multistability-ops.md` · 缺口恢复开关档案 `docs/fork/ma-p0-5c-recover-switch-archive.md` · settings 新键 `packages/coding-agent/docs/settings.md` · 审查/施工/终审材料 `/tmp/ma_audit/`（不在仓内，关键结论已收进本节与运维手册）。
+
+---
+
 ## 2026-09-07 · 主仓迁到独立仓 + 根代理对用户说话方式
 
 这一轮两件事：把远程身份从「官方 fork + 两个实验仓」收成一个独立主仓；把昨晚未提交的根代理沟通契约入仓并记在这里。

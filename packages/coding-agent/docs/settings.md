@@ -263,6 +263,26 @@ own stderr carries memory evidence and `unknown` otherwise.
 }
 ```
 
+### Kernel Bootstrap
+
+The kernel Python venv is shared by every session on the machine and guarded by
+a machine-wide bootstrap lock. Each build identity gets its own versioned
+generation directory (`~/.prime/agent/kernel-venv-<hash12>`); a generation with
+live kernels is never renamed, rebuilt in place, or deleted under them, and an
+old one is reclaimed only after its references drop to zero.
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `kernelBootstrap.lockTimeoutMs` | number | `300000` | How long a kernel boot waits for the shared bootstrap lock while another session is creating or rebuilding the venv (5 min). On timeout the boot fails with a typed error naming the lock holder's pid and the `PRIME_AGENT_KERNEL_PYTHON` bypass. `0` waits forever (the previous unbounded behaviour) |
+
+```json
+{
+  "kernelBootstrap": {
+    "lockTimeoutMs": 300000
+  }
+}
+```
+
 ### Message Delivery
 
 | Setting | Type | Default | Description |
@@ -297,6 +317,23 @@ later succeeded mean it is too short); rollback - raise
 {
   "agentMessage": {
     "targetWaitSeconds": 120
+  }
+}
+```
+
+### Subagent Wake
+
+Whether an agent message queued into a session whose input pump is suspended
+(the user pressed Esc, or the stall watchdog killed the turn) may wake it.
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `subagentWake.policy` | string | `"failure_aggregated"` | `"never"`: nothing wakes the pump; queued work waits for user input, an attach or an explicit resume, and undeliverable terminal notices are persisted and reflowed at the next start. `"failure_aggregated"`: only failure-class subagent terminal notices wake the pump, as one aggregated turn per quiet window, so Esc keeps meaning "stop". `"always"`: every queued agent message wakes the pump (the old behaviour) |
+
+```json
+{
+  "subagentWake": {
+    "policy": "failure_aggregated"
   }
 }
 ```
@@ -349,8 +386,21 @@ Normally the package manager's global modules location is queried using `root -g
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `idleEvictionMinutes` | number or `"off"` | `90` | Idle threshold in minutes for whole-tree worker eviction and individual idle-child passivation; `"off"` disables both. |
+| `daemon.eventGapRecovery` | string | `"log"` | What an attached client does when it detects a hole inside one daemon event generation: `"log"` records the gap only; `"recover"` also re-pulls the session snapshot, behind a circuit breaker (three consecutive gap re-pulls that did not close the hole, or three inside ten minutes, degrade that connection to log-only for the rest of its life). Flipping the default to `"recover"` is gated on the observation archive in `docs/fork/ma-p0-5c-recover-switch-archive.md`; the value is read once per client process |
+| `daemon.supervisorRejectionExitThreshold` | number | off | Exit(1) the daemon supervisor once this many unhandled rejections land inside one hour. Unset or `0` keeps the shipped log-and-isolate behaviour: rejections are logged at a bounded rate, counted over an hour, and published as `degraded` in `daemon_hello` |
+| `daemon.failedWorkerReapHours` | number | `24` | Hours a failed worker registration whose process is provably gone (no schedule, no attached client) is kept before the reaper archives it to the daemon log with its real failure reason and removes it. `0` or negative keeps failed workers forever |
+| `daemon.failedWorkerReapEnabled` | boolean | `true` | Set `false` to disable the failed-worker reaper entirely. The reaper also stands down on its own while the supervisor is degraded |
 
-`idleEvictionMinutes` is a global daemon policy and is read only from `~/.prime/agent/settings.json`. Set it to a positive number to configure the idle threshold.
+`idleEvictionMinutes` is a global daemon policy and is read only from `~/.prime/agent/settings.json`. Set it to a positive number to configure the idle threshold. The `daemon.*` supervisor-policy keys default to the shipped behaviour, so an absent `daemon` section changes nothing.
+
+```json
+{
+  "daemon": {
+    "eventGapRecovery": "log",
+    "failedWorkerReapHours": 24
+  }
+}
+```
 
 ### Sessions
 

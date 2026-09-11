@@ -28,7 +28,7 @@
 - Do not preserve backward compatibility unless the user explicitly asks for it
 - Never hardcode key checks with, eg. `matchesKey(keyData, "ctrl+x")`. All keybindings must be configurable. Add default to matching object (`DEFAULT_EDITOR_KEYBINDINGS` or `DEFAULT_APP_KEYBINDINGS`)
 - NEVER modify `packages/ai/src/models.generated.ts` directly. Update `packages/ai/scripts/generate-models.ts` instead.
-- Never probe private members from tests: no `as unknown as { _foo: ... }` casts, no same-file shadow types (`type XInternals = { _foo: ... }`) cast to with `as unknown as`, no `vi.spyOn(target, "_foo")`. Renaming a private member must not be able to break a test silently. Drive the public entry point and assert on observable output. `npm run check:test-hygiene` (CI job `test-hygiene`) fails on new probes; the frozen stock lives in `scripts/test-private-probe-baseline.json` and only shrinks.
+- Never probe private members from tests: no `as unknown as { _foo: ... }` casts, no same-file shadow types (`type XInternals = { _foo: ... }`) cast to with `as unknown as`, no `vi.spyOn(target, "_foo")`. Renaming a private member must not be able to break a test silently. Drive the public entry point and assert on observable output. `npm run check:test-hygiene` (CI job `test-hygiene`) fails on new probes; the frozen stock lives in `scripts/test-private-probe-baseline.json` and only shrinks. The one escape hatch is a `// test-hygiene-allow: <reason>` comment on the violation line or the line directly above it: the reason is mandatory (a bare marker still fails), every suppression is counted and printed by the gate so the debt stays visible, and a marker must name a specific, checkable reason (for example `frozen stock, tracked by the shadow-type removal task`), never a generic waiver.
 
 ## Commands
 
@@ -227,6 +227,18 @@ Multiple agents may work on different files in the same worktree simultaneously.
 - Before committing, run `git status` and verify you are only staging YOUR files
 - Track which files you created/modified/deleted during the session
 - It is always fine to include `packages/ai/src/models.generated.ts` in a commit alongside the actual files you want to commit
+
+### Shared-Worktree Construction Discipline
+
+Added 2026-09-11 after three parallel-construction incidents (two left HEAD temporarily non-compiling, one swept another lane's in-flight half of a shared file into an unrelated commit). All three had the same root cause: the pre-commit hook re-adds every staged path from the working tree (`for file in $(git diff --cached --name-only); do git add "$file"; done`, to recapture `biome check --write` fixes), so **index-level or hunk-level separation does not work in this repo**.
+
+- **Commits are file-granular, not hunk-granular.** Committing a shared file commits its ENTIRE working-tree content. Before staging, read `git diff -- <file>` hunk by hunk and verify every hunk is yours or was explicitly agreed with the other lane. `git status` showing `M` is not enough.
+- **Serialize shared files.** Two lanes must not hold in-flight hunks in the same file across a commit. Coordinate ordering, commit one lane at a time, and re-read the file before every edit - another lane's hook run (`biome --write` is repo-wide) may have reformatted it under you. If someone else's hunk still rode along: do NOT amend or revert; disclose it in the commit message (or a follow-up registration) and record ownership in both lanes' reports.
+- **Re-verify every commit on a pristine tree.** The hook checks the working tree, so a half-commit (a file referencing symbols that live in a not-yet-committed file) passes the hook and breaks HEAD. After committing, run `git archive HEAD | tar -x -C <tmpdir>`, symlink `node_modules`, and run `npx tsgo --noEmit` there - EXIT must be 0 before you report delivery.
+- **Pin SHAs, not HEAD.** Mutation runs, pristine-tree checks and regression baselines must name an explicit commit sha; HEAD moves under parallel lanes.
+- **Sanitize the test environment.** Subagent sessions leak `RLM_*`, `PRIME_AGENT_*` and `PI_*` env vars into test processes; unsanitized runs write to the real `~/.prime/agent` (orphan-process journal, session leases, `daemon.sock.*.log` files) and settings-derived assertions drift with the machine. Run suites with the leaked vars unset (`env -u RLM_DEPTH -u RLM_SESSION_DIR ... npx tsx ...`); this applies to the Python runtime suite too. In programmatic drivers build `("-u", name)` argument pairs - the `env -u=NAME` spelling silently fails on macOS/BSD.
+- **Keep half-finished files out of the shared worktree.** The hook runs repo-wide checks for EVERY lane's commit, so one lane's WIP (especially a new file under `test/`, which vitest shards also pick up) blocks all lanes. Keep work-in-progress outside the repo (e.g. `/tmp`) until it is green and formatted, and never leave a red or unformatted file behind when you go idle.
+- **Wait for a green window; never `--no-verify`.** If repo-wide checks are red because of another lane's in-flight work, poll for the green window (a small watcher re-running `tsgo`/`biome` plus "the index holds exactly my paths") and commit there. Bypassing the hook is forbidden even when the red is provably not yours.
 
 ### Forbidden Git Operations
 
