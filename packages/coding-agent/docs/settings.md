@@ -173,26 +173,49 @@ watchdog counts time since the last observed session activity:
 | `stallWatchdog.enabled` | boolean | `true` | Enable the session stall watchdog |
 | `stallWatchdog.warnAfterSeconds` | number | `300` | Warn (and log diagnostics) after this many silent seconds (5 min) |
 | `stallWatchdog.abortAfterSeconds` | number | `900` | Automatically abort the current turn after this many silent seconds (15 min). Set to `0` for warn-only mode |
+| `stallWatchdog.toolLivenessExemption` | boolean | `true` | Defer the automatic abort while kernel/host facts vouch that externally owned work is in flight. The warning still fires; only the abort escalation is deferred, and only within a bounded budget |
+| `stallWatchdog.treatKernelCpuProgressAsActivity` | boolean | `false` | Reserved, no effect yet: treating kernel CPU progress as session activity is a pending product decision. Registered so the key round-trips without a schema change later |
 
 When the warn stage fires, Prime Agent writes a diagnostics snapshot (last
 event type/time, in-flight tool calls, input-pump state, unfinished queued
-actions) to the structured agent log and shows a warning. If silence reaches
-`abortAfterSeconds`, the turn is aborted automatically so the session becomes
-usable again instead of appearing busy forever; the abort behaves like pressing
-Escape. Phases that legitimately own the turn boundary (compaction, branch
-summaries, serialized refinement) pause escalation instead of counting against it.
+actions, and — when a kernel is attached — the exemption budget and the kernel
+liveness segment) to the structured agent log and shows a warning. If silence
+reaches `abortAfterSeconds`, the turn is aborted automatically so the session
+becomes usable again instead of appearing busy forever; the abort behaves like
+pressing Escape. Phases that legitimately own the turn boundary (compaction,
+branch summaries, serialized refinement) pause escalation instead of counting
+against it.
+
+Silence that somebody else owns is not stall evidence either. While a tool call
+is in flight, a kernel that speaks protocol 4 reports a liveness heartbeat (one
+frame per `KERNEL_HEARTBEAT_INTERVAL_MS`, default 5s) carrying its event-loop
+tick and monotonic progress counters, and the host adds its own facts
+(in-flight host requests, journaled `bash()` children). When those vouch that
+real work is happening, the abort is deferred and the warning says so, with the
+remaining budget. The deferral is bounded: evidence that something *moved*
+(streamed bytes, pipe backlog, buffered output, a host request being executed)
+buys the full exemption budget (`max(10 x warnAfterSeconds, 30min)`), while
+evidence that something merely *exists* (a live handle producing nothing, a live
+loop awaiting a cell) buys a shorter 20-minute budget that stays near the
+pre-exemption rescue window. A host request stops vouching once it is 15
+minutes old. A kernel whose loop is provably frozen with nothing running
+externally gets no exemption at all and is aborted at `abortAfterSeconds` as
+before, and a genuinely wedged turn is always killed once the budget is spent.
 
 Interactions: provider-stream silence is usually caught earlier by
-`retry.provider.streamStallTimeoutMs` (retryable error + auto-retry). Commands
-that are legitimately long and silent should set `timeout` explicitly in the
-bash tool (or raise/disable the watchdog thresholds for such workloads).
+`retry.provider.streamStallTimeoutMs` (retryable error + auto-retry), and the
+exemption never applies to it — the vouch requires a tool call in flight, so a
+healthy kernel cannot excuse a stuck model stream. Commands that are
+legitimately long and silent should set `timeout` explicitly in the bash tool
+(or raise/disable the watchdog thresholds for such workloads).
 
 ```json
 {
   "stallWatchdog": {
     "enabled": true,
     "warnAfterSeconds": 300,
-    "abortAfterSeconds": 900
+    "abortAfterSeconds": 900,
+    "toolLivenessExemption": true
   }
 }
 ```
