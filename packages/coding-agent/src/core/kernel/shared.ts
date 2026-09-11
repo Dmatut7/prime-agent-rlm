@@ -90,6 +90,17 @@ export interface KernelManagerOptions {
 	 * (the rollback lever for unbounded lazy revival).
 	 */
 	restartPolicy?: () => KernelRestartPolicy;
+	/**
+	 * Host request types whose wait may be cancelled by the cell that triggered it (P1-2a).
+	 *
+	 * Only read-only types belong here. A side-effecting request - `rlm.run` admission, a message
+	 * send, a harness write - keeps the teardown-only signal, because the whole point of admitting
+	 * it is that the work outlives the turn: the system prompt tells a model to start the work,
+	 * record the handle and end the turn, and a user pressing Esc on that cell must not kill the
+	 * child it just spawned (M7). An entry ending in `*` is a prefix pattern (`agent_observe.*`).
+	 * Absent or empty: nothing is cancellable by a cell abort, which is today's behaviour.
+	 */
+	cancellableHostRequestTypes?: readonly string[];
 }
 
 /** How often one session may revive its kernel before it fails closed (C8). */

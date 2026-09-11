@@ -9,6 +9,7 @@ import {
 	DEFAULT_KERNEL_REVIVAL_VOUCH_MAX_AGE_SECONDS,
 	DEFAULT_STALL_ABORT_AFTER_SECONDS,
 	DEFAULT_STALL_WARN_AFTER_SECONDS,
+	readAgentMessageWaitSettings,
 	readKernelBootstrapSettings,
 	SettingsManager,
 } from "../src/core/settings-manager.js";
@@ -639,6 +640,69 @@ describe("SettingsManager", () => {
 
 			expect(readKernelBootstrapSettings(projectDir, agentDir)).toEqual({
 				lockTimeoutMs: DEFAULT_KERNEL_BOOTSTRAP_LOCK_TIMEOUT_MS,
+			});
+		});
+	});
+
+	describe("agent message wait settings", () => {
+		it("derives the four tiers from the one long tier", () => {
+			expect(SettingsManager.create(projectDir, agentDir).getAgentMessageWaitSettings()).toEqual({
+				passivationMs: 120_000,
+				bindMs: 60_000,
+				hydrateMs: 60_000,
+				publicationMs: 60_000,
+			});
+
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ agentMessage: { targetWaitSeconds: 10 } }));
+			expect(SettingsManager.create(projectDir, agentDir).getAgentMessageWaitSettings()).toEqual({
+				passivationMs: 10_000,
+				bindMs: 5_000,
+				hydrateMs: 5_000,
+				publicationMs: 5_000,
+			});
+		});
+
+		it("treats 0 as the unbounded rollback lever and ignores a non-number", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ agentMessage: { targetWaitSeconds: 0 } }));
+			expect(SettingsManager.create(projectDir, agentDir).getAgentMessageWaitSettings()).toEqual({
+				passivationMs: Number.POSITIVE_INFINITY,
+				bindMs: Number.POSITIVE_INFINITY,
+				hydrateMs: Number.POSITIVE_INFINITY,
+				publicationMs: Number.POSITIVE_INFINITY,
+			});
+
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ agentMessage: { targetWaitSeconds: "30" } }));
+			expect(SettingsManager.create(projectDir, agentDir).getAgentMessageWaitSettings()).toEqual({
+				passivationMs: 120_000,
+				bindMs: 60_000,
+				hydrateMs: 60_000,
+				publicationMs: 60_000,
+			});
+		});
+
+		it("never resolves a short tier below a second", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ agentMessage: { targetWaitSeconds: 1 } }));
+			expect(SettingsManager.create(projectDir, agentDir).getAgentMessageWaitSettings()).toEqual({
+				passivationMs: 1_000,
+				bindMs: 1_000,
+				hydrateMs: 1_000,
+				publicationMs: 1_000,
+			});
+		});
+
+		it("reads the tiers from disk without a session settings manager", () => {
+			expect(readAgentMessageWaitSettings(projectDir, agentDir)).toEqual({
+				passivationMs: 120_000,
+				bindMs: 60_000,
+				hydrateMs: 60_000,
+				publicationMs: 60_000,
+			});
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ agentMessage: { targetWaitSeconds: 4 } }));
+			expect(readAgentMessageWaitSettings(projectDir, agentDir)).toEqual({
+				passivationMs: 4_000,
+				bindMs: 2_000,
+				hydrateMs: 2_000,
+				publicationMs: 2_000,
 			});
 		});
 	});

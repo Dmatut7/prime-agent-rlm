@@ -110,7 +110,15 @@ import {
 } from "../../core/session-manager.js";
 import { resolveSessionPath } from "../../core/session-resolver.js";
 import type { SessionStats } from "../../core/session-stats.js";
+import { type ResolvedAgentMessageWaitSettings, readAgentMessageWaitSettings } from "../../core/settings-manager.js";
 import { type SideQuestionRun, startSideQuestion } from "../../core/side-question.js";
+import {
+	type AttemptBudget,
+	consumeAttempt,
+	createAttemptBudget,
+	type WaitTimeoutFacts,
+	withBound,
+} from "../../utils/bounded-wait.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import {
 	createAgentConnectionCommands,
@@ -243,6 +251,14 @@ import {
 	type SupervisorAvailabilityState,
 } from "./supervisor-availability.js";
 import { WorkerRecoveryJournal } from "./worker-recovery-journal.js";
+
+/**
+ * Re-entry ceiling for one subagent hydration (M19). Unrelated to `RLM_MAX_DEPTH` on purpose:
+ * that setting counts agent generations (default 2), so deriving a retry cap from it would fail
+ * legitimate contention - several clients attaching to the same session each publish and re-enter
+ * the hydration, and none of them is a recursion depth.
+ */
+const REHYDRATE_MAX_ATTEMPTS = 32;
 
 export interface DaemonModeOptions {
 	socketPath?: string;
@@ -2854,7 +2870,38 @@ export class AgentDaemon {
 
 	private async waitForPassivation(sessionFile: string): Promise<void> {
 		const passivation = this.findPassivationBySessionFile(sessionFile);
-		if (passivation) await passivation.catch(() => {});
+		if (!passivation) return;
+		// Bounded (P1-1). The passivation is never cancelled - a half-written session file is
+		// worse than a slow one, and the next caller joins the same in-flight promise - but the
+		// caller gets a factual, retryable error instead of parking for as long as the client
+		// request that triggered it lives.
+		await withBound(
+			passivation.catch(() => {}),
+			{
+				timeoutMs: this.agentMessageWaits().passivationMs,
+				phase: "passivation",
+				target: sessionFile,
+				label: "Session target",
+				targetState: () => `${sessionFile} is still being passivated`,
+				onTimeout: (facts) => this.logAgentMessageWaitTimeout(facts),
+			},
+		);
+	}
+
+	/**
+	 * Wait tiers for a transitional message target, read from disk on every wait so an operator
+	 * editing settings.json is honoured by the next one (C14/F17).
+	 */
+	private agentMessageWaits(): ResolvedAgentMessageWaitSettings {
+		return readAgentMessageWaitSettings(this.options.defaultSessionConfig.cwd ?? process.cwd(), this.agentDir);
+	}
+
+	/** The countable signature for a bounded wait that ran out of time, with its waitedMs sample. */
+	private logAgentMessageWaitTimeout(facts: WaitTimeoutFacts): void {
+		const state = facts.targetState === undefined ? "" : ` state="${facts.targetState}"`;
+		this.log(
+			`agent message target wait timed out (target=${facts.target} phase=${facts.phase} waitedMs=${facts.waitedMs}${state})`,
+		);
 	}
 
 	private async hydratePassiveRlmSubagent(
@@ -2926,22 +2973,32 @@ export class AgentDaemon {
 		entry: PassiveRlmSubagentEntry,
 		restoreActiveSessionId?: string,
 		clientEnv?: Record<string, string>,
+		attempts?: AttemptBudget,
 	): Promise<ActiveSessionState> {
 		if (this.updateRestart !== undefined) {
 			throw new BoundSessionUnavailableError("Daemon is preparing an update restart");
 		}
+		// Both re-entries below are legitimate contention - another caller holds the reservation,
+		// or published a different child under the same path - so neither can be told apart from a
+		// loop by looking at one step. The budget is the mechanical ceiling: 32 attempts *and* a
+		// total deadline, deliberately not derived from RLM_MAX_DEPTH, which counts agent
+		// generations and would cap a hydration at four re-entries (M19).
+		const budget = attempts ?? createAttemptBudget(REHYDRATE_MAX_ATTEMPTS, this.agentMessageWaits().hydrateMs);
+		const reentryContext = { phase: "hydrate", target: entry.childId };
 		const sessionKey = resolve(entry.sessionFile);
 		const reservation = this.reservingSessionOpens.get(sessionKey);
 		if (reservation) {
+			consumeAttempt(budget, reentryContext);
 			await reservation;
-			return this.rehydrateCompletedRlmSubagent(parentState, entry, restoreActiveSessionId, clientEnv);
+			return this.rehydrateCompletedRlmSubagent(parentState, entry, restoreActiveSessionId, clientEnv, budget);
 		}
 		const pending = this.openingSessions.get(sessionKey);
 		if (pending) {
 			const state = await pending;
 			if (state.runtime.metadata.kind !== "subagent" || state.runtime.metadata.rlmChildId !== entry.childId) {
+				consumeAttempt(budget, reentryContext);
 				if (this.openingSessions.get(sessionKey) === pending) this.openingSessions.delete(sessionKey);
-				return this.rehydrateCompletedRlmSubagent(parentState, entry, restoreActiveSessionId, clientEnv);
+				return this.rehydrateCompletedRlmSubagent(parentState, entry, restoreActiveSessionId, clientEnv, budget);
 			}
 			return this.waitForBoundSession(state);
 		}
@@ -2970,7 +3027,16 @@ export class AgentDaemon {
 	private async waitForBoundSession(state: ActiveSessionState): Promise<ActiveSessionState> {
 		const completion = this.bindingCompletions.get(state.activeSessionId);
 		if (completion) {
-			await completion;
+			// Bounded (P1-1): the bind keeps running, and a caller that ran out of patience gets a
+			// retryable fact naming the session instead of riding out the client's own timeout.
+			await withBound(completion, {
+				timeoutMs: this.agentMessageWaits().bindMs,
+				phase: "bind",
+				target: state.activeSessionId,
+				label: "Session target",
+				targetState: () => `session ${state.activeSessionId} is still binding`,
+				onTimeout: (facts) => this.logAgentMessageWaitTimeout(facts),
+			});
 		}
 		if (this.sessions.get(state.activeSessionId) !== state || this.bindingSessions.has(state.activeSessionId)) {
 			throw new BoundSessionUnavailableError(`Active session ${state.activeSessionId} did not finish initializing`);

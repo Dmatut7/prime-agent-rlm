@@ -1,5 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import {
+	DEFAULT_SHORT_TARGET_WAIT_MS,
+	WaitTimeoutError,
+	type WaitTimeoutFacts,
+	withBound,
+} from "../utils/bounded-wait.js";
 import type { HostRequestHandler } from "./kernel/index.js";
 import type { CustomMessage } from "./messages.js";
 import { HEARTBEAT_PROMPT_CUSTOM_TYPE } from "./messages.js";
@@ -176,7 +182,7 @@ export interface AgentSessionMessageSendInput {
 export interface AgentSessionMessageController {
 	listAgents(): AgentSessionMessageListResult | Promise<AgentSessionMessageListResult>;
 	roster?(): AgentFamilyRosterResult | Promise<AgentFamilyRosterResult>;
-	awaitPendingChildPublication?(selector: string): Promise<string | undefined>;
+	awaitPendingChildPublication?(selector: string, signal?: AbortSignal): Promise<string | undefined>;
 	assertSessionNameAvailable?(input: AgentSessionNameAvailabilityInput): void | Promise<void>;
 	setSessionName?(name: string): void | Promise<void>;
 	sendAgentMessage(input: AgentSessionMessageSendInput): Promise<AgentSessionMessageReceipt>;
@@ -589,7 +595,12 @@ export function isRetryableAgentMessageSendError(message: string): boolean {
 		/too many pending messages/i.test(message) ||
 		/rate limit exceeded/i.test(message) ||
 		/queued session input is suspended/i.test(message) ||
-		/Agent message was not accepted/i.test(message)
+		/Agent message was not accepted/i.test(message) ||
+		// A bounded wait (P1-1) that ran out of time: the target is mid-transition, nothing was
+		// cancelled, and the same call joins the in-flight operation instead of starting a second
+		// one. Counting it here is what gives the new retryable errors a mechanical ceiling -
+		// three in a row for one target turn terminal (M6b).
+		/wait timed out/i.test(message)
 	);
 }
 
@@ -674,15 +685,31 @@ export class AgentSessionMessageRateLimiter {
 	}
 }
 
+export interface AgentMessageHostHandlerOptions {
+	/**
+	 * Bound on waiting for an in-flight child to publish its session. Default
+	 * {@link DEFAULT_SHORT_TARGET_WAIT_MS}; `Infinity` (the settings rollback lever) waits
+	 * forever, which is today's behaviour.
+	 */
+	publicationWaitMs?: number;
+	/** Every timed-out wait, for the countable `agent message target wait timed out` signature. */
+	onWaitTimeout?: (facts: WaitTimeoutFacts) => void;
+}
+
 export function createAgentMessageHostHandlers(
 	controller: Pick<AgentSessionMessageController, "roster" | "sendAgentMessage" | "awaitPendingChildPublication">,
+	options: AgentMessageHostHandlerOptions = {},
 ): Record<string, HostRequestHandler> {
+	const publicationWaitMs = options.publicationWaitMs ?? DEFAULT_SHORT_TARGET_WAIT_MS;
 	return {
-		"agent_message.list_agents": async () => {
+		// Read-only, so it is on the cancellable list: a cell abort releases the wait instead of
+		// leaving it parked until the kernel host tears down (P1-2a).
+		"agent_message.list_agents": async (_payload, signal) => {
 			if (!controller.roster) throw new Error("agent family roster is not available in this session");
+			signal?.throwIfAborted();
 			return (await controller.roster()) as unknown as Record<string, unknown>;
 		},
-		"agent_message.send": async (payload) => {
+		"agent_message.send": async (payload, signal) => {
 			if (typeof payload.message !== "string") {
 				throw new Error("agent_message.send message must be a string");
 			}
@@ -730,9 +757,24 @@ export function createAgentMessageHostHandlers(
 				}
 				if (!controller.roster) throw new Error("agent family roster is not available in this session");
 				const selector = typeof receiverName === "string" ? receiverName.trim() : undefined;
+				// Bounded (P1-1): a child whose publication never settles used to park this cell
+				// for as long as the parent turn lived. The bound does not cancel the publication
+				// - it keeps running - and on timeout the send falls through to the roster match,
+				// which either finds the child or fails with an actionable "no child matches".
 				const publishedId =
 					role === "child" && selector && controller.awaitPendingChildPublication
-						? await controller.awaitPendingChildPublication(selector)
+						? await withBound(controller.awaitPendingChildPublication(selector, signal), {
+								timeoutMs: publicationWaitMs,
+								phase: "publication",
+								target: selector,
+								label: "Agent message target",
+								targetState: () => `child ${selector} has not published its session yet`,
+								...(signal ? { signal } : {}),
+								...(options.onWaitTimeout ? { onTimeout: options.onWaitTimeout } : {}),
+							}).catch((error: unknown) => {
+								if (error instanceof WaitTimeoutError) return undefined;
+								throw error;
+							})
 						: undefined;
 				const roster = await controller.roster();
 				const matches = roster.entries.filter(

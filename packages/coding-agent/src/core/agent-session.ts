@@ -37,6 +37,7 @@ import {
 	supportsFastMode,
 } from "@earendil-works/pi-ai";
 import { theme } from "../modes/interactive/theme/theme.js";
+import { untilAborted, type WaitTimeoutFacts } from "../utils/bounded-wait.js";
 import { stripFrontmatter } from "../utils/frontmatter.js";
 import { ensurePrivateDirectory, writePrivateFileAtomic } from "../utils/private-files.js";
 import { sleep } from "../utils/sleep.js";
@@ -8857,6 +8858,20 @@ export class AgentSession {
 	}
 
 	/**
+	 * One bounded wait that ran out of time (P1-1). The `waitedMs` field is the distribution the
+	 * tier values get retuned against, so the line is the observable, not just a diagnostic.
+	 */
+	private _reportAgentMessageWaitTimeout(facts: WaitTimeoutFacts): void {
+		sessionLog.warn("agent message target wait timed out", {
+			sessionId: this.sessionId,
+			target: facts.target,
+			phase: facts.phase,
+			waitedMs: facts.waitedMs,
+			...(facts.targetState === undefined ? {} : { targetState: facts.targetState }),
+		});
+	}
+
+	/**
 	 * A kernel death the host did not order. The manager's stderr ring never leaves the host
 	 * process, so this line is the only per-session trace of the cause (code/signal/origin), and
 	 * the origin is what keeps a protocol-repair kill out of the crash statistics.
@@ -11010,54 +11025,62 @@ export class AgentSession {
 		if (this._agentMessageController && visibleKernelSkillNames.has(AGENT_MESSAGE_SKILL_NAME)) {
 			Object.assign(
 				handlers,
-				createAgentMessageHostHandlers({
-					roster: async () =>
-						(await this.handleAgentMessageHostRequest("agent_message.list_agents")) as AgentFamilyRosterResult,
-					awaitPendingChildPublication: (selector) => this._awaitPendingRlmChildPublication(selector),
-					sendAgentMessage: async (input) => {
-						let receipt: AgentSessionMessageReceipt;
-						try {
-							receipt = (await this.handleAgentMessageHostRequest("agent_message.send", {
-								target: input.target,
-								message: input.message,
-							})) as AgentSessionMessageReceipt;
-						} catch (error) {
-							throw this._terminalizeRepeatedAgentMessageSendFailure(input.target, error);
-						}
-						this._agentMessageSendFailures.delete(input.target);
-						// B1: only a delivered reply counts as "the child replied". A
-						// queued receipt means the parent has not seen anything yet, and
-						// counting it would let the parent's terminal gate treat a
-						// still-undelivered reply as delivered - the child believes it
-						// answered while the parent never receives a notice.
-						if (this._rlmDepth > 0) {
-							let addressedParent = input.receiverRole === "parent";
-							if (input.receiverRole === undefined && this._agentMessageController?.roster) {
-								try {
-									const roster = await this._agentMessageController.roster();
-									addressedParent = roster.entries.some(
-										(entry) =>
-											entry.relationship === "parent" &&
-											(entry.id === input.target || entry.name === input.target),
-									);
-								} catch {
-									addressedParent = false;
+				createAgentMessageHostHandlers(
+					{
+						roster: async () =>
+							(await this.handleAgentMessageHostRequest("agent_message.list_agents")) as AgentFamilyRosterResult,
+						awaitPendingChildPublication: (selector, signal) =>
+							this._awaitPendingRlmChildPublication(selector, signal),
+						sendAgentMessage: async (input) => {
+							let receipt: AgentSessionMessageReceipt;
+							try {
+								receipt = (await this.handleAgentMessageHostRequest("agent_message.send", {
+									target: input.target,
+									message: input.message,
+								})) as AgentSessionMessageReceipt;
+							} catch (error) {
+								throw this._terminalizeRepeatedAgentMessageSendFailure(input.target, error);
+							}
+							this._agentMessageSendFailures.delete(input.target);
+							// B1: only a delivered reply counts as "the child replied". A
+							// queued receipt means the parent has not seen anything yet, and
+							// counting it would let the parent's terminal gate treat a
+							// still-undelivered reply as delivered - the child believes it
+							// answered while the parent never receives a notice.
+							if (this._rlmDepth > 0) {
+								let addressedParent = input.receiverRole === "parent";
+								if (input.receiverRole === undefined && this._agentMessageController?.roster) {
+									try {
+										const roster = await this._agentMessageController.roster();
+										addressedParent = roster.entries.some(
+											(entry) =>
+												entry.relationship === "parent" &&
+												(entry.id === input.target || entry.name === input.target),
+										);
+									} catch {
+										addressedParent = false;
+									}
+								}
+								if (
+									countsAsDeliveredParentReply({
+										rlmDepth: this._rlmDepth,
+										deliveryStatus: receipt.deliveryStatus,
+										addressedParent,
+									})
+								) {
+									this._repliedToParentSinceTask = true;
+									this._parentReplyCount += 1;
 								}
 							}
-							if (
-								countsAsDeliveredParentReply({
-									rlmDepth: this._rlmDepth,
-									deliveryStatus: receipt.deliveryStatus,
-									addressedParent,
-								})
-							) {
-								this._repliedToParentSinceTask = true;
-								this._parentReplyCount += 1;
-							}
-						}
-						return receipt;
+							return receipt;
+						},
 					},
-				}),
+					{
+						// Read live: an operator tuning the wait must not have to rebuild the runtime.
+						publicationWaitMs: this.settingsManager.getAgentMessageWaitSettings().publicationMs,
+						onWaitTimeout: (facts) => this._reportAgentMessageWaitTimeout(facts),
+					},
+				),
 			);
 		}
 		if (this._agentObserveController) {
@@ -11505,7 +11528,7 @@ export class AgentSession {
 		}
 	}
 
-	private async _awaitPendingRlmChildPublication(selector: string): Promise<string | undefined> {
+	private async _awaitPendingRlmChildPublication(selector: string, signal?: AbortSignal): Promise<string | undefined> {
 		const run = [...this._activeRlmChildRuns.values()].find(
 			(candidate) =>
 				(candidate.status === "queued" || candidate.status === "running" || candidate.status === "done") &&
@@ -11513,7 +11536,11 @@ export class AgentSession {
 				(candidate.id === selector || candidate.sessionName === selector),
 		);
 		if (!run) return undefined;
-		await run.publication.promise;
+		// Abortable, and bounded by the caller that owns the wait settings
+		// (createAgentMessageHostHandlers): a cancelled cell must not leave this parked on a
+		// publication deferred that may never settle, and the wait never cancels the publication
+		// itself, which would tear a child that is halfway through being created.
+		await untilAborted(run.publication.promise, signal);
 		return run.session?.sessionId;
 	}
 

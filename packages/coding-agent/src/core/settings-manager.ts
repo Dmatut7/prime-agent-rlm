@@ -52,6 +52,40 @@ export const DEFAULT_KERNEL_REVIVAL_VOUCH_MAX_AGE_SECONDS = 600;
  */
 export const DEFAULT_FAILED_WORKER_REAP_HOURS = 24;
 
+/**
+ * Bounds on waiting for an agent-message target that is mid-transition (P1-1 / C14).
+ *
+ * One knob drives all four waits: `targetWaitSeconds` is the longest tier (waiting for a session
+ * to finish passivating) and the three shorter ones are half of it, so an operator tuning the
+ * wait cannot leave a tier unbounded by forgetting it. `0` removes every bound, which is the
+ * rollback lever back to today's "wait as long as the parent turn lives".
+ *
+ * Switch dossier (F17 - ship, observe one round, then retune):
+ * owner: the agent-messaging reviewer of this batch; review: two weeks after this ships;
+ * criterion: the p95 of the `waitedMs` field on the `agent message target wait timed out`
+ * signature - if p95 sits far below a tier, that tier is too long; if a tier times out on waits
+ * that later succeeded, it is too short; rollback: raise `agentMessage.targetWaitSeconds`
+ * (or set it to 0 for unbounded).
+ */
+export interface AgentMessageSettings {
+	targetWaitSeconds?: number; // default: 120; 0 = unbounded waits
+}
+
+/** The four bounded waits, resolved to ms. `Infinity` means the bound is disabled. */
+export interface ResolvedAgentMessageWaitSettings {
+	/** Waiting for a target session to finish passivating. */
+	passivationMs: number;
+	/** Waiting for an active session to finish binding. */
+	bindMs: number;
+	/** Waiting for a passive subagent chain to hydrate. */
+	hydrateMs: number;
+	/** Waiting for an in-flight rlm child to publish its session. */
+	publicationMs: number;
+}
+
+/** Longest agent-message wait tier (C14 乙长值): a cold hydration must not be forced to retry. */
+export const DEFAULT_AGENT_MESSAGE_TARGET_WAIT_SECONDS = 120;
+
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
 	reserveTokens?: number; // default: 16384
@@ -313,6 +347,7 @@ export interface Settings {
 	subagentWake?: SubagentWakeSettings;
 	kernelBootstrap?: KernelBootstrapSettings;
 	kernelRestart?: KernelRestartSettings;
+	agentMessage?: AgentMessageSettings;
 	daemon?: DaemonSettings;
 	autoRefine?: AutoRefineSettings;
 	agentTraces?: AgentTracesSettings;
@@ -1154,6 +1189,11 @@ export class SettingsManager {
 		};
 	}
 
+	/** The four agent-message wait tiers, derived from the one long tier (see AgentMessageSettings). */
+	getAgentMessageWaitSettings(): ResolvedAgentMessageWaitSettings {
+		return resolveAgentMessageWaitSeconds(this.settings.agentMessage?.targetWaitSeconds);
+	}
+
 	getKernelBootstrapSettings(): { lockTimeoutMs: number } {
 		return {
 			lockTimeoutMs: normalizeKernelBootstrapLockTimeoutMs(this.settings.kernelBootstrap?.lockTimeoutMs),
@@ -1605,6 +1645,24 @@ export class SettingsManager {
 }
 
 /**
+ * Resolve the agent-message wait tiers from the one setting. Half the long tier for the short
+ * ones, floored at a second so a tiny configured value cannot produce a zero wait that fails
+ * every healthy target.
+ */
+export function resolveAgentMessageWaitSeconds(targetWaitSeconds: unknown): ResolvedAgentMessageWaitSettings {
+	if (typeof targetWaitSeconds !== "number" || !Number.isFinite(targetWaitSeconds)) {
+		return resolveAgentMessageWaitSeconds(DEFAULT_AGENT_MESSAGE_TARGET_WAIT_SECONDS);
+	}
+	if (targetWaitSeconds <= 0) {
+		const unbounded = Number.POSITIVE_INFINITY;
+		return { passivationMs: unbounded, bindMs: unbounded, hydrateMs: unbounded, publicationMs: unbounded };
+	}
+	const passivationMs = Math.floor(targetWaitSeconds) * 1000;
+	const shortMs = Math.max(1000, Math.round(passivationMs / 2));
+	return { passivationMs, bindMs: shortMs, hydrateMs: shortMs, publicationMs: shortMs };
+}
+
+/**
  * A restart bound: `0` (or any non-positive value) is the documented rollback lever and resolves
  * to `Infinity`, i.e. the bound never trips; a non-number falls back to the shipped default.
  */
@@ -1627,6 +1685,18 @@ function normalizeKernelBootstrapLockTimeoutMs(value: unknown): number {
  * settings.json is honoured by the next boot without a restart. Unreadable or absent
  * scopes yield the defaults rather than failing the boot.
  */
+/**
+ * Agent-message wait tiers for callers with no session (the daemon's passivation, bind and
+ * hydration waits). Reads both scopes from disk on every call, so an operator editing
+ * settings.json is honoured by the next wait.
+ */
+export function readAgentMessageWaitSettings(
+	cwd: string = process.cwd(),
+	agentDir: string = getAgentDir(),
+): ResolvedAgentMessageWaitSettings {
+	return SettingsManager.fromStorage(new FileSettingsStorage(cwd, agentDir)).getAgentMessageWaitSettings();
+}
+
 export function readKernelBootstrapSettings(
 	cwd: string = process.cwd(),
 	agentDir: string = getAgentDir(),

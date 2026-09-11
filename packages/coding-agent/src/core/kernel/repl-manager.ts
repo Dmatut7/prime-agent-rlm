@@ -162,6 +162,23 @@ interface InFlightHostRequest {
 	label?: string;
 }
 
+/**
+ * Whether the host declared one request type read-only, i.e. cancellable by the cell that
+ * triggered it. An entry ending in `*` is a prefix pattern, which is how a whole read-only family
+ * (`agent_observe.*`) is whitelisted without listing every member.
+ */
+export function hostRequestTypeIsCancellable(patterns: readonly string[] | undefined, type: string): boolean {
+	if (!patterns || patterns.length === 0) return false;
+	for (const pattern of patterns) {
+		if (pattern.endsWith("*")) {
+			if (type.startsWith(pattern.slice(0, -1))) return true;
+			continue;
+		}
+		if (pattern === type) return true;
+	}
+	return false;
+}
+
 /** Type and human-readable target of one host request. Never throws on a malformed payload. */
 function describeHostRequest(data: unknown): { type: string; label?: string } {
 	if (!isRecord(data) || typeof data.type !== "string" || data.type.length === 0) {
@@ -378,6 +395,7 @@ export class ReplKernelManager {
 		| "stderrLogPath"
 		| "onUnexpectedExit"
 		| "restartPolicy"
+		| "cancellableHostRequestTypes"
 	>;
 	private readonly handledHostRequestIds = new Set<string>();
 	private child?: ChildProcess;
@@ -504,6 +522,7 @@ export class ReplKernelManager {
 			stderrLogPath: options.stderrLogPath,
 			onUnexpectedExit: options.onUnexpectedExit,
 			restartPolicy: options.restartPolicy,
+			cancellableHostRequestTypes: options.cancellableHostRequestTypes,
 		};
 	}
 
@@ -1986,9 +2005,9 @@ export class ReplKernelManager {
 			this.handledHostRequestIds.delete(oldest);
 		}
 
-		const signal = this.hostRequestController.signal;
 		const startedAt = Date.now();
 		const described = describeHostRequest(data);
+		const signal = this.hostRequestSignal(described.type);
 		// The handler starts on a microtask so the request is registered first: a handler that
 		// blocks before its first await is still counted, and still has an age, from the moment
 		// the request was accepted.
@@ -2025,6 +2044,24 @@ export class ReplKernelManager {
 		void task.finally(() => {
 			this.inFlightHostRequests.delete(task);
 		});
+	}
+
+	/**
+	 * The signal one host request waits under (P1-2a).
+	 *
+	 * Teardown always cancels. A cell abort cancels *only* a type the host declared read-only:
+	 * cancelling an admitted `rlm.run` or a message send because the user pressed Esc on the cell
+	 * that spawned it would take back the fire-and-forget guarantee the orchestration prompt is
+	 * built on (M7). A request with no active cell - a detached spawn firing after its scheduling
+	 * cell went idle - keeps the teardown signal too, so work is never bound to a turn that is
+	 * already over.
+	 */
+	private hostRequestSignal(type: string): AbortSignal {
+		const teardown = this.hostRequestController.signal;
+		if (!hostRequestTypeIsCancellable(this.options.cancellableHostRequestTypes, type)) return teardown;
+		const cell = this.activeExecution?.opts.signal;
+		if (!cell) return teardown;
+		return AbortSignal.any([teardown, cell]);
 	}
 
 	private async handleHostRequest(data: unknown, signal: AbortSignal): Promise<Record<string, unknown>> {

@@ -271,6 +271,36 @@ own stderr carries memory evidence and `unknown` otherwise.
 | `followUpMode` | string | `"one-at-a-time"` | How follow-up messages are sent: `"all"` or `"one-at-a-time"` |
 | `transport` | string | `"sse"` | Preferred transport for providers that support multiple transports: `"sse"`, `"websocket"`, or `"auto"` |
 
+### Agent Messaging
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `agentMessage.targetWaitSeconds` | number | `120` | Longest bound on waiting for a message target that is mid-transition: a session being passivated, an active session still binding, a passive subagent chain hydrating, or an in-flight `rlm()` child publishing its session. The three shorter waits are half of it (60 s at the default). `0` removes every bound, which is the previous behaviour: each wait then lasts as long as the caller's own request |
+
+A bound never cancels the operation it waits for - a passivation, bind or
+hydration always runs to completion, because interrupting one halfway leaves a
+torn session that is worse than a slow one. The caller gets a factual, retryable
+error naming the phase, the target and how long it waited (logged as
+`agent message target wait timed out` with `waitedMs`), and a retry joins the
+in-flight operation instead of starting a second one. Three retryable failures in
+a row for one target become a terminal error telling the model to write its
+result to a file and end the turn.
+
+Switch dossier (ship, observe one round, then retune): owner - the
+agent-messaging reviewer of this batch; review - two weeks after this ships;
+criterion - the p95 of `waitedMs` on the `agent message target wait timed out`
+signature (far below a tier means the tier is too long; timeouts on waits that
+later succeeded mean it is too short); rollback - raise
+`agentMessage.targetWaitSeconds`, or set it to `0` for unbounded waits.
+
+```json
+{
+  "agentMessage": {
+    "targetWaitSeconds": 120
+  }
+}
+```
+
 ### Terminal & Images
 
 | Setting | Type | Default | Description |

@@ -5,3 +5,5 @@
 - Fixed a state restore that exceeds its budget to retry with a longer window instead of renaming a good snapshot aside as corrupt; a timed-out restore keeps snapshot writes paused and says so in the reset notice.
 - Changed in-flight kernel host requests to survive an unexpected kernel death, so work the host already admitted (an `rlm()` child, a message delivery) is not cancelled by a crash; a real teardown still cancels them.
 - Changed unattributed kernel output to stay with the cell the model sees instead of being drained by host-internal cells (snapshot, restore, bootstrap).
+- Added bounds to the four waits an agent message can park on (passivation 120s, bind/hydrate/publication 60s, one `agentMessage.targetWaitSeconds` setting driving all four), each returning a retryable error that names the phase, the target and `waitedMs` instead of hanging for as long as the caller's request lives; the waited-on operation is never cancelled.
+- Added a mechanical ceiling to subagent hydration re-entries (32 attempts and a 60s total deadline, deliberately unrelated to `RLM_MAX_DEPTH`), so a hydration loop ends in a retryable error instead of recursing.
