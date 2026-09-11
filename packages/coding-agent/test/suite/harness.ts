@@ -21,6 +21,7 @@ import type { SubagentRuntimeHost } from "../../src/core/rlm-runtime.js";
 import { SessionManager } from "../../src/core/session-manager.js";
 import type { Settings } from "../../src/core/settings-manager.js";
 import { SettingsManager } from "../../src/core/settings-manager.js";
+import type { JournaledBashFacts, TurnLivenessKernelFacts } from "../../src/core/turn-liveness.js";
 import type { ExtensionFactory, ResourceLoader } from "../../src/index.js";
 import {
 	type CreateTestExtensionsResultInput,
@@ -80,6 +81,10 @@ export interface HarnessOptions {
 	serializedRefine?: boolean;
 	initialGoal?: { objective: string; tokenBudget?: number };
 	stallAbortSettleGraceMs?: number;
+	/** Kernel/host liveness facts behind the stall watchdog vouch (see turn-liveness.ts). */
+	stallKernelLivenessFacts?: () => TurnLivenessKernelFacts | undefined;
+	/** Degraded fact source used when the kernel heartbeat is stale or absent. */
+	stallJournaledBashHandles?: (kernelPid: number | undefined) => JournaledBashFacts | undefined;
 	rlmTerminalNoticeAbandonAfterMs?: number;
 	failureWakeQuietWindowMs?: number;
 }
@@ -207,6 +212,8 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		serializedRefine: options.serializedRefine,
 		initialGoal: options.initialGoal,
 		stallAbortSettleGraceMs: options.stallAbortSettleGraceMs,
+		stallKernelLivenessFacts: options.stallKernelLivenessFacts,
+		stallJournaledBashHandles: options.stallJournaledBashHandles,
 		rlmTerminalNoticeAbandonAfterMs: options.rlmTerminalNoticeAbandonAfterMs,
 		failureWakeQuietWindowMs: options.failureWakeQuietWindowMs,
 	});

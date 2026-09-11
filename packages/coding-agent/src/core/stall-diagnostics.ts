@@ -1,3 +1,5 @@
+import type { StallExemptionDiagnostics, StallKernelDiagnostics } from "./stall-watchdog.js";
+
 /**
  * Forensic snapshot taken when the stall watchdog fires. All timestamps are
  * epoch milliseconds; elapsed fields are derived against `Date.now()` at
@@ -17,4 +19,16 @@ export interface StallDiagnostics {
 	pump: { suspended: boolean; requested: boolean; epoch: number };
 	/** Unfinished session actions (queued/in-flight turns, commands, dispatches). */
 	unfinishedActions: number;
+	/**
+	 * Exemption budget segment: why silence is being excused, which tier of evidence backs it,
+	 * and how much budget is left. Absent when no exemption was ever claimed this arm cycle.
+	 * Additive and optional on the wire: an older client renders the fields it knows.
+	 */
+	exemption?: StallExemptionDiagnostics;
+	/**
+	 * Kernel liveness segment (protocol-4 heartbeat facts plus the reasons silence is *not*
+	 * excused, e.g. `loop_stalled`). Absent when the session has no kernel. `busy.bashRunning`
+	 * keeps meaning the host's own bash tool: a kernel handle is a different owner.
+	 */
+	kernel?: StallKernelDiagnostics;
 }

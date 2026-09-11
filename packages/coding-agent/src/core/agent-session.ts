@@ -295,14 +295,32 @@ import {
 	type SlashCommandInfo,
 } from "./slash-commands.js";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
-import { StallWatchdog, type StallWatchdogOptions, type StallWatchdogStageInfo } from "./stall-watchdog.js";
+import {
+	buildStallAbortMessage,
+	buildStallAbortUnsettledMessage,
+	buildStallWarnMessage,
+	normalizeStallKernelFacts,
+	type StallKernelDiagnostics,
+	type StallMessageContext,
+	type StallVouchFacts,
+	StallWatchdog,
+	type StallWatchdogOptions,
+	type StallWatchdogStageInfo,
+} from "./stall-watchdog.js";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.js";
 import { THINKING_LEVELS } from "./thinking-levels.js";
 import { acpMcpToolNames, createAcpMcpToolDefinitions } from "./tools/acp-mcp.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
 import { createAllToolDefinitions } from "./tools/index.js";
-import { IpythonKernelProvisioner } from "./tools/ipython.js";
+import { type IpythonAbortCause, IpythonKernelProvisioner } from "./tools/ipython.js";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.js";
+import {
+	createTurnLiveness,
+	type JournaledBashFacts,
+	type TurnLiveness,
+	type TurnLivenessEvent,
+	type TurnLivenessKernelFacts,
+} from "./turn-liveness.js";
 import { addAssistantUsage, emptyUsage, type SessionUsageSummary, sessionUsageSummaryFrom } from "./usage.js";
 import { SERPER_CREDENTIAL_ID, SERPER_ENV_VAR, WEBSEARCH_SKILL_NAME } from "./websearch-credential.js";
 
@@ -562,6 +580,18 @@ export interface AgentSessionConfig {
 	 * stopped" detection window.
 	 */
 	stallAbortSettleGraceMs?: number;
+	/**
+	 * Kernel/host liveness facts behind the stall watchdog's vouch (T1-2/T1-3). Injectable so the
+	 * exemption wiring is testable without a kernel; defaults to this session's ipython kernel
+	 * client. Sampled on every watchdog touch, so it must stay O(1) and side-effect free.
+	 */
+	stallKernelLivenessFacts?: () => TurnLivenessKernelFacts | undefined;
+	/**
+	 * Degraded fact source for when the kernel heartbeat is stale or absent: the journaled bash
+	 * children of this kernel (B4). Injectable for tests; defaults to reading the orphan-process
+	 * journal, at most once per stall stage.
+	 */
+	stallJournaledBashHandles?: (kernelPid: number | undefined) => JournaledBashFacts | undefined;
 	/**
 	 * How long a deferred RLM child terminal notice may wait for delivery before it
 	 * is abandoned (default 5 minutes). Injectable so the abandonment path is
@@ -1457,6 +1487,22 @@ export class AgentSession {
 	private readonly _scheduledAutoRefineTimers = new Set<ReturnType<typeof setTimeout>>();
 	private _stallWatchdog: StallWatchdog | undefined;
 	private readonly _stallAbortSettleGraceMs: number | undefined;
+	/** Aggregates the kernel/host facts the watchdog's vouch samples (T1-3). */
+	private _turnLiveness: TurnLiveness | undefined;
+	private readonly _stallKernelLivenessFacts: (() => TurnLivenessKernelFacts | undefined) | undefined;
+	private readonly _stallJournaledBashHandles:
+		| ((kernelPid: number | undefined) => JournaledBashFacts | undefined)
+		| undefined;
+	/** Predicate names that already logged a failure this turn (one line per turn, not per sample). */
+	private readonly _stallPredicateFailures = new Set<string>();
+	/** Turn-liveness event kinds already logged this turn (the degraded path must stay countable). */
+	private readonly _turnLivenessLogged = new Set<string>();
+	/**
+	 * Why the watchdog aborted the turn, for the ipython tool's aborted-cell report. Cleared by the
+	 * next agent_start so a new turn never inherits an old cause. Distinct from `_lastStallAbort`,
+	 * which is the roster/terminal-classifier record and deliberately outlives the turn.
+	 */
+	private _lastStallAbortCause: IpythonAbortCause | undefined;
 	private readonly _rlmTerminalNoticeAbandonAfterMs: number;
 	private readonly _failureWakeQuietWindowMs: number;
 	private _stallLastEvent: { type: string; at: number } | undefined;
@@ -1530,6 +1576,8 @@ export class AgentSession {
 		this._autoRefineReviewer = config.autoRefineReviewer;
 		this._serializedRefine = config.serializedRefine ?? false;
 		this._stallAbortSettleGraceMs = config.stallAbortSettleGraceMs;
+		this._stallKernelLivenessFacts = config.stallKernelLivenessFacts;
+		this._stallJournaledBashHandles = config.stallJournaledBashHandles;
 		this._rlmTerminalNoticeAbandonAfterMs =
 			config.rlmTerminalNoticeAbandonAfterMs ?? RLM_TERMINAL_NOTICE_ABANDON_AFTER_MS;
 		this._failureWakeQuietWindowMs = config.failureWakeQuietWindowMs ?? FAILURE_WAKE_QUIET_WINDOW_MS;
@@ -1587,6 +1635,7 @@ export class AgentSession {
 			includeAllExtensionTools: true,
 		});
 
+		this._turnLiveness = this._createTurnLiveness();
 		this._stallWatchdog = this._createStallWatchdog();
 		// A restart of the same session picks up whatever the previous process could
 		// not deliver (B10: every in-memory queue answers "where is it after a
@@ -3905,11 +3954,160 @@ export class AgentSession {
 				const s = this.settingsManager.getStallWatchdogSettings();
 				return s.abortAfterSeconds > 0 ? s.abortAfterSeconds * 1000 : undefined;
 			},
-			isPaused: () => this.stallExempted,
+			// Both predicates are sampled from inside the watchdog's timer callbacks, so an
+			// exception would escape into the timer, leave the watchdog with no timer armed, and
+			// silently end escalation for this arm cycle (F2). The watchdog is the component that
+			// has to survive other components misbehaving, so a throwing predicate degrades to
+			// "no exemption" and is logged instead.
+			isPaused: () => {
+				try {
+					return this.stallExempted;
+				} catch (error) {
+					this._reportStallPredicateFailure("isPaused", error);
+					return false;
+				}
+			},
+			vouch: () => this._sampleStallVouch(),
 			onStage: (info) => this._handleStallWatchdogStage(info),
 			...(this._stallAbortSettleGraceMs === undefined ? {} : { abortSettleGraceMs: this._stallAbortSettleGraceMs }),
 		};
 		return new StallWatchdog(options);
+	}
+
+	private _createTurnLiveness(): TurnLiveness {
+		return createTurnLiveness({
+			kernel: () =>
+				this._stallKernelLivenessFacts ? this._stallKernelLivenessFacts() : this._kernelLivenessFactsFromClient(),
+			...(this._stallJournaledBashHandles ? { readJournaledBashHandles: this._stallJournaledBashHandles } : {}),
+			onEvent: (event) => this._handleTurnLivenessEvent(event),
+		});
+	}
+
+	/**
+	 * Kernel facts for the vouch, adapted from this session's kernel client. O(1) and read-only:
+	 * the watchdog samples it on every touch. Returns undefined when the session has no kernel,
+	 * which is "no facts", never "no work in flight".
+	 */
+	private _kernelLivenessFactsFromClient(): TurnLivenessKernelFacts | undefined {
+		const kernel = this._ipythonKernelProvisioner?.manager;
+		if (!kernel) return undefined;
+		const liveness = kernel.kernelLiveness;
+		return {
+			...(liveness?.protocol === undefined ? {} : { protocol: liveness.protocol }),
+			...(liveness?.latest ? { latest: liveness.latest } : {}),
+			...(liveness?.previous ? { previous: liveness.previous } : {}),
+			rejectedFrames: liveness?.rejectedFrames,
+			consecutiveRejectedFrames: liveness?.consecutiveRejectedFrames,
+			hostRequestCount: kernel.hostRequestCount,
+			hostRequestOldestAgeMs: kernel.hostRequestOldestAgeMs,
+			kernelPid: kernel.kernelPid,
+			hasActiveExecution: kernel.hasActiveExecution,
+		};
+	}
+
+	/**
+	 * The vouch predicate (T1-3). Sampled at the moment of escalation and on every touch, so it
+	 * caches nothing and adds no timer of its own.
+	 *
+	 * The first term is a necessary conjunction, not an optimization: with no tool in flight the
+	 * silence belongs to the model stream, which `streamStallTimeoutMs` owns. Without it a live
+	 * kernel handle would excuse a stuck provider response, which is the one case the judgement
+	 * table explicitly excludes.
+	 */
+	private _sampleStallVouch(): StallVouchFacts | undefined {
+		try {
+			if (this.settingsManager.getStallWatchdogSettings().toolLivenessExemption === false) return undefined;
+			if (this._stallInFlightTools.size === 0) return undefined;
+			const facts = this._turnLiveness?.sample();
+			if (!facts?.vouched) return undefined;
+			return {
+				active: true,
+				reasons: facts.reasons,
+				// Two tiers: movement buys the full budget, mere existence buys the short one that
+				// stays near the pre-exemption abort threshold (M3).
+				tier: facts.progress ? "progress" : "liveness",
+				kernel: {
+					...(facts.protocol === undefined ? {} : { protocol: facts.protocol }),
+					...(facts.livenessAgeMs === undefined ? {} : { livenessAgeMs: facts.livenessAgeMs }),
+					...(facts.liveBashHandles === undefined ? {} : { liveBashHandles: facts.liveBashHandles }),
+					hostRequestCount: facts.hostRequestCount,
+					...(facts.kernelPid === undefined ? {} : { kernelPid: facts.kernelPid }),
+					reasons: facts.kernelReasons,
+				},
+			};
+		} catch (error) {
+			this._reportStallPredicateFailure("vouch", error);
+			return undefined;
+		}
+	}
+
+	private _reportStallPredicateFailure(predicate: string, error: unknown): void {
+		// One line per predicate per turn: the failure has to be loud (a silently dead watchdog is
+		// worse than the bug it was guarding) but sampling happens on every touch.
+		if (this._stallPredicateFailures.has(predicate)) return;
+		this._stallPredicateFailures.add(predicate);
+		sessionLog.warn("stall watchdog predicate failed; treating it as no exemption", {
+			predicate,
+			error: error instanceof Error ? error.message : String(error),
+			sessionId: this.sessionManager.getSessionId(),
+		});
+	}
+
+	private _handleTurnLivenessEvent(event: TurnLivenessEvent): void {
+		// B4: the degraded path is a fallback, not a silent no-op. One line per kind per turn keeps
+		// it countable in the daemon log without repeating it on every sample.
+		if (this._turnLivenessLogged.has(event.kind)) return;
+		this._turnLivenessLogged.add(event.kind);
+		const fields = { ...event, sessionId: this.sessionManager.getSessionId() };
+		if (event.kind === "degraded_read") {
+			sessionLog.info("stall watchdog: kernel heartbeat unusable, fell back to journaled bash handles", fields);
+			return;
+		}
+		sessionLog.warn(`stall watchdog: kernel liveness ${event.kind.replaceAll("_", " ")}`, fields);
+	}
+
+	/**
+	 * Re-read the degraded facts when the kernel heartbeat cannot vouch. Bounded to one journal
+	 * read per stall stage (a sync file read, tens of ms) and only while a tool is in flight, so
+	 * the fallback cannot become a polling loop. The result lands in time for the next sampling:
+	 * a deferred abort re-checks at most one warn window later.
+	 */
+	private _refreshStallDegradedFacts(): void {
+		try {
+			if (this._stallInFlightTools.size === 0) return;
+			const facts = this._turnLiveness?.sample();
+			if (!facts || facts.state === "fresh") return;
+			this._turnLiveness?.refreshDegradedFacts();
+		} catch (error) {
+			this._reportStallPredicateFailure("degradedFacts", error);
+		}
+	}
+
+	/** Kernel segment for a stall diagnostics payload; undefined when there is no kernel. */
+	private _collectStallKernelDiagnostics(): StallKernelDiagnostics | undefined {
+		try {
+			const facts = this._turnLiveness?.sample();
+			if (!facts || facts.protocol === undefined) return undefined;
+			return normalizeStallKernelFacts({
+				protocol: facts.protocol,
+				...(facts.livenessAgeMs === undefined ? {} : { livenessAgeMs: facts.livenessAgeMs }),
+				...(facts.liveBashHandles === undefined ? {} : { liveBashHandles: facts.liveBashHandles }),
+				hostRequestCount: facts.hostRequestCount,
+				...(facts.kernelPid === undefined ? {} : { kernelPid: facts.kernelPid }),
+				reasons: facts.kernelReasons,
+			});
+		} catch (error) {
+			this._reportStallPredicateFailure("diagnostics", error);
+			return undefined;
+		}
+	}
+
+	/**
+	 * Why the watchdog aborted the current turn, for the ipython tool's aborted-cell report.
+	 * Read-only; undefined until a stall abort fires, and cleared by the next agent_start.
+	 */
+	get lastStallAbortCause(): IpythonAbortCause | undefined {
+		return this._lastStallAbortCause;
 	}
 
 	/**
@@ -3924,6 +4122,11 @@ export class AgentSession {
 		this._stallLastEvent = { type: event.type, at: now };
 		if (event.type === "tool_execution_start") {
 			this._stallInFlightTools.set(event.toolCallId, { toolName: event.toolName, startedAt: now });
+			// B4 ordering: the degraded read is bounded by its own lifetime, so refreshing here lets
+			// the first warning already see the journaled handles instead of promising an abort that
+			// the next sampling then defers. It only reads at all when the kernel heartbeat cannot
+			// vouch (a protocol-3 kernel, or one whose frames stopped arriving).
+			this._refreshStallDegradedFacts();
 		} else if (event.type === "tool_execution_end") {
 			this._stallInFlightTools.delete(event.toolCallId);
 		}
@@ -3935,6 +4138,12 @@ export class AgentSession {
 			// stall marker for a session that recovered.
 			this._lastTurnAbortReason = undefined;
 			this._stallState = undefined;
+			// Same rule for the vouch's own state: a degraded journal read from the previous turn
+			// must not excuse this one, and the once-per-turn log throttles restart with the turn.
+			this._lastStallAbortCause = undefined;
+			this._turnLiveness?.reset();
+			this._stallPredicateFailures.clear();
+			this._turnLivenessLogged.clear();
 			watchdog.arm();
 			return;
 		}
@@ -3951,6 +4160,10 @@ export class AgentSession {
 	private _collectStallDiagnostics(silentMs: number): StallDiagnostics {
 		const now = Date.now();
 		const lastEvent = this._stallLastEvent;
+		// The exemption segment is measured against the clock without re-sampling the predicates,
+		// so collecting diagnostics cannot perturb the watchdog it describes.
+		const exemption = this._stallWatchdog?.collectExemptionDiagnostics();
+		const kernel = this._collectStallKernelDiagnostics();
 		return {
 			silentMs,
 			busy: {
@@ -3972,6 +4185,11 @@ export class AgentSession {
 				epoch: this._sessionInputPumpEpoch,
 			},
 			unfinishedActions: this._actionStore.unfinishedActions().length,
+			// Only a claimed exemption gets a segment: `collectExemptionDiagnostics` always returns
+			// a shape, and an empty one in the payload would read as "an exemption was considered
+			// and measured" rather than "nothing was ever excused".
+			...(exemption?.reason ? { exemption } : {}),
+			...(kernel ? { kernel } : {}),
 		};
 	}
 
@@ -3981,8 +4199,12 @@ export class AgentSession {
 		// flight when the user disables it. Never warn about, or abort, a live turn the
 		// user just put back under their own control.
 		if (!settings.enabled) return;
+		// B4: when the kernel heartbeat cannot vouch (stale, absent, or all frames rejected), the
+		// journaled bash children are the only remaining fact. Read them once per stage, before
+		// this stage's diagnostics are collected, so the next sampling sees them: a deferred abort
+		// re-checks within one warn window.
+		this._refreshStallDegradedFacts();
 		const diagnostics = this._collectStallDiagnostics(info.silentMs);
-		const silentSeconds = Math.max(1, Math.round(info.silentMs / 1000));
 		const logFields = {
 			stage: info.stage,
 			silentMs: info.silentMs,
@@ -3998,9 +4220,20 @@ export class AgentSession {
 			unsettled: info.stage === "abort_unsettled" || this._stallState?.unsettled === true ? true : undefined,
 		};
 		const kernelReasons = readStallKernelReasons(diagnostics);
+		// F3: a warn-only watchdog (abortAfterSeconds 0) has no abort channel, so an exemption
+		// defers nothing and the vouched copy would promise a deferral that cannot happen. Such a
+		// session gets the unexempted text it has always gotten; the exemption is still in the
+		// diagnostics and the log either way.
+		const messageContext: StallMessageContext = {
+			silentMs: info.silentMs,
+			abortAfterSeconds: settings.abortAfterSeconds,
+			...(settings.abortAfterSeconds > 0 && info.exemption ? { exemption: info.exemption } : {}),
+			...(diagnostics.kernel ? { kernel: diagnostics.kernel } : {}),
+		};
+		const exemptionFields = info.exemption ? { exemption: info.exemption } : {};
 		if (info.stage === "warn") {
-			const message = `Possible stall: no session activity for ${silentSeconds}s while a turn is running. If nothing recovers, the turn will be aborted automatically after ${settings.abortAfterSeconds}s of silence. If a tool appears stuck, interrupt the turn manually to recover faster; check the daemon log for stall diagnostics.`;
-			sessionLog.warn("stall watchdog: no activity while turn running", logFields);
+			const message = buildStallWarnMessage(messageContext);
+			sessionLog.warn("stall watchdog: no activity while turn running", { ...logFields, ...exemptionFields });
 			this._emit({
 				type: "stall_warning",
 				message,
@@ -4011,8 +4244,8 @@ export class AgentSession {
 			return;
 		}
 		if (info.stage === "abort") {
-			const message = `Suspected stall: no session activity for ${silentSeconds}s. The current turn is being aborted automatically; diagnostics were logged.`;
-			sessionLog.error("stall watchdog: aborting silent turn", logFields);
+			const message = buildStallAbortMessage(messageContext);
+			sessionLog.error("stall watchdog: aborting silent turn", { ...logFields, ...exemptionFields });
 			// Recorded before the abort so the terminal classifier can tell a
 			// watchdog kill from an ordinary completion; `settled` starts true and
 			// only the abort_unsettled stage below revokes it.
@@ -4022,6 +4255,14 @@ export class AgentSession {
 				inFlightTools: this._stallState.inFlightTools,
 				kernelReasons: kernelReasons.length > 0 ? kernelReasons : undefined,
 				settled: true,
+			};
+			// Structured cause for the aborted cell's own report (T1-5): what was vouching when the
+			// budget ran out is part of the story, so both reason lists ride along, deduplicated.
+			this._lastStallAbortCause = {
+				silentMs: info.silentMs,
+				reasons: [...new Set(["stall_watchdog", ...(info.exemption?.reasons ?? []), ...kernelReasons])],
+				...(diagnostics.kernel?.kernelPid === undefined ? {} : { kernelPid: diagnostics.kernel.kernelPid }),
+				at: Date.now(),
 			};
 			this._emit({
 				type: "stall_abort",
@@ -4037,8 +4278,8 @@ export class AgentSession {
 		// Emitted as its own type (not a second stall_warning) so "killed but still
 		// running" is countable apart from "looks stuck"; a parent that sees it
 		// records the fact on the run and keeps the kill classification.
-		const message = `Suspected stall: auto-abort fired ${silentSeconds}s into silence but the run did not settle; the session may need a restart. Diagnostics were logged.`;
-		sessionLog.error("stall watchdog: abort did not settle the turn", logFields);
+		const message = buildStallAbortUnsettledMessage(messageContext);
+		sessionLog.error("stall watchdog: abort did not settle the turn", { ...logFields, ...exemptionFields });
 		if (this._lastStallAbort) this._lastStallAbort = { ...this._lastStallAbort, settled: false };
 		this._emit({
 			type: "stall_unsettled",
@@ -10546,6 +10787,7 @@ export class AgentSession {
 					shellPath: this.settingsManager.getShellPath(),
 					onLateSentAgentMessage: (toolCallId, message) =>
 						this._recordLateIpythonSentAgentMessage(toolCallId, message),
+					getAbortCause: () => this.lastStallAbortCause,
 				},
 			});
 		}
