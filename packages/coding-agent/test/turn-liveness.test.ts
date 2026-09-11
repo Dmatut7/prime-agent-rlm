@@ -313,7 +313,9 @@ describe("createTurnLiveness", () => {
 		const absent = liveness.sample();
 		expect(absent.state).toBe("absent");
 		expect(absent.vouched).toBe(false);
-		expect(absent.kernelReasons).toEqual([TURN_LIVENESS_REASONS.noKernelFacts]);
+		// A kernel below the heartbeat protocol sends nothing by design: that is the expected
+		// state, not a finding, so it does not appear in the reasons a stall report carries.
+		expect(absent.kernelReasons).toEqual([]);
 		expect(absent.protocol).toBe(3);
 
 		liveness.refreshDegradedFacts();
@@ -370,7 +372,19 @@ describe("createTurnLiveness", () => {
 		expect(sampled.state).toBe("absent");
 		expect(sampled.hostRequestCount).toBe(0);
 		expect(sampled.protocol).toBeUndefined();
+		expect(sampled.kernelReasons).toEqual([]);
+	});
+
+	it("reports a negotiated-4 kernel that sends nothing as a finding", () => {
+		// The heartbeat thread died, or every frame failed validation: this is the case where
+		// "no facts" is evidence rather than an older runtime doing what it was told.
+		const { liveness } = build({
+			kernel: facts({ protocol: 4, latest: undefined, previous: undefined, kernelPid: 5 }),
+		});
+		const sampled = liveness.sample();
+		expect(sampled.state).toBe("absent");
 		expect(sampled.kernelReasons).toEqual([TURN_LIVENESS_REASONS.noKernelFacts]);
+		expect(sampled.vouched).toBe(false);
 	});
 });
 

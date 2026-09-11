@@ -305,7 +305,9 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 		expect(warning.diagnostics.exemption).toMatchObject({ reason: "vouched", tier: "liveness" });
 		expect(warning.diagnostics.exemption?.reasons).toContain("degraded_journal");
 		expect(warning.diagnostics.kernel).toMatchObject({ protocol: 3, liveBashHandles: 2 });
-		expect(warning.diagnostics.kernel?.reasons).toEqual(["no_kernel_facts"]);
+		// An older kernel sending no frames is the expected state, not a finding: the segment
+		// reports the facts (protocol, handles) and leaves the reasons empty.
+		expect(warning.diagnostics.kernel?.reasons).toEqual([]);
 
 		await new Promise((resolve) => setTimeout(resolve, 800));
 		expect(harness.eventsOfType("stall_abort")).toEqual([]);

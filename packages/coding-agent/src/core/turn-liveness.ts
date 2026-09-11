@@ -58,6 +58,13 @@ export const TURN_LIVENESS_REASONS = {
 /** A host request older than this stops vouching: a wedged handler must not excuse silence forever. */
 export const DEFAULT_HOST_REQUEST_MAX_AGE_MS = 15 * 60 * 1000;
 /**
+ * Protocol that introduced the heartbeat, mirroring the runtime's own gate. Below it a kernel
+ * sends no frames by design, so "no facts" is the expected state and not a finding worth putting
+ * in every stall report; at or above it, silence from the sender is evidence (the thread died, or
+ * every frame failed validation).
+ */
+export const KERNEL_HEARTBEAT_MIN_PROTOCOL = 4;
+/**
  * A degraded journal read is only trusted for this long; after that it must be re-read.
  *
  * Fifteen minutes, i.e. about the pre-exemption rescue window: the fallback exists so a kernel
@@ -341,7 +348,12 @@ export function createTurnLiveness(options: TurnLivenessOptions): TurnLiveness {
 			if (verdict.state === "stale") {
 				kernelReasons.push(TURN_LIVENESS_REASONS.heartbeatStale);
 			} else {
-				kernelReasons.push(TURN_LIVENESS_REASONS.noKernelFacts);
+				// Only a kernel that negotiated the heartbeat and then sent nothing is a finding;
+				// an older kernel is doing what it was told, and saying otherwise in every stall
+				// report would drown the reasons that do carry information.
+				if ((kernel?.protocol ?? 0) >= KERNEL_HEARTBEAT_MIN_PROTOCOL) {
+					kernelReasons.push(TURN_LIVENESS_REASONS.noKernelFacts);
+				}
 				if ((kernel?.consecutiveRejectedFrames ?? 0) > 0) {
 					kernelReasons.push(TURN_LIVENESS_REASONS.heartbeatRejected);
 				}
