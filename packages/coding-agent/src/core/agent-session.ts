@@ -169,7 +169,7 @@ import {
 	validateGoalBudget,
 	validateGoalObjective,
 } from "./goals.js";
-import type { HostRequestHandlers, KernelSentAgentMessage } from "./kernel/index.js";
+import type { HostRequestHandlers, KernelDeathCause, KernelSentAgentMessage } from "./kernel/index.js";
 import { type RestoreResult, restoreNoticeLines, snapshotPathIn } from "./kernel/state-snapshot.js";
 import type { AcpMcpServerConfig } from "./mcp/acp-mcp-types.js";
 import type { McpManager } from "./mcp/mcp-manager.js";
@@ -1092,6 +1092,8 @@ interface RlmSubagentModelSelection {
 }
 
 const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
+/** How much of a dead kernel's stderr tail the session log keeps; the ring itself holds 8 KiB. */
+const KERNEL_DEATH_STDERR_LOG_CHARS = 1024;
 const SESSION_PERSIST_FAILURE_REPORT_BASE_MS = 30_000;
 const SESSION_PERSIST_FAILURE_REPORT_MAX_MS = 300_000;
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
@@ -8844,6 +8846,21 @@ export class AgentSession {
 		).catch(() => {});
 	}
 
+	/**
+	 * A kernel death the host did not order. The manager's stderr ring never leaves the host
+	 * process, so this line is the only per-session trace of the cause (code/signal/origin), and
+	 * the origin is what keeps a protocol-repair kill out of the crash statistics.
+	 */
+	private _reportUnexpectedKernelExit(cause: KernelDeathCause): void {
+		sessionLog.error("kernel exited unexpectedly", {
+			sessionId: this.sessionId,
+			code: cause.code,
+			signal: cause.signal,
+			origin: cause.origin,
+			stderrTail: cause.stderrTail.slice(-KERNEL_DEATH_STDERR_LOG_CHARS),
+		});
+	}
+
 	setSteeringMode(mode: "all" | "one-at-a-time"): void {
 		this.agent.steeringMode = mode;
 		this.settingsManager.setSteeringMode(mode);
@@ -10779,6 +10796,7 @@ export class AgentSession {
 				snapshotDir: this._ipythonKernelSnapshotDir,
 				readyGate: previousDispose,
 				onRestore: notifyRestore ? (result) => this._onIpythonStateRestored(result) : undefined,
+				onUnexpectedExit: (cause) => this._reportUnexpectedKernelExit(cause),
 			});
 			configuredBaseToolDefinitions = createAllToolDefinitions(this._cwd, {
 				ipython: {

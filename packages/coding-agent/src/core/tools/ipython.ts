@@ -14,6 +14,7 @@ import {
 	type KernelAttachment,
 	KernelBusyAfterInterruptError,
 	type KernelClient,
+	type KernelDeathCause,
 	type KernelDiffDisplay,
 	type KernelSentAgentMessage,
 	ReplKernelManager,
@@ -321,6 +322,12 @@ export interface IpythonToolOptions {
 	onRestore?: (result: RestoreResult) => void;
 	onLateSentAgentMessage?: (toolCallId: string, message: KernelSentAgentMessage) => void;
 	/**
+	 * Fires once per kernel death the host did not order (crash, OOM kill), with the structured
+	 * cause. The kernel's stderr ring never leaves the host process, so this callback is the only
+	 * way the death reaches the session log.
+	 */
+	onUnexpectedExit?: (cause: KernelDeathCause) => void;
+	/**
 	 * Read once per aborted cell: the host's record of why the turn was aborted
 	 * (for a session, the last stall-watchdog abort). Undefined means "no recorded
 	 * cause", and the result then only says the cell was aborted mid-flight.
@@ -509,6 +516,7 @@ export class IpythonKernelProvisioner {
 					: undefined,
 				stderrLogPath: snapshotDir ? join(snapshotDir, "kernel-stderr.log") : undefined,
 				bootstrapCode,
+				...(this.options?.onUnexpectedExit ? { onUnexpectedExit: this.options.onUnexpectedExit } : {}),
 			});
 			let pendingRestore: RestoreResult | undefined;
 			try {

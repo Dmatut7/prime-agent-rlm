@@ -1,5 +1,6 @@
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import type { KernelBootstrapProgressHandler, KernelPythonSkill } from "./bootstrap.js";
+import type { KernelDeathCause } from "./death-cause.js";
 import type { RestoreResult, SnapshotResult } from "./state-snapshot.js";
 
 export const DEFAULT_MAX_OUTPUT_CHARS = 65536;
@@ -67,6 +68,13 @@ export interface KernelManagerOptions {
 	bootstrapCode?: string;
 	/** File receiving the kernel process's stderr, rotated once at each spawn. */
 	stderrLogPath?: string;
+	/**
+	 * One kernel death the host did not order (a crash, an OOM kill). Fired from the exit
+	 * callback before the teardown, so the owner can log a cause that the in-memory stderr ring
+	 * would otherwise keep to this process. Never fired for shutdown/kill/disposeSync or for the
+	 * protocol-repair kills.
+	 */
+	onUnexpectedExit?: (cause: KernelDeathCause) => void;
 }
 
 export interface KernelStartOptions {

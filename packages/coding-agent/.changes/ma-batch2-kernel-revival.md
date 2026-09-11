@@ -1,0 +1,1 @@
+- Added structured kernel death attribution: an unexpected kernel exit is classified (`oom_suspect` only with memory evidence, otherwise `unknown`), reported to the session log, and tagged apart from the host's own kills (shutdown, kill, dispose, and the protocol-repair family), so a self-repair never reads as a crash.

@@ -22,6 +22,7 @@ import { v4 as uuid } from "uuid";
 import { assertRegularFileNoSymlink, ensurePrivateDirectory, requireNoFollow } from "../../utils/private-files.js";
 import { reapKernelOrphanProcesses, recordOrphanProcessState } from "../orphan-process-journal.js";
 import { ensureKernelPython, managedKernelVenvDirForPython } from "./bootstrap.js";
+import { classifyKernelExit, type KernelDeathCause, type KernelIntentionalExitOrigin } from "./death-cause.js";
 import {
 	AGENT_MESSAGE_DISPLAY_MIME,
 	ATTACHMENT_DISPLAY_MIME,
@@ -318,6 +319,7 @@ export class ReplKernelManager {
 		| "snapshot"
 		| "bootstrapCode"
 		| "stderrLogPath"
+		| "onUnexpectedExit"
 	>;
 	private readonly handledHostRequestIds = new Set<string>();
 	private child?: ChildProcess;
@@ -366,6 +368,13 @@ export class ReplKernelManager {
 	private startGeneration = 0;
 	/** Generation whose graceful shutdown() owns the teardown, so the exit handler must not run it. */
 	private gracefulShutdownGeneration?: number;
+	/**
+	 * Set immediately before an intentional kill and read by the exit callback, so a kernel the
+	 * host killed on purpose is never attributed as a crash (B6/I-1). `state` cannot serve here:
+	 * `killChildToIdle` restores it to `"idle"` before it returns, and `cleanupResources` bumps
+	 * `startGeneration`, so both auxiliary facts are already stale by the time the exit lands.
+	 */
+	private intentionalExitOrigin?: KernelIntentionalExitOrigin;
 	private gracefulShutdownPromise?: Promise<boolean>;
 	/** Memoized so concurrent callers all await the same in-flight startup. */
 	private startPromise?: Promise<void>;
@@ -409,6 +418,7 @@ export class ReplKernelManager {
 			snapshot: options.snapshot,
 			bootstrapCode: options.bootstrapCode,
 			stderrLogPath: options.stderrLogPath,
+			onUnexpectedExit: options.onUnexpectedExit,
 		};
 	}
 
@@ -691,6 +701,9 @@ export class ReplKernelManager {
 			if (stderrLogFd !== undefined) closeSync(stderrLogFd);
 		}
 		this.child = child;
+		// A fresh spawn owns its own exit: a marker left over from the previous teardown must not
+		// excuse a real crash of this child.
+		this.intentionalExitOrigin = undefined;
 		if (child.pid !== undefined) {
 			recordOrphanProcessState(child.pid, true);
 			this.inUseReferencePath = this.recordVenvInUseReference(child.pid);
@@ -832,8 +845,24 @@ export class ReplKernelManager {
 
 		child.on("exit", (code, signal) => {
 			if (this.child !== child) return;
-			if (this.state !== "shutdown") {
-				this.appendKernelDiagnostic(`unexpected exit code=${code} signal=${signal}`);
+			// Attribution runs before any state mutation: the verdict needs the state this exit
+			// interrupted, and the origin marker is single-use (the next spawn clears it too).
+			const verdict = classifyKernelExit({
+				intentionalOrigin: this.intentionalExitOrigin,
+				gracefulShutdownOwned: this.gracefulShutdownGeneration === this.startGeneration,
+				state: this.state,
+				code,
+				signal,
+				stderrTail: this.stderrTail(),
+				at: Date.now(),
+			});
+			this.intentionalExitOrigin = undefined;
+			if (verdict.unexpected) {
+				this.reportUnexpectedKernelExit(verdict.cause, child.pid);
+			} else if (verdict.origin === "repair_kill" || verdict.origin === "bootstrap_fail_kill") {
+				// Tagged, not silent: this is the only place a repair kill can be told apart from
+				// a crash in the host's own ring, and B6 exists to keep the two from mixing.
+				this.appendKernelDiagnostic(`intentional ${verdict.origin} exit code=${code} signal=${signal}`);
 			}
 			this.state = "shutdown";
 			liveKernels.delete(this);
@@ -843,6 +872,31 @@ export class ReplKernelManager {
 			if (this.gracefulShutdownGeneration === this.startGeneration) return;
 			this.cleanupResources();
 		});
+	}
+
+	/**
+	 * One kernel death the host did not order. The in-memory stderr ring never leaves this
+	 * process, so the cause goes out two ways: a countable log line for the machine-wide
+	 * signature, and a callback the owning session turns into its own log line.
+	 */
+	private reportUnexpectedKernelExit(cause: KernelDeathCause, kernelPid: number | undefined): void {
+		this.appendKernelDiagnostic(`unexpected exit code=${cause.code} signal=${cause.signal} origin=${cause.origin}`);
+		kernelLog.error("kernel exited unexpectedly", {
+			code: cause.code,
+			signal: cause.signal,
+			origin: cause.origin,
+			...(kernelPid === undefined ? {} : { kernelPid }),
+			sessionId: this.options.sessionId,
+		});
+		try {
+			this.options.onUnexpectedExit?.(cause);
+		} catch (error) {
+			// A reporting callback must not be able to break the teardown that follows it.
+			kernelLog.warn("kernel unexpected-exit callback failed", {
+				error: errorMessage(error),
+				sessionId: this.options.sessionId,
+			});
+		}
 	}
 
 	private failProtocolFrame(child: ChildProcess, diagnostic: string): void {
@@ -865,7 +919,7 @@ export class ReplKernelManager {
 			// successful restore never implicates the snapshot; keeping the flag
 			// costs at most one bounded restore per later attempt.
 			const snapshotSuspect = this.pendingRestore;
-			this.killChildToIdle();
+			this.killChildToIdle("repair_kill");
 			if (snapshotSuspect) this.pendingRestore = false;
 			return;
 		}
@@ -888,7 +942,7 @@ export class ReplKernelManager {
 
 	private async repairProtocolChild(child: ChildProcess, owner: { superseded: boolean }): Promise<void> {
 		if (this.child !== child || this.state === "shutdown") return;
-		this.killChildToIdle();
+		this.killChildToIdle("repair_kill");
 
 		const start = this.start();
 		const generation = this.startGeneration;
@@ -911,7 +965,7 @@ export class ReplKernelManager {
 		if (this.options.snapshot && restored === null) {
 			if (owner.superseded || this.protocolRepairOwner !== owner) return;
 			this.appendKernelDiagnostic("protocol repair restore failed; discarding replacement kernel");
-			this.killChildToIdle();
+			this.killChildToIdle("repair_kill");
 			// The snapshot is the declared culprit; the lazy path must not retry it.
 			this.pendingRestore = false;
 			return;
@@ -928,7 +982,7 @@ export class ReplKernelManager {
 		if (!bootstrapped) {
 			if (owner.superseded || this.protocolRepairOwner !== owner) return;
 			this.appendKernelDiagnostic("protocol repair bootstrap failed; discarding replacement kernel");
-			this.killChildToIdle();
+			this.killChildToIdle("bootstrap_fail_kill");
 		}
 	}
 
@@ -1018,16 +1072,20 @@ export class ReplKernelManager {
 		}
 		if (!code || !this.pendingRebootstrap) return true;
 		const ok = await this.bootstrapRepairedKernel(code);
-		if (!ok && this.state === "running") this.killChildToIdle();
+		if (!ok && this.state === "running") this.killChildToIdle("bootstrap_fail_kill");
 		return ok;
 	}
 
 	/** Kill the current child and settle at clean idle, so the next start spawns fresh. */
-	private killChildToIdle(): void {
+	private killChildToIdle(origin: "repair_kill" | "bootstrap_fail_kill"): void {
 		// The discarded kernel carried the runtime bootstrap and (possibly) the
 		// restored namespace; a lazily started replacement must reprovision both.
 		this.pendingRebootstrap = true;
 		this.pendingRestore = true;
+		// Tagged before the kill: by the time the exit event is delivered this call has already
+		// put the state back to "idle" and bumped the generation, so nothing else can tell a
+		// protocol repair from a crash.
+		this.intentionalExitOrigin = origin;
 		this.state = "shutdown";
 		liveKernels.delete(this);
 		this.cleanupResources("SIGKILL");
@@ -1752,6 +1810,7 @@ export class ReplKernelManager {
 
 	private async performShutdown(opts: KernelShutdownOptions): Promise<boolean> {
 		if (this.state === "shutdown") {
+			this.intentionalExitOrigin = "shutdown";
 			liveKernels.delete(this);
 			if (this.gracefulShutdownGeneration === this.startGeneration) return false;
 			this.cleanupResources();
@@ -1775,6 +1834,9 @@ export class ReplKernelManager {
 		this.state = "shutdown";
 		liveKernels.delete(this);
 		this.gracefulShutdownGeneration = generation;
+		// Claimed before the kill sequence: the child may exit while this call is still awaiting
+		// its reply, and that exit must read as the host's own shutdown rather than a crash.
+		this.intentionalExitOrigin = "shutdown";
 
 		let shutdownTimer: ReturnType<typeof globalThis.setTimeout> | undefined;
 		let doneWaiterId: string | undefined;
@@ -1903,6 +1965,7 @@ export class ReplKernelManager {
 	async kill(): Promise<void> {
 		this.supersedeProtocolRepair();
 		this.abortHostRequests("IPython kernel killed");
+		this.intentionalExitOrigin = "kill";
 		this.state = "shutdown";
 		liveKernels.delete(this);
 		this.cleanupResources("SIGKILL");
@@ -2189,6 +2252,7 @@ export class ReplKernelManager {
 	disposeSync(): void {
 		this.supersedeProtocolRepair();
 		this.abortHostRequests("IPython kernel disposed");
+		this.intentionalExitOrigin = "dispose_sync";
 		this.state = "shutdown";
 		liveKernels.delete(this);
 		this.cleanupResources();
