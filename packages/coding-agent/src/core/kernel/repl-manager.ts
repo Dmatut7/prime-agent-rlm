@@ -1036,11 +1036,6 @@ export class ReplKernelManager {
 	}
 
 	/**
-	 * One kernel death the host did not order. The in-memory stderr ring never leaves this
-	 * process, so the cause goes out two ways: a countable log line for the machine-wide
-	 * signature, and a callback the owning session turns into its own log line.
-	 */
-	/**
 	 * Bookkeeping for one unowned death: the restart ledger, the requests that were in flight
 	 * when it happened, and the notice the next cell owes the model. Runs before the teardown so
 	 * the in-flight request list is still the pre-death one.
@@ -1196,6 +1191,11 @@ export class ReplKernelManager {
 		this.state = "idle";
 	}
 
+	/**
+	 * One kernel death the host did not order. The in-memory stderr ring never leaves this
+	 * process, so the cause goes out two ways: a countable log line for the machine-wide
+	 * signature, and a callback the owning session turns into its own log line.
+	 */
 	private reportUnexpectedKernelExit(
 		cause: KernelDeathCause,
 		kernelPid: number | undefined,

@@ -11149,10 +11149,12 @@ export class AgentSession {
 						onDuplicateSuppressed: ({ messageId, record }) => {
 							// Countable: this is the line that says a retry was caught instead of
 							// delivered twice, which is the whole point of sender-minted ids (C15).
+							// outcome=uncertain marks the fail-closed refusals, which are the ones
+							// worth watching: they mean a delivery leg failed to report back.
 							sessionLog.info("agent message duplicate suppressed", {
 								sessionId: this.sessionId,
 								messageId,
-								deliveryStatus: record.deliveryStatus,
+								outcome: record.outcome,
 								...(record.target === undefined ? {} : { target: record.target }),
 								handledAt: record.at,
 							});

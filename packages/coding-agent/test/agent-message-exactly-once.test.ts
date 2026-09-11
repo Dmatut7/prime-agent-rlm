@@ -125,12 +125,12 @@ describe("agent message exactly-once delivery (C15)", () => {
 describe("HandledAgentMessageIds", () => {
 	it("evicts the least recently handled id at the limit and degrades to today's behaviour", () => {
 		const handled = new HandledAgentMessageIds(3);
-		handled.record("a", { deliveryStatus: "delivered", at: 1 });
-		handled.record("b", { deliveryStatus: "delivered", at: 2 });
-		handled.record("c", { deliveryStatus: "delivered", at: 3 });
+		handled.record("a", { outcome: "delivered", at: 1 });
+		handled.record("b", { outcome: "delivered", at: 2 });
+		handled.record("c", { outcome: "delivered", at: 3 });
 		// Touching "a" makes "b" the oldest.
 		expect(handled.find("a")).toBeDefined();
-		handled.record("d", { deliveryStatus: "delivered", at: 4 });
+		handled.record("d", { outcome: "delivered", at: 4 });
 		expect(handled.size).toBe(3);
 		expect(handled.find("b")).toBeUndefined();
 		expect(handled.find("a")).toBeDefined();
@@ -141,7 +141,7 @@ describe("HandledAgentMessageIds", () => {
 		expect(HANDLED_AGENT_MESSAGE_ID_LIMIT).toBe(1024);
 		const handled = new HandledAgentMessageIds();
 		for (let index = 0; index < HANDLED_AGENT_MESSAGE_ID_LIMIT + 10; index++) {
-			handled.record(`id-${index}`, { deliveryStatus: "delivered", at: index });
+			handled.record(`id-${index}`, { outcome: "delivered", at: index });
 		}
 		expect(handled.size).toBe(HANDLED_AGENT_MESSAGE_ID_LIMIT);
 		expect(handled.find("id-9")).toBeUndefined();

@@ -622,6 +622,15 @@ export function formatAgentMessageQueuedNotice(input: {
  * "retryable error x host vouch x model persistence" loop: after a bounded number
  * of consecutive retryable failures for the same target the caller must turn the
  * error terminal instead of offering another retry.
+ *
+ * The same predicate decides whether a failed send is recorded as `uncertain` by the id gate, and
+ * that is not a coincidence worth breaking: every pattern here is a refusal the host raises
+ * *before* handing the message to the target (a full queue, the rate limiter, a suspended pump, a
+ * refused admission, or one of the bounded pre-delivery waits), so "worth retrying" and "provably
+ * delivered nothing" are the same statement. Anything else that fails the delivery leg leaves the
+ * outcome unknown, and unknown has to be treated as possibly-delivered - that is the
+ * duplicate-delivery window the id gate fails closed on. Adding a pattern here therefore also
+ * claims "this failure never delivered"; only add one when that is true.
  */
 export function isRetryableAgentMessageSendError(message: string): boolean {
 	return (
@@ -739,12 +748,21 @@ export interface AgentMessageHostHandlerOptions {
 /** How many delivered message ids one session remembers for exactly-once delivery (C15). */
 export const HANDLED_AGENT_MESSAGE_ID_LIMIT = 1024;
 
+/**
+ * What the host knows about the first attempt for one message id.
+ *
+ * `uncertain` is the interesting one: the delivery leg ran and then failed to report back, so the
+ * message may or may not have reached the target. That is the duplicate-delivery window, and it is
+ * answered by refusing the resend rather than by guessing.
+ */
+export type HandledAgentMessageOutcome = AgentSessionMessageDeliveryStatus | "uncertain";
+
 /** What one handled id is worth remembering: enough to answer a duplicate, never the payload. */
 export interface HandledAgentMessageRecord {
-	deliveryStatus: AgentSessionMessageDeliveryStatus;
+	outcome: HandledAgentMessageOutcome;
 	/** Active session id the message went to, when the send resolved one. */
 	target?: string;
-	/** Epoch ms of the delivery. */
+	/** Epoch ms of the attempt. */
 	at: number;
 }
 
@@ -809,14 +827,38 @@ export function formatDuplicateAgentMessageReply(input: {
 	return {
 		id: input.messageId,
 		duplicateSuppressed: true,
-		deliveryStatus: record.deliveryStatus,
+		deliveryStatus: record.outcome === "uncertain" ? undefined : record.outcome,
 		...(record.target === undefined ? {} : { target: { activeSessionId: record.target, sessionId: record.target } }),
 		notice:
-			`This message_id was already handled at ${new Date(record.at).toISOString()} and was ${record.deliveryStatus} then, ` +
+			`This message_id was already handled at ${new Date(record.at).toISOString()} and was ${record.outcome} then, ` +
 			"so it was NOT delivered again. Nothing is lost and nothing is duplicated. If you retried because " +
 			"you never saw a receipt, the first send is the one that counted: check with the recipient (or read " +
 			"its transcript with agent_observe) instead of sending again.",
 	};
+}
+
+/**
+ * The fail-closed answer to resending an id whose first attempt ended with an unknown outcome.
+ *
+ * This is an error, not a receipt: a receipt shape would let a model read "delivered" or "queued"
+ * into it, and the whole point is that the host does not know. It is deliberately terminal for this
+ * id (so the retry gate cannot be talked into looping on it) and it names the two ways out - verify
+ * with the recipient, or send a genuinely new message, which mints a new id and is not blocked.
+ */
+export function formatUncertainAgentMessageResendError(input: {
+	messageId: string;
+	record: HandledAgentMessageRecord;
+}): string {
+	const { record } = input;
+	const target = record.target === undefined ? "the recipient" : `the recipient (${record.target})`;
+	return (
+		`Refusing to resend message_id ${input.messageId}: the earlier attempt at ${new Date(record.at).toISOString()} ` +
+		"failed after the message had been handed to the delivery leg, so the host cannot tell whether it arrived - " +
+		"and it may have. This call delivered nothing and the message is not delivered again by retrying it; the same " +
+		`refusal will answer every further attempt with this id. Find out first: ask ${target}, or read its transcript ` +
+		"with agent_observe.recent. If it genuinely did not arrive, send a new message - a fresh send() call mints a new " +
+		`message_id and is not blocked. This error is terminal for ${input.messageId}, not something to retry.`
+	);
 }
 
 export function createAgentMessageHostHandlers(
@@ -828,17 +870,26 @@ export function createAgentMessageHostHandlers(
 	/** Sender-minted id of this call, when the kernel is new enough to send one. */
 	const messageIdOf = (payload: Record<string, unknown>): string | undefined =>
 		typeof payload.message_id === "string" && payload.message_id.length > 0 ? payload.message_id : undefined;
-	const remember = (
-		messageId: string | undefined,
-		deliveryStatus: AgentSessionMessageDeliveryStatus,
-		target?: string,
-	): void => {
+	const remember = (messageId: string | undefined, outcome: HandledAgentMessageOutcome, target?: string): void => {
 		if (messageId === undefined) return;
 		handled.record(messageId, {
-			deliveryStatus,
+			outcome,
 			...(target === undefined ? {} : { target }),
 			at: Date.now(),
 		});
+	};
+	/**
+	 * What a failed delivery leg leaves behind. A refusal the host raised before handing the
+	 * message over provably delivered nothing, so the id stays unspent and the retry that is the
+	 * correct action still works. Anything else (a worker request that timed out, a connection
+	 * that dropped, a kernel that died between the write and the reply) leaves the outcome
+	 * unknown, and unknown is spent: a resend of that id is refused until the sender has checked.
+	 */
+	const rememberFailure = (messageId: string | undefined, error: unknown, target?: string): void => {
+		if (messageId === undefined) return;
+		const message = error instanceof Error ? error.message : String(error);
+		if (isRetryableAgentMessageSendError(message)) return;
+		remember(messageId, "uncertain", target);
 	};
 	return {
 		// Read-only, so it is on the cancellable list: a cell abort releases the wait instead of
@@ -859,6 +910,9 @@ export function createAgentMessageHostHandlers(
 				const duplicate = handled.find(messageId);
 				if (duplicate) {
 					options.onDuplicateSuppressed?.({ messageId, record: duplicate });
+					if (duplicate.outcome === "uncertain") {
+						throw new Error(formatUncertainAgentMessageResendError({ messageId, record: duplicate }));
+					}
 					return formatDuplicateAgentMessageReply({ messageId, record: duplicate });
 				}
 			}
@@ -891,13 +945,25 @@ export function createAgentMessageHostHandlers(
 								error: result.reason instanceof Error ? result.reason.message : String(result.reason),
 							},
 				);
-				// One id per call, so a broadcast is remembered as one delivery: its aggregate
-				// status is what a duplicate reply should claim.
+				// One id per call, so a broadcast is remembered once. A rejection the host raised
+				// before handing that leg over provably delivered nothing; any other rejection
+				// leaves that leg's outcome unknown, and unknown spends the id.
+				const uncertain = results.some(
+					(result) =>
+						result.status === "rejected" &&
+						!isRetryableAgentMessageSendError(
+							result.reason instanceof Error ? result.reason.message : String(result.reason),
+						),
+				);
 				remember(
 					messageId,
-					results.every((result) => result.status === "fulfilled" && result.value.deliveryStatus === "delivered")
-						? "delivered"
-						: "queued",
+					uncertain
+						? "uncertain"
+						: results.every(
+									(result) => result.status === "fulfilled" && result.value.deliveryStatus === "delivered",
+								)
+							? "delivered"
+							: "queued",
 				);
 				return { receipts } as unknown as Record<string, unknown>;
 			} else {
@@ -948,13 +1014,22 @@ export function createAgentMessageHostHandlers(
 				}
 				target = matches[0]!.id;
 			}
-			const receipt = await controller.sendAgentMessage({
-				target,
-				message: payload.message,
-				receiverRole: payload.receiver_role as AgentFamilyRelationship,
-				...(messageId === undefined ? {} : { messageId }),
-			});
-			remember(messageId, receipt.deliveryStatus, receipt.target?.activeSessionId);
+			let receipt: AgentSessionMessageReceipt;
+			try {
+				receipt = await controller.sendAgentMessage({
+					target,
+					message: payload.message,
+					receiverRole: payload.receiver_role as AgentFamilyRelationship,
+					...(messageId === undefined ? {} : { messageId }),
+				});
+			} catch (error) {
+				// The delivery leg itself failed. It may have landed and only the answer was lost,
+				// which is the duplicate-delivery window: spend the id unless the error is one of
+				// the host's own pre-delivery refusals.
+				rememberFailure(messageId, error, target);
+				throw error;
+			}
+			remember(messageId, receipt.deliveryStatus, receipt.target?.activeSessionId ?? target);
 			return receipt as unknown as Record<string, unknown>;
 		},
 	};
