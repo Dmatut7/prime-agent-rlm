@@ -170,7 +170,7 @@ import {
 	validateGoalObjective,
 } from "./goals.js";
 import type { HostRequestHandlers, KernelSentAgentMessage } from "./kernel/index.js";
-import { type RestoreResult, snapshotPathIn } from "./kernel/state-snapshot.js";
+import { type RestoreResult, restoreNoticeLines, snapshotPathIn } from "./kernel/state-snapshot.js";
 import type { AcpMcpServerConfig } from "./mcp/acp-mcp-types.js";
 import type { McpManager } from "./mcp/mcp-manager.js";
 import {
@@ -8579,25 +8579,14 @@ export class AgentSession {
 	}
 
 	private _onIpythonStateRestored(result: RestoreResult): void {
-		const lines = ["<ipython_state_restored>"];
-		if (result.restored.length > 0) {
-			lines.push(
-				`Your Python kernel state was revived from your previous session. These names are available again: ${result.restored.join(", ")}.`,
-			);
-		} else {
-			lines.push(
-				"Your previous Python kernel state could not be revived; the kernel is starting fresh, so re-create any variables, imports, or loaded data you need.",
-			);
-		}
 		if (result.failed.length > 0) {
-			lines.push(
-				`These could not be restored and must be recreated if needed: ${result.failed.map((f) => f.name).join(", ")}.`,
-			);
+			sessionLog.error("kernel state restore partial", {
+				sessionId: this.sessionId,
+				names: result.failed.map((failure) => failure.name),
+				snapshotPolicy: result.snapshotPolicy,
+			});
 		}
-		if (result.error) {
-			lines.push(`Restore failure: ${result.error}.`);
-		}
-		lines.push("</ipython_state_restored>");
+		const lines = ["<ipython_state_restored>", ...restoreNoticeLines(result), "</ipython_state_restored>"];
 		void this.sendCustomMessage(
 			{
 				customType: IPYTHON_STATE_RESTORED_CUSTOM_TYPE,

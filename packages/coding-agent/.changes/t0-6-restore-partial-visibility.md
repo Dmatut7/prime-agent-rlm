@@ -1,0 +1,1 @@
+- Fixed kernel state restore failures leaving no forensic trace: partial restores now log the unrestored names and snapshot policy, and the restore notice explains whether values were preserved on disk.
