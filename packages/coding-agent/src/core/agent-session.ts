@@ -8300,6 +8300,11 @@ export class AgentSession {
 		return this._hasSelectableSessionInput();
 	}
 
+	/** True while abortForUpdateRestart holds queued work behind the restart fence. */
+	private get _updateRestartFenceUp(): boolean {
+		return this._sessionInputPumpSuspended && this._sessionInputSuspendedForUpdateRestart;
+	}
+
 	/**
 	 * Resume requested by a live connection (TUI Enter on an empty editor, the
 	 * daemon resume_queue command). Never lifts the update-restart fence: queued
@@ -8309,7 +8314,7 @@ export class AgentSession {
 	 * resumeQueuedWork() directly.
 	 */
 	resumeQueuedWorkFromConnection(): boolean {
-		if (this._sessionInputPumpSuspended && this._sessionInputSuspendedForUpdateRestart) return false;
+		if (this._updateRestartFenceUp) return false;
 		return this.resumeQueuedWork();
 	}
 
@@ -9009,7 +9014,8 @@ export class AgentSession {
 		this._disconnectFromAgent();
 		if (!options.skipAbort) await this.abort();
 		let didCompact = false;
-		this._compactionAbortController = new AbortController();
+		const compactionAbort = new AbortController();
+		this._compactionAbortController = compactionAbort;
 		let resolveCompactionOperation: () => void = () => {};
 		const compactionOperation = new Promise<void>((resolve) => {
 			resolveCompactionOperation = resolve;
@@ -9032,7 +9038,7 @@ export class AgentSession {
 				apiKey,
 				headers,
 				customInstructions,
-				signal: this._compactionAbortController.signal,
+				signal: compactionAbort.signal,
 			});
 
 			this._emit({
@@ -9076,13 +9082,25 @@ export class AgentSession {
 			this._scheduleSessionInputPump();
 			if (didCompact) {
 				this._discardPendingAutoRefine({ cancelPostCompactionContinue: true });
+				if (this._goalState.status === "active" && !compactionAbort.signal.aborted) {
+					this._goalContinuationAwaitsRlmWork ||= !this.agent.hasQueuedMessages();
+					// Fork adaptation: a compaction must not lift the update-restart fence.
+					// A queued /compact runs with skipAbort, so a restart landing mid-compaction
+					// still holds the fence here; the armed continuation then waits for the
+					// restart instead of opening a goal turn during teardown.
+					if (!this._updateRestartFenceUp) this.resumeQueuedWork();
+					if (this.agent.hasQueuedMessages()) this._schedulePostCompactionContinue();
+				}
 				if (hadPostCompactionContinue) {
 					this._schedulePostCompactionContinue(continueAfterSessionInput);
 				}
 				// Queued agent or session-owned inputs resume the loop; defer refine
 				// behind them instead of interleaving it before their turns.
 				this._scheduleAutoRefineAfterCompaction(
-					hadPostCompactionContinue || this.agent.hasQueuedMessages() || this.unfinishedActionCount > 0,
+					this._goalContinuationAwaitsRlmWork ||
+						hadPostCompactionContinue ||
+						this.agent.hasQueuedMessages() ||
+						this.unfinishedActionCount > 0,
 				);
 			}
 		}

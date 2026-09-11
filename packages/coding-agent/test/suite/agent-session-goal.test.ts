@@ -12,7 +12,7 @@ import { ModelRegistry } from "../../src/core/model-registry.js";
 import { SessionManager } from "../../src/core/session-manager.js";
 import { SettingsManager } from "../../src/core/settings-manager.js";
 import { createTestResourceLoader } from "../utilities.js";
-import { createHarness, getAssistantTexts, getMessageText, type Harness } from "./harness.js";
+import { createHarness, getAssistantTexts, getMessageText, type Harness, type HarnessOptions } from "./harness.js";
 
 function assistantWithUsage(message: string | AssistantMessage, usage: Partial<Usage>): AssistantMessage {
 	const base = typeof message === "string" ? fauxAssistantMessage(message) : message;
@@ -153,13 +153,81 @@ describe("AgentSession goals", () => {
 		}
 	});
 
-	async function createGoalHarness(extraTools: AgentTool[] = []): Promise<Harness> {
+	async function createGoalHarness(
+		extraTools: AgentTool[] = [],
+		options: Pick<HarnessOptions, "settings" | "extensionFactories" | "persistSession"> = {},
+	): Promise<Harness> {
 		const sessionRef: { current?: AgentSession } = {};
-		const harness = await createHarness({ tools: [createFauxIpythonTool(sessionRef), ...extraTools] });
+		const harness = await createHarness({
+			tools: [createFauxIpythonTool(sessionRef), ...extraTools],
+			...options,
+		});
 		sessionRef.current = harness.session;
 		harnesses.push(harness);
 		return harness;
 	}
+
+	/** Extension-supplied summary, so a manual compaction needs no summarizer turn. */
+	function summaryExtension(): ExtensionFactory {
+		return (pi) => {
+			pi.on("session_before_compact", async (event) => ({
+				compaction: {
+					summary: "summary from extension",
+					firstKeptEntryId: event.preparation.firstKeptEntryId,
+					tokensBefore: event.preparation.tokensBefore,
+					details: {},
+				},
+			}));
+		};
+	}
+
+	/** Two persisted turns (a session too short to compact throws) and an active, idle goal. */
+	async function createIdleGoalBeforeCompaction(): Promise<Harness> {
+		const harness = await createGoalHarness([], {
+			settings: { compaction: { keepRecentTokens: 1 } },
+			extensionFactories: [summaryExtension()],
+		});
+		harness.setResponses([fauxAssistantMessage("first turn"), fauxAssistantMessage("second turn")]);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+
+		// Created while the session is idle, so no continuation has been consumed yet:
+		// resuming the goal is the compaction's job.
+		harness.session.handleGoalHostRequest("goal.create", { objective: "finish the task" });
+		expect(harness.session.goalState.status).toBe("active");
+		harness.appendResponses([
+			fauxAssistantMessage(fauxToolCall("ipython", COMPLETE_GOAL_CELL), { stopReason: "toolUse" }),
+			fauxAssistantMessage("Goal complete."),
+		]);
+		return harness;
+	}
+
+	// Manual compaction aborts and reconnects the agent, so an active goal has to be
+	// re-armed by the compaction itself: nothing else is left to resume it.
+	it("resumes an active goal after manual compaction", async () => {
+		const harness = await createIdleGoalBeforeCompaction();
+
+		await harness.session.compact();
+		await harness.session.waitForHeadlessIdle();
+
+		expect(harness.session.goalState.status).toBe("complete");
+		expect(harness.getPendingResponseCount()).toBe(0);
+	});
+
+	// The re-arm must not defeat the fork's update-restart fence: a queued /compact runs
+	// with skipAbort, so a restart landing mid-compaction still holds queued work back.
+	it("keeps the update-restart fence when a manual compaction re-arms an active goal", async () => {
+		const harness = await createIdleGoalBeforeCompaction();
+
+		harness.session.abortForUpdateRestart();
+		await harness.session.compact(undefined, { skipAbort: true });
+
+		// Fence still up (a connection resume reports it), and no goal turn started during
+		// teardown: both queued responses are untouched and the goal is still active.
+		expect(harness.session.resumeQueuedWorkFromConnection()).toBe(false);
+		expect(harness.getPendingResponseCount()).toBe(2);
+		expect(harness.session.goalState.status).toBe("active");
+	});
 
 	it("keeps continuing until the model completes the goal through ipython", async () => {
 		const harness = await createGoalHarness();
