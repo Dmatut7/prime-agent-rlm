@@ -74,6 +74,37 @@ export interface KernelStartOptions {
 	signal?: AbortSignal;
 }
 
+/**
+ * Capability token a kernel announces in its `ready` frame's `capabilities` array when its
+ * runtime honours snapshot `preserve_names` (merge-write of unrestorable blobs). Announced
+ * per kernel and never inferred from the protocol number: protocol 4 ships before the
+ * runtime change that understands the field, and a stale venv still announces 4.
+ */
+export const KERNEL_CAPABILITY_PRESERVE_NAMES = "preserve_names";
+
+/**
+ * What the kernel's `ready` handshake agreed to. Absent until the kernel is ready
+ * and cleared on every teardown, so a gated request is never sent on the strength
+ * of a previous incarnation's negotiation.
+ */
+export interface KernelCapabilities {
+	/** Protocol version the kernel announced in its `ready` frame. */
+	protocol: number;
+	/**
+	 * True when the negotiated protocol admits the version-4 additions. Anything
+	 * gated on this must stay off for a kernel that negotiated 3: the host treats an
+	 * unknown frame kind as protocol corruption and repairs (kills) the kernel.
+	 */
+	protocol4: boolean;
+	/**
+	 * True only when the kernel negotiated protocol 4 *and* announced
+	 * {@link KERNEL_CAPABILITY_PRESERVE_NAMES}. Snapshot writes must gate on this bit
+	 * rather than on `protocol4`, so a runtime that predates the request field is never
+	 * sent something it would silently ignore.
+	 */
+	preserveNames: boolean;
+}
+
 export interface ExecuteOptions {
 	/** Aborting interrupts the kernel out-of-band. */
 	signal?: AbortSignal;

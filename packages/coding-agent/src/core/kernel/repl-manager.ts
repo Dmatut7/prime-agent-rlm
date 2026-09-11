@@ -17,10 +17,11 @@ import {
 } from "node:fs";
 import { dirname } from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import { getLogger } from "@earendil-works/pi-ai";
 import { v4 as uuid } from "uuid";
 import { assertRegularFileNoSymlink, ensurePrivateDirectory, requireNoFollow } from "../../utils/private-files.js";
 import { reapKernelOrphanProcesses, recordOrphanProcessState } from "../orphan-process-journal.js";
-import { ensureKernelPython } from "./bootstrap.js";
+import { ensureKernelPython, managedKernelVenvDirForPython } from "./bootstrap.js";
 import {
 	AGENT_MESSAGE_DISPLAY_MIME,
 	ATTACHMENT_DISPLAY_MIME,
@@ -38,11 +39,13 @@ import {
 	KERNEL_ABORT_GRACE_MS,
 	KERNEL_BUSY_INTERRUPT_INTERVAL_MS,
 	KERNEL_BUSY_REUSE_WAIT_MS,
+	KERNEL_CAPABILITY_PRESERVE_NAMES,
 	KERNEL_KILL_GRACE_MS,
 	KERNEL_SHUTDOWN_TIMEOUT_MS,
 	KERNEL_TERM_GRACE_MS,
 	type KernelAttachment,
 	KernelBusyAfterInterruptError,
+	type KernelCapabilities,
 	type KernelDiffDisplay,
 	type KernelManagerOptions,
 	type KernelSentAgentMessage,
@@ -62,10 +65,32 @@ import {
 	DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES,
 	isolateCorruptSnapshot,
 	type RestoreResult,
+	type SnapshotPolicyAfterPartialRestore,
 	type SnapshotResult,
+	type SnapshotWriteBlockReason,
+	type SnapshotWritePolicy,
+	snapshotWritePolicy,
 } from "./state-snapshot.js";
+import { recordKernelVenvInUseSync, releaseKernelVenvInUseSync } from "./venv-in-use.js";
 
-const REPL_PROTOCOL_VERSION = 3;
+/** Newest kernel protocol this host speaks, and the one it asks the kernel for. */
+const kernelLog = getLogger("coding-agent.kernel");
+
+const REPL_PROTOCOL_VERSION = 4;
+/**
+ * Oldest kernel protocol this host still serves. The handshake is a range, not an
+ * exact match: a venv whose runtime predates a protocol addition reports the older
+ * value and the session runs with that feature gated off, instead of failing to boot.
+ */
+const REPL_PROTOCOL_VERSION_MIN = 3;
+/** Protocol that introduced gated frames (heartbeat, snapshot `preserve_names`). */
+const KERNEL_PROTOCOL_V4 = 4;
+/**
+ * Negotiation variable. The host only sets it when nobody else did, so
+ * `export PRIME_AGENT_KERNEL_PROTOCOL=3` stays a working rollback for every gated
+ * feature.
+ */
+const KERNEL_PROTOCOL_ENV_VAR = "PRIME_AGENT_KERNEL_PROTOCOL";
 const READY_TIMEOUT_MS = 30_000;
 const REPAIR_STEP_TIMEOUT_MS = 30_000;
 // Runtime-minted host-request ids never repeat; the bound only guards a
@@ -115,8 +140,10 @@ interface ActiveExecution {
 	reject: (error: Error) => void;
 }
 
-// Complete event vocabulary of protocol version 2 (see prime-agent-runtime/src/rlm/repl.md).
-// The version handshake is exact, so an unknown kind is corruption, not a newer runtime.
+// Complete event vocabulary this host accepts (see prime-agent-runtime/src/rlm/repl.md).
+// An unlisted kind is corruption, not a newer runtime: a kernel never sends frames above
+// the version it negotiated, so a kind introduced by a future protocol must land here
+// together with its negotiation gate (KERNEL_PROTOCOL_V4).
 const PROTOCOL_EVENT_KINDS = new Set([
 	"ready",
 	"stdout",
@@ -145,6 +172,15 @@ function invalidProtocolFrameReason(event: Record<string, unknown>): string | un
 		return `${event.event} frame without id`;
 	}
 	return undefined;
+}
+
+/**
+ * Protocol version to request from the kernel: the newest this host speaks, unless the
+ * caller or the environment already pinned one. Never override an explicit value —
+ * `PRIME_AGENT_KERNEL_PROTOCOL=3` is the rollback lever for every gated feature.
+ */
+function requestedKernelProtocol(optionEnv: Record<string, string> | undefined): string {
+	return optionEnv?.[KERNEL_PROTOCOL_ENV_VAR] ?? process.env[KERNEL_PROTOCOL_ENV_VAR] ?? String(REPL_PROTOCOL_VERSION);
 }
 
 function asStringArray(value: unknown): string[] {
@@ -176,7 +212,13 @@ export class ReplKernelManager {
 	>;
 	private readonly handledHostRequestIds = new Set<string>();
 	private child?: ChildProcess;
+	/** Reference file pinning this kernel's bootstrap generation directory; released by every teardown. */
+	private inUseReferencePath?: string;
 	private readyDeferred?: ReturnType<typeof createDeferred<number>>;
+	/** Set by the ready handshake, cleared by every teardown; see {@link kernelCapabilities}. */
+	private negotiatedCapabilities?: KernelCapabilities;
+	/** Capability tokens from the current child's ready frame; empty until it arrives. */
+	private announcedKernelCapabilities: string[] = [];
 	private kernelStderr = "";
 	/** Byte offset this spawn's kernel started at in the stderr log, so a failure report
 	 * never shows a previous incarnation's bytes; undefined when this spawn has no log fd. */
@@ -221,10 +263,17 @@ export class ReplKernelManager {
 	private pendingRebootstrap = false;
 	/** Restore the saved namespace on that fresh start too (false when the snapshot itself is the declared culprit). */
 	private pendingRestore = false;
-	/** A restore attempt failed and the on-disk snapshot has not been isolated: the namespace is
-	 * older than that snapshot, so no snapshot write may overwrite it. Whole-load failures isolate
-	 * the file and clear this flag so a rebuilt namespace can persist again. */
-	private restoreFailed = false;
+	/** A whole-payload load failed and the on-disk snapshot could not be isolated: the namespace
+	 * is older than that snapshot, so no snapshot write may overwrite it. Isolating the file
+	 * clears this flag so a rebuilt namespace can persist again. */
+	private restoreWriteBlocked = false;
+	/** Names the last restore could not revive. Later snapshots ask the runtime to carry their
+	 * saved blobs over verbatim instead of banning every write; a fully successful restore, or
+	 * isolating the payload, clears the set. */
+	private readonly unrestoredNames = new Set<string>();
+	/** Last skipped-write reason already sent to the session log, so a blocked session logs the
+	 * state change once instead of once per cell. */
+	private reportedSnapshotSkipReason?: SnapshotWriteBlockReason;
 	private rebootstrapPromise?: Promise<boolean>;
 	private teardownInFlight = 0;
 
@@ -244,6 +293,16 @@ export class ReplKernelManager {
 
 	get ownerSessionId(): string | undefined {
 		return this.options.sessionId;
+	}
+
+	/** Protocol capabilities agreed at the ready handshake; undefined until ready. */
+	get kernelCapabilities(): KernelCapabilities | undefined {
+		return this.negotiatedCapabilities;
+	}
+
+	/** Protocol version the running kernel announced; undefined until ready. */
+	get negotiatedProtocol(): number | undefined {
+		return this.negotiatedCapabilities?.protocol;
 	}
 
 	private appendKernelDiagnostic(message: string): void {
@@ -336,7 +395,12 @@ export class ReplKernelManager {
 			throw createKernelStartupAbortError();
 		}
 		if (!this.startPromise) {
-			const startPromise = this.doStart({ onBootstrapProgress: options.onBootstrapProgress }).catch((error) => {
+			const startPromise = this.doStart({
+				onBootstrapProgress: options.onBootstrapProgress,
+				// The bootstrap wait is the one part of a start that has no timeout of its own
+				// beyond the lock bound, so it gets the caller's signal too.
+				signal: options.signal,
+			}).catch((error) => {
 				// Only clear our own memoization: a stale start must not evict a newer one.
 				if (this.startPromise === startPromise) this.startPromise = undefined;
 				throw error;
@@ -367,6 +431,7 @@ export class ReplKernelManager {
 				(await ensureKernelPython({
 					pythonSkills: this.options.pythonSkills,
 					onProgress: startOptions.onBootstrapProgress,
+					signal: startOptions.signal,
 				}));
 			if (this.startStale(generation)) throw new Error("Kernel start superseded");
 			this.options.python = python;
@@ -391,6 +456,9 @@ export class ReplKernelManager {
 				env: {
 					...process.env,
 					...this.options.env,
+					// The runtime clamps this into the range it speaks and reports the
+					// negotiated value in its ready frame; an older runtime ignores it.
+					[KERNEL_PROTOCOL_ENV_VAR]: requestedKernelProtocol(this.options.env),
 					PRIME_AGENT_KERNEL_OWNER_PID: String(process.pid),
 				},
 				stdio: ["pipe", "pipe", stderrLogFd ?? "pipe"],
@@ -399,7 +467,10 @@ export class ReplKernelManager {
 			if (stderrLogFd !== undefined) closeSync(stderrLogFd);
 		}
 		this.child = child;
-		if (child.pid !== undefined) recordOrphanProcessState(child.pid, true);
+		if (child.pid !== undefined) {
+			recordOrphanProcessState(child.pid, true);
+			this.inUseReferencePath = this.recordVenvInUseReference(child.pid);
+		}
 		this.readyDeferred = createDeferred<number>();
 		this.startupProtocolError = undefined;
 		this.wireChild(child);
@@ -411,12 +482,24 @@ export class ReplKernelManager {
 			// deferred synchronously before the corruption was parsed, so the rejection
 			// in failProtocolFrame was a no-op. Never mark such a child running.
 			if (this.startupProtocolError) throw this.startupProtocolError;
-			if (protocol !== REPL_PROTOCOL_VERSION) {
+			if (!Number.isInteger(protocol) || protocol < REPL_PROTOCOL_VERSION_MIN || protocol > REPL_PROTOCOL_VERSION) {
 				throw new Error(
-					`Kernel runtime speaks protocol ${protocol}, expected ${REPL_PROTOCOL_VERSION}. ` +
+					`Kernel runtime speaks protocol ${protocol}, expected ${REPL_PROTOCOL_VERSION_MIN}-${REPL_PROTOCOL_VERSION}. ` +
 						"Update prime-agent-runtime in the kernel Python (PRIME_AGENT_KERNEL_PYTHON) to match this prime-agent.",
 				);
 			}
+			// Recorded only once the announcement passed the range check, so a rejected
+			// handshake never leaves capabilities behind for a gated request to trust. Each
+			// feature bit needs both the negotiated version and the kernel's own token: a
+			// version number cannot tell a runtime that predates a request field from one
+			// that honours it.
+			this.negotiatedCapabilities = {
+				protocol,
+				protocol4: protocol >= KERNEL_PROTOCOL_V4,
+				preserveNames:
+					protocol >= KERNEL_PROTOCOL_V4 &&
+					this.announcedKernelCapabilities.includes(KERNEL_CAPABILITY_PRESERVE_NAMES),
+			};
 		} catch (e) {
 			if (this.startStale(generation)) throw e; // never tear down a newer start's kernel
 			const canRetryStartup = (this.state as string) !== "shutdown";
@@ -432,6 +515,27 @@ export class ReplKernelManager {
 	/** True when a teardown (or newer start) superseded the start that captured `generation`. */
 	private startStale(generation: number): boolean {
 		return generation !== this.startGeneration;
+	}
+
+	/**
+	 * Pin the generation directory this kernel was spawned from. Bootstrap never
+	 * rebuilds, renames, or deletes a directory that still has a live reference, so a
+	 * runtime identity change elsewhere on the machine cannot pull this kernel's modules
+	 * out from under it. Best effort: an interpreter outside a managed generation
+	 * (PRIME_AGENT_KERNEL_PYTHON, a project venv) records nothing, and a failed write is
+	 * reported here and read by bootstrap as "reference state unknown", which defers a
+	 * rebuild instead of deleting.
+	 */
+	private recordVenvInUseReference(pid: number): string | undefined {
+		const python = this.options.python;
+		if (!python) return undefined;
+		const venvDir = managedKernelVenvDirForPython(python);
+		if (!venvDir) return undefined;
+		const referencePath = recordKernelVenvInUseSync(venvDir, { pid, sessionId: this.options.sessionId });
+		if (referencePath === undefined) {
+			this.appendKernelDiagnostic(`could not record a kernel venv in-use reference in ${venvDir}`);
+		}
+		return referencePath;
 	}
 
 	private wireChild(child: ChildProcess): void {
@@ -767,6 +871,9 @@ export class ReplKernelManager {
 	private handleEvent(event: Record<string, unknown>): void {
 		const type = event.event;
 		if (type === "ready") {
+			// Additive and optional: a runtime that predates capability announcement sends
+			// no `capabilities` field and negotiates nothing beyond its protocol version.
+			this.announcedKernelCapabilities = asStringArray(event.capabilities);
 			this.readyDeferred?.resolve(typeof event.protocol === "number" ? event.protocol : -1);
 			return;
 		}
@@ -1301,6 +1408,19 @@ export class ReplKernelManager {
 		const child = this.child;
 		this.child = undefined;
 		this.readyDeferred = undefined;
+		// This kernel no longer pins its bootstrap generation directory, so a rebuild
+		// elsewhere may reclaim it once no other kernel references it either.
+		releaseKernelVenvInUseSync(this.inUseReferencePath);
+		this.inUseReferencePath = undefined;
+		// A restarted kernel negotiates again; stale capabilities must not authorize a
+		// gated request against a replacement that may speak an older protocol.
+		this.negotiatedCapabilities = undefined;
+		// Cleared as a pair with the negotiation above: the ready handler always overwrites
+		// this list, so the clear is hygiene, not correctness — but a future reader must
+		// never be able to combine a new negotiation with a previous child's announcement.
+		this.announcedKernelCapabilities = [];
+		// A replacement kernel is a new episode: its first refused write must be logged again.
+		this.reportedSnapshotSkipReason = undefined;
 		if (child) {
 			child.stdin?.destroy();
 			child.stdout?.destroy();
@@ -1539,21 +1659,46 @@ export class ReplKernelManager {
 		return this.captureSnapshot({ executionTimeoutMs: SNAPSHOT_EXECUTION_TIMEOUT_MS, pruneOversized: true });
 	}
 
+	/** The write policy for this kernel's current restore state and negotiated capabilities. */
+	private currentSnapshotWritePolicy(): SnapshotWritePolicy {
+		return snapshotWritePolicy({
+			hasSnapshotConfig: this.options.snapshot !== undefined,
+			pendingRestore: this.pendingRestore,
+			restoreWriteBlocked: this.restoreWriteBlocked,
+			unrestoredNames: [...this.unrestoredNames],
+			// A runtime that never announced the capability would ignore preserve_names and
+			// drop those blobs, which is worse than not writing: keep the ban for it.
+			preserveNamesSupported: this.negotiatedCapabilities?.preserveNames ?? false,
+		});
+	}
+
+	/**
+	 * Report a refused write. The in-memory stderr ring this also writes to never leaves the
+	 * process, so a skipped snapshot used to be invisible everywhere; one session-log line per
+	 * reason makes it countable, and a successful write re-arms the report.
+	 */
+	private reportSnapshotSkipped(reason: SnapshotWriteBlockReason): void {
+		this.appendKernelDiagnostic(`state snapshot skipped: ${reason}, so the on-disk snapshot is preserved`);
+		if (this.reportedSnapshotSkipReason === reason) return;
+		this.reportedSnapshotSkipReason = reason;
+		kernelLog.warn("kernel state snapshot skipped", {
+			reason,
+			names: [...this.unrestoredNames],
+			sessionId: this.options.sessionId,
+		});
+	}
+
 	private async captureSnapshot(
 		options: { executionTimeoutMs?: number; pruneOversized?: boolean } = {},
 	): Promise<SnapshotResult | null> {
 		const cfg = this.options.snapshot;
 		if (!cfg || !this.isRunning) return null;
-		// Hard guard: skip writes while restore is still pending, or while a failed
-		// restore has not isolated the previous snapshot.
-		if (this.pendingRestore || this.restoreFailed) {
-			this.appendKernelDiagnostic(
-				this.pendingRestore
-					? "state snapshot skipped: restore has not completed, so the on-disk snapshot is preserved"
-					: "state snapshot skipped: the last restore failed, so the on-disk snapshot is preserved",
-			);
+		const policy = this.currentSnapshotWritePolicy();
+		if (!policy.write) {
+			this.reportSnapshotSkipped(policy.reason);
 			return null;
 		}
+		this.reportedSnapshotSkipReason = undefined;
 		try {
 			const r = await this.enqueueRequest(
 				{
@@ -1563,27 +1708,51 @@ export class ReplKernelManager {
 					max_bytes: cfg.maxBytes ?? DEFAULT_SNAPSHOT_MAX_BYTES,
 					max_variable_bytes: cfg.maxVariableBytes ?? DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES,
 					prune_oversized: options.pruneOversized ?? false,
+					// Sent only for names that need it, and only to a runtime that announced the
+					// capability (see currentSnapshotWritePolicy).
+					...(policy.preserveNames.length > 0 ? { preserve_names: policy.preserveNames } : {}),
 				},
 				"",
 				{ internal: true },
 				options.executionTimeoutMs,
 			);
 			if (r.status !== "ok" || !r.doneFields) {
-				this.appendKernelDiagnostic(
-					`state snapshot ${r.status === "aborted" ? "timed out" : "failed"}: ${r.error?.evalue ?? r.stderr}`,
-				);
+				const reason = r.status === "aborted" ? "timed out" : "failed";
+				const detail = r.error?.evalue ?? r.stderr;
+				this.appendKernelDiagnostic(`state snapshot ${reason}: ${detail}`);
+				kernelLog.warn("kernel state snapshot failed", {
+					reason,
+					detail,
+					sessionId: this.options.sessionId,
+				});
 				return null;
 			}
 			const pruned = asStringArray(r.doneFields.pruned);
+			// What the runtime actually carried over: a size cap may have dropped the oldest
+			// preserved names, and reporting the request list instead would claim a save that
+			// did not happen.
+			const preserved = asStringArray(r.doneFields.preserved);
+			if (preserved.length > 0) {
+				kernelLog.info("kernel state snapshot preserved unrestored names", {
+					count: preserved.length,
+					names: preserved,
+					sessionId: this.options.sessionId,
+				});
+			}
 			return {
 				saved: asStringArray(r.doneFields.saved),
 				skipped: asReasonArray(r.doneFields.skipped),
 				pruned: pruned.length > 0 ? pruned : undefined,
+				preserved: preserved.length > 0 ? preserved : undefined,
 				bytes: typeof r.doneFields.bytes === "number" ? r.doneFields.bytes : 0,
 				path: cfg.path,
 			};
 		} catch (error) {
 			this.appendKernelDiagnostic(`state snapshot error: ${errorMessage(error)}`);
+			kernelLog.warn("kernel state snapshot error", {
+				error: errorMessage(error),
+				sessionId: this.options.sessionId,
+			});
 			return null;
 		}
 	}
@@ -1617,11 +1786,15 @@ export class ReplKernelManager {
 			this.pendingRestore = false;
 			const restored = asStringArray(r.doneFields.restored);
 			const failed = asReasonArray(r.doneFields.failed);
-			// A partial revive is a failure for snapshot purposes too: the namespace is
-			// missing names the on-disk snapshot still carries, so it must not overwrite it.
-			// A later fully successful restore clears the flag.
-			this.restoreFailed = failed.length > 0;
-			return { restored, failed, path: cfg.path };
+			// A partial revive no longer freezes persistence. The names that did not come back
+			// are remembered so later snapshots ask the runtime to carry their saved blobs over
+			// verbatim: new work is persisted, the unrestorable blobs are not overwritten, and a
+			// later restore still fails on those same names instead of pretending they are fine.
+			// A fully successful restore clears the set and returns to whole-namespace writes.
+			this.unrestoredNames.clear();
+			for (const failure of failed) this.unrestoredNames.add(failure.name);
+			const snapshotPolicy = this.currentSnapshotPolicyAfterRestore(failed.length);
+			return { restored, failed, path: cfg.path, ...(snapshotPolicy ? { snapshotPolicy } : {}) };
 		} catch (error) {
 			this.appendKernelDiagnostic(`state restore error: ${errorMessage(error)}`);
 			this.isolateFailedSnapshot(cfg, errorMessage(error));
@@ -1633,16 +1806,37 @@ export class ReplKernelManager {
 	private isolateFailedSnapshot(cfg: { path: string; manifestPath: string }, reason: string): void {
 		try {
 			const isolated = isolateCorruptSnapshot(cfg.path, cfg.manifestPath);
-			this.restoreFailed = false;
+			this.restoreWriteBlocked = false;
 			this.pendingRestore = false;
+			// The payload that held those names is gone; nothing is left to preserve.
+			this.unrestoredNames.clear();
 			const isolatedPath = isolated.isolatedPath ?? `${cfg.path} (missing)`;
 			this.appendKernelDiagnostic(`state restore failed; isolated corrupt snapshot to ${isolatedPath}: ${reason}`);
+			kernelLog.warn("kernel state restore failed; snapshot isolated", {
+				isolatedPath,
+				reason,
+				sessionId: this.options.sessionId,
+			});
 		} catch (error) {
-			this.restoreFailed = true;
+			this.restoreWriteBlocked = true;
 			this.appendKernelDiagnostic(
 				`state restore failed; could not isolate snapshot at ${cfg.path}: ${errorMessage(error)}`,
 			);
+			kernelLog.error("kernel state restore failed; snapshot could not be isolated", {
+				path: cfg.path,
+				error: errorMessage(error),
+				sessionId: this.options.sessionId,
+			});
 		}
+	}
+
+	/**
+	 * How the next snapshot will treat names that failed to revive, for the model-facing
+	 * notice: preserving needs the runtime capability, otherwise writes stay paused.
+	 */
+	private currentSnapshotPolicyAfterRestore(failedCount: number): SnapshotPolicyAfterPartialRestore | undefined {
+		if (failedCount === 0) return undefined;
+		return this.negotiatedCapabilities?.preserveNames ? "preserve-names" : "write-blocked";
 	}
 
 	/** Live user-defined top-level names, or null if the kernel isn't running. Never throws. */
@@ -1663,9 +1857,15 @@ export class ReplKernelManager {
 
 	private scheduleSnapshot(): void {
 		const cfg = this.options.snapshot;
-		// A namespace never (or incompletely) revived is older than the on-disk
-		// snapshot; never overwrite it.
-		if (!cfg || this.restoreFailed || this.pendingRestore) return;
+		if (!cfg) return;
+		// A namespace that was never revived — or one this runtime cannot preserve the
+		// unrestored names of — is older than the on-disk snapshot; never overwrite it.
+		const policy = this.currentSnapshotWritePolicy();
+		if (!policy.write) {
+			this.reportSnapshotSkipped(policy.reason);
+			return;
+		}
+		this.reportedSnapshotSkipReason = undefined;
 		if (this.snapshotTimer) clearTimeout(this.snapshotTimer);
 		this.snapshotTimer = globalThis.setTimeout(() => {
 			this.snapshotTimer = undefined;
@@ -1696,10 +1896,10 @@ export class ReplKernelManager {
 	private async runSnapshotFlushForDispose(): Promise<void> {
 		if (!this.options.snapshot || !this.isRunning) return;
 		// A kernel that never restored the saved namespace must not overwrite it:
-		// the on-disk snapshot is strictly fresher than this namespace. A FAILED
-		// restore must not write either, but it still settles the queue here —
-		// skipping the wait would let the teardown race and kill in-flight work
-		// (e.g. the lazy re-bootstrap); captureSnapshot enforces the write ban.
+		// the on-disk snapshot is strictly fresher than this namespace. A restore that
+		// failed to load the payload must not write either, but it still settles the queue
+		// here — skipping the wait would let the teardown race and kill in-flight work
+		// (e.g. the lazy re-bootstrap); captureSnapshot enforces the write policy.
 		if (this.pendingRestore) return;
 		// Block new external executions so none can splice ahead of the final snapshot and stall dispose.
 		this.flushingSnapshotForDispose = true;
