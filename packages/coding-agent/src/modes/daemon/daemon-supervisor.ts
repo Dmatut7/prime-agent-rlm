@@ -469,6 +469,29 @@ export function isTransientCatchupFailure(error: unknown): boolean {
 	return TRANSIENT_CATCHUP_FAILURES.some((pattern) => pattern.test(message));
 }
 
+/**
+ * P1-7a: how long a rejected command should wait before it is worth re-issuing,
+ * reported on the failure response as `retryAfterMs`. The hint is the
+ * supervisor's own recheck interval for that state, so a client waits exactly as
+ * long as the state is expected to last instead of guessing.
+ *
+ * Only pre-dispatch rejections qualify: both patterns are thrown before the
+ * command reaches a worker, so nothing was executed and re-issuing is safe.
+ * `failed` deliberately has no hint — it is terminal and the caller's action is
+ * `retry_worker`, not waiting. The patterns are anchored because a worker's own
+ * failure text ("Cannot list heartbeats while session worker is recovering") is
+ * forwarded verbatim and carries no such guarantee.
+ */
+const TRANSIENT_RETRY_AFTER_MS: readonly { pattern: RegExp; retryAfterMs: number }[] = [
+	{ pattern: /^Session worker is recovering\b/, retryAfterMs: DEFERRED_RECOVERY_RECHECK_MS },
+	{ pattern: /^Session worker is stopping\b/, retryAfterMs: STOP_FINALIZATION_RECHECK_MS },
+];
+
+export function transientRetryAfterMs(error: unknown): number | undefined {
+	const message = error instanceof Error ? error.message : String(error);
+	return TRANSIENT_RETRY_AFTER_MS.find((entry) => entry.pattern.test(message))?.retryAfterMs;
+}
+
 /** Terminal commands converge on a target that is already gone instead of failing (C19/L4). */
 const TERMINAL_DAEMON_COMMANDS: ReadonlySet<string> = new Set(["kill", "abort", "cancel_rlm_child"]);
 
@@ -2326,7 +2349,16 @@ export class DaemonSupervisor {
 					`Supervisor command ${command.type} failed: ${error instanceof Error ? error.stack : String(error)}`,
 				);
 			}
-			let response = failure(command.id, command.type, error, serializeDaemonError(error));
+			// P1-7a: a transient worker state is reported with the supervisor's own
+			// recheck interval, so a client that understands the hint waits and
+			// re-issues inside its budget instead of surfacing a red error.
+			let response = failure(
+				command.id,
+				command.type,
+				error,
+				serializeDaemonError(error),
+				transientRetryAfterMs(error),
+			);
 			if (journalIdentity && !isSupervisorGenerationStale(error)) {
 				try {
 					await this.assertCurrentOwnership();

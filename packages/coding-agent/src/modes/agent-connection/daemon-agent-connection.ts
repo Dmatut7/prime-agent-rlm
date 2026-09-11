@@ -201,6 +201,12 @@ export interface DaemonAgentConnectionOptions {
 	reconnectTimeoutMs?: number;
 	/** Bound an incomplete streamed snapshot before failing the attach or resync. */
 	snapshotTimeoutMs?: number;
+	/**
+	 * Bound the attach request itself (P1-7a). Defaults to the snapshot budget: an
+	 * attach that has not answered by then has a snapshot problem anyway, and
+	 * naming the budget here keeps it off the transport's implicit default.
+	 */
+	attachTimeoutMs?: number;
 	/** Overrides the full re-pull schedule used after a failed snapshot self-heal. */
 	snapshotRecoveryRetryDelaysMs?: readonly number[];
 	/**
@@ -463,7 +469,7 @@ export class DaemonAgentConnection implements AgentConnection {
 								...this.lastEventCursor,
 							},
 			},
-			undefined,
+			this.options.attachTimeoutMs ?? DAEMON_SNAPSHOT_TIMEOUT_MS,
 			options,
 		);
 		this.activeSessionId = getAttachActiveSessionId(result);

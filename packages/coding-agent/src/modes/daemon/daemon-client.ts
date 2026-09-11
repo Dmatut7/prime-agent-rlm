@@ -21,6 +21,7 @@ import {
 	isDaemonMutatingCommand,
 	meetsDaemonCommandCompatibility,
 } from "./daemon-protocol.js";
+import { TRANSIENT_RETRY_MAX_ATTEMPTS, TRANSIENT_RETRY_WINDOW_MS } from "./daemon-transient-retry.js";
 import type { DaemonWorkerCommand, DaemonWorkerCommandBody } from "./daemon-worker-protocol.js";
 
 type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
@@ -55,6 +56,8 @@ interface PendingDaemonRequest {
 	awaitingReconnect: boolean;
 	acknowledgeResult: boolean;
 	recoverable: boolean;
+	/** False when the command could have been applied, so a timeout must not invite a blind re-issue. */
+	retryable: boolean;
 	/** Re-checked against the new hello before a reconnect replay. */
 	compatibilities: readonly DaemonCommandCompatibility[];
 }
@@ -75,6 +78,35 @@ export class DaemonSocketClosedError extends Error {
 			`Connection to the Prime Agent daemon closed.${reasonDetails}${causeDetails} ${daemonEndpointDetails(socketPath)}`,
 		);
 		this.name = "DaemonSocketClosedError";
+	}
+}
+
+/** Why a request budget ran out, so a caller can decide whether re-issuing is safe. */
+export type DaemonRequestTimeoutHint =
+	/** The daemon never answered; a command already written to the socket may still be running. */
+	| "no_response"
+	/** The transport was gone when the budget ran out. */
+	| "disconnected"
+	/** The daemon kept deferring the command with a retry hint; it was never executed. */
+	| "transient_rejection";
+
+/**
+ * P1-7a: a request budget that ran out, typed. The command is not recalled from
+ * the socket — recalling it needs server-side cancellation — so the fields tell
+ * the caller what it may safely do next: `retryable` is only true when the
+ * daemon provably did not run the command, or when the command cannot mutate
+ * anything.
+ */
+export class DaemonRequestTimeoutError extends Error {
+	constructor(
+		readonly commandType: string,
+		readonly timeoutMs: number,
+		readonly retryable: boolean,
+		readonly stateHint: DaemonRequestTimeoutHint,
+		message: string,
+	) {
+		super(message);
+		this.name = "DaemonRequestTimeoutError";
 	}
 }
 
@@ -148,6 +180,8 @@ export class DaemonClient {
 	private helloMessage?: DaemonHello;
 	private daemonClosingReason?: DaemonClosingReason;
 	private reconnectPromise?: Promise<void>;
+	/** Pending P1-7a retry waits, woken by close() so a caller is never parked on a hint. */
+	private readonly transientRetrySleeps = new Set<() => void>();
 	private readonly helloWaiters = new Set<{
 		resolve: (hello: DaemonHello) => void;
 		reject: (error: Error) => void;
@@ -396,7 +430,62 @@ export class DaemonClient {
 		return this.requestWire(command, timeoutMs);
 	}
 
+	/**
+	 * P1-7a: a failure carrying `retryAfterMs` is the daemon saying "not now, and
+	 * here is how long 'not now' lasts" — it rejected the command before running
+	 * it, so waiting and re-issuing is safe. The wait and every retry live inside
+	 * the caller's own budget, capped by the merged transient bound (B9/L4), so a
+	 * permanently deferred command still fails within the time the caller allowed.
+	 * A failure without the hint keeps today's semantics and returns immediately.
+	 */
 	private async requestWire(
+		command: DaemonWireCommandBody,
+		timeoutMs: number,
+		options: DaemonClientRequestOptions = {},
+		publicEnvelopeProtocolVersion?: DaemonProtocolVersion,
+		compatibilities: readonly DaemonCommandCompatibility[] = [],
+	): Promise<DaemonResponse> {
+		const retryDeadline = Date.now() + Math.min(timeoutMs, TRANSIENT_RETRY_WINDOW_MS);
+		let attemptTimeoutMs = timeoutMs;
+		for (let attempt = 0; ; attempt++) {
+			const response = await this.requestOnce(
+				command,
+				attemptTimeoutMs,
+				options,
+				publicEnvelopeProtocolVersion,
+				compatibilities,
+			);
+			const retryAfterMs = response.success ? undefined : response.retryAfterMs;
+			if (retryAfterMs === undefined || !(retryAfterMs > 0)) {
+				return response;
+			}
+			if (attempt + 1 >= TRANSIENT_RETRY_MAX_ATTEMPTS) {
+				return response;
+			}
+			// The retry has to fit inside the caller's budget, not merely start before
+			// it ends: a hint that consumes the last millisecond would only produce a
+			// zero-budget attempt, so the honest answer is the typed timeout.
+			const remainingMs = retryDeadline - Date.now();
+			if (retryAfterMs >= remainingMs) {
+				throw new DaemonRequestTimeoutError(
+					command.type,
+					timeoutMs,
+					true,
+					"transient_rejection",
+					`Timed out after ${timeoutMs}ms waiting for the Prime Agent daemon to accept "${command.type}": it kept deferring the command (retry after ${retryAfterMs}ms, ${remainingMs}ms of budget left). ${daemonEndpointDetails(this.socketPath)}`,
+				);
+			}
+			await this.sleepForTransientRetry(retryAfterMs);
+			if (this.closed) {
+				throw new Error(
+					`Prime Agent daemon client closed before the operation completed. ${daemonEndpointDetails(this.socketPath)}`,
+				);
+			}
+			attemptTimeoutMs = Math.max(1, Math.min(timeoutMs, retryDeadline - Date.now()));
+		}
+	}
+
+	private async requestOnce(
 		command: DaemonWireCommandBody,
 		timeoutMs: number,
 		options: DaemonClientRequestOptions = {},
@@ -434,6 +523,8 @@ export class DaemonClient {
 				awaitingReconnect: false,
 				acknowledgeResult,
 				recoverable: options.recoverable !== false,
+				// A read can always be re-issued; a mutation may already be running server-side.
+				retryable: !isDaemonMutatingCommand(fullCommand as DaemonCommand),
 				compatibilities,
 			};
 			this.pendingRequests.set(id, pending);
@@ -445,17 +536,40 @@ export class DaemonClient {
 	private armPendingRequestTimeout(id: string, pending: PendingDaemonRequest): void {
 		pending.timeout = setTimeout(() => {
 			this.pendingRequests.delete(id);
+			// Either way the command was already written to the socket, so whether it
+			// ran is unknown: only a command that cannot mutate is safe to re-issue.
+			const disconnected = !this.socket || this.socket.destroyed;
 			pending.reject(
-				new Error(
+				new DaemonRequestTimeoutError(
+					pending.commandType,
+					pending.timeoutMs,
+					pending.retryable,
+					disconnected ? "disconnected" : "no_response",
 					`Timed out after ${pending.timeoutMs}ms waiting for the Prime Agent daemon response to "${pending.commandType}". ${daemonEndpointDetails(this.socketPath)}`,
 				),
 			);
 		}, pending.timeoutMs);
 	}
 
+	/** A retry wait is interruptible: closing the client must not leave a caller parked on a hint. */
+	private sleepForTransientRetry(ms: number): Promise<void> {
+		return new Promise((resolveSleep) => {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const wake = (): void => {
+				if (timer !== undefined) clearTimeout(timer);
+				this.transientRetrySleeps.delete(wake);
+				resolveSleep();
+			};
+			timer = setTimeout(wake, ms);
+			this.transientRetrySleeps.add(wake);
+		});
+	}
+
 	close(): void {
 		this.closed = true;
 		this.reconnectOptions = undefined;
+		for (const wake of [...this.transientRetrySleeps]) wake();
+		this.transientRetrySleeps.clear();
 		this.detachReader?.();
 		this.detachReader = undefined;
 		this.rejectAll(

@@ -113,8 +113,14 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 //   the stall capability: daemon_hello.adopting / daemon_hello.degraded, and
 //   session_snapshot_failed.reason / .purpose. Each is optional and absent on
 //   the pre-28 wire, so no client gates on the number; the digest identifies it.
-export const DAEMON_SCHEMA_REVISION = 28;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-28-66299858b8b4";
+// Revision 29 adds the transient-retry hint on failure responses
+//   (response.retryAfterMs, P1-7a). It is optional and absent on the pre-29
+//   wire: a client that does not know the field keeps failing immediately,
+//   exactly as it did before, so nothing gates on the number. The per-command
+//   worker request timeouts that ship with it (P1-7b) are supervisor-internal
+//   policy and change no wire shape.
+export const DAEMON_SCHEMA_REVISION = 29;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-29-66299858b8b4";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -1203,6 +1209,14 @@ export type DaemonResponse =
 			success: false;
 			error: string;
 			errorInfo?: DaemonErrorInfo;
+			/**
+			 * P1-7a: the command was rejected before it could do anything, and the
+			 * daemon knows how long the transient state is expected to last. A client
+			 * that understands the field waits and retries inside its own budget; a
+			 * client that does not sees exactly the failure it saw before, so the
+			 * field is additive and never gates a capability.
+			 */
+			retryAfterMs?: number;
 	  };
 
 export type DaemonErrorInfo =
@@ -1551,6 +1565,15 @@ export function isDaemonMutatingCommand(command: Pick<DaemonCommand, "type">): b
 	return !READ_ONLY_DAEMON_COMMANDS.has(command.type);
 }
 
+/**
+ * P1-7b: the read tier of the worker request timeout table. A read never mutates
+ * state, so it fails fast and lets the client retry on the daemon's own hint
+ * instead of holding a worker request open for the long-command budget.
+ */
+export function isDaemonReadOnlyCommand(command: Pick<DaemonCommand, "type">): boolean {
+	return READ_ONLY_DAEMON_COMMANDS.has(command.type);
+}
+
 export const UPDATE_RESTART_DRAIN_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
 	"extension_ui_response",
 	"abort",
@@ -1663,6 +1686,7 @@ export function failure(
 	command: string,
 	error: unknown,
 	errorInfo?: DaemonErrorInfo,
+	retryAfterMs?: number,
 ): DaemonResponse {
 	return {
 		id,
@@ -1671,5 +1695,6 @@ export function failure(
 		success: false,
 		error: error instanceof Error ? error.message : String(error),
 		...(errorInfo ? { errorInfo } : {}),
+		...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
 	};
 }
