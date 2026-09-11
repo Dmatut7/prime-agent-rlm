@@ -1100,8 +1100,10 @@ async function ensureKernelPythonUncached(
 	// provably abandoned directories are touched, so this needs no lock; the generation
 	// this boot is about to use is excluded.
 	await pruneKernelVenvGenerations(base, { activeDir: venv }).catch(() => undefined);
-	if (await kernelReady(python, venv, runtimeIdentity, pythonSkills)) return python;
+	// Before the warm early-return so a machine that never rebuilds still hears about the
+	// leftover pre-generation directory once (interactive boots only; see the callee).
 	reportLegacyKernelVenv(base, options);
+	if (await kernelReady(python, venv, runtimeIdentity, pythonSkills)) return python;
 
 	// The lock stays keyed on the base path, so pre- and post-generation hosts serialize
 	// on the same lock through a mixed-version window.

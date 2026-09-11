@@ -348,7 +348,7 @@ export async function listKernelVenvGenerations(base: string): Promise<string[]>
 		.sort();
 }
 
-async function generationRecencyMs(dir: string): Promise<number> {
+function generationRecencyMs(dir: string): number {
 	try {
 		return lstatSync(dir).mtimeMs;
 	} catch {
@@ -379,7 +379,7 @@ export async function pruneKernelVenvGenerations(
 			kept.push({ dir, liveReferences: state.references.length, protectedByReference: true });
 			continue;
 		}
-		unreferenced.push({ dir, recencyMs: await generationRecencyMs(dir) });
+		unreferenced.push({ dir, recencyMs: generationRecencyMs(dir) });
 	}
 	unreferenced.sort((a, b) => b.recencyMs - a.recencyMs || path.basename(b.dir).localeCompare(path.basename(a.dir)));
 	for (const entry of unreferenced.slice(0, retention)) {
