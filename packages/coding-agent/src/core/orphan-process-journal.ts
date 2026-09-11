@@ -157,7 +157,10 @@ export function isOrphanPidReused(
 	if (Number.isNaN(recorded)) return false;
 	const startId = query(orphan.pid);
 	if (typeof startId !== "string" || !startId.startsWith("ps:")) return false;
-	const started = Date.parse(startId.slice("ps:".length));
+	// getPsProcessStartId pins TZ=UTC for the lstart render, so the stamp must be
+	// parsed as UTC; Date.parse would otherwise read it as local time and skew the
+	// comparison by the UTC offset on non-UTC hosts.
+	const started = Date.parse(`${startId.slice("ps:".length)} UTC`);
 	if (Number.isNaN(started)) return false;
 	return started > recorded;
 }
