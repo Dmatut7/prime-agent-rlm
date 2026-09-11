@@ -134,6 +134,21 @@ const MAX_IGNORED_SNAPSHOT_IDS = 128;
 const SNAPSHOT_RECOVERY_RETRY_DELAYS_MS: readonly number[] = [1_000, 4_000];
 /** P0-5c: at most one gap line per window per connection; the rest are counted into the next one. */
 const EVENT_GAP_LOG_THROTTLE_MS = 1_000;
+/**
+ * T4-4/F9: the breaker bounds on a gap-triggered re-pull. Either one opens it and
+ * the connection falls back to log-only for the rest of its life: a real hole
+ * that a re-pull cannot fix would otherwise loop "re-pull, still gapped, re-pull"
+ * forever, which is a self-inflicted resync storm on top of the original fault.
+ *
+ * - the streak bound catches one incident repeating;
+ * - the window bound catches incidents spaced far enough apart that the streak
+ *   resets, so a long-lived connection still has a resync rate ceiling.
+ */
+const EVENT_GAP_RECOVERY_STREAK_LIMIT = 3;
+/** Gaps further apart than this are separate incidents, so the streak restarts. */
+const EVENT_GAP_RECOVERY_STREAK_RESET_MS = 5 * 60_000;
+const EVENT_GAP_RECOVERY_WINDOW_MS = 10 * 60_000;
+const EVENT_GAP_RECOVERY_WINDOW_LIMIT = 3;
 let cachedEventGapRecoveryMode: "log" | "recover" | undefined;
 
 /**
@@ -313,6 +328,12 @@ export class DaemonAgentConnection implements AgentConnection {
 	private eventGapLastReportAt: number | undefined;
 	private eventGapLastExpected: number | undefined;
 	private eventGapLastGot: number | undefined;
+	/** T4-4/F9 breaker state: consecutive re-pulls, their timestamps, and whether it opened. */
+	private eventGapRecoveryStreak = 0;
+	private eventGapLastRecoveryAt: number | undefined;
+	private readonly eventGapRecoveryTimestamps: number[] = [];
+	private eventGapBreakerOpen = false;
+	private eventGapBreakerReason: string | undefined;
 	private lastEventSequence: number | undefined;
 	private childRosterSequence: number | undefined;
 	private latestSnapshot: AgentConnectionSnapshot | undefined;
@@ -2664,14 +2685,26 @@ export class DaemonAgentConnection implements AgentConnection {
 		lastExpected: number | undefined;
 		lastGot: number | undefined;
 		recoveryInFlight: boolean;
+		/** Configured mode, which the breaker overrides to log-only once it opens. */
+		configuredMode: "log" | "recover";
+		breakerOpen: boolean;
+		breakerReason: string | undefined;
+		recoveryStreak: number;
+		/** Gap re-pulls inside the breaker's sliding window. */
+		recoveryInWindow: number;
 	} {
 		return {
-			mode: this.eventGapRecoveryMode(),
+			mode: this.eventGapBreakerOpen ? "log" : this.eventGapRecoveryMode(),
+			configuredMode: this.eventGapRecoveryMode(),
 			detected: this.eventGapDetected,
 			suppressed: this.eventGapSuppressed,
 			lastExpected: this.eventGapLastExpected,
 			lastGot: this.eventGapLastGot,
 			recoveryInFlight: this.eventGapInFlight,
+			breakerOpen: this.eventGapBreakerOpen,
+			breakerReason: this.eventGapBreakerReason,
+			recoveryStreak: this.eventGapRecoveryStreak,
+			recoveryInWindow: this.eventGapRecoveryTimestamps.length,
 		};
 	}
 
@@ -2680,13 +2713,14 @@ export class DaemonAgentConnection implements AgentConnection {
 		this.eventGapLastExpected = expected;
 		this.eventGapLastGot = got;
 		const detail = `event gap detected for ${this.activeSessionId}: expected sequence ${expected}, got ${got} (generation ${generation})`;
-		if (this.eventGapRecoveryMode() === "recover") {
+		if (this.eventGapRecoveryMode() === "recover" && !this.eventGapBreakerOpen) {
 			// Single flight: one hole triggers one re-pull, not one per later frame.
 			if (this.eventGapInFlight || this.disposed) {
 				return;
 			}
 			this.eventGapInFlight = true;
-			this.appendEventGapLog(`${detail}; re-pulling the session`);
+			const streak = this.beginEventGapRecovery();
+			this.appendEventGapLog(`${detail}; re-pulling the session (streak ${streak})`);
 			// The catch is not optional: a rejection here would be an unhandled one,
 			// which is exactly what the supervisor's crash handlers exist to isolate.
 			void this.recoverFailedSnapshot("resync", new Error(detail))
@@ -2698,6 +2732,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				.finally(() => {
 					this.eventGapInFlight = false;
 				});
+			this.tripEventGapRecoveryBreaker(detail);
 			return;
 		}
 		const now = Date.now();
@@ -2708,10 +2743,56 @@ export class DaemonAgentConnection implements AgentConnection {
 		const suppressed = this.eventGapSuppressed;
 		this.eventGapSuppressed = 0;
 		this.eventGapLastReportAt = now;
+		const breaker = this.eventGapBreakerOpen ? `; recovery circuit open (${this.eventGapBreakerReason})` : "";
 		this.appendEventGapLog(
-			`${detail}; log-only, no recovery attempted${
+			`${detail}; log-only, no recovery attempted${breaker}${
 				suppressed > 0 ? ` (+${suppressed} suppressed in the last ${EVENT_GAP_LOG_THROTTLE_MS}ms)` : ""
 			}`,
+		);
+	}
+
+	/**
+	 * Counts one gap-triggered re-pull against both breaker bounds and returns the
+	 * streak length. A gap that arrives long after the previous one starts a new
+	 * incident, so an occasional hole on a long-lived connection never accumulates
+	 * into a streak.
+	 */
+	private beginEventGapRecovery(): number {
+		const now = Date.now();
+		if (
+			this.eventGapLastRecoveryAt !== undefined &&
+			now - this.eventGapLastRecoveryAt > EVENT_GAP_RECOVERY_STREAK_RESET_MS
+		) {
+			this.eventGapRecoveryStreak = 0;
+		}
+		this.eventGapLastRecoveryAt = now;
+		this.eventGapRecoveryStreak++;
+		this.eventGapRecoveryTimestamps.push(now);
+		while (
+			this.eventGapRecoveryTimestamps.length > 0 &&
+			now - (this.eventGapRecoveryTimestamps[0] ?? now) > EVENT_GAP_RECOVERY_WINDOW_MS
+		) {
+			this.eventGapRecoveryTimestamps.shift();
+		}
+		return this.eventGapRecoveryStreak;
+	}
+
+	/** F9: opens the breaker and drops this connection back to log-only, loudly. */
+	private tripEventGapRecoveryBreaker(detail: string): void {
+		if (this.eventGapBreakerOpen) {
+			return;
+		}
+		const overStreak = this.eventGapRecoveryStreak >= EVENT_GAP_RECOVERY_STREAK_LIMIT;
+		const overWindow = this.eventGapRecoveryTimestamps.length >= EVENT_GAP_RECOVERY_WINDOW_LIMIT;
+		if (!overStreak && !overWindow) {
+			return;
+		}
+		this.eventGapBreakerOpen = true;
+		this.eventGapBreakerReason = overStreak
+			? `${this.eventGapRecoveryStreak} consecutive gap re-pulls did not close the hole`
+			: `${this.eventGapRecoveryTimestamps.length} gap re-pulls within ${EVENT_GAP_RECOVERY_WINDOW_MS}ms`;
+		this.appendEventGapLog(
+			`event gap recovery circuit OPEN for ${this.activeSessionId}: ${this.eventGapBreakerReason}; staying log-only until this connection is replaced (${detail})`,
 		);
 	}
 
