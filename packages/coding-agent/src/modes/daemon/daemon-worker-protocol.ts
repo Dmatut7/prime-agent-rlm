@@ -174,6 +174,30 @@ export interface DaemonWorkerDescriptor {
 	lastError?: string;
 }
 
+/**
+ * The failure reason a reaped worker is archived with (M15).
+ *
+ * Persisting the raw string was refused once, because an error tail can carry an
+ * environment dump; dropping it entirely was worse, because the reaper runs
+ * hours later, usually after a restart, so the archive line — the only on-disk
+ * evidence of an OOM-class accident — always read the placeholder and named no
+ * cause. The middle ground is the first line, capped: the human-readable reason
+ * survives a restart, a stack tail does not.
+ */
+export const DURABLE_LAST_ERROR_MAX_CHARS = 200;
+export const FALLBACK_FAILED_WORKER_LAST_ERROR = "Waiting for a client with fresh runtime context";
+
+export function durableWorkerLastError(descriptor: Pick<DaemonWorkerDescriptor, "lastError">): string {
+	const raw = typeof descriptor.lastError === "string" ? descriptor.lastError : "";
+	const firstLine = raw.split("\n")[0]?.trim() ?? "";
+	if (firstLine.length === 0) {
+		return FALLBACK_FAILED_WORKER_LAST_ERROR;
+	}
+	return firstLine.length > DURABLE_LAST_ERROR_MAX_CHARS
+		? `${firstLine.slice(0, DURABLE_LAST_ERROR_MAX_CHARS - 1)}…`
+		: firstLine;
+}
+
 export function durableDaemonWorkerDescriptor(descriptor: DaemonWorkerDescriptor): DaemonWorkerDescriptor {
 	const versionOneCreateCommand = descriptor.createCommand as unknown as { config?: unknown };
 	const versionOneConfig =
@@ -213,7 +237,7 @@ export function durableDaemonWorkerDescriptor(descriptor: DaemonWorkerDescriptor
 		...(descriptor.stopRequestedAt !== undefined ? { stopRequestedAt: descriptor.stopRequestedAt } : {}),
 		...(descriptor.archiveOnStop !== undefined ? { archiveOnStop: descriptor.archiveOnStop } : {}),
 		...(descriptor.lastFailureAt !== undefined ? { lastFailureAt: descriptor.lastFailureAt } : {}),
-		...(descriptor.lifecycle === "failed" ? { lastError: "Waiting for a client with fresh runtime context" } : {}),
+		...(descriptor.lifecycle === "failed" ? { lastError: durableWorkerLastError(descriptor) } : {}),
 	};
 }
 

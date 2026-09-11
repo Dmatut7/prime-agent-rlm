@@ -33,7 +33,10 @@ import {
 } from "../src/modes/daemon/daemon-protocol.js";
 import {
 	type DaemonWorkerDescriptor,
+	DURABLE_LAST_ERROR_MAX_CHARS,
 	durableDaemonWorkerDescriptor,
+	durableWorkerLastError,
+	FALLBACK_FAILED_WORKER_LAST_ERROR,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
 
 describe("daemon protocol helpers", () => {
@@ -533,4 +536,50 @@ describe("daemon protocol helpers", () => {
 		expect(salvageDaemonCommandId(JSON.stringify("command"))).toBeUndefined();
 		expect(salvageDaemonCommandId("{ not json")).toBeUndefined();
 	});
+});
+
+it("carries the real failure reason into the durable descriptor, bounded to one line", () => {
+	const cases = [
+		{
+			name: "real reason",
+			lastError: "worker exited unexpectedly (signal SIGKILL)",
+			expected: "worker exited unexpectedly (signal SIGKILL)",
+		},
+		{ name: "no reason", lastError: undefined, expected: FALLBACK_FAILED_WORKER_LAST_ERROR },
+		{ name: "blank reason", lastError: "   ", expected: FALLBACK_FAILED_WORKER_LAST_ERROR },
+		// A stack tail can carry an environment dump; only the first line survives.
+		{
+			name: "secret in the tail",
+			lastError: "spawn failed\nenv: PROVIDER_TOKEN=secret-token-value",
+			expected: "spawn failed",
+		},
+		{
+			name: "overlong reason",
+			lastError: "x".repeat(DURABLE_LAST_ERROR_MAX_CHARS + 50),
+			expected: `${"x".repeat(DURABLE_LAST_ERROR_MAX_CHARS - 1)}…`,
+		},
+	];
+	expect(cases.length).toBeGreaterThan(0);
+	for (const testCase of cases) {
+		expect(durableWorkerLastError({ lastError: testCase.lastError }), testCase.name).toBe(testCase.expected);
+		expect(JSON.stringify(durableWorkerLastError({ lastError: testCase.lastError })), testCase.name).not.toContain(
+			"secret-",
+		);
+	}
+	// Wired through the descriptor a restart actually re-adopts, so the reaper's
+	// archive line names a cause instead of a placeholder.
+	const durable = durableDaemonWorkerDescriptor({
+		version: 2,
+		workerId: "worker-failed",
+		pid: 4242,
+		rootActiveSessionId: "active-failed",
+		createdAt: "2026-09-11T00:00:00.000Z",
+		updatedAt: "2026-09-11T00:00:00.000Z",
+		lifecycle: "failed",
+		lastError: "kernel died: out of memory\nstack: secret-frame",
+		consecutiveFailures: 3,
+		createCommand: { type: "create", sessionPath: "/sessions/root.jsonl" },
+	} as unknown as DaemonWorkerDescriptor);
+	expect(durable.lastError).toBe("kernel died: out of memory");
+	expect(JSON.stringify(durable)).not.toContain("secret-");
 });
