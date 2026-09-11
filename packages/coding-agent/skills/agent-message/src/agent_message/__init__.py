@@ -7,6 +7,7 @@ only call the host bridge exposed inside the Prime Agent kernel.
 from __future__ import annotations
 
 from typing import Any, Literal
+from uuid import uuid4
 
 from rlm import host_request
 
@@ -55,6 +56,11 @@ async def send(
             "receiver_role": receiver_role,
             "receiver_name": receiver_name,
         }
+    # One id per call, minted by the sender (C15 first half). The host delivers a given
+    # message_id at most once, so a transport-level repeat - or a retry of a call whose reply was
+    # lost - cannot deliver the same message twice. Absent on an older host: it generates one
+    # itself, which behaves exactly like before.
+    payload["message_id"] = uuid4().hex
     receipt = await host_request("agent_message.send", payload)
     receipts = receipt.get("receipts") if isinstance(receipt, dict) else None
     if isinstance(receipts, list):
@@ -70,11 +76,13 @@ def _emit_sent_message(receipt: dict[str, Any], receiver_role: str | None = None
     try:
         from rlm import emit
 
-        label = (
-            "Agent message queued"
-            if receipt.get("deliveryStatus") == "queued"
-            else "Agent message sent"
-        )
+        if receipt.get("duplicateSuppressed"):
+            # The host already handled this message_id: nothing was delivered a second time.
+            label = "Agent message duplicate suppressed (already delivered once)"
+        elif receipt.get("deliveryStatus") == "queued":
+            label = "Agent message queued"
+        else:
+            label = "Agent message sent"
         display_receipt = dict(receipt)
         if receiver_role in ("parent", "sibling", "child"):
             display_receipt["receiverRole"] = receiver_role

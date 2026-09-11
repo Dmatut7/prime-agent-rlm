@@ -238,7 +238,16 @@ describe("ENG-4649 subagent model selection", () => {
 			harness.setResponses([fauxAssistantMessage("first child answer")]);
 
 			const first = harness.session.runRlmChild("first task", { name: "shared-reviewer" });
+			// C15: while the first admission is still validating its model the name is *reserved*,
+			// and the copy is told apart from a name another agent holds - it points at the handle
+			// that is about to exist instead of at a new name, which is the difference between
+			// "look for your child" and "rename it" for a caller retrying a lost spawn.
 			await expect(harness.session.runRlmChild("second task", { name: "shared-reviewer" })).rejects.toThrow(
+				/an admission for this name is already in flight/,
+			);
+			// Once the first child is registered the same name is simply taken, and the copy says
+			// what to do about that instead.
+			await expect(harness.session.runRlmChild("third task", { name: "shared-reviewer" })).rejects.toThrow(
 				'Agent name "shared-reviewer" is unavailable: an agent of that name already exists at depth 1 under this parent',
 			);
 			await expect(first).resolves.toMatchObject({ name: "shared-reviewer" });

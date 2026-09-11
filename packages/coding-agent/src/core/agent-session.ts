@@ -61,6 +61,7 @@ import {
 	createAgentMessageHostHandlers,
 	DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
 	formatAgentMessageRetryExhaustedError,
+	formatAgentSessionNameReserved,
 	formatAgentSessionNameUnavailable,
 	formatSubagentTerminalErrorNotice,
 	isAgentSessionMessage,
@@ -11145,6 +11146,17 @@ export class AgentSession {
 						// Read live: an operator tuning the wait must not have to rebuild the runtime.
 						publicationWaitMs: this.settingsManager.getAgentMessageWaitSettings().publicationMs,
 						onWaitTimeout: (facts) => this._reportAgentMessageWaitTimeout(facts),
+						onDuplicateSuppressed: ({ messageId, record }) => {
+							// Countable: this is the line that says a retry was caught instead of
+							// delivered twice, which is the whole point of sender-minted ids (C15).
+							sessionLog.info("agent message duplicate suppressed", {
+								sessionId: this.sessionId,
+								messageId,
+								deliveryStatus: record.deliveryStatus,
+								...(record.target === undefined ? {} : { target: record.target }),
+								handledAt: record.at,
+							});
+						},
 					},
 				),
 			);
@@ -12492,6 +12504,10 @@ export class AgentSession {
 	private async _assertRlmSubagentSessionNameAvailable(name: string, ignorePendingReservation = false): Promise<void> {
 		const depth = this._rlmDepth + 1;
 		if (!ignorePendingReservation && this._pendingRlmSubagentSessionNames.has(name)) {
+			// Only reachable for a generated name (the explicit-name path checks the reservation
+			// first, in _startRlmChildRun, and passes ignorePendingReservation). The caller did not
+			// choose this name, so the "your own admission is in flight" copy would be a lie; the
+			// plain one is right, and a retry generates a different name anyway.
 			throw new Error(formatAgentSessionNameUnavailable(name, depth));
 		}
 		const localConflict =
@@ -12597,7 +12613,7 @@ export class AgentSession {
 		}
 		if (requestedSessionName) {
 			if (this._pendingRlmSubagentSessionNames.has(requestedSessionName)) {
-				throw new Error(formatAgentSessionNameUnavailable(requestedSessionName, this._rlmDepth + 1));
+				throw new Error(formatAgentSessionNameReserved(requestedSessionName, this._rlmDepth + 1));
 			}
 			this._pendingRlmSubagentSessionNames.add(requestedSessionName);
 		}

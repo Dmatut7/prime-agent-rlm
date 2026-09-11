@@ -177,6 +177,12 @@ export interface AgentSessionMessageSendInput {
 	target: string;
 	message: string;
 	receiverRole?: AgentFamilyRelationship;
+	/**
+	 * The sender kernel's own id for this call, when it sent one. Exactly-once is enforced at the
+	 * host boundary before delivery, so this is carried for correlation (receipts and logs), not
+	 * for deduplication.
+	 */
+	messageId?: string;
 }
 
 export interface AgentSessionMessageController {
@@ -218,8 +224,35 @@ export function sessionNameReservationKey(input: {
 	return JSON.stringify([input.depth, parentType, parentValue, input.name]);
 }
 
-export function formatAgentSessionNameUnavailable(name: string, depth: number): string {
+function agentSessionNameUnavailablePrefix(name: string, depth: number): string {
 	return `Agent name "${name}" is unavailable: an agent of that name already exists at depth ${depth} under this parent`;
+}
+
+/**
+ * The name is held by something other than this call: a registered child, a sibling under the
+ * same parent, or a reservation in another session. The two actions that resolve it are named,
+ * because "unavailable" on its own reads as a transient failure worth retrying.
+ */
+export function formatAgentSessionNameUnavailable(name: string, depth: number): string {
+	return (
+		`${agentSessionNameUnavailablePrefix(name, depth)}. ` +
+		"Call `await rlm.list_subagents()` to see the children already registered under this parent, " +
+		"or pass a different `name=`."
+	);
+}
+
+/**
+ * The name is reserved by an admission this same session already started - the shape a retry of
+ * your own `rlm()` call hits. Spawning again would create a second child for one task, so the copy
+ * points at the handle that is about to exist instead of at a new name.
+ */
+export function formatAgentSessionNameReserved(name: string, depth: number): string {
+	return (
+		`${agentSessionNameUnavailablePrefix(name, depth)} - an admission for this name is already in ` +
+		"flight from this session. If this is a retry of your own spawn, the child is being created " +
+		"right now: call `await rlm.list_subagents()` and use the handle it returns instead of " +
+		"spawning a second one."
+	);
 }
 
 export function assertAgentSessionNameAvailable(
@@ -694,6 +727,96 @@ export interface AgentMessageHostHandlerOptions {
 	publicationWaitMs?: number;
 	/** Every timed-out wait, for the countable `agent message target wait timed out` signature. */
 	onWaitTimeout?: (facts: WaitTimeoutFacts) => void;
+	/**
+	 * Exactly-once gate for sender-minted message ids; a fresh one is created per handler set, so
+	 * the gate lives exactly as long as the session runtime that registered it.
+	 */
+	handledMessageIds?: HandledAgentMessageIds;
+	/** Every suppressed duplicate, for the countable `agent message duplicate suppressed` line. */
+	onDuplicateSuppressed?: (info: { messageId: string; record: HandledAgentMessageRecord }) => void;
+}
+
+/** How many delivered message ids one session remembers for exactly-once delivery (C15). */
+export const HANDLED_AGENT_MESSAGE_ID_LIMIT = 1024;
+
+/** What one handled id is worth remembering: enough to answer a duplicate, never the payload. */
+export interface HandledAgentMessageRecord {
+	deliveryStatus: AgentSessionMessageDeliveryStatus;
+	/** Active session id the message went to, when the send resolved one. */
+	target?: string;
+	/** Epoch ms of the delivery. */
+	at: number;
+}
+
+/**
+ * Receiver-side exactly-once for agent messages (C15, first half).
+ *
+ * The sender's kernel mints one `message_id` per `send()` call, so an id that arrives twice is a
+ * repeat of one call: a transport-level duplicate, or a retry of a call whose reply was lost -
+ * which is exactly what a kernel death or a bounded wait produces. Delivering it a second time is
+ * the failure that makes a model's retry dangerous.
+ *
+ * This is the half of idempotence that needs no content key. Two *different* calls carrying the
+ * same text still mint two ids and both are delivered, so the legitimate "say the same thing to
+ * two agents" (or twice, deliberately) is not taken away; only a repeat of one call is suppressed.
+ *
+ * Records stay compact (status, target, timestamp) so 1024 of them cost nothing, and eviction
+ * degrades to today's behaviour - a duplicate might slip through - rather than to a wrong answer.
+ * In memory only: a restarted host has no ids to repeat, because the kernel that minted them is
+ * gone with it.
+ */
+export class HandledAgentMessageIds {
+	private readonly records = new Map<string, HandledAgentMessageRecord>();
+
+	constructor(private readonly limit: number = HANDLED_AGENT_MESSAGE_ID_LIMIT) {}
+
+	/** The record for an id already handled, or undefined. A hit refreshes the id's recency. */
+	find(id: string): HandledAgentMessageRecord | undefined {
+		const record = this.records.get(id);
+		if (!record) return undefined;
+		this.records.delete(id);
+		this.records.set(id, record);
+		return record;
+	}
+
+	/** Remember one delivered id, evicting the least recently handled beyond the limit. */
+	record(id: string, entry: HandledAgentMessageRecord): void {
+		this.records.delete(id);
+		this.records.set(id, entry);
+		const limit = Math.max(1, this.limit);
+		while (this.records.size > limit) {
+			const oldest = this.records.keys().next().value;
+			if (oldest === undefined) break;
+			this.records.delete(oldest);
+		}
+	}
+
+	get size(): number {
+		return this.records.size;
+	}
+}
+
+/**
+ * The reply for a `message_id` this session already handled. Shaped like a receipt so the sending
+ * skill renders it without a special case, but it says plainly that nothing was delivered again:
+ * a model that retried because it never saw a receipt needs to know the first send worked.
+ */
+export function formatDuplicateAgentMessageReply(input: {
+	messageId: string;
+	record: HandledAgentMessageRecord;
+}): Record<string, unknown> {
+	const { record } = input;
+	return {
+		id: input.messageId,
+		duplicateSuppressed: true,
+		deliveryStatus: record.deliveryStatus,
+		...(record.target === undefined ? {} : { target: { activeSessionId: record.target, sessionId: record.target } }),
+		notice:
+			`This message_id was already handled at ${new Date(record.at).toISOString()} and was ${record.deliveryStatus} then, ` +
+			"so it was NOT delivered again. Nothing is lost and nothing is duplicated. If you retried because " +
+			"you never saw a receipt, the first send is the one that counted: check with the recipient (or read " +
+			"its transcript with agent_observe) instead of sending again.",
+	};
 }
 
 export function createAgentMessageHostHandlers(
@@ -701,6 +824,22 @@ export function createAgentMessageHostHandlers(
 	options: AgentMessageHostHandlerOptions = {},
 ): Record<string, HostRequestHandler> {
 	const publicationWaitMs = options.publicationWaitMs ?? DEFAULT_SHORT_TARGET_WAIT_MS;
+	const handled = options.handledMessageIds ?? new HandledAgentMessageIds();
+	/** Sender-minted id of this call, when the kernel is new enough to send one. */
+	const messageIdOf = (payload: Record<string, unknown>): string | undefined =>
+		typeof payload.message_id === "string" && payload.message_id.length > 0 ? payload.message_id : undefined;
+	const remember = (
+		messageId: string | undefined,
+		deliveryStatus: AgentSessionMessageDeliveryStatus,
+		target?: string,
+	): void => {
+		if (messageId === undefined) return;
+		handled.record(messageId, {
+			deliveryStatus,
+			...(target === undefined ? {} : { target }),
+			at: Date.now(),
+		});
+	};
 	return {
 		// Read-only, so it is on the cancellable list: a cell abort releases the wait instead of
 		// leaving it parked until the kernel host tears down (P1-2a).
@@ -712,6 +851,16 @@ export function createAgentMessageHostHandlers(
 		"agent_message.send": async (payload, signal) => {
 			if (typeof payload.message !== "string") {
 				throw new Error("agent_message.send message must be a string");
+			}
+			// Checked before anything else: a repeat of one call must not resolve a roster, wait on
+			// a publication, or deliver a second copy (C15).
+			const messageId = messageIdOf(payload);
+			if (messageId !== undefined) {
+				const duplicate = handled.find(messageId);
+				if (duplicate) {
+					options.onDuplicateSuppressed?.({ messageId, record: duplicate });
+					return formatDuplicateAgentMessageReply({ messageId, record: duplicate });
+				}
 			}
 			let target: string;
 			if (typeof payload.target === "string") {
@@ -741,6 +890,14 @@ export function createAgentMessageHostHandlers(
 								target: roster.entries[index]!.id,
 								error: result.reason instanceof Error ? result.reason.message : String(result.reason),
 							},
+				);
+				// One id per call, so a broadcast is remembered as one delivery: its aggregate
+				// status is what a duplicate reply should claim.
+				remember(
+					messageId,
+					results.every((result) => result.status === "fulfilled" && result.value.deliveryStatus === "delivered")
+						? "delivered"
+						: "queued",
 				);
 				return { receipts } as unknown as Record<string, unknown>;
 			} else {
@@ -791,11 +948,14 @@ export function createAgentMessageHostHandlers(
 				}
 				target = matches[0]!.id;
 			}
-			return (await controller.sendAgentMessage({
+			const receipt = await controller.sendAgentMessage({
 				target,
 				message: payload.message,
 				receiverRole: payload.receiver_role as AgentFamilyRelationship,
-			})) as unknown as Record<string, unknown>;
+				...(messageId === undefined ? {} : { messageId }),
+			});
+			remember(messageId, receipt.deliveryStatus, receipt.target?.activeSessionId);
+			return receipt as unknown as Record<string, unknown>;
 		},
 	};
 }
