@@ -1,0 +1,1 @@
+- Reconciled durable worker error records: a failed worker's first-line failure reason now survives restarts for forensics, while key-shaped secrets are still never persisted.

@@ -3506,10 +3506,17 @@ describe("daemon worker supervisor monitoring", () => {
 			runtimeWorker.descriptor.lastError = "secret-runtime-diagnostic";
 			supervisor.persistWorker(runtimeWorker);
 			expect(runtimeWorker.descriptor.lastError).toBe("secret-runtime-diagnostic");
+			// Policy (T4 19f6f96f5 + scrub reconciliation): a plain first-line diagnostic persists
+			// so a reaped worker keeps its real failure reason; only key-shaped secrets are withheld.
 			expect(JSON.parse(readFileSync(descriptorPath, "utf8"))).toMatchObject({
-				lastError: "Waiting for a client with fresh runtime context",
+				lastError: "secret-runtime-diagnostic",
 			});
-			expect(readFileSync(descriptorPath, "utf8")).not.toContain("secret-runtime-diagnostic");
+			// A key-shaped secret on the first line must not reach disk.
+			runtimeWorker.descriptor.lastError = "401 unauthorized: Bearer sk-abc123def456ghi789";
+			supervisor.persistWorker(runtimeWorker);
+			const rewritten = readFileSync(descriptorPath, "utf8");
+			expect(JSON.parse(rewritten).lastError).toBe("Waiting for a client with fresh runtime context");
+			expect(rewritten).not.toContain("sk-abc123def456ghi789");
 		} finally {
 			rmSync(descriptorDir, { recursive: true, force: true });
 		}

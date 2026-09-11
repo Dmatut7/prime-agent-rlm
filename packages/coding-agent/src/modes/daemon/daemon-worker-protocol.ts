@@ -1,6 +1,7 @@
 import { closeSync, readFileSync } from "node:fs";
 import type { AgentSessionMessageDeliveryMode, AgentSessionMessageSender } from "../../core/agent-messages.js";
 import type { IdleEvictionMinutes } from "../../core/session-action-store.js";
+import { findShareSecretHits } from "../../core/share-session.js";
 
 export { SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../../core/session-lease.js";
 
@@ -191,6 +192,10 @@ export function durableWorkerLastError(descriptor: Pick<DaemonWorkerDescriptor, 
 	const raw = typeof descriptor.lastError === "string" ? descriptor.lastError : "";
 	const firstLine = raw.split("\n")[0]?.trim() ?? "";
 	if (firstLine.length === 0) {
+		return FALLBACK_FAILED_WORKER_LAST_ERROR;
+	}
+	// Provider errors often echo credentials on the first line; never persist those.
+	if (findShareSecretHits(firstLine).length > 0) {
 		return FALLBACK_FAILED_WORKER_LAST_ERROR;
 	}
 	return firstLine.length > DURABLE_LAST_ERROR_MAX_CHARS
