@@ -559,6 +559,15 @@ export interface AgentConnectionRlmChildStallState {
 	thresholdMs: number;
 	inFlightTools: string[];
 	unsettled?: boolean;
+	/**
+	 * True while an unspent exemption (a host-owned phase or a kernel/host liveness vouch) is
+	 * excusing the silence: healthy long work, not a wedge. Additive and optional, so a client that
+	 * predates it renders the facts it knows; one without the `rlm_child_stall_activity` capability
+	 * never sees this field at all, because the whole segment is dropped for it.
+	 */
+	excused?: boolean;
+	/** Exemption sub-reasons behind `excused` (e.g. `live_bash_handles`). */
+	excusedReasons?: string[];
 }
 
 export interface AgentConnectionRlmChildAgentSnapshot {

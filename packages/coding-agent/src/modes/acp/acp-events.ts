@@ -252,6 +252,8 @@ export function acpUpdatesForSessionEvent(
 											thresholdMs: event.child.stall.thresholdMs,
 											inFlightTools: event.child.stall.inFlightTools,
 											unsettled: event.child.stall.unsettled,
+											excused: event.child.stall.excused,
+											excusedReasons: event.child.stall.excusedReasons,
 										}
 									: undefined,
 							},

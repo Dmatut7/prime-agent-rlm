@@ -33,6 +33,9 @@ export function classifySubagentSnapshotStatus(child: AgentConnectionRlmChildAge
 
 /** Whether a snapshot row carries a live stall marker (watchdog fired, not yet recovered). */
 export function isStalledSubagentSnapshot(child: AgentConnectionRlmChildAgentSnapshot): boolean {
+	// B9: an excused stall is a long task the kernel or a host phase is vouching for, so it is not
+	// a stalled child. The row keeps its real activity label and is still counted as busy.
+	if (child.stall?.excused === true && child.activity?.kind !== "stalled") return false;
 	return child.activity?.kind === "stalled" || child.stall !== undefined;
 }
 
@@ -40,6 +43,9 @@ export function isStalledSubagentSnapshot(child: AgentConnectionRlmChildAgentSna
 export function formatSubagentStallMarker(child: AgentConnectionRlmChildAgentSnapshot): string | undefined {
 	const stall = child.stall;
 	if (!stall && child.activity?.kind !== "stalled") return undefined;
+	// The marker renders as a red warning line, which is the wrong thing to shout about a healthy
+	// long command; the agents-view row still states the neutral fact ("long-running 12m").
+	if (stall?.excused === true && child.activity?.kind !== "stalled") return undefined;
 	const silentSeconds = Math.max(1, Math.round((stall?.silentMs ?? 0) / 1000));
 	const tools = stall?.inFlightTools ?? [];
 	const toolText = tools.length > 0 ? `, in-flight: ${tools.join(", ")}` : "";

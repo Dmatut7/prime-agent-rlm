@@ -21,7 +21,16 @@ export interface PrimeAgentSubagentMeta {
 	tokenCount?: number;
 	error?: string;
 	/** Present when the subagent's stall watchdog fired; `unsettled` means the abort did not stop it. */
-	stall?: { silentMs: number; thresholdMs: number; inFlightTools: string[]; unsettled?: boolean };
+	stall?: {
+		silentMs: number;
+		thresholdMs: number;
+		inFlightTools: string[];
+		unsettled?: boolean;
+		/** True when an unspent exemption is excusing the silence (healthy long work, not a wedge). */
+		excused?: boolean;
+		/** Exemption sub-reasons behind `excused`. */
+		excusedReasons?: string[];
+	};
 }
 
 export interface PrimeAgentAutonomousMeta {

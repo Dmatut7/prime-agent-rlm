@@ -1086,7 +1086,11 @@ function getSessionStatusLabel(summary: SessionSummary, heartbeat?: UnifiedSessi
 		const silentMs = summary.stall.silentMs;
 		const silent =
 			silentMs >= 60_000 ? `${Math.round(silentMs / 60_000)}m` : `${Math.max(1, Math.round(silentMs / 1000))}s`;
-		return summary.stall.unsettled ? `stalled ${silent}, abort did not settle` : `stalled ${silent}`;
+		if (summary.stall.unsettled) return `stalled ${silent}, abort did not settle`;
+		// B9: silence an unspent exemption is excusing is long work, not a wedge. Neutral wording on
+		// purpose - the row must not read as an alarm, and it must not hide the duration either.
+		if (summary.stall.excused === true) return `long-running ${silent}`;
+		return `stalled ${silent}`;
 	}
 	if (summary.isCompacting) {
 		return "compacting";
