@@ -3185,10 +3185,12 @@ describe("AgentSession rlm recursion", () => {
 			publication: { reject: vi.fn() },
 			emitUpdate: vi.fn(),
 		};
+		// test-hygiene-allow: fixture injection: plants a fake deep run so cancelRlmChildRun's subtree walk has a target the public spawn path cannot hold open deterministically
 		(deepHost as unknown as { _activeRlmChildRuns: Map<string, typeof deepRun> })._activeRlmChildRuns.set(
 			"deep-1",
 			deepRun,
 		);
+		// test-hygiene-allow: fixture injection: retains a fake child session under a settled run, creating the dual-map membership the walk must not visit twice
 		(run?.session as unknown as { _rlmChildSessions: Map<string, { session: AgentSession }> })._rlmChildSessions.set(
 			"deep-host",
 			{ session: deepHost },
@@ -3218,6 +3220,7 @@ describe("AgentSession rlm recursion", () => {
 		const root = createSession({ rlmSessionDir: join(tempDir, "collide-root") });
 		const finished = createSession({ rlmSessionDir: join(tempDir, "collide-finished") });
 		const otherParent = createSession({ rlmSessionDir: join(tempDir, "collide-other") });
+		// test-hygiene-allow: fixture injection: two siblings share the child id sub-dup; only direct map access can build the collision the id walk must survive
 		const rootMaps = root as unknown as { _rlmChildSessions: Map<string, { session: AgentSession }> };
 		// Child ids are only mkdir-unique among siblings: "sub-dup" exists twice.
 		rootMaps._rlmChildSessions.set("sub-dup", { session: finished });
@@ -3231,6 +3234,7 @@ describe("AgentSession rlm recursion", () => {
 			publication: { reject: vi.fn() },
 			emitUpdate: vi.fn(),
 		};
+		// test-hygiene-allow: fixture injection: the colliding live run sits under a different parent session than the finished retained match
 		(otherParent as unknown as { _activeRlmChildRuns: Map<string, typeof collidingRun> })._activeRlmChildRuns.set(
 			"sub-dup",
 			collidingRun,
@@ -3249,6 +3253,7 @@ describe("AgentSession rlm recursion", () => {
 		let cancelPrimitiveCalls = 0;
 		let runMapIterations = 0;
 		for (const [level, session] of sessions.entries()) {
+			// test-hygiene-allow: instrumented fixture: counts map iterations to prove a deep dual-membership chain is walked once per session (#2027 visited-set nail); no public seam exposes visit counts
 			const target = session as unknown as {
 				_activeRlmChildRuns: Map<string, unknown>;
 				_rlmChildSessions: Map<string, { session: AgentSession }>;
@@ -3266,6 +3271,7 @@ describe("AgentSession rlm recursion", () => {
 			};
 			if (level === 0) continue;
 			// A finished intermediate lives in BOTH parent maps until passivation.
+			// test-hygiene-allow: instrumented fixture: same visit-count nail for the parent side of the dual membership
 			const parent = sessions[level - 1] as unknown as {
 				_activeRlmChildRuns: Map<string, unknown>;
 				_rlmChildSessions: Map<string, { session: AgentSession }>;
@@ -3290,6 +3296,7 @@ describe("AgentSession rlm recursion", () => {
 			publication: { reject: vi.fn() },
 			emitUpdate: vi.fn(),
 		};
+		// test-hygiene-allow: fixture injection: plants the leaf run at the bottom of the dual-membership chain
 		(sessions[levels] as unknown as { _activeRlmChildRuns: Map<string, typeof leafRun> })._activeRlmChildRuns.set(
 			"leaf-run",
 			leafRun,
@@ -3384,6 +3391,7 @@ describe("AgentSession rlm recursion", () => {
 		await root.runRlmChild("quick shard");
 		const runs = (root as unknown as InspectableRlmSession)._activeRlmChildRuns;
 		await waitFor(() => runs.size === 0);
+		// test-hygiene-allow: white-box assertion: the proposition is which internal map retains a settled child after cancellation; public snapshots cannot tell the two maps apart
 		const retained = (root as unknown as { _rlmChildSessions: Map<string, { session: AgentSession }> })
 			._rlmChildSessions;
 		expect(retained.size).toBe(1);
@@ -3397,6 +3405,7 @@ describe("AgentSession rlm recursion", () => {
 			publication: { reject: vi.fn() },
 			emitUpdate: vi.fn(),
 		};
+		// test-hygiene-allow: fixture injection: plants a grandchild run under the retained child session
 		(childSession as unknown as { _activeRlmChildRuns: Map<string, typeof grandchild> })._activeRlmChildRuns.set(
 			"grandchild-1",
 			grandchild,
@@ -4252,6 +4261,7 @@ describe("AgentSession rlm recursion", () => {
 
 		await root.runRlmChild("slow shard");
 		await waitFor(() => childStarted);
+		// test-hygiene-allow: white-box read: the nail needs the live run object (run.session/run.abort identity) to prove nested cancellation reaches the grandchild; snapshots expose status only
 		const rootRuns = (root as unknown as InspectableRlmSession)._activeRlmChildRuns;
 		const rootRun = [...rootRuns.values()][0];
 		if (!rootRun?.session) {
@@ -4261,6 +4271,7 @@ describe("AgentSession rlm recursion", () => {
 		const childSession = rootRun.session;
 		const nestedSpawned = await childSession.runRlmChild("nested shard");
 		await waitFor(() => nestedStarted);
+		// test-hygiene-allow: white-box read: same live-run identity requirement for the nested child session
 		const nestedRuns = (childSession as unknown as InspectableRlmSession)._activeRlmChildRuns;
 		expect(nestedRuns.size).toBe(1);
 		const nestedId = [...nestedRuns.keys()][0];

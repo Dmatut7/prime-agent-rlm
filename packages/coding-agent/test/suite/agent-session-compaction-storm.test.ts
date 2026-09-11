@@ -216,6 +216,7 @@ describe("threshold compaction storm guards (scan2 C1/C2/C4)", () => {
 			models: [{ id: "faux-1", contextWindow: 200_000 }],
 		});
 		harnesses.push(harness);
+		// test-hygiene-allow: white-box fixture: drives the threshold-cooldown internals directly; the storm shape cannot be produced through public compaction entry points
 		const internals = harness.session as unknown as SessionWithCompactionInternals;
 
 		harness.setResponses([fauxAssistantMessage("seed reply")]);

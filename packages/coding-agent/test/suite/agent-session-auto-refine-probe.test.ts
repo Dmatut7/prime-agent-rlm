@@ -20,6 +20,7 @@ type SessionWithRefineProbe = {
  * runner environment; under a clean environment it is a no-op.
  */
 function rootSession(harness: Harness): SessionWithRefineProbe {
+	// test-hygiene-allow: white-box fixture: pins _rlmDepth to 0 so the nail is independent of the runner's RLM_DEPTH (see file header); no public setter exists
 	const internals = harness.session as unknown as SessionWithRefineProbe;
 	internals._rlmDepth = 0;
 	return internals;
@@ -48,6 +49,7 @@ describe("_autoRefineAllowedForSession probe cost", () => {
 		const internals = rootSession(harness);
 		expect(internals._localHarnessStateDir()).toBeTypeOf("string");
 
+		// test-hygiene-allow: call-count nail: the proposition is how many times the private resolver runs per probe (cost), which no public surface exposes
 		const spy = vi.spyOn(internals, "_localHarnessStateDir");
 		const first = internals._autoRefineAllowedForSession();
 		const second = internals._autoRefineAllowedForSession();
@@ -111,6 +113,7 @@ describe("_autoRefineAllowedForSession probe cost", () => {
 		await internals._invalidatePendingAutoRefineForBranchChange();
 		expect(internals._autoRefineWritableProbe).toBeUndefined();
 
+		// test-hygiene-allow: call-count nail: proves invalidation re-probes exactly once; counting is the proposition, not a mock of behaviour
 		const spy = vi.spyOn(internals, "_localHarnessStateDir");
 		internals._autoRefineAllowedForSession();
 		expect(spy).toHaveBeenCalledTimes(1);

@@ -56,6 +56,7 @@ describe("extension UI dialogs pause the stall watchdog", () => {
 	it.each([...BLOCKING_DIALOGS])("counts %s while it is open and releases it when it settles", async (name) => {
 		const harness = await createHarness({ settings: { stallWatchdog: { enabled: true } } });
 		harnesses.push(harness);
+		// test-hygiene-allow: white-box wiring nail: _withDialogTracking is the only place the dialog counter is installed and a headless harness has no public entry that opens an extension dialog
 		const internals = harness.session as unknown as SessionWithDialogInternals;
 
 		let release!: (value: unknown) => void;
@@ -78,6 +79,7 @@ describe("extension UI dialogs pause the stall watchdog", () => {
 	it("releases the count when a dialog rejects", async () => {
 		const harness = await createHarness({ settings: { stallWatchdog: { enabled: true } } });
 		harnesses.push(harness);
+		// test-hygiene-allow: white-box wiring nail: the rejection path must release the same counter the wrapper installed
 		const internals = harness.session as unknown as SessionWithDialogInternals;
 		const uiContext = stubUiContext();
 		uiContext.confirm = () => Promise.reject(new Error("dialog blew up"));
@@ -94,6 +96,7 @@ describe("extension UI dialogs pause the stall watchdog", () => {
 	it("pauses the armed stall watchdog while a bound dialog is open, and warns once it settles", async () => {
 		const harness = await createHarness({ settings: { stallWatchdog: { enabled: true } } });
 		harnesses.push(harness);
+		// test-hygiene-allow: white-box wiring nail: asserts the armed watchdog and the dialog counter belong to the same session, which no public surface exposes
 		const internals = harness.session as unknown as {
 			settingsManager: { getStallWatchdogSettings(): unknown };
 			_stallWatchdog: { arm(): void; state: string } | undefined;
@@ -150,6 +153,7 @@ describe("extension UI dialogs pause the stall watchdog", () => {
 	it("leaves the non-blocking notify alone", async () => {
 		const harness = await createHarness({ settings: { stallWatchdog: { enabled: true } } });
 		harnesses.push(harness);
+		// test-hygiene-allow: white-box wiring nail: notify must stay untracked, which is only observable on the wrapper itself
 		const internals = harness.session as unknown as SessionWithDialogInternals;
 		const notify = vi.fn();
 		const tracked = internals._withDialogTracking({ ...stubUiContext(), notify });

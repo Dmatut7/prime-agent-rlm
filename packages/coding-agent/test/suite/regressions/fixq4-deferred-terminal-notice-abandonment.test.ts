@@ -77,6 +77,7 @@ describe("FIX-Q4 stale deferred terminal notices stop pinning the session", () =
 		// Backdate past the threshold. Reading activity is a poll path (session list,
 		// roster, subagent snapshots), so it must not discard a child's report or
 		// admit a turn action just because somebody asked whether the session is busy.
+		// test-hygiene-allow: backdating nail: the abandonment threshold must be crossed without waiting five minutes; the public getter deferredRlmTerminalNoticeSince is read-only
 		const internals = harness.session as unknown as { _rlmTerminalNoticeDeferredSince: number | undefined };
 		internals._rlmTerminalNoticeDeferredSince = Date.now() - STALE_MS;
 
@@ -130,6 +131,7 @@ describe("FIX-Q4 stale deferred terminal notices stop pinning the session", () =
 	] as const)("%s stamps the deferral for a terminal notice (%s route)", async (member, _route) => {
 		const harness = await createHarness();
 		harnesses.push(harness);
+		// test-hygiene-allow: mutator-core nail: the proposition is that every next-turn insertion routes through the stamping mutators; driving them directly is what makes the source scan in this file fail-able
 		const internals = harness.session as unknown as SessionWithNextTurnInternals;
 
 		expect(harness.session.deferredRlmTerminalNoticeSince).toBeUndefined();
@@ -142,6 +144,7 @@ describe("FIX-Q4 stale deferred terminal notices stop pinning the session", () =
 	it("does not stamp the deferral for a message that is not a terminal notice", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
+		// test-hygiene-allow: mutator-core nail: a non-notice message must not stamp the deferral, observable only through the mutator entry point
 		const internals = harness.session as unknown as SessionWithNextTurnInternals;
 
 		internals._enqueuePendingNextTurnMessages(
@@ -227,6 +230,7 @@ describe("FIX-Q4 stale deferred terminal notices stop pinning the session", () =
 	it("re-stamps the deferral when a drained terminal notice is put back through the unshift path", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
+		// test-hygiene-allow: mutator-core nail: re-stamping through the unshift route (take drains, unshift restores) is the temporal chain this file pins
 		const internals = harness.session as unknown as SessionWithNextTurnInternals;
 
 		// Suspend the pump first, like the sibling nails: with it running, the flush inside
