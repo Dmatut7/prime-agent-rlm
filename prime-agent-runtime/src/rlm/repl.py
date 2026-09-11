@@ -36,6 +36,7 @@ from .bash import (
     _kill_live_handles,
     _reset_current_cell,
     _set_current_cell,
+    live_handle_facts,
 )
 
 # Highest protocol version this runtime can speak. What a process actually speaks is
@@ -122,9 +123,40 @@ _sigint_target: str | None = None
 _finishing_rid: str | None = None
 _handoff_interrupted = False
 
+# Liveness heartbeat (protocol 4). A thread ships one out-of-band frame per interval
+# while a request is in flight, carrying the event-loop tick and monotonic progress
+# counters, so the host can tell "the kernel is wedged" from "the kernel is waiting on
+# work it does not own". The tick only advances while the loop runs, so a synchronous
+# cell freezes it: the frames keep arriving and their frozen tick IS the evidence.
+HEARTBEAT_EVENT = "heartbeat"
+# Single gate for every heartbeat frame (the host treats an unnegotiated kind as
+# protocol corruption and repairs, i.e. kills, the kernel).
+HEARTBEAT_MIN_PROTOCOL = 4
+HEARTBEAT_INTERVAL_ENV_VAR = "KERNEL_HEARTBEAT_INTERVAL_MS"
+DEFAULT_HEARTBEAT_INTERVAL_MS = 5000
+MIN_HEARTBEAT_INTERVAL_MS = 100
+MAX_HEARTBEAT_INTERVAL_MS = 600_000
+# Loop-liveness tick period: well under the heartbeat interval, so one frame's tick
+# delta says something about the whole interval that preceded it.
+LOOP_TICK_INTERVAL_S = 0.5
+
+_loop_tick = 0
+_stream_bytes = 0
+_cells_done = 0
+# Resolved once in main(); read by the heartbeat thread without touching the env again.
+_heartbeat_interval_ms = DEFAULT_HEARTBEAT_INTERVAL_MS
+
 
 def _send(event: dict[str, Any]) -> None:
     """Write one protocol frame; the locked single write keeps frames atomic."""
+    global _stream_bytes
+    kind = event.get("event")
+    if kind == "stdout" or kind == "stderr":
+        # Monotonic heartbeat counter: streamed bytes are the one fact that proves a
+        # command is still producing output rather than merely holding a handle open.
+        text = event.get("text")
+        if isinstance(text, str):
+            _stream_bytes += len(text)
     data = (json.dumps(event, separators=(",", ":")) + "\n").encode()
     with _write_lock:
         view = memoryview(data)
@@ -471,7 +503,11 @@ def _consume_handoff_interrupt() -> bool:
 
 def _finish_locked(rid: str) -> None:
     """Drop a finished request; a parked untargeted interrupt survives while others are inflight."""
-    global _finishing_rid, _handoff_interrupted, _sigint_target
+    global _cells_done, _finishing_rid, _handoff_interrupted, _sigint_target
+    if rid in _inflight:
+        # Monotonic heartbeat counter; counted once per request, here, because this is
+        # the single place a request leaves the inflight set.
+        _cells_done += 1
     if _finishing_rid == rid:
         # An unconsumed handoff interrupt dies with its request (state requests
         # have no cancellable post-run work); it must never hit the next request.
@@ -1175,6 +1211,9 @@ async def _handle_request(
 
 
 async def _serve(queue: asyncio.Queue[dict[str, Any]], ns: dict[str, Any]) -> None:
+    # Loop-liveness tick, armed on the loop thread so it stops when the loop does: a
+    # synchronous cell freezes it, and the frozen value rides out in every heartbeat.
+    _start_loop_tick()
     while True:
         req = await queue.get()
         # A cell (or a snapshot-restored prior handler) may have rebound SIGINT; the
@@ -1349,6 +1388,139 @@ def _start_owner_watchdog() -> None:
     ).start()
 
 
+def heartbeat_interval_ms() -> int:
+    """Clamped heartbeat period in ms; unset or unparsable falls back to the default.
+
+    Read from the kernel's own environment, so a host (or a test) can ask for a shorter
+    period; clamped both ways, because a typo must neither busy-loop the thread nor stop
+    it for so long that every turn looks stalled.
+    """
+    raw = os.environ.get(HEARTBEAT_INTERVAL_ENV_VAR)
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_HEARTBEAT_INTERVAL_MS
+    return max(MIN_HEARTBEAT_INTERVAL_MS, min(MAX_HEARTBEAT_INTERVAL_MS, value))
+
+
+def loop_tick() -> int:
+    """Event-loop liveness counter: it advances only while the loop is free to run callbacks."""
+    return _loop_tick
+
+
+def _bump_loop_tick() -> None:
+    """Self-renewing loop timer: `_loop_tick` advances only while the event loop runs."""
+    global _loop_tick
+    _loop_tick += 1
+    assert _loop is not None
+    _loop.call_later(LOOP_TICK_INTERVAL_S, _bump_loop_tick)
+
+
+def _start_loop_tick() -> None:
+    """Arm the tick timer on the loop thread (called from `_serve`, below protocol 4 not at all)."""
+    if negotiated_protocol() < HEARTBEAT_MIN_PROTOCOL:
+        return
+    assert _loop is not None
+    _loop.call_later(LOOP_TICK_INTERVAL_S, _bump_loop_tick)
+
+
+def _heartbeat_facts(rid: str | None) -> dict[str, Any]:
+    """Monotonic counters for one frame.
+
+    Counters, never rates: the host diffs two retained frames, so a frame it never saw
+    (throttled, dropped, rejected) cannot make the next one lie. All values are ints --
+    the frame is serialized with `allow_nan=False` and a non-finite float would drop it.
+    """
+    times = os.times()
+    return {
+        "tick": _loop_tick,
+        "cpu_ms": int((times.user + times.system) * 1000),
+        "stream_bytes": _stream_bytes,
+        "cells_done": _cells_done,
+        "host_requests": len(_pending_host),
+        "interval_ms": _heartbeat_interval_ms,
+        "bash": live_handle_facts(rid),
+    }
+
+
+def _heartbeat_frame() -> dict[str, Any] | None:
+    """One heartbeat frame, or None when this kernel must not send one.
+
+    Two gates, both fail-safe. The negotiated protocol, because a host that never asked
+    for protocol 4 reads the kind as corruption and kills the kernel (the env gate is a
+    single point). And "a request is in flight", because an idle kernel has nothing to
+    vouch for and a frame every 5s for the life of the session would be wire and log
+    noise that buys no fact.
+    """
+    if negotiated_protocol() < HEARTBEAT_MIN_PROTOCOL:
+        return None
+    rid = _active["rid"]
+    if rid is None:
+        # The finishing phase (post-run repr/drain) clears `_active` before the request
+        # leaves `_inflight`, and for a huge repr that phase is the slow one.
+        with _interrupt_lock:
+            inflight = bool(_inflight)
+        if not inflight:
+            return None
+    return {"event": HEARTBEAT_EVENT, "id": rid, **_heartbeat_facts(rid)}
+
+
+def _send_heartbeat(frame: dict[str, Any]) -> bool:
+    """Ship one frame; a value that cannot be serialized strictly drops the frame.
+
+    NaN is the only corruption vector `json.dumps` would otherwise paper over, and a torn
+    frame is fatal on the host side, so the frame dies here instead. The next interval
+    retries: losing one frame only makes the heartbeat look older, which is the direction
+    the host already fails towards.
+    """
+    try:
+        json.dumps(frame, allow_nan=False)
+        _send(frame)
+    except (TypeError, ValueError, OSError):
+        return False
+    return True
+
+
+def _heartbeat_once() -> bool:
+    """One heartbeat round: build the frame, ship it, report whether one went out.
+
+    Never raises. A fact source that throws (a broken handle registry, an unusable
+    `os.times`) costs one frame, not the heartbeat: the frames are what tells the host the
+    kernel process is still there at all.
+    """
+    try:
+        frame = _heartbeat_frame()
+        if frame is None:
+            return False
+        return _send_heartbeat(frame)
+    except BaseException:  # noqa: BLE001 - one broken round must not end the heartbeat
+        return False
+
+
+def _heartbeat_loop() -> None:
+    """Event-loop-independent heartbeat sender, the same shape as `_owner_watchdog`.
+
+    A synchronous cell monopolizes the event loop, so the frames have to come from a
+    thread: they keep arriving while the loop is blocked, and their frozen tick is
+    exactly the evidence the host needs to tell that apart from external work. A thread
+    that dies anyway leaves the host seeing the heartbeat grow old, which fails safe
+    towards killing the turn.
+    """
+    interval = _heartbeat_interval_ms / 1000.0
+    while True:
+        time.sleep(interval)
+        _heartbeat_once()
+
+
+def _start_heartbeat() -> None:
+    """Resolve the interval and start the sender thread; below protocol 4 no thread at all."""
+    global _heartbeat_interval_ms
+    _heartbeat_interval_ms = heartbeat_interval_ms()
+    if negotiated_protocol() < HEARTBEAT_MIN_PROTOCOL:
+        return
+    threading.Thread(target=_heartbeat_loop, daemon=True, name="rlm-heartbeat").start()
+
+
 _pump_out: _Pump
 _pump_err: _Pump
 
@@ -1381,6 +1553,7 @@ def main() -> None:
     _negotiated_protocol = resolve_protocol_version(os.environ.get(PROTOCOL_ENV_VAR))
     stdin_fd = _setup_fds()
     _start_owner_watchdog()
+    _start_heartbeat()
 
     # Alias the executing module so an in-cell `from rlm.repl import emit`
     # binds the live module, not a second copy.

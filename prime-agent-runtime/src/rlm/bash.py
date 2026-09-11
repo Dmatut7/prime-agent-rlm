@@ -957,3 +957,39 @@ def _install_shutdown_hook() -> None:
             return
         _hook_installed = True
     atexit.register(_kill_live_handles)
+
+
+# Heartbeat fact probes: FIONREAD per handle is cheap but not free, so a fleet larger
+# than this reports counts only and one frame stays O(1).
+_LIVENESS_PROBE_CAP = 8
+
+
+def live_handle_facts(cell_id: str | None) -> dict[str, int]:
+    """Read-only liveness snapshot of the bash() registries, for the kernel heartbeat.
+
+    Copies the registries under ``_live_lock`` and probes the pipes only after releasing
+    it: that lock guards the sets and must never be held across an ioctl. At most
+    ``_LIVENESS_PROBE_CAP`` handles are probed, so producing one frame stays O(1)~O(8)
+    whatever the fleet size. Every value is a plain int, because the caller serializes
+    the frame with ``allow_nan=False`` and a non-finite float would drop the frame.
+    """
+    with _live_lock:
+        # `_reaped` (not the `running` property, which marks the handle released as a
+        # side effect): a reaped handle is still in the set until its watcher discards it.
+        handles = [handle for handle in _live_handles if not handle._reaped]
+        cell_handles = len(_cell_handles.get(cell_id, ())) if cell_id is not None else 0
+    buffered_bytes = 0
+    pipe_pending = 0
+    for handle in handles[:_LIVENESS_PROBE_CAP]:
+        try:
+            buffered_bytes += handle._buffer.size()
+            if handle._pipe_pending():
+                pipe_pending += 1
+        except BaseException:  # noqa: BLE001 - a fact probe must never end the heartbeat
+            continue
+    return {
+        "handles": len(handles),
+        "cell_handles": cell_handles,
+        "buffered_bytes": buffered_bytes,
+        "pipe_pending": pipe_pending,
+    }

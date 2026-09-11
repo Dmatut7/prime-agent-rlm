@@ -32,6 +32,11 @@ corruption — it repairs, which means killing, the kernel:
 |---|---|---|
 | `preserve_names` | 4 | the snapshot request field `preserve_names` and the `preserved` field of its `done` frame |
 
+Version 4 also adds one frame kind rather than a request field: `heartbeat`
+(see [Liveness heartbeat](#liveness-heartbeat)), gated on the negotiated version
+alone because a host has to understand the kind before it can accept a frame of
+it.
+
 ## Channels
 
 - Requests arrive on fd 0 (stdin).
@@ -89,6 +94,10 @@ runtime keeps serving. Closing stdin is equivalent to `shutdown`.
 - `{"event":"host_request","id":str,"data":{...}}` — one typed request from
   runtime code to the host; the host answers with a `host_reply` request
   carrying the same id.
+- `{"event":"heartbeat","id":str|null,...}` — protocol 4 only, and only while a
+  request is in flight: one out-of-band liveness frame per interval. See
+  [Liveness heartbeat](#liveness-heartbeat). It is never attributed to a cell's
+  output and the host dispatches it before id attribution.
 - `{"event":"error","id":str|null,"ename":str,"evalue":str,"traceback":[str,...]}`
 - `{"event":"done","id":str,"status":"ok"|"error"}` — exactly one per id'd
   request, always after all of that request's other events. A snapshot `done`
@@ -104,6 +113,44 @@ with a marker byte sequence awaited in the pumps, so every byte the cell wrote
 synchronously — including direct fd writes — precedes its `done`. Ordering
 between a cell's Python-level writes and its raw fd writes is not guaranteed
 (two channels).
+
+## Liveness heartbeat
+
+A host cannot tell a wedged kernel from one that is waiting on work it does not
+own: both look like silence. Protocol 4 therefore adds one out-of-band frame per
+interval, sent from a thread that does not depend on the event loop (the same
+shape as the owner watchdog), while a request is in flight.
+
+```
+{"event":"heartbeat","id":str|null,"tick":int,"cpu_ms":int,"stream_bytes":int,
+ "cells_done":int,"host_requests":int,"interval_ms":int,
+ "bash":{"handles":int,"cell_handles":int,"buffered_bytes":int,"pipe_pending":int}}
+```
+
+- Gate: `negotiated_protocol() >= 4`. A host that never asked for protocol 4
+  reads the kind as corruption and kills the kernel, so a negotiated-3 session
+  sends none at all — no thread is even started.
+- Gate: a request is in flight (`_active["rid"]`, or a rid still in `_inflight`
+  during the post-run finishing phase). An idle kernel sends nothing.
+- Period: `KERNEL_HEARTBEAT_INTERVAL_MS`, default `5000`, clamped to
+  `[100, 600000]`. The resolved value rides in every frame as `interval_ms` so
+  the host can judge staleness against the kernel's own period rather than a
+  guess.
+- `tick` counts a self-renewing `loop.call_later` timer, so it advances only
+  while the event loop is free to run callbacks. A synchronous cell
+  (`time.sleep`) freezes it while frames keep arriving — that contrast is the
+  point of the frame.
+- Every other field is a monotonic counter (`os.times` cpu, streamed stdout/
+  stderr bytes, finished requests, pending `host_request` futures) or an O(1)
+  snapshot of the bash registries (`rlm.bash.live_handle_facts`: live handles,
+  handles attributed to this cell, buffered bytes, handles with bytes pending on
+  the capture pipe). The host diffs two retained frames; counters, not rates, so
+  a frame it never saw cannot make the next one lie.
+- Serialization is strict (`json.dumps(..., allow_nan=False)`): a value that
+  cannot be serialized strictly drops that frame instead of tearing the stream,
+  and a fact source that raises costs one round, not the thread. Both fail
+  towards "the heartbeat looks older", which is the direction the host already
+  treats as evidence against the kernel.
 
 ## Execution
 
