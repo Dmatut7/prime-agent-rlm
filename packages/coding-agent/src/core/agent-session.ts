@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import {
@@ -47,6 +47,7 @@ import {
 	type AgentFamilyCatalogEntry,
 	type AgentFamilyRosterEntry,
 	type AgentFamilyRosterResult,
+	type AgentMessageQueuedReason,
 	type AgentSessionMessage,
 	type AgentSessionMessageAgentSummary,
 	type AgentSessionMessageController,
@@ -55,12 +56,15 @@ import {
 	assertAgentMessageQueueCapacity,
 	assertAgentSessionNameAvailable,
 	assertDirectAgentMessageTarget,
+	countsAsDeliveredParentReply,
 	createAgentMessageHostHandlers,
 	DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
+	formatAgentMessageRetryExhaustedError,
 	formatAgentSessionNameUnavailable,
 	formatSubagentTerminalErrorNotice,
 	isAgentSessionMessage,
 	isAgentSessionMessagePrompt,
+	isRetryableAgentMessageSendError,
 	normalizeAgentSessionMessage,
 	parseAgentSessionMessagePromptId,
 	startsAgentRun,
@@ -188,9 +192,10 @@ import {
 	isSessionSlashCommandMessage,
 	RLM_CHILD_FAILURE_CUSTOM_TYPE,
 	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
+	type RlmChildFailureDetails,
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
-import { throwIfPromptAdmissionCancelled } from "./prompt-admission.js";
+import { SessionInputSuspendedError, throwIfPromptAdmissionCancelled } from "./prompt-admission.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
 import {
 	type AutoRefineReason,
@@ -221,6 +226,13 @@ import {
 } from "./refinement/index.js";
 import { resolveConfigValue } from "./resolve-config-value.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
+import {
+	classifyRlmChildTerminalOutcomeSafely,
+	type RlmChildStallAbortFacts,
+	type RlmChildTerminalFacts,
+	type RlmChildTurnAbortReason,
+	readStallKernelReasons,
+} from "./rlm-child-terminal.js";
 import {
 	type CreateRlmSubagentRuntimeOptions,
 	createDefaultRlmSubagentSessionName,
@@ -301,8 +313,20 @@ export { type ParsedSkillBlock, parseSkillBlock } from "./skill-blocks.js";
 export type RlmChildAgentStatus = "queued" | "running" | "done" | "error" | "cancelled";
 
 export interface RlmChildAgentActivity {
-	kind: "waiting" | "writing" | "executing";
+	kind: "waiting" | "writing" | "executing" | "stalled";
 	toolName?: string;
+}
+
+/**
+ * Forensic stall facts for a child whose watchdog fired, mirrored on the daemon
+ * wire behind the `rlm_child_stall_activity` capability.
+ */
+export interface RlmChildStallState {
+	silentMs: number;
+	thresholdMs: number;
+	inFlightTools: string[];
+	/** True once the watchdog reported abort_unsettled: the abort did not stop the run. */
+	unsettled?: boolean;
 }
 
 export interface RlmChildAgentSnapshot {
@@ -322,6 +346,7 @@ export interface RlmChildAgentSnapshot {
 	activity?: RlmChildAgentActivity;
 	repliedSinceTask?: boolean;
 	error?: string;
+	stall?: RlmChildStallState;
 }
 
 export type CompactionReason = "manual" | "threshold" | "overflow" | "requested";
@@ -407,6 +432,19 @@ export type AgentSessionEvent =
 	 * write succeeds again; the lost entry is backfilled by the next rewrite.
 	 */
 	| { type: "session_persist_failed"; error: string }
+	/**
+	 * Deferred RLM child terminal notices could not be delivered. `abandoned` counts
+	 * the routine notices that were dropped (the session had to stay evictable);
+	 * `persistedToTranscript` counts the failure notices that were written into the
+	 * transcript instead of being dropped. Expected ~0 in production; non-zero is
+	 * now forensically visible instead of a silent filter.
+	 */
+	| {
+			type: "rlm_terminal_notice_abandoned";
+			abandoned: number;
+			persistedToTranscript: number;
+			deferredMs: number;
+	  }
 	| {
 			type: "stall_warning";
 			message: string;
@@ -416,6 +454,18 @@ export type AgentSessionEvent =
 	  }
 	| {
 			type: "stall_abort";
+			message: string;
+			silentMs: number;
+			thresholdMs: number;
+			diagnostics: StallDiagnostics;
+	  }
+	/**
+	 * The stall watchdog aborted the turn but it never settled (no `agent_end`).
+	 * Emitted instead of - not in addition to - `stall_warning`, so "killed but
+	 * still running" stays countable apart from "looks stuck".
+	 */
+	| {
+			type: "stall_unsettled";
 			message: string;
 			silentMs: number;
 			thresholdMs: number;
@@ -505,6 +555,25 @@ export interface AgentSessionConfig {
 	 * is 0 and no persisted thread_goal_state entry exists in the branch.
 	 */
 	initialGoal?: { objective: string; tokenBudget?: number };
+	/**
+	 * How long the stall watchdog waits after an auto-abort for the run to settle
+	 * before reporting `stall_unsettled`. Defaults to the watchdog's own 10s;
+	 * exposed so an operator (or a test) can shorten the "killed but never
+	 * stopped" detection window.
+	 */
+	stallAbortSettleGraceMs?: number;
+	/**
+	 * How long a deferred RLM child terminal notice may wait for delivery before it
+	 * is abandoned (default 5 minutes). Injectable so the abandonment path is
+	 * testable without waiting five minutes, and tunable per host.
+	 */
+	rlmTerminalNoticeAbandonAfterMs?: number;
+	/**
+	 * Window after an Esc/kill inside which one aggregated failure wake is allowed
+	 * (default 50 minutes). Distinct from the stall watchdog's exemption budget:
+	 * same order of magnitude, different clock and different meaning.
+	 */
+	failureWakeQuietWindowMs?: number;
 }
 
 export interface ExtensionBindings {
@@ -552,7 +621,7 @@ export interface PromptOptions {
 	streamingBehavior?: "steer" | "followUp";
 	followUpQueueKey?: string;
 	source?: InputSource;
-	preflightResult?: (success: boolean, queued?: boolean) => void;
+	preflightResult?: (success: boolean, queued?: boolean, queuedReason?: AgentMessageQueuedReason) => void;
 	queueIfBusy?: boolean;
 	resumeIfIdle?: boolean;
 	internalPrompt?: boolean;
@@ -665,13 +734,13 @@ interface PreparedPromptPreparation {
 class DeferredSessionInputError extends Error {}
 
 function oncePreflight(
-	preflightResult: ((success: boolean, queued?: boolean) => void) | undefined,
-): (success: boolean, queued?: boolean) => void {
+	preflightResult: ((success: boolean, queued?: boolean, queuedReason?: AgentMessageQueuedReason) => void) | undefined,
+): (success: boolean, queued?: boolean, queuedReason?: AgentMessageQueuedReason) => void {
 	let settled = false;
-	return (success, queued = false) => {
+	return (success, queued = false, queuedReason) => {
 		if (!settled) {
 			settled = true;
-			preflightResult?.(success, queued);
+			preflightResult?.(success, queued, queuedReason);
 		}
 	};
 }
@@ -945,6 +1014,15 @@ interface RlmChildRun {
 	toolUseCount: number;
 	activity?: RlmChildAgentActivity;
 	error?: string;
+	/**
+	 * Stall-watchdog kill facts recorded while this run was in flight. Set by the
+	 * parent's subscription when the child reports stall_abort/stall_unsettled and
+	 * consumed by the terminal classifier, which must rank a kill above "it
+	 * replied" instead of reporting the kill as a completed-without-reply.
+	 */
+	stallAbort?: RlmChildStallAbortFacts;
+	/** Display/forensic stall state for the roster row; cleared by the next agent_start. */
+	stall?: RlmChildStallState;
 	abort: () => void;
 	publication: AgentMessageDeferred;
 	/** Resolves after terminal result publication and detached-run cleanup finish. */
@@ -989,6 +1067,31 @@ const SESSION_PERSIST_FAILURE_REPORT_MAX_MS = 300_000;
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
 /** How long a deferred RLM terminal notice may wait for delivery before it is abandoned. */
 const RLM_TERMINAL_NOTICE_ABANDON_AFTER_MS = 5 * 60_000;
+/** Consecutive retryable agent-message send failures before the error becomes terminal (M6b). */
+const AGENT_MESSAGE_RETRYABLE_FAILURE_LIMIT = 3;
+/** How long failure-class terminal notices are collected before one aggregated wake. */
+const FAILURE_WAKE_AGGREGATION_MS = 2_000;
+/**
+ * After an Esc/kill, at most one aggregated failure wake inside this window; later
+ * failures are persisted instead of re-igniting the session (B3/N-3 total gate).
+ * Deliberately named apart from the stall watchdog's own 50min exemption budget:
+ * same length, different clock and different meaning.
+ */
+const FAILURE_WAKE_QUIET_WINDOW_MS = 50 * 60_000;
+/** Retry cadence for flushing deferred failure notices once the pump is runnable again. */
+const RLM_TERMINAL_NOTICE_FLUSH_RETRY_MS = 30_000;
+/** Bound on one aggregated wake's text so a failing family cannot flood the turn. */
+const FAILURE_WAKE_REASON_MAX_CHARS = 200;
+/** Sidecar file prefix holding notices/queued replies a dispose would otherwise drop (B10). */
+const UNDELIVERED_RLM_NOTICES_FILE = "undelivered-rlm-notices.jsonl";
+/** Bound on sidecar rows so a family failing in a loop cannot grow the file forever. */
+const UNDELIVERED_RLM_NOTICES_MAX_ROWS = 200;
+
+interface UndeliveredRlmNoticeRow {
+	key: string;
+	message: CustomMessage;
+	writtenAt: number;
+}
 /**
  * How long a writability probe stays valid. Writability rarely flips mid-session,
  * and refine() re-checks it before writing, so a stale "allowed" cannot turn into
@@ -996,6 +1099,27 @@ const RLM_TERMINAL_NOTICE_ABANDON_AFTER_MS = 5 * 60_000;
  * every turn boundary.
  */
 const AUTO_REFINE_WRITABLE_PROBE_TTL_MS = 60_000;
+
+/**
+ * Turn text for one aggregated failure wake: states the count and each cause, and
+ * points at the per-child notices that ride along as prefix messages.
+ */
+function aggregatedFailureWakeText(notices: readonly CustomMessage[]): string {
+	const entries = notices.map((notice) => {
+		const details = notice.details as RlmChildFailureDetails | undefined;
+		const name = details?.sessionName ?? "subagent";
+		const reason = (details?.error ?? (typeof notice.content === "string" ? notice.content : ""))
+			.replace(/\s+/g, " ")
+			.trim();
+		return `${name}: ${reason.slice(0, FAILURE_WAKE_REASON_MAX_CHARS)}`;
+	});
+	const noun = notices.length === 1 ? "subagent failed" : "subagents failed";
+	return (
+		`${notices.length} ${noun} while this session was stopped. ${entries.join(" | ")}. ` +
+		"Each failure notice is included below; nothing was lost. Read the causes before re-dispatching: " +
+		"re-sending the same task to the same wedged shape will fail the same way."
+	);
+}
 
 function noopRlmChildAbort(): void {}
 function noopRlmChildEventUnsubscribe(): void {}
@@ -1141,6 +1265,14 @@ export class AgentSession {
 	private readonly _durableRlmTerminalNoticeActionIds = new Set<string>();
 	private _rlmTerminalNoticeDeferredSince: number | undefined;
 	private _rlmTerminalNoticeAbandonment: { abandonedAt: number; count: number } | undefined;
+	/** When the pump was suspended by the current Esc/kill, if it is suspended. */
+	private _sessionInputSuspendedSince: number | undefined;
+	/** One aggregated failure wake per suspension window (B3 total gate). */
+	private _failureWakeUsedForSuspension = false;
+	/** Failure-class notices collected for the next aggregated wake. */
+	private readonly _pendingFailureWakeNotices: CustomMessage[] = [];
+	private _failureWakeTimer: ReturnType<typeof setTimeout> | undefined;
+	private _failureWakeFlushTimer: ReturnType<typeof setTimeout> | undefined;
 	private _rlmTerminalNoticeAbandonTimer: ReturnType<typeof setTimeout> | undefined;
 	private _sessionActionCommitTail: Promise<void> = Promise.resolve();
 	private _sessionActionCommitOwner: symbol | undefined;
@@ -1254,6 +1386,29 @@ export class AgentSession {
 	private _repliedToParentSinceTask: boolean | undefined;
 	private _parentReplyCount = 0;
 	/**
+	 * Stall-watchdog abort facts for the turn in flight, if the watchdog fired.
+	 * `settled` flips false when the watchdog reports abort_unsettled, so a run
+	 * that was never stopped is not reported as killed.
+	 */
+	private _lastStallAbort: RlmChildStallAbortFacts | undefined;
+	/**
+	 * Live stall marker for roster rows: set when the watchdog reports a stage,
+	 * cleared by the next agent_start. Published so a daemon can put a wedged
+	 * session's silence on its summary row even when the parent that spawned it
+	 * lives in another worker.
+	 */
+	private _stallState: RlmChildStallState | undefined;
+	/** Why the last abort of this session was requested; cleared by the next agent_start. */
+	private _lastTurnAbortReason: RlmChildTurnAbortReason | undefined;
+	/** The child already delivered its own terminal-error notice to the parent. */
+	private _terminalErrorNoticeDelivered = false;
+	/**
+	 * Consecutive retryable `agent_message.send` failures per target. Bounded on
+	 * purpose: a retryable error plus a host liveness vouch plus a persistent model
+	 * is a no-output loop, so after a few attempts the error becomes terminal.
+	 */
+	private readonly _agentMessageSendFailures = new Map<string, { count: number; lastError: string }>();
+	/**
 	 * Retry attempts consumed by the failure sequence that reached the last
 	 * terminal-error junction. Lets the parent-facing terminal notice say whether
 	 * retries were exhausted or never attempted, even though `_retryAttempt` is
@@ -1301,6 +1456,9 @@ export class AgentSession {
 	private readonly _autoRefineOperations = new Set<Promise<void>>();
 	private readonly _scheduledAutoRefineTimers = new Set<ReturnType<typeof setTimeout>>();
 	private _stallWatchdog: StallWatchdog | undefined;
+	private readonly _stallAbortSettleGraceMs: number | undefined;
+	private readonly _rlmTerminalNoticeAbandonAfterMs: number;
+	private readonly _failureWakeQuietWindowMs: number;
 	private _stallLastEvent: { type: string; at: number } | undefined;
 	private readonly _stallInFlightTools = new Map<string, { toolName: string; startedAt: number }>();
 	private _compactAutoRefinePending = false;
@@ -1371,6 +1529,10 @@ export class AgentSession {
 		this._prewarmIpythonKernel = (config.prewarmIpythonKernel ?? false) && this._rlmDepth === 0;
 		this._autoRefineReviewer = config.autoRefineReviewer;
 		this._serializedRefine = config.serializedRefine ?? false;
+		this._stallAbortSettleGraceMs = config.stallAbortSettleGraceMs;
+		this._rlmTerminalNoticeAbandonAfterMs =
+			config.rlmTerminalNoticeAbandonAfterMs ?? RLM_TERMINAL_NOTICE_ABANDON_AFTER_MS;
+		this._failureWakeQuietWindowMs = config.failureWakeQuietWindowMs ?? FAILURE_WAKE_QUIET_WINDOW_MS;
 		this._rlmSessionDir = config.rlmSessionDir;
 		this._rlmParentNodeId = config.rlmParentNodeId;
 		this._rlmParentAgent = config.rlmParentAgent;
@@ -1426,6 +1588,10 @@ export class AgentSession {
 		});
 
 		this._stallWatchdog = this._createStallWatchdog();
+		// A restart of the same session picks up whatever the previous process could
+		// not deliver (B10: every in-memory queue answers "where is it after a
+		// restart"). No-op when the session dir holds no sidecar.
+		this._reflowUndeliveredRlmNotices();
 	}
 
 	/** Refreshes MCP provider registrations without rebuilding the session runtime. */
@@ -3697,6 +3863,40 @@ export class AgentSession {
 		this._agentEventQueue.catch(() => {});
 	};
 
+	/**
+	 * Whether an exemption currently owns this session's silence: the watchdog
+	 * snoozes instead of escalating, and a parent must not label the child
+	 * "stalled" for it (B9/I-13 - healthy long work is not a stall). Today the
+	 * exemptions are the host-owned phases; the kernel-liveness vouch extends the
+	 * same predicate, which is why the label decision reads this getter instead of
+	 * re-deriving a pause list.
+	 */
+	/** Current stall marker, if the watchdog has fired and the turn has not restarted. */
+	get stallState(): RlmChildStallState | undefined {
+		return this._stallState;
+	}
+
+	/**
+	 * Why the last abort of this session was requested, until the next turn starts.
+	 * Published for diagnostics and for a parent classifying a child's terminal
+	 * state: a stale reason would turn a healthy follow-up turn into a reported
+	 * abort, which is exactly what the agent_start reset prevents.
+	 */
+	get lastTurnAbortReason(): RlmChildTurnAbortReason | undefined {
+		return this._lastTurnAbortReason;
+	}
+
+	get stallExempted(): boolean {
+		return (
+			this._disposed ||
+			this._disposing ||
+			this.isCompacting ||
+			this._branchSummaryOperation !== undefined ||
+			this._autoRefineInProgress ||
+			this._pendingUiDialogs > 0
+		);
+	}
+
 	private _createStallWatchdog(): StallWatchdog {
 		const options: StallWatchdogOptions = {
 			enabled: () => this.settingsManager.getStallWatchdogSettings().enabled,
@@ -3705,14 +3905,9 @@ export class AgentSession {
 				const s = this.settingsManager.getStallWatchdogSettings();
 				return s.abortAfterSeconds > 0 ? s.abortAfterSeconds * 1000 : undefined;
 			},
-			isPaused: () =>
-				this._disposed ||
-				this._disposing ||
-				this.isCompacting ||
-				this._branchSummaryOperation !== undefined ||
-				this._autoRefineInProgress ||
-				this._pendingUiDialogs > 0,
+			isPaused: () => this.stallExempted,
 			onStage: (info) => this._handleStallWatchdogStage(info),
+			...(this._stallAbortSettleGraceMs === undefined ? {} : { abortSettleGraceMs: this._stallAbortSettleGraceMs }),
 		};
 		return new StallWatchdog(options);
 	}
@@ -3734,11 +3929,19 @@ export class AgentSession {
 		}
 		if (event.type === "agent_start") {
 			this._stallInFlightTools.clear();
+			// A new turn means the aborted turn is history: without this reset a
+			// follow-up turn that completes normally would still be classified
+			// against the earlier abort reason, and the roster would keep showing a
+			// stall marker for a session that recovered.
+			this._lastTurnAbortReason = undefined;
+			this._stallState = undefined;
 			watchdog.arm();
 			return;
 		}
 		if (event.type === "agent_end") {
 			this._stallInFlightTools.clear();
+			// The abort took effect: the run produced a terminal event after it.
+			if (this._lastStallAbort) this._lastStallAbort = { ...this._lastStallAbort, settled: true };
 			watchdog.disarm();
 			return;
 		}
@@ -3786,6 +3989,15 @@ export class AgentSession {
 			sessionId: this.sessionManager.getSessionId(),
 			diagnostics,
 		};
+		// Roster marker: survives until the next agent_start so a wedged session
+		// keeps reporting its silence instead of reading as healthy progress.
+		this._stallState = {
+			silentMs: info.silentMs,
+			thresholdMs: info.stage === "warn" ? settings.warnAfterSeconds * 1000 : settings.abortAfterSeconds * 1000,
+			inFlightTools: diagnostics.inFlightToolCalls.map((call) => call.toolName),
+			unsettled: info.stage === "abort_unsettled" || this._stallState?.unsettled === true ? true : undefined,
+		};
+		const kernelReasons = readStallKernelReasons(diagnostics);
 		if (info.stage === "warn") {
 			const message = `Possible stall: no session activity for ${silentSeconds}s while a turn is running. If nothing recovers, the turn will be aborted automatically after ${settings.abortAfterSeconds}s of silence. If a tool appears stuck, interrupt the turn manually to recover faster; check the daemon log for stall diagnostics.`;
 			sessionLog.warn("stall watchdog: no activity while turn running", logFields);
@@ -3801,6 +4013,16 @@ export class AgentSession {
 		if (info.stage === "abort") {
 			const message = `Suspected stall: no session activity for ${silentSeconds}s. The current turn is being aborted automatically; diagnostics were logged.`;
 			sessionLog.error("stall watchdog: aborting silent turn", logFields);
+			// Recorded before the abort so the terminal classifier can tell a
+			// watchdog kill from an ordinary completion; `settled` starts true and
+			// only the abort_unsettled stage below revokes it.
+			this._lastStallAbort = {
+				silentMs: info.silentMs,
+				thresholdMs: settings.abortAfterSeconds * 1000,
+				inFlightTools: this._stallState.inFlightTools,
+				kernelReasons: kernelReasons.length > 0 ? kernelReasons : undefined,
+				settled: true,
+			};
 			this._emit({
 				type: "stall_abort",
 				message,
@@ -3808,14 +4030,18 @@ export class AgentSession {
 				thresholdMs: settings.abortAfterSeconds * 1000,
 				diagnostics,
 			});
-			this.requestAbort();
+			this.requestAbort({ reason: "stall_watchdog" });
 			return;
 		}
 		// abort_unsettled: the abort fired but the run never produced agent_end.
+		// Emitted as its own type (not a second stall_warning) so "killed but still
+		// running" is countable apart from "looks stuck"; a parent that sees it
+		// records the fact on the run and keeps the kill classification.
 		const message = `Suspected stall: auto-abort fired ${silentSeconds}s into silence but the run did not settle; the session may need a restart. Diagnostics were logged.`;
 		sessionLog.error("stall watchdog: abort did not settle the turn", logFields);
+		if (this._lastStallAbort) this._lastStallAbort = { ...this._lastStallAbort, settled: false };
 		this._emit({
-			type: "stall_warning",
+			type: "stall_unsettled",
 			message,
 			silentMs: info.silentMs,
 			thresholdMs: settings.abortAfterSeconds * 1000,
@@ -4479,6 +4705,9 @@ export class AgentSession {
 			this._rlmChildSessions.clear();
 			this._rlmChildCleanupFailures.clear();
 			this._deletedRlmChildIds.clear();
+			// B1 后半: dropping the queue here used to be silent, which made "queued"
+			// blinder than the hard failure it replaced. Persist first, then clear.
+			this._persistUndeliveredWorkBeforeDispose();
 			this._pendingNextTurnMessages = [];
 			const deliveryError = new Error("Session disposed before prompt delivery.");
 			const completionError = new Error("Session disposed before prompt completion.");
@@ -4941,15 +5170,20 @@ export class AgentSession {
 				throw new Error("Agent message was cleared before admission");
 			}
 		};
-		if (
-			this._sessionInputPumpSuspended &&
-			this._isBusyForSessionInput("preflight") &&
-			options?.queueIfBusy === true &&
-			options.streamingBehavior
-		) {
+		if (this._sessionInputPumpSuspended && options?.queueIfBusy === true && options.streamingBehavior) {
+			// P0-3a: a suspended pump is a reason to queue, not to refuse. The
+			// idle-and-suspended case used to fall through to _prompt and fail loudly,
+			// so a child replying to a parent that had been aborted (or stall-killed)
+			// got a hard tool error and concluded the message could not be sent at all.
+			// Queuing keeps the message durable and visible; the update-restart fence
+			// still refuses to *wake* the pump (wakeSuspendedSessionInput guards it),
+			// and a disposed session stays a terminal error.
+			if (this._disposed || this._disposing) {
+				throw new Error("Cannot admit a session action because the session is disposing or disposed.");
+			}
 			admissionCommitted();
 			const queued = await this.queueAgentMessagePrompt(text, options.streamingBehavior, customMessage);
-			options.preflightResult?.(queued, queued);
+			options.preflightResult?.(queued, queued, "target_suspended");
 			return;
 		}
 		await this._prompt(text, {
@@ -4972,19 +5206,25 @@ export class AgentSession {
 		customMessage?: AgentSessionMessage,
 	): Promise<boolean> {
 		const agentMessageId = customMessage?.details.id ?? parseAgentSessionMessagePromptId(text);
-		// A pump suspended by requestAbort must be resumed when an agent message is
-		// queued: steer/follow-up actions otherwise only wake on a turn boundary or
-		// external resume, and nothing else resumes the pump after an abort, so the
-		// message would sit unprocessed and the child session would silently stall.
-		// Resume only when actually suspended: an idle session must keep its
-		// queue-and-wait semantics instead of starting a turn immediately. The
-		// idle-and-suspended branch of acceptAgentMessagePrompt goes through _prompt
-		// with resumeIfIdle: false and keeps failing loudly. Never resume a pump
-		// suspended by abortForUpdateRestart: queued work must survive into the
-		// restart manifest instead of starting a new turn during teardown, so the
-		// message stays queued behind the fence (mirrors the triggerTurn guard).
+		// C2 (甲变体): queueing an agent message does NOT automatically start a new
+		// turn. A user Esc (or a stall-watchdog kill) has to keep meaning "stop":
+		// before this, every queued child reply re-ignited the parent, so one Esc
+		// could be answered by a family of failures each opening a fresh turn.
+		//
+		// The message is still durable and visible in the queue, and it is delivered
+		// by the next wake (user input, attach, resumeQueuedWork) or by the
+		// failure-class aggregated wake below. Policy is switchable in settings:
+		//   never              - nothing wakes; terminal notices are persisted instead
+		//   failure_aggregated - default: one aggregated wake per quiet window, for
+		//                        failure-class terminal notices only (see
+		//                        _deliverAggregatedFailureWake)
+		//   always             - the old behaviour: every queued message wakes the pump
+		// Never resume a pump suspended by abortForUpdateRestart: queued work must
+		// survive into the restart manifest instead of starting a turn during
+		// teardown, so the message stays queued behind the fence (mirrors the
+		// triggerTurn guard, and wakeSuspendedSessionInput enforces it).
 		const resumeSuspendedPump = () => {
-			this.wakeSuspendedSessionInput();
+			if (this.settingsManager.getSubagentWakePolicy() === "always") this.wakeSuspendedSessionInput();
 		};
 		if (streamingBehavior === "steer") {
 			await this._queuePreparedPrompt("steer", text, undefined, {
@@ -5062,20 +5302,195 @@ export class AgentSession {
 			return;
 		}
 		const deferredSince = this._rlmTerminalNoticeDeferredSince;
-		if (deferredSince === undefined || now - deferredSince < RLM_TERMINAL_NOTICE_ABANDON_AFTER_MS) return;
+		if (deferredSince === undefined || now - deferredSince < this._rlmTerminalNoticeAbandonAfterMs) return;
 		this._flushDeferredRlmTerminalNotices();
 		if (!this._hasDeferredRlmTerminalNotices()) {
 			this._clearRlmTerminalNoticeDeferred();
 			return;
 		}
-		let count = 0;
+		// C3: the two classes part ways here. A failure notice is the only record
+		// that a child died, so it is written straight into this session's transcript
+		// (and survives a restart through the sidecar written at dispose) instead of
+		// being dropped. `completed_without_reply` / `cancelled` keep the old
+		// abandonment so a session holding only those can still passivate or evict.
+		const persisted: CustomMessage[] = [];
+		let abandoned = 0;
 		this._pendingNextTurnMessages = this._pendingNextTurnMessages.filter((message) => {
 			if (!this._isRlmTerminalNotice(message)) return true;
-			count++;
+			if (message.customType === RLM_CHILD_FAILURE_CUSTOM_TYPE) {
+				persisted.push(message);
+				return false;
+			}
+			abandoned += 1;
 			return false;
 		});
+		for (const message of persisted) this._appendCustomMessageToTranscript(message);
 		this._clearRlmTerminalNoticeDeferred();
-		this._rlmTerminalNoticeAbandonment = { abandonedAt: now, count };
+		if (persisted.length === 0 && abandoned === 0) return;
+		this._rlmTerminalNoticeAbandonment = { abandonedAt: now, count: abandoned + persisted.length };
+		// Three observable exits (event, log, transcript/sidecar) replace a filter
+		// that used to discard a child's death report without a trace. Production
+		// expectation is ~0; anything else is now forensically visible.
+		sessionLog.error("rlm terminal notices were not deliverable", {
+			sessionId: this.sessionId,
+			abandoned,
+			persistedToTranscript: persisted.length,
+			deferredMs: now - deferredSince,
+			pumpSuspended: this._sessionInputPumpSuspended,
+		});
+		this._emit({
+			type: "rlm_terminal_notice_abandoned",
+			abandoned,
+			persistedToTranscript: persisted.length,
+			deferredMs: now - deferredSince,
+		});
+	}
+
+	/**
+	 * Write a custom message straight into the transcript.
+	 *
+	 * `sendCustomMessage`'s direct-land branch is an `else`: while the session is
+	 * streaming the same call becomes a steer/follow-up queue entry, i.e. exactly the
+	 * "wait for the pump" path an undeliverable terminal notice must not take (the
+	 * pump may never come back). This is the unconditional form of the same three
+	 * steps, and the only writer used by the abandonment path.
+	 */
+	private _appendCustomMessageToTranscript(message: CustomMessage): void {
+		const entry = cloneCustomMessage(message);
+		this.agent.state.messages.push(entry);
+		this.sessionManager.appendCustomMessageEntry(entry.customType, entry.content, entry.display, entry.details);
+		this._emit({ type: "message_start", message: entry });
+		this._emit({ type: "message_end", message: entry });
+	}
+
+	/**
+	 * Sidecar holding undelivered notices/queued replies across a restart (B10).
+	 *
+	 * Undefined for a session that does not persist: an in-memory session (a test
+	 * harness, an inline RLM descendant) has no session dir of its own, so a path
+	 * would resolve against the process cwd - dropping a private file into the
+	 * repository and letting an unrelated session reflow somebody else's notices.
+	 */
+	get undeliveredRlmNoticeSidecarPath(): string | undefined {
+		if (!this.sessionManager.allowsPersistence()) return undefined;
+		// A subagent's own artifact dir is per-session already; a top-level session
+		// shares its sessions dir with every other session, so the file name carries
+		// the session id - otherwise a restart of one session would reflow another
+		// session's undelivered notices.
+		const dir = this._rlmSessionDir || this.sessionManager.getSessionDir();
+		if (!dir) return undefined;
+		return join(dir, `${UNDELIVERED_RLM_NOTICES_FILE}.${this.sessionManager.getSessionId()}`);
+	}
+
+	/**
+	 * Dedup identity for one persisted message. A childId is unique per spawn (it is
+	 * the run id), and the notice's own timestamp separates two terminal events for
+	 * the same child and kind, so the same message written twice is one row.
+	 */
+	private _undeliveredRlmNoticeKey(message: CustomMessage): string {
+		const details = message.details as { childId?: string; kind?: string } | undefined;
+		return `${details?.childId ?? "unknown"}:${details?.kind ?? message.customType}:${message.timestamp}`;
+	}
+
+	private _readUndeliveredRlmNoticeRows(): UndeliveredRlmNoticeRow[] {
+		const path = this.undeliveredRlmNoticeSidecarPath;
+		if (!path || !existsSync(path)) return [];
+		const rows: UndeliveredRlmNoticeRow[] = [];
+		try {
+			for (const line of readFileSync(path, "utf8").split("\n")) {
+				const trimmed = line.trim();
+				if (!trimmed) continue;
+				const parsed = JSON.parse(trimmed) as UndeliveredRlmNoticeRow;
+				if (parsed && typeof parsed.key === "string" && parsed.message?.role === "custom") rows.push(parsed);
+			}
+		} catch (error) {
+			sessionLog.warn("undelivered rlm notice sidecar is unreadable", {
+				sessionId: this.sessionId,
+				path,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return [];
+		}
+		return rows;
+	}
+
+	/**
+	 * Persist messages that a dispose would otherwise drop (B1 后半 / B10). Written
+	 * atomically at 0600 and bounded, so a family failing in a loop cannot grow the
+	 * file without limit.
+	 */
+	private _appendUndeliveredRlmNoticeRows(messages: readonly CustomMessage[]): void {
+		if (messages.length === 0) return;
+		const path = this.undeliveredRlmNoticeSidecarPath;
+		if (!path) return;
+		try {
+			const existing = this._readUndeliveredRlmNoticeRows();
+			const seen = new Set(existing.map((row) => row.key));
+			const rows = [...existing];
+			for (const message of messages) {
+				const key = this._undeliveredRlmNoticeKey(message);
+				if (seen.has(key)) continue;
+				seen.add(key);
+				rows.push({ key, message: cloneCustomMessage(message), writtenAt: Date.now() });
+			}
+			const bounded = rows.slice(-UNDELIVERED_RLM_NOTICES_MAX_ROWS);
+			ensurePrivateDirectory(dirname(path));
+			writePrivateFileAtomic(path, `${bounded.map((row) => JSON.stringify(row)).join("\n")}\n`, {
+				privateParent: false,
+			});
+		} catch (error) {
+			sessionLog.error("undelivered rlm notice sidecar write failed", {
+				sessionId: this.sessionId,
+				path,
+				count: messages.length,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	/**
+	 * Reflow sidecar rows into the next-turn queue (idempotent by key) and drop the
+	 * file, so a restart of the same session delivers what the previous process
+	 * could not. Runs at construction and on every admission resume.
+	 */
+	private _reflowUndeliveredRlmNotices(): void {
+		const rows = this._readUndeliveredRlmNoticeRows();
+		if (rows.length === 0) return;
+		const known = new Set(this._pendingNextTurnMessages.map((message) => this._undeliveredRlmNoticeKey(message)));
+		const restored = rows.filter((row) => !known.has(row.key)).map((row) => row.message);
+		if (restored.length > 0) {
+			this._unshiftPendingNextTurnMessages(...restored);
+			sessionLog.info("rlm terminal notices restored from sidecar", {
+				sessionId: this.sessionId,
+				count: restored.length,
+			});
+		}
+		const path = this.undeliveredRlmNoticeSidecarPath;
+		if (!path) return;
+		try {
+			rmSync(path, { force: true });
+		} catch {
+			// A stale sidecar is re-read and de-duplicated by key on the next start.
+		}
+	}
+
+	/**
+	 * Everything a dispose would silently drop: deferred terminal notices and queued
+	 * agent-message replies that never reached a turn. Written to the sidecar so the
+	 * next start of this session reflows them (B1 后半: without this, "queued" would
+	 * be blinder than the old hard failure it replaced).
+	 */
+	private _persistUndeliveredWorkBeforeDispose(): void {
+		const messages: CustomMessage[] = [];
+		for (const message of this._pendingNextTurnMessages) {
+			if (this._isRlmTerminalNotice(message) || isAgentSessionMessage(message)) messages.push(message);
+		}
+		for (const action of this._actionStore.unfinishedActions()) {
+			if (action.payload.kind !== "turn") continue;
+			const message = primaryDeliveryRecord(action).message;
+			if (message.role === "custom" && isAgentSessionMessage(message)) messages.push(message);
+		}
+		this._appendUndeliveredRlmNoticeRows(messages);
 	}
 
 	/**
@@ -5095,7 +5510,7 @@ export class AgentSession {
 	/** Whether the deferred notices have waited past the abandonment threshold. */
 	private _isDeferredRlmTerminalNoticeStale(now = Date.now()): boolean {
 		const deferredSince = this._rlmTerminalNoticeDeferredSince;
-		return deferredSince !== undefined && now - deferredSince >= RLM_TERMINAL_NOTICE_ABANDON_AFTER_MS;
+		return deferredSince !== undefined && now - deferredSince >= this._rlmTerminalNoticeAbandonAfterMs;
 	}
 
 	/**
@@ -5123,6 +5538,19 @@ export class AgentSession {
 		this._enqueuePendingNextTurnMessages(messages, true);
 	}
 
+	/**
+	 * Remove one queued message by identity. Lives in the mutator core with the two
+	 * insertion shells: the aggregated failure wake folds buffered notices out of the
+	 * queue and into a single turn, and that removal must not become a third
+	 * un-guarded write to the array.
+	 */
+	private _removePendingNextTurnMessage(message: CustomMessage): boolean {
+		const index = this._pendingNextTurnMessages.indexOf(message);
+		if (index < 0) return false;
+		this._pendingNextTurnMessages.splice(index, 1);
+		return true;
+	}
+
 	/** Record that terminal notices are deferred, and arm the abandonment driver. */
 	private _markRlmTerminalNoticeDeferred(): void {
 		this._rlmTerminalNoticeDeferredSince ??= Date.now();
@@ -5143,7 +5571,7 @@ export class AgentSession {
 		if (this._rlmTerminalNoticeAbandonTimer !== undefined) return;
 		const deferredSince = this._rlmTerminalNoticeDeferredSince;
 		const elapsed = deferredSince === undefined ? 0 : Date.now() - deferredSince;
-		const waitMs = Math.max(0, RLM_TERMINAL_NOTICE_ABANDON_AFTER_MS - elapsed);
+		const waitMs = Math.max(0, this._rlmTerminalNoticeAbandonAfterMs - elapsed);
 		const timer = setTimeout(() => {
 			this._rlmTerminalNoticeAbandonTimer = undefined;
 			this.maybeAbandonStaleDeferredRlmTerminalNotices();
@@ -5245,11 +5673,159 @@ export class AgentSession {
 		if (!fence) return;
 		try {
 			if (this._disposed || this._disposing) return;
-			this._pushPendingNextTurnMessages(cloneCustomMessage(message));
+			const deferred = cloneCustomMessage(message);
+			this._pushPendingNextTurnMessages(deferred);
 			this._flushDeferredRlmTerminalNotices();
+			this._maybeBufferFailureWake(deferred);
 		} finally {
 			fence.release();
 		}
+	}
+
+	/**
+	 * B3/N-3: a failure-class notice that could not be delivered because the pump is
+	 * suspended joins the aggregation buffer instead of waking the session by
+	 * itself. Ordinary child replies are not buffered: they wait for the next wake,
+	 * which is what keeps an Esc meaning "stop".
+	 */
+	private _maybeBufferFailureWake(message: CustomMessage): void {
+		if (message.customType !== RLM_CHILD_FAILURE_CUSTOM_TYPE) return;
+		if (!this._sessionInputPumpSuspended || this._sessionInputSuspendedForUpdateRestart) return;
+		if (this.settingsManager.getSubagentWakePolicy() === "never") return;
+		if (this._pendingFailureWakeNotices.includes(message)) return;
+		this._pendingFailureWakeNotices.push(message);
+		this._armFailureWakeAggregation();
+	}
+
+	private _armFailureWakeAggregation(): void {
+		if (this._failureWakeTimer !== undefined) return;
+		const timer = setTimeout(() => {
+			this._failureWakeTimer = undefined;
+			this._deliverAggregatedFailureWake();
+		}, FAILURE_WAKE_AGGREGATION_MS);
+		timer.unref?.();
+		this._failureWakeTimer = timer;
+	}
+
+	private _armFailureWakeFlushRetry(): void {
+		if (this._failureWakeFlushTimer !== undefined) return;
+		const timer = setTimeout(() => {
+			this._failureWakeFlushTimer = undefined;
+			if (this._disposed || this._disposing) return;
+			// Delivers as soon as the pump is runnable again; otherwise keeps
+			// re-offering so a revived pump never waits on a notice nobody retries.
+			this._flushDeferredRlmTerminalNotices();
+			if (!this._hasDeferredRlmTerminalNotices()) return;
+			if (this._sessionInputPumpSuspended && this._pendingFailureWakeNotices.length > 0) {
+				this._deliverAggregatedFailureWake();
+				return;
+			}
+			this._armFailureWakeFlushRetry();
+		}, RLM_TERMINAL_NOTICE_FLUSH_RETRY_MS);
+		timer.unref?.();
+		this._failureWakeFlushTimer = timer;
+	}
+
+	private _clearFailureWakeTimers(): void {
+		if (this._failureWakeTimer !== undefined) {
+			clearTimeout(this._failureWakeTimer);
+			this._failureWakeTimer = undefined;
+		}
+		if (this._failureWakeFlushTimer !== undefined) {
+			clearTimeout(this._failureWakeFlushTimer);
+			this._failureWakeFlushTimer = undefined;
+		}
+	}
+
+	/**
+	 * One wake for a family of failures.
+	 *
+	 * The wake itself is pump-level - `wakeSuspendedSessionInput` resumes admission
+	 * and schedules the pump, it cannot be filtered per message - so the buffered
+	 * notices are folded into a SINGLE turn first: they ride along as prefix
+	 * messages and the turn text states the aggregate. Waking first would release
+	 * every queued notice as its own turn, which is exactly the N-turn re-ignition
+	 * an Esc is supposed to prevent (F11: the "one wake releases the whole backlog"
+	 * semantics of the pump is unchanged and stays documented).
+	 */
+	private _deliverAggregatedFailureWake(): void {
+		if (this._disposed || this._disposing) return;
+		if (!this._sessionInputPumpSuspended || this._sessionInputSuspendedForUpdateRestart) {
+			// The pump came back on its own: ordinary delivery handles everything.
+			this._pendingFailureWakeNotices.length = 0;
+			this._flushDeferredRlmTerminalNotices();
+			return;
+		}
+		const buffered = this._pendingFailureWakeNotices.splice(0, this._pendingFailureWakeNotices.length);
+		if (buffered.length === 0) {
+			this._armFailureWakeFlushRetry();
+			return;
+		}
+		const suspendedSince = this._sessionInputSuspendedSince;
+		const withinQuietWindow =
+			suspendedSince !== undefined && Date.now() - suspendedSince <= this._failureWakeQuietWindowMs;
+		if (
+			this.settingsManager.getSubagentWakePolicy() === "never" ||
+			this._failureWakeUsedForSuspension ||
+			!withinQuietWindow
+		) {
+			// Past the total gate (or policy forbids waking): stop re-igniting the
+			// session. The notices stay deferred for the persistence path and the
+			// flush timer keeps re-offering them to a pump that revives on its own.
+			this._pendingFailureWakeNotices.push(...buffered);
+			sessionLog.info("rlm failure wake suppressed", {
+				sessionId: this.sessionId,
+				count: buffered.length,
+				policy: this.settingsManager.getSubagentWakePolicy(),
+				alreadyWoke: this._failureWakeUsedForSuspension,
+				withinQuietWindow,
+			});
+			this._armFailureWakeFlushRetry();
+			return;
+		}
+		// Fold the buffered notices out of the next-turn queue into one turn so the
+		// wake cannot fan them out into one turn per failure.
+		const notices = buffered.filter((message) => this._removePendingNextTurnMessage(message));
+		if (notices.length === 0) {
+			this._armFailureWakeFlushRetry();
+			return;
+		}
+		const summary = aggregatedFailureWakeText(notices);
+		const action = this._createPreparedTurnAction("followUp", summary, undefined, {
+			prefixMessages: notices,
+			suppressAutonomousContinuation: true,
+			resumeIfIdle: false,
+			source: "internal",
+			executionPolicy: this._turnExecutionPolicy("injected"),
+			queueVisible: false,
+		});
+		this._durableRlmTerminalNoticeActionIds.add(action.id);
+		try {
+			const result = this._admitSessionInput(action, { wake: false });
+			if (!result.accepted) throw new Error("Aggregated RLM failure wake was not admitted.");
+		} catch (error) {
+			this._durableRlmTerminalNoticeActionIds.delete(action.id);
+			// Put them back so the persistence path still sees every notice.
+			this._unshiftPendingNextTurnMessages(...notices);
+			this._pendingFailureWakeNotices.push(...notices);
+			sessionLog.warn("rlm failure wake aggregation failed", {
+				sessionId: this.sessionId,
+				count: notices.length,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			this._armFailureWakeFlushRetry();
+			return;
+		}
+		this._failureWakeUsedForSuspension = true;
+		// Countable signature for "one Esc, one aggregated wake".
+		sessionLog.info("rlm failure wake aggregated", {
+			sessionId: this.sessionId,
+			count: notices.length,
+			childIds: notices.map((notice) => (notice.details as { childId?: string } | undefined)?.childId),
+			sinceAbortMs: suspendedSince === undefined ? undefined : Date.now() - suspendedSince,
+		});
+		this._clearRlmTerminalNoticeDeferred();
+		this.wakeSuspendedSessionInput();
 	}
 
 	private _demoteRlmTerminalNoticeActions(): void {
@@ -6063,7 +6639,10 @@ export class AgentSession {
 			throw new Error("Cannot admit a session action while session input admission is paused.");
 		}
 		if (this._sessionInputPumpSuspended) {
-			throw new Error("Cannot admit a session action while queued session input is suspended.");
+			throw new SessionInputSuspendedError({
+				queuedActionCount: this.unfinishedActionCount,
+				suspendedForUpdateRestart: this._sessionInputSuspendedForUpdateRestart,
+			});
 		}
 	}
 
@@ -7005,6 +7584,29 @@ export class AgentSession {
 		return this._sessionInputPumpSuspended;
 	}
 
+	/**
+	 * Unfinished actions that something is actually working on.
+	 *
+	 * `queued` never counts: a message waiting for a wake is not activity, and after
+	 * an Esc it would otherwise pin the session - and with it the whole worker -
+	 * resident until somebody typed something. `selected` does not count while the
+	 * pump is suspended either: the pump claimed the action but is not allowed to
+	 * consume it, so it is still waiting, not working. Every other non-terminal state
+	 * (preparing/committing/running) counts, which keeps `wait_for_idle` and RLM
+	 * quiescence honest about work in flight.
+	 */
+	private _consumedUnfinishedActionCount(): number {
+		const suspended = this._sessionInputPumpSuspended;
+		let count = 0;
+		for (const action of this._actionStore.unfinishedActions()) {
+			const state = action.lifecycle.state;
+			if (state === "queued") continue;
+			if (state === "selected" && suspended) continue;
+			count += 1;
+		}
+		return count;
+	}
+
 	get isSessionActive(): boolean {
 		return (
 			this.isStreaming ||
@@ -7014,7 +7616,13 @@ export class AgentSession {
 			this._refineInFlight !== undefined ||
 			this._branchSummaryOperation !== undefined ||
 			this._postCompactionContinuationSettlement !== undefined ||
-			this.unfinishedActionCount > 0 ||
+			// I-2: only work that is actually being consumed counts. After an Esc the
+			// queue can hold up to 20 undelivered agent messages; counting them would
+			// pin the session (and therefore the whole worker) resident forever, so
+			// queued-but-unconsumed messages wait for a wake instead of claiming
+			// activity. They are not lost: queued actions round-trip through
+			// getSessionActionRecoverySnapshot()/restoreSessionActions().
+			this._consumedUnfinishedActionCount() > 0 ||
 			// Deferred RLM terminal notices are undelivered work: requestAbort demotes
 			// admitted notices back to next-turn deferral, and a session holding only
 			// those would otherwise look idle and be passivated/evicted, dropping the
@@ -7358,7 +7966,15 @@ export class AgentSession {
 		this._sessionInputPumpSuspended = false;
 		this._sessionInputSuspendedForUpdateRestart = false;
 		this._sessionInputPumpEpoch++;
+		// The pump is runnable again: the aggregated failure wake is pointless now,
+		// and the ordinary flush below delivers every deferred notice.
+		this._sessionInputSuspendedSince = undefined;
+		this._clearFailureWakeTimers();
+		this._pendingFailureWakeNotices.length = 0;
 		this._notifySessionInputCheckpointChange();
+		// Reflow before flushing so a sidecar left by an earlier process is delivered
+		// by the same resume that revives the pump.
+		this._reflowUndeliveredRlmNotices();
 		this._flushDeferredRlmTerminalNotices();
 	}
 
@@ -7507,7 +8123,14 @@ export class AgentSession {
 		return this._resourceLoader;
 	}
 
-	requestAbort(): void {
+	/**
+	 * Abort the turn in flight without cascading into subagents: descendants keep
+	 * their own watchdogs and their own cancel entry points (agents view, kill).
+	 * `reason` is recorded so the terminal classifier can tell a user Esc from a
+	 * stall-watchdog kill; the next agent_start clears it.
+	 */
+	requestAbort(options?: { reason?: RlmChildTurnAbortReason }): void {
+		if (options?.reason) this._lastTurnAbortReason = options.reason;
 		for (const run of [...this._unsettledRlmChildRuns]) {
 			if (run.status === "cancelled") this._abandonRlmRunForQuiescence(run);
 		}
@@ -7516,6 +8139,10 @@ export class AgentSession {
 		this._sessionInputPumpEpoch++;
 		this._sessionInputPumpSuspended = true;
 		this._sessionInputSuspendedForUpdateRestart = false;
+		// Start the failure-wake quiet window: one aggregated failure wake per Esc,
+		// later failures are persisted instead of re-igniting the session (B3).
+		this._sessionInputSuspendedSince = Date.now();
+		this._failureWakeUsedForSuspension = false;
 		this._demoteRlmTerminalNoticeActions();
 		this._cancelSessionActions(
 			(action) =>
@@ -7591,7 +8218,7 @@ export class AgentSession {
 		const compactionOperation = this._compactionOperation;
 		const branchSummaryOperation = this._branchSummaryOperation;
 		this.requestAbort();
-		this._cancelActiveRlmChildRuns("Parent session aborted");
+		this._abortRlmSubtree("Parent session aborted");
 		this._goalAbortInProgress = this._goalState.status === "active";
 		try {
 			await Promise.allSettled([
@@ -7615,7 +8242,7 @@ export class AgentSession {
 		this._cancelPostCompactionContinue();
 		this.abortRetry();
 		for (const controller of this._rlmQuiescenceWaitAborts) controller.abort();
-		this._cancelActiveRlmChildRuns("Parent session aborted for update restart");
+		this._abortRlmSubtree("Parent session aborted for update restart");
 		this._goalAbortInProgress = this._goalState.status === "active";
 		this.agent.abort();
 		if (this._goalAbortInProgress) {
@@ -10077,10 +10704,21 @@ export class AgentSession {
 						(await this.handleAgentMessageHostRequest("agent_message.list_agents")) as AgentFamilyRosterResult,
 					awaitPendingChildPublication: (selector) => this._awaitPendingRlmChildPublication(selector),
 					sendAgentMessage: async (input) => {
-						const receipt = (await this.handleAgentMessageHostRequest("agent_message.send", {
-							target: input.target,
-							message: input.message,
-						})) as AgentSessionMessageReceipt;
+						let receipt: AgentSessionMessageReceipt;
+						try {
+							receipt = (await this.handleAgentMessageHostRequest("agent_message.send", {
+								target: input.target,
+								message: input.message,
+							})) as AgentSessionMessageReceipt;
+						} catch (error) {
+							throw this._terminalizeRepeatedAgentMessageSendFailure(input.target, error);
+						}
+						this._agentMessageSendFailures.delete(input.target);
+						// B1: only a delivered reply counts as "the child replied". A
+						// queued receipt means the parent has not seen anything yet, and
+						// counting it would let the parent's terminal gate treat a
+						// still-undelivered reply as delivered - the child believes it
+						// answered while the parent never receives a notice.
 						if (this._rlmDepth > 0) {
 							let addressedParent = input.receiverRole === "parent";
 							if (input.receiverRole === undefined && this._agentMessageController?.roster) {
@@ -10095,7 +10733,13 @@ export class AgentSession {
 									addressedParent = false;
 								}
 							}
-							if (addressedParent) {
+							if (
+								countsAsDeliveredParentReply({
+									rlmDepth: this._rlmDepth,
+									deliveryStatus: receipt.deliveryStatus,
+									addressedParent,
+								})
+							) {
 								this._repliedToParentSinceTask = true;
 								this._parentReplyCount += 1;
 							}
@@ -10394,10 +11038,83 @@ export class AgentSession {
 		this._maybeResumeGoalContinuationAfterRlmWork();
 	}
 
+	/**
+	 * Cancel the runs this session itself tracks. One step of the abort cascade
+	 * (see `_abortRlmSubtree`) and the whole of dispose's cancellation, which then
+	 * disposes every retained child session and lets each one cancel its own.
+	 */
 	private _cancelActiveRlmChildRuns(reason: string): void {
 		for (const run of this._activeRlmChildRuns.values()) {
 			this._cancelRlmChildRun(run, reason);
 		}
+	}
+
+	/**
+	 * Cancel every running or queued RLM run in this session's subtree *and* stop
+	 * the in-flight turn of every retained descendant session.
+	 *
+	 * `_cancelActiveRlmChildRuns` alone only sees this session's own map, so a child
+	 * that had already settled - then been followed up, then spawned a child of its
+	 * own - kept running after the parent was killed, while `hasRunningRlmChildren()`
+	 * (which walks the subtree) reported the family as busy. Walking the same subtree
+	 * here aligns the kill with the judgement.
+	 *
+	 * `requestAbort` deliberately has no cascade semantics, so stopping each
+	 * descendant's own turn costs O(nodes) rather than O(depth^2); the visited set in
+	 * `_rlmSubtreeSessions` keeps a child that sits in both maps from being walked
+	 * twice. This session is excluded from step 2 because the caller already aborted
+	 * it. Cross-worker descendants are out of reach of an in-process walk and are
+	 * covered by the supervisor's kill path instead.
+	 */
+	private _abortRlmSubtree(reason: string): { cancelled: number; failures: number; depth: number } {
+		let cancelled = 0;
+		let failures = 0;
+		let depth = this._rlmDepth;
+		for (const session of this._rlmSubtreeSessions()) {
+			depth = Math.max(depth, session._rlmDepth);
+			for (const run of [...session._activeRlmChildRuns.values()]) {
+				try {
+					if (!session._cancelRlmChildRun(run, reason)) continue;
+					cancelled += 1;
+					// The cancel already fired run.abort(); drop the handle so a second
+					// trigger (a late publication, a repeated cascade) cannot abort the
+					// same child session again.
+					run.abort = noopRlmChildAbort;
+				} catch (error) {
+					failures += 1;
+					sessionLog.warn("rlm abort cascade: cancelling a descendant run failed", {
+						reason,
+						childId: run.id,
+						sessionId: session.sessionId,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
+			if (session === this) continue;
+			try {
+				// A retained descendant can be mid-turn with no run of ours tracking it:
+				// it settled, was followed up, and is now streaming that follow-up.
+				if (session.isStreaming) session.requestAbort({ reason: "user" });
+			} catch (error) {
+				failures += 1;
+				sessionLog.warn("rlm abort cascade: stopping a descendant turn failed", {
+					reason,
+					sessionId: session.sessionId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+		if (cancelled > 0 || failures > 0) {
+			// Countable answer to "how much work did one Esc actually stop".
+			sessionLog.info("rlm abort cascade", {
+				reason,
+				cancelled,
+				failures,
+				depth,
+				sessionId: this.sessionId,
+			});
+		}
+		return { cancelled, failures, depth };
 	}
 
 	private _cancelRlmChildRun(run: RlmChildRun, reason: string): boolean {
@@ -10420,6 +11137,49 @@ export class AgentSession {
 		// exactly when users reach for the kill.
 		run.emitUpdate?.();
 		return true;
+	}
+
+	/**
+	 * Stop a child session that was published after its run had already been
+	 * cancelled. Per-session try/catch so a child that cannot be stopped still
+	 * leaves a trace instead of failing the publish path.
+	 */
+	private _abortRlmChildSessionOnPublish(run: RlmChildRun, child: AgentSession): void {
+		try {
+			void child.abort();
+		} catch (error) {
+			sessionLog.warn("rlm child published after cancellation could not be aborted", {
+				childId: run.id,
+				sessionId: child.sessionId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	/**
+	 * M6b: turn a repeatedly retryable send failure into a terminal one. The first
+	 * attempts pass the original error through unchanged (so a transient rate limit
+	 * or a full queue stays retryable); from the third consecutive failure the caller
+	 * gets an error that says retrying is pointless and what to do instead.
+	 */
+	private _terminalizeRepeatedAgentMessageSendFailure(target: string, error: unknown): Error {
+		const message = error instanceof Error ? error.message : String(error);
+		const original = error instanceof Error ? error : new Error(message);
+		if (!isRetryableAgentMessageSendError(message)) {
+			this._agentMessageSendFailures.delete(target);
+			return original;
+		}
+		const attempts = (this._agentMessageSendFailures.get(target)?.count ?? 0) + 1;
+		this._agentMessageSendFailures.set(target, { count: attempts, lastError: message });
+		if (attempts < AGENT_MESSAGE_RETRYABLE_FAILURE_LIMIT) return original;
+		// Countable signature for a sender that burned its retry budget (appendix B).
+		sessionLog.warn("agent message retryable repeat terminal", {
+			sessionId: this.sessionId,
+			target,
+			attempts,
+			lastError: message,
+		});
+		return new Error(formatAgentMessageRetryExhaustedError({ target, attempts, lastError: message }));
 	}
 
 	getRlmChildRunStatus(childId: string): RlmChildAgentStatus | undefined {
@@ -10899,6 +11659,152 @@ export class AgentSession {
 		};
 	}
 
+	/**
+	 * Record a child's stall-watchdog stage on the parent side.
+	 *
+	 * Label and facts are deliberately separate (B9/I-13): a child whose silence is
+	 * exempted - a host-owned phase today, the kernel-liveness vouch once it lands -
+	 * is healthy long work and keeps its real activity label, while the forensic
+	 * record still reaches the roster row and the terminal classifier. The
+	 * `unsettled` stage is the "killed but never stopped" fact: it revokes
+	 * `settled` so a survivor is not reported dead and a non-survivor still is.
+	 */
+	private _recordRlmChildStallEvent(
+		run: RlmChildRun,
+		child: AgentSession,
+		stage: "warn" | "abort" | "unsettled",
+		event: { silentMs: number; thresholdMs: number; diagnostics: StallDiagnostics },
+	): void {
+		const inFlightTools = event.diagnostics.inFlightToolCalls.map((call) => call.toolName);
+		if (stage === "abort") {
+			run.stallAbort = {
+				silentMs: event.silentMs,
+				thresholdMs: event.thresholdMs,
+				inFlightTools,
+				settled: true,
+			};
+		} else if (stage === "unsettled") {
+			run.stallAbort = {
+				silentMs: event.silentMs,
+				thresholdMs: event.thresholdMs,
+				inFlightTools,
+				settled: false,
+			};
+		}
+		run.stall = {
+			silentMs: event.silentMs,
+			thresholdMs: event.thresholdMs,
+			inFlightTools,
+			unsettled: stage === "unsettled" || run.stall?.unsettled === true ? true : undefined,
+		};
+		if (!child.stallExempted) run.activity = { kind: "stalled" };
+		run.emitUpdate?.();
+	}
+
+	/**
+	 * Facts the terminal classifier reads. Everything here is already recorded by
+	 * the time a run settles; collecting it in one place keeps the classification
+	 * itself a pure function of these fields.
+	 */
+	private _collectRlmChildTerminalFacts(
+		run: RlmChildRun,
+		child: AgentSession | undefined,
+		parentReplyCountBeforeRun: number,
+	): RlmChildTerminalFacts {
+		const lastAssistant = child ? this._findLastAssistantInMessages(child.messages) : undefined;
+		return {
+			runStatus: run.status,
+			lastStopReason: lastAssistant?.stopReason,
+			lastErrorMessage: lastAssistant?.errorMessage,
+			runError: run.error,
+			// The run's own record survives a disposed child session; the child's copy
+			// is the fallback for a kill the parent's subscription did not observe.
+			stallAbort: run.stallAbort ?? child?._lastStallAbort,
+			turnAbortReason: child?._lastTurnAbortReason,
+			repliedDuringRun: child ? child._parentReplyCount > parentReplyCountBeforeRun : false,
+			terminalErrorNoticeDelivered: child?._terminalErrorNoticeDelivered ?? false,
+		};
+	}
+
+	/**
+	 * Classify a finished run and deliver exactly the notice the classification
+	 * asks for.
+	 *
+	 * Failure kinds (stall_killed/aborted/error) bypass the reply-count gate on
+	 * purpose: "it replied" is not evidence it was not killed, and a watchdog kill
+	 * the parent never sees is the failure this replaces - it used to arrive as
+	 * `completed_without_reply`. `suppressTerminalNotice` and `detachedDeletion`
+	 * still gate everything, so a parent that aborted itself is not woken by its
+	 * own kill and an explicit delete keeps its own notice path.
+	 */
+	private async _deliverRlmChildTerminalOutcome(input: {
+		run: RlmChildRun;
+		child: AgentSession | undefined;
+		sessionName: string;
+		parentReplyCountBeforeRun: number;
+		deliver: (message: CustomMessage) => Promise<void>;
+	}): Promise<void> {
+		const { run, child, sessionName, parentReplyCountBeforeRun, deliver } = input;
+		if (run.detachedDeletion || run.suppressTerminalNotice) return;
+		const facts = this._collectRlmChildTerminalFacts(run, child, parentReplyCountBeforeRun);
+		const outcome = classifyRlmChildTerminalOutcomeSafely(facts, (detail) => {
+			// A silent fallback is how a kill goes back to being reported as a
+			// no-reply, so the degradation itself has to be countable.
+			sessionLog.warn("rlm child terminal classification degraded", {
+				childId: run.id,
+				sessionName,
+				runStatus: run.status,
+				degraded: detail.reason,
+				error: detail.error,
+			});
+		});
+		if (outcome.channel === "none") return;
+		if (outcome.channel === "failure") {
+			const stallAbort = run.stallAbort;
+			await deliver(
+				createRlmChildFailureMessage({
+					childId: run.id,
+					sessionName,
+					error: outcome.reason,
+					kind: outcome.kind,
+					stall: stallAbort
+						? {
+								silentMs: stallAbort.silentMs,
+								thresholdMs: stallAbort.thresholdMs,
+								inFlightTools: stallAbort.inFlightTools,
+								unsettled: stallAbort.settled ? undefined : true,
+							}
+						: undefined,
+				}),
+			);
+			// A delivered failure notice is a delivered terminal report: keep the
+			// child's reply accounting in sync so no second notice follows for the
+			// same run.
+			if (child) child._parentReplyCount += 1;
+			return;
+		}
+		if (outcome.kind === "cancelled") {
+			await deliver(
+				createRlmChildTerminalNoticeMessage({
+					kind: "cancelled",
+					childId: run.id,
+					sessionName,
+					reason: outcome.reason,
+				}),
+			);
+			return;
+		}
+		const lastAssistantText = child?.getLastAssistantText();
+		await deliver(
+			createRlmChildTerminalNoticeMessage({
+				kind: "completed_without_reply",
+				childId: run.id,
+				sessionName,
+				lastAssistantTextPreview: lastAssistantText ? compactRlmText(lastAssistantText) : undefined,
+			}),
+		);
+	}
+
 	private _rlmChildSnapshotForRun(
 		run: RlmChildRun,
 		child = run.session ?? this._rlmChildSessions.get(run.id)?.session,
@@ -10920,6 +11826,7 @@ export class AgentSession {
 			activity: run.activity,
 			repliedSinceTask: child?._repliedToParentSinceTask,
 			error: run.error,
+			stall: run.stall,
 		};
 	}
 
@@ -11119,7 +12026,9 @@ export class AgentSession {
 					else run.suppressTerminalNotice = true;
 					return true;
 				}
-				// The abort cascade never reaches running work retained under a settled descendant.
+				// Running work retained under a settled descendant is reachable through
+				// the subtree walk, and abort()/abortForUpdateRestart() cascade over the
+				// same walk (see _abortRlmSubtree).
 				const cancelled = session._cancelRlmChildRun(run, reason);
 				const descendantsCancelled = run.session?.cancelRunningRlmDescendants(reason) ?? false;
 				if (cancelled || descendantsCancelled) {
@@ -11349,13 +12258,19 @@ export class AgentSession {
 
 		const publishChildSession = (child: AgentSession) => {
 			childSession = child;
-			if (this._activeRlmChildRuns.get(run.id) !== run) return;
+			const tracked = this._activeRlmChildRuns.get(run.id) === run;
+			// Cancellation admitted while runtime construction was blocked must stop
+			// the child even when the run already left _activeRlmChildRuns (a cascade
+			// that settled it, or an abort race): map membership is not evidence that
+			// anything ever reached this child. The wiring below stays behind the
+			// tracked guard, so a late publication cannot revive a settled run's
+			// accounting (session/abort/unsubscribe) and hide a live child session
+			// from its parent.
+			if (run.status === "cancelled") this._abortRlmChildSessionOnPublish(run, child);
+			if (!tracked) return;
 			run.session = child;
 			run.abort = () => void child.abort();
 			run.publication.resolve();
-			// Cancellation may have been admitted while runtime construction was
-			// blocked and run.abort was still a no-op.
-			if (run.status === "cancelled") run.abort();
 		};
 		const subagentOptions: CreateRlmSubagentRuntimeOptions = {
 			...this._createRlmSubagentRuntimeOptions({
@@ -11411,6 +12326,9 @@ export class AgentSession {
 		// retention, cancellation, and late-startup cleanup.
 		void (async () => {
 			let childRuntime: RlmSubagentRuntime | undefined;
+			// Hoisted out of the try: the terminal classification runs in both the
+			// success and the failure branch and needs the reply baseline either way.
+			let parentReplyCountBeforeRun = 0;
 			try {
 				childRuntime = await this._createRlmSubagentRuntime(subagentOptions);
 				const child = childRuntime.session;
@@ -11425,8 +12343,27 @@ export class AgentSession {
 						this._emit(event);
 						return;
 					}
+					if (event.type === "stall_warning") {
+						this._recordRlmChildStallEvent(run, child, "warn", event);
+						return;
+					}
+					if (event.type === "stall_abort") {
+						this._recordRlmChildStallEvent(run, child, "abort", event);
+						return;
+					}
+					if (event.type === "stall_unsettled") {
+						// P1-6: "the abort fired but the run never settled" must leave a
+						// mark on the parent side, or the kill is invisible and the
+						// terminal classifier has nothing to rank above "no reply".
+						run.error ??= "stall watchdog aborted the turn but it did not settle";
+						this._recordRlmChildStallEvent(run, child, "unsettled", event);
+						return;
+					}
 					if (event.type === "agent_start") {
 						run.activity = { kind: "waiting" };
+						// A recovered child is no longer stalled; the forensic record stays
+						// so the terminal classification can still see an unsettled abort.
+						run.stall = undefined;
 						emitChildUpdate();
 					} else if (event.type === "agent_end") {
 						run.activity = undefined;
@@ -11502,7 +12439,7 @@ export class AgentSession {
 					timestamp: Date.now(),
 				};
 				throwIfCancelled();
-				const parentReplyCountBeforeRun = child._parentReplyCount;
+				parentReplyCountBeforeRun = child._parentReplyCount;
 				await child.promptAndWait(content, {
 					expandPromptTemplates: false,
 					source: "extension",
@@ -11519,34 +12456,16 @@ export class AgentSession {
 				run.durationMs = Date.now() - startedAt;
 				run.activity = undefined;
 				emitChildUpdate();
-				if (
-					!run.detachedDeletion &&
-					!run.suppressTerminalNotice &&
-					child._parentReplyCount === parentReplyCountBeforeRun
-				) {
-					// A turn that ends with a graceful error message resolves promptAndWait,
-					// so it must be surfaced here or the parent never learns the task failed.
-					const lastAssistant = this._findLastAssistantInMessages(child.messages);
-					if (lastAssistant?.stopReason === "error") {
-						await deliverTerminalMessageToParent(
-							createRlmChildFailureMessage({
-								childId: run.id,
-								sessionName,
-								error: lastAssistant.errorMessage ?? "Assistant turn failed",
-							}),
-						);
-					} else {
-						const lastAssistantText = child.getLastAssistantText();
-						await deliverTerminalMessageToParent(
-							createRlmChildTerminalNoticeMessage({
-								kind: "completed_without_reply",
-								childId: run.id,
-								sessionName,
-								lastAssistantTextPreview: lastAssistantText ? compactRlmText(lastAssistantText) : undefined,
-							}),
-						);
-					}
-				}
+				// A turn that ends with a graceful error message resolves promptAndWait,
+				// and so does a turn the stall watchdog aborted: both must be classified
+				// here or the parent never learns the task failed.
+				await this._deliverRlmChildTerminalOutcome({
+					run,
+					child,
+					sessionName,
+					parentReplyCountBeforeRun,
+					deliver: deliverTerminalMessageToParent,
+				});
 				if (!this.registerRlmChildSession(run.id, child) && !run.detachedDeletion) {
 					if (childRuntime && this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
 						await this._subagentRuntimeHost
@@ -11581,26 +12500,13 @@ export class AgentSession {
 				} else {
 					emitChildUpdate();
 				}
-				if (!run.detachedDeletion && !run.suppressTerminalNotice) {
-					if (run.status === "error") {
-						await deliverTerminalMessageToParent(
-							createRlmChildFailureMessage({
-								childId: run.id,
-								sessionName,
-								error: run.error ?? "unknown error",
-							}),
-						);
-					} else if (run.status === "cancelled") {
-						await deliverTerminalMessageToParent(
-							createRlmChildTerminalNoticeMessage({
-								kind: "cancelled",
-								childId: run.id,
-								sessionName,
-								reason: run.error,
-							}),
-						);
-					}
-				}
+				await this._deliverRlmChildTerminalOutcome({
+					run,
+					child: childSession ?? childRuntime?.session,
+					sessionName,
+					parentReplyCountBeforeRun,
+					deliver: deliverTerminalMessageToParent,
+				});
 				if (!run.detachedDeletion && childSession && this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
 					try {
 						await this._subagentRuntimeHost.releaseRlmSubagentRuntime(
@@ -11899,10 +12805,11 @@ export class AgentSession {
 		});
 		const target = parent.name.trim() || parent.id;
 		let timer: ReturnType<typeof setTimeout> | undefined;
+		let receipt: AgentSessionMessageReceipt | undefined;
 		try {
 			// A hung send on a broken transport must not freeze the event queue of a
 			// session whose turn already failed.
-			await Promise.race([
+			receipt = await Promise.race([
 				controller.sendAgentMessage({ target, message: notice, receiverRole: "parent" }),
 				new Promise<never>((_, reject) => {
 					timer = setTimeout(() => reject(new Error("Subagent terminal-error notice timed out")), 10_000);
@@ -11913,8 +12820,23 @@ export class AgentSession {
 		} finally {
 			if (timer !== undefined) clearTimeout(timer);
 		}
+		// B1: a queued receipt is not a delivered notice. Counting it would tell the
+		// parent's terminal gate "the child already reported" while the report still
+		// sits in a queue that may never drain, leaving both sides silent.
+		if (receipt?.deliveryStatus !== "delivered") {
+			sessionLog.info("subagent terminal-error notice was queued, not delivered", {
+				sessionId: this.sessionId,
+				target,
+				deliveryStatus: receipt?.deliveryStatus,
+			});
+			return;
+		}
 		this._repliedToParentSinceTask = true;
 		this._parentReplyCount += 1;
+		// The parent has now been told through agent_message: the synthesized
+		// terminal notice for the same run must not repeat it (C7 double-send
+		// suppression reads this flag).
+		this._terminalErrorNoticeDelivered = true;
 	}
 
 	private async _handleRetryableError(

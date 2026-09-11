@@ -229,6 +229,7 @@ import { SlashCommandResultMessageComponent } from "./components/slash-command-r
 import {
 	countDirectSubagentStatuses,
 	countRosterSubagentStatuses,
+	formatSubagentStallMarker,
 	SubagentSummaryLine,
 } from "./components/subagent-summary-line.js";
 import { ThinkingSelectorComponent } from "./components/thinking-selector.js";
@@ -5861,11 +5862,26 @@ export class InteractiveMode {
 				this.showError(`Session persistence failed: ${event.error}`);
 				break;
 
+			case "rlm_terminal_notice_abandoned":
+				// A child's terminal report could not be delivered through the queue.
+				// Failure notices were written into the transcript instead of dropped;
+				// routine notices were abandoned so the session stays evictable.
+				this.showError(
+					`Subagent terminal notices could not be delivered: ${event.persistedToTranscript} written to the transcript, ${event.abandoned} abandoned after ${Math.round(event.deferredMs / 1000)}s.`,
+				);
+				break;
+
 			case "stall_warning":
 				this.showError(event.message);
 				break;
 
 			case "stall_abort":
+				this.showError(event.message);
+				break;
+
+			case "stall_unsettled":
+				// "Killed but still running" is a different failure than "looks
+				// stuck": it needs the same loud channel, not a warning color.
 				this.showError(event.message);
 				break;
 
@@ -6103,6 +6119,15 @@ export class InteractiveMode {
 					})
 				: countDirectSubagentStatuses(this.subagentSnapshots.values(), this.rlmNodeId),
 		);
+		// A stalled child still counts as running, so the stall has to be visible on
+		// its own line or a wedged subagent reads as progress.
+		const stallMarkers: string[] = [];
+		for (const child of this.subagentSnapshots.values()) {
+			if (child.parentId !== this.rlmNodeId || child.status === "cancelled") continue;
+			const marker = formatSubagentStallMarker(child);
+			if (marker) stallMarkers.push(`${child.sessionName ?? child.label}: ${marker}`);
+		}
+		this.subagentSummaryLine.setStallMarkers(stallMarkers);
 		if (!this.subagentSummaryLine.isSelectable() && this.subagentSummaryLine.focused) this.focusEditor();
 	}
 

@@ -2,7 +2,7 @@ import { statSync } from "node:fs";
 import { resolve } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { compactRlmText } from "../../core/agent-session.js";
+import { compactRlmText, type RlmChildStallState } from "../../core/agent-session.js";
 import type { AgentSessionRuntimeDiagnostic } from "../../core/agent-session-services.js";
 import { type AgentCronJob, isHeartbeatCronJob } from "../../core/cron-jobs.js";
 import type { SessionActionSnapshot } from "../../core/session-action-store.js";
@@ -87,6 +87,13 @@ export interface SessionSummary {
 	statusLabel?: "queued" | "recovering" | "failed";
 	/** Set while the owning worker has been silent past the staleness threshold. */
 	lastHeardFromAt?: string;
+	/**
+	 * Live stall-watchdog marker for this session (gated by the
+	 * `rlm_child_stall_activity` capability). Lets the roster show a wedged
+	 * subagent that lives in another worker, where the parent's own child
+	 * snapshot cannot see the watchdog fire.
+	 */
+	stall?: RlmChildStallState;
 	/** Resident session-host process state, populated by the global supervisor. */
 	workerState?: "starting" | "ready" | "recovering" | "stopping" | "failed";
 	/** Diagnostic process identity; clients must not use this as a stable session identifier. */
@@ -271,6 +278,7 @@ export function summaryForActiveSession(
 		isCompacting: session.isCompacting,
 		isBashRunning: session.isBashRunning,
 		hasRunningRlmChildren: session.hasRunningRlmChildren(),
+		stall: session.stallState,
 		usage: session.getOwnUsageSummary?.(),
 		isRunningTools: session.isStreaming && session.state.pendingToolCalls.size > 0,
 		attachedClients: activeSession.clients.size,

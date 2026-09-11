@@ -22,6 +22,8 @@ export const SUBAGENT_TERMINAL_ERROR_SUMMARY_MAX_CHARS = 500;
 /** Legacy daemon wire input accepted and ignored for compatibility. */
 export type AgentSessionMessageDeliveryMode = "auto" | "steer" | "follow_up";
 export type AgentSessionMessageDeliveryStatus = "delivered" | "queued";
+/** Why a send was queued instead of delivered; reported back to the sender. */
+export type AgentMessageQueuedReason = "target_suspended" | "target_busy";
 export type AgentSessionMessageRuntimeKind = "top-level" | "subagent";
 export type AgentFamilyStatus = "running" | "idle" | "inactive";
 export type AgentFamilyRelationship = "parent" | "sibling" | "child";
@@ -150,6 +152,18 @@ export interface AgentSessionMessageReceipt {
 	deliveredAt?: string;
 	/** Present only for queued messages: when it was placed behind current work. */
 	queuedAt?: string;
+	/** Present only for queued messages: why it could not be delivered now. */
+	queuedReason?: AgentMessageQueuedReason;
+	/** Present only for queued messages: 1-based position in the target's queue. */
+	queuedPosition?: number;
+	/** How many of this sender's messages to this target are already queued and unread. */
+	queuedRepeatCount?: number;
+	/**
+	 * Actionable consequence text for a queued delivery: what "queued" costs, how
+	 * many retries are useful, and what to do instead. A bare `queued` status reads
+	 * as success to a model that then waits forever.
+	 */
+	queuedNotice?: string;
 	deliveryMode?: "steer";
 }
 
@@ -387,13 +401,34 @@ export function assertDirectAgentMessageTarget(target: string): string {
 	return normalized;
 }
 
+/**
+ * Whether an outbound agent-message receipt counts as "this subagent replied to
+ * its parent" (B1).
+ *
+ * A `queued` receipt must not count: the parent has not seen anything yet, and
+ * treating an undelivered reply as delivered makes the parent's terminal gate
+ * skip its own notice - the child believes it answered, the parent never hears
+ * anything, and both stay silent.
+ */
+export function countsAsDeliveredParentReply(input: {
+	rlmDepth: number;
+	deliveryStatus: AgentSessionMessageDeliveryStatus;
+	addressedParent: boolean;
+}): boolean {
+	return input.rlmDepth > 0 && input.deliveryStatus === "delivered" && input.addressedParent;
+}
+
 export function assertAgentMessageQueueCapacity(
 	unfinishedActionCount: number,
 	maxPending = DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
 ): void {
 	if (unfinishedActionCount >= maxPending) {
+		// Actionable on purpose (L10.2): the sender must be able to tell that the
+		// message was neither queued nor lost, and what to do instead of hammering.
 		throw new Error(
-			`Target session has too many pending messages: ${unfinishedActionCount} unfinished, limit is ${maxPending}`,
+			`Target session has too many pending messages: ${unfinishedActionCount} unfinished, limit is ${maxPending}. ` +
+				"This message was NOT queued and NOT delivered - nothing was lost on your side. Do not retry immediately: " +
+				"wait for the target to drain its queue, or write your result to a file and end the turn.",
 		);
 	}
 }
@@ -480,10 +515,18 @@ export function startsAgentRun(message: AgentMessage): boolean {
 	);
 }
 
+export interface AgentSessionMessageQueuedFacts {
+	reason?: AgentMessageQueuedReason;
+	position?: number;
+	repeatCount?: number;
+	notice?: string;
+}
+
 export function createAgentSessionMessageReceipt(
 	payload: AgentSessionMessagePayload,
 	status: AgentSessionMessageDeliveryStatus,
 	at = new Date().toISOString(),
+	queued?: AgentSessionMessageQueuedFacts,
 ): AgentSessionMessageReceipt {
 	return {
 		id: payload.id,
@@ -493,8 +536,74 @@ export function createAgentSessionMessageReceipt(
 		message: payload.message,
 		deliveryStatus: status,
 		...(status === "delivered" ? { deliveredAt: at } : { queuedAt: at }),
+		...(status === "queued" && queued?.reason ? { queuedReason: queued.reason } : {}),
+		...(status === "queued" && queued?.position !== undefined ? { queuedPosition: queued.position } : {}),
+		...(status === "queued" && queued?.repeatCount !== undefined ? { queuedRepeatCount: queued.repeatCount } : {}),
+		...(status === "queued" && queued?.notice ? { queuedNotice: queued.notice } : {}),
 		deliveryMode: "steer",
 	};
+}
+
+/**
+ * Consequence-bearing text for a queued send (M5). States that nothing was
+ * delivered, how full the target's queue is, and - from the second queued send on -
+ * that the previous one is still unread, which is the fact that should stop a model
+ * from looping.
+ */
+export function formatAgentMessageQueuedNotice(input: {
+	reason?: AgentMessageQueuedReason;
+	position?: number;
+	maxPending: number;
+	repeatCount: number;
+	previousQueuedSecondsAgo?: number;
+}): string {
+	const why =
+		input.reason === "target_suspended"
+			? "the target session is suspended (its turn was aborted), so nothing is reading right now"
+			: "the target session is busy with its current turn";
+	const position =
+		input.position !== undefined
+			? ` Position ${input.position}/${input.maxPending}.`
+			: ` Queue limit ${input.maxPending}.`;
+	const repeat =
+		input.repeatCount > 1
+			? ` This is the ${input.repeatCount}nd time in a row your message to this target ended up queued, and the earlier one is still unread${
+					input.previousQueuedSecondsAgo !== undefined ? ` (queued ${input.previousQueuedSecondsAgo}s ago)` : ""
+				}.`
+			: "";
+	return (
+		`Queued, NOT delivered:${" "}${why}.${position}${repeat}` +
+		" The message is not lost. Do not retry immediately - retrying only adds another copy and is refused once the queue is full." +
+		" If you need an answer from this target, write your result to a file and end the turn instead of waiting."
+	);
+}
+
+/**
+ * Whether a failed send is worth retrying at all. Used to stop the
+ * "retryable error x host vouch x model persistence" loop: after a bounded number
+ * of consecutive retryable failures for the same target the caller must turn the
+ * error terminal instead of offering another retry.
+ */
+export function isRetryableAgentMessageSendError(message: string): boolean {
+	return (
+		/too many pending messages/i.test(message) ||
+		/rate limit exceeded/i.test(message) ||
+		/queued session input is suspended/i.test(message) ||
+		/Agent message was not accepted/i.test(message)
+	);
+}
+
+/** Terminal replacement text once a sender has burned its retry budget (M6b). */
+export function formatAgentMessageRetryExhaustedError(input: {
+	target: string;
+	attempts: number;
+	lastError: string;
+}): string {
+	return (
+		`Agent messaging to ${input.target} failed ${input.attempts} times in a row (last: ${input.lastError}). ` +
+		"This error is terminal, not retryable: do not call agent_message.send again for this target in this turn. " +
+		"Nothing was delivered. Write the result to a file or end the turn so the recipient can pick it up later."
+	);
 }
 
 export interface AgentSessionMessageRateLimiterOptions {

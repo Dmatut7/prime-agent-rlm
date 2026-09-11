@@ -545,8 +545,20 @@ export interface AgentConnectionExtensionUiRequest {
 export type AgentConnectionRlmChildAgentStatus = "queued" | "running" | "done" | "error" | "cancelled";
 
 export interface AgentConnectionRlmChildAgentActivity {
-	kind: "waiting" | "writing" | "executing";
+	kind: "waiting" | "writing" | "executing" | "stalled";
 	toolName?: string;
+}
+
+/**
+ * Stall facts for a child whose watchdog fired. Wire addition gated by the
+ * `rlm_child_stall_activity` server capability; clients that do not see the
+ * capability downgrade `stalled` activity to `waiting` and drop this field.
+ */
+export interface AgentConnectionRlmChildStallState {
+	silentMs: number;
+	thresholdMs: number;
+	inFlightTools: string[];
+	unsettled?: boolean;
 }
 
 export interface AgentConnectionRlmChildAgentSnapshot {
@@ -569,6 +581,7 @@ export interface AgentConnectionRlmChildAgentSnapshot {
 	sessionDir: string;
 	activity?: AgentConnectionRlmChildAgentActivity;
 	error?: string;
+	stall?: AgentConnectionRlmChildStallState;
 }
 
 export type AgentConnectionSessionEvent =
@@ -615,6 +628,12 @@ export type AgentConnectionSessionEvent =
 	| { type: "refine_failed"; error: string }
 	| { type: "session_persist_failed"; error: string }
 	| {
+			type: "rlm_terminal_notice_abandoned";
+			abandoned: number;
+			persistedToTranscript: number;
+			deferredMs: number;
+	  }
+	| {
 			type: "stall_warning";
 			message: string;
 			silentMs: number;
@@ -623,6 +642,13 @@ export type AgentConnectionSessionEvent =
 	  }
 	| {
 			type: "stall_abort";
+			message: string;
+			silentMs: number;
+			thresholdMs: number;
+			diagnostics: StallDiagnostics;
+	  }
+	| {
+			type: "stall_unsettled";
 			message: string;
 			silentMs: number;
 			thresholdMs: number;

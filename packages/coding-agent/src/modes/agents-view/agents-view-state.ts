@@ -1079,6 +1079,15 @@ function getSessionStatusLabel(summary: SessionSummary, heartbeat?: UnifiedSessi
 	if (summary.workerState !== undefined && summary.workerState !== "ready") {
 		return summary.workerState;
 	}
+	// A stall marker outranks the busy labels: the row is silent rather than
+	// progressing, and "thinking" would hide exactly the wedge the watchdog
+	// reported (P1-6 roster trace).
+	if (summary.stall) {
+		const silentMs = summary.stall.silentMs;
+		const silent =
+			silentMs >= 60_000 ? `${Math.round(silentMs / 60_000)}m` : `${Math.max(1, Math.round(silentMs / 1000))}s`;
+		return summary.stall.unsettled ? `stalled ${silent}, abort did not settle` : `stalled ${silent}`;
+	}
 	if (summary.isCompacting) {
 		return "compacting";
 	}

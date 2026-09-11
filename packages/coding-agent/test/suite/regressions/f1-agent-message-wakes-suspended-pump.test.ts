@@ -1,20 +1,30 @@
 /**
- * F1 regression: an agent message queued into a session whose input pump was
- * suspended by requestAbort must wake the pump. Before the fix,
- * queueAgentMessagePrompt went through _queuePreparedPrompt without
- * resumeIfIdle, so the action only woke on a turn boundary or external resume
- * and nothing ever resumed the pump: the queued message sat unprocessed and
- * the child session silently stalled. The TUI steer/follow-up/heartbeat paths
- * already passed resumeIfIdle: true; only the agent-message path lacked it.
+ * F1 regression, revised by P0-3a/P0-3b.
+ *
+ * Original contract: an agent message queued into a session whose input pump was
+ * suspended by requestAbort had to wake the pump, because nothing else ever
+ * resumed it and the child silently stalled.
+ *
+ * Revised contract (C2 甲变体 + B3): queueing no longer starts a turn by itself -
+ * an Esc has to keep meaning "stop" - but the message is still admitted, still
+ * visible in the queue, still durable, and still delivered by the next wake
+ * (user input, attach, resumeQueuedWork, or the aggregated failure wake). The
+ * pre-fix bug (stranded forever, nothing resumes the pump) stays fixed: this file
+ * pins both halves - "not refused" and "not stranded" - plus the settings lever
+ * that restores the old wake-on-queue behaviour.
+ *
+ * The update-restart fence is unchanged: queued work must survive into the
+ * restart manifest instead of starting a turn during teardown.
  */
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	AGENT_MESSAGE_SOURCE,
 	type AgentSessionMessagePayload,
 	createAgentSessionMessage,
 	isAgentSessionMessage,
 } from "../../../src/core/agent-messages.js";
+import { SessionInputSuspendedError } from "../../../src/core/prompt-admission.js";
 import { createHarness, getAssistantTexts, getUserTexts, type Harness } from "../harness.js";
 
 function createPayload(id: string, message: string): AgentSessionMessagePayload {
@@ -34,7 +44,7 @@ function createPayload(id: string, message: string): AgentSessionMessagePayload 
 	};
 }
 
-describe("F1 agent message wakes a suspended session input pump", () => {
+describe("F1 agent message into a suspended session input pump", () => {
 	const harnesses: Harness[] = [];
 
 	afterEach(() => {
@@ -43,22 +53,57 @@ describe("F1 agent message wakes a suspended session input pump", () => {
 		}
 	});
 
-	it("resumes the suspended pump and consumes the queued agent message after abort", async () => {
+	it("queues instead of refusing when suspended with an empty queue, and drains on the next wake", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("queued done"), fauxAssistantMessage("agent message done")]);
-
-		// Visible queued work that survives requestAbort; its external_resume wake
-		// never schedules the pump on its own.
-		await harness.session.followUp("queued before abort");
-		expect(harness.session.getFollowUpMessages()).toEqual(["queued before abort"]);
-
+		harness.setResponses([fauxAssistantMessage("agent message done")]);
 		harness.session.requestAbort();
 		expect(harness.session.isQueuedWorkSuspended).toBe(true);
 
-		// Deliver the agent message the same way daemon-mode does:
-		// queueIfBusy + streamingBehavior takes the queue branch while the pump is
-		// suspended and the session still owns unfinished work.
+		// Red at HEAD: this threw "Cannot admit a session action while queued session
+		// input is suspended.", which read to the sending model as "cannot be sent".
+		const message = createAgentSessionMessage(createPayload("agentmsg_f1_idle", "direct delivery"));
+		let queued: boolean | undefined;
+		let queuedReason: string | undefined;
+		await harness.session.acceptAgentMessagePrompt(message.content, {
+			expandPromptTemplates: false,
+			streamingBehavior: "steer",
+			queueIfBusy: true,
+			customMessage: message,
+			preflightResult: (success, didQueue, reason) => {
+				expect(success).toBe(true);
+				queued = didQueue === true;
+				queuedReason = reason;
+			},
+		});
+
+		expect(queued).toBe(true);
+		expect(queuedReason).toBe("target_suspended");
+		// Esc still means stop: no turn was started by the queueing itself.
+		expect(harness.session.isQueuedWorkSuspended).toBe(true);
+		expect(getAssistantTexts(harness)).toEqual([]);
+		// ...and the message is not stranded: it is visible in the queue.
+		expect(harness.session.getSteeringMessages()).toEqual([message.content]);
+
+		// The next wake delivers it, which is the half F1 was originally about.
+		expect(harness.session.resumeQueuedWork()).toBe(true);
+		await vi.waitFor(() => expect(getAssistantTexts(harness)).toEqual(["agent message done"]), {
+			timeout: 5_000,
+			interval: 20,
+		});
+		expect(harness.session.messages.some((item) => isAgentSessionMessage(item) && item === message)).toBe(true);
+	});
+
+	it("still wakes the pump on queue when the wake policy is 'always'", async () => {
+		const harness = await createHarness({ settings: { subagentWake: { policy: "always" } } });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("queued done"), fauxAssistantMessage("agent message done")]);
+
+		await harness.session.followUp("queued before abort");
+		expect(harness.session.getFollowUpMessages()).toEqual(["queued before abort"]);
+		harness.session.requestAbort();
+		expect(harness.session.isQueuedWorkSuspended).toBe(true);
+
 		const message = createAgentSessionMessage(createPayload("agentmsg_f1_wake", "wake the pump"));
 		await harness.session.acceptAgentMessagePrompt(message.content, {
 			expandPromptTemplates: false,
@@ -67,26 +112,18 @@ describe("F1 agent message wakes a suspended session input pump", () => {
 			customMessage: message,
 		});
 
-		// The queue admission must lift the suspension synchronously.
+		// The rollback lever: one settings key restores the pre-P0-3b behaviour.
 		expect(harness.session.isQueuedWorkSuspended).toBe(false);
-		const idle = await Promise.race([
-			harness.session.waitForIdle().then(() => ({ ok: true as const })),
-			new Promise<{ ok: false; error: Error }>((resolve) =>
-				setTimeout(
-					() => resolve({ ok: false, error: new Error("pump stayed suspended; agent message stranded") }),
-					2000,
-				),
-			),
-		]);
-		expect(idle).toEqual({ ok: true });
+		await vi.waitFor(() => expect(getAssistantTexts(harness)).toEqual(["queued done", "agent message done"]), {
+			timeout: 5_000,
+			interval: 20,
+		});
 		expect(harness.session.queuedActionCount).toBe(0);
 		expect(getUserTexts(harness)).toContain("queued before abort");
-		expect(harness.session.messages.some((item) => isAgentSessionMessage(item) && item === message)).toBe(true);
-		expect(getAssistantTexts(harness)).toEqual(["queued done", "agent message done"]);
 	});
 
 	it("does not break the update-restart fence when an agent message is queued", async () => {
-		const harness = await createHarness();
+		const harness = await createHarness({ settings: { subagentWake: { policy: "always" } } });
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("must not run"), fauxAssistantMessage("also must not run")]);
 
@@ -95,7 +132,8 @@ describe("F1 agent message wakes a suspended session input pump", () => {
 		expect(harness.session.isQueuedWorkSuspended).toBe(true);
 
 		// Queued work must survive into the restart manifest; an agent message may
-		// join the queue but must not lift the update-restart suspension.
+		// join the queue but must not lift the update-restart suspension - not even
+		// under the "always" policy, which is the mutation this case pins.
 		const message = createAgentSessionMessage(createPayload("agentmsg_f1_update_restart", "behind the fence"));
 		await harness.session.acceptAgentMessagePrompt(message.content, {
 			expandPromptTemplates: false,
@@ -111,24 +149,24 @@ describe("F1 agent message wakes a suspended session input pump", () => {
 		expect(harness.getPendingResponseCount()).toBe(2);
 	});
 
-	it("still rejects a direct agent message when suspended with an empty queue", async () => {
+	it("reports suspension as a typed, non-retryable-behind-the-fence error for non-queueing callers", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
-		harness.session.requestAbort();
-		expect(harness.session.isQueuedWorkSuspended).toBe(true);
+		harness.session.abortForUpdateRestart();
 
-		// No unfinished work: acceptAgentMessagePrompt falls through to _prompt with
-		// resumeIfIdle: false, which must keep failing loudly instead of silently
-		// restarting the aborted session.
-		const message = createAgentSessionMessage(createPayload("agentmsg_f1_idle", "direct delivery"));
-		await expect(
-			harness.session.acceptAgentMessagePrompt(message.content, {
-				expandPromptTemplates: false,
-				streamingBehavior: "steer",
-				queueIfBusy: true,
-				customMessage: message,
-			}),
-		).rejects.toThrow("queued session input is suspended");
-		expect(harness.session.isQueuedWorkSuspended).toBe(true);
+		// A caller that cannot queue (no streamingBehavior) still gets a hard error,
+		// but a typed one that says whether retrying could ever help.
+		const error = await harness.session
+			.acceptAgentMessagePrompt("direct delivery", { expandPromptTemplates: false })
+			.then(
+				() => undefined,
+				(thrown: unknown) => thrown,
+			);
+		expect(error).toBeInstanceOf(SessionInputSuspendedError);
+		if (!(error instanceof SessionInputSuspendedError)) throw new Error("unreachable");
+		expect(error.message).toContain("queued session input is suspended");
+		expect(error.suspendedForUpdateRestart).toBe(true);
+		expect(error.retryable).toBe(false);
+		expect(error.queuedActionCount).toBe(0);
 	});
 });

@@ -20,6 +20,8 @@ export interface PrimeAgentSubagentMeta {
 	depth?: number;
 	tokenCount?: number;
 	error?: string;
+	/** Present when the subagent's stall watchdog fired; `unsettled` means the abort did not stop it. */
+	stall?: { silentMs: number; thresholdMs: number; inFlightTools: string[]; unsettled?: boolean };
 }
 
 export interface PrimeAgentAutonomousMeta {
@@ -65,7 +67,8 @@ export interface PrimeAgentSessionPersistMeta {
 }
 
 export interface PrimeAgentStallWatchdogMeta {
-	status: "warning" | "aborted";
+	/** `unsettled`: the auto-abort fired but the run never produced agent_end. */
+	status: "warning" | "aborted" | "unsettled";
 	message: string;
 	silentMs: number;
 }
@@ -127,6 +130,8 @@ export interface PrimeAgentSessionMeta {
 	refinement?: PrimeAgentRefinementMeta;
 	sessionPersistence?: PrimeAgentSessionPersistMeta;
 	stallWatchdog?: PrimeAgentStallWatchdogMeta;
+	/** Undeliverable subagent terminal notices: how many were persisted vs abandoned. */
+	rlmTerminalNotices?: { abandoned: number; persistedToTranscript: number; deferredMs: number };
 	agentMessage?: PrimeAgentAgentMessageMeta;
 	sessionId?: string;
 	rlmDepth?: number;

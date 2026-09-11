@@ -246,6 +246,14 @@ export function acpUpdatesForSessionEvent(
 								model: event.child.model,
 								tokenCount: event.child.tokenCount,
 								error: event.child.error,
+								stall: event.child.stall
+									? {
+											silentMs: event.child.stall.silentMs,
+											thresholdMs: event.child.stall.thresholdMs,
+											inFlightTools: event.child.stall.inFlightTools,
+											unsettled: event.child.stall.unsettled,
+										}
+									: undefined,
 							},
 						],
 					}),
@@ -319,6 +327,30 @@ export function acpUpdatesForSessionEvent(
 					sessionUpdate: "session_info_update",
 					_meta: primeAgentMeta({
 						stallWatchdog: { status: "aborted", message: event.message, silentMs: event.silentMs },
+					}),
+				},
+			];
+
+		case "rlm_terminal_notice_abandoned":
+			return [
+				{
+					sessionUpdate: "session_info_update",
+					_meta: primeAgentMeta({
+						rlmTerminalNotices: {
+							abandoned: event.abandoned,
+							persistedToTranscript: event.persistedToTranscript,
+							deferredMs: event.deferredMs,
+						},
+					}),
+				},
+			];
+
+		case "stall_unsettled":
+			return [
+				{
+					sessionUpdate: "session_info_update",
+					_meta: primeAgentMeta({
+						stallWatchdog: { status: "unsettled", message: event.message, silentMs: event.silentMs },
 					}),
 				},
 			];

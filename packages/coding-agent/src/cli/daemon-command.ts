@@ -1480,10 +1480,20 @@ class DaemonAttachTerminal {
 			case "session_persist_failed":
 				this.writeLine(chalk.red(`Session persistence failed: ${event.error}`));
 				return;
+			case "rlm_terminal_notice_abandoned":
+				this.writeLine(
+					chalk.yellow(
+						`Subagent terminal notices undeliverable: ${event.persistedToTranscript} persisted, ${event.abandoned} abandoned.`,
+					),
+				);
+				return;
 			case "stall_warning":
 				this.writeLine(chalk.yellow(event.message));
 				return;
 			case "stall_abort":
+				this.writeLine(chalk.red(event.message));
+				return;
+			case "stall_unsettled":
 				this.writeLine(chalk.red(event.message));
 				return;
 			case "refine_complete":

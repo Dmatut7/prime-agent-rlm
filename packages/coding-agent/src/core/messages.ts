@@ -9,7 +9,10 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
 import type { AgentCronJob } from "./cron-jobs.js";
 import type { AppliedRefinementEdit, HarnessScope, RefinementResult } from "./refinement/refinement.js";
+import type { RlmChildFailureKind } from "./rlm-child-terminal.js";
 import { isSessionSlashCommandName, parseSessionSlashCommand, type SessionSlashCommand } from "./slash-commands.js";
+
+export type { RlmChildFailureKind };
 
 export const COMPACTION_SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary:
 
@@ -93,6 +96,20 @@ export interface RlmChildFailureDetails {
 	childId: string;
 	sessionName: string;
 	error: string;
+	/**
+	 * Terminal classification bucket, so "how many children were killed by the
+	 * watchdog" is countable instead of inferred from prose. Absent on transcripts
+	 * written before classification existed and on non-terminal failure reports.
+	 */
+	kind?: RlmChildFailureKind;
+	/** Watchdog facts behind a `stall_killed` failure. */
+	stall?: {
+		silentMs: number;
+		thresholdMs: number;
+		inFlightTools: readonly string[];
+		/** The abort fired but the run never settled. */
+		unsettled?: boolean;
+	};
 }
 
 export type RlmChildTerminalNoticeDetails =
@@ -113,10 +130,16 @@ export function createRlmChildFailureMessage(
 	details: RlmChildFailureDetails,
 	timestamp = Date.now(),
 ): CustomMessage<RlmChildFailureDetails> {
+	const stall = details.stall;
+	const stallSuffix = stall
+		? ` [silentMs=${stall.silentMs}, thresholdMs=${stall.thresholdMs}, in-flight tools: ${
+				stall.inFlightTools.length > 0 ? stall.inFlightTools.join(", ") : "none recorded"
+			}${stall.unsettled ? ", abort did not settle" : ""}]`
+		: "";
 	return {
 		role: "custom",
 		customType: RLM_CHILD_FAILURE_CUSTOM_TYPE,
-		content: `RLM child ${details.sessionName} (${details.childId}) failed: ${details.error}`,
+		content: `RLM child ${details.sessionName} (${details.childId}) failed: ${details.error}${stallSuffix}`,
 		display: true,
 		details,
 		timestamp,

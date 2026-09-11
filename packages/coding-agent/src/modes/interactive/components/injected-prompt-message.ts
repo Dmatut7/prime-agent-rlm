@@ -66,6 +66,16 @@ function goalLabel(details: GoalContextDetails | undefined): string {
 	}
 }
 
+/** Error-colored header label for a child failure notice, or undefined for routine notices. */
+function rlmChildFailureLabel(message: InjectedPromptMessage): string | undefined {
+	if (message.customType !== RLM_CHILD_FAILURE_CUSTOM_TYPE) return undefined;
+	const details = message.details as RlmChildFailureDetails | undefined;
+	const kind = details?.kind;
+	if (!kind) return "RLM child failed";
+	const label = kind === "stall_killed" ? "killed by stall watchdog" : kind.replace("_", " ");
+	return `RLM child failed (${label})`;
+}
+
 function compactHeartbeatSchedule(schedule: string | undefined): string {
 	const trimmed = schedule?.trim();
 	if (!trimmed) {
@@ -135,6 +145,11 @@ export class InjectedPromptMessageComponent extends Container {
 			this.message.customType === RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE
 		) {
 			const hint = this.expanded ? "" : ` ${expandCollapseHint("app.tools.expand", false)}`;
+			const failure = rlmChildFailureLabel(this.message);
+			// Failure kinds (stall_killed/aborted/error) are the parent's only signal
+			// that a child died; rendering them in the same muted color as a routine
+			// "completed without reply" notice hides exactly the case that matters.
+			if (failure) return theme.fg("error", failure) + theme.fg("dim", hint);
 			return theme.fg("muted", "RLM child status") + theme.fg("dim", hint);
 		}
 

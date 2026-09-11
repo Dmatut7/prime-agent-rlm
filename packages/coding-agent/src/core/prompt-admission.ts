@@ -1,3 +1,38 @@
+/**
+ * Session input admission is suspended: `requestAbort` parked the pump, or
+ * `abortForUpdateRestart` fenced it so queued work survives into the restart
+ * manifest. Typed so a caller can tell "parked, do not hammer it" from a
+ * permanent failure; the message keeps the historical substring that existing
+ * transcripts and tests match on.
+ */
+export class SessionInputSuspendedError extends Error {
+	/** False for the update-restart fence: retrying cannot succeed until restart. */
+	readonly retryable: boolean;
+	readonly queuedActionCount: number;
+	readonly suspendedForUpdateRestart: boolean;
+
+	constructor(options: {
+		queuedActionCount: number;
+		suspendedForUpdateRestart: boolean;
+		retryable?: boolean;
+	}) {
+		const retryable = options.retryable ?? !options.suspendedForUpdateRestart;
+		super(
+			`Cannot admit a session action while queued session input is suspended.` +
+				`${
+					options.suspendedForUpdateRestart
+						? " The suspension is an update-restart fence: queued work must survive into the restart manifest, so retrying cannot wake it."
+						: ""
+				}` +
+				` ${options.queuedActionCount} action(s) already queued; retryable=${retryable}.`,
+		);
+		this.name = "SessionInputSuspendedError";
+		this.retryable = retryable;
+		this.queuedActionCount = options.queuedActionCount;
+		this.suspendedForUpdateRestart = options.suspendedForUpdateRestart;
+	}
+}
+
 export class PromptAdmissionCancelledError extends Error {
 	constructor() {
 		super("Prompt admission was cancelled.");

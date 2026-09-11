@@ -79,6 +79,9 @@ export interface HarnessOptions {
 	autoRefineReviewer?: AutoRefineReviewer;
 	serializedRefine?: boolean;
 	initialGoal?: { objective: string; tokenBudget?: number };
+	stallAbortSettleGraceMs?: number;
+	rlmTerminalNoticeAbandonAfterMs?: number;
+	failureWakeQuietWindowMs?: number;
 }
 
 export interface Harness {
@@ -203,6 +206,9 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		autoRefineReviewer: options.autoRefineReviewer,
 		serializedRefine: options.serializedRefine,
 		initialGoal: options.initialGoal,
+		stallAbortSettleGraceMs: options.stallAbortSettleGraceMs,
+		rlmTerminalNoticeAbandonAfterMs: options.rlmTerminalNoticeAbandonAfterMs,
+		failureWakeQuietWindowMs: options.failureWakeQuietWindowMs,
 	});
 
 	const events: AgentSessionEvent[] = [];

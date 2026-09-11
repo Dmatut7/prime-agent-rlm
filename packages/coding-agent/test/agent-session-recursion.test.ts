@@ -3047,8 +3047,14 @@ describe("AgentSession rlm recursion", () => {
 
 		await expect(quiescence).rejects.toThrow("RLM quiescence wait cancelled");
 		expect(run.abandonedForQuiescence).toBe(true);
+		// P0-6 contract change: abortForUpdateRestart cascades over the whole subtree
+		// (the same walk hasRunningRlmChildren uses), so a grandchild retained under a
+		// child run is cancelled too instead of being left running where no kill path
+		// can reach it. Before the fix this asserted the grandchild stayed "running".
+		expect(root.hasRunningRlmChildren()).toBe(false);
+		expect(root.getRlmChildSnapshots().some((snapshot) => snapshot.status === "running")).toBe(false);
 		expect(root.getRlmChildSnapshots()).toEqual(
-			expect.arrayContaining([expect.objectContaining({ id: "live-grandchild", status: "running" })]),
+			expect.arrayContaining([expect.objectContaining({ id: "update-restart-parent", status: "cancelled" })]),
 		);
 
 		rootInternals._activeRlmChildRuns.clear();

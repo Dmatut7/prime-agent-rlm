@@ -6,6 +6,9 @@ import { classifySessionRosterStatus, type SessionSummary } from "../../daemon/d
 import { theme } from "../theme/theme.js";
 import { keyText } from "./keybinding-hints.js";
 
+/** Bound on stall marker lines so a wedged family cannot push the editor off screen. */
+const MAX_RENDERED_STALL_MARKERS = 3;
+
 export interface SubagentSummaryCounts {
 	total: number;
 	running: number;
@@ -15,6 +18,10 @@ export interface SubagentSummaryCounts {
 
 export function classifySubagentSnapshotStatus(child: AgentConnectionRlmChildAgentSnapshot): AgentRosterStatus {
 	// Activity implies a live session; the in-process connection never stamps activeSessionId.
+	// A `stalled` activity counts as both resident and busy on purpose: the child
+	// still holds an in-flight turn, so reporting it idle would advertise a wedged
+	// child as free capacity. The stall itself is surfaced by the row's own stall
+	// marker (child.stall), not by demoting the count.
 	const resident = child.activeSessionId !== undefined || child.activity !== undefined;
 	const busy = child.status === "running" || child.status === "queued" || child.activity !== undefined;
 	return classifyAgentStatus({
@@ -22,6 +29,22 @@ export function classifySubagentSnapshotStatus(child: AgentConnectionRlmChildAge
 		queuedChild: !resident && busy,
 		busy,
 	});
+}
+
+/** Whether a snapshot row carries a live stall marker (watchdog fired, not yet recovered). */
+export function isStalledSubagentSnapshot(child: AgentConnectionRlmChildAgentSnapshot): boolean {
+	return child.activity?.kind === "stalled" || child.stall !== undefined;
+}
+
+/** One-line stall marker for a subagent row: silence duration plus the tools still in flight. */
+export function formatSubagentStallMarker(child: AgentConnectionRlmChildAgentSnapshot): string | undefined {
+	const stall = child.stall;
+	if (!stall && child.activity?.kind !== "stalled") return undefined;
+	const silentSeconds = Math.max(1, Math.round((stall?.silentMs ?? 0) / 1000));
+	const tools = stall?.inFlightTools ?? [];
+	const toolText = tools.length > 0 ? `, in-flight: ${tools.join(", ")}` : "";
+	const unsettled = stall?.unsettled ? ", abort did not settle" : "";
+	return `stalled ${silentSeconds}s${toolText}${unsettled}`;
 }
 
 export function countDirectSubagentStatuses(
@@ -55,6 +78,7 @@ export function countRosterSubagentStatuses(
 export class SubagentSummaryLine implements Component, Focusable {
 	focused = false;
 	private counts: SubagentSummaryCounts = { total: 0, running: 0, idle: 0, inactive: 0 };
+	private stallMarkers: readonly string[] = [];
 	private openable = false;
 
 	onOpen?: () => void;
@@ -69,6 +93,15 @@ export class SubagentSummaryLine implements Component, Focusable {
 
 	setSubagentCounts(counts: SubagentSummaryCounts): void {
 		this.counts = counts;
+	}
+
+	/**
+	 * Per-child stall markers (see formatSubagentStallMarker). Rendered in the
+	 * error color below the counts box: a stalled child still counts as running,
+	 * so without this line a wedged subagent is indistinguishable from progress.
+	 */
+	setStallMarkers(markers: readonly string[]): void {
+		this.stallMarkers = markers;
 	}
 
 	setOpenable(openable: boolean): void {
@@ -135,6 +168,9 @@ export class SubagentSummaryLine implements Component, Focusable {
 			`${theme.fg("border", "│")}${content}${theme.fg("border", "│")}`,
 			theme.fg("border", `╰${"─".repeat(inner)}╯`),
 		);
+		for (const marker of this.stallMarkers.slice(0, MAX_RENDERED_STALL_MARKERS)) {
+			lines.push(theme.fg("error", truncateToWidth(`  ⚠ ${marker}`, safeWidth, "…")));
+		}
 		return lines;
 	}
 

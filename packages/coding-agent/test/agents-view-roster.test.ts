@@ -344,6 +344,7 @@ describe("supervisor roster subscription", () => {
 			await barClient.waitForHello();
 			const connection = new DaemonAgentConnection(barClient, "parent-active");
 			const setSubagentCounts = vi.fn();
+			const setStallMarkers = vi.fn();
 			const bar = Object.assign(Object.create(InteractiveMode.prototype), {
 				agentConnection: connection,
 				connectionState: { activeSessionId: "parent-active", sessionId: "parent" },
@@ -353,7 +354,7 @@ describe("supervisor roster subscription", () => {
 				]),
 				rlmNodeId: undefined,
 				heartbeatCatalog: [],
-				subagentSummaryLine: { setSubagentCounts, isSelectable: () => false, focused: false },
+				subagentSummaryLine: { setSubagentCounts, setStallMarkers, isSelectable: () => false, focused: false },
 				scheduleHeartbeatManagerRefresh: vi.fn(),
 				updateWorkingPulse: vi.fn(),
 				syncWorkingLoader: vi.fn(),
@@ -368,6 +369,9 @@ describe("supervisor roster subscription", () => {
 			try {
 				await bar.subscribeToRosterBar();
 				expect(setSubagentCounts).toHaveBeenLastCalledWith({ total: 1, running: 1, idle: 0, inactive: 0 });
+				// Roster rows carry no stall marker; the summary line must be told so
+				// explicitly or a previous stall would linger on the bar.
+				expect(setStallMarkers).toHaveBeenLastCalledWith([]);
 				bar.ui.requestRender.mockClear();
 
 				internals.writeRosterEntry(barChild("child-b", { sessionFile: "/tmp/child-b.jsonl" }));

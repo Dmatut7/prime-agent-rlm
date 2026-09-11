@@ -28,12 +28,14 @@ import {
 	type AgentFamilyCatalogEntry,
 	type AgentFamilyRelationship,
 	type AgentFamilyRosterResult,
+	type AgentMessageQueuedReason,
 	type AgentSessionMessageAgentSummary,
 	type AgentSessionMessageController,
 	type AgentSessionMessageDeliveryStatus,
 	type AgentSessionMessageEndpoint,
 	type AgentSessionMessageListResult,
 	type AgentSessionMessagePayload,
+	type AgentSessionMessageQueuedFacts,
 	AgentSessionMessageRateLimiter,
 	type AgentSessionMessageReceipt,
 	type AgentSessionMessageSender,
@@ -49,6 +51,7 @@ import {
 	DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
 	DEFAULT_AGENT_MESSAGE_RATE_LIMIT_CAPACITY,
 	DEFAULT_AGENT_MESSAGE_RATE_LIMIT_REFILL_MS,
+	formatAgentMessageQueuedNotice,
 	formatAgentSessionNameUnavailable,
 	normalizeAgentSessionMessage,
 	sessionNameReservationKey,
@@ -258,6 +261,9 @@ export type {
 export { defaultDaemonSocketPath } from "./daemon-socket.js";
 
 const structuredLog = getLogger("coding-agent.daemon");
+
+/** Cap on tracked sender→target queued runs (M5 repeat notice); oldest entries are dropped. */
+const AGENT_MESSAGE_QUEUED_RUN_TRACKING_LIMIT = 500;
 const WORKER_SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS = 1_000;
 const UPDATE_RESTART_PREPARE_TIMEOUT_MS = 90_000;
 const MAX_SESSION_SNAPSHOT_STABILIZATION_RETRIES = 3;
@@ -5989,8 +5995,14 @@ export class AgentDaemon {
 			target: this.createAgentSessionMessageEndpoint(targetState),
 		};
 		try {
-			const { status } = await this.acceptAgentSessionMessage(targetState, payload);
-			return createAgentSessionMessageReceipt(payload, status);
+			const outcome = await this.acceptAgentSessionMessage(targetState, payload);
+			// A queued send is a fact the sender must be able to act on: how full the
+			// target's queue is, and whether this is a repeat of an unread earlier send.
+			const queued =
+				outcome.status === "queued"
+					? this.recordQueuedAgentMessage(senderKey, targetState.activeSessionId, outcome)
+					: this.clearQueuedAgentMessage(senderKey, targetState.activeSessionId);
+			return createAgentSessionMessageReceipt(payload, outcome.status, undefined, queued);
 		} catch (error) {
 			this.agentMessageRateLimiter.refund(rateLimitKey);
 			throw error;
@@ -6048,13 +6060,71 @@ export class AgentDaemon {
 		}
 	}
 
+	/**
+	 * Consecutive queued-but-unread sends per sender→target pair. Bounded: an entry
+	 * is dropped as soon as a send to that target is delivered, and the map is capped
+	 * so a long-lived daemon cannot accumulate one row per historical pair.
+	 */
+	private readonly agentMessageQueuedRuns = new Map<string, { count: number; firstQueuedAt: number }>();
+
+	private recordQueuedAgentMessage(
+		senderKey: string,
+		targetActiveSessionId: string,
+		outcome: { queuedReason?: AgentMessageQueuedReason; queuedPosition?: number },
+	): AgentSessionMessageQueuedFacts {
+		const key = `${senderKey}->${targetActiveSessionId}`;
+		const previous = this.agentMessageQueuedRuns.get(key);
+		const count = (previous?.count ?? 0) + 1;
+		this.agentMessageQueuedRuns.delete(key);
+		this.agentMessageQueuedRuns.set(key, { count, firstQueuedAt: previous?.firstQueuedAt ?? Date.now() });
+		while (this.agentMessageQueuedRuns.size > AGENT_MESSAGE_QUEUED_RUN_TRACKING_LIMIT) {
+			const oldest = this.agentMessageQueuedRuns.keys().next();
+			if (oldest.done === true) break;
+			this.agentMessageQueuedRuns.delete(oldest.value);
+		}
+		if (count > 1) {
+			// Countable signature for "the same sender keeps queueing into a target
+			// that is not reading" (appendix B).
+			structuredLog.info("agent message queued repeat (same target)", {
+				senderKey,
+				targetActiveSessionId,
+				count,
+				queuedReason: outcome.queuedReason,
+			});
+		}
+		return {
+			reason: outcome.queuedReason,
+			position: outcome.queuedPosition,
+			repeatCount: count,
+			notice: formatAgentMessageQueuedNotice({
+				reason: outcome.queuedReason,
+				position: outcome.queuedPosition,
+				maxPending: DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
+				repeatCount: count,
+				previousQueuedSecondsAgo: previous
+					? Math.max(1, Math.round((Date.now() - previous.firstQueuedAt) / 1000))
+					: undefined,
+			}),
+		};
+	}
+
+	private clearQueuedAgentMessage(senderKey: string, targetActiveSessionId: string): undefined {
+		this.agentMessageQueuedRuns.delete(`${senderKey}->${targetActiveSessionId}`);
+		return undefined;
+	}
+
 	private async acceptAgentSessionMessage(
 		targetState: ActiveSessionState,
 		payload: AgentSessionMessagePayload,
-	): Promise<{ status: AgentSessionMessageDeliveryStatus }> {
+	): Promise<{
+		status: AgentSessionMessageDeliveryStatus;
+		queuedReason?: AgentMessageQueuedReason;
+		queuedPosition?: number;
+	}> {
 		const message = createAgentSessionMessage(payload);
 		let preflightFailed = false;
 		let preflightQueued = false;
+		let queuedReason: AgentMessageQueuedReason | undefined;
 		await targetState.runtime.session.acceptAgentMessagePrompt(message.content, {
 			expandPromptTemplates: false,
 			streamingBehavior: "steer",
@@ -6074,15 +6144,21 @@ export class AgentDaemon {
 					throw new Error("Target session changed before agent message delivery");
 				}
 			},
-			preflightResult: (didSucceed, didQueue) => {
+			preflightResult: (didSucceed, didQueue, reason) => {
 				preflightFailed = !didSucceed;
 				preflightQueued = didSucceed && didQueue === true;
+				if (preflightQueued) queuedReason = reason;
 			},
 		});
 		if (preflightFailed) {
 			throw new Error("Agent message was not accepted");
 		}
-		return { status: preflightQueued ? "queued" : "delivered" };
+		if (!preflightQueued) return { status: "delivered" };
+		return {
+			status: "queued",
+			queuedReason,
+			queuedPosition: targetState.runtime.session.unfinishedActionCount,
+		};
 	}
 
 	private detachClientFromSession(client: DaemonSocketClient, state: ActiveSessionState): void {
