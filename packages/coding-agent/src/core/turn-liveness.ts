@@ -31,7 +31,7 @@
 import { getLogger } from "@earendil-works/pi-ai";
 import type { KernelLivenessSample, KernelRevivalVouch } from "./kernel/shared.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV, readActiveOrphanProcesses } from "./orphan-process-journal.js";
-import { STALL_KERNEL_REASONS, STALL_VOUCH_REASONS } from "./stall-watchdog.js";
+import { STALL_KERNEL_REASONS, STALL_VOUCH_LIVENESS_BUDGET_MS, STALL_VOUCH_REASONS } from "./stall-watchdog.js";
 
 const livenessLog = getLogger("coding-agent.turn-liveness");
 
@@ -80,15 +80,27 @@ export const DEFAULT_REVIVAL_VOUCH_MAX_AGE_MS = 10 * 60 * 1000;
  */
 export const KERNEL_HEARTBEAT_MIN_PROTOCOL = 4;
 /**
- * A degraded journal read is only trusted for this long; after that it must be re-read.
+ * A degraded journal read is trusted until this long after the **first** read of the arm cycle.
  *
- * Fifteen minutes, i.e. about the pre-exemption rescue window: the fallback exists so a kernel
- * that stopped reporting does not lose the vouch entirely, not so a file read from long ago can
- * keep excusing silence indefinitely. It has to outlive one abort re-check interval (a warn
- * window), or it expires exactly between the two samplings that matter - the warn stage that read
- * it and the abort check that would have used it.
+ * Two invariants, both load bearing (A1):
+ *
+ * - It must exceed the budget the degraded vouch can buy. The lifetime is a hard deadline, not a
+ *   rolling one - a re-read never extends it - so the budget is what ends the deferral and the kill
+ *   reports "the exemption was spent" rather than "the evidence blinked". A lifetime shorter than
+ *   the budget makes the evidence blink first, and a blink observed by a touch releases the accrued
+ *   budget, which is how a renewed exemption ran forever.
+ * - It must outlive one abort re-check interval (a warn window), or it expires exactly between the
+ *   two samplings that matter: the warn stage that read it and the abort check that would use it.
+ *
+ * Two liveness budgets (40 minutes) satisfies both with room for any touch cadence below the abort
+ * threshold to observe the exhaustion while the facts are still valid.
  */
-export const DEFAULT_DEGRADED_FACTS_MAX_AGE_MS = 15 * 60 * 1000;
+export const DEFAULT_DEGRADED_FACTS_MAX_AGE_MS = 2 * STALL_VOUCH_LIVENESS_BUDGET_MS;
+/**
+ * Minimum gap between two journal reads. A re-read exists so a dead orphan stops vouching
+ * (a downgrade), not to refresh anything, so the gap is a cost bound rather than a semantic one.
+ */
+export const DEFAULT_DEGRADED_REFRESH_MIN_GAP_MS = 60 * 1000;
 /** Heartbeat staleness, in units of the kernel's own reported interval. */
 export const DEFAULT_STALE_AFTER_INTERVALS = 3;
 /** Fallback interval when a sample carries none (it always does; this only keeps the math total). */
@@ -143,8 +155,14 @@ export interface TurnLivenessOptions {
 	 * (the settings rollback lever) makes it unbounded again.
 	 */
 	revivalVouchMaxAgeMs?: number | (() => number);
-	/** Lifetime of one degraded read. Default {@link DEFAULT_DEGRADED_FACTS_MAX_AGE_MS}. */
+	/**
+	 * Lifetime of the degraded facts, measured from the first read of the arm cycle.
+	 * Default {@link DEFAULT_DEGRADED_FACTS_MAX_AGE_MS}; must not be shorter than the budget the
+	 * degraded vouch buys (see that constant).
+	 */
 	degradedFactsMaxAgeMs?: number | (() => number);
+	/** Minimum gap between two journal reads. Default {@link DEFAULT_DEGRADED_REFRESH_MIN_GAP_MS}. */
+	degradedRefreshMinGapMs?: number | (() => number);
 	/** Staleness threshold in heartbeat intervals. Default {@link DEFAULT_STALE_AFTER_INTERVALS}. */
 	staleAfterIntervals?: number;
 	onEvent?: (event: TurnLivenessEvent) => void;
@@ -301,6 +319,10 @@ export function createTurnLiveness(options: TurnLivenessOptions): TurnLiveness {
 		const configured = options.degradedFactsMaxAgeMs ?? DEFAULT_DEGRADED_FACTS_MAX_AGE_MS;
 		return typeof configured === "function" ? configured() : configured;
 	};
+	const degradedRefreshMinGapMs = (): number => {
+		const configured = options.degradedRefreshMinGapMs ?? DEFAULT_DEGRADED_REFRESH_MIN_GAP_MS;
+		return typeof configured === "function" ? configured() : configured;
+	};
 	const staleAfterIntervals = options.staleAfterIntervals ?? DEFAULT_STALE_AFTER_INTERVALS;
 	const emit = (event: TurnLivenessEvent): void => {
 		if (options.onEvent) {
@@ -310,43 +332,55 @@ export function createTurnLiveness(options: TurnLivenessOptions): TurnLiveness {
 		livenessLog.info(`turn liveness: ${event.kind}`, { ...event });
 	};
 
-	let degraded: { liveBashHandles: number; readAt: number } | undefined;
+	let degraded: { liveBashHandles: number; readAt: number; lastAttemptAt: number } | undefined;
+	/**
+	 * When the degraded facts of this arm cycle became trustworthy, i.e. the deadline anchor. Set by
+	 * the first successful read and cleared only by `reset()`: no later read, and no failed one,
+	 * may move it, because a renewable deadline is no deadline at all (A1).
+	 */
+	let degradedFirstReadAt: number | undefined;
 	let degradedReads = 0;
 	let degradedEngagements = 0;
 
 	function refreshDegradedFacts(): void {
 		const at = now();
-		// Bounded by lifetime, not only by call site: a read whose result is still inside its TTL
-		// would add nothing, so the session can afford to refresh on a tool start as well as on a
-		// stall stage without turning the fallback into a polling loop.
-		if (degraded && at - degraded.readAt <= degradedFactsMaxAgeMs()) return;
+		// Past the deadline nothing can revive the facts this arm cycle, so do not even pay for the
+		// read: the deadline is anchored to the first successful read and never moves.
+		if (degradedFirstReadAt !== undefined && at - degradedFirstReadAt > degradedFactsMaxAgeMs()) return;
+		// Rate bound, not a usefulness bound: a re-read may *downgrade* the facts (an orphan that
+		// died must stop vouching), so it is skipped only for being too soon after the last attempt.
+		if (degraded && at - degraded.lastAttemptAt < degradedRefreshMinGapMs()) return;
 		const kernel = options.kernel();
 		const kernelPid = kernel?.kernelPid;
 		const result = readJournal(kernelPid);
 		degradedReads++;
 		if (result === undefined) {
-			// Nothing to read (no journal configured, no kernel pid yet). Not a failure, and not
-			// a fact: the previous read, if any, stays until it expires.
+			// Nothing to read (no journal configured, no kernel pid yet). Not a failure and not a
+			// fact; whatever was read before keeps its original deadline.
+			if (degraded) degraded = { ...degraded, lastAttemptAt: at };
 			return;
 		}
 		if ("error" in result) {
 			// B4: the fallback must not fail silently, or a stale heartbeat plus a broken journal
-			// reads exactly like "nothing is running".
+			// reads exactly like "nothing is running". The deadline anchor survives the failure, so
+			// a later successful read cannot use the error to buy a fresh lifetime.
 			degraded = undefined;
 			emit({
 				kind: "degraded_read_failed",
 				...(kernelPid === undefined ? {} : { kernelPid }),
 				reason: result.error,
-				at: now(),
+				at,
 			});
 			return;
 		}
-		degraded = { liveBashHandles: result.liveBashHandles, readAt: at };
+		const readAt = degradedFirstReadAt ?? at;
+		degradedFirstReadAt = readAt;
+		degraded = { liveBashHandles: result.liveBashHandles, readAt, lastAttemptAt: at };
 		emit({
 			kind: "degraded_read",
 			...(kernelPid === undefined ? {} : { kernelPid }),
 			liveBashHandles: result.liveBashHandles,
-			at: degraded.readAt,
+			at: readAt,
 		});
 	}
 
@@ -460,6 +494,9 @@ export function createTurnLiveness(options: TurnLivenessOptions): TurnLiveness {
 		refreshDegradedFacts,
 		reset(): void {
 			degraded = undefined;
+			// A new turn gets a new deadline: the previous turn's degraded facts must not excuse
+			// this one, and this one must not start already expired.
+			degradedFirstReadAt = undefined;
 		},
 		get degradedReads() {
 			return degradedReads;

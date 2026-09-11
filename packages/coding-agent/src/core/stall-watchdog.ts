@@ -28,6 +28,13 @@
  * clearing it unconditionally would let a slow-drip wedge (an event every few
  * minutes) run forever.
  *
+ * A lapse the watchdog notices on its own (a timer fire finding nothing excusing
+ * the silence) banks the accrued exempt time instead of dropping it, and a
+ * resumed exemption inherits it: evidence that blinks — a fact with a lifetime
+ * that expires between two stall stages and is then re-read — cannot renew the
+ * cap. Only observed activity releases the budget, so a turn that is genuinely
+ * producing events never pays for the exemption of an earlier phase.
+ *
  * Timers and the clock are injectable so tests can drive it deterministically
  * without fake global timers.
  */
@@ -112,6 +119,13 @@ export interface StallExemptionSnapshot {
 	remainingMs: number;
 	exhausted: boolean;
 	tier?: StallVouchBudgetTier;
+	/**
+	 * Exempt time this segment inherited from an earlier one in the same arm cycle, i.e. the part
+	 * of `usedMs` that was not accrued while this segment was continuous. Absent (or 0) for a
+	 * segment that started fresh, which is what a post-mortem has to be able to tell apart: a
+	 * resumed segment that aborts at `silentMs ≈ budget` was not one continuous exemption.
+	 */
+	carriedExemptMs?: number;
 	/** Raw kernel facts as sampled with the exemption (normalized by `collectExemptionDiagnostics`). */
 	kernel?: StallKernelFacts;
 }
@@ -125,10 +139,18 @@ export interface StallExemptionDiagnostics {
 	budgetMs?: number;
 	exhausted?: boolean;
 	tier?: StallVouchBudgetTier;
+	/** Inherited exempt time; see {@link StallExemptionSnapshot.carriedExemptMs}. */
+	carriedExemptMs?: number;
 	kernel?: StallKernelDiagnostics;
 }
 
-export type StallExemptionEventKind = "started" | "reason_switch" | "abort_deferred" | "exhausted" | "cleared";
+export type StallExemptionEventKind =
+	| "started"
+	| "resumed"
+	| "reason_switch"
+	| "abort_deferred"
+	| "exhausted"
+	| "cleared";
 
 /** Forensic record of one exemption-budget transition; defaults to `sessionLog.info`. */
 export interface StallExemptionEvent {
@@ -139,6 +161,13 @@ export interface StallExemptionEvent {
 	usedMs: number;
 	budgetMs: number;
 	reasons: readonly string[];
+	/**
+	 * Exempt time carried across a lapse. On `resumed`/`started`/`exhausted`/`abort_deferred` it is
+	 * what the current segment inherited; on `cleared` it is what the lapse banked for a possible
+	 * later segment (0 when genuine activity released it). Two `exhausted` events in one arm cycle
+	 * are expected and distinguishable by this field: one before a gap, one after a resume.
+	 */
+	carriedExemptMs?: number;
 	at: number;
 }
 
@@ -218,7 +247,14 @@ export const STALL_KERNEL_REASONS = {
 } as const;
 
 interface ExemptionSegment {
+	/**
+	 * Epoch ms the segment counts its budget from. Backdated by the carried exempt time when an
+	 * exemption resumes after a lapse, so a resumed segment continues the combined budget instead
+	 * of restarting it.
+	 */
 	since: number;
+	/** Exempt time inherited from the previous segment of this arm cycle (0 for a fresh one). */
+	carriedExemptMs: number;
 	reason: StallExemptionReason;
 	reasons: readonly string[];
 	tier?: StallVouchBudgetTier;
@@ -237,6 +273,20 @@ export class StallWatchdog {
 	private exemptionSegment: ExemptionSegment | undefined = undefined;
 	private lastKernelFacts: StallKernelFacts | undefined = undefined;
 	private abortDeferredLogged = false;
+	/**
+	 * Exempt time accrued by a segment that ended without any observed activity, waiting to be
+	 * inherited by the next segment of this arm cycle. Reset by `resetExemption()` (arm, disarm and
+	 * the give-up path alike) and released by a touch that finds no exemption.
+	 */
+	private bankedExemptMs = 0;
+	/**
+	 * Set once the combined budget has been observed spent anywhere in this arm cycle, and cleared
+	 * only by `resetExemption()`. A spent cap is a fact about the turn, not about the evidence that
+	 * happens to be sampled right now: without the latch, one touch during a blink of the fact
+	 * source would drop the exhausted segment, rebase the escalation and start a fresh budget, which
+	 * is how a renewable vouch kept a wedge alive indefinitely (A1).
+	 */
+	private budgetSpentThisCycle = false;
 
 	constructor(options: StallWatchdogOptions) {
 		this.options = options;
@@ -304,11 +354,13 @@ export class StallWatchdog {
 		// longer claimed drops its accumulated time here instead of at the next fire,
 		// and one that is still claimed keeps it (never cleared unconditionally, or a
 		// slow-drip wedge would refresh its budget forever).
-		const exemption = this.evaluateExemption(now);
-		if (exemption?.exhausted && this.hasAbortEscalation) {
+		const exemption = this.evaluateExemption(now, true);
+		if ((exemption?.exhausted || this.budgetSpentThisCycle) && this.hasAbortEscalation) {
 			// Budget spent while the predicate still claims the turn is owned
 			// elsewhere: keep the accumulated silence and let the pending escalation
-			// fire instead of rebasing it.
+			// fire instead of rebasing it. The latch covers the case where the evidence
+			// blinked out at this very sample - a spent cap must not be un-spent by the
+			// fact source having nothing to say right now.
 			if (this.timerHandle === undefined) {
 				this.scheduleWarn(Math.max(0, this.warnAfterMs - (now - this.lastActivityAt)));
 			}
@@ -350,6 +402,7 @@ export class StallWatchdog {
 			remainingMs: Math.max(0, budgetMs - usedMs),
 			exhausted: usedMs >= budgetMs,
 			tier: segment.tier,
+			...(segment.carriedExemptMs > 0 ? { carriedExemptMs: segment.carriedExemptMs } : {}),
 			kernel: this.lastKernelFacts,
 		};
 	}
@@ -369,6 +422,7 @@ export class StallWatchdog {
 			budgetMs: snapshot.budgetMs,
 			exhausted: snapshot.exhausted,
 			...(snapshot.tier ? { tier: snapshot.tier } : {}),
+			...(snapshot.carriedExemptMs ? { carriedExemptMs: snapshot.carriedExemptMs } : {}),
 			...(kernel ? { kernel } : {}),
 		};
 	}
@@ -377,6 +431,11 @@ export class StallWatchdog {
 		this.exemptionSegment = undefined;
 		this.lastKernelFacts = undefined;
 		this.abortDeferredLogged = false;
+		// Arm, disarm and the give-up path (`fireAbortUnsettled`) all come through here: a new arm
+		// cycle must not inherit the debt of the previous one, or the first exemption of a healthy
+		// turn would start already spent.
+		this.bankedExemptMs = 0;
+		this.budgetSpentThisCycle = false;
 	}
 
 	private clearTimer(): void {
@@ -408,8 +467,15 @@ export class StallWatchdog {
 	 * would refresh the budget forever and the "a real wedge dies within the cap"
 	 * invariant would be false. Reasons only drive logging, the warn channel, and
 	 * the copy.
+	 *
+	 * `observedActivity` says whether this sample came from a touch (real session activity) or from
+	 * a timer fire (mere silence), and that decides what a lapse does to the accrued exempt time:
+	 * activity releases it, a fire banks it for the next segment of this arm cycle. Banking is what
+	 * closes the cap against a predicate that blinks — a fact source whose evidence expires between
+	 * two stall stages and is then re-read would otherwise buy a fresh budget on every blink, and
+	 * the wedge would never be killed.
 	 */
-	private evaluateExemption(now: number): StallExemptionSnapshot | undefined {
+	private evaluateExemption(now: number, observedActivity: boolean): StallExemptionSnapshot | undefined {
 		const paused = this.options.isPaused?.() === true;
 		const vouchFacts = this.options.vouch?.();
 		this.lastKernelFacts = vouchFacts?.kernel;
@@ -418,14 +484,30 @@ export class StallWatchdog {
 		if (observed === undefined) {
 			const previous = this.exemptionSegment;
 			this.exemptionSegment = undefined;
+			const usedMs = previous ? Math.max(0, now - previous.since) : 0;
+			if (observedActivity) {
+				// The turn produced an event while nothing was excusing its silence: the budget is
+				// released, banked time included - unless the cap was already spent, which no event
+				// can undo. Charging a later exemption for an unspent budget would bring back the
+				// pre-consumed budget defect (a long compaction eating the next long command's cap),
+				// which is the defect this whole accounting exists to prevent.
+				if (!this.budgetSpentThisCycle) this.bankedExemptMs = 0;
+			} else if (previous) {
+				// Silence is not activity: keep what was accrued, clamped to what this segment's own
+				// reason and tier could ever have bought.
+				const budgetMs = this.exemptionBudgetMs(previous.reason, previous.tier);
+				if (usedMs >= budgetMs) this.budgetSpentThisCycle = true;
+				this.bankedExemptMs = Math.min(usedMs, budgetMs);
+			}
 			if (previous) {
 				this.emitExemptionEvent(
 					{
 						kind: "cleared",
 						reason: previous.reason,
-						usedMs: Math.max(0, now - previous.since),
+						usedMs,
 						reasons: previous.reasons,
 						tier: previous.tier,
+						carriedExemptMs: this.bankedExemptMs,
 					},
 					now,
 				);
@@ -434,8 +516,15 @@ export class StallWatchdog {
 		}
 
 		if (!this.exemptionSegment) {
+			// A resumed exemption inherits the banked time, measured against the budget its own
+			// reason and tier buy. A downgrade plus inherited debt can therefore be born exhausted
+			// and abort at once; that is deliberate, it fails towards killing the wedge.
+			const budgetMs = this.exemptionBudgetMs(observed, vouchFacts?.tier);
+			const carriedExemptMs = Math.min(this.bankedExemptMs, budgetMs);
+			this.bankedExemptMs = 0;
 			this.exemptionSegment = {
-				since: now,
+				since: now - carriedExemptMs,
+				carriedExemptMs,
 				reason: observed,
 				reasons: observed === "vouched" ? (vouchFacts?.reasons ?? []) : [],
 				tier: vouchFacts?.tier,
@@ -443,11 +532,14 @@ export class StallWatchdog {
 			};
 			this.emitExemptionEvent(
 				{
-					kind: "started",
+					// `started` keeps meaning "a fresh budget"; one that inherits debt reports
+					// `resumed` and carries the inherited amount as its used time.
+					kind: carriedExemptMs > 0 ? "resumed" : "started",
 					reason: observed,
-					usedMs: 0,
+					usedMs: carriedExemptMs,
 					reasons: this.exemptionSegment.reasons,
 					tier: this.exemptionSegment.tier,
+					carriedExemptMs,
 				},
 				now,
 			);
@@ -463,6 +555,7 @@ export class StallWatchdog {
 		}
 
 		const snapshot = this.exemption;
+		if (snapshot?.exhausted) this.budgetSpentThisCycle = true;
 		// One line per segment: the moment the budget stops excusing silence is the
 		// single most load-bearing fact in a stall post-mortem.
 		if (snapshot && snapshot.exhausted && !this.exemptionSegment?.exhaustedLogged) {
@@ -474,6 +567,9 @@ export class StallWatchdog {
 					usedMs: snapshot.usedMs,
 					reasons: snapshot.reasons,
 					tier: snapshot.tier,
+					// Two of these in one arm cycle are expected when an exemption lapsed and
+					// resumed: this field is what tells the two apart in a post-mortem.
+					...(snapshot.carriedExemptMs ? { carriedExemptMs: snapshot.carriedExemptMs } : {}),
 				},
 				now,
 			);
@@ -549,6 +645,9 @@ export class StallWatchdog {
 				usedMs: Math.max(0, now - (this.exemptionSegment?.since ?? now)),
 				reasons: this.exemptionSegment?.reasons ?? [],
 				tier: this.exemptionSegment?.tier,
+				...(this.exemptionSegment?.carriedExemptMs
+					? { carriedExemptMs: this.exemptionSegment.carriedExemptMs }
+					: {}),
 			},
 			now,
 		);
@@ -567,7 +666,8 @@ export class StallWatchdog {
 		this.timerHandle = undefined;
 		if (this.state === "idle") return;
 		const now = this.timers.now();
-		const exemption = this.evaluateExemption(now);
+		// A fire is silence, not activity: a lapse seen here banks the accrued time.
+		const exemption = this.evaluateExemption(now, false);
 		if (exemption && !exemption.exhausted && exemption.reason === "paused") {
 			// Snooze: the paused phase legitimately owns the turn boundary, so its
 			// silent time is not stall evidence. Rebase activity and re-check after
@@ -592,7 +692,8 @@ export class StallWatchdog {
 		this.timerHandle = undefined;
 		if (this.state !== "warned") return;
 		const now = this.timers.now();
-		const exemption = this.evaluateExemption(now);
+		// A fire is silence, not activity: a lapse seen here banks the accrued time.
+		const exemption = this.evaluateExemption(now, false);
 		if (exemption && !exemption.exhausted) {
 			if (exemption.reason === "paused") {
 				// Same snooze as fireWarn: paused silence is not stall evidence.

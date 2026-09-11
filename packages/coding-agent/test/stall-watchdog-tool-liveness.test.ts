@@ -308,10 +308,7 @@ describe("stall watchdog tool liveness vouch (T1-3)", () => {
 		expect(h.stages[1]?.exemption).toMatchObject({ reason: "vouched", tier: "liveness", exhausted: true });
 	});
 
-	it("bounds the degraded fallback by the read's own lifetime", () => {
-		// Default lifetime (15min). The read at the warn stage (5min) is what defers the ordinary
-		// 15min abort; once it expires the vouch collapses and the next re-check kills the turn,
-		// budget or no budget. A file read from long ago must not keep excusing silence.
+	it("ends the degraded deferral with the budget, not with a blink of the evidence", () => {
 		const h = createHarness();
 		h.setKernelFacts(() => ({
 			protocol: 4,
@@ -324,25 +321,60 @@ describe("stall watchdog tool liveness vouch (T1-3)", () => {
 		h.watchdog.arm();
 		h.watchdog.touch();
 
+		// The warn stage (5min) reads the journal; the abort check at 15min is the first sample that
+		// can vouch, so the liveness budget runs to 35min. The facts outlive that by design: the
+		// lifetime is 2x the budget precisely so the budget is what ends the deferral and the kill
+		// can say "spent" instead of "the evidence expired".
 		h.clock.advance(WARN_AFTER_MS);
 		expect(h.stageNames()).toEqual(["warn"]);
-		// The ordinary abort threshold passes with the degraded vouch in effect...
-		h.clock.advance(ABORT_AFTER_MS - WARN_AFTER_MS - 1);
+		expect(h.journalReads.length).toBeGreaterThan(0);
+		h.clock.advance(ABORT_AFTER_MS - WARN_AFTER_MS);
 		expect(h.stageNames()).toEqual(["warn"]);
-		// ... and the kill lands once the read has expired, at the next re-check after that: the
-		// lifetime (15min from the warn stage) plus at most one warn window of granularity.
-		h.clock.advance(2 * WARN_AFTER_MS);
-		expect(h.stageNames()).toEqual(["warn"]);
-		h.clock.advance(WARN_AFTER_MS);
+		h.clock.advance(STALL_VOUCH_LIVENESS_BUDGET_MS);
 		expect(h.stageNames()).toEqual(["warn", "abort"]);
-		expect(h.stages[1]?.silentMs).toBeLessThanOrEqual(
-			WARN_AFTER_MS + DEFAULT_DEGRADED_FACTS_MAX_AGE_MS + WARN_AFTER_MS,
-		);
-		// Not by what the liveness tier would have allowed from the moment the vouch started
-		// (15min + 20min): a file read from long ago stops excusing silence.
-		expect(h.stages[1]?.silentMs).toBeLessThan(ABORT_AFTER_MS + STALL_VOUCH_LIVENESS_BUDGET_MS);
-		// The vouch collapsed rather than running out of budget: no exemption at the abort.
-		expect(h.stages[1]?.exemption).toBeUndefined();
+		expect(h.stages[1]?.exemption).toMatchObject({ reason: "vouched", tier: "liveness", exhausted: true });
+		expect(h.stages[1]?.silentMs).toBeLessThanOrEqual(ABORT_AFTER_MS + STALL_VOUCH_LIVENESS_BUDGET_MS);
+		expect(h.stages[1]?.silentMs).toBeGreaterThan(ABORT_AFTER_MS);
+	});
+
+	it("never lets a re-read extend the degraded deadline", () => {
+		const h = createHarness();
+		h.setKernelFacts(() => ({
+			protocol: 4,
+			latest: sample({ receivedAt: 0, intervalMs: 15_000 }),
+			hostRequestCount: 0,
+			kernelPid: 4242,
+			hasActiveExecution: true,
+		}));
+		h.setJournal(() => ({ liveBashHandles: 1 }));
+		h.watchdog.arm();
+		h.watchdog.touch();
+
+		h.clock.advance(WARN_AFTER_MS);
+		const readsAfterFirst = h.journalReads.length;
+		expect(readsAfterFirst).toBeGreaterThan(0);
+		// A re-read is allowed (a dead orphan has to be able to downgrade the facts) and it does not
+		// move the deadline: that is anchored to the first successful read of the arm cycle.
+		h.clock.advance(30 * MINUTE_MS);
+		h.liveness.refreshDegradedFacts();
+		expect(h.journalReads.length).toBeGreaterThan(readsAfterFirst);
+		expect(h.liveness.sample().vouched).toBe(true);
+
+		// One minute past the lifetime (2x the liveness budget from the first read) the vouch is
+		// gone, and no later refresh can bring it back within this turn.
+		h.clock.advance(DEFAULT_DEGRADED_FACTS_MAX_AGE_MS - 30 * MINUTE_MS + MINUTE_MS);
+		expect(h.liveness.sample().vouched).toBe(false);
+		const readsAtDeadline = h.journalReads.length;
+		h.clock.advance(10 * MINUTE_MS);
+		h.liveness.refreshDegradedFacts();
+		expect(h.journalReads.length).toBe(readsAtDeadline);
+		expect(h.liveness.sample().vouched).toBe(false);
+
+		// A new turn is a new deadline.
+		h.liveness.reset();
+		h.liveness.refreshDegradedFacts();
+		expect(h.journalReads.length).toBeGreaterThan(readsAtDeadline);
+		expect(h.liveness.sample().vouched).toBe(true);
 	});
 
 	it("vouches nothing when the session has no kernel at all, and kills at the threshold", () => {
