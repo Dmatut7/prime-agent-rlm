@@ -128,8 +128,18 @@ export const DAEMON_SNAPSHOT_TIMEOUT_MS = 30_000;
 const MAX_IGNORED_SNAPSHOT_IDS = 128;
 /**
  * Snapshot self-heal schedule. One failed full re-pull must not drop the user
- * offline: the connection degrades visibly and retries, and the terminal
- * `closed` stays reserved for a transport that is really gone.
+ * offline: the connection degrades visibly, keeps the stale view on screen and
+ * retries on this schedule.
+ *
+ * Honest limit, registered rather than papered over: when the whole budget is
+ * spent, `recoverFailedSnapshot` still emits a terminal `closed`. That is
+ * pre-existing behaviour, not something this schedule introduced - before it, a
+ * single failed re-pull went straight to `closed`; this narrows that to three
+ * attempts behind visible `reconnecting` status. It does not remove the path, so
+ * a permanent catch-up failure the supervisor reports as `catchup_failed` can
+ * still end in a terminal close. Closing that off means the client reconnecting
+ * on its own instead of being told the session is gone, which is a capability
+ * change belonging to the client-side budget work, not to this constant.
  */
 const SNAPSHOT_RECOVERY_RETRY_DELAYS_MS: readonly number[] = [1_000, 4_000];
 /** P0-5c: at most one gap line per window per connection; the rest are counted into the next one. */
