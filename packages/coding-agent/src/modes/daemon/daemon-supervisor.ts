@@ -6136,8 +6136,18 @@ export class DaemonSupervisor {
 	 * sender that is still waiting (B10/F10: nothing evaporates).
 	 *
 	 * A retry only ever follows a failure that `requireAvailableWorkerClient`
-	 * threw before anything was written to a worker, so a retry cannot deliver the
-	 * same message twice.
+	 * threw before anything was written to a worker, so this loop cannot deliver
+	 * the same message twice.
+	 *
+	 * KNOWN WINDOW, owned by batch 2 (P1-2 idempotency key): the sender's own
+	 * budget is ~30s (daemon-mode.ts `sendRemoteAgentSessionMessage`) while this
+	 * loop may keep going for the whole delivery budget. A sender that times out
+	 * gets an error, not a receipt, and the message can still land later — so a
+	 * model that re-sends on that error can produce a duplicate. Nothing in this
+	 * file can close that: it needs a sender-supplied delivery key the target
+	 * dedupes on. Until P1-2 lands, this is an open duplicate-delivery window and
+	 * is registered as an acceptance dependency on batch 2 (see build_T4 §7):
+	 * after P1-2 ships, re-send-on-timeout must be proven not to duplicate.
 	 */
 	private async deliverAgentMessage(
 		client: DaemonSocketClient,
@@ -6174,6 +6184,14 @@ export class DaemonSupervisor {
 			);
 		}
 		const entry = admitted.entry;
+		/**
+		 * True once a delivery request has been written to a worker. From that
+		 * moment non-delivery is not provable: the target may have accepted the
+		 * message and only the answer was lost. Every receipt and log line below
+		 * has to keep those two states apart, or the sender re-sends a message
+		 * that already landed.
+		 */
+		let dispatched = false;
 		try {
 			for (;;) {
 				const remainingMs = entry.deadlineAt - Date.now();
@@ -6214,6 +6232,7 @@ export class DaemonSupervisor {
 					);
 					continue;
 				}
+				dispatched = true;
 				const response = await this.raceDeliveryAbort(entry, workerClient.requestWorker(payload, timeoutMs));
 				queue.complete(entry);
 				return { ...response, id: command.id, command: command.type };
@@ -6221,11 +6240,15 @@ export class DaemonSupervisor {
 		} catch (error) {
 			queue.drop(entry);
 			if (error instanceof PendingDeliveryAbortedError) {
+				const reason = error.reason.replaceAll("_", " ");
+				const state = dispatched ? "uncertain" : "undelivered";
 				this.log(
-					`deliver message dropped for ${targetActiveSessionId} (delivery ${entry.deliveryId}, attempts ${entry.attempts}): ${error.message}`,
+					`deliver message dropped for ${targetActiveSessionId} (delivery ${entry.deliveryId}, attempts ${entry.attempts}, state ${state}): ${error.message}`,
 				);
 				throw new Error(
-					`Agent message to ${targetActiveSessionId} was not delivered: the daemon stopped the pending delivery (${error.reason.replaceAll("_", " ")}). Send it again once the daemon is back.`,
+					dispatched
+						? `Agent message to ${targetActiveSessionId} may already have been delivered: the daemon stopped waiting for the target's answer (${reason}). Do not re-send it blindly; ask the target session whether it arrived, or re-send only if a duplicate would be harmless.`
+						: `Agent message to ${targetActiveSessionId} was not delivered: the daemon stopped the pending delivery before it reached the target (${reason}). Send it again once the daemon is back.`,
 				);
 			}
 			throw error;

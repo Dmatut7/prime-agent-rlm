@@ -81,12 +81,17 @@ describe("P1-7c send_message and the update-restart drain", () => {
 		// fixture worker's manifest-less answer stops it.
 		expect(failureText(prepare)).toContain("invalid update manifest");
 
-		// B10: the drained delivery answers its sender instead of evaporating.
+		// B10: the drained delivery answers its sender instead of evaporating, and
+		// the answer is honest about what is provable: this leg was already on the
+		// worker's socket, so non-delivery cannot be claimed.
 		const sendResponse = await send;
 		expect(sendResponse).toMatchObject({ success: false });
-		expect(failureText(sendResponse)).toContain("was not delivered");
+		expect(failureText(sendResponse)).toContain("may already have been delivered");
+		expect(failureText(sendResponse)).toContain("Do not re-send it blindly");
+		expect(failureText(sendResponse)).not.toContain("was not delivered");
 		expect(failureText(sendResponse)).toContain("update restart");
 		expect(harness.logText()).toContain("drained 1 pending agent-message delivery");
+		expect(harness.logText()).toContain("state uncertain");
 	});
 
 	it("still waits for a hanging mutation that is not a delivery", async () => {
@@ -122,7 +127,13 @@ describe("P1-7c send_message and the update-restart drain", () => {
 
 		const sendResponse = await send;
 		expect(sendResponse).toMatchObject({ success: false });
+		// Positive control for the wording above: nothing was ever written to a
+		// worker here (the target stayed recovering), so non-delivery IS provable
+		// and the sender may safely re-send.
 		expect(failureText(sendResponse)).toContain("was not delivered");
+		expect(failureText(sendResponse)).toContain("before it reached the target");
+		expect(failureText(sendResponse)).not.toContain("may already have been delivered");
+		expect(harness.logText()).toContain("state undelivered");
 		// The retry loop stopped at the drain instead of requeueing forever.
 		expect(harness.logText()).toContain("deliver message dropped");
 	});
