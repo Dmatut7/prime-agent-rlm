@@ -16,6 +16,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type * as PiAi from "@earendil-works/pi-ai";
 import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ENV_AGENT_DIR } from "../src/config.js";
 import {
 	appendGlobalRefinement,
 	applyRefinementProposal,
@@ -59,12 +60,25 @@ vi.mock("@earendil-works/pi-ai", async (importOriginal) => {
 });
 
 let tempDir: string | undefined;
+let ambientAgentDir: string | undefined;
+let previousAgentDirEnv: string | undefined;
 
 beforeEach(() => {
 	completeSimpleMock.mockReset();
+	// Parse-failure evidence is appended under the ambient agent dir, so point it at
+	// a throwaway directory instead of the real ~/.prime/agent.
+	ambientAgentDir = mkdtempSync(join(tmpdir(), "prime-agent-refinement-agent-dir-"));
+	previousAgentDirEnv = process.env[ENV_AGENT_DIR];
+	process.env[ENV_AGENT_DIR] = ambientAgentDir;
 });
 
 afterEach(() => {
+	if (previousAgentDirEnv === undefined) delete process.env[ENV_AGENT_DIR];
+	else process.env[ENV_AGENT_DIR] = previousAgentDirEnv;
+	if (ambientAgentDir) {
+		rmSync(ambientAgentDir, { recursive: true, force: true });
+		ambientAgentDir = undefined;
+	}
 	if (tempDir) {
 		rmSync(tempDir, { recursive: true, force: true });
 		tempDir = undefined;

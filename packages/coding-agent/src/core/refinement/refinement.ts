@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { join, parse, resolve } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
@@ -27,6 +28,9 @@ function assertPersistentHarnessStorageSupported(): void {
 
 const HARNESS_STATE_DIR_NAME = "harness";
 const REFINEMENT_HISTORY_FILE_NAME = "refinements.jsonl";
+const REFINEMENT_FAILURES_FILE_NAME = "refinement-failures.jsonl";
+/** Raw model output preserved per parse failure, in UTF-8 bytes: ~8KiB per record. */
+const REFINEMENT_FAILURE_RAW_BYTE_LIMIT = 8 * 1024;
 const DEFAULT_OVERVIEW_ENTRY_LIMIT = 6;
 const DEFAULT_OVERVIEW_REFINEMENT_LIMIT = 5;
 const DEFAULT_OVERVIEW_CONTENT_LIMIT = 180;
@@ -212,6 +216,10 @@ function autoRefineReviewMaxOutputTokens(model: Model<any>): number {
 
 function now(): string {
 	return new Date().toISOString();
+}
+
+function sha256Hex(text: string): string {
+	return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
 function emptyHarnessState(): HarnessState {
@@ -441,6 +449,74 @@ export function saveHarnessState(
 
 export function getRefinementHistoryPath(harnessStateDir: string = getGlobalHarnessStateDir()): string {
 	return join(harnessStateDir, REFINEMENT_HISTORY_FILE_NAME);
+}
+
+/** Append-only evidence log for model replies that could not be parsed into a refinement. */
+export function getRefinementFailuresPath(harnessStateDir: string = getGlobalHarnessStateDir()): string {
+	return join(harnessStateDir, REFINEMENT_FAILURES_FILE_NAME);
+}
+
+export type RefinementParseFailureSource = "refinement" | "auto-refine-review";
+
+export interface RefinementParseFailureRecord {
+	ts: string;
+	source: RefinementParseFailureSource;
+	error: string;
+	/** Digest of the full raw reply, so a truncated record still reconciles with a warn log. */
+	sha256: string;
+	rawChars: number;
+	truncated: boolean;
+	raw: string;
+}
+
+/**
+ * Keeps a bounded prefix of the reply. Iterating code points means the bound is
+ * exact in UTF-8 bytes (CJK-heavy replies are the common case here) and never
+ * cuts a surrogate pair or a multi-byte character in half.
+ */
+function boundedRawText(text: string, byteLimit: number): { raw: string; truncated: boolean } {
+	let bytes = 0;
+	let end = 0;
+	for (const char of text) {
+		const size = Buffer.byteLength(char, "utf8");
+		if (bytes + size > byteLimit) break;
+		bytes += size;
+		end += char.length;
+	}
+	if (end >= text.length) return { raw: text, truncated: false };
+	return { raw: text.slice(0, end), truncated: true };
+}
+
+/**
+ * A parse failure used to leave only the parser's message behind, so a dropped
+ * refinement (a durable preference, an authorization) could not be recovered or
+ * audited afterwards. Keep the model's own words next to the cause. Evidence is
+ * best-effort: a recorder failure must never replace the parse error the caller
+ * is about to surface.
+ */
+export function recordRefinementParseFailure(
+	rawText: string,
+	error: unknown,
+	options: { source?: RefinementParseFailureSource; harnessStateDir?: string } = {},
+): void {
+	try {
+		if (!isPersistentHarnessStorageSupported()) return;
+		const harnessStateDir = options.harnessStateDir ?? getGlobalHarnessStateDir();
+		if (validateHarnessDirectory(harnessStateDir)) return;
+		const { raw, truncated } = boundedRawText(rawText, REFINEMENT_FAILURE_RAW_BYTE_LIMIT);
+		const record: RefinementParseFailureRecord = {
+			ts: now(),
+			source: options.source ?? "refinement",
+			error: error instanceof Error ? error.message : String(error),
+			sha256: sha256Hex(rawText),
+			rawChars: rawText.length,
+			truncated,
+			raw,
+		};
+		appendPrivateFile(getRefinementFailuresPath(harnessStateDir), `${JSON.stringify(record)}\n`);
+	} catch {
+		// Losing the evidence is not a reason to lose the parse error too.
+	}
 }
 
 function isRefinementResult(data: unknown): data is RefinementResult {
@@ -700,6 +776,80 @@ function isIncompleteJson(candidate: string): boolean {
 	return inString || depth > 0;
 }
 
+/** Short JSON escapes for the control characters that have one. */
+const JSON_STRING_CONTROL_ESCAPES: Record<string, string> = {
+	"\b": "\\b",
+	"\t": "\\t",
+	"\n": "\\n",
+	"\f": "\\f",
+	"\r": "\\r",
+};
+
+/**
+ * Escape raw control characters that appear inside JSON string literals - the
+ * shape a model produces when it writes a literal newline into a sentence, which
+ * is common with multi-line content and makes JSON.parse reject an otherwise
+ * complete reply. Structural whitespace outside strings is left untouched and
+ * nothing else is rewritten: this is an escape pass, not a guess at intent.
+ * Returns undefined when there is nothing to escape, so callers keep their
+ * original diagnosis instead of a repair artifact.
+ */
+function escapeRawControlCharsInJsonStrings(candidate: string): string | undefined {
+	let repaired = "";
+	let inString = false;
+	let escaped = false;
+	let changed = false;
+	for (const char of candidate) {
+		if (escaped) {
+			escaped = false;
+			repaired += char;
+			continue;
+		}
+		if (char === "\\") {
+			escaped = inString;
+			repaired += char;
+			continue;
+		}
+		if (char === '"') {
+			inString = !inString;
+			repaired += char;
+			continue;
+		}
+		const code = char.codePointAt(0)!;
+		if (inString && code < 0x20) {
+			repaired += JSON_STRING_CONTROL_ESCAPES[char] ?? `\\u${code.toString(16).padStart(4, "0")}`;
+			changed = true;
+			continue;
+		}
+		repaired += char;
+	}
+	return changed ? repaired : undefined;
+}
+
+interface RepairedJson {
+	value: unknown;
+}
+
+/**
+ * Re-parse a candidate after escaping raw control characters in its string
+ * literals, warning with the candidate digest so a recovered refinement can be
+ * reconciled against what the model sent. Returns undefined when the candidate
+ * needed no such repair or the repair did not make it parse.
+ */
+function parseWithControlCharRepair(candidate: string): RepairedJson | undefined {
+	const repaired = escapeRawControlCharsInJsonStrings(candidate);
+	if (repaired === undefined) return undefined;
+	try {
+		const value: unknown = JSON.parse(repaired);
+		console.warn(
+			`refinement JSON recovered by escaping raw control characters inside string literals (candidate sha256 ${sha256Hex(candidate)})`,
+		);
+		return { value };
+	} catch {
+		return undefined;
+	}
+}
+
 function parseJsonCandidate(candidate: string): unknown {
 	try {
 		return JSON.parse(candidate);
@@ -709,6 +859,10 @@ function parseJsonCandidate(candidate: string): unknown {
 		if (isIncompleteJson(candidate)) {
 			throw new Error(TRUNCATED_JSON_ERROR);
 		}
+		// A complete reply can still be unparseable for one mechanical reason: raw
+		// control characters in string literals. Repair exactly that, and only that.
+		const repaired = parseWithControlCharRepair(candidate);
+		if (repaired) return repaired.value;
 		throw new Error(`the model did not return valid JSON: ${error instanceof Error ? error.message : String(error)}`);
 	}
 }
@@ -730,9 +884,15 @@ function extractJsonObject(text: string): unknown {
 	const start = trimmed.indexOf("{");
 	const end = trimmed.lastIndexOf("}");
 	if (start !== -1 && end > start) {
+		const fragment = trimmed.slice(start, end + 1);
 		try {
-			return JSON.parse(trimmed.slice(start, end + 1));
+			return JSON.parse(fragment);
 		} catch {
+			// The balanced fragment is the only part of a prose-wrapped reply that can
+			// parse, so offer the control-character repair that same candidate before
+			// diagnosing the whole (possibly truncated) text.
+			const repaired = parseWithControlCharRepair(fragment);
+			if (repaired) return repaired.value;
 			return parseJsonCandidate(trimmed.slice(start));
 		}
 	}
@@ -774,12 +934,30 @@ export function normalizeRefinementProposal(value: unknown): RefinementProposal 
 	};
 }
 
-function parseProposal(text: string): RefinementProposal {
-	const value = extractJsonObject(text);
-	if (typeof value !== "object" || value === null || Array.isArray(value)) {
-		throw new Error("Refiner JSON must be an object");
+/**
+ * Parse a model reply into a JSON object, preserving the raw output when that
+ * fails so a dropped refinement stays auditable.
+ */
+function parseModelJsonObject(
+	text: string,
+	source: RefinementParseFailureSource,
+	objectError: string,
+): Record<string, unknown> {
+	let value: unknown;
+	try {
+		value = extractJsonObject(text);
+		if (typeof value !== "object" || value === null || Array.isArray(value)) {
+			throw new Error(objectError);
+		}
+	} catch (error) {
+		recordRefinementParseFailure(text, error, { source });
+		throw error;
 	}
-	return normalizeRefinementProposal(value);
+	return value as Record<string, unknown>;
+}
+
+function parseProposal(text: string): RefinementProposal {
+	return normalizeRefinementProposal(parseModelJsonObject(text, "refinement", "Refiner JSON must be an object"));
 }
 
 function validateEdit(edit: RefinementEdit, computedId?: string): string | undefined {
@@ -1060,11 +1238,7 @@ export async function planRefinement(
 }
 
 function parseAutoRefineReview(text: string): AutoRefineReview {
-	const value = extractJsonObject(text);
-	if (typeof value !== "object" || value === null || Array.isArray(value)) {
-		throw new Error("Auto-refine review JSON must be an object");
-	}
-	const record = value as Record<string, unknown>;
+	const record = parseModelJsonObject(text, "auto-refine-review", "Auto-refine review JSON must be an object");
 	return {
 		shouldRefine: record.shouldRefine === true,
 		rationale: typeof record.rationale === "string" ? record.rationale : "No rationale provided.",

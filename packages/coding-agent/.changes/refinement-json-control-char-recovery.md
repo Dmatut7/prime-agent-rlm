@@ -1,0 +1,2 @@
+- Fixed `/refine` dropping an entire refinement when the model's JSON held a raw control character such as a literal newline inside a string; those replies are now escaped, applied, and announced with a warning carrying the candidate's sha256.
+- Added `~/.prime/agent/harness/refinement-failures.jsonl`, which preserves the raw model output (timestamp, error, sha256, and the reply bounded to 8KiB) whenever a refinement or auto-refine review reply cannot be parsed.
