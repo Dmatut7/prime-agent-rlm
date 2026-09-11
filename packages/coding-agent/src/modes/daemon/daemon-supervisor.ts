@@ -142,6 +142,12 @@ import {
 	waitForDaemonStartupFence,
 } from "./daemon-supervisor-ownership.js";
 import {
+	DAEMON_ADOPTION_REQUEST_TIMEOUT_MS,
+	WORKER_REQUEST_TIMEOUT_TIERS,
+	workerRequestTimeoutMs,
+	workerRequestTimeoutTier,
+} from "./daemon-timeouts.js";
+import {
 	DaemonWorkerAuthenticationError,
 	DaemonWorkerClient,
 	DaemonWorkerProbeTimeoutError,
@@ -192,11 +198,14 @@ const SUPERVISOR_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
 	...DAEMON_SUPERVISOR_ONLY_SERVER_CAPABILITIES,
 ];
 const PEER_TRANSPORT_GRANT_TTL_MS = 10_000;
-const WORKER_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+// P1-7b: the long tier of the split budget table. A fresh create and a
+// user-explicit long command keep it; reads, the delivery leg and adoption have
+// their own tier (see daemon-timeouts.ts).
+const WORKER_REQUEST_TIMEOUT_MS = WORKER_REQUEST_TIMEOUT_TIERS.long;
 // Startup adoption waits on a bounded window instead: a worker that never answers
 // must park failed rather than keep the supervisor from opening its socket (F14).
 // Must stay equal to the update-restart adoption budget (appendix A of the fix plan).
-const ADOPTION_WORKER_REQUEST_TIMEOUT_MS = 300_000;
+export const ADOPTION_WORKER_REQUEST_TIMEOUT_MS = DAEMON_ADOPTION_REQUEST_TIMEOUT_MS;
 // Failed-worker reaper cadence (L5). The threshold itself is settings-driven.
 const FAILED_WORKER_REAP_INTERVAL_MS = 5 * 60_000;
 // L3: how many workers are adopted concurrently once the socket is already open.
@@ -6077,10 +6086,21 @@ export class DaemonSupervisor {
 	private async forwardToWorker(
 		worker: ResidentWorker,
 		command: DaemonCommand,
-		timeoutMs = WORKER_REQUEST_TIMEOUT_MS,
+		timeoutMs = workerRequestTimeoutMs(command.type),
 	): Promise<DaemonResponse> {
 		const client = this.requireAvailableWorkerClient(worker, command.type === "kill");
-		const response = await client.request(withoutCommandId(command), timeoutMs);
+		let response: DaemonResponse;
+		try {
+			response = await client.request(withoutCommandId(command), timeoutMs);
+		} catch (error) {
+			if (error instanceof DaemonWorkerProbeTimeoutError) {
+				// Countable signature (appendix B): which command ran out of which tier.
+				this.logInfo(
+					`worker request timed out after ${timeoutMs}ms (tier ${workerRequestTimeoutTier(command.type)}) for ${command.type} on ${worker.descriptor.workerId}`,
+				);
+			}
+			throw error;
+		}
 		if (command.type === "get_state" && response.success && isSessionSummary(response.data)) {
 			return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };
 		}

@@ -10,7 +10,7 @@ import { spawn } from "node:child_process";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
-import { createConnection, createServer, type Server, type Socket } from "node:net";
+import { createServer, type Server, type Socket } from "node:net";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { type Api, getLogger, type Model } from "@earendil-works/pi-ai";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
@@ -235,6 +235,13 @@ import {
 	SNAPSHOT_TARGET_CHUNK_BYTES,
 	type SnapshotTranscriptChunkSource,
 } from "./snapshot-transcript-cache.js";
+import {
+	connectProbeSupervisor,
+	probeSupervisorAvailability,
+	checkSupervisorAvailability as runSupervisorAvailabilityCheck,
+	SUPERVISOR_PROBE_TIMEOUT_MS,
+	type SupervisorAvailabilityState,
+} from "./supervisor-availability.js";
 import { WorkerRecoveryJournal } from "./worker-recovery-journal.js";
 
 export interface DaemonModeOptions {
@@ -558,6 +565,8 @@ export class AgentDaemon {
 	private supervisorMonitorTimer?: ReturnType<typeof setTimeout>;
 	private supervisorFenceTimer?: ReturnType<typeof setTimeout>;
 	private supervisorLaunchInProgress = false;
+	/** Rounds the supervisor probe failed in a row; drives the recheck backoff (P1-7b). */
+	private readonly supervisorAvailabilityState: SupervisorAvailabilityState = { consecutiveFailures: 0 };
 	private readonly supervisorClaims = new Map<DaemonSocketClient, BoundSupervisorGenerationClaim>();
 	private readonly peerGrants = new Map<string, DaemonWorkerPeerGrant>();
 	private readonly peerClaims = new Map<DaemonSocketClient, DaemonWorkerPeerGrant>();
@@ -734,20 +743,29 @@ export class AgentDaemon {
 		}, delayMs);
 	}
 
+	/**
+	 * One monitoring round (P1-7b, 250ms tier). Death takes a whole failed probe
+	 * round, not one 250ms connect, and the next round is scheduled on a backoff
+	 * that grows with the number of rounds that failed in a row.
+	 */
 	private async checkSupervisorAvailability(supervisorSocketPath: string): Promise<void> {
-		if (this.shuttingDown || this.hasAuthenticatedSupervisorConnection()) {
-			return;
-		}
-		if (await isDaemonShutdownAdmissionActive()) {
-			this.scheduleSupervisorAvailabilityCheck(supervisorSocketPath, 5000);
-			return;
-		}
-		if (await this.canConnectToSupervisor(supervisorSocketPath)) {
-			return;
-		}
-		await this.launchReplacementSupervisor(supervisorSocketPath);
-		if (!this.shuttingDown && !this.hasAuthenticatedSupervisorConnection()) {
-			this.scheduleSupervisorAvailabilityCheck(supervisorSocketPath, 5000);
+		const outcome = await runSupervisorAvailabilityCheck(supervisorSocketPath, this.supervisorAvailabilityState, {
+			probe: (socketPath) =>
+				probeSupervisorAvailability(socketPath, {
+					// Through the method, not the raw socket helper: the monitor's
+					// probe seam stays the one tests and subclasses can observe.
+					connect: (path) => this.canConnectToSupervisor(path),
+					isCancelled: () => this.shuttingDown || this.hasAuthenticatedSupervisorConnection(),
+					onFailedAttempt: (attempt, attempts) =>
+						this.log(`supervisor probe failed (attempt ${attempt}/${attempts}) on ${socketPath}`),
+				}),
+			launchReplacement: (socketPath) => this.launchReplacementSupervisor(socketPath),
+			isConnected: () => this.hasAuthenticatedSupervisorConnection(),
+			isShuttingDown: () => this.shuttingDown,
+			isShutdownAdmissionActive: () => isDaemonShutdownAdmissionActive(),
+		});
+		if (outcome.nextDelayMs !== undefined) {
+			this.scheduleSupervisorAvailabilityCheck(supervisorSocketPath, outcome.nextDelayMs);
 		}
 	}
 
@@ -827,23 +845,7 @@ export class AgentDaemon {
 	}
 
 	private canConnectToSupervisor(socketPath: string): Promise<boolean> {
-		return new Promise((resolveConnect) => {
-			const socket = createConnection(socketPath);
-			let settled = false;
-			const finish = (connected: boolean) => {
-				if (settled) {
-					return;
-				}
-				settled = true;
-				clearTimeout(timeout);
-				socket.removeAllListeners();
-				socket.destroy();
-				resolveConnect(connected);
-			};
-			const timeout = setTimeout(() => finish(false), 250);
-			socket.once("connect", () => finish(true));
-			socket.once("error", () => finish(false));
-		});
+		return connectProbeSupervisor(socketPath, SUPERVISOR_PROBE_TIMEOUT_MS);
 	}
 
 	private async launchReplacementSupervisor(supervisorSocketPath: string): Promise<void> {
@@ -879,6 +881,9 @@ export class AgentDaemon {
 						// An invalid owner is reclaimed atomically below.
 					}
 					if (ownerPid && this.isProcessAlive(ownerPid)) {
+						// Somebody else is already launching the replacement. Not an error:
+						// this round stands down and the monitor rechecks on its backoff.
+						this.log(`supervisor launch lock held by pid ${ownerPid}; backing off`);
 						return;
 					}
 					const staleDirectory = `${lockDirectory}.stale-${process.pid}-${token}`;
@@ -893,6 +898,7 @@ export class AgentDaemon {
 				}
 			}
 			if (!ownsLock) {
+				this.log("supervisor launch lock still contended after 3 attempts; backing off");
 				return;
 			}
 			if (await this.canConnectToSupervisor(supervisorSocketPath)) {

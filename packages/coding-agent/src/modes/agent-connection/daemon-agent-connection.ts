@@ -48,6 +48,7 @@ import {
 	DaemonRoutedClient,
 } from "../daemon/daemon-routed-client.js";
 import type { SessionSummary } from "../daemon/daemon-session-list.js";
+import { DAEMON_BACKGROUND_RECONNECT_RETRY_MS, daemonReconnectBudgetMs } from "../daemon/daemon-timeouts.js";
 import { listDaemonHeartbeats } from "../daemon/heartbeat-catalog.js";
 import {
 	deleteDaemonSavedSession,
@@ -114,7 +115,15 @@ interface DaemonSnapshotAssembly {
 
 export const DAEMON_REFINE_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
 const DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
-export const DAEMON_RECONNECT_TIMEOUT_MS = 60_000;
+/**
+ * P1-7b, 60s tier: the fast reconnect budget. It has to outlive the recovery
+ * ladder it waits for, so it is derived from the adoption create budget rather
+ * than restated (fix-plan appendix A: T3-3 and T4-2 are the same number). A
+ * session still being adopted when this budget ends is not lost: the low-speed
+ * background retry below keeps going and stops only on success, disposal, or a
+ * terminal answer (I-9).
+ */
+export const DAEMON_RECONNECT_TIMEOUT_MS = daemonReconnectBudgetMs();
 export const DAEMON_SNAPSHOT_TIMEOUT_MS = 30_000;
 const MAX_IGNORED_SNAPSHOT_IDS = 128;
 /**
@@ -161,6 +170,22 @@ function formatErrorSentence(error: unknown): string {
 	return /[.!?]$/.test(message) ? message : `${message}.`;
 }
 
+/**
+ * I-9: the low-speed background retry has to be able to stop. These are answers
+ * that do not change by being asked again — a session the failed-worker reaper
+ * collected (C19 made the terminal answer reachable) or a daemon replaced by a
+ * build that lacks the capability. Everything else keeps retrying.
+ */
+export function isTerminalReconnectError(error: unknown): boolean {
+	if (error instanceof DaemonCapabilityUnavailableError) {
+		return true;
+	}
+	const message = error instanceof Error ? error.message : String(error);
+	return TERMINAL_RECONNECT_ERROR_PATTERNS.some((pattern) => pattern.test(message));
+}
+
+const TERMINAL_RECONNECT_ERROR_PATTERNS: readonly RegExp[] = [/^Unknown active session\b/];
+
 function reconnectDaemonTransportAfterUpdate(client: DaemonTransportClient): Promise<void> {
 	const existing = updateTransportReconnects.get(client);
 	if (existing) {
@@ -199,6 +224,8 @@ export interface DaemonAgentConnectionOptions {
 	recoverDaemon?: () => Promise<void>;
 	/** Bound supervisor recovery before surfacing a fatal connection error. */
 	reconnectTimeoutMs?: number;
+	/** Interval of the low-speed retry that continues after `reconnectTimeoutMs` is spent. */
+	backgroundReconnectRetryMs?: number;
 	/** Bound an incomplete streamed snapshot before failing the attach or resync. */
 	snapshotTimeoutMs?: number;
 	/**
@@ -313,6 +340,8 @@ export class DaemonAgentConnection implements AgentConnection {
 	private readonly ignoredSnapshotIds = new Set<string>();
 	private rosterStore: AgentsViewRosterStore | undefined;
 	private reconnectPromise?: Promise<void>;
+	private backgroundReconnectPromise?: Promise<void>;
+	private backgroundRetryWake?: () => void;
 	private initialAttachPending = false;
 	private initialControlPlaneClose?: Error;
 	private readonly definitiveRequestErrors = new WeakSet<Error>();
@@ -1669,6 +1698,9 @@ export class DaemonAgentConnection implements AgentConnection {
 			return;
 		}
 		this.disposing = true;
+		// Stop a low-speed background retry at once instead of letting it wake after dispose.
+		this.backgroundRetryWake?.();
+		this.backgroundRetryWake = undefined;
 		if (this.options.ownedSession && !this.client.isConnected && this.reconnectPromise) {
 			await Promise.race([this.reconnectPromise, delay(OWNED_SESSION_DISPOSE_RECONNECT_WAIT_MS)]).catch(
 				() => undefined,
@@ -1797,13 +1829,110 @@ export class DaemonAgentConnection implements AgentConnection {
 			if (!this.disposed) {
 				this.sessionInputPauses.clear();
 				this.sessionInputPauseGeneration++;
-				this.client.close();
+				// The budget ending is not the end of recovery: the transport is reset
+				// (not closed, so the background retry can re-attach through it) and the
+				// low-speed loop takes over. `closed` still goes out, because a caller
+				// that treats the fast budget as terminal must be able to.
+				this.terminalCloseEmitted = true;
+				this.client.resetTransportForReconnect();
+				this.logConnection(
+					`reconnect budget extended: ${timeoutMs}ms exhausted for ${this.activeSessionId}, retrying every ${DAEMON_BACKGROUND_RECONNECT_RETRY_MS}ms (${lastError.message})`,
+				);
 				await this.emit({ type: "closed", error: `Daemon reconnection failed: ${lastError.message}` });
+				this.startBackgroundReconnect(lastError);
 			}
 		})().finally(() => {
 			this.reconnectPromise = undefined;
 		});
 		return this.reconnectPromise;
+	}
+
+	/**
+	 * Low-speed retry after the fast reconnect budget is spent (P1-7b). One
+	 * attempt every 30s, each a full re-attach plus snapshot, until it succeeds,
+	 * the connection is disposed, or the target answers with a terminal error
+	 * (I-9: a session the reaper collected will keep answering "Unknown active
+	 * session", and retrying that forever is noise, not recovery).
+	 */
+	private startBackgroundReconnect(cause: Error): void {
+		if (this.disposed || this.backgroundReconnectPromise) {
+			return;
+		}
+		this.backgroundReconnectPromise = (async () => {
+			let attempt = 0;
+			let lastError = cause;
+			while (!this.disposed) {
+				await this.sleepBackgroundRetry();
+				if (this.disposed) {
+					return;
+				}
+				attempt++;
+				void this.emit({
+					type: "connection_status",
+					status: "reconnecting",
+					error: lastError.message,
+					backgroundAttempt: attempt,
+				});
+				try {
+					await this.options.recoverDaemon?.();
+					if (this.disposed) {
+						return;
+					}
+					await this.client.connect(1000);
+					await this.client.waitForHello(3000);
+					await this.attach({ recoverable: false });
+					const snapshot = await this.getInitialSnapshot({ recoverable: false });
+					if (this.disposed) {
+						return;
+					}
+					this.terminalCloseEmitted = false;
+					this.logConnection(`background reconnect re-attached ${this.activeSessionId} on attempt ${attempt}`);
+					void this.emit({ type: "session_resynced", snapshot });
+					void this.emit({ type: "connection_status", status: "connected" });
+					return;
+				} catch (error) {
+					lastError = error instanceof Error ? error : new Error(String(error));
+					if (this.disposed) {
+						return;
+					}
+					if (isTerminalReconnectError(lastError)) {
+						this.logConnection(
+							`background reconnect stopped for ${this.activeSessionId}: terminal answer after ${attempt} attempt(s): ${lastError.message}`,
+						);
+						this.client.close();
+						return;
+					}
+					this.logConnection(
+						`background reconnect attempt ${attempt} failed for ${this.activeSessionId}: ${lastError.message}`,
+					);
+					this.client.resetTransportForReconnect();
+				}
+			}
+		})().finally(() => {
+			this.backgroundReconnectPromise = undefined;
+		});
+	}
+
+	/** A background retry wait is interruptible, so dispose stops the loop at once. */
+	private sleepBackgroundRetry(): Promise<void> {
+		return new Promise((resolveSleep) => {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const wake = (): void => {
+				if (timer !== undefined) clearTimeout(timer);
+				this.backgroundRetryWake = undefined;
+				resolveSleep();
+			};
+			this.backgroundRetryWake = wake;
+			timer = setTimeout(wake, this.options.backgroundReconnectRetryMs ?? DAEMON_BACKGROUND_RECONNECT_RETRY_MS);
+		});
+	}
+
+	private logConnection(message: string): void {
+		try {
+			appendRotatingLog(getAgentLogPath(), `[${new Date().toISOString()}] daemon-connection: ${message}`);
+		} catch {
+			// Diagnostics must never become the failure they are describing.
+		}
 	}
 
 	private async requestOk(command: DaemonCommandBody): Promise<void> {

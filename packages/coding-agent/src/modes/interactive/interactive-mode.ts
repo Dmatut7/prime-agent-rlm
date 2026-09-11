@@ -5239,7 +5239,11 @@ export class InteractiveMode {
 					await this.handleConnectionExtensionUiRequest(event.request);
 				} else if (event.type === "connection_status") {
 					this.showStatus(
-						event.status === "connected" ? "Daemon reconnected" : "Daemon connection lost; reconnecting…",
+						event.status === "connected"
+							? "Daemon reconnected"
+							: event.backgroundAttempt !== undefined
+								? `Daemon connection lost; retrying in the background (attempt ${event.backgroundAttempt})`
+								: "Daemon connection lost; reconnecting…",
 						event.status === "reconnecting" ? "warning" : "dim",
 					);
 					if (event.status === "connected") {

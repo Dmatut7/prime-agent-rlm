@@ -663,7 +663,17 @@ export type AgentConnectionEvent =
 	| { type: "session_status"; recap?: string }
 	| { type: "extension_ui_request"; request: AgentConnectionExtensionUiRequest }
 	| { type: "extension_error"; extensionPath: string; event: string; error: string }
-	| { type: "connection_status"; status: "reconnecting" | "connected"; error?: string }
+	| {
+			type: "connection_status";
+			status: "reconnecting" | "connected";
+			error?: string;
+			/**
+			 * Set while the low-speed background retry runs after the fast reconnect
+			 * budget was spent (P1-7b): the 1-based attempt count, so the UI can say
+			 * recovery is still going instead of showing a dead connection.
+			 */
+			backgroundAttempt?: number;
+	  }
 	| { type: "heartbeats_changed" }
 	| { type: "closed"; error?: string };
 
