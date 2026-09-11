@@ -1,0 +1,1 @@
+- Made the auto-refine probe cost test environment-independent: it no longer depends on construction-time cache priming (RLM_DEPTH) and isolates PRIME_AGENT_CODING_AGENT_DIR from the machine's real harness store.
