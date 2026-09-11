@@ -67,11 +67,16 @@ afterEach(() => {
 	}
 });
 
+let managerCount = 0;
+
 function newManager(options: {
 	onUnexpectedExit?: (cause: KernelDeathCause) => void;
 	bootstrapCode?: string;
 }): ReplKernelManager {
-	const python = join(tempDir, "python");
+	// One script per manager: rewriting a shared file under a still-exiting child makes the next
+	// spawn read a half-written script, which is a test artifact, not a kernel fact.
+	managerCount += 1;
+	const python = join(tempDir, `python-${managerCount}`);
 	writeFakeRuntime(python);
 	return new ReplKernelManager({
 		python,
@@ -227,23 +232,24 @@ describe("ReplKernelManager unexpected exit", () => {
 		}
 	});
 
-	it("keeps the three host-initiated teardowns silent", async () => {
-		const shutdownCauses: KernelDeathCause[] = [];
-		const shutdownManager = newManager({ onUnexpectedExit: (cause) => shutdownCauses.push(cause) });
-		await shutdownManager.start();
-		await shutdownManager.shutdown();
-		expect(shutdownCauses).toEqual([]);
-
-		const killCauses: KernelDeathCause[] = [];
-		const killManager = newManager({ onUnexpectedExit: (cause) => killCauses.push(cause) });
-		await killManager.start();
-		await killManager.kill();
-		expect(killCauses).toEqual([]);
-
-		const disposeCauses: KernelDeathCause[] = [];
-		const disposeManager = newManager({ onUnexpectedExit: (cause) => disposeCauses.push(cause) });
-		await disposeManager.start();
-		disposeManager.disposeSync();
-		expect(disposeCauses).toEqual([]);
-	});
+	// Split per teardown so a failure names the path, and so one child's exit cannot be attributed
+	// to the next manager's startup.
+	const teardowns: [string, (manager: ReplKernelManager) => Promise<void>][] = [
+		["shutdown", (manager) => manager.shutdown().then(() => undefined)],
+		["kill", (manager) => manager.kill()],
+		["disposeSync", async (manager) => manager.disposeSync()],
+	];
+	expect(teardowns.length).toBeGreaterThan(0);
+	for (const [name, teardown] of teardowns) {
+		it(`reports no unexpected exit for ${name}`, async () => {
+			const causes: KernelDeathCause[] = [];
+			const manager = newManager({ onUnexpectedExit: (cause) => causes.push(cause) });
+			await manager.start();
+			expect(manager.isRunning).toBe(true);
+			await teardown(manager);
+			// Give a late exit event a chance to be misclassified before asserting silence.
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			expect(causes).toEqual([]);
+		});
+	}
 });
