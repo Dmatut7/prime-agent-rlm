@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, ImageContent, ServiceTier, Transport } from "@earendil-works/pi-ai";
-import { appendRotatingLog, getAgentLogPath, getDaemonLogPath } from "../../config.js";
+import { appendRotatingLog, getAgentDir, getAgentLogPath, getDaemonLogPath } from "../../config.js";
 import type { AgentSessionMessageReceipt, AgentSessionMessageSafetyStatus } from "../../core/agent-messages.js";
 import type { AgentSessionEvent } from "../../core/agent-session.js";
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
@@ -20,6 +20,7 @@ import type { RefinementResult } from "../../core/refinement/index.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { SessionAlreadyActiveError } from "../../core/session-lease.js";
 import type { SessionStats } from "../../core/session-stats.js";
+import { SettingsManager } from "../../core/settings-manager.js";
 import { AgentsViewRosterStore, STALE_ROSTER_DAEMON_MESSAGE } from "../agents-view/roster-store.js";
 import { CompactAssistantStreamReconstructor } from "../daemon/compact-session-stream.js";
 import {
@@ -116,6 +117,32 @@ const DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 export const DAEMON_RECONNECT_TIMEOUT_MS = 60_000;
 export const DAEMON_SNAPSHOT_TIMEOUT_MS = 30_000;
 const MAX_IGNORED_SNAPSHOT_IDS = 128;
+/**
+ * Snapshot self-heal schedule. One failed full re-pull must not drop the user
+ * offline: the connection degrades visibly and retries, and the terminal
+ * `closed` stays reserved for a transport that is really gone.
+ */
+const SNAPSHOT_RECOVERY_RETRY_DELAYS_MS: readonly number[] = [1_000, 4_000];
+/** P0-5c: at most one gap line per window per connection; the rest are counted into the next one. */
+const EVENT_GAP_LOG_THROTTLE_MS = 1_000;
+let cachedEventGapRecoveryMode: "log" | "recover" | undefined;
+
+/**
+ * The shipped default is log-only (C11): the detector is evidence gathering until a
+ * production window shows it does not misfire. Read once per process from settings.
+ */
+function configuredEventGapRecoveryMode(): "log" | "recover" {
+	if (cachedEventGapRecoveryMode !== undefined) {
+		return cachedEventGapRecoveryMode;
+	}
+	try {
+		cachedEventGapRecoveryMode = SettingsManager.create(process.cwd(), getAgentDir()).getDaemonSupervisorSettings()
+			.eventGapRecovery;
+	} catch {
+		cachedEventGapRecoveryMode = "log";
+	}
+	return cachedEventGapRecoveryMode;
+}
 const UPDATE_RECONNECT_TIMEOUT_MS = 120000;
 const UPDATE_RECONNECT_RETRY_MS = 100;
 const MAX_COMPLETED_SNAPSHOTS = 128;
@@ -174,6 +201,15 @@ export interface DaemonAgentConnectionOptions {
 	reconnectTimeoutMs?: number;
 	/** Bound an incomplete streamed snapshot before failing the attach or resync. */
 	snapshotTimeoutMs?: number;
+	/** Overrides the full re-pull schedule used after a failed snapshot self-heal. */
+	snapshotRecoveryRetryDelaysMs?: readonly number[];
+	/**
+	 * Overrides what the event-sequence gap detector does (P0-5c). Defaults to the
+	 * `daemon.eventGapRecovery` setting, which itself defaults to "log": record the
+	 * gap as evidence and change nothing. "recover" additionally re-pulls the
+	 * session, and is only meant to be turned on after a zero-false-positive window.
+	 */
+	eventGapRecovery?: "log" | "recover";
 	/**
 	 * Send this client's allowlisted env (herdr pane identity) with attach so
 	 * an env-less session (e.g. cron-created) adopts it. Set only by the
@@ -232,6 +268,18 @@ export class DaemonAgentConnection implements AgentConnection {
 	private ownedSessionPromotionTail = Promise.resolve();
 	private lastEventCursor: DaemonEventCursor | undefined;
 	private readonly retiredEventGenerations = new Set<string>();
+	/**
+	 * Event-sequence gap detector state (P0-5c): the last cursor this client actually
+	 * observed, disarmed after every reseed so a snapshot can never read as a gap.
+	 */
+	private eventGapBaseline: DaemonEventCursor | undefined;
+	private eventGapArmed = false;
+	private eventGapInFlight = false;
+	private eventGapDetected = 0;
+	private eventGapSuppressed = 0;
+	private eventGapLastReportAt: number | undefined;
+	private eventGapLastExpected: number | undefined;
+	private eventGapLastGot: number | undefined;
 	private lastEventSequence: number | undefined;
 	private childRosterSequence: number | undefined;
 	private latestSnapshot: AgentConnectionSnapshot | undefined;
@@ -427,6 +475,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		this.updateReconnectFailed = false;
 		this.terminalCloseEmitted = false;
 		const attachCursor = getAttachLastEventCursor(result);
+		this.resetEventGapBaseline();
 		if (attachCursor) {
 			this.observeEventCursor(attachCursor);
 		}
@@ -435,7 +484,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			const snapshot = result.snapshotStream
 				? await this.waitForSnapshot(result.snapshotStream.id)
 				: result.snapshot;
-			this.latestSnapshot = mapDaemonSessionSnapshot(snapshot, result.replay);
+			this.latestSnapshot = this.downgradeSnapshotStallState(mapDaemonSessionSnapshot(snapshot, result.replay));
 			if (Array.isArray(snapshot.children)) this.childRosterSequence = snapshot.lastEventSequence;
 			if (this.lastEventSequence !== undefined) {
 				this.latestSnapshot.lastEventSequence = this.lastEventSequence;
@@ -568,6 +617,26 @@ export class DaemonAgentConnection implements AgentConnection {
 		return this.latestSnapshot;
 	}
 
+	/**
+	 * Downgrade subagent stall state when the daemon does not advertise
+	 * `rlm_child_stall_activity` (revision 28 addition): "stalled" activity becomes
+	 * "waiting" and the stall facts are dropped, so a client never renders a stall
+	 * the server did not report.
+	 */
+	private downgradeChildStallState(child: AgentConnectionRlmChildAgentSnapshot): AgentConnectionRlmChildAgentSnapshot {
+		if (this.client.supportsServerCapability("rlm_child_stall_activity")) return child;
+		const stalled = child.activity?.kind === "stalled";
+		if (!stalled && child.stall === undefined) return child;
+		return { ...child, activity: stalled ? { kind: "waiting" } : child.activity, stall: undefined };
+	}
+
+	/** Single ingest point for a mapped daemon snapshot, so the roster downgrade cannot be missed. */
+	private downgradeSnapshotStallState(snapshot: AgentConnectionSnapshot): AgentConnectionSnapshot {
+		return snapshot.children
+			? { ...snapshot, children: snapshot.children.map((child) => this.downgradeChildStallState(child)) }
+			: snapshot;
+	}
+
 	async getRlmChildSnapshots(): Promise<AgentConnectionRlmChildAgentSnapshot[]> {
 		if (!this.client.supportsServerCapability("authoritative_child_roster")) {
 			throw new DaemonCapabilityUnavailableError("get_rlm_children", "authoritative_child_roster");
@@ -579,14 +648,15 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (!Array.isArray(data.children) || !Number.isInteger(data.eventSequence)) {
 			throw new Error("Daemon returned an invalid child roster");
 		}
+		const children = data.children.map((child) => this.downgradeChildStallState(child));
 		if ((this.childRosterSequence ?? -1) > data.eventSequence) {
-			return this.latestSnapshot?.children ?? data.children;
+			return this.latestSnapshot?.children ?? children;
 		}
 		this.childRosterSequence = data.eventSequence;
 		if (this.latestSnapshot) {
-			this.latestSnapshot = { ...this.latestSnapshot, children: data.children };
+			this.latestSnapshot = { ...this.latestSnapshot, children };
 		}
-		return data.children;
+		return children;
 	}
 
 	async getMessages(): Promise<AgentMessage[]> {
@@ -1408,6 +1478,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		this.activeSessionId = targetActiveSessionId;
 		this.lastEventCursor = undefined;
 		this.lastEventSequence = undefined;
+		this.resetEventGapBaseline();
 		this.latestSnapshot = undefined;
 		this.latestSnapshotIsFresh = false;
 		this.retiredEventGenerations.clear();
@@ -1779,7 +1850,10 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 		if (message.type === "session_snapshot_failed") {
 			const assembly = this.getSnapshotAssembly(message.snapshotId);
-			const purpose = assembly.begin?.purpose ?? "attach";
+			// A failure with no begin frame (the supervisor gave up retrying a
+			// catch-up) carries its own purpose; without it a client could not tell
+			// that it must re-pull the session.
+			const purpose = assembly.begin?.purpose ?? message.purpose ?? "attach";
 			const snapshotError = new Error(message.error);
 			const recoveryPromise =
 				purpose === "replacement" || purpose === "resync"
@@ -1802,6 +1876,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (this.isStaleSequencedMessage(message)) {
 			return;
 		}
+		this.observeEventSequenceGap(message);
 		this.observeDaemonEventSequence(message);
 
 		if (message.type === "assistant_stream_delta") {
@@ -1835,19 +1910,25 @@ export class DaemonAgentConnection implements AgentConnection {
 		this.streamReconstructor.observe(message);
 
 		if (message.type === "session_event") {
+			// Child snapshots cross the capability gate before anything observes or
+			// re-emits them, so the roster cache and the UI see the same downgrade.
+			const sessionEvent =
+				message.event.type === "rlm_child_update"
+					? { ...message.event, child: this.downgradeChildStallState(message.event.child) }
+					: message.event;
 			if (
-				message.event.type !== "refine_complete" &&
-				message.event.type !== "refine_failed" &&
-				message.event.type !== "session_persist_failed"
+				sessionEvent.type !== "refine_complete" &&
+				sessionEvent.type !== "refine_failed" &&
+				sessionEvent.type !== "session_persist_failed"
 			) {
-				this.observeStreamingMessage(message.event);
+				this.observeStreamingMessage(sessionEvent);
 			}
-			if (message.event.type === "rlm_child_update") {
+			if (sessionEvent.type === "rlm_child_update") {
 				this.childRosterSequence = maxEventSequence(this.childRosterSequence, getDaemonMessageSequence(message));
-				this.observeRlmChildUpdate(message.event.child);
+				this.observeRlmChildUpdate(sessionEvent.child);
 			}
 			this.latestSnapshotIsFresh = false;
-			await this.emit({ type: "session_event", event: message.event });
+			await this.emit({ type: "session_event", event: sessionEvent });
 			return;
 		}
 		if (message.type === "side_question_event") {
@@ -1867,9 +1948,10 @@ export class DaemonAgentConnection implements AgentConnection {
 			return;
 		}
 		if (message.type === "session_resynced") {
+			this.resetEventGapBaseline();
 			this.attachedSessionId = message.snapshot.state.sessionId;
 			this.attachedSessionFile = message.snapshot.state.sessionFile;
-			this.latestSnapshot = mapDaemonSessionSnapshot(message.snapshot);
+			this.latestSnapshot = this.downgradeSnapshotStallState(mapDaemonSessionSnapshot(message.snapshot));
 			if (Array.isArray(message.snapshot.children)) {
 				this.childRosterSequence = message.snapshot.lastEventSequence;
 			}
@@ -2056,6 +2138,7 @@ export class DaemonAgentConnection implements AgentConnection {
 					this.lastEventSequence = undefined;
 					this.lastEventCursor = undefined;
 					this.retiredEventGenerations.clear();
+					this.resetEventGapBaseline();
 					await this.attach({ recoverable: false });
 					if (this.disposed) {
 						return;
@@ -2146,28 +2229,53 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (purpose === "replacement") {
 			this.latestSnapshot = undefined;
 		}
-		try {
-			const snapshot = await this.getInitialSnapshot();
-			if (this.disposed) {
+		const retryDelays = this.options.snapshotRecoveryRetryDelaysMs ?? SNAPSHOT_RECOVERY_RETRY_DELAYS_MS;
+		let recoveryError: unknown;
+		for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
+			if (attempt > 0) {
+				const retryDelayMs = retryDelays[attempt - 1] ?? 0;
+				// Degrade visibly but stay connected: the previous (now stale) view
+				// stays on screen while the full re-pull is retried. A single failed
+				// re-pull must not be enough to drop an unattended session offline.
+				await this.emit({
+					type: "connection_status",
+					status: "reconnecting",
+					error: `Daemon snapshot recovery failed; retrying in ${retryDelayMs}ms. Recovery error: ${formatErrorSentence(recoveryError)}`,
+				});
+				await delay(retryDelayMs);
+				if (this.disposed) {
+					return;
+				}
+			}
+			try {
+				const snapshot = await this.getInitialSnapshot();
+				if (this.disposed) {
+					return;
+				}
+				this.resetEventGapBaseline();
+				this.attachedSessionId = snapshot.state.sessionId;
+				this.attachedSessionFile = snapshot.state.sessionFile;
+				if (purpose === "replacement") {
+					await this.emit({ type: "session_replaced", state: snapshot.state, messages: snapshot.messages });
+				} else {
+					await this.emit({ type: "session_resynced", snapshot });
+				}
+				if (attempt > 0) {
+					await this.emit({ type: "connection_status", status: "connected" });
+				}
 				return;
+			} catch (error) {
+				recoveryError = error;
 			}
-			this.attachedSessionId = snapshot.state.sessionId;
-			this.attachedSessionFile = snapshot.state.sessionFile;
-			if (purpose === "replacement") {
-				await this.emit({ type: "session_replaced", state: snapshot.state, messages: snapshot.messages });
-			} else {
-				await this.emit({ type: "session_resynced", snapshot });
-			}
-		} catch (recoveryError) {
-			if (this.disposed) {
-				return;
-			}
-			this.terminalCloseEmitted = true;
-			await this.emit({
-				type: "closed",
-				error: `Failed to recover from a ${purpose} snapshot transfer. Snapshot error: ${formatErrorSentence(snapshotError)} Recovery error: ${formatErrorSentence(recoveryError)} ${this.formatDaemonDiagnosticContext()}`,
-			});
 		}
+		if (this.disposed) {
+			return;
+		}
+		this.terminalCloseEmitted = true;
+		await this.emit({
+			type: "closed",
+			error: `Failed to recover from a ${purpose} snapshot transfer after ${retryDelays.length + 1} attempts. Snapshot error: ${formatErrorSentence(snapshotError)} Recovery error: ${formatErrorSentence(recoveryError)} ${this.formatDaemonDiagnosticContext()}`,
+		});
 	}
 
 	private async waitForSnapshot(snapshotId: string): Promise<DaemonSessionSnapshot> {
@@ -2187,13 +2295,14 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	private applyReplacementSnapshot(snapshot: DaemonSessionSnapshot, replay?: DaemonReplayInfo): void {
+		this.resetEventGapBaseline();
 		if (snapshot.lastEventCursor) {
 			this.observeEventCursor(snapshot.lastEventCursor);
 		}
 		this.lastEventSequence = maxEventSequence(this.lastEventSequence, snapshot.lastEventSequence);
 		this.attachedSessionId = snapshot.state.sessionId;
 		this.attachedSessionFile = snapshot.state.sessionFile;
-		this.latestSnapshot = mapDaemonSessionSnapshot(snapshot, replay);
+		this.latestSnapshot = this.downgradeSnapshotStallState(mapDaemonSessionSnapshot(snapshot, replay));
 		this.childRosterSequence = Array.isArray(snapshot.children) ? snapshot.lastEventSequence : undefined;
 		this.reseedStreamReconstructor();
 		this.latestSnapshotIsFresh = true;
@@ -2256,7 +2365,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		this.lastEventSequence = maxEventSequence(this.lastEventSequence, message.lastEventSequence);
 		this.attachedSessionId = snapshot.state.sessionId;
 		this.attachedSessionFile = snapshot.state.sessionFile;
-		this.latestSnapshot = mapDaemonSessionSnapshot(snapshot);
+		this.latestSnapshot = this.downgradeSnapshotStallState(mapDaemonSessionSnapshot(snapshot));
 		this.reseedStreamReconstructor();
 		this.latestSnapshotIsFresh = true;
 		assembly.resolve(snapshot);
@@ -2371,6 +2480,104 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 		const sequence = getDaemonMessageSequence(message);
 		return sequence !== undefined && this.lastEventSequence !== undefined && sequence <= this.lastEventSequence;
+	}
+
+	/**
+	 * P0-5c: detects a hole in one event generation's sequence. Log-only by default
+	 * (C11) — the count and the log line are evidence for the switch to "recover",
+	 * which is gated on a window without false positives. Four rules keep it quiet:
+	 * the first frame after a reseed only re-arms the baseline, a generation change
+	 * only re-baselines, a frame without a cursor is skipped, and reports are
+	 * single-flighted and throttled.
+	 */
+	private observeEventSequenceGap(message: DaemonOutbound): void {
+		const cursor = getDaemonMessageCursor(message);
+		if (!cursor) {
+			return;
+		}
+		const baseline = this.eventGapBaseline;
+		this.eventGapBaseline = cursor;
+		if (!this.eventGapArmed) {
+			this.eventGapArmed = true;
+			return;
+		}
+		if (!baseline || baseline.generation !== cursor.generation) {
+			return;
+		}
+		if (cursor.sequence <= baseline.sequence + 1) {
+			return;
+		}
+		this.reportEventGap(baseline.sequence + 1, cursor.sequence, cursor.generation);
+	}
+
+	/** A reseed (attach, resync, replacement, reconnect) is a new baseline, never a gap. */
+	private resetEventGapBaseline(): void {
+		this.eventGapArmed = false;
+		this.eventGapBaseline = undefined;
+		this.eventGapInFlight = false;
+	}
+
+	private eventGapRecoveryMode(): "log" | "recover" {
+		return this.options.eventGapRecovery ?? configuredEventGapRecoveryMode();
+	}
+
+	/** Gap-detector evidence for tests and diagnostics; no private state to probe. */
+	get eventGapDiagnostics(): {
+		mode: "log" | "recover";
+		detected: number;
+		suppressed: number;
+		lastExpected: number | undefined;
+		lastGot: number | undefined;
+		recoveryInFlight: boolean;
+	} {
+		return {
+			mode: this.eventGapRecoveryMode(),
+			detected: this.eventGapDetected,
+			suppressed: this.eventGapSuppressed,
+			lastExpected: this.eventGapLastExpected,
+			lastGot: this.eventGapLastGot,
+			recoveryInFlight: this.eventGapInFlight,
+		};
+	}
+
+	private reportEventGap(expected: number, got: number, generation: string): void {
+		this.eventGapDetected++;
+		this.eventGapLastExpected = expected;
+		this.eventGapLastGot = got;
+		const detail = `event gap detected for ${this.activeSessionId}: expected sequence ${expected}, got ${got} (generation ${generation})`;
+		if (this.eventGapRecoveryMode() === "recover") {
+			// Single flight: one hole triggers one re-pull, not one per later frame.
+			if (this.eventGapInFlight || this.disposed) {
+				return;
+			}
+			this.eventGapInFlight = true;
+			this.appendEventGapLog(`${detail}; re-pulling the session`);
+			void this.recoverFailedSnapshot("resync", new Error(detail)).finally(() => {
+				this.eventGapInFlight = false;
+			});
+			return;
+		}
+		const now = Date.now();
+		if (this.eventGapLastReportAt !== undefined && now - this.eventGapLastReportAt < EVENT_GAP_LOG_THROTTLE_MS) {
+			this.eventGapSuppressed++;
+			return;
+		}
+		const suppressed = this.eventGapSuppressed;
+		this.eventGapSuppressed = 0;
+		this.eventGapLastReportAt = now;
+		this.appendEventGapLog(
+			`${detail}; log-only, no recovery attempted${
+				suppressed > 0 ? ` (+${suppressed} suppressed in the last ${EVENT_GAP_LOG_THROTTLE_MS}ms)` : ""
+			}`,
+		);
+	}
+
+	private appendEventGapLog(detail: string): void {
+		try {
+			appendRotatingLog(getAgentLogPath(), `[${new Date().toISOString()}] event-gap: ${detail}`);
+		} catch {
+			// A logging failure must not turn an observation into a connection failure.
+		}
 	}
 
 	private observeDaemonEventSequence(message: DaemonOutbound): void {

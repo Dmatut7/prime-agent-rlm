@@ -105,8 +105,16 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 //   25 fork 4044beb7c9f4 | upstream 585ef1102921
 //   26 fork 31fb64b6f4ee | upstream 962b8b4c5e35
 //   27 union of both sides' 24/25/26 (sync-upstream-r3 merge); see S5.1 table in docs/fork/sync-upstream-r3.md
-export const DAEMON_SCHEMA_REVISION = 27;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-27-589a2219bc8b";
+// Revision 28 adds the rlm_child_stall_activity capability: activity.kind
+//   "stalled", the child.stall facts on rlm_child_update snapshots, and the
+//   stall_unsettled session event (capability-gated, old clients downgrade).
+// Revision 28 also carries the daemon-lifecycle optional fields, because both
+//   changes land in one commit and there is no wire state where 28 meant only
+//   the stall capability: daemon_hello.adopting / daemon_hello.degraded, and
+//   session_snapshot_failed.reason / .purpose. Each is optional and absent on
+//   the pre-28 wire, so no client gates on the number; the digest identifies it.
+export const DAEMON_SCHEMA_REVISION = 28;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-28-66299858b8b4";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -158,6 +166,12 @@ export type DaemonServerCapability =
 	| "session_input_pause"
 	| "owned_prompt_cancellation"
 	| "acp_mcp_servers"
+	// The daemon reports subagent stall state: activity.kind "stalled" plus the
+	// child.stall facts (silentMs, thresholdMs, in-flight tools, unsettled) on
+	// rlm_child_update snapshots and the stall_unsettled session event. Clients
+	// must check before rendering a stall marker; without it they downgrade
+	// "stalled" activity to "waiting" and drop child.stall.
+	| "rlm_child_stall_activity"
 	// The daemon honors omitStreamingMessages on list, leaving each row's
 	// in-flight assistant message out of the response. Senders must check before
 	// relying on the smaller payload.
@@ -225,6 +239,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"session_input_pause",
 	"acp_mcp_servers",
 	"list_without_streaming_messages",
+	"rlm_child_stall_activity",
 	"control_plane",
 ];
 
@@ -1304,6 +1319,17 @@ export type DaemonOutbound =
 			supervisorSocketPath?: string;
 			clientId: DaemonClientId;
 			serverCapabilities: readonly DaemonServerCapability[];
+			/**
+			 * Registered session workers still being adopted in the background after
+			 * startup. Absent (not zero) once adoption has settled, so a client that
+			 * does not know the field sees exactly today's hello.
+			 */
+			adopting?: number;
+			/**
+			 * True while the supervisor keeps running on state it could not persist or
+			 * on isolated unhandled rejections. Absent when healthy.
+			 */
+			degraded?: boolean;
 	  }
 	| { type: "daemon_closing"; reason: DaemonClosingReason }
 	| { type: "heartbeats_changed" }
@@ -1363,6 +1389,18 @@ export type DaemonOutbound =
 			activeSessionId: string;
 			snapshotId: string;
 			error: string;
+			/**
+			 * Why the transfer failed. `catchup_exhausted` means the supervisor spent
+			 * its bounded catch-up retry budget, `catchup_failed` that the failure is
+			 * not retryable; both ask the client to re-pull the full snapshot.
+			 */
+			reason?: "catchup_exhausted" | "catchup_failed";
+			/**
+			 * Purpose the failed transfer served. Carried so a client can recover from
+			 * a failure that has no preceding session_snapshot_begin frame; clients
+			 * that do not understand it keep deriving the purpose from the begin frame.
+			 */
+			purpose?: "attach" | "replacement" | "resync";
 	  }
 	| { type: "session_detached"; activeSessionId: string }
 	| { type: "session_closed"; activeSessionId: string; reason: DaemonSessionClosedReason; meta?: DaemonEventMeta }

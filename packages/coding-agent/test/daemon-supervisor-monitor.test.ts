@@ -1012,6 +1012,7 @@ describe("daemon worker supervisor monitoring", () => {
 			signalCleanupHandlers: [],
 			workers: new Map(),
 			clients: new Set(),
+			adoptionRetryTimers: new Map(),
 			catalog: { stop: vi.fn(async () => undefined) },
 			cleanupSocket,
 			snapshotCacheRoot: "\0",
@@ -1072,6 +1073,7 @@ describe("daemon worker supervisor monitoring", () => {
 			signalCleanupHandlers: [],
 			workers,
 			clients: new Set(),
+			adoptionRetryTimers: new Map(),
 			persistWorkerStopTombstone: vi.fn(),
 			hasPersistedWorkerDescriptors: vi.fn(() => true),
 			catalog: { stop: catalogStop },
@@ -1617,6 +1619,9 @@ describe("daemon worker supervisor monitoring", () => {
 				rootActiveSessionId: "root-active",
 				lifecycle: "ready" as const,
 			},
+			// A ready worker is a connected worker: since L4 the supervisor forwards a kill
+			// only when it has a client to forward on, and performs the semantic kill otherwise.
+			client: { close: vi.fn() },
 			summaries: new Map<string, SessionSummary>([
 				[
 					"root-active",
@@ -1765,6 +1770,10 @@ describe("daemon worker supervisor monitoring", () => {
 			launchWorker: vi.fn(async () => worker),
 			persistWorker: vi.fn(),
 			assertRecoveryAllowed: vi.fn(async () => {}),
+			// The park path now offers a scheduled-job re-adoption; this worker has no
+			// roster rows and no session file, so the offer is declined.
+			adoptionRetryTimers: new Map(),
+			workerRosterEntries: vi.fn(() => []),
 		}) as RecoveryHarness;
 
 		const recovery = supervisor.recoverWorker(worker);
@@ -2159,6 +2168,10 @@ describe("daemon worker supervisor monitoring", () => {
 			persistWorker,
 			markWorkerRosterEntries: vi.fn(),
 			log: vi.fn(),
+			// The park path now offers a scheduled-job re-adoption; this worker has no
+			// roster rows and no session file, so the offer is declined.
+			adoptionRetryTimers: new Map(),
+			workerRosterEntries: vi.fn(() => []),
 		}) as { deferWorkerRecovery(target: typeof worker, error: Error): void };
 
 		supervisor.deferWorkerRecovery(worker, new Error("still silent"));
@@ -3868,7 +3881,7 @@ describe("daemon worker supervisor monitoring", () => {
 
 	it("subscribes to worker updates with chunked snapshots", async () => {
 		type SubscriptionWorker = {
-			client: { requestWorker: (command: unknown) => Promise<{ success: boolean }> };
+			client: { requestWorker: (command: unknown, timeoutMs?: number) => Promise<{ success: boolean }> };
 		};
 		const requestWorker = vi.fn(async () => ({ success: true }));
 		const worker: SubscriptionWorker = { client: { requestWorker } };
@@ -3880,12 +3893,17 @@ describe("daemon worker supervisor monitoring", () => {
 
 		await supervisor.subscribeWorker(worker, "active-1");
 
-		expect(requestWorker).toHaveBeenCalledWith({
-			type: "worker_subscribe",
-			activeSessionId: "active-1",
-			capabilities: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"],
-			supportsExtensionUi: false,
-		});
+		// L3/F14: a subscribe is bounded. The default matches the worker client's own
+		// request timeout, so callers that pass no budget keep today's behaviour.
+		expect(requestWorker).toHaveBeenCalledWith(
+			{
+				type: "worker_subscribe",
+				activeSessionId: "active-1",
+				capabilities: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"],
+				supportsExtensionUi: false,
+			},
+			30_000,
+		);
 	});
 
 	it("does not retain an attachment when snapshot loading fails", async () => {

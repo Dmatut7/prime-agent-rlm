@@ -22,6 +22,14 @@ export interface DaemonSocketClient {
 	catchupPromise?: Promise<void>;
 	/** Delayed retry after transient catch-up snapshot preparation failure. */
 	catchupRetryTimer?: NodeJS.Timeout;
+	/**
+	 * Per-session bounded retry budget for catch-up failures. Cleared when the
+	 * catch-up succeeds, when the session's event generation changes, and when
+	 * the socket closes, so a healed client is never told it fell behind.
+	 */
+	catchupRetryState?: Map<string, ClientCatchupRetryState>;
+	/** Latest event generation observed for each attached session; scopes the catch-up retry budgets. */
+	observedEventGenerations?: Map<string, string>;
 	backpressured?: boolean;
 	rosterSubscribed?: boolean;
 	/** A push hit backpressure; one full-roster resync goes out on drain. */
@@ -46,6 +54,18 @@ export interface DaemonSocketClient {
 	/** Command-gating set from declare_client_capabilities. Distinct from event-delivery capabilities. */
 	declaredCommandCapabilities?: Set<DaemonDeclaredCapability>;
 	capabilitiesByActiveSessionId?: Map<string, Set<DaemonClientCapability>>;
+}
+
+/** One client's bounded retry budget for catching up one session (C10). */
+export interface ClientCatchupRetryState {
+	/** Consecutive transient catch-up failures; the budget gives up at the policy attempt cap. */
+	attempts: number;
+	/** When this budget opened; it also expires on the policy wall-clock deadline. */
+	openedAt: number;
+	/** Throttles repeated failure logging to at most one warn per minute per (client, session). */
+	lastWarnAt?: number;
+	/** Event generation the budget is bound to; a different generation means the client moved on. */
+	generation?: string;
 }
 
 export interface ActiveSessionState {

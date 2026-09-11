@@ -1,4 +1,4 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
 	chmodSync,
@@ -11,9 +11,11 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { basename, dirname, join, resolve } from "node:path";
 import { Writable } from "node:stream";
+import { promisify } from "node:util";
 import { getLogger } from "@earendil-works/pi-ai";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import {
@@ -191,6 +193,17 @@ const SUPERVISOR_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
 ];
 const PEER_TRANSPORT_GRANT_TTL_MS = 10_000;
 const WORKER_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+// Startup adoption waits on a bounded window instead: a worker that never answers
+// must park failed rather than keep the supervisor from opening its socket (F14).
+// Must stay equal to the update-restart adoption budget (appendix A of the fix plan).
+const ADOPTION_WORKER_REQUEST_TIMEOUT_MS = 300_000;
+// Failed-worker reaper cadence (L5). The threshold itself is settings-driven.
+const FAILED_WORKER_REAP_INTERVAL_MS = 5 * 60_000;
+// L3: how many workers are adopted concurrently once the socket is already open.
+const ADOPTION_CONCURRENCY = 4;
+// L3/amend: a session with scheduled jobs is re-adopted on a backoff instead of being
+// parked failed, so an unattended heartbeat does not silently stop at startup.
+const ADOPTION_RETRY_DELAYS_MS: readonly number[] = [30_000, 120_000, 600_000];
 const INPUT_PAUSE_CLEANUP_TIMEOUT_MS = 5_000;
 const UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS = 80_000;
 const UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS = 90_000;
@@ -231,6 +244,233 @@ const SCHEDULED_WAKE_MAX_TIMEOUT_MS = 2_147_483_647;
 const SCHEDULED_WAKE_CLIENT_ID = "scheduled-wake";
 const SUPERVISOR_CONFIG_FILE_NAME = "supervisor-config";
 const WORKER_STARTUP_GATE_FD = 3;
+
+/**
+ * Bounded retry budget for a client catch-up that failed transiently (C10).
+ * Both bounds are hard: the attempt cap stops a permanently failing session and
+ * the deadline caps the wall-clock window, so jitter can spread concurrent
+ * clients without stretching how long one lagging client is retried for.
+ */
+export interface ClientCatchupRetryPolicy {
+	/** Exponential backoff schedule; the last entry is also the cap for later attempts. */
+	backoffMs: readonly number[];
+	/** Per-attempt backoff ceiling, before jitter. */
+	capMs: number;
+	/** Consecutive transient failures after which the client is told to re-pull. */
+	maxAttempts: number;
+	/** Upper bound of the random spread added to each delay so clients do not retry in lockstep. */
+	jitterMs: number;
+	/** Wall-clock budget for one (client, session) failure streak. */
+	deadlineMs: number;
+	/** Repeated failures for one (client, session) log at most one warn per window. */
+	logThrottleMs: number;
+}
+
+export const DEFAULT_CLIENT_CATCHUP_RETRY_POLICY: ClientCatchupRetryPolicy = {
+	backoffMs: [250, 500, 1_000, 2_000, 4_000, 8_000],
+	capMs: 8_000,
+	maxAttempts: 40,
+	jitterMs: 60_000,
+	deadlineMs: 5 * 60_000,
+	logThrottleMs: 60_000,
+};
+
+/**
+ * Delay before the next catch-up retry, or `undefined` once the budget is spent.
+ * `attempt` is the 1-based count of consecutive failures, `remainingMs` the time
+ * left on the streak deadline.
+ */
+export function clientCatchupRetryDelayMs(
+	policy: ClientCatchupRetryPolicy,
+	attempt: number,
+	jitterMs: number,
+	remainingMs: number,
+): number | undefined {
+	if (attempt < 1 || attempt >= policy.maxAttempts || remainingMs <= 0) {
+		return undefined;
+	}
+	const backoff = policy.backoffMs[Math.min(attempt, policy.backoffMs.length) - 1] ?? policy.capMs;
+	const jitter = Math.max(0, Math.min(jitterMs, policy.jitterMs));
+	return Math.max(1, Math.min(Math.min(backoff, policy.capMs) + jitter, remainingMs));
+}
+
+/**
+ * Transient catch-up failures are retried; everything else is handed straight to
+ * the client for a full re-pull. The transient set is deliberately narrow: an
+ * unknown or ambiguous session never becomes resolvable by waiting, and retrying
+ * it would only delay the loud failure the client needs in order to self-heal.
+ */
+const TRANSIENT_CATCHUP_FAILURES: readonly RegExp[] = [
+	/Session worker is recovering/i,
+	/was superseded/i,
+	/\btimed out\b/i,
+];
+
+const SUPERVISOR_REJECTION_WINDOW_MS = 60 * 60 * 1000;
+const SUPERVISOR_REJECTION_LOG_THROTTLE_MS = 60 * 1000;
+const SUPERVISOR_DEGRADED_LOG_THROTTLE_MS = 10 * 1000;
+
+export interface SupervisorCrashHandlerOptions {
+	/** Sink for the human-readable line; defaults to stderr. */
+	log?: (message: string) => void;
+	/** Called for every isolated rejection, so the supervisor can mark itself degraded. */
+	recordRejection?: (detail: string) => void;
+	/**
+	 * C18: exit(1) once the windowed rejection count reaches this. Disabled unless
+	 * positive — the shipped default is log-and-isolate, and the threshold is a
+	 * deliberate deviation from the worker-side handler, which exits on the first one.
+	 */
+	rejectionExitThreshold?: number;
+	rejectionWindowMs?: number;
+	rejectionLogThrottleMs?: number;
+	/** Exit hook, injectable so a test can assert the verdict without killing its runner. */
+	exit?: (code: number) => void;
+}
+
+/**
+ * Process-level last line of defence for the supervisor (L6). An uncaught
+ * exception means the process state cannot be trusted, so it is logged with its
+ * stack and the process exits. An unhandled rejection is isolated instead: the
+ * supervisor is a global single point, and one leaked promise must not take every
+ * session down with it. Rejections are counted over a sliding window and logged at
+ * a bounded rate so a storm stays visible without drowning the log.
+ *
+ * Returns the uninstaller; the supervisor removes the handlers when it stops.
+ */
+export function installSupervisorCrashHandlers(options: SupervisorCrashHandlerOptions = {}): () => void {
+	const log = options.log ?? ((message: string) => console.error(message));
+	const exit = options.exit ?? ((code: number) => process.exit(code));
+	const windowMs = options.rejectionWindowMs ?? SUPERVISOR_REJECTION_WINDOW_MS;
+	const throttleMs = options.rejectionLogThrottleMs ?? SUPERVISOR_REJECTION_LOG_THROTTLE_MS;
+	const rejectionTimestamps: number[] = [];
+	let suppressedRejections = 0;
+	let lastRejectionLogAt = 0;
+
+	const onUncaughtException = (error: Error) => {
+		log(`supervisor uncaught exception: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`);
+		exit(1);
+	};
+	const onUnhandledRejection = (reason: unknown) => {
+		const detail = reason instanceof Error ? (reason.stack ?? reason.message) : String(reason);
+		const now = Date.now();
+		while (rejectionTimestamps.length > 0 && now - (rejectionTimestamps[0] ?? 0) > windowMs) {
+			rejectionTimestamps.shift();
+		}
+		rejectionTimestamps.push(now);
+		const count = rejectionTimestamps.length;
+		options.recordRejection?.(detail);
+		if (now - lastRejectionLogAt >= throttleMs) {
+			lastRejectionLogAt = now;
+			const suppressed = suppressedRejections > 0 ? `, ${suppressedRejections} suppressed since the last line` : "";
+			suppressedRejections = 0;
+			log(`supervisor unhandled rejection (count in the last ${windowMs}ms: ${count}${suppressed}): ${detail}`);
+		} else {
+			suppressedRejections++;
+		}
+		const threshold = options.rejectionExitThreshold;
+		if (threshold !== undefined && threshold > 0 && count >= threshold) {
+			log(`supervisor exiting after ${count} unhandled rejections within ${windowMs}ms (threshold ${threshold})`);
+			exit(1);
+		}
+	};
+	process.on("uncaughtException", onUncaughtException);
+	process.on("unhandledRejection", onUnhandledRejection);
+	return () => {
+		process.off("uncaughtException", onUncaughtException);
+		process.off("unhandledRejection", onUnhandledRejection);
+	};
+}
+
+const execFileAsync = promisify(execFile);
+
+/**
+ * Asynchronous process start identity (I-7). `getProcessStartId` shells out with
+ * execFileSync on macOS/BSD/Windows, and a periodic sweep must not block the
+ * supervisor's single thread with it — that is exactly the stall a worker liveness
+ * probe would then misread. Same formats as the synchronous helper, so identities
+ * recorded by either compare equal.
+ */
+export async function getProcessStartIdAsync(pid: number): Promise<string | undefined> {
+	if (!Number.isInteger(pid) || pid <= 0) {
+		return undefined;
+	}
+	if (process.platform === "win32") {
+		try {
+			const { stdout } = await execFileAsync("powershell.exe", [
+				"-NoLogo",
+				"-NoProfile",
+				"-NonInteractive",
+				"-Command",
+				`([System.Diagnostics.Process]::GetProcessById(${pid})).StartTime.ToUniversalTime().Ticks`,
+			]);
+			const ticks = stdout.trim();
+			return /^\d+$/.test(ticks) ? `win:${ticks}` : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+	try {
+		const stat = await readFile(`/proc/${pid}/stat`, "utf8");
+		const commandEnd = stat.lastIndexOf(")");
+		const startTime = stat.slice(commandEnd + 2).split(" ")[19];
+		if (startTime) {
+			return `proc:${startTime}`;
+		}
+	} catch {
+		// Fall through to the portable process listing used on macOS and BSD.
+	}
+	try {
+		// `lstart` is rendered in the subprocess timezone and locale, so pin both for a durable identity.
+		const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "lstart="], {
+			env: { ...process.env, LC_ALL: "C", LC_TIME: "C", LANG: "C", TZ: "UTC" },
+		});
+		const startTime = stdout.trim();
+		return startTime ? `ps:${startTime}` : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The reaper's death proof (L5): the pid is gone, or it is alive under a start
+ * identity that is demonstrably somebody else's. Anything unobservable counts as
+ * alive, because a failed-worker registration is deleted irreversibly.
+ */
+export async function isProcessIdentityConfirmedDead(
+	pid: number,
+	recordedStartId: string | undefined,
+): Promise<boolean> {
+	if (!processIdExists(pid)) {
+		return true;
+	}
+	if (recordedStartId === undefined) {
+		return false;
+	}
+	const observedStartId = await getProcessStartIdAsync(pid);
+	if (observedStartId === undefined) {
+		return false;
+	}
+	return observedStartId !== recordedStartId;
+}
+
+/** Worker-availability errors that are ordinary transient states rather than faults. */
+const EXPECTED_WORKER_AVAILABILITY_ERRORS: readonly RegExp[] = [
+	/^Session worker is (recovering|stopping|starting)\b/,
+	/^Session worker is not connected\b/,
+];
+
+export function isExpectedWorkerAvailabilityError(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return EXPECTED_WORKER_AVAILABILITY_ERRORS.some((pattern) => pattern.test(message));
+}
+
+export function isTransientCatchupFailure(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return TRANSIENT_CATCHUP_FAILURES.some((pattern) => pattern.test(message));
+}
+
+/** Terminal commands converge on a target that is already gone instead of failing (C19/L4). */
+const TERMINAL_DAEMON_COMMANDS: ReadonlySet<string> = new Set(["kill", "abort", "cancel_rlm_child"]);
 
 const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"ack_result",
@@ -371,6 +611,8 @@ interface ResidentWorker {
 	pendingClient?: DaemonWorkerClient;
 	/** Consecutive defer->probe rounds against a live-but-silent worker; bounded by MAX_DEFERRED_RECOVERY_ROUNDS. */
 	deferredRecoveryRounds?: number;
+	/** Backoff re-adoption attempts spent on a worker whose sessions have scheduled jobs (L3). */
+	adoptionRetryAttempt?: number;
 	/** Bumped per applied roster frame; a summaries pull that straddles a frame must not gap-fill. */
 	rosterEpoch?: number;
 	rosterApplyChain?: Promise<void>;
@@ -401,10 +643,18 @@ interface SnapshotTranscriptGeneration {
 	validation?: SnapshotDuplicateValidation;
 }
 
-interface DaemonSupervisorOptions {
+export interface DaemonSupervisorOptions {
 	socketPath?: string;
 	defaultSessionConfig: AgentSessionRuntimeConfig;
 	descriptorDir?: string;
+	/** Overrides the bounded client catch-up retry policy (C10); defaults to the production schedule. */
+	catchupRetryPolicy?: ClientCatchupRetryPolicy;
+	/** Overrides how long a startup adoption may wait on one worker request (F14). */
+	adoptionRequestTimeoutMs?: number;
+	/** Overrides the failed-worker reaper cadence; defaults to FAILED_WORKER_REAP_INTERVAL_MS. */
+	failedWorkerReapIntervalMs?: number;
+	/** Overrides the backoff used to re-adopt a worker whose sessions have scheduled jobs. */
+	adoptionRetryDelaysMs?: readonly number[];
 }
 
 interface PersistedSupervisorConfig {
@@ -760,6 +1010,24 @@ export class DaemonSupervisor {
 	private scheduledWakeRecompute?: Promise<void>;
 	private scheduledWakeRecomputeQueued = false;
 	private readonly scheduledWakeFailures = new Map<string, number>();
+	private readonly catchupRetryPolicy: ClientCatchupRetryPolicy;
+	private readonly adoptionRequestTimeoutMs: number;
+	private readonly failedWorkerReapIntervalMs: number;
+	private readonly adoptionRetryDelaysMs: readonly number[];
+	/** Workers still being adopted; published as daemon_hello.adopting so a partial startup is visible. */
+	private adoptionPendingCount = 0;
+	/** The workers the startup count was opened for, so a runtime re-adoption cannot skew it. */
+	private readonly adoptionCountedWorkers = new Set<ResidentWorker>();
+	private readonly adoptionRetryTimers = new Map<ResidentWorker, NodeJS.Timeout>();
+	private readonly adoptionFailures: Array<{ workerId: string; session: string; reason: string }> = [];
+	private adoptionReported = false;
+	/** Set once the supervisor keeps running on state it could not persist or on an isolated rejection (L6/F16). */
+	private degraded = false;
+	private readonly degradedCounts = new Map<string, number>();
+	private readonly degradedLogState = new Map<string, { at: number; suppressed: number }>();
+	private uninstallCrashHandlers?: () => void;
+	private failedWorkerReaperTimer?: NodeJS.Timeout;
+	private failedWorkerReapSweep?: Promise<void>;
 
 	constructor(
 		private readonly socketPath: string,
@@ -783,6 +1051,10 @@ export class DaemonSupervisor {
 		this.snapshotCacheRoot = join(this.descriptorDir, "snapshot-cache", this.generation);
 		this.catalog = new DaemonCatalogClient((message) => this.log(message));
 		this.settingsManager = SettingsManager.create(process.cwd(), this.defaultSessionConfig.agentDir ?? agentDir);
+		this.catchupRetryPolicy = options.catchupRetryPolicy ?? DEFAULT_CLIENT_CATCHUP_RETRY_POLICY;
+		this.adoptionRequestTimeoutMs = options.adoptionRequestTimeoutMs ?? ADOPTION_WORKER_REQUEST_TIMEOUT_MS;
+		this.failedWorkerReapIntervalMs = options.failedWorkerReapIntervalMs ?? FAILED_WORKER_REAP_INTERVAL_MS;
+		this.adoptionRetryDelaysMs = options.adoptionRetryDelaysMs ?? ADOPTION_RETRY_DELAYS_MS;
 	}
 
 	async start(): Promise<void> {
@@ -827,6 +1099,7 @@ export class DaemonSupervisor {
 			restrictDaemonSocketPath(this.socketPath);
 
 			this.registerSignalHandlers();
+			this.installCrashHandlers();
 			const ownedSessionFiles = new Set(
 				[...this.workers.values()]
 					.flatMap((worker) => [worker.descriptor.sessionFile, worker.descriptor.createCommand.sessionPath])
@@ -848,23 +1121,6 @@ export class DaemonSupervisor {
 			await this.catalog.start().catch((error) => this.log(`Could not start daemon catalog: ${String(error)}`));
 			this.assertSocketLeaseHeld();
 			await this.seedRosterLedger();
-			let adoptionFailure: unknown;
-			let adoptionFailed = false;
-			await Promise.all(
-				workersToAdopt.map(async (worker) => {
-					try {
-						await this.adoptOrRecoverWorker(worker);
-					} catch (error) {
-						if (!adoptionFailed) {
-							adoptionFailed = true;
-							adoptionFailure = error;
-						}
-					}
-				}),
-			);
-			if (adoptionFailed) {
-				throw adoptionFailure;
-			}
 			for (const worker of this.workers.values()) {
 				this.scheduleOwnedWorkerCleanup(worker);
 			}
@@ -872,12 +1128,18 @@ export class DaemonSupervisor {
 			this.scheduleScheduledSessionWakeRecompute();
 			this.rosterWatchdogTimer = setInterval(() => this.sweepRosterStaleness(), ROSTER_WATCHDOG_INTERVAL_MS);
 			this.rosterWatchdogTimer.unref();
+			this.startFailedWorkerReaper();
 			this.assertSocketLeaseHeld();
 			await this.ownership.updatePhase("owner");
 			this.assertSocketLeaseHeld();
 			this.startupComplete = true;
 			this.log(`Prime Agent daemon supervisor ${this.generation} listening on ${this.socketPath}`);
 			this.markReady();
+			// L3: adoption runs after the socket is open and the supervisor is ready.
+			// One wedged worker no longer keeps every session unreachable; a session
+			// whose worker is still being adopted answers as recovering (which clients
+			// retry), and daemon_hello.adopting says how many are in flight.
+			this.beginWorkerAdoption(workersToAdopt);
 		} catch (error) {
 			const startupError = error instanceof Error ? error : new Error(String(error));
 			this.log(`Daemon supervisor startup failed: ${startupError.stack ?? startupError.message}`);
@@ -885,6 +1147,15 @@ export class DaemonSupervisor {
 			this.rejectReady(startupError);
 			throw startupError;
 		}
+	}
+
+	/**
+	 * Releases the socket, timers, worker connections and catalog without exiting
+	 * the process. `shutdown` runs this and then exits; embedders and tests stop a
+	 * supervisor in-process through it. Worker processes keep their own supervision.
+	 */
+	async dispose(): Promise<void> {
+		await this.cleanupSupervisorResources();
 	}
 
 	private listen(): Promise<void> {
@@ -909,6 +1180,101 @@ export class DaemonSupervisor {
 		appendRotatingLog(getDaemonLogPath(this.socketPath), `[${new Date().toISOString()}] supervisor: ${message}`);
 	}
 
+	/** Same destinations as log(), at info level: expected transient states must not read as faults. */
+	private logInfo(message: string): void {
+		console.error(message);
+		structuredLog.info(message, { socketPath: this.socketPath });
+		appendRotatingLog(getDaemonLogPath(this.socketPath), `[${new Date().toISOString()}] supervisor: ${message}`);
+	}
+
+	/**
+	 * Fire-and-forget guard (L6): every detached promise gets a catch, so a failure
+	 * in a background path becomes one log line instead of an unhandled rejection
+	 * that would otherwise be the process's problem.
+	 */
+	private background<T>(operation: Promise<T>, context: string): void {
+		operation.catch((error: unknown) => {
+			this.log(`Background ${context} failed: ${error instanceof Error ? error.message : String(error)}`);
+		});
+	}
+
+	/** Degraded lines are throttled per cause so a stuck disk cannot drown the log. */
+	private logDegraded(cause: string, message: string): void {
+		const now = Date.now();
+		const state = this.degradedLogState.get(cause);
+		if (state && now - state.at < SUPERVISOR_DEGRADED_LOG_THROTTLE_MS) {
+			state.suppressed++;
+			return;
+		}
+		const suppressed = state?.suppressed ?? 0;
+		this.degradedLogState.set(cause, { at: now, suppressed: 0 });
+		this.log(suppressed > 0 ? `${message} (${suppressed} similar lines suppressed)` : message);
+	}
+
+	/**
+	 * Marks the supervisor degraded and counts the cause. Degraded is published in
+	 * daemon_hello, so an operator can tell a healthy daemon from one that is running
+	 * on state it could not persist (L6/F16).
+	 */
+	private recordDegraded(cause: string): number {
+		this.degraded = true;
+		const count = (this.degradedCounts.get(cause) ?? 0) + 1;
+		this.degradedCounts.set(cause, count);
+		return count;
+	}
+
+	/** Whether the supervisor is running on bookkeeping it could not persist (L6). */
+	get isDegraded(): boolean {
+		return this.degraded;
+	}
+
+	/** Per-cause degraded counters, for tests and diagnostics that must not probe privates. */
+	degradedCountsSnapshot(): ReadonlyMap<string, number> {
+		return new Map(this.degradedCounts);
+	}
+
+	private installCrashHandlers(): void {
+		if (this.uninstallCrashHandlers) {
+			return;
+		}
+		this.uninstallCrashHandlers = installSupervisorCrashHandlers({
+			log: (message) => this.log(message),
+			recordRejection: () => {
+				const count = this.recordDegraded("unhandled rejection");
+				void count;
+			},
+			rejectionExitThreshold: this.supervisorRejectionExitThreshold(),
+		});
+	}
+
+	/**
+	 * C18 default: isolate and count, never exit. The threshold is a settings switch
+	 * that stays off until the final ruling (T4-5); a non-positive value disables it.
+	 */
+	private supervisorRejectionExitThreshold(): number | undefined {
+		return this.settingsManager.getDaemonSupervisorSettings().rejectionExitThreshold;
+	}
+
+	/**
+	 * Bookkeeping writes must not abort a recovery: a full or read-only descriptor
+	 * directory used to escape as an unhandled rejection and take the whole supervisor
+	 * down. The failure is logged, counted and published as degraded instead (F16).
+	 */
+	private tryPersistWorker(worker: ResidentWorker, context: string): boolean {
+		try {
+			this.persistWorker(worker);
+			return true;
+		} catch (error) {
+			const count = this.recordDegraded("worker bookkeeping write failed");
+			this.logDegraded(
+				"worker bookkeeping write failed",
+				`Supervisor degraded: could not persist worker ${worker.descriptor.workerId} bookkeeping during ${context} ` +
+					`(degraded count: ${count}): ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return false;
+		}
+	}
+
 	private clearIdleEvictionTimer(): void {
 		if (!this.idleEvictionTimer) return;
 		clearTimeout(this.idleEvictionTimer);
@@ -919,6 +1285,13 @@ export class DaemonSupervisor {
 		if (!this.rosterWatchdogTimer) return;
 		clearInterval(this.rosterWatchdogTimer);
 		this.rosterWatchdogTimer = undefined;
+	}
+
+	private clearAdoptionRetryTimers(): void {
+		for (const timer of this.adoptionRetryTimers.values()) {
+			clearTimeout(timer);
+		}
+		this.adoptionRetryTimers.clear();
 	}
 
 	private clearScheduledWakeTimer(): void {
@@ -1346,6 +1719,9 @@ export class DaemonSupervisor {
 			try {
 				const descriptor: unknown = JSON.parse(readFileSync(path, "utf8"));
 				if (!isDaemonWorkerDescriptor(descriptor, this.socketPath)) {
+					// A silently skipped descriptor is unrecoverable evidence loss: the
+					// worker it named stays invisible to this and every later restart.
+					this.log(`Ignoring worker descriptor ${path}: not a worker descriptor for socket ${this.socketPath}`);
 					continue;
 				}
 				descriptor.supervisorSocketPath = normalizeSocketPath(descriptor.supervisorSocketPath);
@@ -1493,13 +1869,19 @@ export class DaemonSupervisor {
 						supervisorSocketPath: this.ownership?.record.socketPath,
 						clientId: client.id,
 						serverCapabilities: SUPERVISOR_SERVER_CAPABILITIES,
+						// Both fields are optional and absent in the healthy case, so a
+						// client that never learned them simply sees today's hello.
+						...(this.adoptionPendingCount > 0 ? { adopting: this.adoptionPendingCount } : {}),
+						...(this.degraded ? { degraded: true } : {}),
 					});
 				}
 			},
 			() => client.socket.destroy(),
 		);
 
-		client.detachInput = attachJsonlLineReader(socket, (line) => void this.handleLine(client, line));
+		client.detachInput = attachJsonlLineReader(socket, (line) =>
+			this.background(this.handleLine(client, line), `client command handling for ${client.id}`),
+		);
 		let cleaned = false;
 		const cleanup = () => {
 			if (cleaned) {
@@ -1507,6 +1889,7 @@ export class DaemonSupervisor {
 			}
 			cleaned = true;
 			client.detachInput();
+			this.clearClientCatchupRetry(client);
 			this.sessionInputPauseEpochs.set(client, (this.sessionInputPauseEpochs.get(client) ?? 0) + 1);
 			const ownerClientId = this.protocolClientId(client);
 			void this.releaseClientSessionInputPauses(client, undefined, true).catch((error: unknown) =>
@@ -1516,8 +1899,8 @@ export class DaemonSupervisor {
 			this.cancelWaitingPromptAdmissionsForClient(client);
 			for (const activeSessionId of [...client.attachedActiveSessionIds]) {
 				client.attachedActiveSessionIds.delete(activeSessionId);
-				void this.syncWorkerExtensionUi(activeSessionId);
-				void this.evictEmptySessionOnLastDetach(activeSessionId);
+				this.background(this.syncWorkerExtensionUi(activeSessionId), "extension UI sync");
+				this.background(this.evictEmptySessionOnLastDetach(activeSessionId), "empty session eviction on detach");
 			}
 			this.scheduleOwnedWorkerCleanupForClient(this.protocolClientId(client));
 		};
@@ -1931,7 +2314,17 @@ export class DaemonSupervisor {
 				this.write(client, response);
 			}
 		} catch (error) {
-			this.log(`Supervisor command ${command.type} failed: ${error instanceof Error ? error.stack : String(error)}`);
+			if (isExpectedWorkerAvailabilityError(error)) {
+				// A worker mid-recovery is a normal transient state, not a fault: keep it
+				// out of the warn-level stack traces so real failures stay readable.
+				this.logInfo(
+					`Supervisor command ${command.type} deferred: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			} else {
+				this.log(
+					`Supervisor command ${command.type} failed: ${error instanceof Error ? error.stack : String(error)}`,
+				);
+			}
 			let response = failure(command.id, command.type, error, serializeDaemonError(error));
 			if (journalIdentity && !isSupervisorGenerationStale(error)) {
 				try {
@@ -2056,6 +2449,13 @@ export class DaemonSupervisor {
 			}
 			case "attach": {
 				const attached = await this.attachClient(client, command);
+				// A client-driven attach reseeds the whole view, so any catch-up
+				// failure streak for that session is over (I-8).
+				this.noteClientViewReseeded(
+					client,
+					attached.result.activeSessionId,
+					attached.result.lastEventCursor?.generation,
+				);
 				if (client.capabilities.has("chunked_snapshot")) {
 					const transcript = attached.transcript;
 					if (!transcript) {
@@ -2285,10 +2685,12 @@ export class DaemonSupervisor {
 				return success(command.id, command.type, summary ? this.publicSummary(worker, summary) : undefined);
 			}
 			case "restart":
-				setImmediate(() => void this.shutdown(0, false, true, false, "update"));
+				setImmediate(() => this.background(this.shutdown(0, false, true, false, "update"), "restart shutdown"));
 				return success(command.id, command.type);
 			case "shutdown":
-				setImmediate(() => void this.shutdown(0, true, false, command.force === true, "shutdown"));
+				setImmediate(() =>
+					this.background(this.shutdown(0, true, false, command.force === true, "shutdown"), "daemon shutdown"),
+				);
 				return success(command.id, "shutdown");
 			case "prepare_update_restart": {
 				const manifest = await this.prepareUpdateRestart();
@@ -2660,15 +3062,24 @@ export class DaemonSupervisor {
 				: undefined;
 		try {
 			throwIfAdmissionCancelled(admission);
-			const match = await waitForPromptAdmission(
-				command.type === "set_session_name" && command.workerToken !== undefined
-					? this.findWorker(
-							command.activeSessionId,
-							(worker) => worker.descriptor.authenticationToken === command.workerToken,
-						)
-					: this.findWorkerForClient(client, command.activeSessionId),
-				admission?.controller.signal,
-			);
+			let match: WorkerMatch;
+			try {
+				match = await waitForPromptAdmission(
+					command.type === "set_session_name" && command.workerToken !== undefined
+						? this.findWorker(
+								command.activeSessionId,
+								(worker) => worker.descriptor.authenticationToken === command.workerToken,
+							)
+						: this.findWorkerForClient(client, command.activeSessionId),
+					admission?.controller.signal,
+				);
+			} catch (error) {
+				const terminal = this.terminalCommandResponseForGoneTarget(command, error);
+				if (terminal) {
+					return terminal;
+				}
+				throw error;
+			}
 			throwIfAdmissionCancelled(admission);
 			const resolvedCommand = {
 				...command,
@@ -2678,6 +3089,9 @@ export class DaemonSupervisor {
 			if (admission) {
 				admission.worker = match.worker;
 				admission.workerActiveSessionId = match.summary.activeSessionId ?? match.summary.id;
+			}
+			if (command.type === "kill" && !this.isWorkerKillForwardable(match.worker)) {
+				return await this.killUnreachableWorker(match.worker, match.summary, command);
 			}
 			const isRootKill =
 				command.type === "kill" &&
@@ -3154,6 +3568,9 @@ export class DaemonSupervisor {
 		command: DaemonCreateCommand,
 		existing?: ResidentWorker,
 		ownerClientId?: string,
+		// Adoption and recovery bound their create; a fresh create keeps the long
+		// budget because hydrating a large transcript is legitimate work (F14).
+		requestTimeoutMs = WORKER_REQUEST_TIMEOUT_MS,
 	): Promise<ResidentWorker> {
 		await this.assertRecoveryAllowed();
 		if (existing && this.isWorkerRecoveryCancelled(existing)) {
@@ -3318,7 +3735,7 @@ export class DaemonSupervisor {
 				child.unref();
 			}
 			const client = await this.connectWorker(worker, WORKER_CONNECT_TIMEOUT_MS);
-			const response = await client.request(withoutCommandId(createCommand), WORKER_REQUEST_TIMEOUT_MS);
+			const response = await client.request(withoutCommandId(createCommand), requestTimeoutMs);
 			if (!response.success) {
 				throw deserializeDaemonError(response);
 			}
@@ -3332,7 +3749,7 @@ export class DaemonSupervisor {
 			this.writeRosterEntry(workerRosterEntryFromSummary(summary), worker);
 			worker.descriptor.rootSessionId = summary.sessionId;
 			worker.descriptor.sessionFile = summary.sessionFile;
-			await this.subscribeWorker(worker, rootActiveSessionId);
+			await this.subscribeWorker(worker, rootActiveSessionId, requestTimeoutMs);
 			await this.refreshWorkerSummaries(worker, true);
 			if (existing && (this.isWorkerRecoveryCancelled(worker) || worker.stopRevision !== recoveryStopRevision)) {
 				throw new Error(`Session worker ${workerId} recovery was cancelled`);
@@ -3422,7 +3839,12 @@ export class DaemonSupervisor {
 				await client.waitForHello(1000);
 				// Listen before authenticating: the worker flushes its roster snapshot right after auth succeeds.
 				client.onFrame((frame) => this.handleWorkerFrame(worker, frame, client));
-				client.onClose((error) => void this.handleWorkerClose(worker, client, error));
+				client.onClose((error) =>
+					this.background(
+						this.handleWorkerClose(worker, client, error),
+						`worker close handling for ${worker.descriptor.workerId}`,
+					),
+				);
 				worker.pendingClient = client;
 				try {
 					const authResponse = await client.authenticateWorker(
@@ -3463,23 +3885,406 @@ export class DaemonSupervisor {
 		throw new DaemonWorkerProbeTimeoutError(`Timed out connecting to daemon session worker: ${String(lastError)}`);
 	}
 
-	private async subscribeWorker(worker: ResidentWorker, activeSessionId: string): Promise<void> {
+	private async subscribeWorker(worker: ResidentWorker, activeSessionId: string, timeoutMs = 30_000): Promise<void> {
 		if (!worker.client) {
 			throw new Error("Session worker is not connected");
 		}
 		const supportsExtensionUi = [...this.clients].some(
 			(client) => client.attachedActiveSessionIds.has(activeSessionId) && client.supportsExtensionUi,
 		);
-		const response = await worker.client.requestWorker({
-			type: "worker_subscribe",
-			activeSessionId,
-			capabilities: supportsExtensionUi
-				? ["attach_snapshot", "event_sequence", "extension_ui", "slim_attach", "chunked_snapshot"]
-				: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"],
-			supportsExtensionUi,
-		});
+		const response = await worker.client.requestWorker(
+			{
+				type: "worker_subscribe",
+				activeSessionId,
+				capabilities: supportsExtensionUi
+					? ["attach_snapshot", "event_sequence", "extension_ui", "slim_attach", "chunked_snapshot"]
+					: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"],
+				supportsExtensionUi,
+			},
+			timeoutMs,
+		);
 		if (!response.success) {
 			throw new Error(response.error);
+		}
+	}
+
+	/**
+	 * L3: adoption runs off the ready critical path. The socket is already open and
+	 * `markReady()` has run, so a worker that never answers cannot keep the whole
+	 * daemon from serving; its sessions answer as recovering until it lands.
+	 */
+	private beginWorkerAdoption(workers: readonly ResidentWorker[]): void {
+		if (workers.length === 0) {
+			return;
+		}
+		this.adoptionPendingCount = workers.length;
+		for (const worker of workers) {
+			this.adoptionCountedWorkers.add(worker);
+		}
+		this.background(this.runWorkerAdoption(workers), "worker adoption");
+	}
+
+	private async runWorkerAdoption(workers: readonly ResidentWorker[]): Promise<void> {
+		const queue = [...workers];
+		const lanes: Array<Promise<void>> = [];
+		const concurrency = Math.max(1, Math.min(ADOPTION_CONCURRENCY, queue.length));
+		for (let lane = 0; lane < concurrency; lane++) {
+			lanes.push(
+				(async () => {
+					while (queue.length > 0 && !this.shuttingDown) {
+						const worker = queue.shift();
+						if (!worker) {
+							return;
+						}
+						const retryArmed = await this.adoptWorkerContained(worker);
+						if (!retryArmed) {
+							this.finishAdoptionAttempt(worker);
+						}
+					}
+				})(),
+			);
+		}
+		await Promise.all(lanes);
+		this.reportAdoptionOutcome();
+	}
+
+	/**
+	 * Adopts one worker and contains every outcome: startup must not fail because a
+	 * single worker cannot be adopted (L3). Returns true when a backoff re-adoption
+	 * was armed for a session that has scheduled jobs behind it.
+	 */
+	private async adoptWorkerContained(worker: ResidentWorker): Promise<boolean> {
+		let reason: string | undefined;
+		try {
+			await this.adoptOrRecoverWorker(worker);
+			// "recovering" is not a failure: the recovery machinery owns the worker from
+			// here and re-parks or retries it itself. An intentional stop is a completed
+			// adoption of a tombstone.
+			if (
+				worker.descriptor.lifecycle !== "ready" &&
+				worker.descriptor.lifecycle !== "recovering" &&
+				worker.descriptor.stopRequestedAt === undefined
+			) {
+				reason = worker.descriptor.lastError ?? `Worker stayed ${worker.descriptor.lifecycle}`;
+			}
+		} catch (error) {
+			if (this.shuttingDown || isSupervisorRecoveryCancelled(error)) {
+				return false;
+			}
+			reason = error instanceof Error ? error.message : String(error);
+		}
+		if (reason === undefined) {
+			return false;
+		}
+		return this.containAdoptionFailure(worker, reason);
+	}
+
+	/**
+	 * One unadoptable worker parks failed on its own instead of taking the daemon
+	 * down with it. A worker whose sessions have a heartbeat or cron registration is
+	 * re-adopted on a backoff first: parking it would silently stop an unattended
+	 * schedule, which nobody would notice because the daemon itself looks healthy.
+	 */
+	private containAdoptionFailure(worker: ResidentWorker, reason: string): boolean {
+		this.recordAdoptionFailure(worker, reason);
+		if (/\bTimed out\b/.test(reason)) {
+			// Production signature for a bounded adoption that hit its ceiling (F14).
+			this.log(
+				`Worker adoption timed out for ${worker.descriptor.workerId} after ${this.adoptionRequestTimeoutMs}ms: ${reason}`,
+			);
+		}
+		if (worker.descriptor.lifecycle !== "failed") {
+			worker.descriptor.lifecycle = "failed";
+			worker.descriptor.lastError = reason;
+			// Preserve the first failure time: the reaper ages a corpse from it, and a
+			// restart that re-parks the same dead worker must not reset that clock.
+			worker.descriptor.lastFailureAt ??= new Date().toISOString();
+			this.tryPersistWorker(worker, "adoption failure");
+			this.markWorkerRosterEntries(worker, "failed");
+		}
+		return this.armScheduledJobReadoption(worker, reason);
+	}
+
+	private recordAdoptionFailure(worker: ResidentWorker, reason: string): void {
+		const workerId = worker.descriptor.workerId;
+		if (this.adoptionFailures.some((failure) => failure.workerId === workerId)) {
+			return;
+		}
+		this.adoptionFailures.push({
+			workerId,
+			session: worker.descriptor.rootSessionId ?? worker.descriptor.rootActiveSessionId,
+			reason,
+		});
+	}
+
+	private armScheduledJobReadoption(worker: ResidentWorker, reason: string): boolean {
+		if (this.shuttingDown || this.adoptionRetryTimers.has(worker)) {
+			return false;
+		}
+		// An intentional stop must stay stopped; only unexpected failures are retried.
+		if (worker.descriptor.stopRequestedAt !== undefined || worker.intentionalStop) {
+			return false;
+		}
+		// A client-owned worker is re-driven by its owner's next attach; re-adopting it
+		// here would only re-park it until that client shows up.
+		if (worker.descriptor.ownerClientId !== undefined) {
+			return false;
+		}
+		if (!this.workerHasScheduledJobs(worker)) {
+			return false;
+		}
+		const attempt = worker.adoptionRetryAttempt ?? 0;
+		const delayMs = this.adoptionRetryDelaysMs[attempt];
+		if (delayMs === undefined) {
+			this.recordDegraded("scheduled session not re-adopted");
+			this.log(
+				`Worker ${worker.descriptor.workerId} stayed failed after ${this.adoptionRetryDelaysMs.length} re-adoption attempts (${reason}); ` +
+					`its scheduled sessions stay dark until a client attaches or retry_worker runs`,
+			);
+			return false;
+		}
+		worker.adoptionRetryAttempt = attempt + 1;
+		this.log(
+			`Re-adopting worker ${worker.descriptor.workerId} in ${Math.round(delayMs / 1000)}s because its sessions have scheduled jobs ` +
+				`(attempt ${attempt + 1}/${this.adoptionRetryDelaysMs.length}): ${reason}`,
+		);
+		const timer = setTimeout(() => {
+			this.adoptionRetryTimers.delete(worker);
+			this.background(this.retryWorkerAdoption(worker), `worker re-adoption for ${worker.descriptor.workerId}`);
+		}, delayMs);
+		timer.unref();
+		this.adoptionRetryTimers.set(worker, timer);
+		return true;
+	}
+
+	private async retryWorkerAdoption(worker: ResidentWorker): Promise<void> {
+		if (this.shuttingDown || this.workers.get(worker.descriptor.workerId) !== worker) {
+			this.finishAdoptionAttempt(worker);
+			return;
+		}
+		// A re-adoption starts from the parked state, so recovery is allowed to run again.
+		worker.deferredRecoveryRounds = 0;
+		const retryArmed = await this.adoptWorkerContained(worker);
+		if (!retryArmed) {
+			this.finishAdoptionAttempt(worker);
+		}
+	}
+
+	private finishAdoptionAttempt(worker: ResidentWorker): void {
+		if (this.adoptionCountedWorkers.delete(worker)) {
+			this.adoptionPendingCount = Math.max(0, this.adoptionPendingCount - 1);
+		}
+	}
+
+	/** How many registered workers are still being adopted; published in daemon_hello. */
+	get adoptingSessionWorkers(): number {
+		return this.adoptionPendingCount;
+	}
+
+	/**
+	 * M12①: a startup that no longer fails loudly has to report what it could not
+	 * restore, with the reason and the action that brings a session back.
+	 */
+	private reportAdoptionOutcome(): void {
+		if (this.adoptionReported) {
+			return;
+		}
+		this.adoptionReported = true;
+		const failures = this.adoptionFailures;
+		if (failures.length === 0) {
+			return;
+		}
+		const detail = failures.map((failure) => `${failure.session} (worker ${failure.workerId}): ${failure.reason}`);
+		this.log(
+			`Daemon started with ${failures.length} session${failures.length === 1 ? "" : "s"} unrestored: ${detail.join("; ")}. ` +
+				`Each stays registered as failed; attach the session or run retry_worker to bring it back, ` +
+				`and the failed-worker reaper archives it once it is old enough.`,
+		);
+	}
+
+	/** Whether a heartbeat or cron registration behind this worker's sessions still needs it. */
+	private workerHasScheduledJobs(worker: ResidentWorker): boolean {
+		for (const entry of this.workerRosterEntries(worker)) {
+			if (entry.summary.hasRegisteredHeartbeat === true || entry.summary.hasRegisteredCronJob === true) {
+				return true;
+			}
+		}
+		const sessionFile = worker.descriptor.sessionFile;
+		const sessionId = worker.descriptor.rootSessionId;
+		if (!sessionFile || !sessionId) {
+			return false;
+		}
+		try {
+			const artifactDir = getSessionArtifactPathForFile(resolve(sessionFile), sessionId);
+			return existsSync(join(artifactDir, SESSION_SCHEDULED_JOBS_FILENAME));
+		} catch {
+			// An unreadable artifact directory must not decide the policy either way.
+			return false;
+		}
+	}
+
+	private workerHasAttachedClient(worker: ResidentWorker): boolean {
+		const activeSessionIds = new Set(
+			this.workerRosterEntries(worker).map((entry) => entry.summary.activeSessionId ?? entry.summary.id),
+		);
+		if (activeSessionIds.size === 0) {
+			return false;
+		}
+		for (const client of this.clients) {
+			for (const activeSessionId of client.attachedActiveSessionIds) {
+				if (activeSessionIds.has(activeSessionId)) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	private startFailedWorkerReaper(): void {
+		if (this.failedWorkerReaperTimer) {
+			return;
+		}
+		this.failedWorkerReaperTimer = setInterval(() => {
+			this.background(this.reapFailedWorkers(), "failed worker reaper");
+		}, this.failedWorkerReapIntervalMs);
+		this.failedWorkerReaperTimer.unref();
+	}
+
+	private clearFailedWorkerReaperTimer(): void {
+		if (!this.failedWorkerReaperTimer) {
+			return;
+		}
+		clearInterval(this.failedWorkerReaperTimer);
+		this.failedWorkerReaperTimer = undefined;
+	}
+
+	/**
+	 * L5: a failed worker whose process is verifiably gone is archived into the log
+	 * and removed, so restarts stop replaying the same corpses and the agents view
+	 * stops carrying rows nobody can act on. Low frequency by design: this is
+	 * cleanup, not liveness detection.
+	 */
+	private async reapFailedWorkers(now = Date.now()): Promise<void> {
+		if (this.failedWorkerReapSweep || this.shuttingDown) {
+			return this.failedWorkerReapSweep;
+		}
+		this.failedWorkerReapSweep = this.reapFailedWorkersOnce(now).finally(() => {
+			this.failedWorkerReapSweep = undefined;
+		});
+		return this.failedWorkerReapSweep;
+	}
+
+	private async reapFailedWorkersOnce(now: number): Promise<void> {
+		const thresholdHours = this.settingsManager.getDaemonSupervisorSettings().failedWorkerReapHours;
+		if (thresholdHours === undefined) {
+			return;
+		}
+		const thresholdMs = thresholdHours * 60 * 60 * 1000;
+		const candidates = [...this.workers.values()].filter((worker) =>
+			this.isFailedWorkerReapCandidate(worker, now, thresholdMs),
+		);
+		if (candidates.length === 0) {
+			return;
+		}
+		for (const worker of candidates) {
+			if (this.shuttingDown) {
+				return;
+			}
+			// I-7: the identity check may spawn `ps`, so it is awaited (never
+			// execFileSync) and the loop yields between candidates.
+			if (!(await this.isWorkerProcessConfirmedDead(worker))) {
+				continue;
+			}
+			if (this.hasUnconsumedRecoveryJournal(worker)) {
+				this.log(
+					`Keeping failed worker ${worker.descriptor.workerId}: its recovery journal still has unconsumed busy operations`,
+				);
+				continue;
+			}
+			if (this.degraded) {
+				// M16: the reaper's inputs are bookkeeping. While the supervisor runs on
+				// state it could not persist, only the reversible half runs — the roster
+				// row goes inactive, the descriptor (an irreversible delete) is kept.
+				this.logDegraded(
+					"failed worker reaper deferred",
+					`Failed-worker reaper deferred while degraded: kept ${worker.descriptor.workerId} on disk and only flipped its roster rows inactive`,
+				);
+				this.flipWorkerRosterEntriesInactive(worker);
+				continue;
+			}
+			this.archiveAndReapFailedWorker(worker, now);
+			await new Promise<void>((resolveYield) => setImmediate(resolveYield));
+		}
+	}
+
+	private isFailedWorkerReapCandidate(worker: ResidentWorker, now: number, thresholdMs: number): boolean {
+		if (worker.descriptor.lifecycle !== "failed") {
+			return false;
+		}
+		// An intentional or in-flight stop owns the registration until it finishes.
+		if (worker.descriptor.stopRequestedAt !== undefined || this.isWorkerStopping(worker)) {
+			return false;
+		}
+		if (worker.recovery || worker.deferredRecovery || worker.stopFinalization) {
+			return false;
+		}
+		if (this.adoptionRetryTimers.has(worker)) {
+			return false;
+		}
+		// Exemptions: a schedule that still needs the tree, and anybody watching it.
+		if (this.workerHasScheduledJobs(worker) || this.workerHasAttachedClient(worker)) {
+			return false;
+		}
+		const failedAt = Date.parse(worker.descriptor.lastFailureAt ?? worker.descriptor.updatedAt);
+		if (!Number.isFinite(failedAt)) {
+			return false;
+		}
+		return now - failedAt >= thresholdMs;
+	}
+
+	/**
+	 * Death has to be proven twice before an irreversible delete: the pid must be
+	 * gone, and a pid that is alive must demonstrably belong to somebody else. An
+	 * unobservable identity counts as alive, so a transient `ps` failure can never
+	 * authorise deleting a registration.
+	 */
+	private async isWorkerProcessConfirmedDead(worker: ResidentWorker): Promise<boolean> {
+		return isProcessIdentityConfirmedDead(worker.descriptor.pid, worker.descriptor.processStartId);
+	}
+
+	private hasUnconsumedRecoveryJournal(worker: ResidentWorker): boolean {
+		try {
+			const journal = new WorkerRecoveryJournal(worker.descriptor.recoveryJournalPath);
+			return journal.getLatest().some((record) => record.busy);
+		} catch {
+			// An unreadable journal is treated as unconsumed: deleting the descriptor
+			// would drop the only record of operations that may need interruption.
+			return true;
+		}
+	}
+
+	/** C17: the failed descriptor is the only on-disk evidence of an OOM-class accident, so it is archived before deletion. */
+	private archiveAndReapFailedWorker(worker: ResidentWorker, now: number): void {
+		const descriptor = worker.descriptor;
+		const failedAt = Date.parse(descriptor.lastFailureAt ?? descriptor.updatedAt);
+		const failedForMinutes = Number.isFinite(failedAt) ? Math.round((now - failedAt) / 60_000) : undefined;
+		this.log(
+			`Reaped failed worker ${descriptor.workerId} (reaped failed worker: pid ${descriptor.pid}, ` +
+				`processStartId ${descriptor.processStartId ?? "unknown"}, ` +
+				`failedForMinutes ${failedForMinutes ?? "unknown"}, ` +
+				`lastFailureAt ${descriptor.lastFailureAt ?? "unknown"}, ` +
+				`lastError ${descriptor.lastError ?? "unknown"}, ` +
+				`rootActiveSessionId ${descriptor.rootActiveSessionId}, ` +
+				`rootSessionId ${descriptor.rootSessionId ?? "unknown"}, ` +
+				`sessionFile ${descriptor.sessionFile ?? "unknown"}, ` +
+				`descriptorPath ${worker.descriptorPath}, ` +
+				`consecutiveFailures ${descriptor.consecutiveFailures})`,
+		);
+		this.workers.delete(descriptor.workerId);
+		this.flipWorkerRosterEntriesInactive(worker);
+		this.deleteWorkerDescriptor(worker);
+		if (!this.shuttingDown) {
+			this.broadcastHeartbeatsChanged();
 		}
 	}
 
@@ -3499,7 +4304,7 @@ export class DaemonSupervisor {
 						await this.connectWorker(worker, 2000);
 						if (observedProcessStartId) {
 							worker.descriptor.processStartId = observedProcessStartId;
-							this.persistWorker(worker);
+							this.tryPersistWorker(worker, "adoption identity persist");
 						}
 					} catch {
 						// Unverifiable identity stays untrusted; the stop below
@@ -3511,8 +4316,11 @@ export class DaemonSupervisor {
 				this.log(`Completed intentional stop for worker ${worker.descriptor.workerId} during supervisor adoption`);
 			} catch (error) {
 				worker.descriptor.lifecycle = "failed";
+				// Preserve the first failure time: the reaper ages a corpse from it, and a
+				// restart that re-parks the same dead worker must not reset that clock.
+				worker.descriptor.lastFailureAt ??= new Date().toISOString();
 				worker.descriptor.lastError = error instanceof Error ? error.message : String(error);
-				this.persistWorker(worker);
+				this.tryPersistWorker(worker, "adoption intentional-stop failure");
 				this.log(`Could not complete intentional stop for worker ${worker.descriptor.workerId}: ${String(error)}`);
 			}
 			return;
@@ -3524,7 +4332,7 @@ export class DaemonSupervisor {
 			}
 			observedProcessStartId = getProcessStartId(worker.descriptor.pid);
 			await this.connectWorker(worker, 2000);
-			await this.subscribeWorker(worker, worker.descriptor.rootActiveSessionId);
+			await this.subscribeWorker(worker, worker.descriptor.rootActiveSessionId, this.adoptionRequestTimeoutMs);
 			await this.refreshWorkerSummaries(worker, true);
 			if (worker.descriptor.processStartId === undefined && observedProcessStartId) {
 				worker.descriptor.processStartId = observedProcessStartId;
@@ -3533,7 +4341,7 @@ export class DaemonSupervisor {
 			worker.descriptor.lifecycle = "ready";
 			worker.descriptor.consecutiveFailures = 0;
 			worker.deferredRecoveryRounds = 0;
-			this.persistWorker(worker);
+			this.tryPersistWorker(worker, "adoption");
 			this.broadcastHeartbeatsChanged();
 		} catch (error) {
 			if (isSupervisorRecoveryCancelled(error)) {
@@ -3556,7 +4364,7 @@ export class DaemonSupervisor {
 			if (isDaemonWorkerProbeTimeout(error) && (identityNow === "current" || identityNow === "unknown")) {
 				worker.descriptor.lifecycle = "recovering";
 				worker.descriptor.lastError = error instanceof Error ? error.message : String(error);
-				this.persistWorker(worker);
+				this.tryPersistWorker(worker, "adoption probe timeout");
 				void this.recoverWorker(worker).catch((recoveryError) =>
 					this.log(`Could not recover worker ${worker.descriptor.workerId}: ${String(recoveryError)}`),
 				);
@@ -3590,8 +4398,11 @@ export class DaemonSupervisor {
 			// A live or unverifiable survivor parks failed with no destructive cleanup: interruption
 			// marking and orphan reaping must never run against a possibly-active worker.
 			worker.descriptor.lifecycle = "failed";
+			// Preserve the first failure time: the reaper ages a corpse from it, and a
+			// restart that re-parks the same dead worker must not reset that clock.
+			worker.descriptor.lastFailureAt ??= new Date().toISOString();
 			worker.descriptor.lastError = `Pre-roster worker process ${worker.descriptor.pid} is still running and cannot be replaced safely`;
-			this.persistWorker(worker);
+			this.tryPersistWorker(worker, "pre-roster worker park");
 			this.markWorkerRosterEntries(worker, "failed");
 			this.log(`Kept pre-roster worker ${worker.descriptor.workerId} failed: ${worker.descriptor.lastError}`);
 			return;
@@ -3600,7 +4411,12 @@ export class DaemonSupervisor {
 		if (this.isWorkerRecoveryCancelled(worker)) {
 			return;
 		}
-		await this.launchWorker(worker.descriptor.createCommand, worker, worker.descriptor.ownerClientId);
+		await this.launchWorker(
+			worker.descriptor.createCommand,
+			worker,
+			worker.descriptor.ownerClientId,
+			this.adoptionRequestTimeoutMs,
+		);
 	}
 
 	private async handleWorkerClose(worker: ResidentWorker, client: DaemonWorkerClient, error: Error): Promise<void> {
@@ -3654,8 +4470,8 @@ export class DaemonSupervisor {
 		}
 		worker.descriptor.lifecycle = "recovering";
 		worker.descriptor.lastError = error.message;
-		this.persistWorker(worker);
-		void this.recoverWorker(worker);
+		this.tryPersistWorker(worker, "worker disconnect");
+		this.background(this.recoverWorker(worker), `worker recovery for ${worker.descriptor.workerId}`);
 	}
 
 	private isWorkerRecoveryEligible(worker: ResidentWorker): boolean {
@@ -3681,12 +4497,16 @@ export class DaemonSupervisor {
 		worker.deferredRecoveryRounds = (worker.deferredRecoveryRounds ?? 0) + 1;
 		if (worker.deferredRecoveryRounds > MAX_DEFERRED_RECOVERY_ROUNDS) {
 			worker.descriptor.lifecycle = "failed";
+			// Preserve the first failure time: the reaper ages a corpse from it, and a
+			// restart that re-parks the same dead worker must not reset that clock.
+			worker.descriptor.lastFailureAt ??= new Date().toISOString();
 			worker.descriptor.lastError = `Live session worker did not answer recovery probes for ${MAX_DEFERRED_RECOVERY_ROUNDS} rounds: ${disconnectError.message}`;
-			this.persistWorker(worker);
+			this.tryPersistWorker(worker, "deferred recovery park");
 			this.markWorkerRosterEntries(worker, "failed");
 			this.log(
 				`Worker ${worker.descriptor.workerId} is unresponsive; parked failed after ${MAX_DEFERRED_RECOVERY_ROUNDS} probe rounds`,
 			);
+			this.armScheduledJobReadoption(worker, worker.descriptor.lastError ?? "Worker stopped answering probes");
 			return;
 		}
 		worker.deferredRecovery = this.resumeDeferredWorkerRecovery(worker, disconnectError).finally(() => {
@@ -3719,8 +4539,8 @@ export class DaemonSupervisor {
 			}
 			worker.descriptor.lifecycle = "recovering";
 			worker.descriptor.lastError = disconnectError.message;
-			this.persistWorker(worker);
-			void this.recoverWorker(worker);
+			this.tryPersistWorker(worker, "deferred recovery resume");
+			this.background(this.recoverWorker(worker), `deferred worker recovery for ${worker.descriptor.workerId}`);
 			return;
 		}
 	}
@@ -3912,8 +4732,11 @@ export class DaemonSupervisor {
 		}
 		if (worker.descriptor.ownerClientId && !worker.launchEnv && !isProcessAlive(worker.descriptor.pid)) {
 			worker.descriptor.lifecycle = "failed";
+			// Preserve the first failure time: the reaper ages a corpse from it, and a
+			// restart that re-parks the same dead worker must not reset that clock.
+			worker.descriptor.lastFailureAt ??= new Date().toISOString();
 			worker.descriptor.lastError = "Waiting for the owning client to reconnect";
-			this.persistWorker(worker);
+			this.tryPersistWorker(worker, "recovery waiting for owner");
 			return;
 		}
 		if (worker.recovery) {
@@ -3936,7 +4759,11 @@ export class DaemonSupervisor {
 					if (identityCompatible) {
 						try {
 							await this.connectWorker(worker, 1500);
-							await this.subscribeWorker(worker, worker.descriptor.rootActiveSessionId);
+							await this.subscribeWorker(
+								worker,
+								worker.descriptor.rootActiveSessionId,
+								this.adoptionRequestTimeoutMs,
+							);
 							await this.refreshWorkerSummaries(worker, true);
 							if (this.isWorkerRecoveryCancelled(worker)) {
 								return;
@@ -3951,7 +4778,7 @@ export class DaemonSupervisor {
 							worker.descriptor.lifecycle = "ready";
 							worker.descriptor.consecutiveFailures = 0;
 							worker.deferredRecoveryRounds = 0;
-							this.persistWorker(worker);
+							this.tryPersistWorker(worker, "worker recovery");
 							this.broadcastHeartbeatsChanged();
 							return;
 						} catch (error) {
@@ -3977,16 +4804,25 @@ export class DaemonSupervisor {
 					if (!recoveryCommand || !worker.launchEnv) {
 						await this.recoverUncertainWorkerOperations(worker);
 						worker.descriptor.lifecycle = "failed";
+						// Preserve the first failure time: the reaper ages a corpse from it, and a
+						// restart that re-parks the same dead worker must not reset that clock.
+						worker.descriptor.lastFailureAt ??= new Date().toISOString();
 						worker.descriptor.lastError = "Waiting for a client with fresh runtime context";
-						this.persistWorker(worker);
+						this.tryPersistWorker(worker, "recovery park");
 						this.markWorkerRosterEntries(worker, "failed");
+						this.armScheduledJobReadoption(worker, worker.descriptor.lastError);
 						return;
 					}
 					await this.recoverUncertainWorkerOperations(worker);
 					if (this.isWorkerRecoveryCancelled(worker)) {
 						return;
 					}
-					await this.launchWorker(recoveryCommand, worker, worker.descriptor.ownerClientId);
+					await this.launchWorker(
+						recoveryCommand,
+						worker,
+						worker.descriptor.ownerClientId,
+						this.adoptionRequestTimeoutMs,
+					);
 					return;
 				} catch (error) {
 					if (isSupervisorRecoveryCancelled(error) || this.isWorkerRecoveryCancelled(worker)) {
@@ -4002,7 +4838,7 @@ export class DaemonSupervisor {
 					worker.descriptor.consecutiveFailures++;
 					worker.descriptor.lastFailureAt = new Date().toISOString();
 					worker.descriptor.lastError = error instanceof Error ? error.message : String(error);
-					this.persistWorker(worker);
+					this.tryPersistWorker(worker, "recovery failure bookkeeping");
 				}
 			}
 			if (keepProbingLiveWorker) {
@@ -4012,7 +4848,7 @@ export class DaemonSupervisor {
 					return;
 				}
 				worker.descriptor.lifecycle = "recovering";
-				this.persistWorker(worker);
+				this.tryPersistWorker(worker, "recovery deferral");
 				this.deferWorkerRecovery(
 					worker,
 					new Error(worker.descriptor.lastError ?? "Live session worker did not answer recovery probes"),
@@ -4028,9 +4864,16 @@ export class DaemonSupervisor {
 			// its process intact. A verified-identity survivor is reclaimed by the next fresh create;
 			// an unverifiable one waits for exit — killing a pid we cannot verify as ours is worse.
 			worker.descriptor.lifecycle = "failed";
-			this.persistWorker(worker);
+			// Preserve the first failure time: the reaper ages a corpse from it, and a
+			// restart that re-parks the same dead worker must not reset that clock.
+			worker.descriptor.lastFailureAt ??= new Date().toISOString();
+			this.tryPersistWorker(worker, "recovery park");
 			this.markWorkerRosterEntries(worker, "failed");
 			this.log(`Worker ${worker.descriptor.workerId} failed after three recovery attempts`);
+			this.armScheduledJobReadoption(
+				worker,
+				worker.descriptor.lastError ?? "Worker failed after three recovery attempts",
+			);
 		})().finally(() => {
 			worker.recovery = undefined;
 		});
@@ -4351,7 +5194,10 @@ export class DaemonSupervisor {
 		// Direct peers attach and detach on the worker socket, so their last detach arrives
 		// here as roster truth instead of through a supervisor-socket close.
 		if (worker !== undefined && previousDirect > 0 && (entry.summary.directAttachedClients ?? 0) === 0) {
-			void this.evictEmptySessionOnLastDetach(entry.summary.activeSessionId ?? entry.summary.id);
+			this.background(
+				this.evictEmptySessionOnLastDetach(entry.summary.activeSessionId ?? entry.summary.id),
+				"empty session eviction on roster change",
+			);
 		}
 		return stored;
 	}
@@ -4778,6 +5624,123 @@ export class DaemonSupervisor {
 		return worker.descriptor.lifecycle;
 	}
 
+	/**
+	 * Terminal commands are idempotent for a target that existed and is gone, so a
+	 * caller's retry loop converges instead of spinning on "Unknown active session".
+	 * A selector that never matched anything still fails (killing a wrong name must
+	 * not read as a success), and read commands keep failing loudly: a read must not
+	 * claim success for a target it cannot see (C19).
+	 */
+	private terminalCommandResponseForGoneTarget(command: DaemonCommand, error: unknown): DaemonResponse | undefined {
+		if (!TERMINAL_DAEMON_COMMANDS.has(command.type)) {
+			return undefined;
+		}
+		if (!(error instanceof Error) || !error.message.startsWith("Unknown active session:")) {
+			return undefined;
+		}
+		if (!("activeSessionId" in command) || typeof command.activeSessionId !== "string") {
+			return undefined;
+		}
+		if (!this.isKnownGoneSessionSelector(command.activeSessionId)) {
+			return undefined;
+		}
+		return success(command.id, command.type, { alreadyTerminal: true });
+	}
+
+	/** A passivated roster row proves the selector once resolved and its worker is gone. */
+	private isKnownGoneSessionSelector(selector: string): boolean {
+		// A resident registration that still claims the selector means the target is
+		// not gone (it may only be missing a roster row), so the honest lookup error
+		// stands instead of an idempotent success that skips the kill.
+		if (this.residentWorkerClaimsSelector(selector)) {
+			return false;
+		}
+		const pathSelector = looksLikeSessionPath(selector) ? canonicalSessionPath(selector) : undefined;
+		for (const entry of this.roster().values()) {
+			const summary = entry.summary;
+			const activeSessionId = summary.activeSessionId ?? summary.id;
+			const sessionId = summary.sessionId;
+			if (activeSessionId === selector || sessionId === selector || summary.sessionName === selector) {
+				return true;
+			}
+			if (matchesSessionIdSuffix(activeSessionId, selector) || matchesSessionIdSuffix(sessionId, selector)) {
+				return true;
+			}
+			if (pathSelector && summary.sessionFile && canonicalSessionPath(summary.sessionFile) === pathSelector) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** Whether any resident worker registration or its summaries still claim this selector. */
+	private residentWorkerClaimsSelector(selector: string): boolean {
+		const pathSelector = looksLikeSessionPath(selector) ? canonicalSessionPath(selector) : undefined;
+		for (const worker of this.workers.values()) {
+			const descriptor = worker.descriptor;
+			if (descriptor.rootActiveSessionId === selector || descriptor.rootSessionId === selector) {
+				return true;
+			}
+			if (pathSelector && descriptor.sessionFile && canonicalSessionPath(descriptor.sessionFile) === pathSelector) {
+				return true;
+			}
+			if (this.findSummaryInWorker(worker, selector)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** Whether a kill can be forwarded; a stopping worker still answers kill (allowStopping). */
+	private isWorkerKillForwardable(worker: ResidentWorker): boolean {
+		return worker.client !== undefined && worker.descriptor.lifecycle === "ready";
+	}
+
+	/** A worker that will not come back on its own, so its sessions are already terminal. */
+	private isWorkerTerminallyUnavailable(worker: ResidentWorker): boolean {
+		return (
+			worker.descriptor.lifecycle === "failed" ||
+			worker.descriptor.stopRequestedAt !== undefined ||
+			worker.intentionalStop
+		);
+	}
+
+	/**
+	 * L4: kill reaches a worker in every lifecycle. A recovering, starting or failed
+	 * worker cannot be asked to kill its own session, so the supervisor performs the
+	 * semantic kill: the stop tombstone cancels in-flight recovery
+	 * (isWorkerRecoveryCancelled reads stopRequestedAt) and stopWorker reaps the
+	 * process, so the kill leaves no orphan behind.
+	 */
+	private async killUnreachableWorker(
+		worker: ResidentWorker,
+		summary: SessionSummary,
+		command: Extract<DaemonCommand, { type: "kill" }>,
+	): Promise<DaemonResponse> {
+		const targetActiveSessionId = summary.activeSessionId ?? summary.id;
+		const isRootKill = targetActiveSessionId === worker.descriptor.rootActiveSessionId;
+		if (!isRootKill && !this.isWorkerTerminallyUnavailable(worker)) {
+			// Stopping the worker would take sibling sessions with it, and a child kill
+			// needs the worker to name the child: report the state honestly instead.
+			throw new Error(
+				`Session worker is ${this.effectiveWorkerState(worker)}; cannot kill ${targetActiveSessionId} until it is reachable`,
+			);
+		}
+		this.log(
+			`Killing ${targetActiveSessionId} through an unreachable worker (${this.effectiveWorkerState(worker)}): stop tombstone written, recovery cancelled`,
+		);
+		this.persistWorkerStopTombstone(worker, true);
+		const releaseStopOwnership = this.acquireWorkerStopOwnership(worker);
+		try {
+			await this.stopWorker(worker, true, false, true);
+		} finally {
+			releaseStopOwnership();
+		}
+		return isRootKill
+			? success(command.id, command.type)
+			: success(command.id, command.type, { alreadyTerminal: true });
+	}
+
 	private requireAvailableWorkerClient(worker: ResidentWorker, allowStopping = false): DaemonWorkerClient {
 		if (
 			!worker.client ||
@@ -4928,6 +5891,13 @@ export class DaemonSupervisor {
 		}
 		if (matches.length > 1) {
 			throw new Error(`Ambiguous active session "${selector}"`);
+		}
+		// L3: adoption now runs after the socket opens, so a registered worker's
+		// sessions can be missing their roster rows for a moment. Report the real,
+		// retryable state instead of claiming the session never existed — callers
+		// retry a recovering worker, and a "never existed" answer is terminal.
+		if (this.adoptionPendingCount > 0 && this.residentWorkerClaimsSelector(selector)) {
+			throw new Error("Session worker is recovering");
 		}
 		throw new Error(`Unknown active session: ${selector}`);
 	}
@@ -5221,7 +6191,7 @@ export class DaemonSupervisor {
 					lastEventSequence: publicResult.lastEventSequence,
 				});
 			}
-			void this.syncWorkerExtensionUi(activeSessionId);
+			this.background(this.syncWorkerExtensionUi(activeSessionId), "extension UI sync on attach");
 			const detachingSessions = this.detachingInputPauseSessions?.get(client);
 			detachingSessions?.delete(command.activeSessionId);
 			detachingSessions?.delete(activeSessionId);
@@ -5518,8 +6488,8 @@ export class DaemonSupervisor {
 			client.catchupActiveSessionIds?.delete(resolvedId);
 			client.catchupPurposes?.delete(resolvedId);
 			this.write(client, { type: "session_detached", activeSessionId: resolvedId });
-			void this.syncWorkerExtensionUi(resolvedId);
-			void this.evictEmptySessionOnLastDetach(resolvedId);
+			this.background(this.syncWorkerExtensionUi(resolvedId), "extension UI sync on detach");
+			this.background(this.evictEmptySessionOnLastDetach(resolvedId), "empty session eviction on detach");
 		}
 	}
 
@@ -5929,6 +6899,18 @@ export class DaemonSupervisor {
 				// A malformed worker event is still isolated to this worker connection.
 			}
 		}
+		if (decodedOutbound?.type === "session_replaced" || decodedOutbound?.type === "session_resynced") {
+			// The attached clients are about to be reseeded, so any catch-up retry
+			// budget from the previous event generation is stale (I-8): a healed
+			// client must never be told it fell behind.
+			const reseedGeneration = decodedOutbound.meta?.cursor?.generation;
+			for (const client of this.clients) {
+				if (!client.attachedActiveSessionIds.has(activeSessionId)) {
+					continue;
+				}
+				this.noteClientViewReseeded(client, activeSessionId, reseedGeneration);
+			}
+		}
 		const replacementSnapshotFollows =
 			decodedOutbound?.type === "session_replaced" && decodedOutbound.snapshotFollows === true;
 		this.invalidateWorkerSnapshot(
@@ -6059,13 +7041,15 @@ export class DaemonSupervisor {
 			!client.backpressured &&
 			client.catchupActiveSessionIds?.size
 		) {
-			await this.drainClientCatchups(client);
+			if ((await this.drainClientCatchups(client)) === "retry-later") {
+				return;
+			}
 		}
 	}
 
-	private async drainClientCatchups(client: DaemonSocketClient): Promise<void> {
+	private async drainClientCatchups(client: DaemonSocketClient): Promise<"drained" | "retry-later"> {
 		if (client.socket.destroyed) {
-			return;
+			return "drained";
 		}
 		const pending = [...(client.catchupActiveSessionIds ?? [])].map((activeSessionId) => ({
 			activeSessionId,
@@ -6122,6 +7106,7 @@ export class DaemonSupervisor {
 						releaseSnapshotReservation,
 					);
 					releaseTranscript = undefined;
+					this.noteClientViewReseeded(client, activeSessionId, attached.result.lastEventCursor?.generation);
 					continue;
 				}
 				const meta = createDaemonEventMeta(
@@ -6149,15 +7134,183 @@ export class DaemonSupervisor {
 					for (const remaining of pending.slice(index + 1)) {
 						this.queueCatchup(client, remaining.activeSessionId, remaining.purpose);
 					}
-					return;
+					return "retry-later";
 				}
+				this.noteClientViewReseeded(client, activeSessionId, attached.result.lastEventCursor?.generation);
 			} catch (error) {
 				releaseTranscript?.();
-				this.log(`Failed to catch up client ${client.id} for ${activeSessionId}: ${String(error)}`);
+				// Requeue the failed session too: dropping it would leave the client
+				// with a permanently incomplete view after one transient failure.
+				for (const remaining of pending.slice(index)) {
+					this.queueCatchup(client, remaining.activeSessionId, remaining.purpose);
+				}
+				this.handleCatchupFailure(client, activeSessionId, purpose, error);
+				return "retry-later";
 			} finally {
 				releaseSnapshotReservation();
 			}
 		}
+		return "drained";
+	}
+
+	/**
+	 * Bounded retry for a failed catch-up (C10). Transient failures requeue and
+	 * retry on an exponential backoff; a spent budget or a permanent failure tells
+	 * the client to re-pull the whole snapshot instead of leaving a silently
+	 * incomplete view behind (F8). The supervisor never turns a catch-up failure
+	 * into a terminal `closed` frame.
+	 */
+	private handleCatchupFailure(
+		client: DaemonSocketClient,
+		activeSessionId: string,
+		purpose: "replacement" | "resync",
+		error: unknown,
+	): void {
+		const now = Date.now();
+		client.catchupRetryState ??= new Map();
+		const states = client.catchupRetryState;
+		const failure = error instanceof Error ? error.message : String(error);
+		if (!isTransientCatchupFailure(error)) {
+			states.delete(activeSessionId);
+			this.clearClientCatchupRetryTimerIfIdle(client);
+			this.log(
+				`Failed to catch up client ${client.id} for ${activeSessionId} (catchup failed, not retryable): ${failure}`,
+			);
+			this.notifyCatchupGiveUp(client, activeSessionId, purpose, "catchup_failed", failure);
+			return;
+		}
+		const state = states.get(activeSessionId) ?? {
+			attempts: 0,
+			openedAt: now,
+			generation: client.observedEventGenerations?.get(activeSessionId),
+		};
+		state.attempts += 1;
+		states.set(activeSessionId, state);
+		const observedGeneration = client.observedEventGenerations?.get(activeSessionId);
+		if (
+			state.generation !== undefined &&
+			observedGeneration !== undefined &&
+			state.generation !== observedGeneration
+		) {
+			// The client already reseeded onto a newer event generation; a budget from
+			// the previous one must not tell a healed client that it fell behind (I-8).
+			states.delete(activeSessionId);
+			this.clearClientCatchupRetryTimerIfIdle(client);
+			this.log(
+				`Dropped stale catch-up budget for client ${client.id} for ${activeSessionId}: event generation changed`,
+			);
+			return;
+		}
+		const remainingMs = state.openedAt + this.catchupRetryPolicy.deadlineMs - now;
+		const delayMs = clientCatchupRetryDelayMs(
+			this.catchupRetryPolicy,
+			state.attempts,
+			this.catchupRetryJitterMs(),
+			remainingMs,
+		);
+		if (delayMs === undefined) {
+			states.delete(activeSessionId);
+			this.clearClientCatchupRetryTimerIfIdle(client);
+			this.log(
+				`Failed to catch up client ${client.id} for ${activeSessionId} after ${state.attempts} attempts (catchup exhausted): ${failure}`,
+			);
+			this.notifyCatchupGiveUp(client, activeSessionId, purpose, "catchup_exhausted", failure);
+			return;
+		}
+		if (state.lastWarnAt === undefined || now - state.lastWarnAt >= this.catchupRetryPolicy.logThrottleMs) {
+			state.lastWarnAt = now;
+			this.log(
+				`Failed to catch up client ${client.id} for ${activeSessionId}: ${failure} (catchup retry scheduled, attempt ${state.attempts}/${this.catchupRetryPolicy.maxAttempts}, next in ${delayMs}ms)`,
+			);
+		}
+		this.scheduleClientCatchupRetry(client, delayMs);
+	}
+
+	private catchupRetryJitterMs(): number {
+		return Math.random() * this.catchupRetryPolicy.jitterMs;
+	}
+
+	private scheduleClientCatchupRetry(client: DaemonSocketClient, delayMs: number): void {
+		if (client.socket.destroyed || client.catchupRetryTimer) {
+			return;
+		}
+		const timer = setTimeout(() => {
+			client.catchupRetryTimer = undefined;
+			if (client.socket.destroyed || !client.catchupActiveSessionIds?.size) {
+				return;
+			}
+			if (client.snapshotStreaming || client.backpressured) {
+				this.scheduleClientCatchupRetry(client, delayMs);
+				return;
+			}
+			void this.catchUpClient(client).catch((error) =>
+				this.log(`Failed to catch up client ${client.id}: ${String(error)}`),
+			);
+		}, delayMs);
+		timer.unref();
+		client.catchupRetryTimer = timer;
+	}
+
+	/**
+	 * Gives up loudly: the client re-pulls the full snapshot and heals itself.
+	 * The `purpose` and `reason` fields let a client recover from a failure that
+	 * has no preceding `session_snapshot_begin` frame; a client that does not
+	 * understand them keeps today's behaviour and ignores the frame.
+	 */
+	private notifyCatchupGiveUp(
+		client: DaemonSocketClient,
+		activeSessionId: string,
+		purpose: "replacement" | "resync",
+		reason: "catchup_exhausted" | "catchup_failed",
+		failure: string,
+	): void {
+		if (client.socket.destroyed) {
+			return;
+		}
+		this.write(client, {
+			type: "session_snapshot_failed",
+			activeSessionId,
+			snapshotId: `catchup-${reason}-${randomUUID()}`,
+			error: failure,
+			reason,
+			purpose,
+		});
+	}
+
+	private noteClientViewReseeded(
+		client: DaemonSocketClient,
+		activeSessionId: string,
+		generation: string | undefined,
+	): void {
+		this.clearClientCatchupRetry(client, activeSessionId);
+		if (generation === undefined) {
+			return;
+		}
+		client.observedEventGenerations ??= new Map();
+		client.observedEventGenerations.set(activeSessionId, generation);
+	}
+
+	private clearClientCatchupRetry(client: DaemonSocketClient, activeSessionId?: string): void {
+		if (activeSessionId !== undefined) {
+			client.catchupRetryState?.delete(activeSessionId);
+			this.clearClientCatchupRetryTimerIfIdle(client);
+			return;
+		}
+		client.catchupRetryState?.clear();
+		client.observedEventGenerations?.clear();
+		if (client.catchupRetryTimer) {
+			clearTimeout(client.catchupRetryTimer);
+			client.catchupRetryTimer = undefined;
+		}
+	}
+
+	/** One timer serves the whole client queue, so it is only dropped once no session budget is left. */
+	private clearClientCatchupRetryTimerIfIdle(client: DaemonSocketClient): void {
+		if (!client.catchupRetryTimer || (client.catchupRetryState?.size ?? 0) > 0) {
+			return;
+		}
+		clearTimeout(client.catchupRetryTimer);
+		client.catchupRetryTimer = undefined;
 	}
 
 	private async prepareUpdateRestart(): Promise<DaemonUpdateRestartManifest> {
@@ -6556,16 +7709,21 @@ export class DaemonSupervisor {
 		worker.transcriptCaches.clear();
 		worker.snapshotCache.clear();
 		worker.snapshotGenerations?.clear();
-		if (worker.client) {
+		// Hold the client in a local: the worker can disconnect during the request
+		// below, and handleWorkerClose then clears worker.client mid-flight.
+		const stoppingClient = worker.client;
+		if (stoppingClient) {
 			if (archiveSession) {
-				await worker.client
+				await stoppingClient
 					.requestWorker({ type: "worker_archive_and_shutdown" }, force ? 1000 : 5000)
 					.catch(() => undefined);
 			} else {
-				await worker.client.request({ type: "shutdown" }, force ? 1000 : 5000).catch(() => undefined);
+				await stoppingClient.request({ type: "shutdown" }, force ? 1000 : 5000).catch(() => undefined);
 			}
-			worker.client.close();
-			worker.client = undefined;
+			stoppingClient.close();
+			if (worker.client === stoppingClient) {
+				worker.client = undefined;
+			}
 		} else if (directChild) {
 			directChild.child.kill("SIGTERM");
 		} else if (this.processIdentity(entryPid, entryStartId) === "current") {
@@ -6892,7 +8050,11 @@ export class DaemonSupervisor {
 			signals.push("SIGHUP");
 		}
 		for (const signal of signals) {
-			const handler = () => void this.shutdown(signal === "SIGINT" ? 130 : signal === "SIGHUP" ? 129 : 143, false);
+			const handler = () =>
+				this.background(
+					this.shutdown(signal === "SIGINT" ? 130 : signal === "SIGHUP" ? 129 : 143, false),
+					`${signal} shutdown`,
+				);
 			process.on(signal, handler);
 			this.signalCleanupHandlers.push(() => process.off(signal, handler));
 		}
@@ -6967,9 +8129,16 @@ export class DaemonSupervisor {
 		this.clearIdleEvictionTimer();
 		this.clearScheduledWakeTimer();
 		this.clearRosterWatchdogTimer();
+		this.clearFailedWorkerReaperTimer();
+		this.clearAdoptionRetryTimers();
 		await this.idleEvictionSweep?.catch(() => undefined);
 		for (const cleanup of this.signalCleanupHandlers.splice(0)) {
 			await this.runCleanupStep("signal handler", cleanup);
+		}
+		const uninstallCrashHandlers = this.uninstallCrashHandlers;
+		this.uninstallCrashHandlers = undefined;
+		if (uninstallCrashHandlers) {
+			await this.runCleanupStep("crash handler", uninstallCrashHandlers);
 		}
 		const server = this.server;
 		this.server = undefined;
@@ -7068,6 +8237,8 @@ export class DaemonSupervisor {
 		this.clearIdleEvictionTimer();
 		this.clearScheduledWakeTimer();
 		this.clearRosterWatchdogTimer();
+		this.clearFailedWorkerReaperTimer();
+		this.clearAdoptionRetryTimers();
 		await this.idleEvictionSweep?.catch(() => undefined);
 		if (closingReason) {
 			for (const client of this.clients) {
