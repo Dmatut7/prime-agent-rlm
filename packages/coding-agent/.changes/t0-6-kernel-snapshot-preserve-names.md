@@ -1,0 +1,3 @@
+- Fixed a partial kernel state restore permanently silencing snapshot writes: names that failed to revive are now remembered and carried over verbatim by later snapshots, so new work is persisted again instead of the session never writing to disk.
+- Added session-log lines for skipped, failed, and preserving kernel state snapshots (`kernel state snapshot skipped`, `kernel state snapshot failed`, `kernel state snapshot preserved unrestored names`, `kernel state restore failed; snapshot isolated`), which previously only reached an in-memory ring buffer.
+- Changed snapshot writes to stay paused after a partial restore when the kernel runtime does not announce the `preserve_names` capability, so an older runtime can never silently drop the unrestorable values.

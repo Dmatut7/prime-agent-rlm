@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -45,6 +45,27 @@ describeIfKernel("repl kernel state snapshot round-trip (real runtime)", { tags:
 			cwd: dir,
 			snapshot: { path: snapshotPath, manifestPath },
 		});
+	}
+
+	/** Names of isolated copies of one snapshot payload, newest last. */
+	function isolatedSnapshotNames(dir: string, basename: string): string[] {
+		return readdirSync(dir)
+			.filter((name) => name.startsWith(`${basename}.corrupt-`))
+			.sort();
+	}
+
+	/** Base64 of one name's blob inside a payload, or null when the name is absent. */
+	function payloadBlob(snapshot: string, name: string): string | null {
+		const script = [
+			"import base64, dill, sys",
+			`with open(${JSON.stringify(snapshot)}, "rb") as fh:`,
+			"    payload = dill.load(fh)",
+			`blob = payload.get(${JSON.stringify(name)})`,
+			"sys.stdout.write(base64.b64encode(blob).decode() if blob is not None else '')",
+		].join("\n");
+		const result = spawnSync(python as string, ["-c", script], { encoding: "utf8" });
+		expect(result.status, result.stderr).toBe(0);
+		return result.stdout.trim() === "" ? null : result.stdout.trim();
 	}
 
 	/** Build a snapshot artifact by running a dill script in the kernel python. */
@@ -200,7 +221,7 @@ describeIfKernel("repl kernel state snapshot round-trip (real runtime)", { tags:
 		}
 	}, 60_000);
 
-	it("keeps a corrupted snapshot on disk when the whole restore fails", async () => {
+	it("isolates a corrupt snapshot instead of writing over it, then persists again", async () => {
 		const corruptDir = mkdtempSync(join(tmpdir(), "prime-agent-repl-restore-corrupt-"));
 		const snapPath = join(corruptDir, "corrupt.dill");
 		const manifestPath = join(corruptDir, "corrupt.json");
@@ -228,27 +249,36 @@ describeIfKernel("repl kernel state snapshot round-trip (real runtime)", { tags:
 
 			const cell = await manager.execute("y = 2");
 			expect(cell.status).toBe("ok");
-			// The debounced auto-snapshot must not replace the corrupted-but-partial file.
 			await new Promise((resolve) => globalThis.setTimeout(resolve, 500));
-			expect(readFileSync(snapPath).equals(corrupted)).toBe(true);
-			expect(existsSync(manifestPath)).toBe(false);
 
-			// Explicit snapshots also refuse while the failure stands.
-			await expect(manager.snapshotState()).resolves.toBeNull();
-			expect(readFileSync(snapPath).equals(corrupted)).toBe(true);
+			// A whole-payload failure isolates the torn file instead of banning writes: the
+			// bytes are kept for forensics under the isolated name, and the rebuilt namespace
+			// may persist again. Nothing is overwritten in place, so nothing is lost.
+			const isolated = isolatedSnapshotNames(corruptDir, "corrupt.dill");
+			expect(isolated).toHaveLength(1);
+			expect(readFileSync(join(corruptDir, isolated[0] as string)).equals(corrupted)).toBe(true);
+			expect(existsSync(snapPath)).toBe(true);
+			expect(readFileSync(snapPath).equals(corrupted)).toBe(false);
+			expect(payloadBlob(snapPath, "x")).toBeNull();
+
+			// Explicit snapshots work again too, and carry the new work.
+			const snapshot = await manager.snapshotState();
+			expect(snapshot).not.toBeNull();
+			expect(snapshot?.saved).toContain("y");
+			expect(payloadBlob(snapPath, "y")).not.toBeNull();
 		} finally {
 			await manager.shutdown({ snapshot: true, drainHostRequests: true });
 		}
-		// The dispose flush must not have overwritten it either.
-		expect(readFileSync(snapPath).equals(corrupted)).toBe(true);
-		expect(existsSync(manifestPath)).toBe(false);
+		// The dispose flush keeps the isolated copy untouched.
+		expect(isolatedSnapshotNames(corruptDir, "corrupt.dill")).toHaveLength(1);
 		rmSync(corruptDir, { recursive: true, force: true });
 	}, 60_000);
 
-	it("keeps the on-disk snapshot when individual names fail to restore", async () => {
+	it("does not lose the unrestorable blob after a partial restore", async () => {
 		const partialDir = mkdtempSync(join(tmpdir(), "prime-agent-repl-restore-partial-"));
 		const snapPath = join(partialDir, "partial.dill");
 		const manifestPath = join(partialDir, "partial.json");
+		const originalPath = join(partialDir, "original.dill");
 		writeDillPayload(
 			[
 				"import dill",
@@ -259,6 +289,7 @@ describeIfKernel("repl kernel state snapshot round-trip (real runtime)", { tags:
 			].join("\n"),
 		);
 		const before = readFileSync(snapPath);
+		writeFileSync(originalPath, before);
 
 		const manager = new ReplKernelManager({
 			python: python as string,
@@ -270,17 +301,42 @@ describeIfKernel("repl kernel state snapshot round-trip (real runtime)", { tags:
 			expect(restore?.restored).toEqual(["good"]);
 			expect(restore?.failed.map((f) => f.name)).toEqual(["bad"]);
 
+			// Both capability states are pinned, because they have opposite observable
+			// behaviour and silently picking one would hide a regression in the other:
+			// - a runtime that cannot preserve names must not write at all (writing would
+			//   drop the 'bad' blob, which is worse than keeping the old payload);
+			// - a runtime that announced preserve_names must write, carry the blob over
+			//   byte-for-byte, and say so in the manifest.
+			// The forced-capability path is covered deterministically against a fake kernel
+			// in kernel-snapshot-write-policy.test.ts; this branch follows whatever the real
+			// runtime in use announces.
+			const preserveSupported = manager.kernelCapabilities?.preserveNames ?? false;
+			expect(typeof preserveSupported).toBe("boolean");
+
 			const cell = await manager.execute("z = 3");
 			expect(cell.status).toBe("ok");
 			await new Promise((resolve) => globalThis.setTimeout(resolve, 500));
-			expect(readFileSync(snapPath).equals(before)).toBe(true);
 
-			await expect(manager.snapshotState()).resolves.toBeNull();
-			expect(readFileSync(snapPath).equals(before)).toBe(true);
+			if (preserveSupported) {
+				expect(restore?.snapshotPolicy).toBe("preserve-names");
+				const snapshot = await manager.snapshotState();
+				expect(snapshot).not.toBeNull();
+				expect(snapshot?.saved).toEqual(expect.arrayContaining(["z"]));
+				expect(snapshot?.preserved).toEqual(["bad"]);
+				expect(JSON.parse(readFileSync(manifestPath, "utf8")).preserved).toEqual(["bad"]);
+				// The unrestorable value survived the write unchanged.
+				expect(payloadBlob(snapPath, "bad")).toBe(payloadBlob(originalPath, "bad"));
+				expect(payloadBlob(snapPath, "z")).not.toBeNull();
+			} else {
+				expect(restore?.snapshotPolicy).toBe("write-blocked");
+				await expect(manager.snapshotState()).resolves.toBeNull();
+				expect(readFileSync(snapPath).equals(before)).toBe(true);
+				expect(existsSync(manifestPath)).toBe(false);
+			}
 		} finally {
 			await manager.shutdown({ snapshot: true, drainHostRequests: true });
 		}
-		expect(readFileSync(snapPath).equals(before)).toBe(true);
+		expect(payloadBlob(snapPath, "bad")).toBe(payloadBlob(originalPath, "bad"));
 		rmSync(partialDir, { recursive: true, force: true });
 	}, 60_000);
 
@@ -346,9 +402,12 @@ describeIfKernel("repl kernel state snapshot round-trip (real runtime)", { tags:
 		} finally {
 			await provisioner.dispose();
 		}
-		// Bootstrap and the dispose flush ran on top of the failed restore: the file survives.
-		expect(readFileSync(snapPath).equals(corrupted)).toBe(true);
-		expect(existsSync(join(visDir, "kernel-state.json"))).toBe(false);
+		// Bootstrap and the dispose flush ran on top of the failed restore: the torn payload
+		// is kept under its isolated name rather than being written over in place.
+		const isolated = isolatedSnapshotNames(visDir, "kernel-state.dill");
+		expect(isolated).toHaveLength(1);
+		expect(readFileSync(join(visDir, isolated[0] as string)).equals(corrupted)).toBe(true);
+		expect(existsSync(snapPath) && readFileSync(snapPath).equals(corrupted)).toBe(false);
 		rmSync(visDir, { recursive: true, force: true });
 	}, 60_000);
 });
