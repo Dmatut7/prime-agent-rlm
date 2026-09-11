@@ -156,6 +156,15 @@ const BUSY_KERNEL_PROMPT = [
 	"Ctrl+C sent an interrupt, but the previous cell has not stopped yet. A new command cannot start until it finishes.",
 	"Waiting preserves the current kernel state. Killing restarts the kernel and loses in-memory variables, imports, and running tasks.",
 ].join("\n");
+/**
+ * Appended to an aborted cell's result: the output above it is partial, and the
+ * kernel may still be running the cell (see `KERNEL_BUSY_AFTER_INTERRUPT_MESSAGE`).
+ */
+export const IPYTHON_ABORTED_CELL_NOTICE = [
+	"<ipython_cell_aborted>",
+	'This cell was aborted while it was still running, so any output above is partial. The kernel may still be executing it: the next cell can report "The Python kernel is still running the previously interrupted cell" — wait for it to settle, or kill the kernel to start fresh.',
+	"</ipython_cell_aborted>",
+].join("\n");
 const KERNEL_RESTART_NOTICE = [
 	"<ipython_kernel_reset>",
 	"The Python kernel was restarted after a previous interrupted cell kept running. Variables, imports, async tasks, and open resources from before the restart are no longer available; recreate them before using them.",
@@ -247,6 +256,21 @@ function setWorkingMessage(ctx: ExtensionContext | undefined, message?: string):
 
 export type IpythonToolInput = Static<typeof ipythonSchema>;
 
+/**
+ * Why a cell was aborted, as recorded by the host. Lets the model tell a stall-watchdog
+ * kill from a user interrupt, and know which kernel process was involved.
+ */
+export interface IpythonAbortCause {
+	/** Session silence the stall watchdog measured when it aborted the turn, in ms. */
+	silentMs?: number;
+	/** Machine-readable stall reasons (e.g. `stall_watchdog`, `loop_stalled`). */
+	reasons?: readonly string[];
+	/** Kernel process id, when the host knows it. */
+	kernelPid?: number;
+	/** Epoch ms of the abort. */
+	at?: number;
+}
+
 export interface IpythonToolDetails {
 	durationMs?: number;
 	status?: "ok" | "error" | "aborted" | "starting";
@@ -264,6 +288,8 @@ export interface IpythonToolDetails {
 	sentAgentMessages?: KernelSentAgentMessage[];
 	/** True when this result came after killing and restarting a busy kernel. */
 	kernelRestarted?: boolean;
+	/** Structured cause when the cell was aborted mid-flight (stall watchdog, host abort). */
+	abortCause?: IpythonAbortCause;
 	error?: {
 		ename: string;
 		evalue: string;
@@ -294,6 +320,12 @@ export interface IpythonToolOptions {
 	 */
 	onRestore?: (result: RestoreResult) => void;
 	onLateSentAgentMessage?: (toolCallId: string, message: KernelSentAgentMessage) => void;
+	/**
+	 * Read once per aborted cell: the host's record of why the turn was aborted
+	 * (for a session, the last stall-watchdog abort). Undefined means "no recorded
+	 * cause", and the result then only says the cell was aborted mid-flight.
+	 */
+	getAbortCause?: () => IpythonAbortCause | undefined;
 	/** Shared provisioner owning the kernel lifecycle. When provided, the remaining options are ignored. */
 	provisioner?: IpythonKernelProvisioner;
 }
@@ -484,10 +516,12 @@ export class IpythonKernelProvisioner {
 				// mid-flight can replay the current stage.
 				this.emitStartupProgress("Starting Python kernel...");
 				// Only the process spawn + port resolve contends for OS resources under a
-				// fan-out, and it is bounded by start()'s own timeouts — so the permit
-				// covers only start(). Restore/bootstrap run per-kernel afterwards and are
-				// unbounded execute()s; holding the global permit across them could pin it
-				// forever on a wedged bootstrap and starve every other session's boot.
+				// fan-out, and it is bounded by start()'s own timeouts — the ready timeout,
+				// plus the bootstrap lock bound that startupSignal now reaches through
+				// ensureKernelPython — so the permit covers only start(). Restore/bootstrap run
+				// per-kernel afterwards and are unbounded execute()s; holding the global permit
+				// across them could pin it forever on a wedged bootstrap and starve every other
+				// session's boot.
 				await withKernelBootPermit(() => {
 					// Disposed while queued for the permit — don't spawn a kernel nobody wants.
 					if (startupSignal.aborted) throw new Error("Kernel provisioner disposed before start");
@@ -617,6 +651,84 @@ export function imageBlocksFromAttachments(attachments: readonly KernelAttachmen
 		.map((a) => ({ type: "image", data: a.data, mimeType: a.mimeType }));
 }
 
+/** Model-facing result of one executed cell. */
+export interface IpythonToolResultAssembly {
+	content: (TextContent | ImageContent)[];
+	details: IpythonToolDetails;
+	isError: boolean;
+}
+
+/** Renders the host's abort cause for the model; undefined when there is nothing to say. */
+export function formatIpythonAbortCause(cause: IpythonAbortCause | undefined): string | undefined {
+	if (!cause) return undefined;
+	const parts: string[] = [];
+	if (typeof cause.silentMs === "number" && cause.silentMs > 0) {
+		parts.push(`the turn was aborted after ${Math.max(1, Math.round(cause.silentMs / 1000))}s of session silence`);
+	}
+	const reasons = (cause.reasons ?? []).filter((reason) => reason.length > 0);
+	if (reasons.length > 0) {
+		parts.push(`reasons: ${reasons.join(", ")}`);
+	}
+	if (typeof cause.kernelPid === "number" && cause.kernelPid > 0) {
+		parts.push(`kernel pid ${cause.kernelPid}`);
+	}
+	if (parts.length === 0) return undefined;
+	return `Abort cause: ${parts.join("; ")}.`;
+}
+
+/**
+ * Builds the model-facing result for one executed cell.
+ *
+ * An aborted cell keeps whatever output it produced and gains the structured cause:
+ * the alternative (a bare "aborted" stub) is what makes a model re-run a long command
+ * blind, and re-running it is the expensive part of a stall kill.
+ */
+export function assembleIpythonToolResult(
+	r: ExecuteResult,
+	options: { kernelRestarted: boolean; abortCause?: IpythonAbortCause },
+): IpythonToolResultAssembly {
+	let text = r.stdout;
+	if (r.stderr) text += (text ? "\n" : "") + r.stderr;
+	if (r.result) text += (text ? "\n" : "") + r.result;
+	if (r.status === "error" && r.error) {
+		text += (text ? "\n" : "") + r.error.traceback.join("\n");
+	}
+	if (r.backgroundOutput) {
+		text += `${text ? "\n" : ""}[background output (unattributed)]\n${r.backgroundOutput}`;
+	}
+	if (r.status === "aborted") {
+		const cause = formatIpythonAbortCause(options.abortCause);
+		const notice = cause ? `${IPYTHON_ABORTED_CELL_NOTICE}\n${cause}` : IPYTHON_ABORTED_CELL_NOTICE;
+		text = text ? `${text}\n${notice}` : notice;
+	}
+	if (options.kernelRestarted) {
+		text = text ? `${KERNEL_RESTART_NOTICE}\n\n${text}` : KERNEL_RESTART_NOTICE;
+	}
+
+	const imageBlocks = imageBlocksFromAttachments(r.attachments);
+	const content: (TextContent | ImageContent)[] = [{ type: "text", text: text || "" }, ...imageBlocks];
+
+	return {
+		content,
+		details: {
+			durationMs: r.durationMs,
+			status: r.status,
+			errorEname: r.error?.ename,
+			stdout: r.stdout,
+			stderr: r.stderr,
+			result: r.result,
+			backgroundOutput: r.backgroundOutput,
+			diffs: r.diffs,
+			attachments: r.attachments,
+			sentAgentMessages: r.sentAgentMessages,
+			kernelRestarted: options.kernelRestarted,
+			error: r.error,
+			...(options.abortCause ? { abortCause: options.abortCause } : {}),
+		},
+		isError: r.status === "error" || r.status === "aborted",
+	};
+}
+
 export function createIpythonToolDefinition(
 	cwd: string,
 	options?: IpythonToolOptions,
@@ -664,40 +776,11 @@ export function createIpythonToolDefinition(
 					ctx,
 				);
 
-				let text = r.stdout;
-				if (r.stderr) text += (text ? "\n" : "") + r.stderr;
-				if (r.result) text += (text ? "\n" : "") + r.result;
-				if (r.status === "error" && r.error) {
-					text += (text ? "\n" : "") + r.error.traceback.join("\n");
-				}
-				if (r.backgroundOutput) {
-					text += `${text ? "\n" : ""}[background output (unattributed)]\n${r.backgroundOutput}`;
-				}
-				if (kernelRestarted) {
-					text = text ? `${KERNEL_RESTART_NOTICE}\n\n${text}` : KERNEL_RESTART_NOTICE;
-				}
-
-				const imageBlocks = imageBlocksFromAttachments(r.attachments);
-				const content: (TextContent | ImageContent)[] = [{ type: "text", text: text || "" }, ...imageBlocks];
-
-				return {
-					content,
-					details: {
-						durationMs: r.durationMs,
-						status: r.status,
-						errorEname: r.error?.ename,
-						stdout: r.stdout,
-						stderr: r.stderr,
-						result: r.result,
-						backgroundOutput: r.backgroundOutput,
-						diffs: r.diffs,
-						attachments: r.attachments,
-						sentAgentMessages: r.sentAgentMessages,
-						kernelRestarted,
-						error: r.error,
-					},
-					isError: r.status === "error" || r.status === "aborted",
-				};
+				return assembleIpythonToolResult(r, {
+					kernelRestarted,
+					// Only an aborted cell asks the host why: a finished cell has no cause to report.
+					abortCause: r.status === "aborted" ? options?.getAbortCause?.() : undefined,
+				});
 			} finally {
 				if (hasWorkingMessage) {
 					setToolWorkingMessage();
