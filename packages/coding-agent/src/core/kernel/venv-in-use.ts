@@ -34,6 +34,12 @@ export const RETIRED_VENV_RETENTION = 1;
 export const KERNEL_VENV_SUFFIX_LENGTH = 12;
 
 const REFERENCE_RECORD_VERSION = 1;
+/** File name prefix of the tombstone a kernel writes when its reference file could not be written. */
+export const UNVERIFIED_REFERENCE_PREFIX = "unverified-";
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
 const PID_FILE_NAME = /^[1-9][0-9]*$/;
 const GENERATION_SUFFIX = new RegExp(`^[0-9a-f]{${KERNEL_VENV_SUFFIX_LENGTH}}$`);
 
@@ -50,15 +56,29 @@ export interface KernelVenvInUseReference {
 	processStartId?: string;
 	sessionId?: string;
 	recordedAt?: string;
+	/** Set on a tombstone: this kernel could not write a real reference, so its claim is unverified. */
+	unverified?: boolean;
 	/** Absolute path of the reference file; the holder releases exactly this path. */
 	referencePath: string;
+}
+
+/** Outcome of registering one kernel with the generation it was spawned from. */
+export interface KernelVenvInUseRecord {
+	/** Path to release at teardown: the reference file, or the tombstone written after a failed reference write. */
+	releasePath?: string;
+	/** The reference itself could not be written, so readers report this generation's state as unknown. */
+	unverified: boolean;
+	/** Why the write failed, for the caller's log line. */
+	reason?: string;
 }
 
 export interface KernelVenvInUseState {
 	references: KernelVenvInUseReference[];
 	/**
-	 * The generation exists but its references could not be read. Callers must
-	 * treat the directory as in use: deleting it would be the unsafe direction.
+	 * The generation exists but its reference state could not be fully established: either the
+	 * reference directory could not be read, or a live kernel could not write its reference and
+	 * left a tombstone instead. Callers must treat the directory as in use — deleting it would
+	 * be the unsafe direction.
 	 */
 	unknown: boolean;
 	/** Reference files removed because their holder is provably gone. */
@@ -106,7 +126,9 @@ export class KernelVenvRebuildDeferredError extends Error {
 		super(
 			`venv rebuild deferred: ${liveReferences} kernels in use (${path.basename(venvDir)}). ` +
 				(referenceStateUnknown
-					? "Its in-use reference directory could not be read, so it is assumed to be in use. "
+					? liveReferences === 0
+						? "Its in-use reference directory could not be read, so it is assumed to be in use. "
+						: "At least one running kernel could not write its in-use reference, so the reference state is incomplete. "
 					: "") +
 				"A running kernel pins the directory it was spawned from, so that directory is neither rebuilt nor " +
 				"deleted while the kernel lives; this one needs a rebuild because it is not a usable base install. " +
@@ -117,34 +139,15 @@ export class KernelVenvRebuildDeferredError extends Error {
 	}
 }
 
-/**
- * Write this kernel's reference into the generation it was spawned from.
- * Returns the reference file path (the caller releases exactly that path), or
- * undefined when the write failed; a failed write leaves the generation's
- * reference state unverifiable, which the rebuild decision treats as in use.
- */
-export function recordKernelVenvInUseSync(
-	venvDir: string,
-	reference: { pid: number; sessionId?: string },
-): string | undefined {
-	if (!venvDir || !Number.isInteger(reference.pid) || reference.pid <= 0) return undefined;
-	const dir = path.join(venvDir, VENV_IN_USE_DIR_NAME);
-	const referencePath = path.join(dir, String(reference.pid));
+/** Create the reference directory and write one record; returns the failure reason, if any. */
+function writeReferenceFile(filePath: string, dir: string, record: Record<string, unknown>): string | undefined {
 	try {
 		mkdirSync(dir, { recursive: true, mode: 0o700 });
-		const processStartId = getProcessStartId(reference.pid);
-		const record = {
-			version: REFERENCE_RECORD_VERSION,
-			pid: reference.pid,
-			...(reference.sessionId ? { sessionId: reference.sessionId } : {}),
-			...(processStartId ? { processStartId } : {}),
-			recordedAt: new Date().toISOString(),
-		};
-		// O_NOFOLLOW: a planted symlink at the reference path must not be written
-		// through. The mode is re-asserted on the descriptor because the create mode
-		// only applies to a new file (as in orphan-process-journal.ts).
+		// O_NOFOLLOW: a planted symlink at the reference path must not be written through. The
+		// mode is re-asserted on the descriptor because the create mode only applies to a new
+		// file (as in orphan-process-journal.ts).
 		const descriptor = openSync(
-			referencePath,
+			filePath,
 			constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | requireNoFollow(constants.O_NOFOLLOW),
 			0o600,
 		);
@@ -154,10 +157,52 @@ export function recordKernelVenvInUseSync(
 		} finally {
 			closeSync(descriptor);
 		}
-		return referencePath;
-	} catch {
 		return undefined;
+	} catch (error) {
+		return errorMessage(error);
 	}
+}
+
+/**
+ * Register this kernel with the generation it was spawned from.
+ *
+ * Returns the path to release at teardown plus whether the registration is unverified. When the
+ * reference file itself cannot be written (EMFILE, ENOSPC, EACCES, a planted symlink at the
+ * path), a tombstone is written instead so the generation never looks free: with no on-disk
+ * trace, the next boot would read "zero references, state known" and could rebuild or reclaim
+ * the directory out from under this running kernel — the exact failure generation directories
+ * exist to prevent. The tombstone carries the same liveness evidence as a reference, so it
+ * protects the directory while this kernel lives and is swept once it dies. If the tombstone
+ * write fails too there is nothing left to signal with; the caller logs that and the directory
+ * falls back to today's (unprotected) behaviour.
+ */
+export function recordKernelVenvInUseSync(
+	venvDir: string,
+	reference: { pid: number; sessionId?: string },
+): KernelVenvInUseRecord {
+	if (!venvDir || !Number.isInteger(reference.pid) || reference.pid <= 0) {
+		return { unverified: false };
+	}
+	const dir = path.join(venvDir, VENV_IN_USE_DIR_NAME);
+	const processStartId = getProcessStartId(reference.pid);
+	const identity = {
+		version: REFERENCE_RECORD_VERSION,
+		pid: reference.pid,
+		...(reference.sessionId ? { sessionId: reference.sessionId } : {}),
+		...(processStartId ? { processStartId } : {}),
+		recordedAt: new Date().toISOString(),
+	};
+	const referencePath = path.join(dir, String(reference.pid));
+	const failure = writeReferenceFile(referencePath, dir, identity);
+	if (failure === undefined) return { releasePath: referencePath, unverified: false };
+
+	const tombstonePath = path.join(dir, `${UNVERIFIED_REFERENCE_PREFIX}${reference.pid}`);
+	const tombstoneFailure = writeReferenceFile(tombstonePath, dir, { ...identity, unverified: true, reason: failure });
+	return {
+		releasePath: tombstoneFailure === undefined ? tombstonePath : undefined,
+		unverified: true,
+		reason: tombstoneFailure === undefined ? failure : `${failure}; tombstone write also failed: ${tombstoneFailure}`,
+	};
 }
 
 /**
@@ -228,13 +273,18 @@ export async function readKernelVenvInUseState(venvDir: string): Promise<KernelV
 	}
 	const references: KernelVenvInUseReference[] = [];
 	const swept: string[] = [];
+	let unknown = false;
 	for (const entry of [...entries].sort()) {
+		// A tombstone (`unverified-<pid>`) is a reference whose writer could not create the real
+		// file; it counts, and it makes the state unknown so a rebuild defers instead of deleting.
+		const tombstone = entry.startsWith(UNVERIFIED_REFERENCE_PREFIX);
+		const pidName = tombstone ? entry.slice(UNVERIFIED_REFERENCE_PREFIX.length) : entry;
 		// Names this bookkeeping never writes are ignored: they neither protect the
 		// generation nor get deleted.
-		if (!PID_FILE_NAME.test(entry)) continue;
+		if (!PID_FILE_NAME.test(pidName)) continue;
 		const referencePath = path.join(dir, entry);
 		const record = readReferenceRecord(referencePath);
-		const stale = record === undefined || Number(entry) !== record.pid || !referenceIsLive(record);
+		const stale = record === undefined || Number(pidName) !== record.pid || !referenceIsLive(record);
 		if (stale) {
 			try {
 				await rm(referencePath, { force: true });
@@ -244,15 +294,17 @@ export async function readKernelVenvInUseState(venvDir: string): Promise<KernelV
 			}
 			continue;
 		}
+		if (tombstone) unknown = true;
 		references.push({
 			pid: record?.pid as number,
 			...(record?.processStartId ? { processStartId: record.processStartId } : {}),
 			...(record?.sessionId ? { sessionId: record.sessionId } : {}),
 			...(record?.recordedAt ? { recordedAt: record.recordedAt } : {}),
+			...(tombstone ? { unverified: true } : {}),
 			referencePath,
 		});
 	}
-	return { references, unknown: false, swept };
+	return { references, unknown, swept };
 }
 
 /**
@@ -292,7 +344,7 @@ export function decideKernelVenvRebuild(input: {
 		referenceStateUnknown,
 		platform,
 		reason: referenceStateUnknown
-			? "reference state unreadable, so the directory is assumed in use"
+			? "reference state incomplete or unreadable, so the directory is assumed in use"
 			: `${liveReferences} live kernel reference(s)`,
 	};
 }

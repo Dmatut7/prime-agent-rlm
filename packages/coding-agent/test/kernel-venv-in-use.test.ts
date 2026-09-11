@@ -1,12 +1,14 @@
 import { spawnSync } from "node:child_process";
 import {
 	chmodSync,
+	existsSync,
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
 	rmSync,
+	symlinkSync,
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
@@ -27,6 +29,7 @@ import {
 	readKernelVenvInUseState,
 	recordKernelVenvInUseSync,
 	releaseKernelVenvInUseSync,
+	UNVERIFIED_REFERENCE_PREFIX,
 	VENV_IN_USE_DIR_NAME,
 } from "../src/core/kernel/venv-in-use.js";
 import { getProcessStartId } from "../src/core/session-lease.js";
@@ -99,7 +102,9 @@ afterEach(() => {
 describe("kernel venv in-use references", () => {
 	it("records a reference the reader accepts and a release removes", async () => {
 		const venv = createGeneration("aaaaaaaaaaaa");
-		const referencePath = recordKernelVenvInUseSync(venv, { pid: process.pid, sessionId: "session-a" });
+		const recorded = recordKernelVenvInUseSync(venv, { pid: process.pid, sessionId: "session-a" });
+		expect(recorded.unverified).toBe(false);
+		const referencePath = recorded.releasePath;
 		expect(referencePath).toBe(join(venv, VENV_IN_USE_DIR_NAME, String(process.pid)));
 		expect(readdirSync(join(venv, VENV_IN_USE_DIR_NAME))).toEqual([String(process.pid)]);
 		const record = JSON.parse(readFileSync(referencePath as string, "utf8"));
@@ -127,7 +132,7 @@ describe("kernel venv in-use references", () => {
 		const venv = createGeneration("aaaaaaaaaaaa");
 		const dead = deadPid();
 		recordKernelVenvInUseSync(venv, { pid: dead, sessionId: "gone" });
-		const live = recordKernelVenvInUseSync(venv, { pid: process.pid, sessionId: "here" });
+		const live = recordKernelVenvInUseSync(venv, { pid: process.pid, sessionId: "here" }).releasePath;
 
 		const state = await readKernelVenvInUseState(venv);
 		expect(state.references.map((reference) => reference.pid)).toEqual([process.pid]);
@@ -178,7 +183,7 @@ describe("kernel venv in-use references", () => {
 
 	it.skipIf(runsAsRoot)("reports unknown (assume in use) when the reference directory cannot be read", async () => {
 		const venv = createGeneration("aaaaaaaaaaaa");
-		const referencePath = recordKernelVenvInUseSync(venv, { pid: process.pid, sessionId: "session-a" });
+		const referencePath = recordKernelVenvInUseSync(venv, { pid: process.pid, sessionId: "session-a" }).releasePath;
 		chmodSync(join(venv, VENV_IN_USE_DIR_NAME), 0o000);
 		try {
 			const state = await readKernelVenvInUseState(venv);
@@ -190,11 +195,101 @@ describe("kernel venv in-use references", () => {
 		expect(existsReference(referencePath)).toBe(true);
 	});
 
+	it("leaves a tombstone when the reference file cannot be written, and readers treat it as unknown", async () => {
+		const venv = createGeneration("aaaaaaaaaaaa");
+		const referenceDir = join(venv, VENV_IN_USE_DIR_NAME);
+		mkdirSync(referenceDir, { recursive: true, mode: 0o700 });
+		// A planted symlink at the reference path makes the O_NOFOLLOW create fail: the exact
+		// shape of a write failure that leaves the directory readable, i.e. the case where a
+		// reader would otherwise conclude "zero references, state known".
+		const victim = join(tempDir, "victim.txt");
+		writeFileSync(victim, "do not touch\n");
+		symlinkSync(victim, join(referenceDir, String(process.pid)));
+
+		const recorded = recordKernelVenvInUseSync(venv, { pid: process.pid, sessionId: "session-a" });
+
+		expect(recorded.unverified).toBe(true);
+		expect(recorded.reason).toBeTruthy();
+		expect(recorded.releasePath).toBe(join(referenceDir, `${UNVERIFIED_REFERENCE_PREFIX}${process.pid}`));
+		expect(existsSync(recorded.releasePath as string)).toBe(true);
+		// The refused write never followed the link.
+		expect(readFileSync(victim, "utf8")).toBe("do not touch\n");
+
+		const state = await readKernelVenvInUseState(venv);
+		expect(state.unknown).toBe(true);
+		expect(state.references).toHaveLength(1);
+		expect(state.references[0]?.pid).toBe(process.pid);
+		expect(state.references[0]?.unverified).toBe(true);
+		expect(
+			decideKernelVenvRebuild({
+				platform: process.platform,
+				generationDirExists: true,
+				liveReferences: state.references.length,
+				referenceStateUnknown: state.unknown,
+			}).mode,
+		).toBe("defer");
+
+		// The holder releases the tombstone like any other reference.
+		releaseKernelVenvInUseSync(recorded.releasePath);
+		const after = await readKernelVenvInUseState(venv);
+		expect(after.references).toHaveLength(0);
+		expect(after.unknown).toBe(false);
+	});
+
+	it("sweeps a tombstone whose pid is dead so it cannot pin a generation forever", async () => {
+		const venv = createGeneration("aaaaaaaaaaaa");
+		const referenceDir = join(venv, VENV_IN_USE_DIR_NAME);
+		mkdirSync(referenceDir, { recursive: true, mode: 0o700 });
+		const dead = deadPid();
+		writeFileSync(
+			join(referenceDir, `${UNVERIFIED_REFERENCE_PREFIX}${dead}`),
+			`${JSON.stringify({
+				version: 1,
+				pid: dead,
+				unverified: true,
+				recordedAt: new Date().toISOString(),
+			})}\n`,
+			{ mode: 0o600 },
+		);
+
+		const state = await readKernelVenvInUseState(venv);
+
+		expect(state.references).toHaveLength(0);
+		expect(state.unknown).toBe(false);
+		expect(state.swept).toEqual([join(referenceDir, `${UNVERIFIED_REFERENCE_PREFIX}${dead}`)]);
+		expect(readdirSync(referenceDir)).toEqual([]);
+	});
+
+	it.skipIf(runsAsRoot)("reports an unverified registration when the tombstone cannot be written either", async () => {
+		// Bounded residual, pinned so it cannot be mistaken for protection: when neither the
+		// reference nor the tombstone can be created there is no on-disk signal left, the caller's
+		// session-log warning is the only trace, and a reader sees a state it can verify as empty.
+		const venv = createGeneration("aaaaaaaaaaaa");
+		const referenceDir = join(venv, VENV_IN_USE_DIR_NAME);
+		mkdirSync(referenceDir, { recursive: true, mode: 0o700 });
+		chmodSync(referenceDir, 0o500);
+		try {
+			const recorded = recordKernelVenvInUseSync(venv, { pid: process.pid, sessionId: "session-a" });
+			expect(recorded.unverified).toBe(true);
+			expect(recorded.releasePath).toBeUndefined();
+			expect(recorded.reason).toContain("tombstone write also failed");
+
+			const state = await readKernelVenvInUseState(venv);
+			expect(state.references).toHaveLength(0);
+			expect(state.unknown).toBe(false);
+		} finally {
+			chmodSync(referenceDir, 0o700);
+		}
+	});
+
 	it.skipIf(runsAsRoot)("survives an unwritable venv without throwing", () => {
 		const venv = createGeneration("aaaaaaaaaaaa");
 		chmodSync(venv, 0o500);
 		try {
-			expect(recordKernelVenvInUseSync(venv, { pid: process.pid })).toBeUndefined();
+			const record = recordKernelVenvInUseSync(venv, { pid: process.pid });
+			expect(record.unverified).toBe(true);
+			expect(record.releasePath).toBeUndefined();
+			expect(record.reason).toBeTruthy();
 		} finally {
 			chmodSync(venv, 0o700);
 		}

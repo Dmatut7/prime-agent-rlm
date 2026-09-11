@@ -14,6 +14,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { type LogEntry, setLogSink } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	DEFAULT_RLM_EXTRA_IMPORT_NAMES,
@@ -81,6 +82,26 @@ function writeInUseReference(venvDir: string, pid: number, sessionId = "session-
 	writeFileSync(file, `${JSON.stringify({ version: 1, pid, sessionId, recordedAt: new Date().toISOString() })}\n`, {
 		mode: 0o600,
 	});
+	return file;
+}
+
+/** The tombstone format documented by src/core/kernel/venv-in-use.ts. */
+function writeInUseTombstone(venvDir: string, pid: number, sessionId = "session-1"): string {
+	const dir = join(venvDir, ".in-use");
+	mkdirSync(dir, { recursive: true, mode: 0o700 });
+	const file = join(dir, `unverified-${pid}`);
+	writeFileSync(
+		file,
+		`${JSON.stringify({
+			version: 1,
+			pid,
+			sessionId,
+			unverified: true,
+			reason: "ELOOP: too many symbolic links encountered",
+			recordedAt: new Date().toISOString(),
+		})}\n`,
+		{ mode: 0o600 },
+	);
 	return file;
 }
 
@@ -443,6 +464,26 @@ describe("kernel bootstrap builds into versioned generation directories", () => 
 		);
 	}, 60_000);
 
+	it("defers a rebuild when a kernel could only leave a tombstone", async () => {
+		// F1: a kernel whose reference write failed must not leave its generation looking free.
+		installFakeUv();
+		const firstPython = await ensureKernelPython();
+		const generation = dirname(dirname(firstPython));
+		rmSync(join(generation, ".bootstrap-version"));
+		const pid = livePid();
+		const tombstone = writeInUseTombstone(generation, pid, "session-unverified");
+		const inodeBefore = statSync(generation).ino;
+		const uvLog = readFileSync(join(tempDir, "uv.log"), "utf8");
+
+		await expect(ensureKernelPython()).rejects.toThrow(
+			/venv rebuild deferred: 1 kernels in use[\s\S]*could not write its in-use reference/,
+		);
+
+		expect(statSync(generation).ino).toBe(inodeBefore);
+		expect(existsSync(tombstone)).toBe(true);
+		expect(readFileSync(join(tempDir, "uv.log"), "utf8")).toBe(uvLog);
+	}, 60_000);
+
 	it("reports the deferral on Windows hosts too", async () => {
 		// The reachable ceiling on a non-win32 author machine is the decision table in
 		// kernel-venv-in-use.test.ts; this integration case only runs on Windows.
@@ -521,6 +562,35 @@ describe("kernel manager pins its generation with an in-use reference", () => {
 			expect(existsSync(join(tempDir, "override-venv", ".in-use"))).toBe(false);
 			expect(existsSync(join(base, ".in-use"))).toBe(false);
 		} finally {
+			await manager.shutdown({});
+		}
+	}, 60_000);
+
+	it("logs a warning and still starts when no reference can be written", async () => {
+		const generation = join(tempDir, "kernel-venv-cccccccccccc");
+		const python = join(generation, "bin", "python");
+		writeProtocolPython(python);
+		// A regular file where the reference directory belongs: neither the reference nor the
+		// tombstone can be created, so the session log is the only trace (the bounded residual).
+		writeFileSync(join(generation, ".in-use"), "not a directory\n");
+		const entries: LogEntry[] = [];
+		setLogSink((entry) => {
+			entries.push(entry);
+		});
+		const manager = new ReplKernelManager({ python, cwd: tempDir, sessionId: "session-unwritable" });
+
+		try {
+			await manager.start();
+			expect(manager.isRunning).toBe(true);
+			const warnings = entries.filter((entry) => entry.msg === "kernel venv in-use reference unavailable");
+			expect(warnings).toHaveLength(1);
+			expect(warnings[0]?.level).toBe("warn");
+			expect(warnings[0]?.tombstoneWritten).toBe(false);
+			expect(warnings[0]?.sessionId).toBe("session-unwritable");
+			expect(warnings[0]?.venvDir).toBe(generation);
+			expect(typeof warnings[0]?.reason).toBe("string");
+		} finally {
+			setLogSink(undefined);
 			await manager.shutdown({});
 		}
 	}, 60_000);

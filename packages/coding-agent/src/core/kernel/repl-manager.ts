@@ -518,24 +518,37 @@ export class ReplKernelManager {
 	}
 
 	/**
-	 * Pin the generation directory this kernel was spawned from. Bootstrap never
-	 * rebuilds, renames, or deletes a directory that still has a live reference, so a
-	 * runtime identity change elsewhere on the machine cannot pull this kernel's modules
-	 * out from under it. Best effort: an interpreter outside a managed generation
-	 * (PRIME_AGENT_KERNEL_PYTHON, a project venv) records nothing, and a failed write is
-	 * reported here and read by bootstrap as "reference state unknown", which defers a
-	 * rebuild instead of deleting.
+	 * Pin the generation directory this kernel was spawned from, and return the path to release
+	 * at teardown. Bootstrap never rebuilds, renames, or deletes a directory that still has a
+	 * live reference, so a runtime identity change elsewhere on the machine cannot pull this
+	 * kernel's modules out from under it. An interpreter outside a managed generation
+	 * (PRIME_AGENT_KERNEL_PYTHON, a project venv) records nothing.
+	 *
+	 * A reference write that fails is not silent: the recorder leaves a tombstone in the same
+	 * directory, which readers count as a reference and which marks the state unknown, so a
+	 * rebuild defers instead of deleting. That is reported to the session log because the
+	 * in-memory ring never leaves this process. If the tombstone could not be written either,
+	 * the generation is unprotected and the log line is the only trace — the residual case.
 	 */
 	private recordVenvInUseReference(pid: number): string | undefined {
 		const python = this.options.python;
 		if (!python) return undefined;
 		const venvDir = managedKernelVenvDirForPython(python);
 		if (!venvDir) return undefined;
-		const referencePath = recordKernelVenvInUseSync(venvDir, { pid, sessionId: this.options.sessionId });
-		if (referencePath === undefined) {
-			this.appendKernelDiagnostic(`could not record a kernel venv in-use reference in ${venvDir}`);
+		const record = recordKernelVenvInUseSync(venvDir, { pid, sessionId: this.options.sessionId });
+		if (record.unverified) {
+			kernelLog.warn("kernel venv in-use reference unavailable", {
+				venvDir,
+				pid,
+				reason: record.reason,
+				tombstoneWritten: record.releasePath !== undefined,
+				sessionId: this.options.sessionId,
+			});
+			this.appendKernelDiagnostic(
+				`could not record a kernel venv in-use reference in ${venvDir}: ${record.reason ?? "unknown reason"}`,
+			);
 		}
-		return referencePath;
+		return record.releasePath;
 	}
 
 	private wireChild(child: ChildProcess): void {
