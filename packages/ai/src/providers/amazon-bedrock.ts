@@ -44,6 +44,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import { recordStreamFailure, streamFailureFromStopReason } from "../utils/stream-failure.js";
+import { updateThrottledStreamingJson } from "../utils/streaming-json-throttle.js";
 import { adjustMaxTokensForThinking, buildBaseOptions, clampReasoning } from "./simple-options.js";
 import { transformMessages } from "./transform-messages.js";
 
@@ -402,7 +403,11 @@ function handleContentBlockDelta(
 		}
 	} else if (delta?.toolUse && block?.type === "toolCall") {
 		block.partialJson = (block.partialJson || "") + (delta.toolUse.input || "");
-		block.arguments = parseStreamingJson(block.partialJson);
+		// Throttled mid-stream parse; the contentBlockStop parse is authoritative.
+		const parsedArgs = updateThrottledStreamingJson(block, block.partialJson);
+		if (parsedArgs) {
+			block.arguments = parsedArgs;
+		}
 		stream.push({ type: "toolcall_delta", contentIndex: index, delta: delta.toolUse.input || "", partial: output });
 	} else if (delta?.reasoningContent) {
 		let thinkingBlock = block;

@@ -98,6 +98,24 @@ describe("TruncatedText component", () => {
 		assert.ok(!stripped.includes("Third line"));
 	});
 
+	it("returns the same array reference while text and width are unchanged", () => {
+		const text = new TruncatedText("Hello world", 1, 1);
+		const first = text.render(40);
+		assert.strictEqual(text.render(40), first);
+
+		const resized = text.render(30);
+		assert.notStrictEqual(resized, first);
+		assert.strictEqual(text.render(30), resized);
+
+		text.setText("Goodbye");
+		assert.notStrictEqual(text.render(30), resized);
+
+		const afterSet = text.render(30);
+		text.invalidate();
+		assert.notStrictEqual(text.render(30), afterSet);
+		assert.deepStrictEqual(text.render(30), afterSet);
+	});
+
 	it("truncates first line even with newlines in text", () => {
 		const longMultilineText = "This is a very long first line that needs truncation\nSecond line";
 		const text = new TruncatedText(longMultilineText, 1, 0);

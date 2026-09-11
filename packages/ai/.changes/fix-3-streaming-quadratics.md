@@ -1,0 +1,2 @@
+- Reduced streaming CPU usage by throttling incremental tool-call argument parsing instead of re-parsing the full accumulated buffer on every delta.
+- Reduced OpenRouter streaming CPU usage by encoding accumulated reasoning_details once at stream end instead of after every chunk.

@@ -62,18 +62,30 @@ function editCount(edits: AppliedRefinementEdit[]): string {
 
 /** Width-aware collapsed line: truncates the summary so the line never wraps. */
 class CollapsedOutcomeLine implements Component {
+	private cachedWidth?: number;
+	private cachedLines?: string[];
+
 	constructor(
 		private readonly summary: string,
 		private readonly suffix: string,
 	) {}
 
 	render(width: number): string[] {
+		if (this.cachedLines && this.cachedWidth === width) {
+			return this.cachedLines;
+		}
 		const room = Math.max(20, width - visibleWidth(this.suffix) - 1);
 		const line = `${theme.fg("customMessageText", truncateToWidth(this.summary, room, "…"))} ${this.suffix}`;
-		return [truncateToWidth(line, Math.max(1, width), "")];
+		const lines = [truncateToWidth(line, Math.max(1, width), "")];
+		this.cachedWidth = width;
+		this.cachedLines = lines;
+		return lines;
 	}
 
-	invalidate(): void {}
+	invalidate(): void {
+		this.cachedWidth = undefined;
+		this.cachedLines = undefined;
+	}
 }
 
 /** Durable refinement outcome card: per-edit rows with before/after diffs when expanded. */

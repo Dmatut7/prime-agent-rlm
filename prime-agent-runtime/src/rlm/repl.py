@@ -110,6 +110,9 @@ _serve_task: asyncio.Task[Any] | None = None
 _current_cell: contextvars.ContextVar[str | None] = contextvars.ContextVar("_current_cell", default=None)
 _active: dict[str, Any] = {"task": None, "rid": None, "interrupted": False}
 _cell_counter = 0
+# Namespace-mutation epochs for snapshot dirty-tracking: any executed cell or applied
+# restore invalidates the replay shortcut (see _replayable_snapshot).
+_restore_counter = 0
 _pending_host: dict[str, "asyncio.Future[dict[str, Any]]"] = {}
 # Set on the loop thread once stdin hits EOF or a shutdown request arrives; no
 # host reply can arrive after that, so waiting (and future) host_request calls fail.
@@ -167,6 +170,90 @@ def _send(event: dict[str, Any]) -> None:
             pass
 
 
+# Stream-frame coalescing. One print() is several write() calls and a tight loop is one
+# write per line; a JSON frame plus a write syscall per call is what makes output-heavy
+# cells slow. Tagged stream text is therefore batched per (stream, cell id) and shipped
+# as one frame when the writer is flushed, when an entry outgrows the size cap, or when a
+# short window expires - whichever happens first. The window is enforced by a daemon
+# thread so it holds even while a synchronous cell blocks the event loop.
+_STREAM_FLUSH_WINDOW_S = 0.005
+_STREAM_FRAME_MAX_CHARS = 64 * 1024
+
+
+class _StreamCoalescer:
+    """Batches tagged stream writes into one frame per short window.
+
+    Frame boundaries are not part of the protocol (the host concatenates `text` per
+    stream), but ordering and attribution are: entries keep insertion order, carry the
+    cell id captured at write time, and every send happens under the coalescer lock so
+    pop order equals wire order. Lock order is always coalescer -> _write_lock.
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._entries: dict[tuple[str, str | None], list[str]] = {}
+        self._sizes: dict[tuple[str, str | None], int] = {}
+        self._deadline: float | None = None
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        """Arm the window-enforcing flush thread (serving processes only)."""
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._run, daemon=True, name="rlm-stream-flush")
+            self._thread.start()
+
+    def append(self, stream: str, cell_id: str | None, text: str) -> None:
+        key = (stream, cell_id)
+        with self._cond:
+            entry = self._entries.get(key)
+            if entry is None:
+                entry = self._entries[key] = []
+            entry.append(text)
+            self._sizes[key] = self._sizes.get(key, 0) + len(text)
+            if self._deadline is None:
+                self._deadline = time.monotonic() + _STREAM_FLUSH_WINDOW_S
+                self._cond.notify_all()
+            if self._sizes[key] >= _STREAM_FRAME_MAX_CHARS:
+                self._send_entry(key)
+            if not self._entries:
+                self._deadline = None
+
+    def flush(self, stream: str | None = None) -> None:
+        """Ship buffered text now; None flushes every stream in insertion order."""
+        with self._cond:
+            for key in [k for k in self._entries if stream is None or k[0] == stream]:
+                self._send_entry(key)
+            if not self._entries:
+                self._deadline = None
+
+    def _send_entry(self, key: tuple[str, str | None]) -> None:
+        # Callers hold _cond, so the pop-to-wire order cannot interleave.
+        parts = self._entries.pop(key, None)
+        self._sizes.pop(key, None)
+        if parts:
+            _send({"event": key[0], "id": key[1], "text": "".join(parts)})
+
+    def _run(self) -> None:
+        try:
+            with self._cond:
+                while True:
+                    if self._deadline is None:
+                        self._cond.wait()
+                        continue
+                    remaining = self._deadline - time.monotonic()
+                    if remaining > 0:
+                        self._cond.wait(remaining)
+                        continue
+                    for key in list(self._entries):
+                        self._send_entry(key)
+                    self._deadline = None
+        except BaseException:  # noqa: BLE001 - interpreter teardown must not trace back
+            pass
+
+
+_stream_coalescer = _StreamCoalescer()
+
+
 def emit(data: dict[str, Any]) -> None:
     """Ship one display event carrying a dict of MIME type -> JSON payload.
 
@@ -180,6 +267,8 @@ def emit(data: dict[str, Any]) -> None:
     # written, so NaN is the only corruption vector). Payloads are small, so
     # the throwaway serialization here is cheap; _send re-serializes.
     json.dumps(data, allow_nan=False)
+    # Same-context causality: text this cell printed before the emit precedes the frame.
+    _stream_coalescer.flush()
     _send({"event": "display", "id": _current_cell.get(), "data": data})
 
 
@@ -198,6 +287,8 @@ async def host_request(data: dict[str, Any]) -> dict[str, Any]:
     future: asyncio.Future[dict[str, Any]] = _loop.create_future()
     _pending_host[rid] = future
     try:
+        # Same-context causality: output printed before the request precedes the frame.
+        _stream_coalescer.flush()
         _send({"event": "host_request", "id": rid, "data": data})
         return await future
     finally:
@@ -385,11 +476,13 @@ class _TaggedWriter(io.TextIOBase):
         if not isinstance(text, str):
             raise TypeError(f"write() argument must be str, not {type(text).__name__}")
         if text:
-            _send({"event": self._stream, "id": _current_cell.get(), "text": text})
+            # Buffered and coalesced into one frame per short window (see
+            # _StreamCoalescer); the id is captured here, at write time.
+            _stream_coalescer.append(self._stream, _current_cell.get(), text)
         return len(text)
 
     def flush(self) -> None:
-        pass
+        _stream_coalescer.flush(self._stream)
 
     def fileno(self) -> int:
         return self._fallback_fd
@@ -702,6 +795,10 @@ async def _handle_execute(req: dict[str, Any], ns: dict[str, Any]) -> None:
 
 
 def _drain_output() -> None:
+    # Coalesced tagged text ships first and unconditionally: a cell that rebound
+    # sys.stdout/sys.stderr still leaves the pre-rebind writes buffered here, and
+    # everything this cell wrote must precede its result/error/done frames.
+    _stream_coalescer.flush()
     # Per-stream, and ValueError too: a cell may close sys.stdout/sys.stderr, and
     # flushing a closed file raises ValueError, or rebind them to a flush-less
     # object (AttributeError); neither may kill the serve loop nor skip flushing
@@ -824,6 +921,92 @@ def _merge_preserved_blobs(
     return carried
 
 
+# Snapshot dirty-tracking. The host snapshots after every cell (and again on dispose)
+# and kills a snapshot at 5s, so re-serializing every value after every turn thrashes
+# data-heavy sessions. Two cheap facts skip most of that work while keeping the payload
+# byte-identical to a full re-serialization:
+#
+# - A deeply immutable value that is still the identical object serializes to identical
+#   bytes, so its blob is reused instead of re-dumped (_snapshot_blob_cache).
+# - A snapshot request that arrives with no cell executed and no restore applied since
+#   the last successful one, every eligible name still bound to the identical object,
+#   and the committed pair intact on disk cannot improve the payload: the whole write
+#   is skipped and the previous result replayed (_replayable_snapshot).
+#
+# Both are fingerprints, not proofs, against mutators outside the event loop: a
+# background thread mutating a value IN PLACE while no cell runs is invisible to them
+# (rebinding is not - identity is checked). In-place mutation by cells is always caught
+# because any executed cell bumps _cell_counter and invalidates the replay record.
+_snapshot_blob_cache: dict[str, tuple[Any, bytes]] = {}
+_last_snapshot_record: dict[str, Any] | None = None
+
+# Exact types only: an instance of a str/int subclass can carry a mutable __dict__ that
+# dill serializes, so `isinstance` is not enough for blob reuse.
+_IMMUTABLE_ATOMIC_TYPES = frozenset({str, bytes, int, float, complex, bool, type(None), range})
+
+
+def _deeply_immutable(value: Any, seen: set[int] | None = None) -> bool:
+    """True when `value`'s serialized form can never change for this object identity.
+
+    Recurses into tuple/frozenset elements with a shared-reference set so a DAG costs
+    one visit per object. Anything not exactly a known-immutable built-in counts as
+    mutable; a false negative only costs a re-dump, never a stale blob.
+    """
+    vtype = type(value)
+    if vtype in _IMMUTABLE_ATOMIC_TYPES:
+        return True
+    if vtype is not tuple and vtype is not frozenset:
+        return False
+    if seen is None:
+        seen = set()
+    if id(value) in seen:
+        return True
+    seen.add(id(value))
+    try:
+        return all(_deeply_immutable(item, seen) for item in value)
+    except RecursionError:
+        # Pathological nesting: treat as mutable rather than risk a wrong verdict.
+        return False
+
+
+def _replayable_snapshot(key: tuple, path: str, manifest_path: str, ns: dict[str, Any]) -> dict[str, Any] | None:
+    """The last committed result when this exact request provably adds nothing.
+
+    Cheap and conservative: any doubt (a cell ran, a restore applied, a name appeared,
+    vanished, or was rebound, a file moved or changed size) falls through to a full
+    snapshot. The on-disk check keeps the host's corrupt-snapshot isolation intact -
+    an isolated (renamed) or truncated pair is never replayed over.
+    """
+    record = _last_snapshot_record
+    if record is None or record["key"] != key:
+        return None
+    if record["cells"] != _cell_counter or record["restores"] != _restore_counter:
+        return None
+    refs = record["refs"]
+    missing = object()
+    matched = 0
+    for name in list(ns.keys()):
+        if not isinstance(name, str) or name.startswith("_") or name in _ALWAYS_SKIP:
+            continue
+        value = ns.get(name, missing)
+        # A name deleted mid-check is a change this snapshot must report honestly.
+        if value is missing or refs.get(name, missing) is not value:
+            return None
+        matched += 1
+    if matched != len(refs):
+        return None
+    try:
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode) or info.st_size != record["bytes"]:
+            return None
+        manifest_info = os.lstat(manifest_path)
+        if not stat.S_ISREG(manifest_info.st_mode):
+            return None
+    except OSError:
+        return None
+    return record["result"]
+
+
 def _snapshot_state(
     ns: dict[str, Any],
     path: str,
@@ -833,6 +1016,8 @@ def _snapshot_state(
     prune_oversized: bool,
     committed: list[dict[str, Any]] | None = None,
     preserve_names: list[str] | None = None,
+    blob_cache: dict[str, tuple[Any, bytes]] | None = None,
+    seen_out: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Serialize the namespace, carrying `preserve_names` over from the previous payload.
 
@@ -859,6 +1044,7 @@ def _snapshot_state(
     oversized: list[str] = []
     total = 0
     missing = object()
+    seen_names: set[str] = set()
     for name in list(ns.keys()):
         if name.startswith("_") or name in _ALWAYS_SKIP:
             continue
@@ -867,27 +1053,52 @@ def _snapshot_state(
             # A background thread deleted the name after the key listing.
             skipped.append({"name": name, "reason": "deleted during snapshot"})
             continue
+        seen_names.add(name)
+        if seen_out is not None:
+            seen_out[name] = value
         remaining = max_bytes - total
         limit = max_variable_bytes if prune_oversized else min(max_variable_bytes, remaining)
-        buffer = io.BytesIO()
-        try:
-            dill.dump(value, _CappedWriter(buffer, limit))
-            blob = buffer.getvalue()
-        except _SnapshotSizeLimitExceeded:
-            if not prune_oversized and remaining < max_variable_bytes:
-                skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
-            else:
-                skipped.append({"name": name, "reason": "exceeds per-variable snapshot size cap"})
-                oversized.append(name)
-            continue
-        except Exception as err:  # noqa: BLE001 - one unpicklable name must not abort the snapshot
-            skipped.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
-            continue
+        cached = blob_cache.get(name) if blob_cache is not None else None
+        if cached is not None and cached[0] is value:
+            # The identical deeply-immutable object as an earlier dump: its bytes are
+            # known, and len() against the limit reproduces exactly what a fresh capped
+            # dump would have decided (_CappedWriter aborts iff the blob outgrows it).
+            blob = cached[1]
+            if len(blob) > limit:
+                if not prune_oversized and remaining < max_variable_bytes:
+                    skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
+                else:
+                    skipped.append({"name": name, "reason": "exceeds per-variable snapshot size cap"})
+                    oversized.append(name)
+                continue
+        else:
+            buffer = io.BytesIO()
+            try:
+                dill.dump(value, _CappedWriter(buffer, limit))
+                blob = buffer.getvalue()
+            except _SnapshotSizeLimitExceeded:
+                if not prune_oversized and remaining < max_variable_bytes:
+                    skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
+                else:
+                    skipped.append({"name": name, "reason": "exceeds per-variable snapshot size cap"})
+                    oversized.append(name)
+                continue
+            except Exception as err:  # noqa: BLE001 - one unpicklable name must not abort the snapshot
+                skipped.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
+                continue
+            if blob_cache is not None and _deeply_immutable(value):
+                blob_cache[name] = (value, blob)
         if total + len(blob) > max_bytes:
             skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
             continue
         payload[name] = blob
         total += len(blob)
+
+    if blob_cache is not None:
+        # Values are pinned by the cache entry, so a name that vanished from the
+        # namespace must drop its entry or the blob (and the object) would leak.
+        for stale in [stale for stale in blob_cache if stale not in seen_names]:
+            del blob_cache[stale]
 
     preserved = _merge_preserved_blobs(path, payload, skipped, preserve_names)
 
@@ -1061,6 +1272,7 @@ def _snapshot_state(
 def _restore_state(
     ns: dict[str, Any], path: str, committed: list[dict[str, Any]] | None = None
 ) -> dict[str, Any]:
+    global _restore_counter
     if not hasattr(os, "O_NOFOLLOW"):
         return {"restored": [], "failed": [], "error": "O_NOFOLLOW unavailable"}
     if not os.path.lexists(path):
@@ -1100,6 +1312,10 @@ def _restore_state(
     try:
         for name, value in staged.items():
             ns[name] = value
+        # The namespace changed behind the snapshot cache's back: invalidate the replay
+        # shortcut (the applied values are fresh objects, so identity would catch them
+        # too, but a restore that applied nothing must not race a concurrent snapshot).
+        _restore_counter += 1
         # Publish while still parked: a later KeyboardInterrupt into this task finds the committed result (see _handle_state).
         if committed is not None:
             committed.append(result)
@@ -1142,16 +1358,53 @@ async def _handle_state(req: dict[str, Any], ns: dict[str, Any]) -> None:
             # realpath resolves symlinks, so aliased paths cannot silently clobber the payload.
             if os.path.realpath(req["path"]) == os.path.realpath(req["manifest_path"]):
                 return {"error": "path and manifest_path must differ"}
-            return _snapshot_state(
+            global _last_snapshot_record
+            max_bytes = req.get("max_bytes", DEFAULT_SNAPSHOT_MAX_BYTES)
+            max_variable_bytes = req.get("max_variable_bytes", DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES)
+            key = (
+                os.path.realpath(req["path"]),
+                os.path.realpath(req["manifest_path"]),
+                max_bytes,
+                max_variable_bytes,
+                prune,
+                tuple(preserve_names) if preserve_names is not None else None,
+            )
+            replay = _replayable_snapshot(key, req["path"], req["manifest_path"], ns)
+            if replay is not None:
+                # Nothing ran and no binding changed since the last committed snapshot,
+                # and the pair on disk is intact: its result already describes exactly
+                # what this request would write, so replay it without touching the files.
+                if committed is not None:
+                    committed.append(replay)
+                return dict(replay)
+            cells = _cell_counter
+            restores = _restore_counter
+            seen: dict[str, Any] = {}
+            result = _snapshot_state(
                 ns,
                 req["path"],
                 req["manifest_path"],
-                req.get("max_bytes", DEFAULT_SNAPSHOT_MAX_BYTES),
-                req.get("max_variable_bytes", DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES),
+                max_bytes,
+                max_variable_bytes,
                 prune,
                 committed,
                 preserve_names,
+                blob_cache=_snapshot_blob_cache,
+                seen_out=seen,
             )
+            if "error" not in result:
+                # Epochs were read before serialization; a concurrent mutator can only
+                # make the record stale in the conservative direction (the next request
+                # redoes the full work instead of replaying a superseded result).
+                _last_snapshot_record = {
+                    "key": key,
+                    "cells": cells,
+                    "restores": restores,
+                    "refs": seen,
+                    "bytes": result["bytes"],
+                    "result": result,
+                }
+            return result
         return _restore_state(ns, req["path"], committed)
 
     assert _loop is not None
@@ -1254,6 +1507,9 @@ async def _serve(queue: asyncio.Queue[dict[str, Any]], ns: dict[str, Any]) -> No
                     print(f"MCP shutdown failed: {type(exc).__name__}: {exc}", file=sys.stderr)
             # Kill live bash children now; atexit would wait on parked executor threads.
             _kill_live_handles()
+            # Trailing coalesced output (including the MCP failure print above) must
+            # reach the host before the final done and process exit.
+            _stream_coalescer.flush()
             if isinstance(rid, str):
                 _send({"event": "done", "id": rid, "status": "ok"})
             return
@@ -1574,6 +1830,7 @@ def main() -> None:
     global _loop, _negotiated_protocol, _serve_task
     _negotiated_protocol = resolve_protocol_version(os.environ.get(PROTOCOL_ENV_VAR))
     stdin_fd = _setup_fds()
+    _stream_coalescer.start()
     _start_owner_watchdog()
     _start_heartbeat()
 
@@ -1611,6 +1868,7 @@ def main() -> None:
             _loop.run_until_complete(_serve_task)
         except KeyboardInterrupt:
             continue
+    _stream_coalescer.flush()
     _loop.close()
 
 

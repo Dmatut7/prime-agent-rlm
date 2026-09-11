@@ -1,5 +1,6 @@
 import { Container, Loader, Spacer, Text, type TUI } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
+import { BASH_UPDATE_THROTTLE_MS } from "../../../core/tools/bash.js";
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
@@ -24,6 +25,9 @@ export class BashExecutionComponent extends Container {
 	private fullOutputPath?: string;
 	private expanded = false;
 	private contentContainer: Container;
+	private lastUpdateAt = 0;
+	private updateTimer: NodeJS.Timeout | undefined;
+	private updateDirty = false;
 
 	constructor(command: string, ui: TUI, excludeFromContext = false, options: { suppressLeadingSpace?: boolean } = {}) {
 		super();
@@ -60,12 +64,12 @@ export class BashExecutionComponent extends Container {
 	 */
 	setExpanded(expanded: boolean): void {
 		this.expanded = expanded;
-		this.updateDisplay();
+		this.refreshNow();
 	}
 
 	override invalidate(): void {
 		super.invalidate();
-		this.updateDisplay();
+		this.refreshNow();
 	}
 
 	appendOutput(chunk: string): void {
@@ -80,6 +84,39 @@ export class BashExecutionComponent extends Container {
 			this.outputLines.push(...newLines);
 		}
 
+		this.scheduleUpdateDisplay();
+	}
+
+	/**
+	 * Display refreshes throttled to the bash tool's streaming cadence: chunks
+	 * accumulate immediately, the first one renders at once and later ones are
+	 * coalesced into a trailing timer flush.
+	 */
+	private scheduleUpdateDisplay(): void {
+		this.updateDirty = true;
+		const delay = BASH_UPDATE_THROTTLE_MS - (Date.now() - this.lastUpdateAt);
+		if (delay <= 0) {
+			this.refreshNow();
+			return;
+		}
+		if (!this.updateTimer) {
+			this.updateTimer = setTimeout(() => {
+				this.updateTimer = undefined;
+				if (this.updateDirty) {
+					this.refreshNow();
+				}
+			}, delay);
+			this.updateTimer.unref?.();
+		}
+	}
+
+	private refreshNow(): void {
+		if (this.updateTimer) {
+			clearTimeout(this.updateTimer);
+			this.updateTimer = undefined;
+		}
+		this.updateDirty = false;
+		this.lastUpdateAt = Date.now();
 		this.updateDisplay();
 	}
 
@@ -100,7 +137,7 @@ export class BashExecutionComponent extends Container {
 
 		this.loader.stop();
 
-		this.updateDisplay();
+		this.refreshNow();
 	}
 
 	/** Mark the execution as failed before producing a result (e.g. spawn failure). */
@@ -108,52 +145,46 @@ export class BashExecutionComponent extends Container {
 		this.errorMessage = message;
 		this.status = "error";
 		this.loader.stop();
-		this.updateDisplay();
+		this.refreshNow();
 	}
 
 	private updateDisplay(): void {
+		// A running collapsed preview only needs the visible output tail: joining
+		// the full output and re-running the context truncation per streamed chunk
+		// is quadratic over the stream. The exact truncated content (hidden-line
+		// counts, truncation warnings, expanded view) is still derived on
+		// completion or when expanded.
+		const streamingPreview = this.status === "running" && !this.expanded;
+
 		// Apply truncation for LLM context limits (same limits as bash tool)
-		const fullOutput = this.outputLines.join("\n");
-		const contextTruncation = truncateTail(fullOutput, {
-			maxLines: DEFAULT_MAX_LINES,
-			maxBytes: DEFAULT_MAX_BYTES,
-		});
+		const contextTruncation = streamingPreview
+			? undefined
+			: truncateTail(this.outputLines.join("\n"), {
+					maxLines: DEFAULT_MAX_LINES,
+					maxBytes: DEFAULT_MAX_BYTES,
+				});
 
 		// Recompute wrapping from the render width so resizes and split panes cannot use stale columns.
-		const availableLines = contextTruncation.content ? contextTruncation.content.split("\n") : [];
+		const availableLines = contextTruncation?.content ? contextTruncation.content.split("\n") : [];
 
-		const previewLogicalLines = availableLines.slice(-PREVIEW_LINES);
-		const hiddenLineCount = availableLines.length - previewLogicalLines.length;
+		const previewLogicalLines = streamingPreview ? this.previewTailLines() : availableLines.slice(-PREVIEW_LINES);
+		const hiddenLineCount = streamingPreview ? 0 : availableLines.length - previewLogicalLines.length;
 
 		this.contentContainer.clear();
 
 		const header = new Text(theme.fg("bashMode", theme.bold(`$ ${this.command}`)), 1, 0);
 		this.contentContainer.addChild(header);
 
-		if (availableLines.length > 0) {
+		if (streamingPreview) {
+			if (previewLogicalLines.length > 0) {
+				this.addPreviewChild(previewLogicalLines);
+			}
+		} else if (availableLines.length > 0) {
 			if (this.expanded) {
 				const displayText = availableLines.map((line) => theme.fg("muted", line)).join("\n");
 				this.contentContainer.addChild(new Text(`\n${displayText}`, 1, 0));
 			} else {
-				// Use shared visual truncation utility with width-aware caching
-				const styledOutput = previewLogicalLines.map((line) => theme.fg("muted", line)).join("\n");
-				const styledInput = `\n${styledOutput}`;
-				let cachedWidth: number | undefined;
-				let cachedLines: string[] | undefined;
-				this.contentContainer.addChild({
-					render: (width: number) => {
-						if (cachedLines === undefined || cachedWidth !== width) {
-							const result = truncateToVisualLines(styledInput, PREVIEW_LINES, width, 1);
-							cachedLines = result.visualLines;
-							cachedWidth = width;
-						}
-						return cachedLines ?? [];
-					},
-					invalidate: () => {
-						cachedWidth = undefined;
-						cachedLines = undefined;
-					},
-				});
+				this.addPreviewChild(previewLogicalLines);
 			}
 		}
 
@@ -184,7 +215,7 @@ export class BashExecutionComponent extends Container {
 			}
 
 			// Add truncation warning (context truncation, not preview truncation)
-			const wasTruncated = this.truncationResult?.truncated || contextTruncation.truncated;
+			const wasTruncated = this.truncationResult?.truncated || contextTruncation?.truncated;
 			if (wasTruncated && this.fullOutputPath) {
 				statusParts.push(theme.fg("warning", `Output truncated. Full output: ${this.fullOutputPath}`));
 			}
@@ -193,6 +224,46 @@ export class BashExecutionComponent extends Container {
 				this.contentContainer.addChild(new Text(`\n${statusParts.join("\n")}`, 1, 0));
 			}
 		}
+	}
+
+	// Shared visual truncation utility with width-aware caching.
+	private addPreviewChild(previewLogicalLines: string[]): void {
+		const styledOutput = previewLogicalLines.map((line) => theme.fg("muted", line)).join("\n");
+		const styledInput = `\n${styledOutput}`;
+		let cachedWidth: number | undefined;
+		let cachedLines: string[] | undefined;
+		this.contentContainer.addChild({
+			render: (width: number) => {
+				if (cachedLines === undefined || cachedWidth !== width) {
+					const result = truncateToVisualLines(styledInput, PREVIEW_LINES, width, 1);
+					cachedLines = result.visualLines;
+					cachedWidth = width;
+				}
+				return cachedLines ?? [];
+			},
+			invalidate: () => {
+				cachedWidth = undefined;
+				cachedLines = undefined;
+			},
+		});
+	}
+
+	/**
+	 * Visible preview tail while running collapsed. Matches the last
+	 * PREVIEW_LINES lines of the context-truncated full output; the full-output
+	 * path is only needed when the tail window itself exceeds the byte budget
+	 * (oversized output lines).
+	 */
+	private previewTailLines(): string[] {
+		const tail = this.outputLines.slice(-PREVIEW_LINES);
+		const joined = tail.join("\n");
+		if (joined === "") {
+			return [];
+		}
+		if (Buffer.byteLength(joined, "utf-8") <= DEFAULT_MAX_BYTES) {
+			return tail;
+		}
+		return truncateTail(joined, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES }).content.split("\n");
 	}
 
 	/**

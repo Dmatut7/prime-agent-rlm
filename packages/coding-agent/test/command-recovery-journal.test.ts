@@ -1,8 +1,23 @@
-import { appendFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	appendFileSync,
+	chmodSync,
+	existsSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { CommandRecoveryJournal } from "../src/modes/daemon/command-recovery-journal.js";
+import {
+	COMPACT_AFTER_BYTES,
+	COMPACT_AFTER_RECORDS,
+	CommandRecoveryJournal,
+	createCommandIdempotencyKey,
+} from "../src/modes/daemon/command-recovery-journal.js";
 
 describe("CommandRecoveryJournal", () => {
 	const roots: string[] = [];
@@ -35,7 +50,7 @@ describe("CommandRecoveryJournal", () => {
 		expect(existsSync(`${path}.4242.tmp`)).toBe(false);
 	});
 
-	it("compacts atomically without leaving a temp file behind", () => {
+	it("defers compaction past an acknowledgement and leaves no temp file behind", () => {
 		const path = createPath();
 		const journal = new CommandRecoveryJournal(path);
 		journal.begin("client-a", "command-a", "prompt");
@@ -47,8 +62,83 @@ describe("CommandRecoveryJournal", () => {
 		});
 		journal.acknowledge("client-a", "command-a");
 		expect(readdirSync(dirname(path)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+		// The acknowledgement is a record, not a rewrite: the dead entry waits for a bound.
+		expect(recordTypes(path)).toEqual(["received", "result", "acknowledged"]);
 		const reopened = new CommandRecoveryJournal(path);
 		expect(reopened.lookup("client-a", "command-a")).toBeUndefined();
+		expect(reopened.begin("client-a", "command-a", "prompt")).toEqual({ status: "new" });
+	});
+
+	it("compacts atomically at the record bound without leaving a temp file behind", () => {
+		const path = createPath();
+		// Seeded pairs of received+acknowledged records: dead on load, but they still
+		// count toward the bound, so the next result is what triggers the rewrite.
+		const seeded: string[] = [];
+		for (let index = 0; index < COMPACT_AFTER_RECORDS - 2; index += 2) {
+			const key = createCommandIdempotencyKey("seed", `${index}`);
+			seeded.push(
+				JSON.stringify({
+					version: 1,
+					type: "received",
+					key,
+					clientId: "seed",
+					commandId: `${index}`,
+					commandType: "prompt",
+					recordedAt: new Date().toISOString(),
+				}),
+				JSON.stringify({ version: 1, type: "acknowledged", key, recordedAt: new Date().toISOString() }),
+			);
+		}
+		expect(seeded).toHaveLength(COMPACT_AFTER_RECORDS - 2);
+		writeFileSync(path, `${seeded.join("\n")}\n`);
+
+		const journal = new CommandRecoveryJournal(path);
+		journal.begin("client-a", "command-a", "prompt");
+		journal.recordResult("client-a", "command-a", {
+			id: "command-a",
+			type: "response",
+			command: "prompt",
+			success: true,
+		});
+
+		expect(readdirSync(dirname(path)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+		// Only the live entry survived the rewrite.
+		expect(recordTypes(path)).toEqual(["received", "result"]);
+		const reopened = new CommandRecoveryJournal(path);
+		expect(reopened.lookup("client-a", "command-a")).toEqual({
+			status: "complete",
+			response: { id: "command-a", type: "response", command: "prompt", success: true },
+		});
+		expect(reopened.lookup("seed", "0")).toBeUndefined();
+	});
+
+	it("compacts at the byte bound", () => {
+		const path = createPath();
+		const journal = new CommandRecoveryJournal(path);
+		journal.begin("client-a", "command-a", "prompt");
+		journal.recordResult("client-a", "command-a", {
+			id: "command-a",
+			type: "response",
+			command: "prompt",
+			success: true,
+			data: { filler: "x".repeat(COMPACT_AFTER_BYTES) },
+		});
+		// Two records only, so the byte bound is what makes the acknowledgement compact.
+		expect(statSync(path).size).toBeGreaterThanOrEqual(COMPACT_AFTER_BYTES);
+		journal.acknowledge("client-a", "command-a");
+		expect(recordTypes(path)).toEqual([]);
+		expect(statSync(path).size).toBeLessThan(1024);
+	});
+
+	it.skipIf(process.platform === "win32")("tightens journal permissions once, not per record", () => {
+		const path = createPath();
+		writeFileSync(path, "");
+		chmodSync(path, 0o644); // a journal left behind by an older build
+		const journal = new CommandRecoveryJournal(path);
+		expect(statSync(path).mode & 0o777).toBe(0o600);
+		journal.begin("client-a", "command-a", "prompt");
+		journal.acknowledge("client-a", "command-a");
+		expect(statSync(path).mode & 0o777).toBe(0o600);
 	});
 
 	afterEach(() => {
@@ -61,6 +151,16 @@ describe("CommandRecoveryJournal", () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-agent-command-journal-"));
 		roots.push(root);
 		return join(root, "commands.jsonl");
+	}
+
+	function recordTypes(path: string): string[] {
+		if (!existsSync(path)) {
+			return [];
+		}
+		return readFileSync(path, "utf8")
+			.split("\n")
+			.filter((line) => line.length > 0)
+			.map((line) => (JSON.parse(line) as { type: string }).type);
 	}
 
 	it("marks received commands uncertain instead of replaying them", () => {
