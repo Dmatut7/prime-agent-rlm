@@ -24,6 +24,13 @@ export const DEFAULT_STALL_WARN_AFTER_SECONDS = 300;
  */
 export const DEFAULT_STALL_ABORT_AFTER_SECONDS = 900;
 
+/**
+ * Bound on waiting for the shared kernel-venv bootstrap lock before the boot
+ * fails with an actionable error. Without it a wedged lock holder hangs the
+ * kernel start until the session stall watchdog aborts the turn.
+ */
+export const DEFAULT_KERNEL_BOOTSTRAP_LOCK_TIMEOUT_MS = 300_000;
+
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
 	reserveTokens?: number; // default: 16384
@@ -69,6 +76,16 @@ export interface StallWatchdogSettings {
 	enabled?: boolean; // default: true
 	warnAfterSeconds?: number; // default: 300 (5 min silent => warning + diagnostics)
 	abortAfterSeconds?: number; // default: 900 (15 min silent => auto-abort); must exceed warnAfterSeconds
+}
+
+/**
+ * Kernel venv bootstrap knobs. `lockTimeoutMs` bounds how long a boot waits for
+ * the machine-wide bootstrap lock; 0 disables the bound (today's unbounded
+ * wait), matching the `tools.bashTimeoutSeconds` / `extensionHandlerTimeoutMs`
+ * convention in this file.
+ */
+export interface KernelBootstrapSettings {
+	lockTimeoutMs?: number; // default: 300000 (5 min); 0 waits forever
 }
 
 export interface TerminalSettings {
@@ -184,6 +201,7 @@ export interface Settings {
 	theme?: string;
 	compaction?: CompactionSettings;
 	stallWatchdog?: StallWatchdogSettings;
+	kernelBootstrap?: KernelBootstrapSettings;
 	autoRefine?: AutoRefineSettings;
 	agentTraces?: AgentTracesSettings;
 	telemetry?: TelemetrySettings;
@@ -999,6 +1017,12 @@ export class SettingsManager {
 		return { enabled, warnAfterSeconds, abortAfterSeconds };
 	}
 
+	getKernelBootstrapSettings(): { lockTimeoutMs: number } {
+		return {
+			lockTimeoutMs: normalizeKernelBootstrapLockTimeoutMs(this.settings.kernelBootstrap?.lockTimeoutMs),
+		};
+	}
+
 	getRetrySettings(): { enabled: boolean; maxRetries: number; baseDelayMs: number } {
 		return {
 			enabled: this.getRetryEnabled(),
@@ -1405,4 +1429,24 @@ export class SettingsManager {
 		this.markModified("warnings");
 		this.save();
 	}
+}
+
+/** 0 disables the bound; any other non-positive/non-finite value falls back to the default. */
+function normalizeKernelBootstrapLockTimeoutMs(value: unknown): number {
+	if (value === 0) return 0;
+	if (typeof value === "number" && Number.isFinite(value) && value > 0) return Math.floor(value);
+	return DEFAULT_KERNEL_BOOTSTRAP_LOCK_TIMEOUT_MS;
+}
+
+/**
+ * Kernel-bootstrap settings for callers with no session (kernel bootstrap, postinstall,
+ * bootstrap-cli). Reads both scopes from disk on every call, so an operator editing
+ * settings.json is honoured by the next boot without a restart. Unreadable or absent
+ * scopes yield the defaults rather than failing the boot.
+ */
+export function readKernelBootstrapSettings(
+	cwd: string = process.cwd(),
+	agentDir: string = getAgentDir(),
+): { lockTimeoutMs: number } {
+	return SettingsManager.fromStorage(new FileSettingsStorage(cwd, agentDir)).getKernelBootstrapSettings();
 }

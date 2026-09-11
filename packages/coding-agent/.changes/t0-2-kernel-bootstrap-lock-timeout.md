@@ -1,0 +1,1 @@
+- Added the `kernelBootstrap.lockTimeoutMs` setting (default 300000 ms, `0` waits forever) with a session-free `readKernelBootstrapSettings` reader, so the bound on waiting for the shared kernel-venv bootstrap lock can be tuned per machine without a restart.

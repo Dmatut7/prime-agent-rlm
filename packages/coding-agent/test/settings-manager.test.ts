@@ -2,7 +2,11 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { SettingsManager } from "../src/core/settings-manager.js";
+import {
+	DEFAULT_KERNEL_BOOTSTRAP_LOCK_TIMEOUT_MS,
+	readKernelBootstrapSettings,
+	SettingsManager,
+} from "../src/core/settings-manager.js";
 
 describe("SettingsManager", () => {
 	const testDir = join(process.cwd(), "test-settings-tmp");
@@ -566,6 +570,71 @@ describe("SettingsManager", () => {
 			manager.applyOverrides({ telemetry: { enabled: true } });
 
 			expect(manager.getTelemetryEnabled()).toBe(false);
+		});
+	});
+
+	describe("kernel bootstrap lock timeout", () => {
+		it("defaults to five minutes when unset", () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(DEFAULT_KERNEL_BOOTSTRAP_LOCK_TIMEOUT_MS).toBe(300_000);
+			expect(manager.getKernelBootstrapSettings()).toEqual({
+				lockTimeoutMs: DEFAULT_KERNEL_BOOTSTRAP_LOCK_TIMEOUT_MS,
+			});
+		});
+
+		it("reads a configured timeout live from the merged scopes", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ kernelBootstrap: { lockTimeoutMs: 200 } }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getKernelBootstrapSettings()).toEqual({ lockTimeoutMs: 200 });
+
+			// Positive control: a project-scope value wins over the global one, so the
+			// getter really re-reads the merged settings instead of a cached default.
+			writeFileSync(
+				join(projectDir, ".prime", "agent", "settings.json"),
+				JSON.stringify({ kernelBootstrap: { lockTimeoutMs: 90_000 } }),
+			);
+			expect(SettingsManager.create(projectDir, agentDir).getKernelBootstrapSettings()).toEqual({
+				lockTimeoutMs: 90_000,
+			});
+		});
+
+		it("treats 0 as an explicit opt-out and floors fractional values", () => {
+			const cases: [unknown, number][] = [
+				[0, 0],
+				[250.7, 250],
+				[-1, DEFAULT_KERNEL_BOOTSTRAP_LOCK_TIMEOUT_MS],
+				[Number.NaN, DEFAULT_KERNEL_BOOTSTRAP_LOCK_TIMEOUT_MS],
+				[Number.POSITIVE_INFINITY, DEFAULT_KERNEL_BOOTSTRAP_LOCK_TIMEOUT_MS],
+				["300", DEFAULT_KERNEL_BOOTSTRAP_LOCK_TIMEOUT_MS],
+			];
+			expect(cases.length).toBeGreaterThan(0);
+			for (const [configured, expected] of cases) {
+				writeFileSync(
+					join(agentDir, "settings.json"),
+					JSON.stringify({ kernelBootstrap: { lockTimeoutMs: configured } }),
+				);
+				expect(SettingsManager.create(projectDir, agentDir).getKernelBootstrapSettings()).toEqual({
+					lockTimeoutMs: expected,
+				});
+			}
+		});
+
+		it("reads the timeout from disk without a session settings manager", () => {
+			expect(readKernelBootstrapSettings(projectDir, agentDir)).toEqual({
+				lockTimeoutMs: DEFAULT_KERNEL_BOOTSTRAP_LOCK_TIMEOUT_MS,
+			});
+
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ kernelBootstrap: { lockTimeoutMs: 200 } }));
+			expect(readKernelBootstrapSettings(projectDir, agentDir)).toEqual({ lockTimeoutMs: 200 });
+		});
+
+		it("falls back to the default when a settings scope is unreadable", () => {
+			writeFileSync(join(agentDir, "settings.json"), "{not json");
+
+			expect(readKernelBootstrapSettings(projectDir, agentDir)).toEqual({
+				lockTimeoutMs: DEFAULT_KERNEL_BOOTSTRAP_LOCK_TIMEOUT_MS,
+			});
 		});
 	});
 });
