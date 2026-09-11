@@ -8,8 +8,10 @@ import {
 	type AssistantMessageEvent,
 	type Context,
 	EventStream,
+	type ImageContent,
 	isContextOverflow,
 	streamSimple,
+	type TextContent,
 	type ToolResultMessage,
 	validateToolArguments,
 } from "@earendil-works/pi-ai";
@@ -27,6 +29,26 @@ import type {
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
 const ABORT_ERROR_MESSAGE = "Request was aborted";
+
+/** Result stub for a tool call the abort caught in flight; long-standing signature, kept as the last resort. */
+export const TOOL_ABORT_FALLBACK_MESSAGE = "Tool execution aborted";
+/**
+ * Appended to a tool result whose turn was aborted mid-flight, so the model knows
+ * the output it is looking at is partial instead of treating it as the whole answer.
+ */
+export const ABORT_TRUNCATION_MARKER = "[tool result truncated: the turn was aborted while this tool was in flight]";
+/**
+ * How long the abort path waits for an in-flight tool to settle so its partial
+ * output can be preserved. Sized against the kernel's own force-abort grace
+ * (`KERNEL_ABORT_GRACE_MS` = 1000ms in the coding-agent kernel) plus slack: the
+ * harvest must not outlive the interrupt it is collecting evidence for.
+ */
+export const ABORT_HARVEST_TIMEOUT_MS = 1250;
+/** Hard byte bound on harvested text: a print-heavy cell must not inject megabytes into the model. */
+export const ABORT_HARVEST_MAX_BYTES = 8 * 1024;
+
+const abortTextEncoder = new TextEncoder();
+const abortTextDecoder = new TextDecoder();
 const EMPTY_USAGE: AssistantMessage["usage"] = {
 	input: 0,
 	output: 0,
@@ -115,6 +137,103 @@ async function settlePostTurn<T>(operation: Promise<T>, signal: AbortSignal | un
 		}
 		throw error;
 	}
+}
+
+/**
+ * Waits up to `timeoutMs` for a tool operation that was still in flight when the
+ * turn was aborted, so its partial output can be preserved as evidence.
+ *
+ * Resolves `undefined` when the operation does not settle in time or fails. The
+ * operation always keeps a rejection sink, so losing the race can never surface
+ * later as an unhandledRejection.
+ */
+export async function harvestAbortedToolResult<T>(
+	operation: Promise<T>,
+	timeoutMs: number = ABORT_HARVEST_TIMEOUT_MS,
+): Promise<T | undefined> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const timeout = new Promise<undefined>((resolve) => {
+		timer = setTimeout(() => resolve(undefined), timeoutMs);
+	});
+	try {
+		return await Promise.race([operation.catch(() => undefined), timeout]);
+	} finally {
+		if (timer !== undefined) clearTimeout(timer);
+	}
+}
+
+/** Whether a tool result carries anything the tool itself produced. */
+function hasToolOutput(result: AgentToolResult<any> | undefined): result is AgentToolResult<any> {
+	if (!result || !Array.isArray(result.content) || result.content.length === 0) return false;
+	return result.content.some((block) => (block.type === "text" ? block.text.trim().length > 0 : true));
+}
+
+/** Keeps the last `maxBytes` of UTF-8 text, never splitting a multi-byte sequence. */
+function truncateTextTailBytes(text: string, maxBytes: number): string {
+	const bytes = abortTextEncoder.encode(text);
+	if (bytes.byteLength <= maxBytes) return text;
+	let start = bytes.byteLength - maxBytes;
+	// Skip UTF-8 continuation bytes so the tail starts on a sequence boundary.
+	while (start < bytes.byteLength && (bytes[start]! & 0xc0) === 0x80) {
+		start += 1;
+	}
+	return abortTextDecoder.decode(bytes.subarray(start));
+}
+
+function resultTextBytes(result: AgentToolResult<any>): number {
+	return result.content.reduce(
+		(total, block) => (block.type === "text" ? total + abortTextEncoder.encode(block.text).byteLength : total),
+		0,
+	);
+}
+
+/** Bounds the text of a harvested result to its last {@link ABORT_HARVEST_MAX_BYTES}; non-text blocks are kept. */
+function boundHarvestedTextTail(result: AgentToolResult<any>, maxBytes: number): AgentToolResult<any> {
+	if (resultTextBytes(result) <= maxBytes) return result;
+	const kept: (TextContent | ImageContent)[] = [];
+	let budget = maxBytes;
+	for (let index = result.content.length - 1; index >= 0 && budget > 0; index -= 1) {
+		const block = result.content[index]!;
+		if (block.type !== "text") {
+			kept.unshift(block);
+			continue;
+		}
+		const text = truncateTextTailBytes(block.text, budget);
+		budget -= abortTextEncoder.encode(text).byteLength;
+		kept.unshift({ type: "text", text });
+	}
+	return { ...result, content: kept };
+}
+
+/**
+ * Builds the result for a tool call whose turn was aborted while it was in flight.
+ *
+ * Preference order: output the tool already returned, then a bounded harvest of the
+ * still-running operation, then the historical abort stub. Whatever is preserved is
+ * marked as an error and tagged with {@link ABORT_TRUNCATION_MARKER}, so the model
+ * reads it as partial evidence instead of a completed answer.
+ */
+async function preserveAbortedToolResult(
+	executed: ExecutedToolCallOutcome,
+	result: AgentToolResult<any>,
+): Promise<AgentToolResult<any>> {
+	// A result synthesized by the abort path is a stub, not tool output: go straight
+	// to the harvest for it.
+	let preserved = !executed.abortedInFlight && hasToolOutput(result) ? result : undefined;
+	if (!preserved && executed.pendingOperation) {
+		const harvested = await harvestAbortedToolResult(executed.pendingOperation);
+		if (hasToolOutput(harvested)) {
+			preserved = boundHarvestedTextTail(harvested, ABORT_HARVEST_MAX_BYTES);
+		}
+	}
+	if (!preserved) {
+		return createErrorToolResult(TOOL_ABORT_FALLBACK_MESSAGE);
+	}
+	return {
+		content: [...preserved.content, { type: "text", text: ABORT_TRUNCATION_MARKER }],
+		details: preserved.details,
+		...(preserved.terminate === undefined ? {} : { terminate: preserved.terminate }),
+	};
 }
 
 function cloneAssistantContent(content: AssistantMessage["content"]): AssistantMessage["content"] {
@@ -953,6 +1072,10 @@ type ImmediateToolCallOutcome = {
 type ExecutedToolCallOutcome = {
 	result: AgentToolResult<any>;
 	isError: boolean;
+	/** True when the abort raced an in-flight execute, so `result` is a stub carrying no tool output. */
+	abortedInFlight?: boolean;
+	/** The still-running execute promise; harvested (bounded) for partial output on the abort path. */
+	pendingOperation?: Promise<AgentToolResult<any>>;
 };
 
 type FinalizedToolCallOutcome = {
@@ -1043,28 +1166,31 @@ async function executePreparedToolCall(
 ): Promise<ExecutedToolCallOutcome> {
 	const updateEvents: Promise<void>[] = [];
 	let acceptingUpdates = true;
+	/** The raw execute promise, kept so an abort can still harvest what the tool produced. */
+	let operation: Promise<AgentToolResult<any>> | undefined;
 
 	try {
 		throwIfAborted(signal);
-		const result = await raceWithAbort(
-			prepared.tool.execute(prepared.toolCall.id, prepared.args as never, signal, (partialResult) => {
-				if (!acceptingUpdates || signal?.aborted) {
-					return;
-				}
-				updateEvents.push(
-					Promise.resolve(
-						emit({
-							type: "tool_execution_update",
-							toolCallId: prepared.toolCall.id,
-							toolName: prepared.toolCall.name,
-							args: prepared.toolCall.arguments,
-							partialResult,
-						}),
-					),
-				);
-			}),
-			signal,
-		);
+		operation = prepared.tool.execute(prepared.toolCall.id, prepared.args as never, signal, (partialResult) => {
+			if (!acceptingUpdates || signal?.aborted) {
+				return;
+			}
+			updateEvents.push(
+				Promise.resolve(
+					emit({
+						type: "tool_execution_update",
+						toolCallId: prepared.toolCall.id,
+						toolName: prepared.toolCall.name,
+						args: prepared.toolCall.arguments,
+						partialResult,
+					}),
+				),
+			);
+		});
+		// Sink: the abort can settle the race long before the tool does, and a late
+		// rejection must never escape as an unhandledRejection.
+		void operation.catch(() => undefined);
+		const result = await raceWithAbort(operation, signal);
 		acceptingUpdates = false;
 		try {
 			await raceWithAbort(
@@ -1083,11 +1209,16 @@ async function executePreparedToolCall(
 			Promise.all(updateEvents).then(() => undefined),
 			signal,
 		).catch(() => undefined);
+		const abortedInFlight = signal?.aborted === true;
 		return {
 			result: createErrorToolResult(
-				signal?.aborted ? "Tool execution aborted" : error instanceof Error ? error.message : String(error),
+				abortedInFlight ? TOOL_ABORT_FALLBACK_MESSAGE : error instanceof Error ? error.message : String(error),
 			),
 			isError: true,
+			// Keep the in-flight promise so finalize can harvest partial output instead
+			// of reporting a 19-character riddle.
+			...(abortedInFlight && operation ? { abortedInFlight: true, pendingOperation: operation } : {}),
+			...(abortedInFlight && !operation ? { abortedInFlight: true } : {}),
 		};
 	}
 }
@@ -1102,6 +1233,7 @@ async function finalizeExecutedToolCall(
 ): Promise<FinalizedToolCallOutcome> {
 	let result = executed.result;
 	let isError = executed.isError;
+	let abortedDuringFinalize = false;
 
 	if (config.afterToolCall) {
 		try {
@@ -1128,9 +1260,25 @@ async function finalizeExecutedToolCall(
 				isError = afterResult.isError ?? isError;
 			}
 		} catch (error) {
-			result = createErrorToolResult(error instanceof Error ? error.message : String(error));
-			isError = true;
+			if (signal?.aborted && isAbortError(error)) {
+				// The turn was aborted while this result was being finalized. Keep what the
+				// tool produced instead of overwriting it with the abort message: the model
+				// needs the partial output to tell whether the work already happened, which
+				// is what stops a blind re-run of a long command.
+				abortedDuringFinalize = true;
+			} else {
+				result = createErrorToolResult(error instanceof Error ? error.message : String(error));
+				isError = true;
+			}
 		}
+	}
+
+	if (abortedDuringFinalize || executed.abortedInFlight === true) {
+		return {
+			toolCall: prepared.toolCall,
+			result: await preserveAbortedToolResult(executed, result),
+			isError: true,
+		};
 	}
 
 	return {

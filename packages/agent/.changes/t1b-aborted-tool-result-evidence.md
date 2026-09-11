@@ -1,0 +1,1 @@
+- Changed aborted tool calls to keep the evidence instead of replacing the result with "Request was aborted": partial output is preserved, a still-running tool gets a bounded 1.25s harvest (tail capped at 8KB), and the result is marked as an error with a truncation note. This can delay the visible end of an aborted turn by up to 1.25s when there was no output to preserve.
