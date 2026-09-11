@@ -97,3 +97,39 @@ export function classifyKernelExit(facts: KernelExitFacts): KernelExitVerdict {
 		},
 	};
 }
+
+/** One host request that was still in flight when the kernel died. */
+export interface KernelHostRequestFact {
+	/** Request type as the kernel sent it (e.g. `rlm.run`). */
+	type: string;
+	/** Target read off the payload when the type carries one (a child name, a receiver). */
+	label?: string;
+	/**
+	 * True when the work may already have happened, so repeating the request is not safe. The
+	 * answer is deliberately conservative: a reply that never arrived is not evidence that
+	 * nothing was done.
+	 */
+	mayHaveTakenEffect: boolean;
+}
+
+/** What the host did about one unexpected exit. */
+export interface KernelRestartDecision {
+	/** True when the manager settled at idle to be revived by the next cell. */
+	revive: boolean;
+	/** Unexpected exits inside the budget window, this one included. */
+	restartCount: number;
+	/** Rolling budget window the count is measured over. */
+	windowMs: number;
+	/** Restarts still allowed inside the window; 0 once the budget is exhausted. */
+	budgetRemaining: number;
+	/** True when this death exhausted the budget and the session failed closed. */
+	exhausted: boolean;
+	/** Gap to the previous unexpected exit inside the window; absent for the first one. */
+	sincePreviousMs?: number;
+}
+
+/** Everything the owner needs to log one death: the cause, the decision, and the loose ends. */
+export interface KernelUnexpectedExitFacts {
+	decision: KernelRestartDecision;
+	unresolvedHostRequests: KernelHostRequestFact[];
+}

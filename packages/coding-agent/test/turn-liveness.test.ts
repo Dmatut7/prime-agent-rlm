@@ -9,6 +9,7 @@ import {
 	createTurnLiveness,
 	DEFAULT_DEGRADED_FACTS_MAX_AGE_MS,
 	DEFAULT_HOST_REQUEST_MAX_AGE_MS,
+	DEFAULT_REVIVAL_VOUCH_MAX_AGE_MS,
 	type JournaledBashFacts,
 	kernelVouchedAlive,
 	readJournaledBashHandles,
@@ -528,5 +529,83 @@ describe("readJournaledBashHandles", () => {
 	it("does not throw when the journal file is missing", () => {
 		const read = vi.fn(readJournaledBashHandles);
 		expect(read(4242, env(join(tempDir, "missing.jsonl")))).toEqual({ liveBashHandles: 0 });
+	});
+});
+
+describe("revival vouch (B7 / L10.4)", () => {
+	function build(options: {
+		kernel?: TurnLivenessKernelFacts | undefined;
+		revivalVouchMaxAgeMs?: number | (() => number);
+	}) {
+		let clock = T0;
+		const liveness = createTurnLiveness({
+			kernel: () => options.kernel,
+			now: () => clock,
+			...(options.revivalVouchMaxAgeMs === undefined ? {} : { revivalVouchMaxAgeMs: options.revivalVouchMaxAgeMs }),
+		});
+		return {
+			liveness,
+			advance(ms: number): void {
+				clock += ms;
+			},
+		};
+	}
+
+	it("vouches for a revival in flight as progress", () => {
+		const { liveness } = build({
+			// A reviving kernel has no heartbeat yet: this is the only fact on the table, which
+			// is exactly the window the vouch exists for (spawn + restore + bootstrap).
+			kernel: facts({ latest: undefined, previous: undefined, revival: { since: T0 - 5_000 } }),
+		});
+		const vouched = liveness.sample();
+		expect(vouched.vouched).toBe(true);
+		expect(vouched.reasons).toContain(TURN_LIVENESS_REASONS.kernelReviving);
+		expect(vouched.progress).toBe(true);
+		expect(vouched.revivalAgeMs).toBe(5_000);
+	});
+
+	it("stops vouching once the revival outlives the age bound", () => {
+		const aged = build({
+			kernel: facts({
+				latest: undefined,
+				previous: undefined,
+				revival: { since: T0 - DEFAULT_REVIVAL_VOUCH_MAX_AGE_MS - 1 },
+			}),
+		});
+		const agedFacts = aged.liveness.sample();
+		expect(agedFacts.vouched).toBe(false);
+		expect(agedFacts.kernelReasons).toContain(TURN_LIVENESS_REASONS.revivalAgedOut);
+
+		// Positive control: exactly at the bound still vouches.
+		const atBound = build({
+			kernel: facts({
+				latest: undefined,
+				previous: undefined,
+				revival: { since: T0 - DEFAULT_REVIVAL_VOUCH_MAX_AGE_MS },
+			}),
+		});
+		expect(atBound.liveness.sample().vouched).toBe(true);
+	});
+
+	it("ages a revival out with its own clock, not with the age it was handed", () => {
+		const { liveness, advance } = build({
+			kernel: facts({ latest: undefined, previous: undefined, revival: { since: T0 } }),
+			revivalVouchMaxAgeMs: 1_000,
+		});
+		expect(liveness.sample().vouched).toBe(true);
+		advance(1_001);
+		const aged = liveness.sample();
+		expect(aged.vouched).toBe(false);
+		expect(aged.kernelReasons).toContain(TURN_LIVENESS_REASONS.revivalAgedOut);
+		expect(aged.revivalAgeMs).toBe(1_001);
+	});
+
+	it("does not vouch for a session that failed closed", () => {
+		// A spent restart budget leaves no revival in flight, so the watchdog gets nothing to
+		// exempt: the two mechanisms cannot contradict each other (amend B2/T2-3).
+		const { liveness } = build({ kernel: facts({ latest: undefined, previous: undefined, revival: undefined }) });
+		const sampled = liveness.sample();
+		expect(sampled.vouched).toBe(false);
+		expect(sampled.revivalAgeMs).toBeUndefined();
 	});
 });

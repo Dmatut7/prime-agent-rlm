@@ -16,7 +16,9 @@ import {
 	type KernelClient,
 	type KernelDeathCause,
 	type KernelDiffDisplay,
+	type KernelRestartPolicy,
 	type KernelSentAgentMessage,
+	type KernelUnexpectedExitFacts,
 	ReplKernelManager,
 } from "../kernel/index.js";
 import { manifestPathIn, type RestoreResult, snapshotPathIn } from "../kernel/state-snapshot.js";
@@ -289,6 +291,11 @@ export interface IpythonToolDetails {
 	sentAgentMessages?: KernelSentAgentMessage[];
 	/** True when this result came after killing and restarting a busy kernel. */
 	kernelRestarted?: boolean;
+	/**
+	 * True when this result head carries a kernel revival notice: the kernel process died on its
+	 * own and a replacement ran this cell. The notice text itself is in the content block.
+	 */
+	kernelReset?: boolean;
 	/** Structured cause when the cell was aborted mid-flight (stall watchdog, host abort). */
 	abortCause?: IpythonAbortCause;
 	error?: {
@@ -326,7 +333,12 @@ export interface IpythonToolOptions {
 	 * cause. The kernel's stderr ring never leaves the host process, so this callback is the only
 	 * way the death reaches the session log.
 	 */
-	onUnexpectedExit?: (cause: KernelDeathCause) => void;
+	onUnexpectedExit?: (cause: KernelDeathCause, facts: KernelUnexpectedExitFacts) => void;
+	/**
+	 * Live kernel restart budget, read at every unexpected exit. Omit for the shipped defaults
+	 * (three revivals per rolling hour, then fail closed).
+	 */
+	restartPolicy?: () => KernelRestartPolicy;
 	/**
 	 * Read once per aborted cell: the host's record of why the turn was aborted
 	 * (for a session, the last stall-watchdog abort). Undefined means "no recorded
@@ -517,6 +529,7 @@ export class IpythonKernelProvisioner {
 				stderrLogPath: snapshotDir ? join(snapshotDir, "kernel-stderr.log") : undefined,
 				bootstrapCode,
 				...(this.options?.onUnexpectedExit ? { onUnexpectedExit: this.options.onUnexpectedExit } : {}),
+				...(this.options?.restartPolicy ? { restartPolicy: this.options.restartPolicy } : {}),
 			});
 			let pendingRestore: RestoreResult | undefined;
 			try {
@@ -616,21 +629,23 @@ async function executeWithBusyKernelChoice(
 	onWorkingMessage: (message?: string) => void,
 	onLateSentAgentMessage: ((toolCallId: string, message: KernelSentAgentMessage) => void) | undefined,
 	ctx: ExtensionContext | undefined,
-): Promise<{ result: ExecuteResult; kernelRestarted: boolean }> {
+): Promise<{ result: ExecuteResult; kernelRestarted: boolean; resetNotice?: string }> {
 	let kernelRestarted = false;
 	while (true) {
 		const m = await provisioner.ensure(reportStartupProgress, signal);
 		try {
-			return {
-				result: await m.execute(code, {
-					signal,
-					onStream,
-					onLateSentAgentMessage: onLateSentAgentMessage
-						? (message) => onLateSentAgentMessage(toolCallId, message)
-						: undefined,
-				}),
-				kernelRestarted,
-			};
+			const result = await m.execute(code, {
+				signal,
+				onStream,
+				onLateSentAgentMessage: onLateSentAgentMessage
+					? (message) => onLateSentAgentMessage(toolCallId, message)
+					: undefined,
+			});
+			// Consumed only for a result that actually reaches the model. A thrown error leaves
+			// the notice pending, so the next cell carries it instead of losing it (the model
+			// would otherwise never learn that its namespace was rolled back).
+			const resetNotice = m.consumeRestartNotice?.(code);
+			return { result, kernelRestarted, ...(resetNotice === undefined ? {} : { resetNotice }) };
 		} catch (error) {
 			if (!(error instanceof KernelBusyAfterInterruptError) || signal?.aborted) {
 				throw error;
@@ -693,7 +708,7 @@ export function formatIpythonAbortCause(cause: IpythonAbortCause | undefined): s
  */
 export function assembleIpythonToolResult(
 	r: ExecuteResult,
-	options: { kernelRestarted: boolean; abortCause?: IpythonAbortCause },
+	options: { kernelRestarted: boolean; abortCause?: IpythonAbortCause; resetNotice?: string },
 ): IpythonToolResultAssembly {
 	let text = r.stdout;
 	if (r.stderr) text += (text ? "\n" : "") + r.stderr;
@@ -711,6 +726,11 @@ export function assembleIpythonToolResult(
 	}
 	if (options.kernelRestarted) {
 		text = text ? `${KERNEL_RESTART_NOTICE}\n\n${text}` : KERNEL_RESTART_NOTICE;
+	}
+	if (options.resetNotice) {
+		// Above everything else: the rollback facts have to be read before the output of a cell
+		// that ran on a replacement kernel is trusted.
+		text = text ? `${options.resetNotice}\n\n${text}` : options.resetNotice;
 	}
 
 	const imageBlocks = imageBlocksFromAttachments(r.attachments);
@@ -730,6 +750,7 @@ export function assembleIpythonToolResult(
 			attachments: r.attachments,
 			sentAgentMessages: r.sentAgentMessages,
 			kernelRestarted: options.kernelRestarted,
+			...(options.resetNotice ? { kernelReset: true as const } : {}),
 			error: r.error,
 			...(options.abortCause ? { abortCause: options.abortCause } : {}),
 		},
@@ -767,7 +788,11 @@ export function createIpythonToolDefinition(
 			};
 
 			try {
-				const { result: r, kernelRestarted } = await executeWithBusyKernelChoice(
+				const {
+					result: r,
+					kernelRestarted,
+					resetNotice,
+				} = await executeWithBusyKernelChoice(
 					provisioner,
 					reportStartupProgress,
 					toolCallId,
@@ -786,6 +811,7 @@ export function createIpythonToolDefinition(
 
 				return assembleIpythonToolResult(r, {
 					kernelRestarted,
+					...(resetNotice === undefined ? {} : { resetNotice }),
 					// Only an aborted cell asks the host why: a finished cell has no cause to report.
 					abortCause: r.status === "aborted" ? options?.getAbortCause?.() : undefined,
 				});

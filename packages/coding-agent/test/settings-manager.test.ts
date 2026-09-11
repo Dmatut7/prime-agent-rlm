@@ -4,6 +4,9 @@ import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	DEFAULT_KERNEL_BOOTSTRAP_LOCK_TIMEOUT_MS,
+	DEFAULT_KERNEL_MAX_RESTARTS,
+	DEFAULT_KERNEL_RESTART_WINDOW_MINUTES,
+	DEFAULT_KERNEL_REVIVAL_VOUCH_MAX_AGE_SECONDS,
 	DEFAULT_STALL_ABORT_AFTER_SECONDS,
 	DEFAULT_STALL_WARN_AFTER_SECONDS,
 	readKernelBootstrapSettings,
@@ -637,6 +640,65 @@ describe("SettingsManager", () => {
 			expect(readKernelBootstrapSettings(projectDir, agentDir)).toEqual({
 				lockTimeoutMs: DEFAULT_KERNEL_BOOTSTRAP_LOCK_TIMEOUT_MS,
 			});
+		});
+	});
+
+	describe("kernel restart settings", () => {
+		it("resolves the revival budget to its documented defaults", () => {
+			expect(DEFAULT_KERNEL_MAX_RESTARTS).toBe(3);
+			expect(DEFAULT_KERNEL_RESTART_WINDOW_MINUTES).toBe(60);
+			expect(DEFAULT_KERNEL_REVIVAL_VOUCH_MAX_AGE_SECONDS).toBe(600);
+			expect(SettingsManager.create(projectDir, agentDir).getKernelRestartSettings()).toEqual({
+				maxUnexpectedRestarts: 3,
+				windowMs: 60 * 60_000,
+				revivalVouchMaxAgeMs: 600_000,
+			});
+		});
+
+		it("reads a configured budget live from the merged scopes", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({ kernelRestart: { maxUnexpectedRestarts: 5, windowMinutes: 10 } }),
+			);
+			expect(SettingsManager.create(projectDir, agentDir).getKernelRestartSettings()).toEqual({
+				maxUnexpectedRestarts: 5,
+				windowMs: 600_000,
+				revivalVouchMaxAgeMs: 600_000,
+			});
+
+			// Positive control: the project scope wins, so the getter really re-reads the merged
+			// settings instead of a cached default.
+			writeFileSync(
+				join(projectDir, ".prime", "agent", "settings.json"),
+				JSON.stringify({ kernelRestart: { revivalVouchMaxAgeSeconds: 30 } }),
+			);
+			expect(SettingsManager.create(projectDir, agentDir).getKernelRestartSettings()).toEqual({
+				maxUnexpectedRestarts: 5,
+				windowMs: 600_000,
+				revivalVouchMaxAgeMs: 30_000,
+			});
+		});
+
+		it("treats 0 as the unlimited rollback lever and floors fractional values", () => {
+			const cases: [unknown, number][] = [
+				[0, Number.POSITIVE_INFINITY],
+				[-1, Number.POSITIVE_INFINITY],
+				[2.7, 2],
+				[Number.NaN, DEFAULT_KERNEL_MAX_RESTARTS],
+				["3", DEFAULT_KERNEL_MAX_RESTARTS],
+			];
+			expect(cases.length).toBeGreaterThan(0);
+			for (const [configured, expected] of cases) {
+				writeFileSync(
+					join(agentDir, "settings.json"),
+					JSON.stringify({ kernelRestart: { maxUnexpectedRestarts: configured } }),
+				);
+				expect(SettingsManager.create(projectDir, agentDir).getKernelRestartSettings()).toEqual({
+					maxUnexpectedRestarts: expected,
+					windowMs: DEFAULT_KERNEL_RESTART_WINDOW_MINUTES * 60_000,
+					revivalVouchMaxAgeMs: DEFAULT_KERNEL_REVIVAL_VOUCH_MAX_AGE_SECONDS * 1000,
+				});
+			}
 		});
 	});
 

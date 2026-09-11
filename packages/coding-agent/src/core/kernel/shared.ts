@@ -1,6 +1,6 @@
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import type { KernelBootstrapProgressHandler, KernelPythonSkill } from "./bootstrap.js";
-import type { KernelDeathCause } from "./death-cause.js";
+import type { KernelDeathCause, KernelUnexpectedExitFacts } from "./death-cause.js";
 import type { RestoreResult, SnapshotResult } from "./state-snapshot.js";
 
 export const DEFAULT_MAX_OUTPUT_CHARS = 65536;
@@ -52,6 +52,14 @@ export interface KernelSnapshotConfig {
 	maxVariableBytes?: number;
 	/** Debounce window for the auto-snapshot after a successful execution. Default 1500 ms. */
 	debounceMs?: number;
+	/**
+	 * Bound for one restore request. Default 30 s. A restore that exceeds it is *slow*, not
+	 * corrupt: the payload stays where it is and the attempt is retried with the longer retry
+	 * window below (B5).
+	 */
+	restoreTimeoutMs?: number;
+	/** Bound for the retry of a restore that timed out. Default four times `restoreTimeoutMs`. */
+	restoreRetryTimeoutMs?: number;
 }
 
 export interface KernelManagerOptions {
@@ -74,8 +82,28 @@ export interface KernelManagerOptions {
 	 * would otherwise keep to this process. Never fired for shutdown/kill/disposeSync or for the
 	 * protocol-repair kills.
 	 */
-	onUnexpectedExit?: (cause: KernelDeathCause) => void;
+	onUnexpectedExit?: (cause: KernelDeathCause, facts: KernelUnexpectedExitFacts) => void;
+	/**
+	 * Live restart-budget policy, read at every unexpected exit so a settings edit applies
+	 * without a new kernel. Defaults: {@link DEFAULT_MAX_UNEXPECTED_RESTARTS} revivals inside
+	 * {@link DEFAULT_KERNEL_RESTART_WINDOW_MS}. A non-finite `maxRestarts` disables the budget
+	 * (the rollback lever for unbounded lazy revival).
+	 */
+	restartPolicy?: () => KernelRestartPolicy;
 }
+
+/** How often one session may revive its kernel before it fails closed (C8). */
+export interface KernelRestartPolicy {
+	/** Revivals allowed inside the window; `Infinity` disables the budget. */
+	maxRestarts: number;
+	/** Rolling window in ms. */
+	windowMs: number;
+}
+
+/** Default revival budget: three unexpected exits per rolling hour, then fail closed. */
+export const DEFAULT_MAX_UNEXPECTED_RESTARTS = 3;
+/** Default rolling window for the revival budget. */
+export const DEFAULT_KERNEL_RESTART_WINDOW_MS = 60 * 60 * 1000;
 
 export interface KernelStartOptions {
 	onBootstrapProgress?: KernelBootstrapProgressHandler;
@@ -380,6 +408,12 @@ export interface KernelClient {
 	readonly ownerSessionId: string | undefined;
 	readonly isRunning: boolean;
 	/**
+	 * Revival-window vouch facts, present while a replacement kernel is being spawned, restored
+	 * and bootstrapped. Absent once the kernel serves cells again, and bounded by age on the
+	 * reader's side so a wedged revival stops excusing silence (B7).
+	 */
+	readonly revivalVouch?: KernelRevivalVouch;
+	/**
 	 * Liveness facts from protocol-4 heartbeat frames. Optional and absent for a kernel that
 	 * negotiated protocol 3: readers must treat "no facts" as "no evidence either way", never
 	 * as "dead", and never as permission to skip the stall watchdog.
@@ -405,6 +439,25 @@ export interface KernelClient {
 	pruneOversizedVariables(): Promise<SnapshotResult | null>;
 	restoreState(): Promise<RestoreResult | null>;
 	listNamespaceNames(signal?: AbortSignal): Promise<string[] | null>;
+	/**
+	 * The one-shot model-facing notice describing a kernel revival, or undefined when there is
+	 * nothing pending. Called with the cell's source so a repeat of the cell that was running
+	 * when the kernel died can be flagged. Consuming it is the caller's commitment that the
+	 * result reaches the model: an error path must not consume it.
+	 */
+	consumeRestartNotice?(forCode?: string): string | undefined;
+}
+
+/**
+ * One kernel revival window, for the stall watchdog. The window opens when a kernel dies or is
+ * discarded and closes when the replacement serves cells again.
+ */
+export interface KernelRevivalVouch {
+	/**
+	 * Epoch ms the window opened at. The reader computes the age against its own clock, so a
+	 * stale number cannot extend its own vouch; deliberately no `ageMs` field for the same reason.
+	 */
+	since: number;
 }
 
 // One registry serves every client kind; two parallel registries would

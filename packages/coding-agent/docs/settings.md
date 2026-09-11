@@ -222,6 +222,47 @@ legitimately long and silent should set `timeout` explicitly in the bash tool
 
 To disable entirely: `{ "stallWatchdog": { "enabled": false } }`.
 
+A kernel revival vouches the same way: while a replacement kernel is being
+spawned, restored and bootstrapped after an unexpected death, the host is
+demonstrably busy on the turn's behalf, so the abort is deferred. That vouch is
+bounded by `kernelRestart.revivalVouchMaxAgeSeconds` (below), and a session
+whose restart budget is spent grants no exemption at all.
+
+### Kernel Revival
+
+A Python kernel that dies on its own (a crash, an OOM kill) is revived by the
+next cell instead of leaving the session unusable: a replacement is spawned, the
+last snapshot is restored into it, and the runtime bootstrap is re-run. The
+first cell after a revival carries a reset notice in its result head saying
+which snapshot point the namespace rolled back to, that everything defined after
+that point is gone, and that side effects (file writes, commits, messages
+already sent, subagents already spawned) were *not* rolled back.
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `kernelRestart.maxUnexpectedRestarts` | number | `3` | Revivals allowed inside the sliding window. Past it the session fails closed: every cell reports `KernelUnavailableError` carrying the death chain, until the window expires on its own or `/reload` rebuilds the session. `0` removes the budget (unbounded lazy revival) |
+| `kernelRestart.windowMinutes` | number | `60` | Length of the sliding budget window. `0` makes it unbounded |
+| `kernelRestart.revivalVouchMaxAgeSeconds` | number | `600` | How long one revival may vouch for a silent turn (10 min covers a cold bootstrap lock plus a large snapshot read). `0` removes the bound |
+
+All three are read when they are needed, so editing `settings.json` applies to
+the next kernel death without a restart.
+
+Teardowns the host ordered never revive and never touch the budget: `shutdown`,
+`kill`, dispose, and the protocol-repair family are attributed as intentional.
+An unexplained death is logged as `kernel exited unexpectedly` with
+`code`/`signal`/`origin`, where `origin` is `oom_suspect` only when the kernel's
+own stderr carries memory evidence and `unknown` otherwise.
+
+```json
+{
+  "kernelRestart": {
+    "maxUnexpectedRestarts": 3,
+    "windowMinutes": 60,
+    "revivalVouchMaxAgeSeconds": 600
+  }
+}
+```
+
 ### Message Delivery
 
 | Setting | Type | Default | Description |

@@ -12,7 +12,7 @@ type AbortInternals = {
 	writeLine: (request: Record<string, unknown>) => Promise<void>;
 	handleEvent: (event: Record<string, unknown>) => void;
 	wireChild: (child: AbortInternals["child"]) => void;
-	inFlightHostRequests: Map<Promise<void>, number>;
+	inFlightHostRequests: Map<Promise<void>, unknown>;
 	kernelStderr: string;
 	child: EventEmitter & {
 		exitCode: number | null;
@@ -161,24 +161,36 @@ describe("ReplKernelManager host request abort on teardown", () => {
 		expect((observed.signal?.reason as Error).message).toBe("IPython kernel disposed");
 	});
 
-	it("a kernel child exit aborts in-flight host requests", async () => {
+	it("an unexpected kernel exit keeps admitted host work alive", async () => {
 		const observed: { started?: boolean; signal?: AbortSignal } = {};
-		const { internals } = configuredManager(() => {}, {
-			"rlm.run": createRlmRunHostHandler(async (_request, signal) => {
-				observed.started = true;
-				observed.signal = signal;
-				return {};
-			}),
-		});
+		const sent: Record<string, unknown>[] = [];
+		const { internals } = configuredManager(
+			(request) => {
+				sent.push(request);
+			},
+			{
+				"rlm.run": createRlmRunHostHandler(async (_request, signal) => {
+					observed.started = true;
+					observed.signal = signal;
+					return {};
+				}),
+			},
+		);
 
 		internals.handleEvent({ event: "host_request", id: "hr-exit", data: { type: "rlm.run", prompt: "exit child" } });
 		await waitFor(() => observed.started === true);
 
-		// An unexpected kernel exit runs the exit handler's cleanup path.
+		// A crash is not a teardown (I-11). The host already admitted this work - cancelling a
+		// spawned child because its parent kernel died is exactly the collateral damage the
+		// revival path exists to prevent. Only the reply is lost, which the reset notice reports.
 		internals.child.exitCode = 1;
 		internals.child.emit("exit", 1, null);
-		expect(observed.signal?.aborted).toBe(true);
-		expect((observed.signal?.reason as Error).message).toBe("IPython kernel stopped");
+		expect(observed.signal?.aborted).toBe(false);
+		// Positive control that it was not merely "not aborted yet": the handler ran to
+		// completion and its reply was written, i.e. the admitted work survived the crash.
+		await waitFor(() => sent.some((request) => request.type === "host_reply" && request.id === "hr-exit"));
+		const reply = sent.find((request) => request.type === "host_reply") as { data?: { status?: string } } | undefined;
+		expect(reply?.data?.status).toBe("ok");
 	});
 });
 

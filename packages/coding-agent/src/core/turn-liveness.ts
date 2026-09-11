@@ -29,7 +29,7 @@
  */
 
 import { getLogger } from "@earendil-works/pi-ai";
-import type { KernelLivenessSample } from "./kernel/shared.js";
+import type { KernelLivenessSample, KernelRevivalVouch } from "./kernel/shared.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV, readActiveOrphanProcesses } from "./orphan-process-journal.js";
 import { STALL_KERNEL_REASONS, STALL_VOUCH_REASONS } from "./stall-watchdog.js";
 
@@ -53,10 +53,25 @@ export const TURN_LIVENESS_REASONS = {
 	hostRequestAgedOut: "host_request_aged_out",
 	/** The vouch rests on the degraded journal read rather than on a live heartbeat. */
 	degradedJournal: "degraded_journal",
+	/** A replacement kernel is being spawned, restored and bootstrapped after a death. */
+	kernelReviving: "kernel_reviving",
+	/** A revival vouch outlived its age bound, so it stopped excusing silence (B7). */
+	revivalAgedOut: "kernel_revival_aged_out",
 } as const;
 
 /** A host request older than this stops vouching: a wedged handler must not excuse silence forever. */
 export const DEFAULT_HOST_REQUEST_MAX_AGE_MS = 15 * 60 * 1000;
+/**
+ * A kernel revival older than this stops vouching (B7).
+ *
+ * Ten minutes covers the whole revival sequence with room to spare - a cold `uv` bootstrap holds
+ * the shared lock for up to five minutes, the spawn handshake is bounded at 30s, and a large
+ * snapshot read gets its 30s budget plus the longer retry. Without the bound a `run(uv)` that
+ * never returns would vouch forever, which is the "50 minutes of silent hang" shape this exists
+ * to prevent. Deliberately shorter than {@link DEFAULT_HOST_REQUEST_MAX_AGE_MS}: a revival is
+ * host-driven work with known bounds, so it has no business outliving them by much.
+ */
+export const DEFAULT_REVIVAL_VOUCH_MAX_AGE_MS = 10 * 60 * 1000;
 /**
  * Protocol that introduced the heartbeat, mirroring the runtime's own gate. Below it a kernel
  * sends no frames by design, so "no facts" is the expected state and not a finding worth putting
@@ -99,6 +114,11 @@ export interface TurnLivenessKernelFacts {
 	kernelPid?: number;
 	/** Whether a cell is executing, from the host side of the request. */
 	hasActiveExecution?: boolean;
+	/**
+	 * Present while a replacement kernel is being brought up after a death. The same flag that
+	 * blocks snapshot writes gates it, so the two predicates cannot disagree (L10.4).
+	 */
+	revival?: KernelRevivalVouch;
 }
 
 /** Result of the degraded journal read: a count, a failure to report, or "not applicable". */
@@ -118,6 +138,11 @@ export interface TurnLivenessOptions {
 	now?: () => number;
 	/** Age bound on a vouching host request. Default {@link DEFAULT_HOST_REQUEST_MAX_AGE_MS}. */
 	hostRequestMaxAgeMs?: number;
+	/**
+	 * Age bound on a revival vouch. Default {@link DEFAULT_REVIVAL_VOUCH_MAX_AGE_MS}; `Infinity`
+	 * (the settings rollback lever) makes it unbounded again.
+	 */
+	revivalVouchMaxAgeMs?: number | (() => number);
 	/** Lifetime of one degraded read. Default {@link DEFAULT_DEGRADED_FACTS_MAX_AGE_MS}. */
 	degradedFactsMaxAgeMs?: number | (() => number);
 	/** Staleness threshold in heartbeat intervals. Default {@link DEFAULT_STALE_AFTER_INTERVALS}. */
@@ -167,6 +192,8 @@ export interface TurnLivenessFacts {
 	hostRequestCount?: number;
 	kernelPid?: number;
 	rejectedFrames?: number;
+	/** Age of the revival window in ms; absent when no revival is in flight. */
+	revivalAgeMs?: number;
 }
 
 export interface TurnLiveness {
@@ -266,6 +293,10 @@ export function createTurnLiveness(options: TurnLivenessOptions): TurnLiveness {
 	const now = options.now ?? (() => Date.now());
 	const readJournal = options.readJournaledBashHandles ?? readJournaledBashHandles;
 	const hostRequestMaxAgeMs = options.hostRequestMaxAgeMs ?? DEFAULT_HOST_REQUEST_MAX_AGE_MS;
+	const revivalVouchMaxAgeMs = (): number => {
+		const configured = options.revivalVouchMaxAgeMs ?? DEFAULT_REVIVAL_VOUCH_MAX_AGE_MS;
+		return typeof configured === "function" ? configured() : configured;
+	};
 	const degradedFactsMaxAgeMs = (): number => {
 		const configured = options.degradedFactsMaxAgeMs ?? DEFAULT_DEGRADED_FACTS_MAX_AGE_MS;
 		return typeof configured === "function" ? configured() : configured;
@@ -344,6 +375,22 @@ export function createTurnLiveness(options: TurnLivenessOptions): TurnLiveness {
 			kernelReasons.push(TURN_LIVENESS_REASONS.hostRequestAgedOut);
 		}
 
+		// A revival in flight is the host's own work - spawn, restore, bootstrap - while the cell
+		// that triggered it waits. Age-bounded like every other vouch (B7), and impossible once
+		// the restart budget is spent: a fail-closed kernel has no revival to vouch for, so the
+		// watchdog cannot end up exempting a turn that can never produce a cell again.
+		const revival = kernel?.revival;
+		// Aged against this aggregate's own clock rather than the reported age, so a caller that
+		// handed over a stale number cannot extend its own vouch.
+		const revivalAgeMs = revival === undefined ? undefined : Math.max(0, at - revival.since);
+		const revivalAgedOut = revivalAgeMs !== undefined && revivalAgeMs > revivalVouchMaxAgeMs();
+		if (revivalAgeMs !== undefined && !revivalAgedOut) {
+			reasons.push(TURN_LIVENESS_REASONS.kernelReviving);
+			progress = true;
+		} else if (revivalAgedOut) {
+			kernelReasons.push(TURN_LIVENESS_REASONS.revivalAgedOut);
+		}
+
 		let liveBashHandles: number | undefined;
 		let degradedUsed = false;
 		if (verdict.state === "fresh") {
@@ -403,6 +450,7 @@ export function createTurnLiveness(options: TurnLivenessOptions): TurnLiveness {
 			...(liveBashHandles === undefined ? {} : { liveBashHandles }),
 			...(kernel?.kernelPid === undefined ? {} : { kernelPid: kernel.kernelPid }),
 			...(kernel?.rejectedFrames === undefined ? {} : { rejectedFrames: kernel.rejectedFrames }),
+			...(revivalAgeMs === undefined ? {} : { revivalAgeMs }),
 			hostRequestCount,
 		};
 	}

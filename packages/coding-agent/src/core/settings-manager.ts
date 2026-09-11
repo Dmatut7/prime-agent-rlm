@@ -32,6 +32,21 @@ export const DEFAULT_STALL_ABORT_AFTER_SECONDS = 900;
 export const DEFAULT_KERNEL_BOOTSTRAP_LOCK_TIMEOUT_MS = 300_000;
 
 /**
+ * Kernel revival budget (C8): how many unexpected exits one session may revive inside the sliding
+ * window before it fails closed with `KernelUnavailableError`. Unbounded revival is the failure
+ * mode this bounds - each attempt costs a venv check, a snapshot restore and a bootstrap.
+ */
+export const DEFAULT_KERNEL_MAX_RESTARTS = 3;
+/** Sliding window the revival budget is counted over, in minutes. */
+export const DEFAULT_KERNEL_RESTART_WINDOW_MINUTES = 60;
+/**
+ * Age bound on the revival vouch (B7): a revival excuses a silent turn only while it is plausibly
+ * still working (spawn, restore, bootstrap). Ten minutes covers a cold `uv` bootstrap plus a large
+ * snapshot read; past that the watchdog warns and aborts again.
+ */
+export const DEFAULT_KERNEL_REVIVAL_VOUCH_MAX_AGE_SECONDS = 600;
+
+/**
  * Hours a failed session-worker registration is kept before the supervisor's
  * reaper archives it to the daemon log and removes the descriptor (C17).
  */
@@ -133,6 +148,27 @@ export interface SubagentWakeSettings {
  */
 export interface KernelBootstrapSettings {
 	lockTimeoutMs?: number; // default: 300000 (5 min); 0 waits forever
+}
+
+/**
+ * Kernel revival knobs (C8/B7). A kernel that dies on its own is revived by the next cell, and
+ * the budget bounds how often that may happen before the session fails closed instead of looping
+ * a venv rebuild, a restore and a bootstrap per cell. Every value is read live, so an edit
+ * applies to the next kernel death without a restart; `0` is the documented rollback lever for
+ * each bound (`maxUnexpectedRestarts: 0` revives without limit, `revivalVouchMaxAgeSeconds: 0`
+ * lets a revival vouch for silence indefinitely).
+ */
+export interface KernelRestartSettings {
+	maxUnexpectedRestarts?: number; // default: 3 per window; 0 = unlimited (rollback lever)
+	windowMinutes?: number; // default: 60 (sliding)
+	revivalVouchMaxAgeSeconds?: number; // default: 600 (10 min); 0 = unbounded
+}
+
+/** Resolved kernel revival policy, in the units the kernel and watchdog code uses. */
+export interface ResolvedKernelRestartSettings {
+	maxUnexpectedRestarts: number;
+	windowMs: number;
+	revivalVouchMaxAgeMs: number;
 }
 
 /**
@@ -276,6 +312,7 @@ export interface Settings {
 	stallWatchdog?: StallWatchdogSettings;
 	subagentWake?: SubagentWakeSettings;
 	kernelBootstrap?: KernelBootstrapSettings;
+	kernelRestart?: KernelRestartSettings;
 	daemon?: DaemonSettings;
 	autoRefine?: AutoRefineSettings;
 	agentTraces?: AgentTracesSettings;
@@ -1101,6 +1138,22 @@ export class SettingsManager {
 		};
 	}
 
+	/**
+	 * Kernel revival budget and vouch bound. `Infinity` is the resolved form of the `0` rollback
+	 * lever: a comparison against it is simply never true, so no call site needs its own
+	 * "disabled" branch.
+	 */
+	getKernelRestartSettings(): ResolvedKernelRestartSettings {
+		const settings = this.settings.kernelRestart;
+		return {
+			maxUnexpectedRestarts: normalizeRestartBound(settings?.maxUnexpectedRestarts, DEFAULT_KERNEL_MAX_RESTARTS),
+			windowMs: normalizeRestartBound(settings?.windowMinutes, DEFAULT_KERNEL_RESTART_WINDOW_MINUTES) * 60_000,
+			revivalVouchMaxAgeMs:
+				normalizeRestartBound(settings?.revivalVouchMaxAgeSeconds, DEFAULT_KERNEL_REVIVAL_VOUCH_MAX_AGE_SECONDS) *
+				1000,
+		};
+	}
+
 	getKernelBootstrapSettings(): { lockTimeoutMs: number } {
 		return {
 			lockTimeoutMs: normalizeKernelBootstrapLockTimeoutMs(this.settings.kernelBootstrap?.lockTimeoutMs),
@@ -1549,6 +1602,16 @@ export class SettingsManager {
 		this.markModified("warnings");
 		this.save();
 	}
+}
+
+/**
+ * A restart bound: `0` (or any non-positive value) is the documented rollback lever and resolves
+ * to `Infinity`, i.e. the bound never trips; a non-number falls back to the shipped default.
+ */
+function normalizeRestartBound(value: unknown, fallback: number): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+	if (value <= 0) return Number.POSITIVE_INFINITY;
+	return Math.floor(value);
 }
 
 /** 0 disables the bound; any other non-positive/non-finite value falls back to the default. */

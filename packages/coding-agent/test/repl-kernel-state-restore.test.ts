@@ -54,7 +54,7 @@ function stubRunning(manager: ReplKernelManager, extra: Record<string, unknown> 
 }
 
 describe("ReplKernelManager restore failure guards", () => {
-	it("bounds the resume restore with the repair step timeout", async () => {
+	it("bounds the resume restore and retries a timeout without isolating the snapshot", async () => {
 		vi.useFakeTimers();
 		try {
 			const manager = new ReplKernelManager({ cwd: process.cwd(), snapshot: { ...SNAPSHOT_OPTS } });
@@ -92,11 +92,21 @@ describe("ReplKernelManager restore failure guards", () => {
 			expect(settled).toBe(false);
 
 			await vi.advanceTimersByTimeAsync(1);
+			// A bound that trips means the payload was slow, not corrupt (B5): the attempt is
+			// retried with the longer window and the snapshot stays exactly where it is.
+			await waitForCalls(executeInner, 2);
+			expect(seen[1]).toEqual({ type: "restore", hasTimeoutSignal: true });
+			let settledAfterFirstTimeout = false;
+			void restore.finally(() => {
+				settledAfterFirstTimeout = true;
+			});
+			await Promise.resolve();
+			expect(settledAfterFirstTimeout).toBe(false);
+
+			await vi.advanceTimersByTimeAsync(4 * 30_000);
 			await expect(restore).resolves.toBeNull();
-			// A timed-out restore isolates (nothing to isolate here) and must not leave
-			// writes banned: the ban is reported, and only by the isolation failure.
+			expect(logMessages("kernel state restore failed; snapshot isolated")).toHaveLength(0);
 			expect(logMessages("kernel state restore failed; snapshot could not be isolated")).toHaveLength(0);
-			expect(logMessages("kernel state restore failed; snapshot isolated")).toHaveLength(1);
 		} finally {
 			vi.useRealTimers();
 		}

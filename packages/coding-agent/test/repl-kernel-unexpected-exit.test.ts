@@ -183,7 +183,7 @@ describe("ReplKernelManager unexpected exit", () => {
 		const manager = newManager({ onUnexpectedExit: (cause) => causes.push(cause) });
 		try {
 			await expect(manager.execute("die9")).rejects.toThrow();
-			await vi.waitFor(() => expect(causes.length).toBe(1));
+			await vi.waitFor(() => expect(causes.length).toBe(1), { timeout: 15_000 });
 			expect(causes[0]!.code).toBe(9);
 			expect(causes[0]!.origin).toBe("unknown");
 			expect(causes[0]!.stderrTail).toContain("cell failed hard");
@@ -198,7 +198,7 @@ describe("ReplKernelManager unexpected exit", () => {
 		const manager = newManager({ onUnexpectedExit: (cause) => causes.push(cause) });
 		try {
 			await expect(manager.execute("oom")).rejects.toThrow();
-			await vi.waitFor(() => expect(causes.length).toBe(1));
+			await vi.waitFor(() => expect(causes.length).toBe(1), { timeout: 15_000 });
 			expect(causes[0]!.signal).toBe("SIGKILL");
 			expect(causes[0]!.origin).toBe("oom_suspect");
 		} finally {
@@ -218,7 +218,7 @@ describe("ReplKernelManager unexpected exit", () => {
 			// callback runs after cleanupResources cleared the child: the guard, not the
 			// classification, keeps it quiet. The classification must hold anyway.
 			await expect(manager.execute("corrupt")).rejects.toThrow();
-			await vi.waitFor(() => expect(manager.isRunning).toBe(true));
+			await vi.waitFor(() => expect(manager.isRunning).toBe(true), { timeout: 15_000 });
 			const result = await manager.execute("1+1");
 			expect(result.status).toBe("ok");
 			expect(causes).toEqual([]);

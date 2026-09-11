@@ -22,13 +22,23 @@ import { v4 as uuid } from "uuid";
 import { assertRegularFileNoSymlink, ensurePrivateDirectory, requireNoFollow } from "../../utils/private-files.js";
 import { reapKernelOrphanProcesses, recordOrphanProcessState } from "../orphan-process-journal.js";
 import { ensureKernelPython, managedKernelVenvDirForPython } from "./bootstrap.js";
-import { classifyKernelExit, type KernelDeathCause, type KernelIntentionalExitOrigin } from "./death-cause.js";
+import {
+	classifyKernelExit,
+	type KernelDeathCause,
+	type KernelHostRequestFact,
+	type KernelIntentionalExitOrigin,
+	type KernelUnexpectedExitFacts,
+} from "./death-cause.js";
+import { KernelUnavailableError } from "./errors.js";
+import { formatKernelResetNotice, type KernelResetNoticeFacts } from "./reset-notice.js";
 import {
 	AGENT_MESSAGE_DISPLAY_MIME,
 	ATTACHMENT_DISPLAY_MIME,
 	createDeferred,
 	createKernelStartupAbortError,
+	DEFAULT_KERNEL_RESTART_WINDOW_MS,
 	DEFAULT_MAX_OUTPUT_CHARS,
+	DEFAULT_MAX_UNEXPECTED_RESTARTS,
 	DEFAULT_SNAPSHOT_DEBOUNCE_MS,
 	DIFF_DISPLAY_MIME,
 	type ExecuteOptions,
@@ -51,6 +61,8 @@ import {
 	type KernelLiveness,
 	type KernelLivenessSample,
 	type KernelManagerOptions,
+	type KernelRestartPolicy,
+	type KernelRevivalVouch,
 	type KernelSentAgentMessage,
 	type KernelShutdownOptions,
 	type KernelStartOptions,
@@ -115,6 +127,12 @@ const KERNEL_LIVENESS_MAX_SAMPLES = 2;
 const KERNEL_LIVENESS_REJECT_LOG_EVERY = 50;
 const READY_TIMEOUT_MS = 30_000;
 const REPAIR_STEP_TIMEOUT_MS = 30_000;
+/**
+ * A restore that timed out is retried with this multiple of its budget (B5): a large snapshot
+ * read cold from disk can legitimately outlast the repair budget, and the alternative - renaming
+ * the payload aside - would destroy good state to answer a slow read.
+ */
+const RESTORE_RETRY_TIMEOUT_MULTIPLIER = 4;
 // Runtime-minted host-request ids never repeat; the bound only guards a
 // misbehaving runtime from growing the dedup set forever.
 const MAX_HANDLED_HOST_REQUEST_IDS = 1024;
@@ -130,6 +148,45 @@ const KERNEL_STDERR_HOST_TAIL_CHARS = 256;
 // O_NONBLOCK degrades to 0 on win32 (as in private-files.ts): a no-op on regular files,
 // but a planted FIFO then fails at once instead of blocking the event loop.
 const NONBLOCK_FLAG = constants.O_NONBLOCK ?? 0;
+
+/** A kernel revival that has not been reported to the model yet. */
+interface PendingRestartNotice extends Omit<KernelResetNoticeFacts, "restore" | "restoreTimedOut" | "repeatedCell"> {
+	/** Source of the cell that was running when the kernel died, for the repeat check. */
+	repeatedCellCode?: string;
+}
+
+/** One in-flight host request, with the facts the reset notice needs if the kernel dies. */
+interface InFlightHostRequest {
+	startedAt: number;
+	type: string;
+	label?: string;
+}
+
+/** Type and human-readable target of one host request. Never throws on a malformed payload. */
+function describeHostRequest(data: unknown): { type: string; label?: string } {
+	if (!isRecord(data) || typeof data.type !== "string" || data.type.length === 0) {
+		return { type: "unknown" };
+	}
+	const type = data.type;
+	const label = hostRequestLabel(type, data);
+	return label === undefined ? { type } : { type, label };
+}
+
+/** Best-effort target for the notice, so the model can tell two lost requests apart. */
+function hostRequestLabel(type: string, data: Record<string, unknown>): string | undefined {
+	const cap = (value: string): string => (value.length > 80 ? `${value.slice(0, 80)}...` : value);
+	if (type === "rlm.run") {
+		const kwargs = isRecord(data.kwargs) ? data.kwargs : {};
+		return typeof kwargs.name === "string" && kwargs.name.length > 0 ? cap(`name=${kwargs.name}`) : undefined;
+	}
+	if (type === "agent_message.send") {
+		const role = typeof data.receiver_role === "string" ? data.receiver_role : undefined;
+		const name = typeof data.receiver_name === "string" ? data.receiver_name : undefined;
+		if (role === "parent") return "receiver=parent";
+		if (role && name) return cap(`receiver=${role}:${name}`);
+	}
+	return typeof data.target === "string" && data.target.length > 0 ? cap(`target=${data.target}`) : undefined;
+}
 
 /** ExecuteResult plus the raw fields of the request's `done` event (state ops). */
 interface InternalExecuteResult extends ExecuteResult {
@@ -320,6 +377,7 @@ export class ReplKernelManager {
 		| "bootstrapCode"
 		| "stderrLogPath"
 		| "onUnexpectedExit"
+		| "restartPolicy"
 	>;
 	private readonly handledHostRequestIds = new Set<string>();
 	private child?: ChildProcess;
@@ -353,7 +411,7 @@ export class ReplKernelManager {
 	 * request's age, so a handler that wedged stops excusing silence instead of vouching for the
 	 * whole exemption budget.
 	 */
-	private readonly inFlightHostRequests = new Map<Promise<void>, number>();
+	private readonly inFlightHostRequests = new Map<Promise<void>, InFlightHostRequest>();
 	/** Retained heartbeat samples, newest first; at most KERNEL_LIVENESS_MAX_SAMPLES of them. */
 	private readonly livenessSamples: KernelLivenessSample[] = [];
 	/** Heartbeat frames rejected for a bad shape. Counted, never fatal (B4/B8). */
@@ -375,6 +433,32 @@ export class ReplKernelManager {
 	 * `startGeneration`, so both auxiliary facts are already stale by the time the exit lands.
 	 */
 	private intentionalExitOrigin?: KernelIntentionalExitOrigin;
+	/** Set by shutdown()/kill()/disposeSync(): the host declared this kernel gone for good. */
+	private disposedByHost = false;
+	/**
+	 * Epoch ms when the current reprovisioning window opened, or undefined outside one.
+	 *
+	 * `armReprovisionWindow()` is the single place that opens it and the single place that arms
+	 * `pendingRestore`, so the snapshot write block and the revival vouch can never disagree about
+	 * whether a namespace is still owed (L10.4). The window outlives that flag on purpose: the
+	 * runtime bootstrap runs after the restore lands, and it is the long part.
+	 */
+	private reprovisionWindowSince?: number;
+	/** Every unexpected exit inside the budget window, oldest first (C8). */
+	private readonly unexpectedExits: KernelDeathCause[] = [];
+
+	/** Revival facts awaiting the next cell that reaches the model; consumed once. */
+	private pendingRestartNotice?: PendingRestartNotice;
+	/** Outcome of the most recent restore attempt pair, folded into the notice on consumption. */
+	private lastRestoreResult?: RestoreResult | null;
+	private lastRestoreTimedOut = false;
+	/** The last restore needed the longer retry window because its first attempt timed out. */
+	private lastRestoreRetried = false;
+	/** Unattributed output the dying cell had collected; re-surfaced on the next cell. */
+	private dyingBackgroundOutput?: string;
+	private dyingBackgroundOutputTruncated = false;
+	/** A restore timed out and was not retried successfully: the payload is intact but still owed. */
+	private restoreTimedOut = false;
 	private gracefulShutdownPromise?: Promise<boolean>;
 	/** Memoized so concurrent callers all await the same in-flight startup. */
 	private startPromise?: Promise<void>;
@@ -419,6 +503,7 @@ export class ReplKernelManager {
 			bootstrapCode: options.bootstrapCode,
 			stderrLogPath: options.stderrLogPath,
 			onUnexpectedExit: options.onUnexpectedExit,
+			restartPolicy: options.restartPolicy,
 		};
 	}
 
@@ -467,10 +552,47 @@ export class ReplKernelManager {
 	 */
 	get hostRequestOldestAgeMs(): number | undefined {
 		let oldest: number | undefined;
-		for (const startedAt of this.inFlightHostRequests.values()) {
-			if (oldest === undefined || startedAt < oldest) oldest = startedAt;
+		for (const request of this.inFlightHostRequests.values()) {
+			if (oldest === undefined || request.startedAt < oldest) oldest = request.startedAt;
 		}
 		return oldest === undefined ? undefined : Math.max(0, Date.now() - oldest);
+	}
+
+	/**
+	 * Revival-window facts for the stall watchdog, or undefined outside a revival (B7/L10.4).
+	 *
+	 * The gate is the same flag the snapshot write policy reads, so the two predicates cannot
+	 * disagree about whether a namespace is still owed. The window itself is narrower than the
+	 * flag: it covers only the work this host is doing to bring the kernel back (spawn, restore,
+	 * bootstrap) and closes the moment the replacement serves cells, so a kernel that is merely
+	 * waiting for its next cell never excuses a silent turn. Age is the reader's bound.
+	 */
+	get revivalVouch(): KernelRevivalVouch | undefined {
+		const since = this.reprovisionWindowSince;
+		if (since === undefined) return undefined;
+		const reviving =
+			this.state === "starting" || this.rebootstrapPromise !== undefined || this.protocolRepairPromise !== undefined;
+		if (!reviving) return undefined;
+		return { since };
+	}
+
+	/**
+	 * The one-shot notice describing the last revival, or undefined when there is nothing to
+	 * report. `forCode` is the source of the cell about to receive it, which is what makes a
+	 * repeated cell - the model's natural reaction to a lost kernel - say so out loud.
+	 */
+	consumeRestartNotice(forCode?: string): string | undefined {
+		const pending = this.pendingRestartNotice;
+		if (!pending) return undefined;
+		this.pendingRestartNotice = undefined;
+		const { repeatedCellCode, ...facts } = pending;
+		return formatKernelResetNotice({
+			...facts,
+			restore: this.lastRestoreResult,
+			restoreTimedOut: this.lastRestoreTimedOut,
+			restoreRetriedAfterTimeout: this.lastRestoreRetried,
+			repeatedCell: forCode !== undefined && repeatedCellCode !== undefined && forCode === repeatedCellCode,
+		});
 	}
 
 	/** Whether a cell is executing right now, from the host side of the request. */
@@ -742,7 +864,12 @@ export class ReplKernelManager {
 			const canRetryStartup = (this.state as string) !== "shutdown";
 			// Only the call that performed the cleanup may resurrect to idle; a
 			// concurrent kill()/teardown owns the state otherwise.
-			if ((await this.shutdown()) && canRetryStartup) this.state = "idle";
+			if ((await this.shutdown()) && canRetryStartup) {
+				// The teardown here is this failed start's own cleanup, not a host verdict: the
+				// manager stays reusable, so it must also stay revivable.
+				this.disposedByHost = false;
+				this.state = "idle";
+			}
 			throw e;
 		}
 
@@ -858,7 +985,12 @@ export class ReplKernelManager {
 			});
 			this.intentionalExitOrigin = undefined;
 			if (verdict.unexpected) {
-				this.reportUnexpectedKernelExit(verdict.cause, child.pid);
+				const facts = this.recordUnexpectedExit(verdict.cause);
+				this.reportUnexpectedKernelExit(verdict.cause, child.pid, facts);
+				if (facts.decision.revive) {
+					this.armRevivalAfterUnexpectedExit(verdict.cause);
+					return;
+				}
 			} else if (verdict.origin === "repair_kill" || verdict.origin === "bootstrap_fail_kill") {
 				// Tagged, not silent: this is the only place a repair kill can be told apart from
 				// a crash in the host's own ring, and B6 exists to keep the two from mixing.
@@ -870,7 +1002,12 @@ export class ReplKernelManager {
 			// teardown and runs cleanupResources itself. Cleaning up here would bump the
 			// generation and misread the owning shutdown as superseded.
 			if (this.gracefulShutdownGeneration === this.startGeneration) return;
-			this.cleanupResources();
+			// A death that exhausted the budget rejects its own cell with the terminal error too:
+			// the model has to see the budget fact on the cell that died, not one cell later.
+			this.cleanupResources(
+				"SIGTERM",
+				verdict.unexpected ? { activeExecutionError: this.terminalRequestError() } : {},
+			);
 		});
 	}
 
@@ -879,7 +1016,167 @@ export class ReplKernelManager {
 	 * process, so the cause goes out two ways: a countable log line for the machine-wide
 	 * signature, and a callback the owning session turns into its own log line.
 	 */
-	private reportUnexpectedKernelExit(cause: KernelDeathCause, kernelPid: number | undefined): void {
+	/**
+	 * Bookkeeping for one unowned death: the restart ledger, the requests that were in flight
+	 * when it happened, and the notice the next cell owes the model. Runs before the teardown so
+	 * the in-flight request list is still the pre-death one.
+	 */
+	private recordUnexpectedExit(cause: KernelDeathCause): KernelUnexpectedExitFacts {
+		const policy = this.currentRestartPolicy();
+		// Sliding window: a restart budget that never expired would fail a session closed for a
+		// crash it survived hours ago.
+		const windowStart = cause.at - policy.windowMs;
+		while (this.unexpectedExits.length > 0 && (this.unexpectedExits[0]?.at ?? 0) < windowStart) {
+			this.unexpectedExits.shift();
+		}
+		const previous = this.unexpectedExits[this.unexpectedExits.length - 1];
+		this.unexpectedExits.push(cause);
+		const unresolvedHostRequests: KernelHostRequestFact[] = [...this.inFlightHostRequests.values()].map(
+			(request) => ({
+				type: request.type,
+				...(request.label === undefined ? {} : { label: request.label }),
+				// Conservative by design: a reply that never arrived is not evidence that the
+				// work did not happen, and the model is about to be tempted to repeat it (M10c).
+				mayHaveTakenEffect: true,
+			}),
+		);
+		const dyingCellCode = this.activeExecution?.code ?? this.lastCellCode;
+		// Captured before the teardown rejects the cell: its result is thrown away, so the
+		// unattributed output it collected is only visible again if the revival keeps it.
+		this.dyingBackgroundOutput = this.activeExecution?.backgroundOutput;
+		this.dyingBackgroundOutputTruncated = this.activeExecution?.backgroundOutputTruncated ?? false;
+		const restartCount = this.unexpectedExits.length;
+		// C8: the budget counts revivals, so the death that exceeds it fails closed instead of
+		// arming another one.
+		const exhausted = restartCount > policy.maxRestarts;
+		this.pendingRestartNotice = {
+			cause,
+			restartCount,
+			snapshotConfigured: this.options.snapshot !== undefined,
+			hostRequests: unresolvedHostRequests,
+			...(Number.isFinite(policy.maxRestarts) ? { maxRestarts: policy.maxRestarts } : {}),
+			windowMinutes: Math.round(policy.windowMs / 60_000),
+			...(dyingCellCode === undefined ? {} : { repeatedCellCode: dyingCellCode }),
+		};
+		return {
+			decision: {
+				revive: !exhausted && this.canReviveAfterUnexpectedExit(),
+				restartCount,
+				windowMs: policy.windowMs,
+				budgetRemaining: Math.max(0, policy.maxRestarts - restartCount),
+				exhausted,
+				...(previous === undefined ? {} : { sincePreviousMs: Math.max(0, cause.at - previous.at) }),
+			},
+			unresolvedHostRequests,
+		};
+	}
+
+	/** Restart budget in force right now; read at every death so a settings edit applies at once. */
+	private currentRestartPolicy(): KernelRestartPolicy {
+		const configured = this.options.restartPolicy?.();
+		return {
+			maxRestarts: configured?.maxRestarts ?? DEFAULT_MAX_UNEXPECTED_RESTARTS,
+			windowMs: configured?.windowMs ?? DEFAULT_KERNEL_RESTART_WINDOW_MS,
+		};
+	}
+
+	/**
+	 * The error every request gets while this kernel is terminal. A spent restart budget says so
+	 * with the death chain and the two re-arm paths; anything else keeps the plain teardown text.
+	 */
+	private terminalRequestError(): Error {
+		if (!this.restartBudgetExhaustedNow()) return new Error("Kernel has been shut down");
+		const policy = this.currentRestartPolicy();
+		return new KernelUnavailableError({
+			restartCount: this.unexpectedExits.length,
+			maxRestarts: policy.maxRestarts,
+			windowMs: policy.windowMs,
+			causes: this.unexpectedExits,
+		});
+	}
+
+	/**
+	 * Whether an unexpected death may be revived. Everything that says no is a host decision that
+	 * outlives the kernel: an explicit teardown, or a final dispose snapshot still flushing
+	 * (reviving under it would splice a live kernel into a session that is closing).
+	 */
+	private canReviveAfterUnexpectedExit(): boolean {
+		return !this.disposedByHost && !this.flushingSnapshotForDispose && !this.restartBudgetExhaustedNow();
+	}
+
+	/** Drop the exits that fell out of the sliding window. */
+	private pruneUnexpectedExits(at: number): void {
+		const windowStart = at - this.currentRestartPolicy().windowMs;
+		while (this.unexpectedExits.length > 0 && (this.unexpectedExits[0]?.at ?? 0) < windowStart) {
+			this.unexpectedExits.shift();
+		}
+	}
+
+	/** Whether the budget is spent right now. Live, because the window slides (L3). */
+	private restartBudgetExhaustedNow(): boolean {
+		this.pruneUnexpectedExits(Date.now());
+		return this.unexpectedExits.length > this.currentRestartPolicy().maxRestarts;
+	}
+
+	/**
+	 * Re-arm a fail-closed session when its window expires (L3). Lazy on purpose: nothing is
+	 * scheduled, so a session that never runs another cell never restarts a kernel, and one that
+	 * does gets its revival back without a human. Only an exhausted budget is re-armed here - a
+	 * kernel the host tore down stays down.
+	 */
+	private rearmIfRestartBudgetWindowExpired(): void {
+		if (this.state !== "shutdown" || this.disposedByHost) return;
+		if (this.unexpectedExits.length === 0) return;
+		if (this.restartBudgetExhaustedNow()) return;
+		this.appendKernelDiagnostic("kernel restart budget window expired; the next cell revives the kernel");
+		// The failed-closed request memoized a start() that did nothing (the state was terminal
+		// then); without dropping it the revived state would never spawn a child.
+		this.startPromise = undefined;
+		this.pendingRebootstrap = true;
+		this.restoreTimedOut = false;
+		this.armReprovisionWindow();
+		this.state = "idle";
+	}
+
+	/**
+	 * Settle at idle with the reprovisioning flags armed, so the next `execute()` spawns a
+	 * replacement and restores into it. The in-flight host requests are *not* cancelled: they
+	 * belong to work the host already admitted (an `rlm.run` child, a message delivery), and a
+	 * kernel crash is not a teardown of the family (I-11). Their replies are dropped, which is
+	 * what the reset notice reports.
+	 */
+	private armRevivalAfterUnexpectedExit(cause: KernelDeathCause): void {
+		this.pendingRebootstrap = true;
+		// A payload that timed out last time is owed another attempt on the new kernel.
+		this.restoreTimedOut = false;
+		liveKernels.delete(this);
+		this.cleanupResources("SIGKILL", {
+			keepHostRequests: true,
+			keepBackgroundOutput: true,
+			activeExecutionError: new Error(
+				`Python kernel exited unexpectedly (code=${cause.code}, signal=${cause.signal ?? "null"}, origin=${cause.origin}); the next cell starts a replacement kernel and restores the last snapshot`,
+			),
+		});
+		// The dying cell's result was thrown away with it, so the unattributed output it had
+		// collected (an orphan thread, another cell's leftovers) goes back to the pending buffer:
+		// it is evidence about the death, and the next cell is the only one that can show it.
+		if (this.dyingBackgroundOutput && this.dyingBackgroundOutput.length > 0) {
+			this.pendingBackgroundOutput = this.dyingBackgroundOutput;
+			this.pendingBackgroundOutputTruncated = this.dyingBackgroundOutputTruncated;
+		}
+		this.dyingBackgroundOutput = undefined;
+		this.dyingBackgroundOutputTruncated = false;
+		// Armed after the teardown so the window this revival needs is not the one the teardown
+		// just closed, and so its age counts from the death rather than from an earlier window.
+		this.armReprovisionWindow();
+		this.state = "idle";
+	}
+
+	private reportUnexpectedKernelExit(
+		cause: KernelDeathCause,
+		kernelPid: number | undefined,
+		facts: KernelUnexpectedExitFacts,
+	): void {
 		this.appendKernelDiagnostic(`unexpected exit code=${cause.code} signal=${cause.signal} origin=${cause.origin}`);
 		kernelLog.error("kernel exited unexpectedly", {
 			code: cause.code,
@@ -889,7 +1186,7 @@ export class ReplKernelManager {
 			sessionId: this.options.sessionId,
 		});
 		try {
-			this.options.onUnexpectedExit?.(cause);
+			this.options.onUnexpectedExit?.(cause, facts);
 		} catch (error) {
 			// A reporting callback must not be able to break the teardown that follows it.
 			kernelLog.warn("kernel unexpected-exit callback failed", {
@@ -920,7 +1217,7 @@ export class ReplKernelManager {
 			// costs at most one bounded restore per later attempt.
 			const snapshotSuspect = this.pendingRestore;
 			this.killChildToIdle("repair_kill");
-			if (snapshotSuspect) this.pendingRestore = false;
+			if (snapshotSuspect) this.clearPendingRestore();
 			return;
 		}
 		const owner = { superseded: false };
@@ -967,7 +1264,7 @@ export class ReplKernelManager {
 			this.appendKernelDiagnostic("protocol repair restore failed; discarding replacement kernel");
 			this.killChildToIdle("repair_kill");
 			// The snapshot is the declared culprit; the lazy path must not retry it.
-			this.pendingRestore = false;
+			this.clearPendingRestore();
 			return;
 		}
 
@@ -1062,13 +1359,30 @@ export class ReplKernelManager {
 
 	/** Restore (one-shot, best-effort) then bootstrap the lazily started fresh kernel. */
 	private async reprovisionFreshKernel(code: string | undefined): Promise<boolean> {
-		if (this.options.snapshot && this.pendingRestore) {
+		try {
+			return await this.runReprovision(code);
+		} finally {
+			// The sequence is over either way: a kernel that serves cells again must not keep
+			// excusing a silent turn, and the next death has to open a window of its own.
+			this.closeReprovisionWindow();
+		}
+	}
+
+	private async runReprovision(code: string | undefined): Promise<boolean> {
+		if (this.options.snapshot && this.pendingRestore && !this.restoreTimedOut) {
 			await this.performRestore(true); // clears pendingRestore on success
 			// Corrupted during the restore: the spawned repair owns the kernel now.
 			if (this.protocolRepairPromise || this.state !== "running") return false;
 			// One attempt per discard: a clean restore failure falls back to an
-			// empty namespace (ordinary startup semantics), never a retry loop.
-			this.pendingRestore = false;
+			// empty namespace (ordinary startup semantics), never a retry loop. A restore that
+			// only timed out is not retried per cell either (that would tax every cell with two
+			// timeouts); it stays owed, keeps snapshot writes paused, and is retried on the next
+			// kernel start.
+			this.clearPendingRestore();
+		} else if (this.pendingRestore && !this.options.snapshot) {
+			// A session without a snapshot target has nothing to revive: leaving the window open
+			// would keep the revival vouch alive for a kernel that is already serving cells.
+			this.clearPendingRestore();
 		}
 		if (!code || !this.pendingRebootstrap) return true;
 		const ok = await this.bootstrapRepairedKernel(code);
@@ -1076,12 +1390,31 @@ export class ReplKernelManager {
 		return ok;
 	}
 
+	/**
+	 * Open the reprovisioning window. One call arms both facts (L10.4): the snapshot write policy
+	 * refuses to overwrite a payload this namespace has not caught up with, and the stall
+	 * watchdog's revival vouch excuses silence while the replacement is being built.
+	 */
+	private armReprovisionWindow(): void {
+		this.pendingRestore = true;
+		this.reprovisionWindowSince ??= Date.now();
+	}
+
+	/** The namespace caught up, or the payload is no longer owed; the vouch window stays open. */
+	private clearPendingRestore(): void {
+		this.pendingRestore = false;
+	}
+
+	/** End the vouch window, so the next death opens a fresh one instead of inheriting this age. */
+	private closeReprovisionWindow(): void {
+		this.reprovisionWindowSince = undefined;
+	}
+
 	/** Kill the current child and settle at clean idle, so the next start spawns fresh. */
 	private killChildToIdle(origin: "repair_kill" | "bootstrap_fail_kill"): void {
 		// The discarded kernel carried the runtime bootstrap and (possibly) the
 		// restored namespace; a lazily started replacement must reprovision both.
 		this.pendingRebootstrap = true;
-		this.pendingRestore = true;
 		// Tagged before the kill: by the time the exit event is delivered this call has already
 		// put the state back to "idle" and bumped the generation, so nothing else can tell a
 		// protocol repair from a crash.
@@ -1089,6 +1422,9 @@ export class ReplKernelManager {
 		this.state = "shutdown";
 		liveKernels.delete(this);
 		this.cleanupResources("SIGKILL");
+		// Armed after the teardown: cleanupResources closes the window, and a discarded kernel
+		// owes its replacement both a restore and a bootstrap.
+		this.armReprovisionWindow();
 		this.state = "idle";
 	}
 
@@ -1300,9 +1636,13 @@ export class ReplKernelManager {
 		if (opts.signal?.aborted) {
 			return { stdout: "", stderr: "", status: "aborted", durationMs: 0 };
 		}
+		// A fail-closed session re-arms itself when its budget window expires (L3), and the
+		// check has to run before start(): a spent budget leaves the state at "shutdown", which
+		// start() would otherwise treat as a permanent verdict.
+		this.rearmIfRestartBudgetWindowExpired();
 		await this.start({ signal: opts.signal });
 		if ((this.state as string) === "shutdown") {
-			throw new Error("Kernel has been shut down");
+			throw this.terminalRequestError();
 		}
 		if (this.flushingSnapshotForDispose && !opts.internal) {
 			throw new Error("Kernel is shutting down");
@@ -1335,7 +1675,7 @@ export class ReplKernelManager {
 				return { stdout: "", stderr: "", status: "aborted", durationMs: Date.now() - started };
 			}
 			if ((this.state as string) === "shutdown") {
-				throw new Error("Kernel has been shut down");
+				throw this.terminalRequestError();
 			}
 			// A repair started while this request was queued or busy-waiting: release
 			// the slot so the repair's own restore can run, then requeue behind it.
@@ -1389,15 +1729,19 @@ export class ReplKernelManager {
 			diffs: [],
 			attachments: [],
 			sentAgentMessages: [],
-			backgroundOutput: this.pendingBackgroundOutput,
-			backgroundOutputTruncated: this.pendingBackgroundOutputTruncated,
+			// An internal (host-synthesized) cell never reaches the model, so it must not drain
+			// the buffer the next real cell is supposed to see.
+			backgroundOutput: opts.internal ? "" : this.pendingBackgroundOutput,
+			backgroundOutputTruncated: opts.internal ? false : this.pendingBackgroundOutputTruncated,
 			status: "ok",
 			settled: false,
 			resolve: result.resolve,
 			reject: result.reject,
 		};
-		this.pendingBackgroundOutput = "";
-		this.pendingBackgroundOutputTruncated = false;
+		if (!opts.internal) {
+			this.pendingBackgroundOutput = "";
+			this.pendingBackgroundOutputTruncated = false;
+		}
 		let abortTimer: ReturnType<typeof globalThis.setTimeout> | undefined;
 		const clearAbortTimer = () => {
 			if (abortTimer) {
@@ -1455,7 +1799,9 @@ export class ReplKernelManager {
 	private appendBackgroundOutput(text: string): void {
 		if (!text) return;
 		const execution = this.activeExecution;
-		if (execution) {
+		// Output arriving during an internal cell (snapshot, restore, bootstrap) is still
+		// unattributed as far as the model is concerned: keep it for the next cell it sees.
+		if (execution && !execution.opts.internal) {
 			if (execution.backgroundOutput.length >= MAX_BACKGROUND_OUTPUT_CHARS) {
 				execution.backgroundOutputTruncated = true;
 				return;
@@ -1612,7 +1958,7 @@ export class ReplKernelManager {
 		const started = Date.now();
 		while (this.activeExecution && Date.now() - started < KERNEL_BUSY_REUSE_WAIT_MS) {
 			if ((this.state as string) === "shutdown") {
-				throw new Error("Kernel has been shut down");
+				throw this.terminalRequestError();
 			}
 			void this.interrupt().catch(() => undefined);
 			const remaining = KERNEL_BUSY_REUSE_WAIT_MS - (Date.now() - started);
@@ -1642,6 +1988,7 @@ export class ReplKernelManager {
 
 		const signal = this.hostRequestController.signal;
 		const startedAt = Date.now();
+		const described = describeHostRequest(data);
 		// The handler starts on a microtask so the request is registered first: a handler that
 		// blocks before its first await is still counted, and still has an age, from the moment
 		// the request was accepted.
@@ -1670,7 +2017,11 @@ export class ReplKernelManager {
 				}
 			}
 		});
-		this.inFlightHostRequests.set(task, startedAt);
+		this.inFlightHostRequests.set(task, {
+			startedAt,
+			type: described.type,
+			...(described.label === undefined ? {} : { label: described.label }),
+		});
 		void task.finally(() => {
 			this.inFlightHostRequests.delete(task);
 		});
@@ -1708,16 +2059,26 @@ export class ReplKernelManager {
 		await this.writeLine({ type: "interrupt", id: requestId });
 	}
 
-	private cleanupResources(killSignal: NodeJS.Signals = "SIGTERM"): void {
+	private cleanupResources(
+		killSignal: NodeJS.Signals = "SIGTERM",
+		options: { keepHostRequests?: boolean; keepBackgroundOutput?: boolean; activeExecutionError?: Error } = {},
+	): void {
 		this.startGeneration++; // any teardown invalidates in-flight starts
-		this.abortHostRequests("IPython kernel stopped");
+		// A teardown ends the revival window: what comes next either arms a new one (a revival, a
+		// discarded repair kernel) or is a kernel the host closed on purpose, which must not vouch.
+		this.closeReprovisionWindow();
+		// A revival keeps the admitted host work alive; every real teardown cancels it (I-11).
+		if (!options.keepHostRequests) this.abortHostRequests("IPython kernel stopped");
 		this.clearSnapshotTimer();
 		this.lateSentAgentMessageHandlers.clear();
 		this.pendingDoneWaiters.clear();
-		// Stale pre-teardown background output must not surface after a restart.
-		this.pendingBackgroundOutput = "";
-		this.pendingBackgroundOutputTruncated = false;
-		this.rejectActiveExecution(new Error("Kernel has been shut down"));
+		if (!options.keepBackgroundOutput) {
+			// Stale pre-teardown background output must not surface after a restart. A revival
+			// keeps it: an orphan thread's last words are evidence about the death, not noise.
+			this.pendingBackgroundOutput = "";
+			this.pendingBackgroundOutputTruncated = false;
+		}
+		this.rejectActiveExecution(options.activeExecutionError ?? new Error("Kernel has been shut down"));
 		const child = this.child;
 		this.child = undefined;
 		this.readyDeferred = undefined;
@@ -1809,6 +2170,7 @@ export class ReplKernelManager {
 	}
 
 	private async performShutdown(opts: KernelShutdownOptions): Promise<boolean> {
+		this.disposedByHost = true;
 		if (this.state === "shutdown") {
 			this.intentionalExitOrigin = "shutdown";
 			liveKernels.delete(this);
@@ -1954,6 +2316,9 @@ export class ReplKernelManager {
 		try {
 			const performedCleanup = await this.shutdown();
 			if (!performedCleanup) return;
+			// An explicit restart is the host asking for a kernel again, so the teardown it just
+			// performed does not stand as a permanent verdict.
+			this.disposedByHost = false;
 			this.state = "idle";
 			this.kernelStderr = "";
 			await this.start();
@@ -1966,6 +2331,7 @@ export class ReplKernelManager {
 		this.supersedeProtocolRepair();
 		this.abortHostRequests("IPython kernel killed");
 		this.intentionalExitOrigin = "kill";
+		this.disposedByHost = true;
 		this.state = "shutdown";
 		liveKernels.delete(this);
 		this.cleanupResources("SIGKILL");
@@ -2091,24 +2457,72 @@ export class ReplKernelManager {
 		return this.performRestore(false);
 	}
 
-	/** Every restore (resume and repair alike) is bounded so a stalled kernel cannot wedge it. */
+	/**
+	 * Every restore (resume and repair alike) is bounded so a stalled kernel cannot wedge it.
+	 *
+	 * A bound that trips is a *slow* payload, not a corrupt one (B5): a cold read of a large
+	 * snapshot can outlast the ordinary repair budget, and renaming the payload aside because it
+	 * was slow would destroy good state to answer a timeout. So a timeout retries once with the
+	 * longer window and never isolates; only a payload that actually failed to load is isolated.
+	 */
 	private async performRestore(protocolRepair: boolean): Promise<RestoreResult | null> {
 		const cfg = this.options.snapshot;
 		if (!cfg) return null;
+		const timeoutMs = cfg.restoreTimeoutMs ?? REPAIR_STEP_TIMEOUT_MS;
+		const first = await this.runRestoreAttempt(cfg, protocolRepair, timeoutMs);
+		this.lastRestoreTimedOut = first.timedOut;
+		this.lastRestoreResult = first.result;
+		if (!first.timedOut) {
+			this.lastRestoreRetried = false;
+			return first.result;
+		}
+		const retryMs = cfg.restoreRetryTimeoutMs ?? timeoutMs * RESTORE_RETRY_TIMEOUT_MULTIPLIER;
+		this.appendKernelDiagnostic(
+			`state restore timed out after ${timeoutMs}ms; keeping the snapshot in place and retrying with ${retryMs}ms`,
+		);
+		const retry = await this.runRestoreAttempt(cfg, protocolRepair, retryMs);
+		this.lastRestoreRetried = true;
+		this.lastRestoreTimedOut = retry.timedOut;
+		this.lastRestoreResult = retry.result;
+		if (retry.timedOut) {
+			// Still owed: writes stay paused so the newer payload on disk is not overwritten by a
+			// namespace that never caught up with it, and the notice tells the model so.
+			this.restoreTimedOut = true;
+			this.appendKernelDiagnostic(
+				`state restore timed out again after ${retryMs}ms; the snapshot is kept and stays unrestored`,
+			);
+		}
+		return retry.result;
+	}
+
+	/** One bounded restore request. `timedOut` distinguishes a slow payload from a broken one. */
+	private async runRestoreAttempt(
+		cfg: NonNullable<KernelManagerOptions["snapshot"]>,
+		protocolRepair: boolean,
+		timeoutMs: number,
+	): Promise<{ result: RestoreResult | null; timedOut: boolean }> {
 		try {
 			const r = await this.enqueueRequest(
 				{ type: "restore", path: cfg.path },
 				"",
 				{ internal: true, protocolRepair },
-				REPAIR_STEP_TIMEOUT_MS,
+				timeoutMs,
 			);
-			if (r.status !== "ok" || !r.doneFields) {
-				const reason = r.status === "aborted" ? "timed out" : "failed";
-				this.appendKernelDiagnostic(`state restore ${reason}: ${r.error?.evalue ?? r.stderr}`);
-				this.isolateFailedSnapshot(cfg, r.error?.evalue ?? r.stderr ?? reason);
-				return null;
+			if (r.status === "aborted") {
+				this.appendKernelDiagnostic(`state restore timed out after ${timeoutMs}ms`);
+				return { result: null, timedOut: true };
 			}
-			this.pendingRestore = false;
+			if (r.status !== "ok" || !r.doneFields) {
+				const reason = r.error?.evalue ?? r.stderr ?? "failed";
+				this.appendKernelDiagnostic(`state restore failed: ${reason}`);
+				this.isolateFailedSnapshot(cfg, reason);
+				return { result: null, timedOut: false };
+			}
+			this.restoreTimedOut = false;
+			// The namespace caught up with the payload, so a write block left behind by an
+			// earlier failed or timed-out load has nothing left to protect.
+			this.restoreWriteBlocked = false;
+			this.clearPendingRestore();
 			const restored = asStringArray(r.doneFields.restored);
 			const failed = asReasonArray(r.doneFields.failed);
 			// A partial revive no longer freezes persistence. The names that did not come back
@@ -2119,11 +2533,14 @@ export class ReplKernelManager {
 			this.unrestoredNames.clear();
 			for (const failure of failed) this.unrestoredNames.add(failure.name);
 			const snapshotPolicy = this.currentSnapshotPolicyAfterRestore(failed.length);
-			return { restored, failed, path: cfg.path, ...(snapshotPolicy ? { snapshotPolicy } : {}) };
+			return {
+				result: { restored, failed, path: cfg.path, ...(snapshotPolicy ? { snapshotPolicy } : {}) },
+				timedOut: false,
+			};
 		} catch (error) {
 			this.appendKernelDiagnostic(`state restore error: ${errorMessage(error)}`);
 			this.isolateFailedSnapshot(cfg, errorMessage(error));
-			return null;
+			return { result: null, timedOut: false };
 		}
 	}
 
@@ -2132,7 +2549,8 @@ export class ReplKernelManager {
 		try {
 			const isolated = isolateCorruptSnapshot(cfg.path, cfg.manifestPath);
 			this.restoreWriteBlocked = false;
-			this.pendingRestore = false;
+			this.restoreTimedOut = false;
+			this.clearPendingRestore();
 			// The payload that held those names is gone; nothing is left to preserve.
 			this.unrestoredNames.clear();
 			const isolatedPath = isolated.isolatedPath ?? `${cfg.path} (missing)`;
@@ -2144,6 +2562,7 @@ export class ReplKernelManager {
 			});
 		} catch (error) {
 			this.restoreWriteBlocked = true;
+			this.restoreTimedOut = false;
 			this.appendKernelDiagnostic(
 				`state restore failed; could not isolate snapshot at ${cfg.path}: ${errorMessage(error)}`,
 			);
@@ -2253,6 +2672,7 @@ export class ReplKernelManager {
 		this.supersedeProtocolRepair();
 		this.abortHostRequests("IPython kernel disposed");
 		this.intentionalExitOrigin = "dispose_sync";
+		this.disposedByHost = true;
 		this.state = "shutdown";
 		liveKernels.delete(this);
 		this.cleanupResources();

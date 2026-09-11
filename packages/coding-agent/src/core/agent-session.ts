@@ -169,7 +169,12 @@ import {
 	validateGoalBudget,
 	validateGoalObjective,
 } from "./goals.js";
-import type { HostRequestHandlers, KernelDeathCause, KernelSentAgentMessage } from "./kernel/index.js";
+import type {
+	HostRequestHandlers,
+	KernelDeathCause,
+	KernelSentAgentMessage,
+	KernelUnexpectedExitFacts,
+} from "./kernel/index.js";
 import { type RestoreResult, restoreNoticeLines, snapshotPathIn } from "./kernel/state-snapshot.js";
 import type { AcpMcpServerConfig } from "./mcp/acp-mcp-types.js";
 import type { McpManager } from "./mcp/mcp-manager.js";
@@ -1094,6 +1099,8 @@ interface RlmSubagentModelSelection {
 const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
 /** How much of a dead kernel's stderr tail the session log keeps; the ring itself holds 8 KiB. */
 const KERNEL_DEATH_STDERR_LOG_CHARS = 1024;
+/** Two unexpected exits this close together are a crash loop, not bad luck (F2). */
+const KERNEL_FAST_RESTART_GAP_MS = 60_000;
 const SESSION_PERSIST_FAILURE_REPORT_BASE_MS = 30_000;
 const SESSION_PERSIST_FAILURE_REPORT_MAX_MS = 300_000;
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
@@ -3981,6 +3988,8 @@ export class AgentSession {
 			kernel: () =>
 				this._stallKernelLivenessFacts ? this._stallKernelLivenessFacts() : this._kernelLivenessFactsFromClient(),
 			...(this._stallJournaledBashHandles ? { readJournaledBashHandles: this._stallJournaledBashHandles } : {}),
+			// Read live so an operator can widen or disable the bound without a new session (B7).
+			revivalVouchMaxAgeMs: () => this.settingsManager.getKernelRestartSettings().revivalVouchMaxAgeMs,
 			onEvent: (event) => this._handleTurnLivenessEvent(event),
 		});
 	}
@@ -4004,6 +4013,7 @@ export class AgentSession {
 			hostRequestOldestAgeMs: kernel.hostRequestOldestAgeMs,
 			kernelPid: kernel.kernelPid,
 			hasActiveExecution: kernel.hasActiveExecution,
+			...(kernel.revivalVouch ? { revival: kernel.revivalVouch } : {}),
 		};
 	}
 
@@ -8851,14 +8861,57 @@ export class AgentSession {
 	 * process, so this line is the only per-session trace of the cause (code/signal/origin), and
 	 * the origin is what keeps a protocol-repair kill out of the crash statistics.
 	 */
-	private _reportUnexpectedKernelExit(cause: KernelDeathCause): void {
-		sessionLog.error("kernel exited unexpectedly", {
+	private _reportUnexpectedKernelExit(cause: KernelDeathCause, facts: KernelUnexpectedExitFacts): void {
+		const { decision, unresolvedHostRequests } = facts;
+		const fields = {
 			sessionId: this.sessionId,
 			code: cause.code,
 			signal: cause.signal,
 			origin: cause.origin,
 			stderrTail: cause.stderrTail.slice(-KERNEL_DEATH_STDERR_LOG_CHARS),
-		});
+			restartCount: decision.restartCount,
+			budgetRemaining: decision.budgetRemaining,
+			...(decision.sincePreviousMs === undefined ? {} : { sincePreviousMs: decision.sincePreviousMs }),
+			unresolvedHostRequests: unresolvedHostRequests.map((request) => request.type),
+		};
+		if (decision.exhausted) {
+			// Appendix B signature: an unattended session in this state produces nothing but
+			// errors until the window expires or a human reloads it, so it has to be countable.
+			sessionLog.error("kernel budget exhausted", {
+				...fields,
+				windowMinutes: Math.round(decision.windowMs / 60_000),
+				scheduledJobs: this._hasScheduledWork(),
+			});
+			return;
+		}
+		sessionLog.error("kernel exited unexpectedly", fields);
+		if (!decision.revive) return;
+		// F2: the burn is observable per revival, and a crash loop is louder than one crash.
+		const line = {
+			sessionId: this.sessionId,
+			restartCount: decision.restartCount,
+			budgetRemaining: decision.budgetRemaining,
+			lastOrigin: cause.origin,
+		};
+		if (decision.sincePreviousMs !== undefined && decision.sincePreviousMs < KERNEL_FAST_RESTART_GAP_MS) {
+			sessionLog.warn("kernel restarts are coming fast; the budget will fail the session closed", line);
+			return;
+		}
+		sessionLog.info("kernel revival armed", line);
+	}
+
+	/**
+	 * Whether anything can start a turn in this session without a human (a heartbeat or cron
+	 * job). An unattended session that fails closed burns tokens on errors nobody reads, so the
+	 * budget-exhausted signature carries the fact.
+	 */
+	private _hasScheduledWork(): boolean {
+		try {
+			const jobs = this._rlmHeartbeatController?.listRlmHeartbeats();
+			return (jobs ?? []).some((job) => job.status === "active");
+		} catch {
+			return false;
+		}
 	}
 
 	setSteeringMode(mode: "all" | "one-at-a-time"): void {
@@ -10796,7 +10849,11 @@ export class AgentSession {
 				snapshotDir: this._ipythonKernelSnapshotDir,
 				readyGate: previousDispose,
 				onRestore: notifyRestore ? (result) => this._onIpythonStateRestored(result) : undefined,
-				onUnexpectedExit: (cause) => this._reportUnexpectedKernelExit(cause),
+				onUnexpectedExit: (cause, facts) => this._reportUnexpectedKernelExit(cause, facts),
+				restartPolicy: () => {
+					const restart = this.settingsManager.getKernelRestartSettings();
+					return { maxRestarts: restart.maxUnexpectedRestarts, windowMs: restart.windowMs };
+				},
 			});
 			configuredBaseToolDefinitions = createAllToolDefinitions(this._cwd, {
 				ipython: {
