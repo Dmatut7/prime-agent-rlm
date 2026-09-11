@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+	activeKernelVenvDir,
 	DEFAULT_RLM_EXTRA_IMPORT_NAMES,
 	DEFAULT_RLM_EXTRA_UV_ARGS,
 	ensureKernelPython,
@@ -29,7 +30,7 @@ function writeBootstrapVersion(venv: string, pythonSkills: readonly KernelPython
 	writeFileSync(
 		join(venv, ".bootstrap-version"),
 		`${JSON.stringify({
-			schema: 9,
+			schema: 10,
 			runtime: runtimeIdentity,
 			snapshot: "dill",
 			extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
@@ -175,8 +176,11 @@ describe("kernel bootstrap", () => {
 
 	it("bootstraps a missing venv with uv, prime-agent-runtime, and default extra packages", async () => {
 		const logPath = installFakeUv();
-		const venv = join(tempDir, "kernel-venv");
-		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+		const base = join(tempDir, "kernel-venv");
+		// Bootstrap builds into a generation directory next to the base; the base itself
+		// only names the family and holds the lock.
+		const venv = await activeKernelVenvDir(base);
+		process.env.PRIME_AGENT_KERNEL_VENV = base;
 
 		await expect(ensureKernelPython()).resolves.toBe(join(venv, "bin", "python"));
 
@@ -192,7 +196,7 @@ describe("kernel bootstrap", () => {
 		}
 		const version = JSON.parse(readFileSync(join(venv, ".bootstrap-version"), "utf8"));
 		expect(version).toEqual({
-			schema: 9,
+			schema: 10,
 			runtime: runtimeIdentity,
 			snapshot: "dill",
 			extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
@@ -203,9 +207,12 @@ describe("kernel bootstrap", () => {
 
 	it("routes bootstrap progress through the provided callback", async () => {
 		installFakeUv();
-		const venv = join(tempDir, "kernel-venv");
+		const base = join(tempDir, "kernel-venv");
+		// Bootstrap builds into a generation directory next to the base; the base itself
+		// only names the family and holds the lock.
+		const venv = await activeKernelVenvDir(base);
 		const progress: string[] = [];
-		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+		process.env.PRIME_AGENT_KERNEL_VENV = base;
 		const stderrWrite = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 
 		try {
@@ -223,9 +230,12 @@ describe("kernel bootstrap", () => {
 
 	it("installs Python skills into the bootstrapped venv", async () => {
 		const logPath = installFakeUv();
-		const venv = join(tempDir, "kernel-venv");
+		const base = join(tempDir, "kernel-venv");
+		// Bootstrap builds into a generation directory next to the base; the base itself
+		// only names the family and holds the lock.
+		const venv = await activeKernelVenvDir(base);
 		const pythonSkill = createPythonSkill();
-		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+		process.env.PRIME_AGENT_KERNEL_VENV = base;
 
 		await expect(ensureKernelPython({ pythonSkills: [pythonSkill] })).resolves.toBe(join(venv, "bin", "python"));
 
@@ -244,10 +254,13 @@ describe("kernel bootstrap", () => {
 
 	it("installs sibling Python skill dependencies with dependent editable packages", async () => {
 		const logPath = installFakeUv();
-		const venv = join(tempDir, "kernel-venv");
+		const base = join(tempDir, "kernel-venv");
+		// Bootstrap builds into a generation directory next to the base; the base itself
+		// only names the family and holds the lock.
+		const venv = await activeKernelVenvDir(base);
 		const dependencySkill = createPythonSkill("agent-observe");
 		const dependentSkill = createPythonSkillWithDependency("orchestration-heartbeat", "agent-observe");
-		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+		process.env.PRIME_AGENT_KERNEL_VENV = base;
 
 		await expect(ensureKernelPython({ pythonSkills: [dependentSkill] })).resolves.toBe(join(venv, "bin", "python"));
 
@@ -273,7 +286,10 @@ describe("kernel bootstrap", () => {
 
 	it("installs sibling Python skill dependencies when package and directory names differ", async () => {
 		const logPath = installFakeUv();
-		const venv = join(tempDir, "kernel-venv");
+		const base = join(tempDir, "kernel-venv");
+		// Bootstrap builds into a generation directory next to the base; the base itself
+		// only names the family and holds the lock.
+		const venv = await activeKernelVenvDir(base);
 		const dependencySkill = createPythonSkill("attach-image");
 		writeFileSync(
 			dependencySkill.pyprojectPath,
@@ -286,7 +302,7 @@ version = "0.1.0"
 			"orchestration-heartbeat",
 			"prime-agent-skill-attach-image",
 		);
-		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+		process.env.PRIME_AGENT_KERNEL_VENV = base;
 
 		await expect(ensureKernelPython({ pythonSkills: [dependentSkill] })).resolves.toBe(join(venv, "bin", "python"));
 
@@ -297,10 +313,13 @@ version = "0.1.0"
 
 	it("parses Python skill dependencies with extras", async () => {
 		const logPath = installFakeUv();
-		const venv = join(tempDir, "kernel-venv");
+		const base = join(tempDir, "kernel-venv");
+		// Bootstrap builds into a generation directory next to the base; the base itself
+		// only names the family and holds the lock.
+		const venv = await activeKernelVenvDir(base);
 		const dependencySkill = createPythonSkill("gidgethub");
 		const dependentSkill = createPythonSkillWithDependency("orchestration-heartbeat", "gidgethub[httpx]>4.0.0");
-		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+		process.env.PRIME_AGENT_KERNEL_VENV = base;
 
 		await expect(ensureKernelPython({ pythonSkills: [dependentSkill] })).resolves.toBe(join(venv, "bin", "python"));
 
@@ -311,7 +330,10 @@ version = "0.1.0"
 
 	it("syncs a warm venv when a Python skill pyproject changes", async () => {
 		const logPath = installFakeUv();
-		const venv = join(tempDir, "kernel-venv");
+		const base = join(tempDir, "kernel-venv");
+		// Bootstrap builds into a generation directory next to the base; the base itself
+		// only names the family and holds the lock.
+		const venv = await activeKernelVenvDir(base);
 		const python = join(venv, "bin", "python");
 		const pythonSkill = createPythonSkill();
 		mkdirSync(join(venv, "bin"), { recursive: true });
@@ -325,7 +347,7 @@ version = "0.1.0"
 dependencies = ["httpx"]
 `,
 		);
-		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+		process.env.PRIME_AGENT_KERNEL_VENV = base;
 
 		await expect(ensureKernelPython({ pythonSkills: [pythonSkill] })).resolves.toBe(python);
 
@@ -338,10 +360,13 @@ dependencies = ["httpx"]
 
 	it("continues when a Python skill editable install fails and retries it next startup", async () => {
 		const logPath = installFakeUv();
-		const venv = join(tempDir, "kernel-venv");
+		const base = join(tempDir, "kernel-venv");
+		// Bootstrap builds into a generation directory next to the base; the base itself
+		// only names the family and holds the lock.
+		const venv = await activeKernelVenvDir(base);
 		const goodSkill = createPythonSkill("good-skill");
 		const brokenSkill = createPythonSkill("broken-skill");
-		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+		process.env.PRIME_AGENT_KERNEL_VENV = base;
 		process.env.UV_FAIL_ARG = brokenSkill.packagePath;
 
 		await expect(ensureKernelPython({ pythonSkills: [goodSkill, brokenSkill] })).resolves.toBe(
@@ -374,7 +399,10 @@ dependencies = ["httpx"]
 
 	it("rebuilds a warm venv with legacy unhashed Python skill manifest entries", async () => {
 		const logPath = installFakeUv();
-		const venv = join(tempDir, "kernel-venv");
+		const base = join(tempDir, "kernel-venv");
+		// Bootstrap builds into a generation directory next to the base; the base itself
+		// only names the family and holds the lock.
+		const venv = await activeKernelVenvDir(base);
 		const python = join(venv, "bin", "python");
 		const pythonSkill = createPythonSkill();
 		mkdirSync(join(venv, "bin"), { recursive: true });
@@ -394,7 +422,7 @@ dependencies = ["httpx"]
 				],
 			})}\n`,
 		);
-		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+		process.env.PRIME_AGENT_KERNEL_VENV = base;
 
 		await expect(ensureKernelPython()).resolves.toBe(python);
 
@@ -403,9 +431,12 @@ dependencies = ["httpx"]
 
 	it("shares concurrent bootstrap work in one process", async () => {
 		const logPath = installFakeUv();
-		const venv = join(tempDir, "kernel-venv");
+		const base = join(tempDir, "kernel-venv");
+		// Bootstrap builds into a generation directory next to the base; the base itself
+		// only names the family and holds the lock.
+		const venv = await activeKernelVenvDir(base);
 		const python = join(venv, "bin", "python");
-		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+		process.env.PRIME_AGENT_KERNEL_VENV = base;
 
 		await expect(Promise.all([ensureKernelPython(), ensureKernelPython()])).resolves.toEqual([python, python]);
 
@@ -414,33 +445,39 @@ dependencies = ["httpx"]
 	});
 
 	it("reuses a current warm venv without invoking uv", async () => {
-		const venv = join(tempDir, "kernel-venv");
+		const base = join(tempDir, "kernel-venv");
+		// Bootstrap builds into a generation directory next to the base; the base itself
+		// only names the family and holds the lock.
+		const venv = await activeKernelVenvDir(base);
 		const python = join(venv, "bin", "python");
 		mkdirSync(join(venv, "bin"), { recursive: true });
 		writeFakePython(python, ["rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
 		writeBootstrapVersion(venv);
-		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+		process.env.PRIME_AGENT_KERNEL_VENV = base;
 
 		await expect(ensureKernelPython()).resolves.toBe(python);
 	});
 
 	it("rebuilds a warm venv whose recorded runtime hash no longer matches local source", async () => {
 		const logPath = installFakeUv();
-		const venv = join(tempDir, "kernel-venv");
+		const base = join(tempDir, "kernel-venv");
+		// Bootstrap builds into a generation directory next to the base; the base itself
+		// only names the family and holds the lock.
+		const venv = await activeKernelVenvDir(base);
 		const python = join(venv, "bin", "python");
 		mkdirSync(join(venv, "bin"), { recursive: true });
 		writeFakePython(python, ["rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
 		writeFileSync(
 			join(venv, ".bootstrap-version"),
 			`${JSON.stringify({
-				schema: 9,
+				schema: 10,
 				runtime: "sha256:stale",
 				snapshot: "dill",
 				extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
 				pythonSkills: [],
 			})}\n`,
 		);
-		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+		process.env.PRIME_AGENT_KERNEL_VENV = base;
 
 		await expect(ensureKernelPython()).resolves.toBe(python);
 
@@ -451,7 +488,10 @@ dependencies = ["httpx"]
 
 	it("rebuilds a warm venv with a stale rlm runtime", async () => {
 		const logPath = installFakeUv();
-		const venv = join(tempDir, "kernel-venv");
+		const base = join(tempDir, "kernel-venv");
+		// Bootstrap builds into a generation directory next to the base; the base itself
+		// only names the family and holds the lock.
+		const venv = await activeKernelVenvDir(base);
 		const python = join(venv, "bin", "python");
 		mkdirSync(join(venv, "bin"), { recursive: true });
 		writeExecutable(
@@ -469,7 +509,7 @@ dependencies = ["httpx"]
 			].join("\n"),
 		);
 		writeBootstrapVersion(venv);
-		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+		process.env.PRIME_AGENT_KERNEL_VENV = base;
 
 		await expect(ensureKernelPython()).resolves.toBe(python);
 
@@ -478,10 +518,13 @@ dependencies = ["httpx"]
 
 	it("rebuilds a broken venv", async () => {
 		const logPath = installFakeUv();
-		const venv = join(tempDir, "kernel-venv");
+		const base = join(tempDir, "kernel-venv");
+		// Bootstrap builds into a generation directory next to the base; the base itself
+		// only names the family and holds the lock.
+		const venv = await activeKernelVenvDir(base);
 		mkdirSync(join(venv, "bin"), { recursive: true });
 		writeBootstrapVersion(venv);
-		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+		process.env.PRIME_AGENT_KERNEL_VENV = base;
 
 		await expect(ensureKernelPython()).resolves.toBe(join(venv, "bin", "python"));
 

@@ -9,9 +9,19 @@ import { createInterface } from "node:readline/promises";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { getPackageDir } from "../../config.js";
+import { readKernelBootstrapSettings } from "../settings-manager.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
+import {
+	decideKernelVenvRebuild,
+	generationDirForSuffix,
+	KernelVenvRebuildDeferredError,
+	kernelVenvDirForPython,
+	kernelVenvGenerationSuffix,
+	pruneKernelVenvGenerations,
+	readKernelVenvInUseState,
+} from "./venv-in-use.js";
 
-const BOOTSTRAP_SCHEMA = 9;
+const BOOTSTRAP_SCHEMA = 10;
 const PYTHON_VERSION = "3.11";
 const RUNTIME_REQUIREMENT = "prime-agent-runtime";
 // Serializes the kernel's user namespace so it can be revived across session
@@ -56,7 +66,16 @@ const BOOTSTRAP_LOCK_NAME = ".bootstrap.lock";
 const BOOTSTRAP_LOCK_RETRY_MS = 100;
 const BOOTSTRAP_LOCK_STALE_WITHOUT_PID_MS = 30_000;
 
-let inFlightEnsureKernelPython: { key: string; promise: Promise<string> } | null = null;
+interface InFlightBootstrap {
+	key: string;
+	promise: Promise<string>;
+	/** Aborts the shared boot once every attached caller has aborted. */
+	controller: AbortController;
+	waiters: number;
+	aborted: number;
+}
+
+let inFlightEnsureKernelPython: InFlightBootstrap | null = null;
 
 export type KernelPythonSkill = PythonSkillRuntimeInfo;
 export type KernelBootstrapProgressHandler = (message: string) => void;
@@ -64,9 +83,21 @@ export type KernelBootstrapProgressHandler = (message: string) => void;
 export interface EnsureKernelPythonOptions {
 	pythonSkills?: readonly KernelPythonSkill[];
 	onProgress?: KernelBootstrapProgressHandler;
+	/**
+	 * Cancels the wait for the bootstrap lock and the installs it guards. Sessions in one
+	 * process share one memoized bootstrap, so the work is cancelled only once every caller
+	 * attached to it has aborted (see {@link ensureKernelPython}).
+	 */
+	signal?: AbortSignal;
+	/**
+	 * Bound for waiting on the bootstrap lock, in milliseconds; 0 waits forever. Defaults to
+	 * the `kernelBootstrap.lockTimeoutMs` setting, read when the wait actually starts.
+	 */
+	lockTimeoutMs?: number;
 }
 
-interface BootstrapPythonSkill {
+/** One Python skill as recorded in the venv's `.bootstrap-version` manifest. */
+export interface BootstrapPythonSkill {
 	importName: string;
 	packagePath: string;
 	pyprojectPath: string;
@@ -79,6 +110,40 @@ interface BootstrapVersion {
 	snapshot?: string;
 	extraUvArgs?: string[];
 	pythonSkills?: BootstrapPythonSkill[];
+}
+
+/**
+ * The bootstrap lock stayed held past its bound. Thrown instead of waiting forever: an
+ * unbounded wait here is invisible to the user (the session shows "Starting Python
+ * kernel...") until the stall watchdog aborts the turn minutes later. The message has to
+ * carry a way out, because turning "slow" into "failed" is only acceptable if the failure
+ * is actionable.
+ */
+export class KernelBootstrapLockTimeoutError extends Error {
+	readonly lockDir: string;
+	readonly waitedMs: number;
+	readonly holderPid: number | null;
+
+	constructor(lockDir: string, waitedMs: number, holderPid: number | null) {
+		super(
+			`Timed out after ${Math.round(waitedMs / 1000)}s waiting for the kernel venv bootstrap lock at ${lockDir}` +
+				`${holderPid === null ? " (holder pid unknown)" : ` (held by pid ${holderPid})`}. ` +
+				"Another prime-agent process is preparing the Python kernel there: wait for it, stop it, or remove that lock directory if it is wedged. " +
+				"Raise kernelBootstrap.lockTimeoutMs in settings to wait longer (0 waits forever), or set PRIME_AGENT_KERNEL_PYTHON to a Python with a current prime-agent-runtime and default Python packages installed to skip auto-bootstrap.",
+		);
+		this.name = "KernelBootstrapLockTimeoutError";
+		this.lockDir = lockDir;
+		this.waitedMs = waitedMs;
+		this.holderPid = holderPid;
+	}
+}
+
+/** Every session waiting on one shared bootstrap aborted, so the work was cancelled. */
+export class KernelBootstrapAbortedError extends Error {
+	constructor(detail: string) {
+		super(`Kernel venv bootstrap aborted: ${detail}`);
+		this.name = "KernelBootstrapAbortedError";
+	}
 }
 
 function errorMessage(error: unknown): string {
@@ -151,11 +216,14 @@ function normalizePythonSkills(pythonSkills: readonly KernelPythonSkill[] | unde
 	for (const skill of pythonSkills ?? []) {
 		addSkill(skill);
 	}
-	return [...byKey.values()].sort((a, b) => {
-		const packageCompare = a.packagePath.localeCompare(b.packagePath);
-		if (packageCompare !== 0) return packageCompare;
-		return a.importName.localeCompare(b.importName);
-	});
+	return [...byKey.values()].sort(compareBootstrapPythonSkills);
+}
+
+/** Stable record order, so the manifest stays byte-identical across boots. */
+function compareBootstrapPythonSkills(a: BootstrapPythonSkill, b: BootstrapPythonSkill): number {
+	const packageCompare = a.packagePath.localeCompare(b.packagePath);
+	if (packageCompare !== 0) return packageCompare;
+	return a.importName.localeCompare(b.importName);
 }
 
 function readTomlProjectSection(pyprojectPath: string): string | undefined {
@@ -369,14 +437,86 @@ async function resolveWritableKernelVenvDir(): Promise<string> {
 	}
 }
 
-function run(command: string, args: string[], options: { stdio?: "ignore" | "inherit" } = {}): Promise<void> {
+/**
+ * Everything that makes a built venv interchangeable. Two builds with the same key are
+ * the same generation; any difference (runtime source, bootstrap schema, snapshot
+ * requirement, default packages) gets its own directory, so a generation a kernel is
+ * running from is never rebuilt under it.
+ */
+function kernelVenvBuildIdentity(runtimeIdentity: string): string {
+	return JSON.stringify({
+		schema: BOOTSTRAP_SCHEMA,
+		runtime: runtimeIdentity,
+		snapshot: STATE_SNAPSHOT_REQUIREMENT,
+		extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
+	});
+}
+
+/**
+ * The generation directory for one runtime identity: `<base>-<12 hex>`. The base itself is
+ * never used as a venv any more; it only names the family and holds the bootstrap lock.
+ */
+export function kernelVenvDirForIdentity(base: string, runtimeIdentity: string): string {
+	return generationDirForSuffix(base, kernelVenvGenerationSuffix(kernelVenvBuildIdentity(runtimeIdentity)));
+}
+
+/** The generation directory this checkout's runtime identity resolves to. */
+export async function activeKernelVenvDir(base: string): Promise<string> {
+	return kernelVenvDirForIdentity(base, await resolveRuntimeIdentity());
+}
+
+/**
+ * The managed generation a kernel python path belongs to, or undefined for an interpreter
+ * bootstrap does not own (PRIME_AGENT_KERNEL_PYTHON, a project venv, or the legacy
+ * unsuffixed directory). Only managed generations carry the in-use references that keep a
+ * rebuild from deleting a live kernel's tree.
+ */
+export function managedKernelVenvDirForPython(python: string): string | undefined {
+	return kernelVenvDirForPython(python, [getKernelVenvDir(), getXdgKernelVenvDir()]);
+}
+
+/** Legacy venv directories already reported, so a boot mentions one at most once. */
+const reportedLegacyKernelVenvDirs = new Set<string>();
+
+/**
+ * The unsuffixed venv directory predates generations. Kernels spawned by older hosts run
+ * from it without leaving references, so "no references" is not evidence that it is free:
+ * it is never rebuilt, renamed, or deleted here, only reported.
+ */
+function reportLegacyKernelVenv(base: string, options: EnsureKernelPythonOptions): void {
+	if (!options.onProgress || reportedLegacyKernelVenvDirs.has(base)) return;
+	if (!existsSync(path.join(base, "pyvenv.cfg"))) return;
+	reportedLegacyKernelVenvDirs.add(base);
+	reportProgress(
+		options,
+		`note: ${base} is a pre-generation kernel venv that this build no longer uses; ` +
+			"remove it to reclaim the disk space once no older prime-agent host is running",
+	);
+}
+
+function run(
+	command: string,
+	args: string[],
+	options: { stdio?: "ignore" | "inherit"; signal?: AbortSignal } = {},
+): Promise<void> {
 	return new Promise((resolve, reject) => {
+		const cancelled = (): Error => new KernelBootstrapAbortedError(`${command} ${args.join(" ")} was cancelled`);
 		const child = spawn(command, args, {
 			env: process.env,
 			stdio: options.stdio ?? "ignore",
+			// Kills the child on abort, so a cancelled boot does not leave a uv install running.
+			signal: options.signal,
 		});
-		child.on("error", reject);
+		child.on("error", (error) => {
+			// An abort before or during spawn surfaces here as an AbortError; report the
+			// cancellation rather than the opaque underlying reason.
+			reject(options.signal?.aborted ? cancelled() : error);
+		});
 		child.on("exit", (code, signal) => {
+			if (options.signal?.aborted) {
+				reject(cancelled());
+				return;
+			}
 			if (code === 0) {
 				resolve();
 				return;
@@ -468,11 +608,27 @@ async function lockMissingPidIsStale(lockDir: string): Promise<boolean> {
 	}
 }
 
-async function acquireBootstrapLock(venv: string): Promise<() => Promise<void>> {
+/**
+ * Waits for the machine-wide bootstrap lock. Both exits are checked before every retry, so
+ * the wait is bounded by `timeoutMs` and interruptible by `signal`; it used to be neither,
+ * which is how a wedged holder turned one stuck kernel start into a session that only the
+ * 900s stall watchdog could end. Breaking a provably abandoned lock is unchanged.
+ */
+async function acquireBootstrapLock(
+	venv: string,
+	options: { signal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<() => Promise<void>> {
 	const lockDir = bootstrapLockDir(venv);
 	await mkdir(path.dirname(lockDir), { recursive: true });
 
+	const timeoutMs = options.timeoutMs ?? readKernelBootstrapSettings().lockTimeoutMs;
+	const startedAt = Date.now();
+	const deadline = Number.isFinite(timeoutMs) && timeoutMs > 0 ? startedAt + timeoutMs : undefined;
+
 	for (;;) {
+		if (options.signal?.aborted) {
+			throw new KernelBootstrapAbortedError(`every session waiting for the bootstrap lock at ${lockDir} aborted`);
+		}
 		try {
 			await mkdir(lockDir);
 			await writeFile(path.join(lockDir, "pid"), `${process.pid}\n`, "utf8");
@@ -484,6 +640,9 @@ async function acquireBootstrapLock(venv: string): Promise<() => Promise<void>> 
 			if (pid === null ? await lockMissingPidIsStale(lockDir) : !processIsRunning(pid)) {
 				await rm(lockDir, { recursive: true, force: true });
 				continue;
+			}
+			if (deadline !== undefined && Date.now() >= deadline) {
+				throw new KernelBootstrapLockTimeoutError(lockDir, Date.now() - startedAt, pid);
 			}
 
 			await sleep(BOOTSTRAP_LOCK_RETRY_MS);
@@ -523,7 +682,10 @@ async function ensureUv(options: EnsureKernelPythonOptions): Promise<string> {
 
 	reportProgress(options, "› installing uv (one-time)…");
 	try {
-		await run("sh", ["-c", UV_INSTALL_COMMAND], { stdio: options.onProgress ? "ignore" : "inherit" });
+		await run("sh", ["-c", UV_INSTALL_COMMAND], {
+			stdio: options.onProgress ? "ignore" : "inherit",
+			signal: options.signal,
+		});
 	} catch (error) {
 		throw new Error(
 			`couldn't install uv from astral.sh; install it yourself: ${UV_INSTALL_COMMAND}, then re-run prime-agent. ${errorMessage(error)}`,
@@ -597,16 +759,32 @@ function extraUvArgsMatch(a: string[] | undefined, b: string[] | undefined): boo
 	return a.every((v, i) => v === b[i]);
 }
 
-function pythonSkillsMatch(a: BootstrapPythonSkill[] | undefined, b: readonly BootstrapPythonSkill[]): boolean {
-	const left = a ?? [];
-	if (left.length !== b.length) return false;
-	return left.every((skill, index) => {
-		const expected = b[index];
+/**
+ * Readiness is a subset test, not an equality test: every requested skill must appear in
+ * the recorded set with the same package path, pyproject path, and pyproject hash, while
+ * entries the record keeps for skills this session did not request are harmless. Two
+ * sessions with different skill sets then share one venv instead of rewriting the record
+ * back and forth and reinstalling on every boot.
+ *
+ * A recorded entry under the same import name but from another checkout still fails. That
+ * is a real conflict — two editable installs claim one import name and only one can win —
+ * so the union record must not paper over it.
+ *
+ * The compared fields mirror the per-skill skip condition in {@link syncPythonSkills}, so
+ * "satisfied" means exactly "a sync would install nothing".
+ */
+export function pythonSkillsSatisfied(
+	installed: readonly BootstrapPythonSkill[] | undefined,
+	requested: readonly BootstrapPythonSkill[],
+): boolean {
+	const recorded = new Map((installed ?? []).map((skill) => [skill.importName, skill]));
+	return requested.every((skill) => {
+		const entry = recorded.get(skill.importName);
 		return (
-			skill.importName === expected.importName &&
-			skill.packagePath === expected.packagePath &&
-			skill.pyprojectPath === expected.pyprojectPath &&
-			skill.pyprojectHash === expected.pyprojectHash
+			entry !== undefined &&
+			entry.packagePath === skill.packagePath &&
+			entry.pyprojectPath === skill.pyprojectPath &&
+			entry.pyprojectHash === skill.pyprojectHash
 		);
 	});
 }
@@ -619,7 +797,7 @@ function bootstrapVersionCurrent(
 	return (
 		version !== null &&
 		bootstrapBaseVersionCurrent(version, runtimeIdentity) &&
-		pythonSkillsMatch(version.pythonSkills, pythonSkills)
+		pythonSkillsSatisfied(version.pythonSkills, pythonSkills)
 	);
 }
 
@@ -632,17 +810,41 @@ function bootstrapBaseVersionCurrent(version: BootstrapVersion | null, runtimeId
 	);
 }
 
+/**
+ * Union of the recorded skills and the ones this boot installed, deduped by import name
+ * with the freshly installed entry winning (it carries the hash now on disk). Readiness is
+ * a subset test, so keeping entries for skills this session never requested is what lets
+ * sessions with different skill sets share one venv: without the union, a narrow session
+ * rewrites the record down to its own set and the next wide session reinstalls everything.
+ */
+function mergePythonSkillRecords(
+	previous: readonly BootstrapPythonSkill[] | undefined,
+	installed: readonly BootstrapPythonSkill[],
+): BootstrapPythonSkill[] {
+	const byImportName = new Map<string, BootstrapPythonSkill>();
+	for (const skill of previous ?? []) {
+		byImportName.set(skill.importName, skill);
+	}
+	for (const skill of installed) {
+		byImportName.set(skill.importName, skill);
+	}
+	return [...byImportName.values()].sort(compareBootstrapPythonSkills);
+}
+
 async function writeBootstrapVersion(
 	venv: string,
 	runtimeIdentity: string,
 	pythonSkills: readonly BootstrapPythonSkill[],
 ): Promise<void> {
+	// Re-read immediately before writing: every writer holds the bootstrap lock, but the
+	// caller's copy of the record predates the installs it just performed.
+	const previous = (await readBootstrapVersion(venv))?.pythonSkills;
 	const version: BootstrapVersion = {
 		schema: BOOTSTRAP_SCHEMA,
 		runtime: runtimeIdentity,
 		snapshot: STATE_SNAPSHOT_REQUIREMENT,
 		extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
-		pythonSkills: [...pythonSkills],
+		pythonSkills: mergePythonSkillRecords(previous, pythonSkills),
 	};
 	await writeFile(path.join(venv, BOOTSTRAP_VERSION_FILE), `${JSON.stringify(version)}\n`, "utf8");
 }
@@ -721,17 +923,21 @@ async function bootstrapVenv(
 	const runtimeRequirement = sourceDir ?? RUNTIME_REQUIREMENT;
 	const runtimeIdentity = await resolveRuntimeIdentity();
 
-	await run(uv, ["python", "install", PYTHON_VERSION]);
-	await run(uv, ["venv", venv, "--python", PYTHON_VERSION, "--seed"]);
-	await run(uv, [
-		"pip",
-		"install",
-		"--python",
-		python,
-		runtimeRequirement,
-		STATE_SNAPSHOT_REQUIREMENT,
-		...DEFAULT_RLM_EXTRA_UV_ARGS,
-	]);
+	await run(uv, ["python", "install", PYTHON_VERSION], { signal: options.signal });
+	await run(uv, ["venv", venv, "--python", PYTHON_VERSION, "--seed"], { signal: options.signal });
+	await run(
+		uv,
+		[
+			"pip",
+			"install",
+			"--python",
+			python,
+			runtimeRequirement,
+			STATE_SNAPSHOT_REQUIREMENT,
+			...DEFAULT_RLM_EXTRA_UV_ARGS,
+		],
+		{ signal: options.signal },
+	);
 	await syncPythonSkills(uv, venv, python, runtimeIdentity, pythonSkills, options);
 }
 
@@ -791,19 +997,19 @@ async function syncPythonSkills(
 			.flatMap(formatPythonSkillInstallArgs);
 
 		try {
-			await run(uv, [
-				"pip",
-				"install",
-				"--python",
-				python,
-				...formatPythonSkillInstallArgs(skill),
-				...localDependencyArgs,
-			]);
+			await run(
+				uv,
+				["pip", "install", "--python", python, ...formatPythonSkillInstallArgs(skill), ...localDependencyArgs],
+				{ signal: options.signal },
+			);
 			installedPythonSkills.push(
 				skill,
 				...localDependencies.filter((dependency) => !installedPythonSkills.includes(dependency)),
 			);
 		} catch (error) {
+			// A cancelled boot stops here instead of reporting every remaining skill as a
+			// failed install (and killing one more subprocess per skill).
+			if (error instanceof KernelBootstrapAbortedError) throw error;
 			reportProgress(
 				options,
 				`Warning: Python skill ${skill.importName} failed to install and will be unavailable: ${errorMessage(error)}`,
@@ -833,6 +1039,11 @@ async function kernelReady(
 }
 
 function formatBootstrapFailure(error: unknown): Error {
+	// Typed bootstrap failures already carry their own specific, actionable guidance, and
+	// callers need the class to tell a cancellation or a lock timeout from a real failure.
+	if (error instanceof KernelBootstrapLockTimeoutError || error instanceof KernelBootstrapAbortedError) {
+		return error;
+	}
 	return new Error(
 		`Failed to set up the Python kernel runtime. ${errorMessage(error)}\n` +
 			"First-time setup needs internet to install uv, Python, prime-agent-runtime, and default Python packages; once set up, prime-agent runs offline. " +
@@ -872,12 +1083,25 @@ async function ensureKernelPythonUncached(
 		throw new Error(`PRIME_AGENT_KERNEL_PYTHON points to a Python missing ${missing.join(" and ")}: ${python}`);
 	}
 
-	const venv = await resolveWritableKernelVenvDir();
-	const python = path.join(venv, "bin", "python");
+	const base = await resolveWritableKernelVenvDir();
 	const runtimeIdentity = await resolveRuntimeIdentity();
+	// This build identity's own directory. A kernel started from it keeps this exact path
+	// for its whole life, and a later identity change builds a sibling instead of touching it.
+	const venv = kernelVenvDirForIdentity(base, runtimeIdentity);
+	const python = path.join(venv, "bin", "python");
+	// GC trigger 1 (boot): reclaim generations whose references have all dropped. Only
+	// provably abandoned directories are touched, so this needs no lock; the generation
+	// this boot is about to use is excluded.
+	await pruneKernelVenvGenerations(base, { activeDir: venv }).catch(() => undefined);
 	if (await kernelReady(python, venv, runtimeIdentity, pythonSkills)) return python;
+	reportLegacyKernelVenv(base, options);
 
-	const releaseLock = await acquireBootstrapLock(venv);
+	// The lock stays keyed on the base path, so pre- and post-generation hosts serialize
+	// on the same lock through a mixed-version window.
+	const releaseLock = await acquireBootstrapLock(base, {
+		signal: options.signal,
+		timeoutMs: options.lockTimeoutMs,
+	});
 	try {
 		if (await kernelReady(python, venv, runtimeIdentity, pythonSkills)) return python;
 		if (await kernelBaseReady(python, venv, runtimeIdentity)) {
@@ -885,15 +1109,35 @@ async function ensureKernelPythonUncached(
 			return python;
 		}
 
+		// A generation that still has live references is never rebuilt in place: its kernel
+		// keeps resolving lazy imports (and this repo's skills are imported dynamically)
+		// against that absolute path, so rebuilding under it would mix two builds inside one
+		// running kernel. Unreadable reference bookkeeping counts as in use.
+		const inUse = await readKernelVenvInUseState(venv);
 		const hadVenv = existsSync(venv);
+		const decision = decideKernelVenvRebuild({
+			platform: process.platform,
+			generationDirExists: hadVenv,
+			liveReferences: inUse.references.length,
+			referenceStateUnknown: inUse.unknown,
+		});
+		if (decision.mode === "defer") {
+			throw new KernelVenvRebuildDeferredError(venv, decision.liveReferences, decision.referenceStateUnknown);
+		}
+
 		reportProgress(options, "› setting up python kernel (one-time, ~30s)…");
 		if (hadVenv) {
-			reportProgress(options, "rebuilding kernel venv");
+			reportProgress(options, `rebuilding unreferenced kernel venv ${path.basename(venv)}`);
 			await rm(venv, { recursive: true, force: true });
 		}
 
 		await bootstrapVenv(venv, pythonSkills, options);
+		// GC trigger 2 (post-build): a new generation just landed, so retire the surplus
+		// now rather than leaving it on disk until the next boot.
+		await pruneKernelVenvGenerations(base, { activeDir: venv }).catch(() => undefined);
 	} catch (error) {
+		// Already actionable and specific; the bootstrap wrapper would bury the reason.
+		if (error instanceof KernelVenvRebuildDeferredError) throw error;
 		throw formatBootstrapFailure(error);
 	} finally {
 		await releaseLock().catch(() => undefined);
@@ -903,14 +1147,55 @@ async function ensureKernelPythonUncached(
 	return python;
 }
 
+/**
+ * Counts the callers attached to one in-flight bootstrap. A caller's abort cancels the
+ * shared work only once every caller has aborted: sessions in one process share the
+ * memoized bootstrap, so one session being disposed must not tear down another session's
+ * kernel boot. A single caller that wants its own wait to end immediately already gets
+ * that from `raceStartupWithAbort` in the kernel start path.
+ */
+function trackBootstrapWaiter(entry: InFlightBootstrap, signal: AbortSignal | undefined): void {
+	entry.waiters += 1;
+	if (!signal) return;
+
+	const onAbort = (): void => {
+		entry.aborted += 1;
+		if (entry.aborted >= entry.waiters) {
+			entry.controller.abort(new KernelBootstrapAbortedError("every waiting session aborted"));
+		}
+	};
+	if (signal.aborted) {
+		onAbort();
+		return;
+	}
+	signal.addEventListener("abort", onAbort, { once: true });
+	const detach = (): void => signal.removeEventListener("abort", onAbort);
+	// Never leaves a listener behind on a signal that outlives the boot (e.g. a session-wide
+	// dispose signal shared by many kernel starts).
+	void entry.promise.then(detach, detach);
+}
+
 export function ensureKernelPython(options: EnsureKernelPythonOptions = {}): Promise<string> {
+	// Refuse before touching the memo, the readiness probes, or the lock: a cancelled
+	// session must not spawn subprocesses, and must not be handed a boot it will not use.
+	if (options.signal?.aborted) {
+		return Promise.reject(new KernelBootstrapAbortedError("the session aborted before the kernel bootstrap started"));
+	}
+
 	const pythonSkills = normalizePythonSkills(options.pythonSkills);
 	const key = ensureKernelPythonKey(pythonSkills);
-	if (inFlightEnsureKernelPython?.key === key) return inFlightEnsureKernelPython.promise;
+	const inFlight = inFlightEnsureKernelPython;
+	if (inFlight?.key === key) {
+		trackBootstrapWaiter(inFlight, options.signal);
+		return inFlight.promise;
+	}
 
-	const promise = ensureKernelPythonUncached(options, pythonSkills).finally(() => {
+	const controller = new AbortController();
+	const promise = ensureKernelPythonUncached({ ...options, signal: controller.signal }, pythonSkills).finally(() => {
 		if (inFlightEnsureKernelPython?.promise === promise) inFlightEnsureKernelPython = null;
 	});
-	inFlightEnsureKernelPython = { key, promise };
+	const entry: InFlightBootstrap = { key, promise, controller, waiters: 0, aborted: 0 };
+	inFlightEnsureKernelPython = entry;
+	trackBootstrapWaiter(entry, options.signal);
 	return promise;
 }
