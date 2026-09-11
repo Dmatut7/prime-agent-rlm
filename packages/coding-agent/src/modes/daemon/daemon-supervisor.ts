@@ -1121,6 +1121,7 @@ export class DaemonSupervisor {
 			await this.catalog.start().catch((error) => this.log(`Could not start daemon catalog: ${String(error)}`));
 			this.assertSocketLeaseHeld();
 			await this.seedRosterLedger();
+			this.seedAdoptingWorkerRosterRows();
 			for (const worker of this.workers.values()) {
 				this.scheduleOwnedWorkerCleanup(worker);
 			}
@@ -5231,6 +5232,53 @@ export class DaemonSupervisor {
 			}
 		} catch (error) {
 			this.log(`Could not seed the agent roster from the spawn ledger: ${String(error)}`);
+		}
+	}
+
+	/**
+	 * L3 follow-up: adoption runs after `markReady()`, so without this a client that
+	 * lists right after a restart sees zero sessions until adoption settles, which
+	 * reads as losing every session. Seed one honest row per registered root from its
+	 * durable descriptor and let adoption upgrade it in place: the roster keys on
+	 * sessionId and de-duplicates on sessionFile, so no second row can appear, and a
+	 * worker that never comes back still has a row for the park path to flip.
+	 */
+	private seedAdoptingWorkerRosterRows(): void {
+		for (const worker of this.workers.values()) {
+			const descriptor = worker.descriptor;
+			const sessionId = descriptor.rootSessionId;
+			// Client-owned workers are ephemeral and private; their rows are born with
+			// the adoption their owner drives.
+			if (sessionId === undefined || descriptor.ownerClientId !== undefined) {
+				continue;
+			}
+			// A durable stop intent means a kill was in flight: listing it as recovering
+			// would resurrect a root the user deliberately stopped. The stop and reaper
+			// paths own that registration, not the session list.
+			if (this.isWorkerStopping(worker)) {
+				continue;
+			}
+			if (this.workerRosterEntries(worker).length > 0) {
+				continue;
+			}
+			const summary: SessionSummary = {
+				id: descriptor.rootActiveSessionId ?? sessionId,
+				lifecycle: "live",
+				activity: "idle",
+				isSessionActive: false,
+				sessionId,
+				...(descriptor.rootActiveSessionId !== undefined
+					? { activeSessionId: descriptor.rootActiveSessionId }
+					: {}),
+				...(descriptor.sessionFile !== undefined ? { sessionFile: descriptor.sessionFile } : {}),
+				cwd: this.defaultSessionConfig.cwd ?? "",
+				isStreaming: false,
+				isCompacting: false,
+				attachedClients: 0,
+				messageCount: 0,
+				sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+			};
+			this.writeRosterEntry(workerRosterEntryFromSummary(summary), worker, "recovering");
 		}
 	}
 

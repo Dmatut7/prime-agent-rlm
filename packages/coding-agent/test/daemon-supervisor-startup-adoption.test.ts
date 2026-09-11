@@ -50,6 +50,30 @@ describe("T3-3 supervisor startup adoption", () => {
 		expect(harness.readDescriptor()?.lifecycle).not.toBe("ready");
 	}, 30_000);
 
+	it("lists a registered session as recovering while its worker is still being adopted", async () => {
+		const harness = await startSupervisorHarness({
+			prefix: "ma-t3-3-window-",
+			hangAfterAuth: true,
+			supervisorOptions: { adoptionRequestTimeoutMs: 8_000 },
+		});
+		// The adoption window is genuinely open: the worker is wedged, nothing settled.
+		expect(harness.hello?.adopting).toBe(1);
+		const descriptor = harness.readDescriptor();
+		expect(descriptor?.lifecycle).not.toBe("ready");
+
+		// RED before the startup roster seed: handleList builds rows only from roster
+		// entries that adoption itself writes, so a client that listed right after a
+		// restart saw zero sessions until adoption settled - a restart that actually
+		// preserved every worker still looked like losing all of them.
+		const sessions = await harness.listSessions();
+		expect(sessions.length).toBeGreaterThan(0);
+		const row = sessions.find((summary) => summary.workerPid === descriptor?.pid);
+		expect(row?.workerPid).toBe(descriptor?.pid);
+		expect(row?.workerState).toBe("recovering");
+		// One row per registered session: the seed must not duplicate what adoption writes.
+		expect(sessions.filter((summary) => summary.sessionId === row?.sessionId)).toHaveLength(1);
+	}, 30_000);
+
 	it("reports no pending adoption once every worker landed", async () => {
 		const harness = await startSupervisorHarness({ prefix: "ma-t3-3-healthy-" });
 		// Positive control: the healthy adoption path is unchanged.
