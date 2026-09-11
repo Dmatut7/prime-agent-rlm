@@ -1,0 +1,1 @@
+- Registered the stall watchdog exemption settings (`toolLivenessExemption`, default on, and `treatKernelCpuProgressAsActivity`, reserved with no effect yet) so the kernel-liveness vouch can be turned off per host without a code change.

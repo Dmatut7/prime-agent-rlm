@@ -82,6 +82,32 @@ export interface StallWatchdogSettings {
 	enabled?: boolean; // default: true
 	warnAfterSeconds?: number; // default: 300 (5 min silent => warning + diagnostics)
 	abortAfterSeconds?: number; // default: 900 (15 min silent => auto-abort); must exceed warnAfterSeconds
+	/**
+	 * Defer the auto-abort escalation while kernel/host facts vouch that externally
+	 * owned work is in flight (a live bash handle, an in-flight host request, a live
+	 * kernel loop awaiting the cell). Default true. The warning is never suppressed,
+	 * and the deferral is bounded by the watchdog's exemption budget.
+	 */
+	toolLivenessExemption?: boolean;
+	/**
+	 * Reserved, no effect: treating kernel CPU progress as session activity is a
+	 * pending product decision. Registered so the key round-trips through settings
+	 * without a schema change later. Default false.
+	 */
+	treatKernelCpuProgressAsActivity?: boolean;
+}
+
+/**
+ * Resolved stall-watchdog settings. The two exemption keys are optional so a caller
+ * (or a test double) that only knows the three original thresholds still type-checks;
+ * readers apply the documented defaults (exemption on, CPU-as-activity off).
+ */
+export interface ResolvedStallWatchdogSettings {
+	enabled: boolean;
+	warnAfterSeconds: number;
+	abortAfterSeconds: number;
+	toolLivenessExemption?: boolean;
+	treatKernelCpuProgressAsActivity?: boolean;
 }
 
 /**
@@ -1054,7 +1080,7 @@ export class SettingsManager {
 		this.save();
 	}
 
-	getStallWatchdogSettings(): { enabled: boolean; warnAfterSeconds: number; abortAfterSeconds: number } {
+	getStallWatchdogSettings(): ResolvedStallWatchdogSettings {
 		const enabled = this.settings.stallWatchdog?.enabled ?? true;
 		const warnAfterSeconds = this.settings.stallWatchdog?.warnAfterSeconds ?? DEFAULT_STALL_WARN_AFTER_SECONDS;
 		let abortAfterSeconds = this.settings.stallWatchdog?.abortAfterSeconds ?? DEFAULT_STALL_ABORT_AFTER_SECONDS;
@@ -1063,7 +1089,16 @@ export class SettingsManager {
 		if (abortAfterSeconds !== 0 && abortAfterSeconds <= warnAfterSeconds) {
 			abortAfterSeconds = warnAfterSeconds * 2;
 		}
-		return { enabled, warnAfterSeconds, abortAfterSeconds };
+		// Defaults must match DEFAULT_STALL_WATCHDOG_CONFIG / resolveStallWatchdogConfig in
+		// stall-watchdog.ts. They are filled in here rather than delegated because that module
+		// imports these very constants: a reverse import would be a load-time cycle.
+		return {
+			enabled,
+			warnAfterSeconds,
+			abortAfterSeconds,
+			toolLivenessExemption: this.settings.stallWatchdog?.toolLivenessExemption ?? true,
+			treatKernelCpuProgressAsActivity: this.settings.stallWatchdog?.treatKernelCpuProgressAsActivity ?? false,
+		};
 	}
 
 	getKernelBootstrapSettings(): { lockTimeoutMs: number } {

@@ -4,6 +4,8 @@ import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	DEFAULT_KERNEL_BOOTSTRAP_LOCK_TIMEOUT_MS,
+	DEFAULT_STALL_ABORT_AFTER_SECONDS,
+	DEFAULT_STALL_WARN_AFTER_SECONDS,
 	readKernelBootstrapSettings,
 	SettingsManager,
 } from "../src/core/settings-manager.js";
@@ -635,6 +637,49 @@ describe("SettingsManager", () => {
 			expect(readKernelBootstrapSettings(projectDir, agentDir)).toEqual({
 				lockTimeoutMs: DEFAULT_KERNEL_BOOTSTRAP_LOCK_TIMEOUT_MS,
 			});
+		});
+	});
+
+	describe("stall watchdog settings", () => {
+		it("resolves the exemption keys to their documented defaults", () => {
+			expect(SettingsManager.create(projectDir, agentDir).getStallWatchdogSettings()).toEqual({
+				enabled: true,
+				warnAfterSeconds: DEFAULT_STALL_WARN_AFTER_SECONDS,
+				abortAfterSeconds: DEFAULT_STALL_ABORT_AFTER_SECONDS,
+				toolLivenessExemption: true,
+				treatKernelCpuProgressAsActivity: false,
+			});
+		});
+
+		it("round-trips an explicit opt-out of the tool liveness exemption", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					stallWatchdog: { toolLivenessExemption: false, treatKernelCpuProgressAsActivity: true },
+				}),
+			);
+
+			const resolved = SettingsManager.create(projectDir, agentDir).getStallWatchdogSettings();
+			expect(resolved.toolLivenessExemption).toBe(false);
+			// Reserved key: it must survive a read/write round trip even though nothing consumes it.
+			expect(resolved.treatKernelCpuProgressAsActivity).toBe(true);
+		});
+
+		it("keeps the escalation gap rule while the exemption keys ride along", () => {
+			const cases: [{ warnAfterSeconds: number; abortAfterSeconds: number }, number][] = [
+				[{ warnAfterSeconds: 0.2, abortAfterSeconds: 0.6 }, 0.6],
+				// At or below the warn threshold: normalized to a gap instead of firing both at once.
+				[{ warnAfterSeconds: 30, abortAfterSeconds: 30 }, 60],
+				// 0 stays 0: warn-only watchdog.
+				[{ warnAfterSeconds: 30, abortAfterSeconds: 0 }, 0],
+			];
+			expect(cases.length).toBeGreaterThan(0);
+			for (const [configured, expectedAbort] of cases) {
+				writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ stallWatchdog: configured }));
+				const resolved = SettingsManager.create(projectDir, agentDir).getStallWatchdogSettings();
+				expect(resolved.abortAfterSeconds).toBe(expectedAbort);
+				expect(resolved.toolLivenessExemption).toBe(true);
+			}
 		});
 	});
 });
