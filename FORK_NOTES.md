@@ -15,56 +15,13 @@
 
 | 日期 | 这轮干了什么 |
 |---|---|
-| 2026-09-12 凌晨 | 采纳外部贡献者 5 个修复；移除假设置 bashTimeoutSeconds；修"记忆写入遇格式抖动整条丢"；摘官方 3 个优点；大门从自动关 PR 改为人工审；向官方反馈 27 条缺陷（Discussions #2239） |
-| 2026-09-12 中午（TAKE tierA） | 上游可靠性 A 档 4 件 + 1 件半 + fork 自留闸：`waitForIdle` 不再微任务自旋把整台 worker 楔死在 100% CPU；跑测试不再读写开发者真凭证；内核管道 EPIPE 不再打死整台 worker；内核 python 走 `-P` 安全路径（checkout 不能顶替 `rlm`/`dill`/stdlib）；headless 取消后无响应的内核会被杀掉并打上归因标；`prime-agent update` 在 fork 构建上拒绝官方包覆盖 |
-| 2026-09-12 上午（TAKE 第二批） | 上游 TAKE 清单剩余 9 件收口（8 件落地 + 1 件核收）：litellm 上下文超限识别、prompt 参数 `$` 字面量不再二次展开、`/traces` 子命令补全、助手 Markdown 文件链接按会话 cwd 解析（连带 TUI 允许打开 `file://`）、agents-view 用量列/图例/空会话沉底/分支不再算子代理、打包版 CLI 的 Bedrock 装载真修、目录生成器 Qwen 改名映射 + gpt-6 规则、伪装客户端版本升级（Claude Code 2.1.261 / Copilot 0.48.1） |
-| 2026-09-12 中午³ | 修复 4603 测试双缺陷（硬链接 node 会毒死全机 node 的 macOS 级事故 + runner 自停）——今天多次"测试起不来"的真凶；四模型研究团交付七连栈应对战略（已向官方 PR #2249 挂 4 条缝请求） |
-| 2026-09-12 中午² | 合并 DZMing 的 PR #11（性能 7 簇：OSC133 无限累积/渲染缓存失效/provider 流式平方/内核序列化/daemon 风暴/冷启动并发——治"跑久了膨胀"；附终端快照 final 直写修复） |
-| 2026-09-12 中午 | 合并 DZMing 的 PR #12（13 簇：导出 HTML 属性注入 XSS、导出 $ 模式损坏、分岔压缩丢摘要、非 UTC 孤儿清理失效、投递档位计时、Kitty 双触发、RPC 丢 id、ACP 吞扩展错误、MCP OAuth 顺序、streamStallTimeoutMs 传递、Bedrock 缓存定价 + 性能件）；fork 闸门测试缝；4603 两枚缺陷立案 |
-| 2026-09-12 上午 | 官方动态对账：41 个新提交盘点（12 拿/15 适配/14 不拿，top3 已摘完）+ 60 个开放 PR 逐件分析（22 件值得拿，A 档 6 件在摘）；rlm.collect（子代理结果回收）已移植落地（含 stallAbort 终态可分辨增强）；A 档 6 件急修已摘（会话卡死冻全家/测试覆写真实 token/管道 EPIPE 杀 worker/内核 -P 安全路径/update 保护闸/卡死内核 POSIX 半件）；README 门脸改成源码构建优先（防访客误装官方版）；FORK_NOTES 加一览区 |
-| 2026-09-11 | 多代理稳定性大修：54+ 笔提交修掉五段死亡链（长任务 15 分钟被误杀/误杀被瞒报/子代理回话焊死/内核死即残废/僵尸记账），四家模型终审全过 |
+| 2026-09-12 凌晨 | 采纳外部贡献者 DZMing 的 5 个修复（时区孤儿/umask 锁死/测试环境耦合/导出 /tmp/Windows 测试）；移除假设置 bashTimeoutSeconds；修"记忆写入遇格式抖动整条丢"；大门从自动关 PR 改为人工审 |
+| 2026-09-12 上午 | 官方动态对账：41 个新提交盘点 + 60 个开放 PR 逐件分析；摘官方 12 个提交级优点（litellm 超限识别/`$` 不再二次展开/agents-view 用量列/Bedrock 打包真修等）；移植 rlm.collect（子代理结果类型化回收） |
+| 2026-09-12 中午 | 合并 DZMing 的 PR #12（13 簇，含导出 HTML 属性注入 XSS、压缩丢上文修复）与 PR #11（性能 7 簇，治"跑久了膨胀"）；摘上游 PR 急修 6 件（会话卡死冻全家/测试碰真凭证/管道杀 worker/内核安全路径/update 保护闸/卡死内核）；修 4603 测试双缺陷（此前多次"全机测试起不来"的真凶：硬链接毒死 node + runner 自停）；四模型研究团交付官方大重构的应对战略（已向官方 PR #2249 挂 4 条缝请求） |
+| 2026-09-11 | 多代理稳定性大修：五段死亡链治理（长任务 15 分钟被误杀/误杀被瞒报/子代理回话焊死/内核死即残废/僵尸记账），60+ 提交，四家模型终审全过 |
 | 2026-09-07 | 主仓迁到独立仓；根代理沟通契约（说人话、先复述目标、不给选择题） |
 | 2026-09-05 | R3 上游同步（官方 40 提交零丢失合入）+ 全仓复审（28 缺陷簇）+ 第一批修复 |
 | 2026-08-29 | R1 大合入（REPL kernel 线成型）+ R2 迭代 |
-
----
-
-
----
-
-## 2026-09-12 中午 · 上游可靠性 TAKE tierA（4 件 + 1 件半）+ fork 自留闸
-
-范围：`/tmp/ma_audit/upstream_prs_reliability.md` 的 A 档（#2151 / #2135 / #2213 / #2169）与 B 档 #2168，外加一件 fork 自留闸。施工报告 `/tmp/ma_audit/build_tierA.md`，逐件红绿日志在 `/tmp/tierA_relay/`。本车道是接力：前任 `take-tierA` 被看门狗打死在一次变异跑中间，共享文件 `agent-session.ts` 被留在"注释在、判据被换回窄形"的行为半态（10:18→10:44），已还原并与仍在跑的兄弟道 `port-rlm-collect` 协商出提交时序（它先提交 `4fd801d26`，本车道再落 `a31d520ce`）。
-
-- **做了什么 / 用户与 AI 能力能感觉到什么**：
-  - **#2151（`a31d520ce`）一个会话卡死不再冻住全家**：`waitForIdle` 的等待环此前只看"挂起/暂停"两个窄条件就重排输入泵；会话空闲但外部忙（bash 在跑、压缩在飞、重试计时）时泵立刻报 blocked，环里所有 promise 都已 resolve ⇒ 纯微任务自旋，事件循环进不了 timer/IO，能解忙的那个信号永远得不到处理。一台 worker 承载整棵递归代理树，所以一个会话进入该状态＝同 worker 上全部会话一起冻住（attach 超时、heartbeat 列举失败、无人落盘）、worker 100% CPU。现在等待环 park 在泵自己的忙谓词上，并额外排除 disposal（否则 teardown 期间会把 checkpoint waiter 钉住、堵住 daemon passivation）。上游那条测试探针私有成员，本仓重写为两例（自旋让出事件循环 / dispose 后 waiter 必须清零）。
-  - **#2168（`a09cf864d`）跑测试不再碰你的真凭证**：`packages/ai/test/oauth.ts` 此前硬编码读 `~/.pi/agent/auth.json`，过期就真打 provider 的 token 端点刷新并写回；13 个测试模块在模块顶层调它，任何 `skipIf` 都来不及生效。现在活体测试要 `PI_LIVE_TESTS=1` + 专用的 `PI_TEST_AUTH_FILE`（指向两个真 store 之一会直接抛错），刷新只写回那个测试文件；`test.sh` 把 `~/.prime/agent/auth.json` 与 `~/.pi/agent/auth.json` 都挪走、退出时都恢复，并 unset 两个 opt-in 变量。
-  - **#2213（`01f106f26`）一次 EPIPE 不再打死整台 worker**：写请求与内核死亡竞态时，`writeLine` 的写回调已经 reject 且调用方都处理了，但内核子进程的 stdin/stdout **管道**没有 `error` 监听 ⇒ Node 重抛 ⇒ 崩溃兜底 `process.exit(1)` 带走该 worker 上的所有会话（上游 2026-09-10 的生产事故形状）。现在两条管道各挂一个只记诊断的监听（带 stale-child 守卫），善后仍交给既有的写 reject 与 exit 处理。
-  - **#2169（`2dd4b613a`）checkout 不能再顶替内核自己的导入**：内核此前以会话目录为 cwd 且无 safe path，CPython 会把该目录放进 `sys.path[0]`——仓库里放一个 `rlm/repl.py` 就在 ready 握手前被执行（宿主只看到 `Kernel exited before ready`，完全指不到真因），放一个 `dill.py` 就被第一次状态快照导入，放一个 stdlib 同名模块就顶掉解释器自带的。现在内核启动与 bootstrap 的两个 `python -c` 探针都带 `-P`（进程级旗标，不像 `PYTHONSAFEPATH` 会被内核 `bash()` 的子进程继承）。副作用即纪律：项目模块在内核里不可导入，项目代码走项目自己的环境。本仓已亲核复现（不带 `-P` 时影子 `rlm/repl.py` 真的执行并 `exit 3`）。
-  - **#2135 半件（`616bd6759`）headless 取消后无响应的内核会被杀掉**：此前取消一个 headless Python 单元后，宿主返回了，不响应中断的 CPython 还在烧 CPU；而无 UI 的调用方（＝全部 daemon worker）拿到的动作是 `cancel`，只把错误再抛一次 ⇒ 此后每个 cell 都撞 `KernelBusyAfterInterruptError`，会话软砖化。现在宽限期到点即杀：本 cell 的结果里写清"内核已被杀、活状态已丢、下次起新内核并可能恢复快照"（且受输出上限约束），杀因进诊断环，退出打上 `abort_timeout_kill` 归因标（不会被判成崩溃、不白吃重启预算、不给父代理发假的"内核崩了"），实例自报 defunct、供给器丢掉 memo，下一个 cell 起替代内核并给出 `<ipython_kernel_reset>`。交互面仍是 wait/kill 由用户选，响应中断的内核仍保进程保状态。
-  - **fork 自留闸（`c1daaff3f`）`prime-agent update` 不再能把这个 fork 覆盖成官方版**：`update --self` 会把官方发布包装到"提供当前可执行文件的那份安装"上，而本 fork 的 `prime-agent` 是符号链接进 checkout 的构建产物；就算装不动，此前打印的指引还是让用户自己去跑官方安装器——两条路都以"fork 没了"收尾。现在从运行中的模块目录上溯 `FORK_NOTES.md` 判定 fork 构建，在版本探测/会话丢失确认/任何 install spawn **之前**拒绝（退出码 1），并打印 fork 自己的更新路径（`git pull --rebase && npm run build` + `prime-agent shutdown && prime-agent`，或 `prime-agent.sh` 免安装跑），绝不打印官方安装器。要覆盖就显式 `--allow-official`（会说明要覆盖哪个 checkout）；`--force` 语义不变（没有被复用）。扩展包更新不受影响。
-- **没拿 / 留给下一轮**：#2214（resume 后转录空白，四处病全在）与 #2246（孤儿 worker 不回收，内含 #2214 全量，且本仓还要补"无在飞 RLM 子代理"这个退出条件）——都撞 `interactive-mode.ts` / `daemon-mode.ts` 热区，值得单独一件带异构复核；#2135 的 Windows 半件（`reapKernelOrphanProcessesSync` + `cleanupResources` async 化 + 254 行 Windows 测试）；另发现本仓 `cleanupResources()` 在 `kill()` 之前就清掉 `this.child`，而 exit handler 首行是 stale-child 早退 ⇒ 宿主主动杀的内核其 exit 事件到达时 classify 根本跑不到（既有的 `repair_kill`/`bootstrap_fail_kill` 同此），所以 #2135 的归因除打标外还在杀之前显式写了一行诊断；要让标记真正可达需要动 exit handler 的守卫（B6/I-1 热区），未动。
-- **验证**：每件先红后绿，红跑与变异跑一律在隔离 worktree（`/tmp/wt-tierA-2151`、`/tmp/wt-2135-red`）里做，绝不再把共享工作树留在半态；四枚变异钉（park 判据 / opt-in 闸 / spawn 的 `-P` / `abort_timeout_kill` 标记）全部先红后绿并自证还原；6 笔提交全过 husky（biome + tsgo + installer + browser-smoke），未用 `--no-verify`；`git archive HEAD` 纯净树复验 `tsgo --noEmit` 与 `biome check --error-on-warnings` 见报告；测试卫生闸 0 新探针。两例既有红已对基线取证（`4600-supervisor-singleton` 在改动前的隔离树同红；`6006-bundled-bedrock` 需要完整 `npm run build` 才能跑，主树 `packages/ai/dist` 没有 `node/amazon-bedrock.js`）。本批不碰线协议：`DAEMON_SCHEMA_REVISION` 仍是 29。
-
----
-
-## 2026-09-12 上午 · 上游 TAKE 清单第二批（9 件）
-
-范围：`/tmp/ma_audit/upstream_41_review.md` 的 TAKE 12 件里，top3（`0894de1de` / `9c8230df6` / `bcdcd6e65`，已由上一车道摘走）之外的 9 件。施工报告 `/tmp/ma_audit/build_take_rest.md`，逐件红绿日志在 `/tmp/ma_take_rest/`。
-
-- **做了什么**：8 件本车道落地（含 1 件必需的依赖子件），1 件（`a6625e17a` 丢弃孤儿 tool result）核收他道已落地并复跑其测试。每件先在 `git archive HEAD` 纯净树上把上游测试跑红，再落地跑绿；提交保留上游作者署名，message 注明上游 sha 与红绿证据。
-- **用户 / AI 能力能感觉到什么**：
-  - litellm 网关的"超出模型最大上下文"现在会被判成 context overflow ⇒ 触发自动压缩，而不是拿同样超长的上下文一遍遍重试；
-  - 提示词模板参数里的 `$1`、`$@`、`$ARGUMENTS`、`$&`、`$$`、`` $` `` 等字面量不再被二次展开（写 shell / sed / 正则 / 价格的模板不再被悄悄改写）；
-  - `/traces ` 有子命令补全（status/on/off/preview/upload/upload-current/upload-all/login）；
-  - 助手回复里的相对 Markdown 文件链接按**会话 cwd** 解析成可点的 `file://`，TUI 里点得开——此前 daemon worker 的进程 cwd ≠ 会话 cwd，链接一律指错地方；Windows 盘符路径也不再被当成未知协议；
-  - agents 视图：用量改成对齐列（`↑in ↓out · $agent · #sub · $total · age`）、每个分区表头带行数与图例、空会话沉到分区末尾（进入视图时所在会话除外）、分支/fork 会话不再被算成子代理（不再重复计费、不再错误嵌套）、列表末尾的选中项不会再被前导省略号挤出视口；
-  - 打包版 CLI（本仓 `prime-agent` 命令就是 `dist/bundle/cli.js` 的符号链接）里 Bedrock 请求不再 `Cannot find module .../dist/bundle/amazon-bedrock.js`，失败日志保留 level / provider / requestId / pid / mode 等结构化字段；
-  - 目录生成器修掉两处会在下次 `npm run generate-models` 咬人的坑：OpenRouter 已把 `qwen/qwen3.8-max` 改名为 `-0902`，没有别名映射该行会退到 128k/8192 的保守兜底（committed 值是 1M/131k，等于上下文窗口少报 8 倍）；gpt-6 家族补上思考等级与 Copilot Responses 路由规则；
-  - 伪装客户端版本升到 Claude Code 2.1.261 / GitHub Copilot Chat 0.48.1（VS Code 1.136.1），Copilot 身份收敛到单一出处（OAuth 流与生成器共用），不再两份各自漂。
-- **没拿 / 放宽的**：目录数据面（`models.generated.ts`）本批一律不再生成（属 ADAPT 批 3，要连带 `3484f06a1` 的测试搬家）；`e8b7168cc` 里混入的 CI apt 源隔离、Linear 票门禁（本仓没有这道闸）与 6014 测试放宽剔除（6014 在本仓逐字通过，无需放宽）；`#2045` 的 stream-failure 分类（403 → `permission`）是 ADAPT 级未拿，6006 测试对应断言按本仓现状放宽为 `unknown|permission` 并在测试内注明。
-- **验证**：每件先红后绿；8 件提交全过 husky（`npm run check` = biome + tsgo + installer + browser-smoke）；收口 `git archive HEAD` 纯净树 `tsgo --noEmit` EXIT=0。本批不碰线协议：`DAEMON_SCHEMA_REVISION` 仍是 29，`t3_schema_id.mjs` 复算 digest 不变（`protocol-7-schema-29-66299858b8b4`）。
-- **运维注意**：F 件之后 bundle 把 `@earendil-works/pi-ai/bedrock-provider` 留成运行时外部依赖，刷新安装必须走完整 `npm run build`（要重建带 `setLogSink` 导出的 `packages/ai/dist`），只跑 coding-agent 的 bundle 步骤会拿到旧 dist。
 
 ---
 
