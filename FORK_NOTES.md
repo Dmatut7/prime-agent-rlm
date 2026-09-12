@@ -11,6 +11,14 @@
 
 ---
 
+## 2026-09-12 凌晨 · 外部贡献 + 官方互动 + 上游优点摘取
+
+- **做了什么**：① 采纳外部贡献者 DZMing 的 5 个修复（时区误判孤儿进程、umask 锁死私有文件、auto-refine 测试环境耦合、macOS 导出 /tmp 必败、Windows 测试 POSIX 报错），全部先验证再 cherry-pick，署名归他；② 移除半成品设置 `tools.bashTimeoutSeconds`（文档写了但从未接线，RLM 线模型拿不到经典 bash 工具）；③ 修复"记忆写入"（refinement）遇到模型输出格式小抖动整条丢失的问题：宽容解析 + 失败留证 `refinement-failures.jsonl`；④ 摘取上游三个优点：build 不再联网重拉模型目录、/compact 后目标停摆修复、daemon worker initTheme；⑤ 把大门从"非担保自动关 PR"改成"只提醒不关门"（DZMing 的 PR 就是这么被误伤的），并把他加进担保名单；⑥ 向官方提交完整反馈（27 条在官方 main 上逐条亲核的缺陷，走 Discussions 正门 #2239）；⑦ 新增运维手册 `docs/fork/ma-multistability-ops.md`、上游反馈稿 `docs/fork/upstream-feedback-20260911.md`。
+- **对用户/AI 能力**：外部贡献者的修复开始流入；记忆系统不再因格式抖动丢偏好；官方同病的修复有机会回流。
+- **验证**：各修复均带先红后绿与纯净树复验，详见各提交与 /tmp/ma_audit/ 施工报告。
+
+---
+
 ## 2026-09-11 · 多代理稳定性大修（五段死亡链治理）
 
 范围：`merge/repl-kernel` `10b6b4e55..e1eb54bd3`，**54 笔提交、152 文件 +27634/−826**。本节收口基准 `e1eb54bd3`（工作区零残留；批 2 复核发现的幂等键真洞已回修闭合 `e1eb54bd3`，B1c 的诊断 polish 已由收尾车道落地 `6777e77f7`）。运维面（可观测签名 / 回滚开关 / 部署日清单 / flaky 清单）见新建的 **`docs/fork/ma-multistability-ops.md`**；本轮新 settings 键已补进 `packages/coding-agent/docs/settings.md`。
