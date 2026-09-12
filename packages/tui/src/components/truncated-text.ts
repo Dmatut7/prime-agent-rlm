@@ -9,6 +9,10 @@ export class TruncatedText implements Component {
 	private paddingX: number;
 	private paddingY: number;
 
+	private cachedText?: string;
+	private cachedWidth?: number;
+	private cachedLines?: string[];
+
 	constructor(text: string, paddingX: number = 0, paddingY: number = 0) {
 		this.text = text;
 		this.paddingX = paddingX;
@@ -17,11 +21,22 @@ export class TruncatedText implements Component {
 
 	setText(text: string): void {
 		this.text = text;
+		this.cachedText = undefined;
+		this.cachedWidth = undefined;
+		this.cachedLines = undefined;
 	}
 
-	invalidate(): void {}
+	invalidate(): void {
+		this.cachedText = undefined;
+		this.cachedWidth = undefined;
+		this.cachedLines = undefined;
+	}
 
 	render(width: number): string[] {
+		if (this.cachedLines && this.cachedText === this.text && this.cachedWidth === width) {
+			return this.cachedLines;
+		}
+
 		const result: string[] = [];
 
 		const emptyLine = " ".repeat(width);
@@ -53,6 +68,10 @@ export class TruncatedText implements Component {
 		for (let i = 0; i < this.paddingY; i++) {
 			result.push(emptyLine);
 		}
+
+		this.cachedText = this.text;
+		this.cachedWidth = width;
+		this.cachedLines = result;
 
 		return result;
 	}

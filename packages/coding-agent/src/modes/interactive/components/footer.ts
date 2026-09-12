@@ -10,6 +10,9 @@ import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provi
  * `/usage` can expose telemetry without re-plumbing.
  */
 export class FooterComponent implements Component {
+	// Stable reference so the parent aggregator's identity check can hit while the footer is empty.
+	private readonly emptyLines: string[] = [];
+
 	constructor(private footerData: ReadonlyFooterDataProvider) {
 		void this.footerData;
 	}
@@ -37,6 +40,6 @@ export class FooterComponent implements Component {
 	render(_width: number): string[] {
 		// Footer is intentionally empty in the prime brand TUI. Telemetry (cost, tokens, model,
 		// cwd, context %) is hidden by default; bring it back via /usage when needed.
-		return [];
+		return this.emptyLines;
 	}
 }

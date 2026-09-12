@@ -77,6 +77,13 @@ export function shouldCollapseErrorDetails(text: string): boolean {
 
 export class CollapsibleErrorComponent implements Component {
 	private expanded: boolean;
+	private cachedWidth?: number;
+	private cachedExpanded?: boolean;
+	private cachedText?: string;
+	private cachedSummary?: string;
+	private cachedForceCollapse?: boolean;
+	private cachedPaddingX?: number;
+	private cachedLines?: string[];
 
 	constructor(private readonly options: CollapsibleErrorOptions) {
 		this.expanded = options.expanded ?? false;
@@ -87,23 +94,50 @@ export class CollapsibleErrorComponent implements Component {
 	}
 
 	invalidate(): void {
-		// Render output is derived from constructor options and expansion state.
+		this.cachedLines = undefined;
+	}
+
+	private cacheMatches(width: number): boolean {
+		return (
+			this.cachedLines !== undefined &&
+			this.cachedWidth === width &&
+			this.cachedExpanded === this.expanded &&
+			this.cachedText === this.options.text &&
+			this.cachedSummary === this.options.summary &&
+			this.cachedForceCollapse === this.options.forceCollapse &&
+			this.cachedPaddingX === this.options.paddingX
+		);
+	}
+
+	private storeCache(width: number, lines: string[]): string[] {
+		this.cachedWidth = width;
+		this.cachedExpanded = this.expanded;
+		this.cachedText = this.options.text;
+		this.cachedSummary = this.options.summary;
+		this.cachedForceCollapse = this.options.forceCollapse;
+		this.cachedPaddingX = this.options.paddingX;
+		this.cachedLines = lines;
+		return lines;
 	}
 
 	render(width: number): string[] {
+		if (this.cacheMatches(width)) {
+			return this.cachedLines!;
+		}
+
 		const text = normalizeErrorDetails(this.options.text);
 		if (!text) {
-			return [];
+			return this.storeCache(width, []);
 		}
 
 		const collapsible = this.options.forceCollapse ?? shouldCollapseErrorDetails(text);
 		if (!collapsible || this.expanded) {
-			return this.renderText(text, width);
+			return this.storeCache(width, this.renderText(text, width));
 		}
 
 		const summary = normalizeErrorDetails(this.options.summary ?? summarizeErrorDetails(text));
 		const inlineHint = `${summary} ${expandCollapseHint("app.tools.expand", false)}`;
-		return this.renderText(inlineHint, width, "error");
+		return this.storeCache(width, this.renderText(inlineHint, width, "error"));
 	}
 
 	private renderText(text: string, width: number, color: "error" | "muted" = "error"): string[] {

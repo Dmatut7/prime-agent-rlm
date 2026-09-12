@@ -35,6 +35,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
+import { updateThrottledStreamingJson } from "../utils/streaming-json-throttle.js";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
 import { buildBaseOptions } from "./simple-options.js";
@@ -166,6 +167,21 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			timestamp: Date.now(),
 		};
 
+		// OpenRouter reasoning_details accumulate across chunks. The encoded signature
+		// is written once at stream end (and on failure) instead of re-stringifying
+		// the full set on every chunk, which is quadratic in the number of details.
+		const reasoningDetailsByIndex = new Map<number, Record<string, unknown>>();
+		let nextReasoningDetailsIndex = 0;
+		let reasoningDetailsBlock: ThinkingContent | null = null;
+		const encodeAccumulatedReasoningDetails = () => {
+			if (!reasoningDetailsBlock || reasoningDetailsByIndex.size === 0) {
+				return;
+			}
+			reasoningDetailsBlock.thinkingSignature = encodeReasoningDetails(
+				[...reasoningDetailsByIndex.entries()].sort(([left], [right]) => left - right).map(([, detail]) => detail),
+			);
+		};
+
 		try {
 			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
 			const compat = getCompat(model);
@@ -204,9 +220,6 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			let thinkingBlock: ThinkingContent | null = null;
 			const toolCallBlocksByIndex = new Map<number, StreamingToolCallBlock>();
 			const toolCallBlocksById = new Map<string, StreamingToolCallBlock>();
-			const reasoningDetailsByIndex = new Map<number, Record<string, unknown>>();
-			let nextReasoningDetailsIndex = 0;
-			let reasoningDetailsBlock: ThinkingContent | null = null;
 			const blocks = output.content as StreamingBlock[];
 			const getContentIndex = (block: StreamingBlock) => blocks.indexOf(block);
 			const finishBlock = (block: StreamingBlock) => {
@@ -390,7 +403,11 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 							if (toolCall.function?.arguments) {
 								delta = toolCall.function.arguments;
 								block.partialArgs = (block.partialArgs ?? "") + toolCall.function.arguments;
-								block.arguments = parseStreamingJson(block.partialArgs);
+								// Throttled mid-stream parse; the finishBlock parse is authoritative.
+								const parsedArgs = updateThrottledStreamingJson(block, block.partialArgs);
+								if (parsedArgs) {
+									block.arguments = parsedArgs;
+								}
 							}
 							stream.push({
 								type: "toolcall_delta",
@@ -432,26 +449,20 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 								}
 							}
 						}
-						if (reasoningDetailsByIndex.size > 0) {
-							if (!reasoningDetailsBlock) {
-								reasoningDetailsBlock = { type: "thinking", thinking: "", redacted: true };
-								blocks.push(reasoningDetailsBlock);
-								stream.push({
-									type: "thinking_start",
-									contentIndex: getContentIndex(reasoningDetailsBlock),
-									partial: output,
-								});
-							}
-							reasoningDetailsBlock.thinkingSignature = encodeReasoningDetails(
-								[...reasoningDetailsByIndex.entries()]
-									.sort(([left], [right]) => left - right)
-									.map(([, detail]) => detail),
-							);
+						if (reasoningDetailsByIndex.size > 0 && !reasoningDetailsBlock) {
+							reasoningDetailsBlock = { type: "thinking", thinking: "", redacted: true };
+							blocks.push(reasoningDetailsBlock);
+							stream.push({
+								type: "thinking_start",
+								contentIndex: getContentIndex(reasoningDetailsBlock),
+								partial: output,
+							});
 						}
 					}
 				}
 			}
 
+			encodeAccumulatedReasoningDetails();
 			for (const block of blocks) {
 				finishBlock(block);
 			}
@@ -469,6 +480,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
+			// Keep reasoning details accumulated before the failure replayable,
+			// matching what the previous per-chunk encoding left behind.
+			encodeAccumulatedReasoningDetails();
 			for (const block of output.content) {
 				delete (block as { index?: number }).index;
 				// Streaming scratch buffers are only used during parsing; never persist them.

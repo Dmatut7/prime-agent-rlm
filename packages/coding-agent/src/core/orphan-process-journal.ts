@@ -1,9 +1,19 @@
 import { spawnSync } from "node:child_process";
-import { closeSync, constants, fchmodSync, fsyncSync, openSync, readFileSync, rmSync, writeSync } from "node:fs";
+import {
+	closeSync,
+	constants,
+	fchmodSync,
+	fstatSync,
+	fsyncSync,
+	openSync,
+	readFileSync,
+	rmSync,
+	writeSync,
+} from "node:fs";
 import { win32 } from "node:path";
 import { lockSync } from "proper-lockfile";
 import { repairTruncatedTrailingLine } from "../utils/file-lines.js";
-import { getProcessStartId } from "./session-lease.js";
+import { getProcessStartId, getProcessStartIdAsync, getProcProcessStartId } from "./session-lease.js";
 
 export const ORPHAN_PROCESS_JOURNAL_ENV = "PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL";
 
@@ -21,18 +31,36 @@ interface OrphanProcessRecord {
 export interface ActiveOrphanProcess {
 	pid: number;
 	kernelPid?: number;
-	/** Missing on identity-free records: old journals or host writes whose start-id query failed (kernels no longer write pid-only records). */
+	/** Missing on identity-free records: old journals, a host write whose start-id capture is still in flight or failed (kernels no longer write pid-only records). */
 	processStartId?: string;
 	/** When the record was written; bounds pid-reuse checks for identity-free records. */
 	recordedAt?: string;
 }
+
+interface StartIdCapture {
+	readonly path: string;
+}
+
+/** In-flight start-id captures by pid; a later record for the same pid invalidates them. */
+const startIdCaptures = new Map<number, StartIdCapture>();
+const pendingStartIdWrites = new Set<Promise<void>>();
 
 export function recordOrphanProcessState(pid: number, active: boolean): void {
 	const path = process.env[ORPHAN_PROCESS_JOURNAL_ENV];
 	if (!path || !Number.isInteger(pid) || pid <= 0) {
 		return;
 	}
-	const processStartId = active ? getProcessStartId(pid) : undefined;
+	if (!active) {
+		// The deactivation supersedes any start-id capture still in flight for this pid;
+		// landing it afterwards would resurrect the record as active.
+		startIdCaptures.delete(pid);
+	}
+	// Only the /proc identity is cheap enough to hold a spawn for. Where reading it
+	// needs a helper process (macOS/BSD `ps`, win32 powershell) the record goes out
+	// pid-only and is enriched once the query answers, so the fork never blocks the
+	// spawner. Readers treat a pid-only active record as identity-free, which is the
+	// state a failed start-id query already produced.
+	const processStartId = active ? getProcProcessStartId(pid) : undefined;
 	const record: OrphanProcessRecord = {
 		version: 1,
 		pid,
@@ -41,13 +69,76 @@ export function recordOrphanProcessState(pid: number, active: boolean): void {
 		active,
 		recordedAt: new Date().toISOString(),
 	};
+	appendRecord(path, record, { fsync: true, create: true });
+	if (active && processStartId === undefined) {
+		scheduleStartIdCapture(path, pid);
+	}
+}
+
+/** Resolves once every scheduled start-id capture has landed or been superseded. */
+export async function flushOrphanProcessJournal(): Promise<void> {
+	await Promise.allSettled([...pendingStartIdWrites]);
+}
+
+function scheduleStartIdCapture(path: string, pid: number): void {
+	const capture: StartIdCapture = { path };
+	startIdCaptures.set(pid, capture);
+	const write = captureStartId(capture, pid);
+	pendingStartIdWrites.add(write);
+	// captureStartId swallows its own failures; the rejection arm only keeps a
+	// surprise from surfacing as an unhandled rejection, which the host treats as fatal.
+	void write.then(
+		() => pendingStartIdWrites.delete(write),
+		() => pendingStartIdWrites.delete(write),
+	);
+}
+
+async function captureStartId(capture: StartIdCapture, pid: number): Promise<void> {
+	try {
+		const processStartId = await getProcessStartIdAsync(pid);
+		if (!processStartId || startIdCaptures.get(pid) !== capture) {
+			return;
+		}
+		// No fsync: the pid record this enriches is already durable, and the identity
+		// only sharpens reaping. A power loss drops the enrichment, not the child.
+		// No create: a journal cleared in the meantime must not be resurrected.
+		appendRecord(
+			capture.path,
+			{
+				version: 1,
+				pid,
+				ownerPid: process.pid,
+				processStartId,
+				active: true,
+				recordedAt: new Date().toISOString(),
+			},
+			{ fsync: false, create: false },
+		);
+	} catch {
+		// Identity stays best-effort; the pid-only record already journaled the child.
+	} finally {
+		if (startIdCaptures.get(pid) === capture) {
+			startIdCaptures.delete(pid);
+		}
+	}
+}
+
+interface AppendRecordOptions {
+	/** False for the start-id enrichment, which is not part of the recovery contract. */
+	fsync: boolean;
+	/** False to append only to a journal that still exists. */
+	create: boolean;
+}
+
+function appendRecord(path: string, record: OrphanProcessRecord, options: AppendRecordOptions): void {
+	const flags = constants.O_WRONLY | (options.create ? constants.O_CREAT : 0) | (constants.O_NOFOLLOW ?? 0);
 	try {
 		// Host and kernels append to the same journal; hold the guard across
 		// repair+append so a crash-torn tail from one writer cannot glue onto
 		// another writer's record. Lock failures stay best-effort (outer catch).
 		// proper-lockfile requires the lock target to exist; create it first (a
 		// symlinked journal is refused by O_NOFOLLOW and skipped).
-		const touch = openSync(path, constants.O_WRONLY | constants.O_CREAT | (constants.O_NOFOLLOW ?? 0), 0o600);
+		const touch = openSync(path, flags, 0o600);
 		closeSync(touch);
 		let release: (() => void) | undefined;
 		for (let attempt = 0; attempt < 20; attempt++) {
@@ -70,16 +161,16 @@ export function recordOrphanProcessState(pid: number, active: boolean): void {
 			// A crash can leave a torn final line; readers skip it, so drop it before
 			// the append glues onto it.
 			repairTruncatedTrailingLine(path);
-			const descriptor = openSync(
-				path,
-				constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | (constants.O_NOFOLLOW ?? 0),
-				0o600,
-			);
+			const descriptor = openSync(path, flags | constants.O_APPEND, 0o600);
 			try {
 				// Repair legacy 0644 journals: the create mode only applies to new files.
-				if (process.platform !== "win32") fchmodSync(descriptor, 0o600);
+				// Gated on the current mode, so a record does not dirty the inode for a
+				// mode that is already right.
+				if (process.platform !== "win32" && (fstatSync(descriptor).mode & 0o777) !== 0o600) {
+					fchmodSync(descriptor, 0o600);
+				}
 				writeSync(descriptor, `${JSON.stringify(record)}\n`);
-				fsyncSync(descriptor);
+				if (options.fsync) fsyncSync(descriptor);
 			} finally {
 				closeSync(descriptor);
 			}
@@ -122,8 +213,8 @@ export function readActiveOrphanProcesses(path: string, ownerPid: number): Activ
 			// A crash can truncate only the final append.
 		}
 	}
-	// Pid-only actives (no processStartId) still surface from old journals or
-	// host writes whose start-id query failed; reapers decide per-platform.
+	// Pid-only actives (no processStartId) still surface from old journals or host
+	// writes whose start-id capture has not landed yet (or failed); reapers decide per-platform.
 	return [...latest.values()]
 		.filter(
 			(record) =>

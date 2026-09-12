@@ -32,6 +32,23 @@ describe("UserMessageComponent", () => {
 		expect(lines[2].endsWith(BG_RESET)).toBe(true);
 	});
 
+	test("does not accumulate OSC 133 markers on repeated renders", () => {
+		clearDefaultTerminalColors();
+		initTheme("dark");
+
+		const component = new UserMessageComponent("hello");
+		const first = [...component.render(20)];
+		const second = [...component.render(20)];
+
+		expect(second).toEqual(first);
+		expect(first[0].split(OSC133_ZONE_START)).toHaveLength(2);
+		expect(first[first.length - 1].split(OSC133_ZONE_END + OSC133_ZONE_FINAL)).toHaveLength(2);
+
+		// Unchanged content must keep handing back the same array, otherwise the
+		// differential renderer loses its cache hit and repaints every frame.
+		expect(component.render(20)).toBe(component.render(20));
+	});
+
 	test("uses the themed message background when terminal background is unknown", () => {
 		clearDefaultTerminalColors();
 		initTheme("dark");

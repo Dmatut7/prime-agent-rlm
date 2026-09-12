@@ -2,16 +2,26 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Container, resetCapabilitiesCache, setCapabilities, Text, TUI } from "@earendil-works/pi-tui";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import { type Component, Container, resetCapabilitiesCache, setCapabilities, Text, TUI } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { Type } from "typebox";
 import { beforeAll, describe, expect, test, vi } from "vitest";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal.js";
-import type { ToolDefinition } from "../src/core/extensions/types.js";
-import { type BashOperations, createBashTool, createBashToolDefinition } from "../src/core/tools/bash.js";
+import type { ToolDefinition, ToolRenderContext } from "../src/core/extensions/types.js";
+import {
+	type BashOperations,
+	type BashToolDetails,
+	createBashTool,
+	createBashToolDefinition,
+} from "../src/core/tools/bash.js";
 import { createEditToolDefinition } from "../src/core/tools/edit.js";
 import { createAgentConnectionToolDefinition } from "../src/modes/agent-connection/tool-definition.js";
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
+import {
+	truncateToVisualLines,
+	type VisualTruncateResult,
+} from "../src/modes/interactive/components/visual-truncate.js";
 import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 import { getWorkingPulseFrame, workingIconFrame } from "../src/modes/interactive/theme/working-icon.js";
 
@@ -898,5 +908,135 @@ describe("ToolExecutionComponent parity", () => {
 		expect(withDiffLines.filter((line) => line.includes("╰─ README.md +1 -1")).length).toBe(1);
 		expect(withDiffs).toMatch(/1 - before/);
 		expect(withDiffs).toMatch(/1 \+ after/);
+	});
+});
+
+describe("bash preview tail-window parity", () => {
+	beforeAll(() => {
+		initTheme("dark");
+	});
+
+	const definition = createBashToolDefinition(process.cwd());
+	const renderResult = (() => {
+		const fn = definition.renderResult;
+		if (!fn) {
+			throw new Error("bash tool definition must provide renderResult");
+		}
+		return fn;
+	})();
+
+	function createContext(lastComponent: Component | undefined): ToolRenderContext {
+		return {
+			args: { command: "cmd" },
+			toolCallId: "bash-preview",
+			invalidate: () => {},
+			lastComponent,
+			state: {},
+			cwd: process.cwd(),
+			executionStarted: true,
+			argsComplete: true,
+			isPartial: false,
+			expanded: false,
+			showExpandHint: true,
+			showImages: true,
+			includeImageDimensions: true,
+			isError: false,
+		};
+	}
+
+	function renderPreview(output: string, lastComponent?: Component): Component {
+		const result: AgentToolResult<BashToolDetails | undefined> = {
+			content: [{ type: "text", text: output }],
+			details: undefined,
+		};
+		return renderResult(result, { expanded: false, isPartial: false }, theme, createContext(lastComponent));
+	}
+
+	/** The pre-tail-window implementation: restyle and re-wrap the entire output. */
+	function legacyPreview(output: string, width: number): VisualTruncateResult {
+		const styled = output
+			.split("\n")
+			.map((line) => theme.fg("toolOutput", line))
+			.join("\n");
+		return truncateToVisualLines(styled, 5, width);
+	}
+
+	function expectParity(output: string, width: number, component: Component): void {
+		const rendered = component.render(width);
+		const expected = legacyPreview(output.trim(), width);
+		expect(expected.visualLines.length).toBeGreaterThan(0);
+		expect(rendered.slice(-expected.visualLines.length)).toEqual(expected.visualLines);
+		const joined = stripAnsi(rendered.join("\n"));
+		if (expected.skippedCount > 0) {
+			expect(joined).toContain(`... ${expected.skippedCount} earlier lines`);
+		} else {
+			expect(joined).not.toContain("earlier lines");
+		}
+	}
+
+	const cases = [
+		{
+			name: "short lines beyond the preview",
+			output: Array.from({ length: 30 }, (_, i) => `line-${String(i + 1).padStart(2, "0")}`).join("\n"),
+			width: 120,
+		},
+		{
+			name: "a wrapped long line at the tail",
+			output: [...Array.from({ length: 8 }, (_, i) => `short ${i}`), "w".repeat(300), "tail line"].join("\n"),
+			width: 100,
+		},
+		{
+			name: "a single tail line wrapping past the preview",
+			output: [...Array.from({ length: 4 }, (_, i) => `head ${i}`), "z".repeat(900)].join("\n"),
+			width: 80,
+		},
+		{
+			name: "tabs expand like the full-output render",
+			output: Array.from({ length: 10 }, (_, i) => `col\t${i}\tvalue-${"v".repeat(50)}`).join("\n"),
+			width: 60,
+		},
+		{
+			name: "wide CJK characters wrap on visible width",
+			output: [...Array.from({ length: 8 }, (_, i) => `汉字测试 line ${i}`), "尾".repeat(40)].join("\n"),
+			width: 40,
+		},
+		{
+			name: "fewer lines than the preview",
+			output: "alpha\nbeta\ngamma",
+			width: 120,
+		},
+		{
+			name: "exactly five visual lines",
+			output: "1\n2\n3\n4\n5",
+			width: 120,
+		},
+		{
+			name: "narrow width wraps every line",
+			output: Array.from({ length: 12 }, (_, i) => `words that wrap number ${i}`).join("\n"),
+			width: 24,
+		},
+	];
+
+	test.each(cases)("matches the full-output preview for $name", ({ output, width }) => {
+		expectParity(output, width, renderPreview(output));
+	});
+
+	test("keeps parity across repeated streaming updates on the same component", () => {
+		const width = 100;
+		const context = createContext(undefined);
+		let output = "";
+		for (let i = 1; i <= 40; i++) {
+			output = output ? `${output}\nchunk-${i}` : `chunk-${i}`;
+			const result: AgentToolResult<BashToolDetails | undefined> = {
+				content: [{ type: "text", text: output }],
+				details: undefined,
+			};
+			context.lastComponent = renderResult(result, { expanded: false, isPartial: true }, theme, context);
+		}
+		const component = context.lastComponent;
+		if (!component) {
+			throw new Error("streaming updates must produce a component");
+		}
+		expectParity(output, width, component);
 	});
 });

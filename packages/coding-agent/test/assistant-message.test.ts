@@ -42,6 +42,24 @@ describe("AssistantMessageComponent", () => {
 		expect(lines[lines.length - 1].startsWith(OSC133_ZONE_END + OSC133_ZONE_FINAL)).toBe(true);
 	});
 
+	test("does not accumulate OSC 133 markers on repeated renders", () => {
+		initTheme("dark");
+
+		const component = new AssistantMessageComponent(createAssistantMessage([{ type: "text", text: "hello" }]));
+		const first = [...component.render(40)];
+		const second = [...component.render(40)];
+
+		expect(second).toEqual(first);
+		expect(first[0].split(OSC133_ZONE_START)).toHaveLength(2);
+		expect(first[first.length - 1].split(OSC133_ZONE_END + OSC133_ZONE_FINAL)).toHaveLength(2);
+
+		component.updateContent(createAssistantMessage([{ type: "text", text: "hello again" }]));
+		const updated = component.render(40);
+		expect(stripAnsi(updated.join("\n"))).toContain("hello again");
+		expect(updated[0].split(OSC133_ZONE_START)).toHaveLength(2);
+		expect(updated[updated.length - 1].split(OSC133_ZONE_END + OSC133_ZONE_FINAL)).toHaveLength(2);
+	});
+
 	test("ignores null content blocks from malformed provider responses", () => {
 		initTheme("dark");
 

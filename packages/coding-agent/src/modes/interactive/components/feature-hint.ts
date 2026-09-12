@@ -22,6 +22,9 @@ function renderLabelShimmer(characters: string[], frame: number): string {
 
 export class FeatureHintComponent implements Component {
 	private frame = 0;
+	private cachedWidth?: number;
+	private cachedFrame?: number;
+	private cachedLines?: string[];
 
 	constructor(private readonly text: string) {}
 
@@ -29,9 +32,17 @@ export class FeatureHintComponent implements Component {
 		this.frame++;
 	}
 
-	invalidate(): void {}
+	invalidate(): void {
+		this.cachedWidth = undefined;
+		this.cachedFrame = undefined;
+		this.cachedLines = undefined;
+	}
 
 	render(width: number): string[] {
+		if (this.cachedLines && this.cachedWidth === width && this.cachedFrame === this.frame) {
+			return this.cachedLines;
+		}
+
 		const paddingX = width > 2 ? 1 : 0;
 		const availableWidth = Math.max(1, width - paddingX * 2);
 		const displayText = truncateToWidth(`${LABEL} ${this.text}`, availableWidth);
@@ -41,6 +52,10 @@ export class FeatureHintComponent implements Component {
 		const hint = theme.fg("muted", characters.slice(labelLength).join(""));
 		const line = `${" ".repeat(paddingX)}${label}${hint}`;
 
-		return [line + " ".repeat(Math.max(0, width - visibleWidth(line))), " ".repeat(width)];
+		const lines = [line + " ".repeat(Math.max(0, width - visibleWidth(line))), " ".repeat(width)];
+		this.cachedWidth = width;
+		this.cachedFrame = this.frame;
+		this.cachedLines = lines;
+		return lines;
 	}
 }
