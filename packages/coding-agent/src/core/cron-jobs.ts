@@ -115,6 +115,11 @@ interface CronJobsState {
 export const SESSION_SCHEDULED_JOBS_FILENAME = "scheduled-jobs.json";
 
 const MAX_TIMEOUT_MS = 2_147_483_647;
+/**
+ * Re-arm delay used when the store cannot be read at all. Bounded, so a wedged store
+ * costs ticks rather than disarming the scheduler for the rest of the process's life.
+ */
+export const CRON_STORE_FAILURE_RETRY_MS = 30_000;
 const ONE_SECOND_MS = 1000;
 const ONE_MINUTE_MS = 60_000;
 /**
@@ -1145,7 +1150,16 @@ export class AgentCronScheduler {
 		const nextDelay =
 			delayMs ??
 			(() => {
-				const next = this.store.nextActiveRunAt();
+				let next: Date | undefined;
+				try {
+					next = this.store.nextActiveRunAt();
+				} catch (error) {
+					// Never leave the scheduler unarmed. Without a timer nothing can notice
+					// the store recovering, so a single failed lookup would silently stop
+					// every cron job and heartbeat in the process until it restarts.
+					cronLog.warn("cron schedule lookup failed, re-arming", { error: errorMessage(error) });
+					return CRON_STORE_FAILURE_RETRY_MS;
+				}
 				if (!next) {
 					return undefined;
 				}
@@ -1649,12 +1663,51 @@ function readJobsState(path: string): CronJobsState {
 	return readJobsStateIfPresent(path) ?? { jobs: [], dispatches: [] };
 }
 
+/** Store files already reported unreadable, so one wrecked file warns once per incident. */
+const reportedUnreadableJobsFiles = new Set<string>();
+
+/**
+ * Quarantine one unreadable store file instead of failing the read.
+ *
+ * A file this store cannot parse (external edit, flipped bytes, another tool writing
+ * into the artifact directory) holds no usable jobs, and throwing here travels up
+ * through nextActiveRunAt into AgentCronScheduler.scheduleNext: one session's wrecked
+ * file used to disarm the scheduler for every session in the process, with a single
+ * warn as the only trace. The bytes are left exactly as they are - a read path does
+ * not get to destroy data - and the next write to that session replaces the file
+ * atomically, which is the self-heal.
+ */
+function reportUnreadableJobsFile(path: string, error: unknown): void {
+	if (reportedUnreadableJobsFiles.has(path)) {
+		return;
+	}
+	reportedUnreadableJobsFiles.add(path);
+	// Only the error class is logged: a JSON parse failure quotes the offending input,
+	// and a jobs file holds prompts.
+	cronLog.warn("cron store file unreadable, scheduling without it", {
+		path,
+		reason: error instanceof Error ? error.name : "unknown",
+	});
+}
+
 /** The store file is absent until something is scheduled; callers tell that apart from an empty one. */
 function readJobsStateIfPresent(path: string): CronJobsState | undefined {
 	if (!existsSync(path)) {
 		return undefined;
 	}
-	const parsed = JSON.parse(readFileSync(path, "utf-8")) as CronJobsFile;
+	let document: unknown;
+	try {
+		document = JSON.parse(readFileSync(path, "utf-8"));
+	} catch (error) {
+		reportUnreadableJobsFile(path, error);
+		return { jobs: [], dispatches: [] };
+	}
+	if (typeof document !== "object" || document === null || Array.isArray(document)) {
+		reportUnreadableJobsFile(path, new TypeError("store file is not a JSON object"));
+		return { jobs: [], dispatches: [] };
+	}
+	reportedUnreadableJobsFiles.delete(path);
+	const parsed = document as CronJobsFile;
 	return {
 		jobs: Array.isArray(parsed.jobs) ? parsed.jobs.filter(isAgentCronJob) : [],
 		dispatches: Array.isArray(parsed.dispatches) ? parsed.dispatches.filter(isAgentCronDispatchRecord) : [],

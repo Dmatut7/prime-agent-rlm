@@ -23,6 +23,8 @@ export class CountdownTimer {
 				this.onExpire();
 			}
 		}, 1000);
+		// A countdown belonging to a session that is gone must not hold the process open.
+		this.intervalId.unref?.();
 	}
 
 	dispose(): void {

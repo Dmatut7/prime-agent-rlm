@@ -57,7 +57,10 @@ export async function executeBashWithOperations(
 		}
 		const id = randomBytes(8).toString("hex");
 		tempFilePath = join(tmpdir(), `pi-bash-${id}.log`);
-		tempFileStream = createWriteStream(tempFilePath);
+		// This file holds the complete output, including the part truncation kept out of
+		// the model's view, and it lives in a world-shared tmpdir: owner-only, like every
+		// other artifact the agent writes.
+		tempFileStream = createWriteStream(tempFilePath, { mode: 0o600 });
 		for (const chunk of outputChunks) {
 			tempFileStream.write(chunk);
 		}
@@ -65,13 +68,11 @@ export async function executeBashWithOperations(
 
 	const decoder = new TextDecoder();
 
-	const onData = (data: Buffer) => {
-		totalBytes += data.length;
-		const text = sanitizeBinaryOutput(stripAnsi(decoder.decode(data, { stream: true }))).replace(/\r/g, "");
-		if (totalBytes > DEFAULT_MAX_BYTES) {
-			ensureTempFile();
+	const appendText = (decoded: string) => {
+		const text = sanitizeBinaryOutput(stripAnsi(decoded)).replace(/\r/g, "");
+		if (text.length === 0) {
+			return;
 		}
-
 		if (tempFileStream) {
 			tempFileStream.write(text);
 		}
@@ -86,12 +87,31 @@ export async function executeBashWithOperations(
 		}
 	};
 
+	const onData = (data: Buffer) => {
+		totalBytes += data.length;
+		if (totalBytes > DEFAULT_MAX_BYTES) {
+			ensureTempFile();
+		}
+		appendText(decoder.decode(data, { stream: true }));
+	};
+
+	/**
+	 * Deliver whatever the streaming decoder is still holding. A producer cut off
+	 * mid-character (timeout, kill, abort) leaves an incomplete sequence buffered;
+	 * without this those bytes disappear from both the returned output and the
+	 * persisted file instead of surfacing as the replacement character.
+	 */
+	const flushDecoder = () => {
+		appendText(decoder.decode());
+	};
+
 	try {
 		const result = await operations.exec(command, cwd, {
 			onData,
 			signal: options?.signal,
 		});
 
+		flushDecoder();
 		const fullOutput = outputChunks.join("");
 		const truncationResult = truncateTail(fullOutput);
 		if (truncationResult.truncated) {
@@ -111,6 +131,7 @@ export async function executeBashWithOperations(
 		};
 	} catch (err) {
 		if (options?.signal?.aborted) {
+			flushDecoder();
 			const fullOutput = outputChunks.join("");
 			const truncationResult = truncateTail(fullOutput);
 			if (truncationResult.truncated) {

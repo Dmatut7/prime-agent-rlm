@@ -1,0 +1,12 @@
+- Fixed the /share secret preflight scanning the base64-encoded export instead of the session it carries, so a session holding credentials now warns before it is uploaded.
+- Added a PEM private key shape to the /share secret preflight.
+- Fixed /share hanging forever when the `gh gist create` spawn fails, and bounded an upload that stops reporting anything.
+- Changed the bash and tool-output full-output temp files to owner-only 0600 instead of world-readable 0644.
+- Fixed a killed or truncated bash command dropping the trailing bytes of an unfinished multi-byte character from its output.
+- Fixed one session's corrupt scheduled-jobs file silencing every cron job and heartbeat in the process; the file is now quarantined, reported once, and healed by the next write.
+- Fixed the cron scheduler staying disarmed after a store read failure; it re-arms on a bounded retry instead.
+- Bounded skill, prompt, theme and package discovery walks against directory symlink cycles and unbounded depth, and reported skipped directories instead of silently truncating discovery.
+- Changed failed `!command` credential resolutions to expire after 30 seconds instead of being cached for the life of the process.
+- Fixed Escape and Ctrl+C leaking unhandled promise rejections when the daemon rejects one of the best-effort abort commands.
+- Fixed a retry countdown, retry loader or compaction loader surviving session replacement and teardown.
+- Unref'd the retry countdown interval so a countdown from a gone session cannot hold the process open.

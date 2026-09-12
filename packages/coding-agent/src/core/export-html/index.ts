@@ -7,6 +7,7 @@ import { writePrivateFileAtomic } from "../../utils/private-files.js";
 import type { ToolDefinition } from "../extensions/types.js";
 import type { SessionEntry } from "../session-manager.js";
 import { SessionManager } from "../session-manager.js";
+import { encodeEmbeddedSessionData } from "./session-data-embedding.js";
 
 /**
  * Interface for rendering custom tools to HTML.
@@ -153,7 +154,7 @@ function generateHtml(sessionData: SessionData, themeName?: string): string {
 	const bodyBg = themeExport.pageBg ?? derivedExportColors.pageBg;
 	const containerBg = themeExport.cardBg ?? derivedExportColors.cardBg;
 	const infoBg = themeExport.infoBg ?? derivedExportColors.infoBg;
-	const sessionDataBase64 = Buffer.from(JSON.stringify(sessionData)).toString("base64");
+	const sessionDataBase64 = encodeEmbeddedSessionData(sessionData);
 	// All substitutions must use replacer functions: the embedded files contain
 	// `$&`/`$$` sequences (template.js cost display, two hljs grammars) that a
 	// string replacement would expand and corrupt.

@@ -6,7 +6,23 @@
 import { execSync, spawnSync } from "child_process";
 import { getShellConfig } from "../utils/shell.js";
 
-const commandResultCache = new Map<string, string | undefined>();
+/**
+ * How long a *failed* command resolution is served from the cache before it is run
+ * again. A failure is usually transient - `!cat /run/secrets/token` before the file
+ * exists, a credential helper timing out, a network-backed command blipping - and
+ * caching it forever meant the credential never resolved again without a restart.
+ * The window is what keeps a permanently broken command from being spawned on every
+ * model call: inside it, the cached failure is served and nothing runs.
+ */
+export const COMMAND_FAILURE_RETRY_AFTER_MS = 30_000;
+
+interface CachedCommandResult {
+	value: string | undefined;
+	/** Epoch millis after which a failed result may be re-resolved; absent for a resolved value. */
+	retryAfter?: number;
+}
+
+const commandResultCache = new Map<string, CachedCommandResult>();
 
 /**
  * Resolve a config value (API key, header value, etc.) to an actual value.
@@ -83,12 +99,20 @@ function executeCommandUncached(commandConfig: string): string | undefined {
 }
 
 function executeCommand(commandConfig: string): string | undefined {
-	if (commandResultCache.has(commandConfig)) {
-		return commandResultCache.get(commandConfig);
+	const cached = commandResultCache.get(commandConfig);
+	if (cached !== undefined && (cached.retryAfter === undefined || cached.retryAfter > Date.now())) {
+		return cached.value;
 	}
 
 	const result = executeCommandUncached(commandConfig);
-	commandResultCache.set(commandConfig, result);
+	// A resolved credential is cached for the lifetime of the process, as before; only
+	// the failure gets an expiry.
+	commandResultCache.set(
+		commandConfig,
+		result === undefined
+			? { value: undefined, retryAfter: Date.now() + COMMAND_FAILURE_RETRY_AFTER_MS }
+			: { value: result },
+	);
 	return result;
 }
 

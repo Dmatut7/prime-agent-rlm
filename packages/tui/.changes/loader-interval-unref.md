@@ -1,0 +1,1 @@
+- Unref'd the Loader animation interval so an indicator nobody stopped cannot keep the process alive.

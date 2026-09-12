@@ -70,6 +70,8 @@ export class Loader extends Text {
 			this.currentFrame = (this.currentFrame + 1) % this.frames.length;
 			this.updateDisplay();
 		}, this.intervalMs);
+		// An indicator nobody stopped must not be what keeps the process alive.
+		this.intervalId.unref?.();
 	}
 
 	private updateDisplay(): void {

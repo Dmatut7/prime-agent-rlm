@@ -207,7 +207,9 @@ export class OutputAccumulator {
 			return;
 		}
 		this.tempFilePath = defaultTempFilePath(this.tempFilePrefix);
-		this.tempFileStream = createWriteStream(this.tempFilePath);
+		// The full output lands in a world-shared tmpdir and outlives the truncation that
+		// kept part of it out of context: owner-only, like every other artifact we write.
+		this.tempFileStream = createWriteStream(this.tempFilePath, { mode: 0o600 });
 		for (const chunk of this.rawChunks) {
 			this.tempFileStream.write(chunk);
 		}

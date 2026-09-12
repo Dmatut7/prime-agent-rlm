@@ -120,7 +120,7 @@ import { parseCommandArgs } from "../../core/prompt-templates.js";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.js";
 import { SessionImportFileNotFoundError } from "../../core/session-import-errors.js";
 import { resolveSessionPath, SessionSelectorError, SessionSelectorNotFoundError } from "../../core/session-resolver.js";
-import { confirmShareIfSecrets, createShareTempHtmlFile } from "../../core/share-session.js";
+import { confirmShareIfSecrets, createShareTempHtmlFile, SHARE_UPLOAD_TIMEOUT_MS } from "../../core/share-session.js";
 import { parseSkillBlock } from "../../core/skill-blocks.js";
 import {
 	BUILTIN_SLASH_COMMANDS,
@@ -2964,6 +2964,9 @@ export class InteractiveMode {
 		this.activeBashComponent = undefined;
 		// Likewise: the next session's view may never see this refine settle.
 		this.discardRefineLoader();
+		// Same for a retry countdown or a compaction loader from the session being
+		// replaced: both keep an interval running that nothing in the next view owns.
+		this.disposeTransientStatusOverlays();
 		this.pendingBashComponents = [];
 		this.activityTracker.reset();
 		this.contextUsageTokenBaseline = 0;
@@ -3538,6 +3541,30 @@ export class InteractiveMode {
 		this.discardRefineLoader();
 		this.statusContainer.clear();
 		this.syncWorkingLoader();
+	}
+
+	/**
+	 * Stops and removes the transient status overlays: the retry countdown, the retry
+	 * loader and the compaction loader. Both a session replacement and a teardown need
+	 * this. A countdown left running keeps ticking into the next session's view and
+	 * re-rendering it, and on the teardown path its interval is what holds the process
+	 * open after the UI is gone.
+	 */
+	private disposeTransientStatusOverlays(): void {
+		if (this.retryCountdown) {
+			this.retryCountdown.dispose();
+			this.retryCountdown = undefined;
+		}
+		if (this.retryLoader) {
+			this.retryLoader.stop();
+			this.statusContainer.removeChild(this.retryLoader);
+			this.retryLoader = undefined;
+		}
+		if (this.autoCompactionLoader) {
+			this.autoCompactionLoader.stop();
+			this.statusContainer.removeChild(this.autoCompactionLoader);
+			this.autoCompactionLoader = undefined;
+		}
 	}
 
 	/** Stops and removes the loader without remounting old-session state. */
@@ -6954,15 +6981,20 @@ export class InteractiveMode {
 		if (this.sideQuestionEvent?.status === "running") {
 			this.abortSideQuestion(this.sideQuestionEvent.id, true);
 		}
+		// Best-effort aborts issued next to the primary one below. Each needs its own
+		// .catch(): a daemon that answers with an error would otherwise turn one Escape
+		// press into an unhandled rejection. Swallowing is honest here - when one of these
+		// fails the thing it was stopping keeps running on screen, and the primary
+		// abort() reports its own failure to the user.
 		if (this.getRetryAttempt() > 0) {
-			void this.agentConnection.abortRetry();
+			void this.agentConnection.abortRetry().catch(() => undefined);
 		}
 		if (this.isAgentCompacting()) {
-			void this.agentConnection.abortCompaction();
-			void this.agentConnection.abortBranchSummary();
+			void this.agentConnection.abortCompaction().catch(() => undefined);
+			void this.agentConnection.abortBranchSummary().catch(() => undefined);
 		}
 		if (this.isBashRunning()) {
-			void this.agentConnection.abortBash();
+			void this.agentConnection.abortBash().catch(() => undefined);
 		}
 		if (this.isAgentStreaming()) {
 			// The queue is preserved server-side; draining resumes on the next
@@ -9302,7 +9334,9 @@ export class InteractiveMode {
 
 		// Scan the bytes that are actually uploaded. The HTML export also carries the
 		// tool definitions and the working-directory context the exporter adds, so
-		// scanning the raw messages instead would pass secrets it never looks at.
+		// scanning the raw messages instead would pass secrets it never looks at. The
+		// session itself rides along base64-encoded inside those bytes, which is why the
+		// preflight decodes the embedded payload and scans the plaintext it recovers.
 		let exportedHtml: string;
 		try {
 			exportedHtml = readPrivateFile(tmpFile, "utf-8");
@@ -9383,18 +9417,35 @@ export class InteractiveMode {
 		};
 
 		try {
-			const result = await new Promise<{ stdout: string; stderr: string; code: number | null }>((resolve) => {
-				proc = spawn("gh", ["gist", "create", "--public=false", tmpFile]);
-				let stdout = "";
-				let stderr = "";
-				proc.stdout?.on("data", (data) => {
-					stdout += data.toString();
-				});
-				proc.stderr?.on("data", (data) => {
-					stderr += data.toString();
-				});
-				proc.on("close", (code) => resolve({ stdout, stderr, code }));
-			});
+			const result = await new Promise<{ stdout: string; stderr: string; code: number | null }>(
+				(resolve, reject) => {
+					proc = spawn("gh", ["gist", "create", "--public=false", tmpFile]);
+					let stdout = "";
+					let stderr = "";
+					proc.stdout?.on("data", (data) => {
+						stdout += data.toString();
+					});
+					proc.stderr?.on("data", (data) => {
+						stderr += data.toString();
+					});
+					// A spawn that fails (gh removed from PATH after the preflight, EMFILE,
+					// EACCES) emits 'error' and never 'close': without this listener the
+					// await below never settles and /share hangs with the loader on screen.
+					// The bound covers the third shape - a process that reports nothing at
+					// all; the loader's own abort stays the fast path for the user.
+					const bound = setTimeout(() => {
+						proc?.kill();
+						reject(new Error(`gh gist create timed out after ${Math.round(SHARE_UPLOAD_TIMEOUT_MS / 1000)}s`));
+					}, SHARE_UPLOAD_TIMEOUT_MS);
+					bound.unref?.();
+					const settle = (outcome: () => void) => {
+						clearTimeout(bound);
+						outcome();
+					};
+					proc.on("error", (error) => settle(() => reject(error)));
+					proc.on("close", (code) => settle(() => resolve({ stdout, stderr, code })));
+				},
+			);
 
 			if (loader.signal.aborted) return;
 
@@ -10359,6 +10410,7 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 		}
 		this.stopWorkingLoader();
 		this.discardRefineLoader();
+		this.disposeTransientStatusOverlays();
 		this.endFeatureHintRun();
 		this.stopWorkingPulse();
 		this.stopGoalTrayTimer();

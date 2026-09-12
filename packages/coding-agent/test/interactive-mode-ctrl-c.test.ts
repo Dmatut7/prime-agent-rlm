@@ -101,10 +101,12 @@ function createInteractiveFake(options: {
 			abort: vi.fn().mockResolvedValue(undefined),
 			clearQueue: vi.fn().mockResolvedValue({ steering: [], followUp: [] }),
 			abortAndClearQueue: vi.fn().mockResolvedValue({ steering: [], followUp: [] }),
-			abortRetry: vi.fn(),
-			abortCompaction: vi.fn(),
-			abortBranchSummary: vi.fn(),
-			abortBash: vi.fn(),
+			// Promise-returning, as the real connection is: the interrupt path attaches a
+			// .catch() to each of these best-effort aborts.
+			abortRetry: vi.fn().mockResolvedValue(undefined),
+			abortCompaction: vi.fn().mockResolvedValue(undefined),
+			abortBranchSummary: vi.fn().mockResolvedValue(undefined),
+			abortBash: vi.fn().mockResolvedValue(undefined),
 		},
 		subagentSummaryLine: { invalidate: vi.fn() },
 		ui: { requestRender: vi.fn() },

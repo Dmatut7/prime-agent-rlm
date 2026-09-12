@@ -4,6 +4,12 @@ import ignore from "ignore";
 import { homedir } from "os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "path";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
+import {
+	createDiscoveryWalk,
+	type DiscoveryWalk,
+	enterDiscoveryDirectory,
+	leaveDiscoveryDirectory,
+} from "../utils/discovery-walk.js";
 import { parseFrontmatter } from "../utils/frontmatter.js";
 import { canonicalizePath } from "../utils/paths.js";
 import type { ResourceDiagnostic } from "./diagnostics.js";
@@ -283,6 +289,7 @@ function loadSkillsFromDirInternal(
 	includeRootFiles: boolean,
 	ignoreMatcher?: IgnoreMatcher,
 	rootDir?: string,
+	walk: DiscoveryWalk = createDiscoveryWalk(),
 ): LoadSkillsResult {
 	const skills: Skill[] = [];
 	const diagnostics: ResourceDiagnostic[] = [];
@@ -291,11 +298,25 @@ function loadSkillsFromDirInternal(
 		return { skills, diagnostics };
 	}
 
-	const root = rootDir ?? dir;
-	const ig = ignoreMatcher ?? ignore();
-	addIgnoreRules(ig, dir, root);
+	// Skill directories may be symlinks, so the walk has to bound itself: a link to an
+	// ancestor rescans the whole tree until the path name stops fitting, and a link to a
+	// large tree makes every startup walk all of it. Report the skip - a silently
+	// truncated discovery is indistinguishable from "there are no skills here".
+	const skip = enterDiscoveryDirectory(walk, dir);
+	if (skip) {
+		diagnostics.push({
+			type: "warning",
+			message: skip === "cycle" ? "skipped a directory symlink cycle" : "skipped a directory past the depth limit",
+			path: dir,
+		});
+		return { skills, diagnostics };
+	}
 
 	try {
+		const root = rootDir ?? dir;
+		const ig = ignoreMatcher ?? ignore();
+		addIgnoreRules(ig, dir, root);
+
 		const entries = readdirSync(dir, { withFileTypes: true });
 
 		for (const entry of entries) {
@@ -357,7 +378,7 @@ function loadSkillsFromDirInternal(
 			}
 
 			if (isDirectory) {
-				const subResult = loadSkillsFromDirInternal(fullPath, source, false, ig, root);
+				const subResult = loadSkillsFromDirInternal(fullPath, source, false, ig, root, walk);
 				skills.push(...subResult.skills);
 				diagnostics.push(...subResult.diagnostics);
 				continue;
@@ -378,6 +399,8 @@ function loadSkillsFromDirInternal(
 			dir,
 			error: error instanceof Error ? error.message : String(error),
 		});
+	} finally {
+		leaveDiscoveryDirectory(walk);
 	}
 
 	return { skills, diagnostics };

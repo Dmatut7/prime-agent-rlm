@@ -24,16 +24,26 @@ function getEnv(): NodeJS.ProcessEnv {
 
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import type { Readable } from "node:stream";
+import { getLogger } from "@earendil-works/pi-ai";
 import { globSync } from "glob";
 import ignore from "ignore";
 import { minimatch } from "minimatch";
 import { CONFIG_DIR_NAME, getBundledSkillsDir } from "../config.js";
 import { shouldUseWindowsShell } from "../utils/child-process.js";
+import {
+	createDiscoveryWalk,
+	type DiscoverySkipReason,
+	type DiscoveryWalk,
+	enterDiscoveryDirectory,
+	leaveDiscoveryDirectory,
+} from "../utils/discovery-walk.js";
 import { type GitSource, parseGitUrl } from "../utils/git.js";
 import { canonicalizePath, isLocalPath } from "../utils/paths.js";
 import type { ResourceDiagnostic } from "./diagnostics.js";
 import { isStdoutTakenOver } from "./output-guard.js";
 import type { PackageSource, SettingsManager } from "./settings-manager.js";
+
+const log = getLogger("coding-agent.package-manager");
 
 const NETWORK_TIMEOUT_MS = 10000;
 const UPDATE_CHECK_CONCURRENCY = 4;
@@ -291,9 +301,16 @@ function collectFiles(
 	skipNodeModules = true,
 	ignoreMatcher?: IgnoreMatcher,
 	rootDir?: string,
+	walk: DiscoveryWalk = createDiscoveryWalk(),
 ): string[] {
 	const files: string[] = [];
 	if (!existsSync(dir)) return files;
+
+	const skip = enterDiscoveryDirectory(walk, dir);
+	if (skip) {
+		reportDiscoverySkip(skip, dir);
+		return files;
+	}
 
 	const root = rootDir ?? dir;
 	const ig = ignoreMatcher ?? ignore();
@@ -324,13 +341,15 @@ function collectFiles(
 			if (ig.ignores(ignorePath)) continue;
 
 			if (isDir) {
-				files.push(...collectFiles(fullPath, filePattern, skipNodeModules, ig, root));
+				files.push(...collectFiles(fullPath, filePattern, skipNodeModules, ig, root, walk));
 			} else if (isFile && filePattern.test(entry.name)) {
 				files.push(fullPath);
 			}
 		}
-	} catch {
-		// Ignore unreadable directories during file discovery.
+	} catch (error) {
+		reportDiscoveryScanFailure(dir, error, files.length);
+	} finally {
+		leaveDiscoveryDirectory(walk);
 	}
 
 	return files;
@@ -343,9 +362,16 @@ function collectSkillEntries(
 	mode: SkillDiscoveryMode,
 	ignoreMatcher?: IgnoreMatcher,
 	rootDir?: string,
+	walk: DiscoveryWalk = createDiscoveryWalk(),
 ): string[] {
 	const entries: string[] = [];
 	if (!existsSync(dir)) return entries;
+
+	const skip = enterDiscoveryDirectory(walk, dir);
+	if (skip) {
+		reportDiscoverySkip(skip, dir);
+		return entries;
+	}
 
 	const root = rootDir ?? dir;
 	const ig = ignoreMatcher ?? ignore();
@@ -403,13 +429,33 @@ function collectSkillEntries(
 			if (!isDir) continue;
 			if (ig.ignores(`${relPath}/`)) continue;
 
-			entries.push(...collectSkillEntries(fullPath, mode, ig, root));
+			entries.push(...collectSkillEntries(fullPath, mode, ig, root, walk));
 		}
-	} catch {
-		// Ignore unreadable directories during skill discovery.
+	} catch (error) {
+		reportDiscoveryScanFailure(dir, error, entries.length);
+	} finally {
+		leaveDiscoveryDirectory(walk);
 	}
 
 	return entries;
+}
+
+/**
+ * A skipped directory is a hole in the discovery result, so it is reported instead of
+ * being swallowed: "no resources found" and "resources not looked for" must stay
+ * distinguishable.
+ */
+function reportDiscoverySkip(reason: DiscoverySkipReason, dir: string): void {
+	log.warn("resource discovery skipped a directory", { reason, path: dir });
+}
+
+/** Same for a directory that could not be read: the entries after the failure are gone. */
+function reportDiscoveryScanFailure(dir: string, error: unknown, collected: number): void {
+	log.warn("resource discovery could not scan a directory", {
+		path: dir,
+		collected,
+		error: error instanceof Error ? error.message : String(error),
+	});
 }
 
 function collectAutoSkillEntries(dir: string, mode: SkillDiscoveryMode): string[] {
