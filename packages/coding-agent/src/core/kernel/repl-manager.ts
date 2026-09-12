@@ -2520,7 +2520,7 @@ export class ReplKernelManager {
 	}
 
 	private async captureSnapshot(
-		options: { executionTimeoutMs?: number; pruneOversized?: boolean } = {},
+		options: { executionTimeoutMs?: number; pruneOversized?: boolean; final?: boolean } = {},
 	): Promise<SnapshotResult | null> {
 		const cfg = this.options.snapshot;
 		if (!cfg || !this.isRunning) return null;
@@ -2539,6 +2539,13 @@ export class ReplKernelManager {
 					max_bytes: cfg.maxBytes ?? DEFAULT_SNAPSHOT_MAX_BYTES,
 					max_variable_bytes: cfg.maxVariableBytes ?? DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES,
 					prune_oversized: options.pruneOversized ?? false,
+					// The terminal (dispose) flush asks the runtime to skip its snapshot replay
+					// shortcut: an in-place mutation by a background thread after the last snapshot
+					// is invisible to that shortcut's fingerprints, and this write is the last word
+					// on the namespace. Additive and deliberately ungated - a runtime without the
+					// shortcut has nothing to bypass and ignores the key (unlike preserve_names,
+					// where being ignored would lose data).
+					...(options.final ? { final: true } : {}),
 					// Sent only for names that need it, and only to a runtime that announced the
 					// capability (see currentSnapshotWritePolicy).
 					...(policy.preserveNames.length > 0 ? { preserve_names: policy.preserveNames } : {}),
@@ -2800,7 +2807,9 @@ export class ReplKernelManager {
 			]);
 			if (timeout) globalThis.clearTimeout(timeout);
 			if (!queueSettled) return;
-			await this.captureSnapshot({ executionTimeoutMs: SNAPSHOT_EXECUTION_TIMEOUT_MS });
+			// Terminal write: `final` keeps the runtime from answering it out of its replay
+			// shortcut, so a background mutation since the last snapshot still lands on disk.
+			await this.captureSnapshot({ executionTimeoutMs: SNAPSHOT_EXECUTION_TIMEOUT_MS, final: true });
 		} finally {
 			// Reset: a superseding start() can revive this kernel for new work.
 			this.flushingSnapshotForDispose = false;

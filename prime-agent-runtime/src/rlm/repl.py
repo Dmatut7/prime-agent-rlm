@@ -1348,6 +1348,9 @@ async def _handle_state(req: dict[str, Any], ns: dict[str, Any]) -> None:
                     isinstance(name, str) for name in preserve_names
                 ):
                     return {"error": "preserve_names must be a list of strings"}
+            final = req.get("final", False)
+            if not isinstance(final, bool):
+                return {"error": "final must be a boolean"}
             for field in ("max_bytes", "max_variable_bytes"):
                 # Any present value must be a non-negative int; a JSON null is not a valid way to ask
                 # for the default, and a negative cap would prune every user variable from ns.
@@ -1369,7 +1372,14 @@ async def _handle_state(req: dict[str, Any], ns: dict[str, Any]) -> None:
                 prune,
                 tuple(preserve_names) if preserve_names is not None else None,
             )
-            replay = _replayable_snapshot(key, req["path"], req["manifest_path"], ns)
+            # A `final` request is the host's last word on this namespace (the dispose
+            # flush), so it is never answered from the replay record: a background thread
+            # that mutated a value IN PLACE after the last snapshot is invisible to every
+            # fingerprint here (identity unchanged, no cell ran), and only a physical write
+            # captures it. Unlike preserve_names this field carries no protocol gate - a
+            # runtime that predates it has no replay shortcut to bypass, so ignoring the key
+            # degrades to the full write it already performs.
+            replay = None if final else _replayable_snapshot(key, req["path"], req["manifest_path"], ns)
             if replay is not None:
                 # Nothing ran and no binding changed since the last committed snapshot,
                 # and the pair on disk is intact: its result already describes exactly

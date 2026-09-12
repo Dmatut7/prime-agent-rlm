@@ -23,6 +23,8 @@ import tempfile
 import time
 import unittest
 
+import dill
+
 from test_repl import ReplProcess, one, stream_text
 
 SRC = os.path.join(os.path.dirname(__file__), "..", "src")
@@ -280,6 +282,52 @@ class SnapshotReplayProtocolTest(unittest.TestCase):
         self.assertIn("unsafe", d2["reason"])
         with open(outside, "rb") as fh:
             self.assertEqual(fh.read(), b"sentinel")
+
+
+    def test_a_final_request_writes_through_the_replay_shortcut(self) -> None:
+        """`final` is the host's dispose flush: it must never be answered from the record.
+
+        A background thread mutating a value IN PLACE between two snapshots is invisible to
+        every fingerprint the shortcut checks (no cell ran, no binding was replaced, the
+        committed pair is intact), so a plain request legitimately replays a stale payload.
+        The terminal request is the last word on this namespace, so it writes through.
+        """
+        code = (
+            "import threading, time\n"
+            "box = ['initial']\n"
+            "def mutate_later():\n"
+            "    time.sleep(1.5)\n"
+            "    box.append('late')\n"
+            "threading.Thread(target=mutate_later, daemon=True).start()\n"
+        )
+        self.assertEqual(one(self.repl.execute("c1", code), "done")["status"], "ok")
+        self.assertEqual(self.snapshot("s1")["status"], "ok")
+
+        def box_on_disk() -> object:
+            with open(self.path, "rb") as fh:
+                return dill.loads(dill.load(fh)["box"])
+
+        self.assertEqual(box_on_disk(), ["initial"])
+        before = self.pair_facts()
+        # The background mutation lands here; no cell runs, so no fingerprint invalidates.
+        time.sleep(2.0)
+        replayed = self.snapshot("s2")
+        self.assertEqual(replayed["status"], "ok")
+        self.assertEqual(before, self.pair_facts(), "a replayed snapshot must not touch the pair")
+        self.assertEqual(box_on_disk(), ["initial"], "documented approximation: the replay is stale")
+
+        final = self.snapshot("s3", final=True)
+        self.assertEqual(final["status"], "ok")
+        self.assertNotEqual(before, self.pair_facts(), "a final snapshot must physically write")
+        self.assertEqual(box_on_disk(), ["initial", "late"])
+        self.assertIn("box", final["saved"])
+
+    def test_a_malformed_final_flag_is_refused(self) -> None:
+        self.assertEqual(one(self.repl.execute("c1", "x = 1"), "done")["status"], "ok")
+        refused = self.snapshot("s1", final="yes")
+        self.assertEqual(refused["status"], "error")
+        self.assertIn("final must be a boolean", refused["reason"])
+        self.assertFalse(os.path.exists(self.path), "a refused request must not write")
 
 
 class StreamCoalescingProtocolTest(unittest.TestCase):

@@ -61,7 +61,7 @@ it.
 | `execute` | `{"type":"execute","id":str,"code":str}` |
 | `interrupt` | `{"type":"interrupt","id"?:str}` — no reply |
 | `host_reply` | `{"type":"host_reply","id":str,"data":{"status":"ok","result":{...}}}` or an error envelope — no reply |
-| `snapshot` | `{"type":"snapshot","id":str,"path":str,"manifest_path":str,"max_bytes"?:int,"max_variable_bytes"?:int,"prune_oversized"?:bool,"preserve_names"?:[str,...]}` — `preserve_names` needs the negotiated protocol 4 and the `preserve_names` capability token |
+| `snapshot` | `{"type":"snapshot","id":str,"path":str,"manifest_path":str,"max_bytes"?:int,"max_variable_bytes"?:int,"prune_oversized"?:bool,"final"?:bool,"preserve_names"?:[str,...]}` — `preserve_names` needs the negotiated protocol 4 and the `preserve_names` capability token; `final` is ungated, a runtime without the snapshot replay shortcut ignores it |
 | `restore` | `{"type":"restore","id":str,"path":str}` |
 | `list_names` | `{"type":"list_names","id":str}` |
 | `shutdown` | `{"type":"shutdown","id"?:str}` |
@@ -251,6 +251,15 @@ Mutable values are only reused under the no-cell-executed condition, because
 in-place mutation by a cell is invisible to identity; in-place mutation by a
 background thread while no cell runs is outside what the fingerprint can see
 (the same approximation the replay condition makes).
+
+`final: true` marks the host's terminal (dispose) snapshot, and such a request is
+never answered from the replay record: it is the last word on this namespace, so
+it is written even when every fingerprint says nothing changed. That covers the
+hole above for the snapshot a later kernel will restore from; ordinary per-cell
+snapshots keep the shortcut, so a payload written by one of them can still miss
+an in-place background mutation until the next cell or the terminal flush. The
+field is additive and ungated — a runtime without the shortcut has nothing to
+bypass and ignores it.
 
 `preserve_names` (protocol 4, gated on the capability token) turns the write into
 a merge write: for each requested name the blob is copied verbatim from the
