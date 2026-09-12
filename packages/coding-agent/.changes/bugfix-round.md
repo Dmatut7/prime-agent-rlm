@@ -6,3 +6,4 @@
 - Fixed kitty key-release double-fire (PageUp scrolling twice), RPC unknown-command errors missing the request id, and ACP sessions silently swallowing extension errors.
 - MCP OAuth callbacks now validate state before settling; MCP calls and session opens have bounded timeouts instead of hanging for minutes.
 - Fixed Bedrock 1h cache-write mispricing; cron store no longer re-reads everything per mutation and prunes terminal jobs; agents view reconcile is coalesced instead of O(N^2); autonomous gate snapshots are captured lazily; legacy session migration now converges; stdin paste and inline transcript normalization no longer quadratic.
+- Added structured warnings when a cron store lock wait is exhausted and when a scheduled tick fails, so a dropped tick or a contended store file is diagnosable from the agent log.

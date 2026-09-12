@@ -10,8 +10,11 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { getLogger } from "@earendil-works/pi-ai";
 import { lockSync } from "proper-lockfile";
 import { getSessionArtifactPathForFile } from "./session-manager.js";
+
+const cronLog = getLogger("coding-agent.cron-jobs");
 
 export type AgentCronJobStatus = "active" | "paused" | "completed" | "cancelled";
 export type AgentCronScheduleKind = "once" | "cron" | "interval";
@@ -1155,8 +1158,11 @@ export class AgentCronScheduler {
 			() => {
 				// runDue re-arms the timer in its finally block, so a failure here (a store
 				// lock held by another process, for instance) only costs this tick. Left
-				// unhandled it would be an unhandled rejection, which kills the worker.
-				void this.runDue().catch(() => undefined);
+				// unhandled it would be an unhandled rejection, which kills the worker;
+				// swallowed silently it would cost the tick without a trace.
+				void this.runDue().catch((error) => {
+					cronLog.warn("cron tick failed", { error: errorMessage(error) });
+				});
 			},
 			Math.min(nextDelay, MAX_TIMEOUT_MS),
 		);
@@ -1613,6 +1619,14 @@ function withCronJobsStateLocks<T>(paths: readonly string[], action: () => T): T
 						throw new Error(`Cron jobs lock compromised: ${path}`);
 					}
 					if ((error as NodeJS.ErrnoException).code !== "ELOCKED" || attempt === LOCK_RETRY_ATTEMPTS - 1) {
+						// Giving up costs ~205ms of synchronous waiting, so say which store file
+						// was contended: otherwise a lock timeout reads as a store bug.
+						cronLog.warn("cron store lock unavailable", {
+							path,
+							attempts: attempt + 1,
+							code: (error as NodeJS.ErrnoException).code,
+							error: errorMessage(error),
+						});
 						throw error;
 					}
 					Atomics.wait(sleepBuffer, 0, 0, Math.min(LOCK_RETRY_MAX_DELAY_MS, attempt + 1));

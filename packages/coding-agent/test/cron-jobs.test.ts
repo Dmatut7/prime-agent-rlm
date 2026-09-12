@@ -1,6 +1,7 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { type LogEntry, setLogSink } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	type AgentCronJob,
@@ -1138,6 +1139,40 @@ describe("AgentCronJobStore", () => {
 
 		expect(blockedMs).toBeLessThan(700);
 	});
+
+	it("attributes an exhausted store lock wait in the structured log", () => {
+		const storePath = makeStorePath(tempDirs);
+		const store = new AgentCronJobStore(storePath);
+		mkdirSync(`${storePath}.lock`, { recursive: true });
+		const entries: LogEntry[] = [];
+		setLogSink((entry) => {
+			entries.push(entry);
+		});
+
+		try {
+			expect(() =>
+				store.create({
+					activeSessionId: "active-1",
+					sessionId: "session-1",
+					sessionFile: "/tmp/session.jsonl",
+					cwd: "/tmp/project",
+					scheduleText: "in 1h",
+					prompt: "contended write",
+					now: start,
+				}),
+			).toThrow("Lock file is already being held");
+		} finally {
+			setLogSink(undefined);
+		}
+
+		// The retry budget is a fraction of what it used to be, so running out of it
+		// has to be attributable instead of surfacing as an opaque store failure.
+		const lockLogs = entries.filter(
+			(entry) => entry.component === "coding-agent.cron-jobs" && entry.msg === "cron store lock unavailable",
+		);
+		expect(lockLogs.length).toBeGreaterThan(0);
+		expect(lockLogs[0]).toMatchObject({ level: "warn", path: storePath, attempts: 25 });
+	});
 });
 
 describe("AgentCronScheduler", () => {
@@ -1555,6 +1590,56 @@ describe("AgentCronScheduler", () => {
 		]);
 		expect(recovered.getClaimedJob(heartbeat.id)).toBeUndefined();
 		expect(recovered.getDueJob(heartbeat.id, new Date("2026-01-01T12:34:11.000Z"))).toBeUndefined();
+	});
+
+	it("logs a failed tick instead of leaving it as an unhandled rejection", async () => {
+		vi.useFakeTimers();
+		const storePath = makeStorePath(tempDirs);
+		const store = new AgentCronJobStore(storePath);
+		store.create({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: "/tmp/session.jsonl",
+			cwd: "/tmp/project",
+			scheduleText: "in 1m",
+			prompt: "contended tick",
+			now: start,
+		});
+		const scheduler = new AgentCronScheduler(store, {
+			now: () => new Date("2026-01-01T12:35:00.000Z"),
+			runJob: async () => undefined,
+		});
+		const entries: LogEntry[] = [];
+		const unhandled: unknown[] = [];
+		const onUnhandledRejection = (reason: unknown): void => {
+			unhandled.push(reason);
+		};
+
+		scheduler.start();
+		// The claim runs under the store lock, so a lock another process holds makes the
+		// tick fail exactly the way the re-arming timer callback has to absorb.
+		mkdirSync(`${storePath}.lock`, { recursive: true });
+		process.on("unhandledRejection", onUnhandledRejection);
+		setLogSink((entry) => {
+			entries.push(entry);
+		});
+		try {
+			await vi.advanceTimersByTimeAsync(0);
+			scheduler.stop();
+			await vi.advanceTimersByTimeAsync(0);
+		} finally {
+			process.off("unhandledRejection", onUnhandledRejection);
+			setLogSink(undefined);
+			vi.useRealTimers();
+		}
+
+		const tickLogs = entries.filter(
+			(entry) => entry.component === "coding-agent.cron-jobs" && entry.msg === "cron tick failed",
+		);
+		expect(tickLogs.length).toBeGreaterThan(0);
+		expect(tickLogs[0]).toMatchObject({ level: "warn" });
+		expect(String(tickLogs[0].error)).toContain("Lock file is already being held");
+		expect(unhandled).toEqual([]);
 	});
 });
 
