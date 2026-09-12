@@ -1,1 +1,2 @@
 - Changed `prime-agent update` on a build from this fork to refuse the official package install (which would discard the fork's changes) and print the fork's own update steps instead; `--allow-official` still takes the official path, and extension updates are unaffected.
+- Added `PRIME_AGENT_FORK_GATE=off` to switch the fork self-update gate off, so suites running inside this checkout can exercise the official update path.

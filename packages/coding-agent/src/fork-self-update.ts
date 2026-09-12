@@ -33,6 +33,9 @@ export interface ForkInstall {
  * CLI, a `dist/` CLI and a `src/` tsx run all resolve to the same root.
  */
 export function detectForkInstall(startDir: string = __dirname): ForkInstall | undefined {
+	// Test seam: the marker walk always fires for in-repo test runs (the module lives
+	// under the checkout), so suites exercising the official update path opt out here.
+	if (process.env.PRIME_AGENT_FORK_GATE === "off") return undefined;
 	let dir = resolve(startDir);
 	for (;;) {
 		if (existsSync(join(dir, FORK_MARKER_FILE))) return { repoRoot: dir };

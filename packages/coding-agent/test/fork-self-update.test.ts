@@ -48,6 +48,22 @@ describe("fork self-update gate", () => {
 		expect(detectForkInstall(resolve(detected?.repoRoot ?? "."))).toEqual(detected);
 	});
 
+	it("opts out of detection while the in-repo update suites run", () => {
+		// The marker walk always fires inside this checkout, so suites that exercise the
+		// official update path (package-command-paths.test.ts) switch the gate off for
+		// their own duration instead of asserting against the refusal.
+		process.env.PRIME_AGENT_FORK_GATE = "off";
+		try {
+			expect(detectForkInstall(forkRoot)).toBeUndefined();
+			expect(detectForkInstall()).toBeUndefined();
+		} finally {
+			delete process.env.PRIME_AGENT_FORK_GATE;
+		}
+
+		// The opt-out is scoped to the variable and not sticky.
+		expect(detectForkInstall(forkRoot)).toEqual({ repoRoot: resolve(forkRoot) });
+	});
+
 	it("names the fork's own update path and never the official installer", () => {
 		const fork = { repoRoot: forkRoot };
 		const lines = forkSelfUpdateRefusalLines(fork);

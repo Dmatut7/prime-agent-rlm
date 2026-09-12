@@ -60,11 +60,15 @@ describe("package commands", () => {
 		process.exitCode = undefined;
 		process.env[ENV_AGENT_DIR] = agentDir;
 		process.env.TMPDIR = tempDir;
+		// The fork self-update gate keys off this checkout's marker file; these tests
+		// exercise the official update path, so the gate is switched off here.
+		process.env.PRIME_AGENT_FORK_GATE = "off";
 		process.chdir(projectDir);
 	});
 
 	afterEach(() => {
 		vi.unstubAllGlobals();
+		delete process.env.PRIME_AGENT_FORK_GATE;
 		process.chdir(originalCwd);
 		process.exitCode = originalExitCode;
 		restoreEnv(ENV_AGENT_DIR, originalAgentDir);
