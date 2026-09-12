@@ -19,7 +19,11 @@ type AbortInternals = {
 		signalCode: NodeJS.Signals | null;
 		kill: (signal?: NodeJS.Signals | number) => boolean;
 		pid?: number;
-		stdin: { destroyed: boolean; destroy: () => void };
+		stdin: {
+			destroyed: boolean;
+			destroy: () => void;
+			on: (event: string, listener: (...args: unknown[]) => void) => void;
+		};
 		stdout?: { destroy: () => void; on: (event: string, listener: (...args: unknown[]) => void) => void };
 		stderr?: { destroy: () => void; on: (event: string, listener: (...args: unknown[]) => void) => void };
 	};
@@ -39,7 +43,7 @@ function configuredManager(
 		signalCode: null,
 		kill: vi.fn(() => true),
 		pid: undefined,
-		stdin: { destroyed: false, destroy: vi.fn() },
+		stdin: { destroyed: false, destroy: vi.fn(), on: vi.fn() },
 		stdout: { destroy: vi.fn(), on: vi.fn() },
 		stderr: { destroy: vi.fn(), on: vi.fn() },
 	});

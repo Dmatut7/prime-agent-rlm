@@ -982,6 +982,20 @@ export class ReplKernelManager {
 			this.appendKernelStderrText(buf.toString());
 		});
 
+		// A write into a kernel that already died surfaces as an 'error' event on the
+		// pipe (write EPIPE). Without a listener Node rethrows it as an uncaught
+		// exception, and this worker's crash handler turns that into process.exit(1) -
+		// taking every other session the worker hosts with it. The pending writeLine
+		// rejection and the exit handler below own the fallout; this records the cause.
+		child.stdin?.on("error", (error) => {
+			if (this.child !== child) return;
+			this.appendKernelDiagnostic(`kernel stdin error: ${errorMessage(error)}`);
+		});
+		child.stdout?.on("error", (error) => {
+			if (this.child !== child) return;
+			this.appendKernelDiagnostic(`kernel stdout error: ${errorMessage(error)}`);
+		});
+
 		child.on("error", (err) => {
 			if (this.child !== child) return;
 			this.appendKernelDiagnostic(`spawn error: ${err.message}`);

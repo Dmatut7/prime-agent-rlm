@@ -1,0 +1,1 @@
+- Fixed a kernel pipe write error (write EPIPE) crashing the whole session worker: pipe errors on the kernel stdin and stdout are now recorded as kernel diagnostics while the pending write rejects cleanly.
