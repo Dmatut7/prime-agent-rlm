@@ -111,13 +111,27 @@ Prime Agent combines a persistent Python control environment with durable harnes
 
 ## Getting Started
 
-Install the latest stable release on macOS or Linux:
+> **This repository is an independently maintained line, not the upstream release channel.**
+> The one-line installer below installs the **upstream** release, which does **not** include this
+> line's fixes (see [FORK_NOTES.md](FORK_NOTES.md)). To run *this* line, build from source:
 
 ```bash
-curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh
+git clone https://github.com/Dmatut7/prime-agent-rlm.git   # default branch merge/repl-kernel
+cd prime-agent-rlm
+npm ci && npm run build && npm link   # installs the `prime-agent` command from this tree
 ```
 
-The installer downloads a versioned release, verifies its SHA-256 checksum, installs the `prime-agent` command, and can prepare the Python runtime used by the agent.
+Or run straight from source without installing (slower startup, same runtime):
+
+```bash
+./prime-agent.sh --daemon-socket /tmp/prime-agent-fork/daemon.sock
+```
+
+If you actually want the official upstream release instead:
+
+```bash
+curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh   # upstream, without this line's changes
+```
 
 Start Prime Agent from the repository or directory you want it to work in:
 
