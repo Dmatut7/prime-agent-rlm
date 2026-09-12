@@ -1,6 +1,7 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { lockSync } from "proper-lockfile";
 
@@ -122,6 +123,11 @@ interface ProcessQueryOptions {
 
 type ProcessQuery = (command: string, args: string[], options?: ProcessQueryOptions) => string;
 
+type ProcessQueryAsync = (command: string, args: string[], options?: ProcessQueryOptions) => Promise<string>;
+
+/** A wedged helper process must not keep an asynchronous identity capture pending forever. */
+const PROCESS_QUERY_TIMEOUT_MS = 5_000;
+
 function runProcessQuery(command: string, args: string[], options?: ProcessQueryOptions): string {
 	return execFileSync(command, args, {
 		encoding: "utf8",
@@ -130,19 +136,69 @@ function runProcessQuery(command: string, args: string[], options?: ProcessQuery
 	});
 }
 
-export function getWindowsProcessStartId(pid: number, query: ProcessQuery = runProcessQuery): string | undefined {
-	if (!Number.isInteger(pid) || pid <= 0) {
-		return undefined;
-	}
-	try {
-		const startTicks = query("powershell.exe", [
+function runProcessQueryAsync(command: string, args: string[], options?: ProcessQueryOptions): Promise<string> {
+	return new Promise((resolve, reject) => {
+		execFile(
+			command,
+			args,
+			{ encoding: "utf8", timeout: PROCESS_QUERY_TIMEOUT_MS, windowsHide: true, env: options?.env },
+			(error, stdout) => {
+				if (error) {
+					reject(error);
+					return;
+				}
+				resolve(stdout);
+			},
+		);
+	});
+}
+
+function windowsStartIdQuery(pid: number): { command: string; args: string[] } {
+	return {
+		command: "powershell.exe",
+		args: [
 			"-NoLogo",
 			"-NoProfile",
 			"-NonInteractive",
 			"-Command",
 			`([System.Diagnostics.Process]::GetProcessById(${pid})).StartTime.ToUniversalTime().Ticks`,
-		]).trim();
-		return /^\d+$/.test(startTicks) ? `win:${startTicks}` : undefined;
+		],
+	};
+}
+
+// `lstart` is rendered in the subprocess timezone and locale, so pin both for a durable identity.
+function psStartIdQuery(pid: number): { command: string; args: string[]; options: ProcessQueryOptions } {
+	return {
+		command: "ps",
+		args: ["-p", String(pid), "-o", "lstart="],
+		options: { env: { ...process.env, LC_ALL: "C", LC_TIME: "C", LANG: "C", TZ: "UTC" } },
+	};
+}
+
+function parseWindowsStartId(stdout: string): string | undefined {
+	const startTicks = stdout.trim();
+	return /^\d+$/.test(startTicks) ? `win:${startTicks}` : undefined;
+}
+
+function parsePsStartId(stdout: string): string | undefined {
+	const startTime = stdout.trim();
+	return startTime ? `ps:${startTime}` : undefined;
+}
+
+function parseProcStatStartId(stat: string): string | undefined {
+	const commandEnd = stat.lastIndexOf(")");
+	const fields = stat.slice(commandEnd + 2).split(" ");
+	const startTime = fields[19];
+	return startTime ? `proc:${startTime}` : undefined;
+}
+
+export function getWindowsProcessStartId(pid: number, query: ProcessQuery = runProcessQuery): string | undefined {
+	if (!Number.isInteger(pid) || pid <= 0) {
+		return undefined;
+	}
+	try {
+		const { command, args } = windowsStartIdQuery(pid);
+		return parseWindowsStartId(query(command, args));
 	} catch {
 		return undefined;
 	}
@@ -153,12 +209,19 @@ export function getPsProcessStartId(pid: number, query: ProcessQuery = runProces
 		return undefined;
 	}
 	try {
-		// `lstart` is rendered in the subprocess timezone and locale, so pin both for a durable identity.
-		const startTime = query("ps", ["-p", String(pid), "-o", "lstart="], {
-			env: { ...process.env, LC_ALL: "C", LC_TIME: "C", LANG: "C", TZ: "UTC" },
-		}).trim();
-		return startTime ? `ps:${startTime}` : undefined;
+		const { command, args, options } = psStartIdQuery(pid);
+		return parsePsStartId(query(command, args, options));
 	} catch {
+		return undefined;
+	}
+}
+
+/** The /proc start identity: the only source that needs no helper process, so it is the only cheap one. */
+export function getProcProcessStartId(pid: number): string | undefined {
+	try {
+		return parseProcStatStartId(readFileSync(`/proc/${pid}/stat`, "utf8"));
+	} catch {
+		// No procfs (macOS/BSD), or the pid is already gone.
 		return undefined;
 	}
 }
@@ -170,18 +233,44 @@ export function getProcessStartId(pid: number): string | undefined {
 	if (process.platform === "win32") {
 		return getWindowsProcessStartId(pid);
 	}
+	// Fall through to the portable process listing used on macOS and BSD.
+	return getProcProcessStartId(pid) ?? getPsProcessStartId(pid);
+}
+
+/**
+ * Non-blocking twin of `getProcessStartId`, same identity formats, so an identity
+ * captured by either compares equal. A spawn hot path must not fork the helper
+ * process synchronously: that stalls the event loop for the whole round trip.
+ */
+export async function getProcessStartIdAsync(
+	pid: number,
+	query: ProcessQueryAsync = runProcessQueryAsync,
+): Promise<string | undefined> {
+	if (!Number.isInteger(pid) || pid <= 0) {
+		return undefined;
+	}
+	if (process.platform === "win32") {
+		try {
+			const { command, args } = windowsStartIdQuery(pid);
+			return parseWindowsStartId(await query(command, args));
+		} catch {
+			return undefined;
+		}
+	}
 	try {
-		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-		const commandEnd = stat.lastIndexOf(")");
-		const fields = stat.slice(commandEnd + 2).split(" ");
-		const startTime = fields[19];
-		if (startTime) {
-			return `proc:${startTime}`;
+		const fromProc = parseProcStatStartId(await readFile(`/proc/${pid}/stat`, "utf8"));
+		if (fromProc) {
+			return fromProc;
 		}
 	} catch {
 		// Fall through to the portable process listing used on macOS and BSD.
 	}
-	return getPsProcessStartId(pid);
+	try {
+		const { command, args, options } = psStartIdQuery(pid);
+		return parsePsStartId(await query(command, args, options));
+	} catch {
+		return undefined;
+	}
 }
 
 let currentProcessStartId: string | undefined;

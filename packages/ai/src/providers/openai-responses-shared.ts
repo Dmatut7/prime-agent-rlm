@@ -32,6 +32,7 @@ import { shortHash } from "../utils/hash.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import { classifyStreamFailure, StreamFailureError } from "../utils/stream-failure.js";
+import { updateThrottledStreamingJson } from "../utils/streaming-json-throttle.js";
 import { transformMessages } from "./transform-messages.js";
 
 function encodeTextSignatureV1(id: string, phase?: TextSignatureV1["phase"]): string {
@@ -393,7 +394,11 @@ export async function processResponsesStream<TApi extends Api>(
 		} else if (event.type === "response.function_call_arguments.delta") {
 			if (currentItem?.type === "function_call" && currentBlock?.type === "toolCall") {
 				currentBlock.partialJson += event.delta;
-				currentBlock.arguments = parseStreamingJson(currentBlock.partialJson);
+				// Throttled mid-stream parse; the arguments.done/output_item.done parses are authoritative.
+				const parsedArgs = updateThrottledStreamingJson(currentBlock, currentBlock.partialJson);
+				if (parsedArgs) {
+					currentBlock.arguments = parsedArgs;
+				}
 				stream.push({
 					type: "toolcall_delta",
 					contentIndex: blockIndex(),

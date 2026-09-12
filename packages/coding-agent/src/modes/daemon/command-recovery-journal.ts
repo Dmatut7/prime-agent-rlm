@@ -12,6 +12,7 @@ import {
 	writeSync,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { getLogger } from "@earendil-works/pi-ai";
 import { repairTruncatedTrailingLine } from "../../utils/file-lines.js";
 import type { DaemonClientId, DaemonCommandId, DaemonResponse } from "./daemon-protocol.js";
 
@@ -52,7 +53,16 @@ export type CommandJournalBeginResult =
 	| { status: "pending" }
 	| { status: "complete"; response: DaemonResponse };
 
-const COMPACT_AFTER_RECORDS = 4096;
+const structuredLog = getLogger("coding-agent.daemon.command-recovery-journal");
+
+/**
+ * Compaction bounds. Acknowledged records are dead weight on disk but harmless
+ * (a load replays the acknowledgement and drops the entry), so compaction waits
+ * for one of these instead of rewriting the whole journal after every command.
+ * Both bounds match the sibling worker-recovery-journal.
+ */
+export const COMPACT_AFTER_RECORDS = 4096;
+export const COMPACT_AFTER_BYTES = 4 * 1024 * 1024;
 
 export function createCommandIdempotencyKey(clientId: DaemonClientId, commandId: DaemonCommandId): string {
 	return JSON.stringify([clientId, commandId]);
@@ -66,6 +76,7 @@ export function createCommandIdempotencyKey(clientId: DaemonClientId, commandId:
 export class CommandRecoveryJournal {
 	private readonly entries = new Map<string, JournalEntry>();
 	private recordCount = 0;
+	private byteLength = 0;
 
 	constructor(private readonly path: string) {
 		mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -74,6 +85,27 @@ export class CommandRecoveryJournal {
 		// too — the next append must not glue onto the torn bytes.
 		repairTruncatedTrailingLine(path);
 		this.load();
+		this.tightenPermissions();
+	}
+
+	/**
+	 * openSync(path, "a", 0o600) applies the mode only when it creates the file, so
+	 * a journal that already exists with looser permissions is tightened once here.
+	 * Appending never changes a file's mode, which is why this does not run per record.
+	 */
+	private tightenPermissions(): void {
+		try {
+			chmodSync(this.path, 0o600);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				// Nothing on disk yet; the first append creates it with mode 0600.
+				return;
+			}
+			structuredLog.warn("could not tighten command recovery journal permissions", {
+				path: this.path,
+				error: String(error),
+			});
+		}
 	}
 
 	private cleanStaleCompactionTemps(): void {
@@ -133,7 +165,7 @@ export class CommandRecoveryJournal {
 		};
 		this.append(record);
 		entry.response = response;
-		if (this.recordCount >= COMPACT_AFTER_RECORDS) {
+		if (this.shouldCompact()) {
 			this.compact();
 		}
 	}
@@ -150,9 +182,17 @@ export class CommandRecoveryJournal {
 			recordedAt: new Date().toISOString(),
 		});
 		this.entries.delete(key);
-		if (this.entries.size === 0 || this.recordCount >= COMPACT_AFTER_RECORDS) {
+		if (this.shouldCompact()) {
 			this.compact();
 		}
+	}
+
+	/**
+	 * Dead records only cost disk until a bound is hit, while a compaction rewrites
+	 * and fsyncs the whole file synchronously on the supervisor's thread.
+	 */
+	private shouldCompact(): boolean {
+		return this.recordCount >= COMPACT_AFTER_RECORDS || this.byteLength >= COMPACT_AFTER_BYTES;
 	}
 
 	private load(): void {
@@ -165,6 +205,7 @@ export class CommandRecoveryJournal {
 			}
 			throw error;
 		}
+		this.byteLength = Buffer.byteLength(contents);
 		for (const line of contents.split("\n")) {
 			if (!line) {
 				continue;
@@ -201,16 +242,22 @@ export class CommandRecoveryJournal {
 		}
 	}
 
+	/**
+	 * Append and fsync. Unlike the sibling worker journal this record is part of a
+	 * durability contract: the received record must be on disk before the mutating
+	 * command is dispatched, so a crash cannot leave an unjournaled side effect.
+	 */
 	private append(record: JournalRecord): void {
+		const line = `${JSON.stringify(record)}\n`;
 		const descriptor = openSync(this.path, "a", 0o600);
 		try {
-			writeSync(descriptor, `${JSON.stringify(record)}\n`);
+			writeSync(descriptor, line);
 			fsyncSync(descriptor);
 		} finally {
 			closeSync(descriptor);
 		}
-		chmodSync(this.path, 0o600);
 		this.recordCount++;
+		this.byteLength += Buffer.byteLength(line);
 	}
 
 	private compact(): void {
@@ -228,6 +275,7 @@ export class CommandRecoveryJournal {
 				});
 			}
 		}
+		const content = `${records.map((record) => JSON.stringify(record)).join("\n")}\n`;
 		let descriptor: number | undefined;
 		try {
 			descriptor = openSync(
@@ -235,7 +283,7 @@ export class CommandRecoveryJournal {
 				constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
 				0o600,
 			);
-			writeSync(descriptor, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
+			writeSync(descriptor, content);
 			fsyncSync(descriptor);
 			closeSync(descriptor);
 			descriptor = undefined;
@@ -253,5 +301,6 @@ export class CommandRecoveryJournal {
 			closeSync(directoryDescriptor);
 		}
 		this.recordCount = records.length;
+		this.byteLength = Buffer.byteLength(content);
 	}
 }

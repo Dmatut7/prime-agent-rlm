@@ -12,10 +12,11 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	type ActiveOrphanProcess,
 	clearOrphanProcessJournal,
+	flushOrphanProcessJournal,
 	isOrphanPidReused,
 	isOrphanProcessIdentityCurrent,
 	ORPHAN_PROCESS_JOURNAL_ENV,
@@ -24,12 +25,16 @@ import {
 	recordOrphanProcessState,
 	shouldReapOrphanProcess,
 } from "../src/core/orphan-process-journal.js";
+import * as sessionLease from "../src/core/session-lease.js";
 import { getProcessStartId } from "../src/core/session-lease.js";
 
 const tempDirs: string[] = [];
 const originalJournalPath = process.env[ORPHAN_PROCESS_JOURNAL_ENV];
 
-afterEach(() => {
+afterEach(async () => {
+	// Land or cancel every scheduled capture before the journals disappear, so a
+	// capture from one test can never write into the next one's journal.
+	await flushOrphanProcessJournal();
 	if (originalJournalPath === undefined) {
 		delete process.env[ORPHAN_PROCESS_JOURNAL_ENV];
 	} else {
@@ -41,7 +46,7 @@ afterEach(() => {
 });
 
 describe("orphan process journal", () => {
-	it("repairs a torn trailing line before appending and repairs legacy journal modes", () => {
+	it("repairs a torn trailing line before appending and repairs legacy journal modes", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "prime-orphan-journal-torn-"));
 		tempDirs.push(directory);
 		const path = join(directory, "orphans.jsonl");
@@ -52,6 +57,7 @@ describe("orphan process journal", () => {
 		appendFileSync(path, '{"version":1,"pid":999999,"ownerPid":'); // crash mid-append
 
 		recordOrphanProcessState(process.pid, false);
+		await flushOrphanProcessJournal();
 
 		const lines = readFileSync(path, "utf8")
 			.split("\n")
@@ -66,13 +72,14 @@ describe("orphan process journal", () => {
 		}
 	});
 
-	it("retains only detached processes still active for the crashed owner", () => {
+	it("retains only detached processes still active for the crashed owner", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "prime-orphan-journal-test-"));
 		tempDirs.push(directory);
 		const path = join(directory, "orphans.jsonl");
 		process.env[ORPHAN_PROCESS_JOURNAL_ENV] = path;
 
 		recordOrphanProcessState(process.pid, true);
+		await flushOrphanProcessJournal();
 
 		const active = readActiveOrphanProcesses(path, process.pid);
 		expect(active).toHaveLength(1);
@@ -84,6 +91,96 @@ describe("orphan process journal", () => {
 		expect(readActiveOrphanProcesses(path, process.pid)).toEqual([]);
 		clearOrphanProcessJournal(path);
 		expect(existsSync(path)).toBe(false);
+	});
+
+	it("journals the pid before the call returns and enriches it with the start id", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-orphan-journal-test-"));
+		tempDirs.push(directory);
+		const path = join(directory, "orphans.jsonl");
+		process.env[ORPHAN_PROCESS_JOURNAL_ENV] = path;
+		const expectedStartId = getProcessStartId(process.pid);
+
+		recordOrphanProcessState(process.pid, true);
+		// Durable without awaiting anything: a host killed right after the spawn still
+		// leaves the child journaled for the reaper.
+		expect(readActiveOrphanProcesses(path, process.pid).map((orphan) => orphan.pid)).toEqual([process.pid]);
+
+		await flushOrphanProcessJournal();
+		const active = readActiveOrphanProcesses(path, process.pid);
+		// The enriched record supersedes the pid-only one instead of adding a second active.
+		expect(active).toHaveLength(1);
+		expect(active[0]?.processStartId).toBe(expectedStartId);
+		expect(active[0] && isOrphanProcessIdentityCurrent(active[0])).toBe(true);
+
+		recordOrphanProcessState(process.pid, false);
+		expect(readActiveOrphanProcesses(path, process.pid)).toEqual([]);
+	});
+
+	it("captures a helper-process start id off the blocking path", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-orphan-journal-test-"));
+		tempDirs.push(directory);
+		const path = join(directory, "orphans.jsonl");
+		process.env[ORPHAN_PROCESS_JOURNAL_ENV] = path;
+		const expectedStartId = getProcessStartId(process.pid);
+		// Forces the macOS/BSD/win32 shape on every platform: no cheap identity, so the
+		// record goes out pid-only and the helper-process query is awaited afterwards.
+		const noCheapStartId = vi.spyOn(sessionLease, "getProcProcessStartId").mockReturnValue(undefined);
+		try {
+			recordOrphanProcessState(process.pid, true);
+			const pending = readActiveOrphanProcesses(path, process.pid);
+			expect(pending).toHaveLength(1);
+			expect(pending[0]?.processStartId).toBeUndefined();
+			// Identity-free does not mean unprotected: the record still bounds pid reuse.
+			expect(pending[0] && isOrphanPidReused(pending[0])).toBe(false);
+
+			await flushOrphanProcessJournal();
+			const enriched = readActiveOrphanProcesses(path, process.pid);
+			expect(enriched).toHaveLength(1);
+			expect(enriched[0]?.processStartId).toBe(expectedStartId);
+			expect(readFileSync(path, "utf8").trim().split("\n")).toHaveLength(2);
+			recordOrphanProcessState(process.pid, false);
+		} finally {
+			noCheapStartId.mockRestore();
+		}
+	});
+
+	it("does not resurrect a pid deactivated while its capture was in flight", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-orphan-journal-test-"));
+		tempDirs.push(directory);
+		const path = join(directory, "orphans.jsonl");
+		process.env[ORPHAN_PROCESS_JOURNAL_ENV] = path;
+		const noCheapStartId = vi.spyOn(sessionLease, "getProcProcessStartId").mockReturnValue(undefined);
+		try {
+			recordOrphanProcessState(process.pid, true);
+			recordOrphanProcessState(process.pid, false);
+			await flushOrphanProcessJournal();
+
+			expect(readActiveOrphanProcesses(path, process.pid)).toEqual([]);
+			const lines = readFileSync(path, "utf8")
+				.split("\n")
+				.filter((line) => line.length > 0);
+			expect(lines).toHaveLength(2);
+			expect(lines.map((line) => (JSON.parse(line) as { active: boolean }).active)).toEqual([true, false]);
+		} finally {
+			noCheapStartId.mockRestore();
+		}
+	});
+
+	it("drops a capture whose journal was cleared before it landed", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-orphan-journal-test-"));
+		tempDirs.push(directory);
+		const path = join(directory, "orphans.jsonl");
+		process.env[ORPHAN_PROCESS_JOURNAL_ENV] = path;
+		const noCheapStartId = vi.spyOn(sessionLease, "getProcProcessStartId").mockReturnValue(undefined);
+		try {
+			recordOrphanProcessState(process.pid, true);
+			clearOrphanProcessJournal(path);
+			await flushOrphanProcessJournal();
+
+			expect(existsSync(path)).toBe(false);
+		} finally {
+			noCheapStartId.mockRestore();
+		}
 	});
 
 	it("reaps only the given kernel's still-active bash children", async () => {
@@ -248,7 +345,7 @@ describe("orphan journal concurrency and pid reuse", () => {
 		}
 	});
 
-	it("refuses a symlinked journal path without touching its target", () => {
+	it("refuses a symlinked journal path without touching its target", async () => {
 		if (process.platform === "win32") {
 			return;
 		}
@@ -259,10 +356,16 @@ describe("orphan journal concurrency and pid reuse", () => {
 		const alias = join(directory, "orphans.jsonl");
 		symlinkSync(target, alias);
 		process.env[ORPHAN_PROCESS_JOURNAL_ENV] = alias;
+		const noCheapStartId = vi.spyOn(sessionLease, "getProcProcessStartId").mockReturnValue(undefined);
 
-		recordOrphanProcessState(process.pid, true);
-
-		expect(readFileSync(target, "utf8")).toBe("sentinel\n");
+		try {
+			recordOrphanProcessState(process.pid, true);
+			// The deferred start-id capture takes the same O_NOFOLLOW path as the record.
+			await flushOrphanProcessJournal();
+			expect(readFileSync(target, "utf8")).toBe("sentinel\n");
+		} finally {
+			noCheapStartId.mockRestore();
+		}
 	});
 
 	it("treats a pid younger than the record as reused", () => {

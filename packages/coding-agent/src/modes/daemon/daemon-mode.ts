@@ -610,6 +610,8 @@ export class AgentDaemon {
 		queuedChildren: new Map(),
 		removedAgentIds: new Map(),
 		snapshotPending: false,
+		allDirty: true,
+		dirtyActiveSessionIds: new Set(),
 	};
 	private rosterFlushScheduled = false;
 	private rosterHeartbeatTimer?: ReturnType<typeof setInterval>;
@@ -5082,6 +5084,9 @@ export class AgentDaemon {
 					replaceInstructions: command.replaceInstructions,
 					label: command.label,
 				});
+				// Carrier-less mutation: branch navigation swaps the message list
+				// without a session event, so the row refresh must be scheduled.
+				this.scheduleRosterFlush();
 				return success(command.id, "navigate_tree", result);
 			}
 
@@ -7004,6 +7009,17 @@ export class AgentDaemon {
 		return session.sessionId;
 	}
 
+	/** Two resident states sharing an agentId would mix reuse and recompute for one row; callers fall back to a full rebuild. */
+	private hasDuplicateRosterAgentIds(): boolean {
+		const seen = new Set<string>();
+		for (const state of this.sessions.values()) {
+			const agentId = this.rosterAgentIdForState(state);
+			if (seen.has(agentId)) return true;
+			seen.add(agentId);
+		}
+		return false;
+	}
+
 	private rosterAgentIdForRlmChild(childId: string, parentSessionPath: string | undefined): string {
 		return rosterAgentIdForSummary({
 			runtimeKind: "subagent",
@@ -7028,7 +7044,7 @@ export class AgentDaemon {
 		) {
 			return;
 		}
-		this.scheduleRosterFlush();
+		this.scheduleRosterFlush({ activeSessionId: state.activeSessionId });
 	}
 
 	private observeRosterChildUpdate(state: ActiveSessionState, child: AgentConnectionRlmChildAgentSnapshot): void {
@@ -7039,7 +7055,9 @@ export class AgentDaemon {
 		} else {
 			this.rosterReporter.queuedChildren.delete(entry.agentId);
 		}
-		this.scheduleRosterFlush();
+		// The parent's row carries hasRunningRlmChildren; a bound child's own row
+		// recomputes through the queued-row reuse guard or its own session events.
+		this.scheduleRosterFlush({ activeSessionId: state.activeSessionId });
 	}
 
 	private hasSessionForRlmChild(parentState: ActiveSessionState, childId: string): boolean {
@@ -7080,8 +7098,18 @@ export class AgentDaemon {
 		return { agentId: rosterAgentIdForSummary(summary), queuedChild: true, summary };
 	}
 
-	private scheduleRosterFlush(): void {
-		if (!this.options.worker || this.rosterFlushScheduled || this.shuttingDown) return;
+	private scheduleRosterFlush(scope?: { activeSessionId: string }): void {
+		if (!this.options.worker || this.shuttingDown) return;
+		// A scoped call owes only the emitting session's row; every other caller
+		// (structure, clients, cron, commands) invalidates the whole composed roster.
+		if (scope) {
+			const dirty = this.rosterReporter.dirtyActiveSessionIds;
+			if (dirty) dirty.add(scope.activeSessionId);
+			else this.rosterReporter.dirtyActiveSessionIds = new Set([scope.activeSessionId]);
+		} else {
+			this.rosterReporter.allDirty = true;
+		}
+		if (this.rosterFlushScheduled) return;
 		this.rosterFlushScheduled = true;
 		setImmediate(() => {
 			this.rosterFlushScheduled = false;
@@ -7096,11 +7124,43 @@ export class AgentDaemon {
 	private flushRoster(): void {
 		const reporter = this.rosterReporter;
 		const entries = new Map<string, WorkerRosterEntry>();
+		// Serialized json carried over for reused rows: their delta comparison is a
+		// map lookup, so a flush recomputes and re-stringifies only dirty sessions.
+		const reusedJson = new Map<string, string>();
 		const scheduledJobs = this.cronStore.list();
-		for (const summary of buildSessionList([...this.sessions.values()], [], scheduledJobs)) {
-			const entry = workerRosterEntryFromSummary(summary);
-			entries.set(entry.agentId, entry);
+		const dirty = reporter.dirtyActiveSessionIds;
+		// Session-event flushes recompute only the emitting sessions' rows; every other
+		// row is carried over verbatim. Unscoped invalidation, direct calls with no dirty
+		// tracking, and duplicate agent ids (mid-teardown races) take the full rebuild.
+		const incremental = reporter.allDirty !== true && dirty !== undefined && dirty.size > 0;
+		if (incremental && !this.hasDuplicateRosterAgentIds()) {
+			for (const state of this.sessions.values()) {
+				const agentId = this.rosterAgentIdForState(state);
+				const previous = reporter.lastComposed.get(agentId);
+				if (
+					previous !== undefined &&
+					previous.queuedChild !== true &&
+					previous.summary.activeSessionId === state.activeSessionId &&
+					!dirty.has(state.activeSessionId)
+				) {
+					entries.set(agentId, previous);
+					const json = reporter.lastComposedJson.get(agentId);
+					if (json !== undefined) reusedJson.set(agentId, json);
+					continue;
+				}
+				const [summary] = buildSessionList([state], [], scheduledJobs);
+				if (summary === undefined) continue;
+				const entry = workerRosterEntryFromSummary(summary);
+				entries.set(entry.agentId, entry);
+			}
+		} else {
+			for (const summary of buildSessionList([...this.sessions.values()], [], scheduledJobs)) {
+				const entry = workerRosterEntryFromSummary(summary);
+				entries.set(entry.agentId, entry);
+			}
 		}
+		reporter.allDirty = false;
+		dirty?.clear();
 		for (const [agentId, queued] of reporter.queuedChildren) {
 			if (entries.has(agentId)) {
 				reporter.queuedChildren.delete(agentId);
@@ -7152,7 +7212,7 @@ export class AgentDaemon {
 		const changed: WorkerRosterEntry[] = [];
 		const nextJson = new Map<string, string>();
 		for (const entry of entries.values()) {
-			const json = JSON.stringify(entry);
+			const json = reusedJson.get(entry.agentId) ?? JSON.stringify(entry);
 			nextJson.set(entry.agentId, json);
 			if (reporter.lastComposedJson.get(entry.agentId) !== json) changed.push(entry);
 		}
@@ -7594,6 +7654,10 @@ interface WorkerRosterReporterState {
 	/** Pending removals: agentId -> removed sessionId; a new incarnation of the id cancels it. */
 	removedAgentIds: Map<string, string | undefined>;
 	snapshotPending: boolean;
+	/** Structural invalidation (sessions, clients, cron, commands): the next flush rebuilds every row. */
+	allDirty?: boolean;
+	/** Sessions whose own events fired since the last flush; only their rows are recomputed. */
+	dirtyActiveSessionIds?: Set<string>;
 }
 
 const ROSTER_SESSION_EVENT_TRIGGERS = new Set([
@@ -7611,6 +7675,11 @@ const ROSTER_SESSION_EVENT_TRIGGERS = new Set([
 	"session_action_update",
 	"session_info_changed",
 	"thinking_level_changed",
+	// The stall marker rides on the row (summary.stall) and a wedged session is
+	// silent by definition, so the watchdog events are its only recompute carrier.
+	"stall_warning",
+	"stall_abort",
+	"stall_unsettled",
 ]);
 
 function hasDaemonOutboundActiveSessionId(

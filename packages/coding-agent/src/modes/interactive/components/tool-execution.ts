@@ -114,6 +114,8 @@ export class ToolExecutionComponent extends Container {
 		details?: any;
 	};
 	private hideComponent = false;
+	// Stable reference so a hidden tool cannot defeat the parent aggregator's identity check.
+	private readonly hiddenLines: string[] = [];
 
 	constructor(
 		toolName: string,
@@ -367,7 +369,7 @@ export class ToolExecutionComponent extends Container {
 
 	override render(width: number): string[] {
 		if (this.hideComponent) {
-			return [];
+			return this.hiddenLines;
 		}
 		// Refresh the animated glyph without rebuilding the whole panel, for as long
 		// as panelStatus() is still animating (including partial streaming results).
