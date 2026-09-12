@@ -173,9 +173,8 @@ export interface SubagentWakeSettings {
 
 /**
  * Kernel venv bootstrap knobs. `lockTimeoutMs` bounds how long a boot waits for
- * the machine-wide bootstrap lock; 0 disables the bound (today's unbounded
- * wait), matching the `tools.bashTimeoutSeconds` / `extensionHandlerTimeoutMs`
- * convention in this file.
+ * the machine-wide bootstrap lock; 0 disables the bound (waits forever),
+ * matching the `extensionHandlerTimeoutMs` convention in this file.
  */
 export interface KernelBootstrapSettings {
 	lockTimeoutMs?: number; // default: 300000 (5 min); 0 waits forever
