@@ -16,6 +16,7 @@
 | 日期 | 这轮干了什么 |
 |---|---|
 | 2026-09-12 凌晨 | 采纳外部贡献者 5 个修复；移除假设置 bashTimeoutSeconds；修"记忆写入遇格式抖动整条丢"；摘官方 3 个优点；大门从自动关 PR 改为人工审；向官方反馈 27 条缺陷（Discussions #2239） |
+| 2026-09-12 上午（TAKE 第二批） | 上游 TAKE 清单剩余 9 件收口（8 件落地 + 1 件核收）：litellm 上下文超限识别、prompt 参数 `$` 字面量不再二次展开、`/traces` 子命令补全、助手 Markdown 文件链接按会话 cwd 解析（连带 TUI 允许打开 `file://`）、agents-view 用量列/图例/空会话沉底/分支不再算子代理、打包版 CLI 的 Bedrock 装载真修、目录生成器 Qwen 改名映射 + gpt-6 规则、伪装客户端版本升级（Claude Code 2.1.261 / Copilot 0.48.1） |
 | 2026-09-12 上午 | 官方动态对账：41 个新提交盘点（12 拿/15 适配/14 不拿，top3 已摘完）+ 60 个开放 PR 逐件分析（22 件值得拿，A 档 6 件在摘）；rlm.collect（子代理结果回收）移植中；README 门脸改成源码构建优先（防访客误装官方版）；FORK_NOTES 加一览区 |
 | 2026-09-11 | 多代理稳定性大修：54+ 笔提交修掉五段死亡链（长任务 15 分钟被误杀/误杀被瞒报/子代理回话焊死/内核死即残废/僵尸记账），四家模型终审全过 |
 | 2026-09-07 | 主仓迁到独立仓；根代理沟通契约（说人话、先复述目标、不给选择题） |
@@ -24,6 +25,26 @@
 
 ---
 
+
+---
+
+## 2026-09-12 上午 · 上游 TAKE 清单第二批（9 件）
+
+范围：`/tmp/ma_audit/upstream_41_review.md` 的 TAKE 12 件里，top3（`0894de1de` / `9c8230df6` / `bcdcd6e65`，已由上一车道摘走）之外的 9 件。施工报告 `/tmp/ma_audit/build_take_rest.md`，逐件红绿日志在 `/tmp/ma_take_rest/`。
+
+- **做了什么**：8 件本车道落地（含 1 件必需的依赖子件），1 件（`a6625e17a` 丢弃孤儿 tool result）核收他道已落地并复跑其测试。每件先在 `git archive HEAD` 纯净树上把上游测试跑红，再落地跑绿；提交保留上游作者署名，message 注明上游 sha 与红绿证据。
+- **用户 / AI 能力能感觉到什么**：
+  - litellm 网关的"超出模型最大上下文"现在会被判成 context overflow ⇒ 触发自动压缩，而不是拿同样超长的上下文一遍遍重试；
+  - 提示词模板参数里的 `$1`、`$@`、`$ARGUMENTS`、`$&`、`$$`、`` $` `` 等字面量不再被二次展开（写 shell / sed / 正则 / 价格的模板不再被悄悄改写）；
+  - `/traces ` 有子命令补全（status/on/off/preview/upload/upload-current/upload-all/login）；
+  - 助手回复里的相对 Markdown 文件链接按**会话 cwd** 解析成可点的 `file://`，TUI 里点得开——此前 daemon worker 的进程 cwd ≠ 会话 cwd，链接一律指错地方；Windows 盘符路径也不再被当成未知协议；
+  - agents 视图：用量改成对齐列（`↑in ↓out · $agent · #sub · $total · age`）、每个分区表头带行数与图例、空会话沉到分区末尾（进入视图时所在会话除外）、分支/fork 会话不再被算成子代理（不再重复计费、不再错误嵌套）、列表末尾的选中项不会再被前导省略号挤出视口；
+  - 打包版 CLI（本仓 `prime-agent` 命令就是 `dist/bundle/cli.js` 的符号链接）里 Bedrock 请求不再 `Cannot find module .../dist/bundle/amazon-bedrock.js`，失败日志保留 level / provider / requestId / pid / mode 等结构化字段；
+  - 目录生成器修掉两处会在下次 `npm run generate-models` 咬人的坑：OpenRouter 已把 `qwen/qwen3.8-max` 改名为 `-0902`，没有别名映射该行会退到 128k/8192 的保守兜底（committed 值是 1M/131k，等于上下文窗口少报 8 倍）；gpt-6 家族补上思考等级与 Copilot Responses 路由规则；
+  - 伪装客户端版本升到 Claude Code 2.1.261 / GitHub Copilot Chat 0.48.1（VS Code 1.136.1），Copilot 身份收敛到单一出处（OAuth 流与生成器共用），不再两份各自漂。
+- **没拿 / 放宽的**：目录数据面（`models.generated.ts`）本批一律不再生成（属 ADAPT 批 3，要连带 `3484f06a1` 的测试搬家）；`e8b7168cc` 里混入的 CI apt 源隔离、Linear 票门禁（本仓没有这道闸）与 6014 测试放宽剔除（6014 在本仓逐字通过，无需放宽）；`#2045` 的 stream-failure 分类（403 → `permission`）是 ADAPT 级未拿，6006 测试对应断言按本仓现状放宽为 `unknown|permission` 并在测试内注明。
+- **验证**：每件先红后绿；8 件提交全过 husky（`npm run check` = biome + tsgo + installer + browser-smoke）；收口 `git archive HEAD` 纯净树 `tsgo --noEmit` EXIT=0。本批不碰线协议：`DAEMON_SCHEMA_REVISION` 仍是 29，`t3_schema_id.mjs` 复算 digest 不变（`protocol-7-schema-29-66299858b8b4`）。
+- **运维注意**：F 件之后 bundle 把 `@earendil-works/pi-ai/bedrock-provider` 留成运行时外部依赖，刷新安装必须走完整 `npm run build`（要重建带 `setLogSink` 导出的 `packages/ai/dist`），只跑 coding-agent 的 bundle 步骤会拿到旧 dist。
 
 ---
 
