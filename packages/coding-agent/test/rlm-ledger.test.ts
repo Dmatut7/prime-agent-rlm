@@ -221,6 +221,15 @@ describe("rlm spawn ledger", () => {
 			});
 			writeFileSync(ledger.ledgerPath, `${readFileSync(ledger.ledgerPath, "utf8")}not json\n`);
 			await expect(ledger.edges()).rejects.toThrow("Malformed RLM ledger line");
+			// The failure is fail-closed and the path is a hash of the sessions dir, so
+			// the message has to name the file: finding it is the only action that
+			// restores spawning, deletion and delete_saved_session.
+			const failure = await ledger.edges().then(
+				() => undefined,
+				(error: unknown) => (error instanceof Error ? error.message : String(error)),
+			);
+			expect(failure).toContain(ledger.ledgerPath);
+			expect(failure).toContain("sessions dir ");
 			const fresh = new RlmSpawnLedger(root, sessionsDir);
 			writeFileSync(
 				fresh.ledgerPath,

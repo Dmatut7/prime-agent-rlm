@@ -19,10 +19,20 @@ export const WORKER_REQUEST_TIMEOUT_TIERS = {
 	 */
 	adoption: 300_000,
 	/**
-	 * One *retried* agent-message delivery attempt (T4-3). The first attempt keeps
-	 * the long budget: the sender is waiting on it, a slow target hydration is
-	 * legitimate work, and cutting it to 120s would trade a late delivery for an
-	 * uncertain one (C20 kept the 24h delivery semantics on purpose).
+	 * One *retried* agent-message delivery attempt (T4-3). On the agent-origin leg
+	 * the first dispatch keeps the long budget — the sender is waiting on it, a slow
+	 * target hydration is legitimate work, and cutting it to 120s would trade a late
+	 * delivery for an uncertain one (C20 kept the 24h delivery semantics on purpose);
+	 * `deliveryDispatchTimeoutTier` picks between the two there.
+	 *
+	 * The leg that this table drives directly is the sourceless CLI forward
+	 * (`send_message` with no `fromActiveSessionId`, forwarded straight to the target
+	 * worker), and it runs on this tier from its *first* attempt: a CLI caller has
+	 * its own budget and cannot sit on a 24h request. A hydration slower than 120s
+	 * therefore surfaces to that caller as a timeout whose delivery state is
+	 * uncertain — the client does not blind-retry a mutating command
+	 * (`daemon-client.ts` sets `retryable` false for those), so nothing duplicates,
+	 * but the wording it gets is the transport's, not the delivery queue's receipt.
 	 */
 	deliver: 120_000,
 	/** A read answered from the worker's in-memory session state: fail fast and let the client retry on a hint. */

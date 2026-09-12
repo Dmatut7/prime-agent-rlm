@@ -136,7 +136,19 @@ export async function checkSupervisorAvailability(
 	const probe = await deps.probe(socketPath);
 	if (probe.available) {
 		state.consecutiveFailures = 0;
-		return { probe, launchedReplacement: false };
+		// A socket that accepts is not an authenticated supervisor. Between this probe
+		// and `worker_auth` — which adoption queuing stretches to minutes, since
+		// adoptions run four at a time with a 300s request budget each — the
+		// supervisor can still die, and stopping here left the worker neither probing
+		// nor launching a replacement until somebody happened to run the CLI again.
+		// Only an authenticated connection or a shutdown ends the monitoring; until
+		// then keep a slow round armed. The round itself ends early the moment the
+		// connection authenticates (`isCancelled`), so this costs one 250ms connect
+		// probe a minute during the window.
+		if (deps.isShuttingDown() || deps.isConnected()) {
+			return { probe, launchedReplacement: false };
+		}
+		return { probe, launchedReplacement: false, nextDelayMs: SUPERVISOR_RECHECK_MAX_MS };
 	}
 	state.consecutiveFailures++;
 	await deps.launchReplacement(socketPath);

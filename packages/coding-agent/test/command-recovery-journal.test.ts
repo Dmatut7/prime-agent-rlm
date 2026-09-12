@@ -15,8 +15,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
 	COMPACT_AFTER_BYTES,
 	COMPACT_AFTER_RECORDS,
+	COMPLETED_ENTRY_TTL_MS,
 	CommandRecoveryJournal,
 	createCommandIdempotencyKey,
+	MAX_ACTIVE_ENTRIES,
+	PENDING_ENTRY_TTL_MS,
 } from "../src/modes/daemon/command-recovery-journal.js";
 
 describe("CommandRecoveryJournal", () => {
@@ -213,6 +216,167 @@ describe("CommandRecoveryJournal", () => {
 
 		const restored = new CommandRecoveryJournal(path);
 		expect(restored.begin("client-a", "command-a", "prompt")).toEqual({ status: "pending" });
+	});
+
+	it("expires a completed entry no acknowledgement ever reached", () => {
+		const path = createPath();
+		const journal = new CommandRecoveryJournal(path);
+		journal.begin("client-a", "command-a", "prompt");
+		journal.recordResult("client-a", "command-a", {
+			id: "command-a",
+			type: "response",
+			command: "prompt",
+			success: true,
+		});
+
+		expect(journal.sweepExpired(Date.now() + COMPLETED_ENTRY_TTL_MS - 1000)).toBe(0);
+		expect(journal.lookup("client-a", "command-a")?.status).toBe("complete");
+		expect(journal.sweepExpired(Date.now() + COMPLETED_ENTRY_TTL_MS + 1000)).toBe(1);
+		expect(journal.lookup("client-a", "command-a")).toBeUndefined();
+		// The removal is journaled, so a restart cannot resurrect the entry (which
+		// would keep the active set, and the rewrite it forces, growing forever).
+		expect(recordTypes(path)).toContain("expired");
+
+		const restored = new CommandRecoveryJournal(path);
+		expect(restored.lookup("client-a", "command-a")).toBeUndefined();
+		expect(restored.begin("client-a", "command-a", "prompt")).toEqual({ status: "new" });
+	});
+
+	it("keeps a pending entry past the completed TTL and expires it past its own", () => {
+		const path = createPath();
+		const journal = new CommandRecoveryJournal(path);
+		journal.begin("client-a", "command-a", "send_message");
+
+		// A pending entry is the "uncertain" half of the contract: dropping it early
+		// would tell a replay "never seen before" and invite a second execution.
+		expect(journal.sweepExpired(Date.now() + COMPLETED_ENTRY_TTL_MS * 2)).toBe(0);
+		expect(journal.lookup("client-a", "command-a")).toEqual({ status: "pending" });
+		// Past the delivery budget (24h) no answer can still arrive, so it goes.
+		expect(PENDING_ENTRY_TTL_MS).toBeGreaterThan(24 * 60 * 60 * 1000);
+		expect(journal.sweepExpired(Date.now() + PENDING_ENTRY_TTL_MS + 1000)).toBe(1);
+		expect(journal.lookup("client-a", "command-a")).toBeUndefined();
+
+		const restored = new CommandRecoveryJournal(path);
+		expect(restored.begin("client-a", "command-a", "send_message")).toEqual({ status: "new" });
+	});
+
+	it("ages a completed entry from its result, not from a receipt that took a day to answer", () => {
+		const path = createPath();
+		// A long-running command: received yesterday, answered just now.
+		const receivedAt = new Date(Date.now() - COMPLETED_ENTRY_TTL_MS * 12).toISOString();
+		writeFileSync(
+			path,
+			`${JSON.stringify({
+				version: 1,
+				type: "received",
+				key: createCommandIdempotencyKey("client-a", "command-a"),
+				clientId: "client-a",
+				commandId: "command-a",
+				commandType: "send_message",
+				recordedAt: receivedAt,
+			})}\n`,
+		);
+		const journal = new CommandRecoveryJournal(path);
+		expect(journal.lookup("client-a", "command-a")).toEqual({ status: "pending" });
+		journal.recordResult("client-a", "command-a", {
+			id: "command-a",
+			type: "response",
+			command: "send_message",
+			success: true,
+		});
+
+		// The result just landed, so a reconnect replay still gets the stored answer.
+		expect(journal.sweepExpired(Date.now() + 60_000)).toBe(0);
+		expect(journal.lookup("client-a", "command-a")?.status).toBe("complete");
+		expect(journal.sweepExpired(Date.now() + COMPLETED_ENTRY_TTL_MS + 60_000)).toBe(1);
+		expect(journal.lookup("client-a", "command-a")).toBeUndefined();
+	});
+
+	it("drops the oldest completed entries at the active bound and never a pending one", () => {
+		const path = createPath();
+		const over = MAX_ACTIVE_ENTRIES + 6;
+		const seeded: string[] = [];
+		const recordedAt = new Date().toISOString();
+		// The unanswered command is seeded first, so it is the oldest entry in the
+		// journal: a capacity pass that did not spare pending entries would take it
+		// first, and a replay of that command would then execute it a second time.
+		seeded.push(
+			JSON.stringify({
+				version: 1,
+				type: "received",
+				key: createCommandIdempotencyKey("client-seed", "command-pending"),
+				clientId: "client-seed",
+				commandId: "command-pending",
+				commandType: "prompt",
+				recordedAt,
+			}),
+		);
+		for (let index = 0; index < over; index++) {
+			const key = createCommandIdempotencyKey("client-seed", `command-${index}`);
+			seeded.push(
+				JSON.stringify({
+					version: 1,
+					type: "received",
+					key,
+					clientId: "client-seed",
+					commandId: `command-${index}`,
+					commandType: "prompt",
+					recordedAt,
+				}),
+				JSON.stringify({
+					version: 1,
+					type: "result",
+					key,
+					response: { id: `command-${index}`, type: "response", command: "prompt", success: true },
+					recordedAt,
+				}),
+			);
+		}
+		writeFileSync(path, `${seeded.join("\n")}\n`);
+
+		const journal = new CommandRecoveryJournal(path);
+		expect(journal.lookup("client-seed", "command-0")?.status).toBe("complete");
+		// The next mutating command is what enforces the bound, so the journal can
+		// never sit above it: past MAX_ACTIVE_ENTRIES every command would rewrite it.
+		expect(journal.begin("client-new", "command-new", "prompt")).toEqual({ status: "new" });
+
+		expect(journal.lookup("client-seed", "command-pending")).toEqual({ status: "pending" });
+		expect(journal.lookup("client-new", "command-new")).toEqual({ status: "pending" });
+		// Exactly the oldest completed entries went; the rest of the history is intact.
+		const dropped = over + 1 + 1 - MAX_ACTIVE_ENTRIES;
+		expect(dropped).toBeGreaterThan(0);
+		for (let index = 0; index < dropped; index++) {
+			expect(journal.lookup("client-seed", `command-${index}`), `command-${index}`).toBeUndefined();
+		}
+		expect(journal.lookup("client-seed", `command-${dropped}`)?.status).toBe("complete");
+		expect(journal.lookup("client-seed", `command-${over - 1}`)?.status).toBe("complete");
+		// The eviction is journaled and then compacted away together with the entries
+		// it dropped, so the file holds the survivors only.
+		expect(recordTypes(path).length).toBeLessThanOrEqual(2 * MAX_ACTIVE_ENTRIES);
+		expect(recordTypes(path).filter((type) => type === "received")).toHaveLength(MAX_ACTIVE_ENTRIES);
+	});
+
+	it("answers a replay from a reconnecting client instead of executing the mutation twice", () => {
+		const path = createPath();
+		const journal = new CommandRecoveryJournal(path);
+		journal.begin("client-a", "command-a", "prompt");
+		journal.recordResult("client-a", "command-a", {
+			id: "command-a",
+			type: "response",
+			command: "prompt",
+			success: true,
+		});
+
+		// A disconnect must not clear this: DaemonClient replays a recoverable
+		// in-flight command verbatim (same clientId, same command id) once it
+		// reconnects, and the recorded result is the only thing that keeps the replay
+		// from running the mutation a second time. Only the TTL may drop it.
+		expect(journal.sweepExpired(Date.now() + 60_000)).toBe(0);
+		const restored = new CommandRecoveryJournal(path);
+		expect(restored.begin("client-a", "command-a", "prompt")).toEqual({
+			status: "complete",
+			response: { id: "command-a", type: "response", command: "prompt", success: true },
+		});
 	});
 
 	it("durably removes acknowledged results", () => {

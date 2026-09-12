@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
-import { ENV_AGENT_DIR } from "../src/config.js";
+import { ENV_AGENT_DIR, getDaemonLogPath } from "../src/config.js";
 import {
 	AGENT_FAMILY_REACH_ERROR,
 	type AgentSessionMessageController,
@@ -1773,12 +1773,16 @@ describe("daemon mode helpers", () => {
 		expect(internals.closingSessions.has(state.activeSessionId)).toBe(false);
 	});
 
-	it("returns no peers when the supervisor query fails", async () => {
+	it("returns no peers when the supervisor query fails, and reports the directory as incomplete", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-peer-query-failure-"));
+		const socketPath = join(tempDir, "worker.sock");
 		const previousSupervisorSocket = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+		const previousAgentDir = process.env[ENV_AGENT_DIR];
 		try {
+			// Keep the rotating daemon log inside the temp tree.
+			process.env[ENV_AGENT_DIR] = tempDir;
 			process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = join(tempDir, "missing.sock");
-			const daemon = new AgentDaemon("/tmp/prime-agent-worker-test.sock", {
+			const daemon = new AgentDaemon(socketPath, {
 				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
 				createRuntime: vi.fn(),
 				worker: { authenticationToken: "worker-token" },
@@ -1788,9 +1792,23 @@ describe("daemon mode helpers", () => {
 			).listSupervisorAgentPeers.bind(daemon);
 
 			await expect(listSupervisorAgentPeers()).resolves.toEqual([]);
+
+			// "No peers" and "the ask failed" used to be the same silent empty array, so
+			// a one-second hiccup redefined the family as whatever this process can see
+			// with nothing in the log to trace it back to.
+			const logPath = getDaemonLogPath(socketPath);
+			const logged = readFileSync(logPath, "utf8");
+			expect(logged).toContain("Agent family directory is incomplete");
+			expect(logged).toContain("list_agent_peers");
+
+			// Throttled: a supervisor that stays down is asked by every roster pass.
+			await expect(listSupervisorAgentPeers()).resolves.toEqual([]);
+			expect(readFileSync(logPath, "utf8").split("Agent family directory is incomplete")).toHaveLength(2);
 		} finally {
 			if (previousSupervisorSocket === undefined) delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
 			else process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSupervisorSocket;
+			if (previousAgentDir === undefined) delete process.env[ENV_AGENT_DIR];
+			else process.env[ENV_AGENT_DIR] = previousAgentDir;
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});

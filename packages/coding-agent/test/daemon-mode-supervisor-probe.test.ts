@@ -94,8 +94,56 @@ describe("P1-7b supervisor availability round", () => {
 		expect(outcome.probe).toEqual({ available: true, attempts: 2 });
 		expect(probes).toBe(2);
 		expect(state.consecutiveFailures).toBe(0);
-		// A round that found the supervisor does not schedule another one.
+		// A socket that accepts is not an authenticated supervisor yet: between this
+		// probe and `worker_auth` (adoption queuing can stretch that to minutes) the
+		// supervisor can still die, so the round stays armed on the slow tier instead
+		// of ending the monitoring for good.
+		expect(outcome.nextDelayMs).toBe(SUPERVISOR_RECHECK_MAX_MS);
+	});
+
+	it("stops monitoring once the supervisor has authenticated", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ma-t4-2-probe-authenticated-"));
+		roots.push(root);
+		const socketPath = join(root, "supervisor.sock");
+		const { deps, stub } = makeDeps(socketPath, {
+			isConnected: () => true,
+			probe: async () => ({ available: true, attempts: 1 }),
+		});
+		const state: SupervisorAvailabilityState = { consecutiveFailures: 0 };
+
+		const outcome = await checkSupervisorAvailability(socketPath, state, deps);
+
 		expect(outcome.nextDelayMs).toBeUndefined();
+		expect(outcome.launchedReplacement).toBe(false);
+		expect(stub.calls).toBe(0);
+	});
+
+	it("keeps a slow round armed while the socket answers but nobody authenticated", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ma-t4-2-probe-unauthenticated-"));
+		roots.push(root);
+		const socketPath = join(root, "supervisor.sock");
+		let connected = false;
+		const { deps, stub } = makeDeps(socketPath, {
+			isConnected: () => connected,
+			probe: async () => ({ available: true, attempts: 1 }),
+		});
+		const state: SupervisorAvailabilityState = { consecutiveFailures: 0 };
+
+		// The window the fix is about: the probe succeeds, `worker_auth` has not landed.
+		expect((await checkSupervisorAvailability(socketPath, state, deps)).nextDelayMs).toBe(SUPERVISOR_RECHECK_MAX_MS);
+		expect((await checkSupervisorAvailability(socketPath, state, deps)).nextDelayMs).toBe(SUPERVISOR_RECHECK_MAX_MS);
+		expect(stub.calls).toBe(0);
+
+		// Authentication ends it, and a shutdown ends it too.
+		connected = true;
+		expect((await checkSupervisorAvailability(socketPath, state, deps)).nextDelayMs).toBeUndefined();
+		connected = false;
+		const shuttingDown = makeDeps(socketPath, {
+			isConnected: () => false,
+			isShuttingDown: () => true,
+			probe: async () => ({ available: true, attempts: 1 }),
+		});
+		expect((await checkSupervisorAvailability(socketPath, state, shuttingDown.deps)).nextDelayMs).toBeUndefined();
 	});
 
 	it("launches a replacement after a whole round fails, and backs off the recheck", async () => {

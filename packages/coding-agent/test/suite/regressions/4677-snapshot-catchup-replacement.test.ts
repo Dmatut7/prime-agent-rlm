@@ -24,7 +24,7 @@ const directories: string[] = [];
 
 interface WorkerHarness {
 	descriptor: { workerId: string; rootActiveSessionId: string; lifecycle: "ready"; pid: number };
-	client?: { request: ReturnType<typeof vi.fn> };
+	client?: { isConnected: boolean; request: ReturnType<typeof vi.fn> };
 	summaries: Map<string, SessionSummary>;
 	snapshotCache: Map<string, DaemonAttachResult>;
 	transcriptCaches: Map<string, SnapshotTranscriptCache>;
@@ -135,6 +135,9 @@ function workerHarness(result: DaemonAttachResult, transcript: SnapshotTranscrip
 			pid: 4677,
 		},
 		client: {
+			// A live transport: `requireAvailableWorkerClient` refuses a client whose
+			// socket is already gone, and this fixture stands in for a connected worker.
+			isConnected: true,
 			request: vi.fn(async () => {
 				throw new Error("unexpected snapshot reload");
 			}),
@@ -286,6 +289,7 @@ describe("ENG-4677 snapshot catch-up replacement", () => {
 		worker.transcriptCaches.clear();
 		let resolveAttach!: (response: { success: true; data: DaemonAttachResult }) => void;
 		worker.client = {
+			isConnected: true,
 			request: vi.fn(
 				() =>
 					new Promise<{ success: true; data: DaemonAttachResult }>((resolve) => {

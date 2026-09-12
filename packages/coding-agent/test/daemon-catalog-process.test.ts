@@ -26,4 +26,19 @@ describe("daemon catalog selector resolution", () => {
 
 		expect(() => resolveCatalogSessionMatch(sessions, "target")).toThrow('Ambiguous session selector "target"');
 	});
+
+	it("never resolves an empty selector, not even to the only saved session", () => {
+		const only = [session("the-only-session-id", "only", "/tmp/only.jsonl")];
+		const many = [only[0]!, session("another-session-id", "another", "/tmp/another.jsonl")];
+
+		// `"".startsWith` is true for every id, so without the gate a single-session
+		// cwd silently retargeted the caller's message to that session while a
+		// multi-session one reported ambiguity: the same command, two outcomes.
+		expect(resolveCatalogSessionMatch(only, "")).toBeUndefined();
+		expect(resolveCatalogSessionMatch(only, "   ")).toBeUndefined();
+		expect(resolveCatalogSessionMatch(many, "")).toBeUndefined();
+		// Positive control: a real prefix and a real name still resolve.
+		expect(resolveCatalogSessionMatch(only, "the-only")?.path).toBe("/tmp/only.jsonl");
+		expect(resolveCatalogSessionMatch(many, "another")?.path).toBe("/tmp/another.jsonl");
+	});
 });

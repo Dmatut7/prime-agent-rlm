@@ -38,8 +38,16 @@ export class DaemonControlPlaneTransportError extends Error {
 
 /**
  * One logical daemon connection over two sockets: session-plane commands go direct to the worker,
- * the rest to the supervisor. Any direct-path loss degrades silently to supervisor routing; an
- * established direct link keeps serving the session while the supervisor reconnects.
+ * the rest to the supervisor. An established direct link keeps serving the session while the
+ * supervisor reconnects.
+ *
+ * Direct-path loss is *not* silent. `bindDirect`'s close handler drops the direct transport and
+ * re-emits the close to this client's own listeners (`DaemonDirectTransportClosedError`), because
+ * the supervisor link does not automatically take over the event stream: session-plane commands
+ * sent over the direct link never gave the supervisor an `attachedActiveSessionIds` entry, and
+ * that set is the gate its event fan-out uses. The upper layer therefore has to re-attach, which
+ * is what the close is for. The supervisor transport itself stays up, so control-plane commands
+ * keep working throughout.
  */
 export class DaemonRoutedClient implements DaemonTransportClient {
 	private direct?: DaemonWorkerClient;

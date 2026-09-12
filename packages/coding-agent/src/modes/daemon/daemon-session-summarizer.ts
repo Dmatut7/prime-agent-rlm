@@ -1,13 +1,33 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { completeSimple } from "@earendil-works/pi-ai";
+import { completeSimple, getLogger } from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "../../core/model-registry.js";
 import type { AgentStatus, AgentTaskState } from "../../core/session-manager.js";
+import { mapConcurrent } from "../../utils/map-concurrent.js";
 import type { ActiveSessionState } from "./active-session-state.js";
+
+const structuredLog = getLogger("coding-agent.daemon.session-summarizer");
 
 const SWEEP_INTERVAL_MS = 25_000;
 // Collapse a tool-use loop's rapid turn_end bursts into one summarization.
 const SETTLE_DEBOUNCE_MS = 2_000;
+
+/**
+ * Bounds on a summary generation that keeps failing. Without them one broken
+ * summary model meant a real API call per affected session per sweep, forever, all
+ * of them launched in the same tick, with nothing in the log to show for it: an
+ * idle session with a blank recap owed a summary on every pass by construction.
+ * The ladder is per session and a new turn re-arms it, so a model that recovers is
+ * picked up on the next activity instead of never.
+ */
+const SUMMARY_RETRY_BASE_MS = 60_000;
+const SUMMARY_RETRY_MAX_MS = 30 * 60_000;
+/** Failures after which the sweep stops trying until the session's next turn. */
+export const SUMMARY_RETRY_LIMIT = 6;
+/** At most one warn per session per window, so a broken model cannot flood the log. */
+const SUMMARY_FAILURE_LOG_MIN_GAP_MS = 5 * 60_000;
+/** Sweep fan-out: bounded, so N affected sessions are not N simultaneous API calls. */
+export const SWEEP_CONCURRENCY = 4;
 
 const SUMMARY_MODEL_PROVIDER = "prime-inference";
 const SUMMARY_MODEL_ID = "qwen/qwen3-30b-a3b-instruct-2507";
@@ -207,6 +227,8 @@ export class DaemonSessionSummarizer {
 	private readonly inFlight = new Map<string, AbortController>();
 	// Sessions requested while one was running; get one more pass on completion.
 	private readonly rerunRequested = new Set<string>();
+	/** Per-session retry ladder for a generation that keeps failing; cleared by a real turn. */
+	private readonly retryBackoff = new Map<string, { failures: number; notBefore: number; lastLoggedAt: number }>();
 
 	constructor(
 		private readonly listSessions: () => readonly ActiveSessionState[],
@@ -222,11 +244,22 @@ export class DaemonSessionSummarizer {
 			return;
 		}
 		this.interval = setInterval(() => {
-			for (const state of this.listSessions()) {
-				void this.summarize(state);
-			}
+			void this.sweep();
 		}, SWEEP_INTERVAL_MS);
 		this.interval.unref?.();
+	}
+
+	/**
+	 * One sweep pass. Bounded fan-out instead of firing every session at once: an
+	 * upstream that is rate-limiting recovers from four concurrent calls, not from
+	 * one burst shaped exactly like the thing that made it rate-limit.
+	 */
+	private async sweep(): Promise<void> {
+		const states = this.listSessions();
+		if (states.length === 0) {
+			return;
+		}
+		await mapConcurrent(states, SWEEP_CONCURRENCY, (state) => this.summarize(state));
 	}
 
 	stop(): void {
@@ -253,6 +286,7 @@ export class DaemonSessionSummarizer {
 		}
 		this.inFlight.get(activeSessionId)?.abort();
 		this.rerunRequested.delete(activeSessionId);
+		this.retryBackoff.delete(activeSessionId);
 	}
 
 	/** Seed in-memory status from the persisted entry when a session is added. */
@@ -269,6 +303,10 @@ export class DaemonSessionSummarizer {
 	/** Called when a session finishes a turn; debounce until the agent settles. */
 	notifyActivity(state: ActiveSessionState): void {
 		const id = state.activeSessionId;
+		// A finished turn is new information, so it re-arms a session whose summary
+		// generation had backed off or given up: the ladder throttles retries of the
+		// *same* content, not the session's lifetime.
+		this.retryBackoff.delete(id);
 		const existing = this.debounceTimers.get(id);
 		if (existing) {
 			clearTimeout(existing);
@@ -306,6 +344,14 @@ export class DaemonSessionSummarizer {
 		if (contentUnchanged && !isWorking && !owesIdleVerdict && !owesSummary) {
 			return;
 		}
+		// Waiting out a failing summary model: an owed summary is owed on every pass
+		// by construction, so without this the sweep re-called the model for the same
+		// unchanged content every 25s until the process died. `notifyActivity` clears
+		// the ladder, so a real turn is always summarised promptly.
+		const backoff = this.retryBackoff.get(id);
+		if (backoff && Date.now() < backoff.notBefore) {
+			return;
+		}
 		// Include the in-progress message so a long streaming turn gets a live recap.
 		const streaming = isWorking ? session.state.streamingMessage : undefined;
 		const contextMessages = streaming ? [...messages, streaming] : messages;
@@ -322,6 +368,12 @@ export class DaemonSessionSummarizer {
 			// A failed classification on an idle session would spin at "working"
 			// forever (the activity axis holds unjudged idle sessions there), so
 			// settle it to needs_input.
+			const settledWithoutModel = generated === undefined;
+			if (settledWithoutModel) {
+				this.noteSummaryFailure(state, isWorking);
+			} else {
+				this.retryBackoff.delete(id);
+			}
 			const result =
 				generated ??
 				(!isWorking && (owesIdleVerdict || owesSummary)
@@ -356,8 +408,14 @@ export class DaemonSessionSummarizer {
 				previous?.taskState !== status.taskState ||
 				(!isWorking && previous?.basedOnMessageCount !== status.basedOnMessageCount);
 			state.summaryState = status;
-			// Persist only settled idle verdicts, never mid-stream.
-			if (!isWorking) {
+			// Persist only settled idle verdicts, never mid-stream — and never a
+			// verdict this pass invented because the model did not answer. That
+			// fallback is a statement about the summary service, not about the
+			// session; persisted, `seed()` reads it back after a restart and the user
+			// is told a session "needs input" that nobody ever asked anything of. The
+			// in-memory settle still happens, so the roster's activity axis does not
+			// spin at "working" for an unjudged idle session.
+			if (!isWorking && !settledWithoutModel) {
 				try {
 					session.sessionManager.appendAgentStatus(status);
 				} catch {
@@ -374,5 +432,50 @@ export class DaemonSessionSummarizer {
 				this.notifyActivity(state);
 			}
 		}
+	}
+
+	/**
+	 * Count a generation that produced nothing and push the next attempt out. A
+	 * session with no summary model configured is not a failure — that path is cheap
+	 * and expected, and reporting it would bury the real ones.
+	 */
+	private noteSummaryFailure(state: ActiveSessionState, isWorking: boolean): void {
+		if (!summaryModelConfigured(state)) {
+			return;
+		}
+		const id = state.activeSessionId;
+		const previous = this.retryBackoff.get(id);
+		const failures = (previous?.failures ?? 0) + 1;
+		const gaveUp = failures >= SUMMARY_RETRY_LIMIT;
+		const backoffMs = Math.min(SUMMARY_RETRY_MAX_MS, SUMMARY_RETRY_BASE_MS * 2 ** (failures - 1));
+		const now = Date.now();
+		this.retryBackoff.set(id, {
+			failures,
+			notBefore: gaveUp ? Number.POSITIVE_INFINITY : now + backoffMs,
+			lastLoggedAt: previous?.lastLoggedAt ?? 0,
+		});
+		const entry = this.retryBackoff.get(id)!;
+		const firstOrLast = failures === 1 || gaveUp;
+		if (!firstOrLast && now - entry.lastLoggedAt < SUMMARY_FAILURE_LOG_MIN_GAP_MS) {
+			return;
+		}
+		entry.lastLoggedAt = now;
+		structuredLog.warn(gaveUp ? "session status summary gave up" : "session status summary failed", {
+			activeSessionId: id,
+			isWorking,
+			failures,
+			...(gaveUp ? {} : { retryInMs: backoffMs }),
+			...(gaveUp ? { rearmedBy: "the session's next turn" } : {}),
+		});
+	}
+}
+
+/** Cheap, throw-safe check: "no summary model" is not a failure worth counting. */
+function summaryModelConfigured(state: ActiveSessionState): boolean {
+	try {
+		return resolveSummaryModel(state.runtime.session.modelRegistry) !== undefined;
+	} catch {
+		// A registry that cannot answer is not "not configured"; count the failure.
+		return true;
 	}
 }

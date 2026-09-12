@@ -19,6 +19,13 @@ export interface PrivateFrame<THeader extends object> {
 
 export type PrivateFrameHeaderValidator<THeader extends object> = (value: unknown) => value is THeader;
 
+/**
+ * Thrown by `send` before a single byte is encoded, so a caller can tell "this
+ * frame never reached the stream" (non-delivery is provable) apart from a write
+ * that failed in flight (it may have been partially delivered).
+ */
+export class PrivateFrameChannelClosedError extends Error {}
+
 function assertFrameLength(name: string, value: number, maximum: number): void {
 	if (!Number.isSafeInteger(value) || value < 0 || value > maximum) {
 		throw new Error(`Invalid private frame ${name}: ${value}`);
@@ -143,7 +150,7 @@ export class PrivateFramedChannel<THeader extends object> {
 
 	async send(header: THeader, payload?: Uint8Array): Promise<void> {
 		if (this.closed || this.stream.destroyed) {
-			throw new Error("Private frame channel is closed");
+			throw new PrivateFrameChannelClosedError("Private frame channel is closed");
 		}
 		const frame = encodePrivateFrame(header, payload, this.limits);
 		await new Promise<void>((resolve, reject) => {

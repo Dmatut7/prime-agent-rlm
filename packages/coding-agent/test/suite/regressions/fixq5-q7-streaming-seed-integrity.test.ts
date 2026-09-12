@@ -159,7 +159,7 @@ function textUpdateEvent(text: string, delta: string): DaemonOutbound {
 
 interface WorkerHarness {
 	descriptor: { workerId: string; rootActiveSessionId: string; lifecycle: "ready"; pid: number };
-	client: { request: ReturnType<typeof vi.fn> };
+	client: { request: ReturnType<typeof vi.fn>; isConnected: boolean };
 	summaries: Map<string, SessionSummary>;
 	snapshotCache: Map<string, DaemonAttachResult>;
 	transcriptCaches: Map<string, SnapshotTranscriptCache>;
@@ -174,6 +174,9 @@ function workerHarness(root: string): WorkerHarness {
 	return {
 		descriptor: { workerId: "worker-seed", rootActiveSessionId: activeSessionId, lifecycle: "ready", pid: 4712 },
 		client: {
+			// A live transport: `requireAvailableWorkerClient` refuses a client whose
+			// socket is already gone.
+			isConnected: true,
 			request: vi.fn(async () => {
 				throw new Error("unexpected snapshot reload");
 			}),
@@ -317,7 +320,7 @@ describe("FIX-Q7 attach seeding never rewinds or corrupts reconstruction", () =>
 		} as unknown as DaemonAttachResult;
 		const worker = {
 			descriptor: { workerId: "worker-rewind", lifecycle: "ready", pid: 1 },
-			client: {},
+			client: { isConnected: true },
 			summaries: new Map([[activeSessionId, summary]]),
 			snapshotCache: new Map([[activeSessionId, result]]),
 			snapshotLoads: new Map(),
@@ -357,7 +360,7 @@ describe("FIX-Q7 attach seeding never rewinds or corrupts reconstruction", () =>
 		} as unknown as DaemonAttachResult;
 		const worker = {
 			descriptor: { workerId: "worker-idle", lifecycle: "ready", pid: 1 },
-			client: {},
+			client: { isConnected: true },
 			summaries: new Map([[activeSessionId, summary]]),
 			snapshotCache: new Map([[activeSessionId, result]]),
 			snapshotLoads: new Map(),

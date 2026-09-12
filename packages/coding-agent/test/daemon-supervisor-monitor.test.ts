@@ -21,7 +21,7 @@ import {
 } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSocketPathLease } from "../src/modes/daemon/daemon-socket.js";
-import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
+import { DaemonSupervisor, STOP_FINALIZATION_MAX_MS } from "../src/modes/daemon/daemon-supervisor.js";
 import {
 	DaemonWorkerAuthenticationError,
 	DaemonWorkerClient,
@@ -2516,12 +2516,16 @@ describe("daemon worker supervisor monitoring", () => {
 			scheduleWorkerStopFinalization(target: object): void;
 		};
 		const childProcessModule = await import("../src/utils/child-process.js");
+		const sessionLeaseModule = await import("../src/core/session-lease.js");
 		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockImplementation(() => alive);
 		const killSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation((_pid, signal) => {
 			if (signal === "SIGKILL") {
 				alive = false;
 			}
 		});
+		// The finalizer's identity check is the asynchronous one (I-7: it must never
+		// fork `ps` synchronously on the supervisor's thread from a 250ms loop).
+		const startIdSpy = vi.spyOn(sessionLeaseModule, "getProcessStartIdAsync").mockResolvedValue(processStartId);
 		try {
 			supervisor.scheduleWorkerStopFinalization(worker);
 			const finalization = worker.stopFinalization;
@@ -2534,6 +2538,7 @@ describe("daemon worker supervisor monitoring", () => {
 		} finally {
 			aliveSpy.mockRestore();
 			killSpy.mockRestore();
+			startIdSpy.mockRestore();
 		}
 	});
 
@@ -2622,6 +2627,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockReturnValue(true);
 		const killSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation(() => {});
 		const startIdSpy = vi.spyOn(sessionLeaseModule, "getProcessStartId").mockReturnValue("proc:recycled");
+		const startIdAsyncSpy = vi.spyOn(sessionLeaseModule, "getProcessStartIdAsync").mockResolvedValue("proc:recycled");
 		try {
 			supervisor.scheduleWorkerStopFinalization(worker);
 			const finalization = worker.stopFinalization;
@@ -2638,6 +2644,7 @@ describe("daemon worker supervisor monitoring", () => {
 			aliveSpy.mockRestore();
 			killSpy.mockRestore();
 			startIdSpy.mockRestore();
+			startIdAsyncSpy.mockRestore();
 		}
 	});
 
@@ -2844,19 +2851,25 @@ describe("daemon worker supervisor monitoring", () => {
 		// The worker is current on the throttled polls, but the pid is recycled
 		// by the time the SIGKILL deadline arrives.
 		const startIdSpy = vi.spyOn(sessionLeaseModule, "getProcessStartId").mockReturnValue("proc:original");
+		const startIdAsyncSpy = vi.spyOn(sessionLeaseModule, "getProcessStartIdAsync").mockResolvedValue("proc:original");
 		try {
 			supervisor.scheduleWorkerStopFinalization(worker);
 			await vi.advanceTimersByTimeAsync(4900);
 			startIdSpy.mockReturnValue("proc:recycled");
+			startIdAsyncSpy.mockResolvedValue("proc:recycled");
 			await vi.advanceTimersByTimeAsync(2000);
 
 			// The fresh check at signal time sees the recycled pid and holds fire.
 			expect(killSpy).not.toHaveBeenCalled();
+			// Positive control: the identity query really is what the finalizer asks,
+			// so "no kill" is the recycled-pid verdict and not an unobservable identity.
+			expect(startIdAsyncSpy).toHaveBeenCalled();
 		} finally {
 			existsSpy.mockRestore();
 			aliveSpy.mockRestore();
 			killSpy.mockRestore();
 			startIdSpy.mockRestore();
+			startIdAsyncSpy.mockRestore();
 		}
 	});
 
@@ -2900,6 +2913,7 @@ describe("daemon worker supervisor monitoring", () => {
 		});
 		// Identity observation is down when the SIGKILL deadline passes...
 		const startIdSpy = vi.spyOn(sessionLeaseModule, "getProcessStartId").mockReturnValue(undefined);
+		const startIdAsyncSpy = vi.spyOn(sessionLeaseModule, "getProcessStartIdAsync").mockResolvedValue(undefined);
 		try {
 			supervisor.scheduleWorkerStopFinalization(worker);
 			const finalization = worker.stopFinalization;
@@ -2909,6 +2923,7 @@ describe("daemon worker supervisor monitoring", () => {
 
 			// ...but once identity is observable again, escalation still fires.
 			startIdSpy.mockReturnValue("proc:original");
+			startIdAsyncSpy.mockResolvedValue("proc:original");
 			await vi.advanceTimersByTimeAsync(5000);
 			await finalization;
 			expect(killSpy).toHaveBeenCalledWith(worker.descriptor.pid, "SIGKILL");
@@ -2918,6 +2933,7 @@ describe("daemon worker supervisor monitoring", () => {
 			aliveSpy.mockRestore();
 			killSpy.mockRestore();
 			startIdSpy.mockRestore();
+			startIdAsyncSpy.mockRestore();
 		}
 	});
 
@@ -2953,6 +2969,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const killSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation(() => {});
 		// Identity observation fails transiently (e.g. ps unavailable).
 		const startIdSpy = vi.spyOn(sessionLeaseModule, "getProcessStartId").mockReturnValue(undefined);
+		const startIdAsyncSpy = vi.spyOn(sessionLeaseModule, "getProcessStartIdAsync").mockResolvedValue(undefined);
 		try {
 			supervisor.scheduleWorkerStopFinalization(worker);
 
@@ -2962,6 +2979,74 @@ describe("daemon worker supervisor monitoring", () => {
 			expect(killSpy).not.toHaveBeenCalled();
 			expect(stopWorker).not.toHaveBeenCalled();
 			expect(worker.stopFinalization).toBeDefined();
+		} finally {
+			existsSpy.mockRestore();
+			aliveSpy.mockRestore();
+			killSpy.mockRestore();
+			startIdSpy.mockRestore();
+			startIdAsyncSpy.mockRestore();
+		}
+	});
+
+	it("gives up on a stop it can never finalize instead of polling for the rest of its life", async () => {
+		vi.useFakeTimers();
+		const worker = {
+			descriptor: {
+				workerId: "worker-unstoppable-stop",
+				pid: 111_122,
+				processStartId: "proc:original",
+				rootActiveSessionId: "active-1",
+				stopRequestedAt: new Date().toISOString(),
+			},
+			intentionalStop: true,
+			stopRevision: 0,
+			stopFinalization: undefined as Promise<void> | undefined,
+		};
+		const workers = new Map([[worker.descriptor.workerId, worker]]);
+		const stopWorker = vi.fn(async () => {});
+		const log = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers,
+			shuttingDown: false,
+			stopWorker,
+			persistWorker: vi.fn(),
+			log,
+			reportCleanupFailure: vi.fn(),
+		}) as {
+			scheduleWorkerStopFinalization(target: object): void;
+		};
+		const childProcessModule = await import("../src/utils/child-process.js");
+		const sessionLeaseModule = await import("../src/core/session-lease.js");
+		const existsSpy = vi.spyOn(childProcessModule, "processIdExists").mockReturnValue(true);
+		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockReturnValue(true);
+		const killSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation(() => {});
+		// The worst case the report describes: the process survives and every identity
+		// query comes back unobservable, so escalation is never provable and the wait
+		// has no natural end.
+		const startIdSpy = vi.spyOn(sessionLeaseModule, "getProcessStartIdAsync").mockResolvedValue(undefined);
+		try {
+			supervisor.scheduleWorkerStopFinalization(worker);
+			const finalization = worker.stopFinalization;
+
+			await vi.advanceTimersByTimeAsync(STOP_FINALIZATION_MAX_MS - 1000);
+			// Just before the terminal it is still waiting, and still silent about it.
+			expect(finalization).toBeDefined();
+			expect(stopWorker).not.toHaveBeenCalled();
+
+			await vi.advanceTimersByTimeAsync(2000);
+			await finalization;
+
+			// Nothing irreversible happened: the registration and the stop tombstone
+			// are kept for a later retry_worker, kill or restart, and the give-up is
+			// written to the log with the facts an operator needs.
+			expect(killSpy).not.toHaveBeenCalled();
+			expect(stopWorker).not.toHaveBeenCalled();
+			expect(workers.has(worker.descriptor.workerId)).toBe(true);
+			expect(worker.descriptor.stopRequestedAt).toBeDefined();
+			const giveUp = log.mock.calls.map((call) => String(call[0])).filter((line) => line.includes("Gave up"));
+			expect(giveUp).toHaveLength(1);
+			expect(giveUp[0]).toContain("worker-unstoppable-stop");
+			expect(giveUp[0]).toContain("unobservable identity checks");
 		} finally {
 			existsSpy.mockRestore();
 			aliveSpy.mockRestore();
@@ -3648,7 +3733,9 @@ describe("daemon worker supervisor monitoring", () => {
 		} as unknown as DaemonAttachResult;
 		const worker = {
 			descriptor: { workerId: "worker-1", lifecycle: "ready", pid: 1234 },
-			client: {},
+			// A connected transport: `requireAvailableWorkerClient` refuses a client
+			// whose socket is gone, which is the state this fixture must not be in.
+			client: { isConnected: true },
 			summaries: new Map([[activeSessionId, summary]]),
 			snapshotCache: new Map([[activeSessionId, result]]),
 			snapshotTransferFrames: new Map(),
@@ -3938,6 +4025,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const worker = {
 			descriptor: { workerId: "worker-1", lifecycle: "ready", pid: 1234 },
 			client: {
+				isConnected: true,
 				request: vi.fn(async () => {
 					throw new Error("snapshot failed");
 				}),

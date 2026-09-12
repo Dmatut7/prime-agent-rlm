@@ -30,7 +30,11 @@
 
 import { getLogger } from "@earendil-works/pi-ai";
 import type { KernelLivenessSample, KernelRevivalVouch } from "./kernel/shared.js";
-import { ORPHAN_PROCESS_JOURNAL_ENV, readActiveOrphanProcesses } from "./orphan-process-journal.js";
+import {
+	DEGRADED_READ_MAX_BYTES,
+	ORPHAN_PROCESS_JOURNAL_ENV,
+	readActiveOrphanProcesses,
+} from "./orphan-process-journal.js";
 import { STALL_KERNEL_REASONS, STALL_VOUCH_LIVENESS_BUDGET_MS, STALL_VOUCH_REASONS } from "./stall-watchdog.js";
 
 const livenessLog = getLogger("coding-agent.turn-liveness");
@@ -316,9 +320,13 @@ export function kernelVouchedAlive(
  * Journaled bash children of one kernel: the degraded fact source for when the heartbeat is stale
  * or absent (B4 - the fallback must exist and must not fail silently).
  *
- * One bounded file read, no per-record process probes, so it is safe once per stall stage. Pid
- * reuse is deliberately not checked here (that costs a process query per record); the caller
- * bounds the result's lifetime instead, and the fact only ever buys the shorter budget tier.
+ * One bounded file read, no per-record process probes, so it is safe once per stall stage: the
+ * journal is compacted at 4096 records / 4MB and this read never parses more than its newest
+ * DEGRADED_READ_MAX_BYTES, so a legacy or non-compacting journal cannot turn the degraded check
+ * into an unbounded synchronous scan. Past that window the count is a lower bound, which costs a
+ * vouch it cannot prove rather than blocking the caller. Pid reuse is deliberately not checked
+ * here (that costs a process query per record); the caller bounds the result's lifetime instead,
+ * and the fact only ever buys the shorter budget tier.
  * Returns undefined when there is nothing to read (no journal configured, no kernel pid).
  */
 export function readJournaledBashHandles(
@@ -332,7 +340,7 @@ export function readJournaledBashHandles(
 	try {
 		// The journal is shared by the host and its kernels; records written by a kernel carry the
 		// host's pid as owner and the kernel's pid as kernelPid.
-		const records = readActiveOrphanProcesses(path, process.pid);
+		const records = readActiveOrphanProcesses(path, process.pid, { maxBytes: DEGRADED_READ_MAX_BYTES });
 		return {
 			liveBashHandles: records.filter((record) => record.kernelPid === kernelPid && record.pid !== kernelPid).length,
 		};

@@ -48,6 +48,7 @@ interface WorkerFixture {
 		createCommand: { config: { cwd: string }; sessionPath?: string };
 	};
 	client: {
+		isConnected: boolean;
 		request: ReturnType<typeof vi.fn>;
 		requestWorker: ReturnType<typeof vi.fn>;
 	};
@@ -87,6 +88,9 @@ function worker(workerId: string, summaries: SessionSummary[] = []): WorkerFixtu
 			createCommand: { config: { cwd: "/tmp/project" } },
 		},
 		client: {
+			// A live transport: `requireAvailableWorkerClient` refuses a client whose
+			// socket is already gone, and this fixture stands in for a connected worker.
+			isConnected: true,
 			request: vi.fn(),
 			requestWorker: vi.fn(),
 		},

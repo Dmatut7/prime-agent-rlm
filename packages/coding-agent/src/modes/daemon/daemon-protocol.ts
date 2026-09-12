@@ -219,6 +219,19 @@ export const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: readonly DaemonClientCapabili
 ];
 
 /**
+ * Read-side bound for one jsonl daemon command. Every other read side in the
+ * daemon is bounded — the private frame transport caps a header at 1MB and a
+ * payload at 1GB, worker stderr is capped at 64KB — but the command readers
+ * accumulated line segments until a newline arrived, so a same-user process
+ * (including bash code injected from a web page or a repository) could hold a
+ * connection open and grow the reader's heap forever without ever sending a
+ * parseable command. 64MB is far above any legitimate command (`prompt.images`
+ * base64 and `restore_actions` are the largest); an overflow destroys the
+ * connection instead of buffering past the bound.
+ */
+export const DAEMON_COMMAND_MAX_LINE_BYTES = 64 * 1024 * 1024;
+
+/**
  * Capabilities a client may declare on connect as the command-gating set for
  * this connection. Declaring opts the connection into server-side enforcement:
  * capability-gated commands and control-plane commands are refused unless the

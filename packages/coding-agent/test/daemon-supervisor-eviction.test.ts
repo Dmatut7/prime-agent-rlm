@@ -105,6 +105,9 @@ function makeSummary(id: string, now: number, overrides: Partial<SessionSummary>
 
 function makeWorker(id: string, summaries: SessionSummary[]): WorkerFixture {
 	const client = {
+		// A live transport: `requireAvailableWorkerClient` refuses a client whose
+		// socket is already gone, and this fixture stands in for a connected worker.
+		isConnected: true,
 		request: vi.fn(async () => success(undefined, "list", { sessions: summaries })),
 		requestWorker: vi.fn(),
 		close: vi.fn(),
@@ -412,6 +415,9 @@ describe("daemon supervisor whole-tree eviction", () => {
 				message: "wake up",
 			}),
 			24 * 60 * 60 * 1000,
+			// The delivery reports how far the frame got towards the wire, so a
+			// transport that was already gone is never receipted as "may have arrived".
+			expect.objectContaining({ onDispatch: expect.any(Function) }),
 		);
 		expect(response).toMatchObject({ success: true, id: "message-1", command: "send_message" });
 	});
@@ -450,6 +456,7 @@ describe("daemon supervisor whole-tree eviction", () => {
 				message: "continue",
 			}),
 			24 * 60 * 60 * 1000,
+			expect.objectContaining({ onDispatch: expect.any(Function) }),
 		);
 		expect(worker.client?.request).not.toHaveBeenCalled();
 		expect(response).toMatchObject({

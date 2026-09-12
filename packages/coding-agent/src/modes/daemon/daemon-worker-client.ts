@@ -1,6 +1,11 @@
 import { createConnection, type Socket } from "node:net";
+import { getLogger } from "@earendil-works/pi-ai";
 import { serializeJsonLine } from "../rpc/jsonl.js";
-import { type PrivateFrame, PrivateFramedChannel } from "../session-worker/private-framing.js";
+import {
+	type PrivateFrame,
+	PrivateFrameChannelClosedError,
+	PrivateFramedChannel,
+} from "../session-worker/private-framing.js";
 import {
 	type DaemonClientMessageListener,
 	type DaemonClientRequestOptions,
@@ -23,6 +28,8 @@ import {
 	isDaemonWorkerFrameHeader,
 } from "./daemon-worker-protocol.js";
 
+const structuredLog = getLogger("coding-agent.daemon.worker-client");
+
 type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
 type DaemonCommandBody = DistributiveOmit<DaemonCommand, "id">;
 type DaemonWorkerWireCommandBody = DaemonCommandBody | DaemonWorkerCommandBody | DaemonPeerCommandBody;
@@ -37,6 +44,27 @@ export class DaemonWorkerAuthenticationError extends Error {}
 
 /** A probe (hello/response/connect) timed out; recovery treats the worker as live-but-slow, never dead. */
 export class DaemonWorkerProbeTimeoutError extends Error {}
+
+/**
+ * The transport was already gone when the request was built, so no byte of it was
+ * ever handed to the socket: non-delivery is provable, and a caller that reports
+ * "may already have been delivered" for this would be lying. Distinct from a write
+ * that fails in flight, where part of the frame may have reached the peer.
+ */
+export class DaemonWorkerNotConnectedError extends Error {}
+
+/** How far a request got towards the wire; see `DaemonWorkerRequestHooks`. */
+export type DaemonWorkerDispatchStage = "queued" | "written";
+
+export interface DaemonWorkerRequestHooks {
+	/**
+	 * `queued`: the transport checks passed and the frame is being handed to the
+	 * socket now — from here on non-delivery is not provable. `written`: the socket
+	 * accepted the whole frame. A caller that has to tell "never sent" apart from
+	 * "sent, answer lost" counts these instead of counting its own attempts.
+	 */
+	onDispatch?: (stage: DaemonWorkerDispatchStage) => void;
+}
 
 export class DaemonWorkerClient {
 	private socket?: Socket;
@@ -128,7 +156,7 @@ export class DaemonWorkerClient {
 			return Promise.resolve(this.helloMessage);
 		}
 		if (!this.socket || this.socket.destroyed) {
-			return Promise.reject(new Error("Daemon worker client is not connected"));
+			return Promise.reject(new DaemonWorkerNotConnectedError("Daemon worker client is not connected"));
 		}
 		return new Promise((resolve, reject) => {
 			const waiter = {
@@ -167,8 +195,12 @@ export class DaemonWorkerClient {
 		return this.requestWire(command, timeoutMs);
 	}
 
-	requestWorker(command: DaemonWorkerCommandBody, timeoutMs = 30_000): Promise<DaemonResponse> {
-		return this.requestWire(command, timeoutMs);
+	requestWorker(
+		command: DaemonWorkerCommandBody,
+		timeoutMs = 30_000,
+		hooks?: DaemonWorkerRequestHooks,
+	): Promise<DaemonResponse> {
+		return this.requestWire(command, timeoutMs, hooks);
 	}
 
 	async authenticateWorker(
@@ -210,9 +242,13 @@ export class DaemonWorkerClient {
 		this.directClosingReason = undefined;
 	}
 
-	private async requestWire(command: DaemonWorkerWireCommandBody, timeoutMs: number): Promise<DaemonResponse> {
+	private async requestWire(
+		command: DaemonWorkerWireCommandBody,
+		timeoutMs: number,
+		hooks?: DaemonWorkerRequestHooks,
+	): Promise<DaemonResponse> {
 		if (!this.channel || !this.socket || this.socket.destroyed) {
-			throw new Error("Daemon worker client is not connected");
+			throw new DaemonWorkerNotConnectedError("Daemon worker client is not connected");
 		}
 		const id = `worker_${++this.requestId}`;
 		const fullCommand = { ...command, id } as DaemonWorkerWireCommand;
@@ -226,17 +262,31 @@ export class DaemonWorkerClient {
 			this.pending.set(id, { resolve, reject, timeout });
 		});
 		try {
+			hooks?.onDispatch?.("queued");
 			await this.channel.send(
 				{ kind: "command", requestId: id, commandType: command.type },
 				Buffer.from(serializeJsonLine(fullCommand)),
 			);
+			hooks?.onDispatch?.("written");
 		} catch (error) {
+			// A channel that was closed before the frame was encoded is the same fact as
+			// a transport that was gone on entry: provably nothing was written. A write
+			// that failed in flight keeps its own error, because part of the frame may
+			// have reached the peer.
+			const failure =
+				error instanceof PrivateFrameChannelClosedError
+					? new DaemonWorkerNotConnectedError("Daemon worker client is not connected")
+					: error instanceof Error
+						? error
+						: new Error(String(error));
 			const pending = this.pending.get(id);
 			if (pending) {
 				clearTimeout(pending.timeout);
 				this.pending.delete(id);
-				pending.reject(error instanceof Error ? error : new Error(String(error)));
+				pending.reject(failure);
 			}
+			// With no pending entry the request timeout already settled `response` and
+			// the caller holds that rejection; throwing as well would leave it unhandled.
 		}
 		return response;
 	}
@@ -281,7 +331,19 @@ export class DaemonWorkerClient {
 			}
 		}
 		for (const listener of this.frameListeners) {
-			listener(frame);
+			try {
+				listener(frame);
+			} catch (error) {
+				// A consumer failure must not tear down the channel: this loop runs
+				// inside the frame decoder's data handler, whose catch destroys the
+				// stream, so one malformed frame would otherwise cost the whole
+				// supervisor<->worker connection (the shape DaemonClient.handleLine
+				// already guards against for its own listeners).
+				structuredLog.warn("daemon worker frame listener failed", {
+					outboundType: frame.header.outboundType,
+					error: String(error),
+				});
+			}
 		}
 		if (this.directPeer && frame.header.outboundType !== "daemon_hello" && frame.header.outboundType !== "response") {
 			this.emitDirectOutbound(frame);

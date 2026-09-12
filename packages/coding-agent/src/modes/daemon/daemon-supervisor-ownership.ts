@@ -1,22 +1,30 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+	closeSync,
+	constants,
 	existsSync,
+	fchmodSync,
+	fsyncSync,
 	mkdirSync,
+	openSync,
 	readdirSync,
 	readFileSync,
 	realpathSync,
 	renameSync,
 	rmSync,
 	statSync,
-	writeFileSync,
+	writeSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { getLogger } from "@earendil-works/pi-ai";
 import lockfile from "proper-lockfile";
 import { getProcessStartId } from "../../core/session-lease.js";
 import { defaultDaemonSocketDir, normalizeSocketPath } from "./daemon-socket.js";
 
 const DAEMON_SUPERVISOR_REGISTRY_DIR_ENV = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR";
+
+const structuredLog = getLogger("coding-agent.daemon.supervisor-ownership");
 
 const OWNER_VERSION = 1;
 const REGISTRY_LOCK_STALE_MS = 5000;
@@ -483,12 +491,29 @@ export async function acquireDaemonSupervisorOwnership(
 				if (!owner) {
 					continue;
 				}
-				if (!ownerConflicts(owner, record)) {
+				if (ownerConflicts(owner, record)) {
+					if (isProcessIdentityAlive(owner)) {
+						throw new DaemonSupervisorAlreadyRunningError(owner);
+					}
+				} else if (isProcessAlive(owner.pid)) {
+					// Somebody else's live daemon on this box: none of our business.
+					// Only the cheap kill(0) is spent here, deliberately: this loop runs
+					// over every owner directory on the machine inside the registry
+					// guard, on the daemon startup path, and the identity check forks
+					// `ps`/`powershell`. Treating a live pid as alive even when it may be
+					// a recycled one only postpones reclaiming that directory to whoever
+					// eventually conflicts with it, which is exactly today's behavior.
 					continue;
 				}
-				if (isProcessIdentityAlive(owner)) {
-					throw new DaemonSupervisorAlreadyRunningError(owner);
-				}
+				// Dead owners are reclaimed whether or not they conflict. Recovery used
+				// to be keyed on a conflict only, so an owner recorded for a different
+				// socket path (a test fixture, `--daemon-socket`, the two generations of
+				// an update handoff) stayed in this global registry forever — 36 of 45
+				// directories on one machine, two weeks old — and every later acquire and
+				// startup fence paid a full-table readdir + readFileSync + JSON.parse for
+				// each of them. Both liveness predicates above are conservative in the same
+				// direction (an unobservable identity counts as alive), so this only ever
+				// takes a directory whose process is provably gone.
 				const staleDirectory = `${directory}.stale-${randomUUID()}`;
 				renameSync(directory, staleDirectory);
 				staleDirectories.push(staleDirectory);
@@ -644,7 +669,7 @@ export async function waitForDaemonStartupFence(
 	const path = startupFencePath(resolve(registryDir, "startup-fences"), socketPath);
 	const deadline = Date.now() + timeoutMs;
 	while (true) {
-		const fence = readStartupFence(path);
+		const fence = await readStartupFenceOrQuarantine(path, registryDir);
 		if (!fence) {
 			return;
 		}
@@ -861,6 +886,53 @@ function writeOwnerRecord(directory: string, record: DaemonSupervisorOwnerRecord
 	writeJsonAtomically(resolve(directory, "owner.json"), record);
 }
 
+/**
+ * A fence that exists but cannot be parsed is debris, not authority. Treating it as
+ * authoritative made the daemon for that socket unstartable forever: the only path
+ * that clears a fence needs a supervisor that can start, and the only path that
+ * rewrites it runs after a successful start and hello. So the bytes are quarantined
+ * under the registry guard and the wait carries on without them — losing a fence
+ * costs one succession wait (a successor may start before its predecessor is fully
+ * gone), which is what the socket lease and the ownership guard are there to
+ * arbitrate anyway.
+ */
+async function readStartupFenceOrQuarantine(
+	path: string,
+	registryDir: string,
+): Promise<DaemonStartupFenceRecord | undefined> {
+	try {
+		return readStartupFence(path);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			return undefined;
+		}
+		const quarantined = `${path}.corrupt-${randomUUID()}`;
+		const renamed = await withDaemonSupervisorRegistryGuard(registryDir, () => {
+			try {
+				// Re-check under the guard: a successor may have replaced the file
+				// between the read above and now, and a parsable fence must be honoured.
+				readStartupFence(path);
+				return false;
+			} catch (guarded) {
+				if ((guarded as NodeJS.ErrnoException).code === "ENOENT") {
+					return false;
+				}
+				renameSync(path, quarantined);
+				return true;
+			}
+		});
+		if (!renamed) {
+			return readStartupFence(path);
+		}
+		structuredLog.warn("quarantined an unreadable daemon startup fence", {
+			path,
+			quarantined,
+			error: String(error),
+		});
+		return undefined;
+	}
+}
+
 function readStartupFence(path: string): DaemonStartupFenceRecord | undefined {
 	try {
 		const value = JSON.parse(readFileSync(path, "utf8")) as unknown;
@@ -932,14 +1004,55 @@ function readShutdownAdmission(path: string): DaemonShutdownAdmissionRecord | un
 	}
 }
 
-function writeJsonAtomically(path: string, value: unknown): void {
+/**
+ * Durable write for authority state (owner record, startup fence, shutdown
+ * admission, worker descriptor, supervisor config). A rename alone only makes the
+ * name change atomic: without an fsync a machine crash can leave the canonical
+ * path pointing at a zero-byte or half-written file, and the readers here treat
+ * that as authoritative — a torn startup fence makes the daemon for that socket
+ * unstartable (clearing it needs a daemon that can start), a torn worker
+ * descriptor is skipped on every later startup and never cleaned up. Same shape
+ * the three recovery journals already use: fsync the temp, rename, fsync the
+ * directory. The directory fsync is best-effort because not every platform lets a
+ * directory be opened for reading; the rename above is still atomic there, only
+ * its durability across a power loss is weaker.
+ */
+export function writeJsonAtomically(path: string, value: unknown): void {
 	const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+	let descriptor: number | undefined;
 	try {
-		writeFileSync(tempPath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+		descriptor = openSync(
+			tempPath,
+			constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
+			0o600,
+		);
+		writeSync(descriptor, `${JSON.stringify(value, null, 2)}\n`);
+		// open's mode is umask-masked; pin the private bits before the file is durable.
+		fchmodSync(descriptor, 0o600);
+		fsyncSync(descriptor);
+		closeSync(descriptor);
+		descriptor = undefined;
 		renameSync(tempPath, path);
 	} catch (error) {
+		if (descriptor !== undefined) {
+			try {
+				closeSync(descriptor);
+			} catch {
+				// The write failure is the one worth reporting.
+			}
+		}
 		rmSync(tempPath, { force: true });
 		throw error;
+	}
+	try {
+		const directoryDescriptor = openSync(dirname(path), "r");
+		try {
+			fsyncSync(directoryDescriptor);
+		} finally {
+			closeSync(directoryDescriptor);
+		}
+	} catch {
+		// See above: weaker durability, not a failed write.
 	}
 }
 

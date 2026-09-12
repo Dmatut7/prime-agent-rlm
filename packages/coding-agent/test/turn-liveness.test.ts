@@ -1,9 +1,13 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { KernelLivenessSample } from "../src/core/kernel/shared.js";
-import { ORPHAN_PROCESS_JOURNAL_ENV } from "../src/core/orphan-process-journal.js";
+import {
+	DEGRADED_READ_MAX_BYTES,
+	ORPHAN_PROCESS_JOURNAL_ENV,
+	readActiveOrphanProcesses,
+} from "../src/core/orphan-process-journal.js";
 import { STALL_VOUCH_REASONS } from "../src/core/stall-watchdog.js";
 import {
 	createTurnLiveness,
@@ -695,6 +699,30 @@ describe("readJournaledBashHandles", () => {
 	it("does not throw when the journal file is missing", () => {
 		const read = vi.fn(readJournaledBashHandles);
 		expect(read(4242, env(join(tempDir, "missing.jsonl")))).toEqual({ liveBashHandles: 0 });
+	});
+
+	it("parses an oversized journal as a bounded tail instead of in full", () => {
+		// A journal whose compaction is failing, or a legacy one written before there
+		// was a bound, grows without limit; the degraded stall check runs on the host
+		// thread and must not scale with it.
+		const kernelPid = 4242;
+		const pad = "x".repeat(64 * 1024);
+		const fillerCount = Math.ceil(DEGRADED_READ_MAX_BYTES / (pad.length + 256)) + 2;
+		const records: string[] = [JSON.stringify(record(1001, kernelPid))];
+		for (let index = 0; index < fillerCount; index++) {
+			records.push(JSON.stringify({ ...record(200_000 + index), active: false, pad }));
+		}
+		records.push(JSON.stringify(record(1002, kernelPid)));
+		writeFileSync(journalPath(), `${records.join("\n")}\n`);
+		expect(statSync(journalPath()).size).toBeGreaterThan(DEGRADED_READ_MAX_BYTES);
+
+		// The handle written after the filler is inside the window; the one written
+		// before it is not, so the degraded count is a lower bound (a vouch it cannot
+		// prove is one it does not give) while the unbounded read stays complete.
+		expect(readJournaledBashHandles(kernelPid, env(journalPath()))).toEqual({ liveBashHandles: 1 });
+		expect(
+			readActiveOrphanProcesses(journalPath(), process.pid).filter((orphan) => orphan.kernelPid === kernelPid),
+		).toHaveLength(2);
 	});
 });
 

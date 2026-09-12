@@ -1,8 +1,9 @@
-import { type ChildProcess, execFile, spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
 	chmodSync,
 	existsSync,
+	lstatSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
@@ -11,11 +12,9 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import { readFile } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { basename, dirname, join, resolve } from "node:path";
 import { Writable } from "node:stream";
-import { promisify } from "node:util";
 import { getLogger } from "@earendil-works/pi-ai";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import {
@@ -31,6 +30,7 @@ import {
 	type AgentSessionMessageAgentSummary,
 	assertAgentFamilyReach,
 	assertAgentSessionNameAvailable,
+	assertDirectAgentMessageTarget,
 	formatAgentSessionNameUnavailable,
 	sessionNameReservationKey,
 } from "../../core/agent-messages.js";
@@ -60,7 +60,12 @@ import {
 	type IdleEvictionMinutes,
 	type WorkerEvictionSnapshot,
 } from "../../core/session-action-store.js";
-import { canonicalSessionPath, getProcessStartId, SessionAlreadyActiveError } from "../../core/session-lease.js";
+import {
+	canonicalSessionPath,
+	getProcessStartId,
+	getProcessStartIdAsync,
+	SessionAlreadyActiveError,
+} from "../../core/session-lease.js";
 import { getSessionArtifactPathForFile, readSessionInfo, type SessionInfo } from "../../core/session-manager.js";
 import { looksLikeSessionPath } from "../../core/session-resolver.js";
 import { SettingsManager } from "../../core/settings-manager.js";
@@ -88,12 +93,14 @@ import {
 	createDaemonEventMeta,
 	DAEMON_COMMAND_COMPATIBILITY,
 	DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION,
+	DAEMON_COMMAND_MAX_LINE_BYTES,
 	DAEMON_DEFAULT_CLIENT_CAPABILITIES,
 	DAEMON_DEFAULT_SERVER_CAPABILITIES,
 	DAEMON_PROTOCOL_INFO,
 	DAEMON_SCHEMA_ID,
 	DAEMON_SCHEMA_REVISION,
 	DAEMON_SUPERVISOR_ONLY_SERVER_CAPABILITIES,
+	DAEMON_SUPPORTED_CLIENT_CAPABILITIES,
 	DAEMON_UPDATE_RESTART_FORMAT_VERSION,
 	type DaemonAttachResult,
 	type DaemonClientCapability,
@@ -140,6 +147,7 @@ import {
 	acquireDaemonSupervisorOwnership,
 	isDaemonShutdownAdmissionActive,
 	waitForDaemonStartupFence,
+	writeJsonAtomically,
 } from "./daemon-supervisor-ownership.js";
 import {
 	DAEMON_ADOPTION_REQUEST_TIMEOUT_MS,
@@ -151,7 +159,9 @@ import {
 import {
 	DaemonWorkerAuthenticationError,
 	DaemonWorkerClient,
+	DaemonWorkerNotConnectedError,
 	DaemonWorkerProbeTimeoutError,
+	type DaemonWorkerRequestHooks,
 } from "./daemon-worker-client.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
@@ -253,9 +263,24 @@ const WORKER_RETRY_DELAYS_MS = [250, 1000, 5000] as const;
 const DEFERRED_RECOVERY_RECHECK_MS = 5000;
 // ~2.5 minutes of probing: each round is one 5s defer recheck plus a ~11s three-delay probe pass.
 const MAX_DEFERRED_RECOVERY_ROUNDS = 10;
+/**
+ * How long a stream-ending snapshot frame waits for a suspended client's socket to
+ * drain before the stream gives up and releases what it holds. Mirrors the worker
+ * side's WORKER_SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS; data chunks are never bounded.
+ */
+const SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS = 1_000;
 const STOP_FINALIZATION_RECHECK_MS = 250;
 const STOP_FINALIZATION_SIGKILL_GRACE_MS = 5000;
 const STOP_FINALIZATION_RETRY_MS = 5000;
+/**
+ * Wall-clock terminal for the background wait on a worker that survived SIGKILL.
+ * A process in uninterruptible sleep (wedged storage), a zombie nobody reaps, or
+ * an identity query that keeps coming back unobservable would otherwise keep this
+ * loop polling every 250ms for the rest of the supervisor's life. Giving up keeps
+ * the registration and the stop tombstone — nothing irreversible happens — and
+ * says so in the log instead of spinning silently.
+ */
+export const STOP_FINALIZATION_MAX_MS = 10 * 60_000;
 const STALE_RECLAIM_WAIT_MS = 10_000;
 // Polling loops probe existence cheaply via kill(0); the ps-backed zombie and
 // identity checks are throttled so a wedged worker cannot saturate the
@@ -408,55 +433,18 @@ export function installSupervisorCrashHandlers(options: SupervisorCrashHandlerOp
 	};
 }
 
-const execFileAsync = promisify(execFile);
-
 /**
- * Asynchronous process start identity (I-7). `getProcessStartId` shells out with
- * execFileSync on macOS/BSD/Windows, and a periodic sweep must not block the
- * supervisor's single thread with it — that is exactly the stall a worker liveness
- * probe would then misread. Same formats as the synchronous helper, so identities
- * recorded by either compare equal.
+ * Asynchronous process start identity (I-7) is the canonical `session-lease`
+ * helper, re-exported because the reaper and the tests reach it through this
+ * module. `getProcessStartId` shells out with execFileSync on macOS/BSD/Windows,
+ * and a periodic sweep must not block the supervisor's single thread with it —
+ * that is exactly the stall a worker liveness probe would then misread. The
+ * canonical version is also the one that bounds the query (a wedged `ps` or
+ * `powershell` rejects after 5s and reads as unobservable) — a local copy without
+ * that timeout turned one wedged helper process into a reaper whose single-flight
+ * promise never settled, silently for the rest of the supervisor's life.
  */
-export async function getProcessStartIdAsync(pid: number): Promise<string | undefined> {
-	if (!Number.isInteger(pid) || pid <= 0) {
-		return undefined;
-	}
-	if (process.platform === "win32") {
-		try {
-			const { stdout } = await execFileAsync("powershell.exe", [
-				"-NoLogo",
-				"-NoProfile",
-				"-NonInteractive",
-				"-Command",
-				`([System.Diagnostics.Process]::GetProcessById(${pid})).StartTime.ToUniversalTime().Ticks`,
-			]);
-			const ticks = stdout.trim();
-			return /^\d+$/.test(ticks) ? `win:${ticks}` : undefined;
-		} catch {
-			return undefined;
-		}
-	}
-	try {
-		const stat = await readFile(`/proc/${pid}/stat`, "utf8");
-		const commandEnd = stat.lastIndexOf(")");
-		const startTime = stat.slice(commandEnd + 2).split(" ")[19];
-		if (startTime) {
-			return `proc:${startTime}`;
-		}
-	} catch {
-		// Fall through to the portable process listing used on macOS and BSD.
-	}
-	try {
-		// `lstart` is rendered in the subprocess timezone and locale, so pin both for a durable identity.
-		const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "lstart="], {
-			env: { ...process.env, LC_ALL: "C", LC_TIME: "C", LANG: "C", TZ: "UTC" },
-		});
-		const startTime = stdout.trim();
-		return startTime ? `ps:${startTime}` : undefined;
-	} catch {
-		return undefined;
-	}
-}
+export { getProcessStartIdAsync };
 
 /**
  * The reaper's death proof (L5): the pid is gone, or it is alive under a start
@@ -501,6 +489,48 @@ export function isExpectedWorkerAvailabilityError(error: unknown): boolean {
  */
 export function deliveryDispatchTimeoutTier(dispatches: number): WorkerRequestTimeoutTier {
 	return dispatches === 0 ? "long" : "deliver";
+}
+
+/**
+ * What one delivery actually got as far as the wire. Counting the supervisor's own
+ * attempts is not enough: an attempt can fail before a byte is written (the worker
+ * client was already closed), and reporting that as "may already have been
+ * delivered" tells the sender not to re-send a message that provably never left.
+ * The client reports the two stages instead, so the verdict below is keyed on the
+ * transport and the pre-write failures stay countable as bounces.
+ */
+export class DeliveryDispatchCounter {
+	private queued = 0;
+	private confirmed = 0;
+
+	/** Handed to `DaemonWorkerClient.requestWorker` for the delivery's dispatch. */
+	readonly hooks: DaemonWorkerRequestHooks = {
+		onDispatch: (stage) => {
+			if (stage === "queued") {
+				this.queued++;
+			} else {
+				this.confirmed++;
+			}
+		},
+	};
+
+	/**
+	 * Frames handed to the socket, in flight or written. From the first one on,
+	 * non-delivery is not provable: a write that fails halfway can still have
+	 * reached the target, and only its answer was lost.
+	 */
+	get dispatches(): number {
+		return this.queued;
+	}
+
+	/** Frames the socket accepted in full; `dispatches - written` were in flight when the failure hit. */
+	get written(): number {
+		return this.confirmed;
+	}
+
+	get mayHaveBeenDelivered(): boolean {
+		return this.queued > 0;
+	}
 }
 
 export function isTransientCatchupFailure(error: unknown): boolean {
@@ -884,6 +914,15 @@ function responseWithId(response: DaemonResponse, id: string | undefined): Daemo
 	return { ...response, id };
 }
 
+/** The minimum a roster frame entry must carry to be classified and written. */
+function isWorkerRosterEntry(value: unknown): value is WorkerRosterEntry {
+	if (typeof value !== "object" || value === null) {
+		return false;
+	}
+	const entry = value as { agentId?: unknown; summary?: unknown };
+	return typeof entry.agentId === "string" && isSessionSummary(entry.summary);
+}
+
 function isSessionSummary(value: unknown): value is SessionSummary {
 	if (!value || typeof value !== "object") {
 		return false;
@@ -894,7 +933,18 @@ function isSessionSummary(value: unknown): value is SessionSummary {
 	);
 }
 
-function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is DaemonWorkerDescriptor {
+/**
+ * A JSON object carrying a numeric `version` is somebody's descriptor — possibly
+ * one a newer build wrote in a format this one does not know. Only that shape is
+ * left alone when it cannot be used; anything else is garbage (a torn write, a
+ * truncated file, a stray `.json`) and is quarantined instead of being re-parsed
+ * and re-logged on every startup forever.
+ */
+function claimsDescriptorVersion(value: unknown): boolean {
+	return typeof value === "object" && value !== null && typeof (value as { version?: unknown }).version === "number";
+}
+
+function isDaemonWorkerDescriptorShape(value: unknown): value is DaemonWorkerDescriptor {
 	if (!value || typeof value !== "object") {
 		return false;
 	}
@@ -902,7 +952,6 @@ function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is 
 	return (
 		(descriptor.version === 1 || descriptor.version === 2) &&
 		typeof descriptor.supervisorSocketPath === "string" &&
-		normalizeSocketPath(descriptor.supervisorSocketPath) === socketPath &&
 		typeof descriptor.workerId === "string" &&
 		Number.isInteger(descriptor.pid) &&
 		(descriptor.pid ?? 0) > 0 &&
@@ -919,6 +968,10 @@ function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is 
 		typeof descriptor.createCommand === "object" &&
 		descriptor.createCommand.type === "create"
 	);
+}
+
+function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is DaemonWorkerDescriptor {
+	return isDaemonWorkerDescriptorShape(value) && normalizeSocketPath(value.supervisorSocketPath) === socketPath;
 }
 
 class PreRosterWorkerError extends Error {}
@@ -1021,11 +1074,25 @@ function isFinalizedTranscriptEvent(eventType: string | undefined): boolean {
 	);
 }
 
+const SUPPORTED_CLIENT_CAPABILITIES: ReadonlySet<string> = new Set(DAEMON_SUPPORTED_CLIENT_CAPABILITIES);
+
+/**
+ * Same filtering the worker side applies (`normalizeClientCapabilities`): an
+ * attach carries an arbitrary string array that the supervisor echoes back and
+ * keeps per attached session, so unknown names are dropped instead of resident.
+ * A client loses nothing by it — what it declares is either supported here or was
+ * never going to be honoured.
+ */
 function normalizeCapabilities(
 	capabilities: readonly DaemonClientCapability[] | undefined,
 	supportsExtensionUi: boolean | undefined,
 ): Set<DaemonClientCapability> {
-	const normalized = new Set(capabilities ?? DAEMON_DEFAULT_CLIENT_CAPABILITIES);
+	const normalized = new Set<DaemonClientCapability>();
+	for (const capability of capabilities ?? DAEMON_DEFAULT_CLIENT_CAPABILITIES) {
+		if (SUPPORTED_CLIENT_CAPABILITIES.has(capability)) {
+			normalized.add(capability);
+		}
+	}
 	if (supportsExtensionUi) {
 		normalized.add("extension_ui");
 	}
@@ -1181,7 +1248,7 @@ export class DaemonSupervisor {
 			mkdirSync(this.descriptorDir, { recursive: true, mode: 0o700 });
 			chmodSync(this.descriptorDir, 0o700);
 			this.persistSupervisorConfig();
-			rmSync(this.snapshotCacheRoot, { recursive: true, force: true });
+			this.reclaimStaleSnapshotCacheGenerations();
 			mkdirSync(this.snapshotCacheRoot, { recursive: true, mode: 0o700 });
 			this.commandJournal = new CommandRecoveryJournal(join(this.descriptorDir, "command-journal.jsonl"));
 			this.loadWorkerDescriptors();
@@ -1826,11 +1893,27 @@ export class DaemonSupervisor {
 			}
 			const path = join(this.descriptorDir, name);
 			try {
-				const descriptor: unknown = JSON.parse(readFileSync(path, "utf8"));
+				let descriptor: unknown;
+				try {
+					descriptor = JSON.parse(readFileSync(path, "utf8"));
+				} catch (error) {
+					// Quarantine rather than skip: an unreadable file is re-read, re-parsed
+					// and re-logged on every startup forever, and `hasPersistedWorkerDescriptors`
+					// keeps counting it as a registered worker. The rename keeps the bytes as
+					// evidence and takes them out of every later scan.
+					this.log(`Ignoring invalid worker descriptor ${path}: ${String(error)}`);
+					this.quarantineWorkerDescriptor(path, "unreadable");
+					this.recordDegraded("worker descriptor unreadable");
+					continue;
+				}
 				if (!isDaemonWorkerDescriptor(descriptor, this.socketPath)) {
 					// A silently skipped descriptor is unrecoverable evidence loss: the
 					// worker it named stays invisible to this and every later restart.
 					this.log(`Ignoring worker descriptor ${path}: not a worker descriptor for socket ${this.socketPath}`);
+					if (!claimsDescriptorVersion(descriptor)) {
+						this.quarantineWorkerDescriptor(path, "malformed");
+						this.recordDegraded("worker descriptor malformed");
+					}
 					continue;
 				}
 				descriptor.supervisorSocketPath = normalizeSocketPath(descriptor.supervisorSocketPath);
@@ -1910,10 +1993,51 @@ export class DaemonSupervisor {
 			socketPath: this.socketPath,
 			defaultSessionConfig: durableAgentSessionRuntimeConfig(this.defaultSessionConfig),
 		};
-		const tempPath = `${this.supervisorConfigPath}.${process.pid}.tmp`;
-		writeFileSync(tempPath, `${JSON.stringify(persisted, null, 2)}\n`, { mode: 0o600 });
-		chmodSync(tempPath, 0o600);
-		renameSync(tempPath, this.supervisorConfigPath);
+		writeJsonAtomically(this.supervisorConfigPath, persisted);
+	}
+
+	/**
+	 * Reclaim the snapshot transcript directories of previous generations.
+	 * `snapshotCacheRoot` ends in this process's own UUID, so removing *it* before
+	 * creating it (what this used to do) could never match anything: a supervisor
+	 * that was killed, OOMed or lost power instead of shutting down left its
+	 * overflow chunks on disk for good, and every restart added another directory
+	 * next to them. Ownership was acquired above and is exclusive for this
+	 * descriptor directory, so every sibling here belongs to a dead generation.
+	 */
+	private reclaimStaleSnapshotCacheGenerations(): void {
+		const cacheParent = dirname(this.snapshotCacheRoot);
+		let names: string[];
+		try {
+			names = readdirSync(cacheParent);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				return;
+			}
+			this.log(`Could not scan the snapshot cache directory ${cacheParent}: ${String(error)}`);
+			return;
+		}
+		let reclaimed = 0;
+		for (const name of names) {
+			if (name === this.generation) {
+				continue;
+			}
+			const stale = join(cacheParent, name);
+			try {
+				// lstat, and directories only: a planted symlink must never be followed
+				// out of the cache directory, and a stray file is somebody else's business.
+				if (!lstatSync(stale).isDirectory()) {
+					continue;
+				}
+				rmSync(stale, { recursive: true, force: true });
+				reclaimed++;
+			} catch (error) {
+				this.log(`Could not reclaim the stale snapshot cache generation ${stale}: ${String(error)}`);
+			}
+		}
+		if (reclaimed > 0) {
+			this.log(`Reclaimed ${reclaimed} stale snapshot cache generation(s) under ${cacheParent}`);
+		}
 	}
 
 	private hasPersistedWorkerDescriptors(): boolean {
@@ -1924,11 +2048,26 @@ export class DaemonSupervisor {
 
 	private persistWorker(worker: ResidentWorker): void {
 		worker.descriptor.updatedAt = new Date().toISOString();
-		const persisted = durableDaemonWorkerDescriptor(worker.descriptor);
-		const tempPath = `${worker.descriptorPath}.${process.pid}.tmp`;
-		writeFileSync(tempPath, `${JSON.stringify(persisted, null, 2)}\n`, { mode: 0o600 });
-		chmodSync(tempPath, 0o600);
-		renameSync(tempPath, worker.descriptorPath);
+		// Durable write: the descriptor is what a later supervisor adopts from, so a
+		// torn one costs the whole tree its registration (see writeJsonAtomically).
+		writeJsonAtomically(worker.descriptorPath, durableDaemonWorkerDescriptor(worker.descriptor));
+	}
+
+	/**
+	 * Move an unusable descriptor out of the scan set without deleting it. The
+	 * `.corrupt-` suffix keeps the file (evidence for whoever investigates) while
+	 * taking it off the `*.json` path every loader, the ephemeral-cancel sweep and
+	 * `hasPersistedWorkerDescriptors` walk.
+	 */
+	private quarantineWorkerDescriptor(path: string, reason: string): void {
+		const quarantined = `${path}.corrupt-${randomUUID()}`;
+		try {
+			renameSync(path, quarantined);
+			this.log(`Quarantined ${reason} worker descriptor ${path} as ${quarantined}`);
+		} catch (error) {
+			// Leaving it in place is the previous behavior: skipped and logged again.
+			this.log(`Could not quarantine ${reason} worker descriptor ${path}: ${String(error)}`);
+		}
 	}
 
 	private deleteWorkerDescriptor(worker: { descriptorPath: string; descriptor: DaemonWorkerDescriptor }): void {
@@ -1988,8 +2127,24 @@ export class DaemonSupervisor {
 			() => client.socket.destroy(),
 		);
 
-		client.detachInput = attachJsonlLineReader(socket, (line) =>
-			this.background(this.handleLine(client, line), `client command handling for ${client.id}`),
+		client.detachInput = attachJsonlLineReader(
+			socket,
+			(line) => this.background(this.handleLine(client, line), `client command handling for ${client.id}`),
+			{
+				maxLineLength: DAEMON_COMMAND_MAX_LINE_BYTES,
+				onLineOverflow: () => {
+					// Nothing was parsed and nothing was dispatched, so there is no
+					// response to duplicate: drop the connection and make the attempt
+					// visible. logDegraded, not recordDegraded — one peer sending an
+					// over-long line must not flip the supervisor's global degraded flag,
+					// which defers the reaper's irreversible deletes for everybody.
+					this.logDegraded(
+						"client command line overflow",
+						`Destroyed client connection ${client.id}: a command line exceeded ${DAEMON_COMMAND_MAX_LINE_BYTES} bytes`,
+					);
+					socket.destroy(new Error("Daemon command line too long"));
+				},
+			},
 		);
 		let cleaned = false;
 		const cleanup = () => {
@@ -2006,6 +2161,25 @@ export class DaemonSupervisor {
 			);
 			this.clients.delete(client);
 			this.cancelWaitingPromptAdmissionsForClient(client);
+			// Drop the admissions nothing is waiting on. An entry that was registered
+			// but never reached a worker — a gate that refused the command, a cancel
+			// with nowhere to go — has no handler left to delete it, and the map key is
+			// the client object itself, so one leftover pins the DaemonSocketClient
+			// (socket, buffers, attached session ids) for the life of the supervisor.
+			// Entries whose worker cancel is in flight stay mapped until their own
+			// handler's finally removes them: the prompt path relies on still finding
+			// its admission while the cancellation is being answered.
+			const leftoverAdmissions = this.promptAdmissions.get(client);
+			if (leftoverAdmissions) {
+				for (const [key, admission] of leftoverAdmissions) {
+					if (admission.worker === undefined) {
+						leftoverAdmissions.delete(key);
+					}
+				}
+				if (leftoverAdmissions.size === 0) {
+					this.promptAdmissions.delete(client);
+				}
+			}
 			this.abortPendingDeliveriesForSender(client);
 			for (const activeSessionId of [...client.attachedActiveSessionIds]) {
 				client.attachedActiveSessionIds.delete(activeSessionId);
@@ -2321,6 +2495,13 @@ export class DaemonSupervisor {
 			command,
 		);
 		if (missingCapability !== undefined) {
+			// Same invariant as every other early exit after registration: the
+			// admission this line just created has to go with it, or it stays keyed on
+			// the client until the connection dies. A prompt carrying an admissionId
+			// reaches this gate whenever the connection did not declare
+			// prompt_admission_cancellation — which is exactly what a narrow or newer
+			// client's declared set looks like to an older supervisor.
+			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
 			this.write(
 				client,
 				failure(
@@ -2712,7 +2893,21 @@ export class DaemonSupervisor {
 						});
 						if (!release.success) throw new Error(release.error);
 					} catch (error) {
-						match.worker.client?.close();
+						const invalidated = match.worker.client;
+						if (invalidated) {
+							// Close and deregister as a pair, in the order the other disconnect
+							// paths use: `handleWorkerClose` only acts while `worker.client`
+							// still names this client, so it has to run first. Leaving the
+							// registration pointing at a closed client keeps it claiming a ready
+							// transport until the 'close' event lands, and a delivery dispatched
+							// in that window fails without a byte being written.
+							const failure = error instanceof Error ? error : new Error(String(error));
+							this.background(
+								this.handleWorkerClose(match.worker, invalidated, failure),
+								`worker close handling for ${match.worker.descriptor.workerId}`,
+							);
+							invalidated.close();
+						}
 						throw error;
 					}
 					throw new Error("Session input pause acquisition was invalidated before completion");
@@ -3105,6 +3300,11 @@ export class DaemonSupervisor {
 		}
 
 		if (command.type === "send_message") {
+			// Same gate the worker side applies (daemon-mode.ts): an empty target used to
+			// fall through to the catalog, where `"".startsWith` matches every saved
+			// session, so a single-session cwd silently retargeted the message while a
+			// multi-session one reported it as ambiguous.
+			assertDirectAgentMessageTarget(command.targetActiveSessionId);
 			// agentOrigin without fromActiveSessionId is trusted only at the direct socket-client boundary.
 			const source = command.fromActiveSessionId
 				? await this.findWorkerForClient(client, command.fromActiveSessionId)
@@ -5429,7 +5629,16 @@ export class DaemonSupervisor {
 		const applySource = source ?? worker.client ?? worker.pendingClient;
 		if (!this.isWorkerRosterApplyCurrent(worker, applySource)) return;
 		if (delta.snapshot !== true && worker.rosterApplyChain === undefined) {
-			this.applyWorkerRosterDelta(worker, delta);
+			// Same handling as the chained path below: a frame this build cannot apply
+			// costs one log line and a repair pull, never the supervisor<->worker
+			// connection (a throw here reaches the frame decoder's catch, which
+			// destroys the stream).
+			try {
+				this.applyWorkerRosterDelta(worker, delta);
+			} catch (error) {
+				this.log(`could not apply a roster frame: ${String(error)}`);
+				this.scheduleRosterRepairPull(worker);
+			}
 			return;
 		}
 		this.chainWorkerRosterApply(worker, applySource, () =>
@@ -5485,9 +5694,25 @@ export class DaemonSupervisor {
 		worker: ResidentWorker,
 		delta: Extract<DaemonWorkerRosterOutbound, { type: "roster_delta" }>,
 	): void {
+		let skipped = 0;
 		for (const entry of delta.entries) {
+			// A mixed-version worker can send an entry this build cannot classify, and
+			// classification reads `summary.activity`: a missing summary is a
+			// synchronous TypeError. Skip and repair instead of throwing into the frame
+			// dispatcher, the same way `sessionSummariesFromResponse` validates a `list`
+			// response before using it.
+			if (!isWorkerRosterEntry(entry)) {
+				skipped++;
+				continue;
+			}
 			this.writeRosterEntry(entry, worker);
 			this.syncRootDescriptorFromRosterEntry(worker, entry);
+		}
+		if (skipped > 0) {
+			this.log(
+				`Skipped ${skipped} malformed roster ${skipped === 1 ? "entry" : "entries"} from worker ${worker.descriptor.workerId}; pulling a repair snapshot`,
+			);
+			this.scheduleRosterRepairPull(worker);
 		}
 		for (const agentId of delta.removedAgentIds ?? []) {
 			this.roster().delete(agentId);
@@ -5926,14 +6151,21 @@ export class DaemonSupervisor {
 	}
 
 	private requireAvailableWorkerClient(worker: ResidentWorker, allowStopping = false): DaemonWorkerClient {
-		if (
-			!worker.client ||
-			worker.descriptor.lifecycle !== "ready" ||
-			(!allowStopping && this.isWorkerStopping(worker))
-		) {
+		const client = worker.client;
+		if (!client || worker.descriptor.lifecycle !== "ready" || (!allowStopping && this.isWorkerStopping(worker))) {
 			throw new Error(`Session worker is ${this.effectiveWorkerState(worker)}`);
 		}
-		return worker.client;
+		if (!client.isConnected) {
+			// Registration and transport disagree: `close()`/`destroy()` and the
+			// `'close'` event that clears `worker.client` are separated by an async
+			// gap, and a bookkeeping-only check would hand back a client that cannot
+			// write. Saying "not connected" keeps the caller on the paths that treat
+			// it as a transient state (a delivery requeues) instead of letting the
+			// transport error surface as "the request may already have been
+			// delivered" for bytes that were never written.
+			throw new Error("Session worker is not connected");
+		}
+		return client;
 	}
 
 	private async issuePeerTransport(
@@ -6247,16 +6479,19 @@ export class DaemonSupervisor {
 		}
 		const entry = admitted.entry;
 		/**
-		 * Delivery requests actually written to a worker. From the first one,
-		 * non-delivery is not provable: the target may have accepted the message
-		 * and only the answer was lost. Every receipt and log line below has to
-		 * keep those two states apart, or the sender re-sends a message that
-		 * already landed. This count — not `entry.attempts`, which also ticks on
-		 * every pre-dispatch bounce — picks the dispatch timeout tier, so an
-		 * unreachable target that bounces for an hour still gets the long budget
-		 * on the first request that actually reaches a worker (B5).
+		 * Delivery requests whose bytes reached a worker's socket. From the first
+		 * one, non-delivery is not provable: the target may have accepted the
+		 * message and only the answer was lost. Every receipt and log line below
+		 * has to keep those two states apart, or the sender re-sends a message that
+		 * already landed — and, just as badly, or the sender is told not to re-send
+		 * one that provably never left. This count — not `entry.attempts`, which
+		 * also ticks on every pre-dispatch bounce, and not the supervisor's own
+		 * attempt loop, which also ticks when the transport was already gone —
+		 * picks the dispatch timeout tier, so an unreachable target that bounces
+		 * for an hour still gets the long budget on the first request that
+		 * actually reaches a worker (B5).
 		 */
-		let dispatches = 0;
+		const dispatched = new DeliveryDispatchCounter();
 		/**
 		 * F3: when this delivery first found no registered worker for its target.
 		 * A recovery relaunch deletes the registration for the seconds its stop
@@ -6300,10 +6535,22 @@ export class DaemonSupervisor {
 					await this.requeuePendingDelivery(queue, entry, targetActiveSessionId, error);
 					continue;
 				}
-				const tierMs = WORKER_REQUEST_TIMEOUT_TIERS[deliveryDispatchTimeoutTier(dispatches)];
+				const tierMs = WORKER_REQUEST_TIMEOUT_TIERS[deliveryDispatchTimeoutTier(dispatched.dispatches)];
 				const timeoutMs = Math.max(1, Math.min(tierMs, remainingMs));
-				dispatches++;
-				const response = await this.raceDeliveryAbort(entry, workerClient.requestWorker(payload, timeoutMs));
+				let response: DaemonResponse;
+				try {
+					response = await this.raceDeliveryAbort(
+						entry,
+						workerClient.requestWorker(payload, timeoutMs, dispatched.hooks),
+					);
+				} catch (error) {
+					if (!(error instanceof DaemonWorkerNotConnectedError)) throw error;
+					// The transport was gone before the frame was encoded, so nothing was
+					// written: another pre-dispatch bounce, which requeues and keeps the
+					// honest "was not delivered" verdict available to the sender.
+					await this.requeuePendingDelivery(queue, entry, targetActiveSessionId, error);
+					continue;
+				}
 				queue.complete(entry);
 				return { ...response, id: command.id, command: command.type };
 			}
@@ -6311,17 +6558,17 @@ export class DaemonSupervisor {
 			queue.drop(entry);
 			if (error instanceof PendingDeliveryAbortedError) {
 				const reason = error.reason.replaceAll("_", " ");
-				const state = dispatches > 0 ? "uncertain" : "undelivered";
+				const state = dispatched.mayHaveBeenDelivered ? "uncertain" : "undelivered";
 				this.log(
 					`deliver message dropped for ${targetActiveSessionId} (delivery ${entry.deliveryId}, attempts ${entry.attempts}, state ${state}): ${error.message}`,
 				);
 				throw new Error(
-					dispatches > 0
+					dispatched.mayHaveBeenDelivered
 						? `Agent message to ${targetActiveSessionId} may already have been delivered: the daemon stopped waiting for the target's answer (${reason}). Do not re-send it blindly; ask the target session whether it arrived, or re-send only if a duplicate would be harmless.`
 						: `Agent message to ${targetActiveSessionId} was not delivered: the daemon stopped the pending delivery before it reached the target (${reason}). Send it again once the daemon is back.`,
 				);
 			}
-			if (dispatches > 0) {
+			if (dispatched.mayHaveBeenDelivered) {
 				// F2: from the first dispatch on, non-delivery is not provable — the
 				// target may have taken the message and only the answer was lost when
 				// its worker stopped, crashed or ran out of its tier. Report the same
@@ -6329,7 +6576,7 @@ export class DaemonSupervisor {
 				// transport error it will read as "never arrived" and re-send.
 				const detail = error instanceof Error ? error.message : String(error);
 				this.log(
-					`deliver message uncertain for ${targetActiveSessionId} (delivery ${entry.deliveryId}, attempts ${entry.attempts}, state uncertain): ${detail}`,
+					`deliver message uncertain for ${targetActiveSessionId} (delivery ${entry.deliveryId}, attempts ${entry.attempts}, state uncertain, written ${dispatched.written}/${dispatched.dispatches}): ${detail}`,
 				);
 				throw new Error(
 					`Agent message to ${targetActiveSessionId} may already have been delivered: the target's answer was lost (${detail}). Do not re-send it blindly; ask the target session whether it arrived, or re-send only if a duplicate would be harmless.`,
@@ -6921,24 +7168,32 @@ export class DaemonSupervisor {
 				}
 				chunkCount++;
 			}
-			await this.writeSnapshotRecord(client, {
-				type: "session_snapshot_end",
-				activeSessionId: result.activeSessionId,
-				snapshotId: stream.id,
-				chunkCount,
-				lastEventSequence: result.lastEventSequence,
-				lastEventCursor: result.lastEventCursor,
-			});
+			await this.writeSnapshotRecord(
+				client,
+				{
+					type: "session_snapshot_end",
+					activeSessionId: result.activeSessionId,
+					snapshotId: stream.id,
+					chunkCount,
+					lastEventSequence: result.lastEventSequence,
+					lastEventCursor: result.lastEventCursor,
+				},
+				SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS,
+			);
 		} catch (error) {
 			const streamError = error instanceof Error ? error : new Error(String(error));
 			if (!client.socket.destroyed) {
 				try {
-					const delivered = await this.writeSnapshotRecord(client, {
-						type: "session_snapshot_failed",
-						activeSessionId: result.activeSessionId,
-						snapshotId: stream.id,
-						error: streamError.message,
-					});
+					const delivered = await this.writeSnapshotRecord(
+						client,
+						{
+							type: "session_snapshot_failed",
+							activeSessionId: result.activeSessionId,
+							snapshotId: stream.id,
+							error: streamError.message,
+						},
+						SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS,
+					);
 					if (!delivered && !client.socket.destroyed) {
 						client.socket.destroy(streamError);
 					}
@@ -6987,11 +7242,30 @@ export class DaemonSupervisor {
 		};
 	}
 
-	private writeSnapshotRecord(client: DaemonSocketClient, message: DaemonOutbound): Promise<boolean> {
-		return this.writeSnapshotBuffer(client, Buffer.from(serializeJsonLine(message)));
+	private writeSnapshotRecord(
+		client: DaemonSocketClient,
+		message: DaemonOutbound,
+		drainTimeoutMs?: number,
+	): Promise<boolean> {
+		return this.writeSnapshotBuffer(client, Buffer.from(serializeJsonLine(message)), drainTimeoutMs);
 	}
 
-	private async writeSnapshotBuffer(client: DaemonSocketClient, buffer: Uint8Array): Promise<boolean> {
+	/**
+	 * `drainTimeoutMs` bounds how long a write waits for backpressure to clear. It is
+	 * set only for the frames that end a stream: AF_UNIX has no keepalive, so a
+	 * client that was suspended (Ctrl-Z, a debugger, a frozen machine) neither
+	 * drains nor closes, and an unbounded wait here keeps `streamSnapshot`'s finally
+	 * from ever running — the transcript retain and the snapshot reservation leak,
+	 * and that client's catch-up queue stays parked behind `snapshotStreaming` for
+	 * good. Data chunks deliberately keep waiting: that is backpressure, and cutting
+	 * it would drop snapshot bytes. The worker-side twin
+	 * (`writeWorkerSnapshotBuffer`) has taken this parameter all along.
+	 */
+	private async writeSnapshotBuffer(
+		client: DaemonSocketClient,
+		buffer: Uint8Array,
+		drainTimeoutMs?: number,
+	): Promise<boolean> {
 		if (client.socket.destroyed) {
 			return false;
 		}
@@ -7000,6 +7274,7 @@ export class DaemonSupervisor {
 		}
 		return new Promise<boolean>((resolveDrain) => {
 			let settled = false;
+			let drainTimeout: NodeJS.Timeout | undefined;
 			const finish = (value: boolean) => {
 				if (settled) {
 					return;
@@ -7008,6 +7283,9 @@ export class DaemonSupervisor {
 				client.socket.off("drain", onDrain);
 				client.socket.off("close", onClose);
 				client.socket.off("error", onClose);
+				if (drainTimeout) {
+					clearTimeout(drainTimeout);
+				}
 				resolveDrain(value);
 			};
 			const onDrain = () => finish(true);
@@ -7015,6 +7293,13 @@ export class DaemonSupervisor {
 			client.socket.once("drain", onDrain);
 			client.socket.once("close", onClose);
 			client.socket.once("error", onClose);
+			if (drainTimeoutMs !== undefined) {
+				drainTimeout = setTimeout(() => finish(false), drainTimeoutMs);
+				drainTimeout.unref();
+			}
+			if (client.socket.destroyed) {
+				finish(false);
+			}
 		});
 	}
 
@@ -8405,7 +8690,9 @@ export class DaemonSupervisor {
 		let stoppedVerdict = true;
 		let stoppedCanSignal = processStartId !== undefined;
 		let stoppedCheckedAt = 0;
-		const isStoppedProcessAlive = () => {
+		/** How many identity queries came back unobservable in a row (a wedged `ps`). */
+		let unobservableIdentityChecks = 0;
+		const isStoppedProcessAlive = async (): Promise<boolean> => {
 			if (!processIdExists(pid)) {
 				return false;
 			}
@@ -8423,20 +8710,48 @@ export class DaemonSupervisor {
 				// waiting for it to disappear, but never escalate by pid alone.
 				stoppedCanSignal = false;
 			} else {
-				const observed = getProcessStartId(pid);
+				// I-7: the identity query shells out to ps/powershell, and this loop
+				// runs every 250ms for as long as the process survives. A synchronous
+				// fork here stalls the supervisor's single thread — every client
+				// command and every worker frame waits for it — which is the shape the
+				// async twin exists to avoid; it also bounds a wedged helper to 5s
+				// instead of hanging this finalizer forever.
+				const observed = await getProcessStartIdAsync(pid);
+				if (observed === undefined) {
+					unobservableIdentityChecks++;
+				} else {
+					unobservableIdentityChecks = 0;
+				}
 				stoppedVerdict = observed !== processStartId ? observed === undefined : true;
 				stoppedCanSignal = observed === processStartId;
 			}
 			return stoppedVerdict;
 		};
-		const sigkillDeadline = Date.now() + STOP_FINALIZATION_SIGKILL_GRACE_MS;
+		const startedAt = Date.now();
+		const sigkillDeadline = startedAt + STOP_FINALIZATION_SIGKILL_GRACE_MS;
+		const giveUpAt = startedAt + STOP_FINALIZATION_MAX_MS;
 		let killed = false;
 		while (!this.shuttingDown) {
 			if (!isStopGenerationCurrent()) {
 				return;
 			}
-			if (!isStoppedProcessAlive()) {
+			if (!(await isStoppedProcessAlive())) {
 				break;
+			}
+			if (Date.now() >= giveUpAt) {
+				// Deliberately not `recordDegraded`: the global degraded flag is the
+				// supervisor's "my own bookkeeping is untrustworthy" signal, and it makes
+				// the failed-worker reaper defer every irreversible delete. One worker
+				// that will not die must not stop the reaper from cleaning up the others,
+				// so this stays a log line with the facts an operator needs.
+				this.log(
+					`Gave up finalizing the timed-out stop of worker ${worker.descriptor.workerId} after ` +
+						`${Math.round((Date.now() - startedAt) / 1000)}s: pid ${pid} is still there ` +
+						`(start identity ${processStartId ?? "none recorded"}, sigkill ${killed ? "sent" : "not sent"}, ` +
+						`${unobservableIdentityChecks} consecutive unobservable identity checks). ` +
+						`Its registration and stop tombstone are kept, so a later retry_worker, kill or restart can finish it.`,
+				);
+				return;
 			}
 			if (!killed && stoppedCanSignal && Date.now() >= sigkillDeadline) {
 				// Fresh, unthrottled identity check right before signalling: the
@@ -8444,7 +8759,7 @@ export class DaemonSupervisor {
 				// to be recycled by an unrelated process. A transiently
 				// unobservable identity skips this attempt but keeps escalation
 				// armed so a wedged worker is still killed on a later pass.
-				const observedNow = processStartId === undefined ? undefined : getProcessStartId(pid);
+				const observedNow = processStartId === undefined ? undefined : await getProcessStartIdAsync(pid);
 				if (processStartId === undefined || observedNow === processStartId) {
 					signalProcessGroupOrProcess(pid, "SIGKILL");
 					killed = true;

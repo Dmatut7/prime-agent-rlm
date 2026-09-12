@@ -789,7 +789,19 @@ export class RlmSpawnLedger {
 			return cloneLedgerEdges(cached.edges);
 		}
 		const records = this.eventLog.replaySync((line, index) => {
-			const record = parseLedgerLine(line, index);
+			let record: RlmLedgerRecord | RlmLedgerMetaRecord | undefined;
+			try {
+				record = parseLedgerLine(line, index);
+			} catch (error) {
+				// Name the file. The ledger path is a hash of the sessions dir, so
+				// "malformed line 41" on its own does not tell anybody which ledger to
+				// look at — and this error is fail-closed, so the one action that would
+				// restore spawning, deletion and delete_saved_session is finding that
+				// file. Guessing wrong destroys another project's tombstones.
+				throw new Error(
+					`${error instanceof Error ? error.message : String(error)} (ledger ${this.path}, sessions dir ${this.canonicalSessionsDir})`,
+				);
+			}
 			if (record === undefined) {
 				this.log(`RLM ledger: skipped record with unknown op on line ${index + 1}`);
 			}

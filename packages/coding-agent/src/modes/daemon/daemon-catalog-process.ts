@@ -83,6 +83,13 @@ export function resolveCatalogSessionMatch(
 	sessions: readonly SessionInfo[],
 	selector: string,
 ): SessionInfo | undefined {
+	// An empty selector matches every session through `startsWith`, so it would
+	// resolve to "the only saved session" in a fresh cwd and report ambiguity
+	// anywhere else: the same command failing or succeeding on unrelated state.
+	// `matchesSessionIdSuffix` rejects an empty suffix for the same reason.
+	if (!selector.trim()) {
+		return undefined;
+	}
 	const matches = sessions.filter((session) => session.id.startsWith(selector) || session.name === selector);
 	if (matches.length > 1) {
 		throw new Error(`Ambiguous session selector "${selector}"`);

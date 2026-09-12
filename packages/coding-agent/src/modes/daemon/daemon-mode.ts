@@ -158,6 +158,7 @@ import { bindActiveSessionState } from "./daemon-extension-binding.js";
 import {
 	createDaemonEventMeta,
 	createDaemonReplayInfo,
+	DAEMON_COMMAND_MAX_LINE_BYTES,
 	DAEMON_DEFAULT_CLIENT_CAPABILITIES,
 	DAEMON_DEFAULT_SERVER_CAPABILITIES,
 	DAEMON_PROTOCOL_INFO,
@@ -294,6 +295,8 @@ const structuredLog = getLogger("coding-agent.daemon");
 /** Cap on tracked sender→target queued runs (M5 repeat notice); oldest entries are dropped. */
 const AGENT_MESSAGE_QUEUED_RUN_TRACKING_LIMIT = 500;
 const WORKER_SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS = 1_000;
+/** One line per window: a supervisor that is down is asked by every roster pass. */
+const AGENT_DIRECTORY_FAILURE_LOG_MIN_GAP_MS = 60_000;
 const UPDATE_RESTART_PREPARE_TIMEOUT_MS = 90_000;
 const MAX_SESSION_SNAPSHOT_STABILIZATION_RETRIES = 3;
 /**
@@ -588,6 +591,8 @@ export class AgentDaemon {
 	// Sessions inserted into `sessions` but still awaiting extension binding;
 	// visible to host controllers during bind, excluded from targeting.
 	private readonly bindingSessions = new Set<string>();
+	/** Throttle for "the supervisor's peer directory could not be read" (see fetchSupervisorAgentPeers). */
+	private agentDirectoryFailureLoggedAt = 0;
 	private readonly pendingSessionNames = new Set<string>();
 	private restoreActiveSessionId: string | undefined;
 	private supervisorMonitorTimer?: ReturnType<typeof setTimeout>;
@@ -3436,9 +3441,24 @@ export class AgentDaemon {
 				socket.off("end", onEnd);
 			};
 		} else {
-			client.detachInput = attachJsonlLineReader(socket, (line) => {
-				void this.handleLine(client, line);
-			});
+			client.detachInput = attachJsonlLineReader(
+				socket,
+				(line) => {
+					void this.handleLine(client, line);
+				},
+				{
+					maxLineLength: DAEMON_COMMAND_MAX_LINE_BYTES,
+					onLineOverflow: () => {
+						// Bounded like the supervisor's command reader and the private
+						// frame transport: an over-long line is dropped with the
+						// connection instead of buffered without limit.
+						this.log(
+							`Destroyed client connection ${client.id}: a command line exceeded ${DAEMON_COMMAND_MAX_LINE_BYTES} bytes`,
+						);
+						socket.destroy(new Error("Daemon command line too long"));
+					},
+				},
+			);
 		}
 
 		let cleanedUp = false;
@@ -5622,6 +5642,17 @@ export class AgentDaemon {
 		};
 	}
 
+	/**
+	 * The cross-worker half of the agent family directory. Two different answers
+	 * used to be the same empty array: "there is no supervisor to ask" (this process
+	 * is the whole family — a complete answer, nothing to report) and "the ask
+	 * failed" (a 1s connect, a 5s request, or a worker token the supervisor no
+	 * longer accepts). The consumers are a2a reachability, cross-worker name
+	 * uniqueness and the agent_observe roster, all of which phrase their result as
+	 * "this agent does not exist" — so the second one has to be visible, or a
+	 * one-second hiccup silently redefines the family as "whatever this process can
+	 * see" with nothing in the log to trace it back to.
+	 */
 	private async listSupervisorAgentPeers(): Promise<AgentSessionMessageAgentSummary[]> {
 		const supervisorSocketPath = this.supervisorSocketPathFromEnv();
 		if (!this.options.worker || !supervisorSocketPath) return [];
@@ -5636,11 +5667,24 @@ export class AgentDaemon {
 			if (!response.success) throw deserializeDaemonError(response);
 			// SAFETY: The authenticated supervisor constructs the peer response.
 			return (response.data as { peers: AgentSessionMessageAgentSummary[] }).peers;
-		} catch {
+		} catch (error) {
+			this.logAgentDirectoryIncomplete(supervisorSocketPath, error);
 			return [];
 		} finally {
 			client.close();
 		}
+	}
+
+	/** Throttled: a supervisor that is down is asked by every session's roster pass. */
+	private logAgentDirectoryIncomplete(supervisorSocketPath: string, error: unknown): void {
+		const now = Date.now();
+		if (now - this.agentDirectoryFailureLoggedAt < AGENT_DIRECTORY_FAILURE_LOG_MIN_GAP_MS) {
+			return;
+		}
+		this.agentDirectoryFailureLoggedAt = now;
+		this.log(
+			`Agent family directory is incomplete: list_agent_peers on ${supervisorSocketPath} failed, so reachability, name uniqueness and the family roster cover this process only: ${String(error)}`,
+		);
 	}
 
 	private async createAgentMessageListResult(

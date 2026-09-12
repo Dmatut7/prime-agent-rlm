@@ -6,6 +6,8 @@ import {
 	buildStatusContext,
 	DaemonSessionSummarizer,
 	parseAgentStatusResponse,
+	SUMMARY_RETRY_LIMIT,
+	SWEEP_CONCURRENCY,
 } from "../src/modes/daemon/daemon-session-summarizer.js";
 
 function userMessage(text: string): AgentMessage {
@@ -201,7 +203,7 @@ describe("daemon session summarizer", () => {
 			expect(onStatusChanged).toHaveBeenCalledOnce();
 		});
 
-		test("a working refresh with unchanged text stays quiet", async () => {
+		test("a working refresh with unchanged text stays quiet (control for the ladder below)", async () => {
 			const previous: AgentStatus = { summary: "Working on it", taskState: "needs_input", basedOnMessageCount: 2 };
 			const state = makeState({
 				messages: [userMessage("hi"), userMessage("more")],
@@ -212,6 +214,156 @@ describe("daemon session summarizer", () => {
 			const onStatusChanged = await settle(state, { summary: "Working on it" });
 
 			expect(onStatusChanged).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("summary generation failure ladder", () => {
+		function makeLadderState(index: number, appendAgentStatus = vi.fn()): ActiveSessionState {
+			return {
+				activeSessionId: `active-ladder-${index}`,
+				summaryState: undefined,
+				runtime: {
+					session: {
+						isSessionActive: false,
+						messages: [userMessage("hi")],
+						modelRegistry: {},
+						state: { streamingMessage: undefined },
+						sessionManager: { appendAgentStatus },
+					},
+				},
+			} as unknown as ActiveSessionState;
+		}
+
+		function summarizerFor(
+			states: readonly ActiveSessionState[],
+			generate: () => Promise<{ summary: string; taskState?: "needs_input" } | undefined>,
+		) {
+			const summarizer = new DaemonSessionSummarizer(() => states, undefined, generate);
+			return {
+				summarizer,
+				summarize: (state: ActiveSessionState) =>
+					(summarizer as unknown as { summarize(target: ActiveSessionState): Promise<void> }).summarize(state),
+			};
+		}
+
+		test("backs off a session whose summary model keeps failing instead of calling it every sweep", async () => {
+			const state = makeLadderState(1);
+			const generate = vi.fn(async () => undefined);
+			const { summarizer, summarize } = summarizerFor([state], generate);
+			try {
+				await summarize(state);
+				expect(generate).toHaveBeenCalledTimes(1);
+
+				// Every later sweep inside the window owes the same summary and used to
+				// re-call the model for unchanged content, forever, every 25s.
+				await summarize(state);
+				await summarize(state);
+				expect(generate).toHaveBeenCalledTimes(1);
+
+				// A finished turn is new information and re-arms the session at once.
+				summarizer.notifyActivity(state);
+				await summarize(state);
+				expect(generate).toHaveBeenCalledTimes(2);
+			} finally {
+				summarizer.stop();
+			}
+		});
+
+		test("gives up after the retry limit and stays given up until the next turn", async () => {
+			vi.useFakeTimers();
+			try {
+				const state = makeLadderState(2);
+				const generate = vi.fn(async () => undefined);
+				const { summarizer, summarize } = summarizerFor([state], generate);
+				try {
+					for (let attempt = 0; attempt < SUMMARY_RETRY_LIMIT + 3; attempt++) {
+						await summarize(state);
+						// Past the longest rung of the ladder, so only the limit can stop it.
+						await vi.advanceTimersByTimeAsync(60 * 60_000);
+					}
+					expect(generate).toHaveBeenCalledTimes(SUMMARY_RETRY_LIMIT);
+
+					// Still given up an arbitrarily long time later...
+					await vi.advanceTimersByTimeAsync(24 * 60 * 60_000);
+					await summarize(state);
+					expect(generate).toHaveBeenCalledTimes(SUMMARY_RETRY_LIMIT);
+
+					// ...until the session actually does something.
+					summarizer.notifyActivity(state);
+					await summarize(state);
+					expect(generate).toHaveBeenCalledTimes(SUMMARY_RETRY_LIMIT + 1);
+				} finally {
+					summarizer.stop();
+				}
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		test("settles an unjudged idle session in memory without persisting a verdict the model never gave", async () => {
+			const appendAgentStatus = vi.fn();
+			const state = makeLadderState(3, appendAgentStatus);
+			const failing = summarizerFor([state], async () => undefined);
+			try {
+				await failing.summarize(state);
+
+				// The roster's activity axis still gets its settle, so an unjudged idle
+				// session does not spin at "working"...
+				expect(state.summaryState?.taskState).toBe("needs_input");
+				expect(state.summaryState?.summary).toBe("");
+				// ...but the fabricated verdict is not written into the transcript, where
+				// seed() would read it back after a restart as "this session needs input".
+				expect(appendAgentStatus).not.toHaveBeenCalled();
+			} finally {
+				failing.summarizer.stop();
+			}
+
+			// Positive control: a verdict the model really gave is persisted.
+			const persistedState = makeLadderState(4, appendAgentStatus);
+			const answering = summarizerFor([persistedState], async () => ({
+				summary: "Asked which database to target",
+				taskState: "needs_input",
+			}));
+			try {
+				await answering.summarize(persistedState);
+				expect(appendAgentStatus).toHaveBeenCalledOnce();
+				expect(persistedState.summaryState?.summary).toBe("Asked which database to target");
+			} finally {
+				answering.summarizer.stop();
+			}
+		});
+
+		test("bounds how many sessions one sweep calls at once", async () => {
+			vi.useFakeTimers();
+			try {
+				const states = Array.from({ length: SWEEP_CONCURRENCY * 2 + 1 }, (_, index) => makeLadderState(index));
+				let inFlight = 0;
+				let peak = 0;
+				const generate = vi.fn(
+					() =>
+						new Promise<undefined>((resolveGenerate) => {
+							inFlight++;
+							peak = Math.max(peak, inFlight);
+							setTimeout(() => {
+								inFlight--;
+								resolveGenerate(undefined);
+							}, 5);
+						}),
+				);
+				const summarizer = new DaemonSessionSummarizer(() => states, undefined, generate);
+				summarizer.start();
+				try {
+					// One sweep interval, plus enough time for every rung to finish.
+					await vi.advanceTimersByTimeAsync(25_000 + 10_000);
+					expect(generate).toHaveBeenCalledTimes(states.length);
+					expect(peak).toBeGreaterThan(1);
+					expect(peak).toBeLessThanOrEqual(SWEEP_CONCURRENCY);
+				} finally {
+					summarizer.stop();
+				}
+			} finally {
+				vi.useRealTimers();
+			}
 		});
 	});
 });

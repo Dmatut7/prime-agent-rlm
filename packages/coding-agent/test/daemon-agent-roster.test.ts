@@ -554,7 +554,7 @@ interface WorkerFixture {
 		rootSessionId?: string;
 		sessionFile?: string;
 	};
-	client?: { request: ReturnType<typeof vi.fn> };
+	client?: { request: ReturnType<typeof vi.fn>; isConnected: boolean };
 	summaries: Map<string, SessionSummary>;
 	intentionalStop: boolean;
 	snapshotCache: Map<string, unknown>;
@@ -566,7 +566,9 @@ interface WorkerFixture {
 function makeWorker(workerId: string, overrides: Partial<WorkerFixture> = {}): WorkerFixture {
 	return {
 		descriptor: { workerId, pid: 1234, rootActiveSessionId: `${workerId}-root-active`, lifecycle: "ready" },
-		client: { request: vi.fn() },
+		// A live transport: `requireAvailableWorkerClient` refuses a client whose
+		// socket is gone, and these fixtures stand in for a connected worker.
+		client: { request: vi.fn(), isConnected: true },
 		summaries: new Map(),
 		intentionalStop: false,
 		snapshotCache: new Map(),
@@ -596,6 +598,7 @@ interface SupervisorFixture {
 		values(): IterableIterator<AgentRosterEntry>;
 	};
 	refreshWorkerSummaries: ReturnType<typeof vi.fn>;
+	log: ReturnType<typeof vi.fn>;
 }
 
 function makeSupervisor(workers: WorkerFixture[], extra: Record<string, unknown> = {}): SupervisorFixture {
@@ -654,6 +657,27 @@ function rosterDelta(entries: WorkerRosterEntry[], removedAgentIds?: string[], s
 }
 
 describe("supervisor roster ledger", () => {
+	it("skips a malformed roster entry instead of throwing into the frame dispatcher", () => {
+		const worker = makeWorker("worker-malformed-entry");
+		const supervisor = makeSupervisor([worker]);
+		const good = workerRosterEntryFromSummary(
+			summary({ id: "m-session", sessionId: "m-session", activeSessionId: "m-active" }),
+		);
+		// What a mixed-version producer can send: an entry whose summary is missing,
+		// which classification reads (`summary.activity`) and therefore throws on.
+		// Thrown from the direct apply path this reached the frame decoder's catch,
+		// which destroys the stream: one bad frame took the whole worker channel down.
+		const malformed = { agentId: "child-broken" } as unknown as WorkerRosterEntry;
+
+		supervisor.consumeWorkerRosterDelta(worker, rosterDelta([malformed, good]));
+
+		expect(supervisor.log).toHaveBeenCalledWith(expect.stringContaining("Skipped 1 malformed roster entry"));
+		// The well-formed entry in the same frame still landed, and the skip asks for a
+		// repair snapshot instead of leaving the ledger silently short.
+		expect(supervisor.roster().get(good.agentId)?.summary.sessionId).toBe("m-session");
+		expect(supervisor.refreshWorkerSummaries).toHaveBeenCalledWith(worker, false, true);
+	});
+
 	it("serves list from the ledger with zero worker round-trips and exact busy counts", async () => {
 		const visible = makeWorker("visible");
 		const owned = makeWorker("owned", {
@@ -1194,6 +1218,7 @@ describe("saved-session delete paths", () => {
 		const reachableRoster = makeWorker("w-roster");
 		Object.assign(reachableRoster.descriptor, { createCommand: { type: "create" } });
 		reachableRoster.client = {
+			isConnected: true,
 			request: vi.fn(async () => ({ type: "response", command: "delete_saved_session", success: true })),
 		};
 		const unreachable = makeWorker("w-down");
@@ -1266,6 +1291,7 @@ describe("saved-session delete paths", () => {
 			createCommand: { type: "create" },
 		});
 		owned.client = {
+			isConnected: true,
 			request: vi.fn(async () => ({ type: "response", command: "delete_saved_session", success: true })),
 		};
 		const catalogDelete = vi.fn(async () => ({ ok: true, method: "unlink" }));
@@ -1523,6 +1549,7 @@ describe("review-round regressions", () => {
 		supervisor.writeRosterEntry(childEntry, worker);
 		const root = summary({ id: "worker-1-root-active", sessionId: "root", activeSessionId: "worker-1-root-active" });
 		worker.client = {
+			isConnected: true,
 			request: vi.fn(async () => ({
 				type: "response",
 				command: "list",

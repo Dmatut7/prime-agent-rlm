@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { deliveryDispatchTimeoutTier } from "../src/modes/daemon/daemon-supervisor.js";
+import { DeliveryDispatchCounter, deliveryDispatchTimeoutTier } from "../src/modes/daemon/daemon-supervisor.js";
 import { WORKER_REQUEST_TIMEOUT_TIERS } from "../src/modes/daemon/daemon-timeouts.js";
 import { type PendingDeliveryAbortReason, PendingDeliveryQueue } from "../src/modes/daemon/pending-delivery-queue.js";
 
@@ -32,6 +32,42 @@ describe("B5 dispatch timeout tier", () => {
 		expect(deliveryDispatchTimeoutTier(2)).toBe("deliver");
 		expect(WORKER_REQUEST_TIMEOUT_TIERS[deliveryDispatchTimeoutTier(0)]).toBe(WORKER_REQUEST_TIMEOUT_TIERS.long);
 		expect(WORKER_REQUEST_TIMEOUT_TIERS[deliveryDispatchTimeoutTier(1)]).toBe(WORKER_REQUEST_TIMEOUT_TIERS.deliver);
+	});
+});
+
+describe("#7 dispatch counting", () => {
+	it("counts a dispatch only once the transport reports the frame was handed over", () => {
+		const dispatched = new DeliveryDispatchCounter();
+		// Before anything reaches the socket, non-delivery is still provable: the
+		// receipt has to say "was not delivered" and the sender may re-send.
+		expect(dispatched.dispatches).toBe(0);
+		expect(dispatched.written).toBe(0);
+		expect(dispatched.mayHaveBeenDelivered).toBe(false);
+		expect(deliveryDispatchTimeoutTier(dispatched.dispatches)).toBe("long");
+
+		dispatched.hooks.onDispatch?.("queued");
+		expect(dispatched.dispatches).toBe(1);
+		expect(dispatched.written).toBe(0);
+		expect(dispatched.mayHaveBeenDelivered).toBe(true);
+		expect(deliveryDispatchTimeoutTier(dispatched.dispatches)).toBe("deliver");
+
+		dispatched.hooks.onDispatch?.("written");
+		expect(dispatched.dispatches).toBe(1);
+		expect(dispatched.written).toBe(1);
+	});
+
+	it("counts a retried dispatch separately from the bounce that never wrote", () => {
+		const dispatched = new DeliveryDispatchCounter();
+		// Two bounces whose requests were never built (a transport that was already
+		// gone reports its own typed error) leave the counter untouched, so the first
+		// request that does reach a worker still gets the long budget (B5).
+		expect(deliveryDispatchTimeoutTier(dispatched.dispatches)).toBe("long");
+		dispatched.hooks.onDispatch?.("queued");
+		dispatched.hooks.onDispatch?.("written");
+		dispatched.hooks.onDispatch?.("queued");
+		expect(dispatched.dispatches).toBe(2);
+		expect(dispatched.written).toBe(1);
+		expect(deliveryDispatchTimeoutTier(dispatched.dispatches)).toBe("deliver");
 	});
 });
 
