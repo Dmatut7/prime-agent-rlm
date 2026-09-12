@@ -821,7 +821,7 @@ export class TUI extends Container {
 		let href: string;
 		try {
 			const parsed = new URL(url);
-			if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return;
+			if (parsed.protocol !== "http:" && parsed.protocol !== "https:" && parsed.protocol !== "file:") return;
 			href = parsed.href;
 		} catch {
 			return;
