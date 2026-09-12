@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { constants, existsSync, readdirSync, readFileSync } from "node:fs";
+import { constants, type Dirent, existsSync, readdirSync, readFileSync } from "node:fs";
 import { access, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -8,6 +8,7 @@ import { stderr, stdin } from "node:process";
 import { createInterface } from "node:readline/promises";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { getLogger } from "@earendil-works/pi-ai";
 import { getPackageDir } from "../../config.js";
 import { readKernelBootstrapSettings } from "../settings-manager.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
@@ -20,6 +21,8 @@ import {
 	pruneKernelVenvGenerations,
 	readKernelVenvInUseState,
 } from "./venv-in-use.js";
+
+const bootstrapLog = getLogger("coding-agent.kernel-bootstrap");
 
 const BOOTSTRAP_SCHEMA = 10;
 const PYTHON_VERSION = "3.11";
@@ -115,6 +118,17 @@ export interface BootstrapPythonSkill {
 	packagePath: string;
 	pyprojectPath: string;
 	pyprojectHash: string;
+	/**
+	 * Path-independent fingerprint of the content this skill's editable install resolves to
+	 * ({@link pythonSkillContentHash}). Absent in a manifest written before fingerprints existed,
+	 * which reads as "not installed": one reinstall upgrades the record.
+	 *
+	 * This is what makes the manifest usable by more than one checkout. The install itself is
+	 * editable and therefore names an absolute path, but two checkouts of the same commit install
+	 * byte-identical content under different paths, and comparing paths made every alternating
+	 * boot reinstall the whole skill set under the machine-wide bootstrap lock (K-P1-2).
+	 */
+	contentHash?: string;
 }
 
 interface BootstrapVersion {
@@ -203,6 +217,97 @@ function fileContentHash(filePath: string): string {
 	}
 }
 
+/** Fingerprint returned for a package path that is not there any more. */
+const MISSING_PACKAGE_HASH = "missing";
+/**
+ * Directories that never take part in what an editable install resolves to. `__pycache__` is the
+ * load-bearing one: a kernel importing the skill writes `.pyc` files *into the source tree*, so
+ * counting them would change the fingerprint on every boot and reinstall the skill forever.
+ */
+const SKILL_CONTENT_IGNORED_DIRS = new Set([
+	"__pycache__",
+	".git",
+	".mypy_cache",
+	".pytest_cache",
+	".ruff_cache",
+	".venv",
+	"node_modules",
+]);
+const SKILL_CONTENT_IGNORED_SUFFIXES = [".pyc", ".pyo", ".egg-info"];
+
+function collectSkillContentFiles(dir: string, files: string[]): void {
+	let entries: Dirent[];
+	try {
+		entries = readdirSync(dir, { withFileTypes: true });
+	} catch {
+		return;
+	}
+	for (const entry of entries) {
+		// Symlinks are not followed: a link out of the package would make the fingerprint depend
+		// on a tree this build does not own.
+		if (entry.isSymbolicLink()) continue;
+		if (SKILL_CONTENT_IGNORED_SUFFIXES.some((suffix) => entry.name.endsWith(suffix))) continue;
+		const full = path.join(dir, entry.name);
+		if (entry.isDirectory()) {
+			if (SKILL_CONTENT_IGNORED_DIRS.has(entry.name)) continue;
+			collectSkillContentFiles(full, files);
+			continue;
+		}
+		if (entry.isFile()) files.push(full);
+	}
+}
+
+/**
+ * Path-independent fingerprint of the content one skill's editable install resolves to: its
+ * packaging metadata plus everything under `src/` (the wheel hatchling builds from
+ * `packages = ["src/<import_name>"]`). Deliberately *not* the whole package directory: a
+ * `SKILL.md` or a `references/` edit cannot change what the kernel imports, and letting it
+ * change the fingerprint would make two checkouts fight over the shared install over prose.
+ *
+ * A package with no `src/` falls back to every file it has (minus the ignored ones), so an
+ * unusual layout still gets a content-addressed fingerprint rather than an empty one.
+ */
+export function pythonSkillContentHash(packagePath: string): string {
+	if (!existsSync(packagePath)) return MISSING_PACKAGE_HASH;
+	const files: string[] = [];
+	const srcDir = path.join(packagePath, "src");
+	if (existsSync(srcDir)) {
+		files.push(path.join(packagePath, "pyproject.toml"));
+		collectSkillContentFiles(srcDir, files);
+	} else {
+		collectSkillContentFiles(packagePath, files);
+		files.push(path.join(packagePath, "pyproject.toml"));
+	}
+	files.sort();
+	const hash = createHash("sha256");
+	for (const file of files) {
+		hash.update(path.relative(packagePath, file));
+		hash.update("\0");
+		try {
+			hash.update(readFileSync(file));
+		} catch {
+			// Unreadable content is its own fingerprint input: it must not read as "empty package".
+			hash.update("unreadable");
+		}
+		hash.update("\0");
+	}
+	return `sha256:${hash.digest("hex")}`;
+}
+
+/**
+ * Whether a recorded install still holds the content its fingerprint was taken from.
+ *
+ * The install is editable, so it resolves to whichever checkout wrote the record - a directory
+ * this process does not own and cannot assume is still there. A checkout that was deleted (the
+ * record then points at nothing), moved, or edited underneath the record makes it a lie, and a
+ * lie has to cost one reinstall: the alternative is a kernel whose skill imports fail, or that
+ * silently runs another tree's code while its manifest claims this one.
+ */
+export function pythonSkillInstallIsFaithful(entry: BootstrapPythonSkill): boolean {
+	if (entry.contentHash === undefined) return false;
+	return pythonSkillContentHash(entry.packagePath) === entry.contentHash;
+}
+
 function normalizePythonSkills(pythonSkills: readonly KernelPythonSkill[] | undefined): BootstrapPythonSkill[] {
 	const byKey = new Map<string, BootstrapPythonSkill>();
 	const addSkill = (skill: Pick<KernelPythonSkill, "importName" | "packagePath" | "pyprojectPath">): void => {
@@ -217,6 +322,7 @@ function normalizePythonSkills(pythonSkills: readonly KernelPythonSkill[] | unde
 			packagePath,
 			pyprojectPath,
 			pyprojectHash: fileContentHash(pyprojectPath),
+			contentHash: pythonSkillContentHash(packagePath),
 		};
 		byKey.set(key, bootstrapSkill);
 		for (const dependencyName of readPythonSkillDependencyNames(bootstrapSkill)) {
@@ -349,6 +455,7 @@ function resolveSiblingPythonSkillDependency(
 			packagePath,
 			pyprojectPath,
 			pyprojectHash: fileContentHash(pyprojectPath),
+			contentHash: pythonSkillContentHash(packagePath),
 		};
 		if (readPythonSkillProjectName(dependency).replaceAll("_", "-").toLowerCase() === dependencyName) {
 			return dependency;
@@ -455,6 +562,13 @@ async function resolveWritableKernelVenvDir(): Promise<string> {
  * the same generation; any difference (runtime source, bootstrap schema, snapshot
  * requirement, default packages) gets its own directory, so a generation a kernel is
  * running from is never rebuilt under it.
+ *
+ * The requested Python skills are deliberately *not* part of this key. They are per-session (a
+ * session may enable a subset, and the record inside the generation is a union so subsets can
+ * share it), and `pruneKernelVenvGenerations` keeps only one unreferenced generation: keying the
+ * directory on the skill set would give every subset its own ~30s build and then have those
+ * builds delete each other. Skill differences are reconciled inside the generation instead - by
+ * content, never by absolute path (see {@link pythonSkillsSatisfied}, K-P1-2).
  */
 function kernelVenvBuildIdentity(runtimeIdentity: string): string {
 	return JSON.stringify({
@@ -745,7 +859,8 @@ async function readBootstrapVersion(venv: string): Promise<BootstrapVersion | nu
 						typeof v.importName === "string" &&
 						typeof v.packagePath === "string" &&
 						typeof v.pyprojectPath === "string" &&
-						typeof v.pyprojectHash === "string"
+						typeof v.pyprojectHash === "string" &&
+						(v.contentHash === undefined || typeof v.contentHash === "string")
 					);
 				})
 			) {
@@ -773,32 +888,36 @@ function extraUvArgsMatch(a: string[] | undefined, b: string[] | undefined): boo
 }
 
 /**
- * Readiness is a subset test, not an equality test: every requested skill must appear in
- * the recorded set with the same package path, pyproject path, and pyproject hash, while
- * entries the record keeps for skills this session did not request are harmless. Two
- * sessions with different skill sets then share one venv instead of rewriting the record
- * back and forth and reinstalling on every boot.
+ * Readiness is a subset test, not an equality test: every requested skill must appear in the
+ * recorded set with the same *content*, while entries the record keeps for skills this session
+ * did not request are harmless. Two sessions with different skill sets then share one venv
+ * instead of rewriting the record back and forth and reinstalling on every boot.
  *
- * A recorded entry under the same import name but from another checkout still fails. That
- * is a real conflict — two editable installs claim one import name and only one can win —
- * so the union record must not paper over it.
+ * The comparison is path-independent on purpose (K-P1-2). One import name can only have one
+ * editable install, so a recorded entry from another checkout used to be treated as a conflict
+ * and reinstalled - and because two checkouts of the same commit have identical content under
+ * different absolute paths, every alternating boot reinstalled the whole set under the
+ * machine-wide bootstrap lock, each one flipping the record to its own tree. Content is the
+ * actual question: an install of the same bytes serves both checkouts.
  *
- * The compared fields mirror the per-skill skip condition in {@link syncPythonSkills}, so
+ * Content equality is not enough on its own, because the install points at the *other* tree: it
+ * also has to still be there and still hold those bytes ({@link pythonSkillInstallIsFaithful}).
+ * A checkout that was deleted or edited underneath the record fails here and costs one
+ * reinstall, which is how a dangling editable install repairs itself.
+ *
+ * The compared facts mirror the per-skill skip condition in {@link syncPythonSkills}, so
  * "satisfied" means exactly "a sync would install nothing".
  */
 export function pythonSkillsSatisfied(
 	installed: readonly BootstrapPythonSkill[] | undefined,
 	requested: readonly BootstrapPythonSkill[],
+	installIsFaithful: (entry: BootstrapPythonSkill) => boolean = pythonSkillInstallIsFaithful,
 ): boolean {
 	const recorded = new Map((installed ?? []).map((skill) => [skill.importName, skill]));
 	return requested.every((skill) => {
 		const entry = recorded.get(skill.importName);
-		return (
-			entry !== undefined &&
-			entry.packagePath === skill.packagePath &&
-			entry.pyprojectPath === skill.pyprojectPath &&
-			entry.pyprojectHash === skill.pyprojectHash
-		);
+		if (entry === undefined || entry.contentHash === undefined) return false;
+		return entry.contentHash === skill.contentHash && installIsFaithful(entry);
 	});
 }
 
@@ -954,6 +1073,60 @@ async function bootstrapVenv(
 	await syncPythonSkills(uv, venv, python, runtimeIdentity, pythonSkills, options);
 }
 
+/**
+ * What one skill sync is allowed to do to a generation directory. A directory a live kernel was
+ * spawned from is pinned by the in-use invariant in `venv-in-use.ts` - "never rebuilt in place"
+ * covers swapping an editable install exactly as much as it covers `rm -rf` - so the sync that
+ * runs against a warm, referenced generation has to hold back the mutations that would change
+ * what a running kernel resolves.
+ */
+export interface PythonSkillSyncGuard {
+	/** True when a recorded install must not be replaced by this checkout's copy. */
+	skipReplacements: boolean;
+	liveReferences: number;
+	referenceStateUnknown: boolean;
+}
+
+/** A fresh build has no references by construction (`decideKernelVenvRebuild` deferred otherwise). */
+const UNGUARDED_SKILL_SYNC: PythonSkillSyncGuard = {
+	skipReplacements: false,
+	liveReferences: 0,
+	referenceStateUnknown: false,
+};
+
+/** Whether one requested skill is already installed, by content, at a path that still holds it. */
+function skillInstallIsCurrent(candidate: BootstrapPythonSkill, recorded: BootstrapPythonSkill | undefined): boolean {
+	return (
+		recorded !== undefined &&
+		recorded.contentHash !== undefined &&
+		recorded.contentHash === candidate.contentHash &&
+		pythonSkillInstallIsFaithful(recorded)
+	);
+}
+
+function reportSkillReplacementDeferred(
+	skill: BootstrapPythonSkill,
+	recorded: BootstrapPythonSkill,
+	guard: PythonSkillSyncGuard,
+	options: EnsureKernelPythonOptions,
+): void {
+	const why = guard.referenceStateUnknown
+		? "this venv's in-use reference state could not be read"
+		: `${guard.liveReferences} kernel(s) still run from this venv`;
+	reportProgress(
+		options,
+		`Warning: Python skill ${skill.importName} stays installed from ${recorded.packagePath} because ${why}; ` +
+			`this checkout's copy (${skill.packagePath}) differs and was not installed over it`,
+	);
+	bootstrapLog.warn("kernel skill replacement deferred: generation in use", {
+		importName: skill.importName,
+		installedFrom: recorded.packagePath,
+		requestedFrom: skill.packagePath,
+		liveReferences: guard.liveReferences,
+		referenceStateUnknown: guard.referenceStateUnknown,
+	});
+}
+
 async function syncPythonSkills(
 	uv: string,
 	venv: string,
@@ -961,12 +1134,13 @@ async function syncPythonSkills(
 	runtimeIdentity: string,
 	pythonSkills: readonly BootstrapPythonSkill[],
 	options: EnsureKernelPythonOptions,
+	guard: PythonSkillSyncGuard = UNGUARDED_SKILL_SYNC,
 ): Promise<void> {
 	const version = await readBootstrapVersion(venv);
 	const installedPythonSkills: BootstrapPythonSkill[] = [];
-	const currentPythonSkills = new Map(
-		(version?.pythonSkills ?? []).map((skill) => [`${skill.importName}\0${skill.packagePath}`, skill]),
-	);
+	// Keyed by import name: that is the unit one editable install claims, and the manifest never
+	// holds two entries for it (`mergePythonSkillRecords` dedupes the same way).
+	const currentPythonSkills = new Map((version?.pythonSkills ?? []).map((skill) => [skill.importName, skill]));
 	const pythonSkillsByProjectName = new Map(
 		pythonSkills.map((skill) => [readPythonSkillProjectName(skill).replaceAll("_", "-").toLowerCase(), skill]),
 	);
@@ -984,27 +1158,31 @@ async function syncPythonSkills(
 	);
 
 	for (const skill of sortPythonSkillsForInstall(pythonSkills)) {
-		const existingSkill = currentPythonSkills.get(`${skill.importName}\0${skill.packagePath}`);
-		if (existingSkill?.pyprojectPath === skill.pyprojectPath && existingSkill.pyprojectHash === skill.pyprojectHash) {
-			installedPythonSkills.push(skill);
+		const existingSkill = currentPythonSkills.get(skill.importName);
+		if (skillInstallIsCurrent(skill, existingSkill)) {
+			// Re-record the entry that names the install's real location, not this checkout's path:
+			// claiming an install this tree did not perform would point the next faithfulness check
+			// at the wrong directory, and the two checkouts would start trading the record back.
+			installedPythonSkills.push(existingSkill as BootstrapPythonSkill);
+			continue;
+		}
+		if (guard.skipReplacements && existingSkill !== undefined) {
+			// Held back, not installed: the record keeps the entry that is really on disk, so this
+			// generation stays unsatisfied for this checkout and the retry happens on a later boot
+			// (once the references drop) instead of swapping content under a running kernel.
+			reportSkillReplacementDeferred(skill, existingSkill, guard, options);
 			continue;
 		}
 
 		const localDependencies = dependenciesBySkill.get(skill) ?? [];
 		const localDependencyArgs = localDependencies
 			.filter((dependency) => {
-				const installedDependency = currentPythonSkills.get(`${dependency.importName}\0${dependency.packagePath}`);
 				const installedThisSync = installedPythonSkills.some(
 					(installed) =>
-						installed.importName === dependency.importName &&
-						installed.packagePath === dependency.packagePath &&
-						installed.pyprojectPath === dependency.pyprojectPath &&
-						installed.pyprojectHash === dependency.pyprojectHash,
+						installed.importName === dependency.importName && installed.contentHash === dependency.contentHash,
 				);
 				return !(
-					installedThisSync ||
-					(installedDependency?.pyprojectPath === dependency.pyprojectPath &&
-						installedDependency.pyprojectHash === dependency.pyprojectHash)
+					installedThisSync || skillInstallIsCurrent(dependency, currentPythonSkills.get(dependency.importName))
 				);
 			})
 			.flatMap(formatPythonSkillInstallArgs);
@@ -1120,7 +1298,16 @@ async function ensureKernelPythonUncached(
 	try {
 		if (await kernelReady(python, venv, runtimeIdentity, pythonSkills)) return python;
 		if (await kernelBaseReady(python, venv, runtimeIdentity)) {
-			await syncPythonSkills(await ensureUv(options), venv, python, runtimeIdentity, pythonSkills, options);
+			// The in-use invariant covers this branch too, and it used to be the one place that
+			// mutated a generation without reading its references: an editable reinstall swaps
+			// content under every kernel that was spawned from this directory (K-P1-2). Reading
+			// the state also sweeps the references whose holders are provably gone.
+			const inUse = await readKernelVenvInUseState(venv);
+			await syncPythonSkills(await ensureUv(options), venv, python, runtimeIdentity, pythonSkills, options, {
+				skipReplacements: inUse.unknown || inUse.references.length > 0,
+				liveReferences: inUse.references.length,
+				referenceStateUnknown: inUse.unknown,
+			});
 			return python;
 		}
 

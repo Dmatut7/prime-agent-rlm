@@ -57,6 +57,11 @@ export const TURN_LIVENESS_REASONS = {
 	kernelReviving: "kernel_reviving",
 	/** A revival vouch outlived its age bound, so it stopped excusing silence (B7). */
 	revivalAgedOut: "kernel_revival_aged_out",
+	/**
+	 * The kernel is past the cell body and is serializing/draining that cell's result. Existence
+	 * only: the phase blocks the loop by design, so nothing about it demonstrates movement.
+	 */
+	kernelFinishingResult: "kernel_finishing_result",
 } as const;
 
 /** A host request older than this stops vouching: a wedged handler must not excuse silence forever. */
@@ -185,6 +190,12 @@ export interface KernelLivenessVerdict {
 	loopStalled: boolean;
 	/** The kernel says a cell is in flight. */
 	cellAwaiting: boolean;
+	/**
+	 * The in-flight cell is in its post-run finishing phase (repr/drain) rather than executing its
+	 * body. That phase is synchronous, so a frozen tick alongside it is the expected shape and not
+	 * the deadlock `loopStalled` reports (K-P2-2).
+	 */
+	cellFinishing: boolean;
 	/** Something observably moved: streamed bytes, pipe backlog, buffered output, a finished cell. */
 	progress: boolean;
 	/** Bash-side movement only, which is what a live-handle vouch may upgrade its tier with. */
@@ -267,6 +278,7 @@ export function kernelVouchedAlive(
 			loopAlive: false,
 			loopStalled: false,
 			cellAwaiting: false,
+			cellFinishing: false,
 			progress: false,
 			bashProgress: false,
 		};
@@ -292,6 +304,8 @@ export function kernelVouchedAlive(
 		loopAlive: previous !== undefined && latest.tick > previous.tick,
 		loopStalled: previous !== undefined && latest.tick <= previous.tick,
 		cellAwaiting: latest.cellId !== undefined,
+		// A phase marker with no cell to attribute it to proves nothing about this turn.
+		cellFinishing: latest.finishing === true && latest.cellId !== undefined,
 		progress: bashProgress || cellsDelta > 0,
 		bashProgress,
 		movementToken,
@@ -466,9 +480,18 @@ export function createTurnLiveness(options: TurnLivenessOptions): TurnLiveness {
 				// produces nothing must keep its short rescue even if some other cell just finished.
 				if (verdict.progress) progress = true;
 			}
-			if (verdict.loopStalled && verdict.cellAwaiting) {
+			if (verdict.cellFinishing) {
+				// The kernel finished the cell body and is now serializing or draining its result.
+				// That work is synchronous, so the frames keep arriving with a frozen tick and no
+				// observable movement: existence alone, which buys the short tier and no more. A
+				// `__repr__` that waits on a lock is indistinguishable from a huge one, and the
+				// short budget is what keeps that case dying near the pre-exemption threshold.
+				reasons.push(TURN_LIVENESS_REASONS.kernelFinishingResult);
+			}
+			if (verdict.loopStalled && verdict.cellAwaiting && !verdict.cellFinishing) {
 				// Frames arrive but the tick is frozen: a synchronous cell is monopolizing the
 				// loop. This is the genuine-deadlock shape, and nothing about it excuses silence.
+				// The finishing phase is excluded above: there the frozen tick is the point.
 				kernelReasons.push(TURN_LIVENESS_REASONS.loopStalled);
 			}
 		} else {

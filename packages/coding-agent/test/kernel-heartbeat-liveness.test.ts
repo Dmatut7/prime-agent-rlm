@@ -65,7 +65,19 @@ const frame = (overrides) => ({
 const NaN_FRAME =
   '{"event":"heartbeat","id":null,"tick":NaN,"cpu_ms":1,"stream_bytes":0,"cells_done":0,' +
   '"host_requests":0,"interval_ms":5000,"bash":{"handles":0,"cell_handles":0,"buffered_bytes":0,"pipe_pending":0}}';
-emit({ event: "ready", protocol, python: process.version });
+if (process.env.FAKE_REPL_READY_WITH_HEARTBEAT === "1") {
+  // One write, so the host reads both frames in a single stdout chunk: the shape a real
+  // runtime produces when the host's event loop stalls across one heartbeat interval.
+  fs.appendFileSync(frameLog, "ready\\nheartbeat\\n");
+  process.stdout.write(
+    JSON.stringify({ event: "ready", protocol, python: process.version }) +
+      "\\n" +
+      JSON.stringify(frame({ id: null, tick: 1 })) +
+      "\\n",
+  );
+} else {
+  emit({ event: "ready", protocol, python: process.version });
+}
 const input = readline.createInterface({ input: process.stdin });
 let awaitingReplyId = null;
 input.on("line", async (line) => {
@@ -103,6 +115,25 @@ input.on("line", async (line) => {
       emit(frame({ id, tick: 2, stream_bytes: 5 }));
       await sleep(1200);
       emit(frame({ id, tick: 9, cpu_ms: 40, stream_bytes: 45, cells_done: 2 }));
+      emit({ event: "done", id, status: "ok" });
+      return;
+    }
+    if (code === "finishing") {
+      // The post-run phase: the request is still in flight, its loop is blocked by the repr,
+      // and the frame says both.
+      emit(frame({ id, tick: 21, finishing: true }));
+      emit({
+        event: "heartbeat",
+        id,
+        tick: 22,
+        finishing: "yes",
+        cpu_ms: 1,
+        stream_bytes: 0,
+        cells_done: 0,
+        host_requests: 0,
+        interval_ms: 5000,
+        bash: { handles: 0, cell_handles: 0, buffered_bytes: 0, pipe_pending: 0 },
+      });
       emit({ event: "done", id, status: "ok" });
       return;
     }
@@ -166,7 +197,9 @@ function rejectionWarnings(): LogEntry[] {
 	return entries.filter((entry) => entry.level === "warn" && entry.msg === "kernel heartbeat frame rejected");
 }
 
-function newManager(options: { forcedProtocol?: number; hostHandlers?: HostRequestHandlers } = {}): {
+function newManager(
+	options: { forcedProtocol?: number; hostHandlers?: HostRequestHandlers; readyWithHeartbeat?: boolean } = {},
+): {
 	manager: ReplKernelManager;
 	countPath: string;
 	frameLogPath: string;
@@ -184,6 +217,7 @@ function newManager(options: { forcedProtocol?: number; hostHandlers?: HostReque
 			...(options.forcedProtocol === undefined
 				? {}
 				: { FAKE_REPL_FORCE_READY_PROTOCOL: String(options.forcedProtocol) }),
+			...(options.readyWithHeartbeat ? { FAKE_REPL_READY_WITH_HEARTBEAT: "1" } : {}),
 		},
 		...(options.hostHandlers ? { hostHandlers: options.hostHandlers } : {}),
 	});
@@ -302,6 +336,28 @@ describe("kernel heartbeat liveness", () => {
 		}
 	});
 
+	it("keeps the finishing phase attributed to its cell, and rejects a malformed marker", async () => {
+		const { manager, countPath } = newManager();
+
+		try {
+			await manager.start();
+			await expect(manager.execute("finishing")).resolves.toMatchObject({ status: "ok" });
+
+			const liveness = manager.kernelLiveness;
+			// The phase marker survives the trip: a synchronous repr freezes the tick while the
+			// request is still in flight, and this is the fact that tells the two apart.
+			expect(liveness.latest?.finishing).toBe(true);
+			expect(typeof liveness.latest?.cellId).toBe("string");
+			expect(liveness.latest?.tick).toBe(21);
+			// A wrong-typed marker costs one frame, never the kernel (B8).
+			expect(liveness.rejectedFrames).toBe(1);
+			expect(manager.isRunning).toBe(true);
+			expect(spawnCount(countPath)).toBe(1);
+		} finally {
+			await manager.shutdown({ snapshot: true, drainHostRequests: true });
+		}
+	});
+
 	it("still repairs the kernel for a frame kind nobody negotiated", async () => {
 		const { manager, countPath } = newManager();
 
@@ -313,6 +369,44 @@ describe("kernel heartbeat liveness", () => {
 			await expect(manager.execute("say-hi")).resolves.toMatchObject({ status: "ok", stdout: "hi" });
 			// The repair really replaced the child (the next cell waited for it).
 			expect(spawnCount(countPath)).toBe(2);
+		} finally {
+			await manager.shutdown({ snapshot: true, drainHostRequests: true });
+		}
+	});
+
+	it("accepts a heartbeat that shares the ready frame's stdout chunk", async () => {
+		// A host whose event loop stalls across one heartbeat interval reads `ready` and the first
+		// frame in a single chunk, and that chunk's parse loop is synchronous: the negotiated
+		// protocol is still unset when the second line reaches the gate. The healthy kernel must
+		// not be judged corrupt (and killed) for the host's own read latency.
+		const { manager, countPath, frameLogPath } = newManager({ readyWithHeartbeat: true });
+
+		try {
+			await manager.start();
+			expect(manager.isRunning).toBe(true);
+			expect(manager.negotiatedProtocol).toBe(4);
+			// The frame that shared the chunk is a retained fact, not a rejection.
+			expect(manager.kernelLiveness.latest?.tick).toBe(1);
+			expect(manager.kernelLiveness.rejectedFrames).toBe(0);
+			expect(frameKinds(frameLogPath)).toEqual(["ready", "heartbeat"]);
+			await expect(manager.execute("say-hi")).resolves.toMatchObject({ status: "ok", stdout: "hi" });
+			// No repair: the same child served the next cell.
+			expect(spawnCount(countPath)).toBe(1);
+		} finally {
+			await manager.shutdown({ snapshot: true, drainHostRequests: true });
+		}
+	});
+
+	it("still treats a same-chunk heartbeat from a protocol-3 kernel as corruption", async () => {
+		// The chunk-timing tolerance above is about the host not having finished negotiating yet,
+		// not about letting an ungated kind through: a kernel that announced 3 and sent a
+		// heartbeat anyway is still corrupt, in the same chunk or a later one.
+		const { manager, countPath } = newManager({ forcedProtocol: 3, readyWithHeartbeat: true });
+
+		try {
+			await expect(manager.start()).rejects.toThrow(/Kernel protocol error: heartbeat frame/);
+			expect(manager.kernelLiveness.latest).toBeUndefined();
+			expect(spawnCount(countPath)).toBe(1);
 		} finally {
 			await manager.shutdown({ snapshot: true, drainHostRequests: true });
 		}

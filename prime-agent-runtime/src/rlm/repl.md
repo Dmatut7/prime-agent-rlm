@@ -129,8 +129,8 @@ interval, sent from a thread that does not depend on the event loop (the same
 shape as the owner watchdog), while a request is in flight.
 
 ```
-{"event":"heartbeat","id":str|null,"tick":int,"cpu_ms":int,"stream_bytes":int,
- "cells_done":int,"host_requests":int,"interval_ms":int,
+{"event":"heartbeat","id":str|null,"finishing":true?,"tick":int,"cpu_ms":int,
+ "stream_bytes":int,"cells_done":int,"host_requests":int,"interval_ms":int,
  "bash":{"handles":int,"cell_handles":int,"buffered_bytes":int,"pipe_pending":int}}
 ```
 
@@ -139,6 +139,18 @@ shape as the owner watchdog), while a request is in flight.
   sends none at all — no thread is even started.
 - Gate: a request is in flight (`_active["rid"]`, or a rid still in `_inflight`
   during the post-run finishing phase). An idle kernel sends nothing.
+- `id` names the in-flight request in both phases: while the body runs it comes
+  from `_active["rid"]`, and during the post-run finishing phase from
+  `_finishing_rid` (read under `_interrupt_lock` together with `_inflight`, so a
+  request that already finished is never named). An id-less frame told the host
+  "no cell in flight" for exactly the window a huge `repr` spends minutes in,
+  which is the window the frame exists to cover.
+- `finishing: true` (omitted otherwise, so a host that predates it reads the
+  frame it always read) marks that phase. It is synchronous main-thread work, so
+  the loop tick is frozen *by design* while the frames keep arriving; without
+  the marker that is indistinguishable from a deadlocked cell body, and the host
+  reports a stall instead of excusing it. A request that is in flight but neither
+  active nor finishing (a queued snapshot/restore) keeps `id: null`.
 - Period: `KERNEL_HEARTBEAT_INTERVAL_MS`, default `5000`, clamped to
   `[100, 600000]`. The resolved value rides in every frame as `interval_ms` so
   the host can judge staleness against the kernel's own period rather than a

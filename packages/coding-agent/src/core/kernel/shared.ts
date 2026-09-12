@@ -1,6 +1,7 @@
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import type { KernelBootstrapProgressHandler, KernelPythonSkill } from "./bootstrap.js";
 import type { KernelDeathCause, KernelUnexpectedExitFacts } from "./death-cause.js";
+import type { KernelRestartLedger } from "./restart-ledger.js";
 import type { RestoreResult, SnapshotResult } from "./state-snapshot.js";
 
 export const DEFAULT_MAX_OUTPUT_CHARS = 65536;
@@ -90,6 +91,14 @@ export interface KernelManagerOptions {
 	 * (the rollback lever for unbounded lazy revival).
 	 */
 	restartPolicy?: () => KernelRestartPolicy;
+	/**
+	 * Budget ledger to count unexpected deaths against. Defaults to a private one, which is what a
+	 * standalone manager wants; an owner that replaces managers (the provisioner does, after a
+	 * failed startup makes one defunct) shares a single ledger across them, or a kernel that dies
+	 * during startup is counted once per replacement instance and the budget never fires. See
+	 * {@link KernelRestartLedger}.
+	 */
+	restartLedger?: KernelRestartLedger;
 	/**
 	 * Host request types whose wait may be cancelled by the cell that triggered it (P1-2a).
 	 *
@@ -406,6 +415,13 @@ export interface KernelLivenessSample {
 	intervalMs: number;
 	/** Request id the kernel says is in flight; absent when it reported none. */
 	cellId?: string;
+	/**
+	 * The named request is in its post-run finishing phase (repr/drain) rather than executing its
+	 * body. That phase is synchronous, so it blocks the kernel's event loop by design: its frames
+	 * carry a frozen tick while the request is demonstrably still in flight, which is the one
+	 * shape a reader must not judge as a deadlocked cell. Absent (never false) otherwise.
+	 */
+	finishing?: boolean;
 	/** Kernel process cpu (user + system) in ms. */
 	cpuMs: number;
 	/** Streamed stdout/stderr characters since the kernel started. */

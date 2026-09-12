@@ -58,6 +58,24 @@ const python = resolveReplPython();
 /** Named predicate: a runtime without the heartbeat cannot prove anything here, so it skips. */
 const kernelPythonWithoutHeartbeat = python === null;
 
+/**
+ * Whether the resolved runtime marks the post-run finishing phase in its frames. A kernel venv
+ * built before that change still reports protocol 4 and still sends heartbeats, so the capability
+ * cannot be inferred from the protocol number - and asserting the marker against a stale runtime
+ * would be a false red in exactly the mixed-version window this fork lives in.
+ */
+function hasFinishingMarker(runtimePython: string): boolean {
+	const check = spawnSync(
+		runtimePython,
+		["-c", "import inspect, rlm.repl as r; print('finishing' in inspect.getsource(r._heartbeat_frame))"],
+		{ encoding: "utf8" },
+	);
+	return check.status === 0 && (check.stdout ?? "").trim() === "True";
+}
+
+/** Named predicate: a runtime that does not mark the phase cannot prove the host reads it. */
+const runtimeWithoutFinishingMarker = python === null || !hasFinishingMarker(python);
+
 function tickProbe(body: string): string {
 	return ["import rlm.repl as _r", "before = _r.loop_tick()", body, "str(before) + ',' + str(_r.loop_tick())"].join(
 		"\n",
@@ -130,6 +148,43 @@ describe.skipIf(kernelPythonWithoutHeartbeat)(
 				await manager.shutdown({ snapshot: false, drainHostRequests: true });
 			}
 		}, 60_000);
+
+		it.skipIf(runtimeWithoutFinishingMarker)(
+			"attributes the post-run finishing phase to its cell, with the loop frozen (K-P2-2)",
+			async () => {
+				const manager = newManager();
+				try {
+					await manager.start();
+					// The trailing expression's `repr` runs after the cell body: the runtime is in
+					// its finishing phase, the event loop is blocked by design, and the frames keep
+					// coming from the sender thread. This is the shape the host used to read as "no
+					// cell in flight" (the frame carried no id) and therefore could not vouch for.
+					const cell = [
+						"import time",
+						"class _SlowRepr:",
+						"    def __repr__(self):",
+						`        time.sleep(${CELL_SECONDS})`,
+						"        return 'slow'",
+						"_SlowRepr()",
+					].join("\n");
+					const result = await manager.execute(cell);
+					expect(result.status).toBe("ok");
+					expect(result.result).toBe("slow");
+
+					const liveness = manager.kernelLiveness;
+					expect(liveness.latest?.finishing).toBe(true);
+					expect(typeof liveness.latest?.cellId).toBe("string");
+					expect(liveness.previous).toBeDefined();
+					// The tick is frozen, and that is now evidence *for* the kernel rather than
+					// against it: the phase marker is what tells the two apart.
+					expect(liveness.latest?.tick).toBe(liveness.previous?.tick);
+					expect(liveness.rejectedFrames).toBe(0);
+				} finally {
+					await manager.shutdown({ snapshot: false, drainHostRequests: true });
+				}
+			},
+			60_000,
+		);
 
 		it("reports the live bash handle of a running command", async () => {
 			const manager = newManager();

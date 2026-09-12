@@ -1761,14 +1761,28 @@ def _heartbeat_frame() -> dict[str, Any] | None:
     if negotiated_protocol() < HEARTBEAT_MIN_PROTOCOL:
         return None
     rid = _active["rid"]
+    finishing = False
     if rid is None:
         # The finishing phase (post-run repr/drain) clears `_active` before the request
-        # leaves `_inflight`, and for a huge repr that phase is the slow one.
+        # leaves `_inflight`, and for a huge repr that phase is the slow one. It still names
+        # its request: a host that reads "no cell in flight" stops vouching for exactly the
+        # phase this frame exists to cover, and a frozen tick there is the expected shape of
+        # a synchronous repr rather than a deadlock. `finishing` says which of the two it is.
         with _interrupt_lock:
             inflight = bool(_inflight)
+            # `_finish_locked` clears `_finishing_rid` and drops the rid from `_inflight`
+            # under this same lock, so one read cannot see a torn pair.
+            candidate = _finishing_rid if _finishing_rid is not None and _finishing_rid in _inflight else None
         if not inflight:
             return None
-    return {"event": HEARTBEAT_EVENT, "id": rid, **_heartbeat_facts(rid)}
+        rid = candidate
+        finishing = candidate is not None
+    frame: dict[str, Any] = {"event": HEARTBEAT_EVENT, "id": rid, **_heartbeat_facts(rid)}
+    if finishing:
+        # Additive and omitted when false, so a host that predates the field reads the frame
+        # it has always read.
+        frame["finishing"] = True
+    return frame
 
 
 def _send_heartbeat(frame: dict[str, Any]) -> bool:

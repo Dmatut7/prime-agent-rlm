@@ -24,6 +24,7 @@ daemon 面另有 `~/.prime/agent/` 下的 `daemon.sock.*.log` / `supervisor.sock
 | silentMs 分布（stall 日志字段） | 误杀治理的总指标 | 从 ~900000（旧一刀切）迁到预算耗尽级（存在档 ~20min / 进展档 ~50min 封顶后） | 无迁移 ⇒ vouch 未生效（查 `PRIME_AGENT_KERNEL_PROTOCOL`、心跳帧、`toolLivenessExemption`）；900s 级 abort 彻底消失且预算耗尽级也没有 ⇒ 怀疑永豁免类回归（终审 A1 形态），立即上报 |
 | `Request was aborted.`（19 字符工具结果） | 被砍 cell 的输出被丢成了谜团（旧行为） | **0 条** | 复现 ⇒ 批 1 证据保全（`8a6b8f1f4`）回退事故 |
 | `rlm_child_stall_activity`（capability）/ 子代理行 `excused` 旗标 | 被豁免的健康长任务在父侧显示 `long-running 12m` 而非 `stalled 12m`；stall 事实仍随快照流动 | agents view 不再对 vouched 子代理标红 stalled | 健康长任务又显示 stalled ⇒ B9（`9a2828d33`）回退 |
+| vouch reason `kernel_finishing_result`（stall 诊断 / 豁免段 reason） | 内核已过 cell 主体、正在做收尾（`repr(value)` / `_drain_output`）：该相位同步阻塞事件循环，故心跳帧照发但 tick 冻结。宿主按「存在档」豁免（~20min 短档，永不升进展档），并且**不再**同时报 `loop_stalled` | 只在超大 repr / 慢收尾的格子上出现；出现时该格不被误杀 | 高频且伴随 abort ⇒ 查该 reason 是否被降级（K-P2-2 回退）；若 `loop_stalled` 与它同时出现 ⇒ 相位判定回归 |
 | `rlm_terminal_notice_abandoned`（事件） | 终态通知走了「转录直落 + sidecar 下次启动 reflow」兜底（不再 5 分钟静默丢弃） | ≈0 | 非 0 ⇒ 父泵挂死形态仍在，查该父会话 |
 
 ### 1.2 内核（批 0/1c/2）
@@ -34,11 +35,12 @@ daemon 面另有 `~/.prime/agent/` 下的 `daemon.sock.*.log` / `supervisor.sock
 | stall 诊断 kernel 段的 `protocol` 字段（3/4） | 混版窗观测：宿主默认请求 4，`PRIME_AGENT_KERNEL_PROTOCOL=3` 可整体回滚；协议 3 的内核没有任何心跳帧（`kernelLiveness` 缺席即旁证） | build+重启后随发布迁移到 4 | 长期滞留 3 ⇒ dist 没刷新 / daemon 没重启 / venv 没换代 |
 | `Python kernel exited unexpectedly (code=…, signal=…, origin=…)` | 内核意外死亡归因行：`oom_suspect` 仅当内核 stderr 有内存证据，否则 `unknown`；宿主有意杀（shutdown/kill/dispose/协议修复）**不发**这条 | 低频；origin 与真实死因相符 | 有意杀也出现此签名 ⇒ B6 谓词漏路径，死因账被污染 |
 | 复活后首格结果头的 reset notice | 命名空间回滚点、未复活名单、丢失的宿主回话、**副作用不回滚**的明示 | 伴随每次意外死亡出现一次 | 缺失 ⇒ 复活链回归 |
-| `restart budget of 3 ... stopped starting replacement kernels`（KernelUnavailableError） | 复活预算耗尽（3 次/1h 滑窗），会话 fail-closed，直到窗口自然过期或 `/reload` | ≈0 | 非 0 ⇒ 读错误里携带的死亡链找 crash-loop 根因；确认是误伤再调 `kernelRestart.*` |
+| `restart budget of 3 ... stopped starting replacement kernels`（KernelUnavailableError） | 复活预算耗尽（3 次/1h 滑窗），会话 fail-closed，直到窗口自然过期或 `/reload`。账本挂在 provisioner 上（`KernelRestartLedger`）跨 manager 实例存续，**启动期死亡也计入**：破 venv / `Killed:9` / `PRIME_AGENT_KERNEL_PYTHON` 配错这类「ready 之前就死」的形状第 4 格即 fail-closed，不再每格重生一个必死内核（K-P1-1） | ≈0 | 非 0 ⇒ 读错误里携带的死亡链找 crash-loop 根因；确认是误伤再调 `kernelRestart.*`；只见 `Kernel exited before ready` 反复出现而**从不**见本签名 ⇒ 预算账本又变成实例级了（回退事故） |
+| `kernel skill replacement deferred: generation in use`（bootstrapLog.warn，另有同名 UI 进度行） | 本 checkout 的技能内容与该 generation 已装的不同，但有活内核正从该目录跑 ⇒ 按 venv-in-use 不变式**不原地换** editable 安装，本次启动沿用已装那份 | ≈0（同 commit 的多 worktree 内容一致 ⇒ 走「内容指纹相同即满足」，根本不进这条分支） | 持续出现 ⇒ 某车道改了技能 Python 源且与他人共用 generation：等活内核退出后自动补装，或给该车道单独 `PRIME_AGENT_KERNEL_PYTHON` |
 | `kernel state restore partial`（sessionLog.error）/ `state snapshot preserved`（info，带未复活名单数） | 部分恢复失败可见化 / preserve_names 合并写生效（快照单调变好） | 低频 | 高频 ⇒ 快照兼容性事故，查 runtime 版本与快照 manifest |
 | `Timed out after Ns waiting for the kernel venv bootstrap lock`（KernelBootstrapLockTimeoutError，带持锁 pid） | 300s 锁超时显式失败（旧行为是无界挂到看门狗） | ≈0 | 非 0 ⇒ 惊群或锁泄漏；慢机可调 `kernelBootstrap.lockTimeoutMs`；按持锁 pid 查那个会话在干什么 |
 | `venv rebuild deferred: N kernels in use`（KernelVenvRebuildDeferredError，启动显式失败） | 有活引用的 generation 拒绝原地重建（平台无关降级案：新 identity 落新兄弟目录，无 rename 换入） | ≈0 | 出现 ⇒ 该 identity 的目录已陈旧且仍被引用；查引用者 pid 与 identity 来源 |
-| venv 换代证据（文件系统）：新 `~/.prime/agent/kernel-venv-<hash12>` 兄弟目录出现；无引用旧代保留 1 份后被 GC（`pruneKernelVenvGenerations`） | build/identity 变化后各会话内核落入新 generation，活内核脚下的目录永不动 | 仅发布窗/build 后 | 平峰换代 ⇒ 查 identity 哈希来源（dist 副本、双 checkout 漂移） |
+| venv 换代证据（文件系统）：新 `~/.prime/agent/kernel-venv-<hash12>` 兄弟目录出现；无引用旧代保留 1 份后被 GC（`pruneKernelVenvGenerations`） | build/identity 变化后各会话内核落入新 generation，活内核脚下的目录永不动 | 仅发布窗/build 后 | 平峰换代 ⇒ 查 identity 哈希来源（dist 副本、双 checkout 漂移）。技能就绪判定已改为**路径无关的内容指纹**（`pyproject.toml` + `src/**`，排除 `__pycache__`/`.pyc`/`SKILL.md`），同 commit 多 checkout 共用一份安装且互不翻转；`.bootstrap-version` 里的 `contentHash` 即该指纹（K-P1-2） |
 | `kernel venv in-use reference unavailable`（kernelLog.warn，带 reason/tombstoneWritten） | 在用引用写失败 ⇒ 留 tombstone，该 generation 按「引用状态未知=在用」保守处理（F1 修复，宁多保不误删） | ≈0 | 非 0 ⇒ 查目录权限/磁盘；持续出现会让旧代无法回收（磁盘缓涨） |
 | `late kernel host reply` | 内核死后迟到的宿主回话被上报（不再静默丢弃），带请求类型与同名子代理是否已注册 | 低频 | 高频 ⇒ abort×宿主请求碰撞率高 |
 

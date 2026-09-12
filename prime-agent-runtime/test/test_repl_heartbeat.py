@@ -64,14 +64,17 @@ class HeartbeatGateTest(unittest.TestCase):
             "protocol": repl._negotiated_protocol,
             "rid": repl._active["rid"],
             "interval": repl._heartbeat_interval_ms,
+            "finishing": repl._finishing_rid,
         }
         repl._negotiated_protocol = 4
         repl._heartbeat_interval_ms = 5000
+        repl._finishing_rid = None
 
     def tearDown(self) -> None:
         repl._negotiated_protocol = self._saved["protocol"]
         repl._active["rid"] = self._saved["rid"]
         repl._heartbeat_interval_ms = self._saved["interval"]
+        repl._finishing_rid = self._saved["finishing"]
         with repl._interrupt_lock:
             repl._inflight.clear()
 
@@ -109,13 +112,52 @@ class HeartbeatGateTest(unittest.TestCase):
             repl._inflight.clear()
         self.assertIsNone(repl._heartbeat_frame())
 
-        # The finishing phase clears `_active` before the request leaves `_inflight`, and a
-        # slow repr can spend a long time there: that window still counts as in flight.
+        # A request that is in flight but not activated and not finishing (a queued state op)
+        # still counts as in flight, and still gets no attribution the runtime does not have.
         with repl._interrupt_lock:
             repl._inflight.add("cell-9")
         frame = repl._heartbeat_frame()
         self.assertIsNotNone(frame)
+        assert frame is not None
         self.assertIsNone(frame["id"])
+        self.assertNotIn("finishing", frame)
+
+    def test_the_finishing_phase_names_its_request_and_says_it_is_finishing(self) -> None:
+        """K-P2-2: the post-run repr/drain is the slow phase the frame exists to cover.
+
+        It clears `_active` before the request leaves `_inflight`, so an id-less frame told the
+        host "no cell in flight" for exactly the window a huge `repr` spends minutes in - and a
+        frozen tick there (the repr blocks the loop) then read as a stall with nothing vouching
+        against it. The frame names the request and marks the phase, so the host can tell a
+        synchronous finishing phase from a deadlocked cell body.
+        """
+        repl._active["rid"] = None
+        with repl._interrupt_lock:
+            repl._inflight.add("cell-9")
+            repl._finishing_rid = "cell-9"
+        frame = repl._heartbeat_frame()
+        self.assertIsNotNone(frame)
+        assert frame is not None
+        self.assertEqual(frame["id"], "cell-9")
+        self.assertIs(frame["finishing"], True)
+        # The attributed bash facts follow the request that is still in flight.
+        self.assertEqual(frame["bash"]["cell_handles"], 0)
+        json.dumps(frame, allow_nan=False)
+
+        # A stale marker whose request already left `_inflight` names nothing: the finish path
+        # clears both under one lock, and a frame must not resurrect a completed request.
+        with repl._interrupt_lock:
+            repl._inflight.clear()
+        self.assertIsNone(repl._heartbeat_frame())
+
+        # An activated request keeps the plain frame: `finishing` is only the post-run phase.
+        repl._active["rid"] = "cell-9"
+        with repl._interrupt_lock:
+            repl._inflight.add("cell-9")
+        active = repl._heartbeat_frame()
+        assert active is not None
+        self.assertEqual(active["id"], "cell-9")
+        self.assertNotIn("finishing", active)
 
     def test_frame_carries_the_cell_id_and_monotonic_integer_facts(self) -> None:
         repl._active["rid"] = "cell-7"
@@ -133,6 +175,8 @@ class HeartbeatGateTest(unittest.TestCase):
             with self.subTest(field=f"bash.{field}"):
                 self.assertIsInstance(bash_facts[field], int)
         self.assertEqual(frame["interval_ms"], 5000)
+        # The phase marker belongs to the finishing phase alone.
+        self.assertNotIn("finishing", frame)
         # Strict serialization is the gate the host's framing depends on.
         json.dumps(frame, allow_nan=False)
 
@@ -279,6 +323,39 @@ class HeartbeatProcessTest(unittest.TestCase):
         self.assertGreaterEqual(len(frames), 2, "a blocked loop must not stop the frames")
         self.assertEqual(after, before, "a synchronous cell must freeze the loop tick")
         self.assertEqual(max(f["tick"] for f in frames), before)
+        self.assertEqual(proc.shutdown(), 0)
+
+    def test_a_slow_finishing_phase_keeps_naming_its_request(self) -> None:
+        """K-P2-2 on the wire: a slow post-run `repr` keeps sending attributed, phase-marked frames.
+
+        The finishing phase is the one a huge repr spends minutes in, and it blocks the event
+        loop, so its frames carry a frozen tick. Naming the request and marking the phase is what
+        lets the host read that as "still serializing this cell's result" instead of "deadlocked".
+        """
+        proc = self.spawn("4", 200)
+        cell = "\n".join(
+            [
+                "import time",
+                "class _SlowRepr:",
+                "    def __repr__(self):",
+                "        time.sleep(1.5)",
+                "        return 'slow'",
+                "_SlowRepr()",
+            ]
+        )
+        events = proc.execute("fin1", cell)
+        self.assertEqual(one(events, "done")["status"], "ok")
+        result = one(events, "result")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["text"], "slow")
+        frames = heartbeats(events)
+        self.assertGreaterEqual(len(frames), 2, "a 1.5s finishing phase at a 200ms period must emit frames")
+        finishing = [frame for frame in frames if frame.get("finishing") is True]
+        # Positive control for the phase itself: most of the window is repr, not cell body.
+        self.assertGreaterEqual(len(finishing), 2)
+        self.assertTrue(all(frame["id"] == "fin1" for frame in finishing))
+        ticks = [frame["tick"] for frame in finishing]
+        self.assertLessEqual(max(ticks) - min(ticks), 1, "a synchronous repr must not advance the loop tick")
         self.assertEqual(proc.shutdown(), 0)
 
     def test_frames_report_a_live_bash_handle_and_stream_progress(self) -> None:

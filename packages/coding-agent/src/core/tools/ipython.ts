@@ -17,6 +17,7 @@ import {
 	type KernelDeathCause,
 	type KernelDiffDisplay,
 	type KernelLateHostReply,
+	KernelRestartLedger,
 	type KernelRestartPolicy,
 	type KernelSentAgentMessage,
 	type KernelUnexpectedExitFacts,
@@ -376,6 +377,14 @@ export class IpythonKernelProvisioner {
 	private readonly disposeController = new AbortController();
 	/** Snapshot policy of the dispose that aborted a startup, honored by startKernel's failure teardown. */
 	private disposeSnapshot = true;
+	/**
+	 * Revival budget shared by every manager this provisioner creates. A startup that fails makes
+	 * its manager defunct, and the next cell provisions a replacement: without a shared ledger each
+	 * replacement would start counting from zero, so a kernel that dies before it is ready - the
+	 * most common shape of a broken environment - would be respawned once per cell forever and the
+	 * model would never see the fail-closed budget fact (K-P1-1).
+	 */
+	private readonly restartLedger = new KernelRestartLedger();
 
 	constructor(
 		private readonly cwd: string,
@@ -548,6 +557,7 @@ export class IpythonKernelProvisioner {
 				bootstrapCode,
 				...(this.options?.onUnexpectedExit ? { onUnexpectedExit: this.options.onUnexpectedExit } : {}),
 				...(this.options?.restartPolicy ? { restartPolicy: this.options.restartPolicy } : {}),
+				restartLedger: this.restartLedger,
 				...(this.options?.cancellableHostRequestTypes
 					? { cancellableHostRequestTypes: this.options.cancellableHostRequestTypes }
 					: {}),

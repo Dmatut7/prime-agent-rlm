@@ -31,7 +31,8 @@ import {
 	type KernelUnexpectedExitFacts,
 } from "./death-cause.js";
 import { KernelUnavailableError } from "./errors.js";
-import { formatKernelResetNotice, type KernelResetNoticeFacts } from "./reset-notice.js";
+import { formatKernelResetNotice } from "./reset-notice.js";
+import { KernelRestartLedger } from "./restart-ledger.js";
 import {
 	AGENT_MESSAGE_DISPLAY_MIME,
 	ATTACHMENT_DISPLAY_MIME,
@@ -149,12 +150,6 @@ const KERNEL_STDERR_HOST_TAIL_CHARS = 256;
 // O_NONBLOCK degrades to 0 on win32 (as in private-files.ts): a no-op on regular files,
 // but a planted FIFO then fails at once instead of blocking the event loop.
 const NONBLOCK_FLAG = constants.O_NONBLOCK ?? 0;
-
-/** A kernel revival that has not been reported to the model yet. */
-interface PendingRestartNotice extends Omit<KernelResetNoticeFacts, "restore" | "restoreTimedOut" | "repeatedCell"> {
-	/** Source of the cell that was running when the kernel died, for the repeat check. */
-	repeatedCellCode?: string;
-}
 
 /** One in-flight host request, with the facts the reset notice needs if the kernel dies. */
 interface InFlightHostRequest {
@@ -326,6 +321,10 @@ function heartbeatFrameProblem(event: Record<string, unknown>): string | undefin
 	if (id !== null && id !== undefined && (typeof id !== "string" || id === "")) {
 		return "heartbeat field id is neither a non-empty string nor null";
 	}
+	// Additive and optional: a runtime that predates the finishing-phase marker omits it.
+	if (event.finishing !== undefined && typeof event.finishing !== "boolean") {
+		return "heartbeat field finishing is not a boolean";
+	}
 	return undefined;
 }
 
@@ -338,6 +337,7 @@ function heartbeatSample(event: Record<string, unknown>, receivedAt: number): Ke
 		tick: event.tick as number,
 		intervalMs: event.interval_ms as number,
 		...(typeof id === "string" && id.length > 0 ? { cellId: id } : {}),
+		...(event.finishing === true ? { finishing: true } : {}),
 		cpuMs: event.cpu_ms as number,
 		streamBytes: event.stream_bytes as number,
 		cellsDone: event.cells_done as number,
@@ -409,6 +409,15 @@ export class ReplKernelManager {
 	private negotiatedCapabilities?: KernelCapabilities;
 	/** Capability tokens from the current child's ready frame; empty until it arrives. */
 	private announcedKernelCapabilities: string[] = [];
+	/**
+	 * Protocol the current child announced in its `ready` frame, captured synchronously by the
+	 * frame loop. `negotiatedCapabilities` is only assigned once `waitForReady` has resolved, so a
+	 * gated frame that shares the ready frame's stdout chunk would otherwise be judged against
+	 * "nothing negotiated yet" - and a healthy kernel killed for the host's own read latency.
+	 * Cleared with the negotiation on every teardown; the range check in `doStart` still owns
+	 * whether the announcement is acceptable.
+	 */
+	private readyAnnouncedProtocol?: number;
 	private kernelStderr = "";
 	/** Byte offset this spawn's kernel started at in the stderr log, so a failure report
 	 * never shows a previous incarnation's bytes; undefined when this spawn has no log fd. */
@@ -465,11 +474,13 @@ export class ReplKernelManager {
 	 * runtime bootstrap runs after the restore lands, and it is the long part.
 	 */
 	private reprovisionWindowSince?: number;
-	/** Every unexpected exit inside the budget window, oldest first (C8). */
-	private readonly unexpectedExits: KernelDeathCause[] = [];
-
-	/** Revival facts awaiting the next cell that reaches the model; consumed once. */
-	private pendingRestartNotice?: PendingRestartNotice;
+	/**
+	 * Every unexpected exit inside the budget window, oldest first, plus the notice the next
+	 * model-reaching cell owes (C8). Shared with the owner that replaces this instance after a
+	 * failed startup, so a death counted here is still counted by the manager that serves the
+	 * next cell - see {@link KernelRestartLedger}.
+	 */
+	private readonly restartLedger: KernelRestartLedger;
 	/** Outcome of the most recent restore attempt pair, folded into the notice on consumption. */
 	private lastRestoreResult?: RestoreResult | null;
 	private lastRestoreTimedOut = false;
@@ -530,6 +541,7 @@ export class ReplKernelManager {
 			readOnlyHostRequestTimeoutMs: options.readOnlyHostRequestTimeoutMs,
 			onLateHostReply: options.onLateHostReply,
 		};
+		this.restartLedger = options.restartLedger ?? new KernelRestartLedger();
 	}
 
 	get ownerSessionId(): string | undefined {
@@ -607,9 +619,8 @@ export class ReplKernelManager {
 	 * repeated cell - the model's natural reaction to a lost kernel - say so out loud.
 	 */
 	consumeRestartNotice(forCode?: string): string | undefined {
-		const pending = this.pendingRestartNotice;
+		const pending = this.restartLedger.takePendingRestartNotice();
 		if (!pending) return undefined;
-		this.pendingRestartNotice = undefined;
 		const { repeatedCellCode, ...facts } = pending;
 		return formatKernelResetNotice({
 			...facts,
@@ -793,6 +804,10 @@ export class ReplKernelManager {
 
 	private async doStart(startOptions: KernelStartOptions): Promise<void> {
 		if (this.state !== "idle") return;
+		// The ledger can already be spent when this instance is brand new: the deaths that spent it
+		// belong to the manager this one replaced after a failed startup. Failing closed here is
+		// what keeps a broken environment from spawning one more doomed kernel per cell (K-P1-1).
+		if (this.restartBudgetExhaustedNow()) throw this.terminalRequestError();
 		// A restarted kernel serves new host requests; the previous teardown's
 		// abort must not poison them.
 		if (this.hostRequestController.signal.aborted) {
@@ -861,6 +876,7 @@ export class ReplKernelManager {
 		}
 		this.readyDeferred = createDeferred<number>();
 		this.startupProtocolError = undefined;
+		this.readyAnnouncedProtocol = undefined;
 		this.wireChild(child);
 
 		try {
@@ -889,7 +905,11 @@ export class ReplKernelManager {
 					this.announcedKernelCapabilities.includes(KERNEL_CAPABILITY_PRESERVE_NAMES),
 			};
 		} catch (e) {
-			if (this.startStale(generation)) throw e; // never tear down a newer start's kernel
+			// Both exits report through `startupFailureError`: a kernel that dies before it is ready
+			// tears itself down first (which makes this start stale), so the budget fact would
+			// otherwise never reach the cell that spent it (K-P1-1).
+			// Never tear down a newer start's kernel.
+			if (this.startStale(generation)) throw this.startupFailureError(e);
 			const canRetryStartup = (this.state as string) !== "shutdown";
 			// Only the call that performed the cleanup may resurrect to idle; a
 			// concurrent kill()/teardown owns the state otherwise.
@@ -899,10 +919,20 @@ export class ReplKernelManager {
 				this.disposedByHost = false;
 				this.state = "idle";
 			}
-			throw e;
+			throw this.startupFailureError(e);
 		}
 
 		this.state = "running";
+	}
+
+	/**
+	 * What one failed start reports. Once the shared restart budget is spent, the terminal fact
+	 * replaces this attempt's own startup text ("Kernel exited before ready"): the model has to see
+	 * the death chain and the two re-arm paths on the cell that failed closed, whichever phase the
+	 * death landed in, or it keeps retrying an environment that cannot start (K-P1-1).
+	 */
+	private startupFailureError(startError: unknown): unknown {
+		return this.restartBudgetExhaustedNow() ? this.terminalRequestError() : startError;
 	}
 
 	/** True when a teardown (or newer start) superseded the start that captured `generation`. */
@@ -974,7 +1004,12 @@ export class ReplKernelManager {
 					this.failProtocolFrame(child, `non-object protocol line: ${line.slice(0, 200)}`);
 					return;
 				}
-				const invalidReason = invalidProtocolFrameReason(event, this.negotiatedProtocol);
+				// The announcement this child already made covers the frames that share its ready
+				// chunk; the negotiated value only exists after the handshake has been validated.
+				const invalidReason = invalidProtocolFrameReason(
+					event,
+					this.negotiatedProtocol ?? this.readyAnnouncedProtocol,
+				);
 				if (invalidReason) {
 					this.failProtocolFrame(child, `${invalidReason}: ${line.slice(0, 200)}`);
 					return;
@@ -1067,13 +1102,9 @@ export class ReplKernelManager {
 	private recordUnexpectedExit(cause: KernelDeathCause): KernelUnexpectedExitFacts {
 		const policy = this.currentRestartPolicy();
 		// Sliding window: a restart budget that never expired would fail a session closed for a
-		// crash it survived hours ago.
-		const windowStart = cause.at - policy.windowMs;
-		while (this.unexpectedExits.length > 0 && (this.unexpectedExits[0]?.at ?? 0) < windowStart) {
-			this.unexpectedExits.shift();
-		}
-		const previous = this.unexpectedExits[this.unexpectedExits.length - 1];
-		this.unexpectedExits.push(cause);
+		// crash it survived hours ago. The ledger is shared with the replacement manager a failed
+		// startup produces, so a startup-phase death counts exactly like a mid-cell one (K-P1-1).
+		const { restartCount, previous } = this.restartLedger.record(cause, policy);
 		const unresolvedHostRequests: KernelHostRequestFact[] = [...this.inFlightHostRequests.values()].map(
 			(request) => ({
 				type: request.type,
@@ -1088,11 +1119,10 @@ export class ReplKernelManager {
 		// unattributed output it collected is only visible again if the revival keeps it.
 		this.dyingBackgroundOutput = this.activeExecution?.backgroundOutput;
 		this.dyingBackgroundOutputTruncated = this.activeExecution?.backgroundOutputTruncated ?? false;
-		const restartCount = this.unexpectedExits.length;
 		// C8: the budget counts revivals, so the death that exceeds it fails closed instead of
 		// arming another one.
 		const exhausted = restartCount > policy.maxRestarts;
-		this.pendingRestartNotice = {
+		this.restartLedger.setPendingRestartNotice({
 			cause,
 			restartCount,
 			snapshotConfigured: this.options.snapshot !== undefined,
@@ -1100,7 +1130,7 @@ export class ReplKernelManager {
 			...(Number.isFinite(policy.maxRestarts) ? { maxRestarts: policy.maxRestarts } : {}),
 			windowMinutes: Math.round(policy.windowMs / 60_000),
 			...(dyingCellCode === undefined ? {} : { repeatedCellCode: dyingCellCode }),
-		};
+		});
 		return {
 			decision: {
 				revive: !exhausted && this.canReviveAfterUnexpectedExit(),
@@ -1128,13 +1158,14 @@ export class ReplKernelManager {
 	 * with the death chain and the two re-arm paths; anything else keeps the plain teardown text.
 	 */
 	private terminalRequestError(): Error {
-		if (!this.restartBudgetExhaustedNow()) return new Error("Kernel has been shut down");
 		const policy = this.currentRestartPolicy();
+		const causes = this.restartLedger.exitsInWindow(policy, Date.now());
+		if (causes.length <= policy.maxRestarts) return new Error("Kernel has been shut down");
 		return new KernelUnavailableError({
-			restartCount: this.unexpectedExits.length,
+			restartCount: causes.length,
 			maxRestarts: policy.maxRestarts,
 			windowMs: policy.windowMs,
-			causes: this.unexpectedExits,
+			causes,
 		});
 	}
 
@@ -1147,18 +1178,9 @@ export class ReplKernelManager {
 		return !this.disposedByHost && !this.flushingSnapshotForDispose && !this.restartBudgetExhaustedNow();
 	}
 
-	/** Drop the exits that fell out of the sliding window. */
-	private pruneUnexpectedExits(at: number): void {
-		const windowStart = at - this.currentRestartPolicy().windowMs;
-		while (this.unexpectedExits.length > 0 && (this.unexpectedExits[0]?.at ?? 0) < windowStart) {
-			this.unexpectedExits.shift();
-		}
-	}
-
 	/** Whether the budget is spent right now. Live, because the window slides (L3). */
 	private restartBudgetExhaustedNow(): boolean {
-		this.pruneUnexpectedExits(Date.now());
-		return this.unexpectedExits.length > this.currentRestartPolicy().maxRestarts;
+		return this.restartLedger.exhausted(this.currentRestartPolicy(), Date.now());
 	}
 
 	/**
@@ -1169,7 +1191,7 @@ export class ReplKernelManager {
 	 */
 	private rearmIfRestartBudgetWindowExpired(): void {
 		if (this.state !== "shutdown" || this.disposedByHost) return;
-		if (this.unexpectedExits.length === 0) return;
+		if (this.restartLedger.count === 0) return;
 		if (this.restartBudgetExhaustedNow()) return;
 		this.appendKernelDiagnostic("kernel restart budget window expired; the next cell revives the kernel");
 		// The failed-closed request memoized a start() that did nothing (the state was terminal
@@ -1560,6 +1582,9 @@ export class ReplKernelManager {
 			// Additive and optional: a runtime that predates capability announcement sends
 			// no `capabilities` field and negotiates nothing beyond its protocol version.
 			this.announcedKernelCapabilities = asStringArray(event.capabilities);
+			// Recorded before the deferred resolves: the rest of this stdout chunk is parsed
+			// synchronously, long before `doStart` can validate the announcement and publish it.
+			this.readyAnnouncedProtocol = typeof event.protocol === "number" ? event.protocol : undefined;
 			this.readyDeferred?.resolve(typeof event.protocol === "number" ? event.protocol : -1);
 			return;
 		}
@@ -2234,6 +2259,7 @@ export class ReplKernelManager {
 		// this list, so the clear is hygiene, not correctness — but a future reader must
 		// never be able to combine a new negotiation with a previous child's announcement.
 		this.announcedKernelCapabilities = [];
+		this.readyAnnouncedProtocol = undefined;
 		// Liveness facts belong to the child that reported them: a replacement kernel must earn
 		// its own first frame before anything vouches for it again, and a rejection streak from a
 		// broken predecessor must not pre-age the new episode's log throttling.

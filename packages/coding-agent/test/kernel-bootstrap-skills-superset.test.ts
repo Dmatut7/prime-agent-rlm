@@ -10,6 +10,7 @@ import {
 	DEFAULT_RLM_EXTRA_UV_ARGS,
 	ensureKernelPython,
 	type KernelPythonSkill,
+	pythonSkillContentHash,
 	pythonSkillsSatisfied,
 	resolveRuntimeIdentity,
 } from "../src/core/kernel/bootstrap.js";
@@ -157,6 +158,7 @@ function recordEntry(skill: KernelPythonSkill, overrides: Partial<BootstrapPytho
 		packagePath: skill.packagePath,
 		pyprojectPath: skill.pyprojectPath,
 		pyprojectHash: pyprojectHash(skill.pyprojectPath),
+		contentHash: pythonSkillContentHash(skill.packagePath),
 		...overrides,
 	};
 }
@@ -168,6 +170,7 @@ function fakeEntry(importName: string, overrides: Partial<BootstrapPythonSkill> 
 		packagePath: `/skills/${importName}`,
 		pyprojectPath: `/skills/${importName}/pyproject.toml`,
 		pyprojectHash: `sha256:${importName}`,
+		contentHash: `sha256:content-${importName}`,
 		...overrides,
 	};
 }
@@ -196,6 +199,9 @@ describe("kernel bootstrap python skill superset", () => {
 		const alpha = fakeEntry("alpha");
 		const beta = fakeEntry("beta");
 		const gamma = fakeEntry("gamma");
+		// The table's entries have no on-disk package, so the install-faithfulness leg (a real
+		// filesystem check) is stubbed here and pinned by the integration cases below.
+		const faithful = () => true;
 
 		it("accepts a superset record and rejects every way a request can be uncovered", () => {
 			const cases: {
@@ -212,43 +218,49 @@ describe("kernel bootstrap python skill superset", () => {
 				{ name: "requested skill missing", installed: [alpha], requested: [alpha, beta], expected: false },
 				{ name: "absent record with a request", installed: undefined, requested: [alpha], expected: false },
 				{
-					name: "pyproject hash differs",
-					installed: [fakeEntry("alpha", { pyprojectHash: "sha256:stale" })],
+					name: "content hash differs",
+					installed: [fakeEntry("alpha", { contentHash: "sha256:stale" })],
 					requested: [alpha],
 					expected: false,
 				},
 				{
-					name: "same import name from another checkout",
+					name: "record predates content fingerprints",
+					installed: [fakeEntry("alpha", { contentHash: undefined })],
+					requested: [alpha],
+					expected: false,
+				},
+				{
+					// K-P1-2: the comparison is path-independent. One import name has one editable
+					// install, and two checkouts of the same commit install the same bytes, so an
+					// entry recorded by another checkout satisfies this one instead of forcing a
+					// reinstall that flips the record straight back.
+					name: "same content recorded from another checkout",
 					installed: [
 						fakeEntry("alpha", {
 							packagePath: "/other-checkout/alpha",
 							pyprojectPath: "/other-checkout/alpha/pyproject.toml",
+							pyprojectHash: "sha256:other-pyproject-bytes",
 						}),
 					],
 					requested: [alpha],
-					expected: false,
-				},
-				{
-					// Pins the package-path dimension on its own: an identical hash under
-					// another checkout is still a conflict over one import name.
-					name: "package path differs, pyproject hash identical",
-					installed: [fakeEntry("alpha", { packagePath: "/other-checkout/alpha" })],
-					requested: [alpha],
-					expected: false,
-				},
-				{
-					name: "pyproject path differs, hash identical",
-					installed: [fakeEntry("alpha", { pyprojectPath: "/moved/alpha/pyproject.toml" })],
-					requested: [alpha],
-					expected: false,
+					expected: true,
 				},
 			];
 			expect(cases.length).toBeGreaterThan(0);
 			for (const testCase of cases) {
-				expect(pythonSkillsSatisfied(testCase.installed, testCase.requested), testCase.name).toBe(
+				expect(pythonSkillsSatisfied(testCase.installed, testCase.requested, faithful), testCase.name).toBe(
 					testCase.expected,
 				);
 			}
+		});
+
+		it("rejects a record whose install is not faithful", () => {
+			// Content equality is not enough: the install is editable and resolves to the recorded
+			// path, so a checkout that vanished or drifted underneath the record has to cost one
+			// reinstall rather than leave the kernel importing something else.
+			const unfaithful = (entry: BootstrapPythonSkill) => entry.importName !== "alpha";
+			expect(pythonSkillsSatisfied([alpha, beta], [alpha], unfaithful)).toBe(false);
+			expect(pythonSkillsSatisfied([alpha, beta], [beta], unfaithful)).toBe(true);
 		});
 	});
 
@@ -308,7 +320,7 @@ describe("kernel bootstrap python skill superset", () => {
 		expect(editableInstallCount(logPath)).toBe(afterFirstBoot + 1);
 	});
 
-	it("reinstalls a skill whose recorded checkout path differs", async () => {
+	it("reinstalls a skill whose recorded install points at a checkout that is gone", async () => {
 		const logPath = installFakeUv();
 		const base = join(tempDir, "kernel-venv");
 		// The warm venv has to be built where bootstrap looks for it: this identity's
@@ -323,8 +335,10 @@ describe("kernel bootstrap python skill superset", () => {
 			runtime: runtimeIdentity,
 			snapshot: "dill",
 			extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
-			// Another checkout's copy of the same import name is a real conflict, not a
-			// superset: the union record must not paper over it.
+			// Another checkout's copy of the same import name is *not* a conflict when its
+			// content matches - but this one is gone from disk, so the editable install the
+			// record points at resolves to nothing and has to be redone from this checkout
+			// (this is how a dangling install left behind by a deleted worktree repairs).
 			pythonSkills: [
 				recordEntry(skill, {
 					packagePath: join(tempDir, "other-checkout", "shared-skill"),

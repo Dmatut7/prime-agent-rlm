@@ -310,6 +310,58 @@ describe("createTurnLiveness", () => {
 		expect(wedgedFacts.progress).toBe(false);
 	});
 
+	it("vouches for the finishing phase, where a frozen tick is the expected shape (K-P2-2)", () => {
+		// The post-run phase (a huge `repr`, the output drain) is synchronous: the loop tick is
+		// frozen while the request is still in flight and the frames keep arriving. Without the
+		// phase marker this sample is indistinguishable from the genuine-deadlock shape, so a
+		// healthy kernel serializing a million-row result is aborted with no reason recorded at all.
+		const finishing = build({
+			kernel: facts({
+				previous: sample({ receivedAt: T0 - 5_000, tick: 10 }),
+				latest: sample({ tick: 10, cellId: "cell-1", finishing: true }),
+			}),
+		});
+		const sampled = finishing.liveness.sample();
+		expect(sampled.vouched).toBe(true);
+		expect(sampled.reasons).toEqual([TURN_LIVENESS_REASONS.kernelFinishingResult]);
+		// Existence only: a `__repr__` that waits on a lock looks identical from here, so this buys
+		// the short tier and never the progress one.
+		expect(sampled.progress).toBe(false);
+		// The frozen tick is this phase's own doing, so it is not reported as a stalled loop.
+		expect(sampled.kernelReasons).toEqual([]);
+
+		// Same frozen tick, no phase marker: the cell body is blocking the loop, which stays the
+		// deadlock shape nothing excuses.
+		const blocked = build({
+			kernel: facts({
+				previous: sample({ receivedAt: T0 - 5_000, tick: 10 }),
+				latest: sample({ tick: 10, cellId: "cell-1" }),
+			}),
+		});
+		const blockedFacts = blocked.liveness.sample();
+		expect(blockedFacts.vouched).toBe(false);
+		expect(blockedFacts.kernelReasons).toEqual([TURN_LIVENESS_REASONS.loopStalled]);
+
+		// A heartbeat that stopped arriving vouches for nothing, whatever phase it last reported.
+		const stale = build({
+			kernel: facts({
+				previous: sample({ receivedAt: T0 - 60_000, tick: 10 }),
+				latest: sample({ receivedAt: T0 - 60_000, tick: 10, cellId: "cell-1", finishing: true }),
+			}),
+		});
+		expect(stale.liveness.sample().vouched).toBe(false);
+	});
+
+	it("reads the finishing phase off the frame, and only with a cell to attribute it to", () => {
+		expect(kernelVouchedAlive({ latest: sample({ finishing: true }) }, T0).cellFinishing).toBe(true);
+		expect(kernelVouchedAlive({ latest: sample({ cellId: undefined, finishing: true }) }, T0).cellFinishing).toBe(
+			false,
+		);
+		expect(kernelVouchedAlive({ latest: sample() }, T0).cellFinishing).toBe(false);
+		expect(kernelVouchedAlive({ latest: sample({ finishing: false }) }, T0).cellFinishing).toBe(false);
+		expect(kernelVouchedAlive({}, T0).cellFinishing).toBe(false);
+	});
+
 	it("identifies movement, so 'moved since I looked' is not confused with 'says it is moving'", () => {
 		// A frame the watchdog can compare two samples of: the token is derived from the cumulative
 		// output counters, so a job that produced more since the last look has a different one and a

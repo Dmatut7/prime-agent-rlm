@@ -3,7 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { KernelDeathCause, KernelUnexpectedExitFacts } from "../src/core/kernel/index.js";
-import { KernelUnavailableError, ReplKernelManager } from "../src/core/kernel/index.js";
+import { KernelRestartLedger, KernelUnavailableError, ReplKernelManager } from "../src/core/kernel/index.js";
+import { KERNEL_RESET_NOTICE_TAG } from "../src/core/kernel/reset-notice.js";
+import { IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
 
 /**
  * A fake runtime that dies on every `die9` cell and can hold its bootstrap until a flag file is
@@ -219,6 +221,163 @@ describe("kernel restart budget (C8)", () => {
 			expect(Number(readFileSync(harness.countPath, "utf8"))).toBe(2);
 		} finally {
 			await harness.manager.shutdown();
+		}
+	});
+});
+
+/**
+ * A kernel that dies before it is ready: the broken-environment shape (a broken venv, a
+ * `Killed:9` signature kill, a misconfigured `PRIME_AGENT_KERNEL_PYTHON`, an import-time OOM).
+ * Nothing about it is specific to one manager instance, which is the point of K-P1-1.
+ */
+function writeDyingFakeRuntime(path: string): void {
+	writeFileSync(
+		path,
+		`#!/usr/bin/env node
+const fs = require("node:fs");
+const countPath = process.env.FAKE_REPL_SPAWN_COUNT;
+const count = fs.existsSync(countPath) ? Number(fs.readFileSync(countPath, "utf8")) + 1 : 1;
+fs.writeFileSync(countPath, String(count));
+process.stderr.write("fake kernel: simulated startup crash\\n");
+process.exit(3);
+`,
+	);
+	chmodSync(path, 0o755);
+}
+
+function spawnCount(path: string): number {
+	return existsSync(path) ? Number(readFileSync(path, "utf8")) : 0;
+}
+
+function messageOf(value: unknown): string {
+	return value instanceof Error ? value.message : String(value);
+}
+
+describe("kernel restart budget across replacement managers (K-P1-1)", () => {
+	it("fails closed once a kernel that dies before ready has spent the shared budget", async () => {
+		const python = join(tempDir, "python");
+		writeDyingFakeRuntime(python);
+		const countPath = join(tempDir, "spawn-count");
+		const provisioner = new IpythonKernelProvisioner(tempDir, {
+			python,
+			sessionId: "budget-provisioner",
+			env: { FAKE_REPL_SPAWN_COUNT: countPath },
+		});
+		const seen: unknown[] = [];
+		try {
+			for (let cell = 1; cell <= 6; cell++) {
+				seen.push(
+					await provisioner
+						.ensure()
+						.then((manager) => manager.execute("print(1)"))
+						.then(
+							() => undefined,
+							(error: unknown) => error,
+						),
+				);
+			}
+			expect(seen).toHaveLength(6);
+			// Three revivals per window, so the first three cells report the startup death itself...
+			for (const [index, error] of seen.slice(0, 3).entries()) {
+				expect(messageOf(error), `cell ${index + 1}`).toContain("exited before ready");
+			}
+			// ...the fourth death spends the budget, and that cell is the one told so...
+			expect(seen[3]).toBeInstanceOf(KernelUnavailableError);
+			const exhausted = seen[3];
+			expect(messageOf(exhausted)).toContain("3 restarts per 60 minutes");
+			expect(messageOf(exhausted)).toContain("code=3");
+			expect(messageOf(exhausted)).toContain("/reload");
+			if (exhausted instanceof KernelUnavailableError) {
+				expect(exhausted.restartCount).toBe(4);
+				expect(exhausted.causes).toHaveLength(4);
+			}
+			// ...and every later cell fails closed instead of spawning one more doomed kernel.
+			expect(seen[4]).toBeInstanceOf(KernelUnavailableError);
+			expect(seen[5]).toBeInstanceOf(KernelUnavailableError);
+			expect(spawnCount(countPath)).toBe(4);
+		} finally {
+			await provisioner.dispose({ snapshot: false }).catch(() => undefined);
+		}
+	});
+
+	it("counts a death recorded by a replaced manager against its replacement", async () => {
+		const python = join(tempDir, "python");
+		writeFakeRuntime(python);
+		const countPath = join(tempDir, "spawn-count");
+		const env = { FAKE_REPL_SPAWN_COUNT: countPath };
+		const options = {
+			python,
+			cwd: tempDir,
+			env,
+			bootstrapCode: "bootstrap",
+			restartPolicy: () => ({ maxRestarts: 0, windowMs: 60_000 }),
+		};
+		const ledger = new KernelRestartLedger();
+		const first = new ReplKernelManager({ ...options, restartLedger: ledger });
+		try {
+			// Zero allowed revivals: the first death spends the budget on the spot.
+			await expect(first.execute("die9")).rejects.toThrow(KernelUnavailableError);
+			// The host verdict that makes the provisioner replace the instance.
+			await first.shutdown({ snapshot: false });
+			expect(first.isDefunct).toBe(true);
+			expect(spawnCount(countPath)).toBe(1);
+
+			const second = new ReplKernelManager({ ...options, restartLedger: ledger });
+			try {
+				await expect(second.execute("1 + 1")).rejects.toThrow(KernelUnavailableError);
+				// The whole point: the replacement refuses to spawn at all.
+				expect(spawnCount(countPath)).toBe(1);
+			} finally {
+				await second.shutdown({ snapshot: false }).catch(() => undefined);
+			}
+
+			// Positive control: an unshared ledger starts from zero, which is exactly the shape
+			// that let a doomed kernel be respawned once per cell.
+			const independent = new ReplKernelManager(options);
+			try {
+				await expect(independent.execute("1 + 1")).resolves.toMatchObject({ status: "ok" });
+				expect(spawnCount(countPath)).toBe(2);
+			} finally {
+				await independent.shutdown({ snapshot: false }).catch(() => undefined);
+			}
+		} finally {
+			await first.shutdown({ snapshot: false }).catch(() => undefined);
+		}
+	});
+
+	it("delivers the reset notice of a death its own manager never served", async () => {
+		const python = join(tempDir, "python");
+		writeFakeRuntime(python);
+		const countPath = join(tempDir, "spawn-count");
+		const env = { FAKE_REPL_SPAWN_COUNT: countPath };
+		const options = {
+			python,
+			cwd: tempDir,
+			env,
+			sessionId: "notice-across-managers",
+			bootstrapCode: "bootstrap",
+		};
+		const ledger = new KernelRestartLedger();
+		const first = new ReplKernelManager({ ...options, restartLedger: ledger });
+		try {
+			await expect(first.execute("die9")).rejects.toThrow(/exited unexpectedly/);
+			// The notice is armed on the ledger, and this instance is about to be discarded by its
+			// owner without ever serving a cell that could carry it.
+		} finally {
+			await first.shutdown({ snapshot: false }).catch(() => undefined);
+		}
+
+		const second = new ReplKernelManager({ ...options, restartLedger: ledger });
+		try {
+			await expect(second.execute("1 + 1")).resolves.toMatchObject({ status: "ok" });
+			const notice = second.consumeRestartNotice("1 + 1");
+			expect(notice).toBeDefined();
+			expect(notice).toContain(KERNEL_RESET_NOTICE_TAG);
+			expect(notice).toContain("code=9");
+			// Consumed once: the second read is empty.
+			expect(second.consumeRestartNotice("1 + 1")).toBeUndefined();
+		} finally {
+			await second.shutdown({ snapshot: false }).catch(() => undefined);
 		}
 	});
 });

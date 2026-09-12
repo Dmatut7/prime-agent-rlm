@@ -10,6 +10,7 @@ import {
 	ensureKernelPython,
 	getKernelVenvDir,
 	type KernelPythonSkill,
+	pythonSkillContentHash,
 	resolveRuntimeIdentity,
 } from "../src/core/kernel/bootstrap.js";
 
@@ -39,6 +40,7 @@ function writeBootstrapVersion(venv: string, pythonSkills: readonly KernelPython
 				packagePath: skill.packagePath,
 				pyprojectPath: skill.pyprojectPath,
 				pyprojectHash: pyprojectHash(skill.pyprojectPath),
+				contentHash: pythonSkillContentHash(skill.packagePath),
 			})),
 		})}\n`,
 	);
@@ -248,6 +250,7 @@ describe("kernel bootstrap", () => {
 				packagePath: pythonSkill.packagePath,
 				pyprojectPath: pythonSkill.pyprojectPath,
 				pyprojectHash: pyprojectHash(pythonSkill.pyprojectPath),
+				contentHash: pythonSkillContentHash(pythonSkill.packagePath),
 			},
 		]);
 	});
@@ -274,12 +277,14 @@ describe("kernel bootstrap", () => {
 				packagePath: dependencySkill.packagePath,
 				pyprojectPath: dependencySkill.pyprojectPath,
 				pyprojectHash: pyprojectHash(dependencySkill.pyprojectPath),
+				contentHash: pythonSkillContentHash(dependencySkill.packagePath),
 			},
 			{
 				importName: dependentSkill.importName,
 				packagePath: dependentSkill.packagePath,
 				pyprojectPath: dependentSkill.pyprojectPath,
 				pyprojectHash: pyprojectHash(dependentSkill.pyprojectPath),
+				contentHash: pythonSkillContentHash(dependentSkill.packagePath),
 			},
 		]);
 	});
@@ -383,6 +388,7 @@ dependencies = ["httpx"]
 				packagePath: goodSkill.packagePath,
 				pyprojectPath: goodSkill.pyprojectPath,
 				pyprojectHash: pyprojectHash(goodSkill.pyprojectPath),
+				contentHash: pythonSkillContentHash(goodSkill.packagePath),
 			},
 		]);
 
