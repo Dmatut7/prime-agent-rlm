@@ -15,6 +15,7 @@
 
 | 日期 | 这轮干了什么 |
 |---|---|
+| 2026-09-13 凌晨 | core 其余面 + TUI 面围猎修复 10 条：/share 密钥预检此前扫的是 base64（明文形状永不命中，等于没有预检）改为扫上传件里可还原的明文；/share 的 `gh` spawn 失败会永久挂死改为报错 + 上界；bash/工具全量输出临时文件 0644→0600；单个会话 cron 存档损坏曾让全进程所有 cron/heartbeat 永久静默，改为隔离该会话 + 告警 + 下次写自愈，调度器读失败也不再永久失械；资源发现目录符号链接加环检测与深度上限（不再靠内核 ELOOP 兜底）且跳过必留痕；`!command` 凭证失败不再进程级永久负缓存（30 s 过期）；bash 流式解码收尾 flush；中断路径 4 个 best-effort abort 补 catch；重试倒计时/压缩 loader 在换会话与拆除时真正 dispose；Loader 与 CountdownTimer 定时器 unref |
 | 2026-09-12 傍晚 | 修「进会话 / 进 agents 视图间歇 1–5 秒」：会话列表摘要落一份持久缓存（按 dev+ino+size+mtime 失效，内容变了必重扫）+ 三处串行转录扫描改并发；开一次 agents 视图的守护进程侧成本 3.35 s → 0.13 s，冷守护进程下 Enter→聊天 5.25 s → 0.22 s；顺带修 agents 视图 Enter 被目录刷新扣住、250 ms 动画定时器全量重建行 |
 | 2026-09-12 凌晨 | 采纳外部贡献者 DZMing 的 5 个修复（时区孤儿/umask 锁死/测试环境耦合/导出 /tmp/Windows 测试）；移除假设置 bashTimeoutSeconds；修"记忆写入遇格式抖动整条丢"；大门从自动关 PR 改为人工审 |
 | 2026-09-12 上午 | 官方动态对账：41 个新提交盘点 + 60 个开放 PR 逐件分析；摘官方 12 个提交级优点（litellm 超限识别/`$` 不再二次展开/agents-view 用量列/Bedrock 打包真修等）；移植 rlm.collect（子代理结果类型化回收） |
@@ -28,6 +29,18 @@
 | 2026-09-07 | 主仓迁到独立仓；根代理沟通契约（说人话、先复述目标、不给选择题） |
 | 2026-09-05 | R3 上游同步（官方 40 提交零丢失合入）+ 全仓复审（28 缺陷簇）+ 第一批修复 |
 | 2026-08-29 | R1 大合入（REPL kernel 线成型）+ R2 迭代 |
+
+---
+
+## 2026-09-13 凌晨 · core 其余面 + TUI 面围猎修复（10 条）
+
+> 缺陷定位报告 `/tmp/ma_audit/full_corerest.md`（core 其余 ~30k 行）与 `/tmp/ma_audit/full_tui.md`（interactive/ + tui/ 40k 行），施工与验证全记录 `/tmp/ma_audit/build_corerest_fixes.md`。
+
+- **为什么**：两条只读围猎车道交回 1 条 P1 + 9 条 P2。最重的一条是安全面：`/share` 上传前的密钥预检扫的是导出 HTML 全文，而会话内容在导出件里是 `Buffer.from(JSON).toString("base64")` 塞进 `<script id="session-data">` 的——base64 字母表里没有 `-`、`_`、空格，`sk-`/`AKIA`/`ghp_`/`Bearer ` 五个明文形状**永不可能命中**。结果是弹框恒不出现，用户被告知"看起来不含密钥"后照常上传，拿到一个可转发给任何人的 viewer URL。
+- **做了什么**：① **/share 预检**：新增 `export-html/session-data-embedding.ts` 作为容器格式的唯一出处（导出侧 encode、预检侧 decode），预检改为扫「上传字节 ∪ 还原出的明文载荷 ∪ 载荷解开 JSON 转义后的文本」三层——第三层是施工中新发现的真洞：载荷里 `...\nAKIA...` 的换行是转义的两字符，`n` 紧贴在密钥前面，`\b` 锚点照样不命中（活体实测：只解 base64 不解转义，5 类密钥只命中 2 类）。顺带补 PEM 私钥形状。② **/share 上传不再挂死**：`spawn("gh")` 只注册了 `close`，spawn 本身失败（PATH 竞态 / EMFILE / EACCES）时 Node 只发 `error`，Promise 永不 settle；补 `error` 监听 + 5 分钟上界（超时即 kill 并报错，loader 的取消仍是快路径）。③ **临时文件 0600**：`bash-executor` 与 `tools/output-accumulator` 的全量输出落 `/tmp/pi-*.log` 用的是 `createWriteStream` 默认 mode（本机 umask 0022 实测 0644，世界可读），而这份文件里正是被上下文截断挡掉的那部分输出（密钥常在尾部窗口外）；两处都加 `{ mode: 0o600 }`。④ **cron 存档损坏不再全家静默**：`readJobsStateIfPresent` 对存在的文件直接 `JSON.parse` 无 try，一个会话的坏文件会顺着 `nextActiveRunAt` 抛进 `scheduleNext`，在 `setTimeout` 之前就把定时器打死，**全进程所有会话的 cron/heartbeat 直到重启都不再调度**，只留一条 warn；改为把坏文件隔离成空态（字节原样不动，读路径不销毁数据）、按 path 去重告警一次、下次写该会话时原子 rename 自然自愈；另外给 `scheduleNext` 兜底：store 读失败按 30 s 有界重试重新武装，"任何 store 故障最多丢 tick，绝不永久失械"。⑤ **资源发现环检测**：`collectFiles`/`collectSkillEntries`/`loadSkillsFromDirInternal` 对目录符号链接一律无条件递归，不记 visited、不限深度——活体实测 `skills/loop -> skills` 这种**走法层面**的环内核不会报 ELOOP（每次只解析一跳），会一路重复扫到路径名超长为止，同一个技能被收进结果 47 次；新增 `utils/discovery-walk.ts`（realpath 身份 + 分支栈，深度上限 32），命中即跳过该子树并留痕（skills 走 `ResourceDiagnostic`，package-manager 走 logger），原先被静默吞掉的扫描异常也改为带 path 告警。⑥ **`!command` 负缓存加 TTL**：失败结果此前进程级永久缓存，`!cat /run/secrets/token` 首次遇到文件还没生成就永远返回 undefined；改为成功值仍终身缓存、失败 30 s 过期（窗口同时保证坏命令不会被每次模型调用都 spawn 一遍）。⑦ **bash 流式解码收尾 flush**：命令被超时/kill 截在多字节字符中间时，尾部 1-2 字节此前直接消失，与同族 `OutputAccumulator.finish()` 行为不一致；settle 与 cancelled 两条路径都补 flush（表现为 U+FFFD，即"这里被截断了"）。⑧⑨⑩ **TUI 面**：`interruptOrClearInput` 里 4 个 best-effort abort 补 `.catch()`（一次 Escape 曾能造出 4 条 unhandled rejection）；`retryCountdown`/`retryLoader`/`autoCompactionLoader` 在 `stop()` 与 `resetCurrentSessionRenderState()` 里真正 dispose + 从 statusContainer 摘下（换会话不再残留上一会话的倒计时，teardown 不再被 interval 拖住）；`Loader` 与 `CountdownTimer` 的 interval 补 `unref()`。
+- **对用户 / AI 能力**：`/share` 的密钥警告从"恒不出现"变成真的会出现（含 PEM）；`/share` 不会再挂死；同机其他用户读不到 agent 的命令全量输出；一个坏掉的会话存档不再让所有会话的定时任务与心跳停摆；仓库里有目录符号链接时启动不再重复扫整棵树、也不会静默少发现资源；凭证命令首次失败后 30 s 内自愈，不必重启。**没有降能力**：正常符号链接目录仍被跟随（一层），成功凭证仍终身缓存，导出 HTML 的字节形状不变。
+- **验证**：10 条全部先红后绿（红都是行为级，不是"模块不存在"级）——例如 share 面在真导出件上实证 `findShareSecretHits(html) === []` 而载荷里 5 类密钥俱全；cron 面实证一个坏文件让 `store.list()` 直接抛 `SyntaxError`；发现面实证同一个技能被收 47 次；TUI 面实证 4 条 unhandled rejection 与 `hasRef() === true`。变异 25 处全杀（唯一一次"存活"是我的跑测命令把退出码吞在管道里，去掉管道重跑即杀；无等价变异）。新增 8 个测试文件、40 条用例；回归两批共 103 文件 1580 条全过（30 文件 538 条主批 + 73 文件 1042 条交叠批），tui 包 808 条全过（未跑 4603 全量）；`npm run check` 本车道文件零错、`check:test-hygiene` 无新增探针、纯净树 `tsgo --noEmit` EXIT=0。
+- **顺手修正的既有测试**：`interactive-mode-ctrl-c.test.ts` 的 4 个 abort 假件此前返回 `undefined`（生产代码只 `void` 调用所以看不出），补 `.catch()` 后必须是真 Promise，已改为 `mockResolvedValue(undefined)`；新的 share 上传失败用例改用独立临时目录前缀，避免与 `interactive-mode-share-scan-ordering.test.ts`（断言 tmpdir 里 `prime-agent-share-*` 存活集合）在并行 worker 下互相踩。
 
 ---
 
