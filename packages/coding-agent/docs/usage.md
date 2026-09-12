@@ -127,6 +127,11 @@ await agent_message.send(
     receiver_role="child",
     receiver_name=review.name,
 )
+
+# Or read the children back without steering anyone: one typed snapshot per child.
+results = await rlm.collect(timeout_ms=30_000)
+for entry in results:
+    print(entry.session_name, entry.settled, entry.terminal_kind, entry.answer_preview)
 ```
 
 Children inherit the parent model unless the user requests another model. They run as TypeScript `AgentSession` instances under the same root worker and can use the same provider, tools, skills, session storage, and scheduling system. See [RLM Runtime Architecture](rlm-runtime.md).

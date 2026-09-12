@@ -27,7 +27,7 @@ handle = await rlm("inspect the API", name="api-reviewer")
 print(handle.rlm_child_id, handle.name, handle.session_dir, handle.model)
 ```
 
-the call travels as a `host_request` event over the runtime's stdio protocol. `ReplKernelManager` dispatches request type `rlm.run` to the parent `AgentSession`, which starts a child through the same TypeScript agent machinery as the parent. The call returns over the same bridge immediately after task admission with a child handle; it never waits for or returns the child's answer. Results arrive only through explicit `agent_message` replies or files.
+the call travels as a `host_request` event over the runtime's stdio protocol. `ReplKernelManager` dispatches request type `rlm.run` to the parent `AgentSession`, which starts a child through the same TypeScript agent machinery as the parent. The call returns over the same bridge immediately after task admission with a child handle; it never waits for or returns the child's answer. Results arrive through explicit `agent_message` replies, `rlm.collect` snapshots, or files.
 
 The same bridge supports other typed host requests. Bundled Python skills such as `goal` call `rlm.host_request("goal.get", ...)`; state and policy remain in the TypeScript host.
 
@@ -106,7 +106,7 @@ A running cell can await task admission:
 handle = await rlm("subtask")
 ```
 
-The runtime ships the call to the host as a `host_request` event and keeps its event loop free while awaiting the reply. The host dispatches the typed request and answers with a `host_reply` request carrying the same id, so a cell can block on admission without stalling other runtime work. Child answers do not use this response path; they arrive later through explicit `agent_message` replies or files.
+The runtime ships the call to the host as a `host_request` event and keeps its event loop free while awaiting the reply. The host dispatches the typed request and answers with a `host_reply` request carrying the same id, so a cell can block on admission without stalling other runtime work. Child answers do not use this response path; they arrive later through explicit `agent_message` replies or files. The one read that does use it is `rlm.collect`, which returns compact per-child snapshots over the same request/reply pair instead of answers.
 
 ## Python API
 
@@ -117,11 +117,14 @@ rlm
 run(prompt: str, **kwargs)
 find_models(query: str = "", limit: int = 8)
 list_subagents()
+collect(targets=None, *, timeout_ms=0)
 delete_subagent(selector)
 host_request(request_type: str, payload: dict | None = None)
 RLMSpawnHandle
 RLMModel
 RLMSubagent
+RLMChildResult
+RLMChildStallAbort
 ```
 
 The kernel bootstrap places the callable `rlm` object in the user namespace, so these are equivalent:
@@ -177,6 +180,36 @@ This registry survives kernel restart, compaction, and parent restore. Successfu
 The parent can continue a retained daemon child with `await agent_message.send(..., receiver_role="child", receiver_name=child.session_name)`. `rlm.delete_subagent()` accepts an exact child ID, active-session ID, session ID, or unique name. Deletion cancels or closes the runtime, writes a durable tombstone, and removes the child from messaging and observation. It does not erase the transcript or artifacts on disk.
 
 Registry scope follows the parent transcript. An unrelated new parent session does not inherit children.
+
+## Typed Fan-In (`rlm.collect`)
+
+`await rlm.collect(targets=None, timeout_ms=0)` is the read-side companion of the registry: one call returns a typed envelope per direct child instead of N steering messages, N file reads, or a roster poll that says nothing but "done".
+
+```python
+results = await rlm.collect(timeout_ms=30_000)
+for entry in results:
+    print(entry.session_name, entry.status, entry.settled, entry.terminal_kind)
+    if entry.settled and entry.terminal_kind != "none":
+        print("  outcome:", entry.terminal_reason)
+    if entry.stall_abort:
+        print("  watchdog:", entry.stall_abort.silent_ms, entry.stall_abort.in_flight_tools)
+```
+
+`targets` accepts child ids, child session names, child session ids, spawn handles, registry rows, or a list mixing them; `None` or `[]` selects every direct child that is not being deleted. An unknown selector raises, and an ambiguous one raises instead of guessing.
+
+Each `RLMChildResult` carries `rlm_child_id`, `session_name`, `session_dir`, `status`, `settled`, `answer_preview`, `error`, `duration_ms`, `tool_use_count`, `replied_since_task`, `activity_kind`, `terminal_kind`, `terminal_reason`, and `stall_abort`. `activity_kind` is the child's live activity (`waiting`, `writing`, `executing`, `stalled`) and is the only "still working" signal for a child retained without a run - the daemon-recovery shape, whose `status` stays `done` for the recorded task.
+
+The wait is bounded and never destructive:
+
+- `timeout_ms=0` is a guaranteed non-blocking read; a positive value blocks only that kernel call.
+- A timeout returns the current snapshots. It does not raise, does not steer the parent, and does not cancel, abort, or delete any child.
+- The host caps one wait just inside its read-only host-request budget (the `agentMessage.targetWaitSeconds` short tier, 60s by default) so a collect can never lose a race with the kernel's own bound and turn into a timeout error. The effective value is returned in the host reply payload as `timeout_ms`, and a shortened wait is logged as `rlm collect wait clamped`.
+- Aborting the cell (Esc) ends the wait the same way: snapshots, not an error.
+- A settled child keeps its envelope until it is deleted, so re-collecting after a compaction or a kernel restart costs nothing.
+
+`status` is the raw run status and reads `done` for a child the stall watchdog killed. `terminal_kind` is the classification the child's own terminal path recorded - `stall_killed`, `aborted`, `error`, `cancelled`, `completed_without_reply`, or `none` when the parent already knows - and `stall_abort` carries the watchdog facts (`silent_ms`, `threshold_ms`, `in_flight_tools`, `kernel_reasons`, `settled`). Read those two before trusting a completion. `terminal_kind` is absent while a run is in flight, and for a child whose notice path never ran (a suppressed or explicitly deleted child, or one rehydrated without a run).
+
+`collect` is a read: it is on the cancellable kernel host-request whitelist, so a cell abort cancels the wait and nothing else. Large child outputs still belong in files; the envelope's `answer_preview` is a compact preview, not the child's full result.
 
 ## Usage and Cost Attribution
 

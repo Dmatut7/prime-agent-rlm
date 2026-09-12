@@ -19,6 +19,14 @@ export type RlmChildNoticeKind = "cancelled" | "completed_without_reply";
 export type RlmChildTerminalKind = RlmChildFailureKind | RlmChildNoticeKind;
 
 /**
+ * Every kind the classifier can report, including `none` ("the parent already
+ * knows, synthesize nothing"). This is the shape a run records and the shape
+ * `rlm.collect` publishes, so a fan-in reader can tell a watchdog kill from a
+ * child that finished without replying.
+ */
+export type RlmChildTerminalOutcomeKind = RlmChildTerminalKind | "none";
+
+/**
  * Where the outcome has to go: `failure` is the unconditional failure channel
  * (rlm_child_failure), `notice` the synthesized terminal notice, `none` means the
  * parent already knows and nothing may be synthesized.

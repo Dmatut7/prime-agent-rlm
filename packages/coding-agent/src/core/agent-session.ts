@@ -37,7 +37,7 @@ import {
 	supportsFastMode,
 } from "@earendil-works/pi-ai";
 import { theme } from "../modes/interactive/theme/theme.js";
-import { untilAborted, type WaitTimeoutFacts } from "../utils/bounded-wait.js";
+import { untilAborted, type WaitTimeoutFacts, withBound } from "../utils/bounded-wait.js";
 import { stripFrontmatter } from "../utils/frontmatter.js";
 import { ensurePrivateDirectory, writePrivateFileAtomic } from "../utils/private-files.js";
 import { sleep } from "../utils/sleep.js";
@@ -238,12 +238,14 @@ import {
 	classifyRlmChildTerminalOutcomeSafely,
 	type RlmChildStallAbortFacts,
 	type RlmChildTerminalFacts,
+	type RlmChildTerminalOutcomeKind,
 	type RlmChildTurnAbortReason,
 	readStallKernelReasons,
 } from "./rlm-child-terminal.js";
 import {
 	type CreateRlmSubagentRuntimeOptions,
 	createDefaultRlmSubagentSessionName,
+	createRlmCollectHostHandler,
 	createRlmDeleteSubagentHostHandler,
 	createRlmFindModelsHostHandler,
 	createRlmListSubagentsHostHandler,
@@ -252,12 +254,15 @@ import {
 	normalizeRequestedRlmSubagentModel,
 	normalizeRequestedRlmSubagentSessionName,
 	normalizeRequestedRlmSubagentThinkingLevel,
+	type RlmCollectResult,
+	type RlmCollectResultEntry,
 	type RlmDeleteSubagentResult,
 	type RlmFindModelsResult,
 	type RlmListSubagentsResult,
 	type RlmSpawnHandle,
 	type RlmSubagentRegistryEntry,
 	type RlmSubagentRuntime,
+	rlmCollectStallAbort,
 	type SubagentRuntimeHost,
 } from "./rlm-runtime.js";
 import {
@@ -1070,6 +1075,17 @@ interface RlmChildRun {
 	stallAbort?: RlmChildStallAbortFacts;
 	/** Display/forensic stall state for the roster row; cleared by the next agent_start. */
 	stall?: RlmChildStallState;
+	/**
+	 * Terminal classification recorded by the run's own terminal path, with the
+	 * reason text that went with it. Read-only forensics for `collectRlmChildren`:
+	 * a fan-in reader has to tell a watchdog kill from a child that finished
+	 * without replying, and it cannot re-derive the classification later because
+	 * the reply baseline lived in the run loop's closure. Undefined while the run
+	 * is in flight, and for a child whose notice path never ran (suppressed after a
+	 * parent abort, or explicitly deleted).
+	 */
+	terminalKind?: RlmChildTerminalOutcomeKind;
+	terminalReason?: string;
 	abort: () => void;
 	publication: AgentMessageDeferred;
 	/** Resolves after terminal result publication and detached-run cleanup finish. */
@@ -1131,6 +1147,7 @@ const KERNEL_FAST_RESTART_GAP_MS = 60_000;
 export const CANCELLABLE_KERNEL_HOST_REQUEST_TYPES: readonly string[] = [
 	"rlm.find_models", // reads the authenticated model catalog
 	"rlm.list_subagents", // reads this session's own child roster
+	"rlm.collect", // bounded read-only wait for this session's own children; cancelling it cancels no child
 	"agent_observe.*", // list/get/recent: reads transcripts and status
 	"model.info", // reads this session's model
 	"agent_message.list_agents", // reads the family roster
@@ -11070,6 +11087,26 @@ export class AgentSession {
 			})),
 			"rlm.find_models": createRlmFindModelsHostHandler((query, limit) => this.findRlmModels(query, limit)),
 			"rlm.list_subagents": createRlmListSubagentsHostHandler(() => this.listRlmSubagents()),
+			"rlm.collect": createRlmCollectHostHandler(
+				(targets, timeoutMs, signal) => this.collectRlmChildren(targets, timeoutMs, signal),
+				{
+					// The same live value the kernel bounds a read-only host request with
+					// (readOnlyHostRequestTimeoutMs). Staying inside it is what makes a
+					// collect return snapshots instead of a kernel timeout error, and it
+					// keeps the request from vouching for the cell's silence any longer
+					// than any other read-only request may.
+					maxWaitMs: () => this.settingsManager.getAgentMessageWaitSettings().bindMs,
+					onClamped: ({ requestedMs, effectiveMs }) => {
+						// Countable: a wait the host shortened is a fact the caller cannot
+						// see any other way.
+						sessionLog.info("rlm collect wait clamped", {
+							sessionId: this.sessionId,
+							requestedMs,
+							effectiveMs,
+						});
+					},
+				},
+			),
 			"rlm.delete_subagent": createRlmDeleteSubagentHostHandler((target) => this.deleteRlmSubagent(target)),
 			"model.info": async () => ({
 				id: this.model?.id ?? null,
@@ -11724,6 +11761,198 @@ export class AgentSession {
 		return { subagents };
 	}
 
+	/**
+	 * Typed fan-in for direct RLM children: wait (bounded) for the selected runs to
+	 * settle and return result envelopes.
+	 *
+	 * Never steers the parent, and never rejects on a timeout or a cell abort -
+	 * both end the wait and return the snapshots as they are, and nothing behind
+	 * the wait is cancelled, so the caller can end its turn, poll, or retry.
+	 * `timeoutMs` of 0 is a guaranteed non-blocking read. `targets` are child ids,
+	 * child session names, or child session ids; an empty list means every direct
+	 * child that is not being deleted.
+	 */
+	async collectRlmChildren(targets: string[], timeoutMs: number, signal?: AbortSignal): Promise<RlmCollectResult> {
+		const selected = this._selectRlmChildrenForCollect(targets);
+		if (timeoutMs > 0) {
+			const deadlineAt = Date.now() + timeoutMs;
+			// allSettled on purpose: one run's timeout or abort must not strand the
+			// other waits, and a settlement rejection is terminal state to report,
+			// not a collect error.
+			await Promise.allSettled(
+				selected.runs
+					.filter((run) => !run.settled)
+					.map((run) => this._awaitRlmChildSettlementForCollect(run, deadlineAt, signal)),
+			);
+		}
+		return {
+			results: [
+				...selected.runs.map((run) => this._rlmCollectEntryForRun(run)),
+				...selected.runlessChildren.map(({ childId, child }) => this._rlmCollectEntryForSession(childId, child)),
+			],
+		};
+	}
+
+	/**
+	 * The children one collect call may see.
+	 *
+	 * Three sources, because terminal cleanup and daemon recovery each move a child
+	 * out of one of them: a run in flight, a settled run retained next to its
+	 * session, and a session retained without any run (rehydrated after a daemon
+	 * recovery). The roster shows all three, so a fan-in that saw less would report
+	 * a finished child as unknown. Children pending deletion - or whose deletion
+	 * cleanup failed - stay out: the delete path owns their selectors.
+	 */
+	private _selectRlmChildrenForCollect(targets: string[]): {
+		runs: RlmChildRun[];
+		runlessChildren: Array<{ childId: string; child: AgentSession }>;
+	} {
+		const runs = new Map<string, RlmChildRun>();
+		for (const run of this._activeRlmChildRuns.values()) {
+			if (this._isRlmChildHiddenFromCollect(run.id, run)) continue;
+			runs.set(run.id, run);
+		}
+		const runlessChildren: Array<{ childId: string; child: AgentSession }> = [];
+		for (const [childId, retained] of this._rlmChildSessions) {
+			if (this._isRlmChildHiddenFromCollect(childId, retained.run)) continue;
+			if (retained.run) {
+				// The retained copy is the same run object the active map held, so this
+				// only adds a run the terminal cleanup already dropped.
+				if (!runs.has(childId)) runs.set(childId, retained.run);
+				continue;
+			}
+			runlessChildren.push({ childId, child: retained.session });
+		}
+		if (targets.length === 0) {
+			return { runs: [...runs.values()], runlessChildren };
+		}
+		const selectedRuns: RlmChildRun[] = [];
+		const selectedRunless: Array<{ childId: string; child: AgentSession }> = [];
+		const selectedIds = new Set<string>();
+		for (const target of targets) {
+			const matchedRuns = [...runs.values()].filter((run) => this._rlmChildRunMatchesCollectTarget(run, target));
+			const matchedRunless = runlessChildren.filter(
+				({ childId, child }) => childId === target || child.sessionId === target || child.sessionName === target,
+			);
+			if (matchedRuns.length + matchedRunless.length === 0) {
+				throw new Error(`No direct RLM child matches "${target}" in the current parent session`);
+			}
+			if (matchedRuns.length + matchedRunless.length > 1) {
+				throw new Error(`RLM child selector "${target}" is ambiguous in the current parent session`);
+			}
+			// A repeated selector collects the child once, not twice.
+			for (const run of matchedRuns) {
+				if (selectedIds.has(run.id)) continue;
+				selectedIds.add(run.id);
+				selectedRuns.push(run);
+			}
+			for (const entry of matchedRunless) {
+				if (selectedIds.has(entry.childId)) continue;
+				selectedIds.add(entry.childId);
+				selectedRunless.push(entry);
+			}
+		}
+		return { runs: selectedRuns, runlessChildren: selectedRunless };
+	}
+
+	private _isRlmChildHiddenFromCollect(childId: string, run?: RlmChildRun): boolean {
+		return (
+			run?.detachedDeletion !== undefined ||
+			this._deletingRlmChildren.has(childId) ||
+			this._deletedRlmChildIds.has(childId) ||
+			this._rlmChildCleanupFailures.has(childId)
+		);
+	}
+
+	private _rlmChildRunMatchesCollectTarget(run: RlmChildRun, target: string): boolean {
+		const session = run.session ?? this._rlmChildSessions.get(run.id)?.session;
+		return (
+			run.id === target ||
+			run.sessionName === target ||
+			session?.sessionId === target ||
+			session?.sessionName === target
+		);
+	}
+
+	/**
+	 * Wait for one run to settle, bounded by the collect deadline and by a cell
+	 * abort. Both a timeout and an abort end the wait quietly: collect reports the
+	 * facts it has, and the child keeps running either way.
+	 */
+	private async _awaitRlmChildSettlementForCollect(
+		run: RlmChildRun,
+		deadlineAt: number,
+		signal?: AbortSignal,
+	): Promise<void> {
+		const remainingMs = deadlineAt - Date.now();
+		if (run.settled || remainingMs <= 0) return;
+		try {
+			await withBound(
+				// A settlement rejection is the run's terminal state, not a collect error.
+				run.settlement.promise.then(
+					() => undefined,
+					() => undefined,
+				),
+				{
+					timeoutMs: remainingMs,
+					phase: "rlm_collect",
+					target: run.id,
+					label: "RLM child settlement",
+					signal,
+					targetState: () => run.status,
+				},
+			);
+		} catch {
+			// Timeout or abort: fall through to the snapshot the caller asked for.
+		}
+	}
+
+	private _rlmCollectEntryForRun(run: RlmChildRun): RlmCollectResultEntry {
+		const child = run.session ?? this._rlmChildSessions.get(run.id)?.session;
+		const snapshot = this._rlmChildSnapshotForRun(run, child);
+		return {
+			rlm_child_id: snapshot.id,
+			session_name: snapshot.sessionName,
+			session_dir: snapshot.sessionDir,
+			status: snapshot.status,
+			settled: run.settled,
+			answer_preview: snapshot.answerPreview,
+			error: snapshot.error,
+			duration_ms: snapshot.durationMs,
+			tool_use_count: snapshot.toolUseCount,
+			replied_since_task: snapshot.repliedSinceTask,
+			activity_kind: snapshot.activity?.kind,
+			terminal_kind: run.terminalKind,
+			terminal_reason: run.terminalReason,
+			// Same two sources the terminal classifier reads: the run's own record
+			// survives a disposed child session, the child's copy is the fallback for
+			// a kill the parent's subscription never observed.
+			stall_abort: rlmCollectStallAbort(run.stallAbort ?? child?._lastStallAbort),
+		};
+	}
+
+	private _rlmCollectEntryForSession(childId: string, child: AgentSession): RlmCollectResultEntry {
+		const snapshot = this._rlmChildSnapshotForSession(childId, child);
+		return {
+			rlm_child_id: childId,
+			session_name: snapshot.sessionName,
+			session_dir: snapshot.sessionDir,
+			status: snapshot.status,
+			// No run exists (the daemon-recovery shape), so there is no settlement to
+			// wait for; `activity_kind` is what says whether it is working again.
+			settled: true,
+			answer_preview: snapshot.answerPreview,
+			error: snapshot.error,
+			duration_ms: snapshot.durationMs,
+			tool_use_count: snapshot.toolUseCount,
+			replied_since_task: snapshot.repliedSinceTask,
+			activity_kind: snapshot.activity?.kind,
+			terminal_kind: undefined,
+			terminal_reason: undefined,
+			stall_abort: rlmCollectStallAbort(child._lastStallAbort),
+		};
+	}
+
 	private _rlmSubagentMatchesTarget(entry: RlmSubagentRegistryEntry, target: string): boolean {
 		return (
 			entry.rlm_child_id === target ||
@@ -12202,6 +12431,11 @@ export class AgentSession {
 				error: detail.error,
 			});
 		});
+		// Recorded for `collectRlmChildren`, which reads the classification instead
+		// of re-deriving it: by the time a retained run is collected, the reply
+		// baseline this classification used is gone.
+		run.terminalKind = outcome.kind;
+		run.terminalReason = outcome.reason;
 		if (outcome.channel === "none") return;
 		if (outcome.channel === "failure") {
 			const stallAbort = run.stallAbort;

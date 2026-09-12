@@ -31,7 +31,9 @@ if child is not None:
   cwd, status, streaming state, message count, pending count, and a latest
   message preview. The list is restricted to self, parent, siblings, and direct
   children. For direct children, `await rlm.list_subagents()` also exposes
-  parent-owned lifecycle handles.
+  parent-owned lifecycle handles, and `await rlm.collect()` returns typed
+  completion snapshots (status, settled, answer preview, `terminal_kind`,
+  `stall_abort`) in one call without any observation roundtrip.
 - `await agent_observe.get_agent(target)` returns `agent`, where `agent`
   contains one agent summary. `target` is resolved like other live-session
   selectors: active id, session id/name, or unambiguous suffix.

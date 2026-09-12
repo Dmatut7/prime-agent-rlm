@@ -69,7 +69,7 @@ test_review = await rlm("Review the test coverage", name="test-reviewer")
 integration_audit = await rlm("Run the slow integration audit", name="integration-audit")
 ```
 
-Results arrive only through explicit `agent_message` replies or files, never as an `rlm()` return value. Children reply when an answer is needed:
+Results arrive through explicit `agent_message` replies, `rlm.collect()` snapshots, or files, never as an `rlm()` return value. Children reply when an answer is needed:
 
 ```python
 await agent_message.send(message, receiver_role="parent")
@@ -96,6 +96,16 @@ children = await rlm.list_subagents()
 for child in children:
     print(child.session_name, child.status, child.active_session_id)
 ```
+
+For a typed fan-in that does not steer anyone, collect the children instead of waiting on replies:
+
+```python
+results = await rlm.collect(timeout_ms=30_000)
+for entry in results:
+    print(entry.session_name, entry.status, entry.settled, entry.terminal_kind, entry.answer_preview)
+```
+
+`timeout_ms=0` (the default) is a non-blocking read; a positive value blocks only that call, and a timeout returns the current snapshots instead of failing. Nothing is cancelled by the wait. `terminal_kind` and `stall_abort` say how a settled child actually ended - `status` reads `done` even for a child the stall watchdog killed. See [RLM Runtime Architecture](rlm-runtime.md#typed-fan-in-rlmcollect).
 
 Successfully completed daemon-backed children remain addressable while their parent session is open. Delete a child only when its context is no longer needed:
 

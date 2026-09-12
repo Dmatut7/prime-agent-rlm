@@ -463,7 +463,8 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).toContain("Conversation log: /repo/.pi/sessions/session.jsonl");
 		expect(prompt).toContain("await rlm('sub-task')");
 		expect(prompt).toContain("returns at admission, not completion");
-		expect(prompt).toContain("Results arrive only through an available messaging capability or files");
+		expect(prompt).toContain("Results arrive through an available messaging capability");
+		expect(prompt).toContain("await rlm.collect(targets=None, timeout_ms=0)");
 		expect(prompt).toContain("recover direct child handles");
 		expect(prompt).toContain("kernel restart or compaction");
 		expect(prompt).toContain("rlm.list_subagents");

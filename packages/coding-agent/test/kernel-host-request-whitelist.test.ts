@@ -19,6 +19,7 @@ describe("cancellable kernel host request whitelist (P1-2a)", () => {
 		const readOnly = [
 			"rlm.find_models",
 			"rlm.list_subagents",
+			"rlm.collect", // bounded read-only wait; cancelling it cancels no child
 			"model.info",
 			"agent_message.list_agents",
 			"agent_observe.list",

@@ -65,7 +65,7 @@ const REPL_CONTROL_PROMPT = [
 	"",
 	"Terminology: continual harness names the persisted prompt, memory, skill, and subagent layer; RLM names the runtime, Python REPL kernel, and native call interface exposed to the model.",
 	"",
-	"RLM-native call contract: installed Python skills are pre-imported modules. Read the matching SKILL.md and call its documented function, such as `await <skill_import>.<function>(...)`; when a CLI exists, use `<skill_import> ...` from shell. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Spawn a reusable delegation spec with `await rlm('sub-task')`; admission returns a child handle immediately. Results arrive only through an available messaging capability or files, never as an `rlm()` return value. Do not invent non-native wrappers such as `call_skill(...)` or `run_subagent(...)`.",
+	"RLM-native call contract: installed Python skills are pre-imported modules. Read the matching SKILL.md and call its documented function, such as `await <skill_import>.<function>(...)`; when a CLI exists, use `<skill_import> ...` from shell. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Spawn a reusable delegation spec with `await rlm('sub-task')`; admission returns a child handle immediately. Results arrive through an available messaging capability, `await rlm.collect(...)` typed snapshots, or files, never as an `rlm()` return value. Do not invent non-native wrappers such as `call_skill(...)` or `run_subagent(...)`.",
 ].join("\n");
 
 export interface ChildAgentDoctrineOptions {
@@ -176,6 +176,9 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 		} else {
 			parts.push("Use `await rlm.list_subagents()` to recover direct child handles after admission.");
 		}
+		parts.push(
+			"Collect typed results with `await rlm.collect(targets=None, timeout_ms=0)`: one snapshot per direct child (status, settled, answer preview, error, `terminal_kind`, `stall_abort`) without steering anyone and without spending message caps. `timeout_ms` bounds only that call and never rejects - a timeout returns the current snapshots, so waiting is a poll, not a commitment.",
+		);
 		if (hasAgentObserve) {
 			parts.push(
 				"Use `agent_observe` to inspect a child's rollout. Observation is restricted to your parent, siblings, and direct children; relay through the intermediate child for deeper descendants.",
@@ -227,7 +230,8 @@ export function buildSubagentGuidance(
 		lines.push("Use `agent_observe` for bounded transcript inspection.");
 	}
 	lines.push(
-		"Have children write files and read those files for fan-in.",
+		"Fan in results with `await rlm.collect(targets=None, timeout_ms=0)`: it returns typed snapshots of your direct children (status, settled, answer preview, error, and this fork's `terminal_kind` / `stall_abort` markers) without steering anyone and without spending message caps. `timeout_ms` bounds only that call - a timeout returns the current snapshots instead of failing, the host caps one wait at its read-only request budget, and nothing is cancelled by it.",
+		"Large child outputs belong in files that you read selectively; `collect` previews are compact by design, and a child that was killed by the stall watchdog still reports `status='done'`, so read `terminal_kind` before trusting a completion.",
 		"Delegate parallel context-heavy research or independent implementation; do a single known lookup, edit, or command inline.",
 	);
 	if (options.includeRefineExamples ?? true) {

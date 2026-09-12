@@ -101,6 +101,17 @@ await agent_message.send(
 )
 ```
 
+To read long-running children back without steering them, use the typed fan-in:
+
+```python
+results = await rlm.collect(timeout_ms=30_000)
+pending = [entry for entry in results if not entry.settled]
+for entry in results:
+    print(entry.session_name, entry.status, entry.terminal_kind, entry.answer_preview)
+```
+
+One call covers every direct child, so a fan-out of N children costs one host request instead of N message-cap slots or N roster polls. The wait is bounded and non-destructive: `timeout_ms=0` never blocks, a positive `timeout_ms` blocks only that call, and a timeout returns the current snapshots rather than raising - the host also caps one wait inside its read-only request budget (60s by default), so a long fan-in is a poll from the model's side, not a commitment. Children keep running either way; end the turn and collect again later when the work is genuinely long. `terminal_kind` / `stall_abort` distinguish a child the stall watchdog killed from one that finished without replying, which the raw `status` cannot do (both read `done`).
+
 Delivery modes are:
 
 - `auto`: steer a busy target and deliver immediately to an idle target;

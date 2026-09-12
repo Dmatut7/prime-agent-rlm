@@ -221,5 +221,217 @@ class RlmSubagentRegistryTest(unittest.TestCase):
                 asyncio.run(rlm_module.list_subagents())
 
 
+
+class RlmCollectTest(unittest.TestCase):
+    """Typed fan-in (`rlm.collect`), ported from upstream PR #2223 plus fork fields."""
+
+    def test_collect_all_children_returns_typed_results(self) -> None:
+        host_request = AsyncMock(
+            return_value={
+                "results": [
+                    {
+                        "rlm_child_id": "sub-a1b2c3d4",
+                        "session_name": "worker-a",
+                        "session_dir": "/tmp/parent/sub-a1b2c3d4",
+                        "status": "done",
+                        "settled": True,
+                        "answer_preview": "task finished cleanly",
+                        "error": None,
+                        "duration_ms": 4321,
+                        "tool_use_count": 3,
+                        "replied_since_task": False,
+                        "terminal_kind": "completed_without_reply",
+                        "terminal_reason": "completed without sending a reply",
+                        "stall_abort": None,
+                    },
+                    {
+                        "rlm_child_id": "sub-b2c3d4e5",
+                        "session_name": "worker-b",
+                        "session_dir": "/tmp/parent/sub-b2c3d4e5",
+                        "status": "running",
+                        "settled": False,
+                        "answer_preview": None,
+                        "error": None,
+                        "duration_ms": None,
+                        "tool_use_count": None,
+                        "replied_since_task": None,
+                        "activity_kind": "executing",
+                        "terminal_kind": None,
+                        "terminal_reason": None,
+                        "stall_abort": None,
+                    },
+                ],
+                "timeout_ms": 0,
+            }
+        )
+
+        with patch.object(rlm_module, "host_request", host_request):
+            results = asyncio.run(rlm_module.rlm.collect())
+
+        self.assertEqual(len(results), 2)
+        done = results[0]
+        self.assertIsInstance(done, rlm_module.RLMChildResult)
+        self.assertEqual(done.rlm_child_id, "sub-a1b2c3d4")
+        self.assertEqual(done.session_name, "worker-a")
+        self.assertEqual(done.session_dir, Path("/tmp/parent/sub-a1b2c3d4"))
+        self.assertEqual(done.status, "done")
+        self.assertTrue(done.settled)
+        self.assertEqual(done.answer_preview, "task finished cleanly")
+        self.assertIsNone(done.error)
+        self.assertEqual(done.duration_ms, 4321)
+        self.assertEqual(done.tool_use_count, 3)
+        self.assertFalse(done.replied_since_task)
+        self.assertEqual(done.terminal_kind, "completed_without_reply")
+        self.assertEqual(done.terminal_reason, "completed without sending a reply")
+        self.assertIsNone(done.stall_abort)
+        running = results[1]
+        self.assertEqual(running.status, "running")
+        self.assertFalse(running.settled)
+        self.assertIsNone(running.answer_preview)
+        self.assertEqual(running.activity_kind, "executing")
+        self.assertIsNone(running.terminal_kind)
+        host_request.assert_awaited_once_with("rlm.collect", {"targets": [], "timeout_ms": 0})
+
+    def test_collect_exposes_stall_watchdog_facts(self) -> None:
+        """Fork enhancement: a watchdog kill must be distinguishable from a no-reply finish."""
+        host_request = AsyncMock(
+            return_value={
+                "results": [
+                    {
+                        "rlm_child_id": "sub-stalled",
+                        "session_name": "stall-worker",
+                        "session_dir": "/tmp/parent/sub-stalled",
+                        "status": "done",
+                        "settled": True,
+                        "answer_preview": "the turn ended after the abort",
+                        "error": None,
+                        "duration_ms": 900,
+                        "tool_use_count": 1,
+                        "replied_since_task": False,
+                        "activity_kind": "stalled",
+                        "terminal_kind": "stall_killed",
+                        "terminal_reason": "killed by the stall watchdog after 933s of silence",
+                        "stall_abort": {
+                            "silent_ms": 933000,
+                            "threshold_ms": 900000,
+                            "in_flight_tools": ["hang_forever"],
+                            "kernel_reasons": ["no_kernel_heartbeat"],
+                            "settled": True,
+                        },
+                    }
+                ]
+            }
+        )
+
+        with patch.object(rlm_module, "host_request", host_request):
+            (result,) = asyncio.run(rlm_module.rlm.collect(["stall-worker"], timeout_ms=1000))
+
+        self.assertEqual(result.terminal_kind, "stall_killed")
+        self.assertEqual(result.activity_kind, "stalled")
+        stall = result.stall_abort
+        self.assertIsInstance(stall, rlm_module.RLMChildStallAbort)
+        self.assertEqual(stall.silent_ms, 933000)
+        self.assertEqual(stall.threshold_ms, 900000)
+        self.assertEqual(stall.in_flight_tools, ("hang_forever",))
+        self.assertEqual(stall.kernel_reasons, ("no_kernel_heartbeat",))
+        self.assertTrue(stall.settled)
+        host_request.assert_awaited_once_with(
+            "rlm.collect", {"targets": ["stall-worker"], "timeout_ms": 1000}
+        )
+
+    def test_collect_normalizes_spawn_handles_and_names(self) -> None:
+        host_request = AsyncMock(return_value={"results": []})
+        handle = rlm_module.RLMSpawnHandle(
+            rlm_child_id="sub-h1",
+            name="worker-h",
+            session_dir=Path("/tmp/parent/sub-h1"),
+            model="faux/faux-model",
+        )
+        row = rlm_module.RLMSubagent(
+            rlm_child_id="sub-r1",
+            active_session_id=None,
+            session_id=None,
+            session_name="worker-r",
+            session_dir=Path("/tmp/parent/sub-r1"),
+            status="completed",
+        )
+
+        with patch.object(rlm_module, "host_request", host_request):
+            results = asyncio.run(rlm_module.rlm.collect([handle, row, "worker-b"], timeout_ms=250))
+
+        self.assertEqual(results, [])
+        host_request.assert_awaited_once_with(
+            "rlm.collect", {"targets": ["sub-h1", "sub-r1", "worker-b"], "timeout_ms": 250}
+        )
+
+    def test_collect_accepts_a_single_target(self) -> None:
+        host_request = AsyncMock(return_value={"results": []})
+
+        with patch.object(rlm_module, "host_request", host_request):
+            asyncio.run(rlm_module.rlm.collect("worker-b"))
+
+        host_request.assert_awaited_once_with("rlm.collect", {"targets": ["worker-b"], "timeout_ms": 0})
+
+    def test_collect_validates_arguments(self) -> None:
+        with self.assertRaisesRegex(TypeError, "timeout_ms"):
+            asyncio.run(rlm_module.rlm.collect(timeout_ms=-1))
+        with self.assertRaisesRegex(TypeError, "timeout_ms"):
+            asyncio.run(rlm_module.rlm.collect(timeout_ms="soon"))
+        with self.assertRaisesRegex(TypeError, "timeout_ms"):
+            asyncio.run(rlm_module.rlm.collect(timeout_ms=True))
+        with self.assertRaisesRegex(TypeError, "targets must be"):
+            asyncio.run(rlm_module.rlm.collect(42))
+        with self.assertRaisesRegex(TypeError, "collect target"):
+            asyncio.run(rlm_module.rlm.collect(["ok", ""]))
+
+    def test_collect_rejects_invalid_payloads(self) -> None:
+        invalid_payloads = [
+            ({"results": "nope"}, "invalid results list"),
+            ({"results": ["nope"]}, "invalid result entry"),
+            ({"results": [{"status": "done", "settled": True}]}, "missing rlm_child_id"),
+            ({"results": [{"rlm_child_id": "sub-x", "status": "nonsense", "settled": True}]}, "invalid status"),
+            ({"results": [{"rlm_child_id": "sub-x", "status": "done", "settled": "yes"}]}, "invalid settled"),
+            (
+                {"results": [{"rlm_child_id": "sub-x", "status": "done", "settled": True, "terminal_kind": "weird"}]},
+                "invalid terminal_kind",
+            ),
+            (
+                {
+                    "results": [
+                        {
+                            "rlm_child_id": "sub-x",
+                            "status": "done",
+                            "settled": True,
+                            "stall_abort": {"silent_ms": "lots"},
+                        }
+                    ]
+                },
+                "stall_abort has invalid silent_ms",
+            ),
+            (
+                {
+                    "results": [
+                        {"rlm_child_id": "sub-x", "status": "done", "settled": True, "duration_ms": "4321"}
+                    ]
+                },
+                "invalid duration_ms",
+            ),
+            (
+                {
+                    "results": [
+                        {"rlm_child_id": "sub-x", "status": "done", "settled": True, "activity_kind": 3}
+                    ]
+                },
+                "invalid activity_kind",
+            ),
+        ]
+        self.assertGreater(len(invalid_payloads), 0)
+        for payload, expected in invalid_payloads:
+            host_request = AsyncMock(return_value=payload)
+            with patch.object(rlm_module, "host_request", host_request):
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    asyncio.run(rlm_module.rlm.collect())
+
+
 if __name__ == "__main__":
     unittest.main()

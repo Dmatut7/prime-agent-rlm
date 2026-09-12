@@ -37,6 +37,48 @@ class RLMSubagent:
     status: str
 
 
+@dataclass(frozen=True)
+class RLMChildStallAbort:
+    """Stall-watchdog kill facts for one child, from `collect()`.
+
+    ``settled`` is False while the watchdog aborted but the run never produced
+    ``agent_end``: "killed" is then not yet a fact and the child may recover.
+    """
+
+    silent_ms: int
+    threshold_ms: int
+    in_flight_tools: tuple[str, ...]
+    kernel_reasons: tuple[str, ...] | None
+    settled: bool
+
+
+@dataclass(frozen=True)
+class RLMChildResult:
+    """Terminal or in-progress state of one direct child, from `collect()`.
+
+    ``status`` is the raw run status and reads "done" for a child the stall
+    watchdog killed, so ``terminal_kind`` / ``stall_abort`` are the fields that
+    say how the run actually ended. Both are None while the run is in flight.
+    ``activity_kind`` is the live activity (waiting/writing/executing/stalled)
+    and the only "still working" signal for a child retained without a run.
+    """
+
+    rlm_child_id: str
+    session_name: str | None
+    session_dir: Path | None
+    status: str
+    settled: bool
+    answer_preview: str | None
+    error: str | None
+    duration_ms: int | None
+    tool_use_count: int | None
+    replied_since_task: bool | None
+    activity_kind: str | None
+    terminal_kind: str | None
+    terminal_reason: str | None
+    stall_abort: RLMChildStallAbort | None
+
+
 def _spawn_handle_from_payload(payload: Any) -> RLMSpawnHandle:
     if not isinstance(payload, dict):
         raise RuntimeError("rlm.run returned an invalid spawn handle")
@@ -167,6 +209,149 @@ async def list_subagents() -> list[RLMSubagent]:
     return [_subagent_from_payload(entry) for entry in entries]
 
 
+_RLM_CHILD_RUN_STATUSES = frozenset({"queued", "running", "done", "error", "cancelled"})
+_RLM_CHILD_TERMINAL_KINDS = frozenset(
+    {"stall_killed", "aborted", "error", "cancelled", "completed_without_reply", "none"}
+)
+
+
+def _collect_target_selector(target: Any) -> str:
+    """Normalize a collect target: spawn handle, subagent row, or a name/id string."""
+    if isinstance(target, (RLMSpawnHandle, RLMSubagent)):
+        return target.rlm_child_id
+    if isinstance(target, str) and target.strip():
+        return target.strip()
+    raise TypeError(
+        f"collect target must be RLMSpawnHandle, RLMSubagent, or non-empty str, got {type(target).__name__}"
+    )
+
+
+def _optional_str(payload: dict[str, Any], field: str) -> str | None:
+    value = payload.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise RuntimeError(f"rlm.collect entry has invalid {field}")
+    return value
+
+
+def _optional_int(payload: dict[str, Any], field: str) -> int | None:
+    value = payload.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise RuntimeError(f"rlm.collect entry has invalid {field}")
+    return value
+
+
+def _stall_abort_from_payload(payload: Any) -> RLMChildStallAbort | None:
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        raise RuntimeError("rlm.collect entry has invalid stall_abort")
+    silent_ms = payload.get("silent_ms")
+    threshold_ms = payload.get("threshold_ms")
+    for field, value in (("silent_ms", silent_ms), ("threshold_ms", threshold_ms)):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise RuntimeError(f"rlm.collect stall_abort has invalid {field}")
+    in_flight = payload.get("in_flight_tools")
+    if not isinstance(in_flight, list) or any(not isinstance(tool, str) for tool in in_flight):
+        raise RuntimeError("rlm.collect stall_abort has invalid in_flight_tools")
+    kernel_reasons = payload.get("kernel_reasons")
+    if kernel_reasons is not None and (
+        not isinstance(kernel_reasons, list) or any(not isinstance(reason, str) for reason in kernel_reasons)
+    ):
+        raise RuntimeError("rlm.collect stall_abort has invalid kernel_reasons")
+    settled = payload.get("settled")
+    if not isinstance(settled, bool):
+        raise RuntimeError("rlm.collect stall_abort has invalid settled flag")
+    return RLMChildStallAbort(
+        silent_ms=silent_ms,
+        threshold_ms=threshold_ms,
+        in_flight_tools=tuple(in_flight),
+        kernel_reasons=tuple(kernel_reasons) if kernel_reasons is not None else None,
+        settled=settled,
+    )
+
+
+def _child_result_from_payload(payload: Any) -> RLMChildResult:
+    if not isinstance(payload, dict):
+        raise RuntimeError("rlm.collect returned an invalid result entry")
+    child_id = payload.get("rlm_child_id")
+    if not isinstance(child_id, str) or not child_id:
+        raise RuntimeError("rlm.collect entry is missing rlm_child_id")
+    status = payload.get("status")
+    if status not in _RLM_CHILD_RUN_STATUSES:
+        raise RuntimeError("rlm.collect entry has invalid status")
+    settled = payload.get("settled")
+    if not isinstance(settled, bool):
+        raise RuntimeError("rlm.collect entry has invalid settled flag")
+    terminal_kind = payload.get("terminal_kind")
+    if terminal_kind is not None and terminal_kind not in _RLM_CHILD_TERMINAL_KINDS:
+        raise RuntimeError("rlm.collect entry has invalid terminal_kind")
+    replied = payload.get("replied_since_task")
+    if replied is not None and not isinstance(replied, bool):
+        raise RuntimeError("rlm.collect entry has invalid replied_since_task")
+    session_dir = _optional_str(payload, "session_dir")
+    return RLMChildResult(
+        rlm_child_id=child_id,
+        session_name=_optional_str(payload, "session_name"),
+        session_dir=Path(session_dir) if session_dir else None,
+        status=status,
+        settled=settled,
+        answer_preview=_optional_str(payload, "answer_preview"),
+        error=_optional_str(payload, "error"),
+        duration_ms=_optional_int(payload, "duration_ms"),
+        tool_use_count=_optional_int(payload, "tool_use_count"),
+        replied_since_task=replied,
+        activity_kind=_optional_str(payload, "activity_kind"),
+        terminal_kind=terminal_kind,
+        terminal_reason=_optional_str(payload, "terminal_reason"),
+        stall_abort=_stall_abort_from_payload(payload.get("stall_abort")),
+    )
+
+
+async def collect(
+    targets: Any = None,
+    *,
+    timeout_ms: int = 0,
+) -> list[RLMChildResult]:
+    """Collect typed results from direct RLM children.
+
+    ``targets`` selects children: spawn handles, subagent rows, name strings, or a
+    list mixing all three. ``None`` (or an empty list) selects every direct child
+    that is not being deleted.
+
+    ``timeout_ms`` bounds the wait for the selected children to settle: 0 returns a
+    non-blocking snapshot immediately; a positive value blocks only this kernel call
+    until the runs settle or the timeout elapses. A timeout returns current
+    snapshots, never an error, and the parent session is never steered; the host
+    caps one wait at its read-only request budget, so a long ``timeout_ms`` is a
+    poll, not a commitment. Completed children keep their result until deleted, so a
+    later ``collect`` re-reads them without waiting.
+
+    Each entry carries ``terminal_kind`` and ``stall_abort`` next to the raw
+    ``status``: a child killed by the stall watchdog still reports ``status="done"``,
+    and only these two fields distinguish the kill from a child that finished
+    without replying.
+    """
+    if not isinstance(timeout_ms, int) or isinstance(timeout_ms, bool) or timeout_ms < 0:
+        raise TypeError("timeout_ms must be a non-negative int")
+    if targets is None:
+        selectors: list[str] = []
+    elif isinstance(targets, (RLMSpawnHandle, RLMSubagent, str)):
+        selectors = [_collect_target_selector(targets)]
+    elif isinstance(targets, (list, tuple)):
+        selectors = [_collect_target_selector(target) for target in targets]
+    else:
+        raise TypeError(f"targets must be None, a target, or a list of targets, got {type(targets).__name__}")
+    payload = await host_request("rlm.collect", {"targets": selectors, "timeout_ms": timeout_ms})
+    results = payload.get("results")
+    if not isinstance(results, list):
+        raise RuntimeError("rlm.collect returned an invalid results list")
+    return [_child_result_from_payload(entry) for entry in results]
+
+
 async def delete_subagent(target: str | RLMSubagent) -> RLMSubagent:
     """Delete one running or retained direct child from the current parent session."""
     if isinstance(target, RLMSubagent):
@@ -243,6 +428,9 @@ class _RLMCallable:
     async def list_subagents(self) -> list[RLMSubagent]:
         return await list_subagents()
 
+    async def collect(self, targets: Any = None, *, timeout_ms: int = 0) -> list[RLMChildResult]:
+        return await collect(targets, timeout_ms=timeout_ms)
+
     async def delete_subagent(self, target: str | RLMSubagent) -> RLMSubagent:
         return await delete_subagent(target)
 
@@ -270,11 +458,14 @@ __all__ = [
     "McpIntegration",
     "McpToolError",
     "NotEnabled",
+    "RLMChildResult",
+    "RLMChildStallAbort",
     "RLMModel",
     "RLMSpawnHandle",
     "RLMSubagent",
     "RefinementEvent",
     "bash",
+    "collect",
     "delete_subagent",
     "emit",
     "find_models",

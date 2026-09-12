@@ -1,8 +1,9 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, Model, ServiceTier } from "@earendil-works/pi-ai";
-import type { AgentSession } from "./agent-session.js";
+import type { AgentSession, RlmChildAgentActivity, RlmChildAgentStatus } from "./agent-session.js";
 import type { ToolDefinition } from "./extensions/index.js";
 import type { HostRequestHandler } from "./kernel/index.js";
+import type { RlmChildStallAbortFacts, RlmChildTerminalOutcomeKind } from "./rlm-child-terminal.js";
 import { THINKING_LEVELS } from "./thinking-levels.js";
 
 /** Request emitted by `rlm.run`; cellSourceCode preserves the spawning cell for display. */
@@ -49,6 +50,63 @@ export interface RlmModelMatch {
 export interface RlmFindModelsResult {
 	models: RlmModelMatch[];
 }
+
+/** Stall-watchdog kill facts as `rlm.collect` publishes them. */
+export interface RlmCollectStallAbort {
+	silent_ms: number;
+	threshold_ms: number;
+	in_flight_tools: string[];
+	kernel_reasons?: string[];
+	/**
+	 * False while the watchdog aborted but the run never produced `agent_end`:
+	 * "killed" is then not yet a fact, and the run may still recover.
+	 */
+	settled: boolean;
+}
+
+export interface RlmCollectResultEntry {
+	rlm_child_id: string;
+	session_name: string | undefined;
+	session_dir: string;
+	/** Raw run status: queued | running | done | error | cancelled. */
+	status: RlmChildAgentStatus;
+	/** True once the run reached a terminal state (its settlement resolved or rejected). */
+	settled: boolean;
+	answer_preview: string | undefined;
+	error: string | undefined;
+	duration_ms: number | undefined;
+	tool_use_count: number | undefined;
+	replied_since_task: boolean | undefined;
+	/**
+	 * Live activity at snapshot time (waiting | writing | executing | stalled),
+	 * undefined when idle. For a child retained without a run - the daemon-recovery
+	 * shape - this is the only signal that it is working on a follow-up, because its
+	 * `status` stays "done" for the recorded task.
+	 */
+	activity_kind: RlmChildAgentActivity["kind"] | undefined;
+	/**
+	 * The terminal classification the run's own terminal path recorded (P0-2a
+	 * four-state table). Undefined while the run is in flight, and undefined for
+	 * a child whose notice path never ran - a suppressed or explicitly deleted
+	 * child, or one rehydrated without a run. `status` cannot substitute for it:
+	 * a watchdog kill finishes the turn, so its raw status reads "done".
+	 */
+	terminal_kind: RlmChildTerminalOutcomeKind | undefined;
+	/** Model-facing reason recorded alongside {@link terminal_kind}. */
+	terminal_reason: string | undefined;
+	/** Watchdog facts, present even when no failure notice was delivered. */
+	stall_abort: RlmCollectStallAbort | undefined;
+}
+
+export interface RlmCollectResult {
+	results: RlmCollectResultEntry[];
+}
+
+export type RlmCollectHandler = (
+	targets: string[],
+	timeoutMs: number,
+	signal?: AbortSignal,
+) => Promise<RlmCollectResult>;
 
 export type RlmRunHandler = (request: RlmRunRequest, signal?: AbortSignal) => Promise<Record<string, unknown>>;
 export type RlmListSubagentsHandler = () => RlmListSubagentsResult | Promise<RlmListSubagentsResult>;
@@ -211,6 +269,106 @@ export function createRlmDeleteSubagentHostHandler(handler: RlmDeleteSubagentHan
 		}
 		const { subagent, outcome } = await handler(payload.target.trim());
 		return outcome === undefined ? { subagent } : { subagent, outcome };
+	};
+}
+
+/**
+ * Largest `timeout_ms` a collect may ask for. Node clamps a `setTimeout` delay
+ * above 2^31-1 to 1ms, so an oversized value would silently turn a long wait
+ * into an immediate snapshot; rejecting it keeps the request honest.
+ */
+export const RLM_COLLECT_MAX_TIMEOUT_MS = 2_147_483_647;
+
+/**
+ * Head-room kept below the kernel's read-only host-request bound. The kernel
+ * bounds every cancellable (read-only) host request at
+ * `readOnlyHostRequestTimeoutMs`; a collect that waited right up to that value
+ * would race the kernel's own bound and lose, turning "here are the current
+ * snapshots" into "the host request failed". Staying inside the bound keeps the
+ * collect contract - it never rejects on timeout - true in the real runtime.
+ */
+export const RLM_COLLECT_WAIT_MARGIN_MS = 2_000;
+
+/**
+ * The wait one collect call may actually take: the requested bound, kept inside
+ * the host's read-only request budget. A budget smaller than the margin keeps
+ * half of itself instead of collapsing to a non-blocking read.
+ */
+export function clampRlmCollectWaitMs(requestedMs: number, boundMs: number | undefined): number {
+	if (!Number.isFinite(requestedMs) || requestedMs <= 0) return 0;
+	if (boundMs === undefined || !Number.isFinite(boundMs) || boundMs <= 0) return requestedMs;
+	const headroom =
+		boundMs > RLM_COLLECT_WAIT_MARGIN_MS ? boundMs - RLM_COLLECT_WAIT_MARGIN_MS : Math.floor(boundMs / 2);
+	return Math.min(requestedMs, headroom);
+}
+
+/** Project recorded watchdog facts onto the collect wire shape. */
+export function rlmCollectStallAbort(facts: RlmChildStallAbortFacts | undefined): RlmCollectStallAbort | undefined {
+	if (!facts) return undefined;
+	const kernelReasons = facts.kernelReasons ?? [];
+	return {
+		silent_ms: facts.silentMs,
+		threshold_ms: facts.thresholdMs,
+		in_flight_tools: [...facts.inFlightTools],
+		...(kernelReasons.length > 0 ? { kernel_reasons: [...kernelReasons] } : {}),
+		settled: facts.settled,
+	};
+}
+
+export interface CreateRlmCollectHostHandlerOptions {
+	/**
+	 * The kernel's read-only host-request bound, read live so an operator tuning
+	 * the wait setting does not have to restart the session. Undefined or
+	 * non-finite means "no bound" (the documented rollback lever).
+	 */
+	maxWaitMs?: () => number | undefined;
+	/** Reported when a requested wait was cut down to that bound. */
+	onClamped?: (facts: { requestedMs: number; effectiveMs: number }) => void;
+}
+
+/**
+ * Typed fan-in for subagent results: `rlm.collect` waits (bounded) for the
+ * selected direct children's runs to settle and returns result envelopes.
+ *
+ * Never steers the parent and never rejects on timeout: a timeout - or a cell
+ * abort - returns the current snapshots so the caller can end its turn, poll, or
+ * retry, and nothing behind the wait is cancelled.
+ */
+export function createRlmCollectHostHandler(
+	handler: RlmCollectHandler,
+	options?: CreateRlmCollectHostHandlerOptions,
+): HostRequestHandler {
+	return async (payload, signal) => {
+		const rawTargets = payload.targets;
+		if (rawTargets !== undefined && rawTargets !== null && !Array.isArray(rawTargets)) {
+			throw new Error("rlm.collect targets must be an array of child ids or names");
+		}
+		const targets = (rawTargets ?? []).map((target) => {
+			if (typeof target !== "string" || !target.trim()) {
+				throw new Error("rlm.collect targets must be non-empty strings");
+			}
+			return target.trim();
+		});
+		const rawTimeout = payload.timeout_ms;
+		if (rawTimeout !== undefined && rawTimeout !== null) {
+			if (
+				typeof rawTimeout !== "number" ||
+				!Number.isSafeInteger(rawTimeout) ||
+				rawTimeout < 0 ||
+				rawTimeout > RLM_COLLECT_MAX_TIMEOUT_MS
+			) {
+				throw new Error(
+					`rlm.collect timeout_ms must be a non-negative integer up to ${RLM_COLLECT_MAX_TIMEOUT_MS}`,
+				);
+			}
+		}
+		const requestedMs = typeof rawTimeout === "number" ? rawTimeout : 0;
+		const timeoutMs = clampRlmCollectWaitMs(requestedMs, options?.maxWaitMs?.());
+		if (timeoutMs !== requestedMs) {
+			options?.onClamped?.({ requestedMs, effectiveMs: timeoutMs });
+		}
+		const { results } = await handler(targets, timeoutMs, signal);
+		return { results, timeout_ms: timeoutMs };
 	};
 }
 
