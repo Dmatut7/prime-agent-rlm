@@ -5936,6 +5936,7 @@ export class InteractiveMode {
 					this.chatContainer.children.at(-1) instanceof ToolExecutionComponent ||
 					this.chatContainer.children.at(-1) instanceof AgentMessageComponent,
 				mermaidTransform: this.mermaidMarkdownTransform,
+				cwd: this.getCurrentCwd(),
 			},
 		);
 		this.streamingMessage = message;
@@ -6593,6 +6594,7 @@ export class InteractiveMode {
 							this.chatContainer.children.at(-1) instanceof ToolExecutionComponent ||
 							this.chatContainer.children.at(-1) instanceof AgentMessageComponent,
 						mermaidTransform: this.mermaidMarkdownTransform,
+						cwd: this.getCurrentCwd(),
 					},
 				);
 				this.chatContainer.addChild(assistantComponent);
