@@ -286,6 +286,22 @@ export function shouldOpenAgentsViewForDaemonInteractive(options: AgentsViewStar
 	);
 }
 
+export interface DaemonCreatePrefireDecision {
+	resume?: true | string;
+	explicitAgentsView?: boolean;
+}
+
+/**
+ * The daemon create RPC may fire before the client-side prepare only when the
+ * agents-view detour is ruled out: that path returns without consuming the
+ * created connection. Bare --resume always detours and `agents` detours unless
+ * onboarding is pending, and onboarding is not known until prepare finished,
+ * so neither may prefire.
+ */
+export function shouldPrefireDaemonCreateForDaemonInteractive(options: DaemonCreatePrefireDecision): boolean {
+	return options.resume !== true && !options.explicitAgentsView;
+}
+
 export interface DaemonInteractiveSessionManagerDecision {
 	resume?: true | string;
 	continue?: boolean;
@@ -1108,6 +1124,51 @@ async function findAttachedDaemonSessionSummary(
 	return response.data;
 }
 
+interface DaemonInteractivePrefire {
+	readySettled: Promise<DaemonReadyResult>;
+	connection: Promise<{ connection: DaemonAgentConnection; summary: SessionSummary }>;
+}
+
+/**
+ * Kick off daemon readiness (including a stale-daemon takeover) and the
+ * create/attach RPC without waiting for the client-side prepare. The create
+ * only starts once readiness settles, so the "caller must have awaited
+ * ensureInteractiveDaemonRunning" contract of createDaemonClientConnection
+ * still holds.
+ */
+function prefireDaemonInteractiveConnection(
+	daemonReady: Promise<void> | undefined,
+	create: () => Promise<{ connection: DaemonAgentConnection; summary: SessionSummary }>,
+): DaemonInteractivePrefire {
+	const readySettled = awaitDaemonReady(daemonReady);
+	const connection = readySettled.then(() => create());
+	// Errors are rethrown at the await sites; these guards only avoid unhandled
+	// rejections if startup exits before reaching them.
+	readySettled.catch(() => {});
+	connection.catch(() => {});
+	return { readySettled, connection };
+}
+
+/**
+ * Clean up a prefire whose connection the startup never consumed: let an
+ * in-flight create settle, then detach it (an unused draft session is
+ * discarded on detach; a client-owned session is completed) and close the
+ * client. A rejected create cleaned itself up already.
+ */
+async function disposePrefiredDaemonConnection(prefire: DaemonInteractivePrefire | undefined): Promise<void> {
+	if (!prefire) {
+		return;
+	}
+	const created = await prefire.connection.then(
+		(value) => value,
+		() => undefined,
+	);
+	if (!created) {
+		return;
+	}
+	await created.connection.dispose().catch(() => undefined);
+}
+
 export interface MainOptions {
 	extensionFactories?: ExtensionFactory[];
 }
@@ -1371,29 +1432,66 @@ export async function main(args: string[], options?: MainOptions) {
 		return;
 	}
 	if (useDaemonInteractive) {
-		const prepared = await prepareRuntimeServices({
+		// Startup concurrency: the daemon create/attach RPC (worker spawn +
+		// worker-side session creation) is the longest tail of cold interactive
+		// start and does not depend on the client-side prepare below, so fire it
+		// concurrently and await both before wiring the session. Client prepare
+		// and worker create each resolve resources for their own process; that
+		// duplicate work cannot be shared across the process boundary, but
+		// overlapping the two chains hides its cost instead of paying it serially.
+		const daemonConnectionOptions = {
+			socketPath: daemonSocketPath,
 			config: defaultSessionConfig,
-			cwd: sessionManager.getCwd(),
-			agentDir,
-			sessionManager,
-			extensionFactories: options?.extensionFactories,
-		});
+			activeSessionId: activeDaemonSessionSummary
+				? getDaemonSummaryActiveSessionId(activeDaemonSessionSummary)
+				: undefined,
+			sessionPath: getInteractiveDaemonSessionPath(parsed, sessionManager),
+			clientOwned: parsed.noSession,
+			noSession: parsed.noSession,
+			supportsExtensionUi: true,
+		};
+		const prefire = shouldPrefireDaemonCreateForDaemonInteractive({
+			resume: parsed.resume,
+			explicitAgentsView,
+		})
+			? prefireDaemonInteractiveConnection(daemonReady, () => createDaemonClientConnection(daemonConnectionOptions))
+			: undefined;
+
+		let prepared: PreparedRuntimeServices;
+		let startupModel: Awaited<ReturnType<typeof resolvePreparedStartupModel>>;
+		let initialMessage: string | undefined;
+		let initialImages: ImageContent[] | undefined;
+		try {
+			prepared = await prepareRuntimeServices({
+				config: defaultSessionConfig,
+				cwd: sessionManager.getCwd(),
+				agentDir,
+				sessionManager,
+				extensionFactories: options?.extensionFactories,
+			});
+			const { settingsManager } = prepared.services;
+
+			startupModel = await resolvePreparedStartupModel({ prepared, sessionManager });
+
+			const stdinContent = await readPipedStdin();
+			time("readPipedStdin");
+
+			({ initialMessage, initialImages } = await prepareInitialMessage(
+				parsed,
+				settingsManager.getImageAutoResize(),
+				stdinContent,
+			));
+			time("prepareInitialMessage");
+			initTheme(settingsManager.getTheme(), true);
+			time("initTheme");
+		} catch (error) {
+			// The client side failed while the create may be in flight: detach the
+			// half-created daemon session before propagating.
+			await disposePrefiredDaemonConnection(prefire);
+			throw error;
+		}
 		const { services, scopedModels } = prepared;
 		const { settingsManager } = services;
-
-		const startupModel = await resolvePreparedStartupModel({ prepared, sessionManager });
-
-		const stdinContent = await readPipedStdin();
-		time("readPipedStdin");
-
-		const { initialMessage, initialImages } = await prepareInitialMessage(
-			parsed,
-			settingsManager.getImageAutoResize(),
-			stdinContent,
-		);
-		time("prepareInitialMessage");
-		initTheme(settingsManager.getTheme(), true);
-		time("initTheme");
 
 		if (deprecationWarnings.length > 0) {
 			await showDeprecationWarnings(deprecationWarnings);
@@ -1401,6 +1499,7 @@ export async function main(args: string[], options?: MainOptions) {
 
 		reportDiagnostics(prepared.diagnostics);
 		if (prepared.diagnostics.some((diagnostic) => diagnostic.type === "error")) {
+			await disposePrefiredDaemonConnection(prefire);
 			process.exit(1);
 		}
 		time("prepareInteractiveServices");
@@ -1475,7 +1574,14 @@ export async function main(args: string[], options?: MainOptions) {
 			return;
 		}
 
-		daemonReady = (await awaitDaemonReady(daemonReady)).ready;
+		if (prefire) {
+			// Readiness (including a stale-daemon takeover) is already being handled
+			// inside the prefire chain; reuse its settled result instead of handling
+			// the same rejection twice.
+			daemonReady = (await prefire.readySettled).ready;
+		} else {
+			daemonReady = (await awaitDaemonReady(daemonReady)).ready;
+		}
 		// A fresh default chat opens a real but message-less session; the lifecycle
 		// axis treats it as a draft (hidden, discarded on detach if never used), so
 		// no DeferredAgentConnection is needed to avoid creating it up front.
@@ -1484,17 +1590,8 @@ export async function main(args: string[], options?: MainOptions) {
 		let connection: DaemonAgentConnection;
 		let summary: SessionSummary;
 		try {
-			({ connection, summary } = await createDaemonClientConnection({
-				socketPath: daemonSocketPath,
-				config: defaultSessionConfig,
-				activeSessionId: activeDaemonSessionSummary
-					? getDaemonSummaryActiveSessionId(activeDaemonSessionSummary)
-					: undefined,
-				sessionPath: getInteractiveDaemonSessionPath(parsed, sessionManager),
-				clientOwned: parsed.noSession,
-				noSession: parsed.noSession,
-				supportsExtensionUi: true,
-			}));
+			({ connection, summary } = await (prefire?.connection ??
+				createDaemonClientConnection(daemonConnectionOptions)));
 		} catch (error) {
 			if (error instanceof DaemonSessionCreateError) {
 				console.error(chalk.red(`Error: ${error.message}`));

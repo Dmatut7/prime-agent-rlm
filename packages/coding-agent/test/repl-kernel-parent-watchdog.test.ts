@@ -70,12 +70,15 @@ describe("repl kernel parent watchdog", () => {
 
 		expect(readFileSync(envDump, "utf8")).toMatch(new RegExp(`^PRIME_AGENT_KERNEL_OWNER_PID=${process.pid}$`, "m"));
 
-		// Self-exited child: the kill signals nothing, so the record must stay active.
+		// Self-exited child: the kill signals nothing, so no record may deactivate it.
+		// The deferred start-id capture can append a second record for the same pid.
 		await vi.waitFor(() => {
 			const records = readJournalRecords(journalPath);
-			expect(records).toHaveLength(1);
-			expect(records[0]?.ownerPid).toBe(process.pid);
-			expect(records[0]?.active).toBe(true);
+			expect(records.length).toBeGreaterThan(0);
+			for (const record of records) {
+				expect(record.ownerPid).toBe(process.pid);
+				expect(record.active).toBe(true);
+			}
 		});
 	});
 

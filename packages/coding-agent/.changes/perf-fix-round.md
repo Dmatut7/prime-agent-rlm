@@ -1,0 +1,7 @@
+- Fixed OSC 133 zone markers accumulating on memoized render arrays every frame (unbounded string growth and full-viewport repaints in inline mode).
+- Made border/text leaf components render-cache compliant so the transcript stops rebuilding every frame in fullscreen mode.
+- Throttled per-chunk JSON re-parse of streaming tool-call arguments in the providers that re-parsed per chunk (anthropic, openai-completions, bedrock, openai-responses; mistral is unchanged), and encoded OpenRouter reasoning details once at stream end instead of per chunk.
+- Kernel: skip unchanged namespace re-serialization between turns and coalesce stream frames, while the terminal snapshot at shutdown always writes through; roster publishing is now incremental instead of a full rebuild per session event.
+- Reduced journal syscall storms: process-start identity is captured asynchronously (no synchronous ps per spawn on macOS), per-record chmods dropped, and command journals compact on size thresholds instead of after every ack.
+- TUI: bang-command output appends tails instead of re-deriving everything per chunk; bash streaming preview styles only the visible tail window.
+- Cold interactive start now prefires the daemon create RPC concurrently with client-side prepare.

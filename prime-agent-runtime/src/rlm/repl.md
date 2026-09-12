@@ -61,7 +61,7 @@ it.
 | `execute` | `{"type":"execute","id":str,"code":str}` |
 | `interrupt` | `{"type":"interrupt","id"?:str}` — no reply |
 | `host_reply` | `{"type":"host_reply","id":str,"data":{"status":"ok","result":{...}}}` or an error envelope — no reply |
-| `snapshot` | `{"type":"snapshot","id":str,"path":str,"manifest_path":str,"max_bytes"?:int,"max_variable_bytes"?:int,"prune_oversized"?:bool,"preserve_names"?:[str,...]}` — `preserve_names` needs the negotiated protocol 4 and the `preserve_names` capability token |
+| `snapshot` | `{"type":"snapshot","id":str,"path":str,"manifest_path":str,"max_bytes"?:int,"max_variable_bytes"?:int,"prune_oversized"?:bool,"final"?:bool,"preserve_names"?:[str,...]}` — `preserve_names` needs the negotiated protocol 4 and the `preserve_names` capability token; `final` is ungated, a runtime without the snapshot replay shortcut ignores it |
 | `restore` | `{"type":"restore","id":str,"path":str}` |
 | `list_names` | `{"type":"list_names","id":str}` |
 | `shutdown` | `{"type":"shutdown","id"?:str}` |
@@ -107,12 +107,19 @@ runtime keeps serving. Closing stdin is equivalent to `shutdown`.
   `reason`. Restoring a missing file reports `status:"ok"` with empty
   `restored`/`failed` lists and `reason:"snapshot not found"`.
 
-Before a cell's `done`, the runtime drains both channels: tagged Python-level
-writes ship synchronously from the writing thread, and the fd pipes are fenced
-with a marker byte sequence awaited in the pumps, so every byte the cell wrote
-synchronously — including direct fd writes — precedes its `done`. Ordering
-between a cell's Python-level writes and its raw fd writes is not guaranteed
-(two channels).
+Tagged Python-level writes are coalesced: text is batched per (stream, cell id)
+and ships as one frame when the stream is flushed (`flush=True`, drain), when
+an entry outgrows 64 KiB, or ~5 ms after the first buffered write — whichever
+comes first. Frame boundaries carry no meaning (the host concatenates `text`
+per stream), ordering and id attribution do: writes are buffered in arrival
+order with the id captured at write time, and `emit()`/`host_request` flush
+first so a cell's own output precedes its display/host-request frames.
+
+Before a cell's `done`, the runtime drains both channels: buffered tagged
+writes are flushed, and the fd pipes are fenced with a marker byte sequence
+awaited in the pumps, so every byte the cell wrote synchronously — including
+direct fd writes — precedes its `done`. Ordering between a cell's Python-level
+writes and its raw fd writes is not guaranteed (two channels).
 
 ## Liveness heartbeat
 
@@ -229,6 +236,30 @@ payload is written atomically (tmp file + `os.replace`) and a JSON manifest
 (`version`, `savedNames`, `skipped`, `pruned`, `preserved`, `bytes`,
 `pythonVersion`, `timestamp`) is written to `manifest_path`. A manifest write
 failure fails the snapshot (and nothing is pruned).
+
+Snapshots are dirty-tracked, without changing the payload, the manifest, or the
+`done` frame. A name still bound to the identical deeply-immutable object (exact
+built-in types only: str/bytes/int/float/complex/bool/None/range, and
+tuple/frozenset of such) reuses its previously serialized blob instead of
+re-dumping it. A request that arrives with no cell executed and no restore
+applied since the last successful snapshot for the same parameters, every
+eligible name still bound to the identical object, and the committed pair intact
+on disk (regular files, payload size unchanged) is answered by replaying that
+snapshot's result without touching the files — so the manifest `timestamp`
+reflects the last physical write. Any doubt falls through to a full snapshot.
+Mutable values are only reused under the no-cell-executed condition, because
+in-place mutation by a cell is invisible to identity; in-place mutation by a
+background thread while no cell runs is outside what the fingerprint can see
+(the same approximation the replay condition makes).
+
+`final: true` marks the host's terminal (dispose) snapshot, and such a request is
+never answered from the replay record: it is the last word on this namespace, so
+it is written even when every fingerprint says nothing changed. That covers the
+hole above for the snapshot a later kernel will restore from; ordinary per-cell
+snapshots keep the shortcut, so a payload written by one of them can still miss
+an in-place background mutation until the next cell or the terminal flush. The
+field is additive and ungated — a runtime without the shortcut has nothing to
+bypass and ignores it.
 
 `preserve_names` (protocol 4, gated on the capability token) turns the write into
 a merge write: for each requested name the blob is copied verbatim from the

@@ -86,6 +86,9 @@ export class SubagentSummaryLine implements Component, Focusable {
 	private counts: SubagentSummaryCounts = { total: 0, running: 0, idle: 0, inactive: 0 };
 	private stallMarkers: readonly string[] = [];
 	private openable = false;
+	private cachedWidth?: number;
+	private cachedKey?: string;
+	private cachedLines?: string[];
 
 	onOpen?: () => void;
 	onCancel?: () => void;
@@ -136,6 +139,33 @@ export class SubagentSummaryLine implements Component, Focusable {
 	}
 
 	render(width: number): string[] {
+		const key = this.cacheKey();
+		if (this.cachedLines && this.cachedWidth === width && this.cachedKey === key) {
+			return this.cachedLines;
+		}
+		const lines = this.renderLines(width);
+		this.cachedWidth = width;
+		this.cachedKey = key;
+		this.cachedLines = lines;
+		return lines;
+	}
+
+	private cacheKey(): string {
+		return [
+			this.counts.total,
+			this.counts.running,
+			this.counts.idle,
+			this.counts.inactive,
+			this.openable ? 1 : 0,
+			this.focused ? 1 : 0,
+			this.stallMarkers.join("\u0000"),
+			this.getOverrideLabel() ?? "",
+			this.getLocationLabel() ?? "",
+			this.getContextLabel() ?? "",
+		].join("\u0001");
+	}
+
+	private renderLines(width: number): string[] {
 		const lines = this.renderInfoLine(width);
 		if (this.counts.total === 0) return lines;
 		if (width < 2) return lines;
@@ -198,6 +228,9 @@ export class SubagentSummaryLine implements Component, Focusable {
 	}
 
 	invalidate(): void {
-		// Render output is derived from counts and focus state.
+		// Render output is derived from counts, focus state, and theme/keybindings.
+		this.cachedWidth = undefined;
+		this.cachedKey = undefined;
+		this.cachedLines = undefined;
 	}
 }

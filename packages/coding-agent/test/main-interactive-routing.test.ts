@@ -6,6 +6,7 @@ import { mergeAgentSessionRuntimeConfig } from "../src/core/agent-session-config
 import type { CreateAgentSessionOptions } from "../src/core/sdk.js";
 import {
 	type AppMode,
+	type DaemonCreatePrefireDecision,
 	type DaemonInteractiveSessionManagerDecision,
 	daemonServerDefaultSessionConfig,
 	findActiveDaemonSessionSummaryForSessionFile,
@@ -16,6 +17,7 @@ import {
 	shouldEnsureDaemonBeforeActiveSessionLookup,
 	shouldEnsureInteractiveDaemonForStartup,
 	shouldOpenAgentsViewForDaemonInteractive,
+	shouldPrefireDaemonCreateForDaemonInteractive,
 	shouldRejectNonInteractiveAttach,
 	shouldRejectNonInteractiveBareResume,
 	shouldUseDaemonClient,
@@ -203,6 +205,55 @@ describe("daemon-backed interactive session manager routing", () => {
 				resume: true,
 			}),
 		).toBe(true);
+	});
+
+	test("prefires the daemon create RPC for startup that cannot detour to the agents view", () => {
+		expect(shouldPrefireDaemonCreateForDaemonInteractive({})).toBe(true);
+		expect(shouldPrefireDaemonCreateForDaemonInteractive({ resume: "active-1" })).toBe(true);
+	});
+
+	const noPrefireCases: Array<[string, DaemonCreatePrefireDecision]> = [
+		["bare --resume", { resume: true }],
+		["explicit agents view", { explicitAgentsView: true }],
+		["agents verb with a resume selector", { resume: "active-1", explicitAgentsView: true }],
+	];
+
+	test.each(noPrefireCases)("keeps %s on the sequential create path", (_label, decision) => {
+		expect(shouldPrefireDaemonCreateForDaemonInteractive(decision)).toBe(false);
+	});
+
+	test("never prefires a create the agents view could leave unconsumed", () => {
+		const resumes: Array<true | string | undefined> = [undefined, true, "active-1"];
+		const flags = [false, true];
+		const combinations: Array<Parameters<typeof shouldOpenAgentsViewForDaemonInteractive>[0]> = [];
+		for (const resume of resumes) {
+			for (const explicitAgentsView of flags) {
+				for (const needsOnboarding of flags) {
+					for (const cont of flags) {
+						for (const fork of [undefined, "source-session-id"]) {
+							combinations.push({
+								useDaemonInteractive: true,
+								needsOnboarding,
+								explicitAgentsView,
+								resume,
+								continue: cont,
+								fork,
+							});
+						}
+					}
+				}
+			}
+		}
+		expect(combinations.length).toBeGreaterThan(0);
+		for (const combination of combinations) {
+			const prefires = shouldPrefireDaemonCreateForDaemonInteractive({
+				resume: combination.resume,
+				explicitAgentsView: combination.explicitAgentsView,
+			});
+			if (prefires) {
+				expect(shouldOpenAgentsViewForDaemonInteractive(combination)).toBe(false);
+			}
+		}
 	});
 
 	test("ensures daemon is available before probing non-path session selectors", () => {

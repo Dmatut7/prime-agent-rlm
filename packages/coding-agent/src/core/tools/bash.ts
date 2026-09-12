@@ -1,10 +1,10 @@
 import { existsSync } from "node:fs";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Container, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { Container, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { spawn } from "child_process";
 import { type Static, Type } from "typebox";
 import { expandCollapseHint } from "../../modes/interactive/components/keybinding-hints.js";
-import { truncateToVisualLines } from "../../modes/interactive/components/visual-truncate.js";
+import type { VisualTruncateResult } from "../../modes/interactive/components/visual-truncate.js";
 import { theme } from "../../modes/interactive/theme/theme.js";
 import { waitForChildProcess } from "../../utils/child-process.js";
 import {
@@ -17,7 +17,7 @@ import {
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.js";
 import { previewBashCommand } from "./code-preview.js";
 import { OutputAccumulator } from "./output-accumulator.js";
-import { getTextOutput, invalidArgText, str } from "./render-utils.js";
+import { getTextOutput, invalidArgText, replaceTabs, str } from "./render-utils.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult } from "./truncate.js";
 
@@ -182,7 +182,8 @@ export interface BashToolOptions {
 }
 
 const BASH_PREVIEW_LINES = 5;
-const BASH_UPDATE_THROTTLE_MS = 100;
+/** Streaming-update cadence for bash output; shared with the ! command preview (bash-execution.ts). */
+export const BASH_UPDATE_THROTTLE_MS = 100;
 
 type BashRenderState = {
 	startedAt: number | undefined;
@@ -225,6 +226,46 @@ function formatBashCall(args: { command?: string; timeout?: number } | undefined
 	return theme.fg("toolTitle", theme.bold(`$ ${commandDisplay}`)) + timeoutSuffix;
 }
 
+/** Visual lines Text produces for a single logical line at contentWidth. */
+function countVisualLines(line: string, contentWidth: number): number {
+	const expanded = line.includes("\t") ? replaceTabs(line) : line;
+	if (visibleWidth(expanded) <= contentWidth) {
+		return 1;
+	}
+	return wrapTextWithAnsi(expanded, contentWidth).length;
+}
+
+/**
+ * Same result as truncateToVisualLines() over the fully styled output, but
+ * styles and wraps only the trailing window of logical lines the preview
+ * shows; the skipped count still covers every visual line. Styled lines are
+ * self-contained (theme.fg closes its own sequence) and wrapping never
+ * crosses newlines, so the window renders exactly like the full output.
+ */
+function bashPreviewTail(lines: string[], maxVisualLines: number, width: number): VisualTruncateResult {
+	const contentWidth = Math.max(1, width);
+	const counts = lines.map((line) => countVisualLines(line, contentWidth));
+	const totalVisualLines = counts.reduce((sum, count) => sum + count, 0);
+	if (totalVisualLines <= maxVisualLines) {
+		const styled = lines.map((line) => theme.fg("toolOutput", line)).join("\n");
+		return { visualLines: new Text(styled, 0, 0).render(width), skippedCount: 0 };
+	}
+	let start = lines.length;
+	let windowVisualLines = 0;
+	while (start > 0 && windowVisualLines < maxVisualLines) {
+		start--;
+		windowVisualLines += counts[start];
+	}
+	const styled = lines
+		.slice(start)
+		.map((line) => theme.fg("toolOutput", line))
+		.join("\n");
+	return {
+		visualLines: new Text(styled, 0, 0).render(width).slice(-maxVisualLines),
+		skippedCount: totalVisualLines - maxVisualLines,
+	};
+}
+
 function rebuildBashResultRenderComponent(
 	component: BashResultRenderComponent,
 	result: {
@@ -244,18 +285,21 @@ function rebuildBashResultRenderComponent(
 	const output = getTextOutput(result as any, showImages, { includeImageDimensions }).trim();
 
 	if (output) {
-		const styledOutput = output
-			.split("\n")
-			.map((line) => theme.fg("toolOutput", line))
-			.join("\n");
-
 		if (options.expanded) {
+			const styledOutput = output
+				.split("\n")
+				.map((line) => theme.fg("toolOutput", line))
+				.join("\n");
 			component.addChild(new Text(`\n${styledOutput}`, 0, 0));
 		} else {
+			// The preview shows only the last BASH_PREVIEW_LINES visual lines;
+			// restyling and re-wrapping the whole accumulated output on every
+			// streaming update was the dominant render cost for large outputs.
+			const lines = output.split("\n");
 			component.addChild({
 				render: (width: number) => {
 					if (state.cachedLines === undefined || state.cachedWidth !== width) {
-						const preview = truncateToVisualLines(styledOutput, BASH_PREVIEW_LINES, width);
+						const preview = bashPreviewTail(lines, BASH_PREVIEW_LINES, width);
 						state.cachedLines = preview.visualLines;
 						state.cachedSkipped = preview.skippedCount;
 						state.cachedWidth = width;

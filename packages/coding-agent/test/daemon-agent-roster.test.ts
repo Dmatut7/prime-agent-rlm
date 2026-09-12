@@ -417,6 +417,48 @@ describe("worker roster reporter", () => {
 		expect(sentDeltas.at(-1)?.entries.map((entry) => entry.summary.activity)).toEqual(["idle"]);
 	});
 
+	it("recomputes only dirty sessions on an event-scoped flush and carries clean rows over verbatim", () => {
+		const { daemon, sentDeltas } = makeWorkerReporter();
+		const busy = makeState({ activeSessionId: "busy-active", sessionFile: "/tmp/busy.jsonl" });
+		const quiet = makeState({ activeSessionId: "quiet-active", sessionFile: "/tmp/quiet.jsonl" });
+		daemon.sessions.set(busy.activeSessionId, busy);
+		daemon.sessions.set(quiet.activeSessionId, quiet);
+		daemon.flushRoster();
+		sentDeltas.length = 0;
+
+		// The busy session changes and emits; the quiet session changes without a carrier event.
+		(busy.runtime.session as unknown as { isStreaming: boolean }).isStreaming = true;
+		(quiet.runtime.session as unknown as { sessionName: string }).sessionName = "renamed-quiet";
+		daemon.observeRosterEvent(busy, { type: "session_status", activeSessionId: "busy-active" });
+		daemon.flushRoster();
+
+		// The scoped flush republishes only the emitting session's row; the clean row is
+		// carried over verbatim instead of being rebuilt from the mutated state.
+		expect(sentDeltas.at(-1)?.entries.map((entry) => entry.agentId)).toEqual(["session-busy-active"]);
+		expect(sentDeltas.at(-1)?.entries[0]?.summary.isStreaming).toBe(true);
+		expect(daemon.rosterReporter.lastComposed.get("session-quiet-active")?.summary.sessionName).toBe(
+			"name-quiet-active",
+		);
+
+		// The quiet session's own event recomputes and publishes its row.
+		daemon.observeRosterEvent(quiet, {
+			type: "session_event",
+			activeSessionId: "quiet-active",
+			event: { type: "session_info_changed", name: "renamed-quiet" },
+		});
+		daemon.flushRoster();
+		expect(sentDeltas.at(-1)?.entries.map((entry) => entry.agentId)).toEqual(["session-quiet-active"]);
+		expect(sentDeltas.at(-1)?.entries[0]?.summary.sessionName).toBe("renamed-quiet");
+
+		// A flush without dirty tracking is a full rebuild: it repairs carrier-less mutations
+		// in any session, matching the pre-incremental contract for direct/unscoped flushes.
+		sentDeltas.length = 0;
+		(quiet.runtime.session as unknown as { sessionName: string }).sessionName = "renamed-again";
+		daemon.flushRoster();
+		expect(sentDeltas.at(-1)?.entries.map((entry) => entry.agentId)).toEqual(["session-quiet-active"]);
+		expect(sentDeltas.at(-1)?.entries[0]?.summary.sessionName).toBe("renamed-again");
+	});
+
 	it("flushes cron and model changes that have no session-event carrier", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "prime-roster-cron-flush-"));
 		tempDirs.push(directory);

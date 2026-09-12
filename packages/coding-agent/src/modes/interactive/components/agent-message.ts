@@ -45,13 +45,25 @@ export function agentMessageBodyLines(message: string, width: number): string[] 
 }
 
 class AgentMessageBodyComponent implements Component {
+	private cachedWidth?: number;
+	private cachedLines?: string[];
+
 	constructor(private readonly message: string) {}
 
 	render(width: number): string[] {
-		return agentMessageBodyLines(this.message, width);
+		if (this.cachedLines && this.cachedWidth === width) {
+			return this.cachedLines;
+		}
+		const lines = agentMessageBodyLines(this.message, width);
+		this.cachedWidth = width;
+		this.cachedLines = lines;
+		return lines;
 	}
 
-	invalidate(): void {}
+	invalidate(): void {
+		this.cachedWidth = undefined;
+		this.cachedLines = undefined;
+	}
 }
 
 export class AgentMessageComponent extends Container {

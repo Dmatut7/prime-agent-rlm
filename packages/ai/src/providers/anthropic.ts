@@ -41,6 +41,7 @@ import {
 	streamFailureMessage,
 	truncateRawPayload,
 } from "../utils/stream-failure.js";
+import { updateThrottledStreamingJson } from "../utils/streaming-json-throttle.js";
 
 import { resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
@@ -626,7 +627,11 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 						const block = blocks[index];
 						if (block && block.type === "toolCall") {
 							block.partialJson += event.delta.partial_json;
-							block.arguments = parseStreamingJson(block.partialJson);
+							// Throttled mid-stream parse; the content_block_stop parse is authoritative.
+							const parsedArgs = updateThrottledStreamingJson(block, block.partialJson);
+							if (parsedArgs) {
+								block.arguments = parsedArgs;
+							}
 							stream.push({
 								type: "toolcall_delta",
 								contentIndex: index,
