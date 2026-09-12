@@ -688,3 +688,92 @@ R3 合并后的现行落点（行号已漂，按符号给）：服务端强制 =
 - **第59条（git show/grep 0 命中先验路径）**：`git show <path>`=0 字符或 `grep -c`=0 先验证路径存在（`git ls-files|grep basename` 或 `git grep -l`）、0 字符 git show 是「路径错」不是「内容缺」（本轮 4600 曾因漏 suite/regressions/ 路径误读「用例基线不存在」、实际 BASE==HEAD byte 相同用例 pre-existing）。
 - **第60条（三段式标签 + 五环境轴 canonical）**：基线 swap 只控代码轴、对 host/负载轴天然盲 ⇒「基线也红」只证「非本轮引入」不证「代码红」；完整定性一条红要三段式（代码轴 swap + host 轴 GIT_CONFIG 隔离 + 能力/负载轴按完整 stderr 区分）；环境轴按五轴 canonical 组织（①产物 ②调用口径 ③runner env ④host config ⑤本机服务凭据），台账/任务书/W 节编号一致防下轮引用打架。
 - **第61条（两面、都本轮实测有工件）**：① **超时/握手类失败签名要读完整 `failureMessages` 尾部（尤其被测进程自己的 stderr）、不只首行**——4600 就是只读首行 `Timed out` 被误判成能力/负载缺口、完整 stderr 的 `listening`（0.114s）推翻之；反例对照：`daemon-supervisor-process` 的 11 条**读满**后无 listening 行、全是 `Timed out after 1000ms … daemon handshake` ⇒ 两种形状可区分（taxonomy 有牙）。② **跨 worktree 名集合差集前、先断言两层归一化文件键交集非空**——vitest json 报绝对路径，`/private/tmp/…`（macOS realpath）与 `/Users/…` 永不相交，同一条红会被报成「only-in-BASE + only-in-HEAD」两条层特有红、正好是 swap 判据的反面（pre-existing 误判成本轮引入 + 本轮修好各一条）；用 fullName/basename 做**路径归一化**键 + **断言键交集非空**（recheck-final 四次比较：roundtrip 1 / proc 1 / 两簇 2 / ci1×ci2 402 文件、无一次交集为 0）。
+
+
+# 2026-09-12 PR #12 合并轮追加：4603 fixture 两枚 harness 缺陷（macOS 硬链接永久杀 node + 清理路径自停 runner）＋红账更正
+
+**背景**：外部贡献 PR #12（DZMing，13 簇修复＋性能优化）合并轮做末尾全量验证时，`vitest` 主进程被停成 `STAT=T` 且全机新起 node 一律 `Killed: 9`。两条现象同源于 `packages/coding-agent/test/suite/regressions/4603-worker-recovery.test.ts`，都是既有缺陷（三个相关 blob 在 `7c2e7a4cf` 与合并后 HEAD 逐字节相同：`4603-worker-recovery.test.ts` = `19ab4a7f4`、`test/suite/harness.ts` = `1b3a2d921`、`src/modes/daemon/daemon-supervisor-ownership.ts` = `599fcd75d`），与 PR #12 无关。
+
+## 一、缺陷 A ［P0 · 机器级 · macOS-only］`linkSync(process.execPath, …)` 让**本机 node 二进制永久不可 exec**
+
+**病灶**：`test/suite/regressions/4603-worker-recovery.test.ts:128-129`
+```ts
+const executablePath = join(harness.tempDir, APP_NAME);
+linkSync(process.execPath, executablePath);   // 硬链接正在跑测试的那个 node
+```
+全仓仅此一处对可执行文件做 `link(2)`（`src` 里的 `linkSync` 只有 `modes/daemon/rlm-ledger.ts:716`，链的是数据文件；测试里其余都是 `symlinkSync`/`unlinkSync`）。
+
+**机制（决定性实验，三步可复现，2026-09-12 13:15 本机实测）**：
+```sh
+cp ~/.nvm/versions/node/v22.22.0/bin/node.bad-inode /tmp/exp_node
+/tmp/exp_node -e 'console.log(1)'      # → ok, exit=0
+ln /tmp/exp_node /tmp/exp_node_link    # 只加一条硬链接，未写一个字节
+/tmp/exp_node -e 'console.log(1)'      # → Killed: 9 (exit=137)
+/tmp/exp_node_link -e 'console.log(1)' # → Killed: 9
+rm /tmp/exp_node_link
+/tmp/exp_node -e 'console.log(1)'      # → 仍然 Killed: 9（对该 inode 永久）
+```
+即：**给已签名（hardened runtime、TeamIdentifier `HX7739G8FX`）的 node 建一条硬链接，该 inode 的代码签名就在内核/AMFI 眼里永久失效**，此后指向该 inode 的任何路径 exec 一律 SIGKILL，删链接也不恢复。二进制内容与静态签名都没变（`shasum -a 256` 前后同为 `913b144f…b4d4`，`codesign -v` 仍 exit 0）⇒ 坏的是内核对该 vnode 的签名缓存状态，不是文件。
+
+**对照排除（同批实测）**：`cp`（新 inode）无害；`chmod 755` 无害；写 `com.apple.provenance` xattr 无害；`touch -r`（utimes）**有害**——见第四节操作纪律。
+
+**影响面**：跑一次 4603 就废掉本机 node ⇒ 所有车道的 `npm`/`npx`/`vitest`/`prime-agent` CLI（shebang → `env node`）全灭，已 exec 的常驻进程（daemon/worker）不受影响直到需要 respawn。Linux CI 不触发（无 AMFI 硬链接策略），所以 CI 全绿也看不见这缺陷。
+
+**恢复手法（唯一有效）**：换 inode——`cd ~/.nvm/versions/node/v22.22.0/bin && cp node node.fresh && rm node && mv node.fresh node && chmod 755 node`，随后 `node -e 'console.log(1)'` + `npm --version` 双验。**禁止 `touch`**（会二次中毒）。坏 inode 留档为同目录 `node.bad-inode`（111MB，取证完可删）。
+
+## 二、缺陷 B ［P1］4603 的清理路径会 SIGSTOP/SIGKILL **自己的 vitest runner**，全量 run 无输出无退出地挂死
+
+**证据链（2026-09-12 13:10 单文件跑，node 健康）**：
+1. `ps`：vitest 主进程 `88453` `STAT=T`，CPU 时间冻结在 `0:01.08`；`kill -CONT` 后 60 秒内再次变 `T` ⇒ 有人在循环里对它发 SIGSTOP，不是 I/O 卡死。
+2. fixture 目录 `pi-suite-1789189845286-gvr0nol8o2r/registry/old-generation.owner/owner.json`：
+   `"pid": 88453, "processStartId": "ps:Sat Sep 12 05:10:07 2026", "generation": "old-generation", "appVersion": "test"`
+   —— `88453` 正是 runner 自己的 pid，`05:10:07Z` = 本地 `13:10:07` = 该 run 的启动时刻。
+3. 代码路径：测试在 **runner 进程内**直接调 `acquireDaemonSupervisorOwnership({… generation: "old-generation" …})`（`:871-878`）伪造"上一代 owner"，该调用把 `process.pid` + 本机 start-id 写进 `owner.json`；正常路径在 `:948-949` `oldOwner.release()` + `rmSync(ownerDirectory, …)` 清掉。**用例中途失败/抛出时就留着**。
+4. afterAll 清理 `registerFixtureOwnedProcesses()`（`:255-273`）扫 `fixtureRegistryDirs` 下每个 `*.owner/owner.json`，用 `registerFixtureRecord` 把里面的 pid+startId 注册成"待终止 fixture 进程"；`terminateFixtureProcessTree`（`:359-411`）先 `SIGSTOP`（`:365`）再逐个 `SIGSTOP`/`SIGKILL`（`:398`/`:405`）。身份核验（pid + `ps -o lstart=` start-id）**当然通过**，因为那条记录写的就是 runner 自己 ⇒ 测试把自己停了、接着会把自己杀了。
+5. 后果：runner 停在清理循环里 ⇒ 该文件永不结束、整个 `vitest --run` 无输出无退出（12:34 那次全量就是这么挂的，476/480 个文件已有结果、剩 4 个永不落地，最后人工 `kill -9`）。
+
+## 三、本轮红账更正（把 12:34 全量的 7 条重进程红归因到缺陷 A，不再当"待查红"）
+
+12:34:37 开跑的全量里，`4685-daemon-client-modes` ×2、`daemon-supervisor-process` ×2、`4600-supervisor-singleton` ×3（除既有的 unwinds 那条外 ×2）共 7 条红，全是 20s/40s 握手超时形状。**归因**：4603 在 12:35:04 建 fixture（`pi-suite-1789187704596-tooc9nxce9k/prime-agent`，111673840 字节 = node 硬链接）⇒ node inode 当场中毒 ⇒ 同时在跑的上述文件的 fixture `spawn` 全部 exec 即死 ⇒ 握手超时。**验证**：node 换 inode 后单文件重跑，`4685` 19/19 绿、`daemon-supervisor-process` 11 passed + 8 skipped 绿、`4600` 只剩 1 条既有红（`unwinds real pre-bind and post-bind startup failures before retry`，签名与 §5.7 记的 fork-only known-red 逐字相符：stderr 里 `Could not migrate legacy cron jobs: … JSON` 后紧跟 `listening on …`，20730ms 超时、`exit=null/null`）。
+
+**同日其余红的三段式定性（沿用 §5.7 口径）**：
+- `git-context.test.ts` 1 条 = host 第四轴：加 `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null` 后 6/6 全绿（单变量证明，与 §5.7 同结论）。
+- `packages/ai` 6 条（`stream.test.ts` 5 + `context-overflow.test.ts` 1）= 第五轴本机服务：`ollama server not responding - could not find ollama app`、`Failed to pull gpt-oss:20b`；`7c2e7a4cf` 纯净树同 6 条同 id 红。
+- `package-command-paths.test.ts` 6 条 = 本日 `c1daaff3f`（fork 自更新闸门）引入的真红，**已修**：`detectForkInstall` 加 `PRIME_AGENT_FORK_GATE=off` 测试缝（根代理出改动）＋ `fork-self-update.test.ts` 钉一枚 opt-out 用例；变异核（摘掉那行守卫）7 条红、装回 21/21 绿。
+
+## 四、操作纪律（新增，本机实测得来，别再踩）
+
+- **第62条（签名二进制禁 link(2)）**：任何测试/脚本要对"当前 node/可执行文件"造一个别名路径，只能用 `symlink` 或写 `#!/bin/sh\nexec "<process.execPath>" "$@"` wrapper，**绝不 `linkSync`/`ln`**；硬链接会让原 inode 在本机永久不可 exec（macOS AMFI），且症状出现在**别的车道**（全机 node 死），极易误判成内存/看门狗问题。
+- **第63条（签名二进制禁 utimes）**：`touch -r`/`touch` 改时间戳同样会让已签名 Mach-O 的 inode 立即不可 exec（本轮亲自踩：换好的新 node 被一次 `touch -r` 再次打死）。恢复只用 `cp` + `chmod`，别顺手"还原 mtime"。
+- **第64条（诊断顺序补一条）**：新起进程一律 `Killed: 9` 而 `python3`/`sh` 正常时，先做"同内容新 inode 能跑吗 + 硬链接能跑吗"两问，再去查内存/jetsam（`log show --predicate 'process == "kernel"'` 里 jetsam/memorystatus 零条即排除内存轴）。
+- **第65条（fixture 身份核验必须排自己）**：凡测试用"落盘 pid+start-id 记录 → 核验 → 发信号"的清理路径，必须显式跳过 `pid === process.pid`（以及 runner 的祖先链），否则进程内伪造的记录会让测试对自己发 SIGSTOP/SIGKILL；伪造记录也要放进不被清理扫描的目录，或 `finally` 里保证 release+删记录。
+
+## 五、处置（2026-09-12 根代理裁定）
+
+- 缺陷 A 修法：`linkSync` → shell wrapper（`#!/bin/sh` + `exec "$@"` 形式，0o700）。
+- 缺陷 B 修法：`terminateFixtureProcessTree` 加自我护栏（`identity.pid === process.pid` 跳过并 warn）＋ `finally` 保证 `release()` + 清记录。
+- **修完前全仓禁跑 4603**：全量一律带 `--exclude test/suite/regressions/4603-worker-recovery.test.ts`（本轮 PR #12 的末尾全量即按此口径，缺口已在合并报告里显式记账）。
+
+## 六、本轮末尾全量红账（HEAD `863d8727a`，净化 env，排除 4603）——**0 条可归因 PR #12**
+
+**口径**：`npx tsx vitest --run --exclude test/suite/regressions/4603-worker-recovery.test.ts`（479 文件），env 剥掉 `RLM_*`/`PRIME_AGENT_INTERNAL_*`/`PI_*`/`PRIME_AGENT_*` 共 18 个会话变量。
+**结果**：`Test Files 10 failed | 452 passed | 17 skipped (479)`、`Tests 10 failed | 5606 passed | 89 skipped (5705)`（对账 10+5606+89=5705、10+452+17=479 均闭合）。
+**同批其他门**：`npm run check` exit 0；`check:test-hygiene` exit 0（no new private-member probes，497 probes 全部 frozen/suppressed）；`test:kernel` 13 文件 `32 passed | 3 skipped` 全绿（**§5.7 记的 roundtrip ×2 pre-existing 真代码红本轮未复现**）；ai `438 passed`（6 红见下）、agent `88 passed`、tui `805 passed / 0 fail`、Python 运行时 `335 passed + 52 subtests`；`git archive HEAD` 纯净树 `tsgo --noEmit` exit 0。机器负载留证：全量期间 `load averages 4.11–6.50`、`syspolicyd` 常驻 77% CPU、内存 free 59–60%。
+
+| 红 | 条数 | 定性（五轴/台账口径） | clean measure（单文件、同 HEAD） |
+| --- | --- | --- | --- |
+| `git-context` "keeps an ssh remote url verbatim when it cannot be normalized" | 1 | host 第四轴（本机 `~/.gitconfig` 的 `url.https://github.com/.insteadOf`） | 加 `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null` → **6/6 绿**（单变量证明，与 §5.7 同结论） |
+| `4600-supervisor-singleton` "unwinds real pre-bind and post-bind startup failures before retry" | 1 | pre-existing 真代码红（fork-only：#1249 best-effort vs #1372 期望失败），§5.7 已立案 | 单文件同样 1 红、签名逐字相符（stderr `Could not migrate legacy cron jobs: … JSON` 后紧跟 `listening on …`，20730ms、`exit=null/null`） |
+| `6008-headless-python-cancellation` ×2 | 2 | 资源/顺序产物（负载轴） | **5/5 绿** |
+| `daemon-supervisor-process` "isolates a root, streams a chunked snapshot, and adopts the same worker after restart" | 1 | 资源/顺序产物 | **11 passed + 8 skipped 绿** |
+| `repl-kernel-restart-budget` "re-arms by itself once the sliding window expires" | 1 | 资源/顺序产物（同内容 12:34 那轮 7/7 绿、文件耗时 3792ms→11008ms） | **7/7 绿** |
+| `repl-kernel-protocol-corruption` "stays bounded when a teardown races the lazy re-bootstrap of a fresh kernel" | 1 | 资源/顺序产物（同内容 12:34 那轮 22/22 绿、10324ms→41559ms） | **22/22 绿** |
+| `agent-session-autonomous` "terminates the autonomous gate process tree when the timeout expires" | 1 | 资源/顺序产物（12:34 那轮 22/22 绿） | **22/22 绿** |
+| `agent-session-compaction` "waits for threshold-compaction autonomous continuations before finishing prompt" | 1 | 资源/顺序产物（12:34 那轮 38/38 绿） | **38/38 绿** |
+| `agent-session-recursion` "durably defers a child terminal notice across ACP-style input pause and scheduler suspension" | 1 | 资源/顺序产物（12:34 那轮 119/119 绿、43126ms→457457ms） | **119/119 绿** |
+| `6006-bundled-bedrock`（Failed Suite，非 test 红） | 1 文件 | 产物第一轴：`beforeAll` 跑 `node scripts/bundle.mjs`，esbuild `Could not resolve …/dist/node/amazon-bedrock.js`；`dist/node/` 不存在（`fbd676eaf` 新增 `src/node/amazon-bedrock.ts` 后未重建 dist） | 确定性复现（`7 skipped` + 同一 esbuild 报错），修法是 `npm run build`，与 PR #12 无关 |
+| `packages/ai` `stream.test.ts` ×5 + `context-overflow.test.ts` ×1 | 6 | 本机服务第五轴（无 ollama app：`Failed to pull gpt-oss:20b`，该 skip 的没 skip） | `7c2e7a4cf` 纯净树同 6 条同 id 红 |
+
+**结论**：10 条测试红 = 1 host 轴 + 1 既有 known-red + 7 负载/顺序产物（单文件全部转绿）+ 6 ai 侧第五轴（另一个包）；1 个 suite 错 = 产物轴（dist 未重建）。**没有一条能归到 PR #12**，且 PR 触碰的两个高危面（`autonomous.ts`、`compaction.ts`）在单文件 clean measure 下分别 22/22、38/38 全绿。
+
+**顺带记一条本轮实测的口径教训（第66条）**：本机在 `load 4–6.5` + `syspolicyd 77%` 的状态下跑全量，会稳定产出 ~7 条时序/握手形状的红（同一内容前后两轮红名不同、文件耗时放大 3–10 倍）。所以"全量红账"在本机必须配单文件 clean measure 才能定性，只报全量数字会把负载红误记成代码红；反之，只报单文件绿也不能声称全量绿——两个口径都要写进回执。
