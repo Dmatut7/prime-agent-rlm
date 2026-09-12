@@ -1990,6 +1990,7 @@ export class DaemonSupervisor {
 			);
 			this.clients.delete(client);
 			this.cancelWaitingPromptAdmissionsForClient(client);
+			this.abortPendingDeliveriesForSender(client);
 			for (const activeSessionId of [...client.attachedActiveSessionIds]) {
 				client.attachedActiveSessionIds.delete(activeSessionId);
 				this.background(this.syncWorkerExtensionUi(activeSessionId), "extension UI sync");
@@ -4434,6 +4435,9 @@ export class DaemonSupervisor {
 			worker.descriptor.lifecycle = "ready";
 			worker.descriptor.consecutiveFailures = 0;
 			worker.deferredRecoveryRounds = 0;
+			// A spent backoff budget must not outlive the failure it was spent on: a
+			// later episode on a long-lived supervisor gets its own re-adoption retries.
+			worker.adoptionRetryAttempt = 0;
 			this.tryPersistWorker(worker, "adoption");
 			this.broadcastHeartbeatsChanged();
 		} catch (error) {
@@ -6144,11 +6148,11 @@ export class DaemonSupervisor {
 	 * tier (B5). What changed is the bookkeeping: the
 	 * delivery is an entry in the pending-delivery queue instead of an anonymous
 	 * mutation holding the update-restart drain latch, so a target that is not
-	 * reachable yet requeues and retries until the delivery budget runs out, a
-	 * target with a full pending set is rejected with an actionable hint instead
-	 * of being silently piled onto, and a restart drains every entry with an
-	 * explicit receipt to the sender that is still waiting (B10/F10: nothing
-	 * evaporates).
+	 * reachable yet requeues and retries until the delivery budget runs out or the
+	 * sender disconnects, a target with a full pending set is rejected with an
+	 * actionable hint instead of being silently piled onto, and a restart drains
+	 * every entry with an explicit receipt to the sender that is still waiting
+	 * (B10/F10: nothing evaporates).
 	 *
 	 * A retry only ever follows a failure that `requireAvailableWorkerClient`
 	 * threw before anything was written to a worker, so this loop cannot deliver
@@ -6157,7 +6161,8 @@ export class DaemonSupervisor {
 	 * KNOWN WINDOW, owned by batch 2 (P1-2 idempotency key): the sender's own
 	 * budget is ~30s (daemon-mode.ts `sendRemoteAgentSessionMessage`) while this
 	 * loop may keep going for the whole delivery budget. A sender that times out
-	 * gets an error, not a receipt, and the message can still land later — so a
+	 * gets an error, not a receipt, and closes its connection, which abandons the
+	 * entry — but a dispatch already written to a worker can still land later, so a
 	 * model that re-sends on that error can produce a duplicate. Nothing in this
 	 * file can close that: it needs a sender-supplied delivery key the target
 	 * dedupes on. Until P1-2 lands, this is an open duplicate-delivery window and
@@ -6185,7 +6190,9 @@ export class DaemonSupervisor {
 			},
 		};
 		const queue = this.pendingDeliveryQueue();
-		const admitted = queue.admit(targetActiveSessionId, senderKey);
+		// Keyed on the connection id, not client.id, which the command envelope reassigns.
+		const senderConnectionId = this.connectionIds.get(client) ?? client.id;
+		const admitted = queue.admit(targetActiveSessionId, senderKey, senderConnectionId);
 		if (!admitted.ok) {
 			// L6: a full pending set is a retryable rejection, never a fake "queued".
 			this.logInfo(
@@ -6337,6 +6344,32 @@ export class DaemonSupervisor {
 		}
 		this.log(
 			`drained ${drained.length} pending agent-message ${drained.length === 1 ? "delivery" : "deliveries"} (${reason.replaceAll("_", " ")}): ${drained
+				.map((entry) => `${entry.deliveryId}->${entry.targetActiveSessionId}`)
+				.join(", ")}`,
+		);
+	}
+
+	/**
+	 * A disconnected sender cannot read a receipt any more, and its entries would
+	 * hold the target's capacity for the rest of their delivery budget: a sender
+	 * waits seconds (an agent-to-agent send gives up after 30s) while the budget is
+	 * 24h, so one unreachable target orphans a slot per abandoned send until it
+	 * rejects the senders that are still there.
+	 */
+	private abortPendingDeliveriesForSender(client: DaemonSocketClient): void {
+		// The field, not pendingDeliveryQueue(): a supervisor that never relayed an
+		// agent message must not allocate a queue for a client that leaves.
+		const queue = this.pendingDeliveries;
+		if (!queue) {
+			return;
+		}
+		const senderConnectionId = this.connectionIds.get(client) ?? client.id;
+		const abandoned = queue.abortSender(senderConnectionId, "sender_disconnected");
+		if (abandoned.length === 0) {
+			return;
+		}
+		this.log(
+			`abandoned ${abandoned.length} pending agent-message ${abandoned.length === 1 ? "delivery" : "deliveries"} of disconnected sender ${senderConnectionId}: ${abandoned
 				.map((entry) => `${entry.deliveryId}->${entry.targetActiveSessionId}`)
 				.join(", ")}`,
 		);

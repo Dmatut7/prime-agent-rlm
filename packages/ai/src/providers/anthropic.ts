@@ -41,7 +41,7 @@ import {
 	streamFailureMessage,
 	truncateRawPayload,
 } from "../utils/stream-failure.js";
-import { updateThrottledStreamingJson } from "../utils/streaming-json-throttle.js";
+import { finalizeThrottledStreamingJson, updateThrottledStreamingJson } from "../utils/streaming-json-throttle.js";
 
 import { resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
@@ -721,6 +721,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
+			// Mid-stream parses are throttled; run the authoritative final parse on
+			// in-flight tool arguments before the scratch buffers are stripped.
+			finalizeThrottledStreamingJson(output.content);
 			for (const block of output.content) {
 				delete (block as { index?: number }).index;
 				// partialJson is only a streaming scratch buffer; never persist it.

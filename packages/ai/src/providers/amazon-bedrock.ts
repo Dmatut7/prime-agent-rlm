@@ -45,7 +45,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import { recordStreamFailure, streamFailureFromStopReason } from "../utils/stream-failure.js";
-import { updateThrottledStreamingJson } from "../utils/streaming-json-throttle.js";
+import { finalizeThrottledStreamingJson, updateThrottledStreamingJson } from "../utils/streaming-json-throttle.js";
 import { adjustMaxTokensForThinking, buildBaseOptions, clampReasoning } from "./simple-options.js";
 import { transformMessages } from "./transform-messages.js";
 
@@ -270,6 +270,9 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
+			// Mid-stream parses are throttled; run the authoritative final parse on
+			// in-flight tool arguments before the scratch buffers are stripped.
+			finalizeThrottledStreamingJson(output.content);
 			for (const block of output.content) {
 				delete (block as Block).index;
 				// partialJson is only a streaming scratch buffer; never persist it.

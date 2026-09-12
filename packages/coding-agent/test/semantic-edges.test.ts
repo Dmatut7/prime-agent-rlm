@@ -884,6 +884,52 @@ describe("wrapStreamFnWithSemanticEdges", () => {
 		}
 	});
 
+	it("skips the whole-conversation stringify+hash when the recorder is disabled", () => {
+		let stringifyTouches = 0;
+		let innerCalls = 0;
+		// JSON.stringify reads every property, so a counting getter observes each body traversal.
+		const probeContext = {
+			systemPrompt: "s",
+			messages: [
+				{
+					role: "user",
+					get content() {
+						stringifyTouches += 1;
+						return "hi";
+					},
+				},
+			],
+			tools: [],
+		} as unknown as Parameters<StreamFn>[1];
+		const inner: StreamFn = () => {
+			innerCalls += 1;
+			return createAssistantMessageEventStream();
+		};
+
+		// Control: an enabled recorder does stringify the body, so the probe is not vacuous.
+		wrapStreamFnWithSemanticEdges(inner, recorderIn("hash-guard-enabled.jsonl"))(model, probeContext, undefined);
+		const enabledTouches = stringifyTouches;
+		expect(enabledTouches).toBeGreaterThan(0);
+
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			// A ledger path that is a directory disables the recorder at construction.
+			mkdirSync(join(tempDir, "hash-guard-disabled.jsonl"));
+			const disabled = new SemanticEdgeRecorder({
+				ledgerPath: join(tempDir, "hash-guard-disabled.jsonl"),
+				sessionId: "hash-guard-disabled",
+			});
+			expect(disabled.enabled).toBe(false);
+
+			wrapStreamFnWithSemanticEdges(inner, disabled)(model, probeContext, undefined);
+			// The call still goes through, but the body is never stringified (and so never hashed).
+			expect(innerCalls).toBe(2);
+			expect(stringifyTouches).toBe(enabledTouches);
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
 	it("fails the request when the inner stream function throws", () => {
 		const recorder = recorderIn("c.jsonl");
 		const inner: StreamFn = () => {

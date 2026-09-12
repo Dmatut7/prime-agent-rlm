@@ -32,7 +32,7 @@ import { shortHash } from "../utils/hash.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import { classifyStreamFailure, StreamFailureError } from "../utils/stream-failure.js";
-import { updateThrottledStreamingJson } from "../utils/streaming-json-throttle.js";
+import { finalizeThrottledStreamingJson, updateThrottledStreamingJson } from "../utils/streaming-json-throttle.js";
 import { transformMessages } from "./transform-messages.js";
 
 function encodeTextSignatureV1(id: string, phase?: TextSignatureV1["phase"]): string {
@@ -278,7 +278,19 @@ export async function processResponsesStream<TApi extends Api>(
 	const blocks = output.content;
 	const blockIndex = () => blocks.length - 1;
 
-	for await (const event of openaiStream) {
+	// Mid-stream parses are throttled and callers strip the partialJson scratch on
+	// their error paths. Run the authoritative final parse when iteration ends
+	// (failure or stall) so the freshest arguments survive before the scratch is
+	// discarded.
+	const eventsWithFinalParse = async function* (): AsyncGenerator<ResponseStreamEvent> {
+		try {
+			yield* openaiStream;
+		} finally {
+			finalizeThrottledStreamingJson(blocks);
+		}
+	};
+
+	for await (const event of eventsWithFinalParse()) {
 		if (event.type === "response.created") {
 			output.responseId = event.response.id;
 		} else if (event.type === "response.output_item.added") {

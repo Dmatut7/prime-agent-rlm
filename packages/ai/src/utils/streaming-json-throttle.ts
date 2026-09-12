@@ -53,3 +53,30 @@ export function updateThrottledStreamingJson(block: object, buffer: string): Rec
 	}
 	return throttle.update(buffer);
 }
+
+/**
+ * Authoritative final parse for error/abort/stall paths. Mid-stream parses are
+ * throttled, so without this a stream that fails mid tool call would persist
+ * stale (or empty) arguments. Re-parses whatever partial JSON each in-flight
+ * toolCall block accumulated — tolerating invalid JSON exactly like the
+ * block-end parse — before the caller discards the scratch buffer. Finalized
+ * blocks carry no scratch and keep their authoritative arguments; blocks whose
+ * scratch is still empty keep whatever the provider seeded them with.
+ */
+export function finalizeThrottledStreamingJson(blocks: Iterable<object>): void {
+	for (const block of blocks) {
+		const candidate = block as {
+			type?: string;
+			arguments?: Record<string, unknown>;
+			partialJson?: string;
+			partialArgs?: string;
+		};
+		if (candidate.type !== "toolCall") {
+			continue;
+		}
+		const scratch = candidate.partialJson ?? candidate.partialArgs;
+		if (scratch) {
+			candidate.arguments = parseStreamingJson(scratch);
+		}
+	}
+}

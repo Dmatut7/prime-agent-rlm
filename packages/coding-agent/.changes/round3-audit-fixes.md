@@ -1,0 +1,8 @@
+- Fixed stale tool-call arguments persisting into history when a provider stream errors mid-tool-call (final parse now runs on error paths in all provider families).
+- Kernel snapshot blob cache is now aggregate-bounded; orphan start-id enrichment is flushed on shutdown; a diagnostics-error startup exit no longer stalls on the prefired daemon create.
+- Fixed v1 session migration never recording ids (duplicate ids could persist a parentId cycle and hang loads); damaged-header salvage now migrates pre-v2 bodies instead of persisting id-less entries under a current-version header.
+- A torn lease owner.json is now reclaimable instead of permanently locking the session, and owner records are written atomically.
+- A restore interrupted by host teardown no longer isolates a healthy snapshot as corrupt.
+- Pending deliveries from a disconnected sender are aborted so they stop poisoning per-target capacity; adoption retry budget resets after a successful adoption.
+- Turn-liveness now honors cell progress (not just bash progress) for the longer vouch tier; compaction controllers use identity-guarded clears; quiescence waiters clean up on settle.
+- models.json providers with only an apiKey are no longer silently discarded; the codex catalog stale-cache fallback actually fires; per-request credential shell-outs run off the event loop.

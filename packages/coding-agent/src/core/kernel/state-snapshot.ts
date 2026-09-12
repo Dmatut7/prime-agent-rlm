@@ -38,8 +38,10 @@ export interface RestoreResult {
 	/** Names present in the snapshot that failed to revive, with a short reason. */
 	failed: { name: string; reason: string }[];
 	path: string;
-	/** Present when the whole restore attempt failed (corrupt payload, timeout): the saved
-	 * namespace was not revived and the on-disk snapshot is preserved untouched. */
+	/** Present when the whole restore attempt failed (corrupt payload, timeout, a teardown that
+	 * interrupted the load): the saved namespace was not revived. A payload the runtime could not
+	 * load is isolated aside on disk (`<path>.corrupt-<stamp>`) so a rebuilt namespace can persist
+	 * again; a load that never finished leaves the payload where it is, for the next kernel. */
 	error?: string;
 	/**
 	 * What the next snapshot does with the names that failed to revive, so a notice to the
@@ -64,7 +66,8 @@ export interface SnapshotWritePolicyInput {
 	hasSnapshotConfig: boolean;
 	/** The saved namespace has not been revived into this kernel yet. */
 	pendingRestore: boolean;
-	/** A whole-payload load failed and the payload could not be isolated. */
+	/** A whole-payload load did not finish and the payload is still on disk: it could not be
+	 * isolated, or a teardown interrupted the load. */
 	restoreWriteBlocked: boolean;
 	/** Names the last restore could not revive; empty after a fully successful restore. */
 	unrestoredNames: readonly string[];
@@ -149,7 +152,11 @@ function renameIfExists(from: string, to: string): string | null {
 	}
 }
 
-/** Move a failed snapshot aside so a later write can replace the original path. */
+/**
+ * Move a failed snapshot aside so a later write can replace the original path. Only for a payload
+ * the runtime actually failed to load: a load that never finished (a timeout, a host teardown) is
+ * no verdict on the payload, and renaming it away would destroy good state.
+ */
 export function isolateCorruptSnapshot(
 	path: string,
 	manifestPath?: string,

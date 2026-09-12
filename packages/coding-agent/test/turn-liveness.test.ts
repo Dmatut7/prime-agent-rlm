@@ -22,9 +22,10 @@ import {
  * T1-3 fact source: the verdict that decides whether silence is excused, and how much budget it
  * buys. Two properties carry the whole design and are pinned from both directions here: existence
  * of something (a handle, a live loop) is liveness and buys the short tier, while movement
- * (streamed bytes, pipe backlog, buffered output, a host request being executed) is progress and
- * buys the full one. A loop tick is deliberately on the liveness side - `await
- * asyncio.Event().wait()` ticks forever, and handing it the full budget would excuse a deadlock.
+ * (streamed bytes, pipe backlog, buffered output, a finished request, a host request being
+ * executed) is progress and buys the full one. A loop tick is deliberately on the liveness side -
+ * `await asyncio.Event().wait()` ticks forever, and handing it the full budget would excuse a
+ * deadlock.
  */
 const T0 = 1_000_000;
 
@@ -258,6 +259,55 @@ describe("createTurnLiveness", () => {
 		expect(sampled.vouched).toBe(true);
 		expect(sampled.reasons).toEqual([STALL_VOUCH_REASONS.kernelLoopAwaitingCell]);
 		expect(sampled.progress).toBe(false);
+	});
+
+	it("upgrades the cell vouch on finished requests, and the handle vouch only on bash movement", () => {
+		// A cell workload that is provably moving: the loop ticks and `cellsDone` advanced between
+		// the two retained frames, with no bash handle, no streamed byte and no host request. The
+		// kernel finished a request, which is movement, so this earns the full budget tier.
+		const moving = build({
+			kernel: facts({
+				previous: sample({ receivedAt: T0 - 5_000, tick: 10, cellsDone: 3 }),
+				latest: sample({ tick: 40, cellId: "cell-1", cellsDone: 4 }),
+			}),
+		});
+		const movingFacts = moving.liveness.sample();
+		expect(movingFacts.vouched).toBe(true);
+		expect(movingFacts.reasons).toEqual([STALL_VOUCH_REASONS.kernelLoopAwaitingCell]);
+		expect(movingFacts.progress).toBe(true);
+
+		// The same pair with nothing finished: a tick is liveness, so the tier stays short.
+		const ticking = build({
+			kernel: facts({
+				previous: sample({ receivedAt: T0 - 5_000, tick: 10, cellsDone: 3 }),
+				latest: sample({ tick: 40, cellId: "cell-1", cellsDone: 3 }),
+			}),
+		});
+		expect(ticking.liveness.sample().progress).toBe(false);
+
+		// Bash-side movement still upgrades the cell vouch on its own, without a finished request.
+		const streamed = build({
+			kernel: facts({
+				previous: sample({ receivedAt: T0 - 5_000, tick: 10, streamBytes: 100 }),
+				latest: sample({ tick: 40, cellId: "cell-1", streamBytes: 900 }),
+			}),
+		});
+		expect(streamed.liveness.sample().progress).toBe(true);
+
+		// A live handle that produces nothing keeps the short tier even with a finished request on
+		// the frame pair (M3's stdin wedge): here the frozen tick means the cell vouch is absent, so
+		// the handle vouch carries the sample alone and only bash-side evidence may upgrade it.
+		const wedged = build({
+			kernel: facts({
+				previous: sample({ receivedAt: T0 - 5_000, tick: 10, cellsDone: 3 }),
+				latest: sample({ tick: 10, cellId: "cell-1", cellsDone: 4, bashHandles: 1, bashCellHandles: 1 }),
+			}),
+		});
+		const wedgedFacts = wedged.liveness.sample();
+		expect(wedgedFacts.vouched).toBe(true);
+		expect(wedgedFacts.reasons).toEqual([STALL_VOUCH_REASONS.liveBashHandles]);
+		expect(wedgedFacts.kernelReasons).toEqual([TURN_LIVENESS_REASONS.loopStalled]);
+		expect(wedgedFacts.progress).toBe(false);
 	});
 
 	it("does not vouch when the loop is stalled and nothing else is running", () => {

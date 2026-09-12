@@ -938,6 +938,11 @@ def _merge_preserved_blobs(
 # (rebinding is not - identity is checked). In-place mutation by cells is always caught
 # because any executed cell bumps _cell_counter and invalidates the replay record.
 _snapshot_blob_cache: dict[str, tuple[Any, bytes]] = {}
+# Aggregate bound on the bytes the cache may pin. Without it a data-heavy kernel keeps a
+# serialized second copy of every deeply-immutable value it ever binds for as long as the
+# name lives (eviction only happens on name removal). One snapshot's worth of blobs is
+# enough for reuse; a value that does not fit is re-dumped per snapshot instead of cached.
+_SNAPSHOT_BLOB_CACHE_MAX_BYTES = DEFAULT_SNAPSHOT_MAX_BYTES
 _last_snapshot_record: dict[str, Any] | None = None
 
 # Exact types only: an instance of a str/int subclass can carry a mutable __dict__ that
@@ -1045,6 +1050,11 @@ def _snapshot_state(
     total = 0
     missing = object()
     seen_names: set[str] = set()
+    # Running tally of the bytes pinned in the cache: one scan per snapshot, then O(1)
+    # per insert, so inserts can honor _SNAPSHOT_BLOB_CACHE_MAX_BYTES.
+    cache_bytes = (
+        sum(len(entry[1]) for entry in blob_cache.values()) if blob_cache is not None else 0
+    )
     for name in list(ns.keys()):
         if name.startswith("_") or name in _ALWAYS_SKIP:
             continue
@@ -1087,7 +1097,15 @@ def _snapshot_state(
                 skipped.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
                 continue
             if blob_cache is not None and _deeply_immutable(value):
-                blob_cache[name] = (value, blob)
+                # An entry surviving to this fresh dump means a rebind: its identity check
+                # can never match again and it pins a dead object, so it always goes. The
+                # fresh blob is pinned only while the aggregate cache cap has room.
+                replaced = blob_cache.pop(name, None)
+                if replaced is not None:
+                    cache_bytes -= len(replaced[1])
+                if cache_bytes + len(blob) <= _SNAPSHOT_BLOB_CACHE_MAX_BYTES:
+                    blob_cache[name] = (value, blob)
+                    cache_bytes += len(blob)
         if total + len(blob) > max_bytes:
             skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
             continue

@@ -1,0 +1,3 @@
+- Fixed a models.json that supplies only a provider `apiKey` being rejected and silently discarding the entire custom-models file.
+- Fixed a transient OpenAI Codex model-catalog fetch failure dropping every codex model from the executable pool instead of falling back to the cached catalog.
+- Changed `!command` credential resolution (keychain, password manager) for models.json API keys and headers to run asynchronously so it no longer blocks the daemon event loop on every request.

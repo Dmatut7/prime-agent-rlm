@@ -35,7 +35,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
-import { updateThrottledStreamingJson } from "../utils/streaming-json-throttle.js";
+import { finalizeThrottledStreamingJson, updateThrottledStreamingJson } from "../utils/streaming-json-throttle.js";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
 import { buildBaseOptions } from "./simple-options.js";
@@ -483,6 +483,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			// Keep reasoning details accumulated before the failure replayable,
 			// matching what the previous per-chunk encoding left behind.
 			encodeAccumulatedReasoningDetails();
+			// Mid-stream parses are throttled; run the authoritative final parse on
+			// in-flight tool arguments before the scratch buffers are stripped.
+			finalizeThrottledStreamingJson(output.content);
 			for (const block of output.content) {
 				delete (block as { index?: number }).index;
 				// Streaming scratch buffers are only used during parsing; never persist them.

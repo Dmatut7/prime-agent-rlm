@@ -9009,7 +9009,8 @@ export class AgentSession {
 		this._disconnectFromAgent();
 		if (!options.skipAbort) await this.abort();
 		let didCompact = false;
-		this._compactionAbortController = new AbortController();
+		const compactionAbort = new AbortController();
+		this._compactionAbortController = compactionAbort;
 		let resolveCompactionOperation: () => void = () => {};
 		const compactionOperation = new Promise<void>((resolve) => {
 			resolveCompactionOperation = resolve;
@@ -9032,7 +9033,7 @@ export class AgentSession {
 				apiKey,
 				headers,
 				customInstructions,
-				signal: this._compactionAbortController.signal,
+				signal: compactionAbort.signal,
 			});
 
 			this._emit({
@@ -9066,7 +9067,9 @@ export class AgentSession {
 			});
 			throw error;
 		} finally {
-			this._compactionAbortController = undefined;
+			if (this._compactionAbortController === compactionAbort) {
+				this._compactionAbortController = undefined;
+			}
 			this._reconnectToAgent();
 			if (this._compactionOperation === compactionOperation) {
 				this._compactionOperation = undefined;
@@ -10387,7 +10390,8 @@ export class AgentSession {
 		};
 
 		this._emit({ type: "compaction_start", reason, customInstructions });
-		this._autoCompactionAbortController = new AbortController();
+		const autoCompactionAbort = new AbortController();
+		this._autoCompactionAbortController = autoCompactionAbort;
 		let resolveCompactionOperation: () => void = () => {};
 		const compactionOperation = new Promise<void>((resolve) => {
 			resolveCompactionOperation = resolve;
@@ -10418,7 +10422,7 @@ export class AgentSession {
 				apiKey: authResult.apiKey,
 				headers: authResult.headers,
 				customInstructions,
-				signal: this._autoCompactionAbortController.signal,
+				signal: autoCompactionAbort.signal,
 			});
 			// A successful compaction restructures the context; any earlier
 			// skip/failure cooldown no longer reflects reality.
@@ -10500,7 +10504,9 @@ export class AgentSession {
 			resumeAfterFailure();
 			return false;
 		} finally {
-			this._autoCompactionAbortController = undefined;
+			if (this._autoCompactionAbortController === autoCompactionAbort) {
+				this._autoCompactionAbortController = undefined;
+			}
 			if (this._compactionOperation === compactionOperation) {
 				this._compactionOperation = undefined;
 			}
@@ -12396,12 +12402,25 @@ export class AgentSession {
 				// _armRlmTerminalNoticeAbandonTimer), because both predicates below are
 				// pure reads and must not flush or discard anything.
 				if (this.isSessionActive || this._hasActionableDeferredRlmTerminalNotices()) {
-					await wait(
-						Promise.race([
-							this._waitForSessionActivityChange(cancellation.signal),
-							new Promise<void>((resolve) => setTimeout(resolve, 1000)),
-						]),
-					);
+					// The 1s tick can win this race every iteration while bash/refine keep
+					// the session active. Aborting the tick scope on settle removes the
+					// losing activity-change waiter and its signal listener instead of
+					// leaking one per second into MaxListenersExceededWarning spam.
+					const tickAbort = new AbortController();
+					let tickTimer: ReturnType<typeof setTimeout> | undefined;
+					try {
+						await wait(
+							Promise.race([
+								this._waitForSessionActivityChange(tickAbort.signal),
+								new Promise<void>((resolve) => {
+									tickTimer = setTimeout(resolve, 1000);
+								}),
+							]),
+						);
+					} finally {
+						clearTimeout(tickTimer);
+						tickAbort.abort();
+					}
 					continue;
 				}
 				const unsettledRuns = [...this._unsettledRlmChildRuns].filter((run) => !run.settled);

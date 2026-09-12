@@ -90,7 +90,7 @@ import {
 	resolveHeartbeatStreamingBehavior,
 	shouldDeferHeartbeatCronJob,
 } from "../../core/cron-jobs.js";
-import { ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
+import { flushOrphanProcessJournal, ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../../core/rlm-runtime.js";
 import {
@@ -7643,6 +7643,10 @@ export class AgentDaemon {
 			this.server.close(() => resolveClose());
 		});
 		this.cleanupSocketPath();
+		// process.exit skips the drain the journal's in-flight start-id captures rely
+		// on. Records this worker leaves active are reaped by the supervisor from the
+		// journal, and an identity-free record can only be matched by a bare pid.
+		await flushOrphanProcessJournal();
 		process.exit(exitCode);
 	}
 }

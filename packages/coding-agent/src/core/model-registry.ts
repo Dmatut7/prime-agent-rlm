@@ -22,12 +22,14 @@ import {
 } from "@earendil-works/pi-ai";
 import { registerBuiltinMcpOAuthProviders } from "@earendil-works/pi-ai/mcp";
 import { registerOAuthProvider, resetOAuthProviders } from "@earendil-works/pi-ai/oauth";
+import { spawn } from "child_process";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { type Static, type TProperties, Type } from "typebox";
 import type { Validator } from "typebox/compile";
 import type { TLocalizedValidationError } from "typebox/error";
 import { getAgentDir } from "../config.js";
+import { getShellConfig, type ShellConfig } from "../utils/shell.js";
 import type { AuthSourceToken, AuthStatus, AuthStorage } from "./auth-storage.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "./prime-inference-auth.js";
 import {
@@ -36,11 +38,7 @@ import {
 	isPrivatePrimeInferenceModel,
 } from "./prime-inference-models.js";
 import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "./provider-display-names.js";
-import {
-	resolveConfigValueOrThrow,
-	resolveConfigValueUncached,
-	resolveHeadersOrThrow,
-} from "./resolve-config-value.js";
+import { resolveConfigValueOrThrow, resolveConfigValueUncached } from "./resolve-config-value.js";
 
 const PercentileCutoffsSchema = Type.Object({
 	p50: Type.Optional(Type.Number()),
@@ -434,6 +432,110 @@ function isOfflineModeEnabled(): boolean {
 	return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
 }
 
+const REQUEST_AUTH_COMMAND_TIMEOUT_MS = 10_000;
+
+interface ConfigCommandResult {
+	executed: boolean;
+	value: string | undefined;
+}
+
+/**
+ * Async twin of the `!command` execution in resolve-config-value.ts (same shells,
+ * timeout, trimming, and failure semantics). models.json credentials resolve per
+ * request and are intentionally not cached (docs/models.md "Value Resolution"), so
+ * the sync execSync path ran a blocking shell-out on the daemon worker's event loop
+ * for every request; this variant keeps the event loop free while preserving the
+ * request-time resolution contract.
+ */
+function runConfigCommandInShell(
+	shell: string,
+	args: readonly string[],
+	command: string,
+	verbatimArgs = false,
+): Promise<ConfigCommandResult> {
+	return new Promise((resolve) => {
+		const child = spawn(shell, [...args, command], {
+			stdio: ["ignore", "pipe", "ignore"],
+			timeout: REQUEST_AUTH_COMMAND_TIMEOUT_MS,
+			windowsHide: true,
+			windowsVerbatimArguments: verbatimArgs,
+		});
+		let stdout = "";
+		let settled = false;
+		const settle = (result: ConfigCommandResult) => {
+			if (settled) return;
+			settled = true;
+			resolve(result);
+		};
+		child.stdout?.setEncoding("utf-8");
+		child.stdout?.on("data", (chunk: string) => {
+			stdout += chunk;
+		});
+		child.once("error", (error: Error) => {
+			settle({ executed: (error as NodeJS.ErrnoException).code !== "ENOENT", value: undefined });
+		});
+		child.once("close", (code: number | null) => {
+			settle({ executed: true, value: code === 0 ? stdout.trim() || undefined : undefined });
+		});
+	});
+}
+
+async function executeConfigCommandAsync(commandConfig: string): Promise<string | undefined> {
+	const command = commandConfig.slice(1);
+	if (process.platform === "win32") {
+		let shellConfig: ShellConfig | undefined;
+		try {
+			shellConfig = getShellConfig();
+		} catch {
+			shellConfig = undefined;
+		}
+		if (shellConfig) {
+			const configured = await runConfigCommandInShell(shellConfig.shell, shellConfig.args, command);
+			if (configured.executed) {
+				return configured.value;
+			}
+		}
+		const fallback = await runConfigCommandInShell(
+			process.env.ComSpec ?? "cmd.exe",
+			["/d", "/s", "/c"],
+			`"${command}"`,
+			true,
+		);
+		return fallback.value;
+	}
+	const result = await runConfigCommandInShell("/bin/sh", ["-c"], command);
+	return result.value;
+}
+
+async function resolveConfigValueAsync(config: string): Promise<string | undefined> {
+	return config.startsWith("!") ? executeConfigCommandAsync(config) : resolveConfigValueUncached(config);
+}
+
+async function resolveConfigValueOrThrowAsync(config: string, description: string): Promise<string> {
+	if (!config.startsWith("!")) {
+		// Env vars and literals spawn no subprocess; keep the sync resolver as the single source.
+		return resolveConfigValueOrThrow(config, description);
+	}
+	const resolved = await executeConfigCommandAsync(config);
+	if (resolved === undefined) {
+		// Message must stay in sync with resolveConfigValueOrThrow.
+		throw new Error(`Failed to resolve ${description} from shell command: ${config.slice(1)}`);
+	}
+	return resolved;
+}
+
+async function resolveHeadersOrThrowAsync(
+	headers: Record<string, string> | undefined,
+	description: string,
+): Promise<Record<string, string> | undefined> {
+	if (!headers) return undefined;
+	const resolved: Record<string, string> = {};
+	for (const [key, value] of Object.entries(headers)) {
+		resolved[key] = await resolveConfigValueOrThrowAsync(value, `${description} header "${key}"`);
+	}
+	return Object.keys(resolved).length > 0 ? resolved : undefined;
+}
+
 /**
  * Model registry - loads and manages models, resolves API keys via AuthStorage.
  */
@@ -666,9 +768,17 @@ export class ModelRegistry {
 				providerConfig.modelOverrides && Object.keys(providerConfig.modelOverrides).length > 0;
 
 			if (models.length === 0) {
-				if (!providerConfig.baseUrl && !providerConfig.headers && !providerConfig.compat && !hasModelOverrides) {
+				// apiKey alone is a valid override: it supplies models.json auth for the
+				// provider's built-in models (see docs/models.md "Value Resolution").
+				if (
+					!providerConfig.baseUrl &&
+					!providerConfig.apiKey &&
+					!providerConfig.headers &&
+					!providerConfig.compat &&
+					!hasModelOverrides
+				) {
 					throw new Error(
-						`Provider ${providerName}: must specify "baseUrl", "headers", "compat", "modelOverrides", or "models".`,
+						`Provider ${providerName}: must specify "baseUrl", "apiKey", "headers", "compat", "modelOverrides", or "models".`,
 					);
 				}
 			} else if (!isBuiltIn) {
@@ -1003,7 +1113,11 @@ export class ModelRegistry {
 			this.openAICodexModelsCache = { authFingerprint, modelIds, refreshedAt: Date.now() };
 			return availableModels.filter((model) => model.provider !== "openai-codex" || modelIds.has(model.id));
 		} catch {
-			if (cached?.authFingerprint === authFingerprint && Date.now() - cached.refreshedAt < 300_000) {
+			// A failed refetch must not empty the codex pool: fall back to the cached
+			// catalog for the same credentials even when it is past the refresh TTL
+			// (re-checking freshness here could never pass — the fresh-cache guard above
+			// already returned on that condition).
+			if (cached?.authFingerprint === authFingerprint) {
 				return availableModels.filter(
 					(model) => model.provider !== "openai-codex" || cached.modelIds.has(model.id),
 				);
@@ -1302,7 +1416,7 @@ export class ModelRegistry {
 			let apiKey = authStorageAuth.apiKey;
 			let authSourceToken = authStorageAuth.sourceToken;
 			if (apiKey === undefined && providerConfig?.apiKey) {
-				const resolvedApiKey = resolveConfigValueOrThrow(
+				const resolvedApiKey = await resolveConfigValueOrThrowAsync(
 					providerConfig.apiKey,
 					`API key for provider "${model.provider}"`,
 				);
@@ -1318,9 +1432,12 @@ export class ModelRegistry {
 			}
 			this.setLastProviderAuthSourceToken(model.provider, apiKey === undefined ? undefined : authSourceToken);
 
-			const providerHeaders = resolveHeadersOrThrow(providerConfig?.headers, `provider "${model.provider}"`);
+			const providerHeaders = await resolveHeadersOrThrowAsync(
+				providerConfig?.headers,
+				`provider "${model.provider}"`,
+			);
 			const authStorageHeaders = this.authStorage.getProviderHeaders(model.provider);
-			const modelHeaders = resolveHeadersOrThrow(
+			const modelHeaders = await resolveHeadersOrThrowAsync(
 				this.modelRequestHeaders.get(this.getModelRequestKey(model.provider, model.id)),
 				`model "${model.provider}/${model.id}"`,
 			);
@@ -1408,7 +1525,7 @@ export class ModelRegistry {
 			return undefined;
 		}
 
-		const resolvedApiKey = resolveConfigValueUncached(providerApiKey);
+		const resolvedApiKey = await resolveConfigValueAsync(providerApiKey);
 		if (resolvedApiKey === undefined) {
 			this.setLastProviderAuthSourceToken(provider, undefined);
 			return undefined;

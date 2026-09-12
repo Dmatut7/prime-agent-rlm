@@ -1,5 +1,14 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { lockSync } from "proper-lockfile";
@@ -33,6 +42,11 @@ function enabledEnvironment(owner: string): NodeJS.ProcessEnv {
 		[SESSION_LEASES_ENABLED_ENV]: "1",
 		[SESSION_LEASE_OWNER_ID_ENV]: owner,
 	};
+}
+
+function leaseDirectoryFor(agentDir: string, sessionPath: string): string {
+	const key = createHash("sha256").update(sessionPath).digest("hex");
+	return join(agentDir, "session-leases", `${key}.lock`);
 }
 
 describe("session leases", () => {
@@ -288,6 +302,88 @@ describe("session leases", () => {
 			}),
 		);
 
+		const lease = acquireSessionLease(sessionPath, agentDir, enabledEnvironment("replacement"));
+		expect(lease?.sessionPath).toBe(sessionPath);
+		lease?.release();
+	});
+
+	it("reclaims a lease whose owner.json was torn by a crash", () => {
+		// Power loss between the record write and its fsync can leave a truncated
+		// owner.json. It names no process, so the next acquire must take the lease
+		// over instead of locking the session out forever.
+		const agentDir = createTempDir();
+		const sessionPath = canonicalSessionPath(resolve(agentDir, "torn.jsonl"));
+		const lockDirectory = leaseDirectoryFor(agentDir, sessionPath);
+		mkdirSync(lockDirectory, { recursive: true });
+		const tornRecord = JSON.stringify({
+			version: 1,
+			token: "torn",
+			pid: 1,
+			activeSessionId: "crashed-owner",
+			sessionPath,
+			createdAt: new Date(0).toISOString(),
+		}).slice(0, 40);
+		expect(() => JSON.parse(tornRecord)).toThrow();
+		writeFileSync(join(lockDirectory, "owner.json"), tornRecord);
+
+		const lease = acquireSessionLease(sessionPath, agentDir, enabledEnvironment("replacement"));
+		expect(lease?.sessionPath).toBe(sessionPath);
+
+		// The replacement record is complete, and the atomic write left no temp file.
+		expect(readdirSync(lockDirectory)).toEqual(["owner.json"]);
+		const owner = JSON.parse(readFileSync(join(lockDirectory, "owner.json"), "utf8")) as {
+			version: number;
+			token: string;
+			pid: number;
+			activeSessionId: string;
+			sessionPath: string;
+			createdAt: string;
+		};
+		expect(owner).toMatchObject({ version: 1, pid: process.pid, activeSessionId: "replacement", sessionPath });
+		expect(typeof owner.token).toBe("string");
+		expect(typeof owner.createdAt).toBe("string");
+
+		// Reclaiming torn bytes must not weaken the collision guard: the fresh
+		// record still fails closed against another owner identity.
+		expect(() => acquireSessionLease(sessionPath, agentDir, enabledEnvironment("intruder"))).toThrow(
+			SessionAlreadyActiveError,
+		);
+
+		lease?.release();
+		expect(existsSync(lockDirectory)).toBe(false);
+	});
+
+	it("reclaims a lease whose owner.json cannot be decoded", () => {
+		const payloads = [
+			"",
+			"this is not json",
+			'{"version": 1, "token": "half-written", "pi',
+			"null",
+			"[]",
+			"{}",
+			JSON.stringify({ version: 1, token: "orphan" }),
+			JSON.stringify({ version: 1, token: "orphan", pid: "not-a-pid", sessionPath: "/x", createdAt: "now" }),
+		];
+		expect(payloads.length).toBeGreaterThan(0);
+		for (const [index, payload] of payloads.entries()) {
+			const agentDir = createTempDir();
+			const sessionPath = canonicalSessionPath(resolve(agentDir, `undecodable-${index}.jsonl`));
+			const lockDirectory = leaseDirectoryFor(agentDir, sessionPath);
+			mkdirSync(lockDirectory, { recursive: true });
+			writeFileSync(join(lockDirectory, "owner.json"), payload);
+
+			const lease = acquireSessionLease(sessionPath, agentDir, enabledEnvironment("replacement"));
+			expect(lease?.sessionPath, `payload ${index}: ${JSON.stringify(payload)}`).toBe(sessionPath);
+			lease?.release();
+		}
+	});
+
+	it("reclaims a lease when owner.json is absent", () => {
+		const agentDir = createTempDir();
+		const sessionPath = canonicalSessionPath(resolve(agentDir, "absent-lock.jsonl"));
+		const key = createHash("sha256").update(sessionPath).digest("hex");
+		const lockDirectory = join(agentDir, "session-leases", `${key}.lock`);
+		mkdirSync(lockDirectory, { recursive: true });
 		const lease = acquireSessionLease(sessionPath, agentDir, enabledEnvironment("replacement"));
 		expect(lease?.sessionPath).toBe(sessionPath);
 		lease?.release();
