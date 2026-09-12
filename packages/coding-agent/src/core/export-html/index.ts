@@ -154,18 +154,21 @@ function generateHtml(sessionData: SessionData, themeName?: string): string {
 	const containerBg = themeExport.cardBg ?? derivedExportColors.cardBg;
 	const infoBg = themeExport.infoBg ?? derivedExportColors.infoBg;
 	const sessionDataBase64 = Buffer.from(JSON.stringify(sessionData)).toString("base64");
+	// All substitutions must use replacer functions: the embedded files contain
+	// `$&`/`$$` sequences (template.js cost display, two hljs grammars) that a
+	// string replacement would expand and corrupt.
 	const css = templateCss
-		.replace("{{THEME_VARS}}", themeVars)
-		.replace("{{BODY_BG}}", bodyBg)
-		.replace("{{CONTAINER_BG}}", containerBg)
-		.replace("{{INFO_BG}}", infoBg);
+		.replace("{{THEME_VARS}}", () => themeVars)
+		.replace("{{BODY_BG}}", () => bodyBg)
+		.replace("{{CONTAINER_BG}}", () => containerBg)
+		.replace("{{INFO_BG}}", () => infoBg);
 
 	return template
-		.replace("{{CSS}}", css)
-		.replace("{{JS}}", templateJs)
-		.replace("{{SESSION_DATA}}", sessionDataBase64)
-		.replace("{{MARKED_JS}}", markedJs)
-		.replace("{{HIGHLIGHT_JS}}", hljsJs);
+		.replace("{{CSS}}", () => css)
+		.replace("{{JS}}", () => templateJs)
+		.replace("{{SESSION_DATA}}", () => sessionDataBase64)
+		.replace("{{MARKED_JS}}", () => markedJs)
+		.replace("{{HIGHLIGHT_JS}}", () => hljsJs);
 }
 
 /** Tools rendered directly by the HTML template (not pre-rendered via TUI→ANSI→HTML pipeline) */

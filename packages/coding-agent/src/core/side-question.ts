@@ -101,6 +101,7 @@ export function startSideQuestion(
 		transport: "sse",
 		maxRetryDelayMs: parent.maxRetryDelayMs,
 		toolExecution: parent.toolExecution,
+		streamStallTimeoutMs: parent.streamStallTimeoutMs,
 	});
 
 	let answer = "";

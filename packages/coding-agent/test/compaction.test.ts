@@ -453,7 +453,7 @@ describe("prepareCompaction with small sessions", () => {
 });
 
 describe("prepareCompaction with previous compaction", () => {
-	it("should preserve kept messages across repeated compactions when they still fit", () => {
+	it("should skip a repeated compaction when the kept messages still fit", () => {
 		const u1 = createMessageEntry(createUserMessage("user msg 1 (summarized by compaction1)"));
 		const a1 = createMessageEntry(createAssistantMessage("assistant msg 1"));
 		const u2 = createMessageEntry(createUserMessage("user msg 2 - kept by compaction1"));
@@ -465,29 +465,18 @@ describe("prepareCompaction with previous compaction", () => {
 		const a4 = createMessageEntry(createAssistantMessage("assistant msg 4", createMockUsage(8000, 2000)));
 
 		const pathEntries = [u1, a1, u2, a2, u3, a3, compaction1, u4, a4];
-		const contextBefore = buildSessionContext(pathEntries);
 		const preparation = prepareCompaction(pathEntries, DEFAULT_COMPACTION_SETTINGS);
 
-		expect(preparation).toBeDefined();
-		expect(preparation!.firstKeptEntryId).toBe(u2.id);
-		expect(preparation!.previousSummary).toBe("First summary");
-		expect(extractText(preparation!.messagesToSummarize)).not.toContain("First summary");
-		expect(preparation!.tokensBefore).toBe(estimateContextTokens(contextBefore.messages).tokens);
+		// Nothing older than compaction1's cut point (u2) needs summarizing, so a
+		// second compaction could only re-emit "First summary" at the same
+		// firstKeptEntryId. That shrinks nothing, and threshold compaction would
+		// re-fire it every turn.
+		expect(preparation).toBeUndefined();
 
-		const compaction2: CompactionEntry = {
-			type: "compaction",
-			id: "compaction2-id",
-			parentId: a4.id,
-			timestamp: new Date().toISOString(),
-			summary: "Second summary",
-			firstKeptEntryId: preparation!.firstKeptEntryId,
-			tokensBefore: preparation!.tokensBefore,
-		};
-		const contextAfter = buildSessionContext([...pathEntries, compaction2]);
-		const contextAfterText = extractText(contextAfter.messages);
-
-		expect(contextAfterText).toContain("user msg 2 - kept by compaction1");
-		expect(contextAfterText).toContain("user msg 3 - kept by compaction1");
+		const contextText = extractText(buildSessionContext(pathEntries).messages);
+		expect(contextText).toContain("First summary");
+		expect(contextText).toContain("user msg 2 - kept by compaction1");
+		expect(contextText).toContain("user msg 3 - kept by compaction1");
 	});
 
 	it("should re-summarize previously kept messages when the recent window moves past them", () => {
@@ -505,7 +494,8 @@ describe("prepareCompaction with previous compaction", () => {
 			...DEFAULT_COMPACTION_SETTINGS,
 			keepRecentTokens: 100,
 		};
-		const preparation = prepareCompaction([u1, a1, u2, a2, u3, a3, compaction1, u4, a4], settings);
+		const pathEntries = [u1, a1, u2, a2, u3, a3, compaction1, u4, a4];
+		const preparation = prepareCompaction(pathEntries, settings);
 
 		expect(preparation).toBeDefined();
 		const summarizedText = extractText(preparation!.messagesToSummarize);
@@ -513,6 +503,7 @@ describe("prepareCompaction with previous compaction", () => {
 		expect(summarizedText).toContain("user msg 3 - kept by compaction1");
 		expect(summarizedText).not.toContain("First summary");
 		expect(preparation!.previousSummary).toBe("First summary");
+		expect(preparation!.tokensBefore).toBe(estimateContextTokens(buildSessionContext(pathEntries).messages).tokens);
 	});
 });
 

@@ -425,6 +425,69 @@ describe.sequential("MCP OAuth provider", () => {
 		}
 	});
 
+	it("rejects a wrong-state callback without settling and still completes with the correct state", async () => {
+		const nodeFetch = globalThis.fetch;
+		const exchangedCodes: string[] = [];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: unknown, init?: RequestInit): Promise<Response> => {
+				const missing = absentPrm(input);
+				if (missing) return missing;
+				const url = urlOf(input);
+				if (url === "https://srv.test/.well-known/oauth-authorization-server") return jsonResponse(ORIGIN_META);
+				if (url === ORIGIN_META.registration_endpoint) return jsonResponse({ client_id: "c" });
+				if (url === ORIGIN_META.token_endpoint) {
+					exchangedCodes.push(new URLSearchParams(String(init?.body)).get("code") ?? "");
+					return jsonResponse({ access_token: "state-access", expires_in: 60 });
+				}
+				throw new Error(`unexpected fetch: ${url}`);
+			}),
+		);
+
+		let resolveAuthReady!: () => void;
+		const authReady = new Promise<void>((resolve) => {
+			resolveAuthReady = resolve;
+		});
+		let authUrl = "";
+		const onPrompt = vi.fn(async () => "");
+		const loginPromise = createMcpOAuthProvider({ server: "state", url: ORIGIN_URL }).login({
+			onAuth: (info) => {
+				authUrl = info.url;
+				resolveAuthReady();
+			},
+			onPrompt,
+		});
+		await authReady;
+
+		const redirectUri = new URL(new URL(authUrl).searchParams.get("redirect_uri") ?? "");
+		const expectedState = new URL(authUrl).searchParams.get("state") ?? "";
+		expect(expectedState).not.toBe("");
+		// The server binds CALLBACK_HOST (127.0.0.1), so hit it directly instead of "localhost".
+		const callbackUrl = `http://127.0.0.1:${redirectUri.port}${redirectUri.pathname}`;
+
+		const wrongState = await nodeFetch(`${callbackUrl}?code=forged-code&state=wrong-${expectedState}`);
+		expect(wrongState.status).toBe(400);
+		await wrongState.body?.cancel();
+
+		const stillPending = await Promise.race([
+			loginPromise.then(() => false),
+			new Promise<boolean>((resolve) => {
+				setTimeout(() => resolve(true), 100);
+			}),
+		]);
+		expect(stillPending).toBe(true);
+		expect(exchangedCodes).toEqual([]);
+
+		const correctState = await nodeFetch(`${callbackUrl}?code=real-code&state=${expectedState}`);
+		expect(correctState.status).toBe(200);
+		await correctState.body?.cancel();
+
+		const creds = await loginPromise;
+		expect(creds).toMatchObject({ access: "state-access", endpoint: ORIGIN_URL });
+		expect(exchangedCodes).toEqual(["real-code"]);
+		expect(onPrompt).not.toHaveBeenCalled();
+	});
+
 	it("fails clearly when dynamic client registration is unavailable", async () => {
 		vi.stubGlobal(
 			"fetch",

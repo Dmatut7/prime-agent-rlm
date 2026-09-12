@@ -13,6 +13,9 @@ const CALLBACK_PORTS = Array.from({ length: CALLBACK_PORT_COUNT }, (_, i) => CAL
 const redirectUriFor = (port: number) => `http://localhost:${port}${CALLBACK_PATH}`;
 const ALL_REDIRECT_URIS = CALLBACK_PORTS.map(redirectUriFor);
 const TOKEN_EXPIRY_BUFFER_MS = 5 * 60 * 1000;
+// Token refresh runs while the caller holds the shared auth.json lock, so every request
+// gets a hard deadline instead of undici's multi-minute defaults.
+const NETWORK_TIMEOUT_MS = 30_000;
 
 interface AuthServerMetadata {
 	issuer: string;
@@ -86,7 +89,7 @@ function authorizationServerMetadataUrls(issuer: string): string[] {
 }
 
 async function fetchResponse(url: string, init?: RequestInit): Promise<Response> {
-	return fetch(url, { ...init, redirect: "error" });
+	return fetch(url, { ...init, redirect: "error", signal: init?.signal ?? AbortSignal.timeout(NETWORK_TIMEOUT_MS) });
 }
 
 async function fetchJson(url: string, init?: RequestInit): Promise<unknown> {
@@ -240,7 +243,10 @@ async function registerClient(registrationEndpoint: string, label: string): Prom
 
 type CallbackResult = { code: string; state: string } | null;
 
-async function startCallbackServer(label: string): Promise<{
+async function startCallbackServer(
+	label: string,
+	expectedState: string,
+): Promise<{
 	server: Server;
 	redirectUri: string;
 	cancel: () => void;
@@ -268,14 +274,23 @@ async function startCallbackServer(label: string): Promise<{
 		const error = url.searchParams.get("error");
 		const code = url.searchParams.get("code");
 		const state = url.searchParams.get("state");
+		// Validate `state` before settling. The callback port comes from a small fixed
+		// range, so a stale redirect from an earlier login — or any local page probing
+		// the port — would otherwise fail the transaction that is actually in flight.
+		// Reject those and keep waiting for the redirect this login is expecting.
+		if (state !== expectedState) {
+			res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
+			res.end(oauthErrorHtml("State mismatch."));
+			return;
+		}
 		res.writeHead(error || !code ? 400 : 200, { "Content-Type": "text/html; charset=utf-8" });
 		if (error) {
 			res.end(oauthErrorHtml(`${label} authentication failed.`, `Error: ${error}`));
 			settle?.(null);
 			return;
 		}
-		if (!code || !state) {
-			res.end(oauthErrorHtml("Missing code or state parameter."));
+		if (!code) {
+			res.end(oauthErrorHtml("Missing authorization code parameter."));
 			settle?.(null);
 			return;
 		}
@@ -429,7 +444,7 @@ export function createMcpOAuthProvider(config: McpOAuthConfig): OAuthProviderInt
 		// secret used at token exchange, while `state` is echoed on the redirect URL.
 		const state = randomState();
 		const scope = config.scopes ?? meta.scopes_supported?.join(" ");
-		const cb = await startCallbackServer(label);
+		const cb = await startCallbackServer(label, state);
 		try {
 			const authParams = new URLSearchParams({
 				client_id: clientId,

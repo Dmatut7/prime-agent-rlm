@@ -700,8 +700,10 @@ export function prepareCompaction(
 		}
 	}
 
-	// Avoid a compaction that would summarize no history.
-	if (messagesToSummarize.length === 0 && turnPrefixMessages.length === 0 && !previousSummary) {
+	// Avoid a compaction that would summarize no history: it keeps the same
+	// firstKeptEntryId, so the context it produces is no smaller than the one it
+	// replaces, and a threshold compaction would re-fire every turn.
+	if (messagesToSummarize.length === 0 && turnPrefixMessages.length === 0) {
 		return undefined;
 	}
 	const fileOps = extractFileOperations(messagesToSummarize, pathEntries, prevCompactionIndex);
@@ -776,6 +778,9 @@ export async function compact(
 	if (isSplitTurn && turnPrefixMessages.length > 0) {
 		// Split turns make two wire calls with different bodies; each needs its own identity.
 		const [historyResult, turnPrefixResult] = await Promise.all([
+			// An empty history slice still replaces the previous compaction in the
+			// rebuilt context, so carry its summary forward instead of dropping
+			// everything summarized before it.
 			messagesToSummarize.length > 0
 				? summaryCall((callHeaders) =>
 						generateSummary(
@@ -790,7 +795,7 @@ export async function compact(
 							thinkingLevel,
 						),
 					)
-				: Promise.resolve<SummarySlice>({ summary: "No prior history." }),
+				: Promise.resolve<SummarySlice>({ summary: previousSummary ?? "No prior history." }),
 			summaryCall((callHeaders) =>
 				generateTurnPrefixSummary(
 					turnPrefixMessages,
@@ -857,9 +862,18 @@ async function generateTurnPrefixSummary(
 	thinkingLevel?: ThinkingLevel,
 ): Promise<SummarySlice> {
 	const maxTokens = Math.floor(0.5 * reserveTokens); // Smaller budget for turn prefix
-	const llmMessages = convertToLlm(messages);
+	// Same input budget as generateSummary: an oversized turn prefix must not
+	// overflow the summarization request itself.
+	const contextWindow = model.contextWindow || 0;
+	const inputBudget = contextWindow > 0 ? contextWindow - reserveTokens : 0;
+	const { messages: budgetedMessages, elided } = budgetSummarizationInput(messages, inputBudget);
+	const llmMessages = convertToLlm(budgetedMessages);
 	const conversationText = serializeConversation(llmMessages);
-	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
+	let promptText = "";
+	if (elided > 0) {
+		promptText += `[Note: ${elided} older message(s) were elided to fit the summarization budget.]\n`;
+	}
+	promptText += `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
 	const summarizationMessages = [
 		{
 			role: "user" as const,

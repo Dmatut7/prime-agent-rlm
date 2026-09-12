@@ -540,6 +540,180 @@ describe("AgentsViewMode", () => {
 		expect(persistentState.scopeFrames).toHaveLength(1);
 	});
 
+	it("coalesces the progressively streamed saved catalog into a bounded number of reconciles", async () => {
+		vi.useFakeTimers();
+		const total = 40;
+		const wireSession = (index: number) => ({
+			path: `/tmp/sessions/session-${index}.jsonl`,
+			id: `session-${index}`,
+			cwd: "/tmp",
+			created: "2026-01-01T00:00:00.000Z",
+			modified: "2026-01-02T00:00:00.000Z",
+			messageCount: 1,
+			firstMessage: `first message ${index}`,
+			allMessagesText: `first message ${index}`,
+		});
+		const request = vi.fn(
+			async (
+				_command: unknown,
+				_timeout: unknown,
+				callbacks?: { onProgress?: (update: unknown) => void },
+			): Promise<{ success: true; data: { sessions: ReturnType<typeof wireSession>[] } }> => {
+				for (let index = 0; index < total; index++) {
+					callbacks?.onProgress?.({
+						type: "session_list_item",
+						command: "list_saved_sessions",
+						id: "catalog",
+						session: wireSession(index),
+					});
+				}
+				return {
+					success: true,
+					data: { sessions: Array.from({ length: total }, (_, index) => wireSession(index)) },
+				};
+			},
+		);
+		let reconciles = 0;
+		const self: Record<string, unknown> = {
+			options: { config: { cwd: "/tmp" } },
+			persistentState: {},
+			reconnectPromise: undefined,
+			daemonShutdownReceived: false,
+			savedCatalogGeneration: 0,
+			savedCatalogReady: true,
+			savedCatalogRefreshPending: false,
+			lastSuccessfulSavedSessions: [],
+			savedSessions: [],
+			heartbeats: [],
+			lastListedSummaries: [],
+			inactiveAgentIdentities: new Set(),
+			pendingDeleteAgent: undefined,
+			scopeKey: undefined,
+			expandedSubagentParents: new Set(),
+			programShownParents: new Set(),
+			stopped: false,
+			editor: { getText: () => "re:/tmp/sessions/session-3\\.jsonl" },
+			requireClient: () => ({ request }),
+			getSavedSessionCatalogContext: () => ({ cwd: "/tmp" }),
+			setStatusMessage: vi.fn(),
+			resolveMissingSelectionAnchor: vi.fn(),
+			rearmSavedSearchFetch: vi.fn(),
+			applyPendingAncestorExpansion: vi.fn(),
+			restoreSelection: vi.fn(),
+			ui: { requestRender: vi.fn() },
+			withPendingDeleteSession: (sessions: SessionSummary[]) => sessions,
+			getFilteredRecords: () => invoke("getFilteredRecords", self),
+		};
+		self.reconcileCatalogs = () => {
+			reconciles += 1;
+			invoke("reconcileCatalogs", self);
+		};
+		self.scheduleCatalogReconcile = () => invoke("scheduleCatalogReconcile", self);
+
+		try {
+			await expect(invoke("refreshSavedSessions", self)).resolves.toBe(true);
+			expect(request).toHaveBeenCalledOnce();
+			expect((self.savedSessions as unknown[]).length).toBe(total);
+			// One reconcile per streamed session would be quadratic in catalog size:
+			// the burst may only cost a leading rebuild plus the settle.
+			expect(reconciles).toBeGreaterThan(0);
+			expect(reconciles).toBeLessThanOrEqual(3);
+			// The settle already covered the burst, so the trailing flush is a no-op.
+			vi.advanceTimersByTime(500);
+			expect(reconciles).toBeLessThanOrEqual(3);
+			// The regex query was parsed once and still filtered the reconciled rows.
+			const rows = Reflect.get(self, "rows") as AgentsViewRow[];
+			expect(rows.map((row) => row.summary.sessionId)).toEqual(["session-3"]);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("flushes one coalesced reconcile per burst and none after teardown", () => {
+		vi.useFakeTimers();
+		const reconciledAt: number[] = [];
+		const self: Record<string, unknown> = { stopped: false };
+		// Stands in for the real reconcile's bookkeeping: it clears the dirty flag and
+		// stamps the throttle window the scheduler measures against.
+		self.reconcileCatalogs = () => {
+			reconciledAt.push(Date.now());
+			self.catalogReconcileDirty = false;
+			self.lastCatalogReconcileAt = Date.now();
+		};
+
+		try {
+			self.lastCatalogReconcileAt = Date.now();
+			for (let index = 0; index < 25; index++) {
+				invoke("scheduleCatalogReconcile", self);
+			}
+			expect(reconciledAt).toHaveLength(0);
+			vi.advanceTimersByTime(50);
+			expect(reconciledAt).toHaveLength(1);
+
+			// A burst starting outside the window rebuilds at once, then coalesces again.
+			vi.advanceTimersByTime(50);
+			invoke("scheduleCatalogReconcile", self);
+			expect(reconciledAt).toHaveLength(2);
+			invoke("scheduleCatalogReconcile", self);
+			vi.advanceTimersByTime(50);
+			expect(reconciledAt).toHaveLength(3);
+
+			// A stopped view never rebuilds from a scheduled flush.
+			self.stopped = true;
+			invoke("scheduleCatalogReconcile", self);
+			vi.advanceTimersByTime(200);
+			expect(reconciledAt).toHaveLength(3);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("keeps coalescing when a rebuild outlasts the throttle window", () => {
+		vi.useFakeTimers();
+		const rebuiltAt: number[] = [];
+		const self: Record<string, unknown> = {
+			persistentState: {},
+			lastListedSummaries: [],
+			savedSessions: [],
+			heartbeats: [],
+			inactiveAgentIdentities: new Set(),
+			pendingDeleteAgent: undefined,
+			savedCatalogReady: true,
+			scopeKey: undefined,
+			expandedSubagentParents: new Set(),
+			programShownParents: new Set(),
+			stopped: false,
+			lastCatalogReconcileAt: 0,
+			editor: { getText: () => "" },
+			setStatusMessage: vi.fn(),
+			applyPendingAncestorExpansion: vi.fn(),
+			restoreSelection: vi.fn(),
+			withPendingDeleteSession: (sessions: SessionSummary[]) => sessions,
+			getFilteredRecords: () => invoke("getFilteredRecords", self),
+			// Stands in for a large catalog: the rebuild takes longer than the throttle window.
+			ui: {
+				requestRender: () => {
+					rebuiltAt.push(Date.now());
+					vi.advanceTimersByTime(200);
+				},
+			},
+		};
+		self.reconcileCatalogs = () => invoke("reconcileCatalogs", self);
+
+		try {
+			for (let index = 0; index < 10; index++) {
+				invoke("scheduleCatalogReconcile", self);
+			}
+			vi.advanceTimersByTime(500);
+			// The burst costs a leading rebuild plus one trailing flush; a window stamped
+			// at the rebuild's start would rebuild once per streamed session.
+			expect(rebuiltAt.length).toBeGreaterThan(0);
+			expect(rebuiltAt.length).toBeLessThanOrEqual(2);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("carries the resolved scope root across view remounts", () => {
 		const root = summary({ sessionName: "Scoped root" });
 		const persistentState: AgentsViewPersistentState = {

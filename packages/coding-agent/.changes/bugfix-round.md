@@ -1,0 +1,8 @@
+- Fixed HTML export attribute-injection (session content could break out of attributes) and `$`-pattern corruption of embedded assets (missing `$` on cost display, broken hljs grammars).
+- Fixed split-turn compaction dropping the previous summary, and zero-reduction compaction clearing the cooldown loop.
+- Fixed orphan-process reaping on non-UTC hosts (kernel-side ps start-id now pins TZ=UTC/LC_ALL=C, matching the host side).
+- Fixed first-dispatch timeout tiers being eaten by pre-dispatch bounces, and per-bounce reaction accumulation on the delivery abort promise.
+- emitContext no longer deep-clones the whole message history when no handler is registered; streamStallTimeoutMs now propagates to child and side-question agents.
+- Fixed kitty key-release double-fire (PageUp scrolling twice), RPC unknown-command errors missing the request id, and ACP sessions silently swallowing extension errors.
+- MCP OAuth callbacks now validate state before settling; MCP calls and session opens have bounded timeouts instead of hanging for minutes.
+- Fixed Bedrock 1h cache-write mispricing; cron store no longer re-reads everything per mutation and prunes terminal jobs; agents view reconcile is coalesced instead of O(N^2); autonomous gate snapshots are captured lazily; legacy session migration now converges; stdin paste and inline transcript normalization no longer quadratic.

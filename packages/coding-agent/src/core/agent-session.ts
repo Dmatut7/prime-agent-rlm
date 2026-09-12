@@ -11476,6 +11476,7 @@ export class AgentSession {
 			transport: this.settingsManager.getTransport(),
 			maxRetryDelayMs: this.settingsManager.getProviderRetrySettings().maxRetryDelayMs,
 			toolExecution: this.agent.toolExecution,
+			streamStallTimeoutMs: this.agent.streamStallTimeoutMs,
 		});
 
 		const child = new AgentSession({

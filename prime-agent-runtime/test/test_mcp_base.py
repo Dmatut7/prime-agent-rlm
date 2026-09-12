@@ -180,6 +180,85 @@ class McpIntegrationTest(unittest.TestCase):
                 _run(integration.nonexistent_tool())
         self.assertIn("list_issues", str(ctx.exception))
 
+    def test_wedged_call_tool_times_out(self):
+        # A wedged server must not hold a kernel cell for the transport's own read
+        # timeout (300s): the call is bounded like the generic registry's.
+        session = _FakeSession(tools=[], result=None)
+
+        async def wedged(name, arguments):
+            await asyncio.sleep(30)
+
+        session.call_tool = wedged
+        started = time.monotonic()
+        with mock.patch.object(mcp_base, "_CALL_TIMEOUT_SECONDS", 0.05):
+            with self._patch_session(session):
+                with self.assertRaises(TimeoutError) as ctx:
+                    _run(_Integration().call_tool("list_issues", {}))
+        self.assertLess(time.monotonic() - started, 5.0)
+        self.assertIn("demo", str(ctx.exception))
+        self.assertIn("list_issues", str(ctx.exception))
+
+    def test_wedged_open_session_times_out(self):
+        # The bound covers the connect + initialize round trips too, including a
+        # subclass override of _open_session (stdio transports).
+        async def wedged_open(self_, stack: AsyncExitStack):
+            await asyncio.sleep(30)
+            raise AssertionError("unreachable")
+
+        started = time.monotonic()
+        with mock.patch.object(_Integration, "_open_session", wedged_open):
+            with mock.patch.object(mcp_base, "_CALL_TIMEOUT_SECONDS", 0.05):
+                with self.assertRaises(TimeoutError):
+                    _run(_Integration().call_tool("list_issues", {}))
+        self.assertLess(time.monotonic() - started, 5.0)
+
+    def test_wedged_list_tools_times_out(self):
+        session = _FakeSession(tools=[], result=None)
+
+        async def wedged():
+            await asyncio.sleep(30)
+
+        session.list_tools = wedged
+        integration = _Integration()
+        started = time.monotonic()
+        with mock.patch.object(mcp_base, "_OPEN_TIMEOUT_SECONDS", 0.05):
+            with self._patch_session(session):
+                with self.assertRaises(TimeoutError) as ctx:
+                    _run(integration.list_tools())
+        self.assertLess(time.monotonic() - started, 5.0)
+        self.assertIn("list_tools", str(ctx.exception))
+        # The wedged attempt must not leave the discovery lock held.
+        self.assertFalse(integration._lock.locked())
+
+    def test_wedged_session_teardown_does_not_outlast_the_bound(self):
+        # The session that wedged the call can wedge its own __aexit__; the
+        # per-call unwind is bounded so the TimeoutError still reaches the cell.
+        class _WedgingContext:
+            async def __aenter__(self_inner):
+                return None
+
+            async def __aexit__(self_inner, *exc):
+                await asyncio.sleep(30)
+                return False
+
+        async def open_wedging(self_, stack: AsyncExitStack):
+            await stack.enter_async_context(_WedgingContext())
+            session = _FakeSession(tools=[], result=None)
+
+            async def wedged(name, arguments):
+                await asyncio.sleep(30)
+
+            session.call_tool = wedged
+            return session
+
+        started = time.monotonic()
+        with mock.patch.object(_Integration, "_open_session", open_wedging):
+            with mock.patch.object(mcp_base, "_CALL_TIMEOUT_SECONDS", 0.05):
+                with mock.patch.object(mcp_base, "_CLOSE_TIMEOUT_SECONDS", 0.05):
+                    with self.assertRaises(TimeoutError):
+                        _run(_Integration().call_tool("list_issues", {}))
+        self.assertLess(time.monotonic() - started, 5.0)
+
     def test_oversized_text_result_is_truncated_and_marked(self):
         block = type("B", (), {"text": "x" * (mcp_base._MAX_RESULT_CHARS + 100)})()
         result = type("R", (), {"content": [block], "structuredContent": None})()

@@ -291,23 +291,26 @@ async function runAutonomousQualityGates(
 		return "failed";
 	}
 	for (const command of state.gates.commands) {
-		const currentSnapshot = await captureGitWorktreeSnapshot(cwd, signal);
 		signal?.throwIfAborted();
-		if (
-			state.lastGateFailure?.command === command &&
-			state.lastGateFailureSnapshot &&
-			gitWorktreeSnapshotsEqual(currentSnapshot, state.lastGateFailureSnapshot)
-		) {
-			const attempt = (state.gateAttempts[command] ?? state.lastGateFailure.attempt) + 1;
-			state.gateAttempts[command] = attempt;
-			state.lastGateFailure = {
-				...state.lastGateFailure,
-				attempt,
-				exitText: "not rerun: workspace unchanged since previous failed gate",
-				output:
-					"The autonomous gate was not rerun because the workspace has not changed since this failure. Edit source files, tests, or a blocker artifact before attempting to finish again.",
-			};
-			return attempt > state.gates.maxRetries ? "retry_exhausted" : "failed";
+		// Snapshots are only captured where they are read: a pre-run one to decide whether this
+		// command may be skipped, and a post-run one to keep for the next turn's comparison.
+		const previousFailure = state.lastGateFailure;
+		const previousSnapshot = state.lastGateFailureSnapshot;
+		if (previousFailure?.command === command && previousSnapshot) {
+			const currentSnapshot = await captureGitWorktreeSnapshot(cwd, signal);
+			signal?.throwIfAborted();
+			if (gitWorktreeSnapshotsEqual(currentSnapshot, previousSnapshot)) {
+				const attempt = (state.gateAttempts[command] ?? previousFailure.attempt) + 1;
+				state.gateAttempts[command] = attempt;
+				state.lastGateFailure = {
+					...previousFailure,
+					attempt,
+					exitText: "not rerun: workspace unchanged since previous failed gate",
+					output:
+						"The autonomous gate was not rerun because the workspace has not changed since this failure. Edit source files, tests, or a blocker artifact before attempting to finish again.",
+				};
+				return attempt > state.gates.maxRetries ? "retry_exhausted" : "failed";
+			}
 		}
 		const result = await runChildProcess(command, [], {
 			cwd,
@@ -317,8 +320,6 @@ async function runAutonomousQualityGates(
 			signal,
 		});
 		signal?.throwIfAborted();
-		const postRunSnapshot = await captureGitWorktreeSnapshot(cwd, signal);
-		signal?.throwIfAborted();
 		if (result.status === 0 && !result.error && !result.timedOut) {
 			state.gateAttempts[command] = 0;
 			if (state.lastGateFailure?.command === command) {
@@ -327,6 +328,8 @@ async function runAutonomousQualityGates(
 			}
 			continue;
 		}
+		const postRunSnapshot = await captureGitWorktreeSnapshot(cwd, signal);
+		signal?.throwIfAborted();
 		const attempt = (state.gateAttempts[command] ?? 0) + 1;
 		state.gateAttempts[command] = attempt;
 		const exitText = formatProcessExit(result);

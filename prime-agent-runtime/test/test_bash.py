@@ -1107,6 +1107,34 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
                     )
         self.assertEqual(run.call_args.args[0][0], "/bin/ps")
 
+    def test_ps_start_id_pins_utc_and_c_locale(self):
+        # The host recomputes this identity with TZ and locale pinned to UTC/C
+        # (session-lease.ts psStartIdQuery). An unpinned `lstart` renders in the
+        # host's local zone and locale, so on a non-UTC host the journaled stamp
+        # never compares equal and identity-verified reaping refuses to fire.
+        completed = mock.Mock(stdout="Mon Jan  1 00:00:00 2026\n")
+        with mock.patch.object(bash_module.sys, "platform", "darwin"):
+            with mock.patch("builtins.open", side_effect=OSError):
+                with mock.patch.object(bash_module.subprocess, "run", return_value=completed) as run:
+                    bash_module._process_start_id(1234)
+        env = run.call_args.kwargs["env"]
+        for name, pinned in (("TZ", "UTC"), ("LC_ALL", "C"), ("LC_TIME", "C"), ("LANG", "C")):
+            self.assertEqual(env[name], pinned, name)
+
+    def test_ps_start_id_render_is_tz_independent(self):
+        if not bash_module._IS_POSIX:
+            self.skipTest("ps-based start identity")
+        # Real ps on the ps branch (no /proc): the stamp must not move with the
+        # ambient TZ, or the host's TZ=UTC recomputation cannot match it.
+        with mock.patch("builtins.open", side_effect=OSError):
+            with mock.patch.dict(os.environ, {"TZ": "America/New_York"}):
+                eastern = bash_module._process_start_id(os.getpid())
+            with mock.patch.dict(os.environ, {"TZ": "Australia/Sydney"}):
+                sydney = bash_module._process_start_id(os.getpid())
+        self.assertIsNotNone(eastern)
+        self.assertTrue(eastern.startswith("ps:"), eastern)
+        self.assertEqual(eastern, sydney)
+
     async def test_undelivered_kill_leaves_journal_record_active(self):
         if not bash_module._IS_POSIX:
             self.skipTest("POSIX signal-delivery semantics")
@@ -1245,6 +1273,60 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
             result = await bash("echo ok")
         self.assertEqual(result.exit_code, 0)
         self.assertIn("ok", result.output)
+
+    def test_journal_fsync_leaves_the_calling_thread(self):
+        # The append is the enrollment contract (it is what the host reaper reads
+        # and what reports an unwritable journal); the durability wait is not, so
+        # a slow fsync is paid by the flusher thread, never by the spawner.
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = os.path.join(tmp, "journal.jsonl")
+            release = threading.Event()
+            flushed = threading.Event()
+
+            def blocking_fsync(fd):
+                flushed.set()
+                release.wait(5)
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL": journal,
+                    "PRIME_AGENT_KERNEL_OWNER_PID": str(os.getpid()),
+                },
+            ):
+                with mock.patch.object(bash_module.os, "fsync", blocking_fsync):
+                    started = time.monotonic()
+                    self.assertTrue(bash_module._record_journal(os.getpid(), active=False))
+                    elapsed = time.monotonic() - started
+                    # The flush still happens; it just is not waited for here.
+                    self.assertTrue(flushed.wait(5.0))
+                    release.set()
+            self.assertLess(elapsed, 1.0)
+            # The record the host reads is complete without waiting for the flush.
+            with open(journal) as f:
+                records = [json.loads(line) for line in f if line.strip()]
+            mine = [record for record in records if record["pid"] == os.getpid()]
+            self.assertEqual(len(mine), 1)
+            self.assertFalse(mine[0]["active"])
+
+    def test_journal_fsync_failure_does_not_reject_enrollment(self):
+        # A flush error is not an enrollment failure: the record is already in the
+        # file, which is all the host reaper needs after this kernel dies.
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = os.path.join(tmp, "journal.jsonl")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL": journal,
+                    "PRIME_AGENT_KERNEL_OWNER_PID": str(os.getpid()),
+                },
+            ):
+                with mock.patch.object(bash_module.os, "fsync", side_effect=OSError("EIO")):
+                    self.assertTrue(bash_module._record_journal(os.getpid(), active=False))
+            with open(journal) as f:
+                records = [json.loads(line) for line in f if line.strip()]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["pid"], os.getpid())
 
 
 async def _poll_group_dead(pgid: int, timeout: float = 5.0) -> None:

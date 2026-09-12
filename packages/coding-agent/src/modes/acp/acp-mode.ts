@@ -787,6 +787,26 @@ export async function runAcpModeWithConnection(
 						);
 						return;
 					}
+					// Extension failures are connection-scoped diagnostics, not session
+					// events. RPC and interactive mode surface them; dropping them here
+					// would leave an ACP client with no way to see why an extension broke.
+					if (event.type === "extension_error") {
+						void producer.publish(
+							{
+								sessionUpdate: "session_info_update",
+								_meta: primeAgentMeta({
+									extensionError: {
+										extensionPath: event.extensionPath,
+										event: event.event,
+										error: event.error,
+									},
+								}),
+							},
+							0,
+							"event",
+						);
+						return;
+					}
 					if (event.type !== "session_event") return;
 					if (event.event.type === "rlm_child_update") {
 						observedChildren.set(event.event.child.id, event.event.child);

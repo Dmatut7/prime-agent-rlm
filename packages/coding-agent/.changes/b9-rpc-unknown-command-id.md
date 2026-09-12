@@ -1,0 +1,2 @@
+- Fixed RPC mode dropping the request id from unknown-command errors, which left clients waiting for their response timeout instead of failing immediately.
+- Added ACP forwarding of extension failures to the client as a `session_info_update` carrying `extensionError` metadata, so extension errors are diagnosable outside RPC and interactive mode.

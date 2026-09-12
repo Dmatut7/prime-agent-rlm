@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -6,6 +6,7 @@ import {
 	type AgentCronJob,
 	AgentCronJobStore,
 	AgentCronScheduler,
+	MAX_RETAINED_TERMINAL_JOBS,
 	migrateLegacyCronJobsToSessionArtifacts,
 	normalizeHeartbeatDeliveryMode,
 	parseAgentCronSchedule,
@@ -936,6 +937,207 @@ describe("AgentCronJobStore", () => {
 			status: "cancelled",
 		});
 	});
+
+	it("drops the registration of a session whose artifact directory is gone", () => {
+		const root = makeTempDir(tempDirs);
+		const liveDir = join(root, "session-artifacts", "session-live");
+		const deletedDir = join(root, "session-artifacts", "session-deleted");
+		const store = AgentCronJobStore.forSessionArtifacts();
+		store.registerSessionArtifact("session-live", liveDir);
+		store.registerSessionArtifact("session-deleted", deletedDir);
+		store.createHeartbeat({
+			activeSessionId: "active-live",
+			sessionId: "session-live",
+			sessionFile: join(root, "sessions", "session-live.jsonl"),
+			cwd: root,
+			scheduleText: "every 5m",
+			prompt: "watch the live session",
+			now: start,
+		});
+		store.createHeartbeat({
+			activeSessionId: "active-deleted",
+			sessionId: "session-deleted",
+			sessionFile: join(root, "sessions", "session-deleted.jsonl"),
+			cwd: root,
+			scheduleText: "every 5m",
+			prompt: "watch the session that is deleted later",
+			now: start,
+		});
+		expect(existsSync(join(deletedDir, SESSION_SCHEDULED_JOBS_FILENAME))).toBe(true);
+
+		rmSync(deletedDir, { recursive: true, force: true });
+
+		expect(store.list().map((job) => job.sessionId)).toEqual(["session-live"]);
+		// Only a dropped registration can be registered again for the same path.
+		expect(store.registerSessionArtifact("session-deleted", deletedDir)).toBe(true);
+		store.createHeartbeat({
+			activeSessionId: "active-live",
+			sessionId: "session-live",
+			sessionFile: join(root, "sessions", "session-live.jsonl"),
+			cwd: root,
+			scheduleText: "every 5m",
+			prompt: "keep watching the live session",
+			now: new Date("2026-01-01T12:35:00.000Z"),
+		});
+		expect(existsSync(deletedDir)).toBe(false);
+	});
+
+	it("keeps the registration of a session that never wrote an artifact", () => {
+		const root = makeTempDir(tempDirs);
+		const artifactDir = join(root, "session-artifacts", "session-fresh");
+		const store = AgentCronJobStore.forSessionArtifacts();
+		store.registerSessionArtifact("session-fresh", artifactDir);
+
+		expect(store.list()).toEqual([]);
+		expect(store.registerSessionArtifact("session-fresh", artifactDir)).toBe(false);
+
+		const heartbeat = store.createHeartbeat({
+			activeSessionId: "active-fresh",
+			sessionId: "session-fresh",
+			sessionFile: join(root, "sessions", "session-fresh.jsonl"),
+			cwd: root,
+			scheduleText: "every 5m",
+			prompt: "first schedule for a fresh session",
+			now: start,
+		});
+
+		expect(store.list().map((job) => job.id)).toEqual([heartbeat.id]);
+	});
+
+	it("prunes terminal jobs past the retention bound on the next write", () => {
+		const storePath = makeStorePath(tempDirs);
+		const finishedCount = MAX_RETAINED_TERMINAL_JOBS + 20;
+		const finished = Array.from({ length: finishedCount }, (_, index) =>
+			jobFixture({
+				id: `finished-${String(index).padStart(3, "0")}`,
+				updatedAt: new Date(start.getTime() + (index + 1) * 1000).toISOString(),
+			}),
+		);
+		const scheduled = jobFixture({
+			id: "scheduled",
+			status: "active",
+			nextRunAt: "2026-01-01T13:34:00.000Z",
+			updatedAt: new Date(start.getTime() + (finishedCount + 1) * 1000).toISOString(),
+		});
+		writeStoreFile(storePath, [...finished, scheduled]);
+		const store = new AgentCronJobStore(storePath);
+		expect(store.list()).toHaveLength(finishedCount + 1);
+
+		store.cancel(scheduled.id, new Date(start.getTime() + (finishedCount + 2) * 1000));
+
+		const listed = store.list();
+		const ids = new Set(listed.map((job) => job.id));
+		const droppedCount = finishedCount + 1 - MAX_RETAINED_TERMINAL_JOBS;
+		expect(droppedCount).toBeGreaterThan(0);
+		expect(listed).toHaveLength(MAX_RETAINED_TERMINAL_JOBS);
+		expect(ids.has(scheduled.id)).toBe(true);
+		for (const job of finished.slice(0, droppedCount)) {
+			expect(ids.has(job.id)).toBe(false);
+		}
+		for (const job of finished.slice(droppedCount)) {
+			expect(ids.has(job.id)).toBe(true);
+		}
+	});
+
+	it("keeps a terminal job whose dispatch is still claimed while pruning", () => {
+		const storePath = makeStorePath(tempDirs);
+		const finishedCount = MAX_RETAINED_TERMINAL_JOBS + 20;
+		const claimed = jobFixture({ id: "claimed", updatedAt: start.toISOString() });
+		const finished = Array.from({ length: finishedCount }, (_, index) =>
+			jobFixture({
+				id: `finished-${String(index).padStart(3, "0")}`,
+				updatedAt: new Date(start.getTime() + (index + 1) * 1000).toISOString(),
+			}),
+		);
+		const scheduled = jobFixture({
+			id: "scheduled",
+			status: "active",
+			nextRunAt: "2026-01-01T13:34:00.000Z",
+			updatedAt: new Date(start.getTime() + (finishedCount + 1) * 1000).toISOString(),
+		});
+		writeStoreFile(
+			storePath,
+			[claimed, ...finished, scheduled],
+			[
+				{
+					id: "dispatch-1",
+					jobId: claimed.id,
+					claimedAt: start.toISOString(),
+					scheduledFor: start.toISOString(),
+				},
+			],
+		);
+		const store = new AgentCronJobStore(storePath);
+
+		store.cancel(scheduled.id, new Date(start.getTime() + (finishedCount + 2) * 1000));
+
+		const listed = store.list();
+		expect(listed.filter((job) => job.status === "cancelled")).toHaveLength(MAX_RETAINED_TERMINAL_JOBS);
+		expect(listed.map((job) => job.id)).toContain(claimed.id);
+		expect(listed.map((job) => job.id)).toContain(scheduled.id);
+		expect(listed.map((job) => job.id)).not.toContain(finished[0]!.id);
+	});
+
+	it("reports heartbeat catalog changes once and ignores other job updates", () => {
+		const store = new AgentCronJobStore(makeStorePath(tempDirs));
+		let notifications = 0;
+		store.onHeartbeatChange(() => {
+			notifications += 1;
+		});
+		const cronJob = store.create({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: "/tmp/session.jsonl",
+			cwd: "/tmp/project",
+			scheduleText: "in 1h",
+			prompt: "plain cron job",
+			now: start,
+		});
+		store.cancel(cronJob.id, new Date("2026-01-01T12:35:00.000Z"));
+		expect(notifications).toBe(0);
+
+		const heartbeat = store.createHeartbeat({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: "/tmp/session.jsonl",
+			cwd: "/tmp/project",
+			scheduleText: "every 5m",
+			prompt: "check on me",
+			now: start,
+		});
+		expect(notifications).toBe(1);
+
+		store.recordSkipResult(heartbeat.id, { now: new Date("2026-01-01T12:39:00.000Z") });
+		expect(notifications).toBe(1);
+
+		store.pauseHeartbeat("active-1", new Date("2026-01-01T12:40:00.000Z"));
+		expect(notifications).toBe(2);
+
+		store.clearHeartbeat("active-1", new Date("2026-01-01T12:41:00.000Z"));
+		expect(notifications).toBe(3);
+	});
+
+	it("bounds the synchronous wait for a store lock another process holds", () => {
+		const storePath = makeStorePath(tempDirs);
+		const store = new AgentCronJobStore(storePath);
+		mkdirSync(`${storePath}.lock`, { recursive: true });
+
+		const began = performance.now();
+		expect(() =>
+			store.create({
+				activeSessionId: "active-1",
+				sessionId: "session-1",
+				sessionFile: "/tmp/session.jsonl",
+				cwd: "/tmp/project",
+				scheduleText: "in 1h",
+				prompt: "contended write",
+				now: start,
+			}),
+		).toThrow("Lock file is already being held");
+		const blockedMs = performance.now() - began;
+
+		expect(blockedMs).toBeLessThan(700);
+	});
 });
 
 describe("AgentCronScheduler", () => {
@@ -1512,6 +1714,30 @@ function writeJobsForTest(store: AgentCronJobStore, jobs: readonly AgentCronJob[
 			writeJobs(jobs: readonly AgentCronJob[]): void;
 		}
 	).writeJobs(jobs);
+}
+
+function jobFixture(overrides: Partial<AgentCronJob> & Pick<AgentCronJob, "id">): AgentCronJob {
+	return {
+		status: "cancelled",
+		activeSessionId: "active-1",
+		sessionId: "session-1",
+		sessionFile: "/tmp/session.jsonl",
+		cwd: "/tmp/project",
+		prompt: `finished job ${overrides.id}`,
+		schedule: { kind: "cron", expression: "@daily" },
+		createdAt: start.toISOString(),
+		updatedAt: start.toISOString(),
+		runCount: 0,
+		...overrides,
+	};
+}
+
+function writeStoreFile(
+	path: string,
+	jobs: readonly AgentCronJob[],
+	dispatches: ReadonlyArray<{ id: string; jobId: string; claimedAt: string; scheduledFor: string }> = [],
+): void {
+	writeFileSync(path, `${JSON.stringify({ jobs, dispatches }, null, 2)}\n`);
 }
 
 function makeStorePath(tempDirs: string[]): string {

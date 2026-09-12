@@ -416,6 +416,32 @@ describe("TUI differential rendering", () => {
 		tui.stop();
 	});
 
+	it("normalizes changed and restored lines correctly across frames", async () => {
+		const terminal = new VirtualTerminal(40, 6);
+		const tui = new TUI(terminal);
+		const component = new TestComponent();
+		tui.addChild(component);
+
+		component.lines = ["a\tb", "c\td"];
+		tui.start();
+		await terminal.waitForRender();
+		assert.strictEqual(terminal.getViewport()[0], "a   b");
+		assert.strictEqual(terminal.getViewport()[1], "c   d");
+
+		component.lines = ["changed"];
+		tui.requestRender();
+		await terminal.waitForRender();
+		assert.strictEqual(terminal.getViewport()[0], "changed");
+
+		component.lines = ["a\tb", "c\td"];
+		tui.requestRender();
+		await terminal.waitForRender();
+		assert.strictEqual(terminal.getViewport()[0], "a   b", "restored line must normalize again");
+		assert.strictEqual(terminal.getViewport()[1], "c   d");
+
+		tui.stop();
+	});
+
 	it("renders correctly when first line changes but rest stays same", async () => {
 		const terminal = new VirtualTerminal(40, 10);
 		const tui = new TUI(terminal);

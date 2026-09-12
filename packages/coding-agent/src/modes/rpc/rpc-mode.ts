@@ -433,8 +433,11 @@ async function runRpcModeWithConnectionInternal(
 				return success(id, command.type, { commands });
 			}
 			default: {
-				const unknownCommand = command as { type: string };
-				return error(undefined, unknownCommand.type, `Unknown command: ${unknownCommand.type}`);
+				// Echo the request id: clients correlate responses by id, so an id-less
+				// error leaves the caller waiting for its timeout instead of failing fast.
+				const unknownCommand = command as { id?: unknown; type: string };
+				const unknownId = typeof unknownCommand.id === "string" ? unknownCommand.id : undefined;
+				return error(unknownId, unknownCommand.type, `Unknown command: ${unknownCommand.type}`);
 			}
 		}
 	};
