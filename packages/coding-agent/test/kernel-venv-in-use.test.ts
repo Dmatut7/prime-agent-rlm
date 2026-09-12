@@ -16,6 +16,8 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+	BOOT_CLAIM_PREFIX,
+	claimKernelVenvBootSync,
 	decideKernelVenvRebuild,
 	generationDirForSuffix,
 	isKernelVenvGenerationDir,
@@ -125,7 +127,12 @@ describe("kernel venv in-use references", () => {
 
 	it("reports no references for a venv without a reference directory", async () => {
 		const venv = createGeneration("aaaaaaaaaaaa");
-		expect(await readKernelVenvInUseState(venv)).toEqual({ references: [], unknown: false, swept: [] });
+		expect(await readKernelVenvInUseState(venv)).toEqual({
+			references: [],
+			bootClaims: [],
+			unknown: false,
+			swept: [],
+		});
 	});
 
 	it("sweeps a reference whose pid is dead and keeps a live one", async () => {
@@ -464,5 +471,94 @@ describe("kernel venv generation pruning", () => {
 	it("survives a missing parent directory", async () => {
 		const report = await pruneKernelVenvGenerations(join(tempDir, "absent", "kernel-venv"), {});
 		expect(report).toEqual({ removed: [], kept: [] });
+	});
+});
+
+describe("pending-boot claims (P2-2)", () => {
+	it("claims a generation for a boot that has not spawned yet, apart from the references", async () => {
+		const venv = createGeneration("aaaaaaaaaaaa");
+		const claim = claimKernelVenvBootSync(venv, { pid: process.pid, sessionId: "session-boot" });
+		expect(claim.reason).toBeUndefined();
+		expect(claim.claimPath).toBe(join(venv, VENV_IN_USE_DIR_NAME, `${BOOT_CLAIM_PREFIX}${process.pid}`));
+		const record = JSON.parse(readFileSync(claim.claimPath as string, "utf8"));
+		expect(record.version).toBe(1);
+		expect(record.pid).toBe(process.pid);
+		expect(record.sessionId).toBe("session-boot");
+
+		const state = await readKernelVenvInUseState(venv);
+		expect(state.references).toEqual([]);
+		expect(state.bootClaims.map((entry) => entry.pid)).toEqual([process.pid]);
+		// A claim is a promise to spawn, not a running kernel: it must not make the state unknown
+		// and must not defer a rebuild the claimant itself may be about to perform.
+		expect(state.unknown).toBe(false);
+		expect(
+			decideKernelVenvRebuild({
+				platform: process.platform,
+				generationDirExists: true,
+				liveReferences: state.references.length,
+				referenceStateUnknown: state.unknown,
+			}).mode,
+		).toBe("replace");
+	});
+
+	it("sweeps a claim whose holder is provably gone", async () => {
+		const venv = createGeneration("aaaaaaaaaaaa");
+		const dead = deadPid();
+		const claim = claimKernelVenvBootSync(venv, { pid: dead });
+		const state = await readKernelVenvInUseState(venv);
+		expect(state.bootClaims).toEqual([]);
+		expect(state.swept).toEqual([claim.claimPath]);
+		expect(readdirSync(join(venv, VENV_IN_USE_DIR_NAME))).toEqual([]);
+	});
+
+	it("is superseded by the kernel reference the spawn records", () => {
+		const venv = createGeneration("aaaaaaaaaaaa");
+		const claim = claimKernelVenvBootSync(venv, { pid: process.pid, sessionId: "session-boot" });
+		expect(existsSync(claim.claimPath as string)).toBe(true);
+
+		const recorded = recordKernelVenvInUseSync(venv, { pid: process.pid, sessionId: "session-a" });
+		expect(recorded.unverified).toBe(false);
+		// One file, the stronger fact: the claim does not linger next to the reference it handed over to.
+		expect(readdirSync(join(venv, VENV_IN_USE_DIR_NAME))).toEqual([String(process.pid)]);
+	});
+
+	it("keeps a claimed generation out of a prune that would otherwise reclaim it", async () => {
+		const claimed = createGeneration("aaaaaaaaaaaa");
+		const abandoned = createGeneration("bbbbbbbbbbbb");
+		const active = createGeneration("cccccccccccc");
+		// A live host process announced a spawn from the oldest generation and has not spawned yet.
+		const claim = claimKernelVenvBootSync(claimed, { pid: process.pid, sessionId: "concurrent-boot" });
+		expect(claim.claimPath).toBeDefined();
+		setRecency([claimed, abandoned, active]);
+
+		const report = await pruneKernelVenvGenerations(base, { activeDir: active, retention: 0 });
+
+		expect(report.removed).toEqual([abandoned]);
+		expect(existsSync(claimed)).toBe(true);
+		expect(existsSync(claim.claimPath as string)).toBe(true);
+		const keptClaimed = report.kept.find((entry) => entry.dir === claimed);
+		expect(keptClaimed?.pendingBoots).toBe(1);
+		// Kept by the claim, not by a reference: the distinction is what leaves a rebuild possible.
+		expect(keptClaimed?.protectedByReference).toBe(false);
+		expect(keptClaimed?.liveReferences).toBe(0);
+
+		// Positive control: with the claim gone the same prune reclaims it, so the case above is
+		// decided by the claim and not by retention or recency.
+		releaseKernelVenvInUseSync(claim.claimPath);
+		const after = await pruneKernelVenvGenerations(base, { activeDir: active, retention: 0 });
+		expect(after.removed).toEqual([claimed]);
+		expect(existsSync(claimed)).toBe(false);
+	});
+
+	it("prunes a generation whose claim is stale", async () => {
+		const stale = createGeneration("aaaaaaaaaaaa");
+		const active = createGeneration("bbbbbbbbbbbb");
+		claimKernelVenvBootSync(stale, { pid: deadPid() });
+		setRecency([stale, active]);
+
+		const report = await pruneKernelVenvGenerations(base, { activeDir: active, retention: 0 });
+
+		expect(report.removed).toEqual([stale]);
+		expect(existsSync(stale)).toBe(false);
 	});
 });

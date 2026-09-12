@@ -27,7 +27,10 @@ import path from "node:path";
 import { requireNoFollow } from "../../utils/private-files.js";
 import { getProcessStartId } from "../session-lease.js";
 
-/** Directory inside a generation that holds one reference file per live kernel pid. */
+/**
+ * Directory inside a generation that holds one reference file per live kernel pid, plus one
+ * `boot-<pid>` claim per host process that is about to spawn a kernel from it.
+ */
 export const VENV_IN_USE_DIR_NAME = ".in-use";
 /** Unreferenced generations kept for inspection; referenced ones are always kept. */
 export const RETIRED_VENV_RETENTION = 1;
@@ -36,6 +39,14 @@ export const KERNEL_VENV_SUFFIX_LENGTH = 12;
 const REFERENCE_RECORD_VERSION = 1;
 /** File name prefix of the tombstone a kernel writes when its reference file could not be written. */
 export const UNVERIFIED_REFERENCE_PREFIX = "unverified-";
+/**
+ * File name prefix of a pending-boot claim: a host process announces "I am about to spawn a kernel
+ * from this generation" before it has a kernel pid to reference it with (P2-2). Without it the
+ * window between a boot handing back an interpreter path and the spawn recording its reference
+ * reads as "zero references" to a concurrent boot's sweep, which may then delete the directory the
+ * first boot is about to exec - a self-healing but user-visible failed spawn.
+ */
+export const BOOT_CLAIM_PREFIX = "boot-";
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
@@ -72,8 +83,24 @@ export interface KernelVenvInUseRecord {
 	reason?: string;
 }
 
+/** Outcome of announcing one pending kernel spawn. */
+export interface KernelVenvBootClaim {
+	/** Absolute path of the claim file; absent when the claim could not be written. */
+	claimPath?: string;
+	/** Why the claim could not be written, for the caller's log line. */
+	reason?: string;
+}
+
 export interface KernelVenvInUseState {
 	references: KernelVenvInUseReference[];
+	/**
+	 * Live pending-boot claims: host processes that announced a spawn from this generation and have
+	 * not recorded a kernel reference yet. They are deliberately kept apart from `references` - a
+	 * claim is a promise to spawn, not a running kernel, so it protects the directory from being
+	 * *deleted* (nothing would be left to spawn from) without deferring a *rebuild* the claimant
+	 * itself may be about to perform.
+	 */
+	bootClaims: KernelVenvInUseReference[];
 	/**
 	 * The generation exists but its reference state could not be fully established: either the
 	 * reference directory could not be read, or a live kernel could not write its reference and
@@ -87,7 +114,7 @@ export interface KernelVenvInUseState {
 
 export interface KernelVenvPruneReport {
 	removed: string[];
-	kept: { dir: string; liveReferences: number; protectedByReference: boolean }[];
+	kept: { dir: string; liveReferences: number; protectedByReference: boolean; pendingBoots?: number }[];
 }
 
 export type KernelVenvRebuildMode = "replace" | "defer";
@@ -192,6 +219,11 @@ export function recordKernelVenvInUseSync(
 		...(processStartId ? { processStartId } : {}),
 		recordedAt: new Date().toISOString(),
 	};
+	// This process's pending-boot claim for the same generation is superseded by the reference it
+	// is recording now, whichever way the write ends: a reference is the stronger fact, and a
+	// tombstone protects the directory too (it makes the state unknown). Removing the claim first
+	// keeps a host that never spawns again from pinning a generation for its whole lifetime.
+	releaseKernelVenvInUseSync(path.join(dir, `${BOOT_CLAIM_PREFIX}${process.pid}`));
 	const referencePath = path.join(dir, String(reference.pid));
 	const failure = writeReferenceFile(referencePath, dir, identity);
 	if (failure === undefined) return { releasePath: referencePath, unverified: false };
@@ -206,9 +238,43 @@ export function recordKernelVenvInUseSync(
 }
 
 /**
- * Drop this kernel's reference. Synchronous because teardown also runs from
- * `process.on("exit")`; a missed release is reclaimed by the next stale sweep
- * (dead pid, or a live pid whose start identity no longer matches).
+ * Announce that this process is about to spawn a kernel from `venvDir` (P2-2).
+ *
+ * The claim lives in the same directory as the references and is judged by the same liveness rule,
+ * so a host that dies before it spawns is swept by the next reader instead of pinning the
+ * generation forever. It is superseded - removed - by {@link recordKernelVenvInUseSync} from the
+ * same process, which is the normal end of its life: the spawned kernel's own reference takes over.
+ *
+ * Best effort and never fatal: a claim that cannot be written costs the boot nothing but the
+ * protection, which is the pre-existing behaviour, so the caller logs `reason` and carries on.
+ */
+export function claimKernelVenvBootSync(
+	venvDir: string,
+	reference: { pid?: number; sessionId?: string } = {},
+): KernelVenvBootClaim {
+	const pid = reference.pid ?? process.pid;
+	if (!venvDir || !Number.isInteger(pid) || pid <= 0) {
+		return { reason: "no directory or pid to claim for" };
+	}
+	const dir = path.join(venvDir, VENV_IN_USE_DIR_NAME);
+	const processStartId = getProcessStartId(pid);
+	const identity = {
+		version: REFERENCE_RECORD_VERSION,
+		pid,
+		...(reference.sessionId ? { sessionId: reference.sessionId } : {}),
+		...(processStartId ? { processStartId } : {}),
+		recordedAt: new Date().toISOString(),
+	};
+	const claimPath = path.join(dir, `${BOOT_CLAIM_PREFIX}${pid}`);
+	const failure = writeReferenceFile(claimPath, dir, identity);
+	return failure === undefined ? { claimPath } : { reason: failure };
+}
+
+/**
+ * Drop this kernel's reference, or a pending-boot claim: both are files in the same directory and
+ * both are reclaimed by the same stale sweep. Synchronous because teardown also runs from
+ * `process.on("exit")`; a missed release is reclaimed by the next sweep (dead pid, or a live pid
+ * whose start identity no longer matches).
  */
 export function releaseKernelVenvInUseSync(referencePath: string | undefined): void {
 	if (!referencePath) return;
@@ -267,18 +333,26 @@ export async function readKernelVenvInUseState(venvDir: string): Promise<KernelV
 		entries = await readdir(dir);
 	} catch (error) {
 		if (isNodeError(error, "ENOENT") || isNodeError(error, "ENOTDIR")) {
-			return { references: [], unknown: false, swept: [] };
+			return { references: [], bootClaims: [], unknown: false, swept: [] };
 		}
-		return { references: [], unknown: true, swept: [] };
+		return { references: [], bootClaims: [], unknown: true, swept: [] };
 	}
 	const references: KernelVenvInUseReference[] = [];
+	const bootClaims: KernelVenvInUseReference[] = [];
 	const swept: string[] = [];
 	let unknown = false;
 	for (const entry of [...entries].sort()) {
 		// A tombstone (`unverified-<pid>`) is a reference whose writer could not create the real
 		// file; it counts, and it makes the state unknown so a rebuild defers instead of deleting.
 		const tombstone = entry.startsWith(UNVERIFIED_REFERENCE_PREFIX);
-		const pidName = tombstone ? entry.slice(UNVERIFIED_REFERENCE_PREFIX.length) : entry;
+		// A claim (`boot-<pid>`) is a host about to spawn; it is counted apart from the references
+		// so that it protects the directory from deletion without deferring a rebuild (P2-2).
+		const bootClaim = !tombstone && entry.startsWith(BOOT_CLAIM_PREFIX);
+		const pidName = tombstone
+			? entry.slice(UNVERIFIED_REFERENCE_PREFIX.length)
+			: bootClaim
+				? entry.slice(BOOT_CLAIM_PREFIX.length)
+				: entry;
 		// Names this bookkeeping never writes are ignored: they neither protect the
 		// generation nor get deleted.
 		if (!PID_FILE_NAME.test(pidName)) continue;
@@ -295,16 +369,17 @@ export async function readKernelVenvInUseState(venvDir: string): Promise<KernelV
 			continue;
 		}
 		if (tombstone) unknown = true;
-		references.push({
+		const parsed: KernelVenvInUseReference = {
 			pid: record?.pid as number,
 			...(record?.processStartId ? { processStartId: record.processStartId } : {}),
 			...(record?.sessionId ? { sessionId: record.sessionId } : {}),
 			...(record?.recordedAt ? { recordedAt: record.recordedAt } : {}),
 			...(tombstone ? { unverified: true } : {}),
 			referencePath,
-		});
+		};
+		(bootClaim ? bootClaims : references).push(parsed);
 	}
-	return { references, unknown, swept };
+	return { references, bootClaims, unknown, swept };
 }
 
 /**
@@ -412,10 +487,13 @@ function generationRecencyMs(dir: string): number {
  * Reclaim generations no kernel references any more: every referenced generation
  * is kept (one per build identity, however many identities are still running),
  * plus the newest `retention` unreferenced ones. Unreadable reference state
- * counts as referenced. The generation this boot is about to use is never a
- * candidate, and neither is the legacy unsuffixed base directory: kernels
- * spawned by pre-generation hosts run from it without leaving references, so
- * "no references" is not evidence that it is free.
+ * counts as referenced, and so does a live pending-boot claim: a host that
+ * announced a spawn from a generation but has not recorded its kernel yet would
+ * otherwise watch that generation disappear underneath the spawn (P2-2). The
+ * generation this boot is about to use is never a candidate, and neither is the
+ * legacy unsuffixed base directory: kernels spawned by pre-generation hosts run
+ * from it without leaving references, so "no references" is not evidence that it
+ * is free.
  */
 export async function pruneKernelVenvGenerations(
 	base: string,
@@ -427,8 +505,20 @@ export async function pruneKernelVenvGenerations(
 	const unreferenced: { dir: string; recencyMs: number }[] = [];
 	for (const dir of candidates) {
 		const state = await readKernelVenvInUseState(dir);
+		const pendingBoots = state.bootClaims.length;
 		if (state.unknown || state.references.length > 0) {
-			kept.push({ dir, liveReferences: state.references.length, protectedByReference: true });
+			kept.push({
+				dir,
+				liveReferences: state.references.length,
+				protectedByReference: true,
+				...(pendingBoots > 0 ? { pendingBoots } : {}),
+			});
+			continue;
+		}
+		if (pendingBoots > 0) {
+			// Announced by a live host that has no kernel pid to point at yet. The claim is swept
+			// once its holder is provably gone, so this defers the reclaim rather than losing it.
+			kept.push({ dir, liveReferences: 0, protectedByReference: false, pendingBoots });
 			continue;
 		}
 		unreferenced.push({ dir, recencyMs: generationRecencyMs(dir) });

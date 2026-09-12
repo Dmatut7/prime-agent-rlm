@@ -23,6 +23,7 @@ import {
 	resolveRuntimeIdentity,
 } from "../src/core/kernel/bootstrap.js";
 import { ReplKernelManager } from "../src/core/kernel/index.js";
+import { pruneKernelVenvGenerations } from "../src/core/kernel/venv-in-use.js";
 
 let tempDir = "";
 let originalEnv: NodeJS.ProcessEnv;
@@ -365,6 +366,32 @@ describe("kernel bootstrap builds into versioned generation directories", () => 
 		expect(existsSync(join(generation, "previous-build-marker"))).toBe(false);
 	}, 60_000);
 
+	it("claims the generation it hands out, so a concurrent boot's sweep cannot reclaim it", async () => {
+		// P2-2: between this boot returning an interpreter path and the caller recording the
+		// spawned kernel's reference, the generation has no pid pointing at it. A second boot with
+		// another identity sweeps in exactly that window, so the boot's own claim has to hold the
+		// directory - the sweep keeps nothing here by recency or retention.
+		installFakeUv();
+		const python = await ensureKernelPython();
+		const claimedGeneration = dirname(dirname(python));
+		const inUseNames = readdirSync(join(claimedGeneration, ".in-use"));
+		expect(inUseNames).toEqual([`boot-${process.pid}`]);
+		const claim = JSON.parse(readFileSync(join(claimedGeneration, ".in-use", inUseNames[0] as string), "utf8"));
+		expect(claim.pid).toBe(process.pid);
+		expect(claim.version).toBe(1);
+
+		const otherGeneration = createPartialGeneration("aaaaaaaaaaaa");
+		// Oldest first: the claimed generation is the one a retention-0 sweep would take.
+		setRecency([claimedGeneration, otherGeneration]);
+
+		const report = await pruneKernelVenvGenerations(base, { activeDir: otherGeneration, retention: 0 });
+
+		expect(report.removed).not.toContain(claimedGeneration);
+		expect(existsSync(join(claimedGeneration, "bin", "python"))).toBe(true);
+		expect(existsSync(python)).toBe(true);
+		expect(report.kept.some((entry) => entry.dir === claimedGeneration && entry.pendingBoots === 1)).toBe(true);
+	}, 60_000);
+
 	it("keeps an unreferenced generation within retention and every referenced one", async () => {
 		installFakeUv();
 		const python = await ensureKernelPython();
@@ -537,6 +564,8 @@ describe("kernel manager pins its generation with an in-use reference", () => {
 			const referenceDir = join(generation, ".in-use");
 			const references = readdirSync(referenceDir);
 			expect(references).toHaveLength(1);
+			// The pending-boot claim this spawn wrote was superseded by the reference (P2-2).
+			expect(references.some((name) => name.startsWith("boot-"))).toBe(false);
 			const record = JSON.parse(readFileSync(join(referenceDir, references[0] as string), "utf8"));
 			expect(references[0]).toBe(String(record.pid));
 			expect(record.version).toBe(1);
@@ -589,6 +618,12 @@ describe("kernel manager pins its generation with an in-use reference", () => {
 			expect(warnings[0]?.sessionId).toBe("session-unwritable");
 			expect(warnings[0]?.venvDir).toBe(generation);
 			expect(typeof warnings[0]?.reason).toBe("string");
+			// The pending-boot claim this spawn tried to write failed for the same reason, and it
+			// is reported rather than quietly skipped: the generation is unprotected (P2-2).
+			const claimWarnings = entries.filter((entry) => entry.msg === "kernel venv boot claim unavailable");
+			expect(claimWarnings).toHaveLength(1);
+			expect(claimWarnings[0]?.venvDir).toBe(generation);
+			expect(typeof claimWarnings[0]?.reason).toBe("string");
 		} finally {
 			setLogSink(undefined);
 			await manager.shutdown({});

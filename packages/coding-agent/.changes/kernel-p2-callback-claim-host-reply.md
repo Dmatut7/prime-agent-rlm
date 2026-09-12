@@ -1,0 +1,4 @@
+- Fixed a throwing host callback on the kernel's output stream (a UI stream update or a late agent-message handler) crashing the whole daemon worker: the failure is now contained, counted and logged, and the cell keeps the output it had already produced.
+- Fixed a restart-budget or read-only-timeout setting that throws taking the worker down with it; the kernel now falls back to its defaults and logs the failure.
+- Fixed one kernel bootstrap deleting the Python generation directory another boot was about to start its kernel from: a boot now claims the generation until the spawned kernel's own in-use reference takes over.
+- Fixed a host-request reply that only became ready after a kernel revival being written into the replacement kernel's stdin; it is now reported as an undeliverable late reply instead.

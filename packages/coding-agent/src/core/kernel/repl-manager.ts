@@ -88,7 +88,7 @@ import {
 	type SnapshotWritePolicy,
 	snapshotWritePolicy,
 } from "./state-snapshot.js";
-import { recordKernelVenvInUseSync, releaseKernelVenvInUseSync } from "./venv-in-use.js";
+import { claimKernelVenvBootSync, recordKernelVenvInUseSync, releaseKernelVenvInUseSync } from "./venv-in-use.js";
 
 /** Newest kernel protocol this host speaks, and the one it asks the kernel for. */
 const kernelLog = getLogger("coding-agent.kernel");
@@ -127,6 +127,12 @@ const KERNEL_LIVENESS_MIN_SAMPLE_GAP_MS = 1_000;
 const KERNEL_LIVENESS_MAX_SAMPLES = 2;
 /** Rejection streaks are logged at 1 and then every N, so a broken runtime cannot flood the log. */
 const KERNEL_LIVENESS_REJECT_LOG_EVERY = 50;
+/**
+ * Host-callback failures are reported at 1 and then every N, so one broken handler on a stream
+ * that emits thousands of frames cannot flood the log - while the accumulated count on each
+ * throttled line keeps the failure from being silent.
+ */
+const KERNEL_CALLBACK_FAILURE_LOG_EVERY = 25;
 const READY_TIMEOUT_MS = 30_000;
 const REPAIR_STEP_TIMEOUT_MS = 30_000;
 /**
@@ -449,6 +455,15 @@ export class ReplKernelManager {
 	private consecutiveRejectedHeartbeatFrames = 0;
 	/** Well-formed frames dropped for arriving inside the minimum sample gap. */
 	private throttledHeartbeatFrames = 0;
+	/**
+	 * Host callbacks and frame handling contained so far this episode. A callback runs inside a
+	 * stdout "data" handler, so an exception escaping it is an uncaught exception - which the
+	 * daemon worker turns into `process.exit(1)` for every session it hosts. They are counted,
+	 * reported, and never allowed to reach the loop (P2-1).
+	 */
+	private containedCallbackFailures = 0;
+	/** Failed reads of the host's restart policy; reported on every failure (a per-cell path). */
+	private restartPolicyFailures = 0;
 	/** Aborts every in-flight host request (e.g. admitted rlm.run children) on teardown. */
 	private hostRequestController = new AbortController();
 	private state: "idle" | "starting" | "running" | "shutdown" = "idle";
@@ -697,6 +712,61 @@ export class ReplKernelManager {
 		});
 	}
 
+	/**
+	 * Run one host-supplied callback and contain what it throws.
+	 *
+	 * Every callback in this class belongs to somebody else (the tool framework's `onUpdate`, a
+	 * session's message recorder, a UI renderer), and the ones on the frame path run inside a
+	 * `child.stdout` "data" handler: an exception that escapes there is an uncaught exception, and
+	 * the daemon worker's handler for that is `process.exit(1)` - one broken renderer taking every
+	 * session the worker hosts with it (P2-1). Containing it costs the host one log line and never
+	 * the kernel, the cell, or the frame's own bookkeeping, which is done before the callback runs.
+	 */
+	private invokeHostCallback(callback: string, invoke: () => void): void {
+		try {
+			invoke();
+		} catch (error) {
+			this.containCallbackFailure(callback, error);
+		}
+	}
+
+	/** One contained callback failure: counted always, reported at 1 and then every N. */
+	private containCallbackFailure(what: string, error: unknown): void {
+		this.containedCallbackFailures++;
+		const failures = this.containedCallbackFailures;
+		if (failures !== 1 && failures % KERNEL_CALLBACK_FAILURE_LOG_EVERY !== 0) return;
+		this.appendKernelDiagnostic(`kernel ${what} failed: ${errorMessage(error)} (${failures} contained so far)`);
+		kernelLog.warn("kernel host callback failed", {
+			callback: what,
+			error: errorMessage(error),
+			failures,
+			kernelPid: this.child?.pid,
+			sessionId: this.options.sessionId,
+		});
+	}
+
+	/**
+	 * The frame loop's own backstop. The callbacks inside it are contained individually, so this
+	 * only fires on a host-side bug in the event handling itself - and even then the verdict is the
+	 * same: drop the frame, keep the kernel, say so loudly (P2-1).
+	 */
+	private containEventHandlingFailure(event: Record<string, unknown>, error: unknown): void {
+		const kind = typeof event.event === "string" ? event.event : "unknown";
+		this.containedCallbackFailures++;
+		const failures = this.containedCallbackFailures;
+		if (failures !== 1 && failures % KERNEL_CALLBACK_FAILURE_LOG_EVERY !== 0) return;
+		this.appendKernelDiagnostic(
+			`kernel event handling failed for ${kind}: ${errorMessage(error)} (${failures} contained so far)`,
+		);
+		kernelLog.warn("kernel event handling failed", {
+			event: kind,
+			error: errorMessage(error),
+			failures,
+			kernelPid: this.child?.pid,
+			sessionId: this.options.sessionId,
+		});
+	}
+
 	private appendKernelDiagnostic(message: string): void {
 		this.appendKernelStderrText(`[kernel] ${message.endsWith("\n") ? message : `${message}\n`}`);
 	}
@@ -843,6 +913,8 @@ export class ReplKernelManager {
 		}
 
 		const stderrLogFd = this.openStderrLogFd();
+		// Claimed before the spawn, superseded by the reference recorded right after it (P2-2).
+		const bootClaimPath = this.claimVenvForSpawn(python);
 		let child: ChildProcess;
 		try {
 			// Safe path: the session cwd must never sit at sys.path[0], or a checkout
@@ -872,7 +944,12 @@ export class ReplKernelManager {
 		this.intentionalExitOrigin = undefined;
 		if (child.pid !== undefined) {
 			recordOrphanProcessState(child.pid, true);
+			// Recording the kernel's own reference supersedes - removes - the claim above.
 			this.inUseReferencePath = this.recordVenvInUseReference(child.pid);
+		} else {
+			// No pid means no reference will ever supersede it: drop the claim instead of pinning
+			// the generation for this process's lifetime.
+			releaseKernelVenvInUseSync(bootClaimPath);
 		}
 		this.readyDeferred = createDeferred<number>();
 		this.startupProtocolError = undefined;
@@ -974,6 +1051,33 @@ export class ReplKernelManager {
 		return record.releasePath;
 	}
 
+	/**
+	 * Announce the spawn this manager is about to perform and return the claim's path (P2-2).
+	 *
+	 * A revival re-spawns from a generation whose previous reference was released with the dead
+	 * kernel, so between that release and the new reference there is no pid pointing at the
+	 * directory: a concurrent boot's sweep would read it as abandoned and could delete the
+	 * interpreter this spawn is about to exec. The claim is superseded by the reference the spawn
+	 * records, and swept by any reader once this process is provably gone. Best effort, like every
+	 * other piece of this bookkeeping: an interpreter outside a managed generation claims nothing.
+	 */
+	private claimVenvForSpawn(python: string): string | undefined {
+		const venvDir = managedKernelVenvDirForPython(python);
+		if (!venvDir) return undefined;
+		const claim = claimKernelVenvBootSync(venvDir, { pid: process.pid, sessionId: this.options.sessionId });
+		if (claim.reason) {
+			kernelLog.warn("kernel venv boot claim unavailable", {
+				venvDir,
+				reason: claim.reason,
+				sessionId: this.options.sessionId,
+			});
+			this.appendKernelDiagnostic(
+				`could not claim the kernel venv generation ${venvDir} before spawning: ${claim.reason}`,
+			);
+		}
+		return claim.claimPath;
+	}
+
 	private wireChild(child: ChildProcess): void {
 		const decoder = new StringDecoder("utf8");
 		let buffered = "";
@@ -1014,7 +1118,14 @@ export class ReplKernelManager {
 					this.failProtocolFrame(child, `${invalidReason}: ${line.slice(0, 200)}`);
 					return;
 				}
-				this.handleEvent(event);
+				try {
+					this.handleEvent(event);
+				} catch (error) {
+					// Contained here rather than left to the "data" handler, where it would become
+					// an uncaught exception and the daemon worker would exit(1) every session it
+					// hosts. The remaining lines of this chunk are still processed (P2-1).
+					this.containEventHandlingFailure(event, error);
+				}
 			}
 		});
 
@@ -1144,9 +1255,29 @@ export class ReplKernelManager {
 		};
 	}
 
-	/** Restart budget in force right now; read at every death so a settings edit applies at once. */
+	/**
+	 * Restart budget in force right now; read at every death so a settings edit applies at once.
+	 *
+	 * The read is guarded because it also runs inside the kernel "exit" handler (P2-1): a policy
+	 * callback that throws there is an uncaught exception, which the daemon worker turns into
+	 * `process.exit(1)`. The default budget applies instead, and every failure is reported - a
+	 * host that cannot read its own settings has to stay visible, not silently lose its budget.
+	 */
 	private currentRestartPolicy(): KernelRestartPolicy {
-		const configured = this.options.restartPolicy?.();
+		let configured: KernelRestartPolicy | undefined;
+		try {
+			configured = this.options.restartPolicy?.();
+		} catch (error) {
+			this.restartPolicyFailures++;
+			this.appendKernelDiagnostic(
+				`kernel restart policy callback failed: ${errorMessage(error)}; using the default restart budget`,
+			);
+			kernelLog.warn("kernel restart policy callback failed", {
+				error: errorMessage(error),
+				failures: this.restartPolicyFailures,
+				sessionId: this.options.sessionId,
+			});
+		}
 		return {
 			maxRestarts: configured?.maxRestarts ?? DEFAULT_MAX_UNEXPECTED_RESTARTS,
 			windowMs: configured?.windowMs ?? DEFAULT_KERNEL_RESTART_WINDOW_MS,
@@ -1207,8 +1338,11 @@ export class ReplKernelManager {
 	 * Settle at idle with the reprovisioning flags armed, so the next `execute()` spawns a
 	 * replacement and restores into it. The in-flight host requests are *not* cancelled: they
 	 * belong to work the host already admitted (an `rlm.run` child, a message delivery), and a
-	 * kernel crash is not a teardown of the family (I-11). Their replies are dropped, which is
-	 * what the reset notice reports.
+	 * kernel crash is not a teardown of the family (I-11). Their replies are dropped - by the
+	 * generation check in {@link sendHostReply}, which is what makes that unconditional: the
+	 * teardown below bumps the generation, so a reply that only becomes ready after the replacement
+	 * is up is reported as late instead of being written into a kernel that never asked for it
+	 * (P2-3). The drop is what the reset notice reports.
 	 */
 	private armRevivalAfterUnexpectedExit(cause: KernelDeathCause): void {
 		this.pendingRebootstrap = true;
@@ -1643,7 +1777,8 @@ export class ReplKernelManager {
 					}
 				}
 			}
-			execution.opts.onStream?.(text, type);
+			const onStream = execution.opts.onStream;
+			if (onStream) this.invokeHostCallback("onStream", () => onStream(text, type));
 		} else if (type === "result") {
 			if (typeof event.text === "string") execution.result = event.text;
 		} else if (type === "display") {
@@ -1987,7 +2122,7 @@ export class ReplKernelManager {
 		}
 		this.lateSentAgentMessageHandlers.delete(requestId);
 		this.lateSentAgentMessageHandlers.set(requestId, handler);
-		handler(sentAgentMessage);
+		this.invokeHostCallback("late agent_message", () => handler(sentAgentMessage));
 		return true;
 	}
 
@@ -2091,8 +2226,12 @@ export class ReplKernelManager {
 		// off, and unbounded it would hold the cell - and the vouch that excuses the cell's
 		// silence - for as long as the handler likes. A side-effecting one is never bounded here.
 		const readOnlyTimeoutMs = hostRequestTypeIsCancellable(this.options.cancellableHostRequestTypes, described.type)
-			? (this.options.readOnlyHostRequestTimeoutMs?.() ?? DEFAULT_SHORT_TARGET_WAIT_MS)
+			? this.readOnlyHostRequestBoundMs()
 			: undefined;
+		// The kernel this request came from, identified by the start generation it was accepted
+		// under. A revival keeps admitted host work alive (I-11) but replaces the kernel underneath
+		// it, so a long handler can outlive the kernel that asked it (P2-3).
+		const requestGeneration = this.startGeneration;
 		// The handler starts on a microtask so the request is registered first: a handler that
 		// blocks before its first await is still counted, and still has an age, from the moment
 		// the request was accepted.
@@ -2111,22 +2250,16 @@ export class ReplKernelManager {
 								target: described.label === undefined ? described.type : `${described.type} ${described.label}`,
 								label: "Kernel host request",
 							});
-				try {
-					await this.writeLine({ type: "host_reply", id: requestId, data: { status: "ok", result } });
-				} catch (replyError) {
-					this.reportLateHostReply(requestId, described, true, replyError);
-				}
+				await this.sendHostReply(requestId, described, requestGeneration, { status: "ok", result }, true);
 			} catch (error) {
 				this.appendKernelDiagnostic(`host request failed for ${requestId}: ${errorMessage(error)}`);
-				try {
-					await this.writeLine({
-						type: "host_reply",
-						id: requestId,
-						data: { status: "error", error: errorMessage(error) },
-					});
-				} catch (replyError) {
-					this.reportLateHostReply(requestId, described, false, replyError);
-				}
+				await this.sendHostReply(
+					requestId,
+					described,
+					requestGeneration,
+					{ status: "error", error: errorMessage(error) },
+					false,
+				);
 			}
 		});
 		this.inFlightHostRequests.set(task, {
@@ -2137,6 +2270,30 @@ export class ReplKernelManager {
 		void task.finally(() => {
 			this.inFlightHostRequests.delete(task);
 		});
+	}
+
+	/**
+	 * The bound for one read-only (whitelisted) host request, read live so a settings edit applies
+	 * at once. Guarded because this runs inside the frame loop (P2-1): a throwing settings callback
+	 * must neither escape as an uncaught exception nor cost the request its reply, which is what
+	 * dropping the frame would do - the kernel would wait for a reply that never comes. The default
+	 * bound applies and the failure is reported.
+	 */
+	private readOnlyHostRequestBoundMs(): number {
+		const read = this.options.readOnlyHostRequestTimeoutMs;
+		if (!read) return DEFAULT_SHORT_TARGET_WAIT_MS;
+		try {
+			return read();
+		} catch (error) {
+			this.appendKernelDiagnostic(
+				`kernel read-only host request timeout callback failed: ${errorMessage(error)}; using the default bound`,
+			);
+			kernelLog.warn("kernel read-only host request timeout callback failed", {
+				error: errorMessage(error),
+				sessionId: this.options.sessionId,
+			});
+			return DEFAULT_SHORT_TARGET_WAIT_MS;
+		}
 	}
 
 	/**
@@ -2155,6 +2312,43 @@ export class ReplKernelManager {
 		const cell = this.activeExecution?.opts.signal;
 		if (!cell) return teardown;
 		return AbortSignal.any([teardown, cell]);
+	}
+
+	/**
+	 * Deliver one host reply to the kernel that asked for it, or report it as undeliverable.
+	 *
+	 * `requestGeneration` is the asking kernel's identity: every teardown and every spawn bumps it,
+	 * so a mismatch means the reply outlived that kernel - a revival replaced it (which keeps the
+	 * admitted work alive on purpose, I-11), or a repair/shutdown killed it. `writeLine` sends to
+	 * whatever `this.child` is *now*, so writing anyway would put a `host_reply` id the current
+	 * kernel never minted into its stdin (P2-3). The stale reply takes the same path as one whose
+	 * pipe is already gone: reported, never silently dropped (I-6). The check and the write share
+	 * one synchronous step, so no teardown can interleave between them.
+	 */
+	private async sendHostReply(
+		requestId: string,
+		described: { type: string; label?: string },
+		requestGeneration: number,
+		data: Record<string, unknown>,
+		ok: boolean,
+	): Promise<void> {
+		if (this.startStale(requestGeneration)) {
+			// Named precisely: a revival leaves a replacement running, a teardown leaves nothing,
+			// and the session log is the only place this distinction survives.
+			const gone = this.child === undefined ? "torn down" : "replaced";
+			this.reportLateHostReply(
+				requestId,
+				described,
+				ok,
+				new Error(`the kernel that sent this host request was ${gone} before its reply was ready`),
+			);
+			return;
+		}
+		try {
+			await this.writeLine({ type: "host_reply", id: requestId, data });
+		} catch (replyError) {
+			this.reportLateHostReply(requestId, described, ok, replyError);
+		}
 	}
 
 	/**
@@ -2267,6 +2461,9 @@ export class ReplKernelManager {
 		this.rejectedHeartbeatFrames = 0;
 		this.consecutiveRejectedHeartbeatFrames = 0;
 		this.throttledHeartbeatFrames = 0;
+		// A replacement kernel is a new episode for the host callbacks too: the first failure
+		// against it is reported again instead of landing in a throttled slot.
+		this.containedCallbackFailures = 0;
 		// A replacement kernel is a new episode: its first refused write must be logged again.
 		this.reportedSnapshotSkipReason = undefined;
 		if (child) {

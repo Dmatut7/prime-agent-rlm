@@ -13,6 +13,7 @@ import { getPackageDir } from "../../config.js";
 import { readKernelBootstrapSettings } from "../settings-manager.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
 import {
+	claimKernelVenvBootSync,
 	decideKernelVenvRebuild,
 	generationDirForSuffix,
 	KernelVenvRebuildDeferredError,
@@ -1280,14 +1281,39 @@ async function ensureKernelPythonUncached(
 	// for its whole life, and a later identity change builds a sibling instead of touching it.
 	const venv = kernelVenvDirForIdentity(base, runtimeIdentity);
 	const python = path.join(venv, "bin", "python");
+	/**
+	 * Hand back this generation's interpreter, claimed.
+	 *
+	 * The claim (P2-2) covers the gap this function cannot: between returning a path and the
+	 * caller recording the spawned kernel's reference, the generation has no pid pointing at it,
+	 * so a concurrent boot's sweep used to read "zero references" and could `rm -rf` the directory
+	 * the caller is about to exec. Taking the bootstrap lock instead would not close that gap - the
+	 * vulnerable window starts after the lock is released, and the warm path below never takes it -
+	 * so the protection travels with the returned path and is superseded by the reference the spawn
+	 * records (or swept once this process is provably gone).
+	 */
+	const claimedPython = (): string => {
+		const claim = claimKernelVenvBootSync(venv, { pid: process.pid });
+		if (claim.reason) {
+			// Not fatal: the boot proceeds with today's (unprotected) behaviour and the reason is
+			// in the machine-wide log rather than only in this process's memory.
+			bootstrapLog.warn("could not claim the kernel venv generation for this boot", {
+				venvDir: venv,
+				pid: process.pid,
+				reason: claim.reason,
+			});
+		}
+		return python;
+	};
 	// GC trigger 1 (boot): reclaim generations whose references have all dropped. Only
 	// provably abandoned directories are touched, so this needs no lock; the generation
-	// this boot is about to use is excluded.
+	// this boot is about to use is excluded, and a generation another boot claimed but has not
+	// spawned from yet is kept by the claim itself (P2-2).
 	await pruneKernelVenvGenerations(base, { activeDir: venv }).catch(() => undefined);
 	// Before the warm early-return so a machine that never rebuilds still hears about the
 	// leftover pre-generation directory once (interactive boots only; see the callee).
 	reportLegacyKernelVenv(base, options);
-	if (await kernelReady(python, venv, runtimeIdentity, pythonSkills)) return python;
+	if (await kernelReady(python, venv, runtimeIdentity, pythonSkills)) return claimedPython();
 
 	// The lock stays keyed on the base path, so pre- and post-generation hosts serialize
 	// on the same lock through a mixed-version window.
@@ -1296,7 +1322,7 @@ async function ensureKernelPythonUncached(
 		timeoutMs: options.lockTimeoutMs,
 	});
 	try {
-		if (await kernelReady(python, venv, runtimeIdentity, pythonSkills)) return python;
+		if (await kernelReady(python, venv, runtimeIdentity, pythonSkills)) return claimedPython();
 		if (await kernelBaseReady(python, venv, runtimeIdentity)) {
 			// The in-use invariant covers this branch too, and it used to be the one place that
 			// mutated a generation without reading its references: an editable reinstall swaps
@@ -1308,7 +1334,7 @@ async function ensureKernelPythonUncached(
 				liveReferences: inUse.references.length,
 				referenceStateUnknown: inUse.unknown,
 			});
-			return python;
+			return claimedPython();
 		}
 
 		// A generation that still has live references is never rebuilt in place: its kernel
@@ -1346,7 +1372,9 @@ async function ensureKernelPythonUncached(
 	}
 
 	reportProgress(options, "✓ ready");
-	return python;
+	// Claimed here rather than before the build: the rebuild above removed the whole directory,
+	// so a claim written earlier would have been deleted with it.
+	return claimedPython();
 }
 
 /**

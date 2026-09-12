@@ -35,9 +35,21 @@ emit({ event: "ready", protocol: 3, python: process.version });
 if (count === 1 && flag("FAKE_REPL_BACKGROUND_LINE")) {
   emit({ event: "stdout", id: null, text: "orphan-thread-output" });
 }
+const requestLog = process.env.FAKE_REPL_REQUEST_LOG;
+// The cell a host_request was emitted for, so a reply can finish it (positive control).
+let pendingExecuteId = null;
 const input = readline.createInterface({ input: process.stdin });
 input.on("line", (line) => {
+  if (requestLog) fs.appendFileSync(requestLog, line + "\\n");
   const request = JSON.parse(line);
+  if (request.type === "host_reply") {
+    if (pendingExecuteId === null) return;
+    const id = pendingExecuteId;
+    pendingExecuteId = null;
+    emit({ event: "stdout", id, text: "reply-" + request.data.status });
+    emit({ event: "done", id, status: "ok" });
+    return;
+  }
   if (request.type === "execute") {
     if (request.code === "die9" || request.code.endsWith("die9")) {
       process.exit(9);
@@ -49,6 +61,11 @@ input.on("line", (line) => {
     }
     if (request.code === "request-and-hang") {
       emit({ event: "host_request", id: "hr-hang-" + count, data: { type: "slow", target: "worker" } });
+      return;
+    }
+    if (request.code === "request-then-reply") {
+      pendingExecuteId = request.id;
+      emit({ event: "host_request", id: "hr-live-" + count, data: { type: "fast", target: "worker" } });
       return;
     }
     if (request.code === "boom") {
@@ -100,6 +117,8 @@ interface Harness {
 	backgroundFlagPath: string;
 	causes: KernelDeathCause[];
 	handlerSignals: AbortSignal[];
+	lateReplies: { requestId: string; type: string; ok: boolean }[];
+	requestLogPath: string;
 	releaseHandlers: () => void;
 }
 
@@ -131,9 +150,11 @@ function newHarness(
 	const snapshotPath = join(tempDir, "kernel-state.dill");
 	const manifestPath = join(tempDir, "kernel-state.json");
 	const backgroundFlagPath = join(tempDir, "background-line");
+	const requestLogPath = join(tempDir, "kernel-requests.jsonl");
 	if (options.backgroundLine) writeFileSync(backgroundFlagPath, "1");
 	const causes: KernelDeathCause[] = [];
 	const handlerSignals: AbortSignal[] = [];
+	const lateReplies: { requestId: string; type: string; ok: boolean }[] = [];
 	let release: Array<() => void> = [];
 	const manager = new ReplKernelManager({
 		python,
@@ -143,8 +164,10 @@ function newHarness(
 			FAKE_REPL_RESTORE_LOG: restoreLogPath,
 			FAKE_REPL_RESTORE_HANG_COUNT: restoreHangCountPath,
 			FAKE_REPL_BACKGROUND_LINE: backgroundFlagPath,
+			FAKE_REPL_REQUEST_LOG: requestLogPath,
 			FAKE_REPL_HANG_FIRST_RESTORES: String(options.hangFirstRestores ?? 0),
 		},
+		onLateHostReply: (reply) => lateReplies.push(reply),
 		bootstrapCode: "bootstrap",
 		onUnexpectedExit: (cause) => causes.push(cause),
 		...(options.restartPolicy ? { restartPolicy: options.restartPolicy } : {}),
@@ -164,6 +187,7 @@ function newHarness(
 							if (signal) handlerSignals.push(signal);
 							release.push(() => resolve({ ok: true }));
 						}),
+					fast: async () => ({ fast: true }),
 				}
 			: undefined,
 	});
@@ -176,6 +200,8 @@ function newHarness(
 		backgroundFlagPath,
 		causes,
 		handlerSignals,
+		lateReplies,
+		requestLogPath,
 		releaseHandlers: () => {
 			const pending = release;
 			release = [];
@@ -186,6 +212,15 @@ function newHarness(
 
 function spawnCount(harness: Harness): number {
 	return existsSync(harness.countPath) ? Number(readFileSync(harness.countPath, "utf8")) : 0;
+}
+
+/** Every request frame the kernel actually received, in order. */
+function requestsSeenByKernel(harness: Harness): Record<string, unknown>[] {
+	if (!existsSync(harness.requestLogPath)) return [];
+	return readFileSync(harness.requestLogPath, "utf8")
+		.split("\n")
+		.filter((line) => line.trim().length > 0)
+		.map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
 function restoreAttempts(harness: Harness): number {
@@ -253,6 +288,49 @@ describe("kernel revival after an unexpected exit", () => {
 			expect(notice).toContain("slow");
 			expect(notice).toContain("may already have");
 			await vi.waitFor(() => expect(harness.manager.hostRequestCount).toBe(0), { timeout: 15_000 });
+		} finally {
+			await harness.manager.shutdown();
+		}
+	});
+
+	it("never writes a stale host reply into the replacement kernel (P2-3)", async () => {
+		const harness = newHarness({ hostHandlers: true });
+		try {
+			await expect(harness.manager.execute("request-then-die")).rejects.toThrow();
+			await vi.waitFor(() => expect(harness.handlerSignals.length).toBe(1), { timeout: 15_000 });
+			// The admitted work outlives the death (I-11), and it also outlives the revival: the
+			// replacement kernel is up and serving cells before this handler settles.
+			const revived = await harness.manager.execute("1 + 1");
+			expect(revived.status).toBe("ok");
+			expect(spawnCount(harness)).toBe(2);
+
+			harness.releaseHandlers();
+
+			// The reply is reported as undeliverable instead of being handed to a kernel that
+			// never minted its id.
+			await vi.waitFor(() => expect(harness.lateReplies.length).toBe(1), { timeout: 15_000 });
+			expect(harness.lateReplies[0]).toMatchObject({ requestId: "hr-1", type: "slow", ok: true });
+			await vi.waitFor(() => expect(harness.manager.hostRequestCount).toBe(0), { timeout: 15_000 });
+			const replies = requestsSeenByKernel(harness).filter((request) => request.type === "host_reply");
+			expect(replies).toEqual([]);
+			// The replacement kernel is still usable after the dropped reply.
+			expect((await harness.manager.execute("1 + 1")).stdout).toContain("alive:2");
+		} finally {
+			await harness.manager.shutdown();
+		}
+	});
+
+	it("still delivers a host reply to the kernel that asked for it (positive control)", async () => {
+		const harness = newHarness({ hostHandlers: true });
+		try {
+			const result = await harness.manager.execute("request-then-reply");
+			expect(result.status).toBe("ok");
+			expect(result.stdout).toContain("reply-ok");
+			const replies = requestsSeenByKernel(harness).filter((request) => request.type === "host_reply");
+			expect(replies).toHaveLength(1);
+			expect(replies[0]?.id).toBe("hr-live-1");
+			expect(replies[0]?.data).toMatchObject({ status: "ok", result: { fast: true } });
+			expect(harness.lateReplies).toEqual([]);
 		} finally {
 			await harness.manager.shutdown();
 		}
