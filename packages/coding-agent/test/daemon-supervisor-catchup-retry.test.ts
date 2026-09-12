@@ -186,4 +186,64 @@ describe("T3-1 daemon supervisor catch-up retry", () => {
 		expect(harness.messages.filter(isSnapshotFailed)).toHaveLength(0);
 		expect(worker.attachCount()).toBe(attachesAfterSelfHeal);
 	}, 30_000);
+
+	it("does not reopen a retry budget for a session it already gave up on", async () => {
+		const harness = await startSupervisorHarness({
+			prefix: "ma-f4-catchup-",
+			sessionCount: 2,
+			catchupRetryPolicy: testRetryPolicy(5, 100),
+		});
+		await harness.waitForWorkerReady();
+		const worker = harness.worker;
+		if (!worker) throw new Error("Harness started without a fake worker");
+		const [root, child] = harness.sessions;
+		if (!root || !child) throw new Error("Harness did not create two sessions");
+		for (const session of [root, child]) {
+			const response = await harness.request({
+				type: "attach",
+				activeSessionId: session.activeSessionId,
+				capabilities: ["attach_snapshot", "event_sequence"],
+				supportsExtensionUi: false,
+			});
+			if (!response.success) throw new Error(`Fixture attach failed: ${response.error}`);
+		}
+		/** Queues a catch-up by pushing a delta frame the supervisor cannot reconstruct. */
+		const gapFor = (activeSessionId: string): void =>
+			worker.pushFrame(
+				{
+					kind: "outbound",
+					outboundType: "session_event",
+					activeSessionId,
+					sessionEventType: "message_update",
+					payloadEncoding: "assistant-delta",
+				},
+				new TextEncoder().encode("this payload is not json\n"),
+			);
+
+		// A permanent failure gives up after one attempt and tells the client to re-pull.
+		worker.failNextAttaches(`Unknown active session: ${root.activeSessionId}`, 1);
+		gapFor(root.activeSessionId);
+		const failed = await harness.waitFor(isSnapshotFailed);
+		if (failed.type !== "session_snapshot_failed") throw new Error("waitFor returned the wrong frame type");
+		expect(failed.activeSessionId).toBe(root.activeSessionId);
+		expect(failed.reason).toBe("catchup_failed");
+		const framesAtGiveUp = harness.messages.length;
+		const attachesAtGiveUp = worker.attachCount();
+
+		// A new gap on a DIFFERENT session drains the same client queue.
+		// RED on HEAD: the given-up root was still queued, so this trigger re-ran its
+		// attach on a fresh budget and pushed another frame for a healed-by-nobody
+		// session — once per trigger, forever.
+		gapFor(child.activeSessionId);
+		await harness.waitFor(
+			(message) => message.type === "session_resynced" && message.activeSessionId === child.activeSessionId,
+		);
+		await harness.settle(300);
+		expect(worker.attachCount()).toBe(attachesAtGiveUp + 1);
+		const rootFrames = harness.messages
+			.slice(framesAtGiveUp)
+			.filter((message) => "activeSessionId" in message && message.activeSessionId === root.activeSessionId);
+		expect(rootFrames).toHaveLength(0);
+		expect(harness.messages.filter(isSnapshotFailed)).toHaveLength(1);
+	}, 30_000);
 });

@@ -1,0 +1,5 @@
+- Fixed killing a child session on a failed worker whose process is still alive: it stopped the whole session tree and answered `alreadyTerminal`, and now reports the worker's real state with the root kill that would stop the tree instead. An already-terminal answer for a child kill now requires the tree's process to be provably gone.
+- Changed idle and last-detach eviction to count an agent-message delivery in flight as work, so a tree is skipped for that round instead of being stopped mid-delivery.
+- Added an explicit receipt for a delivery a worker stop overtakes: every pending delivery aimed at a stopping tree is answered "not delivered", or "may already have been delivered" once a dispatch was written, instead of failing with a bare transport error.
+- Fixed a pending delivery whose target worker was stopped, evicted or reaped retrying until its 24h budget ran out; it now ends with an explicit "not delivered" receipt.
+- Fixed a client catch-up the supervisor gave up on staying queued, so a later event no longer reopens a full retry budget and re-notifies the client about a failure that does not heal by waiting.

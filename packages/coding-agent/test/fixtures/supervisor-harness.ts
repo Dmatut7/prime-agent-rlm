@@ -51,6 +51,8 @@ export interface SupervisorHarnessOptions {
 	/** Connect a client and wait for daemon_hello (default true). */
 	connectClient?: boolean;
 	sessionCount?: number;
+	/** Report every fixture session with `messageCount: 0`, so empty-session eviction can pick the worker. */
+	emptySessionSummaries?: boolean;
 	/** Write a scheduled-jobs artifact for the root session, so the tree counts as unattended. */
 	scheduledJobsArtifact?: boolean;
 	/** Extra files to drop into the descriptor directory before startup. */
@@ -140,7 +142,7 @@ export async function startSupervisorHarness(options: SupervisorHarnessOptions):
 			sessionId: manager.getSessionId(),
 			sessionFile,
 			cwd: projectDir,
-			messageCount: 1,
+			messageCount: options.emptySessionSummaries ? 0 : 1,
 		});
 	}
 	const session = sessions[0]!;

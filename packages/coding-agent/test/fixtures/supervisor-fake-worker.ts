@@ -55,6 +55,12 @@ export interface FakeWorkerHandle {
 	connectionCount(): number;
 	/** Makes the next `times` attach requests fail with `message`. */
 	failNextAttaches(message: string, times: number): void;
+	/** Rejects every later `worker_auth`, so a recovery attempt fails on a non-timeout error. */
+	failWorkerAuth(message: string): void;
+	/** Destroys the live supervisor connections but keeps listening, so recovery reconnects. */
+	dropConnections(): void;
+	/** Starts hanging every later request of this type, e.g. `worker_subscribe`. */
+	hangCommand(type: string): void;
 	/** Pushes a delta frame the supervisor cannot reconstruct, which queues a catch-up for attached clients. */
 	pushUnreconstructableDelta(): void;
 	/** Pushes an arbitrary outbound frame, e.g. a worker-side session_replaced with a new generation. */
@@ -108,10 +114,13 @@ export function fakeWorkerAttachResult(session: FakeWorkerSession, sequence = 1)
 /** Starts a socket that answers the worker protocol; `adopt: false` leaves every request unanswered. */
 export async function startFakeWorker(options: FakeWorkerOptions): Promise<FakeWorkerHandle> {
 	const session = options.session;
+	const allSessions = [session, ...(options.extraSessions ?? [])];
 	const commands: string[] = [];
 	const sockets = new Set<Socket>();
 	const attachFailures: string[] = [];
 	let attachCount = 0;
+	let authFailure: string | undefined;
+	const hungCommands = new Set<string>(options.hangCommands ?? []);
 
 	const writeFrame = (socket: Socket, header: DaemonWorkerFrameHeader, payload: Uint8Array): void => {
 		if (socket.destroyed) {
@@ -142,7 +151,7 @@ export async function startFakeWorker(options: FakeWorkerOptions): Promise<FakeW
 				if (frame.header.kind !== "command") {
 					continue;
 				}
-				let command: { type?: string };
+				let command: { type?: string; activeSessionId?: string };
 				try {
 					command = JSON.parse(frame.payload.toString("utf8")) as { type?: string };
 				} catch {
@@ -158,6 +167,10 @@ export async function startFakeWorker(options: FakeWorkerOptions): Promise<FakeW
 					continue;
 				}
 				if (type === "worker_auth") {
+					if (authFailure !== undefined) {
+						respond(frame.header.requestId, type, { success: false, error: authFailure });
+						continue;
+					}
 					respond(frame.header.requestId, type, {
 						success: true,
 						data: { capabilities: [DAEMON_WORKER_ROSTER_CAPABILITY] },
@@ -167,7 +180,7 @@ export async function startFakeWorker(options: FakeWorkerOptions): Promise<FakeW
 				if (options.adopt === false || options.hangAfterAuth === true) {
 					continue;
 				}
-				if (options.hangCommands?.includes(type)) {
+				if (hungCommands.has(type)) {
 					continue;
 				}
 				if (type === "list") {
@@ -182,12 +195,15 @@ export async function startFakeWorker(options: FakeWorkerOptions): Promise<FakeW
 				if (type === "attach") {
 					attachCount++;
 					const failure = attachFailures.shift();
+					// Answer for the session that was asked about: a supervisor test with
+					// more than the root drives catch-ups per session.
+					const requested = allSessions.find((candidate) => candidate.activeSessionId === command.activeSessionId);
 					if (failure !== undefined) {
 						respond(frame.header.requestId, type, { success: false, error: failure });
 					} else {
 						respond(frame.header.requestId, type, {
 							success: true,
-							data: fakeWorkerAttachResult(session, attachCount),
+							data: fakeWorkerAttachResult(requested ?? session, attachCount),
 						});
 					}
 					continue;
@@ -206,6 +222,18 @@ export async function startFakeWorker(options: FakeWorkerOptions): Promise<FakeW
 			for (let index = 0; index < times; index++) {
 				attachFailures.push(message);
 			}
+		},
+		failWorkerAuth(message: string): void {
+			authFailure = message;
+		},
+		dropConnections(): void {
+			for (const socket of [...sockets]) {
+				socket.destroy();
+			}
+			sockets.clear();
+		},
+		hangCommand(type: string): void {
+			hungCommands.add(type);
 		},
 		pushUnreconstructableDelta(): void {
 			for (const socket of sockets) {

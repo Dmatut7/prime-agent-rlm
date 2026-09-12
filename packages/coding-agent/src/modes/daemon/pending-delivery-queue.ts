@@ -13,8 +13,8 @@
  * (`drain("update_restart")`) and logs the ones nobody is waiting for any more.
  * A "queued" receipt in this codebase only ever comes from the target worker's
  * own session queue, which is the queue that has persistence. Nothing here can
- * evaporate silently: an entry leaves through `complete`, `drop`, `drain` or
- * `abortSender`.
+ * evaporate silently: an entry leaves through `complete`, `drop`, `drain`,
+ * `drainTargets` or `abortSender`.
  *
  * `abortSender` is the one that is not terminal for the supervisor: a sender
  * whose request budget ran out closes its connection (an agent-to-agent send
@@ -24,7 +24,12 @@
  * entries are abandoned and the capacity is freed.
  */
 
-export type PendingDeliveryAbortReason = "update_restart" | "shutdown" | "supervisor_stopping" | "sender_disconnected";
+export type PendingDeliveryAbortReason =
+	| "update_restart"
+	| "shutdown"
+	| "supervisor_stopping"
+	| "sender_disconnected"
+	| "worker_stopped";
 
 export interface PendingDeliveryEntry {
 	readonly deliveryId: string;
@@ -257,6 +262,42 @@ export class PendingDeliveryQueue {
 			}
 		}
 		this.byTarget.clear();
+		this.counters.drained += drained.length;
+		return drained;
+	}
+
+	/** Whether any entry targets one of these sessions; a worker stop or eviction reads it. */
+	hasEntriesForTargets(targetActiveSessionIds: Iterable<string>): boolean {
+		for (const targetActiveSessionId of targetActiveSessionIds) {
+			const entries = this.byTarget.get(targetActiveSessionId);
+			if (entries !== undefined && entries.size > 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Targeted drain: every entry aimed at one of these sessions is aborted with
+	 * the reason, so a worker stop receipts the senders it is about to cut off
+	 * instead of leaving them with a bare transport error. Entries for other
+	 * targets are untouched. Returns the drained entries, for the caller to log.
+	 */
+	drainTargets(targetActiveSessionIds: Iterable<string>, reason: PendingDeliveryAbortReason): PendingDeliveryEntry[] {
+		const drained: PendingDeliveryEntry[] = [];
+		for (const targetActiveSessionId of new Set(targetActiveSessionIds)) {
+			const entries = this.byTarget.get(targetActiveSessionId);
+			if (!entries) {
+				continue;
+			}
+			for (const entry of entries) {
+				entry.abort(reason);
+				drained.push(entry);
+			}
+			this.byTarget.delete(targetActiveSessionId);
+			// A long-lived supervisor keeps no throttle row per historical target.
+			this.requeueLogState.delete(targetActiveSessionId);
+		}
 		this.counters.drained += drained.length;
 		return drained;
 	}

@@ -229,6 +229,10 @@ const UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS = 80_000;
 // Same cadence as DEFERRED_RECOVERY_RECHECK_MS below, so a retry lands about when
 // the recovery recheck can have changed the state.
 const PENDING_DELIVERY_RETRY_INTERVAL_MS = 5_000;
+// F3: how long a delivery keeps bouncing off a target whose registration is gone
+// before the loss is terminal. Longer than a recovery relaunch's stop-and-register
+// window (a forced stop escalates within ~1.5s), shorter than any sender's patience.
+const DELIVERY_TARGET_GONE_GRACE_MS = 15_000;
 const UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS = 90_000;
 // The whole pre-commit prepare (drain + worker fencing) must finish inside the
 // caller's 120s prepare_update_restart request timeout, or roll back; otherwise
@@ -729,6 +733,8 @@ export interface DaemonSupervisorOptions {
 	pendingDeliveryCapacity?: number;
 	/** Overrides the interval between two delivery attempts for a target that is not reachable yet. */
 	pendingDeliveryRetryIntervalMs?: number;
+	/** Overrides how long a delivery bounces off a target whose worker registration is gone before failing (F3). */
+	pendingDeliveryTargetGoneGraceMs?: number;
 	/** Overrides the requeue log throttle window (one line per target session per window). */
 	pendingDeliveryLogThrottleMs?: number;
 	/** Overrides how long update-restart preparation waits for in-flight mutations to drain. */
@@ -1058,6 +1064,7 @@ export class DaemonSupervisor {
 	private pendingDeliveries?: PendingDeliveryQueue;
 	private pendingDeliveryCapacity?: number;
 	private pendingDeliveryRetryIntervalMs?: number;
+	private pendingDeliveryTargetGoneGraceMs?: number;
 	private pendingDeliveryLogThrottleMs?: number;
 	private updateRestartDrainTimeoutMs?: number;
 	private readonly clients = new Set<DaemonSocketClient>();
@@ -1145,6 +1152,7 @@ export class DaemonSupervisor {
 		this.adoptionRetryDelaysMs = options.adoptionRetryDelaysMs ?? ADOPTION_RETRY_DELAYS_MS;
 		this.pendingDeliveryCapacity = options.pendingDeliveryCapacity;
 		this.pendingDeliveryRetryIntervalMs = options.pendingDeliveryRetryIntervalMs;
+		this.pendingDeliveryTargetGoneGraceMs = options.pendingDeliveryTargetGoneGraceMs;
 		this.pendingDeliveryLogThrottleMs = options.pendingDeliveryLogThrottleMs;
 		this.updateRestartDrainTimeoutMs = options.updateRestartDrainTimeoutMs;
 	}
@@ -1649,7 +1657,12 @@ export class DaemonSupervisor {
 				(worker) =>
 					refreshed.has(worker) &&
 					this.workers.get(worker.descriptor.workerId) === worker &&
-					canEvictWorker(this.workerEvictionSnapshot(worker), idleEvictionMinutes, now),
+					canEvictWorker(this.workerEvictionSnapshot(worker), idleEvictionMinutes, now) &&
+					// F2: an in-flight agent-message delivery is not idleness. It is
+					// invisible to the roster until it lands and no longer holds the
+					// mutation drain latch, so this fenced recheck is what keeps a stop
+					// from cutting a delivery off; the next sweep evicts once it settles.
+					!this.workerHasPendingDeliveries(worker),
 			);
 			// Promise.all may reject and release the fence while sibling stops are still
 			// finishing. That is safe: a racing mutation either reaches a live worker or
@@ -1746,6 +1759,9 @@ export class DaemonSupervisor {
 			this.updateRestartPhase !== undefined ||
 			this.workers.get(worker.descriptor.workerId) !== worker ||
 			this.isWorkerStopping(worker) ||
+			// F2: a delivery still in flight means the tree is about to stop being
+			// empty, and stopping it would take the message with it.
+			this.workerHasPendingDeliveries(worker) ||
 			this.isWakeBlindScheduledWorker(worker)
 		) {
 			return false;
@@ -5840,13 +5856,23 @@ export class DaemonSupervisor {
 		return worker.client !== undefined && worker.descriptor.lifecycle === "ready";
 	}
 
-	/** A worker that will not come back on its own, so its sessions are already terminal. */
-	private isWorkerTerminallyUnavailable(worker: ResidentWorker): boolean {
-		return (
-			worker.descriptor.lifecycle === "failed" ||
-			worker.descriptor.stopRequestedAt !== undefined ||
-			worker.intentionalStop
-		);
+	/**
+	 * F1: whether the whole session tree is provably gone, i.e. no process is left
+	 * that could still be hosting its sessions. Only this makes a non-root kill
+	 * idempotent: while the process lives the child may still be running, and the
+	 * only way to kill it through an unreachable worker is to stop the whole tree,
+	 * which takes the root and every sibling with it. A `failed` lifecycle is not
+	 * enough — a live worker that stopped answering recovery probes parks failed
+	 * with its process intact (deferWorkerRecovery). An unverifiable identity
+	 * counts as alive, so a failed lookup can never authorise "already terminal"
+	 * (the same conservative direction the reaper and stopWorker use).
+	 */
+	private isWorkerTreeGone(worker: ResidentWorker): boolean {
+		if (worker.client !== undefined) {
+			return false;
+		}
+		const identity = this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId);
+		return identity === "gone" || identity === "replaced";
 	}
 
 	/**
@@ -5855,6 +5881,13 @@ export class DaemonSupervisor {
 	 * semantic kill: the stop tombstone cancels in-flight recovery
 	 * (isWorkerRecoveryCancelled reads stopRequestedAt) and stopWorker reaps the
 	 * process, so the kill leaves no orphan behind.
+	 *
+	 * That semantic kill stops the WHOLE tree, so a non-root target only gets it
+	 * once the tree is provably gone (F1) — the stop then clears a registration
+	 * whose sessions are already dead, and `alreadyTerminal` is the truth. While the
+	 * process lives, a child kill is refused with its real state instead: taking
+	 * the root and every sibling down and answering "this target was already
+	 * terminal" tells the caller nothing happened when the whole tree just did.
 	 */
 	private async killUnreachableWorker(
 		worker: ResidentWorker,
@@ -5863,15 +5896,22 @@ export class DaemonSupervisor {
 	): Promise<DaemonResponse> {
 		const targetActiveSessionId = summary.activeSessionId ?? summary.id;
 		const isRootKill = targetActiveSessionId === worker.descriptor.rootActiveSessionId;
-		if (!isRootKill && !this.isWorkerTerminallyUnavailable(worker)) {
-			// Stopping the worker would take sibling sessions with it, and a child kill
-			// needs the worker to name the child: report the state honestly instead.
+		const state = this.effectiveWorkerState(worker);
+		if (!isRootKill && !this.isWorkerTreeGone(worker)) {
+			// Stopping the worker would take the root and every sibling session with
+			// it, and a child kill needs the worker to name the child: report the
+			// state honestly instead.
 			throw new Error(
-				`Session worker is ${this.effectiveWorkerState(worker)}; cannot kill ${targetActiveSessionId} until it is reachable`,
+				`Session worker is ${state}; cannot kill ${targetActiveSessionId} until it is reachable` +
+					(state === "failed"
+						? ` (killing it through a failed worker would stop the whole tree: ${worker.descriptor.rootActiveSessionId} and its other sessions. Kill that root session to stop the tree, or retry_worker to make the child reachable again)`
+						: ""),
 			);
 		}
 		this.log(
-			`Killing ${targetActiveSessionId} through an unreachable worker (${this.effectiveWorkerState(worker)}): stop tombstone written, recovery cancelled`,
+			isRootKill
+				? `Killing ${targetActiveSessionId} through an unreachable worker (${state}): stop tombstone written, recovery cancelled`
+				: `Killing ${targetActiveSessionId} through an unreachable worker (${state}): its tree is already gone, so the stop clears the registration it shared with ${this.workerActiveSessionIds(worker).join(", ")}`,
 		);
 		this.persistWorkerStopTombstone(worker, true);
 		const releaseStopOwnership = this.acquireWorkerStopOwnership(worker);
@@ -6217,6 +6257,15 @@ export class DaemonSupervisor {
 		 * on the first request that actually reaches a worker (B5).
 		 */
 		let dispatches = 0;
+		/**
+		 * F3: when this delivery first found no registered worker for its target.
+		 * A recovery relaunch deletes the registration for the seconds its stop
+		 * takes and then re-registers the same worker object, so one observation is
+		 * not a verdict; a stop that really took the tree down (eviction, kill,
+		 * reaper, owner cleanup) never brings this active session id back.
+		 */
+		let targetGoneSince: number | undefined;
+		const targetGoneGraceMs = this.pendingDeliveryTargetGoneGraceMs ?? DELIVERY_TARGET_GONE_GRACE_MS;
 		try {
 			for (;;) {
 				const remainingMs = entry.deadlineAt - Date.now();
@@ -6226,32 +6275,29 @@ export class DaemonSupervisor {
 					);
 				}
 				entry.attempts++;
-				let workerClient: DaemonWorkerClient;
-				try {
-					workerClient = this.requireAvailableWorkerClient(
-						this.deliveryTargetWorker(target, targetActiveSessionId),
-					);
-				} catch (error) {
-					if (!isExpectedWorkerAvailabilityError(error)) throw error;
-					queue.requeue(entry);
-					// One line per target per window: a full queue retrying every 5s
-					// would otherwise write 20 lines a second. The swallowed count rides
-					// on the next line, and counters.requeued stays exact.
-					const requeueLog = queue.noteRequeueForLog(targetActiveSessionId);
-					if (requeueLog.emit) {
-						const retryIntervalMs = this.pendingDeliveryRetryIntervalMs ?? PENDING_DELIVERY_RETRY_INTERVAL_MS;
-						this.logInfo(
-							`deliver message requeued for ${targetActiveSessionId} (delivery ${entry.deliveryId}, attempt ${entry.attempts}, depth ${queue.depth(targetActiveSessionId)}, retry in ${retryIntervalMs}ms): ${error instanceof Error ? error.message : String(error)}${
-								requeueLog.suppressed > 0
-									? ` (+${requeueLog.suppressed} suppressed in the last ${queue.requeueLogWindowMs}ms)`
-									: ""
-							}`,
+				const targetWorker = this.deliveryTargetWorker(target, targetActiveSessionId);
+				if (targetWorker === undefined) {
+					targetGoneSince ??= Date.now();
+					if (Date.now() - targetGoneSince >= targetGoneGraceMs) {
+						throw new Error(
+							`Agent message to ${targetActiveSessionId} was not delivered: its session worker is gone (stopped, evicted or reaped), so no retry can reach it. Send it again to a live session.`,
 						);
 					}
-					await this.raceDeliveryAbort(
+					await this.requeuePendingDelivery(
+						queue,
 						entry,
-						unrefDelay(this.pendingDeliveryRetryIntervalMs ?? PENDING_DELIVERY_RETRY_INTERVAL_MS),
+						targetActiveSessionId,
+						new Error("Session worker registration is gone"),
 					);
+					continue;
+				}
+				targetGoneSince = undefined;
+				let workerClient: DaemonWorkerClient;
+				try {
+					workerClient = this.requireAvailableWorkerClient(targetWorker);
+				} catch (error) {
+					if (!isExpectedWorkerAvailabilityError(error)) throw error;
+					await this.requeuePendingDelivery(queue, entry, targetActiveSessionId, error);
 					continue;
 				}
 				const tierMs = WORKER_REQUEST_TIMEOUT_TIERS[deliveryDispatchTimeoutTier(dispatches)];
@@ -6275,15 +6321,68 @@ export class DaemonSupervisor {
 						: `Agent message to ${targetActiveSessionId} was not delivered: the daemon stopped the pending delivery before it reached the target (${reason}). Send it again once the daemon is back.`,
 				);
 			}
+			if (dispatches > 0) {
+				// F2: from the first dispatch on, non-delivery is not provable — the
+				// target may have taken the message and only the answer was lost when
+				// its worker stopped, crashed or ran out of its tier. Report the same
+				// uncertain state the drain reports instead of handing the sender a
+				// transport error it will read as "never arrived" and re-send.
+				const detail = error instanceof Error ? error.message : String(error);
+				this.log(
+					`deliver message uncertain for ${targetActiveSessionId} (delivery ${entry.deliveryId}, attempts ${entry.attempts}, state uncertain): ${detail}`,
+				);
+				throw new Error(
+					`Agent message to ${targetActiveSessionId} may already have been delivered: the target's answer was lost (${detail}). Do not re-send it blindly; ask the target session whether it arrived, or re-send only if a duplicate would be harmless.`,
+				);
+			}
 			throw error;
 		}
 	}
 
-	/** A retried delivery re-resolves the target: the roster may have moved it to a replacement worker. */
-	private deliveryTargetWorker(fallback: WorkerMatch, targetActiveSessionId: string): ResidentWorker {
+	/**
+	 * Counts one pre-dispatch bounce and waits out the retry interval. The wait is
+	 * raced against the entry's abort, so a drain never has to wait on a sleeping
+	 * retry, and the log stays throttled to one line per target per window: a full
+	 * queue retrying every 5s would otherwise write 20 lines a second. The swallowed
+	 * count rides on the next line, and counters.requeued stays exact.
+	 */
+	private async requeuePendingDelivery(
+		queue: PendingDeliveryQueue,
+		entry: PendingDeliveryEntry,
+		targetActiveSessionId: string,
+		error: unknown,
+	): Promise<void> {
+		queue.requeue(entry);
+		const requeueLog = queue.noteRequeueForLog(targetActiveSessionId);
+		if (requeueLog.emit) {
+			const retryIntervalMs = this.pendingDeliveryRetryIntervalMs ?? PENDING_DELIVERY_RETRY_INTERVAL_MS;
+			this.logInfo(
+				`deliver message requeued for ${targetActiveSessionId} (delivery ${entry.deliveryId}, attempt ${entry.attempts}, depth ${queue.depth(targetActiveSessionId)}, retry in ${retryIntervalMs}ms): ${
+					error instanceof Error ? error.message : String(error)
+				}${
+					requeueLog.suppressed > 0
+						? ` (+${requeueLog.suppressed} suppressed in the last ${queue.requeueLogWindowMs}ms)`
+						: ""
+				}`,
+			);
+		}
+		await this.raceDeliveryAbort(
+			entry,
+			unrefDelay(this.pendingDeliveryRetryIntervalMs ?? PENDING_DELIVERY_RETRY_INTERVAL_MS),
+		);
+	}
+
+	/**
+	 * A retried delivery re-resolves the target: the roster may have moved it to a
+	 * replacement worker. `undefined` means no registered worker owns it any more
+	 * (F3) — the loop must not keep bouncing on the stale object it was admitted
+	 * with, whose recorded stop intent reports "stopping" forever.
+	 */
+	private deliveryTargetWorker(fallback: WorkerMatch, targetActiveSessionId: string): ResidentWorker | undefined {
 		const rosterEntry = this.roster().byActiveSessionId(targetActiveSessionId);
 		const current = rosterEntry?.workerId !== undefined ? this.workers.get(rosterEntry.workerId) : undefined;
-		return current ?? fallback.worker;
+		const resolved = current ?? fallback.worker;
+		return this.workers.get(resolved.descriptor.workerId) === resolved ? resolved : undefined;
 	}
 
 	/** Races the work against the queue's drain abort, so a restart answers every waiting sender. */
@@ -6370,6 +6469,56 @@ export class DaemonSupervisor {
 		}
 		this.log(
 			`abandoned ${abandoned.length} pending agent-message ${abandoned.length === 1 ? "delivery" : "deliveries"} of disconnected sender ${senderConnectionId}: ${abandoned
+				.map((entry) => `${entry.deliveryId}->${entry.targetActiveSessionId}`)
+				.join(", ")}`,
+		);
+	}
+
+	/** The active session ids this worker's registration currently claims, root included. */
+	private workerActiveSessionIds(worker: ResidentWorker): string[] {
+		const ids = new Set<string>([worker.descriptor.rootActiveSessionId]);
+		for (const entry of this.workerRosterEntries(worker)) {
+			if (entry.queuedChild) continue;
+			ids.add(entry.summary.activeSessionId ?? entry.summary.id);
+		}
+		return [...ids];
+	}
+
+	/**
+	 * F2: whether the supervisor owns a delivery aimed at one of this worker's
+	 * sessions. An in-flight delivery is work the worker has not reported yet — the
+	 * message updates activity and messageCount only once it lands — so the roster a
+	 * residency decision reads still calls the tree idle. `send_message` no longer
+	 * holds the mutation drain latch (P1-7c), so the eviction fence's drain does not
+	 * cover it either: without this check a stop can overtake a delivery.
+	 */
+	private workerHasPendingDeliveries(worker: ResidentWorker): boolean {
+		// The field, not pendingDeliveryQueue(): a residency decision must not allocate one.
+		return this.pendingDeliveries?.hasEntriesForTargets(this.workerActiveSessionIds(worker)) === true;
+	}
+
+	/**
+	 * F2/B10: a stop must not turn an in-flight delivery into a bare transport
+	 * error. Every entry aimed at this worker is aborted before its socket closes,
+	 * so each sender still waiting gets the explicit receipt the queue promises —
+	 * "not delivered" while nothing was written to a worker, "may already have been
+	 * delivered" once a dispatch is out — and the ones nobody waits for any more are
+	 * logged here instead of vanishing with the connection.
+	 */
+	private drainPendingDeliveriesForWorker(worker: ResidentWorker, reason: PendingDeliveryAbortReason): void {
+		// The field, not pendingDeliveryQueue(): a stop must not allocate a queue.
+		const queue = this.pendingDeliveries;
+		if (!queue) {
+			return;
+		}
+		const drained = queue.drainTargets(this.workerActiveSessionIds(worker), reason);
+		if (drained.length === 0) {
+			return;
+		}
+		this.log(
+			`drained ${drained.length} pending agent-message ${
+				drained.length === 1 ? "delivery" : "deliveries"
+			} of stopping worker ${worker.descriptor.workerId} (${reason.replaceAll("_", " ")}): ${drained
 				.map((entry) => `${entry.deliveryId}->${entry.targetActiveSessionId}`)
 				.join(", ")}`,
 		);
@@ -7536,7 +7685,16 @@ export class DaemonSupervisor {
 				for (const remaining of pending.slice(index)) {
 					this.queueCatchup(client, remaining.activeSessionId, remaining.purpose);
 				}
-				this.handleCatchupFailure(client, activeSessionId, purpose, error);
+				// F4: a give-up is the end of this streak, so the session must not stay
+				// queued. Leaving it there made every later trigger — a compact-stream
+				// sync, an invalidated snapshot, a backpressure drain — reopen a full
+				// retry budget for a failure that does not heal by waiting, and notify
+				// the client to re-pull all over again. The client's own re-attach is
+				// what puts the session back in the queue.
+				if (this.handleCatchupFailure(client, activeSessionId, purpose, error) === "give-up") {
+					client.catchupActiveSessionIds?.delete(activeSessionId);
+					client.catchupPurposes?.delete(activeSessionId);
+				}
 				return "retry-later";
 			} finally {
 				releaseSnapshotReservation();
@@ -7551,13 +7709,17 @@ export class DaemonSupervisor {
 	 * the client to re-pull the whole snapshot instead of leaving a silently
 	 * incomplete view behind (F8). The supervisor never turns a catch-up failure
 	 * into a terminal `closed` frame.
+	 *
+	 * Returns whether the streak is over ("give-up"), so the caller can drop the
+	 * session from the client's catch-up queue instead of leaving a permanently
+	 * failing entry behind for the next trigger to reopen (F4).
 	 */
 	private handleCatchupFailure(
 		client: DaemonSocketClient,
 		activeSessionId: string,
 		purpose: "replacement" | "resync",
 		error: unknown,
-	): void {
+	): "retry" | "give-up" {
 		const now = Date.now();
 		client.catchupRetryState ??= new Map();
 		const states = client.catchupRetryState;
@@ -7569,7 +7731,7 @@ export class DaemonSupervisor {
 				`Failed to catch up client ${client.id} for ${activeSessionId} (catchup failed, not retryable): ${failure}`,
 			);
 			this.notifyCatchupGiveUp(client, activeSessionId, purpose, "catchup_failed", failure);
-			return;
+			return "give-up";
 		}
 		const state = states.get(activeSessionId) ?? {
 			attempts: 0,
@@ -7591,7 +7753,7 @@ export class DaemonSupervisor {
 			this.log(
 				`Dropped stale catch-up budget for client ${client.id} for ${activeSessionId}: event generation changed`,
 			);
-			return;
+			return "retry";
 		}
 		const remainingMs = state.openedAt + this.catchupRetryPolicy.deadlineMs - now;
 		const delayMs = clientCatchupRetryDelayMs(
@@ -7607,7 +7769,7 @@ export class DaemonSupervisor {
 				`Failed to catch up client ${client.id} for ${activeSessionId} after ${state.attempts} attempts (catchup exhausted): ${failure}`,
 			);
 			this.notifyCatchupGiveUp(client, activeSessionId, purpose, "catchup_exhausted", failure);
-			return;
+			return "give-up";
 		}
 		if (state.lastWarnAt === undefined || now - state.lastWarnAt >= this.catchupRetryPolicy.logThrottleMs) {
 			state.lastWarnAt = now;
@@ -7616,6 +7778,7 @@ export class DaemonSupervisor {
 			);
 		}
 		this.scheduleClientCatchupRetry(client, delayMs);
+		return "retry";
 	}
 
 	private catchupRetryJitterMs(): number {
@@ -8109,6 +8272,10 @@ export class DaemonSupervisor {
 		worker.transcriptCaches.clear();
 		worker.snapshotCache.clear();
 		worker.snapshotGenerations?.clear();
+		// F2/B10: receipt every delivery aimed at this tree before its socket goes,
+		// so a stop (eviction, kill, reaper, relaunch) never turns an in-flight
+		// message into a bare transport error the sender has to guess about.
+		this.drainPendingDeliveriesForWorker(worker, "worker_stopped");
 		// Hold the client in a local: the worker can disconnect during the request
 		// below, and handleWorkerClose then clears worker.client mid-flight.
 		const stoppingClient = worker.client;
