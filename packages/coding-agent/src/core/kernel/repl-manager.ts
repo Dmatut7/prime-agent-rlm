@@ -1033,9 +1033,14 @@ export class ReplKernelManager {
 					this.armRevivalAfterUnexpectedExit(verdict.cause);
 					return;
 				}
-			} else if (verdict.origin === "repair_kill" || verdict.origin === "bootstrap_fail_kill") {
-				// Tagged, not silent: this is the only place a repair kill can be told apart from
-				// a crash in the host's own ring, and B6 exists to keep the two from mixing.
+			} else if (
+				verdict.origin === "repair_kill" ||
+				verdict.origin === "bootstrap_fail_kill" ||
+				verdict.origin === "abort_timeout_kill"
+			) {
+				// Tagged, not silent: this is the only place a repair kill or an abort-timeout
+				// kill can be told apart from a crash in the host's own ring, and B6 exists to
+				// keep the two from mixing.
 				this.appendKernelDiagnostic(`intentional ${verdict.origin} exit code=${code} signal=${signal}`);
 			}
 			this.state = "shutdown";
@@ -1796,9 +1801,34 @@ export class ReplKernelManager {
 				return;
 			}
 			execution.status = "aborted";
+			if (opts.killOnAbortTimeout) {
+				// Countable on the cell that was interrupted: the model has to learn on this
+				// result, not one cell later, that its namespace went with the kernel.
+				execution.stderr +=
+					`${execution.stderr ? "\n" : ""}Python kernel was killed because the interrupted cell did not stop. ` +
+					"Live Python state was lost. The next call starts a new kernel and may restore the last saved snapshot.";
+				if (execution.stderr.length > execution.maxChars) {
+					execution.stderr = execution.stderr.slice(0, execution.maxChars);
+					execution.stderrTruncated = true;
+				}
+			}
 			// The execution stays active until its done event arrives; clearing it
 			// early would let a new cell race the interrupted one (see busy-after-interrupt).
 			this.resolveExecution(execution, { clearActive: false });
+			if (opts.killOnAbortTimeout) {
+				// Recorded here, not by the exit handler: cleanupResources drops the child
+				// reference before the SIGKILL's exit event is delivered, so the handler's
+				// stale-child guard returns before it could classify this death. Without this
+				// line the ring would not say why the kernel went away.
+				this.appendKernelDiagnostic(
+					"killing the kernel because the interrupted cell did not stop (abort_timeout_kill)",
+				);
+				// Tagged as well, so any exit that is still classified sees the host's own kill
+				// instead of a crash: an untagged one would burn restart budget and report a
+				// kernel failure nobody caused. The owner sees the instance go defunct and
+				// provisions a replacement.
+				void this.kill("abort_timeout_kill");
+			}
 		};
 		const onAbort = () => {
 			void this.interrupt().catch(() => undefined);
@@ -2437,10 +2467,10 @@ export class ReplKernelManager {
 		}
 	}
 
-	async kill(): Promise<void> {
+	async kill(origin: KernelIntentionalExitOrigin = "kill"): Promise<void> {
 		this.supersedeProtocolRepair();
 		this.abortHostRequests("IPython kernel killed");
-		this.intentionalExitOrigin = "kill";
+		this.intentionalExitOrigin = origin;
 		this.disposedByHost = true;
 		this.state = "shutdown";
 		liveKernels.delete(this);
@@ -2790,5 +2820,16 @@ export class ReplKernelManager {
 
 	get isRunning(): boolean {
 		return this.state === "running";
+	}
+
+	/**
+	 * The host tore this kernel down (kill, shutdown or disposeSync), so this instance will not
+	 * serve another cell: `start()` treats the terminal state as a permanent verdict and only
+	 * {@link restart} clears it. An owner that memoizes its client - the ipython provisioner -
+	 * reads this to drop the memo and provision a replacement instead of handing the next cell a
+	 * manager that can only throw.
+	 */
+	get isDefunct(): boolean {
+		return this.disposedByHost;
 	}
 }

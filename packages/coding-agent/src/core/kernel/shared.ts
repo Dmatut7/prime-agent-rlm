@@ -177,6 +177,13 @@ export interface KernelCapabilities {
 export interface ExecuteOptions {
 	/** Aborting interrupts the kernel out-of-band. */
 	signal?: AbortSignal;
+	/**
+	 * Kill the kernel once the interrupt grace period expires instead of leaving it running.
+	 * Headless callers set this: with no UI to offer the wait/kill choice, an unresponsive
+	 * kernel would otherwise keep burning CPU and fail every later cell with
+	 * busy-after-interrupt.
+	 */
+	killOnAbortTimeout?: boolean;
 	onStream?: (chunk: string, name: "stdout" | "stderr") => void;
 	onLateSentAgentMessage?: (message: KernelSentAgentMessage) => void;
 	/** Cap stdout / stderr / result at this many characters. Default 65536. */
@@ -440,6 +447,12 @@ export interface KernelLiveness {
 export interface KernelClient {
 	readonly ownerSessionId: string | undefined;
 	readonly isRunning: boolean;
+	/**
+	 * The host declared this kernel gone for good (kill/shutdown/disposeSync), so this instance
+	 * will never serve another cell and its owner must provision a replacement. Absent on
+	 * clients that cannot be defunct.
+	 */
+	readonly isDefunct?: boolean;
 	/**
 	 * Revival-window vouch facts, present while a replacement kernel is being spawned, restored
 	 * and bootstrapped. Absent once the kernel serves cells again, and bounded by age on the

@@ -42,6 +42,51 @@ function runningManagerWith(writeLine: (request: Record<string, unknown>) => Pro
 	return { manager, internals, kernelKill };
 }
 
+type ExitReportingInternals = {
+	state: string;
+	writeLine: (request: Record<string, unknown>) => Promise<void>;
+	start: () => Promise<void>;
+	child?: unknown;
+	wireChild: (child: unknown) => void;
+	kernelStderr: string;
+	/** Marker the exit classifier reads; set immediately before an intentional kill. */
+	intentionalExitOrigin?: string;
+};
+
+/**
+ * A manager whose fake child is a real EventEmitter, so the exit handler - and with it
+ * the intentional-exit attribution - actually runs.
+ */
+function exitReportingManager(): {
+	manager: ReplKernelManager;
+	internals: ExitReportingInternals;
+	kernelKill: ReturnType<typeof vi.fn>;
+	child: EventEmitter;
+	unexpectedCauses: unknown[];
+} {
+	const unexpectedCauses: unknown[] = [];
+	const manager = new ReplKernelManager({
+		cwd: process.cwd(),
+		onUnexpectedExit: (cause) => {
+			unexpectedCauses.push(cause);
+		},
+	});
+	const kernelKill = vi.fn((_signal?: NodeJS.Signals | number) => true);
+	const child = Object.assign(new EventEmitter(), {
+		kill: kernelKill,
+		pid: 424242,
+		exitCode: null,
+		signalCode: null,
+		stdin: undefined,
+		stdout: undefined,
+		stderr: undefined,
+	});
+	const internals = manager as unknown as ExitReportingInternals;
+	Object.assign(internals, { state: "running", writeLine: vi.fn(async () => {}), start: async () => {}, child });
+	internals.wireChild(child);
+	return { manager, internals, kernelKill, child, unexpectedCauses };
+}
+
 describe("ReplKernelManager abort handling", () => {
 	afterEach(() => {
 		vi.useRealTimers();
@@ -190,6 +235,92 @@ describe("ReplKernelManager abort handling", () => {
 
 		await expect(executePromise).resolves.toMatchObject({ status: "aborted" });
 		expect(interruptWrites.length).toBeGreaterThan(0);
+	});
+
+	it.each([
+		{ maxOutputChars: 0, priorStderr: "", prefix: "", truncated: true },
+		{ maxOutputChars: 8, priorStderr: "", prefix: "Python k", truncated: true },
+		{ maxOutputChars: 16, priorStderr: "warning", prefix: "warning\nPython k", truncated: true },
+		{ maxOutputChars: 16, priorStderr: "x".repeat(16), prefix: "x".repeat(16), truncated: true },
+		{ maxOutputChars: 16, priorStderr: "x".repeat(32), prefix: "x".repeat(16), truncated: true },
+		{ maxOutputChars: 512, priorStderr: "warning", prefix: "warning\nPython kernel was killed", truncated: false },
+	])(
+		"bounds the kill diagnostic with $maxOutputChars chars and prior stderr '$priorStderr'",
+		async ({ maxOutputChars, priorStderr, prefix, truncated }) => {
+			vi.useFakeTimers();
+			const writeLine = vi.fn(async (_request: Record<string, unknown>) => {});
+			const { manager, internals, kernelKill } = runningManagerWith(writeLine);
+			const controller = new AbortController();
+			const execution = manager.execute("while True: pass", {
+				signal: controller.signal,
+				killOnAbortTimeout: true,
+				maxOutputChars,
+			});
+			await waitForCalls(writeLine, 1);
+			internals.handleEvent({ event: "stderr", id: internals.activeExecution?.requestId, text: priorStderr });
+			controller.abort();
+			await vi.advanceTimersByTimeAsync(1000);
+
+			const result = await execution;
+			expect(result.status).toBe("aborted");
+			expect(kernelKill).toHaveBeenCalledWith("SIGKILL");
+			expect(manager.isDefunct).toBe(true);
+			if (truncated) {
+				expect(result.stderr).toBe(`${prefix}\n[... output truncated at ${maxOutputChars} chars ...]`);
+			} else {
+				expect(result.stderr.startsWith(prefix)).toBe(true);
+				expect(result.stderr).toContain("Live Python state was lost.");
+				expect(result.stderr).not.toContain("output truncated");
+				expect(result.stderr.length).toBeLessThanOrEqual(maxOutputChars);
+			}
+		},
+	);
+
+	it("attributes the abort-timeout kill to the host instead of reporting a crash", async () => {
+		vi.useFakeTimers();
+		const { manager, internals, kernelKill, child, unexpectedCauses } = exitReportingManager();
+		const controller = new AbortController();
+		const execution = manager.execute("while True: pass", {
+			signal: controller.signal,
+			killOnAbortTimeout: true,
+		});
+		await waitForCalls(internals.writeLine as unknown as { mock: { calls: unknown[][] } }, 1);
+		controller.abort();
+		await vi.advanceTimersByTimeAsync(1000);
+
+		await expect(execution).resolves.toMatchObject({ status: "aborted" });
+		expect(kernelKill).toHaveBeenCalledWith("SIGKILL");
+		// Tagged, so this death is the host's own kill and not a crash: an untagged one burns
+		// restart budget and reports a kernel failure nobody caused.
+		expect(internals.intentionalExitOrigin).toBe("abort_timeout_kill");
+		// Named in the ring too: cleanupResources drops the child before the exit event is
+		// delivered, so the exit handler's stale-child guard never classifies this death.
+		expect(internals.kernelStderr).toContain("abort_timeout_kill");
+
+		child.emit("exit", null, "SIGKILL");
+		expect(unexpectedCauses).toEqual([]);
+	});
+
+	it("keeps a user-initiated kill distinguishable from an abort-timeout kill", async () => {
+		vi.useFakeTimers();
+		const { manager, internals, child, unexpectedCauses } = exitReportingManager();
+
+		await manager.kill();
+		child.emit("exit", null, "SIGKILL");
+
+		expect(unexpectedCauses).toEqual([]);
+		expect(internals.intentionalExitOrigin).toBe("kill");
+		expect(internals.kernelStderr).not.toContain("abort_timeout_kill");
+	});
+
+	it("reports the same kernel's untagged exit as unexpected (positive control)", async () => {
+		vi.useFakeTimers();
+		const { child, unexpectedCauses } = exitReportingManager();
+
+		child.emit("exit", 1, null);
+
+		// Without this control the case above could pass with a spy that never fires.
+		expect(unexpectedCauses).toHaveLength(1);
 	});
 
 	it("fails a later execution fast when the interrupted cell never settles", async () => {

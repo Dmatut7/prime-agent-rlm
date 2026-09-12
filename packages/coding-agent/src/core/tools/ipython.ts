@@ -171,7 +171,7 @@ export const IPYTHON_ABORTED_CELL_NOTICE = [
 ].join("\n");
 const KERNEL_RESTART_NOTICE = [
 	"<ipython_kernel_reset>",
-	"The Python kernel was restarted after a previous interrupted cell kept running. Variables, imports, async tasks, and open resources from before the restart are no longer available; recreate them before using them.",
+	"The Python kernel was restarted. Variables, imports, async tasks, and open resources from before the restart may no longer be available; check any restored state and recreate missing resources before using them.",
 	"</ipython_kernel_reset>",
 ].join("\n");
 
@@ -451,6 +451,13 @@ export class IpythonKernelProvisioner {
 		if (signal?.aborted) {
 			return Promise.reject(createAbortError());
 		}
+		// A kernel the host tore down (an abort-timeout kill, a UI kill, a dispose) can only
+		// throw from here on, so drop the memo and let this call provision the replacement.
+		// Without it the next cell would be handed the defunct instance and fail closed.
+		if (this.startedManager?.isDefunct === true) {
+			this.managerPromise = undefined;
+			this.startedManager = undefined;
+		}
 		let cleanupProgressListener: (() => void) | undefined;
 		if (onProgress && !this.startedManager) {
 			this.startupListeners.add(onProgress);
@@ -623,7 +630,11 @@ async function chooseBusyKernelAction(
 	signal: AbortSignal | undefined,
 ): Promise<"wait" | "kill" | "cancel"> {
 	if (!ctx?.hasUI) {
-		return "cancel";
+		// No UI means nobody can be offered the wait/kill choice, and "cancel" only rethrows:
+		// the unresponsive kernel keeps burning CPU and every later cell hits the same
+		// busy-after-interrupt error, so the session stays soft-bricked. Kill it instead -
+		// the next cell provisions a replacement and may restore the last saved snapshot.
+		return "kill";
 	}
 	const choice = await ctx.ui.select(BUSY_KERNEL_PROMPT, [BUSY_KERNEL_WAIT_CHOICE, BUSY_KERNEL_KILL_CHOICE], {
 		signal,
@@ -648,12 +659,18 @@ async function executeWithBusyKernelChoice(
 	onLateSentAgentMessage: ((toolCallId: string, message: KernelSentAgentMessage) => void) | undefined,
 	ctx: ExtensionContext | undefined,
 ): Promise<{ result: ExecuteResult; kernelRestarted: boolean; resetNotice?: string }> {
-	let kernelRestarted = false;
+	// A kernel that was killed after a previous cell's interrupt grace expired (headless
+	// aborts kill instead of preserving) is replaced by this call's ensure(), so the model
+	// owes a reset notice on the first cell that runs on the replacement.
+	let kernelRestarted = provisioner.manager?.isDefunct === true;
 	while (true) {
 		const m = await provisioner.ensure(reportStartupProgress, signal);
 		try {
 			const result = await m.execute(code, {
 				signal,
+				// Headless callers get the kill-on-grace-timeout behaviour that an interactive
+				// caller gets from the wait/kill prompt below.
+				killOnAbortTimeout: !ctx?.hasUI,
 				onStream,
 				onLateSentAgentMessage: onLateSentAgentMessage
 					? (message) => onLateSentAgentMessage(toolCallId, message)

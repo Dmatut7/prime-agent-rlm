@@ -17,16 +17,22 @@
  */
 
 /** Every path that ends the kernel on purpose, tagged immediately before the kill. */
-export type KernelIntentionalExitOrigin = "shutdown" | "kill" | "dispose_sync" | "repair_kill" | "bootstrap_fail_kill";
+export type KernelIntentionalExitOrigin =
+	| "shutdown"
+	| "kill"
+	| "dispose_sync"
+	| "repair_kill"
+	| "bootstrap_fail_kill"
+	| "abort_timeout_kill";
 
 /**
  * Attribution vocabulary for one kernel exit.
  *
- * `repair_kill` and `bootstrap_fail_kill` only ever appear on an *intentional* verdict: a death
- * cause handed to `onUnexpectedExit` is by definition not one the host ordered, so it carries
- * `oom_suspect` or `unknown`. They are in the same enum because the diagnostic line names the
- * origin either way, and a repair kill that ever showed up as unexpected would be a predicate
- * leak worth reading in the log.
+ * `repair_kill`, `bootstrap_fail_kill` and `abort_timeout_kill` only ever appear on an
+ * *intentional* verdict: a death cause handed to `onUnexpectedExit` is by definition not one the
+ * host ordered, so it carries `oom_suspect` or `unknown`. They are in the same enum because the
+ * diagnostic line names the origin either way, and a host-ordered kill that ever showed up as
+ * unexpected would be a predicate leak worth reading in the log.
  */
 export type KernelDeathOrigin = KernelIntentionalExitOrigin | "oom_suspect" | "unknown";
 

@@ -135,8 +135,15 @@ describe("classifyKernelExit", () => {
 		if (withoutEvidence.unexpected) expect(withoutEvidence.cause.origin).toBe("unknown");
 	});
 
-	it("never counts an intentional origin, including the two repair kills", () => {
-		const origins = ["shutdown", "kill", "dispose_sync", "repair_kill", "bootstrap_fail_kill"] as const;
+	it("never counts an intentional origin, including the repair and abort-timeout kills", () => {
+		const origins = [
+			"shutdown",
+			"kill",
+			"dispose_sync",
+			"repair_kill",
+			"bootstrap_fail_kill",
+			"abort_timeout_kill",
+		] as const;
 		expect(origins.length).toBeGreaterThan(0);
 		for (const origin of origins) {
 			const verdict = classifyKernelExit({
