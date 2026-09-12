@@ -1,5 +1,15 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { lockSync } from "proper-lockfile";
@@ -34,6 +44,15 @@ function enabledEnvironment(owner: string): NodeJS.ProcessEnv {
 		[SESSION_LEASE_OWNER_ID_ENV]: owner,
 	};
 }
+
+function leaseDirectoryFor(agentDir: string, sessionPath: string): string {
+	const key = createHash("sha256").update(sessionPath).digest("hex");
+	return join(agentDir, "session-leases", `${key}.lock`);
+}
+
+// chmod 000 cannot hide a file from its owner when the test process runs as root,
+// so the unreadable-owner path is only observable for a non-root uid.
+const chmodCanBlockReads = typeof process.getuid === "function" && process.getuid() !== 0;
 
 describe("session leases", () => {
 	it("reads an invariant process start identity on Windows", () => {
@@ -288,6 +307,152 @@ describe("session leases", () => {
 			}),
 		);
 
+		const lease = acquireSessionLease(sessionPath, agentDir, enabledEnvironment("replacement"));
+		expect(lease?.sessionPath).toBe(sessionPath);
+		lease?.release();
+	});
+
+	it("reclaims a lease whose owner.json was torn by a crash", () => {
+		// A truncated owner.json names no process, so the next acquire takes the lease
+		// over. That reclaim is long-standing behavior, pinned here; what is new is the
+		// atomic owner write, which stops fresh tears and leaves no temp file behind.
+		const agentDir = createTempDir();
+		const sessionPath = canonicalSessionPath(resolve(agentDir, "torn.jsonl"));
+		const lockDirectory = leaseDirectoryFor(agentDir, sessionPath);
+		mkdirSync(lockDirectory, { recursive: true });
+		const tornRecord = JSON.stringify({
+			version: 1,
+			token: "torn",
+			pid: 1,
+			activeSessionId: "crashed-owner",
+			sessionPath,
+			createdAt: new Date(0).toISOString(),
+		}).slice(0, 40);
+		expect(() => JSON.parse(tornRecord)).toThrow();
+		writeFileSync(join(lockDirectory, "owner.json"), tornRecord);
+
+		const lease = acquireSessionLease(sessionPath, agentDir, enabledEnvironment("replacement"));
+		expect(lease?.sessionPath).toBe(sessionPath);
+
+		// The replacement record is complete, and the atomic write left no temp file.
+		expect(readdirSync(lockDirectory)).toEqual(["owner.json"]);
+		const owner = JSON.parse(readFileSync(join(lockDirectory, "owner.json"), "utf8")) as {
+			version: number;
+			token: string;
+			pid: number;
+			activeSessionId: string;
+			sessionPath: string;
+			createdAt: string;
+		};
+		expect(owner).toMatchObject({ version: 1, pid: process.pid, activeSessionId: "replacement", sessionPath });
+		expect(typeof owner.token).toBe("string");
+		expect(typeof owner.createdAt).toBe("string");
+
+		// Reclaiming torn bytes must not weaken the collision guard: the fresh
+		// record still fails closed against another owner identity.
+		expect(() => acquireSessionLease(sessionPath, agentDir, enabledEnvironment("intruder"))).toThrow(
+			SessionAlreadyActiveError,
+		);
+
+		lease?.release();
+		expect(existsSync(lockDirectory)).toBe(false);
+	});
+
+	it("reclaims a lease whose owner.json cannot be decoded", () => {
+		const payloads = [
+			"",
+			"this is not json",
+			'{"version": 1, "token": "half-written", "pi',
+			"null",
+			"[]",
+			"{}",
+			JSON.stringify({ version: 1, token: "orphan" }),
+			JSON.stringify({ version: 1, token: "orphan", pid: "not-a-pid", sessionPath: "/x", createdAt: "now" }),
+		];
+		expect(payloads.length).toBeGreaterThan(0);
+		for (const [index, payload] of payloads.entries()) {
+			const agentDir = createTempDir();
+			const sessionPath = canonicalSessionPath(resolve(agentDir, `undecodable-${index}.jsonl`));
+			const lockDirectory = leaseDirectoryFor(agentDir, sessionPath);
+			mkdirSync(lockDirectory, { recursive: true });
+			writeFileSync(join(lockDirectory, "owner.json"), payload);
+
+			const lease = acquireSessionLease(sessionPath, agentDir, enabledEnvironment("replacement"));
+			expect(lease?.sessionPath, `payload ${index}: ${JSON.stringify(payload)}`).toBe(sessionPath);
+			lease?.release();
+		}
+	});
+
+	it("reclaims a lease when owner.json is absent", () => {
+		const agentDir = createTempDir();
+		const sessionPath = canonicalSessionPath(resolve(agentDir, "absent-lock.jsonl"));
+		const key = createHash("sha256").update(sessionPath).digest("hex");
+		const lockDirectory = join(agentDir, "session-leases", `${key}.lock`);
+		mkdirSync(lockDirectory, { recursive: true });
+		const lease = acquireSessionLease(sessionPath, agentDir, enabledEnvironment("replacement"));
+		expect(lease?.sessionPath).toBe(sessionPath);
+		lease?.release();
+	});
+
+	it.skipIf(!chmodCanBlockReads)("fails closed while owner.json cannot be read", () => {
+		// An owner record this process cannot *read* is not the same as a missing
+		// one: reading it is the only way to learn whether its owner is still alive,
+		// and a reclaim only needs write access to the parent directory. Taking over
+		// an unreadable record would steal a lease that may still be held, so acquire
+		// must fail closed for as long as the record stays opaque.
+		const agentDir = createTempDir();
+		const sessionPath = canonicalSessionPath(resolve(agentDir, "unreadable.jsonl"));
+		const lockDirectory = leaseDirectoryFor(agentDir, sessionPath);
+		mkdirSync(lockDirectory, { recursive: true });
+		const ownerPath = join(lockDirectory, "owner.json");
+		const recordedOwner = `${JSON.stringify(
+			{
+				version: 1,
+				token: "opaque",
+				pid: 2_147_483_647,
+				activeSessionId: "opaque-owner",
+				sessionPath,
+				createdAt: new Date(0).toISOString(),
+			},
+			null,
+			2,
+		)}\n`;
+		writeFileSync(ownerPath, recordedOwner, { mode: 0o600 });
+
+		try {
+			chmodSync(ownerPath, 0o000);
+
+			let thrown: unknown;
+			let acquired: ReturnType<typeof acquireSessionLease> | undefined;
+			try {
+				acquired = acquireSessionLease(sessionPath, agentDir, enabledEnvironment("replacement"));
+			} catch (error) {
+				thrown = error;
+			}
+			acquired?.release();
+
+			// Fail closed: refuse the session instead of taking over an opaque lease.
+			expect(acquired).toBeUndefined();
+			expect(thrown).toBeInstanceOf(Error);
+			expect(thrown).not.toBeInstanceOf(SessionAlreadyActiveError);
+			expect((thrown as Error).message).toContain("Could not acquire session lease");
+
+			// The unreadable record survived untouched: nothing was reclaimed, renamed
+			// away, or replaced by this process's own record.
+			chmodSync(ownerPath, 0o600);
+			expect(readdirSync(lockDirectory)).toEqual(["owner.json"]);
+			expect(readFileSync(ownerPath, "utf8")).toBe(recordedOwner);
+		} finally {
+			// A stolen (reclaimed) record leaves nothing to restore; keep the failure
+			// on the assertion that caught the steal instead of masking it with ENOENT.
+			if (existsSync(ownerPath)) {
+				chmodSync(ownerPath, 0o600);
+			}
+		}
+
+		// Fail-closed is scoped to the unreadable window, not a permanent lockout:
+		// once the record is readable again the ordinary stale-owner path reclaims it
+		// (its recorded pid is long gone).
 		const lease = acquireSessionLease(sessionPath, agentDir, enabledEnvironment("replacement"));
 		expect(lease?.sessionPath).toBe(sessionPath);
 		lease?.release();

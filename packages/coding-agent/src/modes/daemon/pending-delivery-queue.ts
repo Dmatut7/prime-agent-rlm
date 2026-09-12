@@ -13,22 +13,35 @@
  * (`drain("update_restart")`) and logs the ones nobody is waiting for any more.
  * A "queued" receipt in this codebase only ever comes from the target worker's
  * own session queue, which is the queue that has persistence. Nothing here can
- * evaporate silently: an entry leaves through `complete`, `drop` or `drain`.
+ * evaporate silently: an entry leaves through `complete`, `drop`, `drain` or
+ * `abortSender`.
+ *
+ * `abortSender` is the one that is not terminal for the supervisor: a sender
+ * whose request budget ran out closes its connection (an agent-to-agent send
+ * waits ~30s, a delivery budget is 24h), and its entries would otherwise hold
+ * the target's capacity until that budget expired, rejecting senders that are
+ * still there. Nobody can read a receipt for a closed connection, so those
+ * entries are abandoned and the capacity is freed.
  */
 
-export type PendingDeliveryAbortReason = "update_restart" | "shutdown" | "supervisor_stopping";
+export type PendingDeliveryAbortReason = "update_restart" | "shutdown" | "supervisor_stopping" | "sender_disconnected";
 
 export interface PendingDeliveryEntry {
 	readonly deliveryId: string;
 	readonly targetActiveSessionId: string;
 	readonly senderKey: string;
+	/**
+	 * The daemon connection that issued the delivery. Its disconnect abandons the
+	 * entry (`abortSender`), so an orphaned sender cannot hold target capacity.
+	 */
+	readonly senderConnectionId?: string;
 	readonly enqueuedAt: number;
 	/** Wall-clock deadline of the whole delivery, i.e. the preserved 24h budget (C20). */
 	readonly deadlineAt: number;
 	attempts: number;
 	/** When the last retry was scheduled; diagnostic, so a stuck entry is attributable. */
 	lastRequeuedAt?: number;
-	/** Settled once, by drain(): the delivery loop races it against the worker request. */
+	/** Settled once, by drain() or abortSender(): the delivery loop races it against the worker request. */
 	readonly aborted: Promise<PendingDeliveryAbortReason>;
 	/**
 	 * Registers a drain handler and returns its unregistration. Handlers are
@@ -132,7 +145,7 @@ export class PendingDeliveryQueue {
 		return total;
 	}
 
-	admit(targetActiveSessionId: string, senderKey: string): PendingDeliveryAdmission {
+	admit(targetActiveSessionId: string, senderKey: string, senderConnectionId?: string): PendingDeliveryAdmission {
 		const entries = this.byTarget.get(targetActiveSessionId) ?? new Set<InternalEntry>();
 		if (entries.size >= this.capacity) {
 			this.counters.overflow++;
@@ -153,6 +166,7 @@ export class PendingDeliveryQueue {
 			deliveryId: this.idFactory(),
 			targetActiveSessionId,
 			senderKey,
+			...(senderConnectionId === undefined ? {} : { senderConnectionId }),
 			enqueuedAt: this.now(),
 			deadlineAt: this.now() + this.deliveryBudgetMs,
 			attempts: 0,
@@ -245,6 +259,32 @@ export class PendingDeliveryQueue {
 		this.byTarget.clear();
 		this.counters.drained += drained.length;
 		return drained;
+	}
+
+	/**
+	 * Abandons every entry one sender connection owns: a client that disconnected
+	 * cannot read a receipt any more, and leaving the entries behind would keep the
+	 * target's capacity occupied for the whole delivery budget. Capacity frees
+	 * synchronously here; the delivery loop's own `drop` for the same entry is then
+	 * a no-op, so nothing is counted twice. Returns the entries, for the caller to log.
+	 */
+	abortSender(senderConnectionId: string, reason: PendingDeliveryAbortReason): PendingDeliveryEntry[] {
+		const abandoned: PendingDeliveryEntry[] = [];
+		for (const entries of this.byTarget.values()) {
+			for (const entry of entries) {
+				if (entry.senderConnectionId !== senderConnectionId) {
+					continue;
+				}
+				entry.abort(reason);
+				abandoned.push(entry);
+			}
+		}
+		for (const entry of abandoned) {
+			if (this.remove(entry)) {
+				this.counters.dropped++;
+			}
+		}
+		return abandoned;
 	}
 
 	private remove(entry: PendingDeliveryEntry): boolean {

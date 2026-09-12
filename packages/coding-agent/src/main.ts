@@ -59,6 +59,7 @@ import { KeybindingsManager } from "./core/keybindings.js";
 import { installFileLogSink, setLogContext } from "./core/logging.js";
 import type { ModelRegistry } from "./core/model-registry.js";
 import { findInitialModel, resolveCliModel, resolveModelScope, type ScopedModel } from "./core/model-resolver.js";
+import { flushOrphanProcessJournal } from "./core/orphan-process-journal.js";
 import { restoreStdout, takeOverStdout } from "./core/output-guard.js";
 import type { CreateAgentSessionOptions } from "./core/sdk.js";
 import {
@@ -167,6 +168,17 @@ function reportDiagnostics(diagnostics: readonly AgentSessionRuntimeDiagnostic[]
 function isTruthyEnvFlag(value: string | undefined): boolean {
 	if (!value) return false;
 	return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
+}
+
+/**
+ * `process.exit` skips the event-loop drain that the orphan journal's in-flight
+ * start-id captures rely on, so an exit taken while a runtime is alive awaits
+ * them first. A record that never receives its start id stays identity-free, and
+ * the reaper is left with a bare pid it cannot prove still names that process.
+ */
+async function exitAfterOrphanJournalFlush(code: number): Promise<never> {
+	await flushOrphanProcessJournal();
+	process.exit(code);
 }
 
 export type ClientMode = AgentExecutionMode;
@@ -437,8 +449,12 @@ async function takeOverStaleDaemonOrExit(socketPath: string): Promise<DaemonRead
 
 // Resolves the daemon-ready promise, returning the promise to keep (the same
 // one on success, or the fresh one from a stale-daemon takeover) so repeat
-// calls don't re-handle the original rejection.
-async function awaitDaemonReady(daemonReady: Promise<void> | undefined): Promise<DaemonReadyResult> {
+// calls don't re-handle the original rejection. `isCancelled` lets an aborting
+// startup skip the takeover instead of being handed its stdin confirmation.
+async function awaitDaemonReady(
+	daemonReady: Promise<void> | undefined,
+	isCancelled?: () => boolean,
+): Promise<DaemonReadyResult> {
 	if (!daemonReady) {
 		return { ready: daemonReady };
 	}
@@ -447,6 +463,9 @@ async function awaitDaemonReady(daemonReady: Promise<void> | undefined): Promise
 		return { ready: daemonReady };
 	} catch (error) {
 		if (error instanceof StaleDaemonError) {
+			if (isCancelled?.()) {
+				throw new Error(`Startup aborted before the stale daemon on ${error.socketPath} could be taken over`);
+			}
 			return takeOverStaleDaemonOrExit(error.socketPath);
 		}
 		throw error;
@@ -1124,9 +1143,11 @@ async function findAttachedDaemonSessionSummary(
 	return response.data;
 }
 
-interface DaemonInteractivePrefire {
+export interface DaemonInteractivePrefire {
 	readySettled: Promise<DaemonReadyResult>;
 	connection: Promise<{ connection: DaemonAgentConnection; summary: SessionSummary }>;
+	/** Stops the chain before it prompts for a stale-daemon takeover or fires the create RPC. */
+	cancel(): void;
 }
 
 /**
@@ -1136,29 +1157,59 @@ interface DaemonInteractivePrefire {
  * ensureInteractiveDaemonRunning" contract of createDaemonClientConnection
  * still holds.
  */
-function prefireDaemonInteractiveConnection(
+export function prefireDaemonInteractiveConnection(
 	daemonReady: Promise<void> | undefined,
 	create: () => Promise<{ connection: DaemonAgentConnection; summary: SessionSummary }>,
 ): DaemonInteractivePrefire {
-	const readySettled = awaitDaemonReady(daemonReady);
-	const connection = readySettled.then(() => create());
+	let cancelled = false;
+	const isCancelled = () => cancelled;
+	const readySettled = awaitDaemonReady(daemonReady, isCancelled);
+	const connection = readySettled.then(() => {
+		// An aborting startup must not create a session it will never consume.
+		if (isCancelled()) {
+			throw new Error("Daemon create cancelled by an aborted startup");
+		}
+		return create();
+	});
 	// Errors are rethrown at the await sites; these guards only avoid unhandled
 	// rejections if startup exits before reaching them.
 	readySettled.catch(() => {});
 	connection.catch(() => {});
-	return { readySettled, connection };
+	return {
+		readySettled,
+		connection,
+		cancel: () => {
+			cancelled = true;
+		},
+	};
 }
 
 /**
- * Clean up a prefire whose connection the startup never consumed: let an
- * in-flight create settle, then detach it (an unused draft session is
- * discarded on detach; a client-owned session is completed) and close the
- * client. A rejected create cleaned itself up already.
+ * Bound on waiting for a prefired create during an abort. The chain may still be
+ * inside daemon readiness (a stale-daemon takeover confirms on stdin) or inside
+ * the create RPC (30s, 120s on win32), so an unbounded wait turns an error exit
+ * into a stall. Past the window the exit wins: the daemon detaches the vanished
+ * client and discards an unused draft, and idle eviction reclaims anything else.
  */
-async function disposePrefiredDaemonConnection(prefire: DaemonInteractivePrefire | undefined): Promise<void> {
-	if (!prefire) {
-		return;
+const PREFIRE_DISPOSAL_GRACE_MS = 5_000;
+
+/** Resolve once `work` settles, or once the grace window expires, whichever comes first. */
+async function settleWithinGrace(work: Promise<void>, graceMs: number): Promise<void> {
+	let timer: NodeJS.Timeout | undefined;
+	try {
+		await Promise.race([
+			work,
+			new Promise<void>((resolve) => {
+				timer = setTimeout(resolve, graceMs);
+			}),
+		]);
+	} finally {
+		if (timer) clearTimeout(timer);
 	}
+}
+
+/** Neither step rejects: the create rejection is mapped away and dispose is caught. */
+async function detachPrefiredConnection(prefire: DaemonInteractivePrefire): Promise<void> {
 	const created = await prefire.connection.then(
 		(value) => value,
 		() => undefined,
@@ -1167,6 +1218,26 @@ async function disposePrefiredDaemonConnection(prefire: DaemonInteractivePrefire
 		return;
 	}
 	await created.connection.dispose().catch(() => undefined);
+}
+
+/**
+ * Clean up a prefire whose connection the startup never consumed: cancel the
+ * chain, then give a create that is already in flight a bounded window to
+ * settle so it can be detached (an unused draft session is discarded on detach;
+ * a client-owned session is completed) and its client closed. A rejected create
+ * cleaned itself up already.
+ */
+export async function disposePrefiredDaemonConnection(
+	prefire: DaemonInteractivePrefire | undefined,
+	graceMs: number = PREFIRE_DISPOSAL_GRACE_MS,
+): Promise<void> {
+	if (!prefire) {
+		return;
+	}
+	prefire.cancel();
+	// The abandoned work keeps running past an expired window; it cannot reject,
+	// so it leaves no unhandled rejection behind for the exit to trip over.
+	await settleWithinGrace(detachPrefiredConnection(prefire), graceMs);
 }
 
 export interface MainOptions {
@@ -1757,7 +1828,7 @@ export async function main(args: string[], options?: MainOptions) {
 	if (parsed.listModels !== undefined) {
 		const searchPattern = typeof parsed.listModels === "string" ? parsed.listModels : undefined;
 		await listModels(modelRegistry, searchPattern);
-		process.exit(0);
+		await exitAfterOrphanJournalFlush(0);
 	}
 
 	// Read piped stdin content (if any) - skip for RPC/daemon modes which use other transports
@@ -1785,13 +1856,13 @@ export async function main(args: string[], options?: MainOptions) {
 	time("resolveModelScope");
 	reportDiagnostics(runtime.diagnostics);
 	if (runtime.diagnostics.some((diagnostic) => diagnostic.type === "error")) {
-		process.exit(1);
+		await exitAfterOrphanJournalFlush(1);
 	}
 	time("createAgentSession");
 
 	if (appMode !== "interactive" && appMode !== "daemon" && !session.model) {
 		console.error(chalk.red(formatNoModelsAvailableMessage()));
-		process.exit(1);
+		await exitAfterOrphanJournalFlush(1);
 	}
 
 	if (appMode === "rpc") {

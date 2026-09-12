@@ -427,6 +427,10 @@ function migrateV1ToV2(entries: FileEntry[]): void {
 		}
 
 		entry.id = generateId(ids);
+		// Without this the collision set stays empty and a repeated draw is handed
+		// out twice: the duplicate id makes byId resolve an entry's parentId forward
+		// to a later entry, and the parent walk from there closes a cycle.
+		ids.add(entry.id);
 		entry.parentId = prevId;
 		prevId = entry.id;
 
@@ -682,6 +686,15 @@ async function parseEntriesFromBufferAsync(buffer: Buffer): Promise<FileEntry[]>
 	return entries;
 }
 
+function parsesAsJson(line: Buffer): boolean {
+	try {
+		JSON.parse(line.toString("utf8"));
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 function finalizeLoadedEntries(entries: FileEntry[]): FileEntry[] {
 	if (entries.length === 0) return entries;
 	const header = entries[0];
@@ -694,6 +707,54 @@ function finalizeLoadedEntries(entries: FileEntry[]): FileEntry[] {
 	}
 	applyChildUsageAttributions(entries);
 	return entries;
+}
+
+/**
+ * Recover a transcript whose first line is damaged. finalizeLoadedEntries
+ * rejects a file whose head is not a valid session header, which used to cost
+ * the whole transcript: setSessionFile then started a fresh session and rewrote
+ * the file, dropping every entry and leaving the session with a new id that no
+ * longer matched its file name. Keep the entries that still parse — a damaged
+ * head costs the header, not the transcript — and rebuild the header, taking
+ * the id from the file name so the two stay in sync and the version the
+ * salvaged body still needs. Returns undefined when there is nothing to
+ * salvage: an empty file, an intact head (a file that simply never had a
+ * header), or a body without a parseable entry.
+ */
+function salvageDamagedHeadEntries(filePath: string, cwd: string): FileEntry[] | undefined {
+	let buffer: Buffer;
+	try {
+		buffer = readFileSync(filePath);
+	} catch {
+		return undefined;
+	}
+	if (buffer.length === 0) return undefined;
+
+	const headEnd = buffer.indexOf(0x0a);
+	const head = headEnd === -1 ? buffer : buffer.subarray(0, headEnd);
+	if (parsesAsJson(head)) return undefined;
+
+	const body = headEnd === -1 ? [] : parseEntriesFromBuffer(buffer.subarray(headEnd + 1));
+	const entries = body.filter((entry): entry is SessionEntry => entry.type !== "session");
+	if (entries.length === 0) return undefined;
+
+	const firstTimestamp = entries[0].timestamp;
+	const fileNameId = basename(filePath).replace(/\.jsonl$/, "");
+	// A pre-v2 body carries no id/parentId. Stamp version 1 so the caller runs the
+	// migration that assigns the chain; stamping the current version instead would
+	// persist id-less entries under a header no later load migrates, leaving the
+	// salvaged transcript on disk but invisible to every branch walk.
+	const preV2Body = entries.every((entry) => typeof entry.id !== "string");
+	const header: SessionHeader = {
+		type: "session",
+		version: preV2Body ? 1 : CURRENT_SESSION_VERSION,
+		id: SESSION_ID_PATTERN.test(fileNameId) ? fileNameId : createSessionId(),
+		timestamp: typeof firstTimestamp === "string" ? firstTimestamp : new Date().toISOString(),
+		cwd,
+	};
+	const salvaged: FileEntry[] = [header, ...entries];
+	applyChildUsageAttributions(salvaged);
+	return salvaged;
 }
 
 /** Exported for testing */
@@ -1404,6 +1465,20 @@ export class SessionManager {
 			// If file was empty or corrupted (no valid header), truncate and start fresh
 			// to avoid appending messages without a session header (which breaks the session)
 			if (this.fileEntries.length === 0) {
+				// A damaged first line loses the header, not the transcript: keep the
+				// entries that still parse instead of truncating them away.
+				const salvaged = salvageDamagedHeadEntries(this.sessionFile, this.cwd);
+				if (salvaged) {
+					this.fileEntries = salvaged;
+					this.sessionId = (salvaged[0] as SessionHeader).id;
+					// A salvaged pre-v2 body arrives stamped version 1 and needs the
+					// migration before it is indexed or written back.
+					migrateToCurrentVersion(this.fileEntries);
+					this._buildIndex();
+					this._rewriteFile();
+					this.flushed = true;
+					return;
+				}
 				const explicitPath = this.sessionFile;
 				this.newSession();
 				this.sessionFile = explicitPath;

@@ -579,20 +579,24 @@ export class IpythonKernelProvisioner {
 				// Revive a prior session's namespace before the bootstrap, so the bootstrap
 				// then overwrites live handles (rlm, skills) on top of anything restored.
 				if (snapshotDir) {
-					const snapshotExisted = existsSync(snapshotPathIn(snapshotDir));
+					const snapshotPath = snapshotPathIn(snapshotDir);
+					const snapshotExisted = existsSync(snapshotPath);
 					this.emitStartupProgress("Restoring Python state...");
 					const restore = await raceWithAbort(m.restoreState(), startupSignal);
 					if (snapshotExisted) {
-						// restoreState() resolves null only for a real failure (corrupt payload,
-						// timeout): surface it so the model knows the saved state was not revived.
-						// The on-disk snapshot stays untouched either way.
+						// restoreState() resolves null only for a real failure: surface it so the
+						// model knows the saved state was not revived. A payload the runtime could
+						// not load was isolated aside on disk (`<path>.corrupt-<stamp>`); a load
+						// that never finished (a timeout, a teardown) leaves it in place to retry.
 						pendingRestore =
 							restore ??
 							({
 								restored: [],
 								failed: [],
-								path: snapshotPathIn(snapshotDir),
-								error: "the saved snapshot exists but could not be restored (corrupt or unreadable); the kernel starts empty and the saved snapshot was kept untouched",
+								path: snapshotPath,
+								error: existsSync(snapshotPath)
+									? "the saved snapshot exists but could not be restored; it stays on disk unchanged for a later kernel to load, and this kernel starts empty"
+									: "the saved snapshot exists but could not be restored (corrupt or unreadable); the kernel starts empty and the failed snapshot was isolated aside on disk",
 							} satisfies RestoreResult);
 					}
 				}

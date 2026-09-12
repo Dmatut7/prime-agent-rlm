@@ -1,6 +1,18 @@
 import { execFile, execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	closeSync,
+	existsSync,
+	fsyncSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	realpathSync,
+	renameSync,
+	rmSync,
+	writeSync,
+} from "node:fs";
 import { readFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { lockSync } from "proper-lockfile";
@@ -57,7 +69,7 @@ export class SessionLease {
 		try {
 			withLeaseGuard(this.directory, () => {
 				const owner = readLeaseOwner(this.directory);
-				if (owner?.token === this.token) {
+				if (typeof owner === "object" && owner.token === this.token) {
 					rmSync(this.directory, { recursive: true, force: true });
 				}
 			});
@@ -90,21 +102,41 @@ export function canonicalSessionPath(sessionPath: string): string {
 	}
 }
 
-function readLeaseOwner(directory: string): SessionLeaseOwner | undefined {
+function isSessionLeaseOwner(value: unknown): value is SessionLeaseOwner {
+	if (typeof value !== "object" || value === null) {
+		return false;
+	}
+	const record = value as Partial<SessionLeaseOwner>;
+	return (
+		record.version === 1 &&
+		typeof record.token === "string" &&
+		typeof record.pid === "number" &&
+		typeof record.sessionPath === "string" &&
+		typeof record.createdAt === "string"
+	);
+}
+
+/**
+ * An unreadable owner may hold a live lease, so only a missing owner is safely
+ * absent. A record that decodes to nothing valid is "corrupt": a torn write or
+ * tampering that names no process, hence no evidence of a live owner to respect.
+ */
+function readLeaseOwner(directory: string): SessionLeaseOwner | "absent" | "unreadable" | "corrupt" {
+	const ownerPath = join(directory, "owner.json");
+	let raw: string;
 	try {
-		const parsed = JSON.parse(readFileSync(join(directory, "owner.json"), "utf8")) as Partial<SessionLeaseOwner>;
-		if (
-			parsed.version !== 1 ||
-			typeof parsed.token !== "string" ||
-			typeof parsed.pid !== "number" ||
-			typeof parsed.sessionPath !== "string" ||
-			typeof parsed.createdAt !== "string"
-		) {
-			return undefined;
+		raw = readFileSync(ownerPath, "utf8");
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unreadable";
+	}
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		return isSessionLeaseOwner(parsed) ? parsed : "corrupt";
+	} catch (error) {
+		if (error instanceof SyntaxError) {
+			return "corrupt";
 		}
-		return parsed as SessionLeaseOwner;
-	} catch {
-		return undefined;
+		throw error;
 	}
 }
 
@@ -375,6 +407,46 @@ function reclaimStaleLease(directory: string): boolean {
 	return true;
 }
 
+/**
+ * Durable owner-record write: temp file beside the destination, fsync, then an
+ * atomic rename, so a published owner.json is never torn mid-record and the
+ * bytes are on disk before the candidate directory rename publishes them.
+ */
+function writeOwnerRecordAtomic(path: string, content: string): void {
+	const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+	try {
+		const descriptor = openSync(tempPath, "wx", 0o600);
+		try {
+			// writeSync may return a short count without throwing; a partial temp must never be renamed in.
+			const bytes = Buffer.from(content, "utf8");
+			let offset = 0;
+			while (offset < bytes.length) {
+				const written = writeSync(descriptor, bytes, offset, bytes.length - offset);
+				if (written <= 0) throw new Error(`Short write persisting ${path}`);
+				offset += written;
+			}
+			fsyncSync(descriptor);
+		} finally {
+			closeSync(descriptor);
+		}
+		// openSync's mode is masked by the umask; enforce the private bits exactly.
+		chmodSync(tempPath, 0o600);
+		renameSync(tempPath, path);
+	} finally {
+		rmSync(tempPath, { force: true });
+	}
+	try {
+		const directoryDescriptor = openSync(dirname(path), "r");
+		try {
+			fsyncSync(directoryDescriptor);
+		} finally {
+			closeSync(directoryDescriptor);
+		}
+	} catch {
+		// Unavailable on some platforms; the atomic rename still protects readers.
+	}
+}
+
 export function acquireSessionLease(
 	sessionPath: string | undefined,
 	agentDir: string,
@@ -402,9 +474,10 @@ export function acquireSessionLease(
 				createdAt: new Date().toISOString(),
 			};
 			mkdirSync(candidateDirectory, { mode: 0o700 });
-			writeFileSync(join(candidateDirectory, "owner.json"), `${JSON.stringify(owner, null, 2)}\n`, {
-				mode: 0o600,
-			});
+			// Durable before the directory rename publishes the record: a power loss
+			// must not leave a torn owner.json for the next acquire to read back as an
+			// unknown owner.
+			writeOwnerRecordAtomic(join(candidateDirectory, "owner.json"), `${JSON.stringify(owner, null, 2)}\n`);
 			try {
 				renameSync(candidateDirectory, directory);
 				return new SessionLease(canonicalPath, directory, token);
@@ -415,8 +488,18 @@ export function acquireSessionLease(
 					throw error;
 				}
 				const existingOwner = readLeaseOwner(directory);
+				if (existingOwner === "unreadable") {
+					// Fail closed: an unreadable record may still name a live owner, and
+					// reclaiming one only needs write access to the parent directory, so a
+					// takeover here could hand the same session to two holders. Retry, and
+					// let the post-loop check refuse the lease while it stays unreadable.
+					continue;
+				}
+				// "corrupt" names no process, so there is no live owner to fail closed
+				// against: reclaim it under the guard (long-standing behavior, now spelled
+				// out) rather than refuse a session over a record nothing can ever repair.
 				if (
-					existingOwner &&
+					typeof existingOwner === "object" &&
 					isLeaseOwnerAlive(existingOwner) &&
 					!isReclaimableOwnLease(existingOwner, directory, environment)
 				) {
@@ -427,7 +510,11 @@ export function acquireSessionLease(
 		}
 
 		const owner = existsSync(directory) ? readLeaseOwner(directory) : undefined;
-		if (owner && isLeaseOwnerAlive(owner) && !isReclaimableOwnLease(owner, directory, environment)) {
+		if (
+			typeof owner === "object" &&
+			isLeaseOwnerAlive(owner) &&
+			!isReclaimableOwnLease(owner, directory, environment)
+		) {
 			throw new SessionAlreadyActiveError(canonicalPath, owner.activeSessionId);
 		}
 		throw new Error(`Could not acquire session lease: ${canonicalPath}`);

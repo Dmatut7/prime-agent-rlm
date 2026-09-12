@@ -2,17 +2,21 @@ import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
+import { StaleDaemonError } from "../src/cli/daemon-launch.js";
 import { mergeAgentSessionRuntimeConfig } from "../src/core/agent-session-config.js";
 import type { CreateAgentSessionOptions } from "../src/core/sdk.js";
 import {
 	type AppMode,
 	type DaemonCreatePrefireDecision,
+	type DaemonInteractivePrefire,
 	type DaemonInteractiveSessionManagerDecision,
 	daemonServerDefaultSessionConfig,
+	disposePrefiredDaemonConnection,
 	findActiveDaemonSessionSummaryForSessionFile,
 	type InteractiveDaemonStartupDecision,
 	isClientOwnedDaemonSession,
 	parseAgentsViewCommand,
+	prefireDaemonInteractiveConnection,
 	resolveRuntimeSessionOptions,
 	shouldEnsureDaemonBeforeActiveSessionLookup,
 	shouldEnsureInteractiveDaemonForStartup,
@@ -25,7 +29,7 @@ import {
 	shouldUseDaemonInteractive,
 	shouldUseEphemeralSessionManagerForDaemonInteractive,
 } from "../src/main.js";
-import type { SessionSummary } from "../src/modes/index.js";
+import type { DaemonAgentConnection, SessionSummary } from "../src/modes/index.js";
 
 describe("interactive startup routing", () => {
 	test.each([
@@ -500,6 +504,79 @@ describe("runtime session option resolution", () => {
 			maxContinuations: 5,
 			gates: { commands: ["npm test"], maxRetries: 3, timeoutMs: 1000 },
 		});
+	});
+});
+
+describe("prefired daemon create disposal", () => {
+	function makePrefire(overrides: Partial<DaemonInteractivePrefire> = {}): DaemonInteractivePrefire {
+		return {
+			readySettled: Promise.resolve({ ready: undefined }),
+			connection: new Promise<{ connection: DaemonAgentConnection; summary: SessionSummary }>(() => {}),
+			cancel: () => {},
+			...overrides,
+		};
+	}
+
+	function makeStubConnection(onDispose: () => void): DaemonAgentConnection {
+		return { dispose: async () => onDispose() } as unknown as DaemonAgentConnection;
+	}
+
+	test("cancelling a prefire stops the create RPC from firing", async () => {
+		let fired = 0;
+		const prefire = prefireDaemonInteractiveConnection(undefined, () => {
+			fired += 1;
+			return Promise.resolve({
+				connection: makeStubConnection(() => {}),
+				summary: makeSessionSummary({ id: "prefired" }),
+			});
+		});
+		prefire.cancel();
+		await expect(prefire.connection).rejects.toThrow(/cancelled/);
+		expect(fired).toBe(0);
+	});
+
+	test("an aborted startup skips the stale-daemon takeover instead of prompting on stdin", async () => {
+		const prefire = prefireDaemonInteractiveConnection(
+			Promise.reject(new StaleDaemonError("/tmp/prime-agent-aborted-takeover.sock")),
+			() =>
+				Promise.resolve({
+					connection: makeStubConnection(() => {}),
+					summary: makeSessionSummary({ id: "prefired" }),
+				}),
+		);
+		prefire.cancel();
+		await expect(prefire.readySettled).rejects.toThrow(/aborted before the stale daemon/);
+	});
+
+	test("an abort does not stall on a create that never settles", async () => {
+		let cancelled = false;
+		const started = Date.now();
+		await disposePrefiredDaemonConnection(
+			makePrefire({
+				cancel: () => {
+					cancelled = true;
+				},
+			}),
+			50,
+		);
+		expect(cancelled).toBe(true);
+		expect(Date.now() - started).toBeLessThan(2_000);
+	});
+
+	test("an abort still detaches a create that already landed", async () => {
+		let disposed = 0;
+		await disposePrefiredDaemonConnection(
+			makePrefire({
+				connection: Promise.resolve({
+					connection: makeStubConnection(() => {
+						disposed += 1;
+					}),
+					summary: makeSessionSummary({ id: "prefired" }),
+				}),
+			}),
+			5_000,
+		);
+		expect(disposed).toBe(1);
 	});
 });
 

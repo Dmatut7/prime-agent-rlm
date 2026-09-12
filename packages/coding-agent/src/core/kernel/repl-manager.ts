@@ -498,9 +498,10 @@ export class ReplKernelManager {
 	private pendingRebootstrap = false;
 	/** Restore the saved namespace on that fresh start too (false when the snapshot itself is the declared culprit). */
 	private pendingRestore = false;
-	/** A whole-payload load failed and the on-disk snapshot could not be isolated: the namespace
-	 * is older than that snapshot, so no snapshot write may overwrite it. Isolating the file
-	 * clears this flag so a rebuilt namespace can persist again. */
+	/** A whole-payload load did not finish and the snapshot is still on disk under its real name —
+	 * it could not be isolated, or a teardown interrupted the load: the namespace is older than
+	 * that snapshot, so no snapshot write may overwrite it. A restore that loads the payload
+	 * clears this flag, and so does isolating the file, which leaves nothing to protect. */
 	private restoreWriteBlocked = false;
 	/** Names the last restore could not revive. Later snapshots ask the runtime to carry their
 	 * saved blobs over verbatim instead of banning every write; a fully successful restore, or
@@ -2610,7 +2611,9 @@ export class ReplKernelManager {
 	 * A bound that trips is a *slow* payload, not a corrupt one (B5): a cold read of a large
 	 * snapshot can outlast the ordinary repair budget, and renaming the payload aside because it
 	 * was slow would destroy good state to answer a timeout. So a timeout retries once with the
-	 * longer window and never isolates; only a payload that actually failed to load is isolated.
+	 * longer window and never isolates; only a payload that actually failed to load is isolated,
+	 * and a load the host's own teardown cut short is not a failure of the payload either (see
+	 * {@link isolateFailedSnapshot}).
 	 */
 	private async performRestore(protocolRepair: boolean): Promise<RestoreResult | null> {
 		const cfg = this.options.snapshot;
@@ -2691,8 +2694,33 @@ export class ReplKernelManager {
 		}
 	}
 
+	/**
+	 * Whether the host is tearing this kernel down (shutdown/kill/disposeSync). Every teardown
+	 * raises these before it can reject an in-flight request, so a request that fails inside this
+	 * window was cut short by the host and says nothing about the payload it was carrying.
+	 */
+	private get hostTeardownInProgress(): boolean {
+		return this.disposedByHost || this.teardownInFlight > 0;
+	}
+
 	/** Rename a snapshot that failed to load so a later write can replace it. */
 	private isolateFailedSnapshot(cfg: { path: string; manifestPath: string }, reason: string): void {
+		if (this.hostTeardownInProgress) {
+			// Not a verdict on the payload: the load never finished, so the namespace is still
+			// older than what is on disk. Leave the file under its real name for the next kernel
+			// to load, and keep writes paused so a teardown's final snapshot of the empty
+			// namespace cannot replace it.
+			this.restoreWriteBlocked = true;
+			this.appendKernelDiagnostic(
+				`state restore interrupted by kernel teardown; keeping the snapshot at ${cfg.path}: ${reason}`,
+			);
+			kernelLog.warn("kernel state restore interrupted by teardown; snapshot kept", {
+				path: cfg.path,
+				reason,
+				sessionId: this.options.sessionId,
+			});
+			return;
+		}
 		try {
 			const isolated = isolateCorruptSnapshot(cfg.path, cfg.manifestPath);
 			this.restoreWriteBlocked = false;

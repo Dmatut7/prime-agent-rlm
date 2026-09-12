@@ -436,6 +436,11 @@ export function createTurnLiveness(options: TurnLivenessOptions): TurnLiveness {
 			}
 			if (verdict.loopAlive && verdict.cellAwaiting) {
 				reasons.push(STALL_VOUCH_REASONS.kernelLoopAwaitingCell);
+				// A tick on its own is liveness, but requests finishing while it ticks are movement
+				// the kernel demonstrably made, so a provably-moving cell workload earns the full
+				// tier. The live-handle vouch above stays on bash-side evidence alone: a handle that
+				// produces nothing must keep its short rescue even if some other cell just finished.
+				if (verdict.progress) progress = true;
 			}
 			if (verdict.loopStalled && verdict.cellAwaiting) {
 				// Frames arrive but the tick is frozen: a synchronous cell is monopolizing the
