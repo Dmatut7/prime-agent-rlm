@@ -22,7 +22,7 @@ import { v4 as uuid } from "uuid";
 import { DEFAULT_SHORT_TARGET_WAIT_MS, withBound } from "../../utils/bounded-wait.js";
 import { assertRegularFileNoSymlink, ensurePrivateDirectory, requireNoFollow } from "../../utils/private-files.js";
 import { reapKernelOrphanProcesses, recordOrphanProcessState } from "../orphan-process-journal.js";
-import { ensureKernelPython, managedKernelVenvDirForPython } from "./bootstrap.js";
+import { ensureKernelPython, KERNEL_PYTHON_SAFE_PATH_ARGS, managedKernelVenvDirForPython } from "./bootstrap.js";
 import {
 	classifyKernelExit,
 	type KernelDeathCause,
@@ -829,7 +829,11 @@ export class ReplKernelManager {
 		const stderrLogFd = this.openStderrLogFd();
 		let child: ChildProcess;
 		try {
-			child = spawn(python, ["-m", "rlm.repl"], {
+			// Safe path: the session cwd must never sit at sys.path[0], or a checkout
+			// could substitute its own rlm/, dill.py, or stdlib-named module for the
+			// runtime's own imports (symptom: "Kernel exited before ready", pointing
+			// nowhere near the real cause).
+			child = spawn(python, [...KERNEL_PYTHON_SAFE_PATH_ARGS, "-m", "rlm.repl"], {
 				cwd: this.options.cwd,
 				// bash.py journals its process groups under this pid so the host can
 				// reap them if the runtime dies without running its shutdown hook.
