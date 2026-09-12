@@ -1,0 +1,135 @@
+# 进会话 / agents 视图间歇 1–5 秒 · 修法与实测（2026-09-12）
+
+> 适用范围：`merge/repl-kernel`，基线 HEAD `0429806b6`。
+> 入口与背景：`FORK_NOTES.md`「2026-09-12 傍晚 · 进视图/进会话卡顿修复」；
+> 缺陷定位报告（只读取证，未改代码）：`/tmp/ma_audit/ui_lag_measure.md`；
+> 施工与验证全记录：`/tmp/ma_audit/build_ui_lag.md`。
+
+## 一、病根（沿用定位报告的结论，本次已复核）
+
+进 agents 视图 / 进会话时，守护进程要做一次 **O(存活子代理边数 × 转录字节数)** 的串行磁盘扫描：
+
+| 落点 | 规模（本机实测） | 修前冷 |
+|---|---|---|
+| `rlm-ledger.ts` `withPassiveRlmDescendantInfos()`：每条存活边一次 `await readSessionInfo(child)` | 456 边 / 757 MB | 2078–2484 ms |
+| `session-manager.ts` `listSessionsFromDir()`：sessions 目录逐文件串行扫 | 83 文件 / 430 MB | 1156–1312 ms |
+| `daemon-mode.ts` `listPassiveRlmSubagents()`：`visit()` 递归里逐条 `await readSessionInfo` | 168 文件 / 305 MB（最大根子树） | 769–784 ms |
+| 一次 `list_saved_sessions` 合计（= 开一次 agents 视图的守护进程侧成本） | 539 文件 | **3333–3373 ms** |
+
+缓存只有 **进程内一层**（`sessionInfoCache`，键 `size+mtimeMs+ino`），所以「换进程就全冷」：
+新 worker、catalog 子进程、守护进程重启、passivate→hydrate 循环，每一次都重付一遍。
+冷热差实测 267×（同一次调用，命中 8 ms / 不命中 2164 ms）——这就是「间歇」的物理来源。
+代码不是今天改坏的：数据涨了（存活边从 9/4 的一半涨到 456 条）。
+
+## 二、修了什么
+
+1. **持久层摘要缓存**（新增 `core/session-info-disk-cache.ts`）
+   - `<agentDir>/session-info-cache/<sha256(转录绝对路径)>.json`，内容 = 一份 `SessionInfo` + 指纹。
+   - **诚实性规则**：只有 `(dev, ino, size, mtimeMs)` 与扫描当时完全一致才发；**内容变了必然重扫**，
+     与进程内缓存同一条判据（多一个 `dev`，因为 inode 只在同一卷内唯一）。
+   - 只在**全量扫描**后写（增量续扫不写：活跃会话每次追加都会重写，而下个进程也用不上）。
+   - 不 fsync（缓存丢了就是一次 miss，不是损坏）；temp+rename 原子落盘；目录 0700 / 文件 0600
+     （摘要里含 `firstMessage`、`allMessagesText`，与转录同级私密）。
+   - **只缓存代理自己的转录目录**（sessions 与 session-artifacts，含 realpath 拼写），
+     其它路径（临时目录 fixture、导入的转录、用户自选路径）行为完全不变、零副作用。
+   - 每周一次的后台清理（`prune-marker`）：转录已消失或指纹已漂移的条目才删。
+   - 写失败连续 3 次即熔断，读永远降级为 miss，任何缓存故障都不会让读失败。
+2. **并发化**（新增 `utils/map-concurrent.ts`，保序、限流、可按序流式回调）
+   - `withPassiveRlmDescendantInfos`、`listSessionsFromDir`、`family()` 的 row 循环、
+     `listPassiveRlmSubagents` 的 `visit()`（拆成「取元数据 → 串行准入判定 → 取摘要 → 按序发射+下钻」四段，
+     准入判定仍串行按边序，`visited` 语义与深度优先前序输出都不变）。
+   - `liveEdges()`：探测改成 in-flight 去重 + 并发；**并且把 `canonicalSessionPath()` 结果记忆化**
+     —— 它是阻塞的 `realpathSync`，同一条边原先被规范化 3 次。
+     坑：**只加并发不加记忆化反而更慢**（实测 repeat 24.6 ms → 44 ms），因为 realpath 在主线程串行。
+3. **客户端两处**（`agents-view/`）
+   - 250 ms 动画定时器不再 `rebuildRows()`（重建 = 重过滤+重汇总+重嵌套+重排序，536 条记录实测 24–28 ms），
+     改为 `refreshAgentsViewRowTimeLabels()` 就地重算时间派生的 `statusLabel`；合成行（subagent-summary /
+     subagent-code 挂的是父行 summary、标签恒为空）跳过，避免凭空造文案。
+   - `resolveMissingSelectionAnchor()` 对「目录刷新在飞」的一票否决改成**有界**：
+     超过 `SELECTION_ANCHOR_REFRESH_GRACE_MS = 2000` 就放行（动画 tick 与 `openSelected()` 都会触发检查），
+     Enter 不再是死路。刷新窗内的正常语义不变：锚点行一到就放行。
+
+**总闸遵守**：没有少显示任何子代理、没有少读任何转录、没有降低搜索/用量/拓扑能力；
+E2E 落定行数修前 82（被动后代那条腿还没到就被判「落定」）→ 修后 97（全量到齐）。
+
+## 三、实测数字
+
+方法同定位报告：① 组件级 = 每场景一个全新进程（进程内缓存冷、OS page cache 热），
+只读真实数据的 APFS clone（`/tmp/uilag_home`，83 根会话 430 MB + 456 存活边 757 MB，账本路径重写）；
+② 端到端 = tmux 200x50 驱动 `agents` 视图，`capture-pane` 每 28 ms 打点。
+两套 build（基线树 / 修后树，均 `git archive 0429806b6` + node_modules 符号链接后各自 `npm run build`）
+在同一台机、同一负载窗内背靠背跑。
+
+### 3.1 组件级（3 次重复，取全部值）
+
+| 指标 | 修前 | 修后 | 倍数 |
+|---|---|---|---|
+| 一次 `list_saved_sessions`（全新进程，539 文件） | 3349 / 3333 / 3373 ms | **173 / 138 / 129 ms** | **25×** |
+| 同上，进程内热重复 | 40.6 / 42.1 / 41.0 ms | **26.0 / 26.8 / 27.4 ms** | 1.5× |
+| `withPassiveRlmDescendantInfos`（456 边 / 757 MB） | 2484 / 2078 / 2108 ms | **46.0 / 48.9 / 45.9 ms** | **46×** |
+| sessions 目录扫描（83 文件 / 430 MB） | 1312 / 1180 / 1156 ms | **19.4 / 19.8 / 19.4 ms** | **60×** |
+| 最大根子树（168 文件 / 305 MB） | 784 / 778 / 769 ms | **17.6 / 20.4 / 18.4 ms** | **42×** |
+| `liveEdges()` 首次（含 1 MB 账本重放） | 87.2 ms | 78.6 ms | 1.1× |
+| `liveEdges()` 重复（纯探测） | 24.6 / 23.9 ms | **15.1 / 15.8 ms** | 1.6× |
+| 修后·持久缓存**空**时的首次（539 次全量扫描 + 建缓存） | — | 3515 ms | ≈ 修前 |
+
+修后冷读的层构成：`diskHits=539, fullScans=0`（一次都不重扫）。
+持久缓存体积：708 条 / 8.4 MB（对应 1.5 GB 转录，约 0.55%）。
+
+**验收口径**：冷进视图（守护进程侧目录成本）**129–173 ms < 500 ms** ✅；
+热（进程内重复）**26–28 ms < 100 ms** ✅。
+
+### 3.2 端到端（tmux + 各自 build 的 bundle）
+
+| 指标 | 修前 | 修后（持久缓存已建） | 修后（缓存空，首次） |
+|---|---|---|---|
+| 守护进程冷：Enter→聊天界面 | **5253 / 5243 ms** | **233 / 221 / 223 / 221 ms** | 5259 / 5261 ms |
+| 守护进程冷：视图出现→行数落定 | 1707 / 1748 ms | 869 / 858 / 627 / 621 ms | 812 / 816 ms |
+| 守护进程冷：落定时行数 | 82（**不全**） | 97（全） | 13（流中途假落定） |
+| 守护进程热：Enter→聊天界面 | 201 / 208 / 190 ms | 206 / 208 / 203 / 192 ms | 207 ms |
+| 守护进程热：视图出现→行数落定 | 449 / 486 / 582 ms | 641 / 556 / 517 / 561 ms | 449 ms |
+
+- 冷启动行数轨迹：修前 `7→8→10→11→13→14→37→38→48→51→55→58→59→66…`（1707 ms 内还在爬，最终只到 82）；
+  修后 `20→48→52→68→82→97`（**279 ms 内到齐**）。
+- 同机同 harness 的**受控 A/B**：修后 build 把持久缓存目录删掉再冷跑 = 5259/5261 ms，
+  与基线 5253/5243 ms 一致 ⇒ 那 5 秒确实是「摘要没落盘 ⇒ 每次换进程全量重扫」造成的，
+  缓存建好之后同一条路径 221–233 ms（**23.7×**）。
+- 守护进程**热**的 Enter→聊天 两边都是 ~200 ms，没有变化：这一档的地板是**转录本体水合**
+  （被打开的是最大的那个根会话，81 MB / 8.5 万条，`loadEntriesFromFileAsync` 实测 248 ms，无缓存），
+  即定位报告排第 4 的「常数项」。不靠少读转录就压不下去，故本次不动，留作后续（见下）。
+- 冷启动的 `启动→视图出现` 两边都是 4.4–4.5 s，**与本修无关**：harness 用 `kill -9` 杀守护进程，
+  日志里是 `supervisor probe failed (attempt 1..3/3)` → `launched replacement supervisor` →
+  `Daemon supervisor startup failed: Error: Lock file is already being held` 的锁恢复循环，
+  两个 build 同样付这份钱，故冷档只看「视图出现之后」的窗口与 Enter→聊天。
+
+## 四、验证
+
+- **先红后绿**：6 个测试文件（33 条）在基线树 `0429806b6`（`git archive` + node_modules 符号链接）上
+  **6 文件全红、9 条断言失败**；同批文件在修后树上 **33/33 全绿**。
+  其中最有信息量的两条红是断言级而非导入级：
+  `expect(probe.peak()).toBeGreaterThanOrEqual(2)` 收到 `1`（串行扫描）、
+  `expect(existsSync(cacheDir())).toBe(true)` 收到 `false`（摘要不落盘）。
+- **变异 8 处，全部被杀**（改一处 → 目标测试必红 → 还原）：
+  M1 不读持久层 / M2 去掉指纹校验 / M3 被动合并限流改 1（退回串行）/ M4 回调不按序发射 /
+  M5 合成行也重算标签 / M6 恢复「刷新一票否决」/ M7 任意路径都缓存 / M8 从不落盘。
+  还原后同一批 33 条重新全绿。
+- **回归**：`test/session-manager/` 全目录 + session-info + rlm-ledger + agents-view + daemon-catalog +
+  saved-session-catalog + daemon-session-list + session-lease = **38 文件 459 条全过**；
+  `daemon-mode` + 全部 `daemon-supervisor-*`（不含 process 版与 4603）= **18 文件 429 条全过**。
+  合计 **56 文件 888 条**。env 已净化（`env -u RLM_* -u PRIME_AGENT_INTERNAL_* …`，
+  且 `PRIME_AGENT_CODING_AGENT_DIR` 指向 /tmp，测试不写真实 `~/.prime`）。
+- `npm run check`（biome 全仓 + tsgo + installer + browser-smoke）、`npm run check:test-hygiene`（无新增私探）、
+  纯净树 `git archive HEAD | tar -x` + `npx tsgo --noEmit` 均 EXIT=0。
+- 未跑 `test/suite/regressions/4603-worker-recovery.test.ts`（按指令禁跑）。
+
+## 五、残留与后续（本次未动，均有据）
+
+1. **转录本体水合 248 ms / 81 MB**（报告 #4）：热档 ~200 ms 的地板。要压只能改 attach 的传输/水合策略
+   （`slim_attach` 已有能力门），属于「少传」而不是「少读」，需要单独一轮。
+2. **账本重放 ~65 ms/进程首次**：`replaySync()` 每次账本变化都整份重读重解析（1 MB / 3199 行）。
+   可做「按字节偏移增量重放 + 截断即全量」，但账本是拓扑权威，风险单独评估。
+3. **`liveEdges()` 的 536 次 stat ≈ 15 ms**：libuv 线程池默认 4，并发再高也压不下去；
+   要再降需改成「按目录一次 `readdir` 批量判在」，但子代理转录是一子一目录，收益有限。
+4. **客户端全量 reconcile 35 ms/次**：本次没改节流窗（50 ms）。因为守护进程侧从 3.3 s 降到 0.13 s，
+   流式窗内的 reconcile 次数从约 40 次掉到约 3 次，1.4 s 的同步阻塞自然消失（E2E 窗口 1707→627 ms 已含此效应）。
+5. **运维侧仍可再降绝对值**（不改代码）：归档 `session-artifacts`（4.9 GB / 1996 份子代理转录）与账本死边。

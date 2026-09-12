@@ -17,6 +17,7 @@ import { EventLog } from "../../core/event-log.js";
 import { canonicalSessionPath } from "../../core/session-lease.js";
 import { getSessionArtifactPathForFile, readSessionInfo, type SessionInfo } from "../../core/session-manager.js";
 import { readFirstLineSync } from "../../utils/file-lines.js";
+import { DEFAULT_MAP_CONCURRENCY_LIMIT, mapConcurrent } from "../../utils/map-concurrent.js";
 
 /**
  * Daemon-owned RLM spawn ledger.
@@ -36,6 +37,13 @@ import { readFirstLineSync } from "../../utils/file-lines.js";
  */
 
 export const RLM_LEDGER_DIR = "rlm-ledger";
+
+/**
+ * Existence probes are metadata-only, so they tolerate a deeper pipeline than a
+ * transcript scan does. On a ledger with ~450 live edges a serial walk costs
+ * ~90 ms of pure round trips; the same probes overlap into single digits.
+ */
+const LEDGER_STAT_CONCURRENCY = 32;
 
 /** Bounded read: a ledger beyond these limits fails closed loudly. */
 export const RLM_LEDGER_MAX_BYTES = 32 * 1024 * 1024;
@@ -503,22 +511,42 @@ export class RlmSpawnLedger {
 	private async liveEdgesUnlocked(
 		edges = [...this.replaySync().values()].filter((edge) => !edge.deleted),
 	): Promise<RlmLedgerEdge[]> {
-		const statCache = new Map<string, boolean>();
-		const exists = async (path: string): Promise<boolean> => {
-			const cached = statCache.get(path);
-			if (cached !== undefined) return cached;
-			let ok = false;
-			try {
-				ok = (await stat(path)).isFile();
-			} catch {
-				ok = false;
-			}
-			statCache.set(path, ok);
-			return ok;
+		// canonicalSessionPath() is a blocking realpath per call, and reconciliation
+		// looks at the same edge path several times; canonicalize each one once.
+		const canonical = new Map<string, string>();
+		const canonicalOf = (path: string): string => {
+			const hit = canonical.get(path);
+			if (hit !== undefined) return hit;
+			const value = canonicalSessionPath(path);
+			canonical.set(path, value);
+			return value;
 		};
+		// Probes are deduped in flight rather than after the fact: siblings share a
+		// parent path, and a serial walk pays one event-loop round trip per edge on
+		// top of the stat itself. Children are probed first so a dead child still
+		// spares its parent's stat, exactly as the serial short-circuit did.
+		const statCache = new Map<string, Promise<boolean>>();
+		const exists = (path: string): Promise<boolean> => {
+			const inflight = statCache.get(path);
+			if (inflight) return inflight;
+			const probe = stat(path)
+				.then((stats) => stats.isFile())
+				.catch(() => false);
+			statCache.set(path, probe);
+			return probe;
+		};
+		const childPaths = [...new Set(edges.map((edge) => canonicalOf(edge.child)))];
+		const childAlive = await mapConcurrent(childPaths, LEDGER_STAT_CONCURRENCY, (path) => exists(path));
+		const liveChildPaths = new Set(childPaths.filter((_path, index) => childAlive[index]));
+		const parentPaths = [
+			...new Set(
+				edges.filter((edge) => liveChildPaths.has(canonicalOf(edge.child))).map((edge) => canonicalOf(edge.parent)),
+			),
+		];
+		await mapConcurrent(parentPaths, LEDGER_STAT_CONCURRENCY, (path) => exists(path));
 		const alive: RlmLedgerEdge[] = [];
 		for (const edge of edges) {
-			if ((await exists(canonicalSessionPath(edge.child))) && (await exists(canonicalSessionPath(edge.parent)))) {
+			if ((await exists(canonicalOf(edge.child))) && (await exists(canonicalOf(edge.parent)))) {
 				alive.push(edge);
 			}
 		}
@@ -567,21 +595,15 @@ export class RlmSpawnLedger {
 			}
 			return true;
 		});
-		const rows: SessionInfo[] = [];
-		for (const rootPath of rootPaths) {
-			rows.push(await this.sessionRow(rootPath, 0, undefined, undefined));
-		}
-		for (const edge of alive) {
-			rows.push(
-				await this.sessionRow(
-					canonicalSessionPath(edge.child),
-					edge.depth,
-					canonicalSessionPath(edge.parent),
-					edge.name,
-				),
-			);
-		}
-		return rows;
+		// Row order is the contract here (roots first, then ledger order), so the
+		// reads overlap but the results are assembled by index.
+		const rootRows = await mapConcurrent(rootPaths, DEFAULT_MAP_CONCURRENCY_LIMIT, (rootPath) =>
+			this.sessionRow(rootPath, 0, undefined, undefined),
+		);
+		const childRows = await mapConcurrent(alive, DEFAULT_MAP_CONCURRENCY_LIMIT, (edge) =>
+			this.sessionRow(canonicalSessionPath(edge.child), edge.depth, canonicalSessionPath(edge.parent), edge.name),
+		);
+		return [...rootRows, ...childRows];
 	}
 
 	private async sessionRow(
@@ -821,23 +843,37 @@ export async function withPassiveRlmDescendantInfos(
 		options.log?.(`Could not merge passive RLM descendants: ${String(error)}`);
 		return sessions;
 	}
+	// Dedupe first, then read the survivors concurrently and emit them through the
+	// in-order callback: same rows, same order, same progressive streaming as the
+	// serial walk, without one event-loop round trip per edge. On a real ledger
+	// (450+ passive descendants, 750+ MB of transcripts) this leg dominated the
+	// cost of opening the agents view.
+	const candidates: Array<{ edge: RlmLedgerEdge; childPath: string }> = [];
 	for (const edge of edges) {
 		const childPath = canonicalSessionPath(edge.child);
 		if (seen.has(childPath)) continue;
 		seen.add(childPath);
-		const info = await readSessionInfo(childPath);
-		if (!info) continue;
-		if (options.cwd !== undefined && (!info.cwd || resolve(info.cwd) !== resolve(options.cwd))) continue;
-		// The ledger edge is the authoritative topology (family() semantics); a fork
-		// can leave the transcript header pointing at a dead ancestor path.
-		const merged: SessionInfo = {
-			...info,
-			parentSessionPath: edge.parent,
-			rlmDepth: edge.depth,
-		};
-		sessions.push(merged);
-		options.onSession?.(merged);
+		candidates.push({ edge, childPath });
 	}
+	await mapConcurrent(
+		candidates,
+		DEFAULT_MAP_CONCURRENCY_LIMIT,
+		(candidate) => readSessionInfo(candidate.childPath),
+		(info, index) => {
+			if (!info) return;
+			if (options.cwd !== undefined && (!info.cwd || resolve(info.cwd) !== resolve(options.cwd))) return;
+			const edge = candidates[index]!.edge;
+			// The ledger edge is the authoritative topology (family() semantics); a fork
+			// can leave the transcript header pointing at a dead ancestor path.
+			const merged: SessionInfo = {
+				...info,
+				parentSessionPath: edge.parent,
+				rlmDepth: edge.depth,
+			};
+			sessions.push(merged);
+			options.onSession?.(merged);
+		},
+	);
 	return sessions;
 }
 

@@ -902,6 +902,32 @@ function createSubagentSummaryRow(
 	};
 }
 
+/**
+ * Re-derive only the clock-dependent part of the rows that already exist.
+ *
+ * The animation tick used to call the full rebuild for this, which re-filters,
+ * re-rolls-up, re-nests and re-sorts every record (measured 24-28 ms on a
+ * 536-record catalog, every 250 ms) just to move "3m ago" to "4m ago". A row's
+ * label is a pure function of its own summary and heartbeat, so it can be
+ * recomputed in place. Synthetic rows are skipped: a subagent-summary or
+ * subagent-code row carries its parent's summary but a label of its own (""),
+ * and recomputing it from the parent would invent text the build never produced.
+ *
+ * Returns true when at least one label actually changed, which is the only case
+ * that needs a render.
+ */
+export function refreshAgentsViewRowTimeLabels(rows: readonly AgentsViewRow[]): boolean {
+	let changed = false;
+	for (const row of rows) {
+		if (row.kind !== "agent" && row.kind !== "subagent") continue;
+		const next = getSessionStatusLabel(row.summary, row.heartbeat) + getQuietDurationLabel(row.summary);
+		if (row.statusLabel === next) continue;
+		row.statusLabel = next;
+		changed = true;
+	}
+	return changed;
+}
+
 function hasSpawnCode(summary: SessionSummary): boolean {
 	return typeof summary.spawnCode === "string" && summary.spawnCode.trim().length > 0;
 }

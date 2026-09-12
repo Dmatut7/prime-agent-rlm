@@ -88,6 +88,7 @@ import {
 	isSubagentSummary,
 	migrateAgentsViewIdentitySet,
 	reconcileUnifiedSessions,
+	refreshAgentsViewRowTimeLabels,
 	resolveAgentsViewLeftResult,
 	resolveAgentsViewScopeFrames,
 	resolveAgentsViewSelectionState,
@@ -105,6 +106,13 @@ import { createSearchTextMatcher } from "./session-view-search.js";
 
 const HEARTBEAT_POLL_INTERVAL_MS = 15000;
 const SAVED_CATALOG_RECONCILE_THROTTLE_MS = 50;
+/**
+ * How long an unresolved selection anchor may keep Enter blocked while a saved
+ * catalog refresh is in flight. The refresh normally delivers the anchor's row
+ * and clears the pending state on its own; this is the backstop for a slow or
+ * wedged RPC, so the key never becomes a permanent dead end.
+ */
+const SELECTION_ANCHOR_REFRESH_GRACE_MS = 2000;
 const RECONNECT_TIMEOUT_MS = 120000;
 const RECONNECT_RETRY_MS = 1000;
 const EXIT_HINT_DURATION_MS = 2000;
@@ -696,6 +704,8 @@ export class AgentsViewMode implements Component, Focusable {
 	private selectedActiveSessionId: string | undefined;
 	private selectedSessionKey: AgentsViewSelectionKey | undefined;
 	private selectionAnchorPending = false;
+	/** When the current anchor wait started; 0 while no anchor is pending. */
+	private selectionAnchorPendingSince = 0;
 	/** Armed reply composer target: a live agent or a saved session to resume on send. */
 	private replyTarget: { key: string; summary: SessionSummary } | undefined;
 	/** Provider bound to the armed target's cwd for file-path completions. */
@@ -915,13 +925,18 @@ export class AgentsViewMode implements Component, Focusable {
 		this.heartbeatPollTimer = setInterval(() => void this.refreshHeartbeats(), HEARTBEAT_POLL_INTERVAL_MS);
 		this.heartbeatPollTimer.unref?.();
 		this.animationTimer = setInterval(() => {
+			// The grace window below is a deadline, not an event: nothing else ticks
+			// while a catalog refresh is parked on a slow RPC.
+			if (this.selectionAnchorPending) this.resolveMissingSelectionAnchor();
 			const hasRunning = this.rows.some((row) => row.section === "running");
 			const hasStaleAge = this.rows.some((row) => row.summary.lastHeardFromAt !== undefined);
 			if (!hasRunning && !hasStaleAge) return;
-			// Age labels are baked into rows at build time; ticking them needs a rebuild.
-			if (hasStaleAge) this.rebuildRows();
+			// Age labels are baked into rows at build time, but they are a pure
+			// function of each row's own summary: patch them in place instead of
+			// rebuilding (and re-filtering, re-rolling-up, re-sorting) every row.
+			const labelsChanged = hasStaleAge ? refreshAgentsViewRowTimeLabels(this.rows) : false;
 			if (hasRunning) this.workingIconFrame += 1;
-			this.ui.requestRender();
+			if (labelsChanged || hasRunning) this.ui.requestRender();
 		}, WORKING_ICON_INTERVAL_MS);
 		this.animationTimer.unref?.();
 
@@ -1389,6 +1404,12 @@ export class AgentsViewMode implements Component, Focusable {
 		const row = this.rows[this.selectedIndex];
 		if (!row?.selectable || this.isPendingDeleteRow(row)) {
 			return;
+		}
+		if (this.selectionAnchorPending) {
+			// Enter must not be a dead end. The animation tick also expires the grace
+			// window, but a keypress is the moment the user is actually waiting, so
+			// re-check here instead of making them press it twice.
+			this.resolveMissingSelectionAnchor();
 		}
 		if (this.selectionAnchorPending) {
 			this.setStatusMessage("Waiting for the selected session to load");
@@ -2352,12 +2373,27 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private resolveMissingSelectionAnchor(): void {
-		if (!this.selectionAnchorPending || this.savedCatalogRefreshPending) {
+		if (!this.selectionAnchorPending) {
+			return;
+		}
+		// An in-flight refresh owns the anchor's arrival and must not be
+		// second-guessed mid-stream: resolving against a half-streamed catalog would
+		// adopt a fallback row the next session could still displace. The wait is
+		// bounded, though, so a slow RPC cannot keep Enter refused indefinitely.
+		if (this.savedCatalogRefreshPending && !this.selectionAnchorGraceExpired()) {
 			return;
 		}
 		this.selectionAnchorPending = false;
+		this.selectionAnchorPendingSince = 0;
 		const row = this.rows[this.selectedIndex];
 		this.selectedActiveSessionId = row?.selectable ? (row.summary.activeSessionId ?? row.summary.id) : undefined;
+	}
+
+	private selectionAnchorGraceExpired(): boolean {
+		return (
+			this.selectionAnchorPendingSince > 0 &&
+			Date.now() - this.selectionAnchorPendingSince >= SELECTION_ANCHOR_REFRESH_GRACE_MS
+		);
 	}
 
 	private restoreSelection(): void {
@@ -2383,6 +2419,7 @@ export class AgentsViewMode implements Component, Focusable {
 				this.selectedSessionKey ??
 				this.persistentState.selectedSessionKey,
 		);
+		this.selectionAnchorPendingSince = this.selectionAnchorPending ? Date.now() : 0;
 		// Catalogs stream independently. Show a temporary fallback row without
 		// replacing the source-session anchor before its daemon row arrives.
 		const fallback = this.rows[this.selectedIndex];
@@ -2397,6 +2434,7 @@ export class AgentsViewMode implements Component, Focusable {
 
 	private syncSelectedRowState(): void {
 		this.selectionAnchorPending = false;
+		this.selectionAnchorPendingSince = 0;
 		const row = this.rows[this.selectedIndex];
 		this.selectedActiveSessionId = row?.selectable ? (row.summary.activeSessionId ?? row.summary.id) : undefined;
 		this.selectedRowIdentity = getSelectedRowIdentity(row);

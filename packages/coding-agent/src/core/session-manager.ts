@@ -19,6 +19,7 @@ import { v7 as uuidv7 } from "uuid";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
 import { readFileLines, readFirstLineSync, repairTruncatedTrailingLine } from "../utils/file-lines.js";
 import { captureGitContext, type GitContext, gitContextsEqual } from "../utils/git.js";
+import { DEFAULT_MAP_CONCURRENCY_LIMIT, mapConcurrent } from "../utils/map-concurrent.js";
 import {
 	appendPrivateFile,
 	assertRegularFileNoSymlink,
@@ -33,6 +34,12 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "./messages.js";
+import {
+	readCachedSessionInfo,
+	SESSION_ARTIFACTS_DIR_NAME,
+	scheduleSessionInfoCachePrune,
+	writeCachedSessionInfo,
+} from "./session-info-disk-cache.js";
 import { resolveCompleteToolPairLeaf } from "./session-tool-pair.js";
 import {
 	addAssistantUsage,
@@ -303,7 +310,7 @@ function createUniqueSessionFileTarget(sessionDir: string): { sessionId: string;
 }
 
 export function getSessionArtifactsRoot(sessionDir: string): string {
-	return resolve(dirname(sessionDir), "session-artifacts");
+	return resolve(dirname(sessionDir), SESSION_ARTIFACTS_DIR_NAME);
 }
 
 const tightenedArtifactDirectories = new Set<string>();
@@ -1149,6 +1156,43 @@ interface SessionInfoCacheEntry {
 // retained scan state lets those reads cover only the appended bytes.
 const sessionInfoCache = new Map<string, SessionInfoCacheEntry>();
 
+/**
+ * Which layer served each `readSessionInfo` call. The point is not telemetry for
+ * its own sake: "the disk layer absorbed what a fresh process would otherwise
+ * have re-scanned" is the whole claim behind the durable cache, and it is only
+ * checkable if the layers are counted.
+ */
+export interface SessionInfoReadStats {
+	memoryHits: number;
+	diskHits: number;
+	fullScans: number;
+	resumedScans: number;
+}
+
+const sessionInfoReadStats: SessionInfoReadStats = {
+	memoryHits: 0,
+	diskHits: 0,
+	fullScans: 0,
+	resumedScans: 0,
+};
+
+export function getSessionInfoReadStats(): SessionInfoReadStats {
+	return { ...sessionInfoReadStats };
+}
+
+/**
+ * Drop the process-local summary cache (and its counters) so a caller can
+ * reproduce the state a freshly spawned worker starts in: no summaries in
+ * memory, everything on disk still there.
+ */
+export function clearSessionInfoCaches(): void {
+	sessionInfoCache.clear();
+	sessionInfoReadStats.memoryHits = 0;
+	sessionInfoReadStats.diskHits = 0;
+	sessionInfoReadStats.fullScans = 0;
+	sessionInfoReadStats.resumedScans = 0;
+}
+
 export async function readSessionInfo(filePath: string): Promise<SessionInfo | null> {
 	let stats: Awaited<ReturnType<typeof stat>>;
 	try {
@@ -1160,6 +1204,7 @@ export async function readSessionInfo(filePath: string): Promise<SessionInfo | n
 	}
 	const cached = sessionInfoCache.get(filePath);
 	if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs && cached.ino === stats.ino) {
+		sessionInfoReadStats.memoryHits++;
 		return cached.info;
 	}
 	// Resume only on a plain append to the same file: same inode, grown, and the
@@ -1172,6 +1217,25 @@ export async function readSessionInfo(filePath: string): Promise<SessionInfo | n
 		cached.scan.offset <= stats.size
 			? cached.scan
 			: undefined;
+	if (!resumable) {
+		// A full scan is the expensive branch, so try the durable layer first: a
+		// summary another process already computed for this exact (dev, ino, size,
+		// mtimeMs) is equivalent to scanning again. Resumable reads skip this — a
+		// few appended bytes are cheaper to parse than a whole summary is to load,
+		// and a resume keeps the incremental state that the next append needs.
+		const fingerprint = { dev: stats.dev, ino: stats.ino, size: stats.size, mtimeMs: stats.mtimeMs };
+		const durable = await readCachedSessionInfo(filePath, fingerprint);
+		if (durable) {
+			sessionInfoReadStats.diskHits++;
+			sessionInfoCache.set(filePath, {
+				size: stats.size,
+				mtimeMs: stats.mtimeMs,
+				ino: stats.ino,
+				info: durable,
+			});
+			return durable;
+		}
+	}
 	const scanned = await scanSessionInfo(filePath, stats, resumable);
 	sessionInfoCache.set(filePath, {
 		size: stats.size,
@@ -1180,6 +1244,23 @@ export async function readSessionInfo(filePath: string): Promise<SessionInfo | n
 		info: scanned.info,
 		...(scanned.scan ? { scan: scanned.scan } : {}),
 	});
+	if (resumable) {
+		sessionInfoReadStats.resumedScans++;
+	} else {
+		sessionInfoReadStats.fullScans++;
+		if (scanned.info) {
+			// Only a full scan is persisted: it is the one that just paid for the
+			// whole file. A resumed scan's summary would be rewritten on every
+			// append of a live session, and the next process cannot use it anyway
+			// until the file stops growing.
+			await writeCachedSessionInfo(
+				filePath,
+				{ dev: stats.dev, ino: stats.ino, size: stats.size, mtimeMs: stats.mtimeMs },
+				scanned.info,
+			);
+			scheduleSessionInfoCachePrune();
+		}
+	}
 	return scanned.info;
 }
 
@@ -1383,15 +1464,22 @@ async function listSessionsFromDir(
 		}
 
 		let loaded = 0;
-		for (const file of files) {
-			const info = await readSessionInfo(file);
-			loaded++;
-			callbacks?.onProgress?.(progressOffset + loaded, total);
-			if (info) {
-				sessions.push(info);
-				callbacks?.onSession?.(info);
-			}
-		}
+		// The files are independent, so their reads overlap; the emit callback keeps
+		// progress counts and streamed sessions in the directory order the serial
+		// loop produced, which is what the catalog's progressive rows assume.
+		await mapConcurrent(
+			files,
+			DEFAULT_MAP_CONCURRENCY_LIMIT,
+			(file) => readSessionInfo(file),
+			(info) => {
+				loaded++;
+				callbacks?.onProgress?.(progressOffset + loaded, total);
+				if (info) {
+					sessions.push(info);
+					callbacks?.onSession?.(info);
+				}
+			},
+		);
 	} catch {
 		// Return no sessions when the directory cannot be read.
 	}

@@ -123,6 +123,7 @@ import {
 	type WaitTimeoutFacts,
 	withBound,
 } from "../../utils/bounded-wait.js";
+import { mapConcurrent } from "../../utils/map-concurrent.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import {
 	createAgentConnectionCommands,
@@ -295,6 +296,12 @@ const AGENT_MESSAGE_QUEUED_RUN_TRACKING_LIMIT = 500;
 const WORKER_SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS = 1_000;
 const UPDATE_RESTART_PREPARE_TIMEOUT_MS = 90_000;
 const MAX_SESSION_SNAPSHOT_STABILIZATION_RETRIES = 3;
+/**
+ * Transcript summaries and per-child display metadata are independent reads, so a
+ * subtree walk overlaps them instead of paying one round trip per child. Kept
+ * well under the file-descriptor limits a worker shares with its kernel.
+ */
+const PASSIVE_SUBTREE_SCAN_CONCURRENCY = 8;
 
 const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"ack_result",
@@ -1332,18 +1339,30 @@ export class AgentDaemon {
 		}
 		const legacyRegistryCache = new Map<string, Promise<LegacyRlmSubagentRegistryEntry[]>>();
 		const passive: PassiveRlmSubagent[] = [];
+		// One node's children are read in three phases instead of one serial loop:
+		// metadata for every edge, then the admission decisions, then the transcript
+		// summaries. Phases 1 and 3 are pure I/O and overlap; phase 2 stays serial
+		// and in edge order because `visited` accumulates as it goes, so admission
+		// (and the row order that follows from it) is decided exactly as the serial
+		// walk decided it. The subtree walk below is unchanged, so the emitted list
+		// is still depth-first pre-order.
 		const visit = async (
 			root: PassiveRlmRoot,
 			parent: { sessionId: string; sessionFile: string },
 			parentChain: PassiveRlmSubagentEntry[],
 			visited: Set<string>,
 		): Promise<void> => {
-			for (const edge of childrenByParent.get(canonicalSessionPath(parent.sessionFile)) ?? []) {
-				// The ledger stores realpath-canonical paths while the rest of the
-				// daemon keys by resolve(): work with the writer-recorded path from
-				// the metadata entry so passive rows keep matching residency,
-				// opens, and passivation bookkeeping.
-				const entry = await this.passiveRlmSubagentEntryForEdge(edge, parent, legacyRegistryCache);
+			const edges = childrenByParent.get(canonicalSessionPath(parent.sessionFile)) ?? [];
+			if (edges.length === 0) return;
+			// The ledger stores realpath-canonical paths while the rest of the
+			// daemon keys by resolve(): work with the writer-recorded path from
+			// the metadata entry so passive rows keep matching residency,
+			// opens, and passivation bookkeeping.
+			const entries = await mapConcurrent(edges, PASSIVE_SUBTREE_SCAN_CONCURRENCY, (edge) =>
+				this.passiveRlmSubagentEntryForEdge(edge, parent, legacyRegistryCache),
+			);
+			const admitted: PassiveRlmSubagentEntry[] = [];
+			for (const entry of entries) {
 				const sessionKey = resolve(entry.sessionFile);
 				if (entry.status === "deleted" || visited.has(sessionKey)) continue;
 				visited.add(sessionKey);
@@ -1354,8 +1373,15 @@ export class AgentDaemon {
 				// serve them from cache and each walk would rescan the whole file only
 				// to discard the result here.
 				if (!includeResident && this.findSessionBySessionFile(entry.sessionFile)) continue;
-				const info = await readSessionInfo(entry.sessionFile);
+				admitted.push(entry);
+			}
+			if (admitted.length === 0) return;
+			const infos = await mapConcurrent(admitted, PASSIVE_SUBTREE_SCAN_CONCURRENCY, (entry) =>
+				readSessionInfo(entry.sessionFile),
+			);
+			for (const [index, info] of infos.entries()) {
 				if (!info) continue;
+				const entry = admitted[index]!;
 				const chain = [...parentChain, entry];
 				passive.push({ ...root, entry, info, chain });
 				await visit(root, { sessionId: info.id, sessionFile: entry.sessionFile }, chain, visited);
