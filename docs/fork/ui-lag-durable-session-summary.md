@@ -32,8 +32,24 @@
      （摘要里含 `firstMessage`、`allMessagesText`，与转录同级私密）。
    - **只缓存代理自己的转录目录**（sessions 与 session-artifacts，含 realpath 拼写），
      其它路径（临时目录 fixture、导入的转录、用户自选路径）行为完全不变、零副作用。
-   - 每周一次的后台清理（`prune-marker`）：转录已消失或指纹已漂移的条目才删。
-   - 写失败连续 3 次即熔断，读永远降级为 miss，任何缓存故障都不会让读失败。
+   - 每周一次的后台清理（`prune-marker` 门控）：**只删能证明是垃圾的**——转录已消失、指纹已漂移、
+     或内容解析不出来（temp+rename 之下解析失败只可能是真损坏）。
+     **读不出来 ≠ 是垃圾**：`readFile`/`stat` 抛瞬时 errno 时保留条目，留给下一轮走查判定
+     （否则会因一次 EMFILE 抖动静默删掉仍然新鲜的摘要，违背自己的注释）。
+     顺带回收崩溃在 `writeFile` 与 `rename` 之间的 `.tmp` 残渣（按 mtime 超过 1 小时才收，
+     年轻的可能是别的进程正在写）。
+   - 写失败按 errno 分两类：**永久性**（EROFS/ENOSPC/EACCES/…）连续 3 次即本进程熔断；
+     **瞬时性**（EMFILE/ENFILE/EAGAIN/EBUSY/EINTR/ENOMEM/ETIMEDOUT）不熔断，改指数退避
+     （250 ms 起、30 s 封顶），退避窗内直接跳过写入（计入 `skipped`），窗口过后自动恢复——
+     本模块自己把同进程 fd 压力放大了 8 倍（并发扫描），把一次描述符尖峰读成「这文件系统永远不行」
+     会让长跑 daemon/worker 余生所有冷扫照常全量。
+   - **摘要时间戳不可序列化时跳过该条目而不是抛**：`Date#toISOString()` 对 Invalid Date 抛 RangeError，
+     而转录头部的 `timestamp` 恰恰可能不可解析（手工编辑/截断/第三方导入；加载路径本来就容忍它，
+     `scanSessionInfo` 对 `modified` 早就有 `Number.isNaN` 回退）。一致性审查 F1 实证：
+     未加守卫时一份坏时间戳转录会让**整个目录**的 `listAll` 在每次冷读时抛 RangeError、返回 0 条，
+     直接证伪本节「任何缓存故障都不会让读失败」的声明。
+   - 读永远降级为 miss；上述三条（不可序列化 / 超 512 KiB / 写失败）都只是「不缓存」，
+     **任何缓存故障都不会让读失败**。
    - **删除即清**：`deleteSessionFile()` 成功后 `forgetSessionInfo()` 同时清进程内条目与持久条目；
      `deleteSessionArtifacts()` 在递归删除**之前**广度优先走一遍该目录（只进真目录、不跟符号链接），
      把被一起删掉的被动后代转录的条目也清掉，否则一个根被删会留下「每子一条」的孤儿等周清。
@@ -115,16 +131,26 @@ E2E 落定行数修前 82（被动后代那条腿还没到就被判「落定」�
 
 ## 四、验证
 
-- **先红后绿**：6 个测试文件在基线树 `0429806b6`（`git archive` + node_modules 符号链接）上
-  **6 文件全红、9 条断言失败**；同批文件在修后树上 **37/37 全绿**（首交 33 条 + 随访 4 条）。
+- **先红后绿**：首交的 6 个测试文件在基线树 `0429806b6`（`git archive` + node_modules 符号链接）上
+  **6 文件全红、9 条断言失败**；同批文件在修后树上全绿（首交 33 条 → 随访 37 条 → 一致性审查这轮 **7 文件 46 条**）。
+  本轮（一致性审查 F1/F4/F5）同样是先红后绿：F1 用审查车道自己的复现脚本
+  `/tmp/ma_audit/repro_invalid_ts.mts` 先证「`readSessionInfo` 抛 RangeError、`listAll` 返回 0 of 3」，
+  修后同一脚本输出「direct read returned / listAll returned **3 of 3** / writes=2 skipped=1」；
+  F4 退避与 F5 prune 各有一条断言级红（`writeErrors` 2≠1、`pruned` 1≠0）。
   其中最有信息量的两条红是断言级而非导入级：
   `expect(probe.peak()).toBeGreaterThanOrEqual(2)` 收到 `1`（串行扫描）、
   `expect(existsSync(cacheDir())).toBe(true)` 收到 `false`（摘要不落盘）。
-- **变异 11 处，全部被杀**（改一处 → 目标测试必红 → 还原）：
+- **变异 19 处：18 杀 + 1 判定为等价变异**（改一处 → 目标测试必红 → 还原）：
   M1 不读持久层 / M2 去掉指纹校验 / M3 被动合并限流改 1（退回串行）/ M4 回调不按序发射 /
   M5 合成行也重算标签 / M6 恢复「刷新一票否决」/ M7 任意路径都缓存 / M8 从不落盘 /
-  **M9 删除后不清条目**（3 条红）/ **M10 删根时不清后代条目**（1 条红）/ **M11 anchor 死线不再重新武装**（1 条红）。
-  M2、M7、M9、M10 是**正确性/卫生方向**而非性能方向的变异。还原后同一批 37 条重新全绿。
+  M9 删除后不清条目（3 条红）/ M10 删根时不清后代条目（1 条红）/ M11 anchor 死线不再重新武装（1 条红）/
+  **M12a 整体回退 F1 修法**（wire 构造挪回 try 之外 + 裸 `toISOString()`，毒列表那条红）/ **M13 瞬时 errno 也走永久熔断** /
+  **M14 退避窗内照写不误** / **M15 prune 把读不出来当垃圾删** / **M16 去掉 512 KiB 上限** /
+  **M17 去掉 prune-marker 周门控** / **M18 不回收 `.tmp` 残渣**（各 1 条红）。
+  M2、M7、M9、M10、M12a、M15 是**正确性/卫生方向**而非性能方向的变异。还原后同一批 46 条重新全绿。
+  **M12b（只摘 `toIsoString` 守卫、wire 仍留在 try 内）存活 —— 判定为等价变异，不计杀**：
+  RangeError 被同一个 `catch { stats.skipped++; return; }` 接住，可观测结果（不落盘 + `skipped` 加一 + 读照常返回）
+  与有守卫时逐字相同。守卫与 try 是两层防护，任一层单独成立；保留守卫是为了不拿异常当控制流、意图写在脸上。
 - **回归**：`test/session-manager/` 全目录 + session-info + rlm-ledger + agents-view + daemon-catalog +
   saved-session-catalog + daemon-session-list + session-lease + session-artifacts-delete = **39 文件 467 条全过**；
   `daemon-mode` + 全部 `daemon-supervisor-*`（不含 process 版与 4603）= **18 文件 429 条全过**。
@@ -145,3 +171,21 @@ E2E 落定行数修前 82（被动后代那条腿还没到就被判「落定」�
 4. **客户端全量 reconcile 35 ms/次**：本次没改节流窗（50 ms）。因为守护进程侧从 3.3 s 降到 0.13 s，
    流式窗内的 reconcile 次数从约 40 次掉到约 3 次，1.4 s 的同步阻塞自然消失（E2E 窗口 1707→627 ms 已含此效应）。
 5. **运维侧仍可再降绝对值**（不改代码）：归档 `session-artifacts`（4.9 GB / 1996 份子代理转录）与账本死边。
+
+## 六、一致性审查（sweep_meta）随访这一轮
+
+审查车道 `/tmp/ma_audit/sweep_meta.md` 在本模块面上开了 5 条（F1–F5）+ 2 条观察级（F7），逐条处置：
+
+| 编号 | 判定 | 处置 |
+|---|---|---|
+| **F1**（必修） | 成立，已用审查方脚本活体复现 | `writeCachedSessionInfo` 把 wire 构造整体挪进 try，并新增 `toIsoString()`：Invalid Date → 跳过该条目（计 `skipped`），**不抛**。回归测试「坏时间戳转录在场时 `listAll` 仍返回全部 3 条」先红（`RangeError: Invalid time value` @ disk-cache:260）后绿。**没有**顺手改 `scanSessionInfo` 里 `created` 的语义：坏头部返回 Invalid Date 是加载路径的既有行为（`modified` 早有 `Number.isNaN` 回退、`created` 一直没有），改它会影响排序与显示，属另一件事，登记在 §五 残留 |
+| **F2** | 成立 | 删掉 `packages/coding-agent/.changes/ma-batch4-pending-delivery-queue.md` 里与 `ma-batch4-send-drain-exemption.md` 重复的那条 bullet（保留信息更全的独立文件）；复核四个包的 fragment：263/24/18/5 条 bullet，**精确重复 0、70 字归一化前缀近重复 0** |
+| **F3** | 成立 | 给 `packages/tui/.changes/` 补两条一行 fragment：`stdin-paste-linear-sequence-scan.md`（f6cf52f58 的 stdin-buffer 二次方）、`truncated-text-render-cache.md`（781d91985 的叶子组件 render-cache）；逐字核过对应 diff 才写的措辞 |
+| **F4** | 成立 | ① 熔断按 errno 分类：永久性连续 3 次才熔断，瞬时性（EMFILE/ENFILE/EAGAIN/EBUSY/EINTR/ENOMEM/ETIMEDOUT/EWOULDBLOCK）改指数退避 250 ms→30 s 且**自动恢复**（半开）；② 三条自证声明补断言：熔断（永久 3 次即停 + 之后不复活）、512 KiB 跳过、prune-marker 周门控 |
+| **F5** | 成立 | prune 把「读不出来」与「内容损坏」分成两个判决：`readFile` 抛错 → 保留（下轮再判）；`stat` 源文件抛**瞬时** errno → 保留；只有解析失败/源已消失（ENOENT）/指纹漂移才删。附带回收 `.tmp` 残渣（>1 h） |
+| **F6** | 不属本车道（是别的提交穿错标签） | 未动，转告父代理 |
+| **F7** | 观察级，顺手做了 | ① 孤儿 JSDoc 归位到 `isSessionInfoDiskCacheable` 头上；② `.tmp` 残渣纳入 prune（见 F5）；③ 内存键用原始拼写 / 磁盘键用 `resolve()` 拼写：维持设计内不变 |
+
+新增测试 9 条（`session-info-disk-cache.test.ts` 13→16、新文件 `session-info-disk-cache-faults.test.ts` 6 条，
+后者用 `vi.mock("node:fs/promises")` 注入指定 errno，配 fake timers 走退避窗）。
+新增变异 7 处（M12–M18），全部被杀。

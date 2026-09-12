@@ -20,6 +20,7 @@ import {
 	pruneStaleSessionInfoCacheEntries,
 	resetSessionInfoDiskCacheState,
 	SESSION_INFO_DISK_CACHE_DIR_NAME,
+	scheduleSessionInfoCachePrune,
 	sessionInfoDiskCacheDir,
 	sessionInfoDiskCacheStats,
 	whenSessionInfoCachePruneSettled,
@@ -335,6 +336,90 @@ describe("durable session-info summary", () => {
 		expect(result.ok).toBe(true);
 		expect(existsSync(childDir)).toBe(false);
 		expect(cacheFiles()).toHaveLength(0);
+	});
+
+	it("does not let one unserializable timestamp poison the whole directory listing", async () => {
+		const good = (id: string) =>
+			writeSession(sessionsDir, id, headerLine(id, "/tmp/project") + messageLine("user", `question ${id}`, 1000));
+		const brokenPath = join(sessionsDir, "bbb-broken.jsonl");
+		// A hand-edited, truncated or third-party-imported transcript: the loader
+		// tolerates this header, so the list path must tolerate it too.
+		const brokenHeader = JSON.stringify({
+			type: "session",
+			version: 3,
+			id: "bbb-broken",
+			timestamp: "definitely-not-a-date",
+			cwd: "/tmp/project",
+		});
+		writeFileSync(brokenPath, `${brokenHeader}\n${messageLine("user", "question bbb-broken", 1000)}`, "utf8");
+		good("aaa-good");
+		good("ccc-good");
+
+		simulateFreshProcess();
+		// The summary of the broken transcript cannot be serialized, so it is not
+		// persisted - but that is a cache decision, and it must never escape as a
+		// throw that takes the other 500 rows down with it.
+		const broken = await sessionManagerModule.readSessionInfo(brokenPath);
+		expect(broken?.id).toBe("bbb-broken");
+		expect(Number.isNaN(broken?.created.getTime() ?? Number.NaN)).toBe(true);
+
+		simulateFreshProcess();
+		const listed = await sessionManagerModule.SessionManager.listAll(undefined, sessionsDir);
+		expect(listed.map((info) => info.id).sort()).toEqual(["aaa-good", "bbb-broken", "ccc-good"]);
+		expect(cacheFiles()).toHaveLength(2);
+		expect(sessionInfoDiskCacheStats().skipped).toBe(1);
+	});
+
+	it("skips a summary too large to be worth its own file", async () => {
+		// The search text is capped at 64 KiB but the first message is not, so one
+		// huge opening message is enough to push the payload over the entry limit.
+		const path = writeSession(
+			sessionsDir,
+			"session-huge",
+			headerLine("session-huge", "/tmp/project") + messageLine("user", "x".repeat(600_000), 1000),
+		);
+		const info = await sessionManagerModule.readSessionInfo(path);
+		expect(info?.firstMessage.length).toBeGreaterThan(512 * 1024);
+		expect(cacheFiles()).toHaveLength(0);
+		expect(sessionInfoDiskCacheStats().skipped).toBe(1);
+
+		// Skipping is a decision, not a failure: the read still returned the summary.
+		expect(info?.messageCount).toBe(1);
+		expect(sessionInfoDiskCacheStats().writeErrors).toBe(0);
+	});
+
+	it("walks the directory at most once per prune interval", async () => {
+		const kept = writeSession(
+			sessionsDir,
+			"session-p",
+			headerLine("session-p", "/tmp/project") + messageLine("user", "one", 1000),
+		);
+		const gone = writeSession(
+			sessionsDir,
+			"session-q",
+			headerLine("session-q", "/tmp/project") + messageLine("user", "two", 1000),
+		);
+		await sessionManagerModule.readSessionInfo(kept);
+		await sessionManagerModule.readSessionInfo(gone);
+		await whenSessionInfoCachePruneSettled();
+		const marker = join(sessionInfoDiskCacheDir(), "prune-marker");
+		expect(existsSync(marker)).toBe(true);
+		expect(cacheFiles()).toHaveLength(2);
+
+		rmSync(gone, { force: true });
+		// The marker is fresh, so a newly started process must not walk the
+		// directory again: the orphan waits for the interval, not for the next boot.
+		simulateFreshProcess();
+		scheduleSessionInfoCachePrune();
+		await whenSessionInfoCachePruneSettled();
+		expect(cacheFiles()).toHaveLength(2);
+
+		rmSync(marker, { force: true });
+		simulateFreshProcess();
+		scheduleSessionInfoCachePrune();
+		await whenSessionInfoCachePruneSettled();
+		expect(cacheFiles()).toHaveLength(1);
+		expect(sessionInfoDiskCacheStats().pruned).toBe(1);
 	});
 
 	it("survives an unwritable cache location without failing the read", async () => {

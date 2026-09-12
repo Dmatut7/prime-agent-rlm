@@ -37,8 +37,31 @@ const MAX_ENTRY_BYTES = 512 * 1024;
 /** Prune is a whole-directory walk, so it runs at most this often per agent dir. */
 const PRUNE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
 const PRUNE_CONCURRENCY = 16;
-/** Consecutive write failures before this process stops trying (read-only home, ENOSPC, odd filesystem). */
+/**
+ * Consecutive *permanent* write failures before this process stops trying
+ * (read-only home, ENOSPC, a regular file where the directory belongs).
+ */
 const WRITE_FAILURE_DISABLE_THRESHOLD = 3;
+/**
+ * Errno values that mean "right now", not "never": descriptor exhaustion and
+ * friends are a moment in a process that just multiplied its own fd pressure
+ * eightfold by reading transcripts concurrently. Latching the durable layer off
+ * for the rest of a long-lived daemon's life would be the wrong reading of them.
+ */
+const TRANSIENT_FS_ERRNOS = new Set([
+	"EAGAIN",
+	"EBUSY",
+	"EINTR",
+	"EMFILE",
+	"ENFILE",
+	"ENOMEM",
+	"ETIMEDOUT",
+	"EWOULDBLOCK",
+]);
+const TRANSIENT_BACKOFF_BASE_MS = 250;
+const TRANSIENT_BACKOFF_MAX_MS = 30_000;
+/** A temp file older than this is the debris of a crash between write and rename. */
+const STALE_TEMP_FILE_AGE_MS = 60 * 60 * 1000;
 
 export interface SessionInfoFingerprint {
 	dev: number;
@@ -65,6 +88,8 @@ export interface SessionInfoDiskCacheStats {
 	writes: number;
 	skipped: number;
 	writeErrors: number;
+	/** Subset of writeErrors whose errno said "try again later" rather than "never". */
+	transientWriteErrors: number;
 	pruned: number;
 	/** Entries dropped because their transcript was deleted. */
 	removed: number;
@@ -77,12 +102,15 @@ const stats: SessionInfoDiskCacheStats = {
 	writes: 0,
 	skipped: 0,
 	writeErrors: 0,
+	transientWriteErrors: 0,
 	pruned: 0,
 	removed: 0,
 };
 
 let consecutiveWriteFailures = 0;
 let writesDisabled = false;
+let transientBackoffMs = 0;
+let transientBackoffUntil = 0;
 let directoryEnsured: string | undefined;
 let pruneScheduled = false;
 let pruneInFlight: Promise<void> | undefined;
@@ -101,10 +129,13 @@ export function resetSessionInfoDiskCacheState(): void {
 	stats.writes = 0;
 	stats.skipped = 0;
 	stats.writeErrors = 0;
+	stats.transientWriteErrors = 0;
 	stats.pruned = 0;
 	stats.removed = 0;
 	consecutiveWriteFailures = 0;
 	writesDisabled = false;
+	transientBackoffMs = 0;
+	transientBackoffUntil = 0;
 	directoryEnsured = undefined;
 	pruneScheduled = false;
 	rootsKey = undefined;
@@ -124,11 +155,6 @@ function sessionInfoFingerprintOf(statsLike: {
 	return { dev: statsLike.dev, ino: statsLike.ino, size: statsLike.size, mtimeMs: statsLike.mtimeMs };
 }
 
-/**
- * Only the agent's own transcript directories are cacheable. Anything else
- * (a fixture in a temp dir, an imported transcript, a user-chosen path) keeps
- * the previous behaviour: read straight from the file, no side effect anywhere.
- */
 /**
  * Both spellings of every root: the configured one and its realpath. Ledger
  * paths are realpath-canonical while catalog paths are the configured spelling,
@@ -165,6 +191,11 @@ function cacheableRoots(): string[] {
 	return roots;
 }
 
+/**
+ * Only the agent's own transcript directories are cacheable. Anything else
+ * (a fixture in a temp dir, an imported transcript, a user-chosen path) keeps
+ * the previous behaviour: read straight from the file, no side effect anywhere.
+ */
 export function isSessionInfoDiskCacheable(filePath: string): boolean {
 	const resolved = resolve(filePath);
 	return cacheableRoots().some((root) => resolved.startsWith(`${root}${sep}`));
@@ -173,6 +204,30 @@ export function isSessionInfoDiskCacheable(filePath: string): boolean {
 function cacheEntryPath(filePath: string): string {
 	const hash = createHash("sha256").update(resolve(filePath)).digest("hex");
 	return join(sessionInfoDiskCacheDir(), `${hash}.json`);
+}
+
+function errnoOf(error: unknown): string | undefined {
+	if (!error || typeof error !== "object" || !("code" in error)) return undefined;
+	const code = (error as { code?: unknown }).code;
+	return typeof code === "string" ? code : undefined;
+}
+
+function isTransientFsError(error: unknown): boolean {
+	const code = errnoOf(error);
+	return code !== undefined && TRANSIENT_FS_ERRNOS.has(code);
+}
+
+/**
+ * `Date#toISOString` throws a RangeError on an Invalid Date, and a transcript
+ * header's timestamp is exactly the kind of field that can arrive unparseable
+ * (hand-edited, truncated, third-party import). The loader tolerates that and
+ * returns a summary whose `created` is Invalid, so this layer has to tolerate it
+ * too: an unrepresentable timestamp makes the entry uncachable, not the read
+ * unreturnable.
+ */
+function toIsoString(value: Date): string | undefined {
+	const ms = value instanceof Date ? value.getTime() : Number.NaN;
+	return Number.isFinite(ms) ? new Date(ms).toISOString() : undefined;
 }
 
 function sameFingerprint(a: SessionInfoFingerprint | undefined, b: SessionInfoFingerprint): boolean {
@@ -254,13 +309,24 @@ export async function writeCachedSessionInfo(
 	info: SessionInfo,
 ): Promise<void> {
 	if (writesDisabled || !isSessionInfoDiskCacheable(filePath)) return;
-	const wire: SessionInfoCacheFile = {
-		v: CACHE_ENTRY_VERSION,
-		fingerprint: sessionInfoFingerprintOf(fingerprint),
-		info: { ...info, created: info.created.toISOString(), modified: info.modified.toISOString() },
-	};
+	if (transientBackoffUntil > Date.now()) {
+		// Not an error: the filesystem asked for a moment and has not had it yet.
+		stats.skipped++;
+		return;
+	}
 	let payload: string;
 	try {
+		const created = toIsoString(info.created);
+		const modified = toIsoString(info.modified);
+		if (created === undefined || modified === undefined) {
+			stats.skipped++;
+			return;
+		}
+		const wire: SessionInfoCacheFile = {
+			v: CACHE_ENTRY_VERSION,
+			fingerprint: sessionInfoFingerprintOf(fingerprint),
+			info: { ...info, created, modified },
+		};
 		payload = JSON.stringify(wire);
 	} catch {
 		stats.skipped++;
@@ -278,12 +344,26 @@ export async function writeCachedSessionInfo(
 		await writeFile(temp, payload, { mode: 0o600, flag: "wx" });
 		await rename(temp, target);
 		consecutiveWriteFailures = 0;
+		transientBackoffMs = 0;
+		transientBackoffUntil = 0;
 		stats.writes++;
-	} catch {
+	} catch (error) {
 		stats.writeErrors++;
+		await rm(temp, { force: true }).catch(() => undefined);
+		if (isTransientFsError(error)) {
+			// Back off exponentially and stay available: a descriptor spike from the
+			// very concurrency this module exists to serve must not close the durable
+			// layer for the remaining life of a daemon or worker process.
+			stats.transientWriteErrors++;
+			transientBackoffMs = Math.min(
+				transientBackoffMs > 0 ? transientBackoffMs * 2 : TRANSIENT_BACKOFF_BASE_MS,
+				TRANSIENT_BACKOFF_MAX_MS,
+			);
+			transientBackoffUntil = Date.now() + transientBackoffMs;
+			return;
+		}
 		consecutiveWriteFailures++;
 		if (consecutiveWriteFailures >= WRITE_FAILURE_DISABLE_THRESHOLD) writesDisabled = true;
-		await rm(temp, { force: true }).catch(() => undefined);
 	}
 }
 
@@ -338,31 +418,67 @@ export async function pruneStaleSessionInfoCacheEntries(): Promise<number> {
 	const dir = sessionInfoDiskCacheDir();
 	let names: string[];
 	try {
-		names = (await readdir(dir)).filter((name) => name.endsWith(".json"));
+		names = await readdir(dir);
 	} catch {
 		return 0;
 	}
 	let pruned = 0;
-	await mapConcurrent(names, PRUNE_CONCURRENCY, async (name) => {
-		const file = join(dir, name);
-		let keep = false;
-		try {
-			const parsed = JSON.parse(await readFile(file, "utf8")) as SessionInfoCacheFile;
-			const sourcePath = isPlausibleInfo(parsed?.info) ? parsed.info.path : undefined;
-			if (sourcePath) {
-				const sourceStats = await stat(sourcePath).catch(() => undefined);
-				keep =
-					sourceStats !== undefined &&
-					sourceStats.isFile() &&
-					sameFingerprint(parsed.fingerprint, sessionInfoFingerprintOf(sourceStats));
+	await mapConcurrent(
+		names.filter((name) => name.endsWith(".json")),
+		PRUNE_CONCURRENCY,
+		async (name) => {
+			const file = join(dir, name);
+			// "Unreadable" and "corrupt" are different verdicts and must not share a
+			// branch: a descriptor spike or a transient I/O error says nothing about
+			// the entry, so it stays and the next walk decides. Only content that
+			// cannot be parsed, or a source that is gone or has moved on, is collected.
+			let raw: string;
+			try {
+				raw = await readFile(file, "utf8");
+			} catch {
+				return;
 			}
-		} catch {
-			keep = false;
-		}
-		if (keep) return;
-		await rm(file, { force: true }).catch(() => undefined);
-		pruned++;
-	});
+			let keep = false;
+			try {
+				const parsed = JSON.parse(raw) as SessionInfoCacheFile;
+				const sourcePath = isPlausibleInfo(parsed?.info) ? parsed.info.path : undefined;
+				if (sourcePath) {
+					try {
+						const sourceStats = await stat(sourcePath);
+						keep =
+							sourceStats.isFile() && sameFingerprint(parsed.fingerprint, sessionInfoFingerprintOf(sourceStats));
+					} catch (error) {
+						// A missing source is the proof we want; a source we could not
+						// probe is not, and must not be read as one.
+						keep = isTransientFsError(error);
+					}
+				}
+			} catch {
+				keep = false;
+			}
+			if (keep) return;
+			await rm(file, { force: true }).catch(() => undefined);
+			pruned++;
+		},
+	);
+	// Debris of a crash between writeFile and rename: never served, never reused
+	// (the name carries a pid and a uuid), so collect it by age. A young temp file
+	// may belong to a writer in another process right now and is left alone.
+	await mapConcurrent(
+		names.filter((name) => name.endsWith(".tmp")),
+		PRUNE_CONCURRENCY,
+		async (name) => {
+			const file = join(dir, name);
+			try {
+				const tempStats = await stat(file);
+				if (Date.now() - tempStats.mtimeMs < STALE_TEMP_FILE_AGE_MS) return;
+			} catch {
+				return;
+			}
+			await rm(file, { force: true }).catch(() => undefined);
+			pruned++;
+		},
+	);
 	stats.pruned += pruned;
 	return pruned;
 }
