@@ -18,6 +18,7 @@
 | 2026-09-12 凌晨 | 采纳外部贡献者 5 个修复；移除假设置 bashTimeoutSeconds；修"记忆写入遇格式抖动整条丢"；摘官方 3 个优点；大门从自动关 PR 改为人工审；向官方反馈 27 条缺陷（Discussions #2239） |
 | 2026-09-12 中午（TAKE tierA） | 上游可靠性 A 档 4 件 + 1 件半 + fork 自留闸：`waitForIdle` 不再微任务自旋把整台 worker 楔死在 100% CPU；跑测试不再读写开发者真凭证；内核管道 EPIPE 不再打死整台 worker；内核 python 走 `-P` 安全路径（checkout 不能顶替 `rlm`/`dill`/stdlib）；headless 取消后无响应的内核会被杀掉并打上归因标；`prime-agent update` 在 fork 构建上拒绝官方包覆盖 |
 | 2026-09-12 上午（TAKE 第二批） | 上游 TAKE 清单剩余 9 件收口（8 件落地 + 1 件核收）：litellm 上下文超限识别、prompt 参数 `$` 字面量不再二次展开、`/traces` 子命令补全、助手 Markdown 文件链接按会话 cwd 解析（连带 TUI 允许打开 `file://`）、agents-view 用量列/图例/空会话沉底/分支不再算子代理、打包版 CLI 的 Bedrock 装载真修、目录生成器 Qwen 改名映射 + gpt-6 规则、伪装客户端版本升级（Claude Code 2.1.261 / Copilot 0.48.1） |
+| 2026-09-12 中午² | 合并 DZMing 的 PR #11（性能 7 簇：OSC133 无限累积/渲染缓存失效/provider 流式平方/内核序列化/daemon 风暴/冷启动并发——治"跑久了膨胀"；附终端快照 final 直写修复） |
 | 2026-09-12 中午 | 合并 DZMing 的 PR #12（13 簇：导出 HTML 属性注入 XSS、导出 $ 模式损坏、分岔压缩丢摘要、非 UTC 孤儿清理失效、投递档位计时、Kitty 双触发、RPC 丢 id、ACP 吞扩展错误、MCP OAuth 顺序、streamStallTimeoutMs 传递、Bedrock 缓存定价 + 性能件）；fork 闸门测试缝；4603 两枚缺陷立案 |
 | 2026-09-12 上午 | 官方动态对账：41 个新提交盘点（12 拿/15 适配/14 不拿，top3 已摘完）+ 60 个开放 PR 逐件分析（22 件值得拿，A 档 6 件在摘）；rlm.collect（子代理结果回收）已移植落地（含 stallAbort 终态可分辨增强）；A 档 6 件急修已摘（会话卡死冻全家/测试覆写真实 token/管道 EPIPE 杀 worker/内核 -P 安全路径/update 保护闸/卡死内核 POSIX 半件）；README 门脸改成源码构建优先（防访客误装官方版）；FORK_NOTES 加一览区 |
 | 2026-09-11 | 多代理稳定性大修：54+ 笔提交修掉五段死亡链（长任务 15 分钟被误杀/误杀被瞒报/子代理回话焊死/内核死即残废/僵尸记账），四家模型终审全过 |
