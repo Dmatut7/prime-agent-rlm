@@ -12,9 +12,6 @@ export const DEFAULT_IDLE_EVICTION_MINUTES = 90;
 /** Abort a provider stream after this long without any events (0 = disabled). */
 export const DEFAULT_STREAM_STALL_TIMEOUT_MS = 300_000;
 
-/** Default timeout (seconds) for bash tool calls when the model passes none. */
-export const DEFAULT_BASH_TIMEOUT_SECONDS = 600;
-
 /** Session stall watchdog: warn after this long without any session activity. */
 export const DEFAULT_STALL_WARN_AFTER_SECONDS = 300;
 
@@ -263,12 +260,8 @@ export interface BundledSkillsSettings {
 }
 
 export interface ToolsSettings {
-	/**
-	 * Default timeout (seconds) applied to bash tool calls when the model does
-	 * not pass an explicit `timeout`. Default: 600. Set to 0 to make "no timeout"
-	 * the default (not recommended: a hung command can wedge the turn forever).
-	 */
-	bashTimeoutSeconds?: number;
+	// Reserved for future tool-level settings. The classic bash tool is not part of
+	// the RLM model surface, so there is currently nothing configurable here.
 }
 
 export interface WarningSettings {
@@ -1266,14 +1259,6 @@ export class SettingsManager {
 		this.globalSettings.hideThinkingBlock = hide;
 		this.markModified("hideThinkingBlock");
 		this.save();
-	}
-
-	getBashTimeoutSeconds(): number {
-		const value = this.settings.tools?.bashTimeoutSeconds;
-		if (typeof value === "number" && Number.isFinite(value)) {
-			return Math.max(0, value);
-		}
-		return DEFAULT_BASH_TIMEOUT_SECONDS;
 	}
 
 	getShellPath(): string | undefined {

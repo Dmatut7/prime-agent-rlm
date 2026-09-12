@@ -349,19 +349,14 @@ Whether an agent message queued into a session whose input pump is suspended
 
 ### Tools
 
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `tools.bashTimeoutSeconds` | number | `600` | Default timeout (seconds) for bash tool calls when the model passes no `timeout`. The model can override per call, and `timeout: 0` disables the timeout for that call. Set to `0` to make "no timeout" the default (not recommended: a hung command can wedge the turn until the stall watchdog aborts it) |
+The classic bash tool is not part of the RLM model surface (the model only gets `ipython`),
+so there is no settings-level bash timeout. SDK consumers can pass `defaultTimeoutSeconds`
+to `createBashToolDefinition` per call site; the model can always override per call with
+`timeout`, and `timeout: 0` disables the timeout for that call.
 
 When a command hits the timeout, its process group is killed and the model
 receives an error explaining that the command was killed and how to re-run it
 with a larger `timeout` (or `timeout: 0` for no limit).
-
-```json
-{
-  "tools": { "bashTimeoutSeconds": 600 }
-}
-```
 
 ### Shell
 

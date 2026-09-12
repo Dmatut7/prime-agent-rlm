@@ -23,8 +23,9 @@ import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult
 
 /**
  * Default timeout (seconds) applied to bash tool calls when the model does not
- * pass an explicit `timeout`. Keep in sync with DEFAULT_BASH_TIMEOUT_SECONDS in
- * settings-manager.ts (the settings-level default for tools.bashTimeoutSeconds).
+ * pass an explicit `timeout`. The classic bash tool is only used by SDK consumers
+ * on the RLM line, so there is no settings-level override; override per call site
+ * via `defaultTimeoutSeconds`.
  */
 export const DEFAULT_BASH_TIMEOUT_SECONDS = 600;
 
