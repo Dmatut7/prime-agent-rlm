@@ -901,6 +901,11 @@ export class ExtensionRunner {
 	}
 
 	async emitContext(messages: AgentMessage[]): Promise<AgentMessage[]> {
+		// Without context handlers nothing consumes the clone: return the live
+		// array instead of deep-cloning the full history on every LLM request.
+		if (!this.hasHandlers("context")) {
+			return messages;
+		}
 		const ctx = this.createContext();
 		let currentMessages = structuredClone(messages);
 

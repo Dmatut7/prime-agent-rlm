@@ -936,8 +936,17 @@ export class TUI extends Container {
 			return;
 		}
 
+		// Filter Kitty key-release events before the global debug and fullscreen
+		// viewport paths: keybindings match press and release sequences alike, so
+		// without this a release re-triggers them (e.g. PageUp scrolls two pages).
+		// Components that opted in via wantsKeyRelease still receive releases below.
+		const keyRelease = isKeyRelease(data);
+		if (keyRelease && !this.focusedComponent?.wantsKeyRelease) {
+			return;
+		}
+
 		// Global debug key handler
-		if (getKeybindings().matches(data, "tui.debug.dump") && this.onDebug) {
+		if (!keyRelease && getKeybindings().matches(data, "tui.debug.dump") && this.onDebug) {
 			this.onDebug();
 			return;
 		}
@@ -1055,6 +1064,11 @@ export class TUI extends Container {
 		this.stopSelectionAutoScroll();
 
 		if (overlayFocused || !fullscreen.viewportControls) return false;
+
+		// Viewport controls fire on press/repeat only. Releases only reach here
+		// when the focused component opted into wantsKeyRelease; scrolling on
+		// them would double every viewport key for those components.
+		if (isKeyRelease(data)) return false;
 
 		const keybindings = getKeybindings();
 		if (keybindings.matches(data, "tui.viewport.pageUp")) {
@@ -1394,14 +1408,31 @@ export class TUI extends Container {
 	}
 
 	private static readonly SEGMENT_RESET = "\x1b[0m\x1b]8;;\x07";
+	// Memoizes normalizeTerminalOutput(line) + SEGMENT_RESET keyed by raw line.
+	// Without it every frame re-runs regexes and re-allocates strings for the
+	// whole transcript, and the differential compare then compares by content
+	// instead of by identity. Components hand back identical raw line strings
+	// while unchanged, so cache hits also make the differ's !== a pointer check.
+	private static readonly LINE_RESET_CACHE_LIMIT = 20_000;
+	private readonly lineResetCache = new Map<string, string>();
 
 	private applyLineResets(lines: string[]): string[] {
 		const reset = TUI.SEGMENT_RESET;
+		const cache = this.lineResetCache;
 		for (let i = 0; i < lines.length; i++) {
 			const line = lines[i];
-			if (!isImageLine(line)) {
-				lines[i] = normalizeTerminalOutput(line) + reset;
+			if (isImageLine(line)) continue;
+			const cached = cache.get(line);
+			if (cached !== undefined) {
+				lines[i] = cached;
+				continue;
 			}
+			const normalized = normalizeTerminalOutput(line) + reset;
+			if (cache.size >= TUI.LINE_RESET_CACHE_LIMIT) {
+				cache.clear();
+			}
+			cache.set(line, normalized);
+			lines[i] = normalized;
 		}
 		return lines;
 	}

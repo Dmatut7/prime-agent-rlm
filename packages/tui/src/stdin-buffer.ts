@@ -173,41 +173,47 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 	let pos = 0;
 
 	while (pos < buffer.length) {
-		const remaining = buffer.slice(pos);
-
-		if (remaining.startsWith(ESC)) {
+		if (buffer[pos] === ESC) {
 			// Two ESC bytes in a row are two Escape keys, not ctrl+alt+[.
 			// Consume only the first byte so the next loop can parse ESC[A as CSI.
 			// A lone second ESC stays incomplete and flushes as Escape after timeout.
-			if (remaining.length >= 2 && remaining[1] === ESC) {
+			if (buffer[pos + 1] === ESC) {
 				sequences.push(ESC);
 				pos += 1;
 				continue;
 			}
-			let seqEnd = 1;
-			while (seqEnd <= remaining.length) {
-				const candidate = remaining.slice(0, seqEnd);
+			let seqEnd = pos + 1;
+			let emitted = false;
+			while (seqEnd <= buffer.length) {
+				const candidate = buffer.slice(pos, seqEnd);
 				const status = isCompleteSequence(candidate);
 
-				if (status === "complete") {
-					sequences.push(candidate);
-					pos += seqEnd;
-					break;
-				} else if (status === "incomplete") {
+				if (status === "incomplete") {
 					seqEnd++;
-				} else {
-					sequences.push(candidate);
-					pos += seqEnd;
-					break;
+					continue;
 				}
+				sequences.push(candidate);
+				pos = seqEnd;
+				emitted = true;
+				break;
 			}
 
-			if (seqEnd > remaining.length) {
-				return { sequences, remainder: remaining };
+			if (!emitted) {
+				return { sequences, remainder: buffer.slice(pos) };
 			}
 		} else {
-			sequences.push(remaining[0]!);
-			pos++;
+			// Batch printable runs: locate the next ESC in one pass and slice the
+			// run once. Slicing the remainder per character made bulk input
+			// (e.g. large non-bracketed pastes) quadratic.
+			let runEnd = buffer.indexOf(ESC, pos + 1);
+			if (runEnd === -1) {
+				runEnd = buffer.length;
+			}
+			const run = buffer.slice(pos, runEnd);
+			for (let i = 0; i < run.length; i++) {
+				sequences.push(run[i]!);
+			}
+			pos = runEnd;
 		}
 	}
 
@@ -241,6 +247,13 @@ function isImmediatePasteEscapeAbort(data: string): boolean {
 	return data === "\x1b[27u" || (data.startsWith("\x1b[27;") && data.endsWith("u"));
 }
 
+/**
+ * Proper prefixes of the markers scanned inside a paste (`\x1b[201~`,
+ * `\x1b[27u`, `\x1b[27;<digits>u`). A window tail matching this can still
+ * grow into a marker in a later chunk, so it must be rescanned on append.
+ */
+const PARTIAL_PASTE_MARKER_REGEX = /^\x1b(\[(2(01?|7(;[\d:]*)?)?)?)?$/;
+
 function findCompleteKittyEscape(buffer: string): { index: number; length: number } | null {
 	const simple = "\x1b[27u";
 	const simpleAt = buffer.indexOf(simple);
@@ -266,7 +279,15 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	private readonly pasteTimeoutMs: number;
 	private readonly pasteMaxBytes: number;
 	private pasteMode: boolean = false;
-	private pasteBuffer: string = "";
+	// Paste content is kept as chunks and joined once on completion. Each
+	// append only scans the new chunk plus `pastePending` (a trailing partial
+	// marker carried across the chunk boundary). Accumulating into one string
+	// and rescanning it per chunk was quadratic: every `+=` plus indexOf/regex
+	// re-flattened and re-walked the whole paste.
+	private pasteChunks: string[] = [];
+	private pasteLength: number = 0;
+	private pasteBufferBytes: number = 0;
+	private pastePending: string = "";
 	private pendingKittyPrintableCodepoint: number | undefined;
 
 	constructor(options: StdinBufferOptions = {}) {
@@ -321,9 +342,9 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.buffer += str;
 
 		if (this.pasteMode) {
-			this.pasteBuffer += this.buffer;
+			const chunk = this.buffer;
 			this.buffer = "";
-			this.handlePasteBuffer();
+			this.appendPasteChunk(chunk);
 			return;
 		}
 
@@ -340,10 +361,10 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			this.pendingKittyPrintableCodepoint = undefined;
 			this.buffer = this.buffer.slice(startIndex + BRACKETED_PASTE_START.length);
 			this.pasteMode = true;
-			this.pasteBuffer = this.buffer;
+			this.resetPasteState();
+			const initialContent = this.buffer;
 			this.buffer = "";
-			this.armPasteWatchdog();
-			this.handlePasteBuffer();
+			this.appendPasteChunk(initialContent);
 			return;
 		}
 
@@ -365,48 +386,92 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		}
 	}
 
-	private handlePasteBuffer(): void {
-		if (this.finishPasteIfComplete()) {
+	private appendPasteChunk(chunk: string): void {
+		if (chunk.length > 0) {
+			this.pasteChunks.push(chunk);
+			this.pasteLength += chunk.length;
+			this.pasteBufferBytes += Buffer.byteLength(chunk, "utf8");
+		}
+
+		// Markers can straddle chunk boundaries; `pastePending` is the trailing
+		// partial-marker prefix carried over from the previous append, so the
+		// scan window covers every position a marker could complete at.
+		const window = this.pastePending.length === 0 ? chunk : this.pastePending + chunk;
+		const windowStart = this.pasteLength - window.length;
+
+		const endIndex = window.indexOf(BRACKETED_PASTE_END);
+		if (endIndex !== -1) {
+			const absoluteEnd = windowStart + endIndex;
+			const content = this.joinPasteChunks();
+			this.emitPasteAndContinue(
+				content.slice(0, absoluteEnd),
+				content.slice(absoluteEnd + BRACKETED_PASTE_END.length),
+			);
 			return;
 		}
-		if (Buffer.byteLength(this.pasteBuffer, "utf8") > this.pasteMaxBytes) {
+
+		if (this.pasteBufferBytes > this.pasteMaxBytes) {
 			this.finishPasteWithoutTerminator();
 			return;
 		}
-		const kittyEsc = findCompleteKittyEscape(this.pasteBuffer);
+
+		const kittyEsc = findCompleteKittyEscape(window);
 		if (kittyEsc) {
-			const remaining = this.pasteBuffer.slice(kittyEsc.index + kittyEsc.length);
+			const remaining = this.joinPasteChunks().slice(windowStart + kittyEsc.index + kittyEsc.length);
 			this.discardPasteMode();
 			if (remaining.length > 0) {
 				this.process(remaining);
 			}
 			return;
 		}
+
+		this.pastePending = this.trailingPartialPasteMarker(window);
 		// Idle timeout: each chunk proves the paste is still flowing.
 		this.armPasteWatchdog();
 	}
 
-	private finishPasteIfComplete(): boolean {
-		const endIndex = this.pasteBuffer.indexOf(BRACKETED_PASTE_END);
-		if (endIndex === -1) {
-			return false;
+	private trailingPartialPasteMarker(window: string): string {
+		// Every scanned marker starts with ESC, so only the tail starting at the
+		// last ESC can still grow into one. Longer tails can only be a partial
+		// Kitty Esc (`\x1b[27;` + digits/colons); checking that run by char code
+		// avoids allocating a multi-megabyte tail slice.
+		const esc = window.lastIndexOf(ESC);
+		if (esc === -1) {
+			return "";
 		}
+		const tail = window.slice(esc);
+		if (tail.length > 8) {
+			if (!tail.startsWith("\x1b[27;")) {
+				return "";
+			}
+			for (let i = 5; i < tail.length; i++) {
+				const code = tail.charCodeAt(i);
+				if (!((code >= 48 && code <= 57) || code === 58)) return "";
+			}
+			return tail;
+		}
+		return PARTIAL_PASTE_MARKER_REGEX.test(tail) ? tail : "";
+	}
 
-		this.emitPasteAndContinue(
-			this.pasteBuffer.slice(0, endIndex),
-			this.pasteBuffer.slice(endIndex + BRACKETED_PASTE_END.length),
-		);
-		return true;
+	private joinPasteChunks(): string {
+		return this.pasteChunks.length === 1 ? this.pasteChunks[0]! : this.pasteChunks.join("");
+	}
+
+	private resetPasteState(): void {
+		this.pasteChunks = [];
+		this.pasteLength = 0;
+		this.pasteBufferBytes = 0;
+		this.pastePending = "";
 	}
 
 	private finishPasteWithoutTerminator(): void {
-		this.emitPasteAndContinue(this.pasteBuffer, "");
+		this.emitPasteAndContinue(this.joinPasteChunks(), "");
 	}
 
 	private emitPasteAndContinue(pastedContent: string, remaining: string): void {
 		this.clearPasteTimers();
 		this.pasteMode = false;
-		this.pasteBuffer = "";
+		this.resetPasteState();
 		this.pendingKittyPrintableCodepoint = undefined;
 		this.emit("paste", pastedContent);
 		if (remaining.length > 0) {
@@ -417,7 +482,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	private discardPasteMode(): void {
 		this.clearPasteTimers();
 		this.pasteMode = false;
-		this.pasteBuffer = "";
+		this.resetPasteState();
 		this.pendingKittyPrintableCodepoint = undefined;
 	}
 
@@ -477,7 +542,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.clearPasteTimers();
 		this.buffer = "";
 		this.pasteMode = false;
-		this.pasteBuffer = "";
+		this.resetPasteState();
 		this.pendingKittyPrintableCodepoint = undefined;
 	}
 

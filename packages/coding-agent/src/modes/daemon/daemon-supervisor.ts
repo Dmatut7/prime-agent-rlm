@@ -144,6 +144,7 @@ import {
 import {
 	DAEMON_ADOPTION_REQUEST_TIMEOUT_MS,
 	WORKER_REQUEST_TIMEOUT_TIERS,
+	type WorkerRequestTimeoutTier,
 	workerRequestTimeoutMs,
 	workerRequestTimeoutTier,
 } from "./daemon-timeouts.js";
@@ -484,6 +485,18 @@ const EXPECTED_WORKER_AVAILABILITY_ERRORS: readonly RegExp[] = [
 export function isExpectedWorkerAvailabilityError(error: unknown): boolean {
 	const message = error instanceof Error ? error.message : String(error);
 	return EXPECTED_WORKER_AVAILABILITY_ERRORS.some((pattern) => pattern.test(message));
+}
+
+/**
+ * The timeout tier for one agent-message dispatch, keyed on the dispatches
+ * actually written to a worker — never on pre-dispatch bounces. The first
+ * dispatch keeps the long budget (C20: the sender is waiting on it and a slow
+ * target hydration is legitimate work — and recovering-from-a-bounce is exactly
+ * when that hydration happens); only a *retried* dispatch runs on the deliver
+ * tier (daemon-timeouts.ts T4-3).
+ */
+export function deliveryDispatchTimeoutTier(dispatches: number): WorkerRequestTimeoutTier {
+	return dispatches === 0 ? "long" : "deliver";
 }
 
 export function isTransientCatchupFailure(error: unknown): boolean {
@@ -6125,15 +6138,17 @@ export class DaemonSupervisor {
 	 * P1-7c: one agent-message delivery, tracked from admission to a terminal
 	 * outcome.
 	 *
-	 * The first attempt keeps the long budget, because the sender is waiting on it
-	 * and hydrating a large transcript is legitimate work (C20 kept the 24h
-	 * delivery semantics on purpose). What changed is the bookkeeping: the
+	 * The first dispatch keeps the long budget, because the sender is waiting on
+	 * it and hydrating a large transcript is legitimate work (C20 kept the 24h
+	 * delivery semantics on purpose); pre-dispatch bounces do not consume that
+	 * tier (B5). What changed is the bookkeeping: the
 	 * delivery is an entry in the pending-delivery queue instead of an anonymous
 	 * mutation holding the update-restart drain latch, so a target that is not
-	 * reachable yet requeues and retries on the deliver tier, a target with a full
-	 * pending set is rejected with an actionable hint instead of being silently
-	 * piled onto, and a restart drains every entry with an explicit receipt to the
-	 * sender that is still waiting (B10/F10: nothing evaporates).
+	 * reachable yet requeues and retries until the delivery budget runs out, a
+	 * target with a full pending set is rejected with an actionable hint instead
+	 * of being silently piled onto, and a restart drains every entry with an
+	 * explicit receipt to the sender that is still waiting (B10/F10: nothing
+	 * evaporates).
 	 *
 	 * A retry only ever follows a failure that `requireAvailableWorkerClient`
 	 * threw before anything was written to a worker, so this loop cannot deliver
@@ -6185,13 +6200,16 @@ export class DaemonSupervisor {
 		}
 		const entry = admitted.entry;
 		/**
-		 * True once a delivery request has been written to a worker. From that
-		 * moment non-delivery is not provable: the target may have accepted the
-		 * message and only the answer was lost. Every receipt and log line below
-		 * has to keep those two states apart, or the sender re-sends a message
-		 * that already landed.
+		 * Delivery requests actually written to a worker. From the first one,
+		 * non-delivery is not provable: the target may have accepted the message
+		 * and only the answer was lost. Every receipt and log line below has to
+		 * keep those two states apart, or the sender re-sends a message that
+		 * already landed. This count — not `entry.attempts`, which also ticks on
+		 * every pre-dispatch bounce — picks the dispatch timeout tier, so an
+		 * unreachable target that bounces for an hour still gets the long budget
+		 * on the first request that actually reaches a worker (B5).
 		 */
-		let dispatched = false;
+		let dispatches = 0;
 		try {
 			for (;;) {
 				const remainingMs = entry.deadlineAt - Date.now();
@@ -6201,9 +6219,6 @@ export class DaemonSupervisor {
 					);
 				}
 				entry.attempts++;
-				const tierMs =
-					entry.attempts === 1 ? WORKER_REQUEST_TIMEOUT_TIERS.long : WORKER_REQUEST_TIMEOUT_TIERS.deliver;
-				const timeoutMs = Math.max(1, Math.min(tierMs, remainingMs));
 				let workerClient: DaemonWorkerClient;
 				try {
 					workerClient = this.requireAvailableWorkerClient(
@@ -6232,7 +6247,9 @@ export class DaemonSupervisor {
 					);
 					continue;
 				}
-				dispatched = true;
+				const tierMs = WORKER_REQUEST_TIMEOUT_TIERS[deliveryDispatchTimeoutTier(dispatches)];
+				const timeoutMs = Math.max(1, Math.min(tierMs, remainingMs));
+				dispatches++;
 				const response = await this.raceDeliveryAbort(entry, workerClient.requestWorker(payload, timeoutMs));
 				queue.complete(entry);
 				return { ...response, id: command.id, command: command.type };
@@ -6241,12 +6258,12 @@ export class DaemonSupervisor {
 			queue.drop(entry);
 			if (error instanceof PendingDeliveryAbortedError) {
 				const reason = error.reason.replaceAll("_", " ");
-				const state = dispatched ? "uncertain" : "undelivered";
+				const state = dispatches > 0 ? "uncertain" : "undelivered";
 				this.log(
 					`deliver message dropped for ${targetActiveSessionId} (delivery ${entry.deliveryId}, attempts ${entry.attempts}, state ${state}): ${error.message}`,
 				);
 				throw new Error(
-					dispatched
+					dispatches > 0
 						? `Agent message to ${targetActiveSessionId} may already have been delivered: the daemon stopped waiting for the target's answer (${reason}). Do not re-send it blindly; ask the target session whether it arrived, or re-send only if a duplicate would be harmless.`
 						: `Agent message to ${targetActiveSessionId} was not delivered: the daemon stopped the pending delivery before it reached the target (${reason}). Send it again once the daemon is back.`,
 				);
@@ -6264,20 +6281,35 @@ export class DaemonSupervisor {
 
 	/** Races the work against the queue's drain abort, so a restart answers every waiting sender. */
 	private async raceDeliveryAbort<T>(entry: PendingDeliveryEntry, work: Promise<T>): Promise<T> {
-		const abort = entry.aborted.then((reason): T => {
-			throw new PendingDeliveryAbortedError(entry.deliveryId, reason);
+		// Subscribe/unsubscribe, not `entry.aborted.then(...)`: this runs once per
+		// bounce iteration and the abort promise stays pending for the whole
+		// delivery budget, so chained reactions would accumulate without bound
+		// while a target is down.
+		return await new Promise<T>((resolve, reject) => {
+			let settled = false;
+			const unsubscribe = entry.onAbort((reason) => {
+				if (settled) return;
+				settled = true;
+				reject(new PendingDeliveryAbortedError(entry.deliveryId, reason));
+			});
+			// Both outcomes are handled here, so the loser of the race has no reader
+			// left and an abandoned worker request cannot become an unhandled
+			// rejection.
+			void work.then(
+				(value) => {
+					if (settled) return;
+					settled = true;
+					unsubscribe();
+					resolve(value);
+				},
+				(error: unknown) => {
+					if (settled) return;
+					settled = true;
+					unsubscribe();
+					reject(error);
+				},
+			);
 		});
-		// The loser of the race has no reader left; swallow it here so an abandoned
-		// worker request cannot become an unhandled rejection.
-		void work.then(
-			() => undefined,
-			() => undefined,
-		);
-		void abort.then(
-			() => undefined,
-			() => undefined,
-		);
-		return await Promise.race([work, abort]);
 	}
 
 	/**

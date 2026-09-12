@@ -1,4 +1,5 @@
 import assert from "node:assert";
+import { performance } from "node:perf_hooks";
 import { beforeEach, describe, it } from "node:test";
 import { StdinBuffer } from "../src/stdin-buffer.js";
 
@@ -37,6 +38,14 @@ describe("StdinBuffer", () => {
 		it("should handle unicode characters", () => {
 			processInput("hello 世界");
 			assert.deepStrictEqual(emittedSequences, ["h", "e", "l", "l", "o", " ", "世", "界"]);
+		});
+
+		it("splits a large printable burst without quadratic slowdown", () => {
+			const text = "a".repeat(100_000);
+			const start = performance.now();
+			processInput(text);
+			assert.ok(performance.now() - start < 2_000, "bulk printable input must stay linear");
+			assert.strictEqual(emittedSequences.length, 100_000);
 		});
 	});
 
@@ -584,6 +593,45 @@ describe("StdinBuffer", () => {
 
 			processInput("[31mred\x1b[201~");
 			assert.deepStrictEqual(emittedPaste, ["hello\x1b[31mred"]);
+			assert.deepStrictEqual(emittedSequences, []);
+		});
+
+		it("detects the paste end marker split at every chunk boundary", () => {
+			const input = "\x1b[200~hi\x1b[31mthere\x1b[201~tail";
+			for (let split = 1; split < input.length; split++) {
+				buffer.clear();
+				emittedSequences.length = 0;
+				emittedPaste.length = 0;
+				processInput(input.slice(0, split));
+				processInput(input.slice(split));
+				assert.deepStrictEqual(emittedPaste, ["hi\x1b[31mthere"], `split at ${split}`);
+				assert.deepStrictEqual(emittedSequences, [..."tail"], `split at ${split}`);
+			}
+		});
+
+		it("detects a Kitty Esc abort split at every chunk boundary", () => {
+			const input = "\x1b[200~hello\x1b[27;1ux";
+			for (let split = 1; split < input.length; split++) {
+				buffer.clear();
+				emittedSequences.length = 0;
+				emittedPaste.length = 0;
+				processInput(input.slice(0, split));
+				processInput(input.slice(split));
+				assert.deepStrictEqual(emittedPaste, [], `split at ${split}`);
+				assert.deepStrictEqual(emittedSequences, ["x"], `split at ${split}`);
+			}
+		});
+
+		it("reassembles a large paste delivered in many small chunks", () => {
+			const content = `${"x".repeat(2_000_000)}\x1b[31m${"y".repeat(2_000_000)}\nline2`;
+			const start = performance.now();
+			processInput("\x1b[200~");
+			for (let i = 0; i < content.length; i += 256) {
+				processInput(content.slice(i, i + 256));
+			}
+			processInput("\x1b[201~");
+			assert.ok(performance.now() - start < 2_000, "chunked paste scanning must stay linear");
+			assert.deepStrictEqual(emittedPaste, [content]);
 			assert.deepStrictEqual(emittedSequences, []);
 		});
 	});

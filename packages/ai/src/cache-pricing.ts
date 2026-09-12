@@ -14,7 +14,11 @@ const ANTHROPIC_ONE_HOUR_CACHE_WRITE_COST_MULTIPLIER = 2;
 export function hasStandardAnthropicCachePricing<TApi extends Api>(model: Model<TApi>): boolean {
 	const modelId = model.id.toLowerCase();
 	const isAnthropicModel =
-		model.provider === "anthropic" || modelId.startsWith("anthropic/") || modelId.startsWith("claude-");
+		model.provider === "anthropic" ||
+		modelId.startsWith("anthropic/") ||
+		modelId.startsWith("claude-") ||
+		// Bedrock base models and system-defined inference profiles: "(us|eu|global|...).anthropic.claude-*".
+		modelId.includes("anthropic.claude");
 	if (!isAnthropicModel) {
 		return false;
 	}

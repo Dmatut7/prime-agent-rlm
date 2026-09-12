@@ -211,6 +211,11 @@ export class SemanticEdgeRecorder {
 		);
 	}
 
+	/** False once the ledger has failed; callers skip per-request work (e.g. body hashing) when set. */
+	get enabled(): boolean {
+		return !this._disabled;
+	}
+
 	get lastTurnRequestId(): string | undefined {
 		return this._lastTurn?.requestId;
 	}
@@ -586,7 +591,8 @@ export function unwrapSemanticEdgeStreamFn(streamFn: StreamFn): StreamFn {
 export function wrapStreamFnWithSemanticEdges(streamFn: StreamFn, recorder: SemanticEdgeRecorder): StreamFn {
 	const inner = unwrapSemanticEdgeStreamFn(streamFn);
 	const wrapped: StreamFn = (model, context, options) => {
-		const requestId = recorder.startTurnRequest(hashTurnBody(model, context, options));
+		// A disabled recorder never returns a request ID; skip the whole-conversation stringify+hash in that case.
+		const requestId = recorder.enabled ? recorder.startTurnRequest(hashTurnBody(model, context, options)) : undefined;
 		if (requestId === undefined) {
 			return inner(model, context, options);
 		}

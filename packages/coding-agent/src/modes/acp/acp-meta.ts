@@ -75,6 +75,19 @@ export interface PrimeAgentSessionPersistMeta {
 	error: string;
 }
 
+/**
+ * An extension handler failure. ACP has no native channel for agent-side
+ * extension diagnostics, so the failure is reported as namespaced metadata
+ * instead of being dropped.
+ */
+export interface PrimeAgentExtensionErrorMeta {
+	/** Path of the extension whose handler failed. */
+	extensionPath: string;
+	/** Extension event being dispatched when the handler failed. */
+	event: string;
+	error: string;
+}
+
 export interface PrimeAgentStallWatchdogMeta {
 	/** `unsettled`: the auto-abort fired but the run never produced agent_end. */
 	status: "warning" | "aborted" | "unsettled";
@@ -138,6 +151,8 @@ export interface PrimeAgentSessionMeta {
 	goal?: PrimeAgentGoalMeta;
 	refinement?: PrimeAgentRefinementMeta;
 	sessionPersistence?: PrimeAgentSessionPersistMeta;
+	/** Present when an extension handler failed during the session. */
+	extensionError?: PrimeAgentExtensionErrorMeta;
 	stallWatchdog?: PrimeAgentStallWatchdogMeta;
 	/** Undeliverable subagent terminal notices: how many were persisted vs abandoned. */
 	rlmTerminalNotices?: { abandoned: number; persistedToTranscript: number; deferredMs: number };

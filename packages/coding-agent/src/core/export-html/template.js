@@ -538,10 +538,18 @@
         }
       }
 
+      /**
+       * Escape HTML special characters including quotes (mirrors ansi-to-html.ts).
+       * Results land in attributes (id, data-entry-id, src), where the DOM
+       * textContent trick would leave " and ' raw and allow attribute breakout.
+       */
       function escapeHtml(text) {
-        const div = document.createElement('div');
-        div.textContent = text;
-        return div.innerHTML;
+        return (text === null ? '' : String(text))
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#039;');
       }
 
       /**

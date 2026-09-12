@@ -114,6 +114,19 @@ export const SESSION_SCHEDULED_JOBS_FILENAME = "scheduled-jobs.json";
 const MAX_TIMEOUT_MS = 2_147_483_647;
 const ONE_SECOND_MS = 1000;
 const ONE_MINUTE_MS = 60_000;
+/**
+ * Cancelled and completed jobs never run again, but every read re-parses them and
+ * every write re-serializes them. Keep the newest few per store file as history.
+ */
+export const MAX_RETAINED_TERMINAL_JOBS = 100;
+/**
+ * Lock acquisition is synchronous, so this budget is also how long one mutation can
+ * stall the event loop while another process holds the lock. The delay ramps up to
+ * the cap so brief contention costs a millisecond, and a live critical section is a
+ * single read plus a single atomic write, far below the total budget.
+ */
+const LOCK_RETRY_ATTEMPTS = 25;
+const LOCK_RETRY_MAX_DELAY_MS = 10;
 export const DEFAULT_HEARTBEAT_SCHEDULE = "every 5m";
 export const DEFAULT_HEARTBEAT_DELIVERY_MODE: AgentHeartbeatDeliveryMode = "steer";
 
@@ -168,6 +181,8 @@ function heartbeatCatalogSignature(jobs: readonly AgentCronJob[]): string {
 
 export class AgentCronJobStore {
 	private readonly sessionArtifactFiles = new Map<string, string>();
+	/** Registered sessions whose jobs file this store has seen on disk; only those can vanish. */
+	private readonly observedSessionArtifactFiles = new Set<string>();
 	private readonly heartbeatChangeListeners = new Set<() => void>();
 
 	constructor(
@@ -791,89 +806,163 @@ export class AgentCronJobStore {
 		return this.readStates().flatMap((state) => state.jobs);
 	}
 
+	/**
+	 * Reads every registered store and drops the registrations whose session is gone.
+	 * A session's artifact directory is removed together with the session, so an entry
+	 * whose directory disappeared can never hold jobs again: keeping it would grow the
+	 * registry for the lifetime of the process and make every later read and mutation
+	 * scan another dead path. Only a jobs file this store has already seen counts, so a
+	 * session that never scheduled anything keeps its registration (its directory may
+	 * still be created) and costs no extra stat here.
+	 */
 	private readStates(): CronJobsState[] {
-		if (this.sessionArtifactMode) {
-			return [...this.sessionArtifactFiles.values()].map((path) => readJobsState(path));
+		if (!this.sessionArtifactMode) {
+			return [readJobsState(this.requireFilePath())];
 		}
-		return [readJobsState(this.requireFilePath())];
+		const states: CronJobsState[] = [];
+		for (const [sessionId, path] of this.sessionArtifactFiles) {
+			const state = readJobsStateIfPresent(path);
+			if (state) {
+				this.observedSessionArtifactFiles.add(sessionId);
+				states.push(state);
+				continue;
+			}
+			if (!this.observedSessionArtifactFiles.has(sessionId) || existsSync(dirname(path))) {
+				states.push({ jobs: [], dispatches: [] });
+				continue;
+			}
+			this.observedSessionArtifactFiles.delete(sessionId);
+			this.sessionArtifactFiles.delete(sessionId);
+		}
+		return states;
 	}
 
 	private mutateStates(mutator: (state: CronJobsState) => AgentCronDispatch[]): AgentCronDispatch[] {
-		const paths = this.sessionArtifactMode ? [...this.sessionArtifactFiles.values()] : [this.requireFilePath()];
-		const previousHeartbeats = heartbeatCatalogSignature(this.readJobs());
-		let changed = false;
+		// A store file that does not exist holds neither jobs nor dispatches, so there is
+		// nothing to mutate in it: skipping such a path keeps one mutation from locking,
+		// reading and recreating the directory of every session ever registered here.
+		const paths = (
+			this.sessionArtifactMode ? [...this.sessionArtifactFiles.values()] : [this.requireFilePath()]
+		).filter((path) => existsSync(path));
+		let previousHeartbeats = "";
+		let nextHeartbeats = "";
 		const dispatches = withCronJobsStateLocks(paths, () => {
-			const dispatches: AgentCronDispatch[] = [];
+			const claimed: AgentCronDispatch[] = [];
+			const beforeJobs: AgentCronJob[] = [];
+			const afterJobs: AgentCronJob[] = [];
 			for (const path of paths) {
 				const state = readJobsState(path);
 				const before = JSON.stringify(state);
-				dispatches.push(...mutator(state));
+				beforeJobs.push(...state.jobs);
+				claimed.push(...mutator(state));
+				state.jobs = pruneTerminalJobs(state.jobs, state.dispatches);
 				if (JSON.stringify(state) !== before) {
 					writeJobsState(path, state);
-					changed = true;
 				}
+				afterJobs.push(...state.jobs);
 			}
-			return dispatches;
+			// Both signatures come from the states already read under the lock; separate
+			// passes over the files would multiply the read cost of every mutation.
+			previousHeartbeats = heartbeatCatalogSignature(beforeJobs);
+			nextHeartbeats = heartbeatCatalogSignature(afterJobs);
+			return claimed;
 		});
-		if (changed && heartbeatCatalogSignature(this.readJobs()) !== previousHeartbeats) {
+		if (previousHeartbeats !== nextHeartbeats) {
 			this.notifyHeartbeatChange();
 		}
 		return dispatches;
 	}
 
 	private writeJobs(jobs: readonly AgentCronJob[]): void {
-		const previousHeartbeats = heartbeatCatalogSignature(this.readJobs());
 		if (this.sessionArtifactMode) {
 			const registeredSessionIds = new Set(this.sessionArtifactFiles.keys());
 			const unregistered = jobs.find((job) => !registeredSessionIds.has(job.sessionId));
 			if (unregistered) {
 				throw new Error(`Cron job ${unregistered.id} targets an unregistered session artifact`);
 			}
-			const paths = [...this.sessionArtifactFiles.values()];
-			withCronJobsStateLocks(paths, () => {
-				const currentBySessionId = new Map(
-					[...this.sessionArtifactFiles].map(([sessionId, path]) => [sessionId, readJobsState(path)]),
-				);
-				const incomingById = new Map(jobs.map((job) => [job.id, job]));
-				const mergedJobsBySessionId = new Map<string, AgentCronJob[]>();
-				for (const [sessionId, current] of currentBySessionId) {
-					const retained = current.jobs.filter((job) => {
-						const incoming = incomingById.get(job.id);
-						return incoming === undefined || incoming.sessionId === sessionId;
-					});
-					mergedJobsBySessionId.set(
-						sessionId,
-						mergeFreshJobs(
-							retained,
-							jobs.filter((job) => job.sessionId === sessionId),
+			// A session with neither incoming jobs nor a store file has nothing to merge
+			// into, so its path is left out of the lock set instead of being locked,
+			// read and written back unchanged on every mutation.
+			const sessionIdsWithJobs = new Set(jobs.map((job) => job.sessionId));
+			const targets = [...this.sessionArtifactFiles].filter(
+				([sessionId, path]) => sessionIdsWithJobs.has(sessionId) || existsSync(path),
+			);
+			let previousHeartbeats = "";
+			let nextHeartbeats = "";
+			withCronJobsStateLocks(
+				targets.map(([, path]) => path),
+				() => {
+					const currentBySessionId = new Map<string, CronJobsState>();
+					for (const [sessionId, path] of targets) {
+						const current = readJobsStateIfPresent(path);
+						if (current) {
+							this.observedSessionArtifactFiles.add(sessionId);
+						}
+						currentBySessionId.set(sessionId, current ?? { jobs: [], dispatches: [] });
+					}
+					const incomingById = new Map(jobs.map((job) => [job.id, job]));
+					const mergedJobsBySessionId = new Map<string, AgentCronJob[]>();
+					for (const [sessionId, current] of currentBySessionId) {
+						const retained = current.jobs.filter((job) => {
+							const incoming = incomingById.get(job.id);
+							return incoming === undefined || incoming.sessionId === sessionId;
+						});
+						mergedJobsBySessionId.set(
+							sessionId,
+							mergeFreshJobs(
+								retained,
+								jobs.filter((job) => job.sessionId === sessionId),
+							),
+						);
+					}
+					const sessionIdByJobId = new Map(
+						[...mergedJobsBySessionId].flatMap(([sessionId, sessionJobs]) =>
+							sessionJobs.map((job) => [job.id, sessionId] as const),
 						),
 					);
-				}
-				const sessionIdByJobId = new Map(
-					[...mergedJobsBySessionId].flatMap(([sessionId, sessionJobs]) =>
-						sessionJobs.map((job) => [job.id, sessionId] as const),
-					),
-				);
-				const dispatches = [...currentBySessionId.values()].flatMap((state) => state.dispatches);
-				for (const [sessionId, path] of this.sessionArtifactFiles) {
-					const current = currentBySessionId.get(sessionId) ?? { jobs: [], dispatches: [] };
-					const nextState = {
-						jobs: mergedJobsBySessionId.get(sessionId) ?? [],
-						dispatches: dispatches.filter((dispatch) => sessionIdByJobId.get(dispatch.jobId) === sessionId),
-					};
-					if (JSON.stringify(current) !== JSON.stringify(nextState)) {
-						writeJobsState(path, nextState);
+					const dispatches = [...currentBySessionId.values()].flatMap((state) => state.dispatches);
+					const beforeJobs: AgentCronJob[] = [];
+					const afterJobs: AgentCronJob[] = [];
+					for (const [sessionId, path] of targets) {
+						const current = currentBySessionId.get(sessionId) ?? { jobs: [], dispatches: [] };
+						const sessionDispatches = dispatches.filter(
+							(dispatch) => sessionIdByJobId.get(dispatch.jobId) === sessionId,
+						);
+						const nextState = {
+							jobs: pruneTerminalJobs(mergedJobsBySessionId.get(sessionId) ?? [], sessionDispatches),
+							dispatches: sessionDispatches,
+						};
+						beforeJobs.push(...current.jobs);
+						afterJobs.push(...nextState.jobs);
+						if (JSON.stringify(current) !== JSON.stringify(nextState)) {
+							writeJobsState(path, nextState);
+							this.observedSessionArtifactFiles.add(sessionId);
+						}
 					}
-				}
-			});
-			if (heartbeatCatalogSignature(this.readJobs()) !== previousHeartbeats) {
+					// Both signatures come from the states already read under the lock;
+					// separate passes over the files would triple the read cost of a write.
+					previousHeartbeats = heartbeatCatalogSignature(beforeJobs);
+					nextHeartbeats = heartbeatCatalogSignature(afterJobs);
+				},
+			);
+			if (previousHeartbeats !== nextHeartbeats) {
 				this.notifyHeartbeatChange();
 			}
 			return;
 		}
 		const path = this.requireFilePath();
-		withCronJobsStateLocks([path], () => writeJobsFile(path, jobs, true));
-		if (heartbeatCatalogSignature(this.readJobs()) !== previousHeartbeats) {
+		let previousHeartbeats = "";
+		let nextHeartbeats = "";
+		withCronJobsStateLocks([path], () => {
+			const current = readJobsState(path);
+			const next = mergedJobsState(current, jobs);
+			previousHeartbeats = heartbeatCatalogSignature(current.jobs);
+			nextHeartbeats = heartbeatCatalogSignature(next.jobs);
+			if (JSON.stringify(current) !== JSON.stringify(next)) {
+				writeJobsState(path, next);
+			}
+		});
+		if (previousHeartbeats !== nextHeartbeats) {
 			this.notifyHeartbeatChange();
 		}
 	}
@@ -923,7 +1012,7 @@ export function migrateLegacyCronJobsToSessionArtifacts(
 		jobsByArtifact.set(artifactPath, grouped);
 	}
 	for (const [artifactPath, artifactJobs] of jobsByArtifact) {
-		writeJobsFile(artifactPath, artifactJobs, true);
+		writeJobsFile(artifactPath, artifactJobs);
 	}
 	renameSync(filePath, `${filePath}.migrated-${Date.now()}`);
 	return jobs.length;
@@ -1064,7 +1153,10 @@ export class AgentCronScheduler {
 		}
 		this.timer = setTimeout(
 			() => {
-				void this.runDue();
+				// runDue re-arms the timer in its finally block, so a failure here (a store
+				// lock held by another process, for instance) only costs this tick. Left
+				// unhandled it would be an unhandled rejection, which kills the worker.
+				void this.runDue().catch(() => undefined);
 			},
 			Math.min(nextDelay, MAX_TIMEOUT_MS),
 		);
@@ -1495,12 +1587,13 @@ function isDueJob(job: AgentCronJob, now: Date): boolean {
 
 function withCronJobsStateLocks<T>(paths: readonly string[], action: () => T): T {
 	const releases: Array<() => void> = [];
+	const sleepBuffer = new Int32Array(new SharedArrayBuffer(4));
 	try {
 		for (const path of [...new Set(paths)].sort()) {
 			mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
 			let release: (() => void) | undefined;
 			let lockCompromised = false;
-			for (let attempt = 0; attempt < 100; attempt++) {
+			for (let attempt = 0; attempt < LOCK_RETRY_ATTEMPTS; attempt++) {
 				try {
 					release = lockSync(path, {
 						realpath: false,
@@ -1519,10 +1612,10 @@ function withCronJobsStateLocks<T>(paths: readonly string[], action: () => T): T
 					if (lockCompromised) {
 						throw new Error(`Cron jobs lock compromised: ${path}`);
 					}
-					if ((error as NodeJS.ErrnoException).code !== "ELOCKED" || attempt === 99) {
+					if ((error as NodeJS.ErrnoException).code !== "ELOCKED" || attempt === LOCK_RETRY_ATTEMPTS - 1) {
 						throw error;
 					}
-					Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+					Atomics.wait(sleepBuffer, 0, 0, Math.min(LOCK_RETRY_MAX_DELAY_MS, attempt + 1));
 				}
 			}
 			if (!release) {
@@ -1539,8 +1632,13 @@ function withCronJobsStateLocks<T>(paths: readonly string[], action: () => T): T
 }
 
 function readJobsState(path: string): CronJobsState {
+	return readJobsStateIfPresent(path) ?? { jobs: [], dispatches: [] };
+}
+
+/** The store file is absent until something is scheduled; callers tell that apart from an empty one. */
+function readJobsStateIfPresent(path: string): CronJobsState | undefined {
 	if (!existsSync(path)) {
-		return { jobs: [], dispatches: [] };
+		return undefined;
 	}
 	const parsed = JSON.parse(readFileSync(path, "utf-8")) as CronJobsFile;
 	return {
@@ -1549,12 +1647,46 @@ function readJobsState(path: string): CronJobsState {
 	};
 }
 
-function writeJobsFile(path: string, jobs: readonly AgentCronJob[], mergeCurrent: boolean): void {
-	const current = readJobsState(path);
-	writeJobsState(path, {
-		jobs: mergeCurrent ? mergeFreshJobs(current.jobs, jobs) : [...jobs],
+function writeJobsFile(path: string, jobs: readonly AgentCronJob[]): void {
+	writeJobsState(path, mergedJobsState(readJobsState(path), jobs));
+}
+
+function mergedJobsState(current: CronJobsState, jobs: readonly AgentCronJob[]): CronJobsState {
+	return {
+		jobs: pruneTerminalJobs(mergeFreshJobs(current.jobs, jobs), current.dispatches),
 		dispatches: current.dispatches,
-	});
+	};
+}
+
+/**
+ * Terminal jobs are history rather than schedule state. Keep the newest
+ * MAX_RETAINED_TERMINAL_JOBS of them per store file, and never drop one that a
+ * dispatch record still points at, or that dispatch would outlive its job.
+ */
+function pruneTerminalJobs(
+	jobs: readonly AgentCronJob[],
+	dispatches: readonly AgentCronDispatchRecord[],
+): AgentCronJob[] {
+	const terminal = jobs.filter((job) => isTerminalJobStatus(job.status));
+	if (terminal.length <= MAX_RETAINED_TERMINAL_JOBS) {
+		return [...jobs];
+	}
+	const claimed = new Set(dispatches.map((dispatch) => dispatch.jobId));
+	const kept = new Set(terminal.filter((job) => claimed.has(job.id)).map((job) => job.id));
+	const replaceable = terminal
+		.filter((job) => !claimed.has(job.id))
+		// Newest first; the id tiebreak keeps pruning deterministic for equal timestamps.
+		.sort(
+			(left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt) || right.id.localeCompare(left.id),
+		);
+	for (const job of replaceable.slice(0, Math.max(0, MAX_RETAINED_TERMINAL_JOBS - kept.size))) {
+		kept.add(job.id);
+	}
+	return jobs.filter((job) => !isTerminalJobStatus(job.status) || kept.has(job.id));
+}
+
+function isTerminalJobStatus(status: AgentCronJobStatus): boolean {
+	return status === "cancelled" || status === "completed";
 }
 
 function writeJobsState(path: string, state: CronJobsState): void {

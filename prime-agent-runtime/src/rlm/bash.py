@@ -788,6 +788,14 @@ def _helper_env() -> dict[str, str]:
     return {**os.environ, "NoDefaultCurrentDirectoryInExePath": "1"}
 
 
+def _ps_env() -> dict[str, str]:
+    # `lstart` is rendered in the subprocess timezone and locale, and the host
+    # recomputes this same identity with both pinned to C/UTC (session-lease.ts
+    # psStartIdQuery). An unpinned render never compares equal on a non-UTC or
+    # non-C host, so identity-verified reaping would refuse to fire.
+    return {**os.environ, "LC_ALL": "C", "LC_TIME": "C", "LANG": "C", "TZ": "UTC"}
+
+
 def _taskkill_tree(pid: int) -> bool:
     # Windows has no process groups to signal; taskkill /T kills the whole tree.
     try:
@@ -839,11 +847,69 @@ def _process_start_id(pid: int) -> str | None:
         # absolute path (bare `ps` stays only as the exotic-POSIX last resort).
         ps = "/bin/ps" if sys.platform == "darwin" else "ps"
         out = subprocess.run(
-            [ps, "-p", str(pid), "-o", "lstart="], capture_output=True, text=True, timeout=5
+            [ps, "-p", str(pid), "-o", "lstart="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=_ps_env(),
         ).stdout.strip()
         return f"ps:{out}" if out else None
     except (OSError, subprocess.SubprocessError):
         return None
+
+
+# Journal durability: an appended record is visible to the host reaper as soon as
+# the write returns, and it outlives this kernel's death because the page cache
+# belongs to the OS -- so the fsync wait, not the write, is what leaves the spawn
+# path. The only durability it adds is against machine power loss, where no
+# orphan can survive to be reaped either. One shared flusher coalesces a burst of
+# appends into a single fsync.
+_journal_dirty = threading.Event()
+_journal_flusher: threading.Thread | None = None
+_journal_flusher_lock = threading.Lock()
+
+
+def _fsync_journal() -> None:
+    """Best-effort durability flush; the record is already readable without it."""
+    path = os.environ.get("PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL")
+    if not path:
+        return
+    try:
+        fd = os.open(path, os.O_WRONLY)
+    except OSError:
+        return  # cleared or unwritable in the meantime: nothing left to flush
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _journal_flush_loop() -> None:
+    while True:
+        _journal_dirty.wait()
+        _journal_dirty.clear()
+        _fsync_journal()
+
+
+def _queue_journal_fsync() -> None:
+    global _journal_flusher
+    _journal_dirty.set()
+    with _journal_flusher_lock:
+        if _journal_flusher is not None and _journal_flusher.is_alive():
+            return
+        flusher = threading.Thread(
+            target=_journal_flush_loop, name="rlm-journal-fsync", daemon=True
+        )
+        try:
+            flusher.start()
+        except RuntimeError:
+            # No thread available: keep the wait on the caller instead of dropping it.
+            _journal_dirty.clear()
+            _fsync_journal()
+            return
+        _journal_flusher = flusher
 
 
 def _record_journal(pid: int, active: bool) -> bool:
@@ -883,11 +949,14 @@ def _record_journal(pid: int, active: bool) -> bool:
                 if written <= 0:
                     return False
                 view = view[written:]
-            os.fsync(fd)
         finally:
             os.close(fd)
     except OSError:
         return False
+    # The append is what the host reaper reads and what every fail-closed
+    # condition (unwritable path, no space, short write) reports through, so it
+    # stays on the calling thread; only the durability wait moves off it.
+    _queue_journal_fsync()
     return True
 
 

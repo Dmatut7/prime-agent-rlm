@@ -136,7 +136,16 @@ export function matchSearchText(text: string, parsed: ParsedSearchQuery): MatchR
 	return { matches: true, score: totalScore };
 }
 
-export function matchesSearchText(text: string, query: string): boolean {
+/**
+ * Parse the query once and hand back a matcher for a whole catalog pass:
+ * re-parsing per row recompiles the `re:` pattern for every session.
+ */
+export function createSearchTextMatcher(query: string): (text: string) => boolean {
 	const parsed = parseSearchQuery(query);
-	return !parsed.error && matchSearchText(text, parsed).matches;
+	if (parsed.error) return () => false;
+	return (text) => matchSearchText(text, parsed).matches;
+}
+
+export function matchesSearchText(text: string, query: string): boolean {
+	return createSearchTextMatcher(query)(text);
 }

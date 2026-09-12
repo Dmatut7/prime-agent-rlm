@@ -30,6 +30,15 @@ export interface PendingDeliveryEntry {
 	lastRequeuedAt?: number;
 	/** Settled once, by drain(): the delivery loop races it against the worker request. */
 	readonly aborted: Promise<PendingDeliveryAbortReason>;
+	/**
+	 * Registers a drain handler and returns its unregistration. Handlers are
+	 * called synchronously by the drain, and `aborted` itself never gathers
+	 * racer reactions, so a delivery loop that races the abort once per bounce
+	 * does not accumulate reactions on a promise that stays pending for the
+	 * whole budget. A handler registered after the abort is called
+	 * synchronously.
+	 */
+	readonly onAbort: (handler: (reason: PendingDeliveryAbortReason) => void) => () => void;
 }
 
 export type PendingDeliveryAdmission =
@@ -135,6 +144,11 @@ export class PendingDeliveryQueue {
 		});
 		// The abort promise is raced, never awaited to completion on its own.
 		void aborted.catch(() => undefined);
+		// Drain fans out to the current subscribers synchronously from abort();
+		// racers subscribe and unsubscribe per iteration instead of chaining
+		// `.then` onto `aborted`, which stays pending for the whole (up to 24h)
+		// delivery budget and would accumulate one reaction per bounce.
+		const abortSubscribers = new Set<(reason: PendingDeliveryAbortReason) => void>();
 		const entry: InternalEntry = {
 			deliveryId: this.idFactory(),
 			targetActiveSessionId,
@@ -143,10 +157,22 @@ export class PendingDeliveryQueue {
 			deadlineAt: this.now() + this.deliveryBudgetMs,
 			attempts: 0,
 			aborted,
+			onAbort: (handler) => {
+				if (entry.abortedReason !== undefined) {
+					handler(entry.abortedReason);
+					return () => undefined;
+				}
+				abortSubscribers.add(handler);
+				return () => {
+					abortSubscribers.delete(handler);
+				};
+			},
 			abort: (reason) => {
 				if (entry.abortedReason === undefined) {
 					entry.abortedReason = reason;
 					abortEntry(reason);
+					for (const handler of [...abortSubscribers]) handler(reason);
+					abortSubscribers.clear();
 				}
 			},
 		};

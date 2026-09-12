@@ -100,9 +100,10 @@ import {
 	type UnifiedSessionRecord,
 } from "./agents-view-state.js";
 import { AgentsViewRosterStore, STALE_ROSTER_DAEMON_MESSAGE } from "./roster-store.js";
-import { matchesSearchText } from "./session-view-search.js";
+import { createSearchTextMatcher } from "./session-view-search.js";
 
 const HEARTBEAT_POLL_INTERVAL_MS = 15000;
+const SAVED_CATALOG_RECONCILE_THROTTLE_MS = 50;
 const RECONNECT_TIMEOUT_MS = 120000;
 const RECONNECT_RETRY_MS = 1000;
 const EXIT_HINT_DURATION_MS = 2000;
@@ -682,6 +683,9 @@ export class AgentsViewMode implements Component, Focusable {
 	private savedCatalogGeneration = 0;
 	private heartbeatCatalogGeneration = 0;
 	private savedCatalogRefreshPending = false;
+	private catalogReconcileTimer: NodeJS.Timeout | undefined;
+	private catalogReconcileDirty = false;
+	private lastCatalogReconcileAt = 0;
 	private expandedSubagentParents = new Set<string>();
 	// Agent row identities whose full spawn program is currently shown.
 	// The program key toggles each agent shown ↔ hidden.
@@ -1288,7 +1292,8 @@ export class AgentsViewMode implements Component, Focusable {
 
 	private getFilteredRecords(): UnifiedSessionRecord[] {
 		const query = this.replyTarget || this.renameTarget ? (this.actionModeSearchQuery ?? "") : this.editor.getText();
-		return filterUnifiedSessions(this.scopedRecords, (text) => matchesSearchText(text, query));
+		const matches = createSearchTextMatcher(query);
+		return filterUnifiedSessions(this.scopedRecords, matches);
 	}
 
 	/** Rebuild rows from the last fetched summaries, keeping selection on the same row. */
@@ -2192,6 +2197,42 @@ export class AgentsViewMode implements Component, Focusable {
 		this.applyPendingAncestorExpansion();
 		this.restoreSelection();
 		this.ui.requestRender();
+		// Stamped after the rebuild: on a large catalog the rebuild itself can outlast
+		// the throttle window, and stamping the start would re-admit one rebuild per
+		// streamed session.
+		this.catalogReconcileDirty = false;
+		this.lastCatalogReconcileAt = Date.now();
+	}
+
+	/**
+	 * The saved catalog streams one session at a time and a reconcile rebuilds every
+	 * row, so reconciling per session is quadratic in catalog size. The first update
+	 * of a burst reconciles at once; the rest coalesce into one trailing rebuild.
+	 */
+	private scheduleCatalogReconcile(): void {
+		if (this.stopped) return;
+		this.catalogReconcileDirty = true;
+		const delay = SAVED_CATALOG_RECONCILE_THROTTLE_MS - (Date.now() - this.lastCatalogReconcileAt);
+		if (delay <= 0) {
+			this.reconcileCatalogs();
+			return;
+		}
+		if (this.catalogReconcileTimer) return;
+		this.catalogReconcileTimer = setTimeout(() => {
+			this.catalogReconcileTimer = undefined;
+			// A reconcile from any other path already covered the pending sessions.
+			if (this.stopped || !this.catalogReconcileDirty) return;
+			this.reconcileCatalogs();
+		}, delay);
+		this.catalogReconcileTimer.unref?.();
+	}
+
+	private clearScheduledCatalogReconcile(): void {
+		if (this.catalogReconcileTimer) {
+			clearTimeout(this.catalogReconcileTimer);
+			this.catalogReconcileTimer = undefined;
+		}
+		this.catalogReconcileDirty = false;
 	}
 
 	private rearmSavedSearchFetch(): void {
@@ -2219,7 +2260,7 @@ export class AgentsViewMode implements Component, Focusable {
 				progressiveSessions.set(resolvePath(canonicalizePath(session.path)), session);
 				this.savedSessions = [...progressiveSessions.values()];
 				this.persistentState.savedSessions = this.savedSessions;
-				this.reconcileCatalogs();
+				this.scheduleCatalogReconcile();
 			};
 			const sessions = await listDaemonSavedSessions(
 				this.requireClient(),
@@ -2365,6 +2406,7 @@ export class AgentsViewMode implements Component, Focusable {
 		this.stopped = true;
 		this.savedCatalogGeneration += 1;
 		this.heartbeatCatalogGeneration += 1;
+		this.clearScheduledCatalogReconcile();
 		if (this.heartbeatPollTimer) {
 			clearInterval(this.heartbeatPollTimer);
 			this.heartbeatPollTimer = undefined;

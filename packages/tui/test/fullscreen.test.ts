@@ -24,6 +24,10 @@ class InputComponent extends TestComponent {
 	}
 }
 
+class ReleaseAwareInputComponent extends InputComponent {
+	wantsKeyRelease = true;
+}
+
 class SelectionOverlay extends TestComponent {
 	private selected = 0;
 
@@ -1237,6 +1241,60 @@ describe("TUI fullscreen mode", () => {
 		await terminal.waitForRender();
 
 		assert.deepStrictEqual(input.inputs, [PAGE_UP]);
+
+		tui.stop();
+	});
+
+	it("scrolls one page for a Kitty PageUp press/release pair", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(30));
+		const editor = new TestComponent();
+		tui.setFocus(editor);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[5;1:1~"); // Kitty PageUp press (event type 1)
+		await terminal.waitForRender();
+		assert.strictEqual(terminal.getViewport()[0], "Line 15", "press scrolls one page");
+
+		terminal.sendInput("\x1b[5;1:3~"); // Kitty PageUp release (event type 3)
+		await terminal.waitForRender();
+		assert.strictEqual(terminal.getViewport()[0], "Line 15", "release must not scroll a second page");
+
+		tui.stop();
+	});
+
+	it("fires the debug handler once for a Kitty press/release pair", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(5));
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		let debugCount = 0;
+		tui.onDebug = () => {
+			debugCount++;
+		};
+
+		terminal.sendInput("\x1b[100;6:1u"); // ctrl+shift+d press
+		terminal.sendInput("\x1b[100;6:3u"); // ctrl+shift+d release
+		assert.strictEqual(debugCount, 1);
+
+		tui.stop();
+	});
+
+	it("delivers releases to opted-in components without scrolling the viewport again", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(30));
+		const game = new ReleaseAwareInputComponent();
+		tui.setFocus(game);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[5;1:1~"); // press: consumed by viewport controls
+		await terminal.waitForRender();
+		assert.strictEqual(terminal.getViewport()[0], "Line 15");
+
+		terminal.sendInput("\x1b[5;1:3~"); // release: passes through to the component
+		await terminal.waitForRender();
+		assert.strictEqual(terminal.getViewport()[0], "Line 15", "release must not scroll a second page");
+		assert.deepStrictEqual(game.inputs, ["\x1b[5;1:3~"]);
 
 		tui.stop();
 	});

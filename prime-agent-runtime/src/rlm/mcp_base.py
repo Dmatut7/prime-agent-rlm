@@ -37,6 +37,16 @@ _EXPIRY_SKEW_SECONDS = 30
 # kernel namespace (or its snapshot) before the display cap would cut it.
 _MAX_RESULT_CHARS = 65536
 
+# Round-trip bounds, mirroring the generic registry's startup/call defaults in
+# mcp.py (which cannot be imported here: mcp.py imports this module). Without
+# them a wedged server holds a kernel cell for the transport's own read timeout
+# (300s below) or forever.
+_OPEN_TIMEOUT_SECONDS = 20.0
+_CALL_TIMEOUT_SECONDS = 60.0
+# A wedged session can wedge its own teardown, so the per-call unwind is bounded
+# too; the stack is per-call, so abandoning it strands nothing the caller needs.
+_CLOSE_TIMEOUT_SECONDS = 5.0
+
 
 class NotEnabled(RuntimeError):
     """Raised when an integration has no usable credentials.
@@ -112,6 +122,15 @@ def _resolve_streamable_http():
     raise ImportError(
         "the installed `mcp` SDK exposes no streamable-HTTP client; upgrade `mcp`"
     )
+
+
+async def _close_stack(stack: AsyncExitStack) -> None:
+    """Unwind a per-call stack, bounded so a wedged server cannot wedge teardown."""
+    try:
+        async with asyncio.timeout(_CLOSE_TIMEOUT_SECONDS):
+            await stack.aclose()
+    except TimeoutError:
+        pass
 
 
 class McpIntegration:
@@ -206,6 +225,8 @@ class McpIntegration:
 
         Override for non-HTTP transports (e.g. stdio). The default connects over
         streamable HTTP to the class ``url`` with a Bearer token from auth.json.
+        Callers wrap this in ``asyncio.timeout``, so an override inherits the
+        bound instead of needing its own.
         """
         import inspect  # noqa: PLC0415
 
@@ -230,6 +251,8 @@ class McpIntegration:
             import httpx2  # noqa: PLC0415
 
             # SDK-factory timeouts; a default client's 5s read cap drops idle SSE streams.
+            # The read cap is a transport backstop only: call_tool/_ensure_tools bound each
+            # round trip themselves, so a wedged server cannot hold a cell for 300s.
             # No redirects: a redirecting endpoint must not receive the bearer header.
             client = await stack.enter_async_context(
                 httpx2.AsyncClient(
@@ -262,17 +285,27 @@ class McpIntegration:
         async with self._lock:
             if self._tools is not None:
                 return
-            async with AsyncExitStack() as stack:
-                session = await self._open_session(stack)
-                resp = await session.list_tools()
-                self._tools = {
-                    t.name: {
-                        "name": t.name,
-                        "description": getattr(t, "description", "") or "",
-                        "inputSchema": getattr(t, "inputSchema", None) or {},
-                    }
-                    for t in resp.tools
+            stack = AsyncExitStack()
+            try:
+                try:
+                    async with asyncio.timeout(_OPEN_TIMEOUT_SECONDS):
+                        session = await self._open_session(stack)
+                        resp = await session.list_tools()
+                except TimeoutError:
+                    raise TimeoutError(
+                        f"MCP server '{self.server}' did not answer list_tools within "
+                        f"{_OPEN_TIMEOUT_SECONDS:g}s"
+                    ) from None
+            finally:
+                await _close_stack(stack)
+            self._tools = {
+                t.name: {
+                    "name": t.name,
+                    "description": getattr(t, "description", "") or "",
+                    "inputSchema": getattr(t, "inputSchema", None) or {},
                 }
+                for t in resp.tools
+            }
 
     async def call_tool(self, tool: str, arguments: dict[str, Any] | None = None) -> Any:
         """Call ``tool`` on the server and return its parsed result.
@@ -280,10 +313,24 @@ class McpIntegration:
         Opens a fresh session per call: MCP sessions are not safe to hold across
         the kernel's snapshot/restore, and per-call connect keeps this robust to
         idle sessions and token rotation at modest latency cost.
+
+        Bounded: a wedged server raises ``TimeoutError`` after
+        ``_CALL_TIMEOUT_SECONDS`` instead of holding the cell until the
+        transport's own read timeout expires.
         """
-        async with AsyncExitStack() as stack:
-            session = await self._open_session(stack)
-            result = await session.call_tool(tool, arguments or {})
+        stack = AsyncExitStack()
+        try:
+            try:
+                async with asyncio.timeout(_CALL_TIMEOUT_SECONDS):
+                    session = await self._open_session(stack)
+                    result = await session.call_tool(tool, arguments or {})
+            except TimeoutError:
+                raise TimeoutError(
+                    f"MCP server '{self.server}' did not answer tool '{tool}' within "
+                    f"{_CALL_TIMEOUT_SECONDS:g}s"
+                ) from None
+        finally:
+            await _close_stack(stack)
         return _parse_result(result)
 
     def __getattr__(self, name: str):

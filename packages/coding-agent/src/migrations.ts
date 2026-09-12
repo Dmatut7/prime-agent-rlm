@@ -136,16 +136,28 @@ export function migrateSessionsFromAgentRoot(): void {
 	}
 }
 
-function isSessionJsonlFile(filePath: string): boolean {
+type SessionFileProbe = "session" | "other" | "unreadable";
+
+/**
+ * Classify a candidate by its JSONL header only. `unreadable` means the header
+ * could not be read at all, which says nothing about the file's content: the
+ * caller must not fold it into the permanent leftovers it marks as done.
+ */
+function probeSessionJsonlFile(filePath: string): SessionFileProbe {
+	let firstLine: string | undefined;
 	try {
-		const firstLine = readFirstLineSync(filePath);
+		firstLine = readFirstLineSync(filePath);
+	} catch {
+		return "unreadable";
+	}
+	try {
 		if (!firstLine?.trim()) {
-			return false;
+			return "other";
 		}
 		const header = JSON.parse(firstLine) as { type?: unknown; id?: unknown };
-		return header.type === "session" && typeof header.id === "string";
+		return header.type === "session" && typeof header.id === "string" ? "session" : "other";
 	} catch {
-		return false;
+		return "other";
 	}
 }
 
@@ -154,11 +166,33 @@ function isLegacySessionDirName(name: string): boolean {
 }
 
 /**
+ * Written into a legacy dir this migration has already drained as far as it can,
+ * so later startups skip it instead of re-reading every file inside again.
+ */
+const LEGACY_DIR_MIGRATION_MARKER = ".migrated-to-session-root";
+
+function isLegacyDirMigrationMarked(legacyDir: string): boolean {
+	return existsSync(join(legacyDir, LEGACY_DIR_MIGRATION_MARKER));
+}
+
+function markLegacyDirMigrationDone(legacyDir: string): void {
+	try {
+		writeFileSync(join(legacyDir, LEGACY_DIR_MIGRATION_MARKER), `${new Date().toISOString()}\n`, {
+			encoding: "utf-8",
+			mode: 0o600,
+		});
+	} catch {
+		// Best-effort: without the marker the next startup simply repeats this pass.
+	}
+}
+
+/**
  * Migrate legacy per-cwd session directories into the flat session root.
  *
  * Older versions stored sessions under ~/.prime/agent/sessions/--cwd--/*.jsonl.
  * The daemon list/continue paths now scan the flat session root, so move any
- * existing nested JSONL session files up one level.
+ * existing nested JSONL session files up one level. A dir that cannot be fully
+ * drained is marked done, so each legacy dir is walked at most once.
  */
 export function migrateLegacySessionDirsToSessionRoot(): void {
 	const agentDir = getAgentDir();
@@ -177,6 +211,9 @@ export function migrateLegacySessionDirsToSessionRoot(): void {
 		}
 
 		const legacyDir = join(sessionsDir, entry.name);
+		if (isLegacyDirMigrationMarked(legacyDir)) {
+			continue;
+		}
 		let files: string[];
 		try {
 			files = readdirSync(legacyDir).filter((file) => file.endsWith(".jsonl"));
@@ -184,10 +221,17 @@ export function migrateLegacySessionDirsToSessionRoot(): void {
 			continue;
 		}
 
+		let unfinished = false;
 		for (const file of files) {
 			const oldPath = join(legacyDir, file);
 			let newPath = join(sessionsDir, file);
-			if (!isSessionJsonlFile(oldPath)) {
+			const probe = probeSessionJsonlFile(oldPath);
+			if (probe !== "session") {
+				if (probe === "unreadable") {
+					// An unreadable header may be a transient failure, so keep the dir
+					// unmarked and let the next startup try again.
+					unfinished = true;
+				}
 				continue;
 			}
 			if (existsSync(newPath)) {
@@ -203,12 +247,18 @@ export function migrateLegacySessionDirsToSessionRoot(): void {
 				renameSync(oldPath, newPath);
 			} catch {
 				// Leave the legacy file in place if it cannot be moved.
+				unfinished = true;
 			}
 		}
 
 		try {
 			if (readdirSync(legacyDir).length === 0) {
 				rmdirSync(legacyDir);
+			} else if (!unfinished) {
+				// Only leftovers this migration can never move remain (non-session
+				// files, nested dirs, a duplicate already in the flat root). Mark the
+				// dir so this pass, and its full-file content compares, run once.
+				markLegacyDirMigrationDone(legacyDir);
 			}
 		} catch {
 			// Ignore cleanup errors; migrated files are already in the flat root.

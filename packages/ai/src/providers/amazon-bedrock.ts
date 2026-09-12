@@ -21,6 +21,7 @@ import {
 	ToolResultStatus,
 } from "@aws-sdk/client-bedrock-runtime";
 import type { DocumentType } from "@smithy/types";
+import { getAnthropicCacheWriteCost, hasStandardAnthropicCachePricing } from "../cache-pricing.js";
 import { calculateCost, clampThinkingLevel } from "../models.js";
 import type {
 	Api,
@@ -191,6 +192,11 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 		try {
 			const client = new BedrockRuntimeClient(config);
 			const cacheRetention = resolveCacheRetention(options.cacheRetention);
+			// A 1h cache point bills writes at 2x input, not the 5m rate stored in model.cost.cacheWrite.
+			const cacheWriteCost =
+				cacheRetention === "long" && supportsPromptCaching(model) && hasStandardAnthropicCachePricing(model)
+					? getAnthropicCacheWriteCost(model.cost.input, "1h")
+					: undefined;
 			let commandInput = {
 				modelId: model.id,
 				messages: convertMessages(context, model, cacheRetention),
@@ -238,7 +244,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 						output.stopReasonRaw = item.messageStop.stopReason;
 					}
 				} else if (item.metadata) {
-					handleMetadata(item.metadata, model, output);
+					handleMetadata(item.metadata, model, output, cacheWriteCost);
 				} else if (item.internalServerException) {
 					throw item.internalServerException;
 				} else if (item.modelStreamErrorException) {
@@ -438,6 +444,7 @@ function handleMetadata(
 	event: ConverseStreamMetadataEvent,
 	model: Model<"bedrock-converse-stream">,
 	output: AssistantMessage,
+	cacheWriteCost?: number,
 ): void {
 	if (event.usage) {
 		output.usage.input = event.usage.inputTokens || 0;
@@ -445,7 +452,7 @@ function handleMetadata(
 		output.usage.cacheRead = event.usage.cacheReadInputTokens || 0;
 		output.usage.cacheWrite = event.usage.cacheWriteInputTokens || 0;
 		output.usage.totalTokens = event.usage.totalTokens || output.usage.input + output.usage.output;
-		calculateCost(model, output.usage);
+		calculateCost(model, output.usage, cacheWriteCost === undefined ? undefined : { cacheWrite: cacheWriteCost });
 	}
 }
 
