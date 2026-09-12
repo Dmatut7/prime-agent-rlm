@@ -4174,6 +4174,10 @@ export class AgentSession {
 				// Two tiers: movement buys the full budget, mere existence buys the short one that
 				// stays near the pre-exemption abort threshold (M3).
 				tier: facts.progress ? "progress" : "liveness",
+				// The watchdog settles accrued exempt silence when this changes between two samples,
+				// which is what keeps a long build that never stops producing from being charged for
+				// the wall clock it takes (P1). Existence-only facts carry no token and settle nothing.
+				...(facts.movementToken === undefined ? {} : { movementToken: facts.movementToken }),
 				kernel: {
 					...(facts.protocol === undefined ? {} : { protocol: facts.protocol }),
 					...(facts.livenessAgeMs === undefined ? {} : { livenessAgeMs: facts.livenessAgeMs }),

@@ -21,6 +21,7 @@ interface Harness {
 function createHarness(options?: {
 	warnAfterMs?: number;
 	abortAfterMs?: number;
+	vouchLivenessBudgetMs?: number;
 	isPaused?: () => boolean;
 	vouch?: () => StallVouchFacts | undefined;
 }): Harness {
@@ -31,6 +32,7 @@ function createHarness(options?: {
 		enabled: true,
 		warnAfterMs: options?.warnAfterMs ?? 1000,
 		abortAfterMs: options?.abortAfterMs === undefined ? 3000 : options.abortAfterMs,
+		...(options?.vouchLivenessBudgetMs === undefined ? {} : { vouchLivenessBudgetMs: options.vouchLivenessBudgetMs }),
 		timers: clock.timersImpl,
 		isPaused: options?.isPaused,
 		vouch: options?.vouch,
@@ -433,5 +435,276 @@ describe("StallWatchdog exemption budget (T1-1)", () => {
 		h.clock.advance(3000);
 		expect(h.watchdog.exemption).toBeUndefined();
 		expect(h.watchdog.collectExemptionDiagnostics().reason).toBeUndefined();
+	});
+});
+
+/**
+ * The budget's dimension (P1): it charges *unexplained silence*, not wall clock under vouch. A fact
+ * source whose movement token changes between two samples settles what the segment had accrued, so
+ * a build that keeps producing for hours never reaches the cap - while every shape that made the
+ * cap necessary (a frozen counter, existence-only evidence, a drip of session events, a blink) still
+ * spends it and dies.
+ */
+describe("StallWatchdog exemption budget charges exempt silence (P1)", () => {
+	function movingVouch(token: { value: string }): () => StallVouchFacts | undefined {
+		return () => ({
+			active: true,
+			tier: "progress",
+			reasons: ["live_bash_handles"],
+			movementToken: token.value,
+		});
+	}
+
+	it("settles the accrued silence whenever the movement token advances, for as long as it does", () => {
+		const token = { value: "frame-0" };
+		// warn 1min => combined cap max(10 x 1min, 30min) = 30min.
+		const h = createHarness({ warnAfterMs: MINUTE_MS, abortAfterMs: 3 * MINUTE_MS, vouch: movingVouch(token) });
+		h.watchdog.arm();
+
+		// Two hours of a build whose counters move between every pair of samples, with no host event
+		// at all: six times the cap in wall clock, and not one minute of it is unexplained silence.
+		let frames = 0;
+		h.clock.advanceInSteps(120 * MINUTE_MS, 30_000, () => {
+			frames += 1;
+			token.value = `frame-${frames}`;
+		});
+		expect(frames).toBeGreaterThan(0);
+
+		expect(h.stageNames()).not.toContain("abort");
+		expect(h.watchdog.exemptionBudgetSpent).toBe(false);
+		// B2 is untouched: an exemption defers the abort, it never swallows the warning.
+		expect(h.stageNames()).toEqual(["warn"]);
+		const exemption = h.watchdog.exemption;
+		expect(exemption?.tier).toBe("progress");
+		expect(exemption?.usedMs ?? Number.NaN).toBeLessThan(exemption?.budgetMs ?? 0);
+		// The post-mortem can tell a settled segment from one that was silent the whole way.
+		expect(exemption?.settledByMovementMs).toBeGreaterThan(0);
+		expect(h.watchdog.collectExemptionDiagnostics().settledByMovementMs).toBeGreaterThan(0);
+	});
+
+	it("charges the silence that follows the last movement, and kills inside the cap", () => {
+		const token = { value: "frame-0" };
+		const h = createHarness({ warnAfterMs: MINUTE_MS, abortAfterMs: 3 * MINUTE_MS, vouch: movingVouch(token) });
+		h.watchdog.arm();
+
+		// An hour of production: nothing owed, nothing spent.
+		let frames = 0;
+		h.clock.advanceInSteps(60 * MINUTE_MS, 30_000, () => {
+			frames += 1;
+			token.value = `frame-${frames}`;
+		});
+		expect(h.stageNames()).not.toContain("abort");
+		expect(h.watchdog.exemptionBudgetSpent).toBe(false);
+
+		// Then it wedges: the frames keep arriving and the handle stays live, but the counters stop.
+		// The cap applies from the last movement, so the kill lands inside one cap of the freeze.
+		const frozeAtMs = h.clock.nowMs;
+		let abortAtMs: number | undefined;
+		let spentAtAbort = false;
+		h.clock.advanceInSteps(60 * MINUTE_MS, 30_000, () => {
+			if (abortAtMs === undefined && h.stageNames().includes("abort")) {
+				abortAtMs = h.clock.nowMs;
+				// Read at the kill: the give-up path that follows resets the arm cycle.
+				spentAtAbort = h.watchdog.exemptionBudgetSpent;
+			}
+		});
+		expect(abortAtMs).toBeDefined();
+		expect(spentAtAbort).toBe(true);
+		expect(abortAtMs ?? Number.POSITIVE_INFINITY).toBeLessThanOrEqual(
+			frozeAtMs + STALL_EXEMPTION_BUDGET_FLOOR_MS + 3 * MINUTE_MS,
+		);
+		expect(h.stages.find((stage) => stage.stage === "abort")?.exemption).toMatchObject({
+			reason: "vouched",
+			exhausted: true,
+		});
+		// The movement it did make is still on the record, so the post-mortem reads "it worked for an
+		// hour and then stopped" instead of "it was silent for an hour".
+		expect(h.stages.find((stage) => stage.stage === "abort")?.exemption?.settledByMovementMs).toBeGreaterThan(0);
+	});
+
+	it("does not settle on a token that never changes, however often it is reported", () => {
+		// A frozen counter claims `progress` at every sample. Reporting movement is not moving, so
+		// this is the slow-drip wedge with a token attached and it must still die inside the cap.
+		const h = createHarness({
+			warnAfterMs: 1000,
+			abortAfterMs: 3000,
+			vouch: () => ({
+				active: true,
+				tier: "progress",
+				reasons: ["live_bash_handles"],
+				movementToken: "frame-1",
+			}),
+		});
+		h.watchdog.arm();
+
+		h.clock.advanceInSteps(31 * MINUTE_MS, 1300, () => h.watchdog.touch());
+		expect(h.stageNames()).toContain("warn");
+		expect(h.stageNames()).toContain("abort");
+		expect(h.watchdog.exemption?.settledByMovementMs).toBeUndefined();
+	});
+
+	it("never lets movement that arrives after the cap was spent un-spend it", () => {
+		const token = { value: "frame-1" };
+		// Warn-only, so the spent cap can be observed together with the touches that follow it: with
+		// an abort channel the escalation lands on the same sample that sees the exhaustion.
+		const h = createHarness({ warnAfterMs: 1000, abortAfterMs: 0, vouch: movingVouch(token) });
+		h.watchdog.arm();
+
+		h.clock.advance(31 * MINUTE_MS);
+		// A warn-only watchdog stops sampling once it has warned, so the cap is observed spent by the
+		// next touch - which is also the shape the registered warn-spam pin uses.
+		h.watchdog.touch();
+		expect(h.watchdog.exemptionBudgetSpent).toBe(true);
+		expect(h.watchdog.exemption?.exhausted).toBe(true);
+
+		// The job "starts producing" after the fact. A spent cap that a later sample could erase is
+		// not a cap (A1), so the movement settles nothing and the kill stays attributable.
+		let frames = 1;
+		h.clock.advanceInSteps(10_000, 500, () => {
+			frames += 1;
+			token.value = `frame-${frames}`;
+			h.watchdog.touch();
+		});
+		expect(h.watchdog.exemptionBudgetSpent).toBe(true);
+		expect(h.watchdog.exemption?.exhausted).toBe(true);
+		expect(h.watchdog.exemption?.settledByMovementMs).toBeUndefined();
+	});
+
+	it("does not let movement arriving with the exhaustion observation pay for silence already owed", () => {
+		const token = { value: "frame-1" };
+		// Warn-only, so nothing samples between the warning and the touch below: that touch is the
+		// first observation to find the cap spent.
+		const h = createHarness({ warnAfterMs: MINUTE_MS, abortAfterMs: 0, vouch: movingVouch(token) });
+		h.watchdog.arm();
+
+		h.clock.advance(31 * MINUTE_MS);
+		expect(h.watchdog.exemptionBudgetSpent).toBe(false);
+
+		// The counters moved at the very same instant the cap was crossed: too late. The sample that
+		// first sees the cap spent decides, so the exhaustion cannot be raced away by movement that
+		// arrives together with the observation of it.
+		token.value = "frame-2";
+		h.watchdog.touch();
+		expect(h.watchdog.exemptionBudgetSpent).toBe(true);
+		expect(h.watchdog.exemption?.exhausted).toBe(true);
+		expect(h.watchdog.exemption?.settledByMovementMs).toBeUndefined();
+	});
+
+	it("tracks movement seen during a host-owned pause without letting it settle the accrued time", () => {
+		const token = { value: "frame-1" };
+		const paused = { value: false };
+		const h = createHarness({
+			warnAfterMs: MINUTE_MS,
+			abortAfterMs: 3 * MINUTE_MS,
+			isPaused: () => paused.value,
+			vouch: movingVouch(token),
+		});
+		h.watchdog.arm();
+
+		// Past the first warn window, so the segment exists and has accrued half a minute of it.
+		h.clock.advance(MINUTE_MS + 30_000);
+		const accruedBefore = h.watchdog.exemption?.usedMs ?? 0;
+		expect(accruedBefore).toBe(30_000);
+
+		// The host takes the turn boundary over (a compaction) while the kernel keeps producing. The
+		// pause snoozes warnings, and its movement is tracked but settles nothing: it is not the
+		// evidence that owns this silence.
+		paused.value = true;
+		let frames = 1;
+		h.clock.advanceInSteps(2 * MINUTE_MS, 30_000, () => {
+			frames += 1;
+			token.value = `frame-${frames}`;
+		});
+		// The kernel stops producing while the host phase is still on, so a sample taken *during the
+		// pause* records the newest token: what the pause saw is what the pause tracked.
+		h.clock.advance(MINUTE_MS);
+
+		// The pause lifts. The movement it saw must not read as fresh movement now: that would let a
+		// paused phase hand the vouch a settled budget it never earned.
+		paused.value = false;
+		h.watchdog.touch();
+		expect(h.watchdog.exemption?.reason).toBe("vouched");
+		expect(h.watchdog.exemption?.settledByMovementMs).toBeUndefined();
+		expect(h.watchdog.exemption?.usedMs ?? 0).toBeGreaterThan(accruedBefore);
+	});
+
+	it("keeps a spent cap spent when the tier upgrades and movement resumes afterwards", () => {
+		const token = { value: "frame-1" };
+		const tier = { value: "liveness" as "liveness" | "progress" };
+		// A 12min liveness budget inside a 30min cap: spend the short one, then let the evidence
+		// upgrade to the tier with the longer budget and start moving. The spent cap is a fact about
+		// the arm cycle, so neither the upgrade nor the movement may un-spend it (A1).
+		const h = createHarness({
+			warnAfterMs: MINUTE_MS,
+			abortAfterMs: 0,
+			vouchLivenessBudgetMs: 12 * MINUTE_MS,
+			vouch: () => ({
+				active: true,
+				tier: tier.value,
+				reasons: ["live_bash_handles"],
+				movementToken: token.value,
+			}),
+		});
+		h.watchdog.arm();
+
+		h.clock.advance(13 * MINUTE_MS);
+		h.watchdog.touch();
+		expect(h.watchdog.exemptionBudgetSpent).toBe(true);
+		expect(h.watchdog.exemption?.exhausted).toBe(true);
+
+		// The upgrade puts usedMs back under the (now larger) budget, so only the spent latch stands
+		// between this movement and a renewed cap.
+		tier.value = "progress";
+		token.value = "frame-2";
+		h.watchdog.touch();
+		expect(h.watchdog.exemption?.budgetMs).toBe(STALL_EXEMPTION_BUDGET_FLOOR_MS);
+		// The snapshot measures against the upgraded budget, so it no longer reads exhausted: this is
+		// exactly why the arm-cycle latch, and not the snapshot, carries "the cap was spent".
+		expect(h.watchdog.exemption?.exhausted).toBe(false);
+		expect(h.watchdog.exemptionBudgetSpent).toBe(true);
+		// And the movement that arrived with the upgrade settles nothing: the accrued 12 minutes stay
+		// on the clock instead of being paid for by a token that changed after the cap was seen spent.
+		expect(h.watchdog.exemption?.settledByMovementMs).toBeUndefined();
+		expect(h.watchdog.exemption?.usedMs ?? 0).toBeGreaterThanOrEqual(12 * MINUTE_MS);
+	});
+
+	it("treats a first token that arrives after the segment was born as a baseline too", () => {
+		// Born on existence-only evidence (a journaled handle, say), then a usable heartbeat arrives
+		// carrying a token. With no predecessor to compare against it cannot claim anything moved, so
+		// the silence accrued while existence was the only evidence stays charged.
+		let token: string | undefined;
+		const h = createHarness({
+			warnAfterMs: MINUTE_MS,
+			abortAfterMs: 3 * MINUTE_MS,
+			vouch: () => ({
+				active: true,
+				tier: token === undefined ? "liveness" : "progress",
+				reasons: ["live_bash_handles"],
+				...(token === undefined ? {} : { movementToken: token }),
+			}),
+		});
+		h.watchdog.arm();
+
+		h.clock.advance(MINUTE_MS + 30_000);
+		const accruedBefore = h.watchdog.exemption?.usedMs ?? 0;
+		expect(accruedBefore).toBe(30_000);
+
+		token = "frame-1";
+		h.watchdog.touch();
+		expect(h.watchdog.exemption?.tier).toBe("progress");
+		expect(h.watchdog.exemption?.settledByMovementMs).toBeUndefined();
+		expect(h.watchdog.exemption?.usedMs ?? 0).toBeGreaterThanOrEqual(accruedBefore);
+	});
+
+	it("keeps the first token a segment sees as a baseline, not as movement", () => {
+		const token = { value: "frame-9" };
+		const h = createHarness({ warnAfterMs: 1000, abortAfterMs: 3000, vouch: movingVouch(token) });
+		h.watchdog.arm();
+
+		// Nothing changes after the birth sample, so nothing may be settled: the birth token has no
+		// predecessor to be compared against and proves only that a frame exists.
+		h.clock.advance(31 * MINUTE_MS);
+		expect(h.stageNames()).toContain("abort");
+		expect(h.watchdog.exemption?.settledByMovementMs).toBeUndefined();
 	});
 });

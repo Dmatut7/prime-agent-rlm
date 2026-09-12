@@ -310,6 +310,70 @@ describe("createTurnLiveness", () => {
 		expect(wedgedFacts.progress).toBe(false);
 	});
 
+	it("identifies movement, so 'moved since I looked' is not confused with 'says it is moving'", () => {
+		// A frame the watchdog can compare two samples of: the token is derived from the cumulative
+		// output counters, so a job that produced more since the last look has a different one and a
+		// wedged job keeps reporting the same claim - and the same token - forever.
+		const frame = (overrides: Partial<KernelLivenessSample> = {}) =>
+			build({
+				kernel: facts({
+					previous: sample({ receivedAt: T0 - 5_000, tick: 10, streamBytes: 100 }),
+					latest: sample({ tick: 40, bashHandles: 1, bashCellHandles: 1, streamBytes: 900, ...overrides }),
+				}),
+			}).liveness.sample();
+
+		const baseline = frame();
+		expect(baseline.progress).toBe(true);
+		expect(baseline.movementToken).toBeDefined();
+		// The identical frame again: nothing moved between the two looks.
+		expect(frame().movementToken).toBe(baseline.movementToken);
+
+		const moved: [string, Partial<KernelLivenessSample>][] = [
+			["more streamed output", { streamBytes: 1_500 }],
+			["more buffered output", { bashBufferedBytes: 32 }],
+			["a pipe backlog appeared", { bashPipePending: 1 }],
+			["a request finished", { cellsDone: 1 }],
+		];
+		expect(moved.length).toBeGreaterThan(0);
+		for (const [name, overrides] of moved) {
+			expect(frame(overrides).movementToken, name).not.toBe(baseline.movementToken);
+		}
+
+		// A tick is liveness, and whether cpu counts as activity is a pending product decision
+		// (`treatKernelCpuProgressAsActivity`), so neither may look like movement.
+		const notMoved: [string, Partial<KernelLivenessSample>][] = [
+			["the loop ticked", { tick: 999 }],
+			["the kernel burned cpu", { cpuMs: 999_999 }],
+			["the frame is newer", { receivedAt: T0 + 5_000 }],
+		];
+		expect(notMoved.length).toBeGreaterThan(0);
+		for (const [name, overrides] of notMoved) {
+			expect(frame(overrides).movementToken, name).toBe(baseline.movementToken);
+		}
+	});
+
+	it("reports no movement token when the heartbeat cannot attest one", () => {
+		// No frame at all: nothing to compare.
+		expect(build({ kernel: facts() }).liveness.sample().movementToken).toBeUndefined();
+
+		// A stale heartbeat with a journaled handle: the degraded path vouches on existence, and
+		// existence must never be able to settle the budget of a segment it is excusing.
+		const { liveness, advance } = build({
+			kernel: facts({
+				latest: sample({ receivedAt: T0, intervalMs: 15_000, bashHandles: 1, streamBytes: 900 }),
+				kernelPid: 4242,
+			}),
+			journal: () => ({ liveBashHandles: 2 }),
+		});
+		advance(46_000);
+		liveness.refreshDegradedFacts();
+		const degraded = liveness.sample();
+		expect(degraded.vouched).toBe(true);
+		expect(degraded.degraded).toBe(true);
+		expect(degraded.progress).toBe(false);
+		expect(degraded.movementToken).toBeUndefined();
+	});
+
 	it("does not vouch when the loop is stalled and nothing else is running", () => {
 		const { liveness } = build({
 			kernel: facts({

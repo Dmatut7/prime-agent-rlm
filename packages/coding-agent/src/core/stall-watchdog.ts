@@ -28,14 +28,25 @@
  * clearing it unconditionally would let a slow-drip wedge (an event every few
  * minutes) run forever.
  *
+ * The budget's dimension is **silent** time, not wall clock: a fact source that
+ * reports fresh movement (its `movementToken` changed since the previous sample)
+ * settles what the segment had accrued, because silence that demonstrably
+ * produced something is not the wedge the cap exists to kill. A healthy
+ * multi-hour build therefore never spends a budget, while a job whose counters
+ * froze spends it on schedule. Reporting movement is not the same as moving: a
+ * frozen counter claims progress forever, so an unchanged token settles nothing,
+ * and neither does a plain `touch()` — an event proves the session spoke, not
+ * that the externally owned work advanced.
+ *
  * A lapse the watchdog notices on its own (a timer fire finding nothing excusing
  * the silence) banks the accrued exempt time instead of dropping it, and a
  * resumed exemption inherits it: evidence that blinks — a fact with a lifetime
  * that expires between two stall stages and is then re-read — cannot renew the
- * cap. Only observed activity releases an *unspent* budget, so a turn that is
- * genuinely producing events never pays for the exemption of an earlier phase;
- * once the cap has been seen spent in an arm cycle nothing un-spends it, because
- * a spent cap that a later event could erase is not a cap.
+ * cap. Only observed activity releases an *unspent* budget at such a lapse, so a
+ * turn that is genuinely producing events never pays for the exemption of an
+ * earlier phase; once the cap has been seen spent in an arm cycle nothing
+ * un-spends it — not an event, and not movement — because a spent cap that a
+ * later sample could erase is not a cap.
  *
  * Timers and the clock are injectable so tests can drive it deterministically
  * without fake global timers.
@@ -96,6 +107,15 @@ export interface StallVouchFacts {
 	reasons?: readonly string[];
 	/** Budget tier; defaults to `"liveness"` (the shorter budget) when omitted. */
 	tier?: StallVouchBudgetTier;
+	/**
+	 * Identity of the movement this sample reports, or absent when the vouch rests on existence
+	 * alone (a live handle, a journaled child, an in-flight host request). Opaque to the watchdog:
+	 * only *change* between two samples of one segment means anything, and a change settles the
+	 * exempt silence accrued since the previous one. A value that stays the same settles nothing
+	 * however often it is reported, which is what keeps a frozen counter from buying an endless
+	 * budget by claiming progress at every sample.
+	 */
+	movementToken?: string;
 	/** Kernel facts snapshot for the diagnostics `kernel` segment. */
 	kernel?: StallKernelFacts;
 }
@@ -112,9 +132,13 @@ export interface StallExemptionSnapshot {
 	reason: StallExemptionReason;
 	/** Sub-reasons behind a vouch; empty for a paused phase. */
 	reasons: readonly string[];
-	/** Epoch ms at which the current continuous exemption segment started. */
+	/**
+	 * Epoch ms the budget counts from: the start of the current continuous exemption segment,
+	 * backdated by any inherited debt and re-based to the newest sample that reported fresh
+	 * movement. It is an accrual anchor, not a claim that the exemption began here.
+	 */
 	since: number;
-	/** Budget consumed by the current segment. */
+	/** Exempt silence charged to the budget by the current segment. */
 	usedMs: number;
 	/** Budget cap for the current reason/tier. */
 	budgetMs: number;
@@ -128,6 +152,12 @@ export interface StallExemptionSnapshot {
 	 * resumed segment that aborts at `silentMs ≈ budget` was not one continuous exemption.
 	 */
 	carriedExemptMs?: number;
+	/**
+	 * Exempt silence this segment released because the fact source reported fresh movement. Absent
+	 * (or 0) when nothing ever moved, which is what makes a kill attributable: a spent budget with
+	 * no settled time was silence the evidence could not explain.
+	 */
+	settledByMovementMs?: number;
 	/** Raw kernel facts as sampled with the exemption (normalized by `collectExemptionDiagnostics`). */
 	kernel?: StallKernelFacts;
 }
@@ -143,6 +173,8 @@ export interface StallExemptionDiagnostics {
 	tier?: StallVouchBudgetTier;
 	/** Inherited exempt time; see {@link StallExemptionSnapshot.carriedExemptMs}. */
 	carriedExemptMs?: number;
+	/** Exempt silence released by fresh movement; see {@link StallExemptionSnapshot.settledByMovementMs}. */
+	settledByMovementMs?: number;
 	/**
 	 * The combined budget was seen spent at some point in this arm cycle. Reported even when no
 	 * segment is live, which is the case that matters most: an abort whose exemption segment was
@@ -265,6 +297,10 @@ interface ExemptionSegment {
 	since: number;
 	/** Exempt time inherited from the previous segment of this arm cycle (0 for a fresh one). */
 	carriedExemptMs: number;
+	/** Exempt silence released by fresh movement while this segment ran. */
+	settledByMovementMs: number;
+	/** Newest movement token this segment saw; undefined when the fact source reports none. */
+	lastMovementToken?: string;
 	reason: StallExemptionReason;
 	reasons: readonly string[];
 	tier?: StallVouchBudgetTier;
@@ -413,6 +449,7 @@ export class StallWatchdog {
 			exhausted: usedMs >= budgetMs,
 			tier: segment.tier,
 			...(segment.carriedExemptMs > 0 ? { carriedExemptMs: segment.carriedExemptMs } : {}),
+			...(segment.settledByMovementMs > 0 ? { settledByMovementMs: segment.settledByMovementMs } : {}),
 			kernel: this.lastKernelFacts,
 		};
 	}
@@ -434,6 +471,7 @@ export class StallWatchdog {
 			exhausted: snapshot.exhausted,
 			...(snapshot.tier ? { tier: snapshot.tier } : {}),
 			...(snapshot.carriedExemptMs ? { carriedExemptMs: snapshot.carriedExemptMs } : {}),
+			...(snapshot.settledByMovementMs ? { settledByMovementMs: snapshot.settledByMovementMs } : {}),
 			...spent,
 			...(kernel ? { kernel } : {}),
 		};
@@ -495,6 +533,10 @@ export class StallWatchdog {
 	 * closes the cap against a predicate that blinks — a fact source whose evidence expires between
 	 * two stall stages and is then re-read would otherwise buy a fresh budget on every blink, and
 	 * the wedge would never be killed.
+	 *
+	 * While the exemption *holds*, the accrual is settled by fresh movement instead
+	 * ({@link settleExemptSilenceOnMovement}): the budget charges unexplained silence, so a job that
+	 * keeps producing is never charged and never reaches the cap.
 	 */
 	private evaluateExemption(now: number, observedActivity: boolean): StallExemptionSnapshot | undefined {
 		const paused = this.options.isPaused?.() === true;
@@ -545,6 +587,10 @@ export class StallWatchdog {
 			this.exemptionSegment = {
 				since: now - carriedExemptMs,
 				carriedExemptMs,
+				settledByMovementMs: 0,
+				// The birth sample is the baseline, not evidence of movement: with nothing to
+				// compare against it cannot say anything moved, so it settles nothing.
+				lastMovementToken: vouchFacts?.movementToken,
 				reason: observed,
 				reasons: observed === "vouched" ? (vouchFacts?.reasons ?? []) : [],
 				tier: vouchFacts?.tier,
@@ -572,6 +618,8 @@ export class StallWatchdog {
 			}
 			if (vouchFacts) segment.tier = vouchFacts.tier;
 			this.commitReasonSwitch(segment, observed, now);
+			// After the switch, so the settle measures the budget this sample's reason and tier buy.
+			this.settleExemptSilenceOnMovement(segment, observed, vouchFacts?.movementToken, now);
 		}
 
 		const snapshot = this.exemption;
@@ -595,6 +643,49 @@ export class StallWatchdog {
 			);
 		}
 		return snapshot;
+	}
+
+	/**
+	 * Charge the budget only for silence the movement evidence does not explain.
+	 *
+	 * A token that changed since this segment's previous sample means the externally owned work
+	 * demonstrably moved in between, so the exempt time accrued since then is released and the
+	 * anchor re-based: the budget measures silent time, not wall clock under vouch, and a healthy
+	 * multi-hour build must not be killed for being long. Everything else keeps accruing —
+	 *
+	 * - an unchanged token, however often it is reported: a frozen counter claims progress at every
+	 *   sample and would otherwise be an immortal budget;
+	 * - no token at all, which is what existence-only evidence (a live handle, a journaled child, an
+	 *   in-flight host request) reports;
+	 * - a plain `touch()`: an event proves the session spoke, not that the work advanced, so a
+	 *   slow-drip wedge still spends the cap and dies.
+	 *
+	 * The token is vouch evidence, so it is tracked on every sample but settles only while the vouch
+	 * is what excuses the silence: movement during a host-owned pause must not settle time a
+	 * different exemption accrued, and tracking it there is what keeps the first vouched sample
+	 * after the pause lifts from reading as fresh movement.
+	 *
+	 * Never releases once the cap has been seen spent in this arm cycle: a spent cap that a later
+	 * movement could erase is not a cap (A1), and a kill that was already owed stays attributable.
+	 */
+	private settleExemptSilenceOnMovement(
+		segment: ExemptionSegment,
+		observed: StallExemptionReason,
+		token: string | undefined,
+		now: number,
+	): void {
+		if (token === undefined) return;
+		const previous = segment.lastMovementToken;
+		segment.lastMovementToken = token;
+		if (previous === undefined || previous === token) return;
+		if (observed !== "vouched") return;
+		if (this.budgetSpentThisCycle) return;
+		const usedMs = Math.max(0, now - segment.since);
+		// Exhausted at this very sample: the latch below has to see it, so the movement that arrived
+		// with the observation is too late to pay for the silence that already ran out.
+		if (usedMs >= this.exemptionBudgetMs(segment.reason, segment.tier)) return;
+		segment.settledByMovementMs += usedMs;
+		segment.since = now;
 	}
 
 	/**

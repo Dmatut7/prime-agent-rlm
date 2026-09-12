@@ -94,6 +94,10 @@ function createHarness(options?: { degradedFactsMaxAgeMs?: number }): LivenessHa
 			active: true,
 			reasons: facts.reasons,
 			tier: facts.progress ? "progress" : "liveness",
+			// Mirrors `_sampleStallVouch`: the watchdog settles accrued exempt silence when this
+			// token changes between two samples, so a harness that drops it would not be testing
+			// the installed predicate.
+			...(facts.movementToken === undefined ? {} : { movementToken: facts.movementToken }),
 			kernel: {
 				...(facts.protocol === undefined ? {} : { protocol: facts.protocol }),
 				...(facts.livenessAgeMs === undefined ? {} : { livenessAgeMs: facts.livenessAgeMs }),
@@ -172,6 +176,115 @@ describe("stall watchdog tool liveness vouch (T1-3)", () => {
 		// B2: the warning was never swallowed by the exemption, and it said the abort was deferred.
 		expect(h.stages[0]?.exemption).toMatchObject({ reason: "vouched", tier: "progress" });
 		expect(h.stages[1]?.exemption?.exhausted).toBe(true);
+	});
+
+	it("never kills a cell that keeps producing, however long it runs (P1: budget = exempt silence)", () => {
+		const h = createHarness();
+		// A two-hour build: the kernel's cumulative counters move on every sample and the host sees a
+		// session event once a minute. Nothing about this turn is a wedge, so the exemption budget -
+		// which bounds *unexplained* silence - must never be charged for it.
+		h.setKernelFacts(() => {
+			const at = h.clock.nowMs;
+			return {
+				protocol: 4,
+				previous: sample({
+					receivedAt: at - 5_000,
+					tick: Math.floor((at - 5_000) / 5_000),
+					streamBytes: Math.floor((at - 5_000) / 10),
+					bashBufferedBytes: Math.floor((at - 5_000) / 25),
+				}),
+				latest: sample({
+					receivedAt: at,
+					tick: Math.floor(at / 5_000),
+					streamBytes: Math.floor(at / 10),
+					bashBufferedBytes: Math.floor(at / 25),
+					bashHandles: 1,
+					bashCellHandles: 1,
+					cpuMs: 1_000 + at,
+				}),
+				hostRequestCount: 0,
+				kernelPid: 4242,
+				hasActiveExecution: true,
+			};
+		});
+		h.watchdog.arm();
+		h.watchdog.touch();
+
+		h.clock.advanceInSteps(120 * MINUTE_MS, MINUTE_MS, () => h.watchdog.touch());
+
+		// Activity every minute keeps the base watchdog quiet and the vouch stays claimed the whole
+		// way, so a stage here can only have come from the budget being spent.
+		expect(h.watchdog.exemption).toMatchObject({ reason: "vouched", tier: "progress" });
+		expect(h.watchdog.exemptionBudgetSpent).toBe(false);
+		expect(h.stageNames()).toEqual([]);
+	});
+
+	it("never kills a silent cell whose counters keep moving either (no host events to rebase)", () => {
+		const h = createHarness();
+		// The same build, but the host sees nothing at all: the only evidence is the kernel's own
+		// movement, which is exactly the case the vouch exists for.
+		h.setKernelFacts(() => {
+			const at = h.clock.nowMs;
+			return {
+				protocol: 4,
+				previous: sample({ receivedAt: at - 5_000, tick: 10, streamBytes: Math.floor((at - 5_000) / 10) }),
+				latest: sample({
+					receivedAt: at,
+					tick: 40,
+					streamBytes: Math.floor(at / 10),
+					bashHandles: 1,
+					bashCellHandles: 1,
+				}),
+				hostRequestCount: 0,
+				kernelPid: 4242,
+				hasActiveExecution: true,
+			};
+		});
+		h.watchdog.arm();
+		h.watchdog.touch();
+
+		h.clock.advance(120 * MINUTE_MS);
+
+		// B2 still holds: the warning is never swallowed by an exemption. The abort is.
+		expect(h.stageNames()).toEqual(["warn"]);
+		expect(h.watchdog.exemptionBudgetSpent).toBe(false);
+	});
+
+	it("still spends the budget when the counters stop moving, events or not (P1 negative control)", () => {
+		const h = createHarness();
+		// The build above, wedged: frames keep arriving and the handle stays live, but nothing moves.
+		// This is the shape the cap exists for, and it must still die inside it.
+		h.setKernelFacts(() => {
+			const at = h.clock.nowMs;
+			return {
+				protocol: 4,
+				previous: sample({
+					receivedAt: at - 5_000,
+					tick: 40,
+					streamBytes: 4_000,
+					bashPipePending: 1,
+					bashHandles: 1,
+				}),
+				latest: sample({ receivedAt: at, tick: 40, streamBytes: 4_000, bashPipePending: 1, bashHandles: 1 }),
+				hostRequestCount: 0,
+				kernelPid: 4242,
+				hasActiveExecution: true,
+			};
+		});
+		h.watchdog.arm();
+		h.watchdog.touch();
+
+		// A backlog on the capture pipe is a level, so the tier stays "progress" and the full cap
+		// applies; a level that never changes is not movement, so the budget still runs out.
+		h.clock.advanceInSteps(45 * MINUTE_MS, MINUTE_MS, () => h.watchdog.touch());
+		expect(h.stageNames()).not.toContain("abort");
+		h.clock.advanceInSteps(30 * MINUTE_MS, MINUTE_MS, () => h.watchdog.touch());
+		expect(h.stageNames()).toContain("abort");
+		expect(h.stages.find((stage) => stage.stage === "abort")?.exemption).toMatchObject({
+			reason: "vouched",
+			tier: "progress",
+			exhausted: true,
+		});
 	});
 
 	it("gives a live handle with no movement the short budget only (M3)", () => {

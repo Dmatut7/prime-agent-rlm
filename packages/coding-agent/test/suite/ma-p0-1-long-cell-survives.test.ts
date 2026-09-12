@@ -154,6 +154,61 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 		expect(harness.eventsOfType("stall_warning").length).toBeGreaterThan(0);
 	});
 
+	it("hands the kernel's movement to the watchdog, so a producing cell is never charged for it", async () => {
+		// The wiring half of P1: the session's own predicate must forward the movement identity the
+		// fact aggregate reports, because that - not the tier - is what tells the watchdog the exempt
+		// silence it is charging was explained. A cell that keeps producing new streamed output on
+		// every sample therefore stays uncharged for as long as it produces.
+		let frames = 0;
+		const harness = track(
+			await createHarness({
+				tools: [hangTool],
+				settings: {
+					stallWatchdog: { enabled: true, warnAfterSeconds: 0.05, abortAfterSeconds: 0.1 },
+					retry: { enabled: false },
+				},
+				stallKernelLivenessFacts: () => {
+					frames += 1;
+					return {
+						protocol: 4,
+						previous: sample({ receivedAt: Date.now() - 5_000, tick: frames, streamBytes: frames * 100 }),
+						latest: sample({
+							receivedAt: Date.now(),
+							tick: frames + 1,
+							streamBytes: (frames + 1) * 100,
+							bashHandles: 1,
+							bashCellHandles: 1,
+						}),
+						rejectedFrames: 0,
+						consecutiveRejectedFrames: 0,
+						hostRequestCount: 0,
+						kernelPid: 4242,
+						hasActiveExecution: true,
+					};
+				},
+			}),
+		);
+		await startHungTurn(harness);
+
+		const warning = await waitForEvent(harness, (event) => event.type === "stall_warning");
+		if (warning.type !== "stall_warning") throw new Error("unreachable");
+		expect(warning.message).toContain("deferred");
+		expect(warning.diagnostics.exemption).toMatchObject({ reason: "vouched", tier: "progress" });
+		// The segment was born at the tool's start event, so by the time the warning fires the
+		// watchdog has sampled the moving counters again and settled what the silence had accrued.
+		// This is the assertion that pins the session's own predicate forwarding the token: without
+		// it the movement is invisible here and nothing is ever settled.
+		expect(warning.diagnostics.exemption?.settledByMovementMs).toBeGreaterThan(0);
+
+		// Twenty warn windows of a cell that never stops producing: the exemption is still claimed and
+		// still unspent, so nothing escalates. (The cap itself has a 30min floor, which is why the
+		// settled-vs-spent arithmetic is pinned by the fake-clock tests rather than here.)
+		await new Promise((resolve) => setTimeout(resolve, 1_000));
+		expect(harness.eventsOfType("stall_abort")).toEqual([]);
+		expect(harness.eventsOfType("stall_unsettled")).toEqual([]);
+		expect(frames).toBeGreaterThan(1);
+	});
+
 	it("still aborts a wedged kernel at the ordinary threshold", async () => {
 		const harness = track(
 			await createHarness({

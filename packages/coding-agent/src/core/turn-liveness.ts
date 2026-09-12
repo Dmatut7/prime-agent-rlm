@@ -189,6 +189,16 @@ export interface KernelLivenessVerdict {
 	progress: boolean;
 	/** Bash-side movement only, which is what a live-handle vouch may upgrade its tier with. */
 	bashProgress: boolean;
+	/**
+	 * Identity of the movement the newest frame reports, derived from the kernel's cumulative
+	 * counters. Two samples carrying the same token saw nothing move between them, however firmly
+	 * each of them claims `progress`: a frozen counter reports the same claim forever, so a caller
+	 * that must tell "moved since I last looked" from "says it is moving" needs the token, not the
+	 * boolean. Absent when there is no frame. Deliberately excludes `tick` (a tick is liveness, not
+	 * progress) and `cpuMs` (whether CPU counts as activity is a pending product decision - see
+	 * `treatKernelCpuProgressAsActivity`).
+	 */
+	movementToken?: string;
 }
 
 export interface TurnLivenessFacts {
@@ -198,6 +208,13 @@ export interface TurnLivenessFacts {
 	reasons: string[];
 	/** True when the vouch is backed by movement rather than by existence alone. */
 	progress: boolean;
+	/**
+	 * Identity of the movement the newest *usable* frame reports; absent when there is no frame or
+	 * the heartbeat is unusable. A caller that has to tell "moved since I last looked" apart from
+	 * "says it is moving" compares two of these. The degraded journal path never carries one: it
+	 * proves existence, and existence must not buy movement.
+	 */
+	movementToken?: string;
 	/** Kernel-side reasons, populated whether or not the verdict vouches. */
 	kernelReasons: string[];
 	/** Heartbeat verdict behind the kernel part of this sample. */
@@ -254,6 +271,9 @@ export function kernelVouchedAlive(
 			bashProgress: false,
 		};
 	}
+	// Level and counter facts about output only: this is what "the job moved" is made of. A counter
+	// reset (a replacement kernel) changes it too, which is correct - that is not the same job.
+	const movementToken = `${latest.streamBytes}|${latest.bashBufferedBytes}|${latest.bashPipePending}|${latest.cellsDone}`;
 	const staleAfterIntervals = options.staleAfterIntervals ?? DEFAULT_STALE_AFTER_INTERVALS;
 	const intervalMs = latest.intervalMs > 0 ? latest.intervalMs : FALLBACK_HEARTBEAT_INTERVAL_MS;
 	const ageMs = Math.max(0, now - latest.receivedAt);
@@ -274,6 +294,7 @@ export function kernelVouchedAlive(
 		cellAwaiting: latest.cellId !== undefined,
 		progress: bashProgress || cellsDelta > 0,
 		bashProgress,
+		movementToken,
 	};
 }
 
@@ -427,7 +448,10 @@ export function createTurnLiveness(options: TurnLivenessOptions): TurnLiveness {
 
 		let liveBashHandles: number | undefined;
 		let degradedUsed = false;
+		// Only a usable heartbeat can attest movement; the degraded path below is existence alone.
+		let movementToken: string | undefined;
 		if (verdict.state === "fresh") {
+			movementToken = verdict.movementToken;
 			liveBashHandles = kernel?.latest?.bashHandles;
 			if ((liveBashHandles ?? 0) > 0) {
 				reasons.push(STALL_VOUCH_REASONS.liveBashHandles);
@@ -484,6 +508,7 @@ export function createTurnLiveness(options: TurnLivenessOptions): TurnLiveness {
 			kernelReasons,
 			state: verdict.state,
 			degraded: degradedUsed,
+			...(movementToken === undefined ? {} : { movementToken }),
 			...(kernel?.protocol === undefined ? {} : { protocol: kernel.protocol }),
 			...(verdict.ageMs === undefined ? {} : { livenessAgeMs: verdict.ageMs }),
 			...(liveBashHandles === undefined ? {} : { liveBashHandles }),
