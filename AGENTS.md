@@ -8,6 +8,7 @@
 - **build 后必须重启才生效：** `prime-agent shutdown`（停旧 daemon + 所有 worker）→ 重开 `prime-agent`；旧会话用 `prime-agent --resume` 或 `prime-agent attach <agent>` 恢复。daemon 不重启就还是旧 bundle。
 - **`install.sh` / `curl … install.sh | sh` 装的是官方发布版，不含本 fork 改动**——要本 fork 最新版只能 build 或 `prime-agent.sh`，别用官方安装器。
 - 其余继承规则（git 并行安全、changelog fragment、代码质量、daemon 协议、依赖 7 天龄、禁 inline import 等）在本 fork 仍适用。
+- **每次 `git push` 前必须更新 FORK_NOTES.md**：在最新一节（或新开日期节）用一两句话写清这批提交改了什么、用户能感觉到什么。推送没带文档更新的，视为交付不完整。
 
 ## Conversational Style
 
