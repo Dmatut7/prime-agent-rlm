@@ -7317,6 +7317,14 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Busy inputs: compaction, retry, bash, plus (for "pump") disposal,
+	 * suspension, queued-work pauses, and branch-summary mutation. Waiters
+	 * parked on this predicate rely on every clear site notifying the
+	 * session-input checkpoint waiters; the idle waiter therefore parks on
+	 * every source except disposal, whose clear site runs only at the end of
+	 * a teardown that can itself block.
+	 */
 	private _isBusyForSessionInput(point: "preflight" | "pump"): boolean {
 		const externalBusy = this.isCompacting || this.isRetrying || this.isBashRunning;
 		if (point === "pump") {
@@ -8356,7 +8364,15 @@ export class AgentSession {
 	private async _waitForIdleOrSettlement(settlement?: PostCompactionContinuationSettlement): Promise<void> {
 		while (settlement === undefined || this._postCompactionContinuationSettlement === settlement) {
 			if (this._actionStore.queuedActions().length > 0) {
-				if (this._sessionInputPumpSuspended || this._queuedWorkPauses.size > 0) {
+				// Park while the pump would refuse scheduling or selection: rescheduling
+				// a blocked pump completes on already-resolved promises, so looping here
+				// would spin on the microtask queue and starve the IO that ends the busy state.
+				// Disposal stays out of the park: disposeAsync() sets _disposing before the
+				// teardown that cancels the queue, and that teardown can block on a wedged
+				// kernel, so parking here would pin a checkpoint waiter (and
+				// hasPendingAdmissionWaiters) for the whole teardown. The fall-through below
+				// resolves once dispose() cancels the queue.
+				if (this._isBusyForSessionInput("pump") && !this._disposed && !this._disposing) {
 					let wake = () => {};
 					const changed = new Promise<void>((resolve) => {
 						wake = resolve;

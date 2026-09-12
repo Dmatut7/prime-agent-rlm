@@ -29,6 +29,7 @@ import {
 	saveHarnessState,
 } from "../../src/core/refinement/index.js";
 import { parseSessionSlashCommand } from "../../src/core/slash-commands.js";
+import type { BashOperations } from "../../src/core/tools/bash.js";
 import { createHarness, getAssistantTexts, getMessageText, getUserTexts, type Harness } from "./harness.js";
 import { createDeferred, createWaitingHarness, gatedHook, withStreaming } from "./scheduling.js";
 
@@ -3662,5 +3663,76 @@ describe("AgentSession scheduler scenarios", () => {
 				process.env.PRIME_AGENT_CODING_AGENT_DIR = previousAgentDir;
 			}
 		}
+	});
+
+	it("waitForIdle yields to the event loop while a running bash blocks queued input", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const session = harness.session;
+		let releaseBash!: () => void;
+		const gate = new Promise<{ exitCode: number | null }>((resolve) => {
+			releaseBash = () => resolve({ exitCode: 0 });
+		});
+		const operations: BashOperations = { exec: async () => await gate };
+		const bashPromise = session.executeBash("blocked", undefined, { operations });
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(session.isBashRunning).toBe(true);
+
+		harness.setResponses([fauxAssistantMessage("first done"), fauxAssistantMessage("second done")]);
+		const firstPrompt = session.prompt("queued while bash runs");
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		// Unfixed, the wait loop rescheduled the blocked pump on already-resolved
+		// promises, so the event loop never reached the check phase and this
+		// setImmediate starved (the test failed as a timeout, not an assertion).
+		const idle = session.waitForIdle();
+		const yielded = await Promise.race([
+			new Promise<boolean>((resolve) => setImmediate(() => resolve(true))),
+			new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 2000)),
+		]);
+		expect(yielded).toBe(true);
+
+		// An arrival during the park must not be lost once the busy state clears.
+		const secondPrompt = session.prompt("queued during park");
+		secondPrompt.catch(() => undefined);
+		releaseBash();
+		await idle;
+		await bashPromise;
+		await firstPrompt;
+		await secondPrompt;
+
+		expect(getAssistantTexts(harness)).toEqual(["first done", "second done"]);
+	});
+
+	it("waitForIdle releases its park when the session is disposed behind a running bash", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const session = harness.session;
+		let releaseBash!: () => void;
+		const gate = new Promise<{ exitCode: number | null }>((resolve) => {
+			releaseBash = () => resolve({ exitCode: 0 });
+		});
+		const operations: BashOperations = { exec: async () => await gate };
+		const bashPromise = session.executeBash("blocked", undefined, { operations });
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		harness.setResponses([fauxAssistantMessage("never delivered")]);
+		const queued = session.prompt("queued while bash runs");
+		queued.catch(() => undefined);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		const idle = session.waitForIdle();
+		await new Promise((resolve) => setImmediate(resolve));
+		session.dispose();
+		releaseBash();
+
+		const settled = await Promise.race([
+			idle.then(() => "idle"),
+			new Promise<"parked">((resolve) => setTimeout(() => resolve("parked"), 2000)),
+		]);
+		expect(settled).toBe("idle");
+		// A waiter left registered here keeps hasPendingAdmissionWaiters true and
+		// blocks daemon passivation for the rest of the worker's life.
+		expect(session.hasPendingAdmissionWaiters).toBe(false);
+		await bashPromise.catch(() => undefined);
 	});
 });
