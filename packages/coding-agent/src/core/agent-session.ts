@@ -66,9 +66,11 @@ import {
 	formatSubagentTerminalErrorNotice,
 	isAgentSessionMessage,
 	isAgentSessionMessagePrompt,
+	isChildReplyToThisSession,
 	isRetryableAgentMessageSendError,
 	normalizeAgentSessionMessage,
 	parseAgentSessionMessagePromptId,
+	QueuedParentReplyBackfills,
 	startsAgentRun,
 } from "./agent-messages.js";
 import {
@@ -1408,6 +1410,11 @@ export class AgentSession {
 	private _retryAuthFailureSources: AuthSourceToken[] = [];
 	private _agentMessageClearEpoch = 0;
 	private _agentMessageOutcomes = new Map<string, AgentMessageOutcome>();
+	/**
+	 * Child replies this session queued but has not delivered yet. Delivery credits
+	 * the sender's reply count, which a `queued` receipt deliberately did not (B1).
+	 */
+	private readonly _queuedChildReplyBackfills = new QueuedParentReplyBackfills();
 	private _lateIpythonSentAgentMessages = new Map<string, KernelSentAgentMessage[]>();
 	/** Outcome disclosures whose session-file append failed; retained for context rebuilds. */
 	private readonly _unpersistedOutcomes: CustomMessage[] = [];
@@ -3885,6 +3892,82 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Take custody of a child reply this session could not deliver now.
+	 *
+	 * The sender saw a `queued` receipt and - correctly (B1) - did not count it as a
+	 * reply, and nothing outside this session sees the moment the queue drains. So
+	 * the pairing is recorded here and consumed by `_creditQueuedChildReplyDelivery`.
+	 * A reply that is dropped instead of delivered is never taken, which keeps the
+	 * B1 answer: an undelivered reply does not count.
+	 */
+	private _registerQueuedChildReply(message: AgentSessionMessage | undefined): void {
+		if (!message) return;
+		const senderSessionId = message.details.from?.sessionId;
+		if (!isChildReplyToThisSession({ fromRelationship: message.details.fromRelationship, senderSessionId })) {
+			return;
+		}
+		if (senderSessionId === undefined) return;
+		this._queuedChildReplyBackfills.register(message.details.id, senderSessionId);
+		// Countable: this is the line saying a reply credit is owed at delivery.
+		sessionLog.info("queued child reply awaiting delivery credit", {
+			sessionId: this.sessionId,
+			messageId: message.details.id,
+			senderSessionId,
+		});
+	}
+
+	/**
+	 * A queued child reply just landed in this session's context: credit its sender
+	 * exactly once. Without this the reply never counts at all, and a child that
+	 * answered a busy parent settles as `completed_without_reply` - a false alarm
+	 * about a reply the parent has already read.
+	 */
+	private _creditQueuedChildReplyDelivery(message: AgentMessage): void {
+		if (!isAgentSessionMessage(message)) return;
+		const senderSessionId = this._queuedChildReplyBackfills.take(message.details.id);
+		if (senderSessionId === undefined) return;
+		const child = this._rlmChildSessionBySessionId(senderSessionId);
+		if (!child) {
+			// The credit has nowhere to land: the sender is gone (a deleted child, or
+			// a restart that re-flowed the queue with an empty ledger). Logging beats
+			// guessing, since a wrong session credited is a wrong terminal verdict.
+			sessionLog.warn("queued child reply delivered after its sender session was gone", {
+				sessionId: this.sessionId,
+				messageId: message.details.id,
+				senderSessionId,
+			});
+			return;
+		}
+		child._creditDeliveredQueuedParentReply(message.details.id);
+	}
+
+	/** The running or retained child session with this transcript id, if this session owns one. */
+	private _rlmChildSessionBySessionId(sessionId: string): AgentSession | undefined {
+		for (const run of this._activeRlmChildRuns.values()) {
+			if (run.session?.sessionId === sessionId) return run.session;
+		}
+		for (const { session } of this._rlmChildSessions.values()) {
+			if (session.sessionId === sessionId) return session;
+		}
+		return undefined;
+	}
+
+	/**
+	 * Count a reply this session sent earlier whose delivery only just happened: the
+	 * receiving parent's queue held it, so the send receipt said `queued` and the
+	 * count stayed put (B1). Called by that parent, once per message id.
+	 */
+	private _creditDeliveredQueuedParentReply(messageId: string): void {
+		this._repliedToParentSinceTask = true;
+		this._parentReplyCount += 1;
+		sessionLog.info("queued parent reply delivered; reply credit backfilled", {
+			sessionId: this.sessionId,
+			messageId,
+			parentReplyCount: this._parentReplyCount,
+		});
+	}
+
 	private _capturingCancelledAction(message: AgentMessage): QueuedSessionAction | undefined {
 		return this._actionStore
 			.ownedActions()
@@ -3946,6 +4029,7 @@ export class AgentSession {
 				if (record?.role === "primary") {
 					this._actionStore.ticketFor(action).settleDelivered({ status: "delivered" });
 					this._settleAgentMessage(action.agentMessageId, "delivery");
+					this._creditQueuedChildReplyDelivery(event.message);
 				}
 			}
 		} else if (event.type === "message_end" && (event.message.role === "user" || event.message.role === "custom")) {
@@ -5023,6 +5107,9 @@ export class AgentSession {
 			const deliveryError = new Error("Session disposed before prompt delivery.");
 			const completionError = new Error("Session disposed before prompt completion.");
 			this._rejectQueuedAgentMessageDeliveries(deliveryError, completionError);
+			// Undelivered replies stop being owed a credit; the persisted queue above is
+			// what survives, and a re-flowed message starts with an empty ledger.
+			this._queuedChildReplyBackfills.clear();
 			for (const [agentMessageId, outcome] of this._agentMessageOutcomes) {
 				if (outcome.delivery) this._settleAgentMessage(agentMessageId, "delivery", deliveryError);
 				if (outcome.completion) this._settleAgentMessage(agentMessageId, "completion", completionError);
@@ -5497,6 +5584,14 @@ export class AgentSession {
 			options.preflightResult?.(queued, queued, "target_suspended");
 			return;
 		}
+		// A queued admission puts this session in custody of a child's reply: the
+		// sender's receipt says `queued`, so the sender does not count it (B1), and
+		// the credit is owed when the queue drains instead.
+		const preflightResult = options?.preflightResult;
+		const reportPreflight = (success: boolean, queued?: boolean, queuedReason?: AgentMessageQueuedReason): void => {
+			if (success && queued === true) this._registerQueuedChildReply(customMessage);
+			preflightResult?.(success, queued, queuedReason);
+		};
 		await this._prompt(text, {
 			...options,
 			resumeIfIdle: false,
@@ -5507,6 +5602,7 @@ export class AgentSession {
 			agentMessageId: options?.agentMessageId ?? customMessage?.details.id ?? parseAgentSessionMessagePromptId(text),
 			customMessage,
 			admissionCommitted,
+			preflightResult: reportPreflight,
 		});
 		if (customMessage?.details.fromRelationship === "parent") this._repliedToParentSinceTask = false;
 	}
@@ -5543,6 +5639,7 @@ export class AgentSession {
 				message: customMessage,
 			});
 			resumeSuspendedPump();
+			this._registerQueuedChildReply(customMessage);
 			if (customMessage?.details.fromRelationship === "parent") this._repliedToParentSinceTask = false;
 			return true;
 		}
@@ -5551,6 +5648,7 @@ export class AgentSession {
 			message: customMessage,
 		});
 		if (queued) resumeSuspendedPump();
+		if (queued) this._registerQueuedChildReply(customMessage);
 		if (queued && customMessage?.details.fromRelationship === "parent") this._repliedToParentSinceTask = false;
 		return queued;
 	}
@@ -7798,6 +7896,9 @@ export class AgentSession {
 			const error =
 				action.payload.kind === "turn" && action.payload.acceptedAgentMessage ? acceptedError : queuedError;
 			this._rejectAgentMessage(action.agentMessageId, error);
+			// A cleared reply is never delivered, so the credit owed for it dies here:
+			// B1 keeps an undelivered reply from counting.
+			if (action.agentMessageId !== undefined) this._queuedChildReplyBackfills.take(action.agentMessageId);
 		}
 		for (const [accepted, error] of [
 			[true, acceptedError],
@@ -13157,6 +13258,18 @@ export class AgentSession {
 				};
 				throwIfCancelled();
 				parentReplyCountBeforeRun = child._parentReplyCount;
+				// The baseline and the credits owed have to describe the same run: a
+				// reply this child left in my queue during an earlier run belongs to
+				// that run's verdict (already delivered), so it must not credit this one.
+				const staleReplyCredits = this._queuedChildReplyBackfills.discardForSender(child.sessionId);
+				if (staleReplyCredits > 0) {
+					sessionLog.info("dropped queued reply credits left over from an earlier run", {
+						sessionId: this.sessionId,
+						childId: run.id,
+						childSessionId: child.sessionId,
+						dropped: staleReplyCredits,
+					});
+				}
 				await child.promptAndWait(content, {
 					expandPromptTemplates: false,
 					source: "extension",

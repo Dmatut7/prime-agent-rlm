@@ -21,7 +21,10 @@ import {
 	createAgentSessionMessageReceipt,
 	formatAgentMessageQueuedNotice,
 	formatAgentMessageRetryExhaustedError,
+	isChildReplyToThisSession,
 	isRetryableAgentMessageSendError,
+	QUEUED_PARENT_REPLY_BACKFILL_LIMIT,
+	QueuedParentReplyBackfills,
 	SUBAGENT_TERMINAL_ERROR_NOTICE_PREFIX,
 } from "../src/core/agent-messages.js";
 import { SessionInputSuspendedError } from "../src/core/prompt-admission.js";
@@ -218,5 +221,87 @@ describe("P0-3a subagent terminal-error notice delivery accounting", () => {
 	it("marks a delivered terminal-error notice as replied", async () => {
 		const harness = await runChildWithReceipt("delivered");
 		expect(harness.session.repliedToParentSinceTask).toBe(true);
+	});
+});
+
+describe("queued child reply delivery credit", () => {
+	it("recognizes only a child's reply that names its sender session", () => {
+		const cases = [
+			{ input: { fromRelationship: "child" as const, senderSessionId: "child-session" }, expected: true },
+			{ input: { fromRelationship: "parent" as const, senderSessionId: "parent-session" }, expected: false },
+			{ input: { fromRelationship: "sibling" as const, senderSessionId: "sibling-session" }, expected: false },
+			{ input: { fromRelationship: undefined, senderSessionId: "unknown-session" }, expected: false },
+			{ input: { fromRelationship: "child" as const, senderSessionId: undefined }, expected: false },
+			{ input: { fromRelationship: "child" as const, senderSessionId: "   " }, expected: false },
+		];
+		expect(cases.length).toBeGreaterThan(0);
+		for (const testCase of cases) {
+			expect(isChildReplyToThisSession(testCase.input), JSON.stringify(testCase.input)).toBe(testCase.expected);
+		}
+	});
+
+	it("hands a queued reply's sender out exactly once", () => {
+		const backfills = new QueuedParentReplyBackfills();
+		expect(backfills.size).toBe(0);
+		backfills.register("agentmsg_reply", "child-session");
+		expect(backfills.size).toBe(1);
+		// The credit is one event: a second delivery report for the same id, or a
+		// direct delivery that was never queued, must not count the reply again.
+		expect(backfills.take("agentmsg_reply")).toBe("child-session");
+		expect(backfills.size).toBe(0);
+		expect(backfills.take("agentmsg_reply")).toBeUndefined();
+		expect(backfills.take("agentmsg_never_queued")).toBeUndefined();
+	});
+
+	it("keeps two queued replies from two children apart", () => {
+		const backfills = new QueuedParentReplyBackfills();
+		backfills.register("agentmsg_first", "child-a");
+		backfills.register("agentmsg_second", "child-b");
+		expect(backfills.size).toBe(2);
+		expect(backfills.take("agentmsg_second")).toBe("child-b");
+		expect(backfills.take("agentmsg_first")).toBe("child-a");
+		expect(backfills.size).toBe(0);
+	});
+
+	it("refreshes an id registered twice instead of duplicating it", () => {
+		const backfills = new QueuedParentReplyBackfills();
+		backfills.register("agentmsg_reply", "child-a");
+		backfills.register("agentmsg_reply", "child-b");
+		expect(backfills.size).toBe(1);
+		expect(backfills.take("agentmsg_reply")).toBe("child-b");
+	});
+
+	it("evicts the oldest pending credit at the limit", () => {
+		const backfills = new QueuedParentReplyBackfills(2);
+		backfills.register("agentmsg_1", "child-1");
+		backfills.register("agentmsg_2", "child-2");
+		backfills.register("agentmsg_3", "child-3");
+		expect(backfills.size).toBe(2);
+		expect(backfills.take("agentmsg_1"), "the evicted id must not credit anyone").toBeUndefined();
+		expect(backfills.take("agentmsg_2")).toBe("child-2");
+		expect(backfills.take("agentmsg_3")).toBe("child-3");
+		expect(QUEUED_PARENT_REPLY_BACKFILL_LIMIT).toBeGreaterThan(2);
+	});
+
+	it("drops only one sender's credits at a run boundary", () => {
+		const backfills = new QueuedParentReplyBackfills();
+		backfills.register("agentmsg_old_run", "child-a");
+		backfills.register("agentmsg_second_old", "child-a");
+		backfills.register("agentmsg_other_child", "child-b");
+		// A stale credit is one the previous run's verdict already answered: it must
+		// not be able to make the next run look replied.
+		expect(backfills.discardForSender("child-a")).toBe(2);
+		expect(backfills.size).toBe(1);
+		expect(backfills.take("agentmsg_old_run")).toBeUndefined();
+		expect(backfills.take("agentmsg_other_child")).toBe("child-b");
+		expect(backfills.discardForSender("child-unknown")).toBe(0);
+	});
+
+	it("drops every pending credit on clear", () => {
+		const backfills = new QueuedParentReplyBackfills();
+		backfills.register("agentmsg_reply", "child-session");
+		backfills.clear();
+		expect(backfills.size).toBe(0);
+		expect(backfills.take("agentmsg_reply")).toBeUndefined();
 	});
 });

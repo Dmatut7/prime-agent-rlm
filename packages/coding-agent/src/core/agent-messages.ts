@@ -457,6 +457,100 @@ export function countsAsDeliveredParentReply(input: {
 	return input.rlmDepth > 0 && input.deliveryStatus === "delivered" && input.addressedParent;
 }
 
+/**
+ * Whether an inbound agent message is a subagent's reply to *this* session, i.e. a
+ * message whose delivery has to be credited back to its sender.
+ *
+ * This is the receiving half of {@link countsAsDeliveredParentReply}. A `queued`
+ * receipt leaves the sender unable to count its own reply - correctly, because the
+ * queue may never drain - and the receiving session is the only one that sees the
+ * moment it does. Without the credit the reply never counts at all, and a child
+ * that answered a busy parent is reported as "completed without sending a reply".
+ *
+ * The sender's session id is required: it is the key the credit is delivered on,
+ * and a message that cannot name its sender cannot be credited to anyone.
+ */
+export function isChildReplyToThisSession(input: {
+	fromRelationship: AgentFamilyRelationship | undefined;
+	senderSessionId: string | undefined;
+}): boolean {
+	return (
+		input.fromRelationship === "child" &&
+		typeof input.senderSessionId === "string" &&
+		input.senderSessionId.trim().length > 0
+	);
+}
+
+/**
+ * Cap for {@link QueuedParentReplyBackfills}. Far above the per-session pending
+ * message limit, so eviction is a leak guard and not a normal path.
+ */
+export const QUEUED_PARENT_REPLY_BACKFILL_LIMIT = 64;
+
+/**
+ * Child replies this session accepted into its queue but has not delivered yet,
+ * keyed by message id with the sender's session id as the value.
+ *
+ * Registering on the queued admission and taking on delivery is what keeps the
+ * credit exactly once: a synchronously delivered reply is counted by its sender
+ * and is never registered here, and `take` hands an id out only once. A queued
+ * reply that is dropped instead of delivered is simply never taken, which is the
+ * B1 answer - an undelivered reply does not count.
+ */
+export class QueuedParentReplyBackfills {
+	private readonly senderSessionIds = new Map<string, string>();
+
+	constructor(private readonly limit: number = QUEUED_PARENT_REPLY_BACKFILL_LIMIT) {}
+
+	/** Record a queued child reply. Re-registering an id refreshes it. */
+	register(messageId: string, senderSessionId: string): void {
+		this.senderSessionIds.delete(messageId);
+		this.senderSessionIds.set(messageId, senderSessionId);
+		const limit = Math.max(1, this.limit);
+		while (this.senderSessionIds.size > limit) {
+			const oldest = this.senderSessionIds.keys().next().value;
+			if (oldest === undefined) break;
+			this.senderSessionIds.delete(oldest);
+		}
+	}
+
+	/**
+	 * Drop every credit still owed to one sender, returning how many were dropped.
+	 *
+	 * Used at a run boundary: a reply the previous run left in the queue belongs to
+	 * that run's verdict, which has already been delivered, so letting it land on the
+	 * new run's baseline would report a silent child as one that replied.
+	 */
+	discardForSender(senderSessionId: string): number {
+		let dropped = 0;
+		for (const [messageId, sender] of this.senderSessionIds) {
+			if (sender !== senderSessionId) continue;
+			this.senderSessionIds.delete(messageId);
+			dropped += 1;
+		}
+		return dropped;
+	}
+
+	/**
+	 * The sender of a queued reply that has now been delivered, or undefined for an
+	 * id this session never queued (a direct delivery) or already credited.
+	 */
+	take(messageId: string): string | undefined {
+		const senderSessionId = this.senderSessionIds.get(messageId);
+		if (senderSessionId === undefined) return undefined;
+		this.senderSessionIds.delete(messageId);
+		return senderSessionId;
+	}
+
+	get size(): number {
+		return this.senderSessionIds.size;
+	}
+
+	clear(): void {
+		this.senderSessionIds.clear();
+	}
+}
+
 export function assertAgentMessageQueueCapacity(
 	unfinishedActionCount: number,
 	maxPending = DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
