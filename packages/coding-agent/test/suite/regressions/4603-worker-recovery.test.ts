@@ -2,12 +2,12 @@ import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import {
 	chmodSync,
 	existsSync,
-	linkSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
 	renameSync,
 	rmSync,
+	statSync,
 	writeFileSync,
 } from "node:fs";
 import { createConnection, type Socket } from "node:net";
@@ -126,7 +126,11 @@ async function createPaths(): Promise<TestPaths> {
 	const harness = await createHarness();
 	harnesses.push(harness);
 	const executablePath = join(harness.tempDir, APP_NAME);
-	linkSync(process.execPath, executablePath);
+	// Never hard-link the signed runner binary: on macOS a link(2) on signed node
+	// permanently invalidates the inode's code signature (AMFI), and every later
+	// exec of that inode is SIGKILLed machine-wide. Spawn through a wrapper.
+	writeFileSync(executablePath, `#!/bin/sh\nexec "${process.execPath}" "$@"\n`, { mode: 0o700 });
+	chmodSync(executablePath, 0o700);
 	const socketTmpDir = `/tmp/eng-4603-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	mkdirSync(socketTmpDir, { recursive: true, mode: 0o700 });
 	socketTempDirs.add(socketTmpDir);
@@ -234,6 +238,12 @@ function registerFixtureProcess(
 	role: FixtureProcessIdentity["role"],
 ): FixtureProcessIdentity | undefined {
 	if (pid === undefined) return undefined;
+	if (pid === process.pid) {
+		// Leaked in-process ownership records name this runner; cleanup must never
+		// stop the test process itself.
+		console.warn(`[eng-4603] ignoring fixture registration for the test runner itself (pid ${pid}, role ${role})`);
+		return undefined;
+	}
 	if (!Number.isSafeInteger(pid) || pid <= 0) {
 		throw new Error(`Invalid fixture process pid: ${String(pid)}`);
 	}
@@ -277,7 +287,11 @@ function registerFixtureOwnedProcesses(): void {
 	}
 }
 
-function registerFixtureRecord(value: unknown, role: "supervisor" | "worker", path: string): FixtureProcessIdentity {
+function registerFixtureRecord(
+	value: unknown,
+	role: "supervisor" | "worker",
+	path: string,
+): FixtureProcessIdentity | undefined {
 	if (!value || typeof value !== "object") {
 		throw new Error(`Invalid fixture process record: ${path}`);
 	}
@@ -291,7 +305,7 @@ function registerFixtureRecord(value: unknown, role: "supervisor" | "worker", pa
 	) {
 		throw new Error(`Invalid fixture process identity: ${path}`);
 	}
-	return registerFixtureProcess(record.pid, record.processStartId, role)!;
+	return registerFixtureProcess(record.pid, record.processStartId, role);
 }
 
 function readFixtureProcessSnapshot(): Map<number, FixtureProcessSnapshot> {
@@ -357,6 +371,11 @@ function signalFixtureProcess(identity: FixtureProcessIdentity, signal: NodeJS.S
 }
 
 async function terminateFixtureProcessTree(root: FixtureProcessIdentity): Promise<void> {
+	if (root.pid === process.pid) {
+		// A leaked in-process ownership record can name this runner; never stop it.
+		console.warn(`[eng-4603] refusing to terminate the test runner itself (${root.pid}/${root.processStartId})`);
+		return;
+	}
 	if (fixtureProcessState(root) === "exited") return;
 	if (process.platform === "win32") {
 		if (signalFixtureProcess(root, "SIGKILL")) await waitForFixtureProcessExit(root);
@@ -878,76 +897,83 @@ describe("ENG-4603 worker recovery convergence", () => {
 			socketPath: workerPaths.socketPath,
 		});
 		const worker = spawnStandaloneWorker(workerPaths, workerSocketPath, token, workerEnvironment);
-		await waitForPath(workerSocketPath);
-		const socket = createConnection(workerSocketPath);
-		const frames = createFrameReader(socket);
-		await new Promise<void>((resolveConnect, rejectConnect) => {
-			socket.once("connect", resolveConnect);
-			socket.once("error", rejectConnect);
-		});
-		await frames.waitFor((frame) => frame.header.kind === "outbound" && frame.header.outboundType === "daemon_hello");
-		const authId = "auth-old";
-		socket.write(
-			encodePrivateFrame<DaemonWorkerFrameHeader>(
-				{ kind: "command", requestId: authId, commandType: "worker_auth" },
-				Buffer.from(
-					serializeJsonLine({
-						id: authId,
-						type: "worker_auth",
-						token,
-						supervisorGeneration: oldOwner.record.generation,
-						supervisorPid: oldOwner.record.pid,
-						supervisorProcessStartId: oldOwner.record.processStartId,
-						supervisorSocketPath: oldOwner.record.socketPath,
-					}),
+		// The forged record names this runner; a mid-test failure must not leak it
+		// into the cleanup scan.
+		const oldOwnerDirectory = join(workerPaths.registryDir, `${oldOwner.record.generation}.owner`);
+		try {
+			await waitForPath(workerSocketPath);
+			const socket = createConnection(workerSocketPath);
+			const frames = createFrameReader(socket);
+			await new Promise<void>((resolveConnect, rejectConnect) => {
+				socket.once("connect", resolveConnect);
+				socket.once("error", rejectConnect);
+			});
+			await frames.waitFor(
+				(frame) => frame.header.kind === "outbound" && frame.header.outboundType === "daemon_hello",
+			);
+			const authId = "auth-old";
+			socket.write(
+				encodePrivateFrame<DaemonWorkerFrameHeader>(
+					{ kind: "command", requestId: authId, commandType: "worker_auth" },
+					Buffer.from(
+						serializeJsonLine({
+							id: authId,
+							type: "worker_auth",
+							token,
+							supervisorGeneration: oldOwner.record.generation,
+							supervisorPid: oldOwner.record.pid,
+							supervisorProcessStartId: oldOwner.record.processStartId,
+							supervisorSocketPath: oldOwner.record.socketPath,
+						}),
+					),
 				),
-			),
-		);
-		expect(
-			decodeResponse(
-				await frames.waitFor((frame) => frame.header.kind === "outbound" && frame.header.requestId === authId),
-			).success,
-		).toBe(true);
-		if (process.platform === "darwin") {
-			const countAfterAuthentication = readFileSync(psCountPath, "utf8").length;
-			await delay(750);
-			expect(readFileSync(psCountPath, "utf8").length).toBe(countAfterAuthentication);
-			const ownerPath = join(workerPaths.registryDir, `${oldOwner.record.generation}.owner`, "owner.json");
-			const ownerRecord = JSON.parse(readFileSync(ownerPath, "utf8")) as { updatedAt: string };
-			ownerRecord.updatedAt = new Date(Date.now() + 1000).toISOString();
-			const updatedOwnerPath = `${ownerPath}.updated`;
-			writeFileSync(updatedOwnerPath, `${JSON.stringify(ownerRecord, null, 2)}\n`);
-			renameSync(updatedOwnerPath, ownerPath);
-			await delay(500);
-			const countAfterOwnerChange = readFileSync(psCountPath, "utf8").length;
-			expect(countAfterOwnerChange).toBeGreaterThan(countAfterAuthentication);
-			await delay(750);
-			expect(readFileSync(psCountPath, "utf8").length).toBe(countAfterOwnerChange);
+			);
+			expect(
+				decodeResponse(
+					await frames.waitFor((frame) => frame.header.kind === "outbound" && frame.header.requestId === authId),
+				).success,
+			).toBe(true);
+			if (process.platform === "darwin") {
+				const countAfterAuthentication = readFileSync(psCountPath, "utf8").length;
+				await delay(750);
+				expect(readFileSync(psCountPath, "utf8").length).toBe(countAfterAuthentication);
+				const ownerPath = join(workerPaths.registryDir, `${oldOwner.record.generation}.owner`, "owner.json");
+				const ownerRecord = JSON.parse(readFileSync(ownerPath, "utf8")) as { updatedAt: string };
+				ownerRecord.updatedAt = new Date(Date.now() + 1000).toISOString();
+				const updatedOwnerPath = `${ownerPath}.updated`;
+				writeFileSync(updatedOwnerPath, `${JSON.stringify(ownerRecord, null, 2)}\n`);
+				renameSync(updatedOwnerPath, ownerPath);
+				await delay(500);
+				const countAfterOwnerChange = readFileSync(psCountPath, "utf8").length;
+				expect(countAfterOwnerChange).toBeGreaterThan(countAfterAuthentication);
+				await delay(750);
+				expect(readFileSync(psCountPath, "utf8").length).toBe(countAfterOwnerChange);
+			}
+			const commandId = "stale-list";
+			const commandFrame = encodePrivateFrame<DaemonWorkerFrameHeader>(
+				{ kind: "command", requestId: commandId, commandType: "list" },
+				Buffer.from(serializeJsonLine({ id: commandId, type: "list" })),
+			);
+			socket.write(commandFrame.subarray(0, commandFrame.length - 1));
+			const ownerPath = join(oldOwnerDirectory, "owner.json");
+			const transitionedOwner = JSON.parse(readFileSync(ownerPath, "utf8")) as OwnerRecord & { updatedAt: string };
+			transitionedOwner.token = "successor-token";
+			transitionedOwner.pid = worker.child.pid!;
+			transitionedOwner.processStartId = getProcessStartId(worker.child.pid!);
+			transitionedOwner.updatedAt = new Date().toISOString();
+			const transitionedOwnerPath = `${ownerPath}.transitioned`;
+			writeFileSync(transitionedOwnerPath, `${JSON.stringify(transitionedOwner, null, 2)}\n`);
+			renameSync(transitionedOwnerPath, ownerPath);
+			socket.write(commandFrame.subarray(commandFrame.length - 1));
+			const staleResponse = decodeResponse(
+				await frames.waitFor((frame) => frame.header.kind === "outbound" && frame.header.requestId === commandId),
+			);
+			expect(staleResponse).toMatchObject({ success: false, error: "supervisor_generation_stale" });
+			socket.destroy();
+		} finally {
+			await oldOwner.release();
+			rmSync(oldOwnerDirectory, { recursive: true, force: true });
 		}
-		const commandId = "stale-list";
-		const commandFrame = encodePrivateFrame<DaemonWorkerFrameHeader>(
-			{ kind: "command", requestId: commandId, commandType: "list" },
-			Buffer.from(serializeJsonLine({ id: commandId, type: "list" })),
-		);
-		socket.write(commandFrame.subarray(0, commandFrame.length - 1));
-		const ownerDirectory = join(workerPaths.registryDir, `${oldOwner.record.generation}.owner`);
-		const ownerPath = join(ownerDirectory, "owner.json");
-		const transitionedOwner = JSON.parse(readFileSync(ownerPath, "utf8")) as OwnerRecord & { updatedAt: string };
-		transitionedOwner.token = "successor-token";
-		transitionedOwner.pid = worker.child.pid!;
-		transitionedOwner.processStartId = getProcessStartId(worker.child.pid!);
-		transitionedOwner.updatedAt = new Date().toISOString();
-		const transitionedOwnerPath = `${ownerPath}.transitioned`;
-		writeFileSync(transitionedOwnerPath, `${JSON.stringify(transitionedOwner, null, 2)}\n`);
-		renameSync(transitionedOwnerPath, ownerPath);
-		socket.write(commandFrame.subarray(commandFrame.length - 1));
-		const staleResponse = decodeResponse(
-			await frames.waitFor((frame) => frame.header.kind === "outbound" && frame.header.requestId === commandId),
-		);
-		expect(staleResponse).toMatchObject({ success: false, error: "supervisor_generation_stale" });
-		socket.destroy();
-		await oldOwner.release();
-		rmSync(ownerDirectory, { recursive: true, force: true });
 		await terminateTrackedFixtureProcess(worker);
 
 		const publicPaths = await createPaths();
@@ -970,12 +996,16 @@ describe("ENG-4603 worker recovery convergence", () => {
 			registryDir: publicPaths.registryDir,
 			socketPath: publicPaths.socketPath,
 		});
-		const rejected = await publicClient.request({ type: "create" });
-		expect(rejected).toMatchObject({ success: false, error: expect.stringContaining("no longer owns") });
-		expect(existsSync(journalPath) ? readFileSync(journalPath, "utf8") : "").toBe(journalBefore);
-		publicClient.close();
-		await replacementOwner.release();
-		rmSync(displacedOwnerDir, { recursive: true, force: true });
+		try {
+			const rejected = await publicClient.request({ type: "create" });
+			expect(rejected).toMatchObject({ success: false, error: expect.stringContaining("no longer owns") });
+			expect(existsSync(journalPath) ? readFileSync(journalPath, "utf8") : "").toBe(journalBefore);
+		} finally {
+			// This record also names this runner; never leak it into the cleanup scan.
+			publicClient.close();
+			await replacementOwner.release();
+			rmSync(displacedOwnerDir, { recursive: true, force: true });
+		}
 		await terminateTrackedFixtureProcess(staleSupervisor);
 	}, 90_000);
 
@@ -1103,4 +1133,46 @@ describe("ENG-4603 worker recovery convergence", () => {
 			expect(result.stdout).toBe("No background services found.\n");
 		}
 	}, 150_000);
+
+	it("spawns fixture processes through a private wrapper, never a hard link of the runner's node", async () => {
+		if (process.platform === "win32") return;
+		const paths = await createPaths();
+		const executableStat = statSync(paths.executablePath);
+		const runnerStat = statSync(process.execPath);
+		// macOS AMFI: hard-linking the signed runner binary permanently invalidates
+		// the shared inode's code signature, and every later exec of that inode is
+		// SIGKILLed machine-wide.
+		expect([executableStat.dev, executableStat.ino]).not.toEqual([runnerStat.dev, runnerStat.ino]);
+		expect(readFileSync(paths.executablePath, "utf8")).toBe(`#!/bin/sh\nexec "${process.execPath}" "$@"\n`);
+		expect(executableStat.mode & 0o111).not.toBe(0);
+	});
+
+	it("never registers or terminates the test runner itself when an in-process owner record leaks", async () => {
+		if (process.platform === "win32") return;
+		const paths = await createPaths();
+		const runnerStartId = getProcessStartId(process.pid);
+		if (!runnerStartId) throw new Error("Could not identify the test runner");
+		// The stale-command test acquires supervisor ownership in-process; a
+		// mid-test failure leaks this record into the cleanup scan.
+		const leakedOwnerDir = join(paths.registryDir, "leaked-runner.owner");
+		mkdirSync(leakedOwnerDir, { recursive: true });
+		writeFileSync(
+			join(leakedOwnerDir, "owner.json"),
+			JSON.stringify({
+				token: "leaked",
+				generation: "leaked-runner",
+				pid: process.pid,
+				processStartId: runnerStartId,
+				socketPath: paths.socketPath,
+				descriptorDir: paths.descriptorDir,
+				agentDir: paths.agentDir,
+			}),
+		);
+		registerFixtureOwnedProcesses();
+		expect([...fixtureProcesses.values()].some((identity) => identity.pid === process.pid)).toBe(false);
+		await terminateFixtureProcessTree({ pid: process.pid, processStartId: runnerStartId, role: "supervisor" });
+		expect(fixtureProcessState({ pid: process.pid, processStartId: runnerStartId, role: "supervisor" })).toBe(
+			"matching",
+		);
+	});
 });
