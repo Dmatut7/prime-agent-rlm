@@ -132,17 +132,30 @@ export function calculateContextTokens(usage: Usage): number {
 }
 
 /**
+ * Whether a message can serve as the context-usage source.
+ *
+ * One predicate for both calibers on purpose: `estimateContextTokens` (the
+ * compaction trigger) and `AgentSession.getContextUsage` (/usage, /context,
+ * compact.status) must agree on which assistant usage is readable, or one reports
+ * a number while the other reports "unknown". Aborted and errored turns carry no
+ * usable usage; a provider that reports zeros is still a source, so the estimate
+ * then counts only the messages that follow it.
+ */
+export function isAssistantUsageSource(message: AgentMessage): message is AssistantMessage {
+	return (
+		message.role === "assistant" &&
+		message.stopReason !== "aborted" &&
+		message.stopReason !== "error" &&
+		Boolean(message.usage)
+	);
+}
+
+/**
  * Get usage from an assistant message if available.
  * Skips aborted and error messages as they don't have valid usage data.
  */
 function getAssistantUsage(msg: AgentMessage): Usage | undefined {
-	if (msg.role === "assistant" && "usage" in msg) {
-		const assistantMsg = msg as AssistantMessage;
-		if (assistantMsg.stopReason !== "aborted" && assistantMsg.stopReason !== "error" && assistantMsg.usage) {
-			return assistantMsg.usage;
-		}
-	}
-	return undefined;
+	return isAssistantUsageSource(msg) ? msg.usage : undefined;
 }
 
 /**

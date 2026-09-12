@@ -290,8 +290,14 @@ function assertValidSessionId(sessionId: string): void {
 	}
 }
 
-function createSessionId(): string {
+/** Generate a fresh session id (uuidv7, so session files stay time-ordered). */
+export function createSessionId(): string {
 	return uuidv7();
+}
+
+/** Whether `value` may serve as a session id, and therefore as a session file stem. */
+export function isValidSessionId(value: string): boolean {
+	return SESSION_ID_PATTERN.test(value);
 }
 
 function getSessionFilePath(sessionDir: string, sessionId: string): string {

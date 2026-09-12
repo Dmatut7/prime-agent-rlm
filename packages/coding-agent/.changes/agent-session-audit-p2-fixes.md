@@ -1,0 +1,5 @@
+- Fixed `/import` overwriting a registered session file when the imported file shared its basename: a different transcript now lands on a free sibling name with its own session id, and re-importing byte-identical content reuses the file that is already registered.
+- Fixed a failed `/new`, `/fork`, `/import` or session switch leaving the runtime pointing at the already-disposed previous session, so every later prompt died with "session is disposing or disposed"; the previous session is now rebuilt and the host re-points at it.
+- Fixed a `!command` result recorded while the agent was streaming being dropped from the transcript when the session ended before the next turn.
+- Fixed `/usage`, `/context` and `compact.status` reporting context usage as unknown after a compaction when the newest assistant response carried no readable token counts, while auto-compaction still had a usage source to read.
+- Fixed a session-input admission failure while a threshold compaction queued its autonomous continuation ending the turn with an unrelated "Cannot admit a session action" error and leaving the never-admitted continuation on the books.

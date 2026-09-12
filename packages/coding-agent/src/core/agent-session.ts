@@ -113,6 +113,7 @@ import {
 	compact,
 	estimateContextTokens,
 	generateBranchSummary,
+	isAssistantUsageSource,
 	prepareCompaction,
 	serializeConversation,
 	shouldCompact,
@@ -3287,11 +3288,31 @@ export class AgentSession {
 			typeof autonomousMessage.content === "string"
 				? autonomousMessage.content
 				: autonomousMessage.content.map((block) => (block.type === "text" ? block.text : "")).join("\n");
-		this._admitSessionInput(
-			this._createPreparedTurnAction("followUp", text, undefined, {
-				message: autonomousMessage,
-			}),
-		);
+		try {
+			this._admitSessionInput(
+				this._createPreparedTurnAction("followUp", text, undefined, {
+					message: autonomousMessage,
+				}),
+			);
+		} catch (error) {
+			// Admission can close inside the await above: a dispose, or an input pause
+			// (the ACP release path waits for the agent to go idle while
+			// shouldStopAfterTurn is still running). Escaping would end the turn on an
+			// unrelated "Cannot admit ..." error, and leaving the message in the
+			// tracking arrays would make the session own a continuation that was never
+			// admitted. Roll the queueing back the way the goal path does; the
+			// compaction still stops the loop, just without a continuation.
+			this._queuedAutonomousThresholdContinuations.delete(message);
+			this._clearQueuedAutonomousContinuations({
+				messages: [autonomousMessage],
+				restoreAutonomousState: true,
+			});
+			sessionLog.warn("threshold compaction continuation was not admitted", {
+				sessionId: this.sessionId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return undefined;
+		}
 		return autonomousMessage;
 	}
 
@@ -5104,6 +5125,9 @@ export class AgentSession {
 			this._rlmChildSessions.clear();
 			this._rlmChildCleanupFailures.clear();
 			this._deletedRlmChildIds.clear();
+			// A deferred `!cmd` result never reaches a turn boundary when the session
+			// ends first, so it is persisted here instead of being dropped.
+			this._flushPendingBashMessagesBeforeDispose();
 			// B1 后半: dropping the queue here used to be silent, which made "queued"
 			// blinder than the hard failure it replaced. Persist first, then clear.
 			this._persistUndeliveredWorkBeforeDispose();
@@ -14044,6 +14068,28 @@ export class AgentSession {
 	}
 
 	/**
+	 * Dispose-time flush for deferred `!cmd` results.
+	 *
+	 * A bash result recorded while the agent was streaming waits for the next turn
+	 * boundary (_prepareForCommit is the only other flush point), so quitting or
+	 * being passivated before that turn used to drop it: the user had seen the
+	 * output, the transcript never did. The flush is skipped while the run is still
+	 * streaming - appending between an assistant tool call and its tool result is
+	 * exactly the ordering corruption the deferral exists to prevent.
+	 */
+	private _flushPendingBashMessagesBeforeDispose(): void {
+		if (this._pendingBashMessages.length === 0) return;
+		if (this.isStreaming) return;
+		try {
+			this._flushPendingBashMessages();
+		} catch (error) {
+			// Disposal stays best-effort; a failed transcript write is still reported
+			// through the regular persist-failure channel.
+			this._reportSessionPersistFailure(error);
+		}
+	}
+
+	/**
 	 * Flush pending bash messages to agent state and session.
 	 * Called after agent turn completes to maintain proper message ordering.
 	 */
@@ -14461,20 +14507,20 @@ export class AgentSession {
 		const latestCompaction = getLatestCompactionEntry(branchEntries);
 
 		if (latestCompaction) {
-			// Check if there's a valid assistant usage after the compaction boundary
+			// Check if there's a readable assistant usage after the compaction boundary.
+			// Keep scanning past aborted, errored and zero-usage assistants: stopping at
+			// the first non-errored one reported "unknown" whenever a provider sent a
+			// zero-usage response, while the compaction trigger - which reads the same
+			// messages through estimateContextTokens - still had a usage source. Both
+			// calibers now share isAssistantUsageSource.
 			const compactionIndex = branchEntries.lastIndexOf(latestCompaction);
 			let hasPostCompactionUsage = false;
 			for (let i = branchEntries.length - 1; i > compactionIndex; i--) {
 				const entry = branchEntries[i];
-				if (entry.type === "message" && entry.message.role === "assistant") {
-					const assistant = entry.message;
-					if (assistant.stopReason !== "aborted" && assistant.stopReason !== "error") {
-						const contextTokens = calculateContextTokens(assistant.usage);
-						if (contextTokens > 0) {
-							hasPostCompactionUsage = true;
-						}
-						break;
-					}
+				if (entry.type !== "message") continue;
+				if (isAssistantUsageSource(entry.message)) {
+					hasPostCompactionUsage = true;
+					break;
 				}
 			}
 

@@ -1,5 +1,6 @@
-import { copyFileSync, existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
+import { getLogger } from "@earendil-works/pi-ai";
 import type { AgentSession } from "./agent-session.js";
 import type { AgentSessionRuntimeConfig } from "./agent-session-config.js";
 import type {
@@ -13,12 +14,15 @@ import { emitSessionShutdownEvent } from "./extensions/runner.js";
 import type { CreateRlmSubagentRuntimeOptions, RlmSubagentRuntime, SubagentRuntimeHost } from "./rlm-runtime.js";
 import type { CreateAgentSessionResult } from "./sdk.js";
 import { assertSessionCwdExists } from "./session-cwd.js";
+import { copyImportedSession, resolveImportDestination } from "./session-import-destination.js";
 import { SessionImportFileNotFoundError } from "./session-import-errors.js";
 import { acquireSessionLease, canonicalSessionPath, type SessionLease } from "./session-lease.js";
 import { SessionManager } from "./session-manager.js";
 import { resolveCompleteToolPairLeaf } from "./session-tool-pair.js";
 
 export { SessionImportFileNotFoundError } from "./session-import-errors.js";
+
+const runtimeLog = getLogger("coding-agent.agent-session-runtime");
 
 export interface CreateAgentSessionRuntimeResult extends CreateAgentSessionResult {
 	services: AgentSessionServices;
@@ -59,6 +63,17 @@ function extractUserMessageText(content: string | Array<{ type: string; text?: s
 		.filter((part): part is { type: "text"; text: string } => part.type === "text" && typeof part.text === "string")
 		.map((part) => part.text)
 		.join("");
+}
+
+/**
+ * What a failed replacement build needs to put the previous session back: the
+ * manager that was live before teardown still holds the transcript, in memory for
+ * non-persisted sessions and on disk otherwise.
+ */
+interface ReplacementRollback {
+	sessionManager: SessionManager;
+	cwd: string;
+	sessionFile: string | undefined;
 }
 
 export interface AgentSessionRuntimeDisposeOptions {
@@ -252,28 +267,94 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	private async buildAndApplyReplacement(
 		build: () => Promise<CreateAgentSessionRuntimeResult>,
 		lease: SessionLease | undefined,
+		rollback?: ReplacementRollback,
 	): Promise<void> {
 		let result: CreateAgentSessionRuntimeResult;
 		try {
 			result = await build();
 		} catch (error) {
 			this.releaseUncommittedLease(lease);
+			if (rollback) {
+				await this.restoreAfterFailedReplacement(rollback, error);
+			}
 			throw error;
 		}
 		this.apply(result);
 		this.commitReplacementLease(lease);
 	}
 
+	/**
+	 * Teardown runs before the replacement build, so the previous session is
+	 * already disposed when the build fails. Hand back what a rollback needs.
+	 */
 	private async teardownForReplacement(
 		reason: SessionShutdownEvent["reason"],
 		targetSessionFile: string | undefined,
 		lease: SessionLease | undefined,
-	): Promise<void> {
+	): Promise<ReplacementRollback> {
+		const rollback: ReplacementRollback = {
+			sessionManager: this.session.sessionManager,
+			cwd: this.cwd,
+			sessionFile: this.session.sessionFile,
+		};
 		try {
 			await this.teardownCurrent(reason, targetSessionFile);
 		} catch (error) {
 			this.releaseUncommittedLease(lease);
 			throw error;
+		}
+		return rollback;
+	}
+
+	/**
+	 * A failed replacement build used to leave `_session` pointing at the disposed
+	 * previous session: every later prompt then died with "Cannot admit a session
+	 * action because the session is disposing or disposed" and only /new recovered.
+	 * Rebuild the previous session from the manager that was live before teardown
+	 * and re-point the host at it, so a failed switch leaves a usable runtime.
+	 *
+	 * Best-effort on purpose - the caller still reports the original build error.
+	 * What cannot come back is what teardown already released (the previous kernel
+	 * and its hosted subagent runtimes); the transcript itself is untouched, so the
+	 * restored session resumes from it.
+	 */
+	private async restoreAfterFailedReplacement(rollback: ReplacementRollback, cause: unknown): Promise<void> {
+		try {
+			const restored = await this.scopedBuild(() =>
+				this.createRuntime({
+					cwd: rollback.cwd,
+					agentDir: this.services.agentDir,
+					sessionManager: rollback.sessionManager,
+					sessionStartEvent: {
+						type: "session_start",
+						reason: "resume",
+						previousSessionFile: rollback.sessionFile,
+					},
+					sessionConfig: this.sessionConfig,
+				}),
+			);
+			this.apply(restored);
+		} catch (restoreError) {
+			runtimeLog.warn("session replacement failed and the previous session could not be restored", {
+				sessionFile: rollback.sessionFile,
+				error: restoreError instanceof Error ? restoreError.message : String(restoreError),
+				cause: cause instanceof Error ? cause.message : String(cause),
+			});
+			return;
+		}
+		runtimeLog.warn("session replacement failed; restored the previous session", {
+			sessionFile: rollback.sessionFile,
+			cause: cause instanceof Error ? cause.message : String(cause),
+		});
+		try {
+			// The session object changed, so the host must re-point at the restored
+			// one; without this it keeps driving the disposed session.
+			await this.finishSessionReplacement();
+		} catch (rebindError) {
+			runtimeLog.warn("host rebind after a restored session failed", {
+				sessionFile: rollback.sessionFile,
+				error: rebindError instanceof Error ? rebindError.message : String(rebindError),
+			});
 		}
 	}
 
@@ -430,7 +511,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			this.releaseUncommittedLease(lease);
 			throw error;
 		}
-		await this.teardownForReplacement("resume", sessionManager.getSessionFile(), lease);
+		const rollback = await this.teardownForReplacement("resume", sessionManager.getSessionFile(), lease);
 		await this.buildAndApplyReplacement(
 			() =>
 				this.scopedBuild(() =>
@@ -447,6 +528,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 					}),
 				),
 			lease,
+			rollback,
 		);
 		await this.finishSessionReplacement(options?.withSession);
 		return { cancelled: false };
@@ -473,7 +555,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		}
 		const lease = this.acquireReplacementLease(sessionManager.getSessionFile());
 
-		await this.teardownForReplacement("new", sessionManager.getSessionFile(), lease);
+		const rollback = await this.teardownForReplacement("new", sessionManager.getSessionFile(), lease);
 		await this.buildAndApplyReplacement(
 			() =>
 				this.scopedBuild(() =>
@@ -490,6 +572,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 					}),
 				),
 			lease,
+			rollback,
 		);
 		if (options?.setup) {
 			await options.setup(this.session.sessionManager);
@@ -548,7 +631,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 					rlmDepth: sourceHeader?.rlmDepth ?? this.session.rlmDepth,
 				});
 				const lease = this.acquireReplacementLease(sessionManager.getSessionFile());
-				await this.teardownForReplacement("fork", sessionManager.getSessionFile(), lease);
+				const rollback = await this.teardownForReplacement("fork", sessionManager.getSessionFile(), lease);
 				await this.buildAndApplyReplacement(
 					() =>
 						this.scopedBuild(() =>
@@ -565,6 +648,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 							}),
 						),
 					lease,
+					rollback,
 				);
 				await this.finishSessionReplacement(options?.withSession);
 				return { cancelled: false, selectedText };
@@ -577,7 +661,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			}
 			const sessionManager = SessionManager.open(forkedSessionPath, sessionDir);
 			const lease = this.acquireReplacementLease(sessionManager.getSessionFile());
-			await this.teardownForReplacement("fork", sessionManager.getSessionFile(), lease);
+			const rollback = await this.teardownForReplacement("fork", sessionManager.getSessionFile(), lease);
 			await this.buildAndApplyReplacement(
 				() =>
 					this.scopedBuild(() =>
@@ -594,6 +678,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 						}),
 					),
 				lease,
+				rollback,
 			);
 			await this.finishSessionReplacement(options?.withSession);
 			return { cancelled: false, selectedText };
@@ -610,7 +695,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			sessionManager.createBranchedSession(targetLeafId);
 		}
 		const lease = this.acquireReplacementLease(sessionManager.getSessionFile());
-		await this.teardownForReplacement("fork", sessionManager.getSessionFile(), lease);
+		const rollback = await this.teardownForReplacement("fork", sessionManager.getSessionFile(), lease);
 		await this.buildAndApplyReplacement(
 			() =>
 				this.scopedBuild(() =>
@@ -627,6 +712,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 					}),
 				),
 			lease,
+			rollback,
 		);
 		await this.finishSessionReplacement(options?.withSession);
 		return { cancelled: false, selectedText };
@@ -634,6 +720,12 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 
 	/**
 	 * Import a session JSONL file and switch runtime state to the imported session.
+	 *
+	 * The transcript is copied into the session directory under its own basename.
+	 * A basename that is already taken by a *different* transcript does not get
+	 * overwritten: the copy moves to a free sibling name and receives a session id
+	 * of its own, so an import can never destroy a registered session. Importing
+	 * byte-identical content reuses the file that is already there.
 	 *
 	 * @returns `{ cancelled: true }` when cancelled by `session_before_switch`, otherwise `{ cancelled: false }`.
 	 * @throws {SessionImportFileNotFoundError} When the input path does not exist.
@@ -650,7 +742,8 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			mkdirSync(sessionDir, { recursive: true });
 		}
 
-		const destinationPath = join(sessionDir, basename(resolvedPath));
+		const destination = resolveImportDestination(resolvedPath, join(sessionDir, basename(resolvedPath)));
+		const destinationPath = destination.path;
 		const beforeResult = await this.emitBeforeSwitch("resume", destinationPath);
 		if (beforeResult.cancelled) {
 			return beforeResult;
@@ -660,8 +753,8 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		const lease = this.acquireReplacementLease(destinationPath);
 		let sessionManager: SessionManager;
 		try {
-			if (resolve(destinationPath) !== resolvedPath) {
-				copyFileSync(resolvedPath, destinationPath);
+			if (!destination.reusedExisting && resolve(destinationPath) !== resolvedPath) {
+				copyImportedSession(resolvedPath, destinationPath, { renamed: destination.renamed });
 			}
 
 			sessionManager = SessionManager.open(destinationPath, sessionDir, cwdOverride);
@@ -670,7 +763,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			this.releaseUncommittedLease(lease);
 			throw error;
 		}
-		await this.teardownForReplacement("resume", sessionManager.getSessionFile(), lease);
+		const rollback = await this.teardownForReplacement("resume", sessionManager.getSessionFile(), lease);
 		await this.buildAndApplyReplacement(
 			() =>
 				this.scopedBuild(() =>
@@ -687,6 +780,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 					}),
 				),
 			lease,
+			rollback,
 		);
 		await this.finishSessionReplacement();
 		return { cancelled: false };
