@@ -4,6 +4,7 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
 	statSync,
 	utimesSync,
@@ -13,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
+import { deleteSessionFile } from "../src/core/session-file-actions.js";
 import {
 	isSessionInfoDiskCacheable,
 	pruneStaleSessionInfoCacheEntries,
@@ -269,6 +271,70 @@ describe("durable session-info summary", () => {
 		if (process.platform === "win32") return;
 		expect(statSync(dir).mode & 0o777).toBe(0o700);
 		expect(statSync(cacheFiles()[0]!).mode & 0o777).toBe(0o600);
+	});
+
+	it("drops the durable summary when the session is deleted", async () => {
+		const path = writeSession(
+			sessionsDir,
+			"session-l",
+			headerLine("session-l", "/tmp/project") + messageLine("user", "one", 1000),
+		);
+		await sessionManagerModule.readSessionInfo(path);
+		await whenSessionInfoCachePruneSettled();
+		expect(cacheFiles()).toHaveLength(1);
+
+		const result = await deleteSessionFile(path);
+		expect(result.ok).toBe(true);
+		expect(existsSync(path)).toBe(false);
+		// Without this the entry would sit in the cache directory until the weekly
+		// prune noticed its transcript was gone.
+		expect(cacheFiles()).toHaveLength(0);
+		expect(sessionInfoDiskCacheStats().removed).toBeGreaterThan(0);
+	});
+
+	it("finds the summary written under the other path spelling of the same file", async () => {
+		const path = writeSession(
+			sessionsDir,
+			"session-m",
+			headerLine("session-m", "/tmp/project") + messageLine("user", "one", 1000),
+		);
+		// The ledger records realpath-canonical paths while a directory scan yields
+		// the configured spelling; on a host with a symlinked temp or home directory
+		// those are two keys for one transcript, and a delete can arrive under either.
+		const canonical = realpathSync(path);
+		await sessionManagerModule.readSessionInfo(canonical);
+		await whenSessionInfoCachePruneSettled();
+		expect(cacheFiles()).toHaveLength(1);
+
+		const result = await deleteSessionFile(path);
+		expect(result.ok).toBe(true);
+		expect(cacheFiles()).toHaveLength(0);
+	});
+
+	it("drops descendant summaries when a deleted root takes its artifact tree with it", async () => {
+		const rootPath = writeSession(
+			sessionsDir,
+			"session-n",
+			headerLine("session-n", "/tmp/project") + messageLine("user", "root", 1000),
+		);
+		const childDir = join(agentDir, "session-artifacts", "session-n", "sub-aaaaaaaa");
+		mkdirSync(childDir, { recursive: true, mode: 0o700 });
+		const childPath = writeSession(
+			childDir,
+			"child",
+			headerLine("session-n-child", "/tmp/project") + messageLine("user", "child", 1000),
+		);
+		await sessionManagerModule.readSessionInfo(rootPath);
+		// Passive descendants are read under their canonical path, as the ledger
+		// records it, which is also how the artifact walk spells them.
+		await sessionManagerModule.readSessionInfo(realpathSync(childPath));
+		await whenSessionInfoCachePruneSettled();
+		expect(cacheFiles()).toHaveLength(2);
+
+		const result = await deleteSessionFile(rootPath);
+		expect(result.ok).toBe(true);
+		expect(existsSync(childDir)).toBe(false);
+		expect(cacheFiles()).toHaveLength(0);
 	});
 
 	it("survives an unwritable cache location without failing the read", async () => {

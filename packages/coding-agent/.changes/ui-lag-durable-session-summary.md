@@ -1,4 +1,5 @@
 - Fixed the intermittent 1-5 second stall when opening the agents view or entering a session: session list metadata now survives a daemon or worker restart, so a freshly spawned process no longer re-reads every subagent transcript from disk.
 - Changed the saved-session catalog, passive-descendant and spawn-ledger scans to read independent transcripts concurrently instead of one at a time.
-- Fixed Enter doing nothing in the agents view while a saved-catalog refresh was in flight; an unresolved restored selection now stops blocking the key after two seconds.
+- Fixed Enter doing nothing in the agents view when a saved-catalog refresh had stalled: an unresolved restored selection stops blocking the key two seconds after the catalog last made progress, instead of for as long as the refresh lives.
+- Removed the cached session-list summary of a session when that session is deleted, along with the summaries of the descendants its artifact directory takes with it.
 - Changed the agents view animation tick to refresh age labels in place instead of rebuilding the whole row set four times a second.

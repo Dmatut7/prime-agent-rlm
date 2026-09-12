@@ -1,8 +1,8 @@
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
-import { rm, unlink } from "node:fs/promises";
-import { basename, dirname } from "node:path";
-import { getSessionArtifactPath } from "./session-manager.js";
+import { type Dirent, existsSync } from "node:fs";
+import { readdir, rm, unlink } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
+import { forgetSessionInfo, getSessionArtifactPath } from "./session-manager.js";
 
 export type DeleteSessionFileResult = { ok: true; method: "trash" | "unlink" } | { ok: false; error: string };
 
@@ -25,7 +25,38 @@ export async function deleteSessionArtifacts(sessionPath: string): Promise<void>
 	// 0755, and a retry-heal sweep must still remove it. Symlinked or escaping
 	// paths still throw and are never traversed.
 	const artifactDir = getSessionArtifactPath(dirname(sessionPath), sessionId, false, false);
+	// Passive descendants persist their transcripts under this directory and each
+	// one may have a durable list-summary; forget them before the recursive remove
+	// so deleting a root does not leave one orphan entry per child.
+	await forgetSummariesUnder(artifactDir);
 	await rm(artifactDir, { recursive: true, force: true });
+}
+
+/**
+ * Drop the cached summaries of every transcript under a directory that is about
+ * to be removed. Breadth-first over real directories only: a symlinked entry is
+ * neither descended into nor treated as a transcript, so cleanup can never reach
+ * outside the directory the caller already decided to delete.
+ */
+async function forgetSummariesUnder(dir: string): Promise<void> {
+	const queue = [dir];
+	while (queue.length > 0) {
+		const current = queue.shift()!;
+		let entries: Dirent[];
+		try {
+			entries = await readdir(current, { withFileTypes: true });
+		} catch {
+			continue;
+		}
+		for (const entry of entries) {
+			const path = join(current, entry.name);
+			if (entry.isDirectory()) {
+				queue.push(path);
+			} else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+				await forgetSessionInfo(path);
+			}
+		}
+	}
 }
 
 /** Remove the session `.jsonl`, trying the `trash` CLI first, then falling back to unlink. */
@@ -74,6 +105,14 @@ export async function deleteSessionFile(
 	const result = await removeSessionFile(sessionPath);
 	if (result.ok) {
 		options.afterFileRemoved?.();
+		// The transcript is gone, so no summary of it can ever be valid again.
+		// Best-effort like the artifact cleanup below: a cache problem must not
+		// turn a successful deletion into a failure.
+		try {
+			await forgetSessionInfo(sessionPath);
+		} catch {
+			// Keep the successful file-deletion result.
+		}
 		// Artifact cleanup is best-effort: a refusal (e.g. a legacy non-private
 		// artifacts root) must not turn a successful session-file deletion into a
 		// failure.

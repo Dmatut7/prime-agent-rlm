@@ -107,10 +107,13 @@ import { createSearchTextMatcher } from "./session-view-search.js";
 const HEARTBEAT_POLL_INTERVAL_MS = 15000;
 const SAVED_CATALOG_RECONCILE_THROTTLE_MS = 50;
 /**
- * How long an unresolved selection anchor may keep Enter blocked while a saved
- * catalog refresh is in flight. The refresh normally delivers the anchor's row
- * and clears the pending state on its own; this is the backstop for a slow or
- * wedged RPC, so the key never becomes a permanent dead end.
+ * How long an unresolved selection anchor may keep Enter blocked while the saved
+ * catalog refresh has stopped making progress. The window is measured from the
+ * last re-arm, and every reconcile that still cannot find the anchor re-arms it
+ * (`restoreSelection`), so a catalog that is actively streaming keeps the wait
+ * alive and Enter still waits that refresh out, up to its own RPC timeout. What
+ * this bounds is the other case: a parked or wedged stream, which used to block
+ * the key for as long as the refresh object lived.
  */
 const SELECTION_ANCHOR_REFRESH_GRACE_MS = 2000;
 const RECONNECT_TIMEOUT_MS = 120000;
@@ -1408,7 +1411,8 @@ export class AgentsViewMode implements Component, Focusable {
 		if (this.selectionAnchorPending) {
 			// Enter must not be a dead end. The animation tick also expires the grace
 			// window, but a keypress is the moment the user is actually waiting, so
-			// re-check here instead of making them press it twice.
+			// re-check here instead of making them press it twice. A refresh that is
+			// still streaming keeps the wait armed and this changes nothing.
 			this.resolveMissingSelectionAnchor();
 		}
 		if (this.selectionAnchorPending) {
@@ -2378,8 +2382,10 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 		// An in-flight refresh owns the anchor's arrival and must not be
 		// second-guessed mid-stream: resolving against a half-streamed catalog would
-		// adopt a fallback row the next session could still displace. The wait is
-		// bounded, though, so a slow RPC cannot keep Enter refused indefinitely.
+		// adopt a fallback row the next session could still displace, and each
+		// reconcile re-arms the wait for exactly that reason. What must not happen is
+		// a stream that stopped delivering anything keeping Enter refused for the
+		// remaining life of the refresh, so the wait expires on silence instead.
 		if (this.savedCatalogRefreshPending && !this.selectionAnchorGraceExpired()) {
 			return;
 		}

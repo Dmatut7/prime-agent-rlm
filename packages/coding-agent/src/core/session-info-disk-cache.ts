@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { readdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { getAgentDir, getSessionsDir } from "../config.js";
 import { mapConcurrent } from "../utils/map-concurrent.js";
@@ -66,6 +66,8 @@ export interface SessionInfoDiskCacheStats {
 	skipped: number;
 	writeErrors: number;
 	pruned: number;
+	/** Entries dropped because their transcript was deleted. */
+	removed: number;
 }
 
 const stats: SessionInfoDiskCacheStats = {
@@ -76,6 +78,7 @@ const stats: SessionInfoDiskCacheStats = {
 	skipped: 0,
 	writeErrors: 0,
 	pruned: 0,
+	removed: 0,
 };
 
 let consecutiveWriteFailures = 0;
@@ -99,6 +102,7 @@ export function resetSessionInfoDiskCacheState(): void {
 	stats.skipped = 0;
 	stats.writeErrors = 0;
 	stats.pruned = 0;
+	stats.removed = 0;
 	consecutiveWriteFailures = 0;
 	writesDisabled = false;
 	directoryEnsured = undefined;
@@ -280,6 +284,47 @@ export async function writeCachedSessionInfo(
 		consecutiveWriteFailures++;
 		if (consecutiveWriteFailures >= WRITE_FAILURE_DISABLE_THRESHOLD) writesDisabled = true;
 		await rm(temp, { force: true }).catch(() => undefined);
+	}
+}
+
+/**
+ * Every cache file that could hold this transcript's summary: the lexical
+ * spelling and the realpath spelling. Callers mix them (the ledger records
+ * realpath-canonical paths, a directory scan yields the configured spelling),
+ * and on a host whose temp or home directory is a symlink those are different
+ * keys for one file. The parent-directory realpath keeps this working after the
+ * transcript itself is already gone, which is the usual reason to call it.
+ */
+function cacheEntryCandidates(filePath: string): string[] {
+	const resolved = resolve(filePath);
+	const spellings = new Set<string>([resolved]);
+	try {
+		spellings.add(resolve(realpathSync(resolved)));
+	} catch {
+		try {
+			spellings.add(join(realpathSync(dirname(resolved)), basename(resolved)));
+		} catch {
+			// Neither the file nor its parent resolves: only the lexical key can exist.
+		}
+	}
+	return [...spellings].map((spelling) => cacheEntryPath(spelling));
+}
+
+/**
+ * Drop the durable summary for a transcript that is being deleted, so a delete
+ * does not leave an orphan entry for the weekly prune to find. Best-effort and
+ * never throws: a cache miss here is exactly the state the prune would reach.
+ */
+export async function removeCachedSessionInfo(filePath: string): Promise<void> {
+	if (!isSessionInfoDiskCacheable(filePath)) return;
+	for (const entry of cacheEntryCandidates(filePath)) {
+		try {
+			await unlink(entry);
+			stats.removed++;
+		} catch {
+			// Absent, or the directory is not writable: either way the entry can
+			// never be served again once its transcript is gone.
+		}
 	}
 }
 

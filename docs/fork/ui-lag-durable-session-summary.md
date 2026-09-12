@@ -34,6 +34,11 @@
      其它路径（临时目录 fixture、导入的转录、用户自选路径）行为完全不变、零副作用。
    - 每周一次的后台清理（`prune-marker`）：转录已消失或指纹已漂移的条目才删。
    - 写失败连续 3 次即熔断，读永远降级为 miss，任何缓存故障都不会让读失败。
+   - **删除即清**：`deleteSessionFile()` 成功后 `forgetSessionInfo()` 同时清进程内条目与持久条目；
+     `deleteSessionArtifacts()` 在递归删除**之前**广度优先走一遍该目录（只进真目录、不跟符号链接），
+     把被一起删掉的被动后代转录的条目也清掉，否则一个根被删会留下「每子一条」的孤儿等周清。
+     删除路径的拼写可能与写入时不同（账本存 realpath、目录扫描存配置拼写），所以按
+     「字面 + realpath（文件已删时退回父目录 realpath + basename）」两种拼写各删一次。
 2. **并发化**（新增 `utils/map-concurrent.ts`，保序、限流、可按序流式回调）
    - `withPassiveRlmDescendantInfos`、`listSessionsFromDir`、`family()` 的 row 循环、
      `listPassiveRlmSubagents` 的 `visit()`（拆成「取元数据 → 串行准入判定 → 取摘要 → 按序发射+下钻」四段，
@@ -45,9 +50,15 @@
    - 250 ms 动画定时器不再 `rebuildRows()`（重建 = 重过滤+重汇总+重嵌套+重排序，536 条记录实测 24–28 ms），
      改为 `refreshAgentsViewRowTimeLabels()` 就地重算时间派生的 `statusLabel`；合成行（subagent-summary /
      subagent-code 挂的是父行 summary、标签恒为空）跳过，避免凭空造文案。
-   - `resolveMissingSelectionAnchor()` 对「目录刷新在飞」的一票否决改成**有界**：
-     超过 `SELECTION_ANCHOR_REFRESH_GRACE_MS = 2000` 就放行（动画 tick 与 `openSelected()` 都会触发检查），
-     Enter 不再是死路。刷新窗内的正常语义不变：锚点行一到就放行。
+   - `resolveMissingSelectionAnchor()` 对「目录刷新在飞」的一票否决改成**停滞即放行**：
+     死线 `SELECTION_ANCHOR_REFRESH_GRACE_MS = 2000` 从「锚点最近一次被重新武装」起算，
+     动画 tick 与 `openSelected()` 都会踩它。
+     **如实说明边界**：流式期间每次 reconcile（节流 50 ms）都经 `restoreSelection()` 重新武装 pending
+     并刷新起点，所以目录**在持续到货**时 Enter 仍会等完整轮刷新（上限 = `list_saved_sessions`
+     自己的 30 s RPC 超时），2 s 兜底只在刷新**停住不动**（RPC 卡死 / 长时间无数据）时才放行。
+     这**不是回归**（原逻辑是无条件等到刷新对象活着的最后一刻），改的是「永久死路」→「停滞即放行」；
+     真正让这条路径变短的是 §2.1/§2.2：目录到货时间从 2.2 s 降到 0.13 s，等待窗本身缩了 17 倍。
+     该重新武装语义有测试钉住（`re-arms the wait on every reconcile that still cannot find the anchor`）。
 
 **总闸遵守**：没有少显示任何子代理、没有少读任何转录、没有降低搜索/用量/拓扑能力；
 E2E 落定行数修前 82（被动后代那条腿还没到就被判「落定」）→ 修后 97（全量到齐）。
@@ -104,19 +115,20 @@ E2E 落定行数修前 82（被动后代那条腿还没到就被判「落定」�
 
 ## 四、验证
 
-- **先红后绿**：6 个测试文件（33 条）在基线树 `0429806b6`（`git archive` + node_modules 符号链接）上
-  **6 文件全红、9 条断言失败**；同批文件在修后树上 **33/33 全绿**。
+- **先红后绿**：6 个测试文件在基线树 `0429806b6`（`git archive` + node_modules 符号链接）上
+  **6 文件全红、9 条断言失败**；同批文件在修后树上 **37/37 全绿**（首交 33 条 + 随访 4 条）。
   其中最有信息量的两条红是断言级而非导入级：
   `expect(probe.peak()).toBeGreaterThanOrEqual(2)` 收到 `1`（串行扫描）、
   `expect(existsSync(cacheDir())).toBe(true)` 收到 `false`（摘要不落盘）。
-- **变异 8 处，全部被杀**（改一处 → 目标测试必红 → 还原）：
+- **变异 11 处，全部被杀**（改一处 → 目标测试必红 → 还原）：
   M1 不读持久层 / M2 去掉指纹校验 / M3 被动合并限流改 1（退回串行）/ M4 回调不按序发射 /
-  M5 合成行也重算标签 / M6 恢复「刷新一票否决」/ M7 任意路径都缓存 / M8 从不落盘。
-  还原后同一批 33 条重新全绿。
+  M5 合成行也重算标签 / M6 恢复「刷新一票否决」/ M7 任意路径都缓存 / M8 从不落盘 /
+  **M9 删除后不清条目**（3 条红）/ **M10 删根时不清后代条目**（1 条红）/ **M11 anchor 死线不再重新武装**（1 条红）。
+  M2、M7、M9、M10 是**正确性/卫生方向**而非性能方向的变异。还原后同一批 37 条重新全绿。
 - **回归**：`test/session-manager/` 全目录 + session-info + rlm-ledger + agents-view + daemon-catalog +
-  saved-session-catalog + daemon-session-list + session-lease = **38 文件 459 条全过**；
+  saved-session-catalog + daemon-session-list + session-lease + session-artifacts-delete = **39 文件 467 条全过**；
   `daemon-mode` + 全部 `daemon-supervisor-*`（不含 process 版与 4603）= **18 文件 429 条全过**。
-  合计 **56 文件 888 条**。env 已净化（`env -u RLM_* -u PRIME_AGENT_INTERNAL_* …`，
+  合计 **57 文件 896 条**（随访两条落地后复跑）。env 已净化（`env -u RLM_* -u PRIME_AGENT_INTERNAL_* …`，
   且 `PRIME_AGENT_CODING_AGENT_DIR` 指向 /tmp，测试不写真实 `~/.prime`）。
 - `npm run check`（biome 全仓 + tsgo + installer + browser-smoke）、`npm run check:test-hygiene`（无新增私探）、
   纯净树 `git archive HEAD | tar -x` + `npx tsgo --noEmit` 均 EXIT=0。

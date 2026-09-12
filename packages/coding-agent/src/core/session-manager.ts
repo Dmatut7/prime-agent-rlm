@@ -36,6 +36,7 @@ import {
 } from "./messages.js";
 import {
 	readCachedSessionInfo,
+	removeCachedSessionInfo,
 	SESSION_ARTIFACTS_DIR_NAME,
 	scheduleSessionInfoCachePrune,
 	writeCachedSessionInfo,
@@ -1191,6 +1192,16 @@ export function clearSessionInfoCaches(): void {
 	sessionInfoReadStats.diskHits = 0;
 	sessionInfoReadStats.fullScans = 0;
 	sessionInfoReadStats.resumedScans = 0;
+}
+
+/**
+ * Drop every summary held for a transcript that no longer exists, in both cache
+ * layers. Called on delete so a removed session does not leave a durable entry
+ * behind for the weekly prune to find.
+ */
+export async function forgetSessionInfo(filePath: string): Promise<void> {
+	sessionInfoCache.delete(filePath);
+	await removeCachedSessionInfo(filePath);
 }
 
 export async function readSessionInfo(filePath: string): Promise<SessionInfo | null> {

@@ -115,4 +115,27 @@ describe("agents view selection anchor grace", () => {
 		expect(self.finish).not.toHaveBeenCalled();
 		expect(self.setStatusMessage).toHaveBeenCalledWith("Waiting for the selected session to load");
 	});
+
+	it("re-arms the wait on every reconcile that still cannot find the anchor", () => {
+		// This is what bounds the guarantee above: a catalog that is actively
+		// streaming re-stamps the wait each time it reconciles (throttled to 50 ms),
+		// so the grace window only expires once the stream stops making progress.
+		// Enter can therefore still wait out a slow-but-moving refresh, up to that
+		// RPC's own timeout, rather than being released two seconds into it.
+		const stale = Date.now() - 60_000;
+		const self: Record<string, unknown> = {
+			rows: pendingSelf({ pendingForMs: 0, refreshInFlight: true }).rows,
+			selectedIndex: 0,
+			selectedRowIdentity: "file:/tmp/never-streamed-in.jsonl",
+			selectedSessionKey: undefined,
+			selectedActiveSessionId: undefined,
+			persistentState: {},
+			selectionAnchorPending: true,
+			selectionAnchorPendingSince: stale,
+		};
+		invoke("restoreSelection", self);
+		expect(self.selectionAnchorPending).toBe(true);
+		expect(self.selectionAnchorPendingSince as number).toBeGreaterThan(stale);
+		expect(Date.now() - (self.selectionAnchorPendingSince as number)).toBeLessThan(1000);
+	});
 });
