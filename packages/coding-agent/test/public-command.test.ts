@@ -155,6 +155,22 @@ describe("public command routing", () => {
 		]);
 	});
 
+	it("forwards the fork self-update override and rejects an unknown update option", async () => {
+		await handlePublicCommand(["update", "--allow-official"]);
+		await handlePublicCommand(["update"]);
+
+		expect(mocks.packageCommands).toEqual([
+			["update", "--self", "--allow-official"],
+			["update", "--self"],
+		]);
+
+		mocks.packageCommands.length = 0;
+		await handlePublicCommand(["update", "--allow-officia"]);
+
+		expect(mocks.packageCommands).toEqual([]);
+		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("Unknown option for update"));
+	});
+
 	it("forwards hidden update restart coordinator invocations", async () => {
 		const args = ["update", DAEMON_UPDATE_RESTART_COORDINATOR_FLAG, "--daemon-socket", "custom-daemon.sock"];
 

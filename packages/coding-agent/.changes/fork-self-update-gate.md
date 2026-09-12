@@ -1,0 +1,1 @@
+- Changed `prime-agent update` on a build from this fork to refuse the official package install (which would discard the fork's changes) and print the fork's own update steps instead; `--allow-official` still takes the official path, and extension updates are unaffected.

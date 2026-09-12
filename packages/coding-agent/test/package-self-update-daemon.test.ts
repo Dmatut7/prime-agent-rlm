@@ -19,6 +19,7 @@ import {
 	VERSION,
 } from "../src/config.js";
 import type { AgentSessionRuntimeMetadata } from "../src/core/agent-session-runtime.js";
+import { detectForkInstall } from "../src/fork-self-update.js";
 import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../src/modes/daemon/daemon-protocol.js";
 import type * as DaemonSocketModule from "../src/modes/daemon/daemon-socket.js";
 import {
@@ -391,6 +392,11 @@ vi.mock("../src/modes/daemon/daemon-client.js", () => ({
 }));
 
 describe("self-update daemon restart", () => {
+	// Every self-update call below passes --allow-official: this suite runs from the
+	// fork checkout, and the fork self-keep gate (src/fork-self-update.ts) refuses an
+	// `update --self` without it by design. The gate has its own case below. --force is
+	// deliberately not used here; it also skips the version probe and the session-loss
+	// confirmation these cases assert on.
 	let tempDir: string;
 	let agentDir: string;
 	let projectDir: string;
@@ -402,7 +408,7 @@ describe("self-update daemon restart", () => {
 	let originalExitCode: typeof process.exitCode;
 
 	async function performUpdateAndRunCoordinator(originActiveSessionId?: string): Promise<void> {
-		await handlePackageCommand(["update", "--self", "--daemon-socket", mockState.socketPath]);
+		await handlePackageCommand(["update", "--self", "--allow-official", "--daemon-socket", mockState.socketPath]);
 		const restartDirectory = join(agentDir, "update-restarts");
 		mkdirSync(restartDirectory, { recursive: true });
 		mockState.lastCoordinatorStatus = await runDaemonUpdateRestartCoordinator({
@@ -572,7 +578,7 @@ describe("self-update daemon restart", () => {
 			vi.fn(async () => Response.json({ version: "0.2.6" })),
 		);
 
-		await expect(handlePackageCommand(["update", "--self"])).resolves.toBe(true);
+		await expect(handlePackageCommand(["update", "--self", "--allow-official"])).resolves.toBe(true);
 
 		expect(process.exitCode).toBe(SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE);
 		expect(mockState.calls.some((call) => call.startsWith("spawn:npm "))).toBe(false);
@@ -595,7 +601,7 @@ describe("self-update daemon restart", () => {
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
 		try {
-			await expect(handlePackageCommand(["update", "--self"])).resolves.toBe(true);
+			await expect(handlePackageCommand(["update", "--self", "--allow-official"])).resolves.toBe(true);
 
 			expect(process.exitCode).toBe(1);
 			expect(mockState.calls.some((call) => call.startsWith("spawn:npm "))).toBe(false);
@@ -610,7 +616,7 @@ describe("self-update daemon restart", () => {
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
 		try {
-			await expect(handlePackageCommand(["update", "--self"])).resolves.toBe(true);
+			await expect(handlePackageCommand(["update", "--self", "--allow-official"])).resolves.toBe(true);
 
 			expect(process.exitCode).toBe(1);
 			expect(mockState.calls).toContain("probe-daemon");
@@ -626,7 +632,9 @@ describe("self-update daemon restart", () => {
 		process.env[SELF_UPDATE_INTERACTIVE_CHILD_ENV] = "1";
 		const customSocketPath = join(tempDir, "custom", "daemon.sock");
 
-		await expect(handlePackageCommand(["update", "--self", "--daemon-socket", customSocketPath])).resolves.toBe(true);
+		await expect(
+			handlePackageCommand(["update", "--self", "--allow-official", "--daemon-socket", customSocketPath]),
+		).resolves.toBe(true);
 
 		expect(mockState.probeSocketPaths).toEqual([customSocketPath]);
 		expect(mockState.calls.some((call) => call.startsWith("spawn:npm "))).toBe(true);
@@ -1477,4 +1485,34 @@ describe("self-update daemon restart", () => {
 			logSpy.mockRestore();
 		}
 	});
+
+	// The gate itself: an unforced self-update in a fork checkout must stop before the
+	// version probe, before the session-loss confirmation and before any install spawn.
+	it.skipIf(detectForkInstall() === undefined)(
+		"refuses an unforced self-update on a fork build without touching the package manager",
+		async () => {
+			const fork = detectForkInstall();
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+			try {
+				await expect(handlePackageCommand(["update", "--self"])).resolves.toBe(true);
+
+				expect(process.exitCode).toBe(1);
+				const printed = errorSpy.mock.calls.map((call) => String(call[0])).join("\n");
+				expect(printed).toContain("refusing to self-update a fork build");
+				expect(printed).toContain(fork?.repoRoot ?? "");
+				expect(printed).toContain("npm run build");
+				expect(printed).toContain("--allow-official");
+				// The refusal must not steer the user at the official installer, which is the
+				// behaviour it replaces.
+				expect(printed).not.toContain("install -g");
+				expect(mockState.calls.some((call) => call.startsWith("spawn:npm "))).toBe(false);
+				expect(mockState.calls).not.toContain("probe-daemon");
+			} finally {
+				errorSpy.mockRestore();
+				logSpy.mockRestore();
+			}
+		},
+	);
 });

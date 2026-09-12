@@ -48,6 +48,7 @@ import type { AgentSessionRuntimeMetadata } from "./core/agent-session-runtime.j
 import { type CustomMessage, isSessionSlashCommand } from "./core/messages.js";
 import { DefaultPackageManager } from "./core/package-manager.js";
 import { SettingsManager } from "./core/settings-manager.js";
+import { detectForkInstall, forkSelfUpdateOverrideLine, forkSelfUpdateRefusalLines } from "./fork-self-update.js";
 import { DaemonClient, type DaemonHello } from "./modes/daemon/daemon-client.js";
 import {
 	DAEMON_FIRST_PARTY_CONTROL_CAPABILITIES,
@@ -87,6 +88,8 @@ interface PackageCommandOptions {
 	updateTarget?: UpdateTarget;
 	local: boolean;
 	force: boolean;
+	/** Fork self-keep gate override: install the official package over this fork build. */
+	allowOfficial: boolean;
 	help: boolean;
 	daemonSocketPath?: string;
 	restartCoordinator: boolean;
@@ -115,7 +118,7 @@ function getPackageCommandUsage(command: PackageCommand): string {
 		case "remove":
 			return `${APP_NAME} package remove <source> [--local]`;
 		case "update":
-			return `${APP_NAME} update [--force] or ${APP_NAME} package update [source]`;
+			return `${APP_NAME} update [--force] [--allow-official] or ${APP_NAME} package update [source]`;
 		case "list":
 			return `${APP_NAME} package list`;
 	}
@@ -167,6 +170,7 @@ Options:
   --extensions            Update installed packages only
   --extension <source>    Update one package only
   --force                 Reinstall ${APP_NAME} even if the current version is latest
+  --allow-official        Install the official package over this fork build (fork gate override)
   --daemon-socket <path>  Restart the daemon listening on this exact socket
 
 Commands:
@@ -200,6 +204,7 @@ function parsePackageCommand(args: string[]): PackageCommandOptions | undefined 
 
 	let local = false;
 	let force = false;
+	let allowOfficial = false;
 	let help = false;
 	let invalidOption: string | undefined;
 	let invalidArgument: string | undefined;
@@ -251,6 +256,15 @@ function parsePackageCommand(args: string[]): PackageCommandOptions | undefined 
 		if (arg === "--force") {
 			if (command === "update") {
 				force = true;
+			} else {
+				invalidOption = invalidOption ?? arg;
+			}
+			continue;
+		}
+
+		if (arg === "--allow-official") {
+			if (command === "update") {
+				allowOfficial = true;
 			} else {
 				invalidOption = invalidOption ?? arg;
 			}
@@ -372,6 +386,7 @@ function parsePackageCommand(args: string[]): PackageCommandOptions | undefined 
 		updateTarget,
 		local,
 		force,
+		allowOfficial,
 		help,
 		daemonSocketPath,
 		restartCoordinator,
@@ -1582,6 +1597,23 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 					}
 				}
 				if (updateTargetIncludesSelf(target)) {
+					// Fork self-keep gate: the official package this path installs does not
+					// contain the fork's changes, so a fork build refuses before the version
+					// probe and before any session-loss confirmation. Extensions above are
+					// unaffected; --allow-official takes the official path anyway.
+					const forkInstall = detectForkInstall();
+					if (forkInstall) {
+						if (!options.allowOfficial) {
+							for (const line of forkSelfUpdateRefusalLines(forkInstall, {
+								extensionsUpdated: updateTargetIncludesExtensions(target),
+							})) {
+								console.error(line);
+							}
+							process.exitCode = 1;
+							return true;
+						}
+						console.error(chalk.yellow(forkSelfUpdateOverrideLine(forkInstall)));
+					}
 					const selfUpdatePlan = await getSelfUpdatePlan(options.force);
 					if (!selfUpdatePlan.shouldRun) {
 						setSelfUpdateNoChangeExitCode();
