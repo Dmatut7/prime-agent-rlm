@@ -4,4 +4,5 @@
 
 export * from "./branch-summarization.js";
 export * from "./compaction.js";
+export * from "./summarization-budget.js";
 export * from "./utils.js";

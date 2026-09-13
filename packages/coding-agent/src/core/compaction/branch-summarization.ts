@@ -15,7 +15,14 @@ import {
 	createCustomMessage,
 } from "../messages.js";
 import type { ReadonlySessionManager, SessionEntry } from "../session-manager.js";
-import { estimateTokens } from "./compaction.js";
+import { estimateTokens, summarizationInflation } from "./compaction.js";
+import {
+	buildSummarizationPromptText,
+	clampConversationText,
+	computeSummarizationInputBudget,
+	SUMMARIZATION_INFLATION_FLOOR,
+	summarizationFrameText,
+} from "./summarization-budget.js";
 import {
 	computeFileLists,
 	createFileOps,
@@ -254,18 +261,6 @@ export async function generateBranchSummary(
 	options: GenerateBranchSummaryOptions,
 ): Promise<BranchSummaryResult> {
 	const { model, apiKey, headers, signal, customInstructions, replaceInstructions, reserveTokens = 16384 } = options;
-	const contextWindow = model.contextWindow || 128000;
-	const tokenBudget = contextWindow - reserveTokens;
-
-	const { messages, fileOps } = prepareBranchEntries(entries, tokenBudget);
-
-	// Nothing model-visible remains after filtering.
-	if (messages.length === 0) {
-		return { summary: "No content to summarize" };
-	}
-	// Serialize before the LLM call so it summarizes rather than continues this branch.
-	const llmMessages = convertToLlm(messages);
-	const conversationText = serializeConversation(llmMessages);
 	let instructions: string;
 	if (replaceInstructions && customInstructions) {
 		instructions = customInstructions;
@@ -274,7 +269,45 @@ export async function generateBranchSummary(
 	} else {
 		instructions = BRANCH_SUMMARY_PROMPT;
 	}
-	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${instructions}`;
+
+	// A branch summary is one request as well, so it gets the same budget: the
+	// provider counts the system prompt and the <conversation> frame against the
+	// same input limit, and a catalog can declare more window than it accepts.
+	const frameText = summarizationFrameText({ style: "turn-prefix", instructions, maxElidedMessages: 0 });
+	const budgetFor = (inflation: number) =>
+		computeSummarizationInputBudget({
+			contextWindow: model.contextWindow || 128000,
+			reserveTokens,
+			systemPromptText: SUMMARIZATION_SYSTEM_PROMPT,
+			wrapperText: frameText,
+			provider: model.provider,
+			modelId: model.id,
+			inflation,
+		});
+	let budget = budgetFor(SUMMARIZATION_INFLATION_FLOOR);
+	let prepared = prepareBranchEntries(entries, budget.conversationTokens);
+	// Second pass: the selected messages carry the provider's own token count, which
+	// calibrates the chars/4 estimate the first selection was made with.
+	const inflation = summarizationInflation(prepared.messages);
+	if (inflation > SUMMARIZATION_INFLATION_FLOOR) {
+		budget = budgetFor(inflation);
+		prepared = prepareBranchEntries(entries, budget.conversationTokens);
+	}
+	const { messages, fileOps } = prepared;
+
+	// Nothing model-visible remains after filtering.
+	if (messages.length === 0) {
+		return { summary: "No content to summarize" };
+	}
+	// Serialize before the LLM call so it summarizes rather than continues this branch.
+	const llmMessages = convertToLlm(messages);
+	const clamped = clampConversationText(serializeConversation(llmMessages), budget.conversationTokens);
+	const promptText = buildSummarizationPromptText({
+		conversationText: clamped.text,
+		elided: 0,
+		style: "turn-prefix",
+		instructions,
+	});
 
 	const summarizationMessages = [
 		{

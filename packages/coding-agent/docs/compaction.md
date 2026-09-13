@@ -267,6 +267,31 @@ This prevents the model from treating it as a conversation to continue.
 
 Tool results are truncated to 2000 characters during serialization. Content beyond that limit is replaced with a marker indicating how many characters were truncated. This keeps summarization requests within reasonable token budgets, since tool results, especially from `ipython` and optional `bash`, are typically the largest contributors to context size.
 
+### Summarization Request Budget
+
+The summarization call is itself one request, and a provider that rejects it rejects the whole compaction: the context stays above the threshold and every later attempt fails the same way. The budget in [`summarization-budget.ts`](../src/core/compaction/summarization-budget.ts) therefore pays for every part of the request, not just the conversation:
+
+```
+inputLimit          = min(model.contextWindow, measured provider input limit)
+safetyMargin        = ceil(inputLimit * 0.02)
+conversationReal    = inputLimit - reserveTokens - systemPromptTokens - wrapperTokens - safetyMargin
+conversationEstimate = floor(conversationReal / inflation)
+```
+
+- **`inputLimit`** — a provider can accept less input than the catalog declares for the window. Bailian's DashScope compatible-mode answers an oversized prompt with `Range of input length should be [1, 983616]` for a model whose `models.json` entry says `contextWindow: 1000000`. Measured limits live in [`model-input-limits.ts`](../src/core/model-input-limits.ts) and clamp the declaration; only limits with recorded evidence are listed.
+- **`wrapperTokens`** — the elision note, the `<conversation>` and `<previous-summary>` delimiters, the instruction template, any `/compact` instructions, and the kernel-persistence note. The previous summary and the instructions are user-sized, so they are measured rather than assumed small.
+- **`safetyMargin`** — 2% of the input limit for overhead no character count can see (chat template, per-message framing, tokenizer drift).
+- **`inflation`** — `estimateTokens` is a chars/4 heuristic and reads CJK- and code-heavy transcripts low by a wide margin (the session that produced the production 400 measured 614k estimated tokens against 982k provider-reported prompt tokens). The newest assistant usage inside the slice is the provider's own count of nearly the same content, so it anchors the conversion; it is floored at 1 and capped at 4.
+
+Two further guards, because an estimate can still be wrong:
+
+- The serialized conversation is clamped to the budget by dropping its oldest characters, with a marker saying how many. The message-level trimmer always keeps the newest message, so one oversized paste used to be sent verbatim.
+- If the provider still rejects the request for input length, the call is retried up to `SUMMARIZATION_INPUT_RETRY_LIMIT` times with `inflation` raised by `SUMMARIZATION_INPUT_RETRY_SHRINK` each time. Every attempt is a separate wire call with its own request identity, so a shrunk body never reuses an idempotency key. Aborts and unrelated errors are never retried.
+
+### When Compaction Keeps Failing
+
+Failures are counted across auto and manual attempts. From `COMPACTION_RECOVERY_HINT_THRESHOLD` (3) consecutive failures on, the failure notice carries the ways out instead of only the provider error: `/compact <instructions>`, `/tree` or `/fork` to continue from a smaller context, `/model` for a larger window, `/new` for a fresh session, and the `compaction.reserveTokens` setting that widens the summarization budget. A compaction that produces a summary clears the streak; aborts and "nothing to compact" skips do not count.
+
 ## Custom Summarization via Extensions
 
 Extensions can intercept and customize both compaction and branch summarization. See [`extensions/types.ts`](../src/core/extensions/types.ts) for event type definitions.
@@ -389,7 +414,7 @@ Configure compaction in `~/.prime/agent/settings.json` or `<project-dir>/.prime/
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `enabled` | `true` | Enable auto-compaction |
-| `reserveTokens` | `16384` | Tokens to reserve for LLM response |
+| `reserveTokens` | `16384` | Tokens to reserve for the LLM response; also subtracted from the summarization request budget, so lowering it widens that request at the cost of summary length |
 | `keepRecentTokens` | `20000` | Recent tokens to keep (not summarized) |
 
 Disable auto-compaction with `"enabled": false`. You can still compact manually with `/compact`.

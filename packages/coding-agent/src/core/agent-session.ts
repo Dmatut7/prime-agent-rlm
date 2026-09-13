@@ -106,7 +106,9 @@ import {
 } from "./autonomous.js";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.js";
 import {
+	buildCompactionRecoveryHint,
 	COMPACT_SKILL_NAME,
+	COMPACTION_RECOVERY_HINT_THRESHOLD,
 	type CompactionResult,
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
@@ -1390,6 +1392,13 @@ export class AgentSession {
 	private _compactionOperation: Promise<void> | undefined = undefined;
 	/** One recovery attempt per overflow; "reported" dedups the failure notice. */
 	private _overflowRecovery: "idle" | "attempted" | "reported" = "idle";
+	/**
+	 * Compactions that failed in a row, counted across auto and manual attempts.
+	 * A context above its threshold whose compaction cannot run does not shrink on
+	 * its own, so once this reaches COMPACTION_RECOVERY_HINT_THRESHOLD the failure
+	 * notice carries the user's way out instead of only the provider error.
+	 */
+	private _consecutiveCompactionFailures = 0;
 	private _continueAfterThresholdCompaction = false;
 	/**
 	 * Cooldown after a threshold compaction that skipped or failed, so an
@@ -9214,6 +9223,7 @@ export class AgentSession {
 			didCompact = true;
 			// Manual compaction restructures the context; drop any stale threshold cooldown.
 			this._thresholdCompactionCooldown = undefined;
+			this._clearCompactionFailures();
 			// A manual compaction satisfies any pending model request; on failure the
 			// request stays scheduled for the next turn boundary.
 			this._pendingRequestedCompaction = undefined;
@@ -9222,16 +9232,23 @@ export class AgentSession {
 			const message = error instanceof Error ? error.message : String(error);
 			const aborted = message === "Compaction cancelled" || (error instanceof Error && error.name === "AbortError");
 			const skipped = error instanceof CompactionSkippedError;
+			// A manual /compact that fails is the user already trying to recover, so a
+			// repeating failure has to surface the remaining options where they will be
+			// read: the thrown message is what the slash-command result prints.
+			const recoveryHint = aborted || skipped ? "" : this._registerCompactionFailure();
 			this._emit({
 				type: "compaction_end",
 				reason: "manual",
 				result: undefined,
 				aborted,
 				willRetry: false,
-				errorMessage: aborted ? undefined : skipped ? message : `Compaction failed: ${message}`,
+				errorMessage: aborted ? undefined : skipped ? message : `Compaction failed: ${message}${recoveryHint}`,
 				errorSeverity: skipped ? "warning" : "error",
 				customInstructions,
 			});
+			if (recoveryHint && error instanceof Error) {
+				throw new Error(`${error.message}${recoveryHint}`, { cause: error });
+			}
 			throw error;
 		} finally {
 			if (this._compactionAbortController === compactionAbort) {
@@ -10481,6 +10498,23 @@ export class AgentSession {
 	}
 
 	/**
+	 * Count a compaction that failed to produce a summary and return the recovery
+	 * guidance to attach once failures repeat (empty until then). Aborts and skips
+	 * do not count: a user-initiated cancel is not a failure to summarize, and
+	 * "nothing to compact" does not leave the session stuck.
+	 */
+	private _registerCompactionFailure(): string {
+		this._consecutiveCompactionFailures += 1;
+		if (this._consecutiveCompactionFailures < COMPACTION_RECOVERY_HINT_THRESHOLD) return "";
+		return buildCompactionRecoveryHint(this._consecutiveCompactionFailures);
+	}
+
+	/** A compaction that produced a summary ends the failure streak. */
+	private _clearCompactionFailures(): void {
+		this._consecutiveCompactionFailures = 0;
+	}
+
+	/**
 	 * Internal: Run automatic (threshold/overflow) or model-requested compaction
 	 * with events.
 	 */
@@ -10586,7 +10620,8 @@ export class AgentSession {
 						: authResult.ok
 							? "no API key is available"
 							: authResult.error;
-				this._endCompactionUnsuccessfully(reason, "failed", `Compaction failed: ${detail}`);
+				const recoveryHint = this._registerCompactionFailure();
+				this._endCompactionUnsuccessfully(reason, "failed", `Compaction failed: ${detail}${recoveryHint}`);
 				this._clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(
 					reason === "threshold" && shouldContinueAfterCompaction,
 					queuedAutonomousContinuationsForThisCompaction,
@@ -10606,6 +10641,7 @@ export class AgentSession {
 			// A successful compaction restructures the context; any earlier
 			// skip/failure cooldown no longer reflects reality.
 			this._thresholdCompactionCooldown = undefined;
+			this._clearCompactionFailures();
 
 			this._emit({
 				type: "compaction_end",
@@ -10669,14 +10705,17 @@ export class AgentSession {
 				resumeAfterFailure();
 				return false;
 			}
+			const recoveryHint = this._registerCompactionFailure();
 			this._endCompactionUnsuccessfully(
 				reason,
 				"failed",
-				reason === "overflow"
-					? `Context overflow recovery failed: ${errorMessage}`
-					: reason === "requested"
-						? `Requested compaction failed: ${errorMessage}`
-						: `Auto-compaction failed: ${errorMessage}`,
+				`${
+					reason === "overflow"
+						? `Context overflow recovery failed: ${errorMessage}`
+						: reason === "requested"
+							? `Requested compaction failed: ${errorMessage}`
+							: `Auto-compaction failed: ${errorMessage}`
+				}${recoveryHint}`,
 				{ customInstructions },
 			);
 			if (reason === "threshold") this._armThresholdCompactionCooldown();

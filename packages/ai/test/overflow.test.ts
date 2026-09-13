@@ -57,6 +57,23 @@ describe("isContextOverflow", () => {
 		expect(isContextOverflow({ ...createErrorMessage(litellmError), stopReason }, 262144)).toBe(false);
 	});
 
+	it("detects Alibaba DashScope (Bailian compatible-mode) input-length rejection", () => {
+		// Verbatim production error: a catalog contextWindow of 1000000 against a
+		// provider input limit of 983616, so the request is rejected wholesale.
+		const message = createErrorMessage(
+			"400 <400> InternalError.Algo.InvalidParameter: Range of input length should be [1, 983616]",
+		);
+		expect(isContextOverflow(message, 1000000)).toBe(true);
+	});
+
+	it("does not treat a DashScope output-cap rejection as overflow", () => {
+		// Shrinking the context cannot fix a max_tokens that the model does not offer.
+		const message = createErrorMessage(
+			"400 <400> InternalError.Algo.InvalidParameter: Range of max_tokens should be [1, 32768]",
+		);
+		expect(isContextOverflow(message, 1000000)).toBe(false);
+	});
+
 	it("detects explicit Ollama prompt-too-long errors", () => {
 		const message = createErrorMessage("400 `prompt too long; exceeded max context length by 100918 tokens`");
 		expect(isContextOverflow(message, 32768)).toBe(true);

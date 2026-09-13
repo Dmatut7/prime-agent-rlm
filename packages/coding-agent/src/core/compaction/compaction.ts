@@ -17,6 +17,18 @@ import {
 import { buildSessionContext, type CompactionEntry, type SessionEntry } from "../session-manager.js";
 import { addAssistantUsage, emptyUsage } from "../usage.js";
 import {
+	buildSummarizationPromptText,
+	clampConversationText,
+	clampSummarizationInflation,
+	computeSummarizationInputBudget,
+	isInputLengthRejection,
+	SUMMARIZATION_INFLATION_FLOOR,
+	SUMMARIZATION_INPUT_RETRY_LIMIT,
+	SUMMARIZATION_INPUT_RETRY_SHRINK,
+	type SummarizationNoteStyle,
+	summarizationFrameText,
+} from "./summarization-budget.js";
+import {
 	computeFileLists,
 	createFileOps,
 	extractFileOpsFromMessage,
@@ -120,6 +132,28 @@ export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	reserveTokens: 16384,
 	keepRecentTokens: 20000,
 };
+
+/** Failed compactions in a row before the failure notice carries recovery options. */
+export const COMPACTION_RECOVERY_HINT_THRESHOLD = 3;
+
+/**
+ * Recovery options for a session whose compaction keeps failing.
+ *
+ * A context above the compaction threshold whose compaction cannot run does not
+ * recover by itself: every later turn re-triggers the same failing call, so the
+ * notice has to say what the user can do instead of repeating the provider error.
+ */
+export function buildCompactionRecoveryHint(consecutiveFailures: number): string {
+	return [
+		"",
+		`Compaction has now failed ${consecutiveFailures} times in a row. The context stays above the compaction threshold, so it will not shrink on its own - pick one:`,
+		"1. /compact <instructions> - retry now; instructions narrow what the summary has to carry.",
+		"2. /tree, or /fork from an earlier user message - continue from a smaller context and leave the oversized tail behind.",
+		"3. /model - switch to a model with a larger context window or a different provider, then compact again.",
+		"4. /new - start a fresh session; /export first if you need this transcript.",
+		"If the error mentions the input length, the summarization request itself is over the provider's input limit: lowering compaction.reserveTokens in settings widens that request's budget, at the cost of summary length rather than context.",
+	].join("\n");
+}
 /**
  * Calculate total context tokens from usage.
  * Uses the native totalTokens field when available, falls back to computing from components.
@@ -576,13 +610,180 @@ export function budgetSummarizationInput(
 }
 
 /**
+ * Provider-anchored correction for the chars/4 estimator.
+ *
+ * estimateTokens reads CJK- and code-heavy transcripts low by a wide margin. The
+ * session that produced the production 400 measured 614k estimated tokens against
+ * 982k provider-reported prompt tokens for the same content (ratio 1.60), so a
+ * budget expressed in raw estimates approves a request the provider rejects. The
+ * newest assistant usage inside the slice is the provider's own count of nearly
+ * this content, which makes it the cheapest honest anchor available. It covers the
+ * agent system prompt and tool schemas too, so it errs high - the safe direction.
+ * Returns the floor when the slice carries no usage to anchor on.
+ */
+export function summarizationInflation(messages: AgentMessage[]): number {
+	let estimated = 0;
+	let anchorTokens = 0;
+	let anchorEstimated = 0;
+	for (const message of messages) {
+		estimated += estimateTokens(message);
+		if (!isAssistantUsageSource(message)) continue;
+		anchorTokens = calculateContextTokens(message.usage);
+		anchorEstimated = estimated;
+	}
+	if (anchorTokens <= 0 || anchorEstimated <= 0) return SUMMARIZATION_INFLATION_FLOOR;
+	return clampSummarizationInflation(anchorTokens / anchorEstimated);
+}
+
+/** Per-call overrides for one summarization request. */
+export interface SummarizationRequestOptions {
+	/**
+	 * Provider tokens per estimated token. Defaults to the anchor measured from the
+	 * slice itself; a retry raises it so the next attempt carries less content.
+	 */
+	inflation?: number;
+}
+
+interface SummarizationCallOptions extends SummarizationRequestOptions {
+	currentMessages: AgentMessage[];
+	model: Model<any>;
+	reserveTokens: number;
+	apiKey: string;
+	headers?: Record<string, string>;
+	signal?: AbortSignal;
+	thinkingLevel?: ThinkingLevel;
+	/** Output cap for this call. */
+	maxTokens: number;
+	/** Instruction block that follows the conversation. */
+	instructions: string;
+	style: SummarizationNoteStyle;
+	previousSummary?: string;
+	/** Error prefix, e.g. "Summarization failed". */
+	errorLabel: string;
+}
+
+/**
+ * Build and send one summarization request.
+ *
+ * The provider measures system prompt + wrapper + serialized conversation against
+ * a single input limit that can sit below the declared context window, so the
+ * conversation only gets what is left after the frame, the output reserve, a
+ * measured-limit clamp and a safety margin are paid for, converted into the
+ * estimator's caliber. Two failure modes the old `contextWindow - reserveTokens`
+ * budget had are closed here: the frame was unbudgeted, and one oversized newest
+ * message was always sent verbatim.
+ */
+async function completeSummarizationRequest(options: SummarizationCallOptions): Promise<SummarySlice> {
+	const {
+		currentMessages,
+		model,
+		reserveTokens,
+		apiKey,
+		headers,
+		signal,
+		thinkingLevel,
+		maxTokens,
+		instructions,
+		style,
+		previousSummary,
+		errorLabel,
+	} = options;
+	const inflation = clampSummarizationInflation(options.inflation ?? summarizationInflation(currentMessages));
+	const wrapperText = summarizationFrameText({
+		style,
+		instructions,
+		previousSummary,
+		maxElidedMessages: currentMessages.length,
+	});
+	const budget = computeSummarizationInputBudget({
+		contextWindow: model.contextWindow,
+		reserveTokens,
+		systemPromptText: SUMMARIZATION_SYSTEM_PROMPT,
+		wrapperText,
+		provider: model.provider,
+		modelId: model.id,
+		inflation,
+	});
+	const { messages: budgetedMessages, elided } = budgetSummarizationInput(currentMessages, budget.conversationTokens);
+	// Serialize before the LLM call so it summarizes rather than continues this conversation.
+	const conversationText = serializeConversation(convertToLlm(budgetedMessages));
+	const clamped = clampConversationText(conversationText, budget.conversationTokens);
+	const promptText = buildSummarizationPromptText({
+		conversationText: clamped.text,
+		elided,
+		style,
+		instructions,
+		previousSummary,
+	});
+
+	const completionOptions =
+		model.reasoning && thinkingLevel && thinkingLevel !== "off"
+			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
+			: { maxTokens, signal, apiKey, headers };
+
+	const response = await completeSimple(
+		model,
+		{
+			systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
+			messages: [
+				{
+					role: "user" as const,
+					content: [{ type: "text" as const, text: promptText }],
+					timestamp: Date.now(),
+				},
+			],
+		},
+		completionOptions,
+	);
+
+	if (response.stopReason === "error") {
+		throw new Error(`${errorLabel}: ${response.errorMessage || "Unknown error"}`);
+	}
+
+	const summary = response.content
+		.filter((c): c is { type: "text"; text: string } => c.type === "text")
+		.map((c) => c.text)
+		.join("\n");
+
+	return { summary, usage: response.usage };
+}
+
+/**
+ * Retry a summarization call with a smaller slice while the provider says the
+ * input was too long.
+ *
+ * The estimator's caliber is the one thing the budget cannot know exactly, so an
+ * input-length rejection is treated as a measurement: assume the content is denser
+ * than assumed and try again. Bounded, because a rejection can also be permanent.
+ * `run` is called once per attempt and must produce a fresh request identity, so
+ * two attempts never share an idempotency key.
+ */
+export async function summarizeWithInputLengthRetry(
+	run: (options: SummarizationRequestOptions) => Promise<SummarySlice>,
+	initialInflation: number,
+	signal?: AbortSignal,
+	isRetryable: (error: unknown) => boolean = (error) =>
+		isInputLengthRejection(error instanceof Error ? error.message : String(error)),
+): Promise<SummarySlice> {
+	let inflation = clampSummarizationInflation(initialInflation);
+	for (let attempt = 0; ; attempt++) {
+		try {
+			return await run({ inflation });
+		} catch (error) {
+			if (attempt >= SUMMARIZATION_INPUT_RETRY_LIMIT || signal?.aborted || !isRetryable(error)) throw error;
+			inflation = clampSummarizationInflation(inflation * SUMMARIZATION_INPUT_RETRY_SHRINK);
+		}
+	}
+}
+
+/**
  * Generate a summary of the conversation using the LLM.
  * If previousSummary is provided, uses the update prompt to merge.
  *
- * The input is trimmed to the model's usable window (mirroring branch
- * summarization) so a large context cannot overflow the summarization request
- * itself. Oldest messages are elided first; file-operation tracking is computed
- * from the full preparation elsewhere and is unaffected.
+ * The input is trimmed to what the summarization request itself can carry
+ * (mirroring branch summarization) so a large context cannot overflow it. Oldest
+ * messages are elided first; file-operation tracking is computed from the full
+ * preparation elsewhere and is unaffected.
  */
 export async function generateSummary(
 	currentMessages: AgentMessage[],
@@ -594,55 +795,23 @@ export async function generateSummary(
 	customInstructions?: string,
 	previousSummary?: string,
 	thinkingLevel?: ThinkingLevel,
+	options?: SummarizationRequestOptions,
 ): Promise<SummarySlice> {
-	const maxTokens = Math.floor(0.8 * reserveTokens);
-
-	const basePrompt = buildSummarizationPrompt(customInstructions, previousSummary);
-	// Serialize before the LLM call so it summarizes rather than continues this conversation.
-	const contextWindow = model.contextWindow || 0;
-	const inputBudget = contextWindow > 0 ? contextWindow - reserveTokens : 0;
-	const { messages: budgetedMessages, elided } = budgetSummarizationInput(currentMessages, inputBudget);
-	const llmMessages = convertToLlm(budgetedMessages);
-	const conversationText = serializeConversation(llmMessages);
-	let promptText = "";
-	if (elided > 0) {
-		promptText += `[Note: ${elided} older message(s) were elided to fit the summarization budget. Reflect any preserved prior summary instead of them.]\n`;
-	}
-	promptText += `<conversation>\n${conversationText}\n</conversation>\n\n`;
-	if (previousSummary) {
-		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
-	}
-	promptText += basePrompt;
-
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
-
-	const completionOptions =
-		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
-			: { maxTokens, signal, apiKey, headers };
-
-	const response = await completeSimple(
+	return completeSummarizationRequest({
+		...options,
+		currentMessages,
 		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		completionOptions,
-	);
-
-	if (response.stopReason === "error") {
-		throw new Error(`Summarization failed: ${response.errorMessage || "Unknown error"}`);
-	}
-
-	const textContent = response.content
-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
-		.map((c) => c.text)
-		.join("\n");
-
-	return { summary: textContent, usage: response.usage };
+		reserveTokens,
+		apiKey,
+		headers,
+		signal,
+		thinkingLevel,
+		maxTokens: Math.floor(0.8 * reserveTokens),
+		instructions: buildSummarizationPrompt(customInstructions, previousSummary),
+		style: "history",
+		previousSummary,
+		errorLabel: "Summarization failed",
+	});
 }
 export interface CompactionPreparation {
 	/** UUID of first entry to keep */
@@ -788,43 +957,10 @@ export async function compact(
 	let summary: string;
 	const slices: SummarySlice[] = [];
 
-	if (isSplitTurn && turnPrefixMessages.length > 0) {
-		// Split turns make two wire calls with different bodies; each needs its own identity.
-		const [historyResult, turnPrefixResult] = await Promise.all([
-			// An empty history slice still replaces the previous compaction in the
-			// rebuilt context, so carry its summary forward instead of dropping
-			// everything summarized before it.
-			messagesToSummarize.length > 0
-				? summaryCall((callHeaders) =>
-						generateSummary(
-							messagesToSummarize,
-							model,
-							settings.reserveTokens,
-							apiKey,
-							callHeaders,
-							signal,
-							customInstructions,
-							previousSummary,
-							thinkingLevel,
-						),
-					)
-				: Promise.resolve<SummarySlice>({ summary: previousSummary ?? "No prior history." }),
-			summaryCall((callHeaders) =>
-				generateTurnPrefixSummary(
-					turnPrefixMessages,
-					model,
-					settings.reserveTokens,
-					apiKey,
-					callHeaders,
-					signal,
-					thinkingLevel,
-				),
-			),
-		]);
-		slices.push(historyResult, turnPrefixResult);
-		summary = `${historyResult.summary}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult.summary}`;
-	} else {
-		const result = await summaryCall((callHeaders) =>
+	// Each attempt is a separate wire call, so it goes through summaryCall again and
+	// gets its own request identity: a shrunk body must never reuse an idempotency key.
+	const runHistorySummary = (requestOptions: SummarizationRequestOptions) =>
+		summaryCall((callHeaders) =>
 			generateSummary(
 				messagesToSummarize,
 				model,
@@ -835,7 +971,41 @@ export async function compact(
 				customInstructions,
 				previousSummary,
 				thinkingLevel,
+				requestOptions,
 			),
+		);
+	const runTurnPrefixSummary = (requestOptions: SummarizationRequestOptions) =>
+		summaryCall((callHeaders) =>
+			generateTurnPrefixSummary(
+				turnPrefixMessages,
+				model,
+				settings.reserveTokens,
+				apiKey,
+				callHeaders,
+				signal,
+				thinkingLevel,
+				requestOptions,
+			),
+		);
+
+	if (isSplitTurn && turnPrefixMessages.length > 0) {
+		// Split turns make two wire calls with different bodies; each needs its own identity.
+		const [historyResult, turnPrefixResult] = await Promise.all([
+			// An empty history slice still replaces the previous compaction in the
+			// rebuilt context, so carry its summary forward instead of dropping
+			// everything summarized before it.
+			messagesToSummarize.length > 0
+				? summarizeWithInputLengthRetry(runHistorySummary, summarizationInflation(messagesToSummarize), signal)
+				: Promise.resolve<SummarySlice>({ summary: previousSummary ?? "No prior history." }),
+			summarizeWithInputLengthRetry(runTurnPrefixSummary, summarizationInflation(turnPrefixMessages), signal),
+		]);
+		slices.push(historyResult, turnPrefixResult);
+		summary = `${historyResult.summary}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult.summary}`;
+	} else {
+		const result = await summarizeWithInputLengthRetry(
+			runHistorySummary,
+			summarizationInflation(messagesToSummarize),
+			signal,
 		);
 		slices.push(result);
 		summary = result.summary;
@@ -864,6 +1034,9 @@ export async function compact(
 
 /**
  * Generate a summary for a turn prefix (when splitting a turn).
+ *
+ * Same request budget as generateSummary: an oversized turn prefix must not
+ * overflow the summarization request itself.
  */
 async function generateTurnPrefixSummary(
 	messages: AgentMessage[],
@@ -873,45 +1046,20 @@ async function generateTurnPrefixSummary(
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
+	options?: SummarizationRequestOptions,
 ): Promise<SummarySlice> {
-	const maxTokens = Math.floor(0.5 * reserveTokens); // Smaller budget for turn prefix
-	// Same input budget as generateSummary: an oversized turn prefix must not
-	// overflow the summarization request itself.
-	const contextWindow = model.contextWindow || 0;
-	const inputBudget = contextWindow > 0 ? contextWindow - reserveTokens : 0;
-	const { messages: budgetedMessages, elided } = budgetSummarizationInput(messages, inputBudget);
-	const llmMessages = convertToLlm(budgetedMessages);
-	const conversationText = serializeConversation(llmMessages);
-	let promptText = "";
-	if (elided > 0) {
-		promptText += `[Note: ${elided} older message(s) were elided to fit the summarization budget.]\n`;
-	}
-	promptText += `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
-
-	const response = await completeSimple(
+	return completeSummarizationRequest({
+		...options,
+		currentMessages: messages,
 		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
-			: { maxTokens, signal, apiKey, headers },
-	);
-
-	if (response.stopReason === "error") {
-		throw new Error(`Turn prefix summarization failed: ${response.errorMessage || "Unknown error"}`);
-	}
-
-	return {
-		summary: response.content
-			.filter((c): c is { type: "text"; text: string } => c.type === "text")
-			.map((c) => c.text)
-			.join("\n"),
-		usage: response.usage,
-	};
+		reserveTokens,
+		apiKey,
+		headers,
+		signal,
+		thinkingLevel,
+		maxTokens: Math.floor(0.5 * reserveTokens), // Smaller budget for turn prefix
+		instructions: TURN_PREFIX_SUMMARIZATION_PROMPT,
+		style: "turn-prefix",
+		errorLabel: "Turn prefix summarization failed",
+	});
 }

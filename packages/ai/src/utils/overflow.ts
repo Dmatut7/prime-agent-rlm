@@ -28,6 +28,9 @@ import type { AssistantMessage } from "../types.js";
  *   with output=0 (no room left to generate). Detected via stopReason "length" + zero output +
  *   input filling the context window.
  * - Ollama: Some deployments truncate silently, others return errors like "prompt too long; exceeded max context length by X tokens"
+ * - Alibaba DashScope / Bailian compatible-mode: "400 <400> InternalError.Algo.InvalidParameter:
+ *   Range of input length should be [1, 983616]" - the announced input cap, which can sit below the
+ *   catalog's contextWindow (that model declares 1000000)
  */
 const OVERFLOW_PATTERNS = [
 	/prompt is too long/i, // Anthropic token overflow
@@ -47,6 +50,7 @@ const OVERFLOW_PATTERNS = [
 	/too large for model with \d+ maximum context length/i, // Mistral
 	/model_context_window_exceeded/i, // z.ai non-standard finish_reason surfaced as error text
 	/prompt too long; exceeded (?:max )?context length/i, // Ollama explicit overflow error
+	/range of input length/i, // Alibaba DashScope / Bailian compatible-mode input cap
 	/context[_ ]length[_ ]exceeded/i, // Generic fallback
 	/too many tokens/i, // Generic fallback
 	/token limit exceeded/i, // Generic fallback
