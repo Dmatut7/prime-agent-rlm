@@ -145,7 +145,6 @@ describe("AgentSession compaction characterization", () => {
 			fauxAssistantMessage("one response"),
 			fauxAssistantMessage("two response"),
 			fauxAssistantMessage("model-generated summary"),
-			fauxAssistantMessage("model-generated turn summary"),
 			fauxAssistantMessage("still usable"),
 		]);
 		await harness.session.prompt("one");
@@ -156,6 +155,11 @@ describe("AgentSession compaction characterization", () => {
 		const entry = harness.sessionManager.getEntries().find((candidate) => candidate.type === "compaction");
 
 		expect(result.summary).toContain("model-generated summary");
+		// The cut is aligned to the start of the last turn, so the retained region
+		// begins with the user message that opened it and the compaction is a single
+		// summarizer call - no separate lossy summary of that turn's prefix.
+		expect(result.summary).not.toContain("Turn Context (split turn)");
+		expect(harness.getPendingResponseCount()).toBe(1);
 		expect(result.tokensBefore).toBeGreaterThan(0);
 		expect(result.firstKeptEntryId).toBeTruthy();
 		expect(entry).toMatchObject({

@@ -6,6 +6,10 @@ LLMs have limited context windows. When conversations grow too long, Prime Agent
 - [`compaction.ts`](../src/core/compaction/compaction.ts) - Auto-compaction logic
 - [`branch-summarization.ts`](../src/core/compaction/branch-summarization.ts) - Branch summarization
 - [`utils.ts`](../src/core/compaction/utils.ts) - Shared utilities (file tracking, serialization)
+- [`fact-appendix.ts`](../src/core/compaction/fact-appendix.ts) - Machine-extracted fact ledger (`<fact-appendix>`)
+- [`user-requests.ts`](../src/core/compaction/user-requests.ts) - Verbatim user-request ledger (`<user-requests>`)
+- [`machine-blocks.ts`](../src/core/compaction/machine-blocks.ts) - Shared render/parse/strip for those blocks
+- [`content-density.ts`](../src/core/compaction/content-density.ts) - CJK/code-aware token pricing for generated blocks
 - [`session-manager.ts`](../src/core/session-manager.ts) - Entry types (`CompactionEntry`, `BranchSummaryEntry`)
 - [`extensions/types.ts`](../src/core/extensions/types.ts) - Extension event types
 
@@ -116,6 +120,20 @@ Valid cut points are:
 
 Never cut at tool results (they must stay with their tool call).
 
+### Turn Alignment
+
+A cut in the middle of a turn keeps recent bytes but summarizes the message that opened the turn, so the retained work loses its own request. `alignCutToTurnStart()` therefore moves such a cut back to the start of its turn whenever that is affordable:
+
+```
+extra = estimated tokens of [turnStart, cutPoint)
+align only if  extra <= keepRecentTokens * TURN_ALIGNMENT_EXTRA_SHARE   (share = 1)
+           and turnStart > startIndex
+```
+
+Refusing when the turn start is the range start keeps a compaction from summarizing nothing, and the slack bound keeps a single oversized turn on the split-turn path above instead of retaining a turn larger than the whole keep budget. Alignment is what makes `isSplitTurn` rare rather than the norm: on the three sessions measured for the fidelity audit all three cuts landed mid-turn, and with alignment two of the three retain their turn whole and need one summarizer call instead of two.
+
+A cut that lands on a `bashExecution`, `custom_message` or `branch_summary` entry is also a turn start, so it is reported as `isSplitTurn: false` — the retained region begins at a user-initiated boundary and there is no prefix to summarize.
+
 ### CompactionEntry Structure
 
 Defined in [`session-manager.ts`](../src/core/session-manager.ts):
@@ -138,10 +156,12 @@ interface CompactionEntry<T = unknown> {
 interface CompactionDetails {
   readFiles: string[];
   modifiedFiles: string[];
+  facts?: FactLedger;            // behind <fact-appendix>
+  userRequests?: UserRequestLedger;  // behind <user-requests>
 }
 ```
 
-Extensions can store any JSON-serializable data in `details`. The default compaction tracks file operations, but custom extension implementations can use their own structure.
+Extensions can store any JSON-serializable data in `details`. The default compaction tracks file operations plus the two ledgers described in [Fidelity](#fidelity-what-survives-without-the-model), and custom extension implementations can use their own structure. `details` is the structured carry-forward for the next compaction; the rendered blocks in `summary` are the fallback for entries that have no details.
 
 See [`prepareCompaction()` and `compact()`](../src/core/compaction/compaction.ts) for the implementation.
 
@@ -211,6 +231,53 @@ Same as compaction, extensions can store custom data in `details`.
 
 See [`collectEntriesForBranchSummary()`, `prepareBranchEntries()`, and `generateBranchSummary()`](../src/core/compaction/branch-summarization.ts) for the implementation.
 
+## Fidelity: What Survives Without The Model
+
+A narrative summary is lossy by design, and the losses are not evenly spread. Measured over three real sessions (a 490k-token first compaction, a 46-generation update chain, and a 12-generation merge review): the narrative kept 73.5% of the items that carried the work, but hard facts survived verbatim only 3-20% of the time (SHAs 4%, numbers 3.3%, paths 2.7%), one-off user instructions were the single largest loss (9 of the 9 dropped curated items), and update mode compounded it — numbers lived 1.1 generations on average, one pass dropped 18 SHAs including the session's rollback anchors, and another restated a SHA with one extra digit, which breaks every git command that uses it. Telling the summarizer to "PRESERVE exact file paths, function names, and error messages" did not change that.
+
+So the values that must be exact no longer go through the model. Compaction appends deterministic blocks after the narrative, and [`stripMachineBlocks()`](../src/core/compaction/machine-blocks.ts) removes them from the previous summary before it is sent back to the summarizer: a block the model never sees is a block it can neither drop nor "correct".
+
+| Block | Source | Contents |
+|-------|--------|----------|
+| `<read-files>`, `<modified-files>` | tool calls + previous `details` | cumulative file lists |
+| `<fact-appendix>` | regex over the summarized slice | error signatures, commit SHAs, paths, threshold numbers, issue refs |
+| `<user-requests>` | user messages and `!commands` | the user's own words, verbatim |
+
+### Fact appendix
+
+[`fact-appendix.ts`](../src/core/compaction/fact-appendix.ts) extracts five kinds of fact from every message leaving the context:
+
+- **sha** — 40-hex anywhere; 7-10 hex only on a line with git context, or in prose somebody wrote (a user or assistant message), where a hex-shaped word like `feedback` is the only real false positive. An abbreviated SHA is folded into the full one it prefixes so one anchor keeps one slot and one weight.
+- **path** — absolute, `~/`, and repo-relative paths. Relative paths need an extension or three segments, so branch names are not paths; URLs, `node_modules`, `.git` and `.venv` are excluded. Extracted by a linear scan rather than a `segment(?:/segment)+` regex, which backtracks quadratically on a long run without a slash and hung a compaction for minutes on an 800k-character tool result.
+- **number** — `identifier: 123` (including quoted JSON keys, which is how settings reach a transcript), keyword pairs written as prose (`exit code 2`, `line 22`), and unit numbers (`900s`, `523MB`, `1.41x`). Each carries a verbatim snippet of the line it came from, because a bare number is not a fact.
+- **error** — lines that report a failure rather than mention one. Source lines, diff hunks and serialized tool calls are filtered out; re-runs of one failure collapse by signature with digits normalized, so `bad JSON at position 1871` and `... 2044` are one recurring error.
+- **issue** — `#4603` and `issues/4603` / `pull/4603` spellings.
+
+Each record carries `n` (the weight of the distinct messages that mentioned it — one message counts once, so a value printed 500 times in one log does not outvote a value the user typed once; user and assistant prose weigh 3, tool calls and custom messages 2, tool output and thinking 1) and `g` (the first and last compaction generation that carried it). Records are JSON lines, so a value containing a quote, a newline or CJK round-trips byte-exactly.
+
+Facts never expire by age. The ledger is folded forward structurally, and eviction happens only when the block has to fit its budget: per-kind caps, then a minimum representation per kind (so a transcript full of paths cannot wipe out its SHAs), then a global ranking by weight with a boost for the current generation. Whatever is dropped is counted in the block's `elided` attribute, so a bounded appendix is never a silent one.
+
+The budget is derived, not configured: `factAppendixTokenBudget(keepRecentTokens, summarizedTokens)` takes 3% of what the appendix stands in for and 25% of what the compaction retains, whichever is larger, clamped to `[400, min(20000, keepRecentTokens)]`. A slice can never exceed the model's window, so the share is window-proportionate on its own — a 490k-token slice gets ~14.7k tokens of appendix, a 90k slice gets the 5k floor.
+
+### Verbatim user requests
+
+[`user-requests.ts`](../src/core/compaction/user-requests.ts) keeps what the user actually said: `user` message text and `!command` bash executions, oldest first, JSON-encoded so multi-line and CJK text is byte-exact. A re-sent message collapses into a repeat count instead of a second record. The budget is `userRequestsTokenBudget(keepRecentTokens)` — 30% of the retained window, clamped to `[400, 16000]` — which held all 93 user messages of the measured 490k-token session inside 8k characters.
+
+When the budget binds, three stages run in order: re-clip the oldest requests to `USER_REQUEST_COMPRESSED_CHARS` (160), then drop the requests that were clipped (longest original first — a pasted log is the least likely thing to still be a live obligation), and only then drop requests outright, oldest first. A one-line instruction is never clipped, so it outlives every paste in the ledger. Drops are counted in the `elided` attribute.
+
+### Sizing generated blocks
+
+Both budgets are spent in [`content-density.ts`](../src/core/compaction/content-density.ts) tokens, not characters: CJK is priced at 1.5 characters per token, fenced code at 3, other text at the usual 4. A block sized in raw characters under-reads a Chinese instruction by ~2.7x, which is how a "6000-token" block becomes a 16k-token one. This is separate from the `inflation` anchor in [Summarization Request Budget](#summarization-request-budget): that one converts a provider's own count into the estimator's caliber for a request about to be sent, this one prices text that has no provider count yet.
+
+### Guarantees
+
+Replaying the three measured sessions through this code, with no model in the loop:
+
+- Facts mentioned by 6 or more weighted messages: retained 100% (session B and C: 100% of everything mentioned 3+ times; session A retains 100% at weight ≥6 and 80% at weight ≥3, because one 490k-token slice holds 2251 unique facts and the appendix is bounded).
+- User requests: 0 dropped, all verbatim (one long paste clipped with the elision disclosed).
+- Across five further generations of compaction that add nothing: 0 facts and 0 requests lost, whether the ledger is carried through `details` or recovered from the rendered block.
+- Extraction cost on a 1M-character slice: tens of milliseconds, and linear in the input.
+
 ## Summary Format
 
 Both compaction and branch summarization use the same structured format:
@@ -249,7 +316,23 @@ path/to/file2.ts
 <modified-files>
 path/to/changed.ts
 </modified-files>
+
+<fact-appendix generation="3" facts="41" elided="12" elidedDetail="path:9,number:3">
+Machine-extracted from the transcript by regex, no model involved: ...
+{"k":"error","v":"Error: Failed to resolve API key for provider \"bailian\"","n":3,"g":"1-3"}
+{"k":"sha","v":"4871d9223bac88ac6da9796f4b0c4d33b7566178","n":6,"g":"2-3"}
+{"k":"path","v":"/tmp/ma_audit/rollback-anchor.md","n":3,"g":"1-3"}
+{"k":"number","v":"reserveTokens=16384","n":2,"g":"3-3","c":"settings compaction reserveTokens: 16384"}
+</fact-appendix>
+
+<user-requests generation="3" count="5">
+The user's own words from the compacted transcript, ...
+{"g":1,"s":0,"k":"user","r":1,"t":"不要 push，先跑测试"}
+{"g":2,"s":1,"k":"bash","r":2,"t":"git log --oneline -3"}
+</user-requests>
 ```
+
+Everything from `<read-files>` down is machine-generated (see [Fidelity](#fidelity-what-survives-without-the-model)). The narrative above it is the model's; the blocks are rebuilt from the transcript on every compaction and are stripped out of the previous summary before it is sent back to the model. Branch summaries carry the file blocks only.
 
 ### Message Serialization
 
@@ -265,7 +348,7 @@ Before summarization, messages are serialized to text via [`serializeConversatio
 
 This prevents the model from treating it as a conversation to continue.
 
-Tool results are truncated to 2000 characters during serialization. Content beyond that limit is replaced with a marker indicating how many characters were truncated. This keeps summarization requests within reasonable token budgets, since tool results, especially from `ipython` and optional `bash`, are typically the largest contributors to context size.
+Tool results are truncated in the middle during serialization: the first `TOOL_RESULT_HEAD_CHARS` (2000) and the last `TOOL_RESULT_TAIL_CHARS` (500) characters are kept, and the dropped span is replaced with a marker saying how many characters went. The tail matters because that is where a tool run's verdict lives — a test runner prints its failure list last, a build prints the stopping error last, a stack trace puts the innermost frame last. Head-only truncation discarded all of it: on one measured session 183 facts existed only past the 2000-character cut, across 62 results whose dropped tails totalled 80k characters. Truncation still keeps summarization requests within budget, since tool results, especially from `ipython` and optional `bash`, are typically the largest contributors to context size.
 
 ### Summarization Request Budget
 

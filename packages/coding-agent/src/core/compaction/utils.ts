@@ -4,6 +4,7 @@
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
+import { findMachineBlock, parseBlockLines } from "./machine-blocks.js";
 export interface FileOperations {
 	read: Set<string>;
 	written: Set<string>;
@@ -91,17 +92,51 @@ export function formatFileOperations(readFiles: string[], modifiedFiles: string[
 	if (sections.length === 0) return "";
 	return `\n\n${sections.join("\n\n")}`;
 }
-/** Maximum characters for a tool result in serialized summaries. */
-const TOOL_RESULT_MAX_CHARS = 2000;
 
 /**
- * Truncate text to a maximum character length for summarization.
- * Keeps the beginning and appends a truncation marker.
+ * Recover the file lists a previous summary carries in its rendered blocks.
+ *
+ * formatFileOperations output is machine-generated and re-emitted every generation,
+ * so the blocks are stripped before a summary goes back to the summarizer. Entries
+ * recorded before details carried the lists would lose them at that point; reading
+ * them back out of the rendered blocks keeps the union of what either source knows.
  */
-function truncateForSummary(text: string, maxChars: number): string {
-	if (text.length <= maxChars) return text;
-	const truncatedChars = text.length - maxChars;
-	return `${text.slice(0, maxChars)}\n\n[... ${truncatedChars} more characters truncated]`;
+export function extractFileOpsFromSummary(summary: string, fileOps: FileOperations): void {
+	const read = findMachineBlock(summary, "read-files");
+	if (read) {
+		for (const line of parseBlockLines(read.body)) fileOps.read.add(line);
+	}
+	const modified = findMachineBlock(summary, "modified-files");
+	if (modified) {
+		for (const line of parseBlockLines(modified.body)) fileOps.edited.add(line);
+	}
+}
+/** Characters kept from the start of a tool result in serialized summaries. */
+export const TOOL_RESULT_HEAD_CHARS = 2000;
+
+/**
+ * Characters kept from the end of a tool result.
+ *
+ * The tail is where the verdict of a tool run lives: a test runner prints its
+ * failure list last, a build prints the error that stopped it last, a stack trace
+ * puts the innermost frame last. Head-only truncation discarded all of it - on one
+ * measured session 183 facts existed only past the 2000-character cut, across 62
+ * results whose dropped tails totalled 80k characters.
+ */
+export const TOOL_RESULT_TAIL_CHARS = 500;
+
+/**
+ * Truncate text for summarization by dropping its middle.
+ *
+ * Keeps the head (what the call was and how it started) and the tail (how it ended),
+ * and says how much went so a reader can tell an excerpt from a complete result.
+ */
+function truncateForSummary(text: string, headChars: number, tailChars: number): string {
+	if (text.length <= headChars + tailChars) return text;
+	const truncatedChars = text.length - headChars - tailChars;
+	const head = text.slice(0, headChars);
+	const tail = text.slice(text.length - tailChars);
+	return `${head}\n\n[... ${truncatedChars} characters truncated ...]\n\n${tail}`;
 }
 
 /**
@@ -159,7 +194,7 @@ export function serializeConversation(messages: Message[]): string {
 				.map((c) => c.text)
 				.join("");
 			if (content) {
-				parts.push(`[Tool result]: ${truncateForSummary(content, TOOL_RESULT_MAX_CHARS)}`);
+				parts.push(`[Tool result]: ${truncateForSummary(content, TOOL_RESULT_HEAD_CHARS, TOOL_RESULT_TAIL_CHARS)}`);
 			}
 		}
 	}

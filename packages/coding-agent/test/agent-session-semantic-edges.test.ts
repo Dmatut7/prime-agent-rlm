@@ -78,6 +78,14 @@ async function waitForAsync(condition: () => Promise<boolean>): Promise<void> {
 	}
 }
 
+/**
+ * A second prompt long enough that retaining its whole turn would cost more than the
+ * tiny keepRecentTokens these tests configure, so the cut stays inside the turn and
+ * compaction takes the two-call split-turn path. A short prompt is aligned back to
+ * its turn start instead (alignCutToTurnStart), which summarizes in one call.
+ */
+const SPLIT_TURN_PROMPT = `two ${"x".repeat(400)}`;
+
 describe("AgentSession semantic edges", () => {
 	let tempDir: string;
 	let sessions: AgentSession[];
@@ -798,7 +806,7 @@ describe("AgentSession semantic edges", () => {
 
 		harness.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
 		await harness.session.prompt("one");
-		await harness.session.prompt("two");
+		await harness.session.prompt(SPLIT_TURN_PROMPT);
 		const preCompactionIds = startedRequestIds(readSemanticEdgeLedger(ledgerPath));
 
 		// One slice succeeds on the wire well before its sibling rejects the whole compaction.
@@ -844,7 +852,7 @@ describe("AgentSession semantic edges", () => {
 
 		harness.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
 		await harness.session.prompt("one");
-		await harness.session.prompt("two");
+		await harness.session.prompt(SPLIT_TURN_PROMPT);
 		const preCompactionIds = startedRequestIds(readSemanticEdgeLedger(ledgerPath));
 
 		// The first slice rejects immediately; its sibling resolves only after the
@@ -908,7 +916,7 @@ describe("AgentSession semantic edges", () => {
 
 		harness.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
 		await harness.session.prompt("one");
-		await harness.session.prompt("two");
+		await harness.session.prompt(SPLIT_TURN_PROMPT);
 
 		const captured: Array<Record<string, string> | undefined> = [];
 		const ledgerAtCall: SemanticEdgeLedgerEvent[][] = [];

@@ -17,6 +17,15 @@ import {
 import { buildSessionContext, type CompactionEntry, type SessionEntry } from "../session-manager.js";
 import { addAssistantUsage, emptyUsage } from "../usage.js";
 import {
+	buildFactLedger,
+	type FactLedger,
+	factAppendixTokenBudget,
+	factLedgerFromDetails,
+	parseFactAppendix,
+	renderFactAppendix,
+} from "./fact-appendix.js";
+import { stripMachineBlocks } from "./machine-blocks.js";
+import {
 	announcedInputLimit,
 	buildSummarizationPromptText,
 	clampConversationText,
@@ -30,18 +39,39 @@ import {
 	summarizationFrameText,
 } from "./summarization-budget.js";
 import {
+	buildUserRequestLedger,
+	parseUserRequests,
+	renderUserRequests,
+	type UserRequestLedger,
+	userRequestLedgerFromDetails,
+	userRequestsTokenBudget,
+} from "./user-requests.js";
+import {
 	computeFileLists,
 	createFileOps,
 	extractFileOpsFromMessage,
+	extractFileOpsFromSummary,
 	type FileOperations,
 	formatFileOperations,
 	SUMMARIZATION_SYSTEM_PROMPT,
 	serializeConversation,
 } from "./utils.js";
-/** Details stored in CompactionEntry.details for file tracking */
+/**
+ * Details stored in CompactionEntry.details.
+ *
+ * Everything here is machine-derived and is the structured carry-forward for the
+ * next compaction: the file lists, the fact ledger behind <fact-appendix> and the
+ * ledger behind <user-requests>. Carrying them structurally is what keeps those
+ * blocks byte-stable across generations; the rendered blocks in the summary text are
+ * the fallback for entries whose details are missing.
+ */
 export interface CompactionDetails {
 	readFiles: string[];
 	modifiedFiles: string[];
+	/** Fact ledger behind the rendered <fact-appendix> block. */
+	facts?: FactLedger;
+	/** Ledger behind the rendered <user-requests> block. */
+	userRequests?: UserRequestLedger;
 }
 
 export interface SummarySlice {
@@ -418,6 +448,64 @@ export function findTurnStartIndex(entries: SessionEntry[], entryIndex: number, 
 	return -1;
 }
 
+/**
+ * Whether an entry begins a turn, so the retained region can start here without
+ * splitting anything: a user message, a user-initiated bash execution, or one of the
+ * entry types that stand in for a user turn (branch summary, custom message).
+ */
+export function isTurnStartEntry(entry: SessionEntry): boolean {
+	if (entry.type === "branch_summary" || entry.type === "custom_message") return true;
+	if (entry.type !== "message") return false;
+	return entry.message.role === "user" || entry.message.role === "bashExecution";
+}
+
+/** Estimated tokens of the message entries in [fromIndex, toIndex). */
+function estimateEntryRangeTokens(entries: SessionEntry[], fromIndex: number, toIndex: number): number {
+	let total = 0;
+	for (let i = fromIndex; i < toIndex; i++) {
+		const entry = entries[i];
+		if (entry.type === "message") total += estimateTokens(entry.message);
+	}
+	return total;
+}
+
+/**
+ * How much more than keepRecentTokens a turn-aligned cut may retain, as a share of
+ * keepRecentTokens. 1 allows the aligned cut to keep up to twice the budget.
+ */
+export const TURN_ALIGNMENT_EXTRA_SHARE = 1;
+
+/**
+ * Move a mid-turn cut back to the start of its turn, when that is affordable.
+ *
+ * A cut in the middle of a turn retains recent bytes but summarizes the message that
+ * started the turn, so the retained work loses its own request: all three sessions
+ * measured for the fidelity audit were cut this way. Moving the cut back keeps the
+ * turn whole - "what am I doing" stays verbatim - and costs one prefix summary fewer.
+ *
+ * The move is bounded because a turn can be arbitrarily large. When retaining the
+ * whole turn would cost more than keepRecentTokens on top of the cut that was
+ * chosen, the mid-turn cut stands and the split-turn prefix summary still covers it:
+ * a compaction that keeps everything and summarizes nothing re-fires every turn.
+ * Aligning to `startIndex` is refused for the same reason.
+ */
+export function alignCutToTurnStart(
+	entries: SessionEntry[],
+	cutIndex: number,
+	startIndex: number,
+	keepRecentTokens: number,
+	extraShare: number = TURN_ALIGNMENT_EXTRA_SHARE,
+): number {
+	if (cutIndex <= startIndex) return cutIndex;
+	const cutEntry = entries[cutIndex];
+	if (!cutEntry || isTurnStartEntry(cutEntry)) return cutIndex;
+	const turnStart = findTurnStartIndex(entries, cutIndex, startIndex);
+	if (turnStart <= startIndex) return cutIndex;
+	const extra = estimateEntryRangeTokens(entries, turnStart, cutIndex);
+	if (extra > keepRecentTokens * extraShare) return cutIndex;
+	return turnStart;
+}
+
 export interface CutPointResult {
 	/** Index of first entry to keep */
 	firstKeptEntryIndex: number;
@@ -489,15 +577,18 @@ export function findCutPoint(
 		}
 		cutIndex--;
 	}
-	const cutEntry = entries[cutIndex];
-	const isUserMessage = cutEntry.type === "message" && cutEntry.message.role === "user";
-	// A cut in a non-user turn requires a prefix summary.
-	const turnStartIndex = isUserMessage ? -1 : findTurnStartIndex(entries, cutIndex, startIndex);
+	// Prefer a cut that starts a turn: the retained region then carries the request it
+	// is answering instead of a lossy summary of it. Bounded, so an oversized turn
+	// still takes the split-turn path.
+	cutIndex = alignCutToTurnStart(entries, cutIndex, startIndex, keepRecentTokens);
+	const isTurnStart = isTurnStartEntry(entries[cutIndex]);
+	// A cut inside a turn requires a prefix summary; a cut at a turn start does not.
+	const turnStartIndex = isTurnStart ? -1 : findTurnStartIndex(entries, cutIndex, startIndex);
 
 	return {
 		firstKeptEntryIndex: cutIndex,
 		turnStartIndex,
-		isSplitTurn: !isUserMessage && turnStartIndex !== -1,
+		isSplitTurn: !isTurnStart && turnStartIndex !== -1,
 	};
 }
 const SUMMARIZATION_PROMPT = `The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
@@ -576,15 +667,27 @@ Use this EXACT format:
 Keep each section concise. Preserve exact file paths, function names, and error messages.`;
 
 /**
+ * Tells the summarizer that the deterministic blocks exist and are not its job.
+ *
+ * Without it the model restates the fact tables in its own words, which is how a
+ * SHA gains a digit and a threshold drifts: the restated copy is what a later
+ * generation then reads. The blocks are appended after the narrative and rebuilt
+ * from the transcript every compaction, so the only thing the narrative has to carry
+ * is what a fact means and whether the work around it is done.
+ */
+const MACHINE_BLOCKS_NOTE = `Machine-generated blocks are appended after your summary and are not part of it: <read-files> and <modified-files>, <fact-appendix> (commit SHAs, paths, threshold numbers, error signatures and issue references, extracted from the transcript by regex) and <user-requests> (the user's own words, verbatim). They are rebuilt every compaction and never pass through you, so do not restate, renumber, re-spell or "correct" their contents anywhere in your sections - a restated SHA or threshold is a second, unreliable copy of a value that is already preserved exactly. Where one of them matters to the plan, refer to it and record its status (done, in progress, blocked, or still owed to the user) instead.`;
+
+/**
  * Build the instruction portion of the summarization prompt: the initial or
- * update template, optional user instructions, and the kernel persistence note.
+ * update template, optional user instructions, the kernel persistence note and the
+ * machine-block note.
  */
 export function buildSummarizationPrompt(customInstructions?: string, previousSummary?: string): string {
 	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
 	if (customInstructions) {
 		basePrompt += `\n\n<user-instructions>\nThe user provided these instructions for this summary. Follow them with high priority while keeping the section format above: emphasize what they ask to focus on, and preserve verbatim anything they ask to remember.\n${customInstructions}\n</user-instructions>`;
 	}
-	return `${basePrompt}\n\n${KERNEL_PERSIST_SUMMARY_NOTE}`;
+	return `${basePrompt}\n\n${KERNEL_PERSIST_SUMMARY_NOTE}\n\n${MACHINE_BLOCKS_NOTE}`;
 }
 
 /**
@@ -857,12 +960,32 @@ export interface CompactionPreparation {
 	/** Whether this is a split turn (cut point in middle of turn) */
 	isSplitTurn: boolean;
 	tokensBefore: number;
-	/** Summary from previous compaction, for iterative update */
+	/**
+	 * Summary from previous compaction, for iterative update. Machine-generated blocks
+	 * are stripped out of it: they are rebuilt by compact() rather than summarized.
+	 */
 	previousSummary?: string;
+	/** Fact ledger carried forward from the previous compaction, if it had one. */
+	previousFacts?: FactLedger;
+	/** Verbatim user-request ledger carried forward from the previous compaction. */
+	previousUserRequests?: UserRequestLedger;
+	/** Compaction generation being written; 1 for a session's first compaction. */
+	generation?: number;
+	/** Effective keepRecentTokens after the window cap; sizes the machine blocks. */
+	keepRecentTokens?: number;
 	/** File operations extracted from messagesToSummarize */
 	fileOps: FileOperations;
 	/** Compaction settions from settings.jsonl	*/
 	settings: CompactionSettings;
+}
+
+/** Compaction generation recorded in an entry's details, or 0 when it carries none. */
+function detailsGeneration(details: unknown): number {
+	if (typeof details !== "object" || details === null) return 0;
+	const typed = details as { facts?: { generation?: number }; userRequests?: { generation?: number } };
+	const fromFacts = Number.isFinite(typed.facts?.generation) ? (typed.facts?.generation ?? 0) : 0;
+	const fromUsers = Number.isFinite(typed.userRequests?.generation) ? (typed.userRequests?.generation ?? 0) : 0;
+	return Math.max(fromFacts, fromUsers);
 }
 
 export function prepareCompaction(
@@ -883,10 +1006,32 @@ export function prepareCompaction(
 	}
 
 	let previousSummary: string | undefined;
+	let previousSummarySource: string | undefined;
+	let previousFacts: FactLedger | undefined;
+	let previousUserRequests: UserRequestLedger | undefined;
+	let previousGeneration = 0;
 	let boundaryStart = 0;
 	if (prevCompactionIndex >= 0) {
 		const prevCompaction = pathEntries[prevCompactionIndex] as CompactionEntry;
-		previousSummary = prevCompaction.summary;
+		const storedSummary = prevCompaction.summary ?? "";
+		previousSummarySource = storedSummary;
+		// The machine-generated blocks never go back to the summarizer. They are
+		// rebuilt from the slice every generation, so sending them only spends frame
+		// budget and hands the model values it can silently alter - the measured
+		// failure was a SHA restated with one extra digit, which breaks every git
+		// command that uses it. What they carried is recovered structurally instead:
+		// details first, the rendered block as the fallback for entries without them.
+		previousSummary = stripMachineBlocks(storedSummary) || undefined;
+		const renderedFacts = parseFactAppendix(storedSummary);
+		const renderedUserRequests = parseUserRequests(storedSummary);
+		previousGeneration = Math.max(
+			detailsGeneration(prevCompaction.details),
+			renderedFacts?.generation ?? 0,
+			renderedUserRequests?.generation ?? 0,
+		);
+		const generation = previousGeneration + 1;
+		previousFacts = factLedgerFromDetails(prevCompaction.details, generation) ?? renderedFacts;
+		previousUserRequests = userRequestLedgerFromDetails(prevCompaction.details, generation) ?? renderedUserRequests;
 		const firstKeptEntryIndex = pathEntries.findIndex((entry) => entry.id === prevCompaction.firstKeptEntryId);
 		boundaryStart = firstKeptEntryIndex >= 0 ? firstKeptEntryIndex : prevCompactionIndex + 1;
 	}
@@ -929,6 +1074,11 @@ export function prepareCompaction(
 			extractFileOpsFromMessage(msg, fileOps);
 		}
 	}
+	// The file lists are stripped out of the previous summary above, so an entry whose
+	// details are missing recovers them from the rendered blocks instead of losing them.
+	if (previousSummarySource) {
+		extractFileOpsFromSummary(previousSummarySource, fileOps);
+	}
 
 	return {
 		firstKeptEntryId,
@@ -937,6 +1087,10 @@ export function prepareCompaction(
 		isSplitTurn: cutPoint.isSplitTurn,
 		tokensBefore,
 		previousSummary,
+		previousFacts,
+		previousUserRequests,
+		generation: previousGeneration + 1,
+		keepRecentTokens,
 		fileOps,
 		settings,
 	};
@@ -1046,6 +1200,11 @@ export async function compact(
 	}
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
 	summary += formatFileOperations(readFiles, modifiedFiles);
+	// Deterministic blocks: no model involvement, so nothing here can be dropped,
+	// restated or altered by the summarizer, and nothing here decays with the
+	// generation count.
+	const appendix = buildCompactionAppendix(preparation);
+	summary += appendix.text;
 
 	if (!firstKeptEntryId) {
 		throw new Error("First kept entry has no UUID - session may need migration");
@@ -1061,8 +1220,58 @@ export async function compact(
 		summary,
 		firstKeptEntryId,
 		tokensBefore,
-		details: { readFiles, modifiedFiles } as CompactionDetails,
+		details: {
+			readFiles,
+			modifiedFiles,
+			facts: appendix.facts,
+			userRequests: appendix.userRequests,
+		} as CompactionDetails,
 		usage,
+	};
+}
+
+export interface CompactionAppendix {
+	/** Fact ledger behind the rendered <fact-appendix> block; carried in entry details. */
+	facts: FactLedger;
+	/** Ledger behind the rendered <user-requests> block; carried in entry details. */
+	userRequests: UserRequestLedger;
+	/** Both blocks rendered, in summary order; empty when neither ledger has content. */
+	text: string;
+}
+
+/**
+ * Build the machine-generated part of a compaction summary.
+ *
+ * The input is the slice being summarized plus, for a split turn, the turn prefix -
+ * both are leaving the context, so both have to be harvested. Budgets come from the
+ * effective keepRecentTokens and the size of what is being replaced, which keeps the
+ * blocks proportionate on a 128k window and on a 1M one without a setting to tune.
+ *
+ * Pure and synchronous: it can be replayed over a stored slice without a model, which
+ * is how the generational-decay guarantee is tested.
+ */
+export function buildCompactionAppendix(preparation: CompactionPreparation): CompactionAppendix {
+	const { messagesToSummarize, turnPrefixMessages, settings } = preparation;
+	const generation = preparation.generation !== undefined && preparation.generation > 0 ? preparation.generation : 1;
+	const keepRecentTokens = preparation.keepRecentTokens ?? capKeepRecentTokens(settings, undefined);
+	const source = turnPrefixMessages.length > 0 ? [...messagesToSummarize, ...turnPrefixMessages] : messagesToSummarize;
+	const summarizedTokens = source.reduce((total, message) => total + estimateTokens(message), 0);
+	const facts = buildFactLedger({
+		messages: source,
+		generation,
+		previous: preparation.previousFacts,
+		tokenBudget: factAppendixTokenBudget(keepRecentTokens, summarizedTokens),
+	});
+	const userRequests = buildUserRequestLedger({
+		messages: source,
+		generation,
+		previous: preparation.previousUserRequests,
+		tokenBudget: userRequestsTokenBudget(keepRecentTokens),
+	});
+	return {
+		facts,
+		userRequests,
+		text: `${renderFactAppendix(facts)}${renderUserRequests(userRequests)}`,
 	};
 }
 
