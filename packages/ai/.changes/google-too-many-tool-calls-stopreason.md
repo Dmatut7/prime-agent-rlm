@@ -1,0 +1,1 @@
+- Fixed Google and Vertex providers treating Gemini's `TOO_MANY_TOOL_CALLS` finish reason as an unhandled stop reason, so a tool-call loop the provider aborts now surfaces as a structured provider stream failure with the raw reason recorded.

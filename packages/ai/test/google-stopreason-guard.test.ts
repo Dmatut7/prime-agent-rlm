@@ -124,6 +124,16 @@ describe("google stopReason guard", () => {
 				expect(message.errorMessage).toContain("MALFORMED_FUNCTION_CALL");
 			});
 
+			it("maps TOO_MANY_TOOL_CALLS to error with the raw reason instead of an unhandled-stop-reason throw", async () => {
+				mockState.chunks = toolCallChunks("TOO_MANY_TOOL_CALLS");
+				const message = await p.run();
+				expect(message.stopReason).toBe("error");
+				expect(message.stopReasonRaw).toBe("TOO_MANY_TOOL_CALLS");
+				expect(message.errorMessage).toContain("TOO_MANY_TOOL_CALLS");
+				expect(message.errorMessage).not.toContain("Unhandled stop reason");
+				expect(message.content.some((b) => b.type === "toolCall")).toBe(true);
+			});
+
 			it("keeps toolUse for STOP with a tool call (normal path unchanged)", async () => {
 				mockState.chunks = toolCallChunks("STOP");
 				const message = await p.run();

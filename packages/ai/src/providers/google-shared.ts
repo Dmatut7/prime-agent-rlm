@@ -330,6 +330,9 @@ export function mapStopReason(reason: FinishReason): StopReason {
 		case FinishReason.LANGUAGE:
 		case FinishReason.MALFORMED_FUNCTION_CALL:
 		case FinishReason.UNEXPECTED_TOOL_CALL:
+		// "Model called too many tools consecutively, thus the system exited execution." -
+		// a tool-protocol abort like UNEXPECTED_TOOL_CALL, not a token-limit truncation.
+		case FinishReason.TOO_MANY_TOOL_CALLS:
 		case FinishReason.NO_IMAGE:
 			return "error";
 		default: {
