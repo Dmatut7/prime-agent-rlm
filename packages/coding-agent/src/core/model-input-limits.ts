@@ -33,7 +33,7 @@ export const MEASURED_PROVIDER_INPUT_LIMITS: readonly MeasuredInputLimit[] = [
 		model: "qwen3.8-max-0902",
 		maxInputTokens: 983616,
 		evidence:
-			'DashScope compatible-mode rejection, verbatim: "400 <400> InternalError.Algo.InvalidParameter: Range of input length should be [1, 983616]" - 56 occurrences across 5 local session transcripts between 2026-09-01 and 2026-09-13, while ~/.prime/agent/models.json declares contextWindow: 1000000 (= 983616 + 16384).',
+			'DashScope compatible-mode rejection, verbatim: "400 <400> InternalError.Algo.InvalidParameter: Range of input length should be [1, 983616]" - 52 occurrences across 4 local session transcripts between 2026-09-01 and 2026-09-13 (16 of them in session 01a07767: 14 consecutive failed threshold compactions plus a failed manual /compact), while ~/.prime/agent/models.json declares contextWindow: 1000000 (= 983616 + 16384).',
 		measuredAt: "2026-09-13",
 	},
 ];
