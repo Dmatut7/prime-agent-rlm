@@ -15,6 +15,7 @@
 
 | 日期 | 这轮干了什么 |
 |---|---|
+| 2026-09-13 傍晚 | 按住的两个依赖升级修好并入：@google/genai 2.21（Gemini 新终局 `TOO_MANY_TOOL_CALLS` 归到工具协议类 `error`，现在带着原始 reason 走结构化 provider 失败并可重试，不再抛 "Unhandled stop reason"；用户可感面＝Gemini 连打工具被 provider 掐断时能自动重试而不是当轮报错收场）＋ vitest 5（去掉 v5 已删的 `describe.sequential`，Anthropic OAuth / MCP OAuth 两个套件此前被**静默丢掉的 17 个测试**全回来；收集面逐枚对账 ai 1178=1178=1180、agent 88=88、coding-agent 6131=6131、test:kernel 36=36、test:process 23=23，差 0） |
 | 2026-09-13 上午 | 压缩保真度根治（实测报告 `/tmp/ma_audit/compaction_fidelity.md`）：硬事实不再走模型——SHA/路径/阈值数字/错误签名/issue 号由正则机械抽取成 `<fact-appendix>` 附在摘要后，用户原话与 `!command` 进 `<user-requests>` 逐字区，两块都结构化跨代 carry-forward 且**不再回喂摘要器**（模型改不了一位 SHA）；toolResult 截断改头 2000+尾 500（测试红的清单在尾部）；切割点对齐到 turn 起点（该轮原始请求逐字在场，常见情况少一次 LLM 调用）；附录预算按内容密度计费（CJK 1.5 字/token）。实测：三场会话回放事实保留 w≥6 100%、用户指令零丢失、再压 5 代零衰减 |
 | 2026-09-13 凌晨 | core 其余面 + TUI 面围猎修复 10 条：/share 密钥预检此前扫的是 base64（明文形状永不命中，等于没有预检）改为扫上传件里可还原的明文；/share 的 `gh` spawn 失败会永久挂死改为报错 + 上界；bash/工具全量输出临时文件 0644→0600；单个会话 cron 存档损坏曾让全进程所有 cron/heartbeat 永久静默，改为隔离该会话 + 告警 + 下次写自愈，调度器读失败也不再永久失械；资源发现目录符号链接加环检测与深度上限（不再靠内核 ELOOP 兜底）且跳过必留痕；`!command` 凭证失败不再进程级永久负缓存（30 s 过期）；bash 流式解码收尾 flush；中断路径 4 个 best-effort abort 补 catch；重试倒计时/压缩 loader 在换会话与拆除时真正 dispose；Loader 与 CountdownTimer 定时器 unref |
 | 2026-09-12 傍晚 | 修「进会话 / 进 agents 视图间歇 1–5 秒」：会话列表摘要落一份持久缓存（按 dev+ino+size+mtime 失效，内容变了必重扫）+ 三处串行转录扫描改并发；开一次 agents 视图的守护进程侧成本 3.35 s → 0.13 s，冷守护进程下 Enter→聊天 5.25 s → 0.22 s；顺带修 agents 视图 Enter 被目录刷新扣住、250 ms 动画定时器全量重建行 |
