@@ -25,7 +25,7 @@ const snapshotId = "snapshot-4602";
 
 interface WorkerHarness {
 	descriptor: { workerId: string; lifecycle: "ready" | "recovering"; pid: number };
-	client?: { close: ReturnType<typeof vi.fn>; request: ReturnType<typeof vi.fn> };
+	client?: { isConnected: boolean; close: ReturnType<typeof vi.fn>; request: ReturnType<typeof vi.fn> };
 	summaries: Map<string, SessionSummary>;
 	snapshotCache: Map<string, DaemonAttachResult>;
 	transcriptCaches: Map<string, SnapshotTranscriptCache>;
@@ -117,7 +117,9 @@ function workerHarness() {
 	});
 	const worker: WorkerHarness = {
 		descriptor: { workerId: "worker-4602", lifecycle: "ready", pid: 987_654_321 },
-		client: { close, request },
+		// A live transport: `requireAvailableWorkerClient` refuses a worker client whose
+		// socket is already gone, and a catch-up attach goes through it.
+		client: { isConnected: true, close, request },
 		summaries: new Map([[activeSessionId, summary()]]),
 		snapshotCache: new Map(),
 		transcriptCaches: new Map<string, SnapshotTranscriptCache>(),

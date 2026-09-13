@@ -284,6 +284,20 @@ async function assertConnectable(socketPath: string): Promise<void> {
 	});
 }
 
+/** Waits for a line the fixture's supervisor logged; stderr arrives on its own schedule. */
+async function waitForLoggedLine(handle: FixtureHandle, needle: string, timeoutMs = 15_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (handle.diagnostics.stdout.includes(needle) || handle.diagnostics.stderr.includes(needle)) {
+			return;
+		}
+		await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+	}
+	throw new Error(
+		`Timed out waiting for ${JSON.stringify(needle)} in fixture output:\n${handle.diagnostics.stdout}\n${handle.diagnostics.stderr}`,
+	);
+}
+
 async function connectEventually(socketPath: string): Promise<DaemonClient> {
 	const deadline = Date.now() + 30_000;
 	let lastError: unknown;
@@ -1162,12 +1176,18 @@ describe("ENG-4600 daemon supervisor ownership", () => {
 		expect(existsSync(`${paths.socketPath}.lock`)).toBe(false);
 		rmSync(paths.socketPath, { force: true });
 
-		writeFileSync(getCronJobsPath(paths.agentDir), "{ malformed\n");
-		const postBindFailure = spawnFixture("supervisor", paths);
+		// Post-bind: the socket file, its lock and the owner record all exist when
+		// this failure lands, so the unwind has to remove all three. The trigger is
+		// injected at a real post-`listen()` step because the original one (a
+		// malformed legacy cron store) is best-effort now - see the retry below.
+		const postBindFailure = spawnFixture("supervisor", paths, {
+			extraEnv: { ENG_4600_FAIL_AFTER_BIND: "1" },
+		});
 		await waitForType(postBindFailure, "booted");
 		send(postBindFailure, "go");
 		expect(await waitForType(postBindFailure, "failed")).toMatchObject({
-			error: expect.stringContaining("JSON"),
+			// "socket bound: true" is the fixture proving the failure came after the bind.
+			error: expect.stringContaining("ENG-4600 injected post-bind startup failure (socket bound: true)"),
 		});
 		await waitForExit(postBindFailure);
 		expect(listOwnerRecords(paths.registryDir)).toEqual([]);
@@ -1175,13 +1195,18 @@ describe("ENG-4600 daemon supervisor ownership", () => {
 		expect(existsSync(paths.socketPath)).toBe(false);
 		const cacheRoot = join(paths.descriptorDir, "snapshot-cache");
 		expect(existsSync(cacheRoot) ? readdirSync(cacheRoot) : []).toEqual([]);
-		rmSync(getCronJobsPath(paths.agentDir), { force: true });
 
+		// The store that used to abort startup post-bind must now only degrade it:
+		// the retry reaches ready, and the unreadable store is reported rather than
+		// fatal (the cron side quarantines it and schedules without it).
+		writeFileSync(getCronJobsPath(paths.agentDir), "{ malformed\n");
 		const healthy = spawnFixture("supervisor", paths);
 		await waitForType(healthy, "booted");
 		send(healthy, "go");
 		await waitForType(healthy, "ready");
+		await waitForLoggedLine(healthy, "cron store file unreadable");
 		await assertConnectable(paths.socketPath);
 		await stopSupervisor(healthy, paths.socketPath);
+		rmSync(getCronJobsPath(paths.agentDir), { force: true });
 	}, 60_000);
 });

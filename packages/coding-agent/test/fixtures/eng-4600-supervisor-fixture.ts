@@ -50,6 +50,32 @@ async function runOwnershipHolder(): Promise<never> {
 	process.exit(0);
 }
 
+/**
+ * Arms a startup failure at a real post-bind step.
+ *
+ * The unwind phase of ENG-4600 needs `start()` to fail *after* the socket is
+ * bound, so there is a live socket, lock and owner record to unwind. Its
+ * original trigger - a malformed legacy cron store - was deliberately degraded
+ * to best-effort (a corrupt legacy store must never keep the daemon from
+ * starting), and every other post-bind step either cannot throw or is wrapped
+ * in a catch. `seedAdoptingWorkerRosterRows` runs after `listen()` and is not
+ * caught, so failing there reproduces the exact shape the unwind must survive.
+ * The thrown message reports whether the socket was bound, so the test proves
+ * the failure really was post-bind instead of trusting the call order.
+ */
+function armPostBindStartupFailure(socketPath: string): void {
+	if (process.env.ENG_4600_FAIL_AFTER_BIND !== "1") {
+		return;
+	}
+	const prototype: object = DaemonSupervisor.prototype;
+	if (typeof Reflect.get(prototype, "seedAdoptingWorkerRosterRows") !== "function") {
+		throw new Error("ENG-4600 post-bind injection point moved; update this fixture");
+	}
+	Reflect.set(prototype, "seedAdoptingWorkerRosterRows", () => {
+		throw new Error(`ENG-4600 injected post-bind startup failure (socket bound: ${existsSync(socketPath)})`);
+	});
+}
+
 async function runSupervisor(): Promise<never> {
 	process.argv[1] = fileURLToPath(new URL("../../src/cli.ts", import.meta.url));
 	process.title = APP_NAME;
@@ -67,6 +93,7 @@ async function runSupervisor(): Promise<never> {
 			noTools: true,
 		},
 	});
+	armPostBindStartupFailure(socketPath);
 	try {
 		await supervisor.start();
 		send({ type: "ready" });

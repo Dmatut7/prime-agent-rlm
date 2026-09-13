@@ -1413,6 +1413,7 @@ describe("InteractiveMode pending bash components", () => {
 
 		const editorStub = { clearHistory: vi.fn(), setText: vi.fn() };
 		const endFeatureHintRun = vi.fn();
+		const disposeRetryCountdown = vi.fn();
 		const queueSelection = new QueueSelection();
 		queueSelection.move({ steering: ["s1"], followUp: [] }, "draft", -1);
 		const fakeThis = {
@@ -1443,6 +1444,18 @@ describe("InteractiveMode pending bash components", () => {
 			setGoalAnnouncementBaseline: vi.fn(),
 			syncGoalTray: vi.fn(),
 			getGoalState: () => emptyGoalState(),
+			// The reset also disposes the transient status overlays, so the real method has to be
+			// on the harness: a stub would let a future collaborator call pass as covered when it
+			// is not. One countdown is mounted so the disposal is observable here too
+			// (interactive-mode-interrupt-teardown drives the real CountdownTimer/Loader trio).
+			retryCountdown: { dispose: disposeRetryCountdown },
+			retryLoader: undefined,
+			autoCompactionLoader: undefined,
+			disposeTransientStatusOverlays(this: unknown): void {
+				(
+					InteractiveMode.prototype as unknown as { disposeTransientStatusOverlays(this: unknown): void }
+				).disposeTransientStatusOverlays.call(this);
+			},
 		} as unknown as InteractiveMode;
 
 		(
@@ -1451,6 +1464,8 @@ describe("InteractiveMode pending bash components", () => {
 
 		expect(loader.intervalId).toBeNull();
 		expect(endFeatureHintRun).toHaveBeenCalledOnce();
+		// The replaced session's retry countdown keeps ticking into the next view otherwise.
+		expect(disposeRetryCountdown).toHaveBeenCalledOnce();
 		expect((fakeThis as unknown as { activeBashComponent: unknown }).activeBashComponent).toBeUndefined();
 		// Queue browsing is session-scoped: Enter in the next session must be a
 		// fresh prompt, and the previous session's stashed draft is discarded.

@@ -390,6 +390,9 @@ describe("daemon supervisor whole-tree eviction", () => {
 		seedSupervisorRoster(supervisor, source);
 		supervisor.catalog.resolve = vi.fn(async () => "/tmp/target.jsonl");
 		supervisor.createOrReuseWorker = vi.fn(async () => {
+			// The real create path registers the worker before returning it, and the
+			// delivery loop re-resolves its target through that registration.
+			supervisor.workers.set("target", target);
 			seedSupervisorRoster(supervisor, target);
 			return target;
 		});

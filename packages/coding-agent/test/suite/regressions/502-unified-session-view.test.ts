@@ -1,6 +1,7 @@
 import stripAnsi from "strip-ansi";
 import { describe, expect, test, vi } from "vitest";
 import { AgentsViewMode } from "../../../src/modes/agents-view/agents-view-mode.js";
+import { buildUnifiedSessionIndex } from "../../../src/modes/agents-view/agents-view-state.js";
 import type { SessionSummary } from "../../../src/modes/daemon/daemon-session-list.js";
 import { initTheme } from "../../../src/modes/interactive/theme/theme.js";
 import { createDeferred as deferred } from "../scheduling.js";
@@ -309,18 +310,34 @@ describe("#502 unified session view regressions", () => {
 		const fallback = summary("fallback");
 		const harness = {
 			selectionAnchorPending: true,
+			// 0 leaves the grace window unexpired, so the in-flight refresh still owns the anchor.
+			selectionAnchorPendingSince: 0,
 			savedCatalogRefreshPending: true,
 			selectedIndex: 0,
 			selectedActiveSessionId: undefined as string | undefined,
 			selectedRowIdentity: "identity-intended",
 			rows: [{ selectable: true, kind: "agent", summary: fallback }],
+			unifiedRecords: [],
+			unifiedIndex: buildUnifiedSessionIndex([]),
 			isPendingDeleteRow: () => false,
 			setStatusMessage: vi.fn(),
 			finish,
+			// Enter re-checks the anchor instead of staying refused, so openSelected calls the
+			// real resolver (which in turn asks the real grace predicate). Carry both bound to
+			// the harness: stubbing them would let openSelected through while the behaviour the
+			// title claims never runs.
+			resolveMissingSelectionAnchor(this: unknown): void {
+				privateMethod<(this: unknown) => void>("resolveMissingSelectionAnchor").call(this);
+			},
+			selectionAnchorGraceExpired(this: unknown): boolean {
+				return privateMethod<(this: unknown) => boolean>("selectionAnchorGraceExpired").call(this);
+			},
 		};
 
 		privateMethod<(this: typeof harness) => void>("openSelected").call(harness);
 		expect(finish).not.toHaveBeenCalled();
+		// Blocked and told so: the row is selectable, so the pending anchor is what stopped the open.
+		expect(harness.setStatusMessage).toHaveBeenCalledWith("Waiting for the selected session to load");
 		privateMethod<(this: typeof harness) => void>("resolveMissingSelectionAnchor").call(harness);
 		expect(harness.selectionAnchorPending).toBe(true);
 		harness.savedCatalogRefreshPending = false;
