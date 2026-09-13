@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # merge/repl-kernel is this fork's main branch. Without it, day-to-day pushes here never run
+    # CI at all and the jobs below only execute for upstream pull requests (base main).
+    branches: [main, merge/repl-kernel]
   pull_request:
     branches: [main]
 
@@ -103,8 +105,9 @@ jobs:
             install_uv: true
           - name: coding-agent kernel
             package: packages/coding-agent
-            command: npm run test:kernel
+            command: npm run test:kernel:ci
             install_uv: true
+            seed_kernel_python: true
           - name: runtime python
             package: prime-agent-runtime
             command: uv run python -m unittest discover -s test
@@ -138,6 +141,36 @@ jobs:
         run: |
           python3 -m pip install --user uv
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # The kernel-heavy files resolve a Python interpreter at module load and fall back to
+      # `describe.skip` when none of the three candidates exists, and vitest exits 0 for a fully
+      # skipped file: this job used to go green with 28 of its 36 tests never run. Seed the venv the
+      # product itself builds, pin it for the rest of the job, and gate the report afterwards.
+      - name: Seed the kernel venv and pin PRIME_AGENT_KERNEL_PYTHON
+        if: matrix.seed_kernel_python
+        env:
+          # A runner is not a TTY, so without this a missing uv aborts the seed instead of installing.
+          PRIME_AGENT_INSTALL_UV: "1"
+          # Seed outside the managed base (~/.prime/agent/kernel-venv). A pinned interpreter that
+          # lives under that base collects an in-use reference from every kernel the suite spawns,
+          # and test/repl-kernel-generation-isolation.test.ts clones the seed venv and counts them.
+          PRIME_AGENT_KERNEL_VENV: ${{ runner.temp }}/pi-kernel-venv
+        run: |
+          npx tsx packages/coding-agent/src/core/kernel/bootstrap-cli.ts --with-bundled-skills > kernel-python.log
+          cat kernel-python.log
+          kernel_python=$(sed -n 's/^kernel python: //p' kernel-python.log)
+          test -n "$kernel_python"
+          # rlm.repl + dill is what the gated files probe; goal and agent_message are what the two
+          # self-bootstrapping files drive. A pin missing a skill only warns at boot and then fails
+          # the test on a missing import, so prove the seed here instead.
+          "$kernel_python" -P -c 'import rlm.repl, dill, goal, agent_message'
+          echo "PRIME_AGENT_KERNEL_PYTHON=$kernel_python" >> "$GITHUB_ENV"
+
+      # Proves the gate that `npm run test:kernel:ci` applies to the suite report can go red: a
+      # planted all-skipped report must fail it, so a broken gate cannot pass as green.
+      - name: Kernel coverage gate self-test
+        if: matrix.seed_kernel_python
+        run: node scripts/check-kernel-coverage.mjs --self-test
 
       - name: Test
         working-directory: ${{ matrix.package }}

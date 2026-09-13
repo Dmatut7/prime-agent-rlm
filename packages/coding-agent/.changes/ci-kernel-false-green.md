@@ -1,0 +1,2 @@
+- Added `--with-bundled-skills` to the kernel venv seeding CLI (`bootstrap-cli.ts`), so a venv seeded for CI also carries the bundled Python skills a pinned `PRIME_AGENT_KERNEL_PYTHON` cannot sync later.
+- Added `npm run test:kernel:ci`, which writes a vitest JSON report for the kernel-heavy suite and fails when a file skipped instead of running or the collected total drops below a floor.
