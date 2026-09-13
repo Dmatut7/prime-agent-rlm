@@ -364,26 +364,35 @@ describe("ENG-4606 update restart coordinator", () => {
 		const predecessor = spawnSupervisor(paths);
 		const client = await connectEventually(paths.socketPath);
 		const predecessorHello = await client.waitForHello(2000);
-		const created = requireSessionSummary(
-			await client.request(
-				{
-					type: "create",
-					config: {
-						agentDir: paths.agentDir,
-						apiKey: "faux-key",
-						cwd: paths.agentDir,
-						extensions: [fauxExtensionPath],
-						model: "faux",
-						noContextFiles: true,
-						noExtensions: false,
-						noSkills: true,
-						noTools: true,
-						provider: "faux",
-					},
+		const createResponse = await client.request(
+			{
+				type: "create",
+				config: {
+					agentDir: paths.agentDir,
+					apiKey: "faux-key",
+					cwd: paths.agentDir,
+					extensions: [fauxExtensionPath],
+					model: "faux",
+					noContextFiles: true,
+					noExtensions: false,
+					noSkills: true,
+					noTools: true,
+					provider: "faux",
 				},
-				60_000,
-			),
+			},
+			60_000,
 		);
+		if (!createResponse.success) {
+			// A predecessor this test just spawned has no reason to refuse a create, so
+			// when it does the reason is in its own output. Run 34753200385 answered
+			// `supervisor_generation_stale` here: a machine-wide `doctor --fix` from
+			// 4603-worker-recovery (same shard) reaped this session-less supervisor as an
+			// idle background service. That suite now runs in its own CI job.
+			throw new Error(
+				`create failed: ${createResponse.error}\npredecessor stderr:\n${predecessor.stderr}\npredecessor stdout:\n${predecessor.stdout}`,
+			);
+		}
+		const created = requireSessionSummary(createResponse);
 		const originalActiveSessionId = created.activeSessionId ?? created.id;
 		const updateCommand = [process.execPath, tsxPath, launcherFixturePath].map(shellQuote).join(" ");
 		const executeResponse = await client.request(

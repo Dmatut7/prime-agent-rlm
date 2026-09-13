@@ -103,6 +103,18 @@ jobs:
             package: packages/coding-agent
             command: npm run test:process
             install_uv: true
+          # 4603-worker-recovery drives the machine-wide discovery commands (`status`,
+          # `doctor --fix`, `shutdown --force`): `daemon ps` finds every prime-agent
+          # daemon on the host through `ss -lxp`/`lsof` rather than only its own socket
+          # (see the header of src/cli/daemon-ps.ts). Run inside a shard, that reaps the
+          # other files' session-less supervisors - in run 34753200385 it stopped 4606's
+          # predecessor mid-test and reddened both files - and on a workstation it stops
+          # the developer's live daemon. So it runs alone, in its own job on its own
+          # runner, and `test:ci` excludes it.
+          - name: coding-agent machine-wide
+            package: packages/coding-agent
+            command: npm run test:machine-wide
+            install_uv: true
           - name: coding-agent kernel
             package: packages/coding-agent
             command: npm run test:kernel:ci
