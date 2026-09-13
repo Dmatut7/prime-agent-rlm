@@ -17,6 +17,7 @@ import {
 import { buildSessionContext, type CompactionEntry, type SessionEntry } from "../session-manager.js";
 import { addAssistantUsage, emptyUsage } from "../usage.js";
 import {
+	announcedInputLimit,
 	buildSummarizationPromptText,
 	clampConversationText,
 	clampSummarizationInflation,
@@ -642,6 +643,26 @@ export interface SummarizationRequestOptions {
 	 * slice itself; a retry raises it so the next attempt carries less content.
 	 */
 	inflation?: number;
+	/**
+	 * Input cap the provider announced when it rejected an earlier attempt. A
+	 * retry passes it back so the next budget is exact instead of guessed.
+	 */
+	inputLimit?: number;
+}
+
+/**
+ * A summarization call the provider rejected because the request input was too
+ * long - the one compaction failure that a smaller request can fix.
+ */
+export class SummarizationInputLengthError extends Error {
+	/** Input cap the provider stated in its rejection, when it stated one. */
+	readonly announcedInputLimit: number | undefined;
+
+	constructor(errorLabel: string, errorMessage: string, announcedLimit: number | undefined) {
+		super(`${errorLabel}: ${errorMessage}`);
+		this.name = "SummarizationInputLengthError";
+		this.announcedInputLimit = announcedLimit;
+	}
 }
 
 interface SummarizationCallOptions extends SummarizationRequestOptions {
@@ -703,6 +724,7 @@ async function completeSummarizationRequest(options: SummarizationCallOptions): 
 		provider: model.provider,
 		modelId: model.id,
 		inflation,
+		announcedInputLimit: options.inputLimit,
 	});
 	const { messages: budgetedMessages, elided } = budgetSummarizationInput(currentMessages, budget.conversationTokens);
 	// Serialize before the LLM call so it summarizes rather than continues this conversation.
@@ -737,7 +759,13 @@ async function completeSummarizationRequest(options: SummarizationCallOptions): 
 	);
 
 	if (response.stopReason === "error") {
-		throw new Error(`${errorLabel}: ${response.errorMessage || "Unknown error"}`);
+		const errorMessage = response.errorMessage || "Unknown error";
+		if (isInputLengthRejection(errorMessage)) {
+			// Carry the cap the provider announced, so a retry budgets against the
+			// number this provider actually refused instead of a guess.
+			throw new SummarizationInputLengthError(errorLabel, errorMessage, announcedInputLimit(errorMessage));
+		}
+		throw new Error(`${errorLabel}: ${errorMessage}`);
 	}
 
 	const summary = response.content
@@ -756,22 +784,28 @@ async function completeSummarizationRequest(options: SummarizationCallOptions): 
  * input-length rejection is treated as a measurement: assume the content is denser
  * than assumed and try again. Bounded, because a rejection can also be permanent.
  * `run` is called once per attempt and must produce a fresh request identity, so
- * two attempts never share an idempotency key.
+ * two attempts never share an idempotency key. When the rejection announced the
+ * provider's cap, the next attempt is budgeted against that exact number.
  */
 export async function summarizeWithInputLengthRetry(
 	run: (options: SummarizationRequestOptions) => Promise<SummarySlice>,
 	initialInflation: number,
 	signal?: AbortSignal,
-	isRetryable: (error: unknown) => boolean = (error) =>
-		isInputLengthRejection(error instanceof Error ? error.message : String(error)),
+	isRetryable: (error: unknown) => boolean = (error) => error instanceof SummarizationInputLengthError,
 ): Promise<SummarySlice> {
 	let inflation = clampSummarizationInflation(initialInflation);
+	let inputLimit: number | undefined;
 	for (let attempt = 0; ; attempt++) {
 		try {
-			return await run({ inflation });
+			return await run({ inflation, inputLimit });
 		} catch (error) {
 			if (attempt >= SUMMARIZATION_INPUT_RETRY_LIMIT || signal?.aborted || !isRetryable(error)) throw error;
+			// Assume the content is denser than measured; and when the provider stated
+			// its cap, budget the next attempt against that number instead of a guess.
 			inflation = clampSummarizationInflation(inflation * SUMMARIZATION_INPUT_RETRY_SHRINK);
+			if (error instanceof SummarizationInputLengthError) {
+				inputLimit = error.announcedInputLimit ?? inputLimit;
+			}
 		}
 	}
 }

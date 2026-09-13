@@ -278,7 +278,7 @@ conversationReal    = inputLimit - reserveTokens - systemPromptTokens - wrapperT
 conversationEstimate = floor(conversationReal / inflation)
 ```
 
-- **`inputLimit`** — a provider can accept less input than the catalog declares for the window. Bailian's DashScope compatible-mode answers an oversized prompt with `Range of input length should be [1, 983616]` for a model whose `models.json` entry says `contextWindow: 1000000`. Measured limits live in [`model-input-limits.ts`](../src/core/model-input-limits.ts) and clamp the declaration; only limits with recorded evidence are listed.
+- **`inputLimit`** — a provider can accept less input than the catalog declares for the window. Bailian's DashScope compatible-mode answers an oversized prompt with `Range of input length should be [1, 983616]` for a model whose `models.json` entry says `contextWindow: 1000000`. Measured limits live in [`model-input-limits.ts`](../src/core/model-input-limits.ts) and clamp the declaration; only limits with recorded evidence are listed. A cap the provider announced in a rejection clamps it further (see below).
 - **`wrapperTokens`** — the elision note, the `<conversation>` and `<previous-summary>` delimiters, the instruction template, any `/compact` instructions, and the kernel-persistence note. The previous summary and the instructions are user-sized, so they are measured rather than assumed small.
 - **`safetyMargin`** — 2% of the input limit for overhead no character count can see (chat template, per-message framing, tokenizer drift).
 - **`inflation`** — `estimateTokens` is a chars/4 heuristic and reads CJK- and code-heavy transcripts low by a wide margin (the session that produced the production 400 measured 614k estimated tokens against 982k provider-reported prompt tokens). The newest assistant usage inside the slice is the provider's own count of nearly the same content, so it anchors the conversion; it is floored at 1 and capped at 4.
@@ -287,6 +287,7 @@ Two further guards, because an estimate can still be wrong:
 
 - The serialized conversation is clamped to the budget by dropping its oldest characters, with a marker saying how many. The message-level trimmer always keeps the newest message, so one oversized paste used to be sent verbatim.
 - If the provider still rejects the request for input length, the call is retried up to `SUMMARIZATION_INPUT_RETRY_LIMIT` times with `inflation` raised by `SUMMARIZATION_INPUT_RETRY_SHRINK` each time. Every attempt is a separate wire call with its own request identity, so a shrunk body never reuses an idempotency key. Aborts and unrelated errors are never retried.
+- A rejection usually states the cap it applied (`Range of input length should be [1, 983616]`, `prompt is too long: N tokens > M maximum`, and the other formats `announcedInputLimit()` knows). That number is fed back into the retry as the input limit, so a model missing from the measured table still gets an exact budget on its second attempt. Announced values below 1024 tokens are ignored as mis-parses.
 
 ### When Compaction Keeps Failing
 

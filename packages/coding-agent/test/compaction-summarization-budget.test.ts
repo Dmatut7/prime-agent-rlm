@@ -2,6 +2,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import {
+	announcedInputLimit,
 	buildCompactionRecoveryHint,
 	buildSummarizationPromptText,
 	COMPACTION_RECOVERY_HINT_THRESHOLD,
@@ -14,6 +15,7 @@ import {
 	SUMMARIZATION_INPUT_RETRY_LIMIT,
 	SUMMARIZATION_SAFETY_MARGIN,
 	SUMMARIZATION_SYSTEM_PROMPT,
+	SummarizationInputLengthError,
 	type SummarySlice,
 	summarizationFrameText,
 	summarizationInflation,
@@ -351,13 +353,15 @@ describe("summarizationInflation", () => {
 });
 
 describe("summarizeWithInputLengthRetry", () => {
-	const rejection = new Error(`Summarization failed: ${DASHSCOPE_400}`);
+	const rejection = new SummarizationInputLengthError("Summarization failed", DASHSCOPE_400, 983_616);
 
 	it("shrinks the slice on every retry and stops at the bound", async () => {
 		const inflations: number[] = [];
+		const limits: Array<number | undefined> = [];
 		let calls = 0;
 		const result = await summarizeWithInputLengthRetry(async (options) => {
 			inflations.push(options.inflation ?? 1);
+			limits.push(options.inputLimit);
 			calls += 1;
 			if (calls <= SUMMARIZATION_INPUT_RETRY_LIMIT) throw rejection;
 			return { summary: "ok" } satisfies SummarySlice;
@@ -365,6 +369,8 @@ describe("summarizeWithInputLengthRetry", () => {
 
 		expect(result.summary).toBe("ok");
 		expect(inflations).toEqual([2, 2.5, 3.125]);
+		// The cap the provider announced is fed back into the next attempt's budget.
+		expect(limits).toEqual([undefined, 983_616, 983_616]);
 	});
 
 	it("gives up after the bounded number of attempts and reports the provider error", async () => {
@@ -456,5 +462,82 @@ describe("buildCompactionRecoveryHint", () => {
 		for (const command of commands) {
 			expect(isBuiltinSlashCommandName(command), `/${command} is not a builtin command`).toBe(true);
 		}
+	});
+});
+
+describe("announcedInputLimit", () => {
+	it("reads the cap out of the rejections that state one", () => {
+		expect(announcedInputLimit(DASHSCOPE_400)).toBe(983_616);
+		expect(announcedInputLimit("prompt is too long: 213462 tokens > 200000 maximum")).toBe(200_000);
+		expect(
+			announcedInputLimit("The input token count (1196265) exceeds the maximum number of tokens allowed (1048575)"),
+		).toBe(1_048_575);
+		expect(
+			announcedInputLimit("This model's maximum prompt length is 131072 but the request contains 537812 tokens"),
+		).toBe(131_072);
+		expect(
+			announcedInputLimit(
+				"400 litellm.BadRequestError: Requested token count exceeds the model's maximum context length of 262144 tokens.",
+			),
+		).toBe(262_144);
+		expect(announcedInputLimit("exceeded model token limit: 131072 (requested: 200000)")).toBe(131_072);
+	});
+
+	it("returns nothing when the message states no cap or the number is not credible", () => {
+		expect(announcedInputLimit(undefined)).toBeUndefined();
+		expect(announcedInputLimit("500 upstream exploded")).toBeUndefined();
+		expect(
+			announcedInputLimit("400 <400> InternalError.Algo.InvalidParameter: Range of max_tokens should be [1, 32768]"),
+		).toBeUndefined();
+		// A mis-read lower bound must never collapse the budget.
+		expect(announcedInputLimit("Range of input length should be [1, 500]")).toBeUndefined();
+	});
+
+	it("clamps the budget to a cap the provider announced", () => {
+		const budget = computeSummarizationInputBudget({
+			contextWindow: 200_000,
+			reserveTokens: 1_000,
+			systemPromptText: "",
+			wrapperText: "",
+			safetyMargin: 0,
+			announcedInputLimit: 120_000,
+		});
+		expect(budget.inputLimit).toBe(120_000);
+		expect(budget.conversationRealTokens).toBe(119_000);
+	});
+
+	it("keeps the tighter of an announced cap and a measured limit", () => {
+		const budget = computeSummarizationInputBudget({
+			contextWindow: PROD_WINDOW,
+			reserveTokens: PROD_RESERVE,
+			systemPromptText: "",
+			wrapperText: "",
+			safetyMargin: 0,
+			announcedInputLimit: 900_000,
+			...PROD,
+		});
+		expect(budget.inputLimit).toBe(900_000);
+		const measuredWins = computeSummarizationInputBudget({
+			contextWindow: PROD_WINDOW,
+			reserveTokens: PROD_RESERVE,
+			systemPromptText: "",
+			wrapperText: "",
+			safetyMargin: 0,
+			announcedInputLimit: 999_000,
+			...PROD,
+		});
+		expect(measuredWins.inputLimit).toBe(PROD_INPUT_LIMIT);
+	});
+
+	it("ignores an announced number too small to be a real cap", () => {
+		const budget = computeSummarizationInputBudget({
+			contextWindow: 200_000,
+			reserveTokens: 0,
+			systemPromptText: "",
+			wrapperText: "",
+			safetyMargin: 0,
+			announcedInputLimit: 16,
+		});
+		expect(budget.inputLimit).toBe(200_000);
 	});
 });

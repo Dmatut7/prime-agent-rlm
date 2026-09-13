@@ -30,6 +30,10 @@ describe("LiteLLM context overflow recovery", () => {
 	it.each([
 		["LiteLLM rejection", litellmError],
 		["known overflow control", "prompt is too long: 270128 tokens > 262144 maximum"],
+		[
+			"DashScope input-length rejection",
+			"400 <400> InternalError.Algo.InvalidParameter: Range of input length should be [1, 258048]",
+		],
 	])("compacts and continues after %s without retrying the unchanged request", async (_name, errorMessage) => {
 		const harness = await setup();
 		const requests: Context[] = [];

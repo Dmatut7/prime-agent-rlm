@@ -315,6 +315,27 @@ describe("summarization request stays inside the provider's real input limit", (
 		expect(recorded).toHaveLength(3);
 	});
 
+	it("budgets the retry against the cap the provider announced", async () => {
+		// A model with no measured limit on file whose provider accepts far less than
+		// the catalog declares. The rejection states the real cap, so the retry is
+		// exact instead of another guess: one rejection, then one fitting request.
+		const REAL_LIMIT = 12_000;
+		const { recorded } = createLimitProvider({ hardInputLimit: REAL_LIMIT, perMessageTokens: 4 });
+		const messages: AgentMessage[] = [];
+		for (let i = 0; i < 40; i++) messages.push(bigUserMessage(`m${i} `));
+
+		const result = await compact(
+			createPreparation(messages),
+			createModel({ contextWindow: CONTEXT_WINDOW }),
+			"test-key",
+		);
+
+		expect(result.summary).toContain("Summarized");
+		expect(recorded).toHaveLength(2);
+		expect(recorded[0].tokens).toBeGreaterThan(REAL_LIMIT);
+		expect(recorded[1].tokens).toBeLessThanOrEqual(REAL_LIMIT);
+	});
+
 	it("clamps a single newest message that alone exceeds the limit", async () => {
 		const { recorded } = createLimitProvider({ hardInputLimit: HARD_INPUT_LIMIT, perMessageTokens: 4 });
 		// budgetSummarizationInput always keeps the newest message, so one huge

@@ -103,7 +103,10 @@ export function summarizationFrameText(options: {
 export interface SummarizationInputBudget {
 	/** contextWindow as declared by the catalog. */
 	declaredContextWindow: number;
-	/** What the provider accepts as input: the declaration clamped by any measured limit. */
+	/**
+	 * What the provider accepts as input: the declaration clamped by any measured
+	 * limit and by a limit the provider announced in a rejection.
+	 */
 	inputLimit: number;
 	/** Held back for the summary the request asks the model to produce. */
 	outputReserve: number;
@@ -143,9 +146,18 @@ export function computeSummarizationInputBudget(options: {
 	modelId?: string;
 	inflation?: number;
 	safetyMargin?: number;
+	/** Input cap the provider announced in a rejection; see announcedInputLimit. */
+	announcedInputLimit?: number;
 }): SummarizationInputBudget {
 	const declaredContextWindow = options.contextWindow && options.contextWindow > 0 ? options.contextWindow : 0;
-	const inputLimit = effectiveInputLimitTokens(declaredContextWindow, options.provider, options.modelId);
+	const catalogLimit = effectiveInputLimitTokens(declaredContextWindow, options.provider, options.modelId);
+	const announced = options.announcedInputLimit;
+	const inputLimit =
+		announced !== undefined && announced >= MIN_CREDIBLE_ANNOUNCED_LIMIT
+			? catalogLimit > 0
+				? Math.min(catalogLimit, announced)
+				: announced
+			: catalogLimit;
 	const outputReserve = Math.max(0, options.reserveTokens);
 	const systemPromptTokens = estimateTextTokens(options.systemPromptText);
 	const wrapperTokens = estimateTextTokens(options.wrapperText);
@@ -216,6 +228,55 @@ export function clampConversationText(
 		text: markerFor(dropped) + conversationText.slice(conversationText.length - keepChars),
 		droppedChars: dropped,
 	};
+}
+
+/**
+ * Ignore an announced limit below this: a real input cap that small makes
+ * summarization pointless, and a small number is far more likely a mis-parse of
+ * something else in the message (a lower bound, a request size, a status code).
+ */
+const MIN_CREDIBLE_ANNOUNCED_LIMIT = 1024;
+
+/**
+ * Captures the input cap a provider states in its own rejection. Only formats
+ * where the number is unambiguously an input/prompt allowance are listed; the
+ * examples are the ones documented in packages/ai/src/utils/overflow.ts.
+ */
+const ANNOUNCED_INPUT_LIMIT_PATTERNS: readonly RegExp[] = [
+	// Alibaba DashScope / Bailian: "Range of input length should be [1, 983616]"
+	/range of input length should be \[\d+,\s*(\d+)\]/i,
+	// Anthropic: "prompt is too long: 213462 tokens > 200000 maximum"
+	/prompt is too long:\s*\d+\s*tokens\s*>\s*(\d+)\s*maximum/i,
+	// Google: "input token count (1196265) exceeds the maximum number of tokens allowed (1048575)"
+	/maximum number of tokens allowed \(?(\d+)\)?/i,
+	// xAI: "This model's maximum prompt length is 131072 but the request contains 537812 tokens"
+	/maximum prompt length is (\d+)/i,
+	// GitHub Copilot: "prompt token count of X exceeds the limit of Y"
+	/exceeds the limit of (\d+)/i,
+	// Kimi For Coding: "exceeded model token limit: 131072 (requested: 200000)"
+	/exceeded model token limit:?\s*(\d+)/i,
+	// OpenRouter / LiteLLM: "maximum context length is 262144 tokens"
+	/maximum context length (?:is|of) (\d+) tokens/i,
+];
+
+/**
+ * The input cap a provider announced when it rejected a request, if it stated one.
+ *
+ * This is the strongest evidence available: the number comes from the provider
+ * that just refused the call, for this exact model, so it beats both the catalog
+ * declaration and a static table that may not cover the model at all. DashScope
+ * states it on every oversized request, which is how a model missing from
+ * MEASURED_PROVIDER_INPUT_LIMITS still gets an exact budget on the second attempt.
+ */
+export function announcedInputLimit(errorMessage: string | undefined): number | undefined {
+	if (!errorMessage) return undefined;
+	for (const pattern of ANNOUNCED_INPUT_LIMIT_PATTERNS) {
+		const match = pattern.exec(errorMessage);
+		if (!match) continue;
+		const value = Number(match[1]);
+		if (Number.isFinite(value) && value >= MIN_CREDIBLE_ANNOUNCED_LIMIT) return value;
+	}
+	return undefined;
 }
 
 /**
