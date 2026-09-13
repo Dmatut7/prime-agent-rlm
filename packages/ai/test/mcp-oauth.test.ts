@@ -58,7 +58,8 @@ async function loginWithManualCode(
 	return { creds, authUrl };
 }
 
-describe.sequential("MCP OAuth provider", () => {
+// vitest 5 removed describe.sequential; a suite runs sequentially unless it is marked .concurrent.
+describe("MCP OAuth provider", () => {
 	afterEach(() => {
 		vi.unstubAllGlobals();
 	});

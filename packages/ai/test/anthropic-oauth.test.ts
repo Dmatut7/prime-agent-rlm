@@ -30,7 +30,8 @@ function getJsonBody(init?: RequestInit): Record<string, string> {
 	return JSON.parse(init.body) as Record<string, string>;
 }
 
-describe.sequential("Anthropic OAuth", () => {
+// vitest 5 removed describe.sequential; a suite runs sequentially unless it is marked .concurrent.
+describe("Anthropic OAuth", () => {
 	afterEach(() => {
 		vi.unstubAllGlobals();
 	});
