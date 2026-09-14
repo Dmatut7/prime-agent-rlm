@@ -949,7 +949,7 @@ export function resolveStallWatchdogConfig(config: StallWatchdogConfig | undefin
 export interface StallMessageContext {
 	/** Milliseconds without observed session activity. */
 	silentMs: number;
-	/** `settings.abortAfterSeconds`, used by the warn copy's escalation promise. */
+	/** `settings.abortAfterSeconds`; 0 or absent means the warn copy promises no abort. */
 	abortAfterSeconds?: number;
 	/** Exemption in effect when the stage fired (`StallWatchdogStageInfo.exemption`). */
 	exemption?: StallExemptionSnapshot;
@@ -962,18 +962,24 @@ function silentSecondsOf(silentMs: number): number {
 }
 
 /**
- * Warning copy. A vouched stall says the abort is deferred and how much budget is
- * left instead of promising an abort deadline that the exemption will not keep.
- * The unexempted copy is byte-identical to the pre-exemption message.
+ * Warning copy. A warn-only watchdog (`abortAfterSeconds` 0, or no value at all) has no abort
+ * channel - the session derives `abortAfterMs: undefined` from it - so its copy says no abort is
+ * coming instead of promising one after "0s". A vouched stall says the abort is deferred and how
+ * much budget is left instead of promising a deadline the exemption will not keep. The unexempted
+ * copy of a session that does have an abort is byte-identical to the pre-exemption message.
  */
 export function buildStallWarnMessage(context: StallMessageContext): string {
 	const seconds = silentSecondsOf(context.silentMs);
+	const abortAfterSeconds = context.abortAfterSeconds;
+	if (abortAfterSeconds === undefined || abortAfterSeconds <= 0) {
+		return `Possible stall: no session activity for ${seconds}s while a turn is running. No automatic abort is configured for this session, so the turn will not be interrupted on its own: it recovers only when the stalled work resumes. If a tool appears stuck, interrupt the turn manually to recover faster; check the daemon log for stall diagnostics.`;
+	}
 	const exemption = context.exemption;
 	if (exemption && exemption.reason === "vouched" && !exemption.exhausted) {
 		const remainingMinutes = Math.max(1, Math.round(exemption.remainingMs / 60_000));
 		return `Possible stall: no session activity for ${seconds}s while a turn is running. In-flight kernel work detected (${humanizeStallReasons(exemption.reasons)}), so the automatic abort is deferred and ${remainingMinutes}min of exemption budget is left. If the process is actually wedged, interrupt the turn manually to recover faster; check the daemon log for stall diagnostics.`;
 	}
-	return `Possible stall: no session activity for ${seconds}s while a turn is running. If nothing recovers, the turn will be aborted automatically after ${context.abortAfterSeconds ?? 0}s of silence. If a tool appears stuck, interrupt the turn manually to recover faster; check the daemon log for stall diagnostics.`;
+	return `Possible stall: no session activity for ${seconds}s while a turn is running. If nothing recovers, the turn will be aborted automatically after ${abortAfterSeconds}s of silence. If a tool appears stuck, interrupt the turn manually to recover faster; check the daemon log for stall diagnostics.`;
 }
 
 /** Abort copy: unchanged by the exemption work (an abort only fires once the budget is spent). */

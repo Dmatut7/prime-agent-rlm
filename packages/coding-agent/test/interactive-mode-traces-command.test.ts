@@ -1,8 +1,12 @@
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 import type { AgentTraceUploadAllResult, AgentTraceUploadResult } from "../src/core/agent-traces.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { PRIME_AGENT_TRACES_PROVIDER_ID } from "../src/core/prime-inference-auth.js";
+import { SettingsManager } from "../src/core/settings-manager.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 
 interface TracesCommandContext {
@@ -12,6 +16,7 @@ interface TracesCommandContext {
 		getAgentTracesEnabled: () => boolean;
 		setAgentTracesEnabled: (enabled: boolean) => void;
 		flush: () => Promise<void>;
+		persistenceFailure: () => Promise<string | undefined>;
 	};
 	modelRegistry: { authStorage: AuthStorage };
 	previewCurrentTrace: () => Promise<void>;
@@ -37,6 +42,7 @@ function makeContext(enabled = true): TracesCommandContext {
 			getAgentTracesEnabled: () => enabled,
 			setAgentTracesEnabled: vi.fn(),
 			flush: vi.fn(async () => {}),
+			persistenceFailure: vi.fn(async () => undefined),
 		},
 		modelRegistry: {
 			authStorage: AuthStorage.inMemory({
@@ -104,6 +110,62 @@ describe("InteractiveMode /traces", () => {
 			);
 		},
 	);
+
+	// H-2: the write is queued and its failure recorded, so "Trace sharing disabled." used to be
+	// printed over a settings.json nobody had changed - which means sharing turns back on at the
+	// next start. The failure and that consequence have to be visible.
+	describe("when the setting cannot be persisted", () => {
+		it("reports the reason instead of claiming trace sharing was disabled", async () => {
+			const context = makeContext(true);
+			vi.mocked(context.settingsManager.persistenceFailure).mockResolvedValue(
+				"EACCES: permission denied, mkdir '/agent/settings.json.lock'",
+			);
+
+			await prototype.handleTracesCommand.call(context, "/traces off");
+
+			expect(context.showError).toHaveBeenCalledWith(expect.stringContaining("EACCES: permission denied"));
+			expect(context.showError).toHaveBeenCalledWith(expect.stringContaining("not saved"));
+			expect(context.showStatus).not.toHaveBeenCalledWith("Trace sharing disabled.");
+		});
+
+		it("reports the reason instead of claiming trace sharing was enabled", async () => {
+			const context = makeContext(false);
+			vi.mocked(context.settingsManager.persistenceFailure).mockResolvedValue(
+				"Global settings not saved: settings file failed to parse",
+			);
+
+			await prototype.handleTracesCommand.call(context, "/traces on");
+
+			expect(context.showError).toHaveBeenCalledWith(expect.stringContaining("failed to parse"));
+			expect(context.showStatus).not.toHaveBeenCalledWith(expect.stringContaining("Trace sharing enabled."));
+		});
+
+		it("shows the failure through a real SettingsManager whose file does not parse", async () => {
+			const root = mkdtempSync(join(tmpdir(), "traces-save-failure-"));
+			const agentDir = join(root, "agent");
+			const cwd = join(root, "project");
+			mkdirSync(agentDir, { recursive: true });
+			mkdirSync(cwd, { recursive: true });
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(settingsPath, '{ "agentTraces": { "enabled": true }, oops }\n');
+			try {
+				const context = makeContext(true);
+				const manager = SettingsManager.create(cwd, agentDir);
+				// main.ts reports load diagnostics once at startup, before this session owns the buffer.
+				manager.drainErrors();
+				context.settingsManager = manager;
+				const before = readFileSync(settingsPath, "utf-8");
+
+				await prototype.handleTracesCommand.call(context, "/traces off");
+
+				expect(readFileSync(settingsPath, "utf-8")).toBe(before);
+				expect(context.showStatus).not.toHaveBeenCalledWith("Trace sharing disabled.");
+				expect(context.showError).toHaveBeenCalledWith(expect.stringContaining("failed to parse"));
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		});
+	});
 
 	it("backfills all discovered traces only for upload-all", async () => {
 		const context = makeContext(false);

@@ -945,6 +945,21 @@ export class SettingsManager {
 		await this.writeQueue;
 	}
 
+	/**
+	 * Await the queued writes and return a user-readable reason when settings did not reach disk:
+	 * a failed write, or every write this session skipped because the settings file cannot be
+	 * parsed. Returns undefined when nothing failed. Consumes the recorded errors, so a failure is
+	 * reported once. Call sites must show the failure instead of claiming a save (H-2).
+	 */
+	async persistenceFailure(scope?: SettingsScope): Promise<string | undefined> {
+		await this.flush();
+		const errors = this.drainErrors(scope);
+		if (errors.length === 0) {
+			return undefined;
+		}
+		return errors.map(({ error }) => error.message).join("; ");
+	}
+
 	drainErrors(scope?: SettingsScope): SettingsError[] {
 		if (!scope) {
 			const drained = [...this.errors];

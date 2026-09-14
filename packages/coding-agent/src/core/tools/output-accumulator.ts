@@ -51,6 +51,7 @@ export class OutputAccumulator {
 
 	private tempFilePath: string | undefined;
 	private tempFileStream: WriteStream | undefined;
+	private tempFileError: Error | undefined;
 
 	constructor(options: OutputAccumulatorOptions = {}) {
 		this.maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
@@ -112,7 +113,8 @@ export class OutputAccumulator {
 		return {
 			content: truncation.content,
 			truncation,
-			fullOutputPath: this.tempFilePath,
+			// Naming the file is a promise the reader can open it; a failed stream makes none.
+			fullOutputPath: this.tempFileError ? undefined : this.tempFilePath,
 		};
 	}
 
@@ -123,6 +125,13 @@ export class OutputAccumulator {
 
 		const stream = this.tempFileStream;
 		this.tempFileStream = undefined;
+
+		if (this.tempFileError) {
+			// A stream that already failed settles nothing: end() on it never emits finish, so
+			// waiting for it would hang the tool call instead of reporting the failure.
+			stream.destroy();
+			throw this.tempFileError;
+		}
 
 		await new Promise<void>((resolve, reject) => {
 			const onError = (error: Error) => {
@@ -137,6 +146,9 @@ export class OutputAccumulator {
 			stream.once("finish", onFinish);
 			stream.end();
 		});
+		if (this.tempFileError) {
+			throw this.tempFileError;
+		}
 	}
 
 	getLastLineBytes(): number {
@@ -209,9 +221,17 @@ export class OutputAccumulator {
 		this.tempFilePath = defaultTempFilePath(this.tempFilePrefix);
 		// The full output lands in a world-shared tmpdir and outlives the truncation that
 		// kept part of it out of context: owner-only, like every other artifact we write.
-		this.tempFileStream = createWriteStream(this.tempFilePath, { mode: 0o600 });
+		const stream = createWriteStream(this.tempFilePath, { mode: 0o600 });
+		// Opening fails asynchronously, through the `error` event, and streaming can outlive the
+		// moment closeTempFile() is listening: with no listener here the event becomes an
+		// uncaughtException and takes the host process down. Capture it; closeTempFile() turns it
+		// into a tool error and snapshot() stops naming a file that does not exist.
+		stream.on("error", (error) => {
+			this.tempFileError ??= error;
+		});
+		this.tempFileStream = stream;
 		for (const chunk of this.rawChunks) {
-			this.tempFileStream.write(chunk);
+			stream.write(chunk);
 		}
 		this.rawChunks = [];
 	}
