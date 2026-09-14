@@ -74,34 +74,79 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Every vitest job writes a JSON report and hands it to
+        # scripts/check-vitest-coverage.mjs. Before this only the kernel job was gated, so a job
+        # could lose a file (or a whole face) to `describe.skip` and still succeed: the ai job
+        # reported 458 passed | 722 skipped with 19 files running nothing, and shard 3 collected
+        # test/repl-kernel-execute.test.ts as `6 skipped` although no job ever ran it.
+        #
+        # min_tests / min_ran_tests are floors at 90% of what the job produces in CI, so ordinary
+        # test churn passes and a collapse (a suite that stops collecting, a job that collects but
+        # never runs) does not. max_nothing_files is how many files are allowed to run nothing in
+        # this job's environment; every non-zero value is a deliberate skip with a reason, and one
+        # more skipping file fails the job and names the file.
         include:
           - name: agent-core
             package: packages/agent
-            command: npm test
+            command: npm test --
+            report: coverage/ci-agent-core.json
+            min_tests: 79
+            min_ran_tests: 79
+            max_nothing_files: 0
             install_uv: false
           - name: ai
             package: packages/ai
-            command: npm test
+            command: npm test --
+            report: coverage/ci-ai.json
+            min_tests: 1062
+            min_ran_tests: 412
+            # 19 files are the live-provider suites, which need credentials this job has none of.
+            max_nothing_files: 19
             install_uv: false
           - name: tui
             package: packages/tui
-            command: npm test
+            command: npm test --
+            # `node --test`, not vitest: no JSON report, and its run reports `# skipped 0` itself.
+            report: ""
             install_uv: false
           - name: coding-agent 1/3
             package: packages/coding-agent
             command: npm run test:ci -- --shard=1/3
+            report: coverage/ci-shard-1.json
+            min_tests: 1924
+            min_ran_tests: 1902
+            # compaction-extensions, rpc (both opt-in), bash-close-hang-windows (win32-only).
+            max_nothing_files: 3
             install_uv: true
           - name: coding-agent 2/3
             package: packages/coding-agent
             command: npm run test:ci -- --shard=2/3
+            report: coverage/ci-shard-2.json
+            min_tests: 2130
+            min_ran_tests: 2118
+            # Six `kernel-heavy` files (tag-filtered here, run by the kernel job).
+            max_nothing_files: 6
             install_uv: true
           - name: coding-agent 3/3
             package: packages/coding-agent
             command: npm run test:ci -- --shard=3/3
+            report: coverage/ci-shard-3.json
+            min_tests: 1534
+            min_ran_tests: 1493
+            # Six `kernel-heavy` files (run by the kernel job) and agent-session-tree-navigation
+            # (describe.skipIf(!API_KEY)). test/repl-kernel-execute.test.ts was the eighth until its
+            # interpreter resolution was fixed; it runs here now, so this budget is what catches it
+            # going back to `describe.skip`.
+            max_nothing_files: 7
             install_uv: true
           - name: coding-agent process smoke
             package: packages/coding-agent
-            command: npm run test:process
+            command: npm run test:process --
+            report: coverage/ci-process-smoke.json
+            min_tests: 20
+            min_ran_tests: 9
+            # The process-stress tests in these two files are the nightly job's face, not this one's.
+            max_nothing_files: 1
             install_uv: true
           # 4603-worker-recovery drives the machine-wide discovery commands (`status`,
           # `doctor --fix`, `shutdown --force`): `daemon ps` finds every prime-agent
@@ -113,17 +158,26 @@ jobs:
           # runner, and `test:ci` excludes it.
           - name: coding-agent machine-wide
             package: packages/coding-agent
-            command: npm run test:machine-wide
+            command: npm run test:machine-wide --
+            report: coverage/ci-machine-wide.json
+            min_tests: 5
+            min_ran_tests: 5
+            max_nothing_files: 0
             install_uv: true
           - name: coding-agent kernel
             package: packages/coding-agent
             command: npm run test:kernel:ci
+            # `test:kernel:ci` writes the report and runs the same gate itself (--min-tests 30,
+            # --max-nothing-files 0), so this row is not gated by the steps below twice.
+            report: ""
             install_uv: true
             seed_kernel_python: true
           - name: runtime python
             package: prime-agent-runtime
             command: uv run python -m unittest discover -s test
+            report: ""
             install_uv: true
+
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -178,15 +232,30 @@ jobs:
           "$kernel_python" -P -c 'import rlm.repl, dill, goal, agent_message'
           echo "PRIME_AGENT_KERNEL_PYTHON=$kernel_python" >> "$GITHUB_ENV"
 
-      # Proves the gate that `npm run test:kernel:ci` applies to the suite report can go red: a
-      # planted all-skipped report must fail it, so a broken gate cannot pass as green.
-      - name: Kernel coverage gate self-test
-        if: matrix.seed_kernel_python
-        run: node scripts/check-kernel-coverage.mjs --self-test
-
+      # The default reporter keeps the human summary; the JSON report is what the coverage gate
+      # reads. Jobs without a `report` (tui's `node --test`, the runtime's unittest suite, and the
+      # kernel job, whose command writes its report and gates it itself) run their command as-is.
       - name: Test
+        if: matrix.report == ''
         working-directory: ${{ matrix.package }}
         run: ${{ matrix.command }}
+
+      - name: Test (with a vitest JSON report)
+        if: matrix.report != ''
+        working-directory: ${{ matrix.package }}
+        run: ${{ matrix.command }} --reporter=default --reporter=json --outputFile.json=${{ matrix.report }}
+
+      # Fails the job when a file ran nothing beyond its budget, when a file collected nothing, or
+      # when the report fell below its floor, and names the files: a job that quietly stopped
+      # running a face of the suite cannot report success.
+      - name: Vitest coverage gate
+        if: matrix.report != ''
+        working-directory: ${{ matrix.package }}
+        run: >-
+          node ../../scripts/check-vitest-coverage.mjs ${{ matrix.report }}
+          --min-tests ${{ matrix.min_tests }}
+          --min-ran-tests ${{ matrix.min_ran_tests }}
+          --max-nothing-files ${{ matrix.max_nothing_files }}
 
   test-hygiene:
     name: Test hygiene
@@ -211,6 +280,12 @@ jobs:
       # matching (a regex flavor regression, a broken walk) cannot pass as green.
       - name: Gate self-test (planted violations must turn the gate red)
         run: node scripts/check-test-private-probes.mjs --self-test
+
+      # The coverage gate is the only thing between "a file stopped running" and a green job, so it
+      # is proven on every run too: planted all-skipped reports, planted zero-collection and planted
+      # floors must turn it red, and the budget must be honoured.
+      - name: Coverage gate self-test (planted all-skipped reports must turn the gate red)
+        run: node scripts/check-vitest-coverage.mjs --self-test
 
       # Diff-scoped and baseline-frozen: the existing stock in scripts/test-private-probe-baseline.json
       # is ignored, anything new under packages/*/test/** fails. BASE_REF is empty or all zeros for a

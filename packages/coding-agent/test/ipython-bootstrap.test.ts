@@ -1,10 +1,10 @@
-import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { ReplKernelManager } from "../src/core/kernel/index.js";
 import { buildRlmBootstrapCode } from "../src/core/tools/ipython.js";
+import { resolveKernelPython } from "./kernel-python.js";
 
 describe("RLM bootstrap", () => {
 	it("pre-imports asyncio so the prompt's subagent patterns work without a manual import", () => {
@@ -51,24 +51,8 @@ describe("RLM bootstrap", () => {
 	});
 });
 
-/** Find a python with a current rlm runtime, or null to skip. */
-function resolveKernelPython(): string | null {
-	const candidates = [
-		process.env.PRIME_AGENT_KERNEL_PYTHON,
-		resolve(__dirname, "..", "..", "..", "prime-agent-runtime", ".venv", "bin", "python"),
-		join(homedir(), ".prime", "agent", "kernel-venv", "bin", "python"),
-	].filter((p): p is string => Boolean(p));
-	for (const python of candidates) {
-		if (!existsSync(python)) continue;
-		const check = spawnSync(python, ["-c", "import rlm.repl, rlm; assert callable(rlm.emit)"], {
-			encoding: "utf8",
-		});
-		if (check.status === 0) return python;
-	}
-	return null;
-}
-
-const python = resolveKernelPython();
+// Resolved the way the product resolves a kernel interpreter; see `test/kernel-python.ts`.
+const python = await resolveKernelPython("import rlm.repl, rlm; assert callable(rlm.emit)");
 const describeIfKernel = python ? describe : describe.skip;
 
 describeIfKernel("RLM bootstrap (real kernel)", () => {
