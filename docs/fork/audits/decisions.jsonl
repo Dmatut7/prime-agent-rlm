@@ -97,3 +97,7 @@
 {"id": "QW-2", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "流式 fragments 模式中途 attach 把工具参数还原成 {}（seed 不回填 toolCallJson；无该用例）", "verified_by": "qwen 实测 vs snapshot 模式对照"}
 {"id": "QW-3", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "sleepSync 迭代上限在拒绝 Atomics.wait 的宿主上退化为 10.9ms/200ms（退避失效）", "verified_by": "qwen 模拟宿主演实"}
 {"id": "QW-R1", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "share 残余：折行/再编码/外人所有的凭证漏检；tui job 不在覆盖闸内", "verified_by": "qwen 复核"}
+{"id": "K3R-1", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "event-log 涂白删掉双读稳定检查：活写者大记录可被涂白成畸形内部行→fail-closed", "verified_by": "K3 读码（event-log.ts:203-215）"}
+{"id": "K3R-2", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "cron run 记账/拆除/恢复写者仍写 now() 不 restamp ⇒ 滞后钟静默丢", "verified_by": "K3 读码（cron-jobs.ts:803/813/1101/1940）"}
+{"id": "K3R-3", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "kitty 去重扩展到批量首字符：无括号粘贴首字符同码点被吃", "verified_by": "K3 读码（stdin-buffer.ts:674-686）"}
+{"id": "K3R-4", "date": "2026-09-15", "severity": "P3", "status": "fixing", "commit": null, "title": "粘贴内完整 kitty 转义仍中止粘贴并把剩余字节送按键路 ⇒ 我方\"粘贴永不注入按键\"表述过绝对", "verified_by": "K3 读码（stdin-buffer.ts:498-506，先于本批存在）"}
