@@ -3,7 +3,6 @@ import {
 	existsSync,
 	fstatSync,
 	fsyncSync,
-	ftruncateSync,
 	mkdirSync,
 	openSync,
 	readSync,
@@ -22,10 +21,11 @@ import { dirname } from "node:path";
  * (rejected by the consumer's parser AND unterminated: a crashed writer's
  * in-progress append) and fails closed on any malformed interior line.
  * Repair happens only on append, never on read — a viewer may replay a live
- * writer's log. EVERY unterminated tail is truncated at its byte offset,
- * even one that parses as JSON: completing it with a newline would turn a
- * line a strict consumer parser rejects into permanent fail-closed interior
- * poison. Unifying consumers keeps the union of their safety behaviors.
+ * writer's log. EVERY unterminated tail is blanked in place, even one that
+ * parses as JSON: completing it with a newline would turn a line a strict
+ * consumer parser rejects into permanent fail-closed interior poison, and
+ * deleting it would cut out a concurrent writer's complete record. Unifying
+ * consumers keeps the union of their safety behaviors.
  */
 
 export interface EventLogOptions {
@@ -49,6 +49,22 @@ function readAllSync(fd: number, maxBytes: number | undefined, path: string): Bu
 		offset += bytesRead;
 	}
 	return buffer.subarray(0, offset);
+}
+
+/**
+ * Positional write of a whole buffer at an explicit offset. A single writeSync
+ * may return a short count without throwing (a file-size limit or ENOSPC does
+ * exactly that), which would leave part of a blanked fragment behind.
+ */
+function writeAllSync(fd: number, contents: Buffer, position: number): void {
+	let offset = 0;
+	while (offset < contents.length) {
+		const written = writeSync(fd, contents, offset, contents.length - offset, position + offset);
+		if (written <= 0) {
+			throw new Error(`event log write stalled at byte ${position + offset}`);
+		}
+		offset += written;
+	}
 }
 
 function serializeLine(event: unknown): string {
@@ -136,9 +152,31 @@ export class EventLog {
 	}
 
 	/**
-	 * Truncate a torn final line from a crashed writer before appending:
-	 * otherwise the append would turn a tolerable torn tail into a fail-closed
-	 * interior line. The torn bytes were never readable data.
+	 * Neutralize a torn final line from a crashed writer before appending:
+	 * otherwise the append would glue the fragment onto the following record and
+	 * turn a tolerable torn tail into a fail-closed interior line. The fragment's
+	 * bytes were never readable data.
+	 *
+	 * The fragment is BLANKED IN PLACE (the same byte count, all spaces) rather
+	 * than truncated to the last newline. Truncation is only correct against the
+	 * snapshot it was computed from: a concurrent writer that appends a complete
+	 * record after that snapshot is cut out of the log, because `ftruncate(keep)`
+	 * removes every byte at or above an offset that was already EOF when the
+	 * snapshot was read. Both writers still report success, so a lost
+	 * spawn/rename/delete record is silent.
+	 *
+	 * A blanking write cannot do that. It only overwrites bytes BELOW the size it
+	 * just read, and this class never removes bytes, so every append — ours, a
+	 * foreign process's, and a repair's own trailing append — starts at or above
+	 * the EOF, which is at or above that size. A complete concurrent record is
+	 * therefore never inside the target range. Two repairs racing on the same
+	 * fragment write the same spaces to the same offsets (the fragment holds no
+	 * newline by construction, so `keep` is invariant under blanking), which
+	 * makes the repair idempotent and commutative.
+	 *
+	 * Readers need no change: `replaySync` trims each line, so blanked bytes are
+	 * skipped as whitespace, and the record appended after the fragment reads back
+	 * as its own line.
 	 */
 	private repairTailSync(): void {
 		const { maxBytes } = this.options;
@@ -157,23 +195,22 @@ export class EventLog {
 		}
 		// All offsets are BYTE offsets on raw buffers: string indices diverge
 		// from byte offsets as soon as any record carries multi-byte UTF-8,
-		// and ftruncate takes bytes.
+		// and a positional write takes bytes.
 		try {
 			const fd = openSync(this.path, "r+");
 			try {
 				const lastByte = Buffer.alloc(1);
 				if (readSync(fd, lastByte, 0, 1, size - 1) !== 1 || lastByte[0] === 0x0a) return;
-				// Truncate guarded by a double-read stability check (cheap
-				// cross-process hardening; a racing append between the check and
-				// the ftruncate stays in the same trust bucket as the documented
-				// O_APPEND small-write atomicity assumption).
-				const first = readAllSync(fd, maxBytes, this.path);
-				const second = readAllSync(fd, maxBytes, this.path);
-				if (second.length !== first.length || !second.equals(first)) return;
-				if (fstatSync(fd).size !== first.length) return;
-				const keep = first.lastIndexOf(0x0a) + 1;
-				ftruncateSync(fd, keep);
-				this.options.log?.(`truncated torn final line (${first.length - keep} bytes)`);
+				const contents = readAllSync(fd, maxBytes, this.path);
+				// `keep` is the byte just past the last newline we read, so
+				// [keep, contents.length) is the unterminated fragment.
+				const keep = contents.lastIndexOf(0x0a) + 1;
+				const torn = contents.length - keep;
+				// A concurrent complete append can close the tail between the probe
+				// and this read; then there is no fragment left to blank.
+				if (torn <= 0) return;
+				writeAllSync(fd, Buffer.alloc(torn, 0x20), keep);
+				this.options.log?.(`blanked torn final line (${torn} bytes)`);
 			} finally {
 				closeSync(fd);
 			}

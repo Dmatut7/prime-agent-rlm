@@ -261,7 +261,7 @@ describe("rlm spawn ledger", () => {
 			const torn = new RlmSpawnLedger(root, sessionsDir, undefined, (message) => logged.push(message));
 			await expect(torn.edges()).resolves.toEqual([expect.objectContaining({ childId: "sub-11111111" })]);
 			expect(logged.some((message) => message.includes("torn final line"))).toBe(true);
-			// The next append repairs the torn tail with a newline first.
+			// The next append neutralizes the torn tail before appending.
 			await torn.appendSpawn({
 				childId: "sub-22222222",
 				parent: parentFile,
@@ -284,7 +284,7 @@ describe("rlm spawn ledger", () => {
 			const { sessionsDir, parentFile } = makeRoots(root);
 			const ledger = new RlmSpawnLedger(root, sessionsDir);
 			// Multi-byte UTF-8 in the name makes string indices diverge from
-			// byte offsets; the truncate must not cut into this record.
+			// byte offsets; the byte-range repair must not cut into this record.
 			await ledger.appendSpawn({
 				childId: "sub-11111111",
 				parent: parentFile,

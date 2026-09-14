@@ -23,12 +23,12 @@ describe("event log substrate", () => {
 		expect(readFileSync(log.path, "utf8")).toBe(before);
 	});
 
-	it("truncates an unterminated tail even when it parses as JSON, keeping strict replays clean", () => {
+	it("drops an unterminated tail even when it parses as JSON, keeping strict replays clean", () => {
 		const path = join(dir, "log.jsonl");
 		const log = new EventLog(path);
 		log.appendSync([{ v: 1, keep: true }]);
 		// A newline-completion here would hand this line to strict parsers as
-		// permanent fail-closed interior poison; truncation must win.
+		// permanent fail-closed interior poison; neutralizing it must win.
 		writeFileSync(path, `${readFileSync(path, "utf8")}{"not":"a valid record"}`);
 		log.appendSync([{ v: 1, second: true }]);
 		const strict = new EventLog(path).replaySync((line, index) => {
@@ -37,6 +37,29 @@ describe("event log substrate", () => {
 			return value;
 		});
 		expect(strict).toEqual([
+			{ v: 1, keep: true },
+			{ v: 1, second: true },
+		]);
+	});
+
+	it("neutralizes an unterminated tail without deleting bytes a concurrent writer could own", () => {
+		const path = join(dir, "log.jsonl");
+		const log = new EventLog(path);
+		log.appendSync([{ v: 1, keep: true }]);
+		const intact = readFileSync(path);
+		const fragment = '{"v":1,"op":"spa';
+		writeFileSync(path, Buffer.concat([intact, Buffer.from(fragment)]));
+		log.appendSync([{ v: 1, second: true }]);
+		// Every append lands at or above the EOF, so a repair that removes bytes
+		// below it removes whatever another process appended inside its window.
+		// The repair must not shorten the log; it blanks the fragment in place.
+		const after = readFileSync(path);
+		const appended = Buffer.byteLength(`${JSON.stringify({ v: 1, second: true })}\n`);
+		expect(after.length).toBe(intact.length + fragment.length + appended);
+		expect(
+			after.subarray(intact.length, intact.length + fragment.length).equals(Buffer.alloc(fragment.length, 0x20)),
+		).toBe(true);
+		expect(new EventLog(path).replaySync((line) => JSON.parse(line))).toEqual([
 			{ v: 1, keep: true },
 			{ v: 1, second: true },
 		]);
