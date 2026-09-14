@@ -1,0 +1,3 @@
+- Fixed compaction reading no user-request or fact ledger at all when anything follows the machine blocks, recovering the block from its last matching tags and warning instead of losing it silently.
+- Fixed a client that attaches mid tool call in fragments mode seeing empty tool arguments, by seeding the argument accumulator with what the stream had already parsed.
+- Fixed the synchronous lock backoff on hosts that refuse `Atomics.wait`, which returned almost immediately instead of waiting its delay.

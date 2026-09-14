@@ -1,5 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { Model } from "@earendil-works/pi-ai";
+import { type LogEntry, type Model, setLogSink } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import {
 	type CompactionDetails,
@@ -504,6 +504,84 @@ describe("F1-E machine blocks are anchored at the end of the document", () => {
 		expect(plain?.previousFacts?.generation).toBe(9);
 		expect(plain?.previousUserRequests?.generation).toBe(9);
 		expect(plain?.generation).toBe(10);
+	});
+
+	/**
+	 * Anchoring says "the renderer wrote the tail". That is true when the renderer is
+	 * the last writer, and false the moment anything appends after it - a footer, a
+	 * hand-edited line, a summary imported from another build. Losing the whole ledger
+	 * (and saying nothing) is a compatibility cliff with no upside: the block is still
+	 * there, with the strict opener and the last matching closer, so it can still be
+	 * read back. What the relaxed read may not do is stay quiet.
+	 */
+	it("15. still reads the ledger when text follows the blocks, and warns that the read was not anchored", () => {
+		const narrative =
+			"## Goal\nship it\n\nThe prompt mentions <user-requests> verbatim, so this prose names a block.";
+		const note = "_Note written after the block_";
+		const doc = `${narrative}\n${userBlock(REAL_REQUESTS, 7, 2)}\n\n${note}\n`;
+		const entries: LogEntry[] = [];
+		setLogSink((entry) => {
+			entries.push(entry);
+		});
+		try {
+			// Red today: the tail scan refuses the document and every read comes back empty.
+			const parsed = parseUserRequests(doc);
+			expect(parsed).toBeDefined();
+			expect(parsed?.generation).toBe(7);
+			expect(parsed?.elided).toBe(2);
+			expect(parsed?.records.map((record) => record.text)).toEqual(REAL_REQUESTS);
+			expect(findMachineBlock(doc, "user-requests")?.attributes.count).toBe("2");
+			expect(parseFactAppendix(doc)).toBeUndefined();
+
+			// The strip keeps its own rule (the sweep removes the block, the note stays),
+			// so the relaxed read does not quietly widen what leaves the document.
+			expect(stripMachineBlocks(doc)).toBe(`${narrative}\n\n${note}`);
+
+			const warns = entries.filter(
+				(entry) => entry.level === "warn" && entry.component === "coding-agent.compaction",
+			);
+			expect(warns.length, "the unanchored read must not be silent").toBeGreaterThan(0);
+		} finally {
+			setLogSink(undefined);
+		}
+	});
+
+	it("16. carries the ledger forward when the blocks are not the last thing in the summary", () => {
+		const narrative = "## Goal\nship it";
+		const note = "_written after the blocks_";
+		const entries: LogEntry[] = [];
+		setLogSink((entry) => {
+			entries.push(entry);
+		});
+		try {
+			// The detail-free path (a summary written before details existed, or an entry
+			// whose details were dropped) with a note appended after the blocks: the next
+			// generation starts at 8 and still carries the user's own words.
+			const continued = prepareWithPrevious({
+				summary: `${narrative}\n${userBlock(REAL_REQUESTS, 7)}\n\n${note}\n`,
+			});
+			expect(continued?.generation).toBe(8);
+			expect(continued?.previousUserRequests?.generation).toBe(7);
+			expect(continued?.previousUserRequests?.records.map((record) => record.text)).toEqual(REAL_REQUESTS);
+			expect(continued?.previousSummary).toBe(`${narrative}\n\n${note}`);
+
+			// Negative control: the shape the renderer writes warns about nothing, so the
+			// warning is about this document and not about reading a ledger at all.
+			entries.length = 0;
+			const anchored = prepareWithPrevious({ summary: document(narrative, "", "", userBlock(REAL_REQUESTS, 7)) });
+			expect(anchored?.previousUserRequests?.records.map((record) => record.text)).toEqual(REAL_REQUESTS);
+			expect(entries.filter((entry) => entry.level === "warn")).toEqual([]);
+		} finally {
+			setLogSink(undefined);
+		}
+	});
+
+	it("15b. keeps the strict facts that follow a block out of the ledger read", () => {
+		// Positive control for 15: a text tail that carries no block is still no block.
+		const doc = `## Goal\nship it\n${userBlock(REAL_REQUESTS, 7)}\n\nno block follows this line\n`;
+		expect(parseFactAppendix(doc)).toBeUndefined();
+		expect(findMachineBlock(doc, "fact-appendix")).toBeUndefined();
+		expect(parseUserRequests(doc)?.records.map((record) => record.text)).toEqual(REAL_REQUESTS);
 	});
 });
 

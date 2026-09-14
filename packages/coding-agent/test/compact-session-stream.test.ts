@@ -324,6 +324,21 @@ describe("isFragmentOnlyToolCallDelta", () => {
 	});
 });
 
+/**
+ * The tool-call arguments a reconstructed `message_update` carries, for the tests
+ * that compare what one encoding produces against what another one produces.
+ */
+function toolArguments(outbound: DaemonOutbound | undefined): Record<string, unknown> | undefined {
+	if (outbound?.type !== "session_event" || outbound.event.type !== "message_update") {
+		throw new Error("expected a message_update");
+	}
+	const message = outbound.event.message;
+	if (message.role !== "assistant") throw new Error("expected an assistant message");
+	const block = message.content[0];
+	if (block?.type !== "toolCall") throw new Error("expected a toolCall block");
+	return block.arguments;
+}
+
 describe("CompactAssistantStreamReconstructor fragment mode", () => {
 	function seed(reconstructor: CompactAssistantStreamReconstructor): void {
 		reconstructor.observe({
@@ -408,5 +423,46 @@ describe("CompactAssistantStreamReconstructor fragment mode", () => {
 		const distinct = new Set(identities);
 		// An unthrottled per-delta parse produces one fresh object per delta.
 		expect(distinct.size).toBeLessThan(identities.length / 2);
+	});
+
+	/**
+	 * A client that attaches mid tool call is seeded with the streaming message the
+	 * session already holds (`reseedStreamReconstructor`). In fragments mode the
+	 * deltas after that seed carry only the new fragment, so the seed's own arguments
+	 * are the first half of the buffer: an accumulator that starts empty hands the
+	 * peer `{}` (or garbage) until `toolcall_end`, and nothing on the wire says so.
+	 * Snapshot mode over the same seed and the same delta is the reference value,
+	 * because there every delta re-states the parsed arguments.
+	 */
+	it("continues fragments after a mid-stream seed instead of accumulating from an empty buffer", () => {
+		const seeding = assistant([{ type: "toolCall", id: "call-1", name: "bash", arguments: { query: "hel" } }]);
+		const updated = assistant([{ type: "toolCall", id: "call-1", name: "bash", arguments: { query: "hello" } }]);
+		const update = (): DaemonOutbound => ({
+			type: "session_event",
+			activeSessionId,
+			event: {
+				type: "message_update",
+				message: updated,
+				assistantMessageEvent: { type: "toolcall_delta", contentIndex: 0, delta: 'lo"}', partial: updated },
+			},
+		});
+
+		const fragments = new CompactAssistantStreamReconstructor();
+		fragments.seed(activeSessionId, seeding);
+		const rebuilt = toolArguments(
+			fragments.reconstruct(
+				createCompactAssistantDelta(update(), { toolCallArguments: "fragments" }) as CompactAssistantDelta,
+			),
+		);
+
+		const snapshot = new CompactAssistantStreamReconstructor();
+		snapshot.seed(activeSessionId, seeding);
+		const reference = toolArguments(
+			snapshot.reconstruct(createCompactAssistantDelta(update()) as CompactAssistantDelta),
+		);
+
+		expect(reference).toEqual({ query: "hello" });
+		// Red today: the fragments side accumulates from "" and reports {}.
+		expect(rebuilt).toEqual(reference);
 	});
 });

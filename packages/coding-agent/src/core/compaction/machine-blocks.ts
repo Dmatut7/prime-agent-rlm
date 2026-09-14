@@ -22,6 +22,13 @@
  * some other channel - a tool `path` argument, a narrative that merely names the
  * tags (the summarization prompt itself contains them), a hook-authored summary -
  * and a forged block header ahead of the real one wins the non-greedy match.
+ *
+ * Anchoring decides what to *trust*, not what to *lose*. The renderer stops being the
+ * last writer the moment a note, a footer, an import or a hand edit lands after the
+ * blocks, and refusing to read the block outright threw away a ledger that was still in
+ * the document. The read path therefore recovers such a block from its last strict opener
+ * and its last line-owning closer, and warns: the anchored read stays authoritative, the
+ * recovered one is a best effort with a name.
  */
 
 import { getLogger } from "@earendil-works/pi-ai";
@@ -223,21 +230,101 @@ function trailingWhitespaceStart(text: string, from: number): number {
 	return cursor;
 }
 
-/** Every machine block of the document's tail region, in document order. */
-export function findMachineBlocks(text: string, tags: readonly MachineBlockTag[] = MACHINE_BLOCK_TAGS): MachineBlock[] {
-	const blocks: MachineBlock[] = [];
-	for (const anchored of scanTailBlocks(text, tags)) {
-		blocks.push({ tag: anchored.tag, attributes: anchored.attributes, body: anchored.body });
+/** Index of the last `</tag>` that owns a line of its own, or undefined when there is none. */
+function lastClosingTagLine(text: string, tag: MachineBlockTag): number | undefined {
+	const literal = closingTagLiteral(tag);
+	let from = text.length;
+	for (;;) {
+		const start = text.lastIndexOf(literal, from);
+		if (start < 0) return undefined;
+		let lineEnd = start + literal.length;
+		while (text[lineEnd] === " " || text[lineEnd] === "\t") lineEnd++;
+		const ownsLine = (start === 0 || text[start - 1] === "\n") && (lineEnd === text.length || text[lineEnd] === "\n");
+		if (ownsLine) return start;
+		from = start - 1;
 	}
-	return blocks;
+}
+
+/**
+ * Read the blocks the tail scan refuses, because something wrote after them.
+ *
+ * The anchored rule says "the renderer wrote the tail", and that is true only while the
+ * renderer is the last writer. A footer, a note appended by a later writer, a summary
+ * imported from another build or hand-edited all put text after the last block, and the
+ * tail scan then reads nothing at all - the ledger is still in the document, one paragraph
+ * away from the end.
+ *
+ * The predicate here is the anchored one minus exactly one clause: the closer no longer has
+ * to be the document's last line, it only has to own a line of its own. Everything that
+ * makes the anchored read trustworthy survives: the opener is still a whole line of strict
+ * shape, and the *last* closer and the *last* opener before it win, so a look-alike written
+ * ahead of the real block (in prose, in a tool `path`, in another block's body) still loses
+ * to the real block. What the dropped clause bought was the guarantee that nothing follows
+ * the block, and that guarantee is gone - so every read through this path warns, and the
+ * caller can tell a recovered block from the renderer's own bytes.
+ */
+function scanUnanchoredBlocks(text: string, tags: readonly MachineBlockTag[]): AnchoredBlock[] {
+	const blocks: AnchoredBlock[] = [];
+	for (const tag of tags) {
+		const closer = lastClosingTagLine(text, tag);
+		if (closer === undefined) continue;
+		const opener = lastOpeningTag(text, closer, tag);
+		if (!opener) continue;
+		blocks.push({
+			tag,
+			attributes: opener.attributes,
+			body: text.slice(opener.end, closer).replace(/^\n/, "").replace(/\n$/, ""),
+			index: opener.start,
+			end: closer + closingTagLiteral(tag).length,
+		});
+	}
+	return blocks.sort((left, right) => left.index - right.index);
+}
+
+/** Say that a ledger was read from a block the anchoring rule refused. */
+function warnUnanchoredRead(text: string, blocks: AnchoredBlock[]): void {
+	const last = blocks[blocks.length - 1];
+	blockLog.warn(
+		"machine blocks are not anchored at the end of the document; read back from their last match instead",
+		{
+			tags: blocks.map((block) => block.tag),
+			blockStart: last?.index,
+			trailingChars: text.length - (last?.end ?? text.length),
+		},
+	);
+}
+
+function toMachineBlock(block: AnchoredBlock): MachineBlock {
+	return { tag: block.tag, attributes: block.attributes, body: block.body };
+}
+
+/**
+ * Every machine block of the document's tail region, in document order.
+ *
+ * A requested tag the anchored scan could not see is read from its last match instead
+ * (`scanUnanchoredBlocks`), because a block that is one paragraph away from the end is a
+ * block the next generation still needs. The anchored blocks stay authoritative, and a
+ * recovered block is announced.
+ */
+export function findMachineBlocks(text: string, tags: readonly MachineBlockTag[] = MACHINE_BLOCK_TAGS): MachineBlock[] {
+	const anchored = scanTailBlocks(text, tags);
+	const anchoredTags = new Set(anchored.map((block) => block.tag));
+	const missing = tags.filter((tag) => !anchoredTags.has(tag));
+	const recovered = missing.length > 0 ? scanUnanchoredBlocks(text, missing) : [];
+	if (recovered.length > 0) warnUnanchoredRead(text, recovered);
+	return [...anchored, ...recovered].sort((left, right) => left.index - right.index).map(toMachineBlock);
 }
 
 /** The document's last block of one tag, or undefined when the text carries none. */
 export function findMachineBlock(text: string, tag: MachineBlockTag): MachineBlock | undefined {
-	const blocks = scanTailBlocks(text, [tag]);
-	const last = blocks[blocks.length - 1];
-	if (!last) return undefined;
-	return { tag: last.tag, attributes: last.attributes, body: last.body };
+	const anchored = scanTailBlocks(text, [tag]);
+	const last = anchored[anchored.length - 1];
+	if (last) return toMachineBlock(last);
+	const recovered = scanUnanchoredBlocks(text, [tag]);
+	const fallback = recovered[recovered.length - 1];
+	if (!fallback) return undefined;
+	warnUnanchoredRead(text, [fallback]);
+	return toMachineBlock(fallback);
 }
 
 /**
@@ -291,8 +378,26 @@ export function checkMachineBlockSelfCount(
 export function stripMachineBlocks(text: string, tags: readonly MachineBlockTag[] = MACHINE_BLOCK_TAGS): string {
 	const tail = scanTailBlocks(text, tags);
 	let stripped = tail.length > 0 ? text.slice(0, tail[0].index) : text;
+	const swept: MachineBlockTag[] = [];
 	for (const tag of tags) {
-		stripped = stripped.replace(sweepPattern(tag), "\n\n");
+		const pattern = sweepPattern(tag);
+		const after = stripped.replace(pattern, "\n\n");
+		if (after !== stripped) swept.push(tag);
+		stripped = after;
+	}
+	if (swept.length > 0) {
+		// The sweep is the loose pass and never a source of truth, so a hit means the
+		// anchoring rule did not own this block: the document's tail was written by
+		// something other than the renderer, or by an older build. That is exactly the
+		// document the read path now recovers a ledger from, so it must not slip through
+		// quietly - a recovered ledger is worth having, and worth knowing about.
+		blockLog.warn(
+			"machine blocks were swept rather than anchored; the document's tail was not written by the renderer",
+			{
+				tags: swept,
+				anchoredTags: tail.map((block) => block.tag),
+			},
+		);
 	}
 	return stripped.replace(/\n{3,}/g, "\n\n").trim();
 }
