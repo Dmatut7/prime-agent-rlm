@@ -150,7 +150,7 @@ import {
 	type WorkerRosterEntry,
 	workerRosterEntryFromSummary,
 } from "./agent-roster.js";
-import { createCompactAssistantDelta } from "./compact-session-stream.js";
+import { createCompactAssistantDelta, planCompactAssistantDelta } from "./compact-session-stream.js";
 import { DaemonClient } from "./daemon-client.js";
 import { filterClientEnv, withClientEnv } from "./daemon-client-env.js";
 import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
@@ -7587,11 +7587,17 @@ export class AgentDaemon {
 	}
 
 	private write(client: DaemonSocketClient, message: DaemonOutbound): boolean {
-		// Direct session peers decode plain jsonl payloads only; compact deltas are a supervisor optimization.
-		const compactDelta =
-			client.transport === "private-framed" && client.authenticationRole !== "session_client"
-				? createCompactAssistantDelta(message)
-				: undefined;
+		// The supervisor leg always takes compact deltas. A direct session peer
+		// takes them only when it declared streaming_deltas on attach (the
+		// client-side reconstructor lives behind that capability), and takes
+		// fragment-only tool-call deltas only with streaming_delta_fragments.
+		const capabilities = hasDaemonOutboundActiveSessionId(message)
+			? daemonClientCapabilitiesForSession(client, message.activeSessionId)
+			: client.capabilities;
+		const plan = planCompactAssistantDelta(client.transport, client.authenticationRole, capabilities);
+		const compactDelta = plan.compact
+			? createCompactAssistantDelta(message, { toolCallArguments: plan.toolCallArguments })
+			: undefined;
 		return this.writeSerialized(
 			client,
 			serializeJsonLine(compactDelta ?? message),

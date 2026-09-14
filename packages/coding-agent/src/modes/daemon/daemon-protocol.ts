@@ -119,8 +119,15 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 //   exactly as it did before, so nothing gates on the number. The per-command
 //   worker request timeouts that ship with it (P1-7b) are supervisor-internal
 //   policy and change no wire shape.
-export const DAEMON_SCHEMA_REVISION = 29;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-29-66299858b8b4";
+// Revision 30 adds the streaming_delta_fragments capability: producers may
+//   then omit CompactAssistantDelta.toolCallArguments on tool-call deltas
+//   (the field was always optional), and the worker may send compact
+//   assistant_stream_delta frames on the direct session-peer link when the
+//   peer declared streaming_deltas on attach. Both directions degrade to the
+//   pre-30 wire when the capability is absent, so nothing gates on the
+//   number; the digest identifies it.
+export const DAEMON_SCHEMA_REVISION = 30;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-30-66299858b8b4";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -143,7 +150,12 @@ export type DaemonClientCapability =
 	// (assistant_stream_delta) instead of rebuilt full message_update events to
 	// clients that advertise this capability. Clients must accumulate the deltas
 	// into the streaming assistant message themselves.
-	| "streaming_deltas";
+	| "streaming_deltas"
+	// tool-call deltas may omit the parsed arguments snapshot
+	// (CompactAssistantDelta.toolCallArguments) and carry only the new fragment
+	// (toolcall_delta.delta). Consumers must accumulate the fragments and parse
+	// throttled; toolcall_end stays authoritative. Revision 30.
+	| "streaming_delta_fragments";
 export type DaemonPromptAdmissionCancellationStatus = "cancelled" | "owned" | "unknown";
 export interface DaemonPromptAdmissionCancellationResult {
 	status: DaemonPromptAdmissionCancellationStatus;
@@ -216,6 +228,7 @@ export const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: readonly DaemonClientCapabili
 	"chunked_snapshot",
 	"client_owned_sessions",
 	"streaming_deltas",
+	"streaming_delta_fragments",
 ];
 
 /**
@@ -1310,7 +1323,9 @@ export type CompactAssistantMessageEvent = WithoutPartialMessage<AssistantMessag
  * streaming_deltas capability instead of the rebuilt full message_update event.
  * Clients accumulate these into the streaming assistant message; contentStart
  * seeds a new content block and toolCallArguments carries the parsed arguments
- * snapshot for tool-call deltas.
+ * snapshot for tool-call deltas. Producers omit toolCallArguments for
+ * consumers that negotiated the streaming_delta_fragments capability; those
+ * consumers accumulate toolcall_delta fragments and parse throttled.
  */
 export interface CompactAssistantDelta {
 	type: "assistant_stream_delta";

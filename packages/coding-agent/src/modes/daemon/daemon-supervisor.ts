@@ -85,7 +85,11 @@ import {
 	workerRosterEntryFromSummary,
 } from "./agent-roster.js";
 import { CommandRecoveryJournal, createCommandIdempotencyKey } from "./command-recovery-journal.js";
-import { CompactAssistantStreamReconstructor, isCompactAssistantDelta } from "./compact-session-stream.js";
+import {
+	CompactAssistantStreamReconstructor,
+	isCompactAssistantDelta,
+	isFragmentOnlyToolCallDelta,
+} from "./compact-session-stream.js";
 import { DAEMON_CATALOG_ROLE_ENV, DaemonCatalogClient } from "./daemon-catalog-process.js";
 import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
 import {
@@ -4207,8 +4211,15 @@ export class DaemonSupervisor {
 				type: "worker_subscribe",
 				activeSessionId,
 				capabilities: supportsExtensionUi
-					? ["attach_snapshot", "event_sequence", "extension_ui", "slim_attach", "chunked_snapshot"]
-					: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"],
+					? [
+							"attach_snapshot",
+							"event_sequence",
+							"extension_ui",
+							"slim_attach",
+							"chunked_snapshot",
+							"streaming_delta_fragments",
+						]
+					: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot", "streaming_delta_fragments"],
 				supportsExtensionUi,
 			},
 			timeoutMs,
@@ -7685,6 +7696,7 @@ export class DaemonSupervisor {
 		let publicPayload = frame.payload;
 		let streamingDeltaPayload: Uint8Array | undefined;
 		let decodedOutbound: DaemonOutbound | undefined;
+		let fragmentOnlyDelta = false;
 		if (payloadEncoding === "assistant-delta") {
 			let compactValue: unknown;
 			try {
@@ -7706,9 +7718,11 @@ export class DaemonSupervisor {
 			}
 			// Capable clients consume the worker's original compact bytes
 			// verbatim; the full message_update serialization happens only when
-			// a legacy client still needs it.
+			// a legacy client still needs it. Fragment-only tool-call deltas
+			// additionally require streaming_delta_fragments on the verbatim leg.
+			fragmentOnlyDelta = isFragmentOnlyToolCallDelta(compactValue);
 			streamingDeltaPayload = frame.payload;
-			if (this.sessionHasAttachedLegacyClient(activeSessionId)) {
+			if (this.sessionNeedsRebuiltStreamPayload(activeSessionId, fragmentOnlyDelta)) {
 				publicPayload = Buffer.from(serializeJsonLine(reconstructed));
 			}
 		} else if (
@@ -7765,7 +7779,9 @@ export class DaemonSupervisor {
 				continue;
 			}
 			const payload =
-				streamingDeltaPayload !== undefined && client.capabilities.has("streaming_deltas")
+				streamingDeltaPayload !== undefined &&
+				client.capabilities.has("streaming_deltas") &&
+				(!fragmentOnlyDelta || client.capabilities.has("streaming_delta_fragments"))
 					? streamingDeltaPayload
 					: publicPayload;
 			this.writeSerialized(client, payload);
@@ -7802,10 +7818,20 @@ export class DaemonSupervisor {
 		}
 	}
 
-	/** Whether any client attached to the session still needs rebuilt full message_update payloads. */
-	private sessionHasAttachedLegacyClient(activeSessionId: string): boolean {
+	/**
+	 * Whether any attached client needs the rebuilt full message_update for this
+	 * delta: legacy clients always do; fragment-only tool-call deltas also force
+	 * a rebuild when a streaming_deltas client lacks streaming_delta_fragments.
+	 */
+	private sessionNeedsRebuiltStreamPayload(activeSessionId: string, fragmentOnlyDelta: boolean): boolean {
 		for (const client of this.clients) {
-			if (client.attachedActiveSessionIds.has(activeSessionId) && !client.capabilities.has("streaming_deltas")) {
+			if (!client.attachedActiveSessionIds.has(activeSessionId)) {
+				continue;
+			}
+			if (!client.capabilities.has("streaming_deltas")) {
+				return true;
+			}
+			if (fragmentOnlyDelta && !client.capabilities.has("streaming_delta_fragments")) {
 				return true;
 			}
 		}
