@@ -136,14 +136,27 @@ export function matchSearchText(text: string, parsed: ParsedSearchQuery): MatchR
 	return { matches: true, score: totalScore };
 }
 
+export interface SearchTextMatcher {
+	(text: string): boolean;
+	/**
+	 * False when every row matches and the row's text is not consulted (an empty
+	 * search box). A catalog pass over rows whose corpus costs a 64 KiB join per
+	 * row must skip materializing corpora it cannot use.
+	 */
+	requiresText: boolean;
+}
+
 /**
  * Parse the query once and hand back a matcher for a whole catalog pass:
  * re-parsing per row recompiles the `re:` pattern for every session.
  */
-export function createSearchTextMatcher(query: string): (text: string) => boolean {
+export function createSearchTextMatcher(query: string): SearchTextMatcher {
 	const parsed = parseSearchQuery(query);
-	if (parsed.error) return () => false;
-	return (text) => matchSearchText(text, parsed).matches;
+	// A parse error rejects every row, so the text still has to be consulted
+	// (or the caller would keep rows the matcher means to drop).
+	const requiresText = parsed.error !== undefined || parsed.mode === "regex" || parsed.tokens.length > 0;
+	if (parsed.error) return Object.assign(() => false, { requiresText });
+	return Object.assign((text: string) => matchSearchText(text, parsed).matches, { requiresText });
 }
 
 export function matchesSearchText(text: string, query: string): boolean {

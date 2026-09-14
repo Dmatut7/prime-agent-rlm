@@ -1,0 +1,2 @@
+- Changed the agents view catalog to rebuild only the rows the daemon reported as changed, coalescing roster pushes into one 50 ms window instead of recomputing every row per push.
+- Changed a session row's search corpus to be built on first use and reused while the row is unchanged, instead of re-joining up to 64 KiB of saved transcript text on every catalog pass.

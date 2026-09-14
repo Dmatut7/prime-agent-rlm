@@ -3,13 +3,31 @@ import { sessionSummaryFromRosterEntry } from "../daemon/agent-roster.js";
 import type { DaemonHello, DaemonTransportClient } from "../daemon/daemon-client.js";
 import type { DaemonOutbound } from "../daemon/daemon-protocol.js";
 import type { SessionSummary } from "../daemon/daemon-session-list.js";
+import { summaryIdentityAliases } from "./agents-view-state.js";
 
 export const STALE_ROSTER_DAEMON_MESSAGE =
 	"Daemon is stale: it does not advertise the agent_roster capability; restart the daemon";
 
+/**
+ * What one coalesced roster update changed. The view uses it to rebuild only the
+ * rows the daemon touched instead of the whole catalog.
+ */
+export interface AgentsViewRosterChange {
+	/** Identity aliases of every session whose row changed or was removed. */
+	changedSessionIds: ReadonlySet<string>;
+	/** The daemon resent the whole roster (subscribe/resync): every row is stale. */
+	fullResync: boolean;
+}
+
 export class AgentsViewRosterStore {
 	private readonly entries = new Map<string, AgentRosterEntry>();
-	private readonly listeners = new Set<() => void>();
+	private readonly listeners = new Set<(change: AgentsViewRosterChange) => void>();
+	// Accumulated across the frames of one coalesced emit, so a burst of pushes
+	// hands the view one dirty set instead of one set per frame.
+	private readonly pendingChange: { changedSessionIds: Set<string>; fullResync: boolean } = {
+		changedSessionIds: new Set(),
+		fullResync: false,
+	};
 	private client: DaemonTransportClient | undefined;
 	private unsubscribeMessage: (() => void) | undefined;
 	private emitScheduled = false;
@@ -70,21 +88,35 @@ export class AgentsViewRosterStore {
 	}
 
 	private applyUpdate(changed: AgentRosterEntry[], removed?: string[], resync?: true): void {
-		if (resync) this.entries.clear();
+		if (resync) {
+			this.entries.clear();
+			this.pendingChange.fullResync = true;
+		}
 		for (const entry of changed) {
 			this.entries.set(entry.agentId, entry);
+			this.markChanged(entry.agentId);
+			this.markChanged(sessionSummaryFromRosterEntry(entry));
 		}
 		for (const agentId of removed ?? []) {
 			this.entries.delete(agentId);
+			this.markChanged(agentId);
 		}
 		this.scheduleEmit();
+	}
+
+	private markChanged(identity: string | SessionSummary): void {
+		if (typeof identity === "string") {
+			this.pendingChange.changedSessionIds.add(identity);
+			return;
+		}
+		for (const alias of summaryIdentityAliases(identity)) this.pendingChange.changedSessionIds.add(alias);
 	}
 
 	summaries(): SessionSummary[] {
 		return [...this.entries.values()].map((entry) => sessionSummaryFromRosterEntry(entry));
 	}
 
-	onUpdate(listener: () => void): () => void {
+	onUpdate(listener: (change: AgentsViewRosterChange) => void): () => void {
 		this.listeners.add(listener);
 		return () => this.listeners.delete(listener);
 	}
@@ -94,9 +126,18 @@ export class AgentsViewRosterStore {
 		this.emitScheduled = true;
 		queueMicrotask(() => {
 			this.emitScheduled = false;
+			// The accumulated frame is handed over as an immutable snapshot and the
+			// accumulator is reset before delivery, so frames pushed by a listener
+			// start a fresh window instead of extending this one.
+			const change: AgentsViewRosterChange = {
+				changedSessionIds: this.pendingChange.changedSessionIds,
+				fullResync: this.pendingChange.fullResync,
+			};
+			this.pendingChange.changedSessionIds = new Set();
+			this.pendingChange.fullResync = false;
 			for (const listener of [...this.listeners]) {
 				try {
-					listener();
+					listener(change);
 				} catch {
 					// One consumer must not interrupt delivery to the others.
 				}
