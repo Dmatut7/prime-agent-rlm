@@ -249,28 +249,36 @@ describe("queued child reply delivered later", () => {
 		expect(terminalNotices(family.parent.session.messages)).toEqual([]);
 	});
 
-	it("keeps the no-reply notice while a queued reply has not been delivered (B1)", async () => {
+	it("keeps the no-reply verdict while a queued reply has not been delivered (B1)", async () => {
 		const family = await makeFamily({ waitForDelivery: false });
 		const handle = await family.parent.session.runRlmChild("audit and reply", { name: "queued-reply-worker" });
 
 		await vi.waitFor(() => expect(family.deliveryStatuses).toEqual(["queued"]), { timeout: 15_000, interval: 20 });
 		// The parent stays busy, so the child settles with its reply still in the
-		// queue: an undelivered reply must not count as one.
+		// queue: an undelivered reply must not count as one. The verdict layer is B1's
+		// and does not move - `collectRlmChildren` reports what was decided at settle.
 		const collected = await family.parent.session.collectRlmChildren([handle.rlm_child_id], 20_000);
 		expect(collected.results[0]?.terminal_kind).toBe("completed_without_reply");
 		expect(collected.results[0]?.replied_since_task).not.toBe(true);
 
 		family.releaseParent();
 		await family.parentTurn;
-		await vi.waitFor(() => expect(terminalNotices(family.parent.session.messages)).toHaveLength(1), {
+		// The publication layer is not the verdict: this drain delivers the reply
+		// first (a steer outranks the notice's follow-up), so the notice would arrive
+		// below the very reply it calls missing. That is the false alarm the
+		// publication gate drops - asserted with its two pins in
+		// ma-stale-no-reply-notice-publication.test.ts (suppressed when the reply
+		// lands, still published when the reply is cleared instead).
+		await vi.waitFor(() => expect(deliveredReplyIds(family.parent.session.messages)).toContain(family.replyIds[0]!), {
 			timeout: 15_000,
 			interval: 20,
 		});
-		expect(terminalNotices(family.parent.session.messages)[0]?.details).toMatchObject({
-			kind: "completed_without_reply",
-			childId: handle.rlm_child_id,
-			sessionName: "queued-reply-worker",
+		await vi.waitFor(() => {
+			expect(family.parent.session.isStreaming).toBe(false);
+			expect(family.parent.session.unfinishedActionCount).toBe(0);
 		});
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(terminalNotices(family.parent.session.messages)).toEqual([]);
 	});
 
 	it("credits a reply queued into a suspended parent once the queue resumes", async () => {

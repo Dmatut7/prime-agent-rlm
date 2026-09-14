@@ -123,6 +123,12 @@ export type RlmChildTerminalNoticeDetails =
 			kind: "completed_without_reply";
 			childId: string;
 			sessionName: string;
+			/**
+			 * The child's last assistant text, quoted from its own transcript. Not a
+			 * message it sent: a child that wrote its answer instead of calling
+			 * `agent_message.send` produces a preview that reads exactly like the reply
+			 * the parent never got, so the notice text has to say where this came from.
+			 */
 			lastAssistantTextPreview?: string;
 	  };
 
@@ -153,7 +159,11 @@ export function createRlmChildTerminalNoticeMessage(
 	const content =
 		details.kind === "cancelled"
 			? `RLM child ${details.sessionName} (${details.childId}) was cancelled${details.reason ? `: ${details.reason}` : ""}`
-			: `RLM child ${details.sessionName} (${details.childId}) completed without sending a reply${details.lastAssistantTextPreview ? `. Last assistant text: ${details.lastAssistantTextPreview}` : ""}`;
+			: `RLM child ${details.sessionName} (${details.childId}) completed without sending a reply${
+					details.lastAssistantTextPreview
+						? `. Its last assistant text (written to its own transcript, never sent to you): ${details.lastAssistantTextPreview}`
+						: ""
+				}`;
 	return {
 		role: "custom",
 		customType: RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,

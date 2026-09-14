@@ -1,0 +1,4 @@
+- Fixed false "completed without sending a reply" notices for subagents that answered a busy parent: the verdict is still recorded when the run settles, but the notice is re-validated when it is published, so a reply the parent has already read suppresses it.
+- Fixed a duplicate failure report when a subagent's own terminal-error notice reached a busy parent after the parent classified the same run.
+- Fixed a silently lost reply credit when a session restart re-flowed a queued subagent reply, and reflowed replies now land ahead of the notices they disprove.
+- Changed the no-reply notice to label the quoted assistant text as text the child never sent.

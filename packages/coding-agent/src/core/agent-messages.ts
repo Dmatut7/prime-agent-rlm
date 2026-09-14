@@ -532,6 +532,22 @@ export class QueuedParentReplyBackfills {
 	}
 
 	/**
+	 * Ids this session still owes a delivery credit for, for one sender.
+	 *
+	 * Read at verdict time: a run whose reply is in this list has a reply the parent
+	 * has accepted but not read yet, so its no-reply notice is provisional until the
+	 * queue settles the question. Peeking must not consume - `take` stays the only
+	 * way an id leaves the ledger, which is what keeps the credit exactly once.
+	 */
+	owedMessageIdsForSender(senderSessionId: string): string[] {
+		const owed: string[] = [];
+		for (const [messageId, sender] of this.senderSessionIds) {
+			if (sender === senderSessionId) owed.push(messageId);
+		}
+		return owed;
+	}
+
+	/**
 	 * The sender of a queued reply that has now been delivered, or undefined for an
 	 * id this session never queued (a direct delivery) or already credited.
 	 */
