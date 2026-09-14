@@ -12,6 +12,11 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { getLogger } from "@earendil-works/pi-ai";
 import { lockSync } from "proper-lockfile";
+import {
+	artifactDirectoryWriteMs,
+	readSessionArtifactTombstone,
+	tombstoneInForce,
+} from "./session-artifact-tombstones.js";
 import { getSessionArtifactPathForFile } from "./session-manager.js";
 
 const cronLog = getLogger("coding-agent.cron-jobs");
@@ -264,6 +269,13 @@ export class AgentCronJobStore {
 	recoverSessionArtifact(sessionId: string, now = new Date()): AgentCronJob[] {
 		const path = this.sessionArtifactFiles.get(sessionId);
 		if (!path) {
+			return [];
+		}
+		// A store file that does not exist holds neither jobs nor dispatches, and the
+		// lock helper below mkdirs the directory of every path it is handed - which is
+		// how a deleted session's artifact directory came back. A tombstone says the
+		// directory is a deleted session's leftovers even if something recreated it.
+		if (!existsSync(path) || sessionArtifactGone(dirname(path), sessionId)) {
 			return [];
 		}
 		return withCronJobsStateLocks([path], () => {
@@ -876,7 +888,7 @@ export class AgentCronJobStore {
 				states.push(state);
 				continue;
 			}
-			if (!this.observedSessionArtifactFiles.has(sessionId) || existsSync(dirname(path))) {
+			if (!this.observedSessionArtifactFiles.has(sessionId) || !sessionArtifactGone(dirname(path), sessionId)) {
 				states.push({ jobs: [], dispatches: [] });
 				continue;
 			}
@@ -1703,6 +1715,25 @@ function stripMatchingQuotes(value: string): string {
 		return value.slice(1, -1);
 	}
 	return value;
+}
+
+/**
+ * Whether a registered session's artifact directory is provably gone, so its
+ * registration may be dropped: either the directory no longer exists, or a
+ * tombstone still describes it (the session was deleted and nothing has been
+ * written into the directory since - including the case where a read path
+ * recreated it). A session that reuses the id writes into the directory after
+ * the deletion, which closes the tombstone window by itself (red test R-6).
+ *
+ * The judgement runs on every registered artifact on every read, so it is two
+ * lstats: "cannot disprove" keeps the registration.
+ */
+function sessionArtifactGone(artifactDir: string, sessionId: string): boolean {
+	if (!existsSync(artifactDir)) {
+		return true;
+	}
+	const root = dirname(artifactDir);
+	return tombstoneInForce(readSessionArtifactTombstone(root, sessionId), artifactDirectoryWriteMs(artifactDir));
 }
 
 function isDueJob(job: AgentCronJob, now: Date): boolean {

@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { type Dirent, existsSync } from "node:fs";
 import { readdir, rm, unlink } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
+import { recordSessionArtifactTombstone } from "./session-artifact-tombstones.js";
 import { forgetSessionInfo, getSessionArtifactPath } from "./session-manager.js";
 
 export type DeleteSessionFileResult = { ok: true; method: "trash" | "unlink" } | { ok: false; error: string };
@@ -29,6 +30,12 @@ export async function deleteSessionArtifacts(sessionPath: string): Promise<void>
 	// one may have a durable list-summary; forget them before the recursive remove
 	// so deleting a root does not leave one orphan entry per child.
 	await forgetSummariesUnder(artifactDir);
+	// Record the tombstone before the remove: a crash after this point leaves a
+	// directory that reads are still forbidden to recreate, and this is the signal
+	// the cron store and the retention sweep read instead of guessing from the
+	// directory's absence (round-08 S1). Best effort: a refused tombstone write must
+	// not turn a completed deletion into a failure.
+	recordSessionArtifactTombstone(dirname(artifactDir), sessionId, { reason: "session-deleted" });
 	await rm(artifactDir, { recursive: true, force: true });
 }
 

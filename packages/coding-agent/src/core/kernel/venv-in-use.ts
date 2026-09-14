@@ -495,10 +495,59 @@ function generationRecencyMs(dir: string): number {
  * from it without leaving references, so "no references" is not evidence that it
  * is free.
  */
-export async function pruneKernelVenvGenerations(
+export interface KernelVenvReclaimPlan {
+	/** Generations whose references are all gone, beyond the retention count. */
+	remove: { dir: string; bytes: number }[];
+	kept: KernelVenvPruneReport["kept"];
+}
+
+/** Plain-file bytes in one generation directory; unreadable parts count as 0. */
+async function generationBytes(dir: string): Promise<number> {
+	let total = 0;
+	const queue = [dir];
+	while (queue.length > 0) {
+		const current = queue.shift()!;
+		let entries: Dirent[];
+		try {
+			entries = await readdir(current, { withFileTypes: true });
+		} catch {
+			continue;
+		}
+		for (const entry of entries) {
+			const child = path.join(current, entry.name);
+			if (entry.isSymbolicLink()) continue;
+			if (entry.isDirectory()) {
+				queue.push(child);
+				continue;
+			}
+			if (!entry.isFile()) continue;
+			try {
+				total += lstatSync(child).size;
+			} catch {
+				// Vanished or unreadable: it contributes no bytes.
+			}
+		}
+	}
+	return total;
+}
+
+/**
+ * The judgement `pruneKernelVenvGenerations` acts on, exposed so a caller with a
+ * deletion budget (the retention sweep) can spend it before removing anything.
+ * Every referenced generation is kept (one per build identity, however many
+ * identities are still running), plus the newest `retention` unreferenced ones.
+ * Unreadable reference state counts as referenced, and so does a live pending-boot
+ * claim: a host that announced a spawn from a generation but has not recorded its
+ * kernel yet would otherwise watch that generation disappear underneath the spawn
+ * (P2-2). The generation a caller names in `activeDir` is never a candidate, and
+ * neither is the legacy unsuffixed base directory: kernels spawned by
+ * pre-generation hosts run from it without leaving references, so "no references"
+ * is not evidence that it is free.
+ */
+export async function planKernelVenvGenerationReclaim(
 	base: string,
 	options: { activeDir?: string; retention?: number } = {},
-): Promise<KernelVenvPruneReport> {
+): Promise<KernelVenvReclaimPlan> {
 	const retention = Math.max(0, options.retention ?? RETIRED_VENV_RETENTION);
 	const candidates = (await listKernelVenvGenerations(base)).filter((dir) => dir !== options.activeDir);
 	const kept: KernelVenvPruneReport["kept"] = [];
@@ -516,8 +565,6 @@ export async function pruneKernelVenvGenerations(
 			continue;
 		}
 		if (pendingBoots > 0) {
-			// Announced by a live host that has no kernel pid to point at yet. The claim is swept
-			// once its holder is provably gone, so this defers the reclaim rather than losing it.
 			kept.push({ dir, liveReferences: 0, protectedByReference: false, pendingBoots });
 			continue;
 		}
@@ -527,8 +574,26 @@ export async function pruneKernelVenvGenerations(
 	for (const entry of unreferenced.slice(0, retention)) {
 		kept.push({ dir: entry.dir, liveReferences: 0, protectedByReference: false });
 	}
-	const removed: string[] = [];
+	const remove: KernelVenvReclaimPlan["remove"] = [];
 	for (const entry of unreferenced.slice(retention)) {
+		remove.push({ dir: entry.dir, bytes: await generationBytes(entry.dir) });
+	}
+	return { remove, kept };
+}
+
+/**
+ * Reclaim generations no kernel references any more. See
+ * {@link planKernelVenvGenerationReclaim} for the judgement; this wrapper only
+ * performs the removals and reports what could not be removed.
+ */
+export async function pruneKernelVenvGenerations(
+	base: string,
+	options: { activeDir?: string; retention?: number } = {},
+): Promise<KernelVenvPruneReport> {
+	const plan = await planKernelVenvGenerationReclaim(base, options);
+	const removed: string[] = [];
+	const kept = [...plan.kept];
+	for (const entry of plan.remove) {
 		try {
 			await rm(entry.dir, { recursive: true, force: true });
 			removed.push(entry.dir);

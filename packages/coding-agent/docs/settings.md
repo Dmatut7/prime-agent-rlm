@@ -397,6 +397,66 @@ Normally the package manager's global modules location is queried using `root -g
 }
 ```
 
+### Retention
+
+The retention sweep reclaims resources that no live session references. It runs on a cadence in the
+daemon, and on demand through `prime-agent retention sweep [--dry-run]`; `prime-agent retention status`
+prints the last sweep. Every default is the shipped behaviour, an absent `retention` section changes
+nothing, and a day/hour knob of `0` or negative switches that class off.
+
+The two switches that matter most:
+
+- `retention.enabled: false` is the master rollback lever: the sweep walks every judgement and writes
+  its report without deleting anything.
+- `retention.dryRun: true` (or `PRIME_AGENT_RETENTION_DRYRUN=1`) does the same for one run; a dry run
+  and a real run scan the same set with the same reasons, so what a dry run reports is what a real
+  sweep reclaims.
+
+Each sweep stops after a circuit breaker (`retention.maxDeleteBytesPerSweep`, default 512 MiB, and
+`retention.maxDeleteEntriesPerSweep`, default 20000); a non-positive value for either keeps the
+shipped default rather than removing the breaker. The report lands in `<agentDir>/retention/last-sweep.json`
+with one compact line per sweep appended to `<agentDir>/retention/history.jsonl`.
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `retention.enabled` | boolean | `true` | Master switch; `false` reports without deleting |
+| `retention.dryRun` | boolean | `false` | Report what a sweep would reclaim, delete nothing |
+| `retention.sweepIntervalMinutes` | number | `60` | Daemon sweep cadence; `0` or negative disables the periodic sweep (the manual command stays) |
+| `retention.maxDeleteBytesPerSweep` | number | `536870912` | Bytes one sweep may reclaim before it stops; non-positive keeps the default |
+| `retention.maxDeleteEntriesPerSweep` | number | `20000` | Entries one sweep may reclaim before it stops; non-positive keeps the default |
+| `retention.cooldownMinutes` | number | `10` | Any candidate touched more recently is kept; non-positive keeps the default |
+| `retention.emptyArtifactDirDays` | number | `7` | Artifact directories with no file anywhere in the subtree, once the session that owned them is provably gone; `0` disables |
+| `retention.deletedSessionResidueDays` | number | `7` | Artifact directories that still hold leftovers (a semantic-edges stub, a local harness copy, a stale kernel snapshot) of a session whose deletion is on record; `0` disables. A directory whose id was reused by a new session is never reclaimed |
+| `retention.childTranscriptDays` | number | `0` | Sub-agent transcripts (`sub-xxxxxxxx/<uuid>.jsonl`) older than this. Off by default: the bytes ride live sub-agent references, and the source keeps a deleted RLM child's transcript as its durable record |
+| `retention.logFileDays` | number | `14` | Log files whose socket no longer exists; the newest file of a rotated group and every log of a live socket are kept; `0` disables |
+| `retention.tmpRlmDirHours` | number | `24` | Empty `prime-agent-rlm-*` temp directories; `0` disables. The daemon's own `prime-agent-<uid>` socket directory is never a candidate |
+| `retention.tmpOtherDirDays` | number | `0` | Any other `prime-agent-*` temp directory (telemetry, test prefixes); off by default |
+| `retention.bashTempFileHours` | number | `24` | `pi-bash-*.log` tool-output temp files; `0` disables |
+| `retention.bashTempFileMaxBytes` | number | `268435456` | Write-side cap for one `pi-bash-*.log` file; non-positive keeps the default |
+| `retention.staleLeaseHours` | number | `24` | Session-lease directories whose owner is provably gone (pid plus process start identity); `0` disables |
+| `retention.kernelSnapshotGenerations` | number | `1` | Retired kernel snapshot generations kept after the referenced ones |
+| `retention.kernelSnapshotReclaimEnabled` | boolean | `false` | Reclaim unreferenced kernel snapshot generations. Off: the snapshot bytes ride live references, and the writer still uses the single-file layout |
+| `retention.venvRetention` | number | `1` | Retired kernel venv generations kept (the boot path's `RETIRED_VENV_RETENTION`) |
+
+The reclaim judgements share one law, borrowed from the kernel venv generation manager: a path whose
+liveness cannot be **disproved** is kept. A probe that fails, a directory whose transcript is missing
+from one root but present in another (a sub-agent's transcript lives under
+`<parentArtifactDir>/sub-xxxxxxxx/`, not in `sessions/`), a lease record that cannot be parsed, and a
+kernel snapshot whose reference state is unreadable are all reported as `unverifiable:` or
+`in-use:`/`reference:` reasons in the report, never treated as reclaimable. The global harness memory
+library (`<agentDir>/harness/`) is not in any sweep class: only the per-session copy inside an artifact
+directory leaves, and only as part of removing that whole directory.
+
+```json
+{
+  "retention": {
+    "sweepIntervalMinutes": 60,
+    "logFileDays": 14,
+    "tmpRlmDirHours": 24
+  }
+}
+```
+
 ### Sessions
 
 | Setting | Type | Default | Description |
