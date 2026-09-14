@@ -15,11 +15,12 @@ import {
 	type OAuthProviderId,
 } from "@earendil-works/pi-ai";
 import { getOAuthApiKey, getOAuthProvider, getOAuthProviders } from "@earendil-works/pi-ai/oauth";
-import { join } from "path";
+import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { getAgentDir } from "../config.js";
 import { ensurePrivateFile, readPrivateFile, writePrivateFileAtomic } from "../utils/private-files.js";
 import { sleepSync } from "../utils/sleep.js";
+import { findFilesHoldingSecrets, purgeLegacyTokenStores } from "./legacy-auth-files.js";
 import {
 	clearPrimeCliCredentials,
 	getPrimeCliConfigPath,
@@ -101,13 +102,30 @@ type AuthApiKeyResult = {
 	sourceToken?: AuthSourceToken;
 };
 
+/** Values of a credential that must not stay readable anywhere after a logout. */
+function credentialSecrets(credential: AuthCredential | undefined): string[] {
+	if (!credential) return [];
+	const values = credential.type === "oauth" ? [credential.access, credential.refresh] : [credential.key];
+	return values.filter((value): value is string => typeof value === "string");
+}
+
 export interface AuthStorageBackend {
 	withLock<T>(fn: (current: string | undefined) => LockResult<T>): T;
 	withLockAsync<T>(fn: (current: string | undefined) => Promise<LockResult<T>>): Promise<T>;
+	/**
+	 * Directory holding the token-bearing files of this store, for backends that have
+	 * one. Logout scans it for copies of the credential; an in-memory backend leaves
+	 * this undefined because it has nothing to clean up.
+	 */
+	readonly stateDirectory?: string;
 }
 
 export class FileAuthStorageBackend implements AuthStorageBackend {
-	constructor(private authPath: string = join(getAgentDir(), "auth.json")) {}
+	readonly stateDirectory: string;
+
+	constructor(private authPath: string = join(getAgentDir(), "auth.json")) {
+		this.stateDirectory = dirname(this.authPath);
+	}
 
 	private ensureFileExists(): void {
 		ensurePrivateFile(this.authPath, "{}");
@@ -756,6 +774,13 @@ export class AuthStorage {
 
 	/**
 	 * Logout from a provider.
+	 *
+	 * The store entry is only half of the credential: older versions left renames and
+	 * copies of the store in the same directory (`oauth.json`, `oauth.json.migrated`,
+	 * `auth.json.bak`, ...), which a refresh token can be exchanged from long after
+	 * the store itself was cleared. They are removed here, and the removal is verified
+	 * against the value being logged out — a logout that cannot show the token is gone
+	 * throws instead of reporting success.
 	 */
 	logout(provider: string): void {
 		if (provider === PRIME_INFERENCE_PROVIDER_ID && this.isPrimeCliConfigEnabled()) {
@@ -767,7 +792,29 @@ export class AuthStorage {
 				throw error;
 			}
 		}
-		this.remove(provider);
+
+		// Snapshot before the removal: afterwards the value is gone from memory too.
+		const secrets = credentialSecrets(this.data[provider]);
+		// Verified removal: logout must not claim success while the entry is still on
+		// disk (the silent variant skips the write when the store failed to load).
+		this.removeVerified(provider);
+		this.purgeLegacyCredentialCopies(secrets);
+	}
+
+	/**
+	 * Delete every legacy copy of the credential store and confirm that the logged-out
+	 * value is not readable in the store directory any more. Called after the store
+	 * entry is gone, so the sweep also covers the write that just happened.
+	 */
+	private purgeLegacyCredentialCopies(secrets: string[]): void {
+		const stateDirectory = this.storage.stateDirectory;
+		if (!stateDirectory) return;
+
+		purgeLegacyTokenStores(stateDirectory);
+		const remaining = findFilesHoldingSecrets(stateDirectory, secrets);
+		if (remaining.length > 0) {
+			throw new Error(`the credential is still readable in ${remaining.join(", ")}`);
+		}
 	}
 
 	/**

@@ -240,6 +240,44 @@ export function ensurePrivateFile(path: string, initialContent = ""): void {
 	}
 }
 
+/**
+ * Tighten an existing private file to 0600 without rewriting it. Used for files a
+ * migration keeps on purpose: the copy is not a healthy private store (so the
+ * helpers above would refuse it), but it must not stay readable by other accounts
+ * on the machine while it sits there.
+ */
+export function tightenPrivateFileMode(path: string): void {
+	const stats = lstatSync(path);
+	if (stats.isSymbolicLink() || !stats.isFile()) return;
+	if ((stats.mode & 0o777) === PRIVATE_FILE_MODE) return;
+	chmodSync(path, PRIVATE_FILE_MODE);
+}
+
+/**
+ * Delete a private file and verify it is gone. A symlink at `path` is unlinked as a
+ * link (its target is never opened, read or deleted), a directory is refused rather
+ * than recursively removed, and a path that survives the removal throws: a cleanup
+ * that cannot delete a credential copy must not look like it succeeded. Returns
+ * false when there was nothing to delete.
+ */
+export function removePrivateFile(path: string): boolean {
+	let stats: ReturnType<typeof lstatSync>;
+	try {
+		stats = lstatSync(path);
+	} catch (error) {
+		if (error instanceof Error && "code" in error && error.code === "ENOENT") return false;
+		throw error;
+	}
+	if (stats.isDirectory()) {
+		throw new Error(`Refusing to remove non-regular private file: ${path}`);
+	}
+	rmSync(path, { force: true });
+	if (pathExistsLexical(path)) {
+		throw new Error(`Private file still present after removal: ${path}`);
+	}
+	return true;
+}
+
 export function readPrivateFile(path: string, encoding: BufferEncoding): string {
 	const fd = openRegularFileNoSymlink(path, constants.O_RDONLY);
 	try {

@@ -89,6 +89,26 @@ function decodeJwt(token: string): JwtPayload | null {
 	}
 }
 
+/**
+ * Describe a token response by field presence and type only.
+ *
+ * The response *is* the credential, so echoing it (as this error used to) puts the
+ * access and refresh tokens into the message: that message reaches the interactive
+ * UI, terminal scrollback and any bug report carrying it. Which fields were present,
+ * and of what type, is what makes the failure actionable.
+ */
+function describeTokenFields(json: { access_token?: unknown; refresh_token?: unknown; expires_in?: unknown }): string {
+	const describe = (name: string, value: unknown): string => {
+		if (value === undefined || value === null) return `${name}=missing`;
+		return `${name}=${typeof value}`;
+	};
+	return [
+		describe("access_token", json.access_token),
+		describe("refresh_token", json.refresh_token),
+		describe("expires_in", json.expires_in),
+	].join(", ");
+}
+
 async function exchangeAuthorizationCode(
 	code: string,
 	verifier: string,
@@ -124,7 +144,7 @@ async function exchangeAuthorizationCode(
 	if (!json.access_token || !json.refresh_token || typeof json.expires_in !== "number") {
 		return {
 			type: "failed",
-			message: `OpenAI Codex token exchange response missing fields: ${JSON.stringify(json)}`,
+			message: `OpenAI Codex token exchange response missing fields: ${describeTokenFields(json)}`,
 		};
 	}
 
@@ -166,7 +186,7 @@ async function refreshAccessToken(refreshToken: string): Promise<TokenResult> {
 		if (!json.access_token || !json.refresh_token || typeof json.expires_in !== "number") {
 			return {
 				type: "failed",
-				message: `OpenAI Codex token refresh response missing fields: ${JSON.stringify(json)}`,
+				message: `OpenAI Codex token refresh response missing fields: ${describeTokenFields(json)}`,
 			};
 		}
 

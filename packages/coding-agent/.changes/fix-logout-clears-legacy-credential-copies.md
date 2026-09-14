@@ -1,0 +1,1 @@
+- Fixed `/logout` leaving a redeemble copy of the credential behind: the startup migration no longer renames the legacy `oauth.json` into a world-readable `oauth.json.migrated`, every historical credential-store copy is deleted (or kept at 0600 when it is the only copy left), and logout now reports failure instead of success when a copy cannot be removed or still holds the value.
