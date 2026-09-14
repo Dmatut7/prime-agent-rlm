@@ -1,7 +1,6 @@
-import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	AGENT_MESSAGE_DISPLAY_MIME,
@@ -10,22 +9,11 @@ import {
 	type HostRequestHandlers,
 	ReplKernelManager,
 } from "../src/core/kernel/index.js";
+import { resolveKernelPython } from "./kernel-python.js";
 
-function resolveReplPython(): string | null {
-	const candidates = [
-		process.env.PRIME_AGENT_KERNEL_PYTHON,
-		resolve(__dirname, "..", "..", "..", "prime-agent-runtime", ".venv", "bin", "python"),
-		join(homedir(), ".prime", "agent", "kernel-venv", "bin", "python"),
-	].filter((p): p is string => Boolean(p));
-	for (const python of candidates) {
-		if (!existsSync(python)) continue;
-		const check = spawnSync(python, ["-c", "import rlm.repl, dill"], { encoding: "utf8" });
-		if (check.status === 0) return python;
-	}
-	return null;
-}
-
-const python = resolveReplPython();
+// Resolved the way the product resolves a kernel interpreter, so `npm run test:ci` (whose first
+// half is the bootstrap that builds the venv) runs these cases instead of skipping them.
+const python = await resolveKernelPython("import rlm.repl, dill");
 const describeIf = python ? describe : describe.skip;
 
 describeIf("ReplKernelManager execute (real runtime)", () => {
