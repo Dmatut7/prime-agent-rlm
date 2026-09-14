@@ -73,6 +73,66 @@ function compactLabel(text: string, maxLength = 80): string {
  * the model-facing context, not what the session has spent, so assistants
  * dropped from the resolved context still count here.
  */
+/**
+ * Incremental form of {@link computeOwnAndTotalUsage} for a session that keeps appending.
+ *
+ * The totals are linear in the entries, so a live session can fold each new entry once
+ * instead of re-walking a transcript that only grows: a busy turn republishes the roster
+ * many times, and every republication used to recompute both passes over every entry the
+ * session had ever written.
+ *
+ * An attribution that arrives before the assistant it targets is held until that assistant
+ * appears, so the result matches the whole-file computation regardless of arrival order.
+ */
+export class OwnUsageAccumulator {
+	private readonly totalUsage: Usage = emptyUsage();
+	private readonly ownUsage: Usage = emptyUsage();
+	/** Assistants whose usage the branch counted, i.e. the targets an attribution may subtract from. */
+	private readonly countedAssistantIds = new Set<string>();
+	/** Attributions that arrived before their target; applied when the target is counted. */
+	private readonly pendingAttributions = new Map<string, Usage[]>();
+	private processed = 0;
+
+	get processedCount(): number {
+		return this.processed;
+	}
+
+	/** Fold every entry past the one already consumed. Same entries in, same totals out. */
+	add(entries: readonly SessionEntry[]): { ownUsage: Usage; totalUsage: Usage } {
+		for (let index = this.processed; index < entries.length; index++) {
+			const entry = entries[index];
+			if (!entry) continue;
+			if (isAssistantEntry(entry)) {
+				addAssistantUsage(this.totalUsage, entry.message.usage);
+				addAssistantUsage(this.ownUsage, entry.message.usage);
+				this.countedAssistantIds.add(entry.id);
+				const pending = this.pendingAttributions.get(entry.id);
+				if (pending !== undefined) {
+					for (const usage of pending) subtractAssistantUsage(this.ownUsage, usage);
+					this.pendingAttributions.delete(entry.id);
+				}
+				continue;
+			}
+			if ((entry.type === "compaction" || entry.type === "branch_summary") && entry.usage) {
+				addAssistantUsage(this.totalUsage, entry.usage);
+				addAssistantUsage(this.ownUsage, entry.usage);
+				continue;
+			}
+			if (entry.type === "child_usage_attributed") {
+				if (this.countedAssistantIds.has(entry.targetId)) {
+					subtractAssistantUsage(this.ownUsage, entry.childUsage);
+				} else {
+					const pending = this.pendingAttributions.get(entry.targetId);
+					if (pending === undefined) this.pendingAttributions.set(entry.targetId, [entry.childUsage]);
+					else pending.push(entry.childUsage);
+				}
+			}
+		}
+		this.processed = entries.length;
+		return { ownUsage: cloneUsage(this.ownUsage), totalUsage: cloneUsage(this.totalUsage) };
+	}
+}
+
 export function computeOwnAndTotalUsage(
 	branch: SessionEntry[],
 	allEntries: SessionEntry[],

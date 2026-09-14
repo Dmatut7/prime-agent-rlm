@@ -126,6 +126,7 @@ import {
 	computeOwnAndTotalUsage,
 	loadContextTreeChildFromDisk,
 	loadContextTreeChildrenFromDisk,
+	OwnUsageAccumulator,
 } from "./context-tree.js";
 import type { AgentCronJob, AgentRlmHeartbeatController, AgentRlmHeartbeatStatusUpdate } from "./cron-jobs.js";
 import { normalizeHeartbeatDeliveryMode } from "./cron-jobs.js";
@@ -14971,6 +14972,7 @@ export class AgentSession {
 		return (provider, modelId) => this._modelRegistry.find(provider, modelId)?.contextWindow;
 	}
 
+	private _ownUsageAccumulator?: OwnUsageAccumulator;
 	private _ownUsageMemo?: { count: number; tailId: string | undefined; usage: SessionUsageSummary | undefined };
 
 	// Whole-file own spend, identical to the catalog scan so rows never shift at passivation.
@@ -14981,7 +14983,11 @@ export class AgentSession {
 		if (memo && memo.count === entries.length && memo.tailId === tailId) {
 			return memo.usage;
 		}
-		const { ownUsage } = computeOwnAndTotalUsage(entries, entries);
+		// Folded incrementally: the roster republishes many times per turn, and a full walk of
+		// both passes over a transcript that has only grown made each republication cost O(entries).
+		// `computeOwnAndTotalUsage(entries, entries)` is the same linear fold this rebuilds.
+		this._ownUsageAccumulator ??= new OwnUsageAccumulator();
+		const { ownUsage } = this._ownUsageAccumulator.add(entries);
 		const usage = sessionUsageSummaryFrom(ownUsage);
 		this._ownUsageMemo = { count: entries.length, tailId, usage };
 		return usage;
