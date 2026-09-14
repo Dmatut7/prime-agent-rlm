@@ -24,6 +24,29 @@ export type SnapshotTranscriptChunkSource = (Iterable<Buffer> | AsyncIterable<Bu
 	dispose?(): void;
 };
 
+/** The frame `createSnapshotTranscriptChunks` and `SnapshotTranscriptCache` both emit. */
+interface SnapshotTranscriptChunkFrame {
+	type: "session_snapshot_chunk";
+	activeSessionId: string;
+	snapshotId: string;
+	index: number;
+	messages: AgentMessage[];
+}
+
+function isSnapshotTranscriptChunkFrame(value: unknown): value is SnapshotTranscriptChunkFrame {
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	const frame = value as Partial<SnapshotTranscriptChunkFrame>;
+	return (
+		frame.type === "session_snapshot_chunk" &&
+		typeof frame.activeSessionId === "string" &&
+		typeof frame.snapshotId === "string" &&
+		typeof frame.index === "number" &&
+		Array.isArray(frame.messages)
+	);
+}
+
 export function createSnapshotTranscriptChunks(options: {
 	activeSessionId: string;
 	snapshotId: string;
@@ -132,6 +155,48 @@ export class SnapshotTranscriptCache {
 		for (let index = 0; index < this.chunkCount; index++) {
 			yield this.readChunk(index);
 		}
+	}
+
+	/**
+	 * Rebuilds the message list from the encoded chunks.
+	 *
+	 * A client that cannot consume the chunk transfer reads the transcript from the
+	 * attach response instead. Decoding the bytes the worker already encoded keeps one
+	 * JSON pass over the transcript per snapshot generation; re-encoding the messages
+	 * into new chunk frames was a second full pass over the same content, and it wrote
+	 * a second copy of the transcript to the supervisor's cache directory.
+	 *
+	 * `undefined` means the transfer is not usable: incomplete, failed, disposed, a chunk
+	 * that does not parse into this snapshot's frame, or a message count that does not
+	 * match what the snapshot summary promises. Callers treat that as "reload".
+	 */
+	decodeMessages(expectedMessageCount?: number): AgentMessage[] | undefined {
+		if (!this.complete) {
+			return undefined;
+		}
+		const messages: AgentMessage[] = [];
+		try {
+			for (let index = 0; index < this.chunkCount; index++) {
+				const frame: unknown = JSON.parse(this.readChunk(index).toString("utf8"));
+				if (
+					!isSnapshotTranscriptChunkFrame(frame) ||
+					frame.snapshotId !== this.snapshotId ||
+					frame.activeSessionId !== this.activeSessionId ||
+					frame.index !== index
+				) {
+					return undefined;
+				}
+				for (const message of frame.messages) {
+					messages.push(message);
+				}
+			}
+		} catch {
+			return undefined;
+		}
+		if (expectedMessageCount !== undefined && messages.length !== expectedMessageCount) {
+			return undefined;
+		}
+		return messages;
 	}
 
 	appendEncodedChunk(buffer: Buffer): void {
