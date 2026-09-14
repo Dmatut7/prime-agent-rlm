@@ -18,6 +18,7 @@
 - 证据纪律：不许把注释当证据；"不存在/无影响"必须附正控；验不了写 unverified
 - 冻结 SHA：本轮 = 审查时点的 HEAD，命令写死 SHA 不用 HEAD
 - 收尾必须回话给 parent（≤12 行）：Top 结论 + 证据路径 + 未完成项
+- **测试环境**：跑任何套件都要 unset 泄露变量，除了 RLM_*/PRIME_AGENT_*/PI_*，还有 **RLM_MAX_DEPTH**（实测：`agent-session-recursion.test.ts` 会因它多出 1 条失败；unset 后 121 项全绿）
 
 ## 角度池（供后续轮次取用）
 性能与资源 / 影响模型智能的面 / 模型运行时表现 / 长期运行稳定性 / 数据与协议正确性 /
