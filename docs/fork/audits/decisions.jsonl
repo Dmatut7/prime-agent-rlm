@@ -101,3 +101,7 @@
 {"id": "K3R-2", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "cron run 记账/拆除/恢复写者仍写 now() 不 restamp ⇒ 滞后钟静默丢", "verified_by": "K3 读码（cron-jobs.ts:803/813/1101/1940）"}
 {"id": "K3R-3", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "kitty 去重扩展到批量首字符：无括号粘贴首字符同码点被吃", "verified_by": "K3 读码（stdin-buffer.ts:674-686）"}
 {"id": "K3R-4", "date": "2026-09-15", "severity": "P3", "status": "fixing", "commit": null, "title": "粘贴内完整 kitty 转义仍中止粘贴并把剩余字节送按键路 ⇒ 我方\"粘贴永不注入按键\"表述过绝对", "verified_by": "K3 读码（stdin-buffer.ts:498-506，先于本批存在）"}
+{"id": "ADV-2", "date": "2026-09-15", "severity": "P1", "status": "fixing", "commit": null, "title": "/share 的逐字比对被 isPlausibleSecretValue 反向过滤旁路（全数字/slug key 四条全不命中）", "verified_by": "K3 对抗线实测 collected=0 hits=0"}
+{"id": "ADV-3", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "粘贴内 kitty 序列之后字节走键盘通路执行且丢弃已缓冲内容（实测 \\r 当回车）", "verified_by": "K3 对抗线实测"}
+{"id": "ADV-4", "date": "2026-09-15", "severity": "P1", "status": "fixing", "commit": null, "title": "venv 代际回收方向反了：不查 writeSync 返回值 + 不可解析即判死 ⇒ 活 pid 截断引用被删、报 known-free 可被 rm -rf", "verified_by": "K3 对抗线实测"}
+{"id": "ADV-5", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "批量输入 64KiB 切片以 \\n 开头被整片丢弃（实测丢 65535 字符）+ 边界劈开 surrogate pair", "verified_by": "K3 对抗线实测"}
