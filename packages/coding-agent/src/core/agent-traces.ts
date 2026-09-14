@@ -1206,11 +1206,20 @@ class AgentTraceUploadController {
 	private inFlight: Promise<void> | undefined;
 	private lastUploadStartedAt: number | undefined;
 	private notBeforeAt = 0;
+	/**
+	 * The agent directory of whoever installed this controller, not of whoever happens to be
+	 * current when a timer fires. A scheduled upload outlives the code that scheduled it (a
+	 * debounce, a throttled retry, a test fixture that returned), and the session's bookkeeping
+	 * belongs to the directory the session was running in.
+	 */
+	private readonly scope: AgentTraceWriteScope;
 
 	constructor(
 		private readonly sessionManager: SessionManager,
 		private options: AgentTraceUploadInstallOptions,
-	) {}
+	) {
+		this.scope = resolveAgentTraceWriteScope();
+	}
 
 	update(options: AgentTraceUploadInstallOptions): void {
 		this.options = options;
@@ -1230,13 +1239,13 @@ class AgentTraceUploadController {
 			if (
 				sessionFile &&
 				!locallyManagedSessionFiles.has(sessionFile) &&
-				markAgentTraceOutboxPendingSync(sessionFile)
+				markAgentTraceOutboxPendingSync(sessionFile, undefined, this.scope)
 			) {
 				locallyManagedSessionFiles.add(sessionFile);
 			}
 			const ledgerPath = this.options.semanticEdgesLedgerPath;
 			if (ledgerPath) {
-				markAgentTraceOutboxPendingSync(ledgerPath, SEMANTIC_EDGES_OUTBOX_KIND);
+				markAgentTraceOutboxPendingSync(ledgerPath, SEMANTIC_EDGES_OUTBOX_KIND, this.scope);
 			}
 		}
 		this.arm();
@@ -1265,10 +1274,14 @@ class AgentTraceUploadController {
 		}
 		this.pending = false;
 		this.lastUploadStartedAt = Date.now();
-		this.inFlight = uploadAgentTraceSession({
-			...this.options,
-			sessionManager: this.sessionManager,
-		}).then(
+		this.inFlight = uploadAgentTraceFileWithRequestGate(
+			{
+				...this.options,
+				sessionFile: this.sessionManager.getSessionFile(),
+			},
+			undefined,
+			this.scope,
+		).then(
 			(result) => {
 				if (result.status === "failed" && isRescheduledUploadFailure(result.statusCode)) {
 					this.pending = true;

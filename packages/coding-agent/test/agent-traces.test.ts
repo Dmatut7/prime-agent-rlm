@@ -1595,6 +1595,33 @@ describe("agent trace upload", () => {
 		expect(calls[0]?.init.headers).toMatchObject({ Authorization: "Bearer inference-key" });
 	});
 
+	it("keeps a scheduled upload in the agent directory that installed the controller", async () => {
+		vi.useFakeTimers();
+		const sessionDir = join(tempDir, "sessions");
+		const session = writeSession(tempDir, sessionDir, "scheduled-scope-session");
+		const overtakingDir = join(tempDir, "scheduled-overtaking-dir");
+		mkdirSync(overtakingDir, { recursive: true });
+
+		const calls: FetchCall[] = [];
+		installAgentTraceUpload(session, {
+			authStorage: AuthStorage.inMemory({
+				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
+			}),
+			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
+			baseUrl: "https://api.example.test",
+			fetchFn: createFetchRecorder(calls),
+		});
+
+		session.appendMessage(createUserMessage("scheduled"));
+		// The fixture's agent directory is withdrawn before the debounce fires.
+		process.env[ENV_AGENT_DIR] = overtakingDir;
+		await advanceTimersUntil(() => calls.length === 1);
+		await vi.advanceTimersToNextTimerAsync();
+
+		expect(listTree(overtakingDir)).toEqual([]);
+		expect(readOutboxEntry(tempDir, session.getSessionFile()!)).toBeDefined();
+	});
+
 	it("strips git remote credentials from the trace header and the trace body alike", async () => {
 		const cwd = join(tempDir, "project");
 		const session = writeSession(cwd, join(tempDir, "sessions"), "token-remote-session");
