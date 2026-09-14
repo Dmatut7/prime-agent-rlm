@@ -1,0 +1,1 @@
+- Fixed a session-tree rewind being undone by a restart: the rewind position is now recorded in the transcript, so `--resume` returns to the point you rewound to instead of the branch tip you left.

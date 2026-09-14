@@ -305,7 +305,10 @@ class TreeList implements Component {
 				entry.type === "thinking_level_change" ||
 				entry.type === "service_tier_change" ||
 				entry.type === "session_info" ||
-				entry.type === "child_usage_attributed";
+				entry.type === "child_usage_attributed" ||
+				// A rewind records where the session now is; the current-leaf highlight
+				// already shows that, so the marker stays out of the default view.
+				entry.type === "leaf_position";
 
 			switch (this.filterMode) {
 				case "user-only":
@@ -561,6 +564,9 @@ class TreeList implements Component {
 			case "label":
 				parts.push("label", entry.label ?? "");
 				break;
+			case "leaf_position":
+				parts.push("position");
+				break;
 		}
 
 		return parts.join(" ");
@@ -794,6 +800,9 @@ class TreeList implements Component {
 				result = entry.name
 					? [theme.fg("dim", "[title: "), theme.fg("dim", entry.name), theme.fg("dim", "]")].join("")
 					: [theme.fg("dim", "[title: "), theme.italic(theme.fg("dim", "empty")), theme.fg("dim", "]")].join("");
+				break;
+			case "leaf_position":
+				result = theme.fg("dim", "[rewind position]");
 				break;
 			default:
 				result = "";

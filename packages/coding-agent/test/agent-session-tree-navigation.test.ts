@@ -226,9 +226,10 @@ describe.skipIf(!API_KEY)("AgentSession tree navigation e2e", () => {
 		const tree = sessionManager.getTree();
 		await session.navigateTree(tree[0].entry.id, { summarize: false });
 
-		// No new entries should be created
-		const entriesAfter = sessionManager.getEntries().length;
-		expect(entriesAfter).toBe(entriesBefore);
+		// Navigating to the root user message clears the leaf; the only entry the
+		// navigation itself writes is the rewind position marker.
+		const appended = sessionManager.getEntries().slice(entriesBefore);
+		expect(appended.map((entry) => entry.type)).toEqual(["leaf_position"]);
 
 		// No branch_summary entries
 		const summaries = sessionManager.getEntries().filter((e) => e.type === "branch_summary");

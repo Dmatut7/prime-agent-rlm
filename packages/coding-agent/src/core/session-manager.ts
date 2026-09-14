@@ -203,6 +203,23 @@ export interface GitStateEntry extends SessionEntryBase {
 	git: GitContext;
 }
 
+/**
+ * Records where the session was left by an explicit position change (`branch()`,
+ * `resetLeaf()`).
+ *
+ * Resume resolves the active leaf from the last line of the session file, so a
+ * leaf that only lives in process memory is silently undone by a restart: the
+ * abandoned branch tip comes back into the model context. The marker is metadata
+ * about the position, not the position itself - it hangs off the entry it points
+ * at, `_buildIndex` resolves it back to that entry, and it never reaches the
+ * model.
+ */
+export interface LeafPositionEntry extends SessionEntryBase {
+	type: "leaf_position";
+	/** Entry the session moved to, or null when the leaf was cleared. */
+	targetId: string | null;
+}
+
 export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 	type: "custom_message";
 	customType: string;
@@ -225,7 +242,8 @@ export type SessionEntry =
 	| SessionInfoEntry
 	| SessionStateEntry
 	| AgentStatusEntry
-	| GitStateEntry;
+	| GitStateEntry
+	| LeafPositionEntry;
 
 export type FileEntry = SessionHeader | SessionEntry;
 
@@ -1682,7 +1700,18 @@ export class SessionManager {
 		for (const entry of this.fileEntries) {
 			if (entry.type === "session") continue;
 			this.byId.set(entry.id, entry);
-			this.leafId = entry.id;
+			if (entry.type === "leaf_position") {
+				// A position marker resolves to the entry it points at, not to itself,
+				// and the last entry in the file still wins: transcripts written before
+				// the marker existed keep resolving by their last line. An unknown
+				// target (truncated or hand-edited file) falls back to that same rule
+				// instead of inventing a position.
+				if (entry.targetId === null || this.byId.has(entry.targetId)) {
+					this.leafId = entry.targetId;
+				}
+			} else {
+				this.leafId = entry.id;
+			}
 			if (entry.type === "label") {
 				if (entry.label) {
 					this.labelsById.set(entry.targetId, entry.label);
@@ -1822,7 +1851,12 @@ export class SessionManager {
 		if (!this.persist || !this.sessionFile) return;
 
 		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
-		const shouldPersistWithoutAssistant = entry.type === "session_state" || entry.type === "session_info";
+		// Position markers join session_state/session_info: they are written by the
+		// app rather than by a model turn and must be durable even in a session that
+		// has no assistant message yet, otherwise a rewind before the first answer
+		// is exactly the position that a restart loses.
+		const shouldPersistWithoutAssistant =
+			entry.type === "session_state" || entry.type === "session_info" || entry.type === "leaf_position";
 		if (!hasAssistant && !shouldPersistWithoutAssistant) {
 			this.flushed = false;
 			return;
@@ -1934,12 +1968,11 @@ export class SessionManager {
 		// A pinned leaf means the session moved (branch navigation) while the
 		// summary was being generated. The entry still belongs to the branch it
 		// summarized, but it must not drag the current position back to it.
-		this.fileEntries.push(entry);
-		this.byId.set(entry.id, entry);
 		if (targetLeaf === this.leafId) {
-			this.leafId = entry.id;
+			this._appendEntry(entry);
+		} else {
+			this._appendEntryKeepingLeaf(entry);
 		}
-		this._persist(entry);
 		return entry.id;
 	}
 
@@ -2304,15 +2337,73 @@ export class SessionManager {
 		return roots;
 	}
 
+	/**
+	 * Move the leaf to `branchFromId` (a rewind or tree navigation) and record the
+	 * new position so it survives a restart.
+	 *
+	 * The position cannot live in memory alone: resume resolves the leaf from the
+	 * last line of the session file, so an unrecorded rewind is silently undone
+	 * when the process stops before the next append - the abandoned turn comes
+	 * back into the model context while the UI and the transcript show no
+	 * difference.
+	 */
 	branch(branchFromId: string): void {
 		if (!this.byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
-		this.leafId = resolveCompleteToolPairLeaf(this.getBranch(branchFromId))?.id ?? null;
+		this._setLeaf(resolveCompleteToolPairLeaf(this.getBranch(branchFromId))?.id ?? null);
 	}
 
+	/** Clear the leaf (rewind past the first entry) and record that position. */
 	resetLeaf(): void {
-		this.leafId = null;
+		this._setLeaf(null);
+	}
+
+	/**
+	 * Append a position marker for the leaf this session was moved to.
+	 *
+	 * Written as a transcript entry rather than a sidecar so the position can never
+	 * fork from the transcript: it is appended by the same writer as every other
+	 * entry, travels with the file through fork/export/checkpoint, and cannot point
+	 * at an entry that the file does not contain. It is deliberately not an
+	 * `_appendEntry`: the marker describes the leaf, so the leaf stays where the
+	 * caller put it and the marker hangs off that entry.
+	 */
+	private _recordLeafPosition(targetId: string | null): void {
+		const entry: LeafPositionEntry = {
+			type: "leaf_position",
+			id: generateId(this.byId),
+			parentId: targetId,
+			timestamp: new Date().toISOString(),
+			targetId,
+		};
+		this.fileEntries.push(entry);
+		this.byId.set(entry.id, entry);
+		this._persist(entry);
+	}
+
+	/**
+	 * Append an entry that must not become the leaf (a compaction of a branch the
+	 * session has already left).
+	 *
+	 * The file's last line decides the leaf on resume, so the entry would drag the
+	 * position back to the branch it belongs to; the current position is therefore
+	 * re-asserted behind it.
+	 */
+	private _appendEntryKeepingLeaf(entry: SessionEntry): void {
+		this.fileEntries.push(entry);
+		this.byId.set(entry.id, entry);
+		this._persist(entry);
+		this._recordLeafPosition(this.leafId);
+	}
+
+	private _setLeaf(targetId: string | null): void {
+		// A no-op move needs no marker: the leaf already resolves to this position,
+		// either because it is the last entry in the file or because an earlier
+		// marker recorded it.
+		if (targetId === this.leafId) return;
+		this.leafId = targetId;
+		this._recordLeafPosition(targetId);
 	}
 
 	branchWithSummary(
