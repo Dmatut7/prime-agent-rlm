@@ -26,7 +26,7 @@ import { spawn } from "child_process";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { type Static, type TProperties, Type } from "typebox";
-import type { Validator } from "typebox/compile";
+import { Compile, type Validator } from "typebox/compile";
 import type { TLocalizedValidationError } from "typebox/error";
 import { getAgentDir } from "../config.js";
 import { getShellConfig, type ShellConfig } from "../utils/shell.js";
@@ -202,18 +202,29 @@ const ModelsConfigSchema = Type.Object({
 	providers: Type.Record(Type.String(), ProviderConfigSchema),
 });
 
-// typebox/compile costs ~300ms to import, so the models.json validator loads
-// lazily. The first load of an existing models.json proceeds on JSON parsing +
-// validateConfig() and reports schema errors asynchronously once the validator
-// is ready; subsequent refreshes validate synchronously.
+// One validator, used synchronously by every load path. A file that has never passed
+// the schema check must not be adopted, so the first load in a process cannot be the one
+// that skips it. Deferring this import ("typebox/compile is expensive") let the
+// constructor's load proceed unvalidated while later refreshes rejected the same file; it
+// also bought nothing, because @earendil-works/pi-ai already imports typebox/compile
+// statically, so the module is evaluated before this file runs.
 let validateModelsConfig: Validator<TProperties, typeof ModelsConfigSchema> | undefined;
-let modelsValidatorPromise: Promise<void> | undefined;
 
-function preloadModelsConfigValidator(): Promise<void> {
-	modelsValidatorPromise ??= import("typebox/compile").then(({ Compile }) => {
-		validateModelsConfig = Compile(ModelsConfigSchema);
-	});
-	return modelsValidatorPromise;
+function modelsConfigValidator(): Validator<TProperties, typeof ModelsConfigSchema> {
+	validateModelsConfig ??= Compile(ModelsConfigSchema);
+	return validateModelsConfig;
+}
+
+/** Formatted schema violations of a parsed models.json; undefined when it validates. */
+function modelsConfigSchemaErrors(parsed: unknown): string | undefined {
+	const validator = modelsConfigValidator();
+	if (validator.Check(parsed)) return undefined;
+	return (
+		validator
+			.Errors(parsed)
+			.map((error) => `  - ${formatValidationPath(error)}: ${error.message}`)
+			.join("\n") || "Unknown schema error"
+	);
 }
 
 type ModelsConfig = Static<typeof ModelsConfigSchema>;
@@ -698,27 +709,12 @@ export class ModelRegistry {
 			const content = readFileSync(modelsJsonPath, "utf-8");
 			const parsed = JSON.parse(stripJsonComments(content)) as unknown;
 
-			if (!validateModelsConfig) {
-				// Validator not loaded yet (first refresh during startup): proceed on
-				// validateConfig() below and report schema errors asynchronously once
-				// the validator is ready. Later refreshes validate synchronously.
-				void preloadModelsConfigValidator().then(() => {
-					if (validateModelsConfig && !validateModelsConfig.Check(parsed)) {
-						const errors =
-							validateModelsConfig
-								.Errors(parsed)
-								.map((error) => `  - ${formatValidationPath(error)}: ${error.message}`)
-								.join("\n") || "Unknown schema error";
-						console.error(`Invalid models.json schema:\n${errors}\n\nFile: ${modelsJsonPath}`);
-					}
-				});
-			} else if (!validateModelsConfig.Check(parsed)) {
-				const errors =
-					validateModelsConfig
-						.Errors(parsed)
-						.map((error) => `  - ${formatValidationPath(error)}: ${error.message}`)
-						.join("\n") || "Unknown schema error";
-				return emptyCustomModelsResult(`Invalid models.json schema:\n${errors}\n\nFile: ${modelsJsonPath}`);
+			const schemaErrors = modelsConfigSchemaErrors(parsed);
+			if (schemaErrors) {
+				// Every load path reaches this same check, so a file that has never validated is
+				// never adopted and the verdict does not change between the first load and a
+				// refresh. getError() carries it to the UI, `model list` and startup.
+				return emptyCustomModelsResult(`Invalid models.json schema:\n${schemaErrors}\n\nFile: ${modelsJsonPath}`);
 			}
 
 			const config = parsed as ModelsConfig;
