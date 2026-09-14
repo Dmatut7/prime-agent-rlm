@@ -209,6 +209,27 @@ function hostRequestLabel(type: string, data: Record<string, unknown>): string |
 	return typeof data.target === "string" && data.target.length > 0 ? cap(`target=${data.target}`) : undefined;
 }
 
+/**
+ * Appends one stream chunk under a per-cell character cap.
+ *
+ * The gate has to be closed (`>=`, as in the background-output path below): a chunk that lands
+ * exactly on `maxChars` is stored, so under a strict `<` gate the *next* chunk fails the test
+ * (`length === maxChars` is not `<`) and is dropped without ever raising the flag. The cell then
+ * reports a complete, untruncated stream with its tail missing - the model cannot tell a short
+ * answer from a cut-off one. An empty chunk on a full stream drops nothing, so it never raises
+ * the flag.
+ */
+function capStreamOutput(current: string, text: string, maxChars: number): { text: string; truncated: boolean } {
+	if (current.length >= maxChars) {
+		return { text: current, truncated: text.length > 0 };
+	}
+	const appended = current + text;
+	if (appended.length > maxChars) {
+		return { text: appended.slice(0, maxChars), truncated: true };
+	}
+	return { text: appended, truncated: false };
+}
+
 /** ExecuteResult plus the raw fields of the request's `done` event (state ops). */
 interface InternalExecuteResult extends ExecuteResult {
 	doneFields?: Record<string, unknown>;
@@ -1777,22 +1798,17 @@ export class ReplKernelManager {
 		}
 		if (type === "stdout" || type === "stderr") {
 			const text = typeof event.text === "string" ? event.text : "";
+			const capped = capStreamOutput(
+				type === "stdout" ? execution.stdout : execution.stderr,
+				text,
+				execution.maxChars,
+			);
 			if (type === "stdout") {
-				if (execution.stdout.length < execution.maxChars) {
-					execution.stdout += text;
-					if (execution.stdout.length > execution.maxChars) {
-						execution.stdout = execution.stdout.slice(0, execution.maxChars);
-						execution.stdoutTruncated = true;
-					}
-				}
+				execution.stdout = capped.text;
+				if (capped.truncated) execution.stdoutTruncated = true;
 			} else {
-				if (execution.stderr.length < execution.maxChars) {
-					execution.stderr += text;
-					if (execution.stderr.length > execution.maxChars) {
-						execution.stderr = execution.stderr.slice(0, execution.maxChars);
-						execution.stderrTruncated = true;
-					}
-				}
+				execution.stderr = capped.text;
+				if (capped.truncated) execution.stderrTruncated = true;
 			}
 			const onStream = execution.opts.onStream;
 			if (onStream) this.invokeHostCallback("onStream", () => onStream(text, type));
