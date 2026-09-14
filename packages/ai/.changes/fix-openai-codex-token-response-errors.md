@@ -1,0 +1,1 @@
+- Fixed OpenAI Codex token exchange and refresh failures printing the whole token response, which put the access and refresh tokens into the error message; the error now reports field names, types and which field is missing.

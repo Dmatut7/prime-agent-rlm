@@ -15,10 +15,12 @@ import {
 	statSync,
 	writeFileSync,
 } from "fs";
-import { basename, dirname, join } from "path";
+import { basename, join } from "path";
 import { CONFIG_DIR_NAME, getAgentDir, getBinDir, getSessionsDir } from "./config.js";
 import { migrateKeybindingsConfig } from "./core/keybindings.js";
+import { purgeLegacyTokenStores, readLegacyTokenStore } from "./core/legacy-auth-files.js";
 import { readFirstLineSync } from "./utils/file-lines.js";
+import { tightenPrivateFileMode, writePrivateFileAtomic } from "./utils/private-files.js";
 
 const MIGRATION_GUIDE_URL =
 	"https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/CHANGELOG.md#extensions-migration";
@@ -26,7 +28,14 @@ const EXTENSIONS_DOC_URL =
 	"https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/docs/extensions.md";
 
 /**
- * Migrate legacy oauth.json and settings.json apiKeys to auth.json.
+ * Migrate legacy oauth.json and settings.json apiKeys to auth.json, then delete the
+ * legacy stores.
+ *
+ * The legacy copies are deleted rather than renamed: `oauth.json.migrated` was a
+ * second, world-readable copy of every token (see legacy-auth-files.ts), and this
+ * migration is the only chance to remove one that an older version already left
+ * behind. A store whose contents are not committed anywhere else is kept instead
+ * (and tightened to 0600) — that is the case of a file this pass cannot read.
  *
  * @returns Array of provider names that were migrated
  */
@@ -36,52 +45,99 @@ export function migrateAuthToAuthJson(): string[] {
 	const oauthPath = join(agentDir, "oauth.json");
 	const settingsPath = join(agentDir, "settings.json");
 
-	// Skip if auth.json already exists
-	if (existsSync(authPath)) return [];
-
 	const migrated: Record<string, unknown> = {};
 	const providers: string[] = [];
+	// Legacy stores whose contents are not (yet) in auth.json and must survive.
+	const unconsumed: string[] = [];
 
-	// Migrate oauth.json
-	if (existsSync(oauthPath)) {
-		try {
-			const oauth = JSON.parse(readFileSync(oauthPath, "utf-8"));
-			for (const [provider, cred] of Object.entries(oauth)) {
-				migrated[provider] = { type: "oauth", ...(cred as object) };
-				providers.push(provider);
-			}
-			renameSync(oauthPath, `${oauthPath}.migrated`);
-		} catch {
-			// Skip on error
-		}
-	}
-
-	// Migrate settings.json apiKeys
-	if (existsSync(settingsPath)) {
-		try {
-			const content = readFileSync(settingsPath, "utf-8");
-			const settings = JSON.parse(content);
-			if (settings.apiKeys && typeof settings.apiKeys === "object") {
-				for (const [provider, key] of Object.entries(settings.apiKeys)) {
-					if (!migrated[provider] && typeof key === "string") {
-						migrated[provider] = { type: "api_key", key };
-						providers.push(provider);
-					}
+	// Skip reading legacy stores if auth.json already exists; they are unreachable
+	// from here on and are removed below either way.
+	if (!existsSync(authPath)) {
+		// Migrate oauth.json
+		if (existsSync(oauthPath)) {
+			const oauth = readLegacyTokenStore(oauthPath);
+			if (oauth) {
+				for (const [provider, cred] of Object.entries(oauth)) {
+					migrated[provider] = { type: "oauth", ...(cred as object) };
+					providers.push(provider);
 				}
-				delete settings.apiKeys;
-				writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+			} else {
+				unconsumed.push(oauthPath);
 			}
-		} catch {
-			// Skip on error
+		}
+
+		// Migrate settings.json apiKeys
+		if (existsSync(settingsPath)) {
+			try {
+				const content = readFileSync(settingsPath, "utf-8");
+				const settings = JSON.parse(content);
+				if (settings.apiKeys && typeof settings.apiKeys === "object") {
+					for (const [provider, key] of Object.entries(settings.apiKeys)) {
+						if (!migrated[provider] && typeof key === "string") {
+							migrated[provider] = { type: "api_key", key };
+							providers.push(provider);
+						}
+					}
+					delete settings.apiKeys;
+					// Same private atomic write as every other credential write: a crash
+					// here used to leave a truncated settings.json behind.
+					writePrivateFileAtomic(settingsPath, JSON.stringify(settings, null, 2));
+				}
+			} catch {
+				// Skip on error
+			}
+		}
+
+		if (Object.keys(migrated).length > 0) {
+			try {
+				// Atomic 0600 write, like the live store's own writes. The legacy store is
+				// removed only after this succeeds, so a failed migration keeps its copy.
+				writePrivateFileAtomic(authPath, JSON.stringify(migrated, null, 2));
+			} catch (error) {
+				if (existsSync(oauthPath)) unconsumed.push(oauthPath);
+				console.error(
+					chalk.yellow(
+						`Warning: could not migrate credentials to ${authPath}: ${error instanceof Error ? error.message : error}`,
+					),
+				);
+			}
 		}
 	}
 
-	if (Object.keys(migrated).length > 0) {
-		mkdirSync(dirname(authPath), { recursive: true });
-		writeFileSync(authPath, JSON.stringify(migrated, null, 2), { mode: 0o600 });
-	}
+	privatizeLiveStore(authPath);
+	removeSupersededLegacyStores(agentDir, unconsumed);
 
 	return providers;
+}
+
+/**
+ * Tighten the live store when it already exists. This code writes it 0600 through
+ * the private-file helpers, but a store left by another tool (or an older version)
+ * can still be world-readable, and the migration is the one pass that sees it
+ * without having to trust the caller.
+ */
+function privatizeLiveStore(authPath: string): void {
+	if (!existsSync(authPath)) return;
+	try {
+		tightenPrivateFileMode(authPath);
+	} catch (error) {
+		console.error(
+			chalk.yellow(`Warning: could not tighten ${authPath}: ${error instanceof Error ? error.message : error}`),
+		);
+	}
+}
+
+/**
+ * Delete credential stores that no code path reads any more. A startup must not die
+ * on a credential copy, so a failed removal is reported instead of thrown; logout is
+ * the path that refuses to report success while a token copy survives.
+ */
+function removeSupersededLegacyStores(agentDir: string, keep: string[]): void {
+	try {
+		purgeLegacyTokenStores(agentDir, { keep });
+	} catch (error) {
+		console.error(chalk.yellow(`Warning: ${error instanceof Error ? error.message : error}`));
+	}
 }
 
 /**

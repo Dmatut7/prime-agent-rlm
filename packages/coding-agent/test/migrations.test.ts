@@ -6,13 +6,18 @@ import {
 	readdirSync,
 	readFileSync,
 	rmSync,
+	statSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
-import { migrateLegacySessionDirsToSessionRoot, migrateSessionsFromAgentRoot } from "../src/migrations.js";
+import {
+	migrateAuthToAuthJson,
+	migrateLegacySessionDirsToSessionRoot,
+	migrateSessionsFromAgentRoot,
+} from "../src/migrations.js";
 
 /** Must match LEGACY_DIR_MIGRATION_MARKER in src/migrations.ts (a durable on-disk name). */
 const LEGACY_DIR_MARKER = ".migrated-to-session-root";
@@ -208,5 +213,125 @@ describe("session migrations", () => {
 
 		expect(existsSync(nestedFile)).toBe(true);
 		expect(existsSync(join(sessionsDir, "session-2.jsonl"))).toBe(false);
+	});
+});
+
+describe("auth store migration", () => {
+	const ACCESS_SECRET = "LEGACY-ACCESS-SECRET-abc123def456";
+	const REFRESH_SECRET = "LEGACY-REFRESH-SECRET-xyz789uvw012";
+	const tempDirs: string[] = [];
+	const previousAgentDir = process.env[ENV_AGENT_DIR];
+
+	afterEach(() => {
+		if (previousAgentDir === undefined) {
+			delete process.env[ENV_AGENT_DIR];
+		} else {
+			process.env[ENV_AGENT_DIR] = previousAgentDir;
+		}
+		for (const dir of tempDirs.splice(0)) {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	function newAgentDir(): string {
+		const agentDir = mkdtempSync(join(tmpdir(), "prime-agent-auth-migration-"));
+		tempDirs.push(agentDir);
+		process.env[ENV_AGENT_DIR] = agentDir;
+		return agentDir;
+	}
+
+	function writeLegacyStore(agentDir: string, name: string, content: string): string {
+		const path = join(agentDir, name);
+		writeFileSync(path, content, { mode: 0o644 });
+		return path;
+	}
+
+	function topLevelFiles(agentDir: string): string[] {
+		return readdirSync(agentDir, { withFileTypes: true })
+			.filter((entry) => entry.isFile())
+			.map((entry) => join(agentDir, entry.name));
+	}
+
+	function filesHolding(agentDir: string, secret: string): string[] {
+		return topLevelFiles(agentDir).filter((path) => readFileSync(path, "utf-8").includes(secret));
+	}
+
+	function oauthStoreJson(): string {
+		return JSON.stringify({ "openai-codex": { access: ACCESS_SECRET, refresh: REFRESH_SECRET } }, null, 2);
+	}
+
+	it("moves legacy credentials without leaving a world-readable copy behind", () => {
+		const agentDir = newAgentDir();
+		const oauthPath = writeLegacyStore(agentDir, "oauth.json", oauthStoreJson());
+
+		const providers = migrateAuthToAuthJson();
+
+		const authPath = join(agentDir, "auth.json");
+		expect(providers).toEqual(["openai-codex"]);
+		expect(existsSync(oauthPath)).toBe(false);
+		expect(existsSync(`${oauthPath}.migrated`)).toBe(false);
+		expect(readFileSync(authPath, "utf-8")).toContain(REFRESH_SECRET);
+		expect(statSync(authPath).mode & 0o777).toBe(0o600);
+		expect(filesHolding(agentDir, REFRESH_SECRET)).toEqual([authPath]);
+	});
+
+	it("still migrates settings.json apiKeys alongside a legacy oauth.json", () => {
+		const agentDir = newAgentDir();
+		writeLegacyStore(agentDir, "oauth.json", oauthStoreJson());
+		writeLegacyStore(
+			agentDir,
+			"settings.json",
+			JSON.stringify({ theme: "dark", apiKeys: { anthropic: "sk-ant-legacy-key-000111" } }, null, 2),
+		);
+
+		expect(migrateAuthToAuthJson().sort()).toEqual(["anthropic", "openai-codex"]);
+
+		const migrated = JSON.parse(readFileSync(join(agentDir, "auth.json"), "utf-8")) as Record<string, unknown>;
+		expect(migrated.anthropic).toEqual({ type: "api_key", key: "sk-ant-legacy-key-000111" });
+		const settings = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8")) as Record<string, unknown>;
+		expect(settings.apiKeys).toBeUndefined();
+		expect(settings.theme).toBe("dark");
+	});
+
+	it("clears the renamed copy an older version left behind", () => {
+		const agentDir = newAgentDir();
+		const authPath = join(agentDir, "auth.json");
+		// The live store can be world-readable: another tool wrote it without the
+		// private-file helpers. The migration sees it and must not leave it that way.
+		writeFileSync(authPath, oauthStoreJson(), { mode: 0o644 });
+		const leftoverPath = writeLegacyStore(agentDir, "oauth.json.migrated", oauthStoreJson());
+
+		migrateAuthToAuthJson();
+
+		expect(existsSync(leftoverPath)).toBe(false);
+		expect(readFileSync(authPath, "utf-8")).toContain(REFRESH_SECRET);
+		expect(statSync(authPath).mode & 0o777).toBe(0o600);
+	});
+
+	it("deletes unreadable legacy copies once the live store exists, and never returns them", () => {
+		const agentDir = newAgentDir();
+		writeFileSync(join(agentDir, "auth.json"), JSON.stringify({ anthropic: { type: "api_key", key: "k" } }), {
+			mode: 0o600,
+		});
+		// Truncated mid-write: unreadable as a store, but the token bytes are in it.
+		writeLegacyStore(agentDir, "oauth.json.migrated", `{"openai-codex":{"access":"${ACCESS_SECRET}"`);
+
+		migrateAuthToAuthJson();
+
+		expect(filesHolding(agentDir, ACCESS_SECRET)).toEqual([]);
+		expect(existsSync(join(agentDir, "oauth.json.migrated"))).toBe(false);
+	});
+
+	it("keeps the one legacy store it could not read, tightened to 0600", () => {
+		const agentDir = newAgentDir();
+		const oauthPath = writeLegacyStore(agentDir, "oauth.json", `{"openai-codex":{"access":"${ACCESS_SECRET}"`);
+
+		migrateAuthToAuthJson();
+
+		// The only copy of a possibly recoverable credential must survive, but not as
+		// a file other accounts on the machine can read.
+		expect(existsSync(oauthPath)).toBe(true);
+		expect(statSync(oauthPath).mode & 0o777).toBe(0o600);
+		expect(existsSync(join(agentDir, "auth.json"))).toBe(false);
 	});
 });

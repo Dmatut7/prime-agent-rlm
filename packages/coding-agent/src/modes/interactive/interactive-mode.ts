@@ -8943,7 +8943,12 @@ export class InteractiveMode {
 				this.showStatus(`${server} is not connected.`);
 				return;
 			}
-			authStorage.logout(`mcp:${server}`);
+			try {
+				authStorage.logout(`mcp:${server}`);
+			} catch (error) {
+				this.showError(`Logout failed: ${error instanceof Error ? error.message : String(error)}`);
+				return;
+			}
 			await this.reloadAfterMcpChange(`Disconnected ${server}.`);
 			return;
 		}

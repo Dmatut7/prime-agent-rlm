@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerOAuthProvider } from "@earendil-works/pi-ai/oauth";
@@ -1103,6 +1103,114 @@ describe("AuthStorage", () => {
 			const apiKey = await authStorage.getApiKey("anthropic");
 
 			expect(apiKey).toBe("stored-key");
+		});
+	});
+
+	describe("logout", () => {
+		const ACCESS_SECRET = "ACCESS-TOKEN-SECRET-abc123def456";
+		const REFRESH_SECRET = "REFRESH-TOKEN-SECRET-xyz789uvw012";
+		const codexCredential = {
+			type: "oauth" as const,
+			access: ACCESS_SECRET,
+			refresh: REFRESH_SECRET,
+			expires: Date.now() + 3_600_000,
+			accountId: "acct_1",
+		};
+
+		function topLevelFiles(): string[] {
+			return readdirSync(tempDir, { withFileTypes: true })
+				.filter((entry) => entry.isFile())
+				.map((entry) => join(tempDir, entry.name));
+		}
+
+		function filesHolding(secret: string): string[] {
+			return topLevelFiles().filter((path) => readFileSync(path, "utf-8").includes(secret));
+		}
+
+		function writeLegacyCopy(name: string, data: Record<string, unknown>): string {
+			const path = join(tempDir, name);
+			writeFileSync(path, JSON.stringify(data, null, 2), { mode: 0o644 });
+			return path;
+		}
+
+		// Positive control for every "no file holds the token" assertion below: the
+		// same detector must flag a planted copy, otherwise a green result would only
+		// prove that the detector cannot see anything.
+		test("positive control: the token detector finds a planted copy", () => {
+			writeLegacyCopy("oauth.json", { "openai-codex": { access: ACCESS_SECRET, refresh: REFRESH_SECRET } });
+
+			expect(filesHolding(REFRESH_SECRET)).toEqual([join(tempDir, "oauth.json")]);
+		});
+
+		test("removes the migrated copy of the credential store, not just auth.json", () => {
+			writeAuthJson({ "openai-codex": codexCredential });
+			const migratedPath = writeLegacyCopy("oauth.json.migrated", {
+				"openai-codex": { access: ACCESS_SECRET, refresh: REFRESH_SECRET },
+			});
+
+			authStorage = AuthStorage.create(authJsonPath);
+			authStorage.logout("openai-codex");
+
+			expect(existsSync(migratedPath)).toBe(false);
+			expect(filesHolding(ACCESS_SECRET)).toEqual([]);
+			expect(filesHolding(REFRESH_SECRET)).toEqual([]);
+			expect(authStorage.has("openai-codex")).toBe(false);
+			expect(statSync(authJsonPath).mode & 0o777).toBe(0o600);
+		});
+
+		test("removes every historical credential-store name a logout could leave behind", () => {
+			writeAuthJson({
+				"openai-codex": codexCredential,
+				anthropic: { type: "api_key", key: "unrelated-anthropic-key-000111" },
+			});
+			const leftovers = [
+				"oauth.json",
+				"oauth.json.bak",
+				"oauth.json.migrated.2026-09-14",
+				"auth.json.old",
+				".auth.json.4242.abcdef.tmp",
+			];
+			for (const name of leftovers) {
+				writeLegacyCopy(name, { "openai-codex": { access: ACCESS_SECRET, refresh: REFRESH_SECRET } });
+			}
+
+			authStorage = AuthStorage.create(authJsonPath);
+			authStorage.logout("openai-codex");
+
+			for (const name of leftovers) {
+				expect(existsSync(join(tempDir, name))).toBe(false);
+			}
+			expect(filesHolding(REFRESH_SECRET)).toEqual([]);
+			// The unrelated provider stays logged in, and its live copy is private.
+			expect(authStorage.has("anthropic")).toBe(true);
+			expect(topLevelFiles().every((path) => (statSync(path).mode & 0o777) === 0o600)).toBe(true);
+		});
+
+		test("fails visibly when a legacy copy survives the removal", () => {
+			writeAuthJson({ "openai-codex": codexCredential });
+			// A directory where a file is expected: unlink cannot remove it, so the
+			// caller must learn about the copy instead of seeing a success message.
+			mkdirSync(join(tempDir, "oauth.json.migrated"));
+
+			authStorage = AuthStorage.create(authJsonPath);
+
+			expect(() => authStorage.logout("openai-codex")).toThrow(/oauth\.json\.migrated/);
+		});
+
+		test("fails visibly when another file still holds the credential", () => {
+			writeAuthJson({ "openai-codex": codexCredential });
+			writeLegacyCopy("creds-manual-copy.json", { refresh: REFRESH_SECRET });
+
+			authStorage = AuthStorage.create(authJsonPath);
+
+			expect(() => authStorage.logout("openai-codex")).toThrow(/creds-manual-copy\.json/);
+		});
+
+		test("in-memory storage has no state directory to clean", () => {
+			authStorage = AuthStorage.inMemory({ "openai-codex": codexCredential });
+
+			expect(() => authStorage.logout("openai-codex")).not.toThrow();
+			expect(authStorage.has("openai-codex")).toBe(false);
 		});
 	});
 });

@@ -1,5 +1,27 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { refreshOpenAICodexToken } from "../src/utils/oauth/openai-codex.js";
+import { loginOpenAICodex, refreshOpenAICodexToken } from "../src/utils/oauth/openai-codex.js";
+
+/**
+ * The token response is the credential itself, so an error about a malformed one
+ * may name fields and types but must never carry values. This is the detector the
+ * assertions below use; `detectorFlagsEchoedSecret` is its positive control.
+ */
+function detectorFlagsEchoedSecret(message: string, secret: string): boolean {
+	return message.includes(secret);
+}
+
+function stubJsonResponse(body: unknown): void {
+	vi.stubGlobal(
+		"fetch",
+		vi.fn(
+			async (): Promise<Response> =>
+				new Response(JSON.stringify(body), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+		),
+	);
+}
 
 describe("OpenAI Codex OAuth", () => {
 	afterEach(() => {
@@ -28,5 +50,47 @@ describe("OpenAI Codex OAuth", () => {
 			/OpenAI Codex token refresh failed \(401\).*Could not validate your token/,
 		);
 		expect(consoleError).not.toHaveBeenCalled();
+	});
+
+	it("positive control: the detector flags a message that echoes a token", () => {
+		const echoed = `OpenAI Codex token refresh response missing fields: {"access_token":"ACCESS-TOKEN-SECRET-abc123"}`;
+
+		expect(detectorFlagsEchoedSecret(echoed, "ACCESS-TOKEN-SECRET-abc123")).toBe(true);
+	});
+
+	it("describes malformed refresh responses without echoing the tokens that arrived with them", async () => {
+		const accessToken = "ACCESS-TOKEN-SECRET-abc123def456";
+		stubJsonResponse({ access_token: accessToken, expires_in: 3600, token_type: "Bearer" });
+
+		const error = await refreshOpenAICodexToken("REFRESH-TOKEN-SECRET-xyz789uvw012").catch(
+			(thrown: unknown) => thrown,
+		);
+
+		expect(error).toBeInstanceOf(Error);
+		const message = (error as Error).message;
+		expect(message).toMatch(/missing fields/);
+		// The field-level diagnosis is what makes the error actionable.
+		expect(message).toContain("access_token");
+		expect(message).toContain("refresh_token");
+		expect(message).toContain("expires_in");
+		expect(detectorFlagsEchoedSecret(message, accessToken)).toBe(false);
+	});
+
+	it("describes malformed token exchange responses without echoing the tokens", async () => {
+		const accessToken = "EXCHANGE-ACCESS-SECRET-abc123def456";
+		const refreshToken = "EXCHANGE-REFRESH-SECRET-xyz789uvw012";
+		stubJsonResponse({ access_token: accessToken, refresh_token: refreshToken, expires_in: "3600" });
+
+		const error = await loginOpenAICodex({
+			onAuth: () => {},
+			onPrompt: async () => "",
+			onManualCodeInput: async () => "auth-code",
+		}).catch((thrown: unknown) => thrown);
+
+		expect(error).toBeInstanceOf(Error);
+		const message = (error as Error).message;
+		expect(message).toMatch(/missing fields/);
+		expect(detectorFlagsEchoedSecret(message, accessToken)).toBe(false);
+		expect(detectorFlagsEchoedSecret(message, refreshToken)).toBe(false);
 	});
 });
