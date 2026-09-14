@@ -36,6 +36,16 @@ const SHUTDOWN_ADMISSION_FILE_NAME = "shutdown-admission.json";
 const SHUTDOWN_ADMISSION_LEASE_MS = 5000;
 const SHUTDOWN_ADMISSION_REFRESH_MS = 1000;
 const SHUTDOWN_ADMISSION_WAIT_MS = 50;
+/**
+ * A waiter refuses instead of hanging forever once a live holder has been silent
+ * for this long: two processes must never run shutdown work at once, so waiting is
+ * the only safe move, but an unbounded wait turns a wedged holder into a wedged
+ * shutdown command with nothing to read.
+ */
+const SHUTDOWN_ADMISSION_WAIT_TIMEOUT_MS = 60_000;
+/** Retries for a renewal that failed on the registry guard or the filesystem, not on ownership. */
+const RENEWAL_RETRY_ATTEMPTS = 3;
+const RENEWAL_RETRY_MS = 50;
 
 type DaemonSupervisorOwnerPhase = "starting" | "owner" | "stopping";
 
@@ -58,6 +68,14 @@ interface DaemonSupervisorOwnerRecord extends ProcessIdentity {
 	updatedAt: string;
 }
 
+/**
+ * Presence of the record is the ticket; `expiresAt` is the holder's renewal
+ * obligation, not a licence to hand the ticket on. A record whose process is
+ * alive keeps the ticket even while its lease has lapsed — a lapsed lease says
+ * the holder could not run its timer, and the alternative (a second process
+ * starting shutdown work while the first one is still inside it) is exactly the
+ * overlap this ticket exists to prevent.
+ */
 interface DaemonShutdownAdmissionRecord extends ProcessIdentity {
 	version: 1;
 	token: string;
@@ -139,6 +157,12 @@ class DaemonShutdownAdmissionError extends Error {
 /**
  * Owns a lease-renew loop safely: the unref()'d interval, single-flight
  * refresh dedup shared by timer-fired and direct calls, and lost-state fencing.
+ *
+ * Only an authoritative refusal is permanent. A failure of the registry guard or
+ * of the filesystem is not: it says nothing about who owns the record on disk, and
+ * burning the ticket over it is how a single stall — a machine sleep, a
+ * synchronous `ps`/`lsof` fork, a guard that changed hands while the event loop
+ * was frozen — used to cost the holder its admission for the rest of its life.
  */
 class RenewableRegistryRecord {
 	private stopped = false;
@@ -151,6 +175,7 @@ class RenewableRegistryRecord {
 		refreshMs: number,
 		private readonly renewUnderGuard: () => void,
 		private readonly createLostError: () => Error,
+		private readonly isRefusal: (error: unknown) => boolean = () => false,
 	) {
 		this.refreshTimer = setInterval(() => {
 			void this.assertOrRenew().catch(() => undefined);
@@ -169,19 +194,30 @@ class RenewableRegistryRecord {
 	}
 
 	private async performRenew(): Promise<void> {
-		try {
-			await withDaemonSupervisorRegistryGuard(this.registryDir, () => {
-				// stop() may have completed while this call waited on the guard;
-				// a stopped record must never be rewritten to disk.
-				if (this.stopped || this.lost) {
-					throw this.createLostError();
+		for (let attempt = 1; ; attempt++) {
+			try {
+				await withDaemonSupervisorRegistryGuard(this.registryDir, () => {
+					// stop() may have completed while this call waited on the guard;
+					// a stopped record must never be rewritten to disk.
+					if (this.stopped || this.lost) {
+						throw this.createLostError();
+					}
+					this.renewUnderGuard();
+				});
+				return;
+			} catch (error) {
+				if (this.isRefusal(error)) {
+					this.lost = true;
+					clearInterval(this.refreshTimer);
+					throw error;
 				}
-				this.renewUnderGuard();
-			});
-		} catch (error) {
-			this.lost = true;
-			clearInterval(this.refreshTimer);
-			throw error;
+				// Transient: retry, and leave the interval running even if every attempt
+				// fails, so the next tick renews the ticket this process still owns.
+				if (attempt >= RENEWAL_RETRY_ATTEMPTS) {
+					throw error;
+				}
+				await delay(RENEWAL_RETRY_MS);
+			}
 		}
 	}
 
@@ -271,8 +307,9 @@ class DaemonShutdownAdmission {
 		this.renewal = new RenewableRegistryRecord(
 			registryDir,
 			SHUTDOWN_ADMISSION_REFRESH_MS,
-			() => this.renewUnderGuard(),
+			() => this.acquireOrRenewUnderGuard(),
 			() => new DaemonShutdownAdmissionError("Daemon shutdown admission was lost"),
+			(error) => error instanceof DaemonShutdownAdmissionError,
 		);
 	}
 
@@ -283,23 +320,42 @@ class DaemonShutdownAdmission {
 		await this.renewal.assertOrRenew();
 	}
 
-	private renewUnderGuard(): void {
+	/**
+	 * Re-acquires or extends this holder's own ticket under the registry guard.
+	 *
+	 * The record is compared by identity, not by its lease clock: a lease that
+	 * lapsed while this process was stalled still names this process, so the holder
+	 * renews it and carries on. Only a *live* foreign holder is an authoritative
+	 * refusal, and it is permanent — another process is inside the shutdown this one
+	 * was admitted for, and continuing would be the overlap the ticket prevents. A
+	 * foreign record whose process is gone is reclaimable, like any other stale
+	 * registry entry.
+	 *
+	 * This deliberately does not re-derive this process's own start identity: the
+	 * record is ours by token, and asking `ps` about our own pid every second both
+	 * forked a synchronous helper on the renew path — one of the stalls that loses
+	 * the ticket — and turned a transient `ps` failure into a permanent loss.
+	 */
+	private acquireOrRenewUnderGuard(): void {
 		const path = shutdownAdmissionPath(this.registryDir);
 		const current = readShutdownAdmission(path);
-		if (
-			!current ||
-			current.token !== this.record.token ||
-			current.pid !== this.record.pid ||
-			current.processStartId !== this.record.processStartId ||
-			Date.parse(current.expiresAt) <= Date.now() ||
-			!matchesExactProcessIdentity(this.record)
-		) {
-			throw new DaemonShutdownAdmissionError("Daemon shutdown admission was lost");
+		if (current && !this.isCurrentTicket(current) && isProcessIdentityAlive(current)) {
+			throw new DaemonShutdownAdmissionError(
+				`Daemon shutdown admission is held by live process ${current.pid}; this shutdown cannot continue`,
+			);
 		}
 		const now = Date.now();
 		this.record.updatedAt = new Date(now).toISOString();
 		this.record.expiresAt = new Date(now + SHUTDOWN_ADMISSION_LEASE_MS).toISOString();
 		writeJsonAtomically(path, this.record);
+	}
+
+	private isCurrentTicket(current: DaemonShutdownAdmissionRecord): boolean {
+		return (
+			current.token === this.record.token &&
+			current.pid === this.record.pid &&
+			current.processStartId === this.record.processStartId
+		);
 	}
 
 	async release(): Promise<void> {
@@ -562,13 +618,24 @@ export async function assertDaemonSupervisorOwnerCurrent(
 	return fingerprint;
 }
 
-export async function acquireDaemonShutdownAdmission(): Promise<DaemonShutdownAdmission> {
+export async function acquireDaemonShutdownAdmission(
+	waitTimeoutMs: number = SHUTDOWN_ADMISSION_WAIT_TIMEOUT_MS,
+): Promise<DaemonShutdownAdmission> {
 	const registryDir = defaultDaemonSupervisorRegistryDir();
 	const processStartId = getProcessStartId(process.pid);
+	const deadline = Date.now() + waitTimeoutMs;
+	// Kept for the failure message: a waiter that gives up must be able to name the
+	// holder instead of only reporting that it could not have the ticket.
+	let holder: DaemonShutdownAdmissionRecord | undefined;
 	while (true) {
 		let acquired: DaemonShutdownAdmissionRecord | undefined;
 		await withDaemonSupervisorRegistryGuard(registryDir, () => {
-			if (readActiveShutdownAdmission(registryDir)) {
+			// A live holder keeps the ticket however stale its lease looks: it is the one
+			// process admitted to run shutdown work, and it renews its own record as soon
+			// as its event loop runs again. Only a record whose process is gone is
+			// reclaimed here, so two processes never hold this admission at once.
+			holder = readLiveShutdownAdmission(registryDir);
+			if (holder) {
 				return;
 			}
 			const now = Date.now();
@@ -585,6 +652,9 @@ export async function acquireDaemonShutdownAdmission(): Promise<DaemonShutdownAd
 		});
 		if (acquired) {
 			return new DaemonShutdownAdmission(acquired, registryDir);
+		}
+		if (Date.now() >= deadline) {
+			throw new DaemonShutdownAdmissionError(describeShutdownAdmissionHolder(holder, waitTimeoutMs));
 		}
 		await delay(SHUTDOWN_ADMISSION_WAIT_MS);
 	}
@@ -709,13 +779,6 @@ function isProcessIdentityAlive(identity: ProcessIdentity): boolean {
 	}
 	const observed = getProcessStartId(identity.pid);
 	return observed === undefined || observed === identity.processStartId;
-}
-
-function matchesExactProcessIdentity(identity: ProcessIdentity): boolean {
-	if (!isProcessAlive(identity.pid)) {
-		return false;
-	}
-	return identity.processStartId === undefined || getProcessStartId(identity.pid) === identity.processStartId;
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -962,17 +1025,49 @@ function readStartupFence(path: string): DaemonStartupFenceRecord | undefined {
 	}
 }
 
-function readActiveShutdownAdmission(registryDir: string): DaemonShutdownAdmissionRecord | undefined {
+/**
+ * The ticket's owner: any record naming a process that is still running, whatever
+ * its lease clock says. Deleting a live holder's record is what let a second
+ * process acquire the same admission while the first one was still inside it, so
+ * reclaim is reserved for a record whose process is provably gone.
+ */
+function readLiveShutdownAdmission(registryDir: string): DaemonShutdownAdmissionRecord | undefined {
 	const path = shutdownAdmissionPath(registryDir);
 	const admission = readShutdownAdmission(path);
 	if (!admission) {
 		return undefined;
 	}
-	if (Date.parse(admission.expiresAt) > Date.now() && isProcessIdentityAlive(admission)) {
+	if (isProcessIdentityAlive(admission)) {
 		return admission;
 	}
 	rmSync(path, { force: true });
 	return undefined;
+}
+
+/** Advisory face ("is a shutdown running right now?"): a lapsed lease reads as no. */
+function readActiveShutdownAdmission(registryDir: string): DaemonShutdownAdmissionRecord | undefined {
+	const admission = readLiveShutdownAdmission(registryDir);
+	return admission && Date.parse(admission.expiresAt) > Date.now() ? admission : undefined;
+}
+
+/**
+ * A waiter refuses instead of waiting forever: the holder may be wedged, and a
+ * shutdown command that neither proceeds nor reports why is worse than one that
+ * names the process standing in its way.
+ */
+function describeShutdownAdmissionHolder(
+	holder: DaemonShutdownAdmissionRecord | undefined,
+	waitTimeoutMs: number,
+): string {
+	if (!holder) {
+		return `Daemon shutdown is in progress and did not finish within ${waitTimeoutMs}ms; this shutdown cannot continue`;
+	}
+	const lapsedMs = Date.now() - Date.parse(holder.expiresAt);
+	const lease = lapsedMs > 0 ? `its lease lapsed ${lapsedMs}ms ago` : "its lease is live";
+	return (
+		`Daemon shutdown is held by live process ${holder.pid} (${lease}) and did not finish within ` +
+		`${waitTimeoutMs}ms; this shutdown cannot continue — wait for that process or stop it`
+	);
 }
 
 function readShutdownAdmission(path: string): DaemonShutdownAdmissionRecord | undefined {

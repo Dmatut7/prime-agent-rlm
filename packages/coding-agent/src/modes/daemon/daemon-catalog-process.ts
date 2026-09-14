@@ -5,10 +5,16 @@ import { createRequire } from "node:module";
 import { join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
-import { getPackageDir, isBunBinary } from "../../config.js";
+import { getAgentDir, getPackageDir, isBunBinary } from "../../config.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
-import { readSessionInfo, type SessionInfo, SessionManager } from "../../core/session-manager.js";
+import { acquireSessionLease, SESSION_LEASES_ENABLED_ENV } from "../../core/session-lease.js";
+import {
+	readSessionInfo,
+	repairOwnedSessionFile,
+	type SessionInfo,
+	SessionManager,
+} from "../../core/session-manager.js";
 
 export const DAEMON_CATALOG_ROLE_ENV = "PRIME_AGENT_INTERNAL_DAEMON_CATALOG";
 const DAEMON_CATALOG_START_TIMEOUT_MS = 30_000;
@@ -137,6 +143,39 @@ export function isDaemonCatalogProcess(environment: NodeJS.ProcessEnv = process.
 	return environment[DAEMON_CATALOG_ROLE_ENV] === "1";
 }
 
+/**
+ * Append to a session transcript from the catalog process.
+ *
+ * The catalog is a separate process writing a file a session worker may be
+ * writing, so it only appends under a session lease: without one its line is
+ * glued onto a crash-torn tail (the last line has no trailing newline), the
+ * glued line stops parsing, and the write is silently lost -- the archived
+ * marker and the worker-recovery note both vanish on the next read.
+ *
+ * The daemon deletes `SESSION_LEASES_ENABLED_ENV` before launching the
+ * supervisor, so the flag is absent from this process's environment; it is
+ * forced on here, exactly like the interactive direct-session branch in
+ * main.ts. Without that, `acquireSessionLease` would return undefined and these
+ * branches would fall back to the blind append this helper exists to prevent.
+ */
+function appendOwnedSessionEntry(sessionPath: string, append: (manager: SessionManager) => void): void {
+	const lease = acquireSessionLease(sessionPath, getAgentDir(), {
+		...process.env,
+		[SESSION_LEASES_ENABLED_ENV]: "1",
+	});
+	if (!lease) {
+		throw new Error(`Refusing to append to a session without a write lease: ${sessionPath}`);
+	}
+	try {
+		// Repair only under the lease: the torn tail belongs to whoever was
+		// writing, and truncating a live writer's in-flight append corrupts it.
+		repairOwnedSessionFile(sessionPath);
+		append(SessionManager.open(sessionPath));
+	} finally {
+		lease.release();
+	}
+}
+
 export async function runDaemonCatalogProcess(): Promise<never> {
 	process.on("disconnect", () => process.exit(0));
 	process.on("message", (value: unknown) => {
@@ -200,7 +239,7 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 				throw new Error(`No session found matching '${request.selector}'`);
 			}
 			case "rename":
-				SessionManager.open(request.sessionPath).appendSessionInfo(request.name.trim());
+				appendOwnedSessionEntry(request.sessionPath, (manager) => manager.appendSessionInfo(request.name.trim()));
 				sendCatalogMessage({ type: "response", id: request.id, success: true });
 				return;
 			case "delete":
@@ -223,7 +262,9 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 					return;
 				}
 				if (session.state?.status !== "archived") {
-					SessionManager.open(request.sessionPath).appendSessionState({ status: "archived" });
+					appendOwnedSessionEntry(request.sessionPath, (manager) =>
+						manager.appendSessionState({ status: "archived" }),
+					);
 				}
 				sendCatalogMessage({
 					type: "response",
@@ -234,14 +275,16 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 				return;
 			}
 			case "mark_interrupted":
-				SessionManager.open(request.sessionPath).appendCustomMessageEntry(
-					"prime-agent.worker_recovery",
-					"<prime_agent_worker_interrupted>\nThe isolated session worker stopped during in-flight work. The saved transcript was recovered, but uncertain model, tool, bash, or child-agent work was not replayed. Inspect external side effects before continuing.\n</prime_agent_worker_interrupted>",
-					false,
-					{
-						activeSessionId: request.activeSessionId,
-						operations: request.operations,
-					},
+				appendOwnedSessionEntry(request.sessionPath, (manager) =>
+					manager.appendCustomMessageEntry(
+						"prime-agent.worker_recovery",
+						"<prime_agent_worker_interrupted>\nThe isolated session worker stopped during in-flight work. The saved transcript was recovered, but uncertain model, tool, bash, or child-agent work was not replayed. Inspect external side effects before continuing.\n</prime_agent_worker_interrupted>",
+						false,
+						{
+							activeSessionId: request.activeSessionId,
+							operations: request.operations,
+						},
+					),
 				);
 				sendCatalogMessage({ type: "response", id: request.id, success: true });
 				return;

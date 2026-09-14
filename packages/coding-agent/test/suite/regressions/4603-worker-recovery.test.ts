@@ -1009,43 +1009,58 @@ describe("ENG-4603 worker recovery convergence", () => {
 		await terminateTrackedFixtureProcess(staleSupervisor);
 	}, 90_000);
 
-	it("serializes shutdown admission and reclaims an unrenewed live lease", async () => {
+	it("serializes shutdown admission and keeps a lapsed lease with its live holder", async () => {
 		const paths = await createPaths();
 		const previousRegistryDir = process.env[supervisorRegistryDirEnv];
 		process.env[supervisorRegistryDirEnv] = paths.registryDir;
 		try {
+			const admissionPath = join(paths.registryDir, "shutdown-admission.json");
+			const readRecord = () =>
+				JSON.parse(readFileSync(admissionPath, "utf8")) as {
+					token: string;
+					pid: number;
+					processStartId?: string;
+					expiresAt: string;
+				};
 			const first = await acquireDaemonShutdownAdmission();
-			const record = JSON.parse(readFileSync(join(paths.registryDir, "shutdown-admission.json"), "utf8")) as {
-				pid: number;
-				processStartId?: string;
-			};
-			expect(record.pid).toBe(process.pid);
-			expect(record.processStartId).toBe(getProcessStartId(process.pid));
-			const renewal = Reflect.get(first, "renewal") as object | undefined;
-			const refreshTimer = renewal
-				? (Reflect.get(renewal, "refreshTimer") as ReturnType<typeof setInterval> | undefined)
-				: undefined;
-			if (!refreshTimer) throw new Error("Shutdown admission did not start its lease refresh");
-			clearInterval(refreshTimer);
-			let acquired = false;
+			const held = readRecord();
+			expect(held.pid).toBe(process.pid);
+			expect(held.processStartId).toBe(getProcessStartId(process.pid));
+
+			// Stall this thread the way a machine sleep or a synchronous ps|lsof fork does:
+			// the holder's 1s refresh cannot run, so its 5s lease lapses with the record on
+			// disk still naming this process. That stall used to burn the ticket permanently.
+			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5_300);
+			expect(Date.parse(readRecord().expiresAt)).toBeLessThan(Date.now());
+
+			// The holder is alive, so a lapsed lease is its own to renew; a second process
+			// must never be admitted into the same shutdown.
+			await expect(first.assertOrRenew()).resolves.toBeUndefined();
+			expect(Date.parse(readRecord().expiresAt)).toBeGreaterThan(Date.now());
+
+			let secondAcquired = false;
 			const waiting = acquireDaemonShutdownAdmission().then((admission) => {
-				acquired = true;
+				secondAcquired = true;
 				return admission;
 			});
 			await delay(250);
-			expect(acquired).toBe(false);
-			const second = await waiting;
-			expect(acquired).toBe(true);
+			expect(secondAcquired).toBe(false);
+			expect(readRecord().token).toBe(held.token);
+
 			let destructivePasses = 0;
 			const destructivePass = async (admission: { assertOrRenew: () => Promise<void> }) => {
 				await admission.assertOrRenew();
 				destructivePasses++;
 			};
-			await expect(destructivePass(first)).rejects.toMatchObject({ code: "daemon_shutdown_in_progress" });
-			await destructivePass(second);
+			await destructivePass(first);
 			expect(destructivePasses).toBe(1);
-			await second.release();
+
 			await first.release();
+			const second = await waiting;
+			expect(secondAcquired).toBe(true);
+			await destructivePass(second);
+			expect(destructivePasses).toBe(2);
+			await second.release();
 		} finally {
 			if (previousRegistryDir === undefined) {
 				delete process.env[supervisorRegistryDirEnv];
@@ -1053,7 +1068,7 @@ describe("ENG-4603 worker recovery convergence", () => {
 				process.env[supervisorRegistryDirEnv] = previousRegistryDir;
 			}
 		}
-	}, 15_000);
+	}, 30_000);
 
 	it("shutdown --force removes hidden supervisors and workers through the public CLI", async () => {
 		if (process.platform === "win32") return;
