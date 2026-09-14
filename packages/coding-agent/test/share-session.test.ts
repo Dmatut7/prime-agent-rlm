@@ -59,13 +59,22 @@ describe("confirmShareIfSecrets", () => {
 
 describe("formatShareSecretWarning", () => {
 	it("lists types without inventing secret values", () => {
-		const warning = formatShareSecretWarning(["API key (sk-)"]);
+		// The preview is a front/back mask: enough to recognise which credential is at risk,
+		// never the value itself.
+		const secret = "sk-live1234567890secret";
+		const warning = formatShareSecretWarning([
+			{ type: "API key (sk-)", view: "the exported session payload", offset: 12, line: 1, masked: "sk-l…cret" },
+		]);
 		expect(warning.message).toContain("- API key (sk-)");
-		expect(warning.message).not.toMatch(/sk-[A-Za-z0-9]/);
+		expect(warning.message).toContain("sk-l…cret");
+		expect(warning.message).not.toContain(secret);
+		expect(warning.message).not.toMatch(/sk-live/);
 	});
 
 	it("describes what is actually uploaded, not a narrower proxy", () => {
-		const { message } = formatShareSecretWarning(["API key (sk-)"]);
+		const { message } = formatShareSecretWarning([
+			{ type: "API key (sk-)", view: "the exported session payload", offset: 12, line: 1, masked: "sk-l…cret" },
+		]);
 		expect(message).toContain("exported session");
 		expect(message).toContain("tools");
 		expect(message).toContain("working-directory context");

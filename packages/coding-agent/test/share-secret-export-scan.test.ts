@@ -52,7 +52,15 @@ describe("share preflight scans the exported session payload", () => {
 			// shapes that follow a `\n` are only visible once those escapes are resolved:
 			// a plain scan of the decoded text sees the first key and the unanchored PEM
 			// header, and nothing else.
-			expect(findShareSecretHits(decoded ?? "")).toEqual(["API key (sk-)", "PEM private key"]);
+			// `Bearer` still does not match here: the escape for the newline in front of it is a
+			// literal `n`, so the `\b` anchor fails. A JWT-shaped value that carries no boundary
+			// the escapes can hide is caught by the high-entropy detector instead, which is why
+			// the second slot is that type and not "Bearer token".
+			expect(findShareSecretHits(decoded ?? "")).toEqual([
+				"API key (sk-)",
+				"PEM private key",
+				"High-entropy credential-like value",
+			]);
 			expect(findShareUploadSecretHits(html)).toEqual([
 				"API key (sk-)",
 				"AWS access key (AKIA)",

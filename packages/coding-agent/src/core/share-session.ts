@@ -1,59 +1,135 @@
 /**
- * /share preflight: detect common secret shapes and create a private temp HTML file.
+ * /share preflight: find the credentials a session would leak, then create a private temp
+ * HTML file.
  *
- * Hits list pattern types only — never the matched secret text.
+ * Reports shape, location and a front/back mask — never the matched secret text.
  */
 
 import { createPrivateTempFile, type PrivateTempFile } from "../utils/private-files.js";
 import { decodeEmbeddedSessionData } from "./export-html/session-data-embedding.js";
+import { maskSecretValue, SHARE_SECRET_DETECTORS, type ShareSecretMatch } from "./share-secret-detectors.js";
+import { collectConfiguredShareSecretValues, type ShareSecretValue } from "./share-secret-values.js";
 
-export interface ShareSecretPattern {
-	/** User-visible type label. Must not include matched content. */
+export type { ShareSecretPattern } from "./share-secret-detectors.js";
+export { SHARE_SECRET_PATTERNS } from "./share-secret-detectors.js";
+
+/** One credential found in the bytes that would be uploaded. Carries no secret text. */
+export interface ShareSecretFinding {
+	/** Shape label, e.g. `API key (sk-)` or `Credential assignment`. */
 	type: string;
-	pattern: RegExp;
+	/** Which of the scanned views the hit is in, e.g. `the exported session payload`. */
+	view: string;
+	/** Offset of the value inside that view. */
+	offset: number;
+	/** 1-based line number of the value inside that view. */
+	line: number;
+	/** Front/back mask of the value, or a hidden-length marker for very short values. */
+	masked: string;
+	/** Non-secret identifier: the environment variable name or the config path it came from. */
+	name?: string;
 }
 
-export const SHARE_SECRET_PATTERNS: readonly ShareSecretPattern[] = [
-	{ type: "API key (sk-)", pattern: /\bsk-[A-Za-z0-9_-]{8,}/g },
-	{ type: "AWS access key (AKIA)", pattern: /\bAKIA[0-9A-Z]{16}\b/g },
-	{ type: "GitHub token (ghp_)", pattern: /\bghp_[A-Za-z0-9_]{20,}/g },
-	{ type: "GitHub token (github_pat_)", pattern: /\bgithub_pat_[A-Za-z0-9_]{20,}/g },
-	{ type: "Bearer token", pattern: /\bBearer\s+[A-Za-z0-9._\-+/=]{8,}/gi },
-	{ type: "PEM private key", pattern: /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/g },
-];
+export interface ShareSecretScanOptions {
+	/**
+	 * Exact values that must not appear in the upload, usually the credentials this session
+	 * has loaded. Omit it to use the value comparison only in `confirmShareIfSecrets`, which
+	 * collects them; pass `[]` for a pure shape scan (tests do this for determinism).
+	 */
+	secretValues?: readonly ShareSecretValue[];
+}
 
-/** Unique secret types found in `content`. Never returns matched secret text. */
+type ShareScanViewKind = "document" | "content";
+
+interface ShareScanView {
+	label: string;
+	/**
+	 * `document` is the export file itself (a fixed template around a base64 payload, so
+	 * entropy scanning it would only match its own container); `content` is decoded text.
+	 */
+	kind: ShareScanViewKind;
+	text: string;
+}
+
+const DOCUMENT_VIEW = "the export document";
+const PAYLOAD_VIEW = "the exported session payload";
+const CONTENT_VIEW = "the session text";
+
+/** Detector order decides the order of the warning, and `SHARE_SECRET_PATTERNS` reads first. */
 export function findShareSecretHits(content: string): string[] {
-	const hits: string[] = [];
-	const seen = new Set<string>();
-	for (const { type, pattern } of SHARE_SECRET_PATTERNS) {
-		pattern.lastIndex = 0;
-		if (pattern.test(content) && !seen.has(type)) {
-			seen.add(type);
-			hits.push(type);
+	return [...new Set(findShareSecretFindings(content).map((finding) => finding.type))];
+}
+
+/** Every credential in plain text, with shape, position and mask. */
+export function findShareSecretFindings(content: string, options?: ShareSecretScanOptions): ShareSecretFinding[] {
+	return scanShareSecretViews([{ label: CONTENT_VIEW, kind: "content", text: content }], options);
+}
+
+function scanShareSecretViews(views: readonly ShareScanView[], options?: ShareSecretScanOptions): ShareSecretFinding[] {
+	const findings: ShareSecretFinding[] = [];
+	// One line per distinct value: the same secret is present twice in an export payload
+	// (raw and with its JSON escapes resolved), and a value caught by two detectors - an
+	// `sk-` key is also a high-entropy token, and it also sits in a `NAME=value` assignment -
+	// is one secret, not two.
+	const seen = new Map<string, ShareSecretFinding>();
+
+	const record = (view: ShareScanView, type: string, match: ShareSecretMatch, name?: string): void => {
+		const masked = maskSecretValue(match.value);
+		const existing = seen.get(masked);
+		if (existing !== undefined) {
+			// The first detector to find a value labels its shape; a later one can still know
+			// the non-secret identifier that goes with it (the environment variable name).
+			if (existing.name === undefined && name !== undefined) {
+				existing.name = name;
+			}
+			return;
+		}
+		const finding: ShareSecretFinding = {
+			type,
+			view: view.label,
+			offset: match.index,
+			line: lineNumberAt(view.text, match.index),
+			masked,
+			...(name !== undefined ? { name } : {}),
+		};
+		seen.set(masked, finding);
+		findings.push(finding);
+	};
+
+	for (const detector of SHARE_SECRET_DETECTORS) {
+		for (const view of views) {
+			if (view.kind === "document" && !detector.scansDocumentBytes) continue;
+			for (const match of detector.detect(view.text)) {
+				record(view, detector.type, match, match.name);
+			}
 		}
 	}
-	return hits;
+
+	for (const secret of options?.secretValues ?? []) {
+		for (const view of views) {
+			const index = view.text.indexOf(secret.value);
+			if (index < 0) continue;
+			record(view, "Configured credential", { value: secret.value, index, name: secret.source }, secret.source);
+			break;
+		}
+	}
+
+	return findings;
 }
 
-export function formatShareSecretWarning(types: readonly string[]): { title: string; message: string } {
-	const list = types.map((type) => `- ${type}`).join("\n");
-	return {
-		title: "Share session",
-		message:
-			`This session looks like it contains secrets:\n${list}\n\n` +
-			"/share uploads the exported session (messages, system prompt, tools, and the\n" +
-			"working-directory context the exporter adds) as a private GitHub gist.\n\n" +
-			"Upload anyway?",
-	};
+function lineNumberAt(text: string, index: number): number {
+	let line = 1;
+	for (let position = 0; position < index && position < text.length; position += 1) {
+		if (text[position] === "\n") line += 1;
+	}
+	return line;
 }
 
 /**
- * JSON string escapes hide the separators a secret shape is delimited by: in the
- * exported payload `...\nAKIA...` puts a literal `n` in front of the key, so the
- * `\b` anchors of the patterns above never fire. Unescape the two-character forms
- * before scanning. Scan-only normalization: the result is never stored, shown or
- * returned, and it can only widen what the preflight sees.
+ * JSON string escapes hide the separators a secret shape is delimited by: in the exported
+ * payload `...\nAKIA...` puts a literal `n` in front of the key, so a `\b`-anchored pattern
+ * never fires there. Unescape the two-character forms before scanning. Scan-only
+ * normalization: the result is never stored, shown or returned, and it can only widen what
+ * the preflight sees.
  */
 const SCAN_JSON_ESCAPES = /\\(?:([nrtbf"\\/])|u([0-9a-fA-F]{4}))/g;
 
@@ -84,46 +160,88 @@ function unescapeForScan(text: string): string {
  * uploaded (plaintext the exporter adds around the payload), the payload recovered
  * from the base64 container, and that payload with its JSON escapes resolved.
  */
-function shareUploadScanTargets(uploadedContent: string): string[] {
-	const targets = [uploadedContent];
+function shareUploadScanViews(uploadedContent: string): ShareScanView[] {
+	const views: ShareScanView[] = [{ label: DOCUMENT_VIEW, kind: "document", text: uploadedContent }];
 	const payload = decodeEmbeddedSessionData(uploadedContent);
 	if (payload !== undefined) {
-		targets.push(payload, unescapeForScan(payload));
-	}
-	return targets;
-}
-
-/**
- * Unique secret types reachable from the bytes that will actually be uploaded, in
- * SHARE_SECRET_PATTERNS order. The exported session travels as base64 inside the
- * document, so scanning the uploaded text alone scans an encoding of the session
- * and passes every secret it contains.
- */
-export function findShareUploadSecretHits(uploadedContent: string): string[] {
-	const found = new Set<string>();
-	for (const target of shareUploadScanTargets(uploadedContent)) {
-		for (const type of findShareSecretHits(target)) {
-			found.add(type);
+		// The unescaped view is listed first so that positions and the non-secret names in a
+		// warning refer to the session text a reader can find; the escaped view is still
+		// scanned, because a shape can be hidden by an escape the unescaping does not cover.
+		const unescaped = unescapeForScan(payload);
+		if (unescaped !== payload) {
+			views.push({ label: PAYLOAD_VIEW, kind: "content", text: unescaped });
 		}
+		views.push({ label: PAYLOAD_VIEW, kind: "content", text: payload });
 	}
-	return SHARE_SECRET_PATTERNS.map((pattern) => pattern.type).filter((type) => found.has(type));
+	return views;
+}
+
+/** Credentials reachable from the bytes that will actually be uploaded, in detector order. */
+export function findShareUploadSecretHits(uploadedContent: string, options?: ShareSecretScanOptions): string[] {
+	return [...new Set(findShareUploadSecretFindings(uploadedContent, options).map((finding) => finding.type))];
 }
 
 /**
- * Gate an upload on a secret scan of `content`. Callers must pass the bytes that
- * will actually be uploaded, not a proxy for them: a narrower shape silently
- * passes every secret that lives outside it. Everything a viewer can recover from
- * those bytes is scanned too (see findShareUploadSecretHits).
+ * Credentials reachable from the bytes that will actually be uploaded, with the position
+ * and shape of each one. The exported session travels as base64 inside the document, so
+ * scanning the uploaded text alone scans an encoding of the session and passes every
+ * secret it contains.
+ */
+export function findShareUploadSecretFindings(
+	uploadedContent: string,
+	options?: ShareSecretScanOptions,
+): ShareSecretFinding[] {
+	return scanShareSecretViews(shareUploadScanViews(uploadedContent), options);
+}
+
+/** A confirm dialog is a decision, not a report: list the first few and count the rest. */
+const MAX_LISTED_FINDINGS = 8;
+
+/**
+ * The confirm dialog: one line per credential with its shape, the non-secret name it was
+ * assigned from, its position in the scanned text and a front/back mask, plus what the
+ * upload would actually carry and what cancelling means.
+ */
+export function formatShareSecretWarning(findings: readonly ShareSecretFinding[]): { title: string; message: string } {
+	const listed = findings
+		.slice(0, MAX_LISTED_FINDINGS)
+		.map(
+			(finding) =>
+				`- ${finding.type}${finding.name ? ` ${finding.name}` : ""} — ${finding.view}, ${finding.masked} at line ${finding.line} (offset ${finding.offset})`,
+		);
+	if (findings.length > MAX_LISTED_FINDINGS) {
+		listed.push(`- ...and ${findings.length - MAX_LISTED_FINDINGS} more`);
+	}
+	return {
+		title: "Share session",
+		message:
+			`This session looks like it contains secrets:\n${listed.join("\n")}\n\n` +
+			"Nothing is uploaded yet: cancel and the session is not shared.\n" +
+			"/share uploads the exported session (messages, system prompt, tools, and the\n" +
+			"working-directory context the exporter adds) as a private GitHub gist, and a secret\n" +
+			"gist is readable by anyone who has the link.\n\n" +
+			"Upload anyway?",
+	};
+}
+
+/**
+ * Gate an upload on a scan of `content`. Callers must pass the bytes that will actually be
+ * uploaded, not a proxy for them: a narrower shape silently passes every secret that lives
+ * outside it. Everything a viewer can recover from those bytes is scanned too (see
+ * findShareUploadSecretFindings), and the values this session has loaded are compared
+ * exactly, which is the only check an unknown credential shape cannot slip past.
  */
 export async function confirmShareIfSecrets(
 	content: string,
 	confirm: (title: string, message: string) => Promise<boolean>,
+	options?: ShareSecretScanOptions,
 ): Promise<boolean> {
-	const hits = findShareUploadSecretHits(content);
-	if (hits.length === 0) {
+	const secretValues = options?.secretValues ?? collectConfiguredShareSecretValues();
+	const findings = findShareUploadSecretFindings(content, { secretValues });
+	if (findings.length === 0) {
 		return true;
 	}
-	const warning = formatShareSecretWarning(hits);
+	const warning = formatShareSecretWarning(findings);
 	return confirm(warning.title, warning.message);
 }
 
