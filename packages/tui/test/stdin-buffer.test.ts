@@ -1,13 +1,16 @@
 import assert from "node:assert";
 import { performance } from "node:perf_hooks";
 import { beforeEach, describe, it } from "node:test";
-import { StdinBuffer } from "../src/stdin-buffer.js";
+import { BULK_TEXT_MAX_SEQUENCE, PASTE_SETTLE_MS, StdinBuffer } from "../src/stdin-buffer.js";
 
 describe("StdinBuffer", () => {
 	let buffer: StdinBuffer;
 	let emittedSequences: string[];
 
 	beforeEach(() => {
+		// A paste is closed asynchronously once its stream settles; destroy the
+		// previous buffer so a pending timer cannot report into this test.
+		buffer?.destroy();
 		buffer = new StdinBuffer({ timeout: 10 });
 
 		emittedSequences = [];
@@ -22,6 +25,11 @@ describe("StdinBuffer", () => {
 
 	async function wait(ms: number): Promise<void> {
 		return new Promise((resolve) => setTimeout(resolve, ms));
+	}
+
+	/** Wait past the quiet window after which a paste is closed. */
+	async function waitForPasteSettle(): Promise<void> {
+		await wait(PASTE_SETTLE_MS + 15);
 	}
 
 	describe("Regular Characters", () => {
@@ -40,12 +48,41 @@ describe("StdinBuffer", () => {
 			assert.deepStrictEqual(emittedSequences, ["h", "e", "l", "l", "o", " ", "世", "界"]);
 		});
 
-		it("splits a large printable burst without quadratic slowdown", () => {
+		it("delivers a large printable burst as bulk sequences, not one per character", () => {
 			const text = "a".repeat(100_000);
 			const start = performance.now();
 			processInput(text);
 			assert.ok(performance.now() - start < 2_000, "bulk printable input must stay linear");
-			assert.strictEqual(emittedSequences.length, 100_000);
+			// Bulk input reaches consumers in a handful of sequences so they can
+			// insert it in one pass; Short bursts stay per character (see below).
+			assert.strictEqual(emittedSequences.length, Math.ceil(text.length / BULK_TEXT_MAX_SEQUENCE));
+			assert.strictEqual(emittedSequences.join(""), text);
+		});
+
+		it("keeps short printable bursts one sequence per character", () => {
+			processInput("hi there");
+			assert.deepStrictEqual(emittedSequences, [..."hi there"]);
+		});
+
+		it("keeps control bytes one sequence each inside a bulk run", () => {
+			processInput(`${"a".repeat(40)}\r${"b".repeat(40)}`);
+			assert.deepStrictEqual(
+				emittedSequences.map((sequence) => sequence.length),
+				[40, 1, 40],
+			);
+		});
+
+		it("keeps newlines inside a bulk run but not at its start", () => {
+			const text = `${"line of text\n".repeat(20)}end`;
+			processInput(text);
+			assert.deepStrictEqual(emittedSequences, [text]);
+			assert.strictEqual(emittedSequences.join(""), text);
+
+			// A leading newline still goes out on its own: consumers read a sequence
+			// that starts with one as the newline key.
+			emittedSequences.length = 0;
+			processInput(`\n${text}`);
+			assert.deepStrictEqual(emittedSequences, ["\n", text]);
 		});
 	});
 
@@ -382,18 +419,22 @@ describe("StdinBuffer", () => {
 			});
 		});
 
-		it("should emit paste event for complete bracketed paste", () => {
+		it("should emit paste event for complete bracketed paste", async () => {
 			const pasteStart = "\x1b[200~";
 			const pasteEnd = "\x1b[201~";
 			const content = "hello world";
 
 			processInput(pasteStart + content + pasteEnd);
 
+			// The paste closes once its byte stream settles, so that a paste whose
+			// content holds an end marker is not cut short.
+			await waitForPasteSettle();
+
 			assert.deepStrictEqual(emittedPaste, ["hello world"]);
 			assert.deepStrictEqual(emittedSequences, []); // No data events during paste
 		});
 
-		it("should handle paste arriving in chunks", () => {
+		it("should handle paste arriving in chunks", async () => {
 			processInput("\x1b[200~");
 			assert.deepStrictEqual(emittedPaste, []);
 
@@ -401,28 +442,47 @@ describe("StdinBuffer", () => {
 			assert.deepStrictEqual(emittedPaste, []);
 
 			processInput("world\x1b[201~");
+			assert.deepStrictEqual(emittedPaste, []);
+
+			await waitForPasteSettle();
 			assert.deepStrictEqual(emittedPaste, ["hello world"]);
 			assert.deepStrictEqual(emittedSequences, []);
 		});
 
-		it("should handle paste with input before and after", () => {
+		it("should handle paste with input before and after", async () => {
 			processInput("a");
 			processInput("\x1b[200~pasted\x1b[201~");
+
+			await waitForPasteSettle();
+			// Input that arrives after the paste stream settles is fresh key input.
 			processInput("b");
 
 			assert.deepStrictEqual(emittedSequences, ["a", "b"]);
 			assert.deepStrictEqual(emittedPaste, ["pasted"]);
 		});
 
-		it("should handle paste with newlines", () => {
+		it("keeps bytes that arrive before the paste stream settles inside the paste", async () => {
+			processInput("\x1b[200~pasted\x1b[201~typed");
+
+			await waitForPasteSettle();
+
+			assert.deepStrictEqual(emittedPaste, ["pastedtyped"]);
+			assert.deepStrictEqual(emittedSequences, []);
+		});
+
+		it("should handle paste with newlines", async () => {
 			processInput("\x1b[200~line1\nline2\nline3\x1b[201~");
+
+			await waitForPasteSettle();
 
 			assert.deepStrictEqual(emittedPaste, ["line1\nline2\nline3"]);
 			assert.deepStrictEqual(emittedSequences, []);
 		});
 
-		it("should handle paste with unicode", () => {
+		it("should handle paste with unicode", async () => {
 			processInput("\x1b[200~Hello 世界 🎉\x1b[201~");
+
+			await waitForPasteSettle();
 
 			assert.deepStrictEqual(emittedPaste, ["Hello 世界 🎉"]);
 			assert.deepStrictEqual(emittedSequences, []);
@@ -477,7 +537,7 @@ describe("StdinBuffer", () => {
 			assert.deepStrictEqual(emittedSequences, ["x"]);
 		});
 
-		it("emits an oversized paste atomically", () => {
+		it("emits an oversized paste in parts and keeps the rest in paste mode", async () => {
 			buffer = new StdinBuffer({ timeout: 10, pasteMaxBytes: 8 });
 			emittedSequences = [];
 			emittedPaste = [];
@@ -491,9 +551,51 @@ describe("StdinBuffer", () => {
 			processInput("\x1b[200~abcdefghij");
 			assert.deepStrictEqual(emittedPaste, ["abcdefghij"]);
 			assert.deepStrictEqual(emittedSequences, []);
+			assert.strictEqual(buffer.isPasteMode(), true);
 
-			processInput("x");
-			assert.deepStrictEqual(emittedSequences, ["x"]);
+			// The rest of the paste is still paste text, not key input.
+			processInput("xyz");
+			assert.deepStrictEqual(emittedPaste, ["abcdefghij"]);
+			assert.deepStrictEqual(emittedSequences, []);
+
+			processInput("\x1b[201~");
+			await waitForPasteSettle();
+			assert.deepStrictEqual(emittedPaste, ["abcdefghij", "xyz"]);
+			assert.deepStrictEqual(emittedSequences, []);
+			assert.strictEqual(buffer.isPasteMode(), false);
+
+			processInput("q");
+			assert.deepStrictEqual(emittedSequences, ["q"]);
+		});
+
+		it("delivers the tail of an oversized paste without per-character events", async () => {
+			// Mechanism control from the audit: the part budget used to drop the
+			// remainder onto the key path, one data event per character.
+			buffer = new StdinBuffer({ timeout: 10, pasteTimeoutMs: 100, pasteMaxBytes: 1000 });
+			emittedSequences = [];
+			emittedPaste = [];
+			buffer.on("data", (sequence) => {
+				emittedSequences.push(sequence);
+			});
+			buffer.on("paste", (data) => {
+				emittedPaste.push(data);
+			});
+
+			processInput(`\x1b[200~${"y".repeat(1500)}`);
+			processInput("z".repeat(500));
+			processInput("\x1b[201~");
+			await waitForPasteSettle();
+
+			assert.deepStrictEqual(emittedSequences, []);
+			assert.strictEqual(emittedPaste.join(""), `${"y".repeat(1500)}${"z".repeat(500)}`);
+		});
+
+		it("delivers a large non-bracketed paste as bulk sequences", () => {
+			const text = "x".repeat(200_000);
+			processInput(text);
+
+			assert.strictEqual(emittedSequences.length, Math.ceil(text.length / BULK_TEXT_MAX_SEQUENCE));
+			assert.strictEqual(emittedSequences.join(""), text);
 		});
 
 		it("discards an unterminated paste on Kitty Esc without inserting it", () => {
@@ -507,10 +609,12 @@ describe("StdinBuffer", () => {
 			assert.deepStrictEqual(emittedSequences, ["x"]);
 		});
 
-		it("still completes paste when 201~ arrives split after a lone ESC", () => {
+		it("still completes paste when 201~ arrives split after a lone ESC", async () => {
 			processInput("\x1b[200~hello");
 			processInput("\x1b");
 			processInput("[201~");
+
+			await waitForPasteSettle();
 
 			assert.deepStrictEqual(emittedPaste, ["hello"]);
 			assert.deepStrictEqual(emittedSequences, []);
@@ -582,7 +686,9 @@ describe("StdinBuffer", () => {
 			assert.deepStrictEqual(emittedPaste, []);
 
 			processInput("\x1b[201~");
+			await waitForPasteSettle();
 			assert.deepStrictEqual(emittedPaste, ["hello\x1b[31mred"]);
+			assert.deepStrictEqual(emittedSequences, []);
 		});
 
 		it("keeps paste when a chunk ends with ESC and CSI completes later", async () => {
@@ -592,20 +698,66 @@ describe("StdinBuffer", () => {
 			assert.strictEqual(buffer.isPasteMode(), true);
 
 			processInput("[31mred\x1b[201~");
+			await waitForPasteSettle();
 			assert.deepStrictEqual(emittedPaste, ["hello\x1b[31mred"]);
 			assert.deepStrictEqual(emittedSequences, []);
 		});
 
-		it("detects the paste end marker split at every chunk boundary", () => {
+		it("detects the paste end marker split at every chunk boundary", async () => {
 			const input = "\x1b[200~hi\x1b[31mthere\x1b[201~tail";
+			// A short quiet window keeps this sweep fast; both chunks are fed
+			// inside one tick, so the paste stays open across the split.
+			buffer = new StdinBuffer({ timeout: 10, pasteSettleMs: 1 });
+			emittedSequences = [];
+			emittedPaste = [];
+			buffer.on("data", (sequence) => {
+				emittedSequences.push(sequence);
+			});
+			buffer.on("paste", (data) => {
+				emittedPaste.push(data);
+			});
+
 			for (let split = 1; split < input.length; split++) {
 				buffer.clear();
 				emittedSequences.length = 0;
 				emittedPaste.length = 0;
 				processInput(input.slice(0, split));
 				processInput(input.slice(split));
-				assert.deepStrictEqual(emittedPaste, ["hi\x1b[31mthere"], `split at ${split}`);
-				assert.deepStrictEqual(emittedSequences, [..."tail"], `split at ${split}`);
+				await wait(5);
+				assert.deepStrictEqual(emittedPaste, ["hi\x1b[31mtheretail"], `split at ${split}`);
+				assert.deepStrictEqual(emittedSequences, [], `split at ${split}`);
+			}
+		});
+
+		it("never turns bytes after an end marker inside a paste into key input", async () => {
+			// Reported injection shape: the pasted bytes hold a literal end marker
+			// and an escape sequence that would otherwise run as ctrl+right.
+			const injection = "\x1b[200~abc\x1b[201~\x1b[1;5Ctail\x1b[201~";
+			buffer = new StdinBuffer({ timeout: 10, pasteSettleMs: 1 });
+			emittedSequences = [];
+			emittedPaste = [];
+			buffer.on("data", (sequence) => {
+				emittedSequences.push(sequence);
+			});
+			buffer.on("paste", (data) => {
+				emittedPaste.push(data);
+			});
+
+			processInput(injection);
+			await wait(5);
+
+			assert.deepStrictEqual(emittedPaste, ["abc\x1b[201~\x1b[1;5Ctail"]);
+			assert.deepStrictEqual(emittedSequences, []);
+
+			for (let split = 1; split < injection.length; split++) {
+				buffer.clear();
+				emittedSequences.length = 0;
+				emittedPaste.length = 0;
+				processInput(injection.slice(0, split));
+				processInput(injection.slice(split));
+				await wait(5);
+				assert.deepStrictEqual(emittedPaste, ["abc\x1b[201~\x1b[1;5Ctail"], `split at ${split}`);
+				assert.deepStrictEqual(emittedSequences, [], `split at ${split}`);
 			}
 		});
 
@@ -622,7 +774,7 @@ describe("StdinBuffer", () => {
 			}
 		});
 
-		it("reassembles a large paste delivered in many small chunks", () => {
+		it("reassembles a large paste delivered in many small chunks", async () => {
 			const content = `${"x".repeat(2_000_000)}\x1b[31m${"y".repeat(2_000_000)}\nline2`;
 			const start = performance.now();
 			processInput("\x1b[200~");
@@ -630,6 +782,7 @@ describe("StdinBuffer", () => {
 				processInput(content.slice(i, i + 256));
 			}
 			processInput("\x1b[201~");
+			await waitForPasteSettle();
 			assert.ok(performance.now() - start < 2_000, "chunked paste scanning must stay linear");
 			assert.deepStrictEqual(emittedPaste, [content]);
 			assert.deepStrictEqual(emittedSequences, []);

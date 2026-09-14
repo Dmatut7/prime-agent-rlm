@@ -499,10 +499,26 @@ interface ParsedModifyOtherKeysSequence {
 let _lastEventType: KeyEventType = "press";
 
 /**
+ * Key sequences are complete, short escape sequences (StdinBuffer emits one per
+ * event). Anything else - pasted text, a bracketed paste payload - is data, not a
+ * key event.
+ */
+function isSingleEscapeSequence(data: string): boolean {
+	return data.length > 0 && data.length <= 32 && data.charCodeAt(0) === 0x1b;
+}
+
+/**
  * Check if the last parsed key event was a key release.
  * Only meaningful when Kitty keyboard protocol with flag 2 is active.
  */
 export function isKeyRelease(data: string): boolean {
+	// Only a single escape sequence can be a key event: a longer sequence is bulk
+	// text (a paste from a terminal without bracketed paste) that merely contains
+	// a pattern like ":3F" (e.g. bluetooth MAC addresses like "90:62:3F:A5").
+	if (!isSingleEscapeSequence(data)) {
+		return false;
+	}
+
 	// Don't treat bracketed paste content as key release, even if it contains
 	// patterns like ":3F" (e.g., bluetooth MAC addresses like "90:62:3F:A5").
 	// Terminal.ts re-wraps paste content with bracketed paste markers before
@@ -531,6 +547,11 @@ export function isKeyRelease(data: string): boolean {
  * Only meaningful when Kitty keyboard protocol with flag 2 is active.
  */
 export function isKeyRepeat(data: string): boolean {
+	// Only a single escape sequence can be a key event. See isKeyRelease().
+	if (!isSingleEscapeSequence(data)) {
+		return false;
+	}
+
 	// Don't treat bracketed paste content as key repeat, even if it contains
 	// patterns like ":2F". See isKeyRelease() for details.
 	if (data.includes("\x1b[200~")) {

@@ -1,11 +1,16 @@
 import { getKeybindings } from "../keybindings.js";
 import { decodeKittyPrintable } from "../keys.js";
 import { KillRing } from "../kill-ring.js";
+import { BULK_TEXT_MIN_RUN } from "../stdin-buffer.js";
 import { type Component, CURSOR_MARKER, type Focusable } from "../tui.js";
 import { UndoStack } from "../undo-stack.js";
 import { getSegmenter, isPunctuationChar, isWhitespaceChar, sliceByColumn, visibleWidth } from "../utils.js";
 
 const segmenter = getSegmenter();
+
+/** Bracketed paste markers as sent by the terminal and re-wrapped by terminal.ts. */
+const PASTE_START = "\x1b[200~";
+const PASTE_END = "\x1b[201~";
 
 interface InputState {
 	value: string;
@@ -45,29 +50,28 @@ export class Input implements Component, Focusable {
 	}
 
 	handleInput(data: string): void {
-		if (data.includes("\x1b[200~")) {
+		if (data.includes(PASTE_START)) {
 			this.isInPaste = true;
 			this.pasteBuffer = "";
-			data = data.replace("\x1b[200~", "");
+			data = data.replace(PASTE_START, "");
 		}
 
 		if (this.isInPaste) {
 			this.pasteBuffer += data;
 
-			const endIndex = this.pasteBuffer.indexOf("\x1b[201~");
-			if (endIndex !== -1) {
-				const pasteContent = this.pasteBuffer.substring(0, endIndex);
-
-				this.handlePaste(pasteContent);
-
-				this.isInPaste = false;
-
-				const remaining = this.pasteBuffer.substring(endIndex + 6); // 6 = length of \x1b[201~
-				this.pasteBuffer = "";
-				if (remaining) {
-					this.handleInput(remaining);
-				}
+			// The paste ends only at the end marker that ends the buffered bytes.
+			// Pasted bytes carry no escaping: content copied out of a terminal can
+			// contain the marker itself, and everything that followed such a marker
+			// inside the same paste is text, never key input.
+			if (!this.pasteBuffer.endsWith(PASTE_END)) {
+				return;
 			}
+
+			const pasteContent = this.pasteBuffer.slice(0, -PASTE_END.length);
+			this.isInPaste = false;
+			this.pasteBuffer = "";
+
+			this.handlePaste(pasteContent);
 			return;
 		}
 
@@ -183,12 +187,24 @@ export class Input implements Component, Focusable {
 
 		// Regular character input - accept printable characters including Unicode,
 		// but reject control characters (C0: 0x00-0x1F, DEL: 0x7F, C1: 0x80-0x9F)
-		const hasControlChars = [...data].some((ch) => {
+		const isControl = (ch: string): boolean => {
 			const code = ch.charCodeAt(0);
 			return code < 32 || code === 0x7f || (code >= 0x80 && code <= 0x9f);
-		});
+		};
+		const hasControlChars = [...data].some(isControl);
 		if (!hasControlChars) {
 			this.insertCharacter(data);
+			return;
+		}
+		// Bulk text (a paste from a terminal without bracketed paste) carries line
+		// breaks and other control bytes: insert the text with the control bytes
+		// removed instead of dropping the whole sequence. Sequences that start with
+		// a control byte (escape remnants) are still ignored.
+		if (data.length >= BULK_TEXT_MIN_RUN && !isControl(data.charAt(0))) {
+			const printable = [...data].filter((ch) => !isControl(ch)).join("");
+			if (printable.length > 0) {
+				this.insertCharacter(printable);
+			}
 		}
 	}
 

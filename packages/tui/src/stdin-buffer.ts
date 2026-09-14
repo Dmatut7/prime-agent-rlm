@@ -24,6 +24,15 @@ const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
 
 /**
+ * Length at or above which a printable run is delivered as one bulk sequence.
+ * Shorter runs stay one character per sequence so typing keeps per-key events.
+ */
+export const BULK_TEXT_MIN_RUN = 32;
+
+/** Upper bound on the length of a single bulk text sequence. */
+export const BULK_TEXT_MAX_SEQUENCE = 64 * 1024;
+
+/**
  * Check if a string is a complete escape sequence or needs more data
  */
 function isCompleteSequence(data: string): "complete" | "incomplete" | "not-escape" {
@@ -168,6 +177,35 @@ function parseUnmodifiedKittyPrintableCodepoint(sequence: string): number | unde
 	return codepoint >= 32 ? codepoint : undefined;
 }
 
+/**
+ * Deliver text as sequences. Short runs stay one character per sequence (typing
+ * must remain per-key); long runs are bulk input - a paste from a terminal
+ * without bracketed paste, the tail of an oversized paste, or a pipe - and are
+ * delivered as a few large sequences so the consumer inserts them in one pass
+ * instead of re-copying the whole line once per character.
+ *
+ * Newlines belong to a long run: a multi-line paste inserted line by line makes
+ * the consumer rebuild its whole text per line. A leading newline still goes out
+ * on its own, so a bulk sequence never starts with one (consumers treat a
+ * sequence that starts with a newline as a single newline key).
+ */
+function pushTextRun(sequences: string[], run: string): void {
+	if (run.length < BULK_TEXT_MIN_RUN) {
+		for (let i = 0; i < run.length; i++) {
+			sequences.push(run[i]!);
+		}
+		return;
+	}
+	let start = 0;
+	while (start < run.length && run[start] === "\n") {
+		sequences.push("\n");
+		start++;
+	}
+	for (let i = start; i < run.length; i += BULK_TEXT_MAX_SEQUENCE) {
+		sequences.push(run.slice(i, i + BULK_TEXT_MAX_SEQUENCE));
+	}
+}
+
 function extractCompleteSequences(buffer: string): { sequences: string[]; remainder: string } {
 	const sequences: string[] = [];
 	let pos = 0;
@@ -210,8 +248,23 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 				runEnd = buffer.length;
 			}
 			const run = buffer.slice(pos, runEnd);
+			// Control bytes carry key semantics, so they stay one sequence each
+			// (newlines are handled inside `pushTextRun`: part of text in a long
+			// run, their own sequence in a short one).
+			let textStart = 0;
 			for (let i = 0; i < run.length; i++) {
+				const code = run.charCodeAt(i);
+				if (code >= 32 || code === 10) {
+					continue;
+				}
+				if (i > textStart) {
+					pushTextRun(sequences, run.slice(textStart, i));
+				}
 				sequences.push(run[i]!);
+				textStart = i + 1;
+			}
+			if (textStart < run.length) {
+				pushTextRun(sequences, run.slice(textStart));
 			}
 			pos = runEnd;
 		}
@@ -222,6 +275,13 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 
 export const PASTE_TIMEOUT_MS = 30_000;
 export const PASTE_MAX_BYTES = 8 * 1024 * 1024;
+/**
+ * Idle time after the last paste byte before the paste is closed (default: 20ms).
+ * The terminator is indistinguishable from an end marker inside the pasted bytes,
+ * so only a quiet stream says the paste is over; everything received up to that
+ * point is delivered as paste text.
+ */
+export const PASTE_SETTLE_MS = 20;
 
 export type StdinBufferOptions = {
 	/**
@@ -230,12 +290,24 @@ export type StdinBufferOptions = {
 	 */
 	timeout?: number;
 	/**
-	 * Idle time without stdin chunks to wait for `201~` after entering paste mode.
-	 * Missing terminator emits the buffer as one atomic paste.
+	 * Idle time without stdin chunks to wait for `201~` after entering paste mode
+	 * when no end marker has been seen at all. Missing terminator emits the buffer
+	 * as one atomic paste.
 	 */
 	pasteTimeoutMs?: number;
-	/** Maximum UTF-8 byte length of `pasteBuffer` before aborting paste mode. */
+	/**
+	 * Maximum UTF-8 byte length of one paste part. Reaching it emits the bytes
+	 * received so far as a paste event and keeps paste mode open, so the rest of
+	 * the paste is still delivered as paste text instead of key input.
+	 */
 	pasteMaxBytes?: number;
+	/**
+	 * Idle time after the last paste byte before the paste is closed (default:
+	 * 20ms). An end marker inside the pasted bytes looks exactly like the
+	 * terminator, so the paste ends when its stream goes quiet rather than at the
+	 * first marker; bytes received up to then are delivered as paste text.
+	 */
+	pasteSettleMs?: number;
 };
 
 export type StdinBufferEventMap = {
@@ -275,9 +347,11 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	private buffer: string = "";
 	private timeout: ReturnType<typeof setTimeout> | null = null;
 	private pasteWatchdog: ReturnType<typeof setTimeout> | null = null;
+	private pasteSettleTimer: ReturnType<typeof setTimeout> | null = null;
 	private readonly timeoutMs: number;
 	private readonly pasteTimeoutMs: number;
 	private readonly pasteMaxBytes: number;
+	private readonly pasteSettleMs: number;
 	private pasteMode: boolean = false;
 	// Paste content is kept as chunks and joined once on completion. Each
 	// append only scans the new chunk plus `pastePending` (a trailing partial
@@ -288,6 +362,8 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	private pasteLength: number = 0;
 	private pasteBufferBytes: number = 0;
 	private pastePending: string = "";
+	/** An end marker was seen; the paste closes once the stream goes quiet. */
+	private pasteTerminated: boolean = false;
 	private pendingKittyPrintableCodepoint: number | undefined;
 
 	constructor(options: StdinBufferOptions = {}) {
@@ -295,6 +371,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.timeoutMs = options.timeout ?? 10;
 		this.pasteTimeoutMs = options.pasteTimeoutMs ?? PASTE_TIMEOUT_MS;
 		this.pasteMaxBytes = options.pasteMaxBytes ?? PASTE_MAX_BYTES;
+		this.pasteSettleMs = options.pasteSettleMs ?? PASTE_SETTLE_MS;
 	}
 
 	public process(data: string | Buffer): void {
@@ -399,19 +476,21 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		const window = this.pastePending.length === 0 ? chunk : this.pastePending + chunk;
 		const windowStart = this.pasteLength - window.length;
 
-		const endIndex = window.indexOf(BRACKETED_PASTE_END);
-		if (endIndex !== -1) {
-			const absoluteEnd = windowStart + endIndex;
-			const content = this.joinPasteChunks();
-			this.emitPasteAndContinue(
-				content.slice(0, absoluteEnd),
-				content.slice(absoluteEnd + BRACKETED_PASTE_END.length),
-			);
-			return;
+		// Pasted bytes carry no escaping, so an end marker inside the content is
+		// indistinguishable from the terminator: only the end of the paste's byte
+		// stream says which marker was the terminator. Remember that a marker was
+		// seen and let the stream go quiet before closing the paste - see
+		// `settlePaste`.
+		if (window.includes(BRACKETED_PASTE_END)) {
+			this.pasteTerminated = true;
 		}
 
 		if (this.pasteBufferBytes > this.pasteMaxBytes) {
-			this.finishPasteWithoutTerminator();
+			// Over the part budget: emit what arrived as paste text and keep paste
+			// mode open. Leaving paste mode here would send the rest of the paste
+			// down the key path (one insert per character, executed escape
+			// sequences) - the exact shape this file exists to prevent.
+			this.flushPastePart();
 			return;
 		}
 
@@ -426,8 +505,76 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		}
 
 		this.pastePending = this.trailingPartialPasteMarker(window);
-		// Idle timeout: each chunk proves the paste is still flowing.
+
+		this.armPasteCloseTimer();
+	}
+
+	/**
+	 * Arm the timer that closes the paste. With a terminator in hand the paste
+	 * ends when the stream goes quiet; without one, a paste whose terminator never
+	 * arrives is closed after pasteTimeoutMs (each chunk proves a slow paste is
+	 * still flowing).
+	 */
+	private armPasteCloseTimer(): void {
+		if (this.pasteTerminated) {
+			// The terminator is somewhere in the bytes we hold, but more of the
+			// paste may still be in flight (a marker inside the content looks the
+			// same). Close the paste only after the stream goes quiet, so no byte
+			// that arrived while the terminal was writing can reach the key parser.
+			this.armPasteSettleTimer();
+			return;
+		}
 		this.armPasteWatchdog();
+	}
+
+	/**
+	 * Emit the bytes received so far as one paste event and stay in paste mode.
+	 * A trailing partial-marker prefix is kept back so a terminator split across
+	 * the flush boundary is still recognized; its bytes are emitted with a later
+	 * part, so no byte is emitted twice.
+	 */
+	private flushPastePart(): void {
+		const content = this.joinPasteChunks();
+		// Hold back a trailing complete terminator as well as a partial one: it may
+		// be the terminator (strip it once the paste closes) or content (an earlier
+		// marker stays part of the text), and `settlePaste` decides with the same
+		// last-marker rule it uses for the rest of the paste.
+		let keep = this.pastePending.length > 0 && this.pastePending.length <= 8 ? this.pastePending : "";
+		if (content.endsWith(BRACKETED_PASTE_END)) {
+			keep = BRACKETED_PASTE_END + keep;
+		}
+		const emit = keep.length > 0 ? content.slice(0, content.length - keep.length) : content;
+		this.pasteChunks = keep.length > 0 ? [keep] : [];
+		this.pasteLength = keep.length;
+		this.pasteBufferBytes = keep.length > 0 ? Buffer.byteLength(keep, "utf8") : 0;
+		if (emit.length > 0) {
+			this.emit("paste", emit);
+		}
+		this.armPasteCloseTimer();
+	}
+
+	/**
+	 * Close a paste whose byte stream has gone quiet after an end marker was seen.
+	 * The last complete marker is taken as the terminator (an earlier one is
+	 * content the clipboard contained), and everything received - later bytes
+	 * included - is emitted as paste text, so no byte of the paste can reach the
+	 * key parser. Bytes that arrive after this point are fresh input.
+	 */
+	private settlePaste(): void {
+		this.pasteSettleTimer = null;
+		if (!this.pasteMode) {
+			return;
+		}
+		const content = this.joinPasteChunks();
+		const lastEnd = content.lastIndexOf(BRACKETED_PASTE_END);
+		const stripped =
+			lastEnd === -1 ? content : content.slice(0, lastEnd) + content.slice(lastEnd + BRACKETED_PASTE_END.length);
+		if (stripped.length === 0) {
+			// Nothing but the terminator: close the paste without an empty event.
+			this.discardPasteMode();
+			return;
+		}
+		this.emitPasteAndContinue(stripped, "");
 	}
 
 	private trailingPartialPasteMarker(window: string): string {
@@ -462,6 +609,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.pasteLength = 0;
 		this.pasteBufferBytes = 0;
 		this.pastePending = "";
+		this.pasteTerminated = false;
 	}
 
 	private finishPasteWithoutTerminator(): void {
@@ -503,14 +651,37 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		}
 	}
 
+	private armPasteSettleTimer(): void {
+		this.clearPasteSettleTimer();
+		this.pasteSettleTimer = setTimeout(() => {
+			this.settlePaste();
+		}, this.pasteSettleMs);
+	}
+
+	private clearPasteSettleTimer(): void {
+		if (this.pasteSettleTimer) {
+			clearTimeout(this.pasteSettleTimer);
+			this.pasteSettleTimer = null;
+		}
+	}
+
 	private clearPasteTimers(): void {
 		this.clearPasteWatchdog();
+		this.clearPasteSettleTimer();
 	}
 
 	private emitDataSequence(sequence: string): void {
-		const rawCodepoint = sequence.length === 1 ? sequence.codePointAt(0) : undefined;
-		if (rawCodepoint !== undefined && rawCodepoint === this.pendingKittyPrintableCodepoint) {
+		const pending = this.pendingKittyPrintableCodepoint;
+		if (pending !== undefined && sequence.length > 0 && sequence.codePointAt(0) === pending) {
+			// A raw printable char that repeats the preceding Kitty CSI-u printable
+			// event is dropped - whether it arrives alone (typing) or as the head of
+			// a bulk text sequence (paste).
 			this.pendingKittyPrintableCodepoint = undefined;
+			sequence = sequence.slice(String.fromCodePoint(pending).length);
+			if (sequence.length === 0) {
+				return;
+			}
+			this.emit("data", sequence);
 			return;
 		}
 

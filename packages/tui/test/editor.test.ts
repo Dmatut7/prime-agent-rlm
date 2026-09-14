@@ -3955,4 +3955,87 @@ describe("Editor component", () => {
 			assert.strictEqual(editor.getText(), "hello");
 		});
 	});
+
+	describe("bracketed paste content", () => {
+		function attach(editor: Editor, stdin: StdinBuffer): void {
+			stdin.on("data", (sequence) => {
+				editor.handleInput(sequence);
+			});
+			stdin.on("paste", (content) => {
+				editor.handleInput(`\x1b[200~${content}\x1b[201~`);
+			});
+		}
+
+		it("inserts bytes after an end marker inside a paste instead of running them as keys", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			editor.handleInput("ab");
+
+			// Same payload terminal.ts delivers for a paste whose content holds a
+			// literal end marker followed by an escape sequence (ctrl+right when
+			// interpreted as key input).
+			editor.handleInput("\x1b[200~abc\x1b[201~\x1b[1;5Ctail\x1b[201~");
+
+			// Everything is text; the escape bytes are dropped by the existing
+			// control-character filter, and the cursor stays where the insert left it.
+			assert.strictEqual(editor.getText(), "ababc[201~[1;5Ctail");
+			assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 19 });
+		});
+
+		it("keeps the tail of an injected paste as text when it arrives through StdinBuffer", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const stdin = new StdinBuffer({ timeout: 10 });
+			attach(editor, stdin);
+
+			stdin.process("\x1b[200~abc\x1b[201~\x1b[1;5Ctail\x1b[201~");
+			await new Promise((resolve) => setTimeout(resolve, 60));
+
+			assert.strictEqual(editor.getText(), "abc[201~[1;5Ctail");
+			assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 17 });
+		});
+
+		it("inserts a multi-line non-bracketed paste as one atomic edit", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const stdin = new StdinBuffer({ timeout: 10 });
+			attach(editor, stdin);
+
+			let changes = 0;
+			editor.onChange = () => {
+				changes += 1;
+			};
+
+			const text = `${"abcdefghijklmnopqrstuvwxyz 0123456789\n".repeat(20)}end`;
+			const start = performance.now();
+			stdin.process(text);
+			const elapsed = performance.now() - start;
+
+			assert.strictEqual(editor.getText(), text);
+			assert.strictEqual(changes, 1);
+			assert.ok(elapsed < 3_000, `multi-line bulk input took ${elapsed.toFixed(0)}ms`);
+
+			editor.handleInput("\x1b[45;5u"); // Ctrl+- (undo)
+			assert.strictEqual(editor.getText(), "");
+		});
+
+		it("inserts a large non-bracketed paste in bulk instead of one character at a time", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const stdin = new StdinBuffer({ timeout: 10 });
+			attach(editor, stdin);
+
+			let changes = 0;
+			editor.onChange = () => {
+				changes += 1;
+			};
+
+			const text = "x".repeat(200_000);
+			const start = performance.now();
+			stdin.process(text);
+			const elapsed = performance.now() - start;
+
+			assert.strictEqual(editor.getText(), text);
+			// One insert per bulk sequence, not one per character (which used to
+			// re-copy the whole line and to rebuild the host's expanded text).
+			assert.ok(changes <= 8, `expected bulk insertion, saw ${changes} onChange calls`);
+			assert.ok(elapsed < 3_000, `200k characters took ${elapsed.toFixed(0)}ms`);
+		});
+	});
 });

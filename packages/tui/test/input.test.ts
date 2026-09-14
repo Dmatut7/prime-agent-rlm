@@ -557,4 +557,18 @@ describe("Input component", () => {
 			assert.strictEqual(input.getValue(), "");
 		});
 	});
+
+	describe("bracketed paste content", () => {
+		it("keeps bytes after an end marker inside a paste as text, not as keys", () => {
+			const input = new Input();
+
+			input.handleInput("ab");
+			input.handleInput("\x1b[200~abc\x1b[201~\x1b[1;5Ctail\x1b[201~");
+
+			// No truncation and no key handling: the escape byte inside the pasted
+			// content is passed through as text by this component.
+			assert.strictEqual(input.getValue(), "ababc\x1b[201~\x1b[1;5Ctail");
+			assert.strictEqual(input.getCursor(), "ababc\x1b[201~\x1b[1;5Ctail".length);
+		});
+	});
 });

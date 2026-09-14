@@ -3,6 +3,8 @@ import { describe, it } from "node:test";
 import {
 	decodeKittyPrintable,
 	decodePrintableKey,
+	isKeyRelease,
+	isKeyRepeat,
 	Key,
 	matchesKey,
 	parseKey,
@@ -595,5 +597,22 @@ describe("parseKey", () => {
 			assert.equal(matchesKey("\x1b\x1bOa", "ctrl+alt+up"), true);
 			assert.equal(matchesKey("\x1b\x1bOb", "ctrl+alt+down"), true);
 		});
+	});
+});
+
+describe("key event type detection", () => {
+	it("reads a single escape sequence as a key release or repeat", () => {
+		assert.equal(isKeyRelease("\x1b[1089::99;5:3u"), true);
+		assert.equal(isKeyRepeat("\x1b[1089:1057:99;6:2u"), true);
+		assert.equal(isKeyRelease("\x1b[1089::99;5:6u"), false);
+	});
+
+	it("does not read bulk text that merely contains a release pattern as a key event", () => {
+		// Pasted text can contain patterns like ":3F" (bluetooth MAC addresses) or
+		// ":2F"; bulk input is delivered as one long sequence, and it is data.
+		const macAddressLine = `90:62:3F:A5 wiped from ${"the log ".repeat(8)}`;
+		assert.equal(isKeyRelease(macAddressLine), false);
+		const repeatLikeText = `${"a:2F ".repeat(12)}done`;
+		assert.equal(isKeyRepeat(repeatLikeText), false);
 	});
 });
