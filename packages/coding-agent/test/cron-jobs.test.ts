@@ -542,6 +542,80 @@ describe("AgentCronJobStore", () => {
 		expect(storedJob(artifactPath, job.id)).toMatchObject({ status: "cancelled" });
 	});
 
+	it("migrates a legacy copy whose stamp is ahead of this process's clock", () => {
+		const root = makeTempDir(tempDirs);
+		const artifactDir = join(root, "session-artifacts", "session-1");
+		const artifactPath = join(artifactDir, SESSION_SCHEDULED_JOBS_FILENAME);
+		const artifacts = AgentCronJobStore.forSessionArtifacts();
+		artifacts.registerSessionArtifact("session-1", artifactDir);
+		// Another writer's clock ran ahead: both copies sit in the future of ours.
+		const ahead = new Date(start.getTime() + 25 * 60_000);
+		const job = artifacts.create({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: join(root, "sessions", "session-1.jsonl"),
+			cwd: root,
+			scheduleText: "every 5m",
+			prompt: "in flight when the clock stepped back",
+			now: ahead,
+		});
+		const legacyPath = join(root, "cron-jobs.json");
+		// The legacy copy is the same instant, and it carries an in-flight dispatch the
+		// migration has to mark interrupted.
+		writeStoreFile(
+			legacyPath,
+			[{ ...job, updatedAt: ahead.toISOString() }],
+			[{ id: "dispatch-1", jobId: job.id, claimedAt: ahead.toISOString(), scheduledFor: ahead.toISOString() }],
+		);
+
+		// The migration runs on a clock that stepped back behind both copies (NTP after
+		// sleep, a container sharing its host's agent directory). Its writes carry the
+		// recovered and cancelled copy, so they must not read as older than what is there.
+		const stored = migrateLegacyCronJobsToSessionArtifacts(legacyPath, {
+			now: start,
+			isSessionOwned: () => false,
+		});
+
+		expect(stored).toBe(1);
+		expect(storedJob(artifactPath, job.id)).toMatchObject({
+			status: "cancelled",
+			lastError: "Interrupted before scheduled operation completion",
+		});
+	});
+
+	it("keeps run bookkeeping when the clock steps back behind the stored copy", () => {
+		const storePath = makeStorePath(tempDirs);
+		const store = new AgentCronJobStore(storePath);
+		const job = store.create({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: "/tmp/session.jsonl",
+			cwd: "/tmp/project",
+			scheduleText: "every 5m",
+			prompt: "poll status",
+			now: start,
+		});
+		// Another writer's clock ran ahead, and the dispatch below is claimed at that same
+		// future instant.
+		const ahead = new Date(start.getTime() + 25 * 60_000);
+		store.recordRunResult(job.id, { now: ahead });
+		const [dispatch] = store.claimDue(new Date(ahead.getTime() + 5 * 60_000), ahead);
+		if (!dispatch) {
+			throw new Error("Expected a claimed dispatch");
+		}
+
+		// The clock then steps back, and recording the run result must still land: its stamp
+		// must not regress behind the copy it replaced, or the bookkeeping reads as stale to
+		// whichever copy a newest-wins merge compares it with.
+		const behind = new Date(start.getTime() + 5 * 60_000);
+		const recorded = store.recordDispatchResult(dispatch.id, { now: behind, outcome: "ran" });
+
+		expect(recorded).toMatchObject({ runCount: 2, lastRunAt: behind.toISOString() });
+		const stored = storedJob(storePath, job.id);
+		expect(stored).toMatchObject({ runCount: 2, lastRunAt: behind.toISOString() });
+		expect(Date.parse(stored.updatedAt)).toBeGreaterThan(ahead.getTime());
+	});
+
 	it("keeps one persistent heartbeat per active session", () => {
 		const store = new AgentCronJobStore(makeStorePath(tempDirs));
 		const first = store.createHeartbeat({

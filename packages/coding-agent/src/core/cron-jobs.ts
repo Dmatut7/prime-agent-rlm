@@ -800,7 +800,7 @@ export class AgentCronJobStore {
 						status: job.schedule.kind === "once" ? "completed" : job.status,
 						nextRunAt: nextRunAt?.toISOString(),
 						lastSkippedAt: now.toISOString(),
-						updatedAt: now.toISOString(),
+						updatedAt: updatedAtForMutation(now, job),
 					};
 					return updated;
 				}
@@ -810,7 +810,7 @@ export class AgentCronJobStore {
 					lastRunAt: now.toISOString(),
 					lastError: result.error === undefined ? undefined : errorMessage(result.error),
 					runCount: job.runCount + 1,
-					updatedAt: now.toISOString(),
+					updatedAt: updatedAtForMutation(now, job),
 				};
 				return updated;
 			});
@@ -1098,7 +1098,7 @@ export function migrateLegacyCronJobsToSessionArtifacts(
 		) {
 			return job;
 		}
-		return withoutNextRunAt({ ...job, status: "cancelled", updatedAt: now.toISOString() });
+		return withoutNextRunAt({ ...job, status: "cancelled", updatedAt: updatedAtForMutation(now, job) });
 	});
 	if (jobs.length === 0) {
 		return 0;
@@ -1937,7 +1937,7 @@ function recoverInterruptedInState(
 			...job,
 			status: job.schedule.kind === "once" ? ("completed" as const) : job.status,
 			lastError: "Interrupted before scheduled operation completion",
-			updatedAt: now.toISOString(),
+			updatedAt: updatedAtForMutation(now, job),
 		};
 		recovered.push(next);
 		return next;

@@ -10,6 +10,8 @@ import {
 	writeSync,
 } from "node:fs";
 import { dirname } from "node:path";
+import { performance } from "node:perf_hooks";
+import { sleepSync } from "../utils/sleep.js";
 
 /**
  * Append-only JSONL event log: the shared crash-safety substrate under the
@@ -21,18 +23,49 @@ import { dirname } from "node:path";
  * (rejected by the consumer's parser AND unterminated: a crashed writer's
  * in-progress append) and fails closed on any malformed interior line.
  * Repair happens only on append, never on read — a viewer may replay a live
- * writer's log. EVERY unterminated tail is blanked in place, even one that
- * parses as JSON: completing it with a newline would turn a line a strict
- * consumer parser rejects into permanent fail-closed interior poison, and
- * deleting it would cut out a concurrent writer's complete record. Unifying
- * consumers keeps the union of their safety behaviors.
+ * writer's log. EVERY unterminated tail a dead writer left is blanked in
+ * place, even one that parses as JSON: completing it with a newline would turn
+ * a line a strict consumer parser rejects into permanent fail-closed interior
+ * poison, and deleting it would cut out a concurrent writer's complete record.
+ * A tail a LIVE writer is still appending is never blanked: the repair watches
+ * the tail for quiescence first, and refuses the append when it cannot tell a
+ * crashed writer from a slow one. Unifying consumers keeps the union of their
+ * safety behaviors.
  */
+
+/**
+ * Idle window by which a torn final line is judged to belong to a crashed
+ * writer rather than to one still writing it (`tailQuiescenceMs`).
+ *
+ * The window has to outlast the gaps between the syscalls of one append, which
+ * are sub-millisecond for a single writer, and stay short enough that the first
+ * append after a crash is not delayed noticeably. Note the assumption this
+ * class already documents: a compliant append is ONE write, so a tail that is
+ * still growing is a writer this substrate cannot reason about - a foreign
+ * appender, or an append split by a short write.
+ */
+export const TAIL_QUIESCENCE_MS = 25;
+
+/** How often the tail is probed while it is being watched, so progress is seen inside one window. */
+const TAIL_PROBE_SLICE_MS = 5;
+
+/**
+ * How many quiescence windows a tail may keep progressing for before the repair
+ * gives up on it: a writer that is still appending after this long is live, and
+ * blanking its bytes would destroy a record it is still writing.
+ */
+const TAIL_OBSERVATION_WINDOWS = 4;
 
 export interface EventLogOptions {
 	/** Fail closed beyond these bounds on every full read, including the repair path. */
 	maxBytes?: number;
 	maxRecords?: number;
 	log?: (message: string) => void;
+	/**
+	 * Idle window a torn final line must stay unchanged for before the repair
+	 * blanks it (default: {@link TAIL_QUIESCENCE_MS}).
+	 */
+	tailQuiescenceMs?: number;
 }
 
 /** Bounded read through the descriptor: the size check and the allocation see the same fd, so a concurrent grow cannot bypass the bound. */
@@ -65,6 +98,32 @@ function writeAllSync(fd: number, contents: Buffer, position: number): void {
 		}
 		offset += written;
 	}
+}
+
+/** The blanked range: `keep` is its first byte and `end` the offset just past its last. */
+type TailRepair = { keep: number; end: number };
+
+/** Whether the file ends on an unterminated tail: nothing after its last newline. */
+function hasTornTail(fd: number, size: number): boolean {
+	if (size === 0) {
+		return false;
+	}
+	const lastByte = Buffer.alloc(1);
+	return readSync(fd, lastByte, 0, 1, size - 1) === 1 && lastByte[0] !== 0x0a;
+}
+
+/** Whether [position, position + length) reads back as the blanks the repair wrote. */
+function rangeIsBlank(fd: number, position: number, length: number): boolean {
+	const buffer = Buffer.alloc(length);
+	let read = 0;
+	while (read < length) {
+		const bytesRead = readSync(fd, buffer, read, length - read, position + read);
+		if (bytesRead <= 0) {
+			return false;
+		}
+		read += bytesRead;
+	}
+	return buffer.every((byte) => byte === 0x20);
 }
 
 function serializeLine(event: unknown): string {
@@ -177,6 +236,17 @@ export class EventLog {
 	 * Readers need no change: `replaySync` trims each line, so blanked bytes are
 	 * skipped as whitespace, and the record appended after the fragment reads back
 	 * as its own line.
+	 *
+	 * What blanking must NOT do is destroy a record that is still being written.
+	 * The single-write append this class documents makes that unreachable for a
+	 * compliant writer, but a foreign appender (or an append split by a short
+	 * write) can leave a tail that is mid-record rather than dead. So the bytes
+	 * are blanked only after the tail has been observed UNCHANGED for a
+	 * quiescence window (`tailQuiescenceMs`), and the observed EOF — not a later
+	 * one — bounds the blanked range. A tail that is still growing is a live
+	 * writer's record: its bytes are left alone, a tail that has meanwhile ended
+	 * on a newline needs no repair at all, and a tail that keeps growing past the
+	 * observation budget refuses the append instead of gambling on it.
 	 */
 	private repairTailSync(): void {
 		const { maxBytes } = this.options;
@@ -196,26 +266,78 @@ export class EventLog {
 		// All offsets are BYTE offsets on raw buffers: string indices diverge
 		// from byte offsets as soon as any record carries multi-byte UTF-8,
 		// and a positional write takes bytes.
+		let outcome: TailRepair | "contended" | undefined;
 		try {
 			const fd = openSync(this.path, "r+");
 			try {
-				const lastByte = Buffer.alloc(1);
-				if (readSync(fd, lastByte, 0, 1, size - 1) !== 1 || lastByte[0] === 0x0a) return;
-				const contents = readAllSync(fd, maxBytes, this.path);
-				// `keep` is the byte just past the last newline we read, so
-				// [keep, contents.length) is the unterminated fragment.
-				const keep = contents.lastIndexOf(0x0a) + 1;
-				const torn = contents.length - keep;
-				// A concurrent complete append can close the tail between the probe
-				// and this read; then there is no fragment left to blank.
-				if (torn <= 0) return;
-				writeAllSync(fd, Buffer.alloc(torn, 0x20), keep);
-				this.options.log?.(`blanked torn final line (${torn} bytes)`);
+				outcome = this.repairObservedTail(fd, maxBytes);
 			} finally {
 				closeSync(fd);
 			}
 		} catch {
 			// Leave the tail for the reader's torn-line tolerance.
+			return;
 		}
+		if (outcome === "contended") {
+			// Appending would glue our record onto a tail a live writer still owns,
+			// and blanking it would destroy that writer's bytes. Refusing loses this
+			// append instead of the log: the caller can retry once the tail settles.
+			throw new Error(
+				`event log ${this.path}: the unterminated final line is still being appended; refusing to append`,
+			);
+		}
+		if (outcome !== undefined) {
+			this.options.log?.(`blanked torn final line (${outcome.end - outcome.keep} bytes)`);
+		}
+	}
+
+	/**
+	 * Watch the unterminated tail until it is either whole, quiescent, or clearly
+	 * live, and blank it only in the quiescent case.
+	 *
+	 * `undefined` means there was nothing to neutralize: the file ends on a
+	 * newline (a live writer completed its record, or another repair closed it).
+	 */
+	private repairObservedTail(fd: number, maxBytes: number | undefined): TailRepair | "contended" | undefined {
+		// A window of zero would blank a tail on sight, which is the behavior this
+		// observation exists to avoid.
+		const quiescenceMs = Math.max(1, this.options.tailQuiescenceMs ?? TAIL_QUIESCENCE_MS);
+		let observedSize = fstatSync(fd).size;
+		if (!hasTornTail(fd, observedSize)) return undefined;
+		const observationStart = performance.now();
+		let stableSince = observationStart;
+		const observationEnd = observationStart + quiescenceMs * TAIL_OBSERVATION_WINDOWS;
+		for (;;) {
+			const quiescentAt = stableSince + quiescenceMs;
+			const untilQuiescent = quiescentAt - performance.now();
+			if (untilQuiescent <= 0) break;
+			sleepSync(Math.min(untilQuiescent, TAIL_PROBE_SLICE_MS));
+			const currentSize = fstatSync(fd).size;
+			// A tail that now ends on a newline is not a fragment any more: a writer
+			// that was mid-record finished it, so its bytes are a readable record.
+			if (!hasTornTail(fd, currentSize)) return undefined;
+			if (currentSize !== observedSize) {
+				// The tail is still growing, so a live writer owns it. Restart the
+				// window; only bytes that stopped changing are a crashed writer's.
+				observedSize = currentSize;
+				stableSince = performance.now();
+				if (stableSince >= observationEnd) return "contended";
+			}
+		}
+		// The observed EOF, not a later one, bounds the range: bytes a writer
+		// appended after it are not ours to blank.
+		const contents = readAllSync(fd, maxBytes, this.path);
+		// A foreign truncation is the one way the file can be shorter than the tail
+		// this repair observed; blank at most what it actually holds.
+		const end = Math.min(observedSize, contents.length);
+		const keep = contents.lastIndexOf(0x0a, end - 1) + 1;
+		const torn = end - keep;
+		if (torn <= 0) return undefined;
+		writeAllSync(fd, Buffer.alloc(torn, 0x20), keep);
+		if (!rangeIsBlank(fd, keep, torn)) {
+			this.options.log?.(`torn final line (${torn} bytes) changed while it was being blanked`);
+			return undefined;
+		}
+		return { keep, end };
 	}
 }
