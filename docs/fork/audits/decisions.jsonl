@@ -36,3 +36,6 @@
 {"id": "V-2", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "新 venv 建好不复检就绪 ⇒ 不合格运行时也报 ready", "verified_by": "R6 读码 + 正控"}
 {"id": "V-3", "date": "2026-09-15", "severity": "P3", "status": "fixing", "commit": null, "title": "daemon 复用不看 buildId（传了不比也不记日志）⇒ build 后新 CLI 接旧 daemon，一个 daemon 可跑两个 build", "verified_by": "R6 读码（机制高置信、端到端 unverified）"}
 {"id": "V-4", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "!command 配置值缓存无 clear：auth.reload 后仍回旧值；Serper key 无兜底", "verified_by": "R6 实跑 + 正控（STALE=true）"}
+{"id": "TP-1", "date": "2026-09-15", "severity": "P3", "status": "fixing", "commit": null, "title": "工具白名单未知名静默过滤：一个错字母导致整套工具消失且零报错", "verified_by": "R6 活体复现 + 正控"}
+{"id": "TP-2", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "Anthropic convertTools 丢 $defs/根 anyOf ⇒ 模型可见契约与本地强制契约不一致", "verified_by": "R6 真请求捕获"}
+{"id": "TP-3", "date": "2026-09-15", "severity": "P3", "status": "fixing", "commit": null, "title": "必填 string 传 null 被静默捏造成 \"null\"/\"\"，工具带模型没给的参数执行", "verified_by": "R6 真模块复现"}
