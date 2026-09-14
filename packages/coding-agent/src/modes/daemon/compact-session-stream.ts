@@ -127,6 +127,31 @@ interface ToolCallParseState {
 	lastParseTime: number;
 }
 
+/**
+ * The accumulated-arguments buffer that a message caught mid tool call stands in for.
+ *
+ * A seed is a tool call the provider had already parsed, and the fragment-only deltas
+ * that follow carry only the bytes from that point on. The raw buffer the provider
+ * accumulated is not part of `ToolCall`, so it is rebuilt from the parsed value and
+ * re-opened: serializing closes every structure the raw buffer had left open, and those
+ * closing quotes and brackets are what the next fragments supply again. Trailing `"`,
+ * `}` and `]` therefore come off, which recovers the raw prefix whenever the stream was
+ * cut mid token - mid string, mid number, mid object - the case a random cut lands in.
+ * A seed whose buffer happened to end on a completed value loses those closers too, and
+ * either the following fragment supplies them again or the block ends and `toolcall_end`
+ * replaces the preview with the authoritative tool call. Only the mid-stream preview
+ * depends on this buffer; `lastParseTime: 0` makes the first fragment re-parse at once.
+ */
+function toolCallBufferFromArguments(args: Record<string, unknown> | undefined): string {
+	try {
+		return JSON.stringify(args ?? {}).replace(/["}\]]+$/, "");
+	} catch {
+		// A value the wire could not have carried (a cycle) has no recoverable buffer; starting
+		// empty is then exactly the old behavior.
+		return "";
+	}
+}
+
 export class CompactAssistantStreamReconstructor {
 	private readonly partialMessages = new Map<string, AssistantMessage>();
 	private readonly toolCallJson = new Map<string, ToolCallParseState>();
@@ -139,6 +164,25 @@ export class CompactAssistantStreamReconstructor {
 			...message,
 			content: message.content.map((block) => ({ ...block })),
 		});
+		// A seeded tool call is mid stream, so its already-parsed arguments are the
+		// start of the accumulator, not something to discard: the deltas that follow
+		// carry only the fragment. Dropping it (the state used to start at "") makes an
+		// attaching peer read `{}` - or a garbage parse - for every tool call in flight,
+		// until `toolcall_end`, with nothing on the wire to say the preview is wrong.
+		this.clearToolCallJson(activeSessionId);
+		message.content.forEach((block, contentIndex) => {
+			if (block.type !== "toolCall") return;
+			this.toolCallJson.set(
+				this.toolCallKey(activeSessionId, contentIndex),
+				this.toolCallStateFromArguments(block.arguments),
+			);
+		});
+	}
+
+	/** Accumulation state for a tool call whose raw buffer is known only through its parsed value. */
+	private toolCallStateFromArguments(args: Record<string, unknown> | undefined): ToolCallParseState {
+		const json = toolCallBufferFromArguments(args);
+		return { json, lastParsedLength: json.length, lastParseTime: 0 };
 	}
 
 	/** Whether a live partial message is currently tracked for the session. */
@@ -236,7 +280,10 @@ export class CompactAssistantStreamReconstructor {
 					content.arguments = delta.toolCallArguments;
 				} else {
 					const key = this.toolCallKey(delta.activeSessionId, event.contentIndex);
-					const state = this.toolCallJson.get(key) ?? { json: "", lastParsedLength: 0, lastParseTime: 0 };
+					// A seed can also arrive as a message_start whose content already holds a
+					// partial tool call, so a missing state is rebuilt from the arguments the
+					// block carries rather than started empty.
+					const state = this.toolCallJson.get(key) ?? this.toolCallStateFromArguments(content.arguments);
 					state.json += event.delta;
 					this.toolCallJson.set(key, state);
 					const now = Date.now();
@@ -276,6 +323,10 @@ export class CompactAssistantStreamReconstructor {
 
 	clear(activeSessionId: string): void {
 		this.partialMessages.delete(activeSessionId);
+		this.clearToolCallJson(activeSessionId);
+	}
+
+	private clearToolCallJson(activeSessionId: string): void {
 		for (const key of this.toolCallJson.keys()) {
 			if (key.startsWith(`${activeSessionId}:`)) {
 				this.toolCallJson.delete(key);

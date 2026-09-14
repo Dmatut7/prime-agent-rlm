@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 import { performance } from "node:perf_hooks";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { sleepSync } from "../src/utils/sleep.js";
 
 /**
@@ -36,6 +36,38 @@ describe("sleepSync", () => {
 
 		expect(elapsedMs).toBeGreaterThanOrEqual(25);
 		expect(elapsedMs).toBeLessThan(1_000);
+	});
+
+	/**
+	 * The blocking wait is the idle path, not the only path. A host that refuses
+	 * `Atomics.wait` on this thread (the constructor succeeds, the call throws) has to
+	 * fall back to something that still waits: the iteration cap is a backstop against a
+	 * clock that never advances, and reading it as the sleep's actual length turns every
+	 * caller's lock backoff into "retry immediately" - measured at 11-29ms for a
+	 * requested 200ms, at the price of 10000 thrown exceptions.
+	 */
+	it("still waits its delay on a host that refuses the blocking wait", () => {
+		const waitSpy = vi.spyOn(Atomics, "wait").mockImplementation(() => {
+			throw new Error("Atomics.wait is not permitted on this thread");
+		});
+		try {
+			const started = performance.now();
+			sleepSync(200);
+			const elapsedMs = performance.now() - started;
+
+			// Red today: ~11ms and 10000 refused calls.
+			expect(elapsedMs).toBeGreaterThanOrEqual(150);
+			expect(elapsedMs).toBeLessThan(2_000);
+			// One refused attempt per call, not one per loop iteration.
+			expect(waitSpy.mock.calls.length).toBeLessThanOrEqual(2);
+		} finally {
+			waitSpy.mockRestore();
+		}
+
+		// Positive control: with the blocking wait back, the sleep is still accurate.
+		const after = performance.now();
+		sleepSync(50);
+		expect(performance.now() - after).toBeGreaterThanOrEqual(40);
 	});
 
 	it("returns from a held-lock retry after the wall clock jumps backwards", () => {
