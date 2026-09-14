@@ -32,3 +32,7 @@
 {"id": "T-A", "date": "2026-09-15", "severity": "P2", "status": "fixed", "commit": "d3c627a62", "title": "cron/heartbeat LWW 用墙钟：落后时钟的写入被吃但报成功（模型收到假回执）", "verified_by": "R4-clock 探针 + 实现线 3 红→绿 + 母席复跑 170 项绿"}
 {"id": "T-C", "date": "2026-09-15", "severity": "P3", "status": "fixed", "commit": "d3c627a62", "title": "同步自旋无迭代上限：时钟回拨即死循环占满事件循环", "verified_by": "探针 6 秒不返回被 kill（两后端）→ 单调钟+Atomics.wait+10k 上限"}
 {"id": "R1", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "回退位置只活在内存 ⇒ 重启后静默回到回退前位置", "verified_by": "R4 复现 + 母席读码；修复线施工中"}
+{"id": "V-1", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "源码运行时内核仍用构建产物：改 prime-agent-runtime 的 Python 不重建 venv 且无提示", "verified_by": "R6 实跑（dist 哈希 vs 活源码哈希 + venv 后缀逐字命中）"}
+{"id": "V-2", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "新 venv 建好不复检就绪 ⇒ 不合格运行时也报 ready", "verified_by": "R6 读码 + 正控"}
+{"id": "V-3", "date": "2026-09-15", "severity": "P3", "status": "fixing", "commit": null, "title": "daemon 复用不看 buildId（传了不比也不记日志）⇒ build 后新 CLI 接旧 daemon，一个 daemon 可跑两个 build", "verified_by": "R6 读码（机制高置信、端到端 unverified）"}
+{"id": "V-4", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "!command 配置值缓存无 clear：auth.reload 后仍回旧值；Serper key 无兜底", "verified_by": "R6 实跑 + 正控（STALE=true）"}
