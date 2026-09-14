@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -115,6 +115,24 @@ function writeLedgerOutboxEntry(agentDir: string, ledgerFile: string, uploadedBy
 	);
 }
 
+/** Every path under `root`, relative to it: the shape a directory that gained nothing still has. */
+function listTree(root: string): string[] {
+	const found: string[] = [];
+	const walk = (dir: string): void => {
+		for (const entry of readdirSync(dir, { withFileTypes: true })) {
+			const child = join(dir, entry.name);
+			found.push(child.slice(root.length + 1));
+			if (entry.isDirectory()) {
+				walk(child);
+			}
+		}
+	};
+	if (existsSync(root)) {
+		walk(root);
+	}
+	return found.sort();
+}
+
 async function advanceTimersUntil(condition: () => boolean): Promise<void> {
 	for (let step = 0; step < 200 && !condition(); step += 1) {
 		await stat(new URL(import.meta.url));
@@ -134,11 +152,16 @@ describe("agent trace upload", () => {
 	let originalTraceBaseUrl: string | undefined;
 	let originalPrimeBaseUrl: string | undefined;
 	let originalAgentDir: string | undefined;
+	let originalDoNotTrack: string | undefined;
 
 	beforeEach(() => {
 		tempDir = mkdtempSync(join(tmpdir(), "agent-traces-test-"));
 		originalAgentDir = process.env[ENV_AGENT_DIR];
 		process.env[ENV_AGENT_DIR] = tempDir;
+		// The suite runs with DO_NOT_TRACK=1 (vitest config); these tests exercise the enabled
+		// path and opt out explicitly where that is the subject.
+		originalDoNotTrack = process.env.DO_NOT_TRACK;
+		process.env.DO_NOT_TRACK = "0";
 		originalTraceApiKey = process.env.PRIME_AGENT_TRACES_API_KEY;
 		originalPrimeApiKey = process.env.PRIME_API_KEY;
 		originalTraceBaseUrl = process.env.PRIME_AGENT_TRACES_BASE_URL;
@@ -152,6 +175,11 @@ describe("agent trace upload", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 		vi.useRealTimers();
+		if (originalDoNotTrack === undefined) {
+			delete process.env.DO_NOT_TRACK;
+		} else {
+			process.env.DO_NOT_TRACK = originalDoNotTrack;
+		}
 		if (originalAgentDir === undefined) {
 			delete process.env[ENV_AGENT_DIR];
 		} else {
@@ -1565,5 +1593,232 @@ describe("agent trace upload", () => {
 		expect(result.status).toBe("uploaded");
 		expect(calls).toHaveLength(1);
 		expect(calls[0]?.init.headers).toMatchObject({ Authorization: "Bearer inference-key" });
+	});
+
+	it("keeps a scheduled upload in the agent directory that installed the controller", async () => {
+		vi.useFakeTimers();
+		const sessionDir = join(tempDir, "sessions");
+		const session = writeSession(tempDir, sessionDir, "scheduled-scope-session");
+		const overtakingDir = join(tempDir, "scheduled-overtaking-dir");
+		mkdirSync(overtakingDir, { recursive: true });
+
+		const calls: FetchCall[] = [];
+		installAgentTraceUpload(session, {
+			authStorage: AuthStorage.inMemory({
+				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
+			}),
+			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
+			baseUrl: "https://api.example.test",
+			fetchFn: createFetchRecorder(calls),
+		});
+
+		session.appendMessage(createUserMessage("scheduled"));
+		// The fixture's agent directory is withdrawn before the debounce fires.
+		process.env[ENV_AGENT_DIR] = overtakingDir;
+		await advanceTimersUntil(() => calls.length === 1);
+		await vi.advanceTimersToNextTimerAsync();
+
+		expect(listTree(overtakingDir)).toEqual([]);
+		expect(readOutboxEntry(tempDir, session.getSessionFile()!)).toBeDefined();
+	});
+
+	it("strips git remote credentials from the trace header and the trace body alike", async () => {
+		const cwd = join(tempDir, "project");
+		const session = writeSession(cwd, join(tempDir, "sessions"), "token-remote-session");
+		const token = "ghp_R11TRACESECRET1234567890";
+		const remote = `https://x-access-token:${token}@github.com/acme/private-repo.git`;
+		session.appendGitState({ repoUrl: remote, commit: "deadbeef" });
+
+		const calls: FetchCall[] = [];
+		const result = await uploadAgentTraceFile({
+			sessionFile: session.getSessionFile(),
+			authStorage: AuthStorage.inMemory({
+				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
+			}),
+			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
+			baseUrl: "https://api.example.test",
+			fetchFn: createFetchRecorder(calls),
+			reloadConfig: false,
+		});
+
+		expect(result.status).toBe("uploaded");
+		expect(calls).toHaveLength(1);
+		const call = calls[0];
+		const headers = new Headers(call?.init.headers);
+		const sentHeaders = JSON.stringify(call?.init.headers);
+		const body = String(call?.init.body);
+
+		// Positive control: the capture works and the header still names the repository.
+		expect(headers.get("x-git-repo")).toBe("https://github.com/acme/private-repo.git");
+		expect(body).toContain("github.com/acme/private-repo.git");
+
+		for (const leaked of [token, "x-access-token", remote]) {
+			expect(headers.get("x-git-repo")).not.toContain(leaked);
+			expect(sentHeaders).not.toContain(leaked);
+			expect(body).not.toContain(leaked);
+		}
+
+		// Audit trail: the upload is recorded as having been changed, without the credential.
+		const log = readFileSync(getAgentTracesLogPath(), "utf8");
+		expect(log).toContain("redacted before upload:");
+		expect(log).toContain("URL userinfo from X-Git-Repo, the session body");
+		expect(log).not.toContain(token);
+	});
+
+	it("replaces a credential in the session body without breaking the JSONL", async () => {
+		const session = writeSession(tempDir, join(tempDir, "sessions"), "secret-body-session");
+		const secret = "sk-r11bodysecret0123456789abcdef";
+		session.appendMessage(createUserMessage(`export OPENAI_API_KEY=${secret}`));
+
+		const calls: FetchCall[] = [];
+		const result = await uploadAgentTraceFile({
+			sessionFile: session.getSessionFile(),
+			authStorage: AuthStorage.inMemory({
+				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
+			}),
+			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
+			baseUrl: "https://api.example.test",
+			fetchFn: createFetchRecorder(calls),
+			reloadConfig: false,
+		});
+
+		expect(result.status).toBe("uploaded");
+		const body = String(calls[0]?.init.body);
+		expect(body).not.toContain(secret);
+		expect(body).toContain("***redacted***");
+		// The credential is gone and the record is still a record.
+		for (const line of body.split("\n")) {
+			if (!line.trim()) continue;
+			expect(() => JSON.parse(line) as unknown).not.toThrow();
+		}
+		expect(readFileSync(getAgentTracesLogPath(), "utf8")).toContain("credential value(s)");
+	});
+
+	it("keeps upload bookkeeping in the agent directory the upload started in", async () => {
+		const startedDir = tempDir;
+		const overtakingDir = join(tempDir, "overtaking-agent-dir");
+		mkdirSync(overtakingDir, { recursive: true });
+		const session = writeSession(startedDir, join(startedDir, "sessions"), "scope-session");
+		const sessionFile = session.getSessionFile();
+		expect(sessionFile).toBeDefined();
+
+		// The agent directory changes while the request is in flight, the way a test fixture
+		// clearing PRIME_AGENT_CODING_AGENT_DIR or a tearing-down sandbox does.
+		const fetchFn: typeof fetch = async () => {
+			process.env[ENV_AGENT_DIR] = overtakingDir;
+			return new Response(JSON.stringify({ session_id: "scope", trace_id: "scope", bytes_stored: 1 }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		};
+
+		const result = await uploadAgentTraceFile({
+			sessionFile,
+			authStorage: AuthStorage.inMemory({
+				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
+			}),
+			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
+			baseUrl: "https://api.example.test",
+			fetchFn,
+			reloadConfig: false,
+		});
+
+		expect(result.status).toBe("uploaded");
+		// The directory that took over mid-upload gains nothing: no cursor, no log line.
+		expect(listTree(overtakingDir)).toEqual([]);
+		// Positive control: the cursor was written, in the directory the upload started in.
+		expect(readOutboxEntry(startedDir, sessionFile!)?.size).toBeGreaterThan(0);
+		const log = readFileSync(join(startedDir, "logs", "agent-traces.log"), "utf8");
+		// An injected transport is not a delivery to the trace API, and the log must not claim it was.
+		expect(log).toContain("not uploaded: injected transport");
+		expect(log).not.toContain("uploaded session");
+	});
+
+	it("does not recreate a deleted agent directory to record an upload cursor", async () => {
+		const session = writeSession(tempDir, join(tempDir, "sessions"), "deleted-scope-session");
+		const fetchFn: typeof fetch = async () => {
+			rmSync(tempDir, { recursive: true, force: true });
+			return new Response(JSON.stringify({ session_id: "deleted", trace_id: "deleted", bytes_stored: 1 }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		};
+
+		const result = await uploadAgentTraceFile({
+			sessionFile: session.getSessionFile(),
+			authStorage: AuthStorage.inMemory({
+				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
+			}),
+			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
+			baseUrl: "https://api.example.test",
+			fetchFn,
+			reloadConfig: false,
+		});
+
+		expect(result.status).toBe("uploaded");
+		expect(existsSync(tempDir)).toBe(false);
+	});
+
+	it("does not start an automatic upload when the environment opts out of tracking", async () => {
+		process.env.DO_NOT_TRACK = "1";
+		const session = writeSession(tempDir, join(tempDir, "sessions"), "opt-out-session");
+		const calls: FetchCall[] = [];
+		const uploadOptions = {
+			sessionFile: session.getSessionFile(),
+			authStorage: AuthStorage.inMemory({
+				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
+			}),
+			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
+			baseUrl: "https://api.example.test",
+			fetchFn: createFetchRecorder(calls),
+			reloadConfig: false,
+		};
+
+		expect(await uploadAgentTraceFile(uploadOptions)).toEqual({ status: "disabled" });
+		expect(calls).toHaveLength(0);
+
+		// Positive control: the same session uploads once the opt-out is off.
+		process.env.DO_NOT_TRACK = "0";
+		expect((await uploadAgentTraceFile(uploadOptions)).status).toBe("uploaded");
+		expect(calls).toHaveLength(1);
+	});
+
+	it("still sends a trace the user asked for by name while the opt-out is set", async () => {
+		process.env.DO_NOT_TRACK = "1";
+		const session = writeSession(tempDir, join(tempDir, "sessions"), "opt-out-explicit-session");
+		const calls: FetchCall[] = [];
+
+		const result = await uploadAgentTraceFile({
+			sessionFile: session.getSessionFile(),
+			authStorage: AuthStorage.inMemory({
+				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
+			}),
+			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: false } }),
+			requireEnabled: false,
+			baseUrl: "https://api.example.test",
+			fetchFn: createFetchRecorder(calls),
+			reloadConfig: false,
+		});
+
+		expect(result.status).toBe("uploaded");
+		expect(calls).toHaveLength(1);
+	});
+
+	it("records no outbox intent for a session persisted while the opt-out is set", async () => {
+		process.env.DO_NOT_TRACK = "1";
+		const session = writeSession(tempDir, join(tempDir, "sessions"), "opt-out-intent-session");
+		installAgentTraceUpload(session, {
+			authStorage: AuthStorage.inMemory({
+				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
+			}),
+			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
+			baseUrl: "https://api.example.test",
+			fetchFn: createFetchRecorder([]),
+		});
+
+		session.appendMessage(createUserMessage("after the opt-in"));
+		session.flushNow();
+
+		expect(readOutboxEntry(tempDir, session.getSessionFile()!)).toBeUndefined();
 	});
 });

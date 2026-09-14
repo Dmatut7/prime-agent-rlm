@@ -1,0 +1,3 @@
+- Added a credential gate to trace uploads: credentials in the uploaded session body and in the git-remote header are replaced, and the userinfo of a remote URL is stripped, before the request leaves.
+- Changed trace upload bookkeeping to use the agent directory the upload started in, so a session belonging to a temporary directory no longer writes its cursor or log into the real one, and an injected transport is logged as not uploaded instead of `uploaded session`.
+- Changed `DO_NOT_TRACK` and `PI_OFFLINE` to stop automatic trace sharing and the startup release check, not only pseudonymous analytics.

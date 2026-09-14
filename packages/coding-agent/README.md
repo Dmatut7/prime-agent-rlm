@@ -676,11 +676,11 @@ prime-agent --thinking high "Solve this complex problem"
 | `PRIME_AGENT_SESSION_DIR` | Override session storage directory (overridden by `--session-dir`) |
 | `PRIME_AGENT_CODING_AGENT_SESSION_DIR` | Legacy alias for `PRIME_AGENT_SESSION_DIR` |
 | `PI_PACKAGE_DIR` | Override package directory (useful for Nix/Guix where store paths tokenize poorly) |
-| `PI_OFFLINE` | Disable startup network operations, including update checks and package update checks |
+| `PI_OFFLINE` | Disable network operations the agent starts on its own, including update checks, package update checks, analytics and automatic trace sharing |
 | `PI_SKIP_VERSION_CHECK` | Skip the Prime Agent version update check at startup. This prevents the release manifest request |
 | `PRIME_AGENT_TELEMETRY` | Override pseudonymous aggregate usage analytics with `1`/`true`/`yes` or `0`/`false`/`no` |
 | `PRIME_AGENT_TELEMETRY_ENDPOINT` | Override the aggregate analytics ingestion endpoint |
-| `DO_NOT_TRACK` | Disable aggregate usage analytics when set to `1`/`true`/`yes` |
+| `DO_NOT_TRACK` | Opt out of every request the agent starts on its own - aggregate usage analytics, the startup release check and automatic trace sharing - when set to `1`/`true`/`yes` |
 | `PRIME_AGENT_DOWNLOAD_BASE_URL` | Override the Prime Agent release manifest and tarball base URL |
 | `PI_CACHE_RETENTION` | Set to `long` for extended prompt cache (Anthropic: 1h, OpenAI: 24h) |
 | `PRIME_API_KEY` | Prime Inference API key; also used for trace sharing if it has `agent_traces` scope |

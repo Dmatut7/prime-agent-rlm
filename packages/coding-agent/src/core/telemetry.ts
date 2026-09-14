@@ -4,6 +4,7 @@ import { arch, platform } from "node:os";
 import { join } from "node:path";
 import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
 import { detectInstallMethod, VERSION } from "../config.js";
+import { DO_NOT_TRACK_ENV, PI_OFFLINE_ENV, parseBooleanEnvFlag } from "../utils/privacy-opt-out.js";
 import type { AgentSession, AgentSessionEvent } from "./agent-session.js";
 import type { AgentExecutionMode } from "./agent-session-config.js";
 import type { AuthCredential, AuthStatus } from "./auth-storage.js";
@@ -187,28 +188,14 @@ function mergeUsage(target: UsageTotals, usage: UsageTotals): void {
 	target.modelCallCount += usage.modelCallCount;
 }
 
-function parseBooleanOverride(value: string | undefined): boolean | undefined {
-	if (value === undefined) {
-		return undefined;
-	}
-	const normalized = value.trim().toLowerCase();
-	if (["1", "true", "yes", "on"].includes(normalized)) {
-		return true;
-	}
-	if (["0", "false", "no", "off"].includes(normalized)) {
-		return false;
-	}
-	return undefined;
-}
-
 export function isTelemetryEnabled(settingsManager: SettingsManager): boolean {
-	if (parseBooleanOverride(process.env.PI_OFFLINE) === true) {
+	if (parseBooleanEnvFlag(process.env[PI_OFFLINE_ENV]) === true) {
 		return false;
 	}
-	if (parseBooleanOverride(process.env.DO_NOT_TRACK) === true) {
+	if (parseBooleanEnvFlag(process.env[DO_NOT_TRACK_ENV]) === true) {
 		return false;
 	}
-	const override = parseBooleanOverride(process.env.PRIME_AGENT_TELEMETRY);
+	const override = parseBooleanEnvFlag(process.env.PRIME_AGENT_TELEMETRY);
 	if (override !== undefined) {
 		return override;
 	}

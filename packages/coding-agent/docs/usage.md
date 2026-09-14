@@ -368,7 +368,8 @@ prime-agent --tools ipython -p "Review the code"
 | `PRIME_AGENT_SESSION_DIR` | Override session storage directory; overridden by `--session-dir` |
 | `PRIME_AGENT_CODING_AGENT_SESSION_DIR` | Legacy alias for `PRIME_AGENT_SESSION_DIR` |
 | `PI_PACKAGE_DIR` | Override package directory, useful for Nix/Guix store paths |
-| `PI_OFFLINE` | Disable startup network operations, including update checks and package update checks |
+| `PI_OFFLINE` | Disable network operations the agent starts on its own, including update checks, package update checks, analytics and automatic trace sharing |
+| `DO_NOT_TRACK` | Opt out of the same unrequested requests - analytics, the startup release check and automatic trace sharing - when set to `1`/`true`/`yes` |
 | `PI_SKIP_VERSION_CHECK` | Skip the Prime Agent version update check at startup. This prevents the release manifest request |
 | `PRIME_AGENT_DOWNLOAD_BASE_URL` | Override the Prime Agent release manifest and tarball base URL |
 | `PI_CACHE_RETENTION` | Set to `long` for extended prompt cache where supported |

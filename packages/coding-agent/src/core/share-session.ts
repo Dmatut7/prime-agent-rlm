@@ -61,11 +61,27 @@ export function findShareSecretHits(content: string): string[] {
 
 /** Every credential in plain text, with shape, position and mask. */
 export function findShareSecretFindings(content: string, options?: ShareSecretScanOptions): ShareSecretFinding[] {
-	return scanShareSecretViews([{ label: CONTENT_VIEW, kind: "content", text: content }], options);
+	return scanShareSecretViews([{ label: CONTENT_VIEW, kind: "content", text: content }], options).findings;
 }
 
-function scanShareSecretViews(views: readonly ShareScanView[], options?: ShareSecretScanOptions): ShareSecretFinding[] {
+/** Where one occurrence of a secret sits in a scanned view, and how long it is. */
+interface ShareSecretOccurrence {
+	offset: number;
+	length: number;
+}
+
+interface ShareSecretScan {
+	findings: ShareSecretFinding[];
+	/**
+	 * Every occurrence, including repeats of one value: a warning lists a value once, while
+	 * `redactShareSecrets` has to remove it everywhere it appears.
+	 */
+	occurrences: ShareSecretOccurrence[];
+}
+
+function scanShareSecretViews(views: readonly ShareScanView[], options?: ShareSecretScanOptions): ShareSecretScan {
 	const findings: ShareSecretFinding[] = [];
+	const occurrences: ShareSecretOccurrence[] = [];
 	// One line per distinct value: the same secret is present twice in an export payload
 	// (raw and with its JSON escapes resolved), and a value caught by two detectors - an
 	// `sk-` key is also a high-entropy token, and it also sits in a `NAME=value` assignment -
@@ -99,6 +115,7 @@ function scanShareSecretViews(views: readonly ShareScanView[], options?: ShareSe
 		for (const view of views) {
 			if (view.kind === "document" && !detector.scansDocumentBytes) continue;
 			for (const match of detector.detect(view.text)) {
+				occurrences.push({ offset: match.index, length: match.value.length });
 				record(view, detector.type, match, match.name);
 			}
 		}
@@ -111,19 +128,29 @@ function scanShareSecretViews(views: readonly ShareScanView[], options?: ShareSe
 		// transcripts, and a warning on each of those stops the warning being read. Dropping such
 		// a value from the set is the mistake this check exists to avoid, so it is compared here;
 		// bytes a shape detector recognizes are still reported by that detector.
-		const match = views
-			.map((view) => ({ view, index: view.text.indexOf(secret.value) }))
-			.find((candidate) => candidate.index >= 0);
-		if (match === undefined || secret.compareOnly === true) continue;
-		record(
-			match.view,
-			"Configured credential",
-			{ value: secret.value, index: match.index, name: secret.source },
-			secret.source,
-		);
+		if (secret.compareOnly === true) continue;
+		let reported = false;
+		for (const view of views) {
+			let index = view.text.indexOf(secret.value);
+			while (index >= 0) {
+				// A credential the session is configured with is removed at every offset; the
+				// warning still names it once, which is what `reported` holds.
+				occurrences.push({ offset: index, length: secret.value.length });
+				if (!reported) {
+					record(
+						view,
+						"Configured credential",
+						{ value: secret.value, index, name: secret.source },
+						secret.source,
+					);
+					reported = true;
+				}
+				index = view.text.indexOf(secret.value, index + secret.value.length);
+			}
+		}
 	}
 
-	return findings;
+	return { findings, occurrences };
 }
 
 function lineNumberAt(text: string, index: number): number {
@@ -186,6 +213,55 @@ function shareUploadScanViews(uploadedContent: string): ShareScanView[] {
 	return views;
 }
 
+/**
+ * What a credential is replaced with before bytes leave the machine. Plain ASCII with no
+ * quote, backslash or whitespace in it: a marker has to survive inside a JSON string, an
+ * NDJSON line and a URL fragment without turning a parseable record into an unparseable one.
+ */
+export const REDACTED_SECRET_MARKER = "***redacted***";
+
+export interface ShareSecretRedaction {
+	/** The text with every detected credential replaced by `REDACTED_SECRET_MARKER`. */
+	text: string;
+	/** Shape labels of what was replaced, in detector order, deduplicated. Carries no secret text. */
+	types: string[];
+	/** How many values were replaced; a value that appears twice counts twice. */
+	count: number;
+}
+
+/**
+ * The removal half of the same scan `findShareSecretFindings` performs: every credential the
+ * preflight would warn about - by shape, and by exact comparison with the values this session
+ * is configured with - is replaced by a fixed marker.
+ *
+ * Used by upload paths that cannot ask a human (/traces sends the session on its own). The
+ * warning path reports one line per distinct value; this one has to remove the value at every
+ * offset it appears at, or the second copy of a key stays in the payload.
+ */
+export function redactShareSecrets(content: string, options?: ShareSecretScanOptions): ShareSecretRedaction {
+	const scan = scanShareSecretViews([{ label: CONTENT_VIEW, kind: "content", text: content }], options);
+	if (scan.occurrences.length === 0) {
+		return { text: content, types: [], count: 0 };
+	}
+	const ordered = [...scan.occurrences].sort((left, right) => left.offset - right.offset);
+	let text = "";
+	let cursor = 0;
+	let count = 0;
+	for (const occurrence of ordered) {
+		// Two detectors can recognize overlapping spans of the same value; the first replacement
+		// already removed those bytes.
+		if (occurrence.offset < cursor) continue;
+		text += content.slice(cursor, occurrence.offset) + REDACTED_SECRET_MARKER;
+		cursor = occurrence.offset + occurrence.length;
+		count += 1;
+	}
+	return {
+		text: text + content.slice(cursor),
+		types: [...new Set(scan.findings.map((finding) => finding.type))],
+		count,
+	};
+}
+
 /** Credentials reachable from the bytes that will actually be uploaded, in detector order. */
 export function findShareUploadSecretHits(uploadedContent: string, options?: ShareSecretScanOptions): string[] {
 	return [...new Set(findShareUploadSecretFindings(uploadedContent, options).map((finding) => finding.type))];
@@ -201,7 +277,7 @@ export function findShareUploadSecretFindings(
 	uploadedContent: string,
 	options?: ShareSecretScanOptions,
 ): ShareSecretFinding[] {
-	return scanShareSecretViews(shareUploadScanViews(uploadedContent), options);
+	return scanShareSecretViews(shareUploadScanViews(uploadedContent), options).findings;
 }
 
 /** A confirm dialog is a decision, not a report: list the first few and count the rest. */

@@ -6,6 +6,7 @@ import {
 	createShareTempHtmlFile,
 	findShareSecretHits,
 	formatShareSecretWarning,
+	redactShareSecrets,
 } from "../src/core/share-session.js";
 
 const describePosix = process.platform === "win32" ? describe.skip : describe;
@@ -54,6 +55,36 @@ describe("confirmShareIfSecrets", () => {
 	it("continues when the user confirms", async () => {
 		const confirm = vi.fn(async () => true);
 		await expect(confirmShareIfSecrets("ghp_abcdefghijklmnopqrstuvwxyz1234", confirm)).resolves.toBe(true);
+	});
+});
+
+describe("redactShareSecrets", () => {
+	it("removes every occurrence of a value, not one line per value", () => {
+		const secret = "sk-r11sharedredaction0123456789";
+		const redacted = redactShareSecrets(`OPENAI_API_KEY=${secret}\nand again: ${secret}`);
+
+		expect(redacted.text).not.toContain(secret);
+		expect(redacted.text).toBe(`OPENAI_API_KEY=***redacted***\nand again: ***redacted***`);
+		expect(redacted.count).toBe(2);
+		expect(redacted.types).toContain("API key (sk-)");
+	});
+
+	it("compares the values the session is configured with, whatever their shape", () => {
+		const redacted = redactShareSecrets("token=opaque-lower-case-value", {
+			secretValues: [{ value: "opaque-lower-case-value", source: "env TEST_TOKEN" }],
+		});
+
+		expect(redacted.text).toBe("token=***redacted***");
+		expect(redacted.types).toEqual(["Configured credential"]);
+	});
+
+	it("leaves text without credentials untouched and replaces nothing for an empty scan", () => {
+		const text = "ordinary transcript with no credentials in it";
+		const redacted = redactShareSecrets(text, { secretValues: [] });
+
+		expect(redacted.text).toBe(text);
+		expect(redacted.count).toBe(0);
+		expect(redacted.types).toEqual([]);
 	});
 });
 

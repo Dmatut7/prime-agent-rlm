@@ -50,7 +50,7 @@ Edit directly or use `/settings` for common options.
 
 Stable builds fetch the release manifest at `https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/latest.json`. Beta builds fetch `beta.json` and continue following beta updates. Override the base URL with `PRIME_AGENT_DOWNLOAD_BASE_URL`.
 
-Set `PI_SKIP_VERSION_CHECK=1` to disable the Prime Agent version update check. Use `--offline` or `PI_OFFLINE=1` to disable startup network operations, including update checks and package update checks.
+Set `PI_SKIP_VERSION_CHECK=1` to disable the Prime Agent version update check. Use `--offline` or `PI_OFFLINE=1` to disable startup network operations, including update checks and package update checks. `DO_NOT_TRACK=1` also stops this check: nobody asked for the request, and the variable is the standing answer to "may this machine call home".
 
 The stable `latest.json` and beta `beta.json` manifests use the same JSON shape:
 
@@ -93,6 +93,29 @@ prime-agent --offline
 ```
 
 `PRIME_AGENT_TELEMETRY_ENDPOINT` overrides the ingestion endpoint for development and self-hosted deployments.
+
+### Requests the agent starts on its own
+
+`DO_NOT_TRACK=1` and `PI_OFFLINE=1` (or `prime-agent --offline`) stop every request the agent
+starts without being asked in the current turn:
+
+- the startup release check,
+- pseudonymous aggregate analytics,
+- automatic trace sharing - `/traces on` uploads the session transcript as it grows.
+
+They do **not** stop work you asked for by name, which is answered by the same act of asking:
+`/share`, `/traces upload-current`, `/traces upload-all`, tool downloads, and the model calls
+your prompts produce. `/traces status` reports automatic uploads as `Enabled, suppressed by
+DO_NOT_TRACK` when a switch is holding them back, and `/traces upload-current` still sends the
+session you pointed at.
+
+A trace upload is scanned before it leaves, in both halves of the request: credentials found by
+shape or by exact comparison with the credentials this session is configured with are replaced
+with `***redacted***`, and the URL userinfo of a git remote - the `user:token@` part of
+`https://x-access-token:<token>@github.com/org/repo.git` - is stripped from the uploaded body
+and from the `X-Git-Repo` header. `~/.prime/agent/logs/agent-traces.log` records each redaction
+by shape and field, never by value. `/share` runs the same scan and asks you before uploading
+instead of changing what it uploads.
 
 ### Warnings
 

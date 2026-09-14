@@ -6717,7 +6717,10 @@ describe("daemon mode helpers", () => {
 	it("resolves delete_subagent while the child's trace upload is still in flight, then the transcript upload completes", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-delete-trace-outbox-"));
 		const originalAgentDir = process.env[ENV_AGENT_DIR];
+		const originalDoNotTrack = process.env.DO_NOT_TRACK;
 		process.env[ENV_AGENT_DIR] = tempDir;
+		// The suite runs with DO_NOT_TRACK=1; this test drives an automatic trace upload.
+		process.env.DO_NOT_TRACK = "0";
 		try {
 			const fixture = makePersistedRlmDaemonFixture(tempDir);
 			const internals = fixture.daemon as unknown as {
@@ -6756,6 +6759,7 @@ describe("daemon mode helpers", () => {
 			} else {
 				process.env[ENV_AGENT_DIR] = originalAgentDir;
 			}
+			restoreDoNotTrack(originalDoNotTrack);
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
@@ -6763,7 +6767,10 @@ describe("daemon mode helpers", () => {
 	it("resolves a delete that joins an in-flight passivation close without awaiting the trace upload", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-delete-passivation-flush-"));
 		const originalAgentDir = process.env[ENV_AGENT_DIR];
+		const originalDoNotTrack = process.env.DO_NOT_TRACK;
 		process.env[ENV_AGENT_DIR] = tempDir;
+		// The suite runs with DO_NOT_TRACK=1; this test drives an automatic trace upload.
+		process.env.DO_NOT_TRACK = "0";
 		let releaseDispose!: () => void;
 		const disposeGate = new Promise<void>((resolve) => {
 			releaseDispose = resolve;
@@ -6811,6 +6818,7 @@ describe("daemon mode helpers", () => {
 			} else {
 				process.env[ENV_AGENT_DIR] = originalAgentDir;
 			}
+			restoreDoNotTrack(originalDoNotTrack);
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
@@ -9241,6 +9249,14 @@ function makeCronJob(input: {
 		nextRunAt: "2026-01-01T12:05:00.000Z",
 		runCount: 0,
 	};
+}
+
+function restoreDoNotTrack(value: string | undefined): void {
+	if (value === undefined) {
+		delete process.env.DO_NOT_TRACK;
+	} else {
+		process.env.DO_NOT_TRACK = value;
+	}
 }
 
 /** Gated fetch stub on a session's trace-upload controller: observes whether a close awaits the upload. */
