@@ -51,6 +51,15 @@ function result(): RefinementResult {
 	};
 }
 
+function getMessageText(message: unknown): string {
+	const content = (message as { content?: string | Array<{ type: string; text?: string }> }).content;
+	if (typeof content === "string") return content;
+	return (content ?? [])
+		.filter((part): part is { type: "text"; text: string } => part.type === "text")
+		.map((part) => part.text)
+		.join("\n");
+}
+
 function rendered(component: RefinementOutcomeMessageComponent): string {
 	return stripAnsi(component.render(120).join("\n"));
 }
@@ -142,10 +151,26 @@ describe("RefinementOutcomeMessageComponent", () => {
 		);
 	});
 
-	test("uses a typed, presentation-only custom message", () => {
+	test("renders an informative outcome into the model context as a system receipt", () => {
 		const message = createRefinementOutcomeMessage(result());
 		expect(isRefinementOutcomeMessage(message)).toBe(true);
-		expect(convertToLlm([message])).toEqual([]);
+
+		const [rendered] = convertToLlm([message]);
+		expect(rendered?.role).toBe("user");
+		const text = getMessageText(rendered);
+		expect(text).toContain("not a new instruction");
+		expect(text).toContain("Added local guidance to make conversational responses rhyme.");
+		expect(text).toContain("applied: create prompt:rhyme-response-guidance");
+
 		expect(isRefinementOutcomeMessage({ ...message, details: { ...message.details, edits: [{}] } })).toBe(false);
+	});
+
+	test("keeps a malformed or empty outcome out of the model context", () => {
+		const malformed = {
+			...createRefinementOutcomeMessage(result()),
+			details: { summary: "x", scope: "local", edits: [{}] },
+		};
+		expect(convertToLlm([malformed])).toEqual([]);
+		expect(convertToLlm([createRefinementOutcomeMessage({ ...result(), appliedEdits: [] })])).toEqual([]);
 	});
 });
