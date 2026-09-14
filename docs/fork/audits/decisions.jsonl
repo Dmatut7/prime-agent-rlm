@@ -27,3 +27,8 @@
 {"id": "T-C", "date": "2026-09-15", "severity": "P3", "status": "fixing", "commit": null, "title": "同步自旋无迭代上限：时钟回拨即死循环占满事件循环", "verified_by": "R4-clock 探针（back 轮 5s 未返回被 kill；fwd 正控 2ms）"}
 {"id": "T-D", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "cron 逐分钟爬墙钟：夏令时跳过的小时整次不跑；>1 年表达式建不出来；扫描在锁内 27~75ms", "verified_by": "R4-clock 复现"}
 {"id": "C-1", "date": "2026-09-15", "severity": "P2", "status": "fixed", "commit": "b95da897b", "title": "尾部修复用 ftruncate 会吃掉并发写者已 fsync 的完整记录（两进程都报成功）", "verified_by": "R4-races 复现 + 母席双进程 harness 亲自复核（基线 false / 修复 true）"}
+{"id": "A1", "date": "2026-09-15", "severity": "P2", "status": "fixed", "commit": "ea2c2f296", "title": "内核自动快照只排 ok cell + 通知写死宣称 1.5s 新鲜度（实测死前 4s 变量静默丢）", "verified_by": "R4-A 真内核实跑 + 实现线 6 红→绿 + 母席复跑 31 项绿"}
+{"id": "A2", "date": "2026-09-15", "severity": "P2", "status": "fixed", "commit": "ea2c2f296", "title": "快照跳过名两边不点名（SnapshotResult.skipped 全仓无消费者）", "verified_by": "同上（新增 RestoreResult.notSaved 由 manifest 填充，两张通知点名+原因）"}
+{"id": "T-A", "date": "2026-09-15", "severity": "P2", "status": "fixed", "commit": "d3c627a62", "title": "cron/heartbeat LWW 用墙钟：落后时钟的写入被吃但报成功（模型收到假回执）", "verified_by": "R4-clock 探针 + 实现线 3 红→绿 + 母席复跑 170 项绿"}
+{"id": "T-C", "date": "2026-09-15", "severity": "P3", "status": "fixed", "commit": "d3c627a62", "title": "同步自旋无迭代上限：时钟回拨即死循环占满事件循环", "verified_by": "探针 6 秒不返回被 kill（两后端）→ 单调钟+Atomics.wait+10k 上限"}
+{"id": "R1", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "回退位置只活在内存 ⇒ 重启后静默回到回退前位置", "verified_by": "R4 复现 + 母席读码；修复线施工中"}
