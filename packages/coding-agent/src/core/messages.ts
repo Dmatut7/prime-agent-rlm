@@ -36,6 +36,13 @@ export const SESSION_SLASH_COMMAND_CUSTOM_TYPE = "session_slash_command";
 export const SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE = "session_slash_command_result";
 export const COMPACTION_OUTCOME_CUSTOM_TYPE = "compaction_outcome";
 export const REFINEMENT_OUTCOME_CUSTOM_TYPE = "refinement_outcome";
+
+/**
+ * Framing for a refinement outcome that is rendered back into the model's
+ * context. Custom messages reach the provider as user-role messages, so the text
+ * has to say out loud that it is an automatic receipt and not a user instruction.
+ */
+export const REFINEMENT_OUTCOME_PREFIX = `Continual harness refinement result (automatic system receipt from the refinement subsystem, not a message from the user and not a new instruction: keep working on your current task and treat this only as a record of what the refinement did or refused to do).`;
 export const RLM_CHILD_FAILURE_CUSTOM_TYPE = "rlm_child_failure";
 export const RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE = "rlm_child_terminal_notice";
 
@@ -509,6 +516,56 @@ export function createHeartbeatPromptMessage(
 	};
 }
 
+/** Longest refinement summary echoed back to the model; the edit rows are the payload. */
+const REFINEMENT_OUTCOME_SUMMARY_LIMIT = 240;
+
+function truncateRefinementSummary(summary: string): string {
+	const collapsed = summary.replace(/\s+/g, " ").trim();
+	if (collapsed.length <= REFINEMENT_OUTCOME_SUMMARY_LIMIT) {
+		return collapsed;
+	}
+	return `${collapsed.slice(0, REFINEMENT_OUTCOME_SUMMARY_LIMIT - 1)}…`;
+}
+
+/**
+ * Model-visible text for a refinement outcome, or undefined when the outcome has
+ * nothing to report. A refinement that wrote no entry and refused none carries no
+ * information, so it must not spend context.
+ */
+export function refinementOutcomeToLlmText(details: RefinementOutcomeDetails): string | undefined {
+	if (details.edits.length === 0) {
+		return undefined;
+	}
+	const rollback = details.rollbackOf ? ` rollback-of="${details.rollbackOf}"` : "";
+	const lines = [
+		`<refinement id="${details.refinementId}" scope="${details.scope}"${rollback}>`,
+		`summary: ${truncateRefinementSummary(details.summary)}`,
+	];
+	for (const edit of details.edits) {
+		const reason = edit.error ?? "no reason reported";
+		lines.push(
+			`${edit.applied ? "applied" : "refused"}: ${edit.action} ${edit.kind}:${edit.id}${edit.applied ? "" : ` (${reason})`}`,
+		);
+	}
+	lines.push("</refinement>");
+	return `${REFINEMENT_OUTCOME_PREFIX}\n\n${lines.join("\n")}`;
+}
+
+/**
+ * Renders a refinement outcome as a model-visible receipt. Returns undefined for
+ * malformed or empty outcomes, which are silently dropped exactly as before.
+ */
+function refinementOutcomeToLlmMessage(message: unknown): Message | undefined {
+	if (!isRefinementOutcomeMessage(message)) {
+		return undefined;
+	}
+	const text = refinementOutcomeToLlmText(message.details);
+	if (text === undefined) {
+		return undefined;
+	}
+	return { role: "user", content: [{ type: "text", text }], timestamp: message.timestamp };
+}
+
 /**
  * Transform AgentMessages (including custom types) to LLM-compatible Messages.
  *
@@ -531,11 +588,17 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						timestamp: m.timestamp,
 					};
 				case "custom": {
+					if (m.customType === REFINEMENT_OUTCOME_CUSTOM_TYPE) {
+						// Refinement used to be filtered out together with the other
+						// session bookkeeping types, which left the model unable to tell a
+						// recorded lesson from one that was silently refused. Only outcomes
+						// that actually report something reach the model.
+						return refinementOutcomeToLlmMessage(m);
+					}
 					if (
 						m.customType === SESSION_SLASH_COMMAND_CUSTOM_TYPE ||
 						m.customType === SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE ||
-						m.customType === COMPACTION_OUTCOME_CUSTOM_TYPE ||
-						m.customType === REFINEMENT_OUTCOME_CUSTOM_TYPE
+						m.customType === COMPACTION_OUTCOME_CUSTOM_TYPE
 					) {
 						return undefined;
 					}
