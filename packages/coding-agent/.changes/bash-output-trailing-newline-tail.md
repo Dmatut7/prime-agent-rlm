@@ -1,0 +1,1 @@
+- Fixed bash output whose last line exceeded the byte budget and ended with a newline being replaced by an empty string: the model saw "(no output)" and the `!` command panel showed only a temp-file path while the full log sat on disk.

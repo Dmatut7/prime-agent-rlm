@@ -178,6 +178,11 @@ export function truncateTail(content: string, options: TruncationOptions = {}): 
 	let outputBytesCount = 0;
 	let truncatedBy: "lines" | "bytes" = "lines";
 	let lastLinePartial = false;
+	// Whether a line with content has been kept yet. The trailing newline of the output splits
+	// into a final empty element, and that element is kept first while walking backwards - so a
+	// length check on `outputLinesArr` would say "we already kept a line" and skip the partial
+	// tail of the oversized line it terminates, handing the caller an empty string.
+	let keptContentLine = false;
 
 	for (let i = lines.length - 1; i >= 0 && outputLinesArr.length < maxLines; i--) {
 		const line = lines[i];
@@ -187,17 +192,19 @@ export function truncateTail(content: string, options: TruncationOptions = {}): 
 			truncatedBy = "bytes";
 			// Edge case: if we haven't added ANY lines yet and this line exceeds maxBytes,
 			// take the end of the line (partial)
-			if (outputLinesArr.length === 0) {
+			if (!keptContentLine) {
 				const truncatedLine = truncateStringToBytesFromEnd(line, maxBytes);
 				outputLinesArr.unshift(truncatedLine);
 				outputBytesCount = Buffer.byteLength(truncatedLine, "utf-8");
 				lastLinePartial = true;
+				if (truncatedLine.length > 0) keptContentLine = true;
 			}
 			break;
 		}
 
 		outputLinesArr.unshift(line);
 		outputBytesCount += lineBytes;
+		if (line.length > 0) keptContentLine = true;
 	}
 
 	if (outputLinesArr.length >= maxLines && outputBytesCount <= maxBytes) {
