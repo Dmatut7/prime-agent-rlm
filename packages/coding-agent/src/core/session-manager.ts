@@ -17,7 +17,13 @@ import { lstat, readdir, readFile, stat } from "fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "path";
 import { v7 as uuidv7 } from "uuid";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
-import { readFileLines, readFirstLineSync, repairTruncatedTrailingLine } from "../utils/file-lines.js";
+import {
+	isLineBoundarySync,
+	isUsableResumePoint,
+	readFileLines,
+	readFirstLineSync,
+	repairTruncatedTrailingLine,
+} from "../utils/file-lines.js";
 import { captureGitContext, type GitContext, gitContextsEqual } from "../utils/git.js";
 import { DEFAULT_MAP_CONCURRENCY_LIMIT, mapConcurrent } from "../utils/map-concurrent.js";
 import {
@@ -1158,6 +1164,12 @@ interface SessionScanState {
 	lastActivityTime: number | undefined;
 	/** Byte offset just past the last newline-terminated line consumed. */
 	offset: number;
+	/**
+	 * Byte position the read actually reached: `offset`, or past it when a torn
+	 * trailing line was skipped. Kept so a later read can tell a scan that covered
+	 * the bytes it claims from one whose offset fell behind them.
+	 */
+	reachedBytes: number;
 	/** Newest-wins per entry id (#2003): a later attribution overwrites the target's usage. */
 	assistantUsageById: Map<string, Usage>;
 	/** Grow-only: one push per child_usage_attributed entry whose target was already seen. */
@@ -1242,14 +1254,20 @@ export async function readSessionInfo(filePath: string): Promise<SessionInfo | n
 		sessionInfoReadStats.memoryHits++;
 		return cached.info;
 	}
-	// Resume only on a plain append to the same file: same inode, grown, and the
-	// previous stopping point still within it. A rewrite renames a fresh inode
-	// over the path, and anything else falls back to a full scan.
+	// Resume only on a plain append to the same file: same inode, grown, and a
+	// previous stopping point that is still usable. A rewrite renames a fresh
+	// inode over the path, and anything else falls back to a full scan. The
+	// stopping point is checked, not trusted: it is only a resume point while it
+	// sits on a line boundary and can account for the bytes the scan that
+	// recorded it claims to have read, so a state recorded by a reader that lost
+	// bytes across chunk boundaries is rescanned instead of being re-counted from.
 	const resumable =
 		cached?.scan !== undefined &&
 		cached.ino === stats.ino &&
 		stats.size > cached.size &&
-		cached.scan.offset <= stats.size
+		cached.scan.offset <= stats.size &&
+		isUsableResumePoint(cached.scan, cached.size) &&
+		isLineBoundarySync(filePath, cached.scan.offset)
 			? cached.scan
 			: undefined;
 	if (!resumable) {
@@ -1314,6 +1332,7 @@ async function scanSessionInfo(
 		let agentStatus: AgentStatus | undefined = resume?.agentStatus;
 		let lastActivityTime: number | undefined = resume?.lastActivityTime;
 		let offset = resume?.offset ?? 0;
+		let reachedBytes = resume?.reachedBytes ?? 0;
 		// Fold attribution aggregates like the loader: either disk representation cancels to the same own spend.
 		// Copied, not shared: readSessionInfo() reads the cache entry, awaits this scan, then stores a new
 		// entry, so two concurrent scans of one live file can both resume from the same object and would
@@ -1323,6 +1342,9 @@ async function scanSessionInfo(
 		const summarizationUsages: Usage[] = resume ? [...resume.summarizationUsages] : [];
 
 		for await (const fileLine of readFileLines(filePath, offset)) {
+			// Where the read got, terminated or not: the resume offset only advances
+			// past terminated lines, the reached position moves on every line.
+			reachedBytes = fileLine.endOffset;
 			// A trailing unterminated line is a torn append still in flight (or a
 			// crash remnant): never count it, and never advance the resume offset
 			// past it, so a completed rewrite of the same bytes is seen exactly once.
@@ -1457,6 +1479,7 @@ async function scanSessionInfo(
 				agentStatus,
 				lastActivityTime,
 				offset,
+				reachedBytes,
 				assistantUsageById,
 				attributedChildUsages,
 				summarizationUsages,
