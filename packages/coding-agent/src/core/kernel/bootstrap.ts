@@ -9,7 +9,7 @@ import { createInterface } from "node:readline/promises";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { getLogger } from "@earendil-works/pi-ai";
-import { getPackageDir } from "../../config.js";
+import { getPackageDir, isBunBinary } from "../../config.js";
 import { readKernelBootstrapSettings } from "../settings-manager.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
 import {
@@ -673,6 +673,40 @@ async function hasPrimeAgentRuntime(python: string): Promise<boolean> {
 	}
 }
 
+/**
+ * What a Python interpreter is missing to serve as the kernel runtime: the runtime API itself, then
+ * the default packages the kernel imports on the model's behalf. Shared by the
+ * `PRIME_AGENT_KERNEL_PYTHON` contract check and the post-install recheck, so both name a gap the
+ * same way.
+ */
+async function missingKernelRuntimeLabels(python: string): Promise<string[]> {
+	if (!(await hasPrimeAgentRuntime(python))) {
+		return [
+			"a current prime-agent-runtime with callable rlm.run, rlm.host_request, and explicit harness CRUD methods",
+		];
+	}
+	const missingExtraImports = await missingRlmExtraImportLabels(python);
+	return missingExtraImports.length > 0 ? [`default Python packages (${missingExtraImports.join(", ")})`] : [];
+}
+
+/**
+ * A successful `uv pip install` is not evidence that the runtime it installed can serve this host:
+ * the install can copy an older runtime in, and the readiness check the warm path relies on is only
+ * ever reached *before* an install. Re-run it here, so a fresh generation that cannot serve the
+ * kernel fails where it was created, naming what is missing, instead of reporting "ready" and
+ * failing later inside the kernel.
+ */
+async function verifyFreshKernelRuntime(venv: string, python: string): Promise<void> {
+	const missing = await missingKernelRuntimeLabels(python);
+	if (missing.length === 0) return;
+	throw new Error(
+		`the runtime installed into ${venv} did not pass its readiness check: it is missing ${missing.join(" and ")}. ` +
+			"Nothing will run from this generation. Re-run this command to rebuild it; if it fails again, check that uv " +
+			"can reach a current prime-agent-runtime (network, index, or a pre-populated uv cache), or point " +
+			"PRIME_AGENT_KERNEL_PYTHON at a Python that already has one installed.",
+	);
+}
+
 async function missingRlmExtraImportLabels(python: string): Promise<string[]> {
 	const missing: string[] = [];
 	for (const pkg of DEFAULT_RLM_EXTRA_PACKAGES) {
@@ -982,22 +1016,68 @@ async function writeBootstrapVersion(
 	await writeFile(path.join(venv, BOOTSTRAP_VERSION_FILE), `${JSON.stringify(version)}\n`, "utf8");
 }
 
-function runtimeCandidateDirs(): string[] {
-	const moduleDir = path.dirname(fileURLToPath(import.meta.url));
-	// dist/prime-agent-runtime is listed first deliberately: it is the only path stable
-	// across every shipped layout (dist/, dist/bundle/, bun), where import.meta.url-relative
-	// resolution breaks. `npm run build` rebuilds it from live source (copy-assets does
-	// rm -rf + cp), so the staleness hash still refreshes on every build. The relative
-	// paths below cover running from source (tsx) where dist/ hasn't been built.
-	return [
-		path.join(getPackageDir(), "dist", "prime-agent-runtime"),
+/**
+ * Where one runtime resolution looks for the runtime it will install. Injectable so the layouts
+ * below can be exercised from a temp tree; every production caller takes the defaults.
+ */
+export interface RuntimeSourceResolution {
+	/** Directory holding the module asking for the runtime. Defaults to this module's directory. */
+	moduleDir?: string;
+	/** Package directory that owns that module. Defaults to {@link getPackageDir}. */
+	packageDir?: string;
+	/** True for a Bun compiled binary, which ships its assets next to the executable. */
+	bunBinary?: boolean;
+}
+
+function resolveRuntimeSourceResolution(options: RuntimeSourceResolution): Required<RuntimeSourceResolution> {
+	return {
+		moduleDir: options.moduleDir ?? path.dirname(fileURLToPath(import.meta.url)),
+		packageDir: options.packageDir ?? getPackageDir(),
+		bunBinary: options.bunBinary ?? isBunBinary,
+	};
+}
+
+/**
+ * True when the running module graph is the checkout's own `src/`. `./prime-agent.sh` runs tsx over
+ * `src/cli.ts`, so such a process is executing the code the user edits and must install the
+ * checkout's `prime-agent-runtime` - the sibling directory those edits land in. A built tree
+ * (`dist/`, `dist/bundle/`, a Bun binary) runs outside `src/` and keeps choosing the build output
+ * copy it shipped with.
+ */
+function isSourceModuleDir(moduleDir: string, packageDir: string): boolean {
+	const sourceRoot = `${path.resolve(packageDir, "src")}${path.sep}`;
+	return `${path.resolve(moduleDir)}${path.sep}`.startsWith(sourceRoot);
+}
+
+/**
+ * Runtime directories to try, most preferred first.
+ *
+ * `dist/prime-agent-runtime` is a build output: it is the only path stable across every shipped
+ * layout (dist/, dist/bundle/, bun), where import.meta.url-relative resolution breaks, so a built
+ * tree reads it first. A source run must not: that copy is whatever the last `npm run build` left
+ * behind, and preferring it makes edits to `<checkout>/prime-agent-runtime/src/rlm` invisible - the
+ * identity hash never moves, so the venv generation is reused and the kernel keeps running the old
+ * Python with no error and no notice. Editing live runtime source therefore has to win over the
+ * copy; the copy stays in the list as the last resort for a checkout that ships no source runtime.
+ */
+export function runtimeCandidateDirs(options: RuntimeSourceResolution = {}): string[] {
+	const { moduleDir, packageDir, bunBinary } = resolveRuntimeSourceResolution(options);
+	const builtDir = path.join(packageDir, "dist", "prime-agent-runtime");
+	const checkoutDir = path.resolve(packageDir, "..", "..", "prime-agent-runtime");
+	const moduleRelative = [
 		path.resolve(moduleDir, "..", "..", "prime-agent-runtime"),
 		path.resolve(moduleDir, "..", "..", "..", "..", "..", "prime-agent-runtime"),
 	];
+	const ordered = bunBinary
+		? [builtDir, ...moduleRelative]
+		: isSourceModuleDir(moduleDir, packageDir)
+			? [checkoutDir, ...moduleRelative, builtDir]
+			: [builtDir, ...moduleRelative];
+	return [...new Set(ordered)];
 }
 
-async function resolveRuntimeSourceDir(): Promise<string | null> {
-	for (const candidate of runtimeCandidateDirs()) {
+export async function resolveRuntimeSourceDir(options: RuntimeSourceResolution = {}): Promise<string | null> {
+	for (const candidate of runtimeCandidateDirs(options)) {
 		if (await exists(path.join(candidate, "pyproject.toml"))) {
 			return candidate;
 		}
@@ -1009,10 +1089,39 @@ async function resolveRuntimeSourceDir(): Promise<string | null> {
 // content hash of every rlm/*.py file plus pyproject.toml, so any runtime code or
 // dependency change invalidates an existing venv automatically. Falls back to the
 // bare package name when the runtime resolves to a registry install (no local source).
-export async function resolveRuntimeIdentity(): Promise<string> {
-	const sourceDir = await resolveRuntimeSourceDir();
+export async function resolveRuntimeIdentity(options: RuntimeSourceResolution = {}): Promise<string> {
+	const sourceDir = await resolveRuntimeSourceDir(options);
 	if (!sourceDir) return RUNTIME_REQUIREMENT;
 	return hashRuntimeSource(sourceDir);
+}
+
+/**
+ * Why a runtime that resolved to the build output copy may still be the wrong source: on a built
+ * tree that is the "runtime source was edited but not rebuilt" state, and it is the one way this
+ * process can end up running Python older than the checkout next to it. Undefined when there is
+ * nothing to say - a source run (which installs the checkout source itself), a build copy whose
+ * contents match the checkout, or no checkout source at all.
+ */
+export async function runtimeSourceShadowNotice(options: RuntimeSourceResolution = {}): Promise<string | undefined> {
+	const { packageDir } = resolveRuntimeSourceResolution(options);
+	const builtDir = path.join(packageDir, "dist", "prime-agent-runtime");
+	const checkoutDir = path.resolve(packageDir, "..", "..", "prime-agent-runtime");
+	if ((await resolveRuntimeSourceDir(options)) !== builtDir) return undefined;
+	let buildIdentity: string;
+	let checkoutIdentity: string;
+	try {
+		buildIdentity = await hashRuntimeSource(builtDir);
+		checkoutIdentity = await hashRuntimeSource(checkoutDir);
+	} catch {
+		// A missing or unreadable checkout runtime is not a shadowed source.
+		return undefined;
+	}
+	if (buildIdentity === checkoutIdentity) return undefined;
+	return (
+		`the kernel runtime resolved to the build copy at ${builtDir}, whose contents differ from ${checkoutDir} ` +
+		`(${buildIdentity} vs ${checkoutIdentity}). Edits under ${path.join(checkoutDir, "src", "rlm")} do not take ` +
+		"effect until `npm run build` refreshes the copy; ./prime-agent.sh runs the checkout's source runtime instead."
+	);
 }
 
 // Throws if the local source can't be read. A failure here must surface rather than
@@ -1042,6 +1151,20 @@ async function hashRuntimeSource(sourceDir: string): Promise<string> {
 		hash.update("\0");
 	}
 	return `sha256:${hash.digest("hex")}`;
+}
+
+/** Reported once per process rather than once per boot: it describes the installation, not the boot. */
+let runtimeSourceShadowReported = false;
+
+async function reportRuntimeSourceShadow(options: EnsureKernelPythonOptions): Promise<void> {
+	if (runtimeSourceShadowReported) return;
+	runtimeSourceShadowReported = true;
+	const notice = await runtimeSourceShadowNotice();
+	if (!notice) return;
+	// The machine-wide log and the session's own progress output: a silently older kernel is the
+	// failure this warns about, so it must not end up only in a log file nobody reads.
+	bootstrapLog.warn(notice, { notice: "runtime-source-shadowed-by-build-copy" });
+	reportProgress(options, `Warning: ${notice}`);
 }
 
 async function bootstrapVenv(
@@ -1250,18 +1373,7 @@ async function ensureKernelPythonUncached(
 	const override = process.env.PRIME_AGENT_KERNEL_PYTHON;
 	if (override) {
 		const python = path.resolve(expandHome(override));
-		const missing: string[] = [];
-		if (!(await hasPrimeAgentRuntime(python))) {
-			missing.push(
-				"a current prime-agent-runtime with callable rlm.run, rlm.host_request, and explicit harness CRUD methods",
-			);
-		}
-		if (missing.length === 0) {
-			const missingExtraImports = await missingRlmExtraImportLabels(python);
-			if (missingExtraImports.length > 0) {
-				missing.push(`default Python packages (${missingExtraImports.join(", ")})`);
-			}
-		}
+		const missing = await missingKernelRuntimeLabels(python);
 		if (missing.length === 0 && pythonSkills.length > 0) {
 			const missingPythonSkills = await missingPythonSkillImportLabels(python, options.pythonSkills ?? []);
 			if (missingPythonSkills.length > 0) {
@@ -1276,6 +1388,9 @@ async function ensureKernelPythonUncached(
 	}
 
 	const base = await resolveWritableKernelVenvDir();
+	// Before the warm early-return: a warm generation built from a build copy stays warm forever, so
+	// the only chance to say "this is not the source you are editing" is on every boot that reads it.
+	await reportRuntimeSourceShadow(options);
 	const runtimeIdentity = await resolveRuntimeIdentity();
 	// This build identity's own directory. A kernel started from it keeps this exact path
 	// for its whole life, and a later identity change builds a sibling instead of touching it.
@@ -1360,6 +1475,9 @@ async function ensureKernelPythonUncached(
 		}
 
 		await bootstrapVenv(venv, pythonSkills, options);
+		// The install just replaced (or created) the generation this boot will hand out, so verify
+		// what landed before announcing it; the readiness checks the warm path runs are all earlier.
+		await verifyFreshKernelRuntime(venv, python);
 		// GC trigger 2 (post-build): a new generation just landed, so retire the surplus
 		// now rather than leaving it on disk until the next boot.
 		await pruneKernelVenvGenerations(base, { activeDir: venv }).catch(() => undefined);
