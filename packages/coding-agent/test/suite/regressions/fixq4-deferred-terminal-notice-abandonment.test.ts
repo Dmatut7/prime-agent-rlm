@@ -218,7 +218,10 @@ describe("FIX-Q4 stale deferred terminal notices stop pinning the session", () =
 			.filter(
 				(line) =>
 					!line.startsWith("this._pendingNextTurnMessages = [];") &&
-					!line.startsWith("this._pendingNextTurnMessages = this._pendingNextTurnMessages.filter("),
+					!line.startsWith("this._pendingNextTurnMessages = this._pendingNextTurnMessages.filter(") &&
+					!line.startsWith(
+						"this._pendingNextTurnMessages = this._filterSupersededRlmTerminalNotices(this._pendingNextTurnMessages)",
+					),
 			);
 		expect(grown).toEqual([]);
 	});
