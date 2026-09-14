@@ -4,6 +4,7 @@ import { homedir } from "os";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
+import { sleepSync } from "../utils/sleep.js";
 import { DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS } from "./extensions/timeout.js";
 
 const RECENT_MODELS_LIMIT = 20;
@@ -462,10 +463,8 @@ export class FileSettingsStorage implements SettingsStorage {
 					throw error;
 				}
 				lastError = error;
-				const start = Date.now();
-				while (Date.now() - start < delayMs) {
-					// Sleep synchronously to avoid changing callers to async.
-				}
+				// Sleep synchronously to avoid changing callers to async.
+				sleepSync(delayMs);
 			}
 		}
 

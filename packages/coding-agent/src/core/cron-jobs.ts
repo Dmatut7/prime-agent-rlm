@@ -112,6 +112,44 @@ interface CronJobsState {
 	dispatches: AgentCronDispatchRecord[];
 }
 
+/**
+ * What a store write left behind.
+ *
+ * `writeJobs` does not store the caller's copies verbatim: it merges them into the state it
+ * finds on disk and keeps whichever copy of a job is newer, so a caller cannot assume its own
+ * copy is what the store now holds. `persisted` is what the store holds for the ids the caller
+ * wrote (read back from disk after the write), and `dropped` names the incoming copies the merge
+ * discarded, mapped to the copy that won. Callers report from here instead of from the copy
+ * they built, because reporting that copy is how a pause or a stop used to look applied while
+ * the job stayed active on disk.
+ */
+interface JobsWriteOutcome {
+	persisted: ReadonlyMap<string, AgentCronJob>;
+	dropped: ReadonlyMap<string, AgentCronJob | undefined>;
+}
+
+/**
+ * A change the caller asked for is not what the store holds: another writer's copy of the same
+ * job won the store's last-write-wins merge. Raised instead of returning the discarded copy, so
+ * a pause/resume/stop that never reached disk cannot be reported as applied.
+ */
+export class CronJobsWriteDroppedError extends Error {
+	readonly action: string;
+	readonly jobId: string;
+	readonly persisted: AgentCronJob | undefined;
+
+	constructor(action: string, jobId: string, persisted: AgentCronJob | undefined) {
+		const outcome = persisted
+			? `the stored copy is "${persisted.status}" (updated ${persisted.updatedAt})`
+			: "the job is no longer stored";
+		super(`${action} was not persisted: another writer's copy of job ${jobId} won the store merge, ${outcome}`);
+		this.name = "CronJobsWriteDroppedError";
+		this.action = action;
+		this.jobId = jobId;
+		this.persisted = persisted;
+	}
+}
+
 export const SESSION_SCHEDULED_JOBS_FILENAME = "scheduled-jobs.json";
 
 const MAX_TIMEOUT_MS = 2_147_483_647;
@@ -268,8 +306,7 @@ export class AgentCronJobStore {
 			nextRunAt: parsed.nextRunAt.toISOString(),
 			runCount: 0,
 		};
-		this.writeJobs([...this.readJobs(), job]);
-		return job;
+		return this.persistedMutation(this.writeJobs([...this.readJobs(), job]), job, "Cron job creation");
 	}
 
 	/**
@@ -310,7 +347,8 @@ export class AgentCronJobStore {
 			return rebound;
 		});
 		if (reboundJobs.length > 0) {
-			this.writeJobs(jobs);
+			const outcome = this.writeJobs(jobs);
+			return reboundJobs.map((job) => this.persistedJob(outcome, job, "Session job rebind"));
 		}
 		return reboundJobs;
 	}
@@ -345,7 +383,12 @@ export class AgentCronJobStore {
 				job.source === "heartbeat" &&
 				(job.status === "active" || job.status === "paused")
 			) {
-				return { ...job, status: "cancelled" as const, nextRunAt: undefined, updatedAt: now.toISOString() };
+				return {
+					...job,
+					status: "cancelled" as const,
+					nextRunAt: undefined,
+					updatedAt: updatedAtForMutation(now, job),
+				};
 			}
 			return job;
 		});
@@ -372,8 +415,7 @@ export class AgentCronJobStore {
 			nextRunAt: parsed.nextRunAt.toISOString(),
 			runCount: 0,
 		};
-		this.writeJobs([...existing, job]);
-		return job;
+		return this.persistedMutation(this.writeJobs([...existing, job]), job, "Heartbeat creation");
 	}
 
 	listRlmHeartbeats(activeSessionId: string, options: { includeInactive?: boolean } = {}): AgentCronJob[] {
@@ -419,8 +461,7 @@ export class AgentCronJobStore {
 			nextRunAt: parsed.nextRunAt.toISOString(),
 			runCount: 0,
 		};
-		this.writeJobs([...this.readJobs(), job]);
-		return job;
+		return this.persistedMutation(this.writeJobs([...this.readJobs(), job]), job, "RLM heartbeat creation");
 	}
 
 	updateRlmHeartbeat(
@@ -479,11 +520,11 @@ export class AgentCronJobStore {
 				}
 				nextJob = { ...nextJob, status: "active", nextRunAt: nextRunAt.toISOString() };
 			}
-			updated = { ...nextJob, updatedAt: now.toISOString() };
+			updated = { ...nextJob, updatedAt: updatedAtForMutation(now, job) };
 			return updated;
 		});
 		if (matchedRlmHeartbeat && updated) {
-			this.writeJobs(jobs);
+			return this.persistedMutation(this.writeJobs(jobs), updated, "RLM heartbeat update");
 		}
 		return updated;
 	}
@@ -494,11 +535,11 @@ export class AgentCronJobStore {
 			if (job.id !== id || job.activeSessionId !== activeSessionId || job.source !== "rlm_heartbeat") {
 				return job;
 			}
-			deleted = withoutNextRunAt({ ...job, status: "cancelled", updatedAt: now.toISOString() });
+			deleted = withoutNextRunAt({ ...job, status: "cancelled", updatedAt: updatedAtForMutation(now, job) });
 			return deleted;
 		});
 		if (deleted) {
-			this.writeJobs(jobs);
+			return this.persistedMutation(this.writeJobs(jobs), deleted, "RLM heartbeat delete");
 		}
 		return deleted;
 	}
@@ -513,12 +554,17 @@ export class AgentCronJobStore {
 			) {
 				return job;
 			}
-			const cancelledJob = withoutNextRunAt({ ...job, status: "cancelled", updatedAt: now.toISOString() });
+			const cancelledJob = withoutNextRunAt({
+				...job,
+				status: "cancelled",
+				updatedAt: updatedAtForMutation(now, job),
+			});
 			cancelled.push(cancelledJob);
 			return cancelledJob;
 		});
 		if (cancelled.length > 0) {
-			this.writeJobs(jobs);
+			const outcome = this.writeJobs(jobs);
+			return cancelled.map((job) => this.persistedJob(outcome, job, "Session heartbeat cancellation"));
 		}
 		return cancelled;
 	}
@@ -537,12 +583,17 @@ export class AgentCronJobStore {
 			if (!matches || (job.status !== "active" && job.status !== "paused")) {
 				return job;
 			}
-			const cancelledJob = withoutNextRunAt({ ...job, status: "cancelled", updatedAt: now.toISOString() });
+			const cancelledJob = withoutNextRunAt({
+				...job,
+				status: "cancelled",
+				updatedAt: updatedAtForMutation(now, job),
+			});
 			cancelled.push(cancelledJob);
 			return cancelledJob;
 		});
 		if (cancelled.length > 0) {
-			this.writeJobs(jobs);
+			const outcome = this.writeJobs(jobs);
+			return cancelled.map((job) => this.persistedJob(outcome, job, "Session job cancellation"));
 		}
 		return cancelled;
 	}
@@ -557,11 +608,10 @@ export class AgentCronJobStore {
 			if (job.id !== current.id) {
 				return job;
 			}
-			paused = { ...job, status: "paused", nextRunAt: undefined, updatedAt: now.toISOString() };
+			paused = { ...job, status: "paused", nextRunAt: undefined, updatedAt: updatedAtForMutation(now, job) };
 			return paused;
 		});
-		this.writeJobs(jobs);
-		return paused;
+		return paused ? this.persistedMutation(this.writeJobs(jobs), paused, "Heartbeat pause") : undefined;
 	}
 
 	resumeHeartbeat(activeSessionId: string, now = new Date()): AgentCronJob | undefined {
@@ -578,11 +628,15 @@ export class AgentCronJobStore {
 			if (job.id !== current.id) {
 				return job;
 			}
-			resumed = { ...job, status: "active", nextRunAt: nextRunAt.toISOString(), updatedAt: now.toISOString() };
+			resumed = {
+				...job,
+				status: "active",
+				nextRunAt: nextRunAt.toISOString(),
+				updatedAt: updatedAtForMutation(now, job),
+			};
 			return resumed;
 		});
-		this.writeJobs(jobs);
-		return resumed;
+		return resumed ? this.persistedMutation(this.writeJobs(jobs), resumed, "Heartbeat resume") : undefined;
 	}
 
 	clearHeartbeat(activeSessionId: string, now = new Date()): AgentCronJob | undefined {
@@ -595,11 +649,10 @@ export class AgentCronJobStore {
 			if (job.id !== current.id) {
 				return job;
 			}
-			cleared = { ...job, status: "cancelled", nextRunAt: undefined, updatedAt: now.toISOString() };
+			cleared = { ...job, status: "cancelled", nextRunAt: undefined, updatedAt: updatedAtForMutation(now, job) };
 			return cleared;
 		});
-		this.writeJobs(jobs);
-		return cleared;
+		return cleared ? this.persistedMutation(this.writeJobs(jobs), cleared, "Heartbeat clear") : undefined;
 	}
 
 	manageHeartbeat(
@@ -617,11 +670,11 @@ export class AgentCronJobStore {
 				return job;
 			}
 			if (action === "pause") {
-				updated = withoutNextRunAt({ ...job, status: "paused", updatedAt: now.toISOString() });
+				updated = withoutNextRunAt({ ...job, status: "paused", updatedAt: updatedAtForMutation(now, job) });
 				return updated;
 			}
 			if (action === "stop") {
-				updated = withoutNextRunAt({ ...job, status: "cancelled", updatedAt: now.toISOString() });
+				updated = withoutNextRunAt({ ...job, status: "cancelled", updatedAt: updatedAtForMutation(now, job) });
 				return updated;
 			}
 			const nextRunAt = nextRunAtForSchedule(job.schedule, now);
@@ -632,14 +685,11 @@ export class AgentCronJobStore {
 				...job,
 				status: "active",
 				nextRunAt: nextRunAt.toISOString(),
-				updatedAt: now.toISOString(),
+				updatedAt: updatedAtForMutation(now, job),
 			};
 			return updated;
 		});
-		if (updated) {
-			this.writeJobs(jobs);
-		}
-		return updated;
+		return updated ? this.persistedMutation(this.writeJobs(jobs), updated, `Heartbeat ${action}`) : updated;
 	}
 
 	cancel(id: string, now = new Date()): AgentCronJob | undefined {
@@ -648,13 +698,10 @@ export class AgentCronJobStore {
 			if (job.id !== id || job.status === "cancelled") {
 				return job;
 			}
-			cancelled = { ...job, status: "cancelled", nextRunAt: undefined, updatedAt: now.toISOString() };
+			cancelled = { ...job, status: "cancelled", nextRunAt: undefined, updatedAt: updatedAtForMutation(now, job) };
 			return cancelled;
 		});
-		if (cancelled) {
-			this.writeJobs(jobs);
-		}
-		return cancelled;
+		return cancelled ? this.persistedMutation(this.writeJobs(jobs), cancelled, "Cron job cancellation") : cancelled;
 	}
 
 	recordRunResult(id: string, result: { now?: Date; error?: unknown }): AgentCronJob | undefined {
@@ -682,14 +729,11 @@ export class AgentCronJobStore {
 				lastRunAt: now.toISOString(),
 				lastError,
 				runCount: job.runCount + 1,
-				updatedAt: now.toISOString(),
+				updatedAt: updatedAtForMutation(now, job),
 			};
 			return updated;
 		});
-		if (updated) {
-			this.writeJobs(jobs);
-		}
-		return updated;
+		return updated ? this.persistedJob(this.writeJobs(jobs), updated, "Run result record") : updated;
 	}
 
 	recordSkipResult(id: string, result: { now?: Date }): AgentCronJob | undefined {
@@ -708,14 +752,11 @@ export class AgentCronJobStore {
 				...job,
 				nextRunAt: nextRunAt?.toISOString(),
 				lastSkippedAt: now.toISOString(),
-				updatedAt: now.toISOString(),
+				updatedAt: updatedAtForMutation(now, job),
 			};
 			return updated;
 		});
-		if (updated) {
-			this.writeJobs(jobs);
-		}
-		return updated;
+		return updated ? this.persistedJob(this.writeJobs(jobs), updated, "Skip result record") : updated;
 	}
 
 	due(now = new Date()): AgentCronJob[] {
@@ -881,7 +922,14 @@ export class AgentCronJobStore {
 		return dispatches;
 	}
 
-	private writeJobs(jobs: readonly AgentCronJob[]): void {
+	/**
+	 * Merges the caller's copies into the store and reports what the store holds afterwards.
+	 *
+	 * The return value is the authority the mutators report from: the emitted outcome is read
+	 * back from disk, so a change the merge discarded (another process's newer copy of the same
+	 * job) is visible to the caller instead of being reported as applied.
+	 */
+	private writeJobs(jobs: readonly AgentCronJob[]): JobsWriteOutcome {
 		if (this.sessionArtifactMode) {
 			const registeredSessionIds = new Set(this.sessionArtifactFiles.keys());
 			const unregistered = jobs.find((job) => !registeredSessionIds.has(job.sessionId));
@@ -897,7 +945,7 @@ export class AgentCronJobStore {
 			);
 			let previousHeartbeats = "";
 			let nextHeartbeats = "";
-			withCronJobsStateLocks(
+			const outcome = withCronJobsStateLocks(
 				targets.map(([, path]) => path),
 				() => {
 					const currentBySessionId = new Map<string, CronJobsState>();
@@ -931,6 +979,7 @@ export class AgentCronJobStore {
 					const dispatches = [...currentBySessionId.values()].flatMap((state) => state.dispatches);
 					const beforeJobs: AgentCronJob[] = [];
 					const afterJobs: AgentCronJob[] = [];
+					const persistedJobs: AgentCronJob[] = [];
 					for (const [sessionId, path] of targets) {
 						const current = currentBySessionId.get(sessionId) ?? { jobs: [], dispatches: [] };
 						const sessionDispatches = dispatches.filter(
@@ -946,22 +995,24 @@ export class AgentCronJobStore {
 							writeJobsState(path, nextState);
 							this.observedSessionArtifactFiles.add(sessionId);
 						}
+						persistedJobs.push(...readJobsState(path).jobs);
 					}
 					// Both signatures come from the states already read under the lock;
 					// separate passes over the files would triple the read cost of a write.
 					previousHeartbeats = heartbeatCatalogSignature(beforeJobs);
 					nextHeartbeats = heartbeatCatalogSignature(afterJobs);
+					return jobsWriteOutcome(persistedJobs, jobs);
 				},
 			);
 			if (previousHeartbeats !== nextHeartbeats) {
 				this.notifyHeartbeatChange();
 			}
-			return;
+			return outcome;
 		}
 		const path = this.requireFilePath();
 		let previousHeartbeats = "";
 		let nextHeartbeats = "";
-		withCronJobsStateLocks([path], () => {
+		const outcome = withCronJobsStateLocks([path], () => {
 			const current = readJobsState(path);
 			const next = mergedJobsState(current, jobs);
 			previousHeartbeats = heartbeatCatalogSignature(current.jobs);
@@ -969,10 +1020,53 @@ export class AgentCronJobStore {
 			if (JSON.stringify(current) !== JSON.stringify(next)) {
 				writeJobsState(path, next);
 			}
+			// The read-back is the caller's answer: a merge that kept another writer's copy, or a
+			// write that did not survive the rename, must not be reported as an applied change.
+			return jobsWriteOutcome(readJobsState(path).jobs, jobs);
 		});
 		if (previousHeartbeats !== nextHeartbeats) {
 			this.notifyHeartbeatChange();
 		}
+		return outcome;
+	}
+
+	/**
+	 * The stored copy of a change the caller asked for, or an error when the merge kept another
+	 * writer's copy instead.
+	 *
+	 * These callers are the ones a user or a model drives directly (pause, resume, stop, update,
+	 * delete), and every one of them reports its return value as the job's state: returning the
+	 * copy this process built would claim a change that never reached disk. A dropped write is a
+	 * real race (two processes write the same store), so it fails loudly and the caller can retry.
+	 */
+	private persistedMutation(outcome: JobsWriteOutcome, intended: AgentCronJob, action: string): AgentCronJob {
+		const persisted = outcome.persisted.get(intended.id);
+		if (!persisted || outcome.dropped.has(intended.id)) {
+			throw new CronJobsWriteDroppedError(action, intended.id, outcome.dropped.get(intended.id));
+		}
+		return persisted;
+	}
+
+	/**
+	 * The stored copy of a change that is reported rather than required to succeed.
+	 *
+	 * Session teardown and run bookkeeping must not fail on a lost race, so those callers name
+	 * whatever the store holds (which is what a reader will see) and log the drop instead of
+	 * throwing. Before this, they returned the discarded copy and the drop left no trace at all.
+	 */
+	private persistedJob(outcome: JobsWriteOutcome, intended: AgentCronJob, action: string): AgentCronJob {
+		const persisted = outcome.persisted.get(intended.id);
+		if (!persisted || outcome.dropped.has(intended.id)) {
+			const winner = outcome.dropped.get(intended.id);
+			cronLog.warn("cron job write dropped", {
+				action,
+				jobId: intended.id,
+				requestedStatus: intended.status,
+				persistedStatus: winner?.status,
+			});
+			return winner ?? intended;
+		}
+		return persisted;
 	}
 
 	private notifyHeartbeatChange(): void {
@@ -1019,11 +1113,21 @@ export function migrateLegacyCronJobsToSessionArtifacts(
 		grouped.push(job);
 		jobsByArtifact.set(artifactPath, grouped);
 	}
+	let stored = 0;
 	for (const [artifactPath, artifactJobs] of jobsByArtifact) {
-		writeJobsFile(artifactPath, artifactJobs);
+		const outcome = writeJobsFile(artifactPath, artifactJobs);
+		// A legacy copy can lose to the artifact copy the session already holds; count and report
+		// what the store kept instead of announcing a migration that did not happen.
+		for (const job of artifactJobs) {
+			if (outcome.dropped.has(job.id)) {
+				cronLog.warn("legacy scheduled job kept the artifact copy", { jobId: job.id, path: artifactPath });
+				continue;
+			}
+			stored += 1;
+		}
 	}
 	renameSync(filePath, `${filePath}.migrated-${Date.now()}`);
-	return jobs.length;
+	return stored;
 }
 
 export class AgentCronScheduler {
@@ -1714,8 +1818,11 @@ function readJobsStateIfPresent(path: string): CronJobsState | undefined {
 	};
 }
 
-function writeJobsFile(path: string, jobs: readonly AgentCronJob[]): void {
+function writeJobsFile(path: string, jobs: readonly AgentCronJob[]): JobsWriteOutcome {
 	writeJobsState(path, mergedJobsState(readJobsState(path), jobs));
+	// Read the write back rather than trusting the merged object: the caller is told what the
+	// store holds, not what this process meant to store.
+	return jobsWriteOutcome(readJobsState(path).jobs, jobs);
 }
 
 function mergedJobsState(current: CronJobsState, jobs: readonly AgentCronJob[]): CronJobsState {
@@ -1861,6 +1968,75 @@ function isAtLeastAsFresh(candidate: AgentCronJob, current: AgentCronJob): boole
 		return false;
 	}
 	return candidateTime >= currentTime;
+}
+
+/**
+ * Timestamp for a change applied on top of `previous`, which the caller has just read.
+ *
+ * Writers are separate processes and the merge resolves competing copies with last-write-wins on
+ * `updatedAt`, so those clocks have to agree for a change to survive. They do not: a copy written
+ * by a clock ahead of ours (NTP stepping a laptop back after sleep, a container sharing an agent
+ * directory with its host, a manual clock change) made every later change from this process look
+ * stale, and the change was dropped while the caller was handed the discarded copy. The caller
+ * read `previous` moments ago, so its change is newer than that copy by construction; saying so
+ * in the data removes the wall clock from the question of whether the change survives its own
+ * read. `updatedAt` therefore stays a monotonic stamp for the store, not a time of day.
+ */
+function updatedAtForMutation(now: Date, previous: AgentCronJob): string {
+	const previousTime = Date.parse(previous.updatedAt);
+	if (Number.isFinite(previousTime) && now.getTime() <= previousTime) {
+		// A copy at the end of the representable range has no later instant to stamp, so it keeps
+		// the caller's own timestamp: a corrupt stamp must not turn a mutation into a throw.
+		const repaired = new Date(previousTime + 1);
+		if (Number.isFinite(repaired.getTime())) {
+			return repaired.toISOString();
+		}
+	}
+	return now.toISOString();
+}
+
+/** Order-insensitive JSON, so two copies of a job compare equal regardless of key order. */
+function canonicalJson(value: unknown): string {
+	return JSON.stringify(value, (_key, entry) =>
+		entry && typeof entry === "object" && !Array.isArray(entry)
+			? Object.fromEntries(
+					Object.entries(entry as Record<string, unknown>).sort(([left], [right]) =>
+						left < right ? -1 : left > right ? 1 : 0,
+					),
+				)
+			: entry,
+	);
+}
+
+/**
+ * Whether the store holds the copy the caller produced. `updatedAt` is a stamp rather than
+ * content: a copy with identical fields and a different stamp is the same job state, so it is
+ * not a dropped write.
+ */
+function sameJobContent(left: AgentCronJob, right: AgentCronJob): boolean {
+	const { updatedAt: _leftUpdatedAt, ...leftContent } = left;
+	const { updatedAt: _rightUpdatedAt, ...rightContent } = right;
+	return canonicalJson(leftContent) === canonicalJson(rightContent);
+}
+
+/**
+ * Compares the copies the caller wrote against the state read back from disk, so callers can
+ * tell an applied change from one the merge discarded.
+ */
+function jobsWriteOutcome(persistedJobs: readonly AgentCronJob[], incoming: readonly AgentCronJob[]): JobsWriteOutcome {
+	const persistedById = new Map(persistedJobs.map((job) => [job.id, job]));
+	const persisted = new Map<string, AgentCronJob>();
+	const dropped = new Map<string, AgentCronJob | undefined>();
+	for (const job of incoming) {
+		const stored = persistedById.get(job.id);
+		if (stored) {
+			persisted.set(job.id, stored);
+		}
+		if (!stored || !sameJobContent(stored, job)) {
+			dropped.set(job.id, stored);
+		}
+	}
+	return { persisted, dropped };
 }
 
 function compareOptionalIso(left: string | undefined, right: string | undefined): number {

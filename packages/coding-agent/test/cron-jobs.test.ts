@@ -460,6 +460,88 @@ describe("AgentCronJobStore", () => {
 		expect(state.dispatches).toContainEqual(expect.objectContaining({ jobId: heartbeat.id }));
 	});
 
+	it("applies a heartbeat stop even when the local clock lags the copy on disk", () => {
+		const root = makeTempDir(tempDirs);
+		const storePath = join(root, "cron-jobs.json");
+		const store = new AgentCronJobStore(storePath);
+		const heartbeat = store.createHeartbeat({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: "/tmp/session.jsonl",
+			cwd: "/tmp/project",
+			scheduleText: "every 5m",
+			prompt: "check on me",
+			now: start,
+		});
+		// Another writer's clock runs ahead of ours, so the stored copy carries a later stamp.
+		store.pauseHeartbeat("active-1", new Date(start.getTime() + 25 * 60_000));
+
+		// This process's clock stepped back (NTP after sleep, container/host skew). Its reads are
+		// newer than the copy they replace, but its own stamps are older than what is on disk.
+		const behind = new Date(start.getTime() + 5 * 60_000);
+		const resumed = store.manageHeartbeat("active-1", heartbeat.id, "resume", behind);
+		expect(storedJob(storePath, heartbeat.id)).toMatchObject({ status: "active" });
+		expect(resumed).toMatchObject({ status: "active" });
+
+		const stopped = store.clearHeartbeat("active-1", new Date(behind.getTime() + 1_000));
+		const stored = storedJob(storePath, heartbeat.id);
+		expect(stored).toMatchObject({ status: "cancelled" });
+		// The caller is handed the stored copy, so a change that did not land cannot be reported
+		// as applied: the return value and the disk agree, whichever way the write went.
+		expect(stopped).toMatchObject({ id: heartbeat.id, status: "cancelled", updatedAt: stored.updatedAt });
+	});
+
+	it("applies an rlm_heartbeat delete from a clock that lags the stored copy", () => {
+		const root = makeTempDir(tempDirs);
+		const storePath = join(root, "cron-jobs.json");
+		const store = new AgentCronJobStore(storePath);
+		const heartbeat = store.createRlmHeartbeat({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: "/tmp/session.jsonl",
+			cwd: "/tmp/project",
+			scheduleText: "every 5m",
+			prompt: "wake me up",
+			now: start,
+		});
+		store.updateRlmHeartbeat("active-1", heartbeat.id, {
+			status: "pause",
+			now: new Date(start.getTime() + 25 * 60_000),
+		});
+
+		// The model's own skill path: a delete from a clock behind the stored copy has to reach
+		// disk, because the tool result is the only thing the model can report to the user.
+		const deleted = store.deleteRlmHeartbeat("active-1", heartbeat.id, new Date(start.getTime() + 5 * 60_000));
+
+		expect(storedJob(storePath, heartbeat.id)).toMatchObject({ status: "cancelled" });
+		expect(deleted).toMatchObject({ id: heartbeat.id, status: "cancelled" });
+	});
+
+	it("counts only the legacy jobs a migration actually stored", () => {
+		const root = makeTempDir(tempDirs);
+		const artifactDir = join(root, "session-artifacts", "session-1");
+		const artifactPath = join(artifactDir, SESSION_SCHEDULED_JOBS_FILENAME);
+		const artifacts = AgentCronJobStore.forSessionArtifacts();
+		artifacts.registerSessionArtifact("session-1", artifactDir);
+		const job = artifacts.create({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: join(root, "sessions", "session-1.jsonl"),
+			cwd: root,
+			scheduleText: "in 1h",
+			prompt: "already stored by the artifact store",
+			now: start,
+		});
+		// The session already holds a newer copy of that job than the legacy file does.
+		artifacts.cancel(job.id, new Date(start.getTime() + 25 * 60_000));
+		const legacyPath = join(root, "cron-jobs.json");
+		writeStoreFile(legacyPath, [{ ...job, status: "active", updatedAt: start.toISOString() }]);
+
+		// A legacy copy the store refuses to overwrite is not a migrated job.
+		expect(migrateLegacyCronJobsToSessionArtifacts(legacyPath)).toBe(0);
+		expect(storedJob(artifactPath, job.id)).toMatchObject({ status: "cancelled" });
+	});
+
 	it("keeps one persistent heartbeat per active session", () => {
 		const store = new AgentCronJobStore(makeStorePath(tempDirs));
 		const first = store.createHeartbeat({
@@ -1823,6 +1905,15 @@ function writeStoreFile(
 	dispatches: ReadonlyArray<{ id: string; jobId: string; claimedAt: string; scheduledFor: string }> = [],
 ): void {
 	writeFileSync(path, `${JSON.stringify({ jobs, dispatches }, null, 2)}\n`);
+}
+
+function storedJob(path: string, id: string): AgentCronJob {
+	const state = JSON.parse(readFileSync(path, "utf8")) as { jobs: AgentCronJob[] };
+	const job = state.jobs.find((candidate) => candidate.id === id);
+	if (!job) {
+		throw new Error(`job ${id} is not stored in ${path}`);
+	}
+	return job;
 }
 
 function makeStorePath(tempDirs: string[]): string {
