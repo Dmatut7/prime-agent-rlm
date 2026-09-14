@@ -6,6 +6,7 @@ import {
 	PrivateFrameChannelClosedError,
 	PrivateFramedChannel,
 } from "../session-worker/private-framing.js";
+import { isCompactAssistantDelta } from "./compact-session-stream.js";
 import {
 	type DaemonClientMessageListener,
 	type DaemonClientRequestOptions,
@@ -355,12 +356,21 @@ export class DaemonWorkerClient {
 		if (frame.header.kind !== "outbound") return;
 		let message: DaemonOutbound;
 		try {
-			if (frame.header.payloadEncoding !== undefined && frame.header.payloadEncoding !== "jsonl") {
+			if (
+				frame.header.payloadEncoding !== undefined &&
+				frame.header.payloadEncoding !== "jsonl" &&
+				frame.header.payloadEncoding !== "assistant-delta"
+			) {
 				throw new Error(`Direct worker sent an unsupported payload encoding: ${frame.header.payloadEncoding}`);
 			}
 			const parsed = JSON.parse(frame.payload.toString("utf8")) as unknown;
 			if (!parsed || typeof parsed !== "object" || typeof (parsed as { type?: unknown }).type !== "string") {
 				throw new Error("Direct worker sent an invalid outbound payload");
+			}
+			// Compact deltas only arrive from workers that saw the streaming_deltas
+			// declaration on this client's attach; validate before delivering.
+			if (frame.header.payloadEncoding === "assistant-delta" && !isCompactAssistantDelta(parsed)) {
+				throw new Error("Direct worker sent an invalid compact assistant delta");
 			}
 			message = parsed as DaemonOutbound;
 		} catch (error) {

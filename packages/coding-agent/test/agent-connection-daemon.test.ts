@@ -2823,6 +2823,7 @@ describe("DaemonAgentConnection", () => {
 				"slim_attach",
 				"chunked_snapshot",
 				"streaming_deltas",
+				"streaming_delta_fragments",
 			],
 			resumeCursor: {
 				activeSessionId: "active-1",
@@ -3521,6 +3522,7 @@ describe("DaemonAgentConnection", () => {
 				"slim_attach",
 				"chunked_snapshot",
 				"streaming_deltas",
+				"streaming_delta_fragments",
 			],
 			resumeCursor: {
 				activeSessionId: "active-1",
@@ -3540,6 +3542,7 @@ describe("DaemonAgentConnection", () => {
 				"slim_attach",
 				"chunked_snapshot",
 				"streaming_deltas",
+				"streaming_delta_fragments",
 			],
 			resumeCursor: {
 				activeSessionId: "active-1",
@@ -3606,6 +3609,7 @@ describe("DaemonAgentConnection", () => {
 				"slim_attach",
 				"chunked_snapshot",
 				"streaming_deltas",
+				"streaming_delta_fragments",
 			],
 		});
 
