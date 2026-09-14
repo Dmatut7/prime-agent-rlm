@@ -31,6 +31,7 @@ import {
 	readKernelVenvInUseState,
 	recordKernelVenvInUseSync,
 	releaseKernelVenvInUseSync,
+	sweepStaleVenvReference,
 	UNVERIFIED_REFERENCE_PREFIX,
 	VENV_IN_USE_DIR_NAME,
 } from "../src/core/kernel/venv-in-use.js";
@@ -65,6 +66,43 @@ function restorePermissions(root: string): void {
 		return;
 	}
 	chmodSync(root, 0o644);
+}
+
+/**
+ * Run `recordKernelVenvInUseSync` in a child whose file size limit is 1 KiB, so the reference
+ * write lands short (the POSIX answer to a full disk): writeSync stops at the limit and returns
+ * the partial count instead of throwing. Returns the record the writer reported.
+ */
+function shortWriteReference(venv: string): { pid: number; unverified: boolean; reason?: string } {
+	const driver = join(tempDir, "short-write-driver.ts");
+	const moduleUrl = new URL("../src/core/kernel/venv-in-use.js", import.meta.url).pathname;
+	writeFileSync(
+		driver,
+		[
+			`import { recordKernelVenvInUseSync } from ${JSON.stringify(moduleUrl)};`,
+			"const venv = process.argv[2] as string;",
+			// A long session id pushes the record well past the 1 KiB file size limit.
+			'const record = recordKernelVenvInUseSync(venv, { pid: process.pid, sessionId: "s".repeat(4096) });',
+			"process.stdout.write(JSON.stringify({ pid: process.pid, ...record }));",
+		].join("\n"),
+	);
+	const result = spawnSync(
+		"bash",
+		[
+			"-c",
+			`ulimit -f 1; exec ${JSON.stringify(process.execPath)} --import tsx ${JSON.stringify(driver)} ${JSON.stringify(venv)}`,
+		],
+		{
+			// tsx must stay out of its cache here: this process may not write a file larger than
+			// the limit either, and a truncated cache would poison other runs.
+			env: { ...process.env, TSX_DISABLE_CACHE: "1" },
+			encoding: "utf8",
+		},
+	);
+	expect(result.stderr).toBe("");
+	expect(result.signal).toBeNull();
+	expect(result.status).toBe(0);
+	return JSON.parse(result.stdout) as { pid: number; unverified: boolean; reason?: string };
 }
 
 function generation(suffix: string): string {
@@ -266,6 +304,87 @@ describe("kernel venv in-use references", () => {
 		expect(state.swept).toEqual([join(referenceDir, `${UNVERIFIED_REFERENCE_PREFIX}${dead}`)]);
 		expect(readdirSync(referenceDir)).toEqual([]);
 	});
+
+	it("keeps a truncated reference of a live pid and never reports the generation free", async () => {
+		// A full disk truncates the reference write (POSIX write returns a short count), so the
+		// record on disk is a prefix of the JSON. The holder is alive, so "cannot be parsed" must
+		// read as "in use", never as "gone": deleting that file is what lets a prune rm -rf a
+		// directory a running kernel is importing from.
+		const venv = createGeneration("aaaaaaaaaaaa");
+		const referenceDir = join(venv, VENV_IN_USE_DIR_NAME);
+		mkdirSync(referenceDir, { recursive: true, mode: 0o700 });
+		const referencePath = join(referenceDir, String(process.pid));
+		const complete = `${JSON.stringify({
+			version: 1,
+			pid: process.pid,
+			sessionId: "s".repeat(2000),
+			recordedAt: new Date().toISOString(),
+		})}\n`;
+		writeFileSync(referencePath, complete.slice(0, 1024), { mode: 0o600 });
+		expect(() => JSON.parse(readFileSync(referencePath, "utf8"))).toThrow();
+
+		const state = await readKernelVenvInUseState(venv);
+
+		expect(state.swept).toEqual([]);
+		expect(state.unknown).toBe(true);
+		expect(state.references).toHaveLength(1);
+		expect(existsSync(referencePath)).toBe(true);
+		expect(
+			decideKernelVenvRebuild({
+				platform: process.platform,
+				generationDirExists: true,
+				liveReferences: state.references.length,
+				referenceStateUnknown: state.unknown,
+			}).mode,
+		).toBe("defer");
+	});
+
+	it("re-reads a reference before unlinking it, so a rewritten one is not deleted", async () => {
+		// The sweep is two steps (judge, then unlink) and the writer is another process, so the
+		// file can be rewritten between them - or, as here, hold a live record by the time the
+		// unlink is decided. The second read decides; a live record survives.
+		const venv = createGeneration("aaaaaaaaaaaa");
+		const referenceDir = join(venv, VENV_IN_USE_DIR_NAME);
+		mkdirSync(referenceDir, { recursive: true, mode: 0o700 });
+		const staleName = String(deadPid());
+		const rewrittenPath = join(referenceDir, staleName);
+		writeFileSync(
+			rewrittenPath,
+			`${JSON.stringify({ version: 1, pid: process.pid, sessionId: "rewritten", recordedAt: new Date().toISOString() })}\n`,
+			{ mode: 0o600 },
+		);
+
+		expect(await sweepStaleVenvReference(rewrittenPath, staleName)).toBe("kept");
+		expect(existsSync(rewrittenPath)).toBe(true);
+
+		// Positive control: the same helper removes an entry whose record is still provably gone.
+		const gone = deadPid();
+		const gonePath = join(referenceDir, String(gone));
+		writeFileSync(gonePath, `${JSON.stringify({ version: 1, pid: gone, recordedAt: new Date().toISOString() })}\n`, {
+			mode: 0o600,
+		});
+		expect(await sweepStaleVenvReference(gonePath, String(gone))).toBe("swept");
+		expect(existsSync(gonePath)).toBe(false);
+	});
+
+	it.skipIf(process.platform === "win32")(
+		"does not leave a silently truncated reference when the write lands short",
+		() => {
+			// The real short write, not a simulation: a file size limit makes writeSync stop at
+			// the limit and return the partial count (a full disk does the same). The old code
+			// ignored the returned count, so the writer believed it had recorded a reference
+			// while the on-disk bytes were a truncated prefix.
+			const venv = createGeneration("aaaaaaaaaaaa");
+			const report = shortWriteReference(venv);
+			expect(report.unverified).toBe(true);
+			expect(report.reason).toBeTruthy();
+
+			const referencePath = join(venv, VENV_IN_USE_DIR_NAME, String(report.pid));
+			const onDisk = existsSync(referencePath) ? readFileSync(referencePath, "utf8") : "";
+			expect(onDisk.length).toBeGreaterThan(0);
+			expect(() => JSON.parse(onDisk)).toThrow();
+		},
+	);
 
 	it.skipIf(runsAsRoot)("reports an unverified registration when the tombstone cannot be written either", async () => {
 		// Bounded residual, pinned so it cannot be mistaken for protection: when neither the

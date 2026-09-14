@@ -105,12 +105,22 @@ function scanShareSecretViews(views: readonly ShareScanView[], options?: ShareSe
 	}
 
 	for (const secret of options?.secretValues ?? []) {
-		for (const view of views) {
-			const index = view.text.indexOf(secret.value);
-			if (index < 0) continue;
-			record(view, "Configured credential", { value: secret.value, index, name: secret.source }, secret.source);
-			break;
-		}
+		// Every loaded value is compared against every view, with no shape and no plausibility in
+		// the way. A `compareOnly` value is compared and then not reported *on its own*: it names
+		// a location (`GOOGLE_APPLICATION_CREDENTIALS`), such a path appears in ordinary
+		// transcripts, and a warning on each of those stops the warning being read. Dropping such
+		// a value from the set is the mistake this check exists to avoid, so it is compared here;
+		// bytes a shape detector recognizes are still reported by that detector.
+		const match = views
+			.map((view) => ({ view, index: view.text.indexOf(secret.value) }))
+			.find((candidate) => candidate.index >= 0);
+		if (match === undefined || secret.compareOnly === true) continue;
+		record(
+			match.view,
+			"Configured credential",
+			{ value: secret.value, index: match.index, name: secret.source },
+			secret.source,
+		);
 	}
 
 	return findings;

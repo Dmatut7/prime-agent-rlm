@@ -101,10 +101,11 @@ export const HIGH_ENTROPY_TOKEN_TYPE = "High-entropy credential-like value";
  * because a session transcript is mostly JSON. The value class stops at quotes, commas,
  * semicolons, backslashes and brackets, so a nested object is not swallowed as a value.
  */
-const CREDENTIAL_NAME = /[A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)[A-Za-z0-9_]*/i;
+const CREDENTIAL_NAME =
+	/[A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|PASSCODE|CREDENTIAL)[A-Za-z0-9_]*/i;
 
 const CREDENTIAL_ASSIGNMENT =
-	/\b([A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)[A-Za-z0-9_]*)["']?\s*[=:]\s*["']?([^\s"',;\\{}[\]()<>]{8,})/g;
+	/\b([A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|PASSCODE|CREDENTIAL)[A-Za-z0-9_]*)["']?\s*[=:]\s*["']?([^\s"',;\\{}[\]()<>]{8,})/g;
 
 /**
  * Names that contain a credential word but never hold a secret. Without this an installed
@@ -120,7 +121,7 @@ function isCredentialName(name: string): boolean {
 
 /** A random-looking token only counts as a credential when a name sits right in front of it. */
 const CREDENTIAL_ANCHOR =
-	/(?:api[_-]?key|apikey|access[_-]?key|access[_-]?token|secret[_-]?key|client[_-]?secret|private[_-]?key|signing[_-]?key|encryption[_-]?key|refresh[_-]?token|authorization|bearer|token|secret|password|passwd|pwd|credential|key)\s*[=:"']{0,3}\s*$/i;
+	/(?:api[_-]?key|apikey|access[_-]?key|access[_-]?token|secret[_-]?key|client[_-]?secret|private[_-]?key|signing[_-]?key|encryption[_-]?key|refresh[_-]?token|authorization|bearer|token|secret|password|passwd|passphrase|pwd|credential|key)\s*[=:"']{0,3}\s*$/i;
 
 /**
  * Encapsulated blobs that real transcripts carry and that no viewer needs warned about:
@@ -161,10 +162,40 @@ function stripWrappingQuotes(value: string): string {
 }
 
 /**
- * Whether a value is worth treating as a credential at all. Used by the comparison against
- * this session's loaded values and by the assignment detector, because the difference
- * between a credential and the prose around it is what decides whether the warning is read:
- * every placeholder here that was taken for a secret would warn on every session.
+ * Values a loaded credential can plausibly look like, without pretending to know what a
+ * credential looks like. Only the two things that would make a *comparison* useless survive:
+ * a reference to somewhere else (`${VAR}`, `$(cat …)`) and a value everyone writes as a
+ * placeholder. Everything else - an all-digit key, a lower-case slug, a value with slashes in
+ * it - is a real value somebody is configured with, and the comparison exists precisely
+ * because shape cannot decide that. See `isPlausibleSecretValue` for the shape-driven
+ * question the detectors ask.
+ */
+export function isComparableSecretValue(raw: string): boolean {
+	const value = stripWrappingQuotes(raw.trim());
+	if (value.length === 0) return false;
+	if (PLACEHOLDER_VALUES.test(value)) return false;
+	// `${ANTHROPIC_API_KEY}` is a reference to a credential this session resolves elsewhere.
+	return !/^[$%]/.test(value);
+}
+
+/**
+ * Whether a loaded value is a *location* rather than a credential - `GOOGLE_APPLICATION_CREDENTIALS`
+ * holding an absolute path, a key file name. Such a value belongs in the comparison set (it is
+ * loaded, and dropping it is how the comparison missed real credentials), but it is not reported
+ * on its own: a transcript mentions the path of a key file constantly, and a warning on every one
+ * of those is what makes the warning stop being read.
+ */
+export function isLocationValuedCredential(raw: string): boolean {
+	const value = stripWrappingQuotes(raw.trim());
+	return looksLikeLocation(value) || value.endsWith("/") || FILE_EXTENSION_TAIL.test(value);
+}
+
+/**
+ * Whether a value is worth treating as a credential at all. Used by the shape-driven
+ * assignment detector, because the difference between a credential and the prose around it is
+ * what decides whether the warning is read: every placeholder here that was taken for a secret
+ * would warn on every session. It is deliberately *not* used to filter the values this session
+ * has loaded - a loaded value is a credential whatever it looks like.
  */
 export function isPlausibleSecretValue(raw: string): boolean {
 	const value = stripWrappingQuotes(raw.trim());
@@ -234,15 +265,16 @@ function looksLikeHash(value: string): boolean {
 
 function looksLikePath(value: string): boolean {
 	return (
+		// A path announces itself: it starts at a root, it is a URL fragment (`platform/…/`), or
+		// it ends in a file name. Counting separators instead was the mistake - the AWS
+		// secret-key shape (`…/…/…`) has two of them and was excluded from the entropy detector
+		// for looking like a path, which is how a bare-pasted key stayed invisible.
 		value.startsWith("/") ||
 		value.startsWith("./") ||
 		value.startsWith("~/") ||
 		value.includes("//") ||
-		// A URL fragment (`platform/…/`) or a file name is not a token, even when it is long and
-		// random-looking; a credential is a single run with no path separator structure.
 		value.includes("://") ||
 		value.endsWith("/") ||
-		value.split("/").length > 2 ||
 		FILE_EXTENSION_TAIL.test(value)
 	);
 }
