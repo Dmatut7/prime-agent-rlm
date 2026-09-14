@@ -1106,6 +1106,21 @@ interface RlmChildRun {
 	 * that run never earned.
 	 */
 	noReplyVerdictSupersededBy?: string;
+	/**
+	 * Set when the publication gate actually withheld this run's no-reply notice, so a
+	 * reader that sees `terminal_kind: "completed_without_reply"` but no notice in the
+	 * parent's transcript can reconcile the two instead of guessing.
+	 */
+	noReplyNoticeSuperseded?: boolean;
+	/**
+	 * The child's own terminal-error report, still queued when this run's failure
+	 * verdict was taken. Per run on purpose: a child session outlives the run that
+	 * failed, so a session-wide flag would swallow the NEXT run's death report - the
+	 * one case where the synthesized notice is the only record.
+	 */
+	provisionalFailureNoticeReplyId?: string;
+	/** That report was delivered after the verdict, so the synthesized one is a duplicate. */
+	failureVerdictSupersededBy?: string;
 	abort: () => void;
 	publication: AgentMessageDeferred;
 	/** Resolves after terminal result publication and detached-run cleanup finish. */
@@ -1531,13 +1546,7 @@ export class AgentSession {
 	 * id it just delivered, which is how this session learns the report did land.
 	 */
 	private _queuedTerminalErrorNoticeMessageId: string | undefined;
-	/**
-	 * The queued terminal-error notice was delivered after this session's run had
-	 * already been classified. Read only by the parent's notice publication gate:
-	 * the classifier's `terminalErrorNoticeDelivered` fact keeps its B1 meaning
-	 * (queued is not delivered), so a verdict is never decided by this flag.
-	 */
-	private _terminalErrorNoticeDeliveredAfterVerdict = false;
+
 	/**
 	 * Consecutive retryable `agent_message.send` failures per target. Bounded on
 	 * purpose: a retryable error plus a host liveness vouch plus a persistent model
@@ -3989,7 +3998,7 @@ export class AgentSession {
 		// Marked before the sender lookup on purpose: a run outlives its session
 		// binding, and "the reply this verdict called missing just landed" has to be
 		// recorded even when the credit itself has nowhere to go.
-		this._markNoReplyVerdictSuperseded(message.details.id);
+		this._markTerminalVerdictsSupersededByDelivery(message.details.id);
 		const child = this._rlmChildSessionBySessionId(senderSessionId);
 		if (!child) {
 			// The credit has nowhere to land: the sender is gone (a deleted child, or
@@ -4020,24 +4029,34 @@ export class AgentSession {
 	}
 
 	/**
-	 * Record that a reply a settled run was still owed has now been delivered.
+	 * Record that a message a settled run was still owed has now been delivered.
 	 *
-	 * Narrow on purpose: only a run that recorded this exact id as owed when its
-	 * verdict was taken is marked, and `take` hands an id out once, so a reply a
-	 * later run boundary discarded can never suppress an earlier run's notice.
+	 * Both terminal verdicts that a late delivery can disprove are marked here, and
+	 * both are narrow on purpose: only a run that recorded this exact id when its
+	 * verdict was taken is marked, and `take` hands an id out once, so neither a reply
+	 * a later run boundary discarded nor a newer run of the same child session can be
+	 * suppressed by an older message.
 	 */
-	private _markNoReplyVerdictSuperseded(messageId: string): void {
+	private _markTerminalVerdictsSupersededByDelivery(messageId: string): void {
 		for (const run of this._knownRlmChildRuns()) {
-			if (run.noReplyVerdictSupersededBy !== undefined) continue;
-			if (!run.provisionalNoReplyReplyIds?.includes(messageId)) continue;
-			run.noReplyVerdictSupersededBy = messageId;
-			// Countable: this is the moment a no-reply verdict becomes known-stale,
-			// which is minutes before the notice that would have repeated it.
-			sessionLog.info("queued child reply landed after its run's no-reply verdict", {
-				sessionId: this.sessionId,
-				childId: run.id,
-				messageId,
-			});
+			if (run.noReplyVerdictSupersededBy === undefined && run.provisionalNoReplyReplyIds?.includes(messageId)) {
+				run.noReplyVerdictSupersededBy = messageId;
+				// Countable: this is the moment a no-reply verdict becomes known-stale,
+				// which is minutes before the notice that would have repeated it.
+				sessionLog.info("queued child reply landed after its run's no-reply verdict", {
+					sessionId: this.sessionId,
+					childId: run.id,
+					messageId,
+				});
+			}
+			if (run.failureVerdictSupersededBy === undefined && run.provisionalFailureNoticeReplyId === messageId) {
+				run.failureVerdictSupersededBy = messageId;
+				sessionLog.info("queued subagent terminal-error notice landed after its run's failure verdict", {
+					sessionId: this.sessionId,
+					childId: run.id,
+					messageId,
+				});
+			}
 		}
 	}
 
@@ -4060,18 +4079,10 @@ export class AgentSession {
 	private _creditDeliveredQueuedParentReply(messageId: string): void {
 		this._repliedToParentSinceTask = true;
 		this._parentReplyCount += 1;
-		if (this._queuedTerminalErrorNoticeMessageId === messageId) {
-			// This session's own terminal-error report just reached the parent, so the
-			// failure notice the parent synthesized for the same run is a duplicate.
-			// The classifier already ran (it saw `queued`, correctly, and reported the
-			// failure), so this only arms the parent's publication gate.
-			this._queuedTerminalErrorNoticeMessageId = undefined;
-			this._terminalErrorNoticeDeliveredAfterVerdict = true;
-			sessionLog.info("queued subagent terminal-error notice delivered after its run's verdict", {
-				sessionId: this.sessionId,
-				messageId,
-			});
-		}
+		// The parent marks the run it owes this delivery to before calling in here, so
+		// the id has served its purpose; dropping it keeps a later run of this session
+		// from being matched against an older report.
+		if (this._queuedTerminalErrorNoticeMessageId === messageId) this._queuedTerminalErrorNoticeMessageId = undefined;
 		sessionLog.info("queued parent reply delivered; reply credit backfilled", {
 			sessionId: this.sessionId,
 			messageId,
@@ -4140,6 +4151,12 @@ export class AgentSession {
 				if (record?.role === "primary") {
 					this._actionStore.ticketFor(action).settleDelivered({ status: "delivered" });
 					this._settleAgentMessage(action.agentMessageId, "delivery");
+					this._creditQueuedChildReplyDelivery(event.message);
+				} else if (record) {
+					// A child reply can also ride in as prefix/next-turn context (a restart
+					// reflow, an aggregated wake): it reaches this session's context all the
+					// same, so the credit is owed. `take` hands an id out once, so a message
+					// delivered on both routes cannot be counted twice.
 					this._creditQueuedChildReplyDelivery(event.message);
 				}
 			}
@@ -5860,14 +5877,19 @@ export class AgentSession {
 			}
 			return undefined;
 		}
-		const child = run?.session ?? this._rlmChildSessions.get(childId)?.session;
-		if (!child) return undefined;
-		return child._terminalErrorNoticeDeliveredAfterVerdict
-			? "the child's own terminal-error notice was delivered first"
+		const failureDetails = message.details as { kind?: string } | undefined;
+		if (failureDetails?.kind !== undefined && failureDetails.kind !== "error") return undefined;
+		const supersededFailure = run?.failureVerdictSupersededBy;
+		return supersededFailure !== undefined
+			? `the child's own terminal-error notice was delivered first (${supersededFailure})`
 			: undefined;
 	}
 
-	/** Log one suppression: a fix that hides a notice has to leave a countable trace. */
+	/**
+	 * Log one suppression: a fix that hides a notice has to leave a countable trace.
+	 * A withheld no-reply notice is also recorded on its run, so `collectRlmChildren`
+	 * can reconcile "the verdict says no reply" with "no notice ever arrived".
+	 */
 	private _reportSupersededRlmTerminalNotice(message: CustomMessage, reason: string): void {
 		const details = message.details as { kind?: string; childId?: string; sessionName?: string } | undefined;
 		sessionLog.info("rlm terminal notice superseded before publication", {
@@ -5877,6 +5899,9 @@ export class AgentSession {
 			kind: details?.kind ?? message.customType,
 			reason,
 		});
+		if (details?.kind !== "completed_without_reply" || typeof details.childId !== "string") return;
+		const run = this._activeRlmChildRuns.get(details.childId) ?? this._rlmChildSessions.get(details.childId)?.run;
+		if (run) run.noReplyNoticeSuperseded = true;
 	}
 
 	/** The notices that are still true, dropping (and logging) the disproved ones. */
@@ -5903,13 +5928,24 @@ export class AgentSession {
 	 */
 	private _dropSupersededRlmTerminalNoticeActions(): void {
 		const superseded = new Map<QueuedSessionAction, string>();
+		// Deliberately not fed the pending next-turn queue: a reply still sitting there
+		// needs this very action's turn to be delivered, so cancelling the notice would
+		// strand the reply it was meant to be disproved by. Only a delivery that has
+		// already happened (or one riding in this same turn, handled by
+		// `_takePendingNextTurnMessagesForTurn`) can disprove a notice.
 		for (const action of this._actionStore.clearableActions()) {
-			if (action.lifecycle.state === "preparing") continue;
-			if (!this._isRlmTerminalNoticeAction(action)) continue;
-			const message = primaryDeliveryRecord(action).message;
-			if (message.role !== "custom") continue;
-			const reason = this._supersededRlmTerminalNoticeReason(message);
-			if (reason !== undefined) superseded.set(action, reason);
+			if (action.lifecycle.state === "preparing" || action.payload.kind !== "turn") continue;
+			const primary = primaryDeliveryRecord(action).message;
+			if (this._isRlmTerminalNoticeAction(action)) {
+				if (primary.role !== "custom") continue;
+				const reason = this._supersededRlmTerminalNoticeReason(primary);
+				if (reason !== undefined) superseded.set(action, reason);
+				continue;
+			}
+			// An aggregated failure wake folds notices in as prefix records behind a
+			// synthetic summary, so the notice is not this action's primary message and
+			// a gate that only reads the primary would wave the duplicate through.
+			this._stripSupersededFoldedRlmTerminalNotices(action, superseded);
 		}
 		if (superseded.size === 0) return;
 		const ids = new Set([...superseded.keys()].map((action) => action.id));
@@ -5923,6 +5959,50 @@ export class AgentSession {
 			new Error("RLM child terminal notice was superseded before publication."),
 		);
 		this._emitQueueUpdate();
+	}
+
+	/**
+	 * Drop superseded notices folded into an action as non-primary records.
+	 *
+	 * The wake's summary text names every failure it folded, so it is rebuilt from the
+	 * survivors: a summary still claiming a failure whose notice was just withheld
+	 * would repeat the duplicate in prose. When nothing survives, the whole action is
+	 * handed back to the caller for cancellation - a wake with nothing to report must
+	 * not start a turn.
+	 */
+	private _stripSupersededFoldedRlmTerminalNotices(
+		action: QueuedSessionAction,
+		cancel: Map<QueuedSessionAction, string>,
+	): void {
+		if (action.payload.kind !== "turn") return;
+		const struck: DeliveryRecord[] = [];
+		for (const record of action.payload.records) {
+			if (record.role === "primary" || record.durable) continue;
+			const message = record.message;
+			if (message.role !== "custom" || !this._isRlmTerminalNotice(message)) continue;
+			const reason = this._supersededRlmTerminalNoticeReason(message);
+			if (reason === undefined) continue;
+			this._reportSupersededRlmTerminalNotice(message, reason);
+			struck.push(record);
+		}
+		if (struck.length === 0) return;
+		const struckSet = new Set<DeliveryRecord>(struck);
+		action.payload.records = action.payload.records.filter((record) => !struckSet.has(record));
+		const survivors = action.payload.records
+			.map((record) => record.message)
+			.filter(
+				(message): message is CustomMessage => message.role === "custom" && this._isRlmTerminalNotice(message),
+			);
+		if (survivors.length === 0) {
+			const firstReason = "every folded terminal notice was superseded before publication";
+			cancel.set(action, firstReason);
+			return;
+		}
+		const summary = aggregatedFailureWakeText(survivors);
+		action.payload.text = summary;
+		action.payload.content = [{ type: "text", text: summary }];
+		const primary = primaryDeliveryRecord(action).message;
+		if (primary.role === "user") primary.content = [{ type: "text", text: summary }];
 	}
 
 	/**
@@ -8839,7 +8919,15 @@ export class AgentSession {
 	}
 
 	restorePendingNextTurnMessages(messages: readonly CustomMessage[]): void {
-		this._pushPendingNextTurnMessages(...messages.map((message) => cloneCustomMessage(message)));
+		const restored = messages.map((message) => cloneCustomMessage(message));
+		// Same two duties as the sidecar reflow: a restored child reply still owes its
+		// sender a delivery credit, and it goes ahead of any restored notice so a turn
+		// that takes both as next-turn context cannot put the verdict above the reply.
+		this._pushPendingNextTurnMessages(
+			...restored.filter((message) => isAgentSessionMessage(message)),
+			...restored.filter((message) => !isAgentSessionMessage(message)),
+		);
+		for (const message of restored) this._registerRestoredQueuedChildReply(message);
 		this._flushDeferredRlmTerminalNotices();
 	}
 
@@ -12376,6 +12464,7 @@ export class AgentSession {
 			activity_kind: snapshot.activity?.kind,
 			terminal_kind: run.terminalKind,
 			terminal_reason: run.terminalReason,
+			no_reply_notice_superseded: run.noReplyNoticeSuperseded,
 			// Same two sources the terminal classifier reads: the run's own record
 			// survives a disposed child session, the child's copy is the fallback for
 			// a kill the parent's subscription never observed.
@@ -12906,6 +12995,18 @@ export class AgentSession {
 			}
 		}
 		if (outcome.channel === "failure") {
+			// Only an `error` verdict can be a duplicate of the child's own report: a
+			// watchdog kill or an abort is a different fact, and the child's terminal
+			// error notice never claims either.
+			const selfReportId = outcome.kind === "error" ? child?._queuedTerminalErrorNoticeMessageId : undefined;
+			if (selfReportId !== undefined) {
+				run.provisionalFailureNoticeReplyId = selfReportId;
+				sessionLog.info("failure verdict is provisional on the child's own queued report", {
+					sessionId: this.sessionId,
+					childId: run.id,
+					messageId: selfReportId,
+				});
+			}
 			const stallAbort = run.stallAbort;
 			await deliver(
 				createRlmChildFailureMessage({

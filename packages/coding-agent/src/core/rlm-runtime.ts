@@ -94,6 +94,15 @@ export interface RlmCollectResultEntry {
 	terminal_kind: RlmChildTerminalOutcomeKind | undefined;
 	/** Model-facing reason recorded alongside {@link terminal_kind}. */
 	terminal_reason: string | undefined;
+	/**
+	 * Set when a `completed_without_reply` verdict's notice was withheld at
+	 * publication because the reply it called missing had been delivered in between.
+	 * The verdict itself is unchanged - {@link terminal_kind} still reports what was
+	 * decided when the run settled - so this is the reconciliation flag for a reader
+	 * that sees a no-reply verdict and no notice in the parent's transcript. Optional
+	 * and additive: an older reader ignores it.
+	 */
+	no_reply_notice_superseded?: boolean;
 	/** Watchdog facts, present even when no failure notice was delivered. */
 	stall_abort: RlmCollectStallAbort | undefined;
 }

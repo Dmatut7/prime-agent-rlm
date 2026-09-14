@@ -163,7 +163,7 @@ describe("a terminal notice published after its verdict went stale", () => {
 	 * entry re-admitted without a sender on the other end), which is the wire that
 	 * used to lose the owed credit silently.
 	 */
-	async function makeFamily(options: { route?: "accept" | "restore" } = {}): Promise<Family> {
+	async function makeFamily(options: { route?: "accept" | "restore" | "pending" } = {}): Promise<Family> {
 		const route = options.route ?? "accept";
 		const family: { parent?: Harness; child?: Harness } = {};
 		const deliveryStatuses: string[] = [];
@@ -190,6 +190,11 @@ describe("a terminal notice published after its verdict went stale", () => {
 						agentMessageId: reply.details.id,
 						customMessage: reply,
 					});
+					deliveryStatuses.push("queued");
+				} else if (route === "pending") {
+					// The daemon's restore_next_turn leg: not an action, so the reply rides
+					// into whichever turn starts next as next-turn context.
+					parent.restorePendingNextTurnMessages([reply]);
 					deliveryStatuses.push("queued");
 				} else {
 					deliveryStatuses.push(await deliverChildMessage(parent, reply));
@@ -281,6 +286,9 @@ describe("a terminal notice published after its verdict went stale", () => {
 		const afterDrain = await family.parent.session.collectRlmChildren([handle.rlm_child_id], 0);
 		expect(afterDrain.results[0]?.replied_since_task).toBe(true);
 		expect(afterDrain.results[0]?.terminal_kind).toBe("completed_without_reply");
+		// Reconciliation without touching the verdict: a reader that sees a no-reply
+		// verdict and no notice in the transcript can tell why.
+		expect(afterDrain.results[0]?.no_reply_notice_superseded).toBe(true);
 	});
 
 	it("still reports a child whose queued reply was cleared instead of delivered", async () => {
@@ -498,4 +506,259 @@ describe("a terminal notice published after its verdict went stale", () => {
 			restored.session.requestAbort();
 		}
 	});
+
+	it("re-arms the owed credit for a reply restored into the next-turn queue", async () => {
+		const family = await makeFamily({ route: "pending" });
+		const handle = await family.parent.session.runRlmChild("audit and reply", { name: "next-turn-worker" });
+		await vi.waitFor(() => expect(family.deliveryStatuses).toEqual(["queued"]), { timeout: 15_000, interval: 20 });
+		const atSettle = await family.parent.session.collectRlmChildren([handle.rlm_child_id], 20_000);
+		expect(atSettle.results[0]?.terminal_kind).toBe("completed_without_reply");
+
+		await drainParent(family);
+
+		// The reply rode in as next-turn context of the notice's own turn: it has to be
+		// in the transcript, credited (a prefix delivery is a delivery), and ahead of
+		// the notice. The notice itself still publishes - the gate only ever acts on a
+		// delivery that has already happened, and cancelling this turn would strand the
+		// very reply it is about to carry - so this leg is fail-open by construction.
+		const transcript = family.parent.session.messages;
+		const replyIndex = deliveredReplyIds(transcript).indexOf(family.messageIds[0]!);
+		expect(replyIndex).toBeGreaterThanOrEqual(0);
+		const noticeIndex = transcript.findIndex(
+			(message) => message.role === "custom" && message.customType === RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
+		);
+		expect(noticeIndex).toBeGreaterThanOrEqual(0);
+		expect(replyIndex).toBeLessThan(noticeIndex);
+		const afterDrain = await family.parent.session.collectRlmChildren([handle.rlm_child_id], 0);
+		expect(afterDrain.results[0]?.replied_since_task).toBe(true);
+	});
+
+	// The two cases below are the review lane's probes (finish-queued-fix, PROBE E and
+	// PROBE B), ported verbatim in shape so the holes they found stay pinned.
+
+	it("still reports a later run's failure when an earlier run reported itself", async () => {
+		// The suppression fact has to be per run: a child session outlives the run that
+		// failed, and a session-wide flag set by run 1 silently swallows run 2's death
+		// report - the one case where the synthesized notice is the only record.
+		const family: { parent?: Harness; child?: Harness } = {};
+		const deliveryStatuses: string[] = [];
+		let sentOwnNotices = 0;
+		const roster = (): AgentFamilyRosterResult => ({
+			current: { name: "failing-child", id: "child-session-id", depth: 1 },
+			entries: [{ relationship: "parent", name: "parent", id: "parent-session-id", depth: 0, status: "running" }],
+		});
+		// Run 1 reports by hand (queued, then delivered). Run 2 cannot: the send fails,
+		// which is exactly when the parent's own synthesized report is the only record.
+		const sendAgentMessage = vi.fn(async (input: { message: string }) => {
+			const parent = family.parent?.session;
+			const child = family.child?.session;
+			if (!parent || !child) throw new Error("the family is not wired yet");
+			sentOwnNotices += 1;
+			if (sentOwnNotices > 1) throw new Error("the child could not report by hand");
+			const notice = childMessage(child, parent, input.message);
+			const status = await deliverChildMessage(parent, notice);
+			deliveryStatuses.push(status);
+			const receipt: AgentSessionMessageReceipt = {
+				id: notice.details.id,
+				source: AGENT_MESSAGE_SOURCE,
+				target: { activeSessionId: "parent-active", sessionId: parent.sessionId },
+				message: input.message,
+				deliveryStatus: status,
+			};
+			return receipt;
+		});
+		let releaseParent: () => void = () => {};
+		const parentGate = new Promise<void>((resolve) => {
+			releaseParent = resolve;
+		});
+		const child = track(
+			await createHarness({
+				rlmDepth: 1,
+				settings: { stallWatchdog: { enabled: false }, retry: { enabled: false } },
+				agentMessageController: { listAgents: () => ({ agents: [] }), roster, sendAgentMessage },
+			}),
+		);
+		const parent = track(
+			await createHarness({
+				tools: [hangTool(parentGate)],
+				rlmDepth: 0,
+				rlmMaxDepth: 1,
+				settings: { stallWatchdog: { enabled: false }, retry: { enabled: false } },
+				subagentRuntimeHost: {
+					createRlmSubagentRuntime: async () => ({ session: child.session }),
+					deleteRlmSubagentRuntime: async () => {},
+				},
+			}),
+		);
+		family.parent = parent;
+		family.child = child;
+		parent.setResponses([
+			fauxAssistantMessage(fauxToolCall("hold_the_turn", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("the long parent turn finished"),
+			fauxAssistantMessage("the parent read the child's own error report"),
+			fauxAssistantMessage("the parent keeps working"),
+			fauxAssistantMessage("the parent is idle again"),
+			fauxAssistantMessage("the parent stays idle"),
+		]);
+		child.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" })]);
+
+		const parentTurn = parent.session.promptAndWait("do the long work");
+		await waitForCondition(() => parent.session.isStreaming);
+		const run1 = await parent.session.runRlmChild("first task", { name: "failing-child" });
+		await vi.waitFor(() => expect(deliveryStatuses).toEqual(["queued"]), { timeout: 20_000, interval: 20 });
+		await vi.waitFor(() => expect(parent.session.hasRunningRlmChildren()).toBe(false), {
+			timeout: 20_000,
+			interval: 20,
+		});
+		releaseParent();
+		await parentTurn.catch(() => {});
+		await vi.waitFor(
+			() => {
+				expect(parent.session.isStreaming).toBe(false);
+				expect(parent.session.unfinishedActionCount).toBe(0);
+			},
+			{ timeout: 20_000, interval: 50 },
+		);
+		// Run 1: exactly one report (the child's own); the gate held back the duplicate.
+		expect(failureNotices(parent.session)).toEqual([]);
+
+		// Run 2 on the SAME child session. It fails and cannot report by hand, so the
+		// parent's synthesized failure notice is the only record that it died.
+		child.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" })]);
+		const run2 = await parent.session.runRlmChild("second task", { name: "failing-child-2" });
+		await vi.waitFor(() => expect(parent.session.hasRunningRlmChildren()).toBe(false), {
+			timeout: 20_000,
+			interval: 20,
+		});
+		const verdict2 = await parent.session.collectRlmChildren([run2.rlm_child_id], 20_000);
+		expect(verdict2.results[0]?.terminal_kind).toBe("error");
+		expect(run2.rlm_child_id).not.toBe(run1.rlm_child_id);
+		// Give the notice every chance to publish: a parent turn drains the queue.
+		await parent.session.promptAndWait("keep working").catch(() => {});
+		await vi.waitFor(
+			() => {
+				expect(parent.session.isStreaming).toBe(false);
+				expect(parent.session.unfinishedActionCount).toBe(0);
+			},
+			{ timeout: 20_000, interval: 50 },
+		);
+		await new Promise((resolve) => setTimeout(resolve, 200));
+		const run2Reports = failureNotices(parent.session).filter(
+			(notice) => (notice.details as { childId?: string }).childId === run2.rlm_child_id,
+		);
+		expect(run2Reports).toHaveLength(1);
+	}, 90_000);
+
+	it("does not publish a folded failure report the child already delivered (aggregated wake)", async () => {
+		// An Esc suspends the pump, so the failure notice is buffered and later folded
+		// into ONE aggregated wake turn as prefix records behind a synthetic summary.
+		// A gate that only reads the action's primary message never sees it.
+		const family: { parent?: Harness; child?: Harness } = {};
+		const deliveryStatuses: string[] = [];
+		const roster = (): AgentFamilyRosterResult => ({
+			current: { name: "failing-child", id: "child-session-id", depth: 1 },
+			entries: [{ relationship: "parent", name: "parent", id: "parent-session-id", depth: 0, status: "running" }],
+		});
+		const sendAgentMessage = vi.fn(async (input: { message: string }) => {
+			const parent = family.parent?.session;
+			const child = family.child?.session;
+			if (!parent || !child) throw new Error("the family is not wired yet");
+			const notice = childMessage(child, parent, input.message);
+			const status = await deliverChildMessage(parent, notice);
+			deliveryStatuses.push(status);
+			const receipt: AgentSessionMessageReceipt = {
+				id: notice.details.id,
+				source: AGENT_MESSAGE_SOURCE,
+				target: { activeSessionId: "parent-active", sessionId: parent.sessionId },
+				message: input.message,
+				deliveryStatus: status,
+			};
+			return receipt;
+		});
+		let releaseParent: () => void = () => {};
+		const parentGate = new Promise<void>((resolve) => {
+			releaseParent = resolve;
+		});
+		let releaseChild: () => void = () => {};
+		const childGate = new Promise<void>((resolve) => {
+			releaseChild = resolve;
+		});
+		const child = track(
+			await createHarness({
+				tools: [hangTool(childGate)],
+				rlmDepth: 1,
+				settings: { stallWatchdog: { enabled: false }, retry: { enabled: false } },
+				agentMessageController: { listAgents: () => ({ agents: [] }), roster, sendAgentMessage },
+			}),
+		);
+		const parent = track(
+			await createHarness({
+				tools: [hangTool(parentGate)],
+				rlmDepth: 0,
+				rlmMaxDepth: 1,
+				failureWakeQuietWindowMs: 60_000,
+				settings: { stallWatchdog: { enabled: false }, retry: { enabled: false } },
+				subagentRuntimeHost: {
+					createRlmSubagentRuntime: async () => ({ session: child.session }),
+					deleteRlmSubagentRuntime: async () => {},
+				},
+			}),
+		);
+		family.parent = parent;
+		family.child = child;
+		parent.setResponses([
+			fauxAssistantMessage(fauxToolCall("hold_the_turn", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("the parent came back after the Esc"),
+			fauxAssistantMessage("the parent is idle again"),
+			fauxAssistantMessage("the parent stays idle"),
+			fauxAssistantMessage("the parent stays idle 2"),
+		]);
+		// The child is still mid-turn when the Esc lands, so its own terminal-error
+		// report and the parent's synthesized one both arrive at a suspended pump.
+		child.setResponses([
+			fauxAssistantMessage(fauxToolCall("hold_the_turn", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+		]);
+
+		const parentTurn = parent.session.promptAndWait("do the long work");
+		await waitForCondition(() => parent.session.isStreaming);
+		const handle = await parent.session.runRlmChild("do the task", { name: "failing-child" });
+		await waitForCondition(() => child.session.isStreaming);
+		parent.session.requestAbort();
+		releaseParent();
+		await parentTurn.catch(() => {});
+		await vi.waitFor(() => expect(parent.session.isQueuedWorkSuspended).toBe(true), {
+			timeout: 20_000,
+			interval: 20,
+		});
+		releaseChild();
+		await vi.waitFor(() => expect(deliveryStatuses).toEqual(["queued"]), { timeout: 20_000, interval: 20 });
+		await vi.waitFor(() => expect(parent.session.hasRunningRlmChildren()).toBe(false), {
+			timeout: 20_000,
+			interval: 20,
+		});
+		const atSettle = await parent.session.collectRlmChildren([handle.rlm_child_id], 20_000);
+		expect(atSettle.results[0]?.terminal_kind).toBe("error");
+
+		// The aggregated wake drains the queue: the child's own report is a steer and
+		// lands first, then the wake turn publishes whatever it folded in.
+		await vi.waitFor(
+			() => {
+				expect(
+					parent.session.messages.filter((message): message is AgentSessionMessage =>
+						isAgentSessionMessage(message),
+					).length,
+				).toBe(1);
+			},
+			{ timeout: 30_000, interval: 50 },
+		);
+		await new Promise((resolve) => setTimeout(resolve, 3_000));
+		const inbound = parent.session.messages.filter((message): message is AgentSessionMessage =>
+			isAgentSessionMessage(message),
+		);
+		expect(inbound).toHaveLength(1);
+		expect(inbound[0]?.content).toContain(SUBAGENT_TERMINAL_ERROR_NOTICE_PREFIX);
+		// One death, one report.
+		expect(failureNotices(parent.session)).toEqual([]);
+	}, 90_000);
 });
