@@ -12,6 +12,7 @@ import type {
 } from "openai/resources/chat/completions.js";
 import { getAnthropicCacheWriteCost, hasStandardAnthropicCachePricing } from "../cache-pricing.js";
 import { getEnvApiKey, getPrimeTeamId } from "../env-api-keys.js";
+import { getLogger } from "../log.js";
 import { calculateCost, clampThinkingLevel } from "../models.js";
 import type {
 	AssistantMessage,
@@ -31,6 +32,7 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.js";
+import { appendAssistantMessageDiagnostic } from "../utils/diagnostics.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
@@ -40,6 +42,8 @@ import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js"
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
 import { buildBaseOptions } from "./simple-options.js";
 import { transformMessages } from "./transform-messages.js";
+
+const log = getLogger("ai.provider");
 
 /**
  * Check if conversation messages contain tool calls or tool results.
@@ -131,6 +135,15 @@ type ChatCompletionToolWithCacheControl = OpenAI.Chat.Completions.ChatCompletion
 	cache_control?: OpenAICompatCacheControl;
 };
 
+interface StreamingToolCallBlock extends ToolCall {
+	partialArgs?: string;
+	streamIndex?: number;
+	/** Provider-supplied id as the wire sent it, before de-duplication. */
+	sourceId?: string;
+}
+type StreamingBlock = TextContent | ThinkingContent | StreamingToolCallBlock;
+type StreamingToolCallDelta = NonNullable<ChatCompletionChunk.Choice.Delta["tool_calls"]>[number];
+
 function resolveCacheRetention(cacheRetention?: CacheRetention): CacheRetention {
 	if (cacheRetention) {
 		return cacheRetention;
@@ -182,6 +195,261 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			);
 		};
 
+		let textBlock: TextContent | null = null;
+		let thinkingBlock: ThinkingContent | null = null;
+		const toolCallBlocksByIndex = new Map<number, StreamingToolCallBlock>();
+		const toolCallBlocksById = new Map<string, StreamingToolCallBlock>();
+		// Ids already handed out to content blocks. Unique provider ids are kept
+		// verbatim; a repeated one gets a deterministic suffix so two calls can
+		// never share an id in the transcript.
+		const claimedToolCallIds = new Set<string>();
+		let generatedToolCallIdCounter = 0;
+		const blocks = output.content as StreamingBlock[];
+		const getContentIndex = (block: StreamingBlock) => blocks.indexOf(block);
+		const finishBlock = (block: StreamingBlock) => {
+			const contentIndex = getContentIndex(block);
+			if (contentIndex === -1) {
+				return;
+			}
+			if (block.type === "text") {
+				stream.push({
+					type: "text_end",
+					contentIndex,
+					content: block.text,
+					partial: output,
+				});
+			} else if (block.type === "thinking") {
+				stream.push({
+					type: "thinking_end",
+					contentIndex,
+					content: block.thinking,
+					partial: output,
+				});
+			} else if (block.type === "toolCall") {
+				block.arguments = parseStreamingJson(block.partialArgs);
+				// Finalize in-place and strip the scratch buffers so replay only
+				// carries parsed arguments.
+				delete block.partialArgs;
+				delete block.streamIndex;
+				delete block.sourceId;
+				stream.push({
+					type: "toolcall_end",
+					contentIndex,
+					toolCall: block,
+					partial: output,
+				});
+			}
+		};
+		const ensureTextBlock = () => {
+			if (!textBlock) {
+				textBlock = { type: "text", text: "" };
+				blocks.push(textBlock);
+				stream.push({ type: "text_start", contentIndex: getContentIndex(textBlock), partial: output });
+			}
+			return textBlock;
+		};
+		const ensureThinkingBlock = (thinkingSignature: string) => {
+			if (!thinkingBlock) {
+				thinkingBlock = {
+					type: "thinking",
+					thinking: "",
+					thinkingSignature,
+				};
+				blocks.push(thinkingBlock);
+				stream.push({ type: "thinking_start", contentIndex: getContentIndex(thinkingBlock), partial: output });
+			}
+			return thinkingBlock;
+		};
+		// Streaming providers do sometimes violate the tool-call index/id
+		// contract. Every recovery is logged and persisted as a message
+		// diagnostic so a mangled stream is never silent.
+		const recordToolCallDiagnostic = (type: string, details: Record<string, unknown>) => {
+			appendAssistantMessageDiagnostic(output, { type, timestamp: Date.now(), details });
+			log.warn("openai-completions tool call stream recovery", {
+				provider: model.provider,
+				model: model.id,
+				type,
+				...details,
+			});
+		};
+		const claimToolCallId = (block: StreamingToolCallBlock, desired: string | undefined): string => {
+			if (!desired) {
+				// A call whose id never arrived still needs a non-empty id: an
+				// empty id cannot be paired with its tool result on replay.
+				do {
+					generatedToolCallIdCounter += 1;
+				} while (claimedToolCallIds.has(`toolcall_${generatedToolCallIdCounter}`));
+				const assignedId = `toolcall_${generatedToolCallIdCounter}`;
+				claimedToolCallIds.add(assignedId);
+				block.id = assignedId;
+				recordToolCallDiagnostic("tool_call_missing_id", {
+					contentIndex: getContentIndex(block),
+					assignedId,
+				});
+				return assignedId;
+			}
+			let assignedId = desired;
+			let attempt = 1;
+			while (claimedToolCallIds.has(assignedId)) {
+				assignedId = `${desired}_${attempt}`;
+				attempt += 1;
+			}
+			claimedToolCallIds.add(assignedId);
+			block.id = assignedId;
+			if (assignedId !== desired) {
+				recordToolCallDiagnostic("tool_call_duplicate_id", {
+					contentIndex: getContentIndex(block),
+					incomingId: desired,
+					assignedId,
+				});
+			}
+			return assignedId;
+		};
+		// Providers repeat the id on every fragment of the same call, so an id
+		// equal to the one the block already carries is ignored rather than
+		// treated as a second call.
+		const applySourceId = (block: StreamingToolCallBlock, sourceId: string): void => {
+			if (block.sourceId !== sourceId) {
+				block.sourceId = sourceId;
+				const assignedId = claimToolCallId(block, sourceId);
+				toolCallBlocksById.set(assignedId, block);
+			}
+			toolCallBlocksById.set(sourceId, block);
+		};
+		const isOpenToolCallBlock = (block: StreamingBlock | undefined): block is StreamingToolCallBlock =>
+			block?.type === "toolCall" && block.partialArgs !== undefined;
+		const findLastOpenToolCallBlock = (): StreamingToolCallBlock | undefined => {
+			for (let i = blocks.length - 1; i >= 0; i -= 1) {
+				const candidate = blocks[i];
+				if (isOpenToolCallBlock(candidate)) {
+					return candidate;
+				}
+			}
+			return undefined;
+		};
+		// A reused index plus a changed id only means "second call" when the fragment
+		// also shows a fresh call: a new name, or a new argument object while the open
+		// call's arguments already form a complete object.
+		const startsNewCallAtReusedIndex = (
+			block: StreamingToolCallBlock,
+			incomingId: string | undefined,
+			incomingName: string | null | undefined,
+			incomingArgs: string | null | undefined,
+		): boolean => {
+			if (incomingId === undefined || block.sourceId === undefined || block.sourceId === incomingId) {
+				return false;
+			}
+			if (incomingName && block.name && incomingName !== block.name) {
+				return true;
+			}
+			return (block.partialArgs ?? "").trimEnd().endsWith("}") && (incomingArgs ?? "").trimStart().startsWith("{");
+		};
+		const ensureToolCallBlock = (toolCall: StreamingToolCallDelta): StreamingToolCallBlock | undefined => {
+			const streamIndex = typeof toolCall.index === "number" ? toolCall.index : undefined;
+			const incomingId = toolCall.id || undefined;
+			let block = streamIndex !== undefined ? toolCallBlocksByIndex.get(streamIndex) : undefined;
+
+			// A mutated id on the same index is normal for some providers (kimi sends
+			// a fresh id per fragment), so it is not enough on its own to call this a
+			// different call. A new name, or the start of a fresh argument object while
+			// the open call already holds a complete one, is. Without that evidence the
+			// fragments keep coalescing into one block, first id wins.
+			if (
+				block &&
+				startsNewCallAtReusedIndex(block, incomingId, toolCall.function?.name, toolCall.function?.arguments)
+			) {
+				recordToolCallDiagnostic("tool_call_index_reused", {
+					index: streamIndex,
+					existingId: block.sourceId,
+					incomingId,
+					existingName: block.name || undefined,
+					incomingName: toolCall.function?.name || undefined,
+				});
+				block = undefined;
+			}
+
+			if (!block && incomingId !== undefined) {
+				const byId = toolCallBlocksById.get(incomingId);
+				// The id fallback must not merge calls that arrived under different
+				// stream indices: it only serves index-less providers, or a call that
+				// already owns this index.
+				if (byId && (byId.streamIndex === undefined || byId.streamIndex === streamIndex)) {
+					block = byId;
+				} else if (byId) {
+					recordToolCallDiagnostic("tool_call_id_reused_across_indices", {
+						incomingId,
+						index: streamIndex,
+						existingIndex: byId.streamIndex,
+					});
+				}
+			}
+
+			if (!block && streamIndex === undefined && incomingId === undefined) {
+				// A fragment with neither index nor id can only continue the call that
+				// is still open; with none open it cannot be attributed to any call.
+				const lastOpen = findLastOpenToolCallBlock();
+				if (!lastOpen) {
+					recordToolCallDiagnostic("tool_call_fragment_unassignable", {
+						argumentsLength: toolCall.function?.arguments?.length ?? 0,
+					});
+					return undefined;
+				}
+				return lastOpen;
+			}
+
+			if (!block) {
+				block = {
+					type: "toolCall",
+					id: "",
+					name: toolCall.function?.name || "",
+					arguments: {},
+					partialArgs: "",
+					streamIndex,
+				};
+				if (streamIndex !== undefined) {
+					toolCallBlocksByIndex.set(streamIndex, block);
+				}
+				blocks.push(block);
+				if (incomingId !== undefined) {
+					applySourceId(block, incomingId);
+				}
+				stream.push({
+					type: "toolcall_start",
+					contentIndex: getContentIndex(block),
+					partial: output,
+				});
+			}
+			if (streamIndex !== undefined && block.streamIndex === undefined) {
+				block.streamIndex = streamIndex;
+				toolCallBlocksByIndex.set(streamIndex, block);
+			}
+			return block;
+		};
+		// Closing pass over in-flight tool call blocks: a block that never received
+		// a name cannot be dispatched and is dropped, and an id-less block gets a
+		// synthesized id instead of persisting an empty one. Both are diagnosed.
+		const finalizeStreamedToolCalls = () => {
+			for (let i = 0; i < blocks.length; i += 1) {
+				const block = blocks[i];
+				if (!isOpenToolCallBlock(block)) {
+					continue;
+				}
+				if (!block.name) {
+					recordToolCallDiagnostic("tool_call_missing_name", {
+						contentIndex: i,
+						id: block.id || undefined,
+						argumentsLength: block.partialArgs?.length ?? 0,
+					});
+					blocks.splice(i, 1);
+					i -= 1;
+					continue;
+				}
+				if (!block.id) {
+					claimToolCallId(block, undefined);
+				}
+			}
+		};
+
 		try {
 			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
 			const compat = getCompat(model);
@@ -208,110 +476,6 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 				.withResponse();
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
-
-			interface StreamingToolCallBlock extends ToolCall {
-				partialArgs?: string;
-				streamIndex?: number;
-			}
-			type StreamingBlock = TextContent | ThinkingContent | StreamingToolCallBlock;
-			type StreamingToolCallDelta = NonNullable<ChatCompletionChunk.Choice.Delta["tool_calls"]>[number];
-
-			let textBlock: TextContent | null = null;
-			let thinkingBlock: ThinkingContent | null = null;
-			const toolCallBlocksByIndex = new Map<number, StreamingToolCallBlock>();
-			const toolCallBlocksById = new Map<string, StreamingToolCallBlock>();
-			const blocks = output.content as StreamingBlock[];
-			const getContentIndex = (block: StreamingBlock) => blocks.indexOf(block);
-			const finishBlock = (block: StreamingBlock) => {
-				const contentIndex = getContentIndex(block);
-				if (contentIndex === -1) {
-					return;
-				}
-				if (block.type === "text") {
-					stream.push({
-						type: "text_end",
-						contentIndex,
-						content: block.text,
-						partial: output,
-					});
-				} else if (block.type === "thinking") {
-					stream.push({
-						type: "thinking_end",
-						contentIndex,
-						content: block.thinking,
-						partial: output,
-					});
-				} else if (block.type === "toolCall") {
-					block.arguments = parseStreamingJson(block.partialArgs);
-					// Finalize in-place and strip the scratch buffers so replay only
-					// carries parsed arguments.
-					delete block.partialArgs;
-					delete block.streamIndex;
-					stream.push({
-						type: "toolcall_end",
-						contentIndex,
-						toolCall: block,
-						partial: output,
-					});
-				}
-			};
-			const ensureTextBlock = () => {
-				if (!textBlock) {
-					textBlock = { type: "text", text: "" };
-					blocks.push(textBlock);
-					stream.push({ type: "text_start", contentIndex: getContentIndex(textBlock), partial: output });
-				}
-				return textBlock;
-			};
-			const ensureThinkingBlock = (thinkingSignature: string) => {
-				if (!thinkingBlock) {
-					thinkingBlock = {
-						type: "thinking",
-						thinking: "",
-						thinkingSignature,
-					};
-					blocks.push(thinkingBlock);
-					stream.push({ type: "thinking_start", contentIndex: getContentIndex(thinkingBlock), partial: output });
-				}
-				return thinkingBlock;
-			};
-			const ensureToolCallBlock = (toolCall: StreamingToolCallDelta) => {
-				const streamIndex = typeof toolCall.index === "number" ? toolCall.index : undefined;
-				let block = streamIndex !== undefined ? toolCallBlocksByIndex.get(streamIndex) : undefined;
-				if (!block && toolCall.id) {
-					block = toolCallBlocksById.get(toolCall.id);
-				}
-				if (!block) {
-					block = {
-						type: "toolCall",
-						id: toolCall.id || "",
-						name: toolCall.function?.name || "",
-						arguments: {},
-						partialArgs: "",
-						streamIndex,
-					};
-					if (streamIndex !== undefined) {
-						toolCallBlocksByIndex.set(streamIndex, block);
-					}
-					if (toolCall.id) {
-						toolCallBlocksById.set(toolCall.id, block);
-					}
-					blocks.push(block);
-					stream.push({
-						type: "toolcall_start",
-						contentIndex: getContentIndex(block),
-						partial: output,
-					});
-				}
-				if (streamIndex !== undefined && block.streamIndex === undefined) {
-					block.streamIndex = streamIndex;
-					toolCallBlocksByIndex.set(streamIndex, block);
-				}
-				if (toolCall.id) {
-					toolCallBlocksById.set(toolCall.id, block);
-				}
-				return block;
-			};
 
 			for await (const chunk of openaiStream) {
 				if (!chunk || typeof chunk !== "object") continue;
@@ -391,9 +555,11 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 					if (choice?.delta?.tool_calls) {
 						for (const toolCall of choice.delta.tool_calls) {
 							const block = ensureToolCallBlock(toolCall);
+							if (!block) {
+								continue;
+							}
 							if (!block.id && toolCall.id) {
-								block.id = toolCall.id;
-								toolCallBlocksById.set(toolCall.id, block);
+								applySourceId(block, toolCall.id);
 							}
 							if (!block.name && toolCall.function?.name) {
 								block.name = toolCall.function.name;
@@ -463,6 +629,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			}
 
 			encodeAccumulatedReasoningDetails();
+			finalizeStreamedToolCalls();
 			for (const block of blocks) {
 				finishBlock(block);
 			}
@@ -483,6 +650,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			// Keep reasoning details accumulated before the failure replayable,
 			// matching what the previous per-chunk encoding left behind.
 			encodeAccumulatedReasoningDetails();
+			// An interrupted call is still persisted, so it gets the same id/name
+			// cleanup as a completed one.
+			finalizeStreamedToolCalls();
 			// Mid-stream parses are throttled; run the authoritative final parse on
 			// in-flight tool arguments before the scratch buffers are stripped.
 			finalizeThrottledStreamingJson(output.content);
@@ -491,6 +661,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 				// Streaming scratch buffers are only used during parsing; never persist them.
 				delete (block as { partialArgs?: string }).partialArgs;
 				delete (block as { streamIndex?: number }).streamIndex;
+				delete (block as { sourceId?: string }).sourceId;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
