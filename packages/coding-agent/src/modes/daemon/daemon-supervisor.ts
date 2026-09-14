@@ -6866,86 +6866,38 @@ export class DaemonSupervisor {
 		client.capabilities = normalizeCapabilities(command.capabilities, command.supportsExtensionUi);
 		client.supportsExtensionUi = client.capabilities.has("extension_ui");
 
+		// The worker's chunk transfer is the one encoding of a transcript: every load asks
+		// for it, and a client that cannot consume the chunks is served by decoding the
+		// cached bytes. That replaced a second full serialization of the same messages in
+		// the supervisor, and a second full snapshot load from the worker for every legacy
+		// attach that followed a chunked one.
+		const wantsChunkedSnapshot = client.capabilities.has("chunked_snapshot");
 		let result = match.worker.snapshotCache.get(activeSessionId);
-		if (
-			result &&
-			!client.capabilities.has("chunked_snapshot") &&
-			result.snapshot.messages.length < result.snapshot.summary.messageCount
-		) {
-			result = undefined;
+		if (result && !wantsChunkedSnapshot) {
+			result = await this.snapshotWithDecodedTranscript(match.worker, activeSessionId, result);
 		}
 		if (!result) {
-			const snapshotLoadKey = `${activeSessionId}:${client.capabilities.has("chunked_snapshot") ? "chunked" : "full"}`;
-			let retryInvalidatedLoad = true;
-			while (!result) {
-				let loading = match.worker.snapshotLoads.get(snapshotLoadKey);
-				if (!loading) {
-					const observedSnapshotId =
-						match.worker.transcriptCaches.get(activeSessionId)?.snapshotId ??
-						match.worker.snapshotCache.get(activeSessionId)?.snapshotStream?.id;
-					loading = (async () => {
-						const workerClient = this.requireAvailableWorkerClient(match.worker);
-						const response = await workerClient.request({
-							type: "attach",
-							activeSessionId,
-							capabilities: client.capabilities.has("chunked_snapshot")
-								? ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"]
-								: ["attach_snapshot", "event_sequence", "slim_attach"],
-							supportsExtensionUi: false,
-							env: command.env ?? collectDaemonClientEnv(),
-						});
-						const loaded = attachResultFromResponse(response);
-						if (match.worker.snapshotLoads.get(snapshotLoadKey) !== loading) {
-							throw new SnapshotLoadInvalidatedError("Session snapshot changed during attach");
-						}
-						return this.cacheLoadedSnapshot(match.worker, activeSessionId, loaded, observedSnapshotId);
-					})();
-					match.worker.snapshotLoads.set(snapshotLoadKey, loading);
-					void loading.then(
-						async (loaded) => {
-							try {
-								const snapshotId = loaded.snapshotStream?.id;
-								const transcript = snapshotId
-									? this.snapshotGeneration(match.worker, loaded.activeSessionId, snapshotId)?.transcript
-									: undefined;
-								if (transcript && !transcript.complete) {
-									let chunkIndex = 0;
-									while (await transcript.waitForChunk(chunkIndex)) {
-										chunkIndex++;
-									}
-								}
-							} catch {
-								// Failed transfers must allow a fresh snapshot request.
-							} finally {
-								if (match.worker.snapshotLoads.get(snapshotLoadKey) === loading) {
-									match.worker.snapshotLoads.delete(snapshotLoadKey);
-								}
-							}
-						},
-						() => {
-							if (match.worker.snapshotLoads.get(snapshotLoadKey) === loading) {
-								match.worker.snapshotLoads.delete(snapshotLoadKey);
-							}
-						},
-					);
-				}
-				try {
-					result = await loading;
-				} catch (error) {
-					if (!(error instanceof SnapshotLoadInvalidatedError)) {
-						throw error;
-					}
-					if (!retryInvalidatedLoad) {
-						throw error;
-					}
-					retryInvalidatedLoad = false;
+			result = await this.loadWorkerSnapshot(match.worker, activeSessionId, command.env, true);
+			if (!wantsChunkedSnapshot) {
+				const decoded = await this.snapshotWithDecodedTranscript(match.worker, activeSessionId, result);
+				if (decoded) {
+					result = decoded;
+				} else if (
+					result.snapshotStream &&
+					result.snapshot.messages.length < result.snapshot.summary.messageCount
+				) {
+					// The worker promised a chunk transfer this client cannot read and there is
+					// nothing decodable behind it (failed, disposed, or superseded). Ask for the
+					// full snapshot shape instead of handing over an empty transcript. A worker
+					// that never promised a transfer is trusted as-is, exactly as before.
+					result = await this.loadWorkerSnapshot(match.worker, activeSessionId, command.env, false);
 				}
 			}
 		}
 		this.requireAvailableWorkerClient(match.worker);
 		const wasAttached = client.attachedActiveSessionIds.has(activeSessionId);
 		let transcript: SnapshotTranscriptCache | undefined;
-		if (client.capabilities.has("chunked_snapshot")) {
+		if (wantsChunkedSnapshot) {
 			while (true) {
 				const validation = this.currentSnapshotGeneration(match.worker, activeSessionId)?.validation;
 				if (validation) {
@@ -7009,6 +6961,176 @@ export class DaemonSupervisor {
 			throw new Error(
 				"Cannot attach to this active agent while telemetry is disabled for the current invocation. Stop the agent and retry so it can restart without telemetry.",
 			);
+		}
+	}
+
+	/**
+	 * One snapshot load from the worker, deduplicated per worker, session and shape.
+	 *
+	 * The chunked shape is what every client asks for now: the worker encodes the
+	 * transcript once and the supervisor caches those bytes, so a later chunked attach
+	 * forwards them and a legacy attach decodes them. The full shape survives only as
+	 * the fallback for a worker that answered without a chunk transfer.
+	 */
+	private async loadWorkerSnapshot(
+		worker: ResidentWorker,
+		activeSessionId: string,
+		env: Record<string, string> | undefined,
+		chunked: boolean,
+	): Promise<DaemonAttachResult> {
+		const snapshotLoadKey = `${activeSessionId}:${chunked ? "chunked" : "full"}`;
+		let result: DaemonAttachResult | undefined;
+		let retryInvalidatedLoad = true;
+		while (!result) {
+			let loading = worker.snapshotLoads.get(snapshotLoadKey);
+			if (!loading) {
+				const observedSnapshotId =
+					worker.transcriptCaches.get(activeSessionId)?.snapshotId ??
+					worker.snapshotCache.get(activeSessionId)?.snapshotStream?.id;
+				loading = (async () => {
+					const workerClient = this.requireAvailableWorkerClient(worker);
+					const response = await workerClient.request({
+						type: "attach",
+						activeSessionId,
+						capabilities: chunked
+							? ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"]
+							: ["attach_snapshot", "event_sequence", "slim_attach"],
+						supportsExtensionUi: false,
+						env: env ?? collectDaemonClientEnv(),
+					});
+					const loaded = attachResultFromResponse(response);
+					if (worker.snapshotLoads.get(snapshotLoadKey) !== loading) {
+						throw new SnapshotLoadInvalidatedError("Session snapshot changed during attach");
+					}
+					return this.cacheLoadedSnapshot(worker, activeSessionId, loaded, observedSnapshotId);
+				})();
+				worker.snapshotLoads.set(snapshotLoadKey, loading);
+				void loading.then(
+					async (loaded) => {
+						try {
+							const snapshotId = loaded.snapshotStream?.id;
+							const transcript = snapshotId
+								? this.snapshotGeneration(worker, loaded.activeSessionId, snapshotId)?.transcript
+								: undefined;
+							if (transcript && !(await this.waitForSnapshotTransfer(transcript))) {
+								this.log(`Snapshot transfer ${snapshotId} did not complete; a later attach reloads it`);
+							}
+						} catch {
+							// Failed transfers must allow a fresh snapshot request.
+						} finally {
+							if (worker.snapshotLoads.get(snapshotLoadKey) === loading) {
+								worker.snapshotLoads.delete(snapshotLoadKey);
+							}
+						}
+					},
+					() => {
+						if (worker.snapshotLoads.get(snapshotLoadKey) === loading) {
+							worker.snapshotLoads.delete(snapshotLoadKey);
+						}
+					},
+				);
+			}
+			try {
+				result = await loading;
+			} catch (error) {
+				if (!(error instanceof SnapshotLoadInvalidatedError)) {
+					throw error;
+				}
+				if (!retryInvalidatedLoad) {
+					throw error;
+				}
+				retryInvalidatedLoad = false;
+			}
+		}
+		return result;
+	}
+
+	/**
+	 * Full-message view of a cached snapshot, for a client that cannot consume the chunk
+	 * transfer itself. The worker's encoded chunks are the only serialization of this
+	 * transcript generation, so decoding them is what keeps a legacy attach from paying
+	 * for a second one. `undefined` means there is nothing complete to decode, and the
+	 * caller falls back to the full snapshot shape.
+	 *
+	 * The returned result carries no `snapshotStream`: the supervisor never streams chunks
+	 * to a client that did not declare `chunked_snapshot`, and an id with no transfer
+	 * behind it would leave such a client waiting for frames that are not coming.
+	 */
+	private async snapshotWithDecodedTranscript(
+		worker: ResidentWorker,
+		activeSessionId: string,
+		result: DaemonAttachResult,
+	): Promise<DaemonAttachResult | undefined> {
+		const { snapshotStream: _snapshotStream, ...rest } = result;
+		const messageCount = result.snapshot.summary.messageCount;
+		if (result.snapshot.messages.length >= messageCount) {
+			return rest;
+		}
+		const snapshotId = result.snapshotStream?.id;
+		if (!snapshotId) {
+			return undefined;
+		}
+		const cached = worker.transcriptCaches.get(activeSessionId);
+		const transcript =
+			this.snapshotGeneration(worker, activeSessionId, snapshotId)?.transcript ??
+			(cached?.snapshotId === snapshotId ? cached : undefined);
+		if (!transcript) {
+			return undefined;
+		}
+		let releaseTranscript: () => void;
+		try {
+			releaseTranscript = transcript.retain();
+		} catch {
+			// Disposed between the cache read and here: reload instead of decoding a corpse.
+			return undefined;
+		}
+		try {
+			if (!(await this.waitForSnapshotTransfer(transcript))) {
+				return undefined;
+			}
+			const messages = transcript.decodeMessages(messageCount);
+			if (!messages) {
+				return undefined;
+			}
+			return { ...rest, snapshot: { ...result.snapshot, messages } };
+		} finally {
+			releaseTranscript();
+		}
+	}
+
+	/**
+	 * Waits for a worker chunk transfer to finish so its bytes can be read.
+	 *
+	 * The budget is the one the equivalent full snapshot load already has: `attach` keeps
+	 * the long worker-request tier precisely because it carries the transcript. A transfer
+	 * that neither completes nor fails within it leaves the caller on the full-load
+	 * fallback instead of parking a client command on a silent worker.
+	 */
+	private async waitForSnapshotTransfer(
+		transcript: SnapshotTranscriptCache,
+		timeoutMs: number = workerRequestTimeoutMs("attach"),
+	): Promise<boolean> {
+		if (transcript.complete) {
+			return true;
+		}
+		let timer: NodeJS.Timeout | undefined;
+		const drained = (async () => {
+			let chunkIndex = 0;
+			while (await transcript.waitForChunk(chunkIndex)) {
+				chunkIndex++;
+			}
+			return true;
+		})().catch(() => false);
+		const timedOut = new Promise<boolean>((resolveTimeout) => {
+			timer = setTimeout(() => resolveTimeout(false), timeoutMs);
+			timer.unref?.();
+		});
+		try {
+			return await Promise.race([drained, timedOut]);
+		} finally {
+			if (timer) {
+				clearTimeout(timer);
+			}
 		}
 	}
 
