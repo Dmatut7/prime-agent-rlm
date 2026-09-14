@@ -2,8 +2,21 @@ import { existsSync, mkdirSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { describe, expect, it } from "vitest";
-import { type CustomEntry, SessionManager } from "../../src/core/session-manager.js";
+import { type CustomEntry, SessionManager, type SessionTreeNode } from "../../src/core/session-manager.js";
 import { assistantMsg, userMsg } from "../utilities.js";
+
+/** Child entry ids of a tree node that represent turns, i.e. excluding metadata. */
+function turnIds(node: SessionTreeNode): string[] {
+	return node.children
+		.filter((child) => child.entry.type !== "leaf_position")
+		.map((child) => child.entry.id)
+		.sort();
+}
+
+/** Child entries of a tree node that record a rewind position (`leaf_position`). */
+function positionMarkers(node: SessionTreeNode): string[] {
+	return node.children.filter((child) => child.entry.type === "leaf_position").map((child) => child.entry.id);
+}
 
 describe("SessionManager append and tree traversal", () => {
 	describe("append operations", () => {
@@ -223,10 +236,10 @@ describe("SessionManager append and tree traversal", () => {
 
 			const node2 = root.children[0];
 			expect(node2.entry.id).toBe(id2);
-			expect(node2.children).toHaveLength(2); // id3 and id4 are siblings
-
-			const childIds = node2.children.map((c) => c.entry.id).sort();
-			expect(childIds).toEqual([id3, id4].sort());
+			// id3 and id4 are siblings of each other; the rewind that produced id4
+			// also records a leaf_position marker under id2, which is metadata, not a turn.
+			expect(turnIds(node2)).toEqual([id3, id4].sort());
+			expect(positionMarkers(node2)).toHaveLength(1);
 		});
 
 		it("handles multiple branches at same point", () => {
@@ -247,10 +260,10 @@ describe("SessionManager append and tree traversal", () => {
 			const tree = session.getTree();
 			const node2 = tree[0].children[0];
 			expect(node2.entry.id).toBe(id2);
-			expect(node2.children).toHaveLength(3);
-
-			const branchIds = node2.children.map((c) => c.entry.id).sort();
-			expect(branchIds).toEqual([idA, idB, idC].sort());
+			expect(turnIds(node2)).toEqual([idA, idB, idC].sort());
+			// The first branch(id2) is a no-op move, so only the two real rewinds
+			// (idA -> id2 and idB -> id2) record a position marker.
+			expect(positionMarkers(node2)).toHaveLength(2);
 		});
 
 		it("handles deep branching", () => {
@@ -264,22 +277,24 @@ describe("SessionManager append and tree traversal", () => {
 
 			session.branch(id2);
 			const id5 = session.appendMessage(userMsg("5"));
-			const _id6 = session.appendMessage(assistantMsg("6"));
+			const id6 = session.appendMessage(assistantMsg("6"));
 
 			// Branch from 5: 5 -> 7
 			session.branch(id5);
-			const _id7 = session.appendMessage(userMsg("7"));
+			const id7 = session.appendMessage(userMsg("7"));
 
 			const tree = session.getTree();
 
 			const node2 = tree[0].children[0];
-			expect(node2.children).toHaveLength(2); // id3 and id5
+			expect(turnIds(node2)).toEqual([id3, id5].sort()); // both rewinds hang off node2
+			expect(positionMarkers(node2)).toHaveLength(1);
 
 			const node5 = node2.children.find((c) => c.entry.id === id5)!;
-			expect(node5.children).toHaveLength(2); // id6 and id7
+			expect(turnIds(node5)).toEqual([id6, id7].sort());
+			expect(positionMarkers(node5)).toHaveLength(1);
 
 			const node3 = node2.children.find((c) => c.entry.id === id3)!;
-			expect(node3.children).toHaveLength(1); // id4
+			expect(node3.children).toHaveLength(1); // id4, no rewind under it
 		});
 	});
 

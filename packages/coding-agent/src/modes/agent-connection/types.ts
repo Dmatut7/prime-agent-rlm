@@ -243,6 +243,11 @@ export interface AgentConnectionGitStateEntry extends AgentConnectionSessionEntr
 	};
 }
 
+export interface AgentConnectionLeafPositionEntry extends AgentConnectionSessionEntryBase {
+	type: "leaf_position";
+	targetId: string | null;
+}
+
 export type AgentConnectionSessionEntry =
 	| AgentConnectionSessionMessageEntry
 	| AgentConnectionThinkingLevelChangeEntry
@@ -257,7 +262,8 @@ export type AgentConnectionSessionEntry =
 	| AgentConnectionSessionInfoEntry
 	| AgentConnectionSessionStateEntry
 	| AgentConnectionAgentStatusEntry
-	| AgentConnectionGitStateEntry;
+	| AgentConnectionGitStateEntry
+	| AgentConnectionLeafPositionEntry;
 
 export interface AgentConnectionSessionTreeFlatNode {
 	entry: AgentConnectionSessionEntry;
