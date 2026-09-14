@@ -9,9 +9,12 @@
 //   <artifactDir>/kernel-state/<stamp>-<rand>.dill      one generation per payload
 //   <artifactDir>/kernel-state/.in-use/<pid>.json       one reference per live kernel
 //
-// The shape is copied from kernel/venv-in-use.ts, including its safety law:
-// "this decides whether a directory may be deleted, so `cannot disprove` must not
-// read as `gone`". A generation whose reference state cannot be read is kept.
+// One entry here is judged by the shared reference law (kernel/reference-records.ts),
+// which is also the venv one: it decides whether a directory may be deleted, so
+// `cannot disprove` must not read as `gone`. An entry that cannot be parsed (a
+// truncated write) or that does not name the pid running inside it is therefore
+// kept, counts as a reference, and makes the whole directory's state unknown - all
+// of its generations are kept, not just the one the entry names.
 //
 // The legacy single-file layout (`<artifactDir>/kernel-state.dill`) is NEVER a
 // generation here: kernels spawned by hosts that predate this module run from it
@@ -19,9 +22,15 @@
 // (red test R-15). Deleting a deleted session's snapshot is the artifact-residue
 // class's job, and only for a session that is provably gone.
 import type { Dirent } from "node:fs";
-import { existsSync, lstatSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { getProcessStartId, isProcessAlive } from "../session-lease.js";
+import {
+	confirmReferenceIsStale,
+	judgeReferenceEntry,
+	parseReferenceRecord,
+	REFERENCE_PID_FILE_NAME,
+	type ReferenceRecord,
+} from "../kernel/reference-records.js";
 import { reclaimWithinBudget } from "./delete.js";
 import {
 	type RetentionClassContext,
@@ -38,8 +47,6 @@ export const RETIRED_KERNEL_SNAPSHOT_RETENTION = 1;
 /** File name of the legacy in-place payload, never judged as a generation. */
 export const LEGACY_KERNEL_SNAPSHOT_BASENAME = "kernel-state.dill";
 
-const REFERENCE_RECORD_VERSION = 1;
-const PID_FILE_NAME = /^[1-9][0-9]*$/;
 /** `<YYYYMMDDTHHMMSS>-<6 hex>`: sortable, and impossible to confuse with a pid file. */
 const GENERATION_NAME = /^[0-9]{8}T[0-9]{6}-[0-9a-f]{6}\.dill$/;
 
@@ -73,63 +80,47 @@ export interface KernelSnapshotReference {
 export interface KernelSnapshotGenerationState {
 	/** Generation file names (basenames) with at least one live reference. */
 	referenced: Set<string>;
-	/** Live references seen, for the report. */
+	/** Reference entries seen (live holders, and entries that cannot be disproved), for the report. */
 	references: KernelSnapshotReference[];
 	/** Reference files swept because their holder is provably gone. */
 	swept: string[];
 	/**
-	 * The reference directory exists but could not be read: callers must treat
-	 * every generation as referenced ("cannot disprove" is not "gone").
+	 * The reference state could not be fully established: the reference directory
+	 * could not be read, or an entry proves nothing either way (an unparseable
+	 * record, a name that disagrees with a holder that runs). Callers must treat
+	 * every generation as referenced: "cannot disprove" is not "gone".
 	 */
 	unknown: boolean;
 	/** Generation file names present on disk. */
 	generations: string[];
 }
 
-interface ReferenceRecord {
-	pid: number;
-	processStartId?: string;
-	sessionId?: string;
-	recordedAt?: string;
-	/** Generation this reference was recorded for, when the writer said so. */
-	generation?: string;
-}
-
-function readReferenceRecord(filePath: string): ReferenceRecord | undefined {
-	try {
-		const stats = lstatSync(filePath);
-		if (stats.isSymbolicLink() || !stats.isFile()) return undefined;
-		const parsed: unknown = JSON.parse(readFileSync(filePath, "utf8"));
-		if (typeof parsed !== "object" || parsed === null) return undefined;
-		const record = parsed as Record<string, unknown>;
-		if (record.version !== REFERENCE_RECORD_VERSION) return undefined;
-		if (!Number.isInteger(record.pid) || (record.pid as number) <= 0) return undefined;
-		return {
-			pid: record.pid as number,
-			...(typeof record.processStartId === "string" ? { processStartId: record.processStartId } : {}),
-			...(typeof record.sessionId === "string" ? { sessionId: record.sessionId } : {}),
-			...(typeof record.recordedAt === "string" ? { recordedAt: record.recordedAt } : {}),
-			...(typeof record.generation === "string" ? { generation: record.generation } : {}),
-		};
-	} catch {
-		return undefined;
-	}
-}
-
-/**
- * Verbatim the venv-in-use rule (`referenceIsLive`, kernel/venv-in-use.ts): a
- * live pid is only the recorded writer when its start identity still matches,
- * and an unqueryable identity keeps the reference.
- */
-function referenceIsLive(record: ReferenceRecord): boolean {
-	if (!isProcessAlive(record.pid)) return false;
-	if (record.processStartId === undefined) return true;
-	const current = getProcessStartId(record.pid);
-	return current === undefined || current === record.processStartId;
+/** Generation this reference was recorded for, when the writer said so. */
+function referenceGeneration(record: ReferenceRecord | undefined): string | undefined {
+	const value = record?.raw.generation;
+	return typeof value === "string" ? value : undefined;
 }
 
 function isNodeError(error: unknown, code: string): boolean {
 	return (error as NodeJS.ErrnoException)?.code === code;
+}
+
+/**
+ * Sweep one entry a first read judged stale, after judging it a second time.
+ *
+ * The writer is another process and neither the record write nor this sweep is atomic, so the
+ * file can become a live reference (or an unreadable one) between the read and the unlink. The
+ * confirmation read is the only thing that authorises the removal.
+ */
+export function sweepStaleKernelSnapshotReference(referencePath: string, pidName: string): "swept" | "kept" {
+	if (!confirmReferenceIsStale(referencePath, pidName)) return "kept";
+	try {
+		rmSync(referencePath, { force: true });
+		return "swept";
+	} catch {
+		// Left for the next sweep; it is not counted as a reference either.
+		return "kept";
+	}
 }
 
 /**
@@ -171,31 +162,36 @@ export function readKernelSnapshotGenerationState(
 		return state;
 	}
 	for (const entry of [...referenceEntries].sort((a, b) => a.name.localeCompare(b.name))) {
-		if (entry.isSymbolicLink() || entry.isDirectory()) continue;
 		// One reference file per live kernel pid, named `<pid>.json`. A name this
 		// bookkeeping never writes is ignored: it neither protects a generation nor
 		// gets deleted.
 		const pidName = entry.name.endsWith(".json") ? entry.name.slice(0, -".json".length) : entry.name;
-		if (!PID_FILE_NAME.test(pidName)) continue;
+		if (!REFERENCE_PID_FILE_NAME.test(pidName)) continue;
 		const referencePath = join(dir, KERNEL_SNAPSHOT_IN_USE_DIR_NAME, entry.name);
-		const record = readReferenceRecord(referencePath);
-		const stale = record === undefined || Number(pidName) !== record.pid || !referenceIsLive(record);
-		if (stale) {
+		const verdict = judgeReferenceEntry(referencePath, pidName);
+		// A symlink or a directory is not a record this bookkeeping writes.
+		if (verdict === "foreign") continue;
+		if (verdict === "stale") {
 			// Read-only mode for a dry run: dropping a stale reference is a filesystem
-			// change, so a dry run only reports that it is not counted (review N-2).
-			if (options.sweepStale !== false) {
-				try {
-					rmSync(referencePath, { force: true });
-					state.swept.push(referencePath);
-				} catch {
-					// Left for the next sweep; it does not count as a reference either.
-				}
+			// change, so a dry run only reports that it is not counted (review N-2). The
+			// second read inside the sweep is what authorises the unlink.
+			if (options.sweepStale !== false && sweepStaleKernelSnapshotReference(referencePath, pidName) === "swept") {
+				state.swept.push(referencePath);
 			}
 			continue;
 		}
-		if (record?.generation) state.referenced.add(record.generation);
+		const record = parseReferenceRecord(referencePath);
+		// `unverifiable` proves nothing either way: an unparseable record is a truncated
+		// write, and a name that disagrees with a record whose holder runs is not a dead
+		// holder. It counts as a reference and makes this directory's state unknown, so
+		// none of its generations is a candidate. Reading it as stale (which this module
+		// used to do) unlinks the entry of a live kernel and frees the generation that
+		// kernel is still reading from.
+		if (verdict === "unverifiable") state.unknown = true;
+		const generation = verdict === "live" ? referenceGeneration(record) : undefined;
+		if (generation !== undefined) state.referenced.add(generation);
 		state.references.push({
-			pid: record?.pid as number,
+			pid: record?.pid ?? Number(pidName),
 			...(record?.processStartId ? { processStartId: record.processStartId } : {}),
 			...(record?.sessionId ? { sessionId: record.sessionId } : {}),
 			...(record?.recordedAt ? { recordedAt: record.recordedAt } : {}),
