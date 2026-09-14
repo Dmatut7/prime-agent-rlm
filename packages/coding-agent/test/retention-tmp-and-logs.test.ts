@@ -106,6 +106,7 @@ function baseSettings(overrides: Partial<ResolvedRetentionSettings> = {}): Resol
 		kernelSnapshotGenerations: 1,
 		kernelSnapshotReclaimEnabled: false,
 		venvRetention: 1,
+		venvReclaim: false,
 		...overrides,
 	};
 }

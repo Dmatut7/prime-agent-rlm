@@ -521,6 +521,15 @@ export function acquireSessionLease(
 	});
 }
 
+/**
+ * Lease directories this process holds right now. Read-only view for cleanup
+ * callers: a sweep must never reclaim a lease its own process is holding, even
+ * when the owner record on disk has not been written yet (adversarial review N-8).
+ */
+export function activeSessionLeaseDirectories(): ReadonlySet<string> {
+	return activeLeaseDirectories;
+}
+
 /** Evidence class of one lease directory, for the retention sweep (L1/L2 layer). */
 export type LeaseDirectoryVerdict = "live" | "held-in-process" | "reclaimable" | "unverifiable";
 

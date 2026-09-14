@@ -73,6 +73,22 @@ export async function reclaimWithinBudget(
 			skipped.push({ path: request.path, reason: SKIP.capHit, detail: "per-sweep cap reached" });
 			continue;
 		}
+		if (request.bytes > context.budget.remainingBytes) {
+			// Never overshoot the breaker: one candidate larger than what is left is left
+			// alone, and the sweep stops deleting. A candidate larger than the whole
+			// per-sweep budget therefore stays until an operator raises the cap - which is
+			// the point of a breaker, and the report says `cap-hit` every sweep (the
+			// stalled-class test then makes "the sweeper runs but never reclaims" visible
+			// instead of silently overshooting by an unbounded factor).
+			capped = true;
+			context.budget.capped = true;
+			skipped.push({
+				path: request.path,
+				reason: SKIP.capHit,
+				detail: `candidate needs ${request.bytes} bytes, ${context.budget.remainingBytes} left this sweep`,
+			});
+			break;
+		}
 		if (request.signature !== undefined) {
 			const current = statSignature(request.path);
 			if (current === undefined) {
