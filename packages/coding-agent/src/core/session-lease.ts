@@ -140,7 +140,7 @@ function readLeaseOwner(directory: string): SessionLeaseOwner | "absent" | "unre
 	}
 }
 
-function isProcessAlive(pid: number): boolean {
+export function isProcessAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
 		return true;
@@ -519,4 +519,52 @@ export function acquireSessionLease(
 		}
 		throw new Error(`Could not acquire session lease: ${canonicalPath}`);
 	});
+}
+
+/** Evidence class of one lease directory, for the retention sweep (L1/L2 layer). */
+export type LeaseDirectoryVerdict = "live" | "held-in-process" | "reclaimable" | "unverifiable";
+
+export interface LeaseDirectoryClassification {
+	verdict: LeaseDirectoryVerdict;
+	ownerPid?: number;
+	sessionPath?: string;
+	/** Human-readable reason for the report; the verdict is what the caller acts on. */
+	detail?: string;
+}
+
+/**
+ * Classify one lease directory with exactly the evidence `acquireSessionLease`
+ * uses: pid plus process start identity (pids get reused), the in-process set
+ * (a lease this process still holds is not stale, however its owner record
+ * reads), and "a record that cannot be read is not an absent owner". A sweep
+ * that deleted a lease the acquirer would have refused to reclaim would let two
+ * processes hold one session, so this is the single place that decides.
+ */
+export function classifyLeaseDirectory(
+	directory: string,
+	options: { activeLeaseDirectories?: ReadonlySet<string>; environment?: NodeJS.ProcessEnv } = {},
+): LeaseDirectoryClassification {
+	const environment = options.environment ?? process.env;
+	if (options.activeLeaseDirectories?.has(directory)) {
+		return { verdict: "held-in-process", detail: "held by this process" };
+	}
+	const owner = readLeaseOwner(directory);
+	if (owner === "absent") {
+		return { verdict: "reclaimable", detail: "no owner record" };
+	}
+	if (owner === "unreadable" || owner === "corrupt") {
+		return { verdict: "unverifiable", detail: `owner record ${owner}` };
+	}
+	const classification: LeaseDirectoryClassification = {
+		verdict: "live",
+		ownerPid: owner.pid,
+		sessionPath: owner.sessionPath,
+	};
+	if (isReclaimableOwnLease(owner, directory, environment)) {
+		return { ...classification, verdict: "reclaimable", detail: "leaked lease of this process" };
+	}
+	if (isLeaseOwnerAlive(owner)) {
+		return { ...classification, detail: "owner alive" };
+	}
+	return { ...classification, verdict: "reclaimable", detail: "owner process is gone" };
 }

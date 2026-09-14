@@ -55,6 +55,7 @@ import {
 	shouldReapOrphanProcess,
 } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
+import { runRetentionSweepOnce } from "../../core/retention/runner.js";
 import {
 	canEvictWorker,
 	type IdleEvictionMinutes,
@@ -232,6 +233,12 @@ const WORKER_REQUEST_TIMEOUT_MS = WORKER_REQUEST_TIMEOUT_TIERS.long;
 export const ADOPTION_WORKER_REQUEST_TIMEOUT_MS = DAEMON_ADOPTION_REQUEST_TIMEOUT_MS;
 // Failed-worker reaper cadence (L5). The threshold itself is settings-driven.
 const FAILED_WORKER_REAP_INTERVAL_MS = 5 * 60_000;
+/**
+ * How often the supervisor checks the retention cadence. The cadence itself comes
+ * from `retention.sweepIntervalMinutes`; this tick only decides when to look, so a
+ * settings change is honoured without a restart.
+ */
+const RETENTION_SWEEP_CHECK_INTERVAL_MS = 5 * 60_000;
 // L3: how many workers are adopted concurrently once the socket is already open.
 const ADOPTION_CONCURRENCY = 4;
 // L3/amend: a session with scheduled jobs is re-adopted on a backoff instead of being
@@ -761,6 +768,8 @@ export interface DaemonSupervisorOptions {
 	adoptionRequestTimeoutMs?: number;
 	/** Overrides the failed-worker reaper cadence; defaults to FAILED_WORKER_REAP_INTERVAL_MS. */
 	failedWorkerReapIntervalMs?: number;
+	/** Overrides the retention sweep cadence check; defaults to RETENTION_SWEEP_CHECK_INTERVAL_MS. */
+	retentionSweepCheckIntervalMs?: number;
 	/** Overrides the backoff used to re-adopt a worker whose sessions have scheduled jobs. */
 	adoptionRetryDelaysMs?: readonly number[];
 	/** Overrides the pending agent-message delivery queue bound per target session (P1-7c). */
@@ -1194,6 +1203,9 @@ export class DaemonSupervisor {
 	private uninstallCrashHandlers?: () => void;
 	private failedWorkerReaperTimer?: NodeJS.Timeout;
 	private failedWorkerReapSweep?: Promise<void>;
+	private readonly retentionSweepCheckIntervalMs: number;
+	private retentionSweepTimer?: NodeJS.Timeout;
+	private lastRetentionSweepAtMs = 0;
 
 	constructor(
 		private readonly socketPath: string,
@@ -1220,6 +1232,7 @@ export class DaemonSupervisor {
 		this.catchupRetryPolicy = options.catchupRetryPolicy ?? DEFAULT_CLIENT_CATCHUP_RETRY_POLICY;
 		this.adoptionRequestTimeoutMs = options.adoptionRequestTimeoutMs ?? ADOPTION_WORKER_REQUEST_TIMEOUT_MS;
 		this.failedWorkerReapIntervalMs = options.failedWorkerReapIntervalMs ?? FAILED_WORKER_REAP_INTERVAL_MS;
+		this.retentionSweepCheckIntervalMs = options.retentionSweepCheckIntervalMs ?? RETENTION_SWEEP_CHECK_INTERVAL_MS;
 		this.adoptionRetryDelaysMs = options.adoptionRetryDelaysMs ?? ADOPTION_RETRY_DELAYS_MS;
 		this.pendingDeliveryCapacity = options.pendingDeliveryCapacity;
 		this.pendingDeliveryRetryIntervalMs = options.pendingDeliveryRetryIntervalMs;
@@ -1301,6 +1314,7 @@ export class DaemonSupervisor {
 			this.rosterWatchdogTimer = setInterval(() => this.sweepRosterStaleness(), ROSTER_WATCHDOG_INTERVAL_MS);
 			this.rosterWatchdogTimer.unref();
 			this.startFailedWorkerReaper();
+			this.startRetentionSweepTimer();
 			this.assertSocketLeaseHeld();
 			await this.ownership.updatePhase("owner");
 			this.assertSocketLeaseHeld();
@@ -4477,6 +4491,69 @@ export class DaemonSupervisor {
 		}
 		clearInterval(this.failedWorkerReaperTimer);
 		this.failedWorkerReaperTimer = undefined;
+	}
+
+	private startRetentionSweepTimer(): void {
+		if (this.retentionSweepTimer) {
+			return;
+		}
+		this.retentionSweepTimer = setInterval(() => {
+			this.background(this.runRetentionSweepIfDue(), "retention sweep");
+		}, this.retentionSweepCheckIntervalMs);
+		this.retentionSweepTimer.unref();
+	}
+
+	private clearRetentionSweepTimer(): void {
+		if (!this.retentionSweepTimer) {
+			return;
+		}
+		clearInterval(this.retentionSweepTimer);
+		this.retentionSweepTimer = undefined;
+	}
+
+	/**
+	 * The disk-retention sweep, on the cadence `retention.sweepIntervalMinutes`
+	 * asks for. Only the daemon runs it on a timer: a short-lived CLI process must
+	 * not perform a large delete while it is exiting. `retention.enabled: false`
+	 * and the per-class zero knobs keep the sweep report-only, and the runner has
+	 * its own in-flight guard, so a slow sweep cannot stack.
+	 */
+	private async runRetentionSweepIfDue(now = Date.now()): Promise<void> {
+		if (this.shuttingDown) {
+			return;
+		}
+		const settings = this.settingsManager.getRetentionSettings();
+		const intervalMs = settings.sweepIntervalMinutes * 60_000;
+		if (intervalMs <= 0) {
+			return;
+		}
+		if (this.lastRetentionSweepAtMs !== 0 && now - this.lastRetentionSweepAtMs < intervalMs) {
+			return;
+		}
+		this.lastRetentionSweepAtMs = now;
+		const report = await runRetentionSweepOnce({
+			settings,
+			...(this.defaultSessionConfig.agentDir ? { agentDir: this.defaultSessionConfig.agentDir } : {}),
+			residentSessionIds: this.residentSessionIds(),
+		});
+		this.log(
+			`retention sweep: reclaimed ${report.totals.reclaimed} entries / ${report.totals.bytes} bytes` +
+				`${report.capped ? " (per-sweep cap reached)" : ""}${report.dryRun ? " (dry run)" : ""}`,
+		);
+	}
+
+	/** Session ids this supervisor has resident, so a sweep never touches them. */
+	private residentSessionIds(): ReadonlySet<string> {
+		const ids = new Set<string>();
+		for (const worker of this.workers.values()) {
+			for (const summary of worker.summaries.values()) {
+				ids.add(summary.id);
+				if (summary.activeSessionId) {
+					ids.add(summary.activeSessionId);
+				}
+			}
+		}
+		return ids;
 	}
 
 	/**
@@ -9038,6 +9115,7 @@ export class DaemonSupervisor {
 		this.clearScheduledWakeTimer();
 		this.clearRosterWatchdogTimer();
 		this.clearFailedWorkerReaperTimer();
+		this.clearRetentionSweepTimer();
 		this.clearAdoptionRetryTimers();
 		await this.idleEvictionSweep?.catch(() => undefined);
 		for (const cleanup of this.signalCleanupHandlers.splice(0)) {

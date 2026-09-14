@@ -6,6 +6,8 @@ import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
 import { sleepSync } from "../utils/sleep.js";
 import { DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS } from "./extensions/timeout.js";
+import { RETIRED_VENV_RETENTION } from "./kernel/venv-in-use.js";
+import type { ResolvedRetentionSettings } from "./retention/types.js";
 
 const RECENT_MODELS_LIMIT = 20;
 export const DEFAULT_IDLE_EVICTION_MINUTES = 90;
@@ -49,6 +51,20 @@ export const DEFAULT_KERNEL_REVIVAL_VOUCH_MAX_AGE_SECONDS = 600;
  * reaper archives it to the daemon log and removes the descriptor (C17).
  */
 export const DEFAULT_FAILED_WORKER_REAP_HOURS = 24;
+
+/** Disk-retention sweep defaults (see RetentionSettings and core/retention/). */
+export const DEFAULT_RETENTION_SWEEP_INTERVAL_MINUTES = 60;
+export const DEFAULT_RETENTION_MAX_DELETE_BYTES_PER_SWEEP = 512 * 1024 * 1024;
+export const DEFAULT_RETENTION_MAX_DELETE_ENTRIES_PER_SWEEP = 20_000;
+export const DEFAULT_RETENTION_COOLDOWN_MINUTES = 10;
+export const DEFAULT_RETENTION_EMPTY_ARTIFACT_DIR_DAYS = 7;
+export const DEFAULT_RETENTION_DELETED_SESSION_RESIDUE_DAYS = 7;
+export const DEFAULT_RETENTION_LOG_FILE_DAYS = 14;
+export const DEFAULT_RETENTION_TMP_RLM_DIR_HOURS = 24;
+export const DEFAULT_RETENTION_BASH_TEMP_FILE_HOURS = 24;
+export const DEFAULT_RETENTION_BASH_TEMP_FILE_MAX_BYTES = 256 * 1024 * 1024;
+export const DEFAULT_RETENTION_STALE_LEASE_HOURS = 24;
+export const DEFAULT_RETENTION_KERNEL_SNAPSHOT_GENERATIONS = 1;
 
 /**
  * Bounds on waiting for an agent-message target that is mid-transition (P1-1 / C14).
@@ -228,6 +244,60 @@ export interface DaemonSettings {
 	failedWorkerReapEnabled?: boolean; // default: true
 }
 
+/**
+ * Disk-retention policy knobs for the periodic sweep (round-08 design,
+ * /tmp/audit_r/round-08/disk-retention.md; implemented in core/retention/).
+ *
+ * Conventions, identical to `daemon.failedWorkerReapHours`: a day/hour knob of
+ * `0` or negative switches that class off, and `retention.enabled: false` is the
+ * master rollback lever (the sweep then only reports). The two circuit-breaker
+ * caps are the exception: a non-positive value falls back to the shipped default
+ * rather than removing the breaker, because "delete without a limit" is exactly
+ * the failure mode the breaker exists for.
+ */
+export interface RetentionSettings {
+	/** Master switch. Default: true. false = scan and report, never delete. */
+	enabled?: boolean;
+	/** Report what a sweep would reclaim without deleting anything. Default: false. */
+	dryRun?: boolean;
+	/** Periodic sweep interval in minutes; 0 or negative = no periodic sweep. Default: 60. */
+	sweepIntervalMinutes?: number;
+	/** Bytes one sweep may reclaim before it stops; non-positive = default. Default: 512 MiB. */
+	maxDeleteBytesPerSweep?: number;
+	/** Entries one sweep may reclaim before it stops; non-positive = default. Default: 20000. */
+	maxDeleteEntriesPerSweep?: number;
+	/** Any candidate touched more recently than this is kept. Default: 10. */
+	cooldownMinutes?: number;
+	/** Empty artifact directories of a provably gone session. Default: 7; 0 = off. */
+	emptyArtifactDirDays?: number;
+	/** Non-empty artifact directories left by a provably deleted session. Default: 7; 0 = off. */
+	deletedSessionResidueDays?: number;
+	/**
+	 * Child transcripts (`sub-xxxxxxxx/<uuid>.jsonl`) older than this. Default: 0 (off).
+	 * Deleted by age only when the owner asks: the bytes ride live sub-agent
+	 * references (round-08 D-1), so the shipped answer is "age is not the judge".
+	 */
+	childTranscriptDays?: number;
+	/** Log files whose socket is gone. Default: 14; 0 = off. */
+	logFileDays?: number;
+	/** Empty `prime-agent-rlm-*` temp directories. Default: 24; 0 = off. */
+	tmpRlmDirHours?: number;
+	/** Any other `prime-agent-*` temp directory. Default: 0 (off, report-only). */
+	tmpOtherDirDays?: number;
+	/** `pi-bash-*.log` temp files. Default: 24; 0 = off. */
+	bashTempFileHours?: number;
+	/** Write-side cap for one `pi-bash-*.log` file; non-positive = default. Default: 256 MiB. */
+	bashTempFileMaxBytes?: number;
+	/** Lease directories whose owner is provably gone. Default: 24; 0 = off. */
+	staleLeaseHours?: number;
+	/** Retired kernel snapshot generations kept. Default: 1; negative = 0. */
+	kernelSnapshotGenerations?: number;
+	/** Kernel snapshot generation reclaim. Default: false (round-08 D-1). */
+	kernelSnapshotReclaimEnabled?: boolean;
+	/** Retired kernel venv generations kept. Default: 1 (RETIRED_VENV_RETENTION). */
+	venvRetention?: number;
+}
+
 export interface TerminalSettings {
 	showImages?: boolean; // default: true (show image type and dimensions)
 	clearOnShrink?: boolean; // default: false (clear empty rows when content shrinks)
@@ -346,6 +416,7 @@ export interface Settings {
 	agentTraces?: AgentTracesSettings;
 	telemetry?: TelemetrySettings;
 	branchSummary?: BranchSummarySettings;
+	retention?: RetentionSettings;
 	retry?: RetrySettings;
 	hideThinkingBlock?: boolean;
 	shellPath?: string; // Custom shell path (e.g., for Cygwin users on Windows)
@@ -1221,6 +1292,14 @@ export class SettingsManager {
 		};
 	}
 
+	/**
+	 * Disk-retention policy (round-08 design). Every day/hour knob resolves to 0
+	 * when it is switched off, so a class only has to test one value.
+	 */
+	getRetentionSettings(): ResolvedRetentionSettings {
+		return resolveRetentionSettings(this.settings.retention);
+	}
+
 	/** Wake policy for agent messages queued into a session whose pump is suspended. */
 	getSubagentWakePolicy(): SubagentWakePolicy {
 		const policy = this.settings.subagentWake?.policy;
@@ -1685,4 +1764,81 @@ export function readKernelBootstrapSettings(
 	agentDir: string = getAgentDir(),
 ): { lockTimeoutMs: number } {
 	return SettingsManager.fromStorage(new FileSettingsStorage(cwd, agentDir)).getKernelBootstrapSettings();
+}
+
+/**
+ * A day/hour knob: `0` or negative switches the class off (the documented
+ * rollback lever), a non-number falls back to the shipped default.
+ */
+function normalizeRetentionWindowDays(value: unknown, fallback: number): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+	if (value <= 0) return 0;
+	return value;
+}
+
+/** A circuit-breaker cap: non-positive keeps the default, so the breaker cannot be removed. */
+function normalizeRetentionCap(value: unknown, fallback: number): number {
+	if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return fallback;
+	return Math.floor(value);
+}
+
+function normalizeRetentionCount(value: unknown, fallback: number): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+	return Math.max(0, Math.floor(value));
+}
+
+/**
+ * Resolve the `retention` section. Exported because the sweep, the CLI runner and
+ * the tests all need the same numbers without constructing a SettingsManager, and
+ * because every "0 = off" decision has to be made in exactly one place.
+ */
+export function resolveRetentionSettings(settings?: RetentionSettings): ResolvedRetentionSettings {
+	return {
+		enabled: settings?.enabled !== false,
+		dryRun: settings?.dryRun === true || process.env.PRIME_AGENT_RETENTION_DRYRUN === "1",
+		sweepIntervalMinutes: normalizeRetentionWindowDays(
+			settings?.sweepIntervalMinutes,
+			DEFAULT_RETENTION_SWEEP_INTERVAL_MINUTES,
+		),
+		maxDeleteBytesPerSweep: normalizeRetentionCap(
+			settings?.maxDeleteBytesPerSweep,
+			DEFAULT_RETENTION_MAX_DELETE_BYTES_PER_SWEEP,
+		),
+		maxDeleteEntriesPerSweep: normalizeRetentionCap(
+			settings?.maxDeleteEntriesPerSweep,
+			DEFAULT_RETENTION_MAX_DELETE_ENTRIES_PER_SWEEP,
+		),
+		// Unlike a class window, the cooldown cannot be switched off: a non-positive
+		// value keeps the shipped window, so "no cooldown" is not reachable by config.
+		cooldownMinutes: normalizeRetentionCap(settings?.cooldownMinutes, DEFAULT_RETENTION_COOLDOWN_MINUTES),
+		emptyArtifactDirDays: normalizeRetentionWindowDays(
+			settings?.emptyArtifactDirDays,
+			DEFAULT_RETENTION_EMPTY_ARTIFACT_DIR_DAYS,
+		),
+		deletedSessionResidueDays: normalizeRetentionWindowDays(
+			settings?.deletedSessionResidueDays,
+			DEFAULT_RETENTION_DELETED_SESSION_RESIDUE_DAYS,
+		),
+		// No shipped default above zero: the owner decided child transcripts are not
+		// reclaimed by age (round-08 D-1, round-09 ruling 1).
+		childTranscriptDays: normalizeRetentionWindowDays(settings?.childTranscriptDays, 0),
+		logFileDays: normalizeRetentionWindowDays(settings?.logFileDays, DEFAULT_RETENTION_LOG_FILE_DAYS),
+		tmpRlmDirHours: normalizeRetentionWindowDays(settings?.tmpRlmDirHours, DEFAULT_RETENTION_TMP_RLM_DIR_HOURS),
+		tmpOtherDirDays: normalizeRetentionWindowDays(settings?.tmpOtherDirDays, 0),
+		bashTempFileHours: normalizeRetentionWindowDays(
+			settings?.bashTempFileHours,
+			DEFAULT_RETENTION_BASH_TEMP_FILE_HOURS,
+		),
+		bashTempFileMaxBytes: normalizeRetentionCap(
+			settings?.bashTempFileMaxBytes,
+			DEFAULT_RETENTION_BASH_TEMP_FILE_MAX_BYTES,
+		),
+		staleLeaseHours: normalizeRetentionWindowDays(settings?.staleLeaseHours, DEFAULT_RETENTION_STALE_LEASE_HOURS),
+		kernelSnapshotGenerations: normalizeRetentionCount(
+			settings?.kernelSnapshotGenerations,
+			DEFAULT_RETENTION_KERNEL_SNAPSHOT_GENERATIONS,
+		),
+		kernelSnapshotReclaimEnabled: settings?.kernelSnapshotReclaimEnabled === true,
+		venvRetention: normalizeRetentionCount(settings?.venvRetention, RETIRED_VENV_RETENTION),
+	};
 }

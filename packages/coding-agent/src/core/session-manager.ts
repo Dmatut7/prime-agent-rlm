@@ -35,6 +35,13 @@ import {
 	createCustomMessage,
 } from "./messages.js";
 import {
+	artifactDirectoryWriteMs,
+	clearSessionArtifactTombstone,
+	readSessionArtifactTombstone,
+	tombstoneInForce,
+} from "./session-artifact-tombstones.js";
+import { assertValidSessionId, isValidSessionId, SESSION_ID_PATTERN } from "./session-id.js";
+import {
 	readCachedSessionInfo,
 	removeCachedSessionInfo,
 	SESSION_ARTIFACTS_DIR_NAME,
@@ -298,25 +305,12 @@ export type ReadonlySessionManager = Pick<
 	| "getSessionName"
 >;
 
-const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
-
-function assertValidSessionId(sessionId: string): void {
-	if (!SESSION_ID_PATTERN.test(sessionId)) {
-		throw new Error(
-			"Invalid session id: expected 1-128 ASCII letters, digits, dots, underscores, or hyphens, starting with a letter or digit",
-		);
-	}
-}
-
 /** Generate a fresh session id (uuidv7, so session files stay time-ordered). */
 export function createSessionId(): string {
 	return uuidv7();
 }
 
-/** Whether `value` may serve as a session id, and therefore as a session file stem. */
-export function isValidSessionId(value: string): boolean {
-	return SESSION_ID_PATTERN.test(value);
-}
+export { assertValidSessionId, isValidSessionId };
 
 function getSessionFilePath(sessionDir: string, sessionId: string): string {
 	assertValidSessionId(sessionId);
@@ -1829,8 +1823,50 @@ export class SessionManager {
 		return target.sessionFile;
 	}
 
+	/**
+	 * This session's artifact directory. Read paths get the path whether or not it
+	 * exists and never create it: the old default (`create: true`) meant any read
+	 * resurrected a deleted session's directory, which in turn kept that session's
+	 * cron registration alive forever (round-08 S1). Writers that own this session
+	 * call {@link ensureSessionArtifactDir}.
+	 */
 	getSessionArtifactDir(options: { create?: boolean } = {}): string | undefined {
-		return this.persist ? getSessionArtifactPath(this.sessionDir, this.sessionId, options.create ?? true) : undefined;
+		if (!this.persist) return undefined;
+		if (options.create !== true) {
+			return getSessionArtifactPath(this.sessionDir, this.sessionId, false);
+		}
+		if (this.sessionArtifactCreationSuppressed()) {
+			return getSessionArtifactPath(this.sessionDir, this.sessionId, false);
+		}
+		return getSessionArtifactPath(this.sessionDir, this.sessionId, true);
+	}
+
+	/**
+	 * Write-side twin of {@link getSessionArtifactDir}: create the directory and
+	 * retire the tombstone. A session that is running owns its id again, and the
+	 * tombstone exists only to stop *reads* from recreating a deleted session's
+	 * directory - it must never make a live session's writes fail (red test R-6).
+	 */
+	ensureSessionArtifactDir(): string | undefined {
+		if (!this.persist) return undefined;
+		const artifactRoot = getSessionArtifactsRoot(this.sessionDir);
+		const artifactDir = getSessionArtifactPath(this.sessionDir, this.sessionId, true);
+		clearSessionArtifactTombstone(artifactRoot, this.sessionId);
+		return artifactDir;
+	}
+
+	/**
+	 * True while a tombstone for this id still describes the directory on disk:
+	 * the session was deleted and nothing has been written into the directory
+	 * since. A new session that reuses the id writes after `deletedAt`, so the
+	 * window closes by itself.
+	 */
+	private sessionArtifactCreationSuppressed(): boolean {
+		const artifactRoot = getSessionArtifactsRoot(this.sessionDir);
+		const tombstone = readSessionArtifactTombstone(artifactRoot, this.sessionId);
+		if (!tombstone) return false;
+		const readPath = getSessionArtifactPath(this.sessionDir, this.sessionId, false);
+		return tombstoneInForce(tombstone, artifactDirectoryWriteMs(readPath));
 	}
 
 	/**

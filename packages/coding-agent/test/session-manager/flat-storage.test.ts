@@ -44,7 +44,7 @@ describe("SessionManager flat storage", () => {
 			const continued = SessionManager.continueRecent(cwdA, sessionDir);
 			expect(continued.getSessionId()).toBe(sessionA.getSessionId());
 
-			expect(sessionA.getSessionArtifactDir()).toBe(
+			expect(sessionA.ensureSessionArtifactDir()).toBe(
 				realpathSync(join(tempDir, "session-artifacts", sessionA.getSessionId())),
 			);
 		} finally {
@@ -70,7 +70,8 @@ describe("SessionManager flat storage", () => {
 			const tempDir = mkdtempSync(join(tmpdir(), "session-artifact-locked-"));
 			try {
 				const session = SessionManager.create(tempDir, join(tempDir, "sessions"));
-				const artifactPath = session.getSessionArtifactDir()!;
+				// Write side: the directory has to exist for the read path to judge.
+				const artifactPath = session.ensureSessionArtifactDir()!;
 				// Deliberately fenced (no owner write): must stay untouched.
 				chmodSync(artifactPath, 0o555);
 				expect(() => session.getSessionArtifactDir({ create: false })).toThrow(
@@ -107,7 +108,7 @@ describe("SessionManager flat storage", () => {
 			const tempDir = mkdtempSync(join(tmpdir(), "session-artifact-private-"));
 			try {
 				const session = SessionManager.create(tempDir, join(tempDir, "sessions"));
-				const artifactPath = session.getSessionArtifactDir()!;
+				const artifactPath = session.ensureSessionArtifactDir()!;
 				chmodSync(artifactPath, 0o755);
 				expect(session.getSessionArtifactDir({ create: false })).toBe(artifactPath);
 				expect(statSync(artifactPath).mode & 0o777).toBe(0o700);

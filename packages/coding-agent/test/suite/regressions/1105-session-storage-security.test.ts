@@ -127,7 +127,9 @@ describe("issue #1105 session storage security", () => {
 			const sessionFile = manager.getSessionFile()!;
 			chmodSync(sessionFile, 0o644);
 			manager.appendSessionInfo("private");
-			const artifactDir = manager.getSessionArtifactDir()!;
+			// Write side: the artifact directory is created by the session that owns it,
+			// not by a read path (round-08 S1).
+			const artifactDir = manager.ensureSessionArtifactDir()!;
 
 			expect(statSync(sessionDir).mode & 0o777).toBe(0o700);
 			expect(statSync(sessionFile).mode & 0o777).toBe(0o600);

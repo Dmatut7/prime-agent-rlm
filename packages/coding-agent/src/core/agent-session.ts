@@ -9816,7 +9816,7 @@ export class AgentSession {
 
 	private _localHarnessStateDir(): string | undefined {
 		return (
-			getLocalHarnessStateDir(this.sessionManager.getSessionArtifactDir()) ??
+			getLocalHarnessStateDir(this.sessionManager.ensureSessionArtifactDir()) ??
 			(this._rlmSessionDir ? getLocalHarnessStateDir(this._rlmSessionDir) : undefined)
 		);
 	}
@@ -11484,7 +11484,9 @@ export class AgentSession {
 			// startup on the old one's dispose (which flushes a final snapshot), so a
 			// reload can't restore from a snapshot the old kernel is still writing.
 			const previousDispose = this._ipythonKernelProvisioner?.dispose();
-			this._ipythonKernelSnapshotDir = this.sessionManager.getSessionArtifactDir();
+			// Write side: the kernel snapshot writer owns this directory, so it is
+			// created here rather than by any read path that merely wants the path.
+			this._ipythonKernelSnapshotDir = this.sessionManager.ensureSessionArtifactDir();
 			// Only surface the "revived from your previous session" notice on the first
 			// build (a genuine resume). A later rebuild (/reload) restores state silently
 			// for continuity — the conversation is unchanged, so there's nothing to flag.
@@ -11873,7 +11875,7 @@ export class AgentSession {
 			return this._rlmSessionDir;
 		}
 
-		const sessionArtifactDir = this.sessionManager.getSessionArtifactDir();
+		const sessionArtifactDir = this.sessionManager.ensureSessionArtifactDir();
 		if (sessionArtifactDir) {
 			ensurePrivateDirectory(sessionArtifactDir);
 			this._rlmSessionDir = sessionArtifactDir;

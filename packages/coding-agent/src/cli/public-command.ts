@@ -2,6 +2,8 @@ import chalk from "chalk";
 import { APP_NAME, SELF_UPDATE_INTERACTIVE_CHILD_ENV } from "../config.js";
 import { AuthStorage } from "../core/auth-storage.js";
 import { runMcpManagementCommand } from "../core/mcp/mcp-command.js";
+import { lastSweepPath, readRetentionHistory, retentionRoots, retentionStatus } from "../core/retention/reports.js";
+import { runRetentionSweepOnce } from "../core/retention/runner.js";
 import { SettingsManager } from "../core/settings-manager.js";
 import { handlePackageCommand, isSelfUpdateSource } from "../package-manager-cli.js";
 import { INTERNAL_RUNTIME_COMMAND_MARKER, parseArgs } from "./args.js";
@@ -108,6 +110,8 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 			return runStatus(args.slice(1));
 		case "doctor":
 			return runDoctor(args.slice(1));
+		case "retention":
+			return runRetention(args.slice(1));
 		case "shutdown":
 			return runShutdown(args.slice(1));
 		case "package":
@@ -249,6 +253,63 @@ async function runStatus(args: string[]): Promise<PublicCommandResult> {
 	const options = parseBooleanOptions(args, new Set(["--json"]), "status");
 	if (!options) return HANDLED;
 	await runPs(options.has("--json"));
+	return HANDLED;
+}
+
+/**
+ * `retention status` reports the last sweep, `retention sweep` runs one now. The
+ * manual trigger exists for a machine whose daemon is not running the periodic
+ * sweep (a short-lived CLI process never sweeps on its own) and for verifying a
+ * `retention.*` change without waiting for the next cadence.
+ */
+async function runRetention(args: string[]): Promise<PublicCommandResult> {
+	const subcommand = args[0];
+	if (subcommand !== "status" && subcommand !== "sweep") {
+		return fail(`Usage: ${APP_NAME} ${getCommandSpec(["retention"])?.usage ?? "retention <status|sweep>"}`);
+	}
+	const options = parseBooleanOptions(args.slice(1), new Set(["--json", "--dry-run"]), `retention ${subcommand}`);
+	if (!options) return HANDLED;
+	const json = options.has("--json");
+	if (subcommand === "sweep") {
+		const report = await runRetentionSweepOnce({ dryRun: options.has("--dry-run") });
+		if (json) {
+			console.log(JSON.stringify(report, null, 2));
+			return HANDLED;
+		}
+		console.log(
+			`Retention sweep${report.dryRun ? " (dry run)" : ""}: reclaimed ${report.totals.reclaimed} entries / ${report.totals.bytes} bytes` +
+				`${report.capped ? ", per-sweep cap reached" : ""}`,
+		);
+		for (const entry of report.classes) {
+			console.log(
+				`  ${entry.class}: scanned ${entry.scanned}, reclaimed ${entry.reclaimed}, bytes ${entry.bytes}` +
+					`${entry.disabled ? " (disabled)" : ""}${entry.capped ? " (capped)" : ""}`,
+			);
+		}
+		for (const classId of report.stalled) {
+			console.log(`  stalled: ${classId} scanned candidates for three sweeps without reclaiming any`);
+		}
+		if (report.enabled && !report.dryRun) {
+			console.log(`  report: ${lastSweepPath(retentionRoots({}))}`);
+		}
+		return HANDLED;
+	}
+	const roots = retentionRoots({});
+	const status = retentionStatus(roots);
+	if (json) {
+		console.log(JSON.stringify({ ...status, history: readRetentionHistory(roots).length }, null, 2));
+		return HANDLED;
+	}
+	console.log(`Agent dir: ${roots.agentDir}`);
+	console.log(`Last sweep: ${status.lastSweepAt ?? "never"}`);
+	const classes = status.lastSweep?.classes ?? [];
+	for (const entry of classes) {
+		console.log(
+			`  ${entry.class}: scanned ${entry.scanned}, reclaimed ${entry.reclaimed}, bytes ${entry.bytes}` +
+				`${entry.disabled ? " (disabled)" : ""}`,
+		);
+	}
+	console.log(`History: ${status.historySweeps} sweeps recorded`);
 	return HANDLED;
 }
 

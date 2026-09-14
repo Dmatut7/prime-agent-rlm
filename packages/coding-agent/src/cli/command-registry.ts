@@ -86,6 +86,15 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 		options: ["--fix   Remove stale sockets and stop idle orphaned services", "--json  Print JSON"],
 	},
 	{
+		path: ["retention"],
+		usage: "retention <status|sweep> [--dry-run] [--json]",
+		summary: "Inspect and run the disk-retention sweep",
+		description:
+			"Retention reclaims only resources no live session references: deleted sessions' artifact leftovers, kernel venv and kernel snapshot generations, log files whose socket is gone, empty prime-agent-rlm-* temp directories, pi-bash temp files, and stale session leases. Configure gaps and switches under retention.* in settings.json; retention.enabled=false reports without deleting.",
+		options: ["--dry-run  Report what a sweep would reclaim without deleting", "--json     Print JSON"],
+		examples: [`retention status`, `retention sweep --dry-run`],
+	},
+	{
 		path: ["shutdown"],
 		usage: "shutdown [--force] [--json]",
 		summary: "Stop every agent and background service",
