@@ -10,7 +10,7 @@
 5. **心跳**：每 30 分钟推进一轮（收线 / 派线 / 并档 / 修缺陷），从不空转。
 
 ## 已用过的角度（每轮换新的，避免审美疲劳）
-- R1（2026-09-14 夜）：性能热路径 / 影响模型智能的面 / 模型运行时表现 / 长期运行稳定性 / 数据与协议正确性
+- R2（2026-09-14 深夜起，老板点名）：**长会话退化**——同一个窗口跑很久之后，工具调用/出字/速度/token 全线变慢。要求量化（把"每次回合要做的事"随转录长度的伸缩曲线量出来），不是靠感觉。\n- R1（2026-09-14 夜）：性能热路径 / 影响模型智能的面 / 模型运行时表现 / 长期运行稳定性 / 数据与协议正确性
 - 已完成的行级深读面（不重复劳动，但发现我的结论有错要报）：agent-session 通知链、stall-watchdog、turn-liveness、orphan-process-journal、venv-in-use、pending-delivery-queue、session-lease、cron-jobs、agent-messages、daemon-protocol、session-info-disk-cache、compaction 渲染/解析
 
 ## 派活纪律（每条线都要带）
