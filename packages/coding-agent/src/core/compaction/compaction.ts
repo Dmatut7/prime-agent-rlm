@@ -1005,6 +1005,15 @@ export function prepareCompaction(
 		}
 	}
 
+	// A hook-authored previous entry is not pi's own machine output: the
+	// session_before_compact hook supplies the summary, the details and the file lists as
+	// one opaque bundle, so its details are extension data (CompactionResult.details is
+	// documented as extension-specific) and its text is extension prose. extractFileOperations
+	// already refuses such an entry's details; everything read out of the same entry has to be
+	// refused too, or the gate covers half the entry and believes the other half.
+	const previousEntry = prevCompactionIndex >= 0 ? (pathEntries[prevCompactionIndex] as CompactionEntry) : undefined;
+	const machineAuthored = previousEntry !== undefined && !previousEntry.fromHook;
+
 	let previousSummary: string | undefined;
 	let previousSummarySource: string | undefined;
 	let previousFacts: FactLedger | undefined;
@@ -1012,7 +1021,7 @@ export function prepareCompaction(
 	let previousGeneration = 0;
 	let boundaryStart = 0;
 	if (prevCompactionIndex >= 0) {
-		const prevCompaction = pathEntries[prevCompactionIndex] as CompactionEntry;
+		const prevCompaction = previousEntry as CompactionEntry;
 		const storedSummary = prevCompaction.summary ?? "";
 		previousSummarySource = storedSummary;
 		// The machine-generated blocks never go back to the summarizer. They are
@@ -1022,16 +1031,25 @@ export function prepareCompaction(
 		// command that uses it. What they carried is recovered structurally instead:
 		// details first, the rendered block as the fallback for entries without them.
 		previousSummary = stripMachineBlocks(storedSummary) || undefined;
-		const renderedFacts = parseFactAppendix(storedSummary);
-		const renderedUserRequests = parseUserRequests(storedSummary);
-		previousGeneration = Math.max(
-			detailsGeneration(prevCompaction.details),
-			renderedFacts?.generation ?? 0,
-			renderedUserRequests?.generation ?? 0,
-		);
+		const renderedFacts = machineAuthored ? parseFactAppendix(storedSummary) : undefined;
+		const renderedUserRequests = machineAuthored ? parseUserRequests(storedSummary) : undefined;
+		// Metadata is text too. The rendered block's `generation` used to enter through
+		// Math.max, so a forged header carrying generation="99" was enough to push every
+		// later generation up by a hundred and write that number into the next entry's
+		// details - details protected the content but not the counter. Details are
+		// authoritative here exactly as they are for content; the rendered values are read
+		// only when details carry no generation at all (an entry from a build that had none).
+		const storedGeneration = machineAuthored ? detailsGeneration(prevCompaction.details) : 0;
+		previousGeneration =
+			storedGeneration > 0
+				? storedGeneration
+				: Math.max(renderedFacts?.generation ?? 0, renderedUserRequests?.generation ?? 0);
 		const generation = previousGeneration + 1;
-		previousFacts = factLedgerFromDetails(prevCompaction.details, generation) ?? renderedFacts;
-		previousUserRequests = userRequestLedgerFromDetails(prevCompaction.details, generation) ?? renderedUserRequests;
+		previousFacts =
+			(machineAuthored ? factLedgerFromDetails(prevCompaction.details, generation) : undefined) ?? renderedFacts;
+		previousUserRequests =
+			(machineAuthored ? userRequestLedgerFromDetails(prevCompaction.details, generation) : undefined) ??
+			renderedUserRequests;
 		const firstKeptEntryIndex = pathEntries.findIndex((entry) => entry.id === prevCompaction.firstKeptEntryId);
 		boundaryStart = firstKeptEntryIndex >= 0 ? firstKeptEntryIndex : prevCompactionIndex + 1;
 	}
@@ -1076,7 +1094,9 @@ export function prepareCompaction(
 	}
 	// The file lists are stripped out of the previous summary above, so an entry whose
 	// details are missing recovers them from the rendered blocks instead of losing them.
-	if (previousSummarySource) {
+	// Same gate as the details above: a hook-authored entry's blocks are extension text,
+	// so they are not a source of file operations either.
+	if (previousSummarySource && machineAuthored) {
 		extractFileOpsFromSummary(previousSummarySource, fileOps);
 	}
 

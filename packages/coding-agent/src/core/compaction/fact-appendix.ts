@@ -22,11 +22,8 @@
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { getLogger } from "@earendil-works/pi-ai";
 import { estimateTextTokensByContent } from "./content-density.js";
-import { findMachineBlock, renderMachineBlock } from "./machine-blocks.js";
-
-const compactionLog = getLogger("coding-agent.compaction");
+import { checkMachineBlockSelfCount, findMachineBlock, renderMachineBlock } from "./machine-blocks.js";
 
 export type FactKind = "sha" | "path" | "number" | "error" | "issue";
 
@@ -846,19 +843,11 @@ export function parseFactAppendix(text: string): FactLedger | undefined {
 		const count = Number.parseInt(entry.slice(separator + 1), 10);
 		if (Number.isFinite(count) && count > 0) elided[kind] = count;
 	}
-	// Same self-check as the user-request block: `facts` is written on the opening tag, so a
-	// gap between the declaration and the records parsed back is damage worth reporting.
-	const declaredFacts = Number.parseInt(block.attributes.facts ?? "", 10);
-	if (Number.isFinite(declaredFacts) && declaredFacts !== records.length) {
-		compactionLog.warn(
-			"<fact-appendix> block is damaged: its declared fact count does not match the records parsed back",
-			{
-				declaredFacts,
-				parsedRecords: records.length,
-				generation,
-			},
-		);
-	}
+	// Same self-check as the user-request block, and the same ordering rule: `facts` is written
+	// on the opening tag, and the comparison runs on the anchored block, so a gap between the
+	// declaration and the records parsed back is damage worth reporting rather than a header
+	// that can declare whatever the payload needs it to declare.
+	checkMachineBlockSelfCount(block, "facts", records.length);
 	return { generation: Number.isFinite(generation) && generation > 0 ? generation : 1, records, elided };
 }
 

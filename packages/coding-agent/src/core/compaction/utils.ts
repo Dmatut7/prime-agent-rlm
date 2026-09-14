@@ -5,11 +5,15 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { getLogger } from "@earendil-works/pi-ai";
-import { findMachineBlock, parseBlockLines } from "./machine-blocks.js";
+import {
+	findMachineBlock,
+	type MachineBlockTag,
+	parseBlockLines,
+	readsAsBlockDelimiter,
+	renderMachineBlock,
+} from "./machine-blocks.js";
 
 const compactionLog = getLogger("coding-agent.compaction");
-/** A line that would read as a machine-block delimiter when this text is parsed back. */
-const BLOCK_DELIMITER_LINE = /<\/?(?:read-files|modified-files|fact-appendix|user-requests)\b/;
 export interface FileOperations {
 	read: Set<string>;
 	written: Set<string>;
@@ -85,31 +89,51 @@ export function computeFileLists(fileOps: FileOperations): { readFiles: string[]
 
 /**
  * Format file operations as XML tags for summary.
+ *
+ * Both lists go through renderMachineBlock like the other two blocks, so all four
+ * share one delimiter shape and one guard.
+ *
+ * The file lists are the one channel that is not JSON, so a payload here cannot be
+ * escaped the way the JSON lines are: `<` -> `\u003c` is unambiguous only when a JSON
+ * layer has already doubled every backslash, and inventing the same escape for plain
+ * lines would make an existing path that contains the literal `\u003c` ambiguous
+ * (turning "escape it" into "sometimes restore it"). A revertible line codec that also
+ * escapes the backslash as well would round-trip, but at the cost of the one property
+ * an older build reading a newer block. So the guard is at render time instead of on
+ * the parse side: a line that would read back as a block delimiter is left out of the
+ * rendered list and reported, and the parse side never has to guess what a line meant.
+ *
+ * The cost is bounded on purpose. `details.readFiles`/`details.modifiedFiles` carry the
+ * same paths structurally and are the primary carry-forward for the next generation, so
+ * what this drops is only the rendered copy - and only for entries that are either a
+ * forged delimiter or a path that is not really a path (a newline inside one).
  */
 export function formatFileOperations(readFiles: string[], modifiedFiles: string[]): string {
 	const sections: string[] = [];
-	if (readFiles.length > 0) {
-		sections.push(`<read-files>\n${readFiles.join("\n")}\n</read-files>`);
+	for (const [tag, entries] of [
+		["read-files", readFiles],
+		["modified-files", modifiedFiles],
+	] as const) {
+		const body = renderListBody(entries, tag);
+		if (body.length > 0) sections.push(renderMachineBlock(tag, {}, body));
 	}
-	if (modifiedFiles.length > 0) {
-		sections.push(`<modified-files>\n${modifiedFiles.join("\n")}\n</modified-files>`);
-	}
-	if (sections.length === 0) return "";
-	// The list blocks carry paths verbatim, so an entry that reads as a delimiter would end its
-	// block early on the next parse and silently truncate the list. Escaping is not available
-	// here (a plain line has no JSON layer, and inventing an escape would make a path that
-	// already contains it ambiguous), so the damage is at least never silent.
-	for (const entry of [...readFiles, ...modifiedFiles]) {
-		if (BLOCK_DELIMITER_LINE.test(entry)) {
-			compactionLog.warn(
-				"a tracked path reads as a machine-block delimiter; the file lists cannot carry it verbatim",
-				{
-					entry,
-				},
-			);
-		}
-	}
-	return `\n\n${sections.join("\n\n")}`;
+	return sections.join("");
+}
+
+/** The lines of one list block, minus the entries the block cannot carry verbatim. */
+function renderListBody(entries: readonly string[], tag: MachineBlockTag): string {
+	const kept = entries.filter((entry) => {
+		// A newline smuggles extra lines; `</` anywhere and a delimiter shape are the two
+		// spellings of "this line is not a path, it is markup". Either way the rendered block
+		// would claim a list the next parse cannot recover.
+		if (!/[\r\n]/.test(entry) && !entry.includes("</") && !readsAsBlockDelimiter(entry)) return true;
+		compactionLog.warn(
+			"a tracked path reads as a machine-block delimiter; it is left out of the rendered file list (entry details still carry it)",
+			{ entry, tag },
+		);
+		return false;
+	});
+	return kept.join("\n");
 }
 
 /**
