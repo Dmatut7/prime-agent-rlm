@@ -47,3 +47,4 @@
 {"id": "UI-1", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "粘贴含字面 ESC[201~ 时粘贴被截断、尾部按按键执行（ctrl+right 真会执行）", "verified_by": "R6 实证 + 正控（发生率 unverified）"}
 {"id": "UI-2", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "超限/超时/非括号大输入逐字符入编辑器 ⇒ 单行 O(n²)：200k=8.2s、1M=257s", "verified_by": "R6 实测 + 机制正控"}
 {"id": "UI-3", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "truncateToWidth(pad) 在 ANSI+宽字符/ZWJ 簇下宽度算错（同串两口径）", "verified_by": "R6 实测 45/80000 + 正控"}
+{"id": "R1", "date": "2026-09-15", "severity": "P2", "status": "fixed", "commit": "0d9fba468", "title": "回退位置只活在内存 ⇒ 重启后静默回到回退前位置", "verified_by": "R4 复现 + 实现线红 4/1 → 8 绿 + 母席复跑 8 绿；老转录/降级/无 assistant 期均有用例"}
