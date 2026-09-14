@@ -85,3 +85,9 @@
 {"id": "SUP-B", "date": "2026-09-15", "severity": "P2", "status": "confirmed_pending_fix", "commit": null, "title": "prime-agent update 接受任意绝对 URL 作 npm install -g 目标，无哈希无签名", "verified_by": "R8 探针（evil.example 被接受）"}
 {"id": "SUP-D", "date": "2026-09-15", "severity": "P2", "status": "confirmed_pending_fix", "commit": null, "title": "fd/rg 走 releases/latest 无校验无固定，且安装时无条件触发", "verified_by": "R8 读码 + install.sh"}
 {"id": "SUP-E", "date": "2026-09-15", "severity": "P2", "status": "confirmed_pending_fix", "commit": null, "title": "内核依赖裸 PyPI 名（含未注册的 prime-agent-runtime）⇒ 抢注即可进程内执行；出货路径不用 uv.lock", "verified_by": "R8 读码 + PyPI 404 核实"}
+{"id": "X1", "date": "2026-09-15", "severity": "P1", "status": "confirmed_pending_fix_win32_only", "commit": null, "title": "内核 venv 解释器路径写死 bin/python ⇒ Windows 上内核永不启动（RLM 主线全损）", "verified_by": "R8 跨平台线读码 + 同仓内证（venv-in-use 认 scripts、bootstrap 已有 win32 分支）+ 本机字面值复现"}
+{"id": "X2", "date": "2026-09-15", "severity": "P2", "status": "confirmed_pending_fix_win32_only", "commit": null, "title": "win32 优雅退出空转：SIGTERM 收不到 + 不注册 SIGHUP（关窗唯一信号）+ SIGBREAK 零监听", "verified_by": "R8 读码 + Node 文档逐字"}
+{"id": "X3", "date": "2026-09-15", "severity": "P2", "status": "confirmed_pending_fix_win32_only", "commit": null, "title": "win32 daemon 发现盲：两个发现源 return [] ⇒ shutdown 不停任何 daemon 却报 no services found", "verified_by": "R8 读码"}
+{"id": "X4", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix_win32_only", "commit": null, "title": "win32 killProcessTree 用裸名 taskkill 且无 error 监听（兄弟实现已硬化）", "verified_by": "R8 读码 + 同仓对照"}
+{"id": "X5", "date": "2026-09-15", "severity": "P2", "status": "confirmed_pending_fix_win32_only", "commit": null, "title": "私有文件硬化在 win32 空转且无文件级 ACL 兜底", "verified_by": "R8 读码（SetNamedSecurityInfo 仅管道）"}
+{"id": "X6", "date": "2026-09-15", "severity": "P3", "status": "awaiting_owner_decision", "commit": null, "title": "win32 整段禁用常驻 harness（疑为未验证而非做不到）", "verified_by": "R8 读码 + 同层 44 处正常调用对照"}
