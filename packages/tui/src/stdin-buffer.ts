@@ -315,29 +315,12 @@ export type StdinBufferEventMap = {
 	paste: [string];
 };
 
-function isImmediatePasteEscapeAbort(data: string): boolean {
-	return data === "\x1b[27u" || (data.startsWith("\x1b[27;") && data.endsWith("u"));
-}
-
 /**
- * Proper prefixes of the markers scanned inside a paste (`\x1b[201~`,
- * `\x1b[27u`, `\x1b[27;<digits>u`). A window tail matching this can still
- * grow into a marker in a later chunk, so it must be rescanned on append.
+ * Proper prefixes of the paste end marker (`\x1b[201~`). A window tail matching
+ * this can still grow into the marker in a later chunk, so it must be rescanned
+ * on append.
  */
-const PARTIAL_PASTE_MARKER_REGEX = /^\x1b(\[(2(01?|7(;[\d:]*)?)?)?)?$/;
-
-function findCompleteKittyEscape(buffer: string): { index: number; length: number } | null {
-	const simple = "\x1b[27u";
-	const simpleAt = buffer.indexOf(simple);
-	if (simpleAt !== -1) {
-		return { index: simpleAt, length: simple.length };
-	}
-	const match = buffer.match(/\x1b\[27;[\d:]+u/);
-	if (match?.index === undefined) {
-		return null;
-	}
-	return { index: match.index, length: match[0].length };
-}
+const PARTIAL_PASTE_MARKER_REGEX = /^\x1b(\[(2(01?)?)?)?$/;
 
 /**
  * Buffers stdin input and emits complete sequences via the 'data' event.
@@ -359,7 +342,6 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	// and rescanning it per chunk was quadratic: every `+=` plus indexOf/regex
 	// re-flattened and re-walked the whole paste.
 	private pasteChunks: string[] = [];
-	private pasteLength: number = 0;
 	private pasteBufferBytes: number = 0;
 	private pastePending: string = "";
 	/** An end marker was seen; the paste closes once the stream goes quiet. */
@@ -400,6 +382,11 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		}
 
 		if (this.pasteMode) {
+			// Ctrl+C is the user's own interrupt: the terminal sends it for the key,
+			// and it is the one way out of a paste whose end marker never arrives.
+			// Everything else that arrives while a paste is open is a byte of that
+			// paste - a bracketed paste carries no escaping, so its content cannot
+			// be told apart from input the terminal means as keys.
 			const interruptAt = str.indexOf("\x03");
 			if (interruptAt !== -1) {
 				this.discardPasteMode();
@@ -408,10 +395,6 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 				if (remaining.length > 0) {
 					this.process(remaining);
 				}
-				return;
-			}
-			if (isImmediatePasteEscapeAbort(str)) {
-				this.discardPasteMode();
 				return;
 			}
 		}
@@ -466,15 +449,13 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	private appendPasteChunk(chunk: string): void {
 		if (chunk.length > 0) {
 			this.pasteChunks.push(chunk);
-			this.pasteLength += chunk.length;
 			this.pasteBufferBytes += Buffer.byteLength(chunk, "utf8");
 		}
 
-		// Markers can straddle chunk boundaries; `pastePending` is the trailing
-		// partial-marker prefix carried over from the previous append, so the
-		// scan window covers every position a marker could complete at.
+		// The end marker can straddle chunk boundaries; `pastePending` is the
+		// trailing partial-marker prefix carried over from the previous append, so
+		// the scan window covers every position the marker could complete at.
 		const window = this.pastePending.length === 0 ? chunk : this.pastePending + chunk;
-		const windowStart = this.pasteLength - window.length;
 
 		// Pasted bytes carry no escaping, so an end marker inside the content is
 		// indistinguishable from the terminator: only the end of the paste's byte
@@ -491,16 +472,6 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			// down the key path (one insert per character, executed escape
 			// sequences) - the exact shape this file exists to prevent.
 			this.flushPastePart();
-			return;
-		}
-
-		const kittyEsc = findCompleteKittyEscape(window);
-		if (kittyEsc) {
-			const remaining = this.joinPasteChunks().slice(windowStart + kittyEsc.index + kittyEsc.length);
-			this.discardPasteMode();
-			if (remaining.length > 0) {
-				this.process(remaining);
-			}
 			return;
 		}
 
@@ -545,7 +516,6 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		}
 		const emit = keep.length > 0 ? content.slice(0, content.length - keep.length) : content;
 		this.pasteChunks = keep.length > 0 ? [keep] : [];
-		this.pasteLength = keep.length;
 		this.pasteBufferBytes = keep.length > 0 ? Buffer.byteLength(keep, "utf8") : 0;
 		if (emit.length > 0) {
 			this.emit("paste", emit);
@@ -578,25 +548,13 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	}
 
 	private trailingPartialPasteMarker(window: string): string {
-		// Every scanned marker starts with ESC, so only the tail starting at the
-		// last ESC can still grow into one. Longer tails can only be a partial
-		// Kitty Esc (`\x1b[27;` + digits/colons); checking that run by char code
-		// avoids allocating a multi-megabyte tail slice.
+		// The scanned marker starts with ESC, so only the tail starting at the last
+		// ESC can still grow into one.
 		const esc = window.lastIndexOf(ESC);
 		if (esc === -1) {
 			return "";
 		}
 		const tail = window.slice(esc);
-		if (tail.length > 8) {
-			if (!tail.startsWith("\x1b[27;")) {
-				return "";
-			}
-			for (let i = 5; i < tail.length; i++) {
-				const code = tail.charCodeAt(i);
-				if (!((code >= 48 && code <= 57) || code === 58)) return "";
-			}
-			return tail;
-		}
 		return PARTIAL_PASTE_MARKER_REGEX.test(tail) ? tail : "";
 	}
 
@@ -606,7 +564,6 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 
 	private resetPasteState(): void {
 		this.pasteChunks = [];
-		this.pasteLength = 0;
 		this.pasteBufferBytes = 0;
 		this.pastePending = "";
 		this.pasteTerminated = false;
@@ -672,17 +629,16 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 
 	private emitDataSequence(sequence: string): void {
 		const pending = this.pendingKittyPrintableCodepoint;
-		if (pending !== undefined && sequence.length > 0 && sequence.codePointAt(0) === pending) {
-			// A raw printable char that repeats the preceding Kitty CSI-u printable
-			// event is dropped - whether it arrives alone (typing) or as the head of
-			// a bulk text sequence (paste).
-			this.pendingKittyPrintableCodepoint = undefined;
-			sequence = sequence.slice(String.fromCodePoint(pending).length);
-			if (sequence.length === 0) {
+		if (pending !== undefined) {
+			// A raw printable key that repeats the preceding Kitty CSI-u printable
+			// event is dropped. Only a sequence that IS that one character counts:
+			// a bulk run (a paste without bracketed paste, a pipe) is text, and its
+			// first character must survive even when it matches the last key.
+			const repeated = String.fromCodePoint(pending);
+			if (sequence === repeated) {
+				this.pendingKittyPrintableCodepoint = undefined;
 				return;
 			}
-			this.emit("data", sequence);
-			return;
 		}
 
 		this.pendingKittyPrintableCodepoint = parseUnmodifiedKittyPrintableCodepoint(sequence);

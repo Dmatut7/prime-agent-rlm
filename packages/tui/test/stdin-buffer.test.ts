@@ -248,6 +248,20 @@ describe("StdinBuffer", () => {
 			assert.deepStrictEqual(emittedSequences, ["\x1b[97u", "b"]);
 		});
 
+		it("keeps the first character of a bulk run that repeats the last Kitty event", () => {
+			// The duplicate guard exists for a raw printable byte that repeats the
+			// Kitty CSI-u event just before it. A bulk run is not that byte: a paste
+			// whose first character happens to match must not lose it.
+			processInput("\x1b[233u");
+			assert.deepStrictEqual(emittedSequences, ["\x1b[233u"]);
+			emittedSequences.length = 0;
+
+			const pasted = `\u00e9${"x".repeat(40)}`;
+			processInput(pasted);
+
+			assert.strictEqual(emittedSequences.join(""), pasted);
+		});
+
 		it("should keep raw character after modified Kitty printable sequence", () => {
 			processInput("\x1b[64;3u@");
 			assert.deepStrictEqual(emittedSequences, ["\x1b[64;3u", "@"]);
@@ -598,15 +612,98 @@ describe("StdinBuffer", () => {
 			assert.strictEqual(emittedSequences.join(""), text);
 		});
 
-		it("discards an unterminated paste on Kitty Esc without inserting it", () => {
+		it("keeps a Kitty Esc inside an unterminated paste as paste text", async () => {
+			// A paste carries raw bytes: a clipboard holding a complete Kitty Esc must
+			// not abort the paste or reach the key path. The paste still closes on its
+			// own idle timeout, as one paste event.
+			buffer = new StdinBuffer({ timeout: 10, pasteTimeoutMs: 25 });
+			emittedSequences = [];
+			emittedPaste = [];
+			buffer.on("data", (sequence) => {
+				emittedSequences.push(sequence);
+			});
+			buffer.on("paste", (data) => {
+				emittedPaste.push(data);
+			});
+
 			processInput("\x1b[200~hello");
 			processInput("\x1b[27u");
 
+			assert.strictEqual(buffer.isPasteMode(), true);
 			assert.deepStrictEqual(emittedPaste, []);
 			assert.deepStrictEqual(emittedSequences, []);
 
 			processInput("x");
-			assert.deepStrictEqual(emittedSequences, ["x"]);
+			assert.strictEqual(buffer.isPasteMode(), true);
+			assert.deepStrictEqual(emittedSequences, []);
+
+			await wait(50);
+			assert.strictEqual(buffer.isPasteMode(), false);
+			assert.deepStrictEqual(emittedPaste, ["hello\x1b[27ux"]);
+			assert.deepStrictEqual(emittedSequences, []);
+
+			processInput("q");
+			assert.deepStrictEqual(emittedSequences, ["q"]);
+		});
+
+		it("keeps a Kitty Esc inside a terminated paste as paste text", async () => {
+			processInput("\x1b[200~hello");
+			processInput("\x1b[27ux");
+
+			assert.strictEqual(buffer.isPasteMode(), true);
+			assert.deepStrictEqual(emittedPaste, []);
+			assert.deepStrictEqual(emittedSequences, []);
+
+			processInput("\x1b[201~");
+			await waitForPasteSettle();
+
+			assert.deepStrictEqual(emittedPaste, ["hello\x1b[27ux"]);
+			assert.deepStrictEqual(emittedSequences, []);
+		});
+
+		it("keeps a paste containing a complete Kitty Esc and a key-looking CSI as one paste", async () => {
+			// Reported injection shape for the Kitty channel: the content holds a
+			// complete Kitty Esc followed by bytes that would run as ctrl+right.
+			buffer = new StdinBuffer({ timeout: 10, pasteSettleMs: 1 });
+			emittedSequences = [];
+			emittedPaste = [];
+			buffer.on("data", (sequence) => {
+				emittedSequences.push(sequence);
+			});
+			buffer.on("paste", (data) => {
+				emittedPaste.push(data);
+			});
+
+			const content = "abc\x1b[27u\x1b[1;5Ctail";
+			processInput(`\x1b[200~${content}\x1b[201~`);
+			await wait(5);
+
+			assert.deepStrictEqual(emittedPaste, [content]);
+			assert.deepStrictEqual(emittedSequences, []);
+		});
+
+		it("keeps a Kitty Esc as paste text at every chunk boundary", async () => {
+			const input = "\x1b[200~hello\x1b[27;1ux\x1b[1;5C\x1b[201~";
+			buffer = new StdinBuffer({ timeout: 10, pasteSettleMs: 1 });
+			emittedSequences = [];
+			emittedPaste = [];
+			buffer.on("data", (sequence) => {
+				emittedSequences.push(sequence);
+			});
+			buffer.on("paste", (data) => {
+				emittedPaste.push(data);
+			});
+
+			for (let split = 1; split < input.length; split++) {
+				buffer.clear();
+				emittedSequences.length = 0;
+				emittedPaste.length = 0;
+				processInput(input.slice(0, split));
+				processInput(input.slice(split));
+				await wait(5);
+				assert.deepStrictEqual(emittedPaste, ["hello\x1b[27;1ux\x1b[1;5C"], `split at ${split}`);
+				assert.deepStrictEqual(emittedSequences, [], `split at ${split}`);
+			}
 		});
 
 		it("still completes paste when 201~ arrives split after a lone ESC", async () => {
@@ -643,40 +740,6 @@ describe("StdinBuffer", () => {
 			assert.deepStrictEqual(emittedPaste, []);
 			processInput("x");
 			assert.ok(emittedSequences.includes("x"));
-		});
-
-		it("forwards keys after a Kitty Esc in the same paste chunk", () => {
-			processInput("\x1b[200~hello");
-			processInput("\x1b[27ux");
-
-			assert.deepStrictEqual(emittedPaste, []);
-			assert.strictEqual(buffer.isPasteMode(), false);
-			assert.deepStrictEqual(emittedSequences, ["x"]);
-		});
-
-		it("forwards leftover keys in the chunk that completes a split Kitty Esc", () => {
-			processInput("\x1b[200~hello");
-			processInput("\x1b[27");
-			processInput("uy");
-
-			assert.deepStrictEqual(emittedPaste, []);
-			assert.strictEqual(buffer.isPasteMode(), false);
-			assert.deepStrictEqual(emittedSequences, ["y"]);
-		});
-
-		it("recognizes a Kitty Esc sequence split across chunks", () => {
-			processInput("\x1b[200~hello");
-			processInput("\x1b[27");
-			assert.strictEqual(buffer.isPasteMode(), true);
-			assert.deepStrictEqual(emittedPaste, []);
-
-			processInput("u");
-			assert.strictEqual(buffer.isPasteMode(), false);
-			assert.deepStrictEqual(emittedPaste, []);
-			assert.deepStrictEqual(emittedSequences, []);
-
-			processInput("x");
-			assert.deepStrictEqual(emittedSequences, ["x"]);
 		});
 
 		it("does not discard ANSI color codes in an unterminated paste", async () => {
@@ -758,19 +821,6 @@ describe("StdinBuffer", () => {
 				await wait(5);
 				assert.deepStrictEqual(emittedPaste, ["abc\x1b[201~\x1b[1;5Ctail"], `split at ${split}`);
 				assert.deepStrictEqual(emittedSequences, [], `split at ${split}`);
-			}
-		});
-
-		it("detects a Kitty Esc abort split at every chunk boundary", () => {
-			const input = "\x1b[200~hello\x1b[27;1ux";
-			for (let split = 1; split < input.length; split++) {
-				buffer.clear();
-				emittedSequences.length = 0;
-				emittedPaste.length = 0;
-				processInput(input.slice(0, split));
-				processInput(input.slice(split));
-				assert.deepStrictEqual(emittedPaste, [], `split at ${split}`);
-				assert.deepStrictEqual(emittedSequences, ["x"], `split at ${split}`);
 			}
 		});
 
