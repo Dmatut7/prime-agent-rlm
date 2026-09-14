@@ -44,3 +44,6 @@
 {"id": "CI-3", "date": "2026-09-15", "severity": "P2", "status": "confirmed_pending_fix", "commit": null, "title": "Windows-only 2 条（+darwin-only 1 条）CI 无 runner，全仓无处可跑", "verified_by": "R6 grep runners + 工件"}
 {"id": "CI-4", "date": "2026-09-15", "severity": "P3", "status": "fixing", "commit": null, "title": "只有 kernel job 有 skip/覆盖率闸；ai job 722 skip 仍绿（现成脚本一喂即 RED）", "verified_by": "R6 用 check-kernel-coverage.mjs 实跑本机 ai report"}
 {"id": "CI-5", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "引用\"最新绿\"不可靠：冻结 SHA 那次 5 个 job 被 cancelled；近 20 次 run 7 次 cancelled", "verified_by": "R6 核 run 列表"}
+{"id": "UI-1", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "粘贴含字面 ESC[201~ 时粘贴被截断、尾部按按键执行（ctrl+right 真会执行）", "verified_by": "R6 实证 + 正控（发生率 unverified）"}
+{"id": "UI-2", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "超限/超时/非括号大输入逐字符入编辑器 ⇒ 单行 O(n²)：200k=8.2s、1M=257s", "verified_by": "R6 实测 + 机制正控"}
+{"id": "UI-3", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "truncateToWidth(pad) 在 ANSI+宽字符/ZWJ 簇下宽度算错（同串两口径）", "verified_by": "R6 实测 45/80000 + 正控"}
