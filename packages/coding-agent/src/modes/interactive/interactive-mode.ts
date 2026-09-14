@@ -9349,6 +9349,11 @@ export class InteractiveMode {
 		}
 		let confirmed: boolean;
 		try {
+			// The preflight scans the exported bytes for known credential shapes, for
+			// credential-name assignment shapes, and compares every value this session has
+			// loaded (its config files, environment and `--api-key` override) verbatim.
+			// A hit is reported masked, with its shape and position, and nothing is uploaded
+			// unless the user confirms here.
 			confirmed = await confirmShareIfSecrets(exportedHtml, (title, message) =>
 				this.showExtensionConfirm(title, message),
 			);
