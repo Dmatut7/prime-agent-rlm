@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
 import {
 	migrateAuthToAuthJson,
@@ -333,5 +333,122 @@ describe("auth store migration", () => {
 		expect(existsSync(oauthPath)).toBe(true);
 		expect(statSync(oauthPath).mode & 0o777).toBe(0o600);
 		expect(existsSync(join(agentDir, "auth.json"))).toBe(false);
+	});
+
+	it("merges an oauth.json the live store never had into an existing auth.json", () => {
+		const agentDir = newAgentDir();
+		const authPath = join(agentDir, "auth.json");
+		// Any read through AuthStorage writes `{}`, so an existing auth.json proves the
+		// store was touched, not that it took over anybody's credentials.
+		writeFileSync(authPath, "{}", { mode: 0o600 });
+		const oauthPath = writeLegacyStore(agentDir, "oauth.json", oauthStoreJson());
+
+		expect(migrateAuthToAuthJson()).toEqual(["openai-codex"]);
+
+		expect(JSON.parse(readFileSync(authPath, "utf-8"))).toMatchObject({
+			"openai-codex": { type: "oauth", access: ACCESS_SECRET, refresh: REFRESH_SECRET },
+		});
+		// The legacy copy may go only because its content is now in the live store.
+		expect(existsSync(oauthPath)).toBe(false);
+		expect(filesHolding(agentDir, REFRESH_SECRET)).toEqual([authPath]);
+	});
+
+	it("takes over settings.json apiKeys when auth.json already exists", () => {
+		const agentDir = newAgentDir();
+		const authPath = join(agentDir, "auth.json");
+		writeFileSync(authPath, JSON.stringify({ bailian: { type: "api_key", key: "existing-key-000111" } }), {
+			mode: 0o600,
+		});
+		writeLegacyStore(
+			agentDir,
+			"settings.json",
+			JSON.stringify({ theme: "dark", apiKeys: { anthropic: "sk-ant-legacy-key-000111" } }, null, 2),
+		);
+
+		expect(migrateAuthToAuthJson()).toEqual(["anthropic"]);
+
+		const stored = JSON.parse(readFileSync(authPath, "utf-8")) as Record<string, unknown>;
+		expect(stored.anthropic).toEqual({ type: "api_key", key: "sk-ant-legacy-key-000111" });
+		expect(stored.bailian).toEqual({ type: "api_key", key: "existing-key-000111" });
+		const settings = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8")) as Record<string, unknown>;
+		expect(settings.apiKeys).toBeUndefined();
+		expect(settings.theme).toBe("dark");
+	});
+
+	it("refuses to delete a legacy store when auth.json cannot be read as a store", () => {
+		const agentDir = newAgentDir();
+		const authPath = join(agentDir, "auth.json");
+		const authBefore = "{ not json";
+		writeFileSync(authPath, authBefore, { mode: 0o600 });
+		const oauthPath = writeLegacyStore(agentDir, "oauth.json", oauthStoreJson());
+
+		const warnings = vi.spyOn(console, "error").mockImplementation(() => {});
+		let providers: string[] = [];
+		try {
+			providers = migrateAuthToAuthJson();
+		} finally {
+			warnings.mockRestore();
+		}
+
+		// Nothing in an unreadable store counts as a takeover, so the migration leaves
+		// both files alone: the broken live store untouched, the legacy store readable
+		// only by this account and reported.
+		expect(providers).toEqual([]);
+		expect(readFileSync(authPath, "utf-8")).toBe(authBefore);
+		expect(existsSync(oauthPath)).toBe(true);
+		expect(readFileSync(oauthPath, "utf-8")).toContain(REFRESH_SECRET);
+		expect(statSync(oauthPath).mode & 0o777).toBe(0o600);
+	});
+
+	it("keeps a legacy copy whose provider is not in the live store", () => {
+		const agentDir = newAgentDir();
+		writeFileSync(join(agentDir, "auth.json"), JSON.stringify({ anthropic: { type: "api_key", key: "k" } }), {
+			mode: 0o600,
+		});
+		const copyPath = writeLegacyStore(agentDir, "oauth.json.migrated", oauthStoreJson());
+
+		migrateAuthToAuthJson();
+
+		// `openai-codex` lives nowhere but this copy, so deleting it would destroy the
+		// only trace of the login. Copies the live store already carries are removed.
+		expect(existsSync(copyPath)).toBe(true);
+		expect(readFileSync(copyPath, "utf-8")).toContain(REFRESH_SECRET);
+		expect(statSync(copyPath).mode & 0o777).toBe(0o600);
+		expect(readFileSync(join(agentDir, "auth.json"), "utf-8")).not.toContain(REFRESH_SECRET);
+	});
+
+	it("control: leaves a provider the live store already has and clears the superseded copy", () => {
+		const agentDir = newAgentDir();
+		const authPath = join(agentDir, "auth.json");
+		writeFileSync(
+			authPath,
+			JSON.stringify({ "openai-codex": { type: "oauth", access: "live-access-token", refresh: "live-refresh" } }),
+			{ mode: 0o600 },
+		);
+		const oauthPath = writeLegacyStore(agentDir, "oauth.json", oauthStoreJson());
+
+		expect(migrateAuthToAuthJson()).toEqual([]);
+
+		// The live store owns the provider: it is not overwritten, and the copy is gone.
+		expect(JSON.parse(readFileSync(authPath, "utf-8"))["openai-codex"]).toMatchObject({
+			access: "live-access-token",
+		});
+		expect(existsSync(oauthPath)).toBe(false);
+	});
+
+	it("does not migrate or delete while the live store is locked by another process", () => {
+		const agentDir = newAgentDir();
+		const authPath = join(agentDir, "auth.json");
+		writeFileSync(authPath, "{}", { mode: 0o600 });
+		// proper-lockfile's held lock: the same shape AuthStorage leaves behind while it
+		// writes. Its presence must stop the merge, not silently skip it.
+		mkdirSync(`${authPath}.lock`);
+		const oauthPath = writeLegacyStore(agentDir, "oauth.json", oauthStoreJson());
+
+		const providers = migrateAuthToAuthJson();
+
+		expect(providers).toEqual([]);
+		expect(readFileSync(authPath, "utf-8")).toBe("{}");
+		expect(existsSync(oauthPath)).toBe(true);
 	});
 });

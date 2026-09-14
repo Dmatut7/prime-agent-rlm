@@ -193,6 +193,15 @@ export async function createAgentSessionServices(
 		});
 		settingsManager.setTelemetryNoticeShown(true);
 	}
+	// A models.json that failed to load is visible in the interactive UI and in
+	// `model list`, but a print, RPC or daemon client sees only diagnostics: the failure
+	// must not live in the registry alone. Warning, not error - the built-in models
+	// still work, and startup must not die on a broken config file.
+	const modelsJsonError = modelRegistry.getError();
+	if (modelsJsonError) {
+		diagnostics.push({ type: "warning", message: modelsJsonError });
+	}
+
 	const extensionsResult = resourceLoader.getExtensions();
 	for (const { name, config, extensionPath } of extensionsResult.runtime.pendingProviderRegistrations) {
 		try {

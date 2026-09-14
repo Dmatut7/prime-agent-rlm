@@ -17,8 +17,9 @@ import {
 } from "fs";
 import { basename, join } from "path";
 import { CONFIG_DIR_NAME, getAgentDir, getBinDir, getSessionsDir } from "./config.js";
+import { FileAuthStorageBackend } from "./core/auth-storage.js";
 import { migrateKeybindingsConfig } from "./core/keybindings.js";
-import { purgeLegacyTokenStores, readLegacyTokenStore } from "./core/legacy-auth-files.js";
+import { findLegacyTokenStores, purgeLegacyTokenStores, readLegacyTokenStore } from "./core/legacy-auth-files.js";
 import { readFirstLineSync } from "./utils/file-lines.js";
 import { tightenPrivateFileMode, writePrivateFileAtomic } from "./utils/private-files.js";
 
@@ -31,11 +32,18 @@ const EXTENSIONS_DOC_URL =
  * Migrate legacy oauth.json and settings.json apiKeys to auth.json, then delete the
  * legacy stores.
  *
- * The legacy copies are deleted rather than renamed: `oauth.json.migrated` was a
- * second, world-readable copy of every token (see legacy-auth-files.ts), and this
- * migration is the only chance to remove one that an older version already left
- * behind. A store whose contents are not committed anywhere else is kept instead
- * (and tightened to 0600) — that is the case of a file this pass cannot read.
+ * What may be deleted is decided on the live store's contents, never on whether
+ * auth.json exists: any read through AuthStorage writes `{}`, so a store can be present
+ * while holding nobody's credentials. A legacy store goes only once every provider it
+ * lists is readable back from auth.json - which means the providers it lacks are merged
+ * in first - and a store that still holds an uncommitted provider is kept (tightened to
+ * 0600) and reported.
+ *
+ * The legacy copies are deleted rather than renamed: `oauth.json.migrated` was a second,
+ * world-readable copy of every token (see legacy-auth-files.ts), and this migration is
+ * the only chance to remove one that an older version already left behind. A file that
+ * never parses as a store is a torn copy rather than the trace of a login, so there is
+ * nothing to take over from it; it survives only while no live store exists at all.
  *
  * @returns Array of provider names that were migrated
  */
@@ -45,69 +53,171 @@ export function migrateAuthToAuthJson(): string[] {
 	const oauthPath = join(agentDir, "oauth.json");
 	const settingsPath = join(agentDir, "settings.json");
 
-	const migrated: Record<string, unknown> = {};
-	const providers: string[] = [];
-	// Legacy stores whose contents are not (yet) in auth.json and must survive.
-	const unconsumed: string[] = [];
+	// A live store that exists but does not parse commits nothing, and merging into it
+	// would overwrite bytes the user may still repair: keep the legacy files and say so.
+	if (existsSync(authPath) && !readStore(authPath)) {
+		return keepLegacyStores(agentDir, `${authPath} is not a readable credential store`);
+	}
 
-	// Skip reading legacy stores if auth.json already exists; they are unreachable
-	// from here on and are removed below either way.
-	if (!existsSync(authPath)) {
-		// Migrate oauth.json
-		if (existsSync(oauthPath)) {
-			const oauth = readLegacyTokenStore(oauthPath);
-			if (oauth) {
-				for (const [provider, cred] of Object.entries(oauth)) {
-					migrated[provider] = { type: "oauth", ...(cred as object) };
-					providers.push(provider);
-				}
-			} else {
-				unconsumed.push(oauthPath);
-			}
-		}
-
-		// Migrate settings.json apiKeys
-		if (existsSync(settingsPath)) {
-			try {
-				const content = readFileSync(settingsPath, "utf-8");
-				const settings = JSON.parse(content);
-				if (settings.apiKeys && typeof settings.apiKeys === "object") {
-					for (const [provider, key] of Object.entries(settings.apiKeys)) {
-						if (!migrated[provider] && typeof key === "string") {
-							migrated[provider] = { type: "api_key", key };
-							providers.push(provider);
-						}
-					}
-					delete settings.apiKeys;
-					// Same private atomic write as every other credential write: a crash
-					// here used to leave a truncated settings.json behind.
-					writePrivateFileAtomic(settingsPath, JSON.stringify(settings, null, 2));
-				}
-			} catch {
-				// Skip on error
-			}
-		}
-
-		if (Object.keys(migrated).length > 0) {
-			try {
-				// Atomic 0600 write, like the live store's own writes. The legacy store is
-				// removed only after this succeeds, so a failed migration keeps its copy.
-				writePrivateFileAtomic(authPath, JSON.stringify(migrated, null, 2));
-			} catch (error) {
-				if (existsSync(oauthPath)) unconsumed.push(oauthPath);
-				console.error(
-					chalk.yellow(
-						`Warning: could not migrate credentials to ${authPath}: ${error instanceof Error ? error.message : error}`,
-					),
-				);
-			}
+	const live = readStore(authPath) ?? {};
+	const additions: Record<string, unknown> = {};
+	// oauth.json is read first so a legacy api key can never shadow an OAuth login.
+	for (const [provider, credential] of Object.entries(readStore(oauthPath) ?? {})) {
+		if (!(provider in live)) additions[provider] = { type: "oauth", ...(credential as object) };
+	}
+	for (const [provider, key] of Object.entries(readSettingsApiKeys(settingsPath) ?? {})) {
+		if (typeof key === "string" && !(provider in live) && !(provider in additions)) {
+			additions[provider] = { type: "api_key", key };
 		}
 	}
 
+	// Re-read after the write: what proves a credential was taken over is what auth.json
+	// holds on disk now, not what this pass meant to put into it.
+	const committed = Object.keys(additions).length > 0 ? commitCredentialAdditions(authPath, additions) : live;
+	if (!committed) {
+		return keepLegacyStores(agentDir, `${authPath} could not be updated`);
+	}
+	const providers = Object.keys(additions).filter((provider) => provider in committed);
+	releaseSettingsApiKeys(settingsPath, committed);
+
+	const keep = legacyStoresNotCommittedIn(agentDir, committed, existsSync(authPath));
+	if (keep.length > 0) {
+		console.error(
+			chalk.yellow(
+				`Warning: kept legacy credential ${keep.length === 1 ? "store" : "stores"} ${keep
+					.map((path) => basename(path))
+					.join(", ")}: it holds a provider that ${basename(authPath)} does not.`,
+			),
+		);
+	}
+
 	privatizeLiveStore(authPath);
-	removeSupersededLegacyStores(agentDir, unconsumed);
+	removeSupersededLegacyStores(agentDir, keep);
 
 	return providers;
+}
+
+/** A credential store's entries, or undefined when the file is absent or is not one. */
+function readStore(path: string): Record<string, unknown> | undefined {
+	return existsSync(path) ? readLegacyTokenStore(path) : undefined;
+}
+
+/** The shape test AuthStorage itself uses: a JSON object of provider entries. */
+function parseStore(content: string | undefined): Record<string, unknown> | undefined {
+	if (!content) return {};
+	try {
+		const parsed = JSON.parse(content) as unknown;
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+		return parsed as Record<string, unknown>;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Nothing could be committed, so every legacy store survives this pass (the purge
+ * tightens what it keeps) with one warning naming the reason.
+ */
+function keepLegacyStores(agentDir: string, reason: string): string[] {
+	console.error(
+		chalk.yellow(`Warning: no credentials were migrated because ${reason}; legacy credential stores were kept.`),
+	);
+	privatizeLiveStore(join(agentDir, "auth.json"));
+	removeSupersededLegacyStores(agentDir, findLegacyTokenStores(agentDir));
+	return [];
+}
+
+/**
+ * Add the missing entries to the live store and return what it holds on disk afterwards,
+ * or undefined when nothing can be trusted. The merge is a read-modify-write on a file a
+ * running session writes too, so it goes through the same `<auth.json>.lock` AuthStorage
+ * uses: a store that will not free, or a write that fails, commits nothing. A provider
+ * the live store already lists is never overwritten - its credential is the current one.
+ */
+function commitCredentialAdditions(
+	authPath: string,
+	additions: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+	try {
+		new FileAuthStorageBackend(authPath).withLock((current) => {
+			const stored = parseStore(current);
+			if (!stored) return { result: undefined };
+			const merged: Record<string, unknown> = { ...stored };
+			for (const [provider, credential] of Object.entries(additions)) {
+				if (!(provider in merged)) merged[provider] = credential;
+			}
+			return { result: undefined, next: JSON.stringify(merged, null, 2) };
+		});
+	} catch (error) {
+		console.error(
+			chalk.yellow(
+				`Warning: could not migrate credentials to ${authPath}: ${error instanceof Error ? error.message : error}`,
+			),
+		);
+	}
+	// The read-back is the proof: an entry that did not survive the write cannot be
+	// reported as migrated, and the store it is missing from cannot be deleted.
+	return readStore(authPath);
+}
+
+/** The legacy `settings.json` apiKeys block, or undefined when there is nothing to take. */
+function readSettingsApiKeys(settingsPath: string): Record<string, unknown> | undefined {
+	const apiKeys = readStore(settingsPath)?.apiKeys;
+	if (typeof apiKeys !== "object" || apiKeys === null || Array.isArray(apiKeys)) return undefined;
+	return apiKeys as Record<string, unknown>;
+}
+
+/**
+ * Drop the apiKeys entries the live store now carries. Anything else stays: removing a
+ * key that was never committed is the loss this migration exists to prevent.
+ */
+function releaseSettingsApiKeys(settingsPath: string, committed: Record<string, unknown>): void {
+	const apiKeys = readSettingsApiKeys(settingsPath);
+	if (!apiKeys) return;
+
+	const settings = readStore(settingsPath);
+	if (!settings) return;
+	const retained: Record<string, unknown> = {};
+	let released = 0;
+	for (const [provider, key] of Object.entries(apiKeys)) {
+		if (typeof key === "string" && provider in committed) {
+			released += 1;
+		} else {
+			retained[provider] = key;
+		}
+	}
+	if (released === 0) return;
+	if (Object.keys(retained).length > 0) settings.apiKeys = retained;
+	else delete settings.apiKeys;
+
+	try {
+		// Same private atomic write as every other credential write: a crash here used to
+		// leave a truncated settings.json behind.
+		writePrivateFileAtomic(settingsPath, JSON.stringify(settings, null, 2));
+	} catch (error) {
+		console.error(
+			chalk.yellow(
+				`Warning: could not clear migrated apiKeys from ${settingsPath}: ${error instanceof Error ? error.message : error}`,
+			),
+		);
+	}
+}
+
+/**
+ * Legacy copies still holding a provider the live store does not have. An empty copy is a
+ * copy of nothing, so it does not block the cleanup; a copy that never parsed is only the
+ * trace of a login while there is no live store to have taken it over.
+ */
+function legacyStoresNotCommittedIn(
+	agentDir: string,
+	committed: Record<string, unknown>,
+	liveStoreExists: boolean,
+): string[] {
+	return findLegacyTokenStores(agentDir).filter((path) => {
+		const entries = readStore(path);
+		if (!entries) return !liveStoreExists;
+		return Object.keys(entries).some((provider) => !(provider in committed));
+	});
 }
 
 /**
