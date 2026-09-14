@@ -6,6 +6,7 @@
 import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
+	appendAssistantMessageDiagnostic,
 	type Context,
 	EventStream,
 	type ImageContent,
@@ -15,6 +16,7 @@ import {
 	type ToolResultMessage,
 	validateToolArguments,
 } from "@earendil-works/pi-ai";
+import { deduplicateToolCallIds, formatToolCallIdCollisions, type ToolCallIdCollision } from "./tool-call-dedupe.js";
 import type {
 	AgentContext,
 	AgentEvent,
@@ -717,6 +719,30 @@ async function streamAssistantResponse(
 	}
 }
 
+/**
+ * Diagnostic type attached to an assistant message whose tool call ids had to be
+ * renamed. `details.collisions` carries the per-call rewrite (original id, tool
+ * name, replacement), so a reused id is visible in the transcript, not silent.
+ */
+export const TOOL_CALL_ID_COLLISION_DIAGNOSTIC_TYPE = "tool_call_id_collision";
+
+type ToolCallIdCollisionLog = Map<string, ToolCallIdCollision>;
+
+function recordToolCallIdCollisions(
+	message: AssistantMessage,
+	collisions: ReadonlyMap<string, ToolCallIdCollision>,
+): void {
+	if (collisions.size === 0) {
+		return;
+	}
+	const list = [...collisions.values()];
+	appendAssistantMessageDiagnostic(message, {
+		type: TOOL_CALL_ID_COLLISION_DIAGNOSTIC_TYPE,
+		timestamp: Date.now(),
+		details: { message: formatToolCallIdCollisions(list), collisions: list },
+	});
+}
+
 /** Runs one assistant stream and places the final message in context, without emitting message_end. */
 async function streamAssistantResponseAttempt(
 	context: AgentContext,
@@ -725,8 +751,55 @@ async function streamAssistantResponseAttempt(
 	emit: AgentEventSink,
 	streamFn?: StreamFn,
 ): Promise<AssistantMessage> {
+	// A message that reuses a tool call id is repaired by renaming the later calls,
+	// so no downstream consumer (UI rows, stall bookkeeping, the next request body)
+	// has to guess which result belongs to which call. The rewrite is reported once,
+	// on the finalized message, instead of per stream chunk.
+	const idCollisions: ToolCallIdCollisionLog = new Map();
+	const message = await runAssistantStreamAttempt(context, config, signal, emit, streamFn, idCollisions);
+	recordToolCallIdCollisions(message, idCollisions);
+	return message;
+}
+
+async function runAssistantStreamAttempt(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	emit: AgentEventSink,
+	streamFn: StreamFn | undefined,
+	idCollisions: ToolCallIdCollisionLog,
+): Promise<AssistantMessage> {
 	let partialMessage: AssistantMessage | null = null;
 	let addedPartial = false;
+	/**
+	 * Renames repeated tool call ids in a streamed message. The provider re-delivers
+	 * the whole partial message on every chunk, so this runs per chunk and must stay
+	 * a pure function of the content: ids are assigned left to right, which is what
+	 * keeps an id stable once a consumer has seen it.
+	 */
+	const normalizeToolCallIds = (message: AssistantMessage): AssistantMessage => {
+		const { content, collisions } = deduplicateToolCallIds(message.content);
+		if (collisions.length === 0) {
+			return message;
+		}
+		for (const collision of collisions) {
+			idCollisions.set(`${collision.contentIndex}:${collision.originalId}`, collision);
+		}
+		return { ...message, content };
+	};
+	/** Applies the same rename to the event, so `partial` and `toolCall` agree with `message`. */
+	const normalizeStreamEvent = (event: AssistantMessageEvent): AssistantMessageEvent => {
+		if (!("partial" in event)) {
+			return event;
+		}
+		const partial = normalizeToolCallIds(event.partial);
+		if (event.type !== "toolcall_end") {
+			return partial === event.partial ? event : { ...event, partial };
+		}
+		const part = partial.content[event.contentIndex];
+		const toolCall = part?.type === "toolCall" ? part : event.toolCall;
+		return partial === event.partial && toolCall === event.toolCall ? event : { ...event, partial, toolCall };
+	};
 	const finishAbortedMessage = async () => {
 		const finalMessage = createAbortedAssistantMessage(config, partialMessage);
 		if (addedPartial) {
@@ -836,7 +909,7 @@ async function streamAssistantResponseAttempt(
 				clearStallTimer();
 				break;
 			}
-			const event = next.value;
+			const event = normalizeStreamEvent(next.value);
 			armStallTimer();
 			switch (event.type) {
 				case "start":
@@ -869,9 +942,9 @@ async function streamAssistantResponseAttempt(
 				case "done":
 				case "error": {
 					clearStallTimer();
-					let finalMessage = getTerminalMessage(event);
+					let finalMessage = normalizeToolCallIds(getTerminalMessage(event));
 					try {
-						finalMessage = await maybePromiseWithAbort(response.result(), signal);
+						finalMessage = normalizeToolCallIds(await maybePromiseWithAbort(response.result(), signal));
 					} catch (error) {
 						if (!signal?.aborted || !isAbortError(error)) {
 							throw error;
@@ -890,7 +963,7 @@ async function streamAssistantResponseAttempt(
 			}
 		}
 
-		const finalMessage = await maybePromiseWithAbort(response.result(), signal);
+		const finalMessage = normalizeToolCallIds(await maybePromiseWithAbort(response.result(), signal));
 		if (addedPartial) {
 			context.messages[context.messages.length - 1] = finalMessage;
 		} else {
