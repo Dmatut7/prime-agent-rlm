@@ -769,9 +769,9 @@ export class RlmSpawnLedger {
 	 *
 	 * Other processes append to this same file, so the guard is the file's own
 	 * size and mtime rather than our own writes. The size stat is required for
-	 * the read bound anyway, which makes the check free. Records only ever append
-	 * (a torn tail is truncated, which shrinks the file), so a change always
-	 * moves the size.
+	 * the read bound anyway, which makes the check free. Records only ever
+	 * append, and a tail repair blanks the torn fragment in place, so a change
+	 * moves the size (an append) or the mtime (a repair) and never neither.
 	 */
 	private replaySync(): Map<string, RlmLedgerEdge> {
 		const edges = new Map<string, RlmLedgerEdge>();
