@@ -525,9 +525,13 @@ export function getCustomThemesDir(): string {
 	return join(getAgentDir(), "themes");
 }
 
-/** Directory where daemon and client diagnostic logs are written (e.g. ~/.prime/agent/logs/). */
-export function getLogsDir(): string {
-	return join(getAgentDir(), "logs");
+/**
+ * Directory where daemon and client diagnostic logs are written (e.g. `~/.prime/agent/logs/`).
+ * An explicit `agentDir` pins the target for callers that must keep writing to the directory
+ * they started in (see the trace upload's write scope).
+ */
+export function getLogsDir(agentDir: string = getAgentDir()): string {
+	return join(agentDir, "logs");
 }
 
 /** Log file capturing client-side agent-open failures. */
@@ -535,8 +539,8 @@ export function getClientErrorLogPath(): string {
 	return join(getLogsDir(), "client-errors.log");
 }
 
-export function getAgentTracesLogPath(): string {
-	return join(getLogsDir(), "agent-traces.log");
+export function getAgentTracesLogPath(agentDir: string = getAgentDir()): string {
+	return join(getLogsDir(agentDir), "agent-traces.log");
 }
 
 /** Shared structured (JSON lines) log for client, daemon, and provider diagnostics. */

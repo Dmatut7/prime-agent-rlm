@@ -142,6 +142,7 @@ import { readClipboardImage } from "../../utils/clipboard-image.js";
 import { parseGitUrl } from "../../utils/git.js";
 import { resizeImage } from "../../utils/image-resize.js";
 import { getCwdRelativePath } from "../../utils/paths.js";
+import { backgroundNetworkOptOut } from "../../utils/privacy-opt-out.js";
 import { createPrivateTempFile, readPrivateFile, writePrivateFileAtomic } from "../../utils/private-files.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import { ensureTool, ensureToolWithStatus, formatMissingRipgrepMessage } from "../../utils/tools-manager.js";
@@ -9766,10 +9767,16 @@ export class InteractiveMode {
 			await this.settingsManager.reload().catch(() => undefined);
 			const credential = await getPrimeAgentTraceCredential(this.modelRegistry.authStorage);
 			const state = await this.agentConnection.getState();
+			const optOut = backgroundNetworkOptOut();
+			const automaticUploads = !this.settingsManager.getAgentTracesEnabled()
+				? "Disabled"
+				: optOut === undefined
+					? "Enabled"
+					: `Enabled, suppressed by ${optOut}`;
 			const info = [
 				theme.bold("Trace Sharing"),
 				"",
-				`${theme.fg("dim", "Automatic uploads:")} ${this.settingsManager.getAgentTracesEnabled() ? "Enabled" : "Disabled"}`,
+				`${theme.fg("dim", "Automatic uploads:")} ${automaticUploads}`,
 				`${theme.fg("dim", "Credential:")} ${credential?.label ?? "Not configured"}`,
 				`${theme.fg("dim", "Endpoint:")} ${resolvePrimeAgentTracesBaseUrl()}`,
 				`${theme.fg("dim", "Session file:")} ${state.sessionFile ?? "In-memory"}`,

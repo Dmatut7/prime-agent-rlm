@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { createServer } from "node:http";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	checkForNewPiVersion,
 	comparePackageVersions,
@@ -11,6 +12,7 @@ const defaultPrimeAgentDownloadBaseUrl = "https://pub-728493de92a943e2a9b2d17b47
 const originalSkipVersionCheck = process.env.PI_SKIP_VERSION_CHECK;
 const originalOffline = process.env.PI_OFFLINE;
 const originalPrimeAgentDownloadBaseUrl = process.env.PRIME_AGENT_DOWNLOAD_BASE_URL;
+const originalDoNotTrack = process.env.DO_NOT_TRACK;
 
 function restoreEnv(name: string, value: string | undefined): void {
 	if (value === undefined) {
@@ -20,11 +22,19 @@ function restoreEnv(name: string, value: string | undefined): void {
 	process.env[name] = value;
 }
 
+beforeEach(() => {
+	// The suite runs with DO_NOT_TRACK=1 (vitest config) and these tests are about the check
+	// itself; the opt-out is set back to `1` by the test that is about the opt-out.
+	process.env.DO_NOT_TRACK = "0";
+	delete process.env.PI_SKIP_VERSION_CHECK;
+});
+
 afterEach(() => {
 	vi.unstubAllGlobals();
 	restoreEnv("PI_SKIP_VERSION_CHECK", originalSkipVersionCheck);
 	restoreEnv("PI_OFFLINE", originalOffline);
 	restoreEnv("PRIME_AGENT_DOWNLOAD_BASE_URL", originalPrimeAgentDownloadBaseUrl);
+	restoreEnv("DO_NOT_TRACK", originalDoNotTrack);
 });
 
 describe("version checks", () => {
@@ -93,5 +103,48 @@ describe("version checks", () => {
 
 		await expect(getLatestPiVersion("1.2.3")).resolves.toBeUndefined();
 		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("skips the startup version check when the environment opted out of tracking", async () => {
+		const fetchMock = vi.fn(async () => Response.json({ version: "v1.2.4" }));
+		vi.stubGlobal("fetch", fetchMock);
+
+		process.env.DO_NOT_TRACK = "1";
+		await expect(checkForNewPiVersion("1.2.3")).resolves.toBeUndefined();
+		expect(fetchMock).not.toHaveBeenCalled();
+
+		// Positive control: the same call reaches the manifest once the opt-out is off.
+		process.env.DO_NOT_TRACK = "0";
+		await expect(checkForNewPiVersion("1.2.3")).resolves.toBe("1.2.4");
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("sends no request to a local manifest server while the opt-out is set", async () => {
+		// A real socket rather than a stubbed fetch: the subject is whether a request leaves the
+		// process at all, and a stub can only report what the code asked for.
+		const hits: string[] = [];
+		const server = createServer((request, response) => {
+			hits.push(`${request.headers["user-agent"] ?? ""} ${request.url ?? ""}`);
+			response.writeHead(200, { "content-type": "application/json" });
+			response.end(JSON.stringify({ version: "v9.9.9" }));
+		});
+		await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+		const address = server.address();
+		const port = typeof address === "object" && address !== null ? address.port : 0;
+		process.env.PRIME_AGENT_DOWNLOAD_BASE_URL = `http://127.0.0.1:${port}`;
+
+		try {
+			// Positive control: the server is reachable and answers a manifest request.
+			process.env.DO_NOT_TRACK = "0";
+			await expect(checkForNewPiVersion("1.2.3")).resolves.toBe("9.9.9");
+			expect(hits).toHaveLength(1);
+			expect(hits[0]).toContain("/latest.json");
+
+			process.env.DO_NOT_TRACK = "1";
+			await expect(checkForNewPiVersion("1.2.3")).resolves.toBeUndefined();
+			expect(hits).toHaveLength(1);
+		} finally {
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+		}
 	});
 });

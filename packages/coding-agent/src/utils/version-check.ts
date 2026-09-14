@@ -1,4 +1,5 @@
 import { getPiUserAgent } from "./pi-user-agent.js";
+import { backgroundNetworkOptOut } from "./privacy-opt-out.js";
 
 const DEFAULT_PRIME_AGENT_DOWNLOAD_BASE_URL = "https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev";
 const STABLE_VERSION_MANIFEST_PATH = "latest.json";
@@ -160,7 +161,16 @@ export async function getLatestPiVersion(
 	return (await getLatestPiRelease(currentVersion, options))?.version;
 }
 
+/**
+ * The startup notice's entry point: this request runs on every interactive start and nobody
+ * asked for it, so the user's standing answer to "may this machine call home" stops it here.
+ * `getLatestPiRelease` stays a plain API for callers acting on an explicit command
+ * (`prime-agent update` fetches the same manifest because you asked it to).
+ */
 export async function checkForNewPiVersion(currentVersion: string): Promise<string | undefined> {
+	if (backgroundNetworkOptOut() !== undefined) {
+		return undefined;
+	}
 	try {
 		const latestVersion = await getLatestPiVersion(currentVersion);
 		if (latestVersion && isNewerPackageVersion(latestVersion, currentVersion)) {

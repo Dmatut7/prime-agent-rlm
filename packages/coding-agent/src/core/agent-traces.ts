@@ -5,6 +5,7 @@ import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { appendRotatingLog, getAgentDir, getAgentTracesLogPath, getSessionsDir, VERSION } from "../config.js";
 import { readFirstLineSync } from "../utils/file-lines.js";
+import { backgroundNetworkOptOut } from "../utils/privacy-opt-out.js";
 import type { AuthStorage } from "./auth-storage.js";
 import {
 	loadPrimeCliConfig,
@@ -14,6 +15,11 @@ import {
 } from "./prime-inference-auth.js";
 import { getSessionArtifactsRoot, type SessionHeader, type SessionManager } from "./session-manager.js";
 import type { SettingsManager } from "./settings-manager.js";
+import {
+	applyUploadPrivacyGate,
+	type UploadPrivacyGateResult,
+	uploadPrivacyGateChanged,
+} from "./upload-privacy-gate.js";
 
 const MAX_TRACE_BYTES = 20 * 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
@@ -570,6 +576,9 @@ function createTraceUploadAllRequestGate(signal?: AbortSignal): BeforeTraceUploa
 
 export async function uploadAllAgentTraces(options: AgentTraceUploadAllOptions): Promise<AgentTraceUploadAllResult> {
 	const { sessionDir, concurrency, onProgress, ...uploadOptions } = options;
+	// One scope for the whole batch: its requests are paced over minutes, and every file in it
+	// belongs to the agent directory the batch started in.
+	const scope = resolveAgentTraceWriteScope();
 	const sessionFiles = await findAgentTraceFiles(sessionDir);
 	type UploadResultItem = AgentTraceUploadAllResult["results"][number];
 	const results: Array<UploadResultItem | undefined> = new Array(sessionFiles.length);
@@ -596,6 +605,7 @@ export async function uploadAllAgentTraces(options: AgentTraceUploadAllOptions):
 					reloadConfig: false,
 				},
 				beforeRequest,
+				scope,
 			);
 			if (uploadOptions.signal?.aborted && result.status === "failed") {
 				return;
@@ -650,14 +660,39 @@ export interface AgentTraceCatchUpResult {
 	results: Array<{ sessionFile: string; result: AgentTraceUploadResult }>;
 }
 
-function getAgentTraceOutboxDir(): string {
-	return join(getAgentDir(), "agent-traces-outbox");
+/**
+ * Where one upload's bookkeeping goes: the outbox cursor and the outcome log.
+ *
+ * Resolved once, when the operation starts, and carried to its end. Reading the agent
+ * directory again at completion time was the bug: `getAgentDir()` follows
+ * `PRIME_AGENT_CODING_AGENT_DIR`, which a test fixture clears when it returns and a sandbox
+ * rewrites when it tears down, so a session belonging to a temporary directory wrote its
+ * cursor and its "uploaded" line into whichever directory happened to be current afterwards -
+ * the real `~/.prime/agent` on a developer machine.
+ */
+interface AgentTraceWriteScope {
+	agentDir: string;
+	outboxDir: string;
+	logPath: string;
+}
+
+function resolveAgentTraceWriteScope(): AgentTraceWriteScope {
+	const agentDir = getAgentDir();
+	return {
+		agentDir,
+		outboxDir: join(agentDir, "agent-traces-outbox"),
+		logPath: getAgentTracesLogPath(agentDir),
+	};
+}
+
+function getAgentTraceOutboxDir(scope: AgentTraceWriteScope): string {
+	return scope.outboxDir;
 }
 
 // One entry file per session file (keyed by path hash): concurrent writers cannot lose each other's cursors, and a bad read costs only its own entry.
-function agentTraceOutboxEntryPath(sessionFile: string): string {
+function agentTraceOutboxEntryPath(scope: AgentTraceWriteScope, sessionFile: string): string {
 	const key = createHash("sha256").update(sessionFile).digest("hex").slice(0, 32);
-	return join(getAgentTraceOutboxDir(), `${key}.json`);
+	return join(getAgentTraceOutboxDir(scope), `${key}.json`);
 }
 
 function parseOutboxEntry(raw: string):
@@ -685,10 +720,13 @@ function parseOutboxEntry(raw: string):
 }
 
 /** `undefined` = no usable cursor; `null` = scheduled but never uploaded. */
-async function readAgentTraceOutboxEntry(sessionFile: string): Promise<AgentTraceUploadedSignature | null | undefined> {
+async function readAgentTraceOutboxEntry(
+	scope: AgentTraceWriteScope,
+	sessionFile: string,
+): Promise<AgentTraceUploadedSignature | null | undefined> {
 	let raw: string;
 	try {
-		raw = await readFile(agentTraceOutboxEntryPath(sessionFile), "utf8");
+		raw = await readFile(agentTraceOutboxEntryPath(scope, sessionFile), "utf8");
 	} catch {
 		return undefined;
 	}
@@ -704,13 +742,17 @@ function signatureEquals(a: AgentTraceUploadedSignature | null | undefined, b: A
 const locallyManagedSessionFiles = new Set<string>();
 
 /** Best-effort and synchronous: upload intent must be on disk the moment the transcript persist returns. */
-function markAgentTraceOutboxPendingSync(sessionFile: string, kind?: string): boolean {
+function markAgentTraceOutboxPendingSync(
+	sessionFile: string,
+	kind?: string,
+	scope: AgentTraceWriteScope = resolveAgentTraceWriteScope(),
+): boolean {
 	try {
-		const entryPath = agentTraceOutboxEntryPath(sessionFile);
+		const entryPath = agentTraceOutboxEntryPath(scope, sessionFile);
 		if (existsSync(entryPath)) {
 			return true;
 		}
-		mkdirSync(getAgentTraceOutboxDir(), { recursive: true });
+		mkdirSync(getAgentTraceOutboxDir(scope), { recursive: true });
 		const tempPath = `${entryPath}.${process.pid}.${randomUUID()}.tmp`;
 		writeFileSync(
 			tempPath,
@@ -726,11 +768,19 @@ function markAgentTraceOutboxPendingSync(sessionFile: string, kind?: string): bo
 }
 
 async function recordAgentTraceOutboxUpload(
+	scope: AgentTraceWriteScope,
 	sessionFile: string,
 	signature: AgentTraceUploadedSignature,
 ): Promise<void> {
-	const entryPath = agentTraceOutboxEntryPath(sessionFile);
-	await mkdir(getAgentTraceOutboxDir(), { recursive: true });
+	// The scope was captured when this upload started. If its agent directory is gone by now,
+	// this is a directory that no longer exists on purpose - a test fixture that returned, a
+	// sandbox that was torn down - and recreating it would scatter fresh bookkeeping through a
+	// deleted path. Nothing is lost: the cursor only tells the next process what it already sent.
+	if (!existsSync(scope.agentDir)) {
+		return;
+	}
+	const entryPath = agentTraceOutboxEntryPath(scope, sessionFile);
+	await mkdir(getAgentTraceOutboxDir(scope), { recursive: true });
 	const tempPath = `${entryPath}.${process.pid}.${randomUUID()}.tmp`;
 	await writeFile(tempPath, `${JSON.stringify({ sessionFile, ...signature })}\n`, "utf8");
 	await rename(tempPath, entryPath);
@@ -744,13 +794,14 @@ async function recordAgentTraceOutboxUpload(
 export async function catchUpAgentTraceUploads(
 	options: Omit<AgentTraceUploadOptions, "sessionFile">,
 ): Promise<AgentTraceCatchUpResult> {
+	const scope = resolveAgentTraceWriteScope();
 	const catchUp: AgentTraceCatchUpResult = { pruned: 0, semanticEdgeLedgersPending: 0, results: [] };
-	if (options.requireEnabled !== false && !(await getAgentTracesEnabled(options))) {
+	if (options.requireEnabled !== false && !(await isAutomaticUploadEnabled(options))) {
 		return catchUp;
 	}
 	let entryNames: string[];
 	try {
-		entryNames = await readdir(getAgentTraceOutboxDir());
+		entryNames = await readdir(getAgentTraceOutboxDir(scope));
 	} catch {
 		return catchUp;
 	}
@@ -762,7 +813,7 @@ export async function catchUpAgentTraceUploads(
 		if (!entryName.endsWith(".json")) {
 			continue;
 		}
-		const entryPath = join(getAgentTraceOutboxDir(), entryName);
+		const entryPath = join(getAgentTraceOutboxDir(scope), entryName);
 		let raw: string;
 		try {
 			raw = await readFile(entryPath, "utf8");
@@ -830,6 +881,7 @@ export async function catchUpAgentTraceUploads(
 		const result = await uploadAgentTraceFileWithRequestGate(
 			{ ...options, sessionFile: entry.sessionFile, reloadConfig: false },
 			beforeRequest,
+			scope,
 		);
 		catchUp.results.push({ sessionFile: entry.sessionFile, result });
 	}
@@ -875,21 +927,40 @@ export async function getPrimeAgentTraceCredential(
 	return undefined;
 }
 
-async function getAgentTracesEnabled(
+/**
+ * Whether *automatic* sharing may upload right now. Two gates, both of which the user can set
+ * without touching this feature's own switch: the session's `agentTraces.enabled` opt-in, and
+ * the standing "do not call home" answer (`DO_NOT_TRACK`, `PI_OFFLINE`) - an automatic upload
+ * of a whole transcript is exactly what a user who set `DO_NOT_TRACK=1` asked not to happen.
+ * An explicit one-shot request (`requireEnabled: false`) does not consult this.
+ */
+async function isAutomaticUploadEnabled(
 	options: Pick<AgentTraceUploadOptions, "reloadConfig" | "settingsManager">,
 ): Promise<boolean> {
+	if (backgroundNetworkOptOut() !== undefined) {
+		return false;
+	}
 	if (options.reloadConfig !== false) {
 		await options.settingsManager.reload().catch(() => undefined);
 	}
 	return options.settingsManager.getAgentTracesEnabled();
 }
 
+/** Whether this process may describe a completed request as an upload to the trace service. */
+function isDeliveredToTraceService(options: AgentTraceUploadOptions): boolean {
+	// An injected transport means the bytes went to the caller's function, not to the trace
+	// API. The outcome log is read as a record of what left this machine, so it must not claim
+	// a delivery the process cannot vouch for.
+	return options.fetchFn === undefined;
+}
+
 async function uploadAgentTraceFileWithRequestGate(
 	options: AgentTraceUploadOptions,
 	beforeRequest?: BeforeTraceUploadRequest,
+	scope: AgentTraceWriteScope = resolveAgentTraceWriteScope(),
 ): Promise<AgentTraceUploadResult> {
-	const result = await performAgentTraceUpload(options, beforeRequest);
-	logAgentTraceOutcome(options.sessionFile, result);
+	const result = await performAgentTraceUpload(options, scope, beforeRequest);
+	logAgentTraceOutcome(scope, options.sessionFile, result, isDeliveredToTraceService(options));
 	return result;
 }
 
@@ -897,11 +968,46 @@ export function uploadAgentTraceFile(options: AgentTraceUploadOptions): Promise<
 	return uploadAgentTraceFileWithRequestGate(options);
 }
 
-function logAgentTraceOutcome(sessionFile: string | undefined, result: AgentTraceUploadResult): void {
+/**
+ * Append to the scope's log - unless the directory the operation started in is gone. Recreating
+ * it would scatter fresh bookkeeping through a deleted path (a test fixture that returned, a
+ * sandbox that was torn down) and that is exactly what the scope is there to prevent.
+ */
+function appendAgentTraceLog(scope: AgentTraceWriteScope, line: string): void {
+	if (!existsSync(scope.agentDir)) {
+		return;
+	}
+	appendRotatingLog(scope.logPath, line);
+}
+
+/** What the privacy gate removed from one request, for the log line that records it. */
+function describeUploadRedaction(result: UploadPrivacyGateResult): string {
+	const parts: string[] = [];
+	if (result.redactedValues > 0) {
+		parts.push(`${result.redactedValues} credential value(s) (${result.redactedTypes.join(", ")})`);
+	}
+	const userinfoFields = [...result.headersWithoutUserinfo];
+	if (result.bodyUserinfoCount > 0) {
+		userinfoFields.push("the session body");
+	}
+	if (userinfoFields.length > 0) {
+		parts.push(`URL userinfo from ${userinfoFields.join(", ")}`);
+	}
+	return parts.join("; ");
+}
+
+function logAgentTraceOutcome(
+	scope: AgentTraceWriteScope,
+	sessionFile: string | undefined,
+	result: AgentTraceUploadResult,
+	deliveredToTraceService: boolean,
+): void {
 	let line: string | undefined;
 	switch (result.status) {
 		case "uploaded":
-			line = `uploaded session ${result.sessionId} (${result.bytesStored} bytes)`;
+			line = deliveredToTraceService
+				? `uploaded session ${result.sessionId} (${result.bytesStored} bytes)`
+				: `not uploaded: injected transport (session ${result.sessionId}, ${result.bytesStored} bytes)`;
 			break;
 		case "failed":
 			line = `upload failed${result.statusCode ? ` (HTTP ${result.statusCode})` : ""}: ${result.message}`;
@@ -919,15 +1025,35 @@ function logAgentTraceOutcome(sessionFile: string | undefined, result: AgentTrac
 			return;
 	}
 	const suffix = sessionFile ? ` [${sessionFile}]` : "";
-	appendRotatingLog(getAgentTracesLogPath(), `[${new Date().toISOString()}] ${line}${suffix}`);
+	// `scope.logPath`, not `getAgentTracesLogPath()`: the log belongs to the directory this
+	// operation started in, which is the only directory the outbox cursor went to as well.
+	appendAgentTraceLog(scope, `[${new Date().toISOString()}] ${line}${suffix}`);
+}
+
+/**
+ * Record what the privacy gate removed, next to the outcome of the request it was removed for.
+ * Shape labels, counts and field names only: the log line must be readable as an audit of what
+ * happened without carrying the credential it is there to protect.
+ */
+function logAgentTraceRedaction(
+	scope: AgentTraceWriteScope,
+	sessionFile: string | undefined,
+	gate: UploadPrivacyGateResult,
+): void {
+	const suffix = sessionFile ? ` [${sessionFile}]` : "";
+	appendAgentTraceLog(
+		scope,
+		`[${new Date().toISOString()}] redacted before upload: ${describeUploadRedaction(gate)}${suffix}`,
+	);
 }
 
 async function performAgentTraceUpload(
 	options: AgentTraceUploadOptions,
+	scope: AgentTraceWriteScope,
 	beforeRequest?: BeforeTraceUploadRequest,
 ): Promise<AgentTraceUploadResult> {
 	const requireEnabled = options.requireEnabled !== false;
-	if (requireEnabled && !(await getAgentTracesEnabled(options))) {
+	if (requireEnabled && !(await isAutomaticUploadEnabled(options))) {
 		return { status: "disabled" };
 	}
 	if (!options.sessionFile) {
@@ -952,7 +1078,7 @@ async function performAgentTraceUpload(
 		return { status: "too_large", size: fileSize, maxBytes: MAX_TRACE_BYTES };
 	}
 	// Cursor invariant: an automatic upload never re-sends a file whose content already matches its uploaded cursor.
-	if (requireEnabled && signatureEquals(await readAgentTraceOutboxEntry(options.sessionFile), signature)) {
+	if (requireEnabled && signatureEquals(await readAgentTraceOutboxEntry(scope, options.sessionFile), signature)) {
 		return { status: "unchanged" };
 	}
 
@@ -969,7 +1095,7 @@ async function performAgentTraceUpload(
 		return { status: "missing_credentials" };
 	}
 
-	if (requireEnabled && !(await getAgentTracesEnabled(options))) {
+	if (requireEnabled && !(await isAutomaticUploadEnabled(options))) {
 		return { status: "disabled" };
 	}
 
@@ -984,7 +1110,6 @@ async function performAgentTraceUpload(
 	}
 
 	const traceContext = resolveTraceContext(options.sessionFile, header);
-	const bodyBytes = Buffer.byteLength(body, "utf8");
 	const headers: Record<string, string> = {
 		Authorization: `Bearer ${credential.apiKey}`,
 		"Content-Type": "application/x-ndjson",
@@ -1004,7 +1129,20 @@ async function performAgentTraceUpload(
 		headers["X-Git-Commit"] = git.commit;
 	}
 
-	if (requireEnabled && !(await getAgentTracesEnabled(options))) {
+	// One gate, both halves: the headers above are a second construction of the same session
+	// facts as the body below, and a credential reaches the service through either.
+	const gate = applyUploadPrivacyGate({
+		headers,
+		body,
+		agentDir: scope.agentDir,
+	});
+	if (uploadPrivacyGateChanged(gate)) {
+		logAgentTraceRedaction(scope, options.sessionFile, gate);
+	}
+	const uploadBody = gate.body;
+	const bodyBytes = Buffer.byteLength(uploadBody, "utf8");
+
+	if (requireEnabled && !(await isAutomaticUploadEnabled(options))) {
 		return { status: "disabled" };
 	}
 
@@ -1019,8 +1157,8 @@ async function performAgentTraceUpload(
 			url,
 			{
 				method: "PUT",
-				headers,
-				body,
+				headers: gate.headers,
+				body: uploadBody,
 			},
 			options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
 			options.signal,
@@ -1042,7 +1180,7 @@ async function performAgentTraceUpload(
 	const responseText = await response.text().catch(() => "");
 	const responseData = parseResponseObject(responseText);
 	try {
-		await recordAgentTraceOutboxUpload(options.sessionFile, signature);
+		await recordAgentTraceOutboxUpload(scope, options.sessionFile, signature);
 	} catch (error) {
 		return { status: "failed", message: `stored, but recording the upload cursor failed: ${describeError(error)}` };
 	}
@@ -1083,8 +1221,11 @@ class AgentTraceUploadController {
 		// Intent is consent-gated at persist time: an entry created while sharing
 		// is off would turn a later enable into retroactive collection of
 		// opted-out sessions. Marking re-runs every persist (existsSync-cheap),
-		// so an entry pruned by a racing catch-up is re-registered.
-		if (this.options.settingsManager.getAgentTracesEnabled()) {
+		// so an entry pruned by a racing catch-up is re-registered. The standing
+		// `DO_NOT_TRACK`/`PI_OFFLINE` answer counts as "off" here for the same
+		// reason: an entry written under it would upload a session the user asked
+		// not to send the moment the variable is unset.
+		if (backgroundNetworkOptOut() === undefined && this.options.settingsManager.getAgentTracesEnabled()) {
 			const sessionFile = this.sessionManager.getSessionFile();
 			if (
 				sessionFile &&
