@@ -1,6 +1,7 @@
 import type { AgentSession, ExtensionBindings } from "../../core/agent-session.js";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
 import type { AgentSessionServices } from "../../core/agent-session-services.js";
+import type { ResourceDiagnostic } from "../../core/diagnostics.js";
 import type { ExtensionCommandContext, ExtensionRunner, ToolDefinition } from "../../core/extensions/index.js";
 import type { ModelRegistry } from "../../core/model-registry.js";
 import type { SessionManager } from "../../core/session-manager.js";
@@ -46,6 +47,8 @@ export interface InteractiveModeLocalSessionHost {
 	createUiServices(): InteractiveModeUiServices;
 	getSessionManager(): SessionManager;
 	getExtensionRunner(): ExtensionRunner;
+	/** Tool name collisions in the session registry (built-in shadowing, cross-source duplicates). */
+	getToolDiagnostics(): ResourceDiagnostic[];
 	getToolRendererDefinition(toolName: string): InteractiveModeLocalToolRendererDefinition | undefined;
 	getSystemPrompt(): string;
 	getAbortSignal(): AbortSignal | undefined;
@@ -89,6 +92,7 @@ export function createInteractiveModeLocalSessionHost(
 		createUiServices: () => createInteractiveModeUiServices(runtimeHost.session),
 		getSessionManager: () => runtimeHost.session.sessionManager,
 		getExtensionRunner: () => runtimeHost.session.extensionRunner,
+		getToolDiagnostics: () => runtimeHost.session.getToolDiagnostics(),
 		getToolRendererDefinition: (toolName) => {
 			const definition = runtimeHost.session.getToolDefinition(toolName);
 			if (!definition) {

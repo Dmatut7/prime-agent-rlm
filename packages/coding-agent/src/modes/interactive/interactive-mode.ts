@@ -2462,8 +2462,11 @@ export class InteractiveMode {
 			extensionDiagnostics.push(...this.getBuiltInCommandConflictDiagnostics(this.connectionCommands));
 
 			if (this.bindLocalSessionExtensions) {
-				const shortcutDiagnostics = this.getLocalSessionHost().getExtensionRunner().getShortcutDiagnostics();
+				const localSessionHost = this.getLocalSessionHost();
+				const shortcutDiagnostics = localSessionHost.getExtensionRunner().getShortcutDiagnostics();
 				extensionDiagnostics.push(...shortcutDiagnostics);
+				extensionDiagnostics.push(...localSessionHost.getExtensionRunner().getToolDiagnostics());
+				extensionDiagnostics.push(...localSessionHost.getToolDiagnostics());
 			}
 
 			if (extensionDiagnostics.length > 0) {
