@@ -9,25 +9,25 @@
 // kernel mix module versions from two builds. A new build identity therefore
 // lands in a new sibling directory, and an old one is reclaimed only after its
 // own references drop to zero.
+//
+// The reference judgement itself - the four states of one entry, the confirmation
+// read that authorises an unlink, and the short-write-safe record writer - lives in
+// `reference-records.ts`, shared with the kernel snapshot generation layout.
 import { createHash } from "node:crypto";
 import type { Dirent } from "node:fs";
-import {
-	closeSync,
-	constants,
-	fchmodSync,
-	fsyncSync,
-	lstatSync,
-	mkdirSync,
-	openSync,
-	readFileSync,
-	rmSync,
-	type Stats,
-	writeSync,
-} from "node:fs";
+import { lstatSync } from "node:fs";
 import { readdir, rm } from "node:fs/promises";
 import path from "node:path";
-import { requireNoFollow } from "../../utils/private-files.js";
 import { getProcessStartId } from "../session-lease.js";
+import {
+	confirmReferenceIsStale,
+	judgeReferenceEntry,
+	parseReferenceRecord,
+	REFERENCE_PID_FILE_NAME,
+	REFERENCE_RECORD_VERSION,
+	releaseReferenceFileSync,
+	writeReferenceFileSync,
+} from "./reference-records.js";
 
 /**
  * Directory inside a generation that holds one reference file per live kernel pid, plus one
@@ -38,7 +38,6 @@ export const VENV_IN_USE_DIR_NAME = ".in-use";
 export const RETIRED_VENV_RETENTION = 1;
 export const KERNEL_VENV_SUFFIX_LENGTH = 12;
 
-const REFERENCE_RECORD_VERSION = 1;
 /** File name prefix of the tombstone a kernel writes when its reference file could not be written. */
 export const UNVERIFIED_REFERENCE_PREFIX = "unverified-";
 /**
@@ -50,18 +49,7 @@ export const UNVERIFIED_REFERENCE_PREFIX = "unverified-";
  */
 export const BOOT_CLAIM_PREFIX = "boot-";
 
-function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
-}
-const PID_FILE_NAME = /^[1-9][0-9]*$/;
 const GENERATION_SUFFIX = new RegExp(`^[0-9a-f]{${KERNEL_VENV_SUFFIX_LENGTH}}$`);
-
-interface ReferenceRecord {
-	pid: number;
-	processStartId?: string;
-	sessionId?: string;
-	recordedAt?: string;
-}
 
 export interface KernelVenvInUseReference {
 	pid: number;
@@ -139,16 +127,6 @@ function isNodeError(error: unknown, code: string): boolean {
 	return error instanceof Error && "code" in error && error.code === code;
 }
 
-function processIsRunning(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		// EPERM means the pid exists and belongs to somebody else.
-		return isNodeError(error, "EPERM");
-	}
-}
-
 /** Raised when a generation directory needs a rebuild but a kernel still runs from it. */
 export class KernelVenvRebuildDeferredError extends Error {
 	readonly code = "kernel_venv_rebuild_deferred" as const;
@@ -171,78 +149,6 @@ export class KernelVenvRebuildDeferredError extends Error {
 				"prime-agent-runtime installed to skip bootstrap entirely.",
 		);
 		this.name = "KernelVenvRebuildDeferredError";
-	}
-}
-
-/** Why a reference write failed, and whether it left bytes behind that are not a record. */
-interface ReferenceWriteFailure {
-	reason: string;
-	/** Bytes of a truncated record are on disk: the file is unusable and must not be mistaken for one. */
-	partialDelete: boolean;
-}
-
-/**
- * Write every byte of `contents` through `descriptor`, then put it on disk. Returns the failure,
- * or undefined when the whole record landed.
- *
- * A short write is not an error the filesystem reports: POSIX `write` stores what fits and
- * returns the count, and that is exactly what a full disk does to a reference record. Ignoring
- * the returned count is how a writer publishes a *truncated* record while believing it recorded
- * a reference - the reader then sees a file it cannot parse and (before this) swept a live
- * kernel's reference away. So the count is checked and the remainder retried, and the record is
- * fsynced before it is considered written: a reader has to see a complete record even if this
- * process dies right after the write returns.
- */
-function writeCompleteFile(descriptor: number, contents: Buffer, filePath: string): ReferenceWriteFailure | undefined {
-	let written = 0;
-	while (written < contents.length) {
-		let count: number;
-		try {
-			count = writeSync(descriptor, contents, written, contents.length - written);
-		} catch (error) {
-			return { reason: `${errorMessage(error)} (${filePath})`, partialDelete: written > 0 };
-		}
-		if (count <= 0) {
-			return {
-				reason: `short write: ${written} of ${contents.length} bytes (${filePath})`,
-				partialDelete: written > 0,
-			};
-		}
-		written += count;
-	}
-	try {
-		fsyncSync(descriptor);
-	} catch (error) {
-		return { reason: `${errorMessage(error)} (${filePath})`, partialDelete: false };
-	}
-	return undefined;
-}
-
-/** Create the reference directory and write one record; returns the failure, if any. */
-function writeReferenceFile(
-	filePath: string,
-	dir: string,
-	record: Record<string, unknown>,
-): ReferenceWriteFailure | undefined {
-	try {
-		mkdirSync(dir, { recursive: true, mode: 0o700 });
-		// O_NOFOLLOW: a planted symlink at the reference path must not be written through. The
-		// mode is re-asserted on the descriptor because the create mode only applies to a new
-		// file (as in orphan-process-journal.ts).
-		const descriptor = openSync(
-			filePath,
-			constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | requireNoFollow(constants.O_NOFOLLOW),
-			0o600,
-		);
-		try {
-			const failure = writeCompleteFile(descriptor, Buffer.from(`${JSON.stringify(record)}\n`), filePath);
-			if (failure === undefined && process.platform !== "win32") fchmodSync(descriptor, 0o600);
-			return failure;
-		} finally {
-			closeSync(descriptor);
-		}
-	} catch (error) {
-		return { reason: errorMessage(error), partialDelete: false };
 	}
 }
 
@@ -281,11 +187,11 @@ export function recordKernelVenvInUseSync(
 	// keeps a host that never spawns again from pinning a generation for its whole lifetime.
 	releaseKernelVenvInUseSync(path.join(dir, `${BOOT_CLAIM_PREFIX}${process.pid}`));
 	const referencePath = path.join(dir, String(reference.pid));
-	const failure = writeReferenceFile(referencePath, dir, identity);
+	const failure = writeReferenceFileSync(referencePath, dir, identity);
 	if (failure === undefined) return { releasePath: referencePath, unverified: false };
 
 	const tombstonePath = path.join(dir, `${UNVERIFIED_REFERENCE_PREFIX}${reference.pid}`);
-	const tombstoneFailure = writeReferenceFile(tombstonePath, dir, {
+	const tombstoneFailure = writeReferenceFileSync(tombstonePath, dir, {
 		...identity,
 		unverified: true,
 		reason: failure.reason,
@@ -337,7 +243,7 @@ export function claimKernelVenvBootSync(
 		recordedAt: new Date().toISOString(),
 	};
 	const claimPath = path.join(dir, `${BOOT_CLAIM_PREFIX}${pid}`);
-	const failure = writeReferenceFile(claimPath, dir, identity);
+	const failure = writeReferenceFileSync(claimPath, dir, identity);
 	if (failure === undefined) return { claimPath };
 	if (failure.partialDelete) {
 		// A claim that landed short is not a claim: no reader can parse the promise out of it, and
@@ -356,81 +262,7 @@ export function claimKernelVenvBootSync(
  * whose start identity no longer matches).
  */
 export function releaseKernelVenvInUseSync(referencePath: string | undefined): void {
-	if (!referencePath) return;
-	try {
-		rmSync(referencePath, { force: true });
-	} catch {
-		// Best effort: the stale sweep reclaims it.
-	}
-}
-
-function readReferenceRecord(filePath: string): ReferenceRecord | undefined {
-	try {
-		const parsed: unknown = JSON.parse(readFileSync(filePath, "utf8"));
-		if (typeof parsed !== "object" || parsed === null) return undefined;
-		const record = parsed as {
-			version?: unknown;
-			pid?: unknown;
-			processStartId?: unknown;
-			sessionId?: unknown;
-			recordedAt?: unknown;
-		};
-		if (record.version !== REFERENCE_RECORD_VERSION) return undefined;
-		if (!Number.isInteger(record.pid) || (record.pid as number) <= 0) return undefined;
-		return {
-			pid: record.pid as number,
-			...(typeof record.processStartId === "string" ? { processStartId: record.processStartId } : {}),
-			...(typeof record.sessionId === "string" ? { sessionId: record.sessionId } : {}),
-			...(typeof record.recordedAt === "string" ? { recordedAt: record.recordedAt } : {}),
-		};
-	} catch {
-		return undefined;
-	}
-}
-
-/**
- * A live pid is only the recorded kernel when its start identity still matches;
- * pids get reused. When the start identity cannot be queried the reference is
- * kept: this decides whether a directory may be deleted, so "cannot disprove"
- * must not read as "gone". (The orphan reaper judges the same evidence the other
- * way round because it decides whether to kill.)
- */
-function referenceIsLive(record: ReferenceRecord): boolean {
-	if (!processIsRunning(record.pid)) return false;
-	if (record.processStartId === undefined) return true;
-	const current = getProcessStartId(record.pid);
-	return current === undefined || current === record.processStartId;
-}
-
-/**
- * What one entry in the reference directory proves about its holder.
- *
- * - `live`: the holder is running and its identity matches, so the generation is in use.
- * - `stale`: the holder is provably gone (dead pid, or a pid whose start identity moved on).
- * - `unverifiable`: the entry exists but proves nothing either way - an unparseable record, or a
- *   file that does not name the pid inside it while that pid runs. It is kept and makes the state
- *   unknown. "Cannot be disproved" must not read as "gone" here: this judgement decides whether a
- *   directory may be deleted, and a running kernel resolves its lazy imports against it.
- * - `foreign`: not a record this bookkeeping writes (a symlink, a directory). It neither protects
- *   the generation nor gets deleted, so a planted entry cannot pin anything.
- */
-type ReferenceVerdict = "live" | "stale" | "unverifiable" | "foreign";
-
-function judgeReferenceEntry(referencePath: string, pidName: string): ReferenceVerdict {
-	let stats: Stats;
-	try {
-		stats = lstatSync(referencePath);
-	} catch {
-		// Gone between the directory listing and this read: nothing left to protect or sweep.
-		return "stale";
-	}
-	if (stats.isSymbolicLink() || !stats.isFile()) return "foreign";
-	const record = readReferenceRecord(referencePath);
-	// An unparseable record is a truncated write (disk full, or a reader that looked mid-write),
-	// not a dead holder: the bytes prove nothing about who wrote them.
-	if (record === undefined) return "unverifiable";
-	if (Number(pidName) !== record.pid) return referenceIsLive(record) ? "unverifiable" : "stale";
-	return referenceIsLive(record) ? "live" : "stale";
+	releaseReferenceFileSync(referencePath);
 }
 
 /**
@@ -442,7 +274,7 @@ function judgeReferenceEntry(referencePath: string, pidName: string): ReferenceV
  * is the only thing that authorises the unlink.
  */
 export async function sweepStaleVenvReference(referencePath: string, pidName: string): Promise<"swept" | "kept"> {
-	if (judgeReferenceEntry(referencePath, pidName) !== "stale") return "kept";
+	if (!confirmReferenceIsStale(referencePath, pidName)) return "kept";
 	try {
 		await rm(referencePath, { force: true });
 		return "swept";
@@ -485,7 +317,7 @@ export async function readKernelVenvInUseState(
 				: entry;
 		// Names this bookkeeping never writes are ignored: they neither protect the
 		// generation nor get deleted.
-		if (!PID_FILE_NAME.test(pidName)) continue;
+		if (!REFERENCE_PID_FILE_NAME.test(pidName)) continue;
 		const referencePath = path.join(dir, entry);
 		const verdict = judgeReferenceEntry(referencePath, pidName);
 		if (verdict === "foreign") continue;
@@ -499,7 +331,7 @@ export async function readKernelVenvInUseState(
 			}
 			continue;
 		}
-		const record = readReferenceRecord(referencePath);
+		const record = parseReferenceRecord(referencePath);
 		if (tombstone) unknown = true;
 		// An unverifiable entry is the "in use" direction for deletion, and for a *reference* it
 		// also makes the rebuild decision defer: a directory whose real state cannot be
