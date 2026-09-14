@@ -335,8 +335,17 @@ The user's own words from the compacted transcript, ...
 Record lines are JSON, and `<` is written as `\u003c` inside them: a payload that quotes a
 block delimiter (`</user-requests>`, say) therefore cannot end its block early, while `JSON.parse`
 restores the character exactly and a block written before this rule still parses. The file-list
-blocks carry paths verbatim instead — they have no JSON layer to hide behind — so a path that
-reads as a delimiter is reported with a warning rather than silently truncating the list.
+blocks carry paths verbatim instead — they have no JSON layer to hide behind, and inventing one
+would make a path containing the literal `\u003c` ambiguous — so an entry that reads as a delimiter
+is left out of the rendered list and reported. `details.readFiles` / `details.modifiedFiles` still
+carry it: the rendered list is the fallback, not the ledger.
+
+The blocks are anchored at the end of the document, because the renderer is the only code that
+writes the tail. A block is read back only there: its closing tag has to be the document's last
+line, its opening tag a whole line of strict shape (`<user-requests-evil>` and
+`<user-requests /evil>` are not openers) that starts a paragraph wherever a candidate does, and
+the last matching opener wins. So a tool `path` argument or a narrative that merely names a tag can
+write a look-alike ahead of the real block without becoming the block that is read.
 
 Everything from `<read-files>` down is machine-generated (see [Fidelity](#fidelity-what-survives-without-the-model)). The narrative above it is the model's; the blocks are rebuilt from the transcript on every compaction and are stripped out of the previous summary before it is sent back to the model. Branch summaries carry the file blocks only.
 
