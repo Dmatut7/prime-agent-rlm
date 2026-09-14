@@ -16,11 +16,8 @@
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { getLogger } from "@earendil-works/pi-ai";
 import { estimateTextTokensByContent } from "./content-density.js";
-import { findMachineBlock, renderMachineBlock } from "./machine-blocks.js";
-
-const compactionLog = getLogger("coding-agent.compaction");
+import { checkMachineBlockSelfCount, findMachineBlock, renderMachineBlock } from "./machine-blocks.js";
 
 export type UserRequestKind = "user" | "bash";
 
@@ -361,21 +358,11 @@ export function parseUserRequests(text: string): UserRequestLedger | undefined {
 			kind: wire.k === "bash" ? "bash" : "user",
 		});
 	}
-	// The block states its own record count on the opening tag. A mismatch means the block
-	// was damaged (a delimiter inside a payload, a hand edit) and lines were skipped above:
-	// say so, because a truncated block that reports nothing is the failure this parser
-	// exists to prevent.
-	const declaredCount = Number.parseInt(block.attributes.count ?? "", 10);
-	if (Number.isFinite(declaredCount) && declaredCount !== records.length) {
-		compactionLog.warn(
-			"<user-requests> block is damaged: its declared count does not match the records parsed back",
-			{
-				declaredCount,
-				parsedRecords: records.length,
-				generation,
-			},
-		);
-	}
+	// The block states its own record count on the opening tag, and the check runs on the
+	// block the anchored finder returned - after anchoring, never before. A truncated block
+	// that reports nothing is the failure this parser exists to prevent, and a block whose
+	// header was forged ahead of the real one cannot pass its own check first.
+	checkMachineBlockSelfCount(block, "count", records.length);
 	return {
 		generation: Number.isFinite(generation) && generation > 0 ? generation : 1,
 		records,
