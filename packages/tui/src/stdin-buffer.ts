@@ -178,6 +178,36 @@ function parseUnmodifiedKittyPrintableCodepoint(sequence: string): number | unde
 }
 
 /**
+ * End offset of the next bulk slice. Two boundaries are not allowed to fall where
+ * the length cap says they do, because the slice a boundary creates has to be
+ * text a consumer can insert:
+ *
+ * - A slice that *starts* with a newline is read as the newline key (or dropped
+ *   outright: a consumer that treats a leading control byte as a key remnant
+ *   discards the whole sequence). The cut steps over the newline instead, so the
+ *   newline ends the current slice rather than leading the next one.
+ * - A cut inside a surrogate pair hands the consumer two lone surrogates, and the
+ *   character is mangled on the way in. The cut moves back one unit so the pair
+ *   travels whole in the following slice.
+ */
+function bulkSliceEnd(run: string, start: number): number {
+	let end = Math.min(run.length, start + BULK_TEXT_MAX_SEQUENCE);
+	if (end >= run.length) {
+		return run.length;
+	}
+	while (end < run.length && run[end] === "\n") {
+		end++;
+	}
+	if (end < run.length) {
+		const code = run.charCodeAt(end);
+		if (code >= 0xdc00 && code <= 0xdfff) {
+			end--;
+		}
+	}
+	return end;
+}
+
+/**
  * Deliver text as sequences. Short runs stay one character per sequence (typing
  * must remain per-key); long runs are bulk input - a paste from a terminal
  * without bracketed paste, the tail of an oversized paste, or a pipe - and are
@@ -187,7 +217,9 @@ function parseUnmodifiedKittyPrintableCodepoint(sequence: string): number | unde
  * Newlines belong to a long run: a multi-line paste inserted line by line makes
  * the consumer rebuild its whole text per line. A leading newline still goes out
  * on its own, so a bulk sequence never starts with one (consumers treat a
- * sequence that starts with a newline as a single newline key).
+ * sequence that starts with a newline as a single newline key), and every slice
+ * boundary is chosen so that no slice it creates breaks that rule - see
+ * `bulkSliceEnd`.
  */
 function pushTextRun(sequences: string[], run: string): void {
 	if (run.length < BULK_TEXT_MIN_RUN) {
@@ -201,8 +233,10 @@ function pushTextRun(sequences: string[], run: string): void {
 		sequences.push("\n");
 		start++;
 	}
-	for (let i = start; i < run.length; i += BULK_TEXT_MAX_SEQUENCE) {
-		sequences.push(run.slice(i, i + BULK_TEXT_MAX_SEQUENCE));
+	while (start < run.length) {
+		const end = bulkSliceEnd(run, start);
+		sequences.push(run.slice(start, end));
+		start = end;
 	}
 }
 
@@ -280,6 +314,10 @@ export const PASTE_MAX_BYTES = 8 * 1024 * 1024;
  * The terminator is indistinguishable from an end marker inside the pasted bytes,
  * so only a quiet stream says the paste is over; everything received up to that
  * point is delivered as paste text.
+ *
+ * Nothing else inside the paste can end it: a control sequence in the bytes is
+ * paste text like any other byte, and only the quiet stream, the watchdog or an
+ * explicit abort closes paste mode.
  */
 export const PASTE_SETTLE_MS = 20;
 
@@ -315,29 +353,12 @@ export type StdinBufferEventMap = {
 	paste: [string];
 };
 
-function isImmediatePasteEscapeAbort(data: string): boolean {
-	return data === "\x1b[27u" || (data.startsWith("\x1b[27;") && data.endsWith("u"));
-}
-
 /**
- * Proper prefixes of the markers scanned inside a paste (`\x1b[201~`,
- * `\x1b[27u`, `\x1b[27;<digits>u`). A window tail matching this can still
- * grow into a marker in a later chunk, so it must be rescanned on append.
+ * Proper prefixes of the paste end marker (`\x1b[201~`). A window tail matching
+ * this can still grow into the terminator in a later chunk, so it must be
+ * rescanned on append.
  */
-const PARTIAL_PASTE_MARKER_REGEX = /^\x1b(\[(2(01?|7(;[\d:]*)?)?)?)?$/;
-
-function findCompleteKittyEscape(buffer: string): { index: number; length: number } | null {
-	const simple = "\x1b[27u";
-	const simpleAt = buffer.indexOf(simple);
-	if (simpleAt !== -1) {
-		return { index: simpleAt, length: simple.length };
-	}
-	const match = buffer.match(/\x1b\[27;[\d:]+u/);
-	if (match?.index === undefined) {
-		return null;
-	}
-	return { index: match.index, length: match[0].length };
-}
+const PARTIAL_PASTE_MARKER_REGEX = /^\x1b(\[(2(0(1)?)?)?)?$/;
 
 /**
  * Buffers stdin input and emits complete sequences via the 'data' event.
@@ -359,7 +380,6 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	// and rescanning it per chunk was quadratic: every `+=` plus indexOf/regex
 	// re-flattened and re-walked the whole paste.
 	private pasteChunks: string[] = [];
-	private pasteLength: number = 0;
 	private pasteBufferBytes: number = 0;
 	private pastePending: string = "";
 	/** An end marker was seen; the paste closes once the stream goes quiet. */
@@ -397,23 +417,6 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		if (str.length === 0 && this.buffer.length === 0) {
 			this.emitDataSequence("");
 			return;
-		}
-
-		if (this.pasteMode) {
-			const interruptAt = str.indexOf("\x03");
-			if (interruptAt !== -1) {
-				this.discardPasteMode();
-				this.emitDataSequence("\x03");
-				const remaining = str.slice(interruptAt + 1);
-				if (remaining.length > 0) {
-					this.process(remaining);
-				}
-				return;
-			}
-			if (isImmediatePasteEscapeAbort(str)) {
-				this.discardPasteMode();
-				return;
-			}
 		}
 
 		this.buffer += str;
@@ -463,18 +466,25 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		}
 	}
 
+	/**
+	 * Append bytes to the paste. Every byte that arrives while paste mode is on
+	 * belongs to the paste text: content bytes and protocol bytes are
+	 * indistinguishable, so a control sequence inside a paste cannot be allowed to
+	 * leave paste mode (that would both drop the buffered content and hand the rest
+	 * of the paste to the key parser, where `\r` is Enter). The only thing that
+	 * closes a paste is its byte stream going quiet after the terminator, the idle
+	 * watchdog, or the caller aborting it.
+	 */
 	private appendPasteChunk(chunk: string): void {
 		if (chunk.length > 0) {
 			this.pasteChunks.push(chunk);
-			this.pasteLength += chunk.length;
 			this.pasteBufferBytes += Buffer.byteLength(chunk, "utf8");
 		}
 
-		// Markers can straddle chunk boundaries; `pastePending` is the trailing
-		// partial-marker prefix carried over from the previous append, so the
-		// scan window covers every position a marker could complete at.
+		// The terminator can straddle chunk boundaries; `pastePending` is the
+		// trailing partial-marker prefix carried over from the previous append, so
+		// the scan window covers every position it could complete at.
 		const window = this.pastePending.length === 0 ? chunk : this.pastePending + chunk;
-		const windowStart = this.pasteLength - window.length;
 
 		// Pasted bytes carry no escaping, so an end marker inside the content is
 		// indistinguishable from the terminator: only the end of the paste's byte
@@ -491,16 +501,6 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			// down the key path (one insert per character, executed escape
 			// sequences) - the exact shape this file exists to prevent.
 			this.flushPastePart();
-			return;
-		}
-
-		const kittyEsc = findCompleteKittyEscape(window);
-		if (kittyEsc) {
-			const remaining = this.joinPasteChunks().slice(windowStart + kittyEsc.index + kittyEsc.length);
-			this.discardPasteMode();
-			if (remaining.length > 0) {
-				this.process(remaining);
-			}
 			return;
 		}
 
@@ -545,7 +545,6 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		}
 		const emit = keep.length > 0 ? content.slice(0, content.length - keep.length) : content;
 		this.pasteChunks = keep.length > 0 ? [keep] : [];
-		this.pasteLength = keep.length;
 		this.pasteBufferBytes = keep.length > 0 ? Buffer.byteLength(keep, "utf8") : 0;
 		if (emit.length > 0) {
 			this.emit("paste", emit);
@@ -574,29 +573,17 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			this.discardPasteMode();
 			return;
 		}
-		this.emitPasteAndContinue(stripped, "");
+		this.emitPasteAndContinue(stripped);
 	}
 
 	private trailingPartialPasteMarker(window: string): string {
-		// Every scanned marker starts with ESC, so only the tail starting at the
-		// last ESC can still grow into one. Longer tails can only be a partial
-		// Kitty Esc (`\x1b[27;` + digits/colons); checking that run by char code
-		// avoids allocating a multi-megabyte tail slice.
+		// The terminator starts with ESC, so only the tail starting at the last ESC
+		// can still grow into one; anything else after it is already content.
 		const esc = window.lastIndexOf(ESC);
 		if (esc === -1) {
 			return "";
 		}
 		const tail = window.slice(esc);
-		if (tail.length > 8) {
-			if (!tail.startsWith("\x1b[27;")) {
-				return "";
-			}
-			for (let i = 5; i < tail.length; i++) {
-				const code = tail.charCodeAt(i);
-				if (!((code >= 48 && code <= 57) || code === 58)) return "";
-			}
-			return tail;
-		}
 		return PARTIAL_PASTE_MARKER_REGEX.test(tail) ? tail : "";
 	}
 
@@ -606,25 +593,26 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 
 	private resetPasteState(): void {
 		this.pasteChunks = [];
-		this.pasteLength = 0;
 		this.pasteBufferBytes = 0;
 		this.pastePending = "";
 		this.pasteTerminated = false;
 	}
 
 	private finishPasteWithoutTerminator(): void {
-		this.emitPasteAndContinue(this.joinPasteChunks(), "");
+		this.emitPasteAndContinue(this.joinPasteChunks());
 	}
 
-	private emitPasteAndContinue(pastedContent: string, remaining: string): void {
+	/**
+	 * Close paste mode with the bytes received so far as paste text. Nothing is
+	 * handed to the key parser here - not even a leftover tail - because no byte
+	 * that arrived while the paste was open may become a key.
+	 */
+	private emitPasteAndContinue(pastedContent: string): void {
 		this.clearPasteTimers();
 		this.pasteMode = false;
 		this.resetPasteState();
 		this.pendingKittyPrintableCodepoint = undefined;
 		this.emit("paste", pastedContent);
-		if (remaining.length > 0) {
-			this.process(remaining);
-		}
 	}
 
 	private discardPasteMode(): void {

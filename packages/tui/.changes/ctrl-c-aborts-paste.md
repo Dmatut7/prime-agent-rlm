@@ -1,1 +1,1 @@
-- Interrupted an in-flight bracketed paste with Ctrl+C so the key is not swallowed for up to 30s.
+- Fixed Ctrl+C inside an in-flight bracketed paste being delivered as an interrupt key: a control byte in pasted bytes is paste text like any other byte.

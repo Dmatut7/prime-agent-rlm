@@ -15,11 +15,13 @@ import {
 	closeSync,
 	constants,
 	fchmodSync,
+	fsyncSync,
 	lstatSync,
 	mkdirSync,
 	openSync,
 	readFileSync,
 	rmSync,
+	type Stats,
 	writeSync,
 } from "node:fs";
 import { readdir, rm } from "node:fs/promises";
@@ -69,6 +71,12 @@ export interface KernelVenvInUseReference {
 	recordedAt?: string;
 	/** Set on a tombstone: this kernel could not write a real reference, so its claim is unverified. */
 	unverified?: boolean;
+	/**
+	 * Set when the entry cannot be disproved: its record does not parse (a short write truncated
+	 * it), or it does not name the pid its file name claims while the recorded holder runs. The
+	 * entry counts as a reference and makes the state unknown; it is never swept.
+	 */
+	unverifiable?: boolean;
 	/** Absolute path of the reference file; the holder releases exactly this path. */
 	referencePath: string;
 }
@@ -166,8 +174,56 @@ export class KernelVenvRebuildDeferredError extends Error {
 	}
 }
 
-/** Create the reference directory and write one record; returns the failure reason, if any. */
-function writeReferenceFile(filePath: string, dir: string, record: Record<string, unknown>): string | undefined {
+/** Why a reference write failed, and whether it left bytes behind that are not a record. */
+interface ReferenceWriteFailure {
+	reason: string;
+	/** Bytes of a truncated record are on disk: the file is unusable and must not be mistaken for one. */
+	partialDelete: boolean;
+}
+
+/**
+ * Write every byte of `contents` through `descriptor`, then put it on disk. Returns the failure,
+ * or undefined when the whole record landed.
+ *
+ * A short write is not an error the filesystem reports: POSIX `write` stores what fits and
+ * returns the count, and that is exactly what a full disk does to a reference record. Ignoring
+ * the returned count is how a writer publishes a *truncated* record while believing it recorded
+ * a reference - the reader then sees a file it cannot parse and (before this) swept a live
+ * kernel's reference away. So the count is checked and the remainder retried, and the record is
+ * fsynced before it is considered written: a reader has to see a complete record even if this
+ * process dies right after the write returns.
+ */
+function writeCompleteFile(descriptor: number, contents: Buffer, filePath: string): ReferenceWriteFailure | undefined {
+	let written = 0;
+	while (written < contents.length) {
+		let count: number;
+		try {
+			count = writeSync(descriptor, contents, written, contents.length - written);
+		} catch (error) {
+			return { reason: `${errorMessage(error)} (${filePath})`, partialDelete: written > 0 };
+		}
+		if (count <= 0) {
+			return {
+				reason: `short write: ${written} of ${contents.length} bytes (${filePath})`,
+				partialDelete: written > 0,
+			};
+		}
+		written += count;
+	}
+	try {
+		fsyncSync(descriptor);
+	} catch (error) {
+		return { reason: `${errorMessage(error)} (${filePath})`, partialDelete: false };
+	}
+	return undefined;
+}
+
+/** Create the reference directory and write one record; returns the failure, if any. */
+function writeReferenceFile(
+	filePath: string,
+	dir: string,
+	record: Record<string, unknown>,
+): ReferenceWriteFailure | undefined {
 	try {
 		mkdirSync(dir, { recursive: true, mode: 0o700 });
 		// O_NOFOLLOW: a planted symlink at the reference path must not be written through. The
@@ -179,14 +235,14 @@ function writeReferenceFile(filePath: string, dir: string, record: Record<string
 			0o600,
 		);
 		try {
-			writeSync(descriptor, `${JSON.stringify(record)}\n`);
-			if (process.platform !== "win32") fchmodSync(descriptor, 0o600);
+			const failure = writeCompleteFile(descriptor, Buffer.from(`${JSON.stringify(record)}\n`), filePath);
+			if (failure === undefined && process.platform !== "win32") fchmodSync(descriptor, 0o600);
+			return failure;
 		} finally {
 			closeSync(descriptor);
 		}
-		return undefined;
 	} catch (error) {
-		return errorMessage(error);
+		return { reason: errorMessage(error), partialDelete: false };
 	}
 }
 
@@ -229,11 +285,26 @@ export function recordKernelVenvInUseSync(
 	if (failure === undefined) return { releasePath: referencePath, unverified: false };
 
 	const tombstonePath = path.join(dir, `${UNVERIFIED_REFERENCE_PREFIX}${reference.pid}`);
-	const tombstoneFailure = writeReferenceFile(tombstonePath, dir, { ...identity, unverified: true, reason: failure });
+	const tombstoneFailure = writeReferenceFile(tombstonePath, dir, {
+		...identity,
+		unverified: true,
+		reason: failure.reason,
+	});
+	if (tombstoneFailure === undefined && failure.partialDelete) {
+		// A truncated prefix is on disk where a record belongs. The tombstone carries the same
+		// evidence in a shape readers accept, so the unusable prefix is removed now that the
+		// stronger signal is written: leaving it behind would leave the generation unreadable
+		// (and so unrebuildable) for good. The removal happens after the tombstone write, never
+		// before, so there is no window in which the directory looks free.
+		releaseKernelVenvInUseSync(referencePath);
+	}
 	return {
 		releasePath: tombstoneFailure === undefined ? tombstonePath : undefined,
 		unverified: true,
-		reason: tombstoneFailure === undefined ? failure : `${failure}; tombstone write also failed: ${tombstoneFailure}`,
+		reason:
+			tombstoneFailure === undefined
+				? failure.reason
+				: `${failure.reason}; tombstone write also failed: ${tombstoneFailure.reason}`,
 	};
 }
 
@@ -267,7 +338,15 @@ export function claimKernelVenvBootSync(
 	};
 	const claimPath = path.join(dir, `${BOOT_CLAIM_PREFIX}${pid}`);
 	const failure = writeReferenceFile(claimPath, dir, identity);
-	return failure === undefined ? { claimPath } : { reason: failure };
+	if (failure === undefined) return { claimPath };
+	if (failure.partialDelete) {
+		// A claim that landed short is not a claim: no reader can parse the promise out of it, and
+		// an unreadable entry would keep the directory out of every future reclaim. The boot
+		// carries on unprotected, which is the pre-existing behaviour for a claim that cannot be
+		// written at all.
+		releaseKernelVenvInUseSync(claimPath);
+	}
+	return { reason: failure.reason };
 }
 
 /**
@@ -287,8 +366,6 @@ export function releaseKernelVenvInUseSync(referencePath: string | undefined): v
 
 function readReferenceRecord(filePath: string): ReferenceRecord | undefined {
 	try {
-		const stats = lstatSync(filePath);
-		if (stats.isSymbolicLink() || !stats.isFile()) return undefined;
 		const parsed: unknown = JSON.parse(readFileSync(filePath, "utf8"));
 		if (typeof parsed !== "object" || parsed === null) return undefined;
 		const record = parsed as {
@@ -325,6 +402,56 @@ function referenceIsLive(record: ReferenceRecord): boolean {
 	return current === undefined || current === record.processStartId;
 }
 
+/**
+ * What one entry in the reference directory proves about its holder.
+ *
+ * - `live`: the holder is running and its identity matches, so the generation is in use.
+ * - `stale`: the holder is provably gone (dead pid, or a pid whose start identity moved on).
+ * - `unverifiable`: the entry exists but proves nothing either way - an unparseable record, or a
+ *   file that does not name the pid inside it while that pid runs. It is kept and makes the state
+ *   unknown. "Cannot be disproved" must not read as "gone" here: this judgement decides whether a
+ *   directory may be deleted, and a running kernel resolves its lazy imports against it.
+ * - `foreign`: not a record this bookkeeping writes (a symlink, a directory). It neither protects
+ *   the generation nor gets deleted, so a planted entry cannot pin anything.
+ */
+type ReferenceVerdict = "live" | "stale" | "unverifiable" | "foreign";
+
+function judgeReferenceEntry(referencePath: string, pidName: string): ReferenceVerdict {
+	let stats: Stats;
+	try {
+		stats = lstatSync(referencePath);
+	} catch {
+		// Gone between the directory listing and this read: nothing left to protect or sweep.
+		return "stale";
+	}
+	if (stats.isSymbolicLink() || !stats.isFile()) return "foreign";
+	const record = readReferenceRecord(referencePath);
+	// An unparseable record is a truncated write (disk full, or a reader that looked mid-write),
+	// not a dead holder: the bytes prove nothing about who wrote them.
+	if (record === undefined) return "unverifiable";
+	if (Number(pidName) !== record.pid) return referenceIsLive(record) ? "unverifiable" : "stale";
+	return referenceIsLive(record) ? "live" : "stale";
+}
+
+/**
+ * Sweep one entry a first read judged stale, after judging it a second time.
+ *
+ * The writer is another process and neither the record write nor this sweep is atomic, so the
+ * file can become a live reference (or an unreadable one) between the read and the unlink. The
+ * confirmation read is what stops a live reference from being deleted by a stale verdict, and it
+ * is the only thing that authorises the unlink.
+ */
+export async function sweepStaleVenvReference(referencePath: string, pidName: string): Promise<"swept" | "kept"> {
+	if (judgeReferenceEntry(referencePath, pidName) !== "stale") return "kept";
+	try {
+		await rm(referencePath, { force: true });
+		return "swept";
+	} catch {
+		// Left for the next sweep; it is not counted as a reference either.
+		return "kept";
+	}
+}
+
 /** Live references of one generation, sweeping provably stale entries. */
 export async function readKernelVenvInUseState(venvDir: string): Promise<KernelVenvInUseState> {
 	const dir = path.join(venvDir, VENV_IN_USE_DIR_NAME);
@@ -357,24 +484,27 @@ export async function readKernelVenvInUseState(venvDir: string): Promise<KernelV
 		// generation nor get deleted.
 		if (!PID_FILE_NAME.test(pidName)) continue;
 		const referencePath = path.join(dir, entry);
-		const record = readReferenceRecord(referencePath);
-		const stale = record === undefined || Number(pidName) !== record.pid || !referenceIsLive(record);
-		if (stale) {
-			try {
-				await rm(referencePath, { force: true });
-				swept.push(referencePath);
-			} catch {
-				// Left for the next sweep; it is not counted as a reference either.
-			}
+		const verdict = judgeReferenceEntry(referencePath, pidName);
+		if (verdict === "foreign") continue;
+		if (verdict === "stale") {
+			if ((await sweepStaleVenvReference(referencePath, pidName)) === "swept") swept.push(referencePath);
 			continue;
 		}
+		const record = readReferenceRecord(referencePath);
 		if (tombstone) unknown = true;
+		// An unverifiable entry is the "in use" direction for deletion, and for a *reference* it
+		// also makes the rebuild decision defer: a directory whose real state cannot be
+		// established is not repairable in place. A boot claim keeps its documented meaning
+		// instead - it protects the directory without deferring a rebuild the claimant itself may
+		// be about to perform - so it does not raise `unknown`.
+		if (verdict === "unverifiable" && !bootClaim) unknown = true;
 		const parsed: KernelVenvInUseReference = {
-			pid: record?.pid as number,
+			pid: record?.pid ?? Number(pidName),
 			...(record?.processStartId ? { processStartId: record.processStartId } : {}),
 			...(record?.sessionId ? { sessionId: record.sessionId } : {}),
 			...(record?.recordedAt ? { recordedAt: record.recordedAt } : {}),
 			...(tombstone ? { unverified: true } : {}),
+			...(verdict === "unverifiable" ? { unverifiable: true } : {}),
 			referencePath,
 		};
 		(bootClaim ? bootClaims : references).push(parsed);

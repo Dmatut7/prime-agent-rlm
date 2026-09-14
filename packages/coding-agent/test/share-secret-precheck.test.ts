@@ -248,6 +248,98 @@ describe("credentials loaded by this session are treated as secrets regardless o
 	});
 });
 
+describe("loaded credentials are compared whatever their shape (ADV-2)", () => {
+	/** Loaded values are compared verbatim, so a credential's shape cannot hide it from the check. */
+	function collectedFromEnv(env: Record<string, string>): ShareSecretValue[] {
+		return collectConfiguredShareSecretValues({ agentDir: "/nonexistent-agent-dir", env, argv: [] });
+	}
+
+	/** All-digit credentials exist (older IoT/vendor keys). */
+	const DIGIT_KEY = "39284756102394857610";
+	/** A slug someone generated rather than wrote: lower case, digits-free, under the length floor. */
+	const SLUG_KEY = "payment-gateway-webhook-signing";
+	/** An AWS-style secret with two slashes, the shape that reads as a path. */
+	const SLASH_KEY = "fAkE9xQ2mZ7pL4wR/tY8uI3oP6sD1fG/hJ5kLzXcVb";
+
+	it("compares an all-digit credential loaded by this session", () => {
+		const collected = collectedFromEnv({ NUMERIC_PROVIDER_KEY: DIGIT_KEY });
+		expect(collected.map((entry) => entry.value)).toContain(DIGIT_KEY);
+
+		const findings = findShareUploadSecretFindings(shareDocument(`the key is ${DIGIT_KEY} ok`), {
+			secretValues: collected,
+		});
+		expect(findings.map((finding) => finding.type)).toContain("Configured credential");
+		expect(JSON.stringify(findings)).not.toContain(DIGIT_KEY);
+	});
+
+	it("compares a lowercase slug credential loaded by this session", () => {
+		const collected = collectedFromEnv({ WEBHOOK_SECRET: SLUG_KEY });
+		expect(collected.map((entry) => entry.value)).toContain(SLUG_KEY);
+
+		const findings = findShareUploadSecretFindings(shareDocument(`secret: ${SLUG_KEY}`), {
+			secretValues: collected,
+		});
+		expect(findings.map((finding) => finding.type)).toContain("Configured credential");
+	});
+
+	it("compares a slash-heavy secret loaded by this session", () => {
+		const collected = collectedFromEnv({ CUSTOMER_API_KEY: SLASH_KEY });
+		expect(collected.map((entry) => entry.value)).toContain(SLASH_KEY);
+
+		const findings = findShareUploadSecretFindings(shareDocument(`token is ${SLASH_KEY} ok`), {
+			secretValues: collected,
+		});
+		expect(findings.map((finding) => finding.type)).toContain("Configured credential");
+	});
+
+	it("flags a bare slash-heavy secret that no session loaded", () => {
+		// Read out of somebody else's project and pasted into the chat: no session value to
+		// compare against, so only the shape scan can see it - and it must not read as a path.
+		const findings = findShareUploadSecretFindings(shareDocument(`customer pasted their key: ${SLASH_KEY}`), {
+			secretValues: [],
+		});
+		expect(findings.length).toBeGreaterThan(0);
+		expect(JSON.stringify(findings)).not.toContain(SLASH_KEY);
+	});
+
+	it("collects a passphrase-named credential", () => {
+		const collected = collectedFromEnv({ BACKUP_PASSPHRASE: "correct horse battery staple" });
+		expect(collected.map((entry) => entry.value)).toContain("correct horse battery staple");
+
+		const findings = findShareUploadSecretFindings(shareDocument("passphrase is correct horse battery staple ok"), {
+			secretValues: collected,
+		});
+		expect(findings.map((finding) => finding.type)).toContain("Configured credential");
+	});
+
+	it("keeps a value too short to be a credential out of the report but not out of the set", () => {
+		// `KEY=1` type values are compared (nothing loaded is dropped) and not reported: a
+		// one-character value is inside almost any export, and a warning on every share is a
+		// warning nobody reads.
+		const collected = collectedFromEnv({ SERVICE_KEY: "1" });
+		expect(collected.map((entry) => entry.value)).toContain("1");
+
+		const findings = findShareUploadSecretFindings(shareDocument("const answer = 1;"), {
+			secretValues: collected,
+		});
+		expect(findings).toEqual([]);
+	});
+
+	it("keeps a location-valued credential in the comparison set without reporting it on its own", () => {
+		// `GOOGLE_APPLICATION_CREDENTIALS` holds a path, and that path is all over an ordinary
+		// transcript. It stays in the compared set (a loaded value is never dropped) but is not
+		// reported by the exact comparison, so a share does not warn about a file name.
+		const path = "/etc/gcp/service-account.json";
+		const collected = collectedFromEnv({ GOOGLE_APPLICATION_CREDENTIALS: path });
+		expect(collected.map((entry) => entry.value)).toContain(path);
+
+		const findings = findShareUploadSecretFindings(shareDocument(`read ${path} first`), {
+			secretValues: collected,
+		});
+		expect(findings).toEqual([]);
+	});
+});
+
 describe("share preflight false positives stay under control", () => {
 	it("does not flag hashes, UUIDs, paths, identifiers or encapsulated blobs", () => {
 		const clean = [

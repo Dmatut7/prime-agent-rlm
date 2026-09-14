@@ -6,7 +6,10 @@
  * is only dangerous when it contains a value that this session is actually configured
  * with, and that comparison needs no shape at all. Every value collected here is compared
  * verbatim against the bytes of the export; a value that is present is reported (masked)
- * whatever it looks like.
+ * whatever it looks like. Nothing is dropped for looking implausible - an all-digit key, a
+ * lower-case slug and a passphrase are all compared like any other loaded value - and only a
+ * value that *names a location* (`GOOGLE_APPLICATION_CREDENTIALS`) is held back from being
+ * reported on its own.
  *
  * Sources, in the order they are consulted (first source wins for a duplicate value):
  *
@@ -23,13 +26,19 @@
 import { readFileSync } from "node:fs";
 import { getAgentDir } from "../config.js";
 import { resolveConfigValue } from "./resolve-config-value.js";
-import { isPlausibleSecretValue } from "./share-secret-detectors.js";
+import { isComparableSecretValue, isLocationValuedCredential } from "./share-secret-detectors.js";
 
 export interface ShareSecretValue {
 	/** The credential value itself. Only ever compared, never displayed. */
 	value: string;
 	/** Non-secret origin label, e.g. `env DASHSCOPE_API_KEY` or `models.json (bailian.apiKey)`. */
 	source: string;
+	/**
+	 * Compared, but never reported on its own: the value is a *location* (`GOOGLE_APPLICATION_CREDENTIALS`
+	 * pointing at a key file), and a transcript mentions those paths constantly. Absent on the
+	 * values that are reported, so a collected entry stays `{ value, source }`.
+	 */
+	compareOnly?: true;
 }
 
 export interface ShareSecretValueOptions {
@@ -41,7 +50,20 @@ export interface ShareSecretValueOptions {
 	agentDir?: string;
 }
 
-const CREDENTIAL_ENV_NAME = /[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)[A-Z0-9_]*/i;
+const CREDENTIAL_ENV_NAME = /[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|PASSCODE|CREDENTIAL)[A-Z0-9_]*/i;
+
+/**
+ * `PIN` only counts as a whole word: `DB_PIN` and `TOTP_PIN` hold a credential, while `PING`,
+ * `SHIPPING` and `TYPING` do not.
+ */
+const CREDENTIAL_ENV_WORD = /(?:^|_)PINS?(?:_|$)/;
+
+/**
+ * The shortest value a report line is worth: a one- or two-character loaded value matches the
+ * export by accident, and a warning about it is noise the reader learns to skip. It is still
+ * compared - the set is never narrowed - only the report is.
+ */
+const MIN_REPORTABLE_SECRET_LENGTH = 4;
 
 /**
  * Names that contain a credential word without holding a secret. Without this an ordinary
@@ -55,7 +77,7 @@ const CREDENTIAL_FIELD_NAME =
 	/(?:^|[._-])(?:key|token|secret|password|passwd|credential|access|refresh|assertion|code|headers?)$|(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|private[_-]?key)/i;
 
 function isCredentialEnvName(name: string): boolean {
-	return CREDENTIAL_ENV_NAME.test(name) && !BENIGN_ENV_NAME.test(name);
+	return (CREDENTIAL_ENV_NAME.test(name) || CREDENTIAL_ENV_WORD.test(name)) && !BENIGN_ENV_NAME.test(name);
 }
 
 function isCredentialFieldName(name: string): boolean {
@@ -110,8 +132,21 @@ export function collectConfiguredShareSecretValues(options: ShareSecretValueOpti
 		const resolved = source.startsWith("env ") ? raw : readConfigValue(raw);
 		if (resolved === undefined) return;
 		const value = resolved.trim();
-		if (!isPlausibleSecretValue(value) || collected.has(value)) return;
-		collected.set(value, { value, source });
+		// No plausibility filter: a value this session is configured with is compared verbatim
+		// whatever it looks like. Shape-driven filtering here is what let an all-digit key, a
+		// lower-case slug and a passphrase leave the machine unnoticed, and the comparison is the
+		// one check that is supposed to have no shape to hide behind. A value that names a
+		// location rather than a secret is still compared (never dropped) but is not reported on
+		// its own; see `ShareSecretValue.compareOnly`.
+		if (!isComparableSecretValue(value) || collected.has(value)) return;
+		// Reported unless the value names a location, or is shorter than any credential (a flag,
+		// a line number). Both stay in the compared set; only the report line is held back.
+		const compareOnly = isLocationValuedCredential(value) || value.length < MIN_REPORTABLE_SECRET_LENGTH;
+		collected.set(value, {
+			value,
+			source,
+			...(compareOnly ? { compareOnly: true as const } : {}),
+		});
 	};
 
 	const env = options.env ?? process.env;

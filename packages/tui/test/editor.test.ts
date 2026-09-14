@@ -3899,7 +3899,9 @@ describe("Editor component", () => {
 			});
 		}
 
-		it("keeps the draft and discards the buffer on Esc during unterminated paste", () => {
+		it("keeps the draft while an unterminated paste carrying a Kitty Esc is still open", () => {
+			// The paste state wins: the Kitty Esc is paste text inside the bracketed paste, so
+			// nothing is inserted yet and nothing is discarded either.
 			const editor = new Editor(createTestTUI(), defaultEditorTheme);
 			for (const ch of "hello") editor.handleInput(ch);
 			const stdin = new StdinBuffer({ timeout: 10 });
@@ -3909,23 +3911,41 @@ describe("Editor component", () => {
 			stdin.process("\x1b[27u");
 
 			assert.strictEqual(editor.getText(), "hello");
+			assert.strictEqual(stdin.isPasteMode(), true);
 		});
 
-		it("keeps the draft when Ctrl+C interrupts an unterminated paste", () => {
+		it("keeps Ctrl+C inside an unterminated paste, and no key leaves the paste", () => {
 			const editor = new Editor(createTestTUI(), defaultEditorTheme);
-			const interrupted: string[] = [];
+			const keyEvents: string[] = [];
 			for (const ch of "hello") editor.handleInput(ch);
 			const stdin = new StdinBuffer({ timeout: 10 });
 			attach(editor, stdin);
 			stdin.on("data", (sequence) => {
-				interrupted.push(sequence);
+				keyEvents.push(sequence);
 			});
 
 			stdin.process("\x1b[200~abc");
 			stdin.process("\x03");
 
 			assert.strictEqual(editor.getText(), "hello");
-			assert.ok(interrupted.includes("\x03"));
+			assert.deepStrictEqual(keyEvents, []);
+			assert.strictEqual(stdin.isPasteMode(), true);
+		});
+
+		it("inserts the paste once its stream goes quiet, and a later key is a key again", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const stdin = new StdinBuffer({ timeout: 10, pasteSettleMs: 1 });
+			attach(editor, stdin);
+
+			stdin.process("\x1b[200~abc\x1b[27u\x1b[201~");
+			await new Promise((resolve) => setTimeout(resolve, 10));
+
+			// The paste arrived as text; the editor's paste filter drops control bytes and keeps
+			// the printable tail, which is its own pre-existing sanitation.
+			assert.strictEqual(editor.getText(), "abc[27u");
+
+			stdin.process("x");
+			assert.strictEqual(editor.getText(), "abc[27ux");
 		});
 
 		it("does not apply a late 201~ after abortPendingInput", () => {

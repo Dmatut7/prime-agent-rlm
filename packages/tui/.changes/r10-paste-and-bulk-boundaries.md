@@ -1,0 +1,2 @@
+- Fixed a bracketed paste that carried a Kitty Esc sequence or Ctrl+C: the paste no longer ends early, so no byte of it can reach the key parser and none of the already buffered content is dropped.
+- Fixed bulk input losing up to 64 KiB when a slice boundary landed on a newline, and mangling an emoji split across a 64 KiB slice boundary.
