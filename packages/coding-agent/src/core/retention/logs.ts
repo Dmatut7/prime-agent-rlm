@@ -68,17 +68,16 @@ function currentUidSuffix(): string {
 }
 
 /**
- * Whether a live socket's *basename* is an active key as well as its hash
- * (the orchestrator's criterion list; in force).
+ * Whether a live socket's *basename* is an active key as well as its hash.
  *
- * Measured on this machine (`~/.prime/agent/logs`, 2167 shape-matching files,
- * `logFileDays = 14`): the live `.../prime-agent-<uid>/daemon.sock` makes the
- * basename key, however, matches all 1587 `daemon.sock.<hash>.log` files, so 1606
- * files stay unconditionally and only 166 are reclaimable. The shipped reading is
- * therefore hash-only (`false`): 742 of this machine's logs are reclaimable, 576
- * of them `daemon.sock.*` whose socket path no longer exists. Either reading keeps
- * every log whose own socket hash is live, so flipping the constant can only ever
- * reclaim more; the test that pins the current reading says so too.
+ * Measured on this machine (`~/.prime/agent/logs`, 1,426 shape-matching files,
+ * `logFileDays = 14`): the live `.../prime-agent-<uid>/daemon.sock` basename would
+ * match every `daemon.sock.<hash>.log` file, keeping 1,606 files unconditionally
+ * and reclaiming 166. The shipped reading is hash-only (`false`) - a basename key
+ * makes every stale log of a long-gone socket immortal, which is the class's whole
+ * point. Either reading keeps every log whose own socket hash is live (that is the
+ * design's criterion), so flipping the constant can only ever reclaim more; the
+ * test that pins the current reading says so too.
  */
 const BASENAME_KEY_IS_ACTIVE = false;
 
@@ -107,10 +106,36 @@ function socketKeysFor(socketPath: string): string[] {
  * Live sockets are discovered by shape, never by mtime: a resident daemon may
  * have stopped writing long ago, and a rotated log may have a brand-new mtime.
  */
-function collectActiveSocketKeys(tmpDir: string): Map<string, string> {
+export function collectActiveSocketKeys(tmpDir: string, agentDir?: string): Map<string, string> {
 	const keys = new Map<string, string>();
-	const directories = [tmpDir, join(tmpDir, `prime-agent-${currentUidSuffix()}`)];
+	const directories = [
+		tmpDir,
+		join(tmpDir, `prime-agent-${currentUidSuffix()}`),
+		// A daemon started with `--socket <path>` keeps its socket where the operator
+		// put it. The default agent dir and one level under it cover the layouts this
+		// repo creates; a socket outside both roots stays invisible here, which is the
+		// irreducible part of this class's criterion (adversarial review N-4) - the
+		// escape for an operator with a custom socket location is `logFileDays: 0`.
+		...(agentDir ? [agentDir] : []),
+	];
 	if (currentUidSuffix() !== "user") directories.push(join(tmpDir, "prime-agent-user"));
+	if (agentDir) {
+		let names: string[] = [];
+		try {
+			names = readdirSync(agentDir);
+		} catch {
+			names = [];
+		}
+		for (const name of names) {
+			if (!name.startsWith("daemon") && !name.startsWith("worker")) continue;
+			const candidate = join(agentDir, name);
+			try {
+				if (lstatSync(candidate).isDirectory()) directories.push(candidate);
+			} catch {
+				// Unreadable: it contributes no keys.
+			}
+		}
+	}
 	for (const directory of directories) {
 		let names: string[];
 		try {
@@ -210,7 +235,7 @@ async function scanAndReclaim(context: RetentionClassContext): Promise<Retention
 		};
 	}
 
-	const activeKeys = collectActiveSocketKeys(roots.tmpDir);
+	const activeKeys = collectActiveSocketKeys(roots.tmpDir, roots.agentDir);
 	// cooldownMinutes is a floor as well: a log touched seconds ago has a writer in flight.
 	const thresholdMs = Math.max(settings.logFileDays * MS_PER_DAY, settings.cooldownMinutes * MS_PER_MINUTE);
 	const groups = new Map<string, LogGroupMember[]>();

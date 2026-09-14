@@ -52,7 +52,14 @@ describe("session artifact tombstones", () => {
 		resetSessionArtifactTombstoneCache();
 		const tombstone = readSessionArtifactTombstones(artifactRoot).get("abc12345");
 		expect(tombstone?.deletedAt).toBe(new Date(0).toISOString());
-		expect(tombstoneInForce(tombstone, Date.parse(new Date(0).toISOString()))).toBe(true);
+		// Strictly older than the deletion: the directory is what the delete left.
+		expect(tombstoneInForce(tombstone, Date.parse(new Date(0).toISOString()) - 1)).toBe(true);
+		// Written in the same millisecond: a reused id whose first write raced the
+		// deletion record. "Cannot disprove reuse" keeps the directory (review N-7).
+		expect(tombstoneInForce(tombstone, Date.parse(new Date(0).toISOString()))).toBe(false);
+		expect(tombstoneInForce(tombstone, Date.parse(new Date(0).toISOString()) + 1)).toBe(false);
+		// No directory at all: nothing has been written since the deletion.
+		expect(tombstoneInForce(tombstone, undefined)).toBe(true);
 		clearSessionArtifactTombstone(artifactRoot, "abc12345");
 		resetSessionArtifactTombstoneCache();
 		expect(readSessionArtifactTombstones(artifactRoot).size).toBe(0);

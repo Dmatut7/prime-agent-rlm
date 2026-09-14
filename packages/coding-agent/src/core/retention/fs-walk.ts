@@ -5,8 +5,11 @@
 // where a real directory was expected reports `unverifiable` and the caller keeps
 // the candidate. Nothing in this module deletes.
 import type { Dirent } from "node:fs";
-import { lstatSync, readdirSync, realpathSync } from "node:fs";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { lstatSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+
+/** The one sidecar name that is not a session transcript. */
+const SEMANTIC_EDGES_FILE = "semantic-edges.jsonl";
 
 export interface TreeAggregate {
 	/** Regular-file bytes in the subtree, symlinks not followed. */
@@ -26,6 +29,13 @@ export interface TreeAggregate {
 	 * are content: a directory that holds one is not empty.
 	 */
 	symlinks: number;
+	/**
+	 * Session ids of the transcripts in the subtree (`<id>.jsonl`, excluding the
+	 * sidecar files a session directory also holds). A candidate that contains
+	 * another session's transcript must not be removed recursively: the transcript
+	 * belongs to a session whose liveness the candidate's own id says nothing about.
+	 */
+	transcriptIds: Set<string>;
 }
 
 /** Stat a path without following a final symlink; undefined when absent or unreadable. */
@@ -52,25 +62,6 @@ export function listDirectory(path: string): Dirent[] | undefined {
 }
 
 /**
- * `realpath` containment: a candidate must still be inside `root` after
- * resolution, and must not be a symlink. Mirrors the artifact-path check in
- * session-manager.ts - a sweep deletes directories and must never traverse one.
- */
-export function containedRealPath(root: string, candidate: string): string | undefined {
-	try {
-		const stats = lstatSync(candidate);
-		if (stats.isSymbolicLink()) return undefined;
-		const realRoot = realpathSync(root);
-		const realCandidate = realpathSync(candidate);
-		const rel = relative(realRoot, realCandidate);
-		if (rel.startsWith("..") || isAbsolute(rel)) return undefined;
-		return realCandidate;
-	} catch {
-		return undefined;
-	}
-}
-
-/**
  * Aggregate one subtree. `maxDepth` bounds the walk (a scan must not follow a
  * pathological layout forever); a walk that hits the bound reports `unreadable`
  * so the caller keeps the candidate instead of judging a partial tree.
@@ -86,6 +77,7 @@ export function aggregateTree(root: string, options: { maxDepth?: number; maxEnt
 		unreadable: false,
 		names: [],
 		symlinks: 0,
+		transcriptIds: new Set<string>(),
 	};
 	const rootStats = quietLstat(root);
 	if (!rootStats) {
@@ -133,17 +125,11 @@ export function aggregateTree(root: string, options: { maxDepth?: number; maxEnt
 				result.files += 1;
 				result.bytes += childStats.size;
 				result.newestMtimeMs = Math.max(result.newestMtimeMs, childStats.mtimeMs);
+				if (entry.name.endsWith(".jsonl") && entry.name !== SEMANTIC_EDGES_FILE && !entry.name.startsWith(".")) {
+					result.transcriptIds.add(entry.name.slice(0, -".jsonl".length));
+				}
 			}
 		}
 	}
 	return result;
-}
-
-/** Resolve a root once, for containment checks; falls back to the lexical path. */
-export function resolveRoot(path: string): string {
-	try {
-		return realpathSync(path);
-	} catch {
-		return resolve(path);
-	}
 }

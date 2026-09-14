@@ -109,6 +109,8 @@ export interface ResolvedRetentionSettings {
 	kernelSnapshotReclaimEnabled: boolean;
 	/** Retired kernel venv generations kept (mirrors RETIRED_VENV_RETENTION). */
 	venvRetention: number;
+	/** Whether the sweep may reclaim retired kernel venv generations. Off by default. */
+	venvReclaim: boolean;
 }
 
 /** Filesystem roots one sweep works on. Everything derived from a single agent dir. */

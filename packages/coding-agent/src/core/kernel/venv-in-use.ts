@@ -326,7 +326,10 @@ function referenceIsLive(record: ReferenceRecord): boolean {
 }
 
 /** Live references of one generation, sweeping provably stale entries. */
-export async function readKernelVenvInUseState(venvDir: string): Promise<KernelVenvInUseState> {
+export async function readKernelVenvInUseState(
+	venvDir: string,
+	options: { sweepStale?: boolean } = {},
+): Promise<KernelVenvInUseState> {
 	const dir = path.join(venvDir, VENV_IN_USE_DIR_NAME);
 	let entries: string[];
 	try {
@@ -360,11 +363,16 @@ export async function readKernelVenvInUseState(venvDir: string): Promise<KernelV
 		const record = readReferenceRecord(referencePath);
 		const stale = record === undefined || Number(pidName) !== record.pid || !referenceIsLive(record);
 		if (stale) {
-			try {
-				await rm(referencePath, { force: true });
-				swept.push(referencePath);
-			} catch {
-				// Left for the next sweep; it is not counted as a reference either.
+			// `sweepStale: false` is the read-only mode: a dry run must not change the
+			// filesystem, and removing another process's reference is a change
+			// (adversarial review N-2). The stale file is simply not counted.
+			if (options.sweepStale !== false) {
+				try {
+					await rm(referencePath, { force: true });
+					swept.push(referencePath);
+				} catch {
+					// Left for the next sweep; it is not counted as a reference either.
+				}
 			}
 			continue;
 		}
@@ -546,14 +554,18 @@ async function generationBytes(dir: string): Promise<number> {
  */
 export async function planKernelVenvGenerationReclaim(
 	base: string,
-	options: { activeDir?: string; retention?: number } = {},
+	options: { activeDir?: string; retention?: number; sweepStale?: boolean } = {},
 ): Promise<KernelVenvReclaimPlan> {
 	const retention = Math.max(0, options.retention ?? RETIRED_VENV_RETENTION);
 	const candidates = (await listKernelVenvGenerations(base)).filter((dir) => dir !== options.activeDir);
 	const kept: KernelVenvPruneReport["kept"] = [];
 	const unreferenced: { dir: string; recencyMs: number }[] = [];
 	for (const dir of candidates) {
-		const state = await readKernelVenvInUseState(dir);
+		// `sweepStale: false` keeps a read-only caller (a dry run) from removing
+		// another process's reference file (adversarial review N-2).
+		const state = await readKernelVenvInUseState(dir, {
+			...(options.sweepStale !== undefined ? { sweepStale: options.sweepStale } : {}),
+		});
 		const pendingBoots = state.bootClaims.length;
 		if (state.unknown || state.references.length > 0) {
 			kept.push({

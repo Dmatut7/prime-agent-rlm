@@ -439,3 +439,157 @@ describe("retention sweep - kernel snapshot generations (red test R-0/R-15)", ()
 		expect(existsSync(join(generations, "20260101T000000-aaaaaa.dill"))).toBe(true);
 	});
 });
+
+describe("retention sweep - a kept descendant protects every ancestor (review F-1)", () => {
+	function nestedFixture(f: Fixture) {
+		const parentId = "11111111-1111-7111-8111-111111111111";
+		const childId = "22222222-2222-7222-8222-222222222222";
+		const grandchildId = "33333333-3333-7333-8333-333333333333";
+		sessionFile(f.agentDir, parentId);
+		const parentArtifact = join(f.artifactRoot, parentId);
+		mkdirSync(join(parentArtifact, "sub-cccc0001"), { recursive: true });
+		writeFileSync(join(parentArtifact, "sub-cccc0001", `${childId}.jsonl`), '{"type":"session"}\n');
+		const childArtifact = join(parentArtifact, "session-artifacts", childId);
+		mkdirSync(join(childArtifact, "sub-gggg0002"), { recursive: true });
+		writeFileSync(join(childArtifact, "sub-gggg0002", `${grandchildId}.jsonl`), '{"type":"session"}\n');
+		const grandchildArtifact = join(childArtifact, "session-artifacts", grandchildId);
+		mkdirSync(grandchildArtifact, { recursive: true });
+		writeFileSync(join(grandchildArtifact, "kernel-state.dill"), "LIVE KERNEL SNAPSHOT");
+		writeFileSync(join(childArtifact, "semantic-edges.jsonl"), '{"e":1}\n');
+		// The child is on record as deleted; the grandchild is live (a resident session).
+		const ledgerPath = join(f.roots.agentDir, "rlm-ledger", "ledger.jsonl");
+		writeFileSync(
+			ledgerPath,
+			`${JSON.stringify({ v: 1, op: "spawn", childId: "sub-cccc0001", child: join(parentArtifact, "sub-cccc0001", `${childId}.jsonl`) })}\n` +
+				`${JSON.stringify({ v: 1, op: "delete", childId: "sub-cccc0001", child: join(parentArtifact, "sub-cccc0001", `${childId}.jsonl`) })}\n` +
+				`${JSON.stringify({ v: 1, op: "spawn", childId: "sub-gggg0002", child: join(childArtifact, "sub-gggg0002", `${grandchildId}.jsonl`) })}\n`,
+		);
+		ageTree(childArtifact, 30 * DAY_MS);
+		return { parentArtifact, childArtifact, grandchildArtifact, grandchildId };
+	}
+
+	it("never removes an ancestor of a transcript that is not on record as deleted", async () => {
+		const f = fixture();
+		const { childArtifact, grandchildArtifact } = nestedFixture(f);
+		const report = await runRetentionSweep({ settings: resolveRetentionSettings({}), roots: f.roots });
+		expect(existsSync(childArtifact)).toBe(true);
+		expect(existsSync(grandchildArtifact)).toBe(true);
+		expect(existsSync(join(grandchildArtifact, "kernel-state.dill"))).toBe(true);
+		expect(existsSync(join(childArtifact, "sub-gggg0002", "33333333-3333-7333-8333-333333333333.jsonl"))).toBe(true);
+		const blocker = allSkipped(report).find((entry) => entry.path === childArtifact);
+		expect(blocker?.reason).toMatch(/^reference:(protected-descendant|descendant-transcript:)/);
+	});
+
+	it("keeps an ancestor of a resident grandchild with no ledger record at all", async () => {
+		const f = fixture();
+		const { childArtifact } = nestedFixture(f);
+		// Drop the ledger: the only evidence left is the live grandchild's transcript.
+		rmSync(join(f.roots.agentDir, "rlm-ledger"), { recursive: true, force: true });
+		const report = await runRetentionSweep({
+			settings: resolveRetentionSettings({}),
+			roots: f.roots,
+		});
+		expect(existsSync(childArtifact)).toBe(true);
+		const blocker = allSkipped(report).find((entry) => entry.path === childArtifact);
+		expect(blocker?.reason).toMatch(/^reference:/);
+	});
+
+	it("still reclaims a deleted child with no live descendants (positive control)", async () => {
+		const f = fixture();
+		const parentId = "44444444-4444-7444-8444-444444444444";
+		const childId = "55555555-5555-7555-8555-555555555555";
+		sessionFile(f.agentDir, parentId);
+		const parentArtifact = join(f.artifactRoot, parentId);
+		mkdirSync(parentArtifact, { recursive: true });
+		const childArtifact = join(parentArtifact, "session-artifacts", childId);
+		mkdirSync(childArtifact, { recursive: true });
+		writeFileSync(join(childArtifact, "semantic-edges.jsonl"), '{"e":1}\n');
+		const transcript = join(parentArtifact, "sub-dead0001", `${childId}.jsonl`);
+		mkdirSync(join(parentArtifact, "sub-dead0001"), { recursive: true });
+		writeFileSync(
+			join(f.roots.agentDir, "rlm-ledger", "ledger.jsonl"),
+			`${JSON.stringify({ v: 1, op: "delete", childId: "sub-dead0001", child: transcript })}\n`,
+		);
+		ageTree(childArtifact, 30 * DAY_MS);
+
+		const report = await runRetentionSweep({ settings: resolveRetentionSettings({}), roots: f.roots });
+		expect(existsSync(childArtifact)).toBe(false);
+		expect(classResult(report, "artifact-residue-dirs").reclaimed).toBe(1);
+	});
+});
+
+describe("retention sweep - circuit breaker and read-only dry run (review N-1/N-2)", () => {
+	it("refuses a candidate larger than the budget left instead of overshooting it", async () => {
+		const f = fixture();
+		const id = "a1000000-8888-7888-8888-a10000000000";
+		const artifact = join(f.artifactRoot, id);
+		mkdirSync(artifact, { recursive: true });
+		writeFileSync(join(artifact, "kernel-state.json"), "x".repeat(4096));
+		recordSessionArtifactTombstone(f.artifactRoot, id, { now: new Date(Date.now() - 20 * DAY_MS) });
+		ageTree(artifact, 30 * DAY_MS);
+
+		const report = await runRetentionSweep({
+			settings: resolveRetentionSettings({ maxDeleteBytesPerSweep: 1024 }),
+			roots: f.roots,
+		});
+		expect(report.totals.reclaimed).toBe(0);
+		expect(report.capped).toBe(true);
+		expect(existsSync(artifact)).toBe(true);
+		const capped = allSkipped(report).find((entry) => entry.path === artifact);
+		expect(capped?.reason).toBe("cap-hit");
+		// The class is then reported as stalled instead of silently overshooting.
+		const stalled = classResult(report, "artifact-residue-dirs");
+		expect(stalled.capped).toBe(true);
+	});
+
+	it("does not touch stale reference files during a dry run", async () => {
+		const f = fixture();
+		const artifact = join(f.artifactRoot, "a2000000-8888-7888-8888-a20000000000");
+		const generations = join(artifact, "kernel-state");
+		mkdirSync(join(generations, ".in-use"), { recursive: true });
+		writeFileSync(join(generations, "20260101T000000-aaaaaa.dill"), "payload");
+		writeFileSync(join(generations, "20260102T000000-bbbbbb.dill"), "payload");
+		// A reference whose holder is long gone.
+		const staleReference = join(generations, ".in-use", "999999.json");
+		writeFileSync(staleReference, JSON.stringify({ version: 1, pid: 999999 }));
+
+		const report = await runRetentionSweep({
+			settings: resolveRetentionSettings({ kernelSnapshotReclaimEnabled: true }),
+			roots: f.roots,
+			forceDryRun: true,
+		});
+		expect(report.dryRun).toBe(true);
+		expect(existsSync(staleReference)).toBe(true);
+		expect(existsSync(join(generations, "20260101T000000-aaaaaa.dill"))).toBe(true);
+	});
+
+	it("offers the retired venv generations as report-only by default (review F-2)", async () => {
+		const f = fixture();
+		const base = join(f.root, "kernel-venv");
+		mkdirSync(base, { recursive: true });
+		const active = `${base}-aaaaaaaaaaaa`;
+		const newer = `${base}-bbbbbbbbbbbb`;
+		for (const dir of [active, newer]) {
+			mkdirSync(join(dir, "lib"), { recursive: true });
+			writeFileSync(join(dir, "lib", "payload.bin"), "x".repeat(1024));
+		}
+		const past = new Date(Date.now() - 5 * DAY_MS);
+		utimesSync(join(active, "lib"), past, past);
+		utimesSync(active, past, past);
+		utimesSync(join(newer, "lib"), past, past);
+		utimesSync(newer, past, past);
+
+		const off = await runRetentionSweep({ settings: resolveRetentionSettings({}), roots: f.roots });
+		const offResult = classResult(off, "kernel-venv-generations");
+		expect(offResult.disabled).toBe(true);
+		expect(offResult.reclaimed).toBe(0);
+		expect(existsSync(active)).toBe(true);
+		expect(existsSync(newer)).toBe(true);
+
+		// Even switched on, the newest generation is never a candidate.
+		const on = await runRetentionSweep({ settings: resolveRetentionSettings({ venvReclaim: true }), roots: f.roots });
+		expect(classResult(on, "kernel-venv-generations").reclaimed).toBe(1);
+		expect(existsSync(newer)).toBe(true);
+		expect(existsSync(active)).toBe(false);
+	});
+});

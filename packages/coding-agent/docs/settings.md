@@ -437,6 +437,7 @@ with one compact line per sweep appended to `<agentDir>/retention/history.jsonl`
 | `retention.kernelSnapshotGenerations` | number | `1` | Retired kernel snapshot generations kept after the referenced ones |
 | `retention.kernelSnapshotReclaimEnabled` | boolean | `false` | Reclaim unreferenced kernel snapshot generations. Off: the snapshot bytes ride live references, and the writer still uses the single-file layout |
 | `retention.venvRetention` | number | `1` | Retired kernel venv generations kept (the boot path's `RETIRED_VENV_RETENTION`) |
+| `retention.venvReclaim` | boolean | `false` | Let the sweep reclaim retired kernel venv generations. Off: the sweep reports what the boot path would prune, and only `bootstrap.ts` prunes for real, because it can name the generation it is about to spawn from while a sweep cannot |
 
 The reclaim judgements share one law, borrowed from the kernel venv generation manager: a path whose
 liveness cannot be **disproved** is kept. A probe that fails, a directory whose transcript is missing

@@ -20,7 +20,7 @@
 import { join, resolve } from "node:path";
 import { readSessionArtifactTombstones, tombstoneInForce } from "../session-artifact-tombstones.js";
 import { isValidSessionId } from "../session-id.js";
-import { RETENTION_TRASH_PREFIX, reclaimWithinBudget } from "./delete.js";
+import { RETENTION_TRASH_PREFIX, reclaimWithinBudget, statSignature } from "./delete.js";
 import { aggregateTree, listDirectory, quietLstat, type TreeAggregate } from "./fs-walk.js";
 import { readKernelSnapshotGenerationState } from "./kernel-snapshot.js";
 import {
@@ -50,6 +50,13 @@ export interface ArtifactCandidate {
 	ledgerLive: boolean;
 	resident: boolean;
 	transcriptRoot?: string;
+}
+
+/** Judged candidate set of one artifact class. */
+export interface ArtifactPlan {
+	scanned: number;
+	requests: { path: string; kind: "dir" | "file"; bytes: number; entries: number; signature?: string }[];
+	skipped: RetentionSkip[];
 }
 
 export interface ArtifactScan {
@@ -155,7 +162,8 @@ function buildCandidate(
 	const tree = aggregateTree(path, { maxDepth: MAX_WALK_DEPTH });
 	const tombstones = readSessionArtifactTombstones(root);
 	const tombstone = tombstones.get(sessionId);
-	const snapshotState = readKernelSnapshotGenerationState(path);
+	// `sweepStale` is off for a dry run: dropping a stale reference is a write (review N-2).
+	const snapshotState = readKernelSnapshotGenerationState(path, { sweepStale: !context.dryRun });
 	const ledgerLive = context.live.ledgerLiveChildIds?.has(sessionId) === true;
 	const ledgerDeleted = context.live.ledgerDeletedChildIds?.has(sessionId) === true;
 	const resident =
@@ -267,15 +275,117 @@ function result(
 }
 
 /** Directories with no file anywhere in the subtree (round-08 S1 leftovers). */
+/**
+ * The candidate set a class may delete, with the two guards that make a recursive
+ * remove safe:
+ *
+ *  1. a candidate is kept when **any nested candidate is kept** - deleting an
+ *     ancestor takes its descendants with it, so "the child is protected" has to
+ *     protect the parent too;
+ *  2. a candidate is kept when the subtree holds **another session's transcript**
+ *     that is not on record as deleted - a live sub-session's transcript lives in
+ *     `<parentArtifactDir>/sub-xxxxxxxx/<uuid>.jsonl`, and a live session with no
+ *     artifact directory of its own is invisible to the candidate set.
+ *
+ * Without these, one sweep can write `in-use:resident` for a grandchild in its own
+ * report and delete that path in the same pass (adversarial review F-1).
+ */
+function planArtifactDirs(context: RetentionClassContext, mode: "empty" | "residue"): ArtifactPlan {
+	const days = mode === "empty" ? context.settings.emptyArtifactDirDays : context.settings.deletedSessionResidueDays;
+	const scan = scanArtifactTree(context);
+	const plan: ArtifactPlan = { scanned: scan.candidates.length, requests: [], skipped: [] };
+	if (days <= 0) return plan;
+	const holdsContent = (candidate: ArtifactCandidate): boolean =>
+		candidate.tree.files > 0 || candidate.tree.symlinks > 0;
+	const mine = scan.candidates.filter((candidate) =>
+		mode === "empty" ? !holdsContent(candidate) : holdsContent(candidate),
+	);
+	const decision = new Map<string, RetentionSkip | "reclaim">();
+	for (const candidate of mine) {
+		const protection =
+			mode === "empty"
+				? protectionReason(candidate, { tombstoneMatters: false })
+				: protectionReason(candidate, { requireDeletionEvidence: true });
+		if (protection) {
+			decision.set(candidate.path, protection);
+			continue;
+		}
+		const young = ageReason(candidate, context.now, days);
+		if (young) {
+			decision.set(candidate.path, young);
+			continue;
+		}
+		decision.set(candidate.path, "reclaim");
+	}
+	// Keep-as-a-whole fixpoint: a kept descendant keeps every ancestor of itself.
+	for (let round = 0; round < mine.length + 1; round++) {
+		let changed = false;
+		for (const candidate of mine) {
+			if (decision.get(candidate.path) !== "reclaim") continue;
+			const blocker = descendantBlocker(candidate, mine, decision, context);
+			if (blocker) {
+				decision.set(candidate.path, blocker);
+				changed = true;
+			}
+		}
+		if (!changed) break;
+	}
+	for (const candidate of mine) {
+		const verdict = decision.get(candidate.path);
+		if (verdict === "reclaim") {
+			const signature = statSignature(candidate.path);
+			plan.requests.push({
+				path: candidate.path,
+				kind: "dir",
+				bytes: candidate.tree.bytes,
+				entries: Math.max(1, candidate.tree.entries),
+				...(signature ? { signature } : {}),
+			});
+			continue;
+		}
+		if (verdict) plan.skipped.push(verdict);
+	}
+	return plan;
+}
+
+/**
+ * Why a candidate may not be removed even though its own evidence allows it: a
+ * kept nested candidate, or a transcript in its subtree whose session is not on
+ * record as deleted.
+ */
+function descendantBlocker(
+	candidate: ArtifactCandidate,
+	candidates: readonly ArtifactCandidate[],
+	decision: ReadonlyMap<string, RetentionSkip | "reclaim">,
+	context: RetentionClassContext,
+): RetentionSkip | undefined {
+	const prefix = `${candidate.path}/`;
+	for (const other of candidates) {
+		if (other.path === candidate.path || !other.path.startsWith(prefix)) continue;
+		if (decision.get(other.path) !== "reclaim") {
+			return {
+				path: candidate.path,
+				reason: SKIP.reference("protected-descendant"),
+				detail: `${other.path} is kept`,
+			};
+		}
+	}
+	for (const id of candidate.tree.transcriptIds) {
+		if (context.live.ledgerDeletedChildIds?.has(id)) continue;
+		return { path: candidate.path, reason: SKIP.reference(`descendant-transcript:${id}`) };
+	}
+	return undefined;
+}
+
+/** Directories with no file anywhere in the subtree (round-08 S1 leftovers). */
 export const artifactEmptyDirsModule: RetentionClassModule = {
 	id: "artifact-empty-dirs",
 	async scanAndReclaim(context: RetentionClassContext): Promise<RetentionClassResult> {
-		const days = context.settings.emptyArtifactDirDays;
-		const scan = scanArtifactTree(context);
-		if (days <= 0) {
+		const plan = planArtifactDirs(context, "empty");
+		if (context.settings.emptyArtifactDirDays <= 0) {
 			return {
 				class: "artifact-empty-dirs",
-				scanned: scan.candidates.length,
+				scanned: plan.scanned,
 				reclaimed: 0,
 				bytes: 0,
 				skipped: [],
@@ -283,47 +393,26 @@ export const artifactEmptyDirsModule: RetentionClassModule = {
 				disabled: true,
 			};
 		}
-		const skipped: RetentionSkip[] = [];
-		const requests = [];
-		for (const candidate of scan.candidates) {
-			if (candidate.tree.files > 0 || candidate.tree.symlinks > 0) {
-				// Not ours: the residue class judges directories that hold content. A
-				// symlink is content this class must not silently remove.
-				continue;
-			}
-			const protection = protectionReason(candidate, { tombstoneMatters: false });
-			if (protection) {
-				skipped.push(protection);
-				continue;
-			}
-			const young = ageReason(candidate, context.now, days);
-			if (young) {
-				skipped.push(young);
-				continue;
-			}
-			requests.push({
-				path: candidate.path,
-				kind: "dir" as const,
-				bytes: candidate.tree.bytes,
-				entries: Math.max(1, candidate.tree.entries),
-			});
-		}
-		// Our own crashed-delete leftovers are always reclaimable, whatever their age.
-		for (const trash of scan.trash) {
+		// Our own crashed-delete leftovers are reclaimed by the sweep's own class; a
+		// trash entry next to an artifact root is removed by this class as well.
+		const requests = [...plan.requests];
+		for (const trash of scanArtifactTree(context).trash) {
 			const stats = quietLstat(trash);
+			const signature = statSignature(trash);
 			requests.push({
 				path: trash,
-				kind: stats?.isDirectory() ? ("dir" as const) : ("file" as const),
+				kind: stats?.isDirectory() ? "dir" : "file",
 				bytes: 0,
 				entries: 1,
+				...(signature ? { signature } : {}),
 			});
 		}
 		const outcome = await reclaimWithinBudget(context, requests);
 		return result(
 			"artifact-empty-dirs",
-			scan.candidates.length + scan.trash.length,
+			plan.scanned + requests.length - plan.requests.length,
 			requests,
-			skipped,
+			plan.skipped,
 			outcome,
 			false,
 		);
@@ -331,21 +420,21 @@ export const artifactEmptyDirsModule: RetentionClassModule = {
 };
 
 /**
- * Leftovers of a session that is provably gone: no transcript in any root, no
- * live kernel reference, not resident or leased, and nothing written into the
- * directory for the residue window. A live session writes into its artifact
- * directory on every turn, so a quiet directory with no transcript anywhere is
- * residue - and if any of the evidence is missing the directory is kept.
+ * Leftovers of a session that is provably gone: a deletion record (a tombstone
+ * still in force, or a ledger delete for that child), no live kernel reference,
+ * not resident or leased, and nothing written into the directory inside the
+ * window. A live session writes into its artifact directory on every turn, so a
+ * quiet directory is residue - and if any piece of evidence is missing, or if
+ * anything inside the directory is still protected, the directory is kept.
  */
 export const artifactResidueModule: RetentionClassModule = {
 	id: "artifact-residue-dirs",
 	async scanAndReclaim(context: RetentionClassContext): Promise<RetentionClassResult> {
-		const days = context.settings.deletedSessionResidueDays;
-		const scan = scanArtifactTree(context);
-		if (days <= 0) {
+		const plan = planArtifactDirs(context, "residue");
+		if (context.settings.deletedSessionResidueDays <= 0) {
 			return {
 				class: "artifact-residue-dirs",
-				scanned: scan.candidates.length,
+				scanned: plan.scanned,
 				reclaimed: 0,
 				bytes: 0,
 				skipped: [],
@@ -353,30 +442,7 @@ export const artifactResidueModule: RetentionClassModule = {
 				disabled: true,
 			};
 		}
-		const skipped: RetentionSkip[] = [];
-		for (const candidate of scan.candidates) {
-			if (candidate.tree.files === 0 && candidate.tree.symlinks === 0) continue;
-			const protection = protectionReason(candidate, { requireDeletionEvidence: true });
-			if (protection) {
-				skipped.push(protection);
-				continue;
-			}
-			const young = ageReason(candidate, context.now, days);
-			if (young) {
-				skipped.push(young);
-			}
-		}
-		const requests = scan.candidates
-			.filter((candidate) => candidate.tree.files > 0 || candidate.tree.symlinks > 0)
-			.filter((candidate) => protectionReason(candidate, { requireDeletionEvidence: true }) === undefined)
-			.filter((candidate) => ageReason(candidate, context.now, days) === undefined)
-			.map((candidate) => ({
-				path: candidate.path,
-				kind: "dir" as const,
-				bytes: candidate.tree.bytes,
-				entries: Math.max(1, candidate.tree.entries),
-			}));
-		const outcome = await reclaimWithinBudget(context, requests);
-		return result("artifact-residue-dirs", scan.candidates.length, requests, skipped, outcome, false);
+		const outcome = await reclaimWithinBudget(context, plan.requests);
+		return result("artifact-residue-dirs", plan.scanned, plan.requests, plan.skipped, outcome, false);
 	},
 };
