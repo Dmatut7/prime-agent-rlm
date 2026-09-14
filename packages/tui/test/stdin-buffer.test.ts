@@ -86,6 +86,39 @@ describe("StdinBuffer", () => {
 		});
 	});
 
+	describe("Bulk slice boundaries", () => {
+		it("never starts a bulk slice with a newline", () => {
+			// A newline exactly at the 64 KiB slice boundary used to lead the second slice, and a
+			// consumer that reads a sequence starting with a control byte as a key - or drops it -
+			// lost the whole 64 KiB tail of the paste.
+			const run = `${"a".repeat(BULK_TEXT_MAX_SEQUENCE)}\n${"b".repeat(BULK_TEXT_MAX_SEQUENCE)}`;
+			processInput(run);
+
+			const leadingNewline = emittedSequences.filter(
+				(sequence) => sequence.length >= 32 && sequence.startsWith("\n"),
+			);
+			assert.deepStrictEqual(leadingNewline, []);
+			assert.strictEqual(emittedSequences.join(""), run);
+		});
+
+		it("never splits a surrogate pair at a bulk slice boundary", () => {
+			const run = `${"a".repeat(BULK_TEXT_MAX_SEQUENCE - 1)}😀${"c".repeat(100)}`;
+			processInput(run);
+
+			const bulk = emittedSequences.filter((sequence) => sequence.length >= 32);
+			assert.ok(bulk.length >= 2, "the run is delivered as bulk slices");
+			// No character is lost, and the pair reaches the consumer whole inside one slice.
+			assert.strictEqual(bulk.join(""), run);
+			assert.ok(bulk.join("").includes("\u{1F600}"));
+			for (const sequence of bulk) {
+				const head = sequence.charCodeAt(0);
+				const tail = sequence.charCodeAt(sequence.length - 1);
+				assert.ok(!(tail >= 0xd800 && tail <= 0xdbff), "a slice must not end on a lone high surrogate");
+				assert.ok(!(head >= 0xdc00 && head <= 0xdfff), "a slice must not start on a lone low surrogate");
+			}
+		});
+	});
+
 	describe("Complete Escape Sequences", () => {
 		it("should pass through complete mouse SGR sequences", () => {
 			const mouseSeq = "\x1b[<35;20;5m";
@@ -612,10 +645,26 @@ describe("StdinBuffer", () => {
 			assert.strictEqual(emittedSequences.join(""), text);
 		});
 
-		it("keeps a Kitty Esc inside an unterminated paste as paste text", async () => {
-			// A paste carries raw bytes: a clipboard holding a complete Kitty Esc must
-			// not abort the paste or reach the key path. The paste still closes on its
-			// own idle timeout, as one paste event.
+		it("keeps a Kitty Esc inside a paste as paste text", async () => {
+			// Content bytes and protocol bytes are indistinguishable inside a paste, so the paste
+			// state wins: a clipboard that carries a Kitty Esc shape is text, not the Esc key.
+			processInput("\x1b[200~hello");
+			processInput("\x1b[27u");
+
+			assert.strictEqual(buffer.isPasteMode(), true);
+			assert.deepStrictEqual(emittedSequences, []);
+
+			processInput("\x1b[201~");
+			await waitForPasteSettle();
+
+			assert.deepStrictEqual(emittedPaste, ["hello\x1b[27u"]);
+			assert.deepStrictEqual(emittedSequences, []);
+			assert.strictEqual(buffer.isPasteMode(), false);
+		});
+
+		it("keeps a Kitty Esc in a paste that never terminates and closes it on the idle watchdog", async () => {
+			// The watchdog is the other way out of a paste whose end marker never arrives; a
+			// Kitty-shaped sequence must not change that, and it is text when the watchdog fires.
 			buffer = new StdinBuffer({ timeout: 10, pasteTimeoutMs: 25 });
 			emittedSequences = [];
 			emittedPaste = [];
@@ -646,66 +695,6 @@ describe("StdinBuffer", () => {
 			assert.deepStrictEqual(emittedSequences, ["q"]);
 		});
 
-		it("keeps a Kitty Esc inside a terminated paste as paste text", async () => {
-			processInput("\x1b[200~hello");
-			processInput("\x1b[27ux");
-
-			assert.strictEqual(buffer.isPasteMode(), true);
-			assert.deepStrictEqual(emittedPaste, []);
-			assert.deepStrictEqual(emittedSequences, []);
-
-			processInput("\x1b[201~");
-			await waitForPasteSettle();
-
-			assert.deepStrictEqual(emittedPaste, ["hello\x1b[27ux"]);
-			assert.deepStrictEqual(emittedSequences, []);
-		});
-
-		it("keeps a paste containing a complete Kitty Esc and a key-looking CSI as one paste", async () => {
-			// Reported injection shape for the Kitty channel: the content holds a
-			// complete Kitty Esc followed by bytes that would run as ctrl+right.
-			buffer = new StdinBuffer({ timeout: 10, pasteSettleMs: 1 });
-			emittedSequences = [];
-			emittedPaste = [];
-			buffer.on("data", (sequence) => {
-				emittedSequences.push(sequence);
-			});
-			buffer.on("paste", (data) => {
-				emittedPaste.push(data);
-			});
-
-			const content = "abc\x1b[27u\x1b[1;5Ctail";
-			processInput(`\x1b[200~${content}\x1b[201~`);
-			await wait(5);
-
-			assert.deepStrictEqual(emittedPaste, [content]);
-			assert.deepStrictEqual(emittedSequences, []);
-		});
-
-		it("keeps a Kitty Esc as paste text at every chunk boundary", async () => {
-			const input = "\x1b[200~hello\x1b[27;1ux\x1b[1;5C\x1b[201~";
-			buffer = new StdinBuffer({ timeout: 10, pasteSettleMs: 1 });
-			emittedSequences = [];
-			emittedPaste = [];
-			buffer.on("data", (sequence) => {
-				emittedSequences.push(sequence);
-			});
-			buffer.on("paste", (data) => {
-				emittedPaste.push(data);
-			});
-
-			for (let split = 1; split < input.length; split++) {
-				buffer.clear();
-				emittedSequences.length = 0;
-				emittedPaste.length = 0;
-				processInput(input.slice(0, split));
-				processInput(input.slice(split));
-				await wait(5);
-				assert.deepStrictEqual(emittedPaste, ["hello\x1b[27;1ux\x1b[1;5C"], `split at ${split}`);
-				assert.deepStrictEqual(emittedSequences, [], `split at ${split}`);
-			}
-		});
-
 		it("still completes paste when 201~ arrives split after a lone ESC", async () => {
 			processInput("\x1b[200~hello");
 			processInput("\x1b");
@@ -717,7 +706,10 @@ describe("StdinBuffer", () => {
 			assert.deepStrictEqual(emittedSequences, []);
 		});
 
-		it("discards paste and forwards Ctrl+C as interrupt", () => {
+		it("interrupts a paste on Ctrl+C instead of keeping it as paste text", () => {
+			// Ruling: every other control byte inside a paste is paste text, but Ctrl+C stays the
+			// user's own interrupt - the one way out of a paste whose end marker never arrives.
+			// The bytes already buffered are dropped rather than inserted.
 			processInput("\x1b[200~hello");
 			processInput("\x03");
 
@@ -727,6 +719,25 @@ describe("StdinBuffer", () => {
 
 			processInput("x");
 			assert.deepStrictEqual(emittedSequences, ["\x03", "x"]);
+		});
+
+		it("an 0x03 in the chunk that opens the paste is still paste text", async () => {
+			// Boundary of the escape hatch, pinned so it is a decision and not an accident: the
+			// interrupt is recognized while paste mode is already on, so an 0x03 that arrives with
+			// the opening marker and the content in one chunk is content. That chunk is a paste
+			// still arriving rather than a stuck paste, and treating it as an interrupt would hand
+			// the rest of the chunk to the key parser - the path this file exists to keep shut.
+			processInput("\x1b[200~hello\x03world");
+
+			assert.strictEqual(buffer.isPasteMode(), true);
+			assert.deepStrictEqual(emittedSequences, []);
+			assert.deepStrictEqual(emittedPaste, []);
+
+			processInput("\x1b[201~");
+			await waitForPasteSettle();
+
+			assert.deepStrictEqual(emittedPaste, ["hello\x03world"]);
+			assert.deepStrictEqual(emittedSequences, []);
 		});
 
 		it("aborts in-flight paste so a later 201~ does not emit into the new session", () => {
@@ -740,6 +751,35 @@ describe("StdinBuffer", () => {
 			assert.deepStrictEqual(emittedPaste, []);
 			processInput("x");
 			assert.ok(emittedSequences.includes("x"));
+		});
+
+		it("keeps bytes after a Kitty Esc in the same paste chunk", async () => {
+			processInput("\x1b[200~BEFORE\x1b[27;5u\rAFTER\x1b[201~");
+
+			await waitForPasteSettle();
+
+			assert.deepStrictEqual(emittedPaste, ["BEFORE\x1b[27;5u\rAFTER"]);
+			assert.deepStrictEqual(emittedSequences, []);
+		});
+
+		it("keeps a Kitty Esc sequence split across chunks inside the paste", async () => {
+			processInput("\x1b[200~hello");
+			processInput("\x1b[27");
+			assert.strictEqual(buffer.isPasteMode(), true);
+			assert.deepStrictEqual(emittedPaste, []);
+
+			processInput("u");
+			assert.strictEqual(buffer.isPasteMode(), true);
+			assert.deepStrictEqual(emittedSequences, []);
+
+			processInput("tail\x1b[201~");
+			await waitForPasteSettle();
+
+			assert.deepStrictEqual(emittedPaste, ["hello\x1b[27utail"]);
+			assert.deepStrictEqual(emittedSequences, []);
+
+			processInput("x");
+			assert.deepStrictEqual(emittedSequences, ["x"]);
 		});
 
 		it("does not discard ANSI color codes in an unterminated paste", async () => {
@@ -822,6 +862,71 @@ describe("StdinBuffer", () => {
 				assert.deepStrictEqual(emittedPaste, ["abc\x1b[201~\x1b[1;5Ctail"], `split at ${split}`);
 				assert.deepStrictEqual(emittedSequences, [], `split at ${split}`);
 			}
+		});
+
+		it("never turns bytes after a Kitty Esc inside a paste into key input", async () => {
+			// The injection shape K3 reported: the pasted bytes hold a Kitty Esc (the clipboard can
+			// carry it) and a carriage return, and the old code dropped the buffer and sent the
+			// remainder down the key path, where `\r` is an Enter press.
+			const injection = "\x1b[200~IMPORTANT-CONTENT-BEFORE\x1b[27;5u\rTAIL-AFTER-KITTY\x1b[201~";
+			const expected = "IMPORTANT-CONTENT-BEFORE\x1b[27;5u\rTAIL-AFTER-KITTY";
+			buffer = new StdinBuffer({ timeout: 10, pasteSettleMs: 1 });
+			emittedSequences = [];
+			emittedPaste = [];
+			buffer.on("data", (sequence) => {
+				emittedSequences.push(sequence);
+			});
+			buffer.on("paste", (data) => {
+				emittedPaste.push(data);
+			});
+
+			processInput(injection);
+			await wait(5);
+
+			assert.deepStrictEqual(emittedPaste, [expected]);
+			assert.deepStrictEqual(emittedSequences, []);
+
+			for (let split = 1; split < injection.length; split++) {
+				buffer.clear();
+				emittedSequences.length = 0;
+				emittedPaste.length = 0;
+				processInput(injection.slice(0, split));
+				processInput(injection.slice(split));
+				await wait(5);
+				assert.deepStrictEqual(emittedPaste, [expected], `split at ${split}`);
+				assert.deepStrictEqual(emittedSequences, [], `split at ${split}`);
+			}
+		});
+
+		it("interrupts a paste on Ctrl+C and returns the bytes behind it to the key path", async () => {
+			// The one channel the ruling keeps open: an 0x03 arriving while a paste is open
+			// interrupts it, so a stuck paste is always escapable. Bytes that shared the chunk with
+			// the interrupt are fresh input again - the price of the escape hatch, bounded to bytes
+			// after the 0x03: everything that arrived before it stays out of the key parser.
+			buffer = new StdinBuffer({ timeout: 10, pasteSettleMs: 1 });
+			emittedSequences = [];
+			emittedPaste = [];
+			buffer.on("data", (sequence) => {
+				emittedSequences.push(sequence);
+			});
+			buffer.on("paste", (data) => {
+				emittedPaste.push(data);
+			});
+
+			processInput("\x1b[200~before");
+			assert.strictEqual(buffer.isPasteMode(), true);
+
+			processInput("\x03\rafter\x1b[201~");
+			await wait(5);
+
+			assert.deepStrictEqual(emittedPaste, []);
+			assert.strictEqual(emittedSequences[0], "\x03");
+			assert.ok(emittedSequences.includes("\r"), "a carriage return behind the interrupt is a key again");
+			assert.strictEqual(buffer.isPasteMode(), false);
+			assert.ok(
+				!emittedSequences.some((sequence) => sequence.includes("before")),
+				"no byte that arrived before the interrupt may reach the key parser",
+			);
 		});
 
 		it("reassembles a large paste delivered in many small chunks", async () => {

@@ -1,6 +1,7 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
 import { Input } from "../src/components/input.js";
+import { BULK_TEXT_MAX_SEQUENCE, StdinBuffer } from "../src/stdin-buffer.js";
 import { visibleWidth } from "../src/utils.js";
 
 describe("Input component", () => {
@@ -555,6 +556,45 @@ describe("Input component", () => {
 
 			input.handleInput("\x1b[45;5u"); // Ctrl+- (undo)
 			assert.strictEqual(input.getValue(), "");
+		});
+	});
+
+	describe("bulk input from StdinBuffer", () => {
+		/** Feed one long non-bracketed run through the real producer and consumer. */
+		function insertBulkRun(run: string): string {
+			const buffer = new StdinBuffer({ timeout: 10, pasteSettleMs: 1, pasteTimeoutMs: 50 });
+			const sequences: string[] = [];
+			buffer.on("data", (sequence) => {
+				sequences.push(sequence);
+			});
+			buffer.process(run);
+			buffer.destroy();
+
+			const input = new Input();
+			for (const sequence of sequences) {
+				input.handleInput(sequence);
+			}
+			return input.getValue();
+		}
+
+		it("keeps every character of a run whose 64 KiB boundary lands on a newline", () => {
+			// Reported loss: the second slice started with `\n`, the bulk gate here read that as
+			// "a sequence that starts with a control byte" and dropped the whole 64 KiB slice.
+			const run = `${"a".repeat(BULK_TEXT_MAX_SEQUENCE)}\n${"b".repeat(BULK_TEXT_MAX_SEQUENCE)}`;
+			const inserted = insertBulkRun(run);
+
+			// A single-line input drops the newline itself; nothing else may be lost.
+			assert.strictEqual(inserted.length, run.length - 1);
+			assert.strictEqual(inserted.slice(0, BULK_TEXT_MAX_SEQUENCE), "a".repeat(BULK_TEXT_MAX_SEQUENCE));
+			assert.strictEqual(inserted.slice(BULK_TEXT_MAX_SEQUENCE), "b".repeat(BULK_TEXT_MAX_SEQUENCE));
+		});
+
+		it("keeps an emoji whole when the 64 KiB boundary lands inside it", () => {
+			const run = `${"a".repeat(BULK_TEXT_MAX_SEQUENCE - 1)}😀${"c".repeat(100)}`;
+			const inserted = insertBulkRun(run);
+
+			assert.strictEqual(inserted.length, run.length);
+			assert.ok(inserted.includes("😀"));
 		});
 	});
 

@@ -1,0 +1,2 @@
+- Fixed `/share` missing loaded credentials whose shape looks implausible (all-digit keys, lower-case slugs, passphrases, values containing slashes) by removing the shape filter from the exact-value comparison.
+- Fixed the kernel venv reference sweep deleting the reference of a running kernel when its record was truncated by a short write, and made reference writes report a short write instead of silently storing a partial record.

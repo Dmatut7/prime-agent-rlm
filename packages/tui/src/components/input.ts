@@ -8,6 +8,8 @@ import { getSegmenter, isPunctuationChar, isWhitespaceChar, sliceByColumn, visib
 
 const segmenter = getSegmenter();
 
+const ESC = "\x1b";
+
 /** Bracketed paste markers as sent by the terminal and re-wrapped by terminal.ts. */
 const PASTE_START = "\x1b[200~";
 const PASTE_END = "\x1b[201~";
@@ -198,9 +200,13 @@ export class Input implements Component, Focusable {
 		}
 		// Bulk text (a paste from a terminal without bracketed paste) carries line
 		// breaks and other control bytes: insert the text with the control bytes
-		// removed instead of dropping the whole sequence. Sequences that start with
-		// a control byte (escape remnants) are still ignored.
-		if (data.length >= BULK_TEXT_MIN_RUN && !isControl(data.charAt(0))) {
+		// removed instead of dropping the whole sequence. A leading control byte is
+		// stripped with the rest rather than being read as "this whole sequence is a
+		// key remnant": a long run that happens to start with a newline or another
+		// text byte is still text, and dropping it lost 64 KiB of a paste. The one
+		// exception is a leading ESC - a protocol sequence the buffer did not
+		// complete, which is not text and must not be inserted.
+		if (data.length >= BULK_TEXT_MIN_RUN && data.charAt(0) !== ESC) {
 			const printable = [...data].filter((ch) => !isControl(ch)).join("");
 			if (printable.length > 0) {
 				this.insertCharacter(printable);
