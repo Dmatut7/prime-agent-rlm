@@ -6,7 +6,7 @@
 // Snapshotting is best-effort and per-variable: each top-level name is pickled
 // with `dill` independently, so a single unpicklable object (open file, socket,
 // GPU tensor, …) is skipped and reported rather than aborting the whole snapshot.
-import { renameSync } from "node:fs";
+import { readFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
 
 /** Default ceiling on a snapshot payload. Over-cap variables are skipped + reported. */
@@ -32,11 +32,26 @@ export interface SnapshotResult {
 	path: string;
 }
 
+/** One top-level name a snapshot write could not save, and why the runtime dropped it. */
+export interface SnapshotDroppedName {
+	name: string;
+	reason: string;
+}
+
 export interface RestoreResult {
 	/** Names successfully revived into the kernel namespace. */
 	restored: string[];
 	/** Names present in the snapshot that failed to revive, with a short reason. */
 	failed: { name: string; reason: string }[];
+	/**
+	 * Names that were live in the kernel which wrote this snapshot but never made it into the
+	 * payload (an unserializable value, a value over a size cap). They are absent from the
+	 * payload, so no restore can revive them and neither notice can report them through
+	 * `failed`; without this field a name the model believes it saved disappears in silence.
+	 * Read from the manifest written next to the payload, and absent when that manifest is
+	 * unreadable or the write reported nothing dropped.
+	 */
+	notSaved?: SnapshotDroppedName[];
 	path: string;
 	/** Present when the whole restore attempt failed (corrupt payload, timeout, a teardown that
 	 * interrupted the load): the saved namespace was not revived. A payload the runtime could not
@@ -126,10 +141,71 @@ export function restoreNoticeLines(result: RestoreResult): string[] {
 				: "Snapshot writes stay paused for this session so a namespace missing those names does not overwrite the state on disk; writing resumes after a restore that revives every saved name.",
 		);
 	}
+	// The other half of "these came back": a name that never entered the payload cannot fail to
+	// restore, so without this line the model hears nothing at all about it.
+	if (result.notSaved && result.notSaved.length > 0) {
+		lines.push(
+			`These were live when that snapshot was written but were never saved into it, so they are gone and must be recreated: ${result.notSaved
+				.map((entry) => `${entry.name} (${entry.reason})`)
+				.join("; ")}.`,
+		);
+	}
 	if (result.error) {
 		lines.push(`Restore failure: ${result.error}.`);
 	}
 	return lines;
+}
+
+/** What the manifest next to a payload records about the write that produced it. */
+export interface SnapshotManifestFacts {
+	/** Top-level names the payload holds. */
+	savedNames: string[];
+	/** Names that were live at write time but were not saved, with the runtime's reason. */
+	notSaved: SnapshotDroppedName[];
+	/** Wall clock of the write, when the manifest records one; undefined otherwise. */
+	writtenAtMs?: number;
+}
+
+function stringArray(value: unknown): string[] {
+	return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
+}
+
+function reasonEntries(value: unknown): SnapshotDroppedName[] {
+	if (!Array.isArray(value)) return [];
+	return value.flatMap((entry) => {
+		if (typeof entry !== "object" || entry === null) return [];
+		const record = entry as Record<string, unknown>;
+		if (typeof record.name !== "string") return [];
+		return [{ name: record.name, reason: typeof record.reason === "string" ? record.reason : "" }];
+	});
+}
+
+/**
+ * Read the manifest that belongs to the payload next to it.
+ *
+ * Tolerant by design: a missing, torn, or foreign manifest yields `null` and the caller keeps
+ * whatever it learned in-process. A name the runtime carried over verbatim from an older payload
+ * (`preserved`) *is* in the payload, so it is subtracted here: the live value that failed to
+ * serialize is gone, but reporting it as unsaved would contradict the restore that then revives
+ * the carried-over blob and reports it through `restored`/`failed`.
+ */
+export function readSnapshotManifest(manifestPath: string): SnapshotManifestFacts | null {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(readFileSync(manifestPath, "utf8"));
+	} catch {
+		return null;
+	}
+	if (typeof parsed !== "object" || parsed === null) return null;
+	const record = parsed as Record<string, unknown>;
+	const preserved = new Set(stringArray(record.preserved));
+	const notSaved = reasonEntries(record.skipped).filter((entry) => !preserved.has(entry.name));
+	const stamp = typeof record.timestamp === "string" ? Date.parse(record.timestamp) : Number.NaN;
+	return {
+		savedNames: stringArray(record.savedNames),
+		notSaved,
+		...(Number.isFinite(stamp) ? { writtenAtMs: stamp } : {}),
+	};
 }
 
 /** Absolute path to the dill payload within a session's artifact directory. */

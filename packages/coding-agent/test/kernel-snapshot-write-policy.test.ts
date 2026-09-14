@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ReplKernelManager } from "../src/core/kernel/index.js";
 import {
 	type RestoreResult,
+	readSnapshotManifest,
 	restoreNoticeLines,
 	type SnapshotWritePolicyInput,
 	snapshotWritePolicy,
@@ -406,6 +407,24 @@ describe("restore notice wording", () => {
 		expect(lines.join("\n")).not.toContain("carry them over");
 	});
 
+	it("names the names the snapshot never saved, with the reason the writer gave", () => {
+		const lines = restoreNoticeLines({
+			restored: ["kept"],
+			failed: [],
+			notSaved: [
+				{ name: "gen", reason: "TypeError: cannot pickle 'generator' object" },
+				{ name: "huge", reason: "exceeds per-variable snapshot size cap" },
+			],
+			path: "/tmp/kernel-state.dill",
+		});
+		const text = lines.join("\n");
+		expect(text).toContain("never saved into it");
+		expect(text).toContain("gen (TypeError: cannot pickle 'generator' object)");
+		expect(text).toContain("huge (exceeds per-variable snapshot size cap)");
+		// A name the payload never held is not a restore failure, so it must not be described as one.
+		expect(text).not.toContain("could not be restored");
+	});
+
 	it("keeps the fresh-start and whole-failure wording", () => {
 		const lines = restoreNoticeLines({
 			restored: [],
@@ -416,5 +435,44 @@ describe("restore notice wording", () => {
 		expect(lines.join("\n")).toContain("could not be revived; the kernel is starting fresh");
 		expect(lines.join("\n")).toContain("Restore failure: load failed: truncated payload.");
 		expect(lines.join("\n")).not.toContain("must be recreated");
+	});
+});
+
+describe("snapshot manifest reading", () => {
+	it("reads the write's own record and drops the names the payload still holds", () => {
+		const path = join(tempDir, "manifest.json");
+		const stamp = "2026-01-02T03:04:05.000Z";
+		writeFileSync(
+			path,
+			JSON.stringify({
+				savedNames: ["kept"],
+				skipped: [
+					{ name: "gen", reason: "TypeError: cannot pickle 'generator' object" },
+					// Carried over verbatim from an older payload: it is in the payload, so calling it
+					// unsaved would contradict the restore that reports it through failed/restored.
+					{ name: "carried", reason: "preserved blob unavailable" },
+				],
+				preserved: ["carried"],
+				timestamp: stamp,
+			}),
+		);
+		const facts = readSnapshotManifest(path);
+		expect(facts).not.toBeNull();
+		expect(facts?.savedNames).toEqual(["kept"]);
+		expect(facts?.notSaved).toEqual([{ name: "gen", reason: "TypeError: cannot pickle 'generator' object" }]);
+		expect(facts?.writtenAtMs).toBe(Date.parse(stamp));
+	});
+
+	it("returns null for a missing, torn, or foreign manifest instead of inventing facts", () => {
+		expect(readSnapshotManifest(join(tempDir, "never-written.json"))).toBeNull();
+		const torn = join(tempDir, "torn.json");
+		writeFileSync(torn, "{ not json");
+		expect(readSnapshotManifest(torn)).toBeNull();
+		const foreign = join(tempDir, "foreign.json");
+		writeFileSync(foreign, JSON.stringify({ hello: "world" }));
+		const facts = readSnapshotManifest(foreign);
+		expect(facts?.savedNames).toEqual([]);
+		expect(facts?.notSaved).toEqual([]);
+		expect(facts?.writtenAtMs).toBeUndefined();
 	});
 });
