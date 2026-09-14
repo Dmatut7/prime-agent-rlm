@@ -22,3 +22,7 @@
 {"id": "A3", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "下划线开头顶层名不进快照/manifest/list_names（与系统提示相悖）", "verified_by": "R4-A 子线读 repl.py", "date": "2026-09-15"}
 {"id": "B2", "severity": "P2", "status": "unverified_by_mother", "commit": null, "title": "branch 非幂等：不完整 tool pair 尾巴下切走再切回少一条消息", "verified_by": "R4-B 线实跑 IDENTITY=false（报告方未独立复现）", "date": "2026-09-15"}
 {"id": "N1", "severity": "-", "status": "retracted", "commit": null, "title": "悬空 tool call 不是问题（transform-messages 已处理）——撤回不并档", "verified_by": "R4 线自证伪", "date": "2026-09-15"}
+{"id": "T-A", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "心跳/cron LWW 用墙钟：写者时钟落后时用户操作被吃但仍报成功（模型收到假回执）", "verified_by": "R4-clock 探针复现 + 正控"}
+{"id": "T-B", "date": "2026-09-15", "severity": "P2", "status": "confirmed_pending_fix", "commit": null, "title": "shutdown admission 自证租约一次 >5s 停顿即永久失守（fail open，第二进程可同时 ACQUIRED）", "verified_by": "R4-clock 探针复现 + 正控"}
+{"id": "T-C", "date": "2026-09-15", "severity": "P3", "status": "fixing", "commit": null, "title": "同步自旋无迭代上限：时钟回拨即死循环占满事件循环", "verified_by": "R4-clock 探针（back 轮 5s 未返回被 kill；fwd 正控 2ms）"}
+{"id": "T-D", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "cron 逐分钟爬墙钟：夏令时跳过的小时整次不跑；>1 年表达式建不出来；扫描在锁内 27~75ms", "verified_by": "R4-clock 复现"}
