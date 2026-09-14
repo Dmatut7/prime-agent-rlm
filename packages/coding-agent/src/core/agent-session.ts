@@ -1064,6 +1064,12 @@ interface RlmChildRun {
 	prompt: string;
 	sessionName: string;
 	sessionDir: string;
+	/**
+	 * The parent's own assistant entry the child's usage is attributed to, resolved on first use.
+	 * The lookup scans the whole transcript, so resolving it per child assistant message costs a
+	 * copy-and-scan of every entry written so far; the answer cannot change while the run is live.
+	 */
+	parentUsageEntry?: SessionMessageEntry;
 	model: Model<Api>;
 	status: RlmChildAgentStatus;
 	durationMs?: number;
@@ -13637,7 +13643,12 @@ export class AgentSession {
 						if (assistant.stopReason !== "error" && assistant.stopReason !== "aborted") {
 							attributeChildUsage(parentAssistantForUsage?.usage ?? emptyUsage(), assistant.usage);
 							if (parentAssistantForUsage) {
-								const parentEntry = this._findAssistantEntryForMessage(parentAssistantForUsage);
+								// Resolved once per run: the parent message is a run-level constant, while
+								// the lookup copies and scans every entry the session has ever written.
+								// A long child run used to pay that scan for every assistant message it
+								// emitted (a session with 56k attributed messages spent minutes here).
+								run.parentUsageEntry ??= this._findAssistantEntryForMessage(parentAssistantForUsage);
+								const parentEntry = run.parentUsageEntry;
 								if (parentEntry) {
 									const messages = child.messages;
 									const assistantIndex = messages.lastIndexOf(assistant);
