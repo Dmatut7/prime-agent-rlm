@@ -509,6 +509,7 @@ describe("AgentsViewMode", () => {
 			ui: { requestRender: vi.fn() },
 			setStatusMessage: vi.fn(),
 			withPendingDeleteSession: (sessions: SessionSummary[]) => sessions,
+			takeCatalogReconcileScope: () => invoke("takeCatalogReconcileScope", self),
 		});
 		self.reconcileCatalogs = () => invoke("reconcileCatalogs", self);
 		invoke("reconcileCatalogs", self);
@@ -602,6 +603,7 @@ describe("AgentsViewMode", () => {
 			restoreSelection: vi.fn(),
 			ui: { requestRender: vi.fn() },
 			withPendingDeleteSession: (sessions: SessionSummary[]) => sessions,
+			takeCatalogReconcileScope: () => invoke("takeCatalogReconcileScope", self),
 			getFilteredRecords: () => invoke("getFilteredRecords", self),
 		};
 		self.reconcileCatalogs = () => {
@@ -632,7 +634,7 @@ describe("AgentsViewMode", () => {
 	it("flushes one coalesced reconcile per burst and none after teardown", () => {
 		vi.useFakeTimers();
 		const reconciledAt: number[] = [];
-		const self: Record<string, unknown> = { stopped: false };
+		const self: Record<string, unknown> = { stopped: false, resolveMissingSelectionAnchor: vi.fn() };
 		// Stands in for the real reconcile's bookkeeping: it clears the dirty flag and
 		// stamps the throttle window the scheduler measures against.
 		self.reconcileCatalogs = () => {
@@ -686,9 +688,11 @@ describe("AgentsViewMode", () => {
 			lastCatalogReconcileAt: 0,
 			editor: { getText: () => "" },
 			setStatusMessage: vi.fn(),
+			resolveMissingSelectionAnchor: vi.fn(),
 			applyPendingAncestorExpansion: vi.fn(),
 			restoreSelection: vi.fn(),
 			withPendingDeleteSession: (sessions: SessionSummary[]) => sessions,
+			takeCatalogReconcileScope: () => invoke("takeCatalogReconcileScope", self),
 			getFilteredRecords: () => invoke("getFilteredRecords", self),
 			// Stands in for a large catalog: the rebuild takes longer than the throttle window.
 			ui: {
@@ -737,6 +741,7 @@ describe("AgentsViewMode", () => {
 			ui: { requestRender: vi.fn() },
 			setStatusMessage: vi.fn(),
 			withPendingDeleteSession: (sessions: SessionSummary[]) => sessions,
+			takeCatalogReconcileScope: () => invoke("takeCatalogReconcileScope", self),
 		};
 		invoke("reconcileCatalogs", self);
 		expect(persistentState.scopeRootSummary).toMatchObject({ sessionId: root.sessionId });
@@ -823,6 +828,7 @@ describe("AgentsViewMode", () => {
 				ui: { requestRender: vi.fn() },
 				setStatusMessage: vi.fn(),
 				withPendingDeleteSession: (sessions: SessionSummary[]) => sessions,
+				takeCatalogReconcileScope: () => invoke("takeCatalogReconcileScope", self),
 			};
 			invoke("reconcileCatalogs", self);
 			if (expand) {

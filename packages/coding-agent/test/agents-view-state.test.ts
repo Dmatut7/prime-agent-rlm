@@ -45,6 +45,7 @@ import {
 	shouldApplyScopeResolution,
 	shouldShowAgentsViewSession,
 	transitionAgentsViewScope,
+	unifiedSessionSearchableText,
 } from "../src/modes/index.js";
 import { formatAgentDepthLabel } from "../src/modes/interactive/interactive-mode.js";
 import type { InteractiveModeUiServices } from "../src/modes/interactive/interactive-mode-services.js";
@@ -1336,8 +1337,9 @@ describe("agents view state", () => {
 
 		const [record] = reconcileUnifiedSessions([daemon], [saved]);
 		expect(record).toMatchObject({ daemon, saved, identity: "file:/tmp/sessions/merged.jsonl", section: "idle" });
-		expect(record?.searchableText).toContain("uniquely searchable transcript");
-		expect(record?.searchableText).toContain("lunar regression");
+		const corpus = unifiedSessionSearchableText(record!);
+		expect(corpus).toContain("uniquely searchable transcript");
+		expect(corpus).toContain("lunar regression");
 		expect(buildAgentsViewRows([record!])[0]).toMatchObject({
 			title: "Live name",
 			record,

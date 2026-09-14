@@ -87,6 +87,7 @@ import {
 	isEmptyAgentsViewSession,
 	isSubagentSummary,
 	migrateAgentsViewIdentitySet,
+	type ReconcileUnifiedSessionsOptions,
 	reconcileUnifiedSessions,
 	refreshAgentsViewRowTimeLabels,
 	resolveAgentsViewLeftResult,
@@ -101,7 +102,7 @@ import {
 	type UnifiedSessionIndex,
 	type UnifiedSessionRecord,
 } from "./agents-view-state.js";
-import { AgentsViewRosterStore, STALE_ROSTER_DAEMON_MESSAGE } from "./roster-store.js";
+import { type AgentsViewRosterChange, AgentsViewRosterStore, STALE_ROSTER_DAEMON_MESSAGE } from "./roster-store.js";
 import { createSearchTextMatcher } from "./session-view-search.js";
 
 const HEARTBEAT_POLL_INTERVAL_MS = 15000;
@@ -698,6 +699,25 @@ export class AgentsViewMode implements Component, Focusable {
 	private catalogReconcileTimer: NodeJS.Timeout | undefined;
 	private catalogReconcileDirty = false;
 	private lastCatalogReconcileAt = 0;
+	/**
+	 * Session identities the daemon reported as changed since the last rebuild, or
+	 * `true` when every row must be recomputed. Any catalog path that is not a
+	 * roster delta (startup, reconnect, saved refresh, heartbeats, a roster resync)
+	 * sets `true`, and a rebuild always leaves an empty set behind.
+	 */
+	private pendingCatalogDirty: Set<string> | true = true;
+	/**
+	 * Inputs the current records were built from. A roster push may only reuse them
+	 * while the saved catalog and the heartbeat catalog are the very same inputs;
+	 * either refresh replaces its array and forces a full rebuild.
+	 */
+	private reconcileBase:
+		| {
+				records: readonly UnifiedSessionRecord[];
+				savedSessions: readonly AgentConnectionSavedSessionInfo[];
+				heartbeats: readonly AgentConnectionHeartbeat[];
+		  }
+		| undefined;
 	private expandedSubagentParents = new Set<string>();
 	// Agent row identities whose full spawn program is currently shown.
 	// The program key toggles each agent shown ↔ hidden.
@@ -919,7 +939,7 @@ export class AgentsViewMode implements Component, Focusable {
 		const runPromise = new Promise<AgentsViewRunResult>((resolve) => {
 			this.resolveRun = resolve;
 		});
-		this.unsubscribeRosterUpdate = this.rosterStore.onUpdate(() => this.onRosterUpdate());
+		this.unsubscribeRosterUpdate = this.rosterStore.onUpdate((change) => this.onRosterUpdate(change));
 		this.applySessionList(this.rosterStore.summaries(), true);
 		this.armSavedSearchFetch();
 		this.resolveMissingSelectionAnchor();
@@ -1315,7 +1335,7 @@ export class AgentsViewMode implements Component, Focusable {
 	private getFilteredRecords(): UnifiedSessionRecord[] {
 		const query = this.replyTarget || this.renameTarget ? (this.actionModeSearchQuery ?? "") : this.editor.getText();
 		const matches = createSearchTextMatcher(query);
-		return filterUnifiedSessions(this.scopedRecords, matches);
+		return filterUnifiedSessions(this.scopedRecords, matches, { skipSearchText: !matches.requiresText });
 	}
 
 	/** Rebuild rows from the last fetched summaries, keeping selection on the same row. */
@@ -2172,10 +2192,26 @@ export class AgentsViewMode implements Component, Focusable {
 		requireDaemonData(response);
 	}
 
-	private onRosterUpdate(): void {
+	/**
+	 * A roster frame is an edge, not a state: a streaming catalog pushes one per
+	 * session event, and each one used to rebuild every row of the catalog. The
+	 * frame only records which rows the daemon changed and lets the coalescing
+	 * window in `scheduleCatalogReconcile` decide when to rebuild.
+	 */
+	private onRosterUpdate(change: AgentsViewRosterChange): void {
 		if (this.stopped || !this.rosterStore) return;
-		this.applySessionList(this.rosterStore.summaries(), true);
-		this.resolveMissingSelectionAnchor();
+		this.lastListedSummaries = this.rosterStore.summaries();
+		this.persistentState.lastSuccessfulLiveSummaries = this.lastListedSummaries;
+		if (change.fullResync) {
+			this.markCatalogFullRebuild();
+		} else if (this.pendingCatalogDirty !== true) {
+			for (const identity of change.changedSessionIds) this.pendingCatalogDirty.add(identity);
+		}
+		if (this.scheduleCatalogReconcile()) this.resolveMissingSelectionAnchor();
+	}
+
+	private markCatalogFullRebuild(): void {
+		this.pendingCatalogDirty = true;
 	}
 
 	private refreshSavedSessionsIfLoaded(): void {
@@ -2191,15 +2227,24 @@ export class AgentsViewMode implements Component, Focusable {
 	private applySessionList(sessions: SessionSummary[], successful = false): void {
 		this.lastListedSummaries = sessions;
 		if (successful) this.persistentState.lastSuccessfulLiveSummaries = sessions;
+		// A full list (startup, reconnect, heartbeat poll) has no per-row diff: it
+		// rebuilds every row.
+		this.markCatalogFullRebuild();
 		this.reconcileCatalogs();
 	}
 
 	private reconcileCatalogs(): void {
+		const reuse = this.takeCatalogReconcileScope();
 		const visibleSessions = this.lastListedSummaries.filter((summary) =>
 			shouldShowAgentsViewSession(summary, this.inactiveAgentIdentities.has(getSummaryIdentity(summary))),
 		);
 		this.lastVisibleSummaries = this.withPendingDeleteSession(visibleSessions);
-		this.unifiedRecords = reconcileUnifiedSessions(this.lastVisibleSummaries, this.savedSessions, this.heartbeats);
+		this.unifiedRecords = reconcileUnifiedSessions(
+			this.lastVisibleSummaries,
+			this.savedSessions,
+			this.heartbeats,
+			reuse,
+		);
 		this.unifiedIndex = buildUnifiedSessionIndex(this.unifiedRecords);
 		migrateAgentsViewIdentitySet(this.expandedSubagentParents, this.unifiedIndex.byKey);
 		migrateAgentsViewIdentitySet(this.programShownParents, this.unifiedIndex.byKey);
@@ -2228,34 +2273,58 @@ export class AgentsViewMode implements Component, Focusable {
 		this.applyPendingAncestorExpansion();
 		this.restoreSelection();
 		this.ui.requestRender();
+		this.reconcileBase = {
+			records: this.unifiedRecords,
+			savedSessions: this.savedSessions,
+			heartbeats: this.heartbeats,
+		};
 		// Stamped after the rebuild: on a large catalog the rebuild itself can outlast
 		// the throttle window, and stamping the start would re-admit one rebuild per
 		// streamed session.
 		this.catalogReconcileDirty = false;
+		this.pendingCatalogDirty = new Set();
 		this.lastCatalogReconcileAt = Date.now();
 	}
 
 	/**
-	 * The saved catalog streams one session at a time and a reconcile rebuilds every
-	 * row, so reconciling per session is quadratic in catalog size. The first update
-	 * of a burst reconciles at once; the rest coalesce into one trailing rebuild.
+	 * The reuse base for this rebuild: the previous records plus the identities the
+	 * daemon reported as changed, or undefined when every row must be rebuilt. The
+	 * pending dirty set is consumed here and cleared by the rebuild that used it.
 	 */
-	private scheduleCatalogReconcile(): void {
-		if (this.stopped) return;
+	private takeCatalogReconcileScope(): ReconcileUnifiedSessionsOptions | undefined {
+		const base = this.reconcileBase;
+		const dirty = this.pendingCatalogDirty;
+		if (dirty === true || base === undefined) return undefined;
+		if (base.savedSessions !== this.savedSessions || base.heartbeats !== this.heartbeats) return undefined;
+		return { previous: base.records, dirtySessionIds: dirty };
+	}
+
+	/**
+	 * Catalog updates arrive as edges: the saved catalog streams one session at a
+	 * time and the daemon pushes one roster frame per session event, while a rebuild
+	 * re-derives every row. The first update of a burst reconciles at once; the rest
+	 * coalesce into one trailing rebuild over the union of the rows they touched.
+	 */
+	private scheduleCatalogReconcile(): boolean {
+		if (this.stopped) return false;
 		this.catalogReconcileDirty = true;
 		const delay = SAVED_CATALOG_RECONCILE_THROTTLE_MS - (Date.now() - this.lastCatalogReconcileAt);
 		if (delay <= 0) {
 			this.reconcileCatalogs();
-			return;
+			return true;
 		}
-		if (this.catalogReconcileTimer) return;
+		if (this.catalogReconcileTimer) return false;
 		this.catalogReconcileTimer = setTimeout(() => {
 			this.catalogReconcileTimer = undefined;
 			// A reconcile from any other path already covered the pending sessions.
 			if (this.stopped || !this.catalogReconcileDirty) return;
 			this.reconcileCatalogs();
+			// The flush owns the rebuild, so the anchor wait it can settle is settled
+			// here instead of one push earlier against the rows it replaced.
+			this.resolveMissingSelectionAnchor();
 		}, delay);
 		this.catalogReconcileTimer.unref?.();
+		return false;
 	}
 
 	private clearScheduledCatalogReconcile(): void {

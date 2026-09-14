@@ -1,8 +1,10 @@
+import { realpathSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { canonicalizePath } from "../../utils/paths.js";
 import type { AgentConnectionHeartbeat, AgentConnectionSavedSessionInfo } from "../agent-connection/index.js";
 import { rosterAgentIdForSummary } from "../daemon/agent-roster.js";
 import { classifySessionRosterStatus, type SessionSummary } from "../daemon/daemon-session-list.js";
+import { createSessionSearchText } from "./session-view-search.js";
 
 export type AgentsViewSection = "running" | "idle" | "inactive";
 
@@ -20,7 +22,14 @@ export interface UnifiedSessionRecord {
 	/** Alternate keys used to restore selection while a session is persisted or reattached. */
 	identityAliases: readonly string[];
 	section: AgentsViewSection;
-	searchableText: string;
+	/**
+	 * Search corpus for this row. Materialized on first read by
+	 * `unifiedSessionSearchableText` and memoized for the record's lifetime, because
+	 * a saved row's corpus carries up to 64 KiB of message text and most catalog
+	 * passes run with an empty search box. Producers that have no daemon/saved
+	 * sources (synthetic rows) may set it directly; when set, it is authoritative.
+	 */
+	searchableText?: string;
 	heartbeat?: UnifiedSessionHeartbeat;
 }
 
@@ -140,15 +149,42 @@ function formatAgeLabel(timestamp: string): string {
 	return minutes < 120 ? `${minutes}m ago` : `${Math.round(minutes / 60)}h ago`;
 }
 
+/**
+ * Canonicalizing a session path is a `realpathSync` syscall, and one catalog pass
+ * canonicalizes the same paths several times per row: identity aliases, parent
+ * keys, row keys and merged summaries all ask for the same session file. Resolved
+ * paths are memoized: one cached-cold pass over the bench catalog spends about
+ * 8 ms canonicalizing its 860 session paths, and later passes about 0.5 ms. Paths
+ * that do not resolve are not memoized, so a file that appears later resolves then. The memo is a flat cache, not a lease: it is dropped whole
+ * when it grows past the catalog-scale bound.
+ */
+const canonicalPathCache = new Map<string, string>();
+const CANONICAL_PATH_CACHE_LIMIT = 4096;
+
 function canonicalSessionPath(path: string): string {
-	return resolve(canonicalizePath(path));
+	const cached = canonicalPathCache.get(path);
+	if (cached !== undefined) return cached;
+	let canonical: string;
+	try {
+		canonical = resolve(realpathSync(path));
+	} catch {
+		return resolve(canonicalizePath(path));
+	}
+	if (canonicalPathCache.size >= CANONICAL_PATH_CACHE_LIMIT) canonicalPathCache.clear();
+	canonicalPathCache.set(path, canonical);
+	return canonical;
 }
 
 function fileIdentity(path: string): string {
 	return `file:${canonicalSessionPath(path)}`;
 }
 
-function summaryIdentityAliases(summary: SessionSummary): string[] {
+/**
+ * Every key a session answers to: file identity, session id, active id and agent
+ * id. Both the reconcile and the roster store key dirty rows by these, so a row is
+ * rebuilt when any of its identities moved.
+ */
+export function summaryIdentityAliases(summary: SessionSummary): string[] {
 	return [
 		summary.runtimeKind === "subagent" && summary.rlmChildId
 			? `agent:${rosterAgentIdForSummary(summary)}`
@@ -164,29 +200,150 @@ function savedIdentityAliases(saved: AgentConnectionSavedSessionInfo): string[] 
 	return [fileIdentity(saved.path), `session:${saved.id}`];
 }
 
+/**
+ * A saved row's corpus is dominated by `allMessagesText`, a per-row transcript
+ * excerpt of up to 64 KiB, and the joined corpus is a pure function of the saved
+ * snapshot object the daemon catalog hands over (the catalog replaces its rows
+ * instead of editing them, so the object identity is the row's revision). Joining
+ * it once per saved snapshot instead of once per record per pass retains one
+ * corpus per saved row -- the same order as the catalog the client already holds.
+ */
+const savedSearchCorpusCache = new WeakMap<AgentConnectionSavedSessionInfo, string>();
+
+function savedSearchCorpus(saved: AgentConnectionSavedSessionInfo): string {
+	const cached = savedSearchCorpusCache.get(saved);
+	if (cached !== undefined) return cached;
+	const corpus = createSessionSearchText([
+		saved.id,
+		saved.name,
+		saved.firstMessage,
+		saved.allMessagesText,
+		saved.agentStatus?.summary,
+		saved.cwd,
+		saved.path,
+		saved.parentSessionPath,
+	]);
+	savedSearchCorpusCache.set(saved, corpus);
+	return corpus;
+}
+
+function daemonSearchCorpus(daemon: SessionSummary): string {
+	return createSessionSearchText([
+		daemon.sessionId,
+		daemon.activeSessionId,
+		daemon.sessionName,
+		daemon.firstMessage,
+		daemon.cwd,
+		daemon.sessionFile,
+		daemon.summary,
+	]);
+}
+
+/**
+ * Byte-identical to joining every field in row order: each fragment joins its own
+ * non-empty parts with a single space, and the fragments are joined the same way.
+ */
 function createUnifiedSearchableText(
 	daemon: SessionSummary | undefined,
 	saved: AgentConnectionSavedSessionInfo | undefined,
 ): string {
-	return [
-		daemon?.sessionId,
-		daemon?.activeSessionId,
-		daemon?.sessionName,
-		daemon?.firstMessage,
-		daemon?.cwd,
-		daemon?.sessionFile,
-		daemon?.summary,
-		saved?.id,
-		saved?.name,
-		saved?.firstMessage,
-		saved?.allMessagesText,
-		saved?.agentStatus?.summary,
-		saved?.cwd,
-		saved?.path,
-		saved?.parentSessionPath,
-	]
-		.filter((part): part is string => typeof part === "string" && part.length > 0)
-		.join(" ");
+	return createSessionSearchText([
+		daemon ? daemonSearchCorpus(daemon) : undefined,
+		saved ? savedSearchCorpus(saved) : undefined,
+	]);
+}
+
+interface SearchableTextMemo {
+	daemon?: SessionSummary;
+	saved?: AgentConnectionSavedSessionInfo;
+	text: string;
+}
+
+const searchableTextMemo = new WeakMap<UnifiedSessionRecord, SearchableTextMemo>();
+
+/**
+ * Search corpus for one row, materialized on first read.
+ *
+ * Building it eagerly for every row costs a 64 KiB join per saved row on every
+ * catalog pass: on the bench catalog (520 live rows, 340 saved rows carrying
+ * 17 MB of transcript text) the cached-cold reconcile drops from 19.4 ms to
+ * 8.5 ms once nothing builds corpora an empty search box cannot read. A record
+ * carried across passes keeps its memo, and the saved fragment is cached against
+ * the saved snapshot, so an unchanged row never re-joins its excerpt.
+ */
+export function unifiedSessionSearchableText(record: UnifiedSessionRecord): string {
+	if (record.searchableText !== undefined) return record.searchableText;
+	const memo = searchableTextMemo.get(record);
+	if (memo !== undefined && memo.daemon === record.daemon && memo.saved === record.saved) {
+		return memo.text;
+	}
+	const text = createUnifiedSearchableText(record.daemon, record.saved);
+	searchableTextMemo.set(record, { daemon: record.daemon, saved: record.saved, text });
+	return text;
+}
+
+export interface ReconcileUnifiedSessionsOptions {
+	/**
+	 * Records from the previous pass. Rows the daemon did not change keep their
+	 * object identity, which is what lets the view skip re-deriving their row text
+	 * and search corpus (a 64 KiB join per saved row).
+	 *
+	 * Only valid when this pass runs over the same `savedSessions` and `heartbeats`
+	 * inputs as the previous one: the reuse invariant is that the alias -> session
+	 * mapping of the catalog is unchanged, and the saved catalog is what the alias
+	 * map routes into.
+	 */
+	previous?: readonly UnifiedSessionRecord[];
+	/** Session ids (any identity alias) whose daemon rows changed in this pass. */
+	dirtySessionIds?: ReadonlySet<string>;
+}
+
+function heartbeatValuesEqual(a: UnifiedSessionHeartbeat | undefined, b: UnifiedSessionHeartbeat | undefined): boolean {
+	if (a === b) return true;
+	if (a === undefined || b === undefined) return false;
+	return a.activeCount === b.activeCount && a.pausedCount === b.pausedCount && a.nextRunAt === b.nextRunAt;
+}
+
+/**
+ * Decide, once per pass, whether unchanged rows may be carried over verbatim.
+ *
+ * The reuse is exact only while the catalog's alias -> session mapping is
+ * unchanged: a new alias (a session that appeared, or a file/active id that just
+ * showed up) or a vanished one (a row that left) can re-route saved snapshots onto
+ * different rows and re-parent the subagent forest, so those passes rebuild.
+ */
+function buildRecordReuse(
+	daemonSummaries: readonly SessionSummary[],
+	aliasesBySummary: readonly (readonly string[])[],
+	options: ReconcileUnifiedSessionsOptions,
+) {
+	const previous = options.previous;
+	const dirtySessionIds = options.dirtySessionIds;
+	if (previous === undefined || dirtySessionIds === undefined) return undefined;
+
+	const previousBySessionId = new Map<string, UnifiedSessionRecord>();
+	const previousByAlias = new Map<string, string>();
+	const previousSessionIds = new Set<string>();
+	for (const record of previous) {
+		const daemon = record.daemon;
+		if (daemon === undefined) continue;
+		previousSessionIds.add(daemon.sessionId);
+		previousBySessionId.set(daemon.sessionId, record);
+		// Later rows win, exactly like the alias index the rebuild itself builds.
+		for (const alias of record.identityAliases) previousByAlias.set(alias, daemon.sessionId);
+	}
+	const currentSessionIds = new Set<string>();
+	for (let index = 0; index < daemonSummaries.length; index++) {
+		const daemon = daemonSummaries[index]!;
+		if (!previousSessionIds.has(daemon.sessionId)) return undefined;
+		if (currentSessionIds.has(daemon.sessionId)) return undefined;
+		currentSessionIds.add(daemon.sessionId);
+		for (const alias of aliasesBySummary[index] ?? []) {
+			if (previousByAlias.get(alias) !== daemon.sessionId) return undefined;
+		}
+	}
+	if (currentSessionIds.size !== previousSessionIds.size) return undefined;
+	return { previousBySessionId };
 }
 
 /**
@@ -198,16 +355,38 @@ export function reconcileUnifiedSessions(
 	daemonSummaries: readonly SessionSummary[],
 	savedSessions: readonly AgentConnectionSavedSessionInfo[],
 	heartbeats: readonly AgentConnectionHeartbeat[] = [],
+	options: ReconcileUnifiedSessionsOptions = {},
 ): UnifiedSessionRecord[] {
 	const heartbeatByActiveId = aggregateSessionHeartbeats(daemonSummaries, heartbeats);
+	// One alias derivation per row per pass: it canonicalizes the session file path,
+	// and both the reuse check and the rebuild itself key rows by these aliases.
+	const aliasesBySummary = daemonSummaries.map((daemon) => summaryIdentityAliases(daemon));
+	const reuse = buildRecordReuse(daemonSummaries, aliasesBySummary, options);
+	const dirtySessionIds = options.dirtySessionIds;
 	const records: UnifiedSessionRecord[] = [];
 	const recordByAlias = new Map<string, UnifiedSessionRecord>();
 
-	for (const daemon of daemonSummaries) {
-		const aliases = summaryIdentityAliases(daemon);
+	for (let index = 0; index < daemonSummaries.length; index++) {
+		const daemon = daemonSummaries[index]!;
+		const aliases = aliasesBySummary[index]!;
 		const heartbeat =
 			heartbeatByActiveId.get(daemon.activeSessionId ?? daemon.id) ??
 			(daemon.hasActiveHeartbeat ? { activeCount: 1 } : undefined);
+		// A row the daemon did not touch keeps its record: its corpus, identity and
+		// section are all derived from inputs that did not change. The aggregated
+		// heartbeat is the one input another row can move (a parent's jobs), so it is
+		// compared by value instead of assumed.
+		const carried = reuse?.previousBySessionId.get(daemon.sessionId);
+		if (
+			carried !== undefined &&
+			dirtySessionIds !== undefined &&
+			!aliases.some((alias) => dirtySessionIds.has(alias)) &&
+			heartbeatValuesEqual(carried.heartbeat, heartbeat)
+		) {
+			records.push(carried);
+			for (const alias of aliases) recordByAlias.set(alias, carried);
+			continue;
+		}
 		const record: UnifiedSessionRecord = {
 			daemon:
 				heartbeat && heartbeat.activeCount > 0 && !daemon.hasActiveHeartbeat
@@ -216,11 +395,9 @@ export function reconcileUnifiedSessions(
 			identity: aliases[0]!,
 			identityAliases: aliases,
 			section: "idle",
-			searchableText: "",
 			...(heartbeat ? { heartbeat } : {}),
 		};
 		record.section = classifyUnifiedSession(record);
-		record.searchableText = createUnifiedSearchableText(daemon, undefined);
 		records.push(record);
 		for (const alias of aliases) recordByAlias.set(alias, record);
 	}
@@ -231,7 +408,6 @@ export function reconcileUnifiedSessions(
 		if (record) {
 			record.saved = saved;
 			record.identityAliases = [...new Set([...record.identityAliases, ...aliases])];
-			record.searchableText = createUnifiedSearchableText(record.daemon, saved);
 			for (const alias of aliases) recordByAlias.set(alias, record);
 			continue;
 		}
@@ -240,7 +416,6 @@ export function reconcileUnifiedSessions(
 			identity: aliases[0]!,
 			identityAliases: aliases,
 			section: "inactive",
-			searchableText: createUnifiedSearchableText(undefined, saved),
 		};
 		records.push(inactive);
 		for (const alias of aliases) recordByAlias.set(alias, inactive);
@@ -405,14 +580,24 @@ export function getUnifiedSessionAncestorSessionIds(
 	return ancestors;
 }
 
+export interface FilterUnifiedSessionsOptions {
+	/**
+	 * Set when the active query cannot match on row text (an empty search box).
+	 * Every corpus read is a 64 KiB join, so a pass that cannot use the text must
+	 * not materialize it.
+	 */
+	skipSearchText?: boolean;
+}
+
 export function filterUnifiedSessions(
 	records: readonly UnifiedSessionRecord[],
 	matches: (searchableText: string) => boolean,
+	options: FilterUnifiedSessionsOptions = {},
 ): UnifiedSessionRecord[] {
 	const index = buildUnifiedSessionIndex(records);
 	const retained = new Set<UnifiedSessionRecord>();
 	for (const record of records) {
-		if (!matches(record.searchableText)) continue;
+		if (!options.skipSearchText && !matches(unifiedSessionSearchableText(record))) continue;
 		let current: UnifiedSessionRecord | undefined = record;
 		while (current && !retained.has(current)) {
 			retained.add(current);
@@ -544,6 +729,12 @@ export function aggregateSessionHeartbeats(
 	summaries: readonly SessionSummary[],
 	heartbeats: readonly AgentConnectionHeartbeat[],
 ): ReadonlyMap<string, UnifiedSessionHeartbeat> {
+	// Nothing to aggregate for a catalog with no scheduled work: the summary index
+	// below canonicalizes a path per row, and most catalogs never have a job.
+	const scheduled = heartbeats.filter(
+		(heartbeat) => heartbeat.job.status === "active" || heartbeat.job.status === "paused",
+	);
+	if (scheduled.length === 0) return new Map();
 	const summaryByKey = new Map<string, SessionSummary>();
 	for (const summary of summaries) {
 		for (const key of getSummaryKeys(summary)) summaryByKey.set(key, summary);
@@ -556,9 +747,8 @@ export function aggregateSessionHeartbeats(
 		ids.add(jobId);
 		byOwner.set(owner, ids);
 	};
-	for (const heartbeat of heartbeats) {
+	for (const heartbeat of scheduled) {
 		const job = heartbeat.job;
-		if (job.status !== "active" && job.status !== "paused") continue;
 		const byOwner = job.status === "active" ? activeJobIdsByOwner : pausedJobIdsByOwner;
 		if (job.status === "active" && job.nextRunAt && Number.isFinite(Date.parse(job.nextRunAt))) {
 			nextRunByJob.set(job.id, job.nextRunAt);
@@ -727,6 +917,37 @@ export function resolveAgentsViewSelectionState(
 	return { index: firstSelectable >= 0 ? firstSelectable : 0, resolved: false };
 }
 
+interface AgentsViewRowText {
+	summary: SessionSummary;
+	title: string;
+	subtitle: string;
+}
+
+const rowTextByRecord = new WeakMap<UnifiedSessionRecord, AgentsViewRowText>();
+
+/**
+ * Row text for one record: the merged summary, its title and its subtitle.
+ *
+ * All three are pure functions of the record, and a record the daemon did not
+ * change is carried across rebuilds, so memoizing here means only dirty rows
+ * re-derive their text -- `basename(cwd)` and the title normalizing regex used to
+ * run for every row of every catalog pass. Clock-dependent text stays out of the
+ * memo: `statusLabel` is recomputed per build, and the animation tick re-derives
+ * its relative parts in place through `refreshAgentsViewRowTimeLabels`.
+ */
+function agentsViewRowText(record: UnifiedSessionRecord): AgentsViewRowText {
+	const memo = rowTextByRecord.get(record);
+	if (memo !== undefined) return memo;
+	const summary = summaryForUnifiedRecord(record);
+	const text: AgentsViewRowText = {
+		summary,
+		title: getAgentsViewSessionTitle(summary),
+		subtitle: getSessionSubtitle(summary),
+	};
+	rowTextByRecord.set(record, text);
+	return text;
+}
+
 export function buildAgentsViewRows(
 	summariesOrRecords: readonly (SessionSummary | UnifiedSessionRecord)[],
 	expandedSubagentParents: ReadonlySet<string> = new Set(),
@@ -735,9 +956,12 @@ export function buildAgentsViewRows(
 	recursiveRollups?: ReadonlyMap<UnifiedSessionRecord, AgentsViewRecursiveRollup>,
 	anchorSessionId?: string,
 ): AgentsViewRow[] {
-	const inputs = summariesOrRecords.map((input) =>
-		isUnifiedSessionRecord(input) ? { summary: summaryForUnifiedRecord(input), record: input } : { summary: input },
-	);
+	const inputs: { summary: SessionSummary; title: string; subtitle: string; record?: UnifiedSessionRecord }[] =
+		summariesOrRecords.map((input) =>
+			isUnifiedSessionRecord(input)
+				? { ...agentsViewRowText(input), record: input }
+				: { summary: input, title: getAgentsViewSessionTitle(input), subtitle: getSessionSubtitle(input) },
+		);
 	const scopeRoot = scope
 		? inputs.find(
 				({ summary }) =>
@@ -751,12 +975,12 @@ export function buildAgentsViewRows(
 	const isDirectScopeChild = (summary: SessionSummary): boolean =>
 		scopeRoot !== undefined && getParentKeys(summary).some((key) => scopeRootKeys.has(key));
 	const baseRows = inputs.map(
-		({ summary, record }): MutableAgentsViewRow => ({
+		({ summary, title, subtitle, record }): MutableAgentsViewRow => ({
 			kind: isSubagentSummary(summary) && !isDirectScopeChild(summary) ? "subagent" : "agent",
 			section: record?.section ?? classifyAgentsViewSession(summary),
 			summary,
-			title: getAgentsViewSessionTitle(summary),
-			subtitle: getSessionSubtitle(summary),
+			title,
+			subtitle,
 			statusLabel: getSessionStatusLabel(summary, record?.heartbeat) + getQuietDurationLabel(summary),
 			depth: 0,
 			selectable: true,

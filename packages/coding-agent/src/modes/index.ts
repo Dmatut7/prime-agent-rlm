@@ -64,6 +64,7 @@ export {
 	type UnifiedSessionHeartbeat,
 	type UnifiedSessionIndex,
 	type UnifiedSessionRecord,
+	unifiedSessionSearchableText,
 } from "./agents-view/agents-view-state.js";
 export {
 	DaemonCapabilityUnavailableError,
