@@ -1,0 +1,1 @@
+- Fixed session list message counts and token totals drifting for sessions that keep appending, by counting bytes buffered across read chunks when recording the scan resume offset and refusing scan state that cannot account for the bytes it read.

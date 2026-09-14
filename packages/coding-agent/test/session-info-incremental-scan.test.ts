@@ -1,4 +1,13 @@
-import { appendFileSync, copyFileSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+	appendFileSync,
+	copyFileSync,
+	mkdtempSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -223,5 +232,123 @@ describe("readSessionInfo incremental rescan", () => {
 		// subtracted back out, so own spend stays 110/25/110 plus the compaction — the fold is
 		// value-neutral on the tokens it accounts for, and drops cacheRead/cacheWrite by one each.
 		expect(info?.usage).toEqual({ inputTokens: 113, outputTokens: 25, cost: 110 });
+	});
+
+	/**
+	 * A live session whose transcript holds a tool result far longer than the
+	 * 64 KiB read chunk, with ordinary entries after it — the shape that makes a
+	 * scan's stopping offset fall behind the real file position. That offset is
+	 * the resume point for the next append, so the whole tail of already-counted
+	 * entries is re-read and counted a second time, which is what makes the
+	 * agents list show inflated counts and wrong token totals for exactly the
+	 * sessions that are still being appended to.
+	 */
+	it("reports what a full scan would after appending past an oversized entry", async () => {
+		const path = join(dir, "chunked.jsonl");
+		writeFileSync(path, headerLine() + messageLine("user", "first question", 1000), "utf8");
+		expect((await readSessionInfo(path))?.messageCount).toBe(1);
+
+		// One entry past SESSION_LIST_PARSE_MAX_LINE_CHARS: it spans many read
+		// chunks and is counted by the oversized-entry path, exactly like a real
+		// multi-megabyte tool result.
+		const bigText = "B".repeat(2 * 1024 * 1024);
+		appendFileSync(
+			path,
+			`${JSON.stringify({
+				type: "message",
+				id: `entry-${++counter}`,
+				parentId: null,
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: bigText }],
+					timestamp: 2000,
+				},
+			})}\n`,
+			"utf8",
+		);
+		// Ordinary entries AFTER the oversized one: these are the ones a lagging
+		// resume point re-reads on the next append.
+		const tailEntries = 20;
+		for (let i = 0; i < tailEntries; i++) {
+			appendFileSync(
+				path,
+				`${JSON.stringify({
+					type: "message",
+					id: `entry-${++counter}`,
+					parentId: null,
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: `answer ${i}` }],
+						timestamp: 3000 + i,
+						usage: usageLine(10, 5),
+					},
+				})}\n`,
+				"utf8",
+			);
+		}
+		let info = await expectMatchesFullScan(path);
+		expect(info?.messageCount).toBe(2 + tailEntries);
+
+		// The append a live session makes next: only the resumed scan sees it.
+		appendFileSync(
+			path,
+			`${JSON.stringify({
+				type: "message",
+				id: `entry-${++counter}`,
+				parentId: null,
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "final answer" }],
+					timestamp: 4000,
+					usage: usageLine(10, 5),
+				},
+			})}\n`,
+			"utf8",
+		);
+		info = await expectMatchesFullScan(path);
+		// One message per ordinary entry; the oversized entry itself carries no usage.
+		expect(info?.messageCount).toBe(3 + tailEntries);
+		// usageLine(10, 5) is 10 input + 1 cacheRead + 2 cacheWrite, for every
+		// ordinary entry including the one appended after the scan's last offset.
+		expect(info?.usage?.inputTokens).toBe((10 + 3) * (tailEntries + 1));
+		expect(info?.firstMessage).toBe("first question");
+	});
+
+	/**
+	 * An in-place rewrite (truncate and write again) keeps the inode and can grow
+	 * the file, so inode plus growth alone reads as an append. The recorded
+	 * stopping point is then applied to a file it was never derived from, and if
+	 * it no longer sits on a line boundary the scan must start over: resuming
+	 * mid-record keeps entries and names from the replaced file while silently
+	 * dropping the record it landed inside.
+	 */
+	it("rescans from scratch when the file was rewritten in place and grew", async () => {
+		const path = join(dir, "in-place-rewrite.jsonl");
+		writeFileSync(
+			path,
+			headerLine() + messageLine("user", "before rewrite", 1000) + namedLine("legacy name"),
+			"utf8",
+		);
+		const before = statSync(path).size;
+		const ino = statSync(path).ino;
+		const first = await readSessionInfo(path);
+		expect(first?.messageCount).toBe(1);
+		expect(first?.name).toBe("legacy name");
+
+		// Same inode, longer, and the old stopping point now falls inside a line.
+		writeFileSync(
+			path,
+			headerLine() + messageLine("user", "after rewrite", 5000) + messageLine("assistant", "x".repeat(4096), 6000),
+			"utf8",
+		);
+		expect(statSync(path).ino).toBe(ino);
+		expect(statSync(path).size).toBeGreaterThan(before);
+		// State the premise: the byte before the recorded offset is not a newline.
+		expect(readFileSync(path)[before - 1]).not.toBe(0x0a);
+
+		const info = await expectMatchesFullScan(path);
+		expect(info?.messageCount).toBe(2);
+		expect(info?.name).toBeUndefined();
+		expect(info?.firstMessage).toBe("after rewrite");
 	});
 });

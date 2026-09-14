@@ -61,11 +61,19 @@ export interface FileLine {
  * Yield each newline-separated line together with where it ends, starting at
  * `startOffset`. A caller that only wants the text should use
  * `readLinesAsBuffers`.
+ *
+ * `endOffset` is derived from the stream position, not from the bytes yielded:
+ * a chunk starts at `startOffset` plus the length of every chunk before it, so a
+ * line whose terminating newline sits at index `end` of the current chunk ends
+ * at `chunkStartOffset + end + 1`. The bytes of that line that arrived in
+ * earlier chunks are already inside `chunkStartOffset`; adding only the closing
+ * fragment is what makes an offset fall behind the file for any line longer than
+ * a chunk, and the offset is a resume point for the next read.
  */
 export async function* readFileLines(filePath: string, startOffset = 0): AsyncGenerator<FileLine> {
 	const pendingParts: Buffer[] = [];
 	let pendingBytes = 0;
-	let consumed = startOffset;
+	let chunkStartOffset = startOffset;
 	for await (const chunk of createReadStream(filePath, { start: startOffset })) {
 		const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
 		let start = 0;
@@ -87,16 +95,68 @@ export async function* readFileLines(filePath: string, startOffset = 0): AsyncGe
 			} else {
 				line = buffer.subarray(start, end);
 			}
-			consumed += end - start + 1;
-			yield { line, endOffset: consumed, terminated: true };
+			yield { line, endOffset: chunkStartOffset + end + 1, terminated: true };
 			start = end + 1;
 		}
+		chunkStartOffset += buffer.length;
 	}
 	if (pendingParts.length > 0) {
 		const line = Buffer.concat(pendingParts, pendingBytes);
 		pendingParts.length = 0;
 		pendingBytes = 0;
-		yield { line, endOffset: consumed + line.length, terminated: false };
+		// Unterminated tail: its end is where the read stopped, which is the last
+		// chunk's own end. Callers must not resume from it (a later append may
+		// still extend the line), but it does say how far this read got.
+		yield { line, endOffset: chunkStartOffset, terminated: false };
+	}
+}
+
+export interface ResumePoint {
+	/** Byte offset just past the last newline-terminated line the read consumed. */
+	offset: number;
+	/** Byte position the read actually reached, `offset` included. */
+	reachedBytes: number;
+}
+
+/**
+ * Whether a recorded resume point may be used again.
+ *
+ * A read that stops at EOF reaches the size the file had when it was read, or
+ * more if the file grew while being read — never less. A point that claims
+ * fewer reached bytes than the size recorded beside it cannot account for the
+ * bytes it was supposed to have consumed, so resuming from it would re-read and
+ * re-count entries the previous read already counted. Callers that keep a
+ * resume point across appends must reject such a point and start over.
+ */
+export function isUsableResumePoint(point: ResumePoint, recordedSize: number): boolean {
+	if (!Number.isInteger(point.offset) || !Number.isInteger(point.reachedBytes)) return false;
+	if (point.offset < 0 || point.offset > point.reachedBytes) return false;
+	return point.reachedBytes >= recordedSize;
+}
+
+/**
+ * Whether `offset` is a byte position a read may resume from: the start of the
+ * file, or just past a newline. An offset that is not on a line boundary points
+ * into the middle of a record — a rewritten file, or a resume point recorded
+ * before the terminator was seen — and resuming there would misparse the rest of
+ * that line instead of failing loudly.
+ */
+export function isLineBoundarySync(filePath: string, offset: number): boolean {
+	if (offset === 0) return true;
+	if (offset < 0) return false;
+	let fd: number;
+	try {
+		fd = openSync(filePath, "r");
+	} catch {
+		return false;
+	}
+	try {
+		const lastByte = Buffer.allocUnsafe(1);
+		return readSync(fd, lastByte, 0, 1, offset - 1) === 1 && lastByte[0] === 0x0a;
+	} catch {
+		return false;
+	} finally {
+		closeSync(fd);
 	}
 }
 
