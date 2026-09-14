@@ -2,3 +2,23 @@
 {"id": "F2", "date": "2026-09-14", "severity": "P3", "status": "confirmed_pending_fix", "title": "PRIME_AGENT_FORK_GATE=off 静默旁路", "verified_by": "千问/DeepSeek 复检 + 母席抽验", "commit": null}
 {"id": "F3", "date": "2026-09-14", "severity": "P3", "status": "confirmed_pending_fix", "title": "collapseChangelog 文档有代码无", "verified_by": "千问/DeepSeek 复检 + 母席抽验", "commit": null}
 {"id": "F4", "date": "2026-09-14", "severity": "P3", "status": "confirmed_pending_fix", "title": "DEFAULT_KERNEL_HEARTBEAT_INTERVAL_MS 死导出", "verified_by": "千问/DeepSeek 复检 + 母席抽验", "commit": null}
+{"id": "PERF-ROSTER", "date": "2026-09-14", "severity": "P1", "status": "fixed", "commit": "bb061784e", "title": "roster 每次事件两遍全量扫描算本会话用量（memo 必然失效）", "verified_by": "longsession-static 实测 + 母席复算"}
+{"id": "PERF-CHILD-LOOKUP", "date": "2026-09-14", "severity": "P1", "status": "fixed", "commit": "1fd3fe02a", "title": "子会话每条 assistant 消息重扫整份转录找父条目（目标是 run 常量）", "verified_by": "r1-perf 实测 + 母席复算 + 先红后绿回归测试(3→9 红 / 3→3 绿)"}
+{"id": "F-A", "date": "2026-09-14", "severity": "P2", "status": "fixed", "commit": "9f72f6761", "title": "bash 输出以换行结尾且末行>50KB 时整段消失", "verified_by": "r1-correctness 报 + 母席复现 + 回归测试(2 红/2 绿正控→4 绿)"}
+{"id": "MR-1", "date": "2026-09-14", "severity": "P2", "status": "confirmed_pending_fix", "title": "openai-completions 无流失败诊断 ⇒ 永久错误在本机模型上被退避重发整份上下文", "verified_by": "r1-model-runtime 报 + 母席 grep 复核（7 provider 各 2 处、openai-completions 0 处）"}
+{"id": "S1", "date": "2026-09-14", "severity": "P2", "status": "confirmed_pending_fix", "title": "删除的子代理 artifact 目录被读路径静默重建", "verified_by": "r1-stability + 母席读码（cron-jobs:1613 无条件 mkdir；session-manager:1804 create 默认 true）"}
+{"id": "S2", "date": "2026-09-14", "severity": "P2", "status": "confirmed_pending_fix", "title": "三类只增不减的账（artifacts 6.0GB / 604 个 dill=4.0GB / logs 1989 文件 / TMPDIR 3149 目录），无回收器", "verified_by": "r1-stability + 母席 du 复核一致"}
+{"id": "S3", "date": "2026-09-14", "severity": "P2", "status": "confirmed_pending_fix", "title": "pi-bash 全量输出临时文件无上限无清理（153 文件/40MB）", "verified_by": "r1-stability + 母席复核"}
+{"id": "PERF-TREE", "date": "2026-09-14", "severity": "P2", "status": "confirmed_pending_fix", "title": "会话树深 10 万时快照序列化栈溢出；get_session_tree 90.3MB/次；/context 544 子会话 2.2s+读 1.08GB", "verified_by": "xval-perf 实测（母席未复算）"}
+{"id": "PERF-STREAM", "date": "2026-09-14", "severity": "P2", "status": "designing", "title": "流式增量重发整段内容（2 万字符=47.2MB 线上/2357×；10 万=1.14GB）", "verified_by": "longsession-dynamic 实测（母席未复算）"}
+{"id": "F1-E", "date": "2026-09-14", "severity": "P1", "status": "fixing", "title": "机器块可被伪造块头替换账本（对抗线打穿方案 D 的三处）", "verified_by": "attack-design 实测 + 母席读报告；加固方案 E 施工中"}
+{"id": "M1", "date": "2026-09-14", "severity": "P1", "status": "fixing", "title": "refine 结果永不回灌模型（convertToLlm 整类过滤）", "verified_by": "r1-intelligence + 母席读码 + kimi 深审（最小修 ~15 行）"}
+{"id": "M4", "date": "2026-09-14", "severity": "P1", "status": "design_done_pending_fix", "title": "注入记忆每种 kind 只 6 条字典序、无检索（954 条里 947 条不可见）", "verified_by": "r1-intelligence + 母席读码 + kimi 深审（建议 harness.search + updated_at 排序）"}
+{"id": "RETRACT-1", "date": "2026-09-14", "severity": "-", "status": "retracted", "title": "母席曾称 buildSessionContext 36ms 且每回合都走 —— 撤回（实测 12.4ms 且普通回合 0 次）", "verified_by": "xval-perf 复算"}
+{"id": "R1", "severity": "P2", "status": "fixing", "commit": null, "title": "回退位置只活在内存 ⇒ 重启后静默回到回退前位置", "verified_by": "R4 线实跑复现 + 母席读码（branch 只改 leafId、_persist 用 leafId 锚位）", "date": "2026-09-15"}
+{"id": "R2", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "archive/mark_interrupted 追加无租约无修尾 ⇒ 残尾粘连致 getSessionState undefined（频率未观测）", "verified_by": "R4 线实跑 + 正控", "date": "2026-09-15"}
+{"id": "A1", "severity": "P2", "status": "confirmed_pending_fix", "commit": null, "title": "内核自动快照只排 ok cell；通知仍宣称快照新鲜（死前 4s 的变量静默丢）", "verified_by": "R4-A 子线真内核实跑", "date": "2026-09-15"}
+{"id": "A2", "severity": "P2", "status": "confirmed_pending_fix", "commit": null, "title": "快照跳过名（不可 pickle/超限）两边都不点名；SnapshotResult.skipped 全仓无消费者", "verified_by": "R4-A 子线 + 通知正控", "date": "2026-09-15"}
+{"id": "A3", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "下划线开头顶层名不进快照/manifest/list_names（与系统提示相悖）", "verified_by": "R4-A 子线读 repl.py", "date": "2026-09-15"}
+{"id": "B2", "severity": "P2", "status": "unverified_by_mother", "commit": null, "title": "branch 非幂等：不完整 tool pair 尾巴下切走再切回少一条消息", "verified_by": "R4-B 线实跑 IDENTITY=false（报告方未独立复现）", "date": "2026-09-15"}
+{"id": "N1", "severity": "-", "status": "retracted", "commit": null, "title": "悬空 tool call 不是问题（transform-messages 已处理）——撤回不并档", "verified_by": "R4 线自证伪", "date": "2026-09-15"}
