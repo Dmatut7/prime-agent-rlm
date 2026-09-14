@@ -18,6 +18,7 @@
 - 证据纪律：不许把注释当证据；"不存在/无影响"必须附正控；验不了写 unverified
 - 冻结 SHA：本轮 = 审查时点的 HEAD，命令写死 SHA 不用 HEAD
 - 收尾必须回话给 parent（≤12 行）：Top 结论 + 证据路径 + 未完成项
+- **禁止触发全机停机/清扫（2026-09-15 加，事故：把老板正在用的 daemon 一起停了）**：任何审查/施工线**不许**跑 `prime-agent shutdown --force`、`shutdown --all`、`doctor --fix`、`daemon ps -k`。原因是 socket 路径按 uid 落在 tmpdir（`daemon-socket.ts:282-285`），只换 HOME/agentDir **隔离不了 socket**，而 `--force` 是全机发现（`daemon-ps.ts:421-495`）。要测停机行为必须在**自己的 TMPDIR** 下起自带 socket 的 daemon，或直接对假 transport 测。事故链：round-06 tool-silence 线在 /tmp/wt-toolfix 跑 `shutdown --force` → 19:04:32 共享 daemon（501）被停 → 客户端按设计进入终局态、19:48 老板手开才恢复。
 - **反卡死纪律（2026-09-15 加，血泪）**：一条审查线被看门狗以"静默 900s"判死、产出为零（报告与心跳都没写）。凡派线必须写死：①每步落心跳（先写发现再继续）②任何单次命令/脚本 ≤60s，大扫描分批 ③每 5~8 步把已确认结论写进产出文件 ④20~30 分钟收口。重派时**拆窄**（同一角度拆成两条线）。
 - **测试环境**：跑任何套件都要 unset 泄露变量，除了 RLM_*/PRIME_AGENT_*/PI_*，还有 **RLM_MAX_DEPTH**（实测：`agent-session-recursion.test.ts` 会因它多出 1 条失败；unset 后 121 项全绿）
 
