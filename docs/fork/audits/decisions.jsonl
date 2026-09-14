@@ -92,3 +92,4 @@
 {"id": "X5", "date": "2026-09-15", "severity": "P2", "status": "confirmed_pending_fix_win32_only", "commit": null, "title": "私有文件硬化在 win32 空转且无文件级 ACL 兜底", "verified_by": "R8 读码（SetNamedSecurityInfo 仅管道）"}
 {"id": "X6", "date": "2026-09-15", "severity": "P3", "status": "awaiting_owner_decision", "commit": null, "title": "win32 整段禁用常驻 harness（疑为未验证而非做不到）", "verified_by": "R8 读码 + 同层 44 处正常调用对照"}
 {"id": "PERF-UI", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "切界面慢：冷列目录 1.9s、大会话 open 405ms + attach 二次序列化 + 首帧 650ms、RSS +500MB 不回收；第一因是机器负载 13.55/10 核，我们放大内存churn", "verified_by": "两条性能线独立实测（含冷/热分离与 12.5× 冷热差）"}
+{"id": "SCAN-OFFSET", "date": "2026-09-15", "severity": "P1", "status": "fixing", "commit": null, "title": "readFileLines 漏计跨 chunk 长行字节（endOffset 偏小 16~39%）⇒ 活会话 append 后重复计行（messageCount +27%、inputTokens −59%）且每次白读 MB 级", "verified_by": "两条性能线独立实测（三档文件尺寸 + 活会话追加对照 + 清缓存真值）"}
