@@ -19,6 +19,7 @@ import { join } from "path";
 import lockfile from "proper-lockfile";
 import { getAgentDir } from "../config.js";
 import { ensurePrivateFile, readPrivateFile, writePrivateFileAtomic } from "../utils/private-files.js";
+import { sleepSync } from "../utils/sleep.js";
 import {
 	clearPrimeCliCredentials,
 	getPrimeCliConfigPath,
@@ -141,10 +142,8 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 					throw error;
 				}
 				lastError = error;
-				const start = Date.now();
-				while (Date.now() - start < delayMs) {
-					// Sleep synchronously to avoid changing callers to async.
-				}
+				// Sleep synchronously to avoid changing callers to async.
+				sleepSync(delayMs);
 			}
 		}
 
