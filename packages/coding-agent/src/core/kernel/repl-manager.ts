@@ -82,6 +82,8 @@ import {
 	DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES,
 	isolateCorruptSnapshot,
 	type RestoreResult,
+	readSnapshotManifest,
+	type SnapshotDroppedName,
 	type SnapshotPolicyAfterPartialRestore,
 	type SnapshotResult,
 	type SnapshotWriteBlockReason,
@@ -536,6 +538,14 @@ export class ReplKernelManager {
 	/** Last skipped-write reason already sent to the session log, so a blocked session logs the
 	 * state change once instead of once per cell. */
 	private reportedSnapshotSkipReason?: SnapshotWriteBlockReason;
+	/** Wall clock of the last successful snapshot write from this process, for the age the reset
+	 * notice reports. The payload's manifest is the primary source; this covers a runtime that
+	 * did not record a timestamp. */
+	private lastSnapshotWrittenAt?: number;
+	/** Names the last successful write reported it could not save (minus the ones carried over
+	 * from an older payload). Recorded because the write-side report had no consumer at all, and
+	 * used as the fallback when the manifest next to the payload cannot be read. */
+	private lastSnapshotNotSaved: SnapshotDroppedName[] = [];
 	private rebootstrapPromise?: Promise<boolean>;
 	private teardownInFlight = 0;
 
@@ -1225,6 +1235,10 @@ export class ReplKernelManager {
 				mayHaveTakenEffect: true,
 			}),
 		);
+		// Measured now, not at render time: by the time the notice reaches the model a replacement
+		// kernel may already have overwritten the payload, and "the payload on disk" only means the
+		// pre-death one here.
+		const snapshotWrittenAt = this.snapshotWrittenAt();
 		const dyingCellCode = this.activeExecution?.code ?? this.lastCellCode;
 		// Captured before the teardown rejects the cell: its result is thrown away, so the
 		// unattributed output it collected is only visible again if the revival keeps it.
@@ -1241,6 +1255,9 @@ export class ReplKernelManager {
 			...(Number.isFinite(policy.maxRestarts) ? { maxRestarts: policy.maxRestarts } : {}),
 			windowMinutes: Math.round(policy.windowMs / 60_000),
 			...(dyingCellCode === undefined ? {} : { repeatedCellCode: dyingCellCode }),
+			...(snapshotWrittenAt === undefined
+				? {}
+				: { snapshotWrittenBeforeDeathMs: Math.max(0, cause.at - snapshotWrittenAt) }),
 		});
 		return {
 			decision: {
@@ -1819,9 +1836,15 @@ export class ReplKernelManager {
 		const result = await this.enqueueExecute(code, opts);
 		// Refresh the on-disk snapshot after real work so a later resume (or a
 		// crash before graceful shutdown) revives the most recent namespace.
-		if (result.status === "ok") {
-			this.scheduleSnapshot();
-		}
+		//
+		// Every cell that ended queues this, not just a successful one: `x = 1` followed by `raise`
+		// is a common shape, and it mutates the namespace the same way a successful cell does. The
+		// old "ok only" gate left the payload at the last successful cell while the reset notice
+		// claimed a debounce-worth of freshness, so a variable defined seconds (or minutes) before
+		// the death was simply gone with nothing said about it. An aborted cell can have run
+		// partially too, and the debounce below coalesces all of this into one write per quiet
+		// period, so the extra queueing costs no extra writes.
+		this.scheduleSnapshot();
 		return result;
 	}
 
@@ -2728,6 +2751,29 @@ export class ReplKernelManager {
 	}
 
 	/**
+	 * Wall clock of the write that produced the payload on disk, or undefined when this host
+	 * cannot tell.
+	 *
+	 * The manifest the runtime writes next to the payload is the primary source: it survives the
+	 * process boundary a `--resume` crosses, which is exactly where this host has no write of its
+	 * own to report. A runtime that records no timestamp falls back to this process's last
+	 * successful write, then to the payload's own modification time. The answer feeds the reset
+	 * notice, which used to assert a fixed debounce instead of the age it can actually measure.
+	 */
+	private snapshotWrittenAt(): number | undefined {
+		const cfg = this.options.snapshot;
+		if (!cfg) return undefined;
+		const fromManifest = readSnapshotManifest(cfg.manifestPath)?.writtenAtMs;
+		if (fromManifest !== undefined) return fromManifest;
+		if (this.lastSnapshotWrittenAt !== undefined) return this.lastSnapshotWrittenAt;
+		try {
+			return statSync(cfg.path).mtimeMs;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
 	 * Report a refused write. The in-memory stderr ring this also writes to never leaves the
 	 * process, so a skipped snapshot used to be invisible everywhere; one session-log line per
 	 * reason makes it countable, and a successful write re-arms the report.
@@ -2801,9 +2847,29 @@ export class ReplKernelManager {
 					sessionId: this.options.sessionId,
 				});
 			}
+			const skipped = asReasonArray(r.doneFields.skipped);
+			// The write-side report used to be returned to nobody: a name this snapshot could not
+			// serialize vanished with no log line and no notice. Record it, report it once per
+			// write, and keep it as the fallback for a notice when the manifest cannot be read.
+			// A preserved name is in the payload (carried over verbatim), so it is not dropped.
+			const preservedSet = new Set(preserved);
+			this.lastSnapshotWrittenAt = Date.now();
+			this.lastSnapshotNotSaved = skipped.filter((entry) => !preservedSet.has(entry.name));
+			if (this.lastSnapshotNotSaved.length > 0) {
+				const names = this.lastSnapshotNotSaved.map((entry) => entry.name);
+				this.appendKernelDiagnostic(
+					`state snapshot did not save ${this.lastSnapshotNotSaved.length} name(s): ${this.lastSnapshotNotSaved
+						.map((entry) => `${entry.name} (${entry.reason})`)
+						.join("; ")}`,
+				);
+				kernelLog.warn("kernel state snapshot could not save names", {
+					names,
+					sessionId: this.options.sessionId,
+				});
+			}
 			return {
 				saved: asStringArray(r.doneFields.saved),
-				skipped: asReasonArray(r.doneFields.skipped),
+				skipped,
 				pruned: pruned.length > 0 ? pruned : undefined,
 				preserved: preserved.length > 0 ? preserved : undefined,
 				bytes: typeof r.doneFields.bytes === "number" ? r.doneFields.bytes : 0,
@@ -2906,8 +2972,19 @@ export class ReplKernelManager {
 			this.unrestoredNames.clear();
 			for (const failure of failed) this.unrestoredNames.add(failure.name);
 			const snapshotPolicy = this.currentSnapshotPolicyAfterRestore(failed.length);
+			// Names the payload never held cannot come back through `failed` (the runtime only
+			// reports what it tried to load), so they are read from the manifest that belongs to
+			// this payload and reported alongside. The in-process record of the last write covers
+			// a manifest that cannot be read; both describe the same payload.
+			const notSaved = readSnapshotManifest(cfg.manifestPath)?.notSaved ?? this.lastSnapshotNotSaved;
 			return {
-				result: { restored, failed, path: cfg.path, ...(snapshotPolicy ? { snapshotPolicy } : {}) },
+				result: {
+					restored,
+					failed,
+					path: cfg.path,
+					...(snapshotPolicy ? { snapshotPolicy } : {}),
+					...(notSaved.length > 0 ? { notSaved: [...notSaved] } : {}),
+				},
 				timedOut: false,
 			};
 		} catch (error) {

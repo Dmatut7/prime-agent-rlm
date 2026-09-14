@@ -7,7 +7,8 @@
  * snapshot, in a process that did not do the side effects the model is about to repeat. So the
  * notice states three facts, and the third one is the reason this module exists:
  *
- *  1. which point in time the namespace was rolled back to, and what failed to come back;
+ *  1. which point in time the namespace was rolled back to, and what failed to come back or was
+ *     never saved;
  *  2. that everything defined after that point is gone and must be recreated;
  *  3. that side effects are *not* rolled back - file writes, commits, sent messages, and spawned
  *     subagents all still exist, and the model's natural reaction to a lost kernel (re-run the
@@ -42,6 +43,32 @@ export interface KernelResetNoticeFacts {
 	hostRequests: readonly KernelHostRequestFact[];
 	/** The first cell after the revival repeats the cell that was running when the kernel died. */
 	repeatedCell?: boolean;
+	/**
+	 * How long before the death the payload that is being restored was written, measured when the
+	 * death was recorded. Absent when the host cannot tell (no snapshot target, nothing on disk).
+	 *
+	 * This replaced a fixed "about 1.5s" that only ever held when the last cell succeeded: the
+	 * snapshot debounce is an upper bound on how long after a cell the write starts, not a bound
+	 * on the age of the payload, and the model reasons from this number about what it still has.
+	 */
+	snapshotWrittenBeforeDeathMs?: number;
+}
+
+/** Seconds with enough precision to matter, and no false precision beyond that. */
+function formatAgeSeconds(ms: number): string {
+	const seconds = Math.max(0, ms) / 1000;
+	return seconds >= 10 ? String(Math.round(seconds)) : seconds.toFixed(1);
+}
+
+/**
+ * Where the restored namespace came from in time. Both branches end with the one bound that is
+ * always true: only the cells that ended before that write are in the payload.
+ */
+function snapshotAgeClause(facts: KernelResetNoticeFacts): string {
+	const clause = "anything a cell changed after that write is not in it";
+	const age = facts.snapshotWrittenBeforeDeathMs;
+	if (age === undefined) return `this host cannot tell when that write happened, so ${clause}`;
+	return `written about ${formatAgeSeconds(age)}s before the death, so ${clause}`;
 }
 
 function formatCause(cause: KernelDeathCause): string {
@@ -62,7 +89,7 @@ function rollbackLine(facts: KernelResetNoticeFacts): string {
 	const restore = facts.restore;
 	if (!restore) {
 		return (
-			"1. State was rolled back to the most recent snapshot (written up to about 1.5s before the death); " +
+			`1. State was rolled back to the most recent snapshot (${snapshotAgeClause(facts)}); ` +
 			"the saved namespace could not be revived, so treat this kernel as empty."
 		);
 	}
@@ -75,7 +102,13 @@ function rollbackLine(facts: KernelResetNoticeFacts): string {
 			? `These names came back: ${restore.restored.join(", ")}.`
 			: "No saved name could be revived.";
 	const missing = failed.length > 0 ? ` These could not be restored and must be rebuilt: ${failed.join(", ")}.` : "";
-	return `1. State was rolled back to the most recent snapshot (written up to about 1.5s before the death). ${revived}${missing}${retried}`;
+	// A name the snapshot never saved cannot fail to restore, so it would otherwise be absent from
+	// both this line and "must be rebuilt" - the exact silence this notice exists to break.
+	const notSaved =
+		restore.notSaved && restore.notSaved.length > 0
+			? ` These were live when that snapshot was written but were never saved into it, so they are gone and must be rebuilt: ${restore.notSaved.map((entry) => `${entry.name} (${entry.reason})`).join("; ")}.`
+			: "";
+	return `1. State was rolled back to the most recent snapshot (${snapshotAgeClause(facts)}). ${revived}${missing}${notSaved}${retried}`;
 }
 
 function hostRequestLines(requests: readonly KernelHostRequestFact[]): string[] {

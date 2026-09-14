@@ -91,9 +91,14 @@ input.on("line", (line) => {
     return;
   }
   if (request.type === "snapshot") {
+    // A faithful manifest (the payload's own record of what it holds), so the host-side reader
+    // sees the same facts the runtime reports in the done frame.
+    const skipped = process.env.FAKE_REPL_SNAPSHOT_SKIPPED
+      ? JSON.parse(process.env.FAKE_REPL_SNAPSHOT_SKIPPED)
+      : [];
     fs.writeFileSync(request.path, "payload");
-    fs.writeFileSync(request.manifest_path, "{}");
-    emit({ event: "done", id: request.id, status: "ok", saved: ["saved_name"], skipped: [], bytes: 7 });
+    fs.writeFileSync(request.manifest_path, JSON.stringify({ savedNames: ["saved_name"], skipped }));
+    emit({ event: "done", id: request.id, status: "ok", saved: ["saved_name"], skipped, bytes: 7 });
     return;
   }
   if (request.type === "shutdown") {
@@ -140,6 +145,8 @@ function newHarness(
 		backgroundLine?: boolean;
 		hostHandlers?: boolean;
 		restartPolicy?: () => { maxRestarts: number; windowMs: number };
+		/** Names the fake snapshot reports it could not save, as the real runtime would. */
+		snapshotSkipped?: { name: string; reason: string }[];
 	} = {},
 ): Harness {
 	const python = join(tempDir, "python");
@@ -166,6 +173,7 @@ function newHarness(
 			FAKE_REPL_BACKGROUND_LINE: backgroundFlagPath,
 			FAKE_REPL_REQUEST_LOG: requestLogPath,
 			FAKE_REPL_HANG_FIRST_RESTORES: String(options.hangFirstRestores ?? 0),
+			...(options.snapshotSkipped ? { FAKE_REPL_SNAPSHOT_SKIPPED: JSON.stringify(options.snapshotSkipped) } : {}),
 		},
 		onLateHostReply: (reply) => lateReplies.push(reply),
 		bootstrapCode: "bootstrap",
@@ -268,6 +276,29 @@ describe("kernel revival after an unexpected exit", () => {
 			const revived = await harness.manager.execute("1 + 1");
 			expect(revived.status).toBe("ok");
 			expect(restoreAttempts(harness)).toBe(1);
+		} finally {
+			await harness.manager.shutdown();
+		}
+	});
+
+	it("names the names the snapshot could not save, and measures the age it reports", async () => {
+		const harness = newHarness({
+			snapshot: true,
+			snapshotSkipped: [{ name: "gen", reason: "TypeError: cannot pickle 'generator' object" }],
+		});
+		try {
+			await harness.manager.execute("seed");
+			await vi.waitFor(() => expect(existsSync(harness.snapshotPath)).toBe(true), { timeout: 15_000 });
+			await expect(harness.manager.execute("die9")).rejects.toThrow();
+			await harness.manager.execute("1 + 1");
+			const notice = harness.manager.consumeRestartNotice();
+			expect(notice).toBeDefined();
+			// The payload never held `gen`, so no restore failure can report it: the only channel is
+			// the manifest the write left next to the payload.
+			expect(notice).toContain("gen (TypeError: cannot pickle 'generator' object)");
+			// And the rollback point is the measured write age, not a fixed debounce claim.
+			expect(notice).not.toContain("1.5s");
+			expect(notice).toMatch(/written about \d+(\.\d+)?s before the death/);
 		} finally {
 			await harness.manager.shutdown();
 		}
