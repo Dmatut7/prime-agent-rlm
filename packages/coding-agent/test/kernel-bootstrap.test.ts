@@ -100,11 +100,24 @@ function writeFakePython(filePath: string, importableModules: readonly string[])
 	);
 }
 
-function installFakeUv(): string {
+/**
+ * Installs a fake `uv`. `venvUnreadyImports` and `venvRuntimeReady` describe a runtime that
+ * installs without error yet does not satisfy the host's readiness check, which is the state the
+ * post-install recheck has to surface instead of reporting "ready".
+ */
+function installFakeUv(options: { venvUnreadyImports?: readonly string[]; venvRuntimeReady?: boolean } = {}): string {
 	const binDir = join(tempDir, "bin");
 	mkdirSync(binDir, { recursive: true });
 	const logPath = join(tempDir, "uv.log");
-	const extraImportCases = DEFAULT_RLM_EXTRA_IMPORT_NAMES.map((moduleName) => `    "import ${moduleName}") exit 0 ;;`);
+	const unreadyImports = options.venvUnreadyImports ?? [];
+	const unreadyImportCases = unreadyImports.map((moduleName) => `    "import ${moduleName}") exit 1 ;;`);
+	const extraImportCases = DEFAULT_RLM_EXTRA_IMPORT_NAMES.filter(
+		(moduleName) => !unreadyImports.includes(moduleName),
+	).map((moduleName) => `    "import ${moduleName}") exit 0 ;;`);
+	const runtimeReadyCase =
+		options.venvRuntimeReady === false
+			? '    *"_harness_methods"*) exit 1 ;;'
+			: '    *"_harness_methods"*) exit 0 ;;';
 	process.env.UV_LOG = logPath;
 	process.env.PATH = `${binDir}${process.env.PATH ? `:${process.env.PATH}` : ""}`;
 	writeExecutable(
@@ -123,9 +136,10 @@ function installFakeUv(): string {
 			"#!/bin/sh",
 			'if [ "$1" = "-P" ] && [ "$2" = "-c" ]; then',
 			'  case "$3" in',
+			...unreadyImportCases,
 			'    "import rlm") exit 0 ;;',
 			...extraImportCases,
-			'    *"_harness_methods"*) exit 0 ;;',
+			runtimeReadyCase,
 			"    *) exit 1 ;;",
 			"  esac",
 			"fi",
@@ -535,6 +549,33 @@ dependencies = ["httpx"]
 		await expect(ensureKernelPython()).resolves.toBe(join(venv, "bin", "python"));
 
 		expect(readFileSync(logPath, "utf8")).toContain(`venv ${venv} --python 3.11 --seed`);
+	});
+
+	it("rejects a freshly installed venv whose runtime is not ready", async () => {
+		installFakeUv({ venvRuntimeReady: false });
+		const base = join(tempDir, "kernel-venv");
+		// Bootstrap builds into a generation directory next to the base; the base itself
+		// only names the family and holds the lock.
+		const venv = await activeKernelVenvDir(base);
+		process.env.PRIME_AGENT_KERNEL_VENV = base;
+		const progress: string[] = [];
+
+		const failure = await ensureKernelPython({ onProgress: (message) => progress.push(message) }).then(
+			() => undefined,
+			(error: Error) => error,
+		);
+
+		expect(failure?.message).toMatch(/missing a current prime-agent-runtime with callable rlm\.run/);
+		expect(failure?.message).toContain(venv);
+		expect(progress).not.toContain("✓ ready");
+	});
+
+	it("rejects a freshly installed venv missing a default package the install claimed", async () => {
+		installFakeUv({ venvUnreadyImports: ["yaml"] });
+		const base = join(tempDir, "kernel-venv");
+		process.env.PRIME_AGENT_KERNEL_VENV = base;
+
+		await expect(ensureKernelPython()).rejects.toThrow(/default Python packages \(yaml \(PyYAML\)\)/);
 	});
 
 	it("uses PRIME_AGENT_KERNEL_PYTHON as an override contract", async () => {

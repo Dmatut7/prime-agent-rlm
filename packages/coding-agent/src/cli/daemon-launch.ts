@@ -16,6 +16,7 @@ import {
 	DAEMON_FIRST_PARTY_CONTROL_CAPABILITIES,
 	DAEMON_PROTOCOL_VERSION,
 	DAEMON_SCHEMA_ID,
+	type DaemonRuntimeIdentity,
 } from "../modes/daemon/daemon-protocol.js";
 import { getDaemonRuntimeIdentity } from "../modes/daemon/daemon-runtime-identity.js";
 import { isSessionSummaryBusy, type SessionSummary } from "../modes/daemon/daemon-session-list.js";
@@ -71,12 +72,98 @@ type DaemonVersionProbe =
 	| { status: "stale"; hello: DaemonHello }
 	| { status: "unresponsive" };
 
-function isCurrentDaemonHello(hello: DaemonHello): boolean {
-	return (
-		hello.protocol.version === DAEMON_PROTOCOL_VERSION &&
-		hello.schemaId === DAEMON_SCHEMA_ID &&
-		hello.appVersion === VERSION
-	);
+/** The parts of a daemon hello the reuse decision reads. */
+export interface DaemonReuseHello {
+	protocol: { version: number };
+	schemaId?: string;
+	appVersion?: string;
+	runtime?: DaemonRuntimeIdentity;
+}
+
+export type DaemonReuseDecision = "reuse" | "reuse-with-warning" | "replace";
+
+export interface DaemonReuseVerdict {
+	decision: DaemonReuseDecision;
+	/** One line for the launch log: why this client keeps or replaces the running daemon. */
+	reason: string;
+}
+
+/**
+ * Whether this client may reuse a running daemon.
+ *
+ * Protocol, wire schema, and app version decide first: a mismatch there is a wire-level
+ * incompatibility and the daemon is replaced.
+ *
+ * `buildId` is local reuse policy, not a wire contract, but it is the only thing that sees a
+ * `npm run build`: the daemon supervisor keeps the module graph it loaded at spawn while every worker
+ * it starts later loads `process.argv[1]` from disk (`subprocess-launch.ts`), so one daemon lifetime
+ * can serve two builds. Ignoring the build id makes "the fix I just built is still broken" a silent
+ * state; the two ids are only comparable when both processes were launched the same way (the same
+ * `PRIME_AGENT_LAUNCHER_PATH`, or neither set). A shell wrapper exports a build id computed at launch
+ * time while an installed CLI carries the id baked into its bundle, so treating that difference as
+ * staleness would replace a healthy daemon on every launch. A daemon that reports no build id at all
+ * is not comparable either: it is kept, with a warning, rather than killed on an unknown.
+ */
+export function judgeDaemonReuse(hello: DaemonReuseHello, clientIdentity: DaemonRuntimeIdentity): DaemonReuseVerdict {
+	const daemonIdentity = `daemon v${hello.appVersion ?? "unknown"}/protocol ${hello.protocol.version}/schema ${hello.schemaId ?? "legacy"}/build ${hello.runtime?.buildId ?? "unknown"}`;
+	const clientIdentityText = `client v${VERSION}/protocol ${DAEMON_PROTOCOL_VERSION}/schema ${DAEMON_SCHEMA_ID}/build ${clientIdentity.buildId}`;
+	const staleFields: string[] = [];
+	if (hello.protocol.version !== DAEMON_PROTOCOL_VERSION) {
+		staleFields.push(`protocol ${hello.protocol.version} != ${DAEMON_PROTOCOL_VERSION}`);
+	}
+	if (hello.schemaId !== DAEMON_SCHEMA_ID) {
+		staleFields.push(`schema ${hello.schemaId ?? "legacy"} != ${DAEMON_SCHEMA_ID}`);
+	}
+	if (hello.appVersion !== VERSION) {
+		staleFields.push(`app version ${hello.appVersion ?? "unknown"} != ${VERSION}`);
+	}
+	if (staleFields.length > 0) {
+		return {
+			decision: "replace",
+			reason: `running daemon is stale (${staleFields.join(", ")}): ${daemonIdentity} vs ${clientIdentityText}`,
+		};
+	}
+	const daemonBuildId = hello.runtime?.buildId;
+	if (!daemonBuildId) {
+		return {
+			decision: "reuse-with-warning",
+			reason:
+				`reusing a running daemon that reports no build identity (${daemonIdentity} vs ${clientIdentityText}); ` +
+				"it may predate the last build and cannot be compared with this client",
+		};
+	}
+	if (daemonBuildId === clientIdentity.buildId) {
+		return {
+			decision: "reuse",
+			reason: `accepting running daemon: protocol, schema, app version, and build ${daemonBuildId} all match this client`,
+		};
+	}
+	const daemonLauncher = hello.runtime?.launcherPath;
+	const clientLauncher = clientIdentity.launcherPath;
+	if (daemonLauncher === clientLauncher) {
+		return {
+			decision: "replace",
+			reason:
+				`running daemon is built from different code: ${daemonIdentity} vs ${clientIdentityText} ` +
+				`(same launch identity ${daemonLauncher ?? "none"}); replacing it so one daemon serves one build`,
+		};
+	}
+	return {
+		decision: "reuse-with-warning",
+		reason:
+			`reusing a daemon from a different launch identity (daemon launcher ${daemonLauncher ?? "none"} vs ` +
+			`client ${clientLauncher ?? "none"}) although its build differs: ${daemonIdentity} vs ${clientIdentityText}`,
+	};
+}
+
+/** One line per socket and verdict: `probeDaemonVersion` also runs inside a startup poll loop. */
+const loggedDaemonReuseReasons = new Set<string>();
+
+function logDaemonReuseVerdict(socketPath: string, verdict: DaemonReuseVerdict): void {
+	const key = `${socketPath}\0${verdict.decision}\0${verdict.reason}`;
+	if (loggedDaemonReuseReasons.has(key)) return;
+	loggedDaemonReuseReasons.add(key);
+	logDaemonLaunch(`daemon on ${socketPath}: ${verdict.reason}`);
 }
 
 /** Connect to a running daemon and check whether it matches this client's protocol and app version. */
@@ -99,18 +186,14 @@ export async function probeDaemonVersion(socketPath: string, helloTimeoutMs = 20
 	}
 	try {
 		const hello = await client.waitForHello(helloTimeoutMs);
-		const current = isCurrentDaemonHello(hello);
-		if (!current) {
-			logDaemonLaunch(
-				`running daemon on ${socketPath} is stale: daemon v${hello.appVersion}/proto${hello.protocol.version}` +
-					`/schema ${hello.schemaId ?? "legacy"}/build ${hello.runtime?.buildId ?? "unknown"} vs client ` +
-					`v${VERSION}/proto${DAEMON_PROTOCOL_VERSION}/schema ${DAEMON_SCHEMA_ID}/build ${getDaemonRuntimeIdentity().buildId}`,
-			);
+		const verdict = judgeDaemonReuse(hello, getDaemonRuntimeIdentity());
+		// Logged for every verdict, reuse included: "why did this client keep the daemon that was
+		// already running" is exactly the question a stale-bundle bug leaves open.
+		logDaemonReuseVerdict(socketPath, verdict);
+		if (verdict.decision === "replace") {
+			return { status: "stale", hello };
 		}
-		if (current) {
-			return { status: "current", hello };
-		}
-		return { status: "stale", hello };
+		return { status: "current", hello };
 	} catch {
 		// The supervisor accepts connections before startup and worker adoption finish.
 		logDaemonLaunch(`running daemon on ${socketPath} sent no recognizable hello; waiting for startup`);
@@ -336,7 +419,7 @@ async function shutdownStaleDaemonIfNotBusy(socketPath: string): Promise<StaleDa
 	}
 
 	const hello = client.hello;
-	if (hello && isCurrentDaemonHello(hello)) {
+	if (hello && judgeDaemonReuse(hello, getDaemonRuntimeIdentity()).decision !== "replace") {
 		client.close();
 		logDaemonLaunch(`daemon on ${socketPath} finished starting while staleness was being checked; reusing it`);
 		return "current";

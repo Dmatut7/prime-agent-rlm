@@ -1,18 +1,25 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	ensureInteractiveDaemonRunning,
+	judgeDaemonReuse,
 	probeDaemonVersion,
 	probeRunningDaemonSessions,
 	shouldStartDaemonEarly,
 	shutdownDaemonAndWait,
 } from "../src/cli/daemon-launch.js";
-import { ENV_AGENT_DIR, getDaemonLogPath, VERSION } from "../src/config.js";
-import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../src/modes/daemon/daemon-protocol.js";
+import { ENV_AGENT_DIR, getClientErrorLogPath, getDaemonLogPath, VERSION } from "../src/config.js";
+import type { DaemonHello } from "../src/modes/daemon/daemon-client.js";
+import {
+	DAEMON_PROTOCOL_VERSION,
+	DAEMON_SCHEMA_ID,
+	type DaemonRuntimeIdentity,
+} from "../src/modes/daemon/daemon-protocol.js";
+import { PRIME_AGENT_BUILD_ID_ENV } from "../src/modes/daemon/daemon-runtime-identity.js";
 
 interface FakeDaemonOptions {
 	/** Sessions returned for a `list` command. */
@@ -26,6 +33,9 @@ interface FakeDaemonOptions {
 	appVersion?: string;
 	schemaId?: string;
 	firstSchemaId?: string;
+	/** Build identity the daemon reports in its hello; `undefined` sends no runtime identity. */
+	runtimeBuildId?: string;
+	runtimeLauncherPath?: string;
 	serverCapabilities?: string[];
 	shouldSendHello?: (connectionIndex: number) => boolean;
 	onConnection?: (connectionIndex: number) => void;
@@ -61,6 +71,15 @@ async function startFakeDaemon(options: FakeDaemonOptions = {}): Promise<FakeDae
 						: (options.schemaId ?? DAEMON_SCHEMA_ID),
 				clientId: "fake-client",
 				serverCapabilities: options.serverCapabilities ?? [],
+				...((options.runtimeBuildId ?? options.runtimeLauncherPath)
+					? {
+							runtime: {
+								buildId: options.runtimeBuildId ?? "fake-build",
+								executablePath: process.execPath,
+								...(options.runtimeLauncherPath ? { launcherPath: options.runtimeLauncherPath } : {}),
+							},
+						}
+					: {}),
 			});
 		}
 		let buffer = "";
@@ -186,6 +205,138 @@ server.listen(socketPath, () => process.stdout.write("ready\\n"));`,
 		},
 	};
 }
+
+interface ReuseHelloOverrides {
+	protocolVersion?: number;
+	schemaId?: string;
+	appVersion?: string;
+	/** `null` sends a hello without any runtime identity. */
+	buildId?: string | null;
+	launcherPath?: string;
+}
+
+function reuseHello(overrides: ReuseHelloOverrides = {}): DaemonHello {
+	const buildId = overrides.buildId === undefined ? "client-build" : overrides.buildId;
+	return {
+		type: "daemon_hello",
+		socketPath: "/tmp/prime-agent-reuse.sock",
+		protocol: { name: "prime-agent.daemon", version: overrides.protocolVersion ?? DAEMON_PROTOCOL_VERSION },
+		schemaId: overrides.schemaId ?? DAEMON_SCHEMA_ID,
+		appVersion: overrides.appVersion ?? VERSION,
+		clientId: "test-client",
+		serverCapabilities: [],
+		...(buildId === null
+			? {}
+			: {
+					runtime: {
+						buildId,
+						executablePath: "/usr/bin/node",
+						...(overrides.launcherPath ? { launcherPath: overrides.launcherPath } : {}),
+					},
+				}),
+	};
+}
+
+const clientIdentity: DaemonRuntimeIdentity = {
+	buildId: "client-build",
+	executablePath: "/usr/bin/node",
+	entrypointPath: "/repo/packages/coding-agent/dist/bundle/cli.js",
+};
+
+describe("judgeDaemonReuse", () => {
+	it("reuses a daemon whose protocol, schema, app version, and build all match", () => {
+		const verdict = judgeDaemonReuse(reuseHello(), clientIdentity);
+		expect(verdict.decision).toBe("reuse");
+		expect(verdict.reason).toContain("client-build");
+	});
+
+	it.each([
+		["protocol version", { protocolVersion: DAEMON_PROTOCOL_VERSION + 1 }, /protocol/],
+		["wire schema", { schemaId: "protocol-7-schema-29-older" }, /schema/],
+		["app version", { appVersion: "0.0.1" }, /app version/],
+	])("replaces a daemon whose %s is stale", (_label, overrides, reasonPattern) => {
+		const verdict = judgeDaemonReuse(reuseHello(overrides), clientIdentity);
+		expect(verdict.decision).toBe("replace");
+		expect(verdict.reason).toMatch(reasonPattern);
+	});
+
+	it("replaces a daemon built from different code behind the same launcher identity", () => {
+		const verdict = judgeDaemonReuse(reuseHello({ buildId: "bundle-before-the-build" }), clientIdentity);
+		expect(verdict.decision).toBe("replace");
+		expect(verdict.reason).toContain("bundle-before-the-build");
+		expect(verdict.reason).toContain("client-build");
+	});
+
+	it("only warns when the two build ids come from different launch identities", () => {
+		const verdict = judgeDaemonReuse(
+			reuseHello({ buildId: "bundle-before-the-build", launcherPath: "/repo/prime-agent.sh" }),
+			clientIdentity,
+		);
+		expect(verdict.decision).toBe("reuse-with-warning");
+		expect(verdict.reason).toContain("bundle-before-the-build");
+	});
+
+	it("only warns about a daemon that reports no build identity at all", () => {
+		const verdict = judgeDaemonReuse(reuseHello({ buildId: null }), clientIdentity);
+		expect(verdict.decision).toBe("reuse-with-warning");
+		expect(verdict.reason).toMatch(/no build identity/);
+	});
+});
+
+/** Runs `check` with the client-errors log pointed at a throwaway agent dir. */
+async function withTempAgentDir(check: () => Promise<void>): Promise<void> {
+	const dir = mkdtempSync(join(tmpdir(), "pa-launch-agentdir-"));
+	const originalAgentDir = process.env[ENV_AGENT_DIR];
+	const originalBuildId = process.env[PRIME_AGENT_BUILD_ID_ENV];
+	process.env[ENV_AGENT_DIR] = dir;
+	try {
+		await check();
+	} finally {
+		if (originalAgentDir === undefined) delete process.env[ENV_AGENT_DIR];
+		else process.env[ENV_AGENT_DIR] = originalAgentDir;
+		if (originalBuildId === undefined) delete process.env[PRIME_AGENT_BUILD_ID_ENV];
+		else process.env[PRIME_AGENT_BUILD_ID_ENV] = originalBuildId;
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+
+describe("probeDaemonVersion build identity", () => {
+	const cleanups: Array<() => Promise<void>> = [];
+	afterEach(async () => {
+		await Promise.all(cleanups.splice(0).map((fn) => fn()));
+	});
+
+	it("treats a daemon built from a different bundle as stale and logs both build ids", async () => {
+		await withTempAgentDir(async () => {
+			const daemon = await startFakeDaemon({
+				appVersion: VERSION,
+				runtimeBuildId: "bundle-before-the-build",
+			});
+			cleanups.push(daemon.close);
+			process.env[PRIME_AGENT_BUILD_ID_ENV] = "bundle-after-the-build";
+
+			await expect(probeDaemonVersion(daemon.socketPath)).resolves.toMatchObject({ status: "stale" });
+
+			const log = readFileSync(getClientErrorLogPath(), "utf8");
+			expect(log).toContain("bundle-before-the-build");
+			expect(log).toContain("bundle-after-the-build");
+		});
+	});
+
+	it("reuses a daemon whose build id matches and records why", async () => {
+		await withTempAgentDir(async () => {
+			const daemon = await startFakeDaemon({ appVersion: VERSION, runtimeBuildId: "shared-build" });
+			cleanups.push(daemon.close);
+			process.env[PRIME_AGENT_BUILD_ID_ENV] = "shared-build";
+
+			await expect(probeDaemonVersion(daemon.socketPath)).resolves.toMatchObject({ status: "current" });
+
+			const log = readFileSync(getClientErrorLogPath(), "utf8");
+			expect(log).toContain("shared-build");
+			expect(log).toContain("daemon-launch:");
+		});
+	});
+});
 
 describe("probeRunningDaemonSessions", () => {
 	const cleanups: Array<() => Promise<void>> = [];
