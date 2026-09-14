@@ -16,8 +16,11 @@
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { getLogger } from "@earendil-works/pi-ai";
 import { estimateTextTokensByContent } from "./content-density.js";
 import { findMachineBlock, renderMachineBlock } from "./machine-blocks.js";
+
+const compactionLog = getLogger("coding-agent.compaction");
 
 export type UserRequestKind = "user" | "bash";
 
@@ -302,7 +305,10 @@ function renderLine(record: UserRequestRecord): string {
 		t: record.text,
 	};
 	if (record.originalChars && record.originalChars > record.text.length) wire.x = record.originalChars;
-	return JSON.stringify(wire);
+	// `<` is JSON-escaped so a payload that quotes a block delimiter cannot end the
+	// block early: the JSON parse restores it byte-exact, and a block written before
+	// this rule still parses (JSON.parse accepts both spellings).
+	return JSON.stringify(wire).replace(/</g, "\\u003c");
 }
 
 function renderBody(records: readonly UserRequestRecord[]): string {
@@ -354,6 +360,21 @@ export function parseUserRequests(text: string): UserRequestLedger | undefined {
 			originalChars: Number.isFinite(wire.x) ? Math.trunc(wire.x as number) : undefined,
 			kind: wire.k === "bash" ? "bash" : "user",
 		});
+	}
+	// The block states its own record count on the opening tag. A mismatch means the block
+	// was damaged (a delimiter inside a payload, a hand edit) and lines were skipped above:
+	// say so, because a truncated block that reports nothing is the failure this parser
+	// exists to prevent.
+	const declaredCount = Number.parseInt(block.attributes.count ?? "", 10);
+	if (Number.isFinite(declaredCount) && declaredCount !== records.length) {
+		compactionLog.warn(
+			"<user-requests> block is damaged: its declared count does not match the records parsed back",
+			{
+				declaredCount,
+				parsedRecords: records.length,
+				generation,
+			},
+		);
 	}
 	return {
 		generation: Number.isFinite(generation) && generation > 0 ? generation : 1,

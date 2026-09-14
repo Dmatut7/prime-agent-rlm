@@ -1,0 +1,1 @@
+- Fixed compaction machine blocks ending early when the user text or an error signature they carry quoted a block delimiter, which silently dropped the rest of the block from the next generation and left block JSON in the text sent back to the summarizer. Record lines now JSON-escape `<`, and a damaged block reports itself instead of parsing back short.

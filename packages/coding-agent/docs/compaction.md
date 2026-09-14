@@ -332,6 +332,12 @@ The user's own words from the compacted transcript, ...
 </user-requests>
 ```
 
+Record lines are JSON, and `<` is written as `\u003c` inside them: a payload that quotes a
+block delimiter (`</user-requests>`, say) therefore cannot end its block early, while `JSON.parse`
+restores the character exactly and a block written before this rule still parses. The file-list
+blocks carry paths verbatim instead — they have no JSON layer to hide behind — so a path that
+reads as a delimiter is reported with a warning rather than silently truncating the list.
+
 Everything from `<read-files>` down is machine-generated (see [Fidelity](#fidelity-what-survives-without-the-model)). The narrative above it is the model's; the blocks are rebuilt from the transcript on every compaction and are stripped out of the previous summary before it is sent back to the model. Branch summaries carry the file blocks only.
 
 ### Message Serialization

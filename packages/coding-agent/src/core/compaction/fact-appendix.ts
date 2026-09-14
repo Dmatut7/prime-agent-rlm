@@ -22,8 +22,11 @@
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { getLogger } from "@earendil-works/pi-ai";
 import { estimateTextTokensByContent } from "./content-density.js";
 import { findMachineBlock, renderMachineBlock } from "./machine-blocks.js";
+
+const compactionLog = getLogger("coding-agent.compaction");
 
 export type FactKind = "sha" | "path" | "number" | "error" | "issue";
 
@@ -773,7 +776,10 @@ function renderFactLine(record: FactRecord): string {
 		g: `${record.firstGeneration}-${record.lastGeneration}`,
 	};
 	if (record.context) wire.c = record.context;
-	return JSON.stringify(wire);
+	// `<` is JSON-escaped so a payload that quotes a block delimiter cannot end the
+	// block early: the JSON parse restores it byte-exact, and a block written before
+	// this rule still parses (JSON.parse accepts both spellings).
+	return JSON.stringify(wire).replace(/</g, "\\u003c");
 }
 
 /** Render the appendix block for a summary; an empty ledger renders nothing. */
@@ -839,6 +845,19 @@ export function parseFactAppendix(text: string): FactLedger | undefined {
 		if (!FACT_KINDS.includes(kind)) continue;
 		const count = Number.parseInt(entry.slice(separator + 1), 10);
 		if (Number.isFinite(count) && count > 0) elided[kind] = count;
+	}
+	// Same self-check as the user-request block: `facts` is written on the opening tag, so a
+	// gap between the declaration and the records parsed back is damage worth reporting.
+	const declaredFacts = Number.parseInt(block.attributes.facts ?? "", 10);
+	if (Number.isFinite(declaredFacts) && declaredFacts !== records.length) {
+		compactionLog.warn(
+			"<fact-appendix> block is damaged: its declared fact count does not match the records parsed back",
+			{
+				declaredFacts,
+				parsedRecords: records.length,
+				generation,
+			},
+		);
 	}
 	return { generation: Number.isFinite(generation) && generation > 0 ? generation : 1, records, elided };
 }

@@ -15,6 +15,7 @@
 
 | 日期 | 这轮干了什么 |
 |---|---|
+| 2026-09-14 夜 | 修机器块被内容截断的静默丢数据缺陷：块体承载用户原话与错误签名，却只转义了属性；正文里出现 `</user-requests>` / `</fact-appendix>` 字面量就会提前收口，让下一代少读记录，并把块 JSON 残留进喂给摘要模型的前文（details 在场也每代必走）。现在记录行内 `<` 写成 `\u003c`（解析侧零改动、老摘要照读、新摘要旧版本也能读），受损块按开标签的 count 自我报警，文件列表块无法承载分隔符时不再静默截断 |
 | 2026-09-14 | 修 CI 红：昨晚两个提交给队列清过期终局通知时用了一种新写法，源码守卫测试的白名单没跟上被误红（写法本身安全，只删不增）；把该写法登记进白名单，CI 恢复绿 |
 | 2026-09-13 深夜 | CI 首次真跑（run 34753200385）4 条红 job 逐枚归因并修：8 枚失败测试里 5 枚是我们自己的测试与源码脱节（502 / interactive-mode-status 的私有方法 harness 缺新协作者，4602×2 的 worker 夹具缺 `isConnected`，eviction 的 create 夹具没把新 worker 注册进 `workers`），1 枚是 4600 的「post-bind 启动失败」触发器失效——本 fork 把 cron 迁移降级为 best-effort（3d935f674，上游没有这层）后坏存档不再让启动失败，改为在真实 post-bind 步骤注入失败并让报错自证「socket 已绑定」，同时钉住「坏 cron 存档只降级不拦启动」；剩下 4603＋4606 是同一根因：`daemon ps`/`doctor --fix`/`shutdown --force` 是**全机**发现（`ss -lxp` 按进程名，见 daemon-ps.ts 头注），在并行分片里 4603 把 4606 刚起的无会话 supervisor 当「闲置后台服务」收走，两条互相拖红——改为 4603 单独一条 CI job 跑、`test:ci` 排除它（顺带拆掉「在开发机上跑全量测试会关掉你自己正在用的 daemon」这颗雷）。用户 / AI 可感面＝CI 信号可信度：agents 视图 Enter 的锚点宽限、换会话时的重试倒计时清理、快照替换后的 catch-up、a2a 投递按 create 时会话目录解析这四处行为重新有测试守着 |
 | 2026-09-13 夜 | 修两条 CI 暗病：CI 触发面补上 `merge/repl-kernel`（此前只认 `main`，本 fork 日常推送从不跑 CI，只有给上游提 PR 时才跑）；`coding-agent kernel` 这条 job 不再假绿——先用产品自己的 bootstrap 造源码后端 venv（`bootstrap-cli.ts --with-bundled-skills`）并把解释器钉进 `PRIME_AGENT_KERNEL_PYTHON`，跑完再用 vitest JSON 报告过一道反假绿闸（`numTotalTests >= 30` 且整片 skip 的文件数 = 0，闸自带 planted-false-green 自测）。用户 / AI 可感面＝内核真运行时面的 28 枚测试（10 个文件）从此在 CI 上真跑，此前它们静默 `describe.skip` 而 job 照样报绿 |

@@ -629,8 +629,14 @@ describe("fact appendix round trip", () => {
 			expect(survivors).toHaveLength(ledger.records.length);
 		}
 		// The block that reaches generation 8 still carries every generation-3 value byte-exactly.
+		// Compared through the parser rather than as a raw JSON substring: a value containing `<`
+		// is JSON-escaped on the wire, so a substring check would be pinned to one spelling.
+		const reparsed = parseFactAppendix(carriedText);
+		expect(ledger.records.length).toBeGreaterThan(0);
 		for (const record of ledger.records) {
-			expect(carriedText).toContain(JSON.stringify(record.value));
+			expect(
+				reparsed?.records.some((candidate) => candidate.value === record.value && candidate.kind === record.kind),
+			).toBe(true);
 		}
 		expect(parseFactAppendix(carriedText)?.generation).toBe(8);
 	});

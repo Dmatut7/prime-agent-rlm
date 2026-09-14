@@ -4,7 +4,12 @@
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
+import { getLogger } from "@earendil-works/pi-ai";
 import { findMachineBlock, parseBlockLines } from "./machine-blocks.js";
+
+const compactionLog = getLogger("coding-agent.compaction");
+/** A line that would read as a machine-block delimiter when this text is parsed back. */
+const BLOCK_DELIMITER_LINE = /<\/?(?:read-files|modified-files|fact-appendix|user-requests)\b/;
 export interface FileOperations {
 	read: Set<string>;
 	written: Set<string>;
@@ -90,6 +95,20 @@ export function formatFileOperations(readFiles: string[], modifiedFiles: string[
 		sections.push(`<modified-files>\n${modifiedFiles.join("\n")}\n</modified-files>`);
 	}
 	if (sections.length === 0) return "";
+	// The list blocks carry paths verbatim, so an entry that reads as a delimiter would end its
+	// block early on the next parse and silently truncate the list. Escaping is not available
+	// here (a plain line has no JSON layer, and inventing an escape would make a path that
+	// already contains it ambiguous), so the damage is at least never silent.
+	for (const entry of [...readFiles, ...modifiedFiles]) {
+		if (BLOCK_DELIMITER_LINE.test(entry)) {
+			compactionLog.warn(
+				"a tracked path reads as a machine-block delimiter; the file lists cannot carry it verbatim",
+				{
+					entry,
+				},
+			);
+		}
+	}
 	return `\n\n${sections.join("\n\n")}`;
 }
 
