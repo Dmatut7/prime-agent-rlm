@@ -10,7 +10,7 @@ import {
 	planKernelVenvGenerationReclaim,
 	readKernelVenvInUseState,
 } from "../kernel/venv-in-use.js";
-import { reclaimWithinBudget } from "./delete.js";
+import { reclaimWithinBudget, statSignature } from "./delete.js";
 import {
 	type RetentionClassContext,
 	type RetentionClassModule,
@@ -39,7 +39,7 @@ export const kernelVenvGenerationsModule: RetentionClassModule = {
 		// Retained / referenced generations are reported with the same reasons the
 		// boot path would use, so a sweep report explains why a build survived.
 		for (const dir of generations) {
-			const state = await readKernelVenvInUseState(dir);
+			const state = await readKernelVenvInUseState(dir, { sweepStale: !context.dryRun });
 			if (state.unknown || state.references.length > 0 || state.bootClaims.length > 0) {
 				skipped.push({
 					path: dir,
@@ -47,7 +47,29 @@ export const kernelVenvGenerationsModule: RetentionClassModule = {
 				});
 			}
 		}
-		const plan = await planKernelVenvGenerationReclaim(base, { retention: context.settings.venvRetention });
+		if (!context.settings.venvReclaim) {
+			// Report only. The boot path (bootstrap.ts) prunes with the generation it is
+			// about to spawn from named in `activeDir`; a sweep cannot name that
+			// generation, and removing it breaks a boot that is about to exec it
+			// (adversarial review F-2). `retention.venvReclaim` turns the removal on for
+			// an operator who accepts that residual window.
+			return {
+				class: "kernel-venv-generations",
+				scanned: generations.length,
+				reclaimed: 0,
+				bytes: 0,
+				skipped,
+				capped: false,
+				disabled: true,
+			};
+		}
+		// Never the newest generation: with `retention >= 1` the most recent
+		// unreferenced generation survives every sweep, the only residual protection
+		// available to a sweep that cannot name the boot's build identity.
+		const plan = await planKernelVenvGenerationReclaim(base, {
+			retention: Math.max(1, context.settings.venvRetention),
+			sweepStale: !context.dryRun,
+		});
 		const requests = plan.remove.map((entry) => ({
 			path: entry.dir,
 			kind: "dir" as const,
@@ -55,6 +77,7 @@ export const kernelVenvGenerationsModule: RetentionClassModule = {
 			// One entry per generation directory: the byte cap already bounds how much
 			// one sweep can free, and re-walking a venv only to count files is waste.
 			entries: 1,
+			...(statSignature(entry.dir) ? { signature: statSignature(entry.dir) } : {}),
 		}));
 		for (const kept of plan.kept) {
 			skipped.push({

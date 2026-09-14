@@ -19,7 +19,7 @@
 // (red test R-15). Deleting a deleted session's snapshot is the artifact-residue
 // class's job, and only for a session that is provably gone.
 import type { Dirent } from "node:fs";
-import { lstatSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { getProcessStartId, isProcessAlive } from "../session-lease.js";
 import { reclaimWithinBudget } from "./delete.js";
@@ -137,7 +137,10 @@ function isNodeError(error: unknown, code: string): boolean {
  * reference files are removed in passing (they are this module's own
  * bookkeeping, not user data) and the stale holder frees its generation.
  */
-export function readKernelSnapshotGenerationState(artifactDir: string): KernelSnapshotGenerationState {
+export function readKernelSnapshotGenerationState(
+	artifactDir: string,
+	options: { sweepStale?: boolean } = {},
+): KernelSnapshotGenerationState {
 	const dir = kernelSnapshotGenerationsDir(artifactDir);
 	const state: KernelSnapshotGenerationState = {
 		referenced: new Set(),
@@ -178,11 +181,15 @@ export function readKernelSnapshotGenerationState(artifactDir: string): KernelSn
 		const record = readReferenceRecord(referencePath);
 		const stale = record === undefined || Number(pidName) !== record.pid || !referenceIsLive(record);
 		if (stale) {
-			try {
-				rmSync(referencePath, { force: true });
-				state.swept.push(referencePath);
-			} catch {
-				// Left for the next sweep; it does not count as a reference either.
+			// Read-only mode for a dry run: dropping a stale reference is a filesystem
+			// change, so a dry run only reports that it is not counted (review N-2).
+			if (options.sweepStale !== false) {
+				try {
+					rmSync(referencePath, { force: true });
+					state.swept.push(referencePath);
+				} catch {
+					// Left for the next sweep; it does not count as a reference either.
+				}
 			}
 			continue;
 		}
@@ -201,6 +208,14 @@ export function readKernelSnapshotGenerationState(artifactDir: string): KernelSn
 export interface KernelSnapshotReclaimPlan {
 	remove: { path: string; bytes: number }[];
 	kept: { path: string; reason: "referenced" | "retained" | "unknown" }[];
+	/**
+	 * The in-place payload (`kernel-state.dill`) is present. It is never a
+	 * generation candidate: a kernel spawned by a host that predates this module
+	 * runs from it without leaving a reference, so "no references" is not evidence
+	 * that it is free (red test R-15). Reported so a reader can see why a directory
+	 * that holds a payload produced no generation work.
+	 */
+	legacyPayload: boolean;
 }
 
 /**
@@ -210,11 +225,14 @@ export interface KernelSnapshotReclaimPlan {
  */
 export function planKernelSnapshotReclaim(
 	artifactDir: string,
-	options: { retention?: number; now?: number } = {},
+	options: { retention?: number; now?: number; sweepStale?: boolean } = {},
 ): KernelSnapshotReclaimPlan {
 	const retention = Math.max(0, options.retention ?? RETIRED_KERNEL_SNAPSHOT_RETENTION);
-	const state = readKernelSnapshotGenerationState(artifactDir);
-	const plan: KernelSnapshotReclaimPlan = { remove: [], kept: [] };
+	const state = readKernelSnapshotGenerationState(artifactDir, {
+		...(options.sweepStale !== undefined ? { sweepStale: options.sweepStale } : {}),
+	});
+	const plan: KernelSnapshotReclaimPlan = { remove: [], kept: [], legacyPayload: false };
+	plan.legacyPayload = existsSync(join(artifactDir, LEGACY_KERNEL_SNAPSHOT_BASENAME));
 	const dir = kernelSnapshotGenerationsDir(artifactDir);
 	const unreferenced: { path: string; bytes: number; recencyMs: number }[] = [];
 	for (const name of state.generations) {
@@ -302,6 +320,7 @@ export const kernelSnapshotGenerationsModule: RetentionClassModule = {
 			const plan = planKernelSnapshotReclaim(artifactDir, {
 				retention: context.settings.kernelSnapshotGenerations,
 				now: context.now,
+				sweepStale: !context.dryRun,
 			});
 			scanned += plan.kept.length + plan.remove.length;
 			for (const kept of plan.kept) {

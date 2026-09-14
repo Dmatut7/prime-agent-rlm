@@ -296,6 +296,15 @@ export interface RetentionSettings {
 	kernelSnapshotReclaimEnabled?: boolean;
 	/** Retired kernel venv generations kept. Default: 1 (RETIRED_VENV_RETENTION). */
 	venvRetention?: number;
+	/**
+	 * Let the sweep reclaim retired kernel venv generations. Default: false.
+	 * The boot path already prunes with the generation it is about to spawn from
+	 * excluded, and a sweep cannot name that generation (adversarial review F-2:
+	 * without it, an unreferenced *active* generation can be removed). Turning this
+	 * on keeps the newest generation of every build identity plus the newest retired
+	 * one, and only reclaims generations no live kernel references.
+	 */
+	venvReclaim?: boolean;
 }
 
 export interface TerminalSettings {
@@ -1840,5 +1849,6 @@ export function resolveRetentionSettings(settings?: RetentionSettings): Resolved
 		),
 		kernelSnapshotReclaimEnabled: settings?.kernelSnapshotReclaimEnabled === true,
 		venvRetention: normalizeRetentionCount(settings?.venvRetention, RETIRED_VENV_RETENTION),
+		venvReclaim: settings?.venvReclaim === true,
 	};
 }

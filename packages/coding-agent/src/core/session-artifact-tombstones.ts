@@ -22,14 +22,17 @@
 // directory whose age cannot be established, keeps the directory.
 import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { appendPrivateFile, ensurePrivateDirectory, writePrivateFileAtomicLines } from "../utils/private-files.js";
+import { appendPrivateFile, writePrivateFileAtomicLines } from "../utils/private-files.js";
 import { isValidSessionId } from "./session-id.js";
 
 /** File name of the per-root tombstone log. Not a valid session id (leading dot). */
 export const SESSION_ARTIFACT_TOMBSTONE_FILENAME = ".session-tombstones.jsonl";
 
-/** Rewrite the log once it holds more than this many records, keeping the newest per id. */
-const MAX_RECORDS_BEFORE_COMPACT = 4096;
+// The log is append-only. An earlier version compacted it in place once it grew past
+// a record count, which is a lock-free read-modify-write: two processes appending at
+// the same time would lose one record, and a lost tombstone resurrects a deleted
+// session's directory (adversarial review N-6). A record is ~90 bytes and one delete
+// writes one, so the log stays small enough to leave alone.
 
 const RECORD_VERSION = 1;
 
@@ -137,7 +140,11 @@ export function tombstoneInForce(
 	if (newestWriteMs === undefined) return true;
 	const deletedAtMs = Date.parse(tombstone.deletedAt);
 	if (Number.isNaN(deletedAtMs)) return false;
-	return newestWriteMs <= deletedAtMs;
+	// Strict: a directory written in the same millisecond as the deletion (or on a
+	// filesystem with one-second timestamps, in the same second) might be a reused
+	// id whose first write raced the deletion record. "Cannot disprove reuse" keeps
+	// the directory and the session's cron registration (adversarial review N-7).
+	return newestWriteMs < deletedAtMs;
 }
 
 /**
@@ -184,26 +191,16 @@ export function recordSessionArtifactTombstone(
 		...(options.reason ? { reason: options.reason } : {}),
 	};
 	try {
-		if (!existsSync(artifactRoot)) {
-			ensurePrivateDirectory(artifactRoot);
-		}
+		// Only an existing root gets a tombstone. Creating one here would make "delete a
+		// session that never wrote artifacts" leave a new directory behind (adversarial
+		// review N-5), and a root that does not exist holds nothing to resurrect: the
+		// read paths this tombstone guards would have to create the root themselves.
+		if (!existsSync(artifactRoot)) return false;
 		appendPrivateFile(sessionArtifactTombstonePath(artifactRoot), `${compactRecords([record])[0] ?? ""}\n`);
 	} catch {
 		return false;
 	}
 	cache.delete(sessionArtifactTombstonePath(artifactRoot));
-	try {
-		const records = [...readSessionArtifactTombstones(artifactRoot).values()];
-		if (records.length > MAX_RECORDS_BEFORE_COMPACT) {
-			writePrivateFileAtomicLines(
-				sessionArtifactTombstonePath(artifactRoot),
-				`${compactRecords(records).join("\n")}\n`,
-			);
-			cache.delete(sessionArtifactTombstonePath(artifactRoot));
-		}
-	} catch {
-		// The appended line is already durable; compaction is opportunistic.
-	}
 	return true;
 }
 
@@ -216,6 +213,9 @@ export function clearSessionArtifactTombstone(artifactRoot: string, sessionId: s
 	if (!isValidSessionId(sessionId)) return;
 	if (!existsSync(sessionArtifactTombstonePath(artifactRoot))) return;
 	try {
+		// Re-read rather than reuse a cached map: the rewrite must not drop a record
+		// another process appended, and this is the one path that rewrites the log.
+		cache.delete(sessionArtifactTombstonePath(artifactRoot));
 		const records = [...readSessionArtifactTombstones(artifactRoot).values()].filter(
 			(record) => record.sessionId !== sessionId,
 		);

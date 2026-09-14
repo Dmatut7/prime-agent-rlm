@@ -10,7 +10,7 @@
 // prediction instead of a different program (design section 4).
 import { readdirSync } from "node:fs";
 import { basename, join } from "node:path";
-import { classifyLeaseDirectory } from "../session-lease.js";
+import { activeSessionLeaseDirectories, classifyLeaseDirectory } from "../session-lease.js";
 import { artifactEmptyDirsModule, artifactResidueModule } from "./artifact-dirs.js";
 import { bashTempFilesModule } from "./bash-temp.js";
 import { childTranscriptsModule } from "./child-transcripts.js";
@@ -110,7 +110,9 @@ export function collectLiveReferences(options: {
 		transcriptIds: new Map<string, string>(),
 		sessionRootIds,
 		leasedSessionIds,
-		activeLeaseDirectories: options.activeLeaseDirectories ?? new Set<string>(),
+		// Production callers pass nothing, so the in-process set of this very process is
+		// the default: a lease this process holds is not stale (review N-8).
+		activeLeaseDirectories: options.activeLeaseDirectories ?? activeSessionLeaseDirectories(),
 	};
 }
 
