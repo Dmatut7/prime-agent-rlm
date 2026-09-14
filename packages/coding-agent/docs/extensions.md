@@ -1859,7 +1859,13 @@ pi.registerTool({
 
 ### Overriding Built-in Tools
 
-Extensions can override built-in tools (`ipython`, `bash`, `edit`) by registering a tool with the same name. Interactive mode displays a warning when this happens.
+Extensions can override built-in tools (`ipython`, `bash`, `edit`) by registering a tool with the same name. The override is reported as a conflict warning that names both sources and a free tool name:
+
+```
+Tool name conflict for "ipython": provided by /path/to/my-extension.ts (extension tool) and <builtin:ipython> (builtin tool). Using /path/to/my-extension.ts (extension tool); <builtin:ipython> (builtin tool) is unreachable and cannot be called. Rename one of the conflicting tools (the name "ipython2" is free).
+```
+
+The warning is shown in the startup diagnostics listing and sent as a UI notification (interactive mode) or written to stderr (headless/RPC/SDK sessions). Session code can read the machine-readable list with `AgentSession.getToolDiagnostics()`, and extension-runner collisions (two extensions registering the same tool name, where the first registration wins and the other tool is unreachable) with `ExtensionRunner.getToolDiagnostics()`.
 
 ```bash
 # Extension's ipython tool replaces built-in ipython

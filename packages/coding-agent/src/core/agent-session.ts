@@ -131,6 +131,7 @@ import {
 import type { AgentCronJob, AgentRlmHeartbeatController, AgentRlmHeartbeatStatusUpdate } from "./cron-jobs.js";
 import { normalizeHeartbeatDeliveryMode } from "./cron-jobs.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
+import type { ResourceDiagnostic } from "./diagnostics.js";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.js";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.js";
 import {
@@ -400,6 +401,7 @@ export type CompactionReason = "manual" | "threshold" | "overflow" | "requested"
 const sessionLog = getLogger("coding-agent.agent-session");
 
 import type { StallDiagnostics } from "./stall-diagnostics.js";
+import { detectToolNameConflicts, type ToolNameSource } from "./tool-name-conflicts.js";
 
 export type { StallDiagnostics };
 
@@ -1596,6 +1598,8 @@ export class AgentSession {
 	private _modelRegistry: ModelRegistry;
 
 	private _toolRegistry: Map<string, AgentTool> = new Map();
+	private readonly _warnedToolNameConflicts = new Set<string>();
+	private readonly _notifiedToolNameConflicts = new Set<string>();
 	private _toolDefinitions: Map<string, ToolDefinitionEntry> = new Map();
 	private _toolPromptSnippets: Map<string, string> = new Map();
 	private _toolPromptGuidelines: Map<string, string[]> = new Map();
@@ -5325,6 +5329,53 @@ export class AgentSession {
 
 	getToolDefinition(name: string): ToolDefinition | undefined {
 		return this._toolDefinitions.get(name)?.definition;
+	}
+
+	private _collectToolNameSources(): ToolNameSource[] {
+		const sources: ToolNameSource[] = [];
+		const allowedToolNames = this._allowedToolNames;
+		const isAllowedTool = (name: string): boolean => !allowedToolNames || allowedToolNames.has(name);
+		for (const name of this._baseToolDefinitions.keys()) {
+			if (!isAllowedTool(name)) continue;
+			sources.push({ name, kind: "builtin", label: `<builtin:${name}>` });
+		}
+		for (const tool of this._extensionRunner.getAllRegisteredTools()) {
+			if (!isAllowedTool(tool.definition.name)) continue;
+			const path = tool.sourceInfo?.path ?? `<extension:${tool.definition.name}>`;
+			sources.push({ name: tool.definition.name, kind: "extension", label: path, path });
+		}
+		for (const tool of this._customTools) {
+			if (!isAllowedTool(tool.name)) continue;
+			sources.push({ name: tool.name, kind: "sdk", label: `<sdk:${tool.name}>` });
+		}
+		for (const tool of this._acpMcpTools) {
+			if (!isAllowedTool(tool.name)) continue;
+			sources.push({ name: tool.name, kind: "acp-mcp", label: `<acp-mcp:${tool.name}>` });
+		}
+		return sources;
+	}
+
+	/**
+	 * Tool name collisions in the session tool registry: a custom tool that reuses a built-in name
+	 * (allowed, the custom tool wins) or two custom tools from different sources fighting over one
+	 * name. Extension-vs-extension collisions are reported by the extension runner instead.
+	 */
+	getToolDiagnostics(): ResourceDiagnostic[] {
+		return detectToolNameConflicts(this._collectToolNameSources(), "last-wins").diagnostics;
+	}
+
+	private _reportToolNameConflicts(): void {
+		for (const diagnostic of this.getToolDiagnostics()) {
+			if (this._extensionRunner.hasUI()) {
+				if (this._notifiedToolNameConflicts.has(diagnostic.message)) continue;
+				this._notifiedToolNameConflicts.add(diagnostic.message);
+				this._extensionRunner.getUIContext().notify(diagnostic.message, "warning");
+			} else {
+				if (this._warnedToolNameConflicts.has(diagnostic.message)) continue;
+				this._warnedToolNameConflicts.add(diagnostic.message);
+				console.warn(diagnostic.message);
+			}
+		}
 	}
 
 	setActiveToolsByName(toolNames: string[]): void {
@@ -11168,6 +11219,7 @@ export class AgentSession {
 		}
 
 		this._applyExtensionBindings(this._extensionRunner);
+		this._reportToolNameConflicts();
 		await this._extensionRunner.emit(this._sessionStartEvent);
 		await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
 	}
@@ -11438,6 +11490,7 @@ export class AgentSession {
 			toolRegistry.set(tool.name, tool);
 		}
 		this._toolRegistry = toolRegistry;
+		this._reportToolNameConflicts();
 
 		const nextActiveToolNames = (
 			options?.activeToolNames ? [...options.activeToolNames] : [...previousActiveToolNames]

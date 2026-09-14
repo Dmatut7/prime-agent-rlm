@@ -11,6 +11,7 @@ import type { KeybindingsConfig } from "../keybindings.js";
 import type { ModelRegistry } from "../model-registry.js";
 import type { SessionManager } from "../session-manager.js";
 import type { BuildSystemPromptOptions } from "../system-prompt.js";
+import { detectToolNameConflicts, type ToolNameSource } from "../tool-name-conflicts.js";
 import {
 	awaitWithTimeout,
 	DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS,
@@ -263,6 +264,8 @@ export class ExtensionRunner {
 	private shutdownHandler: ShutdownHandler = () => {};
 	private shortcutDiagnostics: ResourceDiagnostic[] = [];
 	private commandDiagnostics: ResourceDiagnostic[] = [];
+	private readonly warnedToolDiagnostics = new Set<string>();
+	private readonly notifiedToolDiagnostics = new Set<string>();
 	private staleMessage: string | undefined;
 	private readonly handlerTimeoutMs: number;
 
@@ -370,6 +373,9 @@ export class ExtensionRunner {
 
 	setUIContext(uiContext?: ExtensionUIContext): void {
 		this.uiContext = uiContext ?? noOpUIContext;
+		// A conflict that was already reported to stderr before the UI existed is still worth a
+		// notification now that there is a UI to show it in.
+		this.reportToolNameConflicts();
 	}
 
 	getUIContext(): ExtensionUIContext {
@@ -384,6 +390,43 @@ export class ExtensionRunner {
 		return this.extensions.map((e) => e.path);
 	}
 
+	private collectToolSources(): ToolNameSource[] {
+		const sources: ToolNameSource[] = [];
+		for (const ext of this.extensions) {
+			for (const tool of ext.tools.values()) {
+				sources.push({
+					name: tool.definition.name,
+					kind: "extension",
+					label: ext.path,
+					path: ext.path,
+				});
+			}
+		}
+		return sources;
+	}
+
+	/**
+	 * Tool name collisions between extensions (first registration per name wins, the loser is
+	 * unreachable). Computed on demand so it is available before the first refresh.
+	 */
+	getToolDiagnostics(): ResourceDiagnostic[] {
+		return detectToolNameConflicts(this.collectToolSources(), "first-wins").diagnostics;
+	}
+
+	private reportToolNameConflicts(): void {
+		for (const diagnostic of this.getToolDiagnostics()) {
+			if (this.hasUI()) {
+				if (this.notifiedToolDiagnostics.has(diagnostic.message)) continue;
+				this.notifiedToolDiagnostics.add(diagnostic.message);
+				this.uiContext.notify(diagnostic.message, "warning");
+			} else {
+				if (this.warnedToolDiagnostics.has(diagnostic.message)) continue;
+				this.warnedToolDiagnostics.add(diagnostic.message);
+				console.warn(diagnostic.message);
+			}
+		}
+	}
+
 	/** Get all registered tools from all extensions (first registration per name wins). */
 	getAllRegisteredTools(): RegisteredTool[] {
 		const toolsByName = new Map<string, RegisteredTool>();
@@ -394,6 +437,7 @@ export class ExtensionRunner {
 				}
 			}
 		}
+		this.reportToolNameConflicts();
 		return Array.from(toolsByName.values());
 	}
 
