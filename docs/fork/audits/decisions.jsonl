@@ -108,3 +108,7 @@
 {"id": "H-1", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "卡死警告在 abortAfterSeconds=0 时宣称\"0s 后自动中止\"，而 0 的语义是只警告不中止", "verified_by": "R11 探针逐字复现 + 900s 正控"}
 {"id": "H-2", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "设置落盘失败只进内部错误缓冲无人消费，界面已显示绿字 saved（坏 JSON / 目录不可写时文件零变化）", "verified_by": "R11 探针 B1/B2 实测"}
 {"id": "H-3", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "\"Full output: <path>\" 指向从未创建的文件；未捕获 stream error 炸宿主（daemon process.exit(1)）", "verified_by": "R11 探针 C（TMPDIR=0555）+ 同仓 fail-loud 对照"}
+{"id": "TEL-1", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "trace 出网链零密钥预检：带 userinfo 的 git remote 原样进 X-Git-Repo 头+PUT 体（/share 有预检、这条没有）", "verified_by": "R11 探针实测头 dump；头/体两处独立构造"}
+{"id": "TEL-2", "date": "2026-09-15", "severity": "P3", "status": "fixing", "commit": null, "title": "trace 记账写进真实 agentDir（75 条 outbox + 75 行 uploaded 指向测试临时目录）；mock 上传也记 uploaded", "verified_by": "R11 真机只读采样"}
+{"id": "TEL-3", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "DO_NOT_TRACK=1 拦不住启动期版本检查（UA 带平台与 node 版本）", "verified_by": "R11 探针对照遥测链"}
+{"id": "TEL-4", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "遥测提示只有 stderr 一条路径、全局一次性可被 worker/--print 先消耗、UI 零出现", "verified_by": "R11 读码"}
