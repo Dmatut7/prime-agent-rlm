@@ -34,7 +34,7 @@ function writeCells(chunks: { stream: "stdout" | "stderr"; letter: string; size:
 	return lines.join("\n");
 }
 
-describe.skipIf(kernelPythonMissing)("ReplKernelManager output cap boundary", () => {
+describe.skipIf(kernelPythonMissing)("ReplKernelManager output cap boundary", { tags: ["kernel-heavy"] }, () => {
 	let dir = "";
 	let manager: ReplKernelManager | undefined;
 
