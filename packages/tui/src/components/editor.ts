@@ -4,12 +4,17 @@ import { getKeybindings } from "../keybindings.js";
 import { decodePrintableKey, matchesKey } from "../keys.js";
 import { KillRing } from "../kill-ring.js";
 import { getSlashCommandContext, type SlashCommandContext } from "../slash-command-context.js";
+import { BULK_TEXT_MIN_RUN } from "../stdin-buffer.js";
 import { type Component, CURSOR_MARKER, type Focusable, type OverlayHandle, type TUI } from "../tui.js";
 import { UndoStack } from "../undo-stack.js";
 import { getSegmenter, isPunctuationChar, isWhitespaceChar, truncateToWidth, visibleWidth } from "../utils.js";
 import { SelectList, type SelectListLayoutOptions, type SelectListTheme } from "./select-list.js";
 
 const baseSegmenter = getSegmenter();
+
+/** Bracketed paste markers as sent by the terminal and re-wrapped by terminal.ts. */
+const PASTE_START = "\x1b[200~";
+const PASTE_END = "\x1b[201~";
 
 /** Regex matching paste markers like `[paste #1 +123 lines]` or `[paste #2 1234 chars]`. */
 const PASTE_MARKER_REGEX = /\[paste #(\d+)( (\+\d+ lines|\d+ chars))?\]/g;
@@ -734,28 +739,35 @@ export class Editor implements Component, Focusable {
 			this.jumpMode = null;
 		}
 
-		if (data.includes("\x1b[200~")) {
+		if (data.includes(PASTE_START)) {
 			this.isInPaste = true;
 			this.pasteBuffer = "";
-			data = data.replace("\x1b[200~", "");
+			data = data.replace(PASTE_START, "");
 		}
 
 		if (this.isInPaste) {
 			this.pasteBuffer += data;
-			const endIndex = this.pasteBuffer.indexOf("\x1b[201~");
-			if (endIndex !== -1) {
-				const pasteContent = this.pasteBuffer.substring(0, endIndex);
-				if (pasteContent.length > 0) {
-					this.handlePaste(pasteContent);
-				}
-				this.isInPaste = false;
-				const remaining = this.pasteBuffer.substring(endIndex + 6);
-				this.pasteBuffer = "";
-				if (remaining.length > 0) {
-					this.handleInput(remaining);
-				}
+			// The paste ends only at the end marker that ends the buffered bytes.
+			// Pasted bytes carry no escaping: content copied out of a terminal can
+			// contain the marker itself, and everything that followed such a marker
+			// inside the same paste is text, never key input.
+			if (!this.pasteBuffer.endsWith(PASTE_END)) {
 				return;
 			}
+			const pasteContent = this.pasteBuffer.slice(0, -PASTE_END.length);
+			this.isInPaste = false;
+			this.pasteBuffer = "";
+			if (pasteContent.length > 0) {
+				this.handlePaste(pasteContent);
+			}
+			return;
+		}
+
+		// Bulk text from StdinBuffer (a paste from a terminal without bracketed
+		// paste, a pipe) is inserted in one pass: one undo unit, one change
+		// notification, and line breaks split into lines as a paste would.
+		if (data.length >= BULK_TEXT_MIN_RUN) {
+			this.insertBulkText(data);
 			return;
 		}
 
@@ -1168,6 +1180,22 @@ export class Editor implements Component, Focusable {
 	 */
 	private normalizeText(text: string): string {
 		return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/\t/g, "    ");
+	}
+
+	/**
+	 * Insert a bulk text sequence (longer than any keystroke) at once. The
+	 * consumer used to receive these one character at a time, which re-copied the
+	 * whole buffer - and rebuilt the host's expanded text - once per character.
+	 */
+	private insertBulkText(text: string): void {
+		if (text.length === 0) {
+			return;
+		}
+		this.cancelAutocomplete();
+		this.historyIndex = -1;
+		this.lastAction = null;
+		this.pushUndoSnapshot();
+		this.insertTextAtCursorInternal(text);
 	}
 
 	/**

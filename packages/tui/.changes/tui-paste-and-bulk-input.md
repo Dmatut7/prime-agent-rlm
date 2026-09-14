@@ -1,0 +1,2 @@
+- Fixed bracketed paste truncating at an end marker inside the pasted bytes and running the rest as key input; a paste now ends when its byte stream settles, and everything received is inserted as text.
+- Fixed large non-bracketed input (a paste without bracketed-paste support, a pipe, an oversized paste) being delivered one character at a time, which re-copied the whole prompt per character; bulk input now arrives as a few large sequences and is inserted in one pass.
