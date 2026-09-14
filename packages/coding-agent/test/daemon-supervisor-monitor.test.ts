@@ -3993,7 +3993,13 @@ describe("daemon worker supervisor monitoring", () => {
 			{
 				type: "worker_subscribe",
 				activeSessionId: "active-1",
-				capabilities: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"],
+				capabilities: [
+					"attach_snapshot",
+					"event_sequence",
+					"slim_attach",
+					"chunked_snapshot",
+					"streaming_delta_fragments",
+				],
 				supportsExtensionUi: false,
 			},
 			30_000,
