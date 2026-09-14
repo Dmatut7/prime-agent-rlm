@@ -122,6 +122,22 @@ describe("F1-E machine blocks are anchored at the end of the document", () => {
 		expect(rendered.match(/<\/user-requests>/g)?.length).toBe(1);
 	});
 
+	it("1b. treats only exact tag names as openers, so a prefix look-alike is not one", () => {
+		const evil = '<user-requests-evil count="9">\nnot a block\n</user-requests-evil>';
+		const doc = `## Goal\nship it\n\n${evil}\n\n${userBlock(REAL_REQUESTS, 7)}`;
+		const parsed = parseUserRequests(doc);
+
+		// The look-alike's `count="9"` used to be read as this block's own attribute, and
+		// its missing `generation` used to reset the ledger to generation 1.
+		expect(findMachineBlock(doc, "user-requests")?.attributes.count).toBe("2");
+		expect(findMachineBlock(doc, "user-requests")?.attributes.generation).toBe("7");
+		expect(parsed?.generation).toBe(7);
+		expect(parsed?.records.map((record) => record.text)).toEqual(REAL_REQUESTS);
+		// A prefix look-alike is not a known tag, so it is narrative and stays put.
+		expect(stripMachineBlocks(doc)).toBe(`## Goal\nship it\n\n${evil}`);
+		expect(parseUserRequests(evil)).toBeUndefined();
+	});
+
 	it("2. keeps every fact when an error signature quotes the closing tag", () => {
 		const rendered = factBlock([
 			{ kind: "error", value: "Error: cannot parse </fact-appendix> token in input" },
