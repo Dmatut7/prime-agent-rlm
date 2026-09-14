@@ -11,10 +11,13 @@ import {
 	type AgentMessage,
 	type AgentState,
 	type AgentTool,
+	formatToolCallIdCollisions,
 	type GetContinuationMessagesContext,
 	isEmptyTurnRetryExhausted,
+	readToolCallIdCollisions,
 	type ShouldStopAfterTurnContext,
 	type ThinkingLevel,
+	TOOL_CALL_ID_COLLISION_DIAGNOSTIC_TYPE,
 } from "@earendil-works/pi-agent-core";
 import type {
 	Api,
@@ -4720,6 +4723,7 @@ export class AgentSession {
 				this._lastAssistantMessage = event.message;
 
 				const assistantMsg = event.message as AssistantMessage;
+				this._reportToolCallIdCollisions(assistantMsg);
 				if (assistantMsg.stopReason !== "error") {
 					addAutonomousUsage(this._autonomousState, assistantMsg.usage);
 				}
@@ -13967,6 +13971,28 @@ export class AgentSession {
 
 	private _isAgentLifecycleFailure(message: AssistantMessage): boolean {
 		return message.diagnostics?.some((diagnostic) => diagnostic.type === "agent_lifecycle_failure") ?? false;
+	}
+
+	/**
+	 * A provider that puts one tool call id on two calls in the same assistant
+	 * message makes call/result pairing undecidable downstream (two results sharing
+	 * an id, UI rows keyed by id, the next request body). The agent loop renames the
+	 * later calls before anything consumes them; a repaired id must not be silent,
+	 * so the transcript keeps the loop's diagnostic and the session log gets a line.
+	 */
+	private _reportToolCallIdCollisions(message: AssistantMessage): void {
+		const diagnostic = message.diagnostics?.find(
+			(candidate) => candidate.type === TOOL_CALL_ID_COLLISION_DIAGNOSTIC_TYPE,
+		);
+		if (!diagnostic) {
+			return;
+		}
+		const collisions = readToolCallIdCollisions(diagnostic.details);
+		sessionLog.warn("provider reused a tool call id; renamed the repeated calls", {
+			sessionId: this.sessionManager.getSessionId(),
+			summary: formatToolCallIdCollisions(collisions),
+			collisions,
+		});
 	}
 
 	private _getProviderStreamFailureDetails(message: AssistantMessage): Record<string, unknown> | undefined {
