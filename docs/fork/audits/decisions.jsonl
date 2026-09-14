@@ -80,3 +80,8 @@
 {"id": "SC-2", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "深度配额非子树不变量：降额不回收已派子树，子自身 state 优先于 inherited ⇒ 冻结不了扩散中的树", "verified_by": "R8 线读码"}
 {"id": "SC-3", "date": "2026-09-15", "severity": "P3", "status": "fixing", "commit": null, "title": "中止/默认名失败泄漏空子会话目录（mkdir 在可抛检查之前，无 rm 分支）", "verified_by": "R8 线读码（rm 命中 0）"}
 {"id": "SC-4", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "命名唯一性谓词在混合标识下失效 ⇒ 同名兄弟放行（生产可达性 unverified）", "verified_by": "R8 探针 D/E ALLOWED + 三形状正控"}
+{"id": "SUP-H", "date": "2026-09-15", "severity": "P2", "status": "mitigated", "commit": null, "title": "产物与源码不一致：在跑的 CLI 不含今晚 /share 与 logout 修复（bundle 建于 09-14 15:17）", "verified_by": "R8 线文案比对（3 条 0 命中 vs 正控 1 命中）+ 母席立刻 build"}
+{"id": "SUP-A", "date": "2026-09-15", "severity": "P2", "status": "confirmed_pending_fix", "commit": null, "title": "min-release-age=7 在 npm 10.9.4 静默失效（CI 也是 npm10）", "verified_by": "R8 双版本对照实测"}
+{"id": "SUP-B", "date": "2026-09-15", "severity": "P2", "status": "confirmed_pending_fix", "commit": null, "title": "prime-agent update 接受任意绝对 URL 作 npm install -g 目标，无哈希无签名", "verified_by": "R8 探针（evil.example 被接受）"}
+{"id": "SUP-D", "date": "2026-09-15", "severity": "P2", "status": "confirmed_pending_fix", "commit": null, "title": "fd/rg 走 releases/latest 无校验无固定，且安装时无条件触发", "verified_by": "R8 读码 + install.sh"}
+{"id": "SUP-E", "date": "2026-09-15", "severity": "P2", "status": "confirmed_pending_fix", "commit": null, "title": "内核依赖裸 PyPI 名（含未注册的 prime-agent-runtime）⇒ 抢注即可进程内执行；出货路径不用 uv.lock", "verified_by": "R8 读码 + PyPI 404 核实"}
