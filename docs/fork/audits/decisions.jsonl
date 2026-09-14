@@ -76,3 +76,7 @@
 {"id": "M6", "date": "2026-09-15", "severity": "P4", "status": "confirmed_pending_fix", "commit": null, "title": "失败其实都落盘（30 条）；真缺口是 stopReason=error 与 edits 非数组不落记录", "verified_by": "xval 复核（推翻'intel 线'的'不落记录'）"}
 {"id": "DISK-D", "date": "2026-09-15", "severity": "P2", "status": "design_done_fixing", "commit": null, "title": "磁盘保留策略设计（6GB artifacts 全在活引用上；按年龄删会删活会话；TMPDIR 需分族；删了又回来需四件根治）", "verified_by": "r8-disk 线实测（44 活根 6.15GB / 3022 个恒空 rlm 临时目录 / 单根判据 963/963 误判）+ 母席裁决六条"}
 {"id": "SEC-ALERTS", "date": "2026-09-15", "severity": "P2", "status": "awaiting_owner_decision", "commit": null, "title": "GitHub 密钥扫描 8 条开放告警：Google OAuth client id/secret，仅在历史提交中，HEAD 已无引用；上游以 base64 混淆形式携带（至少 alert#6 的 base64 与上游逐字相同）", "verified_by": "母席用 gh API 逐条核对 + 与上游 fe66edd94^ 对比 + HEAD 全树 grep"}
+{"id": "SC-1", "date": "2026-09-15", "severity": "P3", "status": "fixing", "commit": null, "title": "子代理无并发上限/无排队/无背压（唯一闸是深度 + 无界 Map；boot-gate 只管内核启动）", "verified_by": "R8 线扫描 + 两条正控"}
+{"id": "SC-2", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "深度配额非子树不变量：降额不回收已派子树，子自身 state 优先于 inherited ⇒ 冻结不了扩散中的树", "verified_by": "R8 线读码"}
+{"id": "SC-3", "date": "2026-09-15", "severity": "P3", "status": "fixing", "commit": null, "title": "中止/默认名失败泄漏空子会话目录（mkdir 在可抛检查之前，无 rm 分支）", "verified_by": "R8 线读码（rm 命中 0）"}
+{"id": "SC-4", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "命名唯一性谓词在混合标识下失效 ⇒ 同名兄弟放行（生产可达性 unverified）", "verified_by": "R8 探针 D/E ALLOWED + 三形状正控"}
