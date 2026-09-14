@@ -241,7 +241,10 @@ describe("InteractiveMode /effort", () => {
 					setModel: (provider: string, id: string) => Promise<void>;
 					getState: () => Promise<ModelState>;
 				};
-				settingsManager: { setDefaultModelAndProvider: (provider: string, id: string) => void };
+				settingsManager: {
+					setDefaultModelAndProvider: (provider: string, id: string) => void;
+					persistenceFailure: () => Promise<string | undefined>;
+				};
 				patchConnectionState: (patch: Record<string, unknown>) => void;
 				footer: { invalidate: () => void };
 				subagentSummaryLine: { invalidate: () => void };
@@ -269,7 +272,7 @@ describe("InteractiveMode /effort", () => {
 						}),
 					),
 				},
-				settingsManager: { setDefaultModelAndProvider: vi.fn() },
+				settingsManager: { setDefaultModelAndProvider: vi.fn(), persistenceFailure: vi.fn(async () => undefined) },
 				patchConnectionState,
 				footer: { invalidate: vi.fn() },
 				subagentSummaryLine: { invalidate: vi.fn() },

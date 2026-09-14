@@ -7767,6 +7767,22 @@ export class InteractiveMode {
 		return showFullPaneOverlay(this.ui, component, options);
 	}
 
+	/**
+	 * Apply a change made in the settings panel. Settings writes are queued and their failures are
+	 * recorded rather than thrown, so a toggle used to look accepted while nothing reached disk;
+	 * report the reason and the session-only consequence instead of staying silent (H-2).
+	 */
+	private applySetting(mutate: () => void): void {
+		mutate();
+		void this.settingsManager.persistenceFailure().then((reason) => {
+			if (reason) {
+				this.showError(
+					`Setting not saved: ${reason} It applies to this session only and is lost when the session ends.`,
+				);
+			}
+		});
+	}
+
 	private async showSettingsSelector(): Promise<void> {
 		let state: AgentConnectionState;
 		try {
@@ -7814,10 +7830,10 @@ export class InteractiveMode {
 						this.footer.setAutoCompactEnabled(enabled);
 					},
 					onIdleEvictionMinutesChange: (value) => {
-						this.settingsManager.setIdleEvictionMinutes(value);
+						this.applySetting(() => this.settingsManager.setIdleEvictionMinutes(value));
 					},
 					onShowImagesChange: (enabled) => {
-						this.settingsManager.setShowImages(enabled);
+						this.applySetting(() => this.settingsManager.setShowImages(enabled));
 						for (const child of this.chatContainer.children) {
 							if (child instanceof ToolExecutionComponent) {
 								child.setShowImages(enabled);
@@ -7825,17 +7841,17 @@ export class InteractiveMode {
 						}
 					},
 					onAutoResizeImagesChange: (enabled) => {
-						this.settingsManager.setImageAutoResize(enabled);
+						this.applySetting(() => this.settingsManager.setImageAutoResize(enabled));
 					},
 					onBlockImagesChange: (blocked) => {
-						this.settingsManager.setBlockImages(blocked);
+						this.applySetting(() => this.settingsManager.setBlockImages(blocked));
 					},
 					onEnableSkillCommandsChange: (enabled) => {
-						this.settingsManager.setEnableSkillCommands(enabled);
+						this.applySetting(() => this.settingsManager.setEnableSkillCommands(enabled));
 						this.setupAutocompleteProvider();
 					},
 					onEnableBuiltinSkillsChange: (enabled) => {
-						this.settingsManager.setEnableBuiltinSkills(enabled);
+						this.applySetting(() => this.settingsManager.setEnableBuiltinSkills(enabled));
 						void this.handleReloadCommand();
 					},
 					onSteeringModeChange: (mode) => {
@@ -7869,7 +7885,7 @@ export class InteractiveMode {
 					},
 					onThemeChange: (themeName) => {
 						const result = setTheme(themeName, true);
-						this.settingsManager.setTheme(themeName);
+						this.applySetting(() => this.settingsManager.setTheme(themeName));
 						this.ui.invalidate();
 						if (!result.success) {
 							this.showError(`Failed to load theme "${themeName}": ${result.error}\nFell back to dark theme.`);
@@ -7884,7 +7900,7 @@ export class InteractiveMode {
 					},
 					onHideThinkingBlockChange: (hidden) => {
 						this.hideThinkingBlock = hidden;
-						this.settingsManager.setHideThinkingBlock(hidden);
+						this.applySetting(() => this.settingsManager.setHideThinkingBlock(hidden));
 						for (const child of this.chatContainer.children) {
 							if (child instanceof AssistantMessageComponent) {
 								child.setHideThinkingBlock(hidden);
@@ -7895,46 +7911,46 @@ export class InteractiveMode {
 						});
 					},
 					onMermaidRenderingModeChange: (mode) => {
-						this.settingsManager.setMermaidRenderingMode(mode);
+						this.applySetting(() => this.settingsManager.setMermaidRenderingMode(mode));
 						this.chatContainer.invalidate();
 						this.ui.requestRender();
 					},
 					onQuietStartupChange: (enabled) => {
-						this.settingsManager.setQuietStartup(enabled);
+						this.applySetting(() => this.settingsManager.setQuietStartup(enabled));
 					},
 					onTreeFilterModeChange: (mode) => {
-						this.settingsManager.setTreeFilterMode(mode);
+						this.applySetting(() => this.settingsManager.setTreeFilterMode(mode));
 					},
 					onShowHardwareCursorChange: (enabled) => {
-						this.settingsManager.setShowHardwareCursor(enabled);
+						this.applySetting(() => this.settingsManager.setShowHardwareCursor(enabled));
 						this.ui.setShowHardwareCursor(enabled);
 					},
 					onEditorPaddingXChange: (padding) => {
-						this.settingsManager.setEditorPaddingX(padding);
+						this.applySetting(() => this.settingsManager.setEditorPaddingX(padding));
 						this.defaultEditor.setPaddingX(padding);
 						if (this.editor !== this.defaultEditor && this.editor.setPaddingX !== undefined) {
 							this.editor.setPaddingX(padding);
 						}
 					},
 					onAutocompleteMaxVisibleChange: (maxVisible) => {
-						this.settingsManager.setAutocompleteMaxVisible(maxVisible);
+						this.applySetting(() => this.settingsManager.setAutocompleteMaxVisible(maxVisible));
 						this.defaultEditor.setAutocompleteMaxVisible(maxVisible);
 						if (this.editor !== this.defaultEditor && this.editor.setAutocompleteMaxVisible !== undefined) {
 							this.editor.setAutocompleteMaxVisible(maxVisible);
 						}
 					},
 					onClearOnShrinkChange: (enabled) => {
-						this.settingsManager.setClearOnShrink(enabled);
+						this.applySetting(() => this.settingsManager.setClearOnShrink(enabled));
 						this.ui.setClearOnShrink(enabled);
 					},
 					onShowTerminalProgressChange: (enabled) => {
-						this.settingsManager.setShowTerminalProgress(enabled);
+						this.applySetting(() => this.settingsManager.setShowTerminalProgress(enabled));
 					},
 					onFullscreenChange: (enabled) => {
 						this.setFullscreenMode(enabled);
 					},
 					onWarningsChange: (warnings) => {
-						this.settingsManager.setWarnings(warnings);
+						this.applySetting(() => this.settingsManager.setWarnings(warnings));
 					},
 					onCancel: () => {
 						done();
@@ -7999,6 +8015,14 @@ export class InteractiveMode {
 			return;
 		}
 		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		// The connection switched, so the model is in use; only the default for the next session is
+		// at stake, and that part needs the write to have landed (H-2).
+		const defaultSaveFailure = await this.settingsManager.persistenceFailure();
+		if (defaultSaveFailure) {
+			this.showError(
+				`Default model ${model.provider}/${model.id} not saved: ${defaultSaveFailure} It applies to this session only and is lost when the session ends.`,
+			);
+		}
 		this.patchConnectionState({
 			model: state.model ?? model,
 			serviceTier: state.serviceTier,
@@ -8528,13 +8552,21 @@ export class InteractiveMode {
 					onChange: async (enabledIds) => {
 						await updateSessionModels(enabledIds);
 					},
-					onPersist: (enabledIds) => {
+					onPersist: async (enabledIds) => {
 						// Persist to settings
 						const newPatterns =
 							enabledIds === null || enabledIds.length === allModels.length
 								? undefined // All enabled = clear filter
 								: enabledIds;
-						this.settingsManager.setEnabledModels(newPatterns ? [...newPatterns] : undefined);
+						const enabledIdsCopy = newPatterns ? [...newPatterns] : undefined;
+						this.settingsManager.setEnabledModels(enabledIdsCopy);
+						const saveFailure = await this.settingsManager.persistenceFailure();
+						if (saveFailure) {
+							this.showError(
+								`Model selection not saved: ${saveFailure} It applies to this session only and is lost when the session ends.`,
+							);
+							return;
+						}
 						this.showStatus("Model selection saved to settings");
 					},
 					onCancel: () => {
@@ -9794,7 +9826,13 @@ export class InteractiveMode {
 
 		if (command === "off" || command === "disable") {
 			this.settingsManager.setAgentTracesEnabled(false);
-			await this.settingsManager.flush();
+			const saveFailure = await this.settingsManager.persistenceFailure();
+			if (saveFailure) {
+				this.showError(
+					`Trace sharing not saved: ${saveFailure} It is off for this session only and will be enabled again at the next start.`,
+				);
+				return;
+			}
 			this.showStatus("Trace sharing disabled.");
 			return;
 		}
@@ -9824,12 +9862,20 @@ export class InteractiveMode {
 			}
 
 			this.settingsManager.setAgentTracesEnabled(true);
-			await this.settingsManager.flush();
+			const saveFailure = await this.settingsManager.persistenceFailure();
 			const uploadResult = await this.uploadCurrentTraceOnce();
 			const uploadMessage =
 				uploadResult.status === "no_session_file" || uploadResult.status === "empty_session"
 					? "Current session will upload after the first assistant response."
 					: this.formatTraceUploadResult(uploadResult);
+			if (saveFailure) {
+				// The upload did run, off the in-memory value; what did not happen is the setting, so
+				// the next start falls back to whatever the file still says.
+				this.showError(
+					`Trace sharing not saved: ${saveFailure} It is on for this session only and will be off again at the next start. ${uploadMessage}`,
+				);
+				return;
+			}
 			this.showStatus(`Trace sharing enabled. ${uploadMessage}`);
 			return;
 		}

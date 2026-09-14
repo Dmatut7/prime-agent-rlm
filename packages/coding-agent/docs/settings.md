@@ -205,7 +205,10 @@ actions, and — when a kernel is attached — the exemption budget and the kern
 liveness segment) to the structured agent log and shows a warning. If silence
 reaches `abortAfterSeconds`, the turn is aborted automatically so the session
 becomes usable again instead of appearing busy forever; the abort behaves like
-pressing Escape. Phases that legitimately own the turn boundary (compaction,
+pressing Escape. With `abortAfterSeconds` set to `0` nothing is aborted, and the
+warning says exactly that instead of naming a deadline, because the only way
+back is interrupting the turn by hand.
+Phases that legitimately own the turn boundary (compaction,
 branch summaries, serialized refinement) pause escalation instead of counting
 against it.
 

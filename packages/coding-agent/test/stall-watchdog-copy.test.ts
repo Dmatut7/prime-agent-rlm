@@ -83,6 +83,62 @@ describe("stall watchdog copy (T1-4)", () => {
 		);
 	});
 
+	// H-1: abortAfterSeconds 0 is the documented "warn-only" value; abortAfterMs() then hands the
+	// session no abort channel, so the warn copy must not promise an automatic abort at all -
+	// least of all one "after 0s", which is what the `${value ?? 0}` interpolation produced.
+	it("does not promise an automatic abort for a warn-only watchdog (abortAfterSeconds 0)", () => {
+		const warnOnly = buildStallWarnMessage({ silentMs: 600_000, abortAfterSeconds: 0 });
+		expect(warnOnly).toContain("no session activity for 600s");
+		expect(warnOnly).not.toContain("aborted automatically");
+		expect(warnOnly).not.toMatch(/will be aborted/);
+		expect(warnOnly).not.toContain("after 0s");
+		// The honest alternative: say no abort is coming and how to recover instead.
+		expect(warnOnly).toContain("No automatic abort is configured for this session");
+		expect(warnOnly).toContain("interrupt the turn manually");
+
+		// No configured deadline is not a deadline of zero either.
+		const unset = buildStallWarnMessage({ silentMs: 600_000 });
+		expect(unset).not.toContain("aborted automatically");
+		expect(unset).toContain("No automatic abort is configured for this session");
+	});
+
+	it("keeps naming the real deadline while an abort is configured (positive control)", () => {
+		const message = buildStallWarnMessage({ silentMs: 600_000, abortAfterSeconds: 900 });
+		expect(message).toContain("will be aborted automatically after 900s of silence");
+		// A warn-only session with a vouch still gets the plain warn-only text: deferring an
+		// abort that does not exist would be the same lie in the other branch.
+		const vouched = buildStallWarnMessage({
+			silentMs: 600_000,
+			abortAfterSeconds: 0,
+			exemption: exemptionSnapshot(),
+		});
+		expect(vouched).not.toContain("aborted automatically");
+		expect(vouched).not.toContain("deferred");
+		expect(vouched).toContain("No automatic abort is configured for this session");
+	});
+
+	it("never escalates a warn-only watchdog past the warning", async () => {
+		// Pins the whole 0 semantics chain the copy rests on: what the settings resolve to, what
+		// the session derives from it, and what the watchdog then actually does.
+		expect(resolveStallWatchdogConfig({ warnAfterSeconds: 600, abortAfterSeconds: 0 }).abortAfterSeconds).toBe(0);
+		const clock = new StallFakeClock();
+		const stages: StallWatchdogStageInfo[] = [];
+		new StallWatchdog({
+			enabled: true,
+			warnAfterMs: 600_000,
+			// What AgentSession._createStallWatchdog derives from abortAfterSeconds === 0.
+			abortAfterMs: undefined,
+			timers: clock.timersImpl,
+			onStage: (info) => stages.push(info),
+		}).arm();
+		clock.advance(10 * MINUTE_MS);
+		clock.advance(60 * MINUTE_MS);
+		expect(stages.map((stage) => stage.stage)).toEqual(["warn"]);
+		expect(buildStallStageMessage("warn", { silentMs: 600_000, abortAfterSeconds: 0 })).toContain(
+			"No automatic abort is configured",
+		);
+	});
+
 	it("rewrites the vouched warn copy: deferred, budget left, no unkeepable abort promise", () => {
 		const message = buildStallWarnMessage({
 			silentMs: 300_000,

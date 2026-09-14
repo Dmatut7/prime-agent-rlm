@@ -2355,7 +2355,10 @@ describe("InteractiveMode model selection persistence", () => {
 			getState(): Promise<AgentConnectionState>;
 		};
 		uiServices: {
-			settingsManager: { setDefaultModelAndProvider(provider: string, modelId: string): void };
+			settingsManager: {
+				setDefaultModelAndProvider(provider: string, modelId: string): void;
+				persistenceFailure(): Promise<string | undefined>;
+			};
 		};
 		footer: { invalidate(): void };
 		subagentSummaryLine: { invalidate(): void };
@@ -2397,6 +2400,7 @@ describe("InteractiveMode model selection persistence", () => {
 			settingsManager: {
 				getRecentModels(): string[];
 				setDefaultModelAndProvider(provider: string, modelId: string): void;
+				persistenceFailure(): Promise<string | undefined>;
 			};
 		};
 		footer: { invalidate(): void };
@@ -2510,6 +2514,7 @@ describe("InteractiveMode model selection persistence", () => {
 			settingsManager: {
 				getRecentModels: vi.fn(() => []),
 				setDefaultModelAndProvider: vi.fn(),
+				persistenceFailure: vi.fn(async () => undefined),
 			},
 		};
 		fakeThis.footer = { invalidate: vi.fn() };
@@ -2579,6 +2584,7 @@ describe("InteractiveMode model selection persistence", () => {
 				setDefaultModelAndProvider: vi.fn(() => {
 					order.push("settings");
 				}),
+				persistenceFailure: vi.fn(async () => undefined),
 			},
 		};
 		fakeThis.footer = { invalidate: vi.fn() };
@@ -2613,6 +2619,7 @@ describe("InteractiveMode model selection persistence", () => {
 		fakeThis.uiServices = {
 			settingsManager: {
 				setDefaultModelAndProvider: vi.fn(),
+				persistenceFailure: vi.fn(async () => undefined),
 			},
 		};
 		fakeThis.footer = { invalidate: vi.fn() };
@@ -2640,6 +2647,7 @@ describe("InteractiveMode model selection persistence", () => {
 		fakeThis.uiServices = {
 			settingsManager: {
 				setDefaultModelAndProvider: vi.fn(),
+				persistenceFailure: vi.fn(async () => undefined),
 			},
 		};
 		fakeThis.footer = { invalidate: vi.fn() };
