@@ -1,4 +1,5 @@
 import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
+import { formatStallDiagnosticsLines } from "../../core/stall-diagnostics-render.js";
 import type { AgentConnectionSessionEvent } from "../agent-connection/types.js";
 import type { PrimeAgentIpythonMeta, PrimeAgentSessionMeta } from "./acp-meta.js";
 import { primeAgentMeta } from "./acp-meta.js";
@@ -318,7 +319,12 @@ export function acpUpdatesForSessionEvent(
 				{
 					sessionUpdate: "session_info_update",
 					_meta: primeAgentMeta({
-						stallWatchdog: { status: "warning", message: event.message, silentMs: event.silentMs },
+						stallWatchdog: {
+							status: "warning",
+							message: event.message,
+							silentMs: event.silentMs,
+							diagnostics: formatStallDiagnosticsLines(event.diagnostics),
+						},
 					}),
 				},
 			];
@@ -328,7 +334,12 @@ export function acpUpdatesForSessionEvent(
 				{
 					sessionUpdate: "session_info_update",
 					_meta: primeAgentMeta({
-						stallWatchdog: { status: "aborted", message: event.message, silentMs: event.silentMs },
+						stallWatchdog: {
+							status: "aborted",
+							message: event.message,
+							silentMs: event.silentMs,
+							diagnostics: formatStallDiagnosticsLines(event.diagnostics),
+						},
 					}),
 				},
 			];

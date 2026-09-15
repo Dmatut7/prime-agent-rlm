@@ -93,6 +93,12 @@ export interface PrimeAgentStallWatchdogMeta {
 	status: "warning" | "aborted" | "unsettled";
 	message: string;
 	silentMs: number;
+	/**
+	 * Rendered actionable fields of the stall diagnostics payload (in-flight tool identities,
+	 * busy flags, pump state, exemption/kernel segments, evidence path). Optional and additive:
+	 * a client that does not know it keeps rendering `message` alone.
+	 */
+	diagnostics?: string[];
 }
 
 export interface PrimeAgentQuiescenceMeta {

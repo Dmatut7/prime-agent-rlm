@@ -1,0 +1,3 @@
+- Fixed stall watchdog warnings and aborts to name the files the diagnostics are actually written to (and to say when the session has no daemon), instead of sending readers to a daemon log that never carries them.
+- Added a bounded stall-only evidence log (`logs/stall-evidence.jsonl`) so a stall post-mortem survives rotation of the shared `agent.jsonl`.
+- Changed the interactive, `daemon attach` and ACP renderers of stall events to show the actionable diagnostics fields (in-flight tool ids and ages, busy flags, last event, pump state, exemption and kernel segments) instead of only the one-line message.

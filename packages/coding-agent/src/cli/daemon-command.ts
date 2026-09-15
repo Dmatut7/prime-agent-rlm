@@ -9,6 +9,7 @@ import type { AgentSessionEvent } from "../core/agent-session.js";
 import type { AgentSessionRuntimeConfig } from "../core/agent-session-config.js";
 import { type AgentCronJob, formatAgentCronJob } from "../core/cron-jobs.js";
 import { looksLikeSessionPath } from "../core/session-resolver.js";
+import { formatStallEventLines, type StallEventView } from "../core/stall-diagnostics-render.js";
 import { resolveDaemonSocketForAgentDir } from "../modes/daemon/daemon-agent-endpoint.js";
 import { DaemonClient, type DaemonClientMessageListener } from "../modes/daemon/daemon-client.js";
 import type { DaemonOutbound, DaemonResponse } from "../modes/daemon/daemon-protocol.js";
@@ -1507,13 +1508,13 @@ class DaemonAttachTerminal {
 				);
 				return;
 			case "stall_warning":
-				this.writeLine(chalk.yellow(event.message));
+				this.writeStallEvent(event, chalk.yellow);
 				return;
 			case "stall_abort":
-				this.writeLine(chalk.red(event.message));
+				this.writeStallEvent(event, chalk.red);
 				return;
 			case "stall_unsettled":
-				this.writeLine(chalk.red(event.message));
+				this.writeStallEvent(event, chalk.red);
 				return;
 			case "refine_complete":
 				return;
@@ -1541,6 +1542,19 @@ class DaemonAttachTerminal {
 
 	private printHelp(): void {
 		this.writeLine(chalk.dim("Type a message and press Enter. Commands: /help /state /messages /abort /detach"));
+	}
+
+	/**
+	 * Stall events carry a structured diagnostics payload; rendering only `message` would drop
+	 * the in-flight tool identities, pump state and evidence path the attach view is the only
+	 * channel for.
+	 */
+	private writeStallEvent(event: StallEventView, color: (text: string) => string): void {
+		const lines = formatStallEventLines(event);
+		this.writeLine(color(lines[0] ?? ""));
+		for (const line of lines.slice(1)) {
+			this.writeLine(chalk.dim(line));
+		}
 	}
 
 	private writeLine(text: string): void {

@@ -54,6 +54,13 @@
 
 import { getLogger } from "@earendil-works/pi-ai";
 import { DEFAULT_STALL_ABORT_AFTER_SECONDS, DEFAULT_STALL_WARN_AFTER_SECONDS } from "./settings-manager.js";
+import {
+	formatStallDiagnosticsPointer,
+	formatStallDiagnosticsWhere,
+	formatStallRuntimeClause,
+	resolveStallDiagnosticsPointer,
+	type StallDiagnosticsPointer,
+} from "./stall-evidence.js";
 
 const stallLog = getLogger("coding-agent.stall-watchdog");
 
@@ -955,10 +962,20 @@ export interface StallMessageContext {
 	exemption?: StallExemptionSnapshot;
 	/** Kernel facts to append to the abort_unsettled copy. */
 	kernel?: StallKernelFacts;
+	/**
+	 * Where this process's stall diagnostics actually land. Resolved from the runtime when
+	 * omitted, so the copy always names real files instead of a generic "daemon log".
+	 */
+	diagnosticsPointer?: StallDiagnosticsPointer;
 }
 
 function silentSecondsOf(silentMs: number): number {
 	return Math.max(1, Math.round(silentMs / 1000));
+}
+
+/** Pointer from the context, or resolved from this process's runtime. */
+function stallPointerOf(context: StallMessageContext): StallDiagnosticsPointer {
+	return context.diagnosticsPointer ?? resolveStallDiagnosticsPointer();
 }
 
 /**
@@ -966,30 +983,44 @@ function silentSecondsOf(silentMs: number): number {
  * channel - the session derives `abortAfterMs: undefined` from it - so its copy says no abort is
  * coming instead of promising one after "0s". A vouched stall says the abort is deferred and how
  * much budget is left instead of promising a deadline the exemption will not keep. The unexempted
- * copy of a session that does have an abort is byte-identical to the pre-exemption message.
+ * copy of a session that does have an abort differs from the exempted one only by the exemption
+ * sentence. Every variant ends with the real diagnostics pointer: the files the watchdog writes
+ * to, and whether this session runs under a daemon at all.
  */
 export function buildStallWarnMessage(context: StallMessageContext): string {
 	const seconds = silentSecondsOf(context.silentMs);
+	const pointerSentence = formatStallDiagnosticsPointer(stallPointerOf(context));
 	const abortAfterSeconds = context.abortAfterSeconds;
 	if (abortAfterSeconds === undefined || abortAfterSeconds <= 0) {
-		return `Possible stall: no session activity for ${seconds}s while a turn is running. No automatic abort is configured for this session, so the turn will not be interrupted on its own: it recovers only when the stalled work resumes. If a tool appears stuck, interrupt the turn manually to recover faster; check the daemon log for stall diagnostics.`;
+		return `Possible stall: no session activity for ${seconds}s while a turn is running. No automatic abort is configured for this session, so the turn will not be interrupted on its own: it recovers only when the stalled work resumes. If a tool appears stuck, interrupt the turn manually to recover faster. ${pointerSentence}`;
 	}
 	const exemption = context.exemption;
 	if (exemption && exemption.reason === "vouched" && !exemption.exhausted) {
 		const remainingMinutes = Math.max(1, Math.round(exemption.remainingMs / 60_000));
-		return `Possible stall: no session activity for ${seconds}s while a turn is running. In-flight kernel work detected (${humanizeStallReasons(exemption.reasons)}), so the automatic abort is deferred and ${remainingMinutes}min of exemption budget is left. If the process is actually wedged, interrupt the turn manually to recover faster; check the daemon log for stall diagnostics.`;
+		return `Possible stall: no session activity for ${seconds}s while a turn is running. In-flight kernel work detected (${humanizeStallReasons(exemption.reasons)}), so the automatic abort is deferred and ${remainingMinutes}min of exemption budget is left. If the process is actually wedged, interrupt the turn manually to recover faster. ${pointerSentence}`;
 	}
-	return `Possible stall: no session activity for ${seconds}s while a turn is running. If nothing recovers, the turn will be aborted automatically after ${abortAfterSeconds}s of silence. If a tool appears stuck, interrupt the turn manually to recover faster; check the daemon log for stall diagnostics.`;
+	return `Possible stall: no session activity for ${seconds}s while a turn is running. If nothing recovers, the turn will be aborted automatically after ${abortAfterSeconds}s of silence. If a tool appears stuck, interrupt the turn manually to recover faster. ${pointerSentence}`;
 }
 
 /** Abort copy: unchanged by the exemption work (an abort only fires once the budget is spent). */
 export function buildStallAbortMessage(context: StallMessageContext): string {
-	return `Suspected stall: no session activity for ${silentSecondsOf(context.silentMs)}s. The current turn is being aborted automatically; diagnostics were logged.`;
+	const pointer = stallPointerOf(context);
+	return (
+		`Suspected stall: no session activity for ${silentSecondsOf(context.silentMs)}s. ` +
+		"The current turn is being aborted automatically. " +
+		`Diagnostics are written best-effort to ${formatStallDiagnosticsWhere(pointer)}.` +
+		`${formatStallRuntimeClause(pointer)}`
+	);
 }
 
 /** Abort-unsettled copy: the pre-existing sentence plus the kernel facts, when there are any. */
 export function buildStallAbortUnsettledMessage(context: StallMessageContext): string {
-	const base = `Suspected stall: auto-abort fired ${silentSecondsOf(context.silentMs)}s into silence but the run did not settle; the session may need a restart. Diagnostics were logged.`;
+	const pointer = stallPointerOf(context);
+	const base =
+		`Suspected stall: auto-abort fired ${silentSecondsOf(context.silentMs)}s into silence but the run did not settle; ` +
+		"the session may need a restart. " +
+		`Diagnostics are written best-effort to ${formatStallDiagnosticsWhere(pointer)}.` +
+		`${formatStallRuntimeClause(pointer)}`;
 	const kernel = formatStallKernelFacts(context.kernel ?? context.exemption?.kernel);
 	return kernel ? `${base} Kernel facts: ${kernel}.` : base;
 }
