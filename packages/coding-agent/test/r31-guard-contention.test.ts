@@ -61,7 +61,6 @@ describe("r31 RC-2 guard contention", () => {
 		})();
 
 		let caught: unknown;
-		const startedAt = Date.now();
 		try {
 			await acquireSessionLeaseAsync(sessionPath, agentDir, {
 				[SESSION_LEASES_ENABLED_ENV]: "1",
