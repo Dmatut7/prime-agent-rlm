@@ -20,6 +20,7 @@ export type {
 export type { OpenAICompletionsOptions } from "./providers/openai-completions.js";
 export type { OpenAIResponsesOptions } from "./providers/openai-responses.js";
 export * from "./providers/register-builtins.js";
+export * from "./providers/request-budget.js";
 export * from "./session-resources.js";
 export * from "./stream.js";
 export * from "./types.js";

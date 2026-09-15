@@ -20,6 +20,10 @@ export function buildBaseOptions(model: Model<Api>, options?: SimpleStreamOption
 		// Mistral/Google/Vertex currently ignore this.
 		maxRetryDelayMs: options?.maxRetryDelayMs,
 		onProviderRetry: options?.onProviderRetry,
+		// The shared chain counter and its per-attempt notices must survive
+		// streamSimple's options mapping, or the budget only sees some layers.
+		requestBudget: options?.requestBudget,
+		onProviderRequestAttempt: options?.onProviderRequestAttempt,
 		metadata: options?.metadata,
 	};
 }

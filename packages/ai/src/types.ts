@@ -1,7 +1,9 @@
+import type { ProviderRequestAttemptNotice, ProviderRequestBudget } from "./providers/request-budget.js";
 import type { ProviderRetryNotice } from "./providers/retry-cap.js";
 import type { AssistantMessageDiagnostic } from "./utils/diagnostics.js";
 import type { AssistantMessageEventStream } from "./utils/event-stream.js";
 
+export type { ProviderRequestAttemptNotice, ProviderRequestBudget } from "./providers/request-budget.js";
 export type { ProviderRetryNotice } from "./providers/retry-cap.js";
 
 export type { AssistantMessageEventStream } from "./utils/event-stream.js";
@@ -146,6 +148,20 @@ export interface StreamOptions {
 	 * of a dead connection. Diagnostic only: throwing here does not affect the request.
 	 */
 	onProviderRetry?: (notice: ProviderRetryNotice) => void;
+	/**
+	 * Shared counter for the current request chain. Every layer that can issue a provider
+	 * request for the same logical request counts into it: the SDK-level retries (through
+	 * the fetch wrapper), the agent loop's in-place resends, and the session's turn
+	 * retries. The attempt that spends the last request of the chain is not retried by any
+	 * layer, so one failure cannot silently become a dozen full-context requests.
+	 */
+	requestBudget?: ProviderRequestBudget;
+	/**
+	 * Called for every provider request attempt, including the ones an SDK retried on its
+	 * own and the attempt that ended a chain. Diagnostic only: throwing here does not
+	 * affect the request.
+	 */
+	onProviderRequestAttempt?: (notice: ProviderRequestAttemptNotice) => void;
 	/**
 	 * Optional metadata to include in API requests.
 	 * Providers extract the fields they understand and ignore the rest.

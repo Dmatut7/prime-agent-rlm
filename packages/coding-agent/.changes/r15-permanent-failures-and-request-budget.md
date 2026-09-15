@@ -1,0 +1,2 @@
+- Fixed permanent provider failures (refusal, invalid request, auth) being resent once; they now surface with a single request.
+- Bounded retries across layers with a shared request budget: the chain stops at the configured ceiling and reports the request count in retry events.
