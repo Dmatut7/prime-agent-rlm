@@ -154,3 +154,4 @@
 {"id": "K4", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "stripUrlUserinfo 把 ssh://git@host 改坏且不打标", "verified_by": "K3"}
 {"id": "K5", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "stall 误分类：早先 429 让后续有 partial 的中流 stall 失去整份重发资格", "verified_by": "K3"}
 {"id": "K6", "date": "2026-09-15", "severity": "P3", "status": "fixing", "commit": null, "title": "preflight-push.sh gh 失败 fail-open 且不验工作树==HEAD（我今天新加的闸）", "verified_by": "K3"}
+{"id": "REG-1", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "测试 daemon 泄漏进真实 ~/.prime/supervisor-owners 注册表并留下活进程（4 个幽灵已手工清理；新增的身份闸会因此产生混淆/潜在拒启）", "verified_by": "母席现场取证（5 条记录、其中 4 条 socket 在临时测试目录且进程存活）+ 已清理"}
