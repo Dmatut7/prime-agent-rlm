@@ -10,9 +10,11 @@
  *
  * So both halves go through the same two steps, in this order:
  *
- * 1. URL userinfo is stripped. `scheme://user:password@host/...` becomes `scheme://host/...`;
- *    the username in a git remote is `x-access-token` and the password is the token, and
- *    neither is a fact the trace service indexes on.
+ * 1. URL userinfo carrying a credential is stripped. `scheme://user:password@host/...` becomes
+ *    `scheme://host/...`; the username in a git remote is `x-access-token` and the password is
+ *    the token, and neither is a fact the trace service indexes on. A userinfo block with no
+ *    credential in it (`ssh://git@github.com/...`) is left exactly as written - see
+ *    `userinfoCarriesCredential`.
  * 2. The `/share` credential scan runs over the remaining text and the values this session is
  *    configured with are removed by exact comparison. A session that mentions a key must not
  *    put that key on the wire just because the upload was automatic and nobody was asked.
@@ -22,6 +24,7 @@
  * every upload instead of protecting anything.
  */
 
+import { SHARE_SECRET_PATTERNS } from "./share-secret-detectors.js";
 import { collectConfiguredShareSecretValues, type ShareSecretValue } from "./share-secret-values.js";
 import { REDACTED_SECRET_MARKER, redactShareSecrets } from "./share-session.js";
 
@@ -35,9 +38,51 @@ const AUTHORIZATION_HEADERS = new Set(["authorization", "proxy-authorization", "
 /**
  * `scheme://userinfo@host`. The userinfo class excludes `/`, quotes and whitespace, so a URL
  * with an `@` in its path (`https://github.com/org/repo@v1.0`) is not mistaken for one with
- * credentials in it.
+ * credentials in it. It deliberately does *not* exclude `@`: a credential pasted with its `@`
+ * unescaped (`https://user:p@ssw0rd@host`) is exactly the input this gate is here for, and
+ * stopping at the first `@` leaves `ssw0rd@host` on the wire while the count reports the block
+ * as handled. The greedy class runs to the last `@` of the run, which is the end of the userinfo.
  */
-const URL_USERINFO = /([a-z][a-z0-9+.-]*:\/\/)([^\s"'/@]+)@/gi;
+const URL_USERINFO = /([a-z][a-z0-9+.-]*:\/\/)([^\s"'/]*)@/gi;
+
+/**
+ * Token shapes a bare username can take (`https://ghp_...@github.com/org/repo.git` is a
+ * credential with no password part at all). The same table the share preflight uses, without the
+ * patterns whose match is a prefix plus a value rather than the value itself.
+ */
+const CREDENTIAL_USERNAME_PATTERNS = SHARE_SECRET_PATTERNS.filter((pattern) => pattern.valueGroup === undefined).map(
+	(pattern) => new RegExp(pattern.pattern.source, pattern.pattern.flags.replace("g", "")),
+);
+
+/** Below this length a bare username is a name somebody chose, not a token somebody generated. */
+const TOKEN_USERNAME_MIN_LENGTH = 20;
+
+/**
+ * Whether a username looks generated rather than chosen. A token pasted into the username slot
+ * carries case, digits and separators; account names (`git`, `ubuntu`, `user`) do not.
+ */
+function looksLikeGeneratedToken(username: string): boolean {
+	if (username.length < TOKEN_USERNAME_MIN_LENGTH) return false;
+	let classes = 0;
+	for (const test of [/[a-z]/, /[A-Z]/, /[0-9]/, /[^A-Za-z0-9]/]) {
+		if (test.test(username)) classes += 1;
+	}
+	return classes >= 3;
+}
+
+/**
+ * Whether a userinfo block holds a credential, which is what decides if it may be removed.
+ *
+ * `user:password@` holds one by construction. A bare `user@` holds one only when the user part
+ * is itself a token: `ssh://git@github.com/org/repo.git` and `postgres://user@localhost/app` are
+ * ordinary content, and rewriting them to `ssh://github.com/...` prints a transcript that no
+ * longer matches the session a reader is debugging while removing nothing secret.
+ */
+function userinfoCarriesCredential(userinfo: string): boolean {
+	if (userinfo.includes(":")) return true;
+	if (looksLikeGeneratedToken(userinfo)) return true;
+	return CREDENTIAL_USERNAME_PATTERNS.some((pattern) => pattern.test(userinfo));
+}
 
 export interface StripUrlUserinfoResult {
 	value: string;
@@ -45,10 +90,14 @@ export interface StripUrlUserinfoResult {
 	stripped: number;
 }
 
-/** Remove the `user:password@` part of every URL in `text`. */
+/** Remove the `user:password@` part of every URL in `text` that carries a credential. */
 export function stripUrlUserinfo(text: string): StripUrlUserinfoResult {
 	let stripped = 0;
-	const value = text.replace(URL_USERINFO, (_match, scheme: string) => {
+	const value = text.replace(URL_USERINFO, (match, scheme: string, userinfo: string) => {
+		// Left as written, not replaced by a marker: this runs over the whole session body, and a
+		// marker in the middle of an ordinary `ssh://git@github.com` remote would corrupt evidence
+		// while claiming a credential was found. `stripped` counts removals only.
+		if (!userinfoCarriesCredential(userinfo)) return match;
 		stripped += 1;
 		return scheme;
 	});

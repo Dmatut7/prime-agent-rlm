@@ -38,6 +38,44 @@ describe("BoundedCache", () => {
 		expect(oversized.get("s")).toBe("ab");
 	});
 
+	it("keeps the byte account equal to what is stored when a key is written again", () => {
+		const cache = new BoundedCache<string>({ maxEntries: 100, maxBytes: 1000, estimateBytes: (v) => v.length });
+		cache.set("hot", "0123456789");
+		expect(cache.estimatedBytes).toBe(13);
+		// The refresh path of both consumers: the same key is written again while the value is
+		// unchanged. What is stored is still one record, so the account must not grow.
+		cache.set("hot", "0123456789");
+		expect(cache.estimatedBytes).toBe(13);
+		cache.set("hot", "0123456789ABCDEFGHIJ");
+		expect(cache.estimatedBytes).toBe(23);
+	});
+
+	it("still accepts a new key after one key has been overwritten many times", () => {
+		// A watched child-agent display file is rewritten on every heartbeat, so overwriting one
+		// key is the ordinary path. Eviction can only reclaim records that exist, so ghost bytes
+		// left by overwrites eventually evict the whole cache and the cache then never fills again.
+		const cache = new BoundedCache<string>({ maxEntries: 100, maxBytes: 1000, estimateBytes: () => 90 });
+		for (let i = 0; i < 12; i++) cache.set("hot", "x");
+		expect(cache.size).toBe(1);
+		expect(cache.estimatedBytes).toBe(93);
+		cache.set("fresh", "x");
+		expect(cache.get("fresh")).toBe("x");
+		expect(cache.has("hot")).toBe(true);
+	});
+
+	it("drops the old record's bytes when an overwrite is too big to cache", () => {
+		const cache = new BoundedCache<string>({ maxEntries: 10, maxBytes: 20, estimateBytes: (v) => v.length });
+		cache.set("k", "0123456789");
+		expect(cache.estimatedBytes).toBe(11);
+		// 21 bytes + the key is above the ceiling, so the value is not cached - and the record it
+		// replaced is gone, so its bytes must be gone too.
+		cache.set("k", "0123456789ABCDEFGHIJ");
+		expect(cache.size).toBe(0);
+		expect(cache.estimatedBytes).toBe(0);
+		cache.set("small", "ab");
+		expect(cache.get("small")).toBe("ab");
+	});
+
 	it("tracks bytes through delete and clear", () => {
 		const cache = makeCache(10, 1000);
 		cache.set("a", 1);
