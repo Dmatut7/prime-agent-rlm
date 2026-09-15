@@ -1577,14 +1577,23 @@ describe("daemon supervisor resident workers", () => {
 			activeSessionId: createdSummary.activeSessionId,
 			sessionId: createdSummary.sessionId,
 		});
-		const listed = await client.request({ type: "list", all: true, sessionDir });
-		expect(listed.success).toBe(true);
-		if (!listed.success) {
-			throw new Error(listed.error);
+		// Adoption is asynchronous: the new supervisor lists the worker as
+		// "recovering" until its direct link reattaches, so poll for the ready
+		// state instead of asserting it on a single racing list call.
+		let adopted: ReturnType<typeof requireSessionList>[number] | undefined;
+		const adoptionDeadline = Date.now() + 15_000;
+		while (Date.now() < adoptionDeadline) {
+			const listed = await client.request({ type: "list", all: true, sessionDir });
+			expect(listed.success).toBe(true);
+			if (listed.success) {
+				adopted = requireSessionList(listed.data).find(
+					(summary) =>
+						(summary.activeSessionId ?? summary.id) === (createdSummary.activeSessionId ?? createdSummary.id),
+				);
+				if (adopted?.workerState === "ready") break;
+			}
+			await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
 		}
-		const adopted = requireSessionList(listed.data).find(
-			(summary) => (summary.activeSessionId ?? summary.id) === (createdSummary.activeSessionId ?? createdSummary.id),
-		);
 		expect(adopted).toMatchObject({
 			workerState: "ready",
 			workerPid: createdSummary.workerPid,
