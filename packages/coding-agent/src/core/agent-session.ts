@@ -14542,6 +14542,15 @@ export class AgentSession {
 				}
 			} finally {
 				signal?.removeEventListener("abort", abortFromHost);
+				try {
+					// LAT-3: settle the coalesced child usage ledger so the file
+					// matches what a reload folds once the run is over, instead of
+					// holding deltas back for the next window flush.
+					this.sessionManager.flushChildUsageAttributions();
+				} catch {
+					// Best-effort: the deltas stay in memory and the next persist
+					// rewrites the whole transcript, backfilling them.
+				}
 				if (run.detachedDeletion) {
 					run.deletionRunFinished = true;
 					if (!run.settled) {
