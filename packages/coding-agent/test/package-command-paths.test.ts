@@ -572,4 +572,91 @@ if(args.includes("install")) process.exit(23);
 			logSpy.mockRestore();
 		}
 	});
+
+	describe("self-update separates manifest fetch failures from registry-lane refusals", () => {
+		// A sibling test opts into the registry lane and its restore has gaps, so each case
+		// here pins the allowance itself: the proposition is about the default refusal.
+		let originalAllowRegistryUpdate: string | undefined;
+
+		beforeEach(() => {
+			originalAllowRegistryUpdate = process.env.PRIME_AGENT_ALLOW_REGISTRY_UPDATE;
+			delete process.env.PRIME_AGENT_ALLOW_REGISTRY_UPDATE;
+		});
+
+		afterEach(() => {
+			restoreEnv("PRIME_AGENT_ALLOW_REGISTRY_UPDATE", originalAllowRegistryUpdate);
+		});
+
+		it("a 404 manifest endpoint refuses with fetch-failure guidance, not the registry lane", async () => {
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async () => new Response("not found", { status: 404 })),
+			);
+
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+			try {
+				await expect(runSelfUpdateInstallChild(["update", "--self"])).resolves.toBeUndefined();
+
+				const stderr = errorSpy.mock.calls.map(([message]) => String(message)).join("\n");
+				// The endpoint being down is a fetch problem, so the guidance is retry and
+				// source troubleshooting, never the registry lane this gate exists to close.
+				expect(stderr).toContain("could not fetch the release manifest");
+				expect(stderr).toContain("PRIME_AGENT_DOWNLOAD_BASE_URL");
+				expect(stderr).not.toContain("served a registry spec");
+				expect(stderr).not.toContain("ALLOW_REGISTRY_UPDATE");
+				expect(process.exitCode).toBe(1);
+			} finally {
+				errorSpy.mockRestore();
+				logSpy.mockRestore();
+			}
+		});
+
+		it("a manifest body that is not a release manifest refuses the same honest way", async () => {
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async () => Response.json({ oops: true })),
+			);
+
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+			try {
+				await expect(runSelfUpdateInstallChild(["update", "--self"])).resolves.toBeUndefined();
+
+				const stderr = errorSpy.mock.calls.map(([message]) => String(message)).join("\n");
+				expect(stderr).toContain("could not fetch the release manifest");
+				expect(stderr).toContain("PRIME_AGENT_DOWNLOAD_BASE_URL");
+				expect(stderr).not.toContain("served a registry spec");
+				expect(stderr).not.toContain("ALLOW_REGISTRY_UPDATE");
+				expect(process.exitCode).toBe(1);
+			} finally {
+				errorSpy.mockRestore();
+				logSpy.mockRestore();
+			}
+		});
+
+		it("positive control: a manifest that really serves a registry spec keeps the registry-lane refusal", async () => {
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async () => Response.json({ package: "prime-agent", version: getNewerPatchVersion() })),
+			);
+
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+			try {
+				await expect(runSelfUpdateInstallChild(["update", "--self"])).resolves.toBeUndefined();
+
+				const stderr = errorSpy.mock.calls.map(([message]) => String(message)).join("\n");
+				expect(stderr).toContain("the release manifest served a registry spec");
+				expect(stderr).toContain("PRIME_AGENT_ALLOW_REGISTRY_UPDATE=1");
+				expect(process.exitCode).toBe(1);
+			} finally {
+				errorSpy.mockRestore();
+				logSpy.mockRestore();
+			}
+		});
+	});
 });

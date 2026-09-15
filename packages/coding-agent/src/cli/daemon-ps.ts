@@ -430,7 +430,9 @@ export class ShutdownReport {
 	 * named. "Still here" is both faces of a daemon — its socket file on disk *and*
 	 * its process identity alive — because a daemon whose file was unlinked
 	 * underneath it is still running, and a disk-only check called that clean.
-	 * `stillPresent === []` is the only clean verdict.
+	 * `stillPresent === []` is the only clean verdict. The one exception is the causal
+	 * ledger: a file this run's signalled pid left behind when it died is residue the
+	 * `stopped` entry names, not a live face of the daemon.
 	 *
 	 * Gone is the other half of the observation, and it is judged as strictly: a
 	 * disappearance only becomes a `stopped` when the ledger says this run caused
@@ -447,6 +449,23 @@ export class ShutdownReport {
 			// was observed at the start counts as still running.
 			const processPresent =
 				pid !== undefined && processStartId !== undefined && getProcessStartId(pid) === processStartId;
+			// FR-2: the causal ledger outranks the file residue. A graceful stop answers
+			// and dies before its own unlink, so the socket file can outlive the process.
+			// When this run signalled that pid and the observed identity is gone, the stop
+			// is real; the leftover file is reported as residue, not as a resurrection.
+			if (pid !== undefined && presentAtObservation && !processPresent && this.signalledPids.has(pid)) {
+				const entry = { socketPath, pid, kind };
+				if (filePresent && !stillPresent.includes(socketPath)) {
+					stillPresent.push(socketPath);
+				}
+				this.claim("stopped", {
+					...entry,
+					action: filePresent
+						? `converged during shutdown; its socket file lingers at ${socketPath}`
+						: "converged during shutdown",
+				});
+				continue;
+			}
 			if (filePresent || processPresent) {
 				if (!stillPresent.includes(socketPath)) {
 					stillPresent.push(socketPath);

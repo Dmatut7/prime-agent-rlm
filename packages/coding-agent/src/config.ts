@@ -549,8 +549,7 @@ function describeRefusedUpdateSpec(classification: RejectedUpdateSpec | Artifact
 		);
 	}
 	const outcomes: Record<UpdateSpecRejectionReason, string> = {
-		untrusted_artifact_source:
-			"Install Prime Agent from a trusted release source instead: the published installer verifies the release SHA256SUMS before installing.",
+		untrusted_artifact_source: `Name the origin in ${TRUSTED_UPDATE_ORIGINS_ENV} (comma-separated https origins) to install from a mirror, or use the published installer, which verifies the release SHA256SUMS before installing.`,
 		missing_artifact_hash: `A hash-pinned artifact looks like ${getTrustedUpdateArtifactOrigins()[0] ?? "https://<download base>"}/releases/v<version>/<package>-<version>.tgz#sha256=<64 hex>.`,
 		unverified_local_artifact:
 			"Install the release with the published installer, which verifies the release SHA256SUMS, instead of a local tarball.",

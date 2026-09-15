@@ -197,6 +197,38 @@ describe("converge() only credits stops this run performed", () => {
 		expect(report.discovered).toBe(bucketTotal(report));
 	}, 30_000);
 
+	it("credits a signalled service that died leaving its socket file behind as stopped, not leftRunning", async () => {
+		const directory = makeTempDir();
+		const socketPath = join(directory, "daemon.sock");
+		const child = spawnListener(socketPath);
+		const pid = child.pid;
+		expect(pid).toBeDefined();
+		await waitFor(() => existsSync(socketPath), "the daemon to listen");
+
+		const report = new ShutdownReport();
+		report.observe([{ socketPath, pid, kind: "service" }]);
+		report.recordSignal(pid ?? 0);
+		child.kill("SIGTERM");
+		await waitFor(() => !alive(pid), "the signalled daemon to exit");
+		// The graceful-stop crash window: the daemon answered, died, and never unlinked
+		// its own socket file. What is left on disk is residue, not a live daemon.
+		expect(existsSync(socketPath)).toBe(true);
+
+		const stillPresent = report.converge();
+
+		// The causal ledger outranks the file residue: this run signalled that pid and
+		// the identity observed at the start is gone, so the stop is real. The regression
+		// used to fold the leftover file into a `leftRunning` verdict instead.
+		expect(report.stopped).toEqual([
+			{ socketPath, pid, kind: "service", action: expect.stringContaining("converged during shutdown") },
+		]);
+		expect(report.leftRunning).toEqual([]);
+		// The residue stays named as its own fact rather than laundered into a liveness verdict.
+		expect(stillPresent).toEqual([socketPath]);
+		expect(report.discovered).toBe(1);
+		expect(report.discovered).toBe(bucketTotal(report));
+	}, 30_000);
+
 	it("still reports a target that was already gone before the stop as skipped", async () => {
 		const directory = makeTempDir();
 		const socketPath = join(directory, "gone.sock");
