@@ -4769,7 +4769,17 @@ export class AgentDaemon {
 
 			case "get_context_tree": {
 				const state = this.getSessionState(command.activeSessionId);
-				return success(command.id, "get_context_tree", state.runtime.session.getContextTree());
+				const tree = state.runtime.session.getContextTree();
+				// The scan diagnostics ride the tree for clients that render them; log them
+				// too, so a headless caller that ignores the field still leaves a record
+				// that the roster it received was partial.
+				const scan = tree.scan;
+				if (scan?.truncated) {
+					this.log(
+						`get_context_tree truncated: ${scan.skippedByBudget} child sessions not shown (budget: ${scan.truncatedReason}); ${scan.scannedChildren} read, ${scan.bytesRead} of ${scan.bytesPlanned} bytes`,
+					);
+				}
+				return success(command.id, "get_context_tree", tree);
 			}
 
 			case "get_commands": {

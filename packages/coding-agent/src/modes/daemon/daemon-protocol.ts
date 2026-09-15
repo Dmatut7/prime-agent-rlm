@@ -127,8 +127,15 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 //   peer declared streaming_deltas on attach. Both directions degrade to the
 //   pre-30 wire when the capability is absent, so nothing gates on the
 //   number; the digest identifies it.
-export const DAEMON_SCHEMA_REVISION = 30;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-30-66299858b8b4";
+// Revision 31 adds two optional payload fields, both absent on the pre-31 wire and
+//   both degrading locally: `ContextTreeNode.scan` on the get_context_tree response
+//   (what the bounded on-disk roster scan refused, so a partial /context says so) and
+//   `SessionTreeDepthStats.retainedFromDepth` / `.leafIncluded` on session_snapshot's
+//   sessionTree.bound and on get_session_tree's treeBound (the depth bound now keeps
+//   the newest layers and the live leaf, and says which). No command, event, or
+//   capability gate changed, so nothing checks the number; the digest identifies it.
+export const DAEMON_SCHEMA_REVISION = 31;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-31-66299858b8b4";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;

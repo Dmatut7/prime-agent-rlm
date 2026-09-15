@@ -1,0 +1,3 @@
+- Changed `/context` to keep the most recently active sub-agents when its on-disk scan budget runs out; it used to keep the oldest and silently drop every recent one.
+- Added a "N+ more agents not shown" line to `/context`, plus a matching daemon log line, so a roster the scan budget truncated says what it left out.
+- Changed the session tree depth bound to keep the newest layers and the live leaf instead of the oldest ones, matching the flat tree bound, and to report which side it cut.

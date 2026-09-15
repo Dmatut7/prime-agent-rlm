@@ -24,6 +24,19 @@ export interface ContextTreeNode {
 	totalUsage: Usage;
 	contextUsage?: ContextUsage;
 	children: ContextTreeNode[];
+	/**
+	 * What the on-disk scan left out, present only when it left something out.
+	 *
+	 * A `/context` roster is built from several scans (this session's persisted
+	 * children plus each live child's), and every one of them is budgeted. When a
+	 * budget bites, the tree is partial, and a partial tree that does not say so
+	 * reads as "these are all the agents". The counts ride the node instead of a
+	 * side channel so the renderer - and any client that gets the tree over the
+	 * daemon wire - can say how much is missing. Absent when nothing was skipped,
+	 * and absent on an older daemon's response, so a client that does not know the
+	 * field renders exactly what it did before.
+	 */
+	scan?: ContextTreeScanDiagnostics;
 }
 
 function isAssistantEntry(entry: SessionEntry): entry is SessionEntry & {
@@ -318,6 +331,21 @@ function findSessionFile(dir: string): SessionFile | undefined {
 	return newest && { path: newest.path, size: newest.size };
 }
 
+/**
+ * The `sub-*` dirs under an RLM session dir, **newest first**.
+ *
+ * The order is the budget's eviction policy: the walk consumes this list in
+ * order and stops opening transcripts once a limit bites, so whichever end of
+ * the listing comes last is what a truncated `/context` loses. Newest-first
+ * keeps the agents that were active most recently - the ones a user is asking
+ * about - and drops the oldest branches, which `skippedByBudget` then reports.
+ * The previous ascending order did the opposite: on the measured 544-child
+ * directory it showed the 256 *oldest* children and silently lost every recent
+ * one, i.e. the budget turned into "hide the live half of the roster".
+ *
+ * Each dir is stat'ed once instead of once per comparison, and ties fall back
+ * to the path so one listing is deterministic.
+ */
 function listChildSessionDirs(rlmSessionDir: string): string[] {
 	let names: string[];
 	try {
@@ -325,23 +353,23 @@ function listChildSessionDirs(rlmSessionDir: string): string[] {
 	} catch {
 		return [];
 	}
-	return names
-		.filter((name) => name.startsWith("sub-"))
-		.map((name) => join(rlmSessionDir, name))
-		.filter((path) => {
-			try {
-				return statSync(path).isDirectory();
-			} catch {
-				return false;
+	const candidates: { path: string; mtime: number }[] = [];
+	for (const name of names) {
+		if (!name.startsWith("sub-")) {
+			continue;
+		}
+		const path = join(rlmSessionDir, name);
+		try {
+			const stats = statSync(path);
+			if (stats.isDirectory()) {
+				candidates.push({ path, mtime: stats.mtime.getTime() });
 			}
-		})
-		.sort((a, b) => {
-			try {
-				return statSync(a).mtime.getTime() - statSync(b).mtime.getTime();
-			} catch {
-				return 0;
-			}
-		});
+		} catch {
+			// Unreadable or already gone: not a candidate.
+		}
+	}
+	candidates.sort((a, b) => b.mtime - a.mtime || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+	return candidates.map((candidate) => candidate.path);
 }
 
 /** Which limit stopped a disk scan from reading more session files. */
@@ -372,7 +400,9 @@ export interface ContextTreeScanBudget {
  * - `maxChildren: 256`: `/context` was measured on a directory holding 544
  *   finished children, which cost 2.2s and ~1.08GB of reads. Ordinary RLM
  *   fan-out is in the tens, so 256 keeps a multi-round roster whole while
- *   capping the per-node work (each child is read and folded in full).
+ *   capping the per-node work (each child is read and folded in full). The 256
+ *   kept are the 256 most recently active (see {@link listChildSessionDirs}), so
+ *   what a capped scan drops is the oldest branches, never the live ones.
  * - `maxBytes: 64 MiB`: reading and folding a transcript dominates the scan and
  *   scales with file size, so bytes - not children - are what actually bounds
  *   the time. 64 MiB is roughly a thousand ordinary child sessions, and the
@@ -414,7 +444,16 @@ export interface ContextTreeScanDiagnostics {
 	truncatedReason: ContextTreeTruncatedReason | undefined;
 }
 
-interface ScanState {
+/**
+ * Running accounting of one on-disk scan: the limits in force plus what the walk
+ * has read and refused so far.
+ *
+ * Exported so a caller that runs several scans for one report - `/context` reads
+ * the persisted children of every live child as well as its own - can charge them
+ * all to a single budget and publish a single set of diagnostics, instead of each
+ * subtree getting a private allowance nobody adds up.
+ */
+export interface ContextTreeScanState {
 	readonly maxChildren: number;
 	readonly maxBytes: number;
 	readonly maxDepth: number;
@@ -436,7 +475,7 @@ function limitOr(value: number | undefined, fallback: number): number {
 	return Math.max(0, Math.floor(value));
 }
 
-function createScanState(budget: ContextTreeScanBudget | undefined): ScanState {
+export function createContextTreeScanState(budget?: ContextTreeScanBudget): ContextTreeScanState {
 	const defaults = DEFAULT_CONTEXT_TREE_SCAN_BUDGET;
 	return {
 		maxChildren: limitOr(budget?.maxChildren, defaults.maxChildren),
@@ -453,7 +492,8 @@ function createScanState(budget: ContextTreeScanBudget | undefined): ScanState {
 	};
 }
 
-function diagnosticsOf(state: ScanState): ContextTreeScanDiagnostics {
+/** The diagnostics for a scan so far; safe to read while the walk is still running. */
+export function contextTreeScanDiagnostics(state: ContextTreeScanState): ContextTreeScanDiagnostics {
 	return {
 		scannedChildren: state.scannedChildren,
 		bytesRead: state.bytesRead,
@@ -471,7 +511,7 @@ function diagnosticsOf(state: ScanState): ContextTreeScanDiagnostics {
  * cap stops the whole scan, so the caller never pays for a partial roster it
  * cannot finish.
  */
-function reserveChildRead(state: ScanState, size: number): boolean {
+function reserveChildRead(state: ContextTreeScanState, size: number): boolean {
 	state.bytesPlanned += size;
 	if (!state.readLimitReached) {
 		if (state.scannedChildren >= state.maxChildren) {
@@ -565,7 +605,7 @@ function scanChildrenInto(
 	rootDir: string,
 	rootSiblings: ContextTreeNode[],
 	resolveContextWindow: ContextWindowResolver,
-	state: ScanState,
+	state: ContextTreeScanState,
 	skipIds?: ReadonlySet<string>,
 ): void {
 	const queue: ScanFrame[] = [{ dir: rootDir, siblings: rootSiblings, level: 1, skipIds }];
@@ -607,6 +647,11 @@ export interface ContextTreeScanOptions {
 	budget?: ContextTreeScanBudget;
 	/** Children already represented live, excluded from the scan. */
 	skipIds?: ReadonlySet<string>;
+	/**
+	 * Accounting to charge this scan to, when it is part of a larger report.
+	 * Omitted: the scan gets its own state and `budget` applies to it alone.
+	 */
+	state?: ContextTreeScanState;
 }
 
 export interface ContextTreeScanResult {
@@ -627,13 +672,13 @@ export function scanContextTreeChildrenFromDisk(
 	resolveContextWindow: ContextWindowResolver,
 	options: ContextTreeScanOptions = {},
 ): ContextTreeScanResult {
-	const state = createScanState(options.budget);
+	const state = options.state ?? createContextTreeScanState(options.budget);
 	if (!rlmSessionDir || !existsSync(rlmSessionDir)) {
-		return { nodes: [], diagnostics: diagnosticsOf(state) };
+		return { nodes: [], diagnostics: contextTreeScanDiagnostics(state) };
 	}
 	const nodes: ContextTreeNode[] = [];
 	scanChildrenInto(rlmSessionDir, nodes, resolveContextWindow, state, options.skipIds);
-	return { nodes, diagnostics: diagnosticsOf(state) };
+	return { nodes, diagnostics: contextTreeScanDiagnostics(state) };
 }
 
 /**
@@ -650,6 +695,7 @@ export function loadContextTreeChildFromDisk(
 	childSessionDir: string,
 	resolveContextWindow: ContextWindowResolver,
 	budget?: ContextTreeScanBudget,
+	state?: ContextTreeScanState,
 ): ContextTreeNode | undefined {
 	const sessionFile = findSessionFile(childSessionDir);
 	if (!sessionFile) {
@@ -659,7 +705,7 @@ export function loadContextTreeChildFromDisk(
 	if (!node) {
 		return undefined;
 	}
-	scanChildrenInto(childSessionDir, node.children, resolveContextWindow, createScanState(budget));
+	scanChildrenInto(childSessionDir, node.children, resolveContextWindow, state ?? createContextTreeScanState(budget));
 	return node;
 }
 

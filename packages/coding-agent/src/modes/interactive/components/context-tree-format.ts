@@ -1,6 +1,6 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import type { ContextTreeNode } from "../../../core/context-tree.js";
+import type { ContextTreeNode, ContextTreeTruncatedReason } from "../../../core/context-tree.js";
 import type { ContextUsage } from "../../../core/extensions/index.js";
 import { addAssistantUsage, emptyUsage } from "../../../core/usage.js";
 import { formatTokenCount } from "../agent-activity.js";
@@ -91,6 +91,46 @@ function countNodes(root: ContextTreeNode): number {
 	return 1 + root.children.reduce((sum, child) => sum + countNodes(child), 0);
 }
 
+/** What the budgeted on-disk scans behind one roster read, and what they refused. */
+interface ContextTreeScanTotals {
+	/** Refused child dirs; each stands for its own unvisited subtree, so a lower bound. */
+	skipped: number;
+	scanned: number;
+	bytesRead: number;
+	reasons: ContextTreeTruncatedReason[];
+}
+
+/**
+ * Add up every node's scan diagnostics. A roster is several scans (this session's
+ * persisted children plus each live child's own tree), so the omission a user has
+ * to be told about is the sum, not whichever scan happened to be the root's.
+ */
+function sumScanDiagnostics(root: ContextTreeNode): ContextTreeScanTotals {
+	const totals: ContextTreeScanTotals = { skipped: 0, scanned: 0, bytesRead: 0, reasons: [] };
+	const stack: ContextTreeNode[] = [root];
+	while (stack.length > 0) {
+		const node = stack.pop()!;
+		const scan = node.scan;
+		if (scan) {
+			totals.skipped += scan.skippedByBudget;
+			totals.scanned += scan.scannedChildren;
+			totals.bytesRead += scan.bytesRead;
+			if (scan.truncatedReason && !totals.reasons.includes(scan.truncatedReason)) {
+				totals.reasons.push(scan.truncatedReason);
+			}
+		}
+		stack.push(...node.children);
+	}
+	return totals;
+}
+
+function formatScannedBytes(bytes: number): string {
+	if (bytes >= 1024 * 1024) {
+		return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+	}
+	return `${Math.max(1, Math.round(bytes / 1024))} KiB`;
+}
+
 /** Own usage summed over the whole tree: exact even while children are mid-run. */
 function sumOwnUsage(root: ContextTreeNode): Usage {
 	const total = emptyUsage();
@@ -160,6 +200,16 @@ export function formatContextTree(root: ContextTreeNode, width: number): string 
 		const costCell = padStartAnsi(theme.fg("dim", costCells[index]), costWidth);
 		const contextCell = formatContextColumn(row.node.contextUsage, row.node.id === "root");
 		lines.push(`${labelCell}  ${tokenCell}  ${costCell}  ${contextCell}`);
+	}
+
+	// A capped scan is a partial roster: name what is missing instead of letting the
+	// last row read as the end of the tree.
+	const scanTotals = sumScanDiagnostics(root);
+	if (scanTotals.skipped > 0) {
+		const detail = `(scan budget: ${scanTotals.reasons.join(", ") || "reached"}; ${scanTotals.scanned} child sessions read, ${formatScannedBytes(scanTotals.bytesRead)})`;
+		lines.push(
+			`${theme.fg("warning", `${scanTotals.skipped.toLocaleString()}+ more agents not shown`)} ${theme.fg("dim", detail)}`,
+		);
 	}
 
 	const totals = sumOwnUsage(root);
