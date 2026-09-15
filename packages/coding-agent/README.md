@@ -505,10 +505,12 @@ prime-agent rename <agent> <name>          # Rename an agent
 prime-agent send <agent> <message>         # Send an agent-to-agent message
 prime-agent status                         # Show background service status
 prime-agent doctor [--fix]                 # Inspect or safely clean up background services
-prime-agent shutdown [--force]             # Stop every agent, worker, and background service
+prime-agent shutdown [--force]             # Stop this shell's agents and background services
 ```
 
-`shutdown` asks for confirmation. `shutdown --force` skips confirmation and kills unresponsive workers and their tracked child processes.
+Daemon identity is the socket directory a shell resolves (`$TMPDIR/prime-agent-<uid>`), so `shutdown` and `doctor --fix` scope to that set by default. Both print a named report of every affected socket, its pid and its live session count before anything is stopped, and `--force` prints that report too instead of skipping it. `--all` widens to every daemon discovered on this machine, `--socket <path>` / `--socket-dir <dir>` narrow to one service or one directory, `--dry-run` prints the plan without acting, and `--orphans` refuses anything that still has live sessions, worker processes or cpu. `--force` additionally kills unresponsive workers and their tracked child processes, but never widens the scope.
+
+`status` reports liveness apart from the build check: `current` answers as this build, `outdated` answers as another build while live work is running on it, `stale` means a socket that answers as no known build with no live evidence, and `unreachable` / `orphan-file` are a hung process and a leftover socket file.
 
 ### Scheduled Prompts
 

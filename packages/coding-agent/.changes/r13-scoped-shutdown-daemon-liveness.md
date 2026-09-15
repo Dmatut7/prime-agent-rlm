@@ -1,0 +1,6 @@
+- Changed `prime-agent shutdown` to stop only this shell's own background services by default; stopping every daemon on the machine now requires `--all`, and `--socket <path>` / `--socket-dir <dir>` name a narrower target.
+- Added a named pre-stop report to `shutdown`: every affected socket, its pid and its live session count are listed before the confirmation, and `--force` prints the same report instead of skipping it.
+- Added `shutdown --dry-run` and `shutdown --orphans`, so a scoped plan can be read out and services that still carry live work can be excluded.
+- Fixed `prime-agent status` calling a live service `stale`: liveness (live sessions, verified worker processes, sampled cpu) is now reported separately from the build check, which yields `outdated` for a running service on another build.
+- Fixed sockets of another session's worker processes being discovered as daemons, which is what made a busy worker show up as a `stale` service.
+- Added `--dry-run`, `--orphans` and the same scope selectors to `prime-agent doctor --fix`, and made it clean only this shell's services unless `--all` is given; services with live worker processes are no longer killed or stopped by a cleanup.

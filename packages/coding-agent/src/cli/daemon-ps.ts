@@ -23,6 +23,16 @@ import type { DaemonWorkerDescriptor } from "../modes/daemon/daemon-worker-proto
 import { signalProcessGroupOrProcess } from "../utils/child-process.js";
 import { formatDaemonListTable } from "./daemon-ps-format.js";
 import { promptYesNo } from "./daemon-stop-confirm.js";
+import {
+	currentShutdownScope,
+	describeShutdownScope,
+	MACHINE_SCOPE,
+	MACHINE_STOP_SELECTION,
+	matchesShutdownScope,
+	resolveShutdownScope,
+	type ShutdownScope,
+	type StopSelection,
+} from "./daemon-stop-scope.js";
 
 /**
  * `daemon ps` discovers every prime-agent daemon on the machine, not just the
@@ -42,12 +52,31 @@ import { promptYesNo } from "./daemon-stop-confirm.js";
  * older build (a new protocol command would not).
  */
 
-export type DaemonStatus = "current" | "stale" | "unreachable" | "orphan-file";
+/**
+ * `outdated` and `stale` both mean "the build answering on that socket is not
+ * this build". They differ only on liveness: `outdated` still carries live
+ * evidence (sessions, worker processes, cpu), so neither a human nor a plan may
+ * read it as scrap. `stale` is the no-live-evidence case.
+ */
+export type DaemonStatus = "current" | "outdated" | "stale" | "unreachable" | "orphan-file";
+
+export type { ShutdownScope, StopSelection };
+export {
+	currentShutdownScope,
+	describeShutdownScope,
+	MACHINE_SCOPE,
+	MACHINE_STOP_SELECTION,
+	matchesShutdownScope,
+	resolveShutdownScope,
+};
+
+export type DaemonLiveness = "live" | "idle" | "unknown";
 
 export interface DiscoveredDaemonProcess {
 	pid: number;
 	socketPath: string;
 	uptimeSeconds?: number;
+	cpuPercent?: number;
 }
 
 export interface DaemonInfo {
@@ -64,13 +93,22 @@ export interface DaemonInfo {
 	status: DaemonStatus;
 	isDefault: boolean;
 	hasTrackedWorkers?: boolean;
+	/** Sampled process cpu percentage for `pid`, when a listener pid was found. */
+	cpuPercent?: number;
+	/** Tracked worker processes on this socket whose identity is verified alive. */
+	liveWorkerCount?: number;
+	/** Liveness verdict derived from sessions, worker processes and cpu activity. */
+	liveness?: DaemonLiveness;
+	/** What `liveness` is based on, in the words shown to the user. */
+	livenessEvidence?: string[];
 }
 
 const STATUS_ORDER: Record<DaemonStatus, number> = {
 	current: 0,
-	stale: 1,
-	unreachable: 2,
-	"orphan-file": 3,
+	outdated: 1,
+	stale: 2,
+	unreachable: 3,
+	"orphan-file": 4,
 };
 const SHUTDOWN_QUIET_PERIOD_MS = 1000;
 const SHUTDOWN_CONVERGENCE_TIMEOUT_MS = 10_000;
@@ -160,16 +198,55 @@ export function mergeDiscoveredDaemonProcesses(
 	return [...byIdentity.values()];
 }
 
-/** Parse `ps -o pid=,etimes=` output into a pid → uptime-seconds map. */
-export function parsePsEtimes(stdout: string): Map<number, number> {
-	const uptimes = new Map<number, number>();
+/**
+ * Parse `ps -o pid=,etime=,pcpu=` into a pid → { uptimeSeconds, cpuPercent }
+ * map. A line with only the two first columns still yields an uptime with no
+ * cpu sample, so a platform that refuses `pcpu` degrades to "no cpu evidence"
+ * instead of losing the process row.
+ */
+export function parsePsProcessStats(stdout: string): Map<number, { uptimeSeconds: number; cpuPercent?: number }> {
+	const stats = new Map<number, { uptimeSeconds: number; cpuPercent?: number }>();
 	for (const line of stdout.split("\n")) {
-		const match = line.trim().match(/^(\d+)\s+(\d+)$/);
-		if (match) {
-			uptimes.set(Number.parseInt(match[1]!, 10), Number.parseInt(match[2]!, 10));
+		const match = line.trim().match(/^(\d+)\s+(\S+)(?:\s+([0-9.]+))?$/);
+		if (!match) {
+			continue;
 		}
+		const uptimeSeconds = parsePsElapsedTime(match[2]!);
+		if (uptimeSeconds === undefined) {
+			continue;
+		}
+		const cpuPercent = match[3] === undefined ? undefined : Number.parseFloat(match[3]);
+		stats.set(Number.parseInt(match[1]!, 10), {
+			uptimeSeconds,
+			...(Number.isFinite(cpuPercent) ? { cpuPercent } : {}),
+		});
 	}
-	return uptimes;
+	return stats;
+}
+
+/**
+ * The elapsed-clock format both `ps` families print: `12-22:53:25`
+ * (days-hours-minutes-seconds), `07:37:18`, `04:21`, and the bare
+ * seconds form a BSD `ps` uses for a process younger than a minute.
+ */
+export function parsePsElapsedTime(value: string): number | undefined {
+	const [daysPart, clockPart] = value.includes("-") ? value.split("-", 2) : [undefined, value];
+	const components = (clockPart ?? "").split(":").map((part) => Number.parseInt(part, 10));
+	if (components.some((component) => !Number.isFinite(component)) || components.length === 0) {
+		return undefined;
+	}
+	let seconds = 0;
+	for (const component of components) {
+		seconds = seconds * 60 + component;
+	}
+	if (daysPart !== undefined) {
+		const days = Number.parseInt(daysPart, 10);
+		if (!Number.isFinite(days)) {
+			return undefined;
+		}
+		seconds += days * 86400;
+	}
+	return seconds;
 }
 
 function scanListeningDaemons(): DiscoveredDaemonProcess[] {
@@ -198,22 +275,67 @@ function scanListeningDaemons(): DiscoveredDaemonProcess[] {
 	return enrichUptimes(mergeDiscoveredDaemonProcesses(byName, byPid));
 }
 
+/**
+ * The raw listener scan is machine-wide by construction, so every stop path
+ * that signals a listener has to route through the requested scope first.
+ * Without this a scoped `--force` would still reap services it never named.
+ */
+function scopingListeningDaemons(selection: StopSelection): DiscoveredDaemonProcess[] {
+	return scanListeningDaemons().filter(
+		(listener) =>
+			!isWorkerSocketPath(listener.socketPath) && matchesShutdownScope(listener.socketPath, selection.scope),
+	);
+}
+
 function isDaemonProcessListening(pid: number, socketPath: string): boolean {
 	const target = normalizeSocketPath(socketPath);
 	return scanListeningDaemons().some((daemon) => daemon.pid === pid && daemon.socketPath === target);
 }
 
 function enrichUptimes(daemons: DiscoveredDaemonProcess[]): DiscoveredDaemonProcess[] {
-	const pids = daemons.map((daemon) => daemon.pid);
-	if (pids.length === 0) {
-		return daemons;
+	const stats = sampleProcessStats(daemons.map((daemon) => daemon.pid));
+	return daemons.map((daemon) => {
+		const entry = stats.get(daemon.pid);
+		if (!entry) {
+			return daemon;
+		}
+		return {
+			...daemon,
+			uptimeSeconds: entry.uptimeSeconds,
+			...(entry.cpuPercent !== undefined ? { cpuPercent: entry.cpuPercent } : {}),
+		};
+	});
+}
+
+/**
+ * One `ps` for the whole set, then one per pid that the batch refused to
+ * answer. The batch call exits non-zero and prints nothing as soon as any one
+ * pid has vanished between the socket scan and here, which used to silently
+ * drop the uptime *and* the cpu sample of every other service — and cpu is now
+ * liveness evidence, so "no sample" must not be a listing artifact.
+ */
+function sampleProcessStats(pids: readonly number[]): Map<number, { uptimeSeconds: number; cpuPercent?: number }> {
+	const unique = [...new Set(pids)];
+	if (unique.length === 0) {
+		return new Map();
 	}
-	const ps = spawnSync("ps", ["-o", "pid=,etimes=", "-p", pids.join(",")], { encoding: "utf8" });
-	if (ps.error || typeof ps.stdout !== "string") {
-		return daemons;
+	const stats = parsePsProcessStats(runProcessList(["-o", "pid=,etime=,pcpu=", "-p", unique.join(",")]));
+	for (const pid of unique) {
+		if (stats.has(pid) || !isProcessAlive(pid)) {
+			continue;
+		}
+		const single = parsePsProcessStats(runProcessList(["-o", "pid=,etime=,pcpu=", "-p", String(pid)]));
+		const entry = single.get(pid);
+		if (entry) {
+			stats.set(pid, entry);
+		}
 	}
-	const uptimes = parsePsEtimes(ps.stdout);
-	return daemons.map((daemon) => ({ ...daemon, uptimeSeconds: uptimes.get(daemon.pid) }));
+	return stats;
+}
+
+function runProcessList(args: string[]): string {
+	const result = spawnSync("ps", args, { encoding: "utf8" });
+	return typeof result.stdout === "string" && !result.error ? result.stdout : "";
 }
 
 /** Socket files in the default socket dir (may be live daemons or orphaned files). */
@@ -248,6 +370,8 @@ interface ProbeResult {
 	supervisorPid?: number;
 	supervisorProcessStartId?: string;
 	reachable: boolean;
+	/** The daemon answered hello or the list request; a bare connect is not an answer. */
+	answeredProbe: boolean;
 }
 
 async function probeDaemon(socketPath: string): Promise<ProbeResult> {
@@ -256,7 +380,7 @@ async function probeDaemon(socketPath: string): Promise<ProbeResult> {
 		await client.connect(300);
 	} catch {
 		client.close();
-		return { reachable: false };
+		return { reachable: false, answeredProbe: false };
 	}
 	try {
 		let version: string | undefined;
@@ -299,13 +423,24 @@ async function probeDaemon(socketPath: string): Promise<ProbeResult> {
 			supervisorPid,
 			supervisorProcessStartId,
 			reachable: true,
+			answeredProbe: greeted || sessionCount !== undefined,
 		};
 	} finally {
 		client.close();
 	}
 }
 
-function classifyReachable(probe: ProbeResult): DaemonStatus {
+/**
+ * Decide the status of a socket that accepted a connection.
+ *
+ * `stale` used to mean "answers, but not with this build", which read as
+ * "scrap" even for a supervisor running 119 live sessions at 7.6% cpu. The two
+ * axes are now separate: `liveness` says whether anything is running there,
+ * `status` says whether the answering build is this build. A daemon that
+ * answers the standardized primitives on a different build is `outdated`;
+ * `stale` is reserved for a socket that is not answering as any known build.
+ */
+export function classifyReachable(probe: ReachableProbeEvidence, liveness: DaemonLiveness): DaemonStatus {
 	if (
 		probe.protocolVersion === DAEMON_PROTOCOL_VERSION &&
 		probe.schemaId === DAEMON_SCHEMA_ID &&
@@ -313,7 +448,48 @@ function classifyReachable(probe: ProbeResult): DaemonStatus {
 	) {
 		return "current";
 	}
-	return "stale";
+	return liveness === "unknown" ? "stale" : "outdated";
+}
+
+interface ReachableProbeEvidence {
+	protocolVersion?: number;
+	schemaId?: string;
+	version?: string;
+}
+
+/**
+ * Liveness criteria, in the order the evidence is collected:
+ *
+ *  - `live`   the daemon reported sessions, or owns worker processes whose pid
+ *             identity verifies, or its listener pid shows sampled cpu time.
+ *  - `idle`   the socket answered the standardized probe but nothing is running
+ *             on it: no sessions, no live workers, no cpu.
+ *  - `unknown` the connection was accepted and nothing was answered. Only this
+ *             case may be called `stale`.
+ */
+export function evaluateDaemonLiveness(evidence: {
+	sessionCount?: number;
+	liveWorkerCount?: number;
+	cpuPercent?: number;
+	answeredProbe: boolean;
+}): { liveness: DaemonLiveness; evidence: string[] } {
+	const reasons: string[] = [];
+	if ((evidence.sessionCount ?? 0) > 0) {
+		reasons.push(`${evidence.sessionCount} session(s)`);
+	}
+	if ((evidence.liveWorkerCount ?? 0) > 0) {
+		reasons.push(`${evidence.liveWorkerCount} worker process(es)`);
+	}
+	if ((evidence.cpuPercent ?? 0) > 0) {
+		reasons.push(`cpu ${evidence.cpuPercent}%`);
+	}
+	if (reasons.length > 0) {
+		return { liveness: "live", evidence: reasons };
+	}
+	if (!evidence.answeredProbe) {
+		return { liveness: "unknown", evidence: [] };
+	}
+	return { liveness: "idle", evidence: ["answered probe with no work"] };
 }
 
 export function verifyHelloSupervisorPid(
@@ -349,12 +525,21 @@ export async function discoverDaemons(): Promise<DaemonInfo[]> {
 		processBySocket.set(daemon.socketPath, daemon);
 	}
 
+	const trackedWorkers = findAllTrackedWorkers();
 	const workerSockets = new Set(
-		findAllTrackedWorkers().map((worker) => normalizeSocketPath(worker.descriptor.supervisorSocketPath)),
+		trackedWorkers.map((worker) => normalizeSocketPath(worker.descriptor.supervisorSocketPath)),
 	);
+	// A descriptor names the worker socket it owns, whatever directory that
+	// socket ended up in, so it is authoritative over any name heuristic.
+	const workerOwnedSockets = new Set(
+		trackedWorkers.map((worker) => normalizeSocketPath(worker.descriptor.socketPath)),
+	);
+	const liveWorkersBySupervisor = countLiveTrackedWorkers(trackedWorkers.map((worker) => worker.descriptor));
+	const isDaemonSocket = (socketPath: string): boolean =>
+		!isWorkerSocketPath(socketPath) && !workerOwnedSockets.has(normalizeSocketPath(socketPath));
 	const sockets = new Set<string>([
-		...processBySocket.keys(),
-		...scanSocketDir().filter((socketPath) => !isWorkerSocketPath(socketPath)),
+		...[...processBySocket.keys()].filter(isDaemonSocket),
+		...scanSocketDir().filter(isDaemonSocket),
 		...workerSockets,
 	]);
 	const defaultSocket = normalizeSocketPath(defaultDaemonSocketPath());
@@ -365,8 +550,15 @@ export async function discoverDaemons(): Promise<DaemonInfo[]> {
 			const probe = await probeDaemon(socketPath);
 			const pid = proc?.pid ?? verifyHelloSupervisorPid(probe.supervisorPid, probe.supervisorProcessStartId);
 			const hasTrackedWorkers = workerSockets.has(socketPath);
+			const liveWorkerCount = liveWorkersBySupervisor.get(socketPath) ?? 0;
+			const liveness = evaluateDaemonLiveness({
+				sessionCount: probe.sessionCount,
+				liveWorkerCount,
+				cpuPercent: proc?.cpuPercent,
+				answeredProbe: probe.answeredProbe || liveWorkerCount > 0,
+			});
 			const status: DaemonStatus = probe.reachable
-				? classifyReachable(probe)
+				? classifyReachable(probe, liveness.liveness)
 				: proc || hasTrackedWorkers
 					? "unreachable"
 					: "orphan-file";
@@ -385,6 +577,10 @@ export async function discoverDaemons(): Promise<DaemonInfo[]> {
 				status,
 				isDefault: socketPath === defaultSocket,
 				...(hasTrackedWorkers ? { hasTrackedWorkers: true } : {}),
+				...(proc?.cpuPercent !== undefined ? { cpuPercent: proc.cpuPercent } : {}),
+				...(hasTrackedWorkers ? { liveWorkerCount } : {}),
+				liveness: liveness.liveness,
+				...(liveness.evidence.length > 0 ? { livenessEvidence: liveness.evidence } : {}),
 			};
 		}),
 	);
@@ -402,7 +598,7 @@ export function sortDaemons(infos: DaemonInfo[]): DaemonInfo[] {
 	});
 }
 
-export async function runPs(json: boolean): Promise<void> {
+export async function runPs(json: boolean, selection?: StopSelection): Promise<void> {
 	const daemons = await discoverDaemons();
 	if (json) {
 		console.log(JSON.stringify(daemons, null, 2));
@@ -413,6 +609,20 @@ export async function runPs(json: boolean): Promise<void> {
 		return;
 	}
 	console.log(formatDaemonListTable(daemons));
+	// `status` is machine-wide, but the stop commands are not. Say which rows a
+	// plain `prime-agent shutdown` would actually touch, so the two views of the
+	// machine cannot disagree about what is next on the destroy list.
+	const effective = selection ?? { scope: currentShutdownScope(), orphansOnly: false };
+	const { selected } = selectStoppableDaemons(daemons, effective);
+	console.log(
+		chalk.dim(
+			`\nstop scope: ${describeShutdownScope(effective.scope)} — ${selected.length} of ${daemons.length} service(s); use --all for whole-machine`,
+		),
+	);
+	const live = daemons.filter((daemon) => daemon.liveness === "live");
+	if (live.length > 0) {
+		console.log(chalk.dim(`live services: ${live.map((daemon) => daemon.socketPath).join(", ")}`));
+	}
 }
 
 export type ReapAction =
@@ -420,6 +630,45 @@ export type ReapAction =
 	| { kind: "kill"; daemon: DaemonInfo }
 	| { kind: "shutdown"; daemon: DaemonInfo }
 	| { kind: "skip"; daemon: DaemonInfo; reason: string };
+
+/** Live evidence in the sense used by the liveness criteria above. */
+export function hasLiveWork(daemon: DaemonInfo): boolean {
+	return (
+		daemon.liveness === "live" ||
+		(daemon.sessionCount ?? 0) > 0 ||
+		(daemon.liveWorkerCount ?? 0) > 0 ||
+		(daemon.cpuPercent ?? 0) > 0
+	);
+}
+
+/** Why a discovered daemon must be left alone by this selection, or undefined. */
+export function selectionExclusionReason(daemon: DaemonInfo, selection: StopSelection): string | undefined {
+	if (!matchesShutdownScope(daemon.socketPath, selection.scope)) {
+		const listenedIn = dirname(resolve(normalizeSocketPath(daemon.socketPath)));
+		return `outside the shutdown scope (${describeShutdownScope(selection.scope)}; this service listens in ${listenedIn})`;
+	}
+	if (selection.orphansOnly && hasLiveWork(daemon)) {
+		return `has live work (${daemon.livenessEvidence?.join(", ") ?? `${daemon.sessionCount ?? "unknown"} session(s)`})`;
+	}
+	return undefined;
+}
+
+/** Name one discovered service for a confirmation prompt: path, pid, live sessions. */
+export function describeShutdownTarget(daemon: DaemonInfo): string {
+	const sessions =
+		daemon.sessionCount === undefined
+			? "sessions unknown"
+			: `${daemon.sessionCount} live session(s)${daemon.sessionCount > 0 ? " [ACTIVE WORK]" : ""}`;
+	const pid = daemon.pid === undefined ? "pid unknown" : `pid ${daemon.pid}`;
+	const flags = [
+		daemon.isDefault ? "default service" : undefined,
+		daemon.status === "outdated" ? `built ${daemon.version ?? "unknown"} (not this build)` : undefined,
+		daemon.status === "stale" ? "not answering as any known build" : undefined,
+		daemon.status === "unreachable" ? "not answering" : undefined,
+		(daemon.liveWorkerCount ?? 0) > 0 ? `${daemon.liveWorkerCount} worker process(es)` : undefined,
+	].filter((flag): flag is string => flag !== undefined);
+	return [daemon.socketPath, pid, sessions, ...flags].join("  ");
+}
 
 /**
  * Decide what to do with each discovered daemon (pure, no side effects). Reap
@@ -436,7 +685,11 @@ export type ReapAction =
  * the SIGTERM and backs off to the session-aware paths if it has since become
  * reachable, so a daemon that recovered with live sessions is never killed.
  */
-export function planReap(daemons: readonly DaemonInfo[], force: boolean): ReapAction[] {
+export function planReap(
+	daemons: readonly DaemonInfo[],
+	force: boolean,
+	selection: StopSelection = MACHINE_STOP_SELECTION,
+): ReapAction[] {
 	const pidCounts = new Map<number, number>();
 	for (const daemon of daemons) {
 		if (daemon.pid !== undefined) {
@@ -445,6 +698,10 @@ export function planReap(daemons: readonly DaemonInfo[], force: boolean): ReapAc
 	}
 
 	return daemons.map((daemon): ReapAction => {
+		const excluded = selectionExclusionReason(daemon, selection);
+		if (excluded) {
+			return { kind: "skip", daemon, reason: excluded };
+		}
 		// An orphan socket file has no owning process, so removing it is safe even
 		// on the default path (a stale daemon.sock left by a crash). Decide this
 		// before the default guard so a dead default socket still gets cleaned up.
@@ -458,6 +715,13 @@ export function planReap(daemons: readonly DaemonInfo[], force: boolean): ReapAc
 			if (!force || daemon.pid === undefined) {
 				return { kind: "skip", daemon, reason: 'unreachable; use "prime-agent shutdown --force" to stop it' };
 			}
+			if ((daemon.liveWorkerCount ?? 0) > 0) {
+				return {
+					kind: "skip",
+					daemon,
+					reason: `unreachable; ${daemon.liveWorkerCount} worker process(es) still live, not killing`,
+				};
+			}
 			if ((pidCounts.get(daemon.pid) ?? 0) > 1) {
 				return {
 					kind: "skip",
@@ -470,12 +734,23 @@ export function planReap(daemons: readonly DaemonInfo[], force: boolean): ReapAc
 		if (daemon.sessionCount !== 0) {
 			return { kind: "skip", daemon, reason: `has ${daemon.sessionCount ?? "unknown"} session(s)` };
 		}
+		if ((daemon.liveWorkerCount ?? 0) > 0) {
+			return { kind: "skip", daemon, reason: `has ${daemon.liveWorkerCount} live worker process(es)` };
+		}
 		return { kind: "shutdown", daemon };
 	});
 }
 
-export function planShutdownAll(daemons: readonly DaemonInfo[], force: boolean): ReapAction[] {
+export function planShutdownAll(
+	daemons: readonly DaemonInfo[],
+	force: boolean,
+	selection: StopSelection = MACHINE_STOP_SELECTION,
+): ReapAction[] {
 	return daemons.map((daemon): ReapAction => {
+		const excluded = selectionExclusionReason(daemon, selection);
+		if (excluded) {
+			return { kind: "skip", daemon, reason: excluded };
+		}
 		if (daemon.status === "orphan-file") {
 			return { kind: "remove-file", daemon };
 		}
@@ -511,18 +786,105 @@ export function planShutdownConfirmation(
 	return stdinIsTTY ? "prompt" : "tty-error";
 }
 
-export async function runShutdownAll(json: boolean, force: boolean): Promise<void> {
-	const daemons = await discoverDaemons();
-	switch (planShutdownConfirmation(daemons.length, json, force, process.stdin.isTTY)) {
+/** Partition a discovery result by what one stop selection may touch. */
+export function selectStoppableDaemons(
+	daemons: readonly DaemonInfo[],
+	selection: StopSelection,
+): { selected: DaemonInfo[]; excluded: DaemonInfo[] } {
+	const selected: DaemonInfo[] = [];
+	const excluded: DaemonInfo[] = [];
+	for (const daemon of daemons) {
+		if (selectionExclusionReason(daemon, selection) === undefined) {
+			selected.push(daemon);
+		} else {
+			excluded.push(daemon);
+		}
+	}
+	return { selected, excluded };
+}
+
+function totalLiveSessions(daemons: readonly DaemonInfo[]): number {
+	return daemons.reduce((total, daemon) => total + (daemon.sessionCount ?? 0), 0);
+}
+
+/**
+ * The named pre-stop report: every service this command intends to destroy,
+ * one line each, plus the ones it deliberately leaves alone. Both `shutdown`
+ * and `shutdown --force` print it, because a confirmation that does not name
+ * what it is about to kill is not a confirmation.
+ */
+export function formatShutdownReport(
+	selection: StopSelection,
+	selected: readonly DaemonInfo[],
+	excluded: readonly DaemonInfo[],
+): string {
+	const lines = [
+		`${selection.scope.kind === "machine" ? "WHOLE-MACHINE scope" : "Scoped"}: ${describeShutdownScope(selection.scope)}`,
+		`${selected.length} of ${selected.length + excluded.length} discovered service(s) will be stopped (${totalLiveSessions(selected)} live session(s) on them).`,
+	];
+	for (const daemon of selected) {
+		lines.push(`  stop  ${describeShutdownTarget(daemon)}`);
+	}
+	for (const daemon of excluded) {
+		lines.push(`  keep  ${describeShutdownTarget(daemon)}  (${selectionExclusionReason(daemon, selection)})`);
+	}
+	return lines.join("\n");
+}
+
+export function formatShutdownQuestion(selection: StopSelection, selected: readonly DaemonInfo[]): string {
+	const sessions = totalLiveSessions(selected);
+	const work = sessions > 0 ? ` ${sessions} live session(s) will be interrupted.` : " No live sessions are attached.";
+	if (selection.scope.kind === "machine") {
+		return `Stop every agent and background service on this machine (${selected.length} service(s))?${work}`;
+	}
+	return `Stop ${describeShutdownScope(selection.scope)} (${selected.length} service(s))?${work}`;
+}
+
+/** Services a selection must never signal, by pid, so the force sweeps cannot reach them. */
+export function protectedShutdownPids(daemons: readonly DaemonInfo[], selection: StopSelection): Set<number> {
+	const pids = new Set<number>();
+	for (const daemon of daemons) {
+		if (daemon.pid !== undefined && selectionExclusionReason(daemon, selection) !== undefined) {
+			pids.add(daemon.pid);
+		}
+	}
+	return pids;
+}
+
+export async function runShutdownSelection(
+	json: boolean,
+	force: boolean,
+	selection: StopSelection = { scope: currentShutdownScope(), orphansOnly: false },
+	dryRun = false,
+): Promise<void> {
+	const discovered = (await discoverDaemons()).filter((daemon) => !isWorkerSocketPath(daemon.socketPath));
+	const { selected, excluded } = selectStoppableDaemons(discovered, selection);
+	const report = formatShutdownReport(selection, selected, excluded);
+	if (dryRun) {
+		if (json) {
+			console.log(
+				JSON.stringify({ dryRun: true, scope: selection.scope, targets: selected, leftRunning: excluded }, null, 2),
+			);
+		} else {
+			console.log(`${report}\nDry run: nothing was stopped.`);
+		}
+		return;
+	}
+	switch (planShutdownConfirmation(selected.length, json, force, process.stdin.isTTY)) {
 		case "json-error":
 			process.exitCode = 1;
 			console.log(
 				JSON.stringify(
 					{
+						scope: selection.scope,
 						stopped: [],
-						failed: daemons.map(({ socketPath }) => ({
+						failed: selected.map(({ socketPath }) => ({
 							socketPath,
 							reason: 'confirmation required; use "prime-agent shutdown --force --json"',
+						})),
+						leftRunning: excluded.map(({ socketPath }) => ({
+							socketPath,
+							reason: `outside the requested scope; use --all to include it`,
 						})),
 					},
 					null,
@@ -532,12 +894,10 @@ export async function runShutdownAll(json: boolean, force: boolean): Promise<voi
 			return;
 		case "tty-error":
 			throw new Error(
-				'Shutdown requires confirmation in an interactive terminal. Use "prime-agent shutdown --force".',
+				`Shutdown requires confirmation in an interactive terminal. Use "prime-agent shutdown --force". Requested scope: ${describeShutdownScope(selection.scope)}.`,
 			);
 		case "prompt": {
-			const confirmed = await promptYesNo(
-				"Stop every agent and background service? Active work will be interrupted.",
-			);
+			const confirmed = await promptYesNo(`${report}\n${formatShutdownQuestion(selection, selected)}`);
 			if (!confirmed) {
 				console.log(chalk.dim("Shutdown cancelled."));
 				return;
@@ -545,32 +905,62 @@ export async function runShutdownAll(json: boolean, force: boolean): Promise<voi
 			break;
 		}
 		case "none":
+			// --force skips the question, not the names: whoever forced it must
+			// still be able to see which instances are about to go.
+			if (!json && selected.length > 0) {
+				console.log(report);
+			}
 			break;
+	}
+	if (selected.length === 0) {
+		// planShutdownConfirmation() skips the question for an empty scope, so this
+		// is the only place that tells the user why nothing was stopped.
+		if (json) {
+			console.log(
+				JSON.stringify({ scope: selection.scope, stopped: [], failed: [], leftRunning: excluded }, null, 2),
+			);
+			return;
+		}
+		console.log(report);
+		console.log(chalk.dim("Nothing to stop in this scope."));
+		return;
 	}
 	const admission = await acquireDaemonShutdownAdmission();
 	try {
-		await runShutdownAllConverging(json, force, () => admission.assertOrRenew());
+		await runShutdownConverging(json, force, () => admission.assertOrRenew(), selection);
 	} finally {
 		await admission.release();
 	}
 }
 
-async function runShutdownAllConverging(
+async function runShutdownConverging(
 	json: boolean,
 	force: boolean,
 	assertAdmission: () => Promise<void>,
+	selection: StopSelection,
 ): Promise<void> {
 	const stopped: Array<{ socketPath: string; action: string }> = [];
 	const failed: Array<{ socketPath: string; reason: string }> = [];
 	const handledPids = new Set<number>();
 	const reportedFailures = new Set<string>();
 
-	if (force) {
-		await stopHiddenSupervisors(stopped, failed, handledPids, reportedFailures, assertAdmission);
-	}
 	const daemons = (await discoverDaemons()).filter((daemon) => !isWorkerSocketPath(daemon.socketPath));
+	const { selected, excluded } = selectStoppableDaemons(daemons, selection);
+	const protectedPids = protectedShutdownPids(daemons, selection);
 
-	const actions = [...planShutdownAll(daemons, force)].sort(
+	if (force) {
+		await stopHiddenSupervisors(
+			stopped,
+			failed,
+			handledPids,
+			reportedFailures,
+			assertAdmission,
+			selection,
+			protectedPids,
+		);
+	}
+
+	const actions = [...planShutdownAll(selected, force, selection)].sort(
 		(left, right) => SHUTDOWN_ALL_ACTION_ORDER[left.kind] - SHUTDOWN_ALL_ACTION_ORDER[right.kind],
 	);
 
@@ -651,18 +1041,36 @@ async function runShutdownAllConverging(
 	}
 
 	if (force) {
-		await terminateVerifiedResiduals(stopped, failed, handledPids, reportedFailures, assertAdmission);
+		await terminateVerifiedResiduals(
+			stopped,
+			failed,
+			handledPids,
+			reportedFailures,
+			assertAdmission,
+			selection,
+			protectedPids,
+		);
 	}
 
 	if (json) {
 		if (failed.length > 0) {
 			process.exitCode = 1;
 		}
-		console.log(JSON.stringify({ stopped, failed }, null, 2));
-		return;
-	}
-	if (stopped.length === 0 && failed.length === 0) {
-		console.log("No background services found.");
+		console.log(
+			JSON.stringify(
+				{
+					scope: selection.scope,
+					stopped,
+					failed,
+					leftRunning: excluded.map((daemon) => ({
+						socketPath: daemon.socketPath,
+						reason: selectionExclusionReason(daemon, selection) ?? "outside the requested scope",
+					})),
+				},
+				null,
+				2,
+			),
+		);
 		return;
 	}
 	for (const entry of stopped) {
@@ -670,6 +1078,16 @@ async function runShutdownAllConverging(
 	}
 	for (const entry of failed) {
 		console.log(chalk.red(`failed  ${entry.socketPath}: ${entry.reason}`));
+	}
+	for (const daemon of excluded) {
+		console.log(
+			chalk.dim(
+				`left    ${daemon.socketPath}: ${selectionExclusionReason(daemon, selection) ?? "outside the requested scope"}`,
+			),
+		);
+	}
+	if (stopped.length === 0 && failed.length === 0 && excluded.length === 0) {
+		console.log("No background services found.");
 	}
 	if (failed.length > 0) {
 		process.exitCode = 1;
@@ -682,9 +1100,11 @@ async function stopHiddenSupervisors(
 	handledPids: Set<number>,
 	reportedFailures: Set<string>,
 	assertAdmission: () => Promise<void>,
+	selection: StopSelection,
+	protectedPids: ReadonlySet<number>,
 ): Promise<void> {
 	while (true) {
-		const listeners = scanListeningDaemons().filter((listener) => !isWorkerSocketPath(listener.socketPath));
+		const listeners = scopingListeningDaemons(selection).filter((listener) => !protectedPids.has(listener.pid));
 		const bySocket = new Map<string, DiscoveredDaemonProcess[]>();
 		for (const listener of listeners) {
 			const group = bySocket.get(listener.socketPath) ?? [];
@@ -718,10 +1138,8 @@ async function stopHiddenSupervisors(
 				stopped.push({ socketPath: listener.socketPath, action: `stopped hidden daemon (pid ${listener.pid})` });
 			}
 		}
-		const afterHidden = scanListeningDaemons().filter(
-			(listener) =>
-				!isWorkerSocketPath(listener.socketPath) &&
-				hidden.some((candidate) => candidate.pid === listener.pid && candidate.socketPath === listener.socketPath),
+		const afterHidden = scopingListeningDaemons(selection).filter((listener) =>
+			hidden.some((candidate) => candidate.pid === listener.pid && candidate.socketPath === listener.socketPath),
 		);
 		if (afterHidden.length === 0 || daemonListenerSignature(afterHidden) === before) {
 			return;
@@ -735,13 +1153,15 @@ async function terminateVerifiedResiduals(
 	handledPids: Set<number>,
 	reportedFailures: Set<string>,
 	assertAdmission: () => Promise<void>,
+	selection: StopSelection,
+	protectedPids: ReadonlySet<number>,
 ): Promise<void> {
 	let previousSignature: string | undefined;
 	let quietSince: number | undefined;
 	const deadline = Date.now() + SHUTDOWN_CONVERGENCE_TIMEOUT_MS;
 	while (true) {
 		await assertAdmission();
-		const listeners = scanListeningDaemons();
+		const listeners = scopingListeningDaemons(selection).filter((listener) => !protectedPids.has(listener.pid));
 		const now = Date.now();
 		if (listeners.length === 0) {
 			previousSignature = undefined;
@@ -878,14 +1298,30 @@ function recordShutdownFailure(
 	failed.push({ socketPath, reason });
 }
 
+/**
+ * A worker socket belongs to a supervisor, never to the daemon list.
+ *
+ * The name shape is `worker-<12 hex of the supervisor socket>-<12 hex of the
+ * worker id>.sock` and the supervisor always creates it in *its* default socket
+ * dir, which is `$TMPDIR/prime-agent-<uid>`. Matching only this process's own
+ * dir made every other TMPDIR's live worker show up as a daemon, where the
+ * probe answered with a worker's identity and the build check called it
+ * `stale`. Any `prime-agent-<uid>` dir is therefore a worker dir, whichever
+ * TMPDIR it sits under.
+ */
 export function isWorkerSocketPath(socketPath: string): boolean {
-	return (
-		process.platform !== "win32" &&
-		resolve(dirname(socketPath)) === resolve(defaultDaemonSocketDir()) &&
-		basename(socketPath).startsWith("worker-") &&
-		basename(socketPath).endsWith(".sock")
-	);
+	if (process.platform === "win32") {
+		return false;
+	}
+	const name = basename(socketPath);
+	if (!name.startsWith("worker-") || !name.endsWith(".sock")) {
+		return false;
+	}
+	const parent = basename(resolve(socketPath, ".."));
+	return parent === basename(resolve(defaultDaemonSocketDir(), "..")) || PRIME_AGENT_SOCKET_DIR_NAME.test(parent);
 }
+
+const PRIME_AGENT_SOCKET_DIR_NAME = /^prime-agent-(?:\d+|user)$/;
 
 async function stopBackgroundService(
 	socketPath: string,
@@ -923,6 +1359,58 @@ async function stopBackgroundService(
 interface TrackedWorker {
 	descriptor: DaemonWorkerDescriptor;
 	descriptorPath: string;
+}
+
+/**
+ * Workers whose supervisor socket is no longer served by anything.
+ *
+ * Worker sockets are deliberately kept out of the daemon list, so without this
+ * face a leaked worker (its supervisor crashed, or a suite daemon exited and
+ * left it behind) would be invisible *and* uncleanable. Identity is checked
+ * against the descriptor the supervisor wrote, so a recycled pid is never
+ * signalled.
+ */
+export type OrphanWorkerAction =
+	| { kind: "stop"; descriptor: DaemonWorkerDescriptor }
+	| { kind: "remove-records"; descriptor: DaemonWorkerDescriptor }
+	| { kind: "skip"; descriptor: DaemonWorkerDescriptor; reason: string };
+
+export function planOrphanWorkerReap(
+	workers: readonly DaemonWorkerDescriptor[],
+	servedSupervisorSockets: ReadonlySet<string>,
+	options: {
+		selection: StopSelection;
+		processAlive: (pid: number) => boolean;
+		identityMatches: (descriptor: DaemonWorkerDescriptor) => boolean;
+	},
+): OrphanWorkerAction[] {
+	return workers.map((descriptor): OrphanWorkerAction => {
+		const supervisor = normalizeSocketPath(descriptor.supervisorSocketPath);
+		if (!matchesShutdownScope(supervisor, options.selection.scope)) {
+			return { kind: "skip", descriptor, reason: "supervisor socket is outside the cleanup scope" };
+		}
+		if (servedSupervisorSockets.has(supervisor)) {
+			return { kind: "skip", descriptor, reason: "supervisor is still serving its workers" };
+		}
+		if (!options.processAlive(descriptor.pid)) {
+			return { kind: "remove-records", descriptor };
+		}
+		if (descriptor.processStartId === undefined) {
+			return {
+				kind: "skip",
+				descriptor,
+				reason: `process ${descriptor.pid} is alive but the descriptor recorded no process identity, not signalling it`,
+			};
+		}
+		if (!options.identityMatches(descriptor)) {
+			return {
+				kind: "skip",
+				descriptor,
+				reason: `process ${descriptor.pid} is alive but its identity does not match the descriptor`,
+			};
+		}
+		return { kind: "stop", descriptor };
+	});
 }
 
 async function forceStopTrackedWorkers(
@@ -973,19 +1461,58 @@ async function forceStopTrackedWorkers(
 			}
 		}
 		if (cleanupWorkerRecords) {
-			try {
-				removeSocketFile(descriptor.socketPath);
-				rmSync(worker.descriptorPath, { force: true });
-				rmSync(descriptor.recoveryJournalPath, { force: true });
-				if (descriptor.orphanProcessJournalPath) {
-					rmSync(descriptor.orphanProcessJournalPath, { force: true });
-				}
-			} catch (error) {
-				failures.push(`could not clean up worker ${descriptor.workerId}: ${String(error)}`);
+			const cleanup = removeTrackedWorkerRecords(worker);
+			if (cleanup) {
+				failures.push(`could not clean up worker ${descriptor.workerId}: ${cleanup}`);
 			}
 		}
 	}
 	return failures;
+}
+
+/** Remove a worker's socket and journals. Returns an error string when it failed. */
+function removeTrackedWorkerRecords(worker: TrackedWorker): string | undefined {
+	const { descriptor } = worker;
+	try {
+		removeSocketFile(descriptor.socketPath);
+		rmSync(worker.descriptorPath, { force: true });
+		rmSync(descriptor.recoveryJournalPath, { force: true });
+		if (descriptor.orphanProcessJournalPath) {
+			rmSync(descriptor.orphanProcessJournalPath, { force: true });
+		}
+		return undefined;
+	} catch (error) {
+		return String(error);
+	}
+}
+
+/**
+ * Worker processes whose identity still matches the descriptor their supervisor
+ * wrote. A live worker is the strongest evidence there is that the socket above
+ * it is not scrap: the process is running work right now.
+ */
+export function countLiveTrackedWorkers(
+	descriptors: readonly DaemonWorkerDescriptor[],
+	identityMatches: (descriptor: DaemonWorkerDescriptor) => boolean = defaultIdentityMatches,
+): Map<string, number> {
+	const counts = new Map<string, number>();
+	for (const descriptor of descriptors) {
+		const supervisor = normalizeSocketPath(descriptor.supervisorSocketPath);
+		if (!counts.has(supervisor)) {
+			counts.set(supervisor, 0);
+		}
+		if (identityMatches(descriptor)) {
+			counts.set(supervisor, (counts.get(supervisor) ?? 0) + 1);
+		}
+	}
+	return counts;
+}
+
+function defaultIdentityMatches(descriptor: DaemonWorkerDescriptor): boolean {
+	if (descriptor.processStartId === undefined) {
+		return isProcessAlive(descriptor.pid);
+	}
+	return getProcessStartId(descriptor.pid) === descriptor.processStartId;
 }
 
 function findTrackedWorkers(supervisorSocketPath: string): TrackedWorker[] {
@@ -1092,12 +1619,61 @@ async function stopTrackedProcess(
 	return !isProcessAlive(pid);
 }
 
-export async function runReap(json: boolean, force: boolean): Promise<void> {
+/**
+ * `doctor --fix` cleanup. Scoped by default (the caller's own socket dir), with
+ * `--dry-run` to list each target first and `--orphans` to refuse every service
+ * that still carries live evidence.
+ */
+export async function runReap(
+	json: boolean,
+	force: boolean,
+	selection: StopSelection = { scope: currentShutdownScope(), orphansOnly: false },
+	dryRun = false,
+): Promise<void> {
 	const daemons = await discoverDaemons();
 	const reaped: Array<{ socketPath: string; action: string }> = [];
 	const skipped: Array<{ socketPath: string; reason: string }> = [];
+	const actions = planReap(daemons, force, selection);
+	const workers = findAllTrackedWorkers();
+	const servedSockets = new Set(
+		daemons
+			.filter((daemon) => daemon.pid !== undefined || daemon.liveness !== "unknown")
+			.map((daemon) => daemon.socketPath),
+	);
+	const orphanWorkers = planOrphanWorkerReap(
+		workers.map((worker) => worker.descriptor),
+		servedSockets,
+		{ selection, processAlive: isProcessAlive, identityMatches: defaultIdentityMatches },
+	);
 
-	for (const action of planReap(daemons, force)) {
+	if (dryRun) {
+		const plan = [
+			...actions.map((action) => ({
+				kind: action.kind,
+				socketPath: action.daemon.socketPath,
+				detail: "reason" in action ? action.reason : "would be cleaned",
+			})),
+			...orphanWorkers.map((action) => ({
+				kind: action.kind === "skip" ? ("skip" as const) : action.kind,
+				socketPath: action.descriptor.socketPath,
+				detail:
+					action.kind === "skip"
+						? action.reason
+						: `worker ${action.descriptor.workerId} (pid ${action.descriptor.pid}) of the unserved supervisor ${action.descriptor.supervisorSocketPath}`,
+			})),
+		];
+		if (json) {
+			console.log(JSON.stringify({ dryRun: true, scope: selection.scope, plan }, null, 2));
+			return;
+		}
+		console.log(`Cleanup plan for ${describeShutdownScope(selection.scope)}; nothing was touched.`);
+		for (const entry of plan) {
+			console.log(`  ${entry.kind.padEnd(14)} ${entry.socketPath}: ${entry.detail}`);
+		}
+		return;
+	}
+
+	for (const action of actions) {
 		const { socketPath, pid } = action.daemon;
 		switch (action.kind) {
 			case "skip":
@@ -1137,12 +1713,42 @@ export async function runReap(json: boolean, force: boolean): Promise<void> {
 		}
 	}
 
+	for (const action of orphanWorkers) {
+		const { descriptor } = action;
+		const label = `worker ${descriptor.workerId} (pid ${descriptor.pid})`;
+		if (action.kind === "skip") {
+			skipped.push({ socketPath: descriptor.socketPath, reason: `${label}: ${action.reason}` });
+			continue;
+		}
+		const worker = workers.find((candidate) => candidate.descriptorPath && candidate.descriptor === descriptor);
+		if (!worker) {
+			skipped.push({ socketPath: descriptor.socketPath, reason: `${label}: descriptor disappeared` });
+			continue;
+		}
+		if (action.kind === "stop") {
+			const admission = async () => {};
+			if (!(await stopTrackedProcess(descriptor.pid, descriptor.processStartId, admission))) {
+				skipped.push({ socketPath: descriptor.socketPath, reason: `${label}: could not be stopped safely` });
+				continue;
+			}
+		}
+		const cleanup = removeTrackedWorkerRecords(worker);
+		if (cleanup) {
+			skipped.push({ socketPath: descriptor.socketPath, reason: `${label}: could not remove records (${cleanup})` });
+		} else {
+			reaped.push({
+				socketPath: descriptor.socketPath,
+				action: action.kind === "stop" ? `stopped orphaned ${label}` : `removed records of dead ${label}`,
+			});
+		}
+	}
+
 	if (json) {
-		console.log(JSON.stringify({ reaped, skipped }, null, 2));
+		console.log(JSON.stringify({ scope: selection.scope, reaped, skipped }, null, 2));
 		return;
 	}
 	if (reaped.length === 0 && skipped.length === 0) {
-		console.log("No background services found.");
+		console.log(`No background services found in scope: ${describeShutdownScope(selection.scope)}`);
 		return;
 	}
 	for (const entry of reaped) {

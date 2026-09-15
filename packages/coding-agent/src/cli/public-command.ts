@@ -18,7 +18,8 @@ import {
 	REMOVED_COMMAND_NAMES,
 } from "./command-registry.js";
 import { handleDaemonCommand } from "./daemon-command.js";
-import { runPs, runReap, runShutdownAll } from "./daemon-ps.js";
+import { runPs, runReap, runShutdownSelection } from "./daemon-ps.js";
+import { resolveStopSelection, type StopSelectionFlags } from "./daemon-stop-scope.js";
 import { DAEMON_UPDATE_RESTART_COORDINATOR_FLAG } from "./daemon-update-restart.js";
 
 export interface PublicCommandResult {
@@ -256,6 +257,64 @@ async function runStatus(args: string[]): Promise<PublicCommandResult> {
 	return HANDLED;
 }
 
+const SCOPE_VALUE_FLAGS = ["--socket", "--socket-dir", "--daemon-socket"] as const;
+
+interface ScopedOptions {
+	flags: Set<string>;
+	values: Map<string, string>;
+}
+
+/**
+ * Boolean flags plus the three scope selectors. A value flag without a value,
+ * or a repeated selector, is refused here instead of silently widening or
+ * narrowing what a stop command will destroy.
+ */
+function parseScopedOptions(
+	args: string[],
+	booleanFlags: ReadonlySet<string>,
+	command: string,
+): ScopedOptions | undefined {
+	const flags = new Set<string>();
+	const values = new Map<string, string>();
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index]!;
+		if (booleanFlags.has(arg)) {
+			flags.add(arg);
+			continue;
+		}
+		if ((SCOPE_VALUE_FLAGS as readonly string[]).includes(arg)) {
+			const value = args[index + 1];
+			if (!value || value.startsWith("-")) {
+				fail(`${arg} requires a path.`, `Run "${APP_NAME} help ${command}" for usage.`);
+				return undefined;
+			}
+			if (values.has(arg)) {
+				fail(`${arg} was given more than once.`, `Run "${APP_NAME} help ${command}" for usage.`);
+				return undefined;
+			}
+			values.set(arg, value);
+			index++;
+			continue;
+		}
+		fail(`Unknown option for ${command}: ${arg}`, `Run "${APP_NAME} help ${command}" for usage.`);
+		return undefined;
+	}
+	const socketPath = values.get("--socket") ?? values.get("--daemon-socket");
+	if (socketPath !== undefined) {
+		values.set("--socket", socketPath);
+	}
+	return { flags, values };
+}
+
+function toStopSelectionFlags(options: ScopedOptions): StopSelectionFlags {
+	return {
+		all: options.flags.has("--all"),
+		orphansOnly: options.flags.has("--orphans"),
+		socketPath: options.values.get("--socket"),
+		socketDir: options.values.get("--socket-dir"),
+	};
+}
+
 /**
  * `retention status` reports the last sweep, `retention sweep` runs one now. The
  * manual trigger exists for a machine whose daemon is not running the periodic
@@ -314,20 +373,40 @@ async function runRetention(args: string[]): Promise<PublicCommandResult> {
 }
 
 async function runDoctor(args: string[]): Promise<PublicCommandResult> {
-	const options = parseBooleanOptions(args, new Set(["--fix", "--json"]), "doctor");
-	if (!options) return HANDLED;
-	if (options.has("--fix")) {
-		await runReap(options.has("--json"), false);
-	} else {
+	if (!args.includes("--fix")) {
+		const options = parseBooleanOptions(args, new Set(["--json"]), "doctor");
+		if (!options) return HANDLED;
 		await runPs(options.has("--json"));
+		return HANDLED;
 	}
+	const rest = args.filter((arg) => arg !== "--fix");
+	const options = parseScopedOptions(rest, new Set(["--json", "--all", "--orphans", "--dry-run"]), "doctor --fix");
+	if (!options) return HANDLED;
+	const resolved = resolveStopSelection(toStopSelectionFlags(options));
+	if (!resolved.ok) {
+		return fail(resolved.error, `Run "${APP_NAME} help doctor" for usage.`);
+	}
+	await runReap(options.flags.has("--json"), false, resolved.selection, options.flags.has("--dry-run"));
 	return HANDLED;
 }
 
 async function runShutdown(args: string[]): Promise<PublicCommandResult> {
-	const options = parseBooleanOptions(args, new Set(["--force", "--json"]), "shutdown");
+	const options = parseScopedOptions(
+		args,
+		new Set(["--force", "--json", "--all", "--orphans", "--dry-run"]),
+		"shutdown",
+	);
 	if (!options) return HANDLED;
-	await runShutdownAll(options.has("--json"), options.has("--force"));
+	const resolved = resolveStopSelection(toStopSelectionFlags(options));
+	if (!resolved.ok) {
+		return fail(resolved.error, `Run "${APP_NAME} help shutdown" for usage.`);
+	}
+	await runShutdownSelection(
+		options.flags.has("--json"),
+		options.flags.has("--force"),
+		resolved.selection,
+		options.flags.has("--dry-run"),
+	);
 	return HANDLED;
 }
 

@@ -7,6 +7,7 @@ type DaemonRow = {
 	version: string;
 	status: string;
 	sessions: string;
+	live: string;
 	uptime: string;
 };
 
@@ -17,12 +18,19 @@ export function formatDaemonListTable(daemons: readonly DaemonInfo[]): string {
 		version: daemon.version ?? "",
 		status: daemon.status,
 		sessions: daemon.sessionCount !== undefined ? String(daemon.sessionCount) : "",
+		live: daemon.liveness === "live" ? (daemon.livenessEvidence ?? []).join(", ") : "",
 		uptime: formatUptime(daemon.uptimeSeconds),
 	}));
-	const table = formatTable(["socket", "pid", "version", "status", "sessions", "uptime"], rows, formatDaemonCell);
-	return daemons.some((daemon) => daemon.isDefault)
-		? `${table}\n\n${chalk.dim("* default background service")}`
-		: table;
+	const table = formatTable(
+		["socket", "pid", "version", "status", "sessions", "live", "uptime"],
+		rows,
+		formatDaemonCell,
+	);
+	const notes = daemons.some((daemon) => daemon.isDefault) ? ["* default background service"] : [];
+	if (daemons.some((daemon) => daemon.status === "outdated" || daemon.status === "stale")) {
+		notes.push(formatDaemonStatusLegend());
+	}
+	return notes.length === 0 ? table : `${table}\n\n${chalk.dim(notes.join("\n"))}`;
 }
 
 function formatDaemonCell(_row: DaemonRow, column: keyof DaemonRow, value: string): string {
@@ -36,6 +44,8 @@ function colorStatus(status: DaemonStatus, value: string): string {
 	switch (status) {
 		case "current":
 			return chalk.green(value);
+		case "outdated":
+			return chalk.magenta(value);
 		case "stale":
 			return chalk.yellow(value);
 		case "unreachable":
@@ -43,6 +53,17 @@ function colorStatus(status: DaemonStatus, value: string): string {
 		case "orphan-file":
 			return chalk.dim(value);
 	}
+}
+
+/** What each status claims, so `stale` is never read as "live but old" again. */
+export function formatDaemonStatusLegend(): string {
+	return [
+		"current      answers as this build",
+		"outdated     answers with another build while sessions, workers or cpu show live work",
+		"stale        answers as no known build and carries no live evidence",
+		"unreachable  a process or worker holds the socket, but it does not answer",
+		"orphan-file  a socket file is left behind with no process holding it",
+	].join("\n");
 }
 
 export function formatUptime(uptimeSeconds: number | undefined): string {

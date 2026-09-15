@@ -81,9 +81,19 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 	},
 	{
 		path: ["doctor"],
-		usage: "doctor [--fix] [--json]",
+		usage: "doctor [--fix] [--json] [--dry-run] [--all | --socket <path> | --socket-dir <dir>] [--orphans]",
 		summary: "Inspect and safely clean up background services",
-		options: ["--fix   Remove stale sockets and stop idle orphaned services", "--json  Print JSON"],
+		description:
+			"--fix cleans only the services in scope, and the scope is the socket dir this shell talks to, never the whole machine. --dry-run prints the per-service plan without touching anything; --orphans refuses every service that still has live sessions, worker processes or cpu. Repeat with --all to widen to every daemon discovered on this machine.",
+		options: [
+			"--fix           Remove stale sockets and stop idle services in scope",
+			"--dry-run       List each cleanup target without touching anything",
+			"--all           Whole-machine scope: every daemon discovered on this machine",
+			"--socket <path> Clean only the daemon on this socket",
+			"--socket-dir <dir>  Clean only daemons whose socket lives in this directory",
+			"--orphans       Skip anything with live sessions, worker processes or cpu",
+			"--json          Print JSON",
+		],
 	},
 	{
 		path: ["retention"],
@@ -96,10 +106,20 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 	},
 	{
 		path: ["shutdown"],
-		usage: "shutdown [--force] [--json]",
-		summary: "Stop every agent and background service",
-		description: "Without --force, an interactive confirmation is required. --force also kills unresponsive workers.",
-		options: ["--force  Skip confirmation and kill unresponsive processes", "--json   Print JSON"],
+		usage: "shutdown [--force] [--json] [--dry-run] [--all | --socket <path> | --socket-dir <dir>] [--orphans]",
+		summary: "Stop the agents and background services in scope",
+		description:
+			"Scope defaults to this shell's own socket dir, i.e. the services `list`/`attach`/`stop` talk to; every other daemon on the machine is named and left running. Stopping the whole machine requires --all. Either way the pre-stop report names each socket, its pid and its live session count, and --force prints that report instead of skipping it.",
+		options: [
+			"--force             Skip the confirmation and kill unresponsive processes (still names every target)",
+			"--all               Whole-machine scope: every daemon discovered on this machine",
+			"--socket <path>     Stop only the daemon on this socket",
+			"--socket-dir <dir>  Stop only daemons whose socket lives in this directory",
+			"--orphans           Stop only services with no live sessions, workers or cpu",
+			"--dry-run           Print the scoped plan without stopping anything",
+			"--json              Print JSON",
+		],
+		examples: ["shutdown --dry-run", "shutdown --socket /tmp/ci/daemon.sock", "shutdown --all --force"],
 	},
 	{
 		path: ["mcp"],
