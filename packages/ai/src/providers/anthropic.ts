@@ -774,18 +774,20 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 							output.stopReasonRaw = event.delta.stop_reason;
 						}
 					}
-					// Only update usage fields if present (not null).
-					// Preserves input_tokens from message_start when proxies omit it in message_delta.
-					if (event.usage.input_tokens != null) {
+					// Only positive counts overwrite. message_start already carries the
+					// authoritative input/cache counts, and proxies that omit fields in
+					// message_delta either send null or normalize them to an explicit 0;
+					// a real cumulative count is never 0 once message_start reported one.
+					if (event.usage.input_tokens != null && event.usage.input_tokens > 0) {
 						output.usage.input = event.usage.input_tokens;
 					}
-					if (event.usage.output_tokens != null) {
+					if (event.usage.output_tokens != null && event.usage.output_tokens > 0) {
 						output.usage.output = event.usage.output_tokens;
 					}
-					if (event.usage.cache_read_input_tokens != null) {
+					if (event.usage.cache_read_input_tokens != null && event.usage.cache_read_input_tokens > 0) {
 						output.usage.cacheRead = event.usage.cache_read_input_tokens;
 					}
-					if (event.usage.cache_creation_input_tokens != null) {
+					if (event.usage.cache_creation_input_tokens != null && event.usage.cache_creation_input_tokens > 0) {
 						output.usage.cacheWrite = event.usage.cache_creation_input_tokens;
 					}
 					output.usage.totalTokens =

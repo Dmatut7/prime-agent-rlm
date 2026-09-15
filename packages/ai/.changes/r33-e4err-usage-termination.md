@@ -1,0 +1,5 @@
+- Fixed usage accounting across providers: a partial late usage frame no longer zeroes earlier token counts, and google/vertex/responses fall back to the component sum when the provider reports no totalTokens.
+- Fixed truncated provider streams being reported as successful stops: openai-completions, responses (and azure), google, vertex, mistral, and bedrock now error with a malformed_response diagnostic when the stream ends without a terminal event, matching the existing anthropic guard.
+- Fixed openai-responses ignoring response.incomplete: the stop reason is now mapped from incomplete_details.reason with usage preserved.
+- Fixed anthropic message_delta usage frames that normalize fields to an explicit 0 wiping the message_start counts.
+- Fixed openai-codex stream failures bypassing the shared classifier: 401/429 errors now record a provider_stream_failure diagnostic (auth/rate_limit kinds) and the upstream body is redacted before it reaches the transcript.

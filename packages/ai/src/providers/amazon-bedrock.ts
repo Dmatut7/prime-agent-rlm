@@ -44,7 +44,7 @@ import type {
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
-import { recordStreamFailure, streamFailureFromStopReason } from "../utils/stream-failure.js";
+import { recordStreamFailure, StreamFailureError, streamFailureFromStopReason } from "../utils/stream-failure.js";
 import { finalizeThrottledStreamingJson, updateThrottledStreamingJson } from "../utils/streaming-json-throttle.js";
 import { adjustMaxTokensForThinking, buildBaseOptions, clampReasoning } from "./simple-options.js";
 import { transformMessages } from "./transform-messages.js";
@@ -219,6 +219,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 
 			const response = await client.send(command, { abortSignal: options.signal });
 			const requestId = response.$metadata.requestId;
+			let sawMessageStop = false;
 			if (response.$metadata.httpStatusCode !== undefined) {
 				const responseHeaders: Record<string, string> = {};
 				if (response.$metadata.requestId) {
@@ -240,6 +241,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 				} else if (item.contentBlockStop) {
 					handleContentBlockStop(item.contentBlockStop, blocks, output, stream);
 				} else if (item.messageStop) {
+					sawMessageStop = true;
 					output.stopReason = mapStopReason(item.messageStop.stopReason);
 					if (output.stopReason === "error") {
 						output.stopReasonRaw = item.messageStop.stopReason;
@@ -261,6 +263,15 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 
 			if (options.signal?.aborted) {
 				throw new Error("Request was aborted");
+			}
+
+			// A stream that ends without messageStop was truncated upstream;
+			// reporting it as a normal stop would silently lose the tail.
+			if (!sawMessageStop) {
+				throw new StreamFailureError("Bedrock stream ended before messageStop", {
+					kind: "malformed_response",
+					requestId,
+				});
 			}
 
 			if (output.stopReason === "error" || output.stopReason === "aborted") {
@@ -455,11 +466,20 @@ function handleMetadata(
 	cacheWriteCost?: number,
 ): void {
 	if (event.usage) {
-		output.usage.input = event.usage.inputTokens || 0;
-		output.usage.output = event.usage.outputTokens || 0;
-		output.usage.cacheRead = event.usage.cacheReadInputTokens || 0;
-		output.usage.cacheWrite = event.usage.cacheWriteInputTokens || 0;
-		output.usage.totalTokens = event.usage.totalTokens || output.usage.input + output.usage.output;
+		// Merge per field: a metadata frame that leaves a field undefined must not
+		// zero out the count recorded from an earlier metadata event.
+		const usage = event.usage;
+		const previous = output.usage;
+		const input = usage.inputTokens ?? previous.input;
+		const outputTokens = usage.outputTokens ?? previous.output;
+		const cacheRead = usage.cacheReadInputTokens ?? previous.cacheRead;
+		const cacheWrite = usage.cacheWriteInputTokens ?? previous.cacheWrite;
+		const totalTokens = usage.totalTokens ?? previous.totalTokens;
+		output.usage.input = input;
+		output.usage.output = outputTokens;
+		output.usage.cacheRead = cacheRead;
+		output.usage.cacheWrite = cacheWrite;
+		output.usage.totalTokens = totalTokens || input + outputTokens + cacheRead + cacheWrite;
 		calculateCost(model, output.usage, cacheWriteCost === undefined ? undefined : { cacheWrite: cacheWriteCost });
 	}
 }

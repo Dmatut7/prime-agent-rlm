@@ -5,6 +5,7 @@ import type {
 	ResponseInput,
 	ResponseStreamEvent,
 } from "openai/resources/responses/responses.js";
+import { formatStreamFailureMessage, recordStreamFailure } from "../utils/stream-failure.js";
 import { DEFAULT_MAX_RETRY_DELAY_MS, parseRetryAfterMs } from "./retry-cap.js";
 
 // NEVER convert to top-level runtime imports - breaks browser/Vite builds
@@ -299,7 +300,18 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 						statusText: response.statusText,
 					});
 					const info = await parseErrorResponse(fakeResponse);
-					throw new Error(info.friendlyMessage || info.message);
+					// Carry the HTTP status and the parsed error body so the shared
+					// failure classifier can classify 401/403 as auth, 429 as rate
+					// limit, etc., and keep the provider's short message as detail
+					// instead of falling into "unknown".
+					throw new CodexApiError(info.friendlyMessage || info.message, {
+						code: info.code,
+						status: response.status,
+						payload: { status: response.status },
+						// Attach the upstream text so the classified message keeps it
+						// as (redacted) detail, like the SDK-backed providers.
+						...(info.body ? { error: info.body } : info.message ? { error: { message: info.message } } : {}),
+					});
 				} catch (error) {
 					if (error instanceof RetryDelayCapError) {
 						throw error;
@@ -342,7 +354,12 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 				delete (block as { partialJson?: string }).partialJson;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = error instanceof Error ? error.message : String(error);
+			// Classify + redact like every other provider: the session's
+			// "never resend a permanent failure" gate reads the
+			// provider_stream_failure diagnostic kind, and an upstream body that
+			// echoes the credential must not reach the transcript verbatim.
+			output.errorMessage = formatStreamFailureMessage(error);
+			recordStreamFailure(model, output, error);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -492,13 +509,27 @@ async function processStream(
 
 class CodexApiError extends Error {
 	readonly code?: string;
+	readonly status?: number;
 	readonly payload?: Record<string, unknown>;
+	/** Parsed upstream error body, in the SDK convention the shared failure classifier reads. */
+	readonly error?: { code?: string; type?: string; message?: string };
 
-	constructor(message: string, options?: { code?: string; payload?: Record<string, unknown>; cause?: unknown }) {
+	constructor(
+		message: string,
+		options?: {
+			code?: string;
+			status?: number;
+			payload?: Record<string, unknown>;
+			error?: { code?: string; type?: string; message?: string };
+			cause?: unknown;
+		},
+	) {
 		super(message);
 		this.name = "CodexApiError";
 		this.code = options?.code;
+		this.status = options?.status;
 		this.payload = options?.payload;
+		this.error = options?.error;
 		this.cause = options?.cause;
 	}
 }
@@ -530,6 +561,7 @@ async function* mapCodexEvents(events: AsyncIterable<Record<string, unknown>>): 
 			throw new CodexApiError(`Codex error: ${message || code || JSON.stringify(event)}`, {
 				code: code || undefined,
 				payload: event,
+				...(message ? { error: { code: code || undefined, message } } : {}),
 			});
 		}
 
@@ -537,7 +569,13 @@ async function* mapCodexEvents(events: AsyncIterable<Record<string, unknown>>): 
 			const response = (event as { response?: { error?: { code?: string; message?: string } } }).response;
 			const code = response?.error?.code;
 			const message = response?.error?.message;
-			throw new CodexApiError(message || "Codex response failed", { code, payload: event });
+			throw new CodexApiError(message || "Codex response failed", {
+				code,
+				payload: event,
+				// Attach the parsed body so the classified message keeps the
+				// provider's short text as detail (SDK convention).
+				...(message ? { error: { code, message } } : {}),
+			});
 		}
 
 		if (type === "response.done" || type === "response.completed" || type === "response.incomplete") {
@@ -1272,10 +1310,17 @@ async function processWebSocketStream(
 	}
 }
 
-async function parseErrorResponse(response: Response): Promise<{ message: string; friendlyMessage?: string }> {
+async function parseErrorResponse(response: Response): Promise<{
+	message: string;
+	friendlyMessage?: string;
+	code?: string;
+	body?: { code?: string; type?: string; message?: string };
+}> {
 	const raw = await response.text();
 	let message = raw || response.statusText || "Request failed";
 	let friendlyMessage: string | undefined;
+	let code: string | undefined;
+	let body: { code?: string; type?: string; message?: string } | undefined;
 
 	try {
 		const parsed = JSON.parse(raw) as {
@@ -1283,8 +1328,11 @@ async function parseErrorResponse(response: Response): Promise<{ message: string
 		};
 		const err = parsed?.error;
 		if (err) {
-			const code = err.code || err.type || "";
-			if (/usage_limit_reached|usage_not_included|rate_limit_exceeded/i.test(code) || response.status === 429) {
+			const resolvedCode = err.code || err.type || "";
+			if (
+				/usage_limit_reached|usage_not_included|rate_limit_exceeded/i.test(resolvedCode) ||
+				response.status === 429
+			) {
 				const plan = err.plan_type ? ` (${err.plan_type.toLowerCase()} plan)` : "";
 				const mins = err.resets_at
 					? Math.max(0, Math.round((err.resets_at * 1000 - Date.now()) / 60000))
@@ -1293,12 +1341,14 @@ async function parseErrorResponse(response: Response): Promise<{ message: string
 				friendlyMessage = `You have hit your ChatGPT usage limit${plan}.${when}`.trim();
 			}
 			message = err.message || friendlyMessage || message;
+			if (resolvedCode) code = resolvedCode;
+			if (err.message) body = { code: err.code, type: err.type, message: err.message };
 		}
 	} catch {
 		// Unparseable error body: fall back to the raw message.
 	}
 
-	return { message, friendlyMessage };
+	return { message, friendlyMessage, code, body };
 }
 
 function extractAccountId(token: string): string {

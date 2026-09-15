@@ -37,6 +37,60 @@ export function getGoogleThinkingBudget(
 }
 
 /**
+ * Minimal shape of GenerateContentResponseUsageMetadata that the usage
+ * accounting reads.
+ */
+export interface GoogleUsageMetadataFrame {
+	promptTokenCount?: number;
+	candidatesTokenCount?: number;
+	thoughtsTokenCount?: number;
+	cachedContentTokenCount?: number;
+	totalTokenCount?: number;
+}
+
+/**
+ * Merge a new usageMetadata frame over the previously seen one. Fields the new
+ * frame leaves undefined keep the earlier value, so a partial late frame cannot
+ * zero out usage already recorded from an earlier chunk.
+ */
+export function mergeUsageMetadata(
+	previous: GoogleUsageMetadataFrame | undefined,
+	current: GoogleUsageMetadataFrame,
+): GoogleUsageMetadataFrame {
+	return {
+		promptTokenCount: current.promptTokenCount ?? previous?.promptTokenCount,
+		candidatesTokenCount: current.candidatesTokenCount ?? previous?.candidatesTokenCount,
+		thoughtsTokenCount: current.thoughtsTokenCount ?? previous?.thoughtsTokenCount,
+		cachedContentTokenCount: current.cachedContentTokenCount ?? previous?.cachedContentTokenCount,
+		totalTokenCount: current.totalTokenCount ?? previous?.totalTokenCount,
+	};
+}
+
+/**
+ * Build the token counts of a pi-ai Usage from merged usageMetadata.
+ * totalTokens falls back to the component sum when the provider does not report
+ * totalTokenCount (same invariant as compaction's calculateContextTokens).
+ */
+export function googleUsageCounts(metadata: GoogleUsageMetadataFrame): {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	totalTokens: number;
+} {
+	const promptTokens = metadata.promptTokenCount || 0;
+	const cachedTokens = metadata.cachedContentTokenCount || 0;
+	const outputTokens = (metadata.candidatesTokenCount || 0) + (metadata.thoughtsTokenCount || 0);
+	return {
+		input: promptTokens - cachedTokens,
+		output: outputTokens,
+		cacheRead: cachedTokens,
+		cacheWrite: 0,
+		totalTokens: metadata.totalTokenCount || promptTokens + outputTokens,
+	};
+}
+
+/**
  * Determines whether a streamed Gemini `Part` should be treated as "thinking".
  *
  * Protocol note (Gemini / Vertex AI thought signatures):

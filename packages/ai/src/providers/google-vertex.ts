@@ -26,16 +26,20 @@ import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import {
 	formatStreamFailureMessage,
 	recordStreamFailure,
+	StreamFailureError,
 	streamFailureFromStopReason,
 } from "../utils/stream-failure.js";
-import type { GoogleThinkingLevel } from "./google-shared.js";
 import {
 	convertMessages,
 	convertTools,
+	type GoogleThinkingLevel,
+	type GoogleUsageMetadataFrame,
 	getGoogleThinkingBudget,
+	googleUsageCounts,
 	isThinkingPart,
 	mapStopReason,
 	mapToolChoice,
+	mergeUsageMetadata,
 	retainThoughtSignature,
 } from "./google-shared.js";
 import { buildBaseOptions } from "./simple-options.js";
@@ -106,6 +110,8 @@ export const streamGoogleVertex: StreamFunction<"google-vertex", GoogleVertexOpt
 
 			stream.push({ type: "start", partial: output });
 			let currentBlock: TextContent | ThinkingContent | null = null;
+			let usageMetadata: GoogleUsageMetadataFrame | undefined;
+			let sawFinishReason = false;
 			const blocks = output.content;
 			const blockIndex = () => blocks.length - 1;
 			for await (const chunk of googleStream) {
@@ -225,6 +231,7 @@ export const streamGoogleVertex: StreamFunction<"google-vertex", GoogleVertexOpt
 				}
 
 				if (candidate?.finishReason) {
+					sawFinishReason = true;
 					output.stopReason = mapStopReason(candidate.finishReason);
 					if (output.content.some((b) => b.type === "toolCall") && output.stopReason === "stop") {
 						output.stopReason = "toolUse";
@@ -235,14 +242,11 @@ export const streamGoogleVertex: StreamFunction<"google-vertex", GoogleVertexOpt
 				}
 
 				if (chunk.usageMetadata) {
+					// Merge per field: a partial late usageMetadata frame must not
+					// zero out counts already recorded from an earlier chunk.
+					usageMetadata = mergeUsageMetadata(usageMetadata, chunk.usageMetadata);
 					output.usage = {
-						input:
-							(chunk.usageMetadata.promptTokenCount || 0) - (chunk.usageMetadata.cachedContentTokenCount || 0),
-						output:
-							(chunk.usageMetadata.candidatesTokenCount || 0) + (chunk.usageMetadata.thoughtsTokenCount || 0),
-						cacheRead: chunk.usageMetadata.cachedContentTokenCount || 0,
-						cacheWrite: 0,
-						totalTokens: chunk.usageMetadata.totalTokenCount || 0,
+						...googleUsageCounts(usageMetadata),
 						cost: {
 							input: 0,
 							output: 0,
@@ -275,6 +279,14 @@ export const streamGoogleVertex: StreamFunction<"google-vertex", GoogleVertexOpt
 
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
+			}
+
+			// A stream that ends without a finish reason was truncated upstream;
+			// reporting it as a normal stop would silently lose the tail.
+			if (!sawFinishReason) {
+				throw new StreamFailureError("Google Vertex stream ended before a finish reason", {
+					kind: "malformed_response",
+				});
 			}
 
 			if (output.stopReason === "aborted" || output.stopReason === "error") {
