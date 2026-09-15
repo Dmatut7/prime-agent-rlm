@@ -229,6 +229,24 @@ describe("read-only doctor checks", () => {
 		expect(sessions.detail).toContain("no sessions directory");
 	});
 
+	it("flags a sessions path that cannot be listed instead of calling it empty", () => {
+		writeHealthyAuth(fixture.roots);
+		writeVenvGeneration(fixture.roots);
+		// A file where the sessions directory should be: existsSync is true but
+		// readdirSync throws ENOTDIR, the same "the scan saw nothing" shape as an
+		// unreadable directory (chmod 000 does not stop the owner on macOS, so a
+		// permission fixture would not be red there).
+		rmSync(fixture.roots.sessionsDir, { recursive: true, force: true });
+		writeFileSync(fixture.roots.sessionsDir, "not a directory\n");
+
+		const sessions = byId(collectReadonlyDoctorChecks(fixture.roots), "sessions");
+
+		expect(sessions.status).not.toBe("ok");
+		expect(sessions.detail).not.toContain("directory is empty");
+		expect(sessions.detail).toContain("ENOTDIR");
+		expect(sessions.next.length).toBeGreaterThan(0);
+	});
+
 	it("bounds the session scan to the configured limits", () => {
 		writeHealthyAuth(fixture.roots);
 		writeVenvGeneration(fixture.roots);

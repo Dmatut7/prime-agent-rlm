@@ -1719,7 +1719,7 @@ describe("review-round regressions", () => {
 		Object.assign(killed.descriptor, { pid: 987_654, processStartId: "start-1", createCommand: { type: "create" } });
 		const launchReplacement = vi.fn();
 		const cleanup = vi.fn(async () => {});
-		const signal = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation(() => {});
+		const signal = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation(() => true);
 		const identities = ["current", "gone"];
 		const killSupervisor = makeSupervisor([killed], {
 			assertRecoveryAllowed: vi.fn(async () => {}),
