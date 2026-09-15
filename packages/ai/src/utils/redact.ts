@@ -79,14 +79,29 @@ const COOKIE_SECRET_NAME =
 
 /**
  * A `Cookie` / `Set-Cookie` header and its value: `Cookie: a=1; b=2` in a plain header
- * dump, or `"cookie": "a=1; b=2"` inside a JSON-serialized header map. The value class
- * stops at a quote or a line end, so it never runs past the header it belongs to, and it
- * is a single unquantified negated class: scanning a long header is linear, not quadratic.
+ * dump, or `"cookie": "a=1; b=2"` inside a JSON-serialized header map. Two value shapes,
+ * because a quote means a different thing in each:
+ * - JSON-serialized: the value is wrapped in the string's own quotes, and a cookie value
+ *   holding a quote reaches the log escaped (`"cookie": "session=\"abc\""`). The quoted
+ *   branch consumes both wrapper quotes and lets `\x` escapes through, so the match ends
+ *   at the closing wrapper quote and the line stays parseable JSON.
+ * - plain header dump: quotes belong to the cookie values themselves (`session="v"`), so
+ *   the unquoted branch admits whole quoted runs while still stopping at a bare quote or
+ *   a line end.
+ * Each alternative consumes at least one character per step, so scanning a long header
+ * stays linear, not quadratic.
  */
-const COOKIE_HEADER_VALUE = /\b((?:set-cookie|cookie)\b"?\s*[:=]\s*"?)([^"\r\n]*)/gi;
+const COOKIE_HEADER_VALUE =
+	/\b((?:set-cookie|cookie)\b"?\s*[:=]\s*)(?:"((?:\\.|[^"\\\r\n])*)"|((?:[^"\r\n]|"(?:\\.|[^"\\])*")*))/gi;
 
-/** One `name=value` pair inside a cookie header. No nested quantifiers: a linear scan. */
-const COOKIE_PAIR = /([A-Za-z0-9!#$%&'*+.^_`|~-]{1,256})(\s*=\s*)([^"\s;,]*)/g;
+/**
+ * One `name=value` pair inside a cookie header. The value is either a quoted run - bare
+ * in a plain header (`session="v"`) or backslash-escaped in serialized JSON
+ * (`session=\"abc\"`) - or an unquoted run that stops at whitespace, `;`, `,` or a quote.
+ * Consuming the whole quoted/escaped run is what lets the pair rule wash the value inside
+ * it instead of stopping at the first quote.
+ */
+const COOKIE_PAIR = /([A-Za-z0-9!#$%&'*+.^_`|~-]{1,256})(\s*=\s*)("(?:\\.|[^"\\])*"|(?:\\.|[^\\"\s;,])*)/g;
 
 /**
  * `Set-Cookie` attributes. They name the cookie's scope, not a credential, so a long
@@ -114,6 +129,20 @@ const OPAQUE_RUN_MIN_LENGTH = 20;
  */
 const OPAQUE_ASSIGNMENT = new RegExp(
 	`\\b((?:[A-Za-z0-9]{1,64}[-_])?(?:key|apikey|api_key|token|secret|sig|signature|password|passwd|credential|session|sessionid|session_id|sid|jsessionid|phpsessid|access_key|refresh_key|auth|authorization|authz|otp|passcode|verification)=)(${OPAQUE_RUN_CLASS}{${OPAQUE_RUN_MIN_LENGTH},})`,
+	"gi",
+);
+
+/**
+ * `session=<value>` and its family outside a cookie header. A session id is routinely a
+ * short plain run, so the 20-character opaque bar never fires for it; these keys get
+ * their own lower bar of eight characters. Below that the value is a counter or a short
+ * id (a false positive that would wash real diagnostics), and a bare run with no `key=`
+ * prefix keeps the opaque bar.
+ */
+const SESSION_ASSIGNMENT_MIN_LENGTH = 8;
+
+const SESSION_ASSIGNMENT = new RegExp(
+	`\\b((?:[A-Za-z0-9]{1,64}[-_])?(?:session|sessions|sess|sessionid|session_id|sid|jsessionid|phpsessid|connect[._]sid)=)(${OPAQUE_RUN_CLASS}{${SESSION_ASSIGNMENT_MIN_LENGTH},})`,
 	"gi",
 );
 
@@ -161,7 +190,13 @@ export function redactSecrets(text: string, options?: RedactOptions | Iterable<s
 				: (options as Iterable<string>);
 
 	let redacted = text
-		.replace(COOKIE_HEADER_VALUE, (_match, header: string, value: string) => `${header}${redactCookieValue(value)}`)
+		.replace(
+			COOKIE_HEADER_VALUE,
+			(_match, header: string, jsonValue: string | undefined, plainValue: string | undefined) =>
+				jsonValue === undefined
+					? `${header}${redactCookieValue(plainValue ?? "")}`
+					: `${header}"${redactCookieValue(jsonValue)}"`,
+		)
 		// The key rule runs before the bearer/scheme rules: it consumes the `Bearer` prefix
 		// itself, so the placeholder it writes is never re-matched by them (their value
 		// class cannot start at `[`), and the output stays idempotent.
@@ -185,10 +220,16 @@ export function redactSecrets(text: string, options?: RedactOptions | Iterable<s
 		.replace(CREDENTIAL_SHAPES, REDACTED)
 		.replace(
 			URL_USERINFO,
-			(_match, scheme: string, user: string | undefined, withPassword?: string, password?: string) =>
-				password ? `${scheme}${user ?? ""}:${REDACTED}@` : `${scheme}${user ?? ""}${withPassword ?? ""}@`,
+			(_match, scheme: string, user: string | undefined, withPassword?: string, password?: string) => {
+				// A password (even empty) means the user slot holds a credential too: the
+				// npm/Git "token in the user slot" idiom is `https://<token>:@host`.
+				if (password) return `${scheme}${user ?? ""}:${REDACTED}@`;
+				if (withPassword !== undefined) return `${scheme}${REDACTED}:@`;
+				return `${scheme}${user ?? ""}@`;
+			},
 		)
-		.replace(OPAQUE_ASSIGNMENT, `$1${REDACTED}`);
+		.replace(OPAQUE_ASSIGNMENT, `$1${REDACTED}`)
+		.replace(SESSION_ASSIGNMENT, `$1${REDACTED}`);
 
 	if (secrets !== undefined) {
 		for (const secret of secrets) {

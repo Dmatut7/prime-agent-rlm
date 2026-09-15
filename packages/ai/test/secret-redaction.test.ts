@@ -139,13 +139,71 @@ describe("redactSecrets", () => {
 		expect(redactSecrets("retrying https://alice:pa:ssword@host/v1")).toBe(
 			`retrying https://alice:${REDACTED}@host/v1`,
 		);
-		// No password at all: nothing to wash, so the userinfo stays as it is.
+		// No password and no colon: nothing to wash, so the userinfo stays as it is.
 		expect(redactSecrets("retrying https://alice@proxy.corp.example:8080/v1/models")).toBe(
 			"retrying https://alice@proxy.corp.example:8080/v1/models",
 		);
-		expect(redactSecrets("https://alice:@host")).toBe("https://alice:@host");
+		// An empty password means the user slot carries the token (npm/Git idiom).
+		expect(redactSecrets("https://alice:@host")).toBe(`https://${REDACTED}:@host`);
 		// A password with no username is still a password.
 		expect(redactSecrets("https://:hunter2@host/v1")).toBe(`https://:${REDACTED}@host/v1`);
+	});
+
+	// --- GL-3: a quoted cookie value must come out as valid JSON with the value washed.
+
+	const QUOTED_COOKIE_LINE = JSON.stringify({
+		level: "info",
+		component: "http",
+		msg: "upstream error",
+		headers: { cookie: 'session="abc123def456ghi"' },
+	});
+
+	test("a JSON line with an escaped quoted cookie value stays parseable and loses the secret", () => {
+		const redacted = redactSecrets(QUOTED_COOKIE_LINE);
+		// (a) the line is still a legal JSON log line...
+		expect(() => JSON.parse(redacted)).not.toThrow();
+		const parsed = JSON.parse(redacted) as { headers: { cookie: string } };
+		// ... (b) whose cookie field no longer carries the plaintext.
+		expect(parsed.headers.cookie).not.toContain("abc123def456ghi");
+		expect(parsed.headers.cookie).toContain(`session=${REDACTED}`);
+	});
+
+	test("a plain cookie header with a quoted value is washed too", () => {
+		expect(redactSecrets('Cookie: session="v"; theme=dark')).toBe(`Cookie: session=${REDACTED}; theme=dark`);
+		expect(redactSecrets('Set-Cookie: session="abc123def456ghi"; Path=/; HttpOnly')).toBe(
+			`Set-Cookie: session=${REDACTED}; Path=/; HttpOnly`,
+		);
+	});
+
+	test("a log line without credential material is untouched verbatim", () => {
+		const line = JSON.stringify({
+			ts: "2026-09-15T00:00:00.000Z",
+			level: "info",
+			component: "http",
+			msg: "request finished",
+			requestId: "req_42",
+			path: "/v1/models",
+		});
+		expect(redactSecrets(line)).toBe(line);
+	});
+
+	// --- GL-4R: userinfo tokens in the user slot, and `session=` values at eight characters.
+
+	test("a userinfo token with an empty password is redacted (npm private registry shape)", () => {
+		const url = "https://npm_9f8e7d6c5b4a:@npm.pkg.github.com/org/repo";
+		const redacted = redactSecrets(url);
+		expect(redacted).not.toContain("npm_9f8e7d6c5b4a");
+		expect(redacted).toContain(`https://${REDACTED}:@npm.pkg.github.com/org/repo`);
+	});
+
+	test("a session assignment of eight or more characters is redacted outside a cookie header", () => {
+		expect(redactSecrets("session=abc12345")).toBe(`session=${REDACTED}`);
+		expect(redactSecrets("proxy_session_id=abc12345")).toBe(`proxy_session_id=${REDACTED}`);
+		// Below eight characters: a counter or a short id, not a session.
+		expect(redactSecrets("session=abc1234")).toBe("session=abc1234");
+		// A bare run without a `key=` prefix, and an unknown key, keep their bar.
+		expect(redactSecrets("value abc12345")).toBe("value abc12345");
+		expect(redactSecrets("theme=abcdefghij")).toBe("theme=abcdefghij");
 	});
 
 	test("redaction is stable when applied twice", () => {
@@ -154,6 +212,10 @@ describe("redactSecrets", () => {
 			`Cookie: session=${BARE_SESSION}; theme=dark`,
 			`"X-Custom-Auth": "Token ${CUSTOM_AUTH_VALUE}"`,
 			"https://alice:hunter2@proxy.corp.example:8080/v1/models",
+			"https://npm_9f8e7d6c5b4a:@npm.pkg.github.com/org/repo",
+			QUOTED_COOKIE_LINE,
+			'Cookie: session="v"; theme=dark',
+			"session=abc12345",
 			`url=https://user:hunter2@api.example.com/v1/models?api_key=${API_KEY}`,
 		]) {
 			const once = redactSecrets(text);
