@@ -63,6 +63,80 @@ export interface Args {
 
 const REMOVED_BUILTIN_TOOL_NAMES = new Set(["read", "write", "grep", "find", "ls"]);
 const BUILTIN_TOOL_NAMES = ["ipython"];
+/**
+ * Names `--tools` accepts without a comment: the built-in tool plus the legacy built-in names
+ * kept usable for extensions and custom tools that reuse them (see regression #4428).
+ */
+const KNOWN_TOOL_NAMES = new Set([...BUILTIN_TOOL_NAMES, "bash", "edit"]);
+
+/**
+ * True when `candidate` differs from `name` by a single inserted, deleted, or substituted
+ * character. Used to catch a misspelled built-in tool name, which would otherwise collapse the
+ * session's tool set without a word.
+ */
+function isOneEditApart(name: string, candidate: string): boolean {
+	if (candidate === name || Math.abs(candidate.length - name.length) > 1) {
+		return false;
+	}
+	const [shorter, longer] = candidate.length < name.length ? [candidate, name] : [name, candidate];
+	let index = 0;
+	while (index < shorter.length && shorter[index] === longer[index]) {
+		index++;
+	}
+	if (shorter.length === longer.length) {
+		return shorter.slice(index + 1) === longer.slice(index + 1);
+	}
+	return shorter.slice(index) === longer.slice(index + 1);
+}
+
+/**
+ * Diagnostics for the tool names in a `--tools` allowlist. A name that is not a built-in tool can
+ * still be provided by an extension, an SDK caller, or an ACP server, and the CLI cannot know
+ * that yet, so only near-misses of a built-in name are fatal; every other unrecognized name is
+ * reported (with the names this CLI does know) instead of being accepted in silence.
+ */
+function collectToolNameDiagnostics(toolNames: string[]): Array<{ type: "warning" | "error"; message: string }> {
+	const diagnostics: Array<{ type: "warning" | "error"; message: string }> = [];
+	const removedTools = toolNames.filter((name) => REMOVED_BUILTIN_TOOL_NAMES.has(name));
+	if (removedTools.length > 0) {
+		diagnostics.push({
+			type: "error",
+			message: `Unknown built-in tool(s): ${removedTools.join(", ")}. Available built-in tools: ${BUILTIN_TOOL_NAMES.join(", ")}`,
+		});
+	}
+
+	const unrecognized = toolNames.filter(
+		(name) => !REMOVED_BUILTIN_TOOL_NAMES.has(name) && !KNOWN_TOOL_NAMES.has(name),
+	);
+	if (unrecognized.length === 0) {
+		return diagnostics;
+	}
+
+	const misspelled = unrecognized.filter((name) => [...KNOWN_TOOL_NAMES].some((known) => isOneEditApart(known, name)));
+	const suggestions = misspelled
+		.map((name) => {
+			const known = [...KNOWN_TOOL_NAMES].find((candidate) => isOneEditApart(candidate, name));
+			return `${name} -> ${known}`;
+		})
+		.join(", ");
+
+	if (misspelled.length > 0) {
+		diagnostics.push({
+			type: "error",
+			message: `Unknown built-in tool(s): ${misspelled.join(", ")}. Did you mean ${suggestions}? Available built-in tools: ${BUILTIN_TOOL_NAMES.join(", ")}`,
+		});
+	}
+
+	const unverifiable = unrecognized.filter((name) => !misspelled.includes(name));
+	if (unverifiable.length > 0) {
+		diagnostics.push({
+			type: "warning",
+			message: `Unrecognized tool name(s): ${unverifiable.join(", ")}. They are not built-in tools (${BUILTIN_TOOL_NAMES.join(", ")}); the session only activates them if an extension or custom tool registers that exact name.`,
+		});
+	}
+
+	return diagnostics;
+}
 
 export const INTERNAL_RUNTIME_COMMAND_MARKER = "\0prime-agent-runtime-command";
 
@@ -161,13 +235,7 @@ export function parseArgs(args: string[]): Args {
 				.split(",")
 				.map((s) => s.trim())
 				.filter((name) => name.length > 0);
-			const removedTools = result.tools.filter((name) => REMOVED_BUILTIN_TOOL_NAMES.has(name));
-			if (removedTools.length > 0) {
-				result.diagnostics.push({
-					type: "error",
-					message: `Unknown built-in tool(s): ${removedTools.join(", ")}. Available built-in tools: ${BUILTIN_TOOL_NAMES.join(", ")}`,
-				});
-			}
+			result.diagnostics.push(...collectToolNameDiagnostics(result.tools));
 		} else if (arg === "--thinking" && i + 1 < args.length) {
 			const level = args[++i];
 			if (isValidThinkingLevel(level)) {

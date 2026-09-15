@@ -105,9 +105,74 @@ const claudeCodeTools = [
 
 const ccToolLookup = new Map(claudeCodeTools.map((t) => [t.toLowerCase(), t]));
 
-const toClaudeCodeName = (name: string) => ccToolLookup.get(name.toLowerCase()) ?? name;
+/**
+ * Wire names for OAuth requests, which rename local tools to the canonical Claude Code spelling
+ * (`bash` -> `Bash`). Two distinct tools must never share one wire name: the request would carry
+ * duplicate definitions and a returned tool_use name could not be attributed back to a local
+ * tool. A tool already named with the canonical spelling keeps it, a tool whose alias is taken
+ * falls back to its own name, and a collision that even that cannot resolve is rejected.
+ *
+ * The mapping is a function of the local tool name, which is what makes it usable on the replay
+ * path (a replayed tool_use block must name the tool the same way the definitions did).
+ */
+function assignClaudeCodeToolNames(tools: Tool[] | undefined): {
+	wireNames: string[];
+	byToolName: Map<string, string>;
+} {
+	const wireNames: string[] = [];
+	const byToolName = new Map<string, string>();
+	const list = tools ?? [];
+	if (list.length === 0) return { wireNames, byToolName };
+
+	const taken = new Set<string>();
+	for (const tool of list) {
+		if (ccToolLookup.get(tool.name.toLowerCase()) === tool.name) taken.add(tool.name);
+	}
+
+	for (const tool of list) {
+		const alreadyAssigned = byToolName.get(tool.name);
+		if (alreadyAssigned !== undefined) {
+			wireNames.push(alreadyAssigned);
+			continue;
+		}
+
+		const canonical = ccToolLookup.get(tool.name.toLowerCase());
+		if (canonical === undefined || canonical === tool.name) {
+			wireNames.push(tool.name);
+			byToolName.set(tool.name, tool.name);
+			continue;
+		}
+
+		if (!taken.has(canonical)) {
+			taken.add(canonical);
+			wireNames.push(canonical);
+			byToolName.set(tool.name, canonical);
+			continue;
+		}
+
+		// The canonical name belongs to another tool (`Bash` next to `bash`), so this one keeps
+		// its own name instead of collapsing onto the same wire name.
+		if (!taken.has(tool.name)) {
+			taken.add(tool.name);
+			wireNames.push(tool.name);
+			byToolName.set(tool.name, tool.name);
+			continue;
+		}
+
+		throw new Error(
+			`Duplicate Anthropic tool name "${canonical}": the tool "${tool.name}" cannot be sent next to the tool that already claimed that name. Rename one of them.`,
+		);
+	}
+
+	return { wireNames, byToolName };
+}
+
 const fromClaudeCodeName = (name: string, tools?: Tool[]) => {
 	if (tools && tools.length > 0) {
+		// Exact spelling wins: `bash` and `Bash` can both be present, and a case-insensitive scan
+		// would attribute the call to whichever tool happens to come first.
+		const exactTool = tools.find((tool) => tool.name === name);
+		if (exactTool) return exactTool.name;
 		const lowerName = name.toLowerCase();
 		const matchedTool = tools.find((tool) => tool.name.toLowerCase() === lowerName);
 		if (matchedTool) return matchedTool.name;
@@ -969,9 +1034,10 @@ function buildParams(
 	options?: AnthropicOptions,
 	cacheControl?: CacheControlEphemeral,
 ): MessageCreateParamsStreaming {
+	const claudeCodeToolNames = isOAuthToken ? assignClaudeCodeToolNames(context.tools) : undefined;
 	const params: MessageCreateParamsStreaming = {
 		model: model.id,
-		messages: convertMessages(context.messages, model, isOAuthToken, cacheControl),
+		messages: convertMessages(context.messages, model, isOAuthToken, cacheControl, claudeCodeToolNames?.byToolName),
 		max_tokens: options?.maxTokens || (model.maxTokens / 3) | 0,
 		stream: true,
 	};
@@ -1015,6 +1081,7 @@ function buildParams(
 			isOAuthToken,
 			getAnthropicCompat(model).supportsEagerToolInputStreaming,
 			cacheControl,
+			claudeCodeToolNames?.wireNames,
 		);
 	}
 
@@ -1077,6 +1144,7 @@ function convertMessages(
 	model: Model<"anthropic-messages">,
 	isOAuthToken: boolean,
 	cacheControl?: CacheControlEphemeral,
+	claudeCodeToolNames?: Map<string, string>,
 ): MessageParam[] {
 	const params: MessageParam[] = [];
 
@@ -1169,7 +1237,7 @@ function convertMessages(
 					blocks.push({
 						type: "tool_use",
 						id: block.id,
-						name: isOAuthToken ? toClaudeCodeName(block.name) : block.name,
+						name: isOAuthToken ? (claudeCodeToolNames?.get(block.name) ?? block.name) : block.name,
 						input: block.arguments ?? {},
 					});
 				}
@@ -1284,6 +1352,7 @@ function convertTools(
 	isOAuthToken: boolean,
 	supportsEagerToolInputStreaming: boolean,
 	cacheControl?: CacheControlEphemeral,
+	claudeCodeToolNames?: string[],
 ): Anthropic.Messages.Tool[] {
 	if (!tools) return [];
 
@@ -1295,7 +1364,7 @@ function convertTools(
 			: [];
 
 		return {
-			name: isOAuthToken ? toClaudeCodeName(tool.name) : tool.name,
+			name: isOAuthToken ? (claudeCodeToolNames?.[index] ?? tool.name) : tool.name,
 			description: tool.description,
 			...(supportsEagerToolInputStreaming ? { eager_input_streaming: true } : {}),
 			input_schema: {
