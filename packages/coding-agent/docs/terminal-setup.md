@@ -103,6 +103,8 @@ The built-in terminal has limited escape sequence support. Shift+Enter cannot be
 
 If you want the hardware cursor visible, set `PI_HARDWARE_CURSOR=1` before running `prime-agent` (disabled by default for compatibility).
 
+`PI_HARDWARE_CURSOR` overrides `showHardwareCursor` in `settings.json`. `1`, `true`, or `yes` turns the cursor on; `0`, `false`, or `no` turns it off; any other value is ignored and the settings file decides. When the variable and the file disagree, the environment variable wins and Prime Agent reports the conflict, so the two cannot silently cancel each other out.
+
 Consider using a dedicated terminal emulator for the best experience.
 
 ### macOS Control+Option+Arrow shortcuts

@@ -151,10 +151,17 @@ function collectSettingsDiagnostics(
 	settingsManager: SettingsManager,
 	context: string,
 ): AgentSessionRuntimeDiagnostic[] {
-	return settingsManager.drainErrors().map(({ scope, error }) => ({
-		type: "warning",
+	const errors = settingsManager.drainErrors().map(({ scope, error }) => ({
+		type: "warning" as const,
 		message: `(${context}, ${scope} settings) ${error.message}`,
 	}));
+	// Settings warnings (an unknown key, an env/file conflict) are not load
+	// failures: the file is intact, part of it just has no effect (CD-3/CD-6).
+	const warnings = settingsManager.drainWarnings().map(({ scope, message }) => ({
+		type: "warning" as const,
+		message: `(${context}, ${scope} settings) ${message}`,
+	}));
+	return [...errors, ...warnings];
 }
 
 function reportDiagnostics(diagnostics: readonly AgentSessionRuntimeDiagnostic[]): void {

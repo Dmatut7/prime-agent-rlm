@@ -9,6 +9,8 @@ Prime Agent uses JSON settings files with project settings overriding global set
 
 Edit directly or use `/settings` for common options.
 
+Unknown keys are reported: a misspelled or removed setting (for example `compaction.enabledd`) produces a warning naming the full key path, because a key this version does not recognize is stored but never takes effect. The value is kept in the file, so fixing the spelling restores it. Free-form blocks such as `mcpServers` and array-valued keys are not checked.
+
 ## All Settings
 
 ### Model & Thinking
@@ -43,7 +45,7 @@ Edit directly or use `/settings` for common options.
 | `treeFilterMode` | string | `"user-only"` | Default filter for `/tree`: `"default"`, `"no-tools"`, `"user-only"`, `"labeled-only"`, `"all"` |
 | `editorPaddingX` | number | `0` | Horizontal padding for input editor (0-3) |
 | `autocompleteMaxVisible` | number | `5` | Max visible items in autocomplete dropdown (3-20) |
-| `showHardwareCursor` | boolean | `false` | Show terminal cursor |
+| `showHardwareCursor` | boolean | `false` | Show terminal cursor. `PI_HARDWARE_CURSOR` (`1`/`true`/`yes`, `0`/`false`/`no`) overrides it, and a conflict between the two is reported as a warning |
 
 ### Update Checks
 

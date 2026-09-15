@@ -294,10 +294,69 @@ interface CustomModelsResult {
 	/** Per-model overrides: provider -> modelId -> override */
 	modelOverrides: Map<string, Map<string, ModelOverride>>;
 	error: string | undefined;
+	/** Deprecated-key diagnostics: non-empty means the file parses but lost its effect */
+	warnings: string[];
 }
 
-function emptyCustomModelsResult(error?: string): CustomModelsResult {
-	return { models: [], overrides: new Map(), modelOverrides: new Map(), error };
+/**
+ * Key that a previous config format used. `ProviderCompatSchema` is a non-strict
+ * `Type.Object`, so a removed key is still parseable and then ignored: the config
+ * silently loses its effect and the user has no way to learn that. Diagnostics only -
+ * migrating the mapping would change thinking behavior without the user asking.
+ */
+const DEPRECATED_COMPAT_KEY = "reasoningEffortMap";
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function deprecatedCompatKeyWarnings(compatPath: string, compat: unknown): string[] {
+	if (!isPlainRecord(compat)) return [];
+	const value = compat[DEPRECATED_COMPAT_KEY];
+	if (value === undefined || value === null) return [];
+	// A mapping with no entries maps no level, so ignoring it changes nothing and there is
+	// nothing to migrate. Anything else (including a malformed scalar) is reported.
+	if (isPlainRecord(value) && Object.keys(value).length === 0) return [];
+	return [
+		`${compatPath}.${DEPRECATED_COMPAT_KEY} is deprecated and ignored: it was replaced by the model-level "thinkingLevelMap" (see docs/models.md, "Thinking Level Map"). The mapping no longer applies, so thinking levels fall back to provider defaults.`,
+	];
+}
+
+/** Deprecated-key diagnostics earned by a parsed models.json, in document order. */
+function collectDeprecatedCompatWarnings(parsed: unknown): string[] {
+	if (!isPlainRecord(parsed) || !isPlainRecord(parsed.providers)) return [];
+
+	const warnings: string[] = [];
+	for (const [providerName, providerConfig] of Object.entries(parsed.providers)) {
+		if (!isPlainRecord(providerConfig)) continue;
+
+		warnings.push(...deprecatedCompatKeyWarnings(`providers.${providerName}.compat`, providerConfig.compat));
+
+		const models = Array.isArray(providerConfig.models) ? providerConfig.models : [];
+		models.forEach((model, index) => {
+			if (!isPlainRecord(model)) return;
+			warnings.push(
+				...deprecatedCompatKeyWarnings(`providers.${providerName}.models[${index}].compat`, model.compat),
+			);
+		});
+
+		if (isPlainRecord(providerConfig.modelOverrides)) {
+			for (const [modelId, modelOverride] of Object.entries(providerConfig.modelOverrides)) {
+				if (!isPlainRecord(modelOverride)) continue;
+				warnings.push(
+					...deprecatedCompatKeyWarnings(
+						`providers.${providerName}.modelOverrides.${modelId}.compat`,
+						modelOverride.compat,
+					),
+				);
+			}
+		}
+	}
+	return warnings;
+}
+
+function emptyCustomModelsResult(error?: string, warnings: string[] = []): CustomModelsResult {
+	return { models: [], overrides: new Map(), modelOverrides: new Map(), error, warnings };
 }
 
 function mergeCompat(
@@ -563,6 +622,7 @@ export class ModelRegistry {
 	private openAICodexModelsCache: { authFingerprint: string; modelIds: Set<string>; refreshedAt: number } | undefined;
 	private backgroundPrivatePrimeAuthorization: { fingerprint: string; promise: Promise<void> } | undefined;
 	private loadError: string | undefined = undefined;
+	private loadWarnings: string[] = [];
 
 	/** Re-register dynamic OAuth providers (e.g. user MCP servers) after refresh() resets the registry. */
 	private onOAuthProvidersReset?: () => void;
@@ -627,17 +687,30 @@ export class ModelRegistry {
 		return this.loadError;
 	}
 
+	/**
+	 * Deprecated-key diagnostics from the last models.json load (empty when clean).
+	 * Separate from getError(): built-in models still work, so a client should surface
+	 * these as warnings. Read-only - the same list is returned until the next load.
+	 */
+	getWarnings(): readonly string[] {
+		return this.loadWarnings;
+	}
+
 	private loadModels(): void {
 		const {
 			models: customModels,
 			overrides,
 			modelOverrides,
 			error,
+			warnings,
 		} = this.modelsJsonPath ? this.loadCustomModels(this.modelsJsonPath) : emptyCustomModelsResult();
 
 		if (error) {
 			this.loadError = error;
 		}
+		// Assigned on every load path (including "no models.json"), so a refresh cannot
+		// leave a diagnostic about a file that is no longer on disk.
+		this.loadWarnings = warnings;
 
 		this.explicitPrivatePrimeInferenceModelIds = new Set(
 			customModels.filter(isPrivatePrimeInferenceModel).map((model) => model.id),
@@ -721,6 +794,9 @@ export class ModelRegistry {
 
 			this.validateConfig(config);
 
+			// Only for a file that is actually adopted: a rejected file already reports why.
+			const warnings = collectDeprecatedCompatWarnings(config);
+
 			const overrides = new Map<string, ProviderOverride>();
 			const modelOverrides = new Map<string, Map<string, ModelOverride>>();
 
@@ -742,7 +818,7 @@ export class ModelRegistry {
 				}
 			}
 
-			return { models: this.parseModels(config), overrides, modelOverrides, error: undefined };
+			return { models: this.parseModels(config), overrides, modelOverrides, error: undefined, warnings };
 		} catch (error) {
 			if (error instanceof SyntaxError) {
 				return emptyCustomModelsResult(`Failed to parse models.json: ${error.message}\n\nFile: ${modelsJsonPath}`);

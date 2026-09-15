@@ -502,6 +502,167 @@ function deepMergeSettings(base: Settings, overrides: Settings): Settings {
 	return result;
 }
 
+/**
+ * Every key `Settings` understands (CD-3): the top level is the `Settings`
+ * interface verbatim, and a nested entry lists the keys of that block's
+ * interface when the block has a closed shape. `null` marks a free-form block
+ * (user-defined names), which is never scanned; array-valued keys are skipped
+ * by the scanner because their contents are data, not key names. Keep this in
+ * sync with the interfaces above - a key missing here makes a real setting
+ * report as unknown, an extra key silences a genuine typo.
+ */
+const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
+	onboardingShown: null,
+	onboardingCompleted: null,
+	defaultProvider: null,
+	defaultModel: null,
+	recentModels: null,
+	defaultThinkingLevel: null,
+	defaultServiceTier: null,
+	rlmMaxDepth: null,
+	idleEvictionMinutes: null,
+	transport: null,
+	steeringMode: null,
+	followUpMode: null,
+	theme: null,
+	compaction: ["enabled", "reserveTokens", "keepRecentTokens", "agentCallable"],
+	stallWatchdog: [
+		"enabled",
+		"warnAfterSeconds",
+		"abortAfterSeconds",
+		"toolLivenessExemption",
+		"treatKernelCpuProgressAsActivity",
+	],
+	subagentWake: ["policy"],
+	kernelBootstrap: ["lockTimeoutMs"],
+	kernelRestart: ["maxUnexpectedRestarts", "windowMinutes", "revivalVouchMaxAgeSeconds"],
+	agentMessage: ["targetWaitSeconds"],
+	daemon: ["eventGapRecovery", "supervisorRejectionExitThreshold", "failedWorkerReapHours", "failedWorkerReapEnabled"],
+	autoRefine: ["enabled", "turnInterval", "compact", "cooldownMs"],
+	agentTraces: ["enabled"],
+	telemetry: ["enabled", "noticeShown"],
+	branchSummary: ["reserveTokens", "skipPrompt"],
+	retention: [
+		"enabled",
+		"dryRun",
+		"sweepIntervalMinutes",
+		"maxDeleteBytesPerSweep",
+		"maxDeleteEntriesPerSweep",
+		"cooldownMinutes",
+		"emptyArtifactDirDays",
+		"deletedSessionResidueDays",
+		"childTranscriptDays",
+		"logFileDays",
+		"tmpRlmDirHours",
+		"tmpOtherDirDays",
+		"bashTempFileHours",
+		"bashTempFileMaxBytes",
+		"staleLeaseHours",
+		"kernelSnapshotGenerations",
+		"kernelSnapshotReclaimEnabled",
+		"venvRetention",
+		"venvReclaim",
+	],
+	retry: ["enabled", "maxRetries", "baseDelayMs", "emptyTurn", "provider"],
+	hideThinkingBlock: null,
+	shellPath: null,
+	quietStartup: null,
+	shellCommandPrefix: null,
+	npmCommand: null,
+	mcpServers: null,
+	packages: null,
+	extensions: null,
+	extensionHandlerTimeoutMs: null,
+	skills: null,
+	prompts: null,
+	themes: null,
+	enableSkillCommands: null,
+	bundledSkills: ["websearch"],
+	tools: [],
+	enableBuiltinSkills: null,
+	terminal: ["showImages", "clearOnShrink", "showTerminalProgress", "fullscreen", "fullscreenMouse"],
+	images: ["autoResize", "blockImages"],
+	enabledModels: null,
+	treeFilterMode: null,
+	thinkingBudgets: ["minimal", "low", "medium", "high"],
+	editorPaddingX: null,
+	autocompleteMaxVisible: null,
+	showHardwareCursor: null,
+	markdown: ["codeBlockIndent", "mermaid"],
+	warnings: ["anthropicExtraUsage"],
+	sessionDir: null,
+};
+
+/** Deeper-than-one-level blocks, keyed by their full dotted path. */
+const KNOWN_NESTED_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
+	"retry.provider": ["timeoutMs", "maxRetries", "maxRetryDelayMs", "streamStallTimeoutMs"],
+	"retry.emptyTurn": ["maxAttempts", "baseDelayMs", "maxDelayMs", "maxTotalDelayMs"],
+};
+
+/**
+ * Full dotted paths of every key the current schema does not recognize, so a
+ * misspelled key is visible instead of silently doing nothing.
+ */
+export function collectUnknownSettingsKeys(settings: Record<string, unknown>): string[] {
+	const unknown: string[] = [];
+	for (const [key, value] of Object.entries(settings)) {
+		if (!Object.hasOwn(KNOWN_SETTINGS_KEYS, key)) {
+			unknown.push(key);
+			continue;
+		}
+		scanUnknownNestedKeys(key, value, KNOWN_SETTINGS_KEYS[key], unknown);
+	}
+	return unknown;
+}
+
+function scanUnknownNestedKeys(
+	path: string,
+	value: unknown,
+	knownChildKeys: readonly string[] | null,
+	unknown: string[],
+): void {
+	// Free-form block, or a value with no keys of its own to name.
+	if (knownChildKeys === null || typeof value !== "object" || value === null || Array.isArray(value)) {
+		return;
+	}
+	for (const [childKey, childValue] of Object.entries(value as Record<string, unknown>)) {
+		const childPath = `${path}.${childKey}`;
+		if (!knownChildKeys.includes(childKey)) {
+			unknown.push(childPath);
+			continue;
+		}
+		if (Object.hasOwn(KNOWN_NESTED_SETTINGS_KEYS, childPath)) {
+			scanUnknownNestedKeys(childPath, childValue, KNOWN_NESTED_SETTINGS_KEYS[childPath], unknown);
+		}
+	}
+}
+
+/** The environment switch that turns the terminal's hardware cursor on or off. */
+export const HARDWARE_CURSOR_ENV_VAR = "PI_HARDWARE_CURSOR";
+
+/**
+ * An explicit boolean environment switch. Returns undefined when the variable is
+ * unset or holds a value we do not recognize, so an unrecognized value falls
+ * back to the settings file instead of silently switching a feature off.
+ */
+function parseBooleanEnvSwitch(value: string | undefined): boolean | undefined {
+	if (value === undefined) {
+		return undefined;
+	}
+	switch (value.trim().toLowerCase()) {
+		case "1":
+		case "true":
+		case "yes":
+			return true;
+		case "0":
+		case "false":
+		case "no":
+			return false;
+		default:
+			return undefined;
+	}
+}
+
 export type SettingsScope = "global" | "project";
 
 export interface SettingsStorage {
@@ -511,6 +672,16 @@ export interface SettingsStorage {
 export interface SettingsError {
 	scope: SettingsScope;
 	error: Error;
+}
+
+/**
+ * A non-fatal settings problem the user should see (an unknown key, a conflict
+ * between the environment and the file). Kept apart from `SettingsError` because
+ * nothing failed to load: the file is intact, part of it just has no effect.
+ */
+export interface SettingsWarning {
+	scope: SettingsScope;
+	message: string;
 }
 
 export class FileSettingsStorage implements SettingsStorage {
@@ -625,6 +796,9 @@ export class SettingsManager {
 	private projectSettingsLoadError: Error | null = null; // Track if project settings file had parse errors
 	private writeQueue: Promise<void> = Promise.resolve();
 	private errors: SettingsError[];
+	private warnings: SettingsWarning[] = [];
+	/** Warning identities already reported, so a repeated read/load reports once. */
+	private reportedWarnings = new Set<string>();
 
 	private constructor(
 		storage: SettingsStorage,
@@ -661,7 +835,7 @@ export class SettingsManager {
 			initialErrors.push({ scope: "project", error: projectLoad.error });
 		}
 
-		return new SettingsManager(
+		const manager = new SettingsManager(
 			storage,
 			globalLoad.settings,
 			projectLoad.settings,
@@ -669,6 +843,9 @@ export class SettingsManager {
 			projectLoad.error,
 			initialErrors,
 		);
+		manager.reportUnknownSettingsKeys("global", manager.globalSettings);
+		manager.reportUnknownSettingsKeys("project", manager.projectSettings);
+		return manager;
 	}
 
 	/** Create an in-memory SettingsManager (no file I/O) */
@@ -809,6 +986,8 @@ export class SettingsManager {
 		}
 
 		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		this.reportUnknownSettingsKeys("global", this.globalSettings);
+		this.reportUnknownSettingsKeys("project", this.projectSettings);
 	}
 
 	/** Apply additional overrides on top of current settings */
@@ -842,6 +1021,30 @@ export class SettingsManager {
 	private recordError(scope: SettingsScope, error: unknown): void {
 		const normalizedError = error instanceof Error ? error : new Error(String(error));
 		this.errors.push({ scope, error: normalizedError });
+	}
+
+	/**
+	 * Report a non-fatal settings problem once per scope+identity. Unknown keys
+	 * are re-scanned on every load, so the identity has to outlive a drain.
+	 */
+	private recordWarning(scope: SettingsScope, identity: string, message: string): void {
+		const key = `${scope}\u0000${identity}`;
+		if (this.reportedWarnings.has(key)) {
+			return;
+		}
+		this.reportedWarnings.add(key);
+		this.warnings.push({ scope, message });
+	}
+
+	/** Report every key this version does not recognize (CD-3). */
+	private reportUnknownSettingsKeys(scope: SettingsScope, settings: Settings): void {
+		for (const key of collectUnknownSettingsKeys(settings as Record<string, unknown>)) {
+			this.recordWarning(
+				scope,
+				`unknown-key:${key}`,
+				`unknown settings key "${key}" (${scope} settings): this key is not recognized by this version of Prime Agent, so its value never takes effect. The value is kept in the file.`,
+			);
+		}
 	}
 
 	private clearModifiedScope(scope: SettingsScope): void {
@@ -900,6 +1103,9 @@ export class SettingsManager {
 					(mergedSettings as Record<string, unknown>)[field] = value;
 				}
 			}
+
+			// A write that carries unknown keys back to disk keeps them visible.
+			this.reportUnknownSettingsKeys(scope, mergedSettings);
 
 			return JSON.stringify(mergedSettings, null, 2);
 		});
@@ -976,6 +1182,21 @@ export class SettingsManager {
 		}
 		const drained = this.errors.filter((entry) => entry.scope === scope);
 		this.errors = this.errors.filter((entry) => entry.scope !== scope);
+		return drained;
+	}
+
+	/**
+	 * Consume the warnings recorded so far. Kept apart from `drainErrors`, whose
+	 * count is the save-failure contract callers rely on.
+	 */
+	drainWarnings(scope?: SettingsScope): SettingsWarning[] {
+		if (!scope) {
+			const drained = [...this.warnings];
+			this.warnings = [];
+			return drained;
+		}
+		const drained = this.warnings.filter((entry) => entry.scope === scope);
+		this.warnings = this.warnings.filter((entry) => entry.scope !== scope);
 		return drained;
 	}
 
@@ -1694,8 +1915,28 @@ export class SettingsManager {
 		this.save();
 	}
 
+	/**
+	 * CD-6: docs/terminal-setup.md documents `PI_HARDWARE_CURSOR=1` as the way to
+	 * switch the hardware cursor on, so an explicitly set environment variable wins
+	 * over the file. A settings file that once wrote `false` must not be able to
+	 * silence the documented switch - and when the two disagree, say so.
+	 */
 	getShowHardwareCursor(): boolean {
-		return this.settings.showHardwareCursor ?? process.env.PI_HARDWARE_CURSOR === "1";
+		const rawEnvValue = process.env[HARDWARE_CURSOR_ENV_VAR];
+		const envValue = parseBooleanEnvSwitch(rawEnvValue);
+		const fileValue = this.settings.showHardwareCursor;
+		if (envValue === undefined) {
+			return fileValue ?? false;
+		}
+		if (fileValue !== undefined && fileValue !== envValue) {
+			const scope: SettingsScope = this.projectSettings.showHardwareCursor !== undefined ? "project" : "global";
+			this.recordWarning(
+				scope,
+				`env-conflict:${HARDWARE_CURSOR_ENV_VAR}:${rawEnvValue}:${fileValue}`,
+				`${HARDWARE_CURSOR_ENV_VAR}=${rawEnvValue} (${envValue}) conflicts with showHardwareCursor=${fileValue} (${scope} settings): the environment variable wins`,
+			);
+		}
+		return envValue;
 	}
 
 	setShowHardwareCursor(enabled: boolean): void {

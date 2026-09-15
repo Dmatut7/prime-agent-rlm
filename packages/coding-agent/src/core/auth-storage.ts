@@ -31,7 +31,7 @@ import {
 	savePrimeCliApiKey,
 	savePrimeCliTeamSelection,
 } from "./prime-inference-auth.js";
-import { resolveConfigValue, resolveConfigValueUncached } from "./resolve-config-value.js";
+import { clearResolvedCommandCache, resolveConfigValue, resolveConfigValueUncached } from "./resolve-config-value.js";
 
 export type PrimeTeamCredential = {
 	teamId: string;
@@ -268,7 +268,9 @@ export class AuthStorage {
 		private storage: AuthStorageBackend,
 		private options: AuthStorageOptions = {},
 	) {
-		this.reload();
+		// Not `reload()`: constructing a store is not a credential change, so it must not
+		// drop the process-level `!command` value cache.
+		this.loadCredentialsFromDisk();
 	}
 
 	static create(authPath?: string, options?: AuthStorageOptions): AuthStorage {
@@ -635,9 +637,12 @@ export class AuthStorage {
 	}
 
 	/**
-	 * Reload credentials from storage.
+	 * Read the store from disk without touching the process-level `!command` cache.
+	 * The constructor uses this: a second store in the same process is a second *view* of
+	 * the same credentials, not a credential change, so it must not respawn a credential
+	 * helper (see "cache persists across AuthStorage instances").
 	 */
-	reload(): void {
+	private loadCredentialsFromDisk(): void {
 		let content: string | undefined;
 		try {
 			this.storage.withLock((current) => {
@@ -650,6 +655,21 @@ export class AuthStorage {
 			this.loadError = error as Error;
 			this.recordError(error);
 		}
+	}
+
+	/**
+	 * Reload credentials from storage.
+	 *
+	 * This is the explicit "re-read external state" entry point (`AgentSession.reload`
+	 * for `/reload`, a login saved by the client process, a model-registry refresh), so it
+	 * also drops the `!command` value cache: a command-resolved key is exactly the
+	 * credential whose *value* moves while its command text stays the same. Callers with
+	 * no stale-source fallback of their own - `AgentSession._addWebsearchKeyEnv` writing
+	 * `SERPER_API_KEY` into the kernel environment - have no second chance without this.
+	 */
+	reload(): void {
+		clearResolvedCommandCache();
+		this.loadCredentialsFromDisk();
 	}
 
 	private persistProviderChange(provider: string, credential: AuthCredential | undefined): void {
@@ -684,6 +704,9 @@ export class AuthStorage {
 	 * Set credential for a provider.
 	 */
 	set(provider: string, credential: AuthCredential): void {
+		// A new credential may point at a `!command` whose earlier failure is still inside
+		// the retry window; the write has to drop that cached failure.
+		clearResolvedCommandCache();
 		this.clearStaleAuthSource(provider, "stored");
 		this.data[provider] = credential;
 		this.persistProviderChange(provider, credential);
@@ -693,6 +716,7 @@ export class AuthStorage {
 	 * Remove credential for a provider.
 	 */
 	remove(provider: string): void {
+		clearResolvedCommandCache();
 		this.clearStaleAuthSource(provider, "stored");
 		delete this.data[provider];
 		this.persistProviderChange(provider, undefined);
@@ -713,6 +737,7 @@ export class AuthStorage {
 			return { result: undefined, next: JSON.stringify(merged, null, 2) };
 		});
 		delete this.data[provider];
+		clearResolvedCommandCache();
 		// Post-success only: a failed removal must not make a stale-marked credential selectable again.
 		this.clearStaleAuthSource(provider, "stored");
 	}

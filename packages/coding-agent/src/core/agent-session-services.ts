@@ -202,6 +202,12 @@ export async function createAgentSessionServices(
 		diagnostics.push({ type: "warning", message: modelsJsonError });
 	}
 
+	// Deprecated keys in a models.json that still loads: the registry reports them
+	// separately from the load error, and a print/RPC/daemon client needs them here.
+	for (const modelsJsonWarning of modelRegistry.getWarnings()) {
+		diagnostics.push({ type: "warning", message: modelsJsonWarning });
+	}
+
 	const extensionsResult = resourceLoader.getExtensions();
 	for (const { name, config, extensionPath } of extensionsResult.runtime.pendingProviderRegistrations) {
 		try {

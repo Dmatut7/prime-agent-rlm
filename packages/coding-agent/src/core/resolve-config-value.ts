@@ -25,6 +25,18 @@ interface CachedCommandResult {
 const commandResultCache = new Map<string, CachedCommandResult>();
 
 /**
+ * Drop every cached `!command` result. The cache is keyed by the command *text*, so it
+ * cannot notice that the secret the command reads has moved: rotating a key file, or
+ * pointing the command at a different credential helper, keeps the same key string.
+ * Callers that re-read credentials (`AuthStorage.reload`) or change them
+ * (`AuthStorage.set`/`remove`) must drop the cache, otherwise the next call site keeps
+ * serving the value resolved before the change.
+ */
+export function clearResolvedCommandCache(): void {
+	commandResultCache.clear();
+}
+
+/**
  * Resolve a config value (API key, header value, etc.) to an actual value.
  * - If starts with "!", executes the rest as a shell command and uses stdout (cached)
  * - Otherwise checks environment variable first, then treats as literal (not cached)
