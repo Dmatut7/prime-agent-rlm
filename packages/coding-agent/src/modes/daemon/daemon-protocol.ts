@@ -163,8 +163,19 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // wire DTO's `diagnostics` is now typed optional to match the renderer guard, but that
 // shape lives in agent-connection/types.ts, outside every hashed slice, so this
 // revision is not an identity for it.
-export const DAEMON_SCHEMA_REVISION = 34;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-34-3c415362acce";
+// Revision 35 extends the digest again, not the wire: the session-tree and stall event
+// families also cross the wire through shapes no hashed slice covered - the
+// DaemonSessionSnapshot.sessionTree wrapper (this file), the agent-connection/types.ts
+// contract DTOs (the connection tree bound stats, the snapshot's sessionTree wrapper,
+// and the stall events' optional diagnostics the rev34 note above disclaimed), and the
+// actual get_session_tree response daemon-mode.ts assembles. Until rev35 an edit to any
+// of those rode an unchanged DAEMON_SCHEMA_ID, so a mixed old-daemon/new-client pair
+// kept passing the handshake with the mismatched shapes. The digest stays a hard
+// identity gate, not a local degrade: a mismatched pair replaces an idle daemon and
+// refuses a busy one (judgeDaemonReuse), so widening the digest is a compatibility
+// event every time, exactly as it was for rev32/rev33/rev34.
+export const DAEMON_SCHEMA_REVISION = 35;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-35-5100d7bec2ea";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;

@@ -152,14 +152,36 @@ describe("tools manager", () => {
 
 	it("removes a downloaded binary that fails its version check", async () => {
 		toolState.platform = "win32";
+		// X-11: the version probe only runs after a digest-verified download, and on the
+		// pinned lane the digest must match the pin table, which a fixture archive never
+		// does. The case used to idle there: the checksum refusal produced the same
+		// assertions while extraction and the version probe never ran, so the test only
+		// executed its proposition when the parent environment happened to set the
+		// floating flag - and then the same parent env also decided the digest lane, a
+		// self-attestation. The floating lane is the only lane whose digest a fixture can
+		// satisfy (its published sidecar), so this case declares the flag explicitly
+		// instead of inheriting the parent environment; the afterEach restore keeps the
+		// parent environment - and the pin-table digest lane - authoritative for every
+		// other case in this file.
+		process.env.PRIME_AGENT_TOOLS_ALLOW_FLOATING = "1";
+		const archive = new Uint8Array([1]);
+		const digest = createHash("sha256").update(archive).digest("hex");
 		vi.stubGlobal(
 			"fetch",
 			vi
 				.fn()
-				.mockResolvedValueOnce(new Response(JSON.stringify({ tag_name: "15.1.0" }), { status: 200 }))
-				.mockResolvedValueOnce(new Response(new Uint8Array([1]), { status: 200 })),
+				.mockResolvedValueOnce(
+					new Response(JSON.stringify({ tag_name: "15.1.0" }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					}),
+				)
+				.mockResolvedValueOnce(new Response(`${digest}  ripgrep-15.1.0-x64-pc-windows-msvc.zip\n`, { status: 200 }))
+				.mockResolvedValueOnce(new Response(archive, { status: 200 })),
 		);
+		let extractCalls = 0;
 		toolState.extractZip = async (_source, options) => {
+			extractCalls += 1;
 			writeExecutable(join(options.dir, "rg.exe"), 1);
 		};
 
@@ -168,6 +190,7 @@ describe("tools manager", () => {
 			reason: "download_failed",
 		});
 		expect(existsSync(join(toolState.toolsDir, "rg.exe"))).toBe(false);
+		expect(extractCalls, "version-probe removal path was exercised").toBeGreaterThan(0);
 	});
 
 	it("formats actionable platform-specific ripgrep warnings", () => {
