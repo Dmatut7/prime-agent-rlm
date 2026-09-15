@@ -99,10 +99,22 @@ function shortWriteReference(venv: string): { pid: number; unverified: boolean; 
 			encoding: "utf8",
 		},
 	);
-	expect(result.stderr).toBe("");
-	expect(result.signal).toBeNull();
-	expect(result.status).toBe(0);
-	return JSON.parse(result.stdout) as { pid: number; unverified: boolean; reason?: string };
+	// The two platforms report an over-limit write differently: macOS returns a short count to
+	// `writeSync`, Linux raises SIGXFSZ and kills the child. Both are "the write did not silently
+	// succeed" - which is the property under test - but only the first lets the child report back.
+	// A run that neither returned a JSON record nor died by SIGXFSZ is the failure this guards.
+	const killedByFileSizeLimit = result.signal === "SIGXFSZ";
+	if (!killedByFileSizeLimit) {
+		expect(result.stderr).toBe("");
+		expect(result.signal).toBeNull();
+		expect(result.status).toBe(0);
+		return JSON.parse(result.stdout) as { pid: number; unverified: boolean; reason?: string };
+	}
+	// Signalled path: the child never got to write a record. The record file must not exist in a
+	// silently-truncated shape either.
+	expect(result.stdout).toBe("");
+	expect(existsSync(join(venv, ".in-use", `${process.pid}.json`))).toBe(false);
+	return { pid: process.pid, unverified: true, reason: "signalled" };
 }
 
 function generation(suffix: string): string {
