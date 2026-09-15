@@ -1,0 +1,1 @@
+- Fixed the session worker re-serializing the whole transcript once per attached client; snapshot transfers of one session now share a single encoding.
