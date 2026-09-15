@@ -1,9 +1,11 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { type LogEntry, setLogSink } from "@earendil-works/pi-ai";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
 	detectForkInstall,
+	FORK_GATE_ENV_VAR,
 	FORK_MARKER_FILE,
 	forkSelfUpdateOverrideLine,
 	forkSelfUpdateRefusalLines,
@@ -48,20 +50,61 @@ describe("fork self-update gate", () => {
 		expect(detectForkInstall(resolve(detected?.repoRoot ?? "."))).toEqual(detected);
 	});
 
-	it("opts out of detection while the in-repo update suites run", () => {
+	it("opts out of detection while the in-repo update suites run, and says so", () => {
 		// The marker walk always fires inside this checkout, so suites that exercise the
 		// official update path (package-command-paths.test.ts) switch the gate off for
 		// their own duration instead of asserting against the refusal.
-		process.env.PRIME_AGENT_FORK_GATE = "off";
+		const entries: LogEntry[] = [];
+		setLogSink((entry) => entries.push(entry));
+		process.env[FORK_GATE_ENV_VAR] = "off";
 		try {
+			// Positive control for the diagnostic below: the same call warns only because
+			// the variable is set, not because it got here at all.
 			expect(detectForkInstall(forkRoot)).toBeUndefined();
 			expect(detectForkInstall()).toBeUndefined();
+			expect(entries).toHaveLength(2);
+			for (const entry of entries) {
+				expect(entry.level).toBe("warn");
+				expect(entry.msg).toContain(FORK_GATE_ENV_VAR);
+			}
+			// The warn names the checkout whose gate was skipped, so a leaked seam is
+			// traceable from the log alone.
+			expect(entries[0]?.repoRoot).toBe(resolve(forkRoot));
 		} finally {
-			delete process.env.PRIME_AGENT_FORK_GATE;
+			delete process.env[FORK_GATE_ENV_VAR];
+			setLogSink(undefined);
 		}
 
 		// The opt-out is scoped to the variable and not sticky.
 		expect(detectForkInstall(forkRoot)).toEqual({ repoRoot: resolve(forkRoot) });
+	});
+
+	it("keeps the bypass quiet when the variable is not set", () => {
+		const entries: LogEntry[] = [];
+		setLogSink((entry) => entries.push(entry));
+		try {
+			expect(detectForkInstall(forkRoot)).toEqual({ repoRoot: resolve(forkRoot) });
+			expect(detectForkInstall(plainRoot)).toBeUndefined();
+			expect(entries).toEqual([]);
+		} finally {
+			setLogSink(undefined);
+		}
+	});
+
+	it("says the gate is off even when no fork marker was found", () => {
+		// Unconditional by contract: setting the variable is the event being reported, so an
+		// operator grepping the log sees the skipped gate on any install, not only in-repo.
+		const entries: LogEntry[] = [];
+		setLogSink((entry) => entries.push(entry));
+		process.env[FORK_GATE_ENV_VAR] = "off";
+		try {
+			expect(detectForkInstall(plainRoot)).toBeUndefined();
+			expect(entries.map((entry) => entry.level)).toEqual(["warn"]);
+			expect(entries[0]?.msg).toContain(FORK_GATE_ENV_VAR);
+		} finally {
+			delete process.env[FORK_GATE_ENV_VAR];
+			setLogSink(undefined);
+		}
 	});
 
 	it("names the fork's own update path and never the official installer", () => {

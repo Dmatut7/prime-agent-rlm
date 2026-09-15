@@ -119,10 +119,14 @@ const KERNEL_PROTOCOL_ENV_VAR = "PRIME_AGENT_KERNEL_PROTOCOL";
 const GATED_EVENT_KIND_MIN_PROTOCOL: Readonly<Record<string, number>> = {
 	heartbeat: KERNEL_PROTOCOL_V4,
 };
-/** Heartbeat period the runtime uses by default; every frame carries the kernel's own value. */
-export const DEFAULT_KERNEL_HEARTBEAT_INTERVAL_MS = 5_000;
-/** A heartbeat older than this many of its own intervals is stale and stops vouching for work. */
-export const KERNEL_LIVENESS_STALE_INTERVALS = 3;
+/**
+ * The heartbeat's period and staleness threshold are not this file's to declare: the kernel reports
+ * its own period on every frame (`interval_ms`, merged into each sample), and the host mirrors both
+ * values exactly once, in `turn-liveness.ts` (`FALLBACK_HEARTBEAT_INTERVAL_MS`,
+ * `DEFAULT_STALE_AFTER_INTERVALS`). The copies that used to live here were exported and imported by
+ * nobody, so they read as configuration while nothing could read them; a reader that needs either
+ * number takes it from turn-liveness, never from a second definition.
+ */
 /** Minimum gap between two retained samples, so a kernel that floods frames cannot churn the host. */
 const KERNEL_LIVENESS_MIN_SAMPLE_GAP_MS = 1_000;
 /** Retained samples: enough to diff progress, few enough to stay O(1). */
