@@ -1,0 +1,3 @@
+- Fixed roster child previews gluing the previous answer onto a mid-word slice of a new assistant message in the same run (or freezing at the old capped preview): the streaming preview accumulator now resets at each message_start.
+- Fixed a manual `/compact` preempting an in-flight auto compaction destroying the queued autonomous continuations and cancelling and rolling back the goal continuation, which left the agent idle after the compaction; user-level aborts keep the cancel semantics.
+- Changed a skipped manual compaction that carried custom instructions to reject with an error naming the dropped instructions, and a queued `/compact` skip now shows a result row instead of being silently swallowed.
