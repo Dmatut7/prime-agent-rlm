@@ -77,6 +77,7 @@ import {
 } from "./core/session-lease.js";
 import { repairOwnedSessionFile, SessionManager } from "./core/session-manager.js";
 import { SettingsManager } from "./core/settings-manager.js";
+import { shareExportIdentityHintFromFile } from "./core/share-session.js";
 import { setStallRuntimeDaemonWorker } from "./core/stall-evidence.js";
 import { isTelemetryEnabled } from "./core/telemetry.js";
 import { printTimings, resetTimings, time } from "./core/timings.js";
@@ -1345,6 +1346,14 @@ export async function main(args: string[], options?: MainOptions) {
 			process.exit(1);
 		}
 		console.log(`Exported to: ${result}`);
+		// The HTML export embeds the full session (cwd, usernames, emails) as base64,
+		// invisible at a plain-text glance at the file: say what it carries next to the
+		// path that was just printed (round-27 SEC-5). A read that fails does not
+		// invalidate the export, it just drops the notice.
+		const identityHint = shareExportIdentityHintFromFile(result);
+		if (identityHint !== undefined) {
+			console.log(chalk.yellow(identityHint));
+		}
 		process.exit(0);
 	}
 

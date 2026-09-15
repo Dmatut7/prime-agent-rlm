@@ -120,7 +120,12 @@ import { parseCommandArgs } from "../../core/prompt-templates.js";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.js";
 import { SessionImportFileNotFoundError } from "../../core/session-import-errors.js";
 import { resolveSessionPath, SessionSelectorError, SessionSelectorNotFoundError } from "../../core/session-resolver.js";
-import { confirmShareIfSecrets, createShareTempHtmlFile, SHARE_UPLOAD_TIMEOUT_MS } from "../../core/share-session.js";
+import {
+	confirmShareIfSecrets,
+	createShareTempHtmlFile,
+	SHARE_UPLOAD_TIMEOUT_MS,
+	shareExportIdentityHintFromFile,
+} from "../../core/share-session.js";
 import { parseSkillBlock } from "../../core/skill-blocks.js";
 import {
 	BUILTIN_SLASH_COMMANDS,
@@ -9280,7 +9285,16 @@ export class InteractiveMode {
 				this.showStatus(`Session exported to: ${filePath}`);
 			} else {
 				const filePath = await this.agentConnection.exportToHtml(outputPath);
-				this.showStatus(`Session exported to: ${filePath}`);
+				// The HTML export embeds the full session (cwd, usernames, emails) as
+				// base64, invisible at a plain-text glance at the file: say what it
+				// carries next to the path (round-27 SEC-5). A read that fails does not
+				// invalidate the export, it just drops the notice.
+				const identityHint = shareExportIdentityHintFromFile(filePath);
+				if (identityHint !== undefined) {
+					this.showStatus(`Session exported to: ${filePath}\n${identityHint}`, "warning");
+				} else {
+					this.showStatus(`Session exported to: ${filePath}`);
+				}
 			}
 		} catch (error: unknown) {
 			this.showError(`Failed to export session: ${error instanceof Error ? error.message : "Unknown error"}`);
