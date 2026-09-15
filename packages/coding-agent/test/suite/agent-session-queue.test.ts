@@ -894,14 +894,19 @@ describe("AgentSession queue characterization", () => {
 			expectGlobalContent: "Global content" as string | undefined,
 		},
 		{
+			// M5: an id copied from the overview with a store prefix names that store. A
+			// LOCAL refinement given "global:shared" is refused with the actionable route
+			// instead of silently landing on the local "shared" — the old strip-and-apply
+			// behavior was exactly the scope trap this refusal closes.
 			name: "global display prefixes before applying local refine edits",
 			seedGlobal: false,
 			seedLocal: true,
 			editId: "global:shared",
 			refineOptions: { instructions: "update local memory" },
 			updatedContent: "Updated local content",
-			expectLocalContent: "Updated local content" as string | undefined,
+			expectLocalContent: "Local content" as string | undefined,
 			expectGlobalContent: undefined as string | undefined,
+			expectRefused: true,
 		},
 		{
 			name: "global display prefixes before applying global refine edits",
@@ -923,6 +928,7 @@ describe("AgentSession queue characterization", () => {
 			updatedContent,
 			expectLocalContent,
 			expectGlobalContent,
+			expectRefused,
 		}) => {
 			const harness = await createAutoRefineHarness();
 			harnesses.push(harness);
@@ -962,7 +968,11 @@ describe("AgentSession queue characterization", () => {
 
 				const result = await harness.session.refine(refineOptions);
 
-				expect(result.appliedEdits[0]).toMatchObject({ id: "shared", applied: true });
+				expect(result.appliedEdits[0]).toMatchObject(
+					expectRefused === true
+						? { id: "shared", applied: false, error: expect.stringContaining("refinement targets") }
+						: { id: "shared", applied: true },
+				);
 				if (expectLocalContent !== undefined) {
 					expect(loadHarnessState(localDir, "local").entries.memory.shared.content).toBe(expectLocalContent);
 					expect(loadHarnessState(localDir, "local").entries.memory["global:shared"]).toBeUndefined();
