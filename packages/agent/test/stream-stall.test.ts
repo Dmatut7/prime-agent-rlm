@@ -7,7 +7,11 @@ import {
 	type UserMessage,
 } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
-import { runAgentLoop, SERVER_DIRECTED_RETRY_STALL_STOP_REASON_RAW } from "../src/agent-loop.js";
+import {
+	isServerDirectedRetryStall,
+	runAgentLoop,
+	SERVER_DIRECTED_RETRY_STALL_STOP_REASON_RAW,
+} from "../src/agent-loop.js";
 import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage } from "../src/types.js";
 
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
@@ -262,8 +266,71 @@ describe("agent loop stream stall detection", () => {
 			kind: "rate_limit",
 			status: 429,
 			retryAfterMs: 5000,
+			// The wait is still in flight and nothing has streamed, so the provider's
+			// own instruction is the explanation (the other direction of the pair).
+			stallAttribution: "server_directed_wait",
+			streamedContent: false,
 		});
 		// And it must be recognizable as the shape that is excluded from full-context resends.
 		expect(assistant?.stopReasonRaw).toBe(SERVER_DIRECTED_RETRY_STALL_STOP_REASON_RAW);
+	});
+
+	it("keeps a mid-stream stall retryable when the same attempt saw an earlier 429", async () => {
+		const context = createContext();
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			streamStallTimeoutMs: 60,
+		};
+		const stream = new MockAssistantStream();
+		const streamFn = vi.fn(
+			(_model: Model<any>, _context: unknown, options: { onProviderRetry?: (notice: never) => void }) => {
+				// 1. Earlier in this same attempt the provider answered 429 and asked to wait.
+				options.onProviderRetry?.({
+					status: 429,
+					delayMs: 5000,
+					retryAfter: "5",
+					capped: false,
+				} as never);
+				// 2. The SDK's retry was accepted: the stream came up and produced output.
+				const start = createAssistantMessage([{ type: "text", text: "" }]);
+				stream.push({ type: "start", partial: start });
+				const withText = createAssistantMessage([{ type: "text", text: "half an answer" }]);
+				stream.push({ type: "text_delta", contentIndex: 0, delta: "half an answer", partial: withText });
+				// 3. Then the connection died mid-stream: nothing else ever arrives.
+				return stream;
+			},
+		);
+
+		const messages = await runAgentLoop(
+			[createUserMessage("hello")],
+			context,
+			config,
+			async () => {},
+			undefined,
+			streamFn as never,
+		);
+		const assistant = lastAssistant(messages);
+
+		expect(assistant?.stopReason).toBe("error");
+		// A wait the provider asked for governs the silence before the response body
+		// starts. Output already arrived, so the earlier 429 does not explain this
+		// stall: it is a mid-stream interruption and keeps its full-resend eligibility.
+		expect(isServerDirectedRetryStall(assistant as AssistantMessage)).toBe(false);
+		expect(assistant?.errorMessage).not.toContain("throttling");
+		expect(assistant?.errorMessage).not.toContain("rate limit");
+		// The partial output stays in the transcript, so the turn is a truncated
+		// answer rather than an empty one.
+		expect(assistant?.content).toEqual([{ type: "text", text: "half an answer" }]);
+		// The earlier server answer is still recorded for post-mortems, but it is no
+		// longer presented as the explanation for the stall.
+		const diagnostic = assistant?.diagnostics?.find((entry) => entry.type === "provider_stream_failure");
+		expect(diagnostic?.details).toMatchObject({
+			kind: "rate_limit",
+			status: 429,
+			retryAfterMs: 5000,
+			stallAttribution: "mid_stream_interruption",
+			streamedContent: true,
+		});
 	});
 });
