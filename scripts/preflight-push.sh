@@ -100,7 +100,7 @@ fi
 
 echo "== 4/4 the run any 'CI is green' claim has to name =="
 head_sha=$(git rev-parse HEAD)
-if ! verdict_output=$(bash scripts/latest-ci-run.sh --branch "$BRANCH" --commit "$head_sha" --require-success 2>&1); then
+if ! verdict_output=$(bash "$(dirname "$0")/latest-ci-run.sh" --branch "$BRANCH" --commit "$head_sha" --require-success 2>&1); then
   echo "$verdict_output" | sed 's/^/   /'
   if [ -n "${PREFLIGHT_RED_REVISION_REASON:-}" ]; then
     echo "   overridden by PREFLIGHT_RED_REVISION_REASON: $PREFLIGHT_RED_REVISION_REASON"
