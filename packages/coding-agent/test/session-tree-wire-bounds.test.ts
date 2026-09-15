@@ -122,6 +122,7 @@ describe("session tree wire bounds", () => {
 			expect(tree?.bound?.depthLimit).toBe(SESSION_TREE_MAX_WIRE_DEPTH);
 			expect(tree?.bound?.truncated).toBe(true);
 			expect(tree?.bound?.omittedNodes).toBeGreaterThan(0);
+			expect(tree?.bound?.maxDepth).toBe(CHAIN_LENGTH - 1);
 			// Depth is parent edges, so the kept subtree is the root plus `depthLimit` levels.
 			expect(tree?.bound?.returnedNodes).toBe(SESSION_TREE_MAX_WIRE_DEPTH + 1);
 			// The bound is on the tree, not on the session: the leaf is what the session resumes on.
@@ -163,5 +164,16 @@ describe("session tree wire bounds", () => {
 		expect(stats.truncated).toBe(false);
 		expect(stats.omittedNodes).toBe(0);
 		expect(stats.entries).toBe(5);
+		// The connection contract owns its wire DTO (`AgentConnectionSessionTreeBound`) and may
+		// not import this module, so pin the two field sets to each other: a field added to or
+		// dropped from these stats must fail here instead of silently narrowing the wire shape.
+		expect(Object.keys(stats).sort()).toEqual([
+			"depthLimit",
+			"entries",
+			"maxDepth",
+			"omittedNodes",
+			"returnedNodes",
+			"truncated",
+		]);
 	});
 });

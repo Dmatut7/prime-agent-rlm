@@ -26,7 +26,6 @@ import type {
 	SessionActionSnapshot,
 } from "../../core/session-action-store.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
-import type { SessionTreeDepthStats } from "../../core/session-manager.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import type { StallDiagnostics } from "../../core/stall-diagnostics.js";
 import type { SessionUsageSummary } from "../../core/usage.js";
@@ -276,6 +275,29 @@ export interface AgentConnectionSessionTreeNode extends AgentConnectionSessionTr
 	children: AgentConnectionSessionTreeNode[];
 }
 
+/**
+ * What a depth-bounded session tree left out, so a truncation is never silent.
+ *
+ * This is the connection-owned wire DTO for the local manager's `SessionTreeDepthStats`.
+ * The contract deliberately does not import that module: `SessionManager` is runtime
+ * ownership, and a remote adapter must be able to implement this surface without the local
+ * session runtime in its type graph (see test/interactive-mode-boundary.test.ts). The two
+ * field sets are pinned to each other by test/session-tree-wire-bounds.test.ts, so the
+ * mirror cannot drift silently.
+ */
+export interface AgentConnectionSessionTreeBound {
+	/** Entries in the session. */
+	entries: number;
+	/** Nodes the client receives. */
+	returnedNodes: number;
+	/** Nodes below the depth limit: present in the session, absent from the returned tree. */
+	omittedNodes: number;
+	/** Depth (parent edges) of the deepest entry in the session. */
+	maxDepth: number;
+	depthLimit: number;
+	truncated: boolean;
+}
+
 export interface AgentConnectionSessionContext {
 	messages: AgentMessage[];
 	thinkingLevel: string;
@@ -316,7 +338,7 @@ export interface AgentConnectionSnapshot {
 		tree: AgentConnectionSessionTreeNode[];
 		leafId: string | null;
 		/** Present when the tree was depth-bounded; says what the bound left out. */
-		bound?: SessionTreeDepthStats;
+		bound?: AgentConnectionSessionTreeBound;
 	};
 	parent?: AgentConnectionParentMetadata;
 	/** Live RLM children, including descendants, known to the host at snapshot time. */
