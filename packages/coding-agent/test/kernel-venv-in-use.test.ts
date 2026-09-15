@@ -36,6 +36,7 @@ import {
 	VENV_IN_USE_DIR_NAME,
 } from "../src/core/kernel/venv-in-use.js";
 import { getProcessStartId } from "../src/core/session-lease.js";
+import { runShortWriteChild, type ShortWriteChild, shortWriteDriverPreamble } from "./fixtures/short-write-child.js";
 
 let tempDir = "";
 let base = "";
@@ -69,52 +70,25 @@ function restorePermissions(root: string): void {
 }
 
 /**
- * Run `recordKernelVenvInUseSync` in a child whose file size limit is 1 KiB, so the reference
- * write lands short (the POSIX answer to a full disk): writeSync stops at the limit and returns
- * the partial count instead of throwing. Returns the record the writer reported.
+ * Record a kernel reference from a child that cannot write a whole record (its file size limit is
+ * one block), and return what that child measured about the kernel and reported about the write.
  */
-function shortWriteReference(venv: string): { pid: number; unverified: boolean; reason?: string } {
+function shortWriteReference(venv: string): ShortWriteChild {
 	const driver = join(tempDir, "short-write-driver.ts");
 	const moduleUrl = new URL("../src/core/kernel/venv-in-use.js", import.meta.url).pathname;
 	writeFileSync(
 		driver,
 		[
+			...shortWriteDriverPreamble(),
 			`import { recordKernelVenvInUseSync } from ${JSON.stringify(moduleUrl)};`,
 			"const venv = process.argv[2] as string;",
-			// A long session id pushes the record well past the 1 KiB file size limit.
+			// A long session id pushes the record well past the limit, so the reference write is the
+			// one that has to be detected as incomplete.
 			'const record = recordKernelVenvInUseSync(venv, { pid: process.pid, sessionId: "s".repeat(4096) });',
-			"process.stdout.write(JSON.stringify({ pid: process.pid, ...record }));",
+			'process.stdout.write(JSON.stringify({ line: "report", pid: process.pid, ...record }) + "\\n");',
 		].join("\n"),
 	);
-	const result = spawnSync(
-		"bash",
-		[
-			"-c",
-			`ulimit -f 1; exec ${JSON.stringify(process.execPath)} --import tsx ${JSON.stringify(driver)} ${JSON.stringify(venv)}`,
-		],
-		{
-			// tsx must stay out of its cache here: this process may not write a file larger than
-			// the limit either, and a truncated cache would poison other runs.
-			env: { ...process.env, TSX_DISABLE_CACHE: "1" },
-			encoding: "utf8",
-		},
-	);
-	// The two platforms report an over-limit write differently: macOS returns a short count to
-	// `writeSync`, Linux raises SIGXFSZ and kills the child. Both are "the write did not silently
-	// succeed" - which is the property under test - but only the first lets the child report back.
-	// A run that neither returned a JSON record nor died by SIGXFSZ is the failure this guards.
-	const killedByFileSizeLimit = result.signal === "SIGXFSZ";
-	if (!killedByFileSizeLimit) {
-		expect(result.stderr).toBe("");
-		expect(result.signal).toBeNull();
-		expect(result.status).toBe(0);
-		return JSON.parse(result.stdout) as { pid: number; unverified: boolean; reason?: string };
-	}
-	// Signalled path: the child never got to write a record. The record file must not exist in a
-	// silently-truncated shape either.
-	expect(result.stdout).toBe("");
-	expect(existsSync(join(venv, ".in-use", `${process.pid}.json`))).toBe(false);
-	return { pid: process.pid, unverified: true, reason: "signalled" };
+	return runShortWriteChild({ driver, args: [venv], probePath: join(tempDir, "short-write-probe.bin") });
 }
 
 function generation(suffix: string): string {
@@ -381,20 +355,62 @@ describe("kernel venv in-use references", () => {
 
 	it.skipIf(process.platform === "win32")(
 		"does not leave a silently truncated reference when the write lands short",
-		() => {
-			// The real short write, not a simulation: a file size limit makes writeSync stop at
-			// the limit and return the partial count (a full disk does the same). The old code
-			// ignored the returned count, so the writer believed it had recorded a reference
-			// while the on-disk bytes were a truncated prefix.
+		async () => {
+			// The real short write, not a simulation: a file size limit stops the record write from
+			// landing whole, which is what a full disk does to it. The old code ignored the count
+			// `writeSync` returns, so the writer believed it had recorded a reference while the
+			// on-disk bytes were a truncated prefix.
 			const venv = createGeneration("aaaaaaaaaaaa");
-			const report = shortWriteReference(venv);
-			expect(report.unverified).toBe(true);
-			expect(report.reason).toBeTruthy();
-
-			const referencePath = join(venv, VENV_IN_USE_DIR_NAME, String(report.pid));
+			const outcome = shortWriteReference(venv);
+			const referencePath = join(venv, VENV_IN_USE_DIR_NAME, String(outcome.pid));
 			const onDisk = existsSync(referencePath) ? readFileSync(referencePath, "utf8") : "";
-			expect(onDisk.length).toBeGreaterThan(0);
+
+			if (outcome.kind === "killed") {
+				// Linux's shape: SIGXFSZ ended the writer before it could claim anything, so there is
+				// no false success to disprove - the case passes on that reading, and says so here
+				// rather than pretending the guard was observed. The kill itself proves the limit
+				// bit. macOS must never take this branch (its kernel shortens the write instead of
+				// signalling), so the byte-count guard stays directly asserted there.
+				expect(outcome.signal, "only the file size limit may end the writer").toBe("SIGXFSZ");
+				expect(process.platform, "macOS shortens the write, so the writer must report").not.toBe("darwin");
+			} else {
+				// Both platforms, whenever the writer got to speak: an incomplete record is a failed
+				// registration, never a reference.
+				expect(
+					outcome.report.unverified,
+					`the writer claimed a reference it did not finish: ${JSON.stringify(outcome.report)}`,
+				).toBe(true);
+				expect(outcome.report.reason).toBeTruthy();
+			}
+
+			// The generator's own positive control, measured rather than assumed: a 4 KiB write in the
+			// same child must not have landed whole, or no short write existed to be detected.
+			if (outcome.probe !== undefined) {
+				expect(outcome.probe.landed, JSON.stringify(outcome.probe)).toBeLessThan(outcome.probe.requested);
+				if (process.platform === "darwin") {
+					// BSD answers with a partial count, so on macOS bytes really did land and the
+					// reference write really was truncated mid-record.
+					expect(outcome.probe.landed, JSON.stringify(outcome.probe)).toBeGreaterThan(0);
+				}
+			}
+
+			// The platform-independent half: whatever is at the reference path is not a record, and a
+			// truncated prefix left there must read as "in use", never as a generation free to delete.
 			expect(() => JSON.parse(onDisk)).toThrow();
+			if (onDisk.length > 0) {
+				const state = await readKernelVenvInUseState(venv);
+				expect(state.unknown).toBe(true);
+				expect(state.swept).toEqual([]);
+				expect(state.references.map((reference) => reference.referencePath)).toContain(referencePath);
+				expect(
+					decideKernelVenvRebuild({
+						platform: process.platform,
+						generationDirExists: true,
+						liveReferences: state.references.length,
+						referenceStateUnknown: state.unknown,
+					}).mode,
+				).toBe("defer");
+			}
 		},
 	);
 

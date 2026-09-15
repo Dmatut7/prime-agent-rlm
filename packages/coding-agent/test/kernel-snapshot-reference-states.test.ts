@@ -39,6 +39,7 @@ import {
 } from "../src/core/session-artifact-tombstones.js";
 import { getProcessStartId } from "../src/core/session-lease.js";
 import { resolveRetentionSettings } from "../src/core/settings-manager.js";
+import { runShortWriteChild, shortWriteDriverPreamble } from "./fixtures/short-write-child.js";
 
 const SESSION_ID = "98000000-7777-7777-8777-980000000000";
 const DAY_MS = 86_400_000;
@@ -325,12 +326,13 @@ describe("kernel snapshot reference states", () => {
 		expect(kept?.reason).toMatch(/^unverifiable:kernel-snapshot-reference-state$/);
 	});
 
-	it.skipIf(process.platform === "win32")("reports a short write instead of storing a truncated record", () => {
-		// The third clause of the law, on the write side: a full disk makes writeSync stop at the
-		// limit and return the partial count rather than throw, so a writer that ignores the count
-		// publishes a truncated record while believing it recorded a reference. The shared writer
-		// checks the count, so the failure is reported (and the caller can publish a stronger
-		// signal), and the truncated bytes are then kept by the reader - never swept.
+	it.skipIf(process.platform === "win32")("reports a short write instead of storing a truncated record", async () => {
+		// The third clause of the law, on the write side: a file size limit stops the record
+		// write from landing whole, exactly as a full disk does, and a writer that ignores the
+		// byte count `writeSync` returns publishes a truncated record while believing it recorded
+		// a reference. The shared writer checks the count, so the failure is reported (and the
+		// caller can publish a stronger signal), and the truncated bytes are then kept by the
+		// reader - never swept.
 		const root = mkdtempSync(join(tmpdir(), "kernel-snapshot-shortwrite-"));
 		roots.push(root);
 		const artifact = join(root, "artifact");
@@ -342,11 +344,12 @@ describe("kernel snapshot reference states", () => {
 		writeFileSync(
 			driver,
 			[
+				...shortWriteDriverPreamble(),
 				`import { writeReferenceFileSync } from ${JSON.stringify(moduleUrl)};`,
 				'import { join } from "node:path";',
 				"const [dir, generation] = process.argv.slice(2) as [string, string];",
 				// The reference is named for its holder, and a long session id pushes the record
-				// well past the 1 KiB file size limit of this child.
+				// well past the child's file size limit.
 				'const file = join(dir, String(process.pid) + ".json");',
 				"const failure = writeReferenceFileSync(file, dir, {",
 				"  version: 1,",
@@ -354,47 +357,59 @@ describe("kernel snapshot reference states", () => {
 				'  sessionId: "s".repeat(4096),',
 				"  generation,",
 				"});",
-				"process.stdout.write(JSON.stringify({ file, failure: failure ?? null }));",
+				'process.stdout.write(JSON.stringify({ line: "report", file, failure: failure ?? null }) + "\\n");',
 			].join("\n"),
 		);
-		const result = spawnSync(
-			"bash",
-			[
-				"-c",
-				`ulimit -f 1; exec ${JSON.stringify(process.execPath)} --import tsx ${JSON.stringify(driver)} ${JSON.stringify(references)} ${JSON.stringify(OLDER)}`,
-			],
-			{
-				// tsx must stay out of its cache here: this process may not write a file larger than
-				// the limit either, and a truncated cache would poison other runs.
-				env: { ...process.env, TSX_DISABLE_CACHE: "1" },
-				encoding: "utf8",
-			},
-		);
-		expect(result.stderr).toBe("");
-		expect(result.signal).toBeNull();
-		expect(result.status).toBe(0);
-		const report = JSON.parse(result.stdout) as {
-			file: string;
-			failure: { reason: string; partialDelete: boolean } | null;
-		};
-		expect(report.failure).not.toBeNull();
-		// macOS raises the file-size limit as EFBIG after filling to the limit; a plain full disk
-		// makes writeSync return a short count. Both are reported, and both say bytes landed.
-		expect(report.failure?.reason).toBeTruthy();
-		expect(report.failure?.partialDelete).toBe(true);
+		const outcome = runShortWriteChild({
+			driver,
+			args: [references, OLDER],
+			probePath: join(root, "short-write-probe.bin"),
+		});
+		const holderPath = join(references, `${outcome.pid}.json`);
+		const onDisk = existsSync(holderPath) ? readFileSync(holderPath, "utf8") : "";
+		// Whether this kernel shortened the write (bytes landed, BSD and the Linux hosts that
+		// clip to the limit) or refused it outright (EFBIG with nothing stored) is measured, not
+		// assumed; the writer has to describe the same shape it was given.
+		const landedShort = outcome.probe ? outcome.probe.landed > 0 : onDisk.length > 0;
 
-		// The bytes are on disk, they are not a record, and the reader keeps the generation: the
-		// entry is unverifiable, so it counts as a reference and makes this directory unknown.
-		addGeneration({ root, artifact, generations, references }, OLDER);
-		const onDisk = readFileSync(report.file, "utf8");
-		expect(onDisk.length).toBeGreaterThan(0);
+		if (outcome.kind === "killed") {
+			// Linux's other answer: SIGXFSZ ended the writer before it could report, so no
+			// truncated record was published under a claim of success. Admitted on that platform
+			// only - and the on-disk assertions below still have to hold.
+			expect(outcome.signal, "only the file size limit may end the writer").toBe("SIGXFSZ");
+			expect(process.platform, "macOS shortens the write, so the writer must report").not.toBe("darwin");
+		} else {
+			const failure = (outcome.report.failure ?? null) as { reason?: string; partialDelete?: boolean } | null;
+			expect(failure, "the writer reported no failure for a record that could not land").not.toBeNull();
+			expect(failure?.reason).toBeTruthy();
+			// macOS raises the file-size limit as EFBIG after filling to the limit and a plain full
+			// disk returns a short count; both say bytes landed, and a kernel that refuses the
+			// write must not claim it stored a partial record either.
+			expect(failure?.partialDelete, JSON.stringify({ landedShort, failure })).toBe(landedShort);
+		}
+
+		// The generator's own positive control: a 4 KiB write in the same child must not have
+		// landed whole, or there was no short write to detect. On macOS it must land short rather
+		// than not at all, which is the shape the byte-count guard exists for.
+		if (outcome.probe !== undefined) {
+			expect(outcome.probe.landed, JSON.stringify(outcome.probe)).toBeLessThan(outcome.probe.requested);
+			if (process.platform === "darwin") {
+				expect(outcome.probe.landed, JSON.stringify(outcome.probe)).toBeGreaterThan(0);
+			}
+		}
+
+		// Whatever is at the reference path is not a record.
 		expect(() => JSON.parse(onDisk)).toThrow();
-
-		const state = readKernelSnapshotGenerationState(artifact);
-		expect(state.swept).toEqual([]);
-		expect(state.unknown).toBe(true);
-		expect(existsSync(report.file)).toBe(true);
-		expect(planKernelSnapshotReclaim(artifact, { retention: 0 }).remove).toEqual([]);
+		if (onDisk.length > 0) {
+			// And the reader keeps it: unverifiable counts as a reference, makes the directory
+			// unknown, and takes the generation out of every reclaim.
+			addGeneration({ root, artifact, generations, references }, OLDER);
+			const state = readKernelSnapshotGenerationState(artifact);
+			expect(state.swept).toEqual([]);
+			expect(state.unknown).toBe(true);
+			expect(existsSync(holderPath)).toBe(true);
+			expect(planKernelSnapshotReclaim(artifact, { retention: 0 }).remove).toEqual([]);
+		}
 	});
 
 	it("sweeps a stale reference and claims nothing when the sweep is off (positive control)", () => {
