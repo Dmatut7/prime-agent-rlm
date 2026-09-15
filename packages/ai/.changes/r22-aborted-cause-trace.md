@@ -1,0 +1,1 @@
+- Kept a bounded trace of the abort cause for aborted assistant turns in the next request instead of dropping the whole turn, so the model can see that (and why) the previous turn was cut short; partial reasoning and incomplete tool calls are still stripped.

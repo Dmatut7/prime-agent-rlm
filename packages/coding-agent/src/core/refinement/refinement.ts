@@ -37,7 +37,8 @@ const DEFAULT_OVERVIEW_CONTENT_LIMIT = 180;
 /** The refiner's own view is wider than the injected face but still truncated. */
 const REFINER_OVERVIEW_ENTRY_LIMIT = 40;
 /** How to read entries the view had to drop, per session capability. */
-const KERNEL_FULL_LIST_HINT = "read them all with `rlm.get_harness_state()` (`global_=True` for global entries)";
+const KERNEL_FULL_LIST_HINT =
+	"read them all with `rlm.harness.overview(max_entries_per_kind=...)` (`global_=True` for global entries)";
 const HARNESS_STATE_FILE_HINT = "the full list stays in the harness state file";
 
 export type RefinementKind = "prompt" | "memory" | "skill" | "subagent";
@@ -97,7 +98,7 @@ export interface RefinementEdit {
 	idScope?: HarnessScope;
 }
 
-const SCOPE_PREFIX_PATTERN = /^(global|local):/;
+const SCOPE_PREFIX_PATTERN = /^\[?(global|local):/;
 
 export interface RefinementProposal {
 	summary: string;
@@ -1022,12 +1023,18 @@ function extractJsonObject(text: string): unknown {
 /**
  * Split an id the refiner copied from the overview, where every entry is shown
  * as `[global:foo]`. The bare id is what the stores are keyed by; the prefix is
- * routing information (M5).
+ * routing information (M5). The verbatim bracketed form (and clipped variants
+ * missing one bracket) is accepted too (MV-1): copying the displayed token is
+ * the natural move, and it used to fall back to "entry not found" or mint a
+ * literal `[global:foo]` id on create.
  */
 function stripScopePrefix(id: string): { id: string; scope?: HarnessScope } {
 	const match = SCOPE_PREFIX_PATTERN.exec(id);
 	if (!match) return { id };
-	return { id: id.slice(match[0].length), scope: match[1] as HarnessScope };
+	// A copied token may still carry the overview's closing bracket.
+	let bare = id.slice(match[0].length);
+	if (bare.endsWith("]")) bare = bare.slice(0, -1);
+	return { id: bare, scope: match[1] as HarnessScope };
 }
 
 /**

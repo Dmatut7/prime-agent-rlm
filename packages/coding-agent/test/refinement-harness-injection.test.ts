@@ -257,7 +257,9 @@ describe("which entries reach the prompt", () => {
 		const overflow = overflowLine(face, "memory") ?? "";
 		expect(overflow).toContain("- +3 more memory entries");
 		expect(overflow).toContain("9 recorded");
-		expect(overflow).toContain("rlm.get_harness_state()");
+		// MV-3: the hint must name an entry whose output renders readably in
+		// the REPL; get_harness_state() returns an object with an opaque repr.
+		expect(overflow).toContain("rlm.harness.overview(max_entries_per_kind=");
 	});
 
 	it("breaks ties by id so the same state renders the same text every turn", () => {
