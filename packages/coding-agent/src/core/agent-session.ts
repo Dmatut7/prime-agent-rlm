@@ -2941,7 +2941,7 @@ export class AgentSession {
 		// continuation; the re-arm must not queue a second one on top of it.
 		if (
 			this._actionStore
-				.unfinishedActions()
+				?.unfinishedActions()
 				.some(
 					(action) =>
 						action.payload.kind === "turn" &&
