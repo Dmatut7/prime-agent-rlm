@@ -330,4 +330,34 @@ describe("structured log entries", () => {
 		expect(serialized).toContain("Token [REDACTED]");
 		expect(serialized).toContain("https://proxy-account:[REDACTED]@upstream.example");
 	});
+
+	// --- K3X-2: a JSON-escaped newline glues its escape letter onto the next key name
+	// (\n + "session" reads as "nsession"), so the first key=value pair after a
+	// multiline value escaped the key rules. agent.jsonl is JSONL, so this is the
+	// native shape of any multiline value carrying a header or stack block.
+
+	test("redacts the key=value pair after a JSON-escaped newline", () => {
+		const line = JSON.stringify({ cookie: "a=1\nsession=leaked12345" });
+		const redacted = redactSecrets(line);
+		expect(redacted).not.toContain("leaked12345");
+		expect(redacted).toContain(`session=${REDACTED}`);
+		expect(() => JSON.parse(redacted)).not.toThrow();
+	});
+
+	test("redacts a credential pair after a JSON-escaped newline in an ordinary string", () => {
+		const line = JSON.stringify({ msg: "line1\npassword=hunter2hunter2\nline2" });
+		const redacted = redactSecrets(line);
+		expect(redacted).not.toContain("hunter2hunter2");
+		expect(redacted).toContain(`password=${REDACTED}`);
+		expect(() => JSON.parse(redacted)).not.toThrow();
+	});
+
+	test("a real newline keeps washing the same pair (positive control)", () => {
+		expect(redactSecrets("a=1\nsession=leaked12345")).toBe(`a=1\nsession=${REDACTED}`);
+	});
+
+	test("escaped newlines before ordinary prose stay untouched", () => {
+		const line = JSON.stringify({ msg: "line1\nlesson=learned12345\nend" });
+		expect(redactSecrets(line)).toBe(line);
+	});
 });

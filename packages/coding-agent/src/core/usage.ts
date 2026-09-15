@@ -44,6 +44,25 @@ export function addAssistantUsage(total: Usage, usage: Usage): void {
 	total.cost.total += usage.cost.total;
 }
 
+/**
+ * Move a total from a previously-added usage to a new one. Unlike add/subtract, the
+ * delta can be negative: the attribution path rewrites an assistant's usage to a new
+ * aggregate, and the fold that already counted the old value must follow the rewrite
+ * exactly rather than through the clamped subtraction.
+ */
+export function addUsageDelta(total: Usage, next: Usage, previous: Usage): void {
+	total.input += next.input - previous.input;
+	total.output += next.output - previous.output;
+	total.cacheRead += next.cacheRead - previous.cacheRead;
+	total.cacheWrite += next.cacheWrite - previous.cacheWrite;
+	total.totalTokens += next.totalTokens - previous.totalTokens;
+	total.cost.input += next.cost.input - previous.cost.input;
+	total.cost.output += next.cost.output - previous.cost.output;
+	total.cost.cacheRead += next.cost.cacheRead - previous.cost.cacheRead;
+	total.cost.cacheWrite += next.cost.cacheWrite - previous.cost.cacheWrite;
+	total.cost.total += next.cost.total - previous.cost.total;
+}
+
 /** Remove a previously added usage, clamping at zero to absorb attribution drift. */
 export function subtractAssistantUsage(total: Usage, usage: Usage): void {
 	total.input = Math.max(0, total.input - usage.input);

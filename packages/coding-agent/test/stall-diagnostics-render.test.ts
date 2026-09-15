@@ -78,3 +78,43 @@ describe("stall diagnostics rendering (DO-1b)", () => {
 		}
 	});
 });
+
+describe("cross-version stall events (K3X-1)", () => {
+	it("renders an event without a diagnostics payload instead of crashing", () => {
+		// A pre-DO-1 daemon emits the stall events without `diagnostics`; a new
+		// attach client must degrade the missing payload to an explicit unknown
+		// instead of throwing inside the event handler.
+		const legacyEvent = {
+			type: "stall_warning",
+			message: "Possible stall: no session activity for 61s while a turn is running.",
+			silentMs: 61_000,
+			thresholdMs: 60_000,
+		};
+		const lines = formatStallEventLines(legacyEvent);
+		expect(lines.length).toBeGreaterThan(1);
+		expect(lines[0]).toContain("Possible stall");
+		const text = lines.join("\n");
+		expect(text).toContain("unknown");
+		expect(text).toContain("stage: stall_warning");
+	});
+
+	it("marks a missing busy segment unknown while the rest still renders", () => {
+		// JSON round-trip drops the `busy: undefined` field exactly the way an
+		// older or partially-degraded producer would leave it off the wire.
+		const wireEvent = JSON.parse(
+			JSON.stringify({
+				type: "stall_abort",
+				message: "Turn aborted after stall.",
+				silentMs: 300_000,
+				thresholdMs: 300_000,
+				diagnostics: diagnostics({ busy: undefined }),
+			}),
+		);
+		const lines = formatStallEventLines(wireEvent);
+		const text = lines.join("\n");
+		expect(text).toContain("busy: unknown");
+		// Segments that did arrive still render.
+		expect(text).toContain("toolu_01ABC");
+		expect(text).toContain("epoch=7");
+	});
+});
