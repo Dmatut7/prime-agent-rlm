@@ -17,6 +17,7 @@ import {
 	DAEMON_SCHEMA_ID,
 	type DaemonRuntimeIdentity,
 } from "../modes/daemon/daemon-protocol.js";
+import { getDaemonRuntimeIdentity } from "../modes/daemon/daemon-runtime-identity.js";
 import { defaultDaemonSocketDir, defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
 import {
 	acquireDaemonShutdownAdmission,
@@ -25,7 +26,13 @@ import {
 } from "../modes/daemon/daemon-supervisor-ownership.js";
 import type { DaemonWorkerDescriptor } from "../modes/daemon/daemon-worker-protocol.js";
 import { signalProcessGroupOrProcess } from "../utils/child-process.js";
-import { formatDaemonListTable } from "./daemon-ps-format.js";
+import {
+	type ClientBuildIdentity,
+	describeBuildMismatch,
+	formatDaemonListTable,
+	formatShutdownNextSteps,
+	isVersionOnlyBuildId,
+} from "./daemon-ps-format.js";
 import { promptYesNo } from "./daemon-stop-confirm.js";
 import {
 	bindStopSelection,
@@ -957,7 +964,7 @@ export async function runPs(json: boolean, selection?: StopSelection): Promise<v
 		console.log("No background services found.");
 		return;
 	}
-	console.log(formatDaemonListTable(daemons));
+	console.log(formatDaemonListTable(daemons, currentClientBuildIdentity()));
 	// `status` is machine-wide, but the stop commands are not. Say which rows a
 	// plain `prime-agent shutdown` would actually touch, so the two views of the
 	// machine cannot disagree about what is next on the destroy list.
@@ -1002,8 +1009,32 @@ export function selectionExclusionReason(daemon: DaemonInfo, selection: StopSele
 	return undefined;
 }
 
+/**
+ * What this CLI can say about its own build, from the same identity the daemon
+ * handshake carries and the launch-side staleness check compares. A process
+ * that reports only `release-<version>` has no commit-level build id, and the
+ * user-facing copy says so instead of pretending a comparison.
+ */
+export function currentClientBuildIdentity(): ClientBuildIdentity {
+	const runtime = getDaemonRuntimeIdentity();
+	const executablePath = runtime.launcherPath ?? runtime.entrypointPath ?? runtime.executablePath;
+	const versionOnly = isVersionOnlyBuildId(runtime.buildId, VERSION);
+	return {
+		version: VERSION,
+		protocolVersion: DAEMON_PROTOCOL_VERSION,
+		schemaId: DAEMON_SCHEMA_ID,
+		...(versionOnly
+			? { buildIdUnavailableReason: `it reports only ${runtime.buildId}` }
+			: { buildId: runtime.buildId }),
+		...(executablePath === undefined ? {} : { executablePath }),
+	};
+}
+
 /** Name one discovered service for a confirmation prompt: path, pid, live sessions. */
-export function describeShutdownTarget(daemon: DaemonInfo): string {
+export function describeShutdownTarget(
+	daemon: DaemonInfo,
+	client: ClientBuildIdentity = currentClientBuildIdentity(),
+): string {
 	const sessions =
 		daemon.sessionCount === undefined
 			? "sessions unknown"
@@ -1011,7 +1042,7 @@ export function describeShutdownTarget(daemon: DaemonInfo): string {
 	const pid = daemon.pid === undefined ? "pid unknown" : `pid ${daemon.pid}`;
 	const flags = [
 		daemon.isDefault ? "default service" : undefined,
-		daemon.status === "outdated" ? `built ${daemon.version ?? "unknown"} (not this build)` : undefined,
+		daemon.status === "outdated" ? describeBuildMismatch(daemon, client) : undefined,
 		daemon.status === "stale" ? "not answering as any known build" : undefined,
 		daemon.status === "unreachable" ? "not answering" : undefined,
 		(daemon.liveWorkerCount ?? 0) > 0 ? `${daemon.liveWorkerCount} worker process(es)` : undefined,
@@ -1166,16 +1197,21 @@ export function formatShutdownReport(
 	selection: StopSelection,
 	selected: readonly DaemonInfo[],
 	excluded: readonly DaemonInfo[],
+	client: ClientBuildIdentity = currentClientBuildIdentity(),
 ): string {
+	const listed = [...selected, ...excluded];
 	const lines = [
 		`${selection.scope.kind === "machine" ? "WHOLE-MACHINE scope" : "Scoped"}: ${describeShutdownScope(selection.scope)}`,
 		`${selected.length} of ${selected.length + excluded.length} discovered service(s) will be stopped (${totalLiveSessions(selected)} live session(s) on them).`,
 	];
 	for (const daemon of selected) {
-		lines.push(`  stop  ${describeShutdownTarget(daemon)}`);
+		lines.push(`  stop  ${describeShutdownTarget(daemon, client)}`);
 	}
 	for (const daemon of excluded) {
-		lines.push(`  keep  ${describeShutdownTarget(daemon)}  (${selectionExclusionReason(daemon, selection)})`);
+		lines.push(`  keep  ${describeShutdownTarget(daemon, client)}  (${selectionExclusionReason(daemon, selection)})`);
+	}
+	if (listed.some((daemon) => daemon.status === "outdated" || daemon.status === "stale")) {
+		lines.push(formatShutdownNextSteps(client));
 	}
 	return lines.join("\n");
 }
