@@ -47,44 +47,78 @@ function isSnapshotTranscriptChunkFrame(value: unknown): value is SnapshotTransc
 	);
 }
 
+/**
+ * Memoizes the per-message JSON serialization of one session transcript.
+ *
+ * The worker serves every attached client from the same live message array, and
+ * each snapshot transfer (attach, replacement, catch-up) used to walk it with a
+ * fresh `JSON.stringify` per message — once per client. This cache holds the
+ * serialized strings for the exact message-object sequence it last encoded: an
+ * O(n) pointer comparison detects a hit, so a repeated transfer of an unchanged
+ * transcript costs no re-encoding. A miss (new, replaced or re-ordered message
+ * objects) re-encodes, which is exactly the pre-cache behavior. A session that
+ * mutates a message object in place while keeping the array identity would go
+ * stale, so callers must only use the cache while the session is not streaming.
+ */
+export class TranscriptMessageSerializationCache {
+	private entry?: { messages: AgentMessage[]; serialized: string[] };
+
+	serialize(messages: readonly AgentMessage[]): string[] {
+		const entry = this.entry;
+		if (
+			entry &&
+			entry.messages.length === messages.length &&
+			entry.messages.every((message, index) => message === messages[index])
+		) {
+			return entry.serialized;
+		}
+		const serialized = messages.map((message) => JSON.stringify(message));
+		this.entry = { messages: [...messages], serialized };
+		return serialized;
+	}
+}
+
 export function createSnapshotTranscriptChunks(options: {
 	activeSessionId: string;
 	snapshotId: string;
 	messages: readonly AgentMessage[];
+	/** Pre-serialized messages (e.g. from a {@link TranscriptMessageSerializationCache}); overrides per-message JSON.stringify. */
+	serializedMessages?: string[];
 	targetChunkBytes?: number;
 	signal?: AbortSignal;
 }): Iterable<Buffer> {
 	const messages = [...options.messages];
+	const preSerializedMessages = options.serializedMessages;
 	const targetChunkBytes = options.targetChunkBytes ?? SNAPSHOT_TARGET_CHUNK_BYTES;
 	return {
 		*[Symbol.iterator](): Iterator<Buffer> {
 			options.signal?.throwIfAborted();
-			let serializedMessages: string[] = [];
+			let chunkMessages: string[] = [];
 			let serializedBytes = 0;
 			let index = 0;
 			const flush = (): Buffer | undefined => {
-				if (serializedMessages.length === 0) {
+				if (chunkMessages.length === 0) {
 					return undefined;
 				}
 				const prefix =
 					`{"type":"session_snapshot_chunk","activeSessionId":${JSON.stringify(options.activeSessionId)},` +
 					`"snapshotId":${JSON.stringify(options.snapshotId)},"index":${index},"messages":[`;
-				const line = Buffer.from(`${prefix}${serializedMessages.join(",")}]}\n`);
-				serializedMessages = [];
+				const line = Buffer.from(`${prefix}${chunkMessages.join(",")}]}\n`);
+				chunkMessages = [];
 				serializedBytes = 0;
 				index++;
 				return line;
 			};
 
-			for (const message of messages) {
+			for (let messageIndex = 0; messageIndex < messages.length; messageIndex++) {
 				options.signal?.throwIfAborted();
-				const serialized = JSON.stringify(message);
-				const bytes = Buffer.byteLength(serialized) + (serializedMessages.length > 0 ? 1 : 0);
-				if (serializedMessages.length > 0 && serializedBytes + bytes > targetChunkBytes) {
+				const serialized = preSerializedMessages?.[messageIndex] ?? JSON.stringify(messages[messageIndex]!);
+				const bytes = Buffer.byteLength(serialized) + (chunkMessages.length > 0 ? 1 : 0);
+				if (chunkMessages.length > 0 && serializedBytes + bytes > targetChunkBytes) {
 					const chunk = flush();
 					if (chunk) yield chunk;
 				}
-				serializedMessages.push(serialized);
+				chunkMessages.push(serialized);
 				serializedBytes += bytes;
 			}
 			options.signal?.throwIfAborted();

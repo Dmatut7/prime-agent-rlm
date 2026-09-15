@@ -12,6 +12,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync 
 import { stat } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { type Api, getLogger, type Model } from "@earendil-works/pi-ai";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import {
@@ -249,6 +250,7 @@ import {
 	createSnapshotTranscriptChunks,
 	SNAPSHOT_TARGET_CHUNK_BYTES,
 	type SnapshotTranscriptChunkSource,
+	TranscriptMessageSerializationCache,
 } from "./snapshot-transcript-cache.js";
 import {
 	connectProbeSupervisor,
@@ -545,6 +547,7 @@ export class AgentDaemon {
 	private socketIdentity?: DaemonSocketIdentity;
 	private readonly clients = new Set<DaemonSocketClient>();
 	private readonly sessions = new Map<string, ActiveSessionState>();
+	private readonly transcriptSerializationCaches = new Map<string, TranscriptMessageSerializationCache>();
 	private readonly openingSessions = new Map<string, Promise<ActiveSessionState>>();
 	/** Covers path resolution through publication in openingSessions, before the runtime promise exists. */
 	private readonly reservingSessionOpens = new Map<string, Promise<void>>();
@@ -1455,6 +1458,25 @@ export class AgentDaemon {
 			seenChildIds.add(passive.entry.childId);
 		}
 		return snapshots;
+	}
+
+	/**
+	 * Serialized transcript messages shared by every snapshot transfer of one
+	 * session. Returns undefined while a stream is in flight: the live partial
+	 * message mutates in place under the same array identity, so a cached
+	 * encoding could go stale; such a transfer re-encodes instead (the
+	 * pre-cache behavior).
+	 */
+	private serializedTranscriptFor(state: ActiveSessionState, messages: readonly AgentMessage[]): string[] | undefined {
+		if (state.runtime.session?.isStreaming === true) {
+			return undefined;
+		}
+		let cache = this.transcriptSerializationCaches.get(state.activeSessionId);
+		if (!cache) {
+			cache = new TranscriptMessageSerializationCache();
+			this.transcriptSerializationCaches.set(state.activeSessionId, cache);
+		}
+		return cache.serialize(messages);
 	}
 
 	/**
@@ -4153,6 +4175,7 @@ export class AgentDaemon {
 							activeSessionId: state.activeSessionId,
 							snapshotId,
 							messages: result.snapshot.messages,
+							serializedMessages: this.serializedTranscriptFor(state, result.snapshot.messages),
 							targetChunkBytes: SNAPSHOT_TARGET_CHUNK_BYTES,
 							signal: snapshotSignal,
 						});
@@ -6895,6 +6918,7 @@ export class AgentDaemon {
 		}
 		state.clients.clear();
 		this.acpMcpOwners.delete(state.activeSessionId);
+		this.transcriptSerializationCaches.delete(state.activeSessionId);
 		this.sessions.delete(state.activeSessionId);
 		// Archived top-level sessions leave the worker's list; subagent rows mirror the registry and stay.
 		if (!keepsResumeEntry && state.runtime.metadata.kind !== "subagent" && this.options.worker) {
@@ -7050,6 +7074,7 @@ export class AgentDaemon {
 			activeSessionId: state.activeSessionId,
 			snapshotId,
 			messages: result.snapshot.messages,
+			serializedMessages: this.serializedTranscriptFor(state, result.snapshot.messages),
 			targetChunkBytes: SNAPSHOT_TARGET_CHUNK_BYTES,
 			signal: snapshotSignal,
 		});
@@ -7501,6 +7526,7 @@ export class AgentDaemon {
 							activeSessionId,
 							snapshotId,
 							messages: result.snapshot.messages,
+							serializedMessages: this.serializedTranscriptFor(state, result.snapshot.messages),
 							targetChunkBytes: SNAPSHOT_TARGET_CHUNK_BYTES,
 							signal: snapshotSignal,
 						});
