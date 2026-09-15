@@ -34,14 +34,16 @@ if [ -n "$DIRTY" ]; then
 fi
 
 echo "== 3/4 merge (no commit yet) =="
-git merge --no-commit --no-ff "$BR"
-if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
-  echo "   CONFLICTS: resolve by hand, then re-run. Files:"
+BR_TIP=$(git rev-parse "$BR")
+if ! git merge --no-commit --no-ff "$BR"; then
+  echo "   CONFLICTS: resolve by hand in the tree, then: git commit -m ... (this gate
+   cannot re-verify once a merge is in progress; re-run it before any future merge)."
   git diff --name-only --diff-filter=U | sed 's/^/     /'
   exit 1
 fi
 
 echo "== 4/4 nothing from main was swallowed =="
+echo "   anchor: HEAD=$HEAD_SHA base=$BASE branch=$BR_TIP"
 LOST=0
 for f in $(git diff --name-only "$BASE" "$HEAD_SHA"); do
   b=$(git rev-parse "$BASE:$f" 2>/dev/null || true)
