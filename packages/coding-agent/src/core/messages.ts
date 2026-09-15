@@ -14,7 +14,7 @@ import { isSessionSlashCommandName, parseSessionSlashCommand, type SessionSlashC
 
 export type { RlmChildFailureKind };
 
-export const COMPACTION_SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary:
+export const COMPACTION_SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary. Compaction is lossy: this summary may be incomplete, and content the compacted history carried can be missing from it. Treat the machine-generated blocks it carries (file lists, fact appendix, user requests), the persisted session state and other persistent records as authoritative for exact constraints and values, and re-check anything load-bearing that only this summary's narrative states.
 
 <summary>
 `;
