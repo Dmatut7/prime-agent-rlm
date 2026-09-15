@@ -1,0 +1,5 @@
+- Fixed the Codex SSE parser to flush a trailing event frame and to fail streams that never deliver a terminal response event, so truncated or failed responses no longer end as successful empty turns.
+- Fixed the Codex SSE parser to accept CRLF line terminators, so CRLF-framed streams parse instead of returning empty responses.
+- Fixed the OpenAI Responses event dispatcher to route item-scoped events by item_id/output_index, so interleaved tool calls keep their own arguments and reasoning deltas are not dropped.
+- Fixed the OpenAI Responses stream to recover text, refusal, and reasoning-summary deltas that arrive without their part-added events, and to record diagnostics for deltas that cannot be routed.
+- Fixed the Anthropic SSE guard to fail streams that delivered data frames but never reached message_stop, and to record a diagnostic for frames missing their event line.
