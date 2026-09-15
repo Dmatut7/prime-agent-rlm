@@ -1,0 +1,2 @@
+- Fixed the session-list usage scan to fold child-usage attributions that appear before the assistant line they annotate, so imported or reordered transcripts report the same own spend as /usage.
+- Fixed session forks to re-link the leaf-position marker when its target git_state entry is dropped, keeping the fork's resume position on the recorded rollback point.

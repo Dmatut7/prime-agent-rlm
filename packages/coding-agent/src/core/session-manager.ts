@@ -1482,8 +1482,15 @@ interface SessionScanState {
 	reachedBytes: number;
 	/** Newest-wins per entry id (#2003): a later attribution overwrites the target's usage. */
 	assistantUsageById: Map<string, Usage>;
-	/** Grow-only: one push per child_usage_attributed entry whose target was already seen. */
+	/** Grow-only: one push per child_usage_attributed entry once its target has been seen. */
 	attributedChildUsages: Usage[];
+	/**
+	 * Attributions read before the assistant line they annotate, in file order:
+	 * an imported or hand-reordered transcript can invert the writer's order. Held
+	 * until the target line arrives so the one-pass scan folds them exactly like
+	 * the loader's order-insensitive two-pass fold instead of dropping them.
+	 */
+	pendingAttributions: ChildUsageAttributionEntry[];
 	/** Grow-only: one push per compaction / branch_summary entry that carries usage. */
 	summarizationUsages: Usage[];
 }
@@ -1650,6 +1657,7 @@ async function scanSessionInfo(
 		// otherwise push the same usage twice.
 		const assistantUsageById = new Map(resume?.assistantUsageById);
 		const attributedChildUsages: Usage[] = resume ? [...resume.attributedChildUsages] : [];
+		const pendingAttributions = resume ? [...resume.pendingAttributions] : [];
 		const summarizationUsages: Usage[] = resume ? [...resume.summarizationUsages] : [];
 
 		let lineCount = 0;
@@ -1726,6 +1734,11 @@ async function scanSessionInfo(
 				if (assistantUsageById.has(attribution.targetId)) {
 					assistantUsageById.set(attribution.targetId, attribution.aggregateUsage);
 					attributedChildUsages.push(attribution.childUsage);
+				} else {
+					// Target not seen yet: hold the attribution and fold it when the
+					// target line arrives, so this scan and the loader agree on files
+					// whose lines are not in writer order.
+					pendingAttributions.push(attribution);
 				}
 			}
 			if (entry.type === "compaction" || entry.type === "branch_summary") {
@@ -1750,6 +1763,18 @@ async function scanSessionInfo(
 			const message = (entry as SessionMessageEntry).message;
 			if (message.role === "assistant" && (message as { usage?: Usage }).usage) {
 				assistantUsageById.set(entry.id, (message as { usage: Usage }).usage);
+				// Attributions read before this line fold now, in file order, so
+				// newest-wins matches the loader for inverted-order transcripts too.
+				for (let i = 0; i < pendingAttributions.length; ) {
+					const attribution = pendingAttributions[i];
+					if (attribution.targetId !== entry.id) {
+						i++;
+						continue;
+					}
+					pendingAttributions.splice(i, 1);
+					assistantUsageById.set(entry.id, attribution.aggregateUsage);
+					attributedChildUsages.push(attribution.childUsage);
+				}
 			}
 			if (!isMessageWithContent(message)) continue;
 			if (message.role !== "user" && message.role !== "assistant") continue;
@@ -1809,6 +1834,7 @@ async function scanSessionInfo(
 				reachedBytes,
 				assistantUsageById,
 				attributedChildUsages,
+				pendingAttributions,
 				summarizationUsages,
 			},
 		};
@@ -3264,6 +3290,20 @@ export class SessionManager {
 		for (const entry of sourceEntries) {
 			if (entry.type === "session" || entry.type === "git_state") continue;
 			const parentId = liveParent(entry.parentId);
+			if (entry.type === "leaf_position") {
+				// The marker's targetId must follow the same re-linking as parentId:
+				// left as-is it points at the removed git_state, a marker that
+				// contradicts itself (parentId !== targetId) and _buildIndex
+				// silently falls back to the last-line rule, drifting the fork's
+				// resume position away from the source's recorded rollback point.
+				const targetId = entry.targetId === null ? null : liveParent(entry.targetId);
+				if (parentId === entry.parentId && targetId === entry.targetId) {
+					forkedEntries.push(entry);
+				} else {
+					forkedEntries.push({ ...entry, parentId, targetId });
+				}
+				continue;
+			}
 			const out = parentId === entry.parentId ? entry : { ...entry, parentId };
 			forkedEntries.push(out);
 		}

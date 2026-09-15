@@ -11,7 +11,14 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { readSessionInfo, type SessionHeader, type SessionInfo } from "../src/core/session-manager.js";
+import { computeOwnAndTotalUsage } from "../src/core/context-tree.js";
+import {
+	loadEntriesFromFile,
+	readSessionInfo,
+	type SessionHeader,
+	type SessionInfo,
+} from "../src/core/session-manager.js";
+import { sessionUsageSummaryFrom } from "../src/core/usage.js";
 
 let dir: string;
 let counter = 0;
@@ -232,6 +239,63 @@ describe("readSessionInfo incremental rescan", () => {
 		// subtracted back out, so own spend stays 110/25/110 plus the compaction — the fold is
 		// value-neutral on the tokens it accounts for, and drops cacheRead/cacheWrite by one each.
 		expect(info?.usage).toEqual({ inputTokens: 113, outputTokens: 25, cost: 110 });
+	});
+
+	/**
+	 * An imported or hand-reordered transcript can place child_usage_attributed
+	 * lines before the assistant line they annotate — the writer never produces
+	 * this order, but the loader folds it anyway (two passes over the file), and
+	 * the writer's whole-file rewrite leaves the assistant line carrying the
+	 * aggregate usage. That combination is where a one-pass scan that silently
+	 * drops the early attributions counts the child spend as own spend: the
+	 * session list would report a different number than /usage and /context for
+	 * the same bytes. The scan must fold inverted-order attributions too.
+	 */
+	it("folds attributions that precede their target like the loader does", async () => {
+		const path = join(dir, "inverted-attribution.jsonl");
+		const assistantId = `entry-${++counter}`;
+		// Post-rewrite disk form: the assistant line carries the aggregate usage
+		// (100/16 own + 30/4 child1 + 7/4 child2), not the original turn.
+		const assistantLine = {
+			type: "message",
+			id: assistantId,
+			parentId: null,
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "answer" }],
+				timestamp: 2000,
+				usage: usageLine(137, 30),
+			},
+		};
+		const attributionLine = (id: string, child: number, aggregate: number) =>
+			`${JSON.stringify({
+				type: "child_usage_attributed",
+				id,
+				parentId: null,
+				targetId: assistantId,
+				childUsage: usageLine(child, 4),
+				aggregateUsage: usageLine(aggregate, 24),
+			})}
+`;
+		writeFileSync(
+			path,
+			`${headerLine()}${attributionLine(`entry-${++counter}`, 30, 130)}${attributionLine(`entry-${++counter}`, 7, 137)}${JSON.stringify(assistantLine)}
+`,
+			"utf8",
+		);
+
+		// Fold side: the loader applies the attributions regardless of line order,
+		// then the context-tree basis subtracts the child spend back out.
+		const entries = loadEntriesFromFile(path).filter((e) => e.type !== "session");
+		expect(entries.length).toBe(3);
+		const { ownUsage } = computeOwnAndTotalUsage(entries, entries);
+		// Non-zero fixture: sessionUsageSummaryFrom() returns undefined for
+		// all-zero totals, which would make the comparison pass vacuously.
+		expect(ownUsage.cost.total).toBe(100);
+
+		const info = await readSessionInfo(path);
+		expect(info?.usage).toEqual(sessionUsageSummaryFrom(ownUsage));
+		expect(info?.usage).toEqual({ inputTokens: 100, outputTokens: 16, cost: 100 });
 	});
 
 	/**
