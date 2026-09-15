@@ -17,7 +17,7 @@ import { assertSessionCwdExists } from "./session-cwd.js";
 import { copyImportedSession, resolveImportDestination } from "./session-import-destination.js";
 import { SessionImportFileNotFoundError } from "./session-import-errors.js";
 import { acquireSessionLease, canonicalSessionPath, type SessionLease } from "./session-lease.js";
-import { SessionManager } from "./session-manager.js";
+import { repairOwnedSessionFile, SessionManager } from "./session-manager.js";
 import { resolveCompleteToolPairLeaf } from "./session-tool-pair.js";
 
 export { SessionImportFileNotFoundError } from "./session-import-errors.js";
@@ -505,6 +505,10 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		const lease = this.acquireReplacementLease(sessionPath);
 		let sessionManager: SessionManager;
 		try {
+			// This replacement takes over the write side of the file, so repair a
+			// crash-torn tail before the open: the next append would otherwise glue
+			// itself onto the torn line and both records would stop parsing.
+			repairOwnedSessionFile(sessionPath);
 			sessionManager = SessionManager.open(sessionPath, undefined, options?.cwdOverride);
 			assertSessionCwdExists(sessionManager, this.cwd);
 		} catch (error) {
@@ -654,11 +658,16 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 				return { cancelled: false, selectedText };
 			}
 
+			// The source file is this runtime's live session: repairing its torn tail
+			// before the re-open keeps the fork from silently missing the torn record
+			// (and keeps the runtime's own next append from gluing onto it).
+			repairOwnedSessionFile(currentSessionFile);
 			const sourceManager = SessionManager.open(currentSessionFile, sessionDir);
 			const forkedSessionPath = sourceManager.createBranchedSession(targetLeafId);
 			if (!forkedSessionPath) {
 				throw new Error("Failed to create forked session");
 			}
+			repairOwnedSessionFile(forkedSessionPath);
 			const sessionManager = SessionManager.open(forkedSessionPath, sessionDir);
 			const lease = this.acquireReplacementLease(sessionManager.getSessionFile());
 			const rollback = await this.teardownForReplacement("fork", sessionManager.getSessionFile(), lease);
@@ -763,6 +772,9 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 				});
 			}
 
+			// A copied import can carry a torn tail from its source file; repair it
+			// before the open so the runtime's first append does not glue onto it.
+			repairOwnedSessionFile(destinationPath);
 			sessionManager = SessionManager.open(destinationPath, sessionDir, cwdOverride);
 			assertSessionCwdExists(sessionManager, this.cwd);
 		} catch (error) {

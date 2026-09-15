@@ -23,7 +23,7 @@ import {
 import { registerBuiltinMcpOAuthProviders } from "@earendil-works/pi-ai/mcp";
 import { registerOAuthProvider, resetOAuthProviders } from "@earendil-works/pi-ai/oauth";
 import { spawn } from "child_process";
-import { existsSync, readFileSync, renameSync, writeFileSync } from "fs";
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { type Static, type TProperties, Type } from "typebox";
 import { Compile, type Validator } from "typebox/compile";
@@ -1113,7 +1113,15 @@ export class ModelRegistry {
 		}
 		try {
 			const tmpPath = `${cachePath}.${process.pid}.tmp`;
-			writeFileSync(tmpPath, JSON.stringify({ ...cache, modelIds: [...cache.modelIds] }), { mode: 0o600 });
+			// fsync before the rename (writePrivateFileAtomic precedent) so a power
+			// loss cannot resurrect the stale cache from an unflushed page cache.
+			const descriptor = openSync(tmpPath, "w", 0o600);
+			try {
+				writeFileSync(descriptor, JSON.stringify({ ...cache, modelIds: [...cache.modelIds] }));
+				fsyncSync(descriptor);
+			} finally {
+				closeSync(descriptor);
+			}
 			renameSync(tmpPath, cachePath);
 		} catch {
 			// A failed cache write only requires a later refetch.

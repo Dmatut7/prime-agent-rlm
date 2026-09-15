@@ -259,6 +259,7 @@ import {
 	SUPERVISOR_PROBE_TIMEOUT_MS,
 	type SupervisorAvailabilityState,
 } from "./supervisor-availability.js";
+import { writeUpdateRestartManifestFile } from "./update-restart-manifest.js";
 import { WorkerRecoveryJournal } from "./worker-recovery-journal.js";
 
 /**
@@ -4295,6 +4296,9 @@ export class AgentDaemon {
 								undefined,
 								true,
 							);
+							// Same torn-tail rule as the catalog rename path: repair before
+							// appending, or the session_info line glues onto a torn tail.
+							repairOwnedSessionFile(command.sessionPath);
 							SessionManager.open(command.sessionPath).appendSessionInfo(name);
 							await this.rlmSpawnLedger()
 								.appendRenameByChildPath(command.sessionPath, name)
@@ -6511,8 +6515,7 @@ export class AgentDaemon {
 
 	private writeUpdateRestartManifest(manifest: DaemonUpdateRestartManifest): void {
 		const path = getDaemonUpdateRestartManifestPath(this.socketPath, this.agentDir);
-		mkdirSync(dirname(path), { recursive: true });
-		writeFileSync(path, `${JSON.stringify(manifest)}\n`);
+		writeUpdateRestartManifestFile(path, manifest);
 	}
 
 	private getUpdateRestartSessionDepth(state: ActiveSessionState): number {

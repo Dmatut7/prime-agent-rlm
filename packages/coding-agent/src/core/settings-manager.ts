@@ -1,7 +1,10 @@
 import type { ServiceTier, Transport } from "@earendil-works/pi-ai";
 import {
+	closeSync,
 	existsSync,
+	fsyncSync,
 	mkdirSync,
+	openSync,
 	readFileSync,
 	renameSync,
 	statSync,
@@ -911,7 +914,16 @@ export class FileSettingsStorage implements SettingsStorage {
 				}
 				const temporaryPath = `${path}.${process.pid}.${Date.now()}.tmp`;
 				try {
-					writeFileSync(temporaryPath, next, { encoding: "utf-8", mode: 0o600 });
+					// fsync before the rename (writePrivateFileAtomic precedent): a
+					// power loss right after renameSync must not resurrect the old
+					// settings bytes from an unflushed page cache.
+					const descriptor = openSync(temporaryPath, "w", 0o600);
+					try {
+						writeFileSync(descriptor, next, "utf-8");
+						fsyncSync(descriptor);
+					} finally {
+						closeSync(descriptor);
+					}
 					renameSync(temporaryPath, path);
 				} finally {
 					if (existsSync(temporaryPath)) unlinkSync(temporaryPath);

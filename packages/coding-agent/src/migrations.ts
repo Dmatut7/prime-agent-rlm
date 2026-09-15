@@ -621,6 +621,48 @@ export async function showDeprecationWarnings(warnings: string[]): Promise<void>
 }
 
 /**
+ * Sweep the sessions directory for the atomic writer's crash leftovers.
+ *
+ * `writePrivateFileAtomic`/`writePrivateFileAtomicLines` write their temp file
+ * (`.<name>.<pid>.<uuid>.tmp`) into the target's own directory and remove it in a
+ * `finally` that only runs while the process is alive: a SIGKILL mid-write leaves the
+ * temp behind forever, and in the sessions directory one temp can hold an entire
+ * transcript. The auth store (legacy-auth-files.ts) and the orphan journal already
+ * sweep their crash leftovers at startup; this is the same pass for the sessions
+ * directory. Only temps old enough that no live writer can still own one are removed -
+ * a young temp may be an in-flight write by a concurrent session process.
+ *
+ * @returns Number of stale temps removed.
+ */
+export function sweepStaleSessionDirTemps(agentDir: string = getAgentDir()): number {
+	const sessionsDir = getSessionsDir(agentDir);
+	const cutoff = Date.now() - STALE_SESSION_TEMP_MAX_AGE_MS;
+	let names: string[];
+	try {
+		names = readdirSync(sessionsDir);
+	} catch {
+		return 0;
+	}
+	let removed = 0;
+	for (const name of names) {
+		// The writer's temp family: a dot-prefixed name ending in ".tmp". Session
+		// transcripts and legacy dirs never match, so user-visible files are safe.
+		if (!name.startsWith(".") || !name.endsWith(".tmp")) continue;
+		const tempPath = join(sessionsDir, name);
+		try {
+			if (statSync(tempPath).mtimeMs >= cutoff) continue;
+			rmSync(tempPath, { force: true });
+			removed++;
+		} catch {
+			// A temp that vanished or turned unreadable mid-sweep is already gone.
+		}
+	}
+	return removed;
+}
+
+const STALE_SESSION_TEMP_MAX_AGE_MS = 60_000;
+
+/**
  * Run all migrations. Called once on startup.
  *
  * @returns Object with migration results and deprecation warnings
@@ -632,6 +674,7 @@ export function runMigrations(cwd: string): {
 	const migratedAuthProviders = migrateAuthToAuthJson();
 	migrateSessionsFromAgentRoot();
 	migrateLegacySessionDirsToSessionRoot();
+	sweepStaleSessionDirTemps();
 	migrateToolsToBin();
 	migrateKeybindingsConfigFile();
 	const deprecationWarnings = migrateExtensionSystem(cwd);
