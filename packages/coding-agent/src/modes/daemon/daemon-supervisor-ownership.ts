@@ -583,6 +583,42 @@ export async function findLiveDaemonOwnersForAgentDir(
 	return summaries.sort((left, right) => right.createdAt.localeCompare(left.createdAt) || left.pid - right.pid);
 }
 
+/** A supervisor owner record reduced to the identity a stop command must check before signalling. */
+export interface RecordedDaemonSocketOwner {
+	socketPath: string;
+	pid: number;
+	processStartId?: string;
+}
+
+/**
+ * Every supervisor owner record on this machine: the daemon sockets some daemon
+ * on this box is accountable for, in the current registry and in the read-only
+ * legacy one.
+ *
+ * Read-only and lock-free for the same reason `findLiveDaemonOwnersForAgentDir`
+ * is: a stop command is a reader here and must never take the writer's guard, and
+ * a record is written rename-atomically so a torn read is impossible. No judge of
+ * liveness is made here — the caller checks the identity against the process it
+ * is about to signal.
+ */
+export function readRecordedDaemonSocketOwners(
+	environment: NodeJS.ProcessEnv = process.env,
+): RecordedDaemonSocketOwner[] {
+	const registryDir = defaultDaemonSupervisorRegistryDir(environment);
+	const legacyRegistryDir = legacyDaemonSupervisorRegistryDir(environment);
+	const owners: RecordedDaemonSocketOwner[] = [];
+	for (const directory of [registryDir, ...(legacyRegistryDir ? [legacyRegistryDir] : [])]) {
+		for (const record of readOwnerRecordsIn(directory)) {
+			owners.push({
+				socketPath: normalizeSocketPath(record.socketPath),
+				pid: record.pid,
+				...(record.processStartId ? { processStartId: record.processStartId } : {}),
+			});
+		}
+	}
+	return owners;
+}
+
 function readOwnerRecordsIn(registryDir: string): DaemonSupervisorOwnerRecord[] {
 	try {
 		return listOwnerDirectories(registryDir).flatMap((ownerDirectory) => {
