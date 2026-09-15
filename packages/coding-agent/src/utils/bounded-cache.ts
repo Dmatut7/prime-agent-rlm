@@ -74,7 +74,16 @@ export class BoundedCache<V> {
 
 	set(key: string, value: V): void {
 		const now = Date.now();
-		this.records.delete(key);
+		// Overwriting a key drops the record it replaces, so its bytes leave the account first.
+		// Both consumers refresh the same key on their hot path (a watched file is rewritten on
+		// every heartbeat), and bytes that no record owns are bytes no eviction can reclaim: they
+		// would accumulate to the ceiling, empty the cache, and leave it refusing every write for
+		// the rest of the process's life.
+		const replaced = this.records.get(key);
+		if (replaced !== undefined) {
+			this.bytes = Math.max(0, this.bytes - replaced.bytes);
+			this.records.delete(key);
+		}
 		const bytes = this.options.estimateBytes(value, key) + key.length;
 		if (bytes > this.options.maxBytes) {
 			// Caching it would break the ceiling by itself and evict the whole working

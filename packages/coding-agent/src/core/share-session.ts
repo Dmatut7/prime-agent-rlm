@@ -70,6 +70,44 @@ interface ShareSecretOccurrence {
 	length: number;
 }
 
+/** Shortest value whose base64 form is distinctive enough to compare against. */
+const MIN_BASE64_COMPARISON_LENGTH = 8;
+
+/**
+ * Every form one configured value can be written in. Exact comparison is the check that "no
+ * unknown shape slips past", so comparing only the raw form gives the same secret a free pass
+ * the moment it is escaped: `tok+/=abc` pasted into a URL query is `tok%2B%2F%3Dabc`,
+ * and an `Authorization: Bearer`-style token is often carried base64. Each form is compared as a
+ * substring of the original bytes, so a hit is also removable at the offset it was found at.
+ *
+ * Percent forms are only built when the value actually has a character worth escaping: for an
+ * alphanumeric value they would be the value itself and every form would cost a scan of the
+ * whole upload for nothing.
+ */
+function secretComparisonForms(value: string): string[] {
+	const forms = [value];
+	if (value.length === 0) return forms;
+	const push = (form: string): void => {
+		if (form.length > 0 && !forms.includes(form)) forms.push(form);
+	};
+	const percentEncoded = encodeURIComponent(value);
+	if (percentEncoded !== value) {
+		push(percentEncoded);
+		// Hand-written and non-JS encoders emit lower-case hex.
+		push(percentEncoded.replace(/%[0-9A-F]{2}/g, (hex) => hex.toLowerCase()));
+		// Every character escaped (`%74%6F%6B…`), which is what some log scrubbers and URL
+		// canonicalizers produce.
+		const fullyEncoded = [...value].map((char) => encodeURIComponent(char)).join("");
+		push(fullyEncoded);
+		push(fullyEncoded.replace(/%[0-9A-F]{2}/g, (hex) => hex.toLowerCase()));
+	}
+	if (value.length >= MIN_BASE64_COMPARISON_LENGTH) {
+		push(Buffer.from(value, "utf8").toString("base64"));
+		push(Buffer.from(value, "utf8").toString("base64url"));
+	}
+	return forms;
+}
+
 interface ShareSecretScan {
 	findings: ShareSecretFinding[];
 	/**
@@ -130,22 +168,25 @@ function scanShareSecretViews(views: readonly ShareScanView[], options?: ShareSe
 		// bytes a shape detector recognizes are still reported by that detector.
 		if (secret.compareOnly === true) continue;
 		let reported = false;
-		for (const view of views) {
-			let index = view.text.indexOf(secret.value);
-			while (index >= 0) {
-				// A credential the session is configured with is removed at every offset; the
-				// warning still names it once, which is what `reported` holds.
-				occurrences.push({ offset: index, length: secret.value.length });
-				if (!reported) {
-					record(
-						view,
-						"Configured credential",
-						{ value: secret.value, index, name: secret.source },
-						secret.source,
-					);
-					reported = true;
+		// Every form of the value is compared in every view, raw and encoded. The warning names
+		// the value once (masked from the value itself, not from the form it was found in), while
+		// the occurrences are what removal walks: a secret present in two encodings is two spans.
+		for (const form of secretComparisonForms(secret.value)) {
+			for (const view of views) {
+				let index = view.text.indexOf(form);
+				while (index >= 0) {
+					occurrences.push({ offset: index, length: form.length });
+					if (!reported) {
+						record(
+							view,
+							"Configured credential",
+							{ value: secret.value, index, name: secret.source },
+							secret.source,
+						);
+						reported = true;
+					}
+					index = view.text.indexOf(form, index + form.length);
 				}
-				index = view.text.indexOf(secret.value, index + secret.value.length);
 			}
 		}
 	}
