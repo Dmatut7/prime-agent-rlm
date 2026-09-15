@@ -20,15 +20,47 @@ export const REDACTED = "[REDACTED]";
 /** Minimum length for an exactly-known secret to be replaced as a literal. */
 const MIN_KNOWN_SECRET_LENGTH = 6;
 
+/** `REDACTED` without its closing bracket: what a value class that stops at `]` leaves behind. */
+const REDACTED_HEAD = REDACTED.slice(0, -1);
+
 /**
  * Key names whose value is a credential. Matched as `key: value` / `key=value`, with
- * an optional JSON quote and an optional `Bearer` prefix consumed from the value.
+ * an optional JSON quote and an optional `Bearer`/`Basic`/`Token` prefix consumed from
+ * the value. A value that already starts with the placeholder is left alone by the
+ * callback below, so a text that went through redaction once is not rewritten again.
  */
 const CREDENTIAL_KEY_VALUE =
 	/\b(authorization|proxy-authorization|api[-_]?key|x-api[-_]?key|apikey|auth[-_]?token|access[-_]?token|refresh[-_]?token|id[-_]?token|session[-_]?token|client[-_]?secret|consumer[-_]?secret|secret[-_]?key|secret|password|passwd|pass|token|bearer|credential)\b("?\s*[:=]\s*"?)((?:bearer|basic|token)\s+)?([^\s"'`,;)\]}&\\]+)/gi;
 
-/** `Bearer <token>` anywhere, including inside a value the key pattern did not reach. */
+/**
+ * `Bearer <token>` anywhere, including inside a value the key pattern did not reach.
+ * Bearer keeps its original `{6,}` threshold; the other schemes go through
+ * AUTH_SCHEME_VALUE below, which is stricter so prose like "basic information" survives.
+ */
 const BEARER_VALUE = /\b(bearer\s+)([A-Za-z0-9._~+/=-]{6,})/gi;
+
+/**
+ * Authentication schemes other than `Bearer` that hand the credential over verbatim, and
+ * the value that follows them. Covers custom header values the key table cannot name,
+ * e.g. `"X-Custom-Auth": "Token 40b7..."` or `Proxy-Auth: Basic dXNl...`.
+ */
+const AUTH_SCHEME_VALUE =
+	/\b((?:basic|token|digest|hoba|gnut|ntlm|negotiate|mta|oauth|aws4-hmac-sha256|steamlake|gn2-gn-none)\s+)([A-Za-z0-9._~+/=-]{6,})/gi;
+
+/**
+ * A value behind a scheme name other than `Bearer` is only credential material when it is
+ * not an ordinary word: it must carry a digit or a separator symbol, or be at least this
+ * long. Sixteen sits above every English word that turns up next to these scheme names in
+ * a provider error ("information" is 11, "authentication" is 14) and below any real token.
+ */
+const CREDENTIAL_LENGTH = 16;
+
+/** Digits and separators: absent from a prose word, everywhere in an encoded credential. */
+const CREDENTIAL_SYMBOL = /[0-9._~+/=-]/;
+
+function isCredentialRun(value: string): boolean {
+	return value.length >= CREDENTIAL_LENGTH || CREDENTIAL_SYMBOL.test(value);
+}
 
 /** Known credential prefixes: the shapes a key keeps when nothing names it. */
 const CREDENTIAL_SHAPES =
@@ -37,15 +69,82 @@ const CREDENTIAL_SHAPES =
 /** JWTs: three base64url segments, which is how an OAuth access token looks. */
 const JSON_WEB_TOKEN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
 
-/** `scheme://user:password@host` - the credential is the userinfo, the host is the diagnosis. */
-const URL_USERINFO = /\b([a-z][a-z0-9+.-]*:\/\/)([^/@\s]{1,256})@/gi;
+/**
+ * Cookie names that carry a session or a credential. Matched as one `.`/`-`/`_`-separated
+ * segment of a cookie name, case-insensitively, so `__Secure-session_id` and `JSESSIONID`
+ * hit while `author`, `consider`, `consent` or `passbook` do not.
+ */
+const COOKIE_SECRET_NAME =
+	/(?:^|[^A-Za-z0-9])(?:session|sessions|sess|sid|jsessionid|phpsessid|asp[._]net[._]sessionid|connect[._]sid|auth|authz|authorization|authentication|token|jwt|ticket|secret|secrets|credential|credentials|password|passwd|pwd|pass|login|apikey|api_key|access_key|csrf|xsrf|nonce|signature|sig)(?:$|[^A-Za-z0-9])/i;
+
+/**
+ * A `Cookie` / `Set-Cookie` header and its value: `Cookie: a=1; b=2` in a plain header
+ * dump, or `"cookie": "a=1; b=2"` inside a JSON-serialized header map. The value class
+ * stops at a quote or a line end, so it never runs past the header it belongs to, and it
+ * is a single unquantified negated class: scanning a long header is linear, not quadratic.
+ */
+const COOKIE_HEADER_VALUE = /\b((?:set-cookie|cookie)\b"?\s*[:=]\s*"?)([^"\r\n]*)/gi;
+
+/** One `name=value` pair inside a cookie header. No nested quantifiers: a linear scan. */
+const COOKIE_PAIR = /([A-Za-z0-9!#$%&'*+.^_`|~-]{1,256})(\s*=\s*)([^"\s;,]*)/g;
+
+/**
+ * `Set-Cookie` attributes. They name the cookie's scope, not a credential, so a long
+ * `Domain=` or an opaque-looking `Expires=` value must survive the opaque rule.
+ */
+const COOKIE_ATTRIBUTE_NAME =
+	/^(?:path|domain|expires|max-age|maxage|samesite|same-site|httponly|secure|partitioned|priority)$/i;
+
+/** `scheme://user:password@host` - the password is the credential, the user and host are the diagnosis. */
+const URL_USERINFO = /\b([a-z][a-z0-9+.-]*:\/\/)([^\s/@:]{1,256})?(:([^\s/@]*))?@/gi;
+
+/** Character set of an opaque credential run: base64/base64url/hex plus `.`/`~`/`=`/`-`. */
+const OPAQUE_RUN_CLASS = "[A-Za-z0-9._~+/=-]";
+
+/** Below this length a run of that class is an id, a counter or a word, not a token. */
+const OPAQUE_RUN_MIN_LENGTH = 20;
 
 /**
  * Query/header style assignments whose key name did not make the credential list but
  * whose value is obviously opaque: long base64url-ish runs handed to `key=`, `token=`,
- * `sig=`, `secret=`. Length-bounded so ordinary prose and ids survive.
+ * `sig=`, `secret=`, `session=`, `auth=`. Length-bounded so ordinary prose and ids
+ * survive. The optional `qualifier_`/`qualifier-` prefix lets compound names such as
+ * `access_key=` or `proxy_session_id=` reach this fallback too; requiring the separator
+ * keeps an ordinary word that ends in one of these names (`monkey=`) out of it.
  */
-const OPAQUE_ASSIGNMENT = /\b((?:key|token|secret|sig|signature|password|credential)=)([A-Za-z0-9._~+/=-]{20,})/gi;
+const OPAQUE_ASSIGNMENT = new RegExp(
+	`\\b((?:[A-Za-z0-9]{1,64}[-_])?(?:key|apikey|api_key|token|secret|sig|signature|password|passwd|credential|session|sessionid|session_id|sid|jsessionid|phpsessid|access_key|refresh_key|auth|authorization|authz|otp|passcode|verification)=)(${OPAQUE_RUN_CLASS}{${OPAQUE_RUN_MIN_LENGTH},})`,
+	"gi",
+);
+
+/** A whole value that is nothing but an opaque run of credential length. */
+const OPAQUE_RUN = new RegExp(`^${OPAQUE_RUN_CLASS}{${OPAQUE_RUN_MIN_LENGTH},}$`);
+
+/**
+ * Wash the value of a single cookie pair. A cookie whose name says session or credential
+ * always loses its value; any other cookie only loses it when the value is a long opaque
+ * run, the same bar `OPAQUE_ASSIGNMENT` applies to query parameters. Names, attributes
+ * (`Path`, `Domain`, `Expires`, `Max-Age`, `SameSite`) and ordinary values such as
+ * `theme=dark` stay: which cookies were sent is the actionable half of a cookie header,
+ * and washing the whole value would turn every one of them into `[REDACTED]` noise.
+ */
+function redactCookiePair(name: string, separator: string, value: string): string {
+	if (value === REDACTED || value === "" || COOKIE_ATTRIBUTE_NAME.test(name)) return `${name}${separator}${value}`;
+	if (COOKIE_SECRET_NAME.test(name) || isOpaqueRun(value)) return `${name}${separator}${REDACTED}`;
+	return `${name}${separator}${value}`;
+}
+
+/** `true` when a value is a base64url-ish run long enough that only a token looks like it. */
+function isOpaqueRun(value: string): boolean {
+	return OPAQUE_RUN.test(value);
+}
+
+/** A full cookie header: pair by pair, so the names survive. */
+function redactCookieValue(value: string): string {
+	return value.replace(COOKIE_PAIR, (_match, name: string, separator: string, pairValue: string) =>
+		redactCookiePair(name, separator, pairValue),
+	);
+}
 
 export interface RedactOptions {
 	/** Exact secret values (already known to the caller) to replace literally. */
@@ -62,15 +161,33 @@ export function redactSecrets(text: string, options?: RedactOptions | Iterable<s
 				: (options as Iterable<string>);
 
 	let redacted = text
+		.replace(COOKIE_HEADER_VALUE, (_match, header: string, value: string) => `${header}${redactCookieValue(value)}`)
+		// The key rule runs before the bearer/scheme rules: it consumes the `Bearer` prefix
+		// itself, so the placeholder it writes is never re-matched by them (their value
+		// class cannot start at `[`), and the output stays idempotent.
+		.replace(
+			CREDENTIAL_KEY_VALUE,
+			(match: string, key: string, separator: string, scheme: string | undefined, value: string) => {
+				// A previous rule in this very pass (or an earlier pass over the same text)
+				// already put a placeholder here: the value class stops at the closing
+				// bracket, so rewriting it would append a stray one.
+				if (value.startsWith(REDACTED_HEAD)) return match;
+				// Keep the header name and the `Bearer`/`Basic` scheme: the diagnostic still
+				// shows that a credential was sent, only not which one.
+				return `${key}${separator}${scheme ?? ""}${REDACTED}`;
+			},
+		)
 		.replace(BEARER_VALUE, `$1${REDACTED}`)
-		.replace(CREDENTIAL_KEY_VALUE, (_match, key: string, separator: string, scheme: string | undefined) => {
-			// Keep the header name and the `Bearer`/`Basic` scheme: the diagnostic still
-			// shows that a credential was sent, only not which one.
-			return `${key}${separator}${scheme ?? ""}${REDACTED}`;
-		})
+		.replace(AUTH_SCHEME_VALUE, (match: string, scheme: string, value: string) =>
+			isCredentialRun(value) ? `${scheme}${REDACTED}` : match,
+		)
 		.replace(JSON_WEB_TOKEN, REDACTED)
 		.replace(CREDENTIAL_SHAPES, REDACTED)
-		.replace(URL_USERINFO, `$1${REDACTED}@`)
+		.replace(
+			URL_USERINFO,
+			(_match, scheme: string, user: string | undefined, withPassword?: string, password?: string) =>
+				password ? `${scheme}${user ?? ""}:${REDACTED}@` : `${scheme}${user ?? ""}${withPassword ?? ""}@`,
+		)
 		.replace(OPAQUE_ASSIGNMENT, `$1${REDACTED}`);
 
 	if (secrets !== undefined) {
