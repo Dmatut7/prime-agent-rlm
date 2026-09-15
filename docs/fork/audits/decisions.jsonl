@@ -141,3 +141,7 @@
 {"id": "MS-5", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "权威 registry 搬去 ~/.prime（$TMPDIR 3 天被清）但 socket 与其锁仍在 $TMPDIR", "verified_by": "R13（可达性 unverified）"}
 {"id": "MS-3", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "共享 agent.jsonl + 分裂归属（轮转竞态未隔离复现）", "verified_by": "R13（竞态 unverified）"}
 {"id": "FS-1", "date": "2026-09-15", "severity": "P1", "status": "fixing", "commit": null, "title": "-e 临时扩展缓存在可预测共享 /tmp 路径 + 只判 existsSync ⇒ 预置目录即进程内执行第三方代码（且 refresh 失败被静默吞）", "verified_by": "R14 实测（fake-npm 零调用 + 植入模块写出 marker）+ 正控 + getuid 0 命中对照 daemon-socket.ts:301"}
+{"id": "IT-1", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "/import 名字≠id 的转录⇒两份共用同一 session id，原会话按 id 不可恢复且共写同一 artifact 目录", "verified_by": "R14 确定性复现（resolveSessionPath 抛 Ambiguous）"}
+{"id": "IT-2", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "删除/制品路径按文件名推 id（运行期用 header id）⇒ 名字≠id 的转录删不干净", "verified_by": "R14 复现 + 正控"}
+{"id": "IT-3", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "花费两套口径不一致，差额＝被放弃分支上的摘要费（回退后 footer//context 少报已付费用，逐位吻合）", "verified_by": "R14 真语料 + 构造序列"}
+{"id": "IT-4", "date": "2026-09-15", "severity": "P3", "status": "fixing", "commit": null, "title": "OwnUsageAccumulator 契约在数组缩短后不成立（游标只增）", "verified_by": "R14 单元级证明（生产可达性 unverified）"}
