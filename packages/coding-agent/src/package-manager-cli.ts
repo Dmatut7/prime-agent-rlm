@@ -31,6 +31,7 @@ import {
 	waitForActiveDaemonUpdateRestartCoordinator,
 } from "./cli/daemon-update-restart.js";
 import {
+	ALLOW_REGISTRY_UPDATE_ENV,
 	APP_NAME,
 	type ArtifactUpdateSpec,
 	CONFIG_DIR_NAME,
@@ -41,6 +42,7 @@ import {
 	getSelfUpdateCommand,
 	getSelfUpdateUnavailableInstruction,
 	PACKAGE_NAME,
+	registryUpdateLaneRefusal,
 	SELF_UPDATE_INTERACTIVE_CHILD_ENV,
 	SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE,
 	type SelfUpdateCommand,
@@ -507,6 +509,16 @@ async function downloadVerifiedUpdateArtifact(
 async function resolveUpdateArtifact(
 	installSpec: string,
 ): Promise<{ installSpec: string; verifiedArtifact?: VerifiedUpdateArtifact; artifactDir?: string; refusal?: string }> {
+	// GL-5 SM-2: a registry spec from the manifest installs whatever the configured
+	// registry or mirror serves, with no digest and no origin pinned here. Refuse it
+	// unless the registry lane was explicitly allowed; never fall back to it silently.
+	const registryRefusal = registryUpdateLaneRefusal(installSpec);
+	if (registryRefusal !== undefined) {
+		return {
+			installSpec,
+			refusal: `the release manifest served a registry spec (${installSpec}); ${registryRefusal}`,
+		};
+	}
 	const classification = classifyUpdateSpec(installSpec);
 	if (classification.kind !== "artifact") return { installSpec };
 	try {
@@ -552,7 +564,19 @@ async function getSelfUpdatePlan(force: boolean): Promise<SelfUpdatePlan> {
 			};
 		}
 	} catch {
-		return { installSpec: PACKAGE_NAME, packageName: PACKAGE_NAME, shouldRun: true };
+		// GL-5 SM-2: a manifest fetch failure must not degrade into an unpinned
+		// registry install of the bare package name. The registry lane is opt-in;
+		// without it the update refuses instead of letting the configured registry
+		// or a mirror decide the bytes.
+		if (process.env[ALLOW_REGISTRY_UPDATE_ENV] === "1") {
+			return { installSpec: PACKAGE_NAME, packageName: PACKAGE_NAME, shouldRun: true };
+		}
+		return {
+			installSpec: PACKAGE_NAME,
+			packageName: PACKAGE_NAME,
+			shouldRun: false,
+			refusal: `could not fetch the release manifest; refusing to fall back to an unpinned registry install (set ${ALLOW_REGISTRY_UPDATE_ENV}=1 to allow it)`,
+		};
 	}
 
 	console.log(chalk.green(`${APP_NAME} is already up to date (v${VERSION})`));

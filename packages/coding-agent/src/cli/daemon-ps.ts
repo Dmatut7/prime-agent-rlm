@@ -907,7 +907,10 @@ export function evaluateDaemonLiveness(evidence: {
 	if (!evidence.answeredProbe) {
 		return { liveness: "unknown", evidence: [] };
 	}
-	return { liveness: "idle", evidence: ["answered probe with no work"] };
+	// A missing cpu reading is not a zero reading: "not sampled" is its own fact,
+	// reported as such so an idle verdict never cites evidence that was never gathered.
+	const cpuEvidence = evidence.cpuPercent === undefined ? ["cpu not sampled (no reading)"] : [];
+	return { liveness: "idle", evidence: ["answered probe with no work", ...cpuEvidence] };
 }
 
 export function verifyHelloSupervisorPid(
@@ -1137,11 +1140,10 @@ export function describeShutdownTarget(
  * the SIGTERM and backs off to the session-aware paths if it has since become
  * reachable, so a daemon that recovered with live sessions is never killed.
  */
-export function planReap(
-	daemons: readonly DaemonInfo[],
-	force: boolean,
-	selection: StopSelection = MACHINE_STOP_SELECTION,
-): ReapAction[] {
+/** How long a discovered service is protected from sweep plans after it started (DS-4). */
+export const DAEMON_STARTUP_GRACE_SECONDS = 15;
+
+export function planReap(daemons: readonly DaemonInfo[], force: boolean, selection: StopSelection): ReapAction[] {
 	const pidCounts = new Map<number, number>();
 	for (const daemon of daemons) {
 		if (daemon.pid !== undefined) {
@@ -1163,17 +1165,23 @@ export function planReap(
 		if (daemon.isDefault) {
 			return { kind: "skip", daemon, reason: "default background service" };
 		}
+		// A service that started seconds ago has not had time to accumulate live
+		// evidence, so a sweep must not read its quietness as abandonment (DS-4).
+		if (daemon.uptimeSeconds !== undefined && daemon.uptimeSeconds < DAEMON_STARTUP_GRACE_SECONDS) {
+			return {
+				kind: "skip",
+				daemon,
+				reason: `started ${Math.floor(daemon.uptimeSeconds)}s ago; within the ${DAEMON_STARTUP_GRACE_SECONDS}s startup grace`,
+			};
+		}
 		if (daemon.status === "unreachable") {
 			if (!force || daemon.pid === undefined) {
 				return { kind: "skip", daemon, reason: 'unreachable; use "prime-agent shutdown --force" to stop it' };
 			}
-			if ((daemon.liveWorkerCount ?? 0) > 0) {
-				return {
-					kind: "skip",
-					daemon,
-					reason: `unreachable; ${daemon.liveWorkerCount} worker process(es) still live, not killing`,
-				};
-			}
+			// The live workers of an unreachable supervisor are stopped by the same
+			// run before the kill (see runReap), so the plan may kill: this keeps
+			// `reap --force`, `doctor --fix` advice and `shutdown --force` from
+			// disagreeing about a hung supervisor that still owns workers (DS-4).
 			if ((pidCounts.get(daemon.pid) ?? 0) > 1) {
 				return {
 					kind: "skip",
@@ -1196,7 +1204,7 @@ export function planReap(
 export function planShutdownAll(
 	daemons: readonly DaemonInfo[],
 	force: boolean,
-	selection: StopSelection = MACHINE_STOP_SELECTION,
+	selection: StopSelection,
 ): ReapAction[] {
 	return daemons.map((daemon): ReapAction => {
 		const excluded = selectionExclusionReason(daemon, selection);
@@ -2115,10 +2123,16 @@ export interface TrackedWorkerFailure {
 	reason: string;
 }
 
+/** The stop path needs only these two ledger facts from a stop report (DS-4). */
+export interface TrackedWorkerStopLedger {
+	recordSignal(pid: number): void;
+	recordSocketRemoval(socketPath: string): void;
+}
+
 async function forceStopTrackedWorkers(
 	supervisorSocketPath: string,
 	assertAdmission: () => Promise<void>,
-	report: ShutdownReport,
+	ledger: TrackedWorkerStopLedger,
 ): Promise<TrackedWorkerFailure[]> {
 	const failures: TrackedWorkerFailure[] = [];
 	const fail = (descriptor: DaemonWorkerDescriptor, reason: string): void => {
@@ -2127,7 +2141,7 @@ async function forceStopTrackedWorkers(
 	// Every signal this sweep really sends is written into the report ledger, so the
 	// convergence pass at the end may call a vanished worker a stop this run performed.
 	const stopWithLedger = (pid: number, startId: string | undefined): Promise<boolean> =>
-		stopTrackedProcess(pid, startId, assertAdmission, () => report.recordSignal(pid));
+		stopTrackedProcess(pid, startId, assertAdmission, () => ledger.recordSignal(pid));
 	for (const worker of findTrackedWorkers(supervisorSocketPath)) {
 		const { descriptor } = worker;
 		let cleanupWorkerRecords = await stopWithLedger(descriptor.pid, descriptor.processStartId);
@@ -2148,7 +2162,7 @@ async function forceStopTrackedWorkers(
 				// Pid-only records go through the platform predicate (stopTrackedProcess needs a startId).
 				if (orphan.processStartId === undefined) {
 					if (shouldReapOrphanProcess(orphan)) {
-						report.recordSignal(orphan.pid);
+						ledger.recordSignal(orphan.pid);
 						killOrphanProcess(orphan.pid);
 					}
 					continue;
@@ -2160,7 +2174,7 @@ async function forceStopTrackedWorkers(
 					// taskkill /T, like the sibling reapers: signalling only the shell pid leaves its descendants alive.
 					await assertAdmission();
 					if (isOrphanProcessIdentityCurrent(orphan)) {
-						report.recordSignal(orphan.pid);
+						ledger.recordSignal(orphan.pid);
 						killOrphanProcess(orphan.pid);
 						if (isProcessAlive(orphan.pid)) {
 							cleanupWorkerRecords = false;
@@ -2181,7 +2195,7 @@ async function forceStopTrackedWorkers(
 				fail(descriptor, `could not clean up worker ${descriptor.workerId}: ${cleanup}`);
 			} else {
 				// Its records are gone and with them the socket file this worker held.
-				report.recordSocketRemoval(descriptor.socketPath);
+				ledger.recordSocketRemoval(descriptor.socketPath);
 			}
 		}
 	}
@@ -2430,6 +2444,23 @@ export async function runReap(
 					const verdict = await verifier.verify({ pid: pid!, socketPath });
 					if (!verdict.ok) {
 						skipped.push({ socketPath, reason: verdict.reason });
+						break;
+					}
+					// Stop the tracked workers before the kill, the way `shutdown --force`
+					// does after its own: killing an unreachable supervisor first would
+					// leave its workers orphaned, which is what made `reap --force`
+					// refuse where `shutdown --force` killed (DS-4).
+					const workerFailures = await forceStopTrackedWorkers(socketPath, async () => {}, {
+						recordSignal: () => undefined,
+						recordSocketRemoval: () => undefined,
+					});
+					if (workerFailures.length > 0) {
+						skipped.push({
+							socketPath,
+							reason: `unreachable; could not stop its worker process(es) safely: ${workerFailures
+								.map((failure) => failure.reason)
+								.join("; ")}`,
+						});
 						break;
 					}
 					killDaemon(pid!);

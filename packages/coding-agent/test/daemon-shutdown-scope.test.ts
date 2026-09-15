@@ -106,7 +106,7 @@ describe("scoped cleanup", () => {
 		]);
 	});
 
-	it("never kills an unreachable daemon that still owns live worker processes", () => {
+	it("plans the same kill as shutdown --force for an unreachable daemon that owns live workers", () => {
 		const hungWithWorkers = makeDaemon({
 			socketPath: `${MY_SOCKET_DIR}/hung.sock`,
 			status: "unreachable",
@@ -119,7 +119,11 @@ describe("scoped cleanup", () => {
 			pid: 516,
 			liveWorkerCount: 0,
 		});
-		expect(planReap([hungWithWorkers], true, WHOLE_MACHINE)[0]!.kind).toBe("skip");
+		// DS-4: the kill path stops the tracked workers first (see runReap), so the
+		// plan no longer refuses where `shutdown --force` would kill - the two
+		// commands must not give opposite verdicts on the same daemon.
+		expect(planReap([hungWithWorkers], true, WHOLE_MACHINE)[0]!.kind).toBe("kill");
+		expect(planShutdownAll([hungWithWorkers], true, WHOLE_MACHINE)[0]!.kind).toBe("kill");
 		// Positive control: a truly hung service with no workers is still killable.
 		expect(planReap([hungIdle], true, WHOLE_MACHINE)[0]!.kind).toBe("kill");
 	});

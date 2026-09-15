@@ -19,7 +19,7 @@ import { fileURLToPath } from "url";
 import { shouldUseWindowsShell } from "./utils/child-process.js";
 import { normalizeSocketPath } from "./utils/daemon-socket-path.js";
 import { appendPrivateFile, ensurePrivateFile } from "./utils/private-files.js";
-import { getPrimeAgentDownloadBaseUrl } from "./utils/version-check.js";
+import { DEFAULT_PRIME_AGENT_DOWNLOAD_BASE_URL } from "./utils/version-check.js";
 
 // =============================================================================
 // Package Detection
@@ -212,13 +212,39 @@ const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/i;
 const NPM_PACKAGE_NAME_PATTERN = /^(?:@[A-Za-z0-9][A-Za-z0-9._-]*\/)?[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const NPM_VERSION_SELECTOR_PATTERN = /^[A-Za-z0-9][A-Za-z0-9.+_^~*|<>= -]*$/;
 
-/** Origins whose release artifacts this installation trusts. One source of truth: the download base. */
+/**
+ * Env that names additional origins whose release artifacts this installation trusts.
+ * Comma-separated https origins. Decoupled from {@link PRIME_AGENT_DOWNLOAD_BASE_URL} on
+ * purpose: one env must not move both the manifest source and the artifact byte-source
+ * allowlist, or a single env read in a hostile wrapper dissolves the whole gate (GL-5 SM-1).
+ */
+export const TRUSTED_UPDATE_ORIGINS_ENV = "PRIME_AGENT_TRUSTED_UPDATE_ORIGINS";
+/**
+ * Env that explicitly allows the registry lane for a self-update: the package manager's
+ * configured registry decides the bytes, with no digest or origin pinned by this process
+ * (GL-5 SM-2). Off by default; the manifest lane always resolves to a hash-pinned artifact.
+ */
+export const ALLOW_REGISTRY_UPDATE_ENV = "PRIME_AGENT_ALLOW_REGISTRY_UPDATE";
+
+/** Origins whose release artifacts this installation trusts. */
 export function getTrustedUpdateArtifactOrigins(): string[] {
+	const origins: string[] = [];
 	try {
-		return [new URL(getPrimeAgentDownloadBaseUrl()).origin];
+		origins.push(new URL(DEFAULT_PRIME_AGENT_DOWNLOAD_BASE_URL).origin);
 	} catch {
-		return [];
+		// Unreachable: the default base is a constant https URL.
 	}
+	for (const candidate of (process.env[TRUSTED_UPDATE_ORIGINS_ENV] ?? "").split(",")) {
+		const trimmed = candidate.trim();
+		if (!trimmed) continue;
+		try {
+			const url = new URL(trimmed);
+			if (url.protocol === "https:") origins.push(url.origin);
+		} catch {
+			// A malformed candidate is ignored, not trusted.
+		}
+	}
+	return [...new Set(origins)];
 }
 
 /** True only for https URLs on the configured release download base, lookalike hosts included-none. */
@@ -255,7 +281,22 @@ function looksLikeTarballPath(spec: string): boolean {
 }
 
 function artifactSourceDetail(): string {
-	return `its source is not the configured release download base (${getTrustedUpdateArtifactOrigins().join(", ") || "unset"})`;
+	return `its source is not a trusted release artifact origin (${getTrustedUpdateArtifactOrigins().join(", ") || "unset"})`;
+}
+
+/**
+ * GL-5 SM-2: refusal text for a registry-lane self-update spec, or undefined when the
+ * lane is allowed. The manifest-driven plan consults this before building any install
+ * command, so an unpinned registry install is only reachable behind the explicit opt-in.
+ */
+export function registryUpdateLaneRefusal(spec: string): string | undefined {
+	if (process.env[ALLOW_REGISTRY_UPDATE_ENV] === "1") {
+		return undefined;
+	}
+	if (classifyUpdateSpec(spec).kind !== "registry") {
+		return undefined;
+	}
+	return `the registry lane pins no digest and no origin; set ${ALLOW_REGISTRY_UPDATE_ENV}=1 to allow the package manager's registry as the byte source`;
 }
 
 /**

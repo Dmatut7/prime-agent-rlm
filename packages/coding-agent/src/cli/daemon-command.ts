@@ -1518,11 +1518,20 @@ class DaemonAttachTerminal {
 				return;
 			case "refine_complete":
 				return;
+			case "auth_stale":
+				// DO-5: an auth failure during attach used to be swallowed here, so the
+				// operator only learned about it from a later 401. Same red-line channel
+				// the other failure events in this switch use.
+				this.writeLine(
+					chalk.red(
+						`Authentication for ${event.provider} is stale; the session keeps running but new turns will fail until you re-authenticate (prime-agent login).`,
+					),
+				);
+				return;
 			case "turn_start":
 			case "turn_end":
 			case "message_start":
 			case "tool_execution_update":
-			case "auth_stale":
 				return;
 		}
 	}

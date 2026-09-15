@@ -4,6 +4,7 @@ import {
 	classifyUpdateSpec,
 	getSelfUpdateCommand,
 	getSelfUpdateUnavailableInstruction,
+	registryUpdateLaneRefusal,
 	verifyUpdateArtifactHash,
 } from "../src/config.js";
 
@@ -15,16 +16,21 @@ function trustedSpec(path: string, sha = PINNED_SHA): string {
 }
 
 describe("self-update spec trust policy", () => {
-	test("registry package specs stay installable", () => {
-		expect(classifyUpdateSpec("prime-agent")).toMatchObject({ kind: "registry", packageName: "prime-agent" });
-		expect(classifyUpdateSpec("@earendil-works/pi-coding-agent")).toMatchObject({
-			kind: "registry",
-			packageName: "@earendil-works/pi-coding-agent",
-		});
-		expect(classifyUpdateSpec("prime-agent@0.9.1")).toMatchObject({
-			kind: "registry",
-			packageName: "prime-agent",
-		});
+	test("registry package specs stay installable only behind the explicit allowance", () => {
+		process.env.PRIME_AGENT_ALLOW_REGISTRY_UPDATE = "1";
+		try {
+			expect(classifyUpdateSpec("prime-agent")).toMatchObject({ kind: "registry", packageName: "prime-agent" });
+			expect(classifyUpdateSpec("@earendil-works/pi-coding-agent")).toMatchObject({
+				kind: "registry",
+				packageName: "@earendil-works/pi-coding-agent",
+			});
+			expect(classifyUpdateSpec("prime-agent@0.9.1")).toMatchObject({
+				kind: "registry",
+				packageName: "prime-agent",
+			});
+		} finally {
+			delete process.env.PRIME_AGENT_ALLOW_REGISTRY_UPDATE;
+		}
 	});
 
 	test("an arbitrary absolute URL is refused", () => {
@@ -88,6 +94,55 @@ describe("self-update spec trust policy", () => {
 				verifiedArtifact: { path: "/tmp/other-0.9.1.tgz", sha256: PINNED_SHA },
 			}),
 		).toMatchObject({ kind: "rejected", reason: "unverified_local_artifact" });
+	});
+
+	describe("GL-5 SM-1: manifest source and trusted origin stay decoupled", () => {
+		test("relocating the manifest download base does not widen artifact trust", () => {
+			process.env.PRIME_AGENT_DOWNLOAD_BASE_URL = "https://attacker.example.com/releases";
+			try {
+				expect(
+					classifyUpdateSpec(
+						`https://attacker.example.com/releases/v0.9.1/prime-agent-0.9.1.tgz#sha256=${PINNED_SHA}`,
+					),
+				).toMatchObject({ kind: "rejected", reason: "untrusted_artifact_source" });
+			} finally {
+				delete process.env.PRIME_AGENT_DOWNLOAD_BASE_URL;
+			}
+		});
+
+		test("an extra trusted origin must be named explicitly, not inherited from the download base", () => {
+			process.env.PRIME_AGENT_TRUSTED_UPDATE_ORIGINS = "https://selfhost.example.com";
+			try {
+				expect(
+					classifyUpdateSpec(`https://selfhost.example.com/releases/x.tgz#sha256=${PINNED_SHA}`),
+				).toMatchObject({ kind: "artifact" });
+				expect(classifyUpdateSpec(`https://evil.example/x.tgz#sha256=${PINNED_SHA}`)).toMatchObject({
+					kind: "rejected",
+					reason: "untrusted_artifact_source",
+				});
+			} finally {
+				delete process.env.PRIME_AGENT_TRUSTED_UPDATE_ORIGINS;
+			}
+		});
+	});
+
+	describe("GL-5 SM-2: the registry lane is an explicit opt-in, never a fallback", () => {
+		test("a manifest-served registry spec is refused without the explicit registry allowance", () => {
+			delete process.env.PRIME_AGENT_ALLOW_REGISTRY_UPDATE;
+			expect(registryUpdateLaneRefusal("prime-agent")).toContain("registry lane pins no digest");
+			expect(registryUpdateLaneRefusal("prime-agent@9.9.9")).toContain("PRIME_AGENT_ALLOW_REGISTRY_UPDATE=1");
+			// Only the registry lane is gated: artifact specs are judged by their own checks.
+			expect(registryUpdateLaneRefusal(trustedSpec("prime-agent-0.9.1.tgz"))).toBeUndefined();
+		});
+
+		test("the explicit allowance lifts the registry refusal", () => {
+			process.env.PRIME_AGENT_ALLOW_REGISTRY_UPDATE = "1";
+			try {
+				expect(registryUpdateLaneRefusal("prime-agent@0.9.1")).toBeUndefined();
+			} finally {
+				delete process.env.PRIME_AGENT_ALLOW_REGISTRY_UPDATE;
+			}
+		});
 	});
 
 	test("verifyUpdateArtifactHash rejects bytes that do not match the pinned digest", () => {

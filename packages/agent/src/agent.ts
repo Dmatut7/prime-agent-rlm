@@ -325,8 +325,13 @@ export class Agent {
 		return this.activeRun?.abortController.signal;
 	}
 
-	abort(): void {
-		this.activeRun?.abortController.abort();
+	/**
+	 * Abort the active run. `cause` is attached to the abort signal so the abort
+	 * stubs the loop writes (tool results, assistant message) can say *why* the
+	 * turn died instead of leaving a bare "Request was aborted".
+	 */
+	abort(cause?: string): void {
+		this.activeRun?.abortController.abort(cause);
 	}
 
 	/**
