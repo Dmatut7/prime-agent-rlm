@@ -130,3 +130,8 @@
 {"id": "RC-4", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "空回复策略最短：3 次无间隔、不看 retry 配置、耗尽后被排除出会话级重试（今晚两次线死亡的机制）", "verified_by": "R12 探针矩阵 A/B/C 对照"}
 {"id": "RC-5", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "自判永久的错误仍必被重试一次（refusal 实测 2 次调用）", "verified_by": "R12 实测"}
 {"id": "RC-3", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "SDK 层重试零事件零日志，与 agent 级叠加 ⇒ 单回合最多 12 次全量请求无跨层预算", "verified_by": "R12 读码"}
+{"id": "P-1", "date": "2026-09-15", "severity": "P2", "status": "fixed", "commit": "7f65e2f3c", "title": "系统提示的\"技能＝同名 shell 命令\"改诚实（宿主桥 fd 不可继承 ⇒ 技能无法在独立 shell 进程工作；选路有实测依据）", "verified_by": "R12 实现线红 6失败/2通过 → 8 通过 + 新 pytest 钉住\"桥技能不能纯子进程跑\""}
+{"id": "P-2", "date": "2026-09-15", "severity": "P2", "status": "fixed", "commit": "7f65e2f3c", "title": "提示词的装包指令改为可执行口径（从提示词正则抽出的命令真跑 EXIT=0）", "verified_by": "R12 实现线红（裸 uv pip install exit 2）→ 绿（替换 <kernel-python> 后真跑 0，且不污染共享 venv）"}
+{"id": "BF-2", "date": "2026-09-15", "severity": "P2", "status": "fixed", "commit": "17b8169d1", "title": "无尾换行的合法 header 不再被就地改写成新 id（补齐换行；顺带堵住 repairOwnedSessionFile 把它截成 0 字节的同族自毁口）", "verified_by": "R12 实现线红 33失败/8通过（含逐字 TypeError 与 id 变化断言）→ 绿 41/41 + 14 批回归 EXIT=0"}
+{"id": "BF-1", "date": "2026-09-15", "severity": "P2", "status": "fixed", "commit": "17b8169d1", "title": "形状不合的行不再让整份转录抛异常：三处咽喉加形状闸宽容跳过+留痕，scanSessionInfo 不再吞成 null", "verified_by": "同上（红含 applyChildUsageAttributions:535 TypeError）"}
+{"id": "BF-3", "date": "2026-09-15", "severity": "P3", "status": "fixed", "commit": "17b8169d1", "title": "行数口径统一\"尾换行是终止符\"（truncateHead/Tail + getLineCount + exec 注解）", "verified_by": "同上（红含 exec 旧路报 2002 行）"}
