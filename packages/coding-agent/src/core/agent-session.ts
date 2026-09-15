@@ -198,6 +198,7 @@ import {
 	compactionKernelStateLines,
 	type RestoreResult,
 	restoreNoticeLines,
+	snapshotFailureNoticeLines,
 	snapshotPathIn,
 } from "./kernel/state-snapshot.js";
 import type { AcpMcpServerConfig } from "./mcp/acp-mcp-types.js";
@@ -9864,6 +9865,24 @@ export class AgentSession {
 		this._emit({ type: "message_end", message });
 	}
 
+	/**
+	 * RT-2: a namespace snapshot write failed outside compaction. The kernel keeps
+	 * running, so without this receipt the model keeps treating its namespace as
+	 * persisted while only the in-memory stderr ring saw the failure.
+	 */
+	private _onKernelSnapshotWriteFailure(detail: string): void {
+		const content = ["<ipython_state>", ...snapshotFailureNoticeLines(detail), "</ipython_state>"].join("\n");
+		void this.sendCustomMessage(
+			{
+				customType: "ipython_state",
+				content,
+				display: false,
+				details: { snapshotWriteFailed: true },
+			},
+			{ deliverAs: "nextTurn" },
+		).catch(() => {});
+	}
+
 	private _onIpythonStateRestored(result: RestoreResult): void {
 		if (result.failed.length > 0) {
 			sessionLog.error("kernel state restore partial", {
@@ -12140,6 +12159,7 @@ export class AgentSession {
 				readyGate: previousDispose,
 				onRestore: notifyRestore ? (result) => this._onIpythonStateRestored(result) : undefined,
 				onUnexpectedExit: (cause, facts) => this._reportUnexpectedKernelExit(cause, facts),
+				onSnapshotFailure: (detail) => this._onKernelSnapshotWriteFailure(detail),
 				restartPolicy: () => {
 					const restart = this.settingsManager.getKernelRestartSettings();
 					return { maxRestarts: restart.maxUnexpectedRestarts, windowMs: restart.windowMs };

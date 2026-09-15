@@ -428,6 +428,7 @@ export class ReplKernelManager {
 		| "bootstrapCode"
 		| "stderrLogPath"
 		| "onUnexpectedExit"
+		| "onSnapshotFailure"
 		| "restartPolicy"
 		| "cancellableHostRequestTypes"
 		| "readOnlyHostRequestTimeoutMs"
@@ -563,6 +564,8 @@ export class ReplKernelManager {
 	/** Last skipped-write reason already sent to the session log, so a blocked session logs the
 	 * state change once instead of once per cell. */
 	private reportedSnapshotSkipReason?: SnapshotWriteBlockReason;
+	/** Set while a snapshot-failure receipt has been sent and no write has succeeded since. */
+	private reportedSnapshotFailure = false;
 	/** Wall clock of the last successful snapshot write from this process, for the age the reset
 	 * notice reports. The payload's manifest is the primary source; this covers a runtime that
 	 * did not record a timestamp. */
@@ -586,6 +589,7 @@ export class ReplKernelManager {
 			bootstrapCode: options.bootstrapCode,
 			stderrLogPath: options.stderrLogPath,
 			onUnexpectedExit: options.onUnexpectedExit,
+			onSnapshotFailure: options.onSnapshotFailure,
 			restartPolicy: options.restartPolicy,
 			cancellableHostRequestTypes: options.cancellableHostRequestTypes,
 			readOnlyHostRequestTimeoutMs: options.readOnlyHostRequestTimeoutMs,
@@ -2853,6 +2857,13 @@ export class ReplKernelManager {
 					detail,
 					sessionId: this.options.sessionId,
 				});
+				// RT-2: one model-visible receipt per failure episode (a successful write
+				// re-arms it below). Compaction already reports its own null write; this
+				// path is the ordinary debounced write, which used to stay invisible.
+				if (!this.reportedSnapshotFailure) {
+					this.reportedSnapshotFailure = true;
+					this.options.onSnapshotFailure?.(`${reason}: ${detail ?? "unknown error"}`);
+				}
 				return null;
 			}
 			const pruned = asStringArray(r.doneFields.pruned);
@@ -2874,6 +2885,7 @@ export class ReplKernelManager {
 			// A preserved name is in the payload (carried over verbatim), so it is not dropped.
 			const preservedSet = new Set(preserved);
 			this.lastSnapshotWrittenAt = Date.now();
+			this.reportedSnapshotFailure = false;
 			this.lastSnapshotNotSaved = skipped.filter((entry) => !preservedSet.has(entry.name));
 			if (this.lastSnapshotNotSaved.length > 0) {
 				const names = this.lastSnapshotNotSaved.map((entry) => entry.name);
@@ -2960,9 +2972,18 @@ export class ReplKernelManager {
 		protocolRepair: boolean,
 		timeoutMs: number,
 	): Promise<{ result: RestoreResult | null; timedOut: boolean }> {
+		// RT-3: forward the writing interpreter's version so the runtime can refuse to
+		// revive by-value functions and classes pickled under a different major.minor
+		// line. Additive and ungated: a runtime without the field keeps today's
+		// behaviour, and an old host simply never sends it.
+		const payloadPythonVersion = readSnapshotManifest(cfg.manifestPath)?.pythonVersion;
 		try {
 			const r = await this.enqueueRequest(
-				{ type: "restore", path: cfg.path },
+				{
+					type: "restore",
+					path: cfg.path,
+					...(payloadPythonVersion !== undefined ? { python_version: payloadPythonVersion } : {}),
+				},
 				"",
 				{ internal: true, protocolRepair },
 				timeoutMs,

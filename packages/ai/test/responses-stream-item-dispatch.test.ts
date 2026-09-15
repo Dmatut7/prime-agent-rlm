@@ -255,3 +255,55 @@ describe("openai responses stream item dispatch", () => {
 		expect(thinking?.thinking).toBe("think1");
 	});
 });
+
+it("does not route a duplicate reasoning done onto another item's live block (K3R-12)", async () => {
+	const reasoningAddedFor = (id: string, outputIndex: number): ResponseStreamEvent =>
+		({
+			type: "response.output_item.added",
+			sequence_number: outputIndex * 10,
+			output_index: outputIndex,
+			item: { type: "reasoning", id, summary: [] },
+		}) as ResponseStreamEvent;
+	const reasoningDoneFor = (id: string, outputIndex: number, text: string): ResponseStreamEvent =>
+		({
+			type: "response.output_item.done",
+			sequence_number: outputIndex * 10 + 5,
+			output_index: outputIndex,
+			item: { type: "reasoning", id, summary: [{ type: "summary_text", text }] },
+		}) as ResponseStreamEvent;
+	const summaryDelta = (itemId: string, outputIndex: number, delta: string): ResponseStreamEvent =>
+		({
+			type: "response.reasoning_summary_text.delta",
+			item_id: itemId,
+			output_index: outputIndex,
+			delta,
+		}) as ResponseStreamEvent;
+
+	const { output, events } = await driveResponsesStream([
+		reasoningAddedFor("rs_A", 0),
+		reasoningAddedFor("rs_B", 1),
+		summaryDelta("rs_A", 0, "AAA"),
+		summaryDelta("rs_B", 1, "BBB"),
+		reasoningDoneFor("rs_A", 0, "AAA"),
+		// Gateway duplicates the rs_A done after its slot was released; rs_B's
+		// own done never arrives. The duplicate must not touch rs_B's block.
+		reasoningDoneFor("rs_A", 0, "AAA"),
+		completedEvent(),
+	]);
+
+	const blocks = output.content.filter((block) => block.type === "thinking") as Array<{
+		type: "thinking";
+		thinking: string;
+		thinkingSignature?: string;
+	}>;
+	expect(blocks).toHaveLength(2);
+	const blockB = blocks[1];
+	expect(blockB.thinking).toBe("BBB");
+	// The signature is the replay payload: carrying rs_A's item JSON on rs_B's
+	// block would attribute B's thinking to A's reasoning item on replay.
+	expect(blockB.thinkingSignature ?? "").not.toContain("rs_A");
+	const thinkingEnds = events.filter((event) => event.type === "thinking_end");
+	const contentIndex1Ends = thinkingEnds.filter((event) => (event as { contentIndex?: number }).contentIndex === 1);
+	expect(contentIndex1Ends).toHaveLength(0);
+	expect(output.diagnostics?.some((diagnostic) => diagnostic.type === "responses_done_unrouted")).toBe(true);
+});

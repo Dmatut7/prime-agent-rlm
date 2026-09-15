@@ -308,7 +308,7 @@ function compareEntriesForInjection(a: HarnessEntry, b: HarnessEntry): number {
 	if (recency !== 0) {
 		return recency;
 	}
-	const byId = a.id.localeCompare(b.id);
+	const byId = String(a.id ?? "").localeCompare(String(b.id ?? ""));
 	if (byId !== 0) {
 		return byId;
 	}
@@ -784,17 +784,26 @@ export function formatHarnessStateForPrompt(
 			lines.push(`${kind}: ${entries.length}`);
 		}
 		for (const entry of entries.slice(0, maxEntriesPerKind)) {
+			// RT-4 double insurance: loadHarnessState passes entries through without field
+			// validation, and a Python-side writer used to accept null fields; a null
+			// title/content/arguments here must not break the system-prompt build.
+			const entryArguments = entry.arguments && typeof entry.arguments === "object" ? entry.arguments : {};
+			const entryReference = entry.reference && typeof entry.reference === "object" ? entry.reference : {};
 			const argumentsText =
-				entry.kind === "skill" && Object.keys(entry.arguments).length > 0
-					? ` args=${compactText(JSON.stringify(entry.arguments), maxContentLength)}`
+				entry.kind === "skill" && Object.keys(entryArguments).length > 0
+					? ` args=${compactText(JSON.stringify(entryArguments), maxContentLength)}`
 					: "";
 			const referenceText =
-				entry.kind === "skill" && Object.keys(entry.reference).length > 0
-					? ` ref=${compactText(JSON.stringify(entry.reference), maxContentLength)}`
+				entry.kind === "skill" && Object.keys(entryReference).length > 0
+					? ` ref=${compactText(JSON.stringify(entryReference), maxContentLength)}`
 					: "";
+			const entryTitle = typeof entry.title === "string" ? entry.title : "";
+			const entryPath = typeof entry.path === "string" ? entry.path : "unknown";
+			const entryVersion = typeof entry.version === "number" ? entry.version : 0;
+			const entryContent = typeof entry.content === "string" ? entry.content : "";
 			lines.push(
-				`- [${entry.scope ?? "global"}:${entry.id}] ${entry.title} (${entry.path}, v${entry.version})${referenceText}${argumentsText}: ${compactText(
-					entry.content,
+				`- [${entry.scope ?? "global"}:${entry.id}] ${entryTitle} (${entryPath}, v${entryVersion})${referenceText}${argumentsText}: ${compactText(
+					entryContent,
 					maxContentLength,
 				)}`,
 			);
@@ -819,9 +828,20 @@ export function formatHarnessStateForPrompt(
 
 	lines.push(`recent refinements: ${state.refinements.length}`);
 	for (const event of state.refinements.slice(-maxRefinements)) {
-		const changes = event.changes.length > 0 ? event.changes.join(", ") : "no applied edits";
-		const outcome = event.outcome ? `; outcome: ${compactText(event.outcome, maxContentLength)}` : "";
-		lines.push(`- [${event.id}] ${compactText(event.trigger, maxContentLength)}: ${changes}${outcome}`);
+		// RT-4 double insurance: a refinement event written with null trigger/changes
+		// (the Python writer used to accept them) must be skipped field-by-field, not
+		// break the prompt build with a TypeError on null.
+		const eventChanges = Array.isArray(event?.changes)
+			? event.changes.filter((change): change is string => typeof change === "string")
+			: [];
+		const changes = eventChanges.length > 0 ? eventChanges.join(", ") : "no applied edits";
+		const outcome =
+			typeof event?.outcome === "string" && event.outcome
+				? `; outcome: ${compactText(event.outcome, maxContentLength)}`
+				: "";
+		const eventId = typeof event?.id === "string" ? event.id : "unknown";
+		const trigger = typeof event?.trigger === "string" ? event.trigger : "";
+		lines.push(`- [${eventId}] ${compactText(trigger, maxContentLength)}: ${changes}${outcome}`);
 	}
 	const refinementOverflow = state.refinements.length - Math.min(state.refinements.length, maxRefinements);
 	if (refinementOverflow > 0) {

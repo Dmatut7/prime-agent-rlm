@@ -1056,6 +1056,12 @@ def _snapshot_state(
         sum(len(entry[1]) for entry in blob_cache.values()) if blob_cache is not None else 0
     )
     for name in list(ns.keys()):
+        if not isinstance(name, str):
+            # A non-string key (globals()[1] = 1) is not a persistable name; skipping it
+            # with a report keeps the snapshot alive instead of failing every later
+            # write on the AttributeError the filter below would raise.
+            skipped.append({"name": repr(name), "reason": "non-string namespace key is not a persistable name"})
+            continue
         if name.startswith("_") or name in _ALWAYS_SKIP:
             continue
         value = ns.get(name, missing)
@@ -1068,6 +1074,12 @@ def _snapshot_state(
             seen_out[name] = value
         remaining = max_bytes - total
         limit = max_variable_bytes if prune_oversized else min(max_variable_bytes, remaining)
+        if isinstance(value, io.IOBase):
+            # Open file handles are not persisted: dill would re-open the file by
+            # name and mode on restore, and mode="w"/"a" truncates or appends to the
+            # real file at load time, before any cell runs.
+            skipped.append({"name": name, "reason": "open file handles are not persisted"})
+            continue
         cached = blob_cache.get(name) if blob_cache is not None else None
         if cached is not None and cached[0] is value:
             # The identical deeply-immutable object as an earlier dump: its bytes are
@@ -1287,8 +1299,55 @@ def _snapshot_state(
     return result
 
 
+class _FileReviveBlocked(ValueError):
+    """Raised instead of reopening a real file while reviving an open handle blob."""
+
+
+def _version_mismatch_reason(python_version: str | None) -> str | None:
+    """Why this payload's code objects must not be revived, or None when compatible.
+
+    The manifest records the writing interpreter's version; the caller passes it
+    through the restore request. Bytecode and code objects are only compatible
+    within one major.minor line (a function revived across lines executes and
+    kills the interpreter with SIGTRAP/SIGSEGV, without any load-side error), so a
+    mismatch quarantines by-value functions and classes while plain data revives.
+    """
+    if python_version is None:
+        return None
+    current = sys.version.split()[0]
+    if _major_minor(python_version) == _major_minor(current):
+        return None
+    return f"python version mismatch: payload {python_version}, interpreter {current}"
+
+
+def _major_minor(version: str) -> tuple[int, int] | None:
+    parts = version.split(".")
+    if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        return None
+    return (int(parts[0]), int(parts[1]))
+
+
+def _is_foreign_code_object(value: Any) -> bool:
+    """A by-value function or class whose code ran under another interpreter.
+
+    Objects pickled by reference resolve to the module of this interpreter (safe);
+    by-value copies (``__main__`` cell code) carry foreign bytecode. Only the
+    latter is refused.
+    """
+    if not isinstance(value, (types.FunctionType, type)):
+        return False
+    module = getattr(value, "__module__", None)
+    if not isinstance(module, str):
+        return True
+    loaded = sys.modules.get(module)
+    return getattr(loaded, getattr(value, "__name__", ""), None) is not value
+
+
 def _restore_state(
-    ns: dict[str, Any], path: str, committed: list[dict[str, Any]] | None = None
+    ns: dict[str, Any],
+    path: str,
+    committed: list[dict[str, Any]] | None = None,
+    python_version: str | None = None,
 ) -> dict[str, Any]:
     global _restore_counter
     if not hasattr(os, "O_NOFOLLOW"):
@@ -1317,13 +1376,48 @@ def _restore_state(
 
     staged: dict[str, Any] = {}
     failed: list[dict[str, str]] = []
-    for name, blob in payload.items():
-        if name in _RESTORE_SKIP:
-            continue
-        try:
-            staged[name] = dill.loads(blob)
-        except Exception as err:  # noqa: BLE001 - revive every other name regardless
-            failed.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
+    version_mismatch = _version_mismatch_reason(python_version)
+    # dill revives an open file handle by reopening the real file with its original
+    # mode: mode "w" truncates the file at load time, before any cell runs. The dump
+    # side no longer persists handles, but payloads written by older runtimes still
+    # can: block the reopen for real paths so the load fails per-name instead.
+    dill_dill = sys.modules.get("dill._dill")
+    real_create_filehandle = getattr(dill_dill, "_create_filehandle", None) if dill_dill is not None else None
+    if real_create_filehandle is not None:
+
+        def guarded_create_filehandle(
+            name: object,
+            mode: object,
+            position: object,
+            closed: object,
+            open: Callable[..., Any],
+            strictio: object,
+            fmode: object,
+            fdata: object,
+        ) -> Any:
+            if isinstance(name, str) and not name.startswith("<"):
+                raise _FileReviveBlocked(
+                    f"open file handle {name!r} (mode {mode!r}) is not revived: restoring would reopen the real file"
+                )
+            return real_create_filehandle(name, mode, position, closed, open, strictio, fmode, fdata)
+
+        dill_dill._create_filehandle = guarded_create_filehandle  # type: ignore[union-attr]
+    try:
+        for name, blob in payload.items():
+            if name in _RESTORE_SKIP:
+                continue
+            try:
+                value = dill.loads(blob)
+            except Exception as err:  # noqa: BLE001 - revive every other name regardless
+                failed.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
+                continue
+            if version_mismatch is not None and _is_foreign_code_object(value):
+                failed.append({"name": name, "reason": f"{version_mismatch}: functions and classes are not revived"})
+                continue
+            staged[name] = value
+    finally:
+        if real_create_filehandle is not None:
+            dill_dill._create_filehandle = real_create_filehandle  # type: ignore[union-attr]
     result = {"restored": sorted(staged), "failed": failed}
     # Park SIGINT across the whole apply so it is all-or-nothing; the parked interrupt is consumed by the commit (as in snapshot).
     previous = signal.signal(signal.SIGINT, lambda signum, frame: None)
@@ -1433,7 +1527,10 @@ async def _handle_state(req: dict[str, Any], ns: dict[str, Any]) -> None:
                     "result": result,
                 }
             return result
-        return _restore_state(ns, req["path"], committed)
+        python_version = req.get("python_version")
+        if python_version is not None and not isinstance(python_version, str):
+            return {"error": "python_version must be a string"}
+        return _restore_state(ns, req["path"], committed, python_version)
 
     assert _loop is not None
     task = _loop.create_task(run())

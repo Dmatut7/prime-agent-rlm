@@ -85,6 +85,13 @@ export interface KernelManagerOptions {
 	 */
 	onUnexpectedExit?: (cause: KernelDeathCause, facts: KernelUnexpectedExitFacts) => void;
 	/**
+	 * A namespace snapshot write failed (the request errored or timed out). Fired once per
+	 * failure episode - a later successful write re-arms it - so the owner can surface a
+	 * model-visible receipt; without one the model keeps believing its namespace is persisted
+	 * while only the in-memory stderr ring saw the failure.
+	 */
+	onSnapshotFailure?: (detail: string) => void;
+	/**
 	 * Live restart-budget policy, read at every unexpected exit so a settings edit applies
 	 * without a new kernel. Defaults: {@link DEFAULT_MAX_UNEXPECTED_RESTARTS} revivals inside
 	 * {@link DEFAULT_KERNEL_RESTART_WINDOW_MS}. A non-finite `maxRestarts` disables the budget
