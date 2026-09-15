@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { homedir, tmpdir } from "os";
 import { delimiter, join } from "path";
@@ -150,6 +151,14 @@ function createFakePnpmScript(root: string): string {
 	return `#!/bin/sh\nif [ "$1" = "root" ] && [ "$2" = "-g" ]; then\n\tprintf '%s\\n' '${escapedRoot}'\n\texit 0\nfi\nexit 1\n`;
 }
 
+function createVerifiedArtifact(): { path: string; sha256: string } {
+	const dir = mkdtempSync(join(tmpdir(), "pi-update-artifact-"));
+	const artifactPath = join(dir, "prime-agent-0.73.0.tgz");
+	const bytes = Buffer.from("prime-agent release payload");
+	writeFileSync(artifactPath, bytes);
+	return { path: artifactPath, sha256: createHash("sha256").update(bytes).digest("hex") };
+}
+
 function createFakeYarnScript(globalDir: string): string {
 	if (process.platform === "win32") {
 		return `@echo off\r\nif "%1"=="global" if "%2"=="dir" echo ${globalDir}\r\n`;
@@ -234,34 +243,38 @@ describe("detectInstallMethod", () => {
 		});
 	});
 
-	test("self-updates tarball specs without uninstalling the same logical package first", () => {
+	test("self-updates verified release artifacts without uninstalling the same logical package first", () => {
 		const { prefix } = createNpmPrefixInstall();
-		const tarballUrl = "https://downloads.example.test/prime-agent/prime-agent-0.73.0.tgz";
+		const artifact = createVerifiedArtifact();
 
-		const command = getSelfUpdateCommand("@earendil-works/pi-coding-agent", undefined, tarballUrl);
+		const command = getSelfUpdateCommand("@earendil-works/pi-coding-agent", undefined, artifact.path, undefined, {
+			verifiedArtifact: artifact,
+		});
 
 		expect(command).toEqual({
 			command: "npm",
-			args: ["--prefix", prefix, "install", "-g", tarballUrl],
-			display: `npm --prefix ${prefix} install -g ${tarballUrl}`,
+			args: ["--prefix", prefix, "install", "-g", artifact.path],
+			display: `npm --prefix ${prefix} install -g ${artifact.path}`,
 		});
 	});
 
-	test("self-updates renamed tarball packages by uninstalling the old package after install", () => {
+	test("self-updates renamed verified artifacts by uninstalling the old package after install", () => {
 		const { prefix } = createNpmPrefixInstall();
-		const tarballUrl = "https://downloads.example.test/prime-agent/prime-agent-0.73.0.tgz";
+		const artifact = createVerifiedArtifact();
 
-		const command = getSelfUpdateCommand("@earendil-works/pi-coding-agent", undefined, tarballUrl, "prime-agent");
+		const command = getSelfUpdateCommand("@earendil-works/pi-coding-agent", undefined, artifact.path, "prime-agent", {
+			verifiedArtifact: artifact,
+		});
 
 		expect(command).toEqual({
 			command: "npm",
-			args: ["--prefix", prefix, "install", "-g", tarballUrl],
-			display: `npm --prefix ${prefix} install -g ${tarballUrl} && npm --prefix ${prefix} uninstall -g @earendil-works/pi-coding-agent`,
+			args: ["--prefix", prefix, "install", "-g", artifact.path],
+			display: `npm --prefix ${prefix} install -g ${artifact.path} && npm --prefix ${prefix} uninstall -g @earendil-works/pi-coding-agent`,
 			steps: [
 				{
 					command: "npm",
-					args: ["--prefix", prefix, "install", "-g", tarballUrl],
-					display: `npm --prefix ${prefix} install -g ${tarballUrl}`,
+					args: ["--prefix", prefix, "install", "-g", artifact.path],
+					display: `npm --prefix ${prefix} install -g ${artifact.path}`,
 				},
 				{
 					command: "npm",
@@ -270,6 +283,43 @@ describe("detectInstallMethod", () => {
 				},
 			],
 		});
+	});
+
+	test("refuses an unverified tarball URL instead of handing it to npm", () => {
+		const { prefix } = createNpmPrefixInstall();
+		const tarballUrl = "https://downloads.example.test/prime-agent/prime-agent-0.73.0.tgz";
+
+		expect(getSelfUpdateCommand("@earendil-works/pi-coding-agent", undefined, tarballUrl)).toBeUndefined();
+		expect(getUpdateInstruction.length).toBeGreaterThan(0);
+		const instruction = getSelfUpdateUnavailableInstruction("@earendil-works/pi-coding-agent", undefined, tarballUrl);
+		expect(instruction).toContain("Refusing to self-update");
+		expect(instruction).not.toContain(`install -g ${tarballUrl}`);
+		// A lookalike of a trusted host is not a trusted host either.
+		expect(
+			getSelfUpdateUnavailableInstruction(
+				"@earendil-works/pi-coding-agent",
+				undefined,
+				"https://downloads.example.test.evil.test/prime-agent-0.73.0.tgz",
+			),
+		).toContain("Refusing to self-update");
+		expect(prefix).toBeTruthy();
+	});
+
+	test("refuses a local tarball that was never hash-verified", () => {
+		const artifact = createVerifiedArtifact();
+		const unverified = getSelfUpdateUnavailableInstruction(
+			"@earendil-works/pi-coding-agent",
+			undefined,
+			artifact.path,
+		);
+
+		expect(unverified).toContain("Refusing to self-update");
+		// The same path becomes installable only when its digest is pinned.
+		expect(
+			getSelfUpdateCommand("@earendil-works/pi-coding-agent", undefined, artifact.path, undefined, {
+				verifiedArtifact: { path: artifact.path, sha256: "b".repeat(64) },
+			}),
+		).toBeUndefined();
 	});
 
 	test("self-update respects configured npmCommand", () => {

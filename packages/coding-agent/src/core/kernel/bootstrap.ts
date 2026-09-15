@@ -27,7 +27,19 @@ const bootstrapLog = getLogger("coding-agent.kernel-bootstrap");
 
 const BOOTSTRAP_SCHEMA = 10;
 const PYTHON_VERSION = "3.11";
-const RUNTIME_REQUIREMENT = "prime-agent-runtime";
+/**
+ * Registry name of the Python kernel runtime. Deliberately *not* an install requirement any more:
+ * `https://pypi.org/pypi/prime-agent-runtime` is unregistered (404), so installing this bare name
+ * means "install whatever a stranger uploads under it next" - into an interpreter that runs the
+ * model's Python in-process, with this process's authority. A registry install therefore has to be
+ * opted into explicitly and pinned by hand ({@link resolveKernelRuntimeInstall}); this constant is
+ * only ever spelled out in the pin check and in error messages.
+ */
+const RUNTIME_REGISTRY_NAME = "prime-agent-runtime";
+/** Opt-in that re-enables a registry install of the runtime when no local source is shipped. */
+export const REGISTRY_RUNTIME_ALLOW_ENV = "PRIME_AGENT_KERNEL_ALLOW_REGISTRY_RUNTIME";
+/** Exact `name==version` requirement installed when {@link REGISTRY_RUNTIME_ALLOW_ENV} is `1`. */
+export const REGISTRY_RUNTIME_SPEC_ENV = "PRIME_AGENT_KERNEL_REGISTRY_RUNTIME_SPEC";
 // `-P` (safe path, Python >= 3.11, which prime-agent-runtime requires) keeps the
 // current directory off sys.path, so a checkout carrying `rlm/`, `dill.py`, or a
 // stdlib-named module cannot shadow the kernel's own imports. Every kernel-python
@@ -37,19 +49,29 @@ export const KERNEL_PYTHON_SAFE_PATH_ARGS: readonly string[] = ["-P"];
 // Serializes the kernel's user namespace so it can be revived across session
 // resume. Internal-only; intentionally not surfaced to the model as an import.
 const STATE_SNAPSHOT_REQUIREMENT = "dill";
+/**
+ * Default packages the kernel can import on the model's behalf, pinned to exact versions.
+ *
+ * Pinned on purpose: an unpinned name is re-resolved to whatever is newest at every boot, so a new
+ * machine silently installs Python nobody reviewed into the interpreter that already holds the
+ * model's session state. Each version is the newest stable release whose `requires_python` accepts
+ * PYTHON_VERSION (3.11); `uv pip install` resolves the whole set together for that interpreter, so
+ * the pair is self-consistent. Bumping a pin is a deliberate change: the list is part of the venv
+ * generation identity, so it rebuilds each kernel venv exactly once.
+ */
 const DEFAULT_RLM_EXTRA_PACKAGES = [
-	{ uvArg: "requests", importName: "requests", promptLabel: "requests" },
-	{ uvArg: "httpx", importName: "httpx", promptLabel: "httpx" },
-	{ uvArg: "pyyaml", importName: "yaml", promptLabel: "yaml (PyYAML)" },
-	{ uvArg: "tomli", importName: "tomli", promptLabel: "tomli" },
-	{ uvArg: "python-dotenv", importName: "dotenv", promptLabel: "dotenv (python-dotenv)" },
-	{ uvArg: "pandas", importName: "pandas", promptLabel: "pandas" },
-	{ uvArg: "numpy", importName: "numpy", promptLabel: "numpy" },
-	{ uvArg: "scipy", importName: "scipy", promptLabel: "scipy" },
-	{ uvArg: "beautifulsoup4", importName: "bs4", promptLabel: "bs4 (Beautiful Soup)" },
-	{ uvArg: "lxml", importName: "lxml", promptLabel: "lxml" },
-	{ uvArg: "pydantic", importName: "pydantic", promptLabel: "pydantic" },
-	{ uvArg: "tyro", importName: "tyro", promptLabel: "tyro" },
+	{ uvArg: "requests==2.34.2", importName: "requests", promptLabel: "requests" },
+	{ uvArg: "httpx==0.28.1", importName: "httpx", promptLabel: "httpx" },
+	{ uvArg: "pyyaml==6.0.3", importName: "yaml", promptLabel: "yaml (PyYAML)" },
+	{ uvArg: "tomli==2.4.1", importName: "tomli", promptLabel: "tomli" },
+	{ uvArg: "python-dotenv==1.2.3", importName: "dotenv", promptLabel: "dotenv (python-dotenv)" },
+	{ uvArg: "pandas==3.0.5", importName: "pandas", promptLabel: "pandas" },
+	{ uvArg: "numpy==2.4.6", importName: "numpy", promptLabel: "numpy" },
+	{ uvArg: "scipy==1.17.1", importName: "scipy", promptLabel: "scipy" },
+	{ uvArg: "beautifulsoup4==4.15.0", importName: "bs4", promptLabel: "bs4 (Beautiful Soup)" },
+	{ uvArg: "lxml==6.1.3", importName: "lxml", promptLabel: "lxml" },
+	{ uvArg: "pydantic==2.13.5", importName: "pydantic", promptLabel: "pydantic" },
+	{ uvArg: "tyro==1.0.16", importName: "tyro", promptLabel: "tyro" },
 ];
 export const DEFAULT_RLM_EXTRA_UV_ARGS = DEFAULT_RLM_EXTRA_PACKAGES.map((pkg) => pkg.uvArg);
 export const DEFAULT_RLM_EXTRA_IMPORT_NAMES = DEFAULT_RLM_EXTRA_PACKAGES.map((pkg) => pkg.importName);
@@ -1085,14 +1107,103 @@ export async function resolveRuntimeSourceDir(options: RuntimeSourceResolution =
 	return null;
 }
 
-// Identity of the runtime to be installed. For a local source checkout this is a
-// content hash of every rlm/*.py file plus pyproject.toml, so any runtime code or
-// dependency change invalidates an existing venv automatically. Falls back to the
-// bare package name when the runtime resolves to a registry install (no local source).
-export async function resolveRuntimeIdentity(options: RuntimeSourceResolution = {}): Promise<string> {
+/**
+ * Whether one requirement string pins an exact version (`name==x.y.z`). Ranges, wildcards and bare
+ * names all resolve to "something newer later", which is exactly the property that makes a registry
+ * install unreviewable.
+ */
+export function isPinnedRequirementSpec(spec: string): boolean {
+	return /^[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9._,-]+\])?==[A-Za-z0-9][A-Za-z0-9._+!-]*$/.test(spec.trim());
+}
+
+/**
+ * This install ships no runtime source to install, and a registry install is not allowed (or was
+ * asked for without an exact pin). Carries its own actionable text; never wraps another error.
+ */
+export class KernelRuntimeSourceUnavailableError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "KernelRuntimeSourceUnavailableError";
+	}
+}
+
+function runtimeSourceUnavailableError(): KernelRuntimeSourceUnavailableError {
+	return new KernelRuntimeSourceUnavailableError(
+		`This installation ships no "${RUNTIME_REGISTRY_NAME}" Python source to install, and the registry ` +
+			`fallback is refused. "${RUNTIME_REGISTRY_NAME}" is unregistered on PyPI ` +
+			`(https://pypi.org/pypi/${RUNTIME_REGISTRY_NAME} returns 404), so installing that bare name would ` +
+			"install whatever package is published under it next, and the kernel imports it in-process with " +
+			"this process's authority: whoever registers the name first would get code execution inside the " +
+			"kernel. Install one of these instead:\n" +
+			`  - a prime-agent build that ships its runtime source (the Python package in the checkout's "${RUNTIME_REGISTRY_NAME}/" directory), or\n` +
+			"  - set PRIME_AGENT_KERNEL_PYTHON to a Python that already has a current " +
+			`${RUNTIME_REGISTRY_NAME} and the default Python packages installed (bootstrap is skipped), or\n` +
+			`  - opt into a registry install explicitly with ${REGISTRY_RUNTIME_ALLOW_ENV}=1 and pin the exact ` +
+			`version in ${REGISTRY_RUNTIME_SPEC_ENV} (for example "${RUNTIME_REGISTRY_NAME}==1.2.3"). An unpinned ` +
+			"or ranged requirement is refused, because it would reintroduce the same unresolved-name install.",
+	);
+}
+
+function registryRequirementFromEnv(env: NodeJS.ProcessEnv): string {
+	const spec = env[REGISTRY_RUNTIME_SPEC_ENV]?.trim() ?? "";
+	if (!spec) {
+		throw new KernelRuntimeSourceUnavailableError(
+			`${REGISTRY_RUNTIME_ALLOW_ENV}=1 allows a registry install of the kernel runtime, but ` +
+				`${REGISTRY_RUNTIME_SPEC_ENV} is unset. Set it to the exact requirement to install, for example ` +
+				`"${RUNTIME_REGISTRY_NAME}==1.2.3". Open-ended requirements are refused: the index name ` +
+				`"${RUNTIME_REGISTRY_NAME}" is unregistered, so the resolved version has to be a version you ` +
+				"checked and pinned.",
+		);
+	}
+	if (!isPinnedRequirementSpec(spec)) {
+		throw new KernelRuntimeSourceUnavailableError(
+			`${REGISTRY_RUNTIME_SPEC_ENV}="${spec}" is not an exact "name==version" pin. Pin the version, for ` +
+				`example "${RUNTIME_REGISTRY_NAME}==1.2.3"; a bare name, a range or a wildcard resolves to whatever ` +
+				`is published under "${RUNTIME_REGISTRY_NAME}" later, which is the install this check exists to refuse.`,
+		);
+	}
+	return spec;
+}
+
+/** What a fresh kernel venv is built from: the requirement to install and its generation identity. */
+export interface KernelRuntimeInstall {
+	/** uv/pip requirement: a local runtime source path, or an explicitly pinned registry spec. */
+	requirement: string;
+	/** Venv generation identity. Never the bare registry name (see {@link RUNTIME_REGISTRY_NAME}). */
+	identity: string;
+	/** The local runtime source directory, or null for an opted-in registry install. */
+	sourceDir: string | null;
+}
+
+/**
+ * The runtime a fresh generation installs, resolved from the layouts above.
+ *
+ * A local source still wins and is identified by content, so any runtime code or dependency change
+ * invalidates an existing venv automatically. With no local source the only accepted answer is an
+ * explicitly opt-in, exactly pinned registry requirement: the bare registry name is never returned,
+ * neither as a requirement nor as an identity, because naming it is what turns an unreviewed package
+ * into in-process code execution (see {@link runtimeSourceUnavailableError}).
+ */
+export async function resolveKernelRuntimeInstall(
+	options: RuntimeSourceResolution = {},
+): Promise<KernelRuntimeInstall> {
 	const sourceDir = await resolveRuntimeSourceDir(options);
-	if (!sourceDir) return RUNTIME_REQUIREMENT;
-	return hashRuntimeSource(sourceDir);
+	if (sourceDir) {
+		return { requirement: sourceDir, identity: await hashRuntimeSource(sourceDir), sourceDir };
+	}
+	if (process.env[REGISTRY_RUNTIME_ALLOW_ENV] !== "1") {
+		throw runtimeSourceUnavailableError();
+	}
+	const requirement = registryRequirementFromEnv(process.env);
+	return { requirement, identity: `registry:${requirement}`, sourceDir: null };
+}
+
+/**
+ * Identity of the runtime to be installed: a content hash for a local source checkout, or the exact
+ * pinned spec for an opted-in registry install. Never the bare registry name.
+ */
+export async function resolveRuntimeIdentity(options: RuntimeSourceResolution = {}): Promise<string> {
+	return (await resolveKernelRuntimeInstall(options)).identity;
 }
 
 /**
@@ -1125,8 +1236,8 @@ export async function runtimeSourceShadowNotice(options: RuntimeSourceResolution
 }
 
 // Throws if the local source can't be read. A failure here must surface rather than
-// fall back to RUNTIME_REQUIREMENT: that constant is the registry-install identity, and
-// recording it for a local checkout would permanently mask later source changes.
+// fall back to a registry identity: recording one for a local checkout would
+// permanently mask later source changes.
 async function hashRuntimeSource(sourceDir: string): Promise<string> {
 	const rlmDir = path.join(sourceDir, "src", "rlm");
 	const files: string[] = [path.join(sourceDir, "pyproject.toml")];
@@ -1167,33 +1278,38 @@ async function reportRuntimeSourceShadow(options: EnsureKernelPythonOptions): Pr
 	reportProgress(options, `Warning: ${notice}`);
 }
 
+/**
+ * The one `uv pip install` argv a fresh generation is built from. Exported so the requirement shape
+ * (runtime + snapshot + pinned default packages) is assertable without a network or a real install.
+ */
+export function kernelInstallArgs(python: string, runtimeRequirement: string): string[] {
+	return [
+		"pip",
+		"install",
+		"--python",
+		python,
+		runtimeRequirement,
+		STATE_SNAPSHOT_REQUIREMENT,
+		...DEFAULT_RLM_EXTRA_UV_ARGS,
+	];
+}
+
 async function bootstrapVenv(
 	venv: string,
 	pythonSkills: readonly BootstrapPythonSkill[],
 	options: EnsureKernelPythonOptions,
 ): Promise<void> {
 	await mkdir(path.dirname(venv), { recursive: true });
+	// Resolved before uv is touched: an installation with nothing safe to install from has to fail
+	// without spawning anything, and its requirement is never the bare registry name.
+	const install = await resolveKernelRuntimeInstall();
 	const uv = await ensureUv(options);
 	const python = path.join(venv, "bin", "python");
-	const sourceDir = await resolveRuntimeSourceDir();
-	const runtimeRequirement = sourceDir ?? RUNTIME_REQUIREMENT;
-	const runtimeIdentity = await resolveRuntimeIdentity();
+	const runtimeIdentity = install.identity;
 
 	await run(uv, ["python", "install", PYTHON_VERSION], { signal: options.signal });
 	await run(uv, ["venv", venv, "--python", PYTHON_VERSION, "--seed"], { signal: options.signal });
-	await run(
-		uv,
-		[
-			"pip",
-			"install",
-			"--python",
-			python,
-			runtimeRequirement,
-			STATE_SNAPSHOT_REQUIREMENT,
-			...DEFAULT_RLM_EXTRA_UV_ARGS,
-		],
-		{ signal: options.signal },
-	);
+	await run(uv, kernelInstallArgs(python, install.requirement), { signal: options.signal });
 	await syncPythonSkills(uv, venv, python, runtimeIdentity, pythonSkills, options);
 }
 
@@ -1356,7 +1472,11 @@ async function kernelReady(
 function formatBootstrapFailure(error: unknown): Error {
 	// Typed bootstrap failures already carry their own specific, actionable guidance, and
 	// callers need the class to tell a cancellation or a lock timeout from a real failure.
-	if (error instanceof KernelBootstrapLockTimeoutError || error instanceof KernelBootstrapAbortedError) {
+	if (
+		error instanceof KernelBootstrapLockTimeoutError ||
+		error instanceof KernelBootstrapAbortedError ||
+		error instanceof KernelRuntimeSourceUnavailableError
+	) {
 		return error;
 	}
 	return new Error(

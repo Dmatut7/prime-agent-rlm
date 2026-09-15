@@ -19,6 +19,7 @@ import { fileURLToPath } from "url";
 import { shouldUseWindowsShell } from "./utils/child-process.js";
 import { normalizeSocketPath } from "./utils/daemon-socket-path.js";
 import { appendPrivateFile, ensurePrivateFile } from "./utils/private-files.js";
+import { getPrimeAgentDownloadBaseUrl } from "./utils/version-check.js";
 
 // =============================================================================
 // Package Detection
@@ -134,22 +135,202 @@ function getInferredNpmInstall(): { root: string; prefix: string } | undefined {
 	return undefined;
 }
 
-function isDirectPackageArtifactSpec(updateSpec: string): boolean {
-	const spec = updateSpec.trim().toLowerCase();
-	return (
-		spec.startsWith("http://") ||
-		spec.startsWith("https://") ||
-		spec.startsWith("file:") ||
-		spec.endsWith(".tgz") ||
-		spec.endsWith(".tar.gz")
-	);
+// =============================================================================
+// Self-Update Spec Trust
+// =============================================================================
+
+/**
+ * Why a self-update spec was refused. Each reason carries the shape the caller should
+ * have used instead, because these strings reach the user as the explanation for a
+ * refused update: "untrusted source" without "what a trusted source looks like" is not
+ * actionable.
+ */
+export type UpdateSpecRejectionReason =
+	| "untrusted_artifact_source"
+	| "missing_artifact_hash"
+	| "unverified_local_artifact"
+	| "unsupported_artifact_spec"
+	| "invalid_registry_spec";
+
+/** A registry spec (`name`, `name@version`, `name@tag`) the package manager resolves itself. */
+export interface RegistryUpdateSpec {
+	kind: "registry";
+	spec: string;
+	packageName: string;
 }
 
-function getDefaultUpdatePackageName(installedPackageName: string, updateSpec: string): string {
-	if (isDirectPackageArtifactSpec(updateSpec)) {
-		return installedPackageName;
+/**
+ * A hash-pinned artifact under the configured release download base. Recognized, but never
+ * handed to a package manager as a URL: npm accepts any URL and verifies nothing, so the
+ * caller has to download it and check {@link sha256} first, then come back with
+ * {@link VerifiedUpdateArtifact}.
+ */
+export interface ArtifactUpdateSpec {
+	kind: "artifact";
+	spec: string;
+	url: string;
+	sha256: string;
+}
+
+/** A local tarball the caller has already downloaded and checked against a pinned sha256. */
+export interface VerifiedArtifactUpdateSpec {
+	kind: "verified-artifact";
+	spec: string;
+	path: string;
+	sha256: string;
+}
+
+export interface RejectedUpdateSpec {
+	kind: "rejected";
+	spec: string;
+	reason: UpdateSpecRejectionReason;
+	detail: string;
+}
+
+export type UpdateSpecClassification =
+	| RegistryUpdateSpec
+	| ArtifactUpdateSpec
+	| VerifiedArtifactUpdateSpec
+	| RejectedUpdateSpec;
+
+export interface VerifiedUpdateArtifact {
+	path: string;
+	sha256: string;
+}
+
+export interface UpdateSpecOptions {
+	/**
+	 * A local artifact this process downloaded and verified itself ({@link verifyUpdateArtifactHash}).
+	 * An unverified path on disk is not evidence of anything: `install -g <path>.tgz` runs whatever
+	 * bytes are there, so the downloaded artifact only becomes installable once its digest is pinned
+	 * here.
+	 */
+	verifiedArtifact?: VerifiedUpdateArtifact;
+}
+
+const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/i;
+const NPM_PACKAGE_NAME_PATTERN = /^(?:@[A-Za-z0-9][A-Za-z0-9._-]*\/)?[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const NPM_VERSION_SELECTOR_PATTERN = /^[A-Za-z0-9][A-Za-z0-9.+_^~*|<>= -]*$/;
+
+/** Origins whose release artifacts this installation trusts. One source of truth: the download base. */
+export function getTrustedUpdateArtifactOrigins(): string[] {
+	try {
+		return [new URL(getPrimeAgentDownloadBaseUrl()).origin];
+	} catch {
+		return [];
 	}
-	return updateSpec;
+}
+
+/** True only for https URLs on the configured release download base, lookalike hosts included-none. */
+export function isTrustedUpdateArtifactUrl(url: string): boolean {
+	let parsed: URL;
+	try {
+		parsed = new URL(url);
+	} catch {
+		return false;
+	}
+	if (parsed.protocol !== "https:") return false;
+	return getTrustedUpdateArtifactOrigins().includes(parsed.origin);
+}
+
+/**
+ * Constant-shape digest check for a downloaded release artifact. An unreadable or empty payload
+ * never passes: a zero-byte "release tarball" is not a release tarball.
+ */
+export function verifyUpdateArtifactHash(bytes: Uint8Array, expectedSha256: string): boolean {
+	const expected = expectedSha256.trim().toLowerCase();
+	if (!SHA256_HEX_PATTERN.test(expected)) return false;
+	if (bytes.byteLength === 0) return false;
+	return createHash("sha256").update(bytes).digest("hex") === expected;
+}
+
+function rejectedUpdateSpec(spec: string, reason: UpdateSpecRejectionReason, detail: string): RejectedUpdateSpec {
+	return { kind: "rejected", spec, reason, detail };
+}
+
+function looksLikeTarballPath(spec: string): boolean {
+	const withoutQuery = spec.split("#")[0];
+	if (withoutQuery.startsWith("file:")) return true;
+	return /\.(?:tgz|tar\.gz)$/i.test(withoutQuery);
+}
+
+function artifactSourceDetail(): string {
+	return `its source is not the configured release download base (${getTrustedUpdateArtifactOrigins().join(", ") || "unset"})`;
+}
+
+/**
+ * Classify one self-update spec.
+ *
+ * The rule this encodes: a self-update may only run something whose bytes are pinned by the
+ * release it claims to come from. npm install -g takes an arbitrary absolute URL, follows
+ * redirects, and checks nothing, so a URL is only accepted when it points at the configured
+ * download base *and* carries `#sha256=<64 hex>`, and even then it is not installed directly -
+ * the caller downloads it, verifies the digest, and installs the verified local file.
+ */
+export function classifyUpdateSpec(spec: string, options: UpdateSpecOptions = {}): UpdateSpecClassification {
+	const raw = spec.trim();
+	if (!raw) {
+		return rejectedUpdateSpec(spec, "unsupported_artifact_spec", "it is empty");
+	}
+
+	const hashMatch = raw.match(/#sha256=([0-9A-Za-z]+)$/i);
+	const withoutFragment = hashMatch ? raw.slice(0, raw.length - hashMatch[0].length) : raw;
+	const pinnedSha256 = hashMatch?.[1]?.trim().toLowerCase();
+	const hasValidPin = pinnedSha256 !== undefined && SHA256_HEX_PATTERN.test(pinnedSha256);
+
+	if (/^https?:\/\//i.test(withoutFragment)) {
+		if (!isTrustedUpdateArtifactUrl(withoutFragment)) {
+			return rejectedUpdateSpec(raw, "untrusted_artifact_source", artifactSourceDetail());
+		}
+		if (!hasValidPin) {
+			return rejectedUpdateSpec(
+				raw,
+				"missing_artifact_hash",
+				`it pins no sha256 digest (expected "<url>#sha256=<64 hex>")`,
+			);
+		}
+		return { kind: "artifact", spec: raw, url: withoutFragment, sha256: pinnedSha256 };
+	}
+
+	// Everything that is not an https artifact has to be a local file this process verified:
+	// `file:` URLs, bare paths, and any other scheme (git:, ssh:, …) reach the same refusal.
+	const localSpec = looksLikeTarballPath(withoutFragment) || /^[a-z][a-z0-9+.-]*:/i.test(withoutFragment);
+	if (localSpec) {
+		const localPath = withoutFragment.startsWith("file:") ? withoutFragment.slice("file:".length) : withoutFragment;
+		const verified = options.verifiedArtifact;
+		const isVerified =
+			verified !== undefined &&
+			SHA256_HEX_PATTERN.test(verified.sha256) &&
+			resolve(verified.path) === resolve(localPath);
+		if (!isVerified) {
+			return rejectedUpdateSpec(
+				raw,
+				"unverified_local_artifact",
+				`the local artifact ${localPath} was not verified against a pinned sha256 digest`,
+			);
+		}
+		return {
+			kind: "verified-artifact",
+			spec: raw,
+			path: localPath,
+			sha256: verified.sha256.toLowerCase(),
+		};
+	}
+
+	const selectorIndex = raw.lastIndexOf("@");
+	const packageName = selectorIndex > 0 ? raw.slice(0, selectorIndex) : raw;
+	const selector = selectorIndex > 0 ? raw.slice(selectorIndex + 1) : undefined;
+	if (!NPM_PACKAGE_NAME_PATTERN.test(packageName)) {
+		return rejectedUpdateSpec(raw, "invalid_registry_spec", "it is not a valid npm package name");
+	}
+	if (selector !== undefined && !NPM_VERSION_SELECTOR_PATTERN.test(selector)) {
+		return rejectedUpdateSpec(raw, "invalid_registry_spec", `"${selector}" is not a valid npm version or tag`);
+	}
+	return { kind: "registry", spec: raw, packageName };
+}
+
+function isInstalledArtifactSpec(classification: UpdateSpecClassification): boolean {
+	return classification.kind === "artifact" || classification.kind === "verified-artifact";
 }
 
 function getSelfUpdateCommandForMethod(
@@ -157,33 +338,44 @@ function getSelfUpdateCommandForMethod(
 	installedPackageName: string,
 	updateSpec = installedPackageName,
 	npmCommand?: string[],
-	updatePackageName = getDefaultUpdatePackageName(installedPackageName, updateSpec),
+	updatePackageName?: string,
+	options: UpdateSpecOptions = {},
 ): SelfUpdateCommand | undefined {
-	const uninstallAfterInstall = isDirectPackageArtifactSpec(updateSpec);
+	const classification = classifyUpdateSpec(updateSpec, options);
+	// Refused before any command shape exists: a rejected spec must never reach a package
+	// manager, and a hash-pinned URL is not installable as a URL at all (npm would fetch it
+	// unchecked). The caller resolves that case to a verified local artifact first.
+	if (classification.kind === "rejected" || classification.kind === "artifact") return undefined;
+	// A registry spec carries its own name (so `prime-agent@0.9.1` does not look like a rename);
+	// an artifact installs the package this installation already is unless the caller says otherwise.
+	const resolvedUpdatePackageName =
+		updatePackageName ?? (classification.kind === "registry" ? classification.packageName : installedPackageName);
+	const installSpec = classification.kind === "verified-artifact" ? classification.path : classification.spec;
+	const uninstallAfterInstall = isInstalledArtifactSpec(classification);
 	switch (method) {
 		case "bun-binary":
 		case "homebrew":
 			return undefined;
 		case "pnpm":
 			return makeSelfUpdateCommand(
-				makeSelfUpdateCommandStep("pnpm", ["install", "-g", updateSpec]),
-				updatePackageName === installedPackageName
+				makeSelfUpdateCommandStep("pnpm", ["install", "-g", installSpec]),
+				resolvedUpdatePackageName === installedPackageName
 					? undefined
 					: makeSelfUpdateCommandStep("pnpm", ["remove", "-g", installedPackageName]),
 				{ uninstallAfterInstall },
 			);
 		case "yarn":
 			return makeSelfUpdateCommand(
-				makeSelfUpdateCommandStep("yarn", ["global", "add", updateSpec]),
-				updatePackageName === installedPackageName
+				makeSelfUpdateCommandStep("yarn", ["global", "add", installSpec]),
+				resolvedUpdatePackageName === installedPackageName
 					? undefined
 					: makeSelfUpdateCommandStep("yarn", ["global", "remove", installedPackageName]),
 				{ uninstallAfterInstall },
 			);
 		case "bun":
 			return makeSelfUpdateCommand(
-				makeSelfUpdateCommandStep("bun", ["install", "-g", updateSpec]),
-				updatePackageName === installedPackageName
+				makeSelfUpdateCommandStep("bun", ["install", "-g", installSpec]),
+				resolvedUpdatePackageName === installedPackageName
 					? undefined
 					: makeSelfUpdateCommandStep("bun", ["uninstall", "-g", installedPackageName]),
 				{ uninstallAfterInstall },
@@ -192,9 +384,9 @@ function getSelfUpdateCommandForMethod(
 			const [command = "npm", ...npmArgs] = npmCommand ?? [];
 			const inferred = npmCommand?.length ? undefined : getInferredNpmInstall();
 			const prefixArgs = [...npmArgs, ...(inferred ? ["--prefix", inferred.prefix] : [])];
-			const installStep = makeSelfUpdateCommandStep(command, [...prefixArgs, "install", "-g", updateSpec]);
+			const installStep = makeSelfUpdateCommandStep(command, [...prefixArgs, "install", "-g", installSpec]);
 			const uninstallStep =
-				updatePackageName === installedPackageName
+				resolvedUpdatePackageName === installedPackageName
 					? undefined
 					: makeSelfUpdateCommandStep(command, [...prefixArgs, "uninstall", "-g", installedPackageName]);
 			return makeSelfUpdateCommand(installStep, uninstallStep, { uninstallAfterInstall });
@@ -308,14 +500,41 @@ function isManagedByGlobalPackageManager(method: InstallMethod, packageName: str
 	);
 }
 
+function describeRefusedUpdateSpec(classification: RejectedUpdateSpec | ArtifactUpdateSpec): string {
+	if (classification.kind === "artifact") {
+		return (
+			`Refusing to self-update from ${classification.url}: it is hash-pinned (sha256 ${classification.sha256}) but a package manager cannot check that digest, ` +
+			`so Prime Agent only installs it from a copy it downloaded and verified itself. Re-run the update, or install the release with the published installer.`
+		);
+	}
+	const outcomes: Record<UpdateSpecRejectionReason, string> = {
+		untrusted_artifact_source:
+			"Install Prime Agent from a trusted release source instead: the published installer verifies the release SHA256SUMS before installing.",
+		missing_artifact_hash: `A hash-pinned artifact looks like ${getTrustedUpdateArtifactOrigins()[0] ?? "https://<download base>"}/releases/v<version>/<package>-<version>.tgz#sha256=<64 hex>.`,
+		unverified_local_artifact:
+			"Install the release with the published installer, which verifies the release SHA256SUMS, instead of a local tarball.",
+		unsupported_artifact_spec: "Use the published installer instead.",
+		invalid_registry_spec: "Use a registry spec such as prime-agent or prime-agent@0.9.1.",
+	};
+	return `Refusing to self-update from ${classification.spec}: ${classification.detail}. ${outcomes[classification.reason]}`;
+}
+
 export function getSelfUpdateCommand(
 	packageName: string,
 	npmCommand?: string[],
 	updateSpec = packageName,
-	updatePackageName = getDefaultUpdatePackageName(packageName, updateSpec),
+	updatePackageName?: string,
+	options: UpdateSpecOptions = {},
 ): SelfUpdateCommand | undefined {
 	const method = detectInstallMethod();
-	const command = getSelfUpdateCommandForMethod(method, packageName, updateSpec, npmCommand, updatePackageName);
+	const command = getSelfUpdateCommandForMethod(
+		method,
+		packageName,
+		updateSpec,
+		npmCommand,
+		updatePackageName,
+		options,
+	);
 	if (!command || !isManagedByGlobalPackageManager(method, packageName, npmCommand) || !isSelfUpdatePathWritable()) {
 		return undefined;
 	}
@@ -326,16 +545,31 @@ export function getSelfUpdateUnavailableInstruction(
 	packageName: string,
 	npmCommand?: string[],
 	updateSpec = packageName,
-	updatePackageName = getDefaultUpdatePackageName(packageName, updateSpec),
+	updatePackageName?: string,
+	options: UpdateSpecOptions = {},
 ): string {
 	const method = detectInstallMethod();
+	// A refused spec is about the spec, not about how this installation was installed: saying
+	// "this installation is not managed by a global npm install" here would point the user at
+	// the wrong problem.
+	const classification = classifyUpdateSpec(updateSpec, options);
+	if (classification.kind === "rejected" || classification.kind === "artifact") {
+		return describeRefusedUpdateSpec(classification);
+	}
 	if (method === "bun-binary") {
 		return `Download from: https://github.com/PrimeIntellect-ai/prime-agent/releases/latest`;
 	}
 	if (method === "homebrew") {
 		return `Update with: brew upgrade ${APP_NAME}`;
 	}
-	const command = getSelfUpdateCommandForMethod(method, packageName, updateSpec, npmCommand, updatePackageName);
+	const command = getSelfUpdateCommandForMethod(
+		method,
+		packageName,
+		updateSpec,
+		npmCommand,
+		updatePackageName,
+		options,
+	);
 	if (command) {
 		if (isManagedByGlobalPackageManager(method, packageName, npmCommand) && !isSelfUpdatePathWritable()) {
 			return `This installation is managed by a global ${method} install, but the install path is not writable. Update it yourself with: ${command.display}`;
