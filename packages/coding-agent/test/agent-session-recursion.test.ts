@@ -186,6 +186,7 @@ describe("AgentSession rlm recursion", () => {
 			maxDepth?: number;
 			streamFn?: StreamFn;
 			agentMessageController?: AgentSessionMessageController;
+			rlmMaxChildren?: number;
 			subagentRuntimeHost?: SubagentRuntimeHost;
 			customTools?: ConstructorParameters<typeof AgentSession>[0]["customTools"];
 			rlmSessionDir?: string;
@@ -243,6 +244,7 @@ describe("AgentSession rlm recursion", () => {
 			customTools: options.customTools,
 			rlmDepth: options.depth,
 			rlmMaxDepth: options.maxDepth,
+			rlmMaxChildren: options.rlmMaxChildren,
 			rlmSessionDir: options.rlmSessionDir,
 		});
 		return session;
@@ -2865,6 +2867,113 @@ describe("AgentSession rlm recursion", () => {
 		const root = createSession({ depth: 1, maxDepth: 1 });
 
 		await expect(root.runRlmChild("nested")).rejects.toThrow("RLM recursion depth limit reached");
+	});
+
+	it("bounds live children per session and refuses fan-out instead of queueing it (SC-1)", async () => {
+		const root = createSession({
+			maxDepth: 2,
+			rlmMaxChildren: 1,
+			streamFn: (_model, context) => {
+				const text = userText(context);
+				// A child whose turn never finishes stays live for the whole assertion below.
+				if (text.includes("hang")) return createAssistantMessageEventStream();
+				return streamAnswer(`child answer: ${text}`);
+			},
+		});
+
+		const first = await root.runRlmChild("hang on this turn");
+		expect(first.session_dir).toContain("sub-");
+
+		await expect(root.runRlmChild("second worker")).rejects.toThrow(
+			"RLM subagent limit reached: this session already has 1 live children and the concurrency cap is 1",
+		);
+		// The refusal has to name a way out: a bare "busy" reads as a retry and would be looped.
+		await expect(root.runRlmChild("third worker")).rejects.toThrow("0 disables the cap");
+		await expect(root.runRlmChild("fourth worker")).rejects.toThrow("rlmMaxChildren");
+		root.dispose();
+	});
+
+	it("reads the live-child cap from RLM_MAX_CHILDREN, and only 0 disables it (SC-1)", async () => {
+		const hang = () => {
+			const stream = createAssistantMessageEventStream();
+			return stream;
+		};
+		vi.stubEnv("RLM_MAX_CHILDREN", "1");
+		try {
+			const capped = createSession({ maxDepth: 2, streamFn: hang });
+			await capped.runRlmChild("hang one");
+			await expect(capped.runRlmChild("blocked by the env cap")).rejects.toThrow("concurrency cap is 1");
+			capped.dispose();
+		} finally {
+			vi.unstubAllEnvs();
+		}
+
+		vi.stubEnv("RLM_MAX_CHILDREN", "0");
+		try {
+			const uncapped = createSession({ maxDepth: 2, streamFn: hang });
+			await uncapped.runRlmChild("hang a");
+			await expect(uncapped.runRlmChild("hang b")).resolves.toMatchObject({ rlm_child_id: expect.any(String) });
+			uncapped.dispose();
+		} finally {
+			vi.unstubAllEnvs();
+		}
+	});
+
+	it("removes the child session directory when admission is refused after it was created (SC-3)", async () => {
+		const rlmSessionDir = join(tempDir, "refused-spawn-sessions");
+		const root = createSession({
+			maxDepth: 2,
+			rlmSessionDir,
+			agentMessageController: {
+				listAgents: () => ({ agents: [] }),
+				// The catalog refuses the generated name, which is the last check *after* the
+				// directory exists - the refusal window the ledger flagged.
+				assertSessionNameAvailable: async () => {
+					throw new Error("catalog refused this generated name");
+				},
+				sendAgentMessage: async () => {
+					throw new Error("unexpected send");
+				},
+			},
+		});
+
+		await expect(root.runRlmChild("refused after the directory exists")).rejects.toThrow(
+			"catalog refused this generated name",
+		);
+
+		const leftovers = existsSync(rlmSessionDir)
+			? readdirSync(rlmSessionDir).filter((entry) => entry.startsWith("sub-"))
+			: [];
+		expect(leftovers).toEqual([]);
+	});
+
+	it("applies a lowered max depth to the subtree already in flight (SC-2)", async () => {
+		const root = createSession({ maxDepth: 3 });
+		const childHandle = await root.runRlmChild("first child");
+		await waitFor(() => root.getRlmChildSession(childHandle.rlm_child_id) !== undefined);
+		const child = root.getRlmChildSession(childHandle.rlm_child_id);
+		if (!child) throw new Error("Missing retained child session");
+		const grandchildHandle = await child.runRlmChild("grandchild");
+		await waitFor(() => child.getRlmChildSession(grandchildHandle.rlm_child_id) !== undefined);
+		const grandchild = child.getRlmChildSession(grandchildHandle.rlm_child_id);
+		if (!grandchild) throw new Error("Missing retained grandchild session");
+
+		await root.setRlmMaxDepth(1);
+
+		// Both levels of the dispatched subtree have to spawn under the new cap, not the
+		// snapshot each of them was granted.
+		await expect(child.runRlmChild("grandchild after the reduction")).rejects.toThrow(
+			"an ancestor session lowered this subtree's cap to 1",
+		);
+		await expect(grandchild.runRlmChild("great-grandchild after the reduction")).rejects.toThrow(
+			"an ancestor session lowered this subtree's cap to 1",
+		);
+
+		// A child admitted *after* the reduction is granted the tightened cap, not the old one.
+		await root.setRlmMaxDepth(2);
+		const laterHandle = await root.runRlmChild("child after the reduction");
+		await waitFor(() => root.getRlmChildSession(laterHandle.rlm_child_id) !== undefined);
+		expect(root.getRlmChildSession(laterHandle.rlm_child_id)?.rlmMaxDepth).toBe(2);
 	});
 
 	it("rejects unsupported rlm.run kwargs loudly", async () => {
