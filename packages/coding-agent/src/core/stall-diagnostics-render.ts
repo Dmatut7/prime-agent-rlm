@@ -51,6 +51,16 @@ export function formatStallDiagnosticsLines(diagnostics: StallDiagnostics | unde
 	const payload = isSegment(diagnostics) ? (diagnostics as Record<string, unknown>) : undefined;
 	if (!payload) {
 		lines.push("diagnostics: unknown (event predates the diagnostics payload)");
+		// X-3: the downgrade must still point somewhere. DO-1's retrievability
+		// promise is exactly for this mixed-version event, and the pre-fix
+		// early-return swallowed the pointer line with the payload. The pointer
+		// below is resolved in *this* process (the renderer/client), not by the
+		// daemon that emitted the event: when the daemon runs under a different
+		// agent dir, its own logs hold the record and these paths do not.
+		const degradedPointer = resolveStallDiagnosticsPointer();
+		lines.push(
+			`diagnostics file (resolved locally in this client; the emitting daemon may record under its own logs dir): ${degradedPointer.evidencePath} (also ${degradedPointer.agentLogPath})`,
+		);
 		return lines;
 	}
 	const busy = payload["busy"];

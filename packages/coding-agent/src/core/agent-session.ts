@@ -194,7 +194,12 @@ import type {
 	KernelSentAgentMessage,
 	KernelUnexpectedExitFacts,
 } from "./kernel/index.js";
-import { type RestoreResult, restoreNoticeLines, snapshotPathIn } from "./kernel/state-snapshot.js";
+import {
+	compactionKernelStateLines,
+	type RestoreResult,
+	restoreNoticeLines,
+	snapshotPathIn,
+} from "./kernel/state-snapshot.js";
 import type { AcpMcpServerConfig } from "./mcp/acp-mcp-types.js";
 import type { McpManager } from "./mcp/mcp-manager.js";
 import {
@@ -205,6 +210,7 @@ import {
 	convertToLlm,
 	createCompactionOutcomeMessage,
 	createHeartbeatPromptMessage,
+	createRefinementFailureMessage,
 	createRefinementOutcomeMessage,
 	createRlmChildFailureMessage,
 	createRlmChildTerminalNoticeMessage,
@@ -231,6 +237,7 @@ import {
 	getHarnessStatePath,
 	getLocalHarnessStateDir,
 	getRefinementHistory,
+	type HarnessScope,
 	type HarnessState,
 	inferRefinementResultScope,
 	isPersistentHarnessStorageSupported,
@@ -1230,6 +1237,28 @@ const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
 const RLM_TERMINAL_NOTICE_ABANDON_AFTER_MS = 5 * 60_000;
 /** Consecutive retryable agent-message send failures before the error becomes terminal (M6b). */
 const AGENT_MESSAGE_RETRYABLE_FAILURE_LIMIT = 3;
+
+/**
+ * FR-4: how long one quiescence barrier waits before giving up. A descendant
+ * that never settles must not park the barrier (and every headless completion
+ * behind it) forever; past the deadline the wait warns and reports
+ * `{ settled: false }`.
+ */
+const RLM_QUIESCENCE_GIVE_UP_MS = 5 * 60_000;
+
+/** O1: how long a recorded agent-message send failure stays "consecutive". */
+const AGENT_MESSAGE_SEND_FAILURE_TTL_MS = 24 * 60 * 60_000;
+
+/** O1: hard ceiling on distinct failed targets kept in the ledger. */
+const AGENT_MESSAGE_SEND_FAILURE_MAX_TARGETS = 512;
+
+/** Outcome of a quiescence barrier wait: settled, or gave up on the deadline. */
+export interface RlmQuiescenceOutcome {
+	/** False when the wait gave up on its deadline with work still unsettled. */
+	settled: boolean;
+	/** Present when settled is false because the give-up deadline fired. */
+	timedOut?: true;
+}
 /** How long failure-class terminal notices are collected before one aggregated wake. */
 const FAILURE_WAKE_AGGREGATION_MS = 2_000;
 /**
@@ -1619,8 +1648,18 @@ export class AgentSession {
 	 * Consecutive retryable `agent_message.send` failures per target. Bounded on
 	 * purpose: a retryable error plus a host liveness vouch plus a persistent model
 	 * is a no-output loop, so after a few attempts the error becomes terminal.
+	 *
+	 * O1: entries are not forever. A target that failed once and was never
+	 * addressed again used to keep its count forever - a long-lived session
+	 * accumulated one entry per ever-failed target, and a failure from yesterday
+	 * still counted as "consecutive" today. Entries expire after 24h, and the
+	 * ledger holds a hard volume ceiling so a pathological sender fan-out cannot
+	 * grow it without bound.
 	 */
-	private readonly _agentMessageSendFailures = new Map<string, { count: number; lastError: string }>();
+	private readonly _agentMessageSendFailures = new Map<
+		string,
+		{ count: number; lastError: string; lastFailedAt: number }
+	>();
 	/**
 	 * Retry attempts consumed by the failure sequence that reached the last
 	 * terminal-error junction. Lets the parent-facing terminal notice say whether
@@ -2956,7 +2995,7 @@ export class AgentSession {
 					try {
 						await this._applySerializedPlan(bgResult);
 					} catch (error) {
-						this._emitRefineFailed(error);
+						this._emitRefineFailed(error, bgResult.options.global ? "global" : "local");
 					}
 					this._lastAutoRefineReviewAt = Date.now();
 					this._assistantTurnsSinceAutoRefine = 0;
@@ -3030,7 +3069,7 @@ export class AgentSession {
 			try {
 				await this._runSerializedRefine(pending);
 			} catch (error) {
-				this._emitRefineFailed(error);
+				this._emitRefineFailed(error, pending.global ? "global" : "local");
 			}
 			this._lastAutoRefineReviewAt = Date.now();
 			this._assistantTurnsSinceAutoRefine = 0;
@@ -3889,10 +3928,22 @@ export class AgentSession {
 				if (typeof payload.message !== "string") {
 					throw new Error("agent_message.send message must be a string");
 				}
-				return this._agentMessageController.sendAgentMessage({
-					target: assertDirectAgentMessageTarget(payload.target),
-					message: normalizeAgentSessionMessage(payload.message),
-				});
+				const target = assertDirectAgentMessageTarget(payload.target);
+				const message = normalizeAgentSessionMessage(payload.message);
+				const controller = this._agentMessageController;
+				// The retry ledger and its TTL live on the session (O1), so the
+				// public host request is the seam that owns them; the kernel
+				// handler below only adds the delivery-receipt bookkeeping. The
+				// wrapper keeps this method's mixed sync/async return type.
+				return (async () => {
+					try {
+						const receipt = await controller.sendAgentMessage({ target, message });
+						this._agentMessageSendFailures.delete(target);
+						return receipt;
+					} catch (error) {
+						throw this._terminalizeRepeatedAgentMessageSendFailure(target, error);
+					}
+				})();
 			}
 			default:
 				throw new Error(`unknown agent message request type "${type}"`);
@@ -5184,7 +5235,7 @@ export class AgentSession {
 						try {
 							await this._applySerializedPlan(bgResult);
 						} catch (error) {
-							this._emitRefineFailed(error);
+							this._emitRefineFailed(error, bgResult.options.global ? "global" : "local");
 						}
 						// Stamp cooldown and reset counter so the interval
 						// check below does not trigger a duplicate refine.
@@ -8193,13 +8244,13 @@ export class AgentSession {
 					break;
 				case "refine": {
 					let result: RefinementResult;
+					const options = parseRefineCommandOptions(input.command.args);
 					try {
-						const options = parseRefineCommandOptions(input.command.args);
 						result = await this.refine(options, { skipAbort: true });
 					} catch (error) {
 						// Only a failure of the refinement itself is a refine failure; a later
 						// result-row persist error must not report a completed refinement as failed.
-						this._emitRefineFailed(this._asError(error));
+						this._emitRefineFailed(this._asError(error), options.global ? "global" : "local");
 						throw error;
 					}
 					const applied = result.appliedEdits.filter((edit) => edit.applied).length;
@@ -9560,7 +9611,7 @@ export class AgentSession {
 	private async _syncKernelStateAfterCompaction(): Promise<void> {
 		const provisioner = this._ipythonKernelProvisioner;
 		if (!provisioner?.hasRunningKernel) return;
-		const pruned = await provisioner.pruneOversizedVariables().catch(() => null);
+		const snapshot = await provisioner.pruneOversizedVariables().catch(() => null);
 		const abort = new AbortController();
 		const timer = setTimeout(() => abort.abort(), KERNEL_STATE_LISTING_TIMEOUT_MS);
 		if (typeof timer === "object" && "unref" in timer) timer.unref();
@@ -9571,21 +9622,9 @@ export class AgentSession {
 			clearTimeout(timer);
 		}
 		if (names === null && !provisioner.hasRunningKernel) return;
-		const detail =
-			names === null
-				? ""
-				: names.length > 0
-					? ` These names are still defined: ${names.join(", ")}.`
-					: " You have not defined any names yet.";
-		const prunedDetail =
-			pruned && pruned.length > 0
-				? ` Variables above the per-variable snapshot limit were removed: ${pruned.join(", ")}.`
-				: "";
-		const content = [
-			"<ipython_state>",
-			`Your Python kernel persisted through compaction; its remaining variables, imports, and helpers are still available.${prunedDetail}${detail}`,
-			"</ipython_state>",
-		].join("\n");
+		const content = ["<ipython_state>", ...compactionKernelStateLines({ snapshot, names }), "</ipython_state>"].join(
+			"\n",
+		);
 		const message = {
 			role: "custom" as const,
 			customType: "ipython_state",
@@ -10107,18 +10146,61 @@ export class AgentSession {
 	 * at the turn boundary after compaction checks and before auto-refine
 	 * scheduling so the manual request takes priority.
 	 */
-	private _emitRefineFailed(error: unknown): void {
+	private _emitRefineFailed(error: unknown, scope: HarnessScope = "local"): void {
+		const reason = error instanceof Error ? error.message : String(error);
 		this._emit({
 			type: "refine_failed",
-			error: error instanceof Error ? error.message : String(error),
+			error: reason,
 		});
+		// MV-5: every refinement failure - plan parse, length guard, provider
+		// error, or the persist rejection above - leaves a model-visible receipt,
+		// the same surface successes use (e6c1af56). Without it the failure was
+		// UI/event-only and the model never learned its refine.run produced
+		// nothing. A skip is a deliberate decline, not a failure: it stays
+		// event-only.
+		if (error instanceof RefineSkippedError) return;
+		this._recordRefinementFailureReceipt(reason, scope);
+	}
+
+	private _recordRefinementFailureReceipt(reason: string, scope: HarnessScope): void {
+		const message = createRefinementFailureMessage({
+			refinementId: generateRefinementId(),
+			scope,
+			reason,
+		});
+		try {
+			this.sessionManager.appendCustomMessageEntryWithRollback(
+				message.customType,
+				message.content,
+				message.display,
+				message.details,
+			);
+		} catch (error) {
+			const persistenceError = error instanceof Error ? error.message : String(error);
+			// Same disclosure rule as compaction outcomes: the receipt stays
+			// model-visible for this process and says it could not be saved.
+			const unpersisted = createRefinementFailureMessage(
+				{ refinementId: message.details.refinementId, scope, reason },
+				true,
+				message.timestamp,
+			);
+			unpersisted.content = `${message.content}\n\nThis refinement failure receipt could not be saved to session history: ${persistenceError}`;
+			this._unpersistedOutcomes.push(unpersisted);
+			this.agent.state.messages.push(unpersisted);
+			this._emit({ type: "message_start", message: unpersisted });
+			this._emit({ type: "message_end", message: unpersisted });
+			return;
+		}
+		this.agent.state.messages.push(message);
+		this._emit({ type: "message_start", message });
+		this._emit({ type: "message_end", message });
 	}
 
 	private _consumePendingRequestedRefine(): boolean {
 		const pending = this._pendingRequestedRefine;
 		if (!pending) return false;
 		this._pendingRequestedRefine = undefined;
-		void this.refine(pending).catch((error) => this._emitRefineFailed(error));
+		void this.refine(pending).catch((error) => this._emitRefineFailed(error, pending.global ? "global" : "local"));
 		return true;
 	}
 
@@ -10840,12 +10922,13 @@ export class AgentSession {
 			} catch (error) {
 				refinementPersistError = { error };
 			}
-			try {
-				this._recordRefinementOutcome(result);
-			} catch (error) {
-				if (!refinementPersistError) throw error;
-			}
+			// MV-6: the completion receipt only lands on the success path. The
+			// pre-fix order recorded it before the persist error was thrown, so a
+			// concurrent-write rejection left a "Refinement complete" receipt in the
+			// message flow while nothing landed on disk; the failure path now
+			// reports through `_emitRefineFailed` at the caller's catch instead.
 			if (refinementPersistError) throw refinementPersistError.error;
+			this._recordRefinementOutcome(result);
 			this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
 			this.agent.state.systemPrompt = this._baseSystemPrompt;
 			try {
@@ -11900,16 +11983,10 @@ export class AgentSession {
 						awaitPendingChildPublication: (selector, signal) =>
 							this._awaitPendingRlmChildPublication(selector, signal),
 						sendAgentMessage: async (input) => {
-							let receipt: AgentSessionMessageReceipt;
-							try {
-								receipt = (await this.handleAgentMessageHostRequest("agent_message.send", {
-									target: input.target,
-									message: input.message,
-								})) as AgentSessionMessageReceipt;
-							} catch (error) {
-								throw this._terminalizeRepeatedAgentMessageSendFailure(input.target, error);
-							}
-							this._agentMessageSendFailures.delete(input.target);
+							const receipt = (await this.handleAgentMessageHostRequest("agent_message.send", {
+								target: input.target,
+								message: input.message,
+							})) as AgentSessionMessageReceipt;
 							// B1: only a delivered reply counts as "the child replied". A
 							// queued receipt means the parent has not seen anything yet, and
 							// counting it would let the parent's terminal gate treat a
@@ -12415,6 +12492,26 @@ export class AgentSession {
 	 * or a full queue stays retryable); from the third consecutive failure the caller
 	 * gets an error that says retrying is pointless and what to do instead.
 	 */
+	/**
+	 * Drop expired entries (O1) and enforce the volume ceiling: entries whose
+	 * last failure is older than the TTL are not "consecutive" with a fresh one,
+	 * and the ledger never grows past `AGENT_MESSAGE_SEND_FAILURE_MAX_TARGETS`
+	 * targets (oldest last-failure evicted first; re-insertion on update keeps
+	 * the map's insertion order aligned with recency).
+	 */
+	private _pruneAgentMessageSendFailures(now: number): void {
+		for (const [target, failure] of this._agentMessageSendFailures) {
+			if (now - failure.lastFailedAt > AGENT_MESSAGE_SEND_FAILURE_TTL_MS) {
+				this._agentMessageSendFailures.delete(target);
+			}
+		}
+		while (this._agentMessageSendFailures.size >= AGENT_MESSAGE_SEND_FAILURE_MAX_TARGETS) {
+			const oldest = this._agentMessageSendFailures.keys().next().value;
+			if (oldest === undefined) break;
+			this._agentMessageSendFailures.delete(oldest);
+		}
+	}
+
 	private _terminalizeRepeatedAgentMessageSendFailure(target: string, error: unknown): Error {
 		const message = error instanceof Error ? error.message : String(error);
 		const original = error instanceof Error ? error : new Error(message);
@@ -12422,8 +12519,11 @@ export class AgentSession {
 			this._agentMessageSendFailures.delete(target);
 			return original;
 		}
+		const now = Date.now();
+		this._pruneAgentMessageSendFailures(now);
 		const attempts = (this._agentMessageSendFailures.get(target)?.count ?? 0) + 1;
-		this._agentMessageSendFailures.set(target, { count: attempts, lastError: message });
+		this._agentMessageSendFailures.delete(target);
+		this._agentMessageSendFailures.set(target, { count: attempts, lastError: message, lastFailedAt: now });
 		if (attempts < AGENT_MESSAGE_RETRYABLE_FAILURE_LIMIT) return original;
 		// Countable signature for a sender that burned its retry budget (appendix B).
 		sessionLog.warn("agent message retryable repeat terminal", {
@@ -13433,8 +13533,16 @@ export class AgentSession {
 	 * Wait for every admitted descendant run to publish its terminal parent
 	 * message and for the resulting parent turns to drain. Re-snapshotting after
 	 * each drain includes descendants spawned while earlier results were consumed.
+	 *
+	 * FR-4: the wait is bounded by a give-up deadline (5 minutes). A descendant
+	 * that never settles used to park this barrier forever - and with it every
+	 * headless completion that asked for quiescence. On the deadline the wait
+	 * warns and returns `{ settled: false }` instead of hanging: the caller can
+	 * proceed with the current state, and the log says descendants may still be
+	 * running.
 	 */
-	async waitForRlmQuiescence(externalSignal?: AbortSignal): Promise<void> {
+	async waitForRlmQuiescence(externalSignal?: AbortSignal): Promise<RlmQuiescenceOutcome> {
+		const startedAt = Date.now();
 		const cancellation = new AbortController();
 		const cancelFromParent = () => cancellation.abort();
 		if (externalSignal?.aborted) cancellation.abort();
@@ -13448,6 +13556,17 @@ export class AgentSession {
 		cancellation.signal.addEventListener("abort", onCancelled, { once: true });
 		if (cancellation.signal.aborted) onCancelled();
 		const wait = <T>(operation: Promise<T>): Promise<T> => Promise.race([operation, cancelled]);
+		// The give-up timer reuses the cancellation path so the recursive sibling
+		// waits unwind exactly like an external abort; the flag separates "gave
+		// up on the deadline" from a caller-driven cancellation, which still
+		// rejects.
+		let gaveUpAt: number | undefined;
+		const giveUp = () => {
+			gaveUpAt = Date.now();
+			cancellation.abort();
+		};
+		const giveUpTimer = setTimeout(giveUp, RLM_QUIESCENCE_GIVE_UP_MS);
+		if (typeof giveUpTimer === "object" && "unref" in giveUpTimer) giveUpTimer.unref();
 		try {
 			while (true) {
 				await wait(this.waitForHeadlessIdle());
@@ -13483,7 +13602,7 @@ export class AgentSession {
 				}
 				const unsettledRuns = [...this._unsettledRlmChildRuns].filter((run) => !run.settled);
 				const childSessions = this._rlmChildSessionSnapshot();
-				if (unsettledRuns.length === 0 && !this._hasUnsettledRlmQuiescenceWork()) return;
+				if (unsettledRuns.length === 0 && !this._hasUnsettledRlmQuiescenceWork()) return { settled: true };
 				await wait(
 					Promise.all([
 						...unsettledRuns.map((run) => run.settlement.promise),
@@ -13493,7 +13612,22 @@ export class AgentSession {
 				// Always loop through the self-active/deferred checks again. Work may
 				// start at the child-settlement boundary.
 			}
+		} catch (error) {
+			// FR-4: the deadline fired and unwound the wait through the cancellation
+			// path. Report the give-up instead of surfacing it as an error: the
+			// caller asked "is everything settled" and the honest answer is "not
+			// yet, and I stopped waiting".
+			if (gaveUpAt !== undefined) {
+				sessionLog.warn("rlm quiescence wait gave up after its deadline; descendants may still be unsettled", {
+					sessionId: this.sessionId,
+					waitedMs: gaveUpAt - startedAt,
+					unsettledChildren: this._rlmChildSessionSnapshot().length,
+				});
+				return { settled: false, timedOut: true };
+			}
+			throw error;
 		} finally {
+			clearTimeout(giveUpTimer);
 			// A local descendant error must cancel sibling recursive waits owned by
 			// this barrier before their propagation listeners are removed.
 			cancellation.abort();

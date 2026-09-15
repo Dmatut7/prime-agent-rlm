@@ -2983,10 +2983,11 @@ export class SessionManager {
 		// root the branch selector cannot navigate up from. A node is retained when
 		// either window wants it, and the leaf always falls inside its own window, so
 		// the entry the session resumes on keeps its ancestors. The serializer bound
-		// survives the union: a retained chain is at most `depthLimit` edges inside
-		// either window, and a chain crossing from the live window into the deep one is
-		// at most `2 * depthLimit + 2` edges (it can only exist when the leaf is within
-		// `depthLimit` of the global deepest entry).
+		// holds for the union, not per window: when the leaf is within `depthLimit+1`
+		// of the global deepest entry the live window's cut rises to the deep window's
+		// (see depthRetained), so every retained parent chain is at most `depthLimit`
+		// edges deep in any shape; the pre-fix union stacked the two windows into
+		// chains up to `2 * depthLimit + 1` edges deep.
 		let maxDepth = 0;
 		for (const depth of depths.values()) {
 			if (depth > maxDepth) {
@@ -3014,11 +3015,29 @@ export class SessionManager {
 		// kept set comes back as a root, exactly like a depth-cut node.
 		const nodeCapLimit = Math.max(1, Math.floor(nodeLimit));
 		const nodeCapActive = Number.isFinite(nodeLimit) && entries.length > nodeCapLimit;
+		// K3X-4: the live window rises to the deep window's cut when the leaf sits
+		// within depthLimit+1 of the global deepest entry. The two windows cut the
+		// same side, but their union could stack: the live window keeps the leaf's
+		// ancestor chain and the deep window keeps the deepest layers, and when the
+		// leaf is that deep the two retained segments are contiguous on one parent
+		// chain (or the live chain feeds the deep one through a shared trunk), so the
+		// returned tree was up to maxDepth - liveWindowFrom = 2*depthLimit+1 edges
+		// deep (measured 1149 on a depthLimit-1000 bound) while `depthLimit` rides
+		// the wire as the tree's bound and the serializer budget. Rising to the deep
+		// cut in that regime keeps every retained run at most depthLimit edges; the
+		// leaf itself stays inside the deep window, and only when the leaf sits
+		// exactly one below the cut does it come back detached through the safety
+		// net below. When the leaf is further above the deepest entry (the GL-1
+		// rewind-and-fork shape), the gap between the two windows is unretained, the
+		// runs stay separate, and the live window keeps its own cut.
+		const liveWindowCutsToDeep =
+			leafDepth !== undefined && Number.isFinite(depthLimit) && deepWindowFrom <= leafDepth + 1;
+		const effectiveLiveWindowFrom = liveWindowCutsToDeep ? deepWindowFrom : liveWindowFrom;
 		const depthRetained = (entry: SessionEntry, depth: number): boolean => {
 			if (!Number.isFinite(depthLimit)) {
 				return true;
 			}
-			return depth >= deepWindowFrom || (livePath.has(entry.id) && depth >= liveWindowFrom);
+			return depth >= deepWindowFrom || (livePath.has(entry.id) && depth >= effectiveLiveWindowFrom);
 		};
 		const capKept = new Set<string>();
 		if (nodeCapActive) {
@@ -3061,10 +3080,11 @@ export class SessionManager {
 			const node = nodeMap.get(entry.id)!;
 			if (!isRetained(entry, depth)) {
 				// The leaf anchors its own window, so in practice it is always retained;
-				// this is the safety net for a leaf that somehow falls outside both
-				// windows. It comes back detached and is counted once, in `returned`
-				// only - counting it in both buckets made the stats report one more
-				// node than the session has.
+				// this is the safety net for a leaf that falls outside both windows -
+				// reachable when the K3X-4 live-window rise puts the cut exactly one
+				// above the leaf (deepWindowFrom == leafDepth + 1). It comes back
+				// detached and is counted once, in `returned` only - counting it in
+				// both buckets made the stats report one more node than the session has.
 				if (entry.id === leafId) {
 					detachedLeaf = node;
 					returned += 1;

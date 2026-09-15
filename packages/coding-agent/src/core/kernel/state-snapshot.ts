@@ -116,6 +116,59 @@ export function snapshotWritePolicy(input: SnapshotWritePolicyInput): SnapshotWr
 }
 
 /**
+ * The `<ipython_state>` body written after compaction. Kept next to the result shape so the
+ * wording is assertable without building a session (the restore-side precedent,
+ * `restoreNoticeLines`); the session glue that renders it lives in agent-session.ts.
+ *
+ * FR-5: the post-compaction snapshot write is fail-open (`pruneOversizedVariables` returns
+ * null on refusal or failure), so the notice must not claim persistence unconditionally: a
+ * null write means the on-disk snapshot was NOT refreshed, and anything defined since the
+ * last successful write will not survive a restart. The kernel is still live either way, so
+ * the "still available" half stays true; only the persistence claim is conditional.
+ */
+export function compactionKernelStateLines(input: {
+	/** The snapshot write result, or null when it was refused, failed, or the kernel died. */
+	snapshot: SnapshotResult | null;
+	/** Namespace listing result, or null when the kernel could not be listed. */
+	names: string[] | null;
+}): string[] {
+	const lines: string[] = [];
+	if (input.snapshot === null) {
+		lines.push(
+			"Your Python kernel persisted through compaction; its remaining variables, imports, and helpers are still available.",
+		);
+		lines.push(
+			"The kernel's state snapshot could not be written, so these names were not saved to disk: a restart revives only the last successfully written snapshot, and anything defined since then must be recreated.",
+		);
+	} else {
+		const pruned = input.snapshot.pruned ?? [];
+		lines.push(
+			pruned.length > 0
+				? `Your Python kernel persisted through compaction; its remaining variables, imports, and helpers are still available. Variables above the per-variable snapshot limit were removed: ${pruned.join(", ")}.`
+				: "Your Python kernel persisted through compaction; its remaining variables, imports, and helpers are still available.",
+		);
+		const skipped = input.snapshot.skipped;
+		if (skipped && skipped.length > 0) {
+			lines.push(
+				`These were live but could not be saved into the snapshot, so they will not survive a restart: ${skipped
+					.map((entry) => `${entry.name} (${entry.reason})`)
+					.join("; ")}.`,
+			);
+		}
+	}
+	if (input.names === null) {
+		lines.push("The kernel's namespace could not be listed, so which names are still defined is unknown here.");
+	} else {
+		lines.push(
+			input.names.length > 0
+				? `These names are still defined: ${input.names.join(", ")}.`
+				: "You have not defined any names yet.",
+		);
+	}
+	return lines;
+}
+
+/**
  * The `<ipython_state_restored>` body for one restore result. Kept next to the result shape
  * so the wording is assertable without building a session; the session glue that renders it
  * lives in agent-session.ts.

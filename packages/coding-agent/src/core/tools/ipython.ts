@@ -23,7 +23,7 @@ import {
 	type KernelUnexpectedExitFacts,
 	ReplKernelManager,
 } from "../kernel/index.js";
-import { manifestPathIn, type RestoreResult, snapshotPathIn } from "../kernel/state-snapshot.js";
+import { manifestPathIn, type RestoreResult, type SnapshotResult, snapshotPathIn } from "../kernel/state-snapshot.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 
@@ -411,11 +411,15 @@ export class IpythonKernelProvisioner {
 		return this.startedManager?.isRunning ?? false;
 	}
 
-	/** Remove live variables above the snapshot's per-variable size limit. */
-	async pruneOversizedVariables(): Promise<string[] | null> {
+	/**
+	 * Persist the namespace, then remove live variables above the snapshot's
+	 * per-variable size limit. Returns the full write result - FR-5: a null
+	 * return means the write was refused or failed, and the post-compaction
+	 * notice must not claim persistence then.
+	 */
+	async pruneOversizedVariables(): Promise<SnapshotResult | null> {
 		const m = this.startedManager ?? (await this.managerPromise?.catch(() => undefined));
-		const result = await m?.pruneOversizedVariables();
-		return result ? (result.pruned ?? []) : null;
+		return (await m?.pruneOversizedVariables()) ?? null;
 	}
 
 	/** Live user-defined names in the kernel namespace, or null if listing failed / no kernel. */
