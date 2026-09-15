@@ -283,6 +283,31 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * the loop applies no stall timeout of its own.
 	 */
 	streamStallTimeoutMs?: number;
+
+	/**
+	 * In-place retry policy for a clean but empty assistant turn (no text, no tool
+	 * calls). The loop retries with an exponential wait between attempts and reports
+	 * the terminal failure through `stopReason: "error"` plus a diagnostic.
+	 *
+	 * `maxAttempts` is the total number of provider calls (1 disables retrying);
+	 * `baseDelayMs` doubles per attempt and is clamped by `maxDelayMs`;
+	 * `maxTotalDelayMs` bounds the whole turn and, when reached, ends the retries
+	 * early with the budget named as the reason. Unset fields use
+	 * `EMPTY_TURN_RETRY_DEFAULTS` from the loop.
+	 */
+	emptyTurnRetry?: EmptyTurnRetryConfig;
+}
+
+/** Backoff budget for the loop's empty-turn retries; see `AgentLoopConfig.emptyTurnRetry`. */
+export interface EmptyTurnRetryConfig {
+	/** Total provider attempts for one turn while replies stay empty. */
+	maxAttempts?: number;
+	/** First (and doubling base) wait between attempts, in ms. `0` means no gap. */
+	baseDelayMs?: number;
+	/** Upper bound for a single wait, in ms. */
+	maxDelayMs?: number;
+	/** Upper bound for the summed waits of one turn, in ms. */
+	maxTotalDelayMs?: number;
 }
 
 /**

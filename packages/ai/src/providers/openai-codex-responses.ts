@@ -5,6 +5,7 @@ import type {
 	ResponseInput,
 	ResponseStreamEvent,
 } from "openai/resources/responses/responses.js";
+import { DEFAULT_MAX_RETRY_DELAY_MS, parseRetryAfterMs } from "./retry-cap.js";
 
 // NEVER convert to top-level runtime imports - breaks browser/Vite builds
 let _os: typeof NodeOs | null = null;
@@ -47,7 +48,6 @@ const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 const JWT_CLAIM_PATH = "https://api.openai.com/auth" as const;
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000;
-const DEFAULT_MAX_RETRY_DELAY_MS = 60_000;
 const CODEX_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
 const WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE = 1009;
 
@@ -108,28 +108,6 @@ class RetryDelayCapError extends Error {
 		this.delayMs = delayMs;
 		this.capMs = capMs;
 	}
-}
-
-function parseRetryAfterMs(headers: Headers): number | undefined {
-	const raw = headers.get("retry-after");
-	if (raw == null) {
-		return undefined;
-	}
-	const trimmed = raw.trim();
-	if (trimmed === "") {
-		return undefined;
-	}
-	if (/^\d+(\.\d+)?$/.test(trimmed)) {
-		const seconds = Number(trimmed);
-		if (Number.isFinite(seconds) && seconds >= 0) {
-			return seconds * 1000;
-		}
-	}
-	const dateMs = Date.parse(trimmed);
-	if (!Number.isNaN(dateMs)) {
-		return Math.max(0, dateMs - Date.now());
-	}
-	return undefined;
 }
 
 /** Cap for retry waits. `maxRetryDelayMs === 0` disables the cap. */

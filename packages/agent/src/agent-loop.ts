@@ -8,9 +8,11 @@ import {
 	type AssistantMessageEvent,
 	appendAssistantMessageDiagnostic,
 	type Context,
+	classifyStreamFailure,
 	EventStream,
 	type ImageContent,
 	isContextOverflow,
+	type ProviderRetryNotice,
 	streamSimple,
 	type TextContent,
 	type ToolResultMessage,
@@ -25,6 +27,7 @@ import type {
 	AgentTool,
 	AgentToolCall,
 	AgentToolResult,
+	EmptyTurnRetryConfig,
 	StreamFn,
 } from "./types.js";
 
@@ -296,12 +299,37 @@ function formatStreamStallErrorMessage(timeoutMs: number): string {
 	);
 }
 
+/**
+ * Synthetic `stopReasonRaw` for a stall that happened while the client was obeying a
+ * wait the provider itself asked for (HTTP 429/408/5xx with `Retry-After`). The
+ * provider answered, so the connection is not the suspect; callers use this marker to
+ * keep the shape out of the "resend the whole context" retry class.
+ */
+export const SERVER_DIRECTED_RETRY_STALL_STOP_REASON_RAW = "stalled_during_provider_retry";
+
+/** Whether a message is a stall that the provider's own throttling instruction explains. */
+export function isServerDirectedRetryStall(message: AssistantMessage): boolean {
+	return message.stopReason === "error" && message.stopReasonRaw === SERVER_DIRECTED_RETRY_STALL_STOP_REASON_RAW;
+}
+
+function formatProviderRetryStallMessage(notice: ProviderRetryNotice, retries: number, timeoutMs: number): string {
+	const seconds = Math.max(1, Math.round(timeoutMs / 1000));
+	const asked = notice.retryAfter ? `${notice.delayMs}ms (${notice.retryAfter})` : `${notice.delayMs}ms`;
+	return (
+		`Provider is throttling this request: it answered HTTP ${notice.status} asking to wait ${asked}, ` +
+		`and no stream events arrived within the ${seconds}s stall window, so the wait was aborted after ${retries} such attempt(s). ` +
+		"This is a rate limit, not a dead connection: resending the full conversation now would add load, so it is not retried automatically. " +
+		"Wait for the delay the provider stated, then retry with a smaller request, or raise retry.provider.streamStallTimeoutMs / retry.provider.maxRetryDelayMs for a slow but healthy provider."
+	);
+}
+
 function createStalledAssistantMessage(
 	config: AgentLoopConfig,
 	partialMessage: AssistantMessage | null,
 	timeoutMs: number,
+	providerRetries: readonly ProviderRetryNotice[] = [],
 ): AssistantMessage {
-	return {
+	const message: AssistantMessage = {
 		role: "assistant",
 		content: partialMessage ? cloneAssistantContent(partialMessage.content) : [{ type: "text", text: "" }],
 		api: partialMessage?.api ?? config.model.api,
@@ -312,6 +340,28 @@ function createStalledAssistantMessage(
 		errorMessage: formatStreamStallErrorMessage(timeoutMs),
 		timestamp: Date.now(),
 	};
+	const lastRetry = providerRetries[providerRetries.length - 1];
+	// The server answered and told us how long to wait: classify the silence as
+	// throttling instead of a dead connection, and keep the structured diagnostic so
+	// kind-based routing downstream sees rate_limit rather than nothing.
+	if (lastRetry) {
+		message.errorMessage = formatProviderRetryStallMessage(lastRetry, providerRetries.length, timeoutMs);
+		message.stopReasonRaw = SERVER_DIRECTED_RETRY_STALL_STOP_REASON_RAW;
+		appendAssistantMessageDiagnostic(message, {
+			type: "provider_stream_failure",
+			timestamp: Date.now(),
+			details: {
+				kind: classifyStreamFailure(undefined, lastRetry.status),
+				status: lastRetry.status,
+				retryAfterMs: lastRetry.delayMs,
+				retryAfter: lastRetry.retryAfter,
+				capped: lastRetry.capped,
+				retryAttempts: providerRetries.length,
+				stallTimeoutMs: timeoutMs,
+			},
+		});
+	}
+	return message;
 }
 
 function endAgentStreamOnError(
@@ -612,7 +662,27 @@ async function runLoop(
 	await emit({ type: "agent_end", messages: newMessages });
 }
 
-const MAX_EMPTY_TURN_ATTEMPTS = 3;
+/** Defaults for the in-place empty-turn retry policy; overridable via `AgentLoopConfig.emptyTurnRetry`. */
+export const EMPTY_TURN_RETRY_DEFAULTS = { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 4000 } as const;
+
+/**
+ * Wait between in-place empty-turn retries. Resolves early when the run signal fires,
+ * so an abort is never delayed by the backoff (the next attempt takes the abort path).
+ */
+function waitAbortably(delayMs: number, signal: AbortSignal | undefined): Promise<void> {
+	if (delayMs <= 0) return Promise.resolve();
+	return new Promise((resolve) => {
+		const finish = () => {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		};
+		const timer = setTimeout(finish, delayMs);
+		const onAbort = () => finish();
+		signal?.addEventListener("abort", onAbort, { once: true });
+		if (signal?.aborted) finish();
+	});
+}
 
 /**
  * Synthetic `stopReasonRaw` for a turn that exhausted the empty-response retries.
@@ -624,6 +694,61 @@ export const EMPTY_TURN_RETRY_EXHAUSTED_STOP_REASON_RAW = "empty_response_retry_
 /** Whether a message is the terminal empty-turn-retry failure. */
 export function isEmptyTurnRetryExhausted(message: AssistantMessage): boolean {
 	return message.stopReason === "error" && message.stopReasonRaw === EMPTY_TURN_RETRY_EXHAUSTED_STOP_REASON_RAW;
+}
+
+/** Diagnostic type on the terminal empty-turn failure: attempts, waits, and the effective policy. */
+export const EMPTY_TURN_RETRY_EXHAUSTED_DIAGNOSTIC_TYPE = "empty_turn_retry_exhausted";
+
+function resolveEmptyTurnRetryPolicy(options?: EmptyTurnRetryConfig): {
+	maxAttempts: number;
+	baseDelayMs: number;
+	maxDelayMs: number;
+	maxTotalDelayMs: number;
+} {
+	const maxAttempts = Math.max(1, Math.floor(options?.maxAttempts ?? EMPTY_TURN_RETRY_DEFAULTS.maxAttempts));
+	const baseDelayMs = Math.max(0, options?.baseDelayMs ?? EMPTY_TURN_RETRY_DEFAULTS.baseDelayMs);
+	const maxDelayMs = Math.max(baseDelayMs, options?.maxDelayMs ?? EMPTY_TURN_RETRY_DEFAULTS.maxDelayMs);
+	const maxTotalDelayMs = Math.max(0, options?.maxTotalDelayMs ?? maxDelayMs * Math.max(0, maxAttempts - 1));
+	return { maxAttempts, baseDelayMs, maxDelayMs, maxTotalDelayMs };
+}
+
+function emptyTurnExhaustedMessage(
+	attempts: number,
+	discarded: { waitedMs: number },
+	terminatedBy: "attempts" | "budget" | "abort",
+): string {
+	const waited = `waited ${discarded.waitedMs}ms between attempts`;
+	const why =
+		terminatedBy === "budget"
+			? `the retry wait budget ran out (attempted ${attempts} replies, ${waited})`
+			: terminatedBy === "abort"
+				? `the run was aborted between attempts (got ${attempts} empty replies, ${waited})`
+				: `the provider answered ${attempts} times in a row with no output content or tool calls (${waited})`;
+	return (
+		`Model returned an empty response ${attempts} times in a row: ${why}. ` +
+		"This is the provider returning a clean stop turn with nothing in it, not a connection failure. " +
+		"Adjust retry.emptyTurn.maxAttempts/baseDelayMs/maxTotalDelayMs for more or longer in-place retries, or resend the turn when the upstream recovers."
+	);
+}
+
+function recordEmptyTurnExhaustion(
+	message: AssistantMessage,
+	attempts: number,
+	discarded: { waitedMs: number },
+	policy: { maxAttempts: number; baseDelayMs: number; maxDelayMs: number; maxTotalDelayMs: number },
+): void {
+	appendAssistantMessageDiagnostic(message, {
+		type: EMPTY_TURN_RETRY_EXHAUSTED_DIAGNOSTIC_TYPE,
+		timestamp: Date.now(),
+		details: {
+			attempts,
+			waitedMs: discarded.waitedMs,
+			maxAttempts: policy.maxAttempts,
+			baseDelayMs: policy.baseDelayMs,
+			maxDelayMs: policy.maxDelayMs,
+			maxTotalDelayMs: policy.maxTotalDelayMs,
+		},
+	});
 }
 
 /**
@@ -662,7 +787,8 @@ async function streamAssistantResponse(
 	// reads input + cacheRead on stop turns and its case 3 reads output on length
 	// turns. Inflating the context fields would therefore misclassify a real stop turn
 	// as an overflow, which is why they are never summed on any path.
-	const discarded = { cost: { ...EMPTY_USAGE.cost }, output: 0, attempts: 0 };
+	const discarded = { cost: { ...EMPTY_USAGE.cost }, output: 0, attempts: 0, waitedMs: 0 };
+	const emptyTurnPolicy = resolveEmptyTurnRetryPolicy(config.emptyTurnRetry);
 	for (let attempt = 1; ; attempt++) {
 		const message = await streamAssistantResponseAttempt(context, config, signal, emit, streamFn);
 		// Overflow turns are never discarded, so compaction recovery can still see them.
@@ -670,8 +796,15 @@ async function streamAssistantResponse(
 		// were discarded, their cost is still carried onto this message below.
 		const overflow = isContextOverflow(message, config.model.contextWindow);
 		if (isEmptyAssistantTurn(message) && !overflow) {
-			if (attempt < MAX_EMPTY_TURN_ATTEMPTS) {
+			// Resend gaps: an empty reply usually means the upstream is queued or
+			// overloaded, and three requests inside the same millisecond are the worst
+			// thing to do to it. The wait is exponential, capped per wait and per turn,
+			// and honors the run signal (an abort continues into the attempt's own abort
+			// path instead of being delayed by us).
+			const delayMs = Math.min(emptyTurnPolicy.baseDelayMs * 2 ** (attempt - 1), emptyTurnPolicy.maxDelayMs);
+			if (attempt < emptyTurnPolicy.maxAttempts && discarded.waitedMs + delayMs <= emptyTurnPolicy.maxTotalDelayMs) {
 				discarded.attempts += 1;
+				discarded.waitedMs += delayMs;
 				discarded.output += message.usage.output;
 				discarded.cost.input += message.usage.cost.input;
 				discarded.cost.output += message.usage.cost.output;
@@ -681,11 +814,18 @@ async function streamAssistantResponse(
 				// Drop the empty attempt so it is neither resent to the provider nor
 				// finalized as a transcript turn (message_end is what makes it durable).
 				context.messages.pop();
+				await waitAbortably(delayMs, signal);
 				continue;
 			}
+			const terminatedBy: "attempts" | "budget" | "abort" = signal?.aborted
+				? "abort"
+				: attempt >= emptyTurnPolicy.maxAttempts
+					? "attempts"
+					: "budget";
 			message.stopReason = "error";
 			message.stopReasonRaw = EMPTY_TURN_RETRY_EXHAUSTED_STOP_REASON_RAW;
-			message.errorMessage = `Model returned an empty response (no output content or tool calls) ${MAX_EMPTY_TURN_ATTEMPTS} times in a row`;
+			message.errorMessage = emptyTurnExhaustedMessage(attempt, discarded, terminatedBy);
+			recordEmptyTurnExhaustion(message, attempt, discarded, emptyTurnPolicy);
 		}
 		if (discarded.attempts > 0) {
 			// Carry the discarded spend onto whichever message ends the loop: the synthesized
@@ -818,6 +958,9 @@ async function runAssistantStreamAttempt(
 	const stallController = streamStallTimeoutMs !== undefined ? new AbortController() : undefined;
 	let stallTimer: ReturnType<typeof setTimeout> | undefined;
 	let stallReject!: (error: StreamStallError) => void;
+	// Server-directed retry waits observed during this attempt: proof the provider
+	// answered, so a following silence is throttling, not a dead connection.
+	const providerRetries: ProviderRetryNotice[] = [];
 	const stallPromise = new Promise<never>((_resolve, reject) => {
 		stallReject = reject;
 	});
@@ -843,7 +986,7 @@ async function runAssistantStreamAttempt(
 		streamStallTimeoutMs === undefined ? operation : Promise.race([operation, stallPromise]);
 	let closeIterator: (() => void) | undefined;
 	const finishStalledMessage = async (error: StreamStallError) => {
-		const finalMessage = createStalledAssistantMessage(config, partialMessage, error.timeoutMs);
+		const finalMessage = createStalledAssistantMessage(config, partialMessage, error.timeoutMs, providerRetries);
 		if (addedPartial) {
 			context.messages[context.messages.length - 1] = finalMessage;
 		} else {
@@ -893,6 +1036,9 @@ async function runAssistantStreamAttempt(
 					...config,
 					apiKey: resolvedApiKey,
 					signal: streamSignal,
+					onProviderRetry: (notice: ProviderRetryNotice) => {
+						providerRetries.push(notice);
+					},
 				}),
 				signal,
 			),

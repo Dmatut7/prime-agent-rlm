@@ -1,0 +1,2 @@
+- Changed stream-stall diagnosis to tell a provider that asked us to wait apart from a dead connection, and the stalled turn now carries a structured `rate_limit` diagnostic.
+- Changed empty-response retries to wait with a capped, configurable backoff instead of firing attempts back-to-back, and to report the attempts and waits when they run out.

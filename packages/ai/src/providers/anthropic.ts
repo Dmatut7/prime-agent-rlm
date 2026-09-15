@@ -42,9 +42,9 @@ import {
 	truncateRawPayload,
 } from "../utils/stream-failure.js";
 import { finalizeThrottledStreamingJson, updateThrottledStreamingJson } from "../utils/streaming-json-throttle.js";
-
 import { resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
+import { createRetryCapFetch } from "./retry-cap.js";
 import { adjustMaxTokensForThinking, buildBaseOptions } from "./simple-options.js";
 import { transformMessages } from "./transform-messages.js";
 
@@ -504,6 +504,10 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 					shouldUseFineGrainedToolStreamingBeta(model, context),
 					options?.headers,
 					copilotDynamicHeaders,
+					createRetryCapFetch({
+						maxRetryDelayMs: options?.maxRetryDelayMs,
+						onProviderRetry: options?.onProviderRetry,
+					}),
 				);
 				client = created.client;
 				isOAuth = created.isOAuthToken;
@@ -855,6 +859,7 @@ function createClient(
 	useFineGrainedToolStreamingBeta: boolean,
 	optionsHeaders?: Record<string, string>,
 	dynamicHeaders?: Record<string, string>,
+	retryFetch: (input: string | URL | Request, init?: RequestInit) => Promise<Response> = globalThis.fetch,
 ): { client: Anthropic; isOAuthToken: boolean } {
 	// Adaptive thinking models (Opus 4.6, Sonnet 4.6) have interleaved thinking built-in.
 	// The beta header is deprecated on Opus 4.6 and redundant on Sonnet 4.6, so skip it.
@@ -873,6 +878,7 @@ function createClient(
 			authToken: null,
 			baseURL: resolveCloudflareBaseUrl(model),
 			dangerouslyAllowBrowser: true,
+			fetch: retryFetch,
 			defaultHeaders: mergeHeaders(
 				{
 					accept: "application/json",
@@ -896,6 +902,7 @@ function createClient(
 			authToken: apiKey,
 			baseURL: model.baseUrl,
 			dangerouslyAllowBrowser: true,
+			fetch: retryFetch,
 			defaultHeaders: mergeHeaders(
 				{
 					accept: "application/json",
@@ -917,6 +924,7 @@ function createClient(
 			authToken: apiKey,
 			baseURL: model.baseUrl,
 			dangerouslyAllowBrowser: true,
+			fetch: retryFetch,
 			defaultHeaders: mergeHeaders(
 				{
 					accept: "application/json",
@@ -937,6 +945,7 @@ function createClient(
 		apiKey,
 		baseURL: model.baseUrl,
 		dangerouslyAllowBrowser: true,
+		fetch: retryFetch,
 		defaultHeaders: mergeHeaders(
 			{
 				accept: "application/json",

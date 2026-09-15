@@ -21,6 +21,7 @@ import type {
 	AgentTool,
 	BeforeToolCallContext,
 	BeforeToolCallResult,
+	EmptyTurnRetryConfig,
 	GetContinuationMessagesContext,
 	ShouldStopAfterTurnContext,
 	StreamFn,
@@ -116,6 +117,8 @@ export interface AgentOptions {
 	toolExecution?: ToolExecutionMode;
 	/** See `AgentLoopConfig.streamStallTimeoutMs`. */
 	streamStallTimeoutMs?: number;
+	/** See `AgentLoopConfig.emptyTurnRetry`. */
+	emptyTurnRetry?: EmptyTurnRetryConfig;
 }
 
 class PendingMessageQueue {
@@ -221,6 +224,7 @@ export class Agent {
 	public maxRetryDelayMs?: number;
 	public toolExecution: ToolExecutionMode;
 	public streamStallTimeoutMs?: number;
+	public emptyTurnRetry?: EmptyTurnRetryConfig;
 
 	constructor(options: AgentOptions = {}) {
 		this._state = createMutableAgentState(options.initialState);
@@ -243,6 +247,7 @@ export class Agent {
 		this.maxRetryDelayMs = options.maxRetryDelayMs;
 		this.toolExecution = options.toolExecution ?? "parallel";
 		this.streamStallTimeoutMs = options.streamStallTimeoutMs;
+		this.emptyTurnRetry = options.emptyTurnRetry;
 	}
 
 	/**
@@ -477,6 +482,7 @@ export class Agent {
 			maxRetryDelayMs: this.maxRetryDelayMs,
 			toolExecution: this.toolExecution,
 			streamStallTimeoutMs: this.streamStallTimeoutMs,
+			emptyTurnRetry: this.emptyTurnRetry,
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
 			shouldStopAfterTurn: async (context) => this.shouldStopAfterTurn?.(context) ?? false,

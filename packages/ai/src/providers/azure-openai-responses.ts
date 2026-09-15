@@ -19,6 +19,7 @@ import {
 	streamFailureFromStopReason,
 } from "../utils/stream-failure.js";
 import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.js";
+import { createRetryCapFetch } from "./retry-cap.js";
 import { buildBaseOptions } from "./simple-options.js";
 
 const DEFAULT_AZURE_API_VERSION = "v1";
@@ -231,6 +232,10 @@ function createClient(model: Model<"azure-openai-responses">, apiKey: string, op
 		dangerouslyAllowBrowser: true,
 		defaultHeaders: headers,
 		baseURL: baseUrl,
+		fetch: createRetryCapFetch({
+			maxRetryDelayMs: options?.maxRetryDelayMs,
+			onProviderRetry: options?.onProviderRetry,
+		}),
 	});
 }
 

@@ -14,6 +14,7 @@ import {
 	formatToolCallIdCollisions,
 	type GetContinuationMessagesContext,
 	isEmptyTurnRetryExhausted,
+	isServerDirectedRetryStall,
 	readToolCallIdCollisions,
 	type ShouldStopAfterTurnContext,
 	type ThinkingLevel,
@@ -12066,6 +12067,7 @@ export class AgentSession {
 			maxRetryDelayMs: this.settingsManager.getProviderRetrySettings().maxRetryDelayMs,
 			toolExecution: this.agent.toolExecution,
 			streamStallTimeoutMs: this.agent.streamStallTimeoutMs,
+			emptyTurnRetry: this.settingsManager.getEmptyTurnRetrySettings(),
 		});
 
 		const child = new AgentSession({
@@ -13951,6 +13953,12 @@ export class AgentSession {
 		// The agent loop already retried this in-place; a session-level retry would
 		// resend the whole context on every attempt without ever reaching compaction.
 		if (isEmptyTurnRetryExhausted(message)) return false;
+
+		// The provider answered and told us how long to wait; the stall that followed is
+		// throttling, not a dead connection. Resending the full context a couple of
+		// seconds later is exactly what the rate limit forbids, so this shape is out of
+		// the automatic-resend class and surfaces with the provider's own delay instead.
+		if (isServerDirectedRetryStall(message)) return false;
 
 		if (this._isFauxProviderQueueExhausted(message)) {
 			return false;

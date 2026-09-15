@@ -166,9 +166,15 @@ instead of changing what it uploads.
 | `retry.provider.timeoutMs` | number | SDK default | Provider/SDK request timeout in milliseconds (covers the request up to response headers) |
 | `retry.provider.maxRetries` | number | SDK default | Provider/SDK retry attempts |
 | `retry.provider.maxRetryDelayMs` | number | `60000` | Max server-requested delay before failing (60s) |
-| `retry.provider.streamStallTimeoutMs` | number | `300000` | Abort a provider stream after this many milliseconds without any response events (5 min). The turn settles as a retryable error, so auto-retry picks it up. Set to `0` to disable |
+| `retry.provider.streamStallTimeoutMs` | number | `300000` | Abort a provider stream after this many milliseconds without any response events (5 min). A stall on a silent connection settles as a retryable error, so auto-retry picks it up; a stall while the provider has asked us to wait settles as a rate-limit failure and is not auto-retried. Set to `0` to disable |
+| `retry.emptyTurn.maxAttempts` | number | `3` | Total provider attempts for one turn while replies come back empty (no text, no tool calls). `1` disables in-place empty-turn retries |
+| `retry.emptyTurn.baseDelayMs` | number | `500` | First wait between empty-turn attempts; doubles per attempt |
+| `retry.emptyTurn.maxDelayMs` | number | `4000` | Cap for a single empty-turn wait |
+| `retry.emptyTurn.maxTotalDelayMs` | number | attempts x waits | Cap for the summed empty-turn waits of one turn; when it runs out the turn fails and names the budget |
 
-When a provider requests a retry delay longer than `retry.provider.maxRetryDelayMs` (e.g., Google's "quota will reset after 5h"), the request fails immediately with an informative error instead of waiting silently. Set to `0` to disable the cap.
+When a provider requests a retry delay longer than `retry.provider.maxRetryDelayMs` (e.g., "quota will reset after 5h" delivered as `Retry-After: 18000`), the request fails immediately with an informative error instead of waiting silently. Set to `0` to disable the cap. The cap is enforced in every provider that retries client-side: OpenAI Completions/Responses, Azure OpenAI, Anthropic Messages (via the SDK's `x-should-retry: false` escape hatch, so the provider's own error and rate-limit classification survive) and Codex SSE. Mistral, Google and Vertex AI do not retry 429 at all, so they ignore it.
+
+`retry.enabled: false` also collapses `retry.emptyTurn.maxAttempts` to a single attempt: switching automatic resends off means the empty-reply path does not keep resending either.
 
 ```json
 {
@@ -180,6 +186,11 @@ When a provider requests a retry delay longer than `retry.provider.maxRetryDelay
       "timeoutMs": 3600000,
       "maxRetries": 0,
       "maxRetryDelayMs": 60000
+    },
+    "emptyTurn": {
+      "maxAttempts": 3,
+      "baseDelayMs": 500,
+      "maxDelayMs": 4000
     }
   }
 }

@@ -1,5 +1,8 @@
 import type { AgentEvent, AgentTool } from "@earendil-works/pi-agent-core";
-import { EMPTY_TURN_RETRY_EXHAUSTED_STOP_REASON_RAW } from "@earendil-works/pi-agent-core";
+import {
+	EMPTY_TURN_RETRY_EXHAUSTED_STOP_REASON_RAW,
+	SERVER_DIRECTED_RETRY_STALL_STOP_REASON_RAW,
+} from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, fauxAssistantMessage, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
@@ -268,6 +271,37 @@ describe("AgentSession retry and event characterization", () => {
 
 		// The agent loop already retried this three times in place; a session-level
 		// retry would resend the whole context without ever reaching compaction.
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
+		expect(harness.session.isRetrying).toBe(false);
+	});
+
+	it("does not resend the whole context when a provider retry wait turns into a stall", async () => {
+		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
+		harnesses.push(harness);
+		harness.setResponses([
+			{
+				...fauxAssistantMessage("", {
+					stopReason: "error",
+					errorMessage:
+						"Provider is throttling this request: it answered HTTP 429 asking to wait 18000000ms (18000), and no stream events arrived within the 300s stall window, so the wait was aborted after 1 such attempt(s). This is a rate limit, not a dead connection.",
+				}),
+				stopReasonRaw: SERVER_DIRECTED_RETRY_STALL_STOP_REASON_RAW,
+				diagnostics: [
+					{
+						type: "provider_stream_failure",
+						timestamp: Date.now(),
+						details: { kind: "rate_limit", status: 429, retryAfterMs: 18000000 },
+					},
+				],
+			},
+			fauxAssistantMessage("retry should not happen"),
+		]);
+
+		await harness.session.prompt("test");
+
+		// The provider asked for a wait; a session-level retry resends the full context
+		// into the rate limiter and hides the real cause behind a stall message.
 		expect(harness.faux.state.callCount).toBe(1);
 		expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
 		expect(harness.session.isRetrying).toBe(false);

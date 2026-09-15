@@ -102,6 +102,7 @@ export function startSideQuestion(
 		maxRetryDelayMs: parent.maxRetryDelayMs,
 		toolExecution: parent.toolExecution,
 		streamStallTimeoutMs: parent.streamStallTimeoutMs,
+		emptyTurnRetry: parent.emptyTurnRetry,
 	});
 
 	let answer = "";

@@ -15,8 +15,11 @@ export function buildBaseOptions(model: Model<Api>, options?: SimpleStreamOption
 		onResponse: options?.onResponse,
 		timeoutMs: options?.timeoutMs,
 		maxRetries: options?.maxRetries,
-		// Consumed by Codex SSE Retry-After; Mistral/Google/Vertex currently ignore this.
+		// Caps server-requested retry waits in every provider that retries client-side
+		// (OpenAI/Anthropic SDKs via createRetryCapFetch, Codex SSE natively);
+		// Mistral/Google/Vertex currently ignore this.
 		maxRetryDelayMs: options?.maxRetryDelayMs,
+		onProviderRetry: options?.onProviderRetry,
 		metadata: options?.metadata,
 	};
 }
