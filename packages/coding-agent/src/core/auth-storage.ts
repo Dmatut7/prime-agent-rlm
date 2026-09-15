@@ -10,6 +10,7 @@ import { createHash } from "node:crypto";
 import {
 	findEnvKeys,
 	getEnvApiKey,
+	getLogger,
 	type OAuthCredentials,
 	type OAuthLoginCallbacks,
 	type OAuthProviderId,
@@ -32,6 +33,17 @@ import {
 	savePrimeCliTeamSelection,
 } from "./prime-inference-auth.js";
 import { clearResolvedCommandCache, resolveConfigValue, resolveConfigValueUncached } from "./resolve-config-value.js";
+
+/**
+ * How many failed auth operations are kept for a caller to drain.
+ *
+ * The buffer exists so a failure is not lost, not as a history: a caller that drains
+ * learns what went wrong, and a store that keeps failing (an unwritable token file, an
+ * expired refresh token) must not turn that into unbounded memory.
+ */
+const MAX_RECORDED_AUTH_ERRORS = 20;
+
+const authStorageLog = getLogger("coding-agent.auth-storage");
 
 /**
  * A non-fatal, user-visible side effect of an auth operation.
@@ -276,6 +288,7 @@ export class AuthStorage {
 	private fallbackResolver?: (provider: string) => string | undefined;
 	private loadError: Error | null = null;
 	private errors: Error[] = [];
+	private errorsDropped = 0;
 	private notices: AuthNotice[] = [];
 
 	private constructor(
@@ -330,6 +343,18 @@ export class AuthStorage {
 	private recordError(error: unknown): void {
 		const normalizedError = error instanceof Error ? error : new Error(String(error));
 		this.errors.push(normalizedError);
+		if (this.errors.length <= MAX_RECORDED_AUTH_ERRORS) {
+			return;
+		}
+		// Drop the oldest, keep the newest: the failure that just happened is the one a
+		// caller can still act on. The drop is reported rather than silent - a truncated
+		// buffer that looks complete is worse than a bounded one that says it dropped.
+		this.errors.shift();
+		this.errorsDropped++;
+		authStorageLog.warn("auth error buffer full, dropped the oldest recorded error", {
+			dropped: this.errorsDropped,
+			cap: MAX_RECORDED_AUTH_ERRORS,
+		});
 	}
 
 	private fingerprintAuthSource(source: ActiveAuthStatusSource, material: string): string {
@@ -792,6 +817,14 @@ export class AuthStorage {
 		return { ...this.data };
 	}
 
+	/**
+	 * Take the failures recorded so far, newest last.
+	 *
+	 * Bounded to `MAX_RECORDED_AUTH_ERRORS`: older entries are dropped and the drop is
+	 * reported through the structured log. Callers that never drain are the reason an
+	 * OAuth refresh failure used to be invisible, so this is consumed on the auth-failure
+	 * path in `ModelRegistry`.
+	 */
 	drainErrors(): Error[] {
 		const drained = [...this.errors];
 		this.errors = [];

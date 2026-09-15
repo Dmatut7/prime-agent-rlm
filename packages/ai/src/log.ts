@@ -5,6 +5,8 @@
  * Logging must never throw into the caller.
  */
 
+import { redactLogEntryFields } from "./utils/redact.js";
+
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
 export interface LogEntry {
@@ -61,7 +63,12 @@ export function stringifyLogEntry(entry: LogEntry): string {
 function emit(level: LogLevel, component: string, msg: string, fields?: Record<string, unknown>): void {
 	try {
 		// Reserved keys win over caller fields so entries can't be misclassified.
-		const entry: LogEntry = { ...fields, ts: new Date().toISOString(), level, component, msg };
+		// Every entry passes the redactor on the way out: the sink is a file
+		// (agent.jsonl) that outlives the process, and a caller logging a provider
+		// error body is exactly the case that leaks a credential into it. Redacting
+		// here rather than per call site keeps the guarantee for callers who never
+		// think about it.
+		const entry: LogEntry = redactLogEntryFields({ ...fields, ts: new Date().toISOString(), level, component, msg });
 		try {
 			if (sink) {
 				sink(entry);
