@@ -41,6 +41,7 @@ import {
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 	DAEMON_WORKER_TOKEN_ENV,
 } from "../../src/modes/daemon/daemon-worker-protocol.js";
+import { isolatedSupervisorRegistryEnv } from "../fixtures/supervisor-registry-isolation.js";
 
 const cliPath = resolve(__dirname, "../../src/cli.ts");
 const tsxPath = resolve(__dirname, "../../../../node_modules/tsx/dist/cli.mjs");
@@ -88,6 +89,9 @@ async function runCli(
 			...process.env,
 			TSX_TSCONFIG_PATH: repoTsconfigPath,
 			[ENV_AGENT_DIR]: options.agentDir,
+			// The CLI auto-spawns a real daemon; without this it registers its ownership in
+			// the developer's real ~/.prime/supervisor-owners.
+			...isolatedSupervisorRegistryEnv(options.agentDir),
 			PI_SKIP_VERSION_CHECK: "1",
 			PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND: "0",
 			RLM_DEPTH: "0",

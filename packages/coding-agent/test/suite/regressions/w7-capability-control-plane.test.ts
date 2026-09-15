@@ -10,6 +10,7 @@ import {
 	DAEMON_FIRST_PARTY_SESSION_CAPABILITIES,
 	type DaemonDeclaredCapability,
 } from "../../../src/modes/daemon/daemon-protocol.js";
+import { isolatedSupervisorRegistryEnv } from "../../fixtures/supervisor-registry-isolation.js";
 
 const cliPath = resolve(__dirname, "../../../src/cli.ts");
 const tsxPath = resolve(__dirname, "../../../../../node_modules/tsx/dist/cli.mjs");
@@ -67,7 +68,10 @@ afterEach(async () => {
 function spawnSupervisor(socketPath: string, agentDir: string): ChildProcess {
 	// Scrub inherited RLM_* / PRIME_AGENT_INTERNAL_* / FORCE_COLOR: when the suite
 	// itself runs inside a daemon worker or RLM child, those would make the
-	// spawned supervisor take the worker path and never listen.
+	// spawned supervisor take the worker path and never listen. The scrubbed
+	// PRIME_AGENT_INTERNAL_* set includes the supervisor registry root, so an isolated
+	// one is put back: this daemon must not write the developer's real
+	// `~/.prime/supervisor-owners` (see fixtures/supervisor-registry-isolation.ts).
 	const scrubbedEnv: NodeJS.ProcessEnv = {};
 	for (const [key, value] of Object.entries(process.env)) {
 		if (key.startsWith("PRIME_AGENT_INTERNAL_") || key.startsWith("RLM_") || key === "FORCE_COLOR") {
@@ -84,6 +88,7 @@ function spawnSupervisor(socketPath: string, agentDir: string): ChildProcess {
 			cwd: agentDir,
 			env: {
 				...scrubbedEnv,
+				...isolatedSupervisorRegistryEnv(agentDir),
 				[ENV_AGENT_DIR]: agentDir,
 				PI_OFFLINE: "1",
 				TSX_TSCONFIG_PATH: resolve(__dirname, "../../../../../tsconfig.json"),

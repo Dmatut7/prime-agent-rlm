@@ -1,6 +1,15 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import lockfile from "proper-lockfile";
@@ -89,7 +98,7 @@ function plantOwner(
 	shape: OwnerRecord,
 	generation: string,
 	pid: number,
-	overrides: { socketPath: string; descriptorDir: string; agentDir: string },
+	overrides: { socketPath: string; descriptorDir: string; agentDir: string; phase?: string },
 ): string {
 	const directory = join(paths.registryDir, `${generation}.owner`);
 	mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -130,10 +139,20 @@ describe("daemon supervisor ownership registry reclamation", () => {
 			descriptorDir: join(paths.root, "other-workers-dead"),
 			agentDir: join(paths.root, "other-agent-dead"),
 		});
+		// A live owner still has its world: its agent dir and descriptor dir exist and its
+		// socket file is on disk. Only a footprint that was deleted under the record (see
+		// the abandoned-footprint test) makes a live pid reclaimable.
+		const liveAgentDir = join(paths.root, "other-agent-live");
+		const liveDescriptorDir = join(paths.root, "other-workers-live");
+		const liveSocketPath = join(paths.root, "other-live.sock");
+		mkdirSync(liveAgentDir, { recursive: true });
+		mkdirSync(liveDescriptorDir, { recursive: true });
+		writeFileSync(liveSocketPath, "");
 		const liveDirectory = plantOwner(paths, shape, "live-other-owner", process.pid, {
-			socketPath: join(paths.root, "other-live.sock"),
-			descriptorDir: join(paths.root, "other-workers-live"),
-			agentDir: join(paths.root, "other-agent-live"),
+			socketPath: liveSocketPath,
+			descriptorDir: liveDescriptorDir,
+			agentDir: liveAgentDir,
+			phase: "owner",
 		});
 
 		const acquired = await acquire(paths, "reclaiming-owner");
@@ -149,6 +168,77 @@ describe("daemon supervisor ownership registry reclamation", () => {
 		);
 
 		await acquired.release();
+		rmSync(liveDirectory, { recursive: true, force: true });
+	});
+
+	it("reclaims a live owner whose whole footprint was deleted", async () => {
+		const paths = createPaths();
+		const template = await acquire(paths, "template-owner");
+		await template.updatePhase("owner");
+		const shape = { ...template.record };
+		await template.release();
+
+		// REG-1: the shape a leaked test daemon leaves behind. Its agent dir, socket and
+		// descriptor dir all lived under one temp root that is now gone, while the recorded
+		// pid is still alive — the leaked daemon itself, or a recycled pid. kill(0) alone
+		// said "alive", so the record survived every later acquire and the startup gate kept
+		// reasoning about a supervisor that cannot exist.
+		const standIn = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], { stdio: "ignore" });
+		const standInPid = standIn.pid;
+		if (standInPid === undefined) throw new Error("Stand-in process did not report a pid");
+		const abandonedRoot = mkdtempSync(join(tmpdir(), "ownership-abandoned-"));
+		cleanupDirs.push(abandonedRoot);
+		const abandonedDirectory = plantOwner(paths, shape, "abandoned-owner", standInPid, {
+			socketPath: join(abandonedRoot, "daemon.sock"),
+			descriptorDir: join(abandonedRoot, "workers"),
+			agentDir: join(abandonedRoot, "agent"),
+			phase: "owner",
+		});
+		rmSync(abandonedRoot, { recursive: true, force: true });
+
+		const acquired = await acquire(paths, "after-abandoned-owner");
+
+		expect(existsSync(abandonedDirectory)).toBe(false);
+		expect(existsSync(ownerDir(paths, "after-abandoned-owner"))).toBe(true);
+		await acquired.release();
+		standIn.kill("SIGKILL");
+	});
+
+	it("still refuses by agent dir for a live owner whose world exists", async () => {
+		const paths = createPaths();
+		const template = await acquire(paths, "template-owner");
+		await template.updatePhase("owner");
+		const shape = { ...template.record };
+		await template.release();
+
+		// The same leaked shape, but with its footprint intact: a live owner of another
+		// agent dir is neither reclaimed nor allowed to start a second daemon for that dir.
+		const otherAgentDir = join(paths.root, "other-agent-live");
+		const otherDescriptorDir = join(paths.root, "other-workers-live");
+		const otherSocketPath = join(paths.root, "other-live.sock");
+		mkdirSync(otherAgentDir, { recursive: true });
+		mkdirSync(otherDescriptorDir, { recursive: true });
+		writeFileSync(otherSocketPath, "");
+		const liveDirectory = plantOwner(paths, shape, "live-other-owner", process.pid, {
+			socketPath: otherSocketPath,
+			descriptorDir: otherDescriptorDir,
+			// The gate compares canonical agent dirs; a planted record must name the same one.
+			agentDir: realpathSync(otherAgentDir),
+			phase: "owner",
+		});
+
+		await expect(
+			acquireDaemonSupervisorOwnership({
+				agentDir: otherAgentDir,
+				appVersion: "test",
+				descriptorDir: join(paths.root, "conflicting-workers"),
+				generation: "conflicting-owner",
+				registryDir: paths.registryDir,
+				socketPath: join(paths.root, "conflicting.sock"),
+			}),
+		).rejects.toThrow(/already owns agent dir/);
+		expect(existsSync(liveDirectory)).toBe(true);
+		expect(existsSync(ownerDir(paths, "conflicting-owner"))).toBe(false);
 		rmSync(liveDirectory, { recursive: true, force: true });
 	});
 

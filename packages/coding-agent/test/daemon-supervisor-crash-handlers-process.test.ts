@@ -11,6 +11,7 @@ import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
 import { normalizeSocketPath } from "../src/modes/daemon/daemon-socket.js";
 import type { DaemonWorkerDescriptor } from "../src/modes/daemon/daemon-worker-protocol.js";
 import { type FakeWorkerHandle, startFakeWorker } from "./fixtures/supervisor-fake-worker.js";
+import { isolatedSupervisorRegistryEnv } from "./fixtures/supervisor-registry-isolation.js";
 
 /**
  * T3-4 / P1-5-L6 process half: the assertions that need a real process. An uncaught
@@ -28,15 +29,20 @@ const tempDirs: string[] = [];
 const workers: FakeWorkerHandle[] = [];
 const daemonSockets = new Set<string>();
 
-/** A leaked worker/supervisor env would change what the spawned process believes about itself. */
-function scrubbedEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+/**
+ * A leaked worker/supervisor env would change what the spawned process believes about
+ * itself. The supervisor registry root is scrubbed with the rest, so an isolated one is
+ * put back: a daemon started from here must never write the developer's real
+ * `~/.prime/supervisor-owners`.
+ */
+function scrubbedEnv(root: string, extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
 	const env: NodeJS.ProcessEnv = { ...process.env, ...extra };
 	for (const key of Object.keys(env)) {
 		if (key.startsWith("RLM_") || key.startsWith("PRIME_AGENT_INTERNAL_")) {
 			delete env[key];
 		}
 	}
-	return env;
+	return { ...env, ...isolatedSupervisorRegistryEnv(root) };
 }
 
 afterEach(async () => {
@@ -92,9 +98,10 @@ async function runFixture(
 	mode: string,
 	rejections = "1",
 ): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
+	const fixtureDir = tempDir("ma-t3-4-fixture-");
 	const child = spawn(process.execPath, [tsxPath, fixturePath, mode, rejections], {
-		cwd: tempDir("ma-t3-4-fixture-"),
-		env: scrubbedEnv({ PI_OFFLINE: "1" }),
+		cwd: fixtureDir,
+		env: scrubbedEnv(fixtureDir, { PI_OFFLINE: "1" }),
 		stdio: ["ignore", "pipe", "pipe"],
 	});
 	children.add(child);
@@ -232,7 +239,7 @@ describe("T3-4 supervisor crash handlers in a real process", () => {
 				[tsxPath, cliPath, "--mode", "daemon", "--daemon-socket", socketPath, "--offline"],
 				{
 					cwd: projectDir,
-					env: scrubbedEnv({ [ENV_AGENT_DIR]: agentDir, PI_OFFLINE: "1" }),
+					env: scrubbedEnv(root, { [ENV_AGENT_DIR]: agentDir, PI_OFFLINE: "1" }),
 					stdio: ["ignore", "pipe", "pipe"],
 				},
 			);

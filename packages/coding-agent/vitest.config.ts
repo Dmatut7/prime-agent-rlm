@@ -1,5 +1,19 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
+
+/**
+ * The daemon supervisor's owner registry is user-wide authority state: it lives in
+ * the real home directory on purpose. A test daemon that resolves that root without
+ * an override therefore leaves owner records in the developer's real
+ * `~/.prime/supervisor-owners`, where `status`, endpoint discovery and the
+ * same-agent-dir startup gate read them as live supervisors. Every test process — and
+ * every daemon it spawns, which inherits this environment — writes into one run-scoped
+ * temp root instead.
+ */
+const testSupervisorRegistryDir = mkdtempSync(join(tmpdir(), "prime-agent-test-supervisor-registry-"));
 
 const aiSrcIndex = fileURLToPath(new URL("../ai/src/index.ts", import.meta.url));
 const aiSrcOAuth = fileURLToPath(new URL("../ai/src/oauth.ts", import.meta.url));
@@ -12,7 +26,10 @@ export default defineConfig({
 		globals: true,
 		environment: "node",
 		testTimeout: 30000,
-		env: { DO_NOT_TRACK: "1" },
+		env: {
+			DO_NOT_TRACK: "1",
+			PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR: testSupervisorRegistryDir,
+		},
 		tags: [
 			{
 				name: "process-stress",

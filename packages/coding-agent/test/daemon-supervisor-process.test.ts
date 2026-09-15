@@ -23,6 +23,7 @@ import {
 	isDaemonWorkerFrameHeader,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
 import { encodePrivateFrame, PrivateFrameDecoder } from "../src/modes/session-worker/private-framing.js";
+import { isolatedSupervisorRegistryEnv } from "./fixtures/supervisor-registry-isolation.js";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
 const tsxPath = resolve(__dirname, "../../../node_modules/tsx/dist/cli.mjs");
@@ -84,6 +85,25 @@ function tempDir(): string {
 	return directory;
 }
 
+/**
+ * A test process that is itself nested inside an agent run (RLM child, daemon worker)
+ * inherits the daemon worker role variables; a spawned supervisor that sees them takes
+ * the worker path and never listens, which reads as "timed out waiting for supervisor".
+ * `extraEnv` is applied last at the call site, so a test can still state an explicit value.
+ */
+function scrubbedBaseEnv(): NodeJS.ProcessEnv {
+	const environment: NodeJS.ProcessEnv = {};
+	for (const [key, value] of Object.entries(process.env)) {
+		if (key.startsWith("RLM_") || key.startsWith("PRIME_AGENT_INTERNAL_")) {
+			continue;
+		}
+		if (value !== undefined) {
+			environment[key] = value;
+		}
+	}
+	return environment;
+}
+
 function spawnSupervisor(
 	agentDir: string,
 	socketPath: string,
@@ -98,9 +118,12 @@ function spawnSupervisor(
 		{
 			cwd,
 			env: {
-				...process.env,
+				...scrubbedBaseEnv(),
 				...extraEnv,
 				[ENV_AGENT_DIR]: agentDir,
+				// After the scrub: the registry root is a PRIME_AGENT_INTERNAL_* variable too,
+				// and a daemon started here must not own the developer's real registry.
+				...isolatedSupervisorRegistryEnv(agentDir),
 				PI_OFFLINE: "1",
 				TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
 			},
