@@ -10,6 +10,7 @@ import type { AgentSessionRuntimeConfig } from "../core/agent-session-config.js"
 import { type AgentCronJob, formatAgentCronJob } from "../core/cron-jobs.js";
 import { looksLikeSessionPath } from "../core/session-resolver.js";
 import { formatStallEventLines, type StallEventView } from "../core/stall-diagnostics-render.js";
+import type { AgentConnectionSessionEvent } from "../modes/agent-connection/types.js";
 import { resolveDaemonSocketForAgentDir } from "../modes/daemon/daemon-agent-endpoint.js";
 import { DaemonClient, type DaemonClientMessageListener } from "../modes/daemon/daemon-client.js";
 import type { DaemonOutbound, DaemonResponse } from "../modes/daemon/daemon-protocol.js";
@@ -1437,7 +1438,10 @@ class DaemonAttachTerminal {
 		}
 	}
 
-	private handleSessionEvent(event: AgentSessionEvent): void {
+	// The wire union's stall family may lack `diagnostics` (a daemon from before the
+	// payload), so the handler takes the core union plus the wire union instead of
+	// erasing the difference with a cast.
+	private handleSessionEvent(event: AgentSessionEvent | AgentConnectionSessionEvent): void {
 		switch (event.type) {
 			case "agent_start":
 				this.isStreaming = true;

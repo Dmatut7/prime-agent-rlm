@@ -153,8 +153,18 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // DAEMON_SCHEMA_ID unchanged and a mixed old-daemon/new-client pair passed the
 // handshake with mismatched stall events. The stall family now joins the hashed
 // source; the wire shapes themselves are unchanged.
-export const DAEMON_SCHEMA_REVISION = 33;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-33-f3a2737855c2";
+// Revision 34 makes the session-tree node caps hard and honest: the nested bound's
+// `SessionTreeDepthStats` gains `maxNodes` (the cap the returned tree honors; absent on
+// the pre-34 wire, so clients degrade locally - nothing gates on the number), the cap
+// no longer returns more nodes than it declares (the live-leaf exemption used to push
+// the count past the cap on wide or rewound sessions), the flat bound keeps the
+// rewound live leaf inside its cap instead of shipping a dangling `leafId`, and the
+// `retainedFromDepth` doc no longer claims 0 means the whole tree fit. The stall event
+// wire DTO's `diagnostics` is now typed optional to match the renderer guard, but that
+// shape lives in agent-connection/types.ts, outside every hashed slice, so this
+// revision is not an identity for it.
+export const DAEMON_SCHEMA_REVISION = 34;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-34-3c415362acce";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;

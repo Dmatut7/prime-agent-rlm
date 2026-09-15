@@ -23,6 +23,7 @@ import { ModelRegistry } from "../src/core/model-registry.js";
 import {
 	SESSION_TREE_FLAT_MAX_NODES,
 	SESSION_TREE_MAX_WIRE_DEPTH,
+	SESSION_TREE_MAX_WIRE_NODES,
 	type SessionEntry,
 	type SessionFlatTreeStats,
 	type SessionHeader,
@@ -256,6 +257,44 @@ describe("session tree wire bounds", () => {
 	});
 
 	/**
+	 * X-7: after a rewind, the leaf is an *early* entry and the file's last line is the
+	 * leaf_position marker `branch()` appends, so the leaf is not the last entry in file
+	 * order. A flat bound that keeps only the newest tail cut the entry the session
+	 * resumes on while `leafId` still pointed at it - a dangling reference, and the
+	 * opposite truncation from the nested bound (r19), which keeps the live leaf. The
+	 * daemon's `get_session_tree` and the snapshot's sessionTree are the two connection
+	 * paths, so both bounds must keep the leaf, and both must do it inside the cap.
+	 */
+	it("keeps the rewound live leaf inside both the flat and the nested bound", () => {
+		const sessionManager = SessionManager.open(writeChainSession(20_010), tempDir);
+		sessionManager.branch("entry-5");
+		expect(sessionManager.getLeafId()).toBe("entry-5");
+
+		const flat = sessionManager.getBoundedFlatTree();
+		// 20_010 chain entries plus the leaf_position marker branch() appends.
+		expect(flat.stats.totalEntries).toBe(20_011);
+		expect(flat.stats.truncated).toBe(true);
+		expect(flat.stats.returnedNodes).toBeLessThanOrEqual(SESSION_TREE_FLAT_MAX_NODES);
+		expect(flat.stats.returnedNodes + flat.stats.omittedNodes).toBe(flat.stats.totalEntries);
+		expect(flat.nodes.map((node) => node.entry.id)).toContain("entry-5");
+
+		const nested = sessionManager.getBoundedTree();
+		expect(nested.stats.leafIncluded).toBe(true);
+		expect(nested.stats.returnedNodes).toBeLessThanOrEqual(SESSION_TREE_MAX_WIRE_NODES);
+		expect(nested.stats.returnedNodes + nested.stats.omittedNodes).toBe(nested.stats.entries);
+		expect(treeContains(nested.tree, "entry-5")).toBe(true);
+
+		// Positive control, no rewind: the leaf is the newest entry, so the flat bound
+		// keeps the plain newest tail exactly as it did before the fix.
+		const control = SessionManager.open(writeChainSession(20_010), tempDir);
+		const controlFlat = control.getBoundedFlatTree();
+		expect(controlFlat.stats.returnedNodes).toBe(SESSION_TREE_FLAT_MAX_NODES);
+		expect(controlFlat.nodes.map((node) => node.entry.id)).toContain("entry-20009");
+		expect(controlFlat.nodes.map((node) => node.entry.id)).not.toContain("entry-5");
+		expect(controlFlat.stats.returnedNodes + controlFlat.stats.omittedNodes).toBe(controlFlat.stats.totalEntries);
+	});
+
+	/**
 	 * The wire bound used to keep the *oldest* `depthLimit` layers: on a chain longer than
 	 * the limit, the returned tree was the head of the session and the entry the session
 	 * resumes on was the one thing guaranteed to be missing - the opposite side from the
@@ -343,6 +382,24 @@ describe("session tree wire bounds", () => {
 	 * returned + omitted == entries.
 	 */
 	it("never double-counts a detached leaf: returned plus omitted equals entries", () => {
+		// X-13: a width cap below the live chain's own length is the one shape where the
+		// leaf genuinely comes back detached - a root with no ancestors and no children.
+		// The pre-fix version of this test never constructed one (the safety net that
+		// detaches a leaf is unreachable while the leaf anchors its own window), so the
+		// "counted once" proposition held by construction, not by evidence.
+		const detached = SessionManager.open(writeChainSession(10), tempDir);
+		const detachedBounded = detached.getBoundedTree(Number.POSITIVE_INFINITY, 1);
+		expect(detachedBounded.stats.maxNodes).toBe(1);
+		expect(detachedBounded.stats.returnedNodes).toBe(1);
+		expect(detachedBounded.stats.omittedNodes).toBe(9);
+		expect(detachedBounded.stats.leafIncluded).toBe(true);
+		expect(detachedBounded.tree).toHaveLength(1);
+		expect(detachedBounded.tree[0]?.entry.id).toBe("entry-9");
+		expect(detachedBounded.tree[0]?.children).toEqual([]);
+		expect(detachedBounded.stats.returnedNodes + detachedBounded.stats.omittedNodes).toBe(
+			detachedBounded.stats.entries,
+		);
+
 		const rewound = SessionManager.open(writeChainSession(10), tempDir);
 		rewound.branch("entry-2");
 		const rewoundBounded = rewound.getBoundedTree(3);
@@ -424,6 +481,7 @@ describe("session tree wire bounds", () => {
 			"entries",
 			"leafIncluded",
 			"maxDepth",
+			"maxNodes",
 			"omittedNodes",
 			"retainedFromDepth",
 			"returnedNodes",
@@ -451,9 +509,12 @@ describe("session tree wire bounds", () => {
 
 		expect(bounded.stats.entries).toBe(30_001);
 		expect(bounded.stats.maxDepth).toBe(1);
-		// The cap is 20k newest entries plus the live leaf's retained ancestors (the
-		// root), so at most 20_001 nodes - not the 30_001 the depth window let through.
-		expect(bounded.stats.returnedNodes).toBeLessThanOrEqual(20_001);
+		// X-13: the cap is hard. It used to be soft - the live leaf's retained ancestors
+		// were exempt from the window, so the bound returned 20_001 nodes while the stats
+		// said the cap was 20k. The live chain is now kept first and the window shrinks by
+		// what it cost, so the returned count never exceeds the cap.
+		expect(bounded.stats.maxNodes).toBe(SESSION_TREE_MAX_WIRE_NODES);
+		expect(bounded.stats.returnedNodes).toBe(SESSION_TREE_MAX_WIRE_NODES);
 		expect(bounded.stats.omittedNodes).toBe(30_001 - bounded.stats.returnedNodes);
 		expect(bounded.stats.truncated).toBe(true);
 		expect(bounded.stats.leafIncluded).toBe(true);

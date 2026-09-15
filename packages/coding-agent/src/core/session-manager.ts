@@ -328,11 +328,20 @@ export interface SessionTreeDepthStats {
 	maxDepth: number;
 	depthLimit: number;
 	/**
-	 * Depth of the shallowest retained node, i.e. how many top layers were cut. 0 when the
-	 * whole tree fit. A retained node whose parent is not retained comes back as a root, so
-	 * a client can tell a truncated view from a session that really starts there.
+	 * Depth of the shallowest retained node, i.e. how many top layers were cut. 0 does not
+	 * by itself mean the whole tree fit: a width-only cut (see {@link maxNodes}) can drop
+	 * the oldest siblings while the session's root-depth layer survives, so
+	 * {@link truncated} is the field that says whether anything was dropped. A retained
+	 * node whose parent is not retained comes back as a root, so a client can tell a
+	 * truncated view from a session that really starts there.
 	 */
 	retainedFromDepth: number;
+	/**
+	 * The node cap the returned tree honors: `returnedNodes` never exceeds it. Absent on
+	 * the pre-34 wire (older daemons do not send it), and `Number.MAX_SAFE_INTEGER` for
+	 * an unbounded build, since the stats ride the wire and JSON has no Infinity.
+	 */
+	maxNodes: number;
 	/**
 	 * The session's live leaf is a node in the returned tree. A depth bound must not hide
 	 * the entry the session resumes on: the window is anchored at the leaf's own depth, so
@@ -2809,9 +2818,11 @@ export class SessionManager {
 	 * resumes on.
 	 *
 	 * A second, total-node cap (`maxNodes`) bounds the width the depth bound cannot see:
-	 * a shallow wide tree fits any depth window but is still O(entries) nodes. It keeps the
-	 * newest `maxNodes` entries by file order plus the live leaf's retained ancestors, so
-	 * any tree shape - deep, wide, or both - comes back bounded and reports the cut.
+	 * a shallow wide tree fits any depth window but is still O(entries) nodes. The cap is
+	 * hard: the live leaf's retained ancestor chain is kept first and the newest entries
+	 * fill the rest of the budget, so any tree shape - deep, wide, or both - comes back
+	 * with at most `maxNodes` nodes and reports the cut (including the cap, in
+	 * `stats.maxNodes`).
 	 */
 	getBoundedTree(
 		maxDepth: number = SESSION_TREE_MAX_WIRE_DEPTH,
@@ -2824,19 +2835,23 @@ export class SessionManager {
 	}
 
 	/**
-	 * The flat tree for the wire, capped at `maxNodes` newest entries.
+	 * The flat tree for the wire, capped at `maxNodes` nodes.
 	 *
 	 * Entries are shipped whole, so an uncapped response is O(entries) bytes per call. The
-	 * tail of the file is kept because the leaf is always its last entry: the branch the
-	 * session would resume on stays navigable, and older branches are reported as omitted
-	 * instead of silently disappearing.
+	 * live leaf's entry and ancestor chain are kept first and the newest entries fill the
+	 * rest of the budget: after a rewind the leaf is an early entry while the file's last
+	 * line is the leaf_position marker `branch()` appends, so a pure tail cut would drop
+	 * the entry the session resumes on while `leafId` still points at it. The branch the
+	 * session would resume on stays navigable, older branches are reported as omitted
+	 * instead of silently disappearing, and the returned count never exceeds the cap.
 	 */
 	getBoundedFlatTree(maxNodes: number = SESSION_TREE_FLAT_MAX_NODES): {
 		nodes: SessionTreeFlatNode[];
 		stats: SessionFlatTreeStats;
 	} {
 		const entries = this.getFlatTree();
-		const limit = Math.max(1, Math.floor(maxNodes));
+		const floored = Math.floor(maxNodes);
+		const limit = Number.isFinite(floored) ? Math.max(1, floored) : Number.POSITIVE_INFINITY;
 		if (entries.length <= limit) {
 			return {
 				nodes: entries,
@@ -2849,7 +2864,21 @@ export class SessionManager {
 				},
 			};
 		}
-		const nodes = entries.slice(entries.length - limit);
+		const entryById = new Map<string, SessionEntry>();
+		for (const flatNode of entries) {
+			entryById.set(flatNode.entry.id, flatNode.entry);
+		}
+		// The live chain outranks the newest tail, leaf first, up to the cap; the window
+		// then shrinks by exactly what it cost, so the hard bound holds.
+		const keep = new Set<string>();
+		for (const id of this.livePathOrder(entryById)) {
+			if (keep.size >= limit) {
+				break;
+			}
+			keep.add(id);
+		}
+		const windowFromIndex = entries.length - (limit - keep.size);
+		const nodes = entries.filter((flatNode, index) => keep.has(flatNode.entry.id) || index >= windowFromIndex);
 		return {
 			nodes,
 			stats: {
@@ -2860,6 +2889,27 @@ export class SessionManager {
 				truncated: true,
 			},
 		};
+	}
+
+	/**
+	 * The live leaf's ancestor chain, leaf first, with the same cycle guard the depth
+	 * walk uses, so a cycle reads as a chain that stops.
+	 */
+	private livePathOrder(entryById: Map<string, SessionEntry>): string[] {
+		const leafId = this.getLeafId();
+		if (leafId === null) {
+			return [];
+		}
+		const path: string[] = [];
+		const seen = new Set<string>();
+		let current: SessionEntry | undefined = entryById.get(leafId);
+		while (current && !seen.has(current.id)) {
+			seen.add(current.id);
+			path.push(current.id);
+			const parentId = current.parentId;
+			current = parentId === null || parentId === current.id ? undefined : entryById.get(parentId);
+		}
+		return path;
 	}
 
 	/**
@@ -2949,41 +2999,55 @@ export class SessionManager {
 		const liveWindowFrom =
 			Number.isFinite(depthLimit) && leafDepth !== undefined ? Math.max(0, leafDepth - depthLimit) : 0;
 
-		// The live path: the leaf plus its ancestor chain, walked up parent links with the
-		// same cycle guard the depth walk uses, so a cycle reads as a chain that stops.
-		const livePath = new Set<string>();
-		if (leafId !== null) {
-			let current: SessionEntry | undefined = entryById.get(leafId);
-			while (current && !livePath.has(current.id)) {
-				livePath.add(current.id);
-				const parentId = current.parentId;
-				current = parentId === null || parentId === current.id ? undefined : entryById.get(parentId);
-			}
-		}
+		// The live path: the leaf plus its ancestor chain, leaf first, with the same cycle
+		// guard the depth walk uses, so a cycle reads as a chain that stops.
+		const livePathOrder = this.livePathOrder(entryById);
+		const livePath = new Set<string>(livePathOrder);
 		// The width bound: a tree that fits the depth windows can still be O(entries) nodes
-		// (a star: one shallow root with every entry as a child). The count window keeps the
-		// newest `nodeLimit` entries by file order - the same side the depth windows and the
-		// flat bound keep - plus the live leaf's ancestor chain, so the entry the session
-		// resumes on keeps its parents. A retained node whose parent falls outside the count
-		// window comes back as a root, exactly like a depth-cut node.
+		// (a star: one shallow root with every entry as a child). The cap is hard: the live
+		// leaf's retained ancestor chain is kept first, leaf first, and the remaining budget
+		// fills with the newest entries by file order - the same side the depth windows and
+		// the flat bound keep. The live chain is kept *inside* the budget rather than exempt
+		// from it: the exemption let the bound return more nodes than the cap declared
+		// (20_001 on a star, more after a rewind), so `returnedNodes` could exceed the cap
+		// while the stats said it could not. A retained node whose parent falls outside the
+		// kept set comes back as a root, exactly like a depth-cut node.
 		const nodeCapLimit = Math.max(1, Math.floor(nodeLimit));
 		const nodeCapActive = Number.isFinite(nodeLimit) && entries.length > nodeCapLimit;
-		const nodeCapFromIndex = nodeCapActive ? entries.length - nodeCapLimit : Number.POSITIVE_INFINITY;
-		const fileIndexOf = new Map<string, number>();
-		for (let index = 0; index < entries.length; index++) {
-			fileIndexOf.set(entries[index]?.entry.id, index);
+		const depthRetained = (entry: SessionEntry, depth: number): boolean => {
+			if (!Number.isFinite(depthLimit)) {
+				return true;
+			}
+			return depth >= deepWindowFrom || (livePath.has(entry.id) && depth >= liveWindowFrom);
+		};
+		const capKept = new Set<string>();
+		if (nodeCapActive) {
+			let budget = nodeCapLimit;
+			for (const id of livePathOrder) {
+				if (budget === 0) {
+					break;
+				}
+				const entry = entryById.get(id);
+				if (entry === undefined || !depthRetained(entry, depths.get(id) ?? 0)) {
+					continue;
+				}
+				capKept.add(id);
+				budget -= 1;
+			}
+			for (let index = entries.length - 1; index >= 0 && budget > 0; index--) {
+				const entry = entries[index]!.entry;
+				if (capKept.has(entry.id) || !depthRetained(entry, depths.get(entry.id) ?? 0)) {
+					continue;
+				}
+				capKept.add(entry.id);
+				budget -= 1;
+			}
 		}
 		const isRetained = (entry: SessionEntry, depth: number): boolean => {
-			if (Number.isFinite(depthLimit)) {
-				const depthRetained = depth >= deepWindowFrom || (livePath.has(entry.id) && depth >= liveWindowFrom);
-				if (!depthRetained) {
-					return false;
-				}
+			if (!depthRetained(entry, depth)) {
+				return false;
 			}
-			if (nodeCapActive) {
-				return (fileIndexOf.get(entry.id) ?? 0) >= nodeCapFromIndex || livePath.has(entry.id);
-			}
-			return true;
+			return nodeCapActive ? capKept.has(entry.id) : true;
 		};
 
 		const roots: SessionTreeNode[] = [];
@@ -3053,6 +3117,7 @@ export class SessionManager {
 				// The stats ride the wire, and JSON has no Infinity: an unbounded build reports
 				// the largest representable depth instead of a null that reads as "unknown".
 				depthLimit: Number.isFinite(depthLimit) ? depthLimit : Number.MAX_SAFE_INTEGER,
+				maxNodes: Number.isFinite(nodeLimit) ? nodeCapLimit : Number.MAX_SAFE_INTEGER,
 				retainedFromDepth: shallowestRetained ?? 0,
 				leafIncluded,
 				truncated: omitted > 0,

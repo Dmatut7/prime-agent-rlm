@@ -83,6 +83,7 @@ import type {
 	AgentConnectionSavedSessionScope,
 	AgentConnectionScopedModel,
 	AgentConnectionSessionContext,
+	AgentConnectionSessionEvent,
 	AgentConnectionSessionHeader,
 	AgentConnectionSessionInputPause,
 	AgentConnectionSessionListCallbacks,
@@ -844,10 +845,10 @@ export class DaemonAgentConnection implements AgentConnection {
 		const data = await this.requestData<{
 			flatNodes: AgentConnectionSessionTreeFlatNode[];
 			leafId: string | null;
-			// The daemon caps the flat tree at SESSION_TREE_FLAT_MAX_NODES newest entries
-			// and reports the cap here; forwarding it keeps the truncation visible at the
-			// client boundary instead of silent (the stats are the flat bound, not the
-			// snapshot's depth bound).
+			// The daemon caps the flat tree at SESSION_TREE_FLAT_MAX_NODES nodes - the live
+			// leaf's chain plus the newest entries - and reports the cap here; forwarding it
+			// keeps the truncation visible at the client boundary instead of silent (the
+			// stats are the flat bound, not the snapshot's depth bound).
 			treeBound?: AgentConnectionSessionTreeFlatStats;
 		}>({
 			type: "get_session_tree",
@@ -2587,7 +2588,10 @@ export class DaemonAgentConnection implements AgentConnection {
 		this.latestSnapshot = { ...this.latestSnapshot, children: updatedChildren };
 	}
 
-	private observeStreamingMessage(event: AgentSessionEvent): void {
+	// The wire union's stall family may lack `diagnostics` (a daemon from before the
+	// payload), so this takes the core union plus the wire union instead of erasing the
+	// difference with a cast.
+	private observeStreamingMessage(event: AgentSessionEvent | AgentConnectionSessionEvent): void {
 		if (!this.latestSnapshot) {
 			return;
 		}
