@@ -79,6 +79,40 @@ function readJson(path: string): OwnerRecord {
 	return JSON.parse(readFileSync(path, "utf8")) as OwnerRecord;
 }
 
+/**
+ * Writes an owner record into the registry without going through acquisition, so a
+ * test can describe an owner this process would never legitimately be: dead, or live
+ * on another socket.
+ */
+function plantOwner(
+	paths: ReturnType<typeof createPaths>,
+	shape: OwnerRecord,
+	generation: string,
+	pid: number,
+	overrides: { socketPath: string; descriptorDir: string; agentDir: string },
+): string {
+	const directory = join(paths.registryDir, `${generation}.owner`);
+	mkdirSync(directory, { recursive: true, mode: 0o700 });
+	const processStartId = getProcessStartId(pid);
+	writeFileSync(
+		join(directory, "owner.json"),
+		`${JSON.stringify(
+			{
+				...shape,
+				token: randomUUID(),
+				generation,
+				pid,
+				...(processStartId ? { processStartId } : {}),
+				...overrides,
+			},
+			null,
+			2,
+		)}\n`,
+		{ mode: 0o600 },
+	);
+	return directory;
+}
+
 describe("daemon supervisor ownership registry reclamation", () => {
 	it("reclaims a dead owner that never conflicted and keeps a live one", async () => {
 		const paths = createPaths();
@@ -89,32 +123,18 @@ describe("daemon supervisor ownership registry reclamation", () => {
 
 		const dead = spawnSync(process.execPath, ["-e", "process.exit(0)"]);
 		expect(dead.pid).toBeTypeOf("number");
-		const plant = (generation: string, pid: number, suffix: string) => {
-			const directory = join(paths.registryDir, `${generation}.owner`);
-			mkdirSync(directory, { recursive: true, mode: 0o700 });
-			writeFileSync(
-				join(directory, "owner.json"),
-				`${JSON.stringify(
-					{
-						...shape,
-						token: randomUUID(),
-						generation,
-						pid,
-						...(getProcessStartId(pid) ? { processStartId: getProcessStartId(pid) } : {}),
-						// Neither the socket path nor the descriptor directory overlaps the
-						// acquisition below: this owner could never be reached by conflict.
-						socketPath: join(paths.root, `other-${suffix}.sock`),
-						descriptorDir: join(paths.root, `other-workers-${suffix}`),
-					},
-					null,
-					2,
-				)}\n`,
-				{ mode: 0o600 },
-			);
-			return directory;
-		};
-		const deadDirectory = plant("dead-other-owner", dead.pid as number, "dead");
-		const liveDirectory = plant("live-other-owner", process.pid, "live");
+		// Socket path, descriptor directory and agent dir all differ from the acquisition
+		// below: this owner could never be reached by conflict.
+		const deadDirectory = plantOwner(paths, shape, "dead-other-owner", dead.pid as number, {
+			socketPath: join(paths.root, "other-dead.sock"),
+			descriptorDir: join(paths.root, "other-workers-dead"),
+			agentDir: join(paths.root, "other-agent-dead"),
+		});
+		const liveDirectory = plantOwner(paths, shape, "live-other-owner", process.pid, {
+			socketPath: join(paths.root, "other-live.sock"),
+			descriptorDir: join(paths.root, "other-workers-live"),
+			agentDir: join(paths.root, "other-agent-live"),
+		});
 
 		const acquired = await acquire(paths, "reclaiming-owner");
 
@@ -129,6 +149,27 @@ describe("daemon supervisor ownership registry reclamation", () => {
 		);
 
 		await acquired.release();
+		rmSync(liveDirectory, { recursive: true, force: true });
+	});
+
+	it("refuses a live daemon that holds the same agent dir on another socket", async () => {
+		const paths = createPaths();
+		const template = await acquire(paths, "template-owner");
+		const shape = { ...template.record };
+		await template.release();
+
+		// The daemon identity is the agent dir, not the socket: a shell with a different
+		// $TMPDIR reaches a different socket path for the same sessions, harness state and
+		// leases, so this owner must block the second daemon rather than be sidestepped.
+		const liveDirectory = plantOwner(paths, shape, "live-same-agent-dir", process.pid, {
+			socketPath: join(paths.root, "other-live.sock"),
+			descriptorDir: join(paths.root, "other-workers-live"),
+			agentDir: shape.agentDir as string,
+		});
+
+		await expect(acquire(paths, "second-owner")).rejects.toThrow(/already owns agent dir/);
+		expect(existsSync(liveDirectory)).toBe(true);
+		expect(existsSync(ownerDir(paths, "second-owner"))).toBe(false);
 		rmSync(liveDirectory, { recursive: true, force: true });
 	});
 

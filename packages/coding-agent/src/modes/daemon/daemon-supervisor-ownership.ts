@@ -508,6 +508,93 @@ async function mutateDaemonSupervisorOwner(
 	});
 }
 
+/**
+ * A daemon holds one agent dir for its whole life: it writes that dir's
+ * sessions, harness state, leases, cron store and worker descriptors. Two
+ * daemons on one agent dir are two writers on that state. The socket path alone
+ * never expressed this — the default socket lives in `$TMPDIR`, so a shell with
+ * a different `$TMPDIR` reaches a different socket, can start a second daemon,
+ * and both of them then write the same agent dir.
+ */
+export class DaemonAgentDirAlreadyRunningError extends Error {
+	readonly code = "daemon_agent_dir_already_running" as const;
+
+	constructor(
+		readonly owner: DaemonSupervisorOwnerSummary,
+		readonly agentDir: string,
+	) {
+		super(
+			`Another Prime Agent daemon already owns agent dir ${agentDir}: pid ${owner.pid}, ` +
+				`generation ${owner.generation}, socket ${owner.socketPath}. ` +
+				"Two daemons on one agent dir would co-write its sessions, harness state and leases, " +
+				`so this daemon will not start. Talk to the running one with "--daemon-socket ${owner.socketPath}", ` +
+				"or stop it before starting a new one.",
+		);
+		this.name = "DaemonAgentDirAlreadyRunningError";
+	}
+}
+
+/** The part of an owner record clients and startup guards need, without the internal bookkeeping. */
+export interface DaemonSupervisorOwnerSummary {
+	generation: string;
+	pid: number;
+	socketPath: string;
+	agentDir: string;
+	phase: DaemonSupervisorOwnerPhase;
+	createdAt: string;
+}
+
+/**
+ * Live daemons bound to one agent dir, newest first.
+ *
+ * Read-only and lock-free on purpose: a record is written rename-atomically, so a
+ * torn read is not possible, and a client that is only looking must never take the
+ * registry guard (that is the writer's serialization) nor reclaim another daemon's
+ * directory (only a starting daemon does that, under the guard).
+ */
+export async function findLiveDaemonOwnersForAgentDir(
+	agentDir: string,
+	registryDir?: string,
+): Promise<DaemonSupervisorOwnerSummary[]> {
+	const resolvedRegistryDir = registryDir ?? defaultDaemonSupervisorRegistryDir();
+	const legacyRegistryDir = registryDir === undefined ? legacyDaemonSupervisorRegistryDir() : undefined;
+	const wanted = canonicalizeFilesystemPath(agentDir);
+	const summaries: DaemonSupervisorOwnerSummary[] = [];
+	for (const directory of [resolvedRegistryDir, ...(legacyRegistryDir ? [legacyRegistryDir] : [])]) {
+		for (const owner of readOwnerRecordsIn(directory)) {
+			if (owner.agentDir !== wanted) {
+				continue;
+			}
+			// Only records for this agent dir pay for the identity check, which forks
+			// `ps`/`powershell` when the pid alone is not decisive.
+			if (!isProcessIdentityAlive(owner)) {
+				continue;
+			}
+			summaries.push({
+				generation: owner.generation,
+				pid: owner.pid,
+				socketPath: owner.socketPath,
+				agentDir: owner.agentDir,
+				phase: owner.phase,
+				createdAt: owner.createdAt,
+			});
+		}
+	}
+	return summaries.sort((left, right) => right.createdAt.localeCompare(left.createdAt) || left.pid - right.pid);
+}
+
+function readOwnerRecordsIn(registryDir: string): DaemonSupervisorOwnerRecord[] {
+	try {
+		return listOwnerDirectories(registryDir).flatMap((ownerDirectory) => {
+			const owner = readOwnerRecord(ownerDirectory);
+			return owner ? [owner] : [];
+		});
+	} catch {
+		// An absent or unreadable registry holds no live daemon.
+		return [];
+	}
+}
+
 export async function acquireDaemonSupervisorOwnership(
 	options: AcquireDaemonSupervisorOwnershipOptions,
 ): Promise<DaemonSupervisorOwnership> {
@@ -550,6 +637,24 @@ export async function acquireDaemonSupervisorOwnership(
 				if (ownerConflicts(owner, record)) {
 					if (isProcessIdentityAlive(owner)) {
 						throw new DaemonSupervisorAlreadyRunningError(owner);
+					}
+				} else if (owner.agentDir === record.agentDir) {
+					// Same agent dir, different socket: the second half of the uniqueness
+					// constraint. A daemon that owns an agent dir owns its sessions,
+					// harness state and leases; a live one keeps that ownership whatever
+					// `$TMPDIR` (and therefore whatever socket path) the newcomer resolved.
+					if (isProcessIdentityAlive(owner)) {
+						throw new DaemonAgentDirAlreadyRunningError(
+							{
+								generation: owner.generation,
+								pid: owner.pid,
+								socketPath: owner.socketPath,
+								agentDir: owner.agentDir,
+								phase: owner.phase,
+								createdAt: owner.createdAt,
+							},
+							record.agentDir,
+						);
 					}
 				} else if (isProcessAlive(owner.pid)) {
 					// Somebody else's live daemon on this box: none of our business.

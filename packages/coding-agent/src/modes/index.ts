@@ -66,6 +66,7 @@ export {
 	type UnifiedSessionRecord,
 	unifiedSessionSearchableText,
 } from "./agents-view/agents-view-state.js";
+export { resolveDaemonSocketForAgentDir } from "./daemon/daemon-agent-endpoint.js";
 export {
 	DaemonCapabilityUnavailableError,
 	DaemonClient,
