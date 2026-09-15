@@ -1941,6 +1941,15 @@ export class SessionManager {
 	/** Incrementally maintained (count, tailId) of what getEntries() returns; see getEntryStats(). */
 	private entryCount = 0;
 	private entryTailId: string | undefined;
+	/**
+	 * Cached getSessionName() answer. The name only changes when a session_info
+	 * entry lands (or the transcript is rebuilt/reset), so reads - the roster
+	 * flush pays one per dirty row rebuild - must not re-filter and re-scan the
+	 * whole transcript. Undefined-dirty is tracked separately: a nameless
+	 * transcript also resolves to a cached answer.
+	 */
+	private sessionNameCache: string | undefined;
+	private sessionNameDirty = true;
 	private byId: Map<string, SessionEntry> = new Map();
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
@@ -2362,6 +2371,7 @@ export class SessionManager {
 		this.byId.set(entry.id, entry);
 		this.entryCount += 1;
 		this.entryTailId = entry.id;
+		if (entry.type === "session_info") this.sessionNameDirty = true;
 	}
 
 	/** Recompute the incremental entry stats from fileEntries (rebuild, rollback, reset). */
@@ -2375,6 +2385,10 @@ export class SessionManager {
 		}
 		this.entryCount = count;
 		this.entryTailId = tailId;
+		// A rebuilt, rolled-back or reset transcript may have gained, moved or lost
+		// its last session_info entry; the next read rescans instead of trusting the
+		// cache. Every fileEntries replacement funnels through _buildIndex() or here.
+		this.sessionNameDirty = true;
 	}
 
 	appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
@@ -2528,9 +2542,21 @@ export class SessionManager {
 	}
 
 	getSessionName(): string | undefined {
-		const entries = this.getEntries();
-		for (let i = entries.length - 1; i >= 0; i--) {
-			const entry = entries[i];
+		if (this.sessionNameDirty) {
+			this.sessionNameCache = this._scanSessionName();
+			this.sessionNameDirty = false;
+		}
+		return this.sessionNameCache;
+	}
+
+	/**
+	 * The value getSessionName() caches: the last session_info entry wins. Walks
+	 * fileEntries directly (skipping the header) so the one scan a write pays does
+	 * not also allocate the getEntries() copy.
+	 */
+	private _scanSessionName(): string | undefined {
+		for (let i = this.fileEntries.length - 1; i >= 0; i--) {
+			const entry = this.fileEntries[i];
 			if (entry.type === "session_info") {
 				return entry.name?.trim() || undefined;
 			}
