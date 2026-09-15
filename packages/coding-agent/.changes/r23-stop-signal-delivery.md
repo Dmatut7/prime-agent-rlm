@@ -1,0 +1,2 @@
+- Fixed shutdown reports crediting stops this run never performed: a kill signal the kernel refused to deliver (already-dead or not-permitted pid) no longer enters the causal ledger, so an externally dead daemon with leftover socket residue is reported as left running, and a refused socket face of a signalled pid keeps its refusal verdict instead of being laundered into stopped.
+- Fixed `reap --force` planning a kill of an unreachable supervisor that still owns live workers: it now skips and points at `shutdown --force`, which stops the workers first.

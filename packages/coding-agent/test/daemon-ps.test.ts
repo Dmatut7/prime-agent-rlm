@@ -247,8 +247,8 @@ describe("planReap startup grace (DS-4)", () => {
 	});
 });
 
-describe("unreachable + live workers verdict consistency (DS-4)", () => {
-	it("planReap and planShutdownAll give the same verdict under --force", () => {
+describe("unreachable + live workers verdict (X-10)", () => {
+	it("planReap refuses a hung supervisor that owns live workers; shutdown --force kills it with them", () => {
 		const hung = makeDaemon({
 			socketPath: "/tmp/hung-workers.sock",
 			status: "unreachable",
@@ -257,8 +257,12 @@ describe("unreachable + live workers verdict consistency (DS-4)", () => {
 			liveWorkerCount: 2,
 		});
 		const reap = planReap([hung], true, { scope: { kind: "machine" }, orphansOnly: false })[0]!;
-		const shutdown = planShutdownAll([hung], true, { scope: { kind: "machine" }, orphansOnly: false })[0]!;
-		expect(reap.kind).toBe(shutdown.kind);
+		// The reap sweep is the clearly-safe sweep and has no worker-stop path,
+		// so it must refuse where `shutdown --force` — which stops the workers
+		// first — kills. The verdicts are different on purpose, and both are exact.
+		expect(reap.kind).toBe("skip");
+		expect(reap.kind === "skip" && reap.reason).toContain("2 live worker process(es)");
+		expect(planShutdownAll([hung], true, { scope: { kind: "machine" }, orphansOnly: false })[0]!.kind).toBe("kill");
 	});
 });
 
