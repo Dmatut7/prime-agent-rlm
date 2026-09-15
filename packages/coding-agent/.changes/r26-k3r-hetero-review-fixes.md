@@ -1,0 +1,5 @@
+- Fixed a failed owned-session promotion during a headless give-up falling back to the worker-stopping path: the promote is retried, a persistent failure detaches without stopping the worker, and stderr reports that the session could not be left running instead of promising a re-attach that would not work.
+- Added a structured `run_outcome` terminal event to `--mode json` when the RLM quiescence wait gives up, so CI can tell a give-up apart from a gate failure without scraping stderr.
+- Fixed duplicate `refine_failed` events and failure receipts when a refinement throws a non-Error value: the failure is normalized once at the catch point and every downstream reporter shares the idempotency key.
+- Changed concurrent manual compactions with different custom instructions to queue the second behind the first instead of silently dropping its instructions, and a manual `/compact` now preempts an in-flight auto compaction instead of compacting twice.
+- Removed a dead `artifactDir` field from the self-update refusal plan variant whose cleanup comment described a path that never ran.

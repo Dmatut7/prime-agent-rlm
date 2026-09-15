@@ -11,6 +11,7 @@
 
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { writeRawStdout } from "../../../src/core/output-guard.js";
 import { InProcessAgentConnection } from "../../../src/modes/agent-connection/in-process-agent-connection.js";
 import { runPrintModeWithConnection } from "../../../src/modes/print-mode.js";
 import { createHarness, type Harness } from "../harness.js";
@@ -94,6 +95,23 @@ describe("print mode RLM quiescence give-up", () => {
 
 			// The run completed without hanging ...
 			expect(exitCode).toBeDefined();
+			if (mode === "json") {
+				// K3R-2: the json event stream is a machine surface; a give-up must be
+				// a structured terminal event there, not stderr text CI has to scrape.
+				const outcomeLines = vi
+					.mocked(writeRawStdout)
+					.mock.calls.map((call) => String(call[0]))
+					.filter((line) => line.includes('"run_outcome"') || line.includes('"type":"run_outcome"'));
+				expect(outcomeLines.length).toBeGreaterThan(0);
+				const outcome = JSON.parse(outcomeLines[outcomeLines.length - 1]) as {
+					reason?: string;
+					gaveUp?: boolean;
+					leftRunning?: boolean;
+				};
+				expect(outcome.reason).toBe("rlm_quiescence_give_up");
+				expect(outcome.gaveUp).toBe(true);
+				expect(outcome.leftRunning).toBe(true);
+			}
 			// ... but not as a clean completion: the user hears that descendants were
 			// still running when the wait gave up.
 			expect(stderrCalls.some((text) => text.includes("still running"))).toBe(true);

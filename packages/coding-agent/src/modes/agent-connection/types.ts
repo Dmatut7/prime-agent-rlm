@@ -805,6 +805,20 @@ export interface AgentConnectionDisposeOptions {
 	keepSessionRunning?: boolean;
 }
 
+/**
+ * What a dispose actually achieved, so a caller that asked to keep the session
+ * running can report the truth instead of assuming it. Absent when the dispose
+ * was not asked to keep the session running.
+ */
+export interface AgentConnectionDisposeOutcome {
+	keepSessionRunning?: {
+		/** True when the session (and its running descendants) survives the dispose. */
+		leftRunning: boolean;
+		/** Why the session could not be left running, when it could not. */
+		errorMessage?: string;
+	};
+}
+
 export interface AgentConnectionSessionInputPause {
 	release(): Promise<void>;
 }
@@ -947,7 +961,7 @@ export interface AgentConnection {
 	/** Read-only live-session watcher; unavailable transports return undefined. */
 	watchSession(activeSessionId: string): Promise<AgentConnectionSessionWatcher | undefined>;
 
-	dispose(options?: AgentConnectionDisposeOptions): Promise<void>;
+	dispose(options?: AgentConnectionDisposeOptions): Promise<AgentConnectionDisposeOutcome | undefined>;
 }
 
 export interface AgentConnectionSessionWatcher {

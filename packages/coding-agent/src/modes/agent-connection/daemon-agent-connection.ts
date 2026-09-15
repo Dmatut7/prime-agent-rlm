@@ -59,6 +59,7 @@ import type {
 	AgentConnection,
 	AgentConnectionBeforeSessionInvalidateListener,
 	AgentConnectionDisposeOptions,
+	AgentConnectionDisposeOutcome,
 	AgentConnectionEvent,
 	AgentConnectionEventListener,
 	AgentConnectionExecuteBashOptions,
@@ -186,6 +187,8 @@ const UPDATE_RECONNECT_RETRY_MS = 100;
 const MAX_COMPLETED_SNAPSHOTS = 128;
 const OWNED_SESSION_DISPOSE_RECONNECT_WAIT_MS = 10_000;
 const updateTransportReconnects = new WeakMap<DaemonTransportClient, Promise<void>>();
+
+const OWNED_SESSION_PROMOTE_RETRY_MS = 200;
 
 function delay(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -1741,11 +1744,13 @@ export class DaemonAgentConnection implements AgentConnection {
 			getCommands: () => connection.getCommands(),
 			subscribe: (listener) => connection.subscribe(listener),
 			getToolDefinition: (name) => connection.getToolDefinition(name),
-			close: () => connection.dispose(),
+			close: async () => {
+				await connection.dispose();
+			},
 		};
 	}
 
-	async dispose(options?: AgentConnectionDisposeOptions): Promise<void> {
+	async dispose(options?: AgentConnectionDisposeOptions): Promise<AgentConnectionDisposeOutcome | undefined> {
 		if (this.disposed || this.disposing) {
 			return;
 		}
@@ -1770,10 +1775,16 @@ export class DaemonAgentConnection implements AgentConnection {
 		// cascades into aborting them. Promote the owned session to resident first
 		// so it survives the detach; the descendants keep running and the session
 		// can be re-attached.
+		// K3R-1: a promote failure used to be swallowed and the dispose fell back
+		// to complete_owned_session, silently running the exact cascade the
+		// promotion exists to prevent. Retry the promote; if it still fails, take
+		// the non-cascading detach path and report the failure so the caller's
+		// "left running" message can match reality.
+		let promoteFailure: string | undefined;
 		if (this.options.ownedSession && options?.keepSessionRunning) {
-			await this.promoteToResident().catch(() => undefined);
+			promoteFailure = await this.promoteToResidentForKeepRunning();
 		}
-		if (this.options.ownedSession) {
+		if (this.options.ownedSession && !promoteFailure) {
 			await this.requestOk({ type: "complete_owned_session", activeSessionId: this.activeSessionId }).catch(
 				() => undefined,
 			);
@@ -1784,6 +1795,9 @@ export class DaemonAgentConnection implements AgentConnection {
 			this.client.close();
 		}
 		this.rejectSnapshotAssemblies(new Error("Daemon connection disposed during snapshot transfer"));
+		return options?.keepSessionRunning
+			? { keepSessionRunning: { leftRunning: !promoteFailure, errorMessage: promoteFailure } }
+			: undefined;
 	}
 
 	async promoteToResident(): Promise<void> {
@@ -1791,6 +1805,22 @@ export class DaemonAgentConnection implements AgentConnection {
 			if (!promoteOwnedSession) return;
 			await this.requestOk({ type: "promote_owned_session", activeSessionId: this.activeSessionId });
 		});
+	}
+
+	private async promoteToResidentForKeepRunning(attempts = 3): Promise<string | undefined> {
+		let lastError: unknown;
+		for (let attempt = 0; attempt < attempts; attempt += 1) {
+			try {
+				await this.promoteToResident();
+				return undefined;
+			} catch (error) {
+				lastError = error;
+			}
+			if (attempt < attempts - 1) {
+				await delay(OWNED_SESSION_PROMOTE_RETRY_MS);
+			}
+		}
+		return lastError instanceof Error ? lastError.message : String(lastError);
 	}
 
 	private withOwnedSessionPromotion<T>(operation: (promoteOwnedSession: boolean) => Promise<T>): Promise<T> {
