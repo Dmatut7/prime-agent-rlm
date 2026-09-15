@@ -195,9 +195,16 @@ export interface ChildUsageAttributionEntry extends SessionEntryBase {
  * session file yet. The flush line carries the summed childUsage, the newest
  * aggregateUsage, and splices the chain (id of the last merge, parentId of the
  * first unwritten merge) so a reload folds the same totals.
+ *
+ * LAT-4: the flush row's parent must reference an id a disk line carries, so
+ * it is resolved at flush time by walking the live chain from the last merge
+ * up to the nearest ancestor that is not a deferred merge id (a persisted
+ * entry or an earlier flush row) - this keeps mid-window messages, markers and
+ * compaction entries on the reloaded chain. anchorId (this target's newest
+ * on-disk row) is the terminal fallback for a malformed chain.
  */
 interface PendingAttributionWrite {
-	firstParentId: string | null;
+	anchorId: string;
 	childUsage: Usage;
 	aggregateUsage: Usage;
 	origin?: ChildUsageAttributionEntry["origin"];
@@ -1984,6 +1991,8 @@ export class SessionManager {
 	private persistFailureListeners = new Set<SessionPersistFailureListener>();
 	/** LAT-3: per-target attribution deltas not yet written to the file; see PendingAttributionWrite. */
 	private readonly pendingAttributionWrites = new Map<string, PendingAttributionWrite>();
+	/** LAT-4: ids of deferred attribution merges that no disk line carries yet. */
+	private readonly deferredAttributionIds = new Set<string>();
 	/** LAT-3: last persisted agent_status, so byte-identical re-writes can be skipped. */
 	private lastAgentStatusWrite: { id: string; status: AgentStatus } | undefined;
 
@@ -2021,6 +2030,7 @@ export class SessionManager {
 	 */
 	setSessionFile(sessionFile: string, preloadedEntries?: FileEntry[]): void {
 		this.pendingAttributionWrites.clear();
+		this.deferredAttributionIds.clear();
 		this.sessionFile = resolve(sessionFile);
 		if (existsSync(this.sessionFile)) {
 			try {
@@ -2142,6 +2152,7 @@ export class SessionManager {
 		this.labelTimestampsById.clear();
 		this.leafId = null;
 		this.pendingAttributionWrites.clear();
+		this.deferredAttributionIds.clear();
 		this.lastAgentStatusWrite = undefined;
 		this._rescanEntryStats();
 		this.flushed = false;
@@ -2195,6 +2206,7 @@ export class SessionManager {
 		// A rewrite materializes every in-memory entry as its own line, so any
 		// deferred attribution deltas are already on disk afterwards.
 		this.pendingAttributionWrites.clear();
+		this.deferredAttributionIds.clear();
 		const content = `${this.fileEntries.map((e) => JSON.stringify(e)).join("\n")}\n`;
 		writePrivateFileAtomicLines(this.sessionFile, [content], {
 			preserveOwnership: true,
@@ -2398,6 +2410,11 @@ export class SessionManager {
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
+		// LAT-4: an entry appended while attribution merges are deferred would
+		// reference an in-memory merge id that no disk line carries (its parent
+		// is the current leaf); cut the coalescing window first so the parent
+		// resolves after a reload.
+		this.flushChildUsageAttributions();
 		this._pushIndexedEntry(entry);
 		this.leafId = entry.id;
 		this._persist(entry);
@@ -2563,9 +2580,13 @@ export class SessionManager {
 		// next flush instead of one line per streamed child message.
 		const pending = this.pendingAttributionWrites.get(targetId);
 		if (!pending) {
+			// LAT-4: this entry is persisted immediately, so its parent (the leaf
+			// at append time) must already exist on disk - flush the deferred
+			// merges the leaf may point at, e.g. another child's streamed usage.
+			this.flushChildUsageAttributions();
 			this._persist(entry);
 			this.pendingAttributionWrites.set(targetId, {
-				firstParentId: null,
+				anchorId: entry.id,
 				childUsage: emptyUsage(),
 				aggregateUsage: cloneUsage(aggregateUsage),
 				origin,
@@ -2576,7 +2597,7 @@ export class SessionManager {
 			});
 			return entry.id;
 		}
-		if (pending.merges === 0) pending.firstParentId = entry.parentId;
+		this.deferredAttributionIds.add(entry.id);
 		addAssistantUsage(pending.childUsage, entry.childUsage);
 		pending.aggregateUsage = cloneUsage(aggregateUsage);
 		if (origin) pending.origin = origin;
@@ -2600,13 +2621,37 @@ export class SessionManager {
 	 * fold (readSessionInfo scan, OwnUsageAccumulator, whole-file refold) totals
 	 * the same as one line per merge.
 	 */
+	/**
+	 * LAT-4: walk the live parent chain from `id` up to the nearest ancestor
+	 * whose id a disk line carries (every id not in deferredAttributionIds is a
+	 * persisted entry or an earlier flush row). Returns null when the chain
+	 * reaches the root or a missing id before finding one.
+	 */
+	private _nearestPersistedAncestor(id: string): string | null {
+		let current: SessionEntry | undefined = this.byId.get(id);
+		const seen = new Set<string>([id]);
+		while (current && current.parentId !== null && current.parentId !== undefined) {
+			const parentId = current.parentId;
+			if (seen.has(parentId)) return null;
+			seen.add(parentId);
+			if (!this.deferredAttributionIds.has(parentId)) return parentId;
+			current = this.byId.get(parentId);
+		}
+		return null;
+	}
+
 	private _flushPendingAttributionWrite(targetId: string): void {
 		const pending = this.pendingAttributionWrites.get(targetId);
 		if (!pending || pending.merges === 0) return;
+		// LAT-4: the row's parent must resolve on reload. Splice at the nearest
+		// on-disk ancestor of the last merge so the reloaded chain keeps every
+		// entry the live chain keeps; only deferred merge ids (all of the row's
+		// own type) are spliced past, so the reload folds identical totals.
+		const parentId = this._nearestPersistedAncestor(pending.lastId) ?? pending.anchorId;
 		const entry: ChildUsageAttributionEntry = {
 			type: "child_usage_attributed",
 			id: pending.lastId,
-			parentId: pending.firstParentId,
+			parentId,
 			timestamp: pending.lastTimestamp,
 			targetId,
 			childUsage: pending.childUsage,
@@ -2614,10 +2659,12 @@ export class SessionManager {
 			...(pending.origin ? { origin: pending.origin } : {}),
 		};
 		this._persist(entry);
+		this.deferredAttributionIds.delete(pending.lastId);
 		// Re-seed instead of dropping the pending state: the next merge for this
 		// target stays deferred, so each window costs one line rather than one
-		// line plus a new immediate line.
-		pending.firstParentId = null;
+		// line plus a new immediate line. The anchor is the row just written, so
+		// the next fallback parent also exists on disk.
+		pending.anchorId = entry.id;
 		pending.childUsage = emptyUsage();
 		pending.merges = 0;
 		pending.startedAt = Date.now();
@@ -3355,6 +3402,9 @@ export class SessionManager {
 	 * re-asserted behind it.
 	 */
 	private _appendEntryKeepingLeaf(entry: SessionEntry): void {
+		// LAT-4: same window cut as _appendEntry - the pinned entry's parent and
+		// the position marker behind it must not reference deferred merge ids.
+		this.flushChildUsageAttributions();
 		this._pushIndexedEntry(entry);
 		this._persist(entry);
 		this._recordLeafPosition(this.leafId);
@@ -3365,6 +3415,14 @@ export class SessionManager {
 		// either because it is the last entry in the file or because an earlier
 		// marker recorded it.
 		if (targetId === this.leafId) return;
+		// LAT-4: cut the attribution window before the leaf moves, so a deferred
+		// flush cannot splice the disk chain back into the abandoned branch or
+		// land behind the position marker that records the rewind.
+		this.flushChildUsageAttributions();
+		// LAT-5: the agent_status no-op dedupe key must follow the active branch.
+		// After a rewind the last written verdict can sit off-branch, and the
+		// summarizer re-publishing that same verdict must not be dropped.
+		this.lastAgentStatusWrite = undefined;
 		this.leafId = targetId;
 		this._recordLeafPosition(targetId);
 	}
@@ -3381,6 +3439,10 @@ export class SessionManager {
 		}
 		const snappedId =
 			branchFromId === null ? null : (resolveCompleteToolPairLeaf(this.getBranch(branchFromId))?.id ?? null);
+		// LAT-4: cut the attribution window before the leaf moves to the summary,
+		// so later merges splice onto the summary entry instead of the branch it
+		// summarized away.
+		this.flushChildUsageAttributions();
 		this.leafId = snappedId;
 		const entry: BranchSummaryEntry = {
 			type: "branch_summary",
