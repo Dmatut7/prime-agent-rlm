@@ -72,6 +72,19 @@ function writeChainSession(length: number): string {
 	return path;
 }
 
+/** The node with this entry id anywhere in the returned tree, or undefined. */
+function findNode(roots: readonly SessionTreeNode[], entryId: string): SessionTreeNode | undefined {
+	const stack: SessionTreeNode[] = [...roots];
+	while (stack.length > 0) {
+		const node = stack.pop()!;
+		if (node.entry.id === entryId) {
+			return node;
+		}
+		stack.push(...node.children);
+	}
+	return undefined;
+}
+
 /** Whether a node with this entry id is anywhere in the returned tree. */
 function treeContains(roots: readonly SessionTreeNode[], entryId: string): boolean {
 	const stack: SessionTreeNode[] = [...roots];
@@ -204,24 +217,128 @@ describe("session tree wire bounds", () => {
 		expect(serializeJsonLine({ tree: bounded.tree }).length).toBeGreaterThan(0);
 	});
 
-	it("keeps a rewound leaf visible even when a deeper branch owns the window", () => {
+	it("keeps a rewound leaf and its ancestor chain visible even when a deeper branch owns the deep window", () => {
 		const sessionManager = SessionManager.open(writeChainSession(10), tempDir);
 		// Move the leaf back up the chain: the deepest entries are now an abandoned branch,
-		// so a newest-layers window would cut the entry the session actually resumes on.
+		// so a window anchored only at the global deepest entry would cut the entry the
+		// session actually resumes on down to a detached leaf.
 		sessionManager.branch("entry-2");
 		expect(sessionManager.getLeafId()).toBe("entry-2");
 
 		const bounded = sessionManager.getBoundedTree(3);
 		expect(bounded.stats.maxDepth).toBe(9);
-		expect(bounded.stats.retainedFromDepth).toBe(6);
+		// The live window reaches the root (leaf depth 2, limit 3), so the shallowest
+		// retained node is entry-0.
+		expect(bounded.stats.retainedFromDepth).toBe(0);
 		expect(bounded.stats.leafIncluded).toBe(true);
+		// The live branch's ancestor chain stays a chain, not just a floating leaf.
 		expect(treeContains(bounded.tree, "entry-2")).toBe(true);
+		expect(treeContains(bounded.tree, "entry-1")).toBe(true);
+		expect(treeContains(bounded.tree, "entry-0")).toBe(true);
+		const liveParent = findNode(bounded.tree, "entry-1");
+		expect(liveParent?.children.map((child) => child.entry.id)).toContain("entry-2");
+		// The deep window still keeps the abandoned branch's newest layers.
 		expect(treeContains(bounded.tree, "entry-9")).toBe(true);
-		expect(treeContains(bounded.tree, "entry-0")).toBe(false);
-		// The detached leaf is a root of its own, so the depth bound still holds.
+		expect(treeContains(bounded.tree, "entry-5")).toBe(false);
+		// Depth bound still holds, and the counts still add up to the session.
 		expect(depthOfTree(bounded.tree)).toBeLessThanOrEqual(3);
-		const detached = bounded.tree.find((node) => node.entry.id === "entry-2");
-		expect(detached?.children).toEqual([]);
+		expect(bounded.stats.returnedNodes + bounded.stats.omittedNodes).toBe(bounded.stats.entries);
+	});
+
+	/**
+	 * GL-1: the depth window used to be anchored at the *global* max depth, so a
+	 * rewind-and-fork session (live leaf shallow, abandoned branch deep) kept the dead
+	 * branch's bottom layers and cut the live branch's ancestor chain - the leaf only
+	 * survived as a detached root with no ancestors. The window must also anchor at the
+	 * live leaf's own depth, so the branch the session resumes on stays navigable.
+	 */
+	it("keeps the live branch's ancestor chain in a rewind-and-fork session", () => {
+		const sessionManager = SessionManager.open(writeChainSession(10), tempDir);
+		sessionManager.branch("entry-2");
+		const forkId = sessionManager.appendCustomEntry("probe", { fork: true });
+		expect(sessionManager.getLeafId()).toBe(forkId);
+
+		const bounded = sessionManager.getBoundedTree(3);
+		// The live path (entry-0 -> entry-1 -> entry-2 -> fork) is retained as a chain,
+		// not just its leaf.
+		for (const id of ["entry-0", "entry-1", "entry-2", forkId]) {
+			expect(treeContains(bounded.tree, id)).toBe(true);
+		}
+		// The fork rides under its real parent instead of floating as a detached root.
+		const liveParent = findNode(bounded.tree, "entry-2");
+		expect(liveParent?.children.map((child) => child.entry.id)).toContain(forkId);
+		// The deep window (the "new" side) is still kept for the abandoned branch.
+		expect(treeContains(bounded.tree, "entry-9")).toBe(true);
+		expect(bounded.stats.leafIncluded).toBe(true);
+		expect(depthOfTree(bounded.tree)).toBeLessThanOrEqual(3);
+	});
+
+	/**
+	 * GL-2: a leaf returned as a detached root was counted in both `omittedNodes` and
+	 * `returnedNodes`, so the stats over-reported the session by one (entries=1204,
+	 * returned+omitted=1205). Every bounded view must satisfy the identity
+	 * returned + omitted == entries.
+	 */
+	it("never double-counts a detached leaf: returned plus omitted equals entries", () => {
+		const rewound = SessionManager.open(writeChainSession(10), tempDir);
+		rewound.branch("entry-2");
+		const rewoundBounded = rewound.getBoundedTree(3);
+		// 10 chain entries plus the leaf_position marker branch() appends.
+		expect(rewoundBounded.stats.entries).toBe(11);
+		expect(rewoundBounded.stats.returnedNodes + rewoundBounded.stats.omittedNodes).toBe(rewoundBounded.stats.entries);
+
+		const forked = SessionManager.open(writeChainSession(10), tempDir);
+		forked.branch("entry-2");
+		forked.appendCustomEntry("probe", { fork: true });
+		const forkedBounded = forked.getBoundedTree(3);
+		expect(forkedBounded.stats.returnedNodes + forkedBounded.stats.omittedNodes).toBe(forkedBounded.stats.entries);
+
+		const deep = SessionManager.open(writeChainSession(DEEP_CHAIN_LENGTH), tempDir);
+		const deepBounded = deep.getBoundedTree();
+		expect(deepBounded.stats.returnedNodes + deepBounded.stats.omittedNodes).toBe(deepBounded.stats.entries);
+
+		const unbounded = SessionManager.open(writeChainSession(10), tempDir);
+		const unboundedStats = unbounded.getBoundedTree(Number.POSITIVE_INFINITY).stats;
+		expect(unboundedStats.returnedNodes + unboundedStats.omittedNodes).toBe(unboundedStats.entries);
+	});
+
+	/**
+	 * The TUI tree selector consumes `getSessionTree()`, which prefers the snapshot's
+	 * `sessionTree` (built by `createAgentConnectionSnapshot` via `getBoundedTree()`),
+	 * so the GL-1 anchor fix has to be observable at that boundary, not only on the
+	 * SessionManager. A 1200-deep chain with a rewind-and-fork reproduces the selector's
+	 * view of a session whose live branch is shallower than an abandoned deep branch.
+	 */
+	it("ships the live branch's ancestor chain through the snapshot the tree selector consumes", () => {
+		const FORK_CHAIN_LENGTH = 1200;
+		const { session, dispose } = openDeepSession(FORK_CHAIN_LENGTH);
+		try {
+			session.sessionManager.branch("entry-2");
+			const forkId = session.sessionManager.appendCustomEntry("probe", { fork: true });
+
+			const snapshot = createAgentConnectionSnapshot({ session } as unknown as AgentSessionRuntime);
+			const tree = snapshot.sessionTree?.tree ?? [];
+			expect(snapshot.state.leafId).toBe(forkId);
+			for (const id of ["entry-0", "entry-1", "entry-2", forkId]) {
+				expect(treeContains(tree, id)).toBe(true);
+			}
+			const liveParent = findNode(tree, "entry-2");
+			expect(liveParent?.children.map((child) => child.entry.id)).toContain(forkId);
+			// The abandoned branch's newest layers are still in the snapshot tree.
+			expect(treeContains(tree, `entry-${FORK_CHAIN_LENGTH - 1}`)).toBe(true);
+
+			const bound = snapshot.sessionTree?.bound;
+			if (!bound) {
+				throw new Error("snapshot tree stats missing");
+			}
+			expect(bound.leafIncluded).toBe(true);
+			expect(bound.returnedNodes + bound.omittedNodes).toBe(bound.entries);
+			expect(depthOfTree(tree)).toBeLessThanOrEqual(SESSION_TREE_MAX_WIRE_DEPTH);
+			// The bounded snapshot still serializes.
+			expect(serializeJsonLine(snapshot).length).toBeGreaterThan(0);
+		} finally {
+			dispose();
+		}
 	});
 
 	it("keeps the unbounded tree request unmodified for callers that ask for it", () => {
