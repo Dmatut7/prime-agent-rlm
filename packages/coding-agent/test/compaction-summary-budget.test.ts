@@ -23,14 +23,17 @@ function extractText(messages: AgentMessage[]): string {
 describe("budgetSummarizationInput (scan2 C4)", () => {
 	const big = (label: string): AgentMessage => createUserMessage(`${label} ${"z".repeat(8000)}`); // ~2000 tokens
 
-	it("keeps the newest messages within budget and counts elided", () => {
+	it("pins the first user request, keeps the newest messages, and counts elided", () => {
 		const messages = [big("old"), big("mid"), createUserMessage("recent")];
 		const { messages: kept, elided } = budgetSummarizationInput(messages, 2500);
 		expect(elided).toBe(1);
 		expect(kept).toHaveLength(2);
-		expect(extractText(kept)).toContain("mid");
+		// The first user request is pinned against head elision; when the budget
+		// binds, the oldest retained message (mid) gives way to it, and the elided
+		// count discloses that trade.
+		expect(extractText(kept)).toContain("old");
 		expect(extractText(kept)).toContain("recent");
-		expect(extractText(kept)).not.toContain("old");
+		expect(extractText(kept)).not.toContain("mid");
 	});
 
 	it("always keeps the newest message even when it alone exceeds the budget", () => {

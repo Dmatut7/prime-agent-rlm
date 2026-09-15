@@ -16,10 +16,12 @@
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { AGENT_MESSAGE_CUSTOM_TYPE, isAgentSessionMessage } from "../agent-messages.js";
+import { HEARTBEAT_PROMPT_CUSTOM_TYPE } from "../messages.js";
 import { estimateTextTokensByContent } from "./content-density.js";
 import { checkMachineBlockSelfCount, findMachineBlock, renderMachineBlock } from "./machine-blocks.js";
 
-export type UserRequestKind = "user" | "bash";
+export type UserRequestKind = "user" | "bash" | "agent_message";
 
 export interface UserRequestRecord {
 	/** Verbatim text; clipped past USER_REQUEST_ENTRY_MAX_CHARS with the elision kept visible. */
@@ -56,7 +58,7 @@ const ENTRY_TAIL_CHARS = 250;
 export const USER_REQUEST_COMPRESSED_CHARS = 160;
 
 const BLOCK_HEADER =
-	"The user's own words from the compacted transcript, preserved mechanically, oldest first, JSON-encoded so the text is byte-exact (x marks an elided middle). Not a summary: treat every unresolved instruction and reported problem here as a live obligation.";
+	"The user's own words from the compacted transcript - typed messages, user-initiated bash commands, and agent-delivered messages such as RLM task briefs (k=agent_message) - preserved mechanically, oldest first, JSON-encoded so the text is byte-exact (x marks an elided middle). Not a summary: treat every unresolved instruction and reported problem here as a live obligation.";
 
 /** Share of keepRecentTokens the verbatim block may spend when the caller derives its budget. */
 export const USER_REQUESTS_BUDGET_SHARE = 0.3;
@@ -109,24 +111,68 @@ export function clipUserRequest(text: string, maxChars: number): { text: string;
 	};
 }
 
+/**
+ * The custom message forms that carry the user's or orchestrator's own words.
+ *
+ * An `agent_message` is how a parent's task brief reaches an RLM subagent and how
+ * steering notes arrive mid-run; `details.message` is the sender's text verbatim.
+ * A heartbeat prompt is the schedule the user authored. Everything else under the
+ * custom role is machine output - slash-command bookkeeping, compaction and
+ * refinement receipts, child failure notices - and is not the user speaking, so
+ * it stays out of the verbatim ledger.
+ */
+function customUserIntentText(message: AgentMessage): { text: string; kind: UserRequestKind } | undefined {
+	if (message.role !== "custom") return undefined;
+	if (message.customType === AGENT_MESSAGE_CUSTOM_TYPE && isAgentSessionMessage(message)) {
+		const text = message.details.message;
+		return text.trim() ? { text, kind: "agent_message" } : undefined;
+	}
+	if (message.customType === HEARTBEAT_PROMPT_CUSTOM_TYPE) {
+		const text = textOfContent(message.content);
+		return text.trim() ? { text, kind: "user" } : undefined;
+	}
+	return undefined;
+}
+
+function textOfContent(content: string | Array<{ type: string; text?: string }>): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter(
+			(block): block is { type: "text"; text: string } => block.type === "text" && typeof block.text === "string",
+		)
+		.map((block) => block.text)
+		.join("\n");
+}
+
 function userTexts(message: AgentMessage): Array<{ text: string; kind: UserRequestKind }> {
 	if (message.role === "user") {
-		const content = message.content;
-		if (typeof content === "string") return content.trim() ? [{ text: content, kind: "user" }] : [];
-		if (!Array.isArray(content)) return [];
-		const text = content
-			.filter(
-				(block): block is { type: "text"; text: string } => block.type === "text" && typeof block.text === "string",
-			)
-			.map((block) => block.text)
-			.join("\n");
+		const text = textOfContent(message.content);
 		return text.trim() ? [{ text, kind: "user" }] : [];
 	}
 	if (message.role === "bashExecution" && message.command.trim()) {
 		// `!command` is user-initiated; the output is not the user speaking.
 		return [{ text: message.command, kind: "bash" }];
 	}
+	if (message.role === "custom") {
+		const intent = customUserIntentText(message);
+		return intent ? [intent] : [];
+	}
 	return [];
+}
+
+/**
+ * Whether a message carries the user's or orchestrator's intent in a form worth
+ * protecting: exactly the forms `userTexts` collects. Head elision in
+ * `budgetSummarizationInput` pins the first such message, so "what did the user
+ * ask for" is decided once, for the ledger and for the summarizer input, instead
+ * of one answer per subsystem.
+ */
+export function isUserIntentMessage(message: AgentMessage): boolean {
+	if (message.role === "user") return userTexts(message).length > 0;
+	if (message.role === "bashExecution") return !message.excludeFromContext && message.command.trim().length > 0;
+	if (message.role === "custom") return customUserIntentText(message) !== undefined;
+	return false;
 }
 
 /** Collect the user-originated messages of one slice, in order. */
@@ -293,6 +339,11 @@ interface WireRequest {
 	x?: number;
 }
 
+/** Wire kind values are trusted only as one of the known channels; anything else reads as "user". */
+function normalizeUserRequestKind(value: unknown): UserRequestKind {
+	return value === "bash" || value === "agent_message" ? value : "user";
+}
+
 function renderLine(record: UserRequestRecord): string {
 	const wire: WireRequest = {
 		g: record.generation,
@@ -355,7 +406,7 @@ export function parseUserRequests(text: string): UserRequestLedger | undefined {
 			sequence: Number.isFinite(wire.s) ? wire.s : records.length,
 			repeats: Number.isFinite(wire.r) ? Math.max(1, Math.trunc(wire.r)) : 1,
 			originalChars: Number.isFinite(wire.x) ? Math.trunc(wire.x as number) : undefined,
-			kind: wire.k === "bash" ? "bash" : "user",
+			kind: normalizeUserRequestKind(wire.k),
 		});
 	}
 	// The block states its own record count on the opening tag, and the check runs on the
@@ -391,7 +442,7 @@ export function userRequestLedgerFromDetails(details: unknown, generation: numbe
 			sequence: Number.isFinite(record.sequence) ? record.sequence : records.length,
 			repeats: Number.isFinite(record.repeats) ? Math.max(1, Math.trunc(record.repeats)) : 1,
 			originalChars: Number.isFinite(record.originalChars) ? record.originalChars : undefined,
-			kind: record.kind === "bash" ? "bash" : "user",
+			kind: normalizeUserRequestKind(record.kind),
 		});
 	}
 	return {

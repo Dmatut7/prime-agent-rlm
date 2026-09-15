@@ -40,6 +40,7 @@ import {
 } from "./summarization-budget.js";
 import {
 	buildUserRequestLedger,
+	isUserIntentMessage,
 	parseUserRequests,
 	renderUserRequests,
 	type UserRequestLedger,
@@ -77,6 +78,10 @@ export interface CompactionDetails {
 export interface SummarySlice {
 	summary: string;
 	usage?: Usage;
+	/** Messages the input budget elided from this slice's head (budgetSummarizationInput). */
+	elidedMessages?: number;
+	/** Characters clampConversationText dropped from this slice's serialized conversation. */
+	elidedChars?: number;
 }
 
 /**
@@ -690,11 +695,30 @@ export function buildSummarizationPrompt(customInstructions?: string, previousSu
 	return `${basePrompt}\n\n${KERNEL_PERSIST_SUMMARY_NOTE}\n\n${MACHINE_BLOCKS_NOTE}`;
 }
 
+/** Index of the first user-intent message before `limit`, or -1 when there is none. */
+function firstUserIntentIndex(messages: AgentMessage[], limit: number): number {
+	for (let i = 0; i < limit && i < messages.length; i++) {
+		if (isUserIntentMessage(messages[i])) return i;
+	}
+	return -1;
+}
+
 /**
  * Trim summarization input to fit a token budget, keeping the newest messages.
  * Returns the kept messages and how many older messages were elided. A budget of
  * 0 (or unknown window) disables trimming. The newest message is always kept so
  * summarization has something to work with.
+ *
+ * The first user-intent message is pinned against head elision (the
+ * fact-appendix minimum-set precedent: significance outranks recency for a small
+ * protected set). A summarizer whose input no longer contains the request it is
+ * summarizing cannot answer "## Original Request" or "## Goal" from anything but
+ * its own invention, and the single-turn RLM shape - task brief at the head,
+ * everything after it tool-shaped - made that elision the rule rather than the
+ * corner: the brief was the first thing the budget ate. Pinning trades the oldest
+ * retained messages for the request when the budget binds, which the elided
+ * count discloses. A first request too large for the whole budget is not pinned;
+ * the newest-message guarantee then stands alone.
  */
 export function budgetSummarizationInput(
 	messages: AgentMessage[],
@@ -710,7 +734,19 @@ export function budgetSummarizationInput(
 		start = i;
 	}
 	if (start === messages.length && messages.length > 0) start = messages.length - 1;
-	return { messages: messages.slice(start), elided: start };
+	const pinnedIndex = start > 0 ? firstUserIntentIndex(messages, start) : -1;
+	if (pinnedIndex < 0) return { messages: messages.slice(start), elided: start };
+	const pinnedTokens = estimateTokens(messages[pinnedIndex]);
+	if (pinnedTokens > tokenBudget) return { messages: messages.slice(start), elided: start };
+	// Make room inside the same budget: give up the oldest retained messages before
+	// giving up the request. The newest message always survives the shrink.
+	while (start < messages.length && totalTokens + pinnedTokens > tokenBudget) {
+		totalTokens -= estimateTokens(messages[start]);
+		start++;
+	}
+	if (start >= messages.length) start = messages.length - 1;
+	const kept = start <= pinnedIndex ? messages.slice(start) : [messages[pinnedIndex], ...messages.slice(start)];
+	return { messages: kept, elided: messages.length - kept.length };
 }
 
 /**
@@ -876,7 +912,7 @@ async function completeSummarizationRequest(options: SummarizationCallOptions): 
 		.map((c) => c.text)
 		.join("\n");
 
-	return { summary, usage: response.usage };
+	return { summary, usage: response.usage, elidedMessages: elided, elidedChars: clamped.droppedChars };
 }
 
 /**
@@ -1030,7 +1066,7 @@ export function prepareCompaction(
 		// failure was a SHA restated with one extra digit, which breaks every git
 		// command that uses it. What they carried is recovered structurally instead:
 		// details first, the rendered block as the fallback for entries without them.
-		previousSummary = stripMachineBlocks(storedSummary) || undefined;
+		previousSummary = stripCompactionElision(stripMachineBlocks(storedSummary)) || undefined;
 		const renderedFacts = machineAuthored ? parseFactAppendix(storedSummary) : undefined;
 		const renderedUserRequests = machineAuthored ? parseUserRequests(storedSummary) : undefined;
 		// Metadata is text too. The rendered block's `generation` used to enter through
@@ -1142,6 +1178,35 @@ export type SummaryCallRunner = <T>(
 	call: (callHeaders: Record<string, string> | undefined) => Promise<T>,
 ) => Promise<T>;
 
+/** Machine-readable elision disclosure block, rendered at the head of a summary. */
+const ELISION_DISCLOSURE_TAG = "compaction-elision";
+
+/**
+ * Render the summary's self-describing elision header.
+ *
+ * The counts come from the summarizer request itself (budgetSummarizationInput's
+ * message elision and clampConversationText's character drop), so the summary can
+ * say what it did not see. The tag is deliberately not a machine-block tag: it is
+ * not rebuilt deterministically or carried in details, it is a fact about one
+ * summarization pass, and `stripCompactionElision` removes it before the next
+ * generation re-enters, so disclosures do not accumulate.
+ */
+export function compactionElisionDisclosure(elidedMessages: number, elidedChars: number): string {
+	const counts = [`${elidedMessages} older message(s)`, `${elidedChars} character(s)`];
+	return `<${ELISION_DISCLOSURE_TAG} messages="${elidedMessages}" chars="${elidedChars}">
+This summary has omissions: ${counts.join(" and ")} were elided from the input the summarizer saw, to fit its budget. Content the elided part carried may be missing entirely - check the machine blocks below, the retained transcript and other persistent records before concluding anything was never said.
+</${ELISION_DISCLOSURE_TAG}>`;
+}
+
+/** Remove a leading elision disclosure block from a stored summary. */
+export function stripCompactionElision(text: string): string {
+	const pattern = new RegExp(
+		`^\\s*<${ELISION_DISCLOSURE_TAG}\\b[^>]*>[\\s\\S]*?</${ELISION_DISCLOSURE_TAG}>\\s*\\n*`,
+		"",
+	);
+	return text.replace(pattern, "");
+}
+
 export async function compact(
 	preparation: CompactionPreparation,
 	model: Model<any>,
@@ -1217,6 +1282,14 @@ export async function compact(
 		);
 		slices.push(result);
 		summary = result.summary;
+	}
+	// The elision the summarizer's own input suffered is disclosed in the summary's
+	// self-describing header, machine-readably, so the continuation knows the summary
+	// is a partial record instead of assuming it covers the compacted history.
+	const elidedMessages = slices.reduce((total, slice) => total + (slice.elidedMessages ?? 0), 0);
+	const elidedChars = slices.reduce((total, slice) => total + (slice.elidedChars ?? 0), 0);
+	if (elidedMessages > 0 || elidedChars > 0) {
+		summary = `${compactionElisionDisclosure(elidedMessages, elidedChars)}\n\n${summary}`;
 	}
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
 	summary += formatFileOperations(readFiles, modifiedFiles);
