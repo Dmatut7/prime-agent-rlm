@@ -1,9 +1,9 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 /**
  * `scripts/preflight-push.sh` is the certificate a commit gets before it is pushed, so its two
@@ -17,6 +17,13 @@ interface Fixture {
 	root: string;
 	bin: string;
 }
+
+/** Fixtures a case created, removed after it: a gate test must not litter the temp directory. */
+const createdDirs: string[] = [];
+
+afterEach(() => {
+	for (const dir of createdDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
 
 function makeFixture(): Fixture {
 	const root = mkdtempSync(join(tmpdir(), "preflight-gate-repo-"));
@@ -38,6 +45,7 @@ function makeFixture(): Fixture {
 	mkdirSync(join(root, "scripts"));
 	copyFileSync(SCRIPT, join(root, "scripts", "preflight-push.sh"));
 	const bin = mkdtempSync(join(tmpdir(), "preflight-gate-bin-"));
+	createdDirs.push(root, bin);
 	return { root, bin };
 }
 
