@@ -75,40 +75,82 @@ export function parseReferenceRecord(filePath: string): ReferenceRecord | undefi
 }
 
 /**
+ * Resolves a pid's current start identity. The default forks a helper process
+ * synchronously, so a reader that judges many references resolves them once in
+ * a batch (RC-4) and passes the resulting lookup in instead.
+ */
+export type ProcessStartIdLookup = (pid: number) => string | undefined;
+
+/**
  * A live pid is only the recorded holder when its start identity still matches;
  * pids get reused. When the start identity cannot be queried the reference is
  * kept: this decides whether a directory may be deleted, so "cannot disprove"
  * must not read as "gone". (The orphan reaper judges the same evidence the other
  * way round because it decides whether to kill.)
  */
-export function referenceIsLive(record: ReferenceRecord): boolean {
+export function referenceIsLive(
+	record: ReferenceRecord,
+	currentStartIdOf: ProcessStartIdLookup = getProcessStartId,
+): boolean {
 	if (!isProcessAlive(record.pid)) return false;
 	if (record.processStartId === undefined) return true;
-	const current = getProcessStartId(record.pid);
+	const current = currentStartIdOf(record.pid);
 	return current === undefined || current === record.processStartId;
 }
 
 export type ReferenceVerdict = "live" | "stale" | "unverifiable" | "foreign";
 
 /**
- * What one entry in a reference directory proves about its holder. `pidName` is
- * the pid the file name claims, without the layout's own prefix or suffix.
+ * What one entry in a reference directory proves about its holder, minus the
+ * holder's identity: the lstat outcome and the parsed record. Split out so a
+ * reader can gather every entry first, resolve all start identities in one
+ * batch (RC-4), and then judge without re-reading the files.
  */
-export function judgeReferenceEntry(referencePath: string, pidName: string): ReferenceVerdict {
+export interface ReferenceEntryFacts {
+	/** The entry is gone, or not a file this bookkeeping writes. */
+	kind: "gone" | "foreign" | "record";
+	record?: ReferenceRecord;
+}
+
+export function inspectReferenceEntry(referencePath: string): ReferenceEntryFacts {
 	let stats: ReturnType<typeof lstatSync>;
 	try {
 		stats = lstatSync(referencePath);
 	} catch {
 		// Gone between the directory listing and this read: nothing left to protect or sweep.
-		return "stale";
+		return { kind: "gone" };
 	}
-	if (stats.isSymbolicLink() || !stats.isFile()) return "foreign";
-	const record = parseReferenceRecord(referencePath);
+	if (stats.isSymbolicLink() || !stats.isFile()) return { kind: "foreign" };
+	return { kind: "record", record: parseReferenceRecord(referencePath) };
+}
+
+/**
+ * What one entry in a reference directory proves about its holder. `pidName` is
+ * the pid the file name claims, without the layout's own prefix or suffix.
+ * `currentStartIdOf` defaults to the synchronous per-pid identity query; pass a
+ * batched lookup when judging many entries at once.
+ */
+export function judgeReferenceEntry(
+	referencePath: string,
+	pidName: string,
+	currentStartIdOf?: ProcessStartIdLookup,
+): ReferenceVerdict {
+	return verdictFromEntryFacts(inspectReferenceEntry(referencePath), pidName, currentStartIdOf);
+}
+
+export function verdictFromEntryFacts(
+	facts: ReferenceEntryFacts,
+	pidName: string,
+	currentStartIdOf?: ProcessStartIdLookup,
+): ReferenceVerdict {
+	if (facts.kind === "gone") return "stale";
+	if (facts.kind === "foreign") return "foreign";
+	const record = facts.record;
 	// An unparseable record is a truncated write (disk full, or a reader that looked mid-write),
 	// not a dead holder: the bytes prove nothing about who wrote them.
 	if (record === undefined) return "unverifiable";
-	if (Number(pidName) !== record.pid) return referenceIsLive(record) ? "unverifiable" : "stale";
-	return referenceIsLive(record) ? "live" : "stale";
+	if (Number(pidName) !== record.pid) return referenceIsLive(record, currentStartIdOf) ? "unverifiable" : "stale";
+	return referenceIsLive(record, currentStartIdOf) ? "live" : "stale";
 }
 
 /**
