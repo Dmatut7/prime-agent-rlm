@@ -274,6 +274,51 @@ export interface SessionTreeNode extends SessionTreeFlatNode {
 	children: SessionTreeNode[];
 }
 
+/**
+ * Nesting bound for a session tree handed to a client or embedded in a snapshot.
+ *
+ * A session tree is as deep as its longest parent chain, and a linear session's chain is
+ * as long as the file: a real 101k-entry session produces one root nested 101,473 levels
+ * deep. Every structured consumer pays per level, and `JSON.stringify` (which every JSONL
+ * frame goes through) recurses per level until the stack is gone. 1000 levels is already
+ * far past what a tree view renders, and it keeps the serializer's recursion depth two
+ * orders of magnitude below the engine limit, so the wire stays serializable by construction.
+ */
+export const SESSION_TREE_MAX_WIRE_DEPTH = 1000;
+
+/**
+ * Node bound for the flat tree returned by the `get_session_tree` command.
+ *
+ * The flat tree ships every entry whole, so its cost is O(entries): a 101,514-entry
+ * session is ~90MB of JSON per call, transferred whenever the tree/branch selector opens.
+ * The bound keeps the newest entries (the leaf is always last in file order, so the branch
+ * the session would resume on stays present) and reports how many were left out.
+ */
+export const SESSION_TREE_FLAT_MAX_NODES = 20_000;
+
+/** What a bounded nested tree left out, so a truncation is never silent. */
+export interface SessionTreeDepthStats {
+	/** Entries in the session. */
+	entries: number;
+	/** Nodes the caller receives. */
+	returnedNodes: number;
+	/** Nodes below the depth limit: present in the session, absent from the returned tree. */
+	omittedNodes: number;
+	/** Depth (parent edges) of the deepest entry in the session. */
+	maxDepth: number;
+	depthLimit: number;
+	truncated: boolean;
+}
+
+/** What a bounded flat tree left out, so a truncation is never silent. */
+export interface SessionFlatTreeStats {
+	totalEntries: number;
+	returnedNodes: number;
+	omittedNodes: number;
+	maxNodes: number;
+	truncated: boolean;
+}
+
 export interface SessionContext {
 	messages: AgentMessage[];
 	thinkingLevel: string;
@@ -2604,27 +2649,146 @@ export class SessionManager {
 		}));
 	}
 
+	/**
+	 * The whole tree, unbounded in depth: the caller asked for it, so nothing is left out.
+	 * Do not hand the result to a serializer or a structured clone without a bound - use
+	 * {@link getBoundedTree}, whose stats say what was dropped.
+	 */
 	getTree(): SessionTreeNode[] {
-		const entries = this.getFlatTree();
-		const nodeMap = new Map<string, SessionTreeNode>();
-		const roots: SessionTreeNode[] = [];
+		return this.buildTree(this.getFlatTree(), Number.POSITIVE_INFINITY).tree;
+	}
 
+	/**
+	 * The tree cut off below `maxDepth` parent edges, plus what the cut dropped.
+	 *
+	 * The bound exists because a tree's depth is a property of the transcript, not of the
+	 * view: one long session is one chain of 100k nodes, and a serializer that recurses per
+	 * level dies on it. Cutting instead of serializing deeper keeps the frame's size and its
+	 * recursion depth bounded, and the stats make the omission reportable rather than silent.
+	 */
+	getBoundedTree(maxDepth: number = SESSION_TREE_MAX_WIRE_DEPTH): {
+		tree: SessionTreeNode[];
+		stats: SessionTreeDepthStats;
+	} {
+		return this.buildTree(this.getFlatTree(), maxDepth);
+	}
+
+	/**
+	 * The flat tree for the wire, capped at `maxNodes` newest entries.
+	 *
+	 * Entries are shipped whole, so an uncapped response is O(entries) bytes per call. The
+	 * tail of the file is kept because the leaf is always its last entry: the branch the
+	 * session would resume on stays navigable, and older branches are reported as omitted
+	 * instead of silently disappearing.
+	 */
+	getBoundedFlatTree(maxNodes: number = SESSION_TREE_FLAT_MAX_NODES): {
+		nodes: SessionTreeFlatNode[];
+		stats: SessionFlatTreeStats;
+	} {
+		const entries = this.getFlatTree();
+		const limit = Math.max(1, Math.floor(maxNodes));
+		if (entries.length <= limit) {
+			return {
+				nodes: entries,
+				stats: {
+					totalEntries: entries.length,
+					returnedNodes: entries.length,
+					omittedNodes: 0,
+					maxNodes: limit,
+					truncated: false,
+				},
+			};
+		}
+		const nodes = entries.slice(entries.length - limit);
+		return {
+			nodes,
+			stats: {
+				totalEntries: entries.length,
+				returnedNodes: nodes.length,
+				omittedNodes: entries.length - nodes.length,
+				maxNodes: limit,
+				truncated: true,
+			},
+		};
+	}
+
+	/**
+	 * Build the tree iteratively, from per-entry depths up.
+	 *
+	 * Two walks are explicit here on purpose: the depth of an entry is its parent chain's
+	 * length, and both the chain walk and the child aggregation would recurse as deep as the
+	 * transcript is long. Entries whose resolved depth is past `depthLimit` are counted and
+	 * dropped, so a bounded tree is exactly the unbounded tree truncated at that level.
+	 */
+	private buildTree(
+		entries: readonly SessionTreeFlatNode[],
+		depthLimit: number,
+	): { tree: SessionTreeNode[]; stats: SessionTreeDepthStats } {
+		const nodeMap = new Map<string, SessionTreeNode>();
 		for (const flatNode of entries) {
 			nodeMap.set(flatNode.entry.id, { ...flatNode, children: [] });
 		}
 
+		const entryById = new Map<string, SessionEntry>();
+		for (const flatNode of entries) {
+			entryById.set(flatNode.entry.id, flatNode.entry);
+		}
+
+		const depths = new Map<string, number>();
+		const onPath = new Set<string>();
+		for (const flatNode of entries) {
+			if (depths.has(flatNode.entry.id)) {
+				continue;
+			}
+			const chain: SessionEntry[] = [];
+			let current: SessionEntry | undefined = flatNode.entry;
+			while (current && !depths.has(current.id) && !onPath.has(current.id)) {
+				onPath.add(current.id);
+				chain.push(current);
+				const parentId = current.parentId;
+				if (parentId === null || parentId === current.id) {
+					current = undefined;
+					break;
+				}
+				current = entryById.get(parentId);
+			}
+			// The walk stopped on either a root/orphan (depth 0) or an already-measured
+			// ancestor; a cycle stops it too, and the cycle members all read as roots. That
+			// matches the aggregation below, where an entry whose parent is unknown is a root.
+			const known = current ? depths.get(current.id) : undefined;
+			let depth = known === undefined ? 0 : known + 1;
+			for (let index = chain.length - 1; index >= 0; index--) {
+				depths.set(chain[index].id, depth);
+				depth += 1;
+			}
+			for (const entry of chain) {
+				onPath.delete(entry.id);
+			}
+		}
+
+		const roots: SessionTreeNode[] = [];
+		let returned = 0;
+		let omitted = 0;
+		let maxDepth = 0;
 		for (const flatNode of entries) {
 			const entry = flatNode.entry;
+			const depth = depths.get(entry.id) ?? 0;
+			if (depth > maxDepth) {
+				maxDepth = depth;
+			}
 			const node = nodeMap.get(entry.id)!;
-			if (entry.parentId === null || entry.parentId === entry.id) {
-				roots.push(node);
+			if (depth > depthLimit) {
+				omitted += 1;
+				continue;
+			}
+			returned += 1;
+			const parentId = entry.parentId;
+			const parent = parentId === null || parentId === entry.id ? undefined : nodeMap.get(parentId);
+			const parentDepth = parent ? (depths.get(parent.entry.id) ?? 0) : -1;
+			if (parent && parentDepth <= depthLimit) {
+				parent.children.push(node);
 			} else {
-				const parent = nodeMap.get(entry.parentId);
-				if (parent) {
-					parent.children.push(node);
-				} else {
-					roots.push(node);
-				}
+				roots.push(node);
 			}
 		}
 
@@ -2637,7 +2801,19 @@ export class SessionManager {
 			stack.push(...node.children);
 		}
 
-		return roots;
+		return {
+			tree: roots,
+			stats: {
+				entries: entries.length,
+				returnedNodes: returned,
+				omittedNodes: omitted,
+				maxDepth,
+				// The stats ride the wire, and JSON has no Infinity: an unbounded build reports
+				// the largest representable depth instead of a null that reads as "unknown".
+				depthLimit: Number.isFinite(depthLimit) ? depthLimit : Number.MAX_SAFE_INTEGER,
+				truncated: omitted > 0,
+			},
+		};
 	}
 
 	/**

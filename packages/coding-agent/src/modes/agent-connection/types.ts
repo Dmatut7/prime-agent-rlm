@@ -26,6 +26,7 @@ import type {
 	SessionActionSnapshot,
 } from "../../core/session-action-store.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
+import type { SessionTreeDepthStats } from "../../core/session-manager.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import type { StallDiagnostics } from "../../core/stall-diagnostics.js";
 import type { SessionUsageSummary } from "../../core/usage.js";
@@ -311,7 +312,12 @@ export interface AgentConnectionSnapshot {
 	/** In-flight assistant message, separate from finalized transcript messages. */
 	streamingMessage?: AgentMessage;
 	sessionContext?: AgentConnectionSessionContext;
-	sessionTree?: { tree: AgentConnectionSessionTreeNode[]; leafId: string | null };
+	sessionTree?: {
+		tree: AgentConnectionSessionTreeNode[];
+		leafId: string | null;
+		/** Present when the tree was depth-bounded; says what the bound left out. */
+		bound?: SessionTreeDepthStats;
+	};
 	parent?: AgentConnectionParentMetadata;
 	/** Live RLM children, including descendants, known to the host at snapshot time. */
 	children?: AgentConnectionRlmChildAgentSnapshot[];

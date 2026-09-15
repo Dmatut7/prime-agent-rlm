@@ -65,14 +65,20 @@ export function createAgentConnectionSnapshot(
 ): AgentConnectionSnapshot {
 	const session = runtime.session;
 	const sessionManager = session.sessionManager;
+	const boundedTree = sessionManager.getBoundedTree();
 	return {
 		state: createAgentConnectionState(runtime, activeSessionId),
 		messages: [...session.messages],
 		...(session.state?.streamingMessage ? { streamingMessage: session.state.streamingMessage } : {}),
 		sessionContext: session.buildSessionContext(),
+		// The tree is depth-bounded: a long session is one chain of 100k nodes, and the
+		// snapshot is a JSONL frame whose serializer recurses per nesting level. The stats
+		// travel with the tree so a truncated tree is visible to the client, never a silent
+		// "this session has no older branches" reading.
 		sessionTree: {
-			tree: sessionManager.getTree(),
+			tree: boundedTree.tree,
 			leafId: sessionManager.getLeafId(),
+			bound: boundedTree.stats,
 		},
 		children: session.getRlmChildSnapshots(),
 	};

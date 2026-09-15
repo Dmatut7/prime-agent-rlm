@@ -29,6 +29,7 @@ import type { CustomMessage } from "../../core/messages.js";
 import type { QueuedMessageLane, QueuedMessageMutation } from "../../core/session-action-store.js";
 import type { SessionCwdIssue } from "../../core/session-cwd.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
+import type { SessionTreeDepthStats } from "../../core/session-manager.js";
 import type { SessionUsageSummary } from "../../core/usage.js";
 import type {
 	AgentConnectionAgentStatus,
@@ -469,7 +470,12 @@ export interface DaemonSessionSnapshot {
 	state: AgentConnectionState;
 	messages: AgentMessage[];
 	sessionContext?: AgentConnectionSessionContext;
-	sessionTree?: { tree: AgentConnectionSessionTreeNode[]; leafId: string | null };
+	sessionTree?: {
+		tree: AgentConnectionSessionTreeNode[];
+		leafId: string | null;
+		/** Present when the tree was depth-bounded; says what the bound left out. */
+		bound?: SessionTreeDepthStats;
+	};
 	lastEventSequence: DaemonEventSequence;
 	lastEventCursor?: DaemonEventCursor;
 	parent?: {
