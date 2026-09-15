@@ -304,9 +304,10 @@ export interface SessionTreeDepthStats {
 	/** Nodes the caller receives. */
 	returnedNodes: number;
 	/**
-	 * Nodes outside the retained depth window: present in the session, absent from the
-	 * returned tree. The window is anchored at the deepest entry, so these are the *older*
-	 * ancestors - the same side of the session the flat bound drops.
+	 * Nodes outside both retained depth windows: present in the session, absent from the
+	 * returned tree. The windows are anchored at the deepest entry and at the live leaf's
+	 * own depth, so these are the *older* ancestors of either chain - the same side of the
+	 * session the flat bound drops.
 	 */
 	omittedNodes: number;
 	/** Depth (parent edges) of the deepest entry in the session. */
@@ -314,15 +315,16 @@ export interface SessionTreeDepthStats {
 	depthLimit: number;
 	/**
 	 * Depth of the shallowest retained node, i.e. how many top layers were cut. 0 when the
-	 * whole tree fit. A retained node whose parent is shallower than this comes back as a
-	 * root, so a client can tell a truncated view from a session that really starts there.
+	 * whole tree fit. A retained node whose parent is not retained comes back as a root, so
+	 * a client can tell a truncated view from a session that really starts there.
 	 */
 	retainedFromDepth: number;
 	/**
 	 * The session's live leaf is a node in the returned tree. A depth bound must not hide
-	 * the entry the session resumes on, so a leaf outside the window is returned as a
-	 * detached root (no ancestors, no children) instead of being dropped; this says whether
-	 * that held. False when the session has no leaf.
+	 * the entry the session resumes on: the window is anchored at the leaf's own depth, so
+	 * the leaf keeps its retained ancestor chain, and a leaf that somehow falls outside
+	 * every window is returned as a detached root (no ancestors, no children) instead of
+	 * being dropped; this says whether either held. False when the session has no leaf.
 	 */
 	leafIncluded: boolean;
 	truncated: boolean;
@@ -2722,8 +2724,10 @@ export class SessionManager {
 	 * view: one long session is one chain of 100k nodes, and a serializer that recurses per
 	 * level dies on it. Cutting instead of serializing deeper keeps the frame's size and its
 	 * recursion depth bounded, and the stats make the omission reportable rather than silent.
-	 * The cut keeps the deepest layers and the live leaf, i.e. the same side of the session
-	 * {@link getBoundedFlatTree} keeps, so a client reading either view sees the recent past.
+	 * The cut keeps the deepest layers and the live leaf's ancestor chain, i.e. the same side
+	 * of the session {@link getBoundedFlatTree} keeps, so a client reading either view sees
+	 * the recent past - including, after a rewind-and-fork, the branch the session actually
+	 * resumes on.
 	 */
 	getBoundedTree(maxDepth: number = SESSION_TREE_MAX_WIRE_DEPTH): {
 		tree: SessionTreeNode[];
@@ -2776,10 +2780,11 @@ export class SessionManager {
 	 *
 	 * Two walks are explicit here on purpose: the depth of an entry is its parent chain's
 	 * length, and both the chain walk and the child aggregation would recurse as deep as the
-	 * transcript is long. A bounded build keeps the newest `depthLimit` layers - the window
-	 * is anchored at the deepest entry, so what it drops is the oldest ancestors - and always
-	 * keeps the live leaf, detached if the window would otherwise have cut it. A tree that
-	 * fits under the limit is returned whole and unchanged.
+	 * transcript is long. A bounded build keeps the newest `depthLimit` layers - windows
+	 * anchored at the deepest entry *and* at the live leaf's own depth, so what it drops is
+	 * the oldest ancestors of either chain - and always keeps the live leaf with its
+	 * retained ancestor chain, detached only if it somehow falls outside its own window. A
+	 * tree that fits under the limit is returned whole and unchanged.
 	 */
 	private buildTree(
 		entries: readonly SessionTreeFlatNode[],
@@ -2827,44 +2832,83 @@ export class SessionManager {
 			}
 		}
 
-		// The depth window is anchored at the deepest entry, not at the root. A bound has
-		// to cut something, and which side it cuts is the whole difference between a view
-		// of the session you are in and a view of the session you started: cutting the old
-		// top layers keeps the branch the session resumes on, while cutting everything past
-		// a fixed depth kept the *oldest* 1000 entries of a 100k-entry chain and dropped the
-		// live leaf. This is also the same side the flat bound keeps (newest entries), so one
-		// session no longer presents two opposite truncations. Anchoring at maxDepth is what
-		// preserves the serializer bound: every retained ancestor chain stops at
-		// `retainedFromDepth`, so the returned tree is at most `depthLimit` edges deep.
+		// The depth window has two anchors, and both cut the same side: the *old* top of
+		// the session. The deep window is anchored at the deepest entry - a bound has to
+		// cut something, and which side it cuts is the whole difference between a view of
+		// the session you are in and a view of the session you started: cutting the old
+		// top layers keeps the newest layers, the same side the flat bound keeps (newest
+		// entries), so one session never presents two opposite truncations. The live
+		// window is anchored at the live leaf's own depth: after a rewind-and-fork the
+		// leaf sits on a branch shallower than an abandoned deep branch, and a window
+		// anchored only at the global deepest entry would keep the dead branch's bottom
+		// while cutting the *live* branch's ancestor chain, leaving the leaf a detached
+		// root the branch selector cannot navigate up from. A node is retained when
+		// either window wants it, and the leaf always falls inside its own window, so
+		// the entry the session resumes on keeps its ancestors. The serializer bound
+		// survives the union: a retained chain is at most `depthLimit` edges inside
+		// either window, and a chain crossing from the live window into the deep one is
+		// at most `2 * depthLimit + 2` edges (it can only exist when the leaf is within
+		// `depthLimit` of the global deepest entry).
 		let maxDepth = 0;
 		for (const depth of depths.values()) {
 			if (depth > maxDepth) {
 				maxDepth = depth;
 			}
 		}
-		const retainedFromDepth = Number.isFinite(depthLimit) ? Math.max(0, maxDepth - depthLimit) : 0;
+		const leafId = this.getLeafId();
+		const deepWindowFrom = Number.isFinite(depthLimit) ? Math.max(0, maxDepth - depthLimit) : 0;
+		const leafDepth = leafId === null ? undefined : depths.get(leafId);
+		const liveWindowFrom =
+			Number.isFinite(depthLimit) && leafDepth !== undefined ? Math.max(0, leafDepth - depthLimit) : 0;
+
+		// The live path: the leaf plus its ancestor chain, walked up parent links with the
+		// same cycle guard the depth walk uses, so a cycle reads as a chain that stops.
+		const livePath = new Set<string>();
+		if (leafId !== null) {
+			let current: SessionEntry | undefined = entryById.get(leafId);
+			while (current && !livePath.has(current.id)) {
+				livePath.add(current.id);
+				const parentId = current.parentId;
+				current = parentId === null || parentId === current.id ? undefined : entryById.get(parentId);
+			}
+		}
+		const isRetained = (entry: SessionEntry, depth: number): boolean => {
+			if (!Number.isFinite(depthLimit)) {
+				return true;
+			}
+			return depth >= deepWindowFrom || (livePath.has(entry.id) && depth >= liveWindowFrom);
+		};
 
 		const roots: SessionTreeNode[] = [];
 		let returned = 0;
 		let omitted = 0;
+		let shallowestRetained: number | undefined;
 		let detachedLeaf: SessionTreeNode | undefined;
-		const leafId = this.getLeafId();
 		for (const flatNode of entries) {
 			const entry = flatNode.entry;
 			const depth = depths.get(entry.id) ?? 0;
 			const node = nodeMap.get(entry.id)!;
-			if (depth < retainedFromDepth) {
-				omitted += 1;
+			if (!isRetained(entry, depth)) {
+				// The leaf anchors its own window, so in practice it is always retained;
+				// this is the safety net for a leaf that somehow falls outside both
+				// windows. It comes back detached and is counted once, in `returned`
+				// only - counting it in both buckets made the stats report one more
+				// node than the session has.
 				if (entry.id === leafId) {
 					detachedLeaf = node;
+					returned += 1;
+				} else {
+					omitted += 1;
 				}
 				continue;
 			}
 			returned += 1;
+			if (shallowestRetained === undefined || depth < shallowestRetained) {
+				shallowestRetained = depth;
+			}
 			const parentId = entry.parentId;
 			const parent = parentId === null || parentId === entry.id ? undefined : nodeMap.get(parentId);
-			const parentDepth = parent ? (depths.get(parent.entry.id) ?? 0) : -1;
-			if (parent && parentDepth >= retainedFromDepth) {
+			if (parent && isRetained(parent.entry, depths.get(parent.entry.id) ?? 0)) {
 				parent.children.push(node);
 			} else {
 				roots.push(node);
@@ -2877,12 +2921,11 @@ export class SessionManager {
 			// re-attaching them here would rebuild exactly the chain depth the bound exists
 			// to prevent.
 			roots.push(detachedLeaf);
-			returned += 1;
 		}
 		const leafNode = leafId === null ? undefined : nodeMap.get(leafId);
 		const leafIncluded =
 			leafNode !== undefined &&
-			(leafNode === detachedLeaf || (depths.get(leafNode.entry.id) ?? 0) >= retainedFromDepth);
+			(leafNode === detachedLeaf || isRetained(leafNode.entry, depths.get(leafNode.entry.id) ?? 0));
 
 		// Sort children by timestamp (oldest first, newest at bottom)
 		// Use iterative approach to avoid stack overflow on deep trees
@@ -2903,7 +2946,7 @@ export class SessionManager {
 				// The stats ride the wire, and JSON has no Infinity: an unbounded build reports
 				// the largest representable depth instead of a null that reads as "unknown".
 				depthLimit: Number.isFinite(depthLimit) ? depthLimit : Number.MAX_SAFE_INTEGER,
-				retainedFromDepth,
+				retainedFromDepth: shallowestRetained ?? 0,
 				leafIncluded,
 				truncated: omitted > 0,
 			},
