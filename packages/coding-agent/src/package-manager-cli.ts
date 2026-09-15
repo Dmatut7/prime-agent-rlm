@@ -2,7 +2,9 @@ import type { ImageContent, TextContent, UserMessage } from "@earendil-works/pi-
 import chalk from "chalk";
 import { spawn } from "child_process";
 import { readFileSync, rmSync, statSync } from "fs";
-import { resolve, sep } from "path";
+import { mkdtemp, rm, writeFile } from "fs/promises";
+import { tmpdir } from "os";
+import { basename, join, resolve, sep } from "path";
 import { selectConfig } from "./cli/config-selector.js";
 import {
 	ensureInteractiveDaemonRunning,
@@ -30,7 +32,9 @@ import {
 } from "./cli/daemon-update-restart.js";
 import {
 	APP_NAME,
+	type ArtifactUpdateSpec,
 	CONFIG_DIR_NAME,
+	classifyUpdateSpec,
 	getAgentDir,
 	getDaemonUpdateRestartManifestPath,
 	getLegacyDaemonUpdateRestartManifestPath,
@@ -40,7 +44,10 @@ import {
 	SELF_UPDATE_INTERACTIVE_CHILD_ENV,
 	SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE,
 	type SelfUpdateCommand,
+	type UpdateSpecOptions,
 	VERSION,
+	type VerifiedUpdateArtifact,
+	verifyUpdateArtifactHash,
 } from "./config.js";
 import type { SessionActionRecoverySnapshot } from "./core/agent-session.js";
 import { SESSION_ACTION_RECOVERY_FORMAT_VERSION } from "./core/agent-session.js";
@@ -70,6 +77,7 @@ import {
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 } from "./modes/daemon/daemon-worker-protocol.js";
 import { shouldUseWindowsShell } from "./utils/child-process.js";
+import { getPiUserAgent } from "./utils/pi-user-agent.js";
 import { getLatestPiRelease, isNewerPackageVersion } from "./utils/version-check.js";
 
 export type PackageCommand = "install" | "remove" | "update" | "list";
@@ -427,9 +435,10 @@ function printSelfUpdateUnavailable(
 	npmCommand?: string[],
 	updateSpec = PACKAGE_NAME,
 	updatePackageName = updateSpec,
+	options?: UpdateSpecOptions,
 ): void {
 	console.error(`error: ${APP_NAME} cannot self-update this installation.`);
-	console.error(getSelfUpdateUnavailableInstruction(PACKAGE_NAME, npmCommand, updateSpec, updatePackageName));
+	console.error(getSelfUpdateUnavailableInstruction(PACKAGE_NAME, npmCommand, updateSpec, updatePackageName, options));
 
 	const entrypoint = process.argv[1];
 	if (entrypoint) {
@@ -447,6 +456,69 @@ interface SelfUpdatePlan {
 	packageName: string;
 	shouldRun: boolean;
 	targetVersion?: string;
+	/** Set when the release the manifest pointed at could not be verified: the update must not run. */
+	refusal?: string;
+	/** Digest proven for {@link installSpec} when it is a downloaded release artifact. */
+	verifiedArtifact?: VerifiedUpdateArtifact;
+	/** Temp directory holding the verified artifact, removed once the install attempt ends. */
+	artifactDir?: string;
+}
+
+const UPDATE_ARTIFACT_MAX_BYTES = 512 * 1024 * 1024;
+const UPDATE_ARTIFACT_TIMEOUT_MS = 120_000;
+
+/**
+ * Downloads the release artifact the manifest pointed at and refuses it unless its bytes match the
+ * pinned digest. This is the only way an artifact can reach a package manager: `npm install -g
+ * <url>` accepts any URL, follows redirects, and checks nothing, so a URL is never passed through.
+ */
+async function downloadVerifiedUpdateArtifact(
+	artifact: ArtifactUpdateSpec,
+): Promise<{ path: string; sha256: string; dir: string }> {
+	const response = await fetch(artifact.url, {
+		headers: { "User-Agent": getPiUserAgent(VERSION) },
+		signal: AbortSignal.timeout(UPDATE_ARTIFACT_TIMEOUT_MS),
+	}).catch((error: unknown) => {
+		throw new Error(
+			`could not download the update artifact ${artifact.url}: ${error instanceof Error ? error.message : error}`,
+		);
+	});
+	if (!response.ok) {
+		throw new Error(`could not download the update artifact ${artifact.url}: HTTP ${response.status}`);
+	}
+	const bytes = new Uint8Array(await response.arrayBuffer());
+	if (bytes.byteLength > UPDATE_ARTIFACT_MAX_BYTES) {
+		throw new Error(
+			`refusing the update artifact ${artifact.url}: it is larger than ${UPDATE_ARTIFACT_MAX_BYTES} bytes`,
+		);
+	}
+	if (!verifyUpdateArtifactHash(bytes, artifact.sha256)) {
+		throw new Error(
+			`refusing the update artifact ${artifact.url}: its sha256 does not match the pinned ${artifact.sha256}`,
+		);
+	}
+	const dir = await mkdtemp(join(tmpdir(), "prime-agent-update-"));
+	const artifactPath = join(dir, basename(new URL(artifact.url).pathname) || "prime-agent.tgz");
+	await writeFile(artifactPath, bytes);
+	return { path: artifactPath, sha256: artifact.sha256, dir };
+}
+
+/** Resolves a manifest artifact spec to a verified local file, or to a refusal with the reason. */
+async function resolveUpdateArtifact(
+	installSpec: string,
+): Promise<{ installSpec: string; verifiedArtifact?: VerifiedUpdateArtifact; artifactDir?: string; refusal?: string }> {
+	const classification = classifyUpdateSpec(installSpec);
+	if (classification.kind !== "artifact") return { installSpec };
+	try {
+		const downloaded = await downloadVerifiedUpdateArtifact(classification);
+		return {
+			installSpec: downloaded.path,
+			verifiedArtifact: { path: downloaded.path, sha256: downloaded.sha256 },
+			artifactDir: downloaded.dir,
+		};
+	} catch (error: unknown) {
+		return { installSpec, refusal: error instanceof Error ? error.message : String(error) };
+	}
 }
 
 function setSelfUpdateNoChangeExitCode(): void {
@@ -466,7 +538,18 @@ async function getSelfUpdatePlan(force: boolean): Promise<SelfUpdatePlan> {
 			packageRenameRequiresUpdate ||
 			isNewerPackageVersion(latestRelease.version, VERSION)
 		) {
-			return { installSpec, packageName, shouldRun: true, targetVersion: latestRelease?.version };
+			// A manifest artifact is downloaded and hash-checked before any install command exists;
+			// a failure here is a refusal, never a silent fallback to the registry package.
+			const artifact = await resolveUpdateArtifact(installSpec);
+			return {
+				installSpec: artifact.installSpec,
+				packageName,
+				shouldRun: true,
+				targetVersion: latestRelease?.version,
+				refusal: artifact.refusal,
+				verifiedArtifact: artifact.verifiedArtifact,
+				artifactDir: artifact.artifactDir,
+			};
 		}
 	} catch {
 		return { installSpec: PACKAGE_NAME, packageName: PACKAGE_NAME, shouldRun: true };
@@ -1615,22 +1698,37 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 						console.error(chalk.yellow(forkSelfUpdateOverrideLine(forkInstall)));
 					}
 					const selfUpdatePlan = await getSelfUpdatePlan(options.force);
+					const discardVerifiedArtifact = async (): Promise<void> => {
+						if (!selfUpdatePlan.artifactDir) return;
+						await rm(selfUpdatePlan.artifactDir, { recursive: true, force: true }).catch(() => undefined);
+					};
+					if (selfUpdatePlan.refusal) {
+						console.error(chalk.red(`Error: ${selfUpdatePlan.refusal}`));
+						process.exitCode = 1;
+						return true;
+					}
 					if (!selfUpdatePlan.shouldRun) {
 						setSelfUpdateNoChangeExitCode();
 						return true;
 					}
+					const selfUpdateSpecOptions: UpdateSpecOptions | undefined = selfUpdatePlan.verifiedArtifact
+						? { verifiedArtifact: selfUpdatePlan.verifiedArtifact }
+						: undefined;
 					const selfUpdateCommand = getSelfUpdateCommand(
 						PACKAGE_NAME,
 						selfUpdateNpmCommand,
 						selfUpdatePlan.installSpec,
 						selfUpdatePlan.packageName,
+						selfUpdateSpecOptions,
 					);
 					if (!selfUpdateCommand) {
 						printSelfUpdateUnavailable(
 							selfUpdateNpmCommand,
 							selfUpdatePlan.installSpec,
 							selfUpdatePlan.packageName,
+							selfUpdateSpecOptions,
 						);
+						await discardVerifiedArtifact();
 						process.exitCode = 1;
 						return true;
 					}
@@ -1641,6 +1739,7 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 						if (process.stdin.isTTY) {
 							console.log(chalk.dim("Update cancelled."));
 						}
+						await discardVerifiedArtifact();
 						process.exitCode = 1;
 						return true;
 					}
@@ -1650,9 +1749,11 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 						const message = error instanceof Error ? error.message : "Unknown package command error";
 						console.error(chalk.red(`Error: ${message}`));
 						printSelfUpdateFallback(selfUpdateCommand);
+						await discardVerifiedArtifact();
 						process.exitCode = 1;
 						return true;
 					}
+					await discardVerifiedArtifact();
 					const versionChange = selfUpdatePlan.targetVersion
 						? ` from v${VERSION} to v${selfUpdatePlan.targetVersion}`
 						: "";

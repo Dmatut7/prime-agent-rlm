@@ -50,6 +50,36 @@ jobs:
           node-version: 22
           cache: npm
 
+      # `.npmrc` sets `min-release-age=7`, a key npm 11.10 introduced. Node 22 (what
+      # `node-version: 22` installs here) ships npm 10.x, and npm 10 never errors on that key -
+      # it ignores it silently, so the cooldown was absent exactly where dependencies get
+      # resolved. Pin a fixed npm version instead of the bundled one: not a floating tag, so the
+      # job cannot drift onto an npm that behaves differently. `--min-release-age=0` is required
+      # on this command because the install fetches npm itself and runs under this repository's
+      # `.npmrc`: without it, a release of npm published less than 7 days ago would be refused by
+      # the very key being installed.
+      - name: Pin npm (min-release-age needs npm >= 11.10)
+        run: npm install -g --min-release-age=0 --ignore-scripts --no-audit --no-fund npm@11.12.0
+
+      # The pin is only worth something if it is checked. This gate is red when the npm in use is
+      # older than 11.10 (the silent-ignore shape, which would leave `.npmrc`'s cooldown enforcing
+      # nothing) or when `.npmrc` does not ask for a cooldown of at least one day. `--self-test`
+      # runs first and offline: it plants npm 10.9.4 and an `.npmrc` without the key and requires
+      # the gate to turn red for both.
+      - name: npm release-cooldown gate (npm >= 11.10 and .npmrc min-release-age >= 1)
+        run: |
+          node scripts/check-npm-release-cooldown.mjs --self-test
+          node scripts/check-npm-release-cooldown.mjs
+
+      # Online proof that the policy refuses what it says it refuses: the probe picks a version of
+      # a churny package published *inside* the 7-day window, requires `npm install` to refuse it,
+      # and requires the same command with `--min-release-age=0` to install it (positive control,
+      # so a network or package-name failure cannot pass as a policy success). This job runs
+      # `npm ci`, so it has the network the probe needs. A timeout, an unreachable registry or no
+      # candidate version is a red probe with a reason, never a silent skip.
+      - name: npm release-cooldown probe (live registry)
+        run: node scripts/check-npm-release-cooldown.mjs --probe
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -197,6 +227,27 @@ jobs:
           node-version: 22
           cache: npm
 
+      # `.npmrc` sets `min-release-age=7`, a key npm 11.10 introduced. Node 22 (what
+      # `node-version: 22` installs here) ships npm 10.x, and npm 10 never errors on that key -
+      # it ignores it silently, so the cooldown was absent exactly where dependencies get
+      # resolved. Pin a fixed npm version instead of the bundled one: not a floating tag, so the
+      # job cannot drift onto an npm that behaves differently. `--min-release-age=0` is required
+      # on this command because the install fetches npm itself and runs under this repository's
+      # `.npmrc`: without it, a release of npm published less than 7 days ago would be refused by
+      # the very key being installed.
+      - name: Pin npm (min-release-age needs npm >= 11.10)
+        run: npm install -g --min-release-age=0 --ignore-scripts --no-audit --no-fund npm@11.12.0
+
+      # The pin is only worth something if it is checked. This gate is red when the npm in use is
+      # older than 11.10 (the silent-ignore shape, which would leave `.npmrc`'s cooldown enforcing
+      # nothing) or when `.npmrc` does not ask for a cooldown of at least one day. `--self-test`
+      # runs first and offline: it plants npm 10.9.4 and an `.npmrc` without the key and requires
+      # the gate to turn red for both.
+      - name: npm release-cooldown gate (npm >= 11.10 and .npmrc min-release-age >= 1)
+        run: |
+          node scripts/check-npm-release-cooldown.mjs --self-test
+          node scripts/check-npm-release-cooldown.mjs
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -303,6 +354,13 @@ jobs:
       # floors must turn it red, and the budget must be honoured.
       - name: Coverage gate self-test (planted all-skipped reports must turn the gate red)
         run: node scripts/check-vitest-coverage.mjs --self-test
+
+      # Offline only, and no npm pin here on purpose: this job installs nothing, and the
+      # release-cooldown gate's self-test needs neither npm nor the network. It proves the gate
+      # still turns red for npm 10.9.4 and for an `.npmrc` with no real cooldown, so a matcher
+      # that stopped matching cannot pass as a green board.
+      - name: Release-cooldown gate self-test (planted npm 10.9.4 must turn the gate red)
+        run: node scripts/check-npm-release-cooldown.mjs --self-test
 
       # Diff-scoped and baseline-frozen: the existing stock in scripts/test-private-probe-baseline.json
       # is ignored, anything new under packages/*/test/** fails. BASE_REF is empty or all zeros for a

@@ -1,4 +1,6 @@
-node_modules/
+# No trailing slash on purpose: a *symlink* to node_modules (what linked worktrees use)
+# is not a directory, so `node_modules/` does not match it and `git add -A` sweeps it in.
+node_modules
 dist/
 *.log
 .DS_Store
