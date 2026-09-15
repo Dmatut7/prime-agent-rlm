@@ -797,9 +797,13 @@ class HarnessStateTest(unittest.TestCase):
                 state = get_harness_state()
                 state.create_memory("Global note", "v1", id="routed", global_=True)
 
-                # The overview displays [global:routed]; that id must be usable as-is
-                # and imply the global scope without passing global_.
-                updated = state.update_memory("global:routed", "Global note", "v2")
+                # The overview displays [global:routed]; that id must be usable
+                # as-is on reads, but a write that names the global store from
+                # the local state needs the explicit flag (M5/MV-1b parity).
+                self.assertEqual(state.get("memory", "global:routed").content, "v1")
+                with self.assertRaisesRegex(ValueError, "global_=True"):
+                    state.update_memory("global:routed", "Global note", "sneaky")
+                updated = state.update_memory("global:routed", "Global note", "v2", global_=True)
                 self.assertEqual(updated.scope, "global")
                 self.assertEqual(state.get("memory", "global:routed").content, "v2")
                 self.assertIsNone(state.get("memory", "routed"))
@@ -1044,6 +1048,141 @@ class HarnessStateTest(unittest.TestCase):
                 state.delete("tool", "tool")
             with self.assertRaisesRegex(ValueError, "unknown harness kind"):
                 state.list("tool")
+
+
+
+class ScopePrefixEdgeCases(unittest.TestCase):
+    """MV-1/MV-2/MV-3: the model-visible copy of the harness contract."""
+
+    def _scoped_env(self, temp_dir: str) -> tuple[HarnessState, HarnessState]:
+        local_dir = Path(temp_dir) / "local"
+        global_dir = Path(temp_dir) / "global"
+        os.environ["RLM_HARNESS_STATE_DIR"] = str(local_dir)
+        os.environ["RLM_GLOBAL_HARNESS_STATE_DIR"] = str(global_dir)
+        return HarnessState(local_dir / "harness_state.json"), HarnessState(global_dir / "harness_state.json", scope="global")
+
+    def test_bracketed_ids_are_accepted_verbatim_for_reads_and_matching_writes(self) -> None:
+        previous_local = os.environ.get("RLM_HARNESS_STATE_DIR")
+        previous_global = os.environ.get("RLM_GLOBAL_HARNESS_STATE_DIR")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            local_state, global_state = self._scoped_env(temp_dir)
+            try:
+                global_state.create_memory("Global note", "v1", id="shared")
+                local_state.create_memory("Local note", "v1", id="note")
+
+                # The overview renders [global:shared]; a verbatim copy (closing
+                # bracket included, or clipped off) must resolve, not "does not
+                # exist".
+                self.assertEqual(global_state.get("memory", "[global:shared]").content, "v1")
+                self.assertEqual(global_state.get("memory", "[global:shared").content, "v1")
+                self.assertEqual(global_state.get("memory", "global:shared]").content, "v1")
+                # Reads keep routing to the displayed scope.
+                self.assertEqual(local_state.get("memory", "[global:shared]").content, "v1")
+                # A write addressed to the entry's own store works verbatim.
+                updated = global_state.update_memory("[global:shared]", "Global note", "v2")
+                self.assertEqual(updated.id, "shared")
+                self.assertEqual(global_state.get("memory", "shared").content, "v2")
+                self.assertTrue(global_state.delete_memory("[global:shared]"))
+            finally:
+                for name, previous in (
+                    ("RLM_HARNESS_STATE_DIR", previous_local),
+                    ("RLM_GLOBAL_HARNESS_STATE_DIR", previous_global),
+                ):
+                    if previous is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = previous
+
+    def test_cross_store_prefix_on_update_delete_is_refused_not_routed(self) -> None:
+        previous_local = os.environ.get("RLM_HARNESS_STATE_DIR")
+        previous_global = os.environ.get("RLM_GLOBAL_HARNESS_STATE_DIR")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            local_state, global_state = self._scoped_env(temp_dir)
+            try:
+                global_state.create_memory("Global note", "v1", id="shared")
+
+                # An update/delete whose id names the other store must refuse
+                # with the way out (M5 semantics, TS parity) instead of
+                # silently writing through to the global store.
+                with self.assertRaisesRegex(ValueError, "global_=True"):
+                    local_state.update_memory("global:shared", "Global note", "sneaky")
+                with self.assertRaisesRegex(ValueError, "global_=True"):
+                    local_state.update_memory("[global:shared]", "Global note", "sneaky")
+                with self.assertRaisesRegex(ValueError, "global_=True"):
+                    local_state.delete_memory("global:shared")
+                self.assertEqual(global_state.get("memory", "shared").content, "v1")
+                self.assertFalse((local_state.file_path).exists() if local_state.file_path else False)
+
+                # The explicit flag is the way out.
+                updated = local_state.update_memory("global:shared", "Global note", "v2", global_=True)
+                self.assertEqual(updated.scope, "global")
+                self.assertEqual(global_state.get("memory", "shared").content, "v2")
+
+                # The mirror image: a local-prefixed id on the global store.
+                local_state.create_memory("Local note", "v1", id="note")
+                with self.assertRaisesRegex(ValueError, "local"):
+                    global_state.update_memory("local:note", "Local note", "sneaky")
+                self.assertEqual(local_state.get("memory", "note").content, "v1")
+            finally:
+                for name, previous in (
+                    ("RLM_HARNESS_STATE_DIR", previous_local),
+                    ("RLM_GLOBAL_HARNESS_STATE_DIR", previous_global),
+                ):
+                    if previous is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = previous
+
+    def test_create_with_bracketed_id_strips_prefix_and_brackets(self) -> None:
+        previous_local = os.environ.get("RLM_HARNESS_STATE_DIR")
+        previous_global = os.environ.get("RLM_GLOBAL_HARNESS_STATE_DIR")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            local_state, global_state = self._scoped_env(temp_dir)
+            try:
+                entry = local_state.create_memory("Lesson", "content", id="[global:lesson]")
+                self.assertEqual(entry.id, "lesson")
+                self.assertEqual(entry.scope, "global")
+                self.assertIsNotNone(global_state.get("memory", "lesson"))
+                self.assertNotIn("[global:lesson]", global_state.entries["memory"])
+            finally:
+                for name, previous in (
+                    ("RLM_HARNESS_STATE_DIR", previous_local),
+                    ("RLM_GLOBAL_HARNESS_STATE_DIR", previous_global),
+                ):
+                    if previous is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = previous
+
+    def test_overview_call_contract_does_not_promise_a_shell_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            overview = state.overview()
+        self.assertNotIn("shell CLI", overview)
+        self.assertNotIn("or a matching shell", overview)
+        # The r12 correction, mirrored: a skill name is a kernel module name.
+        self.assertIn("not a shell command", overview)
+
+    def test_harness_state_repr_is_readable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json", scope="local")
+            state.create_memory("Lesson", "keep me", id="lesson")
+            text = repr(state)
+        self.assertIn("local", text)
+        self.assertIn("harness_state.json", text)
+        self.assertIn("memory=1", text)
+        self.assertNotIn("object at 0x", text)
+
+    def test_overview_max_entries_per_kind_lists_the_overflow(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            for index in range(25):
+                state.create_memory(f"Lesson {index}", "keep me", id=f"lesson_{index}")
+            default_view = state.overview()
+            full_view = state.overview(max_entries_per_kind=100)
+        self.assertIn("+5 more", default_view)
+        self.assertIn("lesson_24", full_view)
+        self.assertNotIn("+5 more", full_view)
 
 
 if __name__ == "__main__":

@@ -60,6 +60,39 @@ function downgradeUnsupportedImages<TApi extends Api>(messages: Message[], model
 }
 
 /**
+ * Bounded trace of an abort cause: REPL-visible evidence the turn was cut short (MV-4).
+ */
+const ABORT_TRACE_TEXT_LIMIT = 200;
+
+function abortTraceText(errorMessage: string | undefined): string | undefined {
+	if (typeof errorMessage !== "string" || errorMessage.trim() === "") return undefined;
+	const compact = errorMessage.trim().replace(/\s+/g, " ");
+	// Codepoint-aware truncation: slicing a surrogate pair in half breaks providers.
+	const chars = Array.from(compact);
+	if (chars.length <= ABORT_TRACE_TEXT_LIMIT) return `[assistant turn aborted: ${compact}]`;
+	return `[assistant turn aborted: ${chars.slice(0, ABORT_TRACE_TEXT_LIMIT - 1).join("")}…]`;
+}
+
+/**
+ * An aborted assistant turn replays only what is safe: its text blocks plus a
+ * bounded trace of the abort cause. Partial thinking and incomplete tool calls
+ * are dropped (replaying them causes API errors), and a turn with neither text
+ * nor cause disappears as before.
+ */
+function abortedAssistantTrace(message: AssistantMessage): AssistantMessage | undefined {
+	const textBlocks = message.content.filter(
+		(block): block is TextContent => block.type === "text" && block.text.trim().length > 0,
+	);
+	const trace = abortTraceText(message.errorMessage);
+	if (textBlocks.length === 0 && trace === undefined) return undefined;
+	const content: AssistantMessage["content"] = [...textBlocks];
+	if (trace !== undefined) {
+		content.push({ type: "text", text: trace });
+	}
+	return { ...message, content };
+}
+
+/**
  * Normalize tool call ID for cross-provider compatibility.
  * OpenAI Responses API generates IDs that are 450+ chars with special characters like `|`.
  * Anthropic APIs require IDs matching ^[a-zA-Z0-9_-]+$ (max 64 chars).
@@ -187,13 +220,24 @@ export function transformMessages<TApi extends Api>(
 		if (msg.role === "assistant") {
 			insertSyntheticToolResults();
 
-			// Skip errored/aborted assistant messages entirely.
+			// Skip errored assistant messages entirely.
 			// These are incomplete turns that shouldn't be replayed:
 			// - May have partial content (reasoning without message, incomplete tool calls)
 			// - Replaying them can cause API errors (e.g., OpenAI "reasoning without following item")
 			// - The model should retry from the last valid state
 			const assistantMsg = msg as AssistantMessage;
-			if (assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") {
+			if (assistantMsg.stopReason === "error") {
+				continue;
+			}
+			if (assistantMsg.stopReason === "aborted") {
+				// An aborted turn has no tool result of its own to carry the abort
+				// cause (MV-4), so drop it entirely only when there is nothing safe
+				// to keep: partial thinking and incomplete tool calls are still
+				// stripped, because replaying them is what the omission was for.
+				const abortedTrace = abortedAssistantTrace(assistantMsg);
+				if (abortedTrace) {
+					result.push(abortedTrace);
+				}
 				continue;
 			}
 

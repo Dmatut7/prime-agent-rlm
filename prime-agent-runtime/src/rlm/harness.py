@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import stat
 from dataclasses import asdict, dataclass, field, fields
@@ -60,15 +61,27 @@ def _resolve_global_flag(global_: bool = False, extra: dict[str, Any] | None = N
     return bool(global_)
 
 
-def _strip_scope_prefix(id: str | None, global_: bool) -> tuple[str | None, bool]:
+_SCOPE_PREFIX_PATTERN = re.compile(r"^\[?(global|local):")
+
+
+def _strip_scope_prefix(
+    id: str | None, global_: bool
+) -> tuple[str | None, bool, str | None]:
     # overview() displays entries as [local:id]/[global:id]; accept those ids
-    # verbatim. A global: prefix routes to the global store unless the caller
-    # already forced a scope via global_.
+    # verbatim, including clipped variants missing one bracket (MV-1). A
+    # global: prefix routes to the global store unless the caller already
+    # forced a scope via global_. The third value is the scope the id claimed
+    # by its prefix, if any, so write paths can refuse a cross-store edit.
     if isinstance(id, str):
-        scope, sep, rest = id.partition(":")
-        if sep and rest and scope in ("local", "global"):
-            return rest, global_ or scope == "global"
-    return id, global_
+        match = _SCOPE_PREFIX_PATTERN.match(id)
+        if match:
+            rest = id[match.end():]
+            if rest.endswith("]"):
+                rest = rest[:-1]
+            if rest:
+                claimed = match.group(1)
+                return rest, global_ or claimed == "global", claimed
+    return id, global_, None
 
 
 def _env_dir(name: str) -> str | None:
@@ -255,6 +268,14 @@ def _validate_python_skill_reference(reference: dict[str, Any] | None) -> dict[s
 class HarnessState:
     """CRUD store for reset-free harness refinement state."""
 
+    def __repr__(self) -> str:
+        # The prompt points models at get_harness_state() when they want the
+        # full list; the REPL prints repr(value), so it has to summarize the
+        # state instead of an opaque address (MV-3).
+        counts = ", ".join(f"{kind}={len(records)}" for kind, records in self.entries.items())
+        refinements = len(self.refinements)
+        return f"<HarnessState {self.scope} {self.file_path} {counts}, refinements={refinements}>"
+
     def __init__(
         self,
         file_path: str | Path | None = None,
@@ -414,6 +435,36 @@ class HarnessState:
             return None
         return target
 
+    def _refuse_cross_store_prefix(
+        self, kind: HarnessKind, id: str | None, global_: bool, extra: dict[str, Any] | None
+    ) -> None:
+        # M5/MV-1b parity with the TS side: an update/delete whose id names the
+        # other store must be refused with the way out instead of silently
+        # writing through (reads and creates keep routing). A prefix may only
+        # steer a write into a store the caller addressed explicitly.
+        if not isinstance(id, str):
+            return
+        match = _SCOPE_PREFIX_PATTERN.match(id)
+        if not match:
+            return
+        claimed = match.group(1)
+        explicit_global = _resolve_global_flag(global_, extra)
+        if claimed == "global" and (self.scope == "global" or explicit_global):
+            return
+        if claimed == "local" and self.scope == "local" and not explicit_global:
+            return
+        bare_id = id[match.end():].removesuffix("]")
+        if claimed == "global":
+            raise ValueError(
+                f"{kind} entry {bare_id!r} is prefixed [global:] in the harness overview, "
+                "but this call writes the local store: pass global_=True to update it."
+            )
+        raise ValueError(
+            f"{kind} entry {bare_id!r} is prefixed [local:] in the harness overview, "
+            "but this call writes the global store: use the local harness state "
+            "(get_harness_state(), global_=False) to update it."
+        )
+
     def save(self) -> "HarnessState":
         self._ensure_local_writable()
         if self.file_path is None:
@@ -446,7 +497,7 @@ class HarnessState:
         global_: bool = False,
         **kwargs: Any,
     ) -> HarnessEntry:
-        id, global_ = _strip_scope_prefix(id, global_)
+        id, global_, _claimed_scope = _strip_scope_prefix(id, global_)
         if target := self._global_target(global_, kwargs):
             return target.upsert(
                 kind,
@@ -532,7 +583,7 @@ class HarnessState:
         return entry
 
     def get(self, kind: HarnessKind, id: str, *, global_: bool = False, **kwargs: Any) -> HarnessEntry | None:
-        id, global_ = _strip_scope_prefix(id, global_)
+        id, global_, _claimed_scope = _strip_scope_prefix(id, global_)
         if target := self._global_target(global_, kwargs):
             return target.get(kind, id)
         self._sync_from_disk()
@@ -541,7 +592,8 @@ class HarnessState:
         return self.entries[kind].get(id)
 
     def delete(self, kind: HarnessKind, id: str, *, global_: bool = False, **kwargs: Any) -> bool:
-        id, global_ = _strip_scope_prefix(id, global_)
+        self._refuse_cross_store_prefix(kind, id, global_, kwargs)
+        id, global_, _claimed_scope = _strip_scope_prefix(id, global_)
         if target := self._global_target(global_, kwargs):
             return target.delete(kind, id)
         self._sync_from_disk()
@@ -581,7 +633,7 @@ class HarnessState:
         global_: bool = False,
         **kwargs: Any,
     ) -> HarnessEntry:
-        id, global_ = _strip_scope_prefix(id, global_)
+        id, global_, _claimed_scope = _strip_scope_prefix(id, global_)
         if target := self._global_target(global_, kwargs):
             return target.create(
                 kind,
@@ -628,7 +680,8 @@ class HarnessState:
         global_: bool = False,
         **kwargs: Any,
     ) -> HarnessEntry:
-        id, global_ = _strip_scope_prefix(id, global_)
+        self._refuse_cross_store_prefix(kind, id, global_, kwargs)
+        id, global_, _claimed_scope = _strip_scope_prefix(id, global_)
         if target := self._global_target(global_, kwargs):
             return target.update(
                 kind,
@@ -856,8 +909,9 @@ class HarnessState:
         self._sync_from_disk()
         lines = [
             f"Harness state ({self.scope}): {self.file_path}",
-            "Call contract: installed Python skills use await <skill_import>(...) or a matching shell CLI; "
-            "harness skill entries are Python REPL skills and must include a Python reference plus arguments. "
+            "Call contract: installed Python skills use await <skill_import>(...); a skill name is a "
+            "kernel module name, not a shell command, so there is no <skill_import> ... form to run from "
+            "shell. Harness skill entries are Python REPL skills and must include a Python reference plus arguments. "
             "Spawn a subagent spec by composing a concise task prompt and calling "
             "handle = await rlm('sub-task'); admission returns immediately with rlm_child_id, name, session_dir, "
             "and model, never the child's answer. Results arrive only through explicit agent_message replies or "

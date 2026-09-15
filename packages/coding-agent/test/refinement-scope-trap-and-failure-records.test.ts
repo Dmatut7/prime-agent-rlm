@@ -266,3 +266,94 @@ describe("refinement failure records (M6)", () => {
 		expect(() => failureRecords()).toThrow();
 	});
 });
+
+describe("verbatim bracketed ids (MV-1)", () => {
+	// The overview renders `- [global:shared_fact] ...`; copying that token
+	// verbatim (brackets included) must not fall back to "entry not found".
+	function proposalWithId(id: string) {
+		return {
+			summary: "update the fact",
+			rationale: "copied the id verbatim from the overview",
+			expectedOutcome: "fact updated",
+			edits: [
+				{
+					action: "update" as const,
+					kind: "memory" as const,
+					id,
+					title: "shared_fact",
+					content: "rewrite",
+				},
+			],
+		};
+	}
+
+	it("refuses a verbatim [global:foo] copy on the local store with the way out, not entry not found", () => {
+		const localState = loadHarnessState(makeTempDir(), "local");
+		const result = applyRefinementProposal(localState, proposalWithId("[global:shared_fact]"), {
+			id: "refine_test",
+			scope: "local",
+		});
+
+		expect(result.appliedEdits[0].applied).toBe(false);
+		expect(result.appliedEdits[0].error).toContain("global refinement");
+		expect(result.appliedEdits[0].error).toContain("global_=True");
+		expect(result.appliedEdits[0].error).not.toContain("entry not found");
+		expect(localState.entries.memory.shared_fact).toBeUndefined();
+	});
+
+	it.each(["[global:shared_fact]", "[global:shared_fact", "global:shared_fact]", "global:shared_fact"])(
+		"applies the verbatim copy %s once the refinement targets that store",
+		(id) => {
+			const globalState = globalOnlyState();
+			const result = applyRefinementProposal(globalState, proposalWithId(id), {
+				id: "refine_test",
+				scope: "global",
+			});
+
+			expect(result.appliedEdits[0].applied).toBe(true);
+			expect(globalState.entries.memory.shared_fact.content).toBe("rewrite");
+		},
+	);
+
+	it("does not write the brackets or the prefix into a created id", () => {
+		const localState = loadHarnessState(makeTempDir(), "local");
+		const result = applyRefinementProposal(
+			localState,
+			{
+				summary: "create a fact",
+				rationale: "id copied from an overview line",
+				expectedOutcome: "fact created",
+				edits: [
+					{
+						action: "create" as const,
+						kind: "memory" as const,
+						id: "[global:fresh_fact]",
+						title: "fresh_fact",
+						content: "c",
+					},
+				],
+			},
+			{ id: "refine_test", scope: "local" },
+		);
+
+		expect(result.appliedEdits[0].applied).toBe(true);
+		expect(Object.keys(localState.entries.memory)).toEqual(["fresh_fact"]);
+	});
+});
+
+describe("overflow hint readability (MV-3)", () => {
+	it("points the overflow line at an entry that renders readably in the REPL", () => {
+		const state = loadHarnessState(makeTempDir(), "global");
+		for (let i = 0; i < 6; i++) {
+			state.entries.memory[`fact_${i}`] = globalMemoryEntry(`fact_${i}`);
+		}
+
+		const overview = formatHarnessStateForPrompt(state, { maxEntriesPerKind: 2 });
+
+		expect(overview).toContain("+4 more memory entries");
+		// `rlm.get_harness_state()` returns an object whose REPL repr is an
+		// opaque address; the hint must name a readable entry instead.
+		expect(overview).toContain("rlm.harness.overview(max_entries_per_kind=");
+		expect(overview).not.toContain("rlm.get_harness_state()");
+	});
+});
