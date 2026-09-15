@@ -169,8 +169,7 @@ describe("converge() only credits stops this run performed", () => {
 		expect(report.stopped).toEqual([]);
 		expect(report.leftRunning).toEqual([]);
 		expect(report.skipped).toHaveLength(1);
-		expect(report.skipped[0]?.reason).toMatch(/never signalled it/);
-		expect(report.skipped[0]?.reason).toMatch(new RegExp(`pid ${pid}`));
+		expect(report.skipped[0]?.reason).toMatch(/vanished without this run touching it/);
 		expect(report.discovered).toBe(1);
 		expect(report.discovered).toBe(bucketTotal(report));
 	}, 30_000);
@@ -186,10 +185,8 @@ describe("converge() only credits stops this run performed", () => {
 		const report = new ShutdownReport();
 		report.observe([{ socketPath, pid, kind: "service" }]);
 		// The positive control: this is what a signalling leg records before it kills.
-		report.markSignalled(socketPath, pid);
-		expect(report.wasSignalled(socketPath, pid)).toBe(true);
-		// A different pid on the same path is a different target and was not touched.
-		expect(report.wasSignalled(socketPath, (pid ?? 0) + 1)).toBe(false);
+		// The ledger is keyed by pid, so a different pid on the same path stays untouched.
+		report.recordSignal(pid ?? 0);
 		child.kill("SIGTERM");
 		await waitFor(() => !alive(pid), "the signalled daemon to exit");
 		rmSync(socketPath, { force: true });

@@ -1,1 +1,0 @@
-- Fixed `prime-agent shutdown` reporting a service it never signalled as `stopped` when that service exited on its own during the stop window; only services this run actually signalled are credited with a stop, and an untouched one keeps the bucket and reason the run decided for it.
