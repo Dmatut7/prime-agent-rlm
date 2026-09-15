@@ -91,6 +91,14 @@ export interface RefinementOutcomeDetails {
 	scope: HarnessScope;
 	rollbackOf?: string;
 	edits: AppliedRefinementEdit[];
+	/**
+	 * Present when the refinement did not complete (parse/length/provider/persist
+	 * failure): the receipt is the model-visible failure record. Nothing was
+	 * persisted, so `edits` is empty and `error` carries the reason.
+	 */
+	failed?: true;
+	/** Short failure reason; model-visible alongside `failed`. */
+	error?: string;
 }
 
 export interface RefinementOutcomeMessage extends CustomMessage<RefinementOutcomeDetails> {
@@ -401,6 +409,35 @@ export function createRefinementOutcomeMessage(
 	};
 }
 
+/**
+ * MV-5: the failure receipt for a refinement that died (parse, length, provider,
+ * or persist failure). Successes already reach the model through
+ * `refinementOutcomeToLlmText` (e6c1af56); without this receipt a failure was
+ * event/UI-only and the model never learned its refine.run or auto-refine
+ * attempt produced nothing.
+ */
+export function createRefinementFailureMessage(
+	failure: { refinementId: string; scope: HarnessScope; reason: string },
+	display = true,
+	timestamp = Date.now(),
+): RefinementOutcomeMessage {
+	return {
+		role: "custom",
+		customType: REFINEMENT_OUTCOME_CUSTOM_TYPE,
+		content: `Refinement failed: ${failure.reason}`,
+		display,
+		details: {
+			refinementId: failure.refinementId,
+			summary: failure.reason,
+			scope: failure.scope,
+			edits: [],
+			failed: true,
+			error: failure.reason,
+		},
+		timestamp,
+	};
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }
@@ -533,6 +570,17 @@ function truncateRefinementSummary(summary: string): string {
  * information, so it must not spend context.
  */
 export function refinementOutcomeToLlmText(details: RefinementOutcomeDetails): string | undefined {
+	if (details.failed) {
+		// A failure reports itself even with zero edit rows: the whole point of
+		// the receipt is that the model learns the attempt produced nothing.
+		const lines = [
+			`<refinement id="${details.refinementId}" scope="${details.scope}" outcome="failed">`,
+			`reason: ${truncateRefinementSummary(details.error ?? details.summary)}`,
+			"no edits were applied and the harness state on disk is unchanged.",
+			"</refinement>",
+		];
+		return `${REFINEMENT_OUTCOME_PREFIX}\n\n${lines.join("\n")}`;
+	}
 	if (details.edits.length === 0) {
 		return undefined;
 	}

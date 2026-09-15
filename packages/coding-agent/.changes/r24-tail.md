@@ -1,0 +1,1 @@
+- Added a 5-minute quiescence timeout, honest compaction-snapshot and refine-failure notices, a TTL for agent-message send failures, bounded tree depth for forked deep branches, diagnostic pointers in degraded stall renders, and cross-store refusal plus newline flattening for Python harness memory writes.

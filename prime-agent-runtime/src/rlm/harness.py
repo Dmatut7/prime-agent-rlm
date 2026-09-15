@@ -33,6 +33,14 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _flatten_inline(text: str) -> str:
+    # X-8: title/id/path/content are model-controlled. One entry must render as
+    # one overview line, or a value carrying newlines forges extra lines - up to
+    # a full fake `[global:...]` entry row in a trusted-state surface. TS-side
+    # parity: refinement.ts compacts content the same way.
+    return " ".join(text.split())
+
+
 def _slug(raw: str, fallback: str) -> str:
     normalized = "".join(ch.lower() if ch.isalnum() else "_" for ch in raw.strip())
     normalized = "_".join(part for part in normalized.split("_") if part)
@@ -438,10 +446,12 @@ class HarnessState:
     def _refuse_cross_store_prefix(
         self, kind: HarnessKind, id: str | None, global_: bool, extra: dict[str, Any] | None
     ) -> None:
-        # M5/MV-1b parity with the TS side: an update/delete whose id names the
-        # other store must be refused with the way out instead of silently
-        # writing through (reads and creates keep routing). A prefix may only
-        # steer a write into a store the caller addressed explicitly.
+        # M5/MV-1b parity with the TS side: a write whose id names the other
+        # store must be refused with the way out instead of silently writing
+        # through (reads keep routing). A prefix may only steer a write into a
+        # store the caller addressed explicitly. X-9 extended this from
+        # update/delete to create/upsert: a local-session create with a
+        # [global:] id used to strip the prefix and write the global store.
         if not isinstance(id, str):
             return
         match = _SCOPE_PREFIX_PATTERN.match(id)
@@ -497,6 +507,7 @@ class HarnessState:
         global_: bool = False,
         **kwargs: Any,
     ) -> HarnessEntry:
+        self._refuse_cross_store_prefix(kind, id, global_, kwargs)
         id, global_, _claimed_scope = _strip_scope_prefix(id, global_)
         if target := self._global_target(global_, kwargs):
             return target.upsert(
@@ -633,6 +644,7 @@ class HarnessState:
         global_: bool = False,
         **kwargs: Any,
     ) -> HarnessEntry:
+        self._refuse_cross_store_prefix(kind, id, global_, kwargs)
         id, global_, _claimed_scope = _strip_scope_prefix(id, global_)
         if target := self._global_target(global_, kwargs):
             return target.create(
@@ -923,7 +935,7 @@ class HarnessState:
             records = self.list(kind)[:max_entries_per_kind]
             lines.append(f"{kind}: {len(self.entries[kind])}")
             for entry in records:
-                summary = entry.content.strip().replace("\n", " ")
+                summary = _flatten_inline(entry.content)
                 if len(summary) > 120:
                     summary = f"{summary[:117]}..."
                 argument_summary = ""
@@ -939,7 +951,8 @@ class HarnessState:
                         reference_text = f"{reference_text[:117]}..."
                     reference_summary = f" ref={reference_text}"
                 lines.append(
-                    f"  - [{entry.scope}:{entry.id}] {entry.title} ({entry.path}, v{entry.version})"
+                    f"  - [{entry.scope}:{_flatten_inline(entry.id)}] "
+                    f"{_flatten_inline(entry.title)} ({_flatten_inline(entry.path)}, v{entry.version})"
                     f"{reference_summary}{argument_summary}: {summary}"
                 )
             overflow = len(self.entries[kind]) - len(records)

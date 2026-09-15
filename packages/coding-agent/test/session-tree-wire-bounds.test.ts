@@ -376,6 +376,59 @@ describe("session tree wire bounds", () => {
 	});
 
 	/**
+	 * K3X-4: the union of the two depth windows could stack. When the live leaf
+	 * sits within depthLimit+1 of the global deepest entry, its retained ancestor
+	 * chain and the deep window's retained segment are contiguous on one parent
+	 * chain, so the returned tree was maxDepth - liveWindowFrom edges deep - 1149
+	 * on a depthLimit-1000 bound - while the bound (and every depth assertion in
+	 * this file, which only ever shaped single chains or shallow rewinds) promised
+	 * depthLimit. These shapes pin the bound on the stacked regime: any shape's
+	 * tree depth is at most depthLimit, the leaf survives, and the counts still
+	 * add up.
+	 */
+	it("bounds the union of both depth windows to depthLimit when the leaf sits deep", () => {
+		// The audited shape: a 1149-deep chain, leaf rewound to depth 1000 - the
+		// live window reaches the root while the deep window keeps the abandoned
+		// tail, and the pre-fix union was the whole 1150-entry chain, uncut.
+		const deep = SessionManager.open(writeChainSession(1150), tempDir);
+		deep.branch("entry-1000");
+		const bounded = deep.getBoundedTree(1000);
+		expect(bounded.stats.maxDepth).toBe(1149);
+		expect(bounded.stats.leafIncluded).toBe(true);
+		expect(treeContains(bounded.tree, "entry-1000")).toBe(true);
+		// The cut took the old top, and the leaf keeps its ancestors from the cut up.
+		expect(treeContains(bounded.tree, "entry-0")).toBe(false);
+		expect(treeContains(bounded.tree, "entry-149")).toBe(true);
+		expect(treeContains(bounded.tree, "entry-999")).toBe(true);
+		expect(bounded.stats.returnedNodes + bounded.stats.omittedNodes).toBe(bounded.stats.entries);
+		expect(depthOfTree(bounded.tree)).toBeLessThanOrEqual(1000);
+		expect(serializeJsonLine({ tree: bounded.tree }).length).toBeGreaterThan(0);
+
+		// The razor edge: the cut lands exactly one above the leaf, so the leaf
+		// comes back detached through the safety net (counted once, no children)
+		// instead of stacking the deep window under its ancestor chain.
+		const razor = SessionManager.open(writeChainSession(1150), tempDir);
+		razor.branch("entry-148");
+		const razorBounded = razor.getBoundedTree(1000);
+		expect(razorBounded.stats.leafIncluded).toBe(true);
+		expect(treeContains(razorBounded.tree, "entry-148")).toBe(true);
+		expect(razorBounded.stats.returnedNodes + razorBounded.stats.omittedNodes).toBe(razorBounded.stats.entries);
+		expect(depthOfTree(razorBounded.tree)).toBeLessThanOrEqual(1000);
+
+		// A fork landing inside the deep window under a rewound leaf: the union
+		// of the live chain and the deep tail is one parent chain of
+		// maxDepth - liveWindowFrom edges.
+		const forked = SessionManager.open(writeChainSession(1150), tempDir);
+		forked.branch("entry-900");
+		const forkId = forked.appendCustomEntry("probe", { fork: true });
+		const forkedBounded = forked.getBoundedTree(1000);
+		expect(forkedBounded.stats.leafIncluded).toBe(true);
+		expect(treeContains(forkedBounded.tree, forkId)).toBe(true);
+		expect(forkedBounded.stats.returnedNodes + forkedBounded.stats.omittedNodes).toBe(forkedBounded.stats.entries);
+		expect(depthOfTree(forkedBounded.tree)).toBeLessThanOrEqual(1000);
+	});
+
+	/**
 	 * GL-2: a leaf returned as a detached root was counted in both `omittedNodes` and
 	 * `returnedNodes`, so the stats over-reported the session by one (entries=1204,
 	 * returned+omitted=1205). Every bounded view must satisfy the identity

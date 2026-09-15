@@ -1596,7 +1596,7 @@ describe("AgentSession rlm recursion", () => {
 
 		bashCompletion.resolve();
 		await bash;
-		await expect(quiescence).resolves.toBeUndefined();
+		await expect(quiescence).resolves.toEqual({ settled: true });
 		expect(headlessIdleCalls).toBe(2);
 	});
 
@@ -1623,7 +1623,7 @@ describe("AgentSession rlm recursion", () => {
 		let parentBash: Promise<unknown> | undefined;
 		vi.spyOn(child, "waitForRlmQuiescence").mockImplementation(async (signal) => {
 			childWaitStarted.resolve();
-			await originalChildQuiescence(signal);
+			const outcome = await originalChildQuiescence(signal);
 			parentBash = root.executeBash("parent-boundary-gate", undefined, {
 				operations: {
 					exec: async () => {
@@ -1633,6 +1633,11 @@ describe("AgentSession rlm recursion", () => {
 					},
 				},
 			});
+			// The pre-typed mock implicitly returned the bash promise, so the
+			// parent's Promise.all waited for this boundary bash too; the typed
+			// outcome rides after the same wait to keep that timing.
+			await parentBash;
+			return outcome;
 		});
 
 		const quiescence = root.waitForRlmQuiescence();
@@ -1818,7 +1823,7 @@ describe("AgentSession rlm recursion", () => {
 		).toHaveLength(0);
 
 		inputPause.release();
-		await expect(quiescence).resolves.toBeUndefined();
+		await expect(quiescence).resolves.toEqual({ settled: true });
 		expect(parentNoticeTurns).toBe(1);
 		expect(
 			root.messages.filter(
@@ -3198,10 +3203,10 @@ describe("AgentSession rlm recursion", () => {
 		const spawned = await root.runRlmChild("blocked startup");
 		root.requestAbort();
 		expect(root.cancelRlmChildRun(spawned.rlm_child_id)).toBe(true);
-		await expect(root.waitForRlmQuiescence()).resolves.toBeUndefined();
+		await expect(root.waitForRlmQuiescence()).resolves.toEqual({ settled: true });
 		root.resumeQueuedWork();
 		await root.prompt("next lifecycle");
-		await expect(root.waitForRlmQuiescence()).resolves.toBeUndefined();
+		await expect(root.waitForRlmQuiescence()).resolves.toEqual({ settled: true });
 
 		releaseStartup();
 		await waitFor(() => !(root as unknown as InspectableRlmSession)._activeRlmChildRuns.has(spawned.rlm_child_id));

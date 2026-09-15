@@ -117,4 +117,27 @@ describe("cross-version stall events (K3X-1)", () => {
 		expect(text).toContain("toolu_01ABC");
 		expect(text).toContain("epoch=7");
 	});
+
+	/**
+	 * X-3: the mixed-version downgrade (no diagnostics payload) must still carry
+	 * DO-1's retrievability pointer - the pre-fix early-return swallowed it, so
+	 * the one event that most needs "where do I read the forensics" said nothing.
+	 * The pointer is resolved in the renderer's own process, so the line has to
+	 * say that explicitly rather than imply the daemon wrote there.
+	 */
+	it("keeps the forensics pointer on the cross-version downgrade, qualified as locally resolved", () => {
+		const lines = formatStallEventLines({
+			type: "stall_warning",
+			message: "Possible stall: no session activity for 300s while a turn is running.",
+			silentMs: 300_000,
+			thresholdMs: 300_000,
+		});
+		const text = lines.join("\n");
+		expect(text).toContain("diagnostics: unknown (event predates the diagnostics payload)");
+		expect(text).toContain("diagnostics file");
+		expect(text).toContain("stall-evidence.jsonl");
+		// The honesty qualifier: the paths are this client's resolution, not the
+		// emitting daemon's.
+		expect(text).toContain("resolved locally in this client");
+	});
 });
