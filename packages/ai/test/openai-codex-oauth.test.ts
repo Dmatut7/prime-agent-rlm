@@ -93,4 +93,45 @@ describe("OpenAI Codex OAuth", () => {
 		expect(detectorFlagsEchoedSecret(message, accessToken)).toBe(false);
 		expect(detectorFlagsEchoedSecret(message, refreshToken)).toBe(false);
 	});
+
+	it("arms the refresh request with an abort timeout signal", async () => {
+		// A refresh that never times out holds the auth.json lock for as long as
+		// the token endpoint cares to stay silent (the anthropic provider already
+		// sends signal: AbortSignal.timeout(30_000); codex must match).
+		const inits: (RequestInit | undefined)[] = [];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (_url: unknown, init?: RequestInit) => {
+				inits.push(init);
+				return new Response(JSON.stringify({ access_token: "a", refresh_token: "r", expires_in: 3600 }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}),
+		);
+
+		// The account-id parse of this stub token fails; the proposition under test
+		// is the request wiring, not the response.
+		await refreshOpenAICodexToken("REFRESH-TOKEN-SECRET-xyz789").catch(() => {});
+
+		expect(inits.length).toBe(1);
+		expect(inits[0]?.signal).toBeInstanceOf(AbortSignal);
+	});
+
+	it("aborts a hung token endpoint instead of waiting forever", async () => {
+		// Shrink AbortSignal.timeout so the hang is observable inside the test timeout.
+		const realTimeout = AbortSignal.timeout.bind(AbortSignal);
+		vi.spyOn(AbortSignal, "timeout").mockImplementation(() => realTimeout(15));
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(
+				(_url: unknown, init?: RequestInit) =>
+					new Promise<Response>((_resolve, reject) => {
+						init?.signal?.addEventListener("abort", () => reject(new Error("token endpoint hung")));
+					}),
+			),
+		);
+
+		await expect(refreshOpenAICodexToken("REFRESH-TOKEN-SECRET-xyz789")).rejects.toThrow(/token endpoint hung/);
+	});
 });

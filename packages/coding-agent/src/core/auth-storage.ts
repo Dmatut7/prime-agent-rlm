@@ -243,7 +243,12 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 			throwIfCompromised();
 			const current = readPrivateFile(this.authPath, "utf-8");
 			const { result, next } = await fn(current);
-			throwIfCompromised();
+			// Persist before surfacing a compromise detected during fn: a stolen lock
+			// means the refresh inside fn already rotated the server-side pair, so
+			// dropping `next` would strand auth.json on a refresh token the server has
+			// revoked (every later refresh fails until a manual /login). Writing first
+			// keeps the fresh pair recoverable through the caller's reload() path while
+			// the throw below still reports the stolen lock.
 			if (next !== undefined) {
 				writePrivateFileAtomic(this.authPath, next);
 			}

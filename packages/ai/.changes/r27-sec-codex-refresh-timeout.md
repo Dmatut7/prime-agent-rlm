@@ -1,0 +1,1 @@
+- Added a 30s abort timeout to the OpenAI Codex OAuth refresh request so a silent token endpoint can no longer hold the auth.json lock open-ended.

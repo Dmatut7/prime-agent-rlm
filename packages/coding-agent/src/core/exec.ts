@@ -4,7 +4,7 @@
 
 import { spawn } from "node:child_process";
 import { waitForChildProcess } from "../utils/child-process.js";
-import { killProcessTree, trackDetachedChildPid, untrackDetachedChildPid } from "../utils/shell.js";
+import { killProcessTree, sanitizedChildEnv, trackDetachedChildPid, untrackDetachedChildPid } from "../utils/shell.js";
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
@@ -111,12 +111,14 @@ function formatExecTruncationAnnotation(result: TruncationResult, totalLines: nu
 	return `\n\n[Output truncated: showing last ${formatSize(result.outputBytes)} of ${formatSize(totalBytes)}.]`;
 }
 
-function mergeExecEnv(env?: Record<string, string | undefined>): NodeJS.ProcessEnv | undefined {
-	if (!env) {
-		return undefined;
-	}
-	const merged: NodeJS.ProcessEnv = { ...process.env };
-	for (const [key, value] of Object.entries(env)) {
+function mergeExecEnv(env?: Record<string, string | undefined>): NodeJS.ProcessEnv {
+	// Children start from the sanitized shell env (see sanitizedChildEnv), not the
+	// worker's full process.env: model-authored or third-party commands must not
+	// inherit supervisor auth tokens, recursion bookkeeping, or provider
+	// credentials. Per-call entries still merge on top, and a key with an
+	// undefined value is unset in the child.
+	const merged: NodeJS.ProcessEnv = sanitizedChildEnv();
+	for (const [key, value] of Object.entries(env ?? {})) {
 		if (value === undefined) {
 			delete merged[key];
 		} else {

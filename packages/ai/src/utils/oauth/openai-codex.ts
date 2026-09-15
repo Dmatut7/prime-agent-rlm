@@ -166,6 +166,9 @@ async function refreshAccessToken(refreshToken: string): Promise<TokenResult> {
 				refresh_token: refreshToken,
 				client_id: CLIENT_ID,
 			}),
+			// Same guard as the anthropic provider: a silent token endpoint must not
+			// hold the auth.json lock (and its mtime heartbeat) open-ended.
+			signal: AbortSignal.timeout(30_000),
 		});
 
 		if (!response.ok) {

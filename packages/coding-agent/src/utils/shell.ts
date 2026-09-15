@@ -134,16 +134,69 @@ export function resolveKernelBashShell(customShellPath?: string): string | undef
 	return undefined;
 }
 
+/**
+ * Env keys shell-tool children (the bash tool, exec, extensions) may inherit.
+ * These children run model-authored or third-party code (npm postinstall
+ * scripts, test suites), so the base is an allowlist — mirroring the kernel's
+ * MCP stdio `_SAFE_ENV` — rather than the worker's full process.env: supervisor
+ * auth tokens (PRIME_AGENT_INTERNAL_*), recursion bookkeeping (RLM_*), provider
+ * credentials (SERPER_API_KEY, ANTHROPIC_*, ...) and the user's agent sockets
+ * (SSH_AUTH_SOCK) must not ride along into arbitrary commands.
+ */
+const SHELL_CHILD_SAFE_ENV_KEYS = [
+	"HOME",
+	"PATH",
+	"SHELL",
+	"USER",
+	"LOGNAME",
+	"LANG",
+	"LC_ALL",
+	"LC_CTYPE",
+	"TZ",
+	"TMPDIR",
+	"TEMP",
+	"TMP",
+	"SystemRoot",
+	"WINDIR",
+	"COMSPEC",
+	"PATHEXT",
+	"OS",
+	"SYSTEMDRIVE",
+	"USERPROFILE",
+] as const;
+
+/** Comma-separated env names a user opts back in for shell-tool children. */
+export const SHELL_ENV_PASSTHROUGH_VAR = "PRIME_AGENT_ENV_PASSTHROUGH";
+
+export function sanitizedChildEnv(): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = {};
+	for (const key of SHELL_CHILD_SAFE_ENV_KEYS) {
+		const value = process.env[key];
+		if (value !== undefined) {
+			env[key] = value;
+		}
+	}
+	for (const name of (process.env[SHELL_ENV_PASSTHROUGH_VAR] ?? "").split(",")) {
+		const trimmed = name.trim();
+		const value = trimmed ? process.env[trimmed] : undefined;
+		if (value !== undefined) {
+			env[trimmed] = value;
+		}
+	}
+	return env;
+}
+
 export function getShellEnv(): NodeJS.ProcessEnv {
+	const base = sanitizedChildEnv();
 	const binDir = getBinDir();
-	const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
-	const currentPath = process.env[pathKey] ?? "";
+	const pathKey = Object.keys(base).find((key) => key.toLowerCase() === "path") ?? "PATH";
+	const currentPath = base[pathKey] ?? "";
 	const pathEntries = currentPath.split(delimiter).filter(Boolean);
 	const hasBinDir = pathEntries.includes(binDir);
 	const updatedPath = hasBinDir ? currentPath : [binDir, currentPath].filter(Boolean).join(delimiter);
 
 	return {
-		...process.env,
+		...base,
 		[pathKey]: updatedPath,
 	};
 }
