@@ -1,6 +1,18 @@
 import { spawnSync } from "child_process";
 import { createHash } from "crypto";
-import { accessSync, constants, existsSync, readFileSync, realpathSync, renameSync, rmSync, statSync } from "fs";
+import {
+	accessSync,
+	closeSync,
+	constants,
+	existsSync,
+	openSync,
+	readFileSync,
+	realpathSync,
+	renameSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "fs";
 import { homedir } from "os";
 import { basename, dirname, join, resolve, sep, win32 } from "path";
 import { fileURLToPath } from "url";
@@ -572,10 +584,76 @@ export function getLegacyDaemonUpdateRestartManifestPath(agentDir: string = getA
 const MAX_LOG_BYTES = 5 * 1024 * 1024;
 
 /**
+ * Wait budget and staleness rule for the append lock below. The critical section is a
+ * stat, a rename and an append, so a lock that is still there after this long belongs to
+ * a process that died holding it; and the wait has to stay in the low milliseconds
+ * because this runs on the logging sink, which must not stall a turn.
+ */
+const LOG_LOCK_ATTEMPTS = 40;
+const LOG_LOCK_MAX_DELAY_MS = 5;
+const LOG_LOCK_STALE_MS = 10_000;
+
+/**
+ * Take the append lock for one log, or return undefined when it could not be taken in the
+ * bounded wait (the caller then appends without rotating - never without the line).
+ *
+ * The lock is an `O_EXCL` file next to the log (`<log>.rotate.lock`, pid and time inside).
+ * Rotation is decided from the file's size, so two writers that both see the cap crossed
+ * must not both act on it: one would `rm` the generation the other just rotated out, and
+ * the line it is about to write can land in a file another writer already renamed away.
+ * The lock is dropped with `rm`, which is what a fresh `O_EXCL` open needs.
+ */
+function acquireLogLock(logPath: string): (() => void) | undefined {
+	const lockPath = `${logPath}.rotate.lock`;
+	const waitBuffer = new Int32Array(new SharedArrayBuffer(4));
+	for (let attempt = 0; attempt < LOG_LOCK_ATTEMPTS; attempt++) {
+		try {
+			const descriptor = openSync(lockPath, "wx", 0o600);
+			try {
+				writeFileSync(descriptor, `${process.pid} ${Date.now()}\n`);
+			} finally {
+				closeSync(descriptor);
+			}
+			return () => {
+				try {
+					rmSync(lockPath, { force: true });
+				} catch {
+					// A lock that cannot be dropped only costs the next writer its rotation.
+				}
+			};
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+				return undefined;
+			}
+			try {
+				if (Date.now() - statSync(lockPath).mtimeMs > LOG_LOCK_STALE_MS) {
+					rmSync(lockPath, { force: true });
+					continue;
+				}
+			} catch {
+				// The holder released it between the failed create and this stat: retry now.
+				continue;
+			}
+			Atomics.wait(waitBuffer, 0, 0, Math.min(LOG_LOCK_MAX_DELAY_MS, attempt + 1));
+		}
+	}
+	return undefined;
+}
+
+/**
  * Append a line to a log file, keeping its size bounded with a single-generation
  * rotation. Opens and closes per call (no held fd), so rotation works at runtime
  * — a long-lived writer rotates on the write that crosses the cap, not only at
  * startup. Best-effort: diagnostics must never throw into the caller.
+ *
+ * The check, the rotation and the append are one critical section under `acquireLogLock`,
+ * because this log is shared by the daemon, its workers and its clients: an unserialized
+ * rotation loses the whole generation it rotated out (`rm <log>.old` of another writer's
+ * fresh rotation) and splits one writer's records across `<log>` and `<log>.old`, in an
+ * order that no longer follows the wall clock. Serialized, the rotation boundary is a
+ * single point in the log's append order, so `<log>.old` is a prefix and `<log>` a suffix
+ * of every writer's own sequence. A writer that cannot take the lock appends without
+ * rotating: the line is never dropped for want of a lock.
  */
 export function appendRotatingLog(logPath: string, message: string, maxBytes: number = MAX_LOG_BYTES): void {
 	try {
@@ -584,16 +662,21 @@ export function appendRotatingLog(logPath: string, message: string, maxBytes: nu
 		// still validates the target itself, so a symlinked log path is refused
 		// either way.
 		if (!existsSync(logPath)) ensurePrivateFile(logPath);
+		const release = acquireLogLock(logPath);
 		try {
-			if (statSync(logPath).size > maxBytes) {
-				// Drop any prior .old first: renameSync fails on Windows if it exists.
-				rmSync(`${logPath}.old`, { force: true });
-				renameSync(logPath, `${logPath}.old`);
+			try {
+				if (statSync(logPath).size > maxBytes) {
+					// Drop any prior .old first: renameSync fails on Windows if it exists.
+					rmSync(`${logPath}.old`, { force: true });
+					renameSync(logPath, `${logPath}.old`);
+				}
+			} catch {
+				// Keep appending rather than dropping the log on a rotation failure.
 			}
-		} catch {
-			// Keep appending rather than dropping the log on a rotation failure.
+			appendPrivateFile(logPath, `${message}\n`);
+		} finally {
+			release?.();
 		}
-		appendPrivateFile(logPath, `${message}\n`);
 	} catch {
 		// A read-only or missing log dir must never break the caller.
 	}
