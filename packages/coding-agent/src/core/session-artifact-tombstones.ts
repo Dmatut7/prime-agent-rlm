@@ -175,9 +175,13 @@ function compactRecords(records: readonly SessionArtifactTombstone[]): string[] 
 
 /**
  * Record that a session's artifact directory was deleted. Best effort by
- * contract: a refusal (a legacy non-private root, a read-only agent dir) returns
- * false and the caller keeps its successful delete - a tombstone must never turn
- * a completed deletion into a failure.
+ * contract: a refusal returns false and the caller keeps its successful delete -
+ * a tombstone must never turn a completed deletion into a failure. What is not a
+ * refusal: the append goes through the private-file helpers, which re-tighten a
+ * root that is not exactly 0700, so a legacy 0755 root or an operator-locked
+ * 0555 one is made private again and takes the record (a deliberate delete is
+ * therefore not stopped by a loosened root mode). Only a root that cannot be
+ * written at all - absent, unowned, on a read-only mount - comes back false.
  */
 export function recordSessionArtifactTombstone(
 	artifactRoot: string,

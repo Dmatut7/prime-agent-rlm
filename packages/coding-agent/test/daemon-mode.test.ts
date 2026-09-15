@@ -8,6 +8,7 @@ import {
 	readdirSync,
 	readFileSync,
 	rmSync,
+	statSync,
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
@@ -6824,41 +6825,79 @@ describe("daemon mode helpers", () => {
 	});
 
 	// chmod-based read-only dirs don't block root, so skip when running as uid 0.
-	it.skipIf(process.getuid?.() === 0)("does not fail a deletion when the artifact dir cannot be removed", async () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-artifact-rm-failure-"));
-		let lockedRoot: string | undefined;
-		try {
-			const fixture = makePersistedRlmDaemonFixture(tempDir);
-			const nestedArtifactsRoot = resolve(fixture.childArtifactDir, "..");
-			const internals = fixture.daemon as unknown as {
-				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
-				createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
-			};
-			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
-			chmodSync(nestedArtifactsRoot, 0o555);
-			lockedRoot = nestedArtifactsRoot;
+	//
+	// The refusal has to be simulated on the artifact dir itself: deleting a session now
+	// appends a tombstone into the artifact *root* first, and the private-file helpers
+	// re-tighten any root not already exactly 0700 - one of ours left at 0555 included.
+	// The root barrier is pinned by its own test below.
+	it.skipIf(process.getuid?.() === 0)(
+		"does not fail a deletion when the artifact dir itself cannot be removed",
+		async () => {
+			const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-artifact-rm-failure-"));
+			let lockedArtifactDir: string | undefined;
+			try {
+				const fixture = makePersistedRlmDaemonFixture(tempDir);
+				const snapshot = join(fixture.childArtifactDir, "kernel-state.dill");
+				writeFileSync(snapshot, "payload");
+				chmodSync(fixture.childArtifactDir, 0o555);
+				lockedArtifactDir = fixture.childArtifactDir;
+				const internals = fixture.daemon as unknown as {
+					createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+					createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+				};
+				const parentState = await internals.createRuntime({
+					type: "create",
+					sessionPath: fixture.parentSessionFile,
+				});
 
-			// Cache cleanup is best-effort: the rm failure must not surface.
-			await internals.createSubagentRuntimeHost(parentState).deleteRlmSubagentRuntime(fixture.childId);
+				// Cache cleanup is best-effort: the rm failure must not surface.
+				await internals.createSubagentRuntimeHost(parentState).deleteRlmSubagentRuntime(fixture.childId);
 
-			expect(existsSync(fixture.childArtifactDir)).toBe(true);
-			// Both tombstones are still durable.
-			const display = JSON.parse(readFileSync(join(fixture.childSessionDir, "rlm-subagent.json"), "utf8")) as {
-				status: string;
-			};
-			expect(display).toMatchObject({ status: "deleted" });
-			const ledgerFile = readdirSync(join(tempDir, "rlm-ledger")).find((name) => name.endsWith(".jsonl"));
-			if (!ledgerFile) throw new Error("Missing RLM ledger file");
-			const ledgerOps = readFileSync(join(tempDir, "rlm-ledger", ledgerFile), "utf8")
-				.trim()
-				.split(/\r?\n/)
-				.map((line) => JSON.parse(line) as { op: string; childId?: string });
-			expect(ledgerOps.some((record) => record.op === "delete" && record.childId === fixture.childId)).toBe(true);
-		} finally {
-			if (lockedRoot) chmodSync(lockedRoot, 0o755);
-			rmSync(tempDir, { recursive: true, force: true });
-		}
-	});
+				// Positive control that this tests a *refused* cleanup and not a cleanup
+				// that succeeded: the payload the recursive remove had to unlink is there.
+				expect(existsSync(snapshot)).toBe(true);
+				expectDurableRlmDeletionTombstones(fixture, tempDir);
+			} finally {
+				if (lockedArtifactDir) chmodSync(lockedArtifactDir, 0o755);
+				rmSync(tempDir, { recursive: true, force: true });
+			}
+		},
+	);
+
+	// The other half of the same boundary: a read-only artifact root is no longer a
+	// barrier. The deletion tombstone restores the private mode, so an operator-loosened
+	// or legacy root mode cannot keep a retired child's cache alive; the transcript and
+	// both deletion tombstones stay durable regardless.
+	it.skipIf(process.getuid?.() === 0)(
+		"sweeps the artifact dir after re-tightening a read-only artifact root",
+		async () => {
+			const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-artifact-rm-root-locked-"));
+			let lockedRoot: string | undefined;
+			try {
+				const fixture = makePersistedRlmDaemonFixture(tempDir);
+				const nestedArtifactsRoot = resolve(fixture.childArtifactDir, "..");
+				const internals = fixture.daemon as unknown as {
+					createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+					createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+				};
+				const parentState = await internals.createRuntime({
+					type: "create",
+					sessionPath: fixture.parentSessionFile,
+				});
+				chmodSync(nestedArtifactsRoot, 0o555);
+				lockedRoot = nestedArtifactsRoot;
+
+				await internals.createSubagentRuntimeHost(parentState).deleteRlmSubagentRuntime(fixture.childId);
+
+				expect(statSync(nestedArtifactsRoot).mode & 0o777).toBe(0o700);
+				expect(existsSync(fixture.childArtifactDir)).toBe(false);
+				expectDurableRlmDeletionTombstones(fixture, tempDir);
+			} finally {
+				if (lockedRoot) chmodSync(lockedRoot, 0o755);
+				rmSync(tempDir, { recursive: true, force: true });
+			}
+		},
+	);
 
 	it("still sweeps and resolves when scheduled-job cancellation throws", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-artifact-cancel-throw-"));
@@ -9464,6 +9503,25 @@ function makePersistedRlmDaemonFixture(
 		grandchildId,
 		grandchildSessionFile,
 	};
+}
+
+/**
+ * The durable half of a subagent deletion: the per-child display entry carries the
+ * "deleted" tombstone and the spawn ledger records the delete, so a cache sweep that
+ * cannot run (or already ran) never loses the deletion boundary.
+ */
+function expectDurableRlmDeletionTombstones(fixture: { childId: string; childSessionDir: string }, tempDir: string) {
+	const display = JSON.parse(readFileSync(join(fixture.childSessionDir, "rlm-subagent.json"), "utf8")) as {
+		status: string;
+	};
+	expect(display).toMatchObject({ status: "deleted" });
+	const ledgerFile = readdirSync(join(tempDir, "rlm-ledger")).find((name) => name.endsWith(".jsonl"));
+	if (!ledgerFile) throw new Error("Missing RLM ledger file");
+	const ledgerOps = readFileSync(join(tempDir, "rlm-ledger", ledgerFile), "utf8")
+		.trim()
+		.split(/\r?\n/)
+		.map((line) => JSON.parse(line) as { op: string; childId?: string });
+	expect(ledgerOps.some((record) => record.op === "delete" && record.childId === fixture.childId)).toBe(true);
 }
 
 function makeRuntimeSession(
