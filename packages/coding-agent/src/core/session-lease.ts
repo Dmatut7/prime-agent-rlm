@@ -15,6 +15,7 @@ import {
 } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { lockSync } from "proper-lockfile";
 
 export const SESSION_LEASES_ENABLED_ENV = "PRIME_AGENT_INTERNAL_SESSION_LEASES";
@@ -65,9 +66,22 @@ export class SessionLease {
 			return;
 		}
 		this.released = true;
+		// The in-process bookkeeping drops synchronously: a later acquire in this
+		// process must see this lease as reclaimable-own instead of conflicting.
 		activeLeaseDirectories.delete(this.directory);
+		void this.removeLeaseDirectory();
+	}
+
+	/**
+	 * Remove the owner record under the guard, off the event loop's critical path
+	 * (R31-1): the removal used to sit behind the same 100 x 10ms blocking retry
+	 * as the acquire. Fire-and-forget by contract - every caller treats release
+	 * as best-effort, and a release that loses the guard race leaves an owner
+	 * record the next acquire reclaims (dead pid, or reclaimable-own).
+	 */
+	private async removeLeaseDirectory(): Promise<void> {
 		try {
-			withLeaseGuard(this.directory, () => {
+			await withLeaseGuardAsync(this.directory, () => {
 				const owner = readLeaseOwner(this.directory);
 				if (typeof owner === "object" && owner.token === this.token) {
 					rmSync(this.directory, { recursive: true, force: true });
@@ -422,10 +436,60 @@ function isReclaimableOwnLease(owner: SessionLeaseOwner, directory: string, envi
 	);
 }
 
-function withLeaseGuard<T>(directory: string, action: () => T): T {
+/**
+ * How long a contended lease guard keeps being retried (R31-1): 100 attempts
+ * spaced 10ms apart, the same budget the blocking loop used to spend, but the
+ * backoff is a timer await so the event loop keeps servicing everything else.
+ */
+const GUARD_RETRY_ATTEMPTS = 100;
+const GUARD_RETRY_DELAY_MS = 10;
+
+/** Attribution for a guard that stayed contended: who holds the lease directory. */
+export interface SessionLeaseGuardHolder {
+	pid?: number;
+	activeSessionId?: string;
+	detail: string;
+}
+
+function describeGuardHolder(directory: string): SessionLeaseGuardHolder {
+	const owner = readLeaseOwner(directory);
+	if (typeof owner === "object") {
+		return {
+			pid: owner.pid,
+			activeSessionId: owner.activeSessionId,
+			detail: `the lease is held by pid ${owner.pid}${owner.activeSessionId ? ` (owner ${owner.activeSessionId})` : ""}, acquired at ${owner.createdAt}`,
+		};
+	}
+	if (owner === "unreadable") {
+		return { detail: "the lease has an unreadable owner record that may name a live holder" };
+	}
+	if (owner === "corrupt") {
+		return { detail: "the lease has a corrupt owner record that names no process" };
+	}
+	return { detail: "no owner record is visible yet (a mid-flight acquire holds the guard)" };
+}
+
+/** Raised when the lease guard stays contended for the whole retry budget (R31-1). */
+export class SessionLeaseGuardContentionError extends Error {
+	readonly code = "session_lease_guard_contended" as const;
+
+	constructor(
+		readonly directory: string,
+		readonly holder: SessionLeaseGuardHolder,
+	) {
+		super(
+			`Could not coordinate session lease: ${directory} stayed guarded after ${Math.round(
+				(GUARD_RETRY_ATTEMPTS * GUARD_RETRY_DELAY_MS) / 1000,
+			)}s of retries; ${holder.detail}. Wait for the holder to finish, or force by removing ${directory} and its ${directory}.guard lock once the holder is gone.`,
+		);
+		this.name = "SessionLeaseGuardContentionError";
+	}
+}
+
+async function withLeaseGuardAsync<T>(directory: string, action: () => T): Promise<T> {
 	let release: (() => void) | undefined;
 	let guardCompromised = false;
-	for (let attempt = 0; attempt < 100; attempt++) {
+	for (let attempt = 0; attempt < GUARD_RETRY_ATTEMPTS; attempt++) {
 		try {
 			release = lockSync(directory, {
 				realpath: false,
@@ -440,14 +504,17 @@ function withLeaseGuard<T>(directory: string, action: () => T): T {
 			if ((error as NodeJS.ErrnoException).code !== "ELOCKED") {
 				throw error;
 			}
-			if (attempt === 99) {
-				throw new Error(`Could not coordinate session lease: ${directory}`);
+			if (attempt === GUARD_RETRY_ATTEMPTS - 1) {
+				throw new SessionLeaseGuardContentionError(directory, describeGuardHolder(directory));
 			}
-			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+			// Timer backoff instead of Atomics.wait (R31-1): a daemon worker's
+			// event loop must keep serving every other session while a slow
+			// holder (fsync storm, ps fork) finishes its critical section.
+			await delay(GUARD_RETRY_DELAY_MS);
 		}
 	}
 	if (!release) {
-		throw new Error(`Could not coordinate session lease: ${directory}`);
+		throw new SessionLeaseGuardContentionError(directory, describeGuardHolder(directory));
 	}
 	const assertGuardHeld = () => {
 		if (guardCompromised) throw new Error(`Session lease guard was compromised: ${directory}`);
@@ -524,11 +591,11 @@ function writeOwnerRecordAtomic(path: string, content: string): void {
 	}
 }
 
-export function acquireSessionLease(
+export async function acquireSessionLeaseAsync(
 	sessionPath: string | undefined,
 	agentDir: string,
 	environment: NodeJS.ProcessEnv = process.env,
-): SessionLease | undefined {
+): Promise<SessionLease | undefined> {
 	if (!sessionPath || !leasesEnabled(environment)) {
 		return undefined;
 	}
@@ -536,73 +603,86 @@ export function acquireSessionLease(
 	const root = join(agentDir, "session-leases");
 	mkdirSync(root, { recursive: true, mode: 0o700 });
 	const directory = leaseDirectory(agentDir, canonicalPath);
+	// R31-2: warm our own process start identity BEFORE the guard. The first
+	// capture forks `ps` on macOS (~55ms); doing it inside the critical section
+	// made every other process's acquire of the same path wait on it.
+	getCurrentProcessStartId();
 
-	return withLeaseGuard(directory, () => {
-		for (let attempt = 0; attempt < 3; attempt++) {
-			const token = randomUUID();
-			const candidateDirectory = `${directory}.candidate-${process.pid}-${token}`;
-			const owner: SessionLeaseOwner = {
-				version: 1,
-				token,
-				pid: process.pid,
-				processStartId: getCurrentProcessStartId(),
-				activeSessionId: environment[SESSION_LEASE_OWNER_ID_ENV],
-				sessionPath: canonicalPath,
-				createdAt: new Date().toISOString(),
-			};
-			mkdirSync(candidateDirectory, { mode: 0o700 });
-			// Durable before the directory rename publishes the record: a power loss
-			// must not leave a torn owner.json for the next acquire to read back as an
-			// unknown owner.
-			writeOwnerRecordAtomic(join(candidateDirectory, "owner.json"), `${JSON.stringify(owner, null, 2)}\n`);
-			try {
-				renameSync(candidateDirectory, directory);
-				return new SessionLease(canonicalPath, directory, token);
-			} catch (error) {
-				rmSync(candidateDirectory, { recursive: true, force: true });
-				const code = (error as NodeJS.ErrnoException).code;
-				if (code !== "EEXIST" && code !== "ENOTEMPTY") {
-					throw error;
+	for (let attempt = 0; attempt < 3; attempt++) {
+		const token = randomUUID();
+		const candidateDirectory = `${directory}.candidate-${process.pid}-${token}`;
+		const owner: SessionLeaseOwner = {
+			version: 1,
+			token,
+			pid: process.pid,
+			processStartId: getCurrentProcessStartId(),
+			activeSessionId: environment[SESSION_LEASE_OWNER_ID_ENV],
+			sessionPath: canonicalPath,
+			createdAt: new Date().toISOString(),
+		};
+		// R31-2: candidate preparation (mkdir + owner record + its two fsyncs)
+		// happens OUTSIDE the guard. The candidate path is unique, so nothing can
+		// race it; only the publish rename and the reclaim decision need the
+		// cross-process serialization, which is what the guard is for.
+		mkdirSync(candidateDirectory, { mode: 0o700 });
+		// Durable before the directory rename publishes the record: a power loss
+		// must not leave a torn owner.json for the next acquire to read back as an
+		// unknown owner.
+		writeOwnerRecordAtomic(
+			join(candidateDirectory, "owner.json"),
+			`${JSON.stringify(owner, null, 2)}
+`,
+		);
+		let lease: SessionLease | undefined;
+		try {
+			lease = await withLeaseGuardAsync(directory, () => {
+				try {
+					renameSync(candidateDirectory, directory);
+					return new SessionLease(canonicalPath, directory, token);
+				} catch (error) {
+					const code = (error as NodeJS.ErrnoException).code;
+					if (code !== "EEXIST" && code !== "ENOTEMPTY") {
+						throw error;
+					}
+					const existingOwner = readLeaseOwner(directory);
+					if (existingOwner === "unreadable") {
+						// Fail closed: an unreadable record may still name a live owner, and
+						// reclaiming one only needs write access to the parent directory, so a
+						// takeover here could hand the same session to two holders. Retry, and
+						// let the post-loop check refuse the lease while it stays unreadable.
+						return undefined;
+					}
+					// "corrupt" names no process, so there is no live owner to fail closed
+					// against: reclaim it under the guard (long-standing behavior, now spelled
+					// out) rather than refuse a session over a record nothing can ever repair.
+					if (
+						typeof existingOwner === "object" &&
+						isLeaseOwnerAlive(existingOwner) &&
+						!isReclaimableOwnLease(existingOwner, directory, environment)
+					) {
+						throw new SessionAlreadyActiveError(canonicalPath, existingOwner.activeSessionId);
+					}
+					reclaimStaleLease(directory);
+					return undefined;
 				}
-				const existingOwner = readLeaseOwner(directory);
-				if (existingOwner === "unreadable") {
-					// Fail closed: an unreadable record may still name a live owner, and
-					// reclaiming one only needs write access to the parent directory, so a
-					// takeover here could hand the same session to two holders. Retry, and
-					// let the post-loop check refuse the lease while it stays unreadable.
-					continue;
-				}
-				// "corrupt" names no process, so there is no live owner to fail closed
-				// against: reclaim it under the guard (long-standing behavior, now spelled
-				// out) rather than refuse a session over a record nothing can ever repair.
-				if (
-					typeof existingOwner === "object" &&
-					isLeaseOwnerAlive(existingOwner) &&
-					!isReclaimableOwnLease(existingOwner, directory, environment)
-				) {
-					throw new SessionAlreadyActiveError(canonicalPath, existingOwner.activeSessionId);
-				}
-				reclaimStaleLease(directory);
+			});
+			if (lease) {
+				return lease;
 			}
+		} finally {
+			// A candidate that was not renamed (retry, refusal, guard failure) must
+			// not linger: it is a unique path nothing else will ever clean up.
+			rmSync(candidateDirectory, { recursive: true, force: true });
 		}
+	}
 
-		const owner = existsSync(directory) ? readLeaseOwner(directory) : undefined;
-		if (
-			typeof owner === "object" &&
-			isLeaseOwnerAlive(owner) &&
-			!isReclaimableOwnLease(owner, directory, environment)
-		) {
-			throw new SessionAlreadyActiveError(canonicalPath, owner.activeSessionId);
-		}
-		throw new Error(`Could not acquire session lease: ${canonicalPath}`);
-	});
+	const owner = existsSync(directory) ? readLeaseOwner(directory) : undefined;
+	if (typeof owner === "object" && isLeaseOwnerAlive(owner) && !isReclaimableOwnLease(owner, directory, environment)) {
+		throw new SessionAlreadyActiveError(canonicalPath, owner.activeSessionId);
+	}
+	throw new Error(`Could not acquire session lease: ${canonicalPath}`);
 }
 
-/**
- * Lease directories this process holds right now. Read-only view for cleanup
- * callers: a sweep must never reclaim a lease its own process is holding, even
- * when the owner record on disk has not been written yet (adversarial review N-8).
- */
 export function activeSessionLeaseDirectories(): ReadonlySet<string> {
 	return activeLeaseDirectories;
 }

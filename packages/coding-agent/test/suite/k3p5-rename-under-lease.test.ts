@@ -10,7 +10,11 @@ import {
 	createAgentSessionServices,
 } from "../../src/core/agent-session-runtime.js";
 import { AuthStorage } from "../../src/core/auth-storage.js";
-import { acquireSessionLease, SESSION_LEASES_ENABLED_ENV, type SessionLease } from "../../src/core/session-lease.js";
+import {
+	acquireSessionLeaseAsync,
+	SESSION_LEASES_ENABLED_ENV,
+	type SessionLease,
+} from "../../src/core/session-lease.js";
 import { loadEntriesFromFile, SessionManager } from "../../src/core/session-manager.js";
 import { InProcessAgentConnection } from "../../src/modes/agent-connection/in-process-agent-connection.js";
 
@@ -111,10 +115,14 @@ describe("rename under a write lease", () => {
 
 		// A live writer holds the lease on the saved file: its in-flight append
 		// owns the tail, and a rename-side repair must not truncate under it.
-		const lease: SessionLease | undefined = acquireSessionLease(savedPath, host.runtime.services.agentDir, {
-			...process.env,
-			[SESSION_LEASES_ENABLED_ENV]: "1",
-		});
+		const lease: SessionLease | undefined = await acquireSessionLeaseAsync(
+			savedPath,
+			host.runtime.services.agentDir,
+			{
+				...process.env,
+				[SESSION_LEASES_ENABLED_ENV]: "1",
+			},
+		);
 		expect(lease).toBeDefined();
 
 		const connection = new InProcessAgentConnection(host.runtime);

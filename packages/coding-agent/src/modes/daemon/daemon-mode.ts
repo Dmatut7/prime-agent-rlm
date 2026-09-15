@@ -100,9 +100,9 @@ import {
 	type SessionPassivationSnapshot,
 } from "../../core/session-action-store.js";
 import { deleteSessionArtifacts, deleteSessionFile } from "../../core/session-file-actions.js";
-import { acquireSessionLease, canonicalSessionPath, type SessionLease } from "../../core/session-lease.js";
+import { acquireSessionLeaseAsync, canonicalSessionPath, type SessionLease } from "../../core/session-lease.js";
 import {
-	appendOwnedSessionLine,
+	appendOwnedSessionLineAsync,
 	getSessionArtifactPathForFile,
 	readSessionInfo,
 	repairOwnedSessionFile,
@@ -1822,7 +1822,7 @@ export class AgentDaemon {
 		let sessionLease: SessionLease | undefined;
 		let sessionManager: SessionManager;
 		try {
-			sessionLease = acquireSessionLease(sessionPath, agentDir);
+			sessionLease = await acquireSessionLeaseAsync(sessionPath, agentDir);
 			// Repair only after lease acquisition and only on the write-owning
 			// branch: the in-memory branch never writes this file back.
 			if (sessionPath && !command.noSession) {
@@ -3125,7 +3125,7 @@ export class AgentDaemon {
 		let runtime: AgentSessionRuntime | undefined;
 		let sessionLease: SessionLease | undefined;
 		try {
-			sessionLease = acquireSessionLease(entry.sessionFile, parentState.runtime.services.agentDir);
+			sessionLease = await acquireSessionLeaseAsync(entry.sessionFile, parentState.runtime.services.agentDir);
 			// This runtime takes over writing the child transcript: repair under the lease.
 			repairOwnedSessionFile(entry.sessionFile);
 			const sessionManager = await SessionManager.openAsync(entry.sessionFile, entry.sessionDir);
@@ -4301,7 +4301,7 @@ export class AgentDaemon {
 							// appending, or the session_info line glues onto a torn tail.
 							// K3P-5: and the same lease rule - the repair truncates, so it
 							// only happens under the write lease, never over a live writer.
-							appendOwnedSessionLine(command.sessionPath, this.agentDir, (manager) => {
+							await appendOwnedSessionLineAsync(command.sessionPath, this.agentDir, (manager) => {
 								manager.appendSessionInfo(name);
 							});
 							await this.rlmSpawnLedger()

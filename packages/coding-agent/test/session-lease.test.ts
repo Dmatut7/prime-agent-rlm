@@ -15,7 +15,7 @@ import { join, resolve } from "node:path";
 import { lockSync } from "proper-lockfile";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-	acquireSessionLease,
+	acquireSessionLeaseAsync,
 	canonicalSessionPath,
 	getProcessStartId,
 	getWindowsProcessStartId,
@@ -89,16 +89,16 @@ describe("session leases", () => {
 		expect(queryCount).toBe(1);
 	});
 
-	it("rejects a second live owner with a typed active-session error", () => {
+	it("rejects a second live owner with a typed active-session error", async () => {
 		const agentDir = createTempDir();
 		const sessionPath = join(agentDir, "session.jsonl");
-		const first = acquireSessionLease(sessionPath, agentDir, enabledEnvironment("resident-a"));
+		const first = await acquireSessionLeaseAsync(sessionPath, agentDir, enabledEnvironment("resident-a"));
 
-		expect(() => acquireSessionLease(sessionPath, agentDir, enabledEnvironment("owned-b"))).toThrow(
+		await expect(acquireSessionLeaseAsync(sessionPath, agentDir, enabledEnvironment("owned-b"))).rejects.toThrow(
 			SessionAlreadyActiveError,
 		);
 		try {
-			acquireSessionLease(sessionPath, agentDir, enabledEnvironment("owned-b"));
+			await acquireSessionLeaseAsync(sessionPath, agentDir, enabledEnvironment("owned-b"));
 		} catch (error) {
 			expect(error).toMatchObject({
 				code: "session_already_active",
@@ -108,12 +108,12 @@ describe("session leases", () => {
 		}
 
 		first?.release();
-		const second = acquireSessionLease(sessionPath, agentDir, enabledEnvironment("owned-b"));
+		const second = await acquireSessionLeaseAsync(sessionPath, agentDir, enabledEnvironment("owned-b"));
 		expect(second?.sessionPath).toBe(canonicalSessionPath(sessionPath));
 		second?.release();
 	});
 
-	it("lets an interactive launch force leases without a daemon owner id", () => {
+	it("lets an interactive launch force leases without a daemon owner id", async () => {
 		// Interactive mode enables leases per-acquire (no SESSION_LEASE_OWNER_ID).
 		const agentDir = createTempDir();
 		const sessionPath = canonicalSessionPath(resolve(agentDir, "interactive.jsonl"));
@@ -137,7 +137,7 @@ describe("session leases", () => {
 		delete environment[SESSION_LEASE_OWNER_ID_ENV];
 		let caught: unknown;
 		try {
-			acquireSessionLease(sessionPath, agentDir, environment);
+			await acquireSessionLeaseAsync(sessionPath, agentDir, environment);
 		} catch (error) {
 			caught = error;
 		}
@@ -155,28 +155,30 @@ describe("session leases", () => {
 				createdAt: new Date(0).toISOString(),
 			}),
 		);
-		const lease = acquireSessionLease(sessionPath, agentDir, environment);
+		const lease = await acquireSessionLeaseAsync(sessionPath, agentDir, environment);
 		expect(lease?.sessionPath).toBe(sessionPath);
 		lease?.release();
 	});
 
-	it("keeps an actively held in-process lease conflicting", () => {
+	it("keeps an actively held in-process lease conflicting", async () => {
 		// A live SessionLease in this process (e.g. an in-process RLM child
 		// runtime) must still conflict even under the same pid and owner
 		// identity; only leaked leases are reclaimable.
 		const agentDir = createTempDir();
 		const sessionPath = join(agentDir, "held.jsonl");
 		const environment = enabledEnvironment("held-owner");
-		const first = acquireSessionLease(sessionPath, agentDir, environment);
+		const first = await acquireSessionLeaseAsync(sessionPath, agentDir, environment);
 		expect(first).toBeDefined();
-		expect(() => acquireSessionLease(sessionPath, agentDir, environment)).toThrow(SessionAlreadyActiveError);
+		await expect(acquireSessionLeaseAsync(sessionPath, agentDir, environment)).rejects.toThrow(
+			SessionAlreadyActiveError,
+		);
 		first?.release();
-		const second = acquireSessionLease(sessionPath, agentDir, environment);
+		const second = await acquireSessionLeaseAsync(sessionPath, agentDir, environment);
 		expect(second?.sessionPath).toBe(canonicalSessionPath(sessionPath));
 		second?.release();
 	});
 
-	it("reclaims a lease owned by this process instead of deadlocking on itself", () => {
+	it("reclaims a lease owned by this process instead of deadlocking on itself", async () => {
 		// A prior acquire in this process can leak its lease (failed release,
 		// unavailable start-id detection). Re-acquiring must take it over rather
 		// than raise SessionAlreadyActiveError against its own pid.
@@ -197,7 +199,7 @@ describe("session leases", () => {
 			}),
 		);
 
-		const lease = acquireSessionLease(sessionPath, agentDir, enabledEnvironment("self-session"));
+		const lease = await acquireSessionLeaseAsync(sessionPath, agentDir, enabledEnvironment("self-session"));
 		expect(lease?.sessionPath).toBe(sessionPath);
 		lease?.release();
 	});
@@ -223,7 +225,7 @@ describe("session leases", () => {
 		}
 	});
 
-	it("reclaims a lease whose owner process is gone", () => {
+	it("reclaims a lease whose owner process is gone", async () => {
 		const agentDir = createTempDir();
 		const sessionPath = canonicalSessionPath(resolve(agentDir, "stale.jsonl"));
 		const key = createHash("sha256").update(sessionPath).digest("hex");
@@ -241,12 +243,12 @@ describe("session leases", () => {
 			}),
 		);
 
-		const lease = acquireSessionLease(sessionPath, agentDir, enabledEnvironment("replacement"));
+		const lease = await acquireSessionLeaseAsync(sessionPath, agentDir, enabledEnvironment("replacement"));
 		expect(lease?.sessionPath).toBe(sessionPath);
 		lease?.release();
 	});
 
-	it("reports guard contention as a coordination failure", () => {
+	it("reports guard contention as a coordination failure", async () => {
 		const agentDir = createTempDir();
 		const sessionPath = canonicalSessionPath(join(agentDir, "session.jsonl"));
 		const key = createHash("sha256").update(sessionPath).digest("hex");
@@ -262,7 +264,7 @@ describe("session leases", () => {
 		try {
 			let thrown: unknown;
 			try {
-				acquireSessionLease(sessionPath, agentDir, enabledEnvironment("resident-a"));
+				await acquireSessionLeaseAsync(sessionPath, agentDir, enabledEnvironment("resident-a"));
 			} catch (error) {
 				thrown = error;
 			}
@@ -274,21 +276,21 @@ describe("session leases", () => {
 		}
 	});
 
-	it("treats symlink aliases as the same persisted session", () => {
+	it("treats symlink aliases as the same persisted session", async () => {
 		const agentDir = createTempDir();
 		const sessionPath = join(agentDir, "session.jsonl");
 		const aliasPath = join(agentDir, "session-alias.jsonl");
 		writeFileSync(sessionPath, "");
 		symlinkSync(sessionPath, aliasPath);
-		const first = acquireSessionLease(sessionPath, agentDir, enabledEnvironment("resident-a"));
+		const first = await acquireSessionLeaseAsync(sessionPath, agentDir, enabledEnvironment("resident-a"));
 
-		expect(() => acquireSessionLease(aliasPath, agentDir, enabledEnvironment("owned-b"))).toThrow(
+		await expect(acquireSessionLeaseAsync(aliasPath, agentDir, enabledEnvironment("owned-b"))).rejects.toThrow(
 			SessionAlreadyActiveError,
 		);
 		first?.release();
 	});
 
-	it("reclaims a lease after its pid has been reused", () => {
+	it("reclaims a lease after its pid has been reused", async () => {
 		const agentDir = createTempDir();
 		const sessionPath = canonicalSessionPath(resolve(agentDir, "reused-pid.jsonl"));
 		const key = createHash("sha256").update(sessionPath).digest("hex");
@@ -307,12 +309,12 @@ describe("session leases", () => {
 			}),
 		);
 
-		const lease = acquireSessionLease(sessionPath, agentDir, enabledEnvironment("replacement"));
+		const lease = await acquireSessionLeaseAsync(sessionPath, agentDir, enabledEnvironment("replacement"));
 		expect(lease?.sessionPath).toBe(sessionPath);
 		lease?.release();
 	});
 
-	it("reclaims a lease whose owner.json was torn by a crash", () => {
+	it("reclaims a lease whose owner.json was torn by a crash", async () => {
 		// A truncated owner.json names no process, so the next acquire takes the lease
 		// over. That reclaim is long-standing behavior, pinned here; what is new is the
 		// atomic owner write, which stops fresh tears and leaves no temp file behind.
@@ -331,7 +333,7 @@ describe("session leases", () => {
 		expect(() => JSON.parse(tornRecord)).toThrow();
 		writeFileSync(join(lockDirectory, "owner.json"), tornRecord);
 
-		const lease = acquireSessionLease(sessionPath, agentDir, enabledEnvironment("replacement"));
+		const lease = await acquireSessionLeaseAsync(sessionPath, agentDir, enabledEnvironment("replacement"));
 		expect(lease?.sessionPath).toBe(sessionPath);
 
 		// The replacement record is complete, and the atomic write left no temp file.
@@ -350,7 +352,7 @@ describe("session leases", () => {
 
 		// Reclaiming torn bytes must not weaken the collision guard: the fresh
 		// record still fails closed against another owner identity.
-		expect(() => acquireSessionLease(sessionPath, agentDir, enabledEnvironment("intruder"))).toThrow(
+		await expect(acquireSessionLeaseAsync(sessionPath, agentDir, enabledEnvironment("intruder"))).rejects.toThrow(
 			SessionAlreadyActiveError,
 		);
 
@@ -358,7 +360,7 @@ describe("session leases", () => {
 		expect(existsSync(lockDirectory)).toBe(false);
 	});
 
-	it("reclaims a lease whose owner.json cannot be decoded", () => {
+	it("reclaims a lease whose owner.json cannot be decoded", async () => {
 		const payloads = [
 			"",
 			"this is not json",
@@ -377,24 +379,24 @@ describe("session leases", () => {
 			mkdirSync(lockDirectory, { recursive: true });
 			writeFileSync(join(lockDirectory, "owner.json"), payload);
 
-			const lease = acquireSessionLease(sessionPath, agentDir, enabledEnvironment("replacement"));
+			const lease = await acquireSessionLeaseAsync(sessionPath, agentDir, enabledEnvironment("replacement"));
 			expect(lease?.sessionPath, `payload ${index}: ${JSON.stringify(payload)}`).toBe(sessionPath);
 			lease?.release();
 		}
 	});
 
-	it("reclaims a lease when owner.json is absent", () => {
+	it("reclaims a lease when owner.json is absent", async () => {
 		const agentDir = createTempDir();
 		const sessionPath = canonicalSessionPath(resolve(agentDir, "absent-lock.jsonl"));
 		const key = createHash("sha256").update(sessionPath).digest("hex");
 		const lockDirectory = join(agentDir, "session-leases", `${key}.lock`);
 		mkdirSync(lockDirectory, { recursive: true });
-		const lease = acquireSessionLease(sessionPath, agentDir, enabledEnvironment("replacement"));
+		const lease = await acquireSessionLeaseAsync(sessionPath, agentDir, enabledEnvironment("replacement"));
 		expect(lease?.sessionPath).toBe(sessionPath);
 		lease?.release();
 	});
 
-	it.skipIf(!chmodCanBlockReads)("fails closed while owner.json cannot be read", () => {
+	it.skipIf(!chmodCanBlockReads)("fails closed while owner.json cannot be read", async () => {
 		// An owner record this process cannot *read* is not the same as a missing
 		// one: reading it is the only way to learn whether its owner is still alive,
 		// and a reclaim only needs write access to the parent directory. Taking over
@@ -423,9 +425,9 @@ describe("session leases", () => {
 			chmodSync(ownerPath, 0o000);
 
 			let thrown: unknown;
-			let acquired: ReturnType<typeof acquireSessionLease> | undefined;
+			let acquired: Awaited<ReturnType<typeof acquireSessionLeaseAsync>> | undefined;
 			try {
-				acquired = acquireSessionLease(sessionPath, agentDir, enabledEnvironment("replacement"));
+				acquired = await acquireSessionLeaseAsync(sessionPath, agentDir, enabledEnvironment("replacement"));
 			} catch (error) {
 				thrown = error;
 			}
@@ -453,13 +455,13 @@ describe("session leases", () => {
 		// Fail-closed is scoped to the unreadable window, not a permanent lockout:
 		// once the record is readable again the ordinary stale-owner path reclaims it
 		// (its recorded pid is long gone).
-		const lease = acquireSessionLease(sessionPath, agentDir, enabledEnvironment("replacement"));
+		const lease = await acquireSessionLeaseAsync(sessionPath, agentDir, enabledEnvironment("replacement"));
 		expect(lease?.sessionPath).toBe(sessionPath);
 		lease?.release();
 	});
 
-	it("is inert for direct SDK runtimes unless worker isolation enables it", () => {
+	it("is inert for direct SDK runtimes unless worker isolation enables it", async () => {
 		const agentDir = createTempDir();
-		expect(acquireSessionLease(join(agentDir, "session.jsonl"), agentDir, {})).toBeUndefined();
+		await expect(acquireSessionLeaseAsync(join(agentDir, "session.jsonl"), agentDir, {})).resolves.toBeUndefined();
 	});
 });

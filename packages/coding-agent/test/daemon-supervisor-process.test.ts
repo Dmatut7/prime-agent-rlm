@@ -9,7 +9,7 @@ import { ENV_AGENT_DIR, getCronJobsPath } from "../src/config.js";
 import { AgentCronJobStore } from "../src/core/cron-jobs.js";
 import { readActiveOrphanProcesses } from "../src/core/orphan-process-journal.js";
 import {
-	acquireSessionLease,
+	acquireSessionLeaseAsync,
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 } from "../src/core/session-lease.js";
@@ -1352,7 +1352,7 @@ describe("daemon supervisor resident workers", () => {
 
 		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
 		const client = await connectEventually(socketPath, supervisor);
-		const externalLease = acquireSessionLease(sessionFiles[0], agentDir, {
+		const externalLease = await acquireSessionLeaseAsync(sessionFiles[0], agentDir, {
 			[SESSION_LEASES_ENABLED_ENV]: "1",
 			[SESSION_LEASE_OWNER_ID_ENV]: "external-owner",
 		});

@@ -70,7 +70,7 @@ import {
 	type SessionCwdIssue,
 } from "./core/session-cwd.js";
 import {
-	acquireSessionLease,
+	acquireSessionLeaseAsync,
 	canonicalSessionPath,
 	SESSION_LEASES_ENABLED_ENV,
 	SessionAlreadyActiveError,
@@ -1833,7 +1833,7 @@ export async function main(args: string[], options?: MainOptions) {
 		// interleaving appends. Meta commands (--list-models) skip the lease.
 		const directSessionLease =
 			parsed.listModels === undefined
-				? acquireSessionLease(sessionManager.getSessionFile(), agentDir, {
+				? await acquireSessionLeaseAsync(sessionManager.getSessionFile(), agentDir, {
 						...process.env,
 						[SESSION_LEASES_ENABLED_ENV]: "1",
 					})

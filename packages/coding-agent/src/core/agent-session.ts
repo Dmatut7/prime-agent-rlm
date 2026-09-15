@@ -1776,6 +1776,8 @@ export class AgentSession {
 	 */
 	private _rlmMaxDepthCeiling: number | undefined;
 	private _rlmSessionDir?: string;
+	/** True when `_rlmSessionDir` is this session's own `prime-agent-rlm-*` tmpdir (RC-6). */
+	private _rlmSessionDirEphemeral = false;
 	private readonly _semanticEdges: SemanticEdgeRecorder;
 	private _rlmParentNodeId?: string;
 	private _rlmParentAgent?: string;
@@ -5637,6 +5639,9 @@ export class AgentSession {
 			this._eventListeners = [];
 			cleanupSessionResources(this.sessionId);
 		} finally {
+			// After the child sessions above were disposed (their final flushes may
+			// still write inside it), the ephemeral directory has no remaining owner.
+			this._removeEphemeralRlmSessionDir();
 			void this._startDisposeCallbacks();
 		}
 	}
@@ -12533,7 +12538,30 @@ export class AgentSession {
 
 	private _createEphemeralRlmSessionDir(): string {
 		this._rlmSessionDir = mkdtempSync(join(tmpdir(), "prime-agent-rlm-"));
+		this._rlmSessionDirEphemeral = true;
 		return this._rlmSessionDir;
+	}
+
+	/**
+	 * R31-8/RC-6: remove the ephemeral `prime-agent-rlm-*` temp directory at
+	 * dispose. Nothing durable ever referenced it (an in-memory parent has no
+	 * artifact dir; children and harness state live inside it), so keeping it
+	 * was a per-session leak - 314 measured on one machine, all empty.
+	 */
+	private _removeEphemeralRlmSessionDir(): void {
+		const directory = this._rlmSessionDirEphemeral ? this._rlmSessionDir : undefined;
+		if (!directory) return;
+		this._rlmSessionDir = undefined;
+		this._rlmSessionDirEphemeral = false;
+		try {
+			rmSync(directory, { recursive: true, force: true });
+		} catch (error) {
+			sessionLog.warn("failed to remove the ephemeral RLM session directory", {
+				sessionId: this.sessionId,
+				sessionDir: directory,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 	}
 
 	_contextTokensForCurrentMessages(): number | undefined {

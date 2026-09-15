@@ -346,8 +346,8 @@ export class RlmSpawnLedger {
 	}
 
 	appendRename(input: { childId: string; child: string; name: string }): Promise<void> {
-		return this.enqueue(() => {
-			this.appendRecord({
+		return this.enqueue(async () => {
+			await this.appendRecord({
 				v: 1,
 				op: "rename",
 				at: nowIso(),
@@ -360,19 +360,26 @@ export class RlmSpawnLedger {
 
 	/** Rename by child session path alone (offline saved-session rename knows no childId). */
 	appendRenameByChildPath(child: string, name: string): Promise<void> {
-		return this.enqueue(() => {
+		return this.enqueue(async () => {
 			const target = canonicalSessionPath(child);
 			for (const edge of this.replaySync().values()) {
 				if (!edge.deleted && canonicalSessionPath(edge.child) === target) {
-					this.appendRecord({ v: 1, op: "rename", at: nowIso(), childId: edge.childId, child: target, name });
+					await this.appendRecord({
+						v: 1,
+						op: "rename",
+						at: nowIso(),
+						childId: edge.childId,
+						child: target,
+						name,
+					});
 				}
 			}
 		});
 	}
 
 	appendDelete(input: { childId: string; child: string; reason: RlmLedgerDeleteReason }): Promise<void> {
-		return this.enqueue(() => {
-			this.appendRecord({
+		return this.enqueue(async () => {
+			await this.appendRecord({
 				v: 1,
 				op: "delete",
 				at: nowIso(),
@@ -468,13 +475,13 @@ export class RlmSpawnLedger {
 		return next;
 	}
 
-	private appendSpawnUnlocked(input: {
+	private async appendSpawnUnlocked(input: {
 		childId: string;
 		parent: string;
 		child: string;
 		depth: number;
 		name: string;
-	}): void {
+	}): Promise<void> {
 		// Enforce the same invariants parseLedgerLine checks: never write a
 		// record this reader would refuse to read back.
 		if (!input.childId || !input.parent || !input.child || !Number.isSafeInteger(input.depth) || input.depth < 1) {
@@ -491,7 +498,7 @@ export class RlmSpawnLedger {
 				throw new Error(`RLM ledger: duplicate child session path ${childPath} (already ${edge.childId})`);
 			}
 		}
-		this.appendRecord({
+		await this.appendRecord({
 			v: 1,
 			op: "spawn",
 			at: nowIso(),
@@ -745,12 +752,15 @@ export class RlmSpawnLedger {
 		}
 	}
 
-	private appendRecord(record: RlmLedgerRecord): void {
+	private async appendRecord(record: RlmLedgerRecord): Promise<void> {
 		// A stat cannot distinguish an append that lands within the filesystem's
 		// mtime granularity, and our own writes are the one case we can rule out
 		// for free.
 		this.replayCache = undefined;
-		this.eventLog.appendSync([record], {
+		// appendAsync (R31-13): the torn-tail observation no longer sleeps the
+		// event loop, and an append refused against a live foreign writer is
+		// retried once instead of being lost.
+		await this.eventLog.appendAsync([record], {
 			durable: true,
 			onCreate: () => [
 				{ v: 1, op: "meta", at: nowIso(), sessionsDir: this.canonicalSessionsDir } satisfies RlmLedgerMetaRecord,

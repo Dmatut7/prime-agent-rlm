@@ -25,7 +25,7 @@ vi.mock("proper-lockfile", () => {
 import { acquireDaemonUpdateRestartCoordinator } from "../src/cli/daemon-update-restart.js";
 import { FileAuthStorageBackend } from "../src/core/auth-storage.js";
 import { AgentCronJobStore } from "../src/core/cron-jobs.js";
-import { acquireSessionLease, SESSION_LEASES_ENABLED_ENV } from "../src/core/session-lease.js";
+import { acquireSessionLeaseAsync, SESSION_LEASES_ENABLED_ENV } from "../src/core/session-lease.js";
 import { FileSettingsStorage } from "../src/core/settings-manager.js";
 import {
 	acquireDaemonSocketPathLease,
@@ -160,12 +160,12 @@ describe("proper-lockfile compromise boundaries", () => {
 		expect(readdirSync(registryDir).filter((name) => name.endsWith(".json"))).toEqual([]);
 	});
 
-	it("does not create a session lease after its guard is compromised", () => {
+	it("does not create a session lease after its guard is compromised", async () => {
 		lockState.compromiseSync = true;
 		const agentDir = tempDir("pa-lock-session-");
-		expect(() =>
-			acquireSessionLease(join(agentDir, "session.jsonl"), agentDir, { [SESSION_LEASES_ENABLED_ENV]: "1" }),
-		).toThrow(/Session lease guard was compromised/);
+		await expect(
+			acquireSessionLeaseAsync(join(agentDir, "session.jsonl"), agentDir, { [SESSION_LEASES_ENABLED_ENV]: "1" }),
+		).rejects.toThrow(/Session lease guard was compromised/);
 		expect(readdirSync(join(agentDir, "session-leases"))).toEqual([]);
 	});
 

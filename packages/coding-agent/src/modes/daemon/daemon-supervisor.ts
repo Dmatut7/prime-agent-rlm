@@ -1078,6 +1078,113 @@ function workerSocketPath(supervisorSocketPath: string, workerId: string): strin
 	return join(defaultDaemonSocketDir(), `worker-${key}-${workerId.slice(0, 12)}.sock`);
 }
 
+/**
+ * How old a worker socket with no descriptor behind it must be before the
+ * sweep dares to remove it (R31-5): the DAT-3 precedent (stale compaction
+ * temps, orphan-process-journal.ts) — a young orphaned socket may belong to a
+ * worker whose descriptor write is still in flight, so only the provably dead
+ * (pid gone) or the provably old (past the gate) are removed.
+ */
+export const STALE_WORKER_SOCKET_MAX_AGE_MS = 60_000;
+
+export interface WorkerSocketSweepResult {
+	removed: string[];
+	/** Kept entries with the reason, so the supervisor log shows the verdicts. */
+	kept: Array<{ path: string; reason: string }>;
+}
+
+/**
+ * Sweep stale `worker-*.sock` files this supervisor's socket dir (R31-5):
+ * a SIGKILLed worker cannot run its own exit cleanup, so its socket file
+ * accumulates forever otherwise (59 measured on one machine).
+ *
+ * Removal rules, in order:
+ * 1. A descriptor names the socket and that pid is dead -> remove (the worker
+ *    is gone; a relaunch re-binds the path after prepareDaemonSocketPath
+ *    unlinks the stale file).
+ * 2. A descriptor names the socket and that pid is alive -> keep (a live
+ *    worker owns the bound socket file; unlinking it would break the worker).
+ * 3. No descriptor names the socket: keep while younger than
+ *    {@link STALE_WORKER_SOCKET_MAX_AGE_MS} (spawn-in-flight window), remove
+ *    once past the age gate.
+ *
+ * Unknown-alive never deletes: `isProcessAlive` fail-closes to "alive" on
+ * EPERM, and a pid reused by another process reads as alive, which keeps the
+ * (harmless) file rather than risking a live worker's socket.
+ */
+export function sweepStaleWorkerSockets(options: {
+	supervisorSocketPath: string;
+	descriptorDir: string;
+	socketDir?: string;
+	isProcessAlive?: (pid: number) => boolean;
+	now?: number;
+}): WorkerSocketSweepResult {
+	if (process.platform === "win32") {
+		return { removed: [], kept: [] };
+	}
+	const key = descriptorKey(options.supervisorSocketPath);
+	const socketDir = options.socketDir ?? defaultDaemonSocketDir();
+	const pidAlive = options.isProcessAlive ?? isProcessAlive;
+	const now = options.now ?? Date.now();
+	const prefix = `worker-${key}-`;
+
+	const pidBySocketPath = new Map<string, number>();
+	try {
+		for (const name of readdirSync(options.descriptorDir)) {
+			if (name === SUPERVISOR_CONFIG_FILE_NAME || !name.endsWith(".json")) continue;
+			let descriptor: unknown;
+			try {
+				descriptor = JSON.parse(readFileSync(join(options.descriptorDir, name), "utf8"));
+			} catch {
+				continue;
+			}
+			if (!isDaemonWorkerDescriptorShape(descriptor)) continue;
+			pidBySocketPath.set(descriptor.socketPath, descriptor.pid);
+		}
+	} catch {
+		// An unreadable descriptor dir cannot prove anything dead; sweep nothing.
+		return { removed: [], kept: [] };
+	}
+
+	const result: WorkerSocketSweepResult = { removed: [], kept: [] };
+	let names: string[];
+	try {
+		names = readdirSync(socketDir);
+	} catch {
+		return result;
+	}
+	for (const name of names) {
+		if (!name.startsWith(prefix) || !name.endsWith(".sock")) continue;
+		const path = join(socketDir, name);
+		const pid = pidBySocketPath.get(path);
+		if (pid !== undefined) {
+			if (pidAlive(pid)) {
+				result.kept.push({ path, reason: `live worker pid ${pid}` });
+				continue;
+			}
+			try {
+				rmSync(path, { force: true });
+				result.removed.push(path);
+			} catch {
+				result.kept.push({ path, reason: "removal failed" });
+			}
+			continue;
+		}
+		try {
+			const ageMs = now - statSync(path).mtimeMs;
+			if (ageMs < STALE_WORKER_SOCKET_MAX_AGE_MS) {
+				result.kept.push({ path, reason: `orphaned but young (${Math.round(ageMs / 1000)}s)` });
+				continue;
+			}
+			rmSync(path, { force: true });
+			result.removed.push(path);
+		} catch {
+			// A socket that vanished mid-sweep is already gone.
+		}
+	}
+	return result;
+}
+
 function isFinalizedTranscriptEvent(eventType: string | undefined): boolean {
 	return (
 		eventType === "message_end" ||
@@ -1269,6 +1376,10 @@ export class DaemonSupervisor {
 			mkdirSync(this.snapshotCacheRoot, { recursive: true, mode: 0o700 });
 			this.commandJournal = new CommandRecoveryJournal(join(this.descriptorDir, "command-journal.jsonl"));
 			this.loadWorkerDescriptors();
+			// R31-5: workers SIGKILLed under a previous supervisor never cleaned their
+			// socket files; adoption of their descriptors is the moment their pids can
+			// be judged dead, so sweep the leftovers now.
+			this.sweepStaleWorkerSockets("supervisor startup");
 			this.restorePreparedUpdateRestartState();
 			const workersToAdopt = [...this.workers.values()];
 
@@ -2097,6 +2208,36 @@ export class DaemonSupervisor {
 			}
 		} catch (error) {
 			this.log(`Failed to remove worker descriptor ${worker.descriptorPath}: ${String(error)}`);
+		}
+		// R31-5: a descriptor removal finalizes a worker death, and a SIGKILLed
+		// worker never ran its own exit cleanup. The descriptor was the only
+		// registry entry naming this socket, so remove the file now that the pid
+		// behind it is provably dead; a live pid keeps the file (another worker
+		// may own it, and unlinking a bound socket breaks it).
+		this.removeDeadWorkerSocket(worker.descriptor);
+	}
+
+	private removeDeadWorkerSocket(descriptor: DaemonWorkerDescriptor): void {
+		if (process.platform === "win32") return;
+		if (isProcessAlive(descriptor.pid)) return;
+		try {
+			if (existsSync(descriptor.socketPath)) {
+				rmSync(descriptor.socketPath, { force: true });
+				this.log(`Removed stale worker socket ${descriptor.socketPath} (pid ${descriptor.pid} is gone)`);
+			}
+		} catch (error) {
+			this.log(`Could not remove stale worker socket ${descriptor.socketPath}: ${String(error)}`);
+		}
+	}
+
+	/** Sweep every stale `worker-*.sock` of this supervisor (R31-5); see {@link sweepStaleWorkerSockets}. */
+	private sweepStaleWorkerSockets(reason: string): void {
+		const result = sweepStaleWorkerSockets({
+			supervisorSocketPath: this.socketPath,
+			descriptorDir: this.descriptorDir,
+		});
+		for (const removal of result.removed) {
+			this.log(`Swept stale worker socket ${removal} (${reason})`);
 		}
 	}
 

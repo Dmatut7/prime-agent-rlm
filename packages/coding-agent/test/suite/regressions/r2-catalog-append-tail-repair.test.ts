@@ -20,7 +20,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ENV_AGENT_DIR } from "../../../src/config.js";
-import { acquireSessionLease, SESSION_LEASES_ENABLED_ENV, type SessionLease } from "../../../src/core/session-lease.js";
+import {
+	acquireSessionLeaseAsync,
+	SESSION_LEASES_ENABLED_ENV,
+	type SessionLease,
+} from "../../../src/core/session-lease.js";
 import { CURRENT_SESSION_VERSION, readSessionInfo } from "../../../src/core/session-manager.js";
 import { DaemonCatalogClient } from "../../../src/modes/daemon/daemon-catalog-process.js";
 
@@ -122,7 +126,7 @@ describe("daemon catalog appends under a session lease", () => {
 		expect(facts.lastEntry?.state).toEqual({ status: "archived" });
 
 		// The append releases the lease in `finally`: this process can take it now.
-		const released = acquireSessionLease(sessionFile, agentDir, {
+		const released = await acquireSessionLeaseAsync(sessionFile, agentDir, {
 			...process.env,
 			[SESSION_LEASES_ENABLED_ENV]: "1",
 		});
@@ -164,7 +168,7 @@ describe("daemon catalog appends under a session lease", () => {
 		const { client, agentDir } = startCatalog();
 		const sessionFile = writeTornTranscript(agentDir);
 		// This test process stands in for the live session worker that owns the file.
-		const lease = acquireSessionLease(sessionFile, agentDir, {
+		const lease = await acquireSessionLeaseAsync(sessionFile, agentDir, {
 			...process.env,
 			[SESSION_LEASES_ENABLED_ENV]: "1",
 		});
