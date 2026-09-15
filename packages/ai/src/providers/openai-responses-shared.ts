@@ -3,15 +3,16 @@ import type {
 	Tool as OpenAITool,
 	ResponseCreateParamsStreaming,
 	ResponseFunctionCallOutputItemList,
-	ResponseFunctionToolCall,
 	ResponseInput,
 	ResponseInputContent,
 	ResponseInputImage,
 	ResponseInputText,
+	ResponseOutputItem,
 	ResponseOutputMessage,
 	ResponseReasoningItem,
 	ResponseStreamEvent,
 } from "openai/resources/responses/responses.js";
+import { getLogger } from "../log.js";
 import { calculateCost } from "../models.js";
 import type {
 	Api,
@@ -27,6 +28,7 @@ import type {
 	ToolCall,
 	Usage,
 } from "../types.js";
+import { appendAssistantMessageDiagnostic } from "../utils/diagnostics.js";
 import type { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { shortHash } from "../utils/hash.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
@@ -273,10 +275,100 @@ export async function processResponsesStream<TApi extends Api>(
 	model: Model<TApi>,
 	options?: OpenAIResponsesStreamOptions,
 ): Promise<void> {
-	let currentItem: ResponseReasoningItem | ResponseOutputMessage | ResponseFunctionToolCall | null = null;
-	let currentBlock: ThinkingContent | TextContent | (ToolCall & { partialJson: string }) | null = null;
+	type Item = ResponseOutputItem;
+	type Block = ThinkingContent | TextContent | (ToolCall & { partialJson: string });
+	let currentItem: Item | null = null;
+	let currentBlock: Block | null = null;
 	const blocks = output.content;
 	const blockIndex = () => blocks.length - 1;
+	const indexOfBlock = (block: Block): number => blocks.indexOf(block);
+
+	const log = getLogger("ai.provider");
+	// The Responses protocol tags every item-scoped event with item_id/output_index,
+	// but some gateways replay events interleaved or without those coordinates.
+	// Every recovery below is persisted as a message diagnostic so a mangled
+	// stream is never silent (same contract as the completions tool-call recovery).
+	const recordDeltaDiagnostic = (type: string, details: Record<string, unknown>): void => {
+		appendAssistantMessageDiagnostic(output, { type, timestamp: Date.now(), details });
+		log.warn("openai responses stream event recovery", {
+			provider: model.provider,
+			model: model.id,
+			type,
+			...details,
+		});
+	};
+
+	interface ResponsesItemSlot {
+		item: Item;
+		block: Block | null;
+		itemId: string | undefined;
+		outputIndex: number | undefined;
+	}
+	const slotsByItemId = new Map<string, ResponsesItemSlot>();
+	const slotsByOutputIndex = new Map<number, ResponsesItemSlot>();
+
+	const releaseSlot = (slot: ResponsesItemSlot): void => {
+		if (slot.itemId !== undefined && slotsByItemId.get(slot.itemId) === slot) {
+			slotsByItemId.delete(slot.itemId);
+		}
+		if (slot.outputIndex !== undefined && slotsByOutputIndex.get(slot.outputIndex) === slot) {
+			slotsByOutputIndex.delete(slot.outputIndex);
+		}
+	};
+
+	const registerSlot = (slot: ResponsesItemSlot): void => {
+		if (slot.itemId !== undefined) {
+			const existing = slotsByItemId.get(slot.itemId);
+			if (existing && existing !== slot) {
+				releaseSlot(existing);
+			}
+			slotsByItemId.set(slot.itemId, slot);
+		}
+		if (slot.outputIndex !== undefined) {
+			const existing = slotsByOutputIndex.get(slot.outputIndex);
+			if (existing && existing !== slot) {
+				releaseSlot(existing);
+			}
+			slotsByOutputIndex.set(slot.outputIndex, slot);
+		}
+	};
+
+	interface ItemScopedCoordinates {
+		readonly itemId: string | undefined;
+		readonly outputIndex: number | undefined;
+	}
+	const itemScoped = (event: ResponseStreamEvent): ItemScopedCoordinates => {
+		const scoped = event as { item_id?: unknown; output_index?: unknown };
+		return {
+			itemId: typeof scoped.item_id === "string" ? scoped.item_id : undefined,
+			outputIndex: typeof scoped.output_index === "number" ? scoped.output_index : undefined,
+		};
+	};
+
+	// Resolution order: item_id, then output_index, then the legacy last-added
+	// slot. Events without either coordinate cannot be dispatched any other way.
+	const resolveItemAndBlock = (event: ResponseStreamEvent): { item: Item | null; block: Block | null } => {
+		const { itemId, outputIndex } = itemScoped(event);
+		if (itemId !== undefined) {
+			const slot = slotsByItemId.get(itemId);
+			if (slot) {
+				return { item: slot.item, block: slot.block };
+			}
+			return { item: null, block: null };
+		}
+		if (outputIndex !== undefined) {
+			const slot = slotsByOutputIndex.get(outputIndex);
+			if (slot) {
+				return { item: slot.item, block: slot.block };
+			}
+		}
+		return { item: currentItem, block: currentBlock };
+	};
+
+	const recordUnroutedDiagnostic = (event: ResponseStreamEvent): void => {
+		const { itemId, outputIndex } = itemScoped(event);
+		recordDeltaDiagnostic("responses_delta_unrouted", { eventType: event.type, itemId, outputIndex });
+	};
 
 	// Mid-stream parses are throttled and callers strip the partialJson scratch on
 	// their error paths. Run the authoritative final parse when iteration ends
@@ -295,14 +387,24 @@ export async function processResponsesStream<TApi extends Api>(
 			output.responseId = event.response.id;
 		} else if (event.type === "response.output_item.added") {
 			const item = event.item;
+			const { outputIndex } = itemScoped(event);
+			const slot: ResponsesItemSlot = {
+				item,
+				block: null,
+				itemId: typeof item.id === "string" ? item.id : undefined,
+				outputIndex,
+			};
+			registerSlot(slot);
 			if (item.type === "reasoning") {
 				currentItem = item;
 				currentBlock = { type: "thinking", thinking: "" };
+				slot.block = currentBlock;
 				output.content.push(currentBlock);
 				stream.push({ type: "thinking_start", contentIndex: blockIndex(), partial: output });
 			} else if (item.type === "message") {
 				currentItem = item;
 				currentBlock = { type: "text", text: "" };
+				slot.block = currentBlock;
 				output.content.push(currentBlock);
 				stream.push({ type: "text_start", contentIndex: blockIndex(), partial: output });
 			} else if (item.type === "function_call") {
@@ -314,166 +416,215 @@ export async function processResponsesStream<TApi extends Api>(
 					arguments: {},
 					partialJson: item.arguments || "",
 				};
+				slot.block = currentBlock;
 				output.content.push(currentBlock);
 				stream.push({ type: "toolcall_start", contentIndex: blockIndex(), partial: output });
 			}
 		} else if (event.type === "response.reasoning_summary_part.added") {
-			if (currentItem && currentItem.type === "reasoning") {
-				currentItem.summary = currentItem.summary || [];
-				currentItem.summary.push(event.part);
+			const { item } = resolveItemAndBlock(event);
+			if (item?.type === "reasoning") {
+				item.summary = item.summary || [];
+				item.summary.push(event.part);
+			} else {
+				recordUnroutedDiagnostic(event);
 			}
 		} else if (event.type === "response.reasoning_summary_text.delta") {
-			if (currentItem?.type === "reasoning" && currentBlock?.type === "thinking") {
-				currentItem.summary = currentItem.summary || [];
-				const lastPart = currentItem.summary[currentItem.summary.length - 1];
-				if (lastPart) {
-					currentBlock.thinking += event.delta;
-					lastPart.text += event.delta;
-					stream.push({
-						type: "thinking_delta",
-						contentIndex: blockIndex(),
-						delta: event.delta,
-						partial: output,
-					});
+			const { item, block } = resolveItemAndBlock(event);
+			if (item?.type === "reasoning" && block?.type === "thinking") {
+				item.summary = item.summary || [];
+				let lastPart = item.summary[item.summary.length - 1];
+				if (!lastPart) {
+					// Upstream skipped summary_part.added; recover by starting the
+					// part from the delta so the thinking stream is not empty.
+					lastPart = { type: "summary_text", text: "" };
+					item.summary.push(lastPart);
+					recordDeltaDiagnostic("responses_summary_part_recovered", { itemId: item.id });
 				}
+				block.thinking += event.delta;
+				lastPart.text += event.delta;
+				stream.push({
+					type: "thinking_delta",
+					contentIndex: indexOfBlock(block),
+					delta: event.delta,
+					partial: output,
+				});
+			} else {
+				recordUnroutedDiagnostic(event);
 			}
 		} else if (event.type === "response.reasoning_summary_part.done") {
-			if (currentItem?.type === "reasoning" && currentBlock?.type === "thinking") {
-				currentItem.summary = currentItem.summary || [];
-				const lastPart = currentItem.summary[currentItem.summary.length - 1];
+			const { item, block } = resolveItemAndBlock(event);
+			if (item?.type === "reasoning" && block?.type === "thinking") {
+				item.summary = item.summary || [];
+				const lastPart = item.summary[item.summary.length - 1];
 				if (lastPart) {
-					currentBlock.thinking += "\n\n";
+					block.thinking += "\n\n";
 					lastPart.text += "\n\n";
 					stream.push({
 						type: "thinking_delta",
-						contentIndex: blockIndex(),
+						contentIndex: indexOfBlock(block),
 						delta: "\n\n",
 						partial: output,
 					});
 				}
 			}
 		} else if (event.type === "response.reasoning_text.delta") {
-			if (currentItem?.type === "reasoning" && currentBlock?.type === "thinking") {
-				currentBlock.thinking += event.delta;
+			const { item, block } = resolveItemAndBlock(event);
+			if (item?.type === "reasoning" && block?.type === "thinking") {
+				block.thinking += event.delta;
 				stream.push({
 					type: "thinking_delta",
-					contentIndex: blockIndex(),
+					contentIndex: indexOfBlock(block),
 					delta: event.delta,
 					partial: output,
 				});
+			} else {
+				recordUnroutedDiagnostic(event);
 			}
 		} else if (event.type === "response.content_part.added") {
-			if (currentItem?.type === "message") {
-				currentItem.content = currentItem.content || [];
+			const { item } = resolveItemAndBlock(event);
+			if (item?.type === "message") {
+				item.content = item.content || [];
 				if (event.part.type === "output_text" || event.part.type === "refusal") {
-					currentItem.content.push(event.part);
+					item.content.push(event.part);
 				}
+			} else {
+				recordUnroutedDiagnostic(event);
 			}
 		} else if (event.type === "response.output_text.delta") {
-			if (currentItem?.type === "message" && currentBlock?.type === "text") {
-				if (!currentItem.content || currentItem.content.length === 0) {
-					continue;
+			const { item, block } = resolveItemAndBlock(event);
+			if (item?.type === "message" && block?.type === "text") {
+				item.content = item.content || [];
+				let lastPart = item.content[item.content.length - 1];
+				if (!lastPart) {
+					// Upstream skipped content_part.added; recover by starting the
+					// part from the delta so the text stream is not empty.
+					lastPart = { type: "output_text", text: "", annotations: [] };
+					item.content.push(lastPart);
+					recordDeltaDiagnostic("responses_content_part_recovered", { itemId: item.id });
 				}
-				const lastPart = currentItem.content[currentItem.content.length - 1];
-				if (lastPart?.type === "output_text") {
-					currentBlock.text += event.delta;
+				if (lastPart.type === "output_text") {
+					block.text += event.delta;
 					lastPart.text += event.delta;
 					stream.push({
 						type: "text_delta",
-						contentIndex: blockIndex(),
+						contentIndex: indexOfBlock(block),
 						delta: event.delta,
 						partial: output,
 					});
 				}
+			} else {
+				recordUnroutedDiagnostic(event);
 			}
 		} else if (event.type === "response.refusal.delta") {
-			if (currentItem?.type === "message" && currentBlock?.type === "text") {
-				if (!currentItem.content || currentItem.content.length === 0) {
-					continue;
+			const { item, block } = resolveItemAndBlock(event);
+			if (item?.type === "message" && block?.type === "text") {
+				item.content = item.content || [];
+				let lastPart = item.content[item.content.length - 1];
+				if (!lastPart) {
+					lastPart = { type: "refusal", refusal: "" };
+					item.content.push(lastPart);
+					recordDeltaDiagnostic("responses_content_part_recovered", { itemId: item.id });
 				}
-				const lastPart = currentItem.content[currentItem.content.length - 1];
-				if (lastPart?.type === "refusal") {
-					currentBlock.text += event.delta;
+				if (lastPart.type === "refusal") {
+					block.text += event.delta;
 					lastPart.refusal += event.delta;
 					stream.push({
 						type: "text_delta",
-						contentIndex: blockIndex(),
+						contentIndex: indexOfBlock(block),
 						delta: event.delta,
 						partial: output,
 					});
 				}
+			} else {
+				recordUnroutedDiagnostic(event);
 			}
 		} else if (event.type === "response.function_call_arguments.delta") {
-			if (currentItem?.type === "function_call" && currentBlock?.type === "toolCall") {
-				currentBlock.partialJson += event.delta;
+			const { item, block } = resolveItemAndBlock(event);
+			if (item?.type === "function_call" && block?.type === "toolCall") {
+				block.partialJson += event.delta;
 				// Throttled mid-stream parse; the arguments.done/output_item.done parses are authoritative.
-				const parsedArgs = updateThrottledStreamingJson(currentBlock, currentBlock.partialJson);
+				const parsedArgs = updateThrottledStreamingJson(block, block.partialJson);
 				if (parsedArgs) {
-					currentBlock.arguments = parsedArgs;
+					block.arguments = parsedArgs;
 				}
 				stream.push({
 					type: "toolcall_delta",
-					contentIndex: blockIndex(),
+					contentIndex: indexOfBlock(block),
 					delta: event.delta,
 					partial: output,
 				});
+			} else {
+				recordUnroutedDiagnostic(event);
 			}
 		} else if (event.type === "response.function_call_arguments.done") {
-			if (currentItem?.type === "function_call" && currentBlock?.type === "toolCall") {
-				const previousPartialJson = currentBlock.partialJson;
-				currentBlock.partialJson = event.arguments;
-				currentBlock.arguments = parseStreamingJson(currentBlock.partialJson);
+			const { item, block } = resolveItemAndBlock(event);
+			if (item?.type === "function_call" && block?.type === "toolCall") {
+				const previousPartialJson = block.partialJson;
+				block.partialJson = event.arguments;
+				block.arguments = parseStreamingJson(block.partialJson);
 
 				if (event.arguments.startsWith(previousPartialJson)) {
 					const delta = event.arguments.slice(previousPartialJson.length);
 					if (delta.length > 0) {
 						stream.push({
 							type: "toolcall_delta",
-							contentIndex: blockIndex(),
+							contentIndex: indexOfBlock(block),
 							delta,
 							partial: output,
 						});
 					}
 				}
+			} else {
+				recordUnroutedDiagnostic(event);
 			}
 		} else if (event.type === "response.output_item.done") {
 			const item = event.item;
+			const { outputIndex } = itemScoped(event);
+			let slot: ResponsesItemSlot | null = null;
+			if (typeof item.id === "string") {
+				slot = slotsByItemId.get(item.id) ?? null;
+			}
+			if (!slot && outputIndex !== undefined) {
+				slot = slotsByOutputIndex.get(outputIndex) ?? null;
+			}
+			const block: Block | null = slot?.block ?? currentBlock;
 
-			if (item.type === "reasoning" && currentBlock?.type === "thinking") {
+			if (item.type === "reasoning" && block?.type === "thinking") {
 				const summaryText = item.summary?.map((s) => s.text).join("\n\n") || "";
 				const contentText = item.content?.map((c) => c.text).join("\n\n") || "";
-				currentBlock.thinking = summaryText || contentText || currentBlock.thinking;
-				currentBlock.thinkingSignature = JSON.stringify(item);
+				block.thinking = summaryText || contentText || block.thinking;
+				block.thinkingSignature = JSON.stringify(item);
 				stream.push({
 					type: "thinking_end",
-					contentIndex: blockIndex(),
-					content: currentBlock.thinking,
+					contentIndex: indexOfBlock(block),
+					content: block.thinking,
 					partial: output,
 				});
-				currentBlock = null;
-			} else if (item.type === "message" && currentBlock?.type === "text") {
-				currentBlock.text = item.content.map((c) => (c.type === "output_text" ? c.text : c.refusal)).join("");
-				currentBlock.textSignature = encodeTextSignatureV1(item.id, item.phase ?? undefined);
+			} else if (item.type === "message" && block?.type === "text") {
+				const payloadText = item.content.map((c) => (c.type === "output_text" ? c.text : c.refusal)).join("");
+				// An empty done payload must not wipe text recovered from deltas
+				// that arrived without content_part.added.
+				block.text = payloadText || block.text;
+				block.textSignature = encodeTextSignatureV1(item.id, item.phase ?? undefined);
 				stream.push({
 					type: "text_end",
-					contentIndex: blockIndex(),
-					content: currentBlock.text,
+					contentIndex: indexOfBlock(block),
+					content: block.text,
 					partial: output,
 				});
-				currentBlock = null;
 			} else if (item.type === "function_call") {
 				const args =
-					currentBlock?.type === "toolCall" && currentBlock.partialJson
-						? parseStreamingJson(currentBlock.partialJson)
+					block?.type === "toolCall" && block.partialJson
+						? parseStreamingJson(block.partialJson)
 						: parseStreamingJson(item.arguments || "{}");
 
 				let toolCall: ToolCall;
-				if (currentBlock?.type === "toolCall") {
+				if (block?.type === "toolCall") {
 					// Finalize in-place and strip the scratch buffer so replay only
 					// carries parsed arguments.
-					currentBlock.arguments = args;
-					delete (currentBlock as { partialJson?: string }).partialJson;
-					toolCall = currentBlock;
+					block.arguments = args;
+					delete (block as { partialJson?: string }).partialJson;
+					toolCall = block;
 				} else {
 					toolCall = {
 						type: "toolCall",
@@ -483,8 +634,20 @@ export async function processResponsesStream<TApi extends Api>(
 					};
 				}
 
+				stream.push({
+					type: "toolcall_end",
+					contentIndex: block ? indexOfBlock(block) : blockIndex(),
+					toolCall,
+					partial: output,
+				});
+			}
+
+			if (slot) {
+				releaseSlot(slot);
+				slot.block = null;
+			}
+			if (block && currentBlock === block) {
 				currentBlock = null;
-				stream.push({ type: "toolcall_end", contentIndex: blockIndex(), toolCall, partial: output });
 			}
 		} else if (event.type === "response.completed") {
 			const response = event.response;

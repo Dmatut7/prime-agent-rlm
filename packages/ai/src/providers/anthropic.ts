@@ -28,6 +28,7 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.js";
+import { appendAssistantMessageDiagnostic } from "../utils/diagnostics.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
 import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse.js";
@@ -475,12 +476,18 @@ async function* iterateAnthropicEvents(
 	response: Response,
 	signal?: AbortSignal,
 	requestId?: string,
+	onFrameWithoutEvent?: (frame: ServerSentEvent) => void,
 ): AsyncGenerator<RawMessageStreamEvent> {
 	if (!response.body) {
 		throw new Error("Attempted to iterate over an Anthropic response with no body");
 	}
 
-	let sawMessageStart = false;
+	// Truncation detection activates on any data frame, not only after
+	// message_start: a proxy that strips the `event:` line leaves every frame
+	// undeliverable, and that must surface as a failure instead of an empty
+	// success. Frames missing the event line are reported through the callback
+	// so the loss stays attributable.
+	let sawDataFrame = false;
 	let sawMessageEnd = false;
 
 	for await (const sse of iterateSseMessages(response.body, signal)) {
@@ -488,15 +495,22 @@ async function* iterateAnthropicEvents(
 			throw anthropicSseError(sse.data, requestId);
 		}
 
-		if (!ANTHROPIC_MESSAGE_EVENTS.has(sse.event ?? "")) {
+		if (sse.data.length > 0) {
+			sawDataFrame = true;
+		}
+
+		if (sse.event === null) {
+			onFrameWithoutEvent?.(sse);
+			continue;
+		}
+
+		if (!ANTHROPIC_MESSAGE_EVENTS.has(sse.event)) {
 			continue;
 		}
 
 		try {
 			const event = parseJsonWithRepair<RawMessageStreamEvent>(sse.data);
-			if (event.type === "message_start") {
-				sawMessageStart = true;
-			} else if (event.type === "message_stop") {
+			if (event.type === "message_stop") {
 				sawMessageEnd = true;
 			}
 			yield event;
@@ -509,7 +523,7 @@ async function* iterateAnthropicEvents(
 		}
 	}
 
-	if (sawMessageStart && !sawMessageEnd) {
+	if (sawDataFrame && !sawMessageEnd) {
 		throw new StreamFailureError("Anthropic stream ended before message_stop", {
 			kind: "malformed_response",
 			requestId,
@@ -599,11 +613,14 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			const requestId = response.headers.get("request-id") ?? undefined;
 			stream.push({ type: "start", partial: output });
+			let sseFramesWithoutEvent = 0;
 
 			type Block = (ThinkingContent | TextContent | (ToolCall & { partialJson: string })) & { index: number };
 			const blocks = output.content as Block[];
 
-			for await (const event of iterateAnthropicEvents(response, options?.signal, requestId)) {
+			for await (const event of iterateAnthropicEvents(response, options?.signal, requestId, () => {
+				sseFramesWithoutEvent += 1;
+			})) {
 				if (event.type === "message_start") {
 					output.responseId = event.message.id;
 					// Capture initial token usage from message_start event
@@ -779,6 +796,14 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 						cacheWriteCost === undefined ? undefined : { cacheWrite: cacheWriteCost },
 					);
 				}
+			}
+
+			if (sseFramesWithoutEvent > 0) {
+				appendAssistantMessageDiagnostic(output, {
+					type: "anthropic_sse_frame_without_event",
+					timestamp: Date.now(),
+					details: { frames: sseFramesWithoutEvent },
+				});
 			}
 
 			if (options?.signal?.aborted) {

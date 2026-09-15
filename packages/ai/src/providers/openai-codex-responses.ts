@@ -519,6 +519,7 @@ function isCodexNonTransportError(error: unknown): boolean {
 }
 
 async function* mapCodexEvents(events: AsyncIterable<Record<string, unknown>>): AsyncGenerator<ResponseStreamEvent> {
+	let sawTerminalEvent = false;
 	for await (const event of events) {
 		const type = typeof event.type === "string" ? event.type : undefined;
 		if (!type) continue;
@@ -540,6 +541,7 @@ async function* mapCodexEvents(events: AsyncIterable<Record<string, unknown>>): 
 		}
 
 		if (type === "response.done" || type === "response.completed" || type === "response.incomplete") {
+			sawTerminalEvent = true;
 			const response = (event as { response?: { status?: unknown } }).response;
 			const normalizedResponse = response
 				? { ...response, status: normalizeCodexStatus(response.status) }
@@ -550,11 +552,37 @@ async function* mapCodexEvents(events: AsyncIterable<Record<string, unknown>>): 
 
 		yield event as unknown as ResponseStreamEvent;
 	}
+
+	if (!sawTerminalEvent) {
+		// Mirrors the WebSocket close guard: a stream that never delivered a
+		// terminal response event must not be reported as a normal completion.
+		throw new CodexProtocolError("SSE stream closed before response.completed");
+	}
 }
 
 function normalizeCodexStatus(status: unknown): CodexResponseStatus | undefined {
 	if (typeof status !== "string") return undefined;
 	return CODEX_RESPONSE_STATUSES.has(status as CodexResponseStatus) ? (status as CodexResponseStatus) : undefined;
+}
+
+function* parseSseFrame(chunk: string): Generator<Record<string, unknown>> {
+	const dataLines = chunk
+		.split("\n")
+		.filter((l) => l.startsWith("data:"))
+		.map((l) => l.slice(5).trim());
+	if (dataLines.length === 0) return;
+
+	const data = dataLines.join("\n").trim();
+	if (!data || data === "[DONE]") return;
+
+	try {
+		yield JSON.parse(data) as Record<string, unknown>;
+	} catch (cause) {
+		throw new CodexProtocolError(`Invalid Codex SSE JSON: ${formatThrownValue(cause)}`, {
+			cause,
+			payload: data,
+		});
+	}
 }
 
 async function* parseSSE(response: Response): AsyncGenerator<Record<string, unknown>> {
@@ -564,36 +592,42 @@ async function* parseSSE(response: Response): AsyncGenerator<Record<string, unkn
 	const decoder = new TextDecoder();
 	let buffer = "";
 
+	// SSE permits \r\n line terminators; normalize to \n so frame and line
+	// splitting only ever sees one form (same contract as the Anthropic decoder).
+	// Re-running the replace over the whole buffer also joins a \r that landed at
+	// the end of one chunk with the \n that opens the next.
+	const appendDecoded = (text: string): void => {
+		buffer += text;
+		buffer = buffer.replace(/\r\n/g, "\n");
+	};
+
+	const consumeCompleteFrames = function* (): Generator<Record<string, unknown>> {
+		let idx = buffer.indexOf("\n\n");
+		while (idx !== -1) {
+			const chunk = buffer.slice(0, idx);
+			buffer = buffer.slice(idx + 2);
+			yield* parseSseFrame(chunk);
+			idx = buffer.indexOf("\n\n");
+		}
+	};
+
 	try {
 		while (true) {
 			const { done, value } = await reader.read();
 			if (done) break;
-			buffer += decoder.decode(value, { stream: true });
+			appendDecoded(decoder.decode(value, { stream: true }));
+			yield* consumeCompleteFrames();
+		}
 
-			let idx = buffer.indexOf("\n\n");
-			while (idx !== -1) {
-				const chunk = buffer.slice(0, idx);
-				buffer = buffer.slice(idx + 2);
-
-				const dataLines = chunk
-					.split("\n")
-					.filter((l) => l.startsWith("data:"))
-					.map((l) => l.slice(5).trim());
-				if (dataLines.length > 0) {
-					const data = dataLines.join("\n").trim();
-					if (data && data !== "[DONE]") {
-						try {
-							yield JSON.parse(data) as Record<string, unknown>;
-						} catch (cause) {
-							throw new CodexProtocolError(`Invalid Codex SSE JSON: ${formatThrownValue(cause)}`, {
-								cause,
-								payload: data,
-							});
-						}
-					}
-				}
-				idx = buffer.indexOf("\n\n");
-			}
+		// Tail flush: a stream may close right after the final event frame with no
+		// trailing blank line; dropping the remainder silently loses the terminal
+		// event (see the WebSocket guard for the same contract).
+		appendDecoded(decoder.decode());
+		yield* consumeCompleteFrames();
+		if (buffer.trim().length > 0) {
+			const tail = buffer;
+			buffer = "";
+			yield* parseSseFrame(tail);
 		}
 	} finally {
 		try {
