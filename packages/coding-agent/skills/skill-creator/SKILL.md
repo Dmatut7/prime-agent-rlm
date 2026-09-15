@@ -24,7 +24,7 @@ Before writing a Python-backed skill, read [references/python-skills.md](referen
 3. **Scaffold and write** the directory using the layout and frontmatter rules below.
 4. **Verify** the skill loads (see Verification).
 
-On a name collision the first skill found wins. Precedence: explicit `--skill` paths and `skills` settings entries, then project, then global, then package, then built-in skills.
+On a name collision the first skill found wins. Precedence: explicit `--skill` paths first, then package-provided skills, then `skills` settings entries (project before global), then auto-discovered project, then global, then built-in skills last.
 
 ## Layout
 

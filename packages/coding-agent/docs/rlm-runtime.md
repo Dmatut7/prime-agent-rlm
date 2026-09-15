@@ -76,7 +76,7 @@ The Python side does not call providers or implement an agent loop.
 The kernel is created lazily on first Python REPL use. Python resolution is:
 
 1. `PRIME_AGENT_KERNEL_PYTHON`, when it has a current `prime-agent-runtime`;
-2. `~/.prime/agent/kernel-venv/bin/python`, bootstrapped with `uv`; or
+2. the managed kernel venv under `~/.prime/agent/` (`kernel-venv-<hash>/bin/python`, one generation directory per build identity), bootstrapped with `uv`; or
 3. the XDG data location when `~/.prime` is not writable.
 
 The managed environment includes Python 3.11, `prime-agent-runtime`, `dill`, and the default Python packages. A bootstrap marker detects stale environments.

@@ -148,7 +148,7 @@ Type `/` in the editor to trigger commands. [Extensions](#extensions) can regist
 | `/login`, `/logout` | OAuth authentication |
 | `/model` | Switch models |
 | `/effort` | Set reasoning/thinking level |
-| `/scoped-models` | Enable/disable models for Ctrl+P cycling |
+| `/scoped-models` | Enable/disable models for cycling in the model selector |
 | `/settings` | Thinking level, theme, message delivery, transport |
 | `/resume [id\|path]` | Open the agents view, or resume a session directly |
 | `/new`, `/clear` | Start a new session |
@@ -182,7 +182,7 @@ See `/hotkeys` for the full list. Customize via `~/.prime/agent/keybindings.json
 | Escape | Clear the input without interrupting active work |
 | Escape twice | Open `/tree` |
 | Ctrl+L | Open model selector |
-| Ctrl+P / Shift+Ctrl+P | Cycle scoped models forward/backward |
+| Ctrl+P | Collapse/expand agent message blocks |
 | Ctrl+O | Collapse/expand tool output |
 | Ctrl+T | Collapse/expand thinking blocks |
 
@@ -200,7 +200,7 @@ Submit messages while the agent is working:
 
 On Windows Terminal, `Alt+Enter` is fullscreen by default. Remap it in [docs/terminal-setup.md](docs/terminal-setup.md) so Prime Agent can receive the follow-up shortcut.
 
-Configure delivery in [settings](docs/settings.md): `steeringMode` and `followUpMode` can be `"one-at-a-time"` (default, waits for response) or `"all"` (delivers all queued at once). `transport` selects provider transport preference (`"sse"`, `"websocket"`, or `"auto"`) for providers that support multiple transports.
+Configure delivery in [settings](docs/settings.md): `steeringMode` and `followUpMode` can be `"one-at-a-time"` (default, waits for response) or `"all"` (delivers all queued at once). `transport` selects provider transport preference (`"sse"`, `"websocket"`, `"websocket-cached"`, or `"auto"`; default `"auto"`, which attempts WebSocket with cached context on Codex providers) for providers that support multiple transports.
 
 ## Sessions
 
@@ -398,7 +398,7 @@ Place in `~/.prime/agent/extensions/`, `.prime/agent/extensions/`, or a [Prime A
 
 ### Themes
 
-Built-in: `dark`, `light`. Themes hot-reload: modify the active theme file and Prime Agent immediately applies changes.
+Built-in: `prime`, `dark`, `light` (first run picks `light` on light terminals, `prime` otherwise). Themes hot-reload: modify the active theme file and Prime Agent immediately applies changes.
 
 Place in `~/.prime/agent/themes/`, `.prime/agent/themes/`, or a [Prime Agent package](#prime-agent-packages) to share with others. See [docs/themes.md](docs/themes.md).
 
@@ -555,8 +555,8 @@ cat README.md | prime-agent -p "Summarize this text"
 | `--provider <name>` | Provider (anthropic, openai, google, etc.) |
 | `--model <pattern>` | Model pattern or ID (supports `provider/id` and optional `:<thinking>`) |
 | `--api-key <key>` | API key (overrides env vars) |
-| `--thinking <level>` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh` |
-| `--models <patterns>` | Comma-separated patterns for Ctrl+P cycling |
+| `--thinking <level>` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
+| `--models <patterns>` | Set comma-separated models for cycling |
 
 Use `prime-agent model list [search]` to list available models.
 

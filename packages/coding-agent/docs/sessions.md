@@ -44,11 +44,10 @@ An invalid ID exits with the closest unambiguous session ID when one is availabl
 In the picker you can:
 
 - search by typing
-- toggle path display with Ctrl+P
-- toggle sort mode with Ctrl+S
-- filter to named sessions with Ctrl+N
+- open the selected session with Right, and return with Left
+- start a new session with Ctrl+N
 - rename with Ctrl+R
-- delete with Ctrl+D, then confirm
+- delete (or stop a running agent) with Ctrl+X, then press Ctrl+X again to confirm
 
 When available, Prime Agent uses the `trash` CLI for deletion instead of permanently removing files.
 

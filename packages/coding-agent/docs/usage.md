@@ -200,6 +200,8 @@ See [Prime Agent Packages](packages.md) for package sources and security notes.
 | `--mode json` | Output all events as JSON lines; see [JSON mode](json.md) |
 | `--mode rpc` | RPC mode over stdin/stdout; see [RPC mode](rpc.md) |
 | `--mode acp` | ACP (Agent Client Protocol) over stdin/stdout |
+| `--mode daemon` | Run as the background daemon (internal supervisor; see [Daemon Architecture](daemon.md)) |
+| `--acp-resident` | Keep the ACP session resident after stdin EOF (default: complete) |
 
 In print mode, Prime Agent also reads piped stdin and merges it into the initial prompt:
 
