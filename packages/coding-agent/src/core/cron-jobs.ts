@@ -776,7 +776,13 @@ export class AgentCronJobStore {
 	}
 
 	claimDue(dueAt = new Date(), claimedAt = dueAt): AgentCronDispatch[] {
-		return this.mutateStates((state) => claimDueInState(state, dueAt, claimedAt));
+		// The schedule search is the only open-ended work a claim does, and it used to run
+		// inside the cross-process store lock. Its answer depends only on (schedule,
+		// claimedAt) and never on the store's content, so it is resolved here from an
+		// unlocked read and handed to the locked mutation; a job that appeared between the
+		// two reads still gets its trigger computed under the lock.
+		const plannedTriggers = planDueTriggers(this.readStates(), dueAt, claimedAt);
+		return this.mutateStates((state) => claimDueInState(state, dueAt, claimedAt, plannedTriggers));
 	}
 
 	getClaimedJob(id: string): AgentCronJob | undefined {
@@ -1598,20 +1604,119 @@ export function shouldDeferHeartbeatCronJob(job: AgentCronJob, activity: Heartbe
 	return activity.isStreaming;
 }
 
-function nextCronRunAfter(expression: string, after: Date): Date {
-	const fields = parseCronExpression(expression);
-	const candidate = new Date(after.getTime());
-	candidate.setSeconds(0, 0);
-	candidate.setMinutes(candidate.getMinutes() + 1);
+/**
+ * How far the next-trigger search walks calendar days.
+ *
+ * A cron expression carries no year field, so the only three fields that can make a
+ * day match are month, day-of-month and weekday - and that triple repeats exactly over
+ * the 400-year Gregorian cycle. Walking a whole cycle therefore *proves* that a
+ * schedule never matches, instead of reporting that it did not match in whatever
+ * shorter window the search happened to use. Only a schedule that never matches walks
+ * the window to its end (a one-off cost on the error path); a schedule that does match
+ * is answered at its first matching day.
+ */
+const CRON_SEARCH_HORIZON_DAYS = 366 * 400;
+/**
+ * Trigger lookups repeat (every claim, run bookkeeping, resume) and the answer depends
+ * only on the expression and the minute it is asked from. Bounded: an unfriendly caller
+ * must not be able to grow the cache forever.
+ */
+const NEXT_CRON_RUN_CACHE_LIMIT = 512;
+const nextCronRunCache = new Map<string, number>();
 
-	const deadline = candidate.getTime() + 366 * 24 * 60 * ONE_MINUTE_MS;
-	while (candidate.getTime() <= deadline) {
-		if (matchesCronFields(candidate, fields)) {
-			return candidate;
-		}
-		candidate.setMinutes(candidate.getMinutes() + 1);
+function nextCronRunAfter(expression: string, after: Date): Date {
+	const afterMinute = Math.floor(after.getTime() / ONE_MINUTE_MS);
+	// The answer is a function of (zone, expression, minute). Zone identity comes from TZ:
+	// that is the only way a running process's zone changes (a DST offset shift inside one
+	// zone does not invalidate an entry, because the zone's rule set is what the answer
+	// depends on), and it keeps a test that pins TZ from reading another zone's entry.
+	const cacheKey = `${process.env.TZ ?? ""}\u0000${expression}\u0000${afterMinute}`;
+	const cached = nextCronRunCache.get(cacheKey);
+	if (cached !== undefined) {
+		return new Date(cached);
 	}
-	throw new Error(`Cron schedule did not match within one year: ${expression}`);
+	const found = searchCronRunAfter(parseCronExpression(expression), after);
+	if (found === undefined) {
+		// Proven over a full Gregorian cycle of the only fields that can match a day, so
+		// this is "never", not "not in the window I looked at". A zone that deletes a whole
+		// calendar day only removes days, which cannot create a match either.
+		throw new Error(`Cron schedule never matches: ${expression}`);
+	}
+	if (nextCronRunCache.size >= NEXT_CRON_RUN_CACHE_LIMIT) {
+		nextCronRunCache.clear();
+	}
+	nextCronRunCache.set(cacheKey, found.getTime());
+	return found;
+}
+
+/**
+ * First local wall-clock instant matching `fields` after `after`.
+ *
+ * The search walks *calendar days* and examines a day's scheduled minutes only when that
+ * day's date fields match. Two properties follow from that shape:
+ *
+ *  - Cost. The previous implementation advanced a local clock one minute at a time from
+ *    `after` to the match, and it did so while holding the cron store's cross-process lock
+ *    (`claimDueInState`): a schedule whose next match was months out cost tens of
+ *    milliseconds of lock hold per lookup, against a lock retry budget of ~205ms, so a
+ *    competing process could lose the store for a search that had nothing to do with it.
+ *    Day walking is bounded by the number of days, each checked with a few set lookups.
+ *  - DST. A minute-by-minute walk over the local clock never visits a wall time the zone
+ *    skipped, so a schedule inside the spring-forward gap silently missed that whole day.
+ *    Asking `Date` what instant a *wall time* is answers the skipped case as well:
+ *    `new Date(y, m, d, 2, 30)` in America/New_York on 2026-03-08 is 03:30 EDT, i.e. the
+ *    first instant after the gap, so the run happens late instead of never. A wall time
+ *    that exists twice resolves to its first occurrence, and the trigger computed after
+ *    that occurrence lands on a later matching day, so such a schedule runs once - not
+ *    twice, and not never. Zone rules are read at lookup time (a zone may shift a day by
+ *    23 hours or delete a calendar day), which is why the day walk checks that each
+ *    calendar day it steps to still exists.
+ */
+function searchCronRunAfter(fields: CronFields, after: Date): Date | undefined {
+	const hours = [...fields.hour].sort((left, right) => left - right);
+	const minutes = [...fields.minute].sort((left, right) => left - right);
+	// Strictly after `after`, on the local minute grid (the previous behaviour).
+	const startMs = Math.floor(after.getTime() / ONE_MINUTE_MS) * ONE_MINUTE_MS + ONE_MINUTE_MS;
+	const start = new Date(startMs);
+	let year = start.getFullYear();
+	let month = start.getMonth();
+	let day = start.getDate();
+	let earliest: number | undefined;
+	for (let offset = 0; offset <= CRON_SEARCH_HORIZON_DAYS; offset++) {
+		// Noon is the day's identity: it exists in every zone whose midnight does not, so
+		// the round trip says whether this calendar day exists at all.
+		const noon = new Date(year, month, day, 12, 0, 0, 0);
+		const dayExists = noon.getFullYear() === year && noon.getMonth() === month && noon.getDate() === day;
+		if (dayExists && matchesCronDayFields(noon, fields)) {
+			const dayStart = new Date(year, month, day, 0, 0, 0, 0).getTime();
+			// The answer is the *earliest* candidate, not the first one seen: within a day
+			// wall minutes map to instants non-decreasingly except across a gap at midnight,
+			// where 00:30 can land after 01:00.
+			for (const hour of hours) {
+				for (const minute of minutes) {
+					const candidate = new Date(year, month, day, hour, minute, 0, 0).getTime();
+					if (candidate >= startMs && (earliest === undefined || candidate < earliest)) {
+						earliest = candidate;
+					}
+				}
+			}
+			// A day whose candidates all lie before `after` cannot be the answer, but the
+			// next day still can; only the day-start bound ends the walk.
+			if (earliest !== undefined && dayStart > earliest) {
+				return new Date(earliest);
+			}
+		} else if (earliest !== undefined) {
+			const dayStart = new Date(year, month, day, 0, 0, 0, 0).getTime();
+			if (dayStart > earliest) {
+				return new Date(earliest);
+			}
+		}
+		const nextDay = new Date(year, month, day + 1, 12, 0, 0, 0);
+		year = nextDay.getFullYear();
+		month = nextDay.getMonth();
+		day = nextDay.getDate();
+	}
+	return earliest === undefined ? undefined : new Date(earliest);
 }
 
 function parseCronExpression(expression: string): CronFields {
@@ -1680,16 +1785,11 @@ function parseCronNumber(value: string | undefined, min: number, max: number): n
 	return parsed;
 }
 
-function matchesCronFields(date: Date, fields: CronFields): boolean {
+/** Date fields of one local calendar day: month, day of month and weekday (7 = Sunday). */
+function matchesCronDayFields(date: Date, fields: CronFields): boolean {
 	const day = date.getDay();
 	const dayMatches = fields.dayOfWeek.has(day) || (day === 0 && fields.dayOfWeek.has(7));
-	return (
-		fields.minute.has(date.getMinutes()) &&
-		fields.hour.has(date.getHours()) &&
-		fields.dayOfMonth.has(date.getDate()) &&
-		fields.month.has(date.getMonth() + 1) &&
-		dayMatches
-	);
+	return fields.dayOfMonth.has(date.getDate()) && fields.month.has(date.getMonth() + 1) && dayMatches;
 }
 
 function normalizeCronAlias(text: string): string {
@@ -1918,7 +2018,36 @@ function writeJobsState(path: string, state: CronJobsState): void {
 	}
 }
 
-function claimDueInState(state: CronJobsState, dueAt: Date, claimedAt: Date): AgentCronDispatch[] {
+/**
+ * Next trigger for every job that is due at `dueAt`, keyed by job id.
+ *
+ * `claimDue` calls this on an unlocked read so that no schedule search happens while the
+ * store lock is held. The values are pure functions of the job's schedule and `claimedAt`,
+ * so reusing them for the store content read under the lock is exact, not an approximation.
+ */
+function planDueTriggers(
+	states: readonly CronJobsState[],
+	dueAt: Date,
+	claimedAt: Date,
+): Map<string, string | undefined> {
+	const planned = new Map<string, string | undefined>();
+	for (const state of states) {
+		for (const job of state.jobs) {
+			if (planned.has(job.id) || !isDueJob(job, dueAt)) {
+				continue;
+			}
+			planned.set(job.id, nextRunAtForSchedule(job.schedule, claimedAt)?.toISOString());
+		}
+	}
+	return planned;
+}
+
+function claimDueInState(
+	state: CronJobsState,
+	dueAt: Date,
+	claimedAt: Date,
+	plannedTriggers?: ReadonlyMap<string, string | undefined>,
+): AgentCronDispatch[] {
 	const dispatches: AgentCronDispatch[] = [];
 	const claimedJobIds = new Set(state.dispatches.map((dispatch) => dispatch.jobId));
 	state.jobs = state.jobs.map((job) => {
@@ -1926,7 +2055,9 @@ function claimDueInState(state: CronJobsState, dueAt: Date, claimedAt: Date): Ag
 			return job;
 		}
 		const scheduledFor = job.nextRunAt!;
-		const nextRunAt = nextRunAtForSchedule(job.schedule, claimedAt)?.toISOString();
+		const nextRunAt = plannedTriggers?.has(job.id)
+			? plannedTriggers.get(job.id)
+			: nextRunAtForSchedule(job.schedule, claimedAt)?.toISOString();
 		const advanced = nextRunAt
 			? { ...job, nextRunAt, updatedAt: claimedAt.toISOString() }
 			: withoutNextRunAt({ ...job, updatedAt: claimedAt.toISOString() });
