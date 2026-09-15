@@ -1,0 +1,1 @@
+- Fixed concurrent manual `/compact` calls racing each other into two compactions: a second call now coalesces onto the in-flight compaction, and `abort_compaction` reliably cancels the running one.
