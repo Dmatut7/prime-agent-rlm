@@ -12,6 +12,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { gzipSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Isolation mirrors test/tools-manager.test.ts: the tools directory is redirected through
@@ -78,13 +79,16 @@ function makeTarGz(binaryName: string, exitCode = 0): Uint8Array {
 	const stage = join(toolState.toolsDir, `build_${process.pid}_${Math.random().toString(36).slice(2, 10)}`);
 	mkdirSync(join(stage, "pkg"), { recursive: true });
 	writeExecutable(join(stage, "pkg", binaryName), exitCode);
-	const archive = join(stage, "pkg.tar.gz");
-	const result = spawnSync(hostTarPath, ["czf", archive, "-C", stage, "pkg"], { stdio: "pipe" });
+	// Build with `tar cf` (plain tar: the CI runner has no gzip binary) and compress
+	// with node's zlib, so the fixture works everywhere while still exercising the real
+	// .tar.gz the production `tar xzf` path consumes.
+	const archive = join(stage, "pkg.tar");
+	const result = spawnSync(hostTarPath, ["cf", archive, "-C", stage, "pkg"], { stdio: "pipe" });
 	if (result.error || result.status !== 0) {
 		const reason = result.error?.message ?? result.stderr?.toString().trim() ?? String(result.status);
 		throw new Error(`fixture tar.gz build failed: ${reason}`);
 	}
-	const bytes = new Uint8Array(readFileSync(archive));
+	const bytes = gzipSync(readFileSync(archive));
 	rmSync(stage, { recursive: true, force: true });
 	return bytes;
 }

@@ -207,7 +207,12 @@ describe("disk scan is bounded by depth", () => {
 
 	it("stops a transcript chain deeper than the default depth limit", () => {
 		const rlmDir = makeTempDir();
-		const { built, hitPathLimit } = writeChain(rlmDir, 600);
+		// PATH_MAX differs by platform (1024 on macOS, 4096 on Linux runners), so a fixed
+		// level count cannot be "bounded only by PATH_MAX" everywhere: budget the chain from
+		// the real remaining path length the filesystem will accept for this root.
+		const pathMax = process.platform === "win32" ? 260 : 4096;
+		const chainBudget = Math.ceil((pathMax - rlmDir.length) / 6) + 16;
+		const { built, hitPathLimit } = writeChain(rlmDir, chainBudget);
 		// Deep enough to be a nesting test, and bounded only by PATH_MAX.
 		expect(hitPathLimit).toBe(true);
 		expect(built).toBeGreaterThan(60);
