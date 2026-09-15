@@ -1,0 +1,5 @@
+- Fixed `package`/`config` CLI commands hiding settings warnings (a broken ancestor settings.json was completely silent there while the interactive path printed it).
+- Fixed an ancestor settings.json that breaks again after being fixed never warning again in the same session (the warning identity carried no file stamp).
+- Fixed a manual `/compact` silently dropping the instructions a pending model-requested compaction had named instead of honoring them like the automatic path.
+- Fixed stale kernel variable rosters from earlier compactions being folded back into later summary narratives (the `<ipython_state>` notices are now stripped like machine blocks).
+- Fixed the REPL prompt teaching that `os.environ` changes reach `bash()` children; the prompt and the bash tool description now state the child-env whitelist, the `VAR=value cmd` prefix form and the `PRIME_AGENT_ENV_PASSTHROUGH` opt-in.

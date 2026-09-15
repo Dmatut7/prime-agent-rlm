@@ -48,7 +48,8 @@ describe("machine blocks", () => {
 		expect(stripped).toBe(NARRATIVE);
 		// Stripping is idempotent: a second pass cannot eat narrative text.
 		expect(stripMachineBlocks(stripped)).toBe(NARRATIVE);
-		expect(MACHINE_BLOCK_TAGS.length).toBe(4);
+		// K3R2/MVS-3: the kernel roster notices join as strip-only members.
+		expect(MACHINE_BLOCK_TAGS.length).toBe(6);
 	});
 
 	it("collapses the blank lines a stripped block leaves behind", () => {

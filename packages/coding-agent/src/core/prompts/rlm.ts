@@ -57,7 +57,7 @@ const REPL_CONTROL_PROMPT = [
 	"",
 	"Use Python for reading, searching, and editing files — it gives you reusable variables you can slice, filter, and act on without re-reading. Always assign read/search results to named variables so you can revisit them later.",
 	"",
-	"Each `bash()` call is its own process, so shell state does not persist between calls; use `os.chdir(...)` for the working directory and `os.environ[...]` for environment variables — both persist in the REPL and apply to later `bash()` calls.",
+	"Each `bash()` call is its own process, so shell state does not persist between calls; use `os.chdir(...)` for the working directory — it persists in the REPL and applies to later `bash()` calls. Environment variables do not carry the same way: `bash()` children receive only a fixed child-safe whitelist of the kernel environment (PATH, HOME, TZ, locale, and the agent's own routing keys), so a new `os.environ['MY_VAR']` reaches Python subprocesses but is silently dropped from `bash()` children. Set a variable for one command as a shell prefix (`bash('MY_VAR=value npm test')`), or opt kernel variables into later `bash()` calls first (`os.environ['PRIME_AGENT_ENV_PASSTHROUGH'] = 'MY_VAR,OTHER_VAR'`).",
 	"",
 	"Python state in the kernel persists across cells: named variables, helper functions, classes, imports, notes, parsed outputs, and helper data structures all remain available in every later turn. Tool calls are themselves Python `await` expressions, so their return values can be bound to variables and composed into program logic just like any other call.",
 	"",

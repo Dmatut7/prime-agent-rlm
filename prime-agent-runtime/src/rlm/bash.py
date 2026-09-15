@@ -697,6 +697,12 @@ def bash(command: str) -> BashHandle:
     Output written after the completion fence (e.g. by an EXIT trap or a
     background job) is not in BashResult.output but stays visible via
     handle.output()/tail().
+    Environment: children run on a child-safe whitelist of the kernel env
+    (plus NO_COLOR/TERM=dumb), not on os.environ - a variable set in the REPL
+    reaches Python subprocesses but is silently dropped here. Set a value for
+    one command as a shell prefix (`bash('VAR=value cmd')`), or list names in
+    os.environ['PRIME_AGENT_ENV_PASSTHROUGH'] before the call to pass them
+    through.
     """
     if not isinstance(command, str) or not command:
         raise TypeError("command must be a non-empty str")

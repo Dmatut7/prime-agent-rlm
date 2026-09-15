@@ -1595,6 +1595,20 @@ function attributeChildUsage(parentUsage: Usage, childUsage: Usage): void {
 	parentUsage.totalTokens = parentContextTokens;
 }
 
+/**
+ * Join the instructions a manual compaction was given with the instructions a
+ * pending compact.run request carries (MVS-2): the manual run satisfies the
+ * request, and the auto path's contract - any compaction honors a pending
+ * request's instructions - holds for it too. The caller's own instructions stay
+ * first; empty strings never contribute.
+ */
+function joinCompactionInstructions(manual: string | undefined, pending: string | undefined): string | undefined {
+	const parts = [manual, pending].filter(
+		(value): value is string => typeof value === "string" && value.trim().length > 0,
+	);
+	return parts.length > 0 ? parts.join("\n\n") : undefined;
+}
+
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -10037,6 +10051,17 @@ export class AgentSession {
 		if (autoCompactionOperation) {
 			await autoCompactionOperation.catch(() => undefined);
 		}
+		// MVS-2: this run is the compaction that actually restructures the context,
+		// so a pending compact.run request is satisfied by it - and, exactly like the
+		// auto path ("any compaction consumes a pending model request and honors its
+		// instructions"), the request's instructions join this run's instead of
+		// vanishing. The pending state itself is only cleared on success below; on
+		// failure the request stays scheduled for the next turn boundary.
+		const pendingRequestedCompaction = this._pendingRequestedCompaction;
+		const effectiveCustomInstructions = joinCompactionInstructions(
+			customInstructions,
+			pendingRequestedCompaction?.customInstructions,
+		);
 		const hadPostCompactionContinue = this._postCompactionContinuationScheduled;
 		const continueAfterSessionInput = this._postCompactionContinuationSettlement?.continueAfterSessionInput ?? false;
 		this._disconnectFromAgent();
@@ -10052,7 +10077,7 @@ export class AgentSession {
 		this._emit({
 			type: "compaction_start",
 			reason: "manual",
-			customInstructions,
+			customInstructions: effectiveCustomInstructions,
 		});
 
 		try {
@@ -10065,7 +10090,7 @@ export class AgentSession {
 				model: this.model,
 				apiKey,
 				headers,
-				customInstructions,
+				customInstructions: effectiveCustomInstructions,
 				signal: compactionAbort.signal,
 			});
 
@@ -10075,7 +10100,7 @@ export class AgentSession {
 				result,
 				aborted: false,
 				willRetry: false,
-				customInstructions,
+				customInstructions: effectiveCustomInstructions,
 			});
 			didCompact = true;
 			// Manual compaction restructures the context; drop any stale threshold cooldown.
@@ -10101,7 +10126,7 @@ export class AgentSession {
 				willRetry: false,
 				errorMessage: aborted ? undefined : skipped ? message : `Compaction failed: ${message}${recoveryHint}`,
 				errorSeverity: skipped ? "warning" : "error",
-				customInstructions,
+				customInstructions: effectiveCustomInstructions,
 			});
 			if (recoveryHint && error instanceof Error) {
 				throw new Error(`${error.message}${recoveryHint}`, { cause: error });

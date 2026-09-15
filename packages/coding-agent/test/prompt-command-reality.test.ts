@@ -6,6 +6,7 @@ import { getKernelVenvDir } from "../src/core/kernel/bootstrap.js";
 import { buildRlmPrompt } from "../src/core/prompts/index.js";
 import { formatHarnessStateForPrompt, type HarnessState } from "../src/core/refinement/index.js";
 import { buildSystemPrompt } from "../src/core/system-prompt.js";
+import { createBashToolDefinition } from "../src/core/tools/bash.js";
 
 /**
  * The model-facing prompt may only teach a call form or a command that works in the session that
@@ -165,5 +166,25 @@ describe("package-install doctrine: every taught command must run", () => {
 		});
 		expect(bare.status).not.toBe(0);
 		expect(`${bare.stdout}${bare.stderr}`).toContain("No virtual environment found");
+	});
+});
+
+describe("env doctrine: os.environ does not flow into bash() children", () => {
+	it("teaches the whitelist, the prefix form and the passthrough exit instead of the os.environ lie", () => {
+		const prompt = replPrompt();
+		// MVS-1 (r32): r28 BSH stripped bash() children to a child-safe env
+		// whitelist, but the REPL prompt still taught that os.environ changes
+		// "apply to later `bash()` calls" - true only for the whitelisted keys,
+		// so the model kept setting variables that silently vanished.
+		expect(prompt).not.toContain("both persist in the REPL and apply to later `bash()` calls");
+		expect(prompt).toContain("whitelist");
+		expect(prompt).toContain("PRIME_AGENT_ENV_PASSTHROUGH");
+		expect(prompt).toContain("MY_VAR=value");
+	});
+
+	it("states the same env boundary in the classic bash tool description", () => {
+		const definition = createBashToolDefinition("/repo");
+		expect(definition.description).toContain("whitelist");
+		expect(definition.description).toContain("PRIME_AGENT_ENV_PASSTHROUGH");
 	});
 });

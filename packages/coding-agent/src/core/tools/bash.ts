@@ -362,7 +362,7 @@ export function createBashToolDefinition(
 	const definition: ToolDefinition<typeof bashSchema, BashToolDetails | undefined, BashRenderState> = {
 		name: "bash",
 		label: "bash",
-		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. ${timeoutHint}`,
+		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. ${timeoutHint} Child processes run with a sanitized environment - a fixed child-safe whitelist (PATH, HOME, TZ, locale, agent routing keys), not the full parent env - so set variables inside the command itself (\`VAR=value cmd\`) or have the user export PRIME_AGENT_ENV_PASSTHROUGH=NAME1,NAME2 to forward specific names.`,
 		promptSnippet: "Execute bash commands (ls, grep, find, etc.)",
 		parameters: Type.Object({
 			command: Type.String({ description: "Bash command to execute" }),

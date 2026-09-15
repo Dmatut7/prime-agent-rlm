@@ -450,7 +450,8 @@ describe("F1-E machine blocks are anchored at the end of the document", () => {
 		expect(stripMachineBlocks(stripped)).toBe(narrative);
 		expect(stripped).not.toMatch(/<\/?(read-files|modified-files|fact-appendix|user-requests)\b/);
 		expect(stripped).not.toContain('{"k":"sha"');
-		expect(MACHINE_BLOCK_TAGS.length).toBe(4);
+		// K3R2/MVS-3: the kernel roster notices join the family as strip-only members.
+		expect(MACHINE_BLOCK_TAGS.length).toBe(6);
 
 		const empty = renderMachineBlock("user-requests", { generation: 1, count: 0 }, "");
 		expect(findMachineBlock(empty, "user-requests")).toBeDefined();
