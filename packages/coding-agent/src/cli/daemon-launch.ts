@@ -11,6 +11,7 @@ import { resolve } from "node:path";
 import { appendRotatingLog, expandTildePath, getClientErrorLogPath, getDaemonLogPath, VERSION } from "../config.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../core/orphan-process-journal.js";
 import { getProcessStartId, SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../core/session-lease.js";
+import { resolveDaemonSocketForAgentDir } from "../modes/daemon/daemon-agent-endpoint.js";
 import { DaemonClient, type DaemonHello } from "../modes/daemon/daemon-client.js";
 import {
 	DAEMON_FIRST_PARTY_CONTROL_CAPABILITIES,
@@ -20,7 +21,7 @@ import {
 } from "../modes/daemon/daemon-protocol.js";
 import { getDaemonRuntimeIdentity } from "../modes/daemon/daemon-runtime-identity.js";
 import { isSessionSummaryBusy, type SessionSummary } from "../modes/daemon/daemon-session-list.js";
-import { defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
+import { normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
@@ -684,13 +685,22 @@ export function maybeStartDaemonEarly(args: readonly string[]): void {
 		return;
 	}
 	const socketIndex = args.indexOf("--daemon-socket");
-	const rawSocketPath =
-		socketIndex !== -1 && args[socketIndex + 1] ? (args[socketIndex + 1] as string) : defaultDaemonSocketPath();
+	const explicitSocketPath =
+		socketIndex !== -1 && args[socketIndex + 1] ? (args[socketIndex + 1] as string) : undefined;
 	const cwdIndex = args.indexOf("--cwd");
 	const cwdArg = cwdIndex !== -1 ? args[cwdIndex + 1] : undefined;
 	const spawnCwd = cwdArg ? resolve(expandTildePath(cwdArg)) : undefined;
 	if (spawnCwd && !existsSync(spawnCwd)) {
 		return;
 	}
-	void ensureInteractiveDaemonRunning(normalizeSocketPath(rawSocketPath, spawnCwd), spawnCwd);
+	if (explicitSocketPath !== undefined) {
+		void ensureInteractiveDaemonRunning(normalizeSocketPath(explicitSocketPath, spawnCwd), spawnCwd);
+		return;
+	}
+	// Resolve agent-dir scoped before spawning: in a foreign $TMPDIR the daemon that
+	// owns this agent dir is already running under a different socket path, and the
+	// kick must reuse it rather than start a second one over the same state.
+	void resolveDaemonSocketForAgentDir()
+		.then((endpoint) => ensureInteractiveDaemonRunning(endpoint.socketPath, spawnCwd))
+		.catch(() => undefined);
 }

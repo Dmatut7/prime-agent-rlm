@@ -79,6 +79,7 @@ import { SettingsManager } from "./core/settings-manager.js";
 import { isTelemetryEnabled } from "./core/telemetry.js";
 import { printTimings, resetTimings, time } from "./core/timings.js";
 import { runMigrations, showDeprecationWarnings } from "./migrations.js";
+import { resolveDaemonSocketForAgentDir } from "./modes/daemon/daemon-agent-endpoint.js";
 import { isDaemonCatalogProcess, runDaemonCatalogProcess } from "./modes/daemon/daemon-catalog-process.js";
 import { DaemonSessionCreateError, deserializeDaemonCreateError } from "./modes/daemon/daemon-errors.js";
 import {
@@ -102,7 +103,6 @@ import {
 	DaemonAgentConnection,
 	DaemonCapabilityUnavailableError,
 	DaemonClient,
-	defaultDaemonSocketPath,
 	InProcessAgentConnection,
 	InteractiveMode,
 	normalizeSocketPath,
@@ -1386,7 +1386,9 @@ export async function main(args: string[], options?: MainOptions) {
 		(parsed.sessionDir ? expandTildePath(parsed.sessionDir) : undefined) ??
 		getSessionDirEnvOverride() ??
 		startupSettingsManager.getSessionDir();
-	const daemonSocketPath = parsed.daemonSocket ?? defaultDaemonSocketPath();
+	// Agent-dir scoped, so a shell with a different $TMPDIR still reaches the daemon
+	// that owns this agent dir instead of spawning a second one over the same state.
+	const daemonSocketPath = parsed.daemonSocket ?? (await resolveDaemonSocketForAgentDir()).socketPath;
 	// Kick off daemon spawn/readiness immediately so it overlaps session-manager
 	// and runtime-services preparation; attach only connects to an existing daemon.
 	let daemonReady = shouldEnsureInteractiveDaemonForStartup(useDaemonClient, publicCommand.attachAgent)

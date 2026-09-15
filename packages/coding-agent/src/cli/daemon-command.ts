@@ -9,6 +9,7 @@ import type { AgentSessionEvent } from "../core/agent-session.js";
 import type { AgentSessionRuntimeConfig } from "../core/agent-session-config.js";
 import { type AgentCronJob, formatAgentCronJob } from "../core/cron-jobs.js";
 import { looksLikeSessionPath } from "../core/session-resolver.js";
+import { resolveDaemonSocketForAgentDir } from "../modes/daemon/daemon-agent-endpoint.js";
 import { DaemonClient, type DaemonClientMessageListener } from "../modes/daemon/daemon-client.js";
 import type { DaemonOutbound, DaemonResponse } from "../modes/daemon/daemon-protocol.js";
 import { DAEMON_FIRST_PARTY_CONTROL_CAPABILITIES } from "../modes/daemon/daemon-protocol.js";
@@ -23,6 +24,8 @@ import { runPs, runReap } from "./daemon-ps.js";
 interface ParsedDaemonClientCommand {
 	command: string;
 	socketPath: string;
+	/** True when the caller named a socket, so agent-dir discovery must not override it. */
+	socketExplicit: boolean;
 	json: boolean;
 	positionals: string[];
 }
@@ -70,6 +73,7 @@ export async function handleDaemonCommand(args: string[]): Promise<boolean> {
 
 function parseDaemonClientCommand(args: string[]): ParsedDaemonClientCommand {
 	let socketPath = defaultDaemonSocketPath();
+	let socketExplicit = false;
 	let json = false;
 	const positionals: string[] = [];
 	let passthrough = false;
@@ -110,6 +114,7 @@ function parseDaemonClientCommand(args: string[]): ParsedDaemonClientCommand {
 				throw new Error(`${arg} requires a value`);
 			}
 			socketPath = normalizeSocketPath(value);
+			socketExplicit = true;
 			index++;
 			continue;
 		}
@@ -128,10 +133,24 @@ function parseDaemonClientCommand(args: string[]): ParsedDaemonClientCommand {
 	}
 
 	command = command ?? "open";
-	return { command, socketPath, json, positionals };
+	return { command, socketPath, socketExplicit, json, positionals };
 }
 
-async function runDaemonClientCommand(parsed: ParsedDaemonClientCommand): Promise<void> {
+/**
+ * Agent-dir scoped commands (`list`, `attach`, `stop`, `send`, ...) without an
+ * explicit socket talk to the daemon that owns this agent dir, in whatever
+ * `$TMPDIR` that daemon happens to live (see resolveDaemonSocketForAgentDir).
+ * An explicit `--socket`/`--daemon-socket` is never overridden.
+ */
+async function resolveAgentDirSocket(parsed: ParsedDaemonClientCommand): Promise<ParsedDaemonClientCommand> {
+	const endpoint = await resolveDaemonSocketForAgentDir();
+	return { ...parsed, socketPath: endpoint.socketPath };
+}
+
+async function runDaemonClientCommand(parsedInput: ParsedDaemonClientCommand): Promise<void> {
+	// An explicit socket keeps its exact call shape: it is never awaited through the
+	// discovery path, so nothing about a named endpoint changes by a microtask.
+	const parsed = parsedInput.socketExplicit ? parsedInput : await resolveAgentDirSocket(parsedInput);
 	if (parsed.command === "open") {
 		await runOpen(parsed);
 		return;

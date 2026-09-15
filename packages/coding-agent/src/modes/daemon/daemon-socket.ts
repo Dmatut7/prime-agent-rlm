@@ -305,6 +305,19 @@ function ensureDefaultDaemonSocketDir(socketPath: string): void {
 	chmodSync(defaultDaemonSocketDir(), DAEMON_SOCKET_DIR_MODE);
 }
 
+/**
+ * True when something accepts a connection on `socketPath`.
+ *
+ * Deliberately weaker than a handshake: this answers "is a daemon process bound
+ * here", which is what an agent-dir-scoped client needs before deciding whether
+ * to reuse an endpoint or to start one of its own. A daemon that is still
+ * booting counts as present, so no client ever races a live daemon into a
+ * duplicate.
+ */
+export function isDaemonSocketListening(socketPath: string): Promise<boolean> {
+	return canConnectToUnixSocket(socketPath);
+}
+
 function canConnectToUnixSocket(socketPath: string): Promise<boolean> {
 	return new Promise((resolveConnect) => {
 		const socket = createConnection(socketPath);
