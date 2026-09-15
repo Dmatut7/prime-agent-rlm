@@ -5229,9 +5229,13 @@ export class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				const sessionManager = state.runtime.session.sessionManager;
 				// Every entry ships whole, so an uncapped response is O(entries) bytes - a
-				// 100k-entry session is ~90MB per call. The cap keeps the newest entries (the
-				// leaf is last in file order, so the resumable branch stays present) and the
-				// stats travel to the client so the omission is reportable, not silent.
+				// 100k-entry session is ~90MB per call. The cap keeps the live leaf's entry
+				// and ancestor chain first and the newest entries after them: the leaf is NOT
+				// the last entry in file order after a rewind, because branch() records the
+				// move with a leaf_position marker appended as the file's last line, so a
+				// pure tail cut would drop the resumable branch while leafId still points at
+				// it. The stats travel to the client so the omission is reportable, not
+				// silent.
 				const bounded = sessionManager.getBoundedFlatTree();
 				if (bounded.stats.truncated) {
 					this.log(

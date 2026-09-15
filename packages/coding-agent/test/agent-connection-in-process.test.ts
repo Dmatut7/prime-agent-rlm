@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { AgentSessionEvent, AgentSessionEventListener, PromptOptions } from "../src/core/agent-session.js";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.js";
 import { emptyGoalState } from "../src/core/goals.js";
-import { SESSION_TREE_MAX_WIRE_DEPTH } from "../src/core/session-manager.js";
+import { SESSION_TREE_MAX_WIRE_DEPTH, SESSION_TREE_MAX_WIRE_NODES } from "../src/core/session-manager.js";
 import { InProcessAgentConnection } from "../src/modes/agent-connection/in-process-agent-connection.js";
 import type { AgentConnectionEvent, AgentConnectionState } from "../src/modes/agent-connection/types.js";
 
@@ -109,6 +109,7 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 					depthLimit: SESSION_TREE_MAX_WIRE_DEPTH,
 					// The r19 anchor semantics: the live leaf survived the bound and the
 					// shallowest retained node sits one level down.
+					maxNodes: SESSION_TREE_MAX_WIRE_NODES,
 					retainedFromDepth: 1,
 					leafIncluded: true,
 					truncated: true,
@@ -192,6 +193,7 @@ describe("InProcessAgentConnection", () => {
 			omittedNodes: 2,
 			maxDepth: SESSION_TREE_MAX_WIRE_DEPTH + 2,
 			depthLimit: SESSION_TREE_MAX_WIRE_DEPTH,
+			maxNodes: SESSION_TREE_MAX_WIRE_NODES,
 			retainedFromDepth: 1,
 			leafIncluded: true,
 			truncated: true,
@@ -349,6 +351,7 @@ describe("InProcessAgentConnection", () => {
 					omittedNodes: 2,
 					maxDepth: SESSION_TREE_MAX_WIRE_DEPTH + 2,
 					depthLimit: SESSION_TREE_MAX_WIRE_DEPTH,
+					maxNodes: SESSION_TREE_MAX_WIRE_NODES,
 					retainedFromDepth: 1,
 					leafIncluded: true,
 					truncated: true,

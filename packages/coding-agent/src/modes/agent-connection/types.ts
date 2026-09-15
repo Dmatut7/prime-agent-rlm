@@ -300,11 +300,20 @@ export interface AgentConnectionSessionTreeBound {
 	maxDepth: number;
 	depthLimit: number;
 	/**
-	 * Depth of the shallowest retained node, i.e. how many top layers were cut. 0 when the
-	 * whole tree fit. A retained node whose parent is not retained comes back as a root, so
-	 * a client can tell a truncated view from a session that really starts there.
+	 * Depth of the shallowest retained node, i.e. how many top layers were cut. 0 does not
+	 * by itself mean the whole tree fit: a width-only cut (see {@link maxNodes}) can drop
+	 * the oldest siblings while the session's root-depth layer survives, so `truncated` is
+	 * the field that says whether anything was dropped. A retained node whose parent is
+	 * not retained comes back as a root, so a client can tell a truncated view from a
+	 * session that really starts there.
 	 */
 	retainedFromDepth: number;
+	/**
+	 * The node cap the returned tree honors: `returnedNodes` never exceeds it. Absent on
+	 * the pre-34 wire (older daemons do not send it), and `Number.MAX_SAFE_INTEGER` for an
+	 * unbounded build, since the stats ride the wire and JSON has no Infinity.
+	 */
+	maxNodes: number;
 	/**
 	 * The session's live leaf is a node in the returned tree: the window is anchored at the
 	 * leaf's own depth, so the entry the session resumes on keeps its ancestor chain. False
@@ -717,21 +726,42 @@ export type AgentConnectionSessionEvent =
 			message: string;
 			silentMs: number;
 			thresholdMs: number;
-			diagnostics: StallDiagnostics;
+			/**
+			 * Optional because the wire crosses versions: a daemon from before the
+			 * diagnostics payload emits the stall events without it, and the renderers
+			 * already degrade a missing payload to an explicit "unknown" line instead of
+			 * crashing (see formatStallDiagnosticsLines). The type now says what the wire
+			 * can actually carry, so a new consumer cannot assume the field exists.
+			 */
+			diagnostics?: StallDiagnostics;
 	  }
 	| {
 			type: "stall_abort";
 			message: string;
 			silentMs: number;
 			thresholdMs: number;
-			diagnostics: StallDiagnostics;
+			/**
+			 * Optional because the wire crosses versions: a daemon from before the
+			 * diagnostics payload emits the stall events without it, and the renderers
+			 * already degrade a missing payload to an explicit "unknown" line instead of
+			 * crashing (see formatStallDiagnosticsLines). The type now says what the wire
+			 * can actually carry, so a new consumer cannot assume the field exists.
+			 */
+			diagnostics?: StallDiagnostics;
 	  }
 	| {
 			type: "stall_unsettled";
 			message: string;
 			silentMs: number;
 			thresholdMs: number;
-			diagnostics: StallDiagnostics;
+			/**
+			 * Optional because the wire crosses versions: a daemon from before the
+			 * diagnostics payload emits the stall events without it, and the renderers
+			 * already degrade a missing payload to an explicit "unknown" line instead of
+			 * crashing (see formatStallDiagnosticsLines). The type now says what the wire
+			 * can actually carry, so a new consumer cannot assume the field exists.
+			 */
+			diagnostics?: StallDiagnostics;
 	  };
 
 export type AgentConnectionEvent =
