@@ -630,7 +630,35 @@ export async function processResponsesStream<TApi extends Api>(
 			if (item.type === "reasoning" && block?.type === "thinking") {
 				const summaryText = item.summary?.map((s) => s.text).join("\n\n") || "";
 				const contentText = item.content?.map((c) => c.text).join("\n\n") || "";
-				block.thinking = summaryText || contentText || block.thinking;
+				const doneText = summaryText || contentText;
+				// The done item stays authoritative for replay (encrypted_content and
+				// the whole item travel in thinkingSignature below), but the visible
+				// thinking text is what the deltas streamed: a conflicting done payload
+				// must not rewrite the transcript away from what the user watched.
+				// summary_part.done appends a "\n\n" separator after each part while
+				// the done item joins parts without the trailing separator, so strip
+				// it before comparing.
+				const streamedText = block.thinking.replace(/(?:\n\n)+$/, "");
+				if (block.thinking.length === 0) {
+					block.thinking = doneText;
+				} else if (doneText.length > 0 && doneText !== streamedText) {
+					if (doneText.startsWith(streamedText)) {
+						const tail = doneText.slice(streamedText.length);
+						block.thinking = doneText;
+						stream.push({
+							type: "thinking_delta",
+							contentIndex: indexOfBlock(block),
+							delta: tail,
+							partial: output,
+						});
+					} else {
+						recordDeltaDiagnostic("responses_thinking_conflict", {
+							itemId: typeof item.id === "string" ? item.id : undefined,
+							streamedLength: block.thinking.length,
+							doneLength: doneText.length,
+						});
+					}
+				}
 				block.thinkingSignature = JSON.stringify(item);
 				stream.push({
 					type: "thinking_end",

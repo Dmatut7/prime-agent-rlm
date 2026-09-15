@@ -1,0 +1,2 @@
+- Fixed provider thinking streams so the transcript matches what streamed live: Responses reasoning keeps the streamed text when the item-done payload conflicts, completions reasoning/text blocks keep their arrival order instead of being flattened, and plaintext reasoning_details surface as thinking text (redacted stays reserved for encrypted reasoning).
+- Kept Mistral reasoning signatures so they replay across turns, and stopped the Bedrock stream tail from persisting the internal block index when contentBlockStop is missing.

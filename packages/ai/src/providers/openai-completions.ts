@@ -197,8 +197,6 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			);
 		};
 
-		let textBlock: TextContent | null = null;
-		let thinkingBlock: ThinkingContent | null = null;
 		const toolCallBlocksByIndex = new Map<number, StreamingToolCallBlock>();
 		const toolCallBlocksById = new Map<string, StreamingToolCallBlock>();
 		// Ids already handed out to content blocks. Unique provider ids are kept
@@ -242,25 +240,50 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 				});
 			}
 		};
-		const ensureTextBlock = () => {
-			if (!textBlock) {
-				textBlock = { type: "text", text: "" };
-				blocks.push(textBlock);
-				stream.push({ type: "text_start", contentIndex: getContentIndex(textBlock), partial: output });
+		// Reasoning and text blocks are created in arrival order and only merge
+		// with the tail block of the same kind (same ordering contract as
+		// mistral/anthropic): an interleaved stream must keep one block per run
+		// instead of being flattened into two reordered blocks. The
+		// reasoning_details block is excluded from tail merging so its encoded
+		// signature stays scoped to its own details.
+		const ensureReasoningDetailsBlock = () => {
+			if (!reasoningDetailsBlock) {
+				reasoningDetailsBlock = { type: "thinking", thinking: "" };
+				blocks.push(reasoningDetailsBlock);
+				stream.push({
+					type: "thinking_start",
+					contentIndex: getContentIndex(reasoningDetailsBlock),
+					partial: output,
+				});
 			}
-			return textBlock;
+			return reasoningDetailsBlock;
 		};
-		const ensureThinkingBlock = (thinkingSignature: string) => {
-			if (!thinkingBlock) {
-				thinkingBlock = {
-					type: "thinking",
-					thinking: "",
-					thinkingSignature,
-				};
-				blocks.push(thinkingBlock);
-				stream.push({ type: "thinking_start", contentIndex: getContentIndex(thinkingBlock), partial: output });
+		const isMergeableTextTail = (block: StreamingBlock | undefined): block is TextContent => block?.type === "text";
+		const isMergeableThinkingTail = (block: StreamingBlock | undefined): block is ThinkingContent =>
+			block?.type === "thinking" && block !== reasoningDetailsBlock;
+		const ensureTextBlock = (): TextContent => {
+			const tail = blocks[blocks.length - 1];
+			if (isMergeableTextTail(tail)) {
+				return tail;
 			}
-			return thinkingBlock;
+			const textContent: TextContent = { type: "text", text: "" };
+			blocks.push(textContent);
+			stream.push({ type: "text_start", contentIndex: getContentIndex(textContent), partial: output });
+			return textContent;
+		};
+		const ensureThinkingBlock = (thinkingSignature: string): ThinkingContent => {
+			const tail = blocks[blocks.length - 1];
+			if (isMergeableThinkingTail(tail)) {
+				return tail;
+			}
+			const thinkingContent: ThinkingContent = {
+				type: "thinking",
+				thinking: "",
+				thinkingSignature,
+			};
+			blocks.push(thinkingContent);
+			stream.push({ type: "thinking_start", contentIndex: getContentIndex(thinkingContent), partial: output });
+			return thinkingContent;
 		};
 		// Streaming providers do sometimes violate the tool-call index/id
 		// contract. Every recovery is logged and persisted as a message
@@ -624,6 +647,30 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 								}
 							}
 							reasoningDetailsByIndex.set(index, mergedDetail);
+							const detailBlock = ensureReasoningDetailsBlock();
+							// Plaintext reasoning text belongs in the thinking block: the
+							// repo contract reserves `redacted` for genuinely encrypted
+							// payloads, not for providers that only expose reasoning via
+							// reasoning_details.
+							let plaintext = "";
+							for (const field of ["text", "summary"] as const) {
+								const fragment = detailRecord[field];
+								if (typeof fragment === "string" && fragment.length > 0) {
+									plaintext += fragment;
+								}
+							}
+							if (plaintext.length > 0) {
+								detailBlock.thinking += plaintext;
+								stream.push({
+									type: "thinking_delta",
+									contentIndex: getContentIndex(detailBlock),
+									delta: plaintext,
+									partial: output,
+								});
+							}
+							if (detailRecord.type === "reasoning.encrypted") {
+								detailBlock.redacted = true;
+							}
 							if (
 								detailRecord.type === "reasoning.encrypted" &&
 								typeof detailRecord.id === "string" &&
@@ -636,15 +683,6 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 									matchingToolCall.thoughtSignature = JSON.stringify(detailRecord);
 								}
 							}
-						}
-						if (reasoningDetailsByIndex.size > 0 && !reasoningDetailsBlock) {
-							reasoningDetailsBlock = { type: "thinking", thinking: "", redacted: true };
-							blocks.push(reasoningDetailsBlock);
-							stream.push({
-								type: "thinking_start",
-								contentIndex: getContentIndex(reasoningDetailsBlock),
-								partial: output,
-							});
 						}
 					}
 				}

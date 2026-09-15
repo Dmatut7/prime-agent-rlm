@@ -22,6 +22,7 @@ import type {
 	Tool,
 	ToolCall,
 } from "../types.js";
+import { appendAssistantMessageDiagnostic } from "../utils/diagnostics.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { shortHash } from "../utils/hash.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
@@ -357,20 +358,39 @@ async function consumeChatStream(
 						.filter((text) => text.length > 0)
 						.join("");
 					const thinkingDelta = sanitizeSurrogates(deltaText);
-					if (!thinkingDelta) continue;
+					const signature =
+						typeof item.signature === "string" && item.signature.length > 0 ? item.signature : undefined;
+					if (!thinkingDelta && !signature) continue;
 					if (!currentBlock || currentBlock.type !== "thinking") {
 						finishCurrentBlock(currentBlock);
 						currentBlock = { type: "thinking", thinking: "" };
 						output.content.push(currentBlock);
 						stream.push({ type: "thinking_start", contentIndex: blockIndex(), partial: output });
 					}
-					currentBlock.thinking += thinkingDelta;
-					stream.push({
-						type: "thinking_delta",
-						contentIndex: blockIndex(),
-						delta: thinkingDelta,
-						partial: output,
-					});
+					if (thinkingDelta) {
+						currentBlock.thinking += thinkingDelta;
+						stream.push({
+							type: "thinking_delta",
+							contentIndex: blockIndex(),
+							delta: thinkingDelta,
+							partial: output,
+						});
+					}
+					// The SDK contract calls signature "the signature to replay some
+					// reasoning blocks across turns": keep it so the replay below can
+					// send it back. The closed flag is only meaningful for thinking
+					// prefixing, which is not supported here; persist its drop as a
+					// diagnostic instead of silently losing it.
+					if (signature) {
+						currentBlock.thinkingSignature = signature;
+					}
+					if (item.closed === true) {
+						appendAssistantMessageDiagnostic(output, {
+							type: "mistral_thinking_closed_dropped",
+							timestamp: Date.now(),
+							details: { hasSignature: signature !== undefined },
+						});
+					}
 					continue;
 				}
 
@@ -538,6 +558,7 @@ function toChatMessages(messages: Message[], supportsImages: boolean): ChatCompl
 						contentParts.push({
 							type: "thinking",
 							thinking: [{ type: "text", text: sanitizeSurrogates(block.thinking) }],
+							...(block.thinkingSignature ? { signature: block.thinkingSignature } : {}),
 						});
 					}
 					continue;

@@ -41,6 +41,7 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.js";
+import { appendAssistantMessageDiagnostic } from "../utils/diagnostics.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
@@ -260,6 +261,11 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 					throw item.serviceUnavailableException;
 				}
 			}
+
+			// Blocks whose contentBlockStop never matched (missing or wrong index)
+			// still need closing: without this sweep the scratch index leaks into
+			// the persisted content and the block never emits its terminal event.
+			closeUnstoppedBlocks(blocks, output, stream);
 
 			if (options.signal?.aborted) {
 				throw new Error("Request was aborted");
@@ -484,15 +490,12 @@ function handleMetadata(
 	}
 }
 
-function handleContentBlockStop(
-	event: ContentBlockStopEvent,
-	blocks: Block[],
+function closeContentBlock(
+	block: Block,
+	index: number,
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
 ): void {
-	const index = blocks.findIndex((b) => b.index === event.contentBlockIndex);
-	const block = blocks[index];
-	if (!block) return;
 	delete (block as Block).index;
 
 	switch (block.type) {
@@ -509,6 +512,37 @@ function handleContentBlockStop(
 			delete (block as Block).partialJson;
 			stream.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: output });
 			break;
+	}
+}
+
+function handleContentBlockStop(
+	event: ContentBlockStopEvent,
+	blocks: Block[],
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+): void {
+	const index = blocks.findIndex((b) => b.index === event.contentBlockIndex);
+	const block = blocks[index];
+	if (!block) return;
+	closeContentBlock(block, index, output, stream);
+}
+
+/**
+ * Close blocks that never saw a matching contentBlockStop (missing or
+ * index-mismatched stop event): the scratch index must not leak into the
+ * persisted content and the block still needs its terminal event. The
+ * recovery is persisted as a message diagnostic so a mangled stream is never
+ * silent.
+ */
+function closeUnstoppedBlocks(blocks: Block[], output: AssistantMessage, stream: AssistantMessageEventStream): void {
+	for (const [index, block] of blocks.entries()) {
+		if ((block as Block).index === undefined) continue;
+		appendAssistantMessageDiagnostic(output, {
+			type: "bedrock_content_block_stop_missing",
+			timestamp: Date.now(),
+			details: { contentBlockIndex: (block as Block).index, blockType: block.type },
+		});
+		closeContentBlock(block, index, output, stream);
 	}
 }
 

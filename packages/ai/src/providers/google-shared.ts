@@ -80,6 +80,11 @@ export function googleUsageCounts(metadata: GoogleUsageMetadataFrame): {
 } {
 	const promptTokens = metadata.promptTokenCount || 0;
 	const cachedTokens = metadata.cachedContentTokenCount || 0;
+	// Google bills thinking separately: candidatesTokenCount excludes the
+	// thought tokens ("response pricing is the sum of output tokens and thinking
+	// tokens", Gemini thinking docs), so thoughtsTokenCount must be added here.
+	// OpenAI's completions count is the opposite (completion_tokens_details is a
+	// breakdown of completion_tokens, so reasoning must NOT be re-added there).
 	const outputTokens = (metadata.candidatesTokenCount || 0) + (metadata.thoughtsTokenCount || 0);
 	return {
 		input: promptTokens - cachedTokens,
