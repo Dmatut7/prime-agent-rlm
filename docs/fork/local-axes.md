@@ -106,3 +106,19 @@
 5. 任何用 `Object.create(DaemonSupervisor.prototype)` / `Object.create(DaemonAgentConnection.prototype)` 的假件 → 核它走的路径是否已改读 roster、是否经过 `reseedStreamReconstructor`；缺桩的表现是**误导性错误信息**（指向 selector 而不指向缺失成员）。
 6. 任何会走真 `appendRotatingLog`/`getAgentLogPath` 的测试 → 必须隔离 `ENV_AGENT_DIR`（F77）。
 7. 碰 `daemon-mode.ts` 的 roster/streaming 段 → **行号更正（R3 全面审查）**：客户端活点在 `src/modes/agents-view/agents-view-mode.ts:217-230`，**不是** `daemon-mode.ts:1898`（那是 cron）；本文档 §一.1 的表本来就是对的，错的是派单文本。**启用前陷阱**：`daemon-mode.ts:4184-4185` 无条件继承上轮的 `streamingMessage`，启用 `omitStreamingMessages` 前必须改成 `summary.isStreaming ? previous.get(...) : undefined`，否则 omit 期间结束的 turn 会把大对象永久钉在 roster 上。
+
+## 六、fork 自更新闸门的两条轴（R16 起）
+
+### 6. `detectForkInstall`：fork 标记 walk ＋ `PRIME_AGENT_FORK_GATE` 测试缝
+
+| 轴 | 落点 | 唯一读者 / 正控 |
+| --- | --- | --- |
+| fork 标记 walk | `src/fork-self-update.ts` 的 `FORK_MARKER_FILE`（`FORK_NOTES.md`）＋ `findForkInstall()` | `src/package-manager-cli.ts` 的 `update --self` 支（唯一的拒绝点）；正控＝`test/fork-self-update.test.ts` 的「detects the checkout this test run itself comes from」 |
+| 环境变量旁路 | 同文件 `FORK_GATE_ENV_VAR`（`PRIME_AGENT_FORK_GATE=off`，**测试缝，不是用户开关**） | `test/package-command-paths.test.ts` 的 `beforeEach`（跑官方更新路径的套件用它跳过拒绝）；正控＝`test/fork-self-update.test.ts` 钉的 warn 断言 |
+
+**什么动作会静默弄死它**
+- 删掉旁路里的 `forkGateLog.warn(...)`：**没有测试会红**（F2 的原始状态就是这样，静默旁路活了整整一天才被台账抓到）。诊断本身由 `test/fork-self-update.test.ts` 的 `setLogSink` 断言守住，改文案要连测试一起改。
+- 把 `findForkInstall` 内联回 `detectForkInstall`：可行，但旁路分支就报不出「被跳过的是哪个 checkout」，`entries[0].repoRoot` 那条断言会红。
+- 把变量比较放宽（`startsWith("off")` / 大小写折叠）：`off `、`OFF` 这类值就会开始关闸，而测试只钉了精确 `off`。
+
+**F4 同批**：`src/core/kernel/repl-manager.ts` 过去自带 `DEFAULT_KERNEL_HEARTBEAT_INTERVAL_MS`(=5000) 与 `KERNEL_LIVENESS_STALE_INTERVALS`(=3) 两枚**零引用导出**，与 `src/core/turn-liveness.ts` 的 `FALLBACK_HEARTBEAT_INTERVAL_MS`/`DEFAULT_STALE_AFTER_INTERVALS` 重复。已删（2026-09-15）。要心跳周期或陈旧阈值**只从 `turn-liveness.ts` 取**；内核自己上报的 `interval_ms` 走 `KernelLivenessSample.intervalMs`，不要在 repl-manager 里再声明第二份默认值。
