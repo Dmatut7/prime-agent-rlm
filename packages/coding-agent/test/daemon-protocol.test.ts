@@ -39,6 +39,131 @@ import {
 	FALLBACK_FAILED_WORKER_LAST_ERROR,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
 
+// X-6: the DAEMON_SCHEMA_ID digest recipe is single-sourced in these two helpers so the
+// identity assertion and the shape-sensitivity assertion below cannot drift apart. Every
+// slice is recomputed from the same source files the production shapes live in.
+interface DaemonSchemaSliceSources {
+	command: string;
+	savedSession: string;
+	outbound: string;
+	treeWire: string;
+	stallEvent: string;
+	stallDiagnostics: string;
+	stallKernel: string;
+	stallExemption: string;
+	snapshotWrapper: string;
+	treeAssembly: string;
+	connectionTreeContract: string;
+	connectionSnapshotWrapper: string;
+	connectionStallContract: string;
+}
+
+function readDaemonSchemaSliceSources(): DaemonSchemaSliceSources {
+	const daemonProtocolSource = readFileSync(resolve(__dirname, "../src/modes/daemon/daemon-protocol.ts"), "utf8");
+	const sessionManagerSource = readFileSync(resolve(__dirname, "../src/core/session-manager.ts"), "utf8");
+	const agentSessionSource = readFileSync(resolve(__dirname, "../src/core/agent-session.ts"), "utf8");
+	const stallDiagnosticsModule = readFileSync(resolve(__dirname, "../src/core/stall-diagnostics.ts"), "utf8");
+	const stallWatchdogSource = readFileSync(resolve(__dirname, "../src/core/stall-watchdog.ts"), "utf8");
+	// X-6: the wrapper and contract layers of the session-tree and stall families live
+	// outside the slices above. DaemonSessionSnapshot.sessionTree is the snapshot wire
+	// wrapper (its field set is not the session-manager stats it carries),
+	// agent-connection/types.ts owns the connection-facing tree DTOs, the snapshot
+	// wrapper contract and the stall event wire DTO, and daemon-mode.ts assembles the
+	// actual get_session_tree response. Until rev35 an edit to any of those rode an
+	// unchanged DAEMON_SCHEMA_ID (the rev34 comment admitted the types.ts stall DTO was
+	// "not an identity" for exactly this reason), so they join the hashed source.
+	const connectionTypesSource = readFileSync(resolve(__dirname, "../src/modes/agent-connection/types.ts"), "utf8");
+	const daemonModeSource = readFileSync(resolve(__dirname, "../src/modes/daemon/daemon-mode.ts"), "utf8");
+	return {
+		command: daemonProtocolSource.slice(
+			daemonProtocolSource.indexOf("export type DaemonCommand ="),
+			daemonProtocolSource.indexOf("type DaemonCommandName"),
+		),
+		savedSession: daemonProtocolSource.slice(
+			daemonProtocolSource.indexOf("export interface DaemonSavedSessionInfo"),
+			daemonProtocolSource.indexOf("export type DaemonDeleteSavedSessionResult"),
+		),
+		outbound: daemonProtocolSource.slice(
+			daemonProtocolSource.indexOf("export type DaemonOutbound ="),
+			daemonProtocolSource.indexOf("export const DAEMON_OUTBOUND_COMPATIBILITY"),
+		),
+		// CM-2: response payload shapes do not live in daemon-protocol.ts (DaemonResponse
+		// types its data as unknown), so hashing only the three request/event slices let
+		// any response-shape edit ride an unchanged DAEMON_SCHEMA_ID. The session tree
+		// wire family - node shapes plus both bound stats (session_snapshot's
+		// sessionTree.bound and get_session_tree's flatNodes/treeBound) - lives in
+		// core/session-manager.ts, so its slice joins the digest.
+		treeWire: sessionManagerSource.slice(
+			sessionManagerSource.indexOf("export interface SessionTreeFlatNode"),
+			sessionManagerSource.indexOf("export interface SessionContext"),
+		),
+		// K3X-1: the stall event family is a wire shape too, but it lives in the
+		// session-event union and the diagnostics payload modules, none of which the
+		// three request/event slices or the session-tree slice cover. An edit to the
+		// stall event or payload shape (DO-1 added `diagnostics` as a required field)
+		// used to leave DAEMON_SCHEMA_ID unchanged, so a mixed old-daemon/new-client
+		// pair passed the handshake with mismatched stall events.
+		stallEvent: agentSessionSource.slice(
+			agentSessionSource.indexOf('| {\n\t\t\ttype: "stall_warning"'),
+			agentSessionSource.indexOf("export type AgentSessionEventListener"),
+		),
+		stallDiagnostics: stallDiagnosticsModule.slice(
+			stallDiagnosticsModule.indexOf("export interface StallDiagnostics"),
+		),
+		stallKernel: stallWatchdogSource.slice(
+			stallWatchdogSource.indexOf("export interface StallKernelDiagnostics"),
+			stallWatchdogSource.indexOf("export interface StallExemptionSnapshot"),
+		),
+		stallExemption: stallWatchdogSource.slice(
+			stallWatchdogSource.indexOf("export interface StallExemptionDiagnostics"),
+			stallWatchdogSource.indexOf("export type StallExemptionEventKind"),
+		),
+		snapshotWrapper: daemonProtocolSource.slice(
+			daemonProtocolSource.indexOf("export interface DaemonSessionSnapshot"),
+			daemonProtocolSource.indexOf("export interface DaemonAttachResult"),
+		),
+		treeAssembly: daemonModeSource.slice(
+			daemonModeSource.indexOf('case "get_session_tree": {'),
+			daemonModeSource.indexOf('case "get_user_messages_for_forking": {'),
+		),
+		connectionTreeContract: connectionTypesSource.slice(
+			connectionTypesSource.indexOf("export interface AgentConnectionSessionTreeFlatNode"),
+			connectionTypesSource.indexOf("export interface AgentConnectionSessionContext"),
+		),
+		connectionSnapshotWrapper: connectionTypesSource.slice(
+			connectionTypesSource.indexOf("export interface AgentConnectionSnapshot"),
+			connectionTypesSource.indexOf("export interface AgentConnectionScopedModel"),
+		),
+		connectionStallContract: connectionTypesSource.slice(
+			connectionTypesSource.indexOf('| {\n\t\t\ttype: "stall_warning"'),
+			connectionTypesSource.indexOf("export type AgentConnectionEvent"),
+		),
+	};
+}
+
+function daemonSchemaDigest(sources: DaemonSchemaSliceSources): string {
+	return createHash("sha256")
+		.update(
+			[
+				sources.command,
+				sources.savedSession,
+				sources.outbound,
+				sources.treeWire,
+				sources.stallEvent,
+				sources.stallDiagnostics,
+				sources.stallKernel,
+				sources.stallExemption,
+				sources.snapshotWrapper,
+				sources.treeAssembly,
+				sources.connectionTreeContract,
+				sources.connectionSnapshotWrapper,
+				sources.connectionStallContract,
+			].join("\n"),
+		)
+		.digest("hex")
+		.slice(0, 12);
+}
+
 describe("daemon protocol helpers", () => {
 	it("serializes worker descriptors as identity-only version 2 state", () => {
 		const descriptor = {
@@ -90,69 +215,88 @@ describe("daemon protocol helpers", () => {
 	});
 
 	it("keeps the advertised schema identity synchronized with wire type shapes", () => {
-		const source = readFileSync(resolve(__dirname, "../src/modes/daemon/daemon-protocol.ts"), "utf8");
-		const commandSource = source.slice(
-			source.indexOf("export type DaemonCommand ="),
-			source.indexOf("type DaemonCommandName"),
-		);
-		const savedSessionSource = source.slice(
-			source.indexOf("export interface DaemonSavedSessionInfo"),
-			source.indexOf("export type DaemonDeleteSavedSessionResult"),
-		);
-		const outboundSource = source.slice(
-			source.indexOf("export type DaemonOutbound ="),
-			source.indexOf("export const DAEMON_OUTBOUND_COMPATIBILITY"),
-		);
-		// CM-2: response payload shapes do not live in daemon-protocol.ts (DaemonResponse
-		// types its data as unknown), so hashing only the three request/event slices let
-		// any response-shape edit ride an unchanged DAEMON_SCHEMA_ID. The session tree
-		// wire family - node shapes plus both bound stats (session_snapshot's
-		// sessionTree.bound and get_session_tree's flatNodes/treeBound) - lives in
-		// core/session-manager.ts, so its slice joins the digest.
-		const sessionManagerSource = readFileSync(resolve(__dirname, "../src/core/session-manager.ts"), "utf8");
-		const treeWireSource = sessionManagerSource.slice(
-			sessionManagerSource.indexOf("export interface SessionTreeFlatNode"),
-			sessionManagerSource.indexOf("export interface SessionContext"),
-		);
-		// K3X-1: the stall event family is a wire shape too, but it lives in the
-		// session-event union and the diagnostics payload modules, none of which the
-		// three request/event slices or the session-tree slice cover. An edit to the
-		// stall event or payload shape (DO-1 added `diagnostics` as a required field)
-		// used to leave DAEMON_SCHEMA_ID unchanged, so a mixed old-daemon/new-client
-		// pair passed the handshake with mismatched stall events.
-		const agentSessionSource = readFileSync(resolve(__dirname, "../src/core/agent-session.ts"), "utf8");
-		const stallEventSource = agentSessionSource.slice(
-			agentSessionSource.indexOf('| {\n\t\t\ttype: "stall_warning"'),
-			agentSessionSource.indexOf("export type AgentSessionEventListener"),
-		);
-		const stallDiagnosticsModule = readFileSync(resolve(__dirname, "../src/core/stall-diagnostics.ts"), "utf8");
-		const stallDiagnosticsSource = stallDiagnosticsModule.slice(
-			stallDiagnosticsModule.indexOf("export interface StallDiagnostics"),
-		);
-		const stallWatchdogSource = readFileSync(resolve(__dirname, "../src/core/stall-watchdog.ts"), "utf8");
-		const stallKernelSource = stallWatchdogSource.slice(
-			stallWatchdogSource.indexOf("export interface StallKernelDiagnostics"),
-			stallWatchdogSource.indexOf("export interface StallExemptionSnapshot"),
-		);
-		const stallExemptionSource = stallWatchdogSource.slice(
-			stallWatchdogSource.indexOf("export interface StallExemptionDiagnostics"),
-			stallWatchdogSource.indexOf("export type StallExemptionEventKind"),
-		);
+		const sources = readDaemonSchemaSliceSources();
 		// The slice markers must be found: a silent -1 would hash an empty string
-		// and let the stall family fall back out of the digest unnoticed.
-		expect(stallEventSource).toContain('type: "stall_warning"');
-		expect(stallEventSource).toContain('type: "stall_unsettled"');
-		expect(stallDiagnosticsSource).toContain("export interface StallDiagnostics");
-		expect(stallKernelSource).toContain("export interface StallKernelDiagnostics");
-		expect(stallExemptionSource).toContain("export interface StallExemptionDiagnostics");
-		const digest = createHash("sha256")
-			.update(
-				`${commandSource}\n${savedSessionSource}\n${outboundSource}\n${treeWireSource}\n` +
-					`${stallEventSource}\n${stallDiagnosticsSource}\n${stallKernelSource}\n${stallExemptionSource}`,
-			)
-			.digest("hex")
-			.slice(0, 12);
+		// and let a family fall back out of the digest unnoticed.
+		expect(sources.stallEvent).toContain('type: "stall_warning"');
+		expect(sources.stallEvent).toContain('type: "stall_unsettled"');
+		expect(sources.stallDiagnostics).toContain("export interface StallDiagnostics");
+		expect(sources.stallKernel).toContain("export interface StallKernelDiagnostics");
+		expect(sources.stallExemption).toContain("export interface StallExemptionDiagnostics");
+		expect(sources.snapshotWrapper).toContain("export interface DaemonSessionSnapshot");
+		expect(sources.snapshotWrapper).toContain("bound?: SessionTreeDepthStats");
+		expect(sources.treeAssembly).toContain('case "get_session_tree"');
+		// The assembly slice must carry the actual response keys, not just the case label:
+		// a renamed key with a stale marker would otherwise hash unrelated text.
+		expect(sources.treeAssembly).toContain("treeBound: bounded.stats");
+		expect(sources.connectionTreeContract).toContain("export interface AgentConnectionSessionTreeBound");
+		expect(sources.connectionTreeContract).toContain("export interface AgentConnectionSessionTreeFlatStats");
+		expect(sources.connectionSnapshotWrapper).toContain("export interface AgentConnectionSnapshot");
+		expect(sources.connectionSnapshotWrapper).toContain("bound?: AgentConnectionSessionTreeBound");
+		expect(sources.connectionStallContract).toContain('type: "stall_warning"');
+		expect(sources.connectionStallContract).toContain('type: "stall_unsettled"');
+		expect(sources.connectionStallContract).toContain("diagnostics?: StallDiagnostics");
+		const digest = daemonSchemaDigest(sources);
 		expect(DAEMON_SCHEMA_ID).toBe(`protocol-${DAEMON_PROTOCOL_VERSION}-schema-${DAEMON_SCHEMA_REVISION}-${digest}`);
+	});
+
+	it("counts wrapper, contract and assembly shape edits as identity changes", () => {
+		// X-6: until rev35 the digest covered only free-text type declarations of the
+		// request/event hemisphere plus the core session-manager shapes. Each mutation
+		// below is one of the holes that admitted: a wrapper field-set change, an
+		// assembly-layer response key rename, and the stall DTO optionality flip the
+		// rev34 comment explicitly disclaimed. Applied in memory, every one of them must
+		// move the digest, or a mixed old-daemon/new-client pair again passes the
+		// handshake with shapes the identity does not cover.
+		const sources = readDaemonSchemaSliceSources();
+		const baseline = daemonSchemaDigest(sources);
+		const mutations: Array<{ name: string; key: keyof DaemonSchemaSliceSources; apply: (text: string) => string }> = [
+			{
+				name: "DaemonSessionSnapshot.sessionTree wrapper field set (N1)",
+				key: "snapshotWrapper",
+				apply: (text) =>
+					text.replace(
+						"bound?: SessionTreeDepthStats;",
+						"treeBound: SessionTreeDepthStats;\n\t\twidthCap: number;",
+					),
+			},
+			{
+				name: "get_session_tree response key rename (N2)",
+				key: "treeAssembly",
+				apply: (text) => text.replace("treeBound: bounded.stats,", "treeLimit: bounded.stats,"),
+			},
+			{
+				name: "connection tree bound stats field set",
+				key: "connectionTreeContract",
+				apply: (text) => text.replace("depthLimit: number;", "depthLimit: number;\n\twidthCap: number;"),
+			},
+			{
+				name: "AgentConnectionSnapshot.sessionTree wrapper field set",
+				key: "connectionSnapshotWrapper",
+				apply: (text) =>
+					text.replace("bound?: AgentConnectionSessionTreeBound;", "treeBound: AgentConnectionSessionTreeBound;"),
+			},
+			{
+				name: "stall event wire contract diagnostics optionality (X-12 shape)",
+				key: "connectionStallContract",
+				apply: (text) => text.replace("diagnostics?: StallDiagnostics;", "diagnostics: StallDiagnostics;"),
+			},
+			{
+				// Positive control: a mutation inside a family the digest has covered since
+				// rev32, proving this method detects a covered-shape edit and is not simply
+				// asserting that any mutation anywhere changes nothing.
+				name: "core session-manager tree stats field set (covered since rev32)",
+				key: "treeWire",
+				apply: (text) => text.replace("leafIncluded: boolean;", "leafIncluded: boolean;\n\twidthCap: number;"),
+			},
+		];
+		expect(mutations.length).toBeGreaterThan(0);
+		for (const mutation of mutations) {
+			const mutatedText = mutation.apply(sources[mutation.key]);
+			expect(mutatedText, `${mutation.name}: mutation marker must apply`).not.toBe(sources[mutation.key]);
+			const digest = daemonSchemaDigest({ ...sources, [mutation.key]: mutatedText });
+			expect(digest, `${mutation.name}: shape edit must change the schema identity`).not.toBe(baseline);
+		}
 	});
 
 	it("requires compatibility metadata for the heartbeat protocol surface", () => {

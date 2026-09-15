@@ -1,0 +1,2 @@
+- Extended the daemon schema identity to also cover the session-tree snapshot wrapper, the get_session_tree response assembly, and the connection-side tree and stall event contracts, so edits to those wire shapes can no longer ride an unchanged schema id and pass a mixed-version handshake.
+- Made the self-update plan unable to claim it should run while carrying a refusal, so a refused release can never install regardless of which field a caller reads first.

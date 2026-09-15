@@ -453,18 +453,38 @@ function printSelfUpdateFallback(command: SelfUpdateCommand): void {
 	console.error(chalk.dim(`If this keeps failing, run this command yourself: ${command.display}`));
 }
 
-interface SelfUpdatePlan {
-	installSpec: string;
-	packageName: string;
-	shouldRun: boolean;
-	targetVersion?: string;
-	/** Set when the release the manifest pointed at could not be verified: the update must not run. */
-	refusal?: string;
-	/** Digest proven for {@link installSpec} when it is a downloaded release artifact. */
-	verifiedArtifact?: VerifiedUpdateArtifact;
-	/** Temp directory holding the verified artifact, removed once the install attempt ends. */
-	artifactDir?: string;
-}
+/**
+ * X-11: a plan either runs or refuses, never both. The plan used to allow
+ * `shouldRun: true` alongside a `refusal`; the one caller happened to check the refusal
+ * first, so nothing broke, but the contract itself could say "run" and "refused" at
+ * once and any consumer reading `shouldRun` first would install a refused release. The
+ * refusal is now structural (r22 FR-1 semantics): `refusal` exists only on the
+ * not-running variant, and `verifiedArtifact` only on the running one, because a
+ * refused plan never verified bytes.
+ */
+type SelfUpdatePlan =
+	| {
+			installSpec: string;
+			packageName: string;
+			shouldRun: true;
+			targetVersion?: string;
+			/** Digest proven for {@link installSpec} when it is a downloaded release artifact. */
+			verifiedArtifact?: VerifiedUpdateArtifact;
+			/** Temp directory holding the verified artifact, removed once the install attempt ends. */
+			artifactDir?: string;
+			refusal?: never;
+	  }
+	| {
+			installSpec: string;
+			packageName: string;
+			shouldRun: false;
+			targetVersion?: string;
+			/** Set when the release the manifest pointed at could not be verified: the update must not run. */
+			refusal?: string;
+			/** Temp directory holding a partially downloaded artifact, removed once the refusal is reported. */
+			artifactDir?: string;
+			verifiedArtifact?: never;
+	  };
 
 const UPDATE_ARTIFACT_MAX_BYTES = 512 * 1024 * 1024;
 const UPDATE_ARTIFACT_TIMEOUT_MS = 120_000;
@@ -572,12 +592,24 @@ async function getSelfUpdatePlan(force: boolean): Promise<SelfUpdatePlan> {
 			// A manifest artifact is downloaded and hash-checked before any install command exists;
 			// a failure here is a refusal, never a silent fallback to the registry package.
 			const artifact = await resolveUpdateArtifact(installSpec);
+			// X-11: a refused artifact yields a not-running plan, not a running plan that
+			// also carries a refusal - the contract makes the two states mutually
+			// exclusive instead of relying on the caller checking refusal before shouldRun.
+			if (artifact.refusal !== undefined) {
+				return {
+					installSpec: artifact.installSpec,
+					packageName,
+					shouldRun: false,
+					targetVersion: latestRelease?.version,
+					refusal: artifact.refusal,
+					artifactDir: artifact.artifactDir,
+				};
+			}
 			return {
 				installSpec: artifact.installSpec,
 				packageName,
 				shouldRun: true,
 				targetVersion: latestRelease?.version,
-				refusal: artifact.refusal,
 				verifiedArtifact: artifact.verifiedArtifact,
 				artifactDir: artifact.artifactDir,
 			};
