@@ -764,11 +764,21 @@ def _status_script(command: str, completion_a: str, completion_b: str) -> str:
 
 # bash()/helper children run model-authored shell code, so their env is an
 # allowlist rather than an inheritance of the kernel env: the worker auth token
-# (PRIME_AGENT_INTERNAL_*), recursion bookkeeping (RLM_*), provider credentials
-# injected for in-kernel skills (SERPER_API_KEY, ANTHROPIC_*, ...) and the user's
-# agent sockets (SSH_AUTH_SOCK) must not reach arbitrary commands. Mirrors
-# rlm.mcp._SAFE_ENV; PRIME_AGENT_ENV_PASSTHROUGH (comma-separated names) opts
-# specific variables back in for commands that genuinely need them.
+# (PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN), recursion bookkeeping (RLM_*),
+# provider credentials injected for in-kernel skills (SERPER_API_KEY,
+# ANTHROPIC_*, ...) and the user's agent sockets (SSH_AUTH_SOCK) must not reach
+# arbitrary commands. Mirrors rlm.mcp._SAFE_ENV; PRIME_AGENT_ENV_PASSTHROUGH
+# (comma-separated names) opts specific variables back in for commands that
+# genuinely need them.
+#
+# The agent's own CLI also travels through this channel (self-update, nested
+# prime-agent runs), so the non-secret routing and opt-out names that CLI reads
+# are forwarded: the update routing pair (supervisor socket path, origin session
+# id - paths and ids, never the worker token), the agentDir/sessionDir pins and
+# supervisor registry dir, and the documented privacy opt-outs
+# (DO_NOT_TRACK/PI_OFFLINE/PRIME_AGENT_TELEMETRY - losing them would silently
+# undo the offline/telemetry switches for nested runs). Keep the host table
+# (packages/coding-agent/src/utils/shell.ts SHELL_CHILD_SAFE_ENV_KEYS) in sync.
 _CHILD_SAFE_ENV = (
     "HOME",
     "PATH",
@@ -789,6 +799,16 @@ _CHILD_SAFE_ENV = (
     "OS",
     "SYSTEMDRIVE",
     "USERPROFILE",
+    # Non-secret routing/opt-out names for the agent's own CLI (see above).
+    "PRIME_AGENT_CODING_AGENT_DIR",
+    "PRIME_AGENT_SESSION_DIR",
+    "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET",
+    "PRIME_AGENT_INTERNAL_DAEMON_WORKER_ACTIVE_SESSION_ID",
+    "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR",
+    "DO_NOT_TRACK",
+    "PI_OFFLINE",
+    "PRIME_AGENT_TELEMETRY",
+    "PRIME_AGENT_TRUSTED_UPDATE_ORIGINS",
 )
 _ENV_PASSTHROUGH_VAR = "PRIME_AGENT_ENV_PASSTHROUGH"
 

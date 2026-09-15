@@ -18,6 +18,29 @@ The built-in `ipython` tool can execute Python, shell commands, and subprocesses
 
 `--offline` disables Prime Agent startup network operations such as update checks. It does not block provider inference, Python, extensions, skills, or executed commands from using the network.
 
+### Shell child environment
+
+The bash tool, `exec`, and extension spawns pass an allowlisted environment to
+child processes instead of the agent process's full environment: worker auth
+tokens, recursion bookkeeping (`RLM_*`), provider credentials, and the user's
+agent sockets do not ride along into model-authored or third-party commands
+(for example npm postinstall scripts or test suites). The kernel-side `bash()`
+applies the same table. Non-secret routing names (the agent and session
+directories, the supervisor socket path and origin session id self-update uses)
+and the documented privacy opt-outs (`DO_NOT_TRACK`, `PI_OFFLINE`,
+`PRIME_AGENT_TELEMETRY`) are forwarded, so a nested Prime Agent CLI launched
+through the shell targets the daemon and directories its parent already owns
+and keeps honoring the user's offline/telemetry switches. Additional names can
+be opted back in with `PRIME_AGENT_ENV_PASSTHROUGH` (comma-separated), set on
+the process that starts Prime Agent.
+
+This filtering is passive-leak hygiene: it stops secrets from silently flowing
+into commands the agent executes. It is not a confidentiality boundary against
+the model itself — the IPython kernel keeps the full process environment, so
+model-authored Python can read `os.environ` and paste values into commands.
+For untrusted work, treat the operating-system boundary as the real one (see
+Recommended Isolation).
+
 ## Recommended Isolation
 
 For untrusted repositories or unattended runs, enforce the boundary outside Prime Agent:

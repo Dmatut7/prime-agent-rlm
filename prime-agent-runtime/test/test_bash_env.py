@@ -54,6 +54,34 @@ class BashChildEnvTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("opted-in-serper-key", result.output)
         self.assertIn("opted-in-token", result.output)
 
+    async def test_bash_children_keep_routing_and_optout_names(self):
+        # Non-secret names the product's own CLI reads when it is launched
+        # through bash(): privacy opt-outs (DO_NOT_TRACK/PI_OFFLINE/telemetry),
+        # update routing (supervisor socket, origin session id, trusted mirror
+        # origins) and the agentDir/sessionDir pins. Losing them silently
+        # retargets the nested CLI; none of them is a credential.
+        routing = {
+            "DO_NOT_TRACK": "1",
+            "PI_OFFLINE": "1",
+            "PRIME_AGENT_TELEMETRY": "0",
+            "PRIME_AGENT_TRUSTED_UPDATE_ORIGINS": "https://mirror.example",
+            "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET": "/tmp/bsh-supervisor.sock",
+            "PRIME_AGENT_INTERNAL_DAEMON_WORKER_ACTIVE_SESSION_ID": "origin-session-42",
+            "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR": "/tmp/bsh-registry",
+            "PRIME_AGENT_CODING_AGENT_DIR": "/tmp/bsh-agentdir",
+            "PRIME_AGENT_SESSION_DIR": "/tmp/bsh-sessiondir",
+            # Negative control in the same child: the worker token stays out.
+            "PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN": "worker-token-xyz",
+        }
+        with mock.patch.dict(os.environ, routing):
+            result = await bash("env | sort")
+        self.assertEqual(result.exit_code, 0)
+        for key, value in routing.items():
+            if key == "PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN":
+                continue
+            self.assertIn(f"{key}={value}", result.output, f"{key} dropped from bash() child")
+        self.assertNotIn("worker-token-xyz", result.output)
+
 
 if __name__ == "__main__":
     unittest.main()
