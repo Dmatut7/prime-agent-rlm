@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -32,6 +33,7 @@ import {
 
 const originalPath = process.env.PATH;
 const originalOffline = process.env.PI_OFFLINE;
+const originalFloating = process.env.PRIME_AGENT_TOOLS_ALLOW_FLOATING;
 const pathDir = join(toolState.toolsDir, "path");
 
 function writeExecutable(filePath: string, exitCode = 0): void {
@@ -63,6 +65,8 @@ describe("tools manager", () => {
 		else process.env.PATH = originalPath;
 		if (originalOffline === undefined) delete process.env.PI_OFFLINE;
 		else process.env.PI_OFFLINE = originalOffline;
+		if (originalFloating === undefined) delete process.env.PRIME_AGENT_TOOLS_ALLOW_FLOATING;
+		else process.env.PRIME_AGENT_TOOLS_ALLOW_FLOATING = originalFloating;
 		rmSync(toolState.toolsDir, { recursive: true, force: true });
 	});
 
@@ -118,7 +122,12 @@ describe("tools manager", () => {
 
 	it("validates a downloaded binary before reporting it available", async () => {
 		toolState.platform = "win32";
+		// Downloads are digest-pinned now, so this case reaches the binary check through the
+		// floating path: its checksum sidecar is what lets a synthetic archive be well-formed.
+		process.env.PRIME_AGENT_TOOLS_ALLOW_FLOATING = "1";
 		writeExecutable(join(toolState.toolsDir, "rg.exe"), 1);
+		const archive = new Uint8Array([1]);
+		const digest = createHash("sha256").update(archive).digest("hex");
 		const fetchMock = vi
 			.fn()
 			.mockResolvedValueOnce(
@@ -127,7 +136,8 @@ describe("tools manager", () => {
 					headers: { "Content-Type": "application/json" },
 				}),
 			)
-			.mockResolvedValueOnce(new Response(new Uint8Array([1]), { status: 200 }));
+			.mockResolvedValueOnce(new Response(`${digest}  ripgrep-15.1.0-x86_64-pc-windows-msvc.zip\n`, { status: 200 }))
+			.mockResolvedValueOnce(new Response(archive, { status: 200 }));
 		vi.stubGlobal("fetch", fetchMock);
 		toolState.extractZip = async (_source, options) => {
 			writeExecutable(join(options.dir, "rg.exe"));
@@ -137,7 +147,7 @@ describe("tools manager", () => {
 			status: "available",
 			path: join(toolState.toolsDir, "rg.exe"),
 		});
-		expect(fetchMock).toHaveBeenCalledTimes(2);
+		expect(fetchMock).toHaveBeenCalledTimes(3);
 	});
 
 	it("removes a downloaded binary that fails its version check", async () => {

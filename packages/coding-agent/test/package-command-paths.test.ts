@@ -1,9 +1,22 @@
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { APP_NAME, ENV_AGENT_DIR, PACKAGE_NAME, SELF_UPDATE_INTERACTIVE_CHILD_ENV, VERSION } from "../src/config.js";
 import { main } from "../src/main.js";
+
+// A self-update artifact is only installable from a copy whose bytes match the digest the release
+// manifest pinned, so these tests serve the manifest and the artifact from one trusted origin.
+const UPDATE_ARTIFACT_BYTES = Buffer.from("prime-agent release payload");
+const UPDATE_ARTIFACT_SHA256 = createHash("sha256").update(UPDATE_ARTIFACT_BYTES).digest("hex");
+const UPDATE_DOWNLOAD_BASE_URL = "https://downloads.example.test/prime-agent";
+
+function stubReleaseFetch(manifest: Record<string, unknown>): ReturnType<typeof vi.fn> {
+	return vi.fn(async (input: Request | string | URL) =>
+		String(input).endsWith(".json") ? Response.json(manifest) : new Response(UPDATE_ARTIFACT_BYTES),
+	);
+}
 
 function restoreEnv(name: string, value: string | undefined): void {
 	if (value === undefined) {
@@ -191,7 +204,7 @@ describe("package commands", () => {
 		const selfPackageDir = join(globalPrefix, "lib", "node_modules", "@earendil-works", "pi-coding-agent");
 		const fakeNpmPath = join(tempDir, "fake-npm.cjs");
 		const recordPath = join(tempDir, "self-update.json");
-		const tarballUrl = "https://downloads.example.test/prime-agent/prime-agent-current.tgz";
+		process.env.PRIME_AGENT_DOWNLOAD_BASE_URL = UPDATE_DOWNLOAD_BASE_URL;
 		mkdirSync(selfPackageDir, { recursive: true });
 		mkdirSync(join(projectDir, ".prime", "agent"), { recursive: true });
 		writeFileSync(
@@ -214,7 +227,11 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
 			value: join(selfPackageDir, "dist", "cli.js"),
 			configurable: true,
 		});
-		const fetchMock = vi.fn(async () => Response.json({ tarball: tarballUrl, version: VERSION }));
+		const fetchMock = stubReleaseFetch({
+			tarball: "prime-agent-current.tgz",
+			sha256: UPDATE_ARTIFACT_SHA256,
+			version: VERSION,
+		});
 		vi.stubGlobal("fetch", fetchMock);
 
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -225,10 +242,15 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
 
 			expect(process.exitCode).toBeUndefined();
 			expect(errorSpy).not.toHaveBeenCalled();
-			expect(fetchMock).toHaveBeenCalledOnce();
+			// Two requests now: the release manifest, then the artifact it pins (whose bytes are
+			// checked against the manifest digest before npm ever sees the file).
+			expect(fetchMock).toHaveBeenCalledTimes(2);
+			expect(String(fetchMock.mock.calls[1]?.[0])).toMatch(/prime-agent-current\.tgz$/);
 			const recordedArgs = JSON.parse(readFileSync(recordPath, "utf-8")) as string[];
 			expect(recordedArgs).toContain(globalPrefix);
-			expect(recordedArgs).toContain(tarballUrl);
+			// The verified local copy, never the URL: npm would fetch any URL without checking it.
+			expect(recordedArgs.join(" ")).toContain("prime-agent-current.tgz");
+			expect(recordedArgs.join(" ")).not.toContain("downloads.example.test");
 			expect(recordedArgs).not.toContain(projectPrefix);
 		} finally {
 			logSpy.mockRestore();
@@ -334,8 +356,7 @@ else {
 		const selfPackageDir = join(globalPrefix, "lib", "node_modules", "@earendil-works", "pi-coding-agent");
 		const fakeNpmPath = join(tempDir, "fake-npm.cjs");
 		const recordPath = join(tempDir, "self-update.json");
-		const baseUrl = "https://downloads.example.test/prime-agent";
-		const tarballPath = "releases/v0.73.0/prime-agent-0.73.0.tgz";
+		const baseUrl = UPDATE_DOWNLOAD_BASE_URL;
 		mkdirSync(selfPackageDir, { recursive: true });
 		writeFileSync(
 			fakeNpmPath,
@@ -360,7 +381,12 @@ else {
 		});
 		vi.stubGlobal(
 			"fetch",
-			vi.fn(async () => Response.json({ package: "prime-agent", tarball: tarballPath, version: "0.73.0" })),
+			stubReleaseFetch({
+				package: "prime-agent",
+				tarball: "releases/v0.73.0/prime-agent-0.73.0.tgz",
+				sha256: UPDATE_ARTIFACT_SHA256,
+				version: "0.73.0",
+			}),
 		);
 
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -372,10 +398,13 @@ else {
 			expect(process.exitCode).toBeUndefined();
 			expect(errorSpy).not.toHaveBeenCalled();
 			const recordedCalls = JSON.parse(readFileSync(recordPath, "utf-8")) as string[][];
-			expect(recordedCalls).toEqual([
-				expect.arrayContaining(["install", "-g", `${baseUrl}/${tarballPath}`]),
-				expect.arrayContaining(["uninstall", "-g", PACKAGE_NAME]),
-			]);
+			expect(recordedCalls).toHaveLength(2);
+			const installArgs = recordedCalls[0] ?? [];
+			expect(installArgs.slice(0, 2)).toEqual(["install", "-g"]);
+			const installedSpec = installArgs[2] ?? "";
+			expect(installedSpec).toMatch(/prime-agent-0\.73\.0\.tgz$/);
+			expect(installedSpec.startsWith(baseUrl)).toBe(false);
+			expect(recordedCalls[1]).toEqual(expect.arrayContaining(["uninstall", "-g", PACKAGE_NAME]));
 		} finally {
 			logSpy.mockRestore();
 			errorSpy.mockRestore();

@@ -86,7 +86,7 @@ export function isNewerPackageVersion(candidateVersion: string, currentVersion: 
 	return candidateVersion.trim() !== currentVersion.trim();
 }
 
-function getPrimeAgentDownloadBaseUrl(): string {
+export function getPrimeAgentDownloadBaseUrl(): string {
 	return (process.env.PRIME_AGENT_DOWNLOAD_BASE_URL?.trim() || DEFAULT_PRIME_AGENT_DOWNLOAD_BASE_URL).replace(
 		/\/+$/,
 		"",
@@ -112,6 +112,28 @@ function resolveReleaseUrl(baseUrl: string, pathOrUrl: string): string | undefin
 	}
 }
 
+const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/;
+
+/**
+ * The digest a release manifest pins its artifact with, as hex. Accepts `sha256: "<hex>"` or the
+ * subresource-integrity spelling `integrity: "sha256-<base64>"`. Anything else reads as "no pin",
+ * and a spec without a pin is refused by `config.ts` rather than installed unverified.
+ */
+function readManifestArtifactSha256(data: { sha256?: unknown; integrity?: unknown }): string | undefined {
+	if (typeof data.sha256 === "string") {
+		const hex = data.sha256.trim().toLowerCase();
+		if (SHA256_HEX_PATTERN.test(hex)) return hex;
+	}
+	if (typeof data.integrity === "string") {
+		const match = data.integrity.trim().match(/^sha256-([A-Za-z0-9+/=]+)$/);
+		if (match) {
+			const hex = Buffer.from(match[1], "base64").toString("hex");
+			if (SHA256_HEX_PATTERN.test(hex)) return hex;
+		}
+	}
+	return undefined;
+}
+
 export async function getLatestPiRelease(
 	currentVersion: string,
 	options: { timeoutMs?: number } = {},
@@ -132,6 +154,8 @@ export async function getLatestPiRelease(
 		package?: unknown;
 		packageName?: unknown;
 		tarball?: unknown;
+		sha256?: unknown;
+		integrity?: unknown;
 		version?: unknown;
 	};
 	if (typeof data.version !== "string" || !data.version.trim()) {
@@ -143,7 +167,14 @@ export async function getLatestPiRelease(
 			: typeof data.packageName === "string" && data.packageName.trim()
 				? data.packageName.trim()
 				: undefined;
-	const installSpec = typeof data.tarball === "string" ? resolveReleaseUrl(baseUrl, data.tarball) : undefined;
+	const resolvedInstallSpec = typeof data.tarball === "string" ? resolveReleaseUrl(baseUrl, data.tarball) : undefined;
+	// A manifest artifact carries its digest: config.ts refuses an unpinned URL outright, so the
+	// pin travels with the spec instead of being re-derived later from the same untrusted source.
+	const artifactSha256 = readManifestArtifactSha256(data);
+	const installSpec =
+		resolvedInstallSpec && artifactSha256 && !resolvedInstallSpec.includes("#sha256=")
+			? `${resolvedInstallSpec}#sha256=${artifactSha256}`
+			: resolvedInstallSpec;
 	const release: LatestPiRelease = { version: normalizeReleaseVersion(data.version) };
 	if (packageName) {
 		release.packageName = packageName;
