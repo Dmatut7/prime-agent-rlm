@@ -65,7 +65,7 @@ const REPL_CONTROL_PROMPT = [
 	"",
 	"Terminology: continual harness names the persisted prompt, memory, skill, and subagent layer; RLM names the runtime, Python REPL kernel, and native call interface exposed to the model.",
 	"",
-	"RLM-native call contract: installed Python skills are pre-imported modules. Read the matching SKILL.md and call its documented function, such as `await <skill_import>.<function>(...)`; when a CLI exists, use `<skill_import> ...` from shell. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Spawn a reusable delegation spec with `await rlm('sub-task')`; admission returns a child handle immediately. Results arrive through an available messaging capability, `await rlm.collect(...)` typed snapshots, or files, never as an `rlm()` return value. Do not invent non-native wrappers such as `call_skill(...)` or `run_subagent(...)`.",
+	"RLM-native call contract: installed Python skills are pre-imported modules. Read the matching SKILL.md and call its documented function, such as `await <skill_import>.<function>(...)`. A skill name is a kernel module name, not a shell command: the kernel venv's bin directory is not on the `bash()` PATH, so there is no `<skill_import> ...` form to run from shell. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Spawn a reusable delegation spec with `await rlm('sub-task')`; admission returns a child handle immediately. Results arrive through an available messaging capability, `await rlm.collect(...)` typed snapshots, or files, never as an `rlm()` return value. Do not invent non-native wrappers such as `call_skill(...)` or `run_subagent(...)`.",
 ].join("\n");
 
 export interface ChildAgentDoctrineOptions {
@@ -92,6 +92,17 @@ export function buildChildAgentDoctrine(options: ChildAgentDoctrineOptions): str
 	return lines.join("\n");
 }
 
+/**
+ * Package installation for the kernel interpreter. Every complete command taught here names the
+ * interpreter it installs into: the kernel venv is built by `uv venv --seed` (bootstrap.ts), so it
+ * really does have pip, and a bare `uv pip install` exits 2 in a shell child because nothing
+ * activates that venv. `<kernel-python>` is the kernel's own `sys.executable`; `<pkg>` is the only
+ * other placeholder. The reality tests in test/prompt-command-reality.test.ts substitute both and
+ * run the result, so this string cannot drift back into a command that fails.
+ */
+export const KERNEL_PACKAGE_INSTALL_PROMPT =
+	'Install additional packages into the kernel environment by naming its interpreter: `uv pip install --python "<kernel-python>" <pkg>`, or with the venv\'s own pip: `"<kernel-python>" -m pip install <pkg>`. `<kernel-python>` is the interpreter running this REPL, so pass `sys.executable`. The kernel venv is created by `uv venv --seed`, so pip really is there; `uv pip install` with no interpreter finds no activated environment and exits, and building a `.venv` to work around that puts the package where the kernel cannot import it. To satisfy an external project\'s imports, use that project\'s own environment instead.';
+
 export function buildRlmPrompt(options: RlmPromptOptions): string {
 	const { cwd, skillsDir, messagesPath } = options;
 	const installedSkills = options.installedSkills ?? [];
@@ -113,8 +124,14 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 		`Working directory: ${cwd}`,
 		`Conversation log: ${messagesPath}`,
 		`Recursive agent depth: ${depth}`,
-		`Pre-installed Python packages: ${DEFAULT_RLM_EXTRA_IMPORT_LABELS.join(", ")}.`,
-		"Install additional packages with `uv pip install <pkg>` (this is a uv-managed venv with no pip module).",
+		// Both lines describe the kernel interpreter, so a session without ipython must not be
+		// told it has packages it cannot import (R12 P-2).
+		...(hasIpython
+			? [
+					`Pre-installed Python packages: ${DEFAULT_RLM_EXTRA_IMPORT_LABELS.join(", ")}.`,
+					KERNEL_PACKAGE_INSTALL_PROMPT,
+				]
+			: []),
 	];
 
 	const childDoctrine = buildChildAgentDoctrine(options);
@@ -133,12 +150,12 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 			skillLines.push(
 				"Read each skill's SKILL.md for its API. Inspect a module with `help(<skill>)` or `dir(<skill>)`, then inspect a documented callable with `inspect.signature(<skill>.<function>)`.",
 			);
-		} else if (canRunShellSkills) {
-			skillLines.push(`Installed skills available as shell commands: ${installed}.`);
-		}
-		if (canRunShellSkills) {
 			skillLines.push(
-				"Each skill is also available as a shell command by the same name: `<skill> ...`. Discover its CLI usage with `<skill> --help`.",
+				"Skill names are kernel module names, not shell commands: the kernel venv's bin directory is not on the `bash()` PATH, so `bash('edit --help')` reports command not found even though `edit` is pre-imported.",
+			);
+		} else if (canRunShellSkills) {
+			skillLines.push(
+				`Python skill modules (${installed}) are callable only from the ipython kernel. This session has no ipython tool, so they cannot be called at all, and their names are not shell commands; read their SKILL.md files and carry out the documented steps with the tools you do have.`,
 			);
 		}
 		if (hasIpython && installedSkills.includes("edit")) {

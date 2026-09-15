@@ -169,9 +169,9 @@ Python skills are installed editable into the kernel venv during kernel setup. B
 
 If you set `PRIME_AGENT_KERNEL_PYTHON`, Prime Agent does not install packages into that environment. The Python must already have a current `prime-agent-runtime` and the default runtime packages installed. Missing Python skill imports are disabled with a warning and calling the skill raises a `RuntimeError`.
 
-### Optional CLI Command
+### Optional CLI Command (for humans, not for the model)
 
-A Python skill can expose a shell command by declaring a console script in `pyproject.toml`. The script name must exactly match the Python import name, including underscores:
+A Python skill can declare a console script in `pyproject.toml`. It is installed into the **kernel venv's** `bin` directory, which is not on the `PATH` the agent's shell tool sees, so this is a manual command for whoever runs `<venv>/bin/<script>`; the model only ever calls the Python module. The script name must exactly match the Python import name, including underscores:
 
 ```toml
 [project]
@@ -191,12 +191,13 @@ async def run(query: str, limit: int = 5) -> str:
     ...
 ```
 
-The model can then call the skill from normal Python or from shell mode:
+The model calls the skill through the kernel:
 
 ```python
 await web_search("prime agent")
-!web_search "prime agent" --limit 3
 ```
+
+There is no shell form for it: the kernel is a plain Python REPL (no `!cmd` escape, no `%%bash` cell), and `web_search` is not on the shell `PATH`. A skill whose `run()` talks to the host through `rlm.host_request` cannot work in a subprocess at all, because the host bridge is the kernel process's own protocol pipe.
 
 ## Creating Skills with Prime Agent
 

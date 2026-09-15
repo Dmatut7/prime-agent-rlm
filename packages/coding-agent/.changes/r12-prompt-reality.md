@@ -1,0 +1,2 @@
+- Fixed the system prompt claiming that every skill is also a same-named shell command; it now says skills are Python modules for the REPL and that a session without the ipython tool cannot call them at all.
+- Fixed the system prompt telling the model to install packages with a bare `uv pip install` and that the kernel venv has no pip; it now names the kernel interpreter, which is the form that actually runs.

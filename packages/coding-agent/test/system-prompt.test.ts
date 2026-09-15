@@ -74,7 +74,7 @@ describe("buildRlmPrompt", () => {
 		expect(prompt).not.toContain("persistent Python REPL");
 	});
 
-	test("keeps shell skill command guidance when ipython is inactive", () => {
+	test("tells a session without ipython that Python skills are not callable there", () => {
 		const prompt = buildRlmPrompt({
 			cwd: "/repo",
 			messagesPath: "/repo/.pi/sessions/session.jsonl",
@@ -83,11 +83,19 @@ describe("buildRlmPrompt", () => {
 			allowRecursion: false,
 		});
 
-		expect(prompt).toContain("Installed skills available as shell commands: `websearch`.");
-		expect(prompt).toContain("Each skill is also available as a shell command");
-		expect(prompt).toContain("`<skill> --help`");
+		// R12: this branch used to advertise `websearch ...` and `<skill> --help` as shell
+		// commands. Nothing on the shell PATH resolves a skill name, and without the ipython
+		// tool the kernel (and the host bridge its skills call) never exists, so the promise
+		// was false twice over. The honest form names the only entry point that works.
+		expect(prompt).toContain("Python skill modules (`websearch`) are callable only from the ipython kernel");
+		expect(prompt).toContain("are not shell commands");
+		expect(prompt).not.toContain("available as shell commands");
+		expect(prompt).not.toContain("available as a shell command");
+		expect(prompt).not.toContain("`<skill> --help`");
 		expect(prompt).not.toContain("Installed Python skill modules (pre-imported)");
 		expect(prompt).not.toContain("Read each skill's SKILL.md for its API");
+		// Kernel environment facts describe an interpreter this session does not have.
+		expect(prompt).not.toContain("Pre-installed Python packages");
 	});
 
 	test("gates agent messaging and observation doctrine on installed Python skills", () => {
@@ -513,7 +521,7 @@ describe("buildSystemPrompt", () => {
 
 		expect(prompt).toContain("You are a general purpose agent that uses code to solve tasks.");
 		expect(prompt).toContain("# Continual Harness State");
-		expect(prompt).toContain("Call contract: use installed skills as shell commands");
+		expect(prompt).toContain("Call contract: installed Python skills are kernel modules and are not shell commands");
 		expect(prompt).toContain("subagent: 1");
 		expect(prompt).not.toContain("persistent Python REPL");
 		expect(prompt).not.toContain("Default to non-blocking subagents");
