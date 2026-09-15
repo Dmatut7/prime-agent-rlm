@@ -18,14 +18,15 @@ import type { Dirent } from "node:fs";
 import { lstatSync } from "node:fs";
 import { readdir, rm } from "node:fs/promises";
 import path from "node:path";
-import { getProcessStartId } from "../session-lease.js";
+import { getProcessStartId, getProcessStartIdsAsync, isProcessAlive } from "../session-lease.js";
 import {
 	confirmReferenceIsStale,
-	judgeReferenceEntry,
-	parseReferenceRecord,
+	inspectReferenceEntry,
 	REFERENCE_PID_FILE_NAME,
 	REFERENCE_RECORD_VERSION,
+	type ReferenceEntryFacts,
 	releaseReferenceFileSync,
+	verdictFromEntryFacts,
 	writeReferenceFileSync,
 } from "./reference-records.js";
 
@@ -299,10 +300,17 @@ export async function readKernelVenvInUseState(
 		}
 		return { references: [], bootClaims: [], unknown: true, swept: [] };
 	}
-	const references: KernelVenvInUseReference[] = [];
-	const bootClaims: KernelVenvInUseReference[] = [];
-	const swept: string[] = [];
-	let unknown = false;
+	// First pass: gather every candidate entry and its on-disk evidence without
+	// resolving any process identity (RC-4: judging one entry at a time forks one
+	// helper process per live holder, ~55ms of synchronous execFileSync each, and
+	// a boot pays that tax for every live reference of every retired generation).
+	const candidates: Array<{
+		pidName: string;
+		tombstone: boolean;
+		bootClaim: boolean;
+		referencePath: string;
+		facts: ReferenceEntryFacts;
+	}> = [];
 	for (const entry of [...entries].sort()) {
 		// A tombstone (`unverified-<pid>`) is a reference whose writer could not create the real
 		// file; it counts, and it makes the state unknown so a rebuild defers instead of deleting.
@@ -319,7 +327,33 @@ export async function readKernelVenvInUseState(
 		// generation nor get deleted.
 		if (!REFERENCE_PID_FILE_NAME.test(pidName)) continue;
 		const referencePath = path.join(dir, entry);
-		const verdict = judgeReferenceEntry(referencePath, pidName);
+		candidates.push({
+			pidName,
+			tombstone,
+			bootClaim,
+			referencePath,
+			facts: inspectReferenceEntry(referencePath),
+		});
+	}
+	// One batched identity resolution for every pid the evidence will ask about. A
+	// pid the batch could not observe is absent from the map, which the verdict
+	// reads exactly like a per-pid query that failed: keep, never "gone".
+	const pidsToResolve = new Set<number>();
+	for (const candidate of candidates) {
+		const record = candidate.facts.record;
+		if (record?.processStartId !== undefined && isProcessAlive(record.pid)) {
+			pidsToResolve.add(record.pid);
+		}
+	}
+	const startIds = await getProcessStartIdsAsync(pidsToResolve);
+	const currentStartIdOf = (pid: number): string | undefined => startIds.get(pid);
+
+	const references: KernelVenvInUseReference[] = [];
+	const bootClaims: KernelVenvInUseReference[] = [];
+	const swept: string[] = [];
+	let unknown = false;
+	for (const { pidName, tombstone, bootClaim, referencePath, facts } of candidates) {
+		const verdict = verdictFromEntryFacts(facts, pidName, currentStartIdOf);
 		if (verdict === "foreign") continue;
 		if (verdict === "stale") {
 			// `sweepStale: false` is the read-only mode: a dry run must not change the filesystem, and
@@ -331,7 +365,7 @@ export async function readKernelVenvInUseState(
 			}
 			continue;
 		}
-		const record = parseReferenceRecord(referencePath);
+		const record = facts.record;
 		if (tombstone) unknown = true;
 		// An unverifiable entry is the "in use" direction for deletion, and for a *reference* it
 		// also makes the rebuild decision defer: a directory whose real state cannot be

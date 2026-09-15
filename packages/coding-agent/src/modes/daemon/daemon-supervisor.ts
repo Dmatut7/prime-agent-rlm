@@ -3986,7 +3986,10 @@ export class DaemonSupervisor {
 				throw new Error("Failed to create daemon session worker startup gate");
 			}
 			childPid = child.pid;
-			childProcessStartId = getProcessStartId(childPid);
+			// R31-14: the identity capture must not fork `ps` synchronously - the supervisor
+			// is single-threaded, so N concurrent launches would queue every client command
+			// behind N helper round trips. The async twin resolves the same identity.
+			childProcessStartId = await getProcessStartIdAsync(childPid);
 			await this.assertRecoveryAllowed();
 
 			const descriptor: DaemonWorkerDescriptor = {

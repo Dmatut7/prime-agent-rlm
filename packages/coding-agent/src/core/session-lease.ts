@@ -217,6 +217,33 @@ function parsePsStartId(stdout: string): string | undefined {
 	return startTime ? `ps:${startTime}` : undefined;
 }
 
+// The batch form of `psStartIdQuery`: one invocation for many pids, rendered with the
+// same pinned locale and timezone so an identity from either form compares equal.
+function psStartIdsQuery(pids: number[]): { command: string; args: string[]; options: ProcessQueryOptions } {
+	return {
+		command: "ps",
+		args: ["-p", pids.join(","), "-o", "pid=,lstart="],
+		options: { env: { ...process.env, LC_ALL: "C", LC_TIME: "C", LANG: "C", TZ: "UTC" } },
+	};
+}
+
+function parsePsStartIds(stdout: string): Map<number, string> {
+	const results = new Map<number, string>();
+	for (const line of stdout.split("\n")) {
+		const trimmed = line.trim();
+		if (!trimmed) {
+			continue;
+		}
+		const pidText = trimmed.split(/\s+/, 1)[0]!;
+		const pid = Number.parseInt(pidText, 10);
+		const startTime = trimmed.slice(pidText.length).trim();
+		if (Number.isInteger(pid) && pid > 0 && startTime) {
+			results.set(pid, `ps:${startTime}`);
+		}
+	}
+	return results;
+}
+
 function parseProcStatStartId(stat: string): string | undefined {
 	const commandEnd = stat.lastIndexOf(")");
 	const fields = stat.slice(commandEnd + 2).split(" ");
@@ -303,6 +330,56 @@ export async function getProcessStartIdAsync(
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * Batch twin of `getProcessStartIdAsync`: one helper round trip resolves the start
+ * identities of many pids (RC-4). A reader that judges one reference record per
+ * entry would otherwise fork once per live holder - ~55ms of synchronous
+ * execFileSync each on macOS/BSD - which is the tax this exists to remove. The
+ * returned map holds an entry per pid the query could observe; a pid it could not
+ * observe (dead, gone, or a failed query) is simply absent, and the caller treats
+ * an unobserved pid exactly like a per-pid query that failed.
+ */
+export async function getProcessStartIdsAsync(
+	pids: Iterable<number>,
+	query: ProcessQueryAsync = runProcessQueryAsync,
+): Promise<Map<number, string>> {
+	const unique = [...new Set(pids)].filter((pid) => Number.isInteger(pid) && pid > 0);
+	const observed = new Map<number, string>();
+	if (unique.length === 0) {
+		return observed;
+	}
+	if (process.platform === "win32") {
+		for (const pid of unique) {
+			const startId = await getProcessStartIdAsync(pid, query);
+			if (startId !== undefined) {
+				observed.set(pid, startId);
+			}
+		}
+		return observed;
+	}
+	const unresolved: number[] = [];
+	for (const pid of unique) {
+		// /proc is the only source that needs no helper process, so drain it first.
+		const fromProc = getProcProcessStartId(pid);
+		if (fromProc !== undefined) {
+			observed.set(pid, fromProc);
+		} else {
+			unresolved.push(pid);
+		}
+	}
+	if (unresolved.length > 0) {
+		try {
+			const { command, args, options } = psStartIdsQuery(unresolved);
+			for (const [pid, startId] of parsePsStartIds(await query(command, args, options))) {
+				observed.set(pid, startId);
+			}
+		} catch {
+			// A failed batch query proves nothing: every unresolved pid stays unobserved.
+		}
+	}
+	return observed;
 }
 
 let currentProcessStartId: string | undefined;
