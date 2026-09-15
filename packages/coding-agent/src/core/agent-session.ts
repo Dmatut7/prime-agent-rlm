@@ -1507,6 +1507,8 @@ export class AgentSession {
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _compactionOperation: Promise<void> | undefined = undefined;
+	/** In-flight manual compact() (r25-1): synchronous admission for mutual exclusion. */
+	private _manualCompactionInFlight: Promise<CompactionResult> | undefined = undefined;
 	/** One recovery attempt per overflow; "reported" dedups the failure notice. */
 	private _overflowRecovery: "idle" | "attempted" | "reported" = "idle";
 	/**
@@ -9771,6 +9773,38 @@ export class AgentSession {
 	async compact(customInstructions?: string, options: { skipAbort?: boolean } = {}): Promise<CompactionResult> {
 		if (options.skipAbort && this.isStreaming) {
 			throw new Error("Cannot compact without aborting while the agent is running.");
+		}
+		// r25-1: manual compaction admission must be synchronous. The body below
+		// publishes _compactionOperation only after `await this.abort()`, so two
+		// concurrent compact() calls used to both pass this point, overwrite each
+		// other's abort controller, and record two compactions. A second caller
+		// coalesces onto the in-flight operation instead (same gate shape as the
+		// navigateTree _branchNavigationQueue chain), so exactly one compaction
+		// runs and abortCompaction() always reaches the live scope.
+		const inFlight = this._manualCompactionInFlight;
+		if (inFlight) {
+			return inFlight;
+		}
+		const operation = this._compact(customInstructions, options);
+		this._manualCompactionInFlight = operation;
+		try {
+			return await operation;
+		} finally {
+			if (this._manualCompactionInFlight === operation) {
+				this._manualCompactionInFlight = undefined;
+			}
+		}
+	}
+
+	private async _compact(
+		customInstructions?: string,
+		options: { skipAbort?: boolean } = {},
+	): Promise<CompactionResult> {
+		// Serialize against an auto compaction that was still registering when
+		// abort() snapshotted _compactionOperation; wait it out before running.
+		const autoCompactionOperation = this._compactionOperation;
+		if (autoCompactionOperation) {
+			await autoCompactionOperation.catch(() => undefined);
 		}
 		const hadPostCompactionContinue = this._postCompactionContinuationScheduled;
 		const continueAfterSessionInput = this._postCompactionContinuationSettlement?.continueAfterSessionInput ?? false;
