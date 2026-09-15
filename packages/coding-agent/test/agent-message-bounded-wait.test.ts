@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentFamilyRosterResult } from "../src/core/agent-messages.js";
 import {
 	type AgentSessionMessageReceipt,
@@ -58,29 +58,52 @@ function sendPayload(message = "hello") {
 	return { type: "agent_message.send", message, receiver_role: "child", receiver_name: "worker" };
 }
 
+/** The publication bounds below are driven by a fake clock, never by the wall clock. */
+afterEach(() => {
+	vi.useRealTimers();
+});
+
 describe("agent_message.send bounded target wait (P1-1)", () => {
 	it("returns a readable outcome instead of hanging on a publication that never settles", async () => {
+		// One injected clock drives both the budget and the measurement. With real timers the two
+		// are independent (the timer wheel rounds to whole ms, Date.now() is the wall clock), so the
+		// same 40ms bound was observed reporting 39ms waited under CI load - a coin flip at the
+		// boundary rather than a verdict about the wait.
+		vi.useFakeTimers();
 		const timeouts: unknown[] = [];
-		const handlers = createAgentMessageHostHandlers(
-			controller({ publication: new Promise<string | undefined>(() => {}) }) as never,
-			{ publicationWaitMs: 40, onWaitTimeout: (facts) => timeouts.push(facts) },
-		);
+		const target = controller({ publication: new Promise<string | undefined>(() => {}) });
+		const handlers = createAgentMessageHostHandlers(target as never, {
+			publicationWaitMs: 40,
+			onWaitTimeout: (facts) => timeouts.push(facts),
+		});
 
-		const result = await handlers["agent_message.send"]!(sendPayload());
+		const send = handlers["agent_message.send"]!(sendPayload());
+		// Up to its budget the wait gives up on neither side: no timeout fact, and no delivery
+		// either, because the publication is still what the caller is waiting on.
+		await vi.advanceTimersByTimeAsync(39);
+		expect(timeouts).toEqual([]);
+		expect(target.sentTo).toEqual([]);
+		await vi.advanceTimersByTimeAsync(1);
+		const result = await send;
 		// The wait timed out, the publication was left running, and the send still went through on
 		// the roster match: the model gets its message delivered, not an error to retry.
 		expect(result).toMatchObject({ deliveryStatus: "delivered", target: { activeSessionId: "child-1" } });
 		expect(timeouts).toHaveLength(1);
 		expect(timeouts[0]).toMatchObject({ phase: "publication", target: "worker" });
-		expect((timeouts[0] as { waitedMs: number }).waitedMs).toBeGreaterThanOrEqual(40);
+		// The bound is what bounded it: the wait reports exactly the budget it was given.
+		expect((timeouts[0] as { waitedMs: number }).waitedMs).toBe(40);
+		// And it left nothing behind: the un-settled publication does not keep a timer armed.
+		expect(vi.getTimerCount()).toBe(0);
 	});
 
 	it("reports a roster miss after a timed-out wait as an actionable error", async () => {
+		vi.useFakeTimers();
 		const handlers = createAgentMessageHostHandlers(
 			controller({ publication: new Promise<string | undefined>(() => {}) }) as never,
 			{ publicationWaitMs: 20 },
 		);
-		await expect(
+		// Attached before the clock runs so the rejection is never unhandled.
+		const rejected = expect(
 			handlers["agent_message.send"]!({
 				type: "agent_message.send",
 				message: "hello",
@@ -88,6 +111,8 @@ describe("agent_message.send bounded target wait (P1-1)", () => {
 				receiver_name: "nobody",
 			}),
 		).rejects.toThrow(/No child matches/);
+		await vi.advanceTimersByTimeAsync(20);
+		await rejected;
 	});
 
 	it("delivers to a healthy target end to end (positive control)", async () => {

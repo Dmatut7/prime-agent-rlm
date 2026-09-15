@@ -10,6 +10,7 @@ import { ENV_AGENT_DIR, getAgentTracesLogPath } from "../src/config.js";
 import {
 	catchUpAgentTraceUploads,
 	findAgentTraceFiles,
+	flushAgentTraceUploads,
 	installAgentTraceUpload,
 	previewAgentTraceFile,
 	uploadAgentTraceFile,
@@ -133,6 +134,11 @@ function listTree(root: string): string[] {
 	return found.sort();
 }
 
+/** Every delay armed since the spy was last cleared: the arms of one action, not of the process. */
+function armedDelays(spy: { mock: { calls: unknown[][] } }): number[] {
+	return spy.mock.calls.map((call) => Number(call[1]));
+}
+
 async function advanceTimersUntil(condition: () => boolean): Promise<void> {
 	for (let step = 0; step < 200 && !condition(); step += 1) {
 		await stat(new URL(import.meta.url));
@@ -206,7 +212,11 @@ describe("agent trace upload", () => {
 			process.env.PRIME_API_BASE_URL = originalPrimeBaseUrl;
 		}
 		if (tempDir && existsSync(tempDir)) {
-			rmSync(tempDir, { recursive: true, force: true });
+			// Teardown hygiene, not an assertion. A test that ends while an upload leg is still
+			// running leaves real file system work queued, and the removal races it (`ENOTEMPTY`
+			// from this line in CI runs #94/#95). Bounded, and only retried on the transient errors
+			// a concurrent write can cause; the tests themselves await their legs.
+			rmSync(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 		}
 	});
 
@@ -503,6 +513,7 @@ describe("agent trace upload", () => {
 		mkdirSync(cwd, { recursive: true });
 		const sessionManager = SessionManager.create(cwd, sessionDir);
 		sessionManager.newSession({ id: "throttled-session" });
+		const sessionFile = sessionManager.getSessionFile() as string;
 
 		const calls: FetchCall[] = [];
 		installAgentTraceUpload(sessionManager, {
@@ -514,14 +525,42 @@ describe("agent trace upload", () => {
 			fetchFn: createFetchRecorder(calls),
 		});
 
+		setTimeoutSpy.mockClear();
 		sessionManager.appendMessage(createUserMessage("hello"));
 		sessionManager.appendMessage(createAssistantMessage("hi"));
-		expect(Number(setTimeoutSpy.mock.calls.at(-1)?.[1])).toBe(1_000);
-		await advanceTimersUntil(() => calls.length === 1);
+		// Every timer this persist armed, not just the last one in the process: a persist arms the
+		// debounce and nothing else.
+		expect(armedDelays(setTimeoutSpy)).toEqual([1_000]);
+
+		// Fire the debounce by moving the one clock this test measures against. Reaching for "the
+		// next timer" instead would jump onto the leg's own request timeout and slide the minute
+		// the throttle is computed from.
+		await vi.advanceTimersByTimeAsync(1_000);
+		// Await the leg, not just the request: what the upload still writes after the response -
+		// its outbox cursor - is real file system work, and in CI runs #94/#95 it was still queued
+		// when this fixture was deleted (`ENOTEMPTY` from the afterEach rmSync, attributed to the
+		// test that was running). Awaiting it is both the race-free teardown and the proof that the
+		// upload ran against the entry that had persisted.
+		await flushAgentTraceUploads(sessionManager);
+		expect(calls).toHaveLength(1);
+		expect(readOutboxEntry(tempDir, sessionFile)).toMatchObject({
+			sessionFile,
+			size: Buffer.byteLength(readFileSync(sessionFile, "utf8")),
+		});
 
 		setTimeoutSpy.mockClear();
 		sessionManager.appendMessage(createUserMessage("next"));
-		expect(Number(setTimeoutSpy.mock.calls.at(-1)?.[1])).toBe(60_000);
+		// The next attempt is scheduled for the rest of the minute, and it is the only thing armed.
+		expect(armedDelays(setTimeoutSpy)).toEqual([60_000]);
+
+		// At most once per minute, as behaviour rather than as a timer argument: one ms short of
+		// the minute the second upload has not started.
+		await vi.advanceTimersByTimeAsync(59_999);
+		await flushAgentTraceUploads(sessionManager);
+		expect(calls).toHaveLength(1);
+		await vi.advanceTimersByTimeAsync(1);
+		await flushAgentTraceUploads(sessionManager);
+		expect(calls).toHaveLength(2);
 	});
 
 	it("surfaces the underlying fetch cause and logs the failure", async () => {

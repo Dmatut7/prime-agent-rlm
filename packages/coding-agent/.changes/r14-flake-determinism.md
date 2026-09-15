@@ -1,0 +1,1 @@
+- Fixed a scheduled trace upload that was still writing its outbox cursor when the session directory went away, which lost the cursor and made the next start send the same bytes again.
