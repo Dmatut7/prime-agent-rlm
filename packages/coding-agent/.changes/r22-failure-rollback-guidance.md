@@ -1,0 +1,3 @@
+- Changed `prime-agent update` to report a release manifest that could not be fetched with retry and manifest-source guidance, instead of attributing the failure to a registry spec served by the manifest.
+- Changed shutdown reporting to credit a signalled daemon that died before unlinking its socket file as stopped, with the leftover file named as residue instead of the target being reported left running.
+- Changed the untrusted update artifact refusal to name PRIME_AGENT_TRUSTED_UPDATE_ORIGINS as the way to trust a mirror origin.

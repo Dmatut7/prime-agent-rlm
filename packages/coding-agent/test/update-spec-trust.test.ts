@@ -145,6 +145,16 @@ describe("self-update spec trust policy", () => {
 		});
 	});
 
+	test("the untrusted-origin refusal names the env that widens artifact trust", () => {
+		delete process.env.PRIME_AGENT_TRUSTED_UPDATE_ORIGINS;
+		const mirrorSpec = `https://mirror.example.com/releases/prime-agent-0.9.1.tgz#sha256=${PINNED_SHA}`;
+		expect(classifyUpdateSpec(mirrorSpec)).toMatchObject({ kind: "rejected", reason: "untrusted_artifact_source" });
+		const instruction = getSelfUpdateUnavailableInstruction("prime-agent", undefined, mirrorSpec);
+		// The regression: a mirror user was refused with only the published-installer
+		// suggestion, while the env that exists exactly for their case went unnamed.
+		expect(instruction).toContain("PRIME_AGENT_TRUSTED_UPDATE_ORIGINS");
+	});
+
 	test("verifyUpdateArtifactHash rejects bytes that do not match the pinned digest", () => {
 		const bytes = Buffer.from("prime-agent release payload");
 		const digest = createHash("sha256").update(bytes).digest("hex");

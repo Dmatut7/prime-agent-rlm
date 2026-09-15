@@ -538,18 +538,37 @@ function setSelfUpdateNoChangeExitCode(): void {
 		process.env[SELF_UPDATE_INTERACTIVE_CHILD_ENV] === "1" ? SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE : undefined;
 }
 
+/**
+ * FR-1: a manifest that could not be fetched is a fetch problem, not a statement about the
+ * manifest's content. Attributing it to "the manifest served a registry spec" would steer a
+ * network or endpoint failure at the registry lane this gate exists to keep closed, so the
+ * guidance stays on retrying and on the manifest source, and never on the allowance.
+ */
+function manifestFetchFailureRefusal(): string {
+	return `could not fetch the release manifest; refusing to fall back to an unpinned registry install. Retry the update, or check the release manifest source (PRIME_AGENT_DOWNLOAD_BASE_URL) and network reachability if the failure persists`;
+}
+
 async function getSelfUpdatePlan(force: boolean): Promise<SelfUpdatePlan> {
 	try {
 		const latestRelease = await getLatestPiRelease(VERSION);
-		const packageName = latestRelease?.packageName ?? PACKAGE_NAME;
-		const installSpec = latestRelease?.installSpec ?? packageName;
-		const packageRenameRequiresUpdate = !latestRelease?.installSpec && packageName !== PACKAGE_NAME;
-		if (
-			force ||
-			!latestRelease ||
-			packageRenameRequiresUpdate ||
-			isNewerPackageVersion(latestRelease.version, VERSION)
-		) {
+		// `getLatestPiRelease` answers an unusable manifest (HTTP error, non-manifest JSON,
+		// version-check opt-out) with undefined instead of throwing; without this branch that
+		// answer fell through to the bare package name and read as a registry spec.
+		if (!latestRelease) {
+			if (process.env[ALLOW_REGISTRY_UPDATE_ENV] === "1") {
+				return { installSpec: PACKAGE_NAME, packageName: PACKAGE_NAME, shouldRun: true };
+			}
+			return {
+				installSpec: PACKAGE_NAME,
+				packageName: PACKAGE_NAME,
+				shouldRun: false,
+				refusal: manifestFetchFailureRefusal(),
+			};
+		}
+		const packageName = latestRelease.packageName ?? PACKAGE_NAME;
+		const installSpec = latestRelease.installSpec ?? packageName;
+		const packageRenameRequiresUpdate = !latestRelease.installSpec && packageName !== PACKAGE_NAME;
+		if (force || packageRenameRequiresUpdate || isNewerPackageVersion(latestRelease.version, VERSION)) {
 			// A manifest artifact is downloaded and hash-checked before any install command exists;
 			// a failure here is a refusal, never a silent fallback to the registry package.
 			const artifact = await resolveUpdateArtifact(installSpec);
@@ -567,7 +586,8 @@ async function getSelfUpdatePlan(force: boolean): Promise<SelfUpdatePlan> {
 		// GL-5 SM-2: a manifest fetch failure must not degrade into an unpinned
 		// registry install of the bare package name. The registry lane is opt-in;
 		// without it the update refuses instead of letting the configured registry
-		// or a mirror decide the bytes.
+		// or a mirror decide the bytes. FR-1: the refusal text guides at the fetch,
+		// never at opening the registry lane.
 		if (process.env[ALLOW_REGISTRY_UPDATE_ENV] === "1") {
 			return { installSpec: PACKAGE_NAME, packageName: PACKAGE_NAME, shouldRun: true };
 		}
@@ -575,7 +595,7 @@ async function getSelfUpdatePlan(force: boolean): Promise<SelfUpdatePlan> {
 			installSpec: PACKAGE_NAME,
 			packageName: PACKAGE_NAME,
 			shouldRun: false,
-			refusal: `could not fetch the release manifest; refusing to fall back to an unpinned registry install (set ${ALLOW_REGISTRY_UPDATE_ENV}=1 to allow it)`,
+			refusal: manifestFetchFailureRefusal(),
 		};
 	}
 
