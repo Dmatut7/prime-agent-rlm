@@ -1,0 +1,2 @@
+- Fixed the /share secret preflight missing a configured credential whose value a terminal wrapped across lines: the exact comparison now also runs with line wraps removed, mapped back to the uploaded bytes.
+- Brought the tui CI job (node --test) into the coverage gate: it now writes a junit report checked by scripts/check-node-test-coverage.mjs with its own floors.

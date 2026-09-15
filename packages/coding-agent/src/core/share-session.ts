@@ -108,6 +108,39 @@ function secretComparisonForms(value: string): string[] {
 	return forms;
 }
 
+/**
+ * Line-wrap fold: a terminal wraps a pasted value (or a copy-paste re-wraps it), so the
+ * value reaches the uploaded text as two halves with `\r\n`/`\n`/`\r` inside it. The exact
+ * comparison is the check no unknown shape can slip past, so it also compares with every
+ * line wrap removed - the same fold applied to the value and to the scanned text, so the
+ * only difference folding can bridge is wrapping itself. Scan-only normalization: an
+ * occurrence found in the folded text is mapped back to the span it occupies in the bytes
+ * that will actually be uploaded, and the shape detectors' sensitivity is untouched.
+ */
+function foldLineWraps(text: string): string {
+	return text.replace(/\r\n|\r|\n/g, "");
+}
+
+/** One view with its wraps removed, and where each surviving character sits in the original. */
+interface FoldedView {
+	text: string;
+	offsets: number[];
+}
+
+/** Nothing to fold (no wrap in the text): the raw comparison already covers this view. */
+function foldViewText(text: string): FoldedView | undefined {
+	if (!text.includes("\n") && !text.includes("\r")) return undefined;
+	const offsets: number[] = [];
+	let folded = "";
+	for (let position = 0; position < text.length; position += 1) {
+		const char = text[position];
+		if (char === "\r" || char === "\n") continue;
+		offsets.push(position);
+		folded += char;
+	}
+	return { text: folded, offsets };
+}
+
 interface ShareSecretScan {
 	findings: ShareSecretFinding[];
 	/**
@@ -159,6 +192,15 @@ function scanShareSecretViews(views: readonly ShareScanView[], options?: ShareSe
 		}
 	}
 
+	// The folded pass is computed once per view, only when a view actually carries a wrap.
+	const foldedViews = new Map<ShareScanView, FoldedView | undefined>();
+	const foldedViewOf = (view: ShareScanView): FoldedView | undefined => {
+		if (!foldedViews.has(view)) {
+			foldedViews.set(view, foldViewText(view.text));
+		}
+		return foldedViews.get(view);
+	};
+
 	for (const secret of options?.secretValues ?? []) {
 		// Every loaded value is compared against every view, with no shape and no plausibility in
 		// the way. A `compareOnly` value is compared and then not reported *on its own*: it names
@@ -186,6 +228,33 @@ function scanShareSecretViews(views: readonly ShareScanView[], options?: ShareSe
 						reported = true;
 					}
 					index = view.text.indexOf(form, index + form.length);
+				}
+			}
+			// The folded pass: the form with its wraps removed, compared against each view
+			// with its wraps removed, mapped back to the original span - wrap included, so a
+			// removal replaces the value exactly as it appears in the uploaded bytes. A value
+			// present intact is found by both passes at the same span; the removal half
+			// already skips spans it has replaced.
+			const foldedForm = foldLineWraps(form);
+			if (foldedForm.length === 0) continue;
+			for (const view of views) {
+				const folded = foldedViewOf(view);
+				if (folded === undefined) continue;
+				let index = folded.text.indexOf(foldedForm);
+				while (index >= 0) {
+					const start = folded.offsets[index] ?? 0;
+					const end = (folded.offsets[index + foldedForm.length - 1] ?? start) + 1;
+					occurrences.push({ offset: start, length: end - start });
+					if (!reported) {
+						record(
+							view,
+							"Configured credential",
+							{ value: secret.value, index: start, name: secret.source },
+							secret.source,
+						);
+						reported = true;
+					}
+					index = folded.text.indexOf(foldedForm, index + foldedForm.length);
 				}
 			}
 		}
