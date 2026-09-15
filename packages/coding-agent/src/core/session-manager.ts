@@ -72,6 +72,15 @@ const SESSION_LIST_SEARCH_TEXT_MAX_CHARS = 64 * 1024;
 const SESSION_LIST_PARSE_MAX_LINE_CHARS = 1024 * 1024;
 const SESSION_LIST_LARGE_MESSAGE_PREVIEW_MAX_CHARS = 256;
 const SESSION_STREAMING_LOAD_THRESHOLD_BYTES = 128 * 1024 * 1024;
+/**
+ * LAT-3: one child_usage_attributed line per streamed child assistant message
+ * made the ledger 55.8% of a real 101,481-line transcript (56,622 lines for 288
+ * child targets). Consecutive attributions for the same target are coalesced on
+ * disk: the first lands immediately, later deltas merge into one line per
+ * window. In-memory entries and every usage fold stay per-merge exact.
+ */
+const CHILD_USAGE_ATTRIBUTION_COALESCE_MAX_MERGES = 32;
+const CHILD_USAGE_ATTRIBUTION_COALESCE_MAX_AGE_MS = 120_000;
 const SESSION_ASYNC_PARSE_YIELD_BYTES = 4 * 1024 * 1024;
 /** A session header is one short line; anything longer than this is not recoverable as one. */
 const SESSION_HEADER_SCAN_MAX_BYTES = 64 * 1024;
@@ -179,6 +188,23 @@ export interface ChildUsageAttributionEntry extends SessionEntryBase {
 	childUsage: Usage;
 	aggregateUsage: Usage;
 	origin?: "spawn_task" | "agent_message" | "direct_user";
+}
+
+/**
+ * Deltas from child_usage_attributed merges that have not been written to the
+ * session file yet. The flush line carries the summed childUsage, the newest
+ * aggregateUsage, and splices the chain (id of the last merge, parentId of the
+ * first unwritten merge) so a reload folds the same totals.
+ */
+interface PendingAttributionWrite {
+	firstParentId: string | null;
+	childUsage: Usage;
+	aggregateUsage: Usage;
+	origin?: ChildUsageAttributionEntry["origin"];
+	lastId: string;
+	lastTimestamp: string;
+	merges: number;
+	startedAt: number;
 }
 
 export interface LabelEntry extends SessionEntryBase {
@@ -1956,6 +1982,10 @@ export class SessionManager {
 	private leafId: string | null = null;
 	private persistListeners = new Set<SessionPersistListener>();
 	private persistFailureListeners = new Set<SessionPersistFailureListener>();
+	/** LAT-3: per-target attribution deltas not yet written to the file; see PendingAttributionWrite. */
+	private readonly pendingAttributionWrites = new Map<string, PendingAttributionWrite>();
+	/** LAT-3: last persisted agent_status, so byte-identical re-writes can be skipped. */
+	private lastAgentStatusWrite: { id: string; status: AgentStatus } | undefined;
 
 	private constructor(
 		cwd: string,
@@ -1990,6 +2020,7 @@ export class SessionManager {
 	 * lets the async daemon path skip the synchronous re-read.
 	 */
 	setSessionFile(sessionFile: string, preloadedEntries?: FileEntry[]): void {
+		this.pendingAttributionWrites.clear();
 		this.sessionFile = resolve(sessionFile);
 		if (existsSync(this.sessionFile)) {
 			try {
@@ -2110,6 +2141,8 @@ export class SessionManager {
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
 		this.leafId = null;
+		this.pendingAttributionWrites.clear();
+		this.lastAgentStatusWrite = undefined;
 		this._rescanEntryStats();
 		this.flushed = false;
 
@@ -2124,10 +2157,15 @@ export class SessionManager {
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
 		this.leafId = null;
+		this.lastAgentStatusWrite = undefined;
 		this._rescanEntryStats();
 		for (const entry of this.fileEntries) {
 			if (entry.type === "session") continue;
 			this.byId.set(entry.id, entry);
+			if (entry.type === "agent_status") {
+				const statusEntry = entry as AgentStatusEntry;
+				this.lastAgentStatusWrite = { id: statusEntry.id, status: { ...statusEntry.status } };
+			}
 			if (entry.type === "leaf_position") {
 				// A position marker resolves to the entry it points at, not to itself,
 				// and the last entry in the file still wins: transcripts written before
@@ -2154,6 +2192,9 @@ export class SessionManager {
 
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
+		// A rewrite materializes every in-memory entry as its own line, so any
+		// deferred attribution deltas are already on disk afterwards.
+		this.pendingAttributionWrites.clear();
 		const content = `${this.fileEntries.map((e) => JSON.stringify(e)).join("\n")}\n`;
 		writePrivateFileAtomicLines(this.sessionFile, [content], {
 			preserveOwnership: true,
@@ -2513,8 +2554,84 @@ export class SessionManager {
 			aggregateUsage: cloneUsage(aggregateUsage),
 			...(origin ? { origin } : {}),
 		};
-		this._appendEntry(entry);
+		this._pushIndexedEntry(entry);
+		this.leafId = entry.id;
+		// LAT-3: the first attribution lands on disk exactly as before, so a
+		// single-shot child run (and every reader of a short transcript) sees
+		// unchanged behavior. Later merges for the same target only join the
+		// in-memory ledger; their deltas are summed into one file line at the
+		// next flush instead of one line per streamed child message.
+		const pending = this.pendingAttributionWrites.get(targetId);
+		if (!pending) {
+			this._persist(entry);
+			this.pendingAttributionWrites.set(targetId, {
+				firstParentId: null,
+				childUsage: emptyUsage(),
+				aggregateUsage: cloneUsage(aggregateUsage),
+				origin,
+				lastId: entry.id,
+				lastTimestamp: entry.timestamp,
+				merges: 0,
+				startedAt: Date.now(),
+			});
+			return entry.id;
+		}
+		if (pending.merges === 0) pending.firstParentId = entry.parentId;
+		addAssistantUsage(pending.childUsage, entry.childUsage);
+		pending.aggregateUsage = cloneUsage(aggregateUsage);
+		if (origin) pending.origin = origin;
+		pending.lastId = entry.id;
+		pending.lastTimestamp = entry.timestamp;
+		pending.merges += 1;
+		if (
+			pending.merges >= CHILD_USAGE_ATTRIBUTION_COALESCE_MAX_MERGES ||
+			Date.now() - pending.startedAt >= CHILD_USAGE_ATTRIBUTION_COALESCE_MAX_AGE_MS
+		) {
+			this._flushPendingAttributionWrite(targetId);
+		}
 		return entry.id;
+	}
+
+	/**
+	 * Write one coalesced line for a target's deferred attribution deltas. The
+	 * line reuses the last merge's id and the first unwritten merge's parentId,
+	 * so the reloaded chain splices past the merges whose lines were skipped;
+	 * childUsage carries exactly the deferred delta sum, so every delta-based
+	 * fold (readSessionInfo scan, OwnUsageAccumulator, whole-file refold) totals
+	 * the same as one line per merge.
+	 */
+	private _flushPendingAttributionWrite(targetId: string): void {
+		const pending = this.pendingAttributionWrites.get(targetId);
+		if (!pending || pending.merges === 0) return;
+		const entry: ChildUsageAttributionEntry = {
+			type: "child_usage_attributed",
+			id: pending.lastId,
+			parentId: pending.firstParentId,
+			timestamp: pending.lastTimestamp,
+			targetId,
+			childUsage: pending.childUsage,
+			aggregateUsage: pending.aggregateUsage,
+			...(pending.origin ? { origin: pending.origin } : {}),
+		};
+		this._persist(entry);
+		// Re-seed instead of dropping the pending state: the next merge for this
+		// target stays deferred, so each window costs one line rather than one
+		// line plus a new immediate line.
+		pending.firstParentId = null;
+		pending.childUsage = emptyUsage();
+		pending.merges = 0;
+		pending.startedAt = Date.now();
+	}
+
+	/**
+	 * Persist every deferred attribution delta now. Called at child-run settle
+	 * and other close boundaries so the file ledger matches what a reload folds
+	 * instead of holding deltas back for the next window flush.
+	 */
+	flushChildUsageAttributions(): void {
+		for (const targetId of [...this.pendingAttributionWrites.keys()]) {
+			this._flushPendingAttributionWrite(targetId);
+		}
 	}
 
 	appendSessionInfo(name: string): string {
@@ -2605,6 +2722,19 @@ export class SessionManager {
 	}
 
 	appendAgentStatus(status: AgentStatus): string {
+		// LAT-3: the summarizer persists on every idle settle, even when the
+		// verdict is byte-identical to the last one (16,158 of 17,081 lines on
+		// the real 101,481-line transcript). Every reader folds newest-wins, so
+		// an identical consecutive write carries no information: skip it.
+		const last = this.lastAgentStatusWrite;
+		if (
+			last &&
+			last.status.summary === status.summary &&
+			last.status.taskState === status.taskState &&
+			last.status.basedOnMessageCount === status.basedOnMessageCount
+		) {
+			return last.id;
+		}
 		const entry: AgentStatusEntry = {
 			type: "agent_status",
 			id: generateId(this.byId),
@@ -2617,6 +2747,7 @@ export class SessionManager {
 			},
 		};
 		this._appendEntry(entry);
+		this.lastAgentStatusWrite = { id: entry.id, status: { ...entry.status } };
 		return entry.id;
 	}
 
