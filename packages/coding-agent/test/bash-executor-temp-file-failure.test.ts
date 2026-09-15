@@ -17,8 +17,21 @@ import { DEFAULT_MAX_BYTES } from "../src/core/tools/truncate.js";
 const scratchDirs: string[] = [];
 const previousTmpdir = process.env.TMPDIR;
 
+/**
+ * Red in CI, green on macOS before this was extracted: assigning `undefined` to `process.env`
+ * writes the string "undefined", so an environment that had no TMPDIR (ubuntu runners) came back
+ * poisoned. An absent value has to be restored with `delete`.
+ */
+function restoreTmpdir(value: string | undefined): void {
+	if (value === undefined) {
+		delete process.env.TMPDIR;
+		return;
+	}
+	process.env.TMPDIR = value;
+}
+
 afterEach(() => {
-	process.env.TMPDIR = previousTmpdir;
+	restoreTmpdir(previousTmpdir);
 	while (scratchDirs.length > 0) {
 		const dir = scratchDirs.pop();
 		if (dir) rmSync(dir, { recursive: true, force: true });
@@ -186,5 +199,40 @@ describe("output accumulator full-output file", () => {
 		expect(path).toBeDefined();
 		expect(existsSync(path!)).toBe(true);
 		expect(readFileSync(path!).length).toBeGreaterThanOrEqual(DEFAULT_MAX_BYTES);
+	});
+});
+
+/**
+ * CI run 34918922658 (job 2/3) reported four failures in this file, none of them the property the
+ * file is about: `Error: ENOENT: no such file or directory, mkdtemp 'undefined/bash-executor-ro-XXXXXX'`,
+ * thrown by `readOnlyTmpdir()` before the bash executor was ever called. The environment is at
+ * fault, not the executor: GitHub's ubuntu runners export no `TMPDIR`, so `previousTmpdir` is
+ * `undefined`, and `process.env.TMPDIR = undefined` writes the *string* "undefined" (node
+ * stringifies env assignments) instead of unsetting the variable. `os.tmpdir()` then answers
+ * "undefined" for every later join in this file - the first two tests pass, the rest die before
+ * their assertions. macOS always exports `TMPDIR`, so the assignment was harmless there and the red
+ * only appeared in CI; `env -u TMPDIR` reproduces it locally. Because the poisoned variable is
+ * process-global, a reused worker hands it to whatever file runs next, which is why the restore has
+ * to `delete` an absent value.
+ */
+describe("test harness tmpdir handling", () => {
+	it("restores an absent TMPDIR by deleting it, and a set one by assigning it", () => {
+		const saved = process.env.TMPDIR;
+		try {
+			process.env.TMPDIR = readOnlyTmpdir();
+			// The CI shape: the environment had no TMPDIR before this file touched it.
+			restoreTmpdir(undefined);
+			expect(process.env.TMPDIR).toBeUndefined();
+			expect(tmpdir()).not.toBe("undefined");
+
+			// Positive control: a value that was there is still handed back verbatim.
+			const dir = mkdtempSync(join(tmpdir(), "bash-executor-restore-"));
+			scratchDirs.push(dir);
+			restoreTmpdir(dir);
+			expect(process.env.TMPDIR).toBe(dir);
+			expect(tmpdir()).toBe(dir);
+		} finally {
+			restoreTmpdir(saved);
+		}
 	});
 });
