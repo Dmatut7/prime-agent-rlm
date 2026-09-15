@@ -7,7 +7,7 @@ import {
 	mergeDiscoveredDaemonProcesses,
 	parseLsofListeners,
 	parsePrimeAgentProcessIds,
-	parsePsEtimes,
+	parsePsProcessStats,
 	parseSsListeners,
 	planReap,
 	planShutdownAll,
@@ -116,12 +116,20 @@ describe("verifyHelloSupervisorPid", () => {
 	});
 });
 
-describe("parsePsEtimes", () => {
-	it("maps pid to elapsed seconds", () => {
-		const uptimes = parsePsEtimes("  1234  86400\n  5678      42\n");
-		expect(uptimes.get(1234)).toBe(86400);
-		expect(uptimes.get(5678)).toBe(42);
-		expect(uptimes.size).toBe(2);
+describe("parsePsProcessStats", () => {
+	it("maps pid to elapsed seconds and sampled cpu", () => {
+		const stats = parsePsProcessStats("  1234 1-02:03:04    7.6\n  5678       04:21    0.0\n");
+		expect(stats.get(1234)).toEqual({ uptimeSeconds: 93784, cpuPercent: 7.6 });
+		expect(stats.get(5678)).toEqual({ uptimeSeconds: 261, cpuPercent: 0 });
+		expect(stats.size).toBe(2);
+	});
+
+	it("keeps the uptime when a platform refuses the cpu column", () => {
+		expect(parsePsProcessStats("  1234  42\n").get(1234)).toEqual({ uptimeSeconds: 42 });
+	});
+
+	it("drops a line whose elapsed column is not a duration", () => {
+		expect(parsePsProcessStats("ps: etimes: keyword not found\n").size).toBe(0);
 	});
 });
 

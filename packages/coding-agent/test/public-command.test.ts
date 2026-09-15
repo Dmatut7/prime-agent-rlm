@@ -5,8 +5,8 @@ const mocks = vi.hoisted(() => ({
 	daemonCommands: [] as string[][],
 	packageCommands: [] as string[][],
 	psCalls: [] as boolean[],
-	reapCalls: [] as Array<[boolean, boolean]>,
-	shutdownCalls: [] as Array<[boolean, boolean]>,
+	reapCalls: [] as unknown[][],
+	shutdownCalls: [] as unknown[][],
 	mcpCommands: [] as string[][],
 }));
 
@@ -42,16 +42,28 @@ vi.mock("../src/cli/daemon-ps.js", () => ({
 	runPs: async (json: boolean) => {
 		mocks.psCalls.push(json);
 	},
-	runReap: async (json: boolean, force: boolean) => {
-		mocks.reapCalls.push([json, force]);
+	runReap: async (json: boolean, force: boolean, selection: StopSelection, dryRun: boolean) => {
+		mocks.reapCalls.push([json, force, scopeKind(selection), dryRun]);
 	},
-	runShutdownAll: async (json: boolean, force: boolean) => {
-		mocks.shutdownCalls.push([json, force]);
+	runShutdownSelection: async (json: boolean, force: boolean, selection: StopSelection, dryRun: boolean) => {
+		mocks.shutdownCalls.push([json, force, scopeLabel(selection), dryRun]);
 	},
 }));
 
+function scopeKind(selection: StopSelection | undefined): string {
+	return selection?.scope.kind ?? "unset";
+}
+
+function scopeLabel(selection: StopSelection | undefined): string {
+	if (!selection) return "unset";
+	const scope = selection.scope;
+	const path = scope.kind === "socket" ? scope.socketPath : scope.kind === "socket-dir" ? scope.socketDir : "";
+	return `${scope.kind}:${path}${selection.orphansOnly ? ":orphans" : ""}`;
+}
+
 import { INTERNAL_RUNTIME_COMMAND_MARKER } from "../src/cli/args.js";
 import { formatTopLevelHelp } from "../src/cli/command-registry.js";
+import type { StopSelection } from "../src/cli/daemon-stop-scope.js";
 import { DAEMON_UPDATE_RESTART_COORDINATOR_FLAG } from "../src/cli/daemon-update-restart.js";
 import { handlePublicCommand } from "../src/cli/public-command.js";
 
@@ -270,18 +282,60 @@ describe("public command routing", () => {
 		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("prime-agent package list"));
 	});
 
-	it("uses force only when explicitly requested for full shutdown", async () => {
+	it("uses force only when explicitly requested and keeps the scope narrow", async () => {
 		await handlePublicCommand(["shutdown", "--json"]);
 		await handlePublicCommand(["shutdown", "--force"]);
-		expect(mocks.shutdownCalls).toEqual([
-			[true, false],
-			[false, true],
-		]);
+		const [jsonCall, forceCall] = mocks.shutdownCalls;
+		expect(jsonCall![0]).toBe(true);
+		expect(jsonCall![1]).toBe(false);
+		expect(forceCall![0]).toBe(false);
+		expect(forceCall![1]).toBe(true);
+		// Both stayed on this shell's own services; neither swept the machine.
+		expect(jsonCall![2]).toContain("current:");
+		expect(forceCall![2]).toContain("current:");
 	});
 
-	it("routes doctor fixes through the safe cleanup path", async () => {
+	it("reaches the whole machine only when --all is typed", async () => {
+		await handlePublicCommand(["shutdown", "--all", "--dry-run"]);
+		expect(mocks.shutdownCalls.at(-1)).toEqual([false, false, "machine:", true]);
+	});
+
+	it("scopes a shutdown to one named socket", async () => {
+		await handlePublicCommand(["shutdown", "--socket", "/tmp/r13/daemon.sock"]);
+		expect(mocks.shutdownCalls.at(-1)![2]).toBe("socket:/tmp/r13/daemon.sock");
+	});
+
+	it("keeps --orphans out of the plain shutdown call", async () => {
+		await handlePublicCommand(["shutdown", "--orphans"]);
+		expect(mocks.shutdownCalls.at(-1)![2]).toContain(":orphans");
+	});
+
+	it("refuses a shutdown that asks for two scopes at once", async () => {
+		await handlePublicCommand(["shutdown", "--all", "--socket", "/tmp/r13/daemon.sock"]);
+		expect(mocks.shutdownCalls).toEqual([]);
+		expect(process.exitCode).toBe(1);
+		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("--all cannot be combined"));
+	});
+
+	it("requires a value for a scope selector", async () => {
+		await handlePublicCommand(["shutdown", "--socket"]);
+		expect(mocks.shutdownCalls).toEqual([]);
+		expect(process.exitCode).toBe(1);
+		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("--socket requires a path"));
+	});
+
+	it("routes doctor fixes through the safe scoped cleanup path", async () => {
 		await handlePublicCommand(["doctor", "--fix", "--json"]);
-		expect(mocks.reapCalls).toEqual([[true, false]]);
+		const call = mocks.reapCalls.at(-1);
+		expect(call![0]).toBe(true);
+		expect(call![1]).toBe(false);
+		expect(call![2]).toBe("current");
+		expect(call![3]).toBe(false);
+	});
+
+	it("lists a doctor cleanup without touching anything on --dry-run", async () => {
+		await handlePublicCommand(["doctor", "--fix", "--dry-run"]);
+		expect(mocks.reapCalls.at(-1)).toEqual([false, false, "current", true]);
 	});
 
 	it("rejects the old daemon hierarchy with migration guidance", async () => {
