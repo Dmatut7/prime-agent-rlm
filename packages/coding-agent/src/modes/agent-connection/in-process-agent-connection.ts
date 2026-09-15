@@ -59,6 +59,7 @@ import type {
 	AgentConnectionSessionHeader,
 	AgentConnectionSessionInputPause,
 	AgentConnectionSessionListCallbacks,
+	AgentConnectionSessionTreeBound,
 	AgentConnectionSessionTreeNode,
 	AgentConnectionSessionWatcher,
 	AgentConnectionSideQuestionTurn,
@@ -189,10 +190,20 @@ export class InProcessAgentConnection implements AgentConnection {
 		return this.session.buildSessionContext();
 	}
 
-	async getSessionTree(): Promise<{ tree: AgentConnectionSessionTreeNode[]; leafId: string | null }> {
+	async getSessionTree(): Promise<{
+		tree: AgentConnectionSessionTreeNode[];
+		leafId: string | null;
+		bound?: AgentConnectionSessionTreeBound;
+	}> {
+		// The in-process connection offers the same bounded contract the daemon does:
+		// an unbounded tree is O(entries) nodes and O(depth) serializer recursion, so the
+		// local view is cut by the manager's depth and node-count bounds, and the stats
+		// travel with it so a truncation is reportable rather than silent.
+		const bounded = this.session.sessionManager.getBoundedTree();
 		return {
-			tree: this.session.sessionManager.getTree(),
+			tree: bounded.tree,
 			leafId: this.session.sessionManager.getLeafId(),
+			bound: bounded.stats,
 		};
 	}
 

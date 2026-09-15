@@ -1448,9 +1448,15 @@ export async function runShutdownSelection(
 	const { report, selected, humanReport } = await openShutdownReport(scoped);
 	if (dryRun) {
 		if (json) {
+			// The four-bucket identity (discovered === stopped + failed + skipped +
+			// leftRunning) is a property of a real run's report: a dry run observes and
+			// plans but never signals, so its buckets carry no verdicts. The plan's "left
+			// alone" list is therefore `keptInScope`, not `leftRunning` - the full report's
+			// word means "still running after this run tried to stop it", a different
+			// proposition a scripted consumer must not have to disambiguate by shape.
 			console.log(
 				JSON.stringify(
-					{ dryRun: true, scope: scoped.scope, targets: selected, leftRunning: report.leftRunning },
+					{ dryRun: true, scope: scoped.scope, targets: selected, keptInScope: report.leftRunning },
 					null,
 					2,
 				),

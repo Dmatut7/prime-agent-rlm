@@ -297,6 +297,20 @@ export const SESSION_TREE_MAX_WIRE_DEPTH = 1000;
  */
 export const SESSION_TREE_FLAT_MAX_NODES = 20_000;
 
+/**
+ * Total node bound for the nested tree returned by `getBoundedTree`, i.e. for every
+ * tree a snapshot or client view embeds.
+ *
+ * Depth alone cannot bound the frame: a tree is only as deep as its longest parent
+ * chain, but it is as wide as its branching, and a rewind-fork-heavy session is one
+ * shallow root with tens of thousands of children. Such a tree passed the depth
+ * window whole (O(entries) bytes, `truncated:false`) while the flat view of the same
+ * session cut at {@link SESSION_TREE_FLAT_MAX_NODES}. The cap keeps the same side as
+ * the flat bound - the newest entries, plus the live leaf's retained ancestor chain -
+ * so one session never presents two opposite truncations.
+ */
+export const SESSION_TREE_MAX_WIRE_NODES = 20_000;
+
 /** What a bounded nested tree left out, so a truncation is never silent. */
 export interface SessionTreeDepthStats {
 	/** Entries in the session. */
@@ -2754,12 +2768,20 @@ export class SessionManager {
 	 * of the session {@link getBoundedFlatTree} keeps, so a client reading either view sees
 	 * the recent past - including, after a rewind-and-fork, the branch the session actually
 	 * resumes on.
+	 *
+	 * A second, total-node cap (`maxNodes`) bounds the width the depth bound cannot see:
+	 * a shallow wide tree fits any depth window but is still O(entries) nodes. It keeps the
+	 * newest `maxNodes` entries by file order plus the live leaf's retained ancestors, so
+	 * any tree shape - deep, wide, or both - comes back bounded and reports the cut.
 	 */
-	getBoundedTree(maxDepth: number = SESSION_TREE_MAX_WIRE_DEPTH): {
+	getBoundedTree(
+		maxDepth: number = SESSION_TREE_MAX_WIRE_DEPTH,
+		maxNodes: number = SESSION_TREE_MAX_WIRE_NODES,
+	): {
 		tree: SessionTreeNode[];
 		stats: SessionTreeDepthStats;
 	} {
-		return this.buildTree(this.getFlatTree(), maxDepth);
+		return this.buildTree(this.getFlatTree(), maxDepth, maxNodes);
 	}
 
 	/**
@@ -2815,6 +2837,7 @@ export class SessionManager {
 	private buildTree(
 		entries: readonly SessionTreeFlatNode[],
 		depthLimit: number,
+		nodeLimit: number = Number.POSITIVE_INFINITY,
 	): { tree: SessionTreeNode[]; stats: SessionTreeDepthStats } {
 		const nodeMap = new Map<string, SessionTreeNode>();
 		for (const flatNode of entries) {
@@ -2898,11 +2921,30 @@ export class SessionManager {
 				current = parentId === null || parentId === current.id ? undefined : entryById.get(parentId);
 			}
 		}
+		// The width bound: a tree that fits the depth windows can still be O(entries) nodes
+		// (a star: one shallow root with every entry as a child). The count window keeps the
+		// newest `nodeLimit` entries by file order - the same side the depth windows and the
+		// flat bound keep - plus the live leaf's ancestor chain, so the entry the session
+		// resumes on keeps its parents. A retained node whose parent falls outside the count
+		// window comes back as a root, exactly like a depth-cut node.
+		const nodeCapLimit = Math.max(1, Math.floor(nodeLimit));
+		const nodeCapActive = Number.isFinite(nodeLimit) && entries.length > nodeCapLimit;
+		const nodeCapFromIndex = nodeCapActive ? entries.length - nodeCapLimit : Number.POSITIVE_INFINITY;
+		const fileIndexOf = new Map<string, number>();
+		for (let index = 0; index < entries.length; index++) {
+			fileIndexOf.set(entries[index]?.entry.id, index);
+		}
 		const isRetained = (entry: SessionEntry, depth: number): boolean => {
-			if (!Number.isFinite(depthLimit)) {
-				return true;
+			if (Number.isFinite(depthLimit)) {
+				const depthRetained = depth >= deepWindowFrom || (livePath.has(entry.id) && depth >= liveWindowFrom);
+				if (!depthRetained) {
+					return false;
+				}
 			}
-			return depth >= deepWindowFrom || (livePath.has(entry.id) && depth >= liveWindowFrom);
+			if (nodeCapActive) {
+				return (fileIndexOf.get(entry.id) ?? 0) >= nodeCapFromIndex || livePath.has(entry.id);
+			}
+			return true;
 		};
 
 		const roots: SessionTreeNode[] = [];

@@ -8654,10 +8654,18 @@ export class InteractiveMode {
 	private async showTreeSelector(initialSelectedId?: string): Promise<void> {
 		let tree: AgentConnectionSessionTreeNode[];
 		let realLeafId: string | null;
+		let truncationNotice: string | undefined;
 		try {
 			const sessionTree = await this.agentConnection.getSessionTree();
 			tree = sessionTree.tree;
 			realLeafId = sessionTree.leafId;
+			// The tree may be bounded (depth or node count); say so instead of letting an
+			// older branch look like it never existed.
+			const bound = sessionTree.bound;
+			if (bound?.truncated) {
+				const total = "totalEntries" in bound ? bound.totalEntries : bound.entries;
+				truncationNotice = `Tree truncated to ${bound.returnedNodes} of ${total} entries; older branches omitted`;
+			}
 		} catch (error) {
 			this.showError(error instanceof Error ? error.message : String(error));
 			return;
@@ -8776,6 +8784,7 @@ export class InteractiveMode {
 				},
 				initialSelectedId,
 				initialFilterMode,
+				truncationNotice,
 			);
 			return { component: selector, focus: selector };
 		});

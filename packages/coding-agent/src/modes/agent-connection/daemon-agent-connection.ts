@@ -86,7 +86,9 @@ import type {
 	AgentConnectionSessionHeader,
 	AgentConnectionSessionInputPause,
 	AgentConnectionSessionListCallbacks,
+	AgentConnectionSessionTreeBound,
 	AgentConnectionSessionTreeFlatNode,
+	AgentConnectionSessionTreeFlatStats,
 	AgentConnectionSessionTreeNode,
 	AgentConnectionSessionWatcher,
 	AgentConnectionSideQuestionEvent,
@@ -831,18 +833,31 @@ export class DaemonAgentConnection implements AgentConnection {
 		return data.context;
 	}
 
-	async getSessionTree(): Promise<{ tree: AgentConnectionSessionTreeNode[]; leafId: string | null }> {
+	async getSessionTree(): Promise<{
+		tree: AgentConnectionSessionTreeNode[];
+		leafId: string | null;
+		bound?: AgentConnectionSessionTreeBound | AgentConnectionSessionTreeFlatStats;
+	}> {
 		if (this.latestSnapshotIsFresh && this.latestSnapshot?.sessionTree) {
 			return this.latestSnapshot.sessionTree;
 		}
 		const data = await this.requestData<{
 			flatNodes: AgentConnectionSessionTreeFlatNode[];
 			leafId: string | null;
+			// The daemon caps the flat tree at SESSION_TREE_FLAT_MAX_NODES newest entries
+			// and reports the cap here; forwarding it keeps the truncation visible at the
+			// client boundary instead of silent (the stats are the flat bound, not the
+			// snapshot's depth bound).
+			treeBound?: AgentConnectionSessionTreeFlatStats;
 		}>({
 			type: "get_session_tree",
 			activeSessionId: this.activeSessionId,
 		});
-		return { tree: buildSessionTreeFromFlatNodes(data.flatNodes), leafId: data.leafId };
+		return {
+			tree: buildSessionTreeFromFlatNodes(data.flatNodes),
+			leafId: data.leafId,
+			bound: data.treeBound,
+		};
 	}
 
 	async listSavedSessions(
