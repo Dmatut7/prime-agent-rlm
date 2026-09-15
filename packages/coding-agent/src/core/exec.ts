@@ -59,13 +59,16 @@ class BoundedOutputCollector {
 	private readonly decoder = new TextDecoder();
 	totalBytes = 0;
 	private newlineCount = 0;
+	// Whether the stream's last byte ended its line. A trailing newline terminates the
+	// final line instead of starting an empty one, so counting lines as
+	// `newlineCount + 1` credited every command that ends its output the way commands
+	// do with a line it never printed.
+	private lastTextEndsWithNewline = true;
 
 	add(data: Buffer): void {
 		this.totalBytes += data.length;
 		const text = this.decoder.decode(data, { stream: true });
-		for (let i = 0; i < text.length; i++) {
-			if (text.charCodeAt(i) === 10) this.newlineCount++;
-		}
+		this.observeText(text);
 		this.chunks.push(text);
 		this.retainedBytes += Buffer.byteLength(text);
 		while (this.retainedBytes > OUTPUT_RETENTION_BYTES && this.chunks.length > 1) {
@@ -74,12 +77,18 @@ class BoundedOutputCollector {
 		}
 	}
 
+	private observeText(text: string): void {
+		if (text.length === 0) return;
+		for (let i = 0; i < text.length; i++) {
+			if (text.charCodeAt(i) === 10) this.newlineCount++;
+		}
+		this.lastTextEndsWithNewline = text.charCodeAt(text.length - 1) === 10;
+	}
+
 	finish(): { content: string; truncated: boolean } {
 		const tail = this.decoder.decode();
 		if (tail) {
-			for (let i = 0; i < tail.length; i++) {
-				if (tail.charCodeAt(i) === 10) this.newlineCount++;
-			}
+			this.observeText(tail);
 			this.chunks.push(tail);
 		}
 
@@ -89,7 +98,7 @@ class BoundedOutputCollector {
 			return { content: retained, truncated: false };
 		}
 
-		const totalLines = this.newlineCount + 1;
+		const totalLines = this.newlineCount + (this.lastTextEndsWithNewline ? 0 : 1);
 		const annotation = formatExecTruncationAnnotation(result, totalLines, this.totalBytes);
 		return { content: result.content + annotation, truncated: true };
 	}

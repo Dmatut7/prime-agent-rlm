@@ -18,6 +18,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "path";
 import { v7 as uuidv7 } from "uuid";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
 import {
+	endsWithNewlineSync,
 	isLineBoundarySync,
 	isUsableResumePoint,
 	readFileLines,
@@ -70,6 +71,8 @@ const SESSION_LIST_PARSE_MAX_LINE_CHARS = 1024 * 1024;
 const SESSION_LIST_LARGE_MESSAGE_PREVIEW_MAX_CHARS = 256;
 const SESSION_STREAMING_LOAD_THRESHOLD_BYTES = 128 * 1024 * 1024;
 const SESSION_ASYNC_PARSE_YIELD_BYTES = 4 * 1024 * 1024;
+/** A session header is one short line; anything longer than this is not recoverable as one. */
+const SESSION_HEADER_SCAN_MAX_BYTES = 64 * 1024;
 
 // Entry types that can represent user intent (vs. daemon bookkeeping like
 // session_state/agent_status/git_state/child_usage_attributed). Used by
@@ -511,28 +514,71 @@ export function migrateSessionEntries(entries: FileEntry[]): void {
 	migrateToCurrentVersion(entries);
 }
 
-export function parseSessionEntries(content: string): FileEntry[] {
+export function parseSessionEntries(content: string, sessionFile = "<inline transcript>"): FileEntry[] {
 	const entries: FileEntry[] = [];
 	const lines = content.trim().split("\n");
 
+	let lineNumber = 0;
 	for (const line of lines) {
+		lineNumber++;
 		if (!line.trim()) continue;
+		let parsed: unknown;
 		try {
-			const entry = JSON.parse(line) as FileEntry;
-			entries.push(entry);
+			parsed = JSON.parse(line);
 		} catch {
 			// Skip malformed lines.
+			continue;
 		}
+		// Skip the lines that are not entries either: same tolerance as the file
+		// loaders, so one bad line cannot take the transcript or the caller down.
+		const reason = unindexableEntryReason(parsed);
+		if (reason !== undefined) {
+			noteTranscriptLineSkip(sessionFile, lineNumber, reason);
+			continue;
+		}
+		entries.push(parsed as FileEntry);
 	}
 
 	applyChildUsageAttributions(entries);
 	return entries;
 }
 
+/**
+ * Why a parsed transcript line cannot be indexed, or undefined when it can.
+ *
+ * JSON.parse answers "is this text a JSON value", not "is this an entry". The
+ * loaders promised to skip lines they cannot use but only guarded the parse, so a
+ * line that is valid JSON of the wrong shape - a bare `null`, a message entry with
+ * no message - reached the consumers below unprotected, where `entry.type` /
+ * `entry.message.role` threw a bare TypeError. One such line cost the whole
+ * transcript, and in the listing paths the catch turned that into "no such session".
+ */
+function unindexableEntryReason(entry: unknown): string | undefined {
+	if (typeof entry !== "object" || entry === null) return "not an object";
+	if (Array.isArray(entry)) return "array, not an entry object";
+	if (typeof (entry as { type?: unknown }).type !== "string") return "missing or non-string entry type";
+	if ((entry as { type: string }).type === "message") {
+		const message = (entry as { message?: unknown }).message;
+		if (typeof message !== "object" || message === null || Array.isArray(message)) {
+			return "message entry without a message object";
+		}
+	}
+	return undefined;
+}
+
+/** Whether an entry can be walked, indexed and rendered as the message it claims to be. */
+function isAssistantMessageEntry(entry: FileEntry): entry is AssistantSessionMessageEntry {
+	return (
+		entry.type === "message" &&
+		typeof (entry as SessionMessageEntry).message === "object" &&
+		(entry as SessionMessageEntry).message?.role === "assistant"
+	);
+}
+
 function applyChildUsageAttributions(entries: FileEntry[]): void {
 	const assistantEntriesById = new Map<string, AssistantSessionMessageEntry>();
 	for (const entry of entries) {
-		if (entry.type === "message" && entry.message.role === "assistant") {
+		if (isAssistantMessageEntry(entry)) {
 			assistantEntriesById.set(entry.id, entry as AssistantSessionMessageEntry);
 		}
 	}
@@ -602,7 +648,7 @@ export function buildSessionContext(
 			serviceTier = entry.serviceTier;
 		} else if (entry.type === "model_change") {
 			model = { provider: entry.provider, modelId: entry.modelId };
-		} else if (entry.type === "message" && entry.message.role === "assistant") {
+		} else if (isAssistantMessageEntry(entry)) {
 			model = { provider: entry.message.provider, modelId: entry.message.model };
 		} else if (entry.type === "compaction") {
 			compaction = entry;
@@ -676,38 +722,147 @@ export function getDefaultSessionDir(_cwd: string, agentDir: string = getDefault
 
 // Decode per line off a Buffer: toString("utf8") on a whole large file is far slower
 // (one giant UTF-16 string). Splitting on 0x0a is UTF-8-safe.
-function appendEntryFromBuffer(entries: FileEntry[], buffer: Buffer, start = 0, end = buffer.length): void {
-	if (end <= start) return;
-	try {
-		entries.push(JSON.parse(buffer.toString("utf8", start, end)) as FileEntry);
-	} catch {
-		// Skip malformed or blank lines.
-	}
+/** A transcript line a load or scan had to ignore, and where it came from. */
+export interface TranscriptLineSkip {
+	sessionFile: string;
+	/**
+	 * 1-based line number within the range that was read: the whole file for a load
+	 * or a cold listing scan, the appended tail for a resumed scan. 0 means the read
+	 * as a whole failed, which is a different complaint from one bad line.
+	 */
+	line: number;
+	/** Why the line could not be used. Kept short: it is shown to a human reading a report. */
+	reason: string;
 }
 
-function parseEntriesFromBuffer(buffer: Buffer): FileEntry[] {
+const transcriptLineSkips: TranscriptLineSkip[] = [];
+const TRANSCRIPT_LINE_SKIP_LIMIT = 256;
+
+function noteTranscriptLineSkip(sessionFile: string, line: number, reason: string): void {
+	// Bounded and oldest-evicted: a damaged transcript scanned by every listing
+	// refresh must not grow this without limit, and the skips worth reading are the
+	// ones at the head of the file.
+	if (transcriptLineSkips.length >= TRANSCRIPT_LINE_SKIP_LIMIT) transcriptLineSkips.shift();
+	transcriptLineSkips.push({ sessionFile, line, reason });
+}
+
+/**
+ * Lines the transcript loaders skipped rather than failing on. Skipping is the
+ * documented behaviour; skipping silently is not, so every skip is recorded here
+ * for the daemon and a human running `prime-agent` against a damaged file.
+ */
+export function getTranscriptLineSkips(): TranscriptLineSkip[] {
+	return transcriptLineSkips.map((skip) => ({ ...skip }));
+}
+
+export function clearTranscriptLineSkips(): void {
+	transcriptLineSkips.length = 0;
+}
+
+/**
+ * The one unterminated line a reader must not drop: a session header that is the
+ * whole file. Readers skip a trailing line with no newline because it is normally a
+ * write still in flight, and a header truncated halfway through cannot parse - a
+ * JSON object is missing its closing brace. So a tail that does parse as a session
+ * header is a complete record whose terminating byte went missing (an external
+ * truncate, a short write, an editor that strips the tail), and reading it as "no
+ * session" cost the transcript its identity.
+ */
+function parseUnterminatedHeader(buffer: Buffer): SessionHeader | undefined {
+	if (buffer.length === 0 || buffer.indexOf(0x0a) !== -1) return undefined;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(buffer.toString("utf8"));
+	} catch {
+		return undefined;
+	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+	const header = parsed as Partial<SessionHeader>;
+	if (header.type !== "session" || typeof header.id !== "string" || !SESSION_ID_PATTERN.test(header.id)) {
+		return undefined;
+	}
+	return header as SessionHeader;
+}
+
+/**
+ * Restore the terminating newline of a last line that is a whole record - see
+ * `parseUnterminatedHeader`. Only the write owner may call it: completing a line
+ * another process is still appending to would split its write in two. Returns whether
+ * the byte was written, so a torn tail keeps falling through to the torn-tail repair.
+ */
+function completeTrailingRecordNewline(filePath: string, ownsSessionDir: boolean): boolean {
+	// A header is a short line. Bounding the read by size keeps a transcript whose
+	// last line really was torn from re-reading the whole file to learn nothing.
+	let size: number;
+	try {
+		size = statSync(filePath).size;
+	} catch {
+		return false;
+	}
+	if (size === 0 || size > SESSION_HEADER_SCAN_MAX_BYTES) return false;
+	let buffer: Buffer;
+	try {
+		buffer = readFileSync(filePath);
+	} catch {
+		return false;
+	}
+	if (!parseUnterminatedHeader(buffer)) return false;
+	appendPrivateFile(filePath, "\n", { privateParent: ownsSessionDir });
+	return true;
+}
+
+function appendEntryFromBuffer(
+	entries: FileEntry[],
+	buffer: Buffer,
+	skipContext?: { sessionFile: string; line: number },
+	start = 0,
+	end = buffer.length,
+): void {
+	if (end <= start) return;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(buffer.toString("utf8", start, end));
+	} catch {
+		// Skip malformed or blank lines.
+		return;
+	}
+	const reason = unindexableEntryReason(parsed);
+	if (reason !== undefined) {
+		if (skipContext) noteTranscriptLineSkip(skipContext.sessionFile, skipContext.line, reason);
+		return;
+	}
+	entries.push(parsed as FileEntry);
+}
+
+function parseEntriesFromBuffer(buffer: Buffer, sessionFile: string): FileEntry[] {
 	const entries: FileEntry[] = [];
 	let start = 0;
+	let line = 0;
 	while (start < buffer.length) {
+		line++;
 		const end = buffer.indexOf(0x0a, start);
 		// A trailing unterminated line is a torn append: every reader skips it,
 		// and repairTruncatedTrailingLine removes it before the next write.
 		if (end === -1) break;
-		appendEntryFromBuffer(entries, buffer, start, end);
+		appendEntryFromBuffer(entries, buffer, { sessionFile, line }, start, end);
 		start = end + 1;
 	}
+	const unterminatedHeader = parseUnterminatedHeader(buffer);
+	if (entries.length === 0 && unterminatedHeader) entries.push(unterminatedHeader);
 	return entries;
 }
 
-async function parseEntriesFromBufferAsync(buffer: Buffer): Promise<FileEntry[]> {
+async function parseEntriesFromBufferAsync(buffer: Buffer, sessionFile: string): Promise<FileEntry[]> {
 	const entries: FileEntry[] = [];
 	let start = 0;
+	let line = 0;
 	let bytesSinceYield = 0;
 	while (start < buffer.length) {
+		line++;
 		const end = buffer.indexOf(0x0a, start);
 		// A trailing unterminated line is a torn append; see parseEntriesFromBuffer.
 		if (end === -1) break;
-		appendEntryFromBuffer(entries, buffer, start, end);
+		appendEntryFromBuffer(entries, buffer, { sessionFile, line }, start, end);
 		bytesSinceYield += end - start + 1;
 		start = end + 1;
 		if (bytesSinceYield >= SESSION_ASYNC_PARSE_YIELD_BYTES) {
@@ -715,6 +870,8 @@ async function parseEntriesFromBufferAsync(buffer: Buffer): Promise<FileEntry[]>
 			await new Promise<void>((resolve) => setImmediate(resolve));
 		}
 	}
+	const unterminatedHeader = parseUnterminatedHeader(buffer);
+	if (entries.length === 0 && unterminatedHeader) entries.push(unterminatedHeader);
 	return entries;
 }
 
@@ -731,9 +888,11 @@ function finalizeLoadedEntries(entries: FileEntry[]): FileEntry[] {
 	if (entries.length === 0) return entries;
 	const header = entries[0];
 	if (
+		typeof header !== "object" ||
+		header === null ||
 		header.type !== "session" ||
-		typeof (header as any).id !== "string" ||
-		!SESSION_ID_PATTERN.test((header as any).id)
+		typeof (header as { id?: unknown }).id !== "string" ||
+		!SESSION_ID_PATTERN.test((header as { id: string }).id)
 	) {
 		return [];
 	}
@@ -766,7 +925,7 @@ function salvageDamagedHeadEntries(filePath: string, cwd: string): FileEntry[] |
 	const head = headEnd === -1 ? buffer : buffer.subarray(0, headEnd);
 	if (parsesAsJson(head)) return undefined;
 
-	const body = headEnd === -1 ? [] : parseEntriesFromBuffer(buffer.subarray(headEnd + 1));
+	const body = headEnd === -1 ? [] : parseEntriesFromBuffer(buffer.subarray(headEnd + 1), filePath);
 	const entries = body.filter((entry): entry is SessionEntry => entry.type !== "session");
 	if (entries.length === 0) return undefined;
 
@@ -793,7 +952,7 @@ function salvageDamagedHeadEntries(filePath: string, cwd: string): FileEntry[] |
 export function loadEntriesFromFile(filePath: string): FileEntry[] {
 	if (!existsSync(filePath)) return [];
 	assertRegularFileNoSymlink(filePath);
-	return finalizeLoadedEntries(parseEntriesFromBuffer(readFileSync(filePath)));
+	return finalizeLoadedEntries(parseEntriesFromBuffer(readFileSync(filePath), filePath));
 }
 
 // Async loader for the daemon: reads off the event loop and yields while parsing so a
@@ -807,15 +966,28 @@ export async function loadEntriesFromFileAsync(
 	assertRegularFileNoSymlink(filePath);
 	const streamThresholdBytes = options.streamThresholdBytes ?? SESSION_STREAMING_LOAD_THRESHOLD_BYTES;
 	if ((await stat(filePath)).size < streamThresholdBytes) {
-		return finalizeLoadedEntries(await parseEntriesFromBufferAsync(await readFile(filePath)));
+		return finalizeLoadedEntries(await parseEntriesFromBufferAsync(await readFile(filePath), filePath));
 	}
 
 	const entries: FileEntry[] = [];
+	let line = 0;
 	let bytesSinceYield = 0;
 	for await (const fileLine of readFileLines(filePath)) {
-		// A trailing unterminated line is a torn append; see parseEntriesFromBuffer.
-		if (!fileLine.terminated) break;
-		appendEntryFromBuffer(entries, fileLine.line);
+		line++;
+		// A trailing unterminated line is a torn append; see parseEntriesFromBuffer. The
+		// one exception is a header that lost only its newline: it is a whole record, and
+		// dropping it reads as an empty transcript.
+		if (!fileLine.terminated) {
+			// Line 1 with no terminator means the whole file is that line, which is how
+			// the buffered loader reads the same shape: both paths must agree, or the
+			// threshold that picks one over the other decides whether a session exists.
+			if (entries.length === 0 && line === 1) {
+				const unterminatedHeader = parseUnterminatedHeader(fileLine.line);
+				if (unterminatedHeader) entries.push(unterminatedHeader);
+			}
+			break;
+		}
+		appendEntryFromBuffer(entries, fileLine.line, { sessionFile: filePath, line });
 		bytesSinceYield += fileLine.line.length + 1;
 		if (bytesSinceYield >= SESSION_ASYNC_PARSE_YIELD_BYTES) {
 			bytesSinceYield = 0;
@@ -832,10 +1004,17 @@ export async function loadEntriesFromFileAsync(
  * repairing a file another process is writing can truncate its in-flight
  * append. Validates the path first so a swapped-in symlink is rejected before
  * any truncation.
+ *
+ * A trailing line that parses as a complete record is not crash damage, it is a
+ * whole record whose terminator went missing, and dropping it would throw away the
+ * only session header a file like that has. Those get the terminator back instead.
  */
 export function repairOwnedSessionFile(sessionFile: string | undefined): void {
 	if (!sessionFile || !existsSync(sessionFile)) return;
 	assertRegularFileNoSymlink(sessionFile);
+	// A header that lost only its terminator is a whole record, not a torn append:
+	// truncating it away would leave the transcript with no header at all.
+	if (completeTrailingRecordNewline(sessionFile, true)) return;
 	repairTruncatedTrailingLine(sessionFile);
 }
 
@@ -1335,14 +1514,22 @@ async function scanSessionInfo(
 		const attributedChildUsages: Usage[] = resume ? [...resume.attributedChildUsages] : [];
 		const summarizationUsages: Usage[] = resume ? [...resume.summarizationUsages] : [];
 
+		let lineCount = 0;
 		for await (const fileLine of readFileLines(filePath, offset)) {
+			lineCount++;
 			// Where the read got, terminated or not: the resume offset only advances
 			// past terminated lines, the reached position moves on every line.
 			reachedBytes = fileLine.endOffset;
 			// A trailing unterminated line is a torn append still in flight (or a
 			// crash remnant): never count it, and never advance the resume offset
 			// past it, so a completed rewrite of the same bytes is seen exactly once.
-			if (!fileLine.terminated) break;
+			// A file that is nothing but such a line is the header-only transcript
+			// whose terminator went missing; that head is real, so it still names a
+			// session rather than letting the listing drop it.
+			if (!fileLine.terminated) {
+				if (!header) header = parseUnterminatedHeader(fileLine.line);
+				break;
+			}
 			offset = fileLine.endOffset;
 			const line = fileLine.line.toString("utf8");
 			if (!line.trim()) continue;
@@ -1365,12 +1552,20 @@ async function scanSessionInfo(
 			}
 
 			const trimmed = line.trim();
-			let entry: FileEntry;
+			let parsed: unknown;
 			try {
-				entry = JSON.parse(trimmed) as FileEntry;
+				parsed = JSON.parse(trimmed);
 			} catch {
 				continue;
 			}
+			// One unusable line is skipped, not fatal: it used to throw here, and the
+			// catch around this scan turned that throw into "no such session".
+			const reason = unindexableEntryReason(parsed);
+			if (reason !== undefined) {
+				noteTranscriptLineSkip(filePath, lineCount, reason);
+				continue;
+			}
+			const entry = parsed as FileEntry;
 
 			if (entry.type === "session_info") {
 				const infoEntry = entry as SessionInfoEntry;
@@ -1479,7 +1674,15 @@ async function scanSessionInfo(
 				summarizationUsages,
 			},
 		};
-	} catch {
+	} catch (error) {
+		// The session stays out of the listing - there is nothing safe to show - but a
+		// transcript that cannot be read is not the same thing as no transcript, and a
+		// swallowed error is how "my session disappeared" ends up undiagnosable.
+		noteTranscriptLineSkip(
+			filePath,
+			0,
+			`unreadable transcript: ${error instanceof Error ? error.message : String(error)}`,
+		);
 		return { info: null };
 	}
 }
@@ -1601,6 +1804,13 @@ export class SessionManager {
 				if (!(error instanceof SyntaxError)) throw error;
 			}
 			this.fileEntries = preloadedEntries ?? loadEntriesFromFile(this.sessionFile);
+
+			// The loaders read a header whose terminating newline went missing, but the
+			// next append would glue itself onto that line. This caller owns the write
+			// side, so put the missing byte back before anything can land on it.
+			if (this.persist && !endsWithNewlineSync(this.sessionFile)) {
+				completeTrailingRecordNewline(this.sessionFile, this.ownsSessionDir);
+			}
 
 			// If file was empty or corrupted (no valid header), truncate and start fresh
 			// to avoid appending messages without a session header (which breaks the session)
@@ -1909,7 +2119,7 @@ export class SessionManager {
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
 
-		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
+		const hasAssistant = this.fileEntries.some(isAssistantMessageEntry);
 		// Position markers join session_state/session_info: they are written by the
 		// app rather than by a model turn and must be durable even in a session that
 		// has no assistant message yet, otherwise a rewind before the first answer
@@ -2059,7 +2269,7 @@ export class SessionManager {
 		origin?: ChildUsageAttributionEntry["origin"],
 	): string {
 		const target = this.byId.get(targetId);
-		if (target?.type !== "message" || target.message.role !== "assistant") {
+		if (!target || !isAssistantMessageEntry(target)) {
 			throw new Error(`Assistant message entry ${targetId} not found`);
 		}
 
@@ -2558,7 +2768,7 @@ export class SessionManager {
 			// first assistant response, matching the newSession() contract
 			// and avoiding the duplicate-header bug when _persist()'s
 			// no-assistant guard later resets flushed to false.
-			const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
+			const hasAssistant = this.fileEntries.some(isAssistantMessageEntry);
 			if (hasAssistant) {
 				this._rewriteFile();
 				this.flushed = true;

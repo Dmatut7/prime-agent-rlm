@@ -45,7 +45,7 @@ export class OutputAccumulator {
 	private tailStartsAtLineBoundary = true;
 	private totalRawBytes = 0;
 	private totalDecodedBytes = 0;
-	private totalLines = 1;
+	private newlineCount = 0;
 	private currentLineBytes = 0;
 	private finished = false;
 
@@ -92,7 +92,8 @@ export class OutputAccumulator {
 			maxLines: this.maxLines,
 			maxBytes: this.maxBytes,
 		});
-		const truncated = this.totalLines > this.maxLines || this.totalDecodedBytes > this.maxBytes;
+		const lineCount = this.getLineCount();
+		const truncated = lineCount > this.maxLines || this.totalDecodedBytes > this.maxBytes;
 		const truncatedBy = truncated
 			? (tailTruncation.truncatedBy ?? (this.totalDecodedBytes > this.maxBytes ? "bytes" : "lines"))
 			: null;
@@ -100,7 +101,7 @@ export class OutputAccumulator {
 			...tailTruncation,
 			truncated,
 			truncatedBy,
-			totalLines: this.totalLines,
+			totalLines: lineCount,
 			totalBytes: this.totalDecodedBytes,
 			maxLines: this.maxLines,
 			maxBytes: this.maxBytes,
@@ -151,6 +152,16 @@ export class OutputAccumulator {
 		}
 	}
 
+	/**
+	 * Lines of output so far. A trailing newline ends the last line rather than
+	 * starting a new one, so a stream that ends with its terminator is not credited
+	 * an extra empty line - and a stream that stops exactly at the line limit is not
+	 * reported as one line over it.
+	 */
+	getLineCount(): number {
+		return this.newlineCount + (this.currentLineBytes > 0 ? 1 : 0);
+	}
+
 	getLastLineBytes(): number {
 		return this.currentLineBytes;
 	}
@@ -177,7 +188,7 @@ export class OutputAccumulator {
 		if (newlines === 0) {
 			this.currentLineBytes += bytes;
 		} else {
-			this.totalLines += newlines;
+			this.newlineCount += newlines;
 			this.currentLineBytes = byteLength(text.slice(lastNewline + 1));
 		}
 	}
@@ -210,7 +221,9 @@ export class OutputAccumulator {
 
 	private shouldUseTempFile(): boolean {
 		return (
-			this.totalRawBytes > this.maxBytes || this.totalDecodedBytes > this.maxBytes || this.totalLines > this.maxLines
+			this.totalRawBytes > this.maxBytes ||
+			this.totalDecodedBytes > this.maxBytes ||
+			this.getLineCount() > this.maxLines
 		);
 	}
 
