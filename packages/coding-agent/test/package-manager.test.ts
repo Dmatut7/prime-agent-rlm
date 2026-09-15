@@ -48,12 +48,17 @@ describe("DefaultPackageManager", () => {
 	let settingsManager: SettingsManager;
 	let packageManager: DefaultPackageManager;
 	let previousOfflineEnv: string | undefined;
+	let previousTmpDir: string | undefined;
 
 	beforeEach(() => {
 		previousOfflineEnv = process.env.PI_OFFLINE;
 		delete process.env.PI_OFFLINE;
 		tempDir = join(tmpdir(), `pm-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(tempDir, { recursive: true });
+		// Temporary extension sources install under the process tmp dir; point it into
+		// this test's own tree so cache entries cannot leak between tests or to /tmp.
+		previousTmpDir = process.env.TMPDIR;
+		process.env.TMPDIR = tempDir;
 		agentDir = join(tempDir, "agent");
 		mkdirSync(agentDir, { recursive: true });
 
@@ -67,6 +72,11 @@ describe("DefaultPackageManager", () => {
 	});
 
 	afterEach(() => {
+		if (previousTmpDir === undefined) {
+			delete process.env.TMPDIR;
+		} else {
+			process.env.TMPDIR = previousTmpDir;
+		}
 		if (previousOfflineEnv === undefined) {
 			delete process.env.PI_OFFLINE;
 		} else {
@@ -1726,18 +1736,28 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 		});
 
 		it("should skip refreshing temporary git sources when offline", async () => {
-			process.env.PI_OFFLINE = "1";
 			const gitSource = "git:github.com/example/repo";
-			const parsedGitSource = (packageManager as any).parseSource(gitSource);
-			const installedPath = (packageManager as any).getGitInstallPath(parsedGitSource, "temporary") as string;
+			// Install first through the package manager: an offline run may reuse a cache
+			// entry prime-agent installed, but never one that merely appeared.
+			const internals = packageManager as unknown as {
+				runCommand: (command: string, args: string[], options?: { cwd?: string }) => Promise<void>;
+			};
+			internals.runCommand = async (command, args) => {
+				if (command === "git" && args[0] === "clone") {
+					const target = args[args.length - 1] ?? "";
+					mkdirSync(join(target, "extensions"), { recursive: true });
+					writeFileSync(join(target, "extensions", "index.ts"), "export default function() {};");
+				}
+			};
+			const installed = await packageManager.resolveExtensionSources([gitSource], { temporary: true });
+			expect(installed.extensions.some((r) => pathEndsWith(r.path, "extensions/index.ts"))).toBe(true);
 
-			mkdirSync(join(installedPath, "extensions"), { recursive: true });
-			writeFileSync(join(installedPath, "extensions", "index.ts"), "export default function() {};");
-
+			process.env.PI_OFFLINE = "1";
 			const refreshTemporaryGitSourceSpy = vi.spyOn(packageManager as any, "refreshTemporaryGitSource");
 
 			const result = await packageManager.resolveExtensionSources([gitSource], { temporary: true });
 			expect(result.extensions.some((r) => pathEndsWith(r.path, "extensions/index.ts") && r.enabled)).toBe(true);
+			expect(result.diagnostics).toEqual([]);
 			expect(refreshTemporaryGitSourceSpy).not.toHaveBeenCalled();
 		});
 

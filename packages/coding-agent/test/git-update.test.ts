@@ -1,8 +1,7 @@
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DefaultPackageManager } from "../src/core/package-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
@@ -46,12 +45,17 @@ describe("DefaultPackageManager git update", () => {
 	let installedDir: string; // The installed extension directory
 	let settingsManager: SettingsManager;
 	let packageManager: DefaultPackageManager;
+	let previousTmpDir: string | undefined;
 
 	const gitSource = "git:github.com/test/extension";
 
 	beforeEach(() => {
 		tempDir = join(tmpdir(), `git-update-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(tempDir, { recursive: true });
+		// Temporary extension sources install under the process tmp dir. Point that at
+		// this test's own tree so runs cannot see each other's cache entries.
+		previousTmpDir = process.env.TMPDIR;
+		process.env.TMPDIR = tempDir;
 		remoteDir = join(tempDir, "remote");
 		agentDir = join(tempDir, "agent");
 
@@ -68,6 +72,11 @@ describe("DefaultPackageManager git update", () => {
 	});
 
 	afterEach(() => {
+		if (previousTmpDir === undefined) {
+			delete process.env.TMPDIR;
+		} else {
+			process.env.TMPDIR = previousTmpDir;
+		}
 		if (tempDir && existsSync(tempDir)) {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -266,80 +275,83 @@ describe("DefaultPackageManager git update", () => {
 	});
 
 	describe("temporary git sources", () => {
-		it("should refresh cached temporary git sources when resolving", async () => {
-			const gitHost = "github.com";
-			const gitPath = "test/extension";
-			const hash = createHash("sha256").update(`git-${gitHost}-${gitPath}`).digest("hex").slice(0, 8);
-			const cachedDir = join(tmpdir(), "pi-extensions", `git-${gitHost}`, hash, gitPath);
-			const extensionFile = join(cachedDir, "pi-extensions", "session-breakdown.ts");
-
-			rmSync(cachedDir, { recursive: true, force: true });
-			mkdirSync(join(cachedDir, "pi-extensions"), { recursive: true });
-			writeFileSync(
-				join(cachedDir, "package.json"),
-				JSON.stringify({ pi: { extensions: ["./pi-extensions"] } }, null, 2),
-			);
-			writeFileSync(extensionFile, "// stale");
-
-			const executedCommands: string[] = [];
-			const managerWithInternals = packageManager as unknown as {
+		// A temporary cache entry lives under a private root and is only reused when
+		// prime-agent's own installer record vouches for it, so these tests reach the
+		// cached state by installing it, never by pre-creating a directory.
+		function stubCommands(
+			manager: DefaultPackageManager,
+			onClone?: (target: string) => void,
+		): { executed: string[] } {
+			const executed: string[] = [];
+			const internals = manager as unknown as {
 				runCommand: (command: string, args: string[], options?: { cwd?: string }) => Promise<void>;
 				runCommandCapture: (command: string, args: string[], options?: { cwd?: string }) => Promise<string>;
 			};
-			managerWithInternals.runCommand = async (command, args) => {
-				executedCommands.push(`${command} ${args.join(" ")}`);
-				if (command === "git" && args[0] === "reset") {
-					writeFileSync(extensionFile, "// fresh");
+			internals.runCommand = async (command, args, options) => {
+				executed.push(`${command} ${args.join(" ")}`);
+				if (command === "git" && args[0] === "clone") {
+					onClone?.(args[args.length - 1] ?? "");
+				}
+				if (command === "git" && args[0] === "reset" && options?.cwd) {
+					writeFileSync(join(options.cwd, "pi-extensions", "session-breakdown.ts"), "// fresh");
 				}
 			};
-			managerWithInternals.runCommandCapture = async (_command, args) => {
-				if (args[0] === "rev-parse" && args[1] === "HEAD") {
-					return "local-head";
-				}
-				if (args[0] === "rev-parse" && args[1] === "@{upstream}") {
-					return "remote-head";
-				}
-				if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") {
-					return "origin/main";
-				}
+			internals.runCommandCapture = async (_command, args) => {
+				if (args[0] === "rev-parse" && args[1] === "HEAD") return "local-head";
+				if (args[0] === "rev-parse" && args[1] === "@{upstream}") return "remote-head";
+				if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return "origin/main";
 				return "";
 			};
+			return { executed };
+		}
 
-			await packageManager.resolveExtensionSources([gitSource], { temporary: true });
-
-			expect(executedCommands).toContain(
-				"git fetch --prune --no-tags origin +refs/heads/main:refs/remotes/origin/main",
+		function materialiseClone(target: string): void {
+			mkdirSync(join(target, "pi-extensions"), { recursive: true });
+			writeFileSync(
+				join(target, "package.json"),
+				JSON.stringify({ pi: { extensions: ["./pi-extensions"] } }, null, 2),
 			);
+			writeFileSync(join(target, "pi-extensions", "session-breakdown.ts"), "// stale");
+		}
+
+		function createManager(): DefaultPackageManager {
+			return new DefaultPackageManager({ cwd: tempDir, agentDir, settingsManager });
+		}
+
+		it("should refresh cached temporary git sources when resolving", async () => {
+			const installing = createManager();
+			stubCommands(installing, materialiseClone);
+			const installed = await installing.resolveExtensionSources([gitSource], { temporary: true });
+			expect(installed.extensions).toHaveLength(1);
+			const cachedDir = dirname(dirname(installed.extensions[0].path));
+			expect(getFileContent(cachedDir, "pi-extensions/session-breakdown.ts")).toBe("// stale");
+
+			const refreshing = createManager();
+			const { executed } = stubCommands(refreshing, materialiseClone);
+			const refreshed = await refreshing.resolveExtensionSources([gitSource], { temporary: true });
+
+			expect(refreshed.extensions.map((r) => r.path)).toEqual(installed.extensions.map((r) => r.path));
+			expect(executed).toContain("git fetch --prune --no-tags origin +refs/heads/main:refs/remotes/origin/main");
+			expect(
+				executed.filter((line) => line.startsWith("git clone")),
+				"a verified cache entry must be refreshed in place, not re-cloned",
+			).toEqual([]);
 			expect(getFileContent(cachedDir, "pi-extensions/session-breakdown.ts")).toBe("// fresh");
 		});
 
 		it("should not refresh pinned temporary git sources", async () => {
-			const gitHost = "github.com";
-			const gitPath = "test/extension";
-			const hash = createHash("sha256").update(`git-${gitHost}-${gitPath}`).digest("hex").slice(0, 8);
-			const cachedDir = join(tmpdir(), "pi-extensions", `git-${gitHost}`, hash, gitPath);
-			const extensionFile = join(cachedDir, "pi-extensions", "session-breakdown.ts");
+			const installing = createManager();
+			stubCommands(installing, materialiseClone);
+			const installed = await installing.resolveExtensionSources([`${gitSource}@main`], { temporary: true });
+			expect(installed.extensions).toHaveLength(1);
 
-			rmSync(cachedDir, { recursive: true, force: true });
-			mkdirSync(join(cachedDir, "pi-extensions"), { recursive: true });
-			writeFileSync(
-				join(cachedDir, "package.json"),
-				JSON.stringify({ pi: { extensions: ["./pi-extensions"] } }, null, 2),
-			);
-			writeFileSync(extensionFile, "// pinned");
+			const refreshing = createManager();
+			const { executed } = stubCommands(refreshing, materialiseClone);
+			const refreshed = await refreshing.resolveExtensionSources([`${gitSource}@main`], { temporary: true });
+			const cachedDir = dirname(dirname(refreshed.extensions[0].path));
 
-			const executedCommands: string[] = [];
-			const managerWithInternals = packageManager as unknown as {
-				runCommand: (command: string, args: string[], options?: { cwd?: string }) => Promise<void>;
-			};
-			managerWithInternals.runCommand = async (command, args) => {
-				executedCommands.push(`${command} ${args.join(" ")}`);
-			};
-
-			await packageManager.resolveExtensionSources([`${gitSource}@main`], { temporary: true });
-
-			expect(executedCommands).toEqual([]);
-			expect(getFileContent(cachedDir, "pi-extensions/session-breakdown.ts")).toBe("// pinned");
+			expect(executed).toEqual([]);
+			expect(getFileContent(cachedDir, "pi-extensions/session-breakdown.ts")).toBe("// stale");
 		});
 	});
 

@@ -1,7 +1,7 @@
 import { type ChildProcess, type ChildProcessByStdio, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 
 function getEnv(): NodeJS.ProcessEnv {
 	if (process.platform !== "linux" || Object.keys(process.env).length > 0) {
@@ -39,11 +39,22 @@ import {
 } from "../utils/discovery-walk.js";
 import { type GitSource, parseGitUrl } from "../utils/git.js";
 import { canonicalizePath, isLocalPath } from "../utils/paths.js";
+import {
+	ensurePrivateDirectoryPath,
+	ensurePrivateTempCache,
+	markTempEntryInstalled,
+	type PrivateTempCache,
+	removeTempEntry,
+	verifyTempEntry,
+} from "../utils/private-temp-cache.js";
 import type { ResourceDiagnostic } from "./diagnostics.js";
 import { isStdoutTakenOver } from "./output-guard.js";
 import type { PackageSource, SettingsManager } from "./settings-manager.js";
 
 const log = getLogger("coding-agent.package-manager");
+
+/** Directory name (suffixed with the uid) of the private temporary extension cache. */
+const TEMPORARY_CACHE_NAMESPACE = "pi-extensions";
 
 const NETWORK_TIMEOUT_MS = 10000;
 const UPDATE_CHECK_CONCURRENCY = 4;
@@ -809,6 +820,8 @@ export class DefaultPackageManager implements PackageManager {
 	private globalNpmRoot: string | undefined;
 	private globalNpmRootCommandKey: string | undefined;
 	private progressCallback: ProgressCallback | undefined;
+	private temporaryCache: PrivateTempCache | undefined;
+	private temporaryCacheNotice: string | undefined;
 
 	constructor(options: PackageManagerOptions) {
 		this.cwd = options.cwd;
@@ -1270,8 +1283,10 @@ export class DefaultPackageManager implements PackageManager {
 
 			if (parsed.type === "npm") {
 				const installedPath = this.getNpmInstallPath(parsed, scope);
+				const trust = this.temporaryEntryTrust(installedPath, sourceStr, scope, accumulator);
+				if (trust === "skip") continue;
 				const needsInstall =
-					!existsSync(installedPath) ||
+					trust === "reinstall" ||
 					(parsed.pinned && !(await this.installedNpmMatchesPinnedVersion(parsed, installedPath)));
 				if (needsInstall) {
 					const installed = await installMissing();
@@ -1284,16 +1299,28 @@ export class DefaultPackageManager implements PackageManager {
 
 			if (parsed.type === "git") {
 				const installedPath = this.getGitInstallPath(parsed, scope);
-				if (!existsSync(installedPath)) {
+				const trust = this.temporaryEntryTrust(installedPath, sourceStr, scope, accumulator);
+				if (trust === "skip") continue;
+				if (trust === "reinstall") {
 					const installed = await installMissing();
 					if (!installed) continue;
 				} else if (scope === "temporary" && !parsed.pinned && !isOfflineModeEnabled()) {
-					await this.refreshTemporaryGitSource(parsed, sourceStr);
+					const refreshFailure = await this.refreshTemporaryGitSource(parsed, sourceStr);
+					if (refreshFailure) {
+						accumulator.diagnostics.push({
+							type: "warning",
+							message: `Could not refresh ${sourceStr}: ${refreshFailure} prime-agent is using the copy it installed earlier.`,
+							path: installedPath,
+						});
+					}
 				}
 				metadata.baseDir = installedPath;
 				this.collectPackageResources(installedPath, accumulator, filter, metadata);
 			}
 		}
+		// After the loop: the cache root is claimed while the first temporary path is
+		// computed, so its notice does not exist when resolution starts.
+		this.drainTemporaryCacheNotice(accumulator);
 	}
 
 	private resolveLocalExtensionSource(
@@ -1735,8 +1762,16 @@ export class DefaultPackageManager implements PackageManager {
 			return;
 		}
 		const installRoot = this.getNpmInstallRoot(scope, temporary);
-		this.ensureNpmProject(installRoot);
+		const packageDir = temporary ? this.getNpmInstallPath(source, scope) : undefined;
+		if (packageDir) {
+			// Install into a directory this process just created, never into one it found.
+			this.prepareTemporaryInstallTarget(packageDir);
+		}
+		this.ensureNpmProject(installRoot, temporary);
 		await this.runNpmCommand(["install", source.spec, "--prefix", installRoot]);
+		if (packageDir) {
+			this.claimTemporaryInstallTarget(packageDir);
+		}
 	}
 
 	private async uninstallNpm(source: NpmSource, scope: SourceScope): Promise<void> {
@@ -1753,14 +1788,21 @@ export class DefaultPackageManager implements PackageManager {
 
 	private async installGit(source: GitSource, scope: SourceScope): Promise<void> {
 		const targetDir = this.getGitInstallPath(source, scope);
-		if (existsSync(targetDir)) {
+		if (scope === "temporary") {
+			if (verifyTempEntry(this.getTemporaryCache(), targetDir).trusted) {
+				return;
+			}
+			this.prepareTemporaryInstallTarget(targetDir);
+		} else if (existsSync(targetDir)) {
 			return;
 		}
 		const gitRoot = this.getGitInstallRoot(scope);
 		if (gitRoot) {
 			this.ensureGitIgnore(gitRoot);
 		}
-		mkdirSync(dirname(targetDir), { recursive: true });
+		if (scope !== "temporary") {
+			mkdirSync(dirname(targetDir), { recursive: true });
+		}
 
 		await this.runCommand("git", ["clone", source.repo, targetDir]);
 		if (source.ref) {
@@ -1770,11 +1812,20 @@ export class DefaultPackageManager implements PackageManager {
 		if (existsSync(packageJsonPath)) {
 			await this.runNpmCommand(this.getGitDependencyInstallArgs(), { cwd: targetDir });
 		}
+		if (scope === "temporary") {
+			this.claimTemporaryInstallTarget(targetDir);
+		}
 	}
 
 	private async updateGit(source: GitSource, scope: SourceScope): Promise<void> {
 		const targetDir = this.getGitInstallPath(source, scope);
 		if (!existsSync(targetDir)) {
+			await this.installGit(source, scope);
+			return;
+		}
+		if (scope === "temporary" && !verifyTempEntry(this.getTemporaryCache(), targetDir).trusted) {
+			// `git fetch` reads the target's own `.git/config`, so an unverified checkout
+			// is reinstalled from the source instead of being asked to talk to git.
 			await this.installGit(source, scope);
 			return;
 		}
@@ -1806,16 +1857,24 @@ export class DefaultPackageManager implements PackageManager {
 		}
 	}
 
-	private async refreshTemporaryGitSource(source: GitSource, sourceStr: string): Promise<void> {
+	/**
+	 * Refresh a cached temporary git checkout. A failure is reported to the caller
+	 * rather than swallowed: the cached copy is only kept because prime-agent
+	 * installed it, and the user has to be able to see that it may be stale.
+	 */
+	private async refreshTemporaryGitSource(source: GitSource, sourceStr: string): Promise<string | undefined> {
 		if (isOfflineModeEnabled()) {
-			return;
+			return undefined;
 		}
 		try {
 			await this.withProgress("pull", sourceStr, `Refreshing ${sourceStr}...`, async () => {
 				await this.updateGit(source, "temporary");
 			});
-		} catch {
-			// Keep the cached temporary checkout if refresh fails.
+			return undefined;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			log.warn("temporary git source refresh failed", { source: sourceStr, error: message });
+			return `refresh failed: ${message}`;
 		}
 	}
 
@@ -1848,8 +1907,10 @@ export class DefaultPackageManager implements PackageManager {
 		}
 	}
 
-	private ensureNpmProject(installRoot: string): void {
-		if (!existsSync(installRoot)) {
+	private ensureNpmProject(installRoot: string, temporary = false): void {
+		if (temporary) {
+			ensurePrivateDirectoryPath(installRoot, this.getTemporaryCache().root);
+		} else if (!existsSync(installRoot)) {
 			mkdirSync(installRoot, { recursive: true });
 		}
 		this.ensureGitIgnore(installRoot);
@@ -1927,12 +1988,114 @@ export class DefaultPackageManager implements PackageManager {
 		return join(this.agentDir, "git");
 	}
 
+	/**
+	 * The private root temporary extension sources are installed under. Claimed once
+	 * per package manager; see `utils/private-temp-cache.ts` for why a shared,
+	 * computable directory was not acceptable here.
+	 */
+	private getTemporaryCache(): PrivateTempCache {
+		if (!this.temporaryCache) {
+			this.temporaryCache = ensurePrivateTempCache(TEMPORARY_CACHE_NAMESPACE);
+			if (this.temporaryCache.notice) {
+				this.temporaryCacheNotice = this.temporaryCache.notice;
+			}
+		}
+		return this.temporaryCache;
+	}
+
+	/**
+	 * `prefix`/`suffix` select the entry; the bucket name is derived from the cache
+	 * root's token as well, so a directory name cannot be computed from the source
+	 * string alone. Cross-run caching still works because the token is persisted in the
+	 * root; a root that has to be replaced (squat, symlink, foreign owner) gets fresh
+	 * names, which is exactly the point.
+	 */
 	private getTemporaryDir(prefix: string, suffix?: string): string {
+		const cache = this.getTemporaryCache();
 		const hash = createHash("sha256")
-			.update(`${prefix}-${suffix ?? ""}`)
+			.update(`${cache.token}\u0000${prefix}-${suffix ?? ""}`)
 			.digest("hex")
-			.slice(0, 8);
-		return join(tmpdir(), "pi-extensions", prefix, hash, suffix ?? "");
+			.slice(0, 16);
+		return join(cache.root, prefix, hash, suffix ?? "");
+	}
+
+	/**
+	 * Whether a temporary-scope install directory may be reused. Reuse requires
+	 * provenance: our private root, a chain of directories we own and nobody else can
+	 * write into, and the install record this root's installer leaves behind. An entry
+	 * that is merely *present* is reinstalled instead of loaded, and skipped with a
+	 * diagnostic when a reinstall is impossible (offline mode).
+	 */
+	private temporaryEntryTrust(
+		dir: string,
+		source: string,
+		scope: SourceScope,
+		accumulator: ResourceAccumulator,
+	): "reuse" | "reinstall" | "skip" {
+		if (scope !== "temporary") {
+			return existsSync(dir) ? "reuse" : "reinstall";
+		}
+		const check = verifyTempEntry(this.getTemporaryCache(), dir);
+		if (check.trusted) {
+			return "reuse";
+		}
+		if (check.reason === "missing") {
+			return "reinstall";
+		}
+		if (isOfflineModeEnabled()) {
+			accumulator.diagnostics.push({
+				type: "error",
+				message: `Refusing to load ${source} from ${dir}: ${check.message}. Offline mode blocks reinstalling it.`,
+				path: dir,
+			});
+			return "skip";
+		}
+		accumulator.diagnostics.push({
+			type: "warning",
+			message: `Reinstalling ${source}: the existing directory is not one prime-agent installed (${check.message}).`,
+			path: dir,
+		});
+		return "reinstall";
+	}
+
+	/**
+	 * Clear a directory that failed verification before installing into it, so an
+	 * installer never writes into - and a later resolve never loads - somebody else's
+	 * tree. The parent chain is created as private directories; the target itself is
+	 * left absent for the installer to create.
+	 */
+	private prepareTemporaryInstallTarget(installedPath: string): void {
+		const cache = this.getTemporaryCache();
+		const check = verifyTempEntry(cache, installedPath);
+		if (!check.trusted && check.reason !== "missing") {
+			// Somebody else's tree standing where our install belongs. It is not vouched
+			// for, so it is removed instead of being written into or loaded from. Removal
+			// refuses anything this process may not safely delete.
+			removeTempEntry(cache, installedPath);
+		}
+		ensurePrivateDirectoryPath(dirname(installedPath), cache.root);
+	}
+
+	/**
+	 * Leave the install record that makes a later reuse trustworthy. A silent no-op when
+	 * the installer produced no directory: there is then nothing to vouch for, and the
+	 * next resolve installs again rather than failing on a source that installed nothing.
+	 */
+	private claimTemporaryInstallTarget(installedPath: string): void {
+		if (!existsSync(installedPath)) {
+			return;
+		}
+		markTempEntryInstalled(this.getTemporaryCache(), installedPath);
+	}
+
+	/** Surface the one-off notice when the per-uid cache root could not be claimed. */
+	private drainTemporaryCacheNotice(accumulator: ResourceAccumulator): void {
+		const notice = this.temporaryCacheNotice;
+		if (!notice) {
+			return;
+		}
+		this.temporaryCacheNotice = undefined;
+		accumulator.diagnostics.push({ type: "warning", message: notice });
 	}
 
 	private getBaseDirForScope(scope: SourceScope): string {

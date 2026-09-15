@@ -1,0 +1,3 @@
+- Fixed the temporary extension cache used by `-e <npm-or-git source>` to live in a private, owner-checked `pi-extensions-<uid>` directory instead of a computable shared `/tmp/pi-extensions` tree, so another local account can no longer pre-seed an extension that the agent then imports and runs.
+- Changed temporary extension sources to be reused only when prime-agent installed them (owner, private directory chain, install record); a cache directory it did not create is reinstalled, or refused with a visible diagnostic when offline, and `git` is never run inside one.
+- Changed a failed refresh of a cached `-e` git checkout to report a warning instead of being swallowed silently.
