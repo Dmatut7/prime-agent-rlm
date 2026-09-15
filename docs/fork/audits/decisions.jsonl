@@ -145,3 +145,6 @@
 {"id": "IT-2", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "删除/制品路径按文件名推 id（运行期用 header id）⇒ 名字≠id 的转录删不干净", "verified_by": "R14 复现 + 正控"}
 {"id": "IT-3", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "花费两套口径不一致，差额＝被放弃分支上的摘要费（回退后 footer//context 少报已付费用，逐位吻合）", "verified_by": "R14 真语料 + 构造序列"}
 {"id": "IT-4", "date": "2026-09-15", "severity": "P3", "status": "fixing", "commit": null, "title": "OwnUsageAccumulator 契约在数组缩短后不成立（游标只增）", "verified_by": "R14 单元级证明（生产可达性 unverified）"}
+{"id": "L1", "date": "2026-09-15", "severity": "P3", "status": "fixing", "commit": null, "title": "子代理展示缓存无上限/TTL/LRU：2000 次读 +32MB 且外部删目录后永不可驱逐（正控 107× 差）", "verified_by": "R14 --expose-gc 探针 + 正控 + 真机量级估算 ~5MB"}
+{"id": "L2", "date": "2026-09-15", "severity": "P3", "status": "fixing", "commit": null, "title": "artifact 墓碑缓存同型：仅测试钩子能清、生产无驱逐", "verified_by": "R14 读码"}
+{"id": "L3-CORRECTION", "date": "2026-09-15", "severity": "-", "status": "note", "commit": null, "title": "口径纠正：list --all 的 lifecycle:live ≠ 常驻；只有带 activeSessionId 的行才是常驻（本机 19 条，非 630）", "verified_by": "R14 读码 daemon-session-list.ts:237/270"}
