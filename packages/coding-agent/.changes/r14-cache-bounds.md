@@ -1,0 +1,1 @@
+- Fixed two unbounded daemon-side caches: the per-child RLM display cache and the session-artifact tombstone cache now cap entries and estimated bytes, drop the least recently used under pressure, and expire entries for paths that were deleted out from under the process.
