@@ -1660,6 +1660,10 @@ export class AgentSession {
 
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
+	// The auto compaction scope a manual compact() preempted (K3R-11). That abort
+	// is not the user cancelling the queued work, so the auto compaction's catch
+	// must treat it differently from abortCompaction()/requestAbort().
+	private _autoCompactionPreemptedByManual: AbortController | undefined = undefined;
 	private _compactionOperation: Promise<void> | undefined = undefined;
 	/** In-flight manual compact() (r25-1): synchronous admission for mutual exclusion. */
 	private _manualCompactionInFlight:
@@ -2929,6 +2933,21 @@ export class AgentSession {
 		if (!this._goalContinuationAwaitsRlmWork) return;
 		if (this._disposed || this._disposing || this._hasUnsettledRlmQuiescenceWork()) return;
 		if (this._goalState.status !== "active" || !this._goalState.objective) {
+			this._goalContinuationAwaitsRlmWork = false;
+			return;
+		}
+		// K3R-11: a goal turn already queued (for example the threshold compaction
+		// that a manual compact preempted preserved its continuation) is the owed
+		// continuation; the re-arm must not queue a second one on top of it.
+		if (
+			this._actionStore
+				.unfinishedActions()
+				.some(
+					(action) =>
+						action.payload.kind === "turn" &&
+						action.payload.customMessage?.customType === GOAL_CONTEXT_CUSTOM_TYPE,
+				)
+		) {
 			this._goalContinuationAwaitsRlmWork = false;
 			return;
 		}
@@ -8396,9 +8415,20 @@ export class AgentSession {
 			let displayResult = true;
 			switch (input.command.name) {
 				case "compact":
-					await this.compact(input.command.args || undefined, {
-						skipAbort: true,
-					});
+					try {
+						await this.compact(input.command.args || undefined, {
+							skipAbort: true,
+						});
+					} catch (error) {
+						if (!(error instanceof CompactionSkippedError)) throw error;
+						// K3R-7 follow-up (r28): a queued /compact that skipped never ran
+						// its instructions anywhere. Without instructions the skip is
+						// benign; with them the drop must be visible instead of the
+						// silent return the shared catch gives CompactionSkippedError.
+						if (input.command.args) {
+							resultText = `Compact skipped: ${error instanceof Error ? error.message : String(error)}`;
+						}
+					}
 					break;
 				case "refine": {
 					let result: RefinementResult;
@@ -9970,7 +10000,13 @@ export class AgentSession {
 		// just-compacted context (double LLM compaction, or an "Already
 		// compacted" failure). Aborting the auto scope settles it as cancelled;
 		// the wait in _compact then proceeds into this manual run.
-		this._autoCompactionAbortController?.abort();
+		// K3R-11: the preempted scope is marked so its catch keeps the queued
+		// continuations alive (a manual /compact is not the user cancelling them).
+		const preemptedAutoCompaction = this._autoCompactionAbortController;
+		if (preemptedAutoCompaction) {
+			this._autoCompactionPreemptedByManual = preemptedAutoCompaction;
+			preemptedAutoCompaction.abort();
+		}
 		const operation = this._compact(customInstructions, options);
 		this._manualCompactionInFlight = { operation, customInstructions };
 		try {
@@ -9979,6 +10015,10 @@ export class AgentSession {
 			if (this._manualCompactionInFlight?.operation === operation) {
 				this._manualCompactionInFlight = undefined;
 			}
+			// K3R-11: _compact()'s abort() suspends the session input pump, which is
+			// what delivers the continuations the preempted auto compaction left
+			// queued. Revive it so the preserved work runs after this compaction.
+			if (preemptedAutoCompaction) this.resumeQueuedWork();
 		}
 	}
 
@@ -10060,6 +10100,15 @@ export class AgentSession {
 			});
 			if (recoveryHint && error instanceof Error) {
 				throw new Error(`${error.message}${recoveryHint}`, { cause: error });
+			}
+			// K3R-7 follow-up (r28): a skipped manual compact never consumed its
+			// customInstructions anywhere - a queued second compact re-entering after
+			// the first settled hits "Already compacted" and the instructions silently
+			// die. A bare "Already compacted" does not say that; name the loss.
+			if (skipped && customInstructions !== undefined) {
+				throw new CompactionSkippedError(`${message} — the custom instructions were not applied`, {
+					cause: error,
+				});
 			}
 			throw error;
 		} finally {
@@ -11564,15 +11613,30 @@ export class AgentSession {
 			}
 			return false;
 		} catch (error) {
-			this._clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(
-				reason === "threshold" && shouldContinueAfterCompaction,
-				queuedAutonomousContinuationsForThisCompaction,
-			);
 			const errorMessage = error instanceof Error ? error.message : "compaction failed";
 			const aborted =
 				errorMessage === "Compaction cancelled" || (error instanceof Error && error.name === "AbortError");
+			// K3R-11: a manual compact() preempts this scope; that abort is not the
+			// user cancelling the queued work. The continuations this compaction
+			// stopped the loop for must survive exactly as the success path leaves
+			// them - the manual compaction runs on the same context and resumes the
+			// loop for them when it settles. Only a user-level abort (abortCompaction,
+			// requestAbort) keeps the destroy-and-roll-back semantics.
+			const preemptedByManualCompaction = aborted && this._autoCompactionPreemptedByManual === autoCompactionAbort;
+			if (preemptedByManualCompaction) {
+				this._autoCompactionPreemptedByManual = undefined;
+			} else {
+				this._clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(
+					reason === "threshold" && shouldContinueAfterCompaction,
+					queuedAutonomousContinuationsForThisCompaction,
+				);
+			}
 			if (aborted) {
-				this._clearQueuedGoalContinuationAfterCancelledThresholdCompaction(queuedGoalContinuationForThisCompaction);
+				if (!preemptedByManualCompaction) {
+					this._clearQueuedGoalContinuationAfterCancelledThresholdCompaction(
+						queuedGoalContinuationForThisCompaction,
+					);
+				}
 				this._endCompactionUnsuccessfully(
 					reason,
 					"cancelled",
@@ -11611,6 +11675,9 @@ export class AgentSession {
 			resumeAfterFailure();
 			return false;
 		} finally {
+			if (this._autoCompactionPreemptedByManual === autoCompactionAbort) {
+				this._autoCompactionPreemptedByManual = undefined;
+			}
 			if (this._autoCompactionAbortController === autoCompactionAbort) {
 				this._autoCompactionAbortController = undefined;
 			}
@@ -13706,6 +13773,14 @@ export class AgentSession {
 		run: RlmChildRun,
 		event: Extract<AgentSessionEvent, { type: "message_start" | "message_update" }>,
 	): string {
+		// The accumulator tracks one assistant message, not the run: a run folds
+		// several assistant messages (tool-call rounds, agent_message continuation
+		// rounds) and each starts from an empty text. Reading the previous message's
+		// folded lengths as the new message's consumed prefix glued the old answer
+		// onto a mid-word slice of the new one, or froze the preview at the old cap,
+		// for the whole message. message_start is the per-message boundary; reset
+		// there so only message_update folds incrementally.
+		if (event.type === "message_start") run.streamPreview = undefined;
 		run.streamPreview ??= new RlmChildStreamPreview();
 		const preview = run.streamPreview;
 		return preview.update(event.message as AssistantMessage);
