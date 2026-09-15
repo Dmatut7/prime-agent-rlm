@@ -1,0 +1,1 @@
+- Changed `maxRetryDelayMs` so it is enforced by the OpenAI, Anthropic and Azure SDK-backed providers, not only Codex: a server-requested wait above the cap now fails immediately instead of sleeping, and `onProviderRetry` reports every such wait.

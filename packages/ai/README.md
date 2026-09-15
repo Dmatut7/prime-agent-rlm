@@ -1230,6 +1230,8 @@ const response = await complete(model, {
 
 ### Provider Notes
 
+**Retry delays (OpenAI, Anthropic, Azure)**: The OpenAI and Anthropic SDKs obey a server `Retry-After` header verbatim, so this library wraps their transport to enforce `maxRetryDelayMs` (default 60000ms; `0` disables the cap): when the requested wait exceeds the cap, the response is marked non-retryable (`x-should-retry: false`) and the SDK fails immediately with the provider's own error, keeping the rate-limit classification. Pass `onProviderRetry` in the stream options to observe every server-requested wait, capped or not; callers use it to tell throttling apart from a dead connection.
+
 **OpenAI Codex**: Requires a ChatGPT Plus or Pro subscription. Provides access to GPT-5.x Codex models with extended context windows and reasoning capabilities. The library automatically handles session-based prompt caching when `sessionId` is provided in stream options. You can set `transport` in stream options to `"sse"`, `"websocket"`, or `"auto"` for Codex Responses transport selection. When using WebSocket with a `sessionId`, connections are reused per session and expire after 5 minutes of inactivity. SSE transport retries 429/5xx and honors `Retry-After`. Non-429 4xx responses are not retried. `maxRetries` defaults to 3 (`0` means a single attempt). `maxRetryDelayMs` caps the server-requested wait (default 60000ms; `0` disables the cap). If `Retry-After` exceeds the cap, the request fails immediately instead of waiting.
 
 **Google / Vertex AI**: The current clients do not retry HTTP 429. `maxRetries` and `maxRetryDelayMs` are ignored.

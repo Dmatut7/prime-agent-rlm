@@ -24,6 +24,7 @@ import {
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
 import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.js";
+import { createRetryCapFetch } from "./retry-cap.js";
 import { buildBaseOptions } from "./simple-options.js";
 
 const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
@@ -92,7 +93,17 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
 			const cacheRetention = resolveCacheRetention(options?.cacheRetention);
 			const cacheSessionId = cacheRetention === "none" ? undefined : options?.sessionId;
-			const client = createClient(model, context, apiKey, options?.headers, cacheSessionId);
+			const client = createClient(
+				model,
+				context,
+				apiKey,
+				options?.headers,
+				cacheSessionId,
+				createRetryCapFetch({
+					maxRetryDelayMs: options?.maxRetryDelayMs,
+					onProviderRetry: options?.onProviderRetry,
+				}),
+			);
 			let params = buildParams(model, context, options);
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
@@ -166,6 +177,7 @@ function createClient(
 	apiKey?: string,
 	optionsHeaders?: Record<string, string>,
 	sessionId?: string,
+	retryFetch?: (input: string | URL | Request, init?: RequestInit) => Promise<Response>,
 ) {
 	if (!apiKey) {
 		if (!process.env.OPENAI_API_KEY) {
@@ -212,6 +224,7 @@ function createClient(
 		baseURL: isCloudflareProvider(model.provider) ? resolveCloudflareBaseUrl(model) : model.baseUrl,
 		dangerouslyAllowBrowser: true,
 		defaultHeaders,
+		...(retryFetch ? { fetch: retryFetch } : {}),
 	});
 }
 

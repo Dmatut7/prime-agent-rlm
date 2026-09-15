@@ -7,7 +7,7 @@ import {
 	type UserMessage,
 } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
-import { runAgentLoop } from "../src/agent-loop.js";
+import { runAgentLoop, SERVER_DIRECTED_RETRY_STALL_STOP_REASON_RAW } from "../src/agent-loop.js";
 import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage } from "../src/types.js";
 
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
@@ -220,5 +220,50 @@ describe("agent loop stream stall detection", () => {
 			const messages = await runPromise;
 			expect(lastAssistant(messages)?.stopReason).toBe("aborted");
 		}
+	});
+
+	it("classifies a stall during a server-requested retry wait as throttling, not a dead connection", async () => {
+		const context = createContext();
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			streamStallTimeoutMs: 40,
+		};
+		const streamFn = vi.fn(
+			(_model: Model<any>, _context: unknown, options: { onProviderRetry?: (notice: never) => void }) => {
+				// The provider answered: it asked to wait far longer than the stall window.
+				options.onProviderRetry?.({
+					status: 429,
+					delayMs: 5000,
+					retryAfter: "5",
+					capped: false,
+				} as never);
+				return new MockAssistantStream(); // then silence, while the wait is in progress
+			},
+		);
+
+		const messages = await runAgentLoop(
+			[createUserMessage("hello")],
+			context,
+			config,
+			async () => {},
+			undefined,
+			streamFn as never,
+		);
+		const assistant = lastAssistant(messages);
+
+		expect(assistant?.stopReason).toBe("error");
+		// The diagnosis must name throttling and must not claim a dead connection.
+		expect(assistant?.errorMessage).toContain("throttling");
+		expect(assistant?.errorMessage).not.toContain("likely dead");
+		// It must carry the structured kind that downstream routing keys on.
+		expect(assistant?.diagnostics?.map((diagnostic) => diagnostic.type)).toContain("provider_stream_failure");
+		expect(assistant?.diagnostics?.[0]?.details).toMatchObject({
+			kind: "rate_limit",
+			status: 429,
+			retryAfterMs: 5000,
+		});
+		// And it must be recognizable as the shape that is excluded from full-context resends.
+		expect(assistant?.stopReasonRaw).toBe(SERVER_DIRECTED_RETRY_STALL_STOP_REASON_RAW);
 	});
 });

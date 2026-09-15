@@ -1,5 +1,8 @@
+import type { ProviderRetryNotice } from "./providers/retry-cap.js";
 import type { AssistantMessageDiagnostic } from "./utils/diagnostics.js";
 import type { AssistantMessageEventStream } from "./utils/event-stream.js";
+
+export type { ProviderRetryNotice } from "./providers/retry-cap.js";
 
 export type { AssistantMessageEventStream } from "./utils/event-stream.js";
 
@@ -131,9 +134,18 @@ export interface StreamOptions {
 	 * exceeds this value, the request fails immediately with an error containing the
 	 * requested delay, allowing higher-level retry logic to handle it with user visibility.
 	 * Default: 60000 (60 seconds). Set to 0 to disable the cap.
+	 * Honored by every provider that retries client-side: OpenAI/Anthropic SDK-backed
+	 * providers enforce it via a fetch wrapper, Codex SSE natively.
 	 * Ignored by Mistral, Google, and Vertex AI (those clients currently do not retry 429).
 	 */
 	maxRetryDelayMs?: number;
+	/**
+	 * Called when the provider answers with a retry wait it asked the client to observe
+	 * (HTTP 429/408/5xx with `Retry-After`), whether or not the cap rejects the wait.
+	 * Lets callers classify a later stream stall as server-directed throttling instead
+	 * of a dead connection. Diagnostic only: throwing here does not affect the request.
+	 */
+	onProviderRetry?: (notice: ProviderRetryNotice) => void;
 	/**
 	 * Optional metadata to include in API requests.
 	 * Providers extract the fields they understand and ignore the rest.

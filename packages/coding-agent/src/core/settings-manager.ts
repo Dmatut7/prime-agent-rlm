@@ -126,10 +126,18 @@ export interface ProviderRetrySettings {
 	streamStallTimeoutMs?: number; // default: 300000 (5 min with zero stream events => abort + retryable error); 0 disables
 }
 
+export interface EmptyTurnRetrySettings {
+	maxAttempts?: number; // default: 3 total provider attempts for one turn
+	baseDelayMs?: number; // default: 500, doubled per attempt
+	maxDelayMs?: number; // default: 4000 cap for a single wait
+	maxTotalDelayMs?: number; // default: bounded by the remaining attempts
+}
+
 export interface RetrySettings {
 	enabled?: boolean; // default: true
 	maxRetries?: number; // default: 3
 	baseDelayMs?: number; // default: 2000 (exponential backoff: 2s, 4s, 8s)
+	emptyTurn?: EmptyTurnRetrySettings;
 	provider?: ProviderRetrySettings;
 }
 
@@ -1336,6 +1344,19 @@ export class SettingsManager {
 			maxRetries: this.settings.retry?.maxRetries ?? 3,
 			baseDelayMs: this.settings.retry?.baseDelayMs ?? 2000,
 		};
+	}
+
+	/**
+	 * In-place retry policy for clean-but-empty assistant turns. Honors `retry.enabled`
+	 * (switching retries off leaves a single attempt) so the empty-reply path is gated by
+	 * the same setting as every other retry class instead of being a hidden exception.
+	 */
+	getEmptyTurnRetrySettings(): EmptyTurnRetrySettings {
+		const emptyTurn = this.settings.retry?.emptyTurn ?? {};
+		// `retry.enabled: false` must mean "no automatic resends anywhere", including the
+		// loop's in-place empty-turn retries, so it collapses to a single attempt here.
+		// Omitted numbers are left undefined: the agent loop owns the defaults.
+		return this.getRetryEnabled() ? { ...emptyTurn } : { ...emptyTurn, maxAttempts: 1 };
 	}
 
 	getProviderRetrySettings(): {

@@ -330,6 +330,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		thinkingBudgets: settingsManager.getThinkingBudgets(),
 		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
 		streamStallTimeoutMs: settingsManager.getProviderRetrySettings().streamStallTimeoutMs,
+		emptyTurnRetry: settingsManager.getEmptyTurnRetrySettings(),
 	});
 
 	if (hasExistingSession) {
