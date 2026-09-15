@@ -5,7 +5,7 @@ import type { RlmChildAgentStatus } from "./agent-session.js";
 import { calculateContextTokens, estimateContextTokens } from "./compaction/index.js";
 import type { ContextUsage } from "./extensions/index.js";
 import { buildSessionContext, type FileEntry, loadEntriesFromFile, type SessionEntry } from "./session-manager.js";
-import { addAssistantUsage, cloneUsage, emptyUsage, subtractAssistantUsage } from "./usage.js";
+import { addAssistantUsage, addUsageDelta, cloneUsage, emptyUsage, subtractAssistantUsage } from "./usage.js";
 
 /** Resolves a model's context window so disk-only nodes can report utilization. */
 export type ContextWindowResolver = (provider: string, modelId: string) => number | undefined;
@@ -104,6 +104,15 @@ export class OwnUsageAccumulator {
 	private ownUsage: Usage = emptyUsage();
 	/** Assistants whose usage the branch counted, i.e. the targets an attribution may subtract from. */
 	private readonly countedAssistantIds = new Set<string>();
+	/**
+	 * The usage this fold has counted for each assistant. `appendChildUsageAttribution`
+	 * rewrites a target assistant's `message.usage` in place to the aggregate right
+	 * before appending the attribution entry, and a target the cursor already passed
+	 * is not re-read: the rewrite arrives as a delta against the recorded value, so
+	 * the incremental fold stays equal to the whole-file refold, which reads the
+	 * rewritten usage.
+	 */
+	private readonly countedAssistantUsage = new Map<string, Usage>();
 	/** Attributions that arrived before their target; applied when the target is counted. */
 	private readonly pendingAttributions = new Map<string, Usage[]>();
 	private processed = 0;
@@ -134,6 +143,7 @@ export class OwnUsageAccumulator {
 				addAssistantUsage(this.totalUsage, entry.message.usage);
 				addAssistantUsage(this.ownUsage, entry.message.usage);
 				this.countedAssistantIds.add(entry.id);
+				this.countedAssistantUsage.set(entry.id, cloneUsage(entry.message.usage));
 				const pending = this.pendingAttributions.get(entry.id);
 				if (pending !== undefined) {
 					for (const usage of pending) subtractAssistantUsage(this.ownUsage, usage);
@@ -148,6 +158,22 @@ export class OwnUsageAccumulator {
 			}
 			if (entry.type === "child_usage_attributed") {
 				if (this.countedAssistantIds.has(entry.targetId)) {
+					// The attribution rewrites the target assistant's usage in place
+					// to `aggregateUsage` before this entry is appended, and a target
+					// behind the cursor was folded with its pre-rewrite usage. Apply
+					// the rewrite as a delta against what this fold counted, then
+					// subtract the child share, so the incremental result equals the
+					// whole-file refold over the rewritten transcript.
+					// Transcripts predating `aggregateUsage` on the attribution entry carry
+					// no rewrite either (the loader only rewrites from a present aggregate),
+					// so a missing aggregate falls back to the plain child subtraction.
+					const counted = this.countedAssistantUsage.get(entry.targetId);
+					const aggregate = entry.aggregateUsage;
+					if (counted !== undefined && aggregate !== undefined) {
+						addUsageDelta(this.totalUsage, aggregate, counted);
+						addUsageDelta(this.ownUsage, aggregate, counted);
+						this.countedAssistantUsage.set(entry.targetId, cloneUsage(aggregate));
+					}
 					subtractAssistantUsage(this.ownUsage, entry.childUsage);
 				} else {
 					const pending = this.pendingAttributions.get(entry.targetId);
@@ -175,6 +201,7 @@ export class OwnUsageAccumulator {
 		this.totalUsage = emptyUsage();
 		this.ownUsage = emptyUsage();
 		this.countedAssistantIds.clear();
+		this.countedAssistantUsage.clear();
 		this.pendingAttributions.clear();
 		this.processed = 0;
 		this.lastTail = undefined;

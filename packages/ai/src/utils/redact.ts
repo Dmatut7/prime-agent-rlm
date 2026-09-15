@@ -28,9 +28,16 @@ const REDACTED_HEAD = REDACTED.slice(0, -1);
  * an optional JSON quote and an optional `Bearer`/`Basic`/`Token` prefix consumed from
  * the value. A value that already starts with the placeholder is left alone by the
  * callback below, so a text that went through redaction once is not rewritten again.
+ *
+ * The leading boundary is `\b` or a lookbehind for a JSON escape sequence
+ * (`\\n`/`\\r`/`\\t`/`\\f`/`\\b`): a serialized multiline value glues the escape
+ * letter onto the next key name (`\n` + `session` reads as `nsession`), which
+ * defeats the plain word boundary. The escape prefix is only looked behind, never
+ * consumed, so a washed line stays parseable JSON. The same widened boundary sits
+ * in front of OPAQUE_ASSIGNMENT and SESSION_ASSIGNMENT.
  */
 const CREDENTIAL_KEY_VALUE =
-	/\b(authorization|proxy-authorization|api[-_]?key|x-api[-_]?key|apikey|auth[-_]?token|access[-_]?token|refresh[-_]?token|id[-_]?token|session[-_]?token|client[-_]?secret|consumer[-_]?secret|secret[-_]?key|secret|password|passwd|pass|token|bearer|credential)\b("?\s*[:=]\s*"?)((?:bearer|basic|token)\s+)?([^\s"'`,;)\]}&\\]+)/gi;
+	/(?:(?<=\\[nrtfb])|\b)(authorization|proxy-authorization|api[-_]?key|x-api[-_]?key|apikey|auth[-_]?token|access[-_]?token|refresh[-_]?token|id[-_]?token|session[-_]?token|client[-_]?secret|consumer[-_]?secret|secret[-_]?key|secret|password|passwd|pass|token|bearer|credential)\b("?\s*[:=]\s*"?)((?:bearer|basic|token)\s+)?([^\s"'`,;)\]}&\\]+)/gi;
 
 /**
  * `Bearer <token>` anywhere, including inside a value the key pattern did not reach.
@@ -128,7 +135,7 @@ const OPAQUE_RUN_MIN_LENGTH = 20;
  * keeps an ordinary word that ends in one of these names (`monkey=`) out of it.
  */
 const OPAQUE_ASSIGNMENT = new RegExp(
-	`\\b((?:[A-Za-z0-9]{1,64}[-_])?(?:key|apikey|api_key|token|secret|sig|signature|password|passwd|credential|session|sessionid|session_id|sid|jsessionid|phpsessid|access_key|refresh_key|auth|authorization|authz|otp|passcode|verification)=)(${OPAQUE_RUN_CLASS}{${OPAQUE_RUN_MIN_LENGTH},})`,
+	`(?:(?<=\\\\[nrtfb])|\\b)((?:[A-Za-z0-9]{1,64}[-_])?(?:key|apikey|api_key|token|secret|sig|signature|password|passwd|credential|session|sessionid|session_id|sid|jsessionid|phpsessid|access_key|refresh_key|auth|authorization|authz|otp|passcode|verification)=)(${OPAQUE_RUN_CLASS}{${OPAQUE_RUN_MIN_LENGTH},})`,
 	"gi",
 );
 
@@ -142,7 +149,7 @@ const OPAQUE_ASSIGNMENT = new RegExp(
 const SESSION_ASSIGNMENT_MIN_LENGTH = 8;
 
 const SESSION_ASSIGNMENT = new RegExp(
-	`\\b((?:[A-Za-z0-9]{1,64}[-_])?(?:session|sessions|sess|sessionid|session_id|sid|jsessionid|phpsessid|connect[._]sid)=)(${OPAQUE_RUN_CLASS}{${SESSION_ASSIGNMENT_MIN_LENGTH},})`,
+	`(?:(?<=\\\\[nrtfb])|\\b)((?:[A-Za-z0-9]{1,64}[-_])?(?:session|sessions|sess|sessionid|session_id|sid|jsessionid|phpsessid|connect[._]sid)=)(${OPAQUE_RUN_CLASS}{${SESSION_ASSIGNMENT_MIN_LENGTH},})`,
 	"gi",
 );
 

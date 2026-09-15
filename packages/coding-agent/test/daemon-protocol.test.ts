@@ -114,8 +114,42 @@ describe("daemon protocol helpers", () => {
 			sessionManagerSource.indexOf("export interface SessionTreeFlatNode"),
 			sessionManagerSource.indexOf("export interface SessionContext"),
 		);
+		// K3X-1: the stall event family is a wire shape too, but it lives in the
+		// session-event union and the diagnostics payload modules, none of which the
+		// three request/event slices or the session-tree slice cover. An edit to the
+		// stall event or payload shape (DO-1 added `diagnostics` as a required field)
+		// used to leave DAEMON_SCHEMA_ID unchanged, so a mixed old-daemon/new-client
+		// pair passed the handshake with mismatched stall events.
+		const agentSessionSource = readFileSync(resolve(__dirname, "../src/core/agent-session.ts"), "utf8");
+		const stallEventSource = agentSessionSource.slice(
+			agentSessionSource.indexOf('| {\n\t\t\ttype: "stall_warning"'),
+			agentSessionSource.indexOf("export type AgentSessionEventListener"),
+		);
+		const stallDiagnosticsModule = readFileSync(resolve(__dirname, "../src/core/stall-diagnostics.ts"), "utf8");
+		const stallDiagnosticsSource = stallDiagnosticsModule.slice(
+			stallDiagnosticsModule.indexOf("export interface StallDiagnostics"),
+		);
+		const stallWatchdogSource = readFileSync(resolve(__dirname, "../src/core/stall-watchdog.ts"), "utf8");
+		const stallKernelSource = stallWatchdogSource.slice(
+			stallWatchdogSource.indexOf("export interface StallKernelDiagnostics"),
+			stallWatchdogSource.indexOf("export interface StallExemptionSnapshot"),
+		);
+		const stallExemptionSource = stallWatchdogSource.slice(
+			stallWatchdogSource.indexOf("export interface StallExemptionDiagnostics"),
+			stallWatchdogSource.indexOf("export type StallExemptionEventKind"),
+		);
+		// The slice markers must be found: a silent -1 would hash an empty string
+		// and let the stall family fall back out of the digest unnoticed.
+		expect(stallEventSource).toContain('type: "stall_warning"');
+		expect(stallEventSource).toContain('type: "stall_unsettled"');
+		expect(stallDiagnosticsSource).toContain("export interface StallDiagnostics");
+		expect(stallKernelSource).toContain("export interface StallKernelDiagnostics");
+		expect(stallExemptionSource).toContain("export interface StallExemptionDiagnostics");
 		const digest = createHash("sha256")
-			.update(`${commandSource}\n${savedSessionSource}\n${outboundSource}\n${treeWireSource}`)
+			.update(
+				`${commandSource}\n${savedSessionSource}\n${outboundSource}\n${treeWireSource}\n` +
+					`${stallEventSource}\n${stallDiagnosticsSource}\n${stallKernelSource}\n${stallExemptionSource}`,
+			)
 			.digest("hex")
 			.slice(0, 12);
 		expect(DAEMON_SCHEMA_ID).toBe(`protocol-${DAEMON_PROTOCOL_VERSION}-schema-${DAEMON_SCHEMA_REVISION}-${digest}`);

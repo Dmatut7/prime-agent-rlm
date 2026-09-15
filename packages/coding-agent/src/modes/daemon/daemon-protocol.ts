@@ -145,8 +145,16 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 //   a total-node cap (SESSION_TREE_MAX_WIRE_NODES), so a wide (star-shaped) session's
 //   snapshot tree is cut and reported truncated instead of shipping O(entries) nodes
 //   whole; the shapes on the wire are unchanged and all clients degrade locally.
-export const DAEMON_SCHEMA_REVISION = 32;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-32-031a9f304364";
+// Revision 33 extends the digest again, not the wire: the stall event family
+// (stall_warning/stall_abort/stall_unsettled and their `diagnostics` payload,
+// typed in core/agent-session.ts, core/stall-diagnostics.ts and the exemption/
+// kernel segments in core/stall-watchdog.ts) lives outside the three
+// request/event slices, so adding `diagnostics` as a required event field left
+// DAEMON_SCHEMA_ID unchanged and a mixed old-daemon/new-client pair passed the
+// handshake with mismatched stall events. The stall family now joins the hashed
+// source; the wire shapes themselves are unchanged.
+export const DAEMON_SCHEMA_REVISION = 33;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-33-f3a2737855c2";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;

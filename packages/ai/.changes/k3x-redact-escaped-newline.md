@@ -1,0 +1,1 @@
+- Fixed credential redaction missing the first `key=value` pair after a JSON-escaped newline inside a serialized multiline value (the escape letter glued onto the key name).

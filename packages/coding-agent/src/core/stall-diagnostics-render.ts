@@ -1,13 +1,20 @@
 import type { StallDiagnostics } from "./stall-diagnostics.js";
 import { resolveStallDiagnosticsPointer } from "./stall-evidence.js";
 
-/** One stall event as the UI ends receive it (all three stages share this shape). */
+/**
+ * One stall event as the UI ends receive it (all three stages share this shape).
+ *
+ * `diagnostics` is optional because the wire crosses versions: a daemon from
+ * before the diagnostics payload emits the stall events without it, and the
+ * renderer must degrade that to an explicit "unknown" line instead of throwing
+ * inside an event handler.
+ */
 export interface StallEventView {
 	type: string;
 	message: string;
 	silentMs: number;
 	thresholdMs: number;
-	diagnostics: StallDiagnostics;
+	diagnostics?: StallDiagnostics | undefined;
 }
 
 function seconds(ms: number): string {
@@ -18,6 +25,15 @@ function yesNo(value: boolean): string {
 	return value ? "yes" : "no";
 }
 
+function isSegment(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+function flag(segment: Record<string, unknown>, key: string): string {
+	const value = segment[key];
+	return typeof value === "boolean" ? yesNo(value) : "unknown";
+}
+
 /**
  * The actionable fields of a stall diagnostics payload, one line each.
  *
@@ -25,46 +41,98 @@ function yesNo(value: boolean): string {
  * operator with "something was silent" and no way to act: which tool call to interrupt, whether
  * the pump is wedged, what the kernel last said. These are the fields that change what you do
  * next.
+ *
+ * Every segment is guarded: the payload crosses the daemon wire, and a producer whose shape
+ * drifts (an older daemon, a partially-written entry) must degrade to an explicit `unknown`
+ * line rather than crash the renderer that consumes the event.
  */
-export function formatStallDiagnosticsLines(diagnostics: StallDiagnostics): string[] {
+export function formatStallDiagnosticsLines(diagnostics: StallDiagnostics | undefined): string[] {
 	const lines: string[] = [];
-	const busy = diagnostics.busy;
+	const payload = isSegment(diagnostics) ? (diagnostics as Record<string, unknown>) : undefined;
+	if (!payload) {
+		lines.push("diagnostics: unknown (event predates the diagnostics payload)");
+		return lines;
+	}
+	const busy = payload["busy"];
+	if (isSegment(busy)) {
+		lines.push(
+			`busy: streaming=${flag(busy, "streaming")} compacting=${flag(busy, "compacting")} ` +
+				`retrying=${flag(busy, "retrying")} bashRunning=${flag(busy, "bashRunning")}`,
+		);
+	} else {
+		lines.push("busy: unknown");
+	}
+	const inFlightCalls = payload["inFlightToolCalls"];
+	if (Array.isArray(inFlightCalls)) {
+		const inFlight = inFlightCalls.map((call) => {
+			if (!isSegment(call)) return "unknown (malformed tool call)";
+			const toolName = typeof call["toolName"] === "string" ? call["toolName"] : "unknown";
+			const toolCallId = typeof call["toolCallId"] === "string" ? call["toolCallId"] : "unknown";
+			const elapsed = typeof call["elapsedMs"] === "number" ? seconds(call["elapsedMs"]) : "unknown";
+			return `${toolName} (id=${toolCallId}, ${elapsed})`;
+		});
+		lines.push(`in-flight tools: ${inFlight.length > 0 ? inFlight.join(", ") : "none"}`);
+	} else {
+		lines.push("in-flight tools: unknown");
+	}
+	const lastEvent = payload["lastEvent"];
 	lines.push(
-		`busy: streaming=${yesNo(busy.streaming)} compacting=${yesNo(busy.compacting)} ` +
-			`retrying=${yesNo(busy.retrying)} bashRunning=${yesNo(busy.bashRunning)}`,
-	);
-	const inFlight = diagnostics.inFlightToolCalls.map(
-		(call) => `${call.toolName} (id=${call.toolCallId}, ${seconds(call.elapsedMs)})`,
-	);
-	lines.push(`in-flight tools: ${inFlight.length > 0 ? inFlight.join(", ") : "none"}`);
-	lines.push(
-		diagnostics.lastEvent
-			? `last event: ${diagnostics.lastEvent.type} (${seconds(diagnostics.lastEvent.ageMs)} ago)`
+		isSegment(lastEvent)
+			? `last event: ${typeof lastEvent["type"] === "string" ? lastEvent["type"] : "unknown"} ` +
+					`(${typeof lastEvent["ageMs"] === "number" ? seconds(lastEvent["ageMs"]) : "unknown"} ago)`
 			: "last event: none recorded",
 	);
-	const pump = diagnostics.pump;
-	lines.push(`pump: suspended=${yesNo(pump.suspended)} requested=${yesNo(pump.requested)} epoch=${pump.epoch}`);
-	lines.push(`unfinished actions: ${diagnostics.unfinishedActions}`);
-	const exemption = diagnostics.exemption;
-	if (exemption) {
-		const reasons = exemption.reasons.length > 0 ? exemption.reasons.join(", ") : "none";
-		const remaining = exemption.budgetRemainingMs === undefined ? undefined : seconds(exemption.budgetRemainingMs);
+	const pump = payload["pump"];
+	if (isSegment(pump)) {
 		lines.push(
-			`exemption: ${exemption.reason ?? "unspecified"} [${reasons}]` +
-				`${remaining ? ` budget left ${remaining}` : ""}` +
-				`${exemption.exhausted ? " (exhausted)" : ""}`,
+			`pump: suspended=${flag(pump, "suspended")} requested=${flag(pump, "requested")} ` +
+				`epoch=${typeof pump["epoch"] === "number" ? pump["epoch"] : "unknown"}`,
 		);
+	} else {
+		lines.push("pump: unknown");
 	}
-	const kernel = diagnostics.kernel;
-	if (kernel) {
-		const facts = [
-			`kernel pid ${kernel.kernelPid ?? "unknown"}`,
-			`reasons: ${kernel.reasons.length > 0 ? kernel.reasons.join(", ") : "none"}`,
-			...(kernel.livenessAgeMs === undefined ? [] : [`livenessAgeMs ${kernel.livenessAgeMs}`]),
-			...(kernel.liveBashHandles === undefined ? [] : [`liveBashHandles ${kernel.liveBashHandles}`]),
-			...(kernel.hostRequestCount === undefined ? [] : [`hostRequests ${kernel.hostRequestCount}`]),
-		];
-		lines.push(facts.join("; "));
+	const unfinishedActions = payload["unfinishedActions"];
+	lines.push(`unfinished actions: ${typeof unfinishedActions === "number" ? unfinishedActions : "unknown"}`);
+	const exemption = payload["exemption"];
+	if (exemption !== undefined) {
+		if (isSegment(exemption)) {
+			const reasonsValue = exemption["reasons"];
+			const reasons = Array.isArray(reasonsValue)
+				? reasonsValue.filter((reason): reason is string => typeof reason === "string")
+				: [];
+			const remainingMs = exemption["budgetRemainingMs"];
+			const remaining = typeof remainingMs === "number" ? seconds(remainingMs) : undefined;
+			lines.push(
+				`exemption: ${typeof exemption["reason"] === "string" ? exemption["reason"] : "unspecified"} [${reasons.join(", ") || "none"}]` +
+					`${remaining ? ` budget left ${remaining}` : ""}` +
+					`${exemption["exhausted"] === true ? " (exhausted)" : ""}`,
+			);
+		} else {
+			lines.push("exemption: unknown");
+		}
+	}
+	const kernel = payload["kernel"];
+	if (kernel !== undefined) {
+		if (isSegment(kernel)) {
+			const kernelPid = kernel["kernelPid"];
+			const livenessAgeMs = kernel["livenessAgeMs"];
+			const liveBashHandles = kernel["liveBashHandles"];
+			const hostRequestCount = kernel["hostRequestCount"];
+			const reasonsValue = kernel["reasons"];
+			const reasons = Array.isArray(reasonsValue)
+				? reasonsValue.filter((reason): reason is string => typeof reason === "string")
+				: [];
+			const facts = [
+				`kernel pid ${typeof kernelPid === "number" ? kernelPid : "unknown"}`,
+				`reasons: ${reasons.length > 0 ? reasons.join(", ") : "none"}`,
+				...(typeof livenessAgeMs === "number" ? [`livenessAgeMs ${livenessAgeMs}`] : []),
+				...(typeof liveBashHandles === "number" ? [`liveBashHandles ${liveBashHandles}`] : []),
+				...(typeof hostRequestCount === "number" ? [`hostRequests ${hostRequestCount}`] : []),
+			];
+			lines.push(facts.join("; "));
+		} else {
+			lines.push("kernel: unknown");
+		}
 	}
 	const pointer = resolveStallDiagnosticsPointer();
 	lines.push(`diagnostics file: ${pointer.evidencePath} (also ${pointer.agentLogPath})`);
