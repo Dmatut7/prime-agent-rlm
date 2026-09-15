@@ -293,23 +293,29 @@ function statusFromBranch(entries: SessionEntry[]): "done" | "error" | "cancelle
 	return "done";
 }
 
-function findSessionFile(dir: string): string | undefined {
-	let newest: { path: string; mtime: number } | undefined;
+/** A child session's newest transcript, with its size so a scan can budget it. */
+interface SessionFile {
+	path: string;
+	size: number;
+}
+
+function findSessionFile(dir: string): SessionFile | undefined {
+	let newest: { path: string; mtime: number; size: number } | undefined;
 	for (const name of readdirSync(dir)) {
 		if (!name.endsWith(".jsonl")) {
 			continue;
 		}
 		const path = join(dir, name);
 		try {
-			const mtime = statSync(path).mtime.getTime();
-			if (!newest || mtime > newest.mtime) {
-				newest = { path, mtime };
+			const stats = statSync(path);
+			if (!newest || stats.mtime.getTime() > newest.mtime) {
+				newest = { path, mtime: stats.mtime.getTime(), size: stats.size };
 			}
 		} catch {
 			// Skip unreadable files.
 		}
 	}
-	return newest?.path;
+	return newest && { path: newest.path, size: newest.size };
 }
 
 function listChildSessionDirs(rlmSessionDir: string): string[] {
@@ -338,21 +344,160 @@ function listChildSessionDirs(rlmSessionDir: string): string[] {
 		});
 }
 
+/** Which limit stopped a disk scan from reading more session files. */
+export type ContextTreeTruncatedReason = "children" | "bytes" | "depth";
+
 /**
- * Build a context node for a completed RLM child from its persisted session
- * dir (sub-xxxx/). Children that already attributed grandchild usage carry the
- * aggregate on their assistant messages (applyChildUsageAttributions), so own
- * usage is recovered by subtracting the attribution entries. Returns undefined
- * when the dir holds no readable session.
+ * Upper bounds for one on-disk context tree scan. Omitted fields take
+ * {@link DEFAULT_CONTEXT_TREE_SCAN_BUDGET}.
  */
-export function loadContextTreeChildFromDisk(
-	childSessionDir: string,
+export interface ContextTreeScanBudget {
+	/** Max number of child session transcripts to read. */
+	maxChildren?: number;
+	/** Max total bytes of child session transcripts to read. */
+	maxBytes?: number;
+	/**
+	 * Max nesting level to read: the children of the scanned dir are level 1,
+	 * their children level 2. Deeper dirs are neither read nor listed.
+	 */
+	maxDepth?: number;
+}
+
+/**
+ * Limits that keep a `/context` scan of the persisted RLM session dirs from
+ * turning into an unbounded read of the disk. They are ceilings for pathological
+ * transcripts, not a shape the UI depends on: a session that stays under all
+ * three gets the same tree it always got.
+ *
+ * - `maxChildren: 256`: `/context` was measured on a directory holding 544
+ *   finished children, which cost 2.2s and ~1.08GB of reads. Ordinary RLM
+ *   fan-out is in the tens, so 256 keeps a multi-round roster whole while
+ *   capping the per-node work (each child is read and folded in full).
+ * - `maxBytes: 64 MiB`: reading and folding a transcript dominates the scan and
+ *   scales with file size, so bytes - not children - are what actually bounds
+ *   the time. 64 MiB is roughly a thousand ordinary child sessions, and the
+ *   observed 1.08GB scan is 17x over it.
+ * - `maxDepth: 16`: delegation nests a few levels in practice. The cap exists to
+ *   bound the walk: without it, nesting depth was limited only by the filesystem
+ *   (a `sub-*` dir that points back at an ancestor kept appending path
+ *   components until `PATH_MAX` made `readdirSync` fail, silently ending the
+ *   scan with a duplicated chain).
+ */
+export const DEFAULT_CONTEXT_TREE_SCAN_BUDGET = {
+	maxChildren: 256,
+	maxBytes: 64 * 1024 * 1024,
+	maxDepth: 16,
+} satisfies Required<ContextTreeScanBudget>;
+
+/**
+ * What a scan covered. Callers use this to say how much of the tree is not on
+ * screen instead of quietly showing a partial roster.
+ */
+export interface ContextTreeScanDiagnostics {
+	/** Child session transcripts opened and folded (whether or not they yielded a node). */
+	scannedChildren: number;
+	/** Stat size of every transcript {@link scannedChildren} read. */
+	bytesRead: number;
+	/** Stat size of every candidate transcript the scan looked at, read or refused. */
+	bytesPlanned: number;
+	/**
+	 * Candidate child sessions found at levels the scan still visited that were
+	 * not read. Each refused dir stands for its own unvisited subtree, so this is
+	 * a lower bound on what a full scan would have covered.
+	 */
+	skippedByBudget: number;
+	/** A dir nested past `maxDepth` was refused. */
+	depthLimitReached: boolean;
+	/** The scan did not read everything it found. */
+	truncated: boolean;
+	/** The first limit that bit, or undefined when nothing was skipped. */
+	truncatedReason: ContextTreeTruncatedReason | undefined;
+}
+
+interface ScanState {
+	readonly maxChildren: number;
+	readonly maxBytes: number;
+	readonly maxDepth: number;
+	scannedChildren: number;
+	bytesRead: number;
+	bytesPlanned: number;
+	skippedByBudget: number;
+	depthLimitReached: boolean;
+	truncated: boolean;
+	truncatedReason: ContextTreeTruncatedReason | undefined;
+	/** A read limit was hit, so no further transcript will be opened. */
+	readLimitReached: boolean;
+}
+
+function limitOr(value: number | undefined, fallback: number): number {
+	if (value === undefined || !Number.isFinite(value)) {
+		return fallback;
+	}
+	return Math.max(0, Math.floor(value));
+}
+
+function createScanState(budget: ContextTreeScanBudget | undefined): ScanState {
+	const defaults = DEFAULT_CONTEXT_TREE_SCAN_BUDGET;
+	return {
+		maxChildren: limitOr(budget?.maxChildren, defaults.maxChildren),
+		maxBytes: limitOr(budget?.maxBytes, defaults.maxBytes),
+		maxDepth: limitOr(budget?.maxDepth, defaults.maxDepth),
+		scannedChildren: 0,
+		bytesRead: 0,
+		bytesPlanned: 0,
+		skippedByBudget: 0,
+		depthLimitReached: false,
+		truncated: false,
+		truncatedReason: undefined,
+		readLimitReached: false,
+	};
+}
+
+function diagnosticsOf(state: ScanState): ContextTreeScanDiagnostics {
+	return {
+		scannedChildren: state.scannedChildren,
+		bytesRead: state.bytesRead,
+		bytesPlanned: state.bytesPlanned,
+		skippedByBudget: state.skippedByBudget,
+		depthLimitReached: state.depthLimitReached,
+		truncated: state.truncated,
+		truncatedReason: state.truncatedReason,
+	};
+}
+
+/**
+ * Charge a candidate transcript against the read budget before it is opened.
+ * Returns false, and reads nothing, once a limit is reached - a byte or child
+ * cap stops the whole scan, so the caller never pays for a partial roster it
+ * cannot finish.
+ */
+function reserveChildRead(state: ScanState, size: number): boolean {
+	state.bytesPlanned += size;
+	if (!state.readLimitReached) {
+		if (state.scannedChildren >= state.maxChildren) {
+			state.readLimitReached = true;
+			state.truncatedReason ??= "children";
+		} else if (state.bytesRead + size > state.maxBytes) {
+			state.readLimitReached = true;
+			state.truncatedReason ??= "bytes";
+		}
+	}
+	if (state.readLimitReached) {
+		state.truncated = true;
+		state.skippedByBudget++;
+		return false;
+	}
+	state.scannedChildren++;
+	state.bytesRead += size;
+	return true;
+}
+
+/** Build one disk node. Its children are filled in by the traversal, not here. */
+function readContextTreeNode(
+	id: string,
+	sessionFile: string,
 	resolveContextWindow: ContextWindowResolver,
 ): ContextTreeNode | undefined {
-	const sessionFile = findSessionFile(childSessionDir);
-	if (!sessionFile) {
-		return undefined;
-	}
 	const allEntries = sessionEntriesFromFile(sessionFile);
 	const branch = branchEntries(allEntries);
 	if (branch.length === 0) {
@@ -384,39 +529,154 @@ export function loadContextTreeChildFromDisk(
 	const contextWindow = model ? resolveContextWindow(model.provider, model.id) : undefined;
 
 	return {
-		id: basename(childSessionDir),
+		id,
 		label: label || "child agent",
 		status: statusFromBranch(branch),
 		model,
 		ownUsage,
 		totalUsage,
 		contextUsage: computeContextUsageFromEntries(allEntries, branch, contextWindow),
-		children: loadContextTreeChildrenFromDisk(childSessionDir, resolveContextWindow),
+		children: [],
 	};
 }
 
+/** One directory whose `sub-*` children are still to be visited. */
+interface ScanFrame {
+	dir: string;
+	/** Where the nodes for `dir`'s children are collected. */
+	siblings: ContextTreeNode[];
+	/** Nesting level of the children listed from `dir`. */
+	level: number;
+	/** Children already represented live; set on the first frame only. */
+	skipIds?: ReadonlySet<string>;
+}
+
 /**
- * Build context nodes for all persisted RLM children under an RLM session
- * dir, recursing into nested sub-* dirs for grandchildren. `skipIds`
- * excludes children that are already represented live.
+ * Visit child session dirs with an explicit queue, charging every transcript
+ * read against `state`.
+ *
+ * The walk is breadth first: a roster is read before its grandchildren, so a
+ * truncated scan shows the whole top-level fan-out (the part a caller can
+ * summarize as "N more agents") rather than one deep branch. Frames are queued
+ * only for dirs actually read, which bounds the listing work by the read budget
+ * instead of by the size of the tree on disk.
+ */
+function scanChildrenInto(
+	rootDir: string,
+	rootSiblings: ContextTreeNode[],
+	resolveContextWindow: ContextWindowResolver,
+	state: ScanState,
+	skipIds?: ReadonlySet<string>,
+): void {
+	const queue: ScanFrame[] = [{ dir: rootDir, siblings: rootSiblings, level: 1, skipIds }];
+	for (let index = 0; index < queue.length; index++) {
+		const frame = queue[index];
+		for (const childDir of listChildSessionDirs(frame.dir)) {
+			if (frame.skipIds?.has(basename(childDir))) {
+				continue;
+			}
+			if (frame.level > state.maxDepth) {
+				state.truncated = true;
+				state.truncatedReason ??= "depth";
+				state.depthLimitReached = true;
+				state.skippedByBudget++;
+				continue;
+			}
+			const sessionFile = findSessionFile(childDir);
+			if (!sessionFile) {
+				// Nothing persisted here (or nothing readable): the old scan skipped the
+				// dir too, so it is not a budget skip.
+				continue;
+			}
+			if (!reserveChildRead(state, sessionFile.size)) {
+				continue;
+			}
+			const node = readContextTreeNode(basename(childDir), sessionFile.path, resolveContextWindow);
+			if (!node) {
+				continue;
+			}
+			frame.siblings.push(node);
+			queue.push({ dir: childDir, siblings: node.children, level: frame.level + 1 });
+		}
+	}
+}
+
+/** Options for {@link scanContextTreeChildrenFromDisk}. */
+export interface ContextTreeScanOptions {
+	/** Read limits; omitted fields take {@link DEFAULT_CONTEXT_TREE_SCAN_BUDGET}. */
+	budget?: ContextTreeScanBudget;
+	/** Children already represented live, excluded from the scan. */
+	skipIds?: ReadonlySet<string>;
+}
+
+export interface ContextTreeScanResult {
+	nodes: ContextTreeNode[];
+	diagnostics: ContextTreeScanDiagnostics;
+}
+
+/**
+ * Build context nodes for the persisted RLM children under an RLM session dir,
+ * descending into nested `sub-*` dirs, and report how much of the tree the scan
+ * actually read.
+ *
+ * `loadContextTreeChildFromDisk` builds the equivalent of a single entry in the
+ * returned array, including its subtree.
+ */
+export function scanContextTreeChildrenFromDisk(
+	rlmSessionDir: string | undefined,
+	resolveContextWindow: ContextWindowResolver,
+	options: ContextTreeScanOptions = {},
+): ContextTreeScanResult {
+	const state = createScanState(options.budget);
+	if (!rlmSessionDir || !existsSync(rlmSessionDir)) {
+		return { nodes: [], diagnostics: diagnosticsOf(state) };
+	}
+	const nodes: ContextTreeNode[] = [];
+	scanChildrenInto(rlmSessionDir, nodes, resolveContextWindow, state, options.skipIds);
+	return { nodes, diagnostics: diagnosticsOf(state) };
+}
+
+/**
+ * Build a context node for a completed RLM child from its persisted session
+ * dir (sub-xxxx/). Children that already attributed grandchild usage carry the
+ * aggregate on their assistant messages (applyChildUsageAttributions), so own
+ * usage is recovered by subtracting the attribution entries. Returns undefined
+ * when the dir holds no readable session.
+ *
+ * The requested dir is always read - it is what the caller asked for; `budget`
+ * bounds the subtree below it.
+ */
+export function loadContextTreeChildFromDisk(
+	childSessionDir: string,
+	resolveContextWindow: ContextWindowResolver,
+	budget?: ContextTreeScanBudget,
+): ContextTreeNode | undefined {
+	const sessionFile = findSessionFile(childSessionDir);
+	if (!sessionFile) {
+		return undefined;
+	}
+	const node = readContextTreeNode(basename(childSessionDir), sessionFile.path, resolveContextWindow);
+	if (!node) {
+		return undefined;
+	}
+	scanChildrenInto(childSessionDir, node.children, resolveContextWindow, createScanState(budget));
+	return node;
+}
+
+/**
+ * Build context nodes for all persisted RLM children under an RLM session dir,
+ * descending into nested sub-* dirs. `skipIds` excludes children that are
+ * already represented live.
+ *
+ * This is {@link scanContextTreeChildrenFromDisk} without the diagnostics; pass
+ * `budget` to change the read limits, or call the scan directly to report what
+ * it left out.
  */
 export function loadContextTreeChildrenFromDisk(
 	rlmSessionDir: string | undefined,
 	resolveContextWindow: ContextWindowResolver,
 	skipIds?: ReadonlySet<string>,
+	budget?: ContextTreeScanBudget,
 ): ContextTreeNode[] {
-	if (!rlmSessionDir || !existsSync(rlmSessionDir)) {
-		return [];
-	}
-	const nodes: ContextTreeNode[] = [];
-	for (const childDir of listChildSessionDirs(rlmSessionDir)) {
-		if (skipIds?.has(basename(childDir))) {
-			continue;
-		}
-		const node = loadContextTreeChildFromDisk(childDir, resolveContextWindow);
-		if (node) {
-			nodes.push(node);
-		}
-	}
-	return nodes;
+	return scanContextTreeChildrenFromDisk(rlmSessionDir, resolveContextWindow, { budget, skipIds }).nodes;
 }
