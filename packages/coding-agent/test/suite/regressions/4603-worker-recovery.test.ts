@@ -712,10 +712,36 @@ function lsofListenersOf(lsofOutput: string, socketPath: string): number[] {
 	return pids;
 }
 
+interface StopReportEntry {
+	socketPath: string;
+	pid?: number;
+	kind: "service" | "worker" | "listener";
+	action?: string;
+	reason?: string;
+}
+
 interface StopReport {
-	stopped: Array<{ socketPath: string; action: string }>;
-	failed: Array<{ socketPath: string; reason: string }>;
-	leftRunning: Array<{ socketPath: string; reason: string }>;
+	discovered: number;
+	stopped: StopReportEntry[];
+	failed: StopReportEntry[];
+	skipped: StopReportEntry[];
+	leftRunning: StopReportEntry[];
+	stillPresent: string[];
+}
+
+/** The accounting identity the four-bucket contract promises: every target lands in exactly one bucket. */
+function bucketTotal(report: StopReport): number {
+	return report.stopped.length + report.failed.length + report.skipped.length + report.leftRunning.length;
+}
+
+function entriesFor(report: StopReport, socketPath: string): StopReportEntry[] {
+	return [...report.stopped, ...report.failed, ...report.skipped, ...report.leftRunning].filter(
+		(entry) => entry.socketPath === socketPath,
+	);
+}
+
+function pidsOf(identities: readonly FixtureProcessIdentity[]): string {
+	return identities.map((identity) => identity.pid).join(",");
 }
 
 /** Pull the accounting fields out of a JSON CLI report, failing on a missing one. */
@@ -731,10 +757,11 @@ function pickFields(value: unknown, keys: readonly string[], command: string): R
 
 function parseStopReport(stdout: string, command: string): StopReport {
 	const report = JSON.parse(stdout) as Partial<StopReport>;
-	for (const key of ["stopped", "failed", "leftRunning"] as const) {
+	for (const key of ["stopped", "failed", "skipped", "leftRunning", "stillPresent"] as const) {
 		// A renamed or missing field must not read as "nothing to report".
 		expect(report[key], `${command} reported: ${stdout}`).toEqual(expect.any(Array));
 	}
+	expect(report.discovered, `${command} reported: ${stdout}`).toEqual(expect.any(Number));
 	return report as StopReport;
 }
 
@@ -748,6 +775,7 @@ function exactProcessIsAlive(pid: number, processStartId: string | undefined): b
 async function waitForExactProcessExit(
 	pid: number,
 	processStartId: string | undefined,
+	label = `${pid}`,
 	timeoutMs = 30_000,
 ): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
@@ -755,7 +783,7 @@ async function waitForExactProcessExit(
 		await delay(25);
 	}
 	if (exactProcessIsAlive(pid, processStartId)) {
-		throw new Error(`Timed out waiting for exact process ${pid}/${processStartId ?? "unknown"}`);
+		throw new Error(`Timed out waiting for exact process ${label} (start ${processStartId ?? "unknown"})`);
 	}
 }
 
@@ -1269,30 +1297,86 @@ describe("ENG-4603 worker recovery convergence", () => {
 			);
 		}
 
-		const shutdown = await runCli(paths, ["shutdown", "--force", "--json"], 60_000, lsofEnvironment);
+		// The stop names its target instead of sweeping a directory: two supervisors
+		// hold one socket path here, so each of them has to be a target of its own and
+		// `--socket` is the scope that can say one true thing about each process.
+		const shutdown = await runCli(
+			paths,
+			["shutdown", "--socket", socketPath, "--force", "--json"],
+			60_000,
+			lsofEnvironment,
+		);
 		expect(shutdown.code, shutdown.stderr).toBe(0);
-		const report = parseStopReport(shutdown.stdout, "shutdown --force");
+		const report = parseStopReport(shutdown.stdout, "shutdown --socket --force");
 		// Empty here is the command claiming it left nothing running and excluded
 		// nothing; the exit checks below are what makes that a fact, not a promise.
-		expect(report.failed).toEqual([]);
-		expect(report.leftRunning).toEqual([]);
-		expect(report.stopped.length).toBeGreaterThan(0);
+		expect(report.failed, shutdown.stdout).toEqual([]);
+		expect(report.skipped, shutdown.stdout).toEqual([]);
+		expect(report.leftRunning, shutdown.stdout).toEqual([]);
+
+		// The fact first, before any shape is checked: a run that claimed a clean stop
+		// left no service of its own running. A survivor is quoted with the report that
+		// hid it, so "the accounting looked fine" can never be the answer again.
 		for (const service of services) {
-			await waitForExactProcessExit(service.pid, service.processStartId);
+			try {
+				await waitForExactProcessExit(service.pid, service.processStartId, `${service.role} ${service.pid}`);
+			} catch (error) {
+				const live = spawnSync("ps", ["-o", "pid=,ppid=,stat=,etime=", "-p", pidsOf(services)], {
+					encoding: "utf8",
+				});
+				throw new Error(
+					`${String(error)}; the report said ${JSON.stringify(report.stopped.map((entry) => `${entry.socketPath} pid ${entry.pid} [${entry.kind}] ${entry.action}`))}, still running: ${live.stdout.trim()}`,
+				);
+			}
 		}
 		await delay(11_000);
 		for (const service of services) {
 			expect(exactProcessIsAlive(service.pid, service.processStartId), `pid ${service.pid}`).toBe(false);
 		}
 
+		// Then the shape of the claim. One supervisor socket held by two processes and
+		// one worker socket: every pid the scope covered is named once, with the pid
+		// that died, and the names add up to what was discovered. A survivor must not
+		// be able to hide behind another pid's success on the same path.
+		const supervisorServices = services.filter((service) => service.role !== "worker");
+		const namedSupervisors = entriesFor(report, socketPath);
+		expect(namedSupervisors.length, shutdown.stdout).toBe(supervisorServices.length);
+		for (const service of supervisorServices) {
+			expect(
+				namedSupervisors.filter((entry) => entry.pid === service.pid),
+				`${service.role} ${service.pid} in ${shutdown.stdout}`,
+			).toHaveLength(1);
+		}
+		expect(
+			report.stopped.some((entry) => entry.kind === "worker" && entry.pid === workerPid),
+			shutdown.stdout,
+		).toBe(true);
+		expect(report.stopped.length, shutdown.stdout).toBe(services.length);
+		expect(report.discovered, shutdown.stdout).toBe(bucketTotal(report));
+		expect(report.stillPresent, shutdown.stdout).toEqual([]);
+
+		// The no-work-to-do run comes first: it is the one that says whether the sweep
+		// above really left nothing behind, before `status`/`doctor` read that state.
+		// All four buckets plus the identity and the observation diff are pinned, so a
+		// renamed field reads as a failure and not as "nothing to report".
+		const emptyStopReport = {
+			discovered: 0,
+			stopped: [],
+			failed: [],
+			skipped: [],
+			leftRunning: [],
+			stillPresent: [],
+		};
+		const stopReportKeys = ["discovered", "stopped", "failed", "skipped", "leftRunning", "stillPresent"];
 		const jsonContracts: Array<{ args: string[]; keys?: string[]; expected: unknown }> = [
+			{
+				args: ["shutdown", "--socket", socketPath, "--force", "--json"],
+				keys: stopReportKeys,
+				expected: emptyStopReport,
+			},
 			{ args: ["status", "--json"], expected: [] },
 			{ args: ["doctor", "--fix", "--json"], keys: ["reaped", "skipped"], expected: { reaped: [], skipped: [] } },
-			{
-				args: ["shutdown", "--force", "--json"],
-				keys: ["stopped", "failed", "leftRunning"],
-				expected: { stopped: [], failed: [], leftRunning: [] },
-			},
+			{ args: ["shutdown", "--force", "--json"], keys: stopReportKeys, expected: emptyStopReport },
 		];
 		for (const contract of jsonContracts) {
 			const result = await runCli(paths, contract.args, 60_000, lsofEnvironment);
@@ -1306,10 +1390,18 @@ describe("ENG-4603 worker recovery convergence", () => {
 		}
 		// The empty-scope wording differs per command and both say the same thing:
 		// this scope holds nothing left to stop.
+		// Every human face says the same thing as the JSON above: nothing is
+		// discoverable anywhere, so none of them may fall back to the scoped wording
+		// ("... in scope: ", "Nothing to stop in this scope."), which is reserved for a
+		// machine where services exist somewhere else. Those two wordings only ever
+		// appeared here because a leaked supervisor was still discoverable through the
+		// owner registry after its stop was reported clean.
+		const nothingAnywhere = "No background services found.\n";
 		const idleReports: Array<{ args: string[]; text: string }> = [
-			{ args: ["status"], text: "No background services found.\n" },
-			{ args: ["doctor", "--fix"], text: "No background services found in scope: " },
-			{ args: ["shutdown", "--force"], text: "Nothing to stop in this scope.\n" },
+			{ args: ["status"], text: nothingAnywhere },
+			{ args: ["doctor", "--fix"], text: nothingAnywhere },
+			{ args: ["shutdown", "--force"], text: nothingAnywhere },
+			{ args: ["shutdown", "--socket", socketPath, "--force"], text: nothingAnywhere },
 		];
 		for (const idle of idleReports) {
 			const result = await runCli(paths, idle.args, 60_000, lsofEnvironment);

@@ -127,10 +127,14 @@ export interface ShutdownTargetEntry {
 
 /** What a signalling path has to know about a target before it may touch it. */
 export interface DaemonTargetEvidence {
-	/** The path is a unix socket file a process is listening on right now. */
+	/** The OS scan sees this pid holding this path as a listening unix socket right now. */
 	listeningSocket: boolean;
-	/** A supervisor owner record names this socket path and this pid. */
+	/** The path is a socket file on disk right now. */
+	socketFilePresent: boolean;
+	/** A supervisor owner record names this socket path and this pid, and that record's identity is alive. */
 	recordedOwner: boolean;
+	/** That owner record pins a process start id, so a recycled pid cannot match it. */
+	recordedOwnerIdIsPinned: boolean;
 	/** The socket answered the daemon handshake (hello, or a standardized command). */
 	answeredDaemonHandshake: boolean;
 }
@@ -151,7 +155,15 @@ export function daemonTargetRefusal(
 	target: { pid: number; socketPath: string },
 	evidence: DaemonTargetEvidence,
 ): string | undefined {
-	if (!evidence.listeningSocket) {
+	if (evidence.recordedOwner && evidence.recordedOwnerIdIsPinned) {
+		// The registry names this pid *and* pins the process identity, so a recycled
+		// pid cannot match it. That is the machine's own proof this is a daemon, and it
+		// does not expire when the socket file is unlinked underneath a live owner:
+		// refusing here is what made such a daemon impossible to stop ever again, since
+		// every other sweep reasons from a path that no longer exists.
+		return undefined;
+	}
+	if (!evidence.listeningSocket || !evidence.socketFilePresent) {
 		return `refusing to signal pid ${target.pid}: ${target.socketPath} is not a listening unix socket`;
 	}
 	if (evidence.recordedOwner || evidence.answeredDaemonHandshake) {
@@ -192,14 +204,18 @@ export function createDaemonTargetVerifier(): DaemonTargetVerifier {
 	const handshakes = new Map<string, Promise<boolean>>();
 	return {
 		async verify(target) {
-			const listeningSocket =
-				isDaemonProcessListening(target.pid, target.socketPath) &&
-				(process.platform === "win32" || isSocketFile(target.socketPath));
+			const socketFilePresent = process.platform === "win32" || isSocketFile(target.socketPath);
+			const listeningSocket = isDaemonProcessListening(target.pid, target.socketPath) && socketFilePresent;
 			recordedOwners ??= readRecordedDaemonSocketOwners();
 			const normalized = normalizeSocketPath(target.socketPath);
-			const recordedOwner = recordedOwners.some(
-				(owner) => owner.socketPath === normalized && owner.pid === target.pid && recordedOwnerIsAlive(owner),
+			const owner = recordedOwners.find(
+				(candidate) => candidate.socketPath === normalized && candidate.pid === target.pid,
 			);
+			const recordedOwner = owner !== undefined && recordedOwnerIsAlive(owner);
+			const recordedOwnerIdIsPinned =
+				recordedOwner &&
+				owner?.processStartId !== undefined &&
+				getProcessStartId(target.pid) === owner.processStartId;
 			let answeredDaemonHandshake = false;
 			if (listeningSocket && !recordedOwner) {
 				let pending = handshakes.get(normalized);
@@ -211,7 +227,9 @@ export function createDaemonTargetVerifier(): DaemonTargetVerifier {
 			}
 			const reason = daemonTargetRefusal(target, {
 				listeningSocket,
+				socketFilePresent,
 				recordedOwner,
+				recordedOwnerIdIsPinned,
 				answeredDaemonHandshake,
 			});
 			return reason === undefined ? { ok: true as const } : { ok: false as const, reason };
@@ -221,89 +239,107 @@ export function createDaemonTargetVerifier(): DaemonTargetVerifier {
 
 type ShutdownBucket = "stopped" | "failed" | "skipped" | "leftRunning";
 
-/** One socket path the scope covers, as it looked when the run started. */
-interface ObservedScopeTarget {
-	pid?: number;
-	kind: DaemonStopKind;
-	/** Whether the socket file was already gone when the run began. */
+/**
+ * A target's identity in the report. One socket path can be held by two
+ * processes at once — that is the hidden-supervisor case — and each of them is
+ * its own target: keying by path alone let the pid that was stopped swallow the
+ * verdict for the pid that survived, so a live daemon was absent from every face
+ * of the report while `discovered` still added up.
+ */
+function shutdownTargetKey(socketPath: string, pid: number | undefined): string {
+	return `${socketPath}\u0000${pid === undefined ? "" : pid}`;
+}
+
+/** How strongly a bucket states what happened. The stronger word survives a later, weaker claim. */
+const BUCKET_RANK: Record<ShutdownBucket, number> = {
+	skipped: 0,
+	leftRunning: 1,
+	stopped: 2,
+	failed: 3,
+};
+
+/** One target the scope covers, as it looked when the run started. */
+interface ObservedScopeTarget extends ShutdownTargetEntry {
+	/** Identity of `pid` at observation time, when that process was alive. */
+	processStartId?: string;
+	/** The socket file was on disk, or that exact process was alive, when the run began. */
 	presentAtObservation: boolean;
 }
 
 /**
- * One stop command's accounting, keyed by socket path.
+ * One stop command's accounting, keyed by socket path *and* pid.
  *
- * Keying by path is what makes the totals add up: a service that both failed and
- * disappeared cannot be reported as stopped, a refusal cannot be laundered into a
- * success, and the observation pass at the end (`converge`) gives every socket
- * path the scope covered a bucket, so nothing is silently dropped — which is how
- * a successfully stopped worker came to be absent from every face of the report.
+ * Keying by target is what makes the totals add up: a service that both failed
+ * and disappeared cannot be reported as stopped, a refusal cannot be laundered
+ * into a success, a second process on an already-reported path cannot hide behind
+ * the first one's verdict, and the observation pass at the end (`converge`) gives
+ * every target the scope covered a bucket, so nothing is silently dropped.
  */
 export class ShutdownReport {
-	private readonly bucketByPath = new Map<string, ShutdownBucket>();
+	private readonly bucketByKey = new Map<string, ShutdownBucket>();
 	private readonly entriesByBucket: Record<ShutdownBucket, ShutdownTargetEntry[]> = {
 		stopped: [],
 		failed: [],
 		skipped: [],
 		leftRunning: [],
 	};
-	private readonly refusalByPath = new Map<string, string>();
-	private readonly keptPaths = new Set<string>();
-	private outsideScopeCount = 0;
-	/** Socket paths this run's scope covers, observed before anything was signalled. */
+	private readonly refusalByKey = new Map<string, string>();
+	private readonly keptKeys = new Set<string>();
+	/** Every target this report names, by observation, by keeping, or by a claim. */
+	private readonly namedKeys = new Set<string>();
+	/** Targets this run's scope covers, observed before anything was signalled. */
 	readonly scopeTargets = new Map<string, ObservedScopeTarget>();
 
 	/** A discovered service the selection leaves alone: it stays running, and it was still discovered. */
 	keep(entry: ShutdownTargetEntry & { reason: string }): void {
-		if (this.keptPaths.has(entry.socketPath)) {
+		const key = shutdownTargetKey(entry.socketPath, entry.pid);
+		if (this.keptKeys.has(key)) {
 			return;
 		}
-		this.keptPaths.add(entry.socketPath);
-		this.outsideScopeCount += 1;
+		this.keptKeys.add(key);
 		this.claim("leftRunning", entry);
 	}
 
-	/** The socket set this run is accountable for, observed before anything is signalled. */
-	observe(targets: ReadonlyMap<string, { pid?: number; kind: DaemonStopKind }>): void {
-		for (const [socketPath, target] of targets) {
-			if (!this.scopeTargets.has(socketPath)) {
-				this.scopeTargets.set(socketPath, { ...target, presentAtObservation: existsSync(socketPath) });
+	/** The target set this run is accountable for, observed before anything is signalled. */
+	observe(targets: Iterable<ShutdownTargetEntry>): void {
+		for (const target of targets) {
+			const key = shutdownTargetKey(target.socketPath, target.pid);
+			this.namedKeys.add(key);
+			if (this.scopeTargets.has(key)) {
+				continue;
 			}
+			const processStartId = target.pid === undefined ? undefined : getProcessStartId(target.pid);
+			this.scopeTargets.set(key, {
+				...target,
+				...(processStartId === undefined ? {} : { processStartId }),
+				presentAtObservation: existsSync(target.socketPath) || processStartId !== undefined,
+			});
 		}
 	}
 
-	/** Why a target was refused a signal, so the sweep does not keep re-deciding it. */
-	refusalReason(socketPath: string): string | undefined {
-		return this.refusalByPath.get(socketPath);
+	/** Why one target was refused a signal, so the sweep does not keep re-deciding it. */
+	refusalReason(socketPath: string, pid?: number): string | undefined {
+		return this.refusalByKey.get(shutdownTargetKey(socketPath, pid));
 	}
 
 	/** A target no signal may touch, with the proof that was missing. */
 	refuse(entry: ShutdownTargetEntry & { reason: string }): void {
-		this.refusalByPath.set(entry.socketPath, entry.reason);
+		this.refusalByKey.set(shutdownTargetKey(entry.socketPath, entry.pid), entry.reason);
 		this.claim("leftRunning", entry);
 	}
 
 	claim(bucket: ShutdownBucket, entry: ShutdownTargetEntry): void {
-		const existing = this.bucketByPath.get(entry.socketPath);
-		if (existing === bucket) {
+		const key = shutdownTargetKey(entry.socketPath, entry.pid);
+		this.namedKeys.add(key);
+		const existing = this.bucketByKey.get(key);
+		if (existing !== undefined && BUCKET_RANK[bucket] <= BUCKET_RANK[existing]) {
 			return;
 		}
-		if (existing !== undefined) {
-			// A failure outranks a success claim; everything else keeps the first word.
-			if (!(existing === "stopped" && bucket === "failed")) {
-				return;
-			}
-			const stopped = this.entriesByBucket.stopped;
-			const index = stopped.findIndex((candidate) => candidate.socketPath === entry.socketPath);
-			if (index >= 0) {
-				stopped.splice(index, 1);
-			}
-		}
-		this.bucketByPath.set(entry.socketPath, bucket);
-		this.entriesByBucket[bucket].push(entry);
+		this.record(bucket, key, entry);
 	}
 
-	bucketOf(socketPath: string): ShutdownBucket | undefined {
-		return this.bucketByPath.get(socketPath);
+	bucketOf(socketPath: string, pid?: number): ShutdownBucket | undefined {
+		return this.bucketByKey.get(shutdownTargetKey(socketPath, pid));
 	}
 
 	get stopped(): ShutdownTargetEntry[] {
@@ -323,32 +359,58 @@ export class ShutdownReport {
 	}
 
 	get discovered(): number {
-		return this.scopeTargets.size + this.outsideScopeCount;
+		return this.namedKeys.size;
 	}
 
 	/**
-	 * The observation diff the report is judged by: every socket the scope covered
-	 * is checked once more on disk, whatever its bucket said, and what is still
-	 * there is named. `stillPresent === []` is the only clean verdict.
+	 * The observation diff the report is judged by: every target the scope covered
+	 * is checked once more, whatever its bucket said, and what is still here is
+	 * named. "Still here" is both faces of a daemon — its socket file on disk *and*
+	 * its process identity alive — because a daemon whose file was unlinked
+	 * underneath it is still running, and a disk-only check called that clean.
+	 * `stillPresent === []` is the only clean verdict.
 	 */
 	converge(): string[] {
 		const stillPresent: string[] = [];
-		for (const [socketPath, target] of this.scopeTargets) {
-			const { presentAtObservation, ...entry } = target;
-			if (existsSync(socketPath)) {
-				stillPresent.push(socketPath);
-				const reason =
-					this.refusalByPath.get(socketPath) ??
-					"still present after shutdown: nothing in this scope removed this socket";
-				this.claim("leftRunning", { socketPath, ...entry, reason });
+		for (const target of this.scopeTargets.values()) {
+			const { socketPath, pid, kind, processStartId, presentAtObservation } = target;
+			const filePresent = existsSync(socketPath);
+			// A recycled pid is a convergence, not a survivor: only the identity that
+			// was observed at the start counts as still running.
+			const processPresent =
+				pid !== undefined && processStartId !== undefined && getProcessStartId(pid) === processStartId;
+			if (filePresent || processPresent) {
+				if (!stillPresent.includes(socketPath)) {
+					stillPresent.push(socketPath);
+				}
+				const key = shutdownTargetKey(socketPath, pid);
+				const existing = this.bucketByKey.get(key);
+				// A failure, a refusal and a deliberate keep already say why this target
+				// is still here; only a success claim is contradicted by the observation.
+				if (existing === undefined || existing === "stopped") {
+					const reason =
+						this.refusalByKey.get(key) ??
+						(processPresent
+							? `still running after shutdown: pid ${pid} is alive${
+									filePresent ? "" : " and its socket file is gone"
+								}, and nothing in this scope stopped it`
+							: "still present after shutdown: nothing in this scope removed this socket");
+					this.record("leftRunning", key, {
+						socketPath,
+						...(pid === undefined ? {} : { pid }),
+						kind,
+						reason,
+					});
+				}
 				continue;
 			}
-			// Only a target that was really there can have converged here: a stale
+			// Only a target that was really here can have converged here: a stale
 			// descriptor whose socket was already gone is not a stop we performed.
+			const entry = { socketPath, ...(pid === undefined ? {} : { pid }), kind };
 			if (presentAtObservation) {
-				this.claim("stopped", { socketPath, ...entry, action: "converged during shutdown" });
+				this.claim("stopped", { ...entry, action: "converged during shutdown" });
 			} else {
-				this.claim("skipped", { socketPath, ...entry, reason: "already gone before the stop; nothing to stop" });
+				this.claim("skipped", { ...entry, reason: "already gone before the stop; nothing to stop" });
 			}
 		}
 		return stillPresent.sort();
@@ -362,6 +424,21 @@ export class ShutdownReport {
 			skipped: this.skipped,
 			leftRunning: this.leftRunning,
 		};
+	}
+
+	/** One target holds exactly one entry, so a replaced verdict cannot be counted twice. */
+	private record(bucket: ShutdownBucket, key: string, entry: ShutdownTargetEntry): void {
+		const existing = this.bucketByKey.get(key);
+		if (existing !== undefined) {
+			const entries = this.entriesByBucket[existing];
+			const index = entries.findIndex((candidate) => shutdownTargetKey(candidate.socketPath, candidate.pid) === key);
+			if (index >= 0) {
+				entries.splice(index, 1);
+			}
+		}
+		this.namedKeys.add(key);
+		this.bucketByKey.set(key, bucket);
+		this.entriesByBucket[bucket].push(entry);
 	}
 }
 
@@ -1170,30 +1247,52 @@ function describeShutdownEntry(entry: ShutdownTargetEntry): string {
 async function observeScopeTargets(
 	selection: StopSelection,
 	selectedDaemons: readonly DaemonInfo[],
-): Promise<Map<string, { pid?: number; kind: DaemonStopKind }>> {
-	const targets = new Map<string, { pid?: number; kind: DaemonStopKind }>();
+): Promise<ShutdownTargetEntry[]> {
+	const targets: ShutdownTargetEntry[] = [];
+	const seen = new Set<string>();
+	const add = (socketPath: string, pid: number | undefined, kind: DaemonStopKind): void => {
+		const key = shutdownTargetKey(socketPath, pid);
+		if (seen.has(key)) {
+			return;
+		}
+		seen.add(key);
+		targets.push(targetEntry(socketPath, pid, kind));
+	};
 	for (const daemon of selectedDaemons) {
-		targets.set(daemon.socketPath, targetEntry(daemon.socketPath, daemon.pid, "service"));
+		add(daemon.socketPath, daemon.pid, "service");
 	}
+	// Every pid holding a socket in scope, not one per path: `discoverDaemons` keeps a
+	// single pid per socket on purpose, and a report built on that alone cannot name
+	// the second process on the same path.
 	for (const listener of scanListeningDaemons()) {
-		if (targets.has(listener.socketPath) || !matchesShutdownScope(listener.socketPath, selection.scope)) {
+		if (!matchesShutdownScope(listener.socketPath, selection.scope)) {
 			continue;
 		}
-		targets.set(
-			listener.socketPath,
-			targetEntry(listener.socketPath, listener.pid, kindForPath(listener.socketPath)),
-		);
+		add(listener.socketPath, listener.pid, kindForPath(listener.socketPath));
 	}
 	for (const worker of findAllTrackedWorkers()) {
 		const { descriptor } = worker;
 		const inScope =
 			matchesShutdownScope(descriptor.supervisorSocketPath, selection.scope) ||
 			matchesShutdownScope(descriptor.socketPath, selection.scope);
-		if (inScope && !targets.has(descriptor.socketPath)) {
-			targets.set(descriptor.socketPath, targetEntry(descriptor.socketPath, descriptor.pid, "worker"));
+		if (inScope) {
+			add(descriptor.socketPath, descriptor.pid, "worker");
 		}
 	}
+	// The owner registry names pids, and a pid outlives the removal of its socket
+	// file. Both scans above reason from paths, so a daemon whose file is already
+	// gone would be invisible here — and an invisible target is an unaccounted one.
+	for (const owner of recordedOwnersInScope(selection)) {
+		add(owner.socketPath, owner.pid, kindForPath(owner.socketPath));
+	}
 	return targets;
+}
+
+/** The supervisor owner records this selection covers. Liveness is the caller's call. */
+function recordedOwnersInScope(selection: StopSelection): ReturnType<typeof readRecordedDaemonSocketOwners> {
+	return readRecordedDaemonSocketOwners().filter(
+		(owner) => !isWorkerSocketPath(owner.socketPath) && matchesShutdownScope(owner.socketPath, selection.scope),
+	);
 }
 
 /** Discovery, scope partition and the socket set this run is accountable for. */
@@ -1342,7 +1441,7 @@ async function runShutdownConverging(
 		let refusedServiceTarget = false;
 		if (pid !== undefined && sweep.handledPids.has(pid)) {
 			await assertAdmission();
-			removeSocketFile(socketPath);
+			removeSocketFileUnlessServed(socketPath);
 			report.claim("stopped", {
 				...targetEntry(socketPath, pid, "service"),
 				action: `background service already stopped (pid ${pid})`,
@@ -1360,7 +1459,7 @@ async function runShutdownConverging(
 					applyOutcome(outcome, socketPath, pid, report);
 				} else {
 					await assertAdmission();
-					if (removeSocketFile(socketPath)) {
+					if (removeSocketFileUnlessServed(socketPath)) {
 						report.claim("stopped", {
 							...targetEntry(socketPath, pid, "service"),
 							action: "removed stale socket file",
@@ -1368,7 +1467,7 @@ async function runShutdownConverging(
 					} else {
 						report.claim("failed", {
 							...targetEntry(socketPath, pid, "service"),
-							reason: "could not remove socket file",
+							reason: "could not remove socket file: a live process still serves that path",
 						});
 					}
 				}
@@ -1388,14 +1487,14 @@ async function runShutdownConverging(
 					await forceKillDaemon(pid);
 					sweep.handledPids.add(pid);
 					await assertAdmission();
-					removeSocketFile(socketPath);
+					removeSocketFileUnlessServed(socketPath);
 					report.claim("stopped", {
 						...targetEntry(socketPath, pid, "service"),
 						action: `killed unreachable background service (pid ${pid})`,
 					});
 				} else {
 					await assertAdmission();
-					removeSocketFile(socketPath);
+					removeSocketFileUnlessServed(socketPath);
 					report.claim("stopped", {
 						...targetEntry(socketPath, pid, "service"),
 						action: "background service already stopped",
@@ -1422,6 +1521,7 @@ async function runShutdownConverging(
 
 	if (force) {
 		await terminateVerifiedResiduals(sweep, selection, protectedPids);
+		await terminateRecordedOwners(sweep, selection, protectedPids);
 	}
 
 	// The verdict is an observation, not an intention: whatever the buckets above
@@ -1508,7 +1608,10 @@ async function stopHiddenSupervisors(
 			if (currentPid === undefined || !group.some((listener) => listener.pid === currentPid)) {
 				sweep.report.claim("failed", {
 					...targetEntry(socketPath, undefined, "listener"),
-					reason: "could not identify the current same-path daemon",
+					reason: `could not identify the current same-path daemon among pids ${group
+						.map((listener) => listener.pid)
+						.sort((left, right) => left - right)
+						.join(", ")}`,
 				});
 				continue;
 			}
@@ -1548,7 +1651,9 @@ function eligibleResidualListeners(
 	protectedPids: ReadonlySet<number>,
 ): DiscoveredDaemonProcess[] {
 	return scopingListeningDaemons(selection).filter(
-		(listener) => !protectedPids.has(listener.pid) && sweep.report.refusalReason(listener.socketPath) === undefined,
+		(listener) =>
+			!protectedPids.has(listener.pid) &&
+			sweep.report.refusalReason(listener.socketPath, listener.pid) === undefined,
 	);
 }
 
@@ -1600,6 +1705,40 @@ async function terminateVerifiedResiduals(
 						action: `stopped residual daemon process (pid ${listener.pid})`,
 					});
 				}
+			}
+		}
+	}
+}
+
+/**
+ * The owner registry is the one list of daemons that survives the removal of a
+ * socket file: it names a pid and that pid's process identity, not a path on
+ * disk. Every other leg of a force stop enumerates listeners, so a daemon whose
+ * file was unlinked underneath it — by its own predecessor's exit, or by a
+ * cleanup that ran while it was still serving — used to be both unstoppable and
+ * unreportable. This leg stops it by the identity the machine recorded.
+ */
+async function terminateRecordedOwners(
+	sweep: ShutdownSweep,
+	selection: StopSelection,
+	protectedPids: ReadonlySet<number>,
+): Promise<void> {
+	for (const owner of recordedOwnersInScope(selection)) {
+		if (protectedPids.has(owner.pid) || !recordedOwnerIsAlive(owner)) {
+			continue;
+		}
+		if (sweep.report.refusalReason(owner.socketPath, owner.pid) !== undefined) {
+			continue;
+		}
+		await sweep.assertAdmission();
+		const alreadyReported = sweep.handledPids.has(owner.pid);
+		if (await terminateVerifiedListener(sweep, { pid: owner.pid, socketPath: owner.socketPath })) {
+			sweep.handledPids.add(owner.pid);
+			if (!alreadyReported) {
+				sweep.report.claim("stopped", {
+					...targetEntry(owner.socketPath, owner.pid, kindForPath(owner.socketPath)),
+					action: `stopped recorded daemon owner (pid ${owner.pid})`,
+				});
 			}
 		}
 	}
@@ -1722,8 +1861,25 @@ async function stopBackgroundService(
 	}
 	if (!(await canConnectToSocket(socketPath, 250))) {
 		await sweep.assertAdmission();
-		removeSocketFile(socketPath);
-		return { reaped: "background service already stopped" };
+		if (removeSocketFileUnlessServed(socketPath)) {
+			return { reaped: "background service already stopped" };
+		}
+		// Nothing answers on that path, but a live process still holds the socket: the
+		// file is gone and the daemon is not. "Already stopped" would be a lie, and no
+		// path-based sweep can reach it any more, so the recorded pid is the target.
+		if (pid === undefined) {
+			return { skipped: "socket file is gone but a process still holds it, and no pid is known" };
+		}
+		if (!sweep.force) {
+			return { skipped: "socket file is gone but a process still holds it; retry with --force" };
+		}
+		if (!(await verifyBeforeSignalling(sweep, { pid, socketPath }))) {
+			return { left: sweep.report.refusalReason(socketPath, pid) ?? "not a verified daemon" };
+		}
+		await sweep.assertAdmission();
+		await forceKillDaemon(pid);
+		sweep.handledPids.add(pid);
+		return { reaped: `force-killed the process holding a removed socket (pid ${pid})` };
 	}
 	if (pid === undefined) {
 		return { skipped: "still listening but no pid to kill" };
@@ -1734,13 +1890,13 @@ async function stopBackgroundService(
 	// The graceful request reached *something* on that socket, but only a verified
 	// daemon may be signalled: a stale socket a stranger listens on is not ours.
 	if (!(await verifyBeforeSignalling(sweep, { pid, socketPath }))) {
-		return { left: sweep.report.refusalReason(socketPath) ?? "not a verified daemon" };
+		return { left: sweep.report.refusalReason(socketPath, pid) ?? "not a verified daemon" };
 	}
 	await sweep.assertAdmission();
 	await forceKillDaemon(pid);
 	sweep.handledPids.add(pid);
 	await sweep.assertAdmission();
-	removeSocketFile(socketPath);
+	removeSocketFileUnlessServed(socketPath);
 	return { reaped: `force-killed unresponsive background service (pid ${pid})` };
 }
 
@@ -2224,6 +2380,24 @@ async function reapReachableDaemon(socketPath: string, pid: number | undefined):
 	return (await shutdownDaemon(socketPath, false))
 		? { reaped: `stopped idle background service${pid ? ` (pid ${pid})` : ""}` }
 		: { skipped: "shutdown request failed" };
+}
+
+/**
+ * A socket file may only be unlinked when nothing live is serving that path any
+ * more. Removing it under a live owner is what made that owner impossible to
+ * stop: every later sweep reasons from the path, and the path no longer exists.
+ * Returns false when a live listener kept the file, so no caller may report the
+ * removal as a stop.
+ */
+function removeSocketFileUnlessServed(socketPath: string): boolean {
+	const normalized = normalizeSocketPath(socketPath);
+	const served = scanListeningDaemons().some(
+		(listener) => listener.socketPath === normalized && isProcessAlive(listener.pid),
+	);
+	if (served) {
+		return false;
+	}
+	return removeSocketFile(socketPath);
 }
 
 function removeSocketFile(socketPath: string): boolean {
