@@ -58,6 +58,7 @@ interface DaemonSchemaSliceSources {
 	connectionStallContract: string;
 	headlessResult: string;
 	quiescenceOutcome: string;
+	responseEnvelope: string;
 }
 
 function readDaemonSchemaSliceSources(): DaemonSchemaSliceSources {
@@ -153,6 +154,17 @@ function readDaemonSchemaSliceSources(): DaemonSchemaSliceSources {
 			agentSessionSource.indexOf("/** Outcome of a quiescence barrier wait"),
 			agentSessionSource.indexOf("/** How long failure-class terminal notices are collected"),
 		),
+		// PROT-2/F3: the response envelope is a wire shape too, but it sits between the
+		// command, savedSession and outbound slices in daemon-protocol.ts, so no slice
+		// covered it. Rev29 added response.retryAfterMs through exactly that gap (the
+		// number moved, the digest did not), and a future envelope field that forgets
+		// the bump would pass the handshake on a mismatched envelope. The failure
+		// envelope's errorInfo payload (DaemonErrorInfo) is the same family, so the
+		// slice spans both declarations.
+		responseEnvelope: daemonProtocolSource.slice(
+			daemonProtocolSource.indexOf("export type DaemonResponse ="),
+			daemonProtocolSource.indexOf("export type DaemonSessionClosedReason ="),
+		),
 	};
 }
 
@@ -175,6 +187,7 @@ function daemonSchemaDigest(sources: DaemonSchemaSliceSources): string {
 				sources.connectionStallContract,
 				sources.headlessResult,
 				sources.quiescenceOutcome,
+				sources.responseEnvelope,
 			].join("\n"),
 		)
 		.digest("hex")
@@ -256,6 +269,8 @@ describe("daemon protocol helpers", () => {
 		const digest = daemonSchemaDigest(sources);
 		expect(sources.headlessResult).toContain("rlmQuiescence");
 		expect(sources.quiescenceOutcome).toContain("export interface RlmQuiescenceOutcome");
+		expect(sources.responseEnvelope).toContain("retryAfterMs?: number;");
+		expect(sources.responseEnvelope).toContain("errorInfo?: DaemonErrorInfo;");
 		expect(DAEMON_SCHEMA_ID).toBe(`protocol-${DAEMON_PROTOCOL_VERSION}-schema-${DAEMON_SCHEMA_REVISION}-${digest}`);
 	});
 
@@ -308,6 +323,16 @@ describe("daemon protocol helpers", () => {
 				key: "treeWire",
 				apply: (text) => text.replace("leafIncluded: boolean;", "leafIncluded: boolean;\n\twidthCap: number;"),
 			},
+			{
+				// PROT-2/F3: the response envelope was outside every slice until rev37, so
+				// an envelope field edit rode an unchanged identity (rev29's retryAfterMs
+				// moved the number, not the digest). This is the mutation that guards the
+				// new responseEnvelope slice.
+				name: "response envelope field set (covered since rev37)",
+				key: "responseEnvelope",
+				apply: (text) =>
+					text.replace("retryAfterMs?: number;", "retryAfterMs?: number;\n\t\t\tprobeAfterMs?: number;"),
+			},
 		];
 		expect(mutations.length).toBeGreaterThan(0);
 		for (const mutation of mutations) {
@@ -315,6 +340,85 @@ describe("daemon protocol helpers", () => {
 			expect(mutatedText, `${mutation.name}: mutation marker must apply`).not.toBe(sources[mutation.key]);
 			const digest = daemonSchemaDigest({ ...sources, [mutation.key]: mutatedText });
 			expect(digest, `${mutation.name}: shape edit must change the schema identity`).not.toBe(baseline);
+		}
+	});
+
+	it("replays the rev30 unbounded-to-bounded session-tree wire change as an identity change", () => {
+		// F1 (r30 protocol-chain): commit 55bae7c50 (2026-09-15, rev30 window, ~50
+		// minutes before a5edee5ee claimed 31) bounded the session tree on the wire:
+		// the snapshot wrappers' sessionTree gained `bound`, get_session_tree's
+		// response gained `treeBound`, and the bound stats interfaces joined
+		// core/session-manager.ts. The digest then hashed only the daemon-protocol.ts
+		// request/event hemisphere, so the wire changed and DAEMON_SCHEMA_ID did not -
+		// 55bae7c50 and its parent advertise the identical protocol-7-schema-30-
+		// 66299858b8b4, and a mixed old-daemon/new-client pair passed the handshake on
+		// mismatched tree shapes. This test replays that exact diff shape, inverted onto
+		// the current text (each mutation restores the pre-55bae7c50 wire): every one
+		// must move the digest under the current recipe, or the F1 blind window reopens.
+		const sources = readDaemonSchemaSliceSources();
+		const baseline = daemonSchemaDigest(sources);
+		// The digest recipe exactly as it stood at 55bae7c50: only the three
+		// daemon-protocol.ts request/event slices (the test file at that commit hashed
+		// command, savedSession and outbound and nothing else). DaemonSessionSnapshot -
+		// one of the commit's edit sites, in the same file - sat outside all three
+		// ranges, which is how the incident slipped through.
+		const rev30Digest = (s: DaemonSchemaSliceSources): string =>
+			createHash("sha256").update([s.command, s.savedSession, s.outbound].join("\n")).digest("hex").slice(0, 12);
+
+		const replay: Array<{ name: string; key: keyof DaemonSchemaSliceSources; apply: (text: string) => string }> = [
+			{
+				// The historical edit, verbatim inverted: DaemonSessionSnapshot.sessionTree
+				// collapsed back to the pre-55bae7c50 shape (the wrapper slice only
+				// joined the digest at rev35).
+				name: "55bae7c50: DaemonSessionSnapshot.sessionTree.bound leaves the wire",
+				key: "snapshotWrapper",
+				apply: (text) =>
+					text.replace(
+						"sessionTree?: {\n\t\ttree: AgentConnectionSessionTreeNode[];\n\t\tleafId: string | null;\n\t\t/** Present when the tree was depth-bounded; says what the bound left out. */\n\t\tbound?: SessionTreeDepthStats;\n\t};",
+						"sessionTree?: { tree: AgentConnectionSessionTreeNode[]; leafId: string | null };",
+					),
+			},
+			{
+				name: "55bae7c50: AgentConnectionSnapshot.sessionTree.bound leaves the wire",
+				key: "connectionSnapshotWrapper",
+				apply: (text) =>
+					text.replace(
+						"sessionTree?: {\n\t\ttree: AgentConnectionSessionTreeNode[];\n\t\tleafId: string | null;\n\t\t/** Present when the tree was depth-bounded; says what the bound left out. */\n\t\tbound?: AgentConnectionSessionTreeBound;\n\t};",
+						"sessionTree?: { tree: AgentConnectionSessionTreeNode[]; leafId: string | null };",
+					),
+			},
+			{
+				// The daemon-side assembly edit: the response the commit started shipping.
+				name: "55bae7c50: get_session_tree response loses treeBound",
+				key: "treeAssembly",
+				apply: (text) => text.replace("treeBound: bounded.stats,", ""),
+			},
+			{
+				// The commit also added the whole SessionTreeDepthStats/SessionFlatTreeStats
+				// family (the treeWire slice only joined at rev32); one historically added
+				// field leaving that family replays the class.
+				name: "55bae7c50: SessionTreeDepthStats.depthLimit leaves the wire",
+				key: "treeWire",
+				apply: (text) => text.replace("depthLimit: number;", ""),
+			},
+		];
+		expect(replay.length).toBeGreaterThan(0);
+		for (const mutation of replay) {
+			const mutatedText = mutation.apply(sources[mutation.key]);
+			expect(mutatedText, `${mutation.name}: replay marker must apply`).not.toBe(sources[mutation.key]);
+			const mutated = { ...sources, [mutation.key]: mutatedText };
+			// Red control - the incident, reproduced: under the rev30 recipe the same edit
+			// leaves the identity unchanged. For the snapshotWrapper mutation this is the
+			// exact historical miss (an edit inside daemon-protocol.ts, outside the three
+			// hashed ranges); for the others the recipe never hashed their files at all.
+			expect(rev30Digest(mutated), `${mutation.name}: the rev30 recipe must miss the edit`).toBe(
+				rev30Digest(sources),
+			);
+			// Guard - the current recipe must catch it, or the digest gate has a hole
+			// of the F1 class again.
+			expect(daemonSchemaDigest(mutated), `${mutation.name}: bound edit must change the schema identity`).not.toBe(
+				baseline,
+			);
 		}
 	});
 
