@@ -1,0 +1,2 @@
+- Fixed the startup extension-update check to respect `DO_NOT_TRACK` (and an explicit `PI_OFFLINE=0`) instead of only truthy `PI_OFFLINE`, so background update probes honor the machine-wide privacy opt-out.
+- Fixed repository-local `.prime/agent/settings.json` being able to enable `agentTraces` transcript uploads; the project scope can now only withhold consent, matching the telemetry gate.

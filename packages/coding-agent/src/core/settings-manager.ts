@@ -1531,8 +1531,17 @@ export class SettingsManager {
 		this.save();
 	}
 
+	/**
+	 * Consent to upload full session transcripts is opt-in, and the project scope
+	 * travels with a cloned repository rather than with the user: it may withhold
+	 * consent but never supply it, mirroring the telemetry gate. The user opts in
+	 * through the global scope only.
+	 */
 	getAgentTracesEnabled(): boolean {
-		return this.settings.agentTraces?.enabled ?? false;
+		const globalEnabled = this.globalSettings.agentTraces?.enabled ?? false;
+		const projectEnabled = this.projectSettings.agentTraces?.enabled ?? true;
+		const runtimeEnabled = this.runtimeOverrides.agentTraces?.enabled ?? true;
+		return globalEnabled && projectEnabled && runtimeEnabled;
 	}
 
 	setAgentTracesEnabled(enabled: boolean): void {

@@ -10,6 +10,7 @@
 import { spawn } from "node:child_process";
 import { DefaultPackageManager } from "../../core/package-manager.js";
 import type { SettingsManager } from "../../core/settings-manager.js";
+import { backgroundNetworkOptOut } from "../../utils/privacy-opt-out.js";
 import { checkForNewPiVersion } from "../../utils/version-check.js";
 import { theme } from "../interactive/theme/theme.js";
 
@@ -44,7 +45,11 @@ export async function checkForPackageUpdates(options: {
 	agentDir: string;
 	settingsManager: SettingsManager;
 }): Promise<string[]> {
-	if (process.env.PI_OFFLINE) {
+	// A background outbound path (`npm view` / `git ls-remote`) that runs on every start
+	// without anyone asking for it, so the standing opt-out answer stops it here like the
+	// release check. This also reads `PI_OFFLINE=0` as "not offline", which the previous
+	// bare truthy check got wrong.
+	if (backgroundNetworkOptOut() !== undefined) {
 		return [];
 	}
 
