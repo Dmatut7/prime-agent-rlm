@@ -68,17 +68,13 @@ describe("validateToolArguments", () => {
 		}> = [
 			{ schema: { type: "number" } as Tool["parameters"], input: "42", expected: 42 },
 			{ schema: { type: "number" } as Tool["parameters"], input: true, expected: 1 },
-			{ schema: { type: "number" } as Tool["parameters"], input: null, expected: 0 },
 			{ schema: { type: "integer" } as Tool["parameters"], input: "42", expected: 42 },
 			{ schema: { type: "boolean" } as Tool["parameters"], input: "true", expected: true },
 			{ schema: { type: "boolean" } as Tool["parameters"], input: "false", expected: false },
 			{ schema: { type: "boolean" } as Tool["parameters"], input: 1, expected: true },
 			{ schema: { type: "boolean" } as Tool["parameters"], input: 0, expected: false },
-			{ schema: { type: "string" } as Tool["parameters"], input: null, expected: "" },
 			{ schema: { type: "string" } as Tool["parameters"], input: true, expected: "true" },
-			{ schema: { type: "null" } as Tool["parameters"], input: "", expected: null },
-			{ schema: { type: "null" } as Tool["parameters"], input: 0, expected: null },
-			{ schema: { type: "null" } as Tool["parameters"], input: false, expected: null },
+			{ schema: { type: "string" } as Tool["parameters"], input: 7, expected: "7" },
 			{
 				schema: { type: ["number", "string"] } as Tool["parameters"],
 				input: "1",
@@ -111,6 +107,54 @@ describe("validateToolArguments", () => {
 		for (const testCase of failingCases) {
 			const { tool, toolCall } = createToolCallWithPlainSchema(testCase.schema, testCase.input);
 			expect(() => validateToolArguments(tool, toolCall)).toThrow("Validation failed");
+		}
+	});
+
+	it("rejects an explicit null instead of fabricating a value from it", () => {
+		// A model that sends null is saying "no value". Turning it into "" (or "null")
+		// would rewrite the tool call behind the caller's back, so the mismatch must be
+		// reported with the expected type instead.
+		const cases: Array<{ schema: Tool["parameters"]; input: unknown; expected: string }> = [
+			{ schema: { type: "string" } as Tool["parameters"], input: null, expected: "value: must be string" },
+			{ schema: { type: "number" } as Tool["parameters"], input: null, expected: "value: must be number" },
+			{ schema: { type: "integer" } as Tool["parameters"], input: null, expected: "value: must be integer" },
+			{ schema: { type: "boolean" } as Tool["parameters"], input: null, expected: "value: must be boolean" },
+		];
+
+		expect(cases.length).toBeGreaterThan(0);
+		for (const testCase of cases) {
+			const { tool, toolCall } = createToolCallWithPlainSchema(testCase.schema, testCase.input);
+			expect(() => validateToolArguments(tool, toolCall)).toThrow(testCase.expected);
+		}
+	});
+
+	it("rejects fabricated nulls in the TypeBox path too", () => {
+		// TypeBox's Value.Convert maps null -> "null" for a string schema; that literal
+		// string is pure invention, so the null must survive validation and fail.
+		const tool: Tool = {
+			name: "echo",
+			description: "Echo tool",
+			parameters: Type.Object({
+				value: Type.String(),
+			}),
+		};
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: "tool-1",
+			name: "echo",
+			arguments: { value: null },
+		};
+
+		expect(() => validateToolArguments(tool, toolCall)).toThrow("value: must be string");
+	});
+
+	it("rejects fabricating null from a real value", () => {
+		const cases: unknown[] = ["", 0, false];
+
+		expect(cases.length).toBeGreaterThan(0);
+		for (const input of cases) {
+			const { tool, toolCall } = createToolCallWithPlainSchema({ type: "null" } as Tool["parameters"], input);
+			expect(() => validateToolArguments(tool, toolCall)).toThrow("value: must be null");
 		}
 	});
 });

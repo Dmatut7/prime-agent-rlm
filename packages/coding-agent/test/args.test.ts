@@ -514,6 +514,43 @@ describe("parseArgs", () => {
 				message: "Unknown built-in tool(s): read. Available built-in tools: ipython",
 			});
 		});
+
+		test("rejects a name one edit away from a built-in tool", () => {
+			const result = parseArgs(["--tools", "ipyton"]);
+
+			expect(result.tools).toEqual(["ipyton"]);
+			expect(result.diagnostics).toContainEqual({
+				type: "error",
+				message: expect.stringContaining("ipyton"),
+			});
+			expect(result.diagnostics).toContainEqual({
+				type: "error",
+				message: expect.stringContaining("Did you mean"),
+			});
+			expect(result.diagnostics[0].message).toContain("ipython");
+		});
+
+		test("warns about a name the CLI cannot resolve and lists the available ones", () => {
+			const result = parseArgs(["--tools", "totally_unknown_tool"]);
+
+			expect(result.tools).toEqual(["totally_unknown_tool"]);
+			expect(result.diagnostics).toContainEqual({
+				type: "warning",
+				message: expect.stringContaining("totally_unknown_tool"),
+			});
+			expect(result.diagnostics[0].message).toContain("ipython");
+		});
+
+		test("stays quiet about legacy names and extension or custom tool names", () => {
+			// bash/edit stay silent (regression #4428: extensions and custom tools reuse them).
+			const legacy = parseArgs(["--tools", "bash,edit,ipython"]);
+			expect(legacy.diagnostics).toEqual([]);
+
+			// A custom tool name is unverifiable here, but nothing about it is a typo of a
+			// built-in name, so it must not be an error the CLI exits on.
+			const custom = parseArgs(["--tools", "dynamic_tool"]);
+			expect(custom.diagnostics.some((diagnostic) => diagnostic.type === "error")).toBe(false);
+		});
 	});
 
 	describe("messages and file args", () => {

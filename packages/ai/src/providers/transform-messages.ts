@@ -1,3 +1,4 @@
+import { getLogger } from "../log.js";
 import type {
 	Api,
 	AssistantMessage,
@@ -11,6 +12,8 @@ import type {
 
 const NON_VISION_USER_IMAGE_PLACEHOLDER = "(image omitted: model does not support images)";
 const NON_VISION_TOOL_IMAGE_PLACEHOLDER = "(tool image omitted: model does not support images)";
+
+const logger = getLogger("transform-messages");
 
 function replaceImagesWithPlaceholder(content: (TextContent | ImageContent)[], placeholder: string): TextContent[] {
 	const result: TextContent[] = [];
@@ -155,6 +158,14 @@ export function transformMessages<TApi extends Api>(
 		if (pendingToolCalls.length > 0) {
 			for (const tc of pendingToolCalls) {
 				if (!existingToolResultIds.has(tc.id)) {
+					// The provider requires a result for every call, so the missing one is
+					// replaced with an explicit error result. Log it: the transcript on disk
+					// says nothing about a result the provider will see.
+					logger.warn("Synthesized a tool result for a call without one", {
+						toolCallId: tc.id,
+						toolName: tc.name,
+						replacement: "No result provided",
+					});
 					result.push({
 						role: "toolResult",
 						toolCallId: tc.id,
@@ -195,6 +206,13 @@ export function transformMessages<TApi extends Api>(
 			result.push(msg);
 		} else if (msg.role === "toolResult") {
 			if (!pendingToolCalls.some((toolCall) => toolCall.id === msg.toolCallId)) {
+				// Dropping is required (a result without its call is rejected by the API), but it
+				// must not be silent: the caller has to be able to see that the context changed.
+				logger.warn("Dropped a tool result that matches no tool call in the preceding assistant turn", {
+					toolCallId: msg.toolCallId,
+					toolName: msg.toolName,
+					pendingToolCallIds: pendingToolCalls.map((toolCall) => toolCall.id),
+				});
 				continue;
 			}
 			existingToolResultIds.add(msg.toolCallId);
