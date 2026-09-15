@@ -140,6 +140,14 @@ describe("tools-manager release pinning", () => {
 		if (HOST_CAN_EXTRACT_TARBALLS) {
 			const tarShim = join(pathDir, "tar");
 			if (!existsSync(tarShim)) symlinkSync(hostTarPath, tarShim);
+			// GNU tar spawns an external gzip for `xzf`, so the stubbed PATH has to keep a
+			// resolvable one; without it extraction fails on the Linux runner (macOS tar
+			// decompresses internally, which is why the fixture passed locally).
+			const hostGzipPath = ["/usr/bin/gzip", "/bin/gzip"].find((candidate) => existsSync(candidate));
+			if (hostGzipPath) {
+				const gzipShim = join(pathDir, "gzip");
+				if (!existsSync(gzipShim)) symlinkSync(hostGzipPath, gzipShim);
+			}
 		}
 		process.env.PATH = pathDir;
 		delete process.env.PI_OFFLINE;

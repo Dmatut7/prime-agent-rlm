@@ -50,6 +50,10 @@ function makeWorkerReporter(connected = true): WorkerReporterFixture {
 	const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
 		options: { worker: { authenticationToken: "token" } },
 		sessions: new Map<string, ActiveSessionState>(),
+		// The real constructor initializes these; the double has to carry every field the
+		// close path touches (transcriptSerializationCaches was added by the shared-encoding
+		// work and its delete runs in closeSessionOnce).
+		transcriptSerializationCaches: new Map(),
 		cronStore: { list: () => [], cancelJobsForSession: () => [] },
 		summarizer: { forget: () => {} },
 		acpMcpOwners: new Map(),
