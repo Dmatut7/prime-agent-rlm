@@ -22,6 +22,7 @@
 // directory whose age cannot be established, keeps the directory.
 import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { BoundedCache } from "../utils/bounded-cache.js";
 import { appendPrivateFile, writePrivateFileAtomicLines } from "../utils/private-files.js";
 import { isValidSessionId } from "./session-id.js";
 
@@ -35,6 +36,9 @@ export const SESSION_ARTIFACT_TOMBSTONE_FILENAME = ".session-tombstones.jsonl";
 // writes one, so the log stays small enough to leave alone.
 
 const RECORD_VERSION = 1;
+
+/** Estimated retained bytes of one cached tombstone record (its JSON form plus Map entry overhead). */
+const TOMBSTONE_RECORD_BYTES = 256;
 
 export interface SessionArtifactTombstone {
 	sessionId: string;
@@ -53,11 +57,48 @@ interface CachedTombstones {
 	records: Map<string, SessionArtifactTombstone>;
 }
 
-const cache = new Map<string, CachedTombstones>();
+// One entry per artifact root, keyed by the root's tombstone log path. Same shape as
+// the round-14 L1 finding: unbounded, and invalidated only by touching the same key
+// again, so a root deleted by a retention sweep left its parsed records behind for the
+// life of the process. The ceilings are sized from the population and the miss cost:
+// a loaded dev host (2026-09-15, ~/.prime/agent) holds 165 artifact roots and 0
+// tombstone logs (records exist only where an artifact dir was deliberately deleted),
+// and re-reading a root is one lstat plus a small JSONL parse - far cheaper than the
+// multi-kilobyte display reads that justify L1's larger budget. 1024 roots is ~6x the
+// measured population; at 256 estimated bytes per cached record, 4 MiB is ~16k records,
+// so the byte ceiling binds first once histories get long and the entry ceiling only
+// covers a wide fan-out of small roots. Both are hard, where neither existed before.
+const TOMBSTONE_CACHE_MAX_ENTRIES = 1024;
+const TOMBSTONE_CACHE_MAX_BYTES = 4 * 1024 * 1024;
+// Idle expiry, not freshness: the stat revalidation stays on every hit, and this is
+// what reclaims a root that is never read again because its log was deleted.
+const TOMBSTONE_CACHE_IDLE_TTL_MS = 15 * 60 * 1000;
+
+const cache = new BoundedCache<CachedTombstones>({
+	maxEntries: TOMBSTONE_CACHE_MAX_ENTRIES,
+	maxBytes: TOMBSTONE_CACHE_MAX_BYTES,
+	estimateBytes: (value) => value.records.size * TOMBSTONE_RECORD_BYTES,
+	idleTtlMs: TOMBSTONE_CACHE_IDLE_TTL_MS,
+});
 
 /** Test hook: drop the per-root parse cache (tests rewrite tombstone files by hand). */
 export function resetSessionArtifactTombstoneCache(): void {
 	cache.clear();
+}
+
+/** Whether one artifact root currently has a cached tombstone map. */
+export function sessionArtifactTombstoneCacheHas(artifactRoot: string): boolean {
+	return cache.has(sessionArtifactTombstonePath(artifactRoot));
+}
+
+/** Cache diagnostics: how much the module-level tombstone cache currently holds. */
+export interface SessionArtifactTombstoneCacheStats {
+	entries: number;
+	bytes: number;
+}
+
+export function sessionArtifactTombstoneCacheStats(): SessionArtifactTombstoneCacheStats {
+	return { entries: cache.size, bytes: cache.estimatedBytes };
 }
 
 function parseTombstoneLine(line: string): SessionArtifactTombstone | undefined {

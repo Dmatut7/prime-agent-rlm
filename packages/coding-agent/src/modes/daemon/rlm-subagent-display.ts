@@ -1,6 +1,7 @@
 import { closeSync, fsyncSync, mkdirSync, openSync, renameSync, rmSync, writeSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
+import { BoundedCache } from "../../utils/bounded-cache.js";
 
 /**
  * Per-child RLM subagent hydration/display metadata.
@@ -42,11 +43,39 @@ interface RlmSubagentDisplayCacheEntry {
 	entry: RlmSubagentDisplayEntry | undefined;
 }
 
+// One entry per session dir the daemon has listed, keyed by the display file path.
 // Every session-list walk reads one display file per ledger edge, and the daemon
 // walks on high-frequency session events. Writes are atomic renames of a fully
 // rewritten file, so an unchanged (size, mtimeMs) means identical content; keying
 // on the stat keeps an out-of-process writer's change visible.
-const displayCache = new Map<string, RlmSubagentDisplayCacheEntry>();
+//
+// The ceiling is sized from the population the cache actually serves. A listing
+// pass reads one dir per RLM ledger edge across every saved session, so a cap
+// below that population turns every pass into a full miss (stat + read + parse of
+// a multi-kilobyte JSON file) and the cache stops paying for itself. Measured on a
+// loaded dev host (2026-09-15, ~/.prime/agent): 1540 child display files,
+// 9.8 MB total, mean 6.5 KB, p99 20.4 KB, max 21.9 KB - i.e. the whole historical
+// population is ~10 MB. 4096 entries cover ~2.7x that; 16 MiB covers it with
+// ~1.6x headroom and binds first at the measured mean (~2500 typical entries), so
+// the entry ceiling only matters for a swarm of small children. Both are hard:
+// retained bytes cannot exceed 16 MiB plus one entry's overhead, versus unbounded
+// before. The byte estimate is the file's serialized size, which is what the stat
+// revalidation already reads; V8 stores ASCII at 1 byte/char and CJK at 2 bytes per
+// char against 3 UTF-8 bytes, so it tracks retained size to within a factor of ~1.5.
+const DISPLAY_CACHE_MAX_ENTRIES = 4096;
+const DISPLAY_CACHE_MAX_BYTES = 16 * 1024 * 1024;
+// Idle expiry, not a freshness rule: the stat still revalidates every hit. Children
+// listed on consecutive passes keep refreshing and never expire; a dir deleted out
+// from under the cache is never read again, so this is the only thing that reclaims it.
+const DISPLAY_CACHE_IDLE_TTL_MS = 15 * 60 * 1000;
+
+const displayCache = new BoundedCache<RlmSubagentDisplayCacheEntry>({
+	maxEntries: DISPLAY_CACHE_MAX_ENTRIES,
+	maxBytes: DISPLAY_CACHE_MAX_BYTES,
+	// A cached miss keeps only its stat, so it costs nothing against the budget.
+	estimateBytes: (value) => (value.entry === undefined ? 0 : value.size),
+	idleTtlMs: DISPLAY_CACHE_IDLE_TTL_MS,
+});
 
 function isRlmSubagentDisplayEntry(value: unknown): value is RlmSubagentDisplayEntry {
 	if (!value || typeof value !== "object") return false;
@@ -84,6 +113,26 @@ export function writeRlmSubagentDisplayEntry(entry: RlmSubagentDisplayEntry): vo
 		rmSync(tempPath, { force: true });
 		throw error;
 	}
+}
+
+/** Cache diagnostics: how much the module-level display cache currently holds. */
+export interface RlmSubagentDisplayCacheStats {
+	entries: number;
+	bytes: number;
+}
+
+export function rlmSubagentDisplayCacheStats(): RlmSubagentDisplayCacheStats {
+	return { entries: displayCache.size, bytes: displayCache.estimatedBytes };
+}
+
+/** Whether one session dir currently has a cached display entry. */
+export function rlmSubagentDisplayCacheHas(sessionDir: string): boolean {
+	return displayCache.has(rlmSubagentDisplayPath(sessionDir));
+}
+
+/** Test hook: drop every cached display entry. */
+export function resetRlmSubagentDisplayCache(): void {
+	displayCache.clear();
 }
 
 export async function readRlmSubagentDisplayEntry(sessionDir: string): Promise<RlmSubagentDisplayEntry | undefined> {
