@@ -121,3 +121,7 @@
 {"id": "CD-7", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "已弃用的 compat.reasoningEffortMap 静默失效（schema 非严格、零探测）", "verified_by": "R11 读码"}
 {"id": "P-1", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "系统提示承诺\"技能＝同名 shell 命令\"，实际 8/8 command not found（venv/bin 不在 PATH + 5 个技能无 [project.scripts]）", "verified_by": "R12 实测 127 + 正控（绝对路径可跑）"}
 {"id": "P-2", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "提示词教 `uv pip install` 并称\"venv 没有 pip\"，两条与现实相反（裸命令 exit 2；venv 真有 pip 26.2.1）", "verified_by": "R12 实测 + 正控（加 --python 即成功）"}
+{"id": "BF-1", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "一行形状不合的坏行⇒整份转录抛 TypeError，会话从 agents 视图静默消失（可达性 unverified）", "verified_by": "R12 真模块逐字复现 + 正控"}
+{"id": "BF-2", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "合法 header 无尾换行⇒被就地改写成新 id（185→145B、parent/rlmDepth 丢失、文件名与 id 分家）", "verified_by": "R12 实测 + 正控（带尾换行正常）"}
+{"id": "BF-3", "date": "2026-09-15", "severity": "P3", "status": "fixing", "commit": null, "title": "行数口径把尾换行算成多一行：恰好 2000 行带尾换行被判 truncated（实为空报）", "verified_by": "R12 实测"}
+{"id": "BF-4", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "首行超 64KiB 被静默截断⇒header 解析失败⇒会话静默消失", "verified_by": "R12（可达性 unverified）"}
