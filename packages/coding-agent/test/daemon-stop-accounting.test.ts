@@ -101,21 +101,30 @@ describe("daemonTargetRefusal", () => {
 });
 
 describe("ShutdownReport accounting", () => {
-	it("names a worker that converged, whether or not anything claimed to stop it", () => {
+	it("names a signalled worker that converged, and never one this run left alone", () => {
 		const directory = makeTempDir();
 		const supervisorSocket = join(directory, "daemon.sock");
 		const workerSocket = join(directory, "worker-12f042ee5718-46490fc846bf.sock");
+		const untouchedSocket = join(directory, "elsewhere.sock");
 		writeFileSync(supervisorSocket, "");
 		writeFileSync(workerSocket, "");
+		writeFileSync(untouchedSocket, "");
 
 		const report = new ShutdownReport();
 		report.observe([
 			{ socketPath: supervisorSocket, pid: 11, kind: "service" },
 			{ socketPath: workerSocket, pid: 22, kind: "worker" },
+			{ socketPath: untouchedSocket, pid: 33, kind: "service" },
 		]);
-		// The supervisor was stopped and its socket removed; the worker converged with it.
+		// The supervisor was stopped and its socket removed; the worker was signalled
+		// by the worker leg and converged with it. The third target is one the
+		// selection kept: it exited on its own, and that is not a stop we performed.
+		report.markSignalled(supervisorSocket, 11);
+		report.markSignalled(workerSocket, 22);
+		report.keep({ socketPath: untouchedSocket, pid: 33, kind: "service", reason: "outside the requested scope" });
 		rmSync(supervisorSocket);
 		rmSync(workerSocket);
+		rmSync(untouchedSocket);
 		const stillPresent = report.converge();
 
 		expect(stillPresent).toEqual([]);
@@ -123,7 +132,11 @@ describe("ShutdownReport accounting", () => {
 			[supervisorSocket, "service", 11],
 			[workerSocket, "worker", 22],
 		]);
-		expect(report.discovered).toBe(2);
+		expect(report.leftRunning).toEqual([
+			{ socketPath: untouchedSocket, pid: 33, kind: "service", reason: "outside the requested scope" },
+		]);
+		expect(report.discovered).toBe(3);
+		expect(report.discovered).toBe(bucketTotal(report));
 	});
 
 	it("reports what is still on disk instead of declaring a clean sweep", () => {
