@@ -34,6 +34,11 @@ const REFINEMENT_FAILURE_RAW_BYTE_LIMIT = 8 * 1024;
 const DEFAULT_OVERVIEW_ENTRY_LIMIT = 6;
 const DEFAULT_OVERVIEW_REFINEMENT_LIMIT = 5;
 const DEFAULT_OVERVIEW_CONTENT_LIMIT = 180;
+/** The refiner's own view is wider than the injected face but still truncated. */
+const REFINER_OVERVIEW_ENTRY_LIMIT = 40;
+/** How to read entries the view had to drop, per session capability. */
+const KERNEL_FULL_LIST_HINT = "read them all with `rlm.get_harness_state()` (`global_=True` for global entries)";
+const HARNESS_STATE_FILE_HINT = "the full list stays in the harness state file";
 
 export type RefinementKind = "prompt" | "memory" | "skill" | "subagent";
 export type RefinementAction = "create" | "update" | "delete";
@@ -239,10 +244,75 @@ function slug(raw: string, fallback: string): string {
 	const normalized = raw
 		.trim()
 		.toLowerCase()
-		.replace(/[^a-z0-9]+/g, "_")
+		// Unicode letters and digits survive: stripping CJK would collapse every
+		// non-Latin title onto the kind name and give unrelated facts one identity.
+		.replace(/[^\p{L}\p{N}]+/gu, "_")
 		.replace(/^_+|_+$/g, "")
 		.slice(0, 80);
 	return normalized || fallback;
+}
+
+function comparableTitle(title: string): string {
+	return title.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/**
+ * Titles can normalize onto one id (case, punctuation, or a title with no usable
+ * characters that falls back to the kind name). Give the newcomer a deterministic
+ * suffix instead of dropping the edit, so distinct facts keep distinct identities.
+ * A candidate that already holds the same title is returned unchanged, which keeps
+ * a redundant re-recording a visible "entry already exists" refusal rather than a
+ * silent duplicate.
+ */
+function uniqueEntryId(records: Record<string, HarnessEntry>, baseId: string, title: string): string {
+	const targetTitle = comparableTitle(title);
+	let candidate = baseId;
+	for (let suffix = 2; records[candidate]; suffix += 1) {
+		if (comparableTitle(records[candidate].title) === targetTitle) {
+			break;
+		}
+		candidate = `${baseId}_${suffix}`;
+	}
+	return candidate;
+}
+
+/** Most recent write first; a missing timestamp sorts last. */
+function entryRecency(entry: HarnessEntry): string {
+	const updated = entry.updated_at;
+	if (typeof updated === "string" && updated.length > 0) {
+		return updated;
+	}
+	const created = entry.created_at;
+	return typeof created === "string" ? created : "";
+}
+
+/**
+ * Injection order is "most recently updated first", with the id as a tie-break so the
+ * same state always renders the same text: an ordering that drifts between turns would
+ * invalidate the prompt cache and let a fresh fact fall out of view.
+ */
+function compareEntriesForInjection(a: HarnessEntry, b: HarnessEntry): number {
+	const recency = entryRecency(b).localeCompare(entryRecency(a));
+	if (recency !== 0) {
+		return recency;
+	}
+	const byId = a.id.localeCompare(b.id);
+	if (byId !== 0) {
+		return byId;
+	}
+	return (a.scope ?? "").localeCompare(b.scope ?? "");
+}
+
+function entriesForInjection(state: HarnessState, kind: RefinementKind): HarnessEntry[] {
+	return Object.values(state.entries[kind]).sort(compareEntriesForInjection);
+}
+
+/**
+ * A bare count hides that the view is truncated. Name how many entries are missing and
+ * how to read them, so a missing fact reads as a visible gap instead of an absent one.
+ */
+function overflowLine(kind: RefinementKind, hidden: number, total: number, hint: string): string {
+	return `- +${hidden} more ${kind} entries (${total} recorded; ${hint})`;
 }
 
 function cloneEntry(entry: HarnessEntry | undefined): HarnessEntry | undefined {
@@ -668,9 +738,7 @@ export function formatHarnessStateForPrompt(
 
 	let totalEntries = 0;
 	for (const kind of Object.keys(state.entries) as RefinementKind[]) {
-		const entries = Object.values(state.entries[kind]).sort((a, b) =>
-			[a.path, a.title, a.id].join("\0").localeCompare([b.path, b.title, b.id].join("\0")),
-		);
+		const entries = entriesForInjection(state, kind);
 		totalEntries += entries.length;
 		// Render subagent specs as a task-shaped roster the model can match against — the
 		// analogue of Claude Code's agent-type menu — rather than a bare count. In
@@ -700,7 +768,14 @@ export function formatHarnessStateForPrompt(
 		}
 		const overflow = entries.length - Math.min(entries.length, maxEntriesPerKind);
 		if (overflow > 0) {
-			lines.push(`- +${overflow} more ${kind} entries`);
+			lines.push(
+				overflowLine(
+					kind,
+					overflow,
+					entries.length,
+					includeIpythonExamples ? KERNEL_FULL_LIST_HINT : HARNESS_STATE_FILE_HINT,
+				),
+			);
 		}
 		lines.push("");
 	}
@@ -726,9 +801,9 @@ export function formatHarnessStateForPrompt(
 function overviewForPrompt(state: HarnessState): string {
 	const lines: string[] = [];
 	for (const kind of Object.keys(state.entries) as RefinementKind[]) {
-		const entries = Object.values(state.entries[kind]);
+		const entries = entriesForInjection(state, kind);
 		lines.push(`${kind}: ${entries.length}`);
-		for (const entry of entries.slice(0, 40)) {
+		for (const entry of entries.slice(0, REFINER_OVERVIEW_ENTRY_LIMIT)) {
 			const content = entry.content.replace(/\s+/g, " ").slice(0, 240);
 			const argumentsText =
 				entry.kind === "skill" && Object.keys(entry.arguments).length > 0
@@ -742,8 +817,10 @@ function overviewForPrompt(state: HarnessState): string {
 				`- [${entry.scope ?? "global"}:${entry.id}] ${entry.title} (${entry.path}, v${entry.version})${referenceText}${argumentsText}: ${content}`,
 			);
 		}
-		if (entries.length > 40) {
-			lines.push(`- +${entries.length - 40} more ${kind} entries`);
+		if (entries.length > REFINER_OVERVIEW_ENTRY_LIMIT) {
+			lines.push(
+				overflowLine(kind, entries.length - REFINER_OVERVIEW_ENTRY_LIMIT, entries.length, HARNESS_STATE_FILE_HINT),
+			);
 		}
 	}
 	return lines.join("\n");
@@ -1027,15 +1104,22 @@ export function applyRefinementProposal(
 	const appliedEdits: AppliedRefinementEdit[] = [];
 	const proposalModifiedKeys = new Set<string>();
 	for (const edit of proposal.edits) {
-		const computedId = edit.id ?? (edit.action === "create" ? slug(edit.title ?? edit.kind, edit.kind) : undefined);
-		const id = computedId ?? "";
-		const validationError = validateEdit(edit, id);
+		const derivedId = edit.id ?? (edit.action === "create" ? slug(edit.title ?? edit.kind, edit.kind) : undefined);
+		// Validate against the derived id first: a derived `base_system_prompt` must stay
+		// blocked even when that id is already taken.
+		const validationError = validateEdit(edit, derivedId ?? "");
 		if (validationError) {
-			appliedEdits.push({ ...edit, id, applied: false, error: validationError });
+			appliedEdits.push({ ...edit, id: derivedId ?? "", applied: false, error: validationError });
 			continue;
 		}
 
 		const records = state.entries[edit.kind];
+		// An explicitly requested id keeps the original refuse-on-collision behavior; a
+		// derived id is de-collided so two distinct titles cannot silently share one fact.
+		const id =
+			edit.id === undefined && edit.action === "create"
+				? uniqueEntryId(records, derivedId ?? "", edit.title ?? edit.kind)
+				: (derivedId as string);
 		const before = cloneEntry(records[id]);
 		const entryKey = `${edit.kind}:${id}`;
 		const baseline = cloneEntry(options.baselineState?.entries[edit.kind][id]);
