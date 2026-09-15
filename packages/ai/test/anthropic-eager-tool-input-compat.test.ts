@@ -236,8 +236,6 @@ describe("Anthropic tool schema compatibility", () => {
 					description: "Submit labels",
 					parameters: Type.Unsafe({
 						$schema: "https://json-schema.org/draft/2020-12/schema",
-						$defs: { label: Type.String() },
-						definitions: { legacyLabel: Type.String() },
 						type: "object",
 						properties: { label: Type.String() },
 						required: ["label"],
@@ -252,6 +250,33 @@ describe("Anthropic tool schema compatibility", () => {
 			properties: { label: { type: "string" } },
 			required: ["label"],
 			additionalProperties: false,
+		});
+	});
+
+	it("forwards root definition blocks because they hold $ref targets", async () => {
+		const request = await captureAnthropicRequest(
+			undefined,
+			createContext([
+				{
+					name: "labels",
+					description: "Submit labels",
+					parameters: Type.Unsafe({
+						type: "object",
+						$defs: { label: Type.String() },
+						definitions: { legacyLabel: Type.String() },
+						properties: { label: { $ref: "#/$defs/label" } },
+						required: ["label"],
+					}),
+				},
+			]),
+		);
+
+		expect(getInputSchema(request.body)).toEqual({
+			type: "object",
+			$defs: { label: { type: "string" } },
+			definitions: { legacyLabel: { type: "string" } },
+			properties: { label: { $ref: "#/$defs/label" } },
+			required: ["label"],
 		});
 	});
 });

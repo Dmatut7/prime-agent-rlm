@@ -59,6 +59,29 @@ describe("truncateToWidth", () => {
 		const truncated = truncateToWidth("🙂\t界 \x1b_abc\x07", 7, "…", true);
 		assert.strictEqual(truncated, "🙂\t… ");
 	});
+
+	it("pads to the exact visible width when ANSI codes split a grapheme cluster", () => {
+		// An SGR sequence inside a cluster makes fragment-wise width accumulation
+		// disagree with visibleWidth(): the tail after the escape is measured as a
+		// new cluster, so "❤️" counts 2 and "👩‍👩" counts 4 instead of the
+		// whole-string widths 1 and 2.
+		const cases = [
+			"\u2764\uFE0F\x1b[31m\u0301",
+			"\u{1F469}\x1b[31m\u200D\u{1F469}",
+			"\u{1F468}\u200D\x1b[32m\u{1F469}\u200D\u{1F467}",
+		];
+		assert.ok(cases.length > 0);
+		for (const text of cases) {
+			for (const width of [2, 3, 4, 5, 6, 8, 12]) {
+				assert.strictEqual(
+					visibleWidth(truncateToWidth(text, width, "…", true)),
+					width,
+					`padded width for ${JSON.stringify(text)} at ${width}`,
+				);
+			}
+			assert.strictEqual(visibleWidth(truncateToWidth(text, 40, "…", true)), 40);
+		}
+	});
 });
 
 describe("visibleWidth", () => {

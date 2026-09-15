@@ -66,37 +66,19 @@ function truncateFragmentToWidth(text: string, maxWidth: number): { text: string
 		return { text: clipped, width: clipped.length };
 	}
 
-	const hasAnsi = text.includes("\x1b");
-	const hasTabs = text.includes("\t");
-	if (!hasAnsi && !hasTabs) {
-		let result = "";
-		let width = 0;
-		for (const { segment } of segmenter.segment(text)) {
-			const w = graphemeWidth(segment);
-			if (width + w > maxWidth) {
-				break;
-			}
-			result += segment;
-			width += w;
-		}
-		return { text: result, width };
-	}
-
+	// Same accounting as visibleWidth(): clusters are measured on the
+	// ANSI-stripped text, so an escape sequence inside a cluster cannot split it.
 	let result = "";
 	let width = 0;
-	let i = 0;
 	let pendingAnsi = "";
-	const extractAnsi = createAnsiCodeExtractor(text);
 
-	while (i < text.length) {
-		const ansi = extractAnsi(i);
-		if (ansi) {
-			pendingAnsi += ansi.code;
-			i += ansi.length;
+	for (const unit of buildTruncateUnits(text)) {
+		if (unit.kind === "ansi") {
+			pendingAnsi += unit.code;
 			continue;
 		}
 
-		if (text[i] === "\t") {
+		if (unit.kind === "tab") {
 			if (width + 3 > maxWidth) {
 				break;
 			}
@@ -106,32 +88,26 @@ function truncateFragmentToWidth(text: string, maxWidth: number): { text: string
 			}
 			result += "\t";
 			width += 3;
-			i++;
 			continue;
 		}
 
-		let end = i;
-		while (end < text.length && text[end] !== "\t") {
-			const nextAnsi = extractAnsi(end);
-			if (nextAnsi) {
+		const cluster = unit.cluster;
+		if (!cluster.decided) {
+			cluster.decided = true;
+			if (width + cluster.width > maxWidth) {
 				break;
 			}
-			end++;
+			cluster.kept = true;
+			width += cluster.width;
 		}
 
-		for (const { segment } of segmenter.segment(text.slice(i, end))) {
-			const w = graphemeWidth(segment);
-			if (width + w > maxWidth) {
-				return { text: result, width };
-			}
+		if (cluster.kept) {
 			if (pendingAnsi) {
 				result += pendingAnsi;
 				pendingAnsi = "";
 			}
-			result += segment;
-			width += w;
+			result += unit.text;
 		}
-		i = end;
 	}
 
 	return { text: result, width };
@@ -1044,6 +1020,106 @@ export function applyBackgroundToLine(line: string, width: number, bgFn: (text: 
 }
 
 /**
+ * One item of a line in source order. Visible text is clustered against the
+ * ANSI-stripped text, so escape sequences sitting inside a grapheme cluster
+ * cannot change that cluster's measured width.
+ */
+interface TruncateCluster {
+	width: number;
+	decided: boolean;
+	kept: boolean;
+}
+
+type TruncateUnit =
+	| { kind: "ansi"; code: string }
+	| { kind: "tab" }
+	| { kind: "text"; text: string; cluster: TruncateCluster; endsCluster: boolean };
+
+/**
+ * Split a line into source-ordered units whose cluster widths match visibleWidth().
+ * Tabs stay atomic (three columns) and act as cluster barriers, mirroring the
+ * tab-to-spaces normalization visibleWidth() applies before segmenting.
+ */
+function buildTruncateUnits(text: string): TruncateUnit[] {
+	const units: TruncateUnit[] = [];
+	const extractAnsi = createAnsiCodeExtractor(text);
+	let i = 0;
+
+	while (i < text.length) {
+		const atoms: Array<{ kind: "ansi"; code: string } | { kind: "char"; text: string }> = [];
+		while (i < text.length) {
+			const ansi = extractAnsi(i);
+			if (ansi) {
+				atoms.push({ kind: "ansi", code: ansi.code });
+				i += ansi.length;
+				continue;
+			}
+			if (text[i] === "\t") {
+				break;
+			}
+			const char = String.fromCodePoint(text.codePointAt(i)!);
+			atoms.push({ kind: "char", text: char });
+			i += char.length;
+		}
+
+		units.push(...buildTruncateRunUnits(atoms));
+
+		if (i < text.length && text[i] === "\t") {
+			units.push({ kind: "tab" });
+			i++;
+		}
+	}
+
+	return units;
+}
+
+function buildTruncateRunUnits(
+	atoms: Array<{ kind: "ansi"; code: string } | { kind: "char"; text: string }>,
+): TruncateUnit[] {
+	let stripped = "";
+	for (const atom of atoms) {
+		if (atom.kind === "char") {
+			stripped += atom.text;
+		}
+	}
+
+	const clusters: Array<{ length: number; width: number }> = [];
+	for (const { segment } of segmenter.segment(stripped)) {
+		clusters.push({ length: segment.length, width: graphemeWidth(segment) });
+	}
+
+	const units: TruncateUnit[] = [];
+	let clusterIndex = 0;
+	let offsetInCluster = 0;
+	let cluster: TruncateCluster | null = null;
+
+	for (const atom of atoms) {
+		if (atom.kind === "ansi") {
+			units.push({ kind: "ansi", code: atom.code });
+			continue;
+		}
+		const current = clusters[clusterIndex];
+		if (current === undefined) {
+			// Unreachable: a char atom always contributes to the stripped run.
+			return units;
+		}
+		if (cluster === null) {
+			cluster = { width: current.width, decided: false, kept: false };
+		}
+		offsetInCluster += atom.text.length;
+		const endsCluster = offsetInCluster >= current.length;
+		units.push({ kind: "text", text: atom.text, cluster, endsCluster });
+		if (endsCluster) {
+			clusterIndex++;
+			offsetInCluster = 0;
+			cluster = null;
+		}
+	}
+
+	return units;
+}
+
+/**
  * Truncate text to fit within a maximum visible width, adding ellipsis if needed.
  * Optionally pad with spaces to reach exactly maxWidth.
  * Properly handles ANSI escape codes (they don't count toward width).
@@ -1118,17 +1194,13 @@ export function truncateToWidth(
 		}
 		exhaustedInput = !overflowed;
 	} else {
-		let i = 0;
-		const extractAnsi = createAnsiCodeExtractor(text);
-		while (i < text.length) {
-			const ansi = extractAnsi(i);
-			if (ansi) {
-				pendingAnsi += ansi.code;
-				i += ansi.length;
+		for (const unit of buildTruncateUnits(text)) {
+			if (unit.kind === "ansi") {
+				pendingAnsi += unit.code;
 				continue;
 			}
 
-			if (text[i] === "\t") {
+			if (unit.kind === "tab") {
 				if (keepContiguousPrefix && keptWidth + 3 <= targetWidth) {
 					if (pendingAnsi) {
 						result += pendingAnsi;
@@ -1145,45 +1217,40 @@ export function truncateToWidth(
 					overflowed = true;
 					break;
 				}
-				i++;
 				continue;
 			}
 
-			let end = i;
-			while (end < text.length && text[end] !== "\t") {
-				const nextAnsi = extractAnsi(end);
-				if (nextAnsi) {
-					break;
-				}
-				end++;
-			}
-
-			for (const { segment } of segmenter.segment(text.slice(i, end))) {
-				const width = graphemeWidth(segment);
-				if (keepContiguousPrefix && keptWidth + width <= targetWidth) {
-					if (pendingAnsi) {
-						result += pendingAnsi;
-						pendingAnsi = "";
-					}
-					result += segment;
-					keptWidth += width;
+			const cluster = unit.cluster;
+			if (!cluster.decided) {
+				cluster.decided = true;
+				if (keepContiguousPrefix && keptWidth + cluster.width <= targetWidth) {
+					cluster.kept = true;
+					keptWidth += cluster.width;
 				} else {
 					keepContiguousPrefix = false;
 					pendingAnsi = "";
 				}
-
-				visibleSoFar += width;
+				visibleSoFar += cluster.width;
 				if (visibleSoFar > maxWidth) {
 					overflowed = true;
-					break;
 				}
 			}
-			if (overflowed) {
+
+			if (cluster.kept) {
+				if (pendingAnsi) {
+					result += pendingAnsi;
+					pendingAnsi = "";
+				}
+				result += unit.text;
+			}
+
+			// Stop at cluster boundaries only: a style change inside a cluster must
+			// not cut the cluster in half.
+			if (overflowed && unit.endsCluster) {
 				break;
 			}
-			i = end;
 		}
-		exhaustedInput = i >= text.length;
+		exhaustedInput = !overflowed;
 	}
 
 	if (!overflowed && exhaustedInput) {

@@ -1347,6 +1347,126 @@ function normalizeAnthropicToolSchema(value: unknown): unknown {
 	return normalized;
 }
 
+/**
+ * Root-level keywords that only annotate a schema. They cannot change which
+ * tool inputs are accepted, so they are not forwarded to the provider.
+ * Identity keywords (`$id`, `$anchor`) are dropped too because every `$ref` we
+ * forward must be resolvable inside the schema we send.
+ */
+const ANTHROPIC_TOOL_SCHEMA_ANNOTATION_KEYS = new Set([
+	"$anchor",
+	"$comment",
+	"$id",
+	"$schema",
+	"$vocabulary",
+	"default",
+	"deprecated",
+	"description",
+	"examples",
+	"readOnly",
+	"title",
+	"writeOnly",
+]);
+
+/** Collect every `$ref` string in a schema, in document order. */
+function collectSchemaRefs(value: unknown, refs: string[]): void {
+	if (Array.isArray(value)) {
+		for (const item of value) {
+			collectSchemaRefs(item, refs);
+		}
+		return;
+	}
+	if (!isSchemaObject(value)) {
+		return;
+	}
+	for (const [key, nestedValue] of Object.entries(value)) {
+		if (key === "$ref") {
+			refs.push(typeof nestedValue === "string" ? nestedValue : JSON.stringify(nestedValue));
+			continue;
+		}
+		collectSchemaRefs(nestedValue, refs);
+	}
+}
+
+/** Resolve an in-document JSON Pointer (RFC 6901) against a schema. */
+function resolvesAnthropicSchemaPointer(root: unknown, pointer: string): boolean {
+	if (pointer === "" || pointer === "#") {
+		return true;
+	}
+	if (!pointer.startsWith("#/")) {
+		return false;
+	}
+	let node: unknown = root;
+	for (const rawToken of pointer.slice(2).split("/")) {
+		const token = rawToken.replace(/~1/g, "/").replace(/~0/g, "~");
+		if (Array.isArray(node)) {
+			if (!/^\d+$/.test(token)) {
+				return false;
+			}
+			const index = Number.parseInt(token, 10);
+			if (index >= node.length) {
+				return false;
+			}
+			node = node[index];
+			continue;
+		}
+		if (!isSchemaObject(node) || !Object.hasOwn(node, token)) {
+			return false;
+		}
+		node = node[token];
+	}
+	return true;
+}
+
+/**
+ * Build the Anthropic `input_schema` for a tool.
+ *
+ * Anthropic requires `type: "object"`, but its input schema is otherwise a JSON
+ * Schema (draft 2020-12, per `Anthropic.Messages.Tool.InputSchema`), so every
+ * structural keyword is forwarded as-is. Silently projecting the root schema
+ * down to `properties`/`required` used to drop `$defs` (leaving `$ref` dangling),
+ * root `anyOf`, `minProperties`, and friends, which made what the model sees
+ * wider than what the caller's own validator enforces. Anything that cannot be
+ * represented is now refused loudly instead of being narrowed in silence.
+ */
+function projectAnthropicToolInputSchema(
+	toolName: string,
+	schema: Record<string, unknown>,
+	required: string[],
+): Anthropic.Messages.Tool["input_schema"] {
+	if (Object.hasOwn(schema, "type") && schema.type !== "object") {
+		throw new Error(
+			`Anthropic tool "${toolName}" declares root JSON Schema type ${JSON.stringify(
+				schema.type,
+			)}; Anthropic requires input_schema.type to be "object". Refusing to send a schema that does not describe the tool's real input contract.`,
+		);
+	}
+
+	const projected: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(schema)) {
+		if (ANTHROPIC_TOOL_SCHEMA_ANNOTATION_KEYS.has(key)) {
+			continue;
+		}
+		projected[key] = value;
+	}
+	projected.type = "object";
+	projected.properties = schema.properties ?? {};
+	projected.required = required;
+
+	const refs: string[] = [];
+	collectSchemaRefs(projected, refs);
+	const dangling = [...new Set(refs)].filter((ref) => !resolvesAnthropicSchemaPointer(projected, ref));
+	if (dangling.length > 0) {
+		throw new Error(
+			`Anthropic tool "${toolName}" has $ref values that do not resolve inside the converted schema: ${dangling.join(
+				", ",
+			)}. Refusing to send a schema whose references dangle, because the model would be given a different input contract than the local tool validates.`,
+		);
+	}
+
+	return projected as Anthropic.Messages.Tool["input_schema"];
+}
+
 function convertTools(
 	tools: Tool[],
 	isOAuthToken: boolean,
@@ -1367,15 +1487,7 @@ function convertTools(
 			name: isOAuthToken ? (claudeCodeToolNames?.[index] ?? tool.name) : tool.name,
 			description: tool.description,
 			...(supportsEagerToolInputStreaming ? { eager_input_streaming: true } : {}),
-			input_schema: {
-				type: "object",
-				properties: schema.properties ?? {},
-				required,
-				...(Object.hasOwn(schema, "additionalProperties")
-					? { additionalProperties: schema.additionalProperties }
-					: {}),
-				...(Object.hasOwn(schema, "patternProperties") ? { patternProperties: schema.patternProperties } : {}),
-			},
+			input_schema: projectAnthropicToolInputSchema(tool.name, schema, required),
 			...(cacheControl && index === tools.length - 1 ? { cache_control: cacheControl } : {}),
 		};
 	});
