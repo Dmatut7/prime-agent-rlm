@@ -1130,7 +1130,7 @@ describe("AgentSession queue characterization", () => {
 		}
 	});
 
-	it("keeps an unpersisted refinement outcome when the refinement audit append fails", async () => {
+	it("reports the refinement failure receipt when the refinement audit append fails", async () => {
 		const harness = await createAutoRefineHarness();
 		harnesses.push(harness);
 		const previousAgentDir = process.env.PRIME_AGENT_CODING_AGENT_DIR;
@@ -1152,9 +1152,14 @@ describe("AgentSession queue characterization", () => {
 				auditAppendError.message,
 			);
 
-			expect(harness.session.messages.some(isRefinementOutcomeMessage)).toBe(true);
-			// The outcome survives context rebuilds even when neither session entry could persist.
-			expect(harness.session.buildSessionContext().messages.some(isRefinementOutcomeMessage)).toBe(true);
+			// MV-6: a persist failure must not leave a success receipt behind - the
+			// model-visible record is the failure receipt (details.failed), not an
+			// applied outcome. Rebuilds keep the same honest contract.
+			const outcome = harness.session.messages.find(isRefinementOutcomeMessage);
+			expect(outcome?.details.failed).toBe(true);
+			expect(outcome?.details.error).toContain(auditAppendError.message);
+			const rebuilt = harness.session.buildSessionContext().messages.find(isRefinementOutcomeMessage);
+			expect(rebuilt?.details.failed).toBe(true);
 		} finally {
 			if (previousAgentDir === undefined) {
 				delete process.env.PRIME_AGENT_CODING_AGENT_DIR;

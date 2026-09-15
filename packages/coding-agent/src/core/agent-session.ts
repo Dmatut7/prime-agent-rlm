@@ -9638,7 +9638,10 @@ export class AgentSession {
 		const snapshot = await provisioner.pruneOversizedVariables().catch(() => null);
 		// FR-5: a null write on a kernel with no snapshot machine is not a failed
 		// write; the notice must not talk about a snapshot that never existed.
-		const hasSnapshotConfig = provisioner.hasSnapshotTarget();
+		// Optional probe: an older provisioner (or a test fake) may not expose
+		// hasSnapshotTarget; missing it defaults to assuming a snapshot machine.
+		const hasSnapshotConfig =
+			typeof provisioner.hasSnapshotTarget === "function" ? provisioner.hasSnapshotTarget() : true;
 		const abort = new AbortController();
 		const timer = setTimeout(() => abort.abort(), KERNEL_STATE_LISTING_TIMEOUT_MS);
 		if (typeof timer === "object" && "unref" in timer) timer.unref();
@@ -10207,7 +10210,13 @@ export class AgentSession {
 	 * at the turn boundary after compaction checks and before auto-refine
 	 * scheduling so the manual request takes priority.
 	 */
+	private _refineFailureReceipts = new WeakSet<object>();
 	private _emitRefineFailed(error: unknown, scope: HarnessScope = "local"): void {
+		// Idempotent per error object: refine() failures are reported by the direct
+		// path AND by queued/auto callers that catch the same rethrown error; the
+		// first receipt wins and later calls on the same error are no-ops.
+		if (error instanceof Object && this._refineFailureReceipts.has(error)) return;
+		if (error instanceof Object) this._refineFailureReceipts.add(error);
 		const reason = error instanceof Error ? error.message : String(error);
 		// MV-5: the requested scope is the caller's guess; a persist failure
 		// knows the effective target scope (a local request can roll back a
@@ -10768,7 +10777,17 @@ export class AgentSession {
 			if (this._disposed || refineAbort.signal.aborted) {
 				throw new Error("Refinement cancelled because the session was disposed.");
 			}
-			return await this._applyRefine(plan, options, refineAbort);
+			try {
+				return await this._applyRefine(plan, options, refineAbort);
+			} catch (error) {
+				// MV-5 parity for the direct refine() path (kernel skill, auto runs):
+				// a persist/apply failure leaves a model-visible failure receipt the
+				// same way the queued /refine command path does. _emitRefineFailed is
+				// idempotent per error object, so callers that also catch-and-report
+				// do not double-emit.
+				this._emitRefineFailed(error, options?.global ? "global" : "local");
+				throw error;
+			}
 		} finally {
 			resolveApplySettled();
 			if (this._refineInFlight === applySettled) {

@@ -8,6 +8,7 @@ import {
 	type Usage,
 } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { SnapshotResult } from "../../src/core/kernel/state-snapshot.js";
 import { SessionManager } from "../../src/core/session-manager.js";
 import { createHarness, getMessageText, type Harness } from "./harness.js";
 import { createDeferred } from "./scheduling.js";
@@ -101,7 +102,9 @@ describe("AgentSession compaction characterization", () => {
 		await harness.session.prompt("one");
 		await harness.session.prompt("two");
 
-		const pruneOversizedVariables = vi.fn(async () => ["large_text"]);
+		// FR-5 made pruneOversizedVariables return the full SnapshotResult (pruned
+		// names ride the result object), so the fake follows the production contract.
+		const pruneOversizedVariables = vi.fn(async () => ({ pruned: ["large_text"] }) as SnapshotResult);
 		const listNamespaceNames = vi.fn(async () => ["small_value"]);
 		const internals = harness.session as unknown as { _ipythonKernelProvisioner?: unknown };
 		const previousProvisioner = internals._ipythonKernelProvisioner;
