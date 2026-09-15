@@ -37,6 +37,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
+import { recordStreamFailure } from "../utils/stream-failure.js";
 import { finalizeThrottledStreamingJson, updateThrottledStreamingJson } from "../utils/streaming-json-throttle.js";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
@@ -682,6 +683,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			// Some providers via OpenRouter give additional information in this field.
 			const rawMetadata = (error as any)?.error?.metadata?.raw;
 			if (rawMetadata) output.errorMessage += `\n${rawMetadata}`;
+			// The session's "do not resend a permanent failure" gate reads this diagnostic
+			// only; without it a permanent 400 is retried like a transient outage.
+			recordStreamFailure(model, output, error);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
