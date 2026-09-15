@@ -168,3 +168,4 @@
 {"id": "GL-3", "date": "2026-09-15", "severity": "P3", "status": "fixing", "commit": null, "title": "深度界保根侧、flat 界保新侧，方向相反：10 万深单链的 snapshot 树不含活 leaf（leafId 另发部分缓解）", "verified_by": "GLM5.3 读码"}
 {"id": "GL-4", "date": "2026-09-15", "severity": "P3", "status": "fixing", "commit": null, "title": "redact 漏脱敏：session=/Cookie 与 'Token x' 自定义头；URL userinfo 连用户名一起洗（排障信息损失）", "verified_by": "GLM5.3 读码"}
 {"id": "GL-5", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "供应链两处可绕过：PRIME_AGENT_DOWNLOAD_BASE_URL 同时重定位 manifest 源与受信 origin 列表（一个 env 自拆全闸）；registry 车道（prime-agent@x）无 digest/origin 检查（npm 镜像/缓存即字节源）", "verified_by": "GLM5.3 打穿（r18/supply-chain @ d3945cb68 未合 HEAD）"}
+{"id": "GL-4-R", "date": "2026-09-15", "severity": "P3", "status": "note", "commit": null, "title": "裁决：不把脱敏扩到任意 *auth 头名（会误伤 `auth: true` 这类正常字段）；无方案名/无前缀的裸凭据值保持现状，作为已知边界写文档", "verified_by": "母席裁决（权衡：误报成本 > 边际泄露）"}
