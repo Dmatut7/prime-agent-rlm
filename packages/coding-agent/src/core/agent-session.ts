@@ -15334,15 +15334,17 @@ export class AgentSession {
 	 * `computeOwnAndTotalUsage(entries, entries)` is the same linear fold.
 	 */
 	private _ownUsageTotals(): { ownUsage: Usage; totalUsage: Usage } {
-		const entries = this.sessionManager.getEntries();
-		const tailId = entries.at(-1)?.id;
+		// O(1) hit check: the stats advance with each append, so a flush that added
+		// nothing compares two numbers instead of copying the whole transcript.
+		const { count, tailId } = this.sessionManager.getEntryStats();
 		const memo = this._ownUsageMemo;
-		if (memo && memo.count === entries.length && memo.tailId === tailId) {
+		if (memo && memo.count === count && memo.tailId === tailId) {
 			return { ownUsage: memo.ownUsage, totalUsage: memo.totalUsage };
 		}
+		const entries = this.sessionManager.getEntries();
 		this._ownUsageAccumulator ??= new OwnUsageAccumulator();
 		const { ownUsage, totalUsage } = this._ownUsageAccumulator.add(entries);
-		this._ownUsageMemo = { count: entries.length, tailId, ownUsage, totalUsage };
+		this._ownUsageMemo = { count, tailId, ownUsage, totalUsage };
 		return { ownUsage, totalUsage };
 	}
 
