@@ -109,7 +109,10 @@ describe("AgentSession.getSessionStats", () => {
 			syncAgentMessages(session, sessionManager);
 
 			const stats = session.getSessionStats();
-			expect(stats.tokens.input).toBe(195_000);
+			// Token totals are the session's spend over the whole transcript (every
+			// assistant turn, pre- and post-compaction), the same fold /context and the
+			// session rows use. The current context is reported separately below.
+			expect(stats.tokens.input).toBe(180_000 + 195_000);
 			expect(stats.contextUsage).toBeDefined();
 			expect(stats.contextUsage?.tokens).toBeNull();
 			expect(stats.contextUsage?.percent).toBeNull();
@@ -132,7 +135,9 @@ describe("AgentSession.getSessionStats", () => {
 			syncAgentMessages(session, sessionManager);
 
 			const stats = session.getSessionStats();
-			expect(stats.tokens.input).toBe(220_000);
+			// Whole-transcript spend again: compaction does not refund tokens already
+			// sent, but the model-facing context does follow the post-compaction usage.
+			expect(stats.tokens.input).toBe(180_000 + 195_000 + 25_000);
 			expect(stats.contextUsage).toBeDefined();
 			expect(stats.contextUsage?.tokens).toBe(25_000);
 			expect(stats.contextUsage?.percent).toBe((25_000 / model.contextWindow) * 100);

@@ -19,6 +19,7 @@ import { v7 as uuidv7 } from "uuid";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
 import {
 	endsWithNewlineSync,
+	FirstLineTooLongError,
 	isLineBoundarySync,
 	isUsableResumePoint,
 	readFileLines,
@@ -1104,11 +1105,23 @@ function rootRlmDepthFromEnv(): number {
 	return parsed;
 }
 
+/**
+ * A header that could not be read at all is not the same as a file that has no
+ * header: the first is a transcript this process is hiding from the listing and
+ * `-c`, the second is not a session. Only the first is worth a diagnostic.
+ */
+function noteUnreadableHeader(filePath: string, error: unknown): void {
+	if (error instanceof FirstLineTooLongError) {
+		noteTranscriptLineSkip(filePath, 0, error.message);
+	}
+}
+
 function isValidSessionFile(filePath: string): boolean {
 	try {
 		const header = readSessionHeader(filePath);
 		return header?.type === "session" && typeof header.id === "string" && SESSION_ID_PATTERN.test(header.id);
-	} catch {
+	} catch (error) {
+		noteUnreadableHeader(filePath, error);
 		return false;
 	}
 }
@@ -1158,7 +1171,8 @@ export function findMostRecentSessionForCwd(sessionDir: string, cwd: string): st
 						return undefined;
 					}
 					return { path, mtime: statSync(path).mtime };
-				} catch {
+				} catch (error) {
+					noteUnreadableHeader(path, error);
 					return undefined;
 				}
 			})

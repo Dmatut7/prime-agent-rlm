@@ -11,15 +11,53 @@ import {
 	statSync,
 } from "node:fs";
 
-export function readFirstLineSync(filePath: string, maxBytes = 64 * 1024): string | undefined {
+/**
+ * Hard ceiling on the first line a caller will materialize. A session header is
+ * one short line of metadata, so a first line this long is not a header; the
+ * read must not turn it into one by handing back a prefix.
+ */
+export const MAX_FIRST_LINE_BYTES = 1024 * 1024;
+
+/**
+ * Raised instead of returning the first `maxBytes` of a line that has no
+ * newline in them. A truncated prefix is not "the first line": a caller that
+ * parses it fails on a record that is intact on disk, and a caller that only
+ * checks the prefix reports "no session" for a file that has one.
+ */
+export class FirstLineTooLongError extends Error {
+	readonly filePath: string;
+	readonly maxBytes: number;
+
+	constructor(filePath: string, maxBytes: number) {
+		super(`first line of ${filePath} has no newline within ${maxBytes} bytes`);
+		this.name = "FirstLineTooLongError";
+		this.filePath = filePath;
+		this.maxBytes = maxBytes;
+	}
+}
+
+/**
+ * Read one complete physical line from the head of `filePath`.
+ *
+ * Returns the line without its terminator and without a trailing `\r`; an
+ * unterminated first line is returned as-is (the whole file is that line).
+ * Undefined means the file is empty. A first line longer than `maxBytes`
+ * throws {@link FirstLineTooLongError} rather than yielding a prefix of it.
+ */
+export function readFirstLineSync(filePath: string, maxBytes = MAX_FIRST_LINE_BYTES): string | undefined {
+	if (!(maxBytes > 0)) {
+		throw new RangeError("maxBytes must be positive");
+	}
 	const fd = openSync(filePath, "r");
 	const chunks: Buffer[] = [];
 	let position = 0;
 
 	try {
-		const buffer = Buffer.alloc(1024);
-		while (position < maxBytes) {
-			const bytesToRead = Math.min(buffer.length, maxBytes - position);
+		const buffer = Buffer.alloc(64 * 1024);
+		for (;;) {
+			// Read one byte past the ceiling so a line exactly `maxBytes` long, whose
+			// terminator is the next byte, is still returned instead of rejected.
+			const bytesToRead = Math.min(buffer.length, maxBytes + 1 - position);
 			const bytesRead = readSync(fd, buffer, 0, bytesToRead, position);
 			if (bytesRead === 0) {
 				break;
@@ -34,6 +72,9 @@ export function readFirstLineSync(filePath: string, maxBytes = 64 * 1024): strin
 
 			chunks.push(Buffer.from(chunk));
 			position += bytesRead;
+			if (position > maxBytes) {
+				throw new FirstLineTooLongError(filePath, maxBytes);
+			}
 		}
 	} finally {
 		closeSync(fd);

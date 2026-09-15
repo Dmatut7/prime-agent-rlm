@@ -61,17 +61,19 @@ function compactLabel(text: string, maxLength = 80): string {
 }
 
 /**
- * Usage totals for one agent: `totalUsage` sums the branch's assistant usage
- * (attributed aggregates, so descendants are included), `ownUsage` removes the
- * attributions targeting those assistants. Attribution entries are matched by
- * target across ALL entries, not just the branch: attributions rewrite the
- * target assistant's usage no matter which branch they were appended on, so a
- * fork that keeps the assistant but drops the attribution entry must still
- * subtract it.
+ * Usage totals for one agent: `totalUsage` sums the assistant usage of every
+ * entry (attributed aggregates, so descendants are included), `ownUsage`
+ * removes the attributions targeting those assistants.
  *
- * Totals are deliberately cumulative across compactions: compaction shrinks
- * the model-facing context, not what the session has spent, so assistants
- * dropped from the resolved context still count here.
+ * Callers that display spend pass the whole transcript as both arguments
+ * (`computeOwnAndTotalUsage(entries, entries)`), which is the persistent basis:
+ * the same fold `getOwnUsageSummary` and the on-disk catalog scan use, so a
+ * session's spend reads the same in `/context`, in the session rows, and on
+ * disk. That basis is deliberately cumulative across compactions AND across
+ * branches: compaction and rollback shrink the model-facing context, not what
+ * the session has spent, so entries dropped from the resolved context still
+ * count here. Passing a narrower entry list (a branch) measures the entries
+ * given, not the session, and is only for callers that want that subset.
  */
 /**
  * Incremental form of {@link computeOwnAndTotalUsage} for a session that keeps appending.
@@ -215,8 +217,11 @@ function sessionEntriesFromFile(file: string): SessionEntry[] {
 /**
  * Entries on the current branch, root to leaf, mirroring
  * SessionManager.getBranch(): the leaf is the last appended entry and the
- * branch is its parentId chain. Keeps forked/abandoned paths out of usage
- * sums so disk nodes match what a live session would report.
+ * branch is its parentId chain. This is what a disk node reports for
+ * model-facing quantities - the label, the model, and context utilization -
+ * because those describe the branch the session would resume on, not the whole
+ * file. Spend is not one of them: it is cumulative across branches, so it is
+ * folded over every entry (see {@link computeOwnAndTotalUsage}).
  */
 function branchEntries(entries: SessionEntry[]): SessionEntry[] {
 	if (entries.length === 0) {
@@ -321,7 +326,10 @@ export function loadContextTreeChildFromDisk(
 		return undefined;
 	}
 
-	const { ownUsage, totalUsage } = computeOwnAndTotalUsage(branch, allEntries);
+	// Spend over every entry, not just the branch: a disk node must report the same
+	// total the catalog scan and the session rows do, or the same session reads
+	// differently in `/context` and in the roster.
+	const { ownUsage, totalUsage } = computeOwnAndTotalUsage(allEntries, allEntries);
 
 	let model: { provider: string; id: string } | undefined;
 	for (const entry of branch) {

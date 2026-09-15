@@ -578,7 +578,7 @@ Response:
 }
 ```
 
-`tokens` contains assistant usage totals for the current session state. `contextUsage` contains the actual current context-window estimate used for compaction and footer display.
+`tokens` and `cost` are the session's spend: assistant usage plus compaction/branch-summary usage over every entry in the transcript, minus usage attributed to subagent children, so a compaction or a rollback cannot reduce them (`/context` and the session rows report the same totals). The message counts above them describe the current model-facing session state instead. `contextUsage` contains the actual current context-window estimate used for compaction and footer display.
 
 `contextUsage` is omitted when no model or context window is available. `contextUsage.tokens` and `contextUsage.percent` are `null` immediately after compaction until a fresh post-compaction assistant response provides valid usage data.
 

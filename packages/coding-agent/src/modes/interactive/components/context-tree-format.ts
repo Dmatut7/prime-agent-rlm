@@ -108,6 +108,12 @@ function sumOwnUsage(root: ContextTreeNode): Usage {
  * Render the /context overview: a tree with one row per agent showing its own
  * tokens and cost (descendants excluded, so columns add up) plus per-agent
  * context-window utilization, followed by grand totals.
+ *
+ * The two numeric columns measure different things and the note under the header
+ * says so: spend is the session's lifetime total over every entry in the
+ * transcript (the same fold the session rows and the on-disk catalog use, so a
+ * rollback cannot make already-paid work look unspent), while context is the
+ * active branch's model-facing utilization.
  */
 export function formatContextTree(root: ContextTreeNode, width: number): string {
 	const rows = flattenContextTree(root);
@@ -141,6 +147,7 @@ export function formatContextTree(root: ContextTreeNode, width: number): string 
 			`${" ".repeat(2)}${padEndAnsi("agent", labelWidth)}  ${padStartAnsi(tokenHeader, tokenWidth)}  ${padStartAnsi(costHeader, costWidth)}  ${contextHeader}`,
 		),
 	);
+	lines.push(theme.fg("dim", `${" ".repeat(2)}spend: whole session, every branch · context: current branch`));
 
 	for (const [index, row] of rows.entries()) {
 		const labelSpace = Math.max(1, labelWidth - row.prefix.length - 2);
