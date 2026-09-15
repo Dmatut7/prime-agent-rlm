@@ -82,9 +82,9 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 	{
 		path: ["doctor"],
 		usage: "doctor [--fix] [--json] [--dry-run] [--all | --socket <path> | --socket-dir <dir>] [--orphans]",
-		summary: "Inspect and safely clean up background services",
+		summary: "Run read-only health checks, and clean up background services with --fix",
 		description:
-			"--fix cleans only the services in scope, and the scope is the socket dir this shell talks to, never the whole machine. --dry-run prints the per-service plan without touching anything; --orphans refuses every service that still has live sessions, worker processes or cpu. Repeat with --all to widen to every daemon discovered on this machine.",
+			"Without --fix, doctor is strictly read-only: it prints the background service table plus health checks (stored auth credentials, kernel venv readiness, session transcript headers), each with a verdict and the next step to take. --fix cleans only the services in scope, and the scope is the socket dir this shell talks to, never the whole machine. --dry-run prints the per-service plan without touching anything; --orphans refuses every service that still has live sessions, worker processes or cpu. Repeat with --all to widen to every daemon discovered on this machine.",
 		options: [
 			"--fix           Remove stale sockets and stop idle services in scope",
 			"--dry-run       List each cleanup target without touching anything",

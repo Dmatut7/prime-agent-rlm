@@ -42,6 +42,7 @@ vi.mock("../src/cli/daemon-ps.js", () => ({
 	runPs: async (json: boolean) => {
 		mocks.psCalls.push(json);
 	},
+	discoverDaemons: async () => [],
 	runReap: async (json: boolean, force: boolean, selection: StopSelection, dryRun: boolean) => {
 		mocks.reapCalls.push([json, force, scopeKind(selection), dryRun]);
 	},
