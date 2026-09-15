@@ -47,7 +47,11 @@ describe("createAgentSessionFromServices", () => {
 		expect(services.diagnostics).toContainEqual(
 			expect.objectContaining({ type: "info", message: expect.stringContaining("pseudonymous usage") }),
 		);
-		expect(settingsManager.getTelemetryNoticeShown()).toBe(true);
+		// TEL-4: creating services offers the notice but must not spend the one-time
+		// flag, or whichever process ran first (daemon worker, `--print`) would
+		// consume the disclosure the interactive user is owed.
+		expect(services.telemetryNotice).toContain("pseudonymous usage");
+		expect(settingsManager.getTelemetryNoticeShown()).toBe(false);
 	});
 
 	it("honors an explicit daemon-carried telemetry opt-out", async () => {

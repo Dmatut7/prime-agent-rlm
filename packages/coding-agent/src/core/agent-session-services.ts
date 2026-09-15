@@ -42,6 +42,14 @@ export interface CreateAgentSessionServicesOptions {
 	 */
 	noBuiltinHerdrReporter?: boolean;
 	telemetryDisabled?: true;
+	/**
+	 * Stop watching `settings.json` for direct edits (CD-5). Watching is on by
+	 * default wherever a session is created, because "the session keeps reading
+	 * the file it loaded once" is the behaviour CD-5 reported; the watcher is
+	 * unref'ed, so it never holds a process open. Callers that own the settings
+	 * files themselves (tests writing them on purpose) can switch it off.
+	 */
+	watchSettingsFile?: boolean;
 }
 
 export interface AgentSessionCreationOptions {
@@ -90,6 +98,30 @@ export interface AgentSessionServices {
 	resourceLoader: ResourceLoader;
 	mcpManager: McpManager;
 	diagnostics: AgentSessionRuntimeDiagnostic[];
+	/**
+	 * The one-time telemetry disclosure, when this run owes the user one (TEL-4).
+	 *
+	 * It is a separate field rather than only a diagnostic because the disclosure
+	 * must be *shown* once, and the process that creates these services is not
+	 * always a process a human is looking at: a daemon worker or `--print` run
+	 * used to spend the one-time flag on a stderr line nobody saw, so the next
+	 * interactive start stayed silent. Only a caller that really puts the notice
+	 * in front of the user calls {@link markTelemetryNoticeShown}; everyone else
+	 * may print it as a diagnostic and leave the flag alone.
+	 */
+	telemetryNotice?: string;
+}
+
+/** The disclosure text, in one place: `services.telemetryNotice` and its diagnostic carry it. */
+export const TELEMETRY_NOTICE_MESSAGE =
+	"Prime Agent sends pseudonymous usage and performance metrics without prompts, responses, tool content, file paths, or repository data. Disable this with telemetry.enabled=false, PRIME_AGENT_TELEMETRY=0, DO_NOT_TRACK=1, or offline mode.";
+
+/**
+ * Record that the telemetry disclosure was shown to a human. Nothing else may
+ * call this: an unseen notice is not a shown notice (TEL-4).
+ */
+export function markTelemetryNoticeShown(settingsManager: SettingsManager): void {
+	settingsManager.setTelemetryNoticeShown(true);
 }
 
 function applyExtensionFlagValues(
@@ -180,18 +212,28 @@ export async function createAgentSessionServices(
 	});
 	await resourceLoader.reload();
 
+	// CD-5: a direct edit of settings.json used to be invisible to a running
+	// session until it was restarted. Watch the file so the edit is loaded into
+	// the session that is running, and record it so a UI can say so.
+	if (options.watchSettingsFile !== false) {
+		settingsManager.watchExternalSettings();
+	}
+
 	const diagnostics: AgentSessionRuntimeDiagnostic[] = [];
+	// TEL-4: build the notice, but do not spend the one-time flag here. This
+	// function runs in every process that needs services (interactive client,
+	// daemon worker, --print, RPC), and spending the flag in whichever ran first
+	// is how the disclosure ended up reaching nobody: the worker's stderr line
+	// consumed it before the user's terminal ever existed. The caller that can
+	// actually display it marks it shown via markTelemetryNoticeShown().
+	let telemetryNotice: string | undefined;
 	if (
 		!options.telemetryDisabled &&
 		isTelemetryEnabled(settingsManager) &&
 		!settingsManager.getTelemetryNoticeShown()
 	) {
-		diagnostics.push({
-			type: "info",
-			message:
-				"Prime Agent sends pseudonymous usage and performance metrics without prompts, responses, tool content, file paths, or repository data. Disable this with telemetry.enabled=false, PRIME_AGENT_TELEMETRY=0, DO_NOT_TRACK=1, or offline mode.",
-		});
-		settingsManager.setTelemetryNoticeShown(true);
+		telemetryNotice = TELEMETRY_NOTICE_MESSAGE;
+		diagnostics.push({ type: "info", message: telemetryNotice });
 	}
 	// A models.json that failed to load is visible in the interactive UI and in
 	// `model list`, but a print, RPC or daemon client sees only diagnostics: the failure
@@ -232,6 +274,7 @@ export async function createAgentSessionServices(
 		resourceLoader,
 		mcpManager,
 		diagnostics,
+		...(telemetryNotice === undefined ? {} : { telemetryNotice }),
 	};
 }
 

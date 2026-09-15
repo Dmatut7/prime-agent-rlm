@@ -1,5 +1,15 @@
 import type { ServiceTier, Transport } from "@earendil-works/pi-ai";
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "fs";
+import {
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	renameSync,
+	statSync,
+	unlinkSync,
+	unwatchFile,
+	watchFile,
+	writeFileSync,
+} from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
@@ -11,6 +21,13 @@ import type { ResolvedRetentionSettings } from "./retention/types.js";
 
 const RECENT_MODELS_LIMIT = 20;
 export const DEFAULT_IDLE_EVICTION_MINUTES = 90;
+
+/**
+ * Poll interval for noticing a direct edit of `settings.json` (CD-5). One second
+ * is fast enough that a hand edit lands while the user is still looking at the
+ * terminal, and cheap enough that two `stat` calls per second are invisible.
+ */
+export const DEFAULT_SETTINGS_WATCH_INTERVAL_MS = 1000;
 
 /** Abort a provider stream after this long without any events (0 = disabled). */
 export const DEFAULT_STREAM_STALL_TIMEOUT_MS = 300_000;
@@ -474,32 +491,61 @@ export interface TelemetrySettings {
 	noticeShown?: boolean;
 }
 
-/** Deep merge settings: project/overrides take precedence, nested objects merge recursively */
+/** A JSON object that merges key-by-key; arrays and nulls replace wholesale. */
+function isMergeableObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Merge one setting value: objects recurse, everything else replaces.
+ *
+ * CD-4: this used to stop at the first level, so a project file that set
+ * `retry.provider.maxRetries` silently dropped the global `retry.provider`
+ * keys it did not mention (`timeoutMs`, `maxRetryDelayMs`,
+ * `streamStallTimeoutMs`). Recursion is what makes the "nested objects merge"
+ * contract below true at any depth a settings block nests to.
+ */
+function mergeSettingValue(base: unknown, override: unknown): unknown {
+	if (!isMergeableObject(override)) {
+		return override;
+	}
+	if (!isMergeableObject(base)) {
+		return { ...override };
+	}
+	const merged: Record<string, unknown> = { ...base };
+	for (const key of Object.keys(override)) {
+		const value = override[key];
+		if (value === undefined) {
+			continue;
+		}
+		merged[key] = mergeSettingValue(merged[key], value);
+	}
+	return merged;
+}
+
+/**
+ * Deep merge settings: project/overrides take precedence, nested objects merge
+ * recursively, arrays and `null` replace wholesale.
+ *
+ * A name-keyed block (`mcpServers`: user-chosen names whose values are
+ * discriminated unions) is merged by name here like any other object, so a
+ * project entry that changes a server's `type` keeps the other shape's keys.
+ * That view is not read anywhere today - only `getGlobalMcpServers()` feeds the
+ * MCP manager (CD-follow-up: project-scope servers are ignored entirely) - so
+ * this is a documented property of the merge, not a live behaviour.
+ */
 function deepMergeSettings(base: Settings, overrides: Settings): Settings {
-	const result: Settings = { ...base };
+	const merged: Record<string, unknown> = { ...base };
 
 	for (const key of Object.keys(overrides) as (keyof Settings)[]) {
 		const overrideValue = overrides[key];
-		const baseValue = base[key];
-
 		if (overrideValue === undefined) {
 			continue;
 		}
-		if (
-			typeof overrideValue === "object" &&
-			overrideValue !== null &&
-			!Array.isArray(overrideValue) &&
-			typeof baseValue === "object" &&
-			baseValue !== null &&
-			!Array.isArray(baseValue)
-		) {
-			(result as Record<string, unknown>)[key] = { ...baseValue, ...overrideValue };
-		} else {
-			(result as Record<string, unknown>)[key] = overrideValue;
-		}
+		merged[key] = mergeSettingValue(merged[key], overrideValue);
 	}
 
-	return result;
+	return merged as Settings;
 }
 
 /**
@@ -667,6 +713,13 @@ export type SettingsScope = "global" | "project";
 
 export interface SettingsStorage {
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void;
+	/**
+	 * On-disk path of a scope's settings file, when the backend has one. Only a
+	 * file-backed store can be watched for external edits (CD-5); an in-memory
+	 * store answers `undefined` and `watchExternalSettings` reports that it cannot
+	 * watch rather than pretending it does.
+	 */
+	settingsFilePath?(scope: SettingsScope): string | undefined;
 }
 
 export interface SettingsError {
@@ -691,6 +744,10 @@ export class FileSettingsStorage implements SettingsStorage {
 	constructor(cwd: string, agentDir: string) {
 		this.globalSettingsPath = join(agentDir, "settings.json");
 		this.projectSettingsPath = join(cwd, CONFIG_DIR_NAME, "settings.json");
+	}
+
+	settingsFilePath(scope: SettingsScope): string {
+		return scope === "global" ? this.globalSettingsPath : this.projectSettingsPath;
 	}
 
 	private acquireLockSyncWithRetry(path: string): () => void {
@@ -799,6 +856,13 @@ export class SettingsManager {
 	private warnings: SettingsWarning[] = [];
 	/** Warning identities already reported, so a repeated read/load reports once. */
 	private reportedWarnings = new Set<string>();
+	/**
+	 * Last-seen on-disk identity of each settings file, so a watcher wake-up only
+	 * counts as an external edit when the file really changed (CD-5).
+	 */
+	private loadedStamps = new Map<SettingsScope, string>();
+	private externalWatchers: Array<{ path: string; listener: () => void }> = [];
+	private externalEditReload: Promise<void> | undefined;
 
 	private constructor(
 		storage: SettingsStorage,
@@ -845,6 +909,7 @@ export class SettingsManager {
 		);
 		manager.reportUnknownSettingsKeys("global", manager.globalSettings);
 		manager.reportUnknownSettingsKeys("project", manager.projectSettings);
+		manager.captureSettingsStamps();
 		return manager;
 	}
 
@@ -988,6 +1053,107 @@ export class SettingsManager {
 		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
 		this.reportUnknownSettingsKeys("global", this.globalSettings);
 		this.reportUnknownSettingsKeys("project", this.projectSettings);
+		this.captureSettingsStamps();
+	}
+
+	/**
+	 * On-disk identity of one settings file, or undefined when it does not exist.
+	 * `ino` is part of it because the writer replaces the file by rename: a new
+	 * inode with the same size and millisecond mtime is still a different file.
+	 */
+	private settingsStamp(scope: SettingsScope): string | undefined {
+		const path = this.storage.settingsFilePath?.(scope);
+		if (path === undefined) return undefined;
+		try {
+			const info = statSync(path);
+			return `${info.ino}:${info.mtimeMs}:${info.size}`;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/** Remember what the settings files look like right now (after a load or our own write). */
+	private captureSettingsStamps(): void {
+		for (const scope of ["global", "project"] as SettingsScope[]) {
+			const stamp = this.settingsStamp(scope);
+			if (stamp === undefined) {
+				this.loadedStamps.delete(scope);
+			} else {
+				this.loadedStamps.set(scope, stamp);
+			}
+		}
+	}
+
+	/**
+	 * Watch both settings files for direct edits and reload them into the running
+	 * session (CD-5). Without this, editing `settings.json` by hand had no effect
+	 * on a live session and said nothing about it: the manager loaded the file once
+	 * and kept that snapshot forever.
+	 *
+	 * Polling (`watchFile`) rather than `watch` because the settings file is
+	 * replaced by rename, and a polling watcher keeps working across the inode
+	 * change. The watcher is unref'ed, so it never holds the process open.
+	 *
+	 * Returns false when the storage backend has no settings file to watch, which
+	 * is the honest answer for an in-memory store.
+	 */
+	watchExternalSettings(options: { intervalMs?: number } = {}): boolean {
+		if (this.externalWatchers.length > 0) return true;
+		const globalPath = this.storage.settingsFilePath?.("global");
+		const projectPath = this.storage.settingsFilePath?.("project");
+		if (globalPath === undefined || projectPath === undefined) return false;
+		this.captureSettingsStamps();
+		const intervalMs = options.intervalMs ?? DEFAULT_SETTINGS_WATCH_INTERVAL_MS;
+		for (const [scope, path] of [
+			["global", globalPath],
+			["project", projectPath],
+		] as Array<[SettingsScope, string]>) {
+			const listener = (): void => {
+				const stamp = this.settingsStamp(scope);
+				if (stamp === this.loadedStamps.get(scope)) {
+					// Our own write, a missing file that is still missing, or a touch that
+					// did not change what we loaded: nothing to reload and nothing to say.
+					return;
+				}
+				this.reloadExternalEdit(scope, stamp);
+			};
+			const watcher = watchFile(path, { interval: intervalMs }, listener);
+			watcher.unref();
+			this.externalWatchers.push({ path, listener });
+		}
+		return true;
+	}
+
+	/** Stop watching for external settings edits. Safe to call when not watching. */
+	stopWatchingExternalSettings(): void {
+		for (const { path, listener } of this.externalWatchers) {
+			unwatchFile(path, listener);
+		}
+		this.externalWatchers = [];
+	}
+
+	/**
+	 * Reload after a direct edit and record a user-visible warning. The reload is
+	 * serialized so two quick edits cannot interleave their loads, and the warning
+	 * identity carries the new stamp, so a second edit is reported again instead of
+	 * being swallowed by the once-per-identity dedup.
+	 */
+	private reloadExternalEdit(scope: SettingsScope, stamp: string | undefined): void {
+		const previous = this.externalEditReload ?? Promise.resolve();
+		this.externalEditReload = previous
+			.then(async () => {
+				await this.reload();
+				this.recordWarning(
+					scope,
+					`external-edit:${scope}:${stamp ?? "removed"}`,
+					"settings.json changed on disk while the session was running: it was reloaded into this session. " +
+						"Settings already read earlier in the session (theme, tool or resource lists, model defaults) still " +
+						"need /reload or a restart to change.",
+				);
+			})
+			.catch((error) => {
+				this.recordError(scope, error);
+			});
 	}
 
 	/** Apply additional overrides on top of current settings */
@@ -1109,6 +1275,9 @@ export class SettingsManager {
 
 			return JSON.stringify(mergedSettings, null, 2);
 		});
+		// The write just replaced the file by rename; remember the new identity so
+		// the watcher does not misread our own write as an external edit.
+		this.captureSettingsStamps();
 	}
 
 	private save(): void {

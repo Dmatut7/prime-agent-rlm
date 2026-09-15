@@ -164,7 +164,7 @@ Type `/` in the editor to trigger commands. [Extensions](#extensions) can regist
 | `/btw <question>`, `/side <question>` | Ask an inline side question without adding it to the session; replies continue the side conversation, esc returns |
 | `/export [file]` | Export session to HTML file |
 | `/share` | Upload the full session (messages, system prompt, tools) as a private GitHub gist |
-| `/reload` | Reload keybindings, extensions, skills, prompts, and context files (themes hot-reload automatically) |
+| `/reload` | Reload keybindings, extensions, skills, prompts, and context files (themes hot-reload automatically). `settings.json` edits are picked up live within a second; values the session read once at startup still need this command |
 | `/hotkeys` | Show all keyboard shortcuts |
 | `/changelog` | Display version history |
 | `/quit` | Quit Prime Agent |
@@ -253,6 +253,8 @@ Use `/settings` to modify common options, or edit JSON files directly:
 |----------|-------|
 | `~/.prime/agent/settings.json` | Global (all projects) |
 | `.prime/agent/settings.json` | Project (overrides global) |
+
+Editing either file by hand reaches a running session: it is reloaded within about a second and the change is recorded as a settings warning. Values the session read once when it started (theme, tool and resource lists, model defaults) still need `/reload` or a restart. Nested blocks merge key by key, so a project file may set one key of a nested block without dropping the global keys around it; arrays are replaced whole.
 
 See [docs/settings.md](docs/settings.md) for all options.
 
