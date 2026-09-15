@@ -9,8 +9,11 @@ on:
     branches: [main]
 
 concurrency:
+  # Runs are never cancelled: a cancelled run paints the commit list orange and hides
+  # whether the revision was ever verified end to end. Superseded pushes simply queue.
+  # The repository is public, so extra minutes cost nothing.
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
