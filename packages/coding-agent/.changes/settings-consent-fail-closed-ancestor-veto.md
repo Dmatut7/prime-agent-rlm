@@ -1,0 +1,4 @@
+- Fixed a settings.json that stopped parsing keeping agent-traces and telemetry consent at their last successful value: an unparseable scope now fails the consent gates closed, and a broken external edit is reported as not applied instead of claimed reloaded.
+- Fixed project-level settings (including agent-traces and telemetry vetoes) being ignored when a session starts in a subdirectory of the repository root; project settings are now collected from the repository root down, with any explicit opt-out vetoing.
+- Fixed a manual settings.json edit silently dropping CLI/SDK runtime overrides from the merged settings view after a reload.
+- Fixed session disposal leaking the settings.json file watchers, so a long-lived daemon no longer accumulates two watchers per session.

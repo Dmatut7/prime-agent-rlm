@@ -93,6 +93,14 @@ export interface AgentSessionServices {
 	cwd: string;
 	agentDir: string;
 	authStorage: AuthStorage;
+	/**
+	 * True when {@link createAgentSessionServices} created the settings manager
+	 * itself (no `settingsManager` was passed in). Only then is the session the
+	 * manager's owner: disposing the session also stops the external-settings
+	 * watcher this call started (SEC-10). A caller that passes its own manager
+	 * keeps ownership of its watch lifetime.
+	 */
+	ownsSettingsManager: boolean;
 	settingsManager: SettingsManager;
 	modelRegistry: ModelRegistry;
 	resourceLoader: ResourceLoader;
@@ -178,6 +186,7 @@ export async function createAgentSessionServices(
 	const cwd = options.cwd;
 	const agentDir = options.agentDir ?? getAgentDir();
 	const authStorage = options.authStorage ?? AuthStorage.create(join(agentDir, "auth.json"));
+	const ownsSettingsManager = options.settingsManager === undefined;
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
 	const modelRegistry = options.modelRegistry ?? ModelRegistry.create(authStorage, join(agentDir, "models.json"));
 
@@ -269,6 +278,7 @@ export async function createAgentSessionServices(
 		cwd,
 		agentDir,
 		authStorage,
+		ownsSettingsManager,
 		settingsManager,
 		modelRegistry,
 		resourceLoader,
@@ -330,6 +340,16 @@ export async function createAgentSessionFromServices(
 		serializedRefine: options.serializedRefine,
 		initialGoal: options.initialGoal,
 	});
+	// SEC-10: a session that owns its settings manager must not leave the
+	// external-settings watcher `createAgentSessionServices` started alive after
+	// disposal: a long-lived daemon holding N sessions kept two `watchFile`
+	// listeners per session forever. A caller that passed its own manager in
+	// owns the watch lifetime and is not touched here.
+	if (options.services.ownsSettingsManager) {
+		result.session.registerDisposeCallback(() => {
+			options.services.settingsManager.stopWatchingExternalSettings();
+		});
+	}
 	if (result.session.rlmDepth === 0 && !options.telemetryDisabled) {
 		installAgentTelemetry(result.session, {
 			agentDir: options.services.agentDir,

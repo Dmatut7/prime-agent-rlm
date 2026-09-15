@@ -11,7 +11,7 @@ import {
 	writeFileSync,
 } from "fs";
 import { homedir } from "os";
-import { dirname, join } from "path";
+import { dirname, join, resolve } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
 import { sleepSync } from "../utils/sleep.js";
@@ -549,6 +549,39 @@ function deepMergeSettings(base: Settings, overrides: Settings): Settings {
 }
 
 /**
+ * Consent blocks whose `enabled: false` is a veto inside the collected project
+ * scope (SEC-8): the project layer can only withhold consent, never supply it,
+ * so no subdirectory may re-enable what an ancestor file withdrew.
+ */
+const PROJECT_CONSENT_VETO_KEYS: ReadonlyArray<readonly [string, string]> = [
+	["agentTraces", "enabled"],
+	["telemetry", "enabled"],
+];
+
+/**
+ * Enforce the project consent veto over the closest-wins merge: if any
+ * collected project file (ancestor or the session directory's own) explicitly
+ * disables one of the consent blocks, the merged project scope says disabled.
+ */
+function applyProjectConsentVeto(merged: Record<string, unknown>, files: Settings[]): void {
+	for (const [blockName, key] of PROJECT_CONSENT_VETO_KEYS) {
+		const vetoed = files.some((file) => {
+			const block = (file as Record<string, unknown>)[blockName];
+			return typeof block === "object" && block !== null && (block as Record<string, unknown>)[key] === false;
+		});
+		if (!vetoed) {
+			continue;
+		}
+		const block = merged[blockName];
+		if (typeof block === "object" && block !== null && !Array.isArray(block)) {
+			(block as Record<string, unknown>)[key] = false;
+		} else {
+			merged[blockName] = { [key]: false };
+		}
+	}
+}
+
+/**
  * Every key `Settings` understands (CD-3): the top level is the `Settings`
  * interface verbatim, and a nested entry lists the keys of that block's
  * interface when the block has a closed shape. `null` marks a free-form block
@@ -720,6 +753,14 @@ export interface SettingsStorage {
 	 * watch rather than pretending it does.
 	 */
 	settingsFilePath?(scope: SettingsScope): string | undefined;
+	/**
+	 * Project-scope settings files above the session directory, ordered
+	 * root-most first (SEC-8). A project settings file used to apply only at the
+	 * exact cwd, so a repository-level veto was silently skipped for sessions
+	 * started in a subdirectory; the project scope now also reads these files.
+	 * Only the settings file at the session cwd is written or watched.
+	 */
+	projectAncestorSettingsFilePaths?(): string[];
 }
 
 export interface SettingsError {
@@ -737,17 +778,79 @@ export interface SettingsWarning {
 	message: string;
 }
 
+/**
+ * Find the root of the git repository containing `startDir`, or null outside
+ * any repository. Mirrors the skills loader's bound (`collectAncestorAgentsSkillDirs`
+ * in package-manager.ts); kept local here because settings-manager must not
+ * import package-manager (which imports this module).
+ */
+function findSettingsGitRepoRoot(startDir: string): string | null {
+	let dir = resolve(startDir);
+	while (true) {
+		if (existsSync(join(dir, ".git"))) {
+			return dir;
+		}
+		const parent = dirname(dir);
+		if (parent === dir) {
+			return null;
+		}
+		dir = parent;
+	}
+}
+
+/**
+ * Project settings files in the directories above the session cwd, ordered
+ * root-most first (SEC-8). The walk stops at the git repository root, so a
+ * settings file above the repository does not project into it, and matches the
+ * skills-loader precedent of walking to the filesystem root outside any
+ * repository. The global settings path is excluded: the user-level file is the
+ * global scope, never a second project veto. The session directory itself is
+ * not included - its file is the primary project scope.
+ */
+function collectProjectAncestorSettingsPaths(cwd: string, globalSettingsPath: string): string[] {
+	const resolved = resolve(cwd);
+	const gitRepoRoot = findSettingsGitRepoRoot(resolved);
+	if (gitRepoRoot === resolved) {
+		// The session sits at the repository root: its own file is the primary
+		// project scope and nothing above the repository may project into it.
+		return [];
+	}
+	const paths: string[] = [];
+	let dir = dirname(resolved);
+	while (true) {
+		const path = join(dir, CONFIG_DIR_NAME, "settings.json");
+		if (resolve(path) !== resolve(globalSettingsPath)) {
+			paths.push(path);
+		}
+		if (gitRepoRoot !== null && dir === gitRepoRoot) {
+			break;
+		}
+		const parent = dirname(dir);
+		if (parent === dir) {
+			break;
+		}
+		dir = parent;
+	}
+	return paths.reverse();
+}
+
 export class FileSettingsStorage implements SettingsStorage {
 	private globalSettingsPath: string;
 	private projectSettingsPath: string;
+	private projectAncestorSettingsPaths: string[];
 
 	constructor(cwd: string, agentDir: string) {
 		this.globalSettingsPath = join(agentDir, "settings.json");
 		this.projectSettingsPath = join(cwd, CONFIG_DIR_NAME, "settings.json");
+		this.projectAncestorSettingsPaths = collectProjectAncestorSettingsPaths(cwd, this.globalSettingsPath);
 	}
 
 	settingsFilePath(scope: SettingsScope): string {
 		return scope === "global" ? this.globalSettingsPath : this.projectSettingsPath;
+	}
+
+	projectAncestorSettingsFilePaths(): string[] {
+		return [...this.projectAncestorSettingsPaths];
 	}
 
 	private acquireLockSyncWithRetry(path: string): () => void {
@@ -928,11 +1031,48 @@ export class SettingsManager {
 			return undefined;
 		});
 
-		if (!content) {
-			return {};
+		const primary: Settings = content ? SettingsManager.migrateSettings(JSON.parse(content)) : {};
+		if (scope !== "project") {
+			return primary;
 		}
-		const settings = JSON.parse(content);
-		return SettingsManager.migrateSettings(settings);
+
+		// SEC-8: the project scope also reads the settings files above the session
+		// directory (up to the repository root). Root-most first, then the session
+		// directory itself last: the closest file wins. A file that fails to parse
+		// makes the whole project load fail, so the reload keeps the previous
+		// snapshot and the load error fails the consent gates closed (SEC-7).
+		const ancestorPaths = storage.projectAncestorSettingsFilePaths?.() ?? [];
+		if (ancestorPaths.length === 0) {
+			return primary;
+		}
+		const ancestors: Settings[] = [];
+		for (const path of ancestorPaths) {
+			let raw: string;
+			try {
+				raw = readFileSync(path, "utf-8");
+			} catch (error) {
+				// An ancestor without a settings file simply does not speak; any
+				// other read failure (a file that exists but cannot be read, a
+				// directory in the way) leaves the project scope unverifiable and
+				// propagates so the load fails closed.
+				const code =
+					typeof error === "object" && error !== null && "code" in error
+						? String((error as { code?: unknown }).code)
+						: undefined;
+				if (code === "ENOENT") {
+					continue;
+				}
+				throw error;
+			}
+			ancestors.push(SettingsManager.migrateSettings(JSON.parse(raw)));
+		}
+		let merged: Settings = {};
+		for (const ancestor of ancestors) {
+			merged = deepMergeSettings(merged, ancestor);
+		}
+		merged = deepMergeSettings(merged, primary);
+		applyProjectConsentVeto(merged as Record<string, unknown>, [...ancestors, primary] as Settings[]);
+		return merged;
 	}
 
 	private static tryLoadFromStorage(
@@ -1050,7 +1190,14 @@ export class SettingsManager {
 			this.recordError("project", projectLoad.error);
 		}
 
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		// SEC-9: the merged view is files-with-overrides. Recomputing it from the
+		// two scopes alone silently rolled back every runtime override a CLI flag
+		// or SDK caller had applied, so one external edit of settings.json
+		// dropped them from view until the next applyOverrides call.
+		this.settings = deepMergeSettings(
+			deepMergeSettings(this.globalSettings, this.projectSettings),
+			this.runtimeOverrides,
+		);
 		this.reportUnknownSettingsKeys("global", this.globalSettings);
 		this.reportUnknownSettingsKeys("project", this.projectSettings);
 		this.captureSettingsStamps();
@@ -1124,6 +1271,11 @@ export class SettingsManager {
 		return true;
 	}
 
+	/** Whether external-settings edits are currently being watched. */
+	isWatchingExternalSettings(): boolean {
+		return this.externalWatchers.length > 0;
+	}
+
 	/** Stop watching for external settings edits. Safe to call when not watching. */
 	stopWatchingExternalSettings(): void {
 		for (const { path, listener } of this.externalWatchers) {
@@ -1143,6 +1295,23 @@ export class SettingsManager {
 		this.externalEditReload = previous
 			.then(async () => {
 				await this.reload();
+				const loadError = scope === "global" ? this.globalSettingsLoadError : this.projectSettingsLoadError;
+				if (loadError) {
+					// SEC-7: the edited file failed to parse, so the edit did NOT take
+					// effect - the previous content is still loaded, and the consent
+					// gates treat the unparseable scope as withdrawn. Reporting this
+					// as "reloaded into this session" would tell the user a broken
+					// hand edit had landed when it had not.
+					this.recordWarning(
+						scope,
+						`external-edit-parse-error:${scope}:${stamp ?? "removed"}`,
+						"settings.json changed on disk while the session was running, but it failed to parse: " +
+							"the change was not applied and the previously loaded settings are still in effect. " +
+							"Consent gates (agent traces, telemetry) treat the unparseable scope as withdrawn " +
+							`until the file parses again. Parse error: ${loadError.message}`,
+					);
+					return;
+				}
 				this.recordWarning(
 					scope,
 					`external-edit:${scope}:${stamp ?? "removed"}`,
@@ -1536,10 +1705,16 @@ export class SettingsManager {
 	 * travels with a cloned repository rather than with the user: it may withhold
 	 * consent but never supply it, mirroring the telemetry gate. The user opts in
 	 * through the global scope only.
+	 *
+	 * Consent fails closed (SEC-7): a scope whose file cannot be parsed is a scope
+	 * whose consent cannot be verified, so a broken file after the user revoked
+	 * consent leaves the gate off instead of keeping the last successful value.
 	 */
 	getAgentTracesEnabled(): boolean {
-		const globalEnabled = this.globalSettings.agentTraces?.enabled ?? false;
-		const projectEnabled = this.projectSettings.agentTraces?.enabled ?? true;
+		const globalEnabled =
+			this.globalSettingsLoadError === null && (this.globalSettings.agentTraces?.enabled ?? false);
+		const projectEnabled =
+			this.projectSettingsLoadError === null && (this.projectSettings.agentTraces?.enabled ?? true);
 		const runtimeEnabled = this.runtimeOverrides.agentTraces?.enabled ?? true;
 		return globalEnabled && projectEnabled && runtimeEnabled;
 	}
@@ -1553,9 +1728,15 @@ export class SettingsManager {
 		this.save();
 	}
 
+	/**
+	 * Telemetry is opt-out rather than opt-in, but the privacy direction is the
+	 * same as the traces gate: when a scope's file cannot be parsed, its opt-out
+	 * status cannot be verified and telemetry stays off (SEC-7 fail-closed).
+	 */
 	getTelemetryEnabled(): boolean {
-		const globalEnabled = this.globalSettings.telemetry?.enabled ?? true;
-		const projectEnabled = this.projectSettings.telemetry?.enabled ?? true;
+		const globalEnabled = this.globalSettingsLoadError === null && (this.globalSettings.telemetry?.enabled ?? true);
+		const projectEnabled =
+			this.projectSettingsLoadError === null && (this.projectSettings.telemetry?.enabled ?? true);
 		const runtimeEnabled = this.runtimeOverrides.telemetry?.enabled ?? true;
 		return globalEnabled && projectEnabled && runtimeEnabled;
 	}
