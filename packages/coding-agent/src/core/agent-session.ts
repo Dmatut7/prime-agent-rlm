@@ -1208,7 +1208,69 @@ interface RlmChildRun {
 	reportDeletionCleanupFailure?: (error: unknown) => Promise<void>;
 	emitUpdate?: () => void;
 	lastEmittedUpdate?: string;
+	/**
+	 * Cached rlmChildLabel(prompt): the prompt is a run-level constant, and the
+	 * snapshot builder used to re-regex the whole brief on every streaming chunk.
+	 */
+	label?: string;
+	/**
+	 * Incremental preview accumulator for the child's in-flight assistant message.
+	 * Keeps the per-chunk preview work O(delta) instead of O(text so far).
+	 */
+	streamPreview?: RlmChildStreamPreview;
+	/**
+	 * Volatile snapshot fields as last emitted, for the cheap unchanged check that
+	 * keeps streaming chunks off the snapshot build and JSON.stringify.
+	 */
+	lastEmittedFields?: RlmChildEmitFields;
 	unsubscribe?: () => void;
+}
+
+/**
+ * The fields of {@link RlmChildAgentSnapshot} that can change while a run is live.
+ * Equal fields (with reference equality for the model and stall objects) imply an
+ * identical serialization, so an update whose fields all match the last emission
+ * cannot carry anything new on the wire.
+ */
+interface RlmChildEmitFields {
+	model: Model<Api> | undefined;
+	sessionName: string | undefined;
+	status: RlmChildAgentStatus;
+	durationMs: number | undefined;
+	answerPreview: string | undefined;
+	toolUseCount: number | undefined;
+	tokenCount: number | undefined;
+	recap: string | undefined;
+	activityKind: RlmChildAgentActivity["kind"] | undefined;
+	activityToolName: string | undefined;
+	repliedSinceTask: boolean | undefined;
+	error: string | undefined;
+	stall: RlmChildStallState | undefined;
+}
+
+/**
+ * Reference/strict equality over {@link RlmChildEmitFields}: every field is either a
+ * primitive, an immutable model record, or an object that is replaced (never mutated
+ * in place) when it changes. Equal fields serialize identically, so an update whose
+ * fields all match the last emission cannot carry anything new on the wire.
+ */
+function rlmChildEmitFieldsEqual(fields: RlmChildEmitFields, last: RlmChildEmitFields | undefined): boolean {
+	if (last === undefined) return false;
+	return (
+		fields.model === last.model &&
+		fields.sessionName === last.sessionName &&
+		fields.status === last.status &&
+		fields.durationMs === last.durationMs &&
+		fields.answerPreview === last.answerPreview &&
+		fields.toolUseCount === last.toolUseCount &&
+		fields.tokenCount === last.tokenCount &&
+		fields.recap === last.recap &&
+		fields.activityKind === last.activityKind &&
+		fields.activityToolName === last.activityToolName &&
+		fields.repliedSinceTask === last.repliedSinceTask &&
+		fields.error === last.error &&
+		fields.stall === last.stall
+	);
 }
 
 interface RetainedRlmChild {
@@ -1410,6 +1472,80 @@ export function compactRlmText(text: string, maxLength = 160): string {
 // would only hide the divergence between near-identical sibling prompts.
 export function rlmChildLabel(prompt: string): string {
 	return prompt.replace(/\s+/g, " ").trim() || "child agent";
+}
+
+/**
+ * Incremental counterpart of {@link compactRlmText} for a streaming assistant
+ * message. The preview only depends on the first ~maxLength collapsed characters, so
+ * the window stays bounded and freezes once the cap is crossed; new text is folded in
+ * by tracking how much of each text block has been consumed, which keeps the per-chunk
+ * work at O(new characters + block count) instead of a full join and regex per chunk.
+ * String lengths are O(1) in V8, so the tracking itself never touches the old text.
+ * A block structure the length tracking cannot describe (a block shrinking, the text
+ * count dropping) pays one exact full-text pass instead.
+ *
+ * At every point the folded text equals readAssistantText(message) as it stood at the
+ * last update, so `update()` returns exactly `compactRlmText(textSoFar, maxLength)`.
+ */
+class RlmChildStreamPreview {
+	/** Consumed length per text block, aligned with the message's text-block order. */
+	private foldedTextBlockLengths: number[] = [];
+	private buf = "";
+	private cappedResult: string | undefined;
+
+	constructor(private readonly maxLength: number = 160) {}
+
+	/** Fold the message's new text in and return the compacted preview. */
+	update(message: AssistantMessage): string {
+		const lengths: number[] = [];
+		const deltas: string[] = [];
+		let structural = false;
+		for (const block of message.content) {
+			if (block.type !== "text") continue;
+			const consumed = this.foldedTextBlockLengths[lengths.length] ?? 0;
+			if (block.text.length < consumed) {
+				structural = true;
+				break;
+			}
+			if (block.text.length > consumed) deltas.push(block.text.slice(consumed));
+			lengths.push(block.text.length);
+		}
+		if (structural || lengths.length < this.foldedTextBlockLengths.length) {
+			this.foldedTextBlockLengths = message.content
+				.filter((block) => block.type === "text")
+				.map((block) => (block.type === "text" ? block.text.length : 0));
+			this.buf = readAssistantText(message).replace(/\s+/g, " ");
+			this.cappedResult = undefined;
+			this.applyCap();
+			return this.preview();
+		}
+		this.foldedTextBlockLengths = lengths;
+		if (this.cappedResult === undefined) {
+			for (const delta of deltas) {
+				if (delta.length === 0) continue;
+				// The window may carry one trailing space so a delta that opens with
+				// whitespace collapses against it, exactly like the full-text regex would.
+				this.buf = `${this.buf}${delta}`.replace(/\s+/g, " ");
+				this.applyCap();
+				if (this.cappedResult !== undefined) break;
+			}
+		}
+		return this.preview();
+	}
+
+	preview(): string {
+		return this.cappedResult ?? this.buf.trim();
+	}
+
+	private applyCap(): void {
+		// Same cap decision as compactRlmText: it caps on the trimmed length, so the
+		// window's optional trailing space must not tip a text under the cap over it.
+		const trimmed = this.buf.trim();
+		if (trimmed.length > this.maxLength) {
+			this.cappedResult = `${trimmed.slice(0, Math.max(0, this.maxLength - 3)).trimEnd()}...`;
+			this.buf = "";
+		}
+	}
 }
 
 function readAssistantText(message: AssistantMessage): string {
@@ -13512,12 +13648,15 @@ export class AgentSession {
 		child = run.session ?? this._rlmChildSessions.get(run.id)?.session,
 	): RlmChildAgentSnapshot {
 		const model = child?.model ?? run.model;
+		// The brief is a run-level constant; re-regexing it per streaming chunk
+		// was pure per-chunk CPU on a string that never changes.
+		run.label ??= rlmChildLabel(run.prompt);
 		return {
 			id: run.id,
 			parentId: this._rlmParentNodeId,
 			sessionName: child?.sessionName ?? run.sessionName,
 			model: `${model.provider}/${model.id}`,
-			label: rlmChildLabel(run.prompt),
+			label: run.label,
 			status: run.status,
 			durationMs: run.durationMs,
 			answerPreview: run.answerPreview,
@@ -13526,6 +13665,40 @@ export class AgentSession {
 			recap: child?.getCurrentRecap(),
 			sessionDir: run.sessionDir,
 			activity: run.activity,
+			repliedSinceTask: child?._repliedToParentSinceTask,
+			error: run.error,
+			stall: run.stall,
+		};
+	}
+
+	/**
+	 * Streaming preview for a child's in-flight assistant message. The chunk handler
+	 * used to re-join and re-regex the whole message text per chunk - O(text so far)
+	 * per chunk, O(text^2) over a long answer - while the preview only depends on the
+	 * first collapsed characters; the incremental accumulator folds just the new text.
+	 */
+	private _rlmChildStreamingPreviewText(
+		run: RlmChildRun,
+		event: Extract<AgentSessionEvent, { type: "message_start" | "message_update" }>,
+	): string {
+		run.streamPreview ??= new RlmChildStreamPreview();
+		const preview = run.streamPreview;
+		return preview.update(event.message as AssistantMessage);
+	}
+
+	/** The volatile snapshot fields as they stand right now. */
+	private _rlmChildEmitFields(run: RlmChildRun, child: AgentSession | undefined): RlmChildEmitFields {
+		return {
+			model: child?.model ?? run.model,
+			sessionName: child?.sessionName ?? run.sessionName,
+			status: run.status,
+			durationMs: run.durationMs,
+			answerPreview: run.answerPreview,
+			toolUseCount: run.toolUseCount > 0 ? run.toolUseCount : undefined,
+			tokenCount: child?._contextTokensForCurrentMessages(),
+			recap: child?.getCurrentRecap(),
+			activityKind: run.activity?.kind,
+			activityToolName: run.activity?.toolName,
 			repliedSinceTask: child?._repliedToParentSinceTask,
 			error: run.error,
 			stall: run.stall,
@@ -14022,11 +14195,19 @@ export class AgentSession {
 			signal?.addEventListener("abort", abortFromHost, { once: true });
 		}
 		const emitChildUpdate = () => {
-			const child = this._rlmChildSnapshotForRun(run);
-			const serialized = JSON.stringify(child);
+			// Streaming chunks mostly change nothing the wire can see: the preview is
+			// capped after the first ~160 characters and the label is a run-level
+			// constant. Comparing the volatile fields first keeps the per-chunk cost
+			// off the snapshot build and the JSON.stringify of the full brief.
+			const child = run.session ?? this._rlmChildSessions.get(run.id)?.session;
+			const fields = this._rlmChildEmitFields(run, child);
+			if (rlmChildEmitFieldsEqual(fields, run.lastEmittedFields)) return;
+			const snapshot = this._rlmChildSnapshotForRun(run, child);
+			const serialized = JSON.stringify(snapshot);
+			run.lastEmittedFields = fields;
 			if (serialized === run.lastEmittedUpdate) return;
 			run.lastEmittedUpdate = serialized;
-			this._emit({ type: "rlm_child_update", child });
+			this._emit({ type: "rlm_child_update", child: snapshot });
 		};
 		run.emitUpdate = emitChildUpdate;
 		emitChildUpdate();
@@ -14187,7 +14368,7 @@ export class AgentSession {
 						emitChildUpdate();
 					} else if (event.type === "message_start" || event.type === "message_update") {
 						if (event.message.role === "assistant") {
-							const text = compactRlmText(readAssistantText(event.message as AssistantMessage));
+							const text = this._rlmChildStreamingPreviewText(run, event);
 							if (text) run.answerPreview = text;
 							run.activity = { kind: "writing" };
 							emitChildUpdate();
