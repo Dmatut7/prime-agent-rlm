@@ -34,7 +34,8 @@
     "release:minor": "node scripts/release.mjs minor",
     "release:major": "node scripts/release.mjs major",
     "prepare": "husky",
-    "preflight:push": "bash scripts/preflight-push.sh"
+    "preflight:push": "bash scripts/preflight-push.sh",
+    "merge:preflight": "bash scripts/merge-preflight.sh"
   },
   "devDependencies": {
     "@anthropic-ai/sandbox-runtime": "^0.0.55",
