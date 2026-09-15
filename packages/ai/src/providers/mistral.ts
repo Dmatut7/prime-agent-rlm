@@ -26,7 +26,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { shortHash } from "../utils/hash.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
-import { recordStreamFailure, streamFailureFromStopReason } from "../utils/stream-failure.js";
+import { recordStreamFailure, StreamFailureError, streamFailureFromStopReason } from "../utils/stream-failure.js";
 import { buildBaseOptions } from "./simple-options.js";
 import { transformMessages } from "./transform-messages.js";
 
@@ -273,6 +273,7 @@ async function consumeChatStream(
 	mistralStream: AsyncIterable<CompletionEvent>,
 ): Promise<void> {
 	let currentBlock: TextContent | ThinkingContent | null = null;
+	let sawFinishReason = false;
 	const blocks = output.content;
 	const blockIndex = () => blocks.length - 1;
 	const toolBlocksByKey = new Map<string, number>();
@@ -305,8 +306,12 @@ async function consumeChatStream(
 		output.responseId ||= chunk.id;
 
 		if (chunk.usage) {
-			output.usage.input = chunk.usage.promptTokens || 0;
-			output.usage.output = chunk.usage.completionTokens || 0;
+			// The SDK's inbound schema defaults missing usage fields to 0, so a
+			// partial late frame arrives as explicit zeros rather than undefined:
+			// only a positive value counts as reported when merging, otherwise the
+			// frame would zero out counts recorded from an earlier chunk.
+			output.usage.input = chunk.usage.promptTokens || output.usage.input;
+			output.usage.output = chunk.usage.completionTokens || output.usage.output;
 			output.usage.cacheRead = 0;
 			output.usage.cacheWrite = 0;
 			output.usage.totalTokens = chunk.usage.totalTokens || output.usage.input + output.usage.output;
@@ -317,6 +322,7 @@ async function consumeChatStream(
 		if (!choice) continue;
 
 		if (choice.finishReason) {
+			sawFinishReason = true;
 			output.stopReason = mapChatStopReason(choice.finishReason);
 			if (output.stopReason === "error") {
 				output.stopReasonRaw = choice.finishReason;
@@ -450,6 +456,14 @@ async function consumeChatStream(
 			contentIndex: index,
 			toolCall: toolBlock,
 			partial: output,
+		});
+	}
+
+	// A stream that ends without a finish reason was truncated upstream;
+	// reporting it as a normal stop would silently lose the tail.
+	if (!sawFinishReason) {
+		throw new StreamFailureError("Mistral stream ended before a finish reason", {
+			kind: "malformed_response",
 		});
 	}
 }

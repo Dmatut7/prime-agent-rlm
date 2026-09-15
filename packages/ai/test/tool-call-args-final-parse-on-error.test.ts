@@ -100,6 +100,7 @@ import { streamOpenAICompletions } from "../src/providers/openai-completions.js"
 import { processResponsesStream } from "../src/providers/openai-responses-shared.js";
 import type { AssistantMessage, Context, Model, ToolCall } from "../src/types.js";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.js";
+import { StreamFailureError } from "../src/utils/stream-failure.js";
 
 // Mid-stream parses are throttled by time and growth. Freezing Date keeps the
 // second argument delta inside the throttle window, so without the error-path
@@ -318,8 +319,17 @@ describe("final tool-argument parse on error paths", () => {
 			// Stream ends without arguments.done/output_item.done.
 		})();
 
-		await processResponsesStream(events, output, stream, model);
+		// A stalled stream with no terminal response event is a truncation: the
+		// shared stream now reports it instead of returning a normal stop, and the
+		// freshest arguments must still survive the failure path.
+		let thrown: unknown;
+		try {
+			await processResponsesStream(events, output, stream, model);
+		} catch (error) {
+			thrown = error;
+		}
 
+		expect(thrown).toBeInstanceOf(StreamFailureError);
 		expectFreshToolCallArguments(output.content);
 	});
 });

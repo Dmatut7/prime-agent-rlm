@@ -268,6 +268,42 @@ export function convertResponsesTools(tools: Tool[], options?: ConvertResponsesT
 	}));
 }
 
+type ResponsesUsageFrame = {
+	input_tokens?: number;
+	output_tokens?: number;
+	total_tokens?: number;
+	input_tokens_details?: { cached_tokens?: number };
+};
+
+/**
+ * Merge a new usage frame over the previously seen one. Fields the new frame
+ * leaves undefined keep the earlier value, so a partial late frame cannot zero
+ * out counts already recorded from an earlier terminal frame.
+ */
+function mergeResponsesUsage(
+	previous: ResponsesUsageFrame | undefined,
+	current: ResponsesUsageFrame,
+): ResponsesUsageFrame {
+	return {
+		input_tokens: current.input_tokens ?? previous?.input_tokens,
+		output_tokens: current.output_tokens ?? previous?.output_tokens,
+		total_tokens: current.total_tokens ?? previous?.total_tokens,
+		input_tokens_details: {
+			cached_tokens: current.input_tokens_details?.cached_tokens ?? previous?.input_tokens_details?.cached_tokens,
+		},
+	};
+}
+
+/**
+ * Map incomplete_details.reason: max_output_tokens means the reply was cut off
+ * by the token budget (length); content_filter is a provider-side block (error)
+ * so the failure surfaces with the raw reason attached.
+ */
+function mapIncompleteStopReason(reason: string): StopReason {
+	if (reason === "content_filter") return "error";
+	return "length";
+}
+
 export async function processResponsesStream<TApi extends Api>(
 	openaiStream: AsyncIterable<ResponseStreamEvent>,
 	output: AssistantMessage,
@@ -306,6 +342,8 @@ export async function processResponsesStream<TApi extends Api>(
 	}
 	const slotsByItemId = new Map<string, ResponsesItemSlot>();
 	const slotsByOutputIndex = new Map<number, ResponsesItemSlot>();
+	let sawTerminalResponseEvent = false;
+	let lastRawUsage: ResponsesUsageFrame | undefined;
 
 	const releaseSlot = (slot: ResponsesItemSlot): void => {
 		if (slot.itemId !== undefined && slotsByItemId.get(slot.itemId) === slot) {
@@ -649,20 +687,30 @@ export async function processResponsesStream<TApi extends Api>(
 			if (block && currentBlock === block) {
 				currentBlock = null;
 			}
-		} else if (event.type === "response.completed") {
+		} else if (event.type === "response.completed" || event.type === "response.incomplete") {
+			sawTerminalResponseEvent = true;
 			const response = event.response;
 			if (response?.id) {
 				output.responseId = response.id;
 			}
 			if (response?.usage) {
-				const cachedTokens = response.usage.input_tokens_details?.cached_tokens || 0;
+				// Merge per field: a late usage frame that leaves fields undefined
+				// (or omits usage entirely, as response.incomplete may) must not
+				// zero out counts recorded from an earlier terminal frame.
+				lastRawUsage = mergeResponsesUsage(lastRawUsage, response.usage);
+			}
+			if (lastRawUsage) {
+				const cachedTokens = lastRawUsage.input_tokens_details?.cached_tokens || 0;
 				output.usage = {
 					// OpenAI includes cached tokens in input_tokens, so subtract to get non-cached input
-					input: (response.usage.input_tokens || 0) - cachedTokens,
-					output: response.usage.output_tokens || 0,
+					input: (lastRawUsage.input_tokens || 0) - cachedTokens,
+					output: lastRawUsage.output_tokens || 0,
 					cacheRead: cachedTokens,
 					cacheWrite: 0,
-					totalTokens: response.usage.total_tokens || 0,
+					// Fall back to the component sum when the provider does not
+					// report total_tokens (same invariant as compaction).
+					totalTokens:
+						lastRawUsage.total_tokens || (lastRawUsage.input_tokens || 0) + (lastRawUsage.output_tokens || 0),
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 				};
 			}
@@ -673,12 +721,28 @@ export async function processResponsesStream<TApi extends Api>(
 					: (response?.service_tier ?? options.serviceTier);
 				options.applyServiceTierPricing(output.usage, serviceTier);
 			}
-			output.stopReason = mapStopReason(response?.status);
-			if (output.content.some((b) => b.type === "toolCall") && output.stopReason === "stop") {
-				output.stopReason = "toolUse";
-			}
-			if (output.stopReason === "error" && response?.status) {
-				output.stopReasonRaw = response.status;
+			if (event.type === "response.incomplete") {
+				// Incomplete responses are truncated, not completed: map the stop
+				// reason from incomplete_details.reason so the reason and the usage
+				// survive instead of the event being ignored as a normal stop.
+				const reason = response?.incomplete_details?.reason;
+				output.stopReason = reason ? mapIncompleteStopReason(reason) : mapStopReason(response?.status);
+				if (output.stopReason === "error") {
+					output.stopReasonRaw = reason ?? response?.status;
+				}
+				appendAssistantMessageDiagnostic(output, {
+					type: "responses_incomplete",
+					timestamp: Date.now(),
+					details: { reason: reason ?? null, status: response?.status ?? null },
+				});
+			} else {
+				output.stopReason = mapStopReason(response?.status);
+				if (output.content.some((b) => b.type === "toolCall") && output.stopReason === "stop") {
+					output.stopReason = "toolUse";
+				}
+				if (output.stopReason === "error" && response?.status) {
+					output.stopReasonRaw = response.status;
+				}
 			}
 		} else if (event.type === "error") {
 			throw new StreamFailureError(`Error Code ${event.code}: ${event.message}`, {
@@ -699,6 +763,16 @@ export async function processResponsesStream<TApi extends Api>(
 				providerErrorType,
 			});
 		}
+	}
+
+	// A stream that ends without a terminal response event (completed or
+	// incomplete) was truncated upstream; reporting it as a normal stop would
+	// silently lose the tail. error/response.failed throw instead of ending the
+	// loop, so they are terminal by construction.
+	if (!sawTerminalResponseEvent) {
+		throw new StreamFailureError("Responses stream ended before a terminal response event", {
+			kind: "malformed_response",
+		});
 	}
 }
 

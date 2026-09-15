@@ -37,7 +37,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
-import { recordStreamFailure } from "../utils/stream-failure.js";
+import { recordStreamFailure, StreamFailureError } from "../utils/stream-failure.js";
 import { finalizeThrottledStreamingJson, updateThrottledStreamingJson } from "../utils/streaming-json-throttle.js";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
@@ -492,6 +492,8 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
 
+			let accumulatedUsage: ChunkUsageFrame | undefined;
+			let sawFinishReason = false;
 			for await (const chunk of openaiStream) {
 				if (!chunk || typeof chunk !== "object") continue;
 
@@ -502,7 +504,10 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 					output.responseModel ||= chunk.model;
 				}
 				if (chunk.usage) {
-					output.usage = parseChunkUsage(chunk.usage, model, cacheWriteCost);
+					// Merge per field: a partial late usage frame must not zero out
+					// counts already recorded from an earlier chunk.
+					accumulatedUsage = mergeChunkUsage(accumulatedUsage, chunk.usage);
+					output.usage = parseChunkUsage(accumulatedUsage, model, cacheWriteCost);
 				}
 
 				const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
@@ -511,10 +516,12 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 				// Fallback: some providers (e.g., Moonshot) return usage
 				// in choice.usage instead of the standard chunk.usage
 				if (!chunk.usage && (choice as any).usage) {
-					output.usage = parseChunkUsage((choice as any).usage, model, cacheWriteCost);
+					accumulatedUsage = mergeChunkUsage(accumulatedUsage, (choice as any).usage);
+					output.usage = parseChunkUsage(accumulatedUsage, model, cacheWriteCost);
 				}
 
 				if (choice.finish_reason) {
+					sawFinishReason = true;
 					const finishReasonResult = mapStopReason(choice.finish_reason);
 					output.stopReason = finishReasonResult.stopReason;
 					if (finishReasonResult.errorMessage) {
@@ -657,6 +664,13 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			}
 			if (output.stopReason === "error") {
 				throw new Error(output.errorMessage || "Provider returned an error stop reason");
+			}
+			// A stream that ends without a finish_reason was truncated upstream;
+			// reporting it as a normal stop would silently lose the tail.
+			if (!sawFinishReason) {
+				throw new StreamFailureError("OpenAI completions stream ended before a finish_reason", {
+					kind: "malformed_response",
+				});
 			}
 
 			stream.push({ type: "done", reason: output.stopReason, message: output });
@@ -1312,13 +1326,37 @@ function convertTools(
 	}));
 }
 
+type ChunkUsageFrame = {
+	prompt_tokens?: number;
+	completion_tokens?: number;
+	prompt_cache_hit_tokens?: number;
+	prompt_tokens_details?: { cached_tokens?: number; cache_write_tokens?: number };
+};
+
+/**
+ * Merge a new usage frame over the previously seen one. Fields the new frame
+ * leaves undefined keep the earlier value, so a partial late frame cannot zero
+ * out counts already recorded from an earlier chunk.
+ */
+function mergeChunkUsage(previous: ChunkUsageFrame | undefined, current: ChunkUsageFrame): ChunkUsageFrame {
+	const previousDetails = previous?.prompt_tokens_details;
+	const currentDetails = current.prompt_tokens_details;
+	return {
+		prompt_tokens: current.prompt_tokens ?? previous?.prompt_tokens,
+		completion_tokens: current.completion_tokens ?? previous?.completion_tokens,
+		prompt_cache_hit_tokens: current.prompt_cache_hit_tokens ?? previous?.prompt_cache_hit_tokens,
+		prompt_tokens_details:
+			currentDetails || previousDetails
+				? {
+						cached_tokens: currentDetails?.cached_tokens ?? previousDetails?.cached_tokens,
+						cache_write_tokens: currentDetails?.cache_write_tokens ?? previousDetails?.cache_write_tokens,
+					}
+				: undefined,
+	};
+}
+
 function parseChunkUsage(
-	rawUsage: {
-		prompt_tokens?: number;
-		completion_tokens?: number;
-		prompt_cache_hit_tokens?: number;
-		prompt_tokens_details?: { cached_tokens?: number; cache_write_tokens?: number };
-	},
+	rawUsage: ChunkUsageFrame,
 	model: Model<"openai-completions">,
 	cacheWriteCost?: number,
 ): AssistantMessage["usage"] {

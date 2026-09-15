@@ -78,7 +78,13 @@ describe("openai responses partialJson cleanup", () => {
 		const pushSpy = vi.spyOn(stream, "push");
 		const argumentsJson = '{"path":"README.md","content":"updated"}';
 
-		await processResponsesStream(createFunctionCallEvents(argumentsJson), output, stream, model);
+		// A well-formed stream ends with a terminal response event; the cleanup
+		// under test happens at output_item.done, before it.
+		async function* eventsWithTerminal(): AsyncIterable<ResponseStreamEvent> {
+			yield* createFunctionCallEvents(argumentsJson);
+			yield { type: "response.completed", response: { id: "resp_1", status: "completed" } } as ResponseStreamEvent;
+		}
+		await processResponsesStream(eventsWithTerminal(), output, stream, model);
 
 		expect(output.content).toHaveLength(1);
 		const persistedToolCall = output.content[0];
