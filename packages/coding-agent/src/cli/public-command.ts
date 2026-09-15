@@ -18,9 +18,10 @@ import {
 	REMOVED_COMMAND_NAMES,
 } from "./command-registry.js";
 import { handleDaemonCommand } from "./daemon-command.js";
-import { runPs, runReap, runShutdownSelection } from "./daemon-ps.js";
+import { discoverDaemons, runPs, runReap, runShutdownSelection } from "./daemon-ps.js";
 import { resolveStopSelection, type StopSelectionFlags } from "./daemon-stop-scope.js";
 import { DAEMON_UPDATE_RESTART_COORDINATOR_FLAG } from "./daemon-update-restart.js";
+import { collectReadonlyDoctorChecks, type DoctorCheck, resolveDoctorCheckRoots } from "./doctor-checks.js";
 
 export interface PublicCommandResult {
 	handled: boolean;
@@ -372,11 +373,31 @@ async function runRetention(args: string[]): Promise<PublicCommandResult> {
 	return HANDLED;
 }
 
+function formatDoctorCheckLine(check: DoctorCheck): string {
+	const label = check.status === "ok" ? "OK" : check.status === "warn" ? "WARN" : "FAIL";
+	const colored =
+		check.status === "ok" ? chalk.green(label) : check.status === "warn" ? chalk.yellow(label) : chalk.red(label);
+	return `  [${colored}] ${check.id}: ${check.detail}`;
+}
+
 async function runDoctor(args: string[]): Promise<PublicCommandResult> {
 	if (!args.includes("--fix")) {
 		const options = parseBooleanOptions(args, new Set(["--json"]), "doctor");
 		if (!options) return HANDLED;
-		await runPs(options.has("--json"));
+		const json = options.has("--json");
+		// Read-only health checks: observed, reported, never fixed here (that is doctor --fix).
+		const checks = collectReadonlyDoctorChecks(resolveDoctorCheckRoots());
+		if (json) {
+			const daemons = await discoverDaemons();
+			console.log(JSON.stringify({ daemons, checks }, null, 2));
+			return HANDLED;
+		}
+		await runPs(false);
+		console.log(chalk.bold("\nRead-only health checks:"));
+		for (const check of checks) {
+			console.log(formatDoctorCheckLine(check));
+			console.log(chalk.dim(`         Next: ${check.next}`));
+		}
 		return HANDLED;
 	}
 	const rest = args.filter((arg) => arg !== "--fix");
