@@ -435,12 +435,32 @@ export function getSessionArtifactPath(
 	return canonicalArtifactPath;
 }
 
+/**
+ * The session id a transcript declares in its own header, which is the id the running session
+ * uses for `--resume` and for its artifact directory. `undefined` when the file has no readable
+ * or well-formed header, when it is a symlink, or when it is gone.
+ */
+export function readSessionHeaderId(sessionFile: string): string | undefined {
+	try {
+		const header = readSessionHeader(sessionFile);
+		if (header?.type !== "session" || typeof header.id !== "string") return undefined;
+		return SESSION_ID_PATTERN.test(header.id) ? header.id : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The id whose artifact directory holds this transcript's state. The header is the authority: a
+ * file that was renamed, or imported under its export name, still writes into `<header id>`. The
+ * file stem is only a fallback for a transcript whose header cannot be read.
+ */
+export function resolveSessionArtifactId(sessionFile: string): string {
+	return readSessionHeaderId(sessionFile) ?? basename(sessionFile).replace(/\.jsonl$/, "");
+}
+
 export function getSessionArtifactPathForFile(sessionFile: string, sessionId?: string): string {
-	return getSessionArtifactPath(
-		dirname(sessionFile),
-		sessionId ?? basename(sessionFile).replace(/\.jsonl$/, ""),
-		false,
-	);
+	return getSessionArtifactPath(dirname(sessionFile), sessionId ?? resolveSessionArtifactId(sessionFile), false);
 }
 
 function generateId(byId: { has(id: string): boolean }): string {

@@ -724,8 +724,11 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	 * The transcript is copied into the session directory under its own basename.
 	 * A basename that is already taken by a *different* transcript does not get
 	 * overwritten: the copy moves to a free sibling name and receives a session id
-	 * of its own, so an import can never destroy a registered session. Importing
-	 * byte-identical content reuses the file that is already there.
+	 * of its own, so an import can never destroy a registered session. A session id
+	 * that another transcript in the directory already declares is reassigned the
+	 * same way, even under a free name, because `--resume <id>` and the artifact
+	 * directory are both keyed on it. Importing byte-identical content reuses the
+	 * file that is already there.
 	 *
 	 * @returns `{ cancelled: true }` when cancelled by `session_before_switch`, otherwise `{ cancelled: false }`.
 	 * @throws {SessionImportFileNotFoundError} When the input path does not exist.
@@ -754,7 +757,10 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		let sessionManager: SessionManager;
 		try {
 			if (!destination.reusedExisting && resolve(destinationPath) !== resolvedPath) {
-				copyImportedSession(resolvedPath, destinationPath, { renamed: destination.renamed });
+				copyImportedSession(resolvedPath, destinationPath, {
+					renamed: destination.renamed,
+					sessionId: destination.sessionId,
+				});
 			}
 
 			sessionManager = SessionManager.open(destinationPath, sessionDir, cwdOverride);

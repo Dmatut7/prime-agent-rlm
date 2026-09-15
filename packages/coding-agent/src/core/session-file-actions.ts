@@ -1,9 +1,14 @@
 import { spawnSync } from "node:child_process";
 import { type Dirent, existsSync } from "node:fs";
 import { readdir, rm, unlink } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { dirname, join } from "node:path";
 import { recordSessionArtifactTombstone } from "./session-artifact-tombstones.js";
-import { forgetSessionInfo, getSessionArtifactPath } from "./session-manager.js";
+import {
+	forgetSessionInfo,
+	getSessionArtifactPath,
+	readSessionHeaderId,
+	resolveSessionArtifactId,
+} from "./session-manager.js";
 
 export type DeleteSessionFileResult = { ok: true; method: "trash" | "unlink" } | { ok: false; error: string };
 
@@ -16,16 +21,23 @@ export interface DeleteSessionFileOptions {
  * kernel snapshot, RLM scratch files, …), which lives at
  * `<dirname(sessionDir)>/session-artifacts/<id>`.
  * Only invoked on delete, never on deactivation.
+ *
+ * `sessionId` is the header id of the transcript being deleted. Callers that still have the file
+ * should pass it: once the transcript is gone the header cannot be read, and a transcript whose
+ * file name differs from its session id (an import, a rename) would otherwise be aimed at a
+ * directory that never held its state - leaving the real one behind and filing the tombstone
+ * under an id that belongs to somebody else.
  */
-export async function deleteSessionArtifacts(sessionPath: string): Promise<void> {
-	// A degenerate name (".jsonl") would resolve to the artifacts root itself.
-	const sessionId = basename(sessionPath).replace(/\.jsonl$/, "");
-	if (!sessionId) return;
+export async function deleteSessionArtifacts(sessionPath: string, sessionId?: string): Promise<void> {
+	// The header id is the one the running session wrote into; a degenerate name with no header
+	// (".jsonl") resolves to the artifacts root itself and is skipped.
+	const artifactId = sessionId ?? resolveSessionArtifactId(sessionPath);
+	if (!artifactId) return;
 	// Deletion validates containment (id pattern, symlink, escape) but does not
 	// enforce the private mode: a leftover directory from an older build may be
 	// 0755, and a retry-heal sweep must still remove it. Symlinked or escaping
 	// paths still throw and are never traversed.
-	const artifactDir = getSessionArtifactPath(dirname(sessionPath), sessionId, false, false);
+	const artifactDir = getSessionArtifactPath(dirname(sessionPath), artifactId, false, false);
 	// Passive descendants persist their transcripts under this directory and each
 	// one may have a durable list-summary; forget them before the recursive remove
 	// so deleting a root does not leave one orphan entry per child.
@@ -35,7 +47,7 @@ export async function deleteSessionArtifacts(sessionPath: string): Promise<void>
 	// the cron store and the retention sweep read instead of guessing from the
 	// directory's absence (round-08 S1). Best effort: a refused tombstone write must
 	// not turn a completed deletion into a failure.
-	recordSessionArtifactTombstone(dirname(artifactDir), sessionId, { reason: "session-deleted" });
+	recordSessionArtifactTombstone(dirname(artifactDir), artifactId, { reason: "session-deleted" });
 	await rm(artifactDir, { recursive: true, force: true });
 }
 
@@ -109,6 +121,9 @@ export async function deleteSessionFile(
 	sessionPath: string,
 	options: DeleteSessionFileOptions = {},
 ): Promise<DeleteSessionFileResult> {
+	// Read the identity while the transcript is still here: after the unlink there is no header
+	// left to ask, and the artifact directory is named by that id, not by the file name.
+	const headerSessionId = readSessionHeaderId(sessionPath);
 	const result = await removeSessionFile(sessionPath);
 	if (result.ok) {
 		options.afterFileRemoved?.();
@@ -124,7 +139,7 @@ export async function deleteSessionFile(
 		// artifacts root) must not turn a successful session-file deletion into a
 		// failure.
 		try {
-			await deleteSessionArtifacts(sessionPath);
+			await deleteSessionArtifacts(sessionPath, headerSessionId);
 		} catch {
 			// Keep the successful file-deletion result.
 		}
