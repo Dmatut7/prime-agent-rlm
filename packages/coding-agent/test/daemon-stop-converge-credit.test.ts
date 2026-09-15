@@ -229,6 +229,62 @@ describe("converge() only credits stops this run performed", () => {
 		expect(report.discovered).toBe(bucketTotal(report));
 	}, 30_000);
 
+	it("does not launder a refused face of a signalled pid into stopped", async () => {
+		// X-2: one pid, two socket faces. Face B was refused before any signal was
+		// sent, and the pid this run really signalled then died leaving both files
+		// behind. The refusal already says why face B is still here, and the causal
+		// ledger (keyed by pid) may not turn that refusal into a stop this run
+		// never performed on that face.
+		const directory = makeTempDir();
+		const supervisorSocket = join(directory, "supervisor.sock");
+		const workerSocket = join(directory, "worker.sock");
+		const script = join(directory, "two-face.cjs");
+		writeFileSync(
+			script,
+			[
+				'const net = require("node:net");',
+				"const a = net.createServer((connection) => connection.destroy());",
+				"const b = net.createServer((connection) => connection.destroy());",
+				"a.listen(process.argv[2]);",
+				"b.listen(process.argv[3]);",
+				"",
+			].join("\n"),
+		);
+		const child = spawn(process.execPath, [script, supervisorSocket, workerSocket], {
+			stdio: ["ignore", "ignore", "ignore"],
+		});
+		children.add(child);
+		const pid = child.pid;
+		expect(pid).toBeDefined();
+		await waitFor(() => existsSync(supervisorSocket) && existsSync(workerSocket), "both faces to listen");
+
+		const report = new ShutdownReport();
+		report.observe([
+			{ socketPath: supervisorSocket, pid, kind: "service" },
+			{ socketPath: workerSocket, pid, kind: "listener" },
+		]);
+		const refusal = "refused: not named by any owner record";
+		report.refuse({ socketPath: workerSocket, pid, kind: "listener", reason: refusal });
+		// The signalling leg for face A: the signal is delivered (the pid really dies).
+		report.recordSignal(pid ?? 0);
+		child.kill("SIGTERM");
+		await waitFor(() => !alive(pid), "the signalled pid to exit");
+		// Killed outright, so neither face unlinks its file: both are residue.
+		expect(existsSync(supervisorSocket)).toBe(true);
+		expect(existsSync(workerSocket)).toBe(true);
+
+		const stillPresent = report.converge();
+
+		// The refusal keeps its own verdict and its own reason.
+		expect(report.bucketOf(workerSocket, pid)).toBe("leftRunning");
+		expect(report.leftRunning).toEqual([{ socketPath: workerSocket, pid, kind: "listener", reason: refusal }]);
+		// The signalled face is the only one credited with a stop.
+		expect(report.stopped.map((entry) => entry.socketPath)).toEqual([supervisorSocket]);
+		expect(report.discovered).toBe(2);
+		expect(report.discovered).toBe(bucketTotal(report));
+		expect(stillPresent.sort()).toEqual([supervisorSocket, workerSocket].sort());
+	}, 30_000);
+
 	it("still reports a target that was already gone before the stop as skipped", async () => {
 		const directory = makeTempDir();
 		const socketPath = join(directory, "gone.sock");

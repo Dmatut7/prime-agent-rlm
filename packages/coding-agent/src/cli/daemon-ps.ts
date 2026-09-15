@@ -431,8 +431,9 @@ export class ShutdownReport {
 	 * its process identity alive — because a daemon whose file was unlinked
 	 * underneath it is still running, and a disk-only check called that clean.
 	 * `stillPresent === []` is the only clean verdict. The one exception is the causal
-	 * ledger: a file this run's signalled pid left behind when it died is residue the
-	 * `stopped` entry names, not a live face of the daemon.
+	 * ledger: a file this run's really delivered signal left behind when the observed
+	 * identity died is residue the `stopped` entry names, not a live face of the
+	 * daemon — and never a verdict a refusal or a keep had already given.
 	 *
 	 * Gone is the other half of the observation, and it is judged as strictly: a
 	 * disappearance only becomes a `stopped` when the ledger says this run caused
@@ -449,21 +450,37 @@ export class ShutdownReport {
 			// was observed at the start counts as still running.
 			const processPresent =
 				pid !== undefined && processStartId !== undefined && getProcessStartId(pid) === processStartId;
-			// FR-2: the causal ledger outranks the file residue. A graceful stop answers
-			// and dies before its own unlink, so the socket file can outlive the process.
-			// When this run signalled that pid and the observed identity is gone, the stop
-			// is real; the leftover file is reported as residue, not as a resurrection.
-			if (pid !== undefined && presentAtObservation && !processPresent && this.signalledPids.has(pid)) {
+			// FR-2, with the X-1/X-2 guards: the causal ledger outranks the file
+			// residue, but only for a target whose live identity this run observed
+			// (processStartId) and whose pid it really signalled (the ledger now holds
+			// delivered signals only). A graceful stop answers and dies before its own
+			// unlink, so the socket file can outlive the process; that residue is
+			// named in the stopped entry's action. A target that was only a file at
+			// observation is residue this run did not remove, so it is left running.
+			// And a refusal, a keep or a failure already said why this target is still
+			// here: the same guard the observation leg below applies, so the ledger
+			// cannot launder that verdict into a stop (X-2).
+			if (
+				pid !== undefined &&
+				processStartId !== undefined &&
+				presentAtObservation &&
+				!processPresent &&
+				this.signalledPids.has(pid)
+			) {
 				const entry = { socketPath, pid, kind };
 				if (filePresent && !stillPresent.includes(socketPath)) {
 					stillPresent.push(socketPath);
 				}
-				this.claim("stopped", {
-					...entry,
-					action: filePresent
-						? `converged during shutdown; its socket file lingers at ${socketPath}`
-						: "converged during shutdown",
-				});
+				const key = shutdownTargetKey(socketPath, pid);
+				const existing = this.bucketByKey.get(key);
+				if (existing === undefined || existing === "stopped") {
+					this.claim("stopped", {
+						...entry,
+						action: filePresent
+							? `converged during shutdown; its socket file lingers at ${socketPath}`
+							: "converged during shutdown",
+					});
+				}
 				continue;
 			}
 			if (filePresent || processPresent) {
@@ -1155,7 +1172,10 @@ export function describeShutdownTarget(
  * ever killed with `force`, and even then never via a pid that backs more than
  * one discovered daemon (e.g. macOS lsof reports every unix socket a process
  * holds, so killing a shared pid could take down a reachable daemon with live
- * sessions). runReap additionally re-probes a kill candidate immediately before
+ * sessions), and never when the hung supervisor still owns live worker
+ * processes: `shutdown --force` stops those workers first, and the reap sweep
+ * has no such path, so it refuses and names that command instead (X-10).
+ * runReap additionally re-probes a kill candidate immediately before
  * the SIGTERM and backs off to the session-aware paths if it has since become
  * reachable, so a daemon that recovered with live sessions is never killed.
  */
@@ -1197,10 +1217,18 @@ export function planReap(daemons: readonly DaemonInfo[], force: boolean, selecti
 			if (!force || daemon.pid === undefined) {
 				return { kind: "skip", daemon, reason: 'unreachable; use "prime-agent shutdown --force" to stop it' };
 			}
-			// The live workers of an unreachable supervisor are stopped by the same
-			// run before the kill (see runReap), so the plan may kill: this keeps
-			// `reap --force`, `doctor --fix` advice and `shutdown --force` from
-			// disagreeing about a hung supervisor that still owns workers (DS-4).
+			// X-10: a hung supervisor that still owns live worker processes is not a
+			// clearly-safe reap target. `shutdown --force` is the command that stops
+			// the workers first and then kills the supervisor; the reap sweep has no
+			// worker-stop path, so it refuses and names the command that owns that
+			// decision instead of killing and orphaning the workers.
+			if ((daemon.liveWorkerCount ?? 0) > 0) {
+				return {
+					kind: "skip",
+					daemon,
+					reason: `unreachable; has ${daemon.liveWorkerCount} live worker process(es); use "prime-agent shutdown --force" to stop it with its workers`,
+				};
+			}
 			if ((pidCounts.get(daemon.pid) ?? 0) > 1) {
 				return {
 					kind: "skip",
@@ -1640,18 +1668,23 @@ async function runShutdownConverging(
 						break;
 					}
 					await assertAdmission();
-					report.recordSignal(pid);
-					await forceKillDaemon(pid);
+					// K3X-6: the ledger entry follows the signal, and only a delivered
+					// signal may back a "killed" claim. One that landed on ESRCH/EPERM is
+					// not a stop this run performed; the file cleanup and the convergence
+					// pass report what is really still there.
+					const signalled = await signalAndRecordStop(report, pid);
 					sweep.handledPids.add(pid);
 					await assertAdmission();
 					if (removeSocketFileUnlessServed(socketPath)) {
 						report.recordSocketRemoval(socketPath);
 					}
-					report.recordStoppedService(socketPath);
-					report.claim("stopped", {
-						...targetEntry(socketPath, pid, "service"),
-						action: `killed unreachable background service (pid ${pid})`,
-					});
+					if (signalled) {
+						report.recordStoppedService(socketPath);
+						report.claim("stopped", {
+							...targetEntry(socketPath, pid, "service"),
+							action: `killed unreachable background service (pid ${pid})`,
+						});
+					}
 				} else {
 					await assertAdmission();
 					if (removeSocketFileUnlessServed(socketPath)) {
@@ -1958,12 +1991,14 @@ async function terminateVerifiedListener(sweep: ShutdownSweep, listener: Discove
 	if (getProcessStartId(listener.pid) !== processStartId) {
 		return false;
 	}
-	sweep.report.recordSignal(listener.pid);
-	killDaemon(listener.pid);
+	// K3X-6: the ledger entry follows the signal, and only a signal that was
+	// really delivered may explain what this run took down.
+	const signalled = await signalAndRecordStop(sweep.report, listener.pid, "terminate");
 	const deadline = Date.now() + 1000;
 	while (getProcessStartId(listener.pid) === processStartId && Date.now() < deadline) {
 		await delay(50);
 	}
+	let escalated = false;
 	if (getProcessStartId(listener.pid) === processStartId) {
 		await sweep.assertAdmission();
 		if (getProcessStartId(listener.pid) !== processStartId) {
@@ -1971,17 +2006,21 @@ async function terminateVerifiedListener(sweep: ShutdownSweep, listener: Discove
 		}
 		try {
 			process.kill(listener.pid, "SIGKILL");
+			escalated = true;
 		} catch {
 			// The verified process exited between the identity check and signal.
 		}
 	}
 	const stopped = getProcessStartId(listener.pid) !== processStartId;
-	if (stopped) {
-		// This run is what took that service down, which is also the only thing that
-		// may explain a worker of it disappearing inside the same window.
-		sweep.report.recordStoppedService(listener.socketPath);
+	// A death that neither the delivered signal nor its escalation explains is
+	// not a stop this run performed, however convenient the timing (X-1).
+	if (!stopped || (!signalled && !escalated)) {
+		return false;
 	}
-	return stopped;
+	// This run is what took that service down, which is also the only thing that
+	// may explain a worker of it disappearing inside the same window.
+	sweep.report.recordStoppedService(listener.socketPath);
+	return true;
 }
 
 function daemonListenerSignature(listeners: readonly DiscoveredDaemonProcess[]): string {
@@ -2050,8 +2089,14 @@ async function stopBackgroundService(
 			return { left: sweep.report.refusalReason(socketPath, pid) ?? "not a verified daemon" };
 		}
 		await sweep.assertAdmission();
-		sweep.report.recordSignal(pid);
-		await forceKillDaemon(pid);
+		// K3X-6: the ledger entry follows the signal. One that landed on ESRCH or
+		// EPERM stopped nothing, so it is reported as left running with the reason
+		// instead of as a force-kill this run never delivered.
+		if (!(await signalAndRecordStop(sweep.report, pid))) {
+			return {
+				left: `could not deliver the kill signal to pid ${pid}: it is not ours to signal or it is already gone`,
+			};
+		}
 		sweep.handledPids.add(pid);
 		sweep.report.recordStoppedService(socketPath);
 		return { reaped: `force-killed the process holding a removed socket (pid ${pid})` };
@@ -2068,12 +2113,19 @@ async function stopBackgroundService(
 		return { left: sweep.report.refusalReason(socketPath, pid) ?? "not a verified daemon" };
 	}
 	await sweep.assertAdmission();
-	sweep.report.recordSignal(pid);
-	await forceKillDaemon(pid);
+	// K3X-6: the ledger entry follows the signal, and only a delivered one may
+	// claim the kill. The socket file cleanup below still runs, because a file
+	// nothing serves any more is residue this run may remove either way.
+	const signalled = await signalAndRecordStop(sweep.report, pid);
 	sweep.handledPids.add(pid);
 	await sweep.assertAdmission();
 	if (removeSocketFileUnlessServed(socketPath)) {
 		sweep.report.recordSocketRemoval(socketPath);
+	}
+	if (!signalled) {
+		return {
+			left: `could not deliver the kill signal to pid ${pid}: it is not ours to signal or it is already gone`,
+		};
 	}
 	sweep.report.recordStoppedService(socketPath);
 	return { reaped: `force-killed unresponsive background service (pid ${pid})` };
@@ -2181,8 +2233,11 @@ async function forceStopTrackedWorkers(
 				// Pid-only records go through the platform predicate (stopTrackedProcess needs a startId).
 				if (orphan.processStartId === undefined) {
 					if (shouldReapOrphanProcess(orphan)) {
-						ledger.recordSignal(orphan.pid);
-						killOrphanProcess(orphan.pid);
+						// K3X-6: the ledger entry follows the signal, which the
+						// reaper primitive already reports.
+						if (killOrphanProcess(orphan.pid)) {
+							ledger.recordSignal(orphan.pid);
+						}
 					}
 					continue;
 				}
@@ -2193,8 +2248,9 @@ async function forceStopTrackedWorkers(
 					// taskkill /T, like the sibling reapers: signalling only the shell pid leaves its descendants alive.
 					await assertAdmission();
 					if (isOrphanProcessIdentityCurrent(orphan)) {
-						ledger.recordSignal(orphan.pid);
-						killOrphanProcess(orphan.pid);
+						if (killOrphanProcess(orphan.pid)) {
+							ledger.recordSignal(orphan.pid);
+						}
 						if (isProcessAlive(orphan.pid)) {
 							cleanupWorkerRecords = false;
 							fail(descriptor, `could not stop child process ${orphan.pid} for worker ${descriptor.workerId}`);
@@ -2465,26 +2521,19 @@ export async function runReap(
 						skipped.push({ socketPath, reason: verdict.reason });
 						break;
 					}
-					// Stop the tracked workers before the kill, the way `shutdown --force`
-					// does after its own: killing an unreachable supervisor first would
-					// leave its workers orphaned, which is what made `reap --force`
-					// refuse where `shutdown --force` killed (DS-4).
-					const workerFailures = await forceStopTrackedWorkers(socketPath, async () => {}, {
-						recordSignal: () => undefined,
-						recordSocketRemoval: () => undefined,
-					});
-					if (workerFailures.length > 0) {
-						skipped.push({
-							socketPath,
-							reason: `unreachable; could not stop its worker process(es) safely: ${workerFailures
-								.map((failure) => failure.reason)
-								.join("; ")}`,
-						});
-						break;
-					}
-					killDaemon(pid!);
+					// X-10: the plan already refused every supervisor that still owns
+					// live workers (see planReap), so this kill leg owns no worker
+					// ordering — `shutdown --force` is the command that stops them
+					// first. The kill verdict is only claimed for a signal the kernel
+					// really delivered (K3X-6); the file cleanup is a fact either way.
+					const delivered = killDaemon(pid!);
 					removeSocketFile(socketPath);
-					reaped.push({ socketPath, action: `killed unreachable daemon (pid ${pid})` });
+					reaped.push({
+						socketPath,
+						action: delivered
+							? `killed unreachable daemon (pid ${pid})`
+							: `removed the socket file of pid ${pid}; the kill signal was not delivered`,
+					});
 				} else {
 					apply(await reapReachableDaemon(socketPath, pid), socketPath, reaped, skipped);
 				}
@@ -2626,28 +2675,56 @@ function removeSocketFile(socketPath: string): boolean {
 	}
 }
 
-function killDaemon(pid: number): void {
+/**
+ * Signal a daemon process. Returns whether the signal was really delivered:
+ * ESRCH (already gone) and EPERM (not this user's process) are both "no", so a
+ * caller that reports a stop cannot claim one the kernel refused to send. The
+ * socket file cleanup still runs either way.
+ */
+export function killDaemon(pid: number): boolean {
 	try {
 		process.kill(pid, "SIGTERM");
+		return true;
 	} catch {
 		// Process already gone or not permitted; the socket file cleanup still runs.
+		return false;
 	}
 }
 
-async function forceKillDaemon(pid: number): Promise<void> {
-	killDaemon(pid);
+export async function forceKillDaemon(pid: number): Promise<boolean> {
+	let delivered = killDaemon(pid);
 	const deadline = Date.now() + 1000;
 	while (Date.now() < deadline) {
 		if (!isProcessAlive(pid)) {
-			return;
+			return delivered;
 		}
 		await delay(50);
 	}
 	try {
 		process.kill(pid, "SIGKILL");
+		delivered = true;
 	} catch {
 		// Process already exited between the liveness check and the kill.
 	}
+	return delivered;
+}
+
+/**
+ * The K3X-6 contract every signalling leg shares: the signal goes out first,
+ * and the causal ledger records it only when the primitive reports delivery. A
+ * ledger entry for a signal that landed on nothing is what let a death this run
+ * did not cause be reported as a stop it performed.
+ */
+export async function signalAndRecordStop(
+	ledger: { recordSignal(pid: number): void },
+	pid: number,
+	escalate: "terminate" | "force" = "force",
+): Promise<boolean> {
+	const delivered = escalate === "force" ? await forceKillDaemon(pid) : killDaemon(pid);
+	if (delivered) {
+		ledger.recordSignal(pid);
+	}
+	return delivered;
 }
 
 function isProcessAlive(pid: number): boolean {
