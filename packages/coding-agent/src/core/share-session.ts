@@ -5,11 +5,20 @@
  * Reports shape, location and a front/back mask — never the matched secret text.
  */
 
+import { readFileSync } from "node:fs";
 import { createPrivateTempFile, type PrivateTempFile } from "../utils/private-files.js";
 import { decodeEmbeddedSessionData } from "./export-html/session-data-embedding.js";
+import {
+	findShareIdentityFindings,
+	formatShareIdentityHint,
+	type ShareIdentityFinding,
+	type ShareIdentityView,
+} from "./share-identity-detectors.js";
 import { maskSecretValue, SHARE_SECRET_DETECTORS, type ShareSecretMatch } from "./share-secret-detectors.js";
 import { collectConfiguredShareSecretValues, type ShareSecretValue } from "./share-secret-values.js";
 
+export type { ShareIdentityFinding } from "./share-identity-detectors.js";
+export { formatShareIdentityHint } from "./share-identity-detectors.js";
 export type { ShareSecretPattern } from "./share-secret-detectors.js";
 export { SHARE_SECRET_PATTERNS } from "./share-secret-detectors.js";
 
@@ -390,15 +399,52 @@ export function findShareUploadSecretFindings(
 	return scanShareSecretViews(shareUploadScanViews(uploadedContent), options).findings;
 }
 
+/**
+ * Identity data reachable from the bytes that would actually be uploaded: absolute
+ * paths under the user's home directory (the session cwd among them) and email-shaped
+ * addresses. The same container logic as the secret scan: the document plus the
+ * recovered payload, with its JSON escapes resolved. Only the resolved payload view of
+ * the session is scanned - the escaped form cannot contain a hit its resolution does
+ * not - so one occurrence is counted once, not once per view form.
+ */
+export function findShareUploadIdentityFindings(uploadedContent: string): ShareIdentityFinding[] {
+	const payload = decodeEmbeddedSessionData(uploadedContent);
+	const views: ShareIdentityView[] = [{ label: DOCUMENT_VIEW, text: uploadedContent }];
+	if (payload !== undefined) {
+		views.push({ label: PAYLOAD_VIEW, text: unescapeForScan(payload) });
+	}
+	return findShareIdentityFindings(views);
+}
+
+/**
+ * The /export notice (round-27 SEC-5): the export surface that does not ask anything
+ * still has to say what the file it just wrote carries. Reading the file back can fail
+ * for reasons that do not invalidate the export - a path the writer resolved
+ * differently, a file already moved on - and the notice is then simply omitted.
+ */
+export function shareExportIdentityHintFromFile(path: string): string | undefined {
+	try {
+		return formatShareIdentityHint(findShareUploadIdentityFindings(readFileSync(path, "utf-8")));
+	} catch {
+		return undefined;
+	}
+}
+
 /** A confirm dialog is a decision, not a report: list the first few and count the rest. */
 const MAX_LISTED_FINDINGS = 8;
 
 /**
  * The confirm dialog: one line per credential with its shape, the non-secret name it was
  * assigned from, its position in the scanned text and a front/back mask, plus what the
- * upload would actually carry and what cancelling means.
+ * upload would actually carry and what cancelling means. Identity findings are listed
+ * the same way: they do not authenticate anyone, but they are exactly what the base64
+ * container hides from a plain-text glance at the file (round-27 SEC-5), so the decision
+ * to upload has to be made knowing they are in there.
  */
-export function formatShareSecretWarning(findings: readonly ShareSecretFinding[]): { title: string; message: string } {
+export function formatShareSecretWarning(
+	findings: readonly ShareSecretFinding[],
+	identityFindings: readonly ShareIdentityFinding[] = [],
+): { title: string; message: string } {
 	const listed = findings
 		.slice(0, MAX_LISTED_FINDINGS)
 		.map(
@@ -408,14 +454,29 @@ export function formatShareSecretWarning(findings: readonly ShareSecretFinding[]
 	if (findings.length > MAX_LISTED_FINDINGS) {
 		listed.push(`- ...and ${findings.length - MAX_LISTED_FINDINGS} more`);
 	}
+	const identityListed = identityFindings.map(
+		(finding) =>
+			`- ${finding.type} — ${finding.view}, ${finding.count} ${finding.count === 1 ? "occurrence" : "occurrences"}`,
+	);
+	const sections: string[] = [];
+	if (findings.length > 0) {
+		sections.push(`This session looks like it contains secrets:\n${listed.join("\n")}`);
+		if (identityListed.length > 0) {
+			sections.push(`It also embeds data that identifies you:\n${identityListed.join("\n")}`);
+		}
+	} else {
+		sections.push(`This session export embeds data that identifies you:\n${identityListed.join("\n")}`);
+	}
 	return {
 		title: "Share session",
 		message:
-			`This session looks like it contains secrets:\n${listed.join("\n")}\n\n` +
+			`${sections.join("\n\n")}\n\n` +
 			"Nothing is uploaded yet: cancel and the session is not shared.\n" +
 			"/share uploads the exported session (messages, system prompt, tools, and the\n" +
 			"working-directory context the exporter adds) as a private GitHub gist, and a secret\n" +
-			"gist is readable by anyone who has the link.\n\n" +
+			"gist is readable by anyone who has the link. The session travels base64-encoded\n" +
+			"inside the export, so none of the above is visible at a plain-text glance at the\n" +
+			"file, and all of it is recoverable by anyone holding it.\n\n" +
 			"Upload anyway?",
 	};
 }
@@ -434,10 +495,11 @@ export async function confirmShareIfSecrets(
 ): Promise<boolean> {
 	const secretValues = options?.secretValues ?? collectConfiguredShareSecretValues();
 	const findings = findShareUploadSecretFindings(content, { secretValues });
-	if (findings.length === 0) {
+	const identityFindings = findShareUploadIdentityFindings(content);
+	if (findings.length === 0 && identityFindings.length === 0) {
 		return true;
 	}
-	const warning = formatShareSecretWarning(findings);
+	const warning = formatShareSecretWarning(findings, identityFindings);
 	return confirm(warning.title, warning.message);
 }
 

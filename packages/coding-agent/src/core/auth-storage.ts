@@ -7,6 +7,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { statSync } from "node:fs";
 import {
 	findEnvKeys,
 	getEnvApiKey,
@@ -143,6 +144,21 @@ export interface AuthStorageBackend {
 	 * this undefined because it has nothing to clean up.
 	 */
 	readonly stateDirectory?: string;
+	/**
+	 * Cheap identity of the backing file's current contents (mtime + size), stat'ed
+	 * without reading it and without taking the lock. AuthStorage compares it before
+	 * every credential read to pick up changes other processes made (round-27 F3: no
+	 * event ever reaches a resident worker, so without this a revoked credential is
+	 * served until it expires, and an `api_key` never does). Backends with no file
+	 * omit it.
+	 */
+	statFingerprint?(): string | undefined;
+	/**
+	 * The backing file's current bytes without taking the lock. Every write goes
+	 * through writePrivateFileAtomic (temp file + rename), so a lockless reader sees
+	 * the old or the new file and never a partial one. Backends with no file omit it.
+	 */
+	readUnlocked?(): string | undefined;
 }
 
 export class FileAuthStorageBackend implements AuthStorageBackend {
@@ -209,6 +225,23 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 			if (release) {
 				release();
 			}
+		}
+	}
+
+	statFingerprint(): string | undefined {
+		try {
+			const stat = statSync(this.authPath);
+			return `${stat.mtimeMs}:${stat.size}`;
+		} catch {
+			return undefined;
+		}
+	}
+
+	readUnlocked(): string | undefined {
+		try {
+			return readPrivateFile(this.authPath, "utf-8");
+		} catch {
+			return undefined;
 		}
 	}
 
@@ -292,6 +325,10 @@ export class AuthStorage {
 	private staleAuthSources: Map<string, AuthSourceToken[]> = new Map();
 	private fallbackResolver?: (provider: string) => string | undefined;
 	private loadError: Error | null = null;
+	/** Stat identity of the bytes `data` was parsed from (lazy on-disk invalidation). */
+	private diskStat: string | undefined;
+	/** The exact bytes `data` was parsed from, compared when the stat identity moved. */
+	private diskBytes: string | undefined;
 	private errors: Error[] = [];
 	private errorsDropped = 0;
 	private notices: AuthNotice[] = [];
@@ -695,10 +732,41 @@ export class AuthStorage {
 			});
 			this.data = this.parseStorageData(content);
 			this.loadError = null;
+			this.rememberDiskState(content);
 		} catch (error) {
 			this.loadError = error as Error;
 			this.recordError(error);
 		}
+	}
+
+	/** Record the on-disk identity the in-memory copy was just made current with. */
+	private rememberDiskState(content: string | undefined): void {
+		this.diskBytes = content;
+		this.diskStat = this.storage.statFingerprint?.();
+	}
+
+	/**
+	 * Lazy invalidation of the in-memory copy (round-27 F3 / SEC-6): auth.json can be
+	 * edited by any other process - a /login or /logout in another window, a manual
+	 * revoke - and no event reaches this one, so a resident worker would keep serving
+	 * the revoked credential until it expires (an `api_key` never does). Every
+	 * credential read stats the file first: an unchanged file costs one stat and no
+	 * read, and a moved stat identity is confirmed against the exact bytes before the
+	 * store reloads, so a touch or an atomic rewrite of identical bytes does not drop
+	 * the `!command` value cache. Backends without a file have nothing to watch.
+	 */
+	private reloadIfAuthFileChanged(): void {
+		const statFingerprint = this.storage.statFingerprint;
+		if (statFingerprint === undefined) return;
+		const stat = statFingerprint.call(this.storage);
+		if (stat === this.diskStat) return;
+		const bytes = this.storage.readUnlocked?.();
+		if (bytes !== undefined && bytes === this.diskBytes) {
+			// Same bytes under a new stat identity: adopt the stat, not a reload.
+			this.diskStat = stat;
+			return;
+		}
+		this.reload();
 	}
 
 	/**
@@ -722,6 +790,7 @@ export class AuthStorage {
 		}
 
 		try {
+			let persisted: string | undefined;
 			this.storage.withLock((current) => {
 				const currentData = this.parseStorageData(current);
 				const merged: AuthStorageData = { ...currentData };
@@ -730,8 +799,12 @@ export class AuthStorage {
 				} else {
 					delete merged[provider];
 				}
-				return { result: undefined, next: JSON.stringify(merged, null, 2) };
+				persisted = JSON.stringify(merged, null, 2);
+				return { result: undefined, next: persisted };
 			});
+			// The write just made the in-memory copy current with the disk: record it,
+			// or the next read would mistake it for an external change and reload.
+			this.rememberDiskState(persisted);
 		} catch (error) {
 			this.recordError(error);
 		}
@@ -741,6 +814,7 @@ export class AuthStorage {
 	 * Get credential for a provider.
 	 */
 	get(provider: string): AuthCredential | undefined {
+		this.reloadIfAuthFileChanged();
 		return this.data[provider] ?? undefined;
 	}
 
@@ -797,6 +871,7 @@ export class AuthStorage {
 	 * Check if credentials exist for a provider in auth.json.
 	 */
 	has(provider: string): boolean {
+		this.reloadIfAuthFileChanged();
 		return provider in this.data;
 	}
 
@@ -805,6 +880,7 @@ export class AuthStorage {
 	 * Unlike getApiKey(), this doesn't refresh OAuth tokens.
 	 */
 	hasAuth(provider: string): boolean {
+		this.reloadIfAuthFileChanged();
 		return this.getAvailableAuthCandidate(provider).candidate !== undefined;
 	}
 
@@ -812,6 +888,7 @@ export class AuthStorage {
 	 * Return auth status without exposing credential values or refreshing tokens.
 	 */
 	getAuthStatus(provider: string): AuthStatus {
+		this.reloadIfAuthFileChanged();
 		return this.getAuthStatusFromCandidates(provider);
 	}
 
@@ -819,6 +896,7 @@ export class AuthStorage {
 	 * Get all credentials (for passing to getOAuthApiKey).
 	 */
 	getAll(): AuthStorageData {
+		this.reloadIfAuthFileChanged();
 		return { ...this.data };
 	}
 
@@ -934,7 +1012,9 @@ export class AuthStorage {
 			return null;
 		}
 
+		let diskContent: string | undefined;
 		const result = await this.storage.withLockAsync(async (current) => {
+			diskContent = current;
 			const currentData = this.parseStorageData(current);
 			this.data = currentData;
 			this.loadError = null;
@@ -966,9 +1046,13 @@ export class AuthStorage {
 			};
 			this.data = merged;
 			this.loadError = null;
-			return { result: refreshed, next: JSON.stringify(merged, null, 2) };
+			diskContent = JSON.stringify(merged, null, 2);
+			return { result: refreshed, next: diskContent };
 		});
 
+		// The lock's read (or its write) just made the in-memory copy current with the
+		// disk: record it, or the next read would mistake it for an external change.
+		this.rememberDiskState(diskContent);
 		return result;
 	}
 
@@ -984,6 +1068,10 @@ export class AuthStorage {
 		providerId: string,
 		options?: { includeFallback?: boolean },
 	): Promise<AuthApiKeyResult> {
+		// The stored credential is served from memory, so this read is the point where a
+		// change another process made to auth.json has to be noticed (see
+		// reloadIfAuthFileChanged).
+		this.reloadIfAuthFileChanged();
 		// Runtime overrides take precedence over stored credentials and environment keys.
 		const runtimeCandidate = this.getRuntimeAuthCandidate(providerId);
 		const runtimeKey = this.runtimeOverrides.get(providerId);
