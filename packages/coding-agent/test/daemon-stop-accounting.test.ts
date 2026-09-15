@@ -1,7 +1,7 @@
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { type DaemonTargetEvidence, daemonTargetRefusal, ShutdownReport } from "../src/cli/daemon-ps.js";
 import { getProcessStartId } from "../src/core/session-lease.js";
 
@@ -101,7 +101,7 @@ describe("daemonTargetRefusal", () => {
 });
 
 describe("ShutdownReport accounting", () => {
-	it("names a worker that converged, whether or not anything claimed to stop it", () => {
+	it("names a worker that converged, when this run is what touched it", () => {
 		const directory = makeTempDir();
 		const supervisorSocket = join(directory, "daemon.sock");
 		const workerSocket = join(directory, "worker-12f042ee5718-46490fc846bf.sock");
@@ -111,9 +111,14 @@ describe("ShutdownReport accounting", () => {
 		const report = new ShutdownReport();
 		report.observe([
 			{ socketPath: supervisorSocket, pid: 11, kind: "service" },
-			{ socketPath: workerSocket, pid: 22, kind: "worker" },
+			{ socketPath: workerSocket, pid: 22, kind: "worker", supervisorSocketPath: supervisorSocket },
 		]);
-		// The supervisor was stopped and its socket removed; the worker converged with it.
+		// What the sweep really did on the way: it signalled the supervisor, removed its
+		// socket file, and signalled the worker through the descriptor its supervisor wrote.
+		report.recordSignal(11);
+		report.recordStoppedService(supervisorSocket);
+		report.recordSocketRemoval(supervisorSocket);
+		report.recordSignal(22);
 		rmSync(supervisorSocket);
 		rmSync(workerSocket);
 		const stillPresent = report.converge();
@@ -244,5 +249,212 @@ describe("ShutdownReport accounting", () => {
 		]);
 		expect(report.discovered).toBe(1);
 		expect(report.discovered).toBe(bucketTotal(report));
+	});
+});
+
+/**
+ * Round-18 GL-1: `converge()` may only call a disappearance a stop when this run
+ * caused it. A target that dies inside the observation window for its own reasons
+ * — a natural exit, somebody else's `kill`, an orphan reaper — used to be promoted
+ * to `stopped ... converged during shutdown` over whatever weaker, truer verdict the
+ * run had already recorded, and the exit code stayed green.
+ */
+describe("ShutdownReport convergence credit", () => {
+	/** Pids that are gone, so "the process is not there" is a fact and not a fixture accident. */
+	const deadPids = [99_999_999, 99_999_998, 99_999_997, 99_999_996];
+
+	beforeEach(() => {
+		for (const pid of deadPids) {
+			expect(getProcessStartId(pid), `premise: pid ${pid} must be free on this machine`).toBeUndefined();
+		}
+	});
+
+	/** One target that was on disk when the run started, with a file to disappear. */
+	function observedFile(directory: string, name: string): string {
+		const socketPath = join(directory, name);
+		writeFileSync(socketPath, "");
+		return socketPath;
+	}
+
+	it("never credits a target that vanished without this run touching it", () => {
+		const directory = makeTempDir();
+		const socketPath = observedFile(directory, "daemon.sock");
+		const report = new ShutdownReport();
+		report.observe([{ socketPath, pid: deadPids[0], kind: "service" }]);
+
+		// An outside actor: the process exits and takes its socket file with it.
+		rmSync(socketPath);
+
+		expect(report.converge()).toEqual([]);
+		expect(report.stopped).toEqual([]);
+		expect(report.skipped).toEqual([
+			{ socketPath, pid: deadPids[0], kind: "service", reason: "vanished without this run touching it" },
+		]);
+		expect(report.discovered).toBe(bucketTotal(report));
+	});
+
+	it("credits a vanished target whose pid this run signalled", () => {
+		const directory = makeTempDir();
+		const socketPath = observedFile(directory, "daemon.sock");
+		const report = new ShutdownReport();
+		report.observe([{ socketPath, pid: deadPids[1], kind: "service" }]);
+		report.recordSignal(deadPids[1]!);
+		rmSync(socketPath);
+
+		expect(report.converge()).toEqual([]);
+		expect(report.stopped).toEqual([
+			{ socketPath, pid: deadPids[1], kind: "service", action: "converged during shutdown" },
+		]);
+		expect(report.skipped).toEqual([]);
+	});
+
+	it("credits a vanished target whose socket file this run removed", () => {
+		const directory = makeTempDir();
+		const socketPath = observedFile(directory, "daemon.sock");
+		const report = new ShutdownReport();
+		// No pid at all: an orphan file target this run unlinked.
+		report.observe([{ socketPath, kind: "listener" }]);
+		report.recordSocketRemoval(socketPath);
+		rmSync(socketPath);
+
+		expect(report.converge()).toEqual([]);
+		expect(report.stopped).toEqual([{ socketPath, kind: "listener", action: "converged during shutdown" }]);
+	});
+
+	it("credits a worker that converged with the service this run stopped", () => {
+		const directory = makeTempDir();
+		const supervisorSocket = join(directory, "daemon.sock");
+		const workerSocket = observedFile(directory, "worker-12f042ee5718-46490fc846bf.sock");
+		const report = new ShutdownReport();
+		report.observe([
+			{ socketPath: workerSocket, pid: deadPids[2], kind: "worker", supervisorSocketPath: supervisorSocket },
+		]);
+		// The service was stopped gracefully: no signal reached the worker pid, and the
+		// worker went with the service that owned it.
+		report.recordStoppedService(supervisorSocket);
+		rmSync(workerSocket);
+
+		expect(report.converge()).toEqual([]);
+		expect(report.stopped).toEqual([
+			{
+				socketPath: workerSocket,
+				pid: deadPids[2],
+				kind: "worker",
+				action: "converged with the service this run stopped",
+			},
+		]);
+	});
+
+	it("does not credit a worker of a service this run left alone", () => {
+		const directory = makeTempDir();
+		const supervisorSocket = join(directory, "kept.sock");
+		const workerSocket = observedFile(directory, "worker-12f042ee5718-aaaabbbbcccc.sock");
+		const report = new ShutdownReport();
+		report.observe([
+			{ socketPath: workerSocket, pid: deadPids[3], kind: "worker", supervisorSocketPath: supervisorSocket },
+		]);
+		// The service was protected, so nothing this run did can explain the worker's death.
+		report.recordSignal(deadPids[0]!);
+		report.recordSocketRemoval(join(directory, "something-else.sock"));
+		rmSync(workerSocket);
+
+		expect(report.converge()).toEqual([]);
+		expect(report.stopped).toEqual([]);
+		expect(report.skipped).toEqual([
+			{
+				socketPath: workerSocket,
+				pid: deadPids[3],
+				kind: "worker",
+				reason: "vanished without this run touching it",
+			},
+		]);
+	});
+
+	it("keeps the run's own earlier verdict when an untouched target vanishes", () => {
+		const directory = makeTempDir();
+		const keptSocket = observedFile(directory, "kept.sock");
+		const refusedSocket = observedFile(directory, "stranger.pipe");
+		const unforcedSocket = observedFile(directory, "unresponsive.sock");
+		const report = new ShutdownReport();
+		report.observe([
+			{ socketPath: keptSocket, pid: deadPids[0], kind: "service" },
+			{ socketPath: refusedSocket, pid: deadPids[1], kind: "listener" },
+			{ socketPath: unforcedSocket, pid: deadPids[2], kind: "service" },
+		]);
+		report.keep({
+			socketPath: keptSocket,
+			pid: deadPids[0],
+			kind: "service",
+			reason: "has live work (1 worker process(es))",
+		});
+		report.refuse({
+			socketPath: refusedSocket,
+			pid: deadPids[1],
+			kind: "listener",
+			reason: `refusing to signal pid ${deadPids[1]}: it is not a verified daemon`,
+		});
+		report.claim("skipped", {
+			socketPath: unforcedSocket,
+			pid: deadPids[2],
+			kind: "service",
+			reason: "did not stop gracefully; retry with --force",
+		});
+
+		rmSync(keptSocket);
+		rmSync(refusedSocket);
+		rmSync(unforcedSocket);
+
+		// All three are gone and none of them was touched, so no verdict may be promoted;
+		// what the run decided is what the report still says.
+		expect(report.converge()).toEqual([]);
+		expect(report.stopped).toEqual([]);
+		expect(report.leftRunning).toEqual([
+			{ socketPath: keptSocket, pid: deadPids[0], kind: "service", reason: "has live work (1 worker process(es))" },
+			{
+				socketPath: refusedSocket,
+				pid: deadPids[1],
+				kind: "listener",
+				reason: `refusing to signal pid ${deadPids[1]}: it is not a verified daemon`,
+			},
+		]);
+		expect(report.skipped).toEqual([
+			{
+				socketPath: unforcedSocket,
+				pid: deadPids[2],
+				kind: "service",
+				reason: "did not stop gracefully; retry with --force",
+			},
+		]);
+		expect(report.discovered).toBe(3);
+		expect(report.discovered).toBe(bucketTotal(report));
+	});
+
+	it("still separates a target that was never there from one that vanished", () => {
+		const directory = makeTempDir();
+		const staleSocket = join(directory, "gone-before.sock");
+		const vanishedSocket = observedFile(directory, "gone-during.sock");
+		const report = new ShutdownReport();
+		report.observe([
+			{ socketPath: staleSocket, pid: deadPids[0], kind: "service" },
+			{ socketPath: vanishedSocket, pid: deadPids[1], kind: "service" },
+		]);
+		rmSync(vanishedSocket);
+
+		expect(report.converge()).toEqual([]);
+		expect(report.skipped).toEqual([
+			{
+				socketPath: staleSocket,
+				pid: deadPids[0],
+				kind: "service",
+				reason: "already gone before the stop; nothing to stop",
+			},
+			{
+				socketPath: vanishedSocket,
+				pid: deadPids[1],
+				kind: "service",
+				reason: "vanished without this run touching it",
+			},
+		]);
+		expect(report.stopped).toEqual([]);
 	});
 });

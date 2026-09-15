@@ -44,6 +44,83 @@ function spawnListener(socketPath: string): ChildProcess {
 	return child;
 }
 
+/**
+ * A listener that takes its own socket file with it when it is told to die, the
+ * way a real daemon does. Both faces of the target disappear at once, which is
+ * the shape the convergence window has to judge honestly.
+ */
+function spawnSelfCleaningListener(socketPath: string): ChildProcess {
+	const script = [
+		'const net = require("node:net");',
+		'const fs = require("node:fs");',
+		"const socketPath = process.env.P0_TEST_LISTEN_SOCKET;",
+		"const server = net.createServer((connection) => connection.destroy());",
+		"server.listen(socketPath);",
+		"const leave = () => {",
+		"	try { server.close(); } catch {}",
+		"	try { fs.unlinkSync(socketPath); } catch {}",
+		"	process.exit(0);",
+		"};",
+		'process.on("SIGTERM", leave);',
+		'process.on("SIGINT", leave);',
+	].join("\n");
+	const child = spawn(process.execPath, ["-e", script], {
+		env: { ...process.env, P0_TEST_LISTEN_SOCKET: socketPath },
+		stdio: ["ignore", "ignore", "ignore"],
+	});
+	children.add(child);
+	return child;
+}
+
+/** A listener killed outright, so its socket file survives it: one orphan file, no process. */
+function spawnAbandonedListener(socketPath: string): ChildProcess {
+	const script = [
+		'const net = require("node:net");',
+		"const server = net.createServer((connection) => connection.destroy());",
+		"server.listen(process.env.P0_TEST_LISTEN_SOCKET, () => {",
+		'	process.kill(process.pid, "SIGKILL");',
+		"});",
+	].join("");
+	const child = spawn(process.execPath, ["-e", script], {
+		env: { ...process.env, P0_TEST_LISTEN_SOCKET: socketPath },
+		stdio: ["ignore", "ignore", "ignore"],
+	});
+	children.add(child);
+	return child;
+}
+
+/** A tracked worker descriptor: the supervisor's own record of one worker it owns. */
+function writeWorkerDescriptor(
+	agentDir: string,
+	workerId: string,
+	pid: number,
+	socketPath: string,
+	supervisorSocketPath: string,
+): void {
+	const descriptorDirectory = join(agentDir, "daemon-workers", workerId);
+	mkdirSync(descriptorDirectory, { recursive: true });
+	writeFileSync(
+		join(descriptorDirectory, "worker.json"),
+		JSON.stringify({
+			version: 2,
+			workerId,
+			pid,
+			processStartId: getProcessStartId(pid),
+			socketPath,
+			recoveryJournalPath: join(descriptorDirectory, "recovery.jsonl"),
+			orphanProcessJournalPath: join(descriptorDirectory, "orphans.jsonl"),
+			supervisorSocketPath: normalizeSocketPath(supervisorSocketPath),
+			authenticationToken: "token",
+			rootActiveSessionId: "session",
+			createdAt: new Date().toISOString(),
+			updatedAt: new Date().toISOString(),
+			lifecycle: "ready",
+			createCommand: { type: "create", noSession: true },
+			consecutiveFailures: 0,
+		}),
+	);
+}
+
 function alive(pid: number | undefined): boolean {
 	if (pid === undefined) return false;
 	try {
@@ -61,6 +138,15 @@ async function waitForSocketFile(socketPath: string, timeoutMs = 5000): Promise<
 		await new Promise((resolve) => setTimeout(resolve, 25));
 	}
 	throw new Error(`listener never created ${socketPath}`);
+}
+
+async function waitForFileGone(path: string, timeoutMs = 20000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (!existsSync(path)) return;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	throw new Error(`${path} was never removed`);
 }
 
 async function waitForExitOf(pid: number, timeoutMs = 8000): Promise<void> {
@@ -123,21 +209,29 @@ function writeOwnerRecord(
 	);
 }
 
-async function runShutdown(selection: StopSelection): Promise<Record<string, unknown>> {
+async function runShutdownWithExitCode(
+	selection: StopSelection,
+): Promise<{ report: Record<string, unknown>; exitCode: number | string | undefined }> {
 	const logs: string[] = [];
 	const log = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
 		logs.push(args.map((value) => String(value)).join(" "));
 	});
 	const previousExitCode = process.exitCode;
+	let exitCode: number | string | undefined;
 	try {
 		await runShutdownSelection(true, true, selection);
+		exitCode = process.exitCode ?? undefined;
 	} finally {
 		log.mockRestore();
 		process.exitCode = previousExitCode;
 	}
 	const last = logs.at(-1);
 	if (!last) throw new Error("shutdown printed nothing");
-	return JSON.parse(last) as Record<string, unknown>;
+	return { report: JSON.parse(last) as Record<string, unknown>, exitCode };
+}
+
+async function runShutdown(selection: StopSelection): Promise<Record<string, unknown>> {
+	return (await runShutdownWithExitCode(selection)).report;
 }
 
 function entriesOf(result: Record<string, unknown>, key: string): ShutdownTargetEntry[] {
@@ -290,5 +384,83 @@ describe("stop target identity and convergence", () => {
 			entriesOf(result, "leftRunning").length;
 		expect(result.discovered).toBe(buckets);
 		expect(entriesOf(result, "failed")).toEqual([]);
+	}, 60_000);
+
+	it("does not credit a target that vanished on its own inside the convergence window", async () => {
+		const socketDirectory = join(root, "sockets");
+		mkdirSync(socketDirectory, { recursive: true });
+		mkdirSync(defaultDaemonSocketDir(), { recursive: true });
+
+		// A service `--orphans` keeps: it owns a live worker, so it has live work and
+		// no signal in this run may reach it.
+		const keptSocket = join(socketDirectory, "kept.sock");
+		const kept = spawnSelfCleaningListener(keptSocket);
+		await waitForSocketFile(keptSocket);
+		// Its worker. A worker socket is inside the scope and is observed as a target
+		// of the run, and nothing in a run that may not touch its supervisor signals it.
+		const workerSocket = join(defaultDaemonSocketDir(), "worker-12f042ee5718-aaaabbbbcccc.sock");
+		const worker = spawnSelfCleaningListener(workerSocket);
+		await waitForSocketFile(workerSocket);
+		writeWorkerDescriptor(process.env[ENV_AGENT_DIR]!, "r18-worker", worker.pid!, workerSocket, keptSocket);
+		// The positive control: an orphan socket file with no process behind it, which
+		// this run really removes and really reports as a stop of its own.
+		const orphanSocket = join(defaultDaemonSocketDir(), "stale.sock");
+		spawnAbandonedListener(orphanSocket);
+		await waitForSocketFile(orphanSocket);
+
+		writeFakeTools(join(root, "bin"), [
+			{ pid: kept.pid!, socketPath: keptSocket },
+			{ pid: worker.pid!, socketPath: workerSocket },
+		]);
+		process.env.PATH = `${join(root, "bin")}:${process.env.PATH ?? ""}`;
+
+		const running = runShutdownWithExitCode({ scope: { kind: "machine" }, orphansOnly: true });
+		// Removing the orphan file is the stop plan's own first act, so its disappearance
+		// is the proof that the plan is already running: both live targets above were
+		// observed before any signal, and the kept service is already protected. Killing
+		// them here is an outside actor inside the convergence window, and the report has
+		// to say that is what happened instead of claiming the stops for itself.
+		await waitForFileGone(orphanSocket);
+		kept.kill("SIGTERM");
+		worker.kill("SIGTERM");
+		const { report, exitCode } = await running;
+
+		await waitForExitOf(kept.pid!);
+		await waitForExitOf(worker.pid!);
+		expect(alive(kept.pid), "the kept service was killed from outside").toBe(false);
+		expect(alive(worker.pid), "the worker was killed from outside").toBe(false);
+		expect(existsSync(keptSocket)).toBe(false);
+		expect(existsSync(workerSocket)).toBe(false);
+
+		// The proposition: neither vanished target was signalled by this run, and this
+		// run never removed either socket file, so neither is a stop it performed. The
+		// one entry `stopped` may hold is the orphan file the plan really removed.
+		expect(entriesOf(report, "stopped")).toEqual([
+			{ socketPath: orphanSocket, kind: "service", action: "removed stale socket file" },
+		]);
+
+		const keptEntry = [...entriesOf(report, "leftRunning"), ...entriesOf(report, "skipped")].find(
+			(entry) => entry.socketPath === keptSocket,
+		);
+		expect(keptEntry, JSON.stringify(report)).toBeDefined();
+		expect(keptEntry?.reason).toMatch(/live work/);
+		const workerEntry = [...entriesOf(report, "leftRunning"), ...entriesOf(report, "skipped")].find(
+			(entry) => entry.socketPath === workerSocket,
+		);
+		expect(workerEntry, JSON.stringify(report)).toBeDefined();
+		expect(workerEntry?.pid).toBe(worker.pid);
+		expect(workerEntry?.reason).toMatch(/vanished without this run touching it/);
+
+		// The observation face stays clean and the buckets still add up, so the honest
+		// verdict cannot be had by dropping the target from the report.
+		expect(report.stillPresent).toEqual([]);
+		expect(entriesOf(report, "failed")).toEqual([]);
+		expect(exitCode ?? 0).toBe(0);
+		const buckets =
+			entriesOf(report, "stopped").length +
+			entriesOf(report, "failed").length +
+			entriesOf(report, "skipped").length +
+			entriesOf(report, "leftRunning").length;
+		expect(report.discovered).toBe(buckets);
 	}, 60_000);
 });
