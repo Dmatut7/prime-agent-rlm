@@ -1,0 +1,3 @@
+- Decoupled trusted self-update artifact origins from the manifest download base, so PRIME_AGENT_DOWNLOAD_BASE_URL relocates manifests without widening artifact trust (PRIME_AGENT_TRUSTED_UPDATE_ORIGINS opts in to extra origins).
+- Refused unpinned registry-lane self-updates and the silent bare-name fallback when the release manifest cannot be fetched (PRIME_AGENT_ALLOW_REGISTRY_UPDATE opts in).
+- `prime-agent attach` now reports auth_stale events instead of staying silent until the next 401.
