@@ -883,6 +883,18 @@ class HarnessState:
     ) -> RefinementEvent:
         if target := self._global_target(global_, kwargs):
             return target.record_refinement(trigger, changes, evidence=evidence, outcome=outcome, id=id)
+        if not isinstance(trigger, str):
+            raise ValueError("trigger must be a string")
+        if not isinstance(changes, (list, str)):
+            raise ValueError("changes must be a list of strings or a single string")
+        if isinstance(changes, list) and not all(isinstance(change, str) for change in changes):
+            raise ValueError("changes must be a list of strings or a single string")
+        if not isinstance(evidence, str):
+            raise ValueError("evidence must be a string")
+        if not isinstance(outcome, str):
+            raise ValueError("outcome must be a string")
+        if id is not None and not isinstance(id, str):
+            raise ValueError("id must be a string or None")
         self._sync_from_disk()
         self._ensure_local_writable()
         event_id = id or f"refine_{len(self.refinements) + 1:04d}"

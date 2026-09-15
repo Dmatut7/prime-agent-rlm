@@ -618,12 +618,26 @@ export async function processResponsesStream<TApi extends Api>(
 		} else if (event.type === "response.output_item.done") {
 			const item = event.item;
 			const { outputIndex } = itemScoped(event);
+			// Resolution order matches resolveItemAndBlock: item id, then output_index,
+			// and only a done event with neither coordinate falls back to the last-added
+			// block. A duplicate or out-of-order done whose slot is already released must
+			// not silently land on another item's live block (K3R-12): that would stamp
+			// item A's reasoning JSON onto item B's thinkingSignature, emit a second
+			// thinking_end for B's contentIndex, and misattribute the diagnostic.
 			let slot: ResponsesItemSlot | null = null;
-			if (typeof item.id === "string") {
+			const hasCoordinates = (typeof item.id === "string" && item.id.length > 0) || outputIndex !== undefined;
+			if (typeof item.id === "string" && item.id.length > 0) {
 				slot = slotsByItemId.get(item.id) ?? null;
-			}
-			if (!slot && outputIndex !== undefined) {
+			} else if (outputIndex !== undefined) {
 				slot = slotsByOutputIndex.get(outputIndex) ?? null;
+			}
+			if (!slot && hasCoordinates) {
+				recordDeltaDiagnostic("responses_done_unrouted", {
+					eventType: event.type,
+					itemId: typeof item.id === "string" ? item.id : undefined,
+					outputIndex,
+				});
+				continue;
 			}
 			const block: Block | null = slot?.block ?? currentBlock;
 

@@ -1,0 +1,3 @@
+- Fixed the Python kernel snapshot so open file handles are never persisted or reopened (a write-mode handle used to truncate the real file at restore time), non-string namespace keys no longer abort every snapshot, and functions pickled under a different Python version are refused with a per-name reason instead of crashing the kernel when called.
+- Added a model-visible receipt when an ordinary kernel state snapshot write fails, so the model learns its names were not saved to disk instead of silently losing them on restart.
+- Hardened the harness state formatting against refinement events or entries with null fields written by older runtimes, so system-prompt construction no longer throws.

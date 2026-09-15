@@ -1,0 +1,1 @@
+- Fixed a duplicate or out-of-order `output_item.done` in the OpenAI Responses stream from stamping another item's reasoning JSON onto a live thinking block's signature; unrouted done events now record a diagnostic and are skipped.

@@ -184,6 +184,23 @@ export function compactionKernelStateLines(input: {
 }
 
 /**
+ * The model-visible receipt for a snapshot write that failed outside compaction (the
+ * debounced auto-write after a cell, or the dispose flush). The compaction path has its
+ * own wording (`compactionKernelStateLines`); an ordinary failure used to reach only the
+ * in-memory stderr ring, so the model kept believing its namespace was persisted.
+ *
+ * One receipt per failure episode: a write that succeeds re-arms the notice (the
+ * session-side glue de-duplicates; this function is the wording only).
+ */
+export function snapshotFailureNoticeLines(detail: string): string[] {
+	return [
+		"Your Python kernel is still running, but its state snapshot could not be written, so these names were not saved to disk.",
+		`Reason: ${detail}.`,
+		"A restart revives only the last successfully written snapshot: anything defined since then must be recreated. The kernel keeps retrying the write after later cells; this notice repeats only while writes keep failing.",
+	];
+}
+
+/**
  * The `<ipython_state_restored>` body for one restore result. Kept next to the result shape
  * so the wording is assertable without building a session; the session glue that renders it
  * lives in agent-session.ts.
@@ -232,6 +249,14 @@ export interface SnapshotManifestFacts {
 	notSaved: SnapshotDroppedName[];
 	/** Wall clock of the write, when the manifest records one; undefined otherwise. */
 	writtenAtMs?: number;
+	/**
+	 * The Python version of the interpreter that wrote the payload (e.g. "3.11.13"),
+	 * when the manifest records one. The restore request forwards it so the runtime
+	 * can refuse to revive by-value functions and classes pickled under a different
+	 * major.minor line (reviving them reports success, then executing them kills the
+	 * kernel with SIGTRAP/SIGSEGV).
+	 */
+	pythonVersion?: string;
 }
 
 function stringArray(value: unknown): string[] {
@@ -269,10 +294,12 @@ export function readSnapshotManifest(manifestPath: string): SnapshotManifestFact
 	const preserved = new Set(stringArray(record.preserved));
 	const notSaved = reasonEntries(record.skipped).filter((entry) => !preserved.has(entry.name));
 	const stamp = typeof record.timestamp === "string" ? Date.parse(record.timestamp) : Number.NaN;
+	const pythonVersion = typeof record.pythonVersion === "string" ? record.pythonVersion : undefined;
 	return {
 		savedNames: stringArray(record.savedNames),
 		notSaved,
 		...(Number.isFinite(stamp) ? { writtenAtMs: stamp } : {}),
+		...(pythonVersion !== undefined ? { pythonVersion } : {}),
 	};
 }
 

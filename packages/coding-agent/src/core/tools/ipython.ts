@@ -337,6 +337,11 @@ export interface IpythonToolOptions {
 	 */
 	onUnexpectedExit?: (cause: KernelDeathCause, facts: KernelUnexpectedExitFacts) => void;
 	/**
+	 * A namespace snapshot write failed: fired once per failure episode so the session can
+	 * show the model a receipt (the write is otherwise invisible outside the stderr ring).
+	 */
+	onSnapshotFailure?: (detail: string) => void;
+	/**
 	 * Live kernel restart budget, read at every unexpected exit. Omit for the shipped defaults
 	 * (three revivals per rolling hour, then fail closed).
 	 */
@@ -569,6 +574,7 @@ export class IpythonKernelProvisioner {
 				stderrLogPath: snapshotDir ? join(snapshotDir, "kernel-stderr.log") : undefined,
 				bootstrapCode,
 				...(this.options?.onUnexpectedExit ? { onUnexpectedExit: this.options.onUnexpectedExit } : {}),
+				...(this.options?.onSnapshotFailure ? { onSnapshotFailure: this.options.onSnapshotFailure } : {}),
 				...(this.options?.restartPolicy ? { restartPolicy: this.options.restartPolicy } : {}),
 				restartLedger: this.restartLedger,
 				...(this.options?.cancellableHostRequestTypes
