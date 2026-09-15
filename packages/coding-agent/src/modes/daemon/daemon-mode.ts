@@ -5194,9 +5194,21 @@ export class AgentDaemon {
 
 			case "get_session_tree": {
 				const state = this.getSessionState(command.activeSessionId);
+				const sessionManager = state.runtime.session.sessionManager;
+				// Every entry ships whole, so an uncapped response is O(entries) bytes - a
+				// 100k-entry session is ~90MB per call. The cap keeps the newest entries (the
+				// leaf is last in file order, so the resumable branch stays present) and the
+				// stats travel to the client so the omission is reportable, not silent.
+				const bounded = sessionManager.getBoundedFlatTree();
+				if (bounded.stats.truncated) {
+					this.log(
+						`get_session_tree truncated: ${bounded.stats.returnedNodes} of ${bounded.stats.totalEntries} entries (max ${bounded.stats.maxNodes}); older branches omitted`,
+					);
+				}
 				return success(command.id, "get_session_tree", {
-					flatNodes: state.runtime.session.sessionManager.getFlatTree(),
-					leafId: state.runtime.session.sessionManager.getLeafId(),
+					flatNodes: bounded.nodes,
+					leafId: sessionManager.getLeafId(),
+					treeBound: bounded.stats,
 				});
 			}
 
