@@ -242,6 +242,22 @@ export function formatAgentSessionNameUnavailable(name: string, depth: number): 
 }
 
 /**
+ * The name collides with a same-depth sibling whose parent we could NOT compare against this
+ * one's (one side records only a parent id, the other only a parent path, and the catalog cannot
+ * bridge them). Unlike {@link formatAgentSessionNameUnavailable} we cannot claim the two share a
+ * parent, so the copy says the parent could not be confirmed and points at the same two actions.
+ */
+export function formatAgentSessionNameParentUnconfirmed(name: string, depth: number): string {
+	return (
+		`Agent name "${name}" is unavailable: a same-depth agent of that name exists, but its ` +
+		`parent could not be confirmed against this one (depth ${depth}; the two record different ` +
+		"identifier shapes and the catalog cannot compare them). " +
+		"Call `await rlm.list_subagents()` to see the existing children and their parents, " +
+		"or pass a different `name=`."
+	);
+}
+
+/**
  * The name is reserved by an admission this same session already started - the shape a retry of
  * your own `rlm()` call hits. Spawning again would create a second child for one task, so the copy
  * points at the handle that is about to exist instead of at a new name.
@@ -259,15 +275,21 @@ export function assertAgentSessionNameAvailable(
 	catalog: readonly AgentFamilyCatalogEntry[],
 	input: AgentSessionNameAvailabilityInput,
 ): void {
-	const conflict = catalog.some(
-		(entry) =>
-			entry.id !== input.ignoreSessionId &&
-			entry.name === input.name &&
-			entry.depth === input.depth &&
-			sameAgentSessionNameParent(entry, input, catalog),
-	);
-	if (conflict) {
-		throw new Error(formatAgentSessionNameUnavailable(input.name, input.depth));
+	let unresolvedConflict = false;
+	for (const entry of catalog) {
+		if (entry.id === input.ignoreSessionId || entry.name !== input.name || entry.depth !== input.depth) {
+			continue;
+		}
+		const match = classifyAgentSessionNameParent(entry, input, catalog);
+		if (match === "same") {
+			throw new Error(formatAgentSessionNameUnavailable(input.name, input.depth));
+		}
+		if (match === "unresolved") {
+			unresolvedConflict = true;
+		}
+	}
+	if (unresolvedConflict) {
+		throw new Error(formatAgentSessionNameParentUnconfirmed(input.name, input.depth));
 	}
 }
 
@@ -307,27 +329,42 @@ export function buildAgentFamilyRoster(
 	};
 }
 
-function sameAgentSessionNameParent(
+function classifyAgentSessionNameParent(
 	left: AgentSessionNameScope,
 	right: AgentSessionNameScope,
 	catalog: readonly AgentFamilyCatalogEntry[],
-): boolean {
+): "same" | "unrelated" | "unresolved" {
+	// All depth-0 sessions share the top-level naming scope regardless of parent identifiers, so
+	// two roots are always a proven collision.
 	if (left.depth === 0 && right.depth === 0) {
-		return true;
+		return "same";
 	}
-	return sameAgentFamilyParent(left, right, catalog);
+	return classifyAgentFamilyParent(left, right, catalog);
 }
 
-function sameAgentFamilyParent(
+/**
+ * Whether two scopes could plausibly sit under the same parent.
+ *
+ * - "same": the parent identifiers positively match (path==path, id==id, the catalog bridges
+ *   an id to a path, or both are parentless roots).
+ * - "unrelated": the parent difference is proven - both sides carry the same kind of parent
+ *   identifier and the values differ, or a mixed id/path pair resolves through the catalog to
+ *   two different parents. A parentless non-root is also unrelated: an anonymous orphan must
+ *   not collide with, or be grouped into, a named family.
+ * - "unresolved": the sides carry different kinds of identifier (one id-only, one path-only)
+ *   and the catalog holds no entry that lets the two be compared. This is NOT proof of an
+ *   unrelated pair - it is a missing comparison.
+ */
+function classifyAgentFamilyParent(
 	left: AgentSessionNameScope,
 	right: AgentSessionNameScope,
 	catalog: readonly AgentFamilyCatalogEntry[],
-): boolean {
+): "same" | "unrelated" | "unresolved" {
 	if (left.parentSessionPath !== undefined && left.parentSessionPath === right.parentSessionPath) {
-		return true;
+		return "same";
 	}
 	if (left.parentSessionId !== undefined && left.parentSessionId === right.parentSessionId) {
-		return true;
+		return "same";
 	}
 	const hasCatalogParentPair = (parentSessionId: string | undefined, parentSessionPath: string | undefined) =>
 		parentSessionId !== undefined &&
@@ -341,7 +378,7 @@ function sameAgentFamilyParent(
 		hasCatalogParentPair(left.parentSessionId, right.parentSessionPath) ||
 		hasCatalogParentPair(right.parentSessionId, left.parentSessionPath)
 	) {
-		return true;
+		return "same";
 	}
 	if (
 		left.depth === 0 &&
@@ -351,10 +388,51 @@ function sameAgentFamilyParent(
 		left.parentSessionId === undefined &&
 		right.parentSessionId === undefined
 	) {
-		return true;
+		return "same";
 	}
-	// Unresolved mixed identifiers stay unrelated to avoid false name conflicts across families.
-	return false;
+	// No positive match. Distinguish a proven difference from a comparison we could not make.
+	const leftHasId = left.parentSessionId !== undefined;
+	const leftHasPath = left.parentSessionPath !== undefined;
+	const rightHasId = right.parentSessionId !== undefined;
+	const rightHasPath = right.parentSessionPath !== undefined;
+	// A side that carries NO parent identifier at all (a depth>0 orphan, or a scope whose
+	// parent was never recorded) is kept unrelated ON PURPOSE, not as a gap: merging it into
+	// "possibly related" would (1) make an anonymous orphan block a real named family from
+	// using that name and (2) attach an unrelated orphan as a reachable sibling in the roster.
+	// The mixed-identifier defect SC-4 is about is a pair where BOTH sides name a parent but in
+	// incomparable shapes - that is handled as "unresolved" below. A truly absent parent on either
+	// side is a product decision ("orphans do not merge into named families"), pinned by
+	// test/agent-session-bus.test.ts "resolves sibling parents canonically without grouping
+	// parentless non-roots" and "authorizes exactly one persisted nuclear-family edge".
+	if (!(leftHasId || leftHasPath) || !(rightHasId || rightHasPath)) {
+		return "unrelated";
+	}
+	// Same-kind identifiers present on both sides and not equal above -> proven distinct.
+	if (leftHasPath && rightHasPath) {
+		return "unrelated";
+	}
+	if (leftHasId && rightHasId) {
+		return "unrelated";
+	}
+	// Mixed: one side is id-only, the other path-only, and the catalog bridge above failed.
+	// If the id maps to a catalog session with a known path, that path differs from the other
+	// side (else the bridge matched) -> proven distinct. If the id is absent from the catalog,
+	// we cannot compare the two parents at all -> unresolved.
+	const idOnlySide = leftHasId ? left : right;
+	const resolvesInCatalog = catalog.some(
+		(entry) => entry.id === idOnlySide.parentSessionId && entry.sessionPath !== undefined,
+	);
+	return resolvesInCatalog ? "unrelated" : "unresolved";
+}
+
+function sameAgentFamilyParent(
+	left: AgentSessionNameScope,
+	right: AgentSessionNameScope,
+	catalog: readonly AgentFamilyCatalogEntry[],
+): boolean {
+	// Only a proven difference makes two scopes unrelated; an unresolved comparison is treated
+	// as possibly the same parent so a same-named sibling cannot slip under the same parent.
+	return classifyAgentFamilyParent(left, right, catalog) !== "unrelated";
 }
 
 function isAgentFamilyParent(parent: AgentFamilyCatalogEntry, child: AgentFamilyCatalogEntry): boolean {
