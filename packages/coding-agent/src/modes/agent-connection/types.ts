@@ -26,7 +26,6 @@ import type {
 	SessionActionSnapshot,
 } from "../../core/session-action-store.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
-import type { SessionTreeDepthStats } from "../../core/session-manager.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import type { StallDiagnostics } from "../../core/stall-diagnostics.js";
 import type { SessionUsageSummary } from "../../core/usage.js";
@@ -276,6 +275,45 @@ export interface AgentConnectionSessionTreeNode extends AgentConnectionSessionTr
 	children: AgentConnectionSessionTreeNode[];
 }
 
+/**
+ * What a depth-bounded session tree left out, so a truncation is never silent.
+ *
+ * This is the connection-owned wire DTO for the local manager's `SessionTreeDepthStats`.
+ * The contract deliberately does not import that module: `SessionManager` is runtime
+ * ownership, and a remote adapter must be able to implement this surface without the local
+ * session runtime in its type graph (see test/interactive-mode-boundary.test.ts). The two
+ * field sets are pinned to each other by test/session-tree-wire-bounds.test.ts, so the
+ * mirror cannot drift silently.
+ */
+export interface AgentConnectionSessionTreeBound {
+	/** Entries in the session. */
+	entries: number;
+	/** Nodes the client receives. */
+	returnedNodes: number;
+	/**
+	 * Nodes outside both retained depth windows: present in the session, absent from the
+	 * returned tree. The windows are anchored at the deepest entry and at the live leaf's
+	 * own depth, so these are the *older* ancestors of either chain.
+	 */
+	omittedNodes: number;
+	/** Depth (parent edges) of the deepest entry in the session. */
+	maxDepth: number;
+	depthLimit: number;
+	/**
+	 * Depth of the shallowest retained node, i.e. how many top layers were cut. 0 when the
+	 * whole tree fit. A retained node whose parent is not retained comes back as a root, so
+	 * a client can tell a truncated view from a session that really starts there.
+	 */
+	retainedFromDepth: number;
+	/**
+	 * The session's live leaf is a node in the returned tree: the window is anchored at the
+	 * leaf's own depth, so the entry the session resumes on keeps its ancestor chain. False
+	 * when the session has no leaf.
+	 */
+	leafIncluded: boolean;
+	truncated: boolean;
+}
+
 export interface AgentConnectionSessionContext {
 	messages: AgentMessage[];
 	thinkingLevel: string;
@@ -316,7 +354,7 @@ export interface AgentConnectionSnapshot {
 		tree: AgentConnectionSessionTreeNode[];
 		leafId: string | null;
 		/** Present when the tree was depth-bounded; says what the bound left out. */
-		bound?: SessionTreeDepthStats;
+		bound?: AgentConnectionSessionTreeBound;
 	};
 	parent?: AgentConnectionParentMetadata;
 	/** Live RLM children, including descendants, known to the host at snapshot time. */

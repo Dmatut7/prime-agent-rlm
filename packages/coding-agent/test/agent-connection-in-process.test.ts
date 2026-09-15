@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { AgentSessionEvent, AgentSessionEventListener, PromptOptions } from "../src/core/agent-session.js";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.js";
 import { emptyGoalState } from "../src/core/goals.js";
+import { SESSION_TREE_MAX_WIRE_DEPTH } from "../src/core/session-manager.js";
 import { InProcessAgentConnection } from "../src/modes/agent-connection/in-process-agent-connection.js";
 import type { AgentConnectionEvent, AgentConnectionState } from "../src/modes/agent-connection/types.js";
 
@@ -83,6 +84,35 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 			getLeafId: () => `${id}-leaf`,
 			getEntries: () => [],
 			getTree: () => [],
+			// The snapshot ships the depth-bounded tree, so the double has to answer the
+			// bounded request the real SessionManager answers. The stats are distinctive on
+			// purpose: the snapshot must forward what the manager measured (including a
+			// truncation), not invent its own.
+			getBoundedTree: () => ({
+				tree: [
+					{
+						entry: {
+							type: "message",
+							id: `${id}-node`,
+							parentId: null,
+							timestamp: new Date(1).toISOString(),
+							message: messages[0] ?? userMessage("tree node", 1),
+						},
+					},
+				],
+				stats: {
+					entries: 3,
+					returnedNodes: 1,
+					omittedNodes: 2,
+					maxDepth: SESSION_TREE_MAX_WIRE_DEPTH + 2,
+					depthLimit: SESSION_TREE_MAX_WIRE_DEPTH,
+					// The r19 anchor semantics: the live leaf survived the bound and the
+					// shallowest retained node sits one level down.
+					retainedFromDepth: 1,
+					leafIncluded: true,
+					truncated: true,
+				},
+			}),
 			buildSessionContext,
 		},
 		buildSessionContext,
@@ -274,8 +304,30 @@ describe("InProcessAgentConnection", () => {
 				model: null,
 			},
 			sessionTree: {
-				tree: [],
+				tree: [
+					{
+						entry: {
+							type: "message",
+							id: "snapshot-node",
+							parentId: null,
+							timestamp: new Date(1).toISOString(),
+							message: userMessage("snapshot context", 1),
+						},
+					},
+				],
 				leafId: "snapshot-leaf",
+				// The bound rides with the tree: a client that receives a truncated tree must be
+				// able to say so, and the snapshot may not restate the manager's numbers.
+				bound: {
+					entries: 3,
+					returnedNodes: 1,
+					omittedNodes: 2,
+					maxDepth: SESSION_TREE_MAX_WIRE_DEPTH + 2,
+					depthLimit: SESSION_TREE_MAX_WIRE_DEPTH,
+					retainedFromDepth: 1,
+					leafIncluded: true,
+					truncated: true,
+				},
 			},
 		});
 		messages.push(userMessage("later context", 2));

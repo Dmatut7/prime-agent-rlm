@@ -26,10 +26,12 @@ import {
 	type SessionEntry,
 	type SessionHeader,
 	SessionManager,
+	type SessionTreeDepthStats,
 	type SessionTreeNode,
 } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import { createAgentConnectionSnapshot } from "../src/modes/agent-connection/snapshot.js";
+import type { AgentConnectionSessionTreeBound } from "../src/modes/agent-connection/types.js";
 import { serializeJsonLine } from "../src/modes/rpc/jsonl.js";
 import { createTestResourceLoader } from "./utilities.js";
 
@@ -152,6 +154,7 @@ describe("session tree wire bounds", () => {
 			expect(tree?.bound?.depthLimit).toBe(SESSION_TREE_MAX_WIRE_DEPTH);
 			expect(tree?.bound?.truncated).toBe(true);
 			expect(tree?.bound?.omittedNodes).toBeGreaterThan(0);
+			expect(tree?.bound?.maxDepth).toBe(CHAIN_LENGTH - 1);
 			// Depth is parent edges, so the kept window is `depthLimit` levels plus the
 			// shallowest retained node that stands as their root.
 			expect(tree?.bound?.returnedNodes).toBe(SESSION_TREE_MAX_WIRE_DEPTH + 1);
@@ -349,5 +352,27 @@ describe("session tree wire bounds", () => {
 		expect(stats.truncated).toBe(false);
 		expect(stats.omittedNodes).toBe(0);
 		expect(stats.entries).toBe(5);
+		// The connection contract owns its wire DTO (`AgentConnectionSessionTreeBound`) and may
+		// not import this module, so pin the two field sets to each other: a field added to or
+		// dropped from these stats must fail here instead of silently narrowing the wire shape.
+		// The r19 anchor semantics widened the shape: `retainedFromDepth` now reports the depth
+		// of the shallowest retained node (how many top layers were cut) and `leafIncluded`
+		// says whether the entry the session resumes on survived the bound, so both must ride
+		// on the wire DTO too.
+		expect(Object.keys(stats).sort()).toEqual([
+			"depthLimit",
+			"entries",
+			"leafIncluded",
+			"maxDepth",
+			"omittedNodes",
+			"retainedFromDepth",
+			"returnedNodes",
+			"truncated",
+		]);
+		// The mirror pin, both directions: the DTO must not name a field the stats lack, and
+		// the stats must not gain a field the DTO hides. tsgo fails on either drift.
+		const boundMirror: AgentConnectionSessionTreeBound = stats;
+		const statsMirror: SessionTreeDepthStats = boundMirror;
+		expect(Object.keys(boundMirror).sort()).toEqual(Object.keys(statsMirror).sort());
 	});
 });
