@@ -20,6 +20,7 @@ import {
 import { defaultDaemonSocketDir, defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
 import {
 	acquireDaemonShutdownAdmission,
+	findLiveDaemonOwnersForAgentDir,
 	readRecordedDaemonSocketOwners,
 } from "../modes/daemon/daemon-supervisor-ownership.js";
 import type { DaemonWorkerDescriptor } from "../modes/daemon/daemon-worker-protocol.js";
@@ -27,6 +28,7 @@ import { signalProcessGroupOrProcess } from "../utils/child-process.js";
 import { formatDaemonListTable } from "./daemon-ps-format.js";
 import { promptYesNo } from "./daemon-stop-confirm.js";
 import {
+	bindStopSelection,
 	currentShutdownScope,
 	describeShutdownScope,
 	MACHINE_SCOPE,
@@ -65,6 +67,7 @@ export type DaemonStatus = "current" | "outdated" | "stale" | "unreachable" | "o
 
 export type { ShutdownScope, StopSelection };
 export {
+	bindStopSelection,
 	currentShutdownScope,
 	describeShutdownScope,
 	MACHINE_SCOPE,
@@ -788,6 +791,15 @@ export async function discoverDaemons(): Promise<DaemonInfo[]> {
 	const workerSockets = new Set(
 		trackedWorkers.map((worker) => normalizeSocketPath(worker.descriptor.supervisorSocketPath)),
 	);
+	// The daemons that own this agent dir are services this process talks to,
+	// whether or not this shell's temp dir is where they chose to listen: the
+	// listener scan sees them only when the OS scan reaches their pid, and the
+	// socket-dir sweep only when the socket sits in this shell's directory. The
+	// registry is the same authority `list`/`attach` use, so a daemon reachable
+	// from here is never invisible to `ps` or to a stop plan built on it.
+	const agentDirOwnerSockets = (await findLiveDaemonOwnersForAgentDir(getAgentDir())).map((owner) =>
+		normalizeSocketPath(owner.socketPath),
+	);
 	// A descriptor names the worker socket it owns, whatever directory that
 	// socket ended up in, so it is authoritative over any name heuristic.
 	const workerOwnedSockets = new Set(
@@ -800,6 +812,7 @@ export async function discoverDaemons(): Promise<DaemonInfo[]> {
 		...[...processBySocket.keys()].filter(isDaemonSocket),
 		...scanSocketDir().filter(isDaemonSocket),
 		...workerSockets,
+		...agentDirOwnerSockets.filter(isDaemonSocket),
 	]);
 	const defaultSocket = normalizeSocketPath(defaultDaemonSocketPath());
 
@@ -871,7 +884,7 @@ export async function runPs(json: boolean, selection?: StopSelection): Promise<v
 	// `status` is machine-wide, but the stop commands are not. Say which rows a
 	// plain `prime-agent shutdown` would actually touch, so the two views of the
 	// machine cannot disagree about what is next on the destroy list.
-	const effective = selection ?? { scope: currentShutdownScope(), orphansOnly: false };
+	const effective = await bindStopSelection(selection ?? { scope: { kind: "current" }, orphansOnly: false });
 	const { selected } = selectStoppableDaemons(daemons, effective);
 	console.log(
 		chalk.dim(
@@ -1206,15 +1219,19 @@ async function openShutdownReport(selection: StopSelection): Promise<{
 export async function runShutdownSelection(
 	json: boolean,
 	force: boolean,
-	selection: StopSelection = { scope: currentShutdownScope(), orphansOnly: false },
+	selection: StopSelection = { scope: { kind: "current" }, orphansOnly: false },
 	dryRun = false,
 ): Promise<void> {
-	const { report, selected, humanReport } = await openShutdownReport(selection);
+	// A stop command has to know what this process owns before it plans anything:
+	// the registry leg of the default scope is async, so it is bound once here and
+	// every pure plan below sees the same concrete set.
+	const scoped = await bindStopSelection(selection);
+	const { report, selected, humanReport } = await openShutdownReport(scoped);
 	if (dryRun) {
 		if (json) {
 			console.log(
 				JSON.stringify(
-					{ dryRun: true, scope: selection.scope, targets: selected, leftRunning: report.leftRunning },
+					{ dryRun: true, scope: scoped.scope, targets: selected, leftRunning: report.leftRunning },
 					null,
 					2,
 				),
@@ -1234,15 +1251,15 @@ export async function runShutdownSelection(
 				});
 			}
 			const stillPresent = report.converge();
-			console.log(JSON.stringify({ scope: selection.scope, ...report.toJson(), stillPresent }, null, 2));
+			console.log(JSON.stringify({ scope: scoped.scope, ...report.toJson(), stillPresent }, null, 2));
 			return;
 		}
 		case "tty-error":
 			throw new Error(
-				`Shutdown requires confirmation in an interactive terminal. Use "prime-agent shutdown --force". Requested scope: ${describeShutdownScope(selection.scope)}.`,
+				`Shutdown requires confirmation in an interactive terminal. Use "prime-agent shutdown --force". Requested scope: ${describeShutdownScope(scoped.scope)}.`,
 			);
 		case "prompt": {
-			const confirmed = await promptYesNo(`${humanReport}\n${formatShutdownQuestion(selection, selected)}`);
+			const confirmed = await promptYesNo(`${humanReport}\n${formatShutdownQuestion(scoped, selected)}`);
 			if (!confirmed) {
 				console.log(chalk.dim("Shutdown cancelled."));
 				return;
@@ -1262,7 +1279,14 @@ export async function runShutdownSelection(
 		// is the only place that tells the user why nothing was stopped.
 		const stillPresent = report.converge();
 		if (json) {
-			console.log(JSON.stringify({ scope: selection.scope, ...report.toJson(), stillPresent }, null, 2));
+			console.log(JSON.stringify({ scope: scoped.scope, ...report.toJson(), stillPresent }, null, 2));
+			return;
+		}
+		if (report.discovered === 0) {
+			// Nothing was discovered anywhere, so there is no scope to report on:
+			// a clean machine gets the one answer that has always meant that. The
+			// scoped wording below is for services that exist somewhere else.
+			console.log("No background services found.");
 			return;
 		}
 		console.log(humanReport);
@@ -1271,7 +1295,7 @@ export async function runShutdownSelection(
 	}
 	const admission = await acquireDaemonShutdownAdmission();
 	try {
-		await runShutdownConverging(json, force, () => admission.assertOrRenew(), selection, report);
+		await runShutdownConverging(json, force, () => admission.assertOrRenew(), scoped, report);
 	} finally {
 		await admission.release();
 	}
@@ -1659,6 +1683,17 @@ function daemonListenerSignature(listeners: readonly DiscoveredDaemonProcess[]):
 		.join("\n");
 }
 
+/**
+ * A worker socket is `worker-*.sock` inside a service directory: either this
+ * process's own default socket dir, or a directory named `prime-agent-<uid>`.
+ *
+ * Only the directory a socket sits in counts as that evidence. Comparing the
+ * directory *name* against the name of this process's temp dir (the parent of
+ * the service dir) does not: on every machine whose `$TMPDIR` is `/tmp` — Linux,
+ * CI included — it called each `/tmp/worker-*.sock` a worker socket, which hid
+ * such a daemon from `ps`, from the stop plan and from the force sweeps, so
+ * nothing could stop it any more.
+ */
 export function isWorkerSocketPath(socketPath: string): boolean {
 	if (process.platform === "win32") {
 		return false;
@@ -1667,8 +1702,8 @@ export function isWorkerSocketPath(socketPath: string): boolean {
 	if (!name.startsWith("worker-") || !name.endsWith(".sock")) {
 		return false;
 	}
-	const parent = basename(resolve(socketPath, ".."));
-	return parent === basename(resolve(defaultDaemonSocketDir(), "..")) || PRIME_AGENT_SOCKET_DIR_NAME.test(parent);
+	const directory = resolve(socketPath, "..");
+	return directory === resolve(defaultDaemonSocketDir()) || PRIME_AGENT_SOCKET_DIR_NAME.test(basename(directory));
 }
 
 const PRIME_AGENT_SOCKET_DIR_NAME = /^prime-agent-(?:\d+|user)$/;
@@ -1985,21 +2020,25 @@ async function stopTrackedProcess(
 }
 
 /**
- * `doctor --fix` cleanup. Scoped by default (the caller's own socket dir), with
- * `--dry-run` to list each target first and `--orphans` to refuse every service
- * that still carries live evidence.
+ * `doctor --fix` cleanup. Scoped by default to the services this process owns,
+ * with `--dry-run` to list each target first and `--orphans` to refuse every
+ * service that still carries live evidence.
  */
 export async function runReap(
 	json: boolean,
 	force: boolean,
-	selection: StopSelection = { scope: currentShutdownScope(), orphansOnly: false },
+	selection: StopSelection = { scope: { kind: "current" }, orphansOnly: false },
 	dryRun = false,
 ): Promise<void> {
+	// A stop command has to know what this process owns before it plans anything:
+	// the registry leg of the default scope is async, so it is bound once here and
+	// every pure plan below sees the same concrete set.
+	const scoped = await bindStopSelection(selection);
 	const daemons = await discoverDaemons();
 	const reaped: Array<{ socketPath: string; action: string }> = [];
 	const skipped: Array<{ socketPath: string; reason: string }> = [];
 	const verifier = createDaemonTargetVerifier();
-	const actions = planReap(daemons, force, selection);
+	const actions = planReap(daemons, force, scoped);
 	const workers = findAllTrackedWorkers();
 	const servedSockets = new Set(
 		daemons
@@ -2009,7 +2048,7 @@ export async function runReap(
 	const orphanWorkers = planOrphanWorkerReap(
 		workers.map((worker) => worker.descriptor),
 		servedSockets,
-		{ selection, processAlive: isProcessAlive, identityMatches: defaultIdentityMatches },
+		{ selection: scoped, processAlive: isProcessAlive, identityMatches: defaultIdentityMatches },
 	);
 
 	if (dryRun) {
@@ -2029,10 +2068,10 @@ export async function runReap(
 			})),
 		];
 		if (json) {
-			console.log(JSON.stringify({ dryRun: true, scope: selection.scope, plan }, null, 2));
+			console.log(JSON.stringify({ dryRun: true, scope: scoped.scope, plan }, null, 2));
 			return;
 		}
-		console.log(`Cleanup plan for ${describeShutdownScope(selection.scope)}; nothing was touched.`);
+		console.log(`Cleanup plan for ${describeShutdownScope(scoped.scope)}; nothing was touched.`);
 		for (const entry of plan) {
 			console.log(`  ${entry.kind.padEnd(14)} ${entry.socketPath}: ${entry.detail}`);
 		}
@@ -2117,11 +2156,18 @@ export async function runReap(
 	}
 
 	if (json) {
-		console.log(JSON.stringify({ scope: selection.scope, reaped, skipped }, null, 2));
+		console.log(JSON.stringify({ scope: scoped.scope, reaped, skipped }, null, 2));
 		return;
 	}
 	if (reaped.length === 0 && skipped.length === 0) {
-		console.log(`No background services found in scope: ${describeShutdownScope(selection.scope)}`);
+		if (daemons.length === 0 && workers.length === 0) {
+			// Nothing was discovered anywhere, so there is no scope to report on:
+			// a clean machine gets the one answer that has always meant that. The
+			// scoped wording below is for services that exist somewhere else.
+			console.log("No background services found.");
+		} else {
+			console.log(`No background services found in scope: ${describeShutdownScope(scoped.scope)}`);
+		}
 		return;
 	}
 	for (const entry of reaped) {

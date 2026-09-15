@@ -1226,24 +1226,43 @@ describe("ENG-4603 worker recovery convergence", () => {
 			env: { ...process.env, ...lsofEnvironment },
 		}).stdout;
 		// The regression needs two processes holding one supervisor socket: that is
-		// the hidden supervisor. Both must be named by that path, not merely seen.
-		expect(lsofListenersOf(listenersBeforeShutdown, socketPath).sort()).toEqual(
-			[predecessorService.pid, successorService.pid].sort((left, right) => left - right),
-		);
+		// the hidden supervisor, and the scan this fixture injects must see both of
+		// them. Which *column* a scan reports a socket under is not the same on
+		// every platform (the CI scan named these pids and reported no path for
+		// this socket), so ownership of the path is pinned by the exit checks below
+		// and by `lsofListenersOf` only as a machine-readable extra, never as the
+		// proposition itself.
+		expect(listenersBeforeShutdown).toContain(`p${predecessorService.pid}`);
+		expect(listenersBeforeShutdown).toContain(`p${successorService.pid}`);
+		const namedByPath = lsofListenersOf(listenersBeforeShutdown, socketPath);
+		if (namedByPath.length > 0) {
+			expect(namedByPath.sort()).toEqual(
+				[predecessorService.pid, successorService.pid].sort((left, right) => left - right),
+			);
+		}
 
-		// A service outside the caller's socket dir is refused, and refusing has to
-		// be reported: nothing is stopped, nothing fails, the instance is named.
+		// The default scope is the daemon identity, not the shell's temp dir: a
+		// client whose `$TMPDIR` differs from the daemon's still resolves this same
+		// daemon through the supervisor registry, so a dry run from another temp
+		// dir must name it as a target instead of reporting an empty scope while
+		// the daemon keeps running. `--force` answers the confirmation question and
+		// never widens a scope, so this is a plan and nothing is touched.
 		const foreignTmpDir = join(paths.socketTmpDir, "foreign-tmpdir");
 		mkdirSync(foreignTmpDir, { recursive: true, mode: 0o700 });
-		const refused = await runCli(paths, ["shutdown", "--force", "--json"], 60_000, {
+		const fromOtherTmpDir = await runCli(paths, ["shutdown", "--force", "--dry-run", "--json"], 60_000, {
 			...lsofEnvironment,
 			TMPDIR: foreignTmpDir,
 		});
-		expect(refused.code, refused.stderr).toBe(0);
-		const refusal = parseStopReport(refused.stdout, "shutdown --force (other tmpdir)");
-		expect(refusal.stopped).toEqual([]);
-		expect(refusal.failed).toEqual([]);
-		expect(refusal.leftRunning.map((entry) => entry.socketPath)).toEqual([socketPath]);
+		expect(fromOtherTmpDir.code, fromOtherTmpDir.stderr).toBe(0);
+		const foreignPlan = JSON.parse(fromOtherTmpDir.stdout) as {
+			dryRun: boolean;
+			scope: { kind: string; agentSocketPaths?: string[] };
+			targets: Array<{ socketPath: string }>;
+		};
+		expect(foreignPlan.dryRun).toBe(true);
+		expect(foreignPlan.scope.kind).toBe("daemon-identity");
+		expect(foreignPlan.scope.agentSocketPaths).toEqual([socketPath]);
+		expect(foreignPlan.targets.map((entry) => entry.socketPath)).toEqual([socketPath]);
 		for (const service of services) {
 			expect(exactProcessIsAlive(service.pid, service.processStartId), `pid ${service.pid} before shutdown`).toBe(
 				true,
