@@ -119,6 +119,14 @@ function reportSettingsErrors(settingsManager: SettingsManager, context: string)
 			console.error(chalk.dim(error.stack));
 		}
 	}
+	// K3R2-3 (r31 F4a): ancestor parse failures and unknown-key reports are
+	// warnings, not errors - the rest of the scope still loads. Draining only the
+	// errors left those completely silent in the package/config CLI contexts,
+	// while the interactive path printed them.
+	const warnings = settingsManager.drainWarnings();
+	for (const { scope, message } of warnings) {
+		console.error(chalk.yellow(`Warning (${context}, ${scope} settings): ${message}`));
+	}
 }
 
 function getPackageCommandUsage(command: PackageCommand): string {

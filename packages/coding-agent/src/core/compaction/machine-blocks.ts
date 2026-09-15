@@ -35,8 +35,24 @@ import { getLogger } from "@earendil-works/pi-ai";
 
 const blockLog = getLogger("coding-agent.compaction");
 
-/** Every block tag compaction knows how to render, parse and strip. */
-export const MACHINE_BLOCK_TAGS = ["read-files", "modified-files", "fact-appendix", "user-requests"] as const;
+/**
+ * Every block tag compaction knows how to render, parse and strip.
+ *
+ * The `ipython_state` pair joins the family as strip-only members (MVS-3): the
+ * kernel roster notices are machine-authored custom messages, and when the
+ * summarizer restates one into the summary narrative the next generation must
+ * not feed that stale roster back - the fresh notice is appended after every
+ * compaction, so an old generation has no reuse value. Nothing renders them;
+ * they are recognized so stripping and the delimiter-shape checks cover them.
+ */
+export const MACHINE_BLOCK_TAGS = [
+	"read-files",
+	"modified-files",
+	"fact-appendix",
+	"user-requests",
+	"ipython_state",
+	"ipython_state_restored",
+] as const;
 
 export type MachineBlockTag = (typeof MACHINE_BLOCK_TAGS)[number];
 
@@ -46,7 +62,8 @@ export type MachineBlockTag = (typeof MACHINE_BLOCK_TAGS)[number];
  * Every payload that reaches a block body is checked against this: a body that
  * matches can end its own block, or forge another one, on the next parse.
  */
-const BLOCK_DELIMITER_SHAPE = /<\/?(?:read-files|modified-files|fact-appendix|user-requests)\b/;
+const BLOCK_DELIMITER_SHAPE =
+	/<\/?(?:read-files|modified-files|fact-appendix|user-requests|ipython_state_restored|ipython_state)\b/;
 
 /** Whether text carries anything that would read back as a machine-block delimiter. */
 export function readsAsBlockDelimiter(text: string): boolean {

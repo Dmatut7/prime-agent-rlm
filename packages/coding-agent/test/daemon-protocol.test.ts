@@ -169,6 +169,26 @@ function readDaemonSchemaSliceSources(): DaemonSchemaSliceSources {
 }
 
 function daemonSchemaDigest(sources: DaemonSchemaSliceSources): string {
+	// K3R2-2: a lost or reordered slice marker collapses `slice(start, end)` to ""
+	// or to stray comment text while the other families still hash, and the
+	// recovery ritual this file's header documents is to recalculate
+	// DAEMON_SCHEMA_ID over whatever the slices now return. Before this guard
+	// that ritual froze the unusable slice into the advertised identity (r31 F1:
+	// the whole DaemonCommand union could fall out of the digest with every test
+	// green), so an unusable slice fails loudly here instead of being hashed.
+	for (const [key, text] of Object.entries(sources)) {
+		const codeOnly = text
+			.replace(/\/\*[\s\S]*?\*\//g, "")
+			.replace(/\/\/[^\n]*/g, "")
+			.trim();
+		if (codeOnly.length === 0) {
+			throw new Error(
+				`daemon schema slice "${key}" is empty or comment-only: its start/end markers are lost or ` +
+					`reordered, so that wire family is about to fall out of DAEMON_SCHEMA_ID. Fix the slice ` +
+					`markers in readDaemonSchemaSliceSources instead of recalculating the constant.`,
+			);
+		}
+	}
 	return createHash("sha256")
 		.update(
 			[
@@ -248,6 +268,24 @@ describe("daemon protocol helpers", () => {
 		const sources = readDaemonSchemaSliceSources();
 		// The slice markers must be found: a silent -1 would hash an empty string
 		// and let a family fall back out of the digest unnoticed.
+		// K3R2-2: command/savedSession/outbound were the only three families
+		// without content pins, so the r31 F1 freeze walkthrough (a lost or
+		// reordered marker plus the documented DAEMON_SCHEMA_ID recalculation)
+		// dropped the whole DaemonCommand union out of the digest with every test
+		// green. Each pin anchors the start marker, the tail of the slice (which
+		// an end marker sliding earlier must drop) and core wire members.
+		expect(sources.command).toContain("export type DaemonCommand =");
+		expect(sources.command).toContain('type: "prompt";');
+		expect(sources.command).toContain('type: "get_session_tree";');
+		expect(sources.command).toContain('type: "declare_client_capabilities";');
+		expect(sources.savedSession).toContain("export interface DaemonSavedSessionInfo");
+		expect(sources.savedSession).toContain("messageCount: number;");
+		expect(sources.savedSession).toContain("usage?: SessionUsageSummary;");
+		expect(sources.outbound).toContain("export type DaemonOutbound =");
+		expect(sources.outbound).toContain("| DaemonResponse");
+		expect(sources.outbound).toContain('type: "daemon_hello";');
+		expect(sources.outbound).toContain('type: "session_snapshot_begin";');
+		expect(sources.outbound).toContain("| CompactAssistantDelta;");
 		expect(sources.stallEvent).toContain('type: "stall_warning"');
 		expect(sources.stallEvent).toContain('type: "stall_unsettled"');
 		expect(sources.stallDiagnostics).toContain("export interface StallDiagnostics");
@@ -271,7 +309,46 @@ describe("daemon protocol helpers", () => {
 		expect(sources.quiescenceOutcome).toContain("export interface RlmQuiescenceOutcome");
 		expect(sources.responseEnvelope).toContain("retryAfterMs?: number;");
 		expect(sources.responseEnvelope).toContain("errorInfo?: DaemonErrorInfo;");
+		// K3R2-2: pin the envelope slice's marker end points as well. It starts at
+		// the DaemonResponse declaration and ends where DaemonSessionClosedReason
+		// begins, so the last text it may capture is DaemonErrorInfo's final arm:
+		// an end marker that slides earlier (a moved declaration or a matching
+		// comment) drops the errorInfo family out of the digest with only the
+		// digest line left to notice.
+		expect(sources.responseEnvelope).toContain("export type DaemonResponse =");
+		expect(sources.responseEnvelope).toContain("export type DaemonErrorInfo =");
+		expect(sources.responseEnvelope).toContain('code: "command_result_uncertain"');
 		expect(DAEMON_SCHEMA_ID).toBe(`protocol-${DAEMON_PROTOCOL_VERSION}-schema-${DAEMON_SCHEMA_REVISION}-${digest}`);
+	});
+
+	it("refuses to freeze an empty or comment-only slice into the schema identity", () => {
+		// K3R2-2 (r31 F1): a lost start marker (indexOf -> -1, so start lands after
+		// end) or an end marker reordered ahead of its start collapses a slice to ""
+		// - or to stray comment text when a comment swallows the end marker. The
+		// digest then moves and the header's documented recovery ritual is to
+		// recalculate DAEMON_SCHEMA_ID, which before this guard silently froze the
+		// hole into the advertised identity: the r31 F1 walkthrough moved
+		// DaemonCommandName above DaemonCommand, recalculated, and all 31 tests
+		// stayed green with the whole request union out of the digest. The digest
+		// must refuse an unusable slice instead of hashing it.
+		const sources = readDaemonSchemaSliceSources();
+		const unusable: Array<{ name: string; key: keyof DaemonSchemaSliceSources; text: string }> = [
+			{ name: "start marker lost: slice(-1, end) is empty", key: "command", text: "" },
+			{ name: "end marker reordered before start", key: "responseEnvelope", text: "" },
+			{ name: "savedSession markers collapsed", key: "savedSession", text: "" },
+			{
+				name: "end-marker comment truncated the slice to comments only",
+				key: "outbound",
+				text: "\t// DAEMON_OUTBOUND_COMPATIBILITY moved\n\t/** stray doc comment */\n",
+			},
+		];
+		expect(unusable.length).toBeGreaterThan(0);
+		for (const entry of unusable) {
+			expect(
+				() => daemonSchemaDigest({ ...sources, [entry.key]: entry.text }),
+				`${entry.name}: the digest must refuse an unusable slice`,
+			).toThrow(/empty or comment-only/);
+		}
 	});
 
 	it("counts wrapper, contract and assembly shape edits as identity changes", () => {

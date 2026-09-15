@@ -1423,9 +1423,14 @@ export class SettingsManager {
 	 * contract, and a foreign ancestor file is not this session's save liability.
 	 */
 	private recordAncestorParseError(path: string, error: Error): void {
+		// K3R2-3 (r31 F4b): the identity carries the file's on-disk stamp, like the
+		// external-edit warnings. A path-only identity kept suppressing the warning
+		// after the first corruption, so an ancestor that broke again after being
+		// fixed was silently dropped a second time.
+		const stamp = this.settingsStampForPath(path);
 		this.recordWarning(
 			"project",
-			`ancestor-parse-error:${path}`,
+			`ancestor-parse-error:${path}:${stamp ?? "unreadable"}`,
 			`settings.json at ${path} failed to parse, so it was ignored while building the project settings: ` +
 				`the rest of the project scope is still in effect, and consent (agent traces, telemetry) is ` +
 				`treated as withheld for that file until it parses again. Parse error: ${error.message}`,
