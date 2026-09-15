@@ -190,7 +190,7 @@ describe("loadContextTreeChildrenFromDisk", () => {
 		expect(byId.get("sub-abr00001")?.status).toBe("cancelled");
 	});
 
-	it("sums only the current branch, excluding abandoned forked paths", () => {
+	it("sums the whole transcript, including abandoned forked paths", () => {
 		const rlmDir = makeTempDir();
 		const childDir = join(rlmDir, "sub-fork0001");
 		mkdirSync(childDir, { recursive: true });
@@ -228,9 +228,12 @@ describe("loadContextTreeChildrenFromDisk", () => {
 
 		const nodes = loadContextTreeChildrenFromDisk(rlmDir, resolveContextWindow);
 		expect(nodes).toHaveLength(1);
-		// Only the leaf branch (u1 -> a2) counts; the abandoned a1 path does not.
-		expect(nodes[0].ownUsage.input).toBe(1000);
-		expect(nodes[0].totalUsage.input).toBe(1000);
+		// Spend is the child's whole transcript (u1 -> a1 and u1 -> a2): the abandoned
+		// path was paid for, and the catalog scan for this same file counts it, so a
+		// branch-only total would make this row disagree with the child's roster row.
+		expect(nodes[0].ownUsage.input).toBe(10000);
+		expect(nodes[0].totalUsage.input).toBe(10000);
+		// Context utilization is still the leaf branch (u1 -> a2) only.
 		expect(nodes[0].contextUsage?.tokens).toBe(1100);
 	});
 

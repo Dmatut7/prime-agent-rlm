@@ -127,7 +127,6 @@ import {
 import {
 	type ContextTreeNode,
 	type ContextWindowResolver,
-	computeOwnAndTotalUsage,
 	loadContextTreeChildFromDisk,
 	loadContextTreeChildrenFromDisk,
 	OwnUsageAccumulator,
@@ -345,7 +344,13 @@ import {
 	type TurnLivenessEvent,
 	type TurnLivenessKernelFacts,
 } from "./turn-liveness.js";
-import { addAssistantUsage, emptyUsage, type SessionUsageSummary, sessionUsageSummaryFrom } from "./usage.js";
+import {
+	addAssistantUsage,
+	cloneUsage,
+	emptyUsage,
+	type SessionUsageSummary,
+	sessionUsageSummaryFrom,
+} from "./usage.js";
 import { SERPER_CREDENTIAL_ID, SERPER_ENV_VAR, WEBSEARCH_SKILL_NAME } from "./websearch-credential.js";
 
 export type { GoalState, GoalStatus } from "./goals.js";
@@ -14980,23 +14985,17 @@ export class AgentSession {
 		const toolResults = state.messages.filter((m) => m.role === "toolResult").length;
 
 		let toolCalls = 0;
-		let totalInput = 0;
-		let totalOutput = 0;
-		let totalCacheRead = 0;
-		let totalCacheWrite = 0;
-		let totalCost = 0;
-
 		for (const message of state.messages) {
 			if (message.role === "assistant") {
-				const assistantMsg = message as AssistantMessage;
-				toolCalls += assistantMsg.content.filter((c) => c.type === "toolCall").length;
-				totalInput += assistantMsg.usage.input;
-				totalOutput += assistantMsg.usage.output;
-				totalCacheRead += assistantMsg.usage.cacheRead;
-				totalCacheWrite += assistantMsg.usage.cacheWrite;
-				totalCost += assistantMsg.usage.cost.total;
+				toolCalls += (message as AssistantMessage).content.filter((c) => c.type === "toolCall").length;
 			}
 		}
+
+		// Counts above describe the model-facing context; the token and cost totals
+		// describe the session's spend, so they come from the whole transcript and
+		// match /context and this session's roster row. Summing the live context
+		// instead made every compaction and every rollback look like a refund.
+		const { ownUsage } = this._ownUsageTotals();
 
 		return {
 			sessionFile: this.sessionFile,
@@ -15007,13 +15006,13 @@ export class AgentSession {
 			toolResults,
 			totalMessages: state.messages.length,
 			tokens: {
-				input: totalInput,
-				output: totalOutput,
-				cacheRead: totalCacheRead,
-				cacheWrite: totalCacheWrite,
-				total: totalInput + totalOutput + totalCacheRead + totalCacheWrite,
+				input: ownUsage.input,
+				output: ownUsage.output,
+				cacheRead: ownUsage.cacheRead,
+				cacheWrite: ownUsage.cacheWrite,
+				total: ownUsage.input + ownUsage.output + ownUsage.cacheRead + ownUsage.cacheWrite,
 			},
-			cost: totalCost,
+			cost: ownUsage.cost.total,
 			contextUsage: this.getContextUsage(),
 		};
 	}
@@ -15073,24 +15072,34 @@ export class AgentSession {
 	}
 
 	private _ownUsageAccumulator?: OwnUsageAccumulator;
-	private _ownUsageMemo?: { count: number; tailId: string | undefined; usage: SessionUsageSummary | undefined };
+	private _ownUsageMemo?: { count: number; tailId: string | undefined; ownUsage: Usage; totalUsage: Usage };
 
-	// Whole-file own spend, identical to the catalog scan so rows never shift at passivation.
-	getOwnUsageSummary(): SessionUsageSummary | undefined {
+	/**
+	 * Whole-file own and total spend: the session's spend over every entry in the
+	 * transcript, with attributed child usage subtracted from `ownUsage`. This is
+	 * the persistent basis - the catalog scan, `getOwnUsageSummary` and `/context`
+	 * all fold these same entries, so one session cannot report two totals.
+	 *
+	 * Incremental: the roster republishes many times per turn, and re-walking a
+	 * transcript that only grows made each republication cost O(entries).
+	 * `computeOwnAndTotalUsage(entries, entries)` is the same linear fold.
+	 */
+	private _ownUsageTotals(): { ownUsage: Usage; totalUsage: Usage } {
 		const entries = this.sessionManager.getEntries();
 		const tailId = entries.at(-1)?.id;
 		const memo = this._ownUsageMemo;
 		if (memo && memo.count === entries.length && memo.tailId === tailId) {
-			return memo.usage;
+			return { ownUsage: memo.ownUsage, totalUsage: memo.totalUsage };
 		}
-		// Folded incrementally: the roster republishes many times per turn, and a full walk of
-		// both passes over a transcript that has only grown made each republication cost O(entries).
-		// `computeOwnAndTotalUsage(entries, entries)` is the same linear fold this rebuilds.
 		this._ownUsageAccumulator ??= new OwnUsageAccumulator();
-		const { ownUsage } = this._ownUsageAccumulator.add(entries);
-		const usage = sessionUsageSummaryFrom(ownUsage);
-		this._ownUsageMemo = { count: entries.length, tailId, usage };
-		return usage;
+		const { ownUsage, totalUsage } = this._ownUsageAccumulator.add(entries);
+		this._ownUsageMemo = { count: entries.length, tailId, ownUsage, totalUsage };
+		return { ownUsage, totalUsage };
+	}
+
+	// Whole-file own spend, identical to the catalog scan so rows never shift at passivation.
+	getOwnUsageSummary(): SessionUsageSummary | undefined {
+		return sessionUsageSummaryFrom(this._ownUsageTotals().ownUsage);
 	}
 
 	/**
@@ -15101,10 +15110,17 @@ export class AgentSession {
 	 */
 	getContextTree(): ContextTreeNode {
 		const resolveContextWindow = this._contextWindowResolver();
-		const { ownUsage, totalUsage } = computeOwnAndTotalUsage(
-			this.sessionManager.getBranch(),
-			this.sessionManager.getEntries(),
-		);
+		// Spend comes from the persistent fold (every entry in the transcript, not the
+		// active branch), so the root row reports the same total as this session's
+		// roster/catalog row: a rollback or a fork moves work off the branch, but the
+		// money it cost was still paid, and one session showing two different "spent"
+		// numbers is worse than either basis alone. The context column stays
+		// branch-scoped - that one really does describe only the branch the session
+		// would resume on. Cloned because the fold is memoized and shared with the
+		// roster's own copy of the same totals.
+		const totals = this._ownUsageTotals();
+		const ownUsage = cloneUsage(totals.ownUsage);
+		const totalUsage = cloneUsage(totals.totalUsage);
 
 		const children: ContextTreeNode[] = [];
 		const liveIds = new Set<string>();
