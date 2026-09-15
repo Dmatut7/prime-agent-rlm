@@ -762,8 +762,52 @@ def _status_script(command: str, completion_a: str, completion_b: str) -> str:
     )
 
 
+# bash()/helper children run model-authored shell code, so their env is an
+# allowlist rather than an inheritance of the kernel env: the worker auth token
+# (PRIME_AGENT_INTERNAL_*), recursion bookkeeping (RLM_*), provider credentials
+# injected for in-kernel skills (SERPER_API_KEY, ANTHROPIC_*, ...) and the user's
+# agent sockets (SSH_AUTH_SOCK) must not reach arbitrary commands. Mirrors
+# rlm.mcp._SAFE_ENV; PRIME_AGENT_ENV_PASSTHROUGH (comma-separated names) opts
+# specific variables back in for commands that genuinely need them.
+_CHILD_SAFE_ENV = (
+    "HOME",
+    "PATH",
+    "SHELL",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "SystemRoot",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "OS",
+    "SYSTEMDRIVE",
+    "USERPROFILE",
+)
+_ENV_PASSTHROUGH_VAR = "PRIME_AGENT_ENV_PASSTHROUGH"
+
+
+def _passthrough_env() -> dict[str, str]:
+    passthrough: dict[str, str] = {}
+    for name in os.environ.get(_ENV_PASSTHROUGH_VAR, "").split(","):
+        name = name.strip()
+        value = os.environ.get(name) if name else None
+        if value is not None:
+            passthrough[name] = value
+    return passthrough
+
+
 def _child_env() -> dict[str, str]:
-    return {**os.environ, "NO_COLOR": "1", "TERM": "dumb", "CLICOLOR": "0", "FORCE_COLOR": "0"}
+    env = {key: value for key in _CHILD_SAFE_ENV if (value := os.environ.get(key)) is not None}
+    env.update(_passthrough_env())
+    env.update({"NO_COLOR": "1", "TERM": "dumb", "CLICOLOR": "0", "FORCE_COLOR": "0"})
+    return env
 
 
 def _signal_group(pid: int, sig: int) -> bool:
@@ -785,7 +829,7 @@ def _system32(*parts: str) -> str:
 
 
 def _helper_env() -> dict[str, str]:
-    return {**os.environ, "NoDefaultCurrentDirectoryInExePath": "1"}
+    return {**_child_env(), "NoDefaultCurrentDirectoryInExePath": "1"}
 
 
 def _ps_env() -> dict[str, str]:
@@ -793,7 +837,7 @@ def _ps_env() -> dict[str, str]:
     # recomputes this same identity with both pinned to C/UTC (session-lease.ts
     # psStartIdQuery). An unpinned render never compares equal on a non-UTC or
     # non-C host, so identity-verified reaping would refuse to fire.
-    return {**os.environ, "LC_ALL": "C", "LC_TIME": "C", "LANG": "C", "TZ": "UTC"}
+    return {**_child_env(), "LC_ALL": "C", "LC_TIME": "C", "LANG": "C", "TZ": "UTC"}
 
 
 def _taskkill_tree(pid: int) -> bool:
