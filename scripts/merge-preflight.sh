@@ -26,7 +26,7 @@ if [ "$BASE" != "$HEAD_SHA" ]; then
 fi
 
 echo "== 2/4 no foreign uncommitted work in this tree =="
-DIRTY=$(git status --porcelain | grep -v '^??' | awk '{print $2}')
+DIRTY=$(git status --porcelain | grep -v '^??' | awk '{print $2}' || true)
 if [ -n "$DIRTY" ]; then
   echo "   refusing: staged/modified files present (commit or stash your own first):"
   echo "$DIRTY" | sed 's/^/     /'
