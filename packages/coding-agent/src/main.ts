@@ -77,6 +77,7 @@ import {
 } from "./core/session-lease.js";
 import { repairOwnedSessionFile, SessionManager } from "./core/session-manager.js";
 import { SettingsManager } from "./core/settings-manager.js";
+import { setStallRuntimeDaemonWorker } from "./core/stall-evidence.js";
 import { isTelemetryEnabled } from "./core/telemetry.js";
 import { printTimings, resetTimings, time } from "./core/timings.js";
 import { runMigrations, showDeprecationWarnings } from "./migrations.js";
@@ -1271,6 +1272,8 @@ export async function main(args: string[], options?: MainOptions) {
 		waitForDaemonWorkerStartupGate();
 	}
 	installFileLogSink();
+	// The stall copy has to say whether a daemon exists at all; decide it once, at startup.
+	setStallRuntimeDaemonWorker(isDaemonWorkerProcess());
 	if (isDaemonCatalogProcess()) {
 		await runDaemonCatalogProcess();
 		return;

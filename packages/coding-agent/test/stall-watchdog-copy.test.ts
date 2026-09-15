@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_STALL_ABORT_AFTER_SECONDS, DEFAULT_STALL_WARN_AFTER_SECONDS } from "../src/core/settings-manager.js";
+import type { StallDiagnosticsPointer } from "../src/core/stall-evidence.js";
 import {
 	buildStallAbortMessage,
 	buildStallAbortUnsettledMessage,
@@ -18,6 +19,17 @@ import {
 	type StallWatchdogStageInfo,
 } from "../src/core/stall-watchdog.js";
 import { MINUTE_MS, StallFakeClock } from "./fixtures/stall-fake-clock.js";
+
+/** Fixed pointer so the copy contract is a literal string, not this machine's home dir. */
+const testPointer: StallDiagnosticsPointer = {
+	evidencePath: "/agent/logs/stall-evidence.jsonl",
+	agentLogPath: "/agent/logs/agent.jsonl",
+	daemonWorker: false,
+};
+
+const WHERE =
+	'/agent/logs/stall-evidence.jsonl (stall-only, size-bounded) and /agent/logs/agent.jsonl (all sessions; filter with: grep "stall watchdog" /agent/logs/agent.jsonl)';
+const NO_DAEMON = "This session runs without a daemon, so there is no daemon log.";
 
 function exemptionSnapshot(overrides?: Partial<StallExemptionSnapshot>): StallExemptionSnapshot {
 	return {
@@ -77,10 +89,14 @@ describe("stall watchdog settings config (T1-4)", () => {
 describe("stall watchdog copy (T1-4)", () => {
 	it("leaves the unexempted warn copy byte-identical to the production string", () => {
 		const silentSeconds = 300;
-		const expected = `Possible stall: no session activity for ${silentSeconds}s while a turn is running. If nothing recovers, the turn will be aborted automatically after ${DEFAULT_STALL_ABORT_AFTER_SECONDS}s of silence. If a tool appears stuck, interrupt the turn manually to recover faster; check the daemon log for stall diagnostics.`;
-		expect(buildStallWarnMessage({ silentMs: 300_000, abortAfterSeconds: DEFAULT_STALL_ABORT_AFTER_SECONDS })).toBe(
-			expected,
-		);
+		const expected = `Possible stall: no session activity for ${silentSeconds}s while a turn is running. If nothing recovers, the turn will be aborted automatically after ${DEFAULT_STALL_ABORT_AFTER_SECONDS}s of silence. If a tool appears stuck, interrupt the turn manually to recover faster. This session runs without a daemon, so there is no daemon log to check. Stall diagnostics: ${WHERE}.`;
+		expect(
+			buildStallWarnMessage({
+				silentMs: 300_000,
+				abortAfterSeconds: DEFAULT_STALL_ABORT_AFTER_SECONDS,
+				diagnosticsPointer: testPointer,
+			}),
+		).toBe(expected);
 	});
 
 	// H-1: abortAfterSeconds 0 is the documented "warn-only" value; abortAfterMs() then hands the
@@ -173,22 +189,27 @@ describe("stall watchdog copy (T1-4)", () => {
 		expect(paused).not.toContain("deferred");
 	});
 
-	it("leaves the abort copy byte-identical", () => {
-		expect(buildStallAbortMessage({ silentMs: 900_000 })).toBe(
-			"Suspected stall: no session activity for 900s. The current turn is being aborted automatically; diagnostics were logged.",
+	it("pins the abort copy: it names the real diagnostics files instead of vouching for a write", () => {
+		expect(buildStallAbortMessage({ silentMs: 900_000, diagnosticsPointer: testPointer })).toBe(
+			`Suspected stall: no session activity for 900s. The current turn is being aborted automatically. Diagnostics are written best-effort to ${WHERE}. ${NO_DAEMON}`,
 		);
 	});
 
 	it("appends kernel facts to the abort_unsettled copy and keeps it unchanged without them", () => {
-		const base =
-			"Suspected stall: auto-abort fired 900s into silence but the run did not settle; the session may need a restart. Diagnostics were logged.";
-		expect(buildStallAbortUnsettledMessage({ silentMs: 900_000 })).toBe(base);
-		expect(buildStallAbortUnsettledMessage({ silentMs: 900_000, kernel: kernelFacts })).toBe(
+		const base = `Suspected stall: auto-abort fired 900s into silence but the run did not settle; the session may need a restart. Diagnostics are written best-effort to ${WHERE}. ${NO_DAEMON}`;
+		expect(buildStallAbortUnsettledMessage({ silentMs: 900_000, diagnosticsPointer: testPointer })).toBe(base);
+		expect(
+			buildStallAbortUnsettledMessage({ silentMs: 900_000, kernel: kernelFacts, diagnosticsPointer: testPointer }),
+		).toBe(
 			`${base} Kernel facts: protocol=4 livenessAgeMs=1200 liveBashHandles=1 hostRequestCount=0 kernelPid=4242 reasons=loop_stalled.`,
 		);
 		// The exemption snapshot is the fallback source when no explicit segment is passed.
 		expect(
-			buildStallAbortUnsettledMessage({ silentMs: 900_000, exemption: exemptionSnapshot({ kernel: kernelFacts }) }),
+			buildStallAbortUnsettledMessage({
+				silentMs: 900_000,
+				exemption: exemptionSnapshot({ kernel: kernelFacts }),
+				diagnosticsPointer: testPointer,
+			}),
 		).toContain("reasons=loop_stalled");
 	});
 

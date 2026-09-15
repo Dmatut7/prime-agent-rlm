@@ -129,6 +129,7 @@ import {
 	parseSlashCommand,
 	resolveBuiltinSlashCommandName,
 } from "../../core/slash-commands.js";
+import { formatStallEventLines } from "../../core/stall-diagnostics-render.js";
 import {
 	captureAgentCommandUsed,
 	captureOnboardingCompleted,
@@ -5924,17 +5925,19 @@ export class InteractiveMode {
 				break;
 
 			case "stall_warning":
-				this.showError(event.message);
+				// The event carries the full forensic snapshot; the message alone tells the
+				// operator that something was silent but not what to interrupt or where to look.
+				this.showError(formatStallEventLines(event).join("\n"));
 				break;
 
 			case "stall_abort":
-				this.showError(event.message);
+				this.showError(formatStallEventLines(event).join("\n"));
 				break;
 
 			case "stall_unsettled":
 				// "Killed but still running" is a different failure than "looks
 				// stuck": it needs the same loud channel, not a warning color.
-				this.showError(event.message);
+				this.showError(formatStallEventLines(event).join("\n"));
 				break;
 
 			case "refine_complete":

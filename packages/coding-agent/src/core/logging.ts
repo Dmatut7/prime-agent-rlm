@@ -1,5 +1,6 @@
 import { type LogEntry, setLogSink, stringifyLogEntry } from "@earendil-works/pi-ai";
 import { appendRotatingLog, getAgentLogPath } from "../config.js";
+import { isStallEvidenceMessage, writeStallEvidenceLine } from "./stall-evidence.js";
 
 const AGENT_LOG_MAX_BYTES = 20 * 1024 * 1024;
 
@@ -11,7 +12,14 @@ export function setLogContext(fields: Record<string, unknown>): void {
 }
 
 export function writeFileLogEntry(entry: LogEntry): void {
-	appendRotatingLog(getAgentLogPath(), stringifyLogEntry({ ...entry, ...context }), AGENT_LOG_MAX_BYTES);
+	const line = stringifyLogEntry({ ...entry, ...context });
+	appendRotatingLog(getAgentLogPath(), line, AGENT_LOG_MAX_BYTES);
+	// Stall records get a second, bounded home: the shared log holds every session on the
+	// machine and rotates at 20MB, so a stall post-mortem can otherwise be rolled away by
+	// unrelated chatter before anyone reads it.
+	if (isStallEvidenceMessage(entry.msg)) {
+		writeStallEvidenceLine(line);
+	}
 }
 
 /**
