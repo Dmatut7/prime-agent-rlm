@@ -285,6 +285,8 @@ export class ShutdownReport {
 	};
 	private readonly refusalByKey = new Map<string, string>();
 	private readonly keptKeys = new Set<string>();
+	/** Targets this run dispatched a signal or a stop request to. */
+	private readonly signalledKeys = new Set<string>();
 	/** Every target this report names, by observation, by keeping, or by a claim. */
 	private readonly namedKeys = new Set<string>();
 	/** Targets this run's scope covers, observed before anything was signalled. */
@@ -315,6 +317,25 @@ export class ShutdownReport {
 				presentAtObservation: existsSync(target.socketPath) || processStartId !== undefined,
 			});
 		}
+	}
+
+	/**
+	 * Record that this run dispatched a signal (or a stop request) to that exact
+	 * target.
+	 *
+	 * `converge` may only credit a disappearance to this run when the run touched
+	 * the target. A protected service that exits on its own inside the convergence
+	 * window is not something we stopped, and crediting it anyway made a no-op
+	 * `--orphans` run read like a successful kill: `stillPresent` was honestly
+	 * empty, the totals honestly added up, and the bucket still lied.
+	 */
+	markSignalled(socketPath: string, pid: number | undefined): void {
+		this.signalledKeys.add(shutdownTargetKey(socketPath, pid));
+	}
+
+	/** Did this run send a signal or a stop request to that exact target? */
+	wasSignalled(socketPath: string, pid?: number): boolean {
+		return this.signalledKeys.has(shutdownTargetKey(socketPath, pid));
 	}
 
 	/** Why one target was refused a signal, so the sweep does not keep re-deciding it. */
@@ -404,13 +425,25 @@ export class ShutdownReport {
 				}
 				continue;
 			}
-			// Only a target that was really here can have converged here: a stale
-			// descriptor whose socket was already gone is not a stop we performed.
+			// Only a target that was really here *and* that this run signalled can
+			// have converged because of us: a stale descriptor whose socket was
+			// already gone is not a stop we performed, and neither is a protected
+			// service that died on its own inside the window.
 			const entry = { socketPath, ...(pid === undefined ? {} : { pid }), kind };
-			if (presentAtObservation) {
+			if (!presentAtObservation) {
+				this.claim("skipped", { ...entry, reason: "already gone before the stop; nothing to stop" });
+			} else if (this.wasSignalled(socketPath, pid)) {
 				this.claim("stopped", { ...entry, action: "converged during shutdown" });
 			} else {
-				this.claim("skipped", { ...entry, reason: "already gone before the stop; nothing to stop" });
+				// Never touched, now gone. A keep, a refusal or an earlier skip already
+				// says what this run decided and outranks this observation, so it stands;
+				// a target with no verdict yet is reported as what it is.
+				this.claim("skipped", {
+					...entry,
+					reason: `exited on its own during the stop window${
+						pid === undefined ? "" : ` (pid ${pid})`
+					}; this run never signalled it`,
+				});
 			}
 		}
 		return stillPresent.sort();
@@ -1484,6 +1517,7 @@ async function runShutdownConverging(
 						break;
 					}
 					await assertAdmission();
+					report.markSignalled(socketPath, pid);
 					await forceKillDaemon(pid);
 					sweep.handledPids.add(pid);
 					await assertAdmission();
@@ -1577,7 +1611,11 @@ async function verifyBeforeSignalling(
  * that really stopped is named even though "stopping it" is not what called it.
  */
 async function stopTrackedWorkersOf(sweep: ShutdownSweep, supervisorSocketPath: string): Promise<void> {
-	const failures = await forceStopTrackedWorkers(supervisorSocketPath, sweep.assertAdmission);
+	const failures = await forceStopTrackedWorkers(
+		supervisorSocketPath,
+		sweep.assertAdmission,
+		(workerSocketPath, pid) => sweep.report.markSignalled(workerSocketPath, pid),
+	);
 	for (const failure of failures) {
 		sweep.report.claim("failed", {
 			...targetEntry(failure.descriptor.socketPath, failure.descriptor.pid, "worker"),
@@ -1796,6 +1834,7 @@ async function terminateVerifiedListener(sweep: ShutdownSweep, listener: Discove
 	if (getProcessStartId(listener.pid) !== processStartId) {
 		return false;
 	}
+	sweep.report.markSignalled(listener.socketPath, listener.pid);
 	killDaemon(listener.pid);
 	const deadline = Date.now() + 1000;
 	while (getProcessStartId(listener.pid) === processStartId && Date.now() < deadline) {
@@ -1854,6 +1893,9 @@ async function stopBackgroundService(
 ): Promise<ReapOutcome> {
 	await sweep.assertAdmission();
 	if (await shutdownDaemon(socketPath, sweep.force)) {
+		// The stop request reached that service: whatever happens to it inside the
+		// convergence window is this run's doing.
+		sweep.report.markSignalled(socketPath, pid);
 		if (pid !== undefined) {
 			sweep.handledPids.add(pid);
 		}
@@ -1877,6 +1919,7 @@ async function stopBackgroundService(
 			return { left: sweep.report.refusalReason(socketPath, pid) ?? "not a verified daemon" };
 		}
 		await sweep.assertAdmission();
+		sweep.report.markSignalled(socketPath, pid);
 		await forceKillDaemon(pid);
 		sweep.handledPids.add(pid);
 		return { reaped: `force-killed the process holding a removed socket (pid ${pid})` };
@@ -1893,6 +1936,7 @@ async function stopBackgroundService(
 		return { left: sweep.report.refusalReason(socketPath, pid) ?? "not a verified daemon" };
 	}
 	await sweep.assertAdmission();
+	sweep.report.markSignalled(socketPath, pid);
 	await forceKillDaemon(pid);
 	sweep.handledPids.add(pid);
 	await sweep.assertAdmission();
@@ -1966,6 +2010,7 @@ export interface TrackedWorkerFailure {
 async function forceStopTrackedWorkers(
 	supervisorSocketPath: string,
 	assertAdmission: () => Promise<void>,
+	markSignalled: (socketPath: string, pid: number) => void,
 ): Promise<TrackedWorkerFailure[]> {
 	const failures: TrackedWorkerFailure[] = [];
 	const fail = (descriptor: DaemonWorkerDescriptor, reason: string): void => {
@@ -1973,7 +2018,12 @@ async function forceStopTrackedWorkers(
 	};
 	for (const worker of findTrackedWorkers(supervisorSocketPath)) {
 		const { descriptor } = worker;
-		let cleanupWorkerRecords = await stopTrackedProcess(descriptor.pid, descriptor.processStartId, assertAdmission);
+		let cleanupWorkerRecords = await stopTrackedProcess(
+			descriptor.pid,
+			descriptor.processStartId,
+			assertAdmission,
+			(pid) => markSignalled(descriptor.socketPath, pid),
+		);
 		if (!cleanupWorkerRecords) {
 			fail(descriptor, `could not safely stop worker ${descriptor.workerId} (pid ${descriptor.pid})`);
 		}
@@ -2010,7 +2060,11 @@ async function forceStopTrackedWorkers(
 					}
 					continue;
 				}
-				if (!(await stopTrackedProcess(orphan.pid, orphan.processStartId, assertAdmission))) {
+				if (
+					!(await stopTrackedProcess(orphan.pid, orphan.processStartId, assertAdmission, (pid) =>
+						markSignalled(descriptor.socketPath, pid),
+					))
+				) {
 					cleanupWorkerRecords = false;
 					fail(descriptor, `could not stop child process ${orphan.pid} for worker ${descriptor.workerId}`);
 				}
@@ -2144,6 +2198,7 @@ async function stopTrackedProcess(
 	pid: number,
 	expectedStartId: string | undefined,
 	assertAdmission: () => Promise<void>,
+	onSignal: (pid: number) => void,
 ): Promise<boolean> {
 	if (!isProcessAlive(pid)) {
 		return true;
@@ -2155,6 +2210,7 @@ async function stopTrackedProcess(
 	if (getProcessStartId(pid) !== expectedStartId) {
 		return false;
 	}
+	onSignal(pid);
 	signalProcessGroupOrProcess(pid, "SIGTERM");
 	let deadline = Date.now() + 500;
 	while (isProcessAlive(pid) && Date.now() < deadline) {
@@ -2167,6 +2223,7 @@ async function stopTrackedProcess(
 	if (getProcessStartId(pid) !== expectedStartId) {
 		return false;
 	}
+	onSignal(pid);
 	signalProcessGroupOrProcess(pid, "SIGKILL");
 	deadline = Date.now() + 1000;
 	while (isProcessAlive(pid) && Date.now() < deadline) {
@@ -2295,7 +2352,7 @@ export async function runReap(
 		}
 		if (action.kind === "stop") {
 			const admission = async () => {};
-			if (!(await stopTrackedProcess(descriptor.pid, descriptor.processStartId, admission))) {
+			if (!(await stopTrackedProcess(descriptor.pid, descriptor.processStartId, admission, () => {}))) {
 				skipped.push({ socketPath: descriptor.socketPath, reason: `${label}: could not be stopped safely` });
 				continue;
 			}
