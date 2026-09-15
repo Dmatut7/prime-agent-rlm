@@ -1,0 +1,1 @@
+- Added a shared per-chain provider request budget so SDK-level retries are counted and reported instead of multiplying with the agent and session retries.

@@ -33,11 +33,15 @@ import type {
 import {
 	clampThinkingLevel,
 	cleanupSessionResources,
+	forgetProviderRequestBudget,
 	getLogger,
+	getProviderRequestBudget,
 	getSupportedThinkingLevels,
 	isContextOverflow,
 	modelsAreEqual,
+	type ProviderRequestBudget,
 	resetApiProviders,
+	resetProviderRequestBudget,
 	supportsFastMode,
 } from "@earendil-works/pi-ai";
 import { theme } from "../modes/interactive/theme/theme.js";
@@ -441,6 +445,12 @@ export type AgentSessionEvent =
 			maxAttempts: number;
 			delayMs: number;
 			errorMessage: string;
+			/**
+			 * Requests spent in the current chain, shared with the provider layer. Present
+			 * only when the shared budget counted at least one request, so consumers that
+			 * predate it see the same event shape they always did.
+			 */
+			requestBudget?: { used: number; maxRequests?: number };
 	  }
 	| {
 			type: "auto_retry_end";
@@ -4746,6 +4756,12 @@ export class AgentSession {
 
 				// Reset retry counter immediately on successful assistant response
 				// This prevents accumulation across multiple LLM calls within a turn
+				if (assistantMsg.stopReason !== "error") {
+					// A real answer ends the request chain: the next failure starts from a
+					// clean pool. The loop resets the same counter; doing it here as well
+					// keeps the accounting correct for callers that stream without the loop.
+					resetProviderRequestBudget(this.sessionId);
+				}
 				if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) {
 					this._emit({
 						type: "auto_retry_end",
@@ -4834,6 +4850,9 @@ export class AgentSession {
 	}
 
 	private _resolveRetry(): void {
+		// The chain is over (answered, exhausted, disabled or cancelled): drop the shared
+		// counter so the pool never outlives the request it accounts for.
+		forgetProviderRequestBudget(this.sessionId);
 		this._semanticEdges.clearTurnRetry();
 		if (this._retryResolve) {
 			this._retryResolve();
@@ -13968,11 +13987,33 @@ export class AgentSession {
 			return false;
 		}
 
-		if (this._isStructuredPermanentProviderRetryExhausted(message)) {
+		// The provider answered that the request itself is unacceptable (refusal, invalid
+		// request, auth). Resending the same bytes asks the same question and bills a
+		// second full-context request for the same answer: a retry only helps when it
+		// sends something different. `_retryAttempt` gates below must not be able to
+		// resurrect this class - the failing shape this guards was a "permanent" failure
+		// that was retried once anyway because the check asked "did we already retry?".
+		if (this._isStructuredPermanentProviderFailure(message)) {
 			return false;
 		}
 
 		return true;
+	}
+
+	/**
+	 * Cross-layer request budget for the current request chain: the counter the SDK-level
+	 * retries (through the provider fetch wrapper), the agent loop's in-place resends and
+	 * this session's turn retries all spend from. The ceiling is the product of the
+	 * configured per-layer budgets, which is exactly the envelope the layers used to reach
+	 * by multiplying their independent counters - now shared, so no layer can exceed it.
+	 */
+	private _crossLayerRequestBudget(): ProviderRequestBudget {
+		const retrySettings = this.settingsManager.getRetrySettings();
+		const providerSettings = this.settingsManager.getProviderRetrySettings();
+		const sessionAttempts = (retrySettings.enabled ? retrySettings.maxRetries : 0) + 1;
+		// The SDKs default to 2 retries (3 attempts) when nothing is configured.
+		const providerAttempts = (providerSettings.maxRetries ?? 2) + 1;
+		return getProviderRequestBudget(this.sessionId, sessionAttempts * providerAttempts);
 	}
 
 	private _isFauxProviderQueueExhausted(message: AssistantMessage): boolean {
@@ -14238,6 +14279,31 @@ export class AgentSession {
 			return false;
 		}
 
+		const requestBudget = this._crossLayerRequestBudget();
+		// The shared chain is spent: another resend here would exceed the ceiling the
+		// layers agreed on, so the failure surfaces with the count instead. This is the
+		// only place that can see both the SDK's spend and its own retry budget.
+		if (requestBudget.exhausted) {
+			sessionLog.warn("cross-layer provider request budget exhausted; not retrying", {
+				sessionId: this.sessionId,
+				attempt: this._retryAttempt,
+				requestBudget: { used: requestBudget.used, maxRequests: requestBudget.maxRequests },
+				errorMessage: message.errorMessage,
+			});
+			this._markProviderAuthStaleForRetryFailure(message, options);
+			this._emit({
+				type: "auto_retry_end",
+				success: false,
+				attempt: this._retryAttempt,
+				finalError: `${message.errorMessage ?? "Unknown error"} (not retried: the shared provider request budget is exhausted - ${requestBudget.describe()}).`,
+			});
+			this._terminalFailureAttemptCount = this._retryAttempt;
+			this._retryAttempt = 0;
+			this._retryAuthFailureSources = [];
+			this._resolveRetry();
+			return false;
+		}
+
 		if (!this._retryPromise) {
 			this._retryPromise = new Promise((resolve) => {
 				this._retryResolve = resolve;
@@ -14274,6 +14340,11 @@ export class AgentSession {
 			maxAttempts: settings.maxRetries,
 			delayMs,
 			errorMessage: message.errorMessage || "Unknown error",
+			// Visibility for the retry chain: the count the provider layer already spent is
+			// the number that used to be invisible, since SDK-level retries logged nothing.
+			...(requestBudget.used > 0
+				? { requestBudget: { used: requestBudget.used, maxRequests: requestBudget.maxRequests } }
+				: {}),
 		});
 
 		const messages = this.agent.state.messages;

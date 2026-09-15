@@ -235,6 +235,8 @@ function createClient(model: Model<"azure-openai-responses">, apiKey: string, op
 		fetch: createRetryCapFetch({
 			maxRetryDelayMs: options?.maxRetryDelayMs,
 			onProviderRetry: options?.onProviderRetry,
+			requestBudget: options?.requestBudget,
+			onProviderRequestAttempt: options?.onProviderRequestAttempt,
 		}),
 	});
 }

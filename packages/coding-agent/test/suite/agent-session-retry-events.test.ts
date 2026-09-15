@@ -322,8 +322,12 @@ describe("AgentSession retry and event characterization", () => {
 		expect(harness.eventsOfType("auto_retry_end").map((event) => event.success)).toEqual([true]);
 	});
 
+	// A structured permanent failure used to be resent once because the check asked
+	// "have we already retried?" rather than "can a resend change the answer?". The
+	// provider rejected the request itself, so the identical copy is one billed
+	// full-context request for the same answer.
 	for (const kind of ["auth", "invalid_request", "refusal"] as const) {
-		it(`retries structured permanent provider ${kind} failures once`, async () => {
+		it(`does not resend a structured permanent provider ${kind} failure`, async () => {
 			const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
 			harnesses.push(harness);
 			harness.setResponses([
@@ -334,9 +338,9 @@ describe("AgentSession retry and event characterization", () => {
 
 			await harness.session.prompt("test");
 
-			expect(harness.faux.state.callCount).toBe(2);
-			expect(harness.eventsOfType("auto_retry_start").map((event) => event.attempt)).toEqual([1]);
-			expect(harness.eventsOfType("auto_retry_end").map((event) => event.success)).toEqual([false]);
+			expect(harness.faux.state.callCount).toBe(1);
+			expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
+			expect(harness.eventsOfType("auto_retry_end")).toEqual([]);
 			expect(harness.session.isRetrying).toBe(false);
 		});
 	}

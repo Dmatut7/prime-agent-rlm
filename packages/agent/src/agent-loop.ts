@@ -10,8 +10,11 @@ import {
 	type Context,
 	classifyStreamFailure,
 	EventStream,
+	getProviderRequestBudget,
 	type ImageContent,
 	isContextOverflow,
+	type ProviderRequestAttemptNotice,
+	ProviderRequestBudget,
 	type ProviderRetryNotice,
 	streamSimple,
 	type TextContent,
@@ -715,15 +718,20 @@ function resolveEmptyTurnRetryPolicy(options?: EmptyTurnRetryConfig): {
 function emptyTurnExhaustedMessage(
 	attempts: number,
 	discarded: { waitedMs: number },
-	terminatedBy: "attempts" | "budget" | "abort",
+	terminatedBy: "attempts" | "budget" | "abort" | "request_budget",
+	requestBudget: { used: number; maxRequests?: number } = { used: 0 },
 ): string {
 	const waited = `waited ${discarded.waitedMs}ms between attempts`;
 	const why =
-		terminatedBy === "budget"
-			? `the retry wait budget ran out (attempted ${attempts} replies, ${waited})`
-			: terminatedBy === "abort"
-				? `the run was aborted between attempts (got ${attempts} empty replies, ${waited})`
-				: `the provider answered ${attempts} times in a row with no output content or tool calls (${waited})`;
+		terminatedBy === "request_budget"
+			? `the shared provider request budget ran out after ${requestBudget.used} request(s) in this chain` +
+				(requestBudget.maxRequests === undefined ? "" : ` (ceiling ${requestBudget.maxRequests})`) +
+				`, so the resends stopped instead of spending more (attempted ${attempts} replies, ${waited})`
+			: terminatedBy === "budget"
+				? `the retry wait budget ran out (attempted ${attempts} replies, ${waited})`
+				: terminatedBy === "abort"
+					? `the run was aborted between attempts (got ${attempts} empty replies, ${waited})`
+					: `the provider answered ${attempts} times in a row with no output content or tool calls (${waited})`;
 	return (
 		`Model returned an empty response ${attempts} times in a row: ${why}. ` +
 		"This is the provider returning a clean stop turn with nothing in it, not a connection failure. " +
@@ -736,6 +744,8 @@ function recordEmptyTurnExhaustion(
 	attempts: number,
 	discarded: { waitedMs: number },
 	policy: { maxAttempts: number; baseDelayMs: number; maxDelayMs: number; maxTotalDelayMs: number },
+	requestBudget: { used: number; maxRequests?: number },
+	terminatedBy: "attempts" | "budget" | "abort" | "request_budget",
 ): void {
 	appendAssistantMessageDiagnostic(message, {
 		type: EMPTY_TURN_RETRY_EXHAUSTED_DIAGNOSTIC_TYPE,
@@ -747,6 +757,40 @@ function recordEmptyTurnExhaustion(
 			baseDelayMs: policy.baseDelayMs,
 			maxDelayMs: policy.maxDelayMs,
 			maxTotalDelayMs: policy.maxTotalDelayMs,
+			terminatedBy,
+			requestBudget,
+		},
+	});
+}
+
+/**
+ * Diagnostic type for a chain that issued more than one provider request, or that was cut
+ * short by the shared budget. SDK-level retries used to leave no trace at all in the
+ * transcript, so a turn that quietly spent four requests read exactly like one that spent
+ * one; this puts the attempt list, the chain total and the ceiling on the message.
+ */
+export const PROVIDER_REQUEST_BUDGET_DIAGNOSTIC_TYPE = "provider_request_budget";
+
+function recordProviderRequestAttempts(
+	message: AssistantMessage,
+	attempts: readonly ProviderRequestAttemptNotice[],
+	budget: { used: number; maxRequests?: number },
+): void {
+	if (attempts.length <= 1 && !attempts.some((attempt) => attempt.retrySuppressedBy !== undefined)) {
+		return;
+	}
+	appendAssistantMessageDiagnostic(message, {
+		type: PROVIDER_REQUEST_BUDGET_DIAGNOSTIC_TYPE,
+		timestamp: Date.now(),
+		details: {
+			attempts: attempts.map((attempt) => ({
+				attempt: attempt.attempt,
+				status: attempt.status,
+				networkError: attempt.networkError,
+				retrySuppressedBy: attempt.retrySuppressedBy,
+			})),
+			used: budget.used,
+			maxRequests: budget.maxRequests,
 		},
 	});
 }
@@ -789,12 +833,32 @@ async function streamAssistantResponse(
 	// as an overflow, which is why they are never summed on any path.
 	const discarded = { cost: { ...EMPTY_USAGE.cost }, output: 0, attempts: 0, waitedMs: 0 };
 	const emptyTurnPolicy = resolveEmptyTurnRetryPolicy(config.emptyTurnRetry);
+	// One request budget for every layer that can issue a provider request for this
+	// chain: the SDK's own retries (via the provider fetch wrapper) and the in-place
+	// resends below all count into the same pool, so the layers cannot multiply.
+	const requestBudget =
+		config.requestBudget ?? (config.sessionId ? getProviderRequestBudget(config.sessionId) : new ProviderRequestBudget());
+	const providerAttempts: ProviderRequestAttemptNotice[] = [];
+	const callerAttemptSink = config.onProviderRequestAttempt;
+	const loopConfig: AgentLoopConfig = {
+		...config,
+		requestBudget,
+		onProviderRequestAttempt: (notice) => {
+			providerAttempts.push(notice);
+			callerAttemptSink?.(notice);
+		},
+	};
 	for (let attempt = 1; ; attempt++) {
-		const message = await streamAssistantResponseAttempt(context, config, signal, emit, streamFn);
+		const message = await streamAssistantResponseAttempt(context, loopConfig, signal, emit, streamFn);
 		// Overflow turns are never discarded, so compaction recovery can still see them.
 		// "Untouched" covers the retry decision and the token fields; when earlier attempts
 		// were discarded, their cost is still carried onto this message below.
 		const overflow = isContextOverflow(message, config.model.contextWindow);
+		// A real answer ends the chain, so the next request starts from a clean pool. An
+		// empty turn does not: it is exactly the shape the resends below exist for.
+		if (!overflow && !isEmptyAssistantTurn(message) && message.stopReason !== "error" && message.stopReason !== "aborted") {
+			requestBudget.reset();
+		}
 		if (isEmptyAssistantTurn(message) && !overflow) {
 			// Resend gaps: an empty reply usually means the upstream is queued or
 			// overloaded, and three requests inside the same millisecond are the worst
@@ -802,7 +866,11 @@ async function streamAssistantResponse(
 			// and honors the run signal (an abort continues into the attempt's own abort
 			// path instead of being delayed by us).
 			const delayMs = Math.min(emptyTurnPolicy.baseDelayMs * 2 ** (attempt - 1), emptyTurnPolicy.maxDelayMs);
-			if (attempt < emptyTurnPolicy.maxAttempts && discarded.waitedMs + delayMs <= emptyTurnPolicy.maxTotalDelayMs) {
+			const withinAttempts = attempt < emptyTurnPolicy.maxAttempts;
+			const withinWaitBudget = discarded.waitedMs + delayMs <= emptyTurnPolicy.maxTotalDelayMs;
+			// The shared budget is the outer bound: when the SDK already spent the chain's
+			// last request, this layer must not start another one.
+			if (withinAttempts && withinWaitBudget && !requestBudget.exhausted) {
 				discarded.attempts += 1;
 				discarded.waitedMs += delayMs;
 				discarded.output += message.usage.output;
@@ -817,15 +885,20 @@ async function streamAssistantResponse(
 				await waitAbortably(delayMs, signal);
 				continue;
 			}
-			const terminatedBy: "attempts" | "budget" | "abort" = signal?.aborted
+			// Which limit actually stopped the resends, in the order they are checked:
+			// the container abort, the attempt count, the wait budget, then the shared
+			// request budget - naming the wrong one sends the reader at the wrong knob.
+			const terminatedBy: "attempts" | "budget" | "abort" | "request_budget" = signal?.aborted
 				? "abort"
-				: attempt >= emptyTurnPolicy.maxAttempts
+				: !withinAttempts
 					? "attempts"
-					: "budget";
+					: !withinWaitBudget
+						? "budget"
+						: "request_budget";
 			message.stopReason = "error";
 			message.stopReasonRaw = EMPTY_TURN_RETRY_EXHAUSTED_STOP_REASON_RAW;
-			message.errorMessage = emptyTurnExhaustedMessage(attempt, discarded, terminatedBy);
-			recordEmptyTurnExhaustion(message, attempt, discarded, emptyTurnPolicy);
+			message.errorMessage = emptyTurnExhaustedMessage(attempt, discarded, terminatedBy, requestBudget);
+			recordEmptyTurnExhaustion(message, attempt, discarded, emptyTurnPolicy, requestBudget, terminatedBy);
 		}
 		if (discarded.attempts > 0) {
 			// Carry the discarded spend onto whichever message ends the loop: the synthesized
@@ -854,6 +927,7 @@ async function streamAssistantResponse(
 				},
 			};
 		}
+		recordProviderRequestAttempts(message, providerAttempts, requestBudget);
 		await emit({ type: "message_end", message });
 		return message;
 	}

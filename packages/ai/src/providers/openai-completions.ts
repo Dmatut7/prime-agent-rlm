@@ -471,6 +471,8 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 				createRetryCapFetch({
 					maxRetryDelayMs: options?.maxRetryDelayMs,
 					onProviderRetry: options?.onProviderRetry,
+					requestBudget: options?.requestBudget,
+					onProviderRequestAttempt: options?.onProviderRequestAttempt,
 				}),
 			);
 			let params = buildParams(model, context, options, compat, cacheRetention, cacheControl);

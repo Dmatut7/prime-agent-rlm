@@ -507,6 +507,8 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 					createRetryCapFetch({
 						maxRetryDelayMs: options?.maxRetryDelayMs,
 						onProviderRetry: options?.onProviderRetry,
+						requestBudget: options?.requestBudget,
+						onProviderRequestAttempt: options?.onProviderRequestAttempt,
 					}),
 				);
 				client = created.client;

@@ -102,6 +102,8 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 				createRetryCapFetch({
 					maxRetryDelayMs: options?.maxRetryDelayMs,
 					onProviderRetry: options?.onProviderRetry,
+					requestBudget: options?.requestBudget,
+					onProviderRequestAttempt: options?.onProviderRequestAttempt,
 				}),
 			);
 			let params = buildParams(model, context, options);
