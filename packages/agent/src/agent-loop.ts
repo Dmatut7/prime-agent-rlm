@@ -45,6 +45,17 @@ export const TOOL_ABORT_FALLBACK_MESSAGE = "Tool execution aborted";
  * the output it is looking at is partial instead of treating it as the whole answer.
  */
 export const ABORT_TRUNCATION_MARKER = "[tool result truncated: the turn was aborted while this tool was in flight]";
+
+/**
+ * The abort cause a caller attached to the run's abort signal, when it attached one
+ * (DO-4: `AbortController.abort(causeText)`). Surfaced next to every abort stub so the
+ * model can tell a stall kill from a user interrupt instead of blind-re-running the
+ * long command it was in the middle of.
+ */
+export function abortCauseFromSignal(signal: AbortSignal | undefined): string | undefined {
+	const reason: unknown = signal?.reason;
+	return typeof reason === "string" && reason.trim().length > 0 ? reason.trim() : undefined;
+}
 /**
  * How long the abort path waits for an in-flight tool to settle so its partial
  * output can be preserved. Sized against the kernel's own force-abort grace
@@ -224,6 +235,7 @@ function boundHarvestedTextTail(result: AgentToolResult<any>, maxBytes: number):
 async function preserveAbortedToolResult(
 	executed: ExecutedToolCallOutcome,
 	result: AgentToolResult<any>,
+	abortCause: string | undefined,
 ): Promise<AgentToolResult<any>> {
 	// A result synthesized by the abort path is a stub, not tool output: go straight
 	// to the harvest for it.
@@ -235,10 +247,18 @@ async function preserveAbortedToolResult(
 		}
 	}
 	if (!preserved) {
-		return createErrorToolResult(TOOL_ABORT_FALLBACK_MESSAGE);
+		return createErrorToolResult(
+			abortCause === undefined ? TOOL_ABORT_FALLBACK_MESSAGE : `${TOOL_ABORT_FALLBACK_MESSAGE} ${abortCause}`,
+		);
 	}
 	return {
-		content: [...preserved.content, { type: "text", text: ABORT_TRUNCATION_MARKER }],
+		content: [
+			...preserved.content,
+			{
+				type: "text",
+				text: abortCause === undefined ? ABORT_TRUNCATION_MARKER : `${ABORT_TRUNCATION_MARKER} ${abortCause}`,
+			},
+		],
 		details: preserved.details,
 		...(preserved.terminate === undefined ? {} : { terminate: preserved.terminate }),
 	};
@@ -260,6 +280,7 @@ function cloneUsage(usage: AssistantMessage["usage"]): AssistantMessage["usage"]
 function createAbortedAssistantMessage(
 	config: AgentLoopConfig,
 	partialMessage: AssistantMessage | null,
+	abortCause: string | undefined,
 ): AssistantMessage {
 	return {
 		role: "assistant",
@@ -269,7 +290,7 @@ function createAbortedAssistantMessage(
 		model: partialMessage?.model ?? config.model.id,
 		usage: cloneUsage(partialMessage?.usage ?? EMPTY_USAGE),
 		stopReason: "aborted",
-		errorMessage: ABORT_ERROR_MESSAGE,
+		errorMessage: abortCause === undefined ? ABORT_ERROR_MESSAGE : `${ABORT_ERROR_MESSAGE} (${abortCause})`,
 		timestamp: Date.now(),
 	};
 }
@@ -1068,7 +1089,7 @@ async function runAssistantStreamAttempt(
 		return partial === event.partial && toolCall === event.toolCall ? event : { ...event, partial, toolCall };
 	};
 	const finishAbortedMessage = async () => {
-		const finalMessage = createAbortedAssistantMessage(config, partialMessage);
+		const finalMessage = createAbortedAssistantMessage(config, partialMessage, abortCauseFromSignal(signal));
 		if (addedPartial) {
 			context.messages[context.messages.length - 1] = finalMessage;
 		} else {
@@ -1631,7 +1652,7 @@ async function finalizeExecutedToolCall(
 	if (abortedDuringFinalize || executed.abortedInFlight === true) {
 		return {
 			toolCall: prepared.toolCall,
-			result: await preserveAbortedToolResult(executed, result),
+			result: await preserveAbortedToolResult(executed, result, abortCauseFromSignal(signal)),
 			isError: true,
 		};
 	}

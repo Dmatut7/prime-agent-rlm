@@ -172,6 +172,53 @@ function textOf(result: { content: Array<{ type: string; text?: string }> }): st
 	return result.content.map((block) => (block.type === "text" ? (block.text ?? "") : "")).join("\n");
 }
 
+describe("abort cause disclosure (DO-4)", () => {
+	it("carries the abort cause into the in-flight tool result and the aborted assistant message", async () => {
+		const controller = new AbortController();
+		const cause = "Abort cause: the turn was aborted after 300s of session silence; reasons: stall_watchdog.";
+		const tool = createTool(async () => ({
+			content: [{ type: "text", text: "partial output from a long bash command" }],
+			details: { status: "ok" },
+		}));
+
+		const { messages } = await runToolTurn({
+			tool,
+			signal: controller.signal,
+			config: {
+				afterToolCall: async () => {
+					controller.abort(cause);
+					return undefined;
+				},
+			},
+		});
+
+		const toolResult = toolResultOf(messages);
+		expect(textOf(toolResult)).toContain(ABORT_TRUNCATION_MARKER);
+		expect(textOf(toolResult)).toContain(cause);
+	});
+
+	it("keeps the bare abort stub when no cause was attached", async () => {
+		const controller = new AbortController();
+		const tool = createTool(async () => ({
+			content: [{ type: "text", text: "partial output" }],
+			details: { status: "ok" },
+		}));
+		const { messages } = await runToolTurn({
+			tool,
+			signal: controller.signal,
+			config: {
+				afterToolCall: async () => {
+					controller.abort();
+					return undefined;
+				},
+			},
+		});
+		const toolResult = toolResultOf(messages);
+		expect(textOf(toolResult)).not.toContain("Abort cause");
+		expect(JSON.stringify(toolResult.content)).not.toContain("Request was aborted");
+	});
+});
+
 describe("aborted tool result evidence (T1-5)", () => {
 	it("preserves the tool's own output when the turn aborts during finalization", async () => {
 		const controller = new AbortController();

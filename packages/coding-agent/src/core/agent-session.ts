@@ -341,7 +341,7 @@ import { THINKING_LEVELS } from "./thinking-levels.js";
 import { acpMcpToolNames, createAcpMcpToolDefinitions } from "./tools/acp-mcp.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
 import { createAllToolDefinitions } from "./tools/index.js";
-import { type IpythonAbortCause, IpythonKernelProvisioner } from "./tools/ipython.js";
+import { formatIpythonAbortCause, type IpythonAbortCause, IpythonKernelProvisioner } from "./tools/ipython.js";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.js";
 import {
 	createTurnLiveness,
@@ -9184,7 +9184,12 @@ export class AgentSession {
 		this._autoRefineBranchVersion++;
 		this._autoRefineReviewAbort?.abort();
 		this._refineAbortController?.abort();
-		this.agent.abort();
+		// DO-4: the watchdog's structured cause rides on the abort signal so every
+		// in-flight tool (bash included) and the aborted assistant message report
+		// why the turn was killed, not just "Request was aborted".
+		this.agent.abort(
+			options?.reason === "stall_watchdog" ? formatIpythonAbortCause(this._lastStallAbortCause) : undefined,
+		);
 	}
 
 	/**
