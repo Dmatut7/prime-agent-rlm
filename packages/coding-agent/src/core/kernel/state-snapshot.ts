@@ -129,6 +129,15 @@ export function snapshotWritePolicy(input: SnapshotWritePolicyInput): SnapshotWr
 export function compactionKernelStateLines(input: {
 	/** The snapshot write result, or null when it was refused, failed, or the kernel died. */
 	snapshot: SnapshotResult | null;
+	/**
+	 * Whether this kernel has a snapshot target configured at all. False for
+	 * runtimes with no snapshot machine (e.g. non-persistent sessions): their
+	 * null result is not a *failed* write but the absence of the mechanism, so
+	 * the notice must not point at a "last successfully written snapshot" that
+	 * never existed. Defaults to true so callers without the fact keep the
+	 * failed-write wording.
+	 */
+	hasSnapshotConfig?: boolean;
 	/** Namespace listing result, or null when the kernel could not be listed. */
 	names: string[] | null;
 }): string[] {
@@ -137,9 +146,15 @@ export function compactionKernelStateLines(input: {
 		lines.push(
 			"Your Python kernel persisted through compaction; its remaining variables, imports, and helpers are still available.",
 		);
-		lines.push(
-			"The kernel's state snapshot could not be written, so these names were not saved to disk: a restart revives only the last successfully written snapshot, and anything defined since then must be recreated.",
-		);
+		if (input.hasSnapshotConfig === false) {
+			lines.push(
+				"This kernel has no state snapshot target configured, so nothing in it was saved to disk: a restart starts a fresh kernel and anything defined here must be recreated.",
+			);
+		} else {
+			lines.push(
+				"The kernel's state snapshot could not be written, so these names were not saved to disk: a restart revives only the last successfully written snapshot, and anything defined since then must be recreated.",
+			);
+		}
 	} else {
 		const pruned = input.snapshot.pruned ?? [];
 		lines.push(

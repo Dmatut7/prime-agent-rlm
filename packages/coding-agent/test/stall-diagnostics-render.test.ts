@@ -140,4 +140,17 @@ describe("cross-version stall events (K3X-1)", () => {
 		// emitting daemon's.
 		expect(text).toContain("resolved locally in this client");
 	});
+
+	/**
+	 * X-3 small face: the payload-present (normal) path resolves the same
+	 * pointer in this client's process, but its line carried no qualifier - the
+	 * fix only qualified the degraded path, leaving the two paths with
+	 * inconsistent honesty wording.
+	 */
+	it("qualifies the normal-path pointer as locally resolved too", () => {
+		const lines = formatStallDiagnosticsLines(diagnostics());
+		const pointerLine = lines.find((line) => line.startsWith("diagnostics file"));
+		expect(pointerLine).toBeDefined();
+		expect(pointerLine).toContain("resolved locally in this client");
+	});
 });

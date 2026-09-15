@@ -29,6 +29,10 @@ function isSegment(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }
 
+/** X-3: both pointer paths resolve in this client, not in the emitting daemon. */
+const RESOLVED_LOCALLY_QUALIFIER =
+	"resolved locally in this client; the emitting daemon may record under its own logs dir";
+
 function flag(segment: Record<string, unknown>, key: string): string {
 	const value = segment[key];
 	return typeof value === "boolean" ? yesNo(value) : "unknown";
@@ -59,7 +63,7 @@ export function formatStallDiagnosticsLines(diagnostics: StallDiagnostics | unde
 		// agent dir, its own logs hold the record and these paths do not.
 		const degradedPointer = resolveStallDiagnosticsPointer();
 		lines.push(
-			`diagnostics file (resolved locally in this client; the emitting daemon may record under its own logs dir): ${degradedPointer.evidencePath} (also ${degradedPointer.agentLogPath})`,
+			`diagnostics file (${RESOLVED_LOCALLY_QUALIFIER}): ${degradedPointer.evidencePath} (also ${degradedPointer.agentLogPath})`,
 		);
 		return lines;
 	}
@@ -144,8 +148,13 @@ export function formatStallDiagnosticsLines(diagnostics: StallDiagnostics | unde
 			lines.push("kernel: unknown");
 		}
 	}
+	// X-3: this path resolves the pointer in *this* process too, so it carries
+	// the same locality qualifier as the degraded path above - without it the
+	// payload-present wording implied the emitting daemon wrote these paths.
 	const pointer = resolveStallDiagnosticsPointer();
-	lines.push(`diagnostics file: ${pointer.evidencePath} (also ${pointer.agentLogPath})`);
+	lines.push(
+		`diagnostics file (${RESOLVED_LOCALLY_QUALIFIER}): ${pointer.evidencePath} (also ${pointer.agentLogPath})`,
+	);
 	return lines;
 }
 

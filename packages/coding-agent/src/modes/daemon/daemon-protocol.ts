@@ -163,8 +163,17 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // wire DTO's `diagnostics` is now typed optional to match the renderer guard, but that
 // shape lives in agent-connection/types.ts, outside every hashed slice, so this
 // revision is not an identity for it.
-export const DAEMON_SCHEMA_REVISION = 34;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-34-3c415362acce";
+// Revision 35 adds the `wait_for_headless_completion` response family to the
+// digest: the response now carries the RLM quiescence barrier's outcome as an
+// optional `rlmQuiescence` field (K3Q-1), so a client can tell "descendants
+// settled" from "the wait gave up on its deadline". The field is optional and
+// gated behind the existing `rlm_quiescence_barrier` capability (an old daemon
+// advertising the barrier but not the field degrades to the pre-fix behavior),
+// but the shape lives in headless-completion.ts and agent-session.ts, outside
+// every hashed slice, so an edit to it would otherwise ride an unchanged
+// DAEMON_SCHEMA_ID.
+export const DAEMON_SCHEMA_REVISION = 35;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-35-0632e2e54e98";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;

@@ -1568,7 +1568,7 @@ describe("global refinement history", () => {
 const describePosix = process.platform === "win32" ? describe.skip : describe;
 
 describePosix("persistAppliedRefinement order and mtime", () => {
-	it("writes session audit before harness so rollback survives an interrupted save", () => {
+	it("refuses the whole persist on a stamp mismatch, leaving no ghost rollback history", () => {
 		const dir = makeTempDir();
 		const expectedStamp = readHarnessStateStamp(dir);
 		const state = loadHarnessState(dir, "local");
@@ -1590,6 +1590,11 @@ describePosix("persistAppliedRefinement order and mtime", () => {
 		);
 		saveHarnessState(dir, concurrent);
 
+		// A second store (the global history dir) proves the losing writer leaves
+		// no rollback-selectable row anywhere, not just in the session audit.
+		const globalDir = getGlobalHarnessStateDir(join(dir, "agent"));
+		mkdirSync(globalDir, { recursive: true });
+
 		const audit: RefinementResult[] = [];
 		expect(() =>
 			persistAppliedRefinement({
@@ -1600,13 +1605,19 @@ describePosix("persistAppliedRefinement order and mtime", () => {
 				appendSessionAudit: (entry) => {
 					audit.push(structuredClone(entry));
 				},
+				globalHarnessStateDir: globalDir,
 			}),
 		).toThrow(HARNESS_CONCURRENT_WRITE_ERROR);
 
-		expect(audit.map((entry) => entry.id)).toEqual(["refine_interrupted"]);
+		// K3Q-2: the pre-fix order wrote the session audit and the global history
+		// row before the stamp check, so a losing concurrent writer left a ghost
+		// rollback entry while its receipt said nothing was recorded. With the
+		// state write first, a rejected stamp refuses before any history lands.
+		expect(audit).toEqual([]);
+		expect(loadGlobalRefinementHistory(globalDir)).toEqual([]);
+		expect(mergeRefinementHistory(loadGlobalRefinementHistory(globalDir), audit)).toEqual([]);
 		expect(loadHarnessState(dir, "local").entries.memory.kernel?.content).toBe("from kernel");
 		expect(loadHarnessState(dir, "local").entries.memory.note).toBeUndefined();
-		expect(mergeRefinementHistory([], audit).some((item) => item.id === "refine_interrupted")).toBe(true);
 	});
 
 	it("saves harness when the on-disk mtime still matches the load", () => {

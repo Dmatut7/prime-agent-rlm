@@ -138,6 +138,19 @@ describe("daemon protocol helpers", () => {
 			stallWatchdogSource.indexOf("export interface StallExemptionDiagnostics"),
 			stallWatchdogSource.indexOf("export type StallExemptionEventKind"),
 		);
+		// K3Q-1: the wait_for_headless_completion response is a wire shape too. Its
+		// `rlmQuiescence` field rides the existing rlm_quiescence_barrier capability,
+		// but the shapes live in headless-completion.ts and agent-session.ts, outside
+		// every prior slice; an edit would ride an unchanged DAEMON_SCHEMA_ID.
+		const headlessCompletionSource = readFileSync(resolve(__dirname, "../src/modes/headless-completion.ts"), "utf8");
+		const headlessResultSource = headlessCompletionSource.slice(
+			headlessCompletionSource.indexOf("export interface HeadlessCompletionResult"),
+			headlessCompletionSource.indexOf("export async function waitForHeadlessCompletion"),
+		);
+		const quiescenceOutcomeSource = agentSessionSource.slice(
+			agentSessionSource.indexOf("/** Outcome of a quiescence barrier wait"),
+			agentSessionSource.indexOf("/** How long failure-class terminal notices are collected"),
+		);
 		// The slice markers must be found: a silent -1 would hash an empty string
 		// and let the stall family fall back out of the digest unnoticed.
 		expect(stallEventSource).toContain('type: "stall_warning"');
@@ -145,10 +158,13 @@ describe("daemon protocol helpers", () => {
 		expect(stallDiagnosticsSource).toContain("export interface StallDiagnostics");
 		expect(stallKernelSource).toContain("export interface StallKernelDiagnostics");
 		expect(stallExemptionSource).toContain("export interface StallExemptionDiagnostics");
+		expect(headlessResultSource).toContain("rlmQuiescence");
+		expect(quiescenceOutcomeSource).toContain("export interface RlmQuiescenceOutcome");
 		const digest = createHash("sha256")
 			.update(
 				`${commandSource}\n${savedSessionSource}\n${outboundSource}\n${treeWireSource}\n` +
-					`${stallEventSource}\n${stallDiagnosticsSource}\n${stallKernelSource}\n${stallExemptionSource}`,
+					`${stallEventSource}\n${stallDiagnosticsSource}\n${stallKernelSource}\n${stallExemptionSource}\n` +
+					`${headlessResultSource}\n${quiescenceOutcomeSource}`,
 			)
 			.digest("hex")
 			.slice(0, 12);

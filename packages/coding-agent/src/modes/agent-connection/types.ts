@@ -2,7 +2,6 @@ import type { AgentEvent, AgentMessage, ThinkingLevel } from "@earendil-works/pi
 import type { Api, ImageContent, Model, ServiceTier, TextContent, Transport, Usage } from "@earendil-works/pi-ai";
 import type { AgentSessionMessageReceipt, AgentSessionMessageSafetyStatus } from "../../core/agent-messages.js";
 import type { AuthSourceToken } from "../../core/auth-storage.js";
-import type { AgentAutonomousStatus } from "../../core/autonomous.js";
 import type { BashResult } from "../../core/bash-executor.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
@@ -30,6 +29,7 @@ import type { SessionStats } from "../../core/session-stats.js";
 import type { StallDiagnostics } from "../../core/stall-diagnostics.js";
 import type { SessionUsageSummary } from "../../core/usage.js";
 import type { SessionSummary } from "../daemon/daemon-session-list.js";
+import type { HeadlessCompletionResult } from "../headless-completion.js";
 
 /**
  * Client-side interaction boundary consumed by InteractiveMode.
@@ -794,6 +794,17 @@ export interface AgentConnectionHeadlessCompletionOptions {
 	waitForRlmQuiescence?: boolean;
 }
 
+export interface AgentConnectionDisposeOptions {
+	/**
+	 * Leave the session and its still-running RLM descendants alive instead of
+	 * tearing the session down. Used when a headless run gave up waiting for
+	 * deep descendants: an owned daemon session is promoted to resident (the
+	 * worker keeps running) and an in-process session skips its runtime teardown,
+	 * so completing the run does not cascade into aborting descendants.
+	 */
+	keepSessionRunning?: boolean;
+}
+
 export interface AgentConnectionSessionInputPause {
 	release(): Promise<void>;
 }
@@ -887,7 +898,7 @@ export interface AgentConnection {
 	abort(): Promise<void>;
 	cancelRlmChild(childId: string): Promise<boolean>;
 	waitForIdle(): Promise<void>;
-	waitForHeadlessCompletion(options?: AgentConnectionHeadlessCompletionOptions): Promise<AgentAutonomousStatus>;
+	waitForHeadlessCompletion(options?: AgentConnectionHeadlessCompletionOptions): Promise<HeadlessCompletionResult>;
 
 	/**
 	 * Run a user-initiated bash command (! / !! prefix). Resolution timing is
@@ -936,7 +947,7 @@ export interface AgentConnection {
 	/** Read-only live-session watcher; unavailable transports return undefined. */
 	watchSession(activeSessionId: string): Promise<AgentConnectionSessionWatcher | undefined>;
 
-	dispose(): Promise<void>;
+	dispose(options?: AgentConnectionDisposeOptions): Promise<void>;
 }
 
 export interface AgentConnectionSessionWatcher {

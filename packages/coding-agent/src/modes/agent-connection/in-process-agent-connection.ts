@@ -3,7 +3,6 @@ import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core"
 import type { ImageContent, ServiceTier, Transport } from "@earendil-works/pi-ai";
 import type { AgentSessionMessageReceipt, AgentSessionMessageSafetyStatus } from "../../core/agent-messages.js";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
-import type { AgentAutonomousStatus } from "../../core/autonomous.js";
 import type { BashResult } from "../../core/bash-executor.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
@@ -20,6 +19,7 @@ import { type DeleteSessionFileResult, deleteSessionFile } from "../../core/sess
 import { SessionManager } from "../../core/session-manager.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import { type SideQuestionRun, startSideQuestion } from "../../core/side-question.js";
+import type { HeadlessCompletionResult } from "../headless-completion.js";
 import { waitForHeadlessCompletion } from "../headless-completion.js";
 import {
 	createAgentConnectionCommands,
@@ -31,6 +31,7 @@ import { createAgentConnectionToolDefinition } from "./tool-definition.js";
 import type {
 	AgentConnection,
 	AgentConnectionBeforeSessionInvalidateListener,
+	AgentConnectionDisposeOptions,
 	AgentConnectionEvent,
 	AgentConnectionEventListener,
 	AgentConnectionExecuteBashOptions,
@@ -447,7 +448,9 @@ export class InProcessAgentConnection implements AgentConnection {
 		await this.session.waitForIdle();
 	}
 
-	async waitForHeadlessCompletion(options?: AgentConnectionHeadlessCompletionOptions): Promise<AgentAutonomousStatus> {
+	async waitForHeadlessCompletion(
+		options?: AgentConnectionHeadlessCompletionOptions,
+	): Promise<HeadlessCompletionResult> {
 		return waitForHeadlessCompletion(this.session, options);
 	}
 
@@ -641,7 +644,7 @@ export class InProcessAgentConnection implements AgentConnection {
 		};
 	}
 
-	async dispose(): Promise<void> {
+	async dispose(options?: AgentConnectionDisposeOptions): Promise<void> {
 		this.abortAllSideQuestions();
 		await Promise.allSettled([...this.sessionInputPauses.values()].map((pause) => pause.release()));
 		this.sessionInputPauses.clear();
@@ -651,6 +654,10 @@ export class InProcessAgentConnection implements AgentConnection {
 			this.runtimeHost.setBeforeSessionInvalidate(undefined);
 		}
 		this.runtimeHost.setRebindSession(undefined);
+		// K3Q-1: a headless run that gave up waiting for still-running descendants
+		// disposes without the runtime teardown, because that teardown cascades into
+		// aborting them (session.disposeAsync disposes every child session).
+		if (options?.keepSessionRunning) return;
 		await this.runtimeHost.dispose();
 	}
 
