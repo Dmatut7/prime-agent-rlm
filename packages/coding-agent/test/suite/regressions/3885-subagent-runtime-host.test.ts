@@ -14,7 +14,7 @@ import {
 import { AuthStorage } from "../../../src/core/auth-storage.js";
 import { ModelRegistry } from "../../../src/core/model-registry.js";
 import {
-	acquireSessionLease,
+	acquireSessionLeaseAsync,
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 	SessionAlreadyActiveError,
@@ -170,9 +170,11 @@ describe("ENG-3885 subagent runtime host", () => {
 		expect(result.session_dir).not.toBeNull();
 		const childSessions = await SessionManager.list(tempDir, result.session_dir!);
 		expect(childSessions.some((session) => session.parentSessionPath === runtime.session.sessionFile)).toBe(true);
-		expect(() => acquireSessionLease(childSessions[0]!.path, tempDir)).toThrow(SessionAlreadyActiveError);
+		await expect(acquireSessionLeaseAsync(childSessions[0]!.path, tempDir)).rejects.toThrow(
+			SessionAlreadyActiveError,
+		);
 		await runtime.dispose();
-		const retainedChildLease = acquireSessionLease(childSessions[0]!.path, tempDir);
+		const retainedChildLease = await acquireSessionLeaseAsync(childSessions[0]!.path, tempDir);
 		retainedChildLease?.release();
 		expect(runtime.listSubagentRuntimes()).toEqual([]);
 	});

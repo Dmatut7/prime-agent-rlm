@@ -59,7 +59,7 @@ import {
 	scheduleSessionInfoCachePrune,
 	writeCachedSessionInfo,
 } from "./session-info-disk-cache.js";
-import { acquireSessionLease, SESSION_LEASES_ENABLED_ENV } from "./session-lease.js";
+import { acquireSessionLeaseAsync, SESSION_LEASES_ENABLED_ENV } from "./session-lease.js";
 import { resolveCompleteToolPairLeaf } from "./session-tool-pair.js";
 import {
 	addAssistantUsage,
@@ -1284,21 +1284,50 @@ export async function loadEntriesFromFileAsync(
  * whole record whose terminator went missing, and dropping it would throw away the
  * only session header a file like that has. Those get the terminator back instead.
  */
-export function repairOwnedSessionFile(sessionFile: string | undefined): void {
-	if (!sessionFile || !existsSync(sessionFile)) return;
+/**
+ * Append-safety verdict of a repair pass over a write-owned session file:
+ * - "repaired": something was fixed (terminator completed or torn tail
+ *   truncated); the file now ends on a newline, so an append is safe.
+ * - "clean": nothing needed repairing; an append is safe.
+ * - "unverifiable": the trailing line is too long to verify as a whole record
+ *   (K3P-4) and was left byte-for-byte in place. Appending now would glue the
+ *   new line onto it, and the glued line then parses as nothing - both the
+ *   record and the append vanish from every reader. Callers that append after
+ *   a repair MUST refuse on this outcome instead of appending (K3P-45).
+ */
+export type SessionFileRepairOutcome = "repaired" | "clean" | "unverifiable";
+
+export function repairOwnedSessionFile(sessionFile: string | undefined): SessionFileRepairOutcome {
+	if (!sessionFile || !existsSync(sessionFile)) return "clean";
 	assertRegularFileNoSymlink(sessionFile);
 	// A header that lost only its terminator is a whole record, not a torn append:
 	// truncating it away would leave the transcript with no header at all.
 	const outcome = completeTrailingRecordNewline(sessionFile, true);
-	if (outcome === "completed") return;
+	if (outcome === "completed") return "repaired";
 	if (outcome === "unverifiable") {
 		// K3P-4: the trailing line is too long to verify as a whole record.
 		// Dropping it as torn would destroy a record that may be complete, so the
-		// file is left as it is: a later append that glues onto the unterminated
-		// tail loses a line, but the truncation would lose the record itself.
-		return;
+		// file is left as it is. Returning the outcome lets the append callers
+		// refuse instead of gluing (K3P-45); a manual repair can still complete
+		// the terminator later, which is the only lossless way forward.
+		return "unverifiable";
 	}
 	repairTruncatedTrailingLine(sessionFile);
+	return "repaired";
+}
+
+/**
+ * The transcript's trailing record is unterminated and too large to verify, so
+ * the write owner refuses to append onto it (K3P-45): gluing would make the
+ * record and the append both unreadable while the receipt claimed success.
+ */
+export class SessionTailUnverifiableError extends Error {
+	constructor(readonly sessionFile: string) {
+		super(
+			`Refusing to append to ${sessionFile}: its trailing record is unterminated and too large to verify, so appending would glue the lines together and hide both`,
+		);
+		this.name = "SessionTailUnverifiableError";
+	}
 }
 
 /**
@@ -1312,13 +1341,13 @@ export function repairOwnedSessionFile(sessionFile: string | undefined): void {
  * `SESSION_LEASES_ENABLED_ENV` keeps the "no lease" fallback from silently
  * degrading into an unguarded write.
  */
-export function appendOwnedSessionLine(
+export async function appendOwnedSessionLineAsync(
 	sessionPath: string,
 	agentDir: string,
 	append: (manager: SessionManager) => void,
 	environment: NodeJS.ProcessEnv = process.env,
-): void {
-	const lease = acquireSessionLease(sessionPath, agentDir, {
+): Promise<void> {
+	const lease = await acquireSessionLeaseAsync(sessionPath, agentDir, {
 		...environment,
 		[SESSION_LEASES_ENABLED_ENV]: "1",
 	});
@@ -1326,7 +1355,16 @@ export function appendOwnedSessionLine(
 		throw new Error(`Refusing to append to a session without a write lease: ${sessionPath}`);
 	}
 	try {
-		repairOwnedSessionFile(sessionPath);
+		const repair = repairOwnedSessionFile(sessionPath);
+		if (repair === "unverifiable") {
+			// K3P-45: the trailing record could not be verified whole, and the
+			// repair left it in place on purpose. Appending would glue both lines
+			// into one unparsable interior line - the record AND this append would
+			// vanish from every reader while the caller's receipt said success.
+			throw new Error(
+				`Refusing to append to ${sessionPath}: its trailing record is unterminated and too large to verify, so appending would glue the lines together and hide both`,
+			);
+		}
 		append(SessionManager.open(sessionPath));
 	} finally {
 		lease.release();
@@ -2532,8 +2570,27 @@ export class SessionManager {
 			this.flushed = true;
 		} else {
 			try {
+				// K3P-45: never append onto an unterminated tail. The open-time repair
+				// completes whole-record tails and truncates torn ones, but an oversized
+				// trailing record is left in place (K3P-4) and appending onto it would
+				// glue both lines into one unparsable interior line. Re-repair first (a
+				// tail torn by a crash since open is still fixable), then refuse loudly.
+				if (this.sessionFile && !endsWithNewlineSync(this.sessionFile)) {
+					const repair = repairOwnedSessionFile(this.sessionFile);
+					if (repair !== "repaired" || !endsWithNewlineSync(this.sessionFile)) {
+						throw new SessionTailUnverifiableError(this.sessionFile);
+					}
+				}
 				appendPrivateFile(this.sessionFile, `${JSON.stringify(entry)}\n`, { privateParent: this.ownsSessionDir });
 			} catch (error) {
+				if (error instanceof SessionTailUnverifiableError) {
+					// Deliberately NOT clearing `flushed`: the self-heal path below
+					// rewrites the transcript from memory, and a rewrite would drop the
+					// unverifiable record the repair just chose to preserve (K3P-4).
+					// The append is refused loudly every time until the tail is fixed.
+					this._notifyPersistFailureListeners(error);
+					throw error;
+				}
 				// The entry stays in fileEntries: drop the flushed mark so the next
 				// persist rewrites the whole transcript and backfills the gap instead
 				// of appending past a lost line.

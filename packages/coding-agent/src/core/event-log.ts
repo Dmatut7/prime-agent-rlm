@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { dirname } from "node:path";
 import { performance } from "node:perf_hooks";
+import { setTimeout as delay } from "node:timers/promises";
 import { sleepSync } from "../utils/sleep.js";
 
 /**
@@ -55,6 +56,13 @@ const TAIL_PROBE_SLICE_MS = 5;
  * blanking its bytes would destroy a record it is still writing.
  */
 const TAIL_OBSERVATION_WINDOWS = 4;
+
+/**
+ * Backoff before the single retry of a refused append (R31-13): a live writer
+ * whose tail triggered "still being appended" is usually finishing its record;
+ * losing that append instead of waiting once was the silent-record-loss path.
+ */
+const TAIL_CONTENTION_BACKOFF_MS = 500;
 
 export interface EventLogOptions {
 	/** Fail closed beyond these bounds on every full read, including the repair path. */
@@ -211,6 +219,102 @@ export class EventLog {
 	}
 
 	/**
+	 * Async twin of {@link appendSync} for callers that can await (R31-13):
+	 * the torn-tail observation waits on timers instead of sleeping the event
+	 * loop, and an append refused because a live writer still owns the tail is
+	 * retried once after {@link TAIL_CONTENTION_BACKOFF_MS} so the record is
+	 * not silently lost when that writer finishes. A second refusal propagates.
+	 */
+	async appendAsync(events: unknown[], options?: { durable?: boolean; onCreate?: () => unknown[] }): Promise<void> {
+		const lines = events.map(serializeLine);
+		mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
+		let leadLines: string[] = [];
+		if (existsSync(this.path)) {
+			const contended = await this.repairTailAsync();
+			if (contended) {
+				await delay(TAIL_CONTENTION_BACKOFF_MS);
+				if (await this.repairTailAsync()) {
+					throw new Error(
+						`event log ${this.path}: the unterminated final line is still being appended; refusing to append`,
+					);
+				}
+			}
+		} else {
+			leadLines = (options?.onCreate?.() ?? []).map(serializeLine);
+		}
+		const payload = [...leadLines, ...lines].join("");
+		const handle = openSync(this.path, "a", 0o600);
+		try {
+			writeSync(handle, payload);
+			if (options?.durable) fsyncSync(handle);
+		} finally {
+			closeSync(handle);
+		}
+	}
+
+	/**
+	 * Async twin of `repairTailSync`: the observation window awaits its probe
+	 * slices, so every other task on the event loop keeps running while a torn
+	 * tail is being watched (R31-13: 25ms of `sleepSync` per contended append
+	 * was a pure serial stall on the daemon's single loop).
+	 *
+	 * True when the append must be refused: the tail is still growing after the
+	 * whole observation budget, so a live writer owns it.
+	 */
+	private async repairTailAsync(): Promise<boolean> {
+		const { maxBytes } = this.options;
+		let size: number;
+		try {
+			size = statSync(this.path).size;
+		} catch {
+			return false;
+		}
+		if (size === 0) return false;
+		if (maxBytes !== undefined && size > maxBytes) {
+			throw new Error(`event log ${this.path} exceeds ${maxBytes} bytes (${size}); refusing to read`);
+		}
+		try {
+			const fd = openSync(this.path, "r+");
+			try {
+				return (await this.repairObservedTailAsync(fd, maxBytes)) === "contended";
+			} finally {
+				closeSync(fd);
+			}
+		} catch (error) {
+			if (error instanceof Error && error.message.includes("refusing to read")) throw error;
+			// Leave the tail for the reader's torn-line tolerance.
+			return false;
+		}
+	}
+
+	private async repairObservedTailAsync(
+		fd: number,
+		maxBytes: number | undefined,
+	): Promise<TailRepair | "contended" | undefined> {
+		const quiescenceMs = Math.max(1, this.options.tailQuiescenceMs ?? TAIL_QUIESCENCE_MS);
+		let observedSize = fstatSync(fd).size;
+		if (!hasTornTail(fd, observedSize)) return undefined;
+		const observationStart = performance.now();
+		let stableSince = observationStart;
+		const observationEnd = observationStart + quiescenceMs * TAIL_OBSERVATION_WINDOWS;
+		for (;;) {
+			const quiescentAt = stableSince + quiescenceMs;
+			const untilQuiescent = quiescentAt - performance.now();
+			if (untilQuiescent <= 0) break;
+			await delay(Math.min(untilQuiescent, TAIL_PROBE_SLICE_MS));
+			const currentSize = fstatSync(fd).size;
+			if (!hasTornTail(fd, currentSize)) return undefined;
+			if (currentSize !== observedSize) {
+				observedSize = currentSize;
+				stableSince = performance.now();
+				if (stableSince >= observationEnd) return "contended";
+			}
+		}
+		const outcome = blankObservedTail(fd, observedSize, maxBytes, this.path, this.options.log);
+		return outcome;
+	}
+
+	/**
 	 * Neutralize a torn final line from a crashed writer before appending:
 	 * otherwise the append would glue the fragment onto the following record and
 	 * turn a tolerable torn tail into a fail-closed interior line. The fragment's
@@ -324,20 +428,35 @@ export class EventLog {
 				if (stableSince >= observationEnd) return "contended";
 			}
 		}
-		// The observed EOF, not a later one, bounds the range: bytes a writer
-		// appended after it are not ours to blank.
-		const contents = readAllSync(fd, maxBytes, this.path);
-		// A foreign truncation is the one way the file can be shorter than the tail
-		// this repair observed; blank at most what it actually holds.
-		const end = Math.min(observedSize, contents.length);
-		const keep = contents.lastIndexOf(0x0a, end - 1) + 1;
-		const torn = end - keep;
-		if (torn <= 0) return undefined;
-		writeAllSync(fd, Buffer.alloc(torn, 0x20), keep);
-		if (!rangeIsBlank(fd, keep, torn)) {
-			this.options.log?.(`torn final line (${torn} bytes) changed while it was being blanked`);
-			return undefined;
-		}
-		return { keep, end };
+		return blankObservedTail(fd, observedSize, maxBytes, this.path, this.options.log);
 	}
+}
+
+/**
+ * Blank the torn fragment below the observed EOF (shared by the sync and async
+ * observation paths): the observed EOF bounds the range, the write is the same
+ * byte count of spaces, and the read-back proves the fragment did not change.
+ */
+function blankObservedTail(
+	fd: number,
+	observedSize: number,
+	maxBytes: number | undefined,
+	path: string,
+	log: ((message: string) => void) | undefined,
+): TailRepair | undefined {
+	// The observed EOF, not a later one, bounds the range: bytes a writer
+	// appended after it are not ours to blank.
+	const contents = readAllSync(fd, maxBytes, path);
+	// A foreign truncation is the one way the file can be shorter than the tail
+	// this repair observed; blank at most what it actually holds.
+	const end = Math.min(observedSize, contents.length);
+	const keep = contents.lastIndexOf(0x0a, end - 1) + 1;
+	const torn = end - keep;
+	if (torn <= 0) return undefined;
+	writeAllSync(fd, Buffer.alloc(torn, 0x20), keep);
+	if (!rangeIsBlank(fd, keep, torn)) {
+		log?.(`torn final line (${torn} bytes) changed while it was being blanked`);
+		return undefined;
+	}
+	return { keep, end };
 }

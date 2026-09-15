@@ -9,7 +9,7 @@ import { getAgentDir, getPackageDir, isBunBinary } from "../../config.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
 import {
-	appendOwnedSessionLine,
+	appendOwnedSessionLineAsync,
 	readSessionInfo,
 	type SessionInfo,
 	SessionManager,
@@ -158,11 +158,11 @@ export function isDaemonCatalogProcess(environment: NodeJS.ProcessEnv = process.
  * return undefined and these branches would fall back to the blind append this
  * helper exists to prevent.
  */
-function appendOwnedSessionEntry(sessionPath: string, append: (manager: SessionManager) => void): void {
+async function appendOwnedSessionEntry(sessionPath: string, append: (manager: SessionManager) => void): Promise<void> {
 	// K3P-5: the lease/repair/append sequence now lives in one place
-	// (`appendOwnedSessionLine` in session-manager.ts); the two rename paths use
-	// it too, so all three out-of-session appenders share the same discipline.
-	appendOwnedSessionLine(sessionPath, getAgentDir(), append);
+	// (`appendOwnedSessionLineAsync` in session-manager.ts); the two rename paths
+	// use it too, so all three out-of-session appenders share the same discipline.
+	await appendOwnedSessionLineAsync(sessionPath, getAgentDir(), append);
 }
 
 export async function runDaemonCatalogProcess(): Promise<never> {
@@ -228,7 +228,9 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 				throw new Error(`No session found matching '${request.selector}'`);
 			}
 			case "rename":
-				appendOwnedSessionEntry(request.sessionPath, (manager) => manager.appendSessionInfo(request.name.trim()));
+				await appendOwnedSessionEntry(request.sessionPath, (manager) =>
+					manager.appendSessionInfo(request.name.trim()),
+				);
 				sendCatalogMessage({ type: "response", id: request.id, success: true });
 				return;
 			case "delete":
@@ -251,7 +253,7 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 					return;
 				}
 				if (session.state?.status !== "archived") {
-					appendOwnedSessionEntry(request.sessionPath, (manager) =>
+					await appendOwnedSessionEntry(request.sessionPath, (manager) =>
 						manager.appendSessionState({ status: "archived" }),
 					);
 				}
@@ -264,7 +266,7 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 				return;
 			}
 			case "mark_interrupted":
-				appendOwnedSessionEntry(request.sessionPath, (manager) =>
+				await appendOwnedSessionEntry(request.sessionPath, (manager) =>
 					manager.appendCustomMessageEntry(
 						"prime-agent.worker_recovery",
 						"<prime_agent_worker_interrupted>\nThe isolated session worker stopped during in-flight work. The saved transcript was recovered, but uncertain model, tool, bash, or child-agent work was not replayed. Inspect external side effects before continuing.\n</prime_agent_worker_interrupted>",

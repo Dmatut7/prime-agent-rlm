@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-	acquireSessionLease,
+	acquireSessionLeaseAsync,
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 } from "../src/core/session-lease.js";
@@ -43,7 +43,7 @@ describe("daemon runtime session leases", () => {
 			).createRuntime.bind(daemon);
 
 			await expect(createRuntime({ type: "create", sessionPath }, async () => false)).rejects.toThrow();
-			const reopened = acquireSessionLease(sessionPath, root);
+			const reopened = await acquireSessionLeaseAsync(sessionPath, root);
 			expect(reopened).toBeDefined();
 			reopened?.release();
 		} finally {
