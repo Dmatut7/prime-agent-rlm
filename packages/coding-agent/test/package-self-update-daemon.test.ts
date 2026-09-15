@@ -530,10 +530,15 @@ describe("self-update daemon restart", () => {
 			"fetch",
 			vi.fn(async () => Response.json({ version: "999.0.0" })),
 		);
+		// SM-2: these manifests carry no artifact spec (registry lane); the update
+		// chain (daemon restart, failure handling) is what these tests exercise, so the
+		// lane is opted into. The default-refusal path is covered by update-spec-trust.
+		process.env.PRIME_AGENT_ALLOW_REGISTRY_UPDATE = "1";
 	});
 
 	afterEach(() => {
 		vi.unstubAllGlobals();
+		delete process.env.PRIME_AGENT_ALLOW_REGISTRY_UPDATE;
 		process.chdir(originalCwd);
 		process.exitCode = originalExitCode;
 		if (originalAgentDir === undefined) {
@@ -577,6 +582,7 @@ describe("self-update daemon restart", () => {
 			"fetch",
 			vi.fn(async () => Response.json({ version: "0.2.6" })),
 		);
+		process.env.PRIME_AGENT_ALLOW_REGISTRY_UPDATE = "1";
 
 		await expect(handlePackageCommand(["update", "--self", "--allow-official"])).resolves.toBe(true);
 

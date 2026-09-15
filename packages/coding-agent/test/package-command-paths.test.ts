@@ -45,6 +45,7 @@ describe("package commands", () => {
 	let originalAgentDir: string | undefined;
 	let originalPiPackageDir: string | undefined;
 	let originalPrimeAgentDownloadBaseUrl: string | undefined;
+	let originalTrustedUpdateOrigins: string | undefined;
 	let originalTmpDir: string | undefined;
 	let originalExitCode: typeof process.exitCode;
 	let originalExecPath: string;
@@ -67,6 +68,7 @@ describe("package commands", () => {
 		originalAgentDir = process.env[ENV_AGENT_DIR];
 		originalPiPackageDir = process.env.PI_PACKAGE_DIR;
 		originalPrimeAgentDownloadBaseUrl = process.env.PRIME_AGENT_DOWNLOAD_BASE_URL;
+		originalTrustedUpdateOrigins = process.env.PRIME_AGENT_TRUSTED_UPDATE_ORIGINS;
 		originalTmpDir = process.env.TMPDIR;
 		originalExitCode = process.exitCode;
 		originalExecPath = process.execPath;
@@ -87,6 +89,7 @@ describe("package commands", () => {
 		restoreEnv(ENV_AGENT_DIR, originalAgentDir);
 		restoreEnv("PI_PACKAGE_DIR", originalPiPackageDir);
 		restoreEnv("PRIME_AGENT_DOWNLOAD_BASE_URL", originalPrimeAgentDownloadBaseUrl);
+		restoreEnv("PRIME_AGENT_TRUSTED_UPDATE_ORIGINS", originalTrustedUpdateOrigins);
 		restoreEnv("TMPDIR", originalTmpDir);
 		Object.defineProperty(process, "execPath", { value: originalExecPath, configurable: true });
 		rmSync(tempDir, { recursive: true, force: true });
@@ -205,6 +208,9 @@ describe("package commands", () => {
 		const fakeNpmPath = join(tempDir, "fake-npm.cjs");
 		const recordPath = join(tempDir, "self-update.json");
 		process.env.PRIME_AGENT_DOWNLOAD_BASE_URL = UPDATE_DOWNLOAD_BASE_URL;
+		// SM-1 decoupled trust from the download base: the test host must be named as a
+		// trusted artifact origin explicitly, which is the mechanism the gate provides.
+		process.env.PRIME_AGENT_TRUSTED_UPDATE_ORIGINS = UPDATE_DOWNLOAD_BASE_URL;
 		mkdirSync(selfPackageDir, { recursive: true });
 		mkdirSync(join(projectDir, ".prime", "agent"), { recursive: true });
 		writeFileSync(
@@ -282,6 +288,11 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
 		});
 		const fetchMock = vi.fn(async () => Response.json({ version: getNewerPatchVersion() }));
 		vi.stubGlobal("fetch", fetchMock);
+		// SM-2: a manifest without an artifact spec is the registry lane, which now refuses
+		// by default; these cases exercise the version comparison and install chain, so the
+		// lane is opted into explicitly. The refusal path is covered in update-spec-trust.
+		const previousAllowRegistryUpdate = process.env.PRIME_AGENT_ALLOW_REGISTRY_UPDATE;
+		process.env.PRIME_AGENT_ALLOW_REGISTRY_UPDATE = "1";
 
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -297,6 +308,7 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
 		} finally {
 			logSpy.mockRestore();
 			errorSpy.mockRestore();
+			restoreEnv("PRIME_AGENT_ALLOW_REGISTRY_UPDATE", previousAllowRegistryUpdate);
 		}
 	});
 
@@ -331,6 +343,9 @@ else {
 			"fetch",
 			vi.fn(async () => Response.json({ packageName: activePackageName, version: "0.73.0" })),
 		);
+		// SM-2: a manifest without an artifact spec is the registry lane; opted into
+		// explicitly so this case still exercises the rename install chain.
+		process.env.PRIME_AGENT_ALLOW_REGISTRY_UPDATE = "1";
 
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -375,6 +390,8 @@ else {
 		);
 		process.env.PI_PACKAGE_DIR = selfPackageDir;
 		process.env.PRIME_AGENT_DOWNLOAD_BASE_URL = baseUrl;
+		// SM-1 decoupled trust from the download base; the test host is named explicitly.
+		process.env.PRIME_AGENT_TRUSTED_UPDATE_ORIGINS = baseUrl;
 		Object.defineProperty(process, "execPath", {
 			value: join(selfPackageDir, "dist", "cli.js"),
 			configurable: true,
@@ -440,6 +457,8 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
 		);
 		process.env.PI_PACKAGE_DIR = selfPackageDir;
 		process.env.PRIME_AGENT_DOWNLOAD_BASE_URL = baseUrl;
+		// SM-1 decoupled trust from the download base; the test host is named explicitly.
+		process.env.PRIME_AGENT_TRUSTED_UPDATE_ORIGINS = baseUrl;
 		Object.defineProperty(process, "execPath", {
 			value: join(selfPackageDir, "dist", "cli.js"),
 			configurable: true,
@@ -504,6 +523,9 @@ if(args.includes("install")) process.exit(23);
 			"fetch",
 			vi.fn(async () => Response.json({ packageName: activePackageName, version: "0.73.0" })),
 		);
+		// SM-2: a manifest without an artifact spec is the registry lane; opted into
+		// explicitly so this case still exercises the rename install chain.
+		process.env.PRIME_AGENT_ALLOW_REGISTRY_UPDATE = "1";
 
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
