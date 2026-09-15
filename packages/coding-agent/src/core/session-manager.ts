@@ -59,6 +59,7 @@ import {
 	scheduleSessionInfoCachePrune,
 	writeCachedSessionInfo,
 } from "./session-info-disk-cache.js";
+import { acquireSessionLease, SESSION_LEASES_ENABLED_ENV } from "./session-lease.js";
 import { resolveCompleteToolPairLeaf } from "./session-tool-pair.js";
 import {
 	addAssistantUsage,
@@ -86,6 +87,14 @@ const CHILD_USAGE_ATTRIBUTION_COALESCE_MAX_AGE_MS = 120_000;
 const SESSION_ASYNC_PARSE_YIELD_BYTES = 4 * 1024 * 1024;
 /** A session header is one short line; anything longer than this is not recoverable as one. */
 const SESSION_HEADER_SCAN_MAX_BYTES = 64 * 1024;
+/**
+ * Upper bound on a trailing line that `completeTrailingRecordNewline` will read
+ * back in full to decide whether it is a whole record (K3P-4). Real single-line
+ * records (large tool results, base64 images) are megabytes at most; a line past
+ * this bound is left untouched rather than risk truncating a record we cannot
+ * verify: better an unrepaired tail than a destroyed record.
+ */
+const SESSION_TRAILING_RECORD_VERIFY_MAX_BYTES = 16 * 1024 * 1024;
 
 // Entry types that can represent user intent (vs. daemon bookkeeping like
 // session_state/agent_status/git_state/child_usage_attributed). Used by
@@ -964,36 +973,97 @@ function parseUnterminatedHeader(buffer: Buffer): SessionHeader | undefined {
 }
 
 /**
+ * Outcome of trying to restore the terminating newline of a whole trailing record.
+ * - "completed": the byte was written, the record is whole again.
+ * - "torn": the trailing line is not a whole record; the torn-tail repair may drop it.
+ * - "unverifiable": the trailing line is longer than we are willing to parse, so
+ *   whether it is a whole record cannot be decided. The file must be left exactly
+ *   as it is: truncating it would destroy a record that may be complete (K3P-4).
+ */
+type TrailingRecordNewlineOutcome = "completed" | "torn" | "unverifiable";
+
+/**
  * Restore the terminating newline of a last line that is a whole record - see
  * `parseUnterminatedHeader`. Any entry shape counts, not only a session header: an
  * append torn on its final byte leaves a complete message/state record with no
  * terminator, and the loaders drop exactly that line, so a non-header tail loses a
  * whole record where a header tail keeps its identity. Only the write owner may call
  * it: completing a line another process is still appending to would split its write
- * in two. Returns whether the byte was written, so a torn tail keeps falling through
- * to the torn-tail repair.
+ * in two.
  */
-function completeTrailingRecordNewline(filePath: string, ownsSessionDir: boolean): boolean {
+function completeTrailingRecordNewline(filePath: string, ownsSessionDir: boolean): TrailingRecordNewlineOutcome {
 	// Only the trailing line is inspected, bounded by size: a transcript whose last
-	// line really was torn must not be re-read whole to learn nothing.
+	// line really was torn must not be re-read whole to learn nothing. But when the
+	// window holds no newline at all, the trailing line is simply longer than the
+	// window (a big tool result, a base64 image) and its true start is found by
+	// scanning backwards, so the whole record can be verified instead of being
+	// truncated away as "torn" (K3P-4).
 	let fd: number | undefined;
+	let tailLongerThanWindow = false;
 	try {
 		fd = openSync(filePath, constants.O_RDONLY);
 		const { size } = fstatSync(fd);
-		if (size === 0) return false;
+		if (size === 0) return "torn";
 		const length = Math.min(size, SESSION_HEADER_SCAN_MAX_BYTES);
 		const tail = Buffer.allocUnsafe(length);
-		if (readSync(fd, tail, 0, length, size - length) !== length) return false;
+		if (readSync(fd, tail, 0, length, size - length) !== length) return "torn";
 		const lastNewline = tail.lastIndexOf(0x0a);
-		const line = lastNewline === -1 ? tail : tail.subarray(lastNewline + 1);
-		if (line.length === 0) return false;
-		if (!isCompleteUnterminatedEntryLine(line)) return false;
+		if (lastNewline === -1 && size > SESSION_HEADER_SCAN_MAX_BYTES) {
+			tailLongerThanWindow = true;
+		}
+		const line = lastNewline === -1 ? readTrailingLine(fd, size, length) : tail.subarray(lastNewline + 1);
+		if (line === undefined) return "unverifiable";
+		if (line.length === 0) return "torn";
+		if (!isCompleteUnterminatedEntryLine(line)) return "torn";
 		appendPrivateFile(filePath, "\n", { privateParent: ownsSessionDir });
-		return true;
+		return "completed";
 	} catch {
-		return false;
+		// A failure while handling a line that may be a whole oversized record must
+		// not fall through to the truncating repair.
+		return tailLongerThanWindow ? "unverifiable" : "torn";
 	} finally {
 		if (fd !== undefined) closeSync(fd);
+	}
+}
+
+/**
+ * The whole trailing line of a file whose last `knownClean` bytes contain no
+ * newline: its start is found by scanning backwards for the previous newline
+ * (the same unbounded back-scan `repairTruncatedTrailingLine` already does), and
+ * the line is read in full when it fits the verification bound. `undefined` when
+ * the line is too long to verify or cannot be read: the caller must then leave
+ * the file alone rather than treat it as torn (K3P-4).
+ */
+function readTrailingLine(fd: number, size: number, knownClean: number): Buffer | undefined {
+	const lineStart = findTrailingLineStart(fd, size, knownClean);
+	const lineLength = size - lineStart;
+	if (lineLength > SESSION_TRAILING_RECORD_VERIFY_MAX_BYTES) {
+		return undefined;
+	}
+	const line = Buffer.allocUnsafe(lineLength);
+	if (readSync(fd, line, 0, lineLength, lineStart) !== lineLength) {
+		return undefined;
+	}
+	return line;
+}
+
+/**
+ * Byte offset just past the last newline before the final `knownClean` bytes (0
+ * when there is none): where the trailing line starts.
+ */
+function findTrailingLineStart(fd: number, size: number, knownClean: number): number {
+	const chunkSize = 64 * 1024;
+	const scanEnd = Math.max(0, size - knownClean);
+	let offset = Math.max(0, scanEnd - chunkSize);
+	for (;;) {
+		const length = Math.min(chunkSize, scanEnd - offset);
+		if (length <= 0) return 0;
+		const chunk = Buffer.allocUnsafe(length);
+		if (readSync(fd, chunk, 0, length, offset) !== length) return 0;
+		const index = chunk.lastIndexOf(0x0a);
+		if (index !== -1) return offset + index + 1;
+		if (offset === 0) return 0;
+		offset = Math.max(0, offset - chunkSize);
 	}
 }
 
@@ -1219,8 +1289,48 @@ export function repairOwnedSessionFile(sessionFile: string | undefined): void {
 	assertRegularFileNoSymlink(sessionFile);
 	// A header that lost only its terminator is a whole record, not a torn append:
 	// truncating it away would leave the transcript with no header at all.
-	if (completeTrailingRecordNewline(sessionFile, true)) return;
+	const outcome = completeTrailingRecordNewline(sessionFile, true);
+	if (outcome === "completed") return;
+	if (outcome === "unverifiable") {
+		// K3P-4: the trailing line is too long to verify as a whole record.
+		// Dropping it as torn would destroy a record that may be complete, so the
+		// file is left as it is: a later append that glues onto the unterminated
+		// tail loses a line, but the truncation would lose the record itself.
+		return;
+	}
 	repairTruncatedTrailingLine(sessionFile);
+}
+
+/**
+ * Append one line to a session file this process does not otherwise own, under a
+ * write lease taken for the duration of the append (K3P-5, the
+ * `daemon-catalog-process.ts` precedent). The catalog comment, verbatim in spirit:
+ * repair only under the lease - the torn tail belongs to whoever was writing, and
+ * truncating a live writer's in-flight append corrupts it. Without a lease the
+ * append is refused rather than performed blind: `acquireSessionLease` either
+ * grants the lease or throws (a live owner holds it), and the forced
+ * `SESSION_LEASES_ENABLED_ENV` keeps the "no lease" fallback from silently
+ * degrading into an unguarded write.
+ */
+export function appendOwnedSessionLine(
+	sessionPath: string,
+	agentDir: string,
+	append: (manager: SessionManager) => void,
+	environment: NodeJS.ProcessEnv = process.env,
+): void {
+	const lease = acquireSessionLease(sessionPath, agentDir, {
+		...environment,
+		[SESSION_LEASES_ENABLED_ENV]: "1",
+	});
+	if (!lease) {
+		throw new Error(`Refusing to append to a session without a write lease: ${sessionPath}`);
+	}
+	try {
+		repairOwnedSessionFile(sessionPath);
+		append(SessionManager.open(sessionPath));
+	} finally {
+		lease.release();
+	}
 }
 
 function readSessionHeader(filePath: string): Partial<SessionHeader> | undefined {

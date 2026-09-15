@@ -8,10 +8,9 @@ import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli
 import { getAgentDir, getPackageDir, isBunBinary } from "../../config.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
-import { acquireSessionLease, SESSION_LEASES_ENABLED_ENV } from "../../core/session-lease.js";
 import {
+	appendOwnedSessionLine,
 	readSessionInfo,
-	repairOwnedSessionFile,
 	type SessionInfo,
 	SessionManager,
 } from "../../core/session-manager.js";
@@ -153,27 +152,17 @@ export function isDaemonCatalogProcess(environment: NodeJS.ProcessEnv = process.
  * marker and the worker-recovery note both vanish on the next read.
  *
  * The daemon deletes `SESSION_LEASES_ENABLED_ENV` before launching the
- * supervisor, so the flag is absent from this process's environment; it is
- * forced on here, exactly like the interactive direct-session branch in
- * main.ts. Without that, `acquireSessionLease` would return undefined and these
- * branches would fall back to the blind append this helper exists to prevent.
+ * supervisor, so the flag is absent from this process's environment; the shared
+ * `appendOwnedSessionLine` forces it on, exactly like the interactive
+ * direct-session branch in main.ts. Without that, `acquireSessionLease` would
+ * return undefined and these branches would fall back to the blind append this
+ * helper exists to prevent.
  */
 function appendOwnedSessionEntry(sessionPath: string, append: (manager: SessionManager) => void): void {
-	const lease = acquireSessionLease(sessionPath, getAgentDir(), {
-		...process.env,
-		[SESSION_LEASES_ENABLED_ENV]: "1",
-	});
-	if (!lease) {
-		throw new Error(`Refusing to append to a session without a write lease: ${sessionPath}`);
-	}
-	try {
-		// Repair only under the lease: the torn tail belongs to whoever was
-		// writing, and truncating a live writer's in-flight append corrupts it.
-		repairOwnedSessionFile(sessionPath);
-		append(SessionManager.open(sessionPath));
-	} finally {
-		lease.release();
-	}
+	// K3P-5: the lease/repair/append sequence now lives in one place
+	// (`appendOwnedSessionLine` in session-manager.ts); the two rename paths use
+	// it too, so all three out-of-session appenders share the same discipline.
+	appendOwnedSessionLine(sessionPath, getAgentDir(), append);
 }
 
 export async function runDaemonCatalogProcess(): Promise<never> {

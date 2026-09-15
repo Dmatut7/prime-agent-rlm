@@ -102,6 +102,7 @@ import {
 import { deleteSessionArtifacts, deleteSessionFile } from "../../core/session-file-actions.js";
 import { acquireSessionLease, canonicalSessionPath, type SessionLease } from "../../core/session-lease.js";
 import {
+	appendOwnedSessionLine,
 	getSessionArtifactPathForFile,
 	readSessionInfo,
 	repairOwnedSessionFile,
@@ -4298,8 +4299,11 @@ export class AgentDaemon {
 							);
 							// Same torn-tail rule as the catalog rename path: repair before
 							// appending, or the session_info line glues onto a torn tail.
-							repairOwnedSessionFile(command.sessionPath);
-							SessionManager.open(command.sessionPath).appendSessionInfo(name);
+							// K3P-5: and the same lease rule - the repair truncates, so it
+							// only happens under the write lease, never over a live writer.
+							appendOwnedSessionLine(command.sessionPath, this.agentDir, (manager) => {
+								manager.appendSessionInfo(name);
+							});
 							await this.rlmSpawnLedger()
 								.appendRenameByChildPath(command.sessionPath, name)
 								.catch((error) => {

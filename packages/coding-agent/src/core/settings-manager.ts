@@ -958,7 +958,7 @@ export class SettingsManager {
 	private storage: SettingsStorage;
 	private globalSettings: Settings;
 	private projectSettings: Settings;
-	private settings: Settings;
+	private settings: Settings = {};
 	private runtimeOverrides: Settings = {};
 	private modifiedFields = new Set<keyof Settings>(); // Track global fields modified during session
 	private modifiedNestedFields = new Map<keyof Settings, Set<string>>(); // Track global nested field modifications
@@ -976,6 +976,12 @@ export class SettingsManager {
 	 * counts as an external edit when the file really changed (CD-5).
 	 */
 	private loadedStamps = new Map<SettingsScope, string>();
+	/**
+	 * Last-seen on-disk identity of each ancestor settings file, so a watcher
+	 * wake-up on an ancestor only counts as an external edit when that file
+	 * really changed (K3P-2). `undefined` means the file does not exist.
+	 */
+	private ancestorStamps = new Map<string, string | undefined>();
 	private externalWatchers: Array<{ path: string; listener: () => void }> = [];
 	private externalEditReload: Promise<void> | undefined;
 
@@ -993,7 +999,7 @@ export class SettingsManager {
 		this.globalSettingsLoadError = globalLoadError;
 		this.projectSettingsLoadError = projectLoadError;
 		this.errors = [...initialErrors];
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		this.recomputeMergedSettings();
 	}
 
 	/** Create a SettingsManager that loads from files */
@@ -1022,6 +1028,9 @@ export class SettingsManager {
 			projectLoad.error,
 			initialErrors,
 		);
+		for (const { path, error } of projectLoad.ancestorParseErrors) {
+			manager.recordAncestorParseError(path, error);
+		}
 		manager.reportUnknownSettingsKeys("global", manager.globalSettings);
 		manager.reportUnknownSettingsKeys("project", manager.projectSettings);
 		manager.captureSettingsStamps();
@@ -1036,7 +1045,10 @@ export class SettingsManager {
 		return SettingsManager.fromStorage(storage);
 	}
 
-	private static loadFromStorage(storage: SettingsStorage, scope: SettingsScope): Settings {
+	private static loadFromStorage(
+		storage: SettingsStorage,
+		scope: SettingsScope,
+	): { settings: Settings; ancestorParseErrors: Array<{ path: string; error: Error }> } {
 		let content: string | undefined;
 		storage.withLock(scope, (current) => {
 			content = current;
@@ -1045,19 +1057,23 @@ export class SettingsManager {
 
 		const primary: Settings = content ? SettingsManager.migrateSettings(JSON.parse(content)) : {};
 		if (scope !== "project") {
-			return primary;
+			return { settings: primary, ancestorParseErrors: [] };
 		}
 
 		// SEC-8: the project scope also reads the settings files above the session
 		// directory (up to the repository root). Root-most first, then the session
-		// directory itself last: the closest file wins. A file that fails to parse
-		// makes the whole project load fail, so the reload keeps the previous
-		// snapshot and the load error fails the consent gates closed (SEC-7).
+		// directory itself last: the closest file wins. The primary file at the
+		// session cwd still fails the whole scope when it does not parse (SEC-7:
+		// the reload keeps the previous snapshot, the load error fails the consent
+		// gates closed), but an ancestor that does not parse is dropped on its own
+		// (K3P-1): one broken file in the repository root must not discard the
+		// session's own intact project settings along with it.
 		const ancestorPaths = storage.projectAncestorSettingsFilePaths?.() ?? [];
 		if (ancestorPaths.length === 0) {
-			return primary;
+			return { settings: primary, ancestorParseErrors: [] };
 		}
 		const ancestors: Settings[] = [];
+		const ancestorParseErrors: Array<{ path: string; error: Error }> = [];
 		for (const path of ancestorPaths) {
 			let raw: string;
 			try {
@@ -1076,25 +1092,43 @@ export class SettingsManager {
 				}
 				throw error;
 			}
-			ancestors.push(SettingsManager.migrateSettings(JSON.parse(raw)));
+			try {
+				ancestors.push(SettingsManager.migrateSettings(JSON.parse(raw)));
+			} catch (error) {
+				// K3P-1: the broken ancestor is excluded from the merge and the
+				// failure is reported per file, instead of failing the entire
+				// project scope (which also discarded the primary file).
+				ancestorParseErrors.push({
+					path,
+					error: error instanceof Error ? error : new Error(String(error)),
+				});
+			}
 		}
 		let merged: Settings = {};
 		for (const ancestor of ancestors) {
 			merged = deepMergeSettings(merged, ancestor);
 		}
 		merged = deepMergeSettings(merged, primary);
-		applyProjectConsentVeto(merged as Record<string, unknown>, [...ancestors, primary] as Settings[]);
-		return merged;
+		const consentSources: Settings[] = [...ancestors, primary];
+		if (ancestorParseErrors.length > 0) {
+			// An unparseable ancestor may have held a consent veto, so its consent
+			// cannot be verified: fail that layer closed rather than silently
+			// treating an unknown file as permission (SEC-7 direction, K3P-1 scope).
+			consentSources.push({ telemetry: { enabled: false }, agentTraces: { enabled: false } } as Settings);
+		}
+		applyProjectConsentVeto(merged as Record<string, unknown>, consentSources);
+		return { settings: merged, ancestorParseErrors };
 	}
 
 	private static tryLoadFromStorage(
 		storage: SettingsStorage,
 		scope: SettingsScope,
-	): { settings: Settings; error: Error | null } {
+	): { settings: Settings; error: Error | null; ancestorParseErrors: Array<{ path: string; error: Error }> } {
 		try {
-			return { settings: SettingsManager.loadFromStorage(storage, scope), error: null };
+			const { settings, ancestorParseErrors } = SettingsManager.loadFromStorage(storage, scope);
+			return { settings, error: null, ancestorParseErrors };
 		} catch (error) {
-			return { settings: {}, error: error as Error };
+			return { settings: {}, error: error as Error, ancestorParseErrors: [] };
 		}
 	}
 
@@ -1201,15 +1235,11 @@ export class SettingsManager {
 			this.projectSettingsLoadError = projectLoad.error;
 			this.recordError("project", projectLoad.error);
 		}
+		for (const { path, error } of projectLoad.ancestorParseErrors) {
+			this.recordAncestorParseError(path, error);
+		}
 
-		// SEC-9: the merged view is files-with-overrides. Recomputing it from the
-		// two scopes alone silently rolled back every runtime override a CLI flag
-		// or SDK caller had applied, so one external edit of settings.json
-		// dropped them from view until the next applyOverrides call.
-		this.settings = deepMergeSettings(
-			deepMergeSettings(this.globalSettings, this.projectSettings),
-			this.runtimeOverrides,
-		);
+		this.recomputeMergedSettings();
 		this.reportUnknownSettingsKeys("global", this.globalSettings);
 		this.reportUnknownSettingsKeys("project", this.projectSettings);
 		this.captureSettingsStamps();
@@ -1223,6 +1253,11 @@ export class SettingsManager {
 	private settingsStamp(scope: SettingsScope): string | undefined {
 		const path = this.storage.settingsFilePath?.(scope);
 		if (path === undefined) return undefined;
+		return this.settingsStampForPath(path);
+	}
+
+	/** On-disk identity of any settings-shaped file, or undefined when absent. */
+	private settingsStampForPath(path: string): string | undefined {
 		try {
 			const info = statSync(path);
 			return `${info.ino}:${info.mtimeMs}:${info.size}`;
@@ -1240,6 +1275,12 @@ export class SettingsManager {
 			} else {
 				this.loadedStamps.set(scope, stamp);
 			}
+		}
+		// The ancestor files take part in the project scope (SEC-8), so their
+		// identity is remembered too: an ancestor watcher wake-up only counts as
+		// an external edit when that file changed since the last load (K3P-2).
+		for (const path of this.storage.projectAncestorSettingsFilePaths?.() ?? []) {
+			this.ancestorStamps.set(path, this.settingsStampForPath(path));
 		}
 	}
 
@@ -1275,6 +1316,25 @@ export class SettingsManager {
 					return;
 				}
 				this.reloadExternalEdit(scope, stamp);
+			};
+			const watcher = watchFile(path, { interval: intervalMs }, listener);
+			watcher.unref();
+			this.externalWatchers.push({ path, listener });
+		}
+		// K3P-2: the project scope is built from the ancestor files too (SEC-8),
+		// so they are watched as well - a repository-level veto written while the
+		// session is running must take effect, not wait for the next unrelated
+		// reload or a restart. Polling watchers fire for a file that appears where
+		// none was, so a veto that lands mid-session is picked up the same way.
+		const watchedPaths = new Set([globalPath, projectPath]);
+		for (const path of this.storage.projectAncestorSettingsFilePaths?.() ?? []) {
+			if (watchedPaths.has(path)) continue;
+			const listener = (): void => {
+				const stamp = this.settingsStampForPath(path);
+				if (stamp === this.ancestorStamps.get(path)) {
+					return;
+				}
+				this.reloadExternalEdit("project", stamp);
 			};
 			const watcher = watchFile(path, { interval: intervalMs }, listener);
 			watcher.unref();
@@ -1341,6 +1401,35 @@ export class SettingsManager {
 	applyOverrides(overrides: Partial<Settings>): void {
 		this.runtimeOverrides = deepMergeSettings(this.runtimeOverrides, overrides);
 		this.settings = deepMergeSettings(this.settings, overrides);
+	}
+
+	/**
+	 * The merged view is files-with-overrides. Recomputing it from the two
+	 * scopes alone silently rolled back every runtime override a CLI flag or
+	 * SDK caller had applied (SEC-9 for reload, K3P-3 for the save paths: one
+	 * unrelated save had the same effect as one external edit).
+	 */
+	private recomputeMergedSettings(): void {
+		this.settings = deepMergeSettings(
+			deepMergeSettings(this.globalSettings, this.projectSettings),
+			this.runtimeOverrides,
+		);
+	}
+
+	/**
+	 * Report one ancestor settings file that failed to parse (K3P-1): it was
+	 * excluded from the project-scope merge and its consent is treated as
+	 * withheld. A warning, not an error: the errors list is the save-failure
+	 * contract, and a foreign ancestor file is not this session's save liability.
+	 */
+	private recordAncestorParseError(path: string, error: Error): void {
+		this.recordWarning(
+			"project",
+			`ancestor-parse-error:${path}`,
+			`settings.json at ${path} failed to parse, so it was ignored while building the project settings: ` +
+				`the rest of the project scope is still in effect, and consent (agent traces, telemetry) is ` +
+				`treated as withheld for that file until it parses again. Parse error: ${error.message}`,
+		);
 	}
 
 	/** Mark a global field as modified during this session */
@@ -1462,7 +1551,7 @@ export class SettingsManager {
 	}
 
 	private save(): void {
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		this.recomputeMergedSettings();
 
 		if (this.globalSettingsLoadError) {
 			this.recordError(
@@ -1485,7 +1574,7 @@ export class SettingsManager {
 
 	private saveProjectSettings(settings: Settings): void {
 		this.projectSettings = structuredClone(settings);
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		this.recomputeMergedSettings();
 
 		if (this.projectSettingsLoadError) {
 			this.recordError(

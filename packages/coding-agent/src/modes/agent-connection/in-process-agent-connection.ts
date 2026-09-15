@@ -16,7 +16,7 @@ import type { ExtensionUIContext } from "../../core/extensions/types.js";
 import type { AcpMcpServerConfig } from "../../core/mcp/acp-mcp-types.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import { type DeleteSessionFileResult, deleteSessionFile } from "../../core/session-file-actions.js";
-import { repairOwnedSessionFile, SessionManager } from "../../core/session-manager.js";
+import { appendOwnedSessionLine, SessionManager } from "../../core/session-manager.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import { type SideQuestionRun, startSideQuestion } from "../../core/side-question.js";
 import type { HeadlessCompletionResult } from "../headless-completion.js";
@@ -612,9 +612,13 @@ export class InProcessAgentConnection implements AgentConnection {
 			return;
 		}
 		// The rename append owns the write side for this one line: repair a torn
-		// tail first, or the session_info line glues onto it and both vanish.
-		repairOwnedSessionFile(sessionPath);
-		SessionManager.open(sessionPath).appendSessionInfo(trimmedName);
+		// tail first, or the session_info line glues onto it and both vanish. K3P-5:
+		// the repair truncates, so like the catalog append it only happens under the
+		// write lease - a live writer's in-flight append is never truncated, and the
+		// rename is refused while that writer holds the lease.
+		appendOwnedSessionLine(sessionPath, this.runtimeHost.services.agentDir, (manager) => {
+			manager.appendSessionInfo(trimmedName);
+		});
 	}
 
 	async deleteSavedSession(sessionPath: string): Promise<DeleteSessionFileResult> {
