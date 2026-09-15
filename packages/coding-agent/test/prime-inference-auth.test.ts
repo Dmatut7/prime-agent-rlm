@@ -1,6 +1,16 @@
 import { Buffer } from "node:buffer";
 import { constants, publicEncrypt } from "node:crypto";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	lstatSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -11,6 +21,7 @@ import {
 	loadPrimeCliConfig,
 	loginPrimeAgentTraces,
 	loginPrimeInference,
+	savePrimeCliApiKey,
 } from "../src/core/prime-inference-auth.js";
 
 function jsonResponse(body: unknown, status: number = 200): Response {
@@ -125,6 +136,41 @@ describe("Prime Inference auth", () => {
 			teamRole: "admin",
 			teamIdFromEnv: false,
 		});
+	});
+
+	it("refuses to write the shared Prime CLI config through a symlink instead of replacing its target", () => {
+		const sharedPath = join(tempDir, "shared-prime-config.json");
+		const sharedContents = `${JSON.stringify({ api_key: "another-tool-key", team_id: "other-team" }, null, 2)}\n`;
+		writeFileSync(sharedPath, sharedContents, { mode: 0o600 });
+		symlinkSync(sharedPath, configPath);
+
+		expect(lstatSync(configPath).isSymbolicLink()).toBe(true);
+		expect(() => savePrimeCliApiKey("prime-login-key", configPath)).toThrow();
+
+		// The link and the file behind it are both untouched. The previous writer renamed a
+		// fresh file over the link, so it reported a successful write while the file the link
+		// still showed kept the old key: the tool's config and the config right there on disk
+		// were two different files from then on.
+		expect(lstatSync(configPath).isSymbolicLink()).toBe(true);
+		expect(readFileSync(sharedPath, "utf-8")).toBe(sharedContents);
+
+		// Control for the refusal: the same call succeeds against the link's target, so the
+		// failure above is about writing through a link, not about the write being impossible.
+		savePrimeCliApiKey("prime-login-key", sharedPath);
+		expect(loadPrimeCliConfig(sharedPath).apiKey).toBe("prime-login-key");
+	});
+
+	it("writes the shared Prime CLI config as a private file and leaves no temp file behind", () => {
+		writeFileSync(configPath, `${JSON.stringify({ api_key: "old-key", team_id: "team-1" })}\n`, { mode: 0o600 });
+
+		savePrimeCliApiKey("new-key", configPath);
+
+		// The file holds an api_key and other tools read it, so it is written as a private
+		// store: 0600 for the file, 0700 for the directory it lives in.
+		expect(statSync(configPath).mode & 0o777).toBe(0o600);
+		expect(statSync(tempDir).mode & 0o777).toBe(0o700);
+		expect(readdirSync(tempDir)).toEqual(["config.json"]);
+		expect(loadPrimeCliConfig(configPath).apiKey).toBe("new-key");
 	});
 
 	it("lets PRIME_TEAM_ID override Prime CLI team selection", () => {

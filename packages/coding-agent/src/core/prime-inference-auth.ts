@@ -1,19 +1,10 @@
 import { Buffer } from "node:buffer";
 import { constants, generateKeyPairSync, privateDecrypt } from "node:crypto";
-import {
-	chmodSync,
-	closeSync,
-	existsSync,
-	mkdirSync,
-	openSync,
-	readFileSync,
-	renameSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { join } from "node:path";
 import type { OAuthAuthInfo } from "@earendil-works/pi-ai";
+import { writePrivateFileAtomic } from "../utils/private-files.js";
 
 export const PRIME_INFERENCE_PROVIDER_ID = "prime-inference";
 export const PRIME_INFERENCE_PROVIDER_NAME = "Prime Inference";
@@ -136,31 +127,22 @@ function readPrimeCliConfigData(configPath: string): Record<string, unknown> {
 	return data;
 }
 
+/**
+ * Write the Prime CLI config.
+ *
+ * The file holds an `api_key` and is shared with the `prime` CLI, so it goes through the
+ * private-store writer: the temp file is opened with `O_NOFOLLOW`, fsynced and renamed into
+ * place, the result is 0600 inside a 0700 directory, and a symlink at `configPath` is refused
+ * instead of silently replaced. The hand-rolled `openSync("wx") + renameSync` this replaces did
+ * none of that: it replaced a symlinked config with a regular file, so the file the user's link
+ * still pointed at kept the old key while the writer reported the new one.
+ *
+ * Deliberately not locked: the other writer of this file is the Prime CLI, which does not take
+ * our lock, so locking would narrow a read-modify-write race without closing it. The rename is
+ * atomic, so a lost update can drop a team field but never leave a torn config.
+ */
 function writePrimeCliConfigData(configPath: string, data: Record<string, unknown>): void {
-	const dir = dirname(configPath);
-	if (!existsSync(dir)) {
-		mkdirSync(dir, { recursive: true, mode: 0o700 });
-	}
-	const tempPath = join(
-		dir,
-		`.${basename(configPath)}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`,
-	);
-	let fd: number | undefined = openSync(tempPath, "wx", 0o600);
-	try {
-		writeFileSync(fd, `${JSON.stringify(data, null, 2)}\n`, "utf-8");
-		closeSync(fd);
-		fd = undefined;
-		chmodSync(tempPath, 0o600);
-		renameSync(tempPath, configPath);
-		chmodSync(configPath, 0o600);
-	} finally {
-		if (fd !== undefined) {
-			closeSync(fd);
-		}
-		if (existsSync(tempPath)) {
-			rmSync(tempPath, { force: true });
-		}
-	}
+	writePrivateFileAtomic(configPath, `${JSON.stringify(data, null, 2)}\n`);
 }
 
 function clearPrimeTeamFields(data: Record<string, unknown>): void {
@@ -209,12 +191,34 @@ export function savePrimeCliApiKey(apiKey: string, configPath: string = defaultP
 	return loadPrimeCliConfig(configPath);
 }
 
-export function clearPrimeCliCredentials(configPath: string = defaultPrimeCliConfigPath()): PrimeCliConfig {
+/**
+ * What clearing the Prime CLI config actually removed. The file is not this agent's own store:
+ * the `prime` CLI reads the same `api_key`, so a logout that empties it takes credentials away
+ * from another tool and the caller has to be able to say so.
+ */
+export interface PrimeCliCredentialRemoval {
+	config: PrimeCliConfig;
+	/** The file held an `api_key` before this call, i.e. this call is what removed it. */
+	removedApiKey: boolean;
+	/** The file also held a team selection, which is Prime CLI state rather than an agent credential. */
+	removedTeamSelection: boolean;
+}
+
+export function clearPrimeCliCredentialsWithReport(
+	configPath: string = defaultPrimeCliConfigPath(),
+): PrimeCliCredentialRemoval {
 	const data = readPrimeCliConfigData(configPath);
+	const removedApiKey = typeof data.api_key === "string" && data.api_key.length > 0;
+	const removedTeamSelection =
+		data.team_id !== undefined || data.team_name !== undefined || data.team_role !== undefined;
 	delete data.api_key;
 	clearPrimeTeamFields(data);
 	writePrimeCliConfigData(configPath, data);
-	return loadPrimeCliConfig(configPath);
+	return { config: loadPrimeCliConfig(configPath), removedApiKey, removedTeamSelection };
+}
+
+export function clearPrimeCliCredentials(configPath: string = defaultPrimeCliConfigPath()): PrimeCliConfig {
+	return clearPrimeCliCredentialsWithReport(configPath).config;
 }
 
 export function savePrimeCliTeamSelection(

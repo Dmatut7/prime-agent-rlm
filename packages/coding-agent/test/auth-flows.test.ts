@@ -207,6 +207,25 @@ describe("ProviderAuthFlows", () => {
 		await expect(logoutResult).resolves.toBeNull();
 	});
 
+	it("shows the shared-config warning in the status line when logout clears another tool's key", async () => {
+		writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key", team_id: "team-1" }));
+		const authStorage = AuthStorage.create(authJsonPath, {
+			primeCliConfigPath: primeConfigPath,
+			usePrimeCliConfig: true,
+		});
+		const { host, statusMessages, overlays } = createHost(authStorage);
+
+		const logoutResult = new ProviderAuthFlows(host).runLogout();
+		expect(overlays).toHaveLength(1);
+		overlays[0]?.handleInput?.("prime");
+		overlays[0]?.handleInput?.("\r");
+		await expect(logoutResult).resolves.toBe(PRIME_INFERENCE_PROVIDER_ID);
+
+		const status = stripAnsi(statusMessages.join("\n"));
+		expect(status).toContain("Prime CLI config");
+		expect(status).toContain(primeConfigPath);
+	});
+
 	it("opens login on the requested MCP Connections category", async () => {
 		const authStorage = AuthStorage.create(authJsonPath, { usePrimeCliConfig: false });
 		const { host, overlays } = createHost(authStorage);

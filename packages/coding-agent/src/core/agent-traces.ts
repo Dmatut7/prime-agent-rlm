@@ -1,11 +1,12 @@
 import { Buffer } from "node:buffer";
-import { createHash, randomUUID } from "node:crypto";
-import { type Dirent, existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
-import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { type Dirent, existsSync } from "node:fs";
+import { readdir, readFile, stat, unlink } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { appendRotatingLog, getAgentDir, getAgentTracesLogPath, getSessionsDir, VERSION } from "../config.js";
 import { readFirstLineSync } from "../utils/file-lines.js";
 import { backgroundNetworkOptOut } from "../utils/privacy-opt-out.js";
+import { ensurePrivateDirectory, tightenPrivateFileMode, writePrivateFileAtomic } from "../utils/private-files.js";
 import type { AuthStorage } from "./auth-storage.js";
 import {
 	loadPrimeCliConfig,
@@ -741,7 +742,15 @@ function signatureEquals(a: AgentTraceUploadedSignature | null | undefined, b: A
 /** Session files with a live upload controller in this process; catch-up leaves them to their controller. */
 const locallyManagedSessionFiles = new Set<string>();
 
-/** Best-effort and synchronous: upload intent must be on disk the moment the transcript persist returns. */
+/**
+ * Best-effort and synchronous: upload intent must be on disk the moment the transcript persist returns.
+ *
+ * Written through the private-store writer (0600 inside a 0700 directory, O_NOFOLLOW, fsync,
+ * atomic rename). The outbox names session files and ledger paths and lives in the same agent
+ * directory as the transcripts, so a directory readable by every account on the machine had no
+ * reason to exist; the plain `mkdirSync`/`writeFileSync` here produced 0755/0644 on a machine
+ * whose every other state file is private.
+ */
 function markAgentTraceOutboxPendingSync(
 	sessionFile: string,
 	kind?: string,
@@ -752,14 +761,10 @@ function markAgentTraceOutboxPendingSync(
 		if (existsSync(entryPath)) {
 			return true;
 		}
-		mkdirSync(getAgentTraceOutboxDir(scope), { recursive: true });
-		const tempPath = `${entryPath}.${process.pid}.${randomUUID()}.tmp`;
-		writeFileSync(
-			tempPath,
+		writePrivateFileAtomic(
+			entryPath,
 			`${JSON.stringify(kind === undefined ? { sessionFile } : { sessionFile, kind })}\n`,
-			"utf8",
 		);
-		renameSync(tempPath, entryPath);
 		return true;
 	} catch {
 		// A broken agent dir must not break session persists.
@@ -780,10 +785,9 @@ async function recordAgentTraceOutboxUpload(
 		return;
 	}
 	const entryPath = agentTraceOutboxEntryPath(scope, sessionFile);
-	await mkdir(getAgentTraceOutboxDir(scope), { recursive: true });
-	const tempPath = `${entryPath}.${process.pid}.${randomUUID()}.tmp`;
-	await writeFile(tempPath, `${JSON.stringify({ sessionFile, ...signature })}\n`, "utf8");
-	await rename(tempPath, entryPath);
+	// Same private-store write as the intent marker above: the cursor is bookkeeping about a
+	// transcript, and the file it replaces may itself be a loose leftover from an older version.
+	writePrivateFileAtomic(entryPath, `${JSON.stringify({ sessionFile, ...signature })}\n`);
 }
 
 /**
@@ -805,6 +809,15 @@ export async function catchUpAgentTraceUploads(
 	} catch {
 		return catchUp;
 	}
+	// Legacy bookkeeping repair. An outbox written before this store was private is 0755/0644 and
+	// nothing rewrites an entry that is already there, so the loose mode would outlive every fix.
+	// This is the one pass that visits every entry; both repairs are best-effort, and an entry left
+	// alone is still a correct cursor.
+	try {
+		ensurePrivateDirectory(getAgentTraceOutboxDir(scope));
+	} catch {
+		// A directory that cannot be hardened here is still one whose entries can be read.
+	}
 	const beforeRequest = createTraceUploadAllRequestGate(options.signal);
 	for (const entryName of entryNames) {
 		if (options.signal?.aborted) {
@@ -820,6 +833,11 @@ export async function catchUpAgentTraceUploads(
 		} catch {
 			// Transient read error: keep the entry and retry at the next startup.
 			continue;
+		}
+		try {
+			tightenPrivateFileMode(entryPath);
+		} catch {
+			// Same as the directory above: the cursor is what matters, not its mode.
 		}
 		const entry = parseOutboxEntry(raw);
 		if (!entry) {

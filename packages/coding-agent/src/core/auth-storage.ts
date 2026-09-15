@@ -22,7 +22,7 @@ import { ensurePrivateFile, readPrivateFile, writePrivateFileAtomic } from "../u
 import { sleepSync } from "../utils/sleep.js";
 import { findFilesHoldingSecrets, purgeLegacyTokenStores } from "./legacy-auth-files.js";
 import {
-	clearPrimeCliCredentials,
+	clearPrimeCliCredentialsWithReport,
 	getPrimeCliConfigPath,
 	loadPrimeCliConfig,
 	PRIME_INFERENCE_PROVIDER_ID,
@@ -32,6 +32,19 @@ import {
 	savePrimeCliTeamSelection,
 } from "./prime-inference-auth.js";
 import { resolveConfigValue, resolveConfigValueUncached } from "./resolve-config-value.js";
+
+/**
+ * A non-fatal, user-visible side effect of an auth operation.
+ *
+ * `errors` carries what failed. A notice carries what worked but reached outside this store —
+ * today, the logout of Prime Inference when its credential is the shared Prime CLI config: the
+ * removal is correct and complete, and the user still has to learn that another tool's key went
+ * with it. Callers surface notices; nothing here decides how.
+ */
+export type AuthNotice = {
+	provider: string;
+	message: string;
+};
 
 export type PrimeTeamCredential = {
 	teamId: string;
@@ -263,6 +276,7 @@ export class AuthStorage {
 	private fallbackResolver?: (provider: string) => string | undefined;
 	private loadError: Error | null = null;
 	private errors: Error[] = [];
+	private notices: AuthNotice[] = [];
 
 	private constructor(
 		private storage: AuthStorageBackend,
@@ -760,6 +774,17 @@ export class AuthStorage {
 	}
 
 	/**
+	 * Take the pending user-visible side effects of auth operations. Drained rather than read:
+	 * each notice describes one removal, and a caller that shows it twice would report a side
+	 * effect that did not happen twice.
+	 */
+	drainNotices(): AuthNotice[] {
+		const drained = [...this.notices];
+		this.notices = [];
+		return drained;
+	}
+
+	/**
 	 * Login to an OAuth provider.
 	 */
 	async login(providerId: OAuthProviderId, callbacks: OAuthLoginCallbacks): Promise<void> {
@@ -781,12 +806,29 @@ export class AuthStorage {
 	 * the store itself was cleared. They are removed here, and the removal is verified
 	 * against the value being logged out — a logout that cannot show the token is gone
 	 * throws instead of reporting success.
+	 *
+	 * Prime Inference is the one provider whose credential lives in a file this agent shares
+	 * with another tool: the Prime CLI config holds the same `api_key`, and the team selection
+	 * next to it is Prime CLI state rather than agent state. Removing it is the logout the user
+	 * asked for, and it also signs the `prime` CLI out, so it is recorded as a notice instead of
+	 * happening silently.
 	 */
 	logout(provider: string): void {
 		if (provider === PRIME_INFERENCE_PROVIDER_ID && this.isPrimeCliConfigEnabled()) {
 			try {
-				clearPrimeCliCredentials(this.getEnabledPrimeCliConfigPath());
+				const configPath = this.getEnabledPrimeCliConfigPath();
+				const removal = clearPrimeCliCredentialsWithReport(configPath);
 				this.clearStaleAuthSource(provider, "prime_cli");
+				if (removal.removedApiKey || removal.removedTeamSelection) {
+					this.notices.push({
+						provider,
+						message:
+							`Logged out of Prime Inference by clearing the Prime CLI config at ${configPath}` +
+							`${removal.removedApiKey ? ", including its api_key" : ""}` +
+							`${removal.removedTeamSelection ? " and its team selection" : ""}.` +
+							" Other tools that read that file (the prime CLI among them) lost those credentials too.",
+					});
+				}
 			} catch (error) {
 				this.recordError(error);
 				throw error;

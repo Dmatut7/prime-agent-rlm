@@ -1,6 +1,15 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1181,6 +1190,88 @@ describe("agent trace upload", () => {
 		// Synchronously durable: the intent marker is on disk the moment the persist returns.
 		expect(readOutboxEntry(tempDir, sessionFile as string)).toEqual({ sessionFile });
 		expect(calls).toHaveLength(0);
+	});
+
+	it("keeps the durable outbox private: a 0700 directory holding 0600 entries", async () => {
+		const cwd = join(tempDir, "project");
+		const sessionDir = join(tempDir, "sessions");
+		mkdirSync(cwd, { recursive: true });
+		const sessionManager = writeSession(cwd, sessionDir, "private-outbox-session");
+		const sessionFile = sessionManager.getSessionFile() as string;
+
+		installAgentTraceUpload(sessionManager, {
+			authStorage: AuthStorage.inMemory({
+				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
+			}),
+			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
+			baseUrl: "https://api.example.test",
+			fetchFn: createFetchRecorder([]),
+		});
+		sessionManager.appendMessage(createUserMessage("hello"));
+
+		// Positive control for the two assertions below: the session file is written by the
+		// same private-store helpers, so a mode read here does report what it claims to.
+		expect(statSync(sessionFile).mode & 0o777).toBe(0o600);
+		expect(statSync(outboxEntryPath(tempDir, sessionFile)).mode & 0o777).toBe(0o600);
+		expect(statSync(join(tempDir, "agent-traces-outbox")).mode & 0o777).toBe(0o700);
+	});
+
+	it("keeps a rewritten outbox cursor private after an upload", async () => {
+		const cwd = join(tempDir, "project");
+		const sessionDir = join(tempDir, "sessions");
+		mkdirSync(cwd, { recursive: true });
+		const sessionManager = writeSession(cwd, sessionDir, "cursor-mode-session");
+		const sessionFile = sessionManager.getSessionFile() as string;
+		writeOutboxEntry(tempDir, sessionFile);
+
+		const calls: FetchCall[] = [];
+		await catchUpAgentTraceUploads({
+			authStorage: AuthStorage.inMemory({
+				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
+			}),
+			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
+			baseUrl: "https://api.example.test",
+			fetchFn: createFetchRecorder(calls),
+			reloadConfig: false,
+		});
+
+		expect(calls).toHaveLength(1);
+		// The cursor now records the session's size: the entry was rewritten, and the rewrite
+		// left it private even though the entry it replaced was not.
+		expect(readOutboxEntry(tempDir, sessionFile)?.size).toBeGreaterThan(0);
+		expect(statSync(outboxEntryPath(tempDir, sessionFile)).mode & 0o777).toBe(0o600);
+	});
+
+	it("repairs a legacy outbox mode on the catch-up pass that visits every entry", async () => {
+		const cwd = join(tempDir, "project");
+		const sessionDir = join(tempDir, "sessions");
+		mkdirSync(cwd, { recursive: true });
+		const sessionManager = writeSession(cwd, sessionDir, "legacy-outbox-session");
+		const sessionFile = sessionManager.getSessionFile() as string;
+		// A pre-fix outbox entry: the mode a loose mkdirSync/writeFileSync produced, and a cursor
+		// that already matches the session, so nothing below rewrites it.
+		const stats = await stat(sessionFile);
+		writeOutboxEntry(tempDir, sessionFile, { size: stats.size, mtimeMs: stats.mtimeMs });
+		const entryPath = outboxEntryPath(tempDir, sessionFile);
+		expect(statSync(entryPath).mode & 0o777).toBe(0o644);
+
+		const calls: FetchCall[] = [];
+		const catchUp = await catchUpAgentTraceUploads({
+			authStorage: AuthStorage.inMemory({
+				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
+			}),
+			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
+			baseUrl: "https://api.example.test",
+			fetchFn: createFetchRecorder(calls),
+			reloadConfig: false,
+		});
+
+		// The cursor was up to date, so the entry was skipped: the modes below were repaired in
+		// place, not rewritten by an upload.
+		expect(catchUp.results).toEqual([]);
+		expect(calls).toHaveLength(0);
+		expect(statSync(entryPath).mode & 0o777).toBe(0o600);
+		expect(statSync(join(tempDir, "agent-traces-outbox")).mode & 0o777).toBe(0o700);
 	});
 
 	it("catch-up uploads exactly the content a previous process never uploaded, then goes quiet", async () => {
