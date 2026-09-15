@@ -304,9 +304,12 @@ function formatStreamStallErrorMessage(timeoutMs: number): string {
 
 /**
  * Synthetic `stopReasonRaw` for a stall that happened while the client was obeying a
- * wait the provider itself asked for (HTTP 429/408/5xx with `Retry-After`). The
- * provider answered, so the connection is not the suspect; callers use this marker to
- * keep the shape out of the "resend the whole context" retry class.
+ * wait the provider itself asked for (HTTP 429/408/5xx with `Retry-After`) and no
+ * stream event had arrived yet. The provider answered, so the connection is not the
+ * suspect; callers use this marker to keep the shape out of the "resend the whole
+ * context" retry class. The wait only covers the silence before a response starts
+ * streaming: a stall observed after events have arrived is a mid-stream interruption
+ * and does not carry this marker, even when an earlier 429 stands in the same attempt.
  */
 export const SERVER_DIRECTED_RETRY_STALL_STOP_REASON_RAW = "stalled_during_provider_retry";
 
@@ -326,11 +329,45 @@ function formatProviderRetryStallMessage(notice: ProviderRetryNotice, retries: n
 	);
 }
 
+/** Why a stall was (or was not) explained by a wait the provider itself asked for. */
+type StallAttribution = "server_directed_wait" | "mid_stream_interruption";
+
+/** What the attempt observed before the stall, which is what decides what explains it. */
+interface StreamStallAttemptFacts {
+	/** Server-directed retry waits (`Retry-After` on a retryable status) seen in this attempt. */
+	readonly providerRetries: readonly ProviderRetryNotice[];
+	/** Stream events the provider delivered in this attempt. */
+	readonly streamEventCount: number;
+}
+
+/**
+ * A server-directed wait only explains silence the request spent waiting to start
+ * streaming: both SDKs sleep on `Retry-After` before a response body exists, and the
+ * stall timer is re-armed on every event, so a stall seen after any event is a gap
+ * that began mid-stream. Output already delivered also means the transcript holds a
+ * truncated answer - the shape that needs the whole context resent - so an earlier
+ * 429 in the same attempt must not cost it that eligibility.
+ */
+function attributeStall(facts: StreamStallAttemptFacts): StallAttribution {
+	return facts.streamEventCount === 0 ? "server_directed_wait" : "mid_stream_interruption";
+}
+
+function formatMidStreamStallMessage(notice: ProviderRetryNotice, retries: number, timeoutMs: number): string {
+	const seconds = Math.max(1, Math.round(timeoutMs / 1000));
+	const asked = notice.retryAfter ? `${notice.delayMs}ms (${notice.retryAfter})` : `${notice.delayMs}ms`;
+	return (
+		`Stream stalled: no response events arrived for ${seconds}s after the stream had started, so the provider request was aborted as likely dead. ` +
+		`An earlier HTTP ${notice.status} in this same attempt asked to wait ${asked} (${retries} such wait(s)), but that wait covers only the silence before a response starts streaming. ` +
+		"Output had already arrived, so this is a mid-stream interruption rather than the provider's throttle window, and resending the turn normally succeeds. " +
+		"If this repeats on a healthy but slow provider, raise streamStallTimeoutMs or set it to 0 to disable."
+	);
+}
+
 function createStalledAssistantMessage(
 	config: AgentLoopConfig,
 	partialMessage: AssistantMessage | null,
 	timeoutMs: number,
-	providerRetries: readonly ProviderRetryNotice[] = [],
+	facts: StreamStallAttemptFacts,
 ): AssistantMessage {
 	const message: AssistantMessage = {
 		role: "assistant",
@@ -343,13 +380,21 @@ function createStalledAssistantMessage(
 		errorMessage: formatStreamStallErrorMessage(timeoutMs),
 		timestamp: Date.now(),
 	};
-	const lastRetry = providerRetries[providerRetries.length - 1];
-	// The server answered and told us how long to wait: classify the silence as
-	// throttling instead of a dead connection, and keep the structured diagnostic so
-	// kind-based routing downstream sees rate_limit rather than nothing.
+	const lastRetry = facts.providerRetries[facts.providerRetries.length - 1];
 	if (lastRetry) {
-		message.errorMessage = formatProviderRetryStallMessage(lastRetry, providerRetries.length, timeoutMs);
-		message.stopReasonRaw = SERVER_DIRECTED_RETRY_STALL_STOP_REASON_RAW;
+		const retries = facts.providerRetries.length;
+		const attribution = attributeStall(facts);
+		// The server answered and asked for a wait, and nothing has streamed since: the
+		// silence is throttling, not a dead connection, and the marker keeps this shape
+		// out of the "resend the whole context" class. After any stream event the wait
+		// no longer covers the gap, so the stall keeps its resend eligibility; the
+		// earlier server answer is still recorded for post-mortems.
+		if (attribution === "server_directed_wait") {
+			message.errorMessage = formatProviderRetryStallMessage(lastRetry, retries, timeoutMs);
+			message.stopReasonRaw = SERVER_DIRECTED_RETRY_STALL_STOP_REASON_RAW;
+		} else {
+			message.errorMessage = formatMidStreamStallMessage(lastRetry, retries, timeoutMs);
+		}
 		appendAssistantMessageDiagnostic(message, {
 			type: "provider_stream_failure",
 			timestamp: Date.now(),
@@ -359,8 +404,10 @@ function createStalledAssistantMessage(
 				retryAfterMs: lastRetry.delayMs,
 				retryAfter: lastRetry.retryAfter,
 				capped: lastRetry.capped,
-				retryAttempts: providerRetries.length,
+				retryAttempts: retries,
 				stallTimeoutMs: timeoutMs,
+				stallAttribution: attribution,
+				streamedContent: partialMessage !== null,
 			},
 		});
 	}
@@ -1041,6 +1088,9 @@ async function runAssistantStreamAttempt(
 	// Server-directed retry waits observed during this attempt: proof the provider
 	// answered, so a following silence is throttling, not a dead connection.
 	const providerRetries: ProviderRetryNotice[] = [];
+	// Stream events delivered during this attempt. Together with the waits above it
+	// decides whether one of them explains a stall (see attributeStall).
+	let streamEventCount = 0;
 	const stallPromise = new Promise<never>((_resolve, reject) => {
 		stallReject = reject;
 	});
@@ -1066,7 +1116,10 @@ async function runAssistantStreamAttempt(
 		streamStallTimeoutMs === undefined ? operation : Promise.race([operation, stallPromise]);
 	let closeIterator: (() => void) | undefined;
 	const finishStalledMessage = async (error: StreamStallError) => {
-		const finalMessage = createStalledAssistantMessage(config, partialMessage, error.timeoutMs, providerRetries);
+		const finalMessage = createStalledAssistantMessage(config, partialMessage, error.timeoutMs, {
+			providerRetries,
+			streamEventCount,
+		});
 		if (addedPartial) {
 			context.messages[context.messages.length - 1] = finalMessage;
 		} else {
@@ -1137,6 +1190,9 @@ async function runAssistantStreamAttempt(
 			}
 			const event = normalizeStreamEvent(next.value);
 			armStallTimer();
+			// An event the provider delivered is what puts this attempt past the window a
+			// server-directed retry wait covers, so the stall classification reads it.
+			streamEventCount += 1;
 			switch (event.type) {
 				case "start":
 					partialMessage = event.partial;
