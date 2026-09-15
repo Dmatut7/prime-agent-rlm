@@ -309,7 +309,7 @@ description: Use this skill when the user asks about X.
 2. Then that
 ```
 
-Skills can also be Python-backed. A Python skill is a normal skill directory with `SKILL.md` plus a Python package at `src/<import_name>/`. Prime Agent installs it into the persistent Python kernel and exposes it by import name, so the model can call it directly, inspect it with `help()`, or use any console scripts the skill declares.
+Skills can also be Python-backed. A Python skill is a normal skill directory with `SKILL.md` plus a Python package at `src/<import_name>/`. Prime Agent installs it into the persistent Python kernel and exposes it by import name, so the model calls it directly (`await <import_name>(...)`) or inspects it with `help()`. The kernel venv's `bin` directory is not on the shell `PATH` and a skill's Python entry point may depend on the kernel's host bridge, so a declared console script is a human convenience (`<venv>/bin/<script>`), not a command the model can run.
 
 Place in `~/.prime/agent/skills/`, `~/.agents/skills/`, `.prime/agent/skills/`, or `.agents/skills/` (from `cwd` up through parent directories) or a [Prime Agent package](#prime-agent-packages) to share with others. See [docs/skills.md](docs/skills.md).
 

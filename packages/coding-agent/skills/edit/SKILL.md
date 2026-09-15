@@ -17,6 +17,5 @@ triple single-quoted variables (`old = '''...'''`) or build `old`/`new` from
 inspected file slices. Returns a short confirmation; raises if `old_str` is
 missing or matches more than once (widen the snippet to make it unique).
 
-Or from a shell cell:
-
-    !edit --path pkg/file.py --old-str "..." --new-str "..."
+`edit` is a kernel module, not a shell command: `bash('edit ...')` reports command
+not found because the kernel venv's bin directory is not on the shell PATH.

@@ -38,9 +38,8 @@ Call directly from the kernel:
 
     await word_count("some text to analyze", top=3)
 
-Or from a shell cell:
-
-    !word_count "some text to analyze" --top 3
+The kernel is a plain Python REPL: there is no `!cmd` escape and no `%%bash` cell, so
+do not document a shell form in `SKILL.md`.
 ```
 
 **`pyproject.toml`**
@@ -92,25 +91,24 @@ help(word_count)                # shows run()'s docstring and signature
 - Without `run()`, the module is still imported and exposed by name, just not callable.
 - Import failures do not break the kernel: the name is bound to a placeholder that raises a `RuntimeError` containing the import error when called.
 
-## Optional CLI Command
+## Optional CLI Command (not reachable by the model)
 
-The `[project.scripts]` entry pointing at `rlm.skill:cli` gives the skill a shell command. Rules:
+`[project.scripts]` pointing at `rlm.skill:cli` installs a console script into the **kernel venv's**
+`bin` directory. That directory is not on the `PATH` of the agent's shell tool, so the model cannot
+run `<skill_import> ...`; the REPL module is the only interface the agent sees. Rules:
 
 - The script name must **exactly** match the Python import name, underscores included (`word_count`, not `word-count`).
 - `rlm.skill:cli` imports `<script_name>.run` and parses argv against its signature with `tyro`, awaits async results, and prints non-`None` return values.
-- `rlm` and `tyro` are already present in the kernel venv. Do **not** declare `prime-agent-runtime` as a dependency: it is bundled with Prime Agent, not published on PyPI, so declaring it breaks installs outside the kernel venv. The CLI entry point only works where the runtime is installed, i.e. inside the kernel venv.
+- A skill whose `run()` talks to the host through `rlm.host_request` cannot work as a CLI at all: the host bridge is the kernel process's own protocol pipe (`repl.py` marks the fd non-inheritable), so a subprocess raises `repl runtime is not serving` even when invoked by absolute path. Only self-contained skills (`edit`, `websearch`) have a CLI that does anything, and only for a human who runs `<venv>/bin/<script>` directly.
+- `rlm` and `tyro` are already present in the kernel venv. Do **not** declare `prime-agent-runtime` as a dependency: it is bundled with Prime Agent, not published on PyPI, so declaring it breaks installs outside the kernel venv.
 
-The agent can then use either form:
+So document only the Python form in `SKILL.md`:
 
 ```python
 await word_count("prime agent", top=3)
 ```
 
-```bash
-!word_count "prime agent" --top 3
-```
-
-Omit `[project.scripts]` when a CLI is not needed.
+Omit `[project.scripts]` unless a human user asked for a manual command.
 
 ## Dependencies and the Kernel Venv
 

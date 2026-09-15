@@ -125,7 +125,7 @@ For a skill named `release-audit`, the model can call:
 report = await release_audit(repository=".", target_version="0.4.0")
 ```
 
-This makes Python-backed skills a superset of instruction-only skills: they can provide guidance, scripts, references, dependencies, typed callables, and optional shell commands. They may also call `rlm(...)` themselves when a capability needs recursive delegation.
+This makes Python-backed skills a superset of instruction-only skills: they can provide guidance, scripts, references, dependencies, and typed callables the model calls from the REPL. A declared console script is a manual convenience inside the kernel venv, not a command the model can reach. They may also call `rlm(...)` themselves when a capability needs recursive delegation.
 
 Only skill metadata is placed in the startup prompt. The agent loads the full `SKILL.md` when the task matches, then inspects and calls the documented Python API. See [Skills](skills.md) for discovery, packaging, and the built-in skill-creation workflow.
 
