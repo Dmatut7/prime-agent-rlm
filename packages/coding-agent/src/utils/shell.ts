@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { delimiter } from "node:path";
+import { delimiter, win32 } from "node:path";
 import { spawn, spawnSync } from "child_process";
 import { getBinDir } from "../config.js";
 import { recordOrphanProcessState } from "../core/orphan-process-journal.js";
@@ -217,14 +217,24 @@ export function killTrackedDetachedChildren(): void {
  */
 export function killProcessTree(pid: number): void {
 	if (process.platform === "win32") {
-		// Use taskkill on Windows to kill process tree
+		// Absolute System32 taskkill, like killOrphanProcess: a bare "taskkill"
+		// name can resolve a planted PATH/CWD binary. Spawn failures surface as
+		// async "error" events, so the listener is mandatory, not optional.
 		try {
-			spawn("taskkill", ["/F", "/T", "/PID", String(pid)], {
-				stdio: "ignore",
-				detached: true,
+			const child = spawn(
+				win32.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe"),
+				["/F", "/T", "/PID", String(pid)],
+				{
+					stdio: "ignore",
+					detached: true,
+					env: { ...process.env, NoDefaultCurrentDirectoryInExePath: "1" },
+				},
+			);
+			child.on("error", () => {
+				// A dead, reused, or unkillable pid must not crash the caller.
 			});
 		} catch {
-			// Ignore errors if taskkill fails
+			// Ignore synchronous spawn failures
 		}
 	} else {
 		// Use SIGKILL on Unix/Linux/Mac

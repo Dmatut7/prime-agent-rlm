@@ -8,6 +8,10 @@ Prime Agent requires a bash shell on Windows. Checked locations (in order):
 
 For most users, [Git for Windows](https://git-scm.com/download/win) is sufficient.
 
+## Known limitations on Windows
+
+Graceful shutdown signals, daemon discovery for `shutdown`, private-file permission hardening, and persistent harness storage are limited on Windows; see [win32 known limits](../../../docs/fork/win32-known-limits.md).
+
 ## Custom Shell Path
 
 ```json
