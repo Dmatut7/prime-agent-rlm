@@ -1,0 +1,4 @@
+- Added an invalidation surface for `!command` credentials: `AuthStorage.reload()` and credential writes now re-run the command instead of serving the value cached at process start, so a rotated websearch `serper` key no longer stays stale in a long-lived daemon.
+- Changed settings loading to report unknown or removed `settings.json` keys with their scope and full path, and to surface those warnings at startup, instead of ignoring the key silently.
+- Changed `PI_HARDWARE_CURSOR` to override `showHardwareCursor` from `settings.json` as documented, and to warn when the two disagree.
+- Added a warning naming the full path when a `models.json` still uses the removed `compat.reasoningEffortMap`, which is ignored rather than migrated.

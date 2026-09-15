@@ -243,7 +243,7 @@ Example for a model where thinking cannot be disabled:
 }
 ```
 
-Migration: older configs that used `compat.reasoningEffortMap` should move that mapping to model-level `thinkingLevelMap`. Use `null` for levels that should not appear in the UI.
+Migration: older configs that used `compat.reasoningEffortMap` should move that mapping to model-level `thinkingLevelMap`. Use `null` for levels that should not appear in the UI. A leftover `compat.reasoningEffortMap` is ignored rather than migrated, and loading such a file reports a warning naming its full path.
 
 ## Overriding Built-in Providers
 
