@@ -38,7 +38,7 @@ Edit directly or use `/settings` for common options.
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `theme` | string | `"dark"` | Theme name (`"dark"`, `"light"`, or custom) |
+| `theme` | string | *(detected)* | Theme name (built-in: `"prime"`, `"dark"`, `"light"`, or custom). When unset, the terminal background is detected: `light` on light terminals, `prime` otherwise |
 | `quietStartup` | boolean | `false` | Hide startup header |
 | `collapseChangelog` | boolean | `false` | Show condensed changelog after updates |
 | `treeFilterMode` | string | `"user-only"` | Default filter for `/tree`: `"default"`, `"no-tools"`, `"user-only"`, `"labeled-only"`, `"all"` |
@@ -326,7 +326,7 @@ old one is reclaimed only after its references drop to zero.
 |---------|------|---------|-------------|
 | `steeringMode` | string | `"one-at-a-time"` | How steering messages are sent: `"all"` or `"one-at-a-time"` |
 | `followUpMode` | string | `"one-at-a-time"` | How follow-up messages are sent: `"all"` or `"one-at-a-time"` |
-| `transport` | string | `"sse"` | Preferred transport for providers that support multiple transports: `"sse"`, `"websocket"`, or `"auto"` |
+| `transport` | string | `"auto"` | Preferred transport for providers that support multiple transports: `"sse"`, `"websocket"`, `"websocket-cached"`, or `"auto"`. For Codex providers any value except `"sse"` (including the default `"auto"`) attempts the WebSocket transport; `"auto"` additionally reuses cached server-side context. Set `"sse"` explicitly to force SSE-only |
 
 ### Agent Messaging
 

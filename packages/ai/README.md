@@ -875,25 +875,32 @@ The `openai-completions` API is implemented by many providers with minor differe
 
 ```typescript
 interface OpenAICompletionsCompat {
-  supportsStore?: boolean;           // Whether provider supports the `store` field (default: true)
-  supportsDeveloperRole?: boolean;   // Whether provider supports `developer` role vs `system` (default: true)
-  supportsReasoningEffort?: boolean; // Whether provider supports `reasoning_effort` (default: true)
+  supportsStore?: boolean;           // Whether provider supports the `store` field (default: auto-detected from provider/URL; false for known non-standard endpoints)
+  supportsDeveloperRole?: boolean;   // Whether provider supports `developer` role vs `system` (default: auto-detected from provider/URL)
+  supportsReasoningEffort?: boolean; // Whether provider supports `reasoning_effort` (default: auto-detected from provider/URL)
   supportsUsageInStreaming?: boolean; // Whether provider supports `stream_options: { include_usage: true }` (default: true)
-  supportsStrictMode?: boolean;      // Whether provider supports `strict` in tool definitions (default: true)
+  supportsStrictMode?: boolean;      // Whether provider supports `strict` in tool definitions (default: auto-detected; false for Moonshot, Cloudflare AI Gateway, and Prime Inference)
+  supportsLongCacheRetention?: boolean; // Whether provider supports long prompt cache retention (`prompt_cache_retention: "24h"` or `cache_control.ttl: "1h"`, default: auto-detected; false for Cloudflare)
   sendSessionAffinityHeaders?: boolean; // Whether to send `session_id`, `x-client-request-id`, and `x-session-affinity` from `sessionId` when caching is enabled (default: false)
-  maxTokensField?: 'max_completion_tokens' | 'max_tokens';  // Which field name to use (default: max_completion_tokens)
+  maxTokensField?: 'max_completion_tokens' | 'max_tokens';  // Which field name to use (default: auto-detected from provider/URL)
   requiresToolResultName?: boolean;  // Whether tool results require the `name` field (default: false)
-  requiresAssistantAfterToolResult?: boolean; // Whether tool results must be followed by an assistant message (default: false)
+  requiresAssistantAfterToolResult?: boolean; // Whether a user message after tool results requires an assistant message in between (default: false)
   requiresThinkingAsText?: boolean;  // Whether thinking blocks must be converted to text (default: false)
   requiresReasoningContentOnAssistantMessages?: boolean; // Whether all replayed assistant messages must include empty reasoning_content when reasoning is enabled (default: auto-detected for DeepSeek)
-  thinkingFormat?: 'openai' | 'deepseek' | 'zai' | 'qwen' | 'qwen-chat-template'; // Format for reasoning param: 'openai' uses reasoning_effort, 'deepseek' uses thinking: { type } plus reasoning_effort, 'zai' uses enable_thinking, 'qwen' uses enable_thinking, 'qwen-chat-template' uses chat_template_kwargs.enable_thinking (default: openai)
+  thinkingFormat?: 'openai' | 'openrouter' | 'deepseek' | 'zai' | 'qwen' | 'qwen-chat-template'; // Format for reasoning param: 'openai' uses reasoning_effort, 'openrouter' uses reasoning: { effort }, 'deepseek' uses thinking: { type } plus reasoning_effort, 'zai' and 'qwen' use enable_thinking, 'qwen-chat-template' uses chat_template_kwargs.enable_thinking (default: auto-detected, 'openai' otherwise)
+  preserveThinking?: boolean;        // Whether to send `preserve_thinking: true` so the provider feeds prior reasoning_content back into the input (Bailian/DashScope Qwen3.7+; default: false)
+  enableSearch?: boolean;            // Whether to send `enable_search: true` so the provider runs its built-in web search (Bailian/DashScope; default: false)
+  searchStrategy?: 'turbo' | 'max';  // Bailian web search strategy: 'turbo' (faster) or 'max' (multi-source) (default: provider default)
+  forcedSearch?: boolean;            // Whether Bailian web search must run on every request instead of letting the model decide (default: false)
+  zaiToolStream?: boolean;           // Whether z.ai supports top-level `tool_stream: true` for streaming tool call deltas (default: false)
   cacheControlFormat?: 'anthropic';  // Anthropic-style cache_control on system prompt, last tool, and last user/assistant text content
-  openRouterRouting?: OpenRouterRouting; // OpenRouter routing preferences (default: {})
+  openRouterRouting?: OpenRouterRouting; // OpenRouter routing preferences (only used when baseUrl points to OpenRouter)
   vercelGatewayRouting?: VercelGatewayRouting; // Vercel AI Gateway routing preferences (default: {})
 }
 
 interface OpenAIResponsesCompat {
-  // Reserved for future use
+  sendSessionIdHeader?: boolean;     // Whether to send the OpenAI `session_id` cache-affinity header from `sessionId` when caching is enabled (default: true)
+  supportsLongCacheRetention?: boolean; // Whether the provider supports `prompt_cache_retention: "24h"` (default: true)
 }
 ```
 

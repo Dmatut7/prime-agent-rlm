@@ -104,6 +104,10 @@ Modifier combinations: `ctrl+shift+x`, `alt+ctrl+x`, `ctrl+shift+alt+x`, `ctrl+1
 | `app.editor.external` | `ctrl+g` | Open in external editor (`$VISUAL` or `$EDITOR`) |
 | `app.clipboard.pasteImage` | `ctrl+v` (`alt+v` on Windows) | Paste image from clipboard |
 | `app.clipboard.copyLoginUrl` | `c`, `alt+c` | Copy the sign-in URL from a login dialog |
+| `app.shortcuts` | `?` | Show keyboard shortcuts |
+| `app.prompt.stash` | `ctrl+s` | Stash or restore draft prompt |
+| `app.modal.back` | `left` | Go back / close the current dialog |
+| `app.subagents.focus` | `alt+a` | Open child agents |
 
 ### Sessions
 
@@ -113,6 +117,27 @@ Modifier combinations: `ctrl+shift+x`, `alt+ctrl+x`, `ctrl+shift+alt+x`, `ctrl+1
 | `app.session.tree` | *(none)* | Open session tree navigator (`/tree`) |
 | `app.session.fork` | *(none)* | Fork current session (`/fork`) |
 | `app.session.resume` | *(none)* | Open session resume picker (`/resume`) |
+
+### Agents View
+
+Used inside the agents view (opened by `/resume` or `app.session.resume`). The shortcuts apply while the search field is empty; typing searches.
+
+| Keybinding id | Default | Description |
+|--------|---------|-------------|
+| `app.agents.back` | `left` | Return to parent agent scope |
+| `app.agents.open` | `right` | Drill into selected agent |
+| `app.agents.reply` | `space` | Reply to selected agent, or resume it when inactive |
+| `app.agents.new` | `ctrl+n` | Start a new session from the agents view |
+| `app.agents.delete` | `ctrl+x` | Stop or delete selected agent (press again to confirm) |
+| `app.agents.program` | `ctrl+o` | Show the program that spawned subagents |
+| `app.agents.rename` | `ctrl+r` | Rename selected agent session |
+
+### Heartbeats
+
+| Keybinding id | Default | Description |
+|--------|---------|-------------|
+| `app.heartbeats.open` | `ctrl+r` | Manage heartbeats |
+| `app.heartbeats.openSelected` | `right` | Open selected heartbeat |
 
 ### Models and Thinking
 

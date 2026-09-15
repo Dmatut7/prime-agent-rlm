@@ -48,9 +48,19 @@ Disable discovery with `--no-skills` (explicit `--skill` paths still load).
 
 Prime Agent ships with built-in skills that load by default:
 
+- `agent-message` - message an agent's parent, siblings, or direct children through the daemon.
+- `agent-observe` - read-only observation of family agents (status, bounded recent messages).
+- `attach-image` - load an on-disk image into the model's context as a viewable attachment (requires a vision-capable model).
+- `compact` - check context usage and compact the conversation from the Python REPL.
+- `edit` - replace an exact, unique string in an existing file from the Python kernel.
+- `goal` - manage the persistent thread goal (status, budget usage, completion) from the Python REPL.
+- `linear` - read and write Linear issues, projects, and cycles via Linear's MCP server; loaded only while the Linear integration is authenticated.
+- `notion` - search and read/write Notion pages and databases via Notion's MCP server; loaded only while the Notion integration is authenticated.
 - `prime-intellect` - Prime Intellect products and workflows via the prime CLI: verifiers environments and the Environments Hub, evaluations (local and hosted), Hosted Training and prime-rl, sandboxes, tunnels, Prime Inference, GPU compute, and storage. Reference docs for each area load on demand from the skill's `references/` directory.
+- `refine` - trigger continual harness refinement (memories, skills, subagent specs, prompt notes) from the Python REPL.
+- `rlm-heartbeat` - manage agent-owned RLM heartbeats from the Python REPL.
 - `skill-creator` - teaches the agent to create new skills: markdown skill layout, frontmatter rules, placement and precedence, and the full Python-backed skill contract (package layout, `run()` convention, optional CLI, kernel venv behavior) with a working template in `references/python-skills.md`.
-- `websearch` - a Python-backed Google search skill using the [Serper](https://serper.dev) API.
+- `websearch` - a Python-backed Google search skill using the [Serper](https://serper.dev) API; can be turned off via the `bundledSkills.websearch` setting.
 
 Built-in skills behave like any other skill but have the lowest precedence: a user, project, package, or `--skill` skill with the same name overrides the built-in one.
 
@@ -165,7 +175,7 @@ await web_search.run("prime agent skills")
 help(web_search)
 ```
 
-Python skills are installed editable into the kernel venv during kernel setup. By default this is `~/.prime/agent/kernel-venv`; set `PRIME_AGENT_KERNEL_VENV` to override it. If `pyproject.toml` changes, Prime Agent rebuilds the kernel venv so dependency changes are picked up.
+Python skills are installed editable into the kernel venv during kernel setup. The venv lives in a per-build generation directory under `~/.prime/agent/` named `kernel-venv-<hash>` (the hash derives from the build identity: runtime source, bootstrap schema, snapshot requirement, and default packages); the unsuffixed `kernel-venv` name only holds the bootstrap lock and is never a venv itself. Set `PRIME_AGENT_KERNEL_VENV` to override the base location. Changing a skill's `pyproject.toml` does not rebuild the venv: Python skill content is reconciled by fingerprint inside the existing generation, and only a changed build identity produces a new generation directory.
 
 If you set `PRIME_AGENT_KERNEL_PYTHON`, Prime Agent does not install packages into that environment. The Python must already have a current `prime-agent-runtime` and the default runtime packages installed. Missing Python skill imports are disabled with a warning and calling the skill raises a `RuntimeError`.
 
@@ -240,7 +250,7 @@ Skills register as `/skill:name` commands:
 /skill:pdf-tools extract      # Load skill with arguments
 ```
 
-Arguments after the command are appended to the skill content as `User: <args>`.
+Arguments after the command are appended after the skill content, separated by a blank line (no `User:` prefix is added).
 
 Toggle skill commands via `/settings` in interactive mode or in `settings.json`:
 

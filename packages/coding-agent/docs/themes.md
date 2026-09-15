@@ -18,7 +18,7 @@ Themes are JSON files that define colors for the TUI.
 
 Prime Agent loads themes from:
 
-- Built-in: `dark`, `light`
+- Built-in: `prime`, `dark`, `light`
 - Global: `~/.prime/agent/themes/*.json`
 - Project: `.prime/agent/themes/*.json`
 - Packages: `themes/` directories or `pi.themes` entries in `package.json`
@@ -37,7 +37,7 @@ Select a theme via `/settings` or in `settings.json`:
 }
 ```
 
-On first run, Prime Agent detects your terminal background and defaults to `dark` or `light`.
+On first run, Prime Agent detects your terminal background and defaults to `light` on light terminals and `prime` otherwise.
 
 ## Creating a Custom Theme
 
@@ -140,13 +140,13 @@ vim ~/.prime/agent/themes/my-theme.json
 
 - `name` is required and must be unique.
 - `vars` is optional. Define reusable colors here, then reference them in `colors`.
-- `colors` must define all 51 required tokens.
+- `colors` must define all 55 required tokens.
 
 The `$schema` field enables editor auto-completion and validation.
 
 ## Color Tokens
 
-Every theme must define all 51 color tokens. There are no optional colors.
+Every theme must define all 55 color tokens. There are no optional colors.
 
 ### Core UI (11 colors)
 
@@ -196,13 +196,16 @@ Every theme must define all 51 color tokens. There are no optional colors.
 | `mdHr` | Horizontal rule |
 | `mdListBullet` | List bullets |
 
-### Tool Diffs (3 colors)
+### Tool Diffs (6 colors)
 
 | Token | Purpose |
 |-------|---------|
 | `toolDiffAdded` | Added lines |
 | `toolDiffRemoved` | Removed lines |
 | `toolDiffContext` | Context lines |
+| `toolDiffAddedBg` | Added-line background block |
+| `toolDiffRemovedBg` | Removed-line background block |
+| `toolDiffText` | Diff line content on colored add/remove blocks |
 
 ### Syntax Highlighting (9 colors)
 
@@ -293,5 +296,6 @@ echo $COLORTERM  # Should output "truecolor" or "24bit"
 ## Examples
 
 See the built-in themes:
+- [prime.json](../src/modes/interactive/theme/prime.json)
 - [dark.json](../src/modes/interactive/theme/dark.json)
 - [light.json](../src/modes/interactive/theme/light.json)
