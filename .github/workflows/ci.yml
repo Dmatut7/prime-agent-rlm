@@ -135,9 +135,19 @@ jobs:
             install_uv: false
           - name: tui
             package: packages/tui
-            command: npm test --
-            # `node --test`, not vitest: no JSON report, and its run reports `# skipped 0` itself.
+            # `node --test`, not vitest: no vitest JSON report, so this row feeds its junit XML
+            # (see the node --test steps below) to scripts/check-node-test-coverage.mjs instead.
+            # The reporters are part of the command because node parses `--test-reporter` only
+            # *before* the file list: appended after `npm test --`, the flags are silently
+            # ignored and no report is written. A `# skipped 0` summary line only says what the
+            # runner counted; the floors below are what pin the faces that actually ran.
+            command: node --test --import tsx --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination=coverage/ci-tui.xml test/*.test.ts
             report: ""
+            node_test_report: coverage/ci-tui.xml
+            # 831 tests / 831 ran / 0 all-skipped suites on a full local run; floors at 90%.
+            min_tests: 748
+            min_ran_tests: 748
+            max_nothing_suites: 0
             install_uv: false
           - name: coding-agent 1/3
             package: packages/coding-agent
@@ -291,10 +301,12 @@ jobs:
           echo "PRIME_AGENT_KERNEL_PYTHON=$kernel_python" >> "$GITHUB_ENV"
 
       # The default reporter keeps the human summary; the JSON report is what the coverage gate
-      # reads. Jobs without a `report` (tui's `node --test`, the runtime's unittest suite, and the
-      # kernel job, whose command writes its report and gates it itself) run their command as-is.
+      # reads. Jobs without a `report` (the runtime's unittest suite, and the kernel job, whose
+      # command writes its report and gates it itself) run their command as-is. The tui job
+      # also runs as-is in this step shape: `node --test` takes the junit reporter and its
+      # destination as its own flags, in the steps right after.
       - name: Test
-        if: matrix.report == ''
+        if: matrix.report == '' && matrix.node_test_report == ''
         working-directory: ${{ matrix.package }}
         run: ${{ matrix.command }}
 
@@ -302,6 +314,28 @@ jobs:
         if: matrix.report != ''
         working-directory: ${{ matrix.package }}
         run: ${{ matrix.command }} --reporter=default --reporter=json --outputFile.json=${{ matrix.report }}
+
+      # `node --test` writes no vitest JSON report, so the tui job's command carries its junit
+      # reporter (the flags must precede the file list) and this step only makes sure the
+      # destination directory exists: node does not create it.
+      - name: Test (node --test with a junit report)
+        if: matrix.node_test_report != ''
+        working-directory: ${{ matrix.package }}
+        run: |
+          mkdir -p coverage
+          ${{ matrix.command }}
+
+      # Fails the job when a suite ran nothing beyond its budget, when a test file failed
+      # before its tests ran, when the report fell below its floor, or when this parser and
+      # the runner's own summary disagree - the same shapes the vitest gate above catches.
+      - name: node --test coverage gate
+        if: matrix.node_test_report != ''
+        working-directory: ${{ matrix.package }}
+        run: >-
+          node ../../scripts/check-node-test-coverage.mjs ${{ matrix.node_test_report }}
+          --min-tests ${{ matrix.min_tests }}
+          --min-ran-tests ${{ matrix.min_ran_tests }}
+          --max-nothing-suites ${{ matrix.max_nothing_suites }}
 
       # Fails the job when a file ran nothing beyond its budget, when a file collected nothing, or
       # when the report fell below its floor, and names the files: a job that quietly stopped
@@ -354,6 +388,12 @@ jobs:
       # floors must turn it red, and the budget must be honoured.
       - name: Coverage gate self-test (planted all-skipped reports must turn the gate red)
         run: node scripts/check-vitest-coverage.mjs --self-test
+
+      # The node --test gate is what covers the tui job (no vitest report there), so its planted
+      # red controls run on every CI run too: all-skipped suites, a collapsed total, a file that
+      # failed to load and a drifting summary must each turn it red.
+      - name: node --test coverage gate self-test (planted all-skipped suites must turn the gate red)
+        run: node scripts/check-node-test-coverage.mjs --self-test
 
       # Offline only, and no npm pin here on purpose: this job installs nothing, and the
       # release-cooldown gate's self-test needs neither npm nor the network. It proves the gate
