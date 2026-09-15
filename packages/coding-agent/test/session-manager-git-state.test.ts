@@ -139,6 +139,75 @@ describe("SessionManager git state", () => {
 		expect(entries.find((e) => e.id === "m2")?.parentId).toBe("m1");
 	});
 
+	it("re-links the leaf marker when forking drops its git_state target", () => {
+		const sourcePath = join(sessionDir, "source.jsonl");
+		writeFileSync(
+			sourcePath,
+			`${[
+				JSON.stringify({
+					type: "session",
+					version: 3,
+					id: "src",
+					timestamp: "t",
+					cwd: "/old",
+					git: { repoUrl: "https://github.com/acme/source.git", commit: "sourcesha", branch: "main" },
+				}),
+				JSON.stringify({
+					type: "message",
+					id: "m1",
+					parentId: null,
+					timestamp: "t",
+					message: { role: "user", content: "hi", timestamp: 1 },
+				}),
+				JSON.stringify({
+					type: "git_state",
+					id: "g1",
+					parentId: "m1",
+					timestamp: "t",
+					git: { repoUrl: "https://github.com/acme/source.git", commit: "sourcesha", branch: "main" },
+				}),
+				JSON.stringify({
+					type: "message",
+					id: "m2",
+					parentId: "g1",
+					timestamp: "t",
+					message: { role: "user", content: "on the dropped git_state", timestamp: 2 },
+				}),
+				JSON.stringify({
+					type: "message",
+					id: "m3",
+					parentId: "m2",
+					timestamp: "t",
+					message: { role: "user", content: "branch tip", timestamp: 3 },
+				}),
+				// Leaf rolled back onto the git_state entry: the marker is the last
+				// physical line, its target predates entries that follow the git_state.
+				JSON.stringify({
+					type: "leaf_position",
+					id: "p1",
+					parentId: "g1",
+					timestamp: "t",
+					targetId: "g1",
+				}),
+			].join("\n")}\n`,
+			"utf8",
+		);
+
+		const forked = SessionManager.forkFrom(sourcePath, repoDir, sessionDir);
+
+		// The marker must point at an entry the fork actually contains: parentId
+		// was re-linked but targetId must follow the same remapping, or the fork
+		// carries a self-contradictory marker (parentId !== targetId, dangling
+		// targetId) and _buildIndex falls back to the last-line rule.
+		const marker = forked.getEntries().find((e) => e.type === "leaf_position");
+		expect(marker?.targetId).toBe("m1");
+		expect(marker?.parentId).toBe("m1");
+		expect(forked.getEntries().some((e) => e.id === marker?.targetId)).toBe(true);
+		// Resume position does not drift: the fork resolves the leaf to the
+		// re-linked rollback point (m1), not to the abandoned branch tip (m3).
+		expect(forked.getLeafEntry()?.id).toBe("m1");
+	});
+
 	it("keeps git_state entries out of the LLM context", () => {
 		const sm = SessionManager.create(repoDir, sessionDir);
 		commit(repoDir, "second");
