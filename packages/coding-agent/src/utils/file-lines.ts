@@ -8,6 +8,7 @@ import {
 	lstatSync,
 	openSync,
 	readSync,
+	statSync,
 } from "node:fs";
 
 export function readFirstLineSync(filePath: string, maxBytes = 64 * 1024): string | undefined {
@@ -108,6 +109,35 @@ export async function* readFileLines(filePath: string, startOffset = 0): AsyncGe
 		// chunk's own end. Callers must not resume from it (a later append may
 		// still extend the line), but it does say how far this read got.
 		yield { line, endOffset: chunkStartOffset, terminated: false };
+	}
+}
+
+/**
+ * Whether the file's last byte is a newline, i.e. whether every line in it is
+ * terminated. An empty or unreadable file counts as terminated: it has no line to
+ * leave hanging.
+ */
+export function endsWithNewlineSync(filePath: string): boolean {
+	let size: number;
+	try {
+		size = statSync(filePath).size;
+	} catch {
+		return true;
+	}
+	if (size === 0) return true;
+	let fd: number;
+	try {
+		fd = openSync(filePath, "r");
+	} catch {
+		return true;
+	}
+	try {
+		const lastByte = Buffer.allocUnsafe(1);
+		return readSync(fd, lastByte, 0, 1, size - 1) === 1 && lastByte[0] === 0x0a;
+	} catch {
+		return true;
+	} finally {
+		closeSync(fd);
 	}
 }
 

@@ -58,6 +58,22 @@ export function formatSize(bytes: number): string {
 }
 
 /**
+ * Split output into its lines plus its terminator.
+ *
+ * A trailing newline ends the last line; it does not begin another one. Splitting
+ * without saying so made every newline-terminated output read as one line longer
+ * than it is - and at exactly the line limit, turned "nothing was cut" into a
+ * reported truncation whose only casualty was the terminator byte. The terminator
+ * comes back separately so kept output can still end the way the input did.
+ */
+function splitOutputLines(content: string): { lines: string[]; terminator: string } {
+	if (content.length === 0) return { lines: [], terminator: "" };
+	const endsWithNewline = content.endsWith("\n");
+	const body = endsWithNewline ? content.slice(0, -1) : content;
+	return { lines: body.split("\n"), terminator: endsWithNewline ? "\n" : "" };
+}
+
+/**
  * Truncate content from the head (keep first N lines/bytes).
  * Suitable for file reads where you want to see the beginning.
  *
@@ -69,7 +85,7 @@ export function truncateHead(content: string, options: TruncationOptions = {}): 
 	const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
 
 	const totalBytes = Buffer.byteLength(content, "utf-8");
-	const lines = content.split("\n");
+	const { lines, terminator } = splitOutputLines(content);
 	const totalLines = lines.length;
 
 	if (totalLines <= maxLines && totalBytes <= maxBytes) {
@@ -88,7 +104,7 @@ export function truncateHead(content: string, options: TruncationOptions = {}): 
 		};
 	}
 
-	const firstLineBytes = Buffer.byteLength(lines[0], "utf-8");
+	const firstLineBytes = Buffer.byteLength(lines[0] ?? "", "utf-8");
 	if (firstLineBytes > maxBytes) {
 		return {
 			content: "",
@@ -122,11 +138,18 @@ export function truncateHead(content: string, options: TruncationOptions = {}): 
 		outputBytesCount += lineBytes;
 	}
 
-	if (outputLinesArr.length >= maxLines && outputBytesCount <= maxBytes) {
+	// The input's terminator is only kept when the head reached the last line, and
+	// only while it still fits inside the byte budget - the limit is a limit.
+	const keepTerminator =
+		terminator !== "" && outputLinesArr.length === lines.length && outputBytesCount + 1 <= maxBytes;
+	if (keepTerminator) outputBytesCount += 1;
+	// Only a window that stopped at the line limit was cut by lines; a window that
+	// reached the end of the content was stopped by bytes.
+	if (outputLinesArr.length >= maxLines && outputLinesArr.length < lines.length && outputBytesCount <= maxBytes) {
 		truncatedBy = "lines";
 	}
 
-	const outputContent = outputLinesArr.join("\n");
+	const outputContent = outputLinesArr.join("\n") + (keepTerminator ? terminator : "");
 	const finalOutputBytes = Buffer.byteLength(outputContent, "utf-8");
 
 	return {
@@ -155,7 +178,7 @@ export function truncateTail(content: string, options: TruncationOptions = {}): 
 	const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
 
 	const totalBytes = Buffer.byteLength(content, "utf-8");
-	const lines = content.split("\n");
+	const { lines, terminator } = splitOutputLines(content);
 	const totalLines = lines.length;
 
 	if (totalLines <= maxLines && totalBytes <= maxBytes) {
@@ -178,15 +201,19 @@ export function truncateTail(content: string, options: TruncationOptions = {}): 
 	let outputBytesCount = 0;
 	let truncatedBy: "lines" | "bytes" = "lines";
 	let lastLinePartial = false;
-	// Whether a line with content has been kept yet. The trailing newline of the output splits
-	// into a final empty element, and that element is kept first while walking backwards - so a
-	// length check on `outputLinesArr` would say "we already kept a line" and skip the partial
-	// tail of the oversized line it terminates, handing the caller an empty string.
+	// Whether a line with content has been kept yet: the first line kept is charged no
+	// separator, and the partial tail of an oversized line must still be taken. Before
+	// the terminator stopped counting as a line, that first kept element was the empty
+	// string the trailing newline split off, so a length check on `outputLinesArr`
+	// answered "we already kept a line" and the caller was handed an empty string.
 	let keptContentLine = false;
 
 	for (let i = lines.length - 1; i >= 0 && outputLinesArr.length < maxLines; i--) {
 		const line = lines[i];
-		const lineBytes = Buffer.byteLength(line, "utf-8") + (outputLinesArr.length > 0 ? 1 : 0); // +1 for newline
+		// +1 for the newline that ends the line: its own terminator when it is the last
+		// line of the output, otherwise the separator before the line after it. Without
+		// this the kept tail is one byte over the budget it just certified.
+		const lineBytes = Buffer.byteLength(line, "utf-8") + (outputLinesArr.length > 0 || terminator !== "" ? 1 : 0);
 
 		if (outputBytesCount + lineBytes > maxBytes) {
 			truncatedBy = "bytes";
@@ -207,11 +234,14 @@ export function truncateTail(content: string, options: TruncationOptions = {}): 
 		if (line.length > 0) keptContentLine = true;
 	}
 
+	// The tail always walks back from the end, so whatever was kept ends where the
+	// input did and keeps the input's terminator - the byte charged for it is the one
+	// the first kept line no longer pays.
 	if (outputLinesArr.length >= maxLines && outputBytesCount <= maxBytes) {
 		truncatedBy = "lines";
 	}
 
-	const outputContent = outputLinesArr.join("\n");
+	const outputContent = outputLinesArr.join("\n") + (terminator !== "" && outputLinesArr.length > 0 ? terminator : "");
 	const finalOutputBytes = Buffer.byteLength(outputContent, "utf-8");
 
 	return {
