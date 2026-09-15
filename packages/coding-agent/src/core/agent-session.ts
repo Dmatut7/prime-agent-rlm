@@ -601,6 +601,12 @@ export interface AgentSessionConfig {
 	sessionStartEvent?: SessionStartEvent;
 	rlmDepth?: number;
 	rlmMaxDepth?: number;
+	/**
+	 * Cap on simultaneously live children this session admits; 0 disables the cap.
+	 * Falls back to RLM_MAX_DEPTH-style resolution through RLM_MAX_CHILDREN, then to
+	 * DEFAULT_RLM_MAX_CONCURRENT_CHILDREN.
+	 */
+	rlmMaxChildren?: number;
 	rlmSessionDir?: string;
 	rlmParentNodeId?: string;
 	rlmParentAgent?: string;
@@ -1239,6 +1245,14 @@ const FAILURE_WAKE_REASON_MAX_CHARS = 200;
 const UNDELIVERED_RLM_NOTICES_FILE = "undelivered-rlm-notices.jsonl";
 /** Bound on sidecar rows so a family failing in a loop cannot grow the file forever. */
 const UNDELIVERED_RLM_NOTICES_MAX_ROWS = 200;
+/**
+ * Live children one session may hold at once before admission refuses (SC-1). Depth alone
+ * does not bound anything: a single session could fan out without limit, and every admitted
+ * run is another kernel, another session file, and another entry in an unbounded map.
+ * Overridable per session (`rlmMaxChildren`) or per process (`RLM_MAX_CHILDREN`); 0 disables
+ * the cap, which is the only way back to the old unbounded behavior.
+ */
+const DEFAULT_RLM_MAX_CONCURRENT_CHILDREN = 8;
 
 interface UndeliveredRlmNoticeRow {
 	key: string;
@@ -1301,6 +1315,20 @@ function parseDepth(value: string | undefined, fallback: number, name: string): 
 		throw new Error(`${name} must be a non-negative integer`);
 	}
 	return parsed;
+}
+
+/**
+ * The cap on simultaneously live children this session admits (SC-1). Explicit config wins,
+ * then `RLM_MAX_CHILDREN`, then the default bound; 0 means "no cap".
+ */
+function resolveRlmMaxConcurrentChildren(configured: number | undefined): number {
+	if (configured !== undefined) {
+		if (!isNonNegativeInteger(configured)) {
+			throw new Error("rlmMaxChildren must be a non-negative integer (0 disables the cap)");
+		}
+		return configured;
+	}
+	return parseDepth(process.env.RLM_MAX_CHILDREN, DEFAULT_RLM_MAX_CONCURRENT_CHILDREN, "RLM_MAX_CHILDREN");
 }
 
 function isPersistedRlmMaxDepthState(value: unknown): value is PersistedRlmMaxDepthState {
@@ -1544,6 +1572,16 @@ export class AgentSession {
 	private readonly _configuredRlmMaxDepth: number | undefined;
 	private _rlmMaxDepth: number;
 	private _rlmMaxDepthSource: RlmMaxDepthSource;
+	/** Cap on simultaneously live children; 0 disables it (SC-1). */
+	private readonly _rlmMaxConcurrentChildren: number;
+	/**
+	 * Ceiling an ancestor imposed on this session *after* it was admitted (SC-2). A child
+	 * snapshots its parent's cap at spawn; a later reduction on the ancestor would otherwise
+	 * leave the in-flight subtree spawning at the old, wider cap. This is that live push, and
+	 * it is deliberately tracked (not ratcheted): an ancestor that widens its cap again pushes
+	 * the wider value, so a subtree can never get stuck behind an invisible limit.
+	 */
+	private _rlmMaxDepthCeiling: number | undefined;
 	private _rlmSessionDir?: string;
 	private readonly _semanticEdges: SemanticEdgeRecorder;
 	private _rlmParentNodeId?: string;
@@ -1717,6 +1755,7 @@ export class AgentSession {
 		const resolvedRlmMaxDepth = this._resolveRlmMaxDepth();
 		this._rlmMaxDepth = resolvedRlmMaxDepth.maxDepth;
 		this._rlmMaxDepthSource = resolvedRlmMaxDepth.source;
+		this._rlmMaxConcurrentChildren = resolveRlmMaxConcurrentChildren(config.rlmMaxChildren);
 		this._prewarmIpythonKernel = (config.prewarmIpythonKernel ?? false) && this._rlmDepth === 0;
 		this._autoRefineReviewer = config.autoRefineReviewer;
 		this._serializedRefine = config.serializedRefine ?? false;
@@ -2195,6 +2234,73 @@ export class AgentSession {
 		return true;
 	}
 
+	/**
+	 * The cap this session may actually spawn under: its own resolved depth, tightened by any
+	 * ceiling an ancestor pushed after admission (SC-2).
+	 */
+	private _effectiveRlmMaxDepth(): number {
+		return this._rlmMaxDepthCeiling === undefined
+			? this._rlmMaxDepth
+			: Math.min(this._rlmMaxDepth, this._rlmMaxDepthCeiling);
+	}
+
+	/**
+	 * Apply an ancestor's live cap. Deliberately tracked rather than ratcheted: a widening push
+	 * must lift the ceiling again, or a subtree would stay confined by a limit nobody can see.
+	 * Nothing is rebuilt when the effective cap is unchanged, so idempotent pushes stay cheap.
+	 */
+	private _applyRlmMaxDepthCeiling(maxDepth: number): void {
+		const previousEffective = this._effectiveRlmMaxDepth();
+		this._rlmMaxDepthCeiling = maxDepth;
+		if (this._effectiveRlmMaxDepth() === previousEffective) return;
+		const oldBase = this._baseSystemPrompt;
+		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
+		this.agent.state.systemPrompt = this._refreshExtensionSystemPrompt(this.agent.state.systemPrompt, oldBase);
+		this._pushRlmMaxDepthToChildren();
+	}
+
+	/** Admitted children that have not settled yet - the population SC-1 bounds. */
+	private _liveRlmChildRunCount(): number {
+		const live = new Set<RlmChildRun>();
+		for (const run of this._unsettledRlmChildRuns) {
+			if (!run.settled) live.add(run);
+		}
+		for (const run of this._activeRlmChildRuns.values()) {
+			if (!run.settled) live.add(run);
+		}
+		return live.size;
+	}
+
+	/** Child sessions of this session that can still receive a push (retained or in flight). */
+	private _rlmChildSessionsForCapPush(): AgentSession[] {
+		const sessions: AgentSession[] = [];
+		const seen = new Set<AgentSession>();
+		const add = (session: AgentSession | undefined) => {
+			if (!session || seen.has(session)) return;
+			seen.add(session);
+			sessions.push(session);
+		};
+		for (const retained of this._rlmChildSessions.values()) add(retained.session);
+		for (const run of this._activeRlmChildRuns.values()) {
+			add(run.session ?? this._rlmChildSessions.get(run.id)?.session);
+		}
+		return sessions;
+	}
+
+	/**
+	 * Push this session's effective cap onto every child it still holds; each child forwards
+	 * its own effective cap onward, so one reduction on an ancestor reaches the whole subtree
+	 * it already dispatched (SC-2). A run admitted but not yet published is covered by the
+	 * grant comparison at publication instead.
+	 */
+	private _pushRlmMaxDepthToChildren(): void {
+		const cap = this._effectiveRlmMaxDepth();
+		for (const child of this._rlmChildSessionsForCapPush()) {
+			if (!(child instanceof AgentSession)) continue;
+			child._applyRlmMaxDepthCeiling(cap);
+		}
+	}
+
 	private _reloadGoalStateFromBranch(): void {
 		this._goalState = this._loadPersistedGoalState();
 		this._goalAccountingStartedAt = this._goalState.status === "active" ? Date.now() : undefined;
@@ -2210,6 +2316,9 @@ export class AgentSession {
 			this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
 			this.agent.state.systemPrompt = this._baseSystemPrompt;
 		}
+		// The reloaded cap is this session's current policy; children still in flight must spawn
+		// under it (SC-2).
+		this._pushRlmMaxDepthToChildren();
 	}
 
 	private _persistGoalState(goal: GoalState): void {
@@ -5594,7 +5703,7 @@ export class AgentSession {
 			selectedTools: validToolNames,
 			toolSnippets,
 			promptGuidelines,
-			allowRecursion: this._rlmDepth < this._rlmMaxDepth,
+			allowRecursion: this._rlmDepth < this._effectiveRlmMaxDepth(),
 			rlmDepth: this._rlmDepth,
 			rlmParentAgent: this._rlmParentAgent,
 			harnessState: this._loadMergedHarnessState(),
@@ -11910,7 +12019,9 @@ export class AgentSession {
 		// the TypeScript-side spawn check remains authoritative.
 		const env: Record<string, string> = {
 			RLM_DEPTH: String(this._rlmDepth),
-			RLM_MAX_DEPTH: String(this._rlmMaxDepth),
+			// The effective cap, not this session's own value: a kernel told it may recurse when
+			// an ancestor has already lowered the subtree cap only finds out by being refused.
+			RLM_MAX_DEPTH: String(this._effectiveRlmMaxDepth()),
 			RLM_GLOBAL_HARNESS_STATE_DIR: getGlobalHarnessStateDir(),
 		};
 		const rlmSessionDir = this._ensureRlmSessionDir();
@@ -11984,6 +12095,38 @@ export class AgentSession {
 		throw new Error("Unable to create unique RLM child session directory");
 	}
 
+	/**
+	 * Admit the child's session directory only around the checks that can still refuse the
+	 * spawn (SC-3). The directory has to exist first because the default session name embeds
+	 * its unique basename, so a refusal after creation must remove it again: a refused spawn
+	 * that leaves `sub-xxxxxxxx` behind is a disk leak with no owner.
+	 */
+	private async _admitChildRlmSessionDir(
+		requestedSessionName: string | undefined,
+		prompt: string,
+		signal: AbortSignal | undefined,
+	): Promise<{ childSessionDir: string; childNodeId: string; sessionName: string }> {
+		const childSessionDir = this._createChildRlmSessionDir();
+		try {
+			const childNodeId = basename(childSessionDir);
+			const sessionName = requestedSessionName ?? createDefaultRlmSubagentSessionName(prompt, childNodeId);
+			if (!requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(sessionName);
+			signal?.throwIfAborted();
+			return { childSessionDir, childNodeId, sessionName };
+		} catch (error) {
+			try {
+				rmSync(childSessionDir, { recursive: true, force: true });
+			} catch (cleanupError) {
+				sessionLog.warn("failed to remove the session directory of a refused subagent spawn", {
+					sessionId: this.sessionId,
+					sessionDir: childSessionDir,
+					error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+				});
+			}
+			throw error;
+		}
+	}
+
 	private _createEphemeralRlmSessionDir(): string {
 		this._rlmSessionDir = mkdtempSync(join(tmpdir(), "prime-agent-rlm-"));
 		return this._rlmSessionDir;
@@ -12043,7 +12186,9 @@ export class AgentSession {
 			includeGoals: this._includeGoals,
 			includeCompactSkill: this._includeCompactSkill,
 			rlmDepth: this._rlmDepth + 1,
-			rlmMaxDepth: this._rlmMaxDepth,
+			// Re-read the cap in force *now*: the child is granted what this session currently
+			// may spawn under, ceiling included, not the value it resolved for itself (SC-2).
+			rlmMaxDepth: this._effectiveRlmMaxDepth(),
 			rlmParentNodeId: options.id,
 			spawnedByRequestId: options.spawnedByRequestId,
 		};
@@ -13534,10 +13679,32 @@ export class AgentSession {
 		const requestedModel = normalizeRequestedRlmSubagentModel(rawModel);
 		const requestedThinkingLevel = normalizeRequestedRlmSubagentThinkingLevel(rawThinking);
 		if (requestedSessionName) assertDirectAgentMessageTarget(requestedSessionName);
-		if (this._rlmDepth >= this._rlmMaxDepth) {
+		// The gate reads the *effective* cap, not the value this session resolved for itself:
+		// an ancestor that lowered its max depth after this session was admitted pushes a
+		// ceiling, and a spawn under that ceiling must be refused now (SC-2).
+		const grantedMaxDepth = this._effectiveRlmMaxDepth();
+		if (this._rlmDepth >= grantedMaxDepth) {
+			const ceilingNote =
+				grantedMaxDepth < this._rlmMaxDepth
+					? `; an ancestor session lowered this subtree's cap to ${grantedMaxDepth} after this session was admitted`
+					: "";
 			throw new Error(
-				`RLM recursion depth limit reached (RLM_DEPTH=${this._rlmDepth}, RLM_MAX_DEPTH=${this._rlmMaxDepth})`,
+				`RLM recursion depth limit reached (RLM_DEPTH=${this._rlmDepth}, RLM_MAX_DEPTH=${this._rlmMaxDepth}${ceilingNote})`,
 			);
+		}
+		// Depth bounds how deep the tree goes, never how wide one session fans out: without
+		// this gate a single turn could admit children without limit into an unbounded map.
+		// Refusing loudly (instead of queueing) keeps the fleet observable: a queued spawn
+		// looks identical to a running one from the parent's side.
+		if (this._rlmMaxConcurrentChildren > 0) {
+			const liveChildren = this._liveRlmChildRunCount();
+			if (liveChildren >= this._rlmMaxConcurrentChildren) {
+				throw new Error(
+					`RLM subagent limit reached: this session already has ${liveChildren} live children and the concurrency cap is ${this._rlmMaxConcurrentChildren}. ` +
+						"Fan-out is refused rather than queued, so the family stays observable: wait for one to settle with `await rlm.collect()`, " +
+						'stop one with `await rlm.delete_subagent("<name-or-id>")`, or raise the cap with RLM_MAX_CHILDREN (or the rlmMaxChildren session config); 0 disables the cap.',
+				);
+			}
 		}
 		if (requestedSessionName) {
 			if (this._pendingRlmSubagentSessionNames.has(requestedSessionName)) {
@@ -13563,11 +13730,11 @@ export class AgentSession {
 		}
 		if (this._disposed || this._disposing) throw new Error("Cannot spawn a subagent after its parent was disposed");
 
-		const childSessionDir = this._createChildRlmSessionDir();
-		const childNodeId = basename(childSessionDir);
-		const sessionName = requestedSessionName ?? createDefaultRlmSubagentSessionName(prompt, childNodeId);
-		if (!requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(sessionName);
-		signal?.throwIfAborted();
+		const { childSessionDir, childNodeId, sessionName } = await this._admitChildRlmSessionDir(
+			requestedSessionName,
+			prompt,
+			signal,
+		);
 		const startedAt = Date.now();
 		const parentAssistantForUsage = this._findLastAssistantMessage();
 		let runningToolCount = 0;
@@ -13614,6 +13781,12 @@ export class AgentSession {
 
 		const publishChildSession = (child: AgentSession) => {
 			childSession = child;
+			// The child was granted the cap in force at admission. If an ancestor tightened it
+			// while this run was still starting up, the child must not keep the wider grant
+			// (SC-2); an unchanged cap pushes nothing, so a child that later raises its own
+			// cap is still only limited by whatever its parent actually imposes.
+			const currentCap = this._effectiveRlmMaxDepth();
+			if (currentCap < grantedMaxDepth) child._applyRlmMaxDepthCeiling(currentCap);
 			const tracked = this._activeRlmChildRuns.get(run.id) === run;
 			// Cancellation admitted while runtime construction was blocked must stop
 			// the child even when the run already left _activeRlmChildRuns (a cascade
@@ -14721,6 +14894,9 @@ export class AgentSession {
 		const oldBase = this._baseSystemPrompt;
 		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
 		this.agent.state.systemPrompt = this._refreshExtensionSystemPrompt(this.agent.state.systemPrompt, oldBase);
+		// A lowered cap is the operator's current policy for the whole subtree, not just for
+		// spawns that start after this call (SC-2).
+		this._pushRlmMaxDepthToChildren();
 
 		let globalError: string | undefined;
 		if (options.global) {
