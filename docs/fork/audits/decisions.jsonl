@@ -119,3 +119,5 @@
 {"id": "CD-5", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "直接编辑 settings.json 对运行中会话不生效且无提示（/reload 文档不含 settings）", "verified_by": "R11 读码"}
 {"id": "CD-6", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "PI_HARDWARE_CURSOR 文件优先/ env 兜底 ⇒ settings 落过 false 后开关永久失灵", "verified_by": "R11 读码"}
 {"id": "CD-7", "date": "2026-09-15", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "已弃用的 compat.reasoningEffortMap 静默失效（schema 非严格、零探测）", "verified_by": "R11 读码"}
+{"id": "P-1", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "系统提示承诺\"技能＝同名 shell 命令\"，实际 8/8 command not found（venv/bin 不在 PATH + 5 个技能无 [project.scripts]）", "verified_by": "R12 实测 127 + 正控（绝对路径可跑）"}
+{"id": "P-2", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "提示词教 `uv pip install` 并称\"venv 没有 pip\"，两条与现实相反（裸命令 exit 2；venv 真有 pip 26.2.1）", "verified_by": "R12 实测 + 正控（加 --python 即成功）"}
