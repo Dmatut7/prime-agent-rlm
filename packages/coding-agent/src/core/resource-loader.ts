@@ -447,6 +447,10 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.updateSkillsFromPaths(skillPaths, metadataByPath);
 		// Surface resolution-time skill warnings (e.g. missing bundled skills dir).
 		this.skillDiagnostics.push(...resolvedPaths.diagnostics);
+		// `-e` sources resolve through the same package manager, and their warnings (a
+		// refused or reinstalled cache entry, a failed refresh) are only visible if they
+		// are reported: dropping them would make a refusal look like a silent success.
+		this.skillDiagnostics.push(...cliExtensionPaths.diagnostics);
 		for (const p of this.additionalSkillPaths) {
 			if (isLocalPath(p) && !existsSync(p) && !this.skillDiagnostics.some((d) => d.path === p)) {
 				this.skillDiagnostics.push({ type: "error", message: "Skill path does not exist", path: p });
