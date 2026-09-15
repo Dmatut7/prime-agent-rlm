@@ -1222,6 +1222,8 @@ class AgentTraceUploadController {
 	private timeout: NodeJS.Timeout | undefined;
 	private pending = false;
 	private inFlight: Promise<void> | undefined;
+	/** The scheduled leg while it runs, so a caller can await the work that follows the response. */
+	private running: Promise<void> | undefined;
 	private lastUploadStartedAt: number | undefined;
 	private notBeforeAt = 0;
 	/**
@@ -1279,11 +1281,36 @@ class AgentTraceUploadController {
 		this.timeout = setTimeout(
 			() => {
 				this.timeout = undefined;
-				void this.runScheduledUpload();
+				this.start();
 			},
 			Math.max(TRACE_UPLOAD_DEBOUNCE_MS, throttleDelay, notBeforeDelay),
 		);
 		this.timeout.unref();
+	}
+
+	/**
+	 * Run the leg and remember it. The leg is not over when the request comes back: the upload
+	 * records its cursor afterwards, and that is real file system work in the session's own agent
+	 * directory. Keeping the chain reachable is what lets a caller (a graceful exit, or a fixture
+	 * about to delete that directory) wait for it instead of racing it.
+	 */
+	private start(): void {
+		if (this.running) {
+			return;
+		}
+		const leg = this.runScheduledUpload();
+		this.running = leg;
+		const finished = () => {
+			if (this.running === leg) {
+				this.running = undefined;
+			}
+		};
+		void leg.then(finished, finished);
+	}
+
+	/** The leg already running, if any. A debounce that has not fired yet is left armed, not run. */
+	flush(): Promise<void> {
+		return this.running ?? Promise.resolve();
 	}
 
 	private async runScheduledUpload(): Promise<void> {
@@ -1339,4 +1366,18 @@ export function installAgentTraceUpload(sessionManager: SessionManager, options:
 	controller = new AgentTraceUploadController(sessionManager, options);
 	traceUploadControllers.set(sessionManager, controller);
 	sessionManager.onPersist(controller.schedule);
+}
+
+/**
+ * Await the automatic upload this process already started for one session.
+ *
+ * A scheduled upload is still working after its request comes back: it writes the outbox cursor
+ * that records what was sent. A caller that is about to delete or inspect the session's agent
+ * directory must let that leg land first, or it races the write; a caller that exits without
+ * waiting loses the cursor and re-sends the same bytes on the next start. Legs that are only
+ * debounced (their timer has not fired) are left as they are: this settles work in flight, it does
+ * not run the schedule.
+ */
+export async function flushAgentTraceUploads(sessionManager: SessionManager): Promise<void> {
+	await traceUploadControllers.get(sessionManager)?.flush();
 }
