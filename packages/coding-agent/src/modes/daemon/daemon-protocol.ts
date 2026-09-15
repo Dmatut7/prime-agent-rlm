@@ -176,8 +176,37 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // event every time, exactly as it was for rev32/rev33/rev34.
 // Revision 36 folds the headless-completion quiescence outcome into the same digest
 // (K3Q-1): wait_for_headless_completion rlmQuiescence rides rlm_quiescence_barrier.
-export const DAEMON_SCHEMA_REVISION = 36;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-36-ba0805ab003a";
+// Revision 35 was claimed twice in one evening, the first same-number collision since
+//   the 23-27 era: 7409359a6 (merge/repl-kernel side, digest 5100d7bec2ea, the
+//   wrapper/contract/assembly digest widening) and 7a931c383 (r25/k3q-fixes side,
+//   digest 0632e2e54e98, the quiescence outcome joining the digest) both wrote
+//   DAEMON_SCHEMA_REVISION = 35. The merge 34589648d resolved the collision by jumping
+//   to 36. The two 35s never shared a wire - their digests are distinct, so the
+//   handshake still told them apart - but "35" alone no longer identifies the
+//   k3q-side wire, and this header originally recorded only the repl-kernel-side
+//   meaning. Registered here per the 23-27 collision precedent; do not reuse 35, and
+//   read this header before claiming a number.
+// Honest account of the digest gate's one documented miss (F1, r30 protocol-chain):
+//   on 2026-09-15 commit 55bae7c50 bounded the session tree on the wire
+//   (SessionTreeDepthStats/SessionFlatTreeStats on snapshot sessionTree.bound plus
+//   get_session_tree's treeBound) while the digest still hashed only the
+//   daemon-protocol.ts request/event hemisphere, so the wire changed and
+//   DAEMON_SCHEMA_ID did not: 55bae7c50 and its parent advertise the identical
+//   protocol-7-schema-30-66299858b8b4, and a mixed 55bae7c50-daemon /
+//   1b7cc8468-client pair passed the handshake on mismatched tree shapes for the ~50
+//   minutes until a5edee5ee claimed 31. rev32 (treeWire) and rev35
+//   (wrapper/assembly/contract slices) closed the class; the guard test in
+//   test/daemon-protocol.test.ts ("replays the rev30 unbounded-to-bounded
+//   session-tree wire change") pins that diff shape and fails if any slice stops
+//   covering it.
+// Revision 37 extends the digest again, not the wire: the response envelope
+//   (DaemonResponse plus its DaemonErrorInfo payload, in this file) sat between the
+//   command, savedSession and outbound slices, so an envelope field edit left
+//   DAEMON_SCHEMA_ID unchanged - rev29 added response.retryAfterMs through exactly
+//   that gap, moving the number but not the digest. The envelope now joins the hashed
+//   source; the wire shapes themselves are unchanged and all clients degrade locally.
+export const DAEMON_SCHEMA_REVISION = 37;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-37-f14397289a30";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
