@@ -23,6 +23,7 @@ import {
 	isDaemonWorkerFrameHeader,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
 import { encodePrivateFrame, PrivateFrameDecoder } from "../src/modes/session-worker/private-framing.js";
+import { isolatedSupervisorRegistryEnv } from "./fixtures/supervisor-registry-isolation.js";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
 const tsxPath = resolve(__dirname, "../../../node_modules/tsx/dist/cli.mjs");
@@ -101,6 +102,7 @@ function spawnSupervisor(
 				...process.env,
 				...extraEnv,
 				[ENV_AGENT_DIR]: agentDir,
+				...isolatedSupervisorRegistryEnv(agentDir),
 				PI_OFFLINE: "1",
 				TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
 			},

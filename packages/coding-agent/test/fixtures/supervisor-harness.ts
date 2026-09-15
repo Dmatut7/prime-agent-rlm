@@ -23,6 +23,7 @@ import {
 	startFakeWorker,
 	writeWorkerDescriptor,
 } from "./supervisor-fake-worker.js";
+import { isolatedSupervisorRegistryEnv, SUPERVISOR_REGISTRY_DIR_ENV } from "./supervisor-registry-isolation.js";
 
 /**
  * A supervisor test harness that stays on public surfaces: a real socket, a real
@@ -215,6 +216,12 @@ export async function startSupervisorHarness(options: SupervisorHarnessOptions):
 	// Keep every artifact (including the rotating daemon log) inside the temp tree.
 	const previousAgentDirEnv = process.env[ENV_AGENT_DIR];
 	process.env[ENV_AGENT_DIR] = agentDir;
+	// The owner registry is user-wide authority state. Left alone, this harness wrote a
+	// record naming this worker's pid into the developer's real
+	// ~/.prime/supervisor-owners, where status and the startup gate would read it as a
+	// live supervisor. Keep it inside the harness temp root, like every other artifact.
+	const previousRegistryDirEnv = process.env[SUPERVISOR_REGISTRY_DIR_ENV];
+	process.env[SUPERVISOR_REGISTRY_DIR_ENV] = isolatedSupervisorRegistryEnv(root)[SUPERVISOR_REGISTRY_DIR_ENV];
 	if (options.scheduledJobsArtifact) {
 		const artifactDir = getSessionArtifactPathForFile(session.sessionFile, session.sessionId);
 		mkdirSync(artifactDir, { recursive: true });
@@ -402,6 +409,11 @@ export async function startSupervisorHarness(options: SupervisorHarnessOptions):
 				delete process.env[ENV_AGENT_DIR];
 			} else {
 				process.env[ENV_AGENT_DIR] = previousAgentDirEnv;
+			}
+			if (previousRegistryDirEnv === undefined) {
+				delete process.env[SUPERVISOR_REGISTRY_DIR_ENV];
+			} else {
+				process.env[SUPERVISOR_REGISTRY_DIR_ENV] = previousRegistryDirEnv;
 			}
 			if (standIn && standIn.child.exitCode === null && standIn.child.signalCode === null) {
 				standIn.child.kill("SIGKILL");

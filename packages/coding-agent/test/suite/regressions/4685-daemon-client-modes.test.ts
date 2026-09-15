@@ -13,6 +13,7 @@ import { DaemonSupervisor } from "../../../src/modes/daemon/daemon-supervisor.js
 import { waitForHeadlessCompletion } from "../../../src/modes/headless-completion.js";
 import { RpcClient } from "../../../src/modes/rpc/rpc-client.js";
 import { createRpcExtensionUiBridge } from "../../../src/modes/rpc/rpc-extension-ui-context.js";
+import { isolatedSupervisorRegistryEnv } from "../../fixtures/supervisor-registry-isolation.js";
 import { createHarness, getAssistantTexts, getUserTexts, type Harness } from "../harness.js";
 
 const fixturePath = resolve(__dirname, "../../fixtures/rpc-connection-mode-fixture.ts");
@@ -73,6 +74,9 @@ async function runCli(
 			...process.env,
 			TSX_TSCONFIG_PATH: repoTsconfigPath,
 			[ENV_AGENT_DIR]: options.agentDir,
+			// The CLI auto-spawns a real daemon; without this it registers its ownership in
+			// the developer's real ~/.prime/supervisor-owners.
+			...isolatedSupervisorRegistryEnv(options.agentDir),
 			PI_SKIP_VERSION_CHECK: "1",
 			PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND: "0",
 			PRIME_AGENT_INTERNAL_DAEMON_WORKER: undefined,

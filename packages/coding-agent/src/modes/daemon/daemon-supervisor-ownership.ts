@@ -656,7 +656,7 @@ export async function acquireDaemonSupervisorOwnership(
 							record.agentDir,
 						);
 					}
-				} else if (isProcessAlive(owner.pid)) {
+				} else if (isProcessAlive(owner.pid) && !isAbandonedOwnerFootprint(owner)) {
 					// Somebody else's live daemon on this box: none of our business.
 					// Only the cheap kill(0) is spent here, deliberately: this loop runs
 					// over every owner directory on the machine inside the registry
@@ -666,7 +666,8 @@ export async function acquireDaemonSupervisorOwnership(
 					// eventually conflicts with it, which is exactly today's behavior.
 					continue;
 				}
-				// Dead owners are reclaimed whether or not they conflict. Recovery used
+				// Dead owners, and owners whose whole footprint was deleted, are
+				// reclaimed whether or not they conflict. Recovery used
 				// to be keyed on a conflict only, so an owner recorded for a different
 				// socket path (a test fixture, `--daemon-socket`, the two generations of
 				// an update handoff) stayed in this global registry forever — 36 of 45
@@ -873,6 +874,29 @@ export async function waitForDaemonStartupFence(
 		}
 		await delay(STARTUP_FENCE_POLL_MS);
 	}
+}
+
+/**
+ * A record whose whole footprint is gone is abandoned authority, whatever its pid says.
+ *
+ * The registry is user-wide authority state, so it also collects records from daemons
+ * whose world was temporary: a leaked test daemon owns an agent dir, a socket and a
+ * descriptor dir under one temp root, deleting that root leaves a record whose three
+ * paths no longer exist, and the recorded pid may still be alive (or recycled by an
+ * unrelated process). Liveness by pid alone kept such a record forever, and the
+ * startup gate then had to reason about a supervisor that cannot exist.
+ *
+ * Deliberately narrow: all three paths must be gone and the record must not still be
+ * `starting`. A starting daemon writes its record before it binds its socket and
+ * creates its descriptor dir, and a running daemon has a live agent dir and descriptor
+ * dir on a mounted filesystem plus a bound socket file, so no reachable daemon is
+ * reclaimed here — only a footprint that was deleted under it.
+ */
+function isAbandonedOwnerFootprint(owner: DaemonSupervisorOwnerRecord): boolean {
+	if (owner.phase === "starting") {
+		return false;
+	}
+	return !existsSync(owner.agentDir) && !existsSync(owner.socketPath) && !existsSync(owner.descriptorDir);
 }
 
 function isProcessIdentityAlive(identity: ProcessIdentity): boolean {
