@@ -148,3 +148,9 @@
 {"id": "L1", "date": "2026-09-15", "severity": "P3", "status": "fixing", "commit": null, "title": "子代理展示缓存无上限/TTL/LRU：2000 次读 +32MB 且外部删目录后永不可驱逐（正控 107× 差）", "verified_by": "R14 --expose-gc 探针 + 正控 + 真机量级估算 ~5MB"}
 {"id": "L2", "date": "2026-09-15", "severity": "P3", "status": "fixing", "commit": null, "title": "artifact 墓碑缓存同型：仅测试钩子能清、生产无驱逐", "verified_by": "R14 读码"}
 {"id": "L3-CORRECTION", "date": "2026-09-15", "severity": "-", "status": "note", "commit": null, "title": "口径纠正：list --all 的 lifecycle:live ≠ 常驻；只有带 activeSessionId 的行才是常驻（本机 19 条，非 630）", "verified_by": "R14 读码 daemon-session-list.ts:237/270"}
+{"id": "K1", "date": "2026-09-15", "severity": "P1", "status": "fixing", "commit": null, "title": "bounded-cache 覆盖同 key 不扣旧字节⇒幽灵字节涨满后永久拒收（我今晚新引入的组件）", "verified_by": "K3 打穿（12 次覆盖复现 size=0/bytes=930）"}
+{"id": "K2", "date": "2026-09-15", "severity": "P1", "status": "fixing", "commit": null, "title": "upload-privacy-gate 的 userinfo 只剥到第一个 @ ⇒ 口令含 @ 时残段上线且计数谎报", "verified_by": "K3 打穿"}
+{"id": "K3-ID", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "隐私闸 exact-compare 不认编码变体（percent-encoded 配置密钥通过）", "verified_by": "K3 打穿"}
+{"id": "K4", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "stripUrlUserinfo 把 ssh://git@host 改坏且不打标", "verified_by": "K3"}
+{"id": "K5", "date": "2026-09-15", "severity": "P2", "status": "fixing", "commit": null, "title": "stall 误分类：早先 429 让后续有 partial 的中流 stall 失去整份重发资格", "verified_by": "K3"}
+{"id": "K6", "date": "2026-09-15", "severity": "P3", "status": "fixing", "commit": null, "title": "preflight-push.sh gh 失败 fail-open 且不验工作树==HEAD（我今天新加的闸）", "verified_by": "K3"}
