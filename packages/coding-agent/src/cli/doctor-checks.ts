@@ -250,6 +250,18 @@ interface SessionScan {
 	total: number;
 	truncated: boolean;
 	unparseable: string[];
+	/**
+	 * Set when the sessions directory itself could not be listed. "I read nothing"
+	 * and "there is nothing to read" are different facts, and only the second one
+	 * may be reported as an empty directory.
+	 */
+	dirError?: string;
+}
+
+/** The errno code of a filesystem failure, for a detail line an operator can act on. */
+function errnoCode(error: unknown): string {
+	const code = (error as NodeJS.ErrnoException | undefined)?.code;
+	return typeof code === "string" && code.length > 0 ? code : "unknown error";
 }
 
 /**
@@ -284,7 +296,8 @@ function scanSessions(dir: string, limits: DoctorScanLimits): SessionScan {
 			.filter((name) => name.endsWith(".jsonl"))
 			.map((name) => join(dir, name))
 			.sort();
-	} catch {
+	} catch (error) {
+		scan.dirError = errnoCode(error);
 		return scan;
 	}
 	scan.total = files.length;
@@ -334,6 +347,14 @@ function checkSessions(dir: string, limits: DoctorScanLimits): DoctorCheck {
 		};
 	}
 	const scan = scanSessions(dir, limits);
+	if (scan.dirError !== undefined) {
+		return {
+			id: "sessions",
+			status: "fail",
+			detail: `${dir} exists but could not be listed (${scan.dirError}); no session file was scanned`,
+			next: `Make ${dir} a readable directory (check its permissions and that no file sits at that path); until then ${APP_NAME} cannot list or resume sessions. Re-run doctor afterwards.`,
+		};
+	}
 	if (scan.unparseable.length > 0) {
 		const shown = scan.unparseable.slice(0, 5).join(", ");
 		const more = scan.unparseable.length > 5 ? `, and ${scan.unparseable.length - 5} more` : "";

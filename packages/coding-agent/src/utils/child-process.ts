@@ -51,17 +51,24 @@ export function isProcessAlive(pid: number): boolean {
 	return processIdExists(pid) && !isZombieProcess(pid);
 }
 
-export function signalProcessGroupOrProcess(pid: number, signal: NodeJS.Signals): void {
+/**
+ * Signal the process group, falling back to the bare pid. The answer is whether a
+ * signal was really delivered: EPERM/ESRCH mean it was not, and callers that keep a
+ * causal record of what they did (the stop ledger) must not credit an attempt.
+ */
+export function signalProcessGroupOrProcess(pid: number, signal: NodeJS.Signals): boolean {
 	try {
 		process.kill(-pid, signal);
-		return;
+		return true;
 	} catch {
 		// Fall back when process groups are unavailable or the group already exited.
 	}
 	try {
 		process.kill(pid, signal);
+		return true;
 	} catch {
 		// The process may already be fully reaped.
+		return false;
 	}
 }
 

@@ -1640,8 +1640,9 @@ async function runShutdownConverging(
 						break;
 					}
 					await assertAdmission();
-					report.recordSignal(pid);
-					await forceKillDaemon(pid);
+					if (await forceKillDaemon(pid)) {
+						report.recordSignal(pid);
+					}
 					sweep.handledPids.add(pid);
 					await assertAdmission();
 					if (removeSocketFileUnlessServed(socketPath)) {
@@ -1958,8 +1959,9 @@ async function terminateVerifiedListener(sweep: ShutdownSweep, listener: Discove
 	if (getProcessStartId(listener.pid) !== processStartId) {
 		return false;
 	}
-	sweep.report.recordSignal(listener.pid);
-	killDaemon(listener.pid);
+	if (killDaemon(listener.pid)) {
+		sweep.report.recordSignal(listener.pid);
+	}
 	const deadline = Date.now() + 1000;
 	while (getProcessStartId(listener.pid) === processStartId && Date.now() < deadline) {
 		await delay(50);
@@ -1969,10 +1971,15 @@ async function terminateVerifiedListener(sweep: ShutdownSweep, listener: Discove
 		if (getProcessStartId(listener.pid) !== processStartId) {
 			return false;
 		}
+		let escalated = false;
 		try {
 			process.kill(listener.pid, "SIGKILL");
+			escalated = true;
 		} catch {
 			// The verified process exited between the identity check and signal.
+		}
+		if (escalated) {
+			sweep.report.recordSignal(listener.pid);
 		}
 	}
 	const stopped = getProcessStartId(listener.pid) !== processStartId;
@@ -2050,8 +2057,9 @@ async function stopBackgroundService(
 			return { left: sweep.report.refusalReason(socketPath, pid) ?? "not a verified daemon" };
 		}
 		await sweep.assertAdmission();
-		sweep.report.recordSignal(pid);
-		await forceKillDaemon(pid);
+		if (await forceKillDaemon(pid)) {
+			sweep.report.recordSignal(pid);
+		}
 		sweep.handledPids.add(pid);
 		sweep.report.recordStoppedService(socketPath);
 		return { reaped: `force-killed the process holding a removed socket (pid ${pid})` };
@@ -2068,8 +2076,9 @@ async function stopBackgroundService(
 		return { left: sweep.report.refusalReason(socketPath, pid) ?? "not a verified daemon" };
 	}
 	await sweep.assertAdmission();
-	sweep.report.recordSignal(pid);
-	await forceKillDaemon(pid);
+	if (await forceKillDaemon(pid)) {
+		sweep.report.recordSignal(pid);
+	}
 	sweep.handledPids.add(pid);
 	await sweep.assertAdmission();
 	if (removeSocketFileUnlessServed(socketPath)) {
@@ -2159,6 +2168,7 @@ async function forceStopTrackedWorkers(
 	};
 	// Every signal this sweep really sends is written into the report ledger, so the
 	// convergence pass at the end may call a vanished worker a stop this run performed.
+	// `stopTrackedProcess` runs this callback once per *delivered* signal, never per attempt.
 	const stopWithLedger = (pid: number, startId: string | undefined): Promise<boolean> =>
 		stopTrackedProcess(pid, startId, assertAdmission, () => ledger.recordSignal(pid));
 	for (const worker of findTrackedWorkers(supervisorSocketPath)) {
@@ -2180,9 +2190,8 @@ async function forceStopTrackedWorkers(
 			for (const orphan of orphans) {
 				// Pid-only records go through the platform predicate (stopTrackedProcess needs a startId).
 				if (orphan.processStartId === undefined) {
-					if (shouldReapOrphanProcess(orphan)) {
+					if (shouldReapOrphanProcess(orphan) && killOrphanProcess(orphan.pid)) {
 						ledger.recordSignal(orphan.pid);
-						killOrphanProcess(orphan.pid);
 					}
 					continue;
 				}
@@ -2193,8 +2202,9 @@ async function forceStopTrackedWorkers(
 					// taskkill /T, like the sibling reapers: signalling only the shell pid leaves its descendants alive.
 					await assertAdmission();
 					if (isOrphanProcessIdentityCurrent(orphan)) {
-						ledger.recordSignal(orphan.pid);
-						killOrphanProcess(orphan.pid);
+						if (killOrphanProcess(orphan.pid)) {
+							ledger.recordSignal(orphan.pid);
+						}
 						if (isProcessAlive(orphan.pid)) {
 							cleanupWorkerRecords = false;
 							fail(descriptor, `could not stop child process ${orphan.pid} for worker ${descriptor.workerId}`);
@@ -2335,10 +2345,11 @@ function isTrackedWorkerDescriptor(value: unknown): value is DaemonWorkerDescrip
 	);
 }
 
-async function stopTrackedProcess(
+export async function stopTrackedProcess(
 	pid: number,
 	expectedStartId: string | undefined,
 	assertAdmission: () => Promise<void>,
+	/** Called only after a signal was really delivered to `pid`. */
 	onSignal?: () => void,
 ): Promise<boolean> {
 	if (!isProcessAlive(pid)) {
@@ -2351,8 +2362,9 @@ async function stopTrackedProcess(
 	if (getProcessStartId(pid) !== expectedStartId) {
 		return false;
 	}
-	onSignal?.();
-	signalProcessGroupOrProcess(pid, "SIGTERM");
+	if (signalProcessGroupOrProcess(pid, "SIGTERM")) {
+		onSignal?.();
+	}
 	let deadline = Date.now() + 500;
 	while (isProcessAlive(pid) && Date.now() < deadline) {
 		await delay(25);
@@ -2364,8 +2376,9 @@ async function stopTrackedProcess(
 	if (getProcessStartId(pid) !== expectedStartId) {
 		return false;
 	}
-	onSignal?.();
-	signalProcessGroupOrProcess(pid, "SIGKILL");
+	if (signalProcessGroupOrProcess(pid, "SIGKILL")) {
+		onSignal?.();
+	}
 	deadline = Date.now() + 1000;
 	while (isProcessAlive(pid) && Date.now() < deadline) {
 		await delay(25);
@@ -2626,28 +2639,37 @@ function removeSocketFile(socketPath: string): boolean {
 	}
 }
 
-function killDaemon(pid: number): void {
+/**
+ * The daemon stop primitives answer whether they delivered a signal. EPERM/ESRCH
+ * means nothing was sent, and the causal stop ledger may only credit a delivery.
+ * Exported so the delivery contract can be asserted without a live daemon.
+ */
+export function killDaemon(pid: number): boolean {
 	try {
 		process.kill(pid, "SIGTERM");
+		return true;
 	} catch {
 		// Process already gone or not permitted; the socket file cleanup still runs.
+		return false;
 	}
 }
 
-async function forceKillDaemon(pid: number): Promise<void> {
-	killDaemon(pid);
+export async function forceKillDaemon(pid: number): Promise<boolean> {
+	let delivered = killDaemon(pid);
 	const deadline = Date.now() + 1000;
 	while (Date.now() < deadline) {
 		if (!isProcessAlive(pid)) {
-			return;
+			return delivered;
 		}
 		await delay(50);
 	}
 	try {
 		process.kill(pid, "SIGKILL");
+		delivered = true;
 	} catch {
 		// Process already exited between the liveness check and the kill.
 	}
+	return delivered;
 }
 
 function isProcessAlive(pid: number): boolean {

@@ -1,0 +1,2 @@
+- Fixed `doctor` reporting a sessions directory it could not read as an empty directory; it now fails with the errno and a next step.
+- Changed daemon stop accounting to record a signal only after it was really delivered, so a swallowed EPERM/ESRCH no longer credits a stop the run never performed.
