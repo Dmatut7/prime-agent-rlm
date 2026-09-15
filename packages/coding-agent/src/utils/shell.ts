@@ -139,9 +139,20 @@ export function resolveKernelBashShell(customShellPath?: string): string | undef
  * These children run model-authored or third-party code (npm postinstall
  * scripts, test suites), so the base is an allowlist — mirroring the kernel's
  * MCP stdio `_SAFE_ENV` — rather than the worker's full process.env: supervisor
- * auth tokens (PRIME_AGENT_INTERNAL_*), recursion bookkeeping (RLM_*), provider
- * credentials (SERPER_API_KEY, ANTHROPIC_*, ...) and the user's agent sockets
- * (SSH_AUTH_SOCK) must not ride along into arbitrary commands.
+ * auth tokens (PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN), recursion
+ * bookkeeping (RLM_*), provider credentials (SERPER_API_KEY, ANTHROPIC_*,
+ * ...) and the user's agent sockets (SSH_AUTH_SOCK) must not ride along into
+ * arbitrary commands.
+ *
+ * The agent's own CLI also travels through this channel (self-update, nested
+ * `prime-agent` runs), so the non-secret routing and opt-out names that CLI
+ * reads are forwarded: the update routing pair (supervisor socket path, origin
+ * session id — paths and ids, never the worker token), the agentDir/sessionDir
+ * pins and supervisor registry dir (a nested CLI must target the daemon and
+ * directories its parent already owns), and the documented privacy opt-outs
+ * (DO_NOT_TRACK/PI_OFFLINE/PRIME_AGENT_TELEMETRY — losing them would silently
+ * undo the offline/telemetry switches for nested runs). Keep the kernel table
+ * (`prime-agent-runtime/src/rlm/bash.py` `_CHILD_SAFE_ENV`) in sync.
  */
 const SHELL_CHILD_SAFE_ENV_KEYS = [
 	"HOME",
@@ -163,6 +174,16 @@ const SHELL_CHILD_SAFE_ENV_KEYS = [
 	"OS",
 	"SYSTEMDRIVE",
 	"USERPROFILE",
+	// Non-secret routing/opt-out names for the agent's own CLI (see above).
+	"PRIME_AGENT_CODING_AGENT_DIR",
+	"PRIME_AGENT_SESSION_DIR",
+	"PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET",
+	"PRIME_AGENT_INTERNAL_DAEMON_WORKER_ACTIVE_SESSION_ID",
+	"PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR",
+	"DO_NOT_TRACK",
+	"PI_OFFLINE",
+	"PRIME_AGENT_TELEMETRY",
+	"PRIME_AGENT_TRUSTED_UPDATE_ORIGINS",
 ] as const;
 
 /** Comma-separated env names a user opts back in for shell-tool children. */

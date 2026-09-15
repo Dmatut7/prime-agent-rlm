@@ -695,6 +695,12 @@ prime-agent --thinking high "Solve this complex problem"
 
 The remaining `PI_*` variables in this table are compatibility names still read by the current runtime. They do not change the application name, command, or default `~/.prime/agent` configuration path.
 
+Shell-tool children (the bash tool, `exec`, and extensions) run with an allowlisted environment: secrets such as worker tokens and provider keys are stripped, and the agent's non-secret routing and privacy opt-out names are forwarded. Commands that need another variable can opt it back in. Set `PRIME_AGENT_ENV_PASSTHROUGH` to a comma-separated list of names on the process that starts Prime Agent, since children read it from the agent process:
+
+```bash
+PRIME_AGENT_ENV_PASSTHROUGH=HTTPS_PROXY,HTTP_PROXY,NO_PROXY prime-agent
+```
+
 ## Contributing & Development
 
 See [docs/development.md](docs/development.md) for setup and debugging.

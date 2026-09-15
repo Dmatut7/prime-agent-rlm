@@ -412,6 +412,14 @@ with a larger `timeout` (or `timeout: 0` for no limit).
 
 `npmCommand` is used for all npm package-manager operations, including installs, uninstalls, and dependency installs inside git packages. Use argv-style entries exactly as the process should be launched. When `npmCommand` is configured, git package dependency installs use plain `install` to avoid npm-specific flags in wrappers or alternate package managers.
 
+#### Shell child environment
+
+Bash-tool, `exec`, and extension children run with an allowlisted environment: secrets such as worker tokens and provider keys are stripped, while a usable shell environment plus the agent's non-secret routing and privacy opt-out names (`DO_NOT_TRACK`, `PI_OFFLINE`, `PRIME_AGENT_TELEMETRY`, agent/session directories, the supervisor socket path and origin session id) are forwarded. To forward additional variables that a command genuinely needs, set `PRIME_AGENT_ENV_PASSTHROUGH` to a comma-separated list of names on the process that starts Prime Agent (children read it from the agent process, so it must be set before the daemon starts):
+
+```bash
+PRIME_AGENT_ENV_PASSTHROUGH=HTTPS_PROXY,HTTP_PROXY,NO_PROXY prime-agent
+```
+
 Normally the package manager's global modules location is queried using `root -g`. As a special case, if the first element of `npmCommand` is `"bun"`, the modules location will instead be queried with `pm bin -g`.
 
 ### Daemon
