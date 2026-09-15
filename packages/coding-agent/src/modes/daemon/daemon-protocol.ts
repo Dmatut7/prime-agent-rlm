@@ -131,11 +131,22 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 //   both degrading locally: `ContextTreeNode.scan` on the get_context_tree response
 //   (what the bounded on-disk roster scan refused, so a partial /context says so) and
 //   `SessionTreeDepthStats.retainedFromDepth` / `.leafIncluded` on session_snapshot's
-//   sessionTree.bound and on get_session_tree's treeBound (the depth bound now keeps
-//   the newest layers and the live leaf, and says which). No command, event, or
+//   sessionTree.bound (the depth bound now keeps the newest layers and the live leaf,
+//   and says which). get_session_tree's treeBound is the *flat* bound's
+//   `SessionFlatTreeStats` (totalEntries/returnedNodes/omittedNodes/maxNodes/truncated),
+//   which predates rev31 and never carried the depth fields. No command, event, or
 //   capability gate changed, so nothing checks the number; the digest identifies it.
-export const DAEMON_SCHEMA_REVISION = 31;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-31-66299858b8b4";
+// Revision 32 extends the digest itself, not the wire: response payload shapes live
+//   outside this file (DaemonResponse types its data as unknown), so the session-tree
+//   wire family - SessionTreeFlatNode/SessionTreeNode plus the depth and flat bound
+//   stats in core/session-manager.ts - now joins the hashed source. Until now a field
+//   added to or dropped from those shapes left DAEMON_SCHEMA_ID unchanged, so response
+//   hemisphere edits rode an old identity. The same revision also gives getBoundedTree
+//   a total-node cap (SESSION_TREE_MAX_WIRE_NODES), so a wide (star-shaped) session's
+//   snapshot tree is cut and reported truncated instead of shipping O(entries) nodes
+//   whole; the shapes on the wire are unchanged and all clients degrade locally.
+export const DAEMON_SCHEMA_REVISION = 32;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-32-031a9f304364";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;

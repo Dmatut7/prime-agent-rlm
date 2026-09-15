@@ -268,6 +268,66 @@ describe("stop target identity and convergence", () => {
 		rmSync(root, { recursive: true, force: true });
 	});
 
+	it("dry-run reports its kept targets as keptInScope, never as the full report's leftRunning", async () => {
+		const socketDirectory = join(root, "sockets");
+		mkdirSync(socketDirectory, { recursive: true });
+		const strangerSocket = join(socketDirectory, `${process.pid}.pipe`);
+		const daemonSocket = join(socketDirectory, "daemon.sock");
+		const stranger = spawnListener(strangerSocket);
+		const daemon = spawnListener(daemonSocket);
+		await waitForSocketFile(strangerSocket);
+		await waitForSocketFile(daemonSocket);
+		writeOwnerRecord(
+			process.env[SUPERVISOR_REGISTRY_ENV]!,
+			daemonSocket,
+			daemon.pid!,
+			join(root, "agent"),
+			"r20-dry-run",
+		);
+		writeFakeTools(join(root, "bin"), [
+			{ pid: stranger.pid!, socketPath: strangerSocket },
+			{ pid: daemon.pid!, socketPath: daemonSocket },
+		]);
+		process.env.PATH = `${join(root, "bin")}:${process.env.PATH ?? ""}`;
+
+		const dryLogs: string[] = [];
+		const dryLog = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+			dryLogs.push(args.map((value) => String(value)).join(" "));
+		});
+		try {
+			await runShutdownSelection(
+				true,
+				true,
+				{ scope: { kind: "socket", socketPath: daemonSocket }, orphansOnly: false },
+				true,
+			);
+		} finally {
+			dryLog.mockRestore();
+		}
+		const dry = JSON.parse(dryLogs.at(-1) ?? "") as Record<string, unknown>;
+
+		// A dry run plans and stops nothing.
+		expect(alive(stranger.pid)).toBe(true);
+		expect(alive(daemon.pid)).toBe(true);
+		expect(dry.dryRun).toBe(true);
+		// `leftRunning` in a real run means "still running after we tried to stop it";
+		// the plan's "this stays out of scope" list is a different proposition and must
+		// not reuse the word.
+		expect(Object.keys(dry)).not.toContain("leftRunning");
+		const kept = (dry.keptInScope ?? []) as ShutdownTargetEntry[];
+		expect(kept.map((entry) => entry.socketPath)).toContain(strangerSocket);
+		const targets = (dry.targets ?? []) as ShutdownTargetEntry[];
+		expect(targets.map((entry) => entry.socketPath)).toContain(daemonSocket);
+
+		// The full report keeps the four-bucket vocabulary the dry-run shape avoids,
+		// so a consumer diffing plan against result reads two disjoint key sets.
+		const full = await runShutdown({ scope: { kind: "machine" }, orphansOnly: false });
+		await waitForExitOf(daemon.pid!);
+		expect(alive(stranger.pid)).toBe(true);
+		expect(Object.keys(full)).toContain("leftRunning");
+		expect(Object.keys(full)).not.toContain("keptInScope");
+	}, 60_000);
+
 	it("never signals a listening socket that is not a verified daemon, and names it in leftRunning", async () => {
 		const socketDirectory = join(root, "sockets");
 		mkdirSync(socketDirectory, { recursive: true });

@@ -314,6 +314,26 @@ export interface AgentConnectionSessionTreeBound {
 	truncated: boolean;
 }
 
+/**
+ * What a node-count-bounded flat session tree left out, so a truncation is never silent.
+ *
+ * This is the connection-owned wire DTO for the local manager's `SessionFlatTreeStats`,
+ * the shape the daemon's `get_session_tree` response carries as `treeBound`. It follows
+ * the same rule as {@link AgentConnectionSessionTreeBound}: the contract does not import
+ * the session runtime's module, and the two field sets are pinned to each other by
+ * test/session-tree-wire-bounds.test.ts so the mirror cannot drift silently.
+ */
+export interface AgentConnectionSessionTreeFlatStats {
+	/** Entries in the session. */
+	totalEntries: number;
+	/** Nodes the client receives. */
+	returnedNodes: number;
+	/** Entries present in the session, absent from the returned nodes (the oldest). */
+	omittedNodes: number;
+	maxNodes: number;
+	truncated: boolean;
+}
+
 export interface AgentConnectionSessionContext {
 	messages: AgentMessage[];
 	thinkingLevel: string;
@@ -764,7 +784,20 @@ export interface AgentConnection {
 	getSessionStats(): Promise<SessionStats>;
 	getContextTree(): Promise<ContextTreeNode>;
 	getSessionContext(): Promise<AgentConnectionSessionContext>;
-	getSessionTree(): Promise<{ tree: AgentConnectionSessionTreeNode[]; leafId: string | null }>;
+	getSessionTree(): Promise<{
+		tree: AgentConnectionSessionTreeNode[];
+		leafId: string | null;
+		/**
+		 * What a bounded view left out, so a truncation is never silent at this boundary.
+		 *
+		 * The daemon path returns the flat bound (`treeBound` on the get_session_tree
+		 * response, a node-count cap); the snapshot and in-process paths return the depth
+		 * bound of the nested tree. Absent when the view was not truncated (or an old
+		 * daemon did not send one); present and `truncated: true` when the client is
+		 * seeing fewer nodes than the session holds.
+		 */
+		bound?: AgentConnectionSessionTreeBound | AgentConnectionSessionTreeFlatStats;
+	}>;
 	listSavedSessions(
 		scope: AgentConnectionSavedSessionScope,
 		callbacks?: AgentConnectionSessionListCallbacks,

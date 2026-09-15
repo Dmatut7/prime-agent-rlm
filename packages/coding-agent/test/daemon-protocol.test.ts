@@ -103,8 +103,19 @@ describe("daemon protocol helpers", () => {
 			source.indexOf("export type DaemonOutbound ="),
 			source.indexOf("export const DAEMON_OUTBOUND_COMPATIBILITY"),
 		);
+		// CM-2: response payload shapes do not live in daemon-protocol.ts (DaemonResponse
+		// types its data as unknown), so hashing only the three request/event slices let
+		// any response-shape edit ride an unchanged DAEMON_SCHEMA_ID. The session tree
+		// wire family - node shapes plus both bound stats (session_snapshot's
+		// sessionTree.bound and get_session_tree's flatNodes/treeBound) - lives in
+		// core/session-manager.ts, so its slice joins the digest.
+		const sessionManagerSource = readFileSync(resolve(__dirname, "../src/core/session-manager.ts"), "utf8");
+		const treeWireSource = sessionManagerSource.slice(
+			sessionManagerSource.indexOf("export interface SessionTreeFlatNode"),
+			sessionManagerSource.indexOf("export interface SessionContext"),
+		);
 		const digest = createHash("sha256")
-			.update(`${commandSource}\n${savedSessionSource}\n${outboundSource}`)
+			.update(`${commandSource}\n${savedSessionSource}\n${outboundSource}\n${treeWireSource}`)
 			.digest("hex")
 			.slice(0, 12);
 		expect(DAEMON_SCHEMA_ID).toBe(`protocol-${DAEMON_PROTOCOL_VERSION}-schema-${DAEMON_SCHEMA_REVISION}-${digest}`);

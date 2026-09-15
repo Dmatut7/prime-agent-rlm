@@ -98,6 +98,7 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 							timestamp: new Date(1).toISOString(),
 							message: messages[0] ?? userMessage("tree node", 1),
 						},
+						children: [],
 					},
 				],
 				stats: {
@@ -173,6 +174,30 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 }
 
 describe("InProcessAgentConnection", () => {
+	it("returns the bounded session tree with its stats, not an unbounded tree", async () => {
+		const session = createFakeSession("tree-bound", [userMessage("hello", 1)]);
+		const connection = new InProcessAgentConnection(asRuntime(new FakeRuntime(session.session)));
+
+		const sessionTree = await connection.getSessionTree();
+
+		// The tree comes from getBoundedTree (the fake's single bounded node), not from
+		// the unbounded getTree() (empty in the fake): the in-process connection must
+		// offer the same bounded contract the daemon connection does.
+		expect(sessionTree.tree).toHaveLength(1);
+		expect(sessionTree.tree[0]?.entry.id).toBe("tree-bound-node");
+		expect(sessionTree.leafId).toBe("tree-bound-leaf");
+		expect(sessionTree.bound).toEqual({
+			entries: 3,
+			returnedNodes: 1,
+			omittedNodes: 2,
+			maxDepth: SESSION_TREE_MAX_WIRE_DEPTH + 2,
+			depthLimit: SESSION_TREE_MAX_WIRE_DEPTH,
+			retainedFromDepth: 1,
+			leafIncluded: true,
+			truncated: true,
+		});
+	});
+
 	it.each([
 		{ accepted: true, promptResult: "pending", expectedError: undefined },
 		{ accepted: false, promptResult: "resolve", expectedError: "Prompt was not accepted by the session." },

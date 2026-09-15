@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
 import { MissingSessionCwdError } from "../src/core/session-cwd.js";
 import { SessionImportFileNotFoundError } from "../src/core/session-import-errors.js";
+import { type SessionEntry, type SessionHeader, SessionManager } from "../src/core/session-manager.js";
 import {
 	DAEMON_REFINE_REQUEST_TIMEOUT_MS,
 	DaemonAgentConnection,
@@ -15,6 +16,8 @@ import type {
 	AgentConnectionEvent,
 	AgentConnectionRlmChildAgentSnapshot,
 	AgentConnectionSavedSessionInfo,
+	AgentConnectionSessionTreeFlatNode,
+	AgentConnectionSessionTreeNode,
 	AgentConnectionState,
 } from "../src/modes/agent-connection/types.js";
 import { createCompactAssistantDelta } from "../src/modes/daemon/compact-session-stream.js";
@@ -39,6 +42,46 @@ import {
 } from "../src/modes/daemon/daemon-protocol.js";
 import { DaemonRoutedClient } from "../src/modes/daemon/daemon-routed-client.js";
 import type { DaemonWorkerClient } from "../src/modes/daemon/daemon-worker-client.js";
+
+/** A 30,001-entry chain session file: past the 20k flat-node cap get_session_tree applies. */
+function writeLargeSession(directory: string): string {
+	const header: SessionHeader = {
+		type: "session",
+		id: "large-tree-session",
+		version: 3,
+		timestamp: new Date(0).toISOString(),
+		cwd: directory,
+	};
+	const lines: string[] = [JSON.stringify(header)];
+	let parentId: string | null = null;
+	for (let index = 0; index < 30_001; index++) {
+		const entry: SessionEntry = {
+			type: "custom",
+			id: `entry-${index}`,
+			parentId,
+			timestamp: new Date(index).toISOString(),
+			customType: "probe",
+			data: { index },
+		};
+		lines.push(JSON.stringify(entry));
+		parentId = entry.id;
+	}
+	const path = join(directory, "large-tree.jsonl");
+	writeFileSync(path, `${lines.join("\n")}\n`, "utf8");
+	return path;
+}
+
+/** Total nodes in a nested session tree. */
+function countTreeNodes(roots: readonly AgentConnectionSessionTreeNode[]): number {
+	let count = 0;
+	const stack: AgentConnectionSessionTreeNode[] = [...roots];
+	while (stack.length > 0) {
+		const node = stack.pop()!;
+		count++;
+		stack.push(...node.children);
+	}
+	return count;
+}
 
 class FakeDaemonClient {
 	readonly requests: DaemonCommand[] = [];
@@ -69,6 +112,10 @@ class FakeDaemonClient {
 	cancelPromptAdmissionStatus: "cancelled" | "owned" | "unknown" = "owned";
 	serverCapabilities = new Set<string>();
 	updateRestartSessions: Array<Record<string, unknown>> = [];
+	/** Overrides the get_session_tree response, exactly what a daemon would send. */
+	sessionTreeResponse:
+		| { flatNodes: AgentConnectionSessionTreeFlatNode[]; leafId: string | null; treeBound?: unknown }
+		| undefined;
 	hello: DaemonHello | undefined = {
 		type: "daemon_hello",
 		socketPath: "/tmp/fake.sock",
@@ -235,6 +282,14 @@ class FakeDaemonClient {
 					},
 				};
 			case "get_session_tree":
+				if (this.sessionTreeResponse) {
+					return {
+						type: "response",
+						command: command.type,
+						success: true,
+						data: this.sessionTreeResponse,
+					};
+				}
 				return {
 					type: "response",
 					command: command.type,
@@ -3443,6 +3498,55 @@ describe("DaemonAgentConnection", () => {
 			type: "get_session_tree",
 			activeSessionId: "active-1",
 		});
+	});
+
+	it("carries the daemon's flat tree bound to the client for a session past the cap", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "daemon-tree-bound-"));
+		try {
+			const sessionManager = SessionManager.open(writeLargeSession(directory), directory);
+			const bounded = sessionManager.getBoundedFlatTree();
+			// daemon-mode's get_session_tree handler sends exactly this payload:
+			// flatNodes, leafId and treeBound: bounded.stats.
+			expect(bounded.stats.totalEntries).toBe(30_001);
+			expect(bounded.stats.truncated).toBe(true);
+
+			const fakeClient = new FakeDaemonClient();
+			fakeClient.sessionTreeResponse = {
+				flatNodes: bounded.nodes,
+				leafId: sessionManager.getLeafId(),
+				treeBound: bounded.stats,
+			};
+			const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+			await connection.attach();
+			// Age the attach snapshot so getSessionTree issues the real get_session_tree
+			// request instead of returning the (boundless) snapshot tree.
+			fakeClient.emitMessage({
+				type: "session_event",
+				activeSessionId: "active-1",
+				event: {
+					type: "session_action_update",
+					actions: { queuedCount: 0, steering: [], followUps: [] },
+				},
+				meta: {
+					id: "active-1:13",
+					protocol: DAEMON_PROTOCOL_INFO,
+					activeSessionId: "active-1",
+					sequence: 13,
+					emittedAt: "2026-01-01T00:00:00.000Z",
+				},
+			});
+
+			const sessionTree = await connection.getSessionTree();
+			// The bound the daemon measured is the bound the client sees: before the fix
+			// the connection dropped treeBound on the floor, so a >20k session's tree
+			// truncation was invisible at the client boundary (bound === undefined).
+			expect(sessionTree.bound).toEqual(bounded.stats);
+			expect(sessionTree.bound?.truncated).toBe(true);
+			expect(countTreeNodes(sessionTree.tree)).toBe(bounded.stats.returnedNodes);
+			expect(sessionTree.leafId).toBe("entry-30000");
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
 	});
 
 	it("loads serializable tool metadata through the daemon protocol", async () => {

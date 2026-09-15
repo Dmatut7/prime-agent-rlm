@@ -24,6 +24,7 @@ import {
 	SESSION_TREE_FLAT_MAX_NODES,
 	SESSION_TREE_MAX_WIRE_DEPTH,
 	type SessionEntry,
+	type SessionFlatTreeStats,
 	type SessionHeader,
 	SessionManager,
 	type SessionTreeDepthStats,
@@ -31,7 +32,10 @@ import {
 } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import { createAgentConnectionSnapshot } from "../src/modes/agent-connection/snapshot.js";
-import type { AgentConnectionSessionTreeBound } from "../src/modes/agent-connection/types.js";
+import type {
+	AgentConnectionSessionTreeBound,
+	AgentConnectionSessionTreeFlatStats,
+} from "../src/modes/agent-connection/types.js";
 import { serializeJsonLine } from "../src/modes/rpc/jsonl.js";
 import { createTestResourceLoader } from "./utilities.js";
 
@@ -70,6 +74,45 @@ function writeChainSession(length: number): string {
 		parentId = entry.id;
 	}
 	const path = join(tempDir, `deep-tree-${length}.jsonl`);
+	writeFileSync(path, `${lines.join("\n")}\n`, "utf8");
+	return path;
+}
+
+/**
+ * A session file that is one root with `children` sibling entries: depth 1, width
+ * `children`. This is the shape a rewind-fork-heavy or multi-branch session produces -
+ * shallow, but O(entries) nodes wide.
+ */
+function writeStarSession(children: number): string {
+	const header: SessionHeader = {
+		type: "session",
+		id: "star-tree-session",
+		version: 3,
+		timestamp: new Date(0).toISOString(),
+		cwd: tempDir,
+	};
+	const lines: string[] = [JSON.stringify(header)];
+	const rootEntry: SessionEntry = {
+		type: "custom",
+		id: "star-root",
+		parentId: null,
+		timestamp: new Date(0).toISOString(),
+		customType: "probe",
+		data: {},
+	};
+	lines.push(JSON.stringify(rootEntry));
+	for (let index = 0; index < children; index++) {
+		const entry: SessionEntry = {
+			type: "custom",
+			id: `star-${index}`,
+			parentId: "star-root",
+			timestamp: new Date(index + 1).toISOString(),
+			customType: "probe",
+			data: { index },
+		};
+		lines.push(JSON.stringify(entry));
+	}
+	const path = join(tempDir, `star-tree-${children}.jsonl`);
 	writeFileSync(path, `${lines.join("\n")}\n`, "utf8");
 	return path;
 }
@@ -193,6 +236,23 @@ describe("session tree wire bounds", () => {
 		const unbounded = sessionManager.getBoundedFlatTree(SESSION_TREE_FLAT_MAX_NODES);
 		expect(unbounded.stats.truncated).toBe(false);
 		expect(unbounded.stats.totalEntries).toBe(5);
+
+		// The flat stats ride get_session_tree's treeBound, so the connection contract
+		// owns a wire DTO for them (AgentConnectionSessionTreeFlatStats). Pin the two
+		// field sets to each other, both directions, exactly like the depth-bound mirror:
+		// a field added to or dropped from either side must fail here instead of silently
+		// narrowing the wire shape (treeBound was a dead wire field precisely because no
+		// pin and no consumer existed).
+		expect(Object.keys(bounded.stats).sort()).toEqual([
+			"maxNodes",
+			"omittedNodes",
+			"returnedNodes",
+			"totalEntries",
+			"truncated",
+		]);
+		const flatMirror: AgentConnectionSessionTreeFlatStats = bounded.stats;
+		const statsMirror: SessionFlatTreeStats = flatMirror;
+		expect(Object.keys(flatMirror).sort()).toEqual(Object.keys(statsMirror).sort());
 	});
 
 	/**
@@ -374,5 +434,39 @@ describe("session tree wire bounds", () => {
 		const boundMirror: AgentConnectionSessionTreeBound = stats;
 		const statsMirror: SessionTreeDepthStats = boundMirror;
 		expect(Object.keys(boundMirror).sort()).toEqual(Object.keys(statsMirror).sort());
+	});
+
+	/**
+	 * CM-3: a depth bound cannot bound the frame on its own. A star-shaped session
+	 * (one root, 30k children) has maxDepth 1, so every node passed the depth window,
+	 * the whole tree went on the wire (~6.4MB serialized) and the stats said
+	 * truncated:false while the flat view of the *same* session cut at 20k nodes and
+	 * said truncated:true. The nested bound needs a total node cap, and it must keep
+	 * the same side as every other bound: the newest entries plus the live leaf's
+	 * retained ancestors.
+	 */
+	it("bounds the total node count of a wide tree, not only its depth", () => {
+		const sessionManager = SessionManager.open(writeStarSession(30_000), tempDir);
+		const bounded = sessionManager.getBoundedTree();
+
+		expect(bounded.stats.entries).toBe(30_001);
+		expect(bounded.stats.maxDepth).toBe(1);
+		// The cap is 20k newest entries plus the live leaf's retained ancestors (the
+		// root), so at most 20_001 nodes - not the 30_001 the depth window let through.
+		expect(bounded.stats.returnedNodes).toBeLessThanOrEqual(20_001);
+		expect(bounded.stats.omittedNodes).toBe(30_001 - bounded.stats.returnedNodes);
+		expect(bounded.stats.truncated).toBe(true);
+		expect(bounded.stats.leafIncluded).toBe(true);
+		expect(bounded.stats.returnedNodes + bounded.stats.omittedNodes).toBe(bounded.stats.entries);
+		// The kept side is the newest one; the root survives as the leaf's ancestor.
+		expect(treeContains(bounded.tree, "star-29999")).toBe(true);
+		expect(treeContains(bounded.tree, "star-0")).toBe(false);
+		expect(treeContains(bounded.tree, "star-root")).toBe(true);
+		// The capped tree is both smaller than the whole star and bounded in node count,
+		// which is what keeps the frame from growing with the session's width.
+		const boundedLine = serializeJsonLine({ tree: bounded.tree });
+		const unboundedLine = serializeJsonLine({ tree: sessionManager.getTree() });
+		expect(boundedLine.length).toBeLessThan(unboundedLine.length);
+		expect(boundedLine.length).toBeLessThan(4_000_000);
 	});
 });
