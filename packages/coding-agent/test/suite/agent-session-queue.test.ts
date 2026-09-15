@@ -1145,8 +1145,11 @@ describe("AgentSession queue characterization", () => {
 				throw new Error("outcome write failed");
 			});
 
+			// K3Q-2/MV-5: the persist failure is rethrown wrapped in
+			// RefinePersistScopeError (same message, plus the effective scope for the
+			// failure receipt); assert the message rather than the instance.
 			await expect(harness.session.refine({ instructions: "audit persistence failure" })).rejects.toThrow(
-				auditAppendError,
+				auditAppendError.message,
 			);
 
 			expect(harness.session.messages.some(isRefinementOutcomeMessage)).toBe(true);

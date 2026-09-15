@@ -12,7 +12,7 @@ import { type AgentAutonomousStatus, type AutonomousLimitReason, autonomousLimit
 import { flushRawStdout, writeRawStdout } from "../core/output-guard.js";
 import { killTrackedDetachedChildren } from "../utils/shell.js";
 import { InProcessAgentConnection } from "./agent-connection/in-process-agent-connection.js";
-import type { AgentConnection } from "./agent-connection/types.js";
+import type { AgentConnection, AgentConnectionDisposeOptions } from "./agent-connection/types.js";
 import { latestAutonomousGateAttempt, selectHeadlessTerminalResult } from "./headless-completion.js";
 
 /**
@@ -67,14 +67,18 @@ async function runPrintModeWithConnectionInternal(
 	const { mode, messages = [], initialMessage, initialImages } = options;
 	let exitCode = 0;
 	let disposed = false;
+	// K3Q-1: set when the quiescence barrier gave up with descendants still
+	// running; the dispose then leaves the session alive instead of tearing it
+	// (and its descendants) down.
+	let leaveSessionRunning = false;
 	let unsubscribe: (() => void) | undefined;
 	const signalCleanupHandlers: Array<() => void> = [];
 
-	const disposeConnection = async (): Promise<void> => {
+	const disposeConnection = async (options?: AgentConnectionDisposeOptions): Promise<void> => {
 		if (disposed) return;
 		disposed = true;
 		unsubscribe?.();
-		await connection.dispose();
+		await connection.dispose(options);
 	};
 
 	for (const signal of [
@@ -125,6 +129,17 @@ async function runPrintModeWithConnectionInternal(
 		const autonomousStatus = await connection.waitForHeadlessCompletion({
 			waitForRlmQuiescence: connection.supportsRlmQuiescenceBarrier?.() ?? true,
 		});
+		// K3Q-1: the barrier can give up on its deadline with descendants still
+		// running (FR-4). That must not read as a clean completion: say so on
+		// stderr, exit non-zero, and dispose without stopping the session so the
+		// still-running descendants are not aborted by the teardown cascade.
+		if (autonomousStatus.rlmQuiescence?.timedOut) {
+			console.error(
+				"RLM subagents are still running: the wait for them gave up after its deadline, so this run is not a clean completion. Their work was not aborted and the session was left running - re-attach to this session to follow it.",
+			);
+			exitCode = 1;
+			leaveSessionRunning = true;
+		}
 		if (mode === "text") {
 			const { primary, compactionOutcomes } = selectHeadlessTerminalResult(await connection.getMessages());
 			if (primary?.role === "assistant") {
@@ -172,7 +187,7 @@ async function runPrintModeWithConnectionInternal(
 		for (const cleanup of signalCleanupHandlers) {
 			cleanup();
 		}
-		await disposeConnection();
+		await disposeConnection(leaveSessionRunning ? { keepSessionRunning: true } : undefined);
 		await flushRawStdout();
 	}
 }

@@ -5,7 +5,6 @@ import { appendRotatingLog, getAgentDir, getAgentLogPath, getDaemonLogPath } fro
 import type { AgentSessionMessageReceipt, AgentSessionMessageSafetyStatus } from "../../core/agent-messages.js";
 import type { AgentSessionEvent } from "../../core/agent-session.js";
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
-import type { AgentAutonomousStatus } from "../../core/autonomous.js";
 import type { BashResult } from "../../core/bash-executor.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
@@ -55,9 +54,11 @@ import {
 	listDaemonSavedSessions,
 	renameDaemonSavedSession,
 } from "../daemon/saved-session-catalog.js";
+import type { HeadlessCompletionResult } from "../headless-completion.js";
 import type {
 	AgentConnection,
 	AgentConnectionBeforeSessionInvalidateListener,
+	AgentConnectionDisposeOptions,
 	AgentConnectionEvent,
 	AgentConnectionEventListener,
 	AgentConnectionExecuteBashOptions,
@@ -1343,13 +1344,15 @@ export class DaemonAgentConnection implements AgentConnection {
 		);
 	}
 
-	async waitForHeadlessCompletion(options?: AgentConnectionHeadlessCompletionOptions): Promise<AgentAutonomousStatus> {
+	async waitForHeadlessCompletion(
+		options?: AgentConnectionHeadlessCompletionOptions,
+	): Promise<HeadlessCompletionResult> {
 		if (options?.waitForRlmQuiescence && !this.client.supportsServerCapability("rlm_quiescence_barrier")) {
 			throw new Error(
 				"the daemon is running an older build without RLM quiescence barriers; restart the daemon and try again",
 			);
 		}
-		return this.requestData<AgentAutonomousStatus>(
+		return this.requestData<HeadlessCompletionResult>(
 			{
 				type: "wait_for_headless_completion",
 				activeSessionId: this.activeSessionId,
@@ -1742,7 +1745,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		};
 	}
 
-	async dispose(): Promise<void> {
+	async dispose(options?: AgentConnectionDisposeOptions): Promise<void> {
 		if (this.disposed || this.disposing) {
 			return;
 		}
@@ -1762,6 +1765,14 @@ export class DaemonAgentConnection implements AgentConnection {
 		this.rosterStore = undefined;
 		this.unsubscribeDaemonMessages();
 		this.unsubscribeDaemonClose();
+		// K3Q-1: a headless run that gave up waiting for still-running descendants
+		// must not stop the worker - complete_owned_session's worker shutdown
+		// cascades into aborting them. Promote the owned session to resident first
+		// so it survives the detach; the descendants keep running and the session
+		// can be re-attached.
+		if (this.options.ownedSession && options?.keepSessionRunning) {
+			await this.promoteToResident().catch(() => undefined);
+		}
 		if (this.options.ownedSession) {
 			await this.requestOk({ type: "complete_owned_session", activeSessionId: this.activeSessionId }).catch(
 				() => undefined,

@@ -327,6 +327,7 @@ import {
 	parseRefineCommandOptions,
 	parseSessionSlashCommand,
 	parseSlashCommand,
+	type RefineCommandOptions,
 	type SessionSlashCommand,
 	type SlashCommandInfo,
 } from "./slash-commands.js";
@@ -562,6 +563,23 @@ export class CompactionSkippedError extends Error {}
 
 /** Thrown when a session_before_refine extension skips the refinement round. */
 export class RefineSkippedError extends Error {}
+
+/**
+ * A refinement persist failure annotated with the effective target scope (the
+ * requested scope can differ: a local request rolling back a global record
+ * writes the global store). The message is the underlying persist error's;
+ * failure receipts read the scope off this wrapper instead of the request.
+ */
+export class RefinePersistScopeError extends Error {
+	constructor(
+		message: string,
+		readonly scope: HarnessScope,
+		options?: { cause?: unknown },
+	) {
+		super(message, options);
+		this.name = "RefinePersistScopeError";
+	}
+}
 
 export interface AgentSessionConfig {
 	agent: Agent;
@@ -8246,13 +8264,17 @@ export class AgentSession {
 					break;
 				case "refine": {
 					let result: RefinementResult;
-					const options = parseRefineCommandOptions(input.command.args);
+					// MV-5: the parse sits inside the try so a bad /refine invocation
+					// still emits refine_failed and leaves a model-visible receipt; the
+					// pre-fix placement outside the try lost both.
+					let options: RefineCommandOptions | undefined;
 					try {
+						options = parseRefineCommandOptions(input.command.args);
 						result = await this.refine(options, { skipAbort: true });
 					} catch (error) {
 						// Only a failure of the refinement itself is a refine failure; a later
 						// result-row persist error must not report a completed refinement as failed.
-						this._emitRefineFailed(this._asError(error), options.global ? "global" : "local");
+						this._emitRefineFailed(this._asError(error), options?.global ? "global" : "local");
 						throw error;
 					}
 					const applied = result.appliedEdits.filter((edit) => edit.applied).length;
@@ -9614,6 +9636,9 @@ export class AgentSession {
 		const provisioner = this._ipythonKernelProvisioner;
 		if (!provisioner?.hasRunningKernel) return;
 		const snapshot = await provisioner.pruneOversizedVariables().catch(() => null);
+		// FR-5: a null write on a kernel with no snapshot machine is not a failed
+		// write; the notice must not talk about a snapshot that never existed.
+		const hasSnapshotConfig = provisioner.hasSnapshotTarget();
 		const abort = new AbortController();
 		const timer = setTimeout(() => abort.abort(), KERNEL_STATE_LISTING_TIMEOUT_MS);
 		if (typeof timer === "object" && "unref" in timer) timer.unref();
@@ -9624,9 +9649,11 @@ export class AgentSession {
 			clearTimeout(timer);
 		}
 		if (names === null && !provisioner.hasRunningKernel) return;
-		const content = ["<ipython_state>", ...compactionKernelStateLines({ snapshot, names }), "</ipython_state>"].join(
-			"\n",
-		);
+		const content = [
+			"<ipython_state>",
+			...compactionKernelStateLines({ snapshot, names, hasSnapshotConfig }),
+			"</ipython_state>",
+		].join("\n");
 		const message = {
 			role: "custom" as const,
 			customType: "ipython_state",
@@ -10182,6 +10209,10 @@ export class AgentSession {
 	 */
 	private _emitRefineFailed(error: unknown, scope: HarnessScope = "local"): void {
 		const reason = error instanceof Error ? error.message : String(error);
+		// MV-5: the requested scope is the caller's guess; a persist failure
+		// knows the effective target scope (a local request can roll back a
+		// global record) and the receipt must carry that one.
+		const effectiveScope = error instanceof RefinePersistScopeError ? error.scope : scope;
 		this._emit({
 			type: "refine_failed",
 			error: reason,
@@ -10193,7 +10224,7 @@ export class AgentSession {
 		// nothing. A skip is a deliberate decline, not a failure: it stays
 		// event-only.
 		if (error instanceof RefineSkippedError) return;
-		this._recordRefinementFailureReceipt(reason, scope);
+		this._recordRefinementFailureReceipt(reason, effectiveScope);
 	}
 
 	private _recordRefinementFailureReceipt(reason: string, scope: HarnessScope): void {
@@ -10961,7 +10992,15 @@ export class AgentSession {
 			// concurrent-write rejection left a "Refinement complete" receipt in the
 			// message flow while nothing landed on disk; the failure path now
 			// reports through `_emitRefineFailed` at the caller's catch instead.
-			if (refinementPersistError) throw refinementPersistError.error;
+			// The wrapper carries the *effective* target scope (MV-5): a local
+			// request rolling back a global record must not be reported with the
+			// requested scope.
+			if (refinementPersistError) {
+				const cause = refinementPersistError.error;
+				throw cause instanceof Error
+					? new RefinePersistScopeError(cause.message, targetScope, { cause })
+					: new RefinePersistScopeError(String(cause), targetScope, { cause });
+			}
 			this._recordRefinementOutcome(result);
 			this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
 			this.agent.state.systemPrompt = this._baseSystemPrompt;
@@ -12527,22 +12566,40 @@ export class AgentSession {
 	 * gets an error that says retrying is pointless and what to do instead.
 	 */
 	/**
-	 * Drop expired entries (O1) and enforce the volume ceiling: entries whose
-	 * last failure is older than the TTL are not "consecutive" with a fresh one,
-	 * and the ledger never grows past `AGENT_MESSAGE_SEND_FAILURE_MAX_TARGETS`
-	 * targets (oldest last-failure evicted first; re-insertion on update keeps
-	 * the map's insertion order aligned with recency).
+	 * Drop expired entries (O1): entries whose last failure is older than the TTL
+	 * are not "consecutive" with a fresh one. Runs before the count is read so a
+	 * stale entry for the current target does not survive into the count.
 	 */
-	private _pruneAgentMessageSendFailures(now: number): void {
+	private _expireAgentMessageSendFailures(now: number): void {
 		for (const [target, failure] of this._agentMessageSendFailures) {
 			if (now - failure.lastFailedAt > AGENT_MESSAGE_SEND_FAILURE_TTL_MS) {
 				this._agentMessageSendFailures.delete(target);
 			}
 		}
+	}
+
+	/**
+	 * Enforce the volume ceiling (O1): the ledger never grows past
+	 * `AGENT_MESSAGE_SEND_FAILURE_MAX_TARGETS` targets. The eviction prefers the
+	 * entry carrying the least information - lowest consecutive-failure count,
+	 * ties broken by least-recent failure (re-insertion on update keeps the map's
+	 * insertion order aligned with recency). A target mid-failure-sequence (count
+	 * already 2+) is therefore never evicted while single-failure targets exist;
+	 * the pre-fix order pruned by plain recency before the count was read, which
+	 * could reset the count of the target that was failing right now.
+	 */
+	private _enforceAgentMessageSendFailureCeiling(): void {
 		while (this._agentMessageSendFailures.size >= AGENT_MESSAGE_SEND_FAILURE_MAX_TARGETS) {
-			const oldest = this._agentMessageSendFailures.keys().next().value;
-			if (oldest === undefined) break;
-			this._agentMessageSendFailures.delete(oldest);
+			let victim: string | undefined;
+			let victimCount = Number.POSITIVE_INFINITY;
+			for (const [target, failure] of this._agentMessageSendFailures) {
+				if (failure.count < victimCount) {
+					victim = target;
+					victimCount = failure.count;
+				}
+			}
+			if (victim === undefined) break;
+			this._agentMessageSendFailures.delete(victim);
 		}
 	}
 
@@ -12554,10 +12611,11 @@ export class AgentSession {
 			return original;
 		}
 		const now = Date.now();
-		this._pruneAgentMessageSendFailures(now);
+		this._expireAgentMessageSendFailures(now);
 		const attempts = (this._agentMessageSendFailures.get(target)?.count ?? 0) + 1;
 		this._agentMessageSendFailures.delete(target);
 		this._agentMessageSendFailures.set(target, { count: attempts, lastError: message, lastFailedAt: now });
+		this._enforceAgentMessageSendFailureCeiling();
 		if (attempts < AGENT_MESSAGE_RETRYABLE_FAILURE_LIMIT) return original;
 		// Countable signature for a sender that burned its retry budget (appendix B).
 		sessionLog.warn("agent message retryable repeat terminal", {

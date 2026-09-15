@@ -1,6 +1,6 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import type { AgentSession } from "../core/agent-session.js";
+import type { AgentSession, RlmQuiescenceOutcome } from "../core/agent-session.js";
 import {
 	type AgentAutonomousStatus,
 	autonomousLimitReason,
@@ -89,24 +89,44 @@ export interface HeadlessCompletionOptions {
 	shouldStopGateContinuations?: () => boolean;
 }
 
+/**
+ * The autonomous status of a headless run plus the RLM quiescence barrier's
+ * final outcome. `rlmQuiescence` is present only when the caller asked for the
+ * barrier; `settled: false` with `timedOut: true` means descendants were still
+ * running when the wait gave up on its deadline, so the run is not a clean
+ * completion and callers must not treat it as one.
+ */
+export interface HeadlessCompletionResult extends AgentAutonomousStatus {
+	/** Outcome of the last RLM quiescence barrier wait in this run. */
+	rlmQuiescence?: RlmQuiescenceOutcome;
+}
+
 export async function waitForHeadlessCompletion(
 	session: AgentSession,
 	options: HeadlessCompletionOptions = {},
-): Promise<AgentAutonomousStatus> {
+): Promise<HeadlessCompletionResult> {
 	let lastPromptedProgressKey: string | undefined;
 	let repeatedProgressPrompts = 0;
+	// K3Q-1: the barrier's give-up outcome must travel with the result. The
+	// caller (print mode, ACP) has to be able to tell "everything settled" apart
+	// from "descendants were still running when the wait gave up" - the outcome
+	// used to be discarded here, so a 5-minute deadline completed the run as if
+	// nothing was left behind.
+	let rlmQuiescence: RlmQuiescenceOutcome | undefined;
+	const withQuiescence = (status: AgentAutonomousStatus): HeadlessCompletionResult =>
+		rlmQuiescence === undefined ? status : { ...status, rlmQuiescence };
 	while (true) {
-		if (options.waitForRlmQuiescence) await session.waitForRlmQuiescence();
+		if (options.waitForRlmQuiescence) rlmQuiescence = await session.waitForRlmQuiescence();
 		else await session.waitForHeadlessIdle();
 		const status = session.getAutonomousStatus();
 		if (!shouldContinueAutonomousGates(status) || !status.lastGateFailure) {
-			return status;
+			return withQuiescence(status);
 		}
 		// Gate continuations are the only mutating step of this wait. A handoff in
 		// progress must not be raced by fresh prompts; finish with the current
 		// status (the run reports the still-failing gate) instead.
 		if (options.shouldStopGateContinuations?.()) {
-			return status;
+			return withQuiescence(status);
 		}
 		const progressKey = autonomousProgressKey(status);
 		if (progressKey === lastPromptedProgressKey) {
@@ -140,7 +160,7 @@ export async function waitForHeadlessCompletion(
 					continue;
 				}
 				if (options.waitForRlmQuiescence) continue;
-				return postErrorStatus;
+				return withQuiescence(postErrorStatus);
 			}
 		}
 	}

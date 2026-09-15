@@ -56,6 +56,8 @@ interface DaemonSchemaSliceSources {
 	connectionTreeContract: string;
 	connectionSnapshotWrapper: string;
 	connectionStallContract: string;
+	headlessResult: string;
+	quiescenceOutcome: string;
 }
 
 function readDaemonSchemaSliceSources(): DaemonSchemaSliceSources {
@@ -73,6 +75,7 @@ function readDaemonSchemaSliceSources(): DaemonSchemaSliceSources {
 	// unchanged DAEMON_SCHEMA_ID (the rev34 comment admitted the types.ts stall DTO was
 	// "not an identity" for exactly this reason), so they join the hashed source.
 	const connectionTypesSource = readFileSync(resolve(__dirname, "../src/modes/agent-connection/types.ts"), "utf8");
+	const headlessCompletionSource = readFileSync(resolve(__dirname, "../src/modes/headless-completion.ts"), "utf8");
 	const daemonModeSource = readFileSync(resolve(__dirname, "../src/modes/daemon/daemon-mode.ts"), "utf8");
 	return {
 		command: daemonProtocolSource.slice(
@@ -138,6 +141,18 @@ function readDaemonSchemaSliceSources(): DaemonSchemaSliceSources {
 			connectionTypesSource.indexOf('| {\n\t\t\ttype: "stall_warning"'),
 			connectionTypesSource.indexOf("export type AgentConnectionEvent"),
 		),
+		// K3Q-1: the wait_for_headless_completion response is a wire shape too. Its
+		// optional rlmQuiescence field rides the rlm_quiescence_barrier capability, but
+		// the shapes live in headless-completion.ts and agent-session.ts, outside every
+		// prior slice; an edit would otherwise ride an unchanged DAEMON_SCHEMA_ID.
+		headlessResult: headlessCompletionSource.slice(
+			headlessCompletionSource.indexOf("export interface HeadlessCompletionResult"),
+			headlessCompletionSource.indexOf("export async function waitForHeadlessCompletion"),
+		),
+		quiescenceOutcome: agentSessionSource.slice(
+			agentSessionSource.indexOf("/** Outcome of a quiescence barrier wait"),
+			agentSessionSource.indexOf("/** How long failure-class terminal notices are collected"),
+		),
 	};
 }
 
@@ -158,6 +173,8 @@ function daemonSchemaDigest(sources: DaemonSchemaSliceSources): string {
 				sources.connectionTreeContract,
 				sources.connectionSnapshotWrapper,
 				sources.connectionStallContract,
+				sources.headlessResult,
+				sources.quiescenceOutcome,
 			].join("\n"),
 		)
 		.digest("hex")
@@ -237,6 +254,8 @@ describe("daemon protocol helpers", () => {
 		expect(sources.connectionStallContract).toContain('type: "stall_unsettled"');
 		expect(sources.connectionStallContract).toContain("diagnostics?: StallDiagnostics");
 		const digest = daemonSchemaDigest(sources);
+		expect(sources.headlessResult).toContain("rlmQuiescence");
+		expect(sources.quiescenceOutcome).toContain("export interface RlmQuiescenceOutcome");
 		expect(DAEMON_SCHEMA_ID).toBe(`protocol-${DAEMON_PROTOCOL_VERSION}-schema-${DAEMON_SCHEMA_REVISION}-${digest}`);
 	});
 

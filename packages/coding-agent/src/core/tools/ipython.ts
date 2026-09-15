@@ -422,6 +422,15 @@ export class IpythonKernelProvisioner {
 		return (await m?.pruneOversizedVariables()) ?? null;
 	}
 
+	/**
+	 * Whether this kernel has a snapshot target configured at all. Non-persistent
+	 * sessions configure none: their snapshot writes are not failures but the
+	 * absence of the mechanism (FR-5's post-compaction notice words them apart).
+	 */
+	hasSnapshotTarget(): boolean {
+		return this.options?.snapshotDir !== undefined;
+	}
+
 	/** Live user-defined names in the kernel namespace, or null if listing failed / no kernel. */
 	async listNamespaceNames(signal?: AbortSignal): Promise<string[] | null> {
 		const m = this.startedManager ?? (await this.managerPromise?.catch(() => undefined));

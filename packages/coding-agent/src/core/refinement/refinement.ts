@@ -639,9 +639,19 @@ export function appendGlobalRefinement(harnessStateDir: string, result: Refineme
 
 /**
  * Persist a refinement that has already been applied in memory.
- * Writes the rollback audit (session jsonl, then global history) before the
- * harness file so a crash after the audit still lets `/refine rollback` find
- * the id. `expectedStamp` refuses to clobber a concurrent kernel write.
+ * Writes the harness state first, then the rollback audit (session jsonl and
+ * global history) only after the state write succeeded. `expectedStamp` refuses
+ * to clobber a concurrent kernel write.
+ *
+ * K3Q-2: the order used to be audit/history first, "so a crash after the audit
+ * still lets `/refine rollback` find the id". But the stamp check happens at the
+ * state write, so a *losing concurrent writer* still left rollback-selectable
+ * audit and history rows for a refinement whose failure receipt said nothing was
+ * recorded - a ghost a later rollback could act on. Writing the state first
+ * means a rejected stamp refuses before any history lands; the crash window
+ * moves to "state written, audit not yet", the safer side of the trade: an
+ * applied refinement rollback cannot find is un-actionable, while a ghost row
+ * for an unapplied refinement is not.
  */
 export function persistAppliedRefinement(options: {
 	harnessStateDir: string;
@@ -651,14 +661,15 @@ export function persistAppliedRefinement(options: {
 	appendSessionAudit: (result: RefinementResult) => void;
 	globalHarnessStateDir?: string;
 }): string {
-	options.result.harnessStatePath = getHarnessStatePath(options.harnessStateDir);
+	const statePath = saveHarnessState(options.harnessStateDir, options.state, {
+		expectedStamp: options.expectedStamp,
+	});
+	options.result.harnessStatePath = statePath;
 	options.appendSessionAudit(options.result);
 	if (options.globalHarnessStateDir) {
 		appendGlobalRefinement(options.globalHarnessStateDir, options.result);
 	}
-	return saveHarnessState(options.harnessStateDir, options.state, {
-		expectedStamp: options.expectedStamp,
-	});
+	return statePath;
 }
 
 export function loadGlobalRefinementHistory(harnessStateDir: string = getGlobalHarnessStateDir()): RefinementResult[] {
