@@ -9,6 +9,10 @@
 #      a revision that was "green locally".
 #   3. Pushing a tree the gate did not verify - `npm run check` runs `biome check --write`,
 #      so a run on a dirty tree certifies bytes that are not the ones the push sends.
+#   4. Quoting "CI is green" from memory. Step 4 asks GitHub what the run for *this* revision
+#      concluded and prints the run id, so a green claim has a name; when that revision already
+#      has a finished non-green run the push is refused unless PREFLIGHT_RED_REVISION_REASON
+#      says why the verdict is unrelated.
 #
 # Every check here is fail-closed. A gate that cannot tell "verified" from "could not verify"
 # prints a certificate it has not earned, so `gh` being missing, failing or answering something
@@ -20,7 +24,7 @@ cd "$(dirname "$0")/.."
 
 BRANCH="${PREFLIGHT_BRANCH:-$(git rev-parse --abbrev-ref HEAD)}"
 
-echo "== 1/3 the tree that is about to be pushed =="
+echo "== 1/4 the tree that is about to be pushed =="
 if [ -n "${PREFLIGHT_BRANCH:-}" ]; then
   echo "   branch pinned by PREFLIGHT_BRANCH: $BRANCH"
 elif [ "$BRANCH" = "HEAD" ]; then
@@ -42,7 +46,7 @@ if [ -n "$untracked" ]; then
 fi
 echo "   worktree matches HEAD"
 
-echo "== 2/3 waiting for any in-flight run on $BRANCH =="
+echo "== 2/4 waiting for any in-flight run on $BRANCH =="
 for attempt in $(seq 1 60); do
   # Fail-closed: the status of `gh` is read, not discarded. An unavailable or failing `gh` used to
   # read as "nothing in flight" and still print the success line at the end.
@@ -78,7 +82,7 @@ for attempt in $(seq 1 60); do
   if [ "$attempt" = "60" ]; then echo "   still busy after 20min: refusing to push"; exit 1; fi
 done
 
-echo "== 3/3 repo checks (biome + tsgo + installer + browser smoke) =="
+echo "== 3/4 repo checks (biome + tsgo + installer + browser smoke) =="
 npm run check
 
 if [ "${1:-}" != "--skip-tests" ]; then
@@ -94,4 +98,20 @@ if ! git diff --quiet HEAD --; then
   exit 1
 fi
 
-echo "preflight OK - worktree == HEAD, no run in flight, checks green: safe to push"
+echo "== 4/4 the run any 'CI is green' claim has to name =="
+head_sha=$(git rev-parse HEAD)
+if ! verdict_output=$(bash scripts/latest-ci-run.sh --branch "$BRANCH" --commit "$head_sha" --require-success 2>&1); then
+  echo "$verdict_output" | sed 's/^/   /'
+  if [ -n "${PREFLIGHT_RED_REVISION_REASON:-}" ]; then
+    echo "   overridden by PREFLIGHT_RED_REVISION_REASON: $PREFLIGHT_RED_REVISION_REASON"
+  else
+    echo "   refusing to push: $head_sha already has a finished CI run that is not green."
+    echo "   Pushing it again does not make it green. Fix the failure, or set"
+    echo "   PREFLIGHT_RED_REVISION_REASON=<written reason> if this push is unrelated to that verdict."
+    exit 1
+  fi
+else
+  echo "$verdict_output" | sed 's/^/   /'
+fi
+
+echo "preflight OK - worktree == HEAD, no run in flight, checks green, revision verdict printed: safe to push"

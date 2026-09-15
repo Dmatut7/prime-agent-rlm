@@ -144,9 +144,16 @@ jobs:
             command: npm run test:process --
             report: coverage/ci-process-smoke.json
             min_tests: 20
-            min_ran_tests: 9
+            # This job runs 11 of the 23 tests it collects: the other 12 carry the `process-stress`
+            # tag that vitest.config.ts filters out, and the floor used to be 9, so two of them
+            # could disappear unnoticed. The ledger step below pins the twelve exactly.
+            min_ran_tests: 11
             # The process-stress tests in these two files are the nightly job's face, not this one's.
             max_nothing_files: 1
+            # What this job deliberately does not run, declared and counted. `;;` separates entries;
+            # the reason names where those tests do run, and scripts/check-tag-skip-ledger.sh fails
+            # the job when the report disagrees with this list in either direction.
+            tag_skip_ledger: 'packages/coding-agent/test/daemon-supervisor-process.test.ts=8:process-stress tag-filtered by vitest.config.ts; nightly-process-stress.yml runs it;;packages/coding-agent/test/daemon-supervisor-crash-handlers-process.test.ts=4:process-stress tag-filtered by vitest.config.ts; nightly-process-stress.yml runs it'
             install_uv: true
           # 4603-worker-recovery drives the machine-wide discovery commands (`status`,
           # `doctor --fix`, `shutdown --force`): `daemon ps` finds every prime-agent
@@ -257,6 +264,16 @@ jobs:
           --min-ran-tests ${{ matrix.min_ran_tests }}
           --max-nothing-files ${{ matrix.max_nothing_files }}
 
+      # The coverage gate counts floors and files that ran nothing; it cannot see a test that a
+      # `tagsFilter` turned into `skipped` inside a file that otherwise runs. Jobs that skip by tag
+      # declare what they skip here, and one more (or one fewer) skip is a red job that names it.
+      - name: Tag-skip ledger (every skip declared, counted and named)
+        if: matrix.tag_skip_ledger != ''
+        working-directory: ${{ matrix.package }}
+        run: >-
+          bash ../../scripts/check-tag-skip-ledger.sh ${{ matrix.report }}
+          --ledger "${{ matrix.tag_skip_ledger }}"
+
   test-hygiene:
     name: Test hygiene
     needs: trust
@@ -290,6 +307,16 @@ jobs:
       # Diff-scoped and baseline-frozen: the existing stock in scripts/test-private-probe-baseline.json
       # is ignored, anything new under packages/*/test/** fails. BASE_REF is empty or all zeros for a
       # new branch, which the gate reports and then answers from the baseline alone.
+      # The two gates above keep tests honest about probes and about running at all; these keep the
+      # CI story itself honest: the tests CI cannot run are on a written list, and the "latest run
+      # concluded X" answer comes from a query rather than from memory.
+      - name: CI honesty gates (tag-skip ledger, platform coverage, latest-run query)
+        run: |
+          bash scripts/check-tag-skip-ledger.sh --self-test
+          bash scripts/check-platform-coverage.sh
+          bash scripts/check-platform-coverage.sh --self-test
+          bash scripts/latest-ci-run.sh --self-test
+
       - name: No new private-member probes in tests
         env:
           BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
