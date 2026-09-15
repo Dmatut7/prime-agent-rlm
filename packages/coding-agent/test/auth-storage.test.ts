@@ -762,6 +762,43 @@ describe("AuthStorage", () => {
 			await expect(authStorage.getApiKey("prime-inference")).resolves.toBeUndefined();
 		});
 
+		test("logout reports that it also cleared the shared Prime CLI config", () => {
+			const primeConfigPath = join(tempDir, "prime-config.json");
+			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key", team_id: "team-1" }));
+			writeAuthJson({});
+
+			authStorage = AuthStorage.create(authJsonPath, {
+				primeCliConfigPath: primeConfigPath,
+				usePrimeCliConfig: true,
+			});
+
+			expect(authStorage.drainNotices()).toEqual([]);
+			authStorage.logout("prime-inference");
+
+			const notices = authStorage.drainNotices();
+			expect(notices).toHaveLength(1);
+			expect(notices[0]?.provider).toBe("prime-inference");
+			expect(notices[0]?.message).toContain("Prime CLI config");
+			expect(notices[0]?.message).toContain(primeConfigPath);
+			// Drained, not replayed: the notice describes one removal.
+			expect(authStorage.drainNotices()).toEqual([]);
+		});
+
+		test("logout stays quiet when the shared Prime CLI config held nothing to remove", () => {
+			const primeConfigPath = join(tempDir, "prime-config.json");
+			writeFileSync(primeConfigPath, JSON.stringify({ base_url: "https://prime-api.example" }));
+			writeAuthJson({ "prime-inference": { type: "api_key", key: "agent-key" } });
+
+			authStorage = AuthStorage.create(authJsonPath, {
+				primeCliConfigPath: primeConfigPath,
+				usePrimeCliConfig: true,
+			});
+
+			authStorage.logout("prime-inference");
+
+			expect(authStorage.drainNotices()).toEqual([]);
+		});
+
 		test("setPrimeInferenceTeamSelection writes Prime CLI config", () => {
 			const primeConfigPath = join(tempDir, "prime-config.json");
 			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key" }));

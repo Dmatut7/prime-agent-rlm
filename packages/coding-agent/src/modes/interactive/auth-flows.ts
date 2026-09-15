@@ -214,7 +214,13 @@ export class ProviderAuthFlows {
 							providerOption.authType === "oauth"
 								? `Logged out of ${providerOption.name}`
 								: `Removed stored API key for ${providerOption.name}. Environment variables and models.json config are unchanged.`;
-						this.host.showStatus(message);
+						// A logout can reach outside this store (Prime Inference clears the shared
+						// Prime CLI config). The status line is where the user learns that, so the
+						// notice rides along with the message that says the logout worked.
+						const notices = this.host.modelRegistry.authStorage.drainNotices();
+						this.host.showStatus(
+							notices.length > 0 ? `${message} ${notices.map((notice) => notice.message).join(" ")}` : message,
+						);
 						resolve(providerOption.id);
 					} catch (error: unknown) {
 						this.host.showError(`Logout failed: ${error instanceof Error ? error.message : String(error)}`);
