@@ -1,0 +1,4 @@
+- Fixed `doctor --fix` and `shutdown --force` to give the same verdict on an unreachable service with live workers, and to stop those workers instead of refusing.
+- Added a 15s startup grace so a freshly started background service is not swept as an abandoned one.
+- Reported an unsampled cpu reading as "not sampled" instead of implying a measured zero.
+- Made the stop selection a required argument of the reap/shutdown planners, so whole-machine is never a silent fallback.

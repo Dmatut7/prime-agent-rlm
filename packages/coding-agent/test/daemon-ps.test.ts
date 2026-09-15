@@ -15,6 +15,7 @@ import {
 	sortDaemons,
 	verifyHelloSupervisorPid,
 } from "../src/cli/daemon-ps.js";
+import { MACHINE_STOP_SELECTION } from "../src/cli/daemon-stop-scope.js";
 import { getProcessStartId } from "../src/core/session-lease.js";
 import { defaultDaemonSocketDir } from "../src/modes/daemon/daemon-socket.js";
 
@@ -160,6 +161,7 @@ describe("planReap", () => {
 				makeDaemon({ socketPath: "/tmp/busy.sock", status: "current", sessionCount: 3, pid: 2 }),
 			],
 			true,
+			MACHINE_STOP_SELECTION,
 		);
 		expect(plan.map((action) => action.kind)).toEqual(["skip", "skip"]);
 	});
@@ -171,6 +173,7 @@ describe("planReap", () => {
 				makeDaemon({ socketPath: "/tmp/orphan.sock", status: "orphan-file" }),
 			],
 			false,
+			MACHINE_STOP_SELECTION,
 		);
 		expect(plan.map((action) => action.kind)).toEqual(["shutdown", "remove-file"]);
 	});
@@ -182,6 +185,7 @@ describe("planReap", () => {
 				makeDaemon({ socketPath: "/tmp/live-default.sock", status: "current", isDefault: true, sessionCount: 0 }),
 			],
 			true,
+			MACHINE_STOP_SELECTION,
 		);
 		expect(plan[0]!.kind).toBe("remove-file");
 		expect(plan[1]!.kind).toBe("skip");
@@ -189,10 +193,10 @@ describe("planReap", () => {
 
 	it("only kills unreachable daemons with --force", () => {
 		const daemon = makeDaemon({ socketPath: "/tmp/hung.sock", status: "unreachable", pid: 7 });
-		const skipped = planReap([daemon], false)[0]!;
+		const skipped = planReap([daemon], false, MACHINE_STOP_SELECTION)[0]!;
 		expect(skipped.kind).toBe("skip");
 		expect(skipped.kind === "skip" ? skipped.reason : "").toContain("prime-agent shutdown --force");
-		expect(planReap([daemon], true)[0]!.kind).toBe("kill");
+		expect(planReap([daemon], true, MACHINE_STOP_SELECTION)[0]!.kind).toBe("kill");
 	});
 
 	it("refuses to kill a pid that backs more than one discovered daemon", () => {
@@ -202,10 +206,59 @@ describe("planReap", () => {
 				makeDaemon({ socketPath: "/tmp/phantom.sock", status: "unreachable", pid: 99 }),
 			],
 			true,
+			MACHINE_STOP_SELECTION,
 		);
 		const phantom = plan.find((action) => action.daemon.socketPath === "/tmp/phantom.sock");
 		expect(phantom?.kind).toBe("skip");
 		expect(phantom && phantom.kind === "skip" ? phantom.reason : "").toContain("also backs another daemon");
+	});
+});
+
+describe("planReap startup grace (DS-4)", () => {
+	it("leaves a just-started service out of the destroy plan", () => {
+		const fresh = makeDaemon({
+			socketPath: "/tmp/fresh.sock",
+			status: "current",
+			sessionCount: 0,
+			pid: 5,
+			uptimeSeconds: 2,
+		});
+		const settled = makeDaemon({
+			socketPath: "/tmp/settled.sock",
+			status: "current",
+			sessionCount: 0,
+			pid: 6,
+			uptimeSeconds: 3600,
+		});
+		const plan = planReap([fresh, settled], false, { scope: { kind: "machine" }, orphansOnly: false });
+		const freshAction = plan.find((action) => action.daemon.socketPath === "/tmp/fresh.sock");
+		expect(freshAction?.kind).toBe("skip");
+		expect(freshAction && freshAction.kind === "skip" ? freshAction.reason : "").toContain("startup grace");
+		expect(plan.find((action) => action.daemon.socketPath === "/tmp/settled.sock")?.kind).toBe("shutdown");
+	});
+
+	it("still cleans an orphan file regardless of age", () => {
+		const plan = planReap(
+			[makeDaemon({ socketPath: "/tmp/new-orphan.sock", status: "orphan-file", uptimeSeconds: 1 })],
+			false,
+			{ scope: { kind: "machine" }, orphansOnly: false },
+		);
+		expect(plan[0]!.kind).toBe("remove-file");
+	});
+});
+
+describe("unreachable + live workers verdict consistency (DS-4)", () => {
+	it("planReap and planShutdownAll give the same verdict under --force", () => {
+		const hung = makeDaemon({
+			socketPath: "/tmp/hung-workers.sock",
+			status: "unreachable",
+			pid: 7,
+			hasTrackedWorkers: true,
+			liveWorkerCount: 2,
+		});
+		const reap = planReap([hung], true, { scope: { kind: "machine" }, orphansOnly: false })[0]!;
+		const shutdown = planShutdownAll([hung], true, { scope: { kind: "machine" }, orphansOnly: false })[0]!;
+		expect(reap.kind).toBe(shutdown.kind);
 	});
 });
 
@@ -225,6 +278,7 @@ describe("planShutdownAll", () => {
 				makeDaemon({ socketPath: "/tmp/orphan.sock", status: "orphan-file" }),
 			],
 			true,
+			MACHINE_STOP_SELECTION,
 		);
 		expect(plan.map((action) => action.kind)).toEqual(["shutdown", "shutdown", "kill", "remove-file"]);
 	});
@@ -236,12 +290,17 @@ describe("planShutdownAll", () => {
 				makeDaemon({ socketPath: "/tmp/b.sock", status: "unreachable", pid: 10 }),
 			],
 			true,
+			MACHINE_STOP_SELECTION,
 		);
 		expect(plan.some((action) => action.kind === "skip")).toBe(false);
 	});
 
 	it("removes the socket file for an unreachable daemon with no pid", () => {
-		const plan = planShutdownAll([makeDaemon({ socketPath: "/tmp/c.sock", status: "unreachable" })], false);
+		const plan = planShutdownAll(
+			[makeDaemon({ socketPath: "/tmp/c.sock", status: "unreachable" })],
+			false,
+			MACHINE_STOP_SELECTION,
+		);
 		expect(plan[0]!.kind).toBe("remove-file");
 	});
 
@@ -251,8 +310,8 @@ describe("planShutdownAll", () => {
 			status: "unreachable",
 			hasTrackedWorkers: true,
 		});
-		expect(planShutdownAll([daemon], false)[0]!.kind).toBe("skip");
-		expect(planShutdownAll([daemon], true)[0]!.kind).toBe("remove-file");
+		expect(planShutdownAll([daemon], false, MACHINE_STOP_SELECTION)[0]!.kind).toBe("skip");
+		expect(planShutdownAll([daemon], true, MACHINE_STOP_SELECTION)[0]!.kind).toBe("remove-file");
 	});
 });
 

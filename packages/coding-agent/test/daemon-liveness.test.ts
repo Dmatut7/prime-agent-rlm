@@ -44,6 +44,22 @@ describe("evaluateDaemonLiveness", () => {
 	});
 });
 
+describe("evaluateDaemonLiveness cpu sampling honesty (DS-4)", () => {
+	it("reports an unsampled cpu reading differently from a sampled zero", () => {
+		const unsampled = evaluateDaemonLiveness({ sessionCount: 0, liveWorkerCount: 0, answeredProbe: true });
+		const sampledZero = evaluateDaemonLiveness({
+			sessionCount: 0,
+			liveWorkerCount: 0,
+			cpuPercent: 0,
+			answeredProbe: true,
+		});
+		expect(sampledZero.evidence).toEqual(["answered probe with no work"]);
+		expect(unsampled.evidence).toContain("cpu not sampled (no reading)");
+		expect(unsampled.evidence).not.toEqual(sampledZero.evidence);
+		expect(unsampled.liveness).toBe("idle");
+	});
+});
+
 describe("classifyReachable", () => {
 	it("keeps this build current", () => {
 		expect(classifyReachable(CURRENT, "live")).toBe("current");
