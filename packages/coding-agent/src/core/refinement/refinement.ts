@@ -88,7 +88,16 @@ export interface RefinementEdit {
 	arguments?: Record<string, unknown>;
 	metadata?: Record<string, unknown>;
 	reason?: string;
+	/**
+	 * The store the refiner named in front of the id, when it wrote the id with
+	 * the `[global:foo]` prefix the overview uses (M5). Stripped from `id`, kept
+	 * here so an edit aimed at the other store can be refused with a reason
+	 * instead of failing as a plain "entry not found".
+	 */
+	idScope?: HarnessScope;
 }
+
+const SCOPE_PREFIX_PATTERN = /^(global|local):/;
 
 export interface RefinementProposal {
 	summary: string;
@@ -127,6 +136,8 @@ export type AutoRefineReason = "turn_interval" | "compact";
 export interface AutoRefineReviewContext {
 	reason: AutoRefineReason;
 	turnsSinceLastReview: number;
+	/** Store the review is deciding about; auto-refine is local, and that is the default here. */
+	scope?: HarnessScope;
 }
 
 export interface AutoRefineReview {
@@ -528,8 +539,12 @@ export function getRefinementFailuresPath(harnessStateDir: string = getGlobalHar
 
 export type RefinementFailureSource = "refinement" | "auto-refine-review";
 
-/** Why the reply was lost: it could not be parsed, or the output budget cut it off. */
-export type RefinementFailureReason = "parse" | "length";
+/**
+ * Why the reply was lost: it could not be parsed, the output budget cut it off,
+ * the provider returned an error instead of a reply, or the reply parsed into a
+ * proposal whose `edits` field could not describe any edit (M6).
+ */
+export type RefinementFailureReason = "parse" | "length" | "provider-error" | "malformed-proposal";
 
 export interface RefinementFailureRecord {
 	ts: string;
@@ -720,6 +735,12 @@ export function formatHarnessStateForPrompt(
 		"# Continual Harness State",
 		"",
 		"Local continual harness entries belong to this Prime Agent session. Global continual harness entries persist across Prime Agent sessions.",
+		// M5: the overview mixes both stores and every id carries its store as a
+		// `[global:…]` prefix, while the read and refine defaults are local. Without
+		// this line the prefix reads as decoration, a seat that sees 1005 global
+		// memories still asks for a local refinement, and a local store that is
+		// simply empty reads as "there are no memories at all".
+		"Every entry id below is prefixed with the store it lives in, as in `[global:foo]` or `[local:foo]`; edits always use the bare id. Reads and `refine.run()` default to this session's local store, so an entry shown as `[global:foo]` is only addressable with an explicitly global request (`await refine.run(..., global_=True)`), and a local refinement cannot update or delete it.",
 		"The continual harness entries below are compact summaries, not full descriptions. Use them as routing/context hints; inspect or refine the underlying continual harness entry only when detail matters.",
 		"Default to local continual harness refinement for current task progress, temporary blockers, and session coordination. Use global continual harness refinement only for stable cross-session lessons, durable user preferences, reusable skills/subagents, or explicitly project-qualified facts.",
 		"Use these continual harness prompt notes, memories, skills, and subagent specs when they are relevant. The base system prompt is immutable; prompt entries below are supplemental notes only.",
@@ -798,8 +819,11 @@ export function formatHarnessStateForPrompt(
 	return lines.join("\n").trim();
 }
 
-function overviewForPrompt(state: HarnessState): string {
-	const lines: string[] = [];
+function overviewForPrompt(state: HarnessState, scope: HarnessScope = "local"): string {
+	const lines: string[] = [
+		`Entries are listed from both stores; each id carries its store as a \`[global:…]\` or \`[local:…]\` prefix. Use the bare id in edits. This request targets the ${scope} store, so an update or delete of an entry whose prefix names the other store is refused with a reason: ask for a ${scope === "global" ? "local" : "global"} refinement instead of guessing.`,
+		"",
+	];
 	for (const kind of Object.keys(state.entries) as RefinementKind[]) {
 		const entries = entriesForInjection(state, kind);
 		lines.push(`${kind}: ${entries.length}`);
@@ -996,6 +1020,17 @@ function extractJsonObject(text: string): unknown {
 }
 
 /**
+ * Split an id the refiner copied from the overview, where every entry is shown
+ * as `[global:foo]`. The bare id is what the stores are keyed by; the prefix is
+ * routing information (M5).
+ */
+function stripScopePrefix(id: string): { id: string; scope?: HarnessScope } {
+	const match = SCOPE_PREFIX_PATTERN.exec(id);
+	if (!match) return { id };
+	return { id: id.slice(match[0].length), scope: match[1] as HarnessScope };
+}
+
+/**
  * Normalizes an untrusted refinement proposal while preserving invalid edit
  * fields for apply-time validation.
  */
@@ -1009,21 +1044,25 @@ export function normalizeRefinementProposal(value: unknown): RefinementProposal 
 		expectedOutcome: typeof record.expectedOutcome === "string" ? record.expectedOutcome : "",
 		edits: edits
 			.filter((edit): edit is Record<string, unknown> => typeof edit === "object" && edit !== null)
-			.map((edit) => ({
-				action: edit.action as RefinementAction,
-				kind: edit.kind as RefinementKind,
-				id: typeof edit.id === "string" ? edit.id : undefined,
-				title: typeof edit.title === "string" ? edit.title : undefined,
-				content: typeof edit.content === "string" ? edit.content : undefined,
-				path: typeof edit.path === "string" ? edit.path : undefined,
-				reference: objectRecord(edit.reference),
-				arguments: objectRecord(edit.arguments),
-				metadata:
-					typeof edit.metadata === "object" && edit.metadata !== null && !Array.isArray(edit.metadata)
-						? (edit.metadata as Record<string, unknown>)
-						: undefined,
-				reason: typeof edit.reason === "string" ? edit.reason : undefined,
-			})),
+			.map((edit) => {
+				const bareId = typeof edit.id === "string" ? stripScopePrefix(edit.id) : undefined;
+				return {
+					action: edit.action as RefinementAction,
+					kind: edit.kind as RefinementKind,
+					id: bareId?.id,
+					idScope: bareId?.scope,
+					title: typeof edit.title === "string" ? edit.title : undefined,
+					content: typeof edit.content === "string" ? edit.content : undefined,
+					path: typeof edit.path === "string" ? edit.path : undefined,
+					reference: objectRecord(edit.reference),
+					arguments: objectRecord(edit.arguments),
+					metadata:
+						typeof edit.metadata === "object" && edit.metadata !== null && !Array.isArray(edit.metadata)
+							? (edit.metadata as Record<string, unknown>)
+							: undefined,
+					reason: typeof edit.reason === "string" ? edit.reason : undefined,
+				};
+			}),
 	};
 }
 
@@ -1049,8 +1088,36 @@ function parseModelJsonObject(
 	return value as Record<string, unknown>;
 }
 
+/**
+ * A proposal whose `edits` field is present but is not a list of edit objects
+ * applies zero edits while looking like a successful, empty refinement. Keep the
+ * reply as evidence: that is exactly the case that used to leave no record at
+ * all (M6).
+ */
+function malformedEditsError(edits: unknown): Error | undefined {
+	if (edits === undefined) return undefined;
+	if (!Array.isArray(edits)) {
+		return new Error(
+			`the refiner returned \`edits\` as ${edits === null ? "null" : typeof edits} instead of a list, so no edit could be applied`,
+		);
+	}
+	const badIndex = edits.findIndex((edit) => typeof edit !== "object" || edit === null || Array.isArray(edit));
+	if (badIndex === -1) return undefined;
+	return new Error(
+		`the refiner returned \`edits[${badIndex}]\` as ${edits[badIndex] === null ? "null" : typeof edits[badIndex]} instead of an edit object, so no edit could be applied`,
+	);
+}
+
 function parseProposal(text: string): RefinementProposal {
-	return normalizeRefinementProposal(parseModelJsonObject(text, "refinement", "Refiner JSON must be an object"));
+	const record = parseModelJsonObject(text, "refinement", "Refiner JSON must be an object");
+	const malformed = malformedEditsError(record.edits);
+	if (malformed) {
+		// Recorded, not thrown: the tolerant normalization below already turns this
+		// into "no applied edits", and the caller shows that. What was missing was
+		// the evidence that the proposal was dropped for a reason.
+		recordRefinementFailure(text, malformed, { source: "refinement", reason: "malformed-proposal" });
+	}
+	return normalizeRefinementProposal(record);
 }
 
 function validateEdit(edit: RefinementEdit, computedId?: string): string | undefined {
@@ -1104,12 +1171,37 @@ export function applyRefinementProposal(
 	const appliedEdits: AppliedRefinementEdit[] = [];
 	const proposalModifiedKeys = new Set<string>();
 	for (const edit of proposal.edits) {
-		const derivedId = edit.id ?? (edit.action === "create" ? slug(edit.title ?? edit.kind, edit.kind) : undefined);
+		// The overview shows every id with its store prefix (`[global:foo]`), and a
+		// refiner that copies one is naming the other store, not inventing an id
+		// (M5). Strip it here as well as at parse time so a directly constructed
+		// proposal is diagnosed the same way.
+		const stripped = edit.id === undefined ? undefined : stripScopePrefix(edit.id);
+		const claimedScope = edit.idScope ?? stripped?.scope;
+		const editId = stripped?.id ?? edit.id;
+		const derivedId = editId ?? (edit.action === "create" ? slug(edit.title ?? edit.kind, edit.kind) : undefined);
 		// Validate against the derived id first: a derived `base_system_prompt` must stay
 		// blocked even when that id is already taken.
 		const validationError = validateEdit(edit, derivedId ?? "");
 		if (validationError) {
 			appliedEdits.push({ ...edit, id: derivedId ?? "", applied: false, error: validationError });
+			continue;
+		}
+
+		// An id copied from the overview with its store prefix names the other store:
+		// refuse it with an actionable reason instead of letting it fall through to
+		// "entry not found", which is what made the local/global split a trap (M5).
+		// Creates are exempt: a fresh id cannot collide with an entry that lives
+		// elsewhere, so the prefix is just formatting there.
+		const targetScope = options.scope ?? "local";
+		if (claimedScope && claimedScope !== targetScope && edit.action !== "create") {
+			appliedEdits.push({
+				...edit,
+				id: derivedId ?? "",
+				applied: false,
+				error:
+					`entry id "${derivedId ?? ""}" is prefixed [${claimedScope}:] in the harness overview, but this refinement targets the ` +
+					`${targetScope} store: ask for a ${claimedScope} refinement (for example \`await refine.run(..., global_=True)\`) instead of a local one.`,
+			});
 			continue;
 		}
 
@@ -1298,7 +1390,7 @@ export async function planRefinement(
 		? "Requested refinement scope: global. Only propose stable cross-session continual harness edits, durable user preferences, reusable skills/subagents, or explicitly project-qualified facts that should affect future Prime Agent sessions. Do not persist session-only progress, temporary blockers, or current-run coordination globally."
 		: "Requested refinement scope: local. Prefer local continual harness edits for current task progress, temporary blockers, current-run coordination, and project facts that are not clearly reusable across Prime Agent sessions. Global entries in the overview are read-only context: do not propose update or delete edits for them; create a local entry instead if an override is needed.";
 	const userPrompt = [
-		`<current_harness_state>\n${overviewForPrompt(state)}\n</current_harness_state>`,
+		`<current_harness_state>\n${overviewForPrompt(state, options.global ? "global" : "local")}\n</current_harness_state>`,
 		`<refinement_history>\n${historyForPrompt(history)}\n</refinement_history>`,
 		`<conversation>\n${conversationText}\n</conversation>`,
 		`<scope_policy>\n${scopeInstruction}\n</scope_policy>`,
@@ -1329,7 +1421,12 @@ export async function planRefinement(
 		.join("\n");
 
 	if (response.stopReason === "error") {
-		throw new Error(`Refinement failed: ${response.errorMessage || "Unknown error"}`);
+		// A provider error loses the proposal the same way a parse failure does, and
+		// it used to leave no record at all: only parse and length were recorded, so
+		// a refinement that never happened could not be explained afterwards (M6).
+		const error = new Error(`Refinement failed: ${response.errorMessage || "Unknown error"}`);
+		recordRefinementFailure(text, error, { source: "refinement", reason: "provider-error" });
+		throw error;
 	}
 	if (response.stopReason === "length") {
 		// An exhausted budget loses the proposal exactly like a parse failure does,
@@ -1367,7 +1464,7 @@ export async function reviewAutoRefine(
 ${context.reason}; ${context.turnsSinceLastReview} assistant turns since last auto-refine review
 </trigger>`,
 		`<current_harness_state>
-${overviewForPrompt(state)}
+${overviewForPrompt(state, context.scope ?? "local")}
 </current_harness_state>`,
 		`<refinement_history>
 ${historyForPrompt(history)}
@@ -1393,7 +1490,9 @@ ${conversationText}
 		.map((content) => content.text)
 		.join("\n");
 	if (response.stopReason === "error") {
-		throw new Error(`Auto-refine review failed: ${response.errorMessage || "Unknown error"}`);
+		const error = new Error(`Auto-refine review failed: ${response.errorMessage || "Unknown error"}`);
+		recordRefinementFailure(text, error, { source: "auto-refine-review", reason: "provider-error" });
+		throw error;
 	}
 	if (response.stopReason === "length") {
 		const error = new Error(`Auto-refine review failed: ${TRUNCATED_JSON_ERROR}`);

@@ -192,7 +192,11 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 		argumentHint: "[id|path]",
 		takesArgument: true,
 	},
-	{ name: "reload", description: "Reload keybindings, extensions, skills, prompts, and themes" },
+	{
+		name: "reload",
+		description:
+			"Reload keybindings, extensions, skills, prompts, and themes (settings.json edits are picked up live; values read at startup still need this)",
+	},
 	{
 		name: "fullscreen",
 		description: "Toggle fullscreen (alternate screen) rendering with scrollable transcript",

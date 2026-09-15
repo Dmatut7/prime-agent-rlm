@@ -50,6 +50,7 @@ import {
 	type AgentSessionServices,
 	createAgentSessionFromServices,
 	createAgentSessionServices,
+	markTelemetryNoticeShown,
 } from "./core/agent-session-services.js";
 import { formatNoModelsAvailableMessage } from "./core/auth-guidance.js";
 import { AuthStorage } from "./core/auth-storage.js";
@@ -162,6 +163,19 @@ function collectSettingsDiagnostics(
 		message: `(${context}, ${scope} settings) ${message}`,
 	}));
 	return [...errors, ...warnings];
+}
+
+/**
+ * Hand the one-time telemetry disclosure to the interactive UI, and spend the
+ * one-time flag only now that the notice is on its way into the transcript the
+ * user is looking at (TEL-4). Diagnostics still carry the text for print, RPC
+ * and daemon clients, which must not consume it.
+ */
+function takeInteractiveTelemetryNotice(services: AgentSessionServices): string | undefined {
+	const notice = services.telemetryNotice;
+	if (notice === undefined) return undefined;
+	markTelemetryNoticeShown(services.settingsManager);
+	return notice;
 }
 
 function reportDiagnostics(diagnostics: readonly AgentSessionRuntimeDiagnostic[]): void {
@@ -1688,6 +1702,7 @@ export async function main(args: string[], options?: MainOptions) {
 			agentConnection,
 			daemonSocketPath,
 			uiServices: daemonUiServices,
+			startupNotice: takeInteractiveTelemetryNotice(services),
 			promptStashStore,
 			promptStashSessionId: summary.sessionId,
 			bindLocalSessionExtensions: false,
@@ -1897,6 +1912,7 @@ export async function main(args: string[], options?: MainOptions) {
 		const interactiveMode = new InteractiveMode({
 			agentConnection: new InProcessAgentConnection(runtime),
 			localSessionHost: createInteractiveModeLocalSessionHost(runtime),
+			startupNotice: takeInteractiveTelemetryNotice(runtime.services),
 			promptStashStore: new ClientPromptStashStore(),
 			promptStashSessionId: session.sessionId,
 			bindLocalSessionExtensions: true,
