@@ -157,3 +157,59 @@ describe("navigateTree cut points", () => {
 		expect(unpairedToolCallIds(ctx.session.agent.state.messages)).toEqual([]);
 	});
 });
+
+describe("branch away-and-back idempotency (B2)", () => {
+	it("restores the exact original context when the head tail is a complete tool pair", () => {
+		const session = SessionManager.inMemory();
+		const userId = session.appendMessage(userMsg("hi"));
+		session.appendMessage(assistantWithTools(["tc-1"]));
+		const headId = session.appendMessage(toolResultMsg("tc-1"));
+		const before = session.buildSessionContext().messages;
+
+		session.branch(userId);
+		session.branch(headId);
+
+		expect(session.getLeafId()).toBe(headId);
+		expect(session.buildSessionContext().messages).toEqual(before);
+	});
+
+	it("restores the exact original context when a trailing user message abandoned the unpaired toolCall", () => {
+		const session = SessionManager.inMemory();
+		const userId = session.appendMessage(userMsg("hi"));
+		session.appendMessage(assistantWithTools(["tc-a"]));
+		const headId = session.appendMessage(userMsg("after"));
+		const before = session.buildSessionContext().messages;
+
+		session.branch(userId);
+		session.branch(headId);
+
+		expect(session.getLeafId()).toBe(headId);
+		expect(session.buildSessionContext().messages).toEqual(before);
+	});
+
+	it("lands away-and-back on the snapped cut deterministically and keeps the dropped entry in the transcript", () => {
+		const session = SessionManager.inMemory();
+		session.appendMessage(userMsg("hi"));
+		session.appendMessage(assistantWithTools(["tc-1"]));
+		const resultId = session.appendMessage(toolResultMsg("tc-1"));
+		const orphanAssistantId = session.appendMessage(assistantWithTools(["tc-2"]));
+
+		for (let round = 0; round < 2; round++) {
+			session.branch(resultId);
+			session.branch(orphanAssistantId);
+
+			// The snap from the tool-pair cut: branch never sits on an unpaired
+			// toolCall, so returning to this head lands one entry short of the
+			// leaf the session held before the round trip.
+			expect(session.getLeafId()).toBe(resultId);
+			expect(session.buildSessionContext().messages).toEqual([
+				expect.objectContaining({ role: "user" }),
+				expect.objectContaining({ role: "assistant" }),
+				expect.objectContaining({ role: "toolResult", toolCallId: "tc-1" }),
+			]);
+		}
+
+		// The excluded entry is dropped from the context, not from the transcript.
+		expect(session.getEntries().map((entry) => entry.id)).toContain(orphanAssistantId);
+	});
+});
