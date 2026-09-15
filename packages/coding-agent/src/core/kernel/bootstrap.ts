@@ -1279,6 +1279,19 @@ async function reportRuntimeSourceShadow(options: EnsureKernelPythonOptions): Pr
 }
 
 /**
+ * The interpreter path inside one managed kernel venv. uv lays a Windows venv
+ * out as `Scripts\python.exe` and a POSIX venv out as `bin/python`; the
+ * readiness probes and the `uv pip install --python` argument address that
+ * file directly, so a POSIX literal on win32 never exists and the kernel
+ * cannot boot (`venv-in-use.ts` already accepts both bin and scripts layouts).
+ */
+export function kernelVenvInterpreter(venv: string): string {
+	return process.platform === "win32"
+		? path.win32.join(venv, "Scripts", "python.exe")
+		: path.join(venv, "bin", "python");
+}
+
+/**
  * The one `uv pip install` argv a fresh generation is built from. Exported so the requirement shape
  * (runtime + snapshot + pinned default packages) is assertable without a network or a real install.
  */
@@ -1304,7 +1317,7 @@ async function bootstrapVenv(
 	// without spawning anything, and its requirement is never the bare registry name.
 	const install = await resolveKernelRuntimeInstall();
 	const uv = await ensureUv(options);
-	const python = path.join(venv, "bin", "python");
+	const python = kernelVenvInterpreter(venv);
 	const runtimeIdentity = install.identity;
 
 	await run(uv, ["python", "install", PYTHON_VERSION], { signal: options.signal });
@@ -1515,7 +1528,7 @@ async function ensureKernelPythonUncached(
 	// This build identity's own directory. A kernel started from it keeps this exact path
 	// for its whole life, and a later identity change builds a sibling instead of touching it.
 	const venv = kernelVenvDirForIdentity(base, runtimeIdentity);
-	const python = path.join(venv, "bin", "python");
+	const python = kernelVenvInterpreter(venv);
 	/**
 	 * Hand back this generation's interpreter, claimed.
 	 *
