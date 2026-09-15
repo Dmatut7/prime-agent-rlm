@@ -1,0 +1,5 @@
+- Fixed one unparseable ancestor settings file discarding the session's own project settings: only the broken file is skipped now (with a warning, its consent still withheld), and the rest of the project scope keeps its effect.
+- Fixed repository-level settings vetoes written while a session is running not taking effect until an unrelated reload or restart: ancestor settings files are now watched too.
+- Fixed any settings save silently dropping CLI/SDK runtime overrides from the merged settings view until the next reload.
+- Fixed complete transcript records longer than 64 KiB being truncated away by the torn-tail repair when they lost only their terminating newline; oversized unverifiable tails are left untouched instead.
+- Fixed saved-session rename repairing and appending without the session write lease: both rename paths now refuse while another writer holds the lease.
