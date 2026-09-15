@@ -1889,6 +1889,9 @@ export class SessionManager {
 	private ownsSessionDir: boolean;
 	private flushed: boolean = false;
 	private fileEntries: FileEntry[] = [];
+	/** Incrementally maintained (count, tailId) of what getEntries() returns; see getEntryStats(). */
+	private entryCount = 0;
+	private entryTailId: string | undefined;
 	private byId: Map<string, SessionEntry> = new Map();
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
@@ -2049,6 +2052,7 @@ export class SessionManager {
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
 		this.leafId = null;
+		this._rescanEntryStats();
 		this.flushed = false;
 
 		if (this.persist) {
@@ -2062,6 +2066,7 @@ export class SessionManager {
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
 		this.leafId = null;
+		this._rescanEntryStats();
 		for (const entry of this.fileEntries) {
 			if (entry.type === "session") continue;
 			this.byId.set(entry.id, entry);
@@ -2294,10 +2299,33 @@ export class SessionManager {
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
-		this.fileEntries.push(entry);
-		this.byId.set(entry.id, entry);
+		this._pushIndexedEntry(entry);
 		this.leafId = entry.id;
 		this._persist(entry);
+	}
+
+	/**
+	 * Push one entry and advance the incremental (count, tailId) stats with it, so
+	 * {@link getEntryStats} stays O(1) on the append-heavy write path.
+	 */
+	private _pushIndexedEntry(entry: SessionEntry): void {
+		this.fileEntries.push(entry);
+		this.byId.set(entry.id, entry);
+		this.entryCount += 1;
+		this.entryTailId = entry.id;
+	}
+
+	/** Recompute the incremental entry stats from fileEntries (rebuild, rollback, reset). */
+	private _rescanEntryStats(): void {
+		let count = 0;
+		let tailId: string | undefined;
+		for (const entry of this.fileEntries) {
+			if (entry.type === "session") continue;
+			count += 1;
+			tailId = entry.id;
+		}
+		this.entryCount = count;
+		this.entryTailId = tailId;
 	}
 
 	appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
@@ -2605,6 +2633,7 @@ export class SessionManager {
 			if (this.leafId !== null && this.leafId !== previousLeafId) {
 				this.byId.delete(this.leafId);
 				this.fileEntries.pop();
+				this._rescanEntryStats();
 				this.leafId = previousLeafId;
 				// The failed append may have left a torn line on disk. Restore the file
 				// from the rolled-back entries now; if that also fails (e.g. the disk is
@@ -2698,6 +2727,16 @@ export class SessionManager {
 
 	getEntries(): SessionEntry[] {
 		return this.fileEntries.filter((e): e is SessionEntry => e.type !== "session");
+	}
+
+	/**
+	 * O(1) count and tail id of the entries getEntries() would return. The roster
+	 * usage memo compares these on every republication; going through
+	 * getEntries() there cost an O(transcript) array copy per memo HIT, which
+	 * made the "cheap" check the same order as the fold it avoids.
+	 */
+	getEntryStats(): { count: number; tailId: string | undefined } {
+		return { count: this.entryCount, tailId: this.entryTailId };
 	}
 
 	getFlatTree(): SessionTreeFlatNode[] {
@@ -2993,8 +3032,7 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 			targetId,
 		};
-		this.fileEntries.push(entry);
-		this.byId.set(entry.id, entry);
+		this._pushIndexedEntry(entry);
 		this._persist(entry);
 	}
 
@@ -3007,8 +3045,7 @@ export class SessionManager {
 	 * re-asserted behind it.
 	 */
 	private _appendEntryKeepingLeaf(entry: SessionEntry): void {
-		this.fileEntries.push(entry);
-		this.byId.set(entry.id, entry);
+		this._pushIndexedEntry(entry);
 		this._persist(entry);
 		this._recordLeafPosition(this.leafId);
 	}

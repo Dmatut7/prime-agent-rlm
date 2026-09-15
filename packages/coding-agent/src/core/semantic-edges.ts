@@ -149,6 +149,149 @@ export function hashTurnBody(
 }
 
 /**
+ * The shape one captured message takes in a {@link TurnBodyCache}: the object
+ * identity plus the primitive fields and content-block identities the body hash
+ * was derived from. Reading these back and comparing with `===` is O(messages),
+ * not O(bytes) - a few pointer compares per message instead of a full re-serialize.
+ */
+interface CapturedBlock {
+	ref: unknown;
+	type: unknown;
+	text: unknown;
+	name: unknown;
+	id: unknown;
+}
+
+interface CapturedMessage {
+	ref: unknown;
+	role: unknown;
+	content: unknown;
+	blocks: ReadonlyArray<CapturedBlock> | undefined;
+}
+
+interface CapturedTool {
+	ref: unknown;
+	name: unknown;
+	description: unknown;
+}
+
+interface TurnBodyCache {
+	provider: string;
+	modelId: string;
+	systemPrompt: string | undefined;
+	messages: ReadonlyArray<CapturedMessage>;
+	tools: ReadonlyArray<CapturedTool> | undefined;
+	optionsKey: string;
+	hash: string;
+}
+
+function captureBlock(block: unknown): CapturedBlock {
+	const b = block as { type?: unknown; text?: unknown; name?: unknown; id?: unknown };
+	return { ref: block, type: b.type, text: b.text, name: b.name, id: b.id };
+}
+
+function blockMatches(captured: CapturedBlock, block: unknown): boolean {
+	if (captured.ref !== block) return false;
+	const b = block as { type?: unknown; text?: unknown; name?: unknown; id?: unknown };
+	return captured.type === b.type && captured.text === b.text && captured.name === b.name && captured.id === b.id;
+}
+
+function captureMessage(message: unknown): CapturedMessage {
+	const m = message as { role?: unknown; content?: unknown };
+	const content = m.content;
+	const blocks = Array.isArray(content) ? content.map(captureBlock) : undefined;
+	return { ref: message, role: m.role, content, blocks };
+}
+
+function messageMatches(captured: CapturedMessage, message: unknown): boolean {
+	if (captured.ref !== message) return false;
+	const m = message as { role?: unknown; content?: unknown };
+	if (captured.role !== m.role) return false;
+	const content = m.content;
+	if (captured.content !== content) return false;
+	if (captured.blocks === undefined) return true;
+	if (!Array.isArray(content) || content.length !== captured.blocks.length) return false;
+	for (let index = 0; index < captured.blocks.length; index++) {
+		if (!blockMatches(captured.blocks[index]!, content[index])) return false;
+	}
+	return true;
+}
+
+function captureTool(tool: unknown): CapturedTool {
+	const t = tool as { name?: unknown; description?: unknown };
+	return { ref: tool, name: t.name, description: t.description };
+}
+
+function toolMatches(captured: CapturedTool, tool: unknown): boolean {
+	if (captured.ref !== tool) return false;
+	const t = tool as { name?: unknown; description?: unknown };
+	return captured.name === t.name && captured.description === t.description;
+}
+
+/**
+ * A one-entry memo over {@link hashTurnBody} for the stream wrap. The first call
+ * with a given (model, context, options) pays the full stringify+sha256; a call
+ * that arrives with the very same objects - an SDK-level retry re-issuing the
+ * failed call - reuses the cached hash after an O(messages) identity check
+ * instead of re-serializing the whole conversation. Any identity, length, role,
+ * or text/name change falls back to a fresh full hash, so a body that grew or
+ * mutated in place is still re-derived byte-exactly. In-place mutation of fields
+ * deeper than a content block's primitives (nested objects) is the one residual
+ * the check cannot see; the pure hashTurnBody stays the byte-exact derivation.
+ */
+export function createTurnBodyHashMemo(): (
+	model: { provider: string; id: string },
+	context: { systemPrompt?: string; messages: unknown[]; tools?: unknown[] },
+	options?: {
+		reasoning?: unknown;
+		thinkingBudgets?: unknown;
+		temperature?: number;
+		maxTokens?: number;
+		serviceTier?: unknown;
+	},
+) => string {
+	let cache: TurnBodyCache | undefined;
+	return (model, context, options) => {
+		const optionsKey = JSON.stringify({
+			reasoning: options?.reasoning,
+			thinkingBudgets: options?.thinkingBudgets,
+			temperature: options?.temperature,
+			maxTokens: options?.maxTokens,
+			serviceTier: options?.serviceTier,
+		});
+		if (
+			cache !== undefined &&
+			cache.provider === model.provider &&
+			cache.modelId === model.id &&
+			cache.systemPrompt === context.systemPrompt &&
+			cache.messages.length === context.messages.length &&
+			cache.optionsKey === optionsKey &&
+			cache.messages.every((captured, index) => messageMatches(captured, context.messages[index])) &&
+			toolsMatch(cache.tools, context.tools)
+		) {
+			return cache.hash;
+		}
+		const hash = hashTurnBody(model, context, options);
+		cache = {
+			provider: model.provider,
+			modelId: model.id,
+			systemPrompt: context.systemPrompt,
+			messages: context.messages.map(captureMessage),
+			tools: context.tools?.map(captureTool),
+			optionsKey,
+			hash,
+		};
+		return hash;
+	};
+}
+
+function toolsMatch(captured: ReadonlyArray<CapturedTool> | undefined, tools: unknown[] | undefined): boolean {
+	if (captured === undefined || tools === undefined) return captured === undefined && tools === undefined;
+	if (captured.length !== tools.length) return false;
+	return captured.every((entry, index) => toolMatches(entry, tools[index]));
+}
+
+/**
  * Append-only semantic-edge recorder for one agent session. It only WRITES
  * events; edge semantics live in the pure {@link deriveSemanticEdges} fold.
  *
@@ -214,6 +357,15 @@ export class SemanticEdgeRecorder {
 	/** False once the ledger has failed; callers skip per-request work (e.g. body hashing) when set. */
 	get enabled(): boolean {
 		return !this._disabled;
+	}
+
+	/**
+	 * True while calls are recorded to a ledger. The body hash exists to key the
+	 * parked auto-retry's Idempotency-Key reuse, and only a ledger-backed session
+	 * mints those; an in-memory session therefore never pays the stringify.
+	 */
+	get hasLedger(): boolean {
+		return this._ledgerPath !== undefined;
 	}
 
 	get lastTurnRequestId(): string | undefined {
@@ -590,9 +742,14 @@ export function unwrapSemanticEdgeStreamFn(streamFn: StreamFn): StreamFn {
  */
 export function wrapStreamFnWithSemanticEdges(streamFn: StreamFn, recorder: SemanticEdgeRecorder): StreamFn {
 	const inner = unwrapSemanticEdgeStreamFn(streamFn);
+	const bodyHashOf = createTurnBodyHashMemo();
 	const wrapped: StreamFn = (model, context, options) => {
-		// A disabled recorder never returns a request ID; skip the whole-conversation stringify+hash in that case.
-		const requestId = recorder.enabled ? recorder.startTurnRequest(hashTurnBody(model, context, options)) : undefined;
+		// A disabled recorder never returns a request ID, and a session with no
+		// ledger has no parked-retry identity to key, so neither ever pays the
+		// stringify. A ledger-backed repeat call with the same objects reuses the
+		// memoized hash instead of re-serializing the conversation.
+		const bodyHash = recorder.enabled && recorder.hasLedger ? bodyHashOf(model, context, options) : undefined;
+		const requestId = recorder.enabled ? recorder.startTurnRequest(bodyHash) : undefined;
 		if (requestId === undefined) {
 			return inner(model, context, options);
 		}

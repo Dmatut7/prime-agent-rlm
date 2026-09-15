@@ -1,0 +1,1 @@
+- Fixed long-session slowdowns: the roster usage memo check and the idempotency body hash no longer scale with transcript or context size.

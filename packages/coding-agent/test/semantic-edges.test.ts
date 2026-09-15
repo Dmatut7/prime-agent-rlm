@@ -942,6 +942,116 @@ describe("wrapStreamFnWithSemanticEdges", () => {
 		expect(events.at(-1)).toMatchObject({ type: "request_failed" });
 	});
 
+	it("serializes the body once for a repeat call with the same context objects", () => {
+		// The memo's identity check reads role/content/block fields but never
+		// `timestamp`; JSON.stringify reads everything, so a counting getter on
+		// timestamp observes full-body traversals and only those.
+		let timestampsRead = 0;
+		const messages = [
+			{
+				role: "user",
+				content: [{ type: "text", text: "hi" }],
+				get timestamp() {
+					timestampsRead += 1;
+					return 1;
+				},
+			},
+		];
+		const probedContext = { systemPrompt: "s", messages, tools: [] } as unknown as Parameters<StreamFn>[1];
+		const inner: StreamFn = () => createAssistantMessageEventStream();
+		const wrapped = wrapStreamFnWithSemanticEdges(inner, recorderIn("memo-once.jsonl"));
+
+		wrapped(model, probedContext, undefined);
+		const firstTraversal = timestampsRead;
+		// Control: the first call did serialize the body, so the probe is not vacuous.
+		expect(firstTraversal).toBeGreaterThan(0);
+
+		wrapped(model, probedContext, undefined);
+		// The repeat call reuses the memoized hash: no second traversal.
+		expect(timestampsRead).toBe(firstTraversal);
+	});
+
+	it("re-serializes when the context grows between calls", () => {
+		let timestampsRead = 0;
+		const messages: Array<Record<string, unknown>> = [
+			{
+				role: "user",
+				content: [{ type: "text", text: "hi" }],
+				get timestamp() {
+					timestampsRead += 1;
+					return 1;
+				},
+			},
+		];
+		const probedContext = { systemPrompt: "s", messages, tools: [] } as unknown as Parameters<StreamFn>[1];
+		const inner: StreamFn = () => createAssistantMessageEventStream();
+		const wrapped = wrapStreamFnWithSemanticEdges(inner, recorderIn("memo-grow.jsonl"));
+
+		wrapped(model, probedContext, undefined);
+		const firstTraversal = timestampsRead;
+		expect(firstTraversal).toBeGreaterThan(0);
+
+		messages.push({ role: "user", content: "more", timestamp: 2 });
+		wrapped(model, probedContext, undefined);
+		expect(timestampsRead).toBeGreaterThan(firstTraversal);
+	});
+
+	it("reuses a parked retry ID through the memoized hash and forfeits it on in-place mutation", () => {
+		const recorder = recorderIn("memo-retry.jsonl");
+		const messages = [{ role: "user", content: [{ type: "text", text: "original" }], timestamp: 1 }];
+		const probedContext = { systemPrompt: "s", messages, tools: [] } as unknown as Parameters<StreamFn>[1];
+		const inner: StreamFn = () => createAssistantMessageEventStream();
+		const wrapped = wrapStreamFnWithSemanticEdges(inner, recorder);
+
+		wrapped(model, probedContext, undefined);
+		const attemptId = recorder.lastTurnRequestId;
+		expect(attemptId).toBeDefined();
+		recorder.prepareTurnRetry();
+
+		// Same objects: the memo hit reuses the body hash, so the parked key is claimed.
+		wrapped(model, probedContext, undefined);
+		expect(recorder.lastTurnRequestId).toBe(attemptId);
+		recorder.prepareTurnRetry();
+
+		// TOCTOU: the live message mutates between the call and the retry; the
+		// captured block texts no longer match, so the body is re-hashed and the
+		// parked key is forfeited exactly as a full re-serialization would.
+		(messages[0]!.content as Array<{ type: string; text: string }>)[0]!.text = "mutated";
+		wrapped(model, probedContext, undefined);
+		expect(recorder.lastTurnRequestId).not.toBe(attemptId);
+	});
+
+	it("never serializes the body when the recorder has no ledger", () => {
+		// An in-memory session still mints request IDs on the wire, but its calls
+		// carry no body hash, so no stringify is paid at all.
+		let timestampsRead = 0;
+		const messages = [
+			{
+				role: "user",
+				content: "hi",
+				get timestamp() {
+					timestampsRead += 1;
+					return 1;
+				},
+			},
+		];
+		const probedContext = { systemPrompt: "s", messages, tools: [] } as unknown as Parameters<StreamFn>[1];
+		const captured: Array<Record<string, string> | undefined> = [];
+		const inner: StreamFn = (_model, _context, options) => {
+			captured.push(options?.headers);
+			return createAssistantMessageEventStream();
+		};
+		const memoryOnly = new SemanticEdgeRecorder({ sessionId: "memory-only" });
+		const wrapped = wrapStreamFnWithSemanticEdges(inner, memoryOnly);
+
+		wrapped(model, probedContext, undefined);
+		wrapped(model, probedContext, undefined);
+		expect(timestampsRead).toBe(0);
+		expect(captured).toHaveLength(2);
+		expect(captured[0]?.[MODEL_REQUEST_ID_HEADER]).toMatch(/^[0-9a-f]{32}$/);
+		expect(captured[1]?.[MODEL_REQUEST_ID_HEADER]).not.toBe(captured[0]?.[MODEL_REQUEST_ID_HEADER]);
+	});
+
 	it("rebinding a wrapped streamFn attributes calls to the new recorder only", () => {
 		const parentRecorder = recorderIn("parent.jsonl");
 		const childRecorder = recorderIn("child.jsonl");
