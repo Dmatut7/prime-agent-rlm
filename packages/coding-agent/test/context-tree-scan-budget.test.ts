@@ -372,7 +372,9 @@ describe("default behavior is unchanged", () => {
 		writeSiblings(rlmDir, 6, KIB);
 
 		const result = scan(rlmDir, undefined, new Set(["sub-0000", "sub-0001"]));
-		expect(result.nodes.map((node) => node.id)).toEqual(["sub-0002", "sub-0003", "sub-0004", "sub-0005"]);
+		// Newest first: the listing order is the budget's eviction policy, so the most
+		// recently active child leads and the oldest is what a cap would drop.
+		expect(result.nodes.map((node) => node.id)).toEqual(["sub-0005", "sub-0004", "sub-0003", "sub-0002"]);
 		expectDiagnostics(result, { scannedChildren: 4, skippedByBudget: 0, truncated: false });
 	});
 

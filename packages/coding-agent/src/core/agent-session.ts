@@ -131,9 +131,11 @@ import {
 import {
 	type ContextTreeNode,
 	type ContextWindowResolver,
+	contextTreeScanDiagnostics,
+	createContextTreeScanState,
 	loadContextTreeChildFromDisk,
-	loadContextTreeChildrenFromDisk,
 	OwnUsageAccumulator,
+	scanContextTreeChildrenFromDisk,
 } from "./context-tree.js";
 import type { AgentCronJob, AgentRlmHeartbeatController, AgentRlmHeartbeatStatusUpdate } from "./cron-jobs.js";
 import { normalizeHeartbeatDeliveryMode } from "./cron-jobs.js";
@@ -15369,12 +15371,17 @@ export class AgentSession {
 		const ownUsage = cloneUsage(totals.ownUsage);
 		const totalUsage = cloneUsage(totals.totalUsage);
 
+		// One budget for the whole roster: the persisted children of this session and
+		// of every live child are read for the same report, so they are charged to the
+		// same accounting and the omission published here covers all of them.
+		const scanState = createContextTreeScanState();
 		const children: ContextTreeNode[] = [];
 		const liveIds = new Set<string>();
 		for (const run of this._activeRlmChildRuns.values()) {
 			liveIds.add(run.id);
 			const node =
-				run.session?.getContextTree() ?? loadContextTreeChildFromDisk(run.sessionDir, resolveContextWindow);
+				run.session?.getContextTree() ??
+				loadContextTreeChildFromDisk(run.sessionDir, resolveContextWindow, undefined, scanState);
 			children.push({
 				...(node ?? {
 					ownUsage: emptyUsage(),
@@ -15386,7 +15393,15 @@ export class AgentSession {
 				status: run.status,
 			});
 		}
-		children.push(...loadContextTreeChildrenFromDisk(this._rlmSessionDirForReading(), resolveContextWindow, liveIds));
+		const diskScan = scanContextTreeChildrenFromDisk(this._rlmSessionDirForReading(), resolveContextWindow, {
+			skipIds: liveIds,
+			state: scanState,
+		});
+		children.push(...diskScan.nodes);
+
+		// Say what the budget refused instead of handing back a partial roster that
+		// looks complete; nothing to say means the field stays off the wire.
+		const scan = contextTreeScanDiagnostics(scanState);
 
 		const model = this.model;
 		return {
@@ -15398,6 +15413,7 @@ export class AgentSession {
 			totalUsage,
 			contextUsage: this.getContextUsage(),
 			children,
+			...(scan.truncated ? { scan } : {}),
 		};
 	}
 

@@ -303,11 +303,28 @@ export interface SessionTreeDepthStats {
 	entries: number;
 	/** Nodes the caller receives. */
 	returnedNodes: number;
-	/** Nodes below the depth limit: present in the session, absent from the returned tree. */
+	/**
+	 * Nodes outside the retained depth window: present in the session, absent from the
+	 * returned tree. The window is anchored at the deepest entry, so these are the *older*
+	 * ancestors - the same side of the session the flat bound drops.
+	 */
 	omittedNodes: number;
 	/** Depth (parent edges) of the deepest entry in the session. */
 	maxDepth: number;
 	depthLimit: number;
+	/**
+	 * Depth of the shallowest retained node, i.e. how many top layers were cut. 0 when the
+	 * whole tree fit. A retained node whose parent is shallower than this comes back as a
+	 * root, so a client can tell a truncated view from a session that really starts there.
+	 */
+	retainedFromDepth: number;
+	/**
+	 * The session's live leaf is a node in the returned tree. A depth bound must not hide
+	 * the entry the session resumes on, so a leaf outside the window is returned as a
+	 * detached root (no ancestors, no children) instead of being dropped; this says whether
+	 * that held. False when the session has no leaf.
+	 */
+	leafIncluded: boolean;
 	truncated: boolean;
 }
 
@@ -2699,12 +2716,14 @@ export class SessionManager {
 	}
 
 	/**
-	 * The tree cut off below `maxDepth` parent edges, plus what the cut dropped.
+	 * The tree cut to the newest `maxDepth` parent edges, plus what the cut dropped.
 	 *
 	 * The bound exists because a tree's depth is a property of the transcript, not of the
 	 * view: one long session is one chain of 100k nodes, and a serializer that recurses per
 	 * level dies on it. Cutting instead of serializing deeper keeps the frame's size and its
 	 * recursion depth bounded, and the stats make the omission reportable rather than silent.
+	 * The cut keeps the deepest layers and the live leaf, i.e. the same side of the session
+	 * {@link getBoundedFlatTree} keeps, so a client reading either view sees the recent past.
 	 */
 	getBoundedTree(maxDepth: number = SESSION_TREE_MAX_WIRE_DEPTH): {
 		tree: SessionTreeNode[];
@@ -2757,8 +2776,10 @@ export class SessionManager {
 	 *
 	 * Two walks are explicit here on purpose: the depth of an entry is its parent chain's
 	 * length, and both the chain walk and the child aggregation would recurse as deep as the
-	 * transcript is long. Entries whose resolved depth is past `depthLimit` are counted and
-	 * dropped, so a bounded tree is exactly the unbounded tree truncated at that level.
+	 * transcript is long. A bounded build keeps the newest `depthLimit` layers - the window
+	 * is anchored at the deepest entry, so what it drops is the oldest ancestors - and always
+	 * keeps the live leaf, detached if the window would otherwise have cut it. A tree that
+	 * fits under the limit is returned whole and unchanged.
 	 */
 	private buildTree(
 		entries: readonly SessionTreeFlatNode[],
@@ -2806,31 +2827,62 @@ export class SessionManager {
 			}
 		}
 
-		const roots: SessionTreeNode[] = [];
-		let returned = 0;
-		let omitted = 0;
+		// The depth window is anchored at the deepest entry, not at the root. A bound has
+		// to cut something, and which side it cuts is the whole difference between a view
+		// of the session you are in and a view of the session you started: cutting the old
+		// top layers keeps the branch the session resumes on, while cutting everything past
+		// a fixed depth kept the *oldest* 1000 entries of a 100k-entry chain and dropped the
+		// live leaf. This is also the same side the flat bound keeps (newest entries), so one
+		// session no longer presents two opposite truncations. Anchoring at maxDepth is what
+		// preserves the serializer bound: every retained ancestor chain stops at
+		// `retainedFromDepth`, so the returned tree is at most `depthLimit` edges deep.
 		let maxDepth = 0;
-		for (const flatNode of entries) {
-			const entry = flatNode.entry;
-			const depth = depths.get(entry.id) ?? 0;
+		for (const depth of depths.values()) {
 			if (depth > maxDepth) {
 				maxDepth = depth;
 			}
+		}
+		const retainedFromDepth = Number.isFinite(depthLimit) ? Math.max(0, maxDepth - depthLimit) : 0;
+
+		const roots: SessionTreeNode[] = [];
+		let returned = 0;
+		let omitted = 0;
+		let detachedLeaf: SessionTreeNode | undefined;
+		const leafId = this.getLeafId();
+		for (const flatNode of entries) {
+			const entry = flatNode.entry;
+			const depth = depths.get(entry.id) ?? 0;
 			const node = nodeMap.get(entry.id)!;
-			if (depth > depthLimit) {
+			if (depth < retainedFromDepth) {
 				omitted += 1;
+				if (entry.id === leafId) {
+					detachedLeaf = node;
+				}
 				continue;
 			}
 			returned += 1;
 			const parentId = entry.parentId;
 			const parent = parentId === null || parentId === entry.id ? undefined : nodeMap.get(parentId);
 			const parentDepth = parent ? (depths.get(parent.entry.id) ?? 0) : -1;
-			if (parent && parentDepth <= depthLimit) {
+			if (parent && parentDepth >= retainedFromDepth) {
 				parent.children.push(node);
 			} else {
 				roots.push(node);
 			}
 		}
+		if (detachedLeaf) {
+			// The bound must not hide the entry the session resumes on, so an out-of-window
+			// leaf comes back detached. Detached means no ancestors and no children: its
+			// retained descendants (a deeper branch) already stand as roots of their own, and
+			// re-attaching them here would rebuild exactly the chain depth the bound exists
+			// to prevent.
+			roots.push(detachedLeaf);
+			returned += 1;
+		}
+		const leafNode = leafId === null ? undefined : nodeMap.get(leafId);
+		const leafIncluded =
+			leafNode !== undefined &&
+			(leafNode === detachedLeaf || (depths.get(leafNode.entry.id) ?? 0) >= retainedFromDepth);
 
 		// Sort children by timestamp (oldest first, newest at bottom)
 		// Use iterative approach to avoid stack overflow on deep trees
@@ -2851,6 +2903,8 @@ export class SessionManager {
 				// The stats ride the wire, and JSON has no Infinity: an unbounded build reports
 				// the largest representable depth instead of a null that reads as "unknown".
 				depthLimit: Number.isFinite(depthLimit) ? depthLimit : Number.MAX_SAFE_INTEGER,
+				retainedFromDepth,
+				leafIncluded,
 				truncated: omitted > 0,
 			},
 		};

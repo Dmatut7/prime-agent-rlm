@@ -26,6 +26,7 @@ import {
 	type SessionEntry,
 	type SessionHeader,
 	SessionManager,
+	type SessionTreeNode,
 } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import { createAgentConnectionSnapshot } from "../src/modes/agent-connection/snapshot.js";
@@ -34,6 +35,9 @@ import { createTestResourceLoader } from "./utilities.js";
 
 /** Deep enough that an unbounded JSON.stringify of the nested tree cannot survive it. */
 const CHAIN_LENGTH = 20_000;
+
+/** The scale a real long-running session reaches: one parent chain, no branching. */
+const DEEP_CHAIN_LENGTH = 100_000;
 
 const tempDir = mkdtempSync(join(tmpdir(), "session-tree-depth-"));
 afterAll(() => {
@@ -66,6 +70,19 @@ function writeChainSession(length: number): string {
 	const path = join(tempDir, `deep-tree-${length}.jsonl`);
 	writeFileSync(path, `${lines.join("\n")}\n`, "utf8");
 	return path;
+}
+
+/** Whether a node with this entry id is anywhere in the returned tree. */
+function treeContains(roots: readonly SessionTreeNode[], entryId: string): boolean {
+	const stack: SessionTreeNode[] = [...roots];
+	while (stack.length > 0) {
+		const node = stack.pop()!;
+		if (node.entry.id === entryId) {
+			return true;
+		}
+		stack.push(...node.children);
+	}
+	return false;
 }
 
 function depthOfTree(roots: readonly { children: unknown[] }[]): number {
@@ -122,10 +139,17 @@ describe("session tree wire bounds", () => {
 			expect(tree?.bound?.depthLimit).toBe(SESSION_TREE_MAX_WIRE_DEPTH);
 			expect(tree?.bound?.truncated).toBe(true);
 			expect(tree?.bound?.omittedNodes).toBeGreaterThan(0);
-			// Depth is parent edges, so the kept subtree is the root plus `depthLimit` levels.
+			// Depth is parent edges, so the kept window is `depthLimit` levels plus the
+			// shallowest retained node that stands as their root.
 			expect(tree?.bound?.returnedNodes).toBe(SESSION_TREE_MAX_WIRE_DEPTH + 1);
-			// The bound is on the tree, not on the session: the leaf is what the session resumes on.
+			// The bound is on the tree, not on the session: the leaf is what the session
+			// resumes on, so it is in the kept window rather than below the cut.
 			expect(snapshot.state.leafId).toBe(`entry-${CHAIN_LENGTH - 1}`);
+			expect(tree?.bound?.leafIncluded).toBe(true);
+			expect(tree?.bound?.retainedFromDepth).toBe(CHAIN_LENGTH - 1 - SESSION_TREE_MAX_WIRE_DEPTH);
+			expect(treeContains(tree?.tree ?? [], `entry-${CHAIN_LENGTH - 1}`)).toBe(true);
+			// The cut took the old top of the chain, not the recent tail.
+			expect(treeContains(tree?.tree ?? [], "entry-0")).toBe(false);
 
 			const line = serializeJsonLine(snapshot);
 			expect(line.length).toBeGreaterThan(0);
@@ -153,6 +177,51 @@ describe("session tree wire bounds", () => {
 		const unbounded = sessionManager.getBoundedFlatTree(SESSION_TREE_FLAT_MAX_NODES);
 		expect(unbounded.stats.truncated).toBe(false);
 		expect(unbounded.stats.totalEntries).toBe(5);
+	});
+
+	/**
+	 * The wire bound used to keep the *oldest* `depthLimit` layers: on a chain longer than
+	 * the limit, the returned tree was the head of the session and the entry the session
+	 * resumes on was the one thing guaranteed to be missing - the opposite side from the
+	 * flat bound, which keeps the newest entries. A 100k-entry session is the shape a real
+	 * long-running agent produces, so it is the shape the direction is pinned on.
+	 */
+	it("keeps the live leaf of a 100k-deep chain inside the bounded tree", () => {
+		const sessionManager = SessionManager.open(writeChainSession(DEEP_CHAIN_LENGTH), tempDir);
+		const bounded = sessionManager.getBoundedTree();
+		const leafId = sessionManager.getLeafId();
+
+		expect(bounded.stats.entries).toBe(DEEP_CHAIN_LENGTH);
+		expect(bounded.stats.truncated).toBe(true);
+		expect(leafId).toBe(`entry-${DEEP_CHAIN_LENGTH - 1}`);
+		expect(bounded.stats.leafIncluded).toBe(true);
+		expect(treeContains(bounded.tree, leafId!)).toBe(true);
+		expect(bounded.stats.retainedFromDepth).toBe(DEEP_CHAIN_LENGTH - 1 - SESSION_TREE_MAX_WIRE_DEPTH);
+		expect(bounded.stats.omittedNodes).toBe(DEEP_CHAIN_LENGTH - 1 - SESSION_TREE_MAX_WIRE_DEPTH);
+		expect(bounded.stats.returnedNodes).toBe(SESSION_TREE_MAX_WIRE_DEPTH + 1);
+		// Still serializer-safe: the window is the newest `depthLimit` levels.
+		expect(depthOfTree(bounded.tree)).toBeLessThanOrEqual(SESSION_TREE_MAX_WIRE_DEPTH);
+		expect(serializeJsonLine({ tree: bounded.tree }).length).toBeGreaterThan(0);
+	});
+
+	it("keeps a rewound leaf visible even when a deeper branch owns the window", () => {
+		const sessionManager = SessionManager.open(writeChainSession(10), tempDir);
+		// Move the leaf back up the chain: the deepest entries are now an abandoned branch,
+		// so a newest-layers window would cut the entry the session actually resumes on.
+		sessionManager.branch("entry-2");
+		expect(sessionManager.getLeafId()).toBe("entry-2");
+
+		const bounded = sessionManager.getBoundedTree(3);
+		expect(bounded.stats.maxDepth).toBe(9);
+		expect(bounded.stats.retainedFromDepth).toBe(6);
+		expect(bounded.stats.leafIncluded).toBe(true);
+		expect(treeContains(bounded.tree, "entry-2")).toBe(true);
+		expect(treeContains(bounded.tree, "entry-9")).toBe(true);
+		expect(treeContains(bounded.tree, "entry-0")).toBe(false);
+		// The detached leaf is a root of its own, so the depth bound still holds.
+		expect(depthOfTree(bounded.tree)).toBeLessThanOrEqual(3);
+		const detached = bounded.tree.find((node) => node.entry.id === "entry-2");
+		expect(detached?.children).toEqual([]);
 	});
 
 	it("keeps the unbounded tree request unmodified for callers that ask for it", () => {

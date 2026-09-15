@@ -1,0 +1,1 @@
+- Fixed log and transcript redaction to cover `session=` assignments, `Cookie`/`Set-Cookie` credential values and non-bearer authentication schemes such as `Token <value>`, and to keep the username in a URL with userinfo while washing only the password.
