@@ -19,6 +19,7 @@ import { DaemonAgentConnection } from "../../../src/modes/agent-connection/daemo
 import { DaemonClient } from "../../../src/modes/daemon/daemon-client.js";
 import type { DaemonResponse } from "../../../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../../../src/modes/daemon/daemon-session-list.js";
+import { defaultDaemonSocketDir } from "../../../src/modes/daemon/daemon-socket.js";
 import {
 	acquireDaemonShutdownAdmission,
 	acquireDaemonSupervisorOwnership,
@@ -149,7 +150,15 @@ async function createPaths(): Promise<TestPaths> {
 	};
 }
 
-function spawnSupervisor(paths: TestPaths): ProcessHandle {
+interface SupervisorOverrides {
+	/** Socket the supervisor binds; defaults to the fixture's own path. */
+	socketPath?: string;
+	/** Where the supervisor writes worker descriptors; defaults to the fixture's own dir. */
+	descriptorDir?: string;
+}
+
+function spawnSupervisor(paths: TestPaths, overrides: SupervisorOverrides = {}): ProcessHandle {
+	const socketPath = overrides.socketPath ?? paths.socketPath;
 	return trackProcess(
 		spawn(paths.executablePath, [tsxPath, fixturePath], {
 			cwd: paths.agentDir,
@@ -158,10 +167,10 @@ function spawnSupervisor(paths: TestPaths): ProcessHandle {
 				[supervisorRegistryDirEnv]: paths.registryDir,
 				[ENV_AGENT_DIR]: paths.agentDir,
 				ENG_4600_AGENT_DIR: paths.agentDir,
-				ENG_4600_DESCRIPTOR_DIR: paths.descriptorDir,
+				ENG_4600_DESCRIPTOR_DIR: overrides.descriptorDir ?? paths.descriptorDir,
 				ENG_4600_FIXTURE_MODE: "supervisor",
 				ENG_4600_REGISTRY_DIR: paths.registryDir,
-				ENG_4600_SOCKET_PATH: paths.socketPath,
+				ENG_4600_SOCKET_PATH: socketPath,
 				PI_OFFLINE: "1",
 				TMPDIR: paths.socketTmpDir,
 				TSX_TSCONFIG_PATH: tsconfigPath,
@@ -643,6 +652,92 @@ function requireSummary(value: unknown): SessionSummary {
 	return value as SessionSummary;
 }
 
+/**
+ * The daemon socket dir a CLI run with this TMPDIR would scope a plain
+ * `shutdown`/`doctor` to. Resolved through the production helper instead of
+ * spelling out `prime-agent-<uid>`, so the fixture cannot drift from the rule.
+ */
+function scopedDaemonSocketDir(tmpDir: string): string {
+	const previousTmpDir = process.env.TMPDIR;
+	process.env.TMPDIR = tmpDir;
+	try {
+		return defaultDaemonSocketDir();
+	} finally {
+		if (previousTmpDir === undefined) delete process.env.TMPDIR;
+		else process.env.TMPDIR = previousTmpDir;
+	}
+}
+
+/**
+ * The pid that actually holds a supervisor's sockets. The fixture starts its
+ * supervisors through the `prime-agent` wrapper plus the tsx CLI, and tsx runs
+ * the script in a child process: the tracked pid is a launcher that owns none
+ * of the service.
+ */
+async function servicePidOf(launcher: ProcessHandle, label: string): Promise<FixtureProcessIdentity> {
+	const launcherPid = launcher.child.pid;
+	if (launcherPid === undefined) throw new Error(`${label} supervisor has no launcher pid`);
+	const deadline = Date.now() + 30_000;
+	while (Date.now() < deadline) {
+		const processes = readFixtureProcessSnapshot();
+		const children = [...processes.entries()]
+			.filter(([, process]) => process.ppid === launcherPid && !process.state.startsWith("Z"))
+			.map(([pid]) => pid);
+		if (children.length === 1) {
+			const pid = children[0]!;
+			const identity = registerFixtureProcess(pid, getProcessStartId(pid), "supervisor");
+			if (identity) return identity;
+			throw new Error(`Could not identify the ${label} supervisor process ${pid}`);
+		}
+		if (children.length > 1) {
+			throw new Error(
+				`${label} supervisor launcher ${launcherPid} has ${children.length} children: ${children.join(", ")}`,
+			);
+		}
+		await delay(25);
+	}
+	throw new Error(`Launcher ${launcherPid} never spawned the ${label} supervisor process`);
+}
+
+/** pids whose lsof record names exactly this socket path (`-F pn` record stream). */
+function lsofListenersOf(lsofOutput: string, socketPath: string): number[] {
+	const pids: number[] = [];
+	let pid: number | undefined;
+	for (const line of lsofOutput.split("\n")) {
+		if (line.startsWith("p")) pid = Number.parseInt(line.slice(1), 10);
+		else if (line.startsWith("n") && pid !== undefined && resolve(line.slice(1)) === resolve(socketPath)) {
+			pids.push(pid);
+		}
+	}
+	return pids;
+}
+
+interface StopReport {
+	stopped: Array<{ socketPath: string; action: string }>;
+	failed: Array<{ socketPath: string; reason: string }>;
+	leftRunning: Array<{ socketPath: string; reason: string }>;
+}
+
+/** Pull the accounting fields out of a JSON CLI report, failing on a missing one. */
+function pickFields(value: unknown, keys: readonly string[], command: string): Record<string, unknown> {
+	const report: Record<string, unknown> = {};
+	for (const key of keys) {
+		// A renamed or missing field must not read as "nothing to report".
+		expect(value, `${command} output`).toHaveProperty(key);
+		report[key] = (value as Record<string, unknown>)[key];
+	}
+	return report;
+}
+
+function parseStopReport(stdout: string, command: string): StopReport {
+	const report = JSON.parse(stdout) as Partial<StopReport>;
+	for (const key of ["stopped", "failed", "leftRunning"] as const) {
+		// A renamed or missing field must not read as "nothing to report".
+		expect(report[key], `${command} reported: ${stdout}`).toEqual(expect.any(Array));
+	}
+	return report as StopReport;
+}
+
 function exactProcessIsAlive(pid: number, processStartId: string | undefined): boolean {
 	if (!processStartId) {
 		return false;
@@ -700,11 +795,14 @@ async function runCli(
 			cwd: paths.agentDir,
 			env: {
 				...process.env,
-				...extraEnv,
 				[supervisorRegistryDirEnv]: paths.registryDir,
 				[ENV_AGENT_DIR]: paths.agentDir,
 				PI_OFFLINE: "1",
+				// The stop scope is derived from TMPDIR, so it comes before extraEnv:
+				// a caller that wants to ask what a command refuses to touch has to be
+				// able to move it.
 				TMPDIR: paths.socketTmpDir,
+				...extraEnv,
 				TSX_TSCONFIG_PATH: tsconfigPath,
 			},
 			stdio: ["ignore", "pipe", "pipe"],
@@ -1073,33 +1171,53 @@ describe("ENG-4603 worker recovery convergence", () => {
 	it("shutdown --force removes hidden supervisors and workers through the public CLI", async () => {
 		if (process.platform === "win32") return;
 		const paths = await createPaths();
-		const predecessor = spawnSupervisor(paths);
+		// A background service the public CLI started listens in this shell's daemon
+		// socket dir, and stop commands are scoped to that dir. Bind the fixture
+		// there and give it the production worker-descriptor layout, so a plain
+		// `shutdown --force` is asked about services it is allowed to touch.
+		const serviceDir = scopedDaemonSocketDir(paths.socketTmpDir);
+		mkdirSync(serviceDir, { recursive: true, mode: 0o700 });
+		const socketPath = join(serviceDir, "daemon.sock");
+		const descriptorDir = join(paths.agentDir, "daemon-workers", "eng-4603-shutdown");
+		fixtureDescriptorDirs.add(descriptorDir);
+		const supervisorOverrides = { socketPath, descriptorDir };
+
+		const predecessor = spawnSupervisor(paths, supervisorOverrides);
 		await waitForType(predecessor, "booted");
 		predecessor.child.send({ type: "go" });
 		await waitForType(predecessor, "ready", 60_000);
-		const client = await connectEventually(paths.socketPath);
+		const predecessorService = await servicePidOf(predecessor, "predecessor");
+		const client = await connectEventually(socketPath);
 		const session = await createResidentSession(client, paths.agentDir);
 		const workerPid = session.workerPid;
 		if (!workerPid) throw new Error("Resident worker did not expose its pid");
-		const predecessorStartId = getProcessStartId(predecessor.child.pid!);
 		const workerStartId = getProcessStartId(workerPid);
 		registerFixtureProcess(workerPid, workerStartId, "worker");
 		predecessor.child.send({ type: "release_runtime" });
 		await waitForType(predecessor, "runtime_released");
-		const successor = spawnSupervisor(paths);
+		const successor = spawnSupervisor(paths, supervisorOverrides);
 		await waitForType(successor, "booted");
 		successor.child.send({ type: "go" });
 		await waitForType(successor, "ready", 60_000);
-		const successorStartId = getProcessStartId(successor.child.pid!);
+		const successorService = await servicePidOf(successor, "successor");
 		client.close();
+
+		if (!workerStartId) throw new Error("Resident worker did not expose its process identity");
+		const services: FixtureProcessIdentity[] = [
+			predecessorService,
+			successorService,
+			{ pid: workerPid, processStartId: workerStartId, role: "worker" },
+		];
 		const systemLsofPath = spawnSync("which", ["lsof"], { encoding: "utf8" }).stdout.trim();
 		if (!systemLsofPath) throw new Error("Could not locate lsof for the shutdown regression");
 		const lsofPath = join(paths.agentDir, "lsof");
 		writeFileSync(lsofPath, '#!/bin/sh\nexec "$ENG_4603_SYSTEM_LSOF" -nP -F pn -U -a -p "$ENG_4603_LSOF_PIDS"\n', {
 			mode: 0o700,
 		});
+		// The scan the CLI runs is restricted to the processes that own the service
+		// sockets, so the command cannot be answered by an unrelated process.
 		const lsofEnvironment = {
-			ENG_4603_LSOF_PIDS: `${predecessor.child.pid},${successor.child.pid},${workerPid}`,
+			ENG_4603_LSOF_PIDS: services.map((service) => service.pid).join(","),
 			ENG_4603_SYSTEM_LSOF: systemLsofPath,
 			PATH: `${paths.agentDir}:${process.env.PATH ?? ""}`,
 		};
@@ -1107,45 +1225,77 @@ describe("ENG-4603 worker recovery convergence", () => {
 			encoding: "utf8",
 			env: { ...process.env, ...lsofEnvironment },
 		}).stdout;
-		expect(listenersBeforeShutdown).toContain(`p${predecessor.child.pid}`);
-		expect(listenersBeforeShutdown).toContain(`p${successor.child.pid}`);
+		// The regression needs two processes holding one supervisor socket: that is
+		// the hidden supervisor. Both must be named by that path, not merely seen.
+		expect(lsofListenersOf(listenersBeforeShutdown, socketPath).sort()).toEqual(
+			[predecessorService.pid, successorService.pid].sort((left, right) => left - right),
+		);
+
+		// A service outside the caller's socket dir is refused, and refusing has to
+		// be reported: nothing is stopped, nothing fails, the instance is named.
+		const foreignTmpDir = join(paths.socketTmpDir, "foreign-tmpdir");
+		mkdirSync(foreignTmpDir, { recursive: true, mode: 0o700 });
+		const refused = await runCli(paths, ["shutdown", "--force", "--json"], 60_000, {
+			...lsofEnvironment,
+			TMPDIR: foreignTmpDir,
+		});
+		expect(refused.code, refused.stderr).toBe(0);
+		const refusal = parseStopReport(refused.stdout, "shutdown --force (other tmpdir)");
+		expect(refusal.stopped).toEqual([]);
+		expect(refusal.failed).toEqual([]);
+		expect(refusal.leftRunning.map((entry) => entry.socketPath)).toEqual([socketPath]);
+		for (const service of services) {
+			expect(exactProcessIsAlive(service.pid, service.processStartId), `pid ${service.pid} before shutdown`).toBe(
+				true,
+			);
+		}
 
 		const shutdown = await runCli(paths, ["shutdown", "--force", "--json"], 60_000, lsofEnvironment);
-		expect(shutdown.code).toBe(0);
-		const shutdownResult = JSON.parse(shutdown.stdout) as { stopped: unknown[]; failed: unknown[] };
-		const survivingIdentities = [
-			{ pid: predecessor.child.pid!, processStartId: predecessorStartId },
-			{ pid: successor.child.pid!, processStartId: successorStartId },
-			{ pid: workerPid, processStartId: workerStartId },
-		].filter((identity) => exactProcessIsAlive(identity.pid, identity.processStartId));
-		if (survivingIdentities.length > 0) {
-			expect(shutdownResult.failed).not.toHaveLength(0);
+		expect(shutdown.code, shutdown.stderr).toBe(0);
+		const report = parseStopReport(shutdown.stdout, "shutdown --force");
+		// Empty here is the command claiming it left nothing running and excluded
+		// nothing; the exit checks below are what makes that a fact, not a promise.
+		expect(report.failed).toEqual([]);
+		expect(report.leftRunning).toEqual([]);
+		expect(report.stopped.length).toBeGreaterThan(0);
+		for (const service of services) {
+			await waitForExactProcessExit(service.pid, service.processStartId);
 		}
-		expect(shutdownResult).toMatchObject({ stopped: expect.any(Array), failed: [] });
-		await waitForExactProcessExit(predecessor.child.pid!, predecessorStartId);
-		await waitForExactProcessExit(successor.child.pid!, successorStartId);
-		await waitForExactProcessExit(workerPid, workerStartId);
 		await delay(11_000);
-		expect(exactProcessIsAlive(predecessor.child.pid!, predecessorStartId)).toBe(false);
-		expect(exactProcessIsAlive(successor.child.pid!, successorStartId)).toBe(false);
-		expect(exactProcessIsAlive(workerPid, workerStartId)).toBe(false);
+		for (const service of services) {
+			expect(exactProcessIsAlive(service.pid, service.processStartId), `pid ${service.pid}`).toBe(false);
+		}
 
-		const contracts = [
-			{ args: ["status", "--json"], json: [] },
-			{ args: ["doctor", "--fix", "--json"], json: { reaped: [], skipped: [] } },
-			{ args: ["shutdown", "--force", "--json"], json: { stopped: [], failed: [] } },
+		const jsonContracts: Array<{ args: string[]; keys?: string[]; expected: unknown }> = [
+			{ args: ["status", "--json"], expected: [] },
+			{ args: ["doctor", "--fix", "--json"], keys: ["reaped", "skipped"], expected: { reaped: [], skipped: [] } },
+			{
+				args: ["shutdown", "--force", "--json"],
+				keys: ["stopped", "failed", "leftRunning"],
+				expected: { stopped: [], failed: [], leftRunning: [] },
+			},
 		];
-		for (const contract of contracts) {
+		for (const contract of jsonContracts) {
 			const result = await runCli(paths, contract.args, 60_000, lsofEnvironment);
 			if (result.code !== 0) {
 				throw new Error(`${contract.args.join(" ")} exited ${result.code}: ${result.stderr}`);
 			}
-			expect(JSON.parse(result.stdout)).toEqual(contract.json);
+			const parsed = JSON.parse(result.stdout) as unknown;
+			const reported =
+				contract.keys === undefined ? parsed : pickFields(parsed, contract.keys, contract.args.join(" "));
+			expect(reported, result.stdout).toEqual(contract.expected);
 		}
-		for (const args of [["status"], ["doctor", "--fix"], ["shutdown", "--force"]]) {
-			const result = await runCli(paths, args, 60_000, lsofEnvironment);
-			expect(result.code).toBe(0);
-			expect(result.stdout).toBe("No background services found.\n");
+		// The empty-scope wording differs per command and both say the same thing:
+		// this scope holds nothing left to stop.
+		const idleReports: Array<{ args: string[]; text: string }> = [
+			{ args: ["status"], text: "No background services found.\n" },
+			{ args: ["doctor", "--fix"], text: "No background services found in scope: " },
+			{ args: ["shutdown", "--force"], text: "Nothing to stop in this scope.\n" },
+		];
+		for (const idle of idleReports) {
+			const result = await runCli(paths, idle.args, 60_000, lsofEnvironment);
+			expect(result.code, result.stderr).toBe(0);
+			expect(result.stdout).toContain(idle.text);
 		}
 	}, 150_000);
 
