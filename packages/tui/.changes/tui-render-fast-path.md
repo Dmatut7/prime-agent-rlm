@@ -1,0 +1,2 @@
+- Fixed long-session idle CPU spikes and streaming slowdowns: the line reset cache now evicts its oldest entry instead of clearing all 20k lines at once, and unchanged transcript lines are reused by identity so spinner and streaming frames no longer re-scan the whole transcript.
+- Fixed the 16ms render throttle so slow frames are spaced apart instead of rendering back-to-back.

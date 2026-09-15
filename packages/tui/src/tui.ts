@@ -350,7 +350,15 @@ export class Container implements Component {
 export class TUI extends Container {
 	public terminal: Terminal;
 	private previousLines: string[] = [];
+	// Raw (cursor-marker-stripped, pre-normalization) lines of the frame
+	// committed into previousLines. Same length as previousLines; lets the
+	// next frame prove an unchanged prefix by pointer identity and reuse the
+	// committed normalized strings instead of re-running the reset cache.
+	private previousRawLines: string[] = [];
 	private previousKittyImageIds = new Set<number>();
+	// Occurrence counts behind previousKittyImageIds, so the set can be
+	// maintained incrementally over just the changed region of the frame.
+	private kittyImageIdCounts = new Map<number, number>();
 	private previousWidth = 0;
 	private previousHeight = 0;
 	private readonly transcriptAggregator = new LineAggregator();
@@ -390,7 +398,9 @@ export class TUI extends Container {
 		viewportControls: boolean;
 		inlineState: {
 			previousLines: string[];
+			previousRawLines: string[];
 			previousKittyImageIds: Set<number>;
+			kittyImageIdCounts: Map<number, number>;
 			previousWidth: number;
 			previousHeight: number;
 			cursorRow: number;
@@ -696,8 +706,12 @@ export class TUI extends Container {
 					return;
 				}
 				this.renderRequested = false;
-				this.lastRenderAt = performance.now();
 				this.doRender();
+				// Stamp after the render completes: stamping before it makes
+				// elapsed >= frame duration for any frame slower than the
+				// interval, permanently zeroing the throttle delay and letting
+				// slow frames render back-to-back.
+				this.lastRenderAt = performance.now();
 			});
 			return;
 		}
@@ -738,7 +752,9 @@ export class TUI extends Container {
 			viewportControls: options.viewportControls !== false,
 			inlineState: {
 				previousLines: this.previousLines,
+				previousRawLines: this.previousRawLines,
 				previousKittyImageIds: this.previousKittyImageIds,
+				kittyImageIdCounts: this.kittyImageIdCounts,
 				previousWidth: this.previousWidth,
 				previousHeight: this.previousHeight,
 				cursorRow: this.cursorRow,
@@ -767,7 +783,9 @@ export class TUI extends Container {
 			this.terminal.leaveAltScreen();
 		}
 		this.previousLines = inlineState.previousLines;
+		this.previousRawLines = inlineState.previousRawLines;
 		this.previousKittyImageIds = inlineState.previousKittyImageIds;
+		this.kittyImageIdCounts = inlineState.kittyImageIdCounts;
 		this.previousWidth = inlineState.previousWidth;
 		this.previousHeight = inlineState.previousHeight;
 		this.cursorRow = inlineState.cursorRow;
@@ -905,8 +923,10 @@ export class TUI extends Container {
 				return;
 			}
 			this.renderRequested = false;
-			this.lastRenderAt = performance.now();
 			this.doRender();
+			// Same as requestRender(force): measure the interval from render
+			// completion so slow frames still get throttled apart.
+			this.lastRenderAt = performance.now();
 			if (this.renderRequested) {
 				this.scheduleRender();
 			}
@@ -1416,10 +1436,18 @@ export class TUI extends Container {
 	private static readonly LINE_RESET_CACHE_LIMIT = 20_000;
 	private readonly lineResetCache = new Map<string, string>();
 
-	private applyLineResets(lines: string[]): string[] {
+	/**
+	 * Normalize lines[i] (for i >= start) in place, memoized by raw line.
+	 *
+	 * Callers that can prove an unchanged line prefix (doRender reuses the
+	 * committed normalized strings there) pass the first index that can
+	 * differ; the fullscreen frame path normalizes the whole window with
+	 * start = 0.
+	 */
+	private applyLineResets(lines: string[], start = 0): string[] {
 		const reset = TUI.SEGMENT_RESET;
 		const cache = this.lineResetCache;
-		for (let i = 0; i < lines.length; i++) {
+		for (let i = start; i < lines.length; i++) {
 			const line = lines[i];
 			if (isImageLine(line)) continue;
 			const cached = cache.get(line);
@@ -1428,8 +1456,17 @@ export class TUI extends Container {
 				continue;
 			}
 			const normalized = normalizeTerminalOutput(line) + reset;
+			// Evict the oldest entry instead of clearing. A full clear drops
+			// the normalized identity of every unchanged line at once: the
+			// next frame re-runs the normalization regexes for the whole
+			// transcript and the differ's pointer compares degrade into
+			// content compares. (Same eviction pattern as the editor
+			// wrapCache.)
 			if (cache.size >= TUI.LINE_RESET_CACHE_LIMIT) {
-				cache.clear();
+				const oldest = cache.keys().next().value;
+				if (oldest !== undefined) {
+					cache.delete(oldest);
+				}
 			}
 			cache.set(line, normalized);
 			lines[i] = normalized;
@@ -1437,14 +1474,31 @@ export class TUI extends Container {
 		return lines;
 	}
 
-	private collectKittyImageIds(lines: string[]): Set<number> {
-		const ids = new Set<number>();
-		for (const line of lines) {
-			for (const id of extractKittyImageIds(line)) {
-				ids.add(id);
+	/**
+	 * Maintain previousKittyImageIds incrementally: lines [0, start) of
+	 * newLines are the exact strings committed in previousLines, so only the
+	 * [start, ...) span can add or drop image ids.
+	 */
+	private updateKittyImageIds(newLines: string[], start: number): void {
+		const oldLines = this.previousLines;
+		const counts = this.kittyImageIdCounts;
+		for (let i = start; i < oldLines.length; i++) {
+			for (const id of extractKittyImageIds(oldLines[i] ?? "")) {
+				const count = (counts.get(id) ?? 0) - 1;
+				if (count <= 0) {
+					counts.delete(id);
+					this.previousKittyImageIds.delete(id);
+				} else {
+					counts.set(id, count);
+				}
 			}
 		}
-		return ids;
+		for (let i = start; i < newLines.length; i++) {
+			for (const id of extractKittyImageIds(newLines[i] ?? "")) {
+				counts.set(id, (counts.get(id) ?? 0) + 1);
+				this.previousKittyImageIds.add(id);
+			}
+		}
 	}
 
 	private deleteKittyImages(ids: Iterable<number>): string {
@@ -1456,6 +1510,13 @@ export class TUI extends Container {
 	}
 
 	private expandLastChangedForKittyImages(firstChanged: number, lastChanged: number): number {
+		// previousKittyImageIds is maintained to be exactly the ids present in
+		// previousLines (updateKittyImageIds). When it is empty there is no
+		// image line anywhere in the old frame, so the scan below cannot
+		// extend lastChanged and can be skipped.
+		if (this.previousKittyImageIds.size === 0) {
+			return lastChanged;
+		}
 		let expandedLastChanged = lastChanged;
 		for (let i = firstChanged; i < this.previousLines.length; i++) {
 			if (extractKittyImageIds(this.previousLines[i]).length > 0) {
@@ -1646,7 +1707,29 @@ export class TUI extends Container {
 		// Extract cursor position before applying line resets (marker must be found first)
 		const cursorPos = this.extractCursorPosition(newLines, height);
 
-		newLines = this.applyLineResets(newLines);
+		// Snapshot the raw (marker-stripped, pre-normalization) lines: this is
+		// the identity basis the next frame compares its raw lines against.
+		const rawLines = newLines.slice();
+
+		// Unchanged-prefix fast path. Components hand back the exact same raw
+		// line objects while unchanged, so a raw line that is pointer-equal to
+		// the committed frame's raw line normalizes to the exact string
+		// already committed in previousLines. Reusing it directly (instead of
+		// touching the reset cache) keeps the differ's comparison a pointer
+		// check and confines normalization, diffing, and image-id maintenance
+		// to the region from the first raw change down — the appended segment
+		// plus the visible window in the streaming/spinner case, instead of
+		// the whole transcript.
+		const rawCommon = Math.min(newLines.length, this.previousRawLines.length);
+		let firstRawDiff = 0;
+		while (firstRawDiff < rawCommon && newLines[firstRawDiff] === this.previousRawLines[firstRawDiff]) {
+			firstRawDiff++;
+		}
+		for (let i = 0; i < firstRawDiff; i++) {
+			newLines[i] = this.previousLines[i];
+		}
+
+		newLines = this.applyLineResets(newLines, firstRawDiff);
 
 		// Helper to clear the viewport and repaint the current screen. Do not
 		// clear terminal scrollback: users rely on it to read long prior messages.
@@ -1708,8 +1791,9 @@ export class TUI extends Container {
 				this.maxLinesRendered = newLines.length;
 				this.previousViewportTop = windowStart;
 				this.positionHardwareCursor(cursorPos, newLines.length);
+				this.updateKittyImageIds(newLines, firstRawDiff);
 				this.previousLines = newLines;
-				this.previousKittyImageIds = this.collectKittyImageIds(newLines);
+				this.previousRawLines = rawLines;
 				this.previousWidth = width;
 				this.previousHeight = height;
 				return;
@@ -1739,8 +1823,9 @@ export class TUI extends Container {
 			const bufferLength = Math.max(height, newLines.length);
 			this.previousViewportTop = Math.max(0, bufferLength - height);
 			this.positionHardwareCursor(cursorPos, newLines.length);
+			this.updateKittyImageIds(newLines, firstRawDiff);
 			this.previousLines = newLines;
-			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
+			this.previousRawLines = rawLines;
 			this.previousWidth = width;
 			this.previousHeight = height;
 		};
@@ -1785,11 +1870,14 @@ export class TUI extends Container {
 			return;
 		}
 
-		// Find first and last changed lines
+		// Find first and last changed lines. Below firstRawDiff the lines
+		// were copied from the committed normalized strings, so they are
+		// pointer-identical to previousLines by construction and the scan can
+		// start at the first raw change.
 		let firstChanged = -1;
 		let lastChanged = -1;
 		const maxLines = Math.max(newLines.length, this.previousLines.length);
-		for (let i = 0; i < maxLines; i++) {
+		for (let i = firstRawDiff; i < maxLines; i++) {
 			const oldLine = i < this.previousLines.length ? this.previousLines[i] : "";
 			const newLine = i < newLines.length ? newLines[i] : "";
 
@@ -1859,8 +1947,9 @@ export class TUI extends Container {
 				this.hardwareCursorRow = targetRow;
 			}
 			this.positionHardwareCursor(cursorPos, newLines.length);
+			this.updateKittyImageIds(newLines, firstRawDiff);
 			this.previousLines = newLines;
-			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
+			this.previousRawLines = rawLines;
 			this.previousWidth = width;
 			this.previousHeight = height;
 			this.previousViewportTop = prevViewportTop;
@@ -2024,8 +2113,9 @@ export class TUI extends Container {
 		// Position hardware cursor for IME
 		this.positionHardwareCursor(cursorPos, newLines.length);
 
+		this.updateKittyImageIds(newLines, firstRawDiff);
 		this.previousLines = newLines;
-		this.previousKittyImageIds = this.collectKittyImageIds(newLines);
+		this.previousRawLines = rawLines;
 		this.previousWidth = width;
 		this.previousHeight = height;
 	}
