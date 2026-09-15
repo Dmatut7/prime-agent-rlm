@@ -22,7 +22,9 @@ class ReplProcess:
     def __init__(self) -> None:
         env = {
             **os.environ,
-            "PYTHONPATH": SRC + os.pathsep + os.environ.get("PYTHONPATH", ""),
+            # The dill payload references this test module for functions defined
+            # here; the kernel subprocess needs it importable to restore them.
+            "PYTHONPATH": SRC + os.pathsep + os.path.dirname(__file__) + os.pathsep + os.environ.get("PYTHONPATH", ""),
         }
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "rlm.repl"],
