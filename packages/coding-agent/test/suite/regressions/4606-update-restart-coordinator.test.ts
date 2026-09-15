@@ -394,7 +394,25 @@ describe("ENG-4606 update restart coordinator", () => {
 		}
 		const created = requireSessionSummary(createResponse);
 		const originalActiveSessionId = created.activeSessionId ?? created.id;
-		const updateCommand = [process.execPath, tsxPath, launcherFixturePath].map(shellQuote).join(" ");
+		// SEC-4: bash children get an allowlist env, so the launcher's required
+		// variables (including the worker's internal session id) are assigned
+		// inline for this one command instead of relying on inheritance.
+		const launcherEnv: Record<string, string> = {
+			ENG_4606_AGENT_DIR: paths.agentDir,
+			ENG_4606_CLI_PATH: cliPath,
+			ENG_4606_COMPLETION_PATH: paths.completionPath,
+			ENG_4606_PID_PATH: paths.pidPath,
+			ENG_4606_SOCKET_PATH: paths.socketPath,
+			ENG_4606_TSX_PATH: tsxPath,
+			PRIME_AGENT_INTERNAL_DAEMON_WORKER_ACTIVE_SESSION_ID: originalActiveSessionId,
+			// The coordinator resolves the supervisor registry through this env
+			// (test-isolation dir); with the bash allowlist it must ride inline too.
+			PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR: paths.registryDir,
+		};
+		const envPrefix = Object.entries(launcherEnv)
+			.map(([key, value]) => `${key}=${shellQuote(value)}`)
+			.join(" ");
+		const updateCommand = `${envPrefix} ${[process.execPath, tsxPath, launcherFixturePath].map(shellQuote).join(" ")}`;
 		const executeResponse = await client.request(
 			{ type: "execute_bash", activeSessionId: originalActiveSessionId, command: updateCommand },
 			5000,
