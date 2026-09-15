@@ -7,10 +7,12 @@ import {
 	constants,
 	existsSync,
 	fchmodSync,
+	fstatSync,
 	lstatSync,
 	openSync,
 	readdirSync,
 	readFileSync,
+	readSync,
 	realpathSync,
 	statSync,
 } from "fs";
@@ -963,29 +965,53 @@ function parseUnterminatedHeader(buffer: Buffer): SessionHeader | undefined {
 
 /**
  * Restore the terminating newline of a last line that is a whole record - see
- * `parseUnterminatedHeader`. Only the write owner may call it: completing a line
- * another process is still appending to would split its write in two. Returns whether
- * the byte was written, so a torn tail keeps falling through to the torn-tail repair.
+ * `parseUnterminatedHeader`. Any entry shape counts, not only a session header: an
+ * append torn on its final byte leaves a complete message/state record with no
+ * terminator, and the loaders drop exactly that line, so a non-header tail loses a
+ * whole record where a header tail keeps its identity. Only the write owner may call
+ * it: completing a line another process is still appending to would split its write
+ * in two. Returns whether the byte was written, so a torn tail keeps falling through
+ * to the torn-tail repair.
  */
 function completeTrailingRecordNewline(filePath: string, ownsSessionDir: boolean): boolean {
-	// A header is a short line. Bounding the read by size keeps a transcript whose
-	// last line really was torn from re-reading the whole file to learn nothing.
-	let size: number;
+	// Only the trailing line is inspected, bounded by size: a transcript whose last
+	// line really was torn must not be re-read whole to learn nothing.
+	let fd: number | undefined;
 	try {
-		size = statSync(filePath).size;
+		fd = openSync(filePath, constants.O_RDONLY);
+		const { size } = fstatSync(fd);
+		if (size === 0) return false;
+		const length = Math.min(size, SESSION_HEADER_SCAN_MAX_BYTES);
+		const tail = Buffer.allocUnsafe(length);
+		if (readSync(fd, tail, 0, length, size - length) !== length) return false;
+		const lastNewline = tail.lastIndexOf(0x0a);
+		const line = lastNewline === -1 ? tail : tail.subarray(lastNewline + 1);
+		if (line.length === 0) return false;
+		if (!isCompleteUnterminatedEntryLine(line)) return false;
+		appendPrivateFile(filePath, "\n", { privateParent: ownsSessionDir });
+		return true;
+	} catch {
+		return false;
+	} finally {
+		if (fd !== undefined) closeSync(fd);
+	}
+}
+
+/**
+ * The whole-record test for a trailing line that lost its terminator: it must parse
+ * as JSON and be a loadable entry, exactly what `appendEntryFromBuffer` would have
+ * accepted had the newline survived. Anything else is a torn write that
+ * `repairTruncatedTrailingLine` drops.
+ */
+function isCompleteUnterminatedEntryLine(line: Buffer): boolean {
+	if (line.indexOf(0x0a) !== -1) return false;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(line.toString("utf8"));
 	} catch {
 		return false;
 	}
-	if (size === 0 || size > SESSION_HEADER_SCAN_MAX_BYTES) return false;
-	let buffer: Buffer;
-	try {
-		buffer = readFileSync(filePath);
-	} catch {
-		return false;
-	}
-	if (!parseUnterminatedHeader(buffer)) return false;
-	appendPrivateFile(filePath, "\n", { privateParent: ownsSessionDir });
-	return true;
+	return unindexableEntryReason(parsed) === undefined;
 }
 
 function appendEntryFromBuffer(

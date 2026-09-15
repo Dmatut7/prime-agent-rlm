@@ -1,0 +1,4 @@
+- Fixed complete transcript records that lost only their trailing newline being dropped and truncated away; the write owner now restores the terminator for any whole record, not just the session header.
+- Fixed resume, fork, import, and rename appends gluing onto a crash-torn transcript tail, which silently made both the torn record and the appended lines unreadable.
+- Added a startup sweep for stale atomic-write temp files left in the sessions directory by a killed process.
+- Made the update-restart manifest write atomic and added fsync to the settings and model registry cache writes so a power loss cannot resurrect stale content.
