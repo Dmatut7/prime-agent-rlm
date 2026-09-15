@@ -2,6 +2,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, ImageContent, Message, ServiceTier, TextContent, Usage } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import {
+	chmodSync,
 	closeSync,
 	constants,
 	existsSync,
@@ -343,6 +344,41 @@ export function getSessionArtifactsRoot(sessionDir: string): string {
 }
 
 const tightenedArtifactDirectories = new Set<string>();
+
+/** Transcripts already tightened in this process, so the warning is emitted once each. */
+const tightenedTranscripts = new Set<string>();
+
+/**
+ * Tighten a transcript left with a pre-hardening mode on a read path.
+ *
+ * A session file holds the whole conversation, including anything a tool or a provider
+ * error echoed into it, and pre-hardening versions wrote it with the default 0644, so
+ * every account on the machine could read it. Read paths repair that in place and say
+ * so once, the way `enforceArtifactDirectoryMode` repairs a legacy artifact directory:
+ * a listing or a resume must not fail on a layout the reader can fix, and it must not
+ * silently leave the credential-bearing file readable either.
+ *
+ * A mode that exposes nothing to other accounts (0600, 0400, 0000) is left alone, so a
+ * deliberately fenced layout is not rewritten behind the operator's back. Refusals
+ * stay with the caller's `assertRegularFileNoSymlink`: nothing is chmod'ed through a
+ * symlink or on a path that is not a regular file.
+ */
+function enforcePrivateTranscriptMode(filePath: string): void {
+	if (process.platform === "win32") return;
+	let stats: ReturnType<typeof lstatSync>;
+	try {
+		stats = lstatSync(filePath);
+	} catch {
+		return;
+	}
+	if (stats.isSymbolicLink() || !stats.isFile()) return;
+	const mode = stats.mode & 0o777;
+	if ((mode & 0o077) === 0) return;
+	chmodSync(filePath, 0o600);
+	if (tightenedTranscripts.has(filePath)) return;
+	tightenedTranscripts.add(filePath);
+	console.error(`Tightened legacy session transcript to 0600: ${filePath}`);
+}
 
 /**
  * Enforce the private mode of an existing artifact directory on a read path.
@@ -973,6 +1009,7 @@ function salvageDamagedHeadEntries(filePath: string, cwd: string): FileEntry[] |
 export function loadEntriesFromFile(filePath: string): FileEntry[] {
 	if (!existsSync(filePath)) return [];
 	assertRegularFileNoSymlink(filePath);
+	enforcePrivateTranscriptMode(filePath);
 	return finalizeLoadedEntries(parseEntriesFromBuffer(readFileSync(filePath), filePath));
 }
 
@@ -985,6 +1022,7 @@ export async function loadEntriesFromFileAsync(
 ): Promise<FileEntry[]> {
 	if (!existsSync(filePath)) return [];
 	assertRegularFileNoSymlink(filePath);
+	enforcePrivateTranscriptMode(filePath);
 	const streamThresholdBytes = options.streamThresholdBytes ?? SESSION_STREAMING_LOAD_THRESHOLD_BYTES;
 	if ((await stat(filePath)).size < streamThresholdBytes) {
 		return finalizeLoadedEntries(await parseEntriesFromBufferAsync(await readFile(filePath), filePath));
@@ -1041,6 +1079,7 @@ export function repairOwnedSessionFile(sessionFile: string | undefined): void {
 
 function readSessionHeader(filePath: string): Partial<SessionHeader> | undefined {
 	assertRegularFileNoSymlink(filePath);
+	enforcePrivateTranscriptMode(filePath);
 	const firstLine = readFirstLineSync(filePath);
 	if (!firstLine) {
 		return undefined;
@@ -1452,6 +1491,7 @@ export async function readSessionInfo(filePath: string): Promise<SessionInfo | n
 	try {
 		const lexicalStats = await lstat(filePath);
 		if (lexicalStats.isSymbolicLink() || !lexicalStats.isFile()) return null;
+		enforcePrivateTranscriptMode(filePath);
 		stats = await stat(filePath);
 	} catch {
 		return null;

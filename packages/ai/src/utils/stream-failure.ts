@@ -1,6 +1,7 @@
 import { getLogger } from "../log.js";
 import type { AssistantMessage } from "../types.js";
 import { appendAssistantMessageDiagnostic, extractDiagnosticError } from "./diagnostics.js";
+import { redactSecrets } from "./redact.js";
 
 /**
  * Shared classification and reporting for provider stream failures, so no
@@ -187,12 +188,15 @@ export function extractStreamFailureInfo(error: unknown): StreamFailureInfo {
  * may depend on) is preserved.
  */
 export function formatStreamFailureMessage(error: unknown): string {
-	if (error instanceof StreamFailureError) return error.message;
+	// The returned string becomes `AssistantMessage.errorMessage`, which is persisted in
+	// the session transcript and shown in the UI: redact before it leaves here, not at
+	// each of the call sites that may be handed a provider body verbatim.
+	if (error instanceof StreamFailureError) return redactSecrets(error.message);
 	const { info, detail } = extractStreamFailureParts(error);
 	if (info.kind === "unknown") {
-		return error instanceof Error ? error.message : JSON.stringify(error);
+		return redactSecrets(error instanceof Error ? error.message : JSON.stringify(error));
 	}
-	return streamFailureMessage(info, detail);
+	return redactSecrets(streamFailureMessage(info, detail));
 }
 
 const log = getLogger("ai.provider");
@@ -210,12 +214,19 @@ export function recordStreamFailure(
 ): void {
 	if (output.stopReason !== "error") return;
 	const info = extractStreamFailureInfo(error);
+	// The diagnostic and the message both reach the transcript. Provider bodies reach
+	// this function verbatim (openai-completions assigns the thrown message straight to
+	// errorMessage), so both are redacted here; the classified info that makes the
+	// failure actionable - kind, provider code, status, request id - is not text and
+	// survives untouched.
+	const safeInfo: StreamFailureInfo = info.raw === undefined ? info : { ...info, raw: redactSecrets(info.raw) };
 	appendAssistantMessageDiagnostic(output, {
 		type: "provider_stream_failure",
 		timestamp: Date.now(),
 		error: extractDiagnosticError(error),
-		details: { ...info },
+		details: { ...safeInfo },
 	});
+	if (output.errorMessage) output.errorMessage = redactSecrets(output.errorMessage);
 	const rawMessage = error instanceof Error ? error.message : String(error);
 	log.error("provider stream failure", {
 		provider: model.provider,
@@ -227,6 +238,6 @@ export function recordStreamFailure(
 		requestId: info.requestId,
 		message: output.errorMessage,
 		// errorMessage is user-facing and concise; keep the raw cause for debugging.
-		cause: rawMessage === output.errorMessage ? undefined : truncateRawPayload(rawMessage),
+		cause: rawMessage === output.errorMessage ? undefined : truncateRawPayload(redactSecrets(rawMessage)),
 	});
 }

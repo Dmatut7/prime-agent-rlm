@@ -1,0 +1,2 @@
+- Fixed failed credential refreshes being silent: the auth store's recorded errors are bounded, report dropped entries, and are surfaced by the auth-failure message a session shows.
+- Fixed session transcripts left at a pre-hardening 0644 mode staying world-readable when a listing or resume read them; read paths now tighten them to 0600 and say so once.

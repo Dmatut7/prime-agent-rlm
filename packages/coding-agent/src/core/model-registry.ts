@@ -1517,9 +1517,21 @@ export class ModelRegistry {
 
 			if (providerConfig?.authHeader) {
 				if (!apiKey) {
-					return { ok: false, error: `No API key found for "${model.provider}"` };
+					// A recorded credential failure (a failed load, write or OAuth refresh)
+					// explains why there is no key far better than the bare message does.
+					return {
+						ok: false,
+						error: this.describeCredentialFailure(model.provider) ?? `No API key found for "${model.provider}"`,
+					};
 				}
 				headers = { ...headers, Authorization: `Bearer ${apiKey}` };
+			}
+
+			if (apiKey === undefined) {
+				const failure = this.describeCredentialFailure(model.provider);
+				if (failure) {
+					return { ok: false, error: failure };
+				}
 			}
 
 			return {
@@ -1533,6 +1545,27 @@ export class ModelRegistry {
 				error: error instanceof Error ? error.message : String(error),
 			};
 		}
+	}
+
+	/**
+	 * The credential store's own account of why auth is failing, or undefined when it
+	 * recorded nothing.
+	 *
+	 * The store records a failed load, write or OAuth refresh and carries on, so a
+	 * refresh failure otherwise reached the user as "no API key found" - indistinguishable
+	 * from a provider that was never configured, and silent about the cause. This drain is
+	 * where those errors become visible: `getApiKeyAndHeaders` folds them into the failure
+	 * its caller (AgentSession) reports. Drained, not read: one failure is reported once.
+	 */
+	private describeCredentialFailure(provider: string): string | undefined {
+		const recorded = this.authStorage.drainErrors();
+		const latest = recorded[recorded.length - 1];
+		if (!latest) {
+			return undefined;
+		}
+		const earlier =
+			recorded.length > 1 ? ` (${recorded.length - 1} earlier credential error(s) in the same window)` : "";
+		return `Credential store error for "${provider}": ${latest.message}${earlier}. No API key is available for "${provider}".`;
 	}
 
 	/**

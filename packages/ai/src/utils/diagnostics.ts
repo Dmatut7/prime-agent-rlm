@@ -1,3 +1,5 @@
+import { redactSecrets } from "./redact.js";
+
 export interface DiagnosticErrorInfo {
 	name?: string;
 	message: string;
@@ -18,13 +20,20 @@ export function formatThrownValue(value: unknown): string {
 	return String(value);
 }
 
+/**
+ * Diagnostics are persisted into the session transcript and read back long after the
+ * request, so a provider error that echoes the credential (a 401 body naming the key,
+ * a forwarded Authorization header, a base URL with userinfo) must not carry it in.
+ * Redaction happens here rather than at each call site because every persisted
+ * diagnostic goes through this extractor.
+ */
 export function extractDiagnosticError(error: unknown): DiagnosticErrorInfo {
-	if (!(error instanceof Error)) return { name: "ThrownValue", message: formatThrownValue(error) };
+	if (!(error instanceof Error)) return { name: "ThrownValue", message: redactSecrets(formatThrownValue(error)) };
 	const code = (error as Error & { code?: unknown }).code;
 	return {
 		name: error.name || undefined,
-		message: error.message || error.name,
-		stack: error.stack,
+		message: redactSecrets(error.message || error.name),
+		stack: error.stack === undefined ? undefined : redactSecrets(error.stack),
 		code: typeof code === "string" || typeof code === "number" ? code : undefined,
 	};
 }
