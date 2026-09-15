@@ -12,7 +12,11 @@ import { type AgentAutonomousStatus, type AutonomousLimitReason, autonomousLimit
 import { flushRawStdout, writeRawStdout } from "../core/output-guard.js";
 import { killTrackedDetachedChildren } from "../utils/shell.js";
 import { InProcessAgentConnection } from "./agent-connection/in-process-agent-connection.js";
-import type { AgentConnection, AgentConnectionDisposeOptions } from "./agent-connection/types.js";
+import type {
+	AgentConnection,
+	AgentConnectionDisposeOptions,
+	AgentConnectionDisposeOutcome,
+} from "./agent-connection/types.js";
 import { latestAutonomousGateAttempt, selectHeadlessTerminalResult } from "./headless-completion.js";
 
 /**
@@ -74,11 +78,13 @@ async function runPrintModeWithConnectionInternal(
 	let unsubscribe: (() => void) | undefined;
 	const signalCleanupHandlers: Array<() => void> = [];
 
-	const disposeConnection = async (options?: AgentConnectionDisposeOptions): Promise<void> => {
+	const disposeConnection = async (
+		options?: AgentConnectionDisposeOptions,
+	): Promise<AgentConnectionDisposeOutcome | undefined> => {
 		if (disposed) return;
 		disposed = true;
 		unsubscribe?.();
-		await connection.dispose(options);
+		return await connection.dispose(options);
 	};
 
 	for (const signal of [
@@ -130,13 +136,12 @@ async function runPrintModeWithConnectionInternal(
 			waitForRlmQuiescence: connection.supportsRlmQuiescenceBarrier?.() ?? true,
 		});
 		// K3Q-1: the barrier can give up on its deadline with descendants still
-		// running (FR-4). That must not read as a clean completion: say so on
-		// stderr, exit non-zero, and dispose without stopping the session so the
-		// still-running descendants are not aborted by the teardown cascade.
+		// running (FR-4). That must not read as a clean completion: exit non-zero,
+		// and dispose without stopping the session so the still-running descendants
+		// are not aborted by the teardown cascade. The stderr wording is printed
+		// after the dispose (K3R-1): the owned-session promote can fail, and then
+		// claiming "the session was left running" would be a lie.
 		if (autonomousStatus.rlmQuiescence?.timedOut) {
-			console.error(
-				"RLM subagents are still running: the wait for them gave up after its deadline, so this run is not a clean completion. Their work was not aborted and the session was left running - re-attach to this session to follow it.",
-			);
 			exitCode = 1;
 			leaveSessionRunning = true;
 		}
@@ -187,7 +192,35 @@ async function runPrintModeWithConnectionInternal(
 		for (const cleanup of signalCleanupHandlers) {
 			cleanup();
 		}
-		await disposeConnection(leaveSessionRunning ? { keepSessionRunning: true } : undefined);
+		const disposeOutcome = await disposeConnection(leaveSessionRunning ? { keepSessionRunning: true } : undefined);
+		if (leaveSessionRunning) {
+			const keepRunning = disposeOutcome?.keepSessionRunning;
+			const leftRunning = keepRunning?.leftRunning !== false;
+			if (leftRunning) {
+				console.error(
+					"RLM subagents are still running: the wait for them gave up after its deadline, so this run is not a clean completion. Their work was not aborted and the session was left running - re-attach to this session to follow it.",
+				);
+			} else {
+				console.error(
+					`RLM subagents are still running: the wait for them gave up after its deadline, so this run is not a clean completion. This run did not abort their work itself, but the session could not be left running (${keepRunning?.errorMessage ?? "promotion failed"}); the daemon will stop the session after this client disconnects.`,
+				);
+			}
+			if (mode === "json") {
+				// K3R-2: json mode is a machine surface; the give-up needs a
+				// structured terminal event there so a CI consumer can tell it apart
+				// from a gate failure without scraping stderr.
+				writeRawStdout(
+					`${JSON.stringify({
+						type: "run_outcome",
+						reason: "rlm_quiescence_give_up",
+						gaveUp: true,
+						exitCode,
+						leftRunning,
+						...(leftRunning ? {} : { errorMessage: keepRunning?.errorMessage }),
+					})}\n`,
+				);
+			}
+		}
 		await flushRawStdout();
 	}
 }

@@ -176,7 +176,6 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // event every time, exactly as it was for rev32/rev33/rev34.
 // Revision 36 folds the headless-completion quiescence outcome into the same digest
 // (K3Q-1): wait_for_headless_completion rlmQuiescence rides rlm_quiescence_barrier.
-// Revision 35 adds the `wait_for_headless_completion` response family to the
 export const DAEMON_SCHEMA_REVISION = 36;
 export const DAEMON_SCHEMA_ID = "protocol-7-schema-36-ba0805ab003a";
 

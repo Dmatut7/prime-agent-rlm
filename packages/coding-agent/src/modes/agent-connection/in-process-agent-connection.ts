@@ -32,6 +32,7 @@ import type {
 	AgentConnection,
 	AgentConnectionBeforeSessionInvalidateListener,
 	AgentConnectionDisposeOptions,
+	AgentConnectionDisposeOutcome,
 	AgentConnectionEvent,
 	AgentConnectionEventListener,
 	AgentConnectionExecuteBashOptions,
@@ -644,7 +645,7 @@ export class InProcessAgentConnection implements AgentConnection {
 		};
 	}
 
-	async dispose(options?: AgentConnectionDisposeOptions): Promise<void> {
+	async dispose(options?: AgentConnectionDisposeOptions): Promise<AgentConnectionDisposeOutcome | undefined> {
 		this.abortAllSideQuestions();
 		await Promise.allSettled([...this.sessionInputPauses.values()].map((pause) => pause.release()));
 		this.sessionInputPauses.clear();
@@ -657,7 +658,9 @@ export class InProcessAgentConnection implements AgentConnection {
 		// K3Q-1: a headless run that gave up waiting for still-running descendants
 		// disposes without the runtime teardown, because that teardown cascades into
 		// aborting them (session.disposeAsync disposes every child session).
-		if (options?.keepSessionRunning) return;
+		if (options?.keepSessionRunning) {
+			return { keepSessionRunning: { leftRunning: true } };
+		}
 		await this.runtimeHost.dispose();
 	}
 

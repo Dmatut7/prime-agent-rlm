@@ -481,8 +481,6 @@ type SelfUpdatePlan =
 			targetVersion?: string;
 			/** Set when the release the manifest pointed at could not be verified: the update must not run. */
 			refusal?: string;
-			/** Temp directory holding a partially downloaded artifact, removed once the refusal is reported. */
-			artifactDir?: string;
 			verifiedArtifact?: never;
 	  };
 
@@ -602,7 +600,6 @@ async function getSelfUpdatePlan(force: boolean): Promise<SelfUpdatePlan> {
 					shouldRun: false,
 					targetVersion: latestRelease?.version,
 					refusal: artifact.refusal,
-					artifactDir: artifact.artifactDir,
 				};
 			}
 			return {
@@ -1774,10 +1771,6 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 						console.error(chalk.yellow(forkSelfUpdateOverrideLine(forkInstall)));
 					}
 					const selfUpdatePlan = await getSelfUpdatePlan(options.force);
-					const discardVerifiedArtifact = async (): Promise<void> => {
-						if (!selfUpdatePlan.artifactDir) return;
-						await rm(selfUpdatePlan.artifactDir, { recursive: true, force: true }).catch(() => undefined);
-					};
 					if (selfUpdatePlan.refusal) {
 						console.error(chalk.red(`Error: ${selfUpdatePlan.refusal}`));
 						process.exitCode = 1;
@@ -1787,6 +1780,13 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 						setSelfUpdateNoChangeExitCode();
 						return true;
 					}
+					// K3R-10: only the running plan can carry an artifact directory; the
+					// refusal variant exits above, so the discard hook is defined after
+					// those returns and the field reads are narrowed to the real plan.
+					const discardVerifiedArtifact = async (): Promise<void> => {
+						if (!selfUpdatePlan.artifactDir) return;
+						await rm(selfUpdatePlan.artifactDir, { recursive: true, force: true }).catch(() => undefined);
+					};
 					const selfUpdateSpecOptions: UpdateSpecOptions | undefined = selfUpdatePlan.verifiedArtifact
 						? { verifiedArtifact: selfUpdatePlan.verifiedArtifact }
 						: undefined;

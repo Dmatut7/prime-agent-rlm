@@ -1526,7 +1526,9 @@ export class AgentSession {
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _compactionOperation: Promise<void> | undefined = undefined;
 	/** In-flight manual compact() (r25-1): synchronous admission for mutual exclusion. */
-	private _manualCompactionInFlight: Promise<CompactionResult> | undefined = undefined;
+	private _manualCompactionInFlight:
+		| { operation: Promise<CompactionResult>; customInstructions: string | undefined }
+		| undefined = undefined;
 	/** One recovery attempt per overflow; "reported" dedups the failure notice. */
 	private _overflowRecovery: "idle" | "attempted" | "reported" = "idle";
 	/**
@@ -9811,16 +9813,34 @@ export class AgentSession {
 		// coalesces onto the in-flight operation instead (same gate shape as the
 		// navigateTree _branchNavigationQueue chain), so exactly one compaction
 		// runs and abortCompaction() always reaches the live scope.
+		// K3R-7: coalescing is only honest when the second caller asked for the
+		// same compaction. Different customInstructions used to be silently
+		// dropped - the second caller received the first's result and its
+		// instructions never ran anywhere. Those now queue behind the in-flight
+		// compaction and get their own run, and the merge is logged.
 		const inFlight = this._manualCompactionInFlight;
 		if (inFlight) {
-			return inFlight;
+			if (customInstructions !== inFlight.customInstructions) {
+				sessionLog.warn(
+					"manual compaction coalesced: a second compact with different instructions queues behind the in-flight one",
+					{ sessionId: this.sessionId, queuedInstructions: customInstructions ?? null },
+				);
+				return inFlight.operation.catch(() => undefined).then(() => this.compact(customInstructions, options));
+			}
+			return inFlight.operation;
 		}
+		// K3R-7 (F6): a manual compact preempts an in-flight auto compaction
+		// instead of queueing a second full compaction behind it on the
+		// just-compacted context (double LLM compaction, or an "Already
+		// compacted" failure). Aborting the auto scope settles it as cancelled;
+		// the wait in _compact then proceeds into this manual run.
+		this._autoCompactionAbortController?.abort();
 		const operation = this._compact(customInstructions, options);
-		this._manualCompactionInFlight = operation;
+		this._manualCompactionInFlight = { operation, customInstructions };
 		try {
 			return await operation;
 		} finally {
-			if (this._manualCompactionInFlight === operation) {
+			if (this._manualCompactionInFlight?.operation === operation) {
 				this._manualCompactionInFlight = undefined;
 			}
 		}
@@ -10216,7 +10236,6 @@ export class AgentSession {
 		// path AND by queued/auto callers that catch the same rethrown error; the
 		// first receipt wins and later calls on the same error are no-ops.
 		if (error instanceof Object && this._refineFailureReceipts.has(error)) return;
-		if (error instanceof Object) this._refineFailureReceipts.add(error);
 		const reason = error instanceof Error ? error.message : String(error);
 		// MV-5: the requested scope is the caller's guess; a persist failure
 		// knows the effective target scope (a local request can roll back a
@@ -10231,8 +10250,11 @@ export class AgentSession {
 		// the same surface successes use (e6c1af56). Without it the failure was
 		// UI/event-only and the model never learned its refine.run produced
 		// nothing. A skip is a deliberate decline, not a failure: it stays
-		// event-only.
+		// event-only. K3R-8/F9: the skip early-return comes BEFORE the receipt-set
+		// add - a reused skip sentinel must not be permanently silenced, and only
+		// a value that actually produced a receipt guards later calls.
 		if (error instanceof RefineSkippedError) return;
+		if (error instanceof Object) this._refineFailureReceipts.add(error);
 		this._recordRefinementFailureReceipt(reason, effectiveScope);
 	}
 
@@ -10782,11 +10804,14 @@ export class AgentSession {
 			} catch (error) {
 				// MV-5 parity for the direct refine() path (kernel skill, auto runs):
 				// a persist/apply failure leaves a model-visible failure receipt the
-				// same way the queued /refine command path does. _emitRefineFailed is
-				// idempotent per error object, so callers that also catch-and-report
-				// do not double-emit.
-				this._emitRefineFailed(error, options?.global ? "global" : "local");
-				throw error;
+				// same way the queued /refine command path does. K3R-8: normalize the
+				// thrown value into one Error object here and rethrow THAT object, so
+				// every downstream catch (queued /refine, pending refine.run) shares a
+				// single idempotency key with _emitRefineFailed's receipt guard - a raw
+				// non-Error value used to defeat the WeakSet dedup and double-report.
+				const normalized = this._asError(error);
+				this._emitRefineFailed(normalized, options?.global ? "global" : "local");
+				throw normalized;
 			}
 		} finally {
 			resolveApplySettled();
