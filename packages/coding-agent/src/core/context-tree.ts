@@ -87,20 +87,33 @@ function compactLabel(text: string, maxLength = 80): string {
  * appears, so the result matches the whole-file computation regardless of arrival order.
  */
 export class OwnUsageAccumulator {
-	private readonly totalUsage: Usage = emptyUsage();
-	private readonly ownUsage: Usage = emptyUsage();
+	private totalUsage: Usage = emptyUsage();
+	private ownUsage: Usage = emptyUsage();
 	/** Assistants whose usage the branch counted, i.e. the targets an attribution may subtract from. */
 	private readonly countedAssistantIds = new Set<string>();
 	/** Attributions that arrived before their target; applied when the target is counted. */
 	private readonly pendingAttributions = new Map<string, Usage[]>();
 	private processed = 0;
+	/** The entry the cursor stopped at, so a caller that comes back with a different array is seen. */
+	private lastTail: SessionEntry | undefined;
 
 	get processedCount(): number {
 		return this.processed;
 	}
 
-	/** Fold every entry past the one already consumed. Same entries in, same totals out. */
+	/**
+	 * Fold every entry past the one already consumed. Same entries in, same totals out.
+	 *
+	 * "Same entries" means the array only ever grows at the back. A caller that comes back with a
+	 * shorter array, or with a different entry where the cursor stopped, is asking about a
+	 * transcript that no longer exists: a failed append rolls its entry back and the retry pushes
+	 * a new one at the same length. Rather than keep reporting the rolled-back spend, the fold
+	 * restarts over the array actually present. It restarts instead of throwing because the only
+	 * caller publishes session rows and /usage for the UI, and a bookkeeping reset that a session
+	 * recovers from on its own must not take the roster down.
+	 */
 	add(entries: readonly SessionEntry[]): { ownUsage: Usage; totalUsage: Usage } {
+		if (!this.foldedPrefixIsIntact(entries)) this.restart();
 		for (let index = this.processed; index < entries.length; index++) {
 			const entry = entries[index];
 			if (!entry) continue;
@@ -131,7 +144,27 @@ export class OwnUsageAccumulator {
 			}
 		}
 		this.processed = entries.length;
+		this.lastTail = entries.at(-1);
 		return { ownUsage: cloneUsage(this.ownUsage), totalUsage: cloneUsage(this.totalUsage) };
+	}
+
+	/**
+	 * Whether everything already folded is still the prefix of `entries`. Identity of the
+	 * entry the cursor stopped at covers both shapes of the break: a shorter array and an entry
+	 * replaced at the same length.
+	 */
+	private foldedPrefixIsIntact(entries: readonly SessionEntry[]): boolean {
+		if (this.processed === 0) return true;
+		return entries.length >= this.processed && entries[this.processed - 1] === this.lastTail;
+	}
+
+	private restart(): void {
+		this.totalUsage = emptyUsage();
+		this.ownUsage = emptyUsage();
+		this.countedAssistantIds.clear();
+		this.pendingAttributions.clear();
+		this.processed = 0;
+		this.lastTail = undefined;
 	}
 }
 
