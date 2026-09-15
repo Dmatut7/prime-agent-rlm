@@ -245,7 +245,21 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 			if (existsSync(tempDir)) {
 				// Spawned fixture processes may still be flushing their final registry
 				// writes; retry briefly instead of failing the suite on ENOTEMPTY.
-				rmSync(tempDir, { recursive: true, force: true, maxRetries: 40, retryDelay: 50 });
+				// Node's rmSync maxRetries does not cover ENOTEMPTY, so back off
+				// manually; a cleanup failure must not fail an otherwise green suite.
+				for (let attempt = 0; attempt < 20; attempt++) {
+					try {
+						rmSync(tempDir, { recursive: true, force: true });
+						break;
+					} catch (error) {
+						if (attempt === 19) {
+							console.warn(`harness cleanup gave up on ${tempDir}: ${String(error)}`);
+							break;
+						}
+						// Flush window for fixture processes still writing.
+						Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+					}
+				}
 			}
 		},
 	};
