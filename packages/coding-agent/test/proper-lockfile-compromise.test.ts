@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -51,6 +51,55 @@ function tempDir(prefix: string): string {
 	const dir = mkdtempSync(join(tmpdir(), prefix));
 	tempDirs.push(dir);
 	return dir;
+}
+
+/**
+ * A session store holding one job whose dispatch never finished, so recovery has a real
+ * mutation to perform: `recoverSessionArtifact` rewrites the file only when a dispatch is open.
+ */
+function interruptedDispatchState(): string {
+	return `${JSON.stringify(
+		{
+			jobs: [
+				{
+					id: "job-1",
+					status: "active",
+					source: "heartbeat",
+					activeSessionId: "session-1",
+					sessionId: "session-1",
+					sessionFile: "/tmp/session-1.jsonl",
+					cwd: "/tmp",
+					prompt: "run",
+					schedule: { kind: "once", expression: "" },
+					createdAt: "2026-01-01T00:00:00.000Z",
+					updatedAt: "2026-01-01T00:00:00.000Z",
+					nextRunAt: "2026-01-02T00:00:00.000Z",
+					runCount: 0,
+				},
+			],
+			dispatches: [
+				{
+					id: "dispatch-1",
+					jobId: "job-1",
+					claimedAt: "2026-01-02T00:00:00.000Z",
+					scheduledFor: "2026-01-02T00:00:00.000Z",
+				},
+			],
+		},
+		null,
+		2,
+	)}\n`;
+}
+
+/** A registered session whose store file exists on disk, with one open dispatch. */
+function cronArtifactWithOpenDispatch(prefix: string): { store: AgentCronJobStore; artifactDir: string } {
+	const root = tempDir(prefix);
+	const artifactDir = join(root, "artifact");
+	mkdirSync(artifactDir);
+	writeFileSync(join(artifactDir, "scheduled-jobs.json"), interruptedDispatchState());
+	const store = AgentCronJobStore.forSessionArtifacts();
+	store.registerSessionArtifact("session-1", artifactDir);
+	return { store, artifactDir };
 }
 
 describe("proper-lockfile compromise boundaries", () => {
@@ -136,13 +185,60 @@ describe("proper-lockfile compromise boundaries", () => {
 		expect(existsSync(join(root, "agent", "settings.json"))).toBe(false);
 	});
 
+	/**
+	 * 5338afe49 ("reclaim unreferenced disk state with a bounded retention sweep", merged as
+	 * d1d66f503) made `recoverSessionArtifact` return early for a registered session whose store
+	 * file is absent or tombstoned, and this test's red (`expected [Function] to throw an error`)
+	 * is that change. The early return is the more correct behaviour, so the compromised lock is
+	 * now driven through a store file that really exists:
+	 *
+	 * - `withCronJobsStateLocks` starts by `mkdirSync(dirname(path), { recursive: true })` for
+	 *   every path it is handed, so locking the store of a deleted session recreated the very
+	 *   artifact directory the retention sweep had just removed. Asserting "a compromise must
+	 *   surface even when the file is missing" pinned that resurrection, not fail-closed.
+	 * - A missing store file holds neither jobs nor dispatches, so the skipped path cannot mutate
+	 *   anything; the same invariant now gates `mutateStates` and `writeJobs`, and
+	 *   test/retention-root-fix.test.ts pins "recovery must not recreate a deleted store dir".
+	 *
+	 * The mutation guard itself is unchanged and still asserted below, with a positive control
+	 * showing the seeded dispatch is something recovery would really have rewritten.
+	 */
 	it("does not mutate scheduled jobs after a lock compromise", () => {
 		lockState.compromiseSync = true;
-		const root = tempDir("pa-lock-cron-");
+		const { store, artifactDir } = cronArtifactWithOpenDispatch("pa-lock-cron-");
+		const storePath = join(artifactDir, "scheduled-jobs.json");
+
+		expect(() => store.recoverSessionArtifact("session-1", new Date("2026-01-03T00:00:00.000Z"))).toThrow(
+			/Cron jobs lock compromised/,
+		);
+		// Byte-identical: the interrupted dispatch is still open, nothing was rewritten, and no
+		// temp file from a half-finished atomic write was left behind.
+		expect(readFileSync(storePath, "utf8")).toBe(interruptedDispatchState());
+		expect(readdirSync(artifactDir)).toEqual(["scheduled-jobs.json"]);
+	});
+
+	/** Positive control: the state above is one recovery really does rewrite when the lock is healthy. */
+	it("recovers the same store when its lock is not compromised", () => {
+		const { store, artifactDir } = cronArtifactWithOpenDispatch("pa-lock-cron-healthy-");
+		const storePath = join(artifactDir, "scheduled-jobs.json");
+
+		const recovered = store.recoverSessionArtifact("session-1", new Date("2026-01-03T00:00:00.000Z"));
+
+		expect(recovered.map((job) => job.id)).toEqual(["job-1"]);
+		expect(readFileSync(storePath, "utf8")).not.toBe(interruptedDispatchState());
+		expect(readdirSync(artifactDir)).toEqual(["scheduled-jobs.json"]);
+	});
+
+	/** The new half of the contract: no store file means no lock attempt and no created directory. */
+	it("does not lock or create anything for a session whose store file is absent", () => {
+		// Armed, so reaching `withCronJobsStateLocks` - which also mkdirs - would throw.
+		lockState.compromiseSync = true;
+		const root = tempDir("pa-lock-cron-absent-");
 		const artifactDir = join(root, "artifact");
 		const store = AgentCronJobStore.forSessionArtifacts();
 		store.registerSessionArtifact("session-1", artifactDir);
-		expect(() => store.recoverSessionArtifact("session-1")).toThrow(/Cron jobs lock compromised/);
-		expect(existsSync(join(artifactDir, "scheduled-jobs.json"))).toBe(false);
+
+		expect(store.recoverSessionArtifact("session-1")).toEqual([]);
+		expect(existsSync(artifactDir)).toBe(false);
 	});
 });
