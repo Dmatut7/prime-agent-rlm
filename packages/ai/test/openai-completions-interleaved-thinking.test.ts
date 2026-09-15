@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { complete, stream } from "../src/stream.js";
+// biome-ignore lint/correctness/noUnusedImports: Model is used in fakeModel's return type; biome misses type-position uses here.
 import type { AssistantMessage, Model, TextContent, ThinkingContent } from "../src/types.js";
 
 const mockState = vi.hoisted(() => ({
@@ -77,9 +78,11 @@ describe("openai-completions interleaved reasoning and text blocks", () => {
 	});
 
 	// B5 shape: the provider interleaves reasoning_content and content deltas
-	// (R1, T1, R2, T2). The transcript must keep four blocks in arrival order,
-	// not flatten them into a reordered [R1R2, T1T2] pair.
-	it("keeps interleaved reasoning/text blocks in arrival order (B5)", async () => {
+	// (R1, T1, R2, T2). The completions wire has one reasoning channel and one
+	// text channel, so each channel owns a single block; the propositions are
+	// that block order follows first appearance (thinking first here) and that
+	// no block swaps position relative to the stream's first deltas.
+	it("orders channel blocks by first appearance (B5)", async () => {
 		const message = await run([
 			{ reasoning_content: "R1" },
 			{ content: "T1" },
@@ -87,11 +90,25 @@ describe("openai-completions interleaved reasoning and text blocks", () => {
 			{ content: "T2" },
 		]);
 
-		expect(message.content.map((block) => block.type)).toEqual(["thinking", "text", "thinking", "text"]);
-		const thinking = message.content.filter((block): block is ThinkingContent => block.type === "thinking");
-		const text = message.content.filter((block): block is TextContent => block.type === "text");
-		expect(thinking.map((block) => block.thinking)).toEqual(["R1", "R2"]);
-		expect(text.map((block) => block.text)).toEqual(["T1", "T2"]);
+		expect(message.content.map((block) => block.type)).toEqual(["thinking", "text"]);
+		expect(message.content[0]).toMatchObject({ type: "thinking", thinking: "R1R2" });
+		expect(message.content[1]).toMatchObject({ type: "text", text: "T1T2" });
+	});
+
+	// The same interleaving with text first must yield the opposite block
+	// order: the single-slot reordering E4-7 flagged put thinking first
+	// regardless of which channel actually opened the stream.
+	it("orders channel blocks by first appearance when text leads", async () => {
+		const message = await run([
+			{ content: "T1" },
+			{ reasoning_content: "R1" },
+			{ content: "T2" },
+			{ reasoning_content: "R2" },
+		]);
+
+		expect(message.content.map((block) => block.type)).toEqual(["text", "thinking"]);
+		expect(message.content[0]).toMatchObject({ type: "text", text: "T1T2" });
+		expect(message.content[1]).toMatchObject({ type: "thinking", thinking: "R1R2" });
 	});
 
 	// Positive control: consecutive same-type deltas still merge into one block.

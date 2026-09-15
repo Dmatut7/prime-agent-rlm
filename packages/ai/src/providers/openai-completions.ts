@@ -258,32 +258,38 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			}
 			return reasoningDetailsBlock;
 		};
-		const isMergeableTextTail = (block: StreamingBlock | undefined): block is TextContent => block?.type === "text";
-		const isMergeableThinkingTail = (block: StreamingBlock | undefined): block is ThinkingContent =>
-			block?.type === "thinking" && block !== reasoningDetailsBlock;
+		// The completions wire has one text channel and one reasoning channel:
+		// deltas interleave across a tool call but still accumulate into the same
+		// content part, so each channel owns a single block created at its first
+		// delta. Block order therefore follows first appearance (R-then-T stays
+		// [thinking, text]; T-then-R stays [text, thinking]) instead of being
+		// flattened into provider order, while a text delta after a tool call
+		// continues the same text part rather than starting a second one.
+		let textBlock: TextContent | null = null;
+		let thinkingChannelBlock: ThinkingContent | null = null;
 		const ensureTextBlock = (): TextContent => {
-			const tail = blocks[blocks.length - 1];
-			if (isMergeableTextTail(tail)) {
-				return tail;
+			if (!textBlock) {
+				textBlock = { type: "text", text: "" };
+				blocks.push(textBlock);
+				stream.push({ type: "text_start", contentIndex: getContentIndex(textBlock), partial: output });
 			}
-			const textContent: TextContent = { type: "text", text: "" };
-			blocks.push(textContent);
-			stream.push({ type: "text_start", contentIndex: getContentIndex(textContent), partial: output });
-			return textContent;
+			return textBlock;
 		};
 		const ensureThinkingBlock = (thinkingSignature: string): ThinkingContent => {
-			const tail = blocks[blocks.length - 1];
-			if (isMergeableThinkingTail(tail)) {
-				return tail;
+			if (!thinkingChannelBlock) {
+				thinkingChannelBlock = {
+					type: "thinking",
+					thinking: "",
+					thinkingSignature,
+				};
+				blocks.push(thinkingChannelBlock);
+				stream.push({
+					type: "thinking_start",
+					contentIndex: getContentIndex(thinkingChannelBlock),
+					partial: output,
+				});
 			}
-			const thinkingContent: ThinkingContent = {
-				type: "thinking",
-				thinking: "",
-				thinkingSignature,
-			};
-			blocks.push(thinkingContent);
-			stream.push({ type: "thinking_start", contentIndex: getContentIndex(thinkingContent), partial: output });
-			return thinkingContent;
+			return thinkingChannelBlock;
 		};
 		// Streaming providers do sometimes violate the tool-call index/id
 		// contract. Every recovery is logged and persisted as a message
