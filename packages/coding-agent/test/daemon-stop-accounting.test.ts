@@ -108,25 +108,35 @@ describe("ShutdownReport accounting", () => {
 		writeFileSync(supervisorSocket, "");
 		writeFileSync(workerSocket, "");
 
+		// Pids that no runner has: on a Linux CI machine the low pids this test used
+		// to hardcode (11, 22) are live kernel threads, `converge()` then read them
+		// as "still running" and reported both socket paths as still present (the
+		// exact CI red). The premise is checked like every other dead-pid premise in
+		// this file: a pid that is alive makes the convergence half meaningless.
+		const supervisorPid = 99_999_995;
+		const workerPid = 99_999_994;
+		expect(getProcessStartId(supervisorPid), `premise: pid ${supervisorPid} must be free`).toBeUndefined();
+		expect(getProcessStartId(workerPid), `premise: pid ${workerPid} must be free`).toBeUndefined();
+
 		const report = new ShutdownReport();
 		report.observe([
-			{ socketPath: supervisorSocket, pid: 11, kind: "service" },
-			{ socketPath: workerSocket, pid: 22, kind: "worker", supervisorSocketPath: supervisorSocket },
+			{ socketPath: supervisorSocket, pid: supervisorPid, kind: "service" },
+			{ socketPath: workerSocket, pid: workerPid, kind: "worker", supervisorSocketPath: supervisorSocket },
 		]);
 		// What the sweep really did on the way: it signalled the supervisor, removed its
 		// socket file, and signalled the worker through the descriptor its supervisor wrote.
-		report.recordSignal(11);
+		report.recordSignal(supervisorPid);
 		report.recordStoppedService(supervisorSocket);
 		report.recordSocketRemoval(supervisorSocket);
-		report.recordSignal(22);
+		report.recordSignal(workerPid);
 		rmSync(supervisorSocket);
 		rmSync(workerSocket);
 		const stillPresent = report.converge();
 
 		expect(stillPresent).toEqual([]);
 		expect(report.stopped.map((entry) => [entry.socketPath, entry.kind, entry.pid])).toEqual([
-			[supervisorSocket, "service", 11],
-			[workerSocket, "worker", 22],
+			[supervisorSocket, "service", supervisorPid],
+			[workerSocket, "worker", workerPid],
 		]);
 		expect(report.discovered).toBe(2);
 	});
@@ -135,12 +145,18 @@ describe("ShutdownReport accounting", () => {
 		const directory = makeTempDir();
 		const leftBehind = join(directory, "a.pipe");
 		writeFileSync(leftBehind, "");
+		// The same CI fact: pid 7 is alive on a Linux runner (CI showed
+		// "still running after shutdown: pid 7 is alive"), which swapped the
+		// reason under test. A pid no machine has keeps the proposition about the
+		// file being the thing that is still here.
+		const pid = 99_999_993;
+		expect(getProcessStartId(pid), `premise: pid ${pid} must be free`).toBeUndefined();
 		const report = new ShutdownReport();
-		report.observe([{ socketPath: leftBehind, pid: 7, kind: "listener" }]);
+		report.observe([{ socketPath: leftBehind, pid, kind: "listener" }]);
 		expect(report.converge()).toEqual([leftBehind]);
 		expect(report.stopped).toEqual([]);
 		expect(report.leftRunning).toEqual([
-			{ socketPath: leftBehind, pid: 7, kind: "listener", reason: expect.stringContaining("still present") },
+			{ socketPath: leftBehind, pid, kind: "listener", reason: expect.stringContaining("still present") },
 		]);
 	});
 

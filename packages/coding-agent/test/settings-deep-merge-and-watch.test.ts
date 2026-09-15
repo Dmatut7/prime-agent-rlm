@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -85,6 +85,30 @@ describe("settings deep merge and external edits", () => {
 		expect(manager.getTheme()).toBe("dark");
 
 		expect(manager.watchExternalSettings({ intervalMs: 20 })).toBe(true);
+
+		// `fs.watchFile` establishes its comparison baseline with one async stat on
+		// the libuv threadpool. An edit that lands before that stat completes
+		// *becomes* the baseline, so the watcher never reports it: on a loaded CI
+		// runner the stat regularly loses the race to the synchronous edit below and
+		// the test flakes (`expected 'dark' to be 'light'`). Gate the edit on the
+		// watcher having actually reacted once - a mtime-only touch of the unchanged
+		// content must produce a reload warning, and only a watcher that has
+		// finished a poll can produce one. The touch moves to strictly increasing
+		// future timestamps so no filesystem mtime granularity can hide it either.
+		let touches = 0;
+		let watcherSawATouch = false;
+		const gateDeadline = Date.now() + 4000;
+		while (Date.now() < gateDeadline) {
+			if (manager.drainWarnings("global").length > 0) {
+				watcherSawATouch = true;
+				break;
+			}
+			touches += 1;
+			utimesSync(globalPath, new Date(), new Date(Date.now() + touches * 1000));
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		expect(watcherSawATouch, "the settings watcher never observed a touch").toBe(true);
+		expect(manager.getTheme()).toBe("dark");
 
 		// Somebody edits the file by hand while the session is running.
 		writeFileSync(globalPath, JSON.stringify({ theme: "light" }));
