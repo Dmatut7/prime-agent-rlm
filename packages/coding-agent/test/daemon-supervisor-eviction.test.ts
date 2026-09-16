@@ -9,6 +9,7 @@ import { workerRosterEntryFromSummary } from "../src/modes/daemon/agent-roster.j
 import { success } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor, idleEvictionSweepIntervalMs } from "../src/modes/daemon/daemon-supervisor.js";
+import { WORKER_REQUEST_TIMEOUT_TIERS } from "../src/modes/daemon/daemon-timeouts.js";
 import { seedSupervisorRoster } from "./fixtures/roster-seed.js";
 
 interface WorkerFixture {
@@ -411,16 +412,17 @@ describe("daemon supervisor whole-tree eviction", () => {
 			"sender",
 			expect.objectContaining({ type: "create", sessionPath: "/tmp/target.jsonl", continueRecent: false }),
 		);
-		// The tier budget is clamped by the remaining delivery deadline, so the
-		// exact timeout number is timing-sensitive on a loaded runner; the
-		// propositions under test are the payload shape and the dispatch receipt.
+		// First dispatch on a fresh entry: the long tier budget, not clamped by the
+		// (barely aged) delivery deadline. The same literal assertion in the
+		// same-worker test below stayed green through every run, so the number is
+		// deterministic in this harness.
 		expect(target.client?.requestWorker).toHaveBeenCalledWith(
 			expect.objectContaining({
 				type: "worker_deliver_message",
 				targetActiveSessionId: "target-active",
 				message: "wake up",
 			}),
-			expect.any(Number),
+			WORKER_REQUEST_TIMEOUT_TIERS.long,
 			// The delivery reports how far the frame got towards the wire, so a
 			// transport that was already gone is never receipted as "may have arrived".
 			expect.objectContaining({ onDispatch: expect.any(Function) }),
@@ -461,7 +463,7 @@ describe("daemon supervisor whole-tree eviction", () => {
 				targetActiveSessionId: "target-active",
 				message: "continue",
 			}),
-			24 * 60 * 60 * 1000,
+			WORKER_REQUEST_TIMEOUT_TIERS.long,
 			expect.objectContaining({ onDispatch: expect.any(Function) }),
 		);
 		expect(worker.client?.request).not.toHaveBeenCalled();
