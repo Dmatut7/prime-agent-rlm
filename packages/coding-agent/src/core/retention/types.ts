@@ -20,7 +20,8 @@ export type RetentionClassId =
 	| "bash-temp-files"
 	| "stale-leases"
 	| "kernel-venv-generations"
-	| "crash-leftovers";
+	| "crash-leftovers"
+	| "rlm-ledger-compaction";
 
 /**
  * Fixed reason vocabulary. Free text is not allowed in a skip entry: a report
@@ -111,6 +112,12 @@ export interface ResolvedRetentionSettings {
 	venvRetention: number;
 	/** Whether the sweep may reclaim retired kernel venv generations. Off by default. */
 	venvReclaim: boolean;
+	/**
+	 * Equivalence-compaction of over-bound RLM spawn ledgers (writer ladder and
+	 * sweep class). Default on; off restores the fail-closed state where an
+	 * over-bound ledger stays unreadable until an operator intervenes.
+	 */
+	ledgerCompactionEnabled: boolean;
 }
 
 /** Filesystem roots one sweep works on. Everything derived from a single agent dir. */

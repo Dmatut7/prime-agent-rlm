@@ -14,6 +14,22 @@ import {
 import { readdir, readFile, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { EventLog } from "../../core/event-log.js";
+import { RLM_LEDGER_MAX_BYTES, RLM_LEDGER_MAX_RECORDS } from "../../core/rlm-ledger-bounds.js";
+import {
+	compactRlmLedgerFile,
+	parseRlmLedgerLine,
+	type RlmLedgerBounds,
+	type RlmLedgerCompactionResult,
+	type RlmLedgerDeleteReason,
+	type RlmLedgerDeleteRecord,
+	type RlmLedgerEdge,
+	type RlmLedgerMetaRecord,
+	RlmLedgerOverBoundError,
+	type RlmLedgerRecord,
+	type RlmLedgerRenameRecord,
+	type RlmLedgerSpawnRecord,
+	reduceRlmLedgerEdges,
+} from "../../core/rlm-ledger-compaction.js";
 import { canonicalSessionPath } from "../../core/session-lease.js";
 import { getSessionArtifactPathForFile, readSessionInfo, type SessionInfo } from "../../core/session-manager.js";
 import { readFirstLineSync } from "../../utils/file-lines.js";
@@ -38,6 +54,20 @@ import { DEFAULT_MAP_CONCURRENCY_LIMIT, mapConcurrent } from "../../utils/map-co
 
 export const RLM_LEDGER_DIR = "rlm-ledger";
 
+export type {
+	RlmLedgerDeleteReason,
+	RlmLedgerDeleteRecord,
+	RlmLedgerEdge,
+	RlmLedgerRecord,
+	RlmLedgerRenameRecord,
+	RlmLedgerSpawnRecord,
+};
+// The bounds and the record vocabulary live in core (`rlm-ledger-bounds.ts`,
+// `rlm-ledger-compaction.ts`) so the retention reader can share them without
+// importing a daemon module; they are re-exported here because this file is the
+// ledger's public surface.
+export { RLM_LEDGER_MAX_BYTES, RLM_LEDGER_MAX_RECORDS, RlmLedgerOverBoundError };
+
 /**
  * Existence probes are metadata-only, so they tolerate a deeper pipeline than a
  * transcript scan does. On a ledger with ~450 live edges a serial walk costs
@@ -45,58 +75,18 @@ export const RLM_LEDGER_DIR = "rlm-ledger";
  */
 const LEDGER_STAT_CONCURRENCY = 32;
 
-/** Bounded read: a ledger beyond these limits fails closed loudly. */
-export const RLM_LEDGER_MAX_BYTES = 32 * 1024 * 1024;
-export const RLM_LEDGER_MAX_RECORDS = 100_000;
-
-export type RlmLedgerDeleteReason = "user" | "parent-teardown" | "revoked" | "gc";
-
-interface RlmLedgerMetaRecord {
-	v: 1;
-	op: "meta";
-	at: string;
-	sessionsDir: string;
-}
-
-export interface RlmLedgerSpawnRecord {
-	v: 1;
-	op: "spawn";
-	at: string;
-	childId: string;
-	parent: string;
-	child: string;
-	depth: number;
-	name: string;
-}
-
-export interface RlmLedgerRenameRecord {
-	v: 1;
-	op: "rename";
-	at: string;
-	childId: string;
-	child: string;
-	name: string;
-}
-
-export interface RlmLedgerDeleteRecord {
-	v: 1;
-	op: "delete";
-	at: string;
-	childId: string;
-	child: string;
-	reason: RlmLedgerDeleteReason;
-}
-
-export type RlmLedgerRecord = RlmLedgerSpawnRecord | RlmLedgerRenameRecord | RlmLedgerDeleteRecord;
-
-/** A live edge after replaying the ledger (last-writer-wins per childId+child). */
-export interface RlmLedgerEdge {
-	childId: string;
-	parent: string;
-	child: string;
-	depth: number;
-	name: string;
-	deleted?: RlmLedgerDeleteReason;
+/** Write-side ladder: bounds an append is projected against, plus its switch. */
+export interface RlmLedgerBoundsOptions {
+	/** Read/write byte bound (default `RLM_LEDGER_MAX_BYTES`). */
+	maxBytes?: number;
+	/** Read/write record bound (default `RLM_LEDGER_MAX_RECORDS`). */
+	maxRecords?: number;
+	/**
+	 * Equivalence-compaction rung of the over-bound ladder (`retention.
+	 * ledgerCompactionEnabled`). Off restores the historical fail-closed
+	 * behavior: an append past a bound throws the reader's "refusing to read".
+	 */
+	compactionEnabled?: boolean;
 }
 
 /** Minimal registry-entry shape the seeder consumes (matches the daemon writer). */
@@ -219,83 +209,19 @@ function nowIso(): string {
 	return new Date().toISOString();
 }
 
-function isDeleteReason(value: unknown): value is RlmLedgerDeleteReason {
-	return value === "user" || value === "parent-teardown" || value === "revoked" || value === "gc";
-}
-
 /**
- * Parse one ledger line. Returns undefined for a well-formed v:1 record with
- * an unknown op (forward-compat: newer writers may add ops; readers skip
- * them). Any other violation throws. Version policy: v !== 1 fails loudly —
- * a future v2 must move to a new file/hash (or accept breaking old readers),
- * because silently skipping records a reader cannot understand would corrupt
- * topology.
+ * Whether a replay failure is one of the two bound refusals (the reader's own
+ * message and EventLog's), which is the signal the write ladder compacts on.
+ * A malformed-line failure is NOT a bound failure: it stays fail-closed.
  */
-function parseLedgerLine(line: string, index: number): RlmLedgerRecord | RlmLedgerMetaRecord | undefined {
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(line);
-	} catch (error) {
-		throw new Error(
-			`Malformed RLM ledger line ${index + 1}: ${error instanceof Error ? error.message : String(error)}`,
-		);
-	}
-	const record = parsed as {
-		v?: unknown;
-		op?: unknown;
-		at?: unknown;
-		sessionsDir?: unknown;
-		childId?: unknown;
-		parent?: unknown;
-		child?: unknown;
-		depth?: unknown;
-		name?: unknown;
-		reason?: unknown;
-	};
-	if (record.v !== 1 || typeof record.at !== "string") {
-		throw new Error(`Malformed RLM ledger line ${index + 1}: missing v/at`);
-	}
-	switch (record.op) {
-		case "meta":
-			if (typeof record.sessionsDir !== "string") {
-				throw new Error(`Malformed RLM ledger line ${index + 1}: meta without sessionsDir`);
-			}
-			return record as unknown as RlmLedgerMetaRecord;
-		case "spawn":
-			if (
-				typeof record.childId !== "string" ||
-				typeof record.parent !== "string" ||
-				typeof record.child !== "string" ||
-				typeof record.name !== "string" ||
-				typeof record.depth !== "number" ||
-				!Number.isSafeInteger(record.depth) ||
-				record.depth < 1
-			) {
-				throw new Error(`Malformed RLM ledger line ${index + 1}: invalid spawn record`);
-			}
-			return record as unknown as RlmLedgerSpawnRecord;
-		case "rename":
-			if (
-				typeof record.childId !== "string" ||
-				typeof record.child !== "string" ||
-				typeof record.name !== "string"
-			) {
-				throw new Error(`Malformed RLM ledger line ${index + 1}: invalid rename record`);
-			}
-			return record as unknown as RlmLedgerRenameRecord;
-		case "delete":
-			if (typeof record.childId !== "string" || typeof record.child !== "string" || !isDeleteReason(record.reason)) {
-				throw new Error(`Malformed RLM ledger line ${index + 1}: invalid delete record`);
-			}
-			return record as unknown as RlmLedgerDeleteRecord;
-		default:
-			return undefined;
-	}
+function isLedgerBoundError(error: unknown): boolean {
+	return error instanceof Error && error.message.includes("refusing to read");
 }
 
-function edgeKey(childId: string, child: string): string {
-	return `${childId}\u0000${canonicalSessionPath(child)}`;
-}
+// Line parsing, the edge key and the replay reduction live in
+// `core/rlm-ledger-compaction.ts`: the compactor must reduce a ledger exactly
+// the way this reader does, or "compaction is replay-equivalent" would be a
+// claim about two different implementations.
 
 /** Hand every replay its own edges so a caller can never write into the cache. */
 function cloneLedgerEdges(edges: Map<string, RlmLedgerEdge>): Map<string, RlmLedgerEdge> {
@@ -305,6 +231,8 @@ function cloneLedgerEdges(edges: Map<string, RlmLedgerEdge>): Map<string, RlmLed
 interface RlmLedgerReplayCache {
 	size: number;
 	mtimeMs: number;
+	/** Non-blank lines the replay walked: the record bound's projection input. */
+	records: number;
 	edges: Map<string, RlmLedgerEdge>;
 }
 
@@ -318,6 +246,8 @@ export class RlmSpawnLedger {
 	private readonly path: string;
 	private readonly eventLog: EventLog;
 	private readonly canonicalSessionsDir: string;
+	private readonly bounds: RlmLedgerBounds;
+	private readonly compactionEnabled: boolean;
 	private queue: Promise<unknown> = Promise.resolve();
 	private seedAttempted = false;
 	private replayCache?: RlmLedgerReplayCache;
@@ -327,12 +257,18 @@ export class RlmSpawnLedger {
 		sessionsDir: string,
 		private readonly seedSource?: RlmLedgerSeedSource,
 		private readonly log: (message: string) => void = () => {},
+		bounds?: RlmLedgerBoundsOptions,
 	) {
 		this.canonicalSessionsDir = canonicalizeDirPath(sessionsDir);
 		this.path = rlmLedgerPath(agentDir, sessionsDir);
+		this.bounds = {
+			maxBytes: bounds?.maxBytes ?? RLM_LEDGER_MAX_BYTES,
+			maxRecords: bounds?.maxRecords ?? RLM_LEDGER_MAX_RECORDS,
+		};
+		this.compactionEnabled = bounds?.compactionEnabled !== false;
 		this.eventLog = new EventLog(this.path, {
-			maxBytes: RLM_LEDGER_MAX_BYTES,
-			maxRecords: RLM_LEDGER_MAX_RECORDS,
+			maxBytes: this.bounds.maxBytes,
+			maxRecords: this.bounds.maxRecords,
 			log: (message) => this.log(`RLM ledger: ${message}`),
 		});
 	}
@@ -536,7 +472,20 @@ export class RlmSpawnLedger {
 		// Advisory, per-process: catches double-admission mistakes inside this
 		// daemon. It is NOT a global uniqueness guarantee — other processes
 		// append to the same file between our read and write.
-		for (const edge of this.replaySync().values()) {
+		let knownEdges: Iterable<RlmLedgerEdge>;
+		try {
+			knownEdges = this.replaySync().values();
+		} catch (error) {
+			// An over-bound ledger is what the append ladder below compacts, so
+			// failing closed here would keep exactly the behavior the ladder
+			// exists to remove. The check is advisory, so the degraded form is
+			// "this process does not catch its own double admission". A malformed
+			// line is NOT a bound failure and still refuses the spawn.
+			if (!isLedgerBoundError(error)) throw error;
+			this.log("RLM ledger: duplicate-admission check skipped (ledger over its read bound)");
+			knownEdges = [];
+		}
+		for (const edge of knownEdges) {
 			if (!edge.deleted && canonicalSessionPath(edge.child) === childPath && edge.childId !== input.childId) {
 				throw new Error(`RLM ledger: duplicate child session path ${childPath} (already ${edge.childId})`);
 			}
@@ -752,7 +701,7 @@ export class RlmSpawnLedger {
 		// this large are pathological, and a truncated tree would be more
 		// confusing than a flat one. Not thrown: a hard error here would stick
 		// via seedAttempted and the next append would create an empty ledger.
-		if (records.length + 1 > RLM_LEDGER_MAX_RECORDS || Buffer.byteLength(payload) > RLM_LEDGER_MAX_BYTES) {
+		if (records.length + 1 > this.bounds.maxRecords || Buffer.byteLength(payload) > this.bounds.maxBytes) {
 			this.log(
 				`RLM ledger: seed exceeds read bounds (${records.length} records, ${Buffer.byteLength(payload)} bytes); skipping seeding`,
 			);
@@ -795,7 +744,75 @@ export class RlmSpawnLedger {
 		}
 	}
 
+	/**
+	 * The ADC-2 write ladder: project the append against the bounds, and if it
+	 * would cross one, run equivalence compaction first and project again. Only
+	 * a ledger whose terminal record set itself no longer fits refuses the
+	 * record, and then with a typed error the daemon can show an operator.
+	 * `compactionEnabled: false` skips the ladder entirely and leaves the
+	 * historical fail-closed behavior (the reader's "refusing to read").
+	 */
+	private projectAppendBounds(payloadBytes: number): { bytes: number; records: number; over: boolean } {
+		let size = 0;
+		try {
+			size = statSync(this.path).size;
+		} catch {
+			size = 0;
+		}
+		const bytes = size + payloadBytes;
+		let records = 1;
+		if (size > 0) {
+			const cached = this.replayCache;
+			if (cached && cached.size === size) {
+				records = cached.records + 1;
+			} else {
+				// No warm count for this file state: one bounded replay buys the
+				// exact number (and warms the cache). A replay that refuses the file
+				// is itself the over-bound verdict.
+				try {
+					records = this.replayRecordCount() + 1;
+				} catch (error) {
+					if (isLedgerBoundError(error)) {
+						return { bytes, records: Number.MAX_SAFE_INTEGER, over: true };
+					}
+					throw error;
+				}
+			}
+		}
+		return {
+			bytes,
+			records,
+			over: bytes > this.bounds.maxBytes || records > this.bounds.maxRecords,
+		};
+	}
+
+	/** Record count of the current file state, replaying (and caching) if needed. */
+	private replayRecordCount(): number {
+		this.replaySync();
+		// No cache means the file vanished between the stat and the replay; the
+		// append then creates it, so the projection is the pending record alone.
+		return this.replayCache?.records ?? 0;
+	}
+
 	private async appendRecord(record: RlmLedgerRecord): Promise<void> {
+		if (this.compactionEnabled) {
+			const payloadBytes = Buffer.byteLength(JSON.stringify(record)) + 1;
+			let projection = this.projectAppendBounds(payloadBytes);
+			if (projection.over) {
+				const outcome = this.compactUnderGuard();
+				this.replayCache = undefined;
+				projection = this.projectAppendBounds(payloadBytes);
+				if (projection.over) {
+					throw new RlmLedgerOverBoundError({
+						ledgerPath: this.path,
+						liveEdges: outcome?.liveEdges ?? 0,
+						bounds: this.bounds,
+						projectedBytes: projection.bytes,
+						projectedRecords: projection.records,
+					});
+				}
+			}
+		}
 		// A stat cannot distinguish an append that lands within the filesystem's
 		// mtime granularity, and our own writes are the one case we can rule out
 		// for free.
@@ -809,6 +826,24 @@ export class RlmSpawnLedger {
 				{ v: 1, op: "meta", at: nowIso(), sessionsDir: this.canonicalSessionsDir } satisfies RlmLedgerMetaRecord,
 			],
 		});
+	}
+
+	/** One guarded equivalence compaction of this ledger file. */
+	private compactUnderGuard(): RlmLedgerCompactionResult | undefined {
+		try {
+			return compactRlmLedgerFile(this.path, {
+				bounds: this.bounds,
+				sessionsDir: this.canonicalSessionsDir,
+				log: (message) => this.log(`RLM ledger: ${message}`),
+			});
+		} catch (error) {
+			// A compaction that cannot run (guard held by another process, an
+			// unreadable file) must not mask the reason the append was refused.
+			this.log(
+				`RLM ledger: compaction failed (${error instanceof Error ? error.message : String(error)}); refusing the append`,
+			);
+			return undefined;
+		}
 	}
 
 	/**
@@ -834,17 +869,19 @@ export class RlmSpawnLedger {
 		}
 		const stats = statSync(this.path);
 		const size = stats.size;
-		if (size > RLM_LEDGER_MAX_BYTES) {
-			throw new Error(`RLM ledger ${this.path} exceeds ${RLM_LEDGER_MAX_BYTES} bytes (${size}); refusing to read`);
+		if (size > this.bounds.maxBytes) {
+			throw new Error(`RLM ledger ${this.path} exceeds ${this.bounds.maxBytes} bytes (${size}); refusing to read`);
 		}
 		const cached = this.replayCache;
 		if (cached && cached.size === size && cached.mtimeMs === stats.mtimeMs) {
 			return cloneLedgerEdges(cached.edges);
 		}
+		let recordCount = 0;
 		const records = this.eventLog.replaySync((line, index) => {
+			recordCount += 1;
 			let record: RlmLedgerRecord | RlmLedgerMetaRecord | undefined;
 			try {
-				record = parseLedgerLine(line, index);
+				record = parseRlmLedgerLine(line, index);
 			} catch (error) {
 				// Name the file. The ledger path is a hash of the sessions dir, so
 				// "malformed line 41" on its own does not tell anybody which ledger to
@@ -860,32 +897,10 @@ export class RlmSpawnLedger {
 			}
 			return record;
 		});
-		for (const record of records) {
-			if (record.op === "meta") continue;
-			const key = edgeKey(record.childId, record.child);
-			switch (record.op) {
-				case "spawn":
-					edges.set(key, {
-						childId: record.childId,
-						parent: record.parent,
-						child: record.child,
-						depth: record.depth,
-						name: record.name,
-					});
-					break;
-				case "rename": {
-					const existing = edges.get(key);
-					if (existing) existing.name = record.name;
-					break;
-				}
-				case "delete": {
-					const existing = edges.get(key);
-					if (existing) existing.deleted = record.reason;
-					break;
-				}
-			}
+		for (const [key, edge] of reduceRlmLedgerEdges(records)) {
+			edges.set(key, edge);
 		}
-		this.replayCache = { size, mtimeMs: stats.mtimeMs, edges };
+		this.replayCache = { size, mtimeMs: stats.mtimeMs, records: recordCount, edges };
 		return cloneLedgerEdges(edges);
 	}
 }

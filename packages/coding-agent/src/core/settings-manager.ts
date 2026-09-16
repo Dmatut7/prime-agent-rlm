@@ -329,6 +329,12 @@ export interface RetentionSettings {
 	kernelSnapshotGenerations?: number;
 	/** Kernel snapshot generation reclaim. Default: false (round-08 D-1). */
 	kernelSnapshotReclaimEnabled?: boolean;
+	/**
+	 * Equivalence-compaction of over-bound RLM spawn ledgers. Default: true;
+	 * false restores the fail-closed behavior (an over-bound ledger refuses both
+	 * reads and appends until an operator intervenes).
+	 */
+	ledgerCompactionEnabled?: boolean;
 	/** Retired kernel venv generations kept. Default: 1 (RETIRED_VENV_RETENTION). */
 	venvRetention?: number;
 	/**
@@ -649,6 +655,7 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 		"staleLeaseHours",
 		"kernelSnapshotGenerations",
 		"kernelSnapshotReclaimEnabled",
+		"ledgerCompactionEnabled",
 		"venvRetention",
 		"venvReclaim",
 	],
@@ -2601,6 +2608,9 @@ export function resolveRetentionSettings(settings?: RetentionSettings): Resolved
 			DEFAULT_RETENTION_KERNEL_SNAPSHOT_GENERATIONS,
 		),
 		kernelSnapshotReclaimEnabled: settings?.kernelSnapshotReclaimEnabled === true,
+		// Default on: the compaction rung is what keeps spawning and deletion
+		// alive on a ledger that outgrew its bounds (r41 ADC-2).
+		ledgerCompactionEnabled: settings?.ledgerCompactionEnabled !== false,
 		venvRetention: normalizeRetentionCount(settings?.venvRetention, RETIRED_VENV_RETENTION),
 		venvReclaim: settings?.venvReclaim === true,
 	};

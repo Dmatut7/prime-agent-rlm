@@ -486,6 +486,7 @@ with one compact line per sweep appended to `<agentDir>/retention/history.jsonl`
 | `retention.kernelSnapshotReclaimEnabled` | boolean | `false` | Reclaim unreferenced kernel snapshot generations. Off: the snapshot bytes ride live references, and the writer still uses the single-file layout |
 | `retention.venvRetention` | number | `1` | Retired kernel venv generations kept (the boot path's `RETIRED_VENV_RETENTION`) |
 | `retention.venvReclaim` | boolean | `false` | Let the sweep reclaim retired kernel venv generations. Off: the sweep reports what the boot path would prune, and only `bootstrap.ts` prunes for real, because it can name the generation it is about to spawn from while a sweep cannot |
+| `retention.ledgerCompactionEnabled` | boolean | `true` | Compact an RLM spawn ledger that outgrew its bounds (32 MiB / 100k records) down to its replay-equivalent terminal records, both before a refused append and opportunistically in the sweep. Off: an over-bound ledger fails closed - spawning, deletion and the session catalog refuse to read it until an operator intervenes |
 
 #### Which window applies to which bytes
 

@@ -1,0 +1,3 @@
+- Fixed an RLM spawn ledger that outgrew its bounds (32 MiB / 100k records) taking spawning, deletion and the session catalog down with it: the writer now compacts the ledger to its replay-equivalent terminal records before refusing an append, the retention sweep compacts over-bound ledgers it finds, and a ledger that still does not fit fails with an actionable message instead of a stack trace.
+- Added `retention.ledgerCompactionEnabled` (default `true`); turning it off restores the previous fail-closed behavior for an over-bound ledger.
+- Fixed the retention sweep reading an over-bound RLM ledger as authoritative and treating a record of an unknown ledger version as proof of a deletion; both now make the ledger evidence unknown, so affected artifacts are kept.
