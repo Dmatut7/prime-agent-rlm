@@ -101,6 +101,42 @@ describe("markdown incremental lex equivalence", () => {
 		}
 	});
 
+	it("re-renders a lazy continuation whose raw text is unchanged (K3 blockCache identity)", () => {
+		// marked gives the paragraph the same raw before and after the bare "-"
+		// line gains content, but a different text (the lazy line's indentation
+		// is stripped while the trailing "-" line truncates it). A raw-keyed
+		// block cache serves the stale stripped rendering forever; the cache
+		// must key on the token object itself, which the re-lexed tail replaces.
+		const doc = "***\n\n\npara before lazy\n    lazy continuation arriving later\n- ";
+		const streamed = new Markdown("", 1, 0, defaultMarkdownTheme);
+		for (let pos = 1; pos <= doc.length; pos++) {
+			streamed.setText(doc.slice(0, pos));
+			assert.strictEqual(
+				streamed.render(80).join("\n"),
+				renderLines(doc.slice(0, pos), 80).join("\n"),
+				`frame at length ${pos}`,
+			);
+		}
+		streamed.setText(`${doc}l`);
+		const got = streamed.render(80).join("\n");
+		assert.strictEqual(got, renderLines(`${doc}l`, 80).join("\n"));
+		// The stale rendering is not self-healing: one more append must still
+		// match a full re-lex.
+		streamed.setText(`${doc}l?`);
+		assert.strictEqual(streamed.render(80).join("\n"), renderLines(`${doc}l?`, 80).join("\n"));
+	});
+
+	it("re-renders reused tokens when only the width changes (slot identity guard)", () => {
+		// The lex cache reuses the same token objects across widths, so a slot
+		// cache that keyed only on the token identity would replay 80-column
+		// lines at 40 columns. Width must be part of the hit condition.
+		const doc = buildDoc(prng(0x5107), 12);
+		const streamed = new Markdown(doc, 1, 0, defaultMarkdownTheme);
+		assert.strictEqual(streamed.render(80).join("\n"), renderLines(doc, 80).join("\n"));
+		assert.strictEqual(streamed.render(40).join("\n"), renderLines(doc, 40).join("\n"));
+		assert.strictEqual(streamed.render(80).join("\n"), renderLines(doc, 80).join("\n"));
+	});
+
 	it("width changes invalidate cleanly against a full re-lex", () => {
 		const doc = buildDoc(prng(0x51d7), 14);
 		const streamed = new Markdown("", 1, 0, defaultMarkdownTheme);

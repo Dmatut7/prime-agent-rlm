@@ -132,6 +132,23 @@ function pickMarkdownParser(text: string): Marked {
  * When the next text only changes after that offset (the streaming-append
  * shape), only the tail is re-lexed and the prefix tokens are reused.
  */
+/**
+ * One per-block render cache entry. Slot i holds the lines rendered for
+ * top-level token i; a slot hits only when the token object is identical
+ * (the lex cache reuses prefix token objects across streaming frames, and
+ * tail tokens are always fresh objects), and the width, following-block type
+ * and capabilities version all match. Keying on the token identity instead of
+ * its raw text also catches tokens whose raw is unchanged while their inline
+ * text changes (marked's lazy-continuation truncation).
+ */
+interface BlockSlot {
+	token: Token;
+	width: number;
+	nextType: string | undefined;
+	capsVersion: number;
+	lines: string[];
+}
+
 interface LexCache {
 	/** CR/tab-normalized text that produced the tokens. */
 	text: string;
@@ -285,10 +302,10 @@ export class Markdown implements Component {
 	private selectionRegions: TableCellSelectionRegion[] = [];
 	private tableIdentities: object[] = [];
 	// Per-block render cache so streaming appends only re-render the changing
-	// final block instead of the whole document. Keyed by capabilities
-	// version/width/type/nextType/raw; rebuilt each render so it stays bounded to
-	// the current document's blocks.
-	private blockCache = new Map<string, string[]>();
+	// final block instead of the whole document. Index-aligned to the top-level
+	// token stream and hit by token identity (see BlockSlot); rebuilt each
+	// render so it stays bounded to the current document's blocks.
+	private blockSlots: BlockSlot[] = [];
 	// Block-token lex cache; see LexCache. Survives setText (streaming) and
 	// invalidate() (tokens do not depend on the theme), but is only reused when
 	// the normalized text is unchanged up to the cached cut offset.
@@ -327,7 +344,7 @@ export class Markdown implements Component {
 		this.selectionRegions = [];
 		// External invalidation (e.g. theme change) affects rendered output, so
 		// the per-block cache must go too.
-		this.blockCache = new Map();
+		this.blockSlots = [];
 	}
 
 	/**
@@ -405,25 +422,34 @@ export class Markdown implements Component {
 		// served from the cache. The final block is never cached: while streaming,
 		// appended text can reinterpret it (unterminated fences, growing lists);
 		// once a block is no longer last, its raw text is final.
-		const nextCache = new Map<string, string[]>();
+		const nextSlots: BlockSlot[] = [];
 		const contentLines: string[] = [];
 		for (let i = 0; i < tokens.length; i++) {
 			const token = tokens[i];
 			const nextTokenType = tokens[i + 1]?.type;
 			const useCache = cacheable && i < tokens.length - 1;
-			// capabilitiesVersion keys the block cache too: the same raw block
-			// renders differently before/after a capability flip (F2).
-			const key = useCache ? `${capsVersion}|${width}|${token.type}|${nextTokenType ?? ""}|${token.raw}` : "";
-			let blockLines = useCache ? (nextCache.get(key) ?? this.blockCache.get(key)) : undefined;
+			let blockLines: string[] | undefined;
+			if (useCache) {
+				const slot = this.blockSlots[i];
+				if (
+					slot &&
+					slot.token === token &&
+					slot.width === width &&
+					slot.nextType === nextTokenType &&
+					slot.capsVersion === capsVersion
+				) {
+					blockLines = slot.lines;
+				}
+			}
 			if (!blockLines) {
 				blockLines = this.renderBlock(token, nextTokenType, width, contentWidth);
 			}
 			if (useCache) {
-				nextCache.set(key, blockLines);
+				nextSlots.push({ token, width, nextType: nextTokenType, capsVersion, lines: blockLines });
 			}
 			contentLines.push(...blockLines);
 		}
-		this.blockCache = nextCache;
+		this.blockSlots = nextSlots;
 
 		const bgFn = this.defaultTextStyle?.bgColor;
 		const emptyLine = " ".repeat(width);
