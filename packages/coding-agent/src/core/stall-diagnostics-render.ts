@@ -67,7 +67,7 @@ export function formatStallDiagnosticsLines(diagnostics: StallDiagnostics | unde
 		);
 		return lines;
 	}
-	const busy = payload["busy"];
+	const busy = payload.busy;
 	if (isSegment(busy)) {
 		lines.push(
 			`busy: streaming=${flag(busy, "streaming")} compacting=${flag(busy, "compacting")} ` +
@@ -76,63 +76,63 @@ export function formatStallDiagnosticsLines(diagnostics: StallDiagnostics | unde
 	} else {
 		lines.push("busy: unknown");
 	}
-	const inFlightCalls = payload["inFlightToolCalls"];
+	const inFlightCalls = payload.inFlightToolCalls;
 	if (Array.isArray(inFlightCalls)) {
 		const inFlight = inFlightCalls.map((call) => {
 			if (!isSegment(call)) return "unknown (malformed tool call)";
-			const toolName = typeof call["toolName"] === "string" ? call["toolName"] : "unknown";
-			const toolCallId = typeof call["toolCallId"] === "string" ? call["toolCallId"] : "unknown";
-			const elapsed = typeof call["elapsedMs"] === "number" ? seconds(call["elapsedMs"]) : "unknown";
+			const toolName = typeof call.toolName === "string" ? call.toolName : "unknown";
+			const toolCallId = typeof call.toolCallId === "string" ? call.toolCallId : "unknown";
+			const elapsed = typeof call.elapsedMs === "number" ? seconds(call.elapsedMs) : "unknown";
 			return `${toolName} (id=${toolCallId}, ${elapsed})`;
 		});
 		lines.push(`in-flight tools: ${inFlight.length > 0 ? inFlight.join(", ") : "none"}`);
 	} else {
 		lines.push("in-flight tools: unknown");
 	}
-	const lastEvent = payload["lastEvent"];
+	const lastEvent = payload.lastEvent;
 	lines.push(
 		isSegment(lastEvent)
-			? `last event: ${typeof lastEvent["type"] === "string" ? lastEvent["type"] : "unknown"} ` +
-					`(${typeof lastEvent["ageMs"] === "number" ? seconds(lastEvent["ageMs"]) : "unknown"} ago)`
+			? `last event: ${typeof lastEvent.type === "string" ? lastEvent.type : "unknown"} ` +
+					`(${typeof lastEvent.ageMs === "number" ? seconds(lastEvent.ageMs) : "unknown"} ago)`
 			: "last event: none recorded",
 	);
-	const pump = payload["pump"];
+	const pump = payload.pump;
 	if (isSegment(pump)) {
 		lines.push(
 			`pump: suspended=${flag(pump, "suspended")} requested=${flag(pump, "requested")} ` +
-				`epoch=${typeof pump["epoch"] === "number" ? pump["epoch"] : "unknown"}`,
+				`epoch=${typeof pump.epoch === "number" ? pump.epoch : "unknown"}`,
 		);
 	} else {
 		lines.push("pump: unknown");
 	}
-	const unfinishedActions = payload["unfinishedActions"];
+	const unfinishedActions = payload.unfinishedActions;
 	lines.push(`unfinished actions: ${typeof unfinishedActions === "number" ? unfinishedActions : "unknown"}`);
-	const exemption = payload["exemption"];
+	const exemption = payload.exemption;
 	if (exemption !== undefined) {
 		if (isSegment(exemption)) {
-			const reasonsValue = exemption["reasons"];
+			const reasonsValue = exemption.reasons;
 			const reasons = Array.isArray(reasonsValue)
 				? reasonsValue.filter((reason): reason is string => typeof reason === "string")
 				: [];
-			const remainingMs = exemption["budgetRemainingMs"];
+			const remainingMs = exemption.budgetRemainingMs;
 			const remaining = typeof remainingMs === "number" ? seconds(remainingMs) : undefined;
 			lines.push(
-				`exemption: ${typeof exemption["reason"] === "string" ? exemption["reason"] : "unspecified"} [${reasons.join(", ") || "none"}]` +
+				`exemption: ${typeof exemption.reason === "string" ? exemption.reason : "unspecified"} [${reasons.join(", ") || "none"}]` +
 					`${remaining ? ` budget left ${remaining}` : ""}` +
-					`${exemption["exhausted"] === true ? " (exhausted)" : ""}`,
+					`${exemption.exhausted === true ? " (exhausted)" : ""}`,
 			);
 		} else {
 			lines.push("exemption: unknown");
 		}
 	}
-	const kernel = payload["kernel"];
+	const kernel = payload.kernel;
 	if (kernel !== undefined) {
 		if (isSegment(kernel)) {
-			const kernelPid = kernel["kernelPid"];
-			const livenessAgeMs = kernel["livenessAgeMs"];
-			const liveBashHandles = kernel["liveBashHandles"];
-			const hostRequestCount = kernel["hostRequestCount"];
-			const reasonsValue = kernel["reasons"];
+			const kernelPid = kernel.kernelPid;
+			const livenessAgeMs = kernel.livenessAgeMs;
+			const liveBashHandles = kernel.liveBashHandles;
+			const hostRequestCount = kernel.hostRequestCount;
+			const reasonsValue = kernel.reasons;
 			const reasons = Array.isArray(reasonsValue)
 				? reasonsValue.filter((reason): reason is string => typeof reason === "string")
 				: [];

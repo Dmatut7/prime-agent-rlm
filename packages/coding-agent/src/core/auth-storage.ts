@@ -734,9 +734,6 @@ export class AuthStorage {
 	}
 
 	/** Clear every stale mark recorded for a provider (an explicit re-login resets all sources). */
-	private clearAllStaleAuthSources(provider: string): void {
-		this.staleAuthSources.delete(provider);
-	}
 
 	/**
 	 * Clear stale marks on stored credentials after the auth file changed on disk.
@@ -877,7 +874,15 @@ export class AuthStorage {
 		// An explicit credential write is a full reset for the provider: a 401 marked
 		// the runtime/environment source stale earlier in this process, and the user
 		// re-logging in must recover every source, not only the stored one.
-		this.clearAllStaleAuthSources(provider);
+		// The stored source's stale mark always clears (the user just re-logged in).
+		this.clearStaleAuthSource(provider, "stored");
+		// The runtime source only clears when it carries the same value that was
+		// just set: a stale runtime key must not be revived by an unrelated stored
+		// login (the stored-update/do-not-revive-runtime contract).
+		const runtimeValue = this.runtimeOverrides.get(provider);
+		if (runtimeValue !== undefined && credential.type === "api_key" && runtimeValue === credential.key) {
+			this.clearStaleAuthSource(provider, "runtime");
+		}
 		this.data[provider] = credential;
 		this.persistProviderChange(provider, credential);
 	}

@@ -839,13 +839,13 @@ export function classifyAgentMessageSendFailureByMessage(message: string): Agent
 		const retryable = /\bretryable=(true|false)\b/i.exec(message)?.[1]?.toLowerCase();
 		return {
 			deliveredNothing: true,
-			retryNowSucceeds: retryable === undefined ? undefined : retryable === "true" ? true : false,
+			retryNowSucceeds: retryable === undefined ? undefined : retryable === "true",
 		};
 	}
 	// Paused serializes (b) only for the update-restart teardown lease: the
 	// ordinary lease releases, the teardown one only a restart releases.
 	if (/session input admission is paused/i.test(message)) {
-		return { deliveredNothing: true, retryNowSucceeds: /update-restart teardown/i.test(message) ? false : true };
+		return { deliveredNothing: true, retryNowSucceeds: !/update-restart teardown/i.test(message) };
 	}
 	// QP-3 (r39): a same-key duplicate arrived while its owner was committing;
 	// refused before delivery, retrying after the turn ends is correct.
