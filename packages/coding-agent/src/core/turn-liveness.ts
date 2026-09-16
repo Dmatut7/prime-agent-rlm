@@ -521,6 +521,19 @@ export function createTurnLiveness(options: TurnLivenessOptions): TurnLiveness {
 				reasons.push(STALL_VOUCH_REASONS.liveBashHandles);
 				// Existence of a handle is liveness; only movement upgrades the tier.
 				if (verdict.bashProgress) progress = true;
+				// LIVE-1 (r44): a fresh frame attesting this cell's own handle while a live
+				// loop awaits that cell is the quiet-long-job shape - `await bash(job)` blocked
+				// on a command that is legitimately producing nothing yet. The kernel stays
+				// responsive and the awaited handle demonstrably exists, so the full budget
+				// covers the job's real wall clock instead of expiring the existence tier at
+				// twenty minutes and aborting a turn that is waiting on live work. Every term
+				// is load-bearing: a handle no cell is awaiting (a background fleet behind an
+				// unrelated silent cell) and a handle under a frozen loop (the synchronous
+				// wedge) both keep the short rescue, and the combined cap still bounds how
+				// long a quietly-wedged handle can hold the turn.
+				else if (verdict.loopAlive && verdict.cellAwaiting && (kernel?.latest?.bashCellHandles ?? 0) > 0) {
+					progress = true;
+				}
 			}
 			if (verdict.loopAlive && verdict.cellAwaiting) {
 				reasons.push(STALL_VOUCH_REASONS.kernelLoopAwaitingCell);

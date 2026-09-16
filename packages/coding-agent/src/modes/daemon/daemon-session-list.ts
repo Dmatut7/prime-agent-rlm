@@ -259,7 +259,11 @@ export function summaryForActiveSession(
 		id: activeSession.activeSessionId,
 		lifecycle: activeLifecycleForSession(activeSession),
 		activity: activeActivityForSession(activeSession),
-		isSessionActive: session.isSessionActive,
+		// Kernel-owned work (a cell in flight, or live bash() handles the heartbeat attests)
+		// keeps the row active: this field drives child passivation and whole-worker eviction,
+		// both of which close the session's kernel and with it any background script the session
+		// is hosting (LIVE-1, r44). Optional on stub sessions; undefined reads as no kernel.
+		isSessionActive: session.isSessionActive || session.isKernelWorkInFlight === true,
 		hasActiveHeartbeat: hasActiveHeartbeat || undefined,
 		hasRegisteredHeartbeat: hasRegisteredHeartbeat || undefined,
 		hasRegisteredCronJob: hasRegisteredCronJob || undefined,

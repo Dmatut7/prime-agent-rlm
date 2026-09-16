@@ -1,0 +1,2 @@
+- Fixed idle eviction killing sessions whose Python kernel still ran background `bash()` scripts: a live kernel handle or executing cell now keeps a session resident past child passivation and whole-worker eviction.
+- Changed the stall watchdog to give a quietly running awaited `bash()` command the full exemption budget instead of a 20-minute one, so long silent jobs are no longer aborted mid-run while still alive.

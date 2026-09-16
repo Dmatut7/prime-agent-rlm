@@ -589,6 +589,19 @@ export class RefinePersistScopeError extends Error {
 	}
 }
 
+/**
+ * Kernel-owned work that must keep a session resident after its turn ends (LIVE-1, r44): a
+ * cell executing right now, or bash() handles the kernel's newest heartbeat attests. Closing
+ * the session closes the kernel, and the kernel kills those handle's process groups, so an
+ * eviction policy that treats "turn idle" as "idle" kills long-lived background scripts.
+ */
+export interface KernelResidencyFacts {
+	/** A kernel cell request is executing right now (host-side fact, always fresh). */
+	hasActiveExecution: boolean;
+	/** The kernel's newest heartbeat reports live bash() handles. */
+	isKernelBashRunning: boolean;
+}
+
 export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
@@ -682,6 +695,13 @@ export interface AgentSessionConfig {
 	 * journal, at most once per stall stage.
 	 */
 	stallJournaledBashHandles?: (kernelPid: number | undefined) => JournaledBashFacts | undefined;
+	/**
+	 * Kernel residency facts behind the eviction-facing activity term of this session: a cell
+	 * executing right now, and live bash() handles the kernel's newest heartbeat attests.
+	 * Injectable so the residency wiring is testable without a kernel; defaults to this
+	 * session's ipython kernel client. Pure and O(1) - summary and roster polling read it.
+	 */
+	kernelResidencyFacts?: () => KernelResidencyFacts | undefined;
 	/**
 	 * How long a deferred RLM child terminal notice may wait for delivery before it
 	 * is abandoned (default 5 minutes). Injectable so the abandonment path is
@@ -1905,6 +1925,8 @@ export class AgentSession {
 	private readonly _stallJournaledBashHandles:
 		| ((kernelPid: number | undefined) => JournaledBashFacts | undefined)
 		| undefined;
+	/** Kernel residency facts override for the eviction-facing activity term; defaults to the kernel client. */
+	private readonly _kernelResidencyFacts: (() => KernelResidencyFacts | undefined) | undefined;
 	/** Predicate names that already logged a failure this turn (one line per turn, not per sample). */
 	private readonly _stallPredicateFailures = new Set<string>();
 	/** Turn-liveness event kinds already logged this turn (the degraded path must stay countable). */
@@ -1991,6 +2013,7 @@ export class AgentSession {
 		this._stallAbortSettleGraceMs = config.stallAbortSettleGraceMs;
 		this._stallKernelLivenessFacts = config.stallKernelLivenessFacts;
 		this._stallJournaledBashHandles = config.stallJournaledBashHandles;
+		this._kernelResidencyFacts = config.kernelResidencyFacts;
 		this._rlmTerminalNoticeAbandonAfterMs =
 			config.rlmTerminalNoticeAbandonAfterMs ?? RLM_TERMINAL_NOTICE_ABANDON_AFTER_MS;
 		this._failureWakeQuietWindowMs = config.failureWakeQuietWindowMs ?? FAILURE_WAKE_QUIET_WINDOW_MS;
@@ -4717,6 +4740,34 @@ export class AgentSession {
 			kernelPid: kernel.kernelPid,
 			hasActiveExecution: kernel.hasActiveExecution,
 			...(kernel.revivalVouch ? { revival: kernel.revivalVouch } : {}),
+		};
+	}
+
+	/**
+	 * Kernel-owned work this session is hosting: a cell executing right now, or live bash()
+	 * handles the kernel's newest heartbeat attests. Residency evidence for the eviction-facing
+	 * summaries (LIVE-1, r44): a session that ended its turn with a background script running is
+	 * idle at the turn level, but closing it closes the kernel, and the kernel kills those
+	 * handles' process groups, so eviction policy must treat the session as not idle.
+	 *
+	 * Deliberately not part of {@link isSessionActive}, which RLM quiescence and goal continuation
+	 * read: those wait for turn-level work, and a long-lived background handle must not park them.
+	 * Pure and O(1) - it reads the kernel client's own counters, never a file. `isKernelBashRunning`
+	 * attests the newest retained heartbeat, which stops flowing once the kernel sits idle; the
+	 * attestation then ages rather than refreshes, which errs toward keeping the session resident
+	 * until its next cell updates the facts.
+	 */
+	get isKernelWorkInFlight(): boolean {
+		const facts = this._kernelResidencyFacts ? this._kernelResidencyFacts() : this._kernelResidencyFactsFromClient();
+		return facts?.hasActiveExecution === true || facts?.isKernelBashRunning === true;
+	}
+
+	private _kernelResidencyFactsFromClient(): KernelResidencyFacts | undefined {
+		const kernel = this._ipythonKernelProvisioner?.manager;
+		if (!kernel) return undefined;
+		return {
+			hasActiveExecution: kernel.hasActiveExecution === true,
+			isKernelBashRunning: kernel.isKernelBashRunning === true,
 		};
 	}
 
