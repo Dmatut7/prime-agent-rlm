@@ -131,6 +131,22 @@ describe("K3P-2: ancestor settings edits are live in a watching session", () => 
 		// CI runners can stretch the 100ms stat-poll loop; the window is generous
 		// without weakening the proposition (the ancestor file alone must flip it).
 		const applied = await waitFor(() => manager !== undefined && manager.getAgentTracesEnabled() === false, 20000);
+		if (!applied && manager !== undefined) {
+			// One-shot CI diagnostics: what did the watcher actually see?
+			const internals = manager as unknown as {
+				ancestorStamps?: Map<string, string | undefined>;
+				externalWatchers?: Array<{ path: string }>;
+			};
+			console.error(
+				"ancestor-watch diagnostics:",
+				JSON.stringify({
+					watchers: internals.externalWatchers?.map((w) => w.path),
+					stamps: internals.ancestorStamps && [...internals.ancestorStamps.entries()],
+					vetoExists: existsSync(rootSettingsPath),
+					platform: process.platform,
+				}),
+			);
+		}
 		expect(applied).toBe(true);
 		expect(manager.drainWarnings("project").length).toBeGreaterThan(0);
 	}, 25000);
