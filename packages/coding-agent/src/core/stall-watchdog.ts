@@ -203,7 +203,8 @@ export type StallExemptionEventKind =
 	| "reason_switch"
 	| "abort_deferred"
 	| "exhausted"
-	| "cleared";
+	| "cleared"
+	| "micro_segments";
 
 /** Forensic record of one exemption-budget transition; defaults to `sessionLog.info`. */
 export interface StallExemptionEvent {
@@ -221,6 +222,17 @@ export interface StallExemptionEvent {
 	 * are expected and distinguishable by this field: one before a gap, one after a resume.
 	 */
 	carriedExemptMs?: number;
+	/**
+	 * Only `micro_segments`: how many touch-sampled transitions the summary folds. The vouch's
+	 * tool-in-flight conjunction flips on every tool start/end boundary, so a short-cell polling
+	 * loop would otherwise emit one started/cleared pair per cell and bury the file in noise; the
+	 * count keeps the folded traffic auditable without logging it pair by pair.
+	 */
+	count?: number;
+	/** Only `micro_segments`: wall-clock span the folded transitions covered. */
+	windowMs?: number;
+	/** Only `micro_segments`: folded transitions per kind. */
+	byKind?: Readonly<Record<string, number>>;
 	at: number;
 }
 
@@ -284,6 +296,15 @@ export const STALL_EXEMPTION_BUDGET_FLOOR_MS = 30 * 60 * 1000;
 export const STALL_EXEMPTION_BUDGET_WARN_MULTIPLIER = 10;
 /** Default budget for a liveness-only vouch: near the pre-exemption abort threshold (15min). */
 export const STALL_VOUCH_LIVENESS_BUDGET_MS = 20 * 60 * 1000;
+/**
+ * Flush cadence for touch-sampled exemption transitions folded into `micro_segments` summaries.
+ * One merged line per minute keeps a 10s polling loop at ~1440 lines a day instead of ~17k, while
+ * timer-fire transitions stay per-event and land ahead of their own flush.
+ */
+export const STALL_EXEMPTION_MICRO_SEGMENT_INTERVAL_MS = 60_000;
+
+/** Transitions that fold into a `micro_segments` summary when a touch sampled them. */
+const MICRO_SEGMENT_KINDS: ReadonlySet<string> = new Set(["started", "resumed", "reason_switch", "cleared"]);
 
 /** Vouch sub-reasons produced by the kernel/host liveness aggregate. */
 export const STALL_VOUCH_REASONS = {
@@ -298,6 +319,23 @@ export const STALL_KERNEL_REASONS = {
 	heartbeatStale: "heartbeat_stale",
 	noKernelFacts: "no_kernel_facts",
 } as const;
+
+/**
+ * Touch-sampled exemption transitions awaiting a merged `micro_segments` summary. The budget
+ * itself never sees these: a transition folded here has already been applied to the segment
+ * exactly as before, only its per-event log line is withheld.
+ */
+interface MicroSegmentAccumulator {
+	count: number;
+	byKind: Map<string, number>;
+	reasons: Set<string>;
+	/** Sum of the folded segments' `usedMs`: what the flutter actually charged or released. */
+	usedMs: number;
+	windowStart: number;
+	lastFlushAt: number;
+	reason: StallExemptionReason;
+	tier?: StallVouchBudgetTier;
+}
 
 interface ExemptionSegment {
 	/**
@@ -346,6 +384,7 @@ export class StallWatchdog {
 	 * is how a renewable vouch kept a wedge alive indefinitely (A1).
 	 */
 	private budgetSpentThisCycle = false;
+	private microSegments: MicroSegmentAccumulator | undefined = undefined;
 
 	constructor(options: StallWatchdogOptions) {
 		this.options = options;
@@ -507,6 +546,9 @@ export class StallWatchdog {
 	}
 
 	private resetExemption(): void {
+		// The arm cycle that folded these transitions is over: its summary must not leak into
+		// the next one's timeline, and the disarm tail is the last place it can still land.
+		this.flushMicroSegments(this.stepNow());
 		this.exemptionSegment = undefined;
 		this.lastKernelFacts = undefined;
 		this.abortDeferredLogged = false;
@@ -592,6 +634,7 @@ export class StallWatchdog {
 						carriedExemptMs: this.bankedExemptMs,
 					},
 					now,
+					observedActivity,
 				);
 			}
 			return undefined;
@@ -628,6 +671,7 @@ export class StallWatchdog {
 					carriedExemptMs,
 				},
 				now,
+				observedActivity,
 			);
 		} else {
 			const segment = this.exemptionSegment;
@@ -637,7 +681,7 @@ export class StallWatchdog {
 				segment.reasons = [];
 			}
 			if (vouchFacts) segment.tier = vouchFacts.tier;
-			this.commitReasonSwitch(segment, observed, now);
+			this.commitReasonSwitch(segment, observed, now, observedActivity);
 			// After the switch, so the settle measures the budget this sample's reason and tier buy.
 			this.settleExemptSilenceOnMovement(segment, observed, vouchFacts?.movementToken, now);
 		}
@@ -714,7 +758,12 @@ export class StallWatchdog {
 	 * a flapping pause flag cannot suppress warnings; switching away from it commits
 	 * immediately, because a late warning is the cheaper mistake.
 	 */
-	private commitReasonSwitch(segment: ExemptionSegment, observed: StallExemptionReason, now: number): void {
+	private commitReasonSwitch(
+		segment: ExemptionSegment,
+		observed: StallExemptionReason,
+		now: number,
+		sampledByActivity: boolean,
+	): void {
 		if (segment.reason === observed) {
 			segment.pendingReason = undefined;
 			return;
@@ -741,27 +790,81 @@ export class StallWatchdog {
 				tier: segment.tier,
 			},
 			now,
+			sampledByActivity,
 		);
 	}
 
 	private emitExemptionEvent(
 		event: Omit<StallExemptionEvent, "at" | "budgetMs"> & { tier?: StallVouchBudgetTier },
 		now: number,
+		sampledByActivity = false,
 	): void {
 		const { tier, ...rest } = event;
 		const budgetMs = this.exemptionBudgetMs(event.reason, tier ?? this.exemptionSegment?.tier);
 		const full: StallExemptionEvent = { ...rest, budgetMs, at: now };
+		// A transition sampled by a touch is by construction one edge of the tool-boundary
+		// flutter: the vouch's tool-in-flight conjunction flips at every start/end, so logging
+		// these one at a time turns a 10s polling loop into ~17k stall-evidence lines a day.
+		// Fold them into a merged summary; what a timer fire samples (the blink that banks a
+		// budget, the birth that inherits it), plus exhaustion and deferrals, stays per-event.
+		if (sampledByActivity && MICRO_SEGMENT_KINDS.has(full.kind)) {
+			this.recordMicroSegment(full, tier, now);
+			return;
+		}
+		// Per-event lines keep the timeline readable: the folded window lands ahead of them.
+		this.flushMicroSegments(now);
 		if (this.options.onExemptionEvent) {
 			this.options.onExemptionEvent(full);
 			return;
 		}
-		stallLog.info(`stall watchdog: exemption ${full.kind}`, {
-			reason: full.reason,
-			...(full.previousReason ? { previousReason: full.previousReason } : {}),
-			budgetUsedMs: full.usedMs,
-			budgetMs: full.budgetMs,
-			reasons: full.reasons,
-		});
+		const { msg, fields } = formatStallExemptionEventLog(full);
+		stallLog.info(msg, fields);
+	}
+
+	private recordMicroSegment(event: StallExemptionEvent, tier: StallVouchBudgetTier | undefined, now: number): void {
+		const acc = this.microSegments;
+		if (acc) {
+			acc.count += 1;
+			acc.byKind.set(event.kind, (acc.byKind.get(event.kind) ?? 0) + 1);
+			acc.usedMs += event.usedMs;
+			for (const reason of event.reasons) acc.reasons.add(reason);
+			acc.reason = event.reason;
+			if (tier !== undefined) acc.tier = tier;
+			if (now - acc.lastFlushAt >= STALL_EXEMPTION_MICRO_SEGMENT_INTERVAL_MS) this.flushMicroSegments(now);
+			return;
+		}
+		this.microSegments = {
+			count: 1,
+			byKind: new Map([[event.kind, 1]]),
+			reasons: new Set(event.reasons),
+			usedMs: event.usedMs,
+			windowStart: now,
+			lastFlushAt: now,
+			reason: event.reason,
+			...(tier === undefined ? {} : { tier }),
+		};
+	}
+
+	/** Emit one merged summary for the folded window, if there is anything pending. */
+	private flushMicroSegments(now: number): void {
+		const acc = this.microSegments;
+		if (!acc || acc.count === 0) return;
+		this.microSegments = undefined;
+		const byKind: Record<string, number> = {};
+		for (const [kind, count] of acc.byKind) byKind[kind] = count;
+		this.emitExemptionEvent(
+			{
+				kind: "micro_segments",
+				reason: acc.reason,
+				usedMs: acc.usedMs,
+				reasons: [...acc.reasons],
+				tier: acc.tier,
+				count: acc.count,
+				windowMs: Math.max(0, now - acc.windowStart),
+				byKind,
+			},
+			now,
+		);
 	}
 
 	private noteAbortDeferred(now: number): void {
@@ -882,6 +985,33 @@ export function normalizeStallKernelFacts(facts: StallKernelFacts): StallKernelD
 		...(facts.hostRequestCount === undefined ? {} : { hostRequestCount: facts.hostRequestCount }),
 		...(facts.kernelPid === undefined ? {} : { kernelPid: facts.kernelPid }),
 		reasons: [...(facts.reasons ?? [])],
+	};
+}
+
+/**
+ * Log line for one exemption event. The default sink and session-level sinks (which add the
+ * session id for attribution) share it so the field set cannot drift between them.
+ */
+export function formatStallExemptionEventLog(event: StallExemptionEvent): {
+	msg: string;
+	fields: Record<string, unknown>;
+} {
+	return {
+		msg: `stall watchdog: exemption ${event.kind}`,
+		fields: {
+			reason: event.reason,
+			...(event.previousReason ? { previousReason: event.previousReason } : {}),
+			budgetUsedMs: event.usedMs,
+			budgetMs: event.budgetMs,
+			reasons: event.reasons,
+			...(event.kind === "micro_segments"
+				? {
+						count: event.count,
+						windowMs: event.windowMs,
+						byKind: event.byKind,
+					}
+				: {}),
+		},
 	};
 }
 

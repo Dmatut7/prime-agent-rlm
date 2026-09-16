@@ -245,22 +245,19 @@ describe("StallWatchdog exemption budget (T1-1)", () => {
 		h.clock.advance(500);
 		h.watchdog.touch();
 		expect(h.watchdog.exemption?.reason).toBe("vouched");
-		h.clock.advance(600);
-		h.watchdog.touch();
-		expect(h.watchdog.exemption?.reason).toBe("vouched");
 
-		// One full warn window of continuous pause commits the switch ...
-		h.clock.advance(500);
-		h.watchdog.touch();
+		// One full warn window of continuous pause commits the switch. The touch that armed
+		// the pending switch is the last activity, so the committing sample is the timer's
+		// own fire - which is what keeps the switch visible as a per-event line.
+		h.clock.advance(1000);
 		expect(h.watchdog.exemption?.reason).toBe("paused");
 		const usedAfterSwitch = h.watchdog.exemption?.usedMs ?? 0;
 		// ... without buying any budget: the segment still started at the first warn.
-		expect(usedAfterSwitch).toBeGreaterThanOrEqual(1600);
+		expect(usedAfterSwitch).toBeGreaterThanOrEqual(1500);
 
-		// Switching away from the snoozing reason commits immediately.
+		// Switching away from the snoozing reason commits immediately, on the next fire.
 		paused.value = false;
-		h.clock.advance(100);
-		h.watchdog.touch();
+		h.clock.advance(1000);
 		expect(h.watchdog.exemption?.reason).toBe("vouched");
 		expect(h.watchdog.exemption?.usedMs ?? 0).toBeGreaterThan(usedAfterSwitch);
 		const switches = h.exemptionEvents.filter((event) => event.kind === "reason_switch");

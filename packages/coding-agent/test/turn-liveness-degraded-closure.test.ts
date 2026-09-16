@@ -237,8 +237,11 @@ describe("the exemption cap survives a self-renewing vouch (watchdog-side lock)"
 		const abort = stages.find((stage) => stage.stage === "abort");
 		expect(abort, "a self-renewing vouch outlived a 10-hour simulation").toBeDefined();
 		// The evidence really did blink and get renewed, so this is the carry doing the work.
+		// The lapses were observed by timer fires (banked) and the rebirths by touches, so the
+		// "resumed" transitions land in the folded micro-segment summaries rather than as
+		// per-event lines; the carry they inherit is still pinned by the abort timing below.
 		expect(events).toContain("cleared");
-		expect(events).toContain("resumed");
+		expect(events).toContain("micro_segments");
 		expect(stages.filter((stage) => stage.stage === "warn").length).toBeGreaterThan(1);
 		// Bounded by the combined budget plus the escalation it takes to land, not by 10 hours.
 		expect(abort?.silentMs ?? Number.POSITIVE_INFINITY).toBeLessThanOrEqual(budgetMs + ABORT_AFTER_MS);

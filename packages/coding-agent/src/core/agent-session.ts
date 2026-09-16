@@ -346,7 +346,9 @@ import {
 	buildStallAbortMessage,
 	buildStallAbortUnsettledMessage,
 	buildStallWarnMessage,
+	formatStallExemptionEventLog,
 	normalizeStallKernelFacts,
+	type StallExemptionEvent,
 	type StallKernelDiagnostics,
 	type StallMessageContext,
 	type StallVouchFacts,
@@ -4713,6 +4715,11 @@ export class AgentSession {
 				}
 			},
 			vouch: () => this._sampleStallVouch(),
+			// The default exemption sink logs without a session identity, and a daemon worker
+			// hosts many sessions per process behind one shared stall-evidence file: a line that
+			// cannot be attributed to the session it vouched for is a line a post-mortem cannot
+			// use (JIT-1B). The formatter is shared with the default sink so the fields cannot drift.
+			onExemptionEvent: (event) => this._logStallExemptionEvent(event),
 			onStage: (info) => this._handleStallWatchdogStage(info),
 			...(this._stallAbortSettleGraceMs === undefined ? {} : { abortSettleGraceMs: this._stallAbortSettleGraceMs }),
 		};
@@ -4831,6 +4838,11 @@ export class AgentSession {
 			error: error instanceof Error ? error.message : String(error),
 			sessionId: this.sessionManager.getSessionId(),
 		});
+	}
+
+	private _logStallExemptionEvent(event: StallExemptionEvent): void {
+		const { msg, fields } = formatStallExemptionEventLog(event);
+		sessionLog.info(msg, { ...fields, sessionId: this.sessionManager.getSessionId() });
 	}
 
 	private _handleTurnLivenessEvent(event: TurnLivenessEvent): void {
