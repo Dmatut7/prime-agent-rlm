@@ -437,13 +437,18 @@ export interface KernelLivenessSample {
 	cellsDone: number;
 	/** Host requests the kernel is waiting on, from the kernel's side. */
 	hostRequests: number;
-	/** Live `bash()` handles. */
+	/** Live `bash()` handles; the stall vouch stays fleet-level on this count. */
 	bashHandles: number;
-	/** Live `bash()` handles attributed to `cellId`. */
+	/**
+	 * Live `bash()` handles attributed to `cellId`. Diagnostic context only, deliberately
+	 * not wired into the vouch: one agent turn spans many cells, so a background handle
+	 * spawned earlier in the same turn would sit in an earlier cell and a per-cell gate
+	 * would wrongly stop vouching for legitimate in-turn work (r35 H-3 evaluation).
+	 */
 	bashCellHandles: number;
-	/** Buffered output bytes across the probed handles. */
+	/** Buffered output bytes across the live handles (full-fleet sum since r39). */
 	bashBufferedBytes: number;
-	/** Probed handles with bytes pending on their capture pipe. */
+	/** Handles with bytes pending on their capture pipe (full-fleet count since r39). */
 	bashPipePending: number;
 }
 

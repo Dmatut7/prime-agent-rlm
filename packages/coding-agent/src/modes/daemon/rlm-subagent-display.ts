@@ -37,6 +37,31 @@ export interface RlmSubagentDisplayEntry {
 export function rlmSubagentDisplayPath(sessionDir: string): string {
 	return join(sessionDir, RLM_SUBAGENT_DISPLAY_FILE);
 }
+/**
+ * How long a `running` display entry may keep claiming the child is running after its
+ * transcript stopped moving. The display file is written only at spawn, completion, and
+ * deletion, so a child whose completion write never happened (worker death, daemon
+ * restart, kill) stays `running` on disk forever; read-side reconciliation demotes such
+ * rows to `stale` instead of presenting them as live work (r38 L5).
+ */
+export const RLM_SUBAGENT_STALE_AFTER_MS = 6 * 60 * 60 * 1000;
+
+export type EffectiveRlmSubagentStatus = "running" | "completed" | "deleted" | "stale";
+
+/**
+ * The status a reader should present for one display entry, given the last time the
+ * child's transcript actually moved (`undefined` when unknown). Only `running` entries
+ * are reclassified: `completed` and `deleted` are durable writer facts, and a missing
+ * transcript age is not evidence of staleness.
+ */
+export function effectiveRlmSubagentDisplayStatus(
+	entry: Pick<RlmSubagentDisplayEntry, "status">,
+	lastActivityMs: number | undefined,
+	nowMs: number = Date.now(),
+): EffectiveRlmSubagentStatus {
+	if (entry.status !== "running" || lastActivityMs === undefined) return entry.status;
+	return nowMs - lastActivityMs > RLM_SUBAGENT_STALE_AFTER_MS ? "stale" : "running";
+}
 
 interface RlmSubagentDisplayCacheEntry {
 	size: number;

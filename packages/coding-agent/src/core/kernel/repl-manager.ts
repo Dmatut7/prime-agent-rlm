@@ -22,6 +22,7 @@ import { v4 as uuid } from "uuid";
 import { DEFAULT_SHORT_TARGET_WAIT_MS, withBound } from "../../utils/bounded-wait.js";
 import { assertRegularFileNoSymlink, ensurePrivateDirectory, requireNoFollow } from "../../utils/private-files.js";
 import { reapKernelOrphanProcesses, recordOrphanProcessState } from "../orphan-process-journal.js";
+import { KERNEL_LIVENESS_MIN_SAMPLE_GAP_MS } from "../turn-liveness.js";
 import { ensureKernelPython, KERNEL_PYTHON_SAFE_PATH_ARGS, managedKernelVenvDirForPython } from "./bootstrap.js";
 import {
 	classifyKernelExit,
@@ -127,8 +128,6 @@ const GATED_EVENT_KIND_MIN_PROTOCOL: Readonly<Record<string, number>> = {
  * nobody, so they read as configuration while nothing could read them; a reader that needs either
  * number takes it from turn-liveness, never from a second definition.
  */
-/** Minimum gap between two retained samples, so a kernel that floods frames cannot churn the host. */
-const KERNEL_LIVENESS_MIN_SAMPLE_GAP_MS = 1_000;
 /** Retained samples: enough to diff progress, few enough to stay O(1). */
 const KERNEL_LIVENESS_MAX_SAMPLES = 2;
 /** Rejection streaks are logged at 1 and then every N, so a broken runtime cannot flood the log. */
@@ -723,8 +722,9 @@ export class ReplKernelManager {
 		if (latest && now - latest.receivedAt < KERNEL_LIVENESS_MIN_SAMPLE_GAP_MS) {
 			// Well-formed, but too close to the retained sample to add a fact: keeping the newer
 			// one out of the diff pair bounds the host's work no matter how fast a kernel sends.
-			// The retained sample stays under a second old, so throttling cannot age it into
-			// looking stale.
+			// The retained sample can age up to gap + interval, and kernelVouchedAlive sizes its
+			// staleness threshold to never sit below that, so throttling cannot age a healthy
+			// kernel into looking stale.
 			this.throttledHeartbeatFrames++;
 			return;
 		}

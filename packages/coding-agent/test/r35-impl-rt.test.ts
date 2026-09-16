@@ -180,3 +180,15 @@ describe("RT-3: readSnapshotManifest surfaces the payload's pythonVersion", () =
 		}
 	});
 });
+
+describe("K3G-4: snapshot failure receipt wording matches the dedup semantics", () => {
+	it("states the per-episode re-arm semantics instead of claiming it repeats while failing", () => {
+		const lines = snapshotFailureNoticeLines("disk full");
+		const joined = lines.join(" ");
+		expect(joined).not.toContain("this notice repeats only while writes keep failing");
+		// The receipt is deduplicated per failure episode and re-armed by a successful
+		// write: the wording must say exactly that (r37 ① residue c).
+		expect(joined).toContain("once");
+		expect(joined).toContain("re-arm");
+	});
+});

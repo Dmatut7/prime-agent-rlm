@@ -3,6 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+	effectiveRlmSubagentDisplayStatus,
+	RLM_SUBAGENT_STALE_AFTER_MS,
 	type RlmSubagentDisplayEntry,
 	readRlmSubagentDisplayEntry,
 	rlmSubagentDisplayPath,
@@ -157,5 +159,28 @@ describe("rlm subagent display files", () => {
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("running staleness reconciliation (r38 L5)", () => {
+	it("marks a running child stale only after 6h of transcript silence", () => {
+		const entry = makeEntry("dir", { status: "running" });
+		const now = 2_000_000_000_000;
+		const lastActivity = now - (RLM_SUBAGENT_STALE_AFTER_MS + 1);
+		expect(effectiveRlmSubagentDisplayStatus(entry, lastActivity, now)).toBe("stale");
+		expect(effectiveRlmSubagentDisplayStatus(entry, now - (RLM_SUBAGENT_STALE_AFTER_MS - 1), now)).toBe("running");
+	});
+
+	it("never reclassifies completed or deleted children", () => {
+		const now = 2_000_000_000_000;
+		const ancient = 0;
+		expect(effectiveRlmSubagentDisplayStatus(makeEntry("dir", { status: "completed" }), ancient, now)).toBe(
+			"completed",
+		);
+		expect(effectiveRlmSubagentDisplayStatus(makeEntry("dir", { status: "deleted" }), ancient, now)).toBe("deleted");
+	});
+
+	it("keeps a running child running when the transcript age is unknown", () => {
+		expect(effectiveRlmSubagentDisplayStatus(makeEntry("dir", { status: "running" }), undefined)).toBe("running");
 	});
 });

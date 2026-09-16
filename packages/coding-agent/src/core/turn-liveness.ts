@@ -112,6 +112,13 @@ export const DEFAULT_DEGRADED_FACTS_MAX_AGE_MS = 2 * STALL_VOUCH_LIVENESS_BUDGET
 export const DEFAULT_DEGRADED_REFRESH_MIN_GAP_MS = 60 * 1000;
 /** Heartbeat staleness, in units of the kernel's own reported interval. */
 export const DEFAULT_STALE_AFTER_INTERVALS = 3;
+/**
+ * The minimum gap the host (repl-manager) keeps between two retained heartbeat samples.
+ * A kernel that beats faster than this has its newest retained sample up to one gap plus
+ * one interval old, so any staleness threshold below that age would flip a healthy kernel
+ * stale between frames (r35 H-1).
+ */
+export const KERNEL_LIVENESS_MIN_SAMPLE_GAP_MS = 1_000;
 /** Fallback interval when a sample carries none (it always does; this only keeps the math total). */
 export const FALLBACK_HEARTBEAT_INTERVAL_MS = 5_000;
 
@@ -293,7 +300,12 @@ export function kernelVouchedAlive(
 	const staleAfterIntervals = options.staleAfterIntervals ?? DEFAULT_STALE_AFTER_INTERVALS;
 	const intervalMs = latest.intervalMs > 0 ? latest.intervalMs : FALLBACK_HEARTBEAT_INTERVAL_MS;
 	const ageMs = Math.max(0, now - latest.receivedAt);
-	const state: KernelLivenessState = ageMs > staleAfterIntervals * intervalMs ? "stale" : "fresh";
+	// The host retains samples at least KERNEL_LIVENESS_MIN_SAMPLE_GAP_MS apart, so a
+	// healthy kernel's newest retained sample can be up to gap + interval old: the
+	// threshold never sits below that, or a fast kernel (interval_ms < gap /
+	// staleAfterIntervals) ages into a false "stale" between retained frames.
+	const staleAfterMs = Math.max(staleAfterIntervals * intervalMs, KERNEL_LIVENESS_MIN_SAMPLE_GAP_MS + intervalMs);
+	const state: KernelLivenessState = ageMs > staleAfterMs ? "stale" : "fresh";
 	const previous = samples.previous;
 	// Deltas, not rates: a frame the host never saw cannot make the next one lie.
 	const streamDelta = previous ? Math.max(0, latest.streamBytes - previous.streamBytes) : 0;

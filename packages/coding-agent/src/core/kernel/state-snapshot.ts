@@ -210,7 +210,7 @@ export function snapshotFailureNoticeLines(detail: string): string[] {
 	return [
 		"Your Python kernel is still running, but its state snapshot could not be written, so these names were not saved to disk.",
 		`Reason: ${detail}.`,
-		"A restart revives only the last successfully written snapshot: anything defined since then must be recreated. The kernel keeps retrying the write after later cells; this notice repeats only while writes keep failing.",
+		"A restart revives only the last successfully written snapshot: anything defined since then must be recreated. The kernel keeps retrying the write after later cells; this notice fires once per failing episode and re-arms only after a successful write, so it stays quiet while writes keep failing and reports the next failure as a new episode.",
 	];
 }
 

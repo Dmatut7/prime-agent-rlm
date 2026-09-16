@@ -242,6 +242,7 @@ import {
 	withPassiveRlmDescendantInfos,
 } from "./rlm-ledger.js";
 import {
+	effectiveRlmSubagentDisplayStatus,
 	readRlmSubagentDisplayEntry,
 	rlmSubagentDisplayPath,
 	writeRlmSubagentDisplayEntry,
@@ -477,7 +478,13 @@ interface PassiveRlmSubagentEntry {
 	prompt?: string;
 	spawnCode?: string;
 	model?: { provider: string; modelId: string };
-	status: "running" | "completed" | "deleted";
+	/**
+	 * The read-side status: `stale` demotes a `running` display file whose transcript has
+	 * been silent past {@link RLM_SUBAGENT_STALE_AFTER_MS} (the file itself is only written
+	 * at spawn/completion/deletion, so a child that never reached its completion write would
+	 * otherwise claim `running` forever - r38 L5).
+	 */
+	status: "running" | "completed" | "deleted" | "stale";
 	createdAt: number;
 }
 
@@ -1300,8 +1307,20 @@ export class AgentDaemon {
 		});
 		const display = await readRlmSubagentDisplayEntry(dirname(edge.child));
 		if (display && display.childId === edge.childId) {
-			// A display-file child was ledger-spawned: the edge depth is real.
-			return { ...metadataFields(display), rlmDepth: edge.depth };
+			// A display-file child was ledger-spawned: the edge depth is real. A `running`
+			// entry is reconciled against the transcript's last movement: the file is not
+			// rewritten here (the writer owns it), the reader just stops presenting a
+			// silent child as live work.
+			const displayFields = metadataFields(display);
+			if (displayFields.status !== "running") return { ...displayFields, rlmDepth: edge.depth };
+			const lastActivityMs = await stat(displayFields.sessionFile)
+				.then((stats) => stats.mtimeMs)
+				.catch(() => undefined);
+			return {
+				...displayFields,
+				status: effectiveRlmSubagentDisplayStatus(display, lastActivityMs),
+				rlmDepth: edge.depth,
+			};
 		}
 		const registryPath = this.legacyRlmSubagentRegistryPath(parent.sessionFile, parent.sessionId);
 		let registryRead = legacyRegistryCache?.get(registryPath);
@@ -5785,7 +5804,11 @@ export class AgentDaemon {
 				rlmDepth: info.rlmDepth ?? entry.rlmDepth,
 				status: "inactive",
 				rlmChildId: entry.childId,
-				rlmChildRegistryStatus: entry.status,
+				// The summary field reports the persisted registry status; the read-side
+				// "stale" demotion of a silent `running` child is a presentation fact this
+				// surface does not carry (the session glue already renders non-completed
+				// children as errored).
+				rlmChildRegistryStatus: entry.status === "stale" ? "running" : entry.status,
 				sessionDir: entry.sessionDir,
 				sessionPath: entry.sessionFile,
 			});

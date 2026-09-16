@@ -803,3 +803,26 @@ describe("revival vouch (B7 / L10.4)", () => {
 		expect(sampled.revivalAgeMs).toBeUndefined();
 	});
 });
+
+describe("staleness threshold vs host sample retention (r35 H-1)", () => {
+	it("keeps a healthy sub-second-interval kernel fresh across the 1s retention gap", () => {
+		// The host retains heartbeat samples at least 1s apart, so a kernel beating at
+		// 200ms has a retained sample up to ~1s old; 3x200ms = 600ms would call it stale.
+		const verdict = kernelVouchedAlive({ latest: sample({ receivedAt: T0, intervalMs: 200 }) }, T0 + 950);
+		expect(verdict.state).toBe("fresh");
+	});
+
+	it("still judges a genuinely stalled fast kernel stale", () => {
+		const verdict = kernelVouchedAlive({ latest: sample({ receivedAt: T0, intervalMs: 200 }) }, T0 + 2_000);
+		expect(verdict.state).toBe("stale");
+	});
+
+	it("leaves the default 5s interval threshold unchanged", () => {
+		expect(kernelVouchedAlive({ latest: sample({ receivedAt: T0, intervalMs: 5_000 }) }, T0 + 14_999).state).toBe(
+			"fresh",
+		);
+		expect(kernelVouchedAlive({ latest: sample({ receivedAt: T0, intervalMs: 5_000 }) }, T0 + 15_001).state).toBe(
+			"stale",
+		);
+	});
+});
