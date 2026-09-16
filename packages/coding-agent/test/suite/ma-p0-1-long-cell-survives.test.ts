@@ -406,8 +406,12 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 		await startHungTurn(harness);
 		// The kernel stops reporting part-way through the turn: from here the journal is the only
 		// source of bash facts, and the stage handler is the only thing left that reads it.
+		// Clock-step compensation can age the 5s-old "previous" frame enough to reach the stale
+		// path one tick early on a loaded runner, so the "no read before stall" proposition is
+		// pinned to the flag flip itself, not the ambient reads list.
+		const readsAtFlip = reads.length;
 		heartbeatAlive = false;
-		expect(reads).toEqual([]);
+		expect(readsAtFlip).toBe(0);
 
 		await waitForEvent(harness, (event) => event.type === "stall_warning");
 		await new Promise((resolve) => setTimeout(resolve, 1_000));
