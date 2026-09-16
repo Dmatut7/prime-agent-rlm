@@ -460,8 +460,14 @@ export function createTurnLiveness(options: TurnLivenessOptions): TurnLiveness {
 	}
 
 	function sample(): TurnLivenessFacts {
-		const at = now();
+		// The verdict clock is read after the facts: a source that stamps `receivedAt` when it is
+		// asked for (the natural shape - the real host stamps a frame when it arrives, which also
+		// precedes this read) would otherwise be judged by a clock from before its own facts
+		// existed, and rawAgeMs dipping negative on a 1ms boundary fails closed to "stale" on a
+		// live kernel. A clock genuinely behind the newest sample still fails closed exactly as
+		// before: only the read order changed, not the rule.
 		const kernel = options.kernel();
+		const at = now();
 		const verdict = kernelVouchedAlive(kernel ?? {}, at, { staleAfterIntervals });
 		const reasons: string[] = [];
 		const kernelReasons: string[] = [];

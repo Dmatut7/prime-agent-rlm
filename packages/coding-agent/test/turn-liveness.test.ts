@@ -605,6 +605,75 @@ describe("createTurnLiveness", () => {
 		expect(sampled.kernelReasons).toEqual([TURN_LIVENESS_REASONS.noKernelFacts]);
 		expect(sampled.vouched).toBe(false);
 	});
+
+	it("reads the verdict clock after the kernel facts, not before (r43)", () => {
+		// A fact source that stamps `receivedAt` when it is asked for is the natural shape: the
+		// session wiring builds its facts at call time, and any source derived from "ask the host
+		// now" lands the same way. If the aggregate reads its own clock before the facts, the
+		// verdict judges them from a moment before they existed, and every read pair that crosses
+		// a 1ms boundary flips rawAgeMs negative: the fail-closed rule then reads a live kernel as
+		// stale and masks every other reason. The clock below advances on every read, so the
+		// crossing is deterministic instead of a one-in-thousands scheduling accident.
+		const events: TurnLivenessEvent[] = [];
+		const stampedFacts =
+			(stamp: () => number): (() => TurnLivenessKernelFacts) =>
+			() => {
+				const receivedAt = stamp();
+				return facts({
+					previous: sample({ receivedAt: receivedAt - 5_000, tick: 10, streamBytes: 100 }),
+					latest: sample({ receivedAt, tick: 40, streamBytes: 900, bashHandles: 1, bashCellHandles: 1 }),
+				});
+			};
+		let clock = T0;
+		const jittered = (): number => {
+			clock += 1;
+			return clock;
+		};
+		const live = createTurnLiveness({
+			now: jittered,
+			kernel: stampedFacts(jittered),
+			onEvent: (event) => {
+				events.push(event);
+			},
+		});
+
+		// The kernel is stamping a heartbeat this very moment and its loop is provably moving:
+		// the verdict must read as fresh, with the vouch it earns and no stale marker. With the
+		// clock read first, at lands one read before receivedAt, rawAgeMs is -1, and this same
+		// fixture reports "stale" with kernelReasons ["heartbeat_stale"] and vouches for nothing.
+		const sampled = live.sample();
+		expect(sampled.state).toBe("fresh");
+		expect(sampled.vouched).toBe(true);
+		expect(sampled.kernelReasons).toEqual([]);
+
+		// Positive control, the no-jitter behaviour pinned field for field: a clock that does not
+		// move between the two reads makes the read order unobservable, so the identical fixture
+		// must sample to exactly this literal. Reading the clock after the facts changes nothing
+		// here - if it ever does, this line goes red.
+		const frozen = createTurnLiveness({
+			now: () => T0,
+			kernel: stampedFacts(() => T0),
+			onEvent: (event) => {
+				events.push(event);
+			},
+		});
+		expect(frozen.sample()).toEqual({
+			vouched: true,
+			reasons: [STALL_VOUCH_REASONS.liveBashHandles, STALL_VOUCH_REASONS.kernelLoopAwaitingCell],
+			progress: true,
+			kernelReasons: [],
+			state: "fresh",
+			degraded: false,
+			movementToken: "900|0|0|0",
+			protocol: 4,
+			livenessAgeMs: 0,
+			liveBashHandles: 1,
+			kernelPid: 4242,
+			rejectedFrames: 0,
+			hostRequestCount: 0,
+		});
+		expect(events).toEqual([]);
+	});
 });
 
 describe("readJournaledBashHandles", () => {
