@@ -1,7 +1,6 @@
 import assert from "node:assert";
-import { performance } from "node:perf_hooks";
 import { describe, it } from "node:test";
-import { Markdown } from "../src/components/markdown.js";
+import { Markdown, type MarkdownTheme } from "../src/components/markdown.js";
 import { defaultMarkdownTheme } from "./test-themes.js";
 
 // Incremental lexing guardrails: while a document streams in, Markdown must
@@ -153,64 +152,134 @@ describe("markdown incremental lex equivalence", () => {
 	});
 });
 
-describe("markdown incremental lex cost", () => {
-	const SECTION = `## Section heading
+describe("markdown incremental lex per-frame render work", () => {
+	// Deterministic work counts replace millisecond thresholds: counts do not
+	// drift with the runner, so a red failure always means real per-frame work
+	// regressed, never that the machine is busy. (Pre-change medians, kept as
+	// reference data only: an 800k-char document cost ~6.0ms per streaming frame,
+	// ~2.4ms of it in cache-key construction over the whole document.)
 
-Some explanatory paragraph text that wraps across multiple lines when rendered at
-typical terminal widths, including **bold**, *italic*, and \`inline code\` spans.
-
-- First list item with enough text to wrap when rendered
-- Second list item
-  - Nested item one
-  - Nested item two
-- Third list item
-
-\`\`\`typescript
-function example(value: number): string {
-	const doubled = value * 2;
-	return \`result: \${doubled}\`;
-}
-\`\`\`
-
-> A blockquote with some content that also wraps when the line is long enough to
-> exceed the available width.
-`;
-
-	function medianFrameMs(text: string, frames: number, chunk: number): number {
-		const streamed = new Markdown(
-			text.slice(0, Math.max(1, text.length - frames * chunk)),
-			1,
-			0,
-			defaultMarkdownTheme,
-		);
-		streamed.render(80);
-		const times: number[] = [];
-		for (let f = 0; f < frames; f++) {
-			streamed.setText(text.slice(0, Math.max(1, text.length - (frames - 1 - f) * chunk)));
-			const start = performance.now();
-			streamed.render(80);
-			times.push(performance.now() - start);
-		}
-		times.sort((a, b) => a - b);
-		return times[Math.floor(times.length / 2)];
+	function countingMarkdownTheme(): { theme: MarkdownTheme; calls(): number } {
+		let count = 0;
+		const wrap =
+			(fn: (text: string) => string) =>
+			(text: string): string => {
+				count++;
+				return fn(text);
+			};
+		const theme: MarkdownTheme = {
+			heading: wrap(defaultMarkdownTheme.heading),
+			link: wrap(defaultMarkdownTheme.link),
+			linkUrl: wrap(defaultMarkdownTheme.linkUrl),
+			code: wrap(defaultMarkdownTheme.code),
+			codeBlock: wrap(defaultMarkdownTheme.codeBlock),
+			codeBlockBorder: wrap(defaultMarkdownTheme.codeBlockBorder),
+			quote: wrap(defaultMarkdownTheme.quote),
+			quoteBorder: wrap(defaultMarkdownTheme.quoteBorder),
+			hr: wrap(defaultMarkdownTheme.hr),
+			listBullet: wrap(defaultMarkdownTheme.listBullet),
+			bold: wrap(defaultMarkdownTheme.bold),
+			italic: wrap(defaultMarkdownTheme.italic),
+			strikethrough: wrap(defaultMarkdownTheme.strikethrough),
+			underline: wrap(defaultMarkdownTheme.underline),
+		};
+		return { theme, calls: () => count };
 	}
 
-	it("streaming append frame cost is bounded by the lex cache, not the document", () => {
-		const target = 800_000;
-		const sections = Math.ceil(target / SECTION.length);
-		let sectioned = "";
-		for (let i = 0; i < sections; i++) sectioned += SECTION;
-		// Single-paragraph document: no stable block boundary exists, so every
-		// frame re-lexes in full regardless of the cache (the linear control).
-		const single = `one giant paragraph ${"lorem ipsum dolor sit amet ".repeat(32_000)}`;
-		const sectionedMs = medianFrameMs(sectioned, 30, 250);
-		const singleMs = medianFrameMs(single, 30, 250);
-		// Before incremental lexing both shapes pay the same full re-lex and this
-		// ratio is ~1 (red). With reuse the sectioned shape stays bounded.
+	it("a streaming append frame re-renders only the changing tail blocks, not the prefix", () => {
+		// Every block is a blank-line-separated heading, so each boundary is a
+		// stable lex cut and the prefix blocks are reused verbatim.
+		const blocks = 40;
+		const heading = (i: number) => `## heading ${i}`;
+		const docAt = (count: number) => Array.from({ length: count }, (_, i) => heading(i)).join("\n\n");
+		const { theme, calls } = countingMarkdownTheme();
+		const streamed = new Markdown("", 1, 0, theme);
+		for (let i = 1; i <= blocks; i++) {
+			streamed.setText(docAt(i));
+			streamed.render(80);
+		}
+		// One block's render cost, measured through the same probe on a
+		// single-block component: an append frame may re-render only the block
+		// that stopped being final plus the newly appended block, never the
+		// accumulated prefix (a cache miss there re-renders all `blocks`).
+		const single = countingMarkdownTheme();
+		new Markdown(heading(0), 1, 0, single.theme).render(80);
+		const perBlock = single.calls();
+		assert.ok(perBlock > 0, "probe must observe theme calls for one block");
+		const before = calls();
+		streamed.setText(`${docAt(blocks)}\n\n${heading(blocks)}`);
+		streamed.render(80);
+		const frameCalls = calls() - before;
 		assert.ok(
-			sectionedMs * 3 < singleMs,
-			`sectioned median ${sectionedMs.toFixed(2)}ms should be well under the no-boundary control ${singleMs.toFixed(2)}ms`,
+			frameCalls <= 2 * perBlock,
+			`append frame spent ${frameCalls} theme calls; at most the last block plus the new block (${2 * perBlock}) may re-render`,
 		);
-		assert.ok(sectionedMs < 20, `sectioned median ${sectionedMs.toFixed(2)}ms exceeds the absolute bound`);
+	});
+});
+
+describe("markdown incremental lex with a transform", () => {
+	// A stand-in with the production mermaid transform's cost shape: it reads
+	// the whole document on every call, depends on availableWidth, and records
+	// its invocations. (The production transform itself is not incremental; the
+	// tests below pin that current cost, they do not bound it.)
+	const DOC = [
+		"intro paragraph explaining the diagram below",
+		"a DIAGRAM marker line",
+		"outro paragraph after the diagram, also mentioning DIAGRAM once",
+	].join("\n\n");
+
+	function recordingTransform(): {
+		calls: { text: string; width: number }[];
+		transform: (markdown: string, availableWidth: number) => string;
+	} {
+		const calls: { text: string; width: number }[] = [];
+		const transform = (markdown: string, availableWidth: number): string => {
+			calls.push({ text: markdown, width: availableWidth });
+			return markdown.replaceAll("DIAGRAM", `w${availableWidth}`);
+		};
+		return { calls, transform };
+	}
+
+	function freshRender(
+		text: string,
+		width: number,
+		transform: (markdown: string, availableWidth: number) => string,
+	): string {
+		return new Markdown(text, 1, 0, defaultMarkdownTheme, undefined, { transform }).render(width).join("\n");
+	}
+
+	it("streamed frames with a transform render identically to a fresh full render", () => {
+		const { transform } = recordingTransform();
+		const streamed = new Markdown("", 1, 0, defaultMarkdownTheme, undefined, { transform });
+		for (const width of [80, 40, 60]) {
+			for (let pos = 1; pos <= DOC.length; pos += 7) {
+				const text = DOC.slice(0, pos);
+				streamed.setText(text);
+				assert.strictEqual(
+					streamed.render(width).join("\n"),
+					freshRender(text, width, transform),
+					`width ${width} frame at length ${pos}`,
+				);
+			}
+		}
+	});
+
+	it("runs the transform once per streaming frame, over the full text (current cost)", () => {
+		const { calls, transform } = recordingTransform();
+		const streamed = new Markdown("", 1, 0, defaultMarkdownTheme, undefined, { transform });
+		for (let pos = 1; pos <= DOC.length; pos += 7) {
+			const text = DOC.slice(0, pos);
+			streamed.setText(text);
+			const before = calls.length;
+			streamed.render(80);
+			assert.strictEqual(calls.length - before, 1, `one call for the frame at length ${pos}`);
+			assert.strictEqual(calls.at(-1)?.text, text, `frame at length ${pos} must transform the full text`);
+			assert.strictEqual(calls.at(-1)?.width, 78);
+		}
+		// An unchanged re-render is served from the whole-result cache without
+		// re-running the transform.
+		const before = calls.length;
+		streamed.render(80);
+		assert.strictEqual(calls.length, before);
 	});
 });
