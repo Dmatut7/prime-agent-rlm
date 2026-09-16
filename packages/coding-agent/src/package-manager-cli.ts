@@ -42,6 +42,7 @@ import {
 	getSelfUpdateCommand,
 	getSelfUpdateUnavailableInstruction,
 	PACKAGE_NAME,
+	readInstalledSelfVersion,
 	registryUpdateLaneRefusal,
 	SELF_UPDATE_INTERACTIVE_CHILD_ENV,
 	SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE,
@@ -961,10 +962,31 @@ function clearPreparedDaemonUpdateRestartManifest(socketPath: string, agentDir: 
 	}
 }
 
+// Mirrors the daemon supervisor's UPDATE_RESTART_PREPARED_RESTORE_WINDOW_MS: a prepared
+// manifest is a checkpoint for an update in flight, not a durable record. Reusing one past
+// this window would revive sessions from an update that died arbitrarily long ago.
+const UPDATE_RESTART_PREPARED_RESTORE_WINDOW_MS = 30 * 60_000;
+
+function discardStalePreparedDaemonUpdateRestartManifest(manifestPath: string): void {
+	try {
+		rmSync(manifestPath, { force: true });
+	} catch {
+		// Best effort only; the manifest is also skipped as unusable below.
+	}
+	console.error(
+		chalk.yellow(
+			`Discarded a stale prepared daemon update restart manifest (older than ${Math.round(
+				UPDATE_RESTART_PREPARED_RESTORE_WINDOW_MS / 60_000,
+			)} minutes): ${manifestPath}`,
+		),
+	);
+}
+
 function readPreparedDaemonUpdateRestartManifest(
 	socketPath: string,
 	agentDir: string,
 	notBeforeMs?: number,
+	maxAgeMs?: number,
 ): DaemonUpdateRestartManifest | undefined {
 	for (const manifestPath of [
 		getDaemonUpdateRestartManifestPath(socketPath, agentDir),
@@ -979,6 +1001,11 @@ function readPreparedDaemonUpdateRestartManifest(
 		if (notBeforeMs !== undefined && modifiedAt < notBeforeMs - 1000) {
 			continue;
 		}
+		if (maxAgeMs !== undefined && Date.now() - modifiedAt > maxAgeMs) {
+			// Treat an over-aged orphan as nonexistent instead of reviving it.
+			discardStalePreparedDaemonUpdateRestartManifest(manifestPath);
+			continue;
+		}
 		const parsed = JSON.parse(readFileSync(manifestPath, "utf-8")) as unknown;
 		return parseDaemonUpdateRestartManifest(parsed);
 	}
@@ -990,7 +1017,12 @@ function tryReadPreparedDaemonUpdateRestartManifest(
 	agentDir: string,
 ): DaemonUpdateRestartManifest | undefined {
 	try {
-		return readPreparedDaemonUpdateRestartManifest(socketPath, agentDir);
+		return readPreparedDaemonUpdateRestartManifest(
+			socketPath,
+			agentDir,
+			undefined,
+			UPDATE_RESTART_PREPARED_RESTORE_WINDOW_MS,
+		);
 	} catch {
 		clearPreparedDaemonUpdateRestartManifest(socketPath, agentDir);
 		return undefined;
@@ -1838,10 +1870,26 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 						return true;
 					}
 					await discardVerifiedArtifact();
-					const versionChange = selfUpdatePlan.targetVersion
-						? ` from v${VERSION} to v${selfUpdatePlan.targetVersion}`
-						: "";
-					console.log(chalk.green(`Updated ${APP_NAME}${versionChange}`));
+					// The install steps exiting 0 is not proof the target version landed: a
+					// prefix mismatch or a mirror serving an older release still exits 0. Read
+					// the installed package's version back and report what actually landed.
+					const targetVersion = selfUpdatePlan.targetVersion;
+					const installedVersion = readInstalledSelfVersion();
+					if (
+						targetVersion !== undefined &&
+						installedVersion !== undefined &&
+						installedVersion !== targetVersion
+					) {
+						console.log(chalk.green(`Updated ${APP_NAME} from v${VERSION}`));
+						console.error(
+							chalk.yellow(
+								`Warning: the update targeted v${targetVersion}, but the installed CLI reports v${installedVersion}.`,
+							),
+						);
+					} else {
+						const versionChange = targetVersion ? ` from v${VERSION} to v${targetVersion}` : "";
+						console.log(chalk.green(`Updated ${APP_NAME}${versionChange}`));
+					}
 					if (process.env[SELF_UPDATE_INTERACTIVE_CHILD_ENV] === "1") {
 						return true;
 					}

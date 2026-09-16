@@ -54,7 +54,17 @@ describe("assertNodeVersion", () => {
 		const text = logs.join("\n");
 		expect(text).toContain(`Node ${MIN_NODE_VERSION}`);
 		expect(text).toContain("20.18.1");
-		expect(text).toContain("github.com/PrimeIntellect-ai/prime-agent/releases/latest");
+	});
+
+	test("points an outdated Node at this repository's own build path, not the upstream releases page", () => {
+		// This line is an independently maintained fork: the official installer and the
+		// upstream releases page ship a build without this line's changes, so the old-Node
+		// guidance must send users to the fork's build-from-source path instead.
+		const { logs } = run("20.18.1");
+		const text = logs.join("\n");
+		expect(text).toContain("npm run build");
+		expect(text).toContain("FORK_NOTES.md");
+		expect(text).not.toContain("github.com/PrimeIntellect-ai/prime-agent/releases");
 	});
 
 	test("accepts the v prefix used by process.version", () => {

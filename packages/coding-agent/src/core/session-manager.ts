@@ -690,6 +690,13 @@ function migrateToCurrentVersion(entries: FileEntry[]): boolean {
 	const header = entries.find((e) => e.type === "session") as SessionHeader | undefined;
 	const version = header?.version ?? 1;
 
+	if (version > CURRENT_SESSION_VERSION) {
+		// A file stamped by a newer CLI cannot be migrated down; silently skipping the
+		// migration would let this CLI append its own older-format entries to it.
+		throw new Error(
+			`Session file uses format v${version}, which is newer than this Prime Agent supports (v${CURRENT_SESSION_VERSION}). Upgrade Prime Agent to open it.`,
+		);
+	}
 	if (version >= CURRENT_SESSION_VERSION) return false;
 
 	if (version < 2) migrateV1ToV2(entries);
