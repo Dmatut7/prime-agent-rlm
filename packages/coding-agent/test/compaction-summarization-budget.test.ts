@@ -436,6 +436,22 @@ describe("measured provider input limits", () => {
 		});
 	});
 
+	it("pins the measured Bailian kimi-k3 input limit the 400 reported", () => {
+		// ~/.prime/agent/models.json declares contextWindow 1048576 for kimi-k3;
+		// DashScope rejects input above 1000000 with the verbatim range error.
+		expect(measuredInputLimit("bailian", "kimi-k3")).toBe(1_000_000);
+		expect(effectiveInputLimitTokens(1_048_576, "bailian", "kimi-k3")).toBe(1_000_000);
+	});
+
+	it("reports the kimi-k3 catalog over-declaration so the declaration can be fixed", () => {
+		expect(catalogOverDeclaration(1_048_576, "bailian", "kimi-k3")).toEqual({
+			declared: 1_048_576,
+			measured: 1_000_000,
+		});
+		// Positive control: a catalog inside the measured limit stays silent.
+		expect(catalogOverDeclaration(1_000_000, "bailian", "kimi-k3")).toBeUndefined();
+	});
+
 	it("reports no over-declaration for a catalog that stays within the measured limit", () => {
 		expect(catalogOverDeclaration(PROD_INPUT_LIMIT, PROD.provider, PROD.modelId)).toBeUndefined();
 		expect(catalogOverDeclaration(PROD_WINDOW, "anthropic", "claude-sonnet-4-5")).toBeUndefined();

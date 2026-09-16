@@ -5,10 +5,12 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, getModel } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
+import type { CompactionResult } from "../src/core/compaction/index.js";
 import { MissingSessionCwdError } from "../src/core/session-cwd.js";
 import { SessionImportFileNotFoundError } from "../src/core/session-import-errors.js";
 import { type SessionEntry, type SessionHeader, SessionManager } from "../src/core/session-manager.js";
 import {
+	DAEMON_COMPACT_REQUEST_TIMEOUT_MS,
 	DAEMON_REFINE_REQUEST_TIMEOUT_MS,
 	DaemonAgentConnection,
 } from "../src/modes/agent-connection/daemon-agent-connection.js";
@@ -28,6 +30,7 @@ import {
 	type DaemonClientMessageListener,
 	type DaemonClientRequestOptions,
 	type DaemonHello,
+	DaemonRequestTimeoutError,
 	DaemonSocketClosedError,
 	type DaemonTransportClient,
 } from "../src/modes/daemon/daemon-client.js";
@@ -109,6 +112,16 @@ class FakeDaemonClient {
 	promptGate: Promise<void> | undefined;
 	promptError: Error | undefined;
 	promptResponseError: string | undefined;
+	/**
+	 * Simulates a server-side compaction that takes this long to answer (K3@max
+	 * needs 30-100s on 100k-590k token sessions). Infinity = never answers.
+	 */
+	compactResponseDelayMs: number = 0;
+	compactionResult: CompactionResult = {
+		summary: "compact summary",
+		firstKeptEntryId: "entry-1",
+		tokensBefore: 1234,
+	};
 	cancelPromptAdmissionStatus: "cancelled" | "owned" | "unknown" = "owned";
 	serverCapabilities = new Set<string>();
 	updateRestartSessions: Array<Record<string, unknown>> = [];
@@ -574,6 +587,37 @@ class FakeDaemonClient {
 						filePath: "/tmp/not-found.jsonl",
 					},
 				};
+			case "compact":
+				// Mirrors the real pair: the reply lands only after the daemon
+				// finishes the compaction, while the client arms an absolute budget
+				// (DaemonClient.armPendingRequestTimeout) against it.
+				return await new Promise<DaemonResponse>((resolve, reject) => {
+					const budget = setTimeout(() => {
+						reject(
+							new DaemonRequestTimeoutError(
+								command.type,
+								timeoutMs,
+								false,
+								"no_response",
+								`Timed out after ${timeoutMs}ms waiting for the Prime Agent daemon response to "${command.type}".`,
+							),
+						);
+					}, timeoutMs);
+					const deliver = (): void => {
+						clearTimeout(budget);
+						resolve({
+							type: "response",
+							command: command.type,
+							success: true,
+							data: this.compactionResult,
+						});
+					};
+					const delay = this.compactResponseDelayMs;
+					if (Number.isFinite(delay)) {
+						if (delay > 0) setTimeout(deliver, delay);
+						else deliver();
+					}
+				});
 			default:
 				throw new Error(`Unexpected command: ${command.type}`);
 		}
@@ -3773,6 +3817,64 @@ describe("DaemonAgentConnection", () => {
 		expect(fakeClient.requests[1]).not.toHaveProperty("global");
 		expect(fakeClient.requestTimeouts[0]).toBe(30000);
 		expect(fakeClient.requestTimeouts[1]).toBe(DAEMON_REFINE_REQUEST_TIMEOUT_MS);
+	});
+
+	it("waits out a compaction whose summarizer runs past the 30s default instead of reporting a client-side failure", async () => {
+		vi.useFakeTimers();
+		try {
+			const fakeClient = new FakeDaemonClient();
+			// K3-style deep-reasoning summarizer: observed 30-100s on 100k-590k
+			// token sessions, comfortably past the daemon client's 30s default.
+			fakeClient.compactResponseDelayMs = 45_000;
+			const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+
+			const compaction = connection.compact("keep the audit facts");
+			let failure: string | undefined;
+			compaction.catch((error: Error) => {
+				failure = error.message;
+			});
+
+			await vi.advanceTimersByTimeAsync(31_000);
+			// The old shape rejected here while the daemon was still compacting.
+			expect(failure).toBeUndefined();
+			expect(fakeClient.requestTimeouts.at(-1)).toBe(600_000);
+			expect(DAEMON_COMPACT_REQUEST_TIMEOUT_MS).toBe(600_000);
+
+			await vi.advanceTimersByTimeAsync(45_000 - 31_000 + 1_000);
+			await expect(compaction).resolves.toMatchObject({
+				summary: "compact summary",
+				firstKeptEntryId: "entry-1",
+				tokensBefore: 1234,
+			});
+			expect(fakeClient.requests.at(-1)).toMatchObject({
+				type: "compact",
+				activeSessionId: "active-1",
+				customInstructions: "keep the audit facts",
+			});
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("tells the user the daemon is still compacting when the compact budget does run out", async () => {
+		vi.useFakeTimers();
+		try {
+			const fakeClient = new FakeDaemonClient();
+			fakeClient.compactResponseDelayMs = Number.POSITIVE_INFINITY;
+			const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+
+			const compaction = connection.compact();
+			let failure: string | undefined;
+			compaction.catch((error: Error) => {
+				failure = error.message;
+			});
+
+			await vi.advanceTimersByTimeAsync(600_000 + 1_000);
+			expect(failure).toContain("Timed out after 600000ms");
+			expect(failure).toMatch(/still compacting|still running/i);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("lists and renames saved sessions through the daemon protocol", async () => {

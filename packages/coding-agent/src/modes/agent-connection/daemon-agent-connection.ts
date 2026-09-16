@@ -24,6 +24,7 @@ import { AgentsViewRosterStore, STALE_ROSTER_DAEMON_MESSAGE } from "../agents-vi
 import { CompactAssistantStreamReconstructor } from "../daemon/compact-session-stream.js";
 import {
 	DaemonCapabilityUnavailableError,
+	DaemonRequestTimeoutError,
 	type DaemonTransportClient,
 	getDaemonSocketCloseReason,
 } from "../daemon/daemon-client.js";
@@ -119,6 +120,13 @@ interface DaemonSnapshotAssembly {
 }
 
 export const DAEMON_REFINE_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
+/**
+ * K3C-1: a compact request is only answered when the daemon's summarization
+ * finishes (kimi-k3@max: 55-73s at 100k-150k tokens, ~100s at 590k;
+ * deepseek-v4.1-flash: 37-50s), so the daemon client's 30s default reported
+ * successful compactions as client-side timeouts.
+ */
+export const DAEMON_COMPACT_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
 const DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 /**
  * P1-7b, 60s tier: the fast reconnect budget. It has to outlive the recovery
@@ -1475,11 +1483,27 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async compact(customInstructions?: string): Promise<CompactionResult> {
-		return this.requestData<CompactionResult>({
-			type: "compact",
-			activeSessionId: this.activeSessionId,
-			customInstructions,
-		});
+		try {
+			return await this.requestData<CompactionResult>(
+				{
+					type: "compact",
+					activeSessionId: this.activeSessionId,
+					customInstructions,
+				},
+				DAEMON_COMPACT_REQUEST_TIMEOUT_MS,
+			);
+		} catch (error) {
+			// A timeout here means the client stopped waiting, not that the daemon
+			// stopped compacting: the run continues server-side and a blind retry
+			// would hit "Already compacted", so the error must say what is going on.
+			if (error instanceof DaemonRequestTimeoutError) {
+				throw new Error(
+					`${error.message} The daemon is likely still compacting this session; the result will land with the next compaction_end event, so check the session state instead of retrying immediately.`,
+					{ cause: error },
+				);
+			}
+			throw error;
+		}
 	}
 
 	async refine(
