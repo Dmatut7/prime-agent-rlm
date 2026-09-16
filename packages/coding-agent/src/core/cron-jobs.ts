@@ -13,7 +13,7 @@ import { dirname, join, resolve } from "node:path";
 import { getLogger } from "@earendil-works/pi-ai";
 import { lockSync } from "proper-lockfile";
 import { StepCompensatedClock } from "./clock-step.js";
-import { isRetryableSessionInputRefusal } from "./prompt-admission.js";
+import { isSessionInputRefusedBeforeDelivery } from "./prompt-admission.js";
 import {
 	artifactDirectoryWriteMs,
 	readSessionArtifactTombstone,
@@ -61,6 +61,12 @@ export interface AgentCronJob {
 	nextRunAt?: string;
 	lastRunAt?: string;
 	lastSkippedAt?: string;
+	/** Last deferral tick (pre-delivery admission refusal; the run did not happen). */
+	lastDeferredAt?: string;
+	/** Consecutive deferrals in the current chain; any run or skip resets it. */
+	deferCount?: number;
+	/** Wall-clock start of the current deferral chain (ISO). */
+	deferredSince?: string;
 	lastError?: string;
 	runCount: number;
 }
@@ -91,6 +97,12 @@ export interface CreateAgentCronJobInput {
  *   job stays scheduled.
  */
 export type AgentCronJobRunResult = "ran" | "skipped" | "deferred";
+
+/**
+ * Deferral tier derived from the refusal's `retryNowSucceeds`: "fence" refusals
+ * cannot succeed before a restart, so their retry cadence is restart-aware.
+ */
+export type AgentCronDeferredKind = "transient" | "fence";
 
 /**
  * Per-session cap on concurrent rlm_heartbeat jobs (G3, r37 hbgoal-ts): each
@@ -194,6 +206,26 @@ export const CRON_STORE_FAILURE_RETRY_MS = 30_000;
  * scheduler on zero-delay ticks against a nextRunAt in the past.
  */
 export const CRON_DEFERRED_RETRY_MS = 5_000;
+/**
+ * Fast attempts before the transient deferral cadence starts doubling: a
+ * healthy pause window (MCP reload, ACP stop) releases within a few ticks, so
+ * the first retries stay at the fast cadence.
+ */
+export const CRON_DEFER_FAST_ATTEMPTS = 3;
+/**
+ * Restart-aware first cadence for a deferral whose refusal cannot succeed in
+ * this process (the update-restart fence): the session is closing, so a 5s
+ * in-process spin would only burn writes.
+ */
+export const CRON_FENCE_RETRY_MS = 30_000;
+/** Cap of the deferral backoff cadence (doubling from the fast cadence). */
+export const CRON_DEFER_BACKOFF_CAP_MS = 300_000;
+/** Consecutive-deferral count that escalates the deferral to visible lastError. */
+export const CRON_DEFER_MAX_ATTEMPTS = 20;
+/** Deferral chain age that escalates the deferral to visible lastError. */
+export const CRON_DEFER_ESCALATE_AGE_MS = 15 * 60_000;
+/** Re-check cadence once a deferral chain has escalated. */
+export const CRON_DEFER_ESCALATED_RECHECK_MS = 60 * 60_000;
 const ONE_SECOND_MS = 1000;
 const ONE_MINUTE_MS = 60_000;
 /**
@@ -852,7 +884,13 @@ export class AgentCronJobStore {
 
 	recordDispatchResult(
 		dispatchId: string,
-		result: { now?: Date; outcome: AgentCronJobRunResult; error?: unknown },
+		result: {
+			now?: Date;
+			outcome: AgentCronJobRunResult;
+			error?: unknown;
+			/** Deferral tier; absent for hook-returned deferrals (transient default). */
+			deferredKind?: AgentCronDeferredKind;
+		},
 	): AgentCronJob | undefined {
 		let updated: AgentCronJob | undefined;
 		this.mutateStates((state) => {
@@ -873,24 +911,43 @@ export class AgentCronJobStore {
 						status: job.schedule.kind === "once" ? "completed" : job.status,
 						nextRunAt: nextRunAt?.toISOString(),
 						lastSkippedAt: now.toISOString(),
+						deferCount: undefined,
+						deferredSince: undefined,
 						updatedAt: updatedAtForMutation(now, job),
 					};
 					return updated;
 				}
 				if (result.outcome === "deferred" && result.error === undefined) {
-					// K3Q-3 (r40): a retryable admission refusal (QP-2 pause window,
-					// QP-3 committing window) refused the prompt before anything was
-					// queued or delivered. The run never happened, so no runCount and
-					// no lastError - but a once job has not run yet either, so it stays
-					// scheduled on the deferred retry cadence instead of completing.
+					// K3Q-3 (r40) + XA-1/XA-2 (r41): a pre-delivery admission
+					// refusal refused the prompt before anything was queued or
+					// delivered. The run never happened, so no runCount and no
+					// failed-run lastError - but a once job has not run yet
+					// either, so it stays scheduled instead of completing. The
+					// retry cadence is bounded (XA-2): fast attempts, then
+					// doubling backoff to a cap, then visible escalation - never
+					// an unbounded 5s spin against a wedged window.
+					const deferCount = (typeof job.deferCount === "number" ? job.deferCount : 0) + 1;
+					const chainStartMs = parseDeferredSinceMs(job, now);
+					const escalated =
+						deferCount >= CRON_DEFER_MAX_ATTEMPTS || now.getTime() - chainStartMs >= CRON_DEFER_ESCALATE_AGE_MS;
+					const delayMs = escalated
+						? CRON_DEFER_ESCALATED_RECHECK_MS
+						: deferredRetryDelayMs(result.deferredKind, deferCount);
 					const nextRunAt =
 						job.schedule.kind === "once"
-							? new Date(now.getTime() + CRON_DEFERRED_RETRY_MS)
+							? new Date(now.getTime() + delayMs)
 							: nextRunAtForSchedule(job.schedule, now);
 					updated = {
 						...job,
 						nextRunAt: nextRunAt?.toISOString(),
-						lastSkippedAt: now.toISOString(),
+						lastDeferredAt: now.toISOString(),
+						deferCount,
+						deferredSince: new Date(chainStartMs).toISOString(),
+						...(escalated
+							? {
+									lastError: `Deferred ${deferCount} times since ${new Date(chainStartMs).toISOString()}; admission window has not released`,
+								}
+							: {}),
 						updatedAt: updatedAtForMutation(now, job),
 					};
 					return updated;
@@ -901,6 +958,9 @@ export class AgentCronJobStore {
 					lastRunAt: now.toISOString(),
 					lastError: result.error === undefined ? undefined : errorMessage(result.error),
 					runCount: job.runCount + 1,
+					// A real run ends any deferral chain: the window released.
+					deferCount: undefined,
+					deferredSince: undefined,
 					updatedAt: updatedAtForMutation(now, job),
 				};
 				return updated;
@@ -1288,10 +1348,19 @@ export class AgentCronScheduler {
 				this.scheduleNext();
 			}
 		}
-		const results = await Promise.all(
-			dispatches.map(({ dispatch, endDispatch }) => this.queueDispatch(dispatch, endDispatch)),
-		);
-		return results.filter((result) => result !== "skipped" && result !== "deferred").length;
+		try {
+			const results = await Promise.all(
+				dispatches.map(({ dispatch, endDispatch }) => this.queueDispatch(dispatch, endDispatch)),
+			);
+			return results.filter((result) => result !== "skipped" && result !== "deferred").length;
+		} finally {
+			// Re-arm from the settled store: a claimed once job has no nextRunAt at
+			// claim time, so the claim-time arm above cannot see the retry this tick
+			// may defer onto. Without this re-arm a deferred once job never fires.
+			if (!this.stopped) {
+				this.scheduleNext();
+			}
+		}
 	}
 
 	private queueDispatch(
@@ -1311,15 +1380,19 @@ export class AgentCronScheduler {
 					}
 					let runResult: AgentCronJobRunResult | undefined;
 					let error: unknown;
+					let deferredKind: AgentCronDeferredKind | undefined;
 					try {
 						runResult = await this.hooks.runJob(job);
 					} catch (runError) {
-						if (isRetryableSessionInputRefusal(runError)) {
-							// K3Q-3 (r40): a hook that did not absorb the retryable
-							// admission refusal still never queued or delivered anything,
-							// so the dispatch defers instead of recording a run that
-							// never happened.
+						if (isSessionInputRefusedBeforeDelivery(runError)) {
+							// XA-1 (r41, supersedes the r40 allow-list): every typed
+							// admission refusal - including the update-restart fence -
+							// provably queued and delivered nothing, so the dispatch
+							// defers instead of recording a run that never happened.
+							// (b) picks the tier: fence refusals cannot succeed in this
+							// process, so their retry cadence is restart-aware.
 							runResult = "deferred";
+							deferredKind = runError.retryNowSucceeds ? "transient" : "fence";
 						} else {
 							error = runError;
 							this.hooks.onError?.(job, runError);
@@ -1329,6 +1402,7 @@ export class AgentCronScheduler {
 						now: this.now(),
 						outcome: error === undefined ? (runResult ?? "ran") : "ran",
 						error,
+						...(deferredKind === undefined ? {} : { deferredKind }),
 					});
 					return runResult;
 				} finally {
@@ -1571,7 +1645,10 @@ export function formatAgentCronJob(job: AgentCronJob): string {
 	const error = job.lastError ? ` error=${job.lastError}` : "";
 	const label = job.label ? ` label="${job.label}"` : "";
 	const skipped = job.lastSkippedAt ? ` skipped=${new Date(job.lastSkippedAt).toLocaleString()}` : "";
-	return `${job.id} ${job.status}${label} next=${next} last=${last}${skipped} runs=${job.runCount} schedule="${job.schedule.expression}" prompt="${preview}"${error}`;
+	const deferred = job.lastDeferredAt
+		? ` deferred=${new Date(job.lastDeferredAt).toLocaleString()} defers=${job.deferCount ?? 0}`
+		: "";
+	return `${job.id} ${job.status}${label} next=${next} last=${last}${skipped}${deferred} runs=${job.runCount} schedule="${job.schedule.expression}" prompt="${preview}"${error}`;
 }
 
 function consumeDeliveryOption(text: string): { deliveryMode: AgentHeartbeatDeliveryMode | undefined; rest: string } {
@@ -2036,7 +2113,10 @@ function readJobsStateIfPresent(path: string): CronJobsState | undefined {
 	reportedUnreadableJobsFiles.delete(path);
 	const parsed = document as CronJobsFile;
 	return {
-		jobs: Array.isArray(parsed.jobs) ? parsed.jobs.filter(isAgentCronJob) : [],
+		// The XA-2 deferral fields are optional and new: a record carrying them
+		// ill-typed is treated as absent (default), not dropped whole, so a bad
+		// hand-edit cannot make a job vanish from the schedule.
+		jobs: Array.isArray(parsed.jobs) ? parsed.jobs.map(sanitizeDeferralFields).filter(isAgentCronJob) : [],
 		dispatches: Array.isArray(parsed.dispatches) ? parsed.dispatches.filter(isAgentCronDispatchRecord) : [],
 	};
 }
@@ -2320,6 +2400,50 @@ function withoutNextRunAt(job: AgentCronJob): AgentCronJob {
 	return rest;
 }
 
+/**
+ * Deferral cadence for a once job's next retry: the first fast attempts stay at
+ * the transient cadence, then the delay doubles up to the cap. A fence-tier
+ * deferral starts restart-aware (CRON_FENCE_RETRY_MS) instead of the fast
+ * cadence, because an in-process retry cannot succeed before the restart.
+ */
+function deferredRetryDelayMs(deferredKind: AgentCronDeferredKind | undefined, deferCount: number): number {
+	if (deferredKind === "fence" && deferCount <= CRON_DEFER_FAST_ATTEMPTS) {
+		return CRON_FENCE_RETRY_MS;
+	}
+	const doublings = Math.max(0, deferCount - CRON_DEFER_FAST_ATTEMPTS);
+	const base = deferredKind === "fence" ? CRON_FENCE_RETRY_MS : CRON_DEFERRED_RETRY_MS;
+	return Math.min(base * 2 ** doublings, CRON_DEFER_BACKOFF_CAP_MS);
+}
+
+/** Wall-clock start of the current deferral chain; the record's `now` starts a fresh chain. */
+function parseDeferredSinceMs(job: AgentCronJob, now: Date): number {
+	if (typeof job.deferredSince === "string" && typeof job.deferCount === "number" && job.deferCount > 0) {
+		const parsed = Date.parse(job.deferredSince);
+		if (Number.isFinite(parsed)) {
+			return parsed;
+		}
+	}
+	return now.getTime();
+}
+
+/** Drops ill-typed deferral fields so a corrupt record degrades to "no deferral chain". */
+function sanitizeDeferralFields(value: unknown): unknown {
+	if (!value || typeof value !== "object") {
+		return value;
+	}
+	const candidate = value as Partial<AgentCronJob>;
+	if (candidate.lastDeferredAt !== undefined && typeof candidate.lastDeferredAt !== "string") {
+		delete candidate.lastDeferredAt;
+	}
+	if (candidate.deferCount !== undefined && typeof candidate.deferCount !== "number") {
+		delete candidate.deferCount;
+	}
+	if (candidate.deferredSince !== undefined && typeof candidate.deferredSince !== "string") {
+		delete candidate.deferredSince;
+	}
+	return value;
+}
+
 function isAgentCronJob(value: unknown): value is AgentCronJob {
 	if (!value || typeof value !== "object") {
 		return false;
@@ -2357,7 +2481,10 @@ function isAgentCronJob(value: unknown): value is AgentCronJob {
 		typeof candidate.schedule.expression === "string" &&
 		typeof candidate.createdAt === "string" &&
 		typeof candidate.updatedAt === "string" &&
-		typeof candidate.runCount === "number"
+		typeof candidate.runCount === "number" &&
+		(candidate.lastDeferredAt === undefined || typeof candidate.lastDeferredAt === "string") &&
+		(candidate.deferCount === undefined || typeof candidate.deferCount === "number") &&
+		(candidate.deferredSince === undefined || typeof candidate.deferredSince === "string")
 	);
 }
 

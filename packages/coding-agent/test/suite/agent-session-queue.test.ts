@@ -1793,9 +1793,9 @@ describe("AgentSession queue characterization", () => {
 			() => undefined,
 			(thrown: unknown) => thrown,
 		);
-		const error = refusal as { name?: string; retryable?: boolean };
+		const error = refusal as { name?: string; retryNowSucceeds?: boolean };
 		expect(error?.name).toBe("SessionInputCoalescingError");
-		expect(error?.retryable).toBe(true);
+		expect(error?.retryNowSucceeds).toBe(true);
 		expect(harness.session.getFollowUpMessages()).toEqual([]);
 		expect(harness.session.unfinishedActionCount).toBe(1);
 

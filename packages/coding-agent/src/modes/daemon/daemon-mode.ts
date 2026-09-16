@@ -93,11 +93,7 @@ import {
 	shouldDeferHeartbeatCronJob,
 } from "../../core/cron-jobs.js";
 import { flushOrphanProcessJournal, ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
-import {
-	isRetryableSessionInputRefusal,
-	PromptAdmissionCancelledError,
-	waitForPromptAdmission,
-} from "../../core/prompt-admission.js";
+import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../../core/rlm-runtime.js";
 import {
 	canPassivateSession,
@@ -2006,16 +2002,12 @@ export class AgentDaemon {
 			if (!this.isCronJobRunnableForState(runnableJob, state, requirePersistedJob)) {
 				return "skipped";
 			}
-			try {
-				await session.followUp(runnableJob.prompt, undefined, {
-					resumeIfIdle: true,
-				});
-			} catch (error) {
-				if (isRetryableSessionInputRefusal(error)) {
-					return "deferred";
-				}
-				throw error;
-			}
+			// Admission refusals deliberately propagate: the scheduler's dispatch
+			// queue is the single classification point for pre-delivery refusals
+			// (XA-1, r41), so it defers the tick instead of recording a burned run.
+			await session.followUp(runnableJob.prompt, undefined, {
+				resumeIfIdle: true,
+			});
 			return;
 		}
 		const getRunnableJob = (): AgentCronJob | undefined => {
@@ -2059,12 +2051,9 @@ export class AgentDaemon {
 			if (error === unrunnableAtAdmission) {
 				return "skipped";
 			}
-			if (isRetryableSessionInputRefusal(error)) {
-				// K3Q-3 (r40): QP-2/QP-3 refuse admission with a retryable typed
-				// error before anything is queued or delivered. The run never
-				// happened, so defer the tick instead of recording a failed run.
-				return "deferred";
-			}
+			// Admission refusals propagate for the scheduler's single
+			// classification point (XA-1, r41): a pre-delivery refusal defers
+			// the tick there instead of being classified per-hook.
 			throw error;
 		}
 	}

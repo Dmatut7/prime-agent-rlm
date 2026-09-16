@@ -806,48 +806,86 @@ export function formatAgentMessageQueuedNotice(input: {
 }
 
 /**
- * Whether a failed send is worth retrying at all. Used to stop the
- * "retryable error x host vouch x model persistence" loop: after a bounded number
- * of consecutive retryable failures for the same target the caller must turn the
- * error terminal instead of offering another retry.
+ * What a failed send's message text can prove. The typed contract lives in
+ * prompt-admission.ts (`deliveredNothing` / `retryNowSucceeds`), but a
+ * cross-process send surfaces only the message string, so this classifier is
+ * the *decoder* of that contract's serialized form - not a second authority.
  *
- * The same predicate decides whether a failed send is recorded as `uncertain` by the id gate, and
- * that is not a coincidence worth breaking: every pattern here is a refusal the host raises
- * *before* handing the message to the target (a full queue, the rate limiter, a suspended pump, a
- * refused admission, or one of the bounded pre-delivery waits), so "worth retrying" and "provably
- * delivered nothing" are the same statement. Anything else that fails the delivery leg leaves the
- * outcome unknown, and unknown has to be treated as possibly-delivered - that is the
- * duplicate-delivery window the id gate fails closed on. Adding a pattern here therefore also
- * claims "this failure never delivered"; only add one when that is true.
+ * - `deliveredNothing` (a): every pattern here is a refusal the host raises
+ *   *before* handing the message to the target (a full queue, the rate
+ *   limiter, a suspended or fenced pump, a refused admission, or one of the
+ *   bounded pre-delivery waits). Anything else that fails the delivery leg
+ *   leaves the outcome unknown, and unknown has to be treated as
+ *   possibly-delivered - the duplicate-delivery window the id gate fails
+ *   closed on. Adding a pattern here therefore also claims "this failure
+ *   never delivered"; only add one when that is true.
+ * - `retryNowSucceeds` (b): decoded only where the serialized form carries it
+ *   (the Suspended `retryable=` token and fence sentence, the paused
+ *   teardown append) and `undefined` everywhere else. `undefined` means
+ *   "this shape cannot answer (b)" and must not be guessed: the M6b terminal
+ *   guidance differs between "retry later" and "resend after the restart".
  */
-export function isRetryableAgentMessageSendError(message: string): boolean {
-	return (
+export interface AgentMessageSendFailureClassification {
+	deliveredNothing: boolean;
+	retryNowSucceeds: boolean | undefined;
+}
+
+export function classifyAgentMessageSendFailureByMessage(message: string): AgentMessageSendFailureClassification {
+	// Suspended serializes (b): the fence sentence is the named false source,
+	// the `retryable=` token carries the field value (token name is frozen
+	// history; it serializes retryNowSucceeds). A bare prefix without either
+	// cannot answer (b).
+	if (/queued session input is suspended/i.test(message)) {
+		const retryable = /\bretryable=(true|false)\b/i.exec(message)?.[1]?.toLowerCase();
+		return {
+			deliveredNothing: true,
+			retryNowSucceeds: retryable === undefined ? undefined : retryable === "true" ? true : false,
+		};
+	}
+	// Paused serializes (b) only for the update-restart teardown lease: the
+	// ordinary lease releases, the teardown one only a restart releases.
+	if (/session input admission is paused/i.test(message)) {
+		return { deliveredNothing: true, retryNowSucceeds: /update-restart teardown/i.test(message) ? false : true };
+	}
+	// QP-3 (r39): a same-key duplicate arrived while its owner was committing;
+	// refused before delivery, retrying after the turn ends is correct.
+	if (/equivalent follow-up.*is already committing/i.test(message)) {
+		return { deliveredNothing: true, retryNowSucceeds: true };
+	}
+	if (
 		/too many pending messages/i.test(message) ||
 		/rate limit exceeded/i.test(message) ||
-		/queued session input is suspended/i.test(message) ||
 		/Agent message was not accepted/i.test(message) ||
-		// QP-2 (r39): an admission pause lease refused the action before anything
-		// was queued or delivered (MCP reload, ACP stop, update-restart teardown),
-		// so the id stays unspent and "retry once the pause is released" is the
-		// correct sender guidance.
-		/session input admission is paused/i.test(message) ||
-		// QP-3 (r39): a same-key duplicate arrived while its owner was committing;
-		// refused before delivery, retrying after the turn ends is correct.
-		/equivalent follow-up.*is already committing/i.test(message) ||
 		// A bounded wait (P1-1) that ran out of time: the target is mid-transition, nothing was
 		// cancelled, and the same call joins the in-flight operation instead of starting a second
 		// one. Counting it here is what gives the new retryable errors a mechanical ceiling -
 		// three in a row for one target turn terminal (M6b).
 		/wait timed out/i.test(message)
-	);
+	) {
+		return { deliveredNothing: true, retryNowSucceeds: undefined };
+	}
+	return { deliveredNothing: false, retryNowSucceeds: undefined };
 }
 
-/** Terminal replacement text once a sender has burned its retry budget (M6b). */
+/**
+ * Terminal replacement text once a sender has burned its retry budget (M6b).
+ * `fenced` marks the (b)=false shape: the target is behind an update-restart
+ * fence, so the guidance is to persist and resend after the restart instead of
+ * the generic "write a file and move on".
+ */
 export function formatAgentMessageRetryExhaustedError(input: {
 	target: string;
 	attempts: number;
 	lastError: string;
+	fenced?: boolean;
 }): string {
+	if (input.fenced) {
+		return (
+			`Agent messaging to ${input.target} failed ${input.attempts} times in a row (last: ${input.lastError}). ` +
+			"The target is fenced for an update-restart: Nothing was delivered, and retrying in this process cannot succeed. " +
+			"Do not call agent_message.send again for this target in this turn: persist your result (write it to a file or end the turn) and resend it after the restart."
+		);
+	}
 	return (
 		`Agent messaging to ${input.target} failed ${input.attempts} times in a row (last: ${input.lastError}). ` +
 		"This error is terminal, not retryable: do not call agent_message.send again for this target in this turn. " +
@@ -1084,7 +1122,10 @@ export function createAgentMessageHostHandlers(
 	const rememberFailure = (messageId: string | undefined, error: unknown, target?: string): void => {
 		if (messageId === undefined) return;
 		const message = error instanceof Error ? error.message : String(error);
-		if (isRetryableAgentMessageSendError(message)) return;
+		// Only (a) decides whether the id is spent: a provably pre-delivery
+		// refusal leaves it unspent so the correct resend still works. Whether a
+		// retry can succeed now ((b)) is not this ledger's question.
+		if (classifyAgentMessageSendFailureByMessage(message).deliveredNothing) return;
 		remember(messageId, "uncertain", target);
 	};
 	return {
@@ -1147,9 +1188,9 @@ export function createAgentMessageHostHandlers(
 				const uncertain = results.some(
 					(result) =>
 						result.status === "rejected" &&
-						!isRetryableAgentMessageSendError(
+						!classifyAgentMessageSendFailureByMessage(
 							result.reason instanceof Error ? result.reason.message : String(result.reason),
-						),
+						).deliveredNothing,
 				);
 				remember(
 					messageId,

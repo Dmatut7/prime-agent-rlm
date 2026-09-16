@@ -17,12 +17,12 @@ import {
 	type AgentSessionMessagePayload,
 	type AgentSessionMessageReceipt,
 	assertAgentMessageQueueCapacity,
+	classifyAgentMessageSendFailureByMessage,
 	countsAsDeliveredParentReply,
 	createAgentSessionMessageReceipt,
 	formatAgentMessageQueuedNotice,
 	formatAgentMessageRetryExhaustedError,
 	isChildReplyToThisSession,
-	isRetryableAgentMessageSendError,
 	QUEUED_PARENT_REPLY_BACKFILL_LIMIT,
 	QueuedParentReplyBackfills,
 	SUBAGENT_TERMINAL_ERROR_NOTICE_PREFIX,
@@ -117,10 +117,18 @@ describe("P0-3a queued agent-message receipts", () => {
 			"Agent message was not accepted",
 		];
 		expect(retryable.length).toBeGreaterThan(0);
-		for (const message of retryable) expect(isRetryableAgentMessageSendError(message), message).toBe(true);
+		for (const message of retryable) {
+			// The pre-fix predicate answered one collapsed boolean; the classifier
+			// keeps the (a) truth set intact and leaves (b) unanswered where the
+			// text cannot prove it.
+			expect(classifyAgentMessageSendFailureByMessage(message).deliveredNothing, message).toBe(true);
+			expect(classifyAgentMessageSendFailureByMessage(message).retryNowSucceeds, message).toBeUndefined();
+		}
 		// Terminal shapes must stay terminal, or the budget would hide a real error.
-		expect(isRetryableAgentMessageSendError("Unknown active session: nope")).toBe(false);
-		expect(isRetryableAgentMessageSendError("Agent messaging cannot target the sending session")).toBe(false);
+		expect(classifyAgentMessageSendFailureByMessage("Unknown active session: nope").deliveredNothing).toBe(false);
+		expect(
+			classifyAgentMessageSendFailureByMessage("Agent messaging cannot target the sending session").deliveredNothing,
+		).toBe(false);
 	});
 
 	it("writes a terminal error that forbids another retry", () => {
@@ -166,12 +174,13 @@ describe("P0-3a queued agent-message receipts", () => {
 		const fenced = new SessionInputSuspendedError({ queuedActionCount: 2, suspendedForUpdateRestart: true });
 		expect(fenced.message).toContain("Cannot admit a session action while queued session input is suspended.");
 		expect(fenced.message).toContain("update-restart fence");
-		expect(fenced.retryable).toBe(false);
+		expect(fenced.retryNowSucceeds).toBe(false);
+		expect(fenced.deliveredNothing).toBe(true);
 		expect(fenced.queuedActionCount).toBe(2);
 
 		const parked = new SessionInputSuspendedError({ queuedActionCount: 0, suspendedForUpdateRestart: false });
 		expect(parked.message).toContain("Cannot admit a session action while queued session input is suspended.");
-		expect(parked.retryable).toBe(true);
+		expect(parked.retryNowSucceeds).toBe(true);
 		expect(parked.name).toBe("SessionInputSuspendedError");
 	});
 });

@@ -107,7 +107,7 @@ describe("r40 K3Q-3: retryable admission refusals defer the tick instead of burn
 		expect(hbAfter.runCount).toBe(0);
 		expect(hbAfter.lastRunAt).toBeUndefined();
 		expect(hbAfter.lastError).toBeUndefined();
-		expect(hbAfter.lastSkippedAt).toBe("2026-01-01T12:35:01.000Z");
+		expect(hbAfter.lastDeferredAt).toBe("2026-01-01T12:35:01.000Z");
 		expect(hbAfter.nextRunAt).toBe("2026-01-01T12:35:31.000Z");
 
 		const onceAfter = jobById(store, once.id);
@@ -115,7 +115,8 @@ describe("r40 K3Q-3: retryable admission refusals defer the tick instead of burn
 		expect(onceAfter.runCount).toBe(0);
 		expect(onceAfter.lastRunAt).toBeUndefined();
 		expect(onceAfter.lastError).toBeUndefined();
-		expect(onceAfter.lastSkippedAt).toBe("2026-01-01T12:35:01.000Z");
+		expect(onceAfter.lastDeferredAt).toBe("2026-01-01T12:35:01.000Z");
+		expect(onceAfter.deferCount).toBe(1);
 		expect(onceAfter.nextRunAt).toBe(new Date(tick.getTime() + CRON_DEFERRED_RETRY_MS).toISOString());
 	});
 
@@ -145,7 +146,7 @@ describe("r40 K3Q-3: retryable admission refusals defer the tick instead of burn
 		expect(onceAfter.runCount).toBe(0);
 		expect(onceAfter.lastRunAt).toBeUndefined();
 		expect(onceAfter.lastError).toBeUndefined();
-		expect(onceAfter.lastSkippedAt).toBe("2026-01-01T12:35:00.000Z");
+		expect(onceAfter.lastDeferredAt).toBe("2026-01-01T12:35:00.000Z");
 		expect(onceAfter.nextRunAt).toBe(new Date(tick.getTime() + CRON_DEFERRED_RETRY_MS).toISOString());
 	});
 
@@ -189,7 +190,8 @@ describe("r40 K3Q-3: retryable admission refusals defer the tick instead of burn
 		expect(onceAfter.runCount).toBe(1);
 		expect(onceAfter.lastRunAt).toBe("2026-01-01T12:35:07.000Z");
 		expect(onceAfter.lastError).toBeUndefined();
-		expect(onceAfter.lastSkippedAt).toBe("2026-01-01T12:35:01.000Z");
+		expect(onceAfter.lastDeferredAt).toBe("2026-01-01T12:35:01.000Z");
+		expect(onceAfter.deferCount).toBeUndefined();
 
 		const heartbeatTick = new Date("2026-01-01T12:35:35.000Z");
 		setNow(heartbeatTick);
@@ -200,7 +202,8 @@ describe("r40 K3Q-3: retryable admission refusals defer the tick instead of burn
 		expect(hbAfter.runCount).toBe(1);
 		expect(hbAfter.lastRunAt).toBe("2026-01-01T12:35:35.000Z");
 		expect(hbAfter.lastError).toBeUndefined();
-		expect(hbAfter.lastSkippedAt).toBe("2026-01-01T12:35:01.000Z");
+		expect(hbAfter.lastDeferredAt).toBe("2026-01-01T12:35:01.000Z");
+		expect(hbAfter.deferCount).toBeUndefined();
 		expect(hbAfter.nextRunAt).toBe("2026-01-01T12:36:05.000Z");
 	});
 });

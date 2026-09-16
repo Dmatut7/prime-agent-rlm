@@ -21,9 +21,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	AGENT_MESSAGE_SOURCE,
 	type AgentSessionMessagePayload,
+	classifyAgentMessageSendFailureByMessage,
 	createAgentSessionMessage,
 	isAgentSessionMessage,
-	isRetryableAgentMessageSendError,
 } from "../../../src/core/agent-messages.js";
 import { SessionInputSuspendedError } from "../../../src/core/prompt-admission.js";
 import { createHarness, getAssistantTexts, getUserTexts, type Harness } from "../harness.js";
@@ -148,10 +148,16 @@ describe("F1 agent message into a suspended session input pump", () => {
 				() => undefined,
 				(thrown: unknown) => thrown,
 			);
-		const error = refusal as { name?: string; message?: string; retryable?: boolean };
+		const error = refusal as { name?: string; message?: string; retryNowSucceeds?: boolean };
 		expect(error?.name).toBe("SessionInputAdmissionPausedError");
-		expect(error?.retryable).toBe(true);
-		expect(isRetryableAgentMessageSendError(error?.message ?? "")).toBe(true);
+		// D1a (r41): the teardown lease is restart-only, so the refusal is still
+		// pre-delivery (resend after the restart) but not retry-now.
+		expect(error?.retryNowSucceeds).toBe(false);
+		expect(error?.message).toContain("update-restart teardown");
+		expect(classifyAgentMessageSendFailureByMessage(error?.message ?? "")).toEqual({
+			deliveredNothing: true,
+			retryNowSucceeds: false,
+		});
 
 		expect(harness.session.isQueuedWorkSuspended).toBe(true);
 		expect(harness.session.getFollowUpMessages()).toEqual(["queued before restart"]);
@@ -177,7 +183,8 @@ describe("F1 agent message into a suspended session input pump", () => {
 		if (!(error instanceof SessionInputSuspendedError)) throw new Error("unreachable");
 		expect(error.message).toContain("queued session input is suspended");
 		expect(error.suspendedForUpdateRestart).toBe(true);
-		expect(error.retryable).toBe(false);
+		expect(error.retryNowSucceeds).toBe(false);
+		expect(error.deliveredNothing).toBe(true);
 		expect(error.queuedActionCount).toBe(0);
 	});
 });

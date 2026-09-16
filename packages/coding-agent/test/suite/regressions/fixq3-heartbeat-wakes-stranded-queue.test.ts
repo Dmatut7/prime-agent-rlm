@@ -104,9 +104,12 @@ describe("FIX-Q3 heartbeat wakes a stranded suspended queue", () => {
 				() => undefined,
 				(thrown: unknown) => thrown,
 			);
-		const error = steerRefusal as { name?: string; retryable?: boolean };
+		const error = steerRefusal as { name?: string; message?: string; retryNowSucceeds?: boolean };
 		expect(error?.name).toBe("SessionInputAdmissionPausedError");
-		expect(error?.retryable).toBe(true);
+		// D1a (r41): the teardown lease is restart-only, so the refusal is
+		// pre-delivery (resend after the restart) but not retry-now.
+		expect(error?.retryNowSucceeds).toBe(false);
+		expect(error?.message).toContain("update-restart teardown");
 		expect(harness.session.isQueuedWorkSuspended).toBe(true);
 		expect(harness.session.getSteeringMessages()).toEqual([]);
 

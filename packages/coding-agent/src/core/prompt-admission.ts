@@ -1,14 +1,41 @@
 /**
+ * Base contract for every typed admission refusal: the action was refused
+ * *before* anything was queued or delivered. The two propositions callers
+ * kept collapsing into one "retryable" boolean live here as two fields:
+ * (a) `deliveredNothing` - this attempt spent nothing (the message id stays
+ *     unspent, a resend of the same id is correct);
+ * (b) `retryNowSucceeds` - retrying the same action later *in this process*
+ *     can succeed. False means the refusal is tied to a restart fence: the
+ *     session is closing, so the correct action is to persist the result and
+ *     resend after the restart, not to burn retries against a dead window.
+ * A new admission refusal class must extend this base, which is what keeps
+ * the (a)/(b) split from regressing into a single boolean again.
+ */
+export abstract class SessionInputRefusedBeforeDeliveryError extends Error {
+	/** This attempt queued and delivered nothing (structural: refusals happen before delivery). */
+	readonly deliveredNothing: true;
+	/** Whether an in-process retry can succeed; false is the update-restart fence. */
+	abstract readonly retryNowSucceeds: boolean;
+
+	constructor(message: string) {
+		super(message);
+		this.deliveredNothing = true;
+	}
+}
+
+/**
  * Session input admission is suspended: `requestAbort` parked the pump, or
  * `abortForUpdateRestart` fenced it so queued work survives into the restart
  * manifest. Typed so a caller can tell "parked, do not hammer it" from a
  * permanent failure; the message keeps the historical substring that existing
- * transcripts and tests match on.
+ * transcripts and tests match on, including the `retryable=` token, which
+ * serializes `retryNowSucceeds` (the token name is frozen history).
  */
-export class SessionInputSuspendedError extends Error {
+export class SessionInputSuspendedError extends SessionInputRefusedBeforeDeliveryError {
 	/** False for the update-restart fence: retrying cannot succeed until restart. */
-	readonly retryable: boolean;
+	readonly retryNowSucceeds: boolean;
 	readonly queuedActionCount: number;
+	/** Named source of retryNowSucceeds===false: the update-restart fence. */
 	readonly suspendedForUpdateRestart: boolean;
 
 	constructor(options: {
@@ -27,7 +54,7 @@ export class SessionInputSuspendedError extends Error {
 				` ${options.queuedActionCount} action(s) already queued; retryable=${retryable}.`,
 		);
 		this.name = "SessionInputSuspendedError";
-		this.retryable = retryable;
+		this.retryNowSucceeds = retryable;
 		this.queuedActionCount = options.queuedActionCount;
 		this.suspendedForUpdateRestart = options.suspendedForUpdateRestart;
 	}
@@ -41,18 +68,21 @@ export class SessionInputSuspendedError extends Error {
  * from a permanent failure; the message keeps the historical substring that
  * existing transcripts and tests match on.
  */
-export class SessionInputAdmissionPausedError extends Error {
-	/** True: the pause is released by its owner, so a later retry can succeed. */
-	readonly retryable: boolean;
+export class SessionInputAdmissionPausedError extends SessionInputRefusedBeforeDeliveryError {
+	/** True unless the lease is the update-restart teardown, which only a restart releases. */
+	readonly retryNowSucceeds: boolean;
 
-	constructor(options: { pausedCount?: number } = {}) {
+	constructor(options: { pausedCount?: number; forUpdateRestart?: boolean } = {}) {
 		super(
 			"Cannot admit a session action while session input admission is paused. " +
 				`Nothing was delivered and nothing was queued (${options.pausedCount ?? 1} pause lease(s) held); ` +
-				"retry the same message once the pause is released.",
+				"retry the same message once the pause is released." +
+				(options.forUpdateRestart
+					? " The pause is held for an update-restart teardown; the session is closing, so resend after the restart."
+					: ""),
 		);
 		this.name = "SessionInputAdmissionPausedError";
-		this.retryable = true;
+		this.retryNowSucceeds = !options.forUpdateRestart;
 	}
 }
 
@@ -63,8 +93,8 @@ export class SessionInputAdmissionPausedError extends Error {
  * the same key. Refused before delivery, so retrying after the turn ends is
  * the correct action.
  */
-export class SessionInputCoalescingError extends Error {
-	readonly retryable: boolean;
+export class SessionInputCoalescingError extends SessionInputRefusedBeforeDeliveryError {
+	readonly retryNowSucceeds: boolean;
 	readonly queueKey: string;
 	readonly ownerActionId: string;
 
@@ -74,22 +104,20 @@ export class SessionInputCoalescingError extends Error {
 				"Nothing was delivered; retry the same message after the current turn ends.",
 		);
 		this.name = "SessionInputCoalescingError";
-		this.retryable = true;
+		this.retryNowSucceeds = true;
 		this.queueKey = options.queueKey;
 		this.ownerActionId = options.ownerActionId;
 	}
 }
 
 /**
- * True for the typed, retryable admission refusals: the pause-window refusal
- * and the committing-window refusal above. Both mean nothing was queued or
- * delivered, so a scheduler whose tick hit one can treat the attempt as "not
- * run, retry later" instead of a burned run.
+ * The typed pre-delivery admission refusal contract above. This is the only
+ * typed authority for "this attempt delivered nothing": a scheduler whose tick
+ * hit one records a deferral instead of a burned run, and reads
+ * `retryNowSucceeds` separately to pick the retry cadence.
  */
-export function isRetryableSessionInputRefusal(
-	error: unknown,
-): error is SessionInputAdmissionPausedError | SessionInputCoalescingError {
-	return error instanceof SessionInputAdmissionPausedError || error instanceof SessionInputCoalescingError;
+export function isSessionInputRefusedBeforeDelivery(error: unknown): error is SessionInputRefusedBeforeDeliveryError {
+	return error instanceof SessionInputRefusedBeforeDeliveryError;
 }
 
 export class PromptAdmissionCancelledError extends Error {
