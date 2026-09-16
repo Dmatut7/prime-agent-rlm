@@ -1,0 +1,2 @@
+- Fixed stall-watchdog, turn-liveness and cron scheduling to measure ages, budgets and arm delays on a step-compensated clock, so a backward wall-clock step can no longer freeze exemption budgets, defer aborts, throttle every heartbeat frame or delay scheduled jobs.
+- Added an unref to the cron scheduler arm timer and a random suffix to legacy cron migration backup names.

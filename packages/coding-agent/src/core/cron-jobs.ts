@@ -12,6 +12,7 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { getLogger } from "@earendil-works/pi-ai";
 import { lockSync } from "proper-lockfile";
+import { StepCompensatedClock } from "./clock-step.js";
 import {
 	artifactDirectoryWriteMs,
 	readSessionArtifactTombstone,
@@ -1178,7 +1179,9 @@ export function migrateLegacyCronJobsToSessionArtifacts(
 			stored += 1;
 		}
 	}
-	renameSync(filePath, `${filePath}.migrated-${Date.now()}`);
+	// The random suffix keeps a repeated wall timestamp (a clock step back) from renaming
+	// onto an earlier backup: renameSync would silently overwrite it.
+	renameSync(filePath, `${filePath}.migrated-${Date.now()}-${randomUUID()}`);
 	return stored;
 }
 
@@ -1187,6 +1190,8 @@ export class AgentCronScheduler {
 	private running = false;
 	private stopped = true;
 	private hasStarted = false;
+	/** Schedule-base clock: absorbs backward wall steps so arms measure real elapsed time. */
+	private readonly stepClock = new StepCompensatedClock();
 	private readonly dispatchLanes = new Map<string, Promise<void>>();
 
 	constructor(
@@ -1218,7 +1223,7 @@ export class AgentCronScheduler {
 		this.scheduleNext(0);
 	}
 
-	async runDue(now = this.now()): Promise<number> {
+	async runDue(now = new Date(this.schedulerNowMs())): Promise<number> {
 		if (this.running || (this.stopped && this.hasStarted)) {
 			return 0;
 		}
@@ -1226,7 +1231,7 @@ export class AgentCronScheduler {
 		const dispatches: Array<{ dispatch: AgentCronDispatch; endDispatch?: () => void }> = [];
 		let claimedDispatches: AgentCronDispatch[] | undefined;
 		try {
-			claimedDispatches = this.store.claimDue(now, this.now());
+			claimedDispatches = this.store.claimDue(now, new Date(this.schedulerNowMs()));
 			for (const dispatch of claimedDispatches) {
 				dispatches.push({ dispatch, endDispatch: this.hooks.beginDispatch?.(dispatch) });
 			}
@@ -1297,12 +1302,16 @@ export class AgentCronScheduler {
 		return task;
 	}
 
+	private schedulerNowMs(): number {
+		return this.stepClock.now(this.now().getTime(), performance.now());
+	}
+
 	private scheduleNext(delayMs?: number): void {
 		if (this.timer) {
 			clearTimeout(this.timer);
 			this.timer = undefined;
 		}
-		const now = this.now();
+		const nowMs = this.schedulerNowMs();
 		const nextDelay =
 			delayMs ??
 			(() => {
@@ -1319,23 +1328,26 @@ export class AgentCronScheduler {
 				if (!next) {
 					return undefined;
 				}
-				return Math.max(0, next.getTime() - now.getTime());
+				return Math.max(0, next.getTime() - nowMs);
 			})();
 		if (nextDelay === undefined) {
 			return;
 		}
-		this.timer = setTimeout(
-			() => {
-				// runDue re-arms the timer in its finally block, so a failure here (a store
-				// lock held by another process, for instance) only costs this tick. Left
-				// unhandled it would be an unhandled rejection, which kills the worker;
-				// swallowed silently it would cost the tick without a trace.
-				void this.runDue().catch((error) => {
-					cronLog.warn("cron tick failed", { error: errorMessage(error) });
-				});
-			},
-			Math.min(nextDelay, MAX_TIMEOUT_MS),
-		);
+		const armDelay = Math.min(nextDelay, MAX_TIMEOUT_MS);
+		this.timer = setTimeout(() => {
+			// runDue re-arms the timer in its finally block, so a failure here (a store
+			// lock held by another process, for instance) only costs this tick. Left
+			// unhandled it would be an unhandled rejection, which kills the worker;
+			// swallowed silently it would cost the tick without a trace.
+			// The promised wake time is a floor on how far time has really moved: a
+			// wall step back between arming and waking cannot stretch the wait past it
+			// (same wake-then-recompute shape the MAX_TIMEOUT_MS ceiling already uses).
+			const effectiveMs = Math.max(this.schedulerNowMs(), nowMs + armDelay);
+			void this.runDue(new Date(effectiveMs)).catch((error) => {
+				cronLog.warn("cron tick failed", { error: errorMessage(error) });
+			});
+		}, armDelay);
+		this.timer.unref();
 	}
 
 	private now(): Date {

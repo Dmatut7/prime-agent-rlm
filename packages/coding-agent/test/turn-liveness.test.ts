@@ -400,7 +400,9 @@ describe("createTurnLiveness", () => {
 		const notMoved: [string, Partial<KernelLivenessSample>][] = [
 			["the loop ticked", { tick: 999 }],
 			["the kernel burned cpu", { cpuMs: 999_999 }],
-			["the frame is newer", { receivedAt: T0 + 5_000 }],
+			// Newer than the previous sample but never ahead of the reader's clock: a timestamp
+			// in the future is a clock-step signature and fails closed to "stale" instead.
+			["the frame is newer", { receivedAt: T0 - 1_000 }],
 		];
 		expect(notMoved.length).toBeGreaterThan(0);
 		for (const [name, overrides] of notMoved) {

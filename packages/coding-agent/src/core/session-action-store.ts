@@ -400,6 +400,26 @@ function isIdleEvictionThresholdMet(
 	);
 }
 
+/**
+ * Clamp a foreign clock's reading against this side's monotonic elapsed time.
+ *
+ * Idle-eviction compares worker-recorded wall timestamps against a supervisor-supplied
+ * `now`; the two clocks can disagree by an NTP step or a manual correction. A forward step
+ * inflates the idle delta and evicts a session that is not idle yet, so each borrowed
+ * reading is bounded by the projection of the previous one across the monotonic time this
+ * side measured in between. A backward step only delays eviction, which is the safe
+ * direction, and passes through unchanged.
+ */
+export function clampForeignClockNow(
+	now: number,
+	previous: { wall: number; mono: number } | undefined,
+	monoNow: number,
+): number {
+	if (previous === undefined) return now;
+	const projected = previous.wall + (monoNow - previous.mono);
+	return Math.min(now, projected);
+}
+
 /** Pure per-node residency policy. Roots remain owned by whole-worker eviction. */
 export function canPassivateSession(
 	session: SessionPassivationSnapshot,

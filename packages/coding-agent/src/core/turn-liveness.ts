@@ -119,6 +119,19 @@ export const DEFAULT_STALE_AFTER_INTERVALS = 3;
  * stale between frames (r35 H-1).
  */
 export const KERNEL_LIVENESS_MIN_SAMPLE_GAP_MS = 1_000;
+
+/**
+ * Whether a freshly received heartbeat frame may be retained as a liveness sample. Frames
+ * closer than the minimum gap are throttled so the host's diff pair stays bounded no matter
+ * how fast a kernel sends. A wall clock behind the retained sample's timestamp is a clock
+ * step, not a fast kernel: the frame is retained so the channel re-anchors, or every frame
+ * the kernel sends while the wall clock lags would be throttled and the evidence would
+ * freeze on pre-step facts.
+ */
+export function shouldRetainHeartbeatSample(now: number, latestReceivedAt: number): boolean {
+	if (now < latestReceivedAt) return true;
+	return now - latestReceivedAt >= KERNEL_LIVENESS_MIN_SAMPLE_GAP_MS;
+}
 /** Fallback interval when a sample carries none (it always does; this only keeps the math total). */
 export const FALLBACK_HEARTBEAT_INTERVAL_MS = 5_000;
 
@@ -299,13 +312,17 @@ export function kernelVouchedAlive(
 	const movementToken = `${latest.streamBytes}|${latest.bashBufferedBytes}|${latest.bashPipePending}|${latest.cellsDone}`;
 	const staleAfterIntervals = options.staleAfterIntervals ?? DEFAULT_STALE_AFTER_INTERVALS;
 	const intervalMs = latest.intervalMs > 0 ? latest.intervalMs : FALLBACK_HEARTBEAT_INTERVAL_MS;
-	const ageMs = Math.max(0, now - latest.receivedAt);
+	const rawAgeMs = now - latest.receivedAt;
+	// A wall clock behind the newest sample's anchor cannot certify freshness: that age is
+	// unknown, and an unknown age fails closed to "stale" (the degraded deadline below takes
+	// the same stance) instead of reading as a zero-age fresh sample.
+	const ageMs = Math.max(0, rawAgeMs);
 	// The host retains samples at least KERNEL_LIVENESS_MIN_SAMPLE_GAP_MS apart, so a
 	// healthy kernel's newest retained sample can be up to gap + interval old: the
 	// threshold never sits below that, or a fast kernel (interval_ms < gap /
 	// staleAfterIntervals) ages into a false "stale" between retained frames.
 	const staleAfterMs = Math.max(staleAfterIntervals * intervalMs, KERNEL_LIVENESS_MIN_SAMPLE_GAP_MS + intervalMs);
-	const state: KernelLivenessState = ageMs > staleAfterMs ? "stale" : "fresh";
+	const state: KernelLivenessState = rawAgeMs < 0 || ageMs > staleAfterMs ? "stale" : "fresh";
 	const previous = samples.previous;
 	// Deltas, not rates: a frame the host never saw cannot make the next one lie.
 	const streamDelta = previous ? Math.max(0, latest.streamBytes - previous.streamBytes) : 0;
@@ -404,7 +421,10 @@ export function createTurnLiveness(options: TurnLivenessOptions): TurnLiveness {
 		if (degradedFirstReadAt !== undefined && at - degradedFirstReadAt > degradedFactsMaxAgeMs()) return;
 		// Rate bound, not a usefulness bound: a re-read may *downgrade* the facts (an orphan that
 		// died must stop vouching), so it is skipped only for being too soon after the last attempt.
-		if (degraded && at - degraded.lastAttemptAt < degradedRefreshMinGapMs()) return;
+		// A clock behind the last attempt makes the gap unknown rather than small: the
+		// re-read is allowed so the facts re-anchor at the stepped-back clock.
+		if (degraded && at - degraded.lastAttemptAt >= 0 && at - degraded.lastAttemptAt < degradedRefreshMinGapMs())
+			return;
 		const kernel = options.kernel();
 		const kernelPid = kernel?.kernelPid;
 		const result = readJournal(kernelPid);
@@ -471,8 +491,12 @@ export function createTurnLiveness(options: TurnLivenessOptions): TurnLiveness {
 		const revival = kernel?.revival;
 		// Aged against this aggregate's own clock rather than the reported age, so a caller that
 		// handed over a stale number cannot extend its own vouch.
-		const revivalAgeMs = revival === undefined ? undefined : Math.max(0, at - revival.since);
-		const revivalAgedOut = revivalAgeMs !== undefined && revivalAgeMs > revivalVouchMaxAgeMs();
+		const rawRevivalAgeMs = revival === undefined ? undefined : at - revival.since;
+		// Unknown age (the clock behind the revival anchor) cannot certify the vouch is
+		// inside its bound, so it stops excusing silence exactly like an aged-out one.
+		const revivalAgeMs = rawRevivalAgeMs === undefined ? undefined : Math.max(0, rawRevivalAgeMs);
+		const revivalAgedOut =
+			rawRevivalAgeMs !== undefined && (rawRevivalAgeMs < 0 || rawRevivalAgeMs > revivalVouchMaxAgeMs());
 		if (revivalAgeMs !== undefined && !revivalAgedOut) {
 			reasons.push(TURN_LIVENESS_REASONS.kernelReviving);
 			progress = true;
@@ -532,7 +556,10 @@ export function createTurnLiveness(options: TurnLivenessOptions): TurnLiveness {
 			// this kernel. Existence only, so it can never buy the progress tier.
 			if (degraded) {
 				const age = at - degraded.readAt;
-				if (age > degradedFactsMaxAgeMs()) {
+				// Negative age means the clock stepped back past the read: the deadline cannot
+				// be certified, so the facts fail closed instead of vouching until the wall
+				// clock catches back up. The next re-read re-anchors them at the current clock.
+				if (age < 0 || age > degradedFactsMaxAgeMs()) {
 					emit({ kind: "degraded_expired", liveBashHandles: degraded.liveBashHandles, at });
 					degraded = undefined;
 				} else if (degraded.liveBashHandles > 0) {

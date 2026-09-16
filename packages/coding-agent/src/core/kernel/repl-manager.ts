@@ -22,7 +22,7 @@ import { v4 as uuid } from "uuid";
 import { DEFAULT_SHORT_TARGET_WAIT_MS, withBound } from "../../utils/bounded-wait.js";
 import { assertRegularFileNoSymlink, ensurePrivateDirectory, requireNoFollow } from "../../utils/private-files.js";
 import { reapKernelOrphanProcesses, recordOrphanProcessState } from "../orphan-process-journal.js";
-import { KERNEL_LIVENESS_MIN_SAMPLE_GAP_MS } from "../turn-liveness.js";
+import { shouldRetainHeartbeatSample } from "../turn-liveness.js";
 import { ensureKernelPython, KERNEL_PYTHON_SAFE_PATH_ARGS, managedKernelVenvDirForPython } from "./bootstrap.js";
 import {
 	classifyKernelExit,
@@ -645,7 +645,12 @@ export class ReplKernelManager {
 		for (const request of this.inFlightHostRequests.values()) {
 			if (oldest === undefined || request.startedAt < oldest) oldest = request.startedAt;
 		}
-		return oldest === undefined ? undefined : Math.max(0, Date.now() - oldest);
+		if (oldest === undefined) return undefined;
+		const now = Date.now();
+		// A wall clock behind the request's start cannot measure its age: report no age,
+		// which the liveness aggregate already treats as aged out (fail closed).
+		if (now < oldest) return undefined;
+		return Math.max(0, now - oldest);
 	}
 
 	/**
@@ -719,7 +724,7 @@ export class ReplKernelManager {
 		}
 		const now = Date.now();
 		const latest = this.livenessSamples[0];
-		if (latest && now - latest.receivedAt < KERNEL_LIVENESS_MIN_SAMPLE_GAP_MS) {
+		if (latest && !shouldRetainHeartbeatSample(now, latest.receivedAt)) {
 			// Well-formed, but too close to the retained sample to add a fact: keeping the newer
 			// one out of the diff pair bounds the host's work no matter how fast a kernel sends.
 			// The retained sample can age up to gap + interval, and kernelVouchedAlive sizes its
