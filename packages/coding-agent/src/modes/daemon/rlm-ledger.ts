@@ -396,13 +396,56 @@ export class RlmSpawnLedger {
 	}
 
 	/**
-	 * Replay edges without liveness reconciliation. Deleted edges are filtered
-	 * by default; `includeDeleted` keeps the tombstones (marked with their
-	 * delete reason) for consumers that need a deleted child's identity, such
-	 * as cleanup retries.
+	 * Edges as the live view. Deleted edges are filtered by default, and the
+	 * default view additionally reconciles against the filesystem: an edge
+	 * whose child session directory is gone can never come back - the
+	 * transcript, display file and every artifact under it went with the
+	 * directory - so it is dropped from the live view even without a tombstone
+	 * (r38 LIFE-1: 225 such edges stayed live forever after root teardowns that
+	 * predate parent-teardown records). The judgement is lazy and read-side
+	 * only: the durable record is unchanged, `edges(true)` still returns the
+	 * edge, and cleanup retries can still tombstone it.
+	 * `includeDeleted` skips the reconciliation on purpose: consumers of the
+	 * raw view (tombstone targeting, cleanup retries) want every record.
 	 */
 	edges(includeDeleted = false): Promise<RlmLedgerEdge[]> {
-		return this.enqueue(() => [...this.replaySync().values()].filter((edge) => includeDeleted || !edge.deleted));
+		return this.enqueue(async () => {
+			const edges = [...this.replaySync().values()].filter((edge) => includeDeleted || !edge.deleted);
+			if (includeDeleted || edges.length === 0) return edges;
+			return this.dropEdgesWithGoneChildDirsUnlocked(edges);
+		});
+	}
+
+	/**
+	 * The lazy half of the LIFE-1 reconciliation: one directory probe per unique
+	 * child session dir, batched like liveEdgesUnlocked()'s probes. Only the
+	 * child's directory is asked about, because the form a root teardown leaves
+	 * is "directory removed with the artifact tree"; liveEdgesUnlocked()
+	 * additionally probes the child and parent transcripts for family rows.
+	 */
+	private async dropEdgesWithGoneChildDirsUnlocked(edges: RlmLedgerEdge[]): Promise<RlmLedgerEdge[]> {
+		const canonical = new Map<string, string>();
+		const canonicalOf = (path: string): string => {
+			const hit = canonical.get(path);
+			if (hit !== undefined) return hit;
+			const value = canonicalSessionPath(path);
+			canonical.set(path, value);
+			return value;
+		};
+		const statCache = new Map<string, Promise<boolean>>();
+		const exists = (dir: string): Promise<boolean> => {
+			const inflight = statCache.get(dir);
+			if (inflight) return inflight;
+			const probe = stat(dir)
+				.then((stats) => stats.isDirectory())
+				.catch(() => false);
+			statCache.set(dir, probe);
+			return probe;
+		};
+		const dirs = [...new Set(edges.map((edge) => dirname(canonicalOf(edge.child))))];
+		const present = await mapConcurrent(dirs, LEDGER_STAT_CONCURRENCY, (dir) => exists(dir));
+		const liveDirs = new Set(dirs.filter((_dir, index) => present[index]));
+		return edges.filter((edge) => liveDirs.has(dirname(canonicalOf(edge.child))));
 	}
 
 	/**
@@ -914,11 +957,37 @@ export async function tombstoneSavedSessionDelete(
 		deletedInfo?.parentSessionPath !== undefined ||
 		(deletedInfo?.rlmDepth ?? 0) > 0;
 	const positivelyTopLevel = !knownChild && (knownSummary !== undefined || deletedInfo !== undefined);
-	if (positivelyTopLevel) return { deletedInfo, ledgerEdge: undefined };
-	const edges = await ledger.edges();
+	// Raw view on purpose (`edges(true)` plus the not-deleted filter): tombstoning
+	// is a write path, and the default edges() view drops edges whose child
+	// directory is gone - exactly the edges a retrying deletion is supposed to
+	// make durable.
+	const rawEdges = async (): Promise<RlmLedgerEdge[]> => (await ledger.edges(true)).filter((edge) => !edge.deleted);
+	if (positivelyTopLevel) {
+		// A root teardown removes the whole artifact tree - every child transcript,
+		// display file and artifact directory under it - without any child-level
+		// delete path running. Mirror the child-delete precedent (display tombstone
+		// plus ledger delete BEFORE the file remove, daemon-mode.ts) at the root:
+		// tombstone the direct child edges before the recursive remove, or they stay
+		// raw-live forever (r38 LIFE-1: 225 dead edges / 10 parents on the real
+		// ledger). "parent-teardown" is the durable distinction from a user delete.
+		// Best-effort by design: the root's own delete is safe without these records
+		// (the children's directories die with the tree and the live view reconciles
+		// the edges away read-side), so an unreadable ledger must not fail a root
+		// deletion the way it fails a child deletion.
+		try {
+			const children = (await rawEdges()).filter((edge) => canonicalSessionPath(edge.parent) === deletedPath);
+			for (const edge of children) {
+				await ledger.appendDelete({ childId: edge.childId, child: edge.child, reason: "parent-teardown" });
+			}
+		} catch {
+			// The tombstones stay unwritten; the dead edges keep healing through the
+			// read-side reconciliation until a retrying delete succeeds.
+		}
+		return { deletedInfo, ledgerEdge: undefined };
+	}
 	// Tombstone every matching edge: a duplicate edge for the path (corrupt or raced appends) left
 	// live would resurrect a later recreation at that path as a subagent.
-	const matching = edges.filter((edge) => canonicalSessionPath(edge.child) === deletedPath);
+	const matching = (await rawEdges()).filter((edge) => canonicalSessionPath(edge.child) === deletedPath);
 	for (const edge of matching) {
 		await ledger.appendDelete({ childId: edge.childId, child: sessionPath, reason: "user" });
 	}

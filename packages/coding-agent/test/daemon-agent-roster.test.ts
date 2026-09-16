@@ -1760,7 +1760,7 @@ describe("worker delete tombstone durability", () => {
 		};
 	}
 
-	it("deletes a top-level saved session without touching the spawn ledger", async () => {
+	it("deletes a top-level saved session even when the spawn ledger is unreadable", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "prime-roster-toplevel-delete-"));
 		tempDirs.push(directory);
 		const sessionsDir = join(directory, "sessions");

@@ -1,5 +1,6 @@
+import { createHash } from "node:crypto";
 import { closeSync, fsyncSync, mkdirSync, openSync, renameSync, rmSync, writeSync } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
+import { open, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { BoundedCache } from "../../utils/bounded-cache.js";
 
@@ -40,14 +41,17 @@ export function rlmSubagentDisplayPath(sessionDir: string): string {
 interface RlmSubagentDisplayCacheEntry {
 	size: number;
 	mtimeMs: number;
+	/** Head+tail content fingerprint: a colliding stat can hide a cross-process rewrite. */
+	fingerprint: string;
 	entry: RlmSubagentDisplayEntry | undefined;
 }
 
 // One entry per session dir the daemon has listed, keyed by the display file path.
 // Every session-list walk reads one display file per ledger edge, and the daemon
 // walks on high-frequency session events. Writes are atomic renames of a fully
-// rewritten file, so an unchanged (size, mtimeMs) means identical content; keying
-// on the stat keeps an out-of-process writer's change visible.
+// rewritten file, so a differing (size, mtimeMs) means changed content; a
+// colliding stat is settled by the head+tail content fingerprint below, which is
+// what keeps an out-of-process writer's change visible (r38 LIFE-3).
 //
 // The ceiling is sized from the population the cache actually serves. A listing
 // pass reads one dir per RLM ledger edge across every saved session, so a cap
@@ -135,6 +139,44 @@ export function resetRlmSubagentDisplayCache(): void {
 	displayCache.clear();
 }
 
+// The stat match no longer ends the revalidation: an out-of-process rewrite can
+// land the same (size, mtimeMs) - "running" and "deleted" serialize to the same
+// length, and two writes in one mtime tick are the natural case (r38 LIFE-3). The
+// cache therefore also fingerprints the file's head and tail chunk. Display files
+// are a single JSON line, so for the measured population (mean 6.5 KB, max
+// 21.9 KB) the window covers everything a same-size rewrite can change; the
+// middle of a file larger than both chunks is the accepted blind spot. The
+// fingerprint is computed from bytes, not a decoded string, so the store and the
+// validation paths agree.
+const FINGERPRINT_CHUNK_BYTES = 4096;
+
+function fingerprintOf(buffer: Buffer): string {
+	const hash = createHash("sha256");
+	hash.update(buffer.subarray(0, FINGERPRINT_CHUNK_BYTES));
+	if (buffer.length > FINGERPRINT_CHUNK_BYTES) {
+		hash.update(buffer.subarray(buffer.length - FINGERPRINT_CHUNK_BYTES));
+	}
+	return hash.digest("hex");
+}
+
+/** The file-side fingerprint: bounded head+tail reads, no full-file parse. */
+async function displayFingerprint(path: string, size: number): Promise<string | undefined> {
+	const handle = await open(path, "r");
+	try {
+		if (size <= FINGERPRINT_CHUNK_BYTES * 2) {
+			const whole = Buffer.alloc(size);
+			if (size > 0) await handle.read(whole, 0, size, 0);
+			return fingerprintOf(whole);
+		}
+		const spans = Buffer.alloc(FINGERPRINT_CHUNK_BYTES * 2);
+		await handle.read(spans, 0, FINGERPRINT_CHUNK_BYTES, 0);
+		await handle.read(spans, FINGERPRINT_CHUNK_BYTES, FINGERPRINT_CHUNK_BYTES, size - FINGERPRINT_CHUNK_BYTES);
+		return fingerprintOf(spans);
+	} finally {
+		await handle.close();
+	}
+}
+
 export async function readRlmSubagentDisplayEntry(sessionDir: string): Promise<RlmSubagentDisplayEntry | undefined> {
 	const path = rlmSubagentDisplayPath(sessionDir);
 	let stats: Awaited<ReturnType<typeof stat>>;
@@ -146,7 +188,12 @@ export async function readRlmSubagentDisplayEntry(sessionDir: string): Promise<R
 	}
 	const cached = displayCache.get(path);
 	if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs) {
-		return cached.entry;
+		const fingerprint = await displayFingerprint(path, stats.size).catch(() => undefined);
+		// A failed probe falls through to the full read, which reports the file's
+		// actual state rather than trusting a stat match it could not confirm.
+		if (fingerprint !== undefined && fingerprint === cached.fingerprint) {
+			return cached.entry;
+		}
 	}
 	let contents: string;
 	try {
@@ -162,6 +209,11 @@ export async function readRlmSubagentDisplayEntry(sessionDir: string): Promise<R
 	} catch {
 		entry = undefined;
 	}
-	displayCache.set(path, { size: stats.size, mtimeMs: stats.mtimeMs, entry });
+	displayCache.set(path, {
+		size: stats.size,
+		mtimeMs: stats.mtimeMs,
+		fingerprint: fingerprintOf(Buffer.from(contents, "utf8")),
+		entry,
+	});
 	return entry;
 }

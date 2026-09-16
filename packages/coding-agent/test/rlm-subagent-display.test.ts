@@ -98,6 +98,36 @@ describe("rlm subagent display files", () => {
 		}
 	});
 
+	it("re-reads a cross-process rewrite whose stat cannot be distinguished (r38 LIFE-3)", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-rlm-display-xproc-"));
+		try {
+			const sessionDir = join(tempDir, "sub-1234abcd");
+			const path = rlmSubagentDisplayPath(sessionDir);
+			const pinnedSeconds = 1_700_000_000;
+			const first = makeEntry(sessionDir, { sessionName: "workerA", status: "running" });
+			writeRlmSubagentDisplayEntry(first);
+			utimesSync(path, pinnedSeconds, pinnedSeconds);
+			await expect(readRlmSubagentDisplayEntry(sessionDir)).resolves.toEqual(first);
+			const pinned = statSync(path);
+
+			// An out-of-process writer never runs this process's cache invalidation:
+			// "running" and "deleted" serialize to the same byte length, and the pinned
+			// whole-second mtime survives the stat round trip exactly, so only the
+			// content can tell the two files apart.
+			const second = makeEntry(sessionDir, { sessionName: "workerB", status: "deleted" });
+			writeFileSync(path, `${JSON.stringify(second)}\n`);
+			utimesSync(path, pinnedSeconds, pinnedSeconds);
+			const rewritten = statSync(path);
+			expect(rewritten.size).toBe(pinned.size);
+			expect(rewritten.mtimeMs).toBe(pinned.mtimeMs);
+
+			// Red before the fix: the stat match alone returned the cached "running".
+			await expect(readRlmSubagentDisplayEntry(sessionDir)).resolves.toEqual(second);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("stops reporting an entry once its file is removed", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-rlm-display-removed-"));
 		try {

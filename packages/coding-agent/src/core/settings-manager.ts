@@ -79,6 +79,12 @@ export const DEFAULT_RETENTION_MAX_DELETE_ENTRIES_PER_SWEEP = 20_000;
 export const DEFAULT_RETENTION_COOLDOWN_MINUTES = 10;
 export const DEFAULT_RETENTION_EMPTY_ARTIFACT_DIR_DAYS = 7;
 export const DEFAULT_RETENTION_DELETED_SESSION_RESIDUE_DAYS = 7;
+/**
+ * Deleted (tombstoned) children's transcripts are reclaimed like any other
+ * deleted-session residue: the durable record is the display tombstone plus the
+ * ledger delete record, not the transcript bytes (r38 LIFE-2).
+ */
+export const DEFAULT_RETENTION_CHILD_TRANSCRIPT_DAYS = 30;
 export const DEFAULT_RETENTION_LOG_FILE_DAYS = 14;
 export const DEFAULT_RETENTION_TMP_RLM_DIR_HOURS = 24;
 export const DEFAULT_RETENTION_BASH_TEMP_FILE_HOURS = 24;
@@ -301,9 +307,10 @@ export interface RetentionSettings {
 	/** Non-empty artifact directories left by a provably deleted session. Default: 7; 0 = off. */
 	deletedSessionResidueDays?: number;
 	/**
-	 * Child transcripts (`sub-xxxxxxxx/<uuid>.jsonl`) older than this. Default: 0 (off).
-	 * Deleted by age only when the owner asks: the bytes ride live sub-agent
-	 * references (round-08 D-1), so the shipped answer is "age is not the judge".
+	 * Child transcripts (`sub-xxxxxxxx/<uuid>.jsonl`) older than this. Default: 30.
+	 * A live child is kept by its ledger edge; a deleted child's transcript is
+	 * residue of a provably deleted session whose durable record is elsewhere.
+	 * 0 = off.
 	 */
 	childTranscriptDays?: number;
 	/** Log files whose socket is gone. Default: 14; 0 = off. */
@@ -2570,9 +2577,13 @@ export function resolveRetentionSettings(settings?: RetentionSettings): Resolved
 			settings?.deletedSessionResidueDays,
 			DEFAULT_RETENTION_DELETED_SESSION_RESIDUE_DAYS,
 		),
-		// No shipped default above zero: the owner decided child transcripts are not
-		// reclaimed by age (round-08 D-1, round-09 ruling 1).
-		childTranscriptDays: normalizeRetentionWindowDays(settings?.childTranscriptDays, 0),
+		// Live children are kept by their ledger edge, not by an off-by-default
+		// switch: the 30-day window reclaims deleted children's transcripts while
+		// round-09 ruling 1's live-reference concern is enforced by the class.
+		childTranscriptDays: normalizeRetentionWindowDays(
+			settings?.childTranscriptDays,
+			DEFAULT_RETENTION_CHILD_TRANSCRIPT_DAYS,
+		),
 		logFileDays: normalizeRetentionWindowDays(settings?.logFileDays, DEFAULT_RETENTION_LOG_FILE_DAYS),
 		tmpRlmDirHours: normalizeRetentionWindowDays(settings?.tmpRlmDirHours, DEFAULT_RETENTION_TMP_RLM_DIR_HOURS),
 		tmpOtherDirDays: normalizeRetentionWindowDays(settings?.tmpOtherDirDays, 0),

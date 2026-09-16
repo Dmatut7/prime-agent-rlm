@@ -473,7 +473,7 @@ with one compact line per sweep appended to `<agentDir>/retention/history.jsonl`
 | `retention.cooldownMinutes` | number | `10` | Any candidate touched more recently is kept; non-positive keeps the default |
 | `retention.emptyArtifactDirDays` | number | `7` | Artifact directories with no file anywhere in the subtree, once the session that owned them is provably gone; `0` disables |
 | `retention.deletedSessionResidueDays` | number | `7` | Artifact directories that still hold leftovers (a semantic-edges stub, a local harness copy, a stale kernel snapshot) of a session whose deletion is on record; `0` disables. A directory whose id was reused by a new session is never reclaimed |
-| `retention.childTranscriptDays` | number | `0` | Sub-agent transcripts (`sub-xxxxxxxx/<uuid>.jsonl`) older than this. Off by default: the bytes ride live sub-agent references, and the source keeps a deleted RLM child's transcript as its durable record |
+| `retention.childTranscriptDays` | number | `30` | Sub-agent transcripts (`sub-xxxxxxxx/<uuid>.jsonl`) older than this. A live child is kept by its ledger edge; a deleted child's transcript is residue whose durable record is the display tombstone plus the ledger delete record. `0` = off |
 | `retention.logFileDays` | number | `14` | Log files whose socket no longer exists; the newest file of a rotated group and every log of a live socket are kept; `0` disables |
 | `retention.tmpRlmDirHours` | number | `24` | Empty `prime-agent-rlm-*` temp directories; `0` disables. The daemon's own `prime-agent-<uid>` socket directory is never a candidate |
 | `retention.tmpOtherDirDays` | number | `0` | Any other `prime-agent-*` temp directory (telemetry, test prefixes); off by default |

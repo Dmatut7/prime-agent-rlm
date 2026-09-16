@@ -92,18 +92,27 @@ describe("rlm subagent display cache bounds (round-14 leaks L1)", () => {
 			const prompt = "x".repeat(2048);
 			const path = seedDisplayFile(sessionDir, makeEntry(sessionDir, prompt, "workerA"));
 			utimesSync(path, PINNED_SECONDS, PINNED_SECONDS);
-			await expect(readRlmSubagentDisplayEntry(sessionDir)).resolves.toMatchObject({ sessionName: "workerA" });
+			const first = await readRlmSubagentDisplayEntry(sessionDir);
+			expect(first).toMatchObject({ sessionName: "workerA" });
 			expect(rlmSubagentDisplayCacheHas(sessionDir)).toBe(true);
 
-			// Equal byte length and equal pinned mtime: only a cache hit can still report
-			// workerA, because the stat cannot tell this file apart from the cached one.
+			// The hit-rate control: a repeat read is served from cache, returning the
+			// very object the first read parsed where a re-read would allocate a fresh
+			// one. (The old probe for this - an equal-size equal-mtime rewrite still
+			// reporting workerA - is the cross-process staleness r38 LIFE-3 fixes, so
+			// the probe and the guarantee had to part ways.)
+			await expect(readRlmSubagentDisplayEntry(sessionDir)).resolves.toBe(first);
+
+			// Equal byte length and equal pinned mtime no longer entitle the cache to
+			// the old entry: a cross-process rewrite is content-validated and picked up
+			// even though the stat cannot tell the two files apart.
 			const before = statSync(path);
 			seedDisplayFile(sessionDir, makeEntry(sessionDir, prompt, "workerB"));
 			utimesSync(path, PINNED_SECONDS, PINNED_SECONDS);
 			const after = statSync(path);
 			expect(after.size).toBe(before.size);
 			expect(after.mtimeMs).toBe(before.mtimeMs);
-			await expect(readRlmSubagentDisplayEntry(sessionDir)).resolves.toMatchObject({ sessionName: "workerA" });
+			await expect(readRlmSubagentDisplayEntry(sessionDir)).resolves.toMatchObject({ sessionName: "workerB" });
 
 			// A distinguishable rewrite is still picked up: stat revalidation stays honest.
 			seedDisplayFile(sessionDir, makeEntry(sessionDir, "y".repeat(2048), "workerC"));

@@ -107,6 +107,7 @@ export function collectLiveReferences(options: {
 		residentSessionIds: options.residentSessionIds ?? new Set<string>(),
 		ledgerLiveChildIds,
 		ledgerDeletedChildIds,
+		ledgerScanned: ledger.scanned,
 		transcriptIds: new Map<string, string>(),
 		sessionRootIds,
 		leasedSessionIds,

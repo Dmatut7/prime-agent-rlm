@@ -191,7 +191,11 @@ function buildCandidate(
  */
 function protectionReason(
 	candidate: ArtifactCandidate,
-	options: { tombstoneMatters?: boolean; requireDeletionEvidence?: boolean } = {},
+	options: {
+		tombstoneMatters?: boolean;
+		requireDeletionEvidence?: boolean;
+		ledgerScanned?: boolean;
+	} = {},
 ): RetentionSkip | undefined {
 	if (candidate.resident) {
 		return { path: candidate.path, reason: SKIP.inUse("resident"), detail: "session is resident or leased" };
@@ -233,6 +237,16 @@ function protectionReason(
 		if (candidate.tombstonePresent) {
 			// The id was reused after the delete (red test R-6).
 			return { path: candidate.path, reason: SKIP.reference("tombstone-superseded") };
+		}
+		// r38 LIFE-2 dead zone: a directory with no deletion record also has no
+		// writer left that could ever produce one - not resident, not leased, no
+		// ledger edge, no transcript, no kernel-snapshot reference, all checked
+		// above. When the ledger was positively scanned, "no live edge" is
+		// knowledge rather than a probe failure, so the class age window is the
+		// judge and the directory is reclaimable; an unscanned ledger keeps the
+		// skip, because "cannot disprove liveness" must not read as "gone".
+		if (options.ledgerScanned === true) {
+			return undefined;
 		}
 		return { path: candidate.path, reason: SKIP.noTombstone, detail: "no deletion record for this directory" };
 	}
@@ -305,7 +319,10 @@ function planArtifactDirs(context: RetentionClassContext, mode: "empty" | "resid
 		const protection =
 			mode === "empty"
 				? protectionReason(candidate, { tombstoneMatters: false })
-				: protectionReason(candidate, { requireDeletionEvidence: true });
+				: protectionReason(candidate, {
+						requireDeletionEvidence: true,
+						ledgerScanned: context.live.ledgerScanned === true,
+					});
 		if (protection) {
 			decision.set(candidate.path, protection);
 			continue;
