@@ -144,7 +144,10 @@ describe("daemon supervisor worker launch start-id capture", () => {
 
 			expect(launchProbe.spawns).toBe(CONCURRENT_LAUNCHES);
 			expect(launchProbe.syncStartIdCalls).toBe(0);
-			expect(maxGapMs).toBeLessThan(SYNC_PS_BLOCK_MS * 0.6);
+			// Shared CI runners load the loop with sibling shards; the pre-fix
+			// failure mode blocked the loop for the full serial ps cost (5 x 80ms),
+			// so a CI-tolerant ceiling keeps that margin without flaking on noise.
+			expect(maxGapMs).toBeLessThan(SYNC_PS_BLOCK_MS * 2);
 		} finally {
 			clearInterval(heartbeat);
 			startIdSpy.mockRestore();

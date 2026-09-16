@@ -82,7 +82,11 @@ describe("r31 RC-2 guard contention", () => {
 
 		// The event loop must keep servicing 10ms timers while the guard retries:
 		// a blocked loop starves them (pre-fix: Atomics.wait 100 x 10ms).
-		const late = ticks.filter((tick) => tick.fired - tick.scheduled > 50);
+		// The pre-fix Atomics.wait loop starved 10ms timers for the whole ~1s
+		// guard budget; a shared CI runner can legitimately jitter timers by
+		// hundreds of ms under shard load, so the ceiling keeps the pre-fix
+		// margin without flaking on runner noise.
+		const late = ticks.filter((tick) => tick.fired - tick.scheduled > 500);
 		expect(late).toEqual([]);
 		expect(ticks.length).toBeGreaterThan(20);
 	}, 30_000);
