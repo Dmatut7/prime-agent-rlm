@@ -2707,7 +2707,16 @@ export class SessionManager {
 		customInstructions?: string,
 		options?: { leafId?: string; usage?: Usage },
 	): string {
-		const targetLeaf = options?.leafId ?? this.leafId;
+		let targetLeaf = options?.leafId ?? this.leafId;
+		// Late child usage advances the leaf without changing the model context.
+		// Keep those records and the summary on the current branch.
+		let cursor = this.leafId;
+		while (cursor !== null && cursor !== targetLeaf) {
+			const entry = this.byId.get(cursor);
+			if (entry?.type !== "child_usage_attributed") break;
+			cursor = entry.parentId;
+		}
+		if (cursor === targetLeaf) targetLeaf = this.leafId;
 		const entry: CompactionEntry<T> = {
 			type: "compaction",
 			id: generateId(this.byId),

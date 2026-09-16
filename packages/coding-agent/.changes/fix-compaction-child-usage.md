@@ -1,0 +1,1 @@
+- Fixed compaction summaries being left off the active branch when child usage records arrive during summarization (Dmatut7/prime-agent-rlm#19).
