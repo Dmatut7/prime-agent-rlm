@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { createConnection, type Socket } from "node:net";
 import { join, resolve } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { APP_NAME, ENV_AGENT_DIR } from "../../../src/config.js";
 import { getProcessStartId } from "../../../src/core/session-lease.js";
 import { DaemonAgentConnection } from "../../../src/modes/agent-connection/daemon-agent-connection.js";
@@ -930,7 +930,10 @@ describe("ENG-4603 worker recovery convergence", () => {
 			await delay(25);
 		}
 		if (!failed) throw new Error("Successor did not retain the failed resident");
-		await delay(750);
+		// Negative window: the failed-worker reaper runs on a 5-minute cadence, so
+		// 1.5s of quiet proves the failed resident is retained, not reaped or
+		// restarted; load can only make the reaper later, never earlier.
+		await delay(1500);
 		expect(readWorkerDescriptor(paths.descriptorDir)).toMatchObject({
 			pid: originalWorkerPid,
 			lifecycle: "failed",
@@ -1061,7 +1064,10 @@ describe("ENG-4603 worker recovery convergence", () => {
 			).toBe(true);
 			if (process.platform === "darwin") {
 				const countAfterAuthentication = readFileSync(psCountPath, "utf8").length;
-				await delay(750);
+				// Negative window: the worker re-validates the supervisor claim every
+				// SUPERVISOR_FENCE_POLL_MS (250ms), and an unchanged owner fingerprint
+				// never shells out to `ps`; 1.5s covers six fence polls of quiet.
+				await delay(1500);
 				expect(readFileSync(psCountPath, "utf8").length).toBe(countAfterAuthentication);
 				const ownerPath = join(workerPaths.registryDir, `${oldOwner.record.generation}.owner`, "owner.json");
 				const ownerRecord = JSON.parse(readFileSync(ownerPath, "utf8")) as { updatedAt: string };
@@ -1069,10 +1075,21 @@ describe("ENG-4603 worker recovery convergence", () => {
 				const updatedOwnerPath = `${ownerPath}.updated`;
 				writeFileSync(updatedOwnerPath, `${JSON.stringify(ownerRecord, null, 2)}\n`);
 				renameSync(updatedOwnerPath, ownerPath);
-				await delay(500);
+				// Positive window, event-driven: the changed owner fingerprint makes the
+				// next fence check re-validate the supervisor identity, which is the `ps`
+				// invocation being counted. FSEvents delivery, the fence poll and the
+				// helper round trip all stretch under load, so poll for the first extra
+				// invocation instead of asserting it inside a fixed 500ms window.
+				await vi.waitFor(
+					() => {
+						expect(readFileSync(psCountPath, "utf8").length).toBeGreaterThan(countAfterAuthentication);
+					},
+					{ timeout: 5000, interval: 50 },
+				);
 				const countAfterOwnerChange = readFileSync(psCountPath, "utf8").length;
-				expect(countAfterOwnerChange).toBeGreaterThan(countAfterAuthentication);
-				await delay(750);
+				// Negative window again: the new fingerprint is now validated, so six
+				// more fence polls of quiet must not re-run the identity check.
+				await delay(1500);
 				expect(readFileSync(psCountPath, "utf8").length).toBe(countAfterOwnerChange);
 			}
 			const commandId = "stale-list";

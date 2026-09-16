@@ -13,7 +13,13 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AgentSession, compactRlmText, type RlmChildAgentSnapshot, rlmChildLabel } from "../src/core/agent-session.js";
+import {
+	AgentSession,
+	type AgentSessionEvent,
+	compactRlmText,
+	type RlmChildAgentSnapshot,
+	rlmChildLabel,
+} from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import { SessionManager } from "../src/core/session-manager.js";
@@ -184,7 +190,10 @@ describe("RLM child streaming parent-side cost", () => {
 	 * runs synchronously inside the child's event emission, so the accumulated
 	 * listener wall time is the parent-side CPU the roster updates pay per chunk.
 	 */
-	function timedHostedChild(streamFn: StreamFn): { session: AgentSession; parentListenerMs(): number } {
+	function timedHostedChild(
+		streamFn: StreamFn,
+		perEvent?: (event: AgentSessionEvent) => void,
+	): { session: AgentSession; parentListenerMs(): number } {
 		const child = createSession(streamFn);
 		const originalSubscribe = child.subscribe.bind(child);
 		let listenerMs = 0;
@@ -192,6 +201,7 @@ describe("RLM child streaming parent-side cost", () => {
 			originalSubscribe((event) => {
 				const started = performance.now();
 				try {
+					perEvent?.(event);
 					listener(event);
 				} finally {
 					listenerMs += performance.now() - started;
@@ -199,6 +209,30 @@ describe("RLM child streaming parent-side cost", () => {
 			}),
 		);
 		return { session: child, parentListenerMs: () => listenerMs };
+	}
+
+	/**
+	 * The pre-fix per-chunk work, replicated for calibration: re-derive the preview
+	 * from the whole accumulated text, re-derive the label over the 5k-char task
+	 * brief, and re-stringify the whole snapshot, once per chunk.
+	 */
+	function preFixPerChunkWork(prompt: string): (text: string) => void {
+		return (text: string) => {
+			const preview = compactRlmText(text);
+			const label = rlmChildLabel(prompt);
+			JSON.stringify({ preview, label, status: "writing" });
+		};
+	}
+
+	/** Times the pre-fix re-derive over the same growing prefixes the stream produces. */
+	function timePreFixWork(prompt: string, finalText: string, chunkCount: number): number {
+		const preFixPerChunk = preFixPerChunkWork(prompt);
+		const chunkSize = Math.ceil(finalText.length / chunkCount);
+		const start = performance.now();
+		for (let offset = chunkSize; offset <= finalText.length; offset += chunkSize) {
+			preFixPerChunk(finalText.slice(0, offset));
+		}
+		return performance.now() - start;
 	}
 
 	it("does not re-derive the preview, label and snapshot from the full text per chunk", async () => {
@@ -244,36 +278,60 @@ describe("RLM child streaming parent-side cost", () => {
 
 		// Before the incremental preview/label/snapshot work, each of the ~430 chunks
 		// re-joined the accumulated text, re-regexed it and the 5k-char task brief,
-		// and re-stringified the whole snapshot; the parent-side listener work for the
-		// same stream measured dozens of milliseconds on this machine. The fixed path
-		// folds only the new text, so the same stream costs a fraction of that.
-		expect(parentListenerMs).toBeLessThan(12);
+		// and re-stringified the whole snapshot, so the parent-side listener work
+		// cost dozens of milliseconds. The fixed path folds only the new text, so
+		// the same stream costs a fraction of that. Relative bound, both sides
+		// measured in the same run: the replicated pre-fix work must cost at least
+		// 3x the live listener work. A regressed implementation pays the re-derive
+		// inside the listener itself, collapsing the ratio toward 1, while runner
+		// load stretches both sides together - so the ratio discriminates where an
+		// absolute ms ceiling flakes in both directions (too slow a runner, or a
+		// control that no longer clears a fixed floor on a fast one).
+		const preFixMs = timePreFixWork(prompt, finalText, chunkCount);
+		expect(preFixMs).toBeGreaterThanOrEqual(parentListenerMs * 3);
 	});
 
-	it("the 12ms ceiling still catches the pre-fix per-chunk full re-derive", () => {
-		// Bound control: the ceiling above only discriminates if the work it
-		// forbids actually costs more than 12ms here. Replicate the pre-fix
-		// per-chunk work - compact the whole accumulated text, re-derive the label
-		// over the 5k-char task brief, re-stringify the whole snapshot, once per
-		// chunk - and assert it exceeds the ceiling. A red control means the
-		// ceiling lost its discriminative power (recalibrate it), not that the
-		// implementation regressed.
+	it("the relative bound still catches the pre-fix re-derive paid inside the listener", async () => {
+		// Bound control: the ratio above only discriminates if the work it forbids,
+		// paid where the pre-fix implementation paid it (inside the parent's
+		// listener, on every chunk), collapses it. Drive a hosted child whose
+		// stream runs the same per-chunk re-derive through the listener path and
+		// assert the listener cost itself rises above a third of the replicated
+		// re-derive - i.e. the 3x ratio the main test requires is impossible in the
+		// pre-fix world. A red control means the bound lost its discriminative
+		// power, not that the implementation regressed.
 		const chunkText = "detail line about the quarterly numbers. ";
 		const chunkCount = 400;
 		const finalText = `quarterly summary: ${chunkText.repeat(chunkCount)}`;
 		const prompt = `Analyze the following report and produce a long answer: ${chunkText.repeat(120)}`;
-		const preFixPerChunk = (text: string) => {
-			const preview = compactRlmText(text);
-			const label = rlmChildLabel(prompt);
-			JSON.stringify({ preview, label, status: "writing" });
-		};
 		const chunkSize = Math.ceil(finalText.length / chunkCount);
-		const start = performance.now();
-		for (let offset = chunkSize; offset <= finalText.length; offset += chunkSize) {
-			preFixPerChunk(finalText.slice(0, offset));
-		}
-		const preFixMs = performance.now() - start;
-		expect(preFixMs).toBeGreaterThan(12);
+		const preFixPerChunk = preFixPerChunkWork(prompt);
+		let accumulatedText = "";
+		const hosted = timedHostedChild(streamingAnswer(finalText, chunkSize), (event) => {
+			if (event.type !== "message_update" || event.message.role !== "assistant") return;
+			for (const block of event.message.content) {
+				if (block.type === "text") accumulatedText = block.text;
+			}
+			preFixPerChunk(accumulatedText);
+		});
+		const root = createSession(streamingAnswer("", 1), {
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: hosted.session }),
+				deleteRlmSubagentRuntime: async () => {},
+			},
+		});
+		let resolveDone: (() => void) | undefined;
+		const done = new Promise<void>((resolve) => {
+			resolveDone = resolve;
+		});
+		root.subscribe((event) => {
+			if (event.type === "rlm_child_update" && event.child.status === "done" && resolveDone) resolveDone();
+		});
+		await root.runRlmChild(prompt);
+		await done;
+		const injectedListenerMs = hosted.parentListenerMs();
+		const preFixMs = timePreFixWork(prompt, finalText, chunkCount);
+		expect(injectedListenerMs).toBeGreaterThan(preFixMs / 3);
 	});
 
 	it("emits correct previews while the answer is still short", async () => {

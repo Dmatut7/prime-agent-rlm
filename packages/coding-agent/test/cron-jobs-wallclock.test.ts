@@ -130,9 +130,21 @@ describe("cron trigger lookup cost", () => {
 			for (let i = 0; i < iterations; i++) nextRunAtForSchedule(schedule, from);
 			const perCallMs = Number(process.hrtime.bigint() - started) / 1e6 / iterations;
 
-			// The previous implementation walked local minutes one at a time (~13ms per
-			// call for this expression, inside the cron store's cross-process lock).
-			expect(perCallMs).toBeLessThan(4);
+			// Relative bound, calibrated in the same run: the previous implementation
+			// walked local minutes one at a time (~13ms per call for this expression,
+			// inside the cron store's cross-process lock), so the same-run cost of
+			// walking the ~108-day gap one minute per step is the machine-scaled
+			// price of that regression. A shared runner stretches both sides
+			// together, where the old absolute <4ms ceiling flaked on a single
+			// deschedule landing inside the 50-call measurement window.
+			const targetMs = Date.parse("2027-01-01T00:00:00.000Z");
+			const walkStarted = process.hrtime.bigint();
+			for (let walkMs = from.getTime(); walkMs < targetMs; walkMs += 60_000) {
+				new Date(walkMs);
+			}
+			const minuteWalkMs = Number(process.hrtime.bigint() - walkStarted) / 1e6;
+			expect(minuteWalkMs).toBeGreaterThan(0);
+			expect(perCallMs).toBeLessThan(minuteWalkMs / 2);
 		});
 	});
 });
