@@ -438,6 +438,38 @@ describe("AgentSession concurrent prompt guard", () => {
 		await activeTurn.catch(() => undefined);
 	});
 
+	it("reports a coalesced heartbeat follow-up instead of silently merging it", async () => {
+		createSession();
+		const activeTurn = session.prompt("active turn");
+		await vi.waitFor(() => expect(session.isStreaming).toBe(true));
+		const now = new Date().toISOString();
+		const job: AgentCronJob = {
+			id: "coalesce-job",
+			status: "active",
+			source: "rlm_heartbeat",
+			deliveryMode: "follow_up",
+			activeSessionId: "active-1",
+			sessionId: session.sessionId,
+			sessionFile: "/tmp/session.jsonl",
+			cwd: tempDir,
+			prompt: "heartbeat prompt",
+			schedule: { kind: "interval", expression: "every 1m", intervalMs: 60_000 },
+			createdAt: now,
+			updatedAt: now,
+			runCount: 0,
+		};
+
+		const first = await session.promptHeartbeat(job, { streamingBehavior: "followUp", source: "rpc" });
+		expect(first?.admitted).toBe(true);
+
+		const second = await session.promptHeartbeat(job, { streamingBehavior: "followUp", source: "rpc" });
+		expect(second?.admitted).toBe(false);
+		expect(second?.coalesced).toBe(true);
+
+		await session.abort();
+		await activeTurn.catch(() => undefined);
+	});
+
 	it("serializes an agent message behind cron admission", async () => {
 		createSession();
 		const now = new Date().toISOString();

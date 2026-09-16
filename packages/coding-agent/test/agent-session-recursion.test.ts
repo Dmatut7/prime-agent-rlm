@@ -366,6 +366,20 @@ describe("AgentSession rlm recursion", () => {
 		expect(createDefaultRlmSubagentSessionName("x".repeat(200), "sub-a1b2c3d4")).toHaveLength(64);
 	});
 
+	it("denies goal.create inside a spawned subagent session (goals are depth-0 only)", async () => {
+		const root = createSession({ maxDepth: 2 });
+		const spawned = await root.runRlmChild("try to seed a self-continuing goal");
+
+		await waitFor(() => root.getRlmChildSession(spawned.rlm_child_id) !== undefined);
+		const child = root.getRlmChildSession(spawned.rlm_child_id);
+		if (!child) throw new Error("Missing spawned child session");
+
+		expect(() => child.handleGoalHostRequest("goal.create", { objective: "loop forever without a budget" })).toThrow(
+			"goals are disabled in this session",
+		);
+		expect(child.goalState.active).toBe(false);
+	});
+
 	it("persists the spawned child's parent edge and derived runtime depth in its header", async () => {
 		const root = createSession({ depth: 2, maxDepth: 4 });
 		const result = await root.runRlmChild("persist my tree position");

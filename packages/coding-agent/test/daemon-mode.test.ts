@@ -26,6 +26,7 @@ import {
 	sessionNameReservationKey,
 } from "../src/core/agent-messages.js";
 import type { AgentObserveController } from "../src/core/agent-observe.js";
+import type { AgentHeartbeatPromptResult } from "../src/core/agent-session.js";
 import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.js";
 import { installAgentTraceUpload } from "../src/core/agent-traces.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
@@ -1318,7 +1319,7 @@ describe("daemon mode helpers", () => {
 				sessionFile: childSessionFile,
 				cwd: tempDir,
 				runtimeKind: "subagent",
-				scheduleText: "every 30s",
+				scheduleText: "every 60s",
 				prompt: "report exactly: hi",
 				now: new Date("2026-01-01T00:00:00.000Z"),
 			});
@@ -4140,7 +4141,7 @@ describe("daemon mode helpers", () => {
 				sessionFile: childSessionFile,
 				cwd: tempDir,
 				runtimeKind: "subagent",
-				scheduleText: "every 30s",
+				scheduleText: "every 60s",
 				prompt: "report exactly: hi",
 				now: new Date("2026-01-01T00:00:00.000Z"),
 			});
@@ -4181,7 +4182,7 @@ describe("daemon mode helpers", () => {
 					sessionFile,
 					cwd: tempDir,
 					runtimeKind: "subagent",
-					scheduleText: "every 30s",
+					scheduleText: "every 60s",
 					prompt: "report exactly: hi",
 				});
 			makeJob(childSessionId, fixture.childSessionFile);
@@ -4239,7 +4240,7 @@ describe("daemon mode helpers", () => {
 				sessionFile: fixture.childSessionFile,
 				cwd: tempDir,
 				runtimeKind: "subagent",
-				scheduleText: "every 30s",
+				scheduleText: "every 60s",
 				prompt: "report exactly: hi",
 				now: new Date("2026-01-01T00:00:00.000Z"),
 			});
@@ -4311,7 +4312,7 @@ describe("daemon mode helpers", () => {
 				sessionFile,
 				cwd: tempDir,
 				runtimeKind: "subagent",
-				scheduleText: "every 30s",
+				scheduleText: "every 60s",
 				prompt: "report exactly: hi",
 				now: new Date("2026-01-01T00:00:00.000Z"),
 			});
@@ -4367,7 +4368,7 @@ describe("daemon mode helpers", () => {
 				sessionFile: fixture.childSessionFile,
 				cwd: tempDir,
 				runtimeKind: "subagent",
-				scheduleText: "every 30s",
+				scheduleText: "every 60s",
 				prompt: "report exactly: hi",
 				now: new Date("2026-01-01T00:00:00.000Z"),
 			});
@@ -4443,7 +4444,7 @@ describe("daemon mode helpers", () => {
 				sessionFile: childSessionFile,
 				cwd: tempDir,
 				runtimeKind: "subagent",
-				scheduleText: "every 30s",
+				scheduleText: "every 60s",
 				prompt: "report exactly: hi",
 				now: new Date("2026-01-01T00:00:00.000Z"),
 			});
@@ -5500,7 +5501,7 @@ describe("daemon mode helpers", () => {
 				sessionFile: fixture.childSessionFile,
 				cwd: tempDir,
 				runtimeKind: "subagent",
-				scheduleText: "every 30s",
+				scheduleText: "every 60s",
 				prompt: "must not run",
 				now: new Date("2026-01-01T00:00:00.000Z"),
 			});
@@ -5581,7 +5582,7 @@ describe("daemon mode helpers", () => {
 				sessionFile: fixture.childSessionFile,
 				cwd: tempDir,
 				runtimeKind: "subagent",
-				scheduleText: "every 30s",
+				scheduleText: "every 60s",
 				prompt: "must not run",
 				now: new Date("2026-01-01T00:00:00.000Z"),
 			});
@@ -8266,6 +8267,22 @@ describe("daemon mode helpers", () => {
 		expect(fixture.followUp).not.toHaveBeenCalled();
 	});
 
+	it("records a coalesced or rejected heartbeat prompt as skipped instead of ran", async () => {
+		const fixture = makeCronAdmissionFixture();
+		fixture.promptHeartbeat.mockResolvedValueOnce({ admitted: false, coalesced: true });
+
+		const result = await fixture.runCronJob(
+			makeCronJob({
+				id: "heartbeat-1",
+				source: "rlm_heartbeat",
+				deliveryMode: "follow_up",
+				activeSessionId: fixture.activeSessionId,
+			}),
+		);
+
+		expect(result).toBe("skipped");
+	});
+
 	it("clears prompt admission registered before unauthenticated worker rejection", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-worker-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
@@ -9224,7 +9241,7 @@ function makeCronAdmissionFixture(
 		async (
 			_job: AgentCronJob,
 			_options?: { streamingBehavior?: "steer" | "followUp"; followUpQueueKey?: string; source?: string },
-		) => {},
+		): Promise<AgentHeartbeatPromptResult> => ({ admitted: true, coalesced: false }),
 	);
 	const followUp = vi.fn(async () => true);
 	const removeQueuedFollowUp = vi.fn(() => true);

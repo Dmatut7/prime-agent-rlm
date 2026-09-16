@@ -256,6 +256,33 @@ describe("AgentSession goals", () => {
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
+	// G1 (r37 hbgoal-ts): a budget-less goal must stop after a fixed continuation
+	// budget instead of opening unbounded new turns.
+	it("stops goal continuation at the continuation budget with a visible stop reason", async () => {
+		const harness = await createGoalHarness();
+		harness.setResponses([
+			fauxAssistantMessage("step one, not done"),
+			fauxAssistantMessage("step two, not done"),
+			fauxAssistantMessage("step three, not done"),
+			fauxAssistantMessage("step four, not done"),
+			fauxAssistantMessage("step five, not done"),
+			fauxAssistantMessage("step six, not done"),
+			fauxAssistantMessage("step seven, not done"),
+		]);
+
+		await harness.session.prompt("/goal keep working without completing");
+
+		// One initial turn plus at most three automatic continuations.
+		expect(visibleAssistantTexts(harness)).toHaveLength(4);
+		expect(harness.getPendingResponseCount()).toBe(3);
+		expect(harness.session.goalState).toMatchObject({
+			active: false,
+			status: "budget_limited",
+			continuationsUsed: 3,
+		});
+		expect(harness.session.goalState.lastReason).toContain("goal continuation budget exhausted");
+	});
+
 	it("counts tokens from the goal completion turn", async () => {
 		const harness = await createGoalHarness();
 		harness.setResponses([
@@ -939,6 +966,41 @@ describe("AgentSession goals", () => {
 		).toEqual(["session_slash_command", "session_slash_command_result"]);
 		expect(harness.eventsOfType("goal_update").at(-1)?.goal.status).toBe("idle");
 		expect(harness.getPendingResponseCount()).toBe(1);
+	});
+
+	// G2 (r37 hbgoal-ts): a goal persisted by an older build must not dangle active in a
+	// subagent session that can no longer pursue goals.
+	it("terminates a persisted active goal when goals are disabled for a subagent session", async () => {
+		const harness = await createGoalHarness([], { persistSession: true });
+		harness.session.handleGoalHostRequest("goal.create", { objective: "legacy child goal" });
+		const sessionFile = harness.sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Missing persisted session file");
+
+		const newSessionManager = SessionManager.open(sessionFile);
+		const model = harness.getModel();
+		const newAuth = AuthStorage.inMemory();
+		newAuth.setRuntimeApiKey(model.provider, "faux-key");
+		const newAgent = new Agent({
+			getApiKey: () => "faux-key",
+			initialState: { model, systemPrompt: "You are a test assistant.", tools: [] },
+		});
+		const child = new AgentSession({
+			agent: newAgent,
+			sessionManager: newSessionManager,
+			settingsManager: SettingsManager.inMemory(),
+			cwd: harness.tempDir,
+			modelRegistry: ModelRegistry.inMemory(newAuth),
+			resourceLoader: createTestResourceLoader(),
+			rlmDepth: 1,
+			includeGoals: false,
+		});
+
+		try {
+			expect(child.goalState.status).toBe("error");
+			expect(child.goalState.lastError).toContain("disabled");
+		} finally {
+			child.dispose();
+		}
 	});
 });
 

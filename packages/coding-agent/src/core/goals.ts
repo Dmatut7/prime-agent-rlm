@@ -1,6 +1,13 @@
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { CustomMessage } from "./messages.js";
 
+/**
+ * Hard cap on automatic goal continuations for a single goal, matching the
+ * autonomous default maxContinuations. Without it, a budget-less goal that the
+ * model never completes would open unbounded new turns.
+ */
+export const MAX_GOAL_CONTINUATIONS = 3;
+
 export const GOAL_STATE_CUSTOM_TYPE = "thread_goal_state";
 export const GOAL_CONTEXT_CUSTOM_TYPE = "goal_context";
 export const GOAL_CONTEXT_PREVIEW_LABEL = "Goal context";

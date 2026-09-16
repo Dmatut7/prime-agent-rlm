@@ -2004,12 +2004,18 @@ export class AgentDaemon {
 		};
 		try {
 			if (isHeartbeatCronJob(current)) {
-				await session.promptHeartbeat(current, {
+				const promptResult = await session.promptHeartbeat(current, {
 					streamingBehavior: resolveHeartbeatStreamingBehavior(current.deliveryMode),
 					followUpQueueKey: `heartbeat:${current.id}`,
 					source: "rpc",
 					admissionCommitted,
 				});
+				// G5 (r37 hbgoal-ts): a coalesced or rejected follow-up delivered no new
+				// action; a skipped dispatch keeps runCount and lastRunAt honest instead
+				// of recording a run that never happened.
+				if (promptResult && !promptResult.admitted) {
+					return "skipped";
+				}
 				return;
 			}
 			await session.promptUntilAccepted(current.prompt, {

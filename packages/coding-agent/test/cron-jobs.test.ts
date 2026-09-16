@@ -517,6 +517,65 @@ describe("AgentCronJobStore", () => {
 		expect(deleted).toMatchObject({ id: heartbeat.id, status: "cancelled" });
 	});
 
+	it("caps rlm_heartbeats per session and frees the slot on delete", () => {
+		const store = new AgentCronJobStore(makeStorePath(tempDirs));
+		const input = (label: string) => ({
+			activeSessionId: "active-cap",
+			sessionId: "session-cap",
+			sessionFile: "/tmp/session.jsonl",
+			cwd: "/tmp/project",
+			label,
+			scheduleText: "every 5m",
+			prompt: "keep working",
+			now: start,
+		});
+		const created: AgentCronJob[] = [];
+		for (let index = 0; index < 8; index++) {
+			created.push(store.createRlmHeartbeat(input(`heartbeat-${index}`)));
+		}
+		expect(created).toHaveLength(8);
+
+		expect(() => store.createRlmHeartbeat(input("heartbeat-9"))).toThrow(/at most 8/);
+
+		// A paused heartbeat still holds a slot.
+		store.updateRlmHeartbeat("active-cap", created[7].id, { status: "pause", now: start });
+		expect(() => store.createRlmHeartbeat(input("heartbeat-9-paused"))).toThrow(/at most 8/);
+
+		store.deleteRlmHeartbeat("active-cap", created[7].id, new Date(start.getTime() + 60_000));
+		expect(store.createRlmHeartbeat(input("heartbeat-after-delete")).status).toBe("active");
+
+		// The cap is per session, not global.
+		expect(store.createRlmHeartbeat({ ...input("other-session"), activeSessionId: "active-other" }).status).toBe(
+			"active",
+		);
+	});
+
+	it("rejects rlm_heartbeat intervals below 60 seconds on create and update", () => {
+		const store = new AgentCronJobStore(makeStorePath(tempDirs));
+		const base = {
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: "/tmp/session.jsonl",
+			cwd: "/tmp/project",
+			prompt: "check tests",
+			now: start,
+		};
+
+		expect(() => store.createRlmHeartbeat({ ...base, scheduleText: "every 30s" })).toThrow(
+			"RLM heartbeat interval must be at least 60 seconds",
+		);
+
+		const heartbeat = store.createRlmHeartbeat({ ...base, scheduleText: "every 60s" });
+		expect(heartbeat.schedule).toMatchObject({ kind: "interval", intervalMs: 60_000 });
+
+		expect(() =>
+			store.updateRlmHeartbeat("active-1", heartbeat.id, { scheduleText: "every 45s", now: start }),
+		).toThrow("RLM heartbeat interval must be at least 60 seconds");
+
+		// The user-level /heartbeat keeps its lower floor.
+		expect(store.createHeartbeat({ ...base, scheduleText: "every 30s" }).status).toBe("active");
+	});
+
 	it("counts only the legacy jobs a migration actually stored", () => {
 		const root = makeTempDir(tempDirs);
 		const artifactDir = join(root, "session-artifacts", "session-1");
@@ -867,7 +926,7 @@ describe("AgentCronJobStore", () => {
 			sessionFile: "/tmp/session-rlm.jsonl",
 			cwd: "/tmp/project",
 			label: "tests",
-			scheduleText: "every 30s",
+			scheduleText: "every 60s",
 			prompt: "rerun focused tests",
 			now: start,
 		});
@@ -902,7 +961,7 @@ describe("AgentCronJobStore", () => {
 			cwd: "/tmp/project",
 			runtimeKind: "subagent",
 			label: "active",
-			scheduleText: "every 30s",
+			scheduleText: "every 60s",
 			prompt: "continue active work",
 			now: start,
 		});
@@ -1007,7 +1066,7 @@ describe("AgentCronJobStore", () => {
 			sessionFile: "/tmp/session-rlm.jsonl",
 			cwd: "/tmp/project",
 			label: "tests",
-			scheduleText: "every 30s",
+			scheduleText: "every 60s",
 			prompt: "rerun focused tests",
 			now: start,
 		});
@@ -1043,7 +1102,7 @@ describe("AgentCronJobStore", () => {
 			sessionFile: "/tmp/session-rlm.jsonl",
 			cwd: "/tmp/project",
 			label: "tests",
-			scheduleText: "every 30s",
+			scheduleText: "every 60s",
 			prompt: "rerun focused tests",
 			now: start,
 		});
@@ -1504,7 +1563,7 @@ describe("AgentCronScheduler", () => {
 			sessionFile: "/tmp/session-rlm.jsonl",
 			cwd: "/tmp/project",
 			label: "delete-before-fire",
-			scheduleText: "every 30s",
+			scheduleText: "every 60s",
 			prompt: "this should never run",
 			now: start,
 		});

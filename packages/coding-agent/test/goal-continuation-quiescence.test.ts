@@ -11,6 +11,7 @@ type Harness = {
 	_hasUnsettledRlmQuiescenceWork: () => boolean;
 	_stopGoalContinuationForTerminalMessage: () => boolean;
 	_ensureGoalRuntimeActive: () => void;
+	_goalContinuationBudgetExhausted: () => boolean;
 	_setGoalState: (goal: unknown) => void;
 	_createPreparedTurnAction: ReturnType<typeof vi.fn>;
 	_admitSessionInput: ReturnType<typeof vi.fn>;
@@ -35,6 +36,7 @@ function harness(overrides: Partial<Harness> = {}): Harness {
 		_hasUnsettledRlmQuiescenceWork: () => false,
 		_stopGoalContinuationForTerminalMessage: () => false,
 		_ensureGoalRuntimeActive: () => {},
+		_goalContinuationBudgetExhausted: () => false,
 		_setGoalState: function (this: Harness, goal: unknown) {
 			this._goalState = goal as Harness["_goalState"];
 		},
