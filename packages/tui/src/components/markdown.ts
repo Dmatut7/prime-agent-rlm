@@ -7,7 +7,7 @@ import {
 	markTableStart,
 	type TableCellSelectionRegion,
 } from "../selection-metadata.js";
-import { getCapabilities, hyperlink, isImageLine } from "../terminal-image.js";
+import { getCapabilities, getCapabilitiesVersion, hyperlink, isImageLine } from "../terminal-image.js";
 import type { Component } from "../tui.js";
 import { applyBackgroundToLine, stripAnsi, visibleWidth, wrapTextWithAnsi } from "../utils.js";
 
@@ -280,11 +280,14 @@ export class Markdown implements Component {
 	private cachedText?: string;
 	private cachedWidth?: number;
 	private cachedLines?: string[];
+	/** Capabilities version the cached lines were rendered under (F2). */
+	private cachedCapsVersion?: number;
 	private selectionRegions: TableCellSelectionRegion[] = [];
 	private tableIdentities: object[] = [];
 	// Per-block render cache so streaming appends only re-render the changing
-	// final block instead of the whole document. Keyed by width/type/nextType/raw;
-	// rebuilt each render so it stays bounded to the current document's blocks.
+	// final block instead of the whole document. Keyed by capabilities
+	// version/width/type/nextType/raw; rebuilt each render so it stays bounded to
+	// the current document's blocks.
 	private blockCache = new Map<string, string[]>();
 	// Block-token lex cache; see LexCache. Survives setText (streaming) and
 	// invalidate() (tokens do not depend on the theme), but is only reused when
@@ -358,7 +361,16 @@ export class Markdown implements Component {
 	}
 
 	render(width: number): string[] {
-		if (this.cachedLines && this.cachedText === this.text && this.cachedWidth === width) {
+		// The whole-result cache must also die on a capability flip: the cached
+		// lines were rendered under an older capabilities version, and a flip
+		// (e.g. hyperlinks turning on) changes the output for the same text.
+		const capsVersion = getCapabilitiesVersion();
+		if (
+			this.cachedLines &&
+			this.cachedText === this.text &&
+			this.cachedWidth === width &&
+			this.cachedCapsVersion === capsVersion
+		) {
 			return this.cachedLines;
 		}
 
@@ -370,6 +382,7 @@ export class Markdown implements Component {
 			this.selectionRegions = [];
 			this.cachedText = this.text;
 			this.cachedWidth = width;
+			this.cachedCapsVersion = capsVersion;
 			this.cachedLines = result;
 			return result;
 		}
@@ -398,7 +411,9 @@ export class Markdown implements Component {
 			const token = tokens[i];
 			const nextTokenType = tokens[i + 1]?.type;
 			const useCache = cacheable && i < tokens.length - 1;
-			const key = useCache ? `${width}|${token.type}|${nextTokenType ?? ""}|${token.raw}` : "";
+			// capabilitiesVersion keys the block cache too: the same raw block
+			// renders differently before/after a capability flip (F2).
+			const key = useCache ? `${capsVersion}|${width}|${token.type}|${nextTokenType ?? ""}|${token.raw}` : "";
 			let blockLines = useCache ? (nextCache.get(key) ?? this.blockCache.get(key)) : undefined;
 			if (!blockLines) {
 				blockLines = this.renderBlock(token, nextTokenType, width, contentWidth);
@@ -427,6 +442,7 @@ export class Markdown implements Component {
 
 		this.cachedText = this.text;
 		this.cachedWidth = width;
+		this.cachedCapsVersion = capsVersion;
 		this.cachedLines = result;
 
 		return result.length > 0 ? result : [""];

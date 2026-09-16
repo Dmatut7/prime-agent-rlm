@@ -28,6 +28,18 @@ export interface ImageRenderOptions {
 
 let cachedCapabilities: TerminalCapabilities | null = null;
 
+/**
+ * Monotonic counter bumped whenever the cached capabilities are replaced or
+ * cleared. Renderers that memoize capability-dependent output (Markdown's
+ * whole-result and per-block caches) compare this instead of hashing the caps
+ * object, so any capability dimension added later is covered by the same check.
+ */
+let capabilitiesVersion = 0;
+
+export function getCapabilitiesVersion(): number {
+	return capabilitiesVersion;
+}
+
 // Default cell dimensions - updated by TUI when terminal responds to query
 let cellDimensions: CellDimensions = { widthPx: 9, heightPx: 18 };
 
@@ -110,11 +122,13 @@ export function getCapabilities(): TerminalCapabilities {
 
 export function resetCapabilitiesCache(): void {
 	cachedCapabilities = null;
+	capabilitiesVersion++;
 }
 
 /** Override the cached capabilities. Useful in tests to exercise both code paths. */
 export function setCapabilities(caps: TerminalCapabilities): void {
 	cachedCapabilities = caps;
+	capabilitiesVersion++;
 }
 
 const KITTY_PREFIX = "\x1b_G";
