@@ -1,6 +1,11 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { completeSimple, getLogger } from "@earendil-works/pi-ai";
+import {
+	adjustMaxTokensForThinking,
+	completeSimple,
+	getLogger,
+	modelCannotDisableThinking,
+} from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "../../core/model-registry.js";
 import type { AgentStatus, AgentTaskState } from "../../core/session-manager.js";
 import { mapConcurrent } from "../../utils/map-concurrent.js";
@@ -36,6 +41,49 @@ const SUMMARY_CONTEXT_MESSAGES = 8;
 const SUMMARY_MAX_CHARS_PER_MESSAGE = 600;
 // Generous so a chatty model still closes the tags before truncation.
 const SUMMARY_MAX_TOKENS = 400;
+/**
+ * Ceiling for the thinking reserve on this path: a model that cannot disable thinking
+ * (thinkingLevelMap.off === null) spends part of maxTokens on reasoning it cannot be told
+ * to skip, and 400 is not enough - measured on glm-5.3 with this exact prompt shape, 400
+ * and 512 both end in finish=length with the closing tag cut off, which makes
+ * parseAgentStatusResponse return undefined: the status line silently dies with no error
+ * left in the log. 768 was the first cap that closed the tags, and 1024..2048 all parse
+ * while the model actually spends only ~214..264 tokens, so a larger cap buys worst-case
+ * latency on a 25s sweep and nothing else. Do not lower this to 512; it truncates too.
+ */
+const SUMMARY_MAX_TOKENS_WITH_THINKING_CAP = 2_048;
+/** Sizing level only: never sent to the wire, never changes whether the model thinks. */
+const THINKING_RESERVE_LEVEL = "medium" as const;
+const warnedThinkingReserveTruncations = new Set<string>();
+
+/**
+ * Output budget for one status call. Models that can disable thinking keep the base budget
+ * unchanged; model.maxTokens stays the hard ceiling, and a ceiling that eats the reserve is
+ * warned about once because it degrades this path into a silent truncation.
+ */
+export function agentStatusMaxTokens(model: Model<Api>): number {
+	if (!modelCannotDisableThinking(model)) return SUMMARY_MAX_TOKENS;
+	const adjusted = adjustMaxTokensForThinking(SUMMARY_MAX_TOKENS, model.maxTokens, THINKING_RESERVE_LEVEL);
+	// Uncapped twin of the same call: a larger result means model.maxTokens ate the reserve.
+	const wanted = adjustMaxTokensForThinking(
+		SUMMARY_MAX_TOKENS,
+		Number.MAX_SAFE_INTEGER,
+		THINKING_RESERVE_LEVEL,
+	).maxTokens;
+	if (adjusted.maxTokens < wanted) {
+		const key = `agent-status:${model.provider}/${model.id}`;
+		if (!warnedThinkingReserveTruncations.has(key)) {
+			warnedThinkingReserveTruncations.add(key);
+			structuredLog.warn("thinking reserve truncated by model maxTokens", {
+				model: key,
+				baseMaxTokens: SUMMARY_MAX_TOKENS,
+				maxTokens: adjusted.maxTokens,
+				wantedMaxTokens: wanted,
+			});
+		}
+	}
+	return Math.min(adjusted.maxTokens, SUMMARY_MAX_TOKENS_WITH_THINKING_CAP);
+}
 
 export const AGENT_STATUS_SYSTEM_PROMPT = `You generate a status line for an AI coding agent dashboard. You are given the recent conversation between a user and the agent, plus whether the agent is currently working or idle.
 
@@ -194,7 +242,7 @@ export async function generateAgentStatus(params: GenerateAgentStatusParams): Pr
 					},
 				],
 			},
-			{ maxTokens: SUMMARY_MAX_TOKENS, apiKey: auth.apiKey, headers: auth.headers, signal },
+			{ maxTokens: agentStatusMaxTokens(model), apiKey: auth.apiKey, headers: auth.headers, signal },
 		);
 		if (response.stopReason === "error") {
 			return undefined;

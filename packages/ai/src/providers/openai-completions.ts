@@ -13,7 +13,7 @@ import type {
 import { getAnthropicCacheWriteCost, hasStandardAnthropicCachePricing } from "../cache-pricing.js";
 import { getEnvApiKey, getPrimeTeamId } from "../env-api-keys.js";
 import { getLogger } from "../log.js";
-import { calculateCost, clampThinkingLevel } from "../models.js";
+import { calculateCost, clampThinkingLevel, modelCannotDisableThinking } from "../models.js";
 import type {
 	AssistantMessage,
 	CacheRetention,
@@ -898,17 +898,35 @@ function buildParams(
 		params.tool_choice = options.toolChoice;
 	}
 
+	// The explicit thinking-toggle formats below must not send a disable signal to a model
+	// that cannot disable thinking (thinkingLevelMap.off === null): such an endpoint answers
+	// 400 ("The value of the enable_thinking parameter is restricted to True") and defaults to
+	// thinking on, so the parameter has to be omitted instead. Priority: an explicit level or
+	// reasoningEnabled === true turns thinking on; otherwise a model that can disable thinking
+	// gets the off signal (unchanged behaviour) and a model that cannot gets no parameter at all.
+	// Known limitation, deliberately out of scope: zai/qwen never send reasoning_effort because
+	// the generic else-if below is short-circuited, so the level itself is lost on the wire.
+	const wantThinking = options?.reasoningEffort !== undefined || options?.reasoningEnabled === true;
+	const canSendThinkingToggle = !modelCannotDisableThinking(model);
 	if (compat.thinkingFormat === "zai" && model.reasoning) {
-		(params as any).enable_thinking = !!options?.reasoningEffort;
+		if (wantThinking || canSendThinkingToggle) {
+			(params as any).enable_thinking = wantThinking;
+		}
 	} else if (compat.thinkingFormat === "qwen" && model.reasoning) {
-		(params as any).enable_thinking = !!options?.reasoningEffort;
+		if (wantThinking || canSendThinkingToggle) {
+			(params as any).enable_thinking = wantThinking;
+		}
 	} else if (compat.thinkingFormat === "qwen-chat-template" && model.reasoning) {
-		(params as any).chat_template_kwargs = {
-			enable_thinking: !!options?.reasoningEffort,
-			preserve_thinking: true,
-		};
+		// preserve_thinking is a replay flag rather than a toggle, so it survives the omit case.
+		(params as any).chat_template_kwargs =
+			wantThinking || canSendThinkingToggle
+				? { enable_thinking: wantThinking, preserve_thinking: true }
+				: { preserve_thinking: true };
 	} else if (compat.thinkingFormat === "deepseek" && model.reasoning) {
-		(params as any).thinking = { type: options?.reasoningEffort ? "enabled" : "disabled" };
+		if (wantThinking || canSendThinkingToggle) {
+			(params as any).thinking = { type: wantThinking ? "enabled" : "disabled" };
+		}
+		// Thinking on is both halves: the toggle above plus this effort mapping.
 		if (options?.reasoningEffort) {
 			(params as any).reasoning_effort =
 				model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort;

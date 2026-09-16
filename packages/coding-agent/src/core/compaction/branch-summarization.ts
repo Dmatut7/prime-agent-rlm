@@ -7,7 +7,12 @@
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Model, Usage } from "@earendil-works/pi-ai";
-import { completeSimple } from "@earendil-works/pi-ai";
+import {
+	adjustMaxTokensForThinking,
+	completeSimple,
+	getLogger,
+	modelCannotDisableThinking,
+} from "@earendil-works/pi-ai";
 import {
 	convertToLlm,
 	createBranchSummaryMessage,
@@ -250,6 +255,48 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.`;
 
+/** Base output budget for one branch summary; measured thinking use on this path is ~200 tokens. */
+const BRANCH_SUMMARY_MAX_TOKENS = 2_048;
+/**
+ * Ceiling for the thinking reserve on this path. The reserve exists because a model that
+ * cannot disable thinking (thinkingLevelMap.off === null) spends part of maxTokens on
+ * reasoning the caller cannot suppress, and a truncated summary is silently worse than a
+ * short one. The cap is per path rather than a flat +8192 because measured thinking use
+ * differs by an order of magnitude between paths (branch ~200, status ~390, review ~2700);
+ * model.maxTokens remains the hard ceiling. A model that can disable thinking keeps the
+ * base budget unchanged.
+ */
+const BRANCH_SUMMARY_MAX_TOKENS_WITH_THINKING_CAP = 4_096;
+/** Sizing level only: never sent to the wire, never changes whether the model thinks. */
+const THINKING_RESERVE_LEVEL = "medium" as const;
+const branchSummaryLog = getLogger("coding-agent.compaction.branch-summary");
+const warnedThinkingReserveTruncations = new Set<string>();
+
+export function branchSummaryMaxTokens(model: Model<any>): number {
+	if (!modelCannotDisableThinking(model)) return BRANCH_SUMMARY_MAX_TOKENS;
+	const adjusted = adjustMaxTokensForThinking(BRANCH_SUMMARY_MAX_TOKENS, model.maxTokens, THINKING_RESERVE_LEVEL);
+	// Uncapped twin of the same call: a larger result means model.maxTokens ate the reserve,
+	// which would degrade this path into a silent truncation instead of a loud failure.
+	const wanted = adjustMaxTokensForThinking(
+		BRANCH_SUMMARY_MAX_TOKENS,
+		Number.MAX_SAFE_INTEGER,
+		THINKING_RESERVE_LEVEL,
+	).maxTokens;
+	if (adjusted.maxTokens < wanted) {
+		const key = `branch-summary:${model.provider}/${model.id}`;
+		if (!warnedThinkingReserveTruncations.has(key)) {
+			warnedThinkingReserveTruncations.add(key);
+			branchSummaryLog.warn("thinking reserve truncated by model maxTokens", {
+				model: key,
+				baseMaxTokens: BRANCH_SUMMARY_MAX_TOKENS,
+				maxTokens: adjusted.maxTokens,
+				wantedMaxTokens: wanted,
+			});
+		}
+	}
+	return Math.min(adjusted.maxTokens, BRANCH_SUMMARY_MAX_TOKENS_WITH_THINKING_CAP);
+}
+
 /**
  * Generate a summary of abandoned branch entries.
  *
@@ -319,7 +366,7 @@ export async function generateBranchSummary(
 	const response = await completeSimple(
 		model,
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		{ apiKey, headers, signal, maxTokens: 2048 },
+		{ apiKey, headers, signal, maxTokens: branchSummaryMaxTokens(model) },
 	);
 	if (response.stopReason === "aborted") {
 		return { aborted: true };

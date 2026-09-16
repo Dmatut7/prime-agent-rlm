@@ -3,7 +3,12 @@ import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { join, parse, resolve } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
-import { completeSimple } from "@earendil-works/pi-ai";
+import {
+	adjustMaxTokensForThinking,
+	completeSimple,
+	getLogger,
+	modelCannotDisableThinking,
+} from "@earendil-works/pi-ai";
 import { getAgentDir } from "../../config.js";
 import { appendPrivateFile, readPrivateFile, writePrivateFileAtomic } from "../../utils/private-files.js";
 import { serializeConversation } from "../compaction/utils.js";
@@ -223,12 +228,56 @@ const AUTO_REFINE_REVIEW_MAX_OUTPUT_TOKENS = 4_096;
 const TRUNCATED_JSON_ERROR =
 	"the model stopped before completing its JSON object. This usually means the output budget was exhausted; retry with a smaller request.";
 
-function refinementMaxOutputTokens(model: Model<any>): number {
-	return Math.min(model.maxTokens, REFINEMENT_MAX_OUTPUT_TOKENS);
+const refinementLog = getLogger("coding-agent.refinement.budget");
+
+/**
+ * Budget level used only to size the thinking reserve below. It never reaches the wire
+ * and never changes whether the model thinks. It must stay a real level: the default
+ * budget table has no "off" key, and passing "off" silently yields NaN maxTokens.
+ */
+const THINKING_RESERVE_LEVEL = "medium" as const;
+const warnedThinkingReserveTruncations = new Set<string>();
+
+/**
+ * A model that cannot disable thinking spends part of maxTokens on reasoning this caller
+ * cannot suppress, and both refinement paths fail hard on a truncated reply
+ * (stopReason "length"). Reserve thinking room for exactly those models; a model that can
+ * disable thinking keeps its base budget unchanged, byte for byte.
+ *
+ * model.maxTokens stays the hard ceiling. When it eats the reserve the path degrades into
+ * a silent truncation failure later instead of a loud one now, so leave one warn per model.
+ */
+function withThinkingReserve(site: string, baseMaxTokens: number, model: Model<any>): number {
+	if (!modelCannotDisableThinking(model)) return baseMaxTokens;
+	const adjusted = adjustMaxTokensForThinking(baseMaxTokens, model.maxTokens, THINKING_RESERVE_LEVEL);
+	// Uncapped twin of the same call: a smaller result above means model.maxTokens truncated it.
+	const wanted = adjustMaxTokensForThinking(baseMaxTokens, Number.MAX_SAFE_INTEGER, THINKING_RESERVE_LEVEL).maxTokens;
+	if (adjusted.maxTokens < wanted) {
+		const key = `${site}:${model.provider}/${model.id}`;
+		if (!warnedThinkingReserveTruncations.has(key)) {
+			warnedThinkingReserveTruncations.add(key);
+			refinementLog.warn("thinking reserve truncated by model maxTokens", {
+				site,
+				model: key,
+				baseMaxTokens,
+				maxTokens: adjusted.maxTokens,
+				wantedMaxTokens: wanted,
+			});
+		}
+	}
+	return adjusted.maxTokens;
 }
 
-function autoRefineReviewMaxOutputTokens(model: Model<any>): number {
-	return Math.min(model.maxTokens, AUTO_REFINE_REVIEW_MAX_OUTPUT_TOKENS);
+export function refinementMaxOutputTokens(model: Model<any>): number {
+	return withThinkingReserve("refinement", Math.min(model.maxTokens, REFINEMENT_MAX_OUTPUT_TOKENS), model);
+}
+
+export function autoRefineReviewMaxOutputTokens(model: Model<any>): number {
+	return withThinkingReserve(
+		"auto-refine-review",
+		Math.min(model.maxTokens, AUTO_REFINE_REVIEW_MAX_OUTPUT_TOKENS),
+		model,
+	);
 }
 
 function now(): string {

@@ -21,6 +21,10 @@ export type { OpenAICompletionsOptions } from "./providers/openai-completions.js
 export type { OpenAIResponsesOptions } from "./providers/openai-responses.js";
 export * from "./providers/register-builtins.js";
 export * from "./providers/request-budget.js";
+// Named export on purpose: `export *` would also publish clampReasoning and
+// buildBaseOptions, which are provider-internal mapping helpers. Consumers only
+// need the budget arithmetic to reserve room for thinking they cannot disable.
+export { adjustMaxTokensForThinking } from "./providers/simple-options.js";
 export * from "./session-resources.js";
 export * from "./stream.js";
 export * from "./types.js";

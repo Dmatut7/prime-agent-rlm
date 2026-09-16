@@ -75,6 +75,24 @@ export function getSupportedThinkingLevels<TApi extends Api>(model: Model<TApi>)
 	});
 }
 
+/**
+ * True when a reasoning model cannot turn thinking off, i.e. its capability table
+ * marks `off` as unsupported (`thinkingLevelMap.off === null`). Such endpoints reject
+ * an explicit disable signal - DashScope/Zhipu answer 400 "The value of the
+ * enable_thinking parameter is restricted to True" - so callers must omit the
+ * parameter rather than send it, and must reserve output budget for thinking they
+ * cannot suppress. A missing map counts as "can disable" so models that never
+ * declared the level are not penalised. The `reasoning` conjunct is required:
+ * getSupportedThinkingLevels() returns ["off"] for a non-reasoning model, which
+ * would otherwise read as "needs a thinking reserve".
+ *
+ * Single source of truth shared by the provider layer and the coding-agent budget
+ * call sites; do not fork a second copy of this predicate.
+ */
+export function modelCannotDisableThinking<TApi extends Api>(model: Model<TApi>): boolean {
+	return model.reasoning === true && model.thinkingLevelMap?.off === null;
+}
+
 export function clampThinkingLevel<TApi extends Api>(
 	model: Model<TApi>,
 	level: ModelThinkingLevel,
