@@ -1012,6 +1012,34 @@ def _replayable_snapshot(key: tuple, path: str, manifest_path: str, ns: dict[str
     return record["result"]
 
 
+def _is_open_disk_handle(value: Any) -> bool:
+    """Whether value is an open handle backed by the real filesystem.
+
+    Only those are refused: dill re-opens a real handle by name and mode at load
+    time, so a "w"/"a" handle truncates or appends to the real file before any
+    cell runs. The in-memory streams - BytesIO, StringIO, an un-rolled
+    SpooledTemporaryFile - are serialized by value with content and cursor and
+    revive safely, so evicting them too silently lost working buffers across a
+    restart. SpooledTemporaryFile.fileno() rolls the buffer to disk as a side
+    effect, so the rolled flag is read instead of probing for a descriptor; every
+    other IOBase is classified by its live fileno. A closed or detached handle has
+    no live descriptor either: it stays in the snapshot and the restore-side
+    reopen guard reports it as a per-name failure instead of a silent skip.
+    """
+    if not isinstance(value, io.IOBase):
+        return False
+    if isinstance(value, tempfile.SpooledTemporaryFile) and not getattr(value, "_rolled", False):
+        return False
+    fileno = getattr(value, "fileno", None)
+    if not callable(fileno):
+        return False
+    try:
+        fd = fileno()
+    except Exception:  # noqa: BLE001 - closed, detached, or in-memory: no live descriptor
+        return False
+    return isinstance(fd, int) and fd != -1
+
+
 def _snapshot_state(
     ns: dict[str, Any],
     path: str,
@@ -1074,10 +1102,11 @@ def _snapshot_state(
             seen_out[name] = value
         remaining = max_bytes - total
         limit = max_variable_bytes if prune_oversized else min(max_variable_bytes, remaining)
-        if isinstance(value, io.IOBase):
+        if _is_open_disk_handle(value):
             # Open file handles are not persisted: dill would re-open the file by
             # name and mode on restore, and mode="w"/"a" truncates or appends to the
-            # real file at load time, before any cell runs.
+            # real file at load time, before any cell runs. In-memory streams are
+            # not handles on the real file and survive the narrowed guard.
             skipped.append({"name": name, "reason": "open file handles are not persisted"})
             continue
         cached = blob_cache.get(name) if blob_cache is not None else None
@@ -1343,6 +1372,35 @@ def _is_foreign_code_object(value: Any) -> bool:
     return getattr(loaded, getattr(value, "__name__", ""), None) is not value
 
 
+def _carries_foreign_code(value: Any) -> bool:
+    """Whether value itself, or one level of what it holds, is foreign bytecode.
+
+    The version-mismatch quarantine must hold for containers too: a dict or list
+    holding a by-value function, or an instance of a quarantined class, revives
+    code just as callable as a bare name does, so the whole name is quarantined
+    with the same reason instead of half of it. The scan is one level deep -
+    members are inspected, never descended into - so a self-referential
+    container terminates at its own cap instead of the recursion limit.
+    """
+    if _is_foreign_code_object(value):
+        return True
+    if isinstance(value, dict):
+        members: tuple[Any, ...] = (*value.keys(), *value.values())
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        members = tuple(value)
+    else:
+        # A plain instance: its class (whose methods are the foreign bytecode)
+        # and its own attribute values, one level each.
+        if _is_foreign_code_object(type(value)):
+            return True
+        state = getattr(value, "__dict__", None)
+        members = tuple(state.values()) if isinstance(state, dict) else ()
+    for member in members:
+        if _is_foreign_code_object(member) or _is_foreign_code_object(type(member)):
+            return True
+    return False
+
+
 def _revival_degraded_names(staged: dict[str, Any], ns: dict[str, Any]) -> list[dict[str, str]]:
     """Names dill revived with reduced semantics, so the restore report can say so.
 
@@ -1455,7 +1513,7 @@ def _restore_state(
             except Exception as err:  # noqa: BLE001 - revive every other name regardless
                 failed.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
                 continue
-            if version_mismatch is not None and _is_foreign_code_object(value):
+            if version_mismatch is not None and _carries_foreign_code(value):
                 failed.append({"name": name, "reason": f"{version_mismatch}: functions and classes are not revived"})
                 continue
             staged[name] = value

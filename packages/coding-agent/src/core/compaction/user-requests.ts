@@ -116,14 +116,22 @@ export function clipUserRequest(text: string, maxChars: number): { text: string;
  *
  * An `agent_message` is how a parent's task brief reaches an RLM subagent and how
  * steering notes arrive mid-run; `details.message` is the sender's text verbatim.
- * A heartbeat prompt is the schedule the user authored. Everything else under the
- * custom role is machine output - slash-command bookkeeping, compaction and
- * refinement receipts, child failure notices - and is not the user speaking, so
- * it stays out of the verbatim ledger.
+ * A child's reply is not collected: the sender is a model, so its text is machine
+ * output wearing the user's voice if the ledger takes it in. A heartbeat prompt
+ * is the schedule the user authored. Everything else under the custom role is
+ * machine output - slash-command bookkeeping, compaction and refinement receipts,
+ * child failure notices - and is not the user speaking, so it stays out of the
+ * verbatim ledger.
  */
 function customUserIntentText(message: AgentMessage): { text: string; kind: UserRequestKind } | undefined {
 	if (message.role !== "custom") return undefined;
 	if (message.customType === AGENT_MESSAGE_CUSTOM_TYPE && isAgentSessionMessage(message)) {
+		// A child's reply to this session is model-generated text, not the user's
+		// words: harvesting it would let a failing or compromised subagent plant
+		// instructions in the ledger that the block header then promotes to "the
+		// user's own words" and a live obligation. Only the directions that speak
+		// for the user or the orchestrator belong here.
+		if (message.details.fromRelationship === "child") return undefined;
 		const text = message.details.message;
 		return text.trim() ? { text, kind: "agent_message" } : undefined;
 	}
