@@ -1,0 +1,2 @@
+- Fixed markdown block caching to key on the parsed token object, so streaming text whose raw block text is unchanged but re-parsed (lazy continuations) no longer renders stale lines.
+- Changed markdown per-frame block caching to a token-identity slot array, removing the per-frame cache-key construction that scaled with the whole document.
