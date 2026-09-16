@@ -51,7 +51,22 @@ prime_agent_screen_layout_lab_width=0
 prime_agent_screen_render_lab_width=0
 prime_agent_screen_compact=0
 prime_agent_download_dir=
+prime_agent_force_install=0
+prime_agent_install_lock_dir=
 prime_agent_bootstrap_kernel_on_install=0
+
+# Transport hardening (r36 INSB-1/INSB-4): https-only - a plaintext or redirect-downgraded
+# source cannot serve the tarball or the checksums - plus a hard per-request ceiling so a
+# black-hole mirror cannot hang the install forever. The checksum manifest is still fetched
+# from the release host by default: this fork publishes no second checksum origin, so
+# same-origin checksums remain a documented limitation; PRIME_AGENT_CHECKSUM_BASE_URL lets a
+# deployment host them separately. Loopback-http setups (the release smoke test) opt back
+# into plaintext explicitly with PRIME_AGENT_INSTALLER_ALLOW_INSECURE_TRANSPORT=1.
+prime_agent_curl_transport_flags="--proto =https --proto-redir =https"
+if [ "${PRIME_AGENT_INSTALLER_ALLOW_INSECURE_TRANSPORT:-0}" = 1 ]; then
+	prime_agent_curl_transport_flags=
+fi
+prime_agent_curl_max_time="${PRIME_AGENT_CURL_MAX_TIME:-600}"
 prime_agent_screen_title=
 prime_agent_screen_status=
 prime_agent_screen_detail=
@@ -98,6 +113,15 @@ main() {
 		fi
 	fi
 
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			--force)
+				prime_agent_force_install=1
+				shift
+				;;
+			*) break ;;
+		esac
+	done
 	version="$(resolve_prime_agent_version "$@")"
 	tarball_name="$prime_agent_package-$version.tgz"
 	tarball_url="$prime_agent_base_url/releases/v$version/$tarball_name"
@@ -110,6 +134,7 @@ main() {
 	tarball_path="$download_dir/$tarball_name"
 
 	download_prime_agent_package "$version" "$tarball_url" "$tarball_path"
+	prime_agent_prepare_install "$version"
 	install_prime_agent_package "$tarball_path"
 	rm -rf "$download_dir"
 	prime_agent_download_dir=
@@ -165,6 +190,7 @@ prime_agent_cleanup() {
 	if [ -n "${prime_agent_download_dir:-}" ] && [ -d "$prime_agent_download_dir" ]; then
 		rm -rf "$prime_agent_download_dir"
 	fi
+	prime_agent_release_install_lock
 	prime_agent_restore_terminal
 	return "$status"
 }
@@ -958,7 +984,7 @@ resolve_prime_agent_version() {
 		"Resolving latest release" \
 		"Resolving latest release" \
 		"Checking the $release_channel release channel." \
-		curl -fsSL "$prime_agent_base_url/$release_channel" -o "$channel_path"; then
+		curl -fsSL $prime_agent_curl_transport_flags --max-time "$prime_agent_curl_max_time" "$prime_agent_base_url/$release_channel" -o "$channel_path"; then
 		rm -rf "$channel_dir"
 		printf 'error: could not resolve latest Prime Agent version from %s/%s\n' "$prime_agent_base_url" "$release_channel" >&2
 		exit 1
@@ -1069,9 +1095,11 @@ node_version_string_is_new_enough() {
 	case "$minor" in ''|*[!0-9]*) minor=0 ;; esac
 	case "$patch" in ''|*[!0-9]*) patch=0 ;; esac
 
-	[ "$major" -gt 20 ] && return 0
-	[ "$major" -eq 20 ] && [ "$minor" -gt 6 ] && return 0
-	[ "$major" -eq 20 ] && [ "$minor" -eq 6 ] && [ "$patch" -ge 0 ] && return 0
+	# r36 INSB-4 (F20 partial fix): must match the 22.8.0 preflight gate, or the Linux
+	# package-manager candidates get selected, installed, and then rejected by preflight.
+	[ "$major" -gt 22 ] && return 0
+	[ "$major" -eq 22 ] && [ "$minor" -gt 8 ] && return 0
+	[ "$major" -eq 22 ] && [ "$minor" -eq 8 ] && [ "$patch" -ge 0 ] && return 0
 	return 1
 }
 
@@ -1188,7 +1216,7 @@ install_node_standalone() {
 	mkdir -p "$node_tmp_dir" "$node_base_dir"
 
 	printf 'Resolving Node.js binary for %s-%s\n' "$node_platform" "$node_arch"
-	curl -fsSL "$node_dist_base/SHASUMS256.txt" -o "$node_tmp_dir/SHASUMS256.txt"
+	curl -fsSL $prime_agent_curl_transport_flags --max-time "$prime_agent_curl_max_time" "$node_dist_base/SHASUMS256.txt" -o "$node_tmp_dir/SHASUMS256.txt"
 	node_file=$(awk -v suffix="-$node_platform-$node_arch.tar.xz" '
 		index($2, "node-v") == 1 && length($2) >= length(suffix) && substr($2, length($2) - length(suffix) + 1) == suffix { print $2; exit }
 	' "$node_tmp_dir/SHASUMS256.txt")
@@ -1212,7 +1240,7 @@ install_node_standalone() {
 	esac
 
 	printf 'Downloading Node.js %s\n' "${node_file%.tar.xz}"
-	curl -fsSL "$node_dist_base/$node_file" -o "$node_tmp_dir/$node_file"
+	curl -fsSL $prime_agent_curl_transport_flags --max-time "$prime_agent_curl_max_time" "$node_dist_base/$node_file" -o "$node_tmp_dir/$node_file"
 	verify_node_standalone_download "$node_tmp_dir" "$node_file"
 	ensure_node_standalone_extract_tools "$node_platform"
 
@@ -1457,7 +1485,12 @@ download_prime_agent_package() {
 	tarball_path="$3"
 	download_dir=$(dirname "$tarball_path")
 	tarball_name=$(basename "$tarball_path")
-	checksums_url="$prime_agent_base_url/releases/v$version/SHA256SUMS"
+	# r36 INSB-1: the checksum source can be split from the tarball source so a compromised
+	# release host cannot rewrite the tarball and its checksum together (same-origin remains
+	# the documented default: this fork publishes no second checksum origin).
+	checksums_base="${PRIME_AGENT_CHECKSUM_BASE_URL:-$prime_agent_base_url}"
+	checksums_base="${checksums_base%/}"
+	checksums_url="$checksums_base/releases/v$version/SHA256SUMS"
 	checksums_path="$download_dir/SHA256SUMS"
 
 	if ! command -v curl >/dev/null 2>&1; then
@@ -1469,13 +1502,13 @@ download_prime_agent_package() {
 		"Downloading checksums" \
 		"Downloading release checksums" \
 		"Prime Agent v$version" \
-		curl -fsSL "$checksums_url" -o "$checksums_path"
+		curl -fsSL $prime_agent_curl_transport_flags --max-time "$prime_agent_curl_max_time" "$checksums_url" -o "$checksums_path"
 
 	prime_agent_run_quiet_with_animation \
 		"Downloading Prime Agent" \
 		"Downloading Prime Agent v$version" \
 		"Fetching the verified package." \
-		curl -fsSL "$tarball_url" -o "$tarball_path"
+		curl -fsSL $prime_agent_curl_transport_flags --max-time "$prime_agent_curl_max_time" "$tarball_url" -o "$tarball_path"
 
 	verify_prime_agent_package_checksum "$checksums_path" "$tarball_path"
 }
@@ -1523,6 +1556,106 @@ prime_agent_run_checksum_check() {
 			(cd "$checksum_dir" && shasum -a 256 -c "$selected_checksums_name")
 			;;
 	esac
+}
+
+prime_agent_npm_global_prefix() {
+	npm prefix -g 2>/dev/null || true
+}
+
+# r36 INSB-2: serialize installs into the same npm global prefix. Two concurrent installers
+# used to race inside npm (one EEXIST failure, a final state contradicting both reports); the
+# lock is an atomic mkdir keyed on the prefix npm will install into, with pid liveness and a
+# stale window so a crashed holder cannot wedge every later install.
+prime_agent_acquire_install_lock() {
+	prefix=$(prime_agent_npm_global_prefix)
+	if [ -z "$prefix" ]; then
+		printf 'warning: could not resolve the npm global prefix; continuing without an install lock.\n' >&2
+		return 0
+	fi
+	lock_dir="$prefix/.prime-agent-install.lock"
+	if ! mkdir -p "$prefix" 2>/dev/null; then
+		printf 'warning: npm global prefix %s is not writable; continuing without an install lock.\n' "$prefix" >&2
+		return 0
+	fi
+	lock_timeout_ms="${PRIME_AGENT_INSTALL_LOCK_TIMEOUT_MS:-300000}"
+	case "$lock_timeout_ms" in
+		''|*[!0-9]*) lock_timeout_ms=300000 ;;
+	esac
+	lock_deadline=$(( $(date +%s) + lock_timeout_ms / 1000 + 1 ))
+	while :; do
+		if mkdir "$lock_dir" 2>/dev/null; then
+			printf '%s\n' "$$" >"$lock_dir/pid" 2>/dev/null || true
+			prime_agent_install_lock_dir="$lock_dir"
+			return 0
+		fi
+		holder_pid=$(cat "$lock_dir/pid" 2>/dev/null || true)
+		case "$holder_pid" in
+			''|*[!0-9]*) holder_pid= ;;
+		esac
+		if [ -n "$holder_pid" ] && ! kill -0 "$holder_pid" 2>/dev/null; then
+			rm -rf "$lock_dir"
+			continue
+		fi
+		if [ -z "$holder_pid" ]; then
+			lock_mtime=$(stat -f %m "$lock_dir" 2>/dev/null || stat -c %Y "$lock_dir" 2>/dev/null || printf '%s' "$(date +%s)")
+			case "$lock_mtime" in
+				''|*[!0-9]*) lock_mtime=$(date +%s) ;;
+			esac
+			if [ $(( $(date +%s) - lock_mtime )) -gt 30 ]; then
+				rm -rf "$lock_dir"
+				continue
+			fi
+		fi
+		if [ "$(date +%s)" -ge "$lock_deadline" ]; then
+			printf 'error: another prime-agent install appears to be running (lock %s, held by pid %s).\nWait for it to finish, or remove the lock directory if it is wedged, then re-run this installer.\n' "$lock_dir" "${holder_pid:-unknown}" >&2
+			return 1
+		fi
+		sleep 1
+	done
+}
+
+prime_agent_release_install_lock() {
+	if [ -n "${prime_agent_install_lock_dir:-}" ] && [ -d "${prime_agent_install_lock_dir}" ]; then
+		rm -rf "${prime_agent_install_lock_dir}"
+	fi
+	prime_agent_install_lock_dir=
+}
+
+prime_agent_prepare_install() {
+	prime_agent_acquire_install_lock || exit 1
+	check_existing_installation
+}
+
+# r36 INSB-2: an installer that silently replaced an existing install (including an
+# `npm link` development checkout) left the user running published code they never chose.
+check_existing_installation() {
+	prefix=$(prime_agent_npm_global_prefix)
+	[ -n "$prefix" ] || return 0
+	existing_dir="$prefix/lib/node_modules/$prime_agent_package"
+	if [ ! -e "$existing_dir" ]; then
+		return 0
+	fi
+	if [ -L "$existing_dir" ]; then
+		printf 'warning: %s is a development link into %s.\nRunning this installer replaces that link (and the code it runs) with the published package.\n' "$existing_dir" "$(readlink "$existing_dir")" >&2
+	fi
+	if [ "$prime_agent_force_install" = 1 ]; then
+		printf 'Replacing the existing Prime Agent installation at %s (--force).\n' "$existing_dir" >&2
+		return 0
+	fi
+	if prime_agent_prompt_yes_no \
+		"Reinstall Prime Agent v$version over the existing installation?" \
+		"An installation already exists at $existing_dir." \
+		"Reinstall? [Y/n]"; then
+		return 0
+	else
+		prompt_status=$?
+	fi
+	if [ "$prompt_status" -eq 2 ]; then
+		printf 'error: an existing Prime Agent installation was found at %s and no terminal is available to confirm the reinstall.\nRe-run this installer with --force to overwrite it.\n' "$existing_dir" >&2
+		exit 1
+	fi
+	printf '\nInstallation cancelled; the existing installation at %s was left unchanged.\n' "$existing_dir"
+	exit 0
 }
 
 confirm_install() {

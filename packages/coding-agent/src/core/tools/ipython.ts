@@ -342,6 +342,11 @@ export interface IpythonToolOptions {
 	 */
 	onSnapshotFailure?: (detail: string) => void;
 	/**
+	 * A background prewarm start failed. Without this the failure is invisible until the first
+	 * ipython cell - or forever, when the session never runs python (first-run bootstrap errors).
+	 */
+	onStartupFailure?: (error: Error) => void;
+	/**
 	 * Live kernel restart budget, read at every unexpected exit. Omit for the shipped defaults
 	 * (three revivals per rolling hour, then fail closed).
 	 */
@@ -406,9 +411,15 @@ export class IpythonKernelProvisioner {
 		return this._lastRestore;
 	}
 
-	/** Start the kernel in the background. Failures are swallowed here and surface on the next ensure(). */
+	/**
+	 * Start the kernel in the background. Failures surface on the next ensure(); a first-run
+	 * bootstrap failure is also reported through {@link IpythonToolOptions.onStartupFailure} -
+	 * it used to vanish entirely when the session never ran a python cell (r36 INSB-4/F5).
+	 */
 	prewarm(): void {
-		void this.ensure().catch(() => {});
+		void this.ensure().catch((error: unknown) => {
+			this.options?.onStartupFailure?.(error instanceof Error ? error : new Error(String(error)));
+		});
 	}
 
 	/** Whether a kernel has finished starting and is currently running. */
