@@ -164,7 +164,9 @@ describe("ENG-4519 heartbeat rebirth", () => {
 		const harness = await createHarness({ persistSession: true });
 		harnesses.push(harness);
 		harness.sessionManager.appendSessionState({ status: "active" });
-		const promptHeartbeat = vi.spyOn(harness.session, "promptHeartbeat").mockResolvedValue();
+		const promptHeartbeat = vi
+			.spyOn(harness.session, "promptHeartbeat")
+			.mockResolvedValue({ admitted: true, coalesced: false });
 		const createRuntime = vi.fn<CreateAgentSessionRuntimeFactory>(async ({ cwd, agentDir }) =>
 			runtimeResult(harness, cwd, agentDir),
 		);

@@ -76,6 +76,7 @@ export interface HarnessOptions {
 	persistSession?: boolean;
 	rlmDepth?: number;
 	rlmMaxDepth?: number;
+	includeGoals?: boolean;
 	autonomous?: AgentAutonomousConfig;
 	autoRefineReviewer?: AutoRefineReviewer;
 	serializedRefine?: boolean;
@@ -207,6 +208,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		extensionRunnerRef,
 		rlmDepth: options.rlmDepth,
 		rlmMaxDepth: options.rlmMaxDepth,
+		includeGoals: options.includeGoals,
 		autonomous: options.autonomous,
 		autoRefineReviewer: options.autoRefineReviewer,
 		serializedRefine: options.serializedRefine,

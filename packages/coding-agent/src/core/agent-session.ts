@@ -183,6 +183,7 @@ import {
 	goalHostResponse,
 	goalTokenDeltaForUsage,
 	isPersistedGoalState,
+	MAX_GOAL_CONTINUATIONS,
 	normalizeGoalState,
 	validateGoalBudget,
 	validateGoalObjective,
@@ -2025,6 +2026,14 @@ export class AgentSession {
 			this._pendingNextTurnMessages.push(createGoalContextMessage(this._goalState, "continuation"));
 		}
 		this._restoreLateIpythonSentAgentMessages();
+		if (this._rlmDepth > 0 && !this._includeGoals && this._goalState.status === "active") {
+			// G2 (r37 hbgoal-ts): goals are disabled for subagent sessions, so a goal
+			// persisted by an older build has no continuation path after passivation;
+			// terminate it with a visible reason instead of letting it dangle active.
+			this._finishGoalWithError(
+				"Goals are disabled for this subagent session (goal persisted before it was disabled).",
+			);
+		}
 		if (this._goalState.status === "active") {
 			this._goalAccountingStartedAt = Date.now();
 		}
@@ -2971,6 +2980,10 @@ export class AgentSession {
 		// Keep the deferral while admission is paused or the pump is suspended
 		// (post-abort); the pause release and resumeQueuedWork retry.
 		if (this._sessionInputAdmissionPauses.size > 0 || this._sessionInputPumpSuspended) return;
+		if (this._goalContinuationBudgetExhausted()) {
+			this._goalContinuationAwaitsRlmWork = false;
+			return;
+		}
 		const goalBeforeResume = this._goalState;
 		try {
 			this._ensureGoalRuntimeActive();
@@ -3762,6 +3775,10 @@ export class AgentSession {
 		) {
 			return true;
 		}
+		if (this._goalContinuationBudgetExhausted()) {
+			return false;
+		}
+		const goalBeforeQueue = this._goalState;
 		try {
 			this._ensureGoalRuntimeActive();
 			this._setGoalState({
@@ -3780,6 +3797,10 @@ export class AgentSession {
 			this._queuedGoalThresholdContinuation = goalMessage;
 			return true;
 		} catch {
+			// Admission can race a pause or disposal; roll back the queue-time
+			// increment so the next natural stop re-queues and re-counts it (G4,
+			// r37 hbgoal-ts; mirrors _maybeResumeGoalContinuationAfterRlmWork).
+			this._setGoalState(goalBeforeQueue);
 			return false;
 		}
 	}
@@ -4219,6 +4240,27 @@ export class AgentSession {
 		return this._goalState;
 	}
 
+	/**
+	 * True when the goal has consumed its automatic-continuation budget. Marks the
+	 * goal budget_limited with a visible stop reason the first time the exhausted
+	 * budget is observed, so the stop leaves a durable trace instead of silently
+	 * dangling active (G1, r37 hbgoal-ts).
+	 */
+	private _goalContinuationBudgetExhausted(): boolean {
+		if (this._goalState.status !== "active" || this._goalState.continuationsUsed < MAX_GOAL_CONTINUATIONS) {
+			return false;
+		}
+		const goal = this._goalWithAccountedWallClock();
+		this._setGoalState({
+			...goal,
+			active: false,
+			status: "budget_limited",
+			lastReason: `goal continuation budget exhausted (${goal.continuationsUsed}/${MAX_GOAL_CONTINUATIONS} continuations); the goal stopped to avoid unbounded turns`,
+			lastError: undefined,
+		});
+		return true;
+	}
+
 	private async _getGoalContinuationMessages(
 		context: GetContinuationMessagesContext,
 		signal?: AbortSignal,
@@ -4236,6 +4278,9 @@ export class AgentSession {
 			return [];
 		}
 		this._goalContinuationAwaitsRlmWork = false;
+		if (this._goalContinuationBudgetExhausted()) {
+			return [];
+		}
 		try {
 			this._ensureGoalRuntimeActive(context.context);
 			const nextGoal = {
@@ -6234,9 +6279,9 @@ export class AgentSession {
 		return queued;
 	}
 
-	async promptHeartbeat(job: AgentCronJob, options?: PromptOptions): Promise<void> {
+	async promptHeartbeat(job: AgentCronJob, options?: PromptOptions): Promise<AgentHeartbeatPromptResult> {
 		const message = createHeartbeatPromptMessage(job);
-		await this._promptInjectedMessage(job.prompt, message, {
+		return await this._promptInjectedMessage(job.prompt, message, {
 			...options,
 			followUpQueueKey: options?.followUpQueueKey ?? `heartbeat:${job.id}`,
 			resumeIfIdle: true,
@@ -7081,7 +7126,7 @@ export class AgentSession {
 		text: string,
 		message: CustomMessage,
 		options?: InternalPromptOptions & { executionPolicy?: TurnExecutionPolicy },
-	): Promise<void> {
+	): Promise<AgentHeartbeatPromptResult> {
 		// Never lift the update-restart fence: injected work (heartbeats) must stay
 		// queued for the restart manifest instead of starting a turn during teardown.
 		if (!this.isStreaming && options?.resumeIfIdle && !this._sessionInputSuspendedForUpdateRestart) {
@@ -7133,7 +7178,10 @@ export class AgentSession {
 			if (!result.accepted || !result.ticket) {
 				if (prefixMessages) this._unshiftPendingNextTurnMessages(...prefixMessages);
 				reportPreflight(false, false);
-				return;
+				// G5 (r37 hbgoal-ts): a coalesced or rejected follow-up created no new
+				// action; report that so the cron dispatch can record a skip instead
+				// of counting a run that never happened.
+				return { admitted: false, coalesced: true };
 			}
 			if (result.disposition === "queued") {
 				reportPreflight(true, true);
@@ -7145,10 +7193,11 @@ export class AgentSession {
 			}
 			if (options?.returnAfterAccepted) {
 				if (result.disposition === "starts_when_admitted") await result.ticket.delivered;
-				return;
+				return { admitted: true, coalesced: false };
 			}
-			if (visibleQueued) return;
+			if (visibleQueued) return { admitted: true, coalesced: false };
 			await result.ticket.completed;
+			return { admitted: true, coalesced: false };
 		} catch (error) {
 			reportPreflight(false);
 			throw error;
@@ -12680,7 +12729,10 @@ export class AgentSession {
 			activeToolNames: this.getActiveToolNames(),
 			allowedToolNames: this._allowedToolNames ? [...this._allowedToolNames] : undefined,
 			customTools: [...this._customTools],
-			includeGoals: this._includeGoals,
+			// G2 (r37 hbgoal-ts): goal pursuit stays a depth-0 capability, symmetric
+			// with the CLI initialGoal seeding gate below; a subagent (rlmDepth >= 1)
+			// must not be able to seed its own self-continuing goal chain.
+			includeGoals: false,
 			includeCompactSkill: this._includeCompactSkill,
 			rlmDepth: this._rlmDepth + 1,
 			// Re-read the cap in force *now*: the child is granted what this session currently
@@ -16180,4 +16232,12 @@ function rlmHeartbeatHostResponse(job: AgentCronJob): Record<string, unknown> {
 		last_error: job.lastError ?? null,
 		run_count: job.runCount,
 	};
+}
+
+/** Outcome of an injected heartbeat prompt admission (G5, r37 hbgoal-ts). */
+export interface AgentHeartbeatPromptResult {
+	/** True when a new session action was admitted (immediately or queued). */
+	admitted: boolean;
+	/** True when an equivalent follow-up was already pending, so nothing new was queued. */
+	coalesced: boolean;
 }

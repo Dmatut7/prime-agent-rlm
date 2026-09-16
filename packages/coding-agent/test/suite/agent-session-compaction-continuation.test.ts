@@ -326,6 +326,39 @@ describe("compaction continuation", () => {
 		);
 	});
 
+	// G4 (r37 hbgoal-ts): an admission failure while queueing the threshold-continuation
+	// must roll the continuationsUsed increment back instead of inflating the count.
+	it("rolls back the threshold-queued goal continuation when admission is paused", async () => {
+		const sessionRef: { current?: AgentSession } = {};
+		const harness = await createHarness({
+			tools: [createFauxIpythonTool(sessionRef)],
+			settings: { compaction: { enabled: true, reserveTokens: 500 } },
+			models: [{ id: "faux-1", contextWindow: 6_000 }],
+		});
+		harnesses.push(harness);
+		sessionRef.current = harness.session;
+		harness.setResponses([fauxAssistantMessage(`step one, more to do ${"x".repeat(24_000)}`)]);
+
+		// Hold a public admission pause from the first assistant token so the
+		// threshold queue attempt at turn end throws and takes the catch path.
+		let pause: { release(): void } | undefined;
+		const unsubscribe = harness.session.subscribe((event) => {
+			if (event.type === "message_start" && event.message.role === "assistant" && !pause) {
+				pause = harness.session.acquireSessionInputPause();
+			}
+		});
+		try {
+			await harness.session.prompt("/goal finish the task");
+		} finally {
+			pause?.release();
+			unsubscribe();
+		}
+		await harness.session.waitForIdle();
+
+		expect(harness.session.goalState.continuationsUsed).toBe(0);
+		expect(harness.session.queuedActionCount).toBe(0);
+	});
+
 	// With both drivers active the goal continuation takes exclusive priority, matching _getContinuationMessages.
 	it("queues only the goal continuation when a goal and autonomous mode are both active", async () => {
 		const sessionRef: { current?: AgentSession } = {};

@@ -79,6 +79,16 @@ export interface CreateAgentCronJobInput {
 
 export type AgentCronJobRunResult = "ran" | "skipped";
 
+/**
+ * Per-session cap on concurrent rlm_heartbeat jobs (G3, r37 hbgoal-ts): each
+ * heartbeat tick is a full model turn, so a model that self-creates heartbeats
+ * must not be able to fan out an unbounded amplifier.
+ */
+export const MAX_RLM_HEARTBEATS_PER_SESSION = 8;
+
+/** Minimum interval for a model-created rlm_heartbeat (G3, r37 hbgoal-ts). */
+export const MIN_RLM_HEARTBEAT_INTERVAL_MS = 60_000;
+
 export interface AgentCronDispatch {
 	id: string;
 	job: AgentCronJob;
@@ -450,6 +460,22 @@ export class AgentCronJobStore {
 		if (parsed.schedule.kind === "once") {
 			throw new Error("RLM heartbeat schedule must be recurring");
 		}
+		if (parsed.schedule.kind === "interval" && (parsed.schedule.intervalMs ?? 0) < MIN_RLM_HEARTBEAT_INTERVAL_MS) {
+			throw new Error(
+				`RLM heartbeat interval must be at least 60 seconds (got "${input.scheduleText}"); user-level /heartbeat can go lower`,
+			);
+		}
+		const activeCount = this.readJobs().filter(
+			(job) =>
+				job.activeSessionId === input.activeSessionId &&
+				job.source === "rlm_heartbeat" &&
+				(job.status === "active" || job.status === "paused"),
+		).length;
+		if (activeCount >= MAX_RLM_HEARTBEATS_PER_SESSION) {
+			throw new Error(
+				`Too many RLM heartbeats for this session: at most ${MAX_RLM_HEARTBEATS_PER_SESSION} active or paused rlm_heartbeats are allowed; delete one first (rlm_heartbeat.delete)`,
+			);
+		}
 		const prompt = input.prompt.trim();
 		if (!prompt) {
 			throw new Error("RLM heartbeat instruction cannot be empty");
@@ -517,6 +543,14 @@ export class AgentCronJobStore {
 				const parsed = parseAgentCronSchedule(update.scheduleText, now);
 				if (parsed.schedule.kind === "once") {
 					throw new Error("RLM heartbeat schedule must be recurring");
+				}
+				if (
+					parsed.schedule.kind === "interval" &&
+					(parsed.schedule.intervalMs ?? 0) < MIN_RLM_HEARTBEAT_INTERVAL_MS
+				) {
+					throw new Error(
+						`RLM heartbeat interval must be at least 60 seconds (got "${update.scheduleText}"); user-level /heartbeat can go lower`,
+					);
 				}
 				nextJob =
 					nextJob.status === "paused"
