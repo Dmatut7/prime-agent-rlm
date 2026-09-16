@@ -213,7 +213,18 @@ describe("r41 XA: admission-fence refusals defer the tick with a bounded cadence
 	});
 
 	it("consecutive deferrals back off, cap, escalate, and never complete the once job", async () => {
-		const store = makeStore();
+		// Write-amplification bound: one recordDispatchResult (one store write) per
+		// deferral, counted through the public store API.
+		class CountingStore extends AgentCronJobStore {
+			recordCount = 0;
+			recordDispatchResult(dispatchId: string, result: Parameters<AgentCronJobStore["recordDispatchResult"]>[1]) {
+				this.recordCount += 1;
+				return super.recordDispatchResult(dispatchId, result);
+			}
+		}
+		const dir = mkdtempSync(join(tmpdir(), "prime-agent-r41xa-count-"));
+		tempDirs.push(dir);
+		const store = new CountingStore(join(dir, "cron-jobs.json"));
 		const once = store.create(makeOnceInput(start));
 		const { scheduler, setNow } = makeScheduler(
 			store,
@@ -239,6 +250,7 @@ describe("r41 XA: admission-fence refusals defer the tick with a bounded cadence
 			lastNext = next;
 			tick = new Date(next);
 		}
+		expect(store.recordCount).toBeLessThanOrEqual(12 + 1);
 
 		// Fast attempts, then doubling backoff capped at CRON_DEFER_BACKOFF_CAP_MS.
 		expect(cadences.slice(0, CRON_DEFER_FAST_ATTEMPTS)).toEqual(
