@@ -335,6 +335,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	if (hasExistingSession) {
 		agent.state.messages = existingSession.messages;
+		if (
+			model &&
+			existingSession.model &&
+			(model.provider !== existingSession.model.provider || model.id !== existingSession.model.modelId)
+		) {
+			// The session's saved model could not be restored (auth lost, model gone)
+			// and a fallback was picked: the ledger must record what actually runs,
+			// or the transcript claims a model the session is not using.
+			sessionManager.appendModelChange(model.provider, model.id);
+		}
 		if (!hasThinkingEntry) {
 			sessionManager.appendThinkingLevelChange(thinkingLevel);
 		}

@@ -1,0 +1,1 @@
+- Changed `clampThinkingLevel` to clamp downward on the enabled side (never silently crossing the on/off boundary or rounding up to a more expensive tier), using the minimum enabled tier below the model's floor.

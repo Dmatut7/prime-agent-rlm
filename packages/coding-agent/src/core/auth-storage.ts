@@ -112,7 +112,21 @@ export type AuthSourceToken = {
 	source: ActiveAuthStatusSource;
 	identityFingerprint: string;
 	valueFingerprint: string;
+	/** When the stale mark was set; a mark older than the cooldown stops matching. */
+	markedAt?: number;
 };
+
+/**
+ * How long a stale auth mark keeps suppressing its credential. The mark is a
+ * cooldown, not a deletion: after it expires the credential is retried, and a
+ * fresh 401 simply re-marks it (cost: one failed request round).
+ */
+export const STALE_AUTH_COOLDOWN_MS = 15 * 60_000;
+
+/** True when the stale mark is older than the cooldown and should stop matching. */
+export function isStaleAuthTokenExpired(token: AuthSourceToken, now: number = Date.now()): boolean {
+	return token.markedAt !== undefined && now - token.markedAt >= STALE_AUTH_COOLDOWN_MS;
+}
 
 type AuthSourceCandidate = {
 	source: ActiveAuthStatusSource;
@@ -597,7 +611,7 @@ export class AuthStorage {
 	}
 
 	private isAuthSourceStale(provider: string, candidate: AuthSourceCandidate): boolean {
-		const matchingStale = this.getMatchingStaleAuthSources(provider, candidate);
+		const matchingStale = this.getActiveStaleAuthSources(provider, candidate);
 		if (matchingStale.length === 0) {
 			return false;
 		}
@@ -613,6 +627,12 @@ export class AuthStorage {
 		return stale.filter(
 			(token) => token.source === candidate.source && token.identityFingerprint === candidate.identityFingerprint,
 		);
+	}
+
+	private getActiveStaleAuthSources(provider: string, candidate: AuthSourceCandidate): AuthSourceToken[] {
+		// Cooldown, not deletion: expired marks stay recorded but stop matching, so a
+		// credential whose provider was rejecting it earlier is retried later.
+		return this.getMatchingStaleAuthSources(provider, candidate).filter((token) => !isStaleAuthTokenExpired(token));
 	}
 
 	private getAvailableAuthCandidate(
@@ -682,16 +702,19 @@ export class AuthStorage {
 		if (token.provider.length === 0) {
 			return false;
 		}
+		const stamped: AuthSourceToken = { ...token, markedAt: Date.now() };
 		const stale = this.staleAuthSources.get(token.provider) ?? [];
-		if (
-			!stale.some(
-				(existing) =>
-					existing.source === token.source &&
-					existing.identityFingerprint === token.identityFingerprint &&
-					existing.valueFingerprint === token.valueFingerprint,
-			)
-		) {
-			stale.push(token);
+		const existing = stale.find(
+			(candidate) =>
+				candidate.source === stamped.source &&
+				candidate.identityFingerprint === stamped.identityFingerprint &&
+				candidate.valueFingerprint === stamped.valueFingerprint,
+		);
+		if (existing) {
+			// Re-marking after the cooldown expired restarts the cooldown.
+			existing.markedAt = stamped.markedAt;
+		} else {
+			stale.push(stamped);
 		}
 		this.staleAuthSources.set(token.provider, stale);
 		return true;
@@ -707,6 +730,28 @@ export class AuthStorage {
 			this.staleAuthSources.delete(provider);
 		} else {
 			this.staleAuthSources.set(provider, next);
+		}
+	}
+
+	/** Clear every stale mark recorded for a provider (an explicit re-login resets all sources). */
+	private clearAllStaleAuthSources(provider: string): void {
+		this.staleAuthSources.delete(provider);
+	}
+
+	/**
+	 * Clear stale marks on stored credentials after the auth file changed on disk.
+	 * A moved stat identity means another process wrote the file - most commonly a
+	 * /login - so stored-source stale marks must not outlive the write. Worst case an
+	 * unrelated edit un-stales a really dead key: it gets re-marked after one 401.
+	 */
+	private clearStaleStoredAuthSources(): void {
+		for (const [provider, tokens] of [...this.staleAuthSources]) {
+			const next = tokens.filter((token) => token.source !== "stored");
+			if (next.length === 0) {
+				this.staleAuthSources.delete(provider);
+			} else {
+				this.staleAuthSources.set(provider, next);
+			}
 		}
 	}
 
@@ -760,6 +805,10 @@ export class AuthStorage {
 		if (statFingerprint === undefined) return;
 		const stat = statFingerprint.call(this.storage);
 		if (stat === this.diskStat) return;
+		// A moved stat identity is an external write (another process logged in or
+		// logged out), even when the bytes turn out identical: stored-source stale
+		// marks must not survive it, or a same-value /login never recovers.
+		this.clearStaleStoredAuthSources();
 		const bytes = this.storage.readUnlocked?.();
 		if (bytes !== undefined && bytes === this.diskBytes) {
 			// Same bytes under a new stat identity: adopt the stat, not a reload.
@@ -825,7 +874,10 @@ export class AuthStorage {
 		// A new credential may point at a `!command` whose earlier failure is still inside
 		// the retry window; the write has to drop that cached failure.
 		clearResolvedCommandCache();
-		this.clearStaleAuthSource(provider, "stored");
+		// An explicit credential write is a full reset for the provider: a 401 marked
+		// the runtime/environment source stale earlier in this process, and the user
+		// re-logging in must recover every source, not only the stored one.
+		this.clearAllStaleAuthSources(provider);
 		this.data[provider] = credential;
 		this.persistProviderChange(provider, credential);
 	}

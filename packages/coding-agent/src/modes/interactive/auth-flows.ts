@@ -756,6 +756,8 @@ export class ProviderAuthFlows {
 			}
 
 			this.host.modelRegistry.authStorage.set(providerId, { type: "api_key", key: apiKey });
+			// /login is a full credential reset: drop registry-layer stale marks too.
+			this.host.modelRegistry.clearProviderAuthStale(providerId);
 
 			closeDialog();
 			return await this.completeProviderAuthentication(providerId, providerName, "api_key", undefined, kind);

@@ -30,7 +30,7 @@ import { Compile, type Validator } from "typebox/compile";
 import type { TLocalizedValidationError } from "typebox/error";
 import { getAgentDir } from "../config.js";
 import { getShellConfig, type ShellConfig } from "../utils/shell.js";
-import type { AuthSourceToken, AuthStatus, AuthStorage } from "./auth-storage.js";
+import { type AuthSourceToken, type AuthStatus, type AuthStorage, isStaleAuthTokenExpired } from "./auth-storage.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "./prime-inference-auth.js";
 import {
 	fetchAuthorizedPrivatePrimeInferenceModelIds,
@@ -1300,7 +1300,7 @@ export class ModelRegistry {
 	}
 
 	private isProviderRequestAuthStale(provider: string, source: ProviderRequestAuthSource): boolean {
-		const matchingStale = this.getMatchingStaleProviderRequestAuthSources(provider, source);
+		const matchingStale = this.getActiveStaleProviderRequestAuthSources(provider, source);
 		if (matchingStale.length === 0) {
 			return false;
 		}
@@ -1309,7 +1309,7 @@ export class ModelRegistry {
 	}
 
 	private isProviderRequestAuthStaleForStatus(provider: string, source: ProviderRequestAuthSource): boolean {
-		const matchingStale = this.getMatchingStaleProviderRequestAuthSources(provider, source);
+		const matchingStale = this.getActiveStaleProviderRequestAuthSources(provider, source);
 		if (matchingStale.length === 0) {
 			return false;
 		}
@@ -1333,6 +1333,17 @@ export class ModelRegistry {
 		}
 		return stale.filter(
 			(token) => token.source === source.source && token.identityFingerprint === source.identityFingerprint,
+		);
+	}
+
+	private getActiveStaleProviderRequestAuthSources(
+		provider: string,
+		source: ProviderRequestAuthSource,
+	): AuthSourceToken[] {
+		// Same cooldown contract as AuthStorage: the mark suppresses retries only
+		// inside the window, so both layers recover at the same point in time.
+		return this.getMatchingStaleProviderRequestAuthSources(provider, source).filter(
+			(token) => !isStaleAuthTokenExpired(token),
 		);
 	}
 
@@ -1378,6 +1389,15 @@ export class ModelRegistry {
 	private hasConfiguredProviderRequestAuth(provider: string): boolean {
 		const source = this.getProviderRequestAuthSource(provider);
 		return source !== undefined && !this.isProviderRequestAuthStaleForStatus(provider, source);
+	}
+
+	/**
+	 * Clear this registry's stale marks for a provider (all sources). Called when the
+	 * user explicitly re-logs in: the /login write resets the credential's whole
+	 * stale state, in both layers.
+	 */
+	clearProviderAuthStale(provider: string): void {
+		this.staleProviderRequestAuthSources.delete(provider);
 	}
 
 	markProviderAuthStale(provider: string): boolean {
@@ -1426,16 +1446,19 @@ export class ModelRegistry {
 			providerRequestSource?.source === token.source &&
 			providerRequestSource.identityFingerprint === token.identityFingerprint
 		) {
+			const stamped: AuthSourceToken = { ...token, markedAt: Date.now() };
 			const stale = this.staleProviderRequestAuthSources.get(token.provider) ?? [];
-			if (
-				!stale.some(
-					(existing) =>
-						existing.source === token.source &&
-						existing.identityFingerprint === token.identityFingerprint &&
-						existing.valueFingerprint === token.valueFingerprint,
-				)
-			) {
-				stale.push(token);
+			const existing = stale.find(
+				(candidate) =>
+					candidate.source === stamped.source &&
+					candidate.identityFingerprint === stamped.identityFingerprint &&
+					candidate.valueFingerprint === stamped.valueFingerprint,
+			);
+			if (existing) {
+				// Re-marking after the cooldown expired restarts the cooldown.
+				existing.markedAt = stamped.markedAt;
+			} else {
+				stale.push(stamped);
 			}
 			this.staleProviderRequestAuthSources.set(token.provider, stale);
 			marked = true;

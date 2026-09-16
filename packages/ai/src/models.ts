@@ -85,15 +85,25 @@ export function clampThinkingLevel<TApi extends Api>(
 	const requestedIndex = EXTENDED_THINKING_LEVELS.indexOf(level);
 	if (requestedIndex === -1) return availableLevels[0] ?? "off";
 
-	for (let i = requestedIndex; i < EXTENDED_THINKING_LEVELS.length; i++) {
-		const candidate = EXTENDED_THINKING_LEVELS[i];
-		if (availableLevels.includes(candidate)) return candidate;
+	// Clamp on the enabled side, downward first: a request above what the model
+	// supports must never be silently rounded up to a more expensive tier, and a
+	// request on the enabled side must never silently cross to "off" (turning
+	// thinking off for a coding agent usually hurts tool-use quality more than
+	// any tier mismatch). A request below the model's floor uses the minimum
+	// enabled tier; "off" on a model without "off" also stays at the minimum
+	// enabled tier so the on/off boundary is only crossed on an explicit,
+	// supported "off".
+	const enabledLevels: ModelThinkingLevel[] = availableLevels.filter(
+		(candidate: ModelThinkingLevel) => candidate !== "off",
+	);
+	if (level === "off" || enabledLevels.length === 0) {
+		return enabledLevels[0] ?? availableLevels[0] ?? "off";
 	}
-	for (let i = requestedIndex - 1; i >= 0; i--) {
-		const candidate = EXTENDED_THINKING_LEVELS[i];
-		if (availableLevels.includes(candidate)) return candidate;
+	for (let i = requestedIndex; i >= 1; i--) {
+		const candidate: ModelThinkingLevel | undefined = EXTENDED_THINKING_LEVELS[i];
+		if (candidate !== undefined && enabledLevels.includes(candidate)) return candidate;
 	}
-	return availableLevels[0] ?? "off";
+	return enabledLevels[0] ?? availableLevels[0] ?? "off";
 }
 
 export function modelsAreEqual<TApi extends Api>(
