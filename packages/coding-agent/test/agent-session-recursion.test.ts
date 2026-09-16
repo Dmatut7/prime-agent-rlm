@@ -131,7 +131,10 @@ interface InspectableRlmSession {
 }
 
 async function waitFor(condition: () => boolean): Promise<void> {
-	const deadline = Date.now() + 1000;
+	// 10s, aligned with vi.waitFor and the suite harness's waitForEvent budget:
+	// the deadline only bites on the failure path, so a generous one costs nothing
+	// while a 1s ceiling reds conditions that need a few loaded event-loop turns.
+	const deadline = Date.now() + 10_000;
 	while (!condition()) {
 		if (Date.now() > deadline) {
 			throw new Error("Timed out waiting for condition");
@@ -1660,7 +1663,10 @@ describe("AgentSession rlm recursion", () => {
 		await childBash;
 		const parentBoundaryStarted = await Promise.race([
 			parentBashStarted.promise.then(() => true),
-			sleep(200).then(() => false),
+			// Positive race (the promise must win): the boundary bash starts through
+			// a real async chain, so the bound only needs to sit far above that chain;
+			// a loaded shard can stretch it well past 200ms.
+			sleep(2000).then(() => false),
 		]);
 		expect(parentBoundaryStarted).toBe(true);
 		const boundary = await Promise.race([
@@ -1673,7 +1679,9 @@ describe("AgentSession rlm recursion", () => {
 		await parentBash;
 		const finalBoundary = await Promise.race([
 			quiescence.then(() => "quiesced" as const),
-			sleep(200).then(() => "blocked" as const),
+			// Positive race (quiescence must win); the inverse races in this file
+			// stay at 20ms because they are latch-guaranteed, not timing-guaranteed.
+			sleep(2000).then(() => "blocked" as const),
 		]);
 		expect(finalBoundary).toBe("quiesced");
 	});
@@ -1815,7 +1823,8 @@ describe("AgentSession rlm recursion", () => {
 		expect(root.unfinishedActionCount).toBe(0);
 		const closeIdleBoundary = await Promise.race([
 			root.waitForIdle().then(() => "idle" as const),
-			sleep(50).then(() => "blocked" as const),
+			// Positive race (idle must win) behind a real async settle chain.
+			sleep(2000).then(() => "blocked" as const),
 		]);
 		expect(closeIdleBoundary).toBe("idle");
 		const quiescence = root.waitForRlmQuiescence();

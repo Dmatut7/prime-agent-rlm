@@ -114,6 +114,26 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 		);
 	}
 
+	/**
+	 * Negative-window replacement for "no stall_abort": waits for the watchdog's own
+	 * deferral sample instead of a bare sleep window. The abort stage that would
+	 * kill an unvouched turn at abortAfterSeconds logs one "exemption
+	 * abort_deferred" line when it runs and defers, then re-arms at one warn
+	 * window; five more warn windows of quiet after it sample that re-check cycle
+	 * several times. A bare sleep window can close on a loaded runner before the
+	 * abort stage ever ran - proving nothing - so the negative is pinned to the
+	 * event that owns it.
+	 */
+	async function waitForDeferredAbort(warnAfterMs: number): Promise<void> {
+		await vi.waitFor(
+			() => {
+				expect(entries.some((entry) => entry.msg === "stall watchdog: exemption abort_deferred")).toBe(true);
+			},
+			{ timeout: 10_000, interval: 20 },
+		);
+		await new Promise((resolve) => setTimeout(resolve, 5 * warnAfterMs));
+	}
+
 	async function startHungTurn(harness: Harness): Promise<void> {
 		harness.setResponses([
 			fauxAssistantMessage(fauxToolCall("hang_forever", {}), { stopReason: "toolUse" }),
@@ -148,8 +168,9 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 		expect(warning.diagnostics.kernel).toMatchObject({ protocol: 4, kernelPid: 4242, liveBashHandles: 1 });
 
 		// The budget is max(10 x warn, 30min) for the progress tier, so nothing aborts here: the
-		// window that used to kill this turn at 100ms of silence no longer does.
-		await new Promise((resolve) => setTimeout(resolve, 1_000));
+		// window that used to kill this turn at 100ms of silence no longer does - and the
+		// deferral sample itself is the proof that the abort stage ran and deferred.
+		await waitForDeferredAbort(50);
 		expect(harness.eventsOfType("stall_abort")).toEqual([]);
 		expect(harness.eventsOfType("stall_warning").length).toBeGreaterThan(0);
 	});
@@ -203,7 +224,7 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 		// Twenty warn windows of a cell that never stops producing: the exemption is still claimed and
 		// still unspent, so nothing escalates. (The cap itself has a 30min floor, which is why the
 		// settled-vs-spent arithmetic is pinned by the fake-clock tests rather than here.)
-		await new Promise((resolve) => setTimeout(resolve, 1_000));
+		await waitForDeferredAbort(50);
 		expect(harness.eventsOfType("stall_abort")).toEqual([]);
 		expect(harness.eventsOfType("stall_unsettled")).toEqual([]);
 		expect(frames).toBeGreaterThan(1);
@@ -320,7 +341,10 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 		expect(warning.message).not.toContain("deferred");
 		// The exemption is still recorded for the log, just not promised to the user.
 		expect(warning.diagnostics.exemption).toMatchObject({ reason: "vouched" });
-		await new Promise((resolve) => setTimeout(resolve, 500));
+		// Latched negative: warn-only mode (abortAfterSeconds 0) has no abort channel
+		// at all, so "no abort" needs no timing window - two warn windows of settle
+		// cover a misconfiguration, derived from the threshold instead of 500ms.
+		await new Promise((resolve) => setTimeout(resolve, 100));
 		expect(harness.eventsOfType("stall_abort")).toEqual([]);
 	});
 
@@ -364,7 +388,7 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 		// reports the facts (protocol, handles) and leaves the reasons empty.
 		expect(warning.diagnostics.kernel?.reasons).toEqual([]);
 
-		await new Promise((resolve) => setTimeout(resolve, 800));
+		await waitForDeferredAbort(50);
 		expect(harness.eventsOfType("stall_abort")).toEqual([]);
 		// A journal record proves existence only: the short tier, and the fallback is logged.
 		expect(
@@ -414,10 +438,10 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 		expect(readsAtFlip).toBe(0);
 
 		await waitForEvent(harness, (event) => event.type === "stall_warning");
-		await new Promise((resolve) => setTimeout(resolve, 1_000));
-
+		// The read landed in time for the abort check that follows the warning - the
+		// deferral sample proves that check ran and deferred - so the turn lives.
+		await waitForDeferredAbort(200);
 		expect(reads).toContain(4242);
-		// The read landed in time for the abort check that follows the warning, so the turn lives.
 		expect(harness.eventsOfType("stall_abort")).toEqual([]);
 	});
 
