@@ -287,13 +287,42 @@ describe("stall watchdog tool liveness vouch (T1-3)", () => {
 		});
 	});
 
-	it("gives a live handle with no movement the short budget only (M3)", () => {
+	it("gives a quiet awaited handle the full budget instead of the short one (M3/LIVE-1)", () => {
 		const h = createHarness();
-		// A command wedged on stdin: the handle exists, the loop ticks, nothing is produced.
+		// A quiet awaited command (`await bash(job)`): the handle is the cell's own, the loop
+		// ticks, nothing is produced yet. Before r44 the handle's existence alone bought the
+		// twenty-minute budget, which aborted a legitimately long job mid-run; the conjunction
+		// now earns the full tier, and the stdin-wedge risk that tier guarded is bounded by the
+		// combined cap below instead.
 		h.setKernelFacts(() => ({
 			protocol: 4,
 			previous: sample({ receivedAt: h.clock.nowMs - 5_000, tick: 10 }),
 			latest: sample({ receivedAt: h.clock.nowMs, tick: 40, bashHandles: 1, bashCellHandles: 1 }),
+			hostRequestCount: 0,
+			kernelPid: 4242,
+			hasActiveExecution: true,
+		}));
+		h.watchdog.arm();
+		h.watchdog.touch();
+
+		h.clock.advance(STALL_VOUCH_LIVENESS_BUDGET_MS + 2 * MINUTE_MS);
+		expect(h.stageNames()).toEqual(["warn"]);
+		expect(h.stages[0]?.exemption).toMatchObject({ tier: "progress" });
+		// The combined cap (50min at this warn window) still bounds a handle that quietly
+		// never produces: a wedge must die within the cap, not never.
+		h.clock.advance(50 * MINUTE_MS);
+		expect(h.stageNames()).toEqual(["warn", "abort"]);
+		expect(h.stages[1]?.exemption).toMatchObject({ reason: "vouched", tier: "progress", exhausted: true });
+	});
+
+	it("keeps the short budget for a live handle no awaiting cell owns (M3)", () => {
+		const h = createHarness();
+		// A live handle the awaiting cell is not blocked on (a background fleet behind an
+		// unrelated cell): the conjunction cannot fire, so existence alone buys the short budget.
+		h.setKernelFacts(() => ({
+			protocol: 4,
+			previous: sample({ receivedAt: h.clock.nowMs - 5_000, tick: 10 }),
+			latest: sample({ receivedAt: h.clock.nowMs, tick: 40, bashHandles: 1, bashCellHandles: 0 }),
 			hostRequestCount: 0,
 			kernelPid: 4242,
 			hasActiveExecution: true,

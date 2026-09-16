@@ -61,6 +61,25 @@ function workingKernelFacts(): TurnLivenessKernelFacts {
 	};
 }
 
+/**
+ * LIVE-1 (r44), the 20-minute form: a single cell awaiting a quiet bash() command. Fresh
+ * frames, a ticking loop, the awaited handle is the cell's own, and no output movement. The
+ * vouch must earn the progress tier so the existence budget does not abort the turn at
+ * twenty minutes while the awaited job is still live.
+ */
+function quietAwaitedBashKernelFacts(): TurnLivenessKernelFacts {
+	return {
+		protocol: 4,
+		previous: sample({ receivedAt: Date.now() - 5_000, tick: 10 }),
+		latest: sample({ tick: 40, bashHandles: 1, bashCellHandles: 1 }),
+		rejectedFrames: 0,
+		consecutiveRejectedFrames: 0,
+		hostRequestCount: 0,
+		kernelPid: 4242,
+		hasActiveExecution: true,
+	};
+}
+
 /** A kernel whose loop is blocked by a synchronous cell: frames arrive, the tick does not move. */
 function wedgedKernelFacts(): TurnLivenessKernelFacts {
 	return {
@@ -173,6 +192,33 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 		await waitForDeferredAbort(50);
 		expect(harness.eventsOfType("stall_abort")).toEqual([]);
 		expect(harness.eventsOfType("stall_warning").length).toBeGreaterThan(0);
+	});
+
+	it("earns the full tier for a quiet awaited bash() handle, so the existence budget cannot kill it (LIVE-1)", async () => {
+		const harness = track(
+			await createHarness({
+				tools: [hangTool],
+				settings: {
+					stallWatchdog: { enabled: true, warnAfterSeconds: 0.05, abortAfterSeconds: 0.1 },
+					retry: { enabled: false },
+				},
+				stallKernelLivenessFacts: () => quietAwaitedBashKernelFacts(),
+			}),
+		);
+		await startHungTurn(harness);
+
+		const warning = await waitForEvent(harness, (event) => event.type === "stall_warning");
+		if (warning.type !== "stall_warning") throw new Error("unreachable");
+		expect(warning.message).toContain("deferred");
+		// The tier is the fix: existence alone used to buy "liveness", whose twenty-minute
+		// budget aborted `await bash(job)` turns while the job was still running.
+		expect(warning.diagnostics.exemption).toMatchObject({ reason: "vouched", tier: "progress" });
+		expect(warning.diagnostics.exemption?.reasons).toContain("live_bash_handles");
+		expect(warning.diagnostics.kernel).toMatchObject({ liveBashHandles: 1 });
+
+		// The abort that the unvouched shape would fire at 100ms of silence stays deferred.
+		await waitForDeferredAbort(50);
+		expect(harness.eventsOfType("stall_abort")).toEqual([]);
 	});
 
 	it("hands the kernel's movement to the watchdog, so a producing cell is never charged for it", async () => {

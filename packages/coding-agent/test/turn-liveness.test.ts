@@ -222,22 +222,23 @@ describe("createTurnLiveness", () => {
 	});
 
 	it("separates a live handle with movement from a live handle with none", () => {
-		// M3's shape: a command wedged on stdin has a handle and produces nothing.
-		const hung = build({
+		// LIVE-1 (r44): a fresh frame attesting the cell's own awaited handle while a live loop
+		// awaits that cell is the quiet-long-job shape (`await bash(job)` producing nothing yet),
+		// so it now earns the full tier rather than the twenty-minute existence budget that
+		// killed a legitimately long job mid-run. The stdin-wedge risk this tier used to guard
+		// is bounded by the combined cap and by the frozen-loop shape below.
+		const quiet = build({
 			kernel: facts({
 				previous: sample({ receivedAt: T0 - 5_000, tick: 10 }),
 				latest: sample({ tick: 40, bashHandles: 1, bashCellHandles: 1 }),
 			}),
 		});
-		const hungFacts = hung.liveness.sample();
-		expect(hungFacts.vouched).toBe(true);
-		expect(hungFacts.reasons).toContain(STALL_VOUCH_REASONS.liveBashHandles);
-		// The loop is ticking (the cell awaits the handle), so it vouches too - but a tick is
-		// liveness, not movement, so the tier stays short. This is the case that decides whether
-		// a command wedged on stdin is rescued near today's window or after the full budget.
-		expect(hungFacts.reasons).toContain(STALL_VOUCH_REASONS.kernelLoopAwaitingCell);
-		expect(hungFacts.progress).toBe(false);
-		expect(hungFacts.liveBashHandles).toBe(1);
+		const quietFacts = quiet.liveness.sample();
+		expect(quietFacts.vouched).toBe(true);
+		expect(quietFacts.reasons).toContain(STALL_VOUCH_REASONS.liveBashHandles);
+		expect(quietFacts.reasons).toContain(STALL_VOUCH_REASONS.kernelLoopAwaitingCell);
+		expect(quietFacts.progress).toBe(true);
+		expect(quietFacts.liveBashHandles).toBe(1);
 
 		// The same handle streaming output is a working job, not a hung one.
 		const working = build({
@@ -250,6 +251,32 @@ describe("createTurnLiveness", () => {
 		expect(workingFacts.vouched).toBe(true);
 		expect(workingFacts.progress).toBe(true);
 		expect(workingFacts.reasons).toContain(STALL_VOUCH_REASONS.liveBashHandles);
+	});
+
+	it("keeps the short tier for a handle that is not the awaiting cell's own (LIVE-1)", () => {
+		// A background fleet behind a cell that awaits something else: the handles are live but
+		// the cell is not provably blocked on one of them, so the conjunction must not fire.
+		const backgroundFleet = build({
+			kernel: facts({
+				previous: sample({ receivedAt: T0 - 5_000, tick: 10 }),
+				latest: sample({ tick: 40, bashHandles: 1, bashCellHandles: 0 }),
+			}),
+		});
+		const fleetFacts = backgroundFleet.liveness.sample();
+		expect(fleetFacts.reasons).toContain(STALL_VOUCH_REASONS.liveBashHandles);
+		expect(fleetFacts.progress).toBe(false);
+	});
+
+	it("keeps the short tier for a handle with no cell awaiting it (LIVE-1)", () => {
+		const noCell = build({
+			kernel: facts({
+				previous: sample({ receivedAt: T0 - 5_000, tick: 10, cellId: undefined }),
+				latest: sample({ tick: 40, cellId: undefined, bashHandles: 1, bashCellHandles: 0 }),
+			}),
+		});
+		const noCellFacts = noCell.liveness.sample();
+		expect(noCellFacts.reasons).toContain(STALL_VOUCH_REASONS.liveBashHandles);
+		expect(noCellFacts.progress).toBe(false);
 	});
 
 	it("vouches for a live loop awaiting the cell, without granting it progress", () => {
