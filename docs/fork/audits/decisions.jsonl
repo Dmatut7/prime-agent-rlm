@@ -307,3 +307,7 @@
 {"id": "G2", "date": "2026-09-16", "severity": "P3", "status": "fixing", "commit": null, "title": "子代理继承 includeGoals 可自建无预算自续跑链且 passivate 后 goal 悬挂无恢复；与 CLI initialGoal 仅 depth-0 播种闸不对称", "verified_by": "GLM r37"}
 {"id": "G3", "date": "2026-09-16", "severity": "P3", "status": "fixing", "commit": null, "title": "rlm_heartbeat 无条数上限+最小间隔仅 10s：模型可铺 M×10s 自催 turn 的 token 放大器", "verified_by": "GLM r37"}
 {"id": "G4", "date": "2026-09-16", "severity": "P4", "status": "fixing", "commit": null, "title": "goal 续跑 admission 抛错时 continuationsUsed +1 不回滚（同文件三处有回滚正控）；被 coalesce 的 follow_up 心跳记成 ran（运行史失真）", "verified_by": "GLM r37"}
+{"id": "K3G-1", "date": "2026-09-16", "severity": "P2", "status": "fixing", "commit": null, "title": "CF-1 修复引入：user-requests 收 agent_message 不分方向——子代理回复被当用户原话收进跨压缩台账（信任升格+注入放大）；方向字段机读但零引用", "verified_by": "K3 r37 复核（tsx 打穿）"}
+{"id": "K3G-2", "date": "2026-09-16", "severity": "P2", "status": "fixing", "commit": null, "title": "RT-1 修复误伤：isinstance(io.IOBase) 把 StringIO/BytesIO/内存态 SpooledTemporaryFile 逐出快照（dill 往返它们完全安全）——跨重启数据丢失", "verified_by": "K3 r37（真运行时复现+正控）"}
+{"id": "K3G-3", "date": "2026-09-16", "severity": "P2", "status": "fixing", "commit": null, "title": "RT-3 版本隔离只查顶层：dict 内函数、被隔离类的实例照常复活（跨版本外来字节码执行面+命名空间不一致态）", "verified_by": "K3 r37（真 _restore_state 复现）"}
+{"id": "K3G-4", "date": "2026-09-16", "severity": "P3", "status": "confirmed_pending_fix", "commit": null, "title": "快照失败回执措辞与实际语义相反（flap 重发/compaction 双报残留）；install --force 只在领先位置解析且无文档", "verified_by": "K3 r37"}
