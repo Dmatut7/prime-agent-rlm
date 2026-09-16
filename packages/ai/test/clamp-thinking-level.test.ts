@@ -63,9 +63,11 @@ describe("clampThinkingLevel (r43 MC-3)", () => {
 		expect(clampThinkingLevel(deepseekRestricted, "medium")).toBe("low");
 		expect(clampThinkingLevel(deepseekRestricted, "minimal")).toBe("low");
 		expect(clampThinkingLevel(restrictedMinimal, "medium")).toBe("minimal");
-		// [low, high, max]: xhigh used to clamp UP to max (the "asked for less, got
-		// the most expensive tier" shape from r42 ④F4).
-		expect(clampThinkingLevel(lowHighMax, "xhigh")).toBe("high");
+		// [low, high, max]: an unsupported xhigh still maps to the model's own top
+		// tier (max) - the same shape the shipped anthropic opus-4.6 test pins. The
+		// r42 ④F4 complaint was mid-range requests rounding UP; the top-tier request
+		// mapping to the top tier is the intended semantics.
+		expect(clampThinkingLevel(lowHighMax, "xhigh")).toBe("max");
 	});
 
 	it("never silently crosses the on/off boundary", () => {

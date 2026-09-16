@@ -99,6 +99,16 @@ export function clampThinkingLevel<TApi extends Api>(
 	if (level === "off" || enabledLevels.length === 0) {
 		return enabledLevels[0] ?? availableLevels[0] ?? "off";
 	}
+	// xhigh is the extended tier: when the model lacks it, the answer is the
+	// model's own top tier (e.g. max), not the tier below the request - the list
+	// puts max after xhigh, so a downward walk would skip the real ceiling.
+	if (level === "xhigh") {
+		for (let i = EXTENDED_THINKING_LEVELS.length - 1; i >= 1; i--) {
+			const candidate: ModelThinkingLevel | undefined = EXTENDED_THINKING_LEVELS[i];
+			if (candidate !== undefined && enabledLevels.includes(candidate)) return candidate;
+		}
+		return enabledLevels[0] ?? availableLevels[0] ?? "off";
+	}
 	for (let i = requestedIndex; i >= 1; i--) {
 		const candidate: ModelThinkingLevel | undefined = EXTENDED_THINKING_LEVELS[i];
 		if (candidate !== undefined && enabledLevels.includes(candidate)) return candidate;
