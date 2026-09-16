@@ -1,0 +1,1 @@
+- Added a parent-facing notice when a running subagent stays silent past the stall-watchdog warn threshold, so the parent agent can check on a long-running child instead of the watchdog killing its turn.

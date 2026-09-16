@@ -1,0 +1,1 @@
+- Fixed compaction summaries being written to a side branch when the session appended an entry (for example a subagent usage attribution) while the summary was being generated, which left the live context uncompacted until it exceeded the model's context window ([#19](https://github.com/Dmatut7/prime-agent-rlm/issues/19))

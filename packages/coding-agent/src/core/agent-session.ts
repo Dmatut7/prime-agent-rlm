@@ -216,6 +216,7 @@ import {
 	createRefinementFailureMessage,
 	createRefinementOutcomeMessage,
 	createRlmChildFailureMessage,
+	createRlmChildStallNoticeMessage,
 	createRlmChildTerminalNoticeMessage,
 	createSessionSlashCommandMessage,
 	createSessionSlashCommandResultMessage,
@@ -1174,6 +1175,12 @@ interface RlmChildRun {
 	/** Display/forensic stall state for the roster row; cleared by the next agent_start. */
 	stall?: RlmChildStallState;
 	/**
+	 * Epoch ms of the last parent-facing "this child is still silent" notice. A rate
+	 * limit only - the watchdog's warn stage is edge-triggered per silence episode -
+	 * so a child that keeps re-arming the stage cannot flood the parent transcript.
+	 */
+	lastStallNoticeAt?: number;
+	/**
 	 * Terminal classification recorded by the run's own terminal path, with the
 	 * reason text that went with it. Read-only forensics for `collectRlmChildren`:
 	 * a fan-in reader has to tell a watchdog kill from a child that finished
@@ -1347,6 +1354,15 @@ const SESSION_PERSIST_FAILURE_REPORT_MAX_MS = 300_000;
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
 /** How long a deferred RLM terminal notice may wait for delivery before it is abandoned. */
 const RLM_TERMINAL_NOTICE_ABANDON_AFTER_MS = 5 * 60_000;
+
+/**
+ * Minimum spacing between two parent-facing "this child is still silent" notices for
+ * one run. The watchdog's warn stage is already edge-triggered (it fires once per
+ * silence episode and re-arms on the child's next event), so this only bounds the
+ * case of a child that keeps re-arming the stage with a trickle of events: the
+ * parent gets at most one notice per interval instead of one per re-arm.
+ */
+const RLM_CHILD_STALL_NOTICE_MIN_INTERVAL_MS = 10 * 60_000;
 /** Consecutive retryable agent-message send failures before the error becomes terminal (M6b). */
 const AGENT_MESSAGE_RETRYABLE_FAILURE_LIMIT = 3;
 
@@ -6958,6 +6974,84 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Admit a stall notice as its own turn, the way a terminal notice reaches the
+	 * parent: the input pump schedules it once the session is free, so a parent that
+	 * is idle when its child goes quiet still gets told instead of finding out
+	 * whenever it happens to run next.
+	 */
+	private _enqueueRlmChildStallNoticeAction(message: CustomMessage): void {
+		const action = this._createPreparedTurnAction("followUp", message.content as string, undefined, {
+			message,
+			suppressAutonomousContinuation: true,
+			resumeIfIdle: false,
+			source: "internal",
+			executionPolicy: this._turnExecutionPolicy("injected"),
+			queueVisible: false,
+		});
+		const result = this._admitSessionInput(action, { wake: false });
+		if (!result.accepted) throw new Error("RLM child stall notice was not admitted.");
+	}
+
+	/**
+	 * Tell the parent (this session) that a direct child has been silent past the
+	 * watchdog's warn stage - without killing anything.
+	 *
+	 * The warn stage used to be roster-only: the sole stall signal a parent model ever
+	 * received was the failure notice that a kill produced, so a warn-only watchdog
+	 * would have traded a false kill for no signal at all. The notice is the signal;
+	 * whether the silence is genuine work or a wedge is the parent's call, and the
+	 * parent holds the lever (`rlm.delete_subagent`) for the wedge case.
+	 */
+	private _notifyRlmChildStall(
+		run: RlmChildRun,
+		child: AgentSession,
+		sessionName: string,
+		event: { silentMs: number; thresholdMs: number; diagnostics: StallDiagnostics },
+	): void {
+		// Same two-flag guard the terminal-notice publication gate uses: a run that is
+		// being deleted (detachedDeletion) or whose notices are suppressed must not be
+		// pinged - the parent itself asked for this child to go away.
+		if (this._disposed || this._disposing || run.detachedDeletion || run.suppressTerminalNotice) return;
+		const now = Date.now();
+		if (run.lastStallNoticeAt !== undefined && now - run.lastStallNoticeAt < RLM_CHILD_STALL_NOTICE_MIN_INTERVAL_MS) {
+			return;
+		}
+		run.lastStallNoticeAt = now;
+		const inFlightTools = event.diagnostics.inFlightToolCalls.map((call) =>
+			call.elapsedMs > 0 ? `${call.toolName} (${Math.max(1, Math.round(call.elapsedMs / 1000))}s)` : call.toolName,
+		);
+		const exemption = event.diagnostics.exemption;
+		const workEvidence = exemption !== undefined && exemption.exhausted !== true ? [...exemption.reasons] : [];
+		// The deadline that matters is the child's own watchdog - it is the one that can
+		// abort the turn - so the notice describes the child's configuration, not the
+		// parent's. The two differ whenever a project-scope settings file overrides the
+		// global one for one side only.
+		const abortAfterMs = child.settingsManager.getStallWatchdogSettings().abortAfterSeconds * 1000;
+		const message = createRlmChildStallNoticeMessage({
+			childId: run.id,
+			sessionName,
+			silentMs: event.silentMs,
+			thresholdMs: event.thresholdMs,
+			inFlightTools,
+			...(workEvidence.length > 0 ? { workEvidence } : {}),
+			...(abortAfterMs > 0 ? { abortAfterMs } : {}),
+		});
+		try {
+			this._enqueueRlmChildStallNoticeAction(message);
+			this._scheduleSessionInputPump();
+		} catch (error) {
+			// A paused pump (a user dialog, compaction) must not drop the only signal the
+			// parent gets; keep the notice for the next turn boundary instead.
+			this._pushPendingNextTurnMessages(cloneCustomMessage(message));
+			sessionLog.warn("child stall notice deferred to the next turn boundary", {
+				sessionId: this.sessionId,
+				childId: run.id,
+				message: this._asError(error).message,
+			});
+		}
+	}
+
 	private _flushDeferredRlmTerminalNotices(): void {
 		if (
 			this._sessionInputAdmissionPauses.size > 0 ||
@@ -10620,7 +10714,20 @@ export class AgentSession {
 				details,
 				fromExtension,
 				customInstructions,
-				{ leafId: compactionLeafId ?? undefined, usage },
+				{
+					leafId: compactionLeafId ?? undefined,
+					usage,
+					// Issue #19 forensics: SessionManager has no logger, and these fields
+					// must not ride in `details` (the next compaction reads the previous
+					// entry's details back to seed its fact/user-request ledgers). The
+					// caller owns the log line.
+					onCommit: (info) => {
+						sessionLog.info("compaction committed", {
+							sessionId: this.sessionId,
+							...info,
+						});
+					},
+				},
 			);
 		} catch (error) {
 			compactionSettled = true;
@@ -14795,6 +14902,7 @@ export class AgentSession {
 					}
 					if (event.type === "stall_warning") {
 						this._recordRlmChildStallEvent(run, child, "warn", event);
+						this._notifyRlmChildStall(run, child, sessionName, event);
 						return;
 					}
 					if (event.type === "stall_abort") {

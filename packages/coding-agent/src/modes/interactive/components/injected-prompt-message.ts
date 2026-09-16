@@ -16,8 +16,10 @@ import {
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
 	type IpythonStateRestoredDetails,
 	RLM_CHILD_FAILURE_CUSTOM_TYPE,
+	RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE,
 	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
 	type RlmChildFailureDetails,
+	type RlmChildStallNoticeDetails,
 	type RlmChildTerminalNoticeDetails,
 } from "../../../core/messages.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
@@ -28,6 +30,7 @@ type InjectedPromptDetails =
 	| HeartbeatPromptDetails
 	| IpythonStateRestoredDetails
 	| RlmChildFailureDetails
+	| RlmChildStallNoticeDetails
 	| RlmChildTerminalNoticeDetails;
 type InjectedPromptMessage = CustomMessage<InjectedPromptDetails>;
 
@@ -38,6 +41,7 @@ export function isInjectedPromptMessage(message: AgentMessage): message is Injec
 			message.customType === GOAL_CONTEXT_CUSTOM_TYPE ||
 			message.customType === IPYTHON_STATE_RESTORED_CUSTOM_TYPE ||
 			message.customType === RLM_CHILD_FAILURE_CUSTOM_TYPE ||
+			message.customType === RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE ||
 			message.customType === RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE)
 	);
 }
@@ -139,6 +143,12 @@ export class InjectedPromptMessageComponent extends Container {
 			const details = this.message.details as IpythonStateRestoredDetails | undefined;
 			const label = details?.restored === false ? "Started fresh Python kernel" : "Restored Python kernel state";
 			return `${theme.fg("accent", "◆")} ${theme.fg("muted", label)}`;
+		}
+		if (this.message.customType === RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE) {
+			const hint = this.expanded ? "" : ` ${expandCollapseHint("app.tools.expand", false)}`;
+			// Not an error: the silence may be healthy long work. The label says what is
+			// known ("still running"), and the expanded body carries the facts.
+			return theme.fg("muted", "RLM child still running") + theme.fg("dim", hint);
 		}
 		if (
 			this.message.customType === RLM_CHILD_FAILURE_CUSTOM_TYPE ||

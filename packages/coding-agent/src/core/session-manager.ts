@@ -173,6 +173,74 @@ export interface CompactionEntry<T = unknown> extends SessionEntryBase {
 	usage?: Usage;
 }
 
+/**
+ * Forensic record of one compaction commit, handed to `options.onCommit`.
+ *
+ * The classification exists because "the pinned leaf is not the current leaf" used to
+ * be read as exactly one thing - branch navigation - when it can mean two: the session
+ * may merely have appended forward while the summary was in flight (a child usage
+ * attribution, a label write). Reading the second as the first parked the summary on a
+ * side branch and left the live context uncompacted forever (issue #19).
+ *
+ * These fields are for the caller's log and for post-mortems only. They must NOT be
+ * written into `CompactionEntry.details`: the next compaction reads the previous
+ * entry's details back to seed its fact and user-request ledgers, so logging fields
+ * there would feed the following summarization.
+ *
+ * Contract for `options.onCommit`: it must not throw. It runs after the entry is
+ * durable and the leaf has moved, and a throw is swallowed so an observer cannot turn
+ * a committed compaction into a reported failure (the caller's catch block would mark
+ * it failed while the transcript already carries it, and would skip rebuilding the
+ * agent state). There is no logger in this class, hence the silent swallow.
+ */
+export interface CompactionCommitInfo {
+	classification:
+		| "same_branch_forward"
+		| "same_branch_no_window_append"
+		| "branch_navigation"
+		| "unknown_target_leaf"
+		/**
+		 * No pin reached this call. Named for what is observable rather than for one of its
+		 * causes: the production caller passes `compactionLeafId ?? undefined`, so "the
+		 * session was empty when the pin was taken" and "the caller supplied no pin" are
+		 * indistinguishable here, and both behave as a same-branch commit.
+		 */
+		| "no_pin_supplied";
+	/** The leaf the caller pinned when summarization started; null when no pin was supplied. */
+	pinnedLeafId: string | null;
+	/** The leaf after the commit. */
+	currentLeafId: string | null;
+	/**
+	 * Entries appended between the pin and the compaction entry, on the branch the
+	 * summary now sits on.
+	 *
+	 * ⚠️ Read this before using the field for forensics: under `branch_navigation` the
+	 * count is STRUCTURALLY zero, because the entry's parent is the pin itself, so
+	 * nothing can sit between them. Zero therefore does NOT mean "nothing was appended
+	 * during the window" - appends made before the session navigated away do exist, they
+	 * are simply not on this slice (they hang off the pin, and `getChildren(pin)` shows
+	 * them). Reporting the whole-window total would need the entry count bookkept at pin
+	 * time, which is deliberately not done. Drawing the inverse conclusion from a zero
+	 * here is exactly the mistake this field exists to prevent.
+	 */
+	windowEntriesOnSummarizedBranch: number;
+	windowEntryTypesOnSummarizedBranch: readonly string[];
+	/** The cut point named a deferred attribution id and was walked back to a persisted ancestor. */
+	firstKeptRewritten: boolean;
+	/**
+	 * The cut point named a deferred id with no persisted ancestor to walk back to.
+	 *
+	 * Defensive only, and deliberately untested: no public call sequence can make it
+	 * true. `deferredAttributionIds` is populated solely by live attribution appends and
+	 * `_buildIndex()` clears it on load, so a reopened session never gates; and in a live
+	 * session the first attribution for a target is persisted immediately and is the
+	 * parent of every later merge, so the upward walk always terminates at a persisted
+	 * ancestor. Exercising this branch would require probing private state, which the
+	 * repo forbids - the absence of a test here is a ruling, not an oversight.
+	 */
+	firstKeptUnresolvable: boolean;
+}
+
 export interface BranchSummaryEntry<T = unknown> extends SessionEntryBase {
 	type: "branch_summary";
 	fromId: string;
@@ -2705,9 +2773,15 @@ export class SessionManager {
 		details?: T,
 		fromHook?: boolean,
 		customInstructions?: string,
-		options?: { leafId?: string; usage?: Usage },
+		options?: { leafId?: string; usage?: Usage; onCommit?: (info: CompactionCommitInfo) => void },
 	): string {
-		const targetLeaf = options?.leafId ?? this.leafId;
+		const pinnedLeafId = options?.leafId ?? null;
+		const targetLeaf = pinnedLeafId ?? this.leafId;
+		// Everything the classification reads is sampled here, in the same synchronous
+		// block as the commit. The leaf captured at pin time is the one fact that must
+		// not drive the decision on its own: reading "the leaf moved" as "the session
+		// navigated away" is exactly issue #19.
+		const leafAtCommit = this.leafId;
 		const entry: CompactionEntry<T> = {
 			type: "compaction",
 			id: generateId(this.byId),
@@ -2721,13 +2795,78 @@ export class SessionManager {
 			customInstructions,
 			usage: options?.usage,
 		};
-		// A pinned leaf means the session moved (branch navigation) while the
-		// summary was being generated. The entry still belongs to the branch it
-		// summarized, but it must not drag the current position back to it.
-		if (targetLeaf === this.leafId) {
+
+		// The cut point can name a deferred attribution merge, and those ids never reach
+		// disk: after a reopen, buildSessionContext() would never match firstKeptEntryId
+		// and the whole kept tail would silently vanish. Walk back to the nearest
+		// persisted ancestor - backwards only ever keeps more, so it is the safe
+		// direction. Both branches need this: a summary parked on a side branch is still
+		// readable later through branch().
+		this.flushChildUsageAttributions();
+		let firstKeptRewritten = false;
+		let firstKeptUnresolvable = false;
+		if (this.deferredAttributionIds.has(entry.firstKeptEntryId)) {
+			const persisted = this._nearestPersistedAncestor(entry.firstKeptEntryId);
+			if (persisted === null) {
+				// A corrupt chain leaves nowhere to walk back to. Keep the id rather than
+				// throw, and report it, so a lost kept tail stays attributable.
+				firstKeptUnresolvable = true;
+			} else {
+				entry.firstKeptEntryId = persisted;
+				firstKeptRewritten = true;
+			}
+		}
+
+		// "The pinned leaf is not the current leaf" has two very different meanings: the
+		// session navigated to another branch, or it merely appended forward while the
+		// summary was being generated. Only the first may park the summary off the live
+		// chain; the second still describes the live history (issue #19).
+		const sameBranch =
+			targetLeaf === null ||
+			targetLeaf === leafAtCommit ||
+			(leafAtCommit !== null && this._isOnCurrentBranch(targetLeaf));
+
+		let classification: CompactionCommitInfo["classification"];
+		if (sameBranch) {
+			// _appendEntry() uses entry.parentId as-is, so it must be retargeted: left
+			// pointing at the pinned leaf it would fork the chain there and orphan every
+			// entry appended during the window.
+			entry.parentId = leafAtCommit;
 			this._appendEntry(entry);
+			classification =
+				pinnedLeafId === null
+					? "no_pin_supplied"
+					: leafAtCommit === targetLeaf
+						? "same_branch_no_window_append"
+						: "same_branch_forward";
 		} else {
+			// A pinned leaf the session really left: the entry belongs to the branch it
+			// summarized, and it must not drag the current position back to it.
 			this._appendEntryKeepingLeaf(entry);
+			// Sampled at commit time on purpose: at pin time the id was necessarily known,
+			// and only something like newSession() during the window can remove it.
+			classification =
+				targetLeaf !== null && this.byId.get(targetLeaf) === undefined
+					? "unknown_target_leaf"
+					: "branch_navigation";
+		}
+
+		// The observer runs after the entry is durable and the leaf has moved, so a
+		// throwing callback must not turn a successful commit into a reported failure:
+		// the caller's catch block would mark the compaction failed while the transcript
+		// already carries it. There is no logger in this class, hence the swallow - the
+		// contract is that onCommit does not throw (see CompactionCommitInfo).
+		try {
+			options?.onCommit?.({
+				classification,
+				pinnedLeafId,
+				currentLeafId: this.leafId,
+				...this._compactionWindowFacts(targetLeaf, entry.id),
+				firstKeptRewritten,
+				firstKeptUnresolvable,
+			});
+		} catch {
+			// Deliberately ignored; see above.
 		}
 		return entry.id;
 	}
@@ -2821,6 +2960,51 @@ export class SessionManager {
 	 * fold (readSessionInfo scan, OwnUsageAccumulator, whole-file refold) totals
 	 * the same as one line per merge.
 	 */
+	/**
+	 * Whether `id` sits on the current leaf's parent chain - i.e. the session only
+	 * appended forward since `id` was written, rather than navigating to another branch.
+	 * Walks parent pointers with an early exit and a cycle guard; the shape follows
+	 * _nearestPersistedAncestor so the file does not grow a third, subtly different
+	 * upward walk.
+	 */
+	private _isOnCurrentBranch(id: string): boolean {
+		let cursor: SessionEntry | undefined = this.leafId === null ? undefined : this.byId.get(this.leafId);
+		const seen = new Set<string>();
+		while (cursor) {
+			if (cursor.id === id) return true;
+			if (seen.has(cursor.id)) return false;
+			seen.add(cursor.id);
+			const parentId = cursor.parentId;
+			cursor = parentId === null || parentId === undefined ? undefined : this.byId.get(parentId);
+		}
+		return false;
+	}
+
+	/**
+	 * Entries written between the pinned leaf and the compaction entry, on the branch the
+	 * summary now sits on. Read from `getBranch(compactionId)` and sliced - never by
+	 * diffing `getBranch(pinned)` before and after the commit: that is the pinned leaf's
+	 * ANCESTOR chain, which window appends (its descendants) never change, so such a diff
+	 * is always empty and the field would forever report "nothing was appended".
+	 */
+	private _compactionWindowFacts(
+		targetLeaf: string | null,
+		compactionId: string,
+	): Pick<CompactionCommitInfo, "windowEntriesOnSummarizedBranch" | "windowEntryTypesOnSummarizedBranch"> {
+		const chain = this.getBranch(compactionId);
+		const pinnedIndex = targetLeaf === null ? -1 : chain.findIndex((entry) => entry.id === targetLeaf);
+		// No pinned leaf, or one that is not on this chain (an unknown/corrupt id): there
+		// is no window to speak of, and guessing one would be worse than reporting none.
+		if (pinnedIndex < 0) {
+			return { windowEntriesOnSummarizedBranch: 0, windowEntryTypesOnSummarizedBranch: [] };
+		}
+		const window = chain.slice(pinnedIndex + 1, chain.length - 1);
+		return {
+			windowEntriesOnSummarizedBranch: window.length,
+			windowEntryTypesOnSummarizedBranch: window.map((entry) => entry.type),
+		};
+	}
+
 	/**
 	 * LAT-4: walk the live parent chain from `id` up to the nearest ancestor
 	 * whose id a disk line carries (every id not in deferredAttributionIds is a

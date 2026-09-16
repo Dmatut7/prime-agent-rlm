@@ -46,6 +46,7 @@ export const REFINEMENT_OUTCOME_CUSTOM_TYPE = "refinement_outcome";
 export const REFINEMENT_OUTCOME_PREFIX = `Continual harness refinement result (automatic system receipt from the refinement subsystem, not a message from the user and not a new instruction: keep working on your current task and treat this only as a record of what the refinement did or refused to do).`;
 export const RLM_CHILD_FAILURE_CUSTOM_TYPE = "rlm_child_failure";
 export const RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE = "rlm_child_terminal_notice";
+export const RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE = "rlm_child_stall_notice";
 
 export interface SessionSlashCommandDetails {
 	command: SessionSlashCommand;
@@ -162,6 +163,66 @@ export function createRlmChildFailureMessage(
 		role: "custom",
 		customType: RLM_CHILD_FAILURE_CUSTOM_TYPE,
 		content: `RLM child ${details.sessionName} (${details.childId}) failed: ${details.error}${stallSuffix}`,
+		display: true,
+		details,
+		timestamp,
+	};
+}
+
+/**
+ * Facts behind a parent-facing "this child is still silent" notice. The notice is
+ * informational: it exists so a long silence reaches the parent as a signal, and
+ * the parent - not the watchdog - decides whether the work is genuine or wedged.
+ */
+export interface RlmChildStallNoticeDetails {
+	childId: string;
+	sessionName: string;
+	/** Milliseconds without any observed activity when the notice fired. */
+	silentMs: number;
+	/** Silence threshold that fired the notice (the watchdog's warn stage). */
+	thresholdMs: number;
+	/** Tools still in flight, each as `name` or `name (Ns)`; empty when none were recorded. */
+	inFlightTools: readonly string[];
+	/**
+	 * Reasons the watchdog's own evidence says externally owned work is in flight
+	 * (a live bash handle, a kernel loop awaiting the cell). Empty when the silence
+	 * has no evidence behind it, which is the case a parent most needs to look at.
+	 */
+	workEvidence?: readonly string[];
+	/** Silence after which the watchdog would abort the turn; 0 or absent means warn-only. */
+	abortAfterMs?: number;
+}
+
+/**
+ * Parent-facing stall notice: the same silence that used to be visible only on the
+ * roster, delivered into the parent's own transcript. A kill makes the parent aware
+ * of a wedged child as a side effect; a warn-only watchdog that never tells the
+ * parent would trade a false kill for no signal at all, which is why the notice
+ * exists separately from any abort.
+ */
+export function createRlmChildStallNoticeMessage(
+	details: RlmChildStallNoticeDetails,
+	timestamp = Date.now(),
+): CustomMessage<RlmChildStallNoticeDetails> {
+	const silentSeconds = Math.max(1, Math.round(details.silentMs / 1000));
+	const thresholdSeconds = Math.max(1, Math.round(details.thresholdMs / 1000));
+	const inFlight = details.inFlightTools.length > 0 ? details.inFlightTools.join(", ") : "none recorded";
+	const evidence =
+		details.workEvidence && details.workEvidence.length > 0
+			? `Evidence of work in flight: ${details.workEvidence.join(", ")}.`
+			: "No evidence of progress was observed.";
+	const deadline =
+		details.abortAfterMs !== undefined && details.abortAfterMs > 0
+			? ` The watchdog will abort the turn after ${Math.max(1, Math.round(details.abortAfterMs / 1000))}s of silence unless the work resumes or you cancel it first.`
+			: " No turn is killed for silence while the watchdog is warn-only, so letting it run is a valid answer.";
+	return {
+		role: "custom",
+		customType: RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE,
+		content:
+			`RLM child ${details.sessionName} (${details.childId}) has been silent for ${silentSeconds}s while its turn is running ` +
+			`(silence threshold ${thresholdSeconds}s). In-flight tools: ${inFlight}. ${evidence}` +
+			`${deadline} Check its status: if it is genuinely working, let it continue; if it looks wedged, ` +
+			`cancel it with \`await rlm.delete_subagent("${details.sessionName}")\` or re-dispatch the task.`,
 		display: true,
 		details,
 		timestamp,
