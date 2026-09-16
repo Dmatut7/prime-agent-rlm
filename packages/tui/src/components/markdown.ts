@@ -1,4 +1,4 @@
-import { Marked, type Token, Tokenizer, type TokenizerExtension, type Tokens } from "marked";
+import { Marked, type Token, Tokenizer, type TokenizerExtension, type Tokens, type TokensList } from "marked";
 import { latexToUnicode } from "../latex.js";
 import {
 	extractTableCellSelectionRegions,
@@ -128,6 +128,97 @@ function pickMarkdownParser(text: string): Marked {
 }
 
 /**
+ * Block tokens from the last successful lex plus a verified resume offset.
+ * When the next text only changes after that offset (the streaming-append
+ * shape), only the tail is re-lexed and the prefix tokens are reused.
+ */
+interface LexCache {
+	/** CR/tab-normalized text that produced the tokens. */
+	text: string;
+	/** Tokens tiling [0, cut); reused verbatim while the prefix is unchanged. */
+	tokens: Token[];
+	/** Resume offset; 0 disables reuse. */
+	cut: number;
+	/** text.slice(0, cut), so the per-frame reuse check is one startsWith. */
+	prefix: string;
+}
+
+/**
+ * Latest offset where re-lexing the text from that point reproduces the token
+ * stream a full re-lex would produce, for any text that keeps this prefix. The
+ * boundary must sit at a token start (block tokens tile the text exactly) and
+ * pass isStableLexBoundary. Returns 0 when no boundary qualifies or the tokens
+ * do not tile the text exactly.
+ */
+function computeLexCut(tokens: Token[], text: string): { cut: number; kept: number } {
+	let pos = 0;
+	let cut = 0;
+	let kept = 0;
+	for (let i = 0; i < tokens.length; i++) {
+		const raw = tokens[i]?.raw;
+		if (typeof raw !== "string") {
+			return { cut: 0, kept: 0 };
+		}
+		if (i > 0 && isStableLexBoundary(tokens, i, text, pos)) {
+			cut = pos;
+			kept = i;
+		}
+		pos += raw.length;
+	}
+	if (pos !== text.length) {
+		return { cut: 0, kept: 0 };
+	}
+	return { cut, kept };
+}
+
+/**
+ * A token start is reusable only while it stays a token start as the tail
+ * grows. Three conditions hold at every stable boundary:
+ * - a blank line ends the kept region, so no lazy continuation and no
+ *   single-newline merge (marked folds those into a trailing paragraph/text
+ *   token) can reach back across it;
+ * - the tail starts with non-whitespace, because indented content after a
+ *   blank line continues a preceding list (or forms an indented code block),
+ *   and such boundaries move while the text grows;
+ * - the nearest non-space kept block is not a list/html block, because those
+ *   absorb blank-line-separated content as they grow.
+ * Token starts near a growing end are unstable (a partial final line can
+ * re-split; lists re-absorb separated items once their line completes), so
+ * boundaries that fail any check are never reused.
+ */
+function isStableLexBoundary(tokens: Token[], i: number, text: string, cut: number): boolean {
+	if (cut < 2 || text[cut - 2] !== "\n" || text[cut - 1] !== "\n") {
+		return false;
+	}
+	const first = text[cut];
+	if (first === " " || first === "\t" || first === "\n") {
+		return false;
+	}
+	for (let j = i - 1; j >= 0; j--) {
+		const type = tokens[j].type;
+		if (type === "space") {
+			continue;
+		}
+		return type !== "list" && type !== "html";
+	}
+	return true;
+}
+
+function buildLexCache(normalizedText: string, tokens: TokensList): LexCache {
+	if (Object.keys(tokens.links ?? {}).length > 0) {
+		// Reference definitions let a later block change how an earlier one
+		// renders (an appended definition can resolve an earlier reference),
+		// so documents containing them always re-lex in full.
+		return { text: normalizedText, tokens: [], cut: 0, prefix: "" };
+	}
+	const { cut, kept } = computeLexCut(tokens, normalizedText);
+	if (cut === 0) {
+		return { text: normalizedText, tokens: [], cut: 0, prefix: "" };
+	}
+	return { text: normalizedText, tokens: tokens.slice(0, kept), cut, prefix: normalizedText.slice(0, cut) };
+}
+
+/**
  * Default text styling for markdown content.
  * Applied to all text unless overridden by markdown formatting.
  */
@@ -195,6 +286,10 @@ export class Markdown implements Component {
 	// final block instead of the whole document. Keyed by width/type/nextType/raw;
 	// rebuilt each render so it stays bounded to the current document's blocks.
 	private blockCache = new Map<string, string[]>();
+	// Block-token lex cache; see LexCache. Survives setText (streaming) and
+	// invalidate() (tokens do not depend on the theme), but is only reused when
+	// the normalized text is unchanged up to the cached cut offset.
+	private lexCache?: LexCache;
 
 	constructor(
 		text: string,
@@ -232,6 +327,36 @@ export class Markdown implements Component {
 		this.blockCache = new Map();
 	}
 
+	/**
+	 * Lex `normalizedText`, reusing cached prefix tokens when the text only
+	 * changed after the cached cut offset. Reuse conditions and why they yield
+	 * exactly the tokens a full re-lex would produce:
+	 * - the prefix [0, cut) is byte-identical (startsWith check), so a full
+	 *   re-lex would match the same tokens at the same offsets;
+	 * - the token before the cut is not paragraph/text (computeLexCut), so no
+	 *   tail construct can merge into a reused token - merges into the empty
+	 *   fresh lexer are impossible and merges into prefix tokens are excluded;
+	 * - the tail is lexed with a fresh lexer over the same remaining string a
+	 *   full re-lex would see at that offset, with the same (empty) links map;
+	 * - any link reference definition appearing in the tail forces a full
+	 *   re-lex, because it could resolve references inside reused blocks.
+	 */
+	private lex(normalizedText: string): TokensList {
+		const cache = this.lexCache;
+		if (cache && cache.cut > 0 && normalizedText.startsWith(cache.prefix)) {
+			const tailTokens = pickMarkdownParser(normalizedText).lexer(normalizedText.slice(cache.cut));
+			if (Object.keys(tailTokens.links ?? {}).length === 0) {
+				const tokens = cache.tokens.concat(tailTokens) as TokensList;
+				tokens.links = tailTokens.links ?? {};
+				this.lexCache = buildLexCache(normalizedText, tokens);
+				return tokens;
+			}
+		}
+		const tokens = pickMarkdownParser(normalizedText).lexer(normalizedText);
+		this.lexCache = buildLexCache(normalizedText, tokens);
+		return tokens;
+	}
+
 	render(width: number): string[] {
 		if (this.cachedLines && this.cachedText === this.text && this.cachedWidth === width) {
 			return this.cachedLines;
@@ -249,10 +374,15 @@ export class Markdown implements Component {
 			return result;
 		}
 
-		const normalizedText = text.replace(/\t/g, "   ");
+		// Carriage returns are normalized here as well: the lexer replaces them
+		// internally, and leaving them in would desynchronize the offset-based
+		// lex cache (token raws would no longer tile the input string).
+		const normalizedText = text.replace(/\t/g, "   ").replace(/\r\n|\r/g, "\n");
 
-		// Parse markdown to HTML-like tokens
-		const tokens = pickMarkdownParser(normalizedText).lexer(normalizedText);
+		// Parse markdown to HTML-like tokens. Streaming appends re-lex only the
+		// tail after the last merge-safe block boundary; prefix blocks are reused
+		// from the lex cache instead of re-lexing the whole document every frame.
+		const tokens = this.lex(normalizedText);
 
 		// Reference-link definitions make a block's rendering depend on other
 		// blocks, so per-block caching is disabled when any are present.
