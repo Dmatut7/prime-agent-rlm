@@ -33,6 +33,53 @@ export class SessionInputSuspendedError extends Error {
 	}
 }
 
+/**
+ * Session input admission is paused: an owner (a kernel MCP transport reload,
+ * an ACP stop/cancel window, or the update-restart teardown fence) holds an
+ * admission pause lease, so the action is refused before anything is queued or
+ * delivered. Typed so a caller can tell "paused, retry the same message later"
+ * from a permanent failure; the message keeps the historical substring that
+ * existing transcripts and tests match on.
+ */
+export class SessionInputAdmissionPausedError extends Error {
+	/** True: the pause is released by its owner, so a later retry can succeed. */
+	readonly retryable: boolean;
+
+	constructor(options: { pausedCount?: number } = {}) {
+		super(
+			"Cannot admit a session action while session input admission is paused. " +
+				`Nothing was delivered and nothing was queued (${options.pausedCount ?? 1} pause lease(s) held); ` +
+				"retry the same message once the pause is released.",
+		);
+		this.name = "SessionInputAdmissionPausedError";
+		this.retryable = true;
+	}
+}
+
+/**
+ * A same-key follow-up arrived while its queue-key owner is committing - the
+ * window between handing the prompt to the agent and the running turn, where
+ * coalescing no longer applies but a second queued copy would double-deliver
+ * the same key. Refused before delivery, so retrying after the turn ends is
+ * the correct action.
+ */
+export class SessionInputCoalescingError extends Error {
+	readonly retryable: boolean;
+	readonly queueKey: string;
+	readonly ownerActionId: string;
+
+	constructor(options: { queueKey: string; ownerActionId: string }) {
+		super(
+			`Cannot admit a session action because an equivalent follow-up (key ${options.queueKey}) is already committing. ` +
+				"Nothing was delivered; retry the same message after the current turn ends.",
+		);
+		this.name = "SessionInputCoalescingError";
+		this.retryable = true;
+		this.queueKey = options.queueKey;
+		this.ownerActionId = options.ownerActionId;
+	}
+}
+
 export class PromptAdmissionCancelledError extends Error {
 	constructor() {
 		super("Prompt admission was cancelled.");

@@ -826,6 +826,14 @@ export function isRetryableAgentMessageSendError(message: string): boolean {
 		/rate limit exceeded/i.test(message) ||
 		/queued session input is suspended/i.test(message) ||
 		/Agent message was not accepted/i.test(message) ||
+		// QP-2 (r39): an admission pause lease refused the action before anything
+		// was queued or delivered (MCP reload, ACP stop, update-restart teardown),
+		// so the id stays unspent and "retry once the pause is released" is the
+		// correct sender guidance.
+		/session input admission is paused/i.test(message) ||
+		// QP-3 (r39): a same-key duplicate arrived while its owner was committing;
+		// refused before delivery, retrying after the turn ends is correct.
+		/equivalent follow-up.*is already committing/i.test(message) ||
 		// A bounded wait (P1-1) that ran out of time: the target is mid-transition, nothing was
 		// cancelled, and the same call joins the in-flight operation instead of starting a second
 		// one. Counting it here is what gives the new retryable errors a mechanical ceiling -

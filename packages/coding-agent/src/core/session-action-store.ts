@@ -224,6 +224,19 @@ export class ActionStore<TAction extends SessionAction = SessionAction> {
 		this.tickets.set(action.id, new ActionTicketController(action.id));
 	}
 
+	/**
+	 * Lane priority (r39 QP-4, single source of truth): the steering lane
+	 * (`nextTurnBoundary`) always drains before the follow-up lane
+	 * (`whenRunIdle`), even when a follow-up was queued earlier; arrival order
+	 * is FIFO only within a lane. The lane an input joins is fixed by its
+	 * source's delivery policy - subagent replies and heartbeat prompts
+	 * default to steering, so they overtake earlier follow-ups by design.
+	 * Admission refusals (pause leases, update-restart teardown, the same-key
+	 * committing window) are raised before enqueueing in
+	 * AgentSession._admitSessionInput and are retryable: they never delivered
+	 * anything, so the sender retries instead of being told the outcome is
+	 * unknown.
+	 */
 	selectFirst(): TAction | undefined {
 		const action =
 			this.nextTurnBoundary.find((item) => item.lifecycle.state === "queued") ??

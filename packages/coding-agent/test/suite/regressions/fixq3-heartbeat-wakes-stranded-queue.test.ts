@@ -95,15 +95,27 @@ describe("FIX-Q3 heartbeat wakes a stranded suspended queue", () => {
 		expect(harness.getPendingResponseCount()).toBe(2);
 
 		// The TUI steer/follow-up wake path (resumeIfIdle admission) must not lift
-		// the fence either; the message queues behind it.
-		await harness.session.steer("queued behind the fence", undefined, { resumeIfIdle: true });
+		// the fence either. Since QP-2 (r39) teardown also holds an admission
+		// pause: the manifest snapshot is already taken, so a late steer is
+		// refused with retry semantics instead of queueing behind the fence.
+		const steerRefusal = await harness.session
+			.steer("queued behind the fence", undefined, { resumeIfIdle: true })
+			.then(
+				() => undefined,
+				(thrown: unknown) => thrown,
+			);
+		const error = steerRefusal as { name?: string; retryable?: boolean };
+		expect(error?.name).toBe("SessionInputAdmissionPausedError");
+		expect(error?.retryable).toBe(true);
 		expect(harness.session.isQueuedWorkSuspended).toBe(true);
+		expect(harness.session.getSteeringMessages()).toEqual([]);
 
-		// The heartbeat itself was rejected at the admission fence (suspended):
-		// loud failure, retried on the next tick. Only the steer drains on resume.
+		// The heartbeat itself was rejected at the admission fence (paused for the
+		// teardown): loud, retryable failure, redelivered on the next tick.
 		await harness.session.resumeQueuedWork();
 		await harness.session.waitForIdle();
 		await expect(pending).resolves.toBe("rejected");
-		expect(harness.getPendingResponseCount()).toBe(1);
+		// Nothing was admitted behind the fence, so both responses stay untouched.
+		expect(harness.getPendingResponseCount()).toBe(2);
 	});
 });

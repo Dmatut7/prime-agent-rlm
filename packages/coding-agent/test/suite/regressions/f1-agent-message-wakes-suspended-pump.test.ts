@@ -23,6 +23,7 @@ import {
 	type AgentSessionMessagePayload,
 	createAgentSessionMessage,
 	isAgentSessionMessage,
+	isRetryableAgentMessageSendError,
 } from "../../../src/core/agent-messages.js";
 import { SessionInputSuspendedError } from "../../../src/core/prompt-admission.js";
 import { createHarness, getAssistantTexts, getUserTexts, type Harness } from "../harness.js";
@@ -122,7 +123,7 @@ describe("F1 agent message into a suspended session input pump", () => {
 		expect(getUserTexts(harness)).toContain("queued before abort");
 	});
 
-	it("does not break the update-restart fence when an agent message is queued", async () => {
+	it("refuses a late agent message behind the update-restart fence with a retryable error (QP-2, r39)", async () => {
 		const harness = await createHarness({ settings: { subagentWake: { policy: "always" } } });
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("must not run"), fauxAssistantMessage("also must not run")]);
@@ -131,19 +132,29 @@ describe("F1 agent message into a suspended session input pump", () => {
 		harness.session.abortForUpdateRestart();
 		expect(harness.session.isQueuedWorkSuspended).toBe(true);
 
-		// Queued work must survive into the restart manifest; an agent message may
-		// join the queue but must not lift the update-restart suspension - not even
-		// under the "always" policy, which is the mutation this case pins.
+		// Queued work must survive into the restart manifest; a reply that arrives
+		// during teardown can no longer join that manifest (its snapshot is already
+		// taken), so it is refused with retry semantics instead of queue-and-lose -
+		// not even the "always" wake policy may lift the fence, which this case pins.
 		const message = createAgentSessionMessage(createPayload("agentmsg_f1_update_restart", "behind the fence"));
-		await harness.session.acceptAgentMessagePrompt(message.content, {
-			expandPromptTemplates: false,
-			streamingBehavior: "followUp",
-			queueIfBusy: true,
-			customMessage: message,
-		});
+		const refusal = await harness.session
+			.acceptAgentMessagePrompt(message.content, {
+				expandPromptTemplates: false,
+				streamingBehavior: "followUp",
+				queueIfBusy: true,
+				customMessage: message,
+			})
+			.then(
+				() => undefined,
+				(thrown: unknown) => thrown,
+			);
+		const error = refusal as { name?: string; message?: string; retryable?: boolean };
+		expect(error?.name).toBe("SessionInputAdmissionPausedError");
+		expect(error?.retryable).toBe(true);
+		expect(isRetryableAgentMessageSendError(error?.message ?? "")).toBe(true);
 
 		expect(harness.session.isQueuedWorkSuspended).toBe(true);
-		expect(harness.session.getFollowUpMessages()).toEqual(["queued before restart", message.content]);
+		expect(harness.session.getFollowUpMessages()).toEqual(["queued before restart"]);
 		await new Promise<void>((resolve) => setTimeout(resolve, 20));
 		expect(getAssistantTexts(harness)).toEqual([]);
 		expect(harness.getPendingResponseCount()).toBe(2);

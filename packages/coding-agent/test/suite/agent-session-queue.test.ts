@@ -1766,10 +1766,10 @@ describe("AgentSession queue characterization", () => {
 		expect(getUserTexts(harness)).toEqual(["steering heartbeat"]);
 	});
 
-	it("queues a same-key follow-up once the prior owner has handed off", async () => {
+	it("refuses a same-key follow-up while the prior owner is committing (QP-3, r39)", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("first done"), fauxAssistantMessage("second done")]);
+		harness.setResponses([fauxAssistantMessage("first done")]);
 		const dispatchGate = createDeferred();
 		const promptCalled = createDeferred();
 		const originalPrompt = harness.session.agent.prompt.bind(harness.session.agent);
@@ -1786,15 +1786,23 @@ describe("AgentSession queue characterization", () => {
 		pause.release();
 		await promptCalled.promise;
 
-		// The first prompt handed off to the turn; a same-key follow-up must queue
-		// for the next turn instead of coalescing into the committed one.
-		expect(await harness.session.followUp("second heartbeat", undefined, { queueKey: "heartbeat" })).toBe(true);
-		expect(harness.session.getFollowUpMessages()).toEqual(["second heartbeat"]);
+		// The first prompt handed off to the turn (owner committing). A same-key
+		// duplicate used to queue and double-deliver; it is now refused as
+		// retryable so the sender retries after the turn ends instead.
+		const refusal = await harness.session.followUp("second heartbeat", undefined, { queueKey: "heartbeat" }).then(
+			() => undefined,
+			(thrown: unknown) => thrown,
+		);
+		const error = refusal as { name?: string; retryable?: boolean };
+		expect(error?.name).toBe("SessionInputCoalescingError");
+		expect(error?.retryable).toBe(true);
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
+		expect(harness.session.unfinishedActionCount).toBe(1);
 
 		dispatchGate.resolve();
 		await harness.session.waitForSessionInputIdle();
 		await harness.session.waitForIdle();
-		expect(getUserTexts(harness)).toEqual(["first heartbeat", "second heartbeat"]);
+		expect(getUserTexts(harness)).toEqual(["first heartbeat"]);
 	});
 
 	it("does not reclaim a handed-off action before its delivery event", async () => {

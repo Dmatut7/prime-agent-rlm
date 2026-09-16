@@ -227,7 +227,12 @@ import {
 	type RlmChildFailureDetails,
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
-import { SessionInputSuspendedError, throwIfPromptAdmissionCancelled } from "./prompt-admission.js";
+import {
+	SessionInputAdmissionPausedError,
+	SessionInputCoalescingError,
+	SessionInputSuspendedError,
+	throwIfPromptAdmissionCancelled,
+} from "./prompt-admission.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
 import {
 	type AutoRefineReason,
@@ -299,6 +304,7 @@ import {
 import {
 	ActionStore,
 	type ActionTicket,
+	ActionTicketController,
 	canSelectSessionAction,
 	type DeliveryPolicy,
 	type DeliveryRecord,
@@ -1644,6 +1650,8 @@ export class AgentSession {
 	// Branch mutation pause leases can overlap and must all release before dispatch resumes.
 	private readonly _queuedWorkPauses = new Set<symbol>();
 	private readonly _sessionInputAdmissionPauses = new Set<symbol>();
+	/** Admission pause held while the update-restart teardown fence is up (QP-2, r39). */
+	private _updateRestartAdmissionPause: { release(): void } | undefined;
 	private readonly _durableRlmTerminalNoticeActionIds = new Set<string>();
 	private _rlmTerminalNoticeDeferredSince: number | undefined;
 	private _rlmTerminalNoticeAbandonment: { abandonedAt: number; count: number } | undefined;
@@ -7209,7 +7217,13 @@ export class AgentSession {
 	private async _prompt(text: string, options?: InternalPromptOptions): Promise<void> {
 		const resumeSuspendedInput = options?.resumeIfIdle !== false;
 		if (!this.isStreaming) {
-			if (resumeSuspendedInput) this._resumeSessionInputAdmission();
+			// QP-1 (r39): never let an idle resume lift the update-restart fence - a
+			// direct prompt during teardown must hit the admission refusal (mirrors
+			// the sendCustomMessage triggerTurn guard) instead of reviving the pump
+			// and draining the backlog that the restart manifest owns.
+			if (resumeSuspendedInput && !this._sessionInputSuspendedForUpdateRestart) {
+				this._resumeSessionInputAdmission();
+			}
 			this._assertSessionActionAdmissionAvailable();
 		}
 		const admissionEpoch = this._sessionInputPumpEpoch;
@@ -7650,6 +7664,9 @@ export class AgentSession {
 			message: snapshot.customMessage,
 			prefixMessages: snapshot.prefixMessages,
 			source: "internal",
+			// The snapshot already captured this action, so admission-pause leases
+			// (QP-2, r39) must not refuse the restore; coalesce still dedupes it.
+			admissionPauseExempt: true,
 		});
 		// Same debt as the sidecar reflow: the queue survived, the ledger did not.
 		if (queued && snapshot.customMessage) this._registerRestoredQueuedChildReply(snapshot.customMessage);
@@ -7916,17 +7933,41 @@ export class AgentSession {
 			);
 	}
 
+	/**
+	 * The same-key owner in the committing window (QP-3, r39): the prompt has been
+	 * handed to the agent, so a new same-key admission is refused as retryable
+	 * instead of queueing a duplicate that would also deliver.
+	 */
+	private _committingFollowUpOwner(action: QueuedSessionAction): QueuedSessionAction | undefined {
+		if (action.delivery !== "when_run_idle" || action.payload.kind !== "turn" || !action.queueKey) return undefined;
+		return this._actionStore
+			.unfinishedActions()
+			.find((candidate) => candidate.queueKey === action.queueKey && candidate.lifecycle.state === "committing");
+	}
+
 	private _assertSessionActionAdmissionAvailable(): void {
 		if (this._disposed || this._disposing) {
 			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
 		}
+		// Fence first: a direct (non-queueing) caller during update-restart teardown
+		// keeps the fence-specific SessionInputSuspendedError diagnosis (the manifest
+		// owns the queue; retrying cannot wake this session). Then the pause leases
+		// (QP-2, r39 retryable refusal), then the ordinary abort suspension.
+		// Queueing callers never get here: _admitSessionInput's own pause check
+		// refuses them with the retryable error instead.
+		if (this._sessionInputPumpSuspended && this._sessionInputSuspendedForUpdateRestart) {
+			throw new SessionInputSuspendedError({
+				queuedActionCount: this.unfinishedActionCount,
+				suspendedForUpdateRestart: true,
+			});
+		}
 		if (this._sessionInputAdmissionPauses.size > 0) {
-			throw new Error("Cannot admit a session action while session input admission is paused.");
+			throw new SessionInputAdmissionPausedError({ pausedCount: this._sessionInputAdmissionPauses.size });
 		}
 		if (this._sessionInputPumpSuspended) {
 			throw new SessionInputSuspendedError({
 				queuedActionCount: this.unfinishedActionCount,
-				suspendedForUpdateRestart: this._sessionInputSuspendedForUpdateRestart,
+				suspendedForUpdateRestart: false,
 			});
 		}
 	}
@@ -7935,6 +7976,8 @@ export class AgentSession {
 		action: QueuedSessionAction,
 		options: {
 			restore?: boolean;
+			/** QP-2 (r39): a manifest restore re-admits captured work; pause leases do not refuse it. */
+			admissionPauseExempt?: boolean;
 			front?: boolean;
 			wake?: boolean;
 			immediatelyEligible?: boolean;
@@ -7947,8 +7990,17 @@ export class AgentSession {
 		if (this._disposed || this._disposing) {
 			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
 		}
-		if (this._sessionInputAdmissionPauses.size > 0) {
-			throw new Error("Cannot admit a session action while session input admission is paused.");
+		// QP-2 (r39): typed and retryable, so an agent-message sender whose reply
+		// lands in a pause window (MCP reload, ACP stop, update-restart teardown)
+		// does not burn its message id as uncertain and is told to retry later.
+		// Restores are exempt: they re-admit actions the restart manifest already
+		// captured, so they are the recovery source rather than a new admission.
+		if (
+			options.restore !== true &&
+			options.admissionPauseExempt !== true &&
+			this._sessionInputAdmissionPauses.size > 0
+		) {
+			throw new SessionInputAdmissionPausedError({ pausedCount: this._sessionInputAdmissionPauses.size });
 		}
 		if (
 			options.restore !== true &&
@@ -7962,13 +8014,39 @@ export class AgentSession {
 		}
 		const coalescedOwner = options.restore ? undefined : this._coalescedFollowUpOwner(action);
 		if (coalescedOwner) {
+			// QP-3 (r39): a coalesce hit used to be a silent drop - no ticket, no
+			// trace, a "queued" disposition that never came true. Settle a standalone
+			// ticket as coalesced onto the surviving owner and log the hit so the
+			// deduplication is visible; the queue snapshot itself is untouched.
+			const controller = new ActionTicketController(action.id);
+			controller.settleAccepted({ status: "coalesced", existingActionId: coalescedOwner.id });
+			controller.settleDelivered({ status: "not_applicable" });
+			controller.settleCompleted();
+			sessionLog.info(`session input coalesced into running ${action.queueKey}`, {
+				sessionId: this.sessionId,
+				queueKey: action.queueKey,
+				existingActionId: coalescedOwner.id,
+				agentMessageId: action.agentMessageId,
+			});
 			if (action.agentMessageId !== coalescedOwner.agentMessageId) {
 				this._rejectAgentMessage(
 					action.agentMessageId,
 					new Error("Prompt was not queued because an equivalent follow-up is already pending."),
 				);
 			}
-			return { accepted: false, disposition: "queued" };
+			return { accepted: false, disposition: "queued", ticket: controller.ticket };
+		}
+		// QP-3 (r39): the committing window is not a coalesce window - the owner has
+		// handed its prompt to the agent, so a second same-key admission would queue
+		// a duplicate that also delivers. Refuse it as retryable instead (mirrors the
+		// QP-2 admission refusal semantics); a running owner still accepts a queued
+		// same-key action for the next tick.
+		const committingOwner = options.restore ? undefined : this._committingFollowUpOwner(action);
+		if (committingOwner) {
+			throw new SessionInputCoalescingError({
+				queueKey: committingOwner.queueKey ?? "",
+				ownerActionId: committingOwner.id,
+			});
 		}
 		const canStartImmediately =
 			options.immediatelyEligible === true &&
@@ -8017,13 +8095,18 @@ export class AgentSession {
 			suppressAutonomousContinuation?: boolean;
 			resumeIfIdle?: boolean;
 			source?: InputSource | "internal";
+			/** A manifest restore re-admits captured work; pause leases do not refuse it. */
+			admissionPauseExempt?: boolean;
 		} = {},
 	): Promise<boolean> {
 		const action = this._createPreparedTurnAction(schedule, text, images, options);
 		if (action.suppressAutonomousContinuation) {
 			this._markAutonomousContinuationSuppressed(primaryDeliveryRecord(action).message);
 		}
-		return this._admitSessionInput(action).accepted;
+		return this._admitSessionInput(
+			action,
+			options.admissionPauseExempt === true ? { admissionPauseExempt: true } : {},
+		).accepted;
 	}
 
 	private _runtimeActivity(): RuntimeActivity {
@@ -8834,7 +8917,7 @@ export class AgentSession {
 			this._rejectAgentMessage(item.agentMessageId, error);
 			this._cancelSessionActions((candidate) => candidate === item, error);
 			this._emitQueueUpdate();
-			this.resumeQueuedWork();
+			this._resumeQueuedWorkUnlessFenced();
 			return "applied";
 		}
 		if (mutation.type === "move") {
@@ -8881,7 +8964,7 @@ export class AgentSession {
 			item.wake = mutation.lane === "steering" ? "on_lower_boundary" : "external_resume";
 			this._actionStore.moveQueued(item, targetPolicy, this._actionStore.queuedActions(targetPolicy).length);
 		}
-		this.resumeQueuedWork();
+		this._resumeQueuedWorkUnlessFenced();
 		this._emitQueueUpdate();
 		return "applied";
 	}
@@ -9290,6 +9373,10 @@ export class AgentSession {
 		// by the same resume that revives the pump.
 		this._reflowUndeliveredRlmNotices();
 		this._flushDeferredRlmTerminalNotices();
+		// Lifting the suspension ends the teardown window: the update-restart
+		// admission pause (QP-2, r39) must not outlive the fence it guards.
+		this._updateRestartAdmissionPause?.release();
+		this._updateRestartAdmissionPause = undefined;
 	}
 
 	/**
@@ -9305,6 +9392,20 @@ export class AgentSession {
 		this._resumeSessionInputAdmission();
 		this._scheduleSessionInputPump();
 		return true;
+	}
+
+	/**
+	 * QP-1 (r39): queue bookkeeping (mutateQueuedMessage, the compact
+	 * preempted-auto finally) must never lift the update-restart fence - the
+	 * parked queue belongs to the restart manifest, not to a fresh turn during
+	 * teardown (mirrors resumeQueuedWorkFromConnection/wakeSuspendedSessionInput
+	 * refusals). Direct resumeQueuedWork() calls keep the recovery contract
+	 * (post-restart restore, in-process unwedge). Refusing here touches neither
+	 * the pump flags nor the epoch, so in-flight preparations stay valid.
+	 */
+	private _resumeQueuedWorkUnlessFenced(): void {
+		if (this._updateRestartFenceUp) return;
+		this.resumeQueuedWork();
 	}
 
 	/** Resume the scheduler after requestAbort/abortForUpdateRestart suspended it; owned pause leases are unaffected. */
@@ -9474,6 +9575,10 @@ export class AgentSession {
 		this._sessionInputPumpEpoch++;
 		this._sessionInputPumpSuspended = true;
 		this._sessionInputSuspendedForUpdateRestart = false;
+		// A plain abort downgrades the update-restart fence to an ordinary
+		// suspension, so the teardown admission pause goes with it (QP-2, r39).
+		this._updateRestartAdmissionPause?.release();
+		this._updateRestartAdmissionPause = undefined;
 		// Start the failure-wake quiet window: one aggregated failure wake per Esc,
 		// later failures are persisted instead of re-igniting the session (B3).
 		this._sessionInputSuspendedSince = Date.now();
@@ -9579,6 +9684,14 @@ export class AgentSession {
 		this._sessionInputPumpEpoch++;
 		this._sessionInputPumpSuspended = true;
 		this._sessionInputSuspendedForUpdateRestart = true;
+		// QP-2 (r39): pause admission for the whole teardown window. The restart
+		// manifest snapshot is already taken by the time teardown starts, so a
+		// message admitted now would answer "queued" and then vanish with the
+		// closing session; refusing it with retry semantics (the admission-pause
+		// error) lets the sender redeliver after the restart instead. Released when
+		// the fence marker is cleared (requestAbort) or the suspension is lifted.
+		this._updateRestartAdmissionPause?.release();
+		this._updateRestartAdmissionPause = this.acquireSessionInputPause();
 		this._cancelPostCompactionContinue();
 		this.abortRetry();
 		for (const controller of this._rlmQuiescenceWaitAborts) controller.abort();
@@ -10123,8 +10236,10 @@ export class AgentSession {
 			}
 			// K3R-11: _compact()'s abort() suspends the session input pump, which is
 			// what delivers the continuations the preempted auto compaction left
-			// queued. Revive it so the preserved work runs after this compaction.
-			if (preemptedAutoCompaction) this.resumeQueuedWork();
+			// queued. Revive it so the preserved work runs after this compaction -
+			// unless teardown fenced the queue meanwhile (QP-1, r39): the fence
+			// outranks the revival, same as the other queue-mutation resumes.
+			if (preemptedAutoCompaction) this._resumeQueuedWorkUnlessFenced();
 		}
 	}
 
