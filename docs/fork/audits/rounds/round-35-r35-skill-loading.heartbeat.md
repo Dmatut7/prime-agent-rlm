@@ -1,0 +1,6 @@
+- 07:00:59 | start | sub-line② kickoff; repo=prime-agent @438d3338
+- 07:02:00 | read | skills.ts full + ipython.ts bootstrap src read; dedup ledger next
+- 07:05:10 | experiments | exp1..exp6 run against real bootstrap+runtime: hijack/state-split/reload/stale-signature/collision/ cli() all captured
+- 07:07:08 | report | r35-skill-loading.md written: 6 findings (all P3), 2 negative conclusions with positive controls, 5 open items
+- 07:07:27 | report-fix | all file:line citations verified against source line numbers
+- 07:07:47 | done | summary sent to parent (queued, pos3); report + heartbeat in /tmp/audit_r/round-35/

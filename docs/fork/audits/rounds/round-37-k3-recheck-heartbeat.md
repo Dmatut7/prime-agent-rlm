@@ -1,0 +1,5 @@
+- 08:46:59 start: locate commits and diff stats
+- 08:56:32 static review done for ①②③④⑤; running targeted tests as positive control
+- 08:58:49 ⑤ shell punch: sandbox fake-npm install.sh --force / lock
+- 09:01:34 report written: 3xP2 (CF-1 direction, RT-1 StringIO/BytesIO, RT-3 nested), 2xP3 clusters
+- 09:01:51 done

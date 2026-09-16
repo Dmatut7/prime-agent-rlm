@@ -1,0 +1,4 @@
+- 09:28:48 | start | lane 3 dill ownership audit begins
+- 09:33:18 | E2 setup | 3.13.9 wrote 4 payloads; loader=3.11.13 kernel venv python
+- 09:35:41 | E2 real crash | 3.12-written payload + python_version=None into 3.11 -> SIGSEGV exit 139; gate on -> quarantined
+- 09:37:44 | report | dill-ownership.md written (D1 high / D2 medium / D3 medium / D4 low)

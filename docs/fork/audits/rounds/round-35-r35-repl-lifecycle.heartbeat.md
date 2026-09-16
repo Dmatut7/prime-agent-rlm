@@ -1,0 +1,9 @@
+- 07:00:58 | start | line1 REPL lifecycle audit
+- 07:05:30 | driver | wrote /tmp/r35_repl_driver.py
+- 07:08:21 | tests | started full runtime unittest suite
+- 07:09:00 | tests | suite still running (pid 13635)
+- 07:09:17 | tests | 367 tests, 1 error (test_mcp.py MCPError, unrelated), 1 skip, 46.8s
+- 07:09:25 | tests | rerun full suite with full output -> /tmp/audit_r/round-35/suite.txt
+- 07:09:52 | report | wrote /tmp/audit_r/round-35/r35-repl-lifecycle.md (10517 chars)
+- 07:10:47 | report | N4 updated with exact failing test name
+- 07:10:56 | artifacts | driver copied to /tmp/audit_r/round-35/r35_repl_driver.py; repo untouched

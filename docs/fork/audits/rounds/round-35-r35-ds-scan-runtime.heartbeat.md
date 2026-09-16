@@ -1,0 +1,1 @@
+2026-09-15T23:12 父席 r35 收口：6 线全交、INDEX 落盘、5 子席已 delete；关键三条父席独立复核为真（open file 截断/open file P1、非str键快照全败 P2、跨版本致死内核 P2）；已写入 global 记忆 prime_agent_r35_python_kernel_snapshot_restore_five_hard_facts_20260915；已向父席回话。

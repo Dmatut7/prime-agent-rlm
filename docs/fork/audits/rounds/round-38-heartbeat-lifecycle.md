@@ -1,0 +1,4 @@
+- 09:25:29 start r38 subagent-artifact-lifecycle
+- 09:33:59 reconcile.py done: 3990 ledger records, 1065 raw live / 840 reconciled, 225 live edges to gone dirs (10 parents), 916 tombstoned dirs on disk (1.22GB)
+- 09:33:59 display cache stale-read repro OK (same size+same mtimeMs -> stale); ledger torn/v2 controls refused (fail-closed)
+- 09:41:11 L8(③ dill 代际) + L9(⑤ 孤儿回收) 已并入 lifecycle.md，两条线关键结构面已独立复核

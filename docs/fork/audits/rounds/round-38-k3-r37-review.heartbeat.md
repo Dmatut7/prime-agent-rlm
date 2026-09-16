@@ -1,0 +1,7 @@
+- 2026-09-16T09:27:26 lane k3-r37-review start; reviewing 030b1ada4 (G1-G5) + e3f9484f9 (K3G-1/2/3)
+- 2026-09-16T09:33:11 item5 K3G-3 CONFIRMED punch-through: namedtuple/list-subclass instances bypass foreign-code quarantine (2-proc repro, mag()/shout() executed); dataclass+dict-fn controls quarantined correctly
+- 2026-09-16T09:36:38 item3 G3: parser is 5-field minute-grid (6-field rejected); * * * * * = exactly 60s floor; store create gate rejects 30s/59s. Verifying update gate + cap via repo tests next
+- 2026-09-16T09:37:38 item3 G3 NO punch-through: 6-field cron rejected; * * * * * == 60s floor exactly; sub-60s interval rejected on create+update (repo tests pass 3/3); aliases all >=hourly
+- 2026-09-16T09:38:58 item4 K3G-1: sibling direction STILL harvested verbatim into ledger (punch-through repro); user/CLI (undefined rel) + parent brief still collected = no user-intent regression
+- 2026-09-16T09:46:48 report written: 5/5 items closed; 2 punch-throughs (K3G-3 namedtuple P2, K3G-1 sibling P3), G3 clean, G2 clean, G1 no-double-count + 2 narrow residuals
+- 2026-09-16T09:47:16 lane done: report delivered to parent; repo clean check passed

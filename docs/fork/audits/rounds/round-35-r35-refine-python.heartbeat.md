@@ -1,0 +1,12 @@
+- 07:01:01 | start | session up; repo /Users/a1/Desktop/ai/prime-agent
+- 07:03:07 | env | created /tmp/audit_r/round-35/exp
+- 07:06:28 | report | wrote r35-refine-python.md (16449 chars)
+- read | harness.py 全文 + rlm/__init__.py proxy + refinement.ts 全文分片 + bootstrap allowlist；decisions.jsonl 去重（X-8/M1/M2/M5/MV-1/5/6/K3Q-3 已查，无本线同案）
+- baseline | unittest test_harness.py: Ran 50 tests OK
+- E1-E6/e1.py | 写路径零校验(trigger:null/outcome:null/evidence:[...])；loader 静默丢弃+save 持久化；id 重号(DUP True)；TOCTOU clobber(B event 未存活)；global 路由落地同文件
+- e2.py | E5a 未配置=抛(fail-closed 正控)；E5b symlink-loop 走 _degraded 内存态=静默成功且盘上无
+- ts_consumer.ts / ts_contract.ts / ts_inject.ts | TS 真函数读 Python 文件：null trigger/dict trigger/changes 非数组 → TypeError；python id 不在 rollback 历史(TS id 正控=True)；id/changes 换行伪造注入行
+- e3.py | 自带 id 不查重(['refine_0001','refine_0001'])；refinement 行绕过 _flatten_inline 伪造 overview 行；plan_refinement 无副作用
+- e4.py | global 库永不存在未配置(回退 agent dir 真写盘)；TS 形状事件 Python 原样读回
+- report | 写入 /tmp/audit_r/round-35/r35-refine-python.md 并校正 file:line 引用（sed 逐条核对）
+- 07:07:21 | send | reply to parent, 4020 chars

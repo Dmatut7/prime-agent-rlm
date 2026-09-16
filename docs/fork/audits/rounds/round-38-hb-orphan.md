@@ -1,0 +1,6 @@
+- 09:28:48 start orphan-reclaim audit; repo read-only
+- 09:32:59 journal+lease+retention read; real enumeration done
+- 09:38:31 evidence collection complete; writing report
+- 09:40:08 report written: /tmp/audit_r/round-38/orphan-reclaim.md
+- 09:40:22 report finalized
+- 09:40:34 replied to parent; going idle
