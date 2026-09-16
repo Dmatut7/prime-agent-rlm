@@ -101,6 +101,7 @@ import {
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../../core/rlm-runtime.js";
 import {
 	canPassivateSession,
+	clampForeignClockNow,
 	type IdleEvictionMinutes,
 	type SessionPassivationSnapshot,
 } from "../../core/session-action-store.js";
@@ -2950,12 +2951,21 @@ export class AgentDaemon {
 		}
 	}
 
+	/** Last supervisor clock reading plus this side's monotonic anchor for it. */
+	private foreignPassivationClock: { wall: number; mono: number } | undefined;
+
 	private async passivateIdleChildren(
 		idleEvictionMinutes: IdleEvictionMinutes,
 		now: number,
 		limit: number,
 	): Promise<number> {
 		if (this.shuttingDown || this.updateRestart !== undefined || limit <= 0) return 0;
+		// `now` is the supervisor's wall clock while the snapshots' activity timestamps are
+		// this worker's: clamp the borrowed reading by the monotonic time measured here since
+		// the previous sweep, so a forward step on either side cannot evict early.
+		const monoNow = performance.now();
+		now = clampForeignClockNow(now, this.foreignPassivationClock, monoNow);
+		this.foreignPassivationClock = { wall: now, mono: monoNow };
 		const states = [...this.sessions.values()];
 		const passiveRlmSubagents = await this.listPassiveRlmSubagents();
 		const snapshots = await Promise.all(

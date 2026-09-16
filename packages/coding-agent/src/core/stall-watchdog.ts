@@ -53,6 +53,7 @@
  */
 
 import { getLogger } from "@earendil-works/pi-ai";
+import { StepCompensatedClock } from "./clock-step.js";
 import { DEFAULT_STALL_ABORT_AFTER_SECONDS, DEFAULT_STALL_WARN_AFTER_SECONDS } from "./settings-manager.js";
 import {
 	formatStallDiagnosticsPointer,
@@ -68,12 +69,15 @@ export interface StallWatchdogTimers {
 	setTimeout: (callback: () => void, delayMs: number) => unknown;
 	clearTimeout: (handle: unknown) => void;
 	now: () => number;
+	/** Monotonic reading the elapsed-time floor is measured on. Defaults to performance.now(). */
+	monotonicNow?: () => number;
 }
 
 const defaultTimers: StallWatchdogTimers = {
 	setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
 	clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
 	now: () => Date.now(),
+	monotonicNow: () => performance.now(),
 };
 
 export type StallWatchdogStage = "warn" | "abort" | "abort_unsettled";
@@ -322,6 +326,8 @@ export class StallWatchdog {
 	private state: StallWatchdogState = "idle";
 	private armedAt = 0;
 	private lastActivityAt = 0;
+	/** Elapsed-time base for every age, budget and delay: absorbs backward wall steps. */
+	private readonly stepClock = new StepCompensatedClock();
 	private timerHandle: unknown = undefined;
 	private exemptionSegment: ExemptionSegment | undefined = undefined;
 	private lastKernelFacts: StallKernelFacts | undefined = undefined;
@@ -381,6 +387,13 @@ export class StallWatchdog {
 		return enabled && this.warnAfterMs > 0;
 	}
 
+	private stepNow(): number {
+		const raw = this.timers.now();
+		// An injected clock without a monotonic reading stays comparable to itself: the
+		// wall reading doubles as the monotonic one so the floor cannot drift the values.
+		return this.stepClock.now(raw, this.timers.monotonicNow?.() ?? raw);
+	}
+
 	/** Start watching a turn. Re-arming resets the escalation state and the exemption budget. */
 	arm(): void {
 		if (!this.active) {
@@ -388,7 +401,7 @@ export class StallWatchdog {
 			this.clearTimer();
 			return;
 		}
-		this.armedAt = this.timers.now();
+		this.armedAt = this.stepNow();
 		this.lastActivityAt = this.armedAt;
 		this.resetExemption();
 		this.state = "armed";
@@ -402,7 +415,7 @@ export class StallWatchdog {
 		// cancels the settle timer and restarts the warn→abort cycle, contradicting
 		// the "no infinite abort loops" guarantee in fireAbortUnsettled.
 		if (this.state === "aborting") return;
-		const now = this.timers.now();
+		const now = this.stepNow();
 		// Sampling on touch is what makes the budget honest: an exemption that is no
 		// longer claimed drops its accumulated time here instead of at the next fire,
 		// and one that is still claimed keeps it (never cleared unconditionally, or a
@@ -443,7 +456,7 @@ export class StallWatchdog {
 	get exemption(): StallExemptionSnapshot | undefined {
 		const segment = this.exemptionSegment;
 		if (!segment) return undefined;
-		const now = this.timers.now();
+		const now = this.stepNow();
 		const budgetMs = this.exemptionBudgetMs(segment.reason, segment.tier);
 		const usedMs = Math.max(0, now - segment.since);
 		return {
@@ -783,7 +796,7 @@ export class StallWatchdog {
 		}
 		this.timerHandle = undefined;
 		if (this.state === "idle") return;
-		const now = this.timers.now();
+		const now = this.stepNow();
 		// A fire is silence, not activity: a lapse seen here banks the accrued time.
 		const exemption = this.evaluateExemption(now, false);
 		if (exemption && !exemption.exhausted && exemption.reason === "paused") {
@@ -798,7 +811,7 @@ export class StallWatchdog {
 		this.emitStage("warn", exemption);
 		const abortAfterMs = this.abortAfterMs;
 		if (abortAfterMs === undefined || !this.hasAbortEscalation) return;
-		const delayMs = Math.max(0, abortAfterMs - (this.timers.now() - this.lastActivityAt));
+		const delayMs = Math.max(0, abortAfterMs - (this.stepNow() - this.lastActivityAt));
 		this.timerHandle = this.timers.setTimeout(() => this.fireAbort(), delayMs);
 	}
 
@@ -809,7 +822,7 @@ export class StallWatchdog {
 		}
 		this.timerHandle = undefined;
 		if (this.state !== "warned") return;
-		const now = this.timers.now();
+		const now = this.stepNow();
 		// A fire is silence, not activity: a lapse seen here banks the accrued time.
 		const exemption = this.evaluateExemption(now, false);
 		if (exemption && !exemption.exhausted) {
@@ -852,7 +865,7 @@ export class StallWatchdog {
 	private emitStage(stage: StallWatchdogStage, exemption?: StallExemptionSnapshot): void {
 		this.options.onStage({
 			stage,
-			silentMs: this.timers.now() - this.lastActivityAt,
+			silentMs: this.stepNow() - this.lastActivityAt,
 			armedAt: this.armedAt,
 			lastActivityAt: this.lastActivityAt,
 			...(exemption ? { exemption } : {}),
