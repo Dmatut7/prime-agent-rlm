@@ -565,3 +565,38 @@ describe("skills", () => {
 		});
 	});
 });
+
+describe("python import name collisions (RT-5 F6)", () => {
+	const dupA = createTestSkill({
+		name: "dup-a",
+		description: "first skill sharing an import name",
+		filePath: "/a/SKILL.md",
+		baseDir: "/a",
+		python: { importName: "skill_dup", packagePath: "/a", pyprojectPath: "/a/pyproject.toml" },
+	});
+	const dupB = createTestSkill({
+		name: "dup-b",
+		description: "second skill sharing an import name",
+		filePath: "/b/SKILL.md",
+		baseDir: "/b",
+		python: { importName: "skill_dup", packagePath: "/b", pyprojectPath: "/b/pyproject.toml" },
+	});
+
+	it("keeps exactly one runtime entry per import name (the first visible skill)", () => {
+		const runtime = getPythonSkillRuntimeInfo([dupA, dupB]);
+		// One authority decides who owns an import name: the first skill in the
+		// model-visible list. The install list and the kernel import list both flow from
+		// this, so they cannot disagree about which package wins.
+		expect(runtime).toHaveLength(1);
+		expect(runtime[0].name).toBe("dup-a");
+	});
+
+	it("marks only the winning skill as callable by import name in the prompt", () => {
+		const prompt = formatSkillsForPrompt([dupA, dupB]);
+		const tags = prompt.match(/<python_import>skill_dup<\/python_import>/g) ?? [];
+		expect(tags).toHaveLength(1);
+		// The shadowed skill is still listed (name/description/location), it just cannot
+		// claim the shared import name.
+		expect(prompt).toContain("dup-b");
+	});
+});

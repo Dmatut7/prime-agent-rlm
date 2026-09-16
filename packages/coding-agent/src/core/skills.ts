@@ -260,14 +260,24 @@ function detectPythonSkill(
 }
 
 export function getPythonSkillRuntimeInfo(skills: readonly Skill[]): PythonSkillRuntimeInfo[] {
-	return skills
-		.filter((skill): skill is PythonSkill => skill.kind === "python")
-		.map((skill) => ({
+	// One authority owns an import name: the first visible skill that declares it. The
+	// kernel import list, the venv install list, and the prompt's python_import tags all
+	// flow from this order, so two skills sharing a name can no longer be bound, installed,
+	// and advertised as three different winners.
+	const seenImportNames = new Set<string>();
+	const runtimeInfo: PythonSkillRuntimeInfo[] = [];
+	for (const skill of skills) {
+		if (skill.kind !== "python") continue;
+		if (seenImportNames.has(skill.python.importName)) continue;
+		seenImportNames.add(skill.python.importName);
+		runtimeInfo.push({
 			name: skill.name,
 			importName: skill.python.importName,
 			packagePath: skill.python.packagePath,
 			pyprojectPath: skill.python.pyprojectPath,
-		}));
+		});
+	}
+	return runtimeInfo;
 }
 
 /**
@@ -479,11 +489,22 @@ export function formatSkillsForPrompt(skills: Skill[]): string {
 		"<available_skills>",
 	];
 
+	// Same authority as getPythonSkillRuntimeInfo: the first visible skill with a given
+	// import name is the one the kernel actually binds, so only it may claim the
+	// python_import tag. The shadowed skill stays listed (name, description, location);
+	// it just cannot promise a callable import name it does not own.
+	const importNameOwners = new Map<string, Skill>();
+	for (const skill of visibleSkills) {
+		if (skill.kind === "python" && !importNameOwners.has(skill.python.importName)) {
+			importNameOwners.set(skill.python.importName, skill);
+		}
+	}
+
 	for (const skill of visibleSkills) {
 		lines.push("  <skill>");
 		lines.push(`    <name>${escapeXml(skill.name)}</name>`);
 		lines.push(`    <type>${skill.kind}</type>`);
-		if (skill.kind === "python") {
+		if (skill.kind === "python" && importNameOwners.get(skill.python.importName) === skill) {
 			lines.push(`    <python_import>${escapeXml(skill.python.importName)}</python_import>`);
 		}
 		lines.push(`    <description>${escapeXml(skill.description)}</description>`);

@@ -1343,6 +1343,50 @@ def _is_foreign_code_object(value: Any) -> bool:
     return getattr(loaded, getattr(value, "__name__", ""), None) is not value
 
 
+def _revival_degraded_names(staged: dict[str, Any], ns: dict[str, Any]) -> list[dict[str, str]]:
+    """Names dill revived with reduced semantics, so the restore report can say so.
+
+    A function pickled by value (the runtime pickles `__main__` functions by value so
+    they survive without importable source) comes back with a private copy of its
+    defining namespace: loading "succeeded", but the function keeps reading the values
+    it closed over at save time instead of the live kernel namespace, and the copy's
+    identity is frozen (aliases and isinstance against revived classes break). That is
+    neither a failed load nor an honest "available again", so it is reported
+    separately: the value is still applied, the claim is downgraded.
+
+    Detection is conservative: only a function whose globals is neither the live
+    namespace nor any loaded module's dict (a module function revived by reference
+    keeps its module's own dict), and which reads at least one revived or live name
+    whose frozen copy no longer holds the same object.
+    """
+    live_module_dicts: set[int] = set()
+    for module in list(sys.modules.values()):
+        module_dict = getattr(module, "__dict__", None)
+        if module_dict is not None:
+            live_module_dicts.add(id(module_dict))
+    reason = (
+        "revived with a frozen copy of its defining namespace: it reads the values it "
+        "closed over at save time, not the live kernel namespace"
+    )
+    degraded: list[dict[str, str]] = []
+    for name, value in staged.items():
+        fn = value.__func__ if inspect.ismethod(value) else value
+        if not isinstance(fn, types.FunctionType):
+            continue
+        fn_globals = fn.__globals__
+        if fn_globals is ns or id(fn_globals) in live_module_dicts:
+            continue
+        reads = (set(fn.__code__.co_names) - {"__builtins__"}) & (
+            set(staged) | (set(ns) - {"__builtins__"})
+        )
+        for read_name in sorted(reads):
+            live = staged.get(read_name, ns.get(read_name))
+            if live is not None and fn_globals.get(read_name) is not live:
+                degraded.append({"name": name, "reason": reason})
+                break
+    return degraded
+
+
 def _restore_state(
     ns: dict[str, Any],
     path: str,
@@ -1418,7 +1462,18 @@ def _restore_state(
     finally:
         if real_create_filehandle is not None:
             dill_dill._create_filehandle = real_create_filehandle  # type: ignore[union-attr]
-    result = {"restored": sorted(staged), "failed": failed}
+    degraded = _revival_degraded_names(staged, ns)
+    degraded_names = {entry["name"] for entry in degraded}
+    # Degraded values are still applied below - they are usable, just not the live
+    # objects an "available again" claim promises - but they leave `restored` so no
+    # host renders them as fully back. The field is additive: an older host that has
+    # no place for it simply never hears about these names, which is the behaviour it
+    # already had.
+    result = {
+        "restored": sorted(name for name in staged if name not in degraded_names),
+        "failed": failed,
+        **({"degraded": degraded} if degraded else {}),
+    }
     # Park SIGINT across the whole apply so it is all-or-nothing; the parked interrupt is consumed by the commit (as in snapshot).
     previous = signal.signal(signal.SIGINT, lambda signum, frame: None)
     try:

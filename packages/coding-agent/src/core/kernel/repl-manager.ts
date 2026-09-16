@@ -3005,6 +3005,10 @@ export class ReplKernelManager {
 			this.clearPendingRestore();
 			const restored = asStringArray(r.doneFields.restored);
 			const failed = asReasonArray(r.doneFields.failed);
+			// RT-5: names the runtime revived with reduced semantics (a by-value function
+			// carrying a frozen copy of its namespace). The runtime already keeps them out
+			// of `restored`; the host just has to carry the reason through.
+			const degraded = asReasonArray(r.doneFields.degraded);
 			// A partial revive no longer freezes persistence. The names that did not come back
 			// are remembered so later snapshots ask the runtime to carry their saved blobs over
 			// verbatim: new work is persisted, the unrestorable blobs are not overwritten, and a
@@ -3025,6 +3029,7 @@ export class ReplKernelManager {
 					path: cfg.path,
 					...(snapshotPolicy ? { snapshotPolicy } : {}),
 					...(notSaved.length > 0 ? { notSaved: [...notSaved] } : {}),
+					...(degraded.length > 0 ? { degraded } : {}),
 				},
 				timedOut: false,
 			};

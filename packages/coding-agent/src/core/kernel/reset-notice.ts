@@ -102,13 +102,19 @@ function rollbackLine(facts: KernelResetNoticeFacts): string {
 			? `These names came back: ${restore.restored.join(", ")}.`
 			: "No saved name could be revived.";
 	const missing = failed.length > 0 ? ` These could not be restored and must be rebuilt: ${failed.join(", ")}.` : "";
+	// The reduced-semantics tier: revived, callable, but reading values frozen at save
+	// time. Naming them here keeps the restart notice consistent with the resume notice.
+	const degraded =
+		restore.degraded && restore.degraded.length > 0
+			? ` These came back with reduced semantics (frozen save-time values, not the live namespace) and can silently misbehave: ${restore.degraded.map((entry) => entry.name).join(", ")}.`
+			: "";
 	// A name the snapshot never saved cannot fail to restore, so it would otherwise be absent from
 	// both this line and "must be rebuilt" - the exact silence this notice exists to break.
 	const notSaved =
 		restore.notSaved && restore.notSaved.length > 0
 			? ` These were live when that snapshot was written but were never saved into it, so they are gone and must be rebuilt: ${restore.notSaved.map((entry) => `${entry.name} (${entry.reason})`).join("; ")}.`
 			: "";
-	return `1. State was rolled back to the most recent snapshot (${snapshotAgeClause(facts)}). ${revived}${missing}${notSaved}${retried}`;
+	return `1. State was rolled back to the most recent snapshot (${snapshotAgeClause(facts)}). ${revived}${missing}${notSaved}${degraded}${retried}`;
 }
 
 function hostRequestLines(requests: readonly KernelHostRequestFact[]): string[] {

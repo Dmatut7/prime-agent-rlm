@@ -55,6 +55,196 @@ describe("RLM bootstrap", () => {
 const python = await resolveKernelPython("import rlm.repl, rlm; assert callable(rlm.emit)");
 const describeIfKernel = python ? describe : describe.skip;
 
+// ---------------------------------------------------------------------------
+// RT-5 (round-36): the callable-skill-module wrapper's contract has to hold for every
+// access path a model can take, not just the kernel-global name.
+// ---------------------------------------------------------------------------
+describeIfKernel("RLM bootstrap skill wrapping (RT-5)", { tags: ["kernel-heavy"] }, () => {
+	const skillsDir = mkdtempSync(join(tmpdir(), "prime-agent-rt5-skills-"));
+	const kernelDir = mkdtempSync(join(tmpdir(), "prime-agent-rt5-kernel-"));
+
+	afterAll(() => {
+		rmSync(skillsDir, { recursive: true, force: true });
+		rmSync(kernelDir, { recursive: true, force: true });
+	});
+
+	/** Writes a python skill package; returns its runtime info and src dir. */
+	function writeSkill(
+		dirName: string,
+		importName: string,
+		initPy: string,
+	): {
+		info: { name: string; importName: string; packagePath: string; pyprojectPath: string };
+		srcDir: string;
+	} {
+		const packagePath = join(skillsDir, dirName);
+		const srcDir = join(packagePath, "src", importName);
+		mkdirSync(srcDir, { recursive: true });
+		writeFileSync(join(srcDir, "__init__.py"), initPy);
+		const pyprojectPath = join(packagePath, "pyproject.toml");
+		writeFileSync(pyprojectPath, `[project]\nname = "${dirName}"\nversion = "0.1.0"\n`);
+		return {
+			info: { name: dirName, importName, packagePath, pyprojectPath },
+			srcDir: join(packagePath, "src"),
+		};
+	}
+
+	const alpha = writeSkill(
+		"skill-alpha",
+		"skill_alpha",
+		'import skill_beta\nB = skill_beta\n\n\nasync def run():\n    return "alpha"\n',
+	);
+	const beta = writeSkill("skill-beta", "skill_beta", 'import skill_alpha\n\n\nasync def run():\n    return "beta"\n');
+	const state = writeSkill(
+		"skill-state",
+		"skill_state",
+		"MARK = None\n\n\nasync def run():\n    return 1\n\n\nasync def read_mark():\n    return MARK\n",
+	);
+	const gamma = writeSkill(
+		"skill-gamma",
+		"skill_gamma",
+		"import definitely_missing_module_xyz\n\n\nasync def run():\n    return 'gamma'\n",
+	);
+
+	async function withSkillKernel(
+		skills: readonly {
+			info: { name: string; importName: string; packagePath: string; pyprojectPath: string };
+			srcDir: string;
+		}[],
+		cells: string[],
+	): Promise<string[]> {
+		const manager = new ReplKernelManager({
+			python: python as string,
+			cwd: kernelDir,
+			env: { PYTHONPATH: skills.map((skill) => skill.srcDir).join(":") },
+		});
+		try {
+			await manager.start();
+			const bootstrap = await manager.execute(buildRlmBootstrapCode(skills.map((skill) => skill.info)));
+			expect(bootstrap.status).toBe("ok");
+			const out: string[] = [];
+			for (const cell of cells) {
+				const result = await manager.execute(cell);
+				expect(result.status).toBe("ok");
+				out.push(result.stdout);
+			}
+			return out;
+		} finally {
+			await manager.shutdown({ snapshot: true, drainHostRequests: true });
+		}
+	}
+
+	it("gives cross-skill module references the callable wrapper too (F1)", async () => {
+		const out = await withSkillKernel(
+			[alpha, beta],
+			[
+				"import skill_alpha as sa\nprint('wrapper:', type(sa.B).__name__ == '_PrimeAgentCallableSkillModule')\nprint('callable:', callable(sa.B))\nprint('await:', await sa.B())",
+			],
+		);
+		expect(out[0]).toContain("wrapper: True");
+		expect(out[0]).toContain("callable: True");
+		expect(out[0]).toContain("await: beta");
+	}, 60_000);
+
+	it("shares the wrapper namespace with the skill's own functions (F2)", async () => {
+		const out = await withSkillKernel(
+			[state],
+			[
+				"import skill_state as st\nprint('shared:', st.run.__globals__ is st.__dict__)\nst.MARK = 7\nprint('sees:', await st.read_mark())",
+			],
+		);
+		expect(out[0]).toContain("shared: True");
+		expect(out[0]).toContain("sees: 7");
+	}, 60_000);
+
+	it("keeps inspect.signature and importlib.reload honest after a reload (F3)", async () => {
+		const sig = writeSkill("skill-sig", "skill_sig", "async def run(x=1):\n    return x\n");
+		const out = await withSkillKernel(
+			[sig, alpha, beta],
+			[
+				"import skill_sig as s, inspect\nprint('sig1:', str(inspect.signature(s)))",
+				"import importlib, inspect\nimportlib.reload(s)\nprint('sig2:', str(inspect.signature(s)))",
+				"import importlib, skill_alpha as sa\nimportlib.reload(sa.B)\nprint('cross_reload: ok')",
+			],
+		);
+		expect(out[0]).toContain("sig1: (x=1)");
+		// Rewrite run's signature on disk, then reload: the wrapper must not keep the
+		// startup-time signature snapshot.
+		writeFileSync(join(sig.srcDir, "skill_sig", "__init__.py"), "async def run(x=1, y=2):\n    return x + y\n");
+		const manager = new ReplKernelManager({
+			python: python as string,
+			cwd: kernelDir,
+			env: { PYTHONPATH: [sig.srcDir, alpha.srcDir, beta.srcDir].join(":") },
+		});
+		try {
+			await manager.start();
+			const bootstrap = await manager.execute(buildRlmBootstrapCode([sig.info, alpha.info, beta.info]));
+			expect(bootstrap.status).toBe("ok");
+			const result = await manager.execute(
+				"import skill_sig as s, importlib, inspect\nimportlib.reload(s)\nprint('sig3:', str(inspect.signature(s)))",
+			);
+			expect(result.status).toBe("ok");
+			expect(result.stdout).toContain("sig3: (x=1, y=2)");
+		} finally {
+			await manager.shutdown({ snapshot: true, drainHostRequests: true });
+		}
+	}, 90_000);
+
+	it("gives every access path to a failed skill the same named RuntimeError (F4)", async () => {
+		const out = await withSkillKernel(
+			[gamma],
+			[
+				"import skill_gamma\nprint('import_bound:', skill_gamma.__name__)",
+				"try:\n    await skill_gamma.run()\nexcept RuntimeError as e:\n    print('run_error_named:', 'skill_gamma' in str(e))",
+				"try:\n    skill_gamma.NOPE_ATTR\nexcept RuntimeError as e:\n    print('attr_error_named:', 'skill_gamma' in str(e))\nexcept AttributeError as e:\n    print('attr_error_leaked:', type(e).__name__)",
+				"from skill_gamma import run as gamma_run\ntry:\n    await gamma_run()\nexcept RuntimeError as e:\n    print('fromimport_error_named:', 'skill_gamma' in str(e))",
+			],
+		);
+		expect(out[0]).toContain("import_bound: skill_gamma");
+		expect(out[1]).toContain("run_error_named: True");
+		expect(out[2]).toContain("attr_error_named: True");
+		expect(out[2]).not.toContain("attr_error_leaked");
+		expect(out[3]).toContain("fromimport_error_named: True");
+	}, 60_000);
+
+	it("refuses to wrap skill import names that collide with kernel-provided modules (F5)", async () => {
+		const fakeAsyncio = {
+			info: {
+				name: "asyncio-hijack",
+				importName: "asyncio",
+				packagePath: "/nonexistent",
+				pyprojectPath: "/nonexistent/pyproject.toml",
+			},
+			srcDir: "/nonexistent",
+		};
+		const fakeRlm = {
+			info: {
+				name: "rlm-hijack",
+				importName: "rlm",
+				packagePath: "/nonexistent",
+				pyprojectPath: "/nonexistent/pyproject.toml",
+			},
+			srcDir: "/nonexistent",
+		};
+		const out = await withSkillKernel(
+			[fakeAsyncio, fakeRlm],
+			[
+				"import sys, asyncio\nprint('asyncio_type:', type(asyncio).__name__)\nprint('sys_asyncio_type:', type(sys.modules['asyncio']).__name__)",
+				"import sys\nprint('rlm_replaced:', type(sys.modules['rlm']).__name__ == '_PrimeAgentCallableSkillModule')\nprint('rlm_still_callable:', callable(rlm))",
+				"print('refused_asyncio:', 'asyncio' in _PRIME_AGENT_SKILL_IMPORT_ERRORS)\nprint('refused_rlm:', 'rlm' in _PRIME_AGENT_SKILL_IMPORT_ERRORS)",
+			],
+		);
+		expect(out[0]).toContain("asyncio_type: module");
+		expect(out[0]).toContain("sys_asyncio_type: module");
+		// The runtime's own rlm module is a callable module by design; what must not
+		// happen is the bootstrap replacing it with a skill wrapper snapshot.
+		expect(out[1]).toContain("rlm_replaced: False");
+		expect(out[1]).toContain("rlm_still_callable: True");
+		expect(out[2]).toContain("refused_asyncio: True");
+		expect(out[2]).toContain("refused_rlm: True");
+	}, 60_000);
+});
+
 describeIfKernel("RLM bootstrap (real kernel)", () => {
 	const dir = mkdtempSync(join(tmpdir(), "prime-agent-bootstrap-"));
 
