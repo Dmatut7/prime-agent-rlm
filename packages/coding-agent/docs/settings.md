@@ -459,6 +459,11 @@ The two switches that matter most:
 - `retention.dryRun: true` (or `PRIME_AGENT_RETENTION_DRYRUN=1`) does the same for one run; a dry run
   and a real run scan the same set with the same reasons, so what a dry run reports is what a real
   sweep reclaims.
+- `retention.sweepLockEnabled: false` is the rollback lever for the sweep guard. The guard is an
+  account-integrity lock, not a delete-safety lock: it keeps one per-sweep circuit breaker and one
+  serialized rewrite of `history.jsonl`. A guard that cannot be created (a read-only agent dir)
+  degrades to an unlocked sweep with a log line rather than stopping cleanup, and a contended sweep
+  leaves `<agentDir>/retention/sweep-in-progress.json` naming the holder pid and start time.
 
 Each sweep stops after a circuit breaker (`retention.maxDeleteBytesPerSweep`, default 512 MiB, and
 `retention.maxDeleteEntriesPerSweep`, default 20000); a non-positive value for either keeps the
@@ -473,6 +478,7 @@ with one compact line per sweep appended to `<agentDir>/retention/history.jsonl`
 | `retention.maxDeleteBytesPerSweep` | number | `536870912` | Bytes one sweep may reclaim before it stops; non-positive keeps the default |
 | `retention.maxDeleteEntriesPerSweep` | number | `20000` | Entries one sweep may reclaim before it stops; non-positive keeps the default |
 | `retention.cooldownMinutes` | number | `10` | Any candidate touched more recently is kept; non-positive keeps the default |
+| `retention.sweepLockEnabled` | boolean | `true` | One sweep per agent dir at a time, across processes: a second trigger reports the last sweep instead of walking the tree twice and re-writing the sweep history. `false` goes back to concurrent sweeps |
 | `retention.emptyArtifactDirDays` | number | `7` | Artifact directories with no file anywhere in the subtree, once the session that owned them is provably gone; `0` disables |
 | `retention.deletedSessionResidueDays` | number | `7` | Artifact directories that still hold leftovers (a semantic-edges stub, a local harness copy, a stale kernel snapshot) of a session whose deletion is on record; `0` disables. A directory whose id was reused by a new session is never reclaimed |
 | `retention.childTranscriptDays` | number | `30` | Sub-agent transcripts (`sub-xxxxxxxx/<uuid>.jsonl`) older than this. A live child is kept by its ledger edge; a deleted child's transcript is residue whose durable record is the display tombstone plus the ledger delete record. `0` = off |

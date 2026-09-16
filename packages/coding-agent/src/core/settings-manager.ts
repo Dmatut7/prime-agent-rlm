@@ -302,6 +302,13 @@ export interface RetentionSettings {
 	maxDeleteEntriesPerSweep?: number;
 	/** Any candidate touched more recently than this is kept. Default: 10. */
 	cooldownMinutes?: number;
+	/**
+	 * The cross-process sweep guard. Default: true. With it, a second trigger of the
+	 * sweep - another daemon, or `retention sweep` while a tick is running - reports
+	 * the last sweep instead of walking the tree a second time. Set false to go back
+	 * to concurrent sweeps.
+	 */
+	sweepLockEnabled?: boolean;
 	/** Empty artifact directories of a provably gone session. Default: 7; 0 = off. */
 	emptyArtifactDirDays?: number;
 	/** Non-empty artifact directories left by a provably deleted session. Default: 7; 0 = off. */
@@ -638,6 +645,7 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 		"maxDeleteBytesPerSweep",
 		"maxDeleteEntriesPerSweep",
 		"cooldownMinutes",
+		"sweepLockEnabled",
 		"emptyArtifactDirDays",
 		"deletedSessionResidueDays",
 		"childTranscriptDays",
@@ -2569,6 +2577,9 @@ export function resolveRetentionSettings(settings?: RetentionSettings): Resolved
 		// Unlike a class window, the cooldown cannot be switched off: a non-positive
 		// value keeps the shipped window, so "no cooldown" is not reachable by config.
 		cooldownMinutes: normalizeRetentionCap(settings?.cooldownMinutes, DEFAULT_RETENTION_COOLDOWN_MINUTES),
+		// On by default: the guard is the account-integrity fix, and it degrades to an
+		// unlocked sweep by itself whenever it cannot be taken (see retention/runner.ts).
+		sweepLockEnabled: settings?.sweepLockEnabled !== false,
 		emptyArtifactDirDays: normalizeRetentionWindowDays(
 			settings?.emptyArtifactDirDays,
 			DEFAULT_RETENTION_EMPTY_ARTIFACT_DIR_DAYS,

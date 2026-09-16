@@ -21,6 +21,14 @@ import type { RetentionRoots, RetentionSweepReport } from "./types.js";
 export const RETENTION_DIR_NAME = "retention";
 export const LAST_SWEEP_FILE_NAME = "last-sweep.json";
 export const HISTORY_FILE_NAME = "history.jsonl";
+/**
+ * The cross-process sweep guard (ADC-3): a proper-lockfile directory inside the
+ * retention dir, so the report writer and the lock live in one place and a sweep
+ * of another agent dir cannot collide with it. `sweep-in-progress.json` is the
+ * owner record published while the guard is held: it names who to wait for.
+ */
+export const SWEEP_GUARD_FILE_NAME = "sweep.guard";
+export const SWEEP_IN_PROGRESS_FILE_NAME = "sweep-in-progress.json";
 const HISTORY_LIMIT = 200;
 
 /** The roots one sweep works on, derived the same way the native code derives them. */
@@ -50,6 +58,14 @@ export function lastSweepPath(roots: RetentionRoots): string {
 
 export function retentionHistoryPath(roots: RetentionRoots): string {
 	return join(roots.retentionDir, HISTORY_FILE_NAME);
+}
+
+export function sweepGuardPath(roots: RetentionRoots): string {
+	return join(roots.retentionDir, SWEEP_GUARD_FILE_NAME);
+}
+
+export function sweepInProgressPath(roots: RetentionRoots): string {
+	return join(roots.retentionDir, SWEEP_IN_PROGRESS_FILE_NAME);
 }
 
 /** Compact form for the history line: the skipped list is dropped, the counts stay. */
