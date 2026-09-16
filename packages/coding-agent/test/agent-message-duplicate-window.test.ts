@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { AgentFamilyRosterResult } from "../src/core/agent-messages.js";
 import {
 	type AgentSessionMessageReceipt,
+	classifyAgentMessageSendFailureByMessage,
 	createAgentMessageHostHandlers,
-	isRetryableAgentMessageSendError,
 } from "../src/core/agent-messages.js";
 
 /**
@@ -90,7 +90,7 @@ describe("the errored-first-send duplicate window (four-step check)", () => {
 		// Fail closed, and say what to do instead of guessing.
 		expect(message).toContain("agent_observe");
 		expect(message).toMatch(/new message_id|fresh id|new call/i);
-		expect(isRetryableAgentMessageSendError(message)).toBe(false);
+		expect(classifyAgentMessageSendFailureByMessage(message).deliveredNothing).toBe(false);
 	});
 
 	it("does not block the retry that is the correct action after a pre-delivery refusal", async () => {

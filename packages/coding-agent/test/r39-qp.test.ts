@@ -4,9 +4,9 @@ import {
 	AGENT_MESSAGE_SOURCE,
 	type AgentFamilyRosterResult,
 	type AgentSessionMessagePayload,
+	classifyAgentMessageSendFailureByMessage,
 	createAgentMessageHostHandlers,
 	createAgentSessionMessage,
-	isRetryableAgentMessageSendError,
 } from "../src/core/agent-messages.js";
 import { createHarness, getUserTexts, type Harness } from "./suite/harness.js";
 import { createDeferred, createWaitingHarness } from "./suite/scheduling.js";
@@ -187,8 +187,11 @@ describe("r39 QP-2: the admission-pause refusal is retryable for agent-message s
 		return { handlers, deliveries: () => deliveries };
 	}
 
-	it("classifies the admission-pause refusal as retryable", () => {
-		expect(isRetryableAgentMessageSendError(pausedText)).toBe(true);
+	it("classifies the admission-pause refusal as delivered-nothing and retry-now", () => {
+		expect(classifyAgentMessageSendFailureByMessage(pausedText)).toEqual({
+			deliveredNothing: true,
+			retryNowSucceeds: true,
+		});
 	});
 
 	it("an admission-pause refusal leaves the message id unspent so the resend reaches the delivery leg", async () => {
@@ -215,11 +218,11 @@ describe("r39 QP-2: the admission-pause refusal is retryable for agent-message s
 			(thrown: unknown) => thrown,
 		);
 		expect(error).toBeInstanceOf(Error);
-		const err = error as { name?: string; message?: string; retryable?: boolean };
+		const err = error as { name?: string; message?: string; retryNowSucceeds?: boolean };
 		expect(err.name).toBe("SessionInputAdmissionPausedError");
 		expect(err.message).toContain("session input admission is paused");
-		expect(err.retryable).toBe(true);
-		expect(isRetryableAgentMessageSendError(err.message ?? "")).toBe(true);
+		expect(err.retryNowSucceeds).toBe(true);
+		expect(classifyAgentMessageSendFailureByMessage(err.message ?? "").deliveredNothing).toBe(true);
 		expect(harness.getPendingResponseCount()).toBe(1);
 		pause.release();
 	});
@@ -243,10 +246,17 @@ describe("r39 QP-2: the admission-pause refusal is retryable for agent-message s
 				() => undefined,
 				(thrown: unknown) => thrown,
 			);
-		const err = error as { name?: string; message?: string; retryable?: boolean };
+		const err = error as { name?: string; message?: string; retryNowSucceeds?: boolean };
 		expect(err.name).toBe("SessionInputAdmissionPausedError");
-		expect(err.retryable).toBe(true);
-		expect(isRetryableAgentMessageSendError(err.message ?? "")).toBe(true);
+		// D1a (r41): the teardown lease is restart-only, so the refusal is still
+		// pre-delivery (resend after the restart) but not retry-now.
+		expect(err.retryNowSucceeds).toBe(false);
+		expect(err.message).toContain("update-restart teardown");
+		expect(err.message).toContain("resend after the restart");
+		expect(classifyAgentMessageSendFailureByMessage(err.message ?? "")).toEqual({
+			deliveredNothing: true,
+			retryNowSucceeds: false,
+		});
 		// The reply was refused, not parked: nothing runs during teardown.
 		expect(harness.session.isQueuedWorkSuspended).toBe(true);
 		expect(harness.getPendingResponseCount()).toBe(1);
@@ -305,10 +315,10 @@ describe("r39 QP-3: coalesce tickets and the committing window", () => {
 			() => undefined,
 			(thrown: unknown) => thrown,
 		);
-		const err = error as { name?: string; message?: string; retryable?: boolean };
+		const err = error as { name?: string; message?: string; retryNowSucceeds?: boolean };
 		expect(err.name).toBe("SessionInputCoalescingError");
-		expect(err.retryable).toBe(true);
-		expect(isRetryableAgentMessageSendError(err.message ?? "")).toBe(true);
+		expect(err.retryNowSucceeds).toBe(true);
+		expect(classifyAgentMessageSendFailureByMessage(err.message ?? "").deliveredNothing).toBe(true);
 		expect(harness.session.unfinishedActionCount).toBe(1);
 
 		dispatchGate.resolve();

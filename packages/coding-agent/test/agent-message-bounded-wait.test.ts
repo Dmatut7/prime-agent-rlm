@@ -2,8 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentFamilyRosterResult } from "../src/core/agent-messages.js";
 import {
 	type AgentSessionMessageReceipt,
+	classifyAgentMessageSendFailureByMessage,
 	createAgentMessageHostHandlers,
-	isRetryableAgentMessageSendError,
 } from "../src/core/agent-messages.js";
 import { DEFAULT_HOST_REQUEST_MAX_AGE_MS } from "../src/core/turn-liveness.js";
 import {
@@ -149,7 +149,7 @@ describe("agent_message.send bounded target wait (P1-1)", () => {
 describe("retryable classification of the new bounded waits (M6b)", () => {
 	it("counts a timed-out wait toward the three-strike terminal gate", () => {
 		const message = formatWaitTimeoutMessage({ phase: "passivation", target: "/tmp/s.jsonl", waitedMs: 120_000 });
-		expect(isRetryableAgentMessageSendError(message)).toBe(true);
+		expect(classifyAgentMessageSendFailureByMessage(message).deliveredNothing).toBe(true);
 	});
 
 	it("counts an exhausted re-entry budget, and not an unrelated failure", () => {
@@ -160,10 +160,10 @@ describe("retryable classification of the new bounded waits (M6b)", () => {
 			target: "child-1",
 			maxAttempts: DEFAULT_ATTEMPT_BUDGET_MAX,
 		});
-		expect(isRetryableAgentMessageSendError(exhausted.message)).toBe(true);
+		expect(classifyAgentMessageSendFailureByMessage(exhausted.message).deliveredNothing).toBe(true);
 		expect(exhausted.retryable).toBe(true);
 		// Negative control: a plain delivery failure stays non-retryable.
-		expect(isRetryableAgentMessageSendError('No child matches "worker"')).toBe(false);
+		expect(classifyAgentMessageSendFailureByMessage('No child matches "worker"').deliveredNothing).toBe(false);
 	});
 });
 

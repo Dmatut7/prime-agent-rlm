@@ -65,6 +65,7 @@ import {
 	assertAgentMessageQueueCapacity,
 	assertAgentSessionNameAvailable,
 	assertDirectAgentMessageTarget,
+	classifyAgentMessageSendFailureByMessage,
 	countsAsDeliveredParentReply,
 	createAgentMessageHostHandlers,
 	DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
@@ -75,7 +76,6 @@ import {
 	isAgentSessionMessage,
 	isAgentSessionMessagePrompt,
 	isChildReplyToThisSession,
-	isRetryableAgentMessageSendError,
 	normalizeAgentSessionMessage,
 	parseAgentSessionMessagePromptId,
 	QueuedParentReplyBackfills,
@@ -1649,7 +1649,7 @@ export class AgentSession {
 	private _sessionInputSuspendedForUpdateRestart = false;
 	// Branch mutation pause leases can overlap and must all release before dispatch resumes.
 	private readonly _queuedWorkPauses = new Set<symbol>();
-	private readonly _sessionInputAdmissionPauses = new Set<symbol>();
+	private readonly _sessionInputAdmissionPauses = new Map<symbol, { forUpdateRestart: boolean }>();
 	/** Admission pause held while the update-restart teardown fence is up (QP-2, r39). */
 	private _updateRestartAdmissionPause: { release(): void } | undefined;
 	private readonly _durableRlmTerminalNoticeActionIds = new Set<string>();
@@ -7962,7 +7962,10 @@ export class AgentSession {
 			});
 		}
 		if (this._sessionInputAdmissionPauses.size > 0) {
-			throw new SessionInputAdmissionPausedError({ pausedCount: this._sessionInputAdmissionPauses.size });
+			throw new SessionInputAdmissionPausedError({
+				pausedCount: this._sessionInputAdmissionPauses.size,
+				forUpdateRestart: this._anySessionInputPauseForUpdateRestart(),
+			});
 		}
 		if (this._sessionInputPumpSuspended) {
 			throw new SessionInputSuspendedError({
@@ -8000,7 +8003,10 @@ export class AgentSession {
 			options.admissionPauseExempt !== true &&
 			this._sessionInputAdmissionPauses.size > 0
 		) {
-			throw new SessionInputAdmissionPausedError({ pausedCount: this._sessionInputAdmissionPauses.size });
+			throw new SessionInputAdmissionPausedError({
+				pausedCount: this._sessionInputAdmissionPauses.size,
+				forUpdateRestart: this._anySessionInputPauseForUpdateRestart(),
+			});
 		}
 		if (
 			options.restore !== true &&
@@ -9239,9 +9245,9 @@ export class AgentSession {
 		}
 	}
 
-	acquireSessionInputPause(): { release(): void } {
+	acquireSessionInputPause(options: { forUpdateRestart?: boolean } = {}): { release(): void } {
 		const token = Symbol("session-input-admission-pause");
-		this._sessionInputAdmissionPauses.add(token);
+		this._sessionInputAdmissionPauses.set(token, { forUpdateRestart: options.forUpdateRestart === true });
 		this._sessionInputPumpRequested = false;
 		this._sessionInputPumpEpoch++;
 		let released = false;
@@ -9257,6 +9263,14 @@ export class AgentSession {
 				this._scheduleSessionInputPump();
 			},
 		};
+	}
+
+	/** True when any held admission pause belongs to the update-restart teardown window. */
+	private _anySessionInputPauseForUpdateRestart(): boolean {
+		for (const pause of this._sessionInputAdmissionPauses.values()) {
+			if (pause.forUpdateRestart) return true;
+		}
+		return false;
 	}
 
 	acquireQueuedWorkPause(): { release(): void } {
@@ -9691,7 +9705,10 @@ export class AgentSession {
 		// error) lets the sender redeliver after the restart instead. Released when
 		// the fence marker is cleared (requestAbort) or the suspension is lifted.
 		this._updateRestartAdmissionPause?.release();
-		this._updateRestartAdmissionPause = this.acquireSessionInputPause();
+		// D1a: the teardown lease is flagged so the queued path's pause refusal
+		// reports retryNowSucceeds=false (the session is closing; resend after the
+		// restart) instead of luring senders into burning retries against it.
+		this._updateRestartAdmissionPause = this.acquireSessionInputPause({ forUpdateRestart: true });
 		this._cancelPostCompactionContinue();
 		this.abortRetry();
 		for (const controller of this._rlmQuiescenceWaitAborts) controller.abort();
@@ -13113,7 +13130,11 @@ export class AgentSession {
 	private _terminalizeRepeatedAgentMessageSendFailure(target: string, error: unknown): Error {
 		const message = error instanceof Error ? error.message : String(error);
 		const original = error instanceof Error ? error : new Error(message);
-		if (!isRetryableAgentMessageSendError(message)) {
+		// (a) drives the strike count: only a provably pre-delivery refusal is
+		// retryable bookkeeping. (b) drives the terminal guidance once the budget
+		// is burned: an update-restart fence must not invite another retry.
+		const classification = classifyAgentMessageSendFailureByMessage(message);
+		if (!classification.deliveredNothing) {
 			this._agentMessageSendFailures.delete(target);
 			return original;
 		}
@@ -13131,7 +13152,14 @@ export class AgentSession {
 			attempts,
 			lastError: message,
 		});
-		return new Error(formatAgentMessageRetryExhaustedError({ target, attempts, lastError: message }));
+		return new Error(
+			formatAgentMessageRetryExhaustedError({
+				target,
+				attempts,
+				lastError: message,
+				fenced: classification.retryNowSucceeds === false,
+			}),
+		);
 	}
 
 	getRlmChildRunStatus(childId: string): RlmChildAgentStatus | undefined {
