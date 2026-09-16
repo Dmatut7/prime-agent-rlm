@@ -1,17 +1,14 @@
 // Child transcripts: `sub-xxxxxxxx/<uuid>.jsonl` under an artifact root.
 //
-// OFF BY DEFAULT (round-09 ruling 1: "sub-agent dill/transcripts are not reclaimed
-// by age"). The bytes are real (round-08 D-2 measured 1,977 MiB of child
-// transcripts on this machine) but they sit on live references, and the source
-// deliberately keeps a deleted RLM child's transcript: daemon-mode.ts records the
-// transcript plus a display tombstone as the durable record of that child. Age is
-// therefore the owner's call, and `retention.childTranscriptDays = 0` ships the
-// answer "no".
-//
-// When it is switched on, three judgements must all pass before a transcript goes:
-// the ledger has no live edge for that child, no resident or leased session holds
-// it, and every file in the transcript's directory is older than the window (a
-// writer that is mid-flush keeps its file).
+// Reclaims a deleted child's transcript after the age window (default 30 days,
+// r38 LIFE-2): a deleted RLM child's durable record is the display tombstone plus
+// the ledger delete record, not the transcript bytes, so once the window passes
+// the bytes are residue. The round-09 ruling 1 concern - "the bytes ride live
+// sub-agent references" - is enforced rather than assumed: three judgements must
+// all pass before a transcript goes, the ledger scan positively reports no live
+// edge for that child (an unreadable ledger proves nothing and keeps everything),
+// no resident or leased session holds it, and every file in the transcript's
+// directory is older than the window (a writer that is mid-flush keeps its file).
 import { join, resolve } from "node:path";
 import { reclaimWithinBudget } from "./delete.js";
 import { aggregateTree, listDirectory, quietLstat } from "./fs-walk.js";
@@ -79,6 +76,14 @@ export const childTranscriptsModule: RetentionClassModule = {
 				const path = join(dir, entry.name);
 				scanned += 1;
 				const sessionId = entry.name.replace(/\.jsonl$/, "");
+				// The ledger is the only positive record of a passive child's liveness.
+				// A scan that failed proves nothing about live edges, and with a window
+				// shipped by default "unknown" must not read as "no live edge", or an
+				// unreadable ledger would age out live children's transcripts.
+				if (context.live.ledgerScanned !== true) {
+					skipped.push({ path, reason: SKIP.unverifiable("ledger-scan") });
+					continue;
+				}
 				if (context.live.ledgerLiveChildIds?.has(sessionId)) {
 					skipped.push({ path, reason: SKIP.reference("ledger-live") });
 					continue;

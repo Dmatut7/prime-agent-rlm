@@ -89,7 +89,7 @@ export interface ResolvedRetentionSettings {
 	emptyArtifactDirDays: number;
 	/** Non-empty artifact directories left by a provably deleted session (0 = off). */
 	deletedSessionResidueDays: number;
-	/** Child transcripts by age (0 = off; the shipped default is off, see D-1). */
+	/** Child transcripts by age (0 = off; default 30, see r38 LIFE-2). */
 	childTranscriptDays: number;
 	/** Log files whose socket is gone (0 = off). */
 	logFileDays: number;
@@ -151,6 +151,12 @@ export interface RetentionLiveReferences {
 	leasedSessionIds?: ReadonlySet<string>;
 	/** Child session ids the ledger recorded as deleted (positive evidence). */
 	ledgerDeletedChildIds?: ReadonlySet<string>;
+	/**
+	 * Whether the ledger scan actually read records. False or undefined means
+	 * the live/deleted sets are unknown, not empty: a class that would delete on
+	 * "no live edge" must keep the candidate instead (r38 LIFE-2).
+	 */
+	ledgerScanned?: boolean;
 	/** Lease directories currently held in this process. */
 	activeLeaseDirectories?: ReadonlySet<string>;
 }
