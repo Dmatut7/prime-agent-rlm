@@ -20,6 +20,7 @@
 import { join, resolve } from "node:path";
 import { readSessionArtifactTombstones, tombstoneInForce } from "../session-artifact-tombstones.js";
 import { isValidSessionId } from "../session-id.js";
+import { judgeChildTranscriptAge } from "./child-transcripts.js";
 import { RETENTION_TRASH_PREFIX, reclaimWithinBudget, statSignature } from "./delete.js";
 import { aggregateTree, listDirectory, quietLstat, type TreeAggregate } from "./fs-walk.js";
 import { readKernelSnapshotGenerationState } from "./kernel-snapshot.js";
@@ -387,9 +388,38 @@ function descendantBlocker(
 			};
 		}
 	}
-	for (const id of candidate.tree.transcriptIds) {
-		if (context.live.ledgerDeletedChildIds?.has(id)) continue;
-		return { path: candidate.path, reason: SKIP.reference(`descendant-transcript:${id}`) };
+	for (const transcript of candidate.tree.transcripts) {
+		// A transcript whose child the ledger recorded as deleted is residue of a
+		// session that is gone - but the bytes are the transcript class's to judge,
+		// and its window (`childTranscriptDays`) is longer than this directory's
+		// residue window. Removing the directory at the residue window would take
+		// bytes the transcript class promised to keep (ADC-1), so the window
+		// judgement is asked here through the same function the class uses: one
+		// authority, two call sites. A directory whose protected bytes are all past
+		// their own window is reclaimed as a whole, which is the end state the
+		// transcript class would have reached on its own.
+		if (context.live.ledgerDeletedChildIds?.has(transcript.id)) {
+			const days = context.settings.childTranscriptDays;
+			const verdict = judgeChildTranscriptAge({
+				transcriptPath: transcript.path,
+				now: context.now,
+				days,
+			});
+			if (verdict.status === "expired") continue;
+			if (verdict.status === "unverifiable") {
+				return {
+					path: candidate.path,
+					reason: SKIP.unverifiable("child-transcript-tree"),
+					detail: `cannot age ${transcript.path}`,
+				};
+			}
+			return {
+				path: candidate.path,
+				reason: SKIP.young(`child-transcript:${days}d`),
+				detail: `${transcript.path} is inside its transcript window`,
+			};
+		}
+		return { path: candidate.path, reason: SKIP.reference(`descendant-transcript:${transcript.id}`) };
 	}
 	return undefined;
 }

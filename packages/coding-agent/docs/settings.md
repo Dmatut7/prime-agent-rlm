@@ -487,6 +487,30 @@ with one compact line per sweep appended to `<agentDir>/retention/history.jsonl`
 | `retention.venvRetention` | number | `1` | Retired kernel venv generations kept (the boot path's `RETIRED_VENV_RETENTION`) |
 | `retention.venvReclaim` | boolean | `false` | Let the sweep reclaim retired kernel venv generations. Off: the sweep reports what the boot path would prune, and only `bootstrap.ts` prunes for real, because it can name the generation it is about to spawn from while a sweep cannot |
 
+#### Which window applies to which bytes
+
+A directory is not one kind of content. An artifact directory left by a deleted session holds its own
+residue (`harness/`, `kernel-state/`, `semantic-edges.jsonl`) *and* the deleted sub-agents' transcripts
+under `sub-xxxxxxxx/`, and those bytes do not have the same lifetime. Each identity therefore has one
+window and exactly one implementation that judges it - the window follows the bytes' identity, not the
+directory they sit in:
+
+| Bytes (by identity) | Window | The one judge |
+|---------------------|--------|---------------|
+| `sub-*/<uuid>.jsonl` transcript of a non-live child, deleted children included | `retention.childTranscriptDays` (`30`) | the `child-transcripts` class: age is the newer of the transcript's own mtime and the newest write anywhere in the `sub-*` directory that holds it (a sibling writer mid-flush keeps the file) |
+| `sub-*/rlm-subagent.json` display tombstone | none of its own - it lives and dies with its transcript | none: it goes when its directory goes |
+| the rest of a deleted session's directory (`harness/`, `kernel-state/`, `semantic-edges.jsonl`, trash) | `retention.deletedSessionResidueDays` (`7`) | the `artifact-residue-dirs` class |
+| a directory with no file anywhere in its subtree | `retention.emptyArtifactDirDays` (`7`) | the `artifact-empty-dirs` class |
+| ledger records | no age; only records that replay identically without them may be compacted | the rlm-ledger compaction path |
+
+Rule for mixed directories (max-window): **a directory may only be removed as a whole once every
+protected byte inside it has passed its own window**, so a mixed directory lives until the maximum of
+the windows of the bytes it holds. With the shipped defaults a deleted session's directory that still
+contains a child transcript is kept between days 7 and 30 with the reason
+`young:child-transcript:30d`, and is reclaimed in a single pass after day 30 - the same end state the
+7-day residue window produced, one window later. A directory without protected bytes inside keeps its
+7-day life.
+
 The reclaim judgements share one law, borrowed from the kernel venv generation manager: a path whose
 liveness cannot be **disproved** is kept. A probe that fails, a directory whose transcript is missing
 from one root but present in another (a sub-agent's transcript lives under

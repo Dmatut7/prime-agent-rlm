@@ -36,6 +36,13 @@ export interface TreeAggregate {
 	 * belongs to a session whose liveness the candidate's own id says nothing about.
 	 */
 	transcriptIds: Set<string>;
+	/**
+	 * The same transcripts with the path each one was found at. Collected from the
+	 * `lstat` the walk already performs, so a caller that has to judge one
+	 * transcript's own age window (a nested `<sub-*>/<id>.jsonl`) does not need a
+	 * second traversal to find it.
+	 */
+	transcripts: { id: string; path: string }[];
 }
 
 /** Stat a path without following a final symlink; undefined when absent or unreadable. */
@@ -78,6 +85,7 @@ export function aggregateTree(root: string, options: { maxDepth?: number; maxEnt
 		names: [],
 		symlinks: 0,
 		transcriptIds: new Set<string>(),
+		transcripts: [],
 	};
 	const rootStats = quietLstat(root);
 	if (!rootStats) {
@@ -126,7 +134,9 @@ export function aggregateTree(root: string, options: { maxDepth?: number; maxEnt
 				result.bytes += childStats.size;
 				result.newestMtimeMs = Math.max(result.newestMtimeMs, childStats.mtimeMs);
 				if (entry.name.endsWith(".jsonl") && entry.name !== SEMANTIC_EDGES_FILE && !entry.name.startsWith(".")) {
-					result.transcriptIds.add(entry.name.slice(0, -".jsonl".length));
+					const id = entry.name.slice(0, -".jsonl".length);
+					result.transcriptIds.add(id);
+					result.transcripts.push({ id, path: child });
 				}
 			}
 		}

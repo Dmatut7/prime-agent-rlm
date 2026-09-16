@@ -9,9 +9,10 @@
 // edge for that child (an unreadable ledger proves nothing and keeps everything),
 // no resident or leased session holds it, and every file in the transcript's
 // directory is older than the window (a writer that is mid-flush keeps its file).
-import { join, resolve } from "node:path";
+import type { Stats } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { reclaimWithinBudget } from "./delete.js";
-import { aggregateTree, listDirectory, quietLstat } from "./fs-walk.js";
+import { aggregateTree, listDirectory, quietLstat, type TreeAggregate } from "./fs-walk.js";
 import {
 	type RetentionClassContext,
 	type RetentionClassModule,
@@ -22,6 +23,12 @@ import {
 
 const SUB_SESSION_DIR_PREFIX = "sub-";
 const MAX_WALK_DEPTH = 8;
+/**
+ * How deep the sibling tree of one transcript is aggregated. Both call sites of
+ * the age judgement below pass this same bound, so "how old is this transcript"
+ * cannot answer two different ways depending on who asked.
+ */
+const CHILD_TRANSCRIPT_TREE_MAX_DEPTH = 2;
 
 /** Every `sub-*` session directory under the artifact tree, bounded. */
 function findChildSessionDirs(artifactRoot: string): string[] {
@@ -43,6 +50,43 @@ function findChildSessionDirs(artifactRoot: string): string[] {
 		}
 	}
 	return found.sort();
+}
+
+/** The one judgement of a child transcript's age window. */
+export type ChildTranscriptAgeVerdict =
+	| { status: "unverifiable"; code: "gone" | "tree" }
+	| { status: "young"; ageMs: number; stats: Stats }
+	| { status: "expired"; ageMs: number; stats: Stats };
+
+/**
+ * The single authority for "may this `<sub-*>/<child>.jsonl` transcript go?".
+ *
+ * Two callers ask the same question: this class, which reclaims the transcript
+ * itself, and `artifact-dirs`'s descendant blocker, which has to decide whether a
+ * directory holding the transcript may be removed as a whole. The window is the
+ * same in both - `childTranscriptDays` - and so is the age: measured from the
+ * newer of the transcript's own `mtime` and the newest write anywhere in the
+ * directory that holds it, because a sibling writer mid-flush keeps its file.
+ *
+ * `unverifiable` is the conservative answer: a transcript that cannot be stat'ed
+ * (`gone`) or a sibling tree that could not be walked (`tree`) proves nothing
+ * about age, and both callers keep what they were about to remove.
+ */
+export function judgeChildTranscriptAge(options: {
+	transcriptPath: string;
+	now: number;
+	days: number;
+	/** Pre-aggregated sibling directory; a caller that already walked it passes it. */
+	tree?: TreeAggregate;
+}): ChildTranscriptAgeVerdict {
+	const tree =
+		options.tree ?? aggregateTree(dirname(options.transcriptPath), { maxDepth: CHILD_TRANSCRIPT_TREE_MAX_DEPTH });
+	const stats = quietLstat(options.transcriptPath);
+	if (!stats) return { status: "unverifiable", code: "gone" };
+	if (tree.unreadable) return { status: "unverifiable", code: "tree" };
+	const ageMs = options.now - Math.max(stats.mtimeMs, tree.newestMtimeMs);
+	if (ageMs < options.days * 24 * 60 * 60 * 1000) return { status: "young", ageMs, stats };
+	return { status: "expired", ageMs, stats };
 }
 
 export const childTranscriptsModule: RetentionClassModule = {
@@ -70,7 +114,7 @@ export const childTranscriptsModule: RetentionClassModule = {
 				skipped.push({ path: dir, reason: SKIP.unverifiable("readdir") });
 				continue;
 			}
-			const tree = aggregateTree(dir, { maxDepth: 2 });
+			const tree = aggregateTree(dir, { maxDepth: CHILD_TRANSCRIPT_TREE_MAX_DEPTH });
 			for (const entry of entries) {
 				if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
 				const path = join(dir, entry.name);
@@ -92,21 +136,19 @@ export const childTranscriptsModule: RetentionClassModule = {
 					skipped.push({ path, reason: SKIP.inUse("resident") });
 					continue;
 				}
-				const stats = quietLstat(path);
-				if (!stats) {
-					skipped.push({ path, reason: SKIP.unverifiable("gone") });
+				// The age window has one authority (see `judgeChildTranscriptAge`), shared
+				// with the directory blocker in `artifact-dirs`; a sibling writer in the
+				// same directory (a child flush) keeps the file.
+				const verdict = judgeChildTranscriptAge({ transcriptPath: path, now: context.now, days, tree });
+				if (verdict.status === "unverifiable") {
+					skipped.push({ path, reason: SKIP.unverifiable(verdict.code) });
 					continue;
 				}
-				// A sibling writer in the same directory (a child flush) keeps the file.
-				if (tree.unreadable) {
-					skipped.push({ path, reason: SKIP.unverifiable("tree") });
-					continue;
-				}
-				const ageMs = context.now - Math.max(stats.mtimeMs, tree.newestMtimeMs);
-				if (ageMs < days * 24 * 60 * 60 * 1000) {
+				if (verdict.status === "young") {
 					skipped.push({ path, reason: SKIP.young(`${days}d`) });
 					continue;
 				}
+				const stats = verdict.stats;
 				requests.push({
 					path,
 					kind: "file" as const,
