@@ -94,6 +94,7 @@ function baseSettings(overrides: Partial<ResolvedRetentionSettings> = {}): Resol
 		maxDeleteBytesPerSweep: 512 * 1024 * 1024,
 		maxDeleteEntriesPerSweep: 20000,
 		cooldownMinutes: 10,
+		sweepLockEnabled: true,
 		emptyArtifactDirDays: 7,
 		deletedSessionResidueDays: 30,
 		childTranscriptDays: 0,

@@ -86,6 +86,12 @@ export interface ResolvedRetentionSettings {
 	maxDeleteEntriesPerSweep: number;
 	/** Cooldown window: any candidate touched more recently is kept. */
 	cooldownMinutes: number;
+	/**
+	 * Cross-process sweep guard (ADC-3): one sweep per agent dir at a time, so the
+	 * circuit breaker is global and history.jsonl's read-modify-write is serialized.
+	 * Off = concurrent sweeps, which is the rollback lever.
+	 */
+	sweepLockEnabled: boolean;
 	/** Empty artifact directories whose session is provably gone (0 = off). */
 	emptyArtifactDirDays: number;
 	/** Non-empty artifact directories left by a provably deleted session (0 = off). */

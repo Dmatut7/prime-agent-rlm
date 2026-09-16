@@ -2,7 +2,13 @@ import chalk from "chalk";
 import { APP_NAME, SELF_UPDATE_INTERACTIVE_CHILD_ENV } from "../config.js";
 import { AuthStorage } from "../core/auth-storage.js";
 import { runMcpManagementCommand } from "../core/mcp/mcp-command.js";
-import { lastSweepPath, readRetentionHistory, retentionRoots, retentionStatus } from "../core/retention/reports.js";
+import {
+	lastSweepPath,
+	readRetentionHistory,
+	retentionRoots,
+	retentionStatus,
+	SWEEP_IN_PROGRESS_FILE_NAME,
+} from "../core/retention/reports.js";
 import { runRetentionSweepOnce } from "../core/retention/runner.js";
 import { SettingsManager } from "../core/settings-manager.js";
 import { handlePackageCommand, isSelfUpdateSource } from "../package-manager-cli.js";
@@ -331,13 +337,33 @@ async function runRetention(args: string[]): Promise<PublicCommandResult> {
 	if (!options) return HANDLED;
 	const json = options.has("--json");
 	if (subcommand === "sweep") {
-		const report = await runRetentionSweepOnce({ dryRun: options.has("--dry-run") });
+		const outcome = await runRetentionSweepOnce({ dryRun: options.has("--dry-run") });
+		// A contended guard is not an error: this process is not the sweeper, so it
+		// reports what the sweep that is owns has already recorded, and exits 0.
+		const report = outcome.report ?? outcome.lastReport;
 		if (json) {
-			console.log(JSON.stringify(report, null, 2));
+			console.log(
+				JSON.stringify(
+					outcome.lockHeld ? { lockHeld: true, holder: outcome.holder ?? null, report } : report,
+					null,
+					2,
+				),
+			);
+			return HANDLED;
+		}
+		if (outcome.lockHeld) {
+			console.log(
+				`Retention sweep already in flight${outcome.holder ? ` (${outcome.holder})` : ""}; ` +
+					`reading ${SWEEP_IN_PROGRESS_FILE_NAME} instead of sweeping again.`,
+			);
+		}
+		if (!report) {
+			console.log("Retention sweep: no completed sweep to report yet.");
 			return HANDLED;
 		}
 		console.log(
-			`Retention sweep${report.dryRun ? " (dry run)" : ""}: reclaimed ${report.totals.reclaimed} entries / ${report.totals.bytes} bytes` +
+			`${outcome.lockHeld ? "Last sweep" : `Retention sweep${report.dryRun ? " (dry run)" : ""}`}: ` +
+				`reclaimed ${report.totals.reclaimed} entries / ${report.totals.bytes} bytes` +
 				`${report.capped ? ", per-sweep cap reached" : ""}`,
 		);
 		for (const entry of report.classes) {

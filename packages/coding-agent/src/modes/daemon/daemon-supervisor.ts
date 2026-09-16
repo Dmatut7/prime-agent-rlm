@@ -4661,8 +4661,14 @@ export class DaemonSupervisor {
 	 * The disk-retention sweep, on the cadence `retention.sweepIntervalMinutes`
 	 * asks for. Only the daemon runs it on a timer: a short-lived CLI process must
 	 * not perform a large delete while it is exiting. `retention.enabled: false`
-	 * and the per-class zero knobs keep the sweep report-only, and the runner has
-	 * its own in-flight guard, so a slow sweep cannot stack.
+	 * and the per-class zero knobs keep the sweep report-only, the runner has its
+	 * own in-flight guard so a slow sweep cannot stack, and the runner's sweep guard
+	 * keeps a second process on the same agent dir out of the same accounts.
+	 *
+	 * The cadence clock moves only after a sweep that actually ran. A trigger that
+	 * found the guard held by another process did no work, so it is not a sweep at
+	 * this timestamp: the next check tick tries again instead of waiting out a full
+	 * interval for nothing.
 	 */
 	private async runRetentionSweepIfDue(now = Date.now()): Promise<void> {
 		if (this.shuttingDown) {
@@ -4676,15 +4682,26 @@ export class DaemonSupervisor {
 		if (this.lastRetentionSweepAtMs !== 0 && now - this.lastRetentionSweepAtMs < intervalMs) {
 			return;
 		}
-		this.lastRetentionSweepAtMs = now;
-		const report = await runRetentionSweepOnce({
+		const outcome = await runRetentionSweepOnce({
 			settings,
 			...(this.defaultSessionConfig.agentDir ? { agentDir: this.defaultSessionConfig.agentDir } : {}),
 			residentSessionIds: this.residentSessionIds(),
 		});
+		if (outcome.lockHeld) {
+			this.log(
+				`retention sweep skipped: another sweep holds the guard${outcome.holder ? ` (${outcome.holder})` : ""}`,
+			);
+			return;
+		}
+		this.lastRetentionSweepAtMs = now;
+		const report = outcome.report;
+		if (!report) {
+			return;
+		}
 		this.log(
 			`retention sweep: reclaimed ${report.totals.reclaimed} entries / ${report.totals.bytes} bytes` +
-				`${report.capped ? " (per-sweep cap reached)" : ""}${report.dryRun ? " (dry run)" : ""}`,
+				`${report.capped ? " (per-sweep cap reached)" : ""}${report.dryRun ? " (dry run)" : ""}` +
+				`${outcome.lockUnavailable ? " (no sweep guard)" : ""}`,
 		);
 	}
 
