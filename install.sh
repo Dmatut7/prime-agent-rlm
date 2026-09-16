@@ -122,6 +122,14 @@ main() {
 			*) break ;;
 		esac
 	done
+	# --force counts wherever it appears: `install.sh 1.2.3 --force` used to stop the
+	# scan at the first non-flag argument and silently ignore the flag. The version
+	# resolver reads only the first argument, so a later --force stays inert there.
+	for remaining_arg in "$@"; do
+		if [ "$remaining_arg" = "--force" ]; then
+			prime_agent_force_install=1
+		fi
+	done
 	version="$(resolve_prime_agent_version "$@")"
 	tarball_name="$prime_agent_package-$version.tgz"
 	tarball_url="$prime_agent_base_url/releases/v$version/$tarball_name"

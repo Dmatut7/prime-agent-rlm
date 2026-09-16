@@ -133,6 +133,14 @@ If you actually want the official upstream release instead:
 curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh   # upstream, without this line's changes
 ```
 
+The installer refuses to overwrite an existing installation unless it can ask for
+confirmation in a terminal; a non-interactive rerun (the plain `curl … | sh` path) is
+rejected in that state. Pass `--force` to reinstall over the existing files without a
+prompt — for example `sh install.sh 1.2.3 --force` when pinning a version. The flag is
+honored wherever it appears on the command line (before or after the version or channel
+argument) and still respects the installer lock: a live concurrent installer is never
+overridden by it.
+
 Start Prime Agent from the repository or directory you want it to work in:
 
 ```bash
