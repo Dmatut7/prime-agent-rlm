@@ -15,6 +15,38 @@ const baseSegmenter = getSegmenter();
 /** Bracketed paste markers as sent by the terminal and re-wrapped by terminal.ts. */
 const PASTE_START = "\x1b[200~";
 const PASTE_END = "\x1b[201~";
+/**
+ * Drop control characters (except newlines) from pasted text. A per-character
+ * `split("").filter().join()` used to allocate one array element per character, which
+ * turned an 8MB paste into a ~150ms main-thread freeze plus a transient heap spike; the
+ * loop below copies only the kept runs, and a paste with no control bytes is returned
+ * as-is without any copy.
+ */
+function filterPasteControlChars(text: string): string {
+	let firstDropped = -1;
+	for (let i = 0; i < text.length; i++) {
+		const code = text.charCodeAt(i);
+		if (code !== 10 && code < 32) {
+			firstDropped = i;
+			break;
+		}
+	}
+	if (firstDropped === -1) return text;
+	let result = text.slice(0, firstDropped);
+	let runStart = -1;
+	for (let i = firstDropped; i < text.length; i++) {
+		const code = text.charCodeAt(i);
+		const keep = code === 10 || code >= 32;
+		if (keep) {
+			if (runStart === -1) runStart = i;
+		} else if (runStart !== -1) {
+			result += text.slice(runStart, i);
+			runStart = -1;
+		}
+	}
+	if (runStart !== -1) result += text.slice(runStart);
+	return result;
+}
 
 /** Regex matching paste markers like `[paste #1 +123 lines]` or `[paste #2 1234 chars]`. */
 const PASTE_MARKER_REGEX = /\[paste #(\d+)( (\+\d+ lines|\d+ chars))?\]/g;
@@ -1311,10 +1343,7 @@ export class Editor implements Component, Focusable {
 
 		const cleanText = this.normalizeText(decodedText);
 
-		let filteredText = cleanText
-			.split("")
-			.filter((char) => char === "\n" || char.charCodeAt(0) >= 32)
-			.join("");
+		let filteredText = filterPasteControlChars(cleanText);
 
 		// If pasting a file path (starts with /, ~, or .) and the character before
 		// the cursor is a word character, prepend a space for better readability
