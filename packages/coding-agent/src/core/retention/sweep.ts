@@ -19,6 +19,7 @@ import { staleLeasesModule } from "./leases.js";
 import { scanRlmLedgerDirectory } from "./ledger-scan.js";
 import { logsModule } from "./logs.js";
 import { readRetentionHistory } from "./reports.js";
+import { rlmLedgerCompactionModule } from "./rlm-ledger-compaction.js";
 import { tmpOtherDirsModule, tmpRlmDirsModule } from "./tmp-dirs.js";
 import { retentionCrashLeftoversModule } from "./trash.js";
 import type {
@@ -46,6 +47,9 @@ const CLASS_MODULES = [
 	staleLeasesModule,
 	kernelVenvGenerationsModule,
 	retentionCrashLeftoversModule,
+	// Last: it rewrites the ledger the classes above read their evidence from,
+	// so it must not change that evidence mid-sweep.
+	rlmLedgerCompactionModule,
 ];
 
 /** How many consecutive empty-but-scanned sweeps mark a class as stalled. */

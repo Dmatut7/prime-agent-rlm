@@ -350,10 +350,30 @@ describe("rlm spawn ledger", () => {
 			writeFileSync(oversized.ledgerPath, Buffer.alloc(RLM_LEDGER_MAX_BYTES + 1, "\n"));
 			await expect(oversized.edges()).rejects.toThrow("bytes");
 
-			// The torn-tail repair path must hit the same bound before any
-			// file-sized allocation, not just replaySync.
+			// The write ladder compacts instead of failing closed, so an
+			// over-bound file no longer refuses the append; with the compaction
+			// rung switched off (`retention.ledgerCompactionEnabled: false`) the
+			// historical fail-closed behavior is what an append gets.
 			await expect(
 				new RlmSpawnLedger(root, sessionsDir).appendRename({ childId: "sub-1", child: "/c", name: "n" }),
+			).resolves.toBeUndefined();
+			writeFileSync(oversized.ledgerPath, Buffer.alloc(RLM_LEDGER_MAX_BYTES + 1, "\n"));
+			await expect(
+				new RlmSpawnLedger(root, sessionsDir, undefined, () => {}, { compactionEnabled: false }).appendRename({
+					childId: "sub-1",
+					child: "/c",
+					name: "n",
+				}),
+			).rejects.toThrow("bytes");
+			// The torn-tail repair path must hit the same bound before any
+			// file-sized allocation, not just replaySync.
+			writeFileSync(oversized.ledgerPath, Buffer.alloc(RLM_LEDGER_MAX_BYTES + 1, "\n"));
+			await expect(
+				new RlmSpawnLedger(root, sessionsDir, undefined, () => {}, { compactionEnabled: false }).appendRename({
+					childId: "sub-1",
+					child: "/c",
+					name: "n",
+				}),
 			).rejects.toThrow("bytes");
 
 			const record = `${JSON.stringify({ v: 1, op: "rename", at: "x", childId: "sub-1", child: "/c", name: "n" })}\n`;

@@ -105,6 +105,7 @@ function baseSettings(overrides: Partial<ResolvedRetentionSettings> = {}): Resol
 		staleLeaseHours: 24,
 		kernelSnapshotGenerations: 1,
 		kernelSnapshotReclaimEnabled: false,
+		ledgerCompactionEnabled: true,
 		venvRetention: 1,
 		venvReclaim: false,
 		...overrides,

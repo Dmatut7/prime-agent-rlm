@@ -9,9 +9,17 @@
 //     same-source signal the transcript-existence test cannot give (round-08 D-2).
 //
 // An unreadable ledger yields `scanned: false`, and the callers then judge with
-// transcript existence alone (the conservative branch).
-import { readdirSync, readFileSync } from "node:fs";
+// transcript existence alone (the conservative branch). An OVER-BOUND ledger is
+// unreadable by definition: the writer (`modes/daemon/rlm-ledger.ts`) refuses to
+// replay past the same two numbers, so this scan refuses them too instead of
+// reporting a topology the daemon itself could not read back (r41 ADC-2 reader
+// alignment). Records of an unknown version are skipped rather than consumed: a
+// v:2 delete this reader cannot validate is not positive evidence of a deletion
+// (the daemon's parseLedgerLine fails loudly on it; a sweep must keep running,
+// so the conservative form here is "ignore the line", never "trust it").
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
+import { RLM_LEDGER_MAX_BYTES, RLM_LEDGER_MAX_RECORDS } from "../rlm-ledger-bounds.js";
 
 export interface RlmLedgerChildScan {
 	scanned: boolean;
@@ -30,6 +38,17 @@ function childSessionId(value: unknown): string | undefined {
 	return id.length > 0 ? id : undefined;
 }
 
+/**
+ * The conservative bail-out: one over-bound file makes the whole directory
+ * unknown, so every caller keeps its candidates (`ledgerScanned: false`).
+ */
+function overBound(scan: RlmLedgerChildScan): RlmLedgerChildScan {
+	scan.scanned = false;
+	scan.liveChildIds.clear();
+	scan.deletedChildIds.clear();
+	return scan;
+}
+
 export function scanRlmLedgerDirectory(ledgerDir: string): RlmLedgerChildScan {
 	const scan: RlmLedgerChildScan = { scanned: false, liveChildIds: new Set(), deletedChildIds: new Set(), files: 0 };
 	let names: string[];
@@ -42,22 +61,30 @@ export function scanRlmLedgerDirectory(ledgerDir: string): RlmLedgerChildScan {
 	const live = new Map<string, boolean>();
 	let readAny = false;
 	for (const name of names.sort()) {
+		const path = join(ledgerDir, name);
 		let raw: string;
 		try {
-			raw = readFileSync(join(ledgerDir, name), "utf8");
+			// The byte bound is checked on the stat, before any allocation: an
+			// over-bound file must not be read into memory just to be refused.
+			if (statSync(path).size > RLM_LEDGER_MAX_BYTES) return overBound(scan);
+			raw = readFileSync(path, "utf8");
 		} catch {
 			continue;
 		}
 		readAny = true;
 		scan.files += 1;
+		let records = 0;
 		for (const line of raw.split("\n")) {
 			if (!line.trim()) continue;
-			let record: { op?: unknown; childId?: unknown; child?: unknown };
+			if (++records > RLM_LEDGER_MAX_RECORDS) return overBound(scan);
+			let record: { v?: unknown; op?: unknown; childId?: unknown; child?: unknown };
 			try {
-				record = JSON.parse(line) as { op?: unknown; childId?: unknown; child?: unknown };
+				record = JSON.parse(line) as { v?: unknown; op?: unknown; childId?: unknown; child?: unknown };
 			} catch {
 				continue;
 			}
+			// Version gate: only v:1 records are understood (see the header).
+			if (record.v !== 1) continue;
 			const id = childSessionId(record.child);
 			if (!id) continue;
 			if (record.op === "delete") {

@@ -6153,6 +6153,7 @@ export class DaemonSupervisor {
 			this.defaultSessionConfig.sessionDir ?? getSessionsDir(agentDir),
 			createRlmLedgerRegistrySeedSource(),
 			(message) => this.log(message),
+			this.rlmLedgerBoundsOptions(),
 		);
 		return this.rlmSpawnLedgerInstance;
 	}
@@ -6167,9 +6168,22 @@ export class DaemonSupervisor {
 		if (!agentDir) {
 			throw new Error("Daemon supervisor config is missing agentDir");
 		}
-		return new RlmSpawnLedger(agentDir, sessionDir, createRlmLedgerRegistrySeedSource(), (message) =>
-			this.log(message),
+		return new RlmSpawnLedger(
+			agentDir,
+			sessionDir,
+			createRlmLedgerRegistrySeedSource(),
+			(message) => this.log(message),
+			this.rlmLedgerBoundsOptions(),
 		);
+	}
+
+	/** Bounds ladder switch for the ledger writer; defaults to on when unreadable. */
+	private rlmLedgerBoundsOptions(): { compactionEnabled: boolean } {
+		try {
+			return { compactionEnabled: this.settingsManager.getRetentionSettings().ledgerCompactionEnabled };
+		} catch {
+			return { compactionEnabled: true };
+		}
 	}
 
 	/**

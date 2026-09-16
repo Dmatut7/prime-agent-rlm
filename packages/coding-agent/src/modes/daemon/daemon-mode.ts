@@ -240,8 +240,10 @@ import { MutationDrainLatch } from "./mutation-drain-latch.js";
 import {
 	createRlmLedgerRegistrySeedSource,
 	type LegacyRlmSubagentRegistryEntry,
+	type RlmLedgerBoundsOptions,
 	type RlmLedgerDeleteReason,
 	type RlmLedgerEdge,
+	RlmLedgerOverBoundError,
 	RlmSpawnLedger,
 	readLegacyRlmSubagentRegistry as readLegacyRlmSubagentRegistryFile,
 	tombstoneSavedSessionDelete,
@@ -1053,8 +1055,26 @@ export class AgentDaemon {
 			this.rlmLedgerSessionsDir(),
 			createRlmLedgerRegistrySeedSource(),
 			(message) => this.log(message),
+			this.rlmLedgerBoundsOptions(),
 		);
 		return this.rlmSpawnLedgerInstance;
+	}
+
+	/**
+	 * Bounds ladder switch for the ledger writer (`retention.
+	 * ledgerCompactionEnabled`). A settings read failure must not disable the
+	 * rung that keeps spawning and deletion alive, so it defaults to on.
+	 */
+	private rlmLedgerBoundsOptions(): RlmLedgerBoundsOptions {
+		try {
+			const settings = SettingsManager.create(
+				this.options.defaultSessionConfig.cwd ?? process.cwd(),
+				this.agentDir,
+			).getRetentionSettings();
+			return { compactionEnabled: settings.ledgerCompactionEnabled };
+		} catch {
+			return { compactionEnabled: true };
+		}
 	}
 
 	// Ledgers are per sessions-dir family: a catalog request for another dir must read that dir's ledger.
@@ -1062,8 +1082,12 @@ export class AgentDaemon {
 		if (sessionDir === undefined || resolve(sessionDir) === resolve(this.rlmLedgerSessionsDir())) {
 			return this.rlmSpawnLedger();
 		}
-		return new RlmSpawnLedger(this.agentDir, sessionDir, createRlmLedgerRegistrySeedSource(), (message) =>
-			this.log(message),
+		return new RlmSpawnLedger(
+			this.agentDir,
+			sessionDir,
+			createRlmLedgerRegistrySeedSource(),
+			(message) => this.log(message),
+			this.rlmLedgerBoundsOptions(),
 		);
 	}
 
@@ -1244,7 +1268,16 @@ export class AgentDaemon {
 		// The ledger delete record is the topology tombstone; unlike the
 		// dual-write era it has no other writer to fall back on, so a failed
 		// append is a failed deletion.
-		await this.rlmSpawnLedger().appendDelete({ childId, child: entry.sessionFile, reason });
+		try {
+			await this.rlmSpawnLedger().appendDelete({ childId, child: entry.sessionFile, reason });
+		} catch (error) {
+			if (error instanceof RlmLedgerOverBoundError) {
+				// Last rung of the ADC-2 ladder: tell the operator what to do
+				// instead of handing them a stack from inside the ledger writer.
+				throw new Error(`Could not delete RLM subagent ${childId}: ${error.message}`);
+			}
+			throw error;
+		}
 		if (this.options.worker) {
 			this.rosterReporter.removedAgentIds.set(
 				this.rosterAgentIdForRlmChild(childId, entry.parentSessionFile),
