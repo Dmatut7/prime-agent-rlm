@@ -74,6 +74,8 @@ You can submit messages while the agent is still working:
 - While browsing, **Enter** applies the edit as steering input and **Alt+Enter** applies it as a follow-up; submitting an empty edit deletes the item.
 - **Ctrl+Option+Up / Ctrl+Option+Down** move the selected item earlier or later within its queue.
 
+Who overtakes whom: the steering queue always drains before the follow-up queue, even when a follow-up was queued earlier; within one queue arrival order is preserved. Subagent replies and heartbeat prompts are delivered as steering by default, so they overtake follow-ups that were queued first. While admission is paused (MCP server reload, ACP stop window, update-restart teardown), new input is refused with a retryable error - nothing is accepted and then lost - and during restart teardown the parked queue is handed to the restarted session instead of running mid-shutdown.
+
 On Windows Terminal, Alt+Enter is fullscreen by default. Remap it as described in [Terminal setup](terminal-setup.md) if you want Prime Agent to receive the shortcut.
 
 Configure delivery in [Settings](settings.md) with `steeringMode` and `followUpMode`.

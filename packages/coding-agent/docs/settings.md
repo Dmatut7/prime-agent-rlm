@@ -329,6 +329,8 @@ old one is reclaimed only after its references drop to zero.
 | `followUpMode` | string | `"one-at-a-time"` | How follow-up messages are sent: `"all"` or `"one-at-a-time"` |
 | `transport` | string | `"auto"` | Preferred transport for providers that support multiple transports: `"sse"`, `"websocket"`, `"websocket-cached"`, or `"auto"`. For Codex providers any value except `"sse"` (including the default `"auto"`) attempts the WebSocket transport; `"auto"` additionally reuses cached server-side context. Set `"sse"` explicitly to force SSE-only |
 
+Who overtakes whom: `steeringMode` and `followUpMode` only control how each queue batches its own deliveries - the steering queue itself always drains before the follow-up queue, even when a follow-up was queued earlier, and arrival order is preserved within a queue. Subagent replies and heartbeat prompts default to steering, so they overtake earlier follow-ups. When admission is paused (MCP reload, ACP stop, update-restart teardown), new input is refused with a retryable error rather than accepted and lost, and during restart teardown the parked queue survives into the restart.
+
 ### Agent Messaging
 
 | Setting | Type | Default | Description |

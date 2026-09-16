@@ -198,6 +198,8 @@ Submit messages while the agent is working:
 - While browsing, **Enter** applies the edit as steering input and **Alt+Enter** applies it as a follow-up; submitting an empty edit deletes the item
 - **Ctrl+Alt+Up / Ctrl+Alt+Down** move the selected item earlier or later within its queue
 
+Who overtakes whom: the two queues are not FIFO relative to each other - the steering queue always drains before the follow-up queue, even when a follow-up was queued earlier. Within a single queue, arrival order is preserved. Subagent replies and heartbeat prompts are delivered as steering by default, so they overtake follow-ups you queued first. While admission is paused (an MCP server reload, an ACP stop window, or update-restart teardown), new input is refused with a retryable error instead of being accepted and then lost; during restart teardown the parked queue survives into the restart instead of running mid-shutdown.
+
 On Windows Terminal, `Alt+Enter` is fullscreen by default. Remap it in [docs/terminal-setup.md](docs/terminal-setup.md) so Prime Agent can receive the follow-up shortcut.
 
 Configure delivery in [settings](docs/settings.md): `steeringMode` and `followUpMode` can be `"one-at-a-time"` (default, waits for response) or `"all"` (delivers all queued at once). `transport` selects provider transport preference (`"sse"`, `"websocket"`, `"websocket-cached"`, or `"auto"`; default `"auto"`, which attempts WebSocket with cached context on Codex providers) for providers that support multiple transports.
