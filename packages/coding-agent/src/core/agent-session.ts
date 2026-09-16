@@ -9883,6 +9883,25 @@ export class AgentSession {
 		).catch(() => {});
 	}
 
+	/**
+	 * A background prewarm failed (r36 INSB-4/F5): the failure used to be swallowed, so a first
+	 * run without network showed the "~30s" progress line and then nothing. Log it and tell the
+	 * model on the next turn - the ipython tool retries on first use.
+	 */
+	private _onIpythonStartupFailure(error: Error): void {
+		sessionLog.error("ipython kernel prewarm failed", { sessionId: this.sessionId, message: error.message });
+		const content = [
+			"<ipython_bootstrap_failed>",
+			`Python kernel failed to start: ${error.message}`,
+			"The ipython tool will retry on first use; the message above names the underlying cause.",
+			"</ipython_bootstrap_failed>",
+		].join("\n");
+		void this.sendCustomMessage(
+			{ customType: "ipython_bootstrap_failed", content, display: true, details: { prewarmFailed: true } },
+			{ deliverAs: "nextTurn" },
+		).catch(() => {});
+	}
+
 	private _onIpythonStateRestored(result: RestoreResult): void {
 		if (result.failed.length > 0) {
 			sessionLog.error("kernel state restore partial", {
@@ -12160,6 +12179,7 @@ export class AgentSession {
 				onRestore: notifyRestore ? (result) => this._onIpythonStateRestored(result) : undefined,
 				onUnexpectedExit: (cause, facts) => this._reportUnexpectedKernelExit(cause, facts),
 				onSnapshotFailure: (detail) => this._onKernelSnapshotWriteFailure(detail),
+				onStartupFailure: (error) => this._onIpythonStartupFailure(error),
 				restartPolicy: () => {
 					const restart = this.settingsManager.getKernelRestartSettings();
 					return { maxRestarts: restart.maxUnexpectedRestarts, windowMs: restart.windowMs };

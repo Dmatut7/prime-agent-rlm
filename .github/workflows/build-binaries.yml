@@ -204,6 +204,7 @@ jobs:
           PATH="$NPM_CONFIG_PREFIX/bin:$PATH" \
             PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL=0 \
             PRIME_AGENT_INSTALLER_PLAIN=1 \
+            PRIME_AGENT_INSTALLER_ALLOW_INSECURE_TRANSPORT=1 \
             sh /tmp/prime-agent-npm12-install.sh "$SMOKE_VERSION"
           test -x "$NPM_CONFIG_PREFIX/bin/prime-agent"
 

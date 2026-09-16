@@ -164,6 +164,21 @@ describe("IpythonKernelProvisioner", () => {
 		expect(countRuns()).toBe(2);
 	});
 
+	it("prewarm() reports the failure through onStartupFailure instead of dropping it", async () => {
+		const { python } = writeFakePython();
+		const failures: Error[] = [];
+		const provisioner = new IpythonKernelProvisioner(tempDir, {
+			python,
+			onStartupFailure: (error) => failures.push(error),
+		});
+
+		provisioner.prewarm();
+		await vi.waitFor(() => expect(failures.length).toBeGreaterThan(0), { timeout: 5000 });
+		expect(failures[0]?.message).toMatch(/Kernel exited before ready|Failed/);
+
+		await provisioner.dispose().catch(() => {});
+	});
+
 	it("prewarm() swallows the failure and the next ensure() starts fresh", async () => {
 		const { python, countRuns } = writeFakePython();
 		const provisioner = new IpythonKernelProvisioner(tempDir, { python });

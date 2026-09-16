@@ -76,7 +76,36 @@ const DEFAULT_RLM_EXTRA_PACKAGES = [
 export const DEFAULT_RLM_EXTRA_UV_ARGS = DEFAULT_RLM_EXTRA_PACKAGES.map((pkg) => pkg.uvArg);
 export const DEFAULT_RLM_EXTRA_IMPORT_NAMES = DEFAULT_RLM_EXTRA_PACKAGES.map((pkg) => pkg.importName);
 export const DEFAULT_RLM_EXTRA_IMPORT_LABELS = DEFAULT_RLM_EXTRA_PACKAGES.map((pkg) => pkg.promptLabel);
-const UV_INSTALL_COMMAND = "curl -LsSf https://astral.sh/uv/install.sh | sh";
+const UV_INSTALL_COMMAND = "curl --max-time 120 -LsSf https://astral.sh/uv/install.sh | sh";
+/**
+ * Hard ceiling for one uv subprocess (r36 INSB-3/F6): without it, a proxy that blackholes or a
+ * wedged DNS lookup leaves the first run silent forever - the user's last visible line is the
+ * "~30s" progress message. Generous on purpose: `uv pip install` legitimately moves hundreds of
+ * MB on slow links. Overridable for tests via PRIME_AGENT_KERNEL_UV_TIMEOUT_MS.
+ */
+const DEFAULT_UV_COMMAND_TIMEOUT_MS = 900_000;
+/**
+ * One python invocation, fed over stdin, that imports every default package (r36 INSB-4/F3): the
+ * warm path used to trust the manifest alone, so a venv whose packages were uninstalled after the
+ * fact stayed "ready" forever and failed far from the cause. Stdin (rather than `-c`) keeps the
+ * argv shape distinct from the readiness probes.
+ */
+const RLM_EXTRA_IMPORTS_PROBE_SCRIPT = [
+	"import importlib, sys",
+	`names = ${JSON.stringify(DEFAULT_RLM_EXTRA_IMPORT_NAMES)}`,
+	"missing = []",
+	"for name in names:",
+	"    try:",
+	"        importlib.import_module(name)",
+	"    except BaseException:",
+	"        missing.append(name)",
+	"sys.exit(1 if missing else 0)",
+].join("\n");
+
+function uvCommandTimeoutMs(): number {
+	const raw = Number.parseInt(process.env.PRIME_AGENT_KERNEL_UV_TIMEOUT_MS ?? "", 10);
+	return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_UV_COMMAND_TIMEOUT_MS;
+}
 const REQUIRED_HARNESS_METHODS = [
 	"create_memory",
 	"update_memory",
@@ -644,35 +673,99 @@ function reportLegacyKernelVenv(base: string, options: EnsureKernelPythonOptions
 	);
 }
 
-function run(
-	command: string,
-	args: string[],
-	options: { stdio?: "ignore" | "inherit"; signal?: AbortSignal } = {},
-): Promise<void> {
+/**
+ * A subprocess failure whose own stderr was captured. Carrying that text matters because uv's
+ * diagnostics name the real cause (ENOSPC, EACCES, index errors, proxy failures); without it every
+ * failure collapses into an opaque "failed with exit code N" (r36 INSB-3).
+ */
+class KernelSubprocessError extends Error {
+	readonly subprocessStderr: string | undefined;
+
+	constructor(message: string, subprocessStderr?: string) {
+		super(message);
+		this.name = "KernelSubprocessError";
+		this.subprocessStderr = subprocessStderr;
+	}
+}
+
+interface RunCommandOptions {
+	stdio?: "ignore" | "inherit";
+	signal?: AbortSignal;
+	/** Hard ceiling for this subprocess; a step that never answers cannot hang a first run. */
+	timeoutMs?: number;
+	/** Captures stderr and attaches it to the failure message. */
+	captureStderr?: boolean;
+	/** Script fed to the child's stdin (used with `-` args). */
+	stdinScript?: string;
+}
+
+function run(command: string, args: string[], options: RunCommandOptions = {}): Promise<void> {
 	return new Promise((resolve, reject) => {
 		const cancelled = (): Error => new KernelBootstrapAbortedError(`${command} ${args.join(" ")} was cancelled`);
+		const commandLine = `${command} ${args.join(" ")}`;
+		let stderrText: string | undefined;
+		let stderrChunks = "";
+		let timedOut = false;
+		let killTimer: ReturnType<typeof setTimeout> | undefined;
+		const defaultIo: "ignore" | "inherit" = options.stdio ?? "ignore";
+		const stdio: ("ignore" | "inherit" | "pipe")[] = [
+			options.stdinScript !== undefined ? "pipe" : defaultIo,
+			options.captureStderr ? "ignore" : defaultIo,
+			options.captureStderr ? "pipe" : defaultIo,
+		];
 		const child = spawn(command, args, {
 			env: process.env,
-			stdio: options.stdio ?? "ignore",
+			stdio,
 			// Kills the child on abort, so a cancelled boot does not leave a uv install running.
 			signal: options.signal,
 		});
+		if (options.stdinScript !== undefined && child.stdin !== null) {
+			child.stdin.on("error", () => undefined);
+			child.stdin.end(options.stdinScript);
+		}
+		if (options.captureStderr) {
+			child.stderr?.setEncoding("utf8");
+			child.stderr?.on("error", () => undefined);
+			child.stderr?.on("data", (chunk: string) => {
+				// Keep a bounded tail: uv can be verbose, and the diagnostic is at the end.
+				stderrChunks = (stderrChunks + chunk).slice(-16_384);
+			});
+		}
+		if (options.timeoutMs !== undefined && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0) {
+			killTimer = setTimeout(() => {
+				timedOut = true;
+				child.kill("SIGKILL");
+			}, options.timeoutMs);
+		}
+		const clearTimer = (): void => {
+			if (killTimer !== undefined) clearTimeout(killTimer);
+		};
 		child.on("error", (error) => {
+			clearTimer();
 			// An abort before or during spawn surfaces here as an AbortError; report the
 			// cancellation rather than the opaque underlying reason.
 			reject(options.signal?.aborted ? cancelled() : error);
 		});
 		child.on("exit", (code, signal) => {
+			clearTimer();
+			if (options.captureStderr && stderrChunks.trim() !== "") {
+				stderrText = stderrChunks;
+			}
 			if (options.signal?.aborted) {
 				reject(cancelled());
 				return;
 			}
-			if (code === 0) {
+			if (code === 0 && !timedOut) {
 				resolve();
 				return;
 			}
-			const reason = signal ? `signal ${signal}` : `exit code ${code}`;
-			reject(new Error(`${command} ${args.join(" ")} failed with ${reason}`));
+			const reason = timedOut
+				? `timed out after ${options.timeoutMs}ms`
+				: signal
+					? `signal ${signal}`
+					: `exit code ${code}`;
+			const stderrDetail = stderrText !== undefined ? `\n${stderrText.trim().slice(-4_000)}` : "";
+			reject(new KernelSubprocessError(`${commandLine} failed with ${reason}${stderrDetail}`, stderrText));
 		});
 	});
 }
@@ -798,12 +891,32 @@ async function lockMissingPidIsStale(lockDir: string): Promise<boolean> {
  * which is how a wedged holder turned one stuck kernel start into a session that only the
  * 900s stall watchdog could end. Breaking a provably abandoned lock is unchanged.
  */
+/**
+ * The bootstrap lock directory could not be created (r36 INSB-3/F2): a read-only HOME, an NFS-RO
+ * mount, or a full disk used to leak a bare `EACCES: permission denied, mkdir ...` from outside
+ * the try/catch that wraps bootstrap failures, with no kernel context and no way out.
+ */
+class KernelBootstrapLockCreateError extends Error {
+	constructor(lockDir: string, cause: unknown) {
+		super(
+			`couldn't create the kernel bootstrap lock at ${lockDir}: ${errorMessage(cause)} ` +
+				`Fix permissions on ${path.dirname(lockDir)} (or free space on that volume), or set ` +
+				"PRIME_AGENT_KERNEL_PYTHON to a Python with a current prime-agent-runtime installed to skip auto-bootstrap.",
+		);
+		this.name = "KernelBootstrapLockCreateError";
+	}
+}
+
 async function acquireBootstrapLock(
 	venv: string,
 	options: { signal?: AbortSignal; timeoutMs?: number } = {},
 ): Promise<() => Promise<void>> {
 	const lockDir = bootstrapLockDir(venv);
-	await mkdir(path.dirname(lockDir), { recursive: true });
+	try {
+		await mkdir(path.dirname(lockDir), { recursive: true });
+	} catch (error) {
+		throw new KernelBootstrapLockCreateError(lockDir, error);
+	}
 
 	const timeoutMs = options.timeoutMs ?? readKernelBootstrapSettings().lockTimeoutMs;
 	const startedAt = Date.now();
@@ -818,7 +931,11 @@ async function acquireBootstrapLock(
 			await writeFile(path.join(lockDir, "pid"), `${process.pid}\n`, "utf8");
 			return () => rm(lockDir, { recursive: true, force: true });
 		} catch (error) {
-			if (!isNodeError(error, "EEXIST")) throw error;
+			if (!isNodeError(error, "EEXIST")) {
+				throw error instanceof KernelBootstrapLockCreateError
+					? error
+					: new KernelBootstrapLockCreateError(lockDir, error);
+			}
 
 			const pid = await readLockPid(lockDir);
 			if (pid === null ? await lockMissingPidIsStale(lockDir) : !processIsRunning(pid)) {
@@ -869,6 +986,7 @@ async function ensureUv(options: EnsureKernelPythonOptions): Promise<string> {
 		await run("sh", ["-c", UV_INSTALL_COMMAND], {
 			stdio: options.onProgress ? "ignore" : "inherit",
 			signal: options.signal,
+			timeoutMs: uvCommandTimeoutMs(),
 		});
 	} catch (error) {
 		throw new Error(
@@ -1320,9 +1438,11 @@ async function bootstrapVenv(
 	const python = kernelVenvInterpreter(venv);
 	const runtimeIdentity = install.identity;
 
-	await run(uv, ["python", "install", PYTHON_VERSION], { signal: options.signal });
-	await run(uv, ["venv", venv, "--python", PYTHON_VERSION, "--seed"], { signal: options.signal });
-	await run(uv, kernelInstallArgs(python, install.requirement), { signal: options.signal });
+	const uvRun = (args: string[]): Promise<void> =>
+		run(uv, args, { signal: options.signal, timeoutMs: uvCommandTimeoutMs(), captureStderr: true });
+	await uvRun(["python", "install", PYTHON_VERSION]);
+	await uvRun(["venv", venv, "--python", PYTHON_VERSION, "--seed"]);
+	await uvRun(kernelInstallArgs(python, install.requirement));
 	await syncPythonSkills(uv, venv, python, runtimeIdentity, pythonSkills, options);
 }
 
@@ -1444,7 +1564,11 @@ async function syncPythonSkills(
 			await run(
 				uv,
 				["pip", "install", "--python", python, ...formatPythonSkillInstallArgs(skill), ...localDependencyArgs],
-				{ signal: options.signal },
+				{
+					signal: options.signal,
+					timeoutMs: uvCommandTimeoutMs(),
+					captureStderr: true,
+				},
 			);
 			installedPythonSkills.push(
 				skill,
@@ -1466,8 +1590,22 @@ async function syncPythonSkills(
 async function kernelBaseReady(python: string, venv: string, runtimeIdentity: string): Promise<boolean> {
 	return (
 		(await hasPrimeAgentRuntime(python)) &&
-		bootstrapBaseVersionCurrent(await readBootstrapVersion(venv), runtimeIdentity)
+		bootstrapBaseVersionCurrent(await readBootstrapVersion(venv), runtimeIdentity) &&
+		// A venv whose default packages no longer import needs a rebuild, not a skill sync -
+		// the base-ready branch would otherwise hand the broken generation back out (r36 INSB-4).
+		(await defaultRlmExtraPackagesImportable(python))
 	);
+}
+
+async function defaultRlmExtraPackagesImportable(python: string): Promise<boolean> {
+	try {
+		await run(python, [...KERNEL_PYTHON_SAFE_PATH_ARGS, "-"], {
+			stdinScript: RLM_EXTRA_IMPORTS_PROBE_SCRIPT,
+		});
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 async function kernelReady(
@@ -1478,7 +1616,8 @@ async function kernelReady(
 ): Promise<boolean> {
 	return (
 		(await hasPrimeAgentRuntime(python)) &&
-		bootstrapVersionCurrent(await readBootstrapVersion(venv), runtimeIdentity, pythonSkills)
+		bootstrapVersionCurrent(await readBootstrapVersion(venv), runtimeIdentity, pythonSkills) &&
+		(await defaultRlmExtraPackagesImportable(python))
 	);
 }
 
@@ -1488,13 +1627,19 @@ function formatBootstrapFailure(error: unknown): Error {
 	if (
 		error instanceof KernelBootstrapLockTimeoutError ||
 		error instanceof KernelBootstrapAbortedError ||
-		error instanceof KernelRuntimeSourceUnavailableError
+		error instanceof KernelRuntimeSourceUnavailableError ||
+		error instanceof KernelBootstrapLockCreateError
 	) {
 		return error;
 	}
+	// r36 INSB-3: when uv's own stderr is attached, it names the actual cause (ENOSPC, EACCES,
+	// index or proxy errors) - leading with "needs internet" would misdirect the user.
+	const carriesSubprocessStderr = error instanceof KernelSubprocessError && error.subprocessStderr !== undefined;
+	const hint = carriesSubprocessStderr
+		? "The output above is uv's own diagnostic; it names the actual failure (disk, permissions, index, or network). "
+		: "First-time setup needs internet to install uv, Python, prime-agent-runtime, and default Python packages; once set up, prime-agent runs offline. ";
 	return new Error(
-		`Failed to set up the Python kernel runtime. ${errorMessage(error)}\n` +
-			"First-time setup needs internet to install uv, Python, prime-agent-runtime, and default Python packages; once set up, prime-agent runs offline. " +
+		`Failed to set up the Python kernel runtime. ${errorMessage(error)}\n${hint}` +
 			"Set PRIME_AGENT_KERNEL_PYTHON to a Python with a current prime-agent-runtime and default Python packages installed to skip auto-bootstrap.",
 	);
 }
