@@ -97,6 +97,7 @@ import {
 	formatAuthenticationFailedMessage,
 	formatNoApiKeyFoundMessage,
 	formatNoModelSelectedMessage,
+	formatStaleAuthMessage,
 	isLikelyAuthenticationError,
 } from "./auth-guidance.js";
 import type { AuthSourceToken } from "./auth-storage.js";
@@ -225,6 +226,7 @@ import {
 	RLM_CHILD_FAILURE_CUSTOM_TYPE,
 	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
 	type RlmChildFailureDetails,
+	THINKING_LEVEL_CLAMPED_CUSTOM_TYPE,
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import {
@@ -1622,6 +1624,8 @@ export class AgentSession {
 	readonly sessionManager: SessionManager;
 	readonly settingsManager: SettingsManager;
 	private _serviceTierPreference: ServiceTier;
+	/** The user's requested thinking level, before per-model clamping (r43 MC-3). */
+	private _requestedThinkingLevel: ThinkingLevel | undefined;
 
 	private _scopedModels: Array<{
 		model: Model<any>;
@@ -2931,6 +2935,12 @@ export class AgentSession {
 			const isOAuth = this._modelRegistry.isUsingOAuth(this.model);
 			if (isOAuth) {
 				throw new Error(formatAuthenticationFailedMessage(this.model.provider));
+			}
+			// A stale mark means the credential exists but was 401/401-rejected and
+			// disabled: say that instead of "No API key found", which sends the user
+			// hunting for a key they never lost.
+			if (this._modelRegistry.getProviderAuthStatus(this.model.provider).source === "stale") {
+				throw new Error(formatStaleAuthMessage(this.model.provider));
 			}
 			throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
 		}
@@ -9899,8 +9909,29 @@ export class AgentSession {
 	}
 
 	setThinkingLevel(level: ThinkingLevel): void {
+		// Record the user's requested level as the intent; the effective level is
+		// derived per model, so a later model switch re-clamps from what was asked
+		// instead of from the value clamped for the previous model.
+		this._requestedThinkingLevel = level;
 		const availableLevels = this.getAvailableThinkingLevels();
 		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
+
+		if (effectiveLevel !== level && this.model) {
+			// Clamping must not be silent: the user asked for one tier and runs another.
+			const clampedMessage = `Model ${this.model.provider}/${this.model.id} does not support thinking level "${level}"; using "${effectiveLevel}" instead.`;
+			sessionLog.warn(clampedMessage, {
+				requested: level,
+				effective: effectiveLevel,
+				provider: this.model.provider,
+				modelId: this.model.id,
+			});
+			this.sessionManager.appendCustomMessageEntry(THINKING_LEVEL_CLAMPED_CUSTOM_TYPE, clampedMessage, true, {
+				requested: level,
+				effective: effectiveLevel,
+				provider: this.model.provider,
+				modelId: this.model.id,
+			});
+		}
 
 		const previousLevel = this.agent.state.thinkingLevel;
 		const isChanging = effectiveLevel !== previousLevel;
@@ -9909,9 +9940,13 @@ export class AgentSession {
 
 		if (isChanging) {
 			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
-			if (this.supportsThinking() || effectiveLevel !== "off") {
-				this.settingsManager.setDefaultThinkingLevel(effectiveLevel);
-			}
+		}
+		if (this.supportsThinking() || level !== "off") {
+			// Persist the requested level, never the clamped value: the saved default
+			// must keep the user's meaning so it survives model switches.
+			this.settingsManager.setDefaultThinkingLevel(level);
+		}
+		if (isChanging) {
 			this._emit({ type: "thinking_level_changed", level: effectiveLevel });
 			void this._extensionRunner.emit({
 				type: "thinking_level_select",
@@ -9992,7 +10027,9 @@ export class AgentSession {
 		if (!this.supportsThinking()) {
 			return this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
 		}
-		return this.thinkingLevel;
+		// Prefer the user's requested level over the effective level clamped for the
+		// previous model: setThinkingLevel re-clamps it for the new model.
+		return this._requestedThinkingLevel ?? this.settingsManager.getDefaultThinkingLevel() ?? this.thinkingLevel;
 	}
 
 	private _clampThinkingLevel(level: ThinkingLevel, _availableLevels: ThinkingLevel[]): ThinkingLevel {

@@ -37,6 +37,19 @@ export function formatNoApiKeyFoundMessage(provider: string): string {
 	return `No API key found for ${providerDisplay}.\n\n${getProviderLoginHelp()}`;
 }
 
+export function formatStaleAuthMessage(provider: string): string {
+	const providerDisplay = provider === UNKNOWN_PROVIDER ? "the selected model" : provider;
+	return (
+		`Credentials for ${providerDisplay} are still configured, but were rejected (401/403) earlier in this session and have been disabled.
+
+` +
+		`Run /login to update the credentials, or restart the process to retry (the disable cools down automatically).
+
+` +
+		LOGIN_RECOVERY_MESSAGE
+	);
+}
+
 export function formatAuthenticationFailedMessage(provider: string): string {
 	return (
 		`Authentication failed for "${provider}". Credentials may have expired or network is unavailable.\n\n` +

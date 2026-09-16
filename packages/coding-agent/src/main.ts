@@ -597,6 +597,9 @@ function buildSessionOptions(
 			cliProvider: config.provider,
 			cliModel: config.model,
 			modelRegistry,
+			// "--api-key" registers its key after resolution, so first-time setup
+			// must resolve against the full catalog.
+			allowUnauthenticated: Boolean(config.apiKey),
 		});
 		if (resolved.warning) {
 			diagnostics.push({ type: "warning", message: resolved.warning });

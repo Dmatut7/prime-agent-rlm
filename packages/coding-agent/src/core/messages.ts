@@ -35,6 +35,7 @@ export const IPYTHON_STATE_RESTORED_CUSTOM_TYPE = "ipython_state_restored";
 export const SESSION_SLASH_COMMAND_CUSTOM_TYPE = "session_slash_command";
 export const SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE = "session_slash_command_result";
 export const COMPACTION_OUTCOME_CUSTOM_TYPE = "compaction_outcome";
+export const THINKING_LEVEL_CLAMPED_CUSTOM_TYPE = "thinking_level_clamped";
 export const REFINEMENT_OUTCOME_CUSTOM_TYPE = "refinement_outcome";
 
 /**

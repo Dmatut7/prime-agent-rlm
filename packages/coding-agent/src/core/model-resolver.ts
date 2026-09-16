@@ -344,6 +344,12 @@ export function resolveCliModel(options: {
 	cliProvider?: string;
 	cliModel?: string;
 	modelRegistry: ModelRegistry;
+	/**
+	 * Resolve against the full catalog even without configured credentials.
+	 * Used for "--api-key" first-time setup, where the key is registered only
+	 * after the model is resolved.
+	 */
+	allowUnauthenticated?: boolean;
 }): ResolveCliModelResult {
 	const { cliProvider, cliModel, modelRegistry } = options;
 
@@ -351,14 +357,27 @@ export function resolveCliModel(options: {
 		return { model: undefined, warning: undefined, error: undefined };
 	}
 
-	// Important: use *all* models here, not just models with pre-configured auth.
-	// This allows "--api-key" to be used for first-time setup.
-	const availableModels = modelRegistry.getAll();
-	if (availableModels.length === 0) {
+	const allModels = modelRegistry.getAll();
+	if (allModels.length === 0) {
 		return {
 			model: undefined,
 			warning: undefined,
 			error: "No models available. Check your installation or add models to models.json.",
+		};
+	}
+
+	// Resolve inside the authenticated face unless the caller explicitly opted out.
+	// An explicit --provider pins the provider, and "--api-key" first-time setup
+	// registers its key only after resolution (see main.ts), so both must keep the
+	// full catalog. Without either, a fuzzy pattern that only matches unauthenticated
+	// providers would otherwise silently pick a provider the user cannot run.
+	const useFullCatalog = Boolean(cliProvider) || options.allowUnauthenticated === true;
+	const availableModels = useFullCatalog ? allModels : modelRegistry.getAvailable();
+	if (availableModels.length === 0) {
+		return {
+			model: undefined,
+			warning: undefined,
+			error: `No providers with configured credentials found. Run /login or restart with --api-key <key> to configure one, then retry with --model "${cliModel}".`,
 		};
 	}
 	const providerMap = new Map<string, string>();
@@ -461,12 +480,23 @@ export function resolveCliModel(options: {
 	}
 
 	const display = provider ? `${provider}/${pattern}` : cliModel;
-	return {
-		model: undefined,
-		thinkingLevel: undefined,
-		warning,
-		error: `Model "${display}" not found. Use "${APP_NAME} model list" to see available models.`,
-	};
+	let error = `Model "${display}" not found. Use "${APP_NAME} model list" to see available models.`;
+	if (!useFullCatalog) {
+		// The authenticated face had no match: name the providers the user can run
+		// right now, and any unauthenticated match, so the failure says what to do
+		// instead of surfacing as "No API key found" on the first run.
+		const configuredProviders = [...new Set(availableModels.map((m) => m.provider))];
+		const unauthenticatedMatch =
+			parseModelPattern(pattern, allModels, { allowInvalidThinkingLevelFallback: false }).model ??
+			parseModelPattern(cliModel, allModels, { allowInvalidThinkingLevelFallback: false }).model;
+		const unauthenticatedProviders =
+			unauthenticatedMatch && !availableModels.includes(unauthenticatedMatch) ? [unauthenticatedMatch.provider] : [];
+		error = `Model "${display}" not found among providers with configured credentials (${configuredProviders.join(", ")}).`;
+		if (unauthenticatedProviders.length > 0) {
+			error += ` It matches ${unauthenticatedProviders.join(", ")} without credentials: run /login or pass --provider ${unauthenticatedProviders[0]} --model "${cliModel}" to use it anyway.`;
+		}
+	}
+	return { model: undefined, thinkingLevel: undefined, warning, error };
 }
 
 export interface InitialModelResult {
