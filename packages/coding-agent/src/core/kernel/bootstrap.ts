@@ -611,9 +611,15 @@ async function resolveWritableKernelVenvDir(): Promise<string> {
 
 /**
  * Everything that makes a built venv interchangeable. Two builds with the same key are
- * the same generation; any difference (runtime source, bootstrap schema, snapshot
- * requirement, default packages) gets its own directory, so a generation a kernel is
+ * the same generation; any difference (interpreter line, runtime source, bootstrap schema,
+ * snapshot requirement, default packages) gets its own directory, so a generation a kernel is
  * running from is never rebuilt under it.
+ *
+ * The interpreter line is part of the key (L8D-2): bytecode and the venv's installed
+ * binaries are only interchangeable within one major.minor line, so bumping
+ * PYTHON_VERSION must move to a fresh generation instead of rm-and-rebuilding the
+ * same directory a live kernel is running from. The skills note below is why that
+ * rule does not extend to everything installable.
  *
  * The requested Python skills are deliberately *not* part of this key. They are per-session (a
  * session may enable a subset, and the record inside the generation is a union so subsets can
@@ -622,8 +628,9 @@ async function resolveWritableKernelVenvDir(): Promise<string> {
  * builds delete each other. Skill differences are reconciled inside the generation instead - by
  * content, never by absolute path (see {@link pythonSkillsSatisfied}, K-P1-2).
  */
-function kernelVenvBuildIdentity(runtimeIdentity: string): string {
+function kernelVenvBuildIdentity(runtimeIdentity: string, pythonVersion: string = PYTHON_VERSION): string {
 	return JSON.stringify({
+		python: pythonVersion,
 		schema: BOOTSTRAP_SCHEMA,
 		runtime: runtimeIdentity,
 		snapshot: STATE_SNAPSHOT_REQUIREMENT,
@@ -635,8 +642,15 @@ function kernelVenvBuildIdentity(runtimeIdentity: string): string {
  * The generation directory for one runtime identity: `<base>-<12 hex>`. The base itself is
  * never used as a venv any more; it only names the family and holds the bootstrap lock.
  */
-export function kernelVenvDirForIdentity(base: string, runtimeIdentity: string): string {
-	return generationDirForSuffix(base, kernelVenvGenerationSuffix(kernelVenvBuildIdentity(runtimeIdentity)));
+export function kernelVenvDirForIdentity(
+	base: string,
+	runtimeIdentity: string,
+	pythonVersion: string = PYTHON_VERSION,
+): string {
+	return generationDirForSuffix(
+		base,
+		kernelVenvGenerationSuffix(kernelVenvBuildIdentity(runtimeIdentity, pythonVersion)),
+	);
 }
 
 /** The generation directory this checkout's runtime identity resolves to. */

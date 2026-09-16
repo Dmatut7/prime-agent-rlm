@@ -680,7 +680,12 @@ class ReplTest(unittest.TestCase):
             fresh = ReplProcess()
             self.addCleanup(fresh.close)
             fresh.ready()
-            fresh.send({"type": "restore", "id": "r1", "path": path})
+            # L8D-1: a version-less restore now quarantines code objects (fail
+            # closed), so the roundtrip forwards the version the way the host
+            # does: read from the manifest this snapshot just wrote.
+            fresh.send(
+                {"type": "restore", "id": "r1", "path": path, "python_version": manifest["pythonVersion"]}
+            )
             done = one(fresh.until_done("r1"), "done")
             self.assertEqual(done["status"], "ok")
             self.assertEqual(sorted(done["restored"]), ["bump", "socket", "x"])

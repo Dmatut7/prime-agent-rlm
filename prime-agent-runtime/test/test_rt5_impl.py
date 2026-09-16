@@ -117,7 +117,11 @@ class Rt5RestoreHonestyTest(unittest.TestCase):
         self.assertEqual(done["status"], "ok", msg=json.dumps(done))
 
     def _restore(self, reader: ReplProcess) -> dict:
-        reader.send({"type": "restore", "id": "r1", "path": self.path})
+        # L8D-1: a version-less restore now quarantines code objects, so these
+        # degraded-revival tests state the compatible version a real host would
+        # forward from the manifest the writer just wrote.
+        version = f"{sys.version_info[0]}.{sys.version_info[1]}.{sys.version_info[2]}"
+        reader.send({"type": "restore", "id": "r1", "path": self.path, "python_version": version})
         return one(reader.until_done("r1"), "done")
 
     def test_rt5_frozen_globals_function_is_degraded_not_restored(self) -> None:

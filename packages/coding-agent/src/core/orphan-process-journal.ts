@@ -641,6 +641,92 @@ export function clearOrphanProcessJournal(path: string): void {
 	rmSync(path, { force: true });
 }
 
+/**
+ * L9F-1: retire still-active records a foreign owner wrote into this journal.
+ *
+ * A worker's journal also collects records from processes that inherited the journal
+ * env (a session host writes with its own pid as ownerPid). Every reader is
+ * owner-filtered and every reaper is owner- or kernel-scoped, which is right for
+ * killing - a foreign owner may still be alive and managing its own children - but
+ * it also means that once such a writer dies, nothing ever deactivates its records:
+ * they sit active forever and each compaction keeps the newest one per
+ * (ownerPid, pid), so the journal only grows (audit r38 F1: 60 foreign pairs, 0
+ * live, in one real journal).
+ *
+ * This reaper closes exactly that hole without touching the rejection semantics:
+ * it never kills and never touches the journal owner's own records (the
+ * owner-filtered reapers own those). A foreign record is retired - by appending
+ * the deactivation record its writer would have written, under the same ownerPid
+ * so every reader and every compaction sees it superseded - only when the pid is
+ * demonstrably gone: the pid no longer exists, or now belongs to a different
+ * start id. A pid that still exists under the recorded identity, or a pid-only
+ * record whose pid still exists, is left exactly as written: a live foreign owner
+ * still owns it.
+ */
+export function reapForeignOrphanProcessRecords(
+	path: string,
+	ownerPid: number,
+	query: (pid: number) => string | undefined = getProcessStartId,
+): number {
+	let contents: string;
+	try {
+		contents = readJournalContents(path, Number.POSITIVE_INFINITY);
+	} catch {
+		// ENOENT: a concurrent clear removed the journal; there is nothing to reap.
+		return 0;
+	}
+	const latest = new Map<string, OrphanProcessRecord>();
+	for (const line of contents.split("\n")) {
+		if (!line) {
+			continue;
+		}
+		try {
+			const record = JSON.parse(line) as Partial<OrphanProcessRecord>;
+			// Same validity predicate readActiveOrphanProcesses applies, minus the
+			// owner filter - and the owner's own records are skipped instead.
+			if (isJournalRecord(record) && record.ownerPid !== ownerPid) {
+				latest.set(`${record.ownerPid}:${record.pid}`, record);
+			}
+		} catch {
+			// A crash can truncate only the final append.
+		}
+	}
+	let reaped = 0;
+	for (const record of latest.values()) {
+		if (!record.active || foreignRecordPidIsLive(record, query)) {
+			continue;
+		}
+		appendRecord(
+			path,
+			{
+				version: 1,
+				pid: record.pid,
+				ownerPid: record.ownerPid,
+				active: false,
+				recordedAt: new Date().toISOString(),
+			},
+			{ fsync: true, create: true },
+		);
+		reaped += 1;
+	}
+	return reaped;
+}
+
+/**
+ * Whether a foreign record's pid still plausibly names the journaled process. A
+ * pid that no longer exists is dead; one running under a different start id means
+ * the journaled process exited and the pid was recycled, so the record is dead
+ * either way. A pid-only record whose pid still exists cannot prove death, so it
+ * is treated as live - retiring it would be a guess, and a reused pid must never
+ * be treated as retired on evidence it cannot supply.
+ */
+function foreignRecordPidIsLive(record: OrphanProcessRecord, query: (pid: number) => string | undefined): boolean {
+	const current = query(record.pid);
+	if (current === undefined) return false;
+	if (record.processStartId === undefined) return true;
+	return current === record.processStartId;
+}
+
 // Kills still-active bash() children journaled by the given kernel pid; sibling kernels' records are untouched.
 export function reapKernelOrphanProcesses(kernelPid: number): void {
 	const path = process.env[ORPHAN_PROCESS_JOURNAL_ENV];

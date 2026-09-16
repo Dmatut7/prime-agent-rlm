@@ -93,3 +93,22 @@ describe("kernel python resolution for real-kernel tests", () => {
 		expect(await resolveKernelPython(PROBE, await productKernelPythonCandidates(join(tempDir, "absent")))).toBe(null);
 	});
 });
+
+describe("L8D-2: the venv generation identity includes the interpreter version", () => {
+	it("gives two interpreter lines different generation directories under one base", () => {
+		const base = join(tempDir, "kernel-venv");
+		const runtime = "runtime-identity-l8d2";
+		const py311 = kernelVenvDirForIdentity(base, runtime, "3.11");
+		const py312 = kernelVenvDirForIdentity(base, runtime, "3.12");
+		// RED on HEAD: the identity hashed only schema/runtime/snapshot/uv-args, so
+		// bumping the requested interpreter rebuilt the same directory in place
+		// (rm + recreate) instead of moving to a new generation.
+		expect(py311).not.toBe(py312);
+		expect(basename(py311)).toMatch(GENERATION_SUFFIX);
+		expect(basename(py312)).toMatch(GENERATION_SUFFIX);
+		// Positive controls: the same line is still the same generation, and the
+		// runtime identity still separates generations on its own.
+		expect(kernelVenvDirForIdentity(base, runtime, "3.12")).toBe(py312);
+		expect(kernelVenvDirForIdentity(base, "runtime-identity-other", "3.12")).not.toBe(py312);
+	});
+});

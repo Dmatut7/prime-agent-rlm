@@ -28,6 +28,7 @@ import {
 import {
 	type AgentFamilyCatalogEntry,
 	type AgentSessionMessageAgentSummary,
+	agentFamilyRelationship,
 	assertAgentFamilyReach,
 	assertAgentSessionNameAvailable,
 	assertDirectAgentMessageTarget,
@@ -52,6 +53,7 @@ import {
 	killOrphanProcess,
 	ORPHAN_PROCESS_JOURNAL_ENV,
 	readActiveOrphanProcesses,
+	reapForeignOrphanProcessRecords,
 	shouldReapOrphanProcess,
 } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
@@ -4824,9 +4826,39 @@ export class DaemonSupervisor {
 		);
 		this.workers.delete(descriptor.workerId);
 		this.flipWorkerRosterEntriesInactive(worker);
+		// L9F-1 / audit F2: this path used to delete the orphan journal without
+		// reaping it (reclaimStaleWorkerRegistration reaps first), leaking the dead
+		// worker's still-running bash children and leaving foreign dead records
+		// active until the file went. Reap both halves before the delete.
+		this.reapFailedWorkerOrphanJournal(worker);
 		this.deleteWorkerDescriptor(worker);
 		if (!this.shuttingDown) {
 			this.broadcastHeartbeatsChanged();
+		}
+	}
+
+	/**
+	 * L9F-1: the failed-worker reap path's journal cleanup. The owner half mirrors
+	 * `recoverUncertainWorkerOperations` (kill the dead worker's still-active bash
+	 * children, guarded by the same identity checks); the foreign half only retires
+	 * records whose pid is already gone, never killing anything a foreign writer
+	 * still owns. The journal itself still goes with the descriptor right after.
+	 */
+	private reapFailedWorkerOrphanJournal(worker: ResidentWorker): void {
+		const path = worker.descriptor.orphanProcessJournalPath;
+		if (!path) {
+			return;
+		}
+		try {
+			for (const orphan of readActiveOrphanProcesses(path, worker.descriptor.pid)) {
+				if (!shouldReapOrphanProcess(orphan)) {
+					continue;
+				}
+				killOrphanProcess(orphan.pid);
+			}
+			reapForeignOrphanProcessRecords(path, worker.descriptor.pid);
+		} catch (error) {
+			this.log(`Could not reap orphan journal of failed worker ${worker.descriptor.workerId}: ${String(error)}`);
 		}
 	}
 
@@ -5503,6 +5535,11 @@ export class DaemonSupervisor {
 					}
 					if (!killOrphanProcess(orphan.pid)) reapFailed = true;
 				}
+				// L9F-1: records a foreign writer (an inherited env host) left behind
+				// are invisible to the owner-filtered read above; retire the ones whose
+				// pid is already dead so a journal that survives this recovery (the
+				// retry case) stops carrying them as active forever.
+				reapForeignOrphanProcessRecords(orphanProcessJournalPath, worker.descriptor.pid);
 				if (!reapFailed || !retryIsSafe) clearOrphanProcessJournal(orphanProcessJournalPath);
 			} catch (error) {
 				this.log(`Could not reap orphaned worker resources: ${String(error)}`);
@@ -6681,10 +6718,19 @@ export class DaemonSupervisor {
 		targetActiveSessionId: string,
 	): Promise<DaemonResponse> {
 		const senderKey = source.summary.activeSessionId ?? source.summary.id;
+		// K3L-1: the target worker cannot resolve the sender's session state (it
+		// lives in this worker), so the relationship is computed here and forwarded;
+		// without it the worker-side send reported no relationship and model-sourced
+		// directions (child, sibling) slipped past every direction gate downstream.
+		const fromRelationship = agentFamilyRelationship(
+			this.familyCatalogEntry(target.summary),
+			this.familyCatalogEntry(source.summary),
+		);
 		const payload: DaemonWorkerCommandBody = {
 			type: "worker_deliver_message",
 			targetActiveSessionId,
 			message: command.message,
+			...(fromRelationship ? { fromRelationship } : {}),
 			sender: {
 				activeSessionId: senderKey,
 				sessionId: source.summary.sessionId,
