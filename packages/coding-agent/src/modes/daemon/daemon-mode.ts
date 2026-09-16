@@ -79,6 +79,7 @@ import {
 } from "../../core/agent-session-runtime.js";
 import {
 	type AgentCronJob,
+	type AgentCronJobRunResult,
 	AgentCronJobStore,
 	AgentCronScheduler,
 	type AgentHeartbeatDeliveryMode,
@@ -92,7 +93,11 @@ import {
 	shouldDeferHeartbeatCronJob,
 } from "../../core/cron-jobs.js";
 import { flushOrphanProcessJournal, ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
-import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
+import {
+	isRetryableSessionInputRefusal,
+	PromptAdmissionCancelledError,
+	waitForPromptAdmission,
+} from "../../core/prompt-admission.js";
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../../core/rlm-runtime.js";
 import {
 	canPassivateSession,
@@ -1967,7 +1972,7 @@ export class AgentDaemon {
 		}
 	}
 
-	private async runCronJob(job: AgentCronJob): Promise<"skipped" | undefined> {
+	private async runCronJob(job: AgentCronJob): Promise<AgentCronJobRunResult | undefined> {
 		const requirePersistedJob = this.cronStore.list().some((candidate) => candidate.id === job.id);
 		const dueJob = requirePersistedJob ? this.getRunnableCronJob(job.id) : job;
 		if (!dueJob) {
@@ -2000,9 +2005,16 @@ export class AgentDaemon {
 			if (!this.isCronJobRunnableForState(runnableJob, state, requirePersistedJob)) {
 				return "skipped";
 			}
-			await session.followUp(runnableJob.prompt, undefined, {
-				resumeIfIdle: true,
-			});
+			try {
+				await session.followUp(runnableJob.prompt, undefined, {
+					resumeIfIdle: true,
+				});
+			} catch (error) {
+				if (isRetryableSessionInputRefusal(error)) {
+					return "deferred";
+				}
+				throw error;
+			}
 			return;
 		}
 		const getRunnableJob = (): AgentCronJob | undefined => {
@@ -2045,6 +2057,12 @@ export class AgentDaemon {
 		} catch (error) {
 			if (error === unrunnableAtAdmission) {
 				return "skipped";
+			}
+			if (isRetryableSessionInputRefusal(error)) {
+				// K3Q-3 (r40): QP-2/QP-3 refuse admission with a retryable typed
+				// error before anything is queued or delivered. The run never
+				// happened, so defer the tick instead of recording a failed run.
+				return "deferred";
 			}
 			throw error;
 		}

@@ -12,6 +12,7 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { getLogger } from "@earendil-works/pi-ai";
 import { lockSync } from "proper-lockfile";
+import { isRetryableSessionInputRefusal } from "./prompt-admission.js";
 import {
 	artifactDirectoryWriteMs,
 	readSessionArtifactTombstone,
@@ -77,7 +78,18 @@ export interface CreateAgentCronJobInput {
 	now?: Date;
 }
 
-export type AgentCronJobRunResult = "ran" | "skipped";
+/**
+ * Dispatch outcome recorded for a claimed job:
+ * - "ran": the job's prompt was handed to the session, or the attempt failed
+ *   while doing so (an error is stamped).
+ * - "skipped": the dispatch deliberately did not run (deferred against queued
+ *   work, coalesced away, unrunnable at admission); a once job counts as
+ *   consumed.
+ * - "deferred": a retryable admission refusal refused the prompt before
+ *   anything was queued or delivered, so the run is retried later and a once
+ *   job stays scheduled.
+ */
+export type AgentCronJobRunResult = "ran" | "skipped" | "deferred";
 
 /**
  * Per-session cap on concurrent rlm_heartbeat jobs (G3, r37 hbgoal-ts): each
@@ -173,6 +185,14 @@ const MAX_TIMEOUT_MS = 2_147_483_647;
  * costs ticks rather than disarming the scheduler for the rest of the process's life.
  */
 export const CRON_STORE_FAILURE_RETRY_MS = 30_000;
+/**
+ * Retry cadence for a dispatch deferred by a retryable admission refusal: the
+ * pause window that refused the prompt is transient (an MCP transport reload,
+ * an ACP stop window, an update-restart teardown), so a once job that hit the
+ * window stays scheduled and retries at this cadence instead of spinning the
+ * scheduler on zero-delay ticks against a nextRunAt in the past.
+ */
+export const CRON_DEFERRED_RETRY_MS = 5_000;
 const ONE_SECOND_MS = 1000;
 const ONE_MINUTE_MS = 60_000;
 /**
@@ -856,6 +876,24 @@ export class AgentCronJobStore {
 					};
 					return updated;
 				}
+				if (result.outcome === "deferred" && result.error === undefined) {
+					// K3Q-3 (r40): a retryable admission refusal (QP-2 pause window,
+					// QP-3 committing window) refused the prompt before anything was
+					// queued or delivered. The run never happened, so no runCount and
+					// no lastError - but a once job has not run yet either, so it stays
+					// scheduled on the deferred retry cadence instead of completing.
+					const nextRunAt =
+						job.schedule.kind === "once"
+							? new Date(now.getTime() + CRON_DEFERRED_RETRY_MS)
+							: nextRunAtForSchedule(job.schedule, now);
+					updated = {
+						...job,
+						nextRunAt: nextRunAt?.toISOString(),
+						lastSkippedAt: now.toISOString(),
+						updatedAt: updatedAtForMutation(now, job),
+					};
+					return updated;
+				}
 				updated = {
 					...job,
 					status: job.schedule.kind === "once" ? "completed" : job.status,
@@ -1248,7 +1286,7 @@ export class AgentCronScheduler {
 		const results = await Promise.all(
 			dispatches.map(({ dispatch, endDispatch }) => this.queueDispatch(dispatch, endDispatch)),
 		);
-		return results.filter((result) => result !== "skipped").length;
+		return results.filter((result) => result !== "skipped" && result !== "deferred").length;
 	}
 
 	private queueDispatch(
@@ -1271,12 +1309,20 @@ export class AgentCronScheduler {
 					try {
 						runResult = await this.hooks.runJob(job);
 					} catch (runError) {
-						error = runError;
-						this.hooks.onError?.(job, runError);
+						if (isRetryableSessionInputRefusal(runError)) {
+							// K3Q-3 (r40): a hook that did not absorb the retryable
+							// admission refusal still never queued or delivered anything,
+							// so the dispatch defers instead of recording a run that
+							// never happened.
+							runResult = "deferred";
+						} else {
+							error = runError;
+							this.hooks.onError?.(job, runError);
+						}
 					}
 					this.store.recordDispatchResult(dispatch.id, {
 						now: this.now(),
-						outcome: runResult === "skipped" && error === undefined ? "skipped" : "ran",
+						outcome: error === undefined ? (runResult ?? "ran") : "ran",
 						error,
 					});
 					return runResult;

@@ -80,6 +80,18 @@ export class SessionInputCoalescingError extends Error {
 	}
 }
 
+/**
+ * True for the typed, retryable admission refusals: the pause-window refusal
+ * and the committing-window refusal above. Both mean nothing was queued or
+ * delivered, so a scheduler whose tick hit one can treat the attempt as "not
+ * run, retry later" instead of a burned run.
+ */
+export function isRetryableSessionInputRefusal(
+	error: unknown,
+): error is SessionInputAdmissionPausedError | SessionInputCoalescingError {
+	return error instanceof SessionInputAdmissionPausedError || error instanceof SessionInputCoalescingError;
+}
+
 export class PromptAdmissionCancelledError extends Error {
 	constructor() {
 		super("Prompt admission was cancelled.");
