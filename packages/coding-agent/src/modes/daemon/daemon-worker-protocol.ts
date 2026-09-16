@@ -1,5 +1,9 @@
 import { closeSync, readFileSync } from "node:fs";
-import type { AgentSessionMessageDeliveryMode, AgentSessionMessageSender } from "../../core/agent-messages.js";
+import type {
+	AgentFamilyRelationship,
+	AgentSessionMessageDeliveryMode,
+	AgentSessionMessageSender,
+} from "../../core/agent-messages.js";
 import type { IdleEvictionMinutes } from "../../core/session-action-store.js";
 import { findShareSecretHits } from "../../core/share-session.js";
 
@@ -133,6 +137,13 @@ export type DaemonWorkerCommand =
 			message: string;
 			sender: AgentSessionMessageSender;
 			deliveryMode?: AgentSessionMessageDeliveryMode;
+			/**
+			 * Sender relationship from the target's point of view, computed by the
+			 * supervisor (the only place both family entries are visible). Additive and
+			 * optional: an older worker ignores it, which is the undefined relationship
+			 * it already produced for this path.
+			 */
+			fromRelationship?: AgentFamilyRelationship;
 	  }
 	| { id?: string; type: "worker_prepare_update" }
 	| { id?: string; type: "worker_commit_update" }

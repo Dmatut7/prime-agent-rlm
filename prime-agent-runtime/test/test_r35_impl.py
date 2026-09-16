@@ -258,7 +258,7 @@ class R35ImplTest(unittest.TestCase):
         events = reader.execute("c1", "helper(1)")
         self.assertEqual(reader.result_text(events), "2")
 
-    def test_rt3_missing_version_field_keeps_current_behaviour(self) -> None:
+    def test_rt3_missing_version_field_quarantines_code_objects(self) -> None:
         import dill
 
         payload = {"helper": dill.dumps(lambda n: n + 1)}
@@ -268,8 +268,15 @@ class R35ImplTest(unittest.TestCase):
         reader = self._writer()
         reader.send({"type": "restore", "id": "r1", "path": self.path})
         done = one(reader.until_done("r1"), "done")
+        # L8D-1: the gate fails closed. A request without python_version (the shape
+        # a legacy, missing, or torn manifest produces) quarantines by-value code
+        # objects with an "unknown" reason instead of reviving them.
         self.assertEqual(done["status"], "ok")
-        self.assertEqual(done["restored"], ["helper"])
+        self.assertEqual(done["restored"], [])
+        failed = {entry["name"]: entry["reason"] for entry in done["failed"]}
+        self.assertIn("python version unknown", failed["helper"])
+        events = reader.execute("c1", "helper(1)")
+        self.assertIn("NameError", one(events, "error")["ename"])
 
     def test_rt3_non_string_version_rejected(self) -> None:
         reader = self._writer()

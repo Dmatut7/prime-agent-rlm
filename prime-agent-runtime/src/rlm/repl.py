@@ -1340,11 +1340,20 @@ def _version_mismatch_reason(python_version: str | None) -> str | None:
     within one major.minor line (a function revived across lines executes and
     kills the interpreter with SIGTRAP/SIGSEGV, without any load-side error), so a
     mismatch quarantines by-value functions and classes while plain data revives.
+
+    The gate fails closed: a request without a usable version (legacy manifest,
+    missing or torn manifest, unparseable field) also quarantines code objects,
+    because "source version unknown" is indistinguishable from "cross-line
+    bytecode" at load time and the failure mode of guessing wrong is the kernel
+    dying on the first call. Plain data still revives either way.
     """
     if python_version is None:
-        return None
+        return "python version unknown: the snapshot records no writing interpreter version"
     current = sys.version.split()[0]
-    if _major_minor(python_version) == _major_minor(current):
+    payload_line = _major_minor(python_version)
+    if payload_line is None:
+        return "python version unknown: the snapshot's version field is unparseable"
+    if payload_line == _major_minor(current):
         return None
     return f"python version mismatch: payload {python_version}, interpreter {current}"
 
@@ -1381,18 +1390,24 @@ def _carries_foreign_code(value: Any) -> bool:
     with the same reason instead of half of it. The scan is one level deep -
     members are inspected, never descended into - so a self-referential
     container terminates at its own cap instead of the recursion limit.
+
+    The type check comes before the container branches: a namedtuple or a list
+    subclass is an instance of a foreign class first and a tuple second, and its
+    methods are foreign bytecode exactly like a plain instance's are (K3L-1).
+    For the builtin containers the check is O(1) and always negative, so it
+    costs nothing on the common path.
     """
     if _is_foreign_code_object(value):
+        return True
+    if _is_foreign_code_object(type(value)):
         return True
     if isinstance(value, dict):
         members: tuple[Any, ...] = (*value.keys(), *value.values())
     elif isinstance(value, (list, tuple, set, frozenset)):
         members = tuple(value)
     else:
-        # A plain instance: its class (whose methods are the foreign bytecode)
-        # and its own attribute values, one level each.
-        if _is_foreign_code_object(type(value)):
-            return True
+        # A plain instance: the class check above already covered its methods;
+        # its own attribute values are the remaining one level to inspect.
         state = getattr(value, "__dict__", None)
         members = tuple(state.values()) if isinstance(state, dict) else ()
     for member in members:

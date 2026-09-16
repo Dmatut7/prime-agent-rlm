@@ -3956,6 +3956,10 @@ export class AgentDaemon {
 						message: command.message,
 						sender: command.sender,
 						senderKey: command.sender.activeSessionId ?? `client:${command.sender.clientId}`,
+						// K3L-1: the supervisor computed the relationship because the
+						// sender's session lives in another worker; without it this send
+						// reported no relationship and defeated every direction gate.
+						...(command.fromRelationship ? { fromRelationship: command.fromRelationship } : {}),
 						origin: "agent",
 					});
 					this.writeWorkerSuccess(client, command, receipt);
@@ -6138,6 +6142,8 @@ export class AgentDaemon {
 		targetSelector: string;
 		message: string;
 		fromState?: ActiveSessionState;
+		/** Pre-computed relationship for senders whose session state is not local (cross-worker delivery). */
+		fromRelationship?: AgentFamilyRelationship;
 		sender?: AgentSessionMessageSender;
 		clientId?: string;
 		senderKey?: string;
@@ -6211,7 +6217,11 @@ export class AgentDaemon {
 			from:
 				options.sender ??
 				this.createAgentSessionMessageSender(options.fromState, options.clientId ?? options.origin),
-			fromRelationship: this.agentMessageRelationship(options.fromState, targetState),
+			// A local fromState is authoritative; the forwarded relationship is the
+			// only source when the sender's session lives in another worker.
+			fromRelationship: options.fromState
+				? this.agentMessageRelationship(options.fromState, targetState)
+				: options.fromRelationship,
 			target: this.createAgentSessionMessageEndpoint(targetState),
 		};
 		try {

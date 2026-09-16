@@ -278,7 +278,9 @@ export interface SnapshotManifestFacts {
 	 * when the manifest records one. The restore request forwards it so the runtime
 	 * can refuse to revive by-value functions and classes pickled under a different
 	 * major.minor line (reviving them reports success, then executing them kills the
-	 * kernel with SIGTRAP/SIGSEGV).
+	 * kernel with SIGTRAP/SIGSEGV). When this is undefined the request forwards no
+	 * version and the runtime's gate fails closed: code objects are quarantined with
+	 * a "source version unknown" reason while plain data still revives (L8D-1).
 	 */
 	pythonVersion?: string;
 }
@@ -300,11 +302,17 @@ function reasonEntries(value: unknown): SnapshotDroppedName[] {
 /**
  * Read the manifest that belongs to the payload next to it.
  *
- * Tolerant by design: a missing, torn, or foreign manifest yields `null` and the caller keeps
+ * Reading stays tolerant: a missing, torn, or foreign manifest yields `null` and the caller keeps
  * whatever it learned in-process. A name the runtime carried over verbatim from an older payload
  * (`preserved`) *is* in the payload, so it is subtracted here: the live value that failed to
  * serialize is gone, but reporting it as unsaved would contradict the restore that then revives
  * the carried-over blob and reports it through `restored`/`failed`.
+ *
+ * The tolerance is no longer the whole story downstream: `pythonVersion` is what the restore
+ * request forwards so the runtime can quarantine by-value functions and classes, and a `null`
+ * here (or a manifest without the field) means no version is forwarded, so the runtime's gate
+ * fails closed and quarantines code objects with "source version unknown" instead of reviving
+ * them (L8D-1). Plain data still revives.
  */
 export function readSnapshotManifest(manifestPath: string): SnapshotManifestFacts | null {
 	let parsed: unknown;
