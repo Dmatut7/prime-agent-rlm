@@ -774,6 +774,21 @@ export const APP_TITLE: string = piConfigName ? APP_NAME : "π";
 export const CONFIG_DIR_NAME: string = pkg.piConfig?.configDir || ".prime/agent";
 export const VERSION: string = pkg.version || "0.0.0";
 
+/**
+ * Read the installed package's version from disk, freshly, after a self-update has
+ * rewritten the package files. VERSION is bound at module load, so it still reports
+ * the pre-update version; the update receipt must not trust the manifest's claim
+ * over what actually landed on disk.
+ */
+export function readInstalledSelfVersion(): string | undefined {
+	try {
+		const installed = JSON.parse(readFileSync(getPackageJsonPath(), "utf-8")) as PackageJson;
+		return typeof installed.version === "string" && installed.version.length > 0 ? installed.version : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 // e.g., PI_CODING_AGENT_DIR or PRIME_AGENT_CODING_AGENT_DIR
 export const ENV_AGENT_DIR = `${envPrefix}_CODING_AGENT_DIR`;
 export const ENV_SESSION_DIR = `${envPrefix}_SESSION_DIR`;

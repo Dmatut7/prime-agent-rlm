@@ -1,0 +1,4 @@
+- Discarded prepared update-restart manifests older than the 30-minute restore window instead of reviving sessions from an update that died long ago.
+- Reported the version actually installed after a self-update instead of trusting the update manifest's target version.
+- Pointed the old-Node guidance at this repository's build-from-source path instead of the upstream releases page.
+- Errored explicitly when a session file was written by a newer Prime Agent version, instead of silently skipping its migration.
