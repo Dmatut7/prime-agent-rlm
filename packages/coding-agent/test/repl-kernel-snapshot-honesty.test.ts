@@ -173,6 +173,32 @@ describeIfKernel("kernel snapshot honesty (real runtime)", { tags: ["kernel-heav
 		}
 	}, 90_000);
 
+	it("does not claim a function revived with reduced semantics is available again", async () => {
+		const writer = harness.manager;
+		await writer.execute("plain = 1\nlst = [1, 2]\nalias = lst\ndef helper():\n    return len(lst)");
+		await expect.poll(() => persistedNames(harness), { timeout: 15_000 }).toContain("helper");
+		await writer.shutdown({ snapshot: true, drainHostRequests: true });
+
+		const reader = new ReplKernelManager({
+			python: python as string,
+			cwd: harness.dir,
+			snapshot: { path: harness.snapshotPath, manifestPath: harness.manifestPath, debounceMs: 50 },
+		});
+		try {
+			const restore = await reader.restoreState();
+			// RT-5: `helper` revives with a frozen copy of its defining namespace, so it is
+			// not "available again" in the sense the notice promises.
+			expect(restore?.restored).not.toContain("helper");
+			expect(restore?.degraded?.map((entry) => entry.name)).toContain("helper");
+			expect(restore?.restored).toContain("plain");
+			const lines = restoreNoticeLines(restore as NonNullable<typeof restore>).join("\n");
+			expect(lines).not.toMatch(/available again[^\n]*helper/);
+			expect(lines).toContain("reduced semantics");
+		} finally {
+			await reader.shutdown({ snapshot: false, drainHostRequests: true }).catch(() => undefined);
+		}
+	}, 90_000);
+
 	it("reports the real age of the snapshot instead of a fixed debounce claim", async () => {
 		await harness.manager.execute("old = 1");
 		await expect.poll(() => persistedNames(harness), { timeout: 15_000 }).toContain("old");
@@ -221,6 +247,29 @@ describe("kernel reset notice freshness wording", () => {
 		});
 		expect(notice).not.toContain("1.5s");
 		expect(notice).toContain("this host cannot tell when");
+	});
+
+	it("separates reduced-semantics revivals from the available-again claim", () => {
+		const lines = restoreNoticeLines({
+			restored: ["plain"],
+			failed: [],
+			degraded: [{ name: "helper", reason: "revived with a frozen copy of its defining namespace" }],
+			path: "/tmp/kernel-state.dill",
+		});
+		const text = lines.join("\n");
+		expect(text).toContain("reduced semantics");
+		expect(text).toContain("helper (revived with a frozen copy of its defining namespace)");
+		expect(text).not.toMatch(/available again[^\n]*helper/);
+		// A result with only degraded names must not claim a fresh start either: those
+		// values are in the kernel, just not trustworthy.
+		const degradedOnly = restoreNoticeLines({
+			restored: [],
+			failed: [],
+			degraded: [{ name: "helper", reason: "frozen namespace copy" }],
+			path: "/tmp/kernel-state.dill",
+		}).join("\n");
+		expect(degradedOnly).toContain("reduced semantics");
+		expect(degradedOnly).not.toContain("could not be revived");
 	});
 
 	it("names the names the snapshot never saved, with the runtime's reason", () => {

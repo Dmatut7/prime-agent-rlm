@@ -89,6 +89,18 @@ import sys as _prime_agent_sys
 import types as _prime_agent_types
 
 class _PrimeAgentCallableSkillModule(_prime_agent_types.ModuleType):
+    # Computed from the current run on every lookup, so importlib.reload of a skill
+    # cannot leave inspect.signature(skill) pinned to the startup-time snapshot.
+    @property
+    def __signature__(self):
+        run = getattr(self, "run", None)
+        if not callable(run):
+            return None
+        try:
+            return _prime_agent_inspect.signature(run)
+        except Exception:
+            return None
+
     async def __call__(self, *args, **kwargs):
         result = self.run(*args, **kwargs)
         if _prime_agent_inspect.isawaitable(result):
@@ -110,30 +122,111 @@ class _PrimeAgentUnavailableSkill:
     async def __call__(self, *args, **kwargs):
         return await self.run(*args, **kwargs)
 
+    def __getattr__(self, attr):
+        if attr in ("__path__", "__all__"):
+            # The import machinery probes these on 'from name import x'; it must see a
+            # non-package answer instead of the unavailable-skill error.
+            raise AttributeError(attr)
+        # The same named RuntimeError for attribute access as for calling, instead of
+        # leaking this class name in an AttributeError.
+        raise RuntimeError(
+            f"Python skill {self.__name__} is unavailable in this kernel. "
+            f"Import error: {self._prime_agent_import_error}"
+        )
+
     def __repr__(self):
         return f"<unavailable Python skill {self.__name__!r}: {self._prime_agent_import_error}>"
+
+def _prime_agent_rebind_function_globals(fn, target):
+    """Rebuild a module-level function against the wrapper's own dict.
+
+    Without this the wrapper's dict is a shallow copy: skill functions keep the raw
+    module dict as __globals__, so global rebinding and attribute writes on the
+    kernel-visible skill name are invisible to the skill's own code (and vice versa).
+    """
+    try:
+        rebound = _prime_agent_types.FunctionType(
+            fn.__code__, target, fn.__name__, fn.__defaults__, fn.__closure__
+        )
+    except Exception:
+        return fn
+    rebound.__dict__.update(fn.__dict__)
+    rebound.__module__ = fn.__module__
+    rebound.__qualname__ = fn.__qualname__
+    rebound.__doc__ = fn.__doc__
+    rebound.__annotations__ = fn.__annotations__
+    if fn.__kwdefaults__ is not None:
+        rebound.__kwdefaults__ = dict(fn.__kwdefaults__)
+    return rebound
+
+_PRIME_AGENT_SKILL_WRAPPERS = {}
 
 def _prime_agent_wrap_skill_module(module):
     run = getattr(module, "run", None)
     if not callable(run):
         return module
+    existing = _PRIME_AGENT_SKILL_WRAPPERS.get(module)
+    if existing is not None:
+        return existing
     if isinstance(module, _PrimeAgentCallableSkillModule):
+        _PRIME_AGENT_SKILL_WRAPPERS[module] = module
         return module
+    raw_dict = module.__dict__
     wrapped = _PrimeAgentCallableSkillModule(module.__name__)
-    wrapped.__dict__.update(module.__dict__)
-    try:
-        wrapped.__signature__ = _prime_agent_inspect.signature(run)
-    except Exception:
-        pass
+    wrapped.__dict__.update(raw_dict)
+    for _prime_agent_key, _prime_agent_value in list(wrapped.__dict__.items()):
+        # Only functions this module defined itself: a helper imported from another
+        # module keeps the globals of the module that defined it.
+        if (
+            _prime_agent_inspect.isfunction(_prime_agent_value)
+            and _prime_agent_value.__globals__ is raw_dict
+        ):
+            wrapped.__dict__[_prime_agent_key] = _prime_agent_rebind_function_globals(
+                _prime_agent_value, wrapped.__dict__
+            )
     doc = getattr(run, "__doc__", None)
     if doc:
         wrapped.__doc__ = doc
     _prime_agent_sys.modules[module.__name__] = wrapped
+    _PRIME_AGENT_SKILL_WRAPPERS[module] = wrapped
     return wrapped
+
+def _prime_agent_repoint_cross_skill_references():
+    """Skills that import each other hold raw module references from import time.
+
+    Swapping them for the wrappers keeps the callable contract (await A.B(...))
+    working inside skill code, and lets importlib.reload(A.B) find the wrapper in
+    sys.modules instead of failing with a backwards "not in sys.modules" error.
+    """
+    for _prime_agent_holder in list(_PRIME_AGENT_SKILL_WRAPPERS.values()):
+        for _prime_agent_key, _prime_agent_value in list(_prime_agent_holder.__dict__.items()):
+            # A module dict can hold unhashable values (e.g. its own __spec__), so the
+            # registry lookup is gated on module values.
+            if not isinstance(_prime_agent_value, _prime_agent_types.ModuleType):
+                continue
+            _prime_agent_replacement = _PRIME_AGENT_SKILL_WRAPPERS.get(_prime_agent_value)
+            if _prime_agent_replacement is not None and _prime_agent_replacement is not _prime_agent_value:
+                _prime_agent_holder.__dict__[_prime_agent_key] = _prime_agent_replacement
 
 _PRIME_AGENT_SKILL_IMPORT_ERRORS = {}
 
+# A skill import name the kernel already answers to (a loaded module, a bootstrap
+# global, the stdlib, or a builtin) must not be wrapped: wrapping would replace the
+# real sys.modules entry with a startup-time snapshot copy.
+_prime_agent_reserved_skill_names = (
+    frozenset(_prime_agent_sys.modules)
+    | frozenset(globals())
+    | frozenset(getattr(_prime_agent_sys, "stdlib_module_names", ()))
+    | frozenset(_prime_agent_sys.builtin_module_names)
+)
+
 for _prime_agent_skill_name in ${JSON.stringify(importNames)}:
+    if _prime_agent_skill_name in _prime_agent_reserved_skill_names:
+        _PRIME_AGENT_SKILL_IMPORT_ERRORS[_prime_agent_skill_name] = (
+            "refused: this import name is already provided by the kernel "
+            "(a loaded module, a kernel global, or the standard library)"
+        )
+        continue
     try:
         globals()[_prime_agent_skill_name] = _prime_agent_wrap_skill_module(
             _prime_agent_importlib.import_module(_prime_agent_skill_name)
@@ -144,6 +237,12 @@ for _prime_agent_skill_name in ${JSON.stringify(importNames)}:
             _prime_agent_skill_name,
             str(_prime_agent_skill_error),
         )
+        # Park the stub in sys.modules too, so 'import name' and 'from name import run'
+        # bind the stub and raise the named RuntimeError instead of re-raising the
+        # skill's own dependency error from a bare import.
+        _prime_agent_sys.modules[_prime_agent_skill_name] = globals()[_prime_agent_skill_name]
+
+_prime_agent_repoint_cross_skill_references()
 `.trim();
 }
 

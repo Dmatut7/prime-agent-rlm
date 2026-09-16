@@ -38,6 +38,12 @@ export interface SnapshotDroppedName {
 	reason: string;
 }
 
+/** One revived name whose semantics are reduced, and the runtime's reason. */
+export interface RestoreDegradedName {
+	name: string;
+	reason: string;
+}
+
 export interface RestoreResult {
 	/** Names successfully revived into the kernel namespace. */
 	restored: string[];
@@ -52,6 +58,14 @@ export interface RestoreResult {
 	 * unreadable or the write reported nothing dropped.
 	 */
 	notSaved?: SnapshotDroppedName[];
+	/**
+	 * Names the runtime revived but with reduced semantics: the value is in the kernel
+	 * and callable, yet it is not the live object the "available again" wording promises
+	 * (a by-value function carries a frozen copy of its defining namespace, so it reads
+	 * save-time values and its identity is frozen). Reported separately from `restored`
+	 * so neither notice claims them as fully back; absent when nothing was flagged.
+	 */
+	degraded?: RestoreDegradedName[];
 	path: string;
 	/** Present when the whole restore attempt failed (corrupt payload, timeout, a teardown that
 	 * interrupted the load): the saved namespace was not revived. A payload the runtime could not
@@ -211,7 +225,7 @@ export function restoreNoticeLines(result: RestoreResult): string[] {
 		lines.push(
 			`Your Python kernel state was revived from your previous session. These names are available again: ${result.restored.join(", ")}.`,
 		);
-	} else {
+	} else if ((result.degraded?.length ?? 0) === 0) {
 		lines.push(
 			"Your previous Python kernel state could not be revived; the kernel is starting fresh, so re-create any variables, imports, or loaded data you need.",
 		);
@@ -224,6 +238,16 @@ export function restoreNoticeLines(result: RestoreResult): string[] {
 			result.snapshotPolicy === "preserve-names"
 				? "Their saved values stay on disk unchanged and later snapshots carry them over as they are, so a future session can still revive them; in this session they are gone until you rebuild them."
 				: "Snapshot writes stay paused for this session so a namespace missing those names does not overwrite the state on disk; writing resumes after a restore that revives every saved name.",
+		);
+	}
+	// The third tier of "these came back": a name whose value revived but with reduced
+	// semantics. It is not in `restored` (the runtime moved it out), so without this line
+	// the model hears nothing about a value it will keep calling with frozen assumptions.
+	if (result.degraded && result.degraded.length > 0) {
+		lines.push(
+			`These were revived with reduced semantics and can silently misbehave: they read values frozen when the snapshot was written instead of the live kernel namespace, and their identity does not match other revived names. Re-define them from source before trusting their results: ${result.degraded
+				.map((entry) => `${entry.name} (${entry.reason})`)
+				.join("; ")}.`,
 		);
 	}
 	// The other half of "these came back": a name that never entered the payload cannot fail to

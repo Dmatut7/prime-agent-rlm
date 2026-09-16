@@ -1,0 +1,2 @@
+- Fixed Python skill wrapping so cross-skill imports, module-namespace rebinding, reloads, failed-skill errors, and kernel-reserved import names all behave like the kernel-global name, and made duplicate python import names resolve to one owner everywhere.
+- Changed kernel state restore notices to report functions revived with a frozen copy of their defining namespace as "reduced semantics" instead of claiming they are available again.
