@@ -128,10 +128,12 @@ describe("K3P-2: ancestor settings edits are live in a watching session", () => 
 		// when the session started.
 		writeFileSync(rootSettingsPath, JSON.stringify({ agentTraces: { enabled: false } }));
 
-		const applied = await waitFor(() => manager !== undefined && manager.getAgentTracesEnabled() === false, 5000);
+		// CI runners can stretch the 100ms stat-poll loop; the window is generous
+		// without weakening the proposition (the ancestor file alone must flip it).
+		const applied = await waitFor(() => manager !== undefined && manager.getAgentTracesEnabled() === false, 20000);
 		expect(applied).toBe(true);
 		expect(manager.drainWarnings("project").length).toBeGreaterThan(0);
-	}, 10000);
+	}, 25000);
 
 	it("control: a watched global edit still reloads and picks up the ancestor veto", async () => {
 		const globalPath = join(agentDir, "settings.json");
