@@ -12,7 +12,6 @@ import { fauxAssistantMessage, fauxToolCall, type LogEntry, setLogSink } from "@
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentSessionEvent } from "../../src/core/agent-session.js";
-import type { KernelLivenessSample } from "../../src/core/kernel/shared.js";
 import type { TurnLivenessKernelFacts } from "../../src/core/turn-liveness.js";
 import { createHarness, type Harness } from "./harness.js";
 
@@ -23,26 +22,6 @@ const quickTool: AgentTool = {
 	parameters: Type.Object({}),
 	execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
 };
-
-function sample(overrides: Partial<KernelLivenessSample> = {}): KernelLivenessSample {
-	// Live clock: the aggregate judges staleness against Date.now(), so a fixed epoch here
-	// would make every fixture look like a heartbeat that stopped long ago.
-	return {
-		receivedAt: Date.now(),
-		tick: 10,
-		intervalMs: 5_000,
-		cellId: "cell-1",
-		cpuMs: 1_000,
-		streamBytes: 0,
-		cellsDone: 0,
-		hostRequests: 0,
-		bashHandles: 0,
-		bashCellHandles: 0,
-		bashBufferedBytes: 0,
-		bashPipePending: 0,
-		...overrides,
-	};
-}
 
 /** A kernel a journaled degraded read would vouch for: live handles under a live loop. */
 function degradedJournalKernelFacts(): TurnLivenessKernelFacts {

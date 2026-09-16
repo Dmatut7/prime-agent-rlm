@@ -56,7 +56,7 @@ describe("a complete non-header record that lost only its newline", () => {
 		const dir = sessionDir();
 		const file = writeFile(
 			dir,
-			`${[headerLine(dir), infoLine("info-1", "first")].join("\n") + "\n" + infoLine("info-2", "second")}`,
+			`${`${[headerLine(dir), infoLine("info-1", "first")].join("\n")}\n${infoLine("info-2", "second")}`}`,
 		);
 
 		repairOwnedSessionFile(file);
@@ -72,7 +72,7 @@ describe("a complete non-header record that lost only its newline", () => {
 		const dir = sessionDir();
 		const file = writeFile(
 			dir,
-			`${[headerLine(dir), infoLine("info-1", "first")].join("\n") + "\n" + infoLine("info-2", "second")}`,
+			`${`${[headerLine(dir), infoLine("info-1", "first")].join("\n")}\n${infoLine("info-2", "second")}`}`,
 		);
 
 		// The write-owning open restores the terminator before anything can append
@@ -88,7 +88,7 @@ describe("a complete non-header record that lost only its newline", () => {
 	it("control: a genuinely torn tail is still dropped, not restored", () => {
 		const dir = sessionDir();
 		const torn = '{"type":"session_info","id":"info-torn","nam';
-		const file = writeFile(dir, `${[headerLine(dir), infoLine("info-1", "first")].join("\n") + "\n" + torn}`);
+		const file = writeFile(dir, `${`${[headerLine(dir), infoLine("info-1", "first")].join("\n")}\n${torn}`}`);
 
 		repairOwnedSessionFile(file);
 

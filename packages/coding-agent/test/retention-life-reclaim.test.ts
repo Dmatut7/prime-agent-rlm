@@ -102,7 +102,7 @@ function allSkipped(report: RetentionSweepReport) {
 function writeLedger(agentDir: string, records: unknown[]): void {
 	writeFileSync(
 		join(agentDir, "rlm-ledger", "ledger.jsonl"),
-		records.map((record) => JSON.stringify(record)).join("\n") + "\n",
+		`${records.map((record) => JSON.stringify(record)).join("\n")}\n`,
 	);
 }
 

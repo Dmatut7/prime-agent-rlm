@@ -102,7 +102,7 @@ function rolledBackTranscriptLines(sessionId: string, cwd: string): string[] {
 			type: "message",
 			id,
 			parentId,
-			timestamp: "2026-01-01T00:00:0" + id.slice(-1) + "Z",
+			timestamp: `2026-01-01T00:00:0${id.slice(-1)}Z`,
 			message: { role, content: "x", timestamp: 1, usage: messageUsage },
 		});
 	return [
