@@ -163,7 +163,7 @@ export function convertResponsesMessages<TApi extends Api>(
 				assistantMsg.provider === model.provider &&
 				assistantMsg.api === model.api;
 
-			for (const block of msg.content) {
+			for (const [blockIndex, block] of msg.content.entries()) {
 				if (block.type === "thinking") {
 					if (block.thinkingSignature) {
 						const reasoningItem = JSON.parse(block.thinkingSignature) as ResponseReasoningItem;
@@ -175,7 +175,12 @@ export function convertResponsesMessages<TApi extends Api>(
 					// OpenAI requires id to be max 64 characters
 					let msgId = parsedSignature?.id;
 					if (!msgId) {
-						msgId = `msg_${msgIndex}`;
+						// Unsigned text blocks (cross-provider handoff, aborted-turn
+						// traces) carry no API id, so synthesize one from the message AND
+						// block position: a message-level index alone made every unsigned
+						// block of one message collide, and the Responses API silently
+						// drops input items that reuse an id.
+						msgId = `msg_${msgIndex}_${blockIndex}`;
 					} else if (msgId.length > 64) {
 						msgId = `msg_${shortHash(msgId)}`;
 					}
@@ -744,8 +749,10 @@ export async function processResponsesStream<TApi extends Api>(
 			if (lastRawUsage) {
 				const cachedTokens = lastRawUsage.input_tokens_details?.cached_tokens || 0;
 				output.usage = {
-					// OpenAI includes cached tokens in input_tokens, so subtract to get non-cached input
-					input: (lastRawUsage.input_tokens || 0) - cachedTokens,
+					// OpenAI includes cached tokens in input_tokens, so subtract to get non-cached input.
+					// Some upstream proxies report cached > input; clamp so a bogus frame cannot
+					// turn the non-cached input (and cost/overflow math downstream) negative.
+					input: Math.max(0, (lastRawUsage.input_tokens || 0) - cachedTokens),
 					output: lastRawUsage.output_tokens || 0,
 					cacheRead: cachedTokens,
 					cacheWrite: 0,

@@ -80,6 +80,9 @@ export function googleUsageCounts(metadata: GoogleUsageMetadataFrame): {
 } {
 	const promptTokens = metadata.promptTokenCount || 0;
 	const cachedTokens = metadata.cachedContentTokenCount || 0;
+	// Clamp: a buggy proxy can report cached > prompt; a negative non-cached input
+	// would corrupt cost math and overflow decisions downstream.
+	const nonCachedPromptTokens = Math.max(0, promptTokens - cachedTokens);
 	// Google bills thinking separately: candidatesTokenCount excludes the
 	// thought tokens ("response pricing is the sum of output tokens and thinking
 	// tokens", Gemini thinking docs), so thoughtsTokenCount must be added here.
@@ -87,7 +90,7 @@ export function googleUsageCounts(metadata: GoogleUsageMetadataFrame): {
 	// breakdown of completion_tokens, so reasoning must NOT be re-added there).
 	const outputTokens = (metadata.candidatesTokenCount || 0) + (metadata.thoughtsTokenCount || 0);
 	return {
-		input: promptTokens - cachedTokens,
+		input: nonCachedPromptTokens,
 		output: outputTokens,
 		cacheRead: cachedTokens,
 		cacheWrite: 0,
