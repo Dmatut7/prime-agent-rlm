@@ -8,7 +8,6 @@ next to this file. Cells execute with top-level await in one persistent
 from __future__ import annotations
 
 import ast
-import asyncio
 import codecs
 import contextvars
 import ctypes
@@ -21,7 +20,6 @@ import platform
 import signal
 import stat
 import sys
-import tempfile
 import threading
 import time
 import traceback
@@ -510,6 +508,10 @@ def _consume_task_exception(task: asyncio.Task[Any]) -> None:
 
 
 def _sigint_handler(signum: int, frame: types.FrameType | None) -> None:
+    # asyncio loads by the time any task can be active (main() imports it), so
+    # this is a cached sys.modules hit even inside the signal handler.
+    import asyncio
+
     global _handoff_interrupted
     task = _active["task"]
     # No lock (the main thread may hold it): the rid equality revalidates the
@@ -723,6 +725,8 @@ async def _run_codes(codes: list[types.CodeType], ns: dict[str, Any]) -> Any:
 
 async def _run_guarded(task: asyncio.Task[Any], rid: str) -> tuple[str, Any, dict[str, Any] | None]:
     """Await a request task; returns (status, value, error event or None)."""
+    import asyncio
+
     with _interrupt_lock:
         _active["interrupted"] = False
         _active["rid"] = rid
@@ -1063,6 +1067,7 @@ def _snapshot_state(
     a rebuilt variable outranks the blob that could not be revived.
     """
     import datetime
+    import tempfile
 
     if not hasattr(os, "O_NOFOLLOW"):
         return {"error": "O_NOFOLLOW unavailable"}
@@ -1566,6 +1571,8 @@ def _restore_state(
 
 async def _handle_state(req: dict[str, Any], ns: dict[str, Any]) -> None:
     """Run snapshot/restore as an interruptible task and reply in the done event."""
+    import asyncio
+
     rid = req["id"]
     committed: list[dict[str, Any]] = []
 
@@ -2109,12 +2116,6 @@ def main() -> None:
     user_module.__dict__["__builtins__"] = __builtins__
     sys.modules["__main__"] = user_module
 
-    _loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(_loop)
-    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-    signal.signal(signal.SIGINT, _sigint_handler)
-    threading.Thread(target=_read_requests, args=(stdin_fd, queue), daemon=True).start()
-
     ready: dict[str, Any] = {
         "event": "ready",
         "protocol": _negotiated_protocol,
@@ -2127,7 +2128,23 @@ def main() -> None:
         ready["capabilities"] = capabilities
     _send(ready)
 
+    # The event-loop stack (asyncio plus its ssl, concurrent.futures, and
+    # logging imports) is the heaviest part of this module's boot chain; load
+    # it after the ready event so kernel startup stays lean. The loop, reader
+    # thread, and serve task all come up here before the host's first request
+    # can be served, and every function that references asyncio runs only
+    # after this point.
+    import asyncio
+    _loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_loop)
+    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    threading.Thread(target=_read_requests, args=(stdin_fd, queue), daemon=True).start()
+
     _serve_task = _loop.create_task(_serve(queue, user_module.__dict__))
+    # _sigint_handler has no task to target before serving starts, so installing
+    # it earlier would silently swallow a Ctrl-C during this boot window; the
+    # default handler must stay in charge until the loop and serve task exist.
+    signal.signal(signal.SIGINT, _sigint_handler)
     # A KeyboardInterrupt escaping a cell or background task stops
     # run_until_complete; the interrupt is already recorded, so resume serving.
     while not _serve_task.done():

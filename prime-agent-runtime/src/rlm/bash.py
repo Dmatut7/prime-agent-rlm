@@ -2,18 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
-import atexit
 import contextvars
 import json
 import os
 import re
-import secrets
-import selectors
-import shutil
 import signal
 import socket
-import struct
 import subprocess
 import sys
 import threading
@@ -21,16 +15,17 @@ import time
 from collections import deque
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, cast
 
 from . import _winjob
 
-_IS_POSIX = os.name == "posix"
+# Boot-lean imports: asyncio, secrets, shutil, datetime, selectors, struct,
+# fcntl/termios, and atexit load on first use below so `import rlm` (and with
+# it the kernel's pre-ready startup path) stays small. asyncio is bound onto
+# this module's globals by BashHandle.__init__ before any code path here can
+# touch it; every other user imports inside the function that needs it.
 
-if _IS_POSIX:
-    import fcntl
-    import termios
+_IS_POSIX = os.name == "posix"
 
 _HEAD_CAP = 512 * 1024
 _TAIL_CAP = 3 * 512 * 1024
@@ -132,6 +127,12 @@ class BashHandle:
     """
 
     def __init__(self, command: str) -> None:
+        # Every asyncio use in this module runs on a handle path (bash() is the
+        # only constructor), so bind the module global here, before
+        # _schedule_background_completion_notice or any await can run.
+        global asyncio
+        import asyncio
+
         self.command = command
         self._buffer = _BoundedBuffer()
         self._done = threading.Event()
@@ -160,6 +161,8 @@ class BashHandle:
         self._completion_marker: bytes | None = None
         status_write = -1
         if _IS_POSIX:
+            import secrets
+
             # Full-duplex status channel: the child end rides in as stdin (fd 0)
             # and the script remaps it to _STATUS_FD before swapping in /dev/null
             # (dash rejects multi-digit fds in redirections at parse time). The
@@ -310,6 +313,8 @@ class BashHandle:
             _signal_group(self._pid, signal.SIGKILL)
 
     def _pump(self) -> None:
+        import selectors
+
         stdout = self._proc.stdout
         assert stdout is not None
         if not _IS_POSIX:
@@ -470,6 +475,8 @@ class BashHandle:
     def _read_status(self) -> int | None:
         if self._status_read < 0:
             return None
+        import selectors
+
         try:
             # DefaultSelector (kqueue/epoll) instead of select(): select() rejects
             # fds >= FD_SETSIZE (1024) even when the process fd limit is higher.
@@ -516,6 +523,9 @@ class BashHandle:
         # quiescence heuristic (best-effort parity).
         if not _IS_POSIX or self._eof.is_set():
             return False
+        import fcntl
+        import struct
+        import termios
         stdout = self._proc.stdout
         if stdout is None:
             return False
@@ -1100,6 +1110,8 @@ def bash(command: str) -> BashHandle:
 
 
 def _shell() -> str:
+    import shutil
+
     # Read per call so env changes made in the REPL apply to later commands.
     override = os.environ.get("PRIME_AGENT_BASH_SHELL")
     if override:
@@ -1126,6 +1138,8 @@ def _with_prefix(command: str) -> str:
 
 
 def _fence_printf() -> str:
+    import shutil
+
     # `\command -p printf` defeats alias expansion but not a user-defined shell
     # function named `command`, which would swallow both fence frames and leave
     # the await hanging until the shell dies (wedged behind background jobs). A
@@ -1404,6 +1418,8 @@ def _record_journal(pid: int, active: bool) -> bool:
     # Returns False only when the journal is configured but enrollment failed;
     # active-record callers must then fail closed. Active records always carry
     # a processStartId so host reaping stays identity-verified.
+    from datetime import datetime, timezone
+
     path = os.environ.get("PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL")
     owner = os.environ.get("PRIME_AGENT_KERNEL_OWNER_PID")
     if not path or not owner:
@@ -1509,6 +1525,8 @@ def _kill_live_handles() -> None:
 
 def _install_shutdown_hook() -> None:
     global _hook_installed
+    import atexit
+
     with _hook_lock:
         if _hook_installed:
             return

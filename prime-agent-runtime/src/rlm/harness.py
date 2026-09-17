@@ -13,7 +13,6 @@ import json
 import math
 import os
 import re
-import secrets
 import stat
 import unicodedata
 from dataclasses import asdict, dataclass, field, fields
@@ -339,6 +338,8 @@ def _write_private_json_atomic(path: Path, data: dict[str, Any]) -> None:
         info = path.lstat()
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
             raise OSError(f"Refusing to replace non-regular private file: {path}")
+    import secrets
+
     temp_path = path.parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(12)}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _require_no_follow()
     fd: int | None = None
