@@ -554,6 +554,8 @@ In print mode, Prime Agent also reads piped stdin and merges it into the initial
 cat README.md | prime-agent -p "Summarize this text"
 ```
 
+The piped-stdin read gives up after a short idle window (default 250ms, `PI_STDIN_TIMEOUT_MS`, `0` skips, capped at 30s), so a non-interactive parent holding the pipe open never hangs the boot.
+
 ### Model Options
 
 | Option | Description |

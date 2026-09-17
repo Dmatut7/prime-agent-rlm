@@ -31,6 +31,8 @@ const daemonClientMock = vi.hoisted(() => {
 		emitStaleAgentEndOnAttach: false,
 		connectFails: false,
 		sessions: [] as Array<Record<string, unknown>>,
+		/** Optional live-session summary returned by the mocked create request. */
+		createdSession: undefined as Record<string, unknown> | undefined,
 	};
 
 	class MockDaemonClient {
@@ -52,6 +54,9 @@ const daemonClientMock = vi.hoisted(() => {
 			this.requests.push(command);
 			if (command.type === "list") {
 				return { type: "response", command: command.type, success: true, data: { sessions: behavior.sessions } };
+			}
+			if (command.type === "create" && behavior.createdSession !== undefined) {
+				return { type: "response", command: command.type, success: true, data: behavior.createdSession };
 			}
 			if (command.type === "attach" && behavior.emitStaleAgentEndOnAttach) {
 				this.emitMessage({ type: "session_event", activeSessionId: "active-1", event: { type: "agent_end" } });
@@ -138,6 +143,7 @@ describe("daemon command", () => {
 		daemonClientMock.behavior.emitStaleAgentEndOnAttach = false;
 		daemonClientMock.behavior.connectFails = false;
 		daemonClientMock.behavior.sessions = [];
+		daemonClientMock.behavior.createdSession = undefined;
 		consoleErrorMessages = [];
 		vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null | undefined) => {
 			throw new Error(`exit ${code}`);
@@ -521,6 +527,35 @@ describe("daemon command", () => {
 		await handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "create", "second"]);
 		const secondConfig = daemonClientMock.instances.at(-1)?.requests[0]?.config;
 		expect(secondConfig?.initialGoal).toBeUndefined();
+	});
+
+	it("errors on non-interactive daemon attach with the json remediation instead of hanging", async () => {
+		// The test runner's stdin is not a TTY, so the attach terminal guard must
+		// fail fast rather than block on a readline that can never be answered.
+		await expect(
+			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "attach", "active-1"]),
+		).resolves.toBe(true);
+
+		expect(process.exitCode).toBe(1);
+		expect(consoleErrorMessages.join(" ")).toContain("attach requires an interactive terminal");
+	});
+
+	it("prints the created session for non-interactive --json open instead of attaching", async () => {
+		daemonClientMock.behavior.createdSession = makeSessionSummary("active-open-1", "session-open-1", "open-1");
+		const logCalls: unknown[][] = [];
+		vi.spyOn(console, "log").mockImplementation((...messages: unknown[]) => {
+			logCalls.push(messages);
+		});
+
+		await expect(handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "--json"])).resolves.toBe(true);
+
+		// No attach-guard error: the machine-readable path prints the summary and exits.
+		expect(process.exitCode).toBeUndefined();
+		expect(consoleErrorMessages).toEqual([]);
+		const client = daemonClientMock.instances.at(-1);
+		expect(client?.requests.some((request) => request.type === "attach")).toBe(false);
+		expect(logCalls.length).toBe(1);
+		expect(() => JSON.parse(String(logCalls[0]?.[0]))).not.toThrow();
 	});
 });
 
