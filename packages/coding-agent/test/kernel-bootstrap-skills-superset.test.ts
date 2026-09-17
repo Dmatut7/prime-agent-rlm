@@ -148,7 +148,7 @@ function editableInstallCount(logPath: string, packagePath?: string): number {
 
 /** `uv venv` invocations, matched by shape so a versioned venv directory still counts. */
 function venvCreateCount(logPath: string): number {
-	return uvLines(logPath).filter((line) => /^venv .+ --python 3\.11 --seed/.test(line)).length;
+	return uvLines(logPath).filter((line) => /^venv .+ --python 3\.11/.test(line)).length;
 }
 
 /** A record entry for a real on-disk skill; `overrides` simulates drift (stale hash, other checkout). */

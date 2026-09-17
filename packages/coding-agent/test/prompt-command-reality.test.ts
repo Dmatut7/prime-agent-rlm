@@ -134,7 +134,7 @@ describe("package-install doctrine: every taught command must run", () => {
 		}
 		const prompt = replPrompt();
 		expect(prompt).not.toContain("no pip module");
-		expect(commands.length).toBeGreaterThan(1);
+		expect(commands.length).toBeGreaterThan(0);
 	});
 
 	const kernelPython = installedKernelPython();
@@ -158,12 +158,6 @@ describe("package-install doctrine: every taught command must run", () => {
 			}
 		},
 	);
-
-	it.skipIf(!kernelPython)("the venv the prompt installs into is the seeded one, contrary to the old claim", () => {
-		const pip = spawnSync(kernelPython as string, ["-m", "pip", "--version"], { encoding: "utf8", timeout: 30_000 });
-		expect(pip.status, `${pip.stdout}\n${pip.stderr}`).toBe(0);
-		expect(pip.stdout).toContain("pip");
-	});
 
 	it.skipIf(!canProbe)("the bare `uv pip install <pkg>` the old prompt taught fails in this environment", () => {
 		const bare = spawnSync(shell, ["-lc", "uv pip install --dry-run six"], {

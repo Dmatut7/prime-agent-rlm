@@ -1485,7 +1485,9 @@ async function bootstrapVenv(
 	const uvRun = (args: string[]): Promise<void> =>
 		run(uv, args, { signal: options.signal, timeoutMs: uvCommandTimeoutMs(), captureStderr: true });
 	await uvRun(["python", "install", PYTHON_VERSION]);
-	await uvRun(["venv", venv, "--python", PYTHON_VERSION, "--seed"]);
+	// Nothing invokes the venv's own pip; every kernel-venv package is installed
+	// through `uv pip install --python`, so the venv is created unseeded.
+	await uvRun(["venv", venv, "--python", PYTHON_VERSION]);
 	await uvRun(kernelInstallArgs(python, install.requirement));
 	// Land the base marker before the skill sync: a session killed mid-sync must
 	// leave the next one on the skills-only path instead of wiping the venv and
