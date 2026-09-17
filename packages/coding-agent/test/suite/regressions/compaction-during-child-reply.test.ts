@@ -1,65 +1,95 @@
 /**
- * Symptom B (boss's field observation): with the parent's context already over the
- * compaction threshold, a child's reply is admitted first - it opens a turn on the
- * oversized context - and the parent's own auto compaction only runs after that turn
- * ends. Manually killing agent-message admission is what let the compaction through,
- * so the ranking observed at HEAD is "child reply > compaction". This file pins the
- * opposite ranking: compaction first, child reply second. It also pins the two valves
- * that keep a repeatedly failing compaction from wedging the session.
+ * Symptom B (boss's field observation, 2026-09-17): with the parent's context already
+ * over the compaction threshold, a child's reply was admitted first - it opened a turn
+ * on the oversized context - and the parent's own auto compaction only ran after that
+ * turn ended. Manually killing agent-message admission was what let the compaction
+ * through, so the ranking then was "child reply > compaction". This file pins the
+ * opposite ranking - compaction first, child reply second - plus the two valves that
+ * keep a repeatedly failing compaction from wedging the session.
+ *
+ * Status: pins 1 and 3 were RED at HEAD=06260455d (measured 23:09 - the reply's
+ * `message_start` came at timeline index 1, `compaction_end` at index 3) and went green
+ * once `_incomingAgentMessageCompactionGate` landed. They stay here as regression pins;
+ * the flag-off control below still reproduces the old ordering on demand.
  *
  * ## Coordinates
- * Symbol names are authoritative. The line numbers in parentheses were read off the
- * working tree at 2026-09-17 23:20 (HEAD=06260455d plus compaction-safety's in-flight,
- * uncommitted src edits) and src is still moving under this file: quote the symbol, not
- * the number.
+ * Symbol names are authoritative. The line numbers were read off the working tree at
+ * 2026-09-17 23:52 (HEAD=236faf357, other lanes' src edits in flight) and src keeps
+ * moving under this file: quote the symbol, not the number.
  *
- * ## Mechanism at HEAD (read-only; nothing under src/ is touched here)
- *   - `DaemonMode.acceptAgentSessionMessage` (daemon-mode.ts:6500) is the child-reply
+ * ## The bug that was (still visible through the escape hatch)
+ *   - `DaemonMode.acceptAgentSessionMessage` (daemon-mode.ts:6567) is the child-reply
  *     call: streamingBehavior "steer", queueIfBusy true, customMessage.
- *   - `AgentSession.acceptAgentMessagePrompt` (agent-session.ts:6368) forwards to
- *     `_prompt` (agent-session.ts:7606) with skipInputHandlers + skipPrePromptWork +
+ *   - `AgentSession.acceptAgentMessagePrompt` (agent-session.ts:6381) forwards to
+ *     `_prompt` (agent-session.ts:7622) with skipInputHandlers + skipPrePromptWork +
  *     returnAfterAccepted.
  *   - On a session that is neither streaming nor compacting, `_prompt` takes the direct
  *     branch: `queueForBusy` is false because `_isBusyForSessionInput("preflight")`
- *     (agent-session.ts:8778) only reports compaction/retry/bash/pending work, so
+ *     (agent-session.ts:8794) only reports compaction/retry/bash/pending work, so
  *     `visibleQueued` is false and the action is admitted with `immediatelyEligible`.
- *   - The asymmetry that matters is in `_turnExecutionPolicy` (agent-session.ts:8155):
+ *   - The asymmetry is in `_turnExecutionPolicy` (agent-session.ts:8171):
  *     `preTurnCompaction: options.skipPrePromptWork ? "skip" : "afterModelSelection"`
- *     (agent-session.ts:8185). A child reply therefore never reaches
- *     `_runPreTurnCompaction` (agent-session.ts:6246) through `_prepareForCommit`
- *     (agent-session.ts:6266/6271), while a plain user prompt does. Its compaction is
- *     deferred to that turn's agent_end (`_checkCompaction`, agent-session.ts:5370).
- *     Pins 1 and 3 are red on exactly that ordering; pin 0 is the positive control that
- *     the direct-prompt path really does compact first.
- *   - The in-flight window behaves the other way: once `_runAutoCompaction`
- *     (agent-session.ts:12360) has armed `_autoCompactionAbortController`
- *     (agent-session.ts:12392), `isCompacting` is true, `_isBusyForSessionInput`
- *     queues the reply, and `_pumpSessionInputs` (agent-session.ts:8562) refuses to
- *     select it while compacting. Pin 2 documents that half.
- *   - Valves: `_registerCompactionFailure` (agent-session.ts:12211) counts consecutive
- *     failures; `shrunkKeepRecentTokens` (compaction.ts:746, wired at
- *     agent-session.ts:10837) halves the retained tail from
- *     COMPACTION_KEEP_RECENT_SHRINK_START (2) down to MIN_SHRUNK_KEEP_RECENT_TOKENS
- *     (4096) - pin 4; `_runEmergencyContextShrink` (agent-session.ts:12298) is the
- *     lossy last resort at COMPACTION_EMERGENCY_SHRINK_FAILURES (4), whose summary
- *     comes from `buildEmergencyShrinkSummary` (compaction.ts:952) and whose persisted
- *     notice from `buildEmergencyShrinkNotice` (compaction.ts:994) - pin 5.
+ *     (agent-session.ts:8201). A child reply therefore never reached
+ *     `_runPreTurnCompaction` (agent-session.ts:6259) through `_prepareForCommit`
+ *     (agent-session.ts:6279/6284), while a plain user prompt does - pin 0 pins that
+ *     path, so a gate that fixed agent messages by breaking directPrompt goes red.
+ *     Without pre-turn compaction the reply's compaction was deferred to that turn's
+ *     agent_end (`_checkCompaction`, agent-session.ts:5383): one request closer to the
+ *     provider's input wall per reply.
+ *
+ * ## The gate now in the tree
+ *   - `_incomingAgentMessageCompactionGate` (agent-session.ts:6522) answers
+ *     "compaction_in_flight" (a compaction is running: do not interrupt it),
+ *     "compaction_pending" (over the trigger and nothing running: start one now) or
+ *     undefined (admit normally). It stands down for human input, system fences, a
+ *     suspended pump, a streaming turn, disabled compaction and inside
+ *     `_isThresholdCompactionCoolingDown` (agent-session.ts:12200) - the anti-starvation
+ *     case, so a family is not blocked by a compaction that will not run.
+ *   - `acceptAgentMessagePrompt` (agent-session.ts:6407-6438) then starts the compaction
+ *     BEFORE queueing (`_startThresholdCompactionForIncomingInput`, agent-session.ts:6565,
+ *     fire-and-forget so admission never blocks on a summarization call), queues the
+ *     reply with reason "compaction_pending", and re-schedules the pump so a compaction
+ *     that settled mid-queue cannot strand the message.
+ *   - The in-flight half was already correct before the gate: once `_runAutoCompaction`
+ *     (agent-session.ts:12385) has armed `_autoCompactionAbortController`
+ *     (agent-session.ts:12417), `isCompacting` is true, `_isBusyForSessionInput` queues
+ *     the reply, and `_pumpSessionInputs` (agent-session.ts:8578) refuses to select it
+ *     while compacting. Pin 2 documents that half.
+ *
+ * ## Valves
+ *   - `_registerCompactionFailure` (agent-session.ts:12228) counts consecutive failures;
+ *     `shrunkKeepRecentTokens` (compaction.ts:749, wired at agent-session.ts:10848)
+ *     halves the retained tail from COMPACTION_KEEP_RECENT_SHRINK_START (1) down to
+ *     MIN_SHRUNK_KEEP_RECENT_TOKENS (4096) - pin 4.
+ *   - `_runEmergencyContextShrink` (agent-session.ts:12315) is the lossy last resort at
+ *     COMPACTION_EMERGENCY_SHRINK_FAILURES (4): `planEmergencyShrink` (compaction.ts:882)
+ *     picks the cut, `buildEmergencyShrinkSummary` (compaction.ts:953) writes the summary
+ *     the model reads, `buildEmergencyShrinkNotice` (compaction.ts:995) the persisted
+ *     compaction-outcome notice - pin 5.
  *
  * ## Controls (this repo requires both directions)
  *   - pin 0 proves the direct-prompt path compacts first, so pins 1/3 are not asserting
- *     something every path already does, and a gate that breaks directPrompt goes red;
+ *     something every path already does;
  *   - pin 2's `queued === true` is checked against a control that admits the very same
  *     steer immediately when nothing is in flight;
  *   - pins 1/3's ordering is checked against `compaction.priorityOverAgentMessages:
- *     false`, the documented escape hatch back to the old ranking.
+ *     false`, the documented escape hatch back to the old ranking;
+ *   - pin 5's "the oldest context is what gets dropped" is checked against the same
+ *     fill being verifiably in the model's view before the valve runs.
  *
  * ## Calibers
  * Context size is measured as transcript characters plus a fill marker, not as
  * `estimateContextTokens`: that estimate anchors on the last assistant usage, and a
  * compaction keeps recent assistant messages whose usage still reports the
- * pre-compaction context (`_getThresholdContextTokens`, agent-session.ts:12026, exists
+ * pre-compaction context (`_getThresholdContextTokens`, agent-session.ts:12042, exists
  * precisely to ignore those). The marker is what says "the oversized turn was really
- * summarized away".
+ * summarized away". Where a token number is needed anyway (pins 4/5), it is compared
+ * against src's own `compactionThresholdTokens`, not a hardcoded figure.
+ *
+ * A compaction is failed by making the SUMMARIZATION REQUEST fail, not by throwing from
+ * the `session_before_compact` hook: `ExtensionRunner.callHandler`
+ * (extensions/runner.ts:600-609) swallows handler errors and returns undefined, so a
+ * throwing hook silently becomes "no extension compaction" and the real summarizer runs.
  */
 
 import { writeFileSync } from "node:fs";
@@ -290,14 +320,11 @@ const SUMMARIZER_FAILURE = "summarizer exploded";
  * matching on the summarization system prompt keeps the turn responses intact however
  * the requests interleave.
  */
-const DIAG_SYSTEM_PROMPTS: string[] = [];
 function summarizerFailsResponder(answer = "answer") {
-	return (context: Context) => {
-		DIAG_SYSTEM_PROMPTS.push(JSON.stringify(context.systemPrompt?.slice(0, 90)));
-		return context.systemPrompt === SUMMARIZATION_SYSTEM_PROMPT
+	return (context: Context) =>
+		context.systemPrompt === SUMMARIZATION_SYSTEM_PROMPT
 			? fauxAssistantMessage("", { stopReason: "error", errorMessage: SUMMARIZER_FAILURE })
 			: fauxAssistantMessage(answer);
-	};
 }
 
 interface PreflightRecord {
@@ -646,21 +673,16 @@ describe("compaction vs. a child reply racing for the parent (symptom B)", () =>
 		expect(harness.session.queuedActionCount).toBe(0);
 		expect(harness.session.messages.filter((item) => isChildReply(item, childReplyId))).toHaveLength(1);
 		expect(assistantCount(harness)).toBeGreaterThan(assistantsBeforeReply);
-		writeFileSync(
-			"/tmp/pin2-diag.txt",
-			`pending=${harness.getPendingResponseCount()}\nstreaming=${harness.session.isStreaming}\ncompacting=${
-				harness.session.isCompacting
-			}\nqueued=${harness.session.queuedActionCount}\nunfinished=${
-				harness.session.unfinishedActionCount
-			}\nsteering=${JSON.stringify(harness.session.getSteeringMessages())}\nfollowUps=${JSON.stringify(
-				harness.session.getFollowUpMessages(),
-			)}\nagentStarts=${harness.eventsOfType("agent_start").length}\nagentEnds=${
-				harness.eventsOfType("agent_end").length
-			}\nturnStarts=${harness.eventsOfType("turn_start").length}\nmsgs=${harness.session.messages
-				.map((m) => `${m.role}${isAgentSessionMessage(m) ? "(child)" : ""}:${messageText(m).slice(0, 28)}`)
-				.join(" | ")}\n`,
-		);
-		expect(getAssistantTexts(harness)).toContain("child reply handled");
+		// The reply reached the model: an assistant message follows it in the transcript.
+		// Which response text landed there is NOT asserted, because the post-compaction
+		// continuation and the delivered reply can share one run - `agent.continue()` sends
+		// the whole transcript, the child message included, so the next queued answer
+		// replies to both (observed: one run, the reply committed before its answer).
+		const messagesAfterSettle = harness.session.messages;
+		const replyIndex = messagesAfterSettle.findIndex((item) => isChildReply(item, childReplyId));
+		expect(replyIndex).toBeGreaterThan(-1);
+		expect(messagesAfterSettle.slice(replyIndex + 1).some((item) => item.role === "assistant")).toBe(true);
+		expect(harness.getPendingResponseCount()).toBeGreaterThan(0);
 	});
 
 	it("pin 3: the compaction runs on its own (no admission pause) and the reply's turn sees the compacted context", async () => {
@@ -751,12 +773,6 @@ describe("compaction vs. a child reply racing for the parent (symptom B)", () =>
 		// 防假阳 for the whole pin: the transcript really is bigger than the retained-tail
 		// budget, so a skip cannot masquerade as a failure and the sequence below cannot
 		// pass on a session that never reached the hook.
-		writeFileSync(
-			"/tmp/pin4-diag.txt",
-			`tokens=${estimateContextTokens(harness.session.messages).tokens}\n${harness.session.messages
-				.map((m) => `${m.role}:${JSON.stringify(m).length}`)
-				.join("\n")}\n---prompts---\n${DIAG_SYSTEM_PROMPTS.join("\n")}\n`,
-		);
 		expect(estimateContextTokens(harness.session.messages).tokens).toBeGreaterThan(VALVE_KEEP_RECENT_TOKENS);
 
 		for (let attempt = 0; attempt < EXPECTED_KEEP_RECENT_SEQUENCE.length; attempt++) {
@@ -851,12 +867,6 @@ describe("compaction vs. a child reply racing for the parent (symptom B)", () =>
 		await harness.session.prompt("run the fill tool");
 		await harness.session.waitForIdle();
 		row("fill");
-		writeFileSync(
-			"/tmp/pin5-fill.txt",
-			`hookCalls=${recorder.calls}\nfill=${bigFillInContext(harness)}\nover=${overThreshold(
-				harness,
-			)}\n${harness.session.messages.map((m) => `${m.role}:${JSON.stringify(m).length}`).join("\n")}\n---prompts---\n${DIAG_SYSTEM_PROMPTS.map((x) => x.slice(0, 60)).join("\n")}\n`,
-		);
 		// The valve's precondition, and the positive control for claim (3) below: the
 		// oldest context is in the model's view now, and over the trigger.
 		expect(bigFillInContext(harness)).toBe(true);
@@ -874,17 +884,15 @@ describe("compaction vs. a child reply racing for the parent (symptom B)", () =>
 			await harness.session.waitForIdle();
 			row(String(turn));
 		}
-		writeFileSync("/tmp/pin5-diag.tsv", `${diag.join("\n")}\n`);
-		writeFileSync(
-			"/tmp/pin5-prompts.txt",
-			`${DIAG_SYSTEM_PROMPTS.join("\n")}\n---SUMMARIZATION_SYSTEM_PROMPT---\n${JSON.stringify(
-				SUMMARIZATION_SYSTEM_PROMPT.slice(0, 90),
-			)}\n---messages---\n${harness.session.messages
-				.map((m) => `${m.role}:${JSON.stringify(m).length}`)
-				.join("\n")}\n`,
-		);
+		// Diagnostic table on demand (COMPACTION_PIN5_DIAG=1): turns used, branch growth,
+		// compaction starts/ends with their outcome, hook calls, pending responses.
+		if (process.env.COMPACTION_PIN5_DIAG) writeFileSync("/tmp/pin5-diag.tsv", `${diag.join("\n")}\n`);
 
+		// The loop stopped on the failure count, not on its 40-turn bound. Observed: four
+		// failures inside three turns - an overflow-recovery attempt counts as a failure
+		// too, so the threshold cooldown does not space them out as much as it looks.
 		expect(turns.length).toBeGreaterThan(1);
+		expect(turns.length).toBeLessThan(40);
 		// 防假阳: the failures really accumulated, counted at the hook (a skip never reaches
 		// it and never counts). Without this the claims below could pass on a session that
 		// never compacted at all.
@@ -926,16 +934,11 @@ describe("compaction vs. a child reply racing for the parent (symptom B)", () =>
 		const target = thresholdTokens(harness) * EMERGENCY_SHRINK_TARGET_RATIO;
 		const estimate = estimateContextTokens(harness.session.messages).tokens;
 		const noticeAdmitsMiss = /could not reach/i.test(emergencyNotice?.content ?? "");
-		writeFileSync(
-			"/tmp/pin5-claim4.txt",
-			`estimate=${estimate}\ntarget=${target}\nthreshold=${thresholdTokens(harness)}\nover=${overThreshold(
-				harness,
-			)}\nnoticeAdmitsMiss=${noticeAdmitsMiss}\nnotice=${JSON.stringify(
-				(emergencyNotice?.content ?? "").slice(0, 400),
-			)}\nmsgs=${harness.session.messages.map((m) => `${m.role}:${JSON.stringify(m).length}`).join(",")}\n`,
-		);
 		expect(estimate < target || noticeAdmitsMiss).toBe(true);
-		expect(overThreshold(harness) || noticeAdmitsMiss).toBe(true);
+		// A shrink that reached its target must also take the session back under the
+		// trigger, or the next turn re-fires the same failing compaction. When the notice
+		// admits the miss, staying over the trigger is the documented outcome.
+		expect(overThreshold(harness)).toBe(noticeAdmitsMiss);
 	});
 
 	it("control: the same child steer is admitted at once when nothing is in flight (pin 2's queued=true is not vacuous)", async () => {
