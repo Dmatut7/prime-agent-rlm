@@ -1,5 +1,6 @@
 import { createServer } from "node:http";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { FORK_GATE_ENV_VAR } from "../src/fork-self-update.js";
 import {
 	checkForNewPiVersion,
 	comparePackageVersions,
@@ -13,6 +14,7 @@ const originalSkipVersionCheck = process.env.PI_SKIP_VERSION_CHECK;
 const originalOffline = process.env.PI_OFFLINE;
 const originalPrimeAgentDownloadBaseUrl = process.env.PRIME_AGENT_DOWNLOAD_BASE_URL;
 const originalDoNotTrack = process.env.DO_NOT_TRACK;
+const originalForkGate = process.env[FORK_GATE_ENV_VAR];
 
 function restoreEnv(name: string, value: string | undefined): void {
 	if (value === undefined) {
@@ -27,6 +29,12 @@ beforeEach(() => {
 	// itself; the opt-out is set back to `1` by the test that is about the opt-out.
 	process.env.DO_NOT_TRACK = "0";
 	delete process.env.PI_SKIP_VERSION_CHECK;
+	// The suite lives inside the fork checkout, so the marker walk in detectForkInstall always
+	// fires here and checkForNewPiVersion would answer "no notice" for every case below. Same
+	// in-repo seam r36-self-update-installed-version / package-command-paths use; the gate's own
+	// behaviour is pinned by fork-self-update.test.ts and by the gate describe at the end of this
+	// file, which turns the seam back off for exactly those two cases.
+	process.env[FORK_GATE_ENV_VAR] = "off";
 });
 
 afterEach(() => {
@@ -35,6 +43,7 @@ afterEach(() => {
 	restoreEnv("PI_OFFLINE", originalOffline);
 	restoreEnv("PRIME_AGENT_DOWNLOAD_BASE_URL", originalPrimeAgentDownloadBaseUrl);
 	restoreEnv("DO_NOT_TRACK", originalDoNotTrack);
+	restoreEnv(FORK_GATE_ENV_VAR, originalForkGate);
 });
 
 describe("version checks", () => {
@@ -146,5 +155,34 @@ describe("version checks", () => {
 		} finally {
 			await new Promise<void>((resolve) => server.close(() => resolve()));
 		}
+	});
+});
+
+describe("fork checkout gate", () => {
+	it("suppresses the notice while this checkout still points at upstream's releases", async () => {
+		// The seam above is off for this case: the subject is what a fork build does. One
+		// checkout cannot fix itself by installing upstream's package over it, so the
+		// background notice - whose only answer is "replace this build" - is suppressed, and
+		// the suppression is not silent (detectForkInstall logs the checkout it skipped).
+		delete process.env[FORK_GATE_ENV_VAR];
+		const fetchMock = vi.fn(async () => Response.json({ version: "v1.2.3" }));
+		vi.stubGlobal("fetch", fetchMock);
+
+		await expect(checkForNewPiVersion("1.2.2")).resolves.toBeUndefined();
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("still announces a newer version once the release origin is this line's own", async () => {
+		// Positive control for the case above: the gate is keyed to the *origin* plus the
+		// checkout, not to "is this a fork" alone, so pointing the download base at this
+		// line's own releases brings the notice back. Without this half the suppression
+		// assertion would stay green even if the check were disabled everywhere.
+		delete process.env[FORK_GATE_ENV_VAR];
+		process.env.PRIME_AGENT_DOWNLOAD_BASE_URL = "https://releases.example.invalid/fork-line";
+		const fetchMock = vi.fn(async () => Response.json({ version: "v1.2.3" }));
+		vi.stubGlobal("fetch", fetchMock);
+
+		await expect(checkForNewPiVersion("1.2.2")).resolves.toBe("1.2.3");
+		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 });
