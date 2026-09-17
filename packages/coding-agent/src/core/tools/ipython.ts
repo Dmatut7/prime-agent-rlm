@@ -52,10 +52,13 @@ except Exception as _prime_agent_rlm_error:
                 f"Import error: {_PRIME_AGENT_RLM_IMPORT_ERROR}"
             )
 
-        async def run(self, prompt, **kwargs):
+        async def spawn(self, prompt, **kwargs):
             self._raise_missing()
 
         async def find_models(self, query="", limit=8):
+            self._raise_missing()
+
+        async def create_session(self, prompt, **kwargs):
             self._raise_missing()
 
         async def list_subagents(self):
@@ -63,9 +66,6 @@ except Exception as _prime_agent_rlm_error:
 
         async def delete_subagent(self, target):
             self._raise_missing()
-
-        async def __call__(self, prompt, **kwargs):
-            return await self.run(prompt, **kwargs)
 
     rlm = _PrimeAgentMissingRlm()
 

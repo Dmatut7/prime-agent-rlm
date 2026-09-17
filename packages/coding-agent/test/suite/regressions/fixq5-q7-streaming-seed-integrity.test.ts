@@ -272,11 +272,15 @@ describe("FIX-Q5 catch-up reservation covers the snapshot load window", () => {
 
 		const transcript = worker.transcriptCaches.get(activeSessionId)!;
 		let windowDeltaFed = false;
+		let deferredAtDelta = -1;
 		internals.attachClient = vi.fn(async () => {
 			if (!windowDeltaFed) {
 				windowDeltaFed = true;
 				// A live delta arrives while the replacement snapshot loads.
 				handleWorkerFrame(worker, deltaFrame(textUpdateEvent("window-token", "window-token")));
+				// Positive control for the deferral buffer (#2260): the withheld delta is
+				// parked on the client instead of being forwarded into the clearing stream.
+				deferredAtDelta = legacy.client.deferredSessionPayloads?.get(activeSessionId)?.payloads.length ?? 0;
 			}
 			return { worker, result: attachResult(), transcript, releaseTranscript: undefined };
 		});
@@ -284,12 +288,15 @@ describe("FIX-Q5 catch-up reservation covers the snapshot load window", () => {
 
 		internals.queueCatchup(legacy.client, activeSessionId, "replacement");
 		await internals.catchUpClient(legacy.client);
-		// Round 2 drains the re-queued window delta inside the same catch-up.
-		expect(internals.attachClient).toHaveBeenCalledTimes(2);
+		// The deferral buffer replaced the re-queue: one attach round only, and the
+		// live delta is withheld behind the snapshot reservation instead of triggering
+		// a second catch-up round.
+		expect(internals.attachClient).toHaveBeenCalledTimes(1);
+		expect(deferredAtDelta).toBe(1);
 		expect(legacy.client.catchupActiveSessionIds?.size ?? 0).toBe(0);
 
 		// The window delta must never reach the client mid catch-up; it is
-		// re-queued and only delivered by a later, consistent catch-up round.
+		// buffered and only delivered by a later, consistent catch-up round.
 		const forwarded = legacy.lines() as DaemonOutbound[];
 		expect(
 			forwarded.some(

@@ -32,6 +32,8 @@ export interface CreateAgentSessionServicesOptions {
 	authStorage?: AuthStorage;
 	settingsManager?: SettingsManager;
 	modelRegistry?: ModelRegistry;
+	/** Pre-built MCP manager (tests inject stub probes and stores). */
+	mcpManager?: McpManager;
 	extensionFlagValues?: Map<string, boolean | string>;
 	resourceLoaderOptions?: Omit<DefaultResourceLoaderOptions, "cwd" | "agentDir" | "settingsManager">;
 	/**
@@ -50,6 +52,12 @@ export interface CreateAgentSessionServicesOptions {
 	 * files themselves (tests writing them on purpose) can switch it off.
 	 */
 	watchSettingsFile?: boolean;
+	/**
+	 * Hold the telemetry disclosure back on a first interactive launch, where it
+	 * would land on the onboarding screen. Onboarding marks itself shown, so the
+	 * notice appears on the next launch; sessions that never onboard disclose now.
+	 */
+	deferTelemetryNoticeForOnboarding?: boolean;
 }
 
 export interface AgentSessionCreationOptions {
@@ -192,10 +200,12 @@ export async function createAgentSessionServices(
 
 	// MCP integrations: registers OAuth providers and gates the built-in
 	// integration skills by whether the user is logged in (enable-by-login).
-	const mcpManager = new McpManager({
-		authStorage,
-		getUserServers: () => settingsManager.getGlobalMcpServers(),
-	});
+	const mcpManager =
+		options.mcpManager ??
+		new McpManager({
+			authStorage,
+			getUserServers: () => settingsManager.getGlobalMcpServers(),
+		});
 	// refresh() resets the OAuth registry to built-ins; re-add user MCP providers too.
 	modelRegistry.setOnOAuthProvidersReset(() => mcpManager.registerUserProviders());
 
@@ -239,6 +249,10 @@ export async function createAgentSessionServices(
 	if (
 		!options.telemetryDisabled &&
 		isTelemetryEnabled(settingsManager) &&
+		// A first interactive launch belongs to onboarding, where the notice would
+		// land on the welcome screen; it surfaces on the next launch once
+		// onboarding marks itself shown. Sessions that never onboard disclose now.
+		(settingsManager.getOnboardingShown() || !options.deferTelemetryNoticeForOnboarding) &&
 		!settingsManager.getTelemetryNoticeShown()
 	) {
 		telemetryNotice = TELEMETRY_NOTICE_MESSAGE;

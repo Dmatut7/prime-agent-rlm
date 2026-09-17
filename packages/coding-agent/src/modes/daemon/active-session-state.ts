@@ -39,6 +39,14 @@ export interface DaemonSocketClient {
 	transport?: "jsonl" | "private-framed";
 	snapshotStreaming?: boolean;
 	snapshotActiveSessionIds?: Set<string>;
+	/**
+	 * Relay payloads withheld while a snapshot stream is active for that session
+	 * (supervisor side: serialized buffers). They replay when the stream completes
+	 * instead of each one triggering a full snapshot re-transfer (#2260).
+	 */
+	deferredSessionPayloads?: Map<string, { payloads: Buffer[]; bytes: number }>;
+	/** Supervisor-side sessions whose deferral buffer overflowed this stream. */
+	deferredSessionPayloadsDropped?: Set<string>;
 	snapshotActiveSessionCounts?: Map<string, number>;
 	snapshotTransferAbortControllers?: Map<string, AbortController>;
 	snapshotTransferTails?: Map<string, Promise<void>>;

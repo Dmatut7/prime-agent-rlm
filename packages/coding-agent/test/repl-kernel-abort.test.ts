@@ -49,6 +49,7 @@ type ExitReportingInternals = {
 	child?: unknown;
 	wireChild: (child: unknown) => void;
 	kernelStderr: string;
+	kernelDiagnostics: string;
 	/** Marker the exit classifier reads; set immediately before an intentional kill. */
 	intentionalExitOrigin?: string;
 };
@@ -295,7 +296,7 @@ describe("ReplKernelManager abort handling", () => {
 		expect(internals.intentionalExitOrigin).toBe("abort_timeout_kill");
 		// Named in the ring too: cleanupResources drops the child before the exit event is
 		// delivered, so the exit handler's stale-child guard never classifies this death.
-		expect(internals.kernelStderr).toContain("abort_timeout_kill");
+		expect(internals.kernelDiagnostics).toContain("abort_timeout_kill");
 
 		child.emit("exit", null, "SIGKILL");
 		expect(unexpectedCauses).toEqual([]);
@@ -310,7 +311,7 @@ describe("ReplKernelManager abort handling", () => {
 
 		expect(unexpectedCauses).toEqual([]);
 		expect(internals.intentionalExitOrigin).toBe("kill");
-		expect(internals.kernelStderr).not.toContain("abort_timeout_kill");
+		expect(internals.kernelDiagnostics).not.toContain("abort_timeout_kill");
 	});
 
 	it("reports the same kernel's untagged exit as unexpected (positive control)", async () => {

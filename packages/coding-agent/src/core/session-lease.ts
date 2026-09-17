@@ -1,4 +1,4 @@
-import { execFile, execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
 	chmodSync,
@@ -17,6 +17,7 @@ import { readFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { lockSync } from "proper-lockfile";
+import { execFileSyncHidden } from "../utils/child-process.js";
 
 export const SESSION_LEASES_ENABLED_ENV = "PRIME_AGENT_INTERNAL_SESSION_LEASES";
 export const SESSION_LEASE_OWNER_ID_ENV = "PRIME_AGENT_INTERNAL_SESSION_LEASE_OWNER_ID";
@@ -175,7 +176,7 @@ type ProcessQueryAsync = (command: string, args: string[], options?: ProcessQuer
 const PROCESS_QUERY_TIMEOUT_MS = 5_000;
 
 function runProcessQuery(command: string, args: string[], options?: ProcessQueryOptions): string {
-	return execFileSync(command, args, {
+	return execFileSyncHidden(command, args, {
 		encoding: "utf8",
 		stdio: ["ignore", "pipe", "ignore"],
 		env: options?.env,
@@ -537,17 +538,48 @@ async function withLeaseGuardAsync<T>(directory: string, action: () => T): Promi
 	}
 }
 
+export function isRenameTargetContention(
+	directory: string,
+	code: string | undefined,
+	platform: string = process.platform,
+): boolean {
+	// POSIX: renameSync into an existing directory raises EEXIST or ENOTEMPTY.
+	if (code === "EEXIST" || code === "ENOTEMPTY") {
+		return true;
+	}
+	// Windows: renameSync into an existing directory raises EPERM or EACCES
+	// instead of EEXIST.  Only treat them as contention when the target
+	// actually exists so real permission errors still propagate.
+	if ((code === "EPERM" || code === "EACCES") && platform === "win32") {
+		try {
+			return existsSync(directory);
+		} catch {
+			return false;
+		}
+	}
+	return false;
+}
+
 function reclaimStaleLease(directory: string): boolean {
 	const stalePath = `${directory}.stale-${process.pid}-${randomUUID()}`;
-	try {
-		renameSync(directory, stalePath);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-			return true;
+	const sleepBuffer = new Int32Array(new SharedArrayBuffer(4));
+	for (let attempt = 1; ; attempt++) {
+		try {
+			renameSync(directory, stalePath);
+			break;
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code === "ENOENT") return true;
+			const transient = process.platform === "win32" && (code === "EBUSY" || code === "EPERM" || code === "EACCES");
+			if (!transient || attempt >= 8) return false;
+			Atomics.wait(sleepBuffer, 0, 0, 10 * attempt);
 		}
-		return false;
 	}
-	rmSync(stalePath, { recursive: true, force: true });
+	try {
+		rmSync(stalePath, { recursive: true, force: true, maxRetries: 8, retryDelay: 10 });
+	} catch {
+		// The quarantined directory no longer owns the lease path.
+	}
 	return true;
 }
 

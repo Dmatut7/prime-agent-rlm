@@ -3237,7 +3237,17 @@ export class InteractiveMode {
 		if (shortcuts.size === 0) return;
 
 		const localSessionHost = this.getLocalSessionHost();
+		// #2095 host timers: the shortcut path builds its own ctx, so its timers must be the same
+		// host-owned ones the runner tracks. They are resolved when a handler actually schedules
+		// one instead of being spread at construction time: building the shortcut context only
+		// requires the runner surface the shortcut path owns (getShortcuts/hasUI/getUIContext),
+		// and a host that hands a runner without the timer factory still gets a working context.
+		const hostTimers = () => extensionRunner.createTimerBindings();
 		const createContext = (): ExtensionContext => ({
+			setTimeout: (callback, ms) => hostTimers().setTimeout(callback, ms),
+			clearTimeout: (handle) => hostTimers().clearTimeout(handle),
+			setInterval: (callback, ms) => hostTimers().setInterval(callback, ms),
+			clearInterval: (handle) => hostTimers().clearInterval(handle),
 			// The runner already holds the dialog-tracking wrapper that bindExtensions
 			// installed, and extension handlers get their UI context from it. Building a
 			// fresh one here left the shortcut path uncounted, so a dialog opened by a

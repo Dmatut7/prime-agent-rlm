@@ -8,13 +8,14 @@ import {
 } from "../utils/bounded-wait.js";
 import type { HostRequestHandler } from "./kernel/index.js";
 import type { CustomMessage } from "./messages.js";
-import { HEARTBEAT_PROMPT_CUSTOM_TYPE } from "./messages.js";
+import { ASYNC_BASH_COMPLETION_CUSTOM_TYPE, HEARTBEAT_PROMPT_CUSTOM_TYPE } from "./messages.js";
 import { canonicalSessionPath } from "./session-lease.js";
 
 export const AGENT_MESSAGE_CUSTOM_TYPE = "agent_message";
 export const AGENT_MESSAGE_SKILL_NAME = "agent-message";
 export const AGENT_MESSAGE_IMPORT_NAME = "agent_message";
 export const AGENT_MESSAGE_SOURCE = "agent_message";
+export const AGENT_MESSAGE_ID_PREFIX = "agentmsg_";
 export const AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL = "Agent message received";
 export const DEFAULT_AGENT_MESSAGE_MAX_CHARS = 16_384;
 export const DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION = 20;
@@ -217,6 +218,7 @@ export interface AgentSessionMessageSendInput {
 export interface AgentSessionMessageController {
 	listAgents(): AgentSessionMessageListResult | Promise<AgentSessionMessageListResult>;
 	roster?(): AgentFamilyRosterResult | Promise<AgentFamilyRosterResult>;
+	family?(): Promise<AgentFamilyMember[]>;
 	awaitPendingChildPublication?(selector: string, signal?: AbortSignal): Promise<string | undefined>;
 	assertSessionNameAvailable?(input: AgentSessionNameAvailabilityInput): void | Promise<void>;
 	setSessionName?(name: string): void | Promise<void>;
@@ -378,6 +380,19 @@ export function buildAgentFamilyRoster(
 	return buildAgentFamilyRosterFromDirectory(selectAgentFamilyDirectory(current, catalog));
 }
 
+/**
+ * Second entry point over the same directory decision: the flat member list
+ * upstream's #2153 fold uses. One directory, two entries - the fold does not
+ * remove the roster entry point (AGENTS.md and the shipped agent-message skill
+ * both call `agent_message.list_agents`), so both names stay exported.
+ */
+export function selectAgentFamily(
+	current: AgentFamilyCatalogEntry,
+	catalog: readonly AgentFamilyCatalogEntry[],
+): AgentFamilyMember[] {
+	return selectAgentFamilyDirectory(current, catalog).members;
+}
+
 function classifyAgentSessionNameParent(
 	left: AgentSessionNameScope,
 	right: AgentSessionNameScope,
@@ -513,7 +528,12 @@ export function assertAgentFamilyReach(
 }
 
 export function createAgentSessionMessageId(): string {
-	return `agentmsg_${randomUUID()}`;
+	return `${AGENT_MESSAGE_ID_PREFIX}${randomUUID()}`;
+}
+
+/** Distinguishes agent-to-agent ids from the synthetic ids callers mint to track prompt completion. */
+export function isAgentSessionMessageId(id: string | undefined): boolean {
+	return id !== undefined && id.startsWith(AGENT_MESSAGE_ID_PREFIX);
 }
 
 export interface SubagentTerminalErrorNoticeInput {
@@ -709,6 +729,10 @@ export function assertAgentMessageQueueCapacity(
 	}
 }
 
+/**
+ * Parses the message id out of the pre-bracket-grammar header that persisted
+ * transcripts still contain; current prompts keep the id in details only.
+ */
 export function parseAgentSessionMessagePromptId(text: string): string | undefined {
 	const lines = text.split("\n");
 	const offset = lines[0]?.startsWith("[from ") ? 1 : 0;
@@ -787,7 +811,9 @@ export function startsAgentRun(message: AgentMessage): boolean {
 	return (
 		message.role === "user" ||
 		isAgentSessionMessage(message) ||
-		(message.role === "custom" && message.customType === HEARTBEAT_PROMPT_CUSTOM_TYPE)
+		(message.role === "custom" &&
+			(message.customType === HEARTBEAT_PROMPT_CUSTOM_TYPE ||
+				message.customType === ASYNC_BASH_COMPLETION_CUSTOM_TYPE))
 	);
 }
 
@@ -1147,10 +1173,38 @@ export function formatUncertainAgentMessageResendError(input: {
 }
 
 export function createAgentMessageHostHandlers(
-	controller: Pick<AgentSessionMessageController, "roster" | "sendAgentMessage" | "awaitPendingChildPublication">,
+	controller: Pick<AgentSessionMessageController, "roster" | "sendAgentMessage" | "awaitPendingChildPublication"> & {
+		/**
+		 * Second discovery entry (#2153). Optional: a fork session exposes the roster
+		 * entry point only, and familyMembers() projects it into the same member shape.
+		 */
+		family?(): Promise<AgentFamilyMember[]>;
+	},
 	options: AgentMessageHostHandlerOptions = {},
 ): Record<string, HostRequestHandler> {
 	const publicationWaitMs = options.publicationWaitMs ?? DEFAULT_SHORT_TARGET_WAIT_MS;
+	/**
+	 * Family members for the two discovery paths below, from whichever entry point
+	 * the session exposes. A fork session provides the roster (flat rows), so its
+	 * rows are projected back into member shape: every field these two paths read
+	 * (relationship, entry.id, entry.name via agentFamilyMemberName) survives the
+	 * projection, and the catalog-only fields they never read stay absent.
+	 */
+	const familyMembers = async (): Promise<AgentFamilyMember[]> => {
+		if (controller.family) return controller.family();
+		if (!controller.roster) throw new Error("agent family roster is not available in this session");
+		const roster = await controller.roster();
+		return roster.entries.map((entry) => ({
+			relationship: entry.relationship,
+			entry: {
+				id: entry.id,
+				name: entry.name,
+				depth: entry.depth,
+				status: entry.status,
+				...(entry.repliedSinceTask === undefined ? {} : { repliedSinceTask: entry.repliedSinceTask }),
+			},
+		}));
+	};
 	const handled = options.handledMessageIds ?? new HandledAgentMessageIds();
 	/** Sender-minted id of this call, when the kernel is new enough to send one. */
 	const messageIdOf = (payload: Record<string, unknown>): string | undefined =>
@@ -1214,14 +1268,13 @@ export function createAgentMessageHostHandlers(
 				if (payload.receiver_role !== undefined || payload.receiver_name !== undefined) {
 					throw new Error("agent_message.send broadcast cannot be combined with receiver_role/receiver_name");
 				}
-				if (!controller.roster) throw new Error("agent family roster is not available in this session");
-				const roster = await controller.roster();
+				const family = await familyMembers();
 				const results = await Promise.allSettled(
-					roster.entries.map((entry) =>
+					family.map((member) =>
 						controller.sendAgentMessage({
-							target: entry.id,
+							target: member.entry.id,
 							message: payload.message as string,
-							receiverRole: entry.relationship,
+							receiverRole: member.relationship,
 						}),
 					),
 				);
@@ -1229,7 +1282,7 @@ export function createAgentMessageHostHandlers(
 					result.status === "fulfilled"
 						? result.value
 						: {
-								target: roster.entries[index]!.id,
+								target: family[index]!.entry.id,
 								error: result.reason instanceof Error ? result.reason.message : String(result.reason),
 							},
 				);
@@ -1266,7 +1319,6 @@ export function createAgentMessageHostHandlers(
 				if (role !== "parent" && (typeof receiverName !== "string" || !receiverName.trim())) {
 					throw new Error("agent_message.send receiver_name is required for sibling and child messages");
 				}
-				if (!controller.roster) throw new Error("agent family roster is not available in this session");
 				const selector = typeof receiverName === "string" ? receiverName.trim() : undefined;
 				// Bounded (P1-1): a child whose publication never settles used to park this cell
 				// for as long as the parent turn lived. The bound does not cancel the publication
@@ -1287,11 +1339,13 @@ export function createAgentMessageHostHandlers(
 								throw error;
 							})
 						: undefined;
-				const roster = await controller.roster();
-				const matches = roster.entries.filter(
-					(entry) =>
-						entry.relationship === role &&
-						(role === "parent" || entry.name === selector || entry.id === selector || entry.id === publishedId),
+				const matches = (await familyMembers()).filter(
+					(member) =>
+						member.relationship === role &&
+						(role === "parent" ||
+							agentFamilyMemberName(member.entry) === selector ||
+							member.entry.id === selector ||
+							member.entry.id === publishedId),
 				);
 				if (matches.length !== 1) {
 					throw new Error(
@@ -1300,7 +1354,7 @@ export function createAgentMessageHostHandlers(
 							: `${role} selector ${JSON.stringify(receiverName)} is ambiguous`,
 					);
 				}
-				target = matches[0]!.id;
+				target = matches[0]!.entry.id;
 			}
 			let receipt: AgentSessionMessageReceipt;
 			try {

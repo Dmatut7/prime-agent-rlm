@@ -294,7 +294,9 @@ export class ProviderAuthFlows {
 			options.push({
 				id: providerId,
 				name,
-				authType: credential.type,
+				// The login selector only distinguishes oauth from key-style auth; an MCP static
+				// token is key-style (a bearer pasted once), so it presents as api_key here.
+				authType: credential.type === "oauth" ? "oauth" : "api_key",
 				category: isSerper || isMcp ? "service" : "provider",
 			});
 		}

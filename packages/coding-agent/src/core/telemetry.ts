@@ -33,6 +33,7 @@ export type TelemetryOnboardingOutcome = "success" | "error" | "aborted";
 export type TelemetryAuthCategory =
 	| "oauth"
 	| "api_key"
+	| "mcp_static_token"
 	| "runtime_api_key"
 	| "environment"
 	| "prime_cli"

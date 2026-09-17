@@ -1,0 +1,6 @@
+- Added a typed `session_recovering` daemon error (upstream-compatible `DaemonSessionRecoveringError` with wire round-trip) for sessions whose worker is registered but not yet hydrated, alongside the fork's adoption-window "Session worker is recovering" contract; both classify as transient with a 5s retry hint.
+- Bounded snapshot terminal-frame writes two ways: the fork's drain timeout plus the per-transfer abort signal (upstream #2260), so a suspended client or a superseded transfer can no longer leak the snapshot reservation.
+- Supervisor catch-up failures now drop the session's deferred payloads and keep the fork's bounded retry budget (C10/F4/F8), while a failed session no longer blocks the rest of the catch-up batch.
+- Platform-aware worker connect budgets: startup adoption and recovery probes keep the fork's fast-fail lanes (2s/1.5s on POSIX) while Windows gets the #2036 headroom (90s/10s).
+- Snapshot transfer integrity violations (restarted/mismatched duplicate transfers) keep the fork's close-the-worker containment instead of upstream's resync-only handling.
+- Authority-state writes (worker descriptors, supervisor config, shutdown admissions, update-restart manifest) now all go through the atomic-file util with fsync + directory fsync preserved.

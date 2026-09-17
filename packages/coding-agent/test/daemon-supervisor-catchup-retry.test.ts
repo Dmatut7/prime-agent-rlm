@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { DaemonSessionRecoveringError } from "../src/modes/daemon/daemon-errors.js";
 import type { DaemonOutbound } from "../src/modes/daemon/daemon-protocol.js";
 import {
 	type ClientCatchupRetryPolicy,
 	clientCatchupRetryDelayMs,
 	DEFAULT_CLIENT_CATCHUP_RETRY_POLICY,
 	isTransientCatchupFailure,
+	transientRetryAfterMs,
 } from "../src/modes/daemon/daemon-supervisor.js";
 import { disposeSupervisorHarnesses, startSupervisorHarness } from "./fixtures/supervisor-harness.js";
 
@@ -245,5 +247,99 @@ describe("T3-1 daemon supervisor catch-up retry", () => {
 			.filter((message) => "activeSessionId" in message && message.activeSessionId === root.activeSessionId);
 		expect(rootFrames).toHaveLength(0);
 		expect(harness.messages.filter(isSnapshotFailed)).toHaveLength(1);
+	}, 30_000);
+});
+
+describe("P3 merge union: recovering contract and retry-timer ownership", () => {
+	it("classifies the typed recovering error as transient with the 5s recheck hint", () => {
+		// The typed path (descriptor-addressed recovering roots) and the string path
+		// (adoption window) must both land in the retryable class with the same hint.
+		const typed = new DaemonSessionRecoveringError("active-1234");
+		expect(isTransientCatchupFailure(typed)).toBe(true);
+		expect(transientRetryAfterMs(typed)).toBe(5_000);
+		// The string contract is unchanged: the adoption-window path still throws it,
+		// and clients matching the message keep working.
+		expect(isTransientCatchupFailure(new Error("Session worker is recovering"))).toBe(true);
+		expect(transientRetryAfterMs(new Error("Session worker is recovering"))).toBe(5_000);
+		// Terminal answers stay terminal.
+		expect(isTransientCatchupFailure(new Error("Unknown active session: x"))).toBe(false);
+		expect(transientRetryAfterMs(new Error("Unknown active session: x"))).toBeUndefined();
+	});
+
+	it("parks the batch behind the armed backoff and heals every session on the retry", async () => {
+		const harness = await startSupervisorHarness({
+			prefix: "ma-batch-catchup-",
+			sessionCount: 2,
+			catchupRetryPolicy: testRetryPolicy(5, 400),
+		});
+		await harness.waitForWorkerReady();
+		const worker = harness.worker;
+		if (!worker) throw new Error("Harness started without a fake worker");
+		const [root, child] = harness.sessions;
+		if (!root || !child) throw new Error("Harness did not create two sessions");
+		for (const session of [root, child]) {
+			const response = await harness.request({
+				type: "attach",
+				activeSessionId: session.activeSessionId,
+				capabilities: ["attach_snapshot", "event_sequence"],
+				supportsExtensionUi: false,
+			});
+			expect(response.success).toBe(true);
+		}
+		/** Queues a catch-up by pushing a delta frame the supervisor cannot reconstruct. */
+		const gapFor = (activeSessionId: string): void =>
+			worker.pushFrame(
+				{
+					kind: "outbound",
+					outboundType: "session_event",
+					activeSessionId,
+					sessionEventType: "message_update",
+					payloadEncoding: "assistant-delta",
+				},
+				new TextEncoder().encode("this payload is not json\n"),
+			);
+		// Let any residual queue work from the attach snapshots finish, so the pass
+		// below contains exactly the two gapped sessions.
+		await harness.settle(400);
+		harness.messages.length = 0;
+		const attachesAtStart = worker.attachCount();
+
+		// The first gap's drain snapshots the queue before the second gap lands, so the
+		// sibling's entry parks behind the retry timer the failure just armed (the
+		// catchUpClient gate) — one failed attach, no sibling attach yet, no spin.
+		worker.failNextAttaches("Session worker is recovering", 1);
+		gapFor(root.activeSessionId);
+		gapFor(child.activeSessionId);
+		await harness.settle(150);
+		expect(worker.attachCount()).toBe(attachesAtStart + 1);
+		expect(harness.messages.filter(isSnapshotFailed)).toHaveLength(0);
+
+		// The armed backoff retries once and drains both queued sessions to health.
+		await harness.waitForCount((message) => message.type === "session_resynced", 2, 10_000);
+		expect(worker.attachCount()).toBe(attachesAtStart + 3);
+		expect(harness.messages.filter(isSnapshotFailed)).toHaveLength(0);
+	}, 30_000);
+
+	it("keeps a single writer for catchupRetryTimer: triggers during backoff do not re-arm", async () => {
+		const policy = testRetryPolicy(5, 400);
+		const { harness, worker, triggerCatchup } = await startCatchupHarness(policy);
+		harness.messages.length = 0;
+		const attachesAtStart = worker.attachCount();
+
+		worker.failNextAttaches("Session worker is recovering", 1);
+		await triggerCatchup();
+		// A second trigger lands while the policy timer is armed: the catchUpClient gate
+		// (snapshotStreaming || backpressured || catchupRetryTimer) must swallow it —
+		// a second writer (e.g. upstream's fixed 250ms re-arm) would retry immediately
+		// and double-drive the budget.
+		await triggerCatchup();
+		await harness.settle(150);
+		expect(worker.attachCount()).toBe(attachesAtStart + 1);
+		expect(harness.messages.filter(isSnapshotFailed)).toHaveLength(0);
+
+		// The armed retry fires once and heals the client.
+		await harness.waitFor(isResynced);
+		await harness.settle(200);
+		expect(worker.attachCount()).toBe(attachesAtStart + 2);
 	}, 30_000);
 });

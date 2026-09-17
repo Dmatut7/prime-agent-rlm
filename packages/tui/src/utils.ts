@@ -29,6 +29,7 @@ function couldBeEmoji(segment: string): boolean {
 }
 
 // Regexes for character classification (same as string-width library)
+const nonPrintableAsciiRegex = /[^\x20-\x7e]/;
 const zeroWidthRegex = /^(?:\p{Default_Ignorable_Code_Point}|\p{Control}|\p{Mark}|\p{Surrogate})+$/v;
 const leadingNonPrintingRegex = /^[\p{Default_Ignorable_Code_Point}\p{Control}\p{Format}\p{Mark}\p{Surrogate}]+/v;
 const rgiEmojiRegex = /^\p{RGI_Emoji}$/v;
@@ -47,13 +48,7 @@ const widthCache = new Map<string, number>();
 let widthCacheChars = 0;
 
 function isPrintableAscii(str: string): boolean {
-	for (let i = 0; i < str.length; i++) {
-		const code = str.charCodeAt(i);
-		if (code < 0x20 || code > 0x7e) {
-			return false;
-		}
-	}
-	return true;
+	return !nonPrintableAsciiRegex.test(str);
 }
 
 function truncateFragmentToWidth(text: string, maxWidth: number): { text: string; width: number } {

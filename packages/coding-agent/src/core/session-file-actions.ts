@@ -1,7 +1,7 @@
-import { spawnSync } from "node:child_process";
 import { type Dirent, existsSync } from "node:fs";
 import { readdir, rm, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { spawnSyncHidden } from "../utils/child-process.js";
 import { recordSessionArtifactTombstone } from "./session-artifact-tombstones.js";
 import {
 	forgetSessionInfo,
@@ -81,7 +81,7 @@ async function forgetSummariesUnder(dir: string): Promise<void> {
 /** Remove the session `.jsonl`, trying the `trash` CLI first, then falling back to unlink. */
 async function removeSessionFile(sessionPath: string): Promise<DeleteSessionFileResult> {
 	const trashArgs = sessionPath.startsWith("-") ? ["--", sessionPath] : [sessionPath];
-	const trashResult = spawnSync("trash", trashArgs, { encoding: "utf-8" });
+	const trashResult = spawnSyncHidden("trash", trashArgs, { encoding: "utf-8" });
 
 	const getTrashErrorHint = (): string | null => {
 		const parts: string[] = [];

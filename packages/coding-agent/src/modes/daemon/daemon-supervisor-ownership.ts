@@ -1,25 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
-import {
-	closeSync,
-	constants,
-	existsSync,
-	fchmodSync,
-	fsyncSync,
-	mkdirSync,
-	openSync,
-	readdirSync,
-	readFileSync,
-	realpathSync,
-	renameSync,
-	rmSync,
-	statSync,
-	writeSync,
-} from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { getLogger } from "@earendil-works/pi-ai";
 import lockfile from "proper-lockfile";
 import { getProcessStartId } from "../../core/session-lease.js";
+import { writeFileAtomicSync } from "../../utils/atomic-file.js";
 import { defaultDaemonSocketDir, normalizeSocketPath } from "./daemon-socket.js";
 
 const DAEMON_SUPERVISOR_REGISTRY_DIR_ENV = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR";
@@ -1289,42 +1275,13 @@ function readShutdownAdmission(path: string): DaemonShutdownAdmissionRecord | un
  * its durability across a power loss is weaker.
  */
 export function writeJsonAtomically(path: string, value: unknown): void {
-	const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
-	let descriptor: number | undefined;
-	try {
-		descriptor = openSync(
-			tempPath,
-			constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
-			0o600,
-		);
-		writeSync(descriptor, `${JSON.stringify(value, null, 2)}\n`);
-		// open's mode is umask-masked; pin the private bits before the file is durable.
-		fchmodSync(descriptor, 0o600);
-		fsyncSync(descriptor);
-		closeSync(descriptor);
-		descriptor = undefined;
-		renameSync(tempPath, path);
-	} catch (error) {
-		if (descriptor !== undefined) {
-			try {
-				closeSync(descriptor);
-			} catch {
-				// The write failure is the one worth reporting.
-			}
-		}
-		rmSync(tempPath, { force: true });
-		throw error;
-	}
-	try {
-		const directoryDescriptor = openSync(dirname(path), "r");
-		try {
-			fsyncSync(directoryDescriptor);
-		} finally {
-			closeSync(directoryDescriptor);
-		}
-	} catch {
-		// See above: weaker durability, not a failed write.
-	}
+	// The util owns the short-write loop (a single writeSync can return a partial
+	// count); the flags keep this site's unconditional fsync + directory fsync.
+	writeFileAtomicSync(path, `${JSON.stringify(value, null, 2)}\n`, {
+		mode: 0o600,
+		fsync: true,
+		fsyncDir: true,
+	});
 }
 
 function startupFencePath(directory: string, socketPath: string): string {

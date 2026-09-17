@@ -14,6 +14,7 @@ type AbortInternals = {
 	wireChild: (child: AbortInternals["child"]) => void;
 	inFlightHostRequests: Map<Promise<void>, unknown>;
 	kernelStderr: string;
+	kernelDiagnostics: string;
 	child: EventEmitter & {
 		exitCode: number | null;
 		signalCode: NodeJS.Signals | null;
@@ -25,7 +26,11 @@ type AbortInternals = {
 			on: (event: string, listener: (...args: unknown[]) => void) => void;
 		};
 		stdout?: { destroy: () => void; on: (event: string, listener: (...args: unknown[]) => void) => void };
-		stderr?: { destroy: () => void; on: (event: string, listener: (...args: unknown[]) => void) => void };
+		stderr?: {
+			destroy: () => void;
+			on: (event: string, listener: (...args: unknown[]) => void) => void;
+			once: (event: string, listener: (...args: unknown[]) => void) => void;
+		};
 	};
 };
 
@@ -45,7 +50,7 @@ function configuredManager(
 		pid: undefined,
 		stdin: { destroyed: false, destroy: vi.fn(), on: vi.fn() },
 		stdout: { destroy: vi.fn(), on: vi.fn() },
-		stderr: { destroy: vi.fn(), on: vi.fn() },
+		stderr: { destroy: vi.fn(), on: vi.fn(), once: vi.fn() },
 	});
 	Object.assign(internals, {
 		state: "running",
@@ -120,7 +125,7 @@ describe("ReplKernelManager host request abort on teardown", () => {
 		expect(observed.settled).toBe(true);
 		expect(observed.signal?.reason).toBeInstanceOf(Error);
 		expect((observed.signal?.reason as Error).message).toBe("IPython kernel shut down");
-		expect(internals.kernelStderr).toContain("host request failed for hr-live");
+		expect(internals.kernelDiagnostics).toContain("host request failed for hr-live");
 		expect(internals.inFlightHostRequests.size).toBe(0);
 	});
 

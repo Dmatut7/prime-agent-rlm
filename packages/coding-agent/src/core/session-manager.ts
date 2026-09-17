@@ -23,10 +23,10 @@ import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js"
 import {
 	endsWithNewlineSync,
 	FirstLineTooLongError,
-	isLineBoundarySync,
-	isUsableResumePoint,
+	readBytesSync,
 	readFileLines,
 	readFirstLineSync,
+	readLinesAsBuffers,
 	repairTruncatedTrailingLine,
 } from "../utils/file-lines.js";
 import { captureGitContext, type GitContext, gitContextsEqual } from "../utils/git.js";
@@ -481,12 +481,19 @@ export interface SessionContext {
 	model: { provider: string; modelId: string } | null;
 }
 
+export interface SessionModelRef {
+	provider: string;
+	modelId: string;
+}
+
 export interface SessionInfo {
 	path: string;
 	id: string;
 	cwd: string;
 	name?: string;
 	state?: SessionState;
+	/** Last model the session ran with, from model_change entries and assistant messages. */
+	model?: SessionModelRef;
 	parentSessionPath?: string;
 	rlmDepth: number;
 	created: Date;
@@ -1223,6 +1230,63 @@ async function parseEntriesFromBufferAsync(buffer: Buffer, sessionFile: string):
 	return entries;
 }
 
+/**
+ * Zero-filled crash damage on the trailing record: upstream #2028's NUL rescue,
+ * narrowed to this fork's tail-only, write-owned repair.
+ *
+ * A crash mid-append can leave the last line as `\0…\0{…json…}` with no
+ * terminator. Every reader skips that line, and the torn-tail repair truncates it
+ * away, so an intact record is lost. Upstream recovers those by rebuilding the
+ * whole file; this fork only ever touches the trailing line and only under write
+ * ownership, so the recovery rewrites just that line: drop the damaged tail, then
+ * append the record back without its NUL prefix and with its terminator, through
+ * the private-append path (0o600 / O_NOFOLLOW / fsync).
+ *
+ * Interior NUL-filled lines are deliberately NOT recovered: that needs the
+ * whole-file rewrite this fork rejects (a read-only open must not write, and a
+ * synchronous rewrite costs 2-3x the file size on the event loop). The caller
+ * (`repairOwnedSessionFile`) has already asserted a regular, non-symlink file, so
+ * the descriptor here is opened read-only like the neighbouring tail reader.
+ *
+ * True only when a record was recovered, so the caller can report "repaired".
+ */
+function recoverNulPrefixedTrailingRecord(filePath: string): boolean {
+	let fd: number | undefined;
+	try {
+		fd = openSync(filePath, constants.O_RDONLY);
+		const { size } = fstatSync(fd);
+		if (size === 0) return false;
+		const window = Math.min(size, SESSION_HEADER_SCAN_MAX_BYTES);
+		const tail = Buffer.allocUnsafe(window);
+		if (readSync(fd, tail, 0, window, size - window) !== window) return false;
+		// A terminated file has no crash-damaged trailing record to rescue.
+		if (tail[window - 1] === 0x0a) return false;
+		const lastNewline = tail.lastIndexOf(0x0a);
+		const line = lastNewline === -1 ? readTrailingLine(fd, size, window) : tail.subarray(lastNewline + 1);
+		// Too long to verify as a whole record (K3P-4): leave it to the unverifiable verdict.
+		if (line === undefined) return false;
+		let recordStart = 0;
+		while (recordStart < line.length && line[recordStart] === 0) recordStart++;
+		if (recordStart === 0) return false;
+		const record = line.subarray(recordStart);
+		if (record.length === 0 || !isCompleteUnterminatedEntryLine(record)) return false;
+		const recovered = `${record.toString("utf8")}\n`;
+		closeSync(fd);
+		fd = undefined;
+		// Both primitives are the ones the existing repair already uses. A crash
+		// between them loses a line no reader could parse anyway, so the window is
+		// not a regression against the truncation it replaces.
+		repairTruncatedTrailingLine(filePath);
+		appendPrivateFile(filePath, recovered, { privateParent: true });
+		return true;
+	} catch {
+		// An unreadable tail stays exactly as it was: the caller's torn/unverifiable
+		// verdicts own every case this recovery does not prove it can fix.
+		return false;
+	} finally {
+		if (fd !== undefined) closeSync(fd);
+	}
+}
 function parsesAsJson(line: Buffer): boolean {
 	try {
 		JSON.parse(line.toString("utf8"));
@@ -1375,6 +1439,9 @@ export type SessionFileRepairOutcome = "repaired" | "clean" | "unverifiable";
 export function repairOwnedSessionFile(sessionFile: string | undefined): SessionFileRepairOutcome {
 	if (!sessionFile || !existsSync(sessionFile)) return "clean";
 	assertRegularFileNoSymlink(sessionFile);
+	// A zero-filled trailing record is still a whole record (upstream #2028's NUL
+	// rescue): recover it before the torn-tail path below truncates it away.
+	if (recoverNulPrefixedTrailingRecord(sessionFile)) return "repaired";
 	// A header that lost only its terminator is a whole record, not a torn append:
 	// truncating it away would leave the transcript with no header at all.
 	const outcome = completeTrailingRecordNewline(sessionFile, true);
@@ -1760,66 +1827,139 @@ function extractOversizedMessageSummary(line: string): {
 	};
 }
 
-/**
- * Everything a scan accumulates, so a later scan of the same file can pick up
- * where this one stopped instead of starting over. Every field either only ever
- * grows (counts, search text, the usage aggregates), keeps the newest value
- * (name, state, status, per-entry usage attribution), or is fixed by the first
- * line (header, first message) — which is what makes a resumed scan equivalent
- * to a full one.
- */
-interface SessionScanState {
-	header: SessionHeader;
+interface SessionScanAccumulator {
+	header?: SessionHeader;
+	model?: SessionModelRef;
+	/** The first parsed entry was not a session header; appends cannot repair this. */
+	invalid: boolean;
 	messageCount: number;
 	firstMessage: string;
 	allMessagesText: string;
-	name: string | undefined;
-	state: SessionState | undefined;
-	agentStatus: AgentStatus | undefined;
-	lastActivityTime: number | undefined;
-	/** Byte offset just past the last newline-terminated line consumed. */
-	offset: number;
-	/**
-	 * Byte position the read actually reached: `offset`, or past it when a torn
-	 * trailing line was skipped. Kept so a later read can tell a scan that covered
-	 * the bytes it claims from one whose offset fell behind them.
-	 */
-	reachedBytes: number;
-	/** Newest-wins per entry id (#2003): a later attribution overwrites the target's usage. */
+	name?: string;
+	state?: SessionState;
+	agentStatus?: AgentStatus;
+	lastActivityTime?: number;
+	// Fold attribution aggregates like the loader: either disk representation cancels to the same own spend.
 	assistantUsageById: Map<string, Usage>;
-	/** Grow-only: one push per child_usage_attributed entry once its target has been seen. */
-	attributedChildUsages: Usage[];
+	attributedChildUsage: Usage;
+	summarizationUsage: Usage;
 	/**
 	 * Attributions read before the assistant line they annotate, in file order:
 	 * an imported or hand-reordered transcript can invert the writer's order. Held
-	 * until the target line arrives so the one-pass scan folds them exactly like
-	 * the loader's order-insensitive two-pass fold instead of dropping them.
+	 * until the target line arrives so the one-pass scan folds them exactly like the
+	 * loader's order-insensitive two-pass fold instead of dropping them (fork port).
 	 */
 	pendingAttributions: ChildUsageAttributionEntry[];
-	/** Grow-only: one push per compaction / branch_summary entry that carries usage. */
-	summarizationUsages: Usage[];
 }
 
-interface SessionInfoCacheEntry {
-	size: number;
+interface SessionScanState {
+	fileSize: number;
 	mtimeMs: number;
-	/** Distinguishes an append from a whole-file rewrite, which renames a new inode into place. */
+	/** Identity of the scanned file: a rename rewrite replaces the inode and invalidates the resume state. */
+	dev: number;
 	ino: number;
+	/** Bytes consumed as complete newline-terminated lines; the resume point for the next scan. */
+	offset: number;
+	/** Last bytes of the consumed prefix; a resume only proceeds while the file still starts with them. */
+	tail: Buffer;
+	acc: SessionScanAccumulator;
 	info: SessionInfo | null;
-	scan?: SessionScanState;
+	/** Usage entries counted against the retained bound at the last store. */
+	accountedUsageEntries: number;
 }
 
-// An unchanged (size, mtimeMs) means identical content, so list metadata is
-// served straight from the cache. A live session appends on every message, so
-// that check always misses for exactly the sessions asked about most; the
-// retained scan state lets those reads cover only the appended bytes.
-const sessionInfoCache = new Map<string, SessionInfoCacheEntry>();
+const SESSION_SCAN_RESUME_TAIL_BYTES = 16;
+const NEWLINE_BUFFER = Buffer.from("\n");
+// Memory/performance budget: whole-state LRU eviction can force a full catalog rescan every refresh.
+// Keep large families (~2k sessions, 150k usage entries) and growth headroom resident.
+const SESSION_SCAN_MAX_RETAINED_USAGE_ENTRIES = 400_000;
+
+// Session files are append-only between whole-file rewrites, so scans resume
+// from the last consumed byte offset; rewrites are detected by shrink,
+// same-size mtime change, replaced inode, or a changed prefix tail. In-place
+// interior edits that defeat all four are outside the writer model.
+const sessionScanStates = new Map<string, SessionScanState>();
+// Scans of a path run one at a time; a later caller chains its own pass (its
+// stat sees every prior append) instead of joining an earlier scan's result.
+const sessionScanQueue = new Map<string, Promise<SessionInfo | null>>();
+
+export function readSessionInfo(filePath: string): Promise<SessionInfo | null> {
+	const previous = sessionScanQueue.get(filePath);
+	const scan = previous
+		? previous.then(
+				() => scanSessionInfo(filePath),
+				() => scanSessionInfo(filePath),
+			)
+		: scanSessionInfo(filePath);
+	sessionScanQueue.set(filePath, scan);
+	void scan.finally(() => {
+		if (sessionScanQueue.get(filePath) === scan) sessionScanQueue.delete(filePath);
+	});
+	return scan;
+}
+
+let retainedUsageEntries = 0;
+
+function dropSessionScanState(filePath: string): void {
+	const state = sessionScanStates.get(filePath);
+	if (!state) return;
+	retainedUsageEntries -= state.accountedUsageEntries;
+	sessionScanStates.delete(filePath);
+}
+
+/** Refresh LRU recency and enforce the retained-usage bound. */
+function storeSessionScanState(filePath: string, state: SessionScanState): void {
+	dropSessionScanState(filePath);
+	state.accountedUsageEntries = state.acc.assistantUsageById.size;
+	retainedUsageEntries += state.accountedUsageEntries;
+	sessionScanStates.set(filePath, state);
+	for (const key of sessionScanStates.keys()) {
+		if (retainedUsageEntries <= SESSION_SCAN_MAX_RETAINED_USAGE_ENTRIES) break;
+		dropSessionScanState(key);
+	}
+}
+
+function createSessionScanAccumulator(): SessionScanAccumulator {
+	return {
+		invalid: false,
+		messageCount: 0,
+		firstMessage: "",
+		allMessagesText: "",
+		assistantUsageById: new Map<string, Usage>(),
+		attributedChildUsage: emptyUsage(),
+		summarizationUsage: emptyUsage(),
+		pendingAttributions: [],
+	};
+}
+
+function scannedPrefixIntact(filePath: string, state: SessionScanState): boolean {
+	if (state.offset === 0) return true;
+	try {
+		const start = Math.max(0, state.offset - SESSION_SCAN_RESUME_TAIL_BYTES);
+		return readBytesSync(filePath, start, state.offset).equals(state.tail);
+	} catch {
+		return false;
+	}
+}
+
+/** Last bytes of the consumed prefix after appending one line and its newline, copied out of the stream chunk. */
+function advanceScanTail(tail: Buffer, line: Buffer): Buffer {
+	if (line.length >= SESSION_SCAN_RESUME_TAIL_BYTES - 1) {
+		return Buffer.concat([line.subarray(line.length - (SESSION_SCAN_RESUME_TAIL_BYTES - 1)), NEWLINE_BUFFER]);
+	}
+	const combined = Buffer.concat([tail, line, NEWLINE_BUFFER]);
+	return combined.length <= SESSION_SCAN_RESUME_TAIL_BYTES
+		? combined
+		: Buffer.from(combined.subarray(combined.length - SESSION_SCAN_RESUME_TAIL_BYTES));
+}
 
 /**
  * Which layer served each `readSessionInfo` call. The point is not telemetry for
  * its own sake: "the disk layer absorbed what a fresh process would otherwise
  * have re-scanned" is the whole claim behind the durable cache, and it is only
- * checkable if the layers are counted.
+ * checkable if the layers are counted. Memory hits are the upstream scan-state
+ * map, disk hits the fork's durable summary layer, and the two scan counters
+ * distinguish a resumed pass from one that paid for the whole file.
  */
 export interface SessionInfoReadStats {
 	memoryHits: number;
@@ -1842,10 +1982,13 @@ export function getSessionInfoReadStats(): SessionInfoReadStats {
 /**
  * Drop the process-local summary cache (and its counters) so a caller can
  * reproduce the state a freshly spawned worker starts in: no summaries in
- * memory, everything on disk still there.
+ * memory, everything on disk still there. Eviction goes through
+ * `dropSessionScanState` so the retained-usage accounting stays exact.
  */
 export function clearSessionInfoCaches(): void {
-	sessionInfoCache.clear();
+	for (const key of [...sessionScanStates.keys()]) {
+		dropSessionScanState(key);
+	}
 	sessionInfoReadStats.memoryHits = 0;
 	sessionInfoReadStats.diskHits = 0;
 	sessionInfoReadStats.fullScans = 0;
@@ -1858,11 +2001,11 @@ export function clearSessionInfoCaches(): void {
  * behind for the weekly prune to find.
  */
 export async function forgetSessionInfo(filePath: string): Promise<void> {
-	sessionInfoCache.delete(filePath);
+	dropSessionScanState(filePath);
 	await removeCachedSessionInfo(filePath);
 }
 
-export async function readSessionInfo(filePath: string): Promise<SessionInfo | null> {
+async function scanSessionInfo(filePath: string, retryOnReplacement = true): Promise<SessionInfo | null> {
 	let stats: Awaited<ReturnType<typeof stat>>;
 	try {
 		const lexicalStats = await lstat(filePath);
@@ -1870,290 +2013,293 @@ export async function readSessionInfo(filePath: string): Promise<SessionInfo | n
 		enforcePrivateTranscriptMode(filePath);
 		stats = await stat(filePath);
 	} catch {
+		dropSessionScanState(filePath);
 		return null;
 	}
-	const cached = sessionInfoCache.get(filePath);
-	if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs && cached.ino === stats.ino) {
+	const previous = sessionScanStates.get(filePath);
+	const sameFile = previous !== undefined && previous.dev === stats.dev && previous.ino === stats.ino;
+	if (sameFile && previous.fileSize === stats.size && previous.mtimeMs === stats.mtimeMs) {
 		sessionInfoReadStats.memoryHits++;
-		return cached.info;
+		storeSessionScanState(filePath, previous);
+		return previous.info;
 	}
-	// Resume only on a plain append to the same file: same inode, grown, and a
-	// previous stopping point that is still usable. A rewrite renames a fresh
-	// inode over the path, and anything else falls back to a full scan. The
-	// stopping point is checked, not trusted: it is only a resume point while it
-	// sits on a line boundary and can account for the bytes the scan that
-	// recorded it claims to have read, so a state recorded by a reader that lost
-	// bytes across chunk boundaries is rescanned instead of being re-counted from.
-	const resumable =
-		cached?.scan !== undefined &&
-		cached.ino === stats.ino &&
-		stats.size > cached.size &&
-		cached.scan.offset <= stats.size &&
-		isUsableResumePoint(cached.scan, cached.size) &&
-		isLineBoundarySync(filePath, cached.scan.offset)
-			? cached.scan
-			: undefined;
-	if (!resumable) {
-		// A full scan is the expensive branch, so try the durable layer first: a
-		// summary another process already computed for this exact (dev, ino, size,
-		// mtimeMs) is equivalent to scanning again. Resumable reads skip this — a
-		// few appended bytes are cheaper to parse than a whole summary is to load,
-		// and a resume keeps the incremental state that the next append needs.
-		const fingerprint = { dev: stats.dev, ino: stats.ino, size: stats.size, mtimeMs: stats.mtimeMs };
-		const durable = await readCachedSessionInfo(filePath, fingerprint);
+	const resume = sameFile && stats.size > previous.fileSize && scannedPrefixIntact(filePath, previous);
+	if (!resume) {
+		// A full scan is the expensive branch, so try the fork's durable layer first:
+		// a summary another process already computed for this exact (dev, ino, size,
+		// mtimeMs) is equivalent to scanning again. Resumable reads skip it - a few
+		// appended bytes are cheaper to parse than a whole summary is to load, and a
+		// resume keeps the incremental state that the next append needs.
+		const durable = await readCachedSessionInfo(filePath, {
+			dev: stats.dev,
+			ino: stats.ino,
+			size: stats.size,
+			mtimeMs: stats.mtimeMs,
+		});
 		if (durable) {
 			sessionInfoReadStats.diskHits++;
-			sessionInfoCache.set(filePath, {
-				size: stats.size,
-				mtimeMs: stats.mtimeMs,
-				ino: stats.ino,
-				info: durable,
-			});
+			// Drop any stale scan state with it: that accumulator stopped before this
+			// summary's bytes, so a later append must not resume from it and silently
+			// lose the range the durable summary already covered.
+			dropSessionScanState(filePath);
 			return durable;
 		}
 	}
-	const scanned = await scanSessionInfo(filePath, stats, resumable);
-	sessionInfoCache.set(filePath, {
-		size: stats.size,
-		mtimeMs: stats.mtimeMs,
-		ino: stats.ino,
-		info: scanned.info,
-		...(scanned.scan ? { scan: scanned.scan } : {}),
-	});
-	if (resumable) {
+	const state: SessionScanState = resume
+		? previous
+		: {
+				fileSize: 0,
+				mtimeMs: 0,
+				dev: stats.dev,
+				ino: stats.ino,
+				offset: 0,
+				tail: Buffer.alloc(0),
+				acc: createSessionScanAccumulator(),
+				info: null,
+				accountedUsageEntries: 0,
+			};
+	try {
+		const tornTail = await scanSessionLines(filePath, state, stats.size);
+		state.info = snapshotSessionInfo(state.acc, tornTail, filePath, stats);
+	} catch {
+		dropSessionScanState(filePath);
+		return null;
+	}
+	// A rename rewrite racing the scan can mix two files' bytes into one
+	// accumulator: a changed inode afterwards discards the state and rescans.
+	let after: Awaited<ReturnType<typeof stat>> | undefined;
+	try {
+		after = await stat(filePath);
+	} catch {
+		after = undefined;
+	}
+	if (!after || after.dev !== stats.dev || after.ino !== stats.ino) {
+		dropSessionScanState(filePath);
+		return retryOnReplacement ? scanSessionInfo(filePath, false) : null;
+	}
+	state.fileSize = stats.size;
+	state.mtimeMs = stats.mtimeMs;
+	storeSessionScanState(filePath, state);
+	if (resume) {
 		sessionInfoReadStats.resumedScans++;
 	} else {
 		sessionInfoReadStats.fullScans++;
-		if (scanned.info) {
-			// Only a full scan is persisted: it is the one that just paid for the
-			// whole file. A resumed scan's summary would be rewritten on every
-			// append of a live session, and the next process cannot use it anyway
-			// until the file stops growing.
+		if (state.info) {
+			// Only a full scan is persisted: it is the one that just paid for the whole
+			// file. A resumed scan's summary would be rewritten on every append of a
+			// live session, and the next process cannot use it anyway until the file
+			// stops growing.
 			await writeCachedSessionInfo(
 				filePath,
 				{ dev: stats.dev, ino: stats.ino, size: stats.size, mtimeMs: stats.mtimeMs },
-				scanned.info,
+				state.info,
 			);
 			scheduleSessionInfoCachePrune();
 		}
 	}
-	return scanned.info;
+	return state.info;
 }
 
-async function scanSessionInfo(
+/**
+ * Fold the complete lines in [state.offset, size) into the accumulator. An
+ * unterminated final line may be an in-progress append: it is returned for
+ * snapshot-only folding, never consumed into the resumable accumulator.
+ */
+async function scanSessionLines(filePath: string, state: SessionScanState, size: number): Promise<Buffer | undefined> {
+	if (state.acc.invalid || state.offset >= size) return undefined;
+	// Pass-relative line numbers: a skip note names the line this read could not
+	// use, and a resumed pass starts counting at its own first line.
+	let lineNo = 0;
+	for await (const lineBuffer of readLinesAsBuffers(filePath, { start: state.offset, end: size - 1 })) {
+		lineNo++;
+		const lineEnd = state.offset + lineBuffer.length;
+		if (lineEnd >= size) return lineBuffer;
+		foldSessionScanLine(state.acc, lineBuffer, { filePath, line: lineNo });
+		state.tail = advanceScanTail(state.tail, lineBuffer);
+		state.offset = lineEnd + 1;
+		if (state.acc.invalid) break;
+	}
+	return undefined;
+}
+
+function foldSessionScanLine(
+	acc: SessionScanAccumulator,
+	lineBuffer: Buffer,
+	ctx?: { filePath: string; line: number },
+): void {
+	const line = lineBuffer.toString("utf8");
+	if (!line.trim()) return;
+
+	// Large tool-result entries can be many MB. They do not carry the
+	// session-list metadata we need, and parsing them during every refresh
+	// can exhaust the daemon heap.
+	if (line.length > SESSION_LIST_PARSE_MAX_LINE_CHARS) {
+		if (looksLikeMessageEntry(line)) {
+			acc.messageCount++;
+			const summary = extractOversizedMessageSummary(line);
+			if (typeof summary.timestamp === "number" && (summary.role === "user" || summary.role === "assistant")) {
+				acc.lastActivityTime = Math.max(acc.lastActivityTime ?? 0, summary.timestamp);
+			}
+			if (summary.role === "user" && !acc.firstMessage) {
+				acc.firstMessage = summary.textPreview || "(large message)";
+			}
+		}
+		return;
+	}
+
+	const trimmed = line.trim();
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(trimmed);
+	} catch {
+		return;
+	}
+	// One unusable line is skipped, not fatal - and it is countable: the loader and
+	// the scan must agree on what a transcript contains.
+	const skipReason = unindexableEntryReason(parsed);
+	if (skipReason !== undefined) {
+		if (ctx) noteTranscriptLineSkip(ctx.filePath, ctx.line, skipReason);
+		return;
+	}
+	const entry = parsed as FileEntry;
+
+	if (entry.type === "session_info") {
+		const infoEntry = entry as SessionInfoEntry;
+		acc.name = infoEntry.name?.trim() || undefined;
+	}
+	if (entry.type === "session_state") {
+		const stateEntry = entry as SessionStateEntry;
+		const status = normalizeSessionStateStatus(stateEntry.state?.status);
+		if (status) {
+			acc.state = { status };
+		}
+	}
+	// Keep the latest recap/verdict so off-daemon sessions don't all show as
+	// unjudged in the agents view. Append-only, so last seen wins.
+	if (entry.type === "agent_status") {
+		acc.agentStatus = (entry as AgentStatusEntry).status;
+	}
+	if (entry.type === "model_change") {
+		const modelEntry = entry as ModelChangeEntry;
+		acc.model = { provider: modelEntry.provider, modelId: modelEntry.modelId };
+	}
+	if (entry.type === "child_usage_attributed") {
+		const attribution = entry as ChildUsageAttributionEntry;
+		if (acc.assistantUsageById.has(attribution.targetId)) {
+			acc.assistantUsageById.set(attribution.targetId, attribution.aggregateUsage);
+			addAssistantUsage(acc.attributedChildUsage, attribution.childUsage);
+		} else {
+			// Target not seen yet: hold the attribution and fold it when the target
+			// line arrives, so this scan and the loader agree on files whose lines are
+			// not in writer order (fork port; upstream dropped them).
+			acc.pendingAttributions.push(attribution);
+		}
+	}
+	if (entry.type === "compaction" || entry.type === "branch_summary") {
+		const summarizationUsage = (entry as CompactionEntry | BranchSummaryEntry).usage;
+		if (summarizationUsage) addAssistantUsage(acc.summarizationUsage, summarizationUsage);
+	}
+	if (!acc.header) {
+		if (entry.type !== "session") {
+			acc.invalid = true;
+			return;
+		}
+		const header = entry as SessionHeader;
+		// A first line that cannot name the transcript is not a session: refuse the
+		// listing row instead of showing a bogus id (fork port of the scan's check).
+		if (typeof header.id !== "string" || !SESSION_ID_PATTERN.test(header.id)) {
+			acc.invalid = true;
+			return;
+		}
+		acc.header = header;
+	}
+
+	acc.lastActivityTime = updateLastActivityTime(acc.lastActivityTime, entry);
+
+	if (entry.type !== "message") return;
+	acc.messageCount++;
+
+	const message = (entry as SessionMessageEntry).message;
+	if (message.role === "assistant" && (message as { usage?: Usage }).usage) {
+		acc.assistantUsageById.set(entry.id, (message as { usage: Usage }).usage);
+		// Attributions read before this line fold now, in file order, so newest-wins
+		// matches the loader for inverted-order transcripts too.
+		for (let index = 0; index < acc.pendingAttributions.length; ) {
+			const attribution = acc.pendingAttributions[index];
+			if (attribution.targetId !== entry.id) {
+				index++;
+				continue;
+			}
+			acc.pendingAttributions.splice(index, 1);
+			acc.assistantUsageById.set(entry.id, attribution.aggregateUsage);
+			addAssistantUsage(acc.attributedChildUsage, attribution.childUsage);
+		}
+	}
+	if (message.role === "assistant") {
+		const assistant = message as { provider?: string; model?: string };
+		if (typeof assistant.provider === "string" && typeof assistant.model === "string") {
+			acc.model = { provider: assistant.provider, modelId: assistant.model };
+		}
+	}
+	if (!isMessageWithContent(message)) return;
+	if (message.role !== "user" && message.role !== "assistant") return;
+
+	const textContent = extractTextContent(message);
+	if (!textContent) return;
+
+	acc.allMessagesText = appendCappedSearchText(acc.allMessagesText, textContent);
+	if (!acc.firstMessage && message.role === "user") {
+		acc.firstMessage = textContent;
+	}
+}
+
+function snapshotSessionInfo(
+	persistent: SessionScanAccumulator,
+	tornTail: Buffer | undefined,
 	filePath: string,
 	stats: Awaited<ReturnType<typeof stat>>,
-	resume?: SessionScanState,
-): Promise<{ info: SessionInfo | null; scan?: SessionScanState }> {
-	try {
-		let header: SessionHeader | undefined = resume?.header;
-		let messageCount = resume?.messageCount ?? 0;
-		let firstMessage = resume?.firstMessage ?? "";
-		let allMessagesText = resume?.allMessagesText ?? "";
-		let name: string | undefined = resume?.name;
-		let state: SessionState | undefined = resume?.state;
-		let agentStatus: AgentStatus | undefined = resume?.agentStatus;
-		let lastActivityTime: number | undefined = resume?.lastActivityTime;
-		let offset = resume?.offset ?? 0;
-		let reachedBytes = resume?.reachedBytes ?? 0;
-		// Fold attribution aggregates like the loader: either disk representation cancels to the same own spend.
-		// Copied, not shared: readSessionInfo() reads the cache entry, awaits this scan, then stores a new
-		// entry, so two concurrent scans of one live file can both resume from the same object and would
-		// otherwise push the same usage twice.
-		const assistantUsageById = new Map(resume?.assistantUsageById);
-		const attributedChildUsages: Usage[] = resume ? [...resume.attributedChildUsages] : [];
-		const pendingAttributions = resume ? [...resume.pendingAttributions] : [];
-		const summarizationUsages: Usage[] = resume ? [...resume.summarizationUsages] : [];
-
-		let lineCount = 0;
-		for await (const fileLine of readFileLines(filePath, offset)) {
-			lineCount++;
-			// Where the read got, terminated or not: the resume offset only advances
-			// past terminated lines, the reached position moves on every line.
-			reachedBytes = fileLine.endOffset;
-			// A trailing unterminated line is a torn append still in flight (or a
-			// crash remnant): never count it, and never advance the resume offset
-			// past it, so a completed rewrite of the same bytes is seen exactly once.
-			// A file that is nothing but such a line is the header-only transcript
-			// whose terminator went missing; that head is real, so it still names a
-			// session rather than letting the listing drop it.
-			if (!fileLine.terminated) {
-				if (!header) header = parseUnterminatedHeader(fileLine.line);
-				break;
-			}
-			offset = fileLine.endOffset;
-			const line = fileLine.line.toString("utf8");
-			if (!line.trim()) continue;
-
-			// Large tool-result entries can be many MB. They do not carry the
-			// session-list metadata we need, and parsing them during every refresh
-			// can exhaust the daemon heap.
-			if (line.length > SESSION_LIST_PARSE_MAX_LINE_CHARS) {
-				if (looksLikeMessageEntry(line)) {
-					messageCount++;
-					const summary = extractOversizedMessageSummary(line);
-					if (typeof summary.timestamp === "number" && (summary.role === "user" || summary.role === "assistant")) {
-						lastActivityTime = Math.max(lastActivityTime ?? 0, summary.timestamp);
-					}
-					if (summary.role === "user" && !firstMessage) {
-						firstMessage = summary.textPreview || "(large message)";
-					}
-				}
-				continue;
-			}
-
-			const trimmed = line.trim();
-			let parsed: unknown;
-			try {
-				parsed = JSON.parse(trimmed);
-			} catch {
-				continue;
-			}
-			// One unusable line is skipped, not fatal: it used to throw here, and the
-			// catch around this scan turned that throw into "no such session".
-			const reason = unindexableEntryReason(parsed);
-			if (reason !== undefined) {
-				noteTranscriptLineSkip(filePath, lineCount, reason);
-				continue;
-			}
-			const entry = parsed as FileEntry;
-
-			if (entry.type === "session_info") {
-				const infoEntry = entry as SessionInfoEntry;
-				name = infoEntry.name?.trim() || undefined;
-			}
-			if (entry.type === "session_state") {
-				const stateEntry = entry as SessionStateEntry;
-				const status = normalizeSessionStateStatus(stateEntry.state?.status);
-				if (status) {
-					state = { status };
-				}
-			}
-			// Keep the latest recap/verdict so off-daemon sessions don't all show as
-			// unjudged in the agents view. Append-only, so last seen wins.
-			if (entry.type === "agent_status") {
-				agentStatus = (entry as AgentStatusEntry).status;
-			}
-			if (entry.type === "child_usage_attributed") {
-				const attribution = entry as ChildUsageAttributionEntry;
-				if (assistantUsageById.has(attribution.targetId)) {
-					assistantUsageById.set(attribution.targetId, attribution.aggregateUsage);
-					attributedChildUsages.push(attribution.childUsage);
-				} else {
-					// Target not seen yet: hold the attribution and fold it when the
-					// target line arrives, so this scan and the loader agree on files
-					// whose lines are not in writer order.
-					pendingAttributions.push(attribution);
-				}
-			}
-			if (entry.type === "compaction" || entry.type === "branch_summary") {
-				const summarizationUsage = (entry as CompactionEntry | BranchSummaryEntry).usage;
-				if (summarizationUsage) summarizationUsages.push(summarizationUsage);
-			}
-			if (!header) {
-				if (entry.type !== "session") {
-					return { info: null };
-				}
-				header = entry as SessionHeader;
-				if (typeof header.id !== "string" || !SESSION_ID_PATTERN.test(header.id)) {
-					return { info: null };
-				}
-			}
-
-			lastActivityTime = updateLastActivityTime(lastActivityTime, entry);
-
-			if (entry.type !== "message") continue;
-			messageCount++;
-
-			const message = (entry as SessionMessageEntry).message;
-			if (message.role === "assistant" && (message as { usage?: Usage }).usage) {
-				assistantUsageById.set(entry.id, (message as { usage: Usage }).usage);
-				// Attributions read before this line fold now, in file order, so
-				// newest-wins matches the loader for inverted-order transcripts too.
-				for (let i = 0; i < pendingAttributions.length; ) {
-					const attribution = pendingAttributions[i];
-					if (attribution.targetId !== entry.id) {
-						i++;
-						continue;
-					}
-					pendingAttributions.splice(i, 1);
-					assistantUsageById.set(entry.id, attribution.aggregateUsage);
-					attributedChildUsages.push(attribution.childUsage);
-				}
-			}
-			if (!isMessageWithContent(message)) continue;
-			if (message.role !== "user" && message.role !== "assistant") continue;
-
-			const textContent = extractTextContent(message);
-			if (!textContent) continue;
-
-			allMessagesText = appendCappedSearchText(allMessagesText, textContent);
-			if (!firstMessage && message.role === "user") {
-				firstMessage = textContent;
-			}
-		}
-
-		if (!header) return { info: null };
-		const usageTotal = emptyUsage();
-		for (const usage of assistantUsageById.values()) {
-			addAssistantUsage(usageTotal, usage);
-		}
-		for (const usage of summarizationUsages) {
-			addAssistantUsage(usageTotal, usage);
-		}
-		for (const childUsage of attributedChildUsages) {
-			subtractAssistantUsage(usageTotal, childUsage);
-		}
-		const cwd = typeof header.cwd === "string" ? header.cwd : "";
-		const parentSessionPath = header.parentSession;
-		const rlmDepth = resolveSessionRlmDepth(header, filePath);
-		const modified = getSessionModifiedDateFromLastActivity(lastActivityTime, header, stats.mtime);
-
-		return {
-			info: {
-				path: filePath,
-				id: header.id,
-				cwd,
-				name,
-				state,
-				parentSessionPath,
-				rlmDepth,
-				created: new Date(header.timestamp),
-				modified,
-				messageCount,
-				firstMessage: firstMessage || "(no messages)",
-				allMessagesText,
-				agentStatus,
-				usage: sessionUsageSummaryFrom(usageTotal),
-			},
-			scan: {
-				header,
-				messageCount,
-				firstMessage,
-				allMessagesText,
-				name,
-				state,
-				agentStatus,
-				lastActivityTime,
-				offset,
-				reachedBytes,
-				assistantUsageById,
-				attributedChildUsages,
-				pendingAttributions,
-				summarizationUsages,
-			},
+): SessionInfo | null {
+	let acc = persistent;
+	if (tornTail !== undefined && tornTail.length > 0 && !acc.invalid) {
+		acc = {
+			...persistent,
+			assistantUsageById: new Map(persistent.assistantUsageById),
+			attributedChildUsage: cloneUsage(persistent.attributedChildUsage),
+			summarizationUsage: cloneUsage(persistent.summarizationUsage),
+			pendingAttributions: [...persistent.pendingAttributions],
 		};
-	} catch (error) {
-		// The session stays out of the listing - there is nothing safe to show - but a
-		// transcript that cannot be read is not the same thing as no transcript, and a
-		// swallowed error is how "my session disappeared" ends up undiagnosable.
-		noteTranscriptLineSkip(
-			filePath,
-			0,
-			`unreadable transcript: ${error instanceof Error ? error.message : String(error)}`,
-		);
-		return { info: null };
+		foldSessionScanLine(acc, tornTail);
 	}
+	if (acc.invalid || !acc.header) return null;
+	const usageTotal = emptyUsage();
+	for (const usage of acc.assistantUsageById.values()) {
+		addAssistantUsage(usageTotal, usage);
+	}
+	addAssistantUsage(usageTotal, acc.summarizationUsage);
+	subtractAssistantUsage(usageTotal, acc.attributedChildUsage);
+	const header = acc.header;
+	const cwd = typeof header.cwd === "string" ? header.cwd : "";
+	const parentSessionPath = header.parentSession;
+	const rlmDepth = resolveSessionRlmDepth(header, filePath);
+	const modified = getSessionModifiedDateFromLastActivity(acc.lastActivityTime, header, stats.mtime);
+
+	return {
+		path: filePath,
+		id: header.id,
+		cwd,
+		name: acc.name,
+		state: acc.state,
+		model: acc.model,
+		parentSessionPath,
+		rlmDepth,
+		created: new Date(header.timestamp),
+		modified,
+		messageCount: acc.messageCount,
+		firstMessage: acc.firstMessage || "(no messages)",
+		allMessagesText: acc.allMessagesText,
+		agentStatus: acc.agentStatus,
+		usage: sessionUsageSummaryFrom(usageTotal),
+	};
 }
 
 export type SessionListProgress = (loaded: number, total: number) => void;
@@ -2172,6 +2318,9 @@ async function listSessionsFromDir(
 ): Promise<SessionInfo[]> {
 	const sessions: SessionInfo[] = [];
 	if (!existsSync(dir)) {
+		for (const key of sessionScanStates.keys()) {
+			if (dirname(key) === dir) dropSessionScanState(key);
+		}
 		return sessions;
 	}
 
@@ -2181,9 +2330,9 @@ async function listSessionsFromDir(
 		const total = progressTotal ?? files.length;
 
 		const present = new Set(files);
-		for (const key of sessionInfoCache.keys()) {
+		for (const key of sessionScanStates.keys()) {
 			if (dirname(key) === dir && !present.has(key)) {
-				sessionInfoCache.delete(key);
+				dropSessionScanState(key);
 			}
 		}
 
@@ -2405,6 +2554,7 @@ export class SessionManager {
 			git,
 		};
 		this.fileEntries = [header];
+		this.hasAssistantEntry = false;
 		this.byId.clear();
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
@@ -2645,6 +2795,10 @@ export class SessionManager {
 			return;
 		}
 
+		// The existsSync check is what lets the next append recover from the session
+		// file being deleted underneath a live session: without it appendFileSync
+		// would recreate a headerless stub (pinned by session-state.test.ts's
+		// "rewrites the full session if the session file disappears after flushing").
 		if (!this.flushed || !existsSync(this.sessionFile)) {
 			try {
 				this._rewriteFile();
@@ -2791,7 +2945,11 @@ export class SessionManager {
 		details?: T,
 		fromHook?: boolean,
 		customInstructions?: string,
-		options?: { leafId?: string; usage?: Usage; onCommit?: (info: CompactionCommitInfo) => void },
+		options?: {
+			leafId?: string;
+			usage?: Usage;
+			onCommit?: (info: CompactionCommitInfo) => void;
+		},
 	): string {
 		const pinnedLeafId = options?.leafId ?? null;
 		const targetLeaf = pinnedLeafId ?? this.leafId;

@@ -86,6 +86,8 @@ export interface TuiStopOptions {
 export interface FullscreenOptions {
 	scroll: Component[];
 	dock: Component;
+	/** Pinned above the scrolling transcript — stays on top while scrolling. */
+	pin?: Component;
 	mouse?: boolean;
 	viewportControls?: boolean;
 }
@@ -394,6 +396,7 @@ export class TUI extends Container {
 		viewport: FullscreenViewport;
 		scroll: Component[];
 		dock: Component;
+		pin: Component | undefined;
 		mouse: boolean;
 		viewportControls: boolean;
 		inlineState: {
@@ -748,6 +751,7 @@ export class TUI extends Container {
 			viewport: new FullscreenViewport(),
 			scroll: options.scroll,
 			dock: options.dock,
+			pin: options.pin,
 			mouse: options.mouse !== false,
 			viewportControls: options.viewportControls !== false,
 			inlineState: {
@@ -858,7 +862,7 @@ export class TUI extends Container {
 							href,
 						]
 					: ["xdg-open", href];
-		execFile(command, args, () => {});
+		execFile(command, args, { windowsHide: true }, () => {});
 	}
 
 	private copySelection(text: string): void {
@@ -1124,8 +1128,8 @@ export class TUI extends Container {
 		}
 
 		setCellDimensions({ widthPx, heightPx });
-		// Invalidate all components so images re-render with correct dimensions.
-		this.invalidate();
+		// Images keep the cell-dimensions version in their cache key, so a change
+		// here re-renders only image components on the next frame.
 		this.requestRender();
 		return true;
 	}
@@ -1388,13 +1392,9 @@ export class TUI extends Container {
 		return visibleContentSpan(line, maxWidth);
 	}
 
-	private createDockSelectionRegions(
-		frame: string[],
-		transcriptWindowHeight: number,
-		width: number,
-	): FrameSelectionRegion[] {
+	private createDockSelectionRegions(frame: string[], firstDockRow: number, width: number): FrameSelectionRegion[] {
 		const regions: FrameSelectionRegion[] = [];
-		for (let row = Math.max(0, transcriptWindowHeight); row < frame.length; row++) {
+		for (let row = Math.max(0, firstDockRow); row < frame.length; row++) {
 			const span = this.selectableSpan(frame[row] ?? "", width);
 			if (span) {
 				regions.push({ line: row, col: span.from, width: span.to - span.from });
@@ -1552,15 +1552,23 @@ export class TUI extends Container {
 
 		// Single pass through baseLine extracts both before and after segments
 		const afterStart = startCol + overlayWidth;
-		const base = extractSegments(baseLine, startCol, afterStart, totalWidth - afterStart, true);
+		const base = extractSegments(
+			normalizeTerminalOutput(baseLine),
+			startCol,
+			afterStart,
+			totalWidth - afterStart,
+			true,
+		);
+		// Clip a wide character crossing the overlay boundary instead of shifting the overlay.
+		const before = sliceWithWidth(base.before, 0, startCol, true);
 
 		// Extract overlay with width tracking (strict=true to exclude wide chars at boundary)
 		const overlay = sliceWithWidth(overlayLine, 0, overlayWidth, true);
 
 		// Pad segments to target widths
-		const beforePad = Math.max(0, startCol - base.beforeWidth);
+		const beforePad = Math.max(0, startCol - before.width);
 		const overlayPad = Math.max(0, overlayWidth - overlay.width);
-		const actualBeforeWidth = Math.max(startCol, base.beforeWidth);
+		const actualBeforeWidth = Math.max(startCol, before.width);
 		const actualOverlayWidth = Math.max(overlayWidth, overlay.width);
 		const afterTarget = Math.max(0, totalWidth - actualBeforeWidth - actualOverlayWidth);
 		const afterPad = Math.max(0, afterTarget - base.afterWidth);
@@ -1568,7 +1576,7 @@ export class TUI extends Container {
 		// Compose result
 		const r = TUI.SEGMENT_RESET;
 		const result =
-			base.before +
+			before.text +
 			" ".repeat(beforePad) +
 			r +
 			overlay.text +
@@ -1637,10 +1645,15 @@ export class TUI extends Container {
 			selectionRegions = aggregated.selectionRegions;
 			return fullscreen.dock.render(width);
 		});
+		const header = withFullscreenImageFallback(() => fullscreen.pin?.render(width) ?? []);
 
-		let frame = fullscreen.viewport.composeFrame(transcript, dock, height, selectionRegions);
+		let frame = fullscreen.viewport.composeFrame(transcript, dock, height, selectionRegions, header);
 		this.overlaySelectionRegions.push(
-			...this.createDockSelectionRegions(frame, fullscreen.viewport.windowHeight(), width),
+			...this.createDockSelectionRegions(
+				frame,
+				fullscreen.viewport.headerHeight() + fullscreen.viewport.windowHeight(),
+				width,
+			),
 		);
 		const scrollInfo = fullscreen.viewport.scrollInfo();
 		if (fullscreen.viewportControls && !scrollInfo.following) {
@@ -1649,7 +1662,7 @@ export class TUI extends Container {
 			const followKey = getKeybindings().getKeys("tui.viewport.follow")[0] ?? "ctrl+shift+down";
 			const label = ` ${followKey} to follow `;
 			const labelWidth = visibleWidth(label);
-			const row = fullscreen.viewport.windowHeight() - 1;
+			const row = fullscreen.viewport.headerHeight() + fullscreen.viewport.windowHeight() - 1;
 			if (row >= 0 && row < frame.length && labelWidth <= width) {
 				const col = Math.floor((width - labelWidth) / 2);
 				frame[row] = this.compositeLineAt(frame[row], `\x1b[7m${label}\x1b[27m`, col, labelWidth, width);

@@ -15,6 +15,7 @@ import {
 	createCustomMessage,
 } from "../messages.js";
 import { effectiveInputLimitTokens } from "../model-input-limits.js";
+import type { ProviderRetryPolicy } from "../provider-retry.js";
 import { buildSessionContext, type CompactionEntry, type SessionEntry } from "../session-manager.js";
 import { addAssistantUsage, emptyUsage } from "../usage.js";
 import { ASCII_CHARS_PER_TOKEN, measureContentDensity } from "./content-density.js";
@@ -1636,6 +1637,10 @@ export async function compact(
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
 	summaryCall: SummaryCallRunner = (call) => call(headers),
+	// biome-ignore lint/correctness/noUnusedFunctionParameters: upstream #2045 threads a provider retry policy and the session id into compact(); this fork's summarization runner (completeSummarizationRequest) owns the wire call and budgets/ retries on input length itself, so the policy has no consumer yet. Kept in the signature because the call site (agent-session.ts) already passes both.
+	retry?: ProviderRetryPolicy,
+	// biome-ignore lint/correctness/noUnusedFunctionParameters: same as retry above - accepted at the boundary, not yet threaded into the fork's summarization runner.
+	sessionId?: string,
 ): Promise<CompactionResult> {
 	const {
 		firstKeptEntryId,

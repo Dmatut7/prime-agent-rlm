@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import {
 	chmodSync,
 	lstatSync,
@@ -78,7 +79,6 @@ describe("ReplKernelManager startup", () => {
 			errorSpy.mockRestore();
 		}
 	});
-
 	it("rotates an oversized stderr log at spawn", async () => {
 		const python = join(tempDir, "python");
 		writeExecutable(python, ["#!/bin/sh", 'echo "fresh incarnation" >&2', "exit 42", ""].join("\n"));
@@ -129,8 +129,9 @@ describe("ReplKernelManager startup", () => {
 		const manager = new ReplKernelManager({ python, cwd: tempDir, stderrLogPath });
 
 		try {
-			// The log open must fail closed and fall back to a pipe, so the startup error
-			// still carries the kernel's last words while the link target stays untouched.
+			// The log open must fail closed (no file is written; the pipe still feeds the
+			// ring), so the startup error carries the kernel's last words while the link
+			// target stays untouched.
 			await expect(manager.execute("print(1)")).rejects.toThrow(
 				/Kernel exited before ready[\s\S]*boom before ready/,
 			);
@@ -142,7 +143,7 @@ describe("ReplKernelManager startup", () => {
 		}
 	});
 
-	it("keeps logging when stderr log rotation fails", async () => {
+	it("keeps the log open when rotation fails and marks the exhausted budget", async () => {
 		const python = join(tempDir, "python");
 		writeExecutable(python, ["#!/bin/sh", 'echo "fresh incarnation" >&2', "exit 42", ""].join("\n"));
 		const stderrLogPath = join(tempDir, "kernel-stderr.log");
@@ -159,9 +160,11 @@ describe("ReplKernelManager startup", () => {
 				/Kernel exited before ready[\s\S]*fresh incarnation/,
 			);
 			await manager.shutdown({ snapshot: true, drainHostRequests: true });
-			// A failed rotation must not cost the log: the new bytes are appended to the
-			// oversized file instead of the whole log being dropped for this spawn.
-			expect(statSync(stderrLogPath).size).toBe(previous.length + "fresh incarnation\n".length);
+			// A failed rotation leaves the file oversized, so the write budget is already
+			// spent: the kernel's bytes still reach the ring (and the report above), while
+			// the file gains exactly one exhaustion marker.
+			expect(statSync(stderrLogPath).size).toBe(previous.length + "[stderr log budget exhausted]\n".length);
+			expect(readFileSync(stderrLogPath, "utf8").endsWith("[stderr log budget exhausted]\n")).toBe(true);
 			expect(statSync(`${stderrLogPath}.old`).isDirectory()).toBe(true);
 		} finally {
 			errorSpy.mockRestore();
@@ -187,13 +190,39 @@ describe("ReplKernelManager startup", () => {
 			await failOnce("first incarnation");
 			const second = await failOnce("second incarnation");
 			expect(second).toMatch(/second incarnation/);
-			// Both lines are under 20 bytes, so without a per-spawn window start the tail
+			// Both lines are under 20 bytes, so without the per-wire ring reset the tail
 			// still carries the previous incarnation's bytes into this failure report.
 			expect(second).not.toMatch(/first incarnation/);
 		} finally {
 			errorSpy.mockRestore();
 		}
 	});
+	it("completes teardown while an inherited grandchild keeps writing stderr", async () => {
+		const python = join(tempDir, "python");
+		writeExecutable(
+			python,
+			[
+				"#!/bin/sh",
+				// A busy writer inherits fd 2 and survives the kernel: its stream
+				// never goes quiet and never EOFs.
+				"sh -c 'while :; do echo post-mortem noise; done' >&2 &",
+				"exit 42",
+				"",
+			].join("\n"),
+		);
+		const stderrLogPath = join(tempDir, "kernel-stderr.log");
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const manager = new ReplKernelManager({ python, cwd: tempDir, stderrLogPath });
+
+		try {
+			// Well under the 30s ready timeout: teardown must not wait for the
+			// grandchild (destroying the pipe kills it with SIGPIPE).
+			await expect(manager.execute("print(1)")).rejects.toThrow(/Kernel exited before ready/);
+		} finally {
+			errorSpy.mockRestore();
+			await manager.shutdown({ snapshot: true, drainHostRequests: true });
+		}
+	}, 15000);
 
 	it("fails a runtime announcing an unexpected protocol version", async () => {
 		const python = join(tempDir, "python");
@@ -242,6 +271,94 @@ describe("ReplKernelManager startup", () => {
 			await expectation;
 		} finally {
 			vi.useRealTimers();
+			errorSpy.mockRestore();
+			await manager.shutdown({ snapshot: true, drainHostRequests: true });
+		}
+	});
+	it("marks the log once when the write budget runs out and keeps the last words in the report", async () => {
+		const python = join(tempDir, "python");
+		// 4096 bytes of noise, then the last words; the log starts 100 bytes short of the cap.
+		writeExecutable(
+			python,
+			["#!/bin/sh", "head -c 4096 /dev/zero | tr '\\0' 'y' >&2", "printf 'LASTWORDS' >&2", "exit 42", ""].join("\n"),
+		);
+		const stderrLogPath = join(tempDir, "kernel-stderr.log");
+		writeFileSync(stderrLogPath, Buffer.alloc(5 * 1024 * 1024 - 100, "x"));
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const manager = new ReplKernelManager({ python, cwd: tempDir, stderrLogPath });
+
+		try {
+			// The ring is fed before the budget is checked, so the report keeps the last
+			// words even though they never reached the file.
+			await expect(manager.execute("print(1)")).rejects.toThrow(/Kernel exited before ready[\s\S]*LASTWORDS/);
+			await manager.shutdown({ snapshot: true, drainHostRequests: true });
+			const log = readFileSync(stderrLogPath, "utf8");
+			expect(log.endsWith("[stderr log budget exhausted]\n")).toBe(true);
+			expect(statSync(stderrLogPath).size).toBeLessThanOrEqual(5 * 1024 * 1024 + 30);
+			expect(log.split("[stderr log budget exhausted]\n").length).toBe(2);
+			expect(log).not.toContain("LASTWORDS");
+		} finally {
+			errorSpy.mockRestore();
+		}
+	});
+
+	it.skipIf(process.platform === "win32")(
+		"fails a planted FIFO at the stderr log path immediately instead of blocking",
+		async () => {
+			const python = join(tempDir, "python");
+			writeExecutable(python, ["#!/bin/sh", 'echo "fifo test last words" >&2', "exit 42", ""].join("\n"));
+			const stderrLogPath = join(tempDir, "kernel-stderr.log");
+			const mkfifo = spawnSync("mkfifo", [stderrLogPath]);
+			if (mkfifo.status !== 0) {
+				console.warn("mkfifo unavailable; skipping FIFO assertion");
+				return;
+			}
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const manager = new ReplKernelManager({ python, cwd: tempDir, stderrLogPath });
+
+			const started = Date.now();
+			try {
+				// Far below the 30s ready timeout: the open did not block the event loop.
+				await expect(manager.execute("print(1)")).rejects.toThrow(
+					/Kernel exited before ready[\s\S]*Refusing to use non-regular private file[\s\S]*fifo test last words/,
+				);
+				expect(Date.now() - started).toBeLessThan(5000);
+				expect(statSync(stderrLogPath).isFIFO()).toBe(true);
+			} finally {
+				errorSpy.mockRestore();
+				await manager.shutdown({ snapshot: true, drainHostRequests: true });
+			}
+		},
+	);
+
+	it("includes the kernel's final bytes in the ready-failure report", async () => {
+		const python = join(tempDir, "python");
+		// No sleep: the bytes race the exit, so only waiting for the pipe's close keeps them.
+		writeExecutable(python, ["#!/bin/sh", "printf 'LASTWORDS-NO-SLEEP' >&2", "exit 42", ""].join("\n"));
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const manager = new ReplKernelManager({ python, cwd: tempDir });
+
+		try {
+			await expect(manager.execute("print(1)")).rejects.toThrow(
+				/Kernel exited before ready[\s\S]*LASTWORDS-NO-SLEEP/,
+			);
+		} finally {
+			errorSpy.mockRestore();
+			await manager.shutdown({ snapshot: true, drainHostRequests: true });
+		}
+	});
+
+	it("flushes a truncated multibyte character into the tail", async () => {
+		const python = join(tempDir, "python");
+		// \303 is the first byte of a two-byte UTF-8 sequence that never completes; the
+		// decoder's end() flush is what puts the replacement character into the tail.
+		writeExecutable(python, ["#!/bin/sh", "printf 'caf\\303' >&2", "exit 42", ""].join("\n"));
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const manager = new ReplKernelManager({ python, cwd: tempDir });
+
+		try {
+			await expect(manager.execute("print(1)")).rejects.toThrow(/caf\uFFFD/);
+		} finally {
 			errorSpy.mockRestore();
 			await manager.shutdown({ snapshot: true, drainHostRequests: true });
 		}

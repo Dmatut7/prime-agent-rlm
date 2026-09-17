@@ -14,7 +14,7 @@ import {
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 	DAEMON_WORKER_TOKEN_ENV,
 } from "../modes/daemon/daemon-worker-protocol.js";
-import { createCliSubprocessLaunchSpec } from "./subprocess-launch.js";
+import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "./subprocess-launch.js";
 
 export const DAEMON_UPDATE_RESTART_COORDINATOR_FLAG = "--internal-update-restart-coordinator";
 export const DAEMON_UPDATE_RESTART_STATUS_FLAG = "--internal-update-restart-status";
@@ -524,7 +524,12 @@ function createStatusPath(agentDir: string, socketPath: string, requestId: strin
 }
 
 function coordinatorEnvironment(agentDir: string): NodeJS.ProcessEnv {
-	const environment = { ...process.env };
+	// The coordinator child re-enters the CLI under tsx from whatever environment
+	// spawned this process (e.g. a worker bash child whose allowlist env dropped
+	// TSX_TSCONFIG_PATH). Derive it from the current entrypoint so the child
+	// resolves the same workspace sources (tsconfig paths) as every other CLI
+	// subprocess, instead of falling back to an unrelated installed build.
+	const environment = createCliSubprocessEnv();
 	environment[ENV_AGENT_DIR] = agentDir;
 	delete environment[SELF_UPDATE_INTERACTIVE_CHILD_ENV];
 	delete environment[DAEMON_WORKER_ROLE_ENV];

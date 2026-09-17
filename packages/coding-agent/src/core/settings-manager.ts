@@ -21,6 +21,7 @@ import { sleepSync } from "../utils/sleep.js";
 import { clampCompactionTriggerRatio } from "./compaction/compaction.js";
 import { DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS } from "./extensions/timeout.js";
 import { RETIRED_VENV_RETENTION } from "./kernel/venv-in-use.js";
+import type { ProviderWaitPolicy } from "./provider-retry.js";
 import type { ResolvedRetentionSettings } from "./retention/types.js";
 
 const RECENT_MODELS_LIMIT = 20;
@@ -171,11 +172,21 @@ export interface AutoRefineSettings {
 	cooldownMs?: number; // default: 20 minutes
 }
 
+export interface ProviderWaitSettings {
+	enabled?: boolean; // default: true - bounded wait for quota/unavailability recovery
+	baseDelayMs?: number; // default: 1000 (first ping delay)
+	maxDelayMs?: number; // default: 300000 (per-ping ceiling, 5m)
+	maxAttempts?: number; // default: 30 (abort bound: max pings)
+	maxWaitMs?: number; // default: 900000 (abort bound: max total wait, 15m)
+}
+
 export interface ProviderRetrySettings {
 	timeoutMs?: number; // SDK/provider request timeout in milliseconds
 	maxRetries?: number; // SDK/provider retry attempts
-	maxRetryDelayMs?: number; // default: 60000 (max server-requested delay before failing)
+	maxRetryDelayMs?: number; // default: 60000 (max server-requested retry delay before failing; 0 disables the cap)
 	streamStallTimeoutMs?: number; // default: 300000 (5 min with zero stream events => abort + retryable error); 0 disables
+	/** Bounded wait-for-recovery loop for quota exhaustion and provider unavailability. */
+	waitForUsage?: ProviderWaitSettings;
 }
 
 export interface EmptyTurnRetrySettings {
@@ -406,6 +417,43 @@ export interface ThinkingBudgetsSettings {
 	high?: number;
 }
 
+/** One autonomous-run budget limit: a positive number, or "unlimited" for no cap. */
+export type AutonomousLimitSetting = number | "unlimited";
+
+/**
+ * Persisted defaults for autonomous-run budget limits. They apply when a run
+ * starts without explicit `--autonomous-*` CLI or `/autonomous on` budget
+ * flags; explicit flags keep winning per run.
+ */
+export interface AutonomousSettings {
+	maxContinuations?: AutonomousLimitSetting;
+	maxTurns?: AutonomousLimitSetting;
+	maxTokens?: AutonomousLimitSetting;
+	timeoutMs?: AutonomousLimitSetting;
+}
+
+/** Autonomous limit settings resolved to finite positive numbers; invalid entries are dropped. */
+export interface ResolvedAutonomousLimits {
+	maxContinuations?: number;
+	maxTurns?: number;
+	maxTokens?: number;
+	timeoutMs?: number;
+}
+
+function resolveAutonomousLimit(value: AutonomousLimitSetting | undefined): number | undefined {
+	if (value === "unlimited") {
+		// Matches the runtime's UNLIMITED_AUTONOMOUS_LIMIT sentinel.
+		return Number.MAX_SAFE_INTEGER;
+	}
+	if (typeof value !== "number" || !Number.isFinite(value)) {
+		return undefined;
+	}
+	// Truncate before validating so a positive fraction (e.g. 0.5) drops to
+	// undefined instead of becoming a zero limit that stops the run immediately.
+	const truncated = Math.trunc(value);
+	return truncated > 0 ? truncated : undefined;
+}
+
 export type MermaidRenderingMode = "off" | "final" | "streaming";
 
 export interface MarkdownSettings {
@@ -444,10 +492,10 @@ export type PackageSource =
 	  };
 
 /**
- * Remote/local MCP server an integration connects to. Built-in integrations
- * (Linear/Notion) are defined in the ai/mcp catalog; this is for user-declared
- * servers. The kernel-side integration package reads creds from auth.json
- * (`mcp:<name>`); login/refresh run host-side.
+ * Remote/local MCP server an integration connects to. Catalog services are
+ * defined in the ai/mcp service catalog; this is for user-declared servers.
+ * The kernel's generic mcp runtime reads creds from auth.json (`mcp:<name>`);
+ * login/refresh/verification run host-side.
  */
 export type McpServerConfig =
 	| {
@@ -458,6 +506,18 @@ export type McpServerConfig =
 			bearerTokenEnvVar?: string;
 			/** Use the generic OAuth login flow for this server. */
 			oauth?: boolean;
+			/** Pre-registered OAuth client id for this server (optional). */
+			oauthClientId?: string;
+			/**
+			 * Env var holding the OAuth client secret. When set, a missing or
+			 * empty env value fails the login/refresh — never a stale stored
+			 * secret fallback.
+			 */
+			oauthClientSecretEnvVar?: string;
+			/** Client identity metadata document URL (CIMD) for this server. */
+			oauthClientMetadataUrl?: string;
+			/** Requested OAuth scopes for this server (config > PRM > omit). */
+			oauthScopes?: string[];
 			/** Force-disable even when credentials exist. */
 			enabled?: boolean;
 			enabledTools?: string[];
@@ -484,6 +544,8 @@ export interface Settings {
 	onboardingCompleted?: boolean;
 	defaultProvider?: string;
 	defaultModel?: string;
+	subagentDefaultModel?: string; // "provider/id" for rlm.spawn without a pinned model; unset inherits the parent model
+	updateChannel?: "stable" | "nightly"; // release channel for self-updates; unset follows the running version
 	recentModels?: string[]; // "provider/id" keys, most-recently-used first
 	// "provider/id" for background LLM passes (refinement review and planning);
 	// unset falls back to the session model. Routing these to a different model
@@ -512,11 +574,19 @@ export interface Settings {
 	retention?: RetentionSettings;
 	retry?: RetrySettings;
 	hideThinkingBlock?: boolean;
+	/**
+	 * User-defined backup model ("provider/model-id" or a bare model id) used
+	 * while the primary model is quota-blocked or its provider is unavailable.
+	 * Default: none - requests never silently switch models.
+	 */
+	providerBackupModel?: string;
+	autonomous?: AutonomousSettings;
 	shellPath?: string; // Custom shell path (e.g., for Cygwin users on Windows)
 	quietStartup?: boolean;
 	shellCommandPrefix?: string; // Prefix prepended to every bash command (e.g., "shopt -s expand_aliases" for alias support)
 	npmCommand?: string[]; // Command used for npm package lookup/install operations, argv-style (e.g., ["mise", "exec", "node@20", "--", "npm"])
 	mcpServers?: Record<string, McpServerConfig>; // User-declared MCP servers (name → config); built-ins are in the ai/mcp catalog
+	mcpCatalogSources?: string[]; // Extra local MCP service catalog files (~-relative ok); merged after the built-in catalog, first source wins per id
 	packages?: PackageSource[]; // Array of npm/git package sources (string or object with filtering)
 	extensions?: string[]; // Array of local extension file paths or directories
 	/** Per-handler / factory timeout in ms. Default 30000; 0 disables the wall-clock timeout. */
@@ -969,14 +1039,19 @@ export class FileSettingsStorage implements SettingsStorage {
 				release = this.acquireLockSyncWithRetry(path);
 			}
 			const current = fileExists ? readFileSync(path, "utf-8") : undefined;
-			const next = fn(current);
+			let next = fn(current);
 			if (next !== undefined) {
 				if (!existsSync(dir)) {
 					mkdirSync(dir, { recursive: true });
 				}
 				if (!release) {
 					release = this.acquireLockSyncWithRetry(path);
+					// The first-write read ran unlocked; a racing first writer may have landed since.
+					if (existsSync(path)) {
+						next = fn(readFileSync(path, "utf-8"));
+					}
 				}
+				if (next === undefined) return;
 				const temporaryPath = `${path}.${process.pid}.${Date.now()}.tmp`;
 				try {
 					// fsync before the rename (writePrivateFileAtomic precedent): a
@@ -1741,6 +1816,15 @@ export class SettingsManager {
 		return this.settings.defaultModel;
 	}
 
+	/** Model selector applied when `rlm.spawn` does not pin a model; unset inherits the parent model. */
+	getSubagentDefaultModel(): string | undefined {
+		// Parsed settings are only cast to Settings; a non-string JSON value
+		// (e.g. 42) must behave as unset, never throw into the spawn path.
+		const reference = this.settings.subagentDefaultModel;
+		if (typeof reference !== "string") return undefined;
+		return reference.trim() ? reference.trim() : undefined;
+	}
+
 	setDefaultProvider(provider: string): void {
 		this.globalSettings.defaultProvider = provider;
 		this.markModified("defaultProvider");
@@ -1807,6 +1891,18 @@ export class SettingsManager {
 	setTheme(theme: string): void {
 		this.globalSettings.theme = theme;
 		this.markModified("theme");
+		this.save();
+	}
+
+	/** A per-user preference: read from global settings only, and ignore anything but the two known values. */
+	getUpdateChannel(): "stable" | "nightly" | undefined {
+		const channel = this.globalSettings.updateChannel;
+		return channel === "stable" || channel === "nightly" ? channel : undefined;
+	}
+
+	setUpdateChannel(channel: "stable" | "nightly"): void {
+		this.globalSettings.updateChannel = channel;
+		this.markModified("updateChannel");
 		this.save();
 	}
 
@@ -2000,6 +2096,23 @@ export class SettingsManager {
 		};
 	}
 
+	/**
+	 * Persisted autonomous-run limit defaults, ready for the runtime. Invalid
+	 * entries are dropped so the built-in per-field defaults still apply.
+	 */
+	getAutonomousLimits(): ResolvedAutonomousLimits {
+		const settings = this.settings.autonomous;
+		if (!settings) {
+			return {};
+		}
+		return {
+			maxContinuations: resolveAutonomousLimit(settings.maxContinuations),
+			maxTurns: resolveAutonomousLimit(settings.maxTurns),
+			maxTokens: resolveAutonomousLimit(settings.maxTokens),
+			timeoutMs: resolveAutonomousLimit(settings.timeoutMs),
+		};
+	}
+
 	getBranchSummarySettings(): { reserveTokens: number; skipPrompt: boolean } {
 		return {
 			reserveTokens: this.settings.branchSummary?.reserveTokens ?? 16384,
@@ -2149,6 +2262,27 @@ export class SettingsManager {
 			maxRetryDelayMs: this.settings.retry?.provider?.maxRetryDelayMs ?? 60000,
 			streamStallTimeoutMs: this.settings.retry?.provider?.streamStallTimeoutMs ?? DEFAULT_STREAM_STALL_TIMEOUT_MS,
 		};
+	}
+
+	getProviderWaitSettings(): ProviderWaitPolicy {
+		const wait = this.settings.retry?.provider?.waitForUsage;
+		const bound = (value: number | undefined, fallback: number): number =>
+			typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : fallback;
+		return {
+			enabled: wait?.enabled ?? true,
+			baseDelayMs: bound(wait?.baseDelayMs, 1000),
+			maxDelayMs: bound(wait?.maxDelayMs, 300_000),
+			maxAttempts: bound(wait?.maxAttempts, 30),
+			maxWaitMs: bound(wait?.maxWaitMs, 900_000),
+		};
+	}
+
+	getProviderBackupModel(): string | undefined {
+		// Parsed settings are only cast to Settings; a non-string JSON value
+		// (e.g. 123) must behave as unset, never throw into the retry path.
+		const reference = this.settings.providerBackupModel;
+		if (typeof reference !== "string") return undefined;
+		return reference.trim() ? reference.trim() : undefined;
 	}
 
 	getHideThinkingBlock(): boolean {
@@ -2433,6 +2567,11 @@ export class SettingsManager {
 	/** MCP execution is intentionally restricted to user/global settings. */
 	getGlobalMcpServers(): Record<string, McpServerConfig> | undefined {
 		return structuredClone(this.globalSettings.mcpServers);
+	}
+
+	/** Declared local service-catalog source paths (unexpanded ~ allowed). */
+	getMcpCatalogSources(): string[] {
+		return structuredClone(this.globalSettings.mcpCatalogSources ?? []);
 	}
 
 	setGlobalMcpServer(name: string, config: McpServerConfig, force = false): void {

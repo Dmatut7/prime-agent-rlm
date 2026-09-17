@@ -42,10 +42,13 @@ import type { AgentFamilyRelationship } from "./agent-messages.js";
 import { AGENT_MESSAGE_CUSTOM_TYPE } from "./agent-messages.js";
 import { GOAL_CONTEXT_CUSTOM_TYPE, GOAL_STATE_CUSTOM_TYPE } from "./goals.js";
 import {
+	ASYNC_BASH_COMPLETION_CUSTOM_TYPE,
 	COMPACTION_OUTCOME_CUSTOM_TYPE,
 	type CustomMessage,
 	HEARTBEAT_PROMPT_CUSTOM_TYPE,
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
+	MCP_CONNECTION_OUTCOME_CUSTOM_TYPE,
+	REFINEMENT_NOTICE_CUSTOM_TYPE,
 	REFINEMENT_OUTCOME_CUSTOM_TYPE,
 	RLM_CHILD_FAILURE_CUSTOM_TYPE,
 	RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE,
@@ -142,11 +145,16 @@ const CUSTOM_TYPE_INPUT_CLASSES: ReadonlyMap<string, InputClass> = new Map<strin
 	// Post-compaction and refinement receipts.
 	[COMPACTION_OUTCOME_CUSTOM_TYPE, "internal_continuation"],
 	[REFINEMENT_OUTCOME_CUSTOM_TYPE, "internal_continuation"],
+	[REFINEMENT_NOTICE_CUSTOM_TYPE, "internal_continuation"],
 	[REFINEMENT_CUSTOM_TYPE, "internal_continuation"],
 	// Harness bookkeeping receipts.
 	[THINKING_LEVEL_CLAMPED_CUSTOM_TYPE, "internal_continuation"],
 	[IPYTHON_STATE_RESTORED_CUSTOM_TYPE, "internal_continuation"],
 	[SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE, "internal_continuation"],
+	// Tool-infrastructure receipts: an MCP connection outcome and a finished
+	// background command are machine records, never a human or an agent turn.
+	[MCP_CONNECTION_OUTCOME_CUSTOM_TYPE, "internal_continuation"],
+	[ASYNC_BASH_COMPLETION_CUSTOM_TYPE, "internal_continuation"],
 	// Human by design: this record *is* the command the human typed
 	// (createSessionSlashCommandMessage sets content = command.text). Ranking it
 	// as a machine class would let the matrix place a human command below

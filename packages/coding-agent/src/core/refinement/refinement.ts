@@ -13,6 +13,7 @@ import { getAgentDir } from "../../config.js";
 import { appendPrivateFile, readPrivateFile, writePrivateFileAtomic } from "../../utils/private-files.js";
 import { serializeConversation } from "../compaction/utils.js";
 import { convertToLlm } from "../messages.js";
+import type { ProviderRetryPolicy } from "../provider-retry.js";
 import type { CustomEntry } from "../session-manager.js";
 
 export const REFINEMENT_CUSTOM_TYPE = "prime-agent.refinement";
@@ -135,6 +136,7 @@ export interface RefineOptions {
 	instructions?: string;
 	rollbackId?: string;
 	global?: boolean;
+	retry?: ProviderRetryPolicy;
 }
 
 export type AutoRefineReason = "turn_interval" | "compact";
@@ -776,6 +778,107 @@ function compactText(text: string, maxLength: number): string {
 	return `${normalized.slice(0, Math.max(0, maxLength - 3))}...`;
 }
 
+/** Notice body in digest notation: trigger line plus applied edits as `action kind [scope:id] title: content`; rollbacks print via their rollback summaries. */
+export function formatRefinementNoticeBody(result: RefinementResult): string {
+	const lines = [compactText(result.summary, DEFAULT_OVERVIEW_CONTENT_LIMIT)];
+	for (const edit of result.appliedEdits) {
+		if (!edit.applied) continue;
+		const entry = edit.after ?? edit.before;
+		const scope = entry?.scope ?? result.scope ?? "local";
+		lines.push(
+			`- ${edit.action} ${edit.kind} [${scope}:${edit.id}] ${entry?.title ?? edit.id}: ${compactText(
+				entry?.content ?? "",
+				DEFAULT_OVERVIEW_CONTENT_LIMIT,
+			)}`,
+		);
+	}
+	return lines.join("\n");
+}
+
+/**
+ * Query terms for relevance-ranked harness digests: term -> weight.
+ * Built by the caller from task signal (goal objective, recent
+ * messages). The ranking is a pure weighted-term overlap over the
+ * entry's searchable fields.
+ */
+export type HarnessQueryTerms = Map<string, number>;
+
+/** Lowercase a possibly malformed persisted field. */
+function searchableField(value: unknown): string {
+	return typeof value === "string" ? value.toLowerCase() : "";
+}
+
+/** CJK ideographs, kana, and Hangul: scripts that do not mark word
+ * boundaries with spaces. */
+const CJK_TERM_RANGES =
+	"\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af" +
+	"\u{20000}-\u{2a6df}\u{2a700}-\u{2b73f}\u{2b740}-\u{2b81f}" +
+	"\u{2b820}-\u{2ceaf}\u{2ceb0}-\u{2ebef}\u{2ebf0}-\u{2ee5f}" +
+	"\u{2f800}-\u{2fa1f}\u{30000}-\u{3134f}\u{31350}-\u{323af}\u{323b0}-\u{3347f}";
+const CJK_TERM_PATTERN = new RegExp(`[${CJK_TERM_RANGES}]`, "u");
+const CJK_TERM_SPLIT = new RegExp(`[${CJK_TERM_RANGES}]+|[^${CJK_TERM_RANGES}]+`, "gu");
+
+/**
+ * Tokenize text into lowercase query terms for harness relevance ranking.
+ * Letters, digits, and combining marks of any script form terms; punctuation only
+ * separate them, so a query like `worktree?` never ranks entries by their
+ * question marks. CJK runs carry no spaces between words, so each run
+ * becomes overlapping bigrams: `修复登录` yields 修复/复登/登录 and still
+ * matches an entry containing 登录故障. Each distinct term is returned once.
+ */
+export function harnessQueryTerms(text: string): string[] {
+	const terms: string[] = [];
+	// \p{M} keeps combining marks inside their run so mark-heavy scripts
+	// spell whole words (Devanagari किताब stays one run).
+	for (const run of text.toLowerCase().match(/[\p{L}\p{N}\p{M}]+/gu) ?? []) {
+		// Runs break only at CJK boundaries: accented Latin stays whole
+		// (naïve) while spacing-free CJK is cut from adjacent words.
+		for (const segment of run.match(CJK_TERM_SPLIT) ?? []) {
+			if (CJK_TERM_PATTERN.test(segment)) {
+				// Code points, not UTF-16 units, keep astral ideographs whole.
+				const chars = Array.from(segment);
+				if (chars.length === 1) terms.push(segment);
+				else for (let i = 0; i < chars.length - 1; i += 1) terms.push(chars[i] + chars[i + 1]);
+			} else if (segment.length >= 4) {
+				// Short runs are noise (the, and, ids) and are dropped.
+				terms.push(segment);
+			}
+		}
+	}
+	return [...new Set(terms)];
+}
+
+/** Score one harness entry against query terms: weighted term overlap. */
+export function scoreHarnessEntryForQuery(entry: HarnessEntry, terms: HarnessQueryTerms): number {
+	if (terms.size === 0) return 0;
+	const title = searchableField(entry.title);
+	const content = searchableField(entry.content);
+	const identifier = `${searchableField(entry.path)} ${searchableField(entry.id)}`;
+	let score = 0;
+	for (const [term, weight] of terms) {
+		// One match per field counts once per term: coverage over distinct
+		// fields matters more than repetition inside a single field. Path
+		// and id form a single identifier slot: the id is often embedded in
+		// the path, so matching both is one signal, not two.
+		let fields = 0;
+		if (title.includes(term)) fields += 1;
+		if (content.includes(term)) fields += 1;
+		if (identifier.includes(term)) fields += 1;
+		if (fields > 0) score += weight * (1 + (fields - 1) * 0.5);
+	}
+	return score;
+}
+
+// biome-ignore lint/correctness/noUnusedVariables: #2241 phase 2 is deferred until #2098 lands (merge doc 3.2: ranked digests before the static prompt cut prefix-cache hits from 94.3% to ~0 and 5x the prompt bill). Kept exported-shaped and wired-ready; the only caller is the overviewForPrompt sort this merge keeps on the fork's compareEntriesForInjection.
+function compareRankedHarnessEntries(a: HarnessEntry, b: HarnessEntry, terms: HarnessQueryTerms): number {
+	const scoreDifference = scoreHarnessEntryForQuery(b, terms) - scoreHarnessEntryForQuery(a, terms);
+	if (scoreDifference !== 0) return scoreDifference;
+	// Recency breaks ties; alphabetical order keeps selection deterministic.
+	const recencyDifference = (Date.parse(b.updated_at) || 0) - (Date.parse(a.updated_at) || 0);
+	if (recencyDifference !== 0) return recencyDifference;
+	return [a.path, a.title, a.id].join("\0").localeCompare([b.path, b.title, b.id].join("\0"));
+}
+
 export function formatHarnessStateForPrompt(
 	state: HarnessState,
 	options: {
@@ -785,6 +888,9 @@ export function formatHarnessStateForPrompt(
 		includeIpythonExamples?: boolean;
 		includeShellExamples?: boolean;
 		includeRefineExamples?: boolean;
+		/** Select entries by relevance to these terms instead of
+		 * alphabetical order. */
+		queryTerms?: HarnessQueryTerms;
 	} = {},
 ): string {
 	const maxEntriesPerKind = options.maxEntriesPerKind ?? DEFAULT_OVERVIEW_ENTRY_LIMIT;
@@ -1456,6 +1562,7 @@ export async function planRefinement(
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
+	sessionId?: string,
 ): Promise<RefinementPlan> {
 	const id = generateRefinementId();
 	if (options.rollbackId) {
@@ -1493,6 +1600,7 @@ export async function planRefinement(
 	// Keep the refinement request non-reasoning regardless of the interactive session
 	// thinking level so the model uses its output budget for the JSON object.
 	void thinkingLevel;
+	void sessionId;
 	const response = await completeSimple(
 		model,
 		{
@@ -1544,6 +1652,8 @@ export async function reviewAutoRefine(
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
+	retry?: ProviderRetryPolicy,
+	sessionId?: string,
 ): Promise<AutoRefineReview> {
 	const conversationText = serializeConversation(convertToLlm(messages)).slice(-40_000);
 	const userPrompt = [
@@ -1564,6 +1674,8 @@ ${conversationText}
 	// Auto-refine review requires parseable JSON. Keep it non-reasoning so
 	// reasoning-capable models use final text budget for the JSON object.
 	void thinkingLevel;
+	void retry;
+	void sessionId;
 	const response = await completeSimple(
 		model,
 		{
@@ -1599,8 +1711,20 @@ export async function refineHarness(
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
+	sessionId?: string,
 ): Promise<RefinementResult> {
-	const plan = await planRefinement(messages, state, history, model, apiKey, options, headers, signal, thinkingLevel);
+	const plan = await planRefinement(
+		messages,
+		state,
+		history,
+		model,
+		apiKey,
+		options,
+		headers,
+		signal,
+		thinkingLevel,
+		sessionId,
+	);
 	return applyRefinementProposal(state, plan.proposal, {
 		id: plan.id,
 		rollbackOf: plan.rollbackOf,

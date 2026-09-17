@@ -16,6 +16,8 @@ type WiredKernelManager = {
 	state: "running";
 	child: ChildProcess | undefined;
 	kernelStderr: string;
+	kernelDiagnostics: string;
+	stderrTail: () => string;
 	wireChild: (child: unknown) => void;
 };
 
@@ -59,13 +61,13 @@ describe("ReplKernelManager kernel pipe errors", () => {
 		// No listener on a stream's 'error' makes emit() throw, which is how an
 		// unhandled write EPIPE became "uncaught exception" in the session worker.
 		expect(() => child.stdin.emit("error", new Error("write EPIPE"))).not.toThrow();
-		expect(internals.kernelStderr).toContain("kernel stdin error: write EPIPE");
+		expect(internals.kernelDiagnostics).toContain("kernel stdin error: write EPIPE");
 	});
 
 	it("absorbs a stdout pipe error as a diagnostic instead of throwing it at the worker", () => {
 		const { internals, child } = wiredManager();
 		expect(() => child.stdout.emit("error", new Error("read ECONNRESET"))).not.toThrow();
-		expect(internals.kernelStderr).toContain("kernel stdout error: read ECONNRESET");
+		expect(internals.kernelDiagnostics).toContain("kernel stdout error: read ECONNRESET");
 	});
 
 	it("ignores pipe errors from a child a newer spawn superseded", () => {
@@ -73,15 +75,43 @@ describe("ReplKernelManager kernel pipe errors", () => {
 		const replacement = fakeKernelChild();
 		internals.child = replacement as unknown as ChildProcess;
 		internals.wireChild(replacement);
-		internals.kernelStderr = "";
+		internals.kernelDiagnostics = "";
 
 		expect(() => child.stdin.emit("error", new Error("write EPIPE"))).not.toThrow();
 		expect(() => child.stdout.emit("error", new Error("read ECONNRESET"))).not.toThrow();
-		expect(internals.kernelStderr).toBe("");
+		expect(internals.kernelDiagnostics).toBe("");
 
 		// The live child still reports: the guard is about attribution, not silence.
 		expect(() => replacement.stdin.emit("error", new Error("write EPIPE"))).not.toThrow();
-		expect(internals.kernelStderr).toContain("kernel stdin error: write EPIPE");
+		expect(internals.kernelDiagnostics).toContain("kernel stdin error: write EPIPE");
+	});
+
+	it("starts each wired child's stderr window empty", () => {
+		const { internals, child } = wiredManager();
+		child.stderr.emit("data", Buffer.from("first incarnation\n"));
+		const replacement = fakeKernelChild();
+		internals.child = replacement as unknown as ChildProcess;
+		internals.wireChild(replacement);
+		replacement.stderr.emit("data", Buffer.from("second incarnation\n"));
+		// The window is the per-wire ring reset, not a file offset: a previous spawn's
+		// bytes must not ride into this one's failure report.
+		const tail = internals.stderrTail();
+		expect(tail).toContain("second incarnation");
+		expect(tail).not.toContain("first incarnation");
+	});
+
+	it("keeps host diagnostics in the report tail when kernel noise floods the ring", () => {
+		const { internals, child } = wiredManager();
+		// One host diagnostic, then a flood of kernel bytes that overflows the shared
+		// 8 KiB ring several times over. The dual quota keeps them apart: the host tail
+		// (256) precedes the kernel tail (768).
+		expect(() => child.stdin.emit("error", new Error("write EPIPE"))).not.toThrow();
+		child.stderr.emit("data", Buffer.alloc(9 * 1024, "z"));
+		const tail = internals.stderrTail();
+		expect(tail).toContain("kernel stdin error: write EPIPE");
+		expect(tail.length).toBeLessThanOrEqual(1024);
+		expect(tail.endsWith("z")).toBe(true);
+		expect(tail.indexOf("EPIPE")).toBeLessThan(tail.lastIndexOf("z"));
 	});
 });
 

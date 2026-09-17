@@ -12,6 +12,7 @@ type ShutdownInternals = {
 	pendingDoneWaiters: Map<string, () => void>;
 	inFlightHostRequests: Map<Promise<void>, number>;
 	kernelStderr: string;
+	kernelDiagnostics: string;
 	child: EventEmitter & {
 		exitCode: number | null;
 		signalCode: NodeJS.Signals | null;
@@ -23,7 +24,11 @@ type ShutdownInternals = {
 			on: (event: string, listener: (...args: unknown[]) => void) => void;
 		};
 		stdout?: { destroy: () => void; on: (event: string, listener: (...args: unknown[]) => void) => void };
-		stderr?: { destroy: () => void; on: (event: string, listener: (...args: unknown[]) => void) => void };
+		stderr?: {
+			destroy: () => void;
+			on: (event: string, listener: (...args: unknown[]) => void) => void;
+			once: (event: string, listener: (...args: unknown[]) => void) => void;
+		};
 	};
 };
 
@@ -48,7 +53,7 @@ function configuredManager(
 		pid: undefined,
 		stdin: { destroyed: false, destroy: vi.fn(), on: vi.fn() },
 		stdout: { destroy: vi.fn(), on: vi.fn() },
-		stderr: { destroy: vi.fn(), on: vi.fn() },
+		stderr: { destroy: vi.fn(), on: vi.fn(), once: vi.fn() },
 	});
 	Object.assign(internals, {
 		state: "running",
@@ -79,8 +84,8 @@ describe("ReplKernelManager graceful shutdown", () => {
 			await vi.advanceTimersByTimeAsync(2_000);
 			await vi.advanceTimersByTimeAsync(2_000);
 			await expect(shutdown).resolves.toBe(true);
-			expect(internals.kernelStderr).toContain("Kernel did not shut down within 5000ms");
-			expect(internals.kernelStderr).toContain("sending SIGKILL");
+			expect(internals.kernelDiagnostics).toContain("Kernel did not shut down within 5000ms");
+			expect(internals.kernelDiagnostics).toContain("sending SIGKILL");
 			const killSignals = (child.kill as unknown as { mock: { calls: [NodeJS.Signals?][] } }).mock.calls.map(
 				(call) => call[0],
 			);
