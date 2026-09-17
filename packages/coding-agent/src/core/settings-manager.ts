@@ -617,17 +617,41 @@ export interface AgentTracesSettings {
 }
 
 /**
+ * Tuning for the sub-agent spend cell, for a user who wants a custom refresh
+ * cadence instead of the built-in one.
+ */
+export interface SubagentSpendCellSettings {
+	/**
+	 * How often the cell's figure may go stale while a family works, in ms.
+	 * Default {@link DEFAULT_SUBAGENT_SPEND_CELL_INTERVAL_MS}; clamped to
+	 * [{@link MIN_SUBAGENT_SPEND_CELL_INTERVAL_MS}, {@link MAX_SUBAGENT_SPEND_CELL_INTERVAL_MS}],
+	 * and a non-number falls back to the default rather than erroring (same
+	 * discipline as `compaction.triggerRatio`).
+	 */
+	intervalMs?: number;
+}
+
+/**
  * Behaviour of the interactive UI's own cells.
  */
 export interface UiSettings {
 	/**
-	 * Show the sub-agent spend cell in the subagents tray line, and refresh it.
-	 * Default true. `false` is the emergency switch: the cell renders nothing and
-	 * the tray stops asking for the (disk-scanning) context tree at all - the
-	 * counts and stall markers keep updating from the roster stream.
+	 * Show the sub-agent spend cell in the subagents tray line, and refresh it:
+	 * `true`/absent keeps it on with the default cadence, `false` is the emergency
+	 * switch (the cell renders nothing and the tray stops asking for the
+	 * disk-scanning context tree at all - the counts and stall markers keep
+	 * updating from the roster stream), and an object keeps it on with a custom
+	 * cadence (see {@link SubagentSpendCellSettings}).
 	 */
-	subagentSpendCell?: boolean;
+	subagentSpendCell?: boolean | SubagentSpendCellSettings;
 }
+
+/** Default cadence of the spend cell's idle tick and its stale-figure catch-up. */
+export const DEFAULT_SUBAGENT_SPEND_CELL_INTERVAL_MS = 15_000;
+/** Fastest cadence a user may configure: below this the scan cost stops being negligible. */
+export const MIN_SUBAGENT_SPEND_CELL_INTERVAL_MS = 5_000;
+/** Slowest cadence a user may configure; past this the figure is stale by design anyway. */
+export const MAX_SUBAGENT_SPEND_CELL_INTERVAL_MS = 120_000;
 
 export interface TelemetrySettings {
 	enabled?: boolean;
@@ -834,6 +858,8 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 /** Deeper-than-one-level blocks, keyed by their full dotted path. */
 const KNOWN_NESTED_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	"retry.provider": ["timeoutMs", "maxRetries", "maxRetryDelayMs", "streamStallTimeoutMs", "waitForUsage"],
+	// The cell's cadence block: `ui.subagentSpendCell` is either a boolean or this object.
+	"ui.subagentSpendCell": ["intervalMs"],
 	"retry.emptyTurn": ["maxAttempts", "baseDelayMs", "maxDelayMs", "maxTotalDelayMs"],
 };
 
@@ -2699,7 +2725,34 @@ export class SettingsManager {
 	 * turned it off.
 	 */
 	getSubagentSpendCellEnabled(): boolean {
-		return this.settings.ui?.subagentSpendCell ?? true;
+		return this.settings.ui?.subagentSpendCell !== false;
+	}
+
+	/**
+	 * How stale the spend cell's figure may get, in ms. An object form sets it; a
+	 * non-number clamps to the default instead of failing, and out-of-range values
+	 * clamp to the bound (a NaN-free, never-throwing read, like `triggerRatio`).
+	 */
+	getSubagentSpendCellIntervalMs(): number {
+		const raw = this.settings.ui?.subagentSpendCell;
+		const configured = typeof raw === "object" && raw !== null ? raw.intervalMs : undefined;
+		if (typeof configured !== "number" || !Number.isFinite(configured)) {
+			return DEFAULT_SUBAGENT_SPEND_CELL_INTERVAL_MS;
+		}
+		return Math.max(
+			MIN_SUBAGENT_SPEND_CELL_INTERVAL_MS,
+			Math.min(MAX_SUBAGENT_SPEND_CELL_INTERVAL_MS, Math.floor(configured)),
+		);
+	}
+
+	setSubagentSpendCellIntervalMs(intervalMs: number): void {
+		const current = this.globalSettings.ui?.subagentSpendCell;
+		const settings = typeof current === "object" && current !== null ? { ...current } : {};
+		settings.intervalMs = intervalMs;
+		this.globalSettings.ui ??= {};
+		this.globalSettings.ui.subagentSpendCell = settings;
+		this.markModified("ui", "subagentSpendCell");
+		this.save();
 	}
 
 	setSubagentSpendCellEnabled(enabled: boolean): void {

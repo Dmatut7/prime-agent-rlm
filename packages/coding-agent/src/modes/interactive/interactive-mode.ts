@@ -328,12 +328,14 @@ const SUBAGENT_SPEND_MIN_INTERVAL_MS = 5_000;
 const SUBAGENT_SPEND_HEAVY_SCAN_MS = 100;
 const SUBAGENT_SPEND_HEAVY_INTERVAL_MS = 15_000;
 /**
- * Idle heartbeat of a visible spend cell, in ms.
+ * Fallback idle heartbeat of a visible spend cell, in ms, for callers whose settings
+ * surface predates `ui.subagentSpendCell.intervalMs` (the live value comes from the
+ * settings manager; see `subagentSpendIntervalMs`).
  *
  * The cell stays fresh while a family works without polling per event: the context
  * tree behind it is a disk-scanning RPC, and a working family emits child updates
  * continuously, so a per-update refresh meant a tree scan behind every burst. One
- * tick per 15s is the freshness the figure is worth - money spent by sub-agents
+ * tick per interval is the freshness the figure is worth - money spent by sub-agents
  * moves slowly compared to the update stream that used to trigger the scans - and a
  * quiet family costs one scan per tick instead of one per update.
  */
@@ -1108,6 +1110,8 @@ export class InteractiveMode {
 	private subagentSpendTimerForced = false;
 	/** Idle heartbeat of the visible spend cell; undefined while the cell is off screen. */
 	private subagentSpendTickTimer: ReturnType<typeof setInterval> | undefined;
+	/** Period the armed tick was created with, so a settings change re-arms it. */
+	private subagentSpendTickIntervalMs = 0;
 	/**
 	 * Set while the terminal is suspended (Ctrl-Z) and the TUI is stopped: nothing is on
 	 * screen, so the spend cell neither ticks nor refreshes until SIGCONT restores it.
@@ -6364,11 +6368,32 @@ export class InteractiveMode {
 			this.subagentSummaryLine.setSubagentSpend(undefined);
 			return;
 		}
+		const interval = this.subagentSpendIntervalMs();
 		if (!this.hasSubagentSpendFigure()) {
 			// First sight of a family: fill the cell in now instead of waiting out a tick.
 			this.scheduleSubagentSpendRefresh();
+		} else if (this.subagentSpendAgeMs() >= interval) {
+			// The figure has outlived its cadence while events kept arriving - a long turn
+			// with a working family. The next event is the natural moment to catch up, so
+			// the age is reset here rather than waiting out the tick's phase: the staleness
+			// bound stays one interval, and no second timer is added to get it. Forced,
+			// because the age it has already reached is exactly what the debounce and the
+			// floor exist to ration.
+			this.scheduleSubagentSpendRefresh(true);
 		}
-		this.startSubagentSpendIdleTick();
+		this.startSubagentSpendIdleTick(interval);
+	}
+
+	/** How stale the on-screen figure may get, in ms (`ui.subagentSpendCell.intervalMs`). */
+	private subagentSpendIntervalMs(): number {
+		const settings = this.settingsManager as { getSubagentSpendCellIntervalMs?: () => number };
+		return settings.getSubagentSpendCellIntervalMs?.() ?? SUBAGENT_SPEND_IDLE_TICK_MS;
+	}
+
+	/** Age of the figure on screen, in ms; +Infinity when there is none. */
+	private subagentSpendAgeMs(): number {
+		if (!(this.subagentSpendLastScanAt > 0)) return Number.POSITIVE_INFINITY;
+		return Math.max(0, Date.now() - this.subagentSpendLastScanAt);
 	}
 
 	/**
@@ -6384,8 +6409,14 @@ export class InteractiveMode {
 		);
 	}
 
-	private startSubagentSpendIdleTick(): void {
-		if (this.subagentSpendTickTimer !== undefined) return;
+	private startSubagentSpendIdleTick(intervalMs = this.subagentSpendIntervalMs()): void {
+		if (this.subagentSpendTickTimer !== undefined) {
+			if (this.subagentSpendTickIntervalMs === intervalMs) return;
+			// The configured cadence moved while a tick was armed: re-arm at the new one
+			// instead of letting the old period outlive the settings change.
+			this.stopSubagentSpendIdleTick();
+		}
+		this.subagentSpendTickIntervalMs = intervalMs;
 		this.subagentSpendTickTimer = setInterval(() => {
 			// Re-checked per tick: the setting can flip, the family can go away, and the
 			// terminal can suspend between ticks, none of which needs its own teardown path.
@@ -6394,12 +6425,13 @@ export class InteractiveMode {
 				return;
 			}
 			void this.refreshSubagentSpend(false);
-		}, SUBAGENT_SPEND_IDLE_TICK_MS);
+		}, intervalMs);
 		// A freshness nicety, never a reason to hold the process open.
 		this.subagentSpendTickTimer.unref?.();
 	}
 
 	private stopSubagentSpendIdleTick(): void {
+		this.subagentSpendTickIntervalMs = 0;
 		if (this.subagentSpendTickTimer === undefined) return;
 		clearInterval(this.subagentSpendTickTimer);
 		this.subagentSpendTickTimer = undefined;

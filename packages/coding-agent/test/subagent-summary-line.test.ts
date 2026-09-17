@@ -718,6 +718,8 @@ describe("subagent spend cell", () => {
 			total?: number;
 			suspended?: boolean;
 			stubIdleTick?: boolean;
+			/** `ui.subagentSpendCell.intervalMs`; undefined = the tree's own default (15s). */
+			intervalMs?: number;
 			/** Model rates lookup behind the unpriced annotation; undefined = an unpriced model. */
 			modelCost?: { input: number; output: number; cacheRead: number; cacheWrite: number } | undefined;
 		} = {},
@@ -738,7 +740,10 @@ describe("subagent spend cell", () => {
 			uiServices: {
 				// The real seam: InteractiveMode reads the settings manager and the model
 				// registry from here.
-				settingsManager: { getSubagentSpendCellEnabled: () => options.spendCellEnabled ?? true },
+				settingsManager: {
+					getSubagentSpendCellEnabled: () => options.spendCellEnabled ?? true,
+					getSubagentSpendCellIntervalMs: () => options.intervalMs ?? 15_000,
+				},
 				modelRegistry: { find: vi.fn(() => (options.modelCost ? { cost: options.modelCost } : undefined)) },
 			},
 			agentConnection: { getContextTree },
@@ -842,6 +847,74 @@ describe("subagent spend cell", () => {
 			await vi.advanceTimersByTimeAsync(60_000);
 			expect(suspended.getContextTree).not.toHaveBeenCalled();
 			expect(suspended.setSpend).toHaveBeenCalledWith(undefined);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("catches a stale figure up on the next event instead of waiting out the tick", async () => {
+		vi.useFakeTimers();
+		try {
+			// The tick is stubbed so the count is the event-driven cadence alone.
+			const { mode, getContextTree, update } = createSpendMode({
+				stubIdleTick: true,
+				contextTree: tree(usage(1_000, 500, 0.5), [agent("sub-1", usage(2_000, 1_000, 1.2), undefined)]),
+			});
+
+			// First sight of a family fills the cell in.
+			update.call(mode, child("worker", "running"));
+			await vi.advanceTimersByTimeAsync(600);
+			expect(getContextTree).toHaveBeenCalledTimes(1);
+
+			// While the figure is inside its cadence, events still scan nothing.
+			await vi.advanceTimersByTimeAsync(10_000);
+			update.call(mode, child("worker", "running", { activity: { kind: "executing" } }));
+			await vi.advanceTimersByTimeAsync(600);
+			expect(getContextTree).toHaveBeenCalledTimes(1);
+
+			// Past it, the very next event catches up - no timer-driven scan is added -
+			// and the age it just reset is what rations the following events.
+			await vi.advanceTimersByTimeAsync(5_000);
+			update.call(mode, child("worker", "running", { activity: { kind: "writing" } }));
+			await vi.advanceTimersByTimeAsync(0);
+			expect(getContextTree).toHaveBeenCalledTimes(2);
+			update.call(mode, child("worker", "running", { activity: { kind: "executing" } }));
+			await vi.advanceTimersByTimeAsync(600);
+			expect(getContextTree).toHaveBeenCalledTimes(2);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("follows ui.subagentSpendCell.intervalMs for the idle tick", async () => {
+		vi.useFakeTimers();
+		try {
+			const { mode, getContextTree, update } = createSpendMode({
+				intervalMs: 5_000,
+				contextTree: tree(usage(1_000, 500, 0.5), [agent("sub-1", usage(2_000, 1_000, 1.2), undefined)]),
+			});
+			const scanStamps: number[] = [];
+			const implementation = getContextTree.getMockImplementation() as () => Promise<ContextTreeNode>;
+			getContextTree.mockImplementation(async () => {
+				scanStamps.push(Date.now());
+				return await implementation();
+			});
+
+			update.call(mode, child("worker", "running"));
+			await vi.advanceTimersByTimeAsync(600);
+			expect(scanStamps).toHaveLength(1);
+
+			// Twenty seconds at a 5s cadence: four more ticks. The tick is anchored to when it
+			// was armed, so the first gap is shortened by the leading fill's debounce; from the
+			// second tick on, every gap is the configured cadence.
+			await vi.advanceTimersByTimeAsync(20_000);
+			expect(scanStamps).toHaveLength(5);
+			const tickGaps = scanStamps.slice(2).map((stamp, index) => stamp - scanStamps[index + 1]);
+			expect(tickGaps).toHaveLength(3);
+			for (const gap of tickGaps) {
+				expect(gap).toBeGreaterThanOrEqual(4_950);
+				expect(gap).toBeLessThanOrEqual(5_050);
+			}
 		} finally {
 			vi.useRealTimers();
 		}

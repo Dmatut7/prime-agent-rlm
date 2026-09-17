@@ -843,6 +843,58 @@ describe("SettingsManager", () => {
 			expect(SettingsManager.create(projectDir, agentDir).getSubagentSpendCellEnabled()).toBe(false);
 		});
 
+		it("bounds the cadence, defaulting anything that is not a number", () => {
+			const interval = (ui: unknown): number => {
+				writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ ui }));
+				return SettingsManager.create(projectDir, agentDir).getSubagentSpendCellIntervalMs();
+			};
+
+			// Absent, boolean and object forms: the boolean is enabled, not a cadence.
+			expect(interval({})).toBe(15_000);
+			expect(interval({ subagentSpendCell: true })).toBe(15_000);
+			expect(interval({ subagentSpendCell: {} })).toBe(15_000);
+			expect(interval({ subagentSpendCell: { intervalMs: 30_000 } })).toBe(30_000);
+
+			// Out of range clamps to the bound; an unusable value falls back, never throws.
+			const cases: [unknown, number, boolean][] = [
+				[1, 5_000, true],
+				[5_000, 5_000, true],
+				[120_000, 120_000, true],
+				[999_999, 120_000, true],
+				[7_000.9, 7_000, true],
+				["30000", 15_000, true],
+				[Number.NaN, 15_000, true],
+				[Number.POSITIVE_INFINITY, 15_000, true],
+			];
+			for (const [configured, expected, stillEnabled] of cases) {
+				writeFileSync(
+					join(agentDir, "settings.json"),
+					JSON.stringify({ ui: { subagentSpendCell: { intervalMs: configured } } }),
+				);
+				const manager = SettingsManager.create(projectDir, agentDir);
+				expect(manager.getSubagentSpendCellIntervalMs()).toBe(expected);
+				// A cadence block is a tuning, not an opt-out.
+				expect(manager.getSubagentSpendCellEnabled()).toBe(stillEnabled);
+			}
+			// The opt-out still reads as one, whatever the block would have said.
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ ui: { subagentSpendCell: false } }));
+			expect(SettingsManager.create(projectDir, agentDir).getSubagentSpendCellEnabled()).toBe(false);
+		});
+
+		it("writes a cadence to the global file and knows the nested key", async () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setSubagentSpendCellIntervalMs(30_000);
+			await manager.flush();
+
+			const saved = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8"));
+			expect(saved.ui).toEqual({ subagentSpendCell: { intervalMs: 30_000 } });
+			// The nested name is registered; a typo inside the block still reports.
+			expect(collectUnknownSettingsKeys({ ui: { subagentSpendCell: { intervalMs: 30_000 } } })).toEqual([]);
+			expect(collectUnknownSettingsKeys({ ui: { subagentSpendCell: { interval: 30_000 } } })).toEqual([
+				"ui.subagentSpendCell.interval",
+			]);
+		});
+
 		it("writes the opt-out to the global file and knows the key", async () => {
 			const manager = SettingsManager.create(projectDir, agentDir);
 			manager.setSubagentSpendCellEnabled(false);
