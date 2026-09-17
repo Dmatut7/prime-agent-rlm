@@ -26,11 +26,16 @@ if child is not None:
 
 ## API
 
+Family discovery has one directory and two entries: `await agent_observe.list_agents()` returns it as `agents` rows, each carrying `relationship` with live detail for a resident member and persisted facts otherwise, and `await agent_message.list_agents()` returns the same members in its legacy `current`/`entries` shape.
+
 - `await agent_message.list_agents()` — returns `current` (`name`, `id`, `depth`)
   and family-scoped `entries` (`relationship`, `name`, `id`, `depth`, `status`)
   for the current agent's parent, siblings, and children. It includes inactive
   family members and sorts parent, siblings by name, then children by name; it
-  does not expose a global daemon session list.
+  does not expose a global daemon session list. It is the legacy shape of the one
+  family directory, so its members, their `relationship`, their order, and their
+  coarse `status` (`running`/`idle`/`inactive`) are exactly what
+  `await agent_observe.list_agents()` reports.
 - `await agent_message.send(message, receiver_role="parent" | "sibling" | "child", receiver_name=None)` — sends one direct
   text message to an active session. Sending to an idle completed subagent
   starts an ordinary follow-up turn in that same child session and context.

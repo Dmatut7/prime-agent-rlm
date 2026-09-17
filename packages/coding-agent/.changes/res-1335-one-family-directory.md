@@ -1,0 +1,2 @@
+- Changed `agent_observe.list_agents()` into the one family directory: it now lists every member `agent_message` can reach, active or not, and each row carries its `relationship`.
+- Changed `agent_message.list_agents()` to read that same directory, so the two discovery entry points report the same family members in the same order.

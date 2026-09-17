@@ -95,6 +95,15 @@ export interface AgentFamilyCatalogEntry {
 	parentSessionId?: string;
 	parentSessionPath?: string;
 	sessionPath?: string;
+	/** Working directory: live for a resident session, persisted for one read from disk. */
+	cwd?: string;
+	/** RLM child registry id, set when this member is a spawned subagent. */
+	rlmChildId?: string;
+	/** Set only for peers live in another worker; a local member reads residency directly. */
+	activeSessionId?: string;
+	/** Persisted transcript facts, known only for entries read from disk. */
+	messageCount?: number;
+	firstMessage?: string;
 }
 
 export interface AgentFamilyRosterEntry {
@@ -109,6 +118,26 @@ export interface AgentFamilyRosterEntry {
 export interface AgentFamilyRosterResult {
 	current: { name: string; id: string; depth: number };
 	entries: AgentFamilyRosterEntry[];
+}
+
+/**
+ * One family member as the catalog holds it: the membership decision (relationship)
+ * paired with the catalog entry itself, so a caller keeps every persisted and live
+ * field instead of the flat projection a roster row needs.
+ */
+export interface AgentFamilyMember {
+	relationship: AgentFamilyRelationship;
+	entry: AgentFamilyCatalogEntry;
+}
+
+/**
+ * The one family directory: this agent's own row plus the members it can reach. Both
+ * discovery entry points read it - `agent_observe.list_agents()` renders it directly and
+ * `agent_message.list_agents()` returns the same members in its legacy roster shape.
+ */
+export interface AgentFamilyDirectory {
+	current: { name: string; id: string; depth: number };
+	members: AgentFamilyMember[];
 }
 
 export interface AgentSessionNameScope {
@@ -293,40 +322,60 @@ export function assertAgentSessionNameAvailable(
 	}
 }
 
-export function buildAgentFamilyRoster(
+/**
+ * Decide family membership once, from the catalog that `send` already resolves targets
+ * against: parent, then same-depth siblings under the same parent, then this agent's own
+ * children, siblings and children ordered by name so two calls in one turn agree.
+ */
+export function selectAgentFamilyDirectory(
 	current: AgentFamilyCatalogEntry,
 	catalog: readonly AgentFamilyCatalogEntry[],
-): AgentFamilyRosterResult {
+): AgentFamilyDirectory {
 	const parent = catalog.find((entry) => isAgentFamilyParent(entry, current));
 	const siblings = catalog.filter(
 		(entry) =>
 			entry.id !== current.id && entry.depth === current.depth && sameAgentFamilyParent(entry, current, catalog),
 	);
 	const children = catalog.filter((entry) => entry.depth === current.depth + 1 && isAgentFamilyParent(current, entry));
-	const row = (relationship: AgentFamilyRelationship, entry: AgentFamilyCatalogEntry): AgentFamilyRosterEntry => ({
-		relationship,
-		name: entry.name ?? entry.id,
-		id: entry.id,
-		depth: entry.depth,
-		status: entry.status,
-		...(relationship === "child" && entry.repliedSinceTask !== undefined
-			? { repliedSinceTask: entry.repliedSinceTask }
-			: {}),
-	});
+	const byName = (a: AgentFamilyCatalogEntry, b: AgentFamilyCatalogEntry) =>
+		agentFamilyMemberName(a).localeCompare(agentFamilyMemberName(b));
 	return {
-		current: {
-			name: current.name ?? current.id,
-			id: current.id,
-			depth: current.depth,
-		},
-		entries: [
-			...(parent ? [row("parent", parent)] : []),
-			...siblings
-				.sort((a, b) => (a.name ?? a.id).localeCompare(b.name ?? b.id))
-				.map((entry) => row("sibling", entry)),
-			...children.sort((a, b) => (a.name ?? a.id).localeCompare(b.name ?? b.id)).map((entry) => row("child", entry)),
+		current: { name: agentFamilyMemberName(current), id: current.id, depth: current.depth },
+		members: [
+			...(parent ? [{ relationship: "parent" as const, entry: parent }] : []),
+			...siblings.sort(byName).map((entry) => ({ relationship: "sibling" as const, entry })),
+			...children.sort(byName).map((entry) => ({ relationship: "child" as const, entry })),
 		],
 	};
+}
+
+/** The name a row shows for a member: its session name, falling back to its session id. */
+export function agentFamilyMemberName(entry: AgentFamilyCatalogEntry): string {
+	return entry.name ?? entry.id;
+}
+
+/** The `agent_message.list_agents()` shape of a directory: same members, flat rows. */
+export function buildAgentFamilyRosterFromDirectory(directory: AgentFamilyDirectory): AgentFamilyRosterResult {
+	return {
+		current: directory.current,
+		entries: directory.members.map((member) => ({
+			relationship: member.relationship,
+			name: agentFamilyMemberName(member.entry),
+			id: member.entry.id,
+			depth: member.entry.depth,
+			status: member.entry.status,
+			...(member.relationship === "child" && member.entry.repliedSinceTask !== undefined
+				? { repliedSinceTask: member.entry.repliedSinceTask }
+				: {}),
+		})),
+	};
+}
+
+export function buildAgentFamilyRoster(
+	current: AgentFamilyCatalogEntry,
+	catalog: readonly AgentFamilyCatalogEntry[],
+): AgentFamilyRosterResult {
+	return buildAgentFamilyRosterFromDirectory(selectAgentFamilyDirectory(current, catalog));
 }
 
 function classifyAgentSessionNameParent(

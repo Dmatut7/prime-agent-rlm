@@ -27,8 +27,8 @@ import {
 	AGENT_FAMILY_REACH_ERROR,
 	AGENT_MESSAGE_SOURCE,
 	type AgentFamilyCatalogEntry,
+	type AgentFamilyDirectory,
 	type AgentFamilyRelationship,
-	type AgentFamilyRosterResult,
 	type AgentMessageQueuedReason,
 	type AgentSessionMessageAgentSummary,
 	type AgentSessionMessageController,
@@ -44,7 +44,7 @@ import {
 	assertAgentFamilyReach,
 	assertAgentSessionNameAvailable,
 	assertDirectAgentMessageTarget,
-	buildAgentFamilyRoster,
+	buildAgentFamilyRosterFromDirectory,
 	createAgentSessionMessage,
 	createAgentSessionMessageId,
 	createAgentSessionMessageReceipt,
@@ -55,15 +55,18 @@ import {
 	formatAgentMessageQueuedNotice,
 	formatAgentSessionNameUnavailable,
 	normalizeAgentSessionMessage,
+	selectAgentFamilyDirectory,
 	sessionNameReservationKey,
 } from "../../core/agent-messages.js";
 import {
+	AGENT_OBSERVE_PREVIEW_MAX_CHARS,
 	type AgentObserveAgentSnapshot,
 	type AgentObserveAgentSummary,
 	type AgentObserveController,
 	type AgentObserveListResult,
 	type AgentObserveRecentMessagesInput,
 	type AgentObserveRecentMessagesResult,
+	createAgentObserveFamilyList,
 	createAgentObserveMessagePreview,
 	normalizeObserveLimit,
 	normalizeObserveMaxChars,
@@ -3413,7 +3416,13 @@ export class AgentDaemon {
 		};
 		return {
 			listAgents: () => this.createAgentMessageListResult(requireCurrentState()),
-			roster: () => this.createAgentFamilyRoster(requireCurrentState()),
+			// One directory, two entries: this roster is the observe-owned family directory
+			// (the very call `agent_observe.list_agents()` renders), projected into the legacy
+			// roster shape so every existing caller keeps working unchanged.
+			roster: async () =>
+				buildAgentFamilyRosterFromDirectory(
+					await this.createAgentObserveController(requireCurrentState).familyDirectory!(),
+				),
 			assertSessionNameAvailable: (input) => this.assertFamilySessionNameAvailable(input),
 			setSessionName: (name) => this.setStateSessionNameViaSupervisor(requireCurrentState(), name),
 			sendAgentMessage: (input) =>
@@ -3436,56 +3445,28 @@ export class AgentDaemon {
 		};
 		return {
 			listAgents: () => this.createAgentObserveListResult(requireCurrentState()),
+			familyDirectory: () => this.createAgentFamilyDirectory(requireCurrentState()),
 			getAgent: (target) => this.createAgentObserveAgentSnapshot(requireCurrentState(), target),
 			recentMessages: (input) => this.createAgentObserveRecentMessages(requireCurrentState(), input),
 		};
 	}
 
 	private async createAgentObserveListResult(currentState: ActiveSessionState): Promise<AgentObserveListResult> {
-		const agents = this.listTargetableSessionStates(currentState)
-			.filter(
-				(state) =>
-					state.activeSessionId === currentState.activeSessionId ||
-					this.isAgentFamilyReachable(currentState, state),
-			)
-			.map((state) => this.createAgentObserveSummary(state, currentState));
-		const residentIds = new Set(agents.map((agent) => agent.activeSessionId));
-		for (const passive of await this.listPassiveRlmSubagents()) {
-			if (residentIds.has(passive.info.id)) continue;
-			try {
-				assertAgentFamilyReach(this.agentFamilyEntry(currentState), this.passiveAgentFamilyEntry(passive));
-			} catch (error) {
-				if (error instanceof Error && error.message === AGENT_FAMILY_REACH_ERROR) continue;
-				throw error;
-			}
-			agents.push({
-				activeSessionId: passive.info.id,
-				sessionId: passive.info.id,
-				sessionName: passive.info.name ?? passive.entry.sessionName,
-				runtimeKind: "subagent",
-				cwd: passive.info.cwd,
-				status: "idle",
-				isCurrent: false,
-				isStreaming: false,
-				isCompacting: false,
-				attachedClients: 0,
-				messageCount: passive.info.messageCount,
-				queuedCount: 0,
-				isSessionActive: false,
-				...(passive.chain.length === 1 && passive.rootParentState
-					? { parentActiveSessionId: passive.rootParentState.activeSessionId }
-					: {}),
-				parentSessionId: passive.entry.parentSessionId,
-				rlmChildId: passive.entry.childId,
-				...(passive.entry.rlmParentNodeId ? { rlmParentNodeId: passive.entry.rlmParentNodeId } : {}),
-				...(passive.info.firstMessage ? { firstMessage: passive.info.firstMessage } : {}),
-			});
-			residentIds.add(passive.info.id);
-		}
-		return {
+		// Membership comes from the one family directory that `send` resolves targets
+		// against, so the observe list and the agent_message roster cannot disagree. A
+		// member with no live session here still gets a row, reported from persisted facts.
+		const directory = await this.createAgentFamilyDirectory(currentState);
+		const residentBySessionId = new Map(
+			this.listTargetableSessionStates(currentState).map((state) => [state.runtime.session.sessionId, state]),
+		);
+		return createAgentObserveFamilyList({
 			current: this.createAgentObserveSummary(currentState, currentState),
-			agents,
-		};
+			directory,
+			liveSummary: (member) => {
+				const state = residentBySessionId.get(member.entry.id);
+				return state ? this.createAgentObserveSummary(state, currentState) : undefined;
+			},
+		});
 	}
 
 	private async createAgentObserveAgentSnapshot(
@@ -3560,7 +3541,11 @@ export class AgentDaemon {
 			...(summary.firstMessage ? { firstMessage: summary.firstMessage } : {}),
 			...(latest
 				? {
-						latestMessage: createAgentObserveMessagePreview(latest, messages.length - 1, 240),
+						latestMessage: createAgentObserveMessagePreview(
+							latest,
+							messages.length - 1,
+							AGENT_OBSERVE_PREVIEW_MAX_CHARS,
+						),
 					}
 				: {}),
 		};
@@ -5977,10 +5962,16 @@ export class AgentDaemon {
 					depth: info.rlmDepth ?? 0,
 					status: "inactive",
 					sessionPath: canonicalSessionPath(info.path),
+					cwd: info.cwd,
+					// Persisted counts only: a saved root's opening prompt stays off the wire,
+					// or one roster reply would carry the first message of every saved session.
+					messageCount: info.messageCount,
 				}),
 			);
 		const byId = new Map<string, AgentFamilyCatalogEntry>(savedRoots.map((entry) => [entry.id, entry]));
-		const addAgent = (agent: AgentSessionMessageAgentSummary) => {
+		// `remote` peers live in another worker: their active id stays routable, while a
+		// local summary's stand-in id for a passive child is not an active session.
+		const addAgent = (agent: AgentSessionMessageAgentSummary, remote = false) => {
 			const depth = agent.rlmDepth ?? 0;
 			byId.set(agent.sessionId, {
 				id: agent.sessionId,
@@ -5999,9 +5990,12 @@ export class AgentDaemon {
 					? { parentSessionPath: canonicalSessionPath(agent.parentSessionPath) }
 					: {}),
 				...(agent.sessionPath ? { sessionPath: canonicalSessionPath(agent.sessionPath) } : {}),
+				...(agent.rlmChildId ? { rlmChildId: agent.rlmChildId } : {}),
+				...(remote ? { activeSessionId: agent.activeSessionId } : {}),
+				cwd: agent.cwd,
 			});
 		};
-		for (const peer of remotePeers) addAgent(peer);
+		for (const peer of remotePeers) addAgent(peer, true);
 		for (const agent of localAgents) addAgent(agent);
 		for (const state of this.sessions.values()) {
 			const entry = byId.get(state.runtime.session.sessionId);
@@ -6010,16 +6004,24 @@ export class AgentDaemon {
 		}
 		for (const passive of await this.listPassiveRlmSubagents()) {
 			const entry = byId.get(passive.info.id);
-			if (entry) entry.sessionPath = canonicalSessionPath(passive.entry.sessionFile);
+			if (!entry) continue;
+			entry.sessionPath = canonicalSessionPath(passive.entry.sessionFile);
+			entry.messageCount = passive.info.messageCount;
+			entry.firstMessage = passive.info.firstMessage;
 		}
 		return [...byId.values()];
 	}
 
-	private async createAgentFamilyRoster(currentState: ActiveSessionState): Promise<AgentFamilyRosterResult> {
+	/**
+	 * The one family directory: membership plus relationship, relative to the session that
+	 * asked. `agent_observe.list_agents()` renders it and `agent_message`'s roster projects
+	 * it, so both discovery entry points read one construction.
+	 */
+	private async createAgentFamilyDirectory(currentState: ActiveSessionState): Promise<AgentFamilyDirectory> {
 		const catalog = await this.createAgentFamilyCatalog(currentState);
 		const current = catalog.find((entry) => entry.id === currentState.runtime.session.sessionId);
 		if (!current) throw new Error("Current agent is missing from the family catalog");
-		return buildAgentFamilyRoster(current, catalog);
+		return selectAgentFamilyDirectory(current, catalog);
 	}
 
 	private async assertFamilySessionNameAvailable(

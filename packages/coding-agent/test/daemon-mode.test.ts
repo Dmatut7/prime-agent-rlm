@@ -3044,11 +3044,14 @@ describe("daemon mode helpers", () => {
 		const messaging = internals.createAgentMessageController(() => child);
 		const observe = internals.createAgentObserveController(() => child);
 
-		expect((await observe.listAgents()).agents.map((agent) => agent.activeSessionId)).toEqual([
-			"root",
-			"child",
-			"sibling",
-			"grandchild",
+		// One directory: the parent, the same-depth sibling, and this agent's own child. Self
+		// is `current`, and a cousin (a sibling's child) is not family-reachable.
+		const observed = await observe.listAgents();
+		expect(observed.current.activeSessionId).toBe("child");
+		expect(observed.agents.map((agent) => [agent.relationship, agent.activeSessionId])).toEqual([
+			["parent", "root"],
+			["sibling", "sibling"],
+			["child", "grandchild"],
 		]);
 		await expect(observe.getAgent("cousin")).rejects.toThrow(
 			"Agent reach is limited to parent, siblings, and children",
@@ -4537,16 +4540,23 @@ describe("daemon mode helpers", () => {
 				}
 			).createAgentObserveController(() => parentState);
 			const observedAgents = await observeController.listAgents();
+			// A passive child has no live session here, so its row reports persisted facts
+			// only: no active session id, no depth, and the catalog's own status.
 			expect(observedAgents.agents).toContainEqual(
 				expect.objectContaining({
-					activeSessionId: expect.any(String),
+					relationship: "child",
 					sessionName: "renamed-worker",
 					runtimeKind: "subagent",
-					status: "idle",
+					status: "inactive",
 					messageCount: 1,
 					rlmChildId: fixture.childId,
 				}),
 			);
+			expect(observedAgents.agents.find((agent) => agent.sessionName === "renamed-worker")).not.toHaveProperty(
+				"activeSessionId",
+			);
+			// A grandchild is outside the nuclear family, so neither entry lists it.
+			expect(observedAgents.agents.map((agent) => agent.sessionName)).not.toContain("nested-worker");
 			expect(fixture.createRuntime).toHaveBeenCalledOnce();
 
 			const messageController = internals.createAgentMessageController(() => parentState);
@@ -4556,6 +4566,12 @@ describe("daemon mode helpers", () => {
 					expect.objectContaining({ relationship: "child", name: "renamed-worker", depth: 1, status: "inactive" }),
 				],
 			});
+			// The two discovery entry points render one family directory: the legacy roster
+			// and the observe list agree on every member, its relationship and its status.
+			const legacyRoster = await messageController.roster?.();
+			expect(observedAgents.agents.map((agent) => [agent.relationship, agent.sessionName, agent.status])).toEqual(
+				legacyRoster?.entries.map((entry) => [entry.relationship, entry.name, entry.status]),
+			);
 			await expect(
 				messageController.assertSessionNameAvailable?.({
 					name: "renamed-worker",

@@ -1,23 +1,30 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentFamilyDirectory, AgentFamilyMember, AgentFamilyRelationship } from "./agent-messages.js";
 
 export const AGENT_OBSERVE_SKILL_NAME = "agent-observe";
 export const AGENT_OBSERVE_IMPORT_NAME = "agent_observe";
 export const ORCHESTRATION_HEARTBEAT_SKILL_NAME = "orchestration-heartbeat";
+/** Shared cap for the message previews a roster row carries. */
+export const AGENT_OBSERVE_PREVIEW_MAX_CHARS = 240;
 
 export interface AgentObserveAgentSummary {
-	activeSessionId: string;
+	/** Absent for a family member that has no live session in this daemon. */
+	activeSessionId?: string;
 	sessionId: string;
 	sessionName?: string;
+	/** Absent for the current agent: self is not one of its own family members. */
+	relationship?: AgentFamilyRelationship;
 	runtimeKind?: "top-level" | "subagent";
-	cwd: string;
+	cwd?: string;
 	status: string;
 	isCurrent: boolean;
 	isStreaming: boolean;
 	isCompacting: boolean;
 	attachedClients: number;
-	messageCount: number;
+	messageCount?: number;
 	queuedCount: number;
 	isSessionActive: boolean;
+	repliedSinceTask?: boolean;
 	parentActiveSessionId?: string;
 	parentSessionId?: string;
 	rlmChildId?: string;
@@ -61,6 +68,12 @@ export interface AgentObserveMessagePreview {
 
 export interface AgentObserveController {
 	listAgents(): AgentObserveListResult | Promise<AgentObserveListResult>;
+	/**
+	 * The one family directory behind `listAgents()`: membership and relationship for this
+	 * agent's family. `agent_message`'s roster is built from this same call, so the two
+	 * discovery entry points cannot disagree about who is reachable.
+	 */
+	familyDirectory?(): AgentFamilyDirectory | Promise<AgentFamilyDirectory>;
 	getAgent(target: string): AgentObserveAgentSnapshot | Promise<AgentObserveAgentSnapshot>;
 	recentMessages(
 		input: AgentObserveRecentMessagesInput,
@@ -86,6 +99,62 @@ export function createAgentObserveHostHandlers(controller: AgentObserveControlle
 				maxChars: normalizeOptionalInteger(payload.max_chars ?? payload.maxChars, "agent_observe.recent max_chars"),
 			})) as unknown as Record<string, unknown>;
 		},
+	};
+}
+
+/**
+ * A family member with no live session in this daemon: only the persisted catalog facts
+ * are known, so its runtime flags read false and its previews stay capped. A peer live in
+ * another worker is not one of those, so it keeps the active session id its summary reports.
+ */
+export function createPersistedAgentObserveSummary(member: AgentFamilyMember): AgentObserveAgentSummary {
+	const entry = member.entry;
+	return {
+		...(entry.activeSessionId ? { activeSessionId: entry.activeSessionId } : {}),
+		sessionId: entry.id,
+		...(entry.name ? { sessionName: entry.name } : {}),
+		relationship: member.relationship,
+		runtimeKind: entry.depth > 0 ? "subagent" : "top-level",
+		...(entry.cwd ? { cwd: entry.cwd } : {}),
+		status: entry.status,
+		isCurrent: false,
+		isStreaming: false,
+		isCompacting: false,
+		attachedClients: 0,
+		...(entry.messageCount !== undefined ? { messageCount: entry.messageCount } : {}),
+		queuedCount: 0,
+		isSessionActive: entry.status === "running",
+		...(entry.repliedSinceTask !== undefined ? { repliedSinceTask: entry.repliedSinceTask } : {}),
+		...(entry.parentSessionId ? { parentSessionId: entry.parentSessionId } : {}),
+		...(entry.rlmChildId ? { rlmChildId: entry.rlmChildId } : {}),
+		...(entry.firstMessage ? { firstMessage: entry.firstMessage.slice(0, AGENT_OBSERVE_PREVIEW_MAX_CHARS) } : {}),
+	};
+}
+
+/**
+ * Render the one family directory as the observe list. A member resident in this daemon
+ * keeps its live summary, annotated with the relationship a caller needs to address it;
+ * every other member is reported from persisted facts only. The rows follow the directory
+ * order, so the list is a snapshot of the same membership `agent_message.list_agents()`
+ * returns in its legacy shape.
+ */
+export function createAgentObserveFamilyList(input: {
+	current: AgentObserveAgentSummary;
+	directory: AgentFamilyDirectory;
+	/** Live summary for a member resident here, or undefined when it has no session here. */
+	liveSummary?: (member: AgentFamilyMember) => AgentObserveAgentSummary | undefined;
+}): AgentObserveListResult {
+	return {
+		current: input.current,
+		agents: input.directory.members.map((member) => {
+			const live = input.liveSummary?.(member);
+			if (!live) return createPersistedAgentObserveSummary(member);
+			return {
+				...live,
+				relationship: member.relationship,
+				...(member.entry.repliedSinceTask !== undefined ? { repliedSinceTask: member.entry.repliedSinceTask } : {}),
+			};
+		}),
 	};
 }
 
