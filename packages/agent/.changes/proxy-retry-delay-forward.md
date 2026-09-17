@@ -1,0 +1,1 @@
+- Fixed `streamProxy()` to forward `maxRetryDelayMs` again, so the retry-delay cap configured through settings still reaches proxied providers.

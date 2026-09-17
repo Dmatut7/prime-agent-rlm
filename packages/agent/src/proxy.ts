@@ -57,6 +57,12 @@ type ProxySerializableStreamOptions = Pick<
 	| "metadata"
 	| "transport"
 	| "thinkingBudgets"
+	// Fork delta: upstream removed this agent option outright, while this fork still
+	// declares and uses it (packages/ai/src/types.ts retry cap chain: settings
+	// retry.provider.maxRetryDelayMs -> Agent options -> stream options). Any caller
+	// that uses streamProxy() as its streamFn must keep forwarding it, or the cap is
+	// silently dropped at the proxy hop. See absorption-audit-B ④ / A1.
+	| "maxRetryDelayMs"
 >;
 
 export interface ProxyStreamOptions extends ProxySerializableStreamOptions {
@@ -95,6 +101,7 @@ function buildProxyRequestOptions(options: ProxyStreamOptions): ProxySerializabl
 		metadata: options.metadata,
 		transport: options.transport,
 		thinkingBudgets: options.thinkingBudgets,
+		maxRetryDelayMs: options.maxRetryDelayMs,
 	};
 }
 
