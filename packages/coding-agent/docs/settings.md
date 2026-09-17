@@ -207,7 +207,7 @@ watchdog counts time since the last observed session activity:
 |---------|------|---------|-------------|
 | `stallWatchdog.enabled` | boolean | `true` | Enable the session stall watchdog |
 | `stallWatchdog.warnAfterSeconds` | number | `300` | Warn (and log diagnostics) after this many silent seconds (5 min) |
-| `stallWatchdog.abortAfterSeconds` | number | `900` | Automatically abort the current turn after this many silent seconds (15 min). Set to `0` for warn-only mode |
+| `stallWatchdog.abortAfterSeconds` | number | `0` | Automatically abort the current turn after this many silent seconds. The default `0` is warn-only: the silence is reported and nothing is interrupted. Set a positive value (it must exceed `warnAfterSeconds`) to opt into the automatic abort |
 | `stallWatchdog.toolLivenessExemption` | boolean | `true` | Defer the automatic abort while kernel/host facts vouch that externally owned work is in flight. The warning still fires; only the abort escalation is deferred, and only within a bounded budget |
 | `stallWatchdog.treatKernelCpuProgressAsActivity` | boolean | `false` | Reserved, no effect yet: treating kernel CPU progress as session activity is a pending product decision. Registered so the key round-trips without a schema change later |
 
@@ -215,11 +215,21 @@ When the warn stage fires, Prime Agent writes a diagnostics snapshot (last
 event type/time, in-flight tool calls, input-pump state, unfinished queued
 actions, and — when a kernel is attached — the exemption budget and the kernel
 liveness segment) to the structured agent log and shows a warning. If silence
-reaches `abortAfterSeconds`, the turn is aborted automatically so the session
-becomes usable again instead of appearing busy forever; the abort behaves like
-pressing Escape. With `abortAfterSeconds` set to `0` nothing is aborted, and the
-warning says exactly that instead of naming a deadline, because the only way
-back is interrupting the turn by hand.
+reaches a positive `abortAfterSeconds`, the turn is aborted automatically so the
+session becomes usable again instead of appearing busy forever; the abort behaves
+like pressing Escape.
+
+With the default `abortAfterSeconds: 0` nothing is aborted, and the warning says
+exactly that instead of naming a deadline. That is the intended default: silence is
+the normal state of legitimate long work — a quiet build, a cell awaiting a long
+job, a subprocess that only reports at the end — and no allowlist of "observable
+work" is complete enough to tell it apart from a wedge, so an automatic abort
+kills real work. The warning is the signal instead, and it is routed to whoever can
+judge: for a subagent it is delivered into the parent agent's transcript with the
+silent duration, the in-flight tools and any evidence of work in flight, so the
+parent can let it run or cancel it with `rlm.delete_subagent`. A session that is
+genuinely wedged is recovered by interrupting the turn (Escape in the TUI), which
+is what the automatic abort used to do on a timer's guess.
 Phases that legitimately own the turn boundary (compaction,
 branch summaries, serialized refinement) pause escalation instead of counting
 against it.
@@ -252,11 +262,16 @@ legitimately long and silent should set `timeout` explicitly in the bash tool
   "stallWatchdog": {
     "enabled": true,
     "warnAfterSeconds": 300,
-    "abortAfterSeconds": 900,
+    "abortAfterSeconds": 0,
     "toolLivenessExemption": true
   }
 }
 ```
+
+Unattended fleets that would rather reclaim a wedged turn automatically than
+investigate it can opt back in with a long deadline, for example
+`"abortAfterSeconds": 3600`. The kill then also produces the parent-facing failure
+notice, which is the only signal a parent gets when the abort is what ended the run.
 
 To disable entirely: `{ "stallWatchdog": { "enabled": false } }`.
 

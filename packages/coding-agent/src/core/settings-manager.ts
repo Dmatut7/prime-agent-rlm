@@ -40,9 +40,22 @@ export const DEFAULT_STALL_WARN_AFTER_SECONDS = 300;
 
 /**
  * Session stall watchdog: abort the turn after this long without any session
- * activity. Must be greater than the warn threshold when both are enabled.
+ * activity. `0` - the default - is warn-only: report the silent turn, never abort it.
+ * A positive value must exceed the warn threshold.
+ *
+ * This fork's default used to be 900 (15 min). It changed because the abort held
+ * authority it cannot justify: silence is the normal state of legitimate long work (a
+ * quiet build, a cell awaiting a long job, a subprocess that only reports at the end),
+ * and the exemption allowlist that tried to tell silence apart from a wedge can never
+ * be complete, so real work was killed. Upstream has no session watchdog at all.
+ *
+ * The warn stage is what carries the signal now: it reaches the roster and, for a
+ * subagent, its parent's transcript, so the agent that owns the child can look at it
+ * and cancel it with `rlm.delete_subagent` when it really is wedged. A decision made by
+ * something that can see the work beats a timer that cannot. Set a positive value to
+ * opt back into the automatic abort.
  */
-export const DEFAULT_STALL_ABORT_AFTER_SECONDS = 900;
+export const DEFAULT_STALL_ABORT_AFTER_SECONDS = 0;
 
 /**
  * Bound on waiting for the shared kernel-venv bootstrap lock before the boot
@@ -170,15 +183,20 @@ export interface RetrySettings {
 /**
  * Last-resort protection against sessions that go quiet mid-turn (dead provider
  * stream, wedged tool, loop that never settles). While a turn is running, the
- * watchdog warns after `warnAfterSeconds` without any session event and aborts
- * the turn after `abortAfterSeconds`. Both thresholds count from the last
- * observed activity; timer escalations are deferred while compaction, branch
- * summaries, or serialized refinement own the turn boundary.
+ * watchdog warns after `warnAfterSeconds` without any session event, and aborts the
+ * turn after `abortAfterSeconds` when that is a positive value; the default `0` keeps
+ * it warn-only. Both thresholds count from the last observed activity; timer
+ * escalations are deferred while compaction, branch summaries, or serialized
+ * refinement own the turn boundary.
+ *
+ * A dead provider stream is handled separately and is unaffected by this setting:
+ * `retry.provider.streamStallTimeoutMs` aborts the stream itself and settles the turn
+ * with a retryable error.
  */
 export interface StallWatchdogSettings {
 	enabled?: boolean; // default: true
 	warnAfterSeconds?: number; // default: 300 (5 min silent => warning + diagnostics)
-	abortAfterSeconds?: number; // default: 900 (15 min silent => auto-abort); must exceed warnAfterSeconds
+	abortAfterSeconds?: number; // default: 0 (warn-only: report the silence, never abort); a positive value must exceed warnAfterSeconds
 	/**
 	 * Defer the auto-abort escalation while kernel/host facts vouch that externally
 	 * owned work is in flight (a live bash handle, an in-flight host request, a live

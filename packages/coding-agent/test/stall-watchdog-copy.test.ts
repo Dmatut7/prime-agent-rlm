@@ -58,10 +58,14 @@ describe("stall watchdog settings config (T1-4)", () => {
 	it("defaults match the settings-manager thresholds and gate the new keys", () => {
 		expect(DEFAULT_STALL_WATCHDOG_CONFIG.warnAfterSeconds).toBe(DEFAULT_STALL_WARN_AFTER_SECONDS);
 		expect(DEFAULT_STALL_WATCHDOG_CONFIG.abortAfterSeconds).toBe(DEFAULT_STALL_ABORT_AFTER_SECONDS);
+		// The fork default is warn-only: a silent turn is reported, never aborted. The
+		// automatic abort is opt-in via a positive abortAfterSeconds. Pinning the value
+		// here keeps the default a decision instead of an accident.
+		expect(DEFAULT_STALL_ABORT_AFTER_SECONDS).toBe(0);
 		expect(resolveStallWatchdogConfig(undefined)).toEqual({
 			enabled: true,
 			warnAfterSeconds: 300,
-			abortAfterSeconds: 900,
+			abortAfterSeconds: 0,
 			toolLivenessExemption: true,
 			// Reserved: registered so it round-trips, never read by the watchdog.
 			treatKernelCpuProgressAsActivity: false,
@@ -79,7 +83,7 @@ describe("stall watchdog settings config (T1-4)", () => {
 		expect(resolveStallWatchdogConfig({ enabled: false, toolLivenessExemption: false })).toEqual({
 			enabled: false,
 			warnAfterSeconds: 300,
-			abortAfterSeconds: 900,
+			abortAfterSeconds: 0,
 			toolLivenessExemption: false,
 			treatKernelCpuProgressAsActivity: false,
 		});
@@ -89,11 +93,14 @@ describe("stall watchdog settings config (T1-4)", () => {
 describe("stall watchdog copy (T1-4)", () => {
 	it("leaves the unexempted warn copy byte-identical to the production string", () => {
 		const silentSeconds = 300;
-		const expected = `Possible stall: no session activity for ${silentSeconds}s while a turn is running. If nothing recovers, the turn will be aborted automatically after ${DEFAULT_STALL_ABORT_AFTER_SECONDS}s of silence. If a tool appears stuck, interrupt the turn manually to recover faster. This session runs without a daemon, so there is no daemon log to check. Stall diagnostics: ${WHERE}.`;
+		// An explicit deadline, not the default: the fork default is warn-only (0), which
+		// has its own copy and its own case below.
+		const abortAfterSeconds = 900;
+		const expected = `Possible stall: no session activity for ${silentSeconds}s while a turn is running. If nothing recovers, the turn will be aborted automatically after ${abortAfterSeconds}s of silence. If a tool appears stuck, interrupt the turn manually to recover faster. This session runs without a daemon, so there is no daemon log to check. Stall diagnostics: ${WHERE}.`;
 		expect(
 			buildStallWarnMessage({
 				silentMs: 300_000,
-				abortAfterSeconds: DEFAULT_STALL_ABORT_AFTER_SECONDS,
+				abortAfterSeconds,
 				diagnosticsPointer: testPointer,
 			}),
 		).toBe(expected);
