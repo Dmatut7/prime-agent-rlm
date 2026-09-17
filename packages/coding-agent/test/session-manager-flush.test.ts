@@ -13,6 +13,7 @@ import {
 	statSync,
 	symlinkSync,
 	type writeFileSync,
+	type writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -22,27 +23,33 @@ type ChmodSync = typeof chmodSync;
 type FchownSync = typeof fchownSync;
 type RenameSync = typeof renameSync;
 type WriteFileSync = typeof writeFileSync;
+type WriteSync = typeof writeSync;
 
 const fsMocks = vi.hoisted(() => ({
 	actualWriteFileSync: undefined as WriteFileSync | undefined,
+	actualWriteSync: undefined as WriteSync | undefined,
 	chmodSync: vi.fn<ChmodSync>(),
 	fchownSync: vi.fn<FchownSync>(),
 	renameSync: vi.fn<RenameSync>(),
 	writeFileSync: vi.fn<WriteFileSync>(),
+	writeSync: vi.fn<WriteSync>(),
 }));
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
 	fsMocks.actualWriteFileSync = actual.writeFileSync;
+	fsMocks.actualWriteSync = actual.writeSync;
 	fsMocks.chmodSync.mockImplementation(actual.chmodSync);
 	fsMocks.fchownSync.mockImplementation(actual.fchownSync);
 	fsMocks.renameSync.mockImplementation(actual.renameSync);
 	fsMocks.writeFileSync.mockImplementation(actual.writeFileSync);
+	fsMocks.writeSync.mockImplementation(actual.writeSync);
 	return {
 		...actual,
 		chmodSync: fsMocks.chmodSync,
 		fchownSync: fsMocks.fchownSync,
 		renameSync: fsMocks.renameSync,
 		writeFileSync: fsMocks.writeFileSync,
+		writeSync: fsMocks.writeSync,
 	};
 });
 
@@ -103,10 +110,13 @@ describe("SessionManager.flushNow", () => {
 		const tempPrefix = `.${basename(file)}.`;
 
 		mgr.appendMessage({ role: "user", content: "pending", timestamp: Date.now() });
-		fsMocks.writeFileSync.mockImplementationOnce((path, data, options) => {
-			fsMocks.actualWriteFileSync!(path, Buffer.from(String(data)).subarray(0, 12), options);
+		// The rewrite writes through writeAllSync/writeSync (upstream #2276), so
+		// the partial-write-then-fail injection rides on writeSync now: 12 bytes
+		// land, the write throws, and the finally must remove the temp.
+		fsMocks.writeSync.mockImplementationOnce(((fd: number, data: Buffer, offset = 0) => {
+			fsMocks.actualWriteSync!(fd, data, offset, 12);
 			throw new Error("disk full");
-		});
+		}) as unknown as WriteSync);
 
 		expect(() => mgr.flushNow()).toThrow("disk full");
 		expect(readFileSync(file)).toEqual(before);
@@ -305,10 +315,11 @@ function failNextOutcomeAppend(mgr: SessionManager, file: string): void {
 	};
 }
 
-const failAfterPartialTempWrite: WriteFileSync = (path, data, options) => {
-	fsMocks.actualWriteFileSync!(path, Buffer.from(String(data)).subarray(0, 12), options);
+/** Lands 12 bytes of the rewrite batch, then fails: the repair path must survive a torn temp. */
+const failAfterPartialTempWrite: WriteSync = ((fd: number, data: Buffer, offset = 0) => {
+	fsMocks.actualWriteSync!(fd, data, offset, 12);
 	throw new Error("repair failed");
-};
+}) as unknown as WriteSync;
 
 describe("SessionManager.appendCustomMessageEntryWithRollback", () => {
 	it("flushes rollback-aware value entries immediately", () => {
@@ -375,7 +386,7 @@ describe("SessionManager.appendCustomMessageEntryWithRollback", () => {
 	it("preserves old history when rollback repair fails", () => {
 		const { mgr, file, before } = createPersistedSessionForRollbackTest();
 		failNextOutcomeAppend(mgr, file);
-		fsMocks.writeFileSync.mockImplementationOnce(failAfterPartialTempWrite);
+		fsMocks.writeSync.mockImplementationOnce(failAfterPartialTempWrite);
 
 		expect(() => mgr.appendCustomMessageEntryWithRollback("test.outcome", "details", false)).toThrow("append failed");
 		expect(readFileSync(file).subarray(0, before.length)).toEqual(before);
@@ -384,7 +395,7 @@ describe("SessionManager.appendCustomMessageEntryWithRollback", () => {
 	it("repairs a torn tail on the next successful retry", () => {
 		const { mgr, file, before } = createPersistedSessionForRollbackTest();
 		failNextOutcomeAppend(mgr, file);
-		fsMocks.writeFileSync.mockImplementationOnce(failAfterPartialTempWrite);
+		fsMocks.writeSync.mockImplementationOnce(failAfterPartialTempWrite);
 		expect(() => mgr.appendCustomMessageEntryWithRollback("test.outcome", "details", false)).toThrow();
 
 		mgr.flushNow();

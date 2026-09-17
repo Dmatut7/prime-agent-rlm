@@ -16,7 +16,7 @@ import {
 	renameSync,
 	rmSync,
 	statSync,
-	writeFileSync,
+	writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, parse, resolve } from "node:path";
@@ -114,6 +114,27 @@ function isAlreadyExistsError(error: unknown): boolean {
 	return error instanceof Error && "code" in error && error.code === "EEXIST";
 }
 
+/**
+ * Write the whole payload, looping on short counts. A single fd write may
+ * return a short count without throwing (ENOSPC or a file-size limit does
+ * exactly that), and writeFileSync does not loop: a short write here would
+ * leave a torn line that the atomic-rename writers then promote to the target
+ * file, exactly the torn-tail corruption the open-time repair tolerates by
+ * dropping the line. A zero or negative count is a stall, not progress, so it
+ * throws instead of spinning (same discipline as event-log's writeAllSync).
+ */
+function writeAllSync(fd: number, data: string | Uint8Array, path: string): void {
+	const bytes = typeof data === "string" ? Buffer.from(data, "utf8") : Buffer.from(data);
+	let offset = 0;
+	while (offset < bytes.length) {
+		const written = writeSync(fd, bytes, offset, bytes.length - offset);
+		if (written <= 0) {
+			throw new Error(`Short write persisting ${path}`);
+		}
+		offset += written;
+	}
+}
+
 function openRegularFileNoSymlink(path: string, flags: number): number {
 	assertRegularFileNoSymlink(path);
 	const fd = openSync(path, flags | requireNoFollow(constants.O_NOFOLLOW) | NONBLOCK_FLAG);
@@ -205,7 +226,7 @@ export function ensurePrivateFile(path: string, initialContent = ""): void {
 				constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | requireNoFollow(constants.O_NOFOLLOW),
 				PRIVATE_FILE_MODE,
 			);
-			writeFileSync(fd, initialContent);
+			writeAllSync(fd, initialContent, path);
 			// open's mode is umask-masked; fix it while the writable fd is still open,
 			// before the O_RDONLY reopen below can EACCES on a mode-000 file.
 			setPrivateFileMode(fd, path, PRIVATE_FILE_MODE);
@@ -318,7 +339,7 @@ export function writePrivateFileAtomic(
 			constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | requireNoFollow(constants.O_NOFOLLOW),
 			PRIVATE_FILE_MODE,
 		);
-		writeFileSync(fd, content);
+		writeAllSync(fd, content, path);
 		// open's mode is umask-masked; enforce the exact private bits before the
 		// temp file can be renamed into place.
 		setPrivateFileMode(fd, tempPath, PRIVATE_FILE_MODE);
@@ -356,11 +377,11 @@ export function writePrivateFileAtomicLines(
 		for (const line of lines) {
 			batch += line;
 			if (batch.length >= WRITE_BATCH_CHARS) {
-				writeFileSync(fd, batch);
+				writeAllSync(fd, batch, path);
 				batch = "";
 			}
 		}
-		if (batch.length > 0) writeFileSync(fd, batch);
+		if (batch.length > 0) writeAllSync(fd, batch, path);
 		// open's mode is umask-masked; enforce the exact private bits before the
 		// temp file can be renamed into place.
 		setPrivateFileMode(fd, tempPath, PRIVATE_FILE_MODE);
@@ -399,7 +420,7 @@ export function appendPrivateFile(path: string, content: string, options: { priv
 		if (process.platform === "win32" || (stats.mode & 0o777) !== PRIVATE_FILE_MODE) {
 			setPrivateFileMode(fd, path, PRIVATE_FILE_MODE);
 		}
-		writeFileSync(fd, content);
+		writeAllSync(fd, content, path);
 	} finally {
 		closeSync(fd);
 	}

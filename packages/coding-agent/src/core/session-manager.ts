@@ -2224,6 +2224,15 @@ export class SessionManager {
 	private entryCount = 0;
 	private entryTailId: string | undefined;
 	/**
+	 * Flip-once cache for "this transcript contains an assistant message"
+	 * (upstream #2276): `_persist`'s no-assistant guard runs on every append and
+	 * must not rescan the whole entry list. `_pushIndexedEntry` flips it to true
+	 * and never back; every fileEntries replacement funnels through
+	 * `_buildIndex()` or `_rescanEntryStats()`, which recompute it, so the cache
+	 * can never go stale on rebuild, rollback, reset, branch or reopen.
+	 */
+	private hasAssistantEntry = false;
+	/**
 	 * Cached getSessionName() answer. The name only changes when a session_info
 	 * entry lands (or the transcript is rebuilt/reset), so reads - the roster
 	 * flush pays one per dirty row rebuild - must not re-filter and re-scan the
@@ -2622,7 +2631,9 @@ export class SessionManager {
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
 
-		const hasAssistant = this.fileEntries.some(isAssistantMessageEntry);
+		// Flip-once cache: the scan this replaced walked every entry on every
+		// append (O(n) per append on the suppressed pre-assistant path).
+		const hasAssistant = this.hasAssistantEntry;
 		// Position markers join session_state/session_info: they are written by the
 		// app rather than by a model turn and must be durable even in a session that
 		// has no assistant message yet, otherwise a rewind before the first answer
@@ -2697,6 +2708,9 @@ export class SessionManager {
 		this.byId.set(entry.id, entry);
 		this.entryCount += 1;
 		this.entryTailId = entry.id;
+		if (!this.hasAssistantEntry && isAssistantMessageEntry(entry)) {
+			this.hasAssistantEntry = true;
+		}
 		if (entry.type === "session_info") this.sessionNameDirty = true;
 	}
 
@@ -2711,6 +2725,10 @@ export class SessionManager {
 		}
 		this.entryCount = count;
 		this.entryTailId = tailId;
+		// The guard cache is only written here and in _pushIndexedEntry, and
+		// every fileEntries replacement funnels through _buildIndex() or this
+		// method, so one recompute keeps it exact for all of them at once.
+		this.hasAssistantEntry = this.fileEntries.some(isAssistantMessageEntry);
 		// A rebuilt, rolled-back or reset transcript may have gained, moved or lost
 		// its last session_info entry; the next read rescans instead of trusting the
 		// cache. Every fileEntries replacement funnels through _buildIndex() or here.
@@ -3907,8 +3925,9 @@ export class SessionManager {
 			// Otherwise defer to _persist(), which creates the file on the
 			// first assistant response, matching the newSession() contract
 			// and avoiding the duplicate-header bug when _persist()'s
-			// no-assistant guard later resets flushed to false.
-			const hasAssistant = this.fileEntries.some(isAssistantMessageEntry);
+			// no-assistant guard later resets flushed to false. The
+			// _buildIndex() above just recomputed the guard cache.
+			const hasAssistant = this.hasAssistantEntry;
 			if (hasAssistant) {
 				this._rewriteFile();
 				this.flushed = true;
