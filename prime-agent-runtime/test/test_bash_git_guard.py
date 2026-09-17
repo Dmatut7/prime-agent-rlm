@@ -48,6 +48,18 @@ def read_tracked(root: str) -> str:
         return f.read()
 
 
+def git_status_lines(root: str) -> list[str]:
+    """Porcelain lines for the repo, to assert staging/stash side effects."""
+    proc = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return [line for line in proc.stdout.split("\n") if line]
+
+
 @contextmanager
 def chdir(path: str):
     old = os.getcwd()
@@ -68,10 +80,10 @@ def write_stub_git(directory: str, body: str) -> str:
     return directory
 
 
-# Matcher vectors mirror the TS face (b0aeef69a,
+# Matcher vectors mirror the TS face (b0aeef69a discards, 15437361f sweeps,
 # packages/coding-agent/test/bash-destructive-git-guard.test.ts) so the two
-# faces stay pattern-compatible. `git add -A` / `git add .` / `git stash` are
-# deliberately absent from the matches: the sweep family is TS-face only.
+# faces stay pattern-compatible. Two mode groups: destructive discards and
+# shared-worktree sweeps (git add -A / git add . / git stash).
 MATCHES = [
     "git checkout -- .",
     "git checkout .",
@@ -120,6 +132,29 @@ MATCHES = [
     "cd sub && git reset --hard",
 ]
 
+# Sweep group: commands that stage or stash the whole shared worktree. A root
+# pathspec (. / ./ :/) counts; a scoped pathspec (git add -A docs/) does not.
+SWEEP_MATCHES = [
+    "git add -A",
+    "git add --all",
+    "git add -A .",
+    "git add .",
+    "git add ./",
+    "git add :/",
+    "git add -- .",
+    "git add -A -- .",
+    "git add src .",
+    "git add -A && git status",
+    "git add -A; git commit",
+    "git -C sub add -A",
+    "git -C sub stash",
+    "git stash",
+    "git stash push",
+    "git stash push -m wip",
+    "git stash save",
+    "git stash; git status",
+]
+
 DOES_NOT_MATCH = [
     "git status",
     "git log --oneline",
@@ -142,14 +177,32 @@ DOES_NOT_MATCH = [
     "git clean -d",
     "git reset",
     "git reset --soft HEAD~1",
-    # Sweep family: TS face only (second mode group); this face guards discards.
-    "git stash",
-    "git stash push",
-    "git add -A",
-    "git add .",
-    "git add --all",
     "echo hello world",
     "npm run check",
+]
+
+# Reverse pins for the sweep group: scoped adds, non-sweeping stash
+# subcommands, help flags and quoted lookalikes must not match.
+SWEEP_DOES_NOT_MATCH = [
+    "git add src/file.ts",
+    "git add -A docs/",
+    "git add -A -- docs/",
+    "git add -u",
+    "git add -p",
+    "git add -- src/file.ts",
+    "git stash list",
+    "git stash pop",
+    "git stash apply",
+    "git stash drop",
+    "git stash show",
+    "git stash clear",
+    "git stash branch tmp",
+    "git stash create",
+    "git stash store abc123",
+    "git stash -h",
+    "git stash --help",
+    "echo 'git add -A'",
+    "git commit -m 'git stash push'",
 ]
 
 
@@ -159,14 +212,18 @@ class MatcherVectorTest(unittest.TestCase):
     def test_matches(self):
         find = getattr(bash_module, "_find_destructive_git_discard_commands", None)
         self.assertIsNotNone(find, "guard matcher missing")
-        for command in MATCHES:
+        vectors = [*MATCHES, *SWEEP_MATCHES]
+        self.assertGreater(len(vectors), len(MATCHES))
+        for command in vectors:
             with self.subTest(command=command):
                 self.assertTrue(bool(find(command)), command)
 
     def test_does_not_match(self):
         find = getattr(bash_module, "_find_destructive_git_discard_commands", None)
         self.assertIsNotNone(find, "guard matcher missing")
-        for command in DOES_NOT_MATCH:
+        vectors = [*DOES_NOT_MATCH, *SWEEP_DOES_NOT_MATCH]
+        self.assertGreater(len(vectors), len(DOES_NOT_MATCH))
+        for command in vectors:
             with self.subTest(command=command):
                 self.assertFalse(bool(find(command)), command)
 
@@ -180,9 +237,9 @@ class GuardSymbolTest(unittest.TestCase):
 
 
 class GuardBehaviorTest(unittest.IsolatedAsyncioTestCase):
-    """bash() refuses destructive git discards on a dirty tree, fails open
-    outside a repository or beyond its covered probe scope, and bypasses only
-    through the kernel env var."""
+    """bash() refuses destructive git discards and shared-worktree sweeps on a
+    dirty tree, fails open outside a repository or beyond its covered probe
+    scope, and bypasses only through the kernel env var."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="py-git-guard-")
@@ -252,6 +309,83 @@ class GuardBehaviorTest(unittest.IsolatedAsyncioTestCase):
         with chdir(repo):
             result = await bash("git checkout -- .")
         self.assertEqual(result.exit_code, 0)
+
+    async def test_refuses_worktree_sweeps_and_stages_nothing(self):
+        for command in [
+            "git add -A",
+            "git add .",
+            "git add --all",
+            "git add -A .",
+            "git stash",
+            "git stash push -m wip",
+        ]:
+            with self.subTest(command=command):
+                repo = self.dirty_repo(f"sweep-{abs(hash(command)) % 100000}")
+                message = await self.assert_refused(command, repo)
+                self.assertIn("Refusing to run this destructive git command", message)
+                # Nothing staged and nothing stashed: the work is untouched.
+                self.assertEqual(git_status_lines(repo), [" M tracked.txt", "?? untracked.txt"])
+                self.assertEqual(read_tracked(repo), "modified\n")
+
+    async def test_git_dash_c_sweep_refuses_a_dirty_nested_repository(self):
+        sub = self.dirty_repo("sub")
+        message = await self.assert_refused("git -C sub add -A", self.tmp)
+        self.assertIn("tracked.txt", message)
+        self.assertEqual(git_status_lines(sub), [" M tracked.txt", "?? untracked.txt"])
+
+    async def test_runs_the_sweep_when_the_tree_is_clean(self):
+        for command in ["git add -A", "git stash"]:
+            with self.subTest(command=command):
+                repo = self.clean_repo(f"clean-{abs(hash(command)) % 100000}")
+                with chdir(repo):
+                    result = await bash(command)
+                self.assertEqual(result.exit_code, 0)
+
+    async def test_env_bypass_stages_or_stashes_intentionally(self):
+        repo = self.dirty_repo("bypass-add")
+        with mock.patch.dict(os.environ, {BYPASS_ENV: "1"}):
+            with chdir(repo):
+                result = await bash("git add -A")
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(git_status_lines(repo), ["M  tracked.txt", "A  untracked.txt"])
+
+        stashed = self.dirty_repo("bypass-stash")
+        with mock.patch.dict(os.environ, {BYPASS_ENV: "1"}):
+            with chdir(stashed):
+                result = await bash("git stash")
+        self.assertEqual(result.exit_code, 0)
+        # The stash saved the work instead of losing it: recoverable by design
+        # (untracked files stay behind; git stash without -u does not take them).
+        self.assertEqual(read_tracked(stashed), "committed\n")
+        self.assertEqual(git_status_lines(stashed), ["?? untracked.txt"])
+
+    async def test_inline_child_env_prefix_does_not_bypass_a_sweep(self):
+        repo = self.dirty_repo()
+        await self.assert_refused(f"{BYPASS_ENV}=1 git add -A", repo)
+        self.assertEqual(read_tracked(repo), "modified\n")
+
+    async def test_scoped_adds_and_non_sweeping_stash_subcommands_run(self):
+        repo = self.dirty_repo()
+        os.makedirs(os.path.join(repo, "docs"), exist_ok=True)
+        with open(os.path.join(repo, "docs", "note.md"), "w") as f:
+            f.write("doc\n")
+        with chdir(repo):
+            for command in ["git add -A docs/", "git stash list", "git add tracked.txt"]:
+                with self.subTest(command=command):
+                    result = await bash(command)
+                    self.assertEqual(result.exit_code, 0)
+        # The scoped add staged only docs/, the named file staged only itself:
+        # neither reached the other lane's untracked file.
+        self.assertEqual(set(git_status_lines(repo)), {"A  docs/note.md", "M  tracked.txt", "?? untracked.txt"})
+
+    async def test_sweep_cd_chain_fails_open_documented_boundary(self):
+        # Same documented boundary as the discard family: a cd chain relocates
+        # the sweep target and this face does not replay it, so it runs.
+        sub = self.dirty_repo("sub")
+        with chdir(self.tmp):
+            result = await bash("cd sub && git add -A")
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(git_status_lines(sub), ["M  tracked.txt", "A  untracked.txt"])
 
     async def test_env_bypass_discards_intentionally(self):
         repo = self.dirty_repo()

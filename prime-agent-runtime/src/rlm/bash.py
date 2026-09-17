@@ -690,6 +690,13 @@ class BashHandle:
 # guard cannot reach it. Matcher semantics are shared with the TS face; the
 # probe-target scope is a documented subset:
 #
+# Two mode groups, both ported from the TS face: destructive discards
+# (checkout / restore / reset --hard / clean -f, b0aeef69a) and
+# shared-worktree sweeps (git add -A / git add . / git stash, 15437361f), which
+# do not delete work themselves but sweep other lanes' uncommitted changes
+# into one index or stash on a shared worktree. Both groups share the probe,
+# the bypass and the fail-open scope below.
+#
 # Covered: direct discard forms plus `git -C <dir>` (plain paths, repeated -C
 # included) and wrapper/env-assignment prefixes that do not relocate the
 # repository (sudo, env, path-qualified, NAME=value).
@@ -747,6 +754,14 @@ _DISCARD_RESET_PATTERN = re.compile(
 )
 _DISCARD_CLEAN_PATTERN = re.compile(r"\bgit\s+" + _GIT_GLOBAL_OPTIONS + r"clean\s+([^;&|]*)")
 
+# Sweep family: commands that stage or stash the whole shared worktree
+# (git add -A / git add . / git stash). Port of the TS face's second mode group
+# (15437361f); see the guard section comment for why they are refused.
+_SWEEP_ADD_PATTERN = re.compile(r"\bgit\s+" + _GIT_GLOBAL_OPTIONS + r"add\s+([^;&|]*)")
+_SWEEP_STASH_PATTERN = re.compile(
+    r"\bgit\s+" + _GIT_GLOBAL_OPTIONS + r"stash(?=\s|$|[;&|)])(?:\s+([^;&|]*))?"
+)
+
 # Command segments before the git token, and the wrappers that cannot change
 # directory or select another repository.
 _PREFIX_SEPARATORS = re.compile(r"&&|\|\||;|\||\n")
@@ -757,7 +772,15 @@ _RELOCATING_ASSIGNMENTS = ("GIT_DIR=", "GIT_WORK_TREE=")
 _RELOCATING_GLOBAL_OPTIONS = ("--git-dir", "--work-tree", "--prefix")
 _RELOCATING_CONFIGS = ("core.worktree", "core.bare")
 _UNSAFE_DASH_C_CHARS = set("\"'\\$`")
-_GIT_SUBCOMMANDS = frozenset({"reset", "checkout", "clean", "restore"})
+_GIT_SUBCOMMANDS = frozenset({"reset", "checkout", "clean", "restore", "add", "stash"})
+# git add options that stage the whole worktree unless a non-root pathspec
+# narrows them (git add -A docs/ stays scoped).
+_SWEEP_ADD_ALL_OPTIONS = frozenset({"-A", "--all", "--no-ignore-removal"})
+_ROOT_PATHSPECS = frozenset({".", "./", ":/"})
+# git stash subcommands that push a stash; every other subcommand
+# (list/show/pop/apply/drop/clear/branch/create/store) and the help flags do
+# not sweep the worktree into one.
+_SWEEP_STASH_SUBCOMMANDS = frozenset({"push", "save"})
 
 
 def _is_forced_clean_segment(args: str) -> bool:
@@ -778,6 +801,36 @@ def _is_forced_clean_segment(args: str) -> bool:
         token == "--dry-run" or (token.startswith("-") and not token.startswith("--") and "n" in token)
         for token in option_tokens
     )
+
+
+def _is_sweep_add_segment(args: str) -> bool:
+    tokens = [token for token in args.split() if token]
+    # Everything after -- is a pathspec, not an option.
+    option_end = tokens.index("--") if "--" in tokens else -1
+    options = tokens if option_end == -1 else tokens[:option_end]
+    pathspec = [] if option_end == -1 else tokens[option_end + 1 :]
+    has_all = False
+    has_pathspec = bool(pathspec)
+    for token in options:
+        if token in _SWEEP_ADD_ALL_OPTIONS:
+            has_all = True
+        elif token.startswith("-"):
+            continue  # other options do not widen the staged set
+        else:
+            has_pathspec = True  # a bare pathspec token
+            if token in _ROOT_PATHSPECS:
+                return True
+    if any(token in _ROOT_PATHSPECS for token in pathspec):
+        return True
+    # -A with an explicit non-root pathspec stays scoped (git add -A docs/).
+    return has_all and not has_pathspec
+
+
+def _is_sweep_stash_segment(args: str | None) -> bool:
+    tokens = [token for token in (args or "").split() if token]
+    if not tokens:
+        return True  # bare `git stash` pushes
+    return tokens[0] in _SWEEP_STASH_SUBCOMMANDS
 
 
 def _mask_quoted_spans(command: str) -> str:
@@ -844,16 +897,22 @@ def _mask_quoted_spans(command: str) -> str:
 
 
 def _find_destructive_git_discard_commands(command: str) -> list[int]:
-    """Match starts of every destructive git discard in `command` (empty when
-    none match). Best-effort shell-text heuristics, not a parse; a false
-    positive costs one `git status` probe, a false negative silently loses
-    work."""
+    """Match starts of every destructive git discard or shared-worktree sweep in
+    `command` (empty when none match). Best-effort shell-text heuristics, not a
+    parse; a false positive costs one `git status` probe, a false negative
+    silently loses work."""
     masked = _mask_quoted_spans(command)
     indices: list[int] = []
     for pattern in (_DISCARD_CHECKOUT_PATTERN, _DISCARD_RESTORE_PATTERN, _DISCARD_RESET_PATTERN):
         indices.extend(match.start() for match in pattern.finditer(masked))
     for match in _DISCARD_CLEAN_PATTERN.finditer(masked):
         if _is_forced_clean_segment(match.group(1)):
+            indices.append(match.start())
+    for match in _SWEEP_ADD_PATTERN.finditer(masked):
+        if _is_sweep_add_segment(match.group(1)):
+            indices.append(match.start())
+    for match in _SWEEP_STASH_PATTERN.finditer(masked):
+        if _is_sweep_stash_segment(match.group(1)):
             indices.append(match.start())
     return sorted(indices)
 
@@ -1025,11 +1084,13 @@ def bash(command: str) -> BashHandle:
     os.environ['PRIME_AGENT_ENV_PASSTHROUGH'] before the call to pass them
     through.
     Guard: destructive git discards (git checkout -- ., git clean -f...,
-    git reset --hard, git restore ., with git -C) are refused with the dirty
-    paths while the tree they target has uncommitted changes; set
-    PI_BASH_ALLOW_DESTRUCTIVE_GIT=1 in the kernel environment to bypass
-    intentionally. Fails open outside a repository and beyond the covered
-    probe scope (cd chains, GIT_DIR prefixes); see the guard section above.
+    git reset --hard, git restore .) and shared-worktree sweeps (git add -A,
+    git add ., git stash), with git -C, are refused with the dirty paths while
+    the tree they target has uncommitted changes; scoped forms (git add
+    docs/, git add <paths>) run, and setting PI_BASH_ALLOW_DESTRUCTIVE_GIT=1
+    in the kernel environment bypasses intentionally. Fails open outside a
+    repository and beyond the covered probe scope (cd chains, GIT_DIR
+    prefixes); see the guard section above.
     """
     if not isinstance(command, str) or not command:
         raise TypeError("command must be a non-empty str")
