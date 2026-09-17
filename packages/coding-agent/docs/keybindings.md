@@ -145,6 +145,8 @@ Used inside the agents view (opened by `/resume` or `app.session.resume`). The s
 |--------|---------|-------------|
 | `app.model.select` | `ctrl+l` | Open model selector |
 | `app.model.toggleScope` | `alt+s` | Toggle between all and scoped models |
+| `app.model.cycleForward` | `alt+m` | Cycle to the next scoped model |
+| `app.model.cycleBackward` | `shift+alt+m` | Cycle to the previous scoped model |
 | `app.thinking.toggle` | `ctrl+t` | Collapse or expand thinking blocks |
 
 ### Configuration Menu

@@ -4336,6 +4336,8 @@ export class InteractiveMode {
 			void this.handleDebugCommand();
 		};
 		this.defaultEditor.onAction("app.model.select", () => this.showModelSelector());
+		this.defaultEditor.onAction("app.model.cycleForward", () => this.handleModelCycle("forward"));
+		this.defaultEditor.onAction("app.model.cycleBackward", () => this.handleModelCycle("backward"));
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
 		this.defaultEditor.onAction("app.messages.expand", () => this.toggleAgentMessageExpansion());
 		this.defaultEditor.onAction("app.edits.expand", () => this.toggleEditDiffExpansion());
@@ -8185,8 +8187,20 @@ export class InteractiveMode {
 				`Default model ${model.provider}/${model.id} not saved: ${defaultSaveFailure} It applies to this session only and is lost when the session ends.`,
 			);
 		}
+		this.applyModelSwitchUiState(state, model);
+	}
+
+	/**
+	 * Patch the model-derived connection state and refresh every face that reads it,
+	 * so the header, model-selector highlight, /fast availability and /effort
+	 * completions never keep describing the model that was just replaced.
+	 */
+	private applyModelSwitchUiState(
+		state: Pick<AgentConnectionState, "model" | "serviceTier" | "availableThinkingLevels">,
+		fallbackModel: AgentConnectionModel,
+	): void {
 		this.patchConnectionState({
-			model: state.model ?? model,
+			model: state.model ?? fallbackModel,
 			serviceTier: state.serviceTier,
 			availableThinkingLevels: state.availableThinkingLevels,
 		});
@@ -8514,6 +8528,39 @@ export class InteractiveMode {
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
 				this.showStatus(`Thinking level: ${level}`);
+			})
+			.catch((error) => {
+				this.showError(error instanceof Error ? error.message : String(error));
+			});
+	}
+
+	/**
+	 * Cycle the session model (app.model.cycleForward/cycleBackward). The connection and
+	 * the session id are captured before the await, like applySelectedModel, so a session
+	 * switch mid-cycle discards the stale result instead of applying it to whichever
+	 * session is active when the answer lands.
+	 */
+	private handleModelCycle(direction: "forward" | "backward"): void {
+		const connection = this.agentConnection;
+		const sessionId = this.connectionState?.sessionId;
+		void connection
+			.cycleModel(direction)
+			.then(async (result) => {
+				// Also the singleton scope and single-model cases: nothing else to cycle to.
+				if (!result) {
+					this.showStatus("No other models available to cycle");
+					return;
+				}
+				const state = await connection.getState();
+				if (
+					this.agentConnection !== connection ||
+					this.connectionState?.sessionId !== sessionId ||
+					(sessionId !== undefined && state.sessionId !== sessionId)
+				) {
+					return;
+				}
+				this.applyModelSwitchUiState(state, result.model);
+				this.showStatus(`Model: ${result.model.provider}/${result.model.id}`);
 			})
 			.catch((error) => {
 				this.showError(error instanceof Error ? error.message : String(error));

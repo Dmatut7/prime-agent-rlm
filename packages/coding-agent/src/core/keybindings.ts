@@ -19,6 +19,8 @@ export interface AppKeybindings {
 	"app.suspend": true;
 	"app.model.select": true;
 	"app.model.toggleScope": true;
+	"app.model.cycleForward": true;
+	"app.model.cycleBackward": true;
 	"app.configuration.previousTab": true;
 	"app.configuration.exit": true;
 	"app.tools.expand": true;
@@ -88,6 +90,8 @@ export const KEYBINDINGS = {
 	},
 	"app.model.select": { defaultKeys: "ctrl+l", description: "Open model selector" },
 	"app.model.toggleScope": { defaultKeys: "alt+s", description: "Toggle model selector scope" },
+	"app.model.cycleForward": { defaultKeys: "alt+m", description: "Cycle to the next scoped model" },
+	"app.model.cycleBackward": { defaultKeys: "shift+alt+m", description: "Cycle to the previous scoped model" },
 	"app.configuration.previousTab": { defaultKeys: "shift+tab", description: "Select previous configuration tab" },
 	"app.configuration.exit": { defaultKeys: "ctrl+c", description: "Exit configuration selector" },
 	"app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output", defaultKeyScope: "editor" },

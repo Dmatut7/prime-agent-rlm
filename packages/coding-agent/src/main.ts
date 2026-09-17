@@ -632,7 +632,7 @@ function buildSessionOptions(
 		options.thinkingLevel = config.thinking;
 	}
 
-	// Scoped models for Ctrl+P cycling
+	// Scoped models for Alt+M cycling
 	// Keep thinking level undefined when not explicitly set in the model pattern.
 	// Undefined means "inherit current session thinking level" during cycling.
 	if (scopedModels.length > 0) {
@@ -1607,7 +1607,7 @@ export async function main(args: string[], options?: MainOptions) {
 					return `${sm.model.id}${thinkingStr}`;
 				})
 				.join(", ");
-			console.log(chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Ctrl+P to cycle)")}`));
+			console.log(chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Alt+M to cycle)")}`));
 		}
 
 		const promptStashStore = new ClientPromptStashStore();
@@ -1908,7 +1908,7 @@ export async function main(args: string[], options?: MainOptions) {
 					return `${sm.model.id}${thinkingStr}`;
 				})
 				.join(", ");
-			console.log(chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Ctrl+P to cycle)")}`));
+			console.log(chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Alt+M to cycle)")}`));
 		}
 
 		const interactiveMode = new InteractiveMode({

@@ -1,0 +1,1 @@
+- Fixed model cycling being unreachable from the interactive UI: Alt+M / Shift+Alt+M now cycle scoped models, and the docs, the `/scoped-models` description and the `--models` startup banner no longer claim the unavailable Ctrl+P binding.
