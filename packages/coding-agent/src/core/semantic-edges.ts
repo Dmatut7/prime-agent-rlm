@@ -1,7 +1,24 @@
 import { createHash, randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, truncateSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, fsyncSync, ftruncateSync, openSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
+import { appendPrivateFile, ensurePrivateDirectory, requireNoFollow } from "../utils/private-files.js";
+
+/**
+ * Truncate the ledger's torn tail through an O_NOFOLLOW fd: a symlink swapped
+ * in for the ledger must not have its target truncated before the append's own
+ * symlink refusal runs.
+ */
+function truncateLedgerTail(path: string, bytes: number): void {
+	const fd = openSync(path, constants.O_WRONLY | requireNoFollow(constants.O_NOFOLLOW));
+	try {
+		if (!fstatSync(fd).isFile()) throw new Error(`Refusing to use non-regular private file: ${path}`);
+		ftruncateSync(fd, bytes);
+		fsyncSync(fd);
+	} finally {
+		closeSync(fd);
+	}
+}
 
 /**
  * ACP semantic-edges-v1 producer: a durable per-agent ledger of model-request
@@ -511,17 +528,21 @@ export class SemanticEdgeRecorder {
 		}
 		if (this._ledgerPath) {
 			try {
-				mkdirSync(dirname(this._ledgerPath), { recursive: true });
+				// The ledger sits in the private store tree, so it takes the same
+				// hardening as every other writer there: 0700 directory, 0600
+				// file, no symlink following. appendPrivateFile keeps O_APPEND, so
+				// concurrent appenders still interleave line-atomically.
+				ensurePrivateDirectory(dirname(this._ledgerPath));
 				if (this._pendingRepair) {
 					if ("truncateToBytes" in this._pendingRepair) {
 						// Discard the torn tail line so it never becomes mid-file corruption.
-						truncateSync(this._ledgerPath, this._pendingRepair.truncateToBytes);
+						truncateLedgerTail(this._ledgerPath, this._pendingRepair.truncateToBytes);
 					} else {
-						appendFileSync(this._ledgerPath, "\n");
+						appendPrivateFile(this._ledgerPath, "\n");
 					}
 					this._pendingRepair = undefined;
 				}
-				appendFileSync(this._ledgerPath, `${JSON.stringify(event)}\n`);
+				appendPrivateFile(this._ledgerPath, `${JSON.stringify(event)}\n`);
 			} catch (error) {
 				this._disable(error);
 				return false;

@@ -1,0 +1,1 @@
+- Hardened the semantic-edge ledger to the private-store standard: the ledger directory is created 0700, the file lands 0600, torn-tail repair truncates through an O_NOFOLLOW file descriptor, and a symlink planted at the ledger path disables the ledger instead of being written through.
