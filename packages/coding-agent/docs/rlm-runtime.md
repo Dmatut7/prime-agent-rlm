@@ -118,7 +118,7 @@ run(prompt: str, **kwargs)
 find_models(query: str = "", limit: int = 8)
 list_subagents()
 collect(targets=None, *, timeout_ms=0)
-delete_subagent(selector)
+delete_subagent(target: RLMSpawnHandle | RLMSubagent | str)
 host_request(request_type: str, payload: dict | None = None)
 RLMSpawnHandle
 RLMModel
@@ -177,7 +177,7 @@ The TypeScript parent maintains the authoritative direct-child registry. `await 
 
 This registry survives kernel restart, compaction, and parent restore. Successfully completed daemon-backed children are rehydrated from the parent artifact registry. Inline children remain inspectable in the current process but have no active-session ID.
 
-The parent can continue a retained daemon child with `await agent_message.send(..., receiver_role="child", receiver_name=child.session_name)`. `rlm.delete_subagent()` accepts an exact child ID, active-session ID, session ID, or unique name. Deletion cancels or closes the runtime, writes a durable tombstone, and removes the child from messaging and observation. It does not erase the transcript or artifacts on disk.
+The parent can continue a retained daemon child with `await agent_message.send(..., receiver_role="child", receiver_name=child.session_name)`. `rlm.delete_subagent()` accepts the spawn handle returned by `rlm.spawn`, a subagent row from `list_subagents()`, or an exact child ID, active-session ID, session ID, or unique name. Deletion cancels or closes the runtime, writes a durable tombstone, and removes the child from messaging and observation. It does not erase the transcript or artifacts on disk.
 
 Registry scope follows the parent transcript. An unrelated new parent session does not inherit children.
 
