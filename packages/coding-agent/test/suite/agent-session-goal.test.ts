@@ -560,12 +560,12 @@ describe("AgentSession goals", () => {
 	 * more turn so a navigation target exists whose branch keeps the stale entry
 	 * as its last thread_goal_state.
 	 */
-	async function createGoalWithStaleBranchSnapshot(): Promise<{
+	async function createGoalWithStaleBranchSnapshot(options: Pick<HarnessOptions, "extensionFactories"> = {}): Promise<{
 		harness: Harness;
 		goalId: string;
 		targetEntryId: string;
 	}> {
-		const harness = await createGoalHarness();
+		const harness = await createGoalHarness([], options);
 		harness.setResponses([fauxAssistantMessage("history before the goal")]);
 		await harness.session.prompt("start");
 
@@ -678,6 +678,46 @@ describe("AgentSession goals", () => {
 		// even though it is lower than the in-memory accounting.
 		expect(harness.session.goalState.status).toBe("active");
 		expect(harness.session.goalState.tokensUsed).toBe(10);
+	});
+
+	/**
+	 * An extension that answers session_before_tree with an empty summary string. The
+	 * summary-branch predicate is truthiness-based, so this is a plain branch move even
+	 * though the caller asked for a summary.
+	 */
+	function emptySummaryExtension(): ExtensionFactory {
+		return (pi) => {
+			pi.on("session_before_tree", async () => ({ summary: { summary: "" } }));
+		};
+	}
+
+	it("treats an extension-provided empty summary as a plain branch move", async () => {
+		const { harness, goalId, targetEntryId } = await createGoalWithStaleBranchSnapshot({
+			extensionFactories: [emptySummaryExtension()],
+		});
+		harness.setResponses([fauxAssistantMessage("branch summary")]);
+
+		const result = await harness.session.navigateTree(targetEntryId, { summarize: true });
+
+		// No summary branch was created, so this is a plain branch move: the monotonic
+		// retention path must not kick in, and the branch's own goal state stays faithful
+		// even though it lags the in-memory accounting.
+		expect(result.cancelled).toBe(false);
+		expect(result.summaryEntry).toBeUndefined();
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "branch_summary")).toEqual([]);
+		// The extension answered the summary request itself, so the summarizer never ran:
+		// the response queued for it is still pending. That is what makes this the
+		// extension-provided-empty-summary case and not "the summarizer returned nothing".
+		expect(harness.getPendingResponseCount()).toBe(1);
+		expect(harness.session.goalState.status).toBe("active");
+		expect(harness.session.goalState.goalId).toBe(goalId);
+		expect(harness.session.goalState.tokensUsed).toBe(10);
+
+		// The kernel-visible surface agrees: the branch's own budget stance, not the
+		// in-memory fired gate that a summary branch would have preserved.
+		const response: GoalHostResponse = harness.session.handleGoalHostRequest("goal.get");
+		expect(response.goal?.status).toBe("active");
+		expect(response.remaining_tokens).toBe(90);
 	});
 
 	it("normalizes queued goal context text and images", async () => {
