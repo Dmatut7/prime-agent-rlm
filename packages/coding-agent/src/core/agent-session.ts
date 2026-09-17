@@ -116,18 +116,26 @@ import {
 import { type BashResult, executeBashWithOperations } from "./bash-executor.js";
 import {
 	buildCompactionRecoveryHint,
+	buildEmergencyShrinkNotice,
+	buildEmergencyShrinkSummary,
 	COMPACT_SKILL_NAME,
+	COMPACTION_EMERGENCY_SHRINK_FAILURES,
 	COMPACTION_RECOVERY_HINT_THRESHOLD,
 	type CompactionResult,
+	type CompactionSettings,
+	type CompactionWindowLimits,
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
+	compactionThresholdTokens,
 	estimateContextTokens,
 	generateBranchSummary,
 	isAssistantUsageSource,
+	planEmergencyShrink,
 	prepareCompaction,
 	serializeConversation,
 	shouldCompact,
+	shrunkKeepRecentTokens,
 } from "./compaction/index.js";
 import {
 	type ContextTreeNode,
@@ -189,6 +197,7 @@ import {
 	validateGoalBudget,
 	validateGoalObjective,
 } from "./goals.js";
+import { classifyIncomingInput, incomingInputFactsFromMessage, inputClassOrigin } from "./input-classification.js";
 import type {
 	HostRequestHandlers,
 	KernelDeathCause,
@@ -334,7 +343,7 @@ import {
 } from "./session-manager.js";
 import type { SessionStats } from "./session-stats.js";
 import { resolveCompleteToolPairLeaf } from "./session-tool-pair.js";
-import type { SettingsManager } from "./settings-manager.js";
+import { DEFAULT_STREAM_STALL_TIMEOUT_MS, type SettingsManager } from "./settings-manager.js";
 import { getPythonSkillRuntimeInfo, type Skill } from "./skills.js";
 import {
 	BUILTIN_SLASH_COMMANDS,
@@ -1021,6 +1030,19 @@ const IPYTHON_SENT_AGENT_MESSAGE_CUSTOM_ENTRY = "ipython_sent_agent_message";
  * cannot actually shrink (e.g. a single tool result larger than the usable window).
  */
 const THRESHOLD_COMPACTION_RETRY_MIN_NEW_ENTRIES = 5;
+
+/**
+ * How long a compaction may hold queued agent messages before the admission gate
+ * aborts it and lets them through.
+ *
+ * The stall watchdog cannot be this bound: it ships warn-only (`abortAfterSeconds`
+ * defaults to 0) and it snoozes while a host phase owns the turn boundary, which
+ * compaction does. Without a bound of its own, a gate that ranks compaction above
+ * agent messages would turn one hung summarization call into a starved family. Two
+ * times the default provider stream-stall timeout, so a genuinely slow 1M-token
+ * summary still finishes while a wedged stream is cut.
+ */
+const COMPACTION_GATE_ABORT_AFTER_SECONDS = (DEFAULT_STREAM_STALL_TIMEOUT_MS / 1000) * 2;
 
 interface PersistedIpythonSentAgentMessage {
 	toolCallId: string;
@@ -1745,6 +1767,8 @@ export class AgentSession {
 	// must treat it differently from abortCompaction()/requestAbort().
 	private _autoCompactionPreemptedByManual: AbortController | undefined = undefined;
 	private _compactionOperation: Promise<void> | undefined = undefined;
+	/** Timer that aborts a compaction holding queued agent messages for too long. */
+	private _compactionGateWatchdog: ReturnType<typeof setTimeout> | undefined = undefined;
 	/** In-flight manual compact() (r25-1): synchronous admission for mutual exclusion. */
 	private _manualCompactionInFlight:
 		| { operation: Promise<CompactionResult>; customInstructions: string | undefined }
@@ -3746,7 +3770,10 @@ export class AgentSession {
 		}
 
 		const contextTokens = this._getThresholdContextTokens(context.message, compactionTimestamp);
-		if (contextTokens === undefined || !shouldCompact(contextTokens, contextWindow, settings)) {
+		if (
+			contextTokens === undefined ||
+			!shouldCompact(contextTokens, contextWindow, settings, this._compactionWindowLimits())
+		) {
 			return false;
 		}
 
@@ -4035,6 +4062,7 @@ export class AgentSession {
 					this.sessionManager.getBranch(),
 					this.settingsManager.getCompactionSettings(),
 					this.model?.contextWindow,
+					this._compactionWindowLimits(),
 				);
 				if (!preparation) {
 					const lastEntry = this.sessionManager.getBranch().at(-1);
@@ -6376,6 +6404,38 @@ export class AgentSession {
 			options.preflightResult?.(queued, queued, "target_suspended");
 			return;
 		}
+		// Compaction outranks an incoming agent message
+		// (compaction.priorityOverAgentMessages). Without this the reply took the
+		// direct-prompt branch of _prompt, whose execution policy skips pre-turn
+		// compaction (skipPrePromptWork), so it opened a turn on the over-threshold
+		// context and the compaction only ran at that turn's agent_end - one request
+		// closer to the provider's input wall every time. The message queues instead
+		// (durable, visible, credited as queued) and the compaction starts now; the
+		// pump delivers the message once the compaction settles.
+		const compactionGate = this._incomingAgentMessageCompactionGate(customMessage, options);
+		if (compactionGate !== undefined && options?.streamingBehavior) {
+			if (this._disposed || this._disposing) {
+				throw new Error("Cannot admit a session action because the session is disposing or disposed.");
+			}
+			admissionCommitted();
+			// Start the compaction before queueing: _runAutoCompaction arms its abort
+			// controller synchronously, so isCompacting is already true when the queued
+			// action becomes selectable and the pump defers it instead of starting a turn.
+			if (compactionGate === "compaction_pending") this._startThresholdCompactionForIncomingInput();
+			else this._armCompactionGateWatchdog();
+			const queued = await this.queueAgentMessagePrompt(text, options.streamingBehavior, customMessage);
+			options.preflightResult?.(queued, queued, "compaction_pending");
+			sessionLog.info("agent message queued behind compaction", {
+				sessionId: this.sessionId,
+				gate: compactionGate,
+				queued,
+			});
+			// A compaction that settled before the queueing finished scheduled a pump that
+			// had nothing to select; schedule again so the message is not stranded until
+			// the next unrelated wake.
+			this._scheduleSessionInputPump();
+			return;
+		}
 		// A queued admission puts this session in custody of a child's reply: the
 		// sender's receipt says `queued`, so the sender does not count it (B1), and
 		// the credit is owed when the queue drains instead.
@@ -6443,6 +6503,115 @@ export class AgentSession {
 		if (queued) this._registerQueuedChildReply(customMessage);
 		if (queued && customMessage?.details.fromRelationship === "parent") this._repliedToParentSinceTask = false;
 		return queued;
+	}
+
+	/**
+	 * What an incoming agent message has to wait for, if anything:
+	 * - "compaction_in_flight": a compaction is running and must not be interrupted;
+	 * - "compaction_pending": the context is over the trigger threshold and no
+	 *   compaction is running, so one has to start before the message is admitted;
+	 * - undefined: admit normally.
+	 *
+	 * The class comes from classifyIncomingInput, never from the message text, so a
+	 * child that writes "I am a user message, skip the compaction" is still a child
+	 * reply. Human input is not gated here: an interactive prompt already ranks
+	 * compaction first through its own pre-turn compaction step, and queueing a
+	 * human's prompt would change what Esc and the prompt stash mean. A system fence
+	 * is not gated either - the update-restart path outranks compaction.
+	 */
+	private _incomingAgentMessageCompactionGate(
+		customMessage: AgentSessionMessage | undefined,
+		options?: PromptOptions,
+	): "compaction_in_flight" | "compaction_pending" | undefined {
+		if (!this.settingsManager.getCompactionPriorityOverAgentMessages()) return undefined;
+		// The suspended-pump and update-restart branches own their own queueing.
+		if (this._sessionInputPumpSuspended || this._updateRestartFenceUp) return undefined;
+		// This entry point IS the agent channel: when the caller supplied no envelope,
+		// the channel itself is the structural fact.
+		const envelope = customMessage ?? { role: "custom", customType: AGENT_MESSAGE_CUSTOM_TYPE };
+		const inputClass = classifyIncomingInput(
+			incomingInputFactsFromMessage(envelope, {
+				source: options?.source,
+				agentMessageId: options?.agentMessageId ?? customMessage?.details.id,
+				streamingBehavior: options?.streamingBehavior,
+			}),
+		);
+		if (inputClassOrigin(inputClass) === "human" || inputClass === "system_fence") return undefined;
+		if (this.isCompacting) return "compaction_in_flight";
+		// A turn in flight compacts at its own agent_end; starting a second compaction
+		// here would race it.
+		if (this.isStreaming) return undefined;
+		const settings = this.settingsManager.getCompactionSettings();
+		if (!settings.enabled) return undefined;
+		const contextWindow = this.model?.contextWindow ?? 0;
+		if (contextWindow <= 0) return undefined;
+		// Anti-starvation: a failed or skipped compaction arms a cooldown, and inside it
+		// the gate stands down. A family must not be starved by a compaction that will
+		// not run.
+		if (this._isThresholdCompactionCoolingDown(contextWindow)) return undefined;
+		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
+		const compactionTimestamp = compactionEntry ? new Date(compactionEntry.timestamp).getTime() : undefined;
+		const contextTokens = this._estimateThresholdContextTokens(compactionTimestamp);
+		if (contextTokens === undefined) return undefined;
+		if (!shouldCompact(contextTokens, contextWindow, settings, this._compactionWindowLimits())) return undefined;
+		return "compaction_pending";
+	}
+
+	/**
+	 * Start the threshold compaction a queued agent message is waiting for.
+	 * Fire-and-forget on purpose: admission must not block on the summarization call,
+	 * and _runAutoCompaction reports its own outcome through the compaction events.
+	 */
+	private _startThresholdCompactionForIncomingInput(): void {
+		if (this.isCompacting || this._disposed || this._disposing) return;
+		void this._runAutoCompaction("threshold", false).catch((error: unknown) => {
+			sessionLog.error("threshold compaction started by an incoming agent message failed", {
+				sessionId: this.sessionId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
+		this._armCompactionGateWatchdog();
+	}
+
+	/**
+	 * Bound how long a compaction may hold queued agent messages.
+	 *
+	 * The stall watchdog snoozes while a host phase owns the turn boundary
+	 * (stall-watchdog.ts: `isPaused()` covers compaction), so a hung summarization
+	 * call would otherwise hold every queued reply forever: the gate that ranks
+	 * compaction first must not become a way to starve the family. After the
+	 * configured stall budget the compaction is aborted and the pump is scheduled, so
+	 * the queued input is delivered instead.
+	 */
+	private _armCompactionGateWatchdog(): void {
+		if (this._compactionGateWatchdog !== undefined) return;
+		const operation = this._compactionOperation;
+		if (!operation) return;
+		const configured = this.settingsManager.getStallWatchdogSettings().abortAfterSeconds;
+		// The stall watchdog ships warn-only (abortAfterSeconds 0), and it snoozes while
+		// compaction owns the turn boundary anyway, so the gate carries its own bound.
+		const abortAfterSeconds =
+			Number.isFinite(configured) && configured > 0 ? configured : COMPACTION_GATE_ABORT_AFTER_SECONDS;
+		const timer = setTimeout(() => {
+			this._compactionGateWatchdog = undefined;
+			if (this._disposed || this._disposing) return;
+			if (!this.isCompacting) return;
+			sessionLog.warn("compaction holding queued agent messages exceeded the stall budget; aborting it", {
+				sessionId: this.sessionId,
+				abortAfterSeconds,
+			});
+			this.abortCompaction();
+			this._scheduleSessionInputPump();
+		}, abortAfterSeconds * 1000);
+		timer.unref?.();
+		this._compactionGateWatchdog = timer;
+		const clear = (): void => {
+			if (this._compactionGateWatchdog === timer) {
+				clearTimeout(timer);
+				this._compactionGateWatchdog = undefined;
+			}
+		};
+		void operation.then(clear, clear);
 	}
 
 	async promptHeartbeat(job: AgentCronJob, options?: PromptOptions): Promise<AgentHeartbeatPromptResult> {
@@ -10600,6 +10769,11 @@ export class AgentSession {
 			// repeating failure has to surface the remaining options where they will be
 			// read: the thrown message is what the slash-command result prints.
 			const recoveryHint = aborted || skipped ? "" : this._registerCompactionFailure();
+			// Same valve as the auto path: a user hammering /compact on a context whose
+			// summarization keeps failing is already trying to recover by hand, and the
+			// shrink is the one thing that works without a bigger window. An abort or a
+			// skip is not a failure to summarize, so neither counts toward the streak.
+			if (!aborted && !skipped) await this._runEmergencyContextShrink("requested", message);
 			this._emit({
 				type: "compaction_end",
 				reason: "manual",
@@ -10661,6 +10835,28 @@ export class AgentSession {
 	}
 
 	/**
+	 * Compaction settings for this attempt, with the failure valve applied.
+	 *
+	 * From the second consecutive failure on, each retry halves keepRecentTokens
+	 * (floor MIN_SHRUNK_KEEP_RECENT_TOKENS, never above the configured value): a
+	 * summarization request that keeps failing is usually failing because the slice
+	 * it has to carry does not fit the provider's input limit, and a smaller
+	 * retained tail is the one knob that shrinks the request without user input.
+	 */
+	private _compactionSettingsForAttempt(): CompactionSettings {
+		const configured = this.settingsManager.getCompactionSettings();
+		const keepRecentTokens = shrunkKeepRecentTokens(configured.keepRecentTokens, this._consecutiveCompactionFailures);
+		if (keepRecentTokens === configured.keepRecentTokens) return configured;
+		sessionLog.warn("compaction retry with a shrunk keep-recent budget", {
+			sessionId: this.sessionId,
+			consecutiveFailures: this._consecutiveCompactionFailures,
+			configuredKeepRecentTokens: configured.keepRecentTokens,
+			keepRecentTokens,
+		});
+		return { ...configured, keepRecentTokens };
+	}
+
+	/**
 	 * Shared compaction core behind /compact, auto-compaction, and the compact
 	 * skill. Throws CompactionSkippedError when there is nothing to compact and
 	 * Error("Compaction cancelled") on abort or extension cancel.
@@ -10674,13 +10870,16 @@ export class AgentSession {
 	}): Promise<CompactionResult> {
 		const { model, apiKey, headers, customInstructions, signal } = options;
 		const pathEntries = this.sessionManager.getBranch();
-		const settings = this.settingsManager.getCompactionSettings();
+		const settings = this._compactionSettingsForAttempt();
 		// Pin the branch position for the duration of the summarization call. If
 		// the user navigates the tree while the summary is being generated, the
 		// resulting entry still attaches to the branch it summarized.
 		const compactionLeafId = this.sessionManager.getLeafId();
 
-		const preparation = prepareCompaction(pathEntries, settings, model.contextWindow);
+		const preparation = prepareCompaction(pathEntries, settings, model.contextWindow, {
+			provider: model.provider,
+			modelId: model.id,
+		});
 		if (!preparation) {
 			const lastEntry = pathEntries[pathEntries.length - 1];
 			if (lastEntry?.type === "compaction") {
@@ -11844,24 +12043,46 @@ export class AgentSession {
 		assistantMessage: AssistantMessage,
 		compactionTimestamp: number | undefined,
 	): number | undefined {
-		const messages = this.agent.state.messages;
-		const estimate = estimateContextTokens(messages);
-		if (estimate.lastUsageIndex !== null) {
-			// Verify the usage source is post-compaction. Kept pre-compaction messages
-			// have stale usage reflecting the old (larger) context and would falsely
-			// trigger compaction right after one just finished.
-			const usageMsg = messages[estimate.lastUsageIndex];
-			if (
-				compactionTimestamp !== undefined &&
-				usageMsg.role === "assistant" &&
-				(usageMsg as AssistantMessage).timestamp <= compactionTimestamp
-			) {
-				return undefined;
-			}
-			return estimate.tokens;
+		if (estimateContextTokens(this.agent.state.messages).lastUsageIndex !== null) {
+			return this._estimateThresholdContextTokens(compactionTimestamp);
 		}
+
 		if (assistantMessage.stopReason === "error") return undefined;
 		return calculateContextTokens(assistantMessage.usage);
+	}
+
+	/**
+	 * The context size the trigger reads, or undefined when it is unknowable.
+	 *
+	 * One caliber for every trigger site (agent_end, the shouldStopAfterTurn hook and
+	 * the admission gate), so an input cannot be over the threshold for one of them
+	 * and under it for another.
+	 */
+	private _estimateThresholdContextTokens(compactionTimestamp: number | undefined): number | undefined {
+		const messages = this.agent.state.messages;
+		const estimate = estimateContextTokens(messages);
+		if (estimate.lastUsageIndex === null) return estimate.tokens;
+		// Verify the usage source is post-compaction. Kept pre-compaction messages
+		// have stale usage reflecting the old (larger) context and would falsely
+		// trigger compaction right after one just finished.
+		const usageMsg = messages[estimate.lastUsageIndex];
+		if (
+			compactionTimestamp !== undefined &&
+			usageMsg?.role === "assistant" &&
+			usageMsg.timestamp <= compactionTimestamp
+		) {
+			return undefined;
+		}
+		return estimate.tokens;
+	}
+
+	/**
+	 * Model identity for the compaction trigger: the declared window clamped to the
+	 * provider's measured input limit, so a catalog entry that over-declares (1048576
+	 * declared, 1000000 accepted) cannot push the trigger past the wall.
+	 */
+	private _compactionWindowLimits(): CompactionWindowLimits | undefined {
+		return this.model ? { provider: this.model.provider, modelId: this.model.id } : undefined;
 	}
 
 	private async _checkCompaction(
@@ -11951,7 +12172,7 @@ export class AgentSession {
 		// assistant usage are included, matching the /usage context display.
 		const contextTokens = this._getThresholdContextTokens(assistantMessage, compactionTimestamp);
 		if (contextTokens === undefined) return false;
-		if (shouldCompact(contextTokens, contextWindow, settings)) {
+		if (shouldCompact(contextTokens, contextWindow, settings, this._compactionWindowLimits())) {
 			if (this._isThresholdCompactionCoolingDown(contextWindow)) return false;
 			if (queueAutonomousContinuation && this._queueGoalContinuationForThresholdCompaction(assistantMessage)) {
 				this._continueAfterThresholdCompaction = true;
@@ -12073,6 +12294,94 @@ export class AgentSession {
 		this._emit({ type: "message_end", message: outcomeMessage });
 	}
 
+	/**
+	 * The last-resort valve for a session whose compaction keeps failing.
+	 *
+	 * After COMPACTION_EMERGENCY_SHRINK_FAILURES consecutive failures the context is
+	 * still over the trigger threshold, so every further request is headed for the
+	 * provider's input wall and the session cannot recover by itself: the next turn
+	 * re-triggers the same failing summarization. The valve drops the oldest
+	 * NON-summary context - a previous compaction summary and branch summaries are
+	 * carried into the replacement summary instead of being lost - until the estimate
+	 * lands under the threshold's emergency target.
+	 *
+	 * Never silent. The loss is named in three places: the replacement summary the
+	 * model reads next turn, a persisted compaction-outcome notice the user reads in
+	 * the transcript, and a warn-level session log line. Nothing is deleted from the
+	 * transcript on disk, and the notice says so.
+	 *
+	 * Returns whether the shrink ran and whether it reached its target.
+	 */
+	private async _runEmergencyContextShrink(
+		reason: CompactionOutcomeReason,
+		lastError: string,
+	): Promise<{ shrunk: boolean; reachedTarget: boolean }> {
+		if (this._consecutiveCompactionFailures < COMPACTION_EMERGENCY_SHRINK_FAILURES) {
+			return { shrunk: false, reachedTarget: false };
+		}
+		const settings = this.settingsManager.getCompactionSettings();
+		const contextWindow = this.model?.contextWindow ?? 0;
+		const threshold = compactionThresholdTokens(contextWindow, settings, this._compactionWindowLimits());
+		if (threshold <= 0) return { shrunk: false, reachedTarget: false };
+		const plan = planEmergencyShrink(this.sessionManager.getBranch(), threshold);
+		if (!plan) return { shrunk: false, reachedTarget: false };
+		const summary = buildEmergencyShrinkSummary(plan, {
+			consecutiveFailures: this._consecutiveCompactionFailures,
+			lastError,
+			thresholdTokens: threshold,
+		});
+		const leafId = this.sessionManager.getLeafId();
+		try {
+			this.sessionManager.appendCompaction(
+				summary,
+				plan.firstKeptEntryId,
+				plan.tokensBefore,
+				undefined,
+				false,
+				undefined,
+				{
+					leafId: leafId ?? undefined,
+					onCommit: (info) => {
+						sessionLog.warn("emergency context shrink committed", {
+							sessionId: this.sessionId,
+							...info,
+							droppedEntries: plan.span.droppedEntries,
+							droppedTokens: plan.span.droppedTokens,
+							reachedTarget: plan.reachedTarget,
+						});
+					},
+				},
+			);
+		} catch (error) {
+			// The valve must not become a second, quieter failure: report that the shrink
+			// itself could not be committed and leave the session exactly as it was.
+			sessionLog.error("emergency context shrink could not be committed", {
+				sessionId: this.sessionId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			this._persistCompactionOutcome(
+				reason,
+				"failed",
+				`Emergency context shrink could not be committed: ${
+					error instanceof Error ? error.message : String(error)
+				}. The context is still over the compaction threshold; use /tree, /fork, /model or /new.`,
+			);
+			return { shrunk: false, reachedTarget: false };
+		}
+		this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
+		this._mergeUnpersistedOutcomes(this.agent.state.messages);
+		this._restoreLateIpythonSentAgentMessages();
+		this._persistCompactionOutcome(reason, "failed", buildEmergencyShrinkNotice(plan, lastError));
+		await this._syncKernelStateAfterCompaction();
+		if (plan.reachedTarget) {
+			// The context is back under the threshold, so the cooldown that was armed for
+			// the failed attempt no longer describes reality. The failure streak stays: a
+			// further failure should shrink again instead of earning three fresh retries.
+			this._thresholdCompactionCooldown = undefined;
+		}
+		return { shrunk: true, reachedTarget: plan.reachedTarget };
+	}
+
 	private async _runAutoCompaction(
 		reason: "overflow" | "threshold" | "requested",
 		willRetry: boolean,
@@ -12128,6 +12437,7 @@ export class AgentSession {
 					queuedAutonomousContinuationsForThisCompaction,
 				);
 				if (reason === "threshold") this._armThresholdCompactionCooldown();
+				await this._runEmergencyContextShrink(reason, detail);
 				resumeAfterFailure();
 				return false;
 			}
@@ -12235,6 +12545,11 @@ export class AgentSession {
 				{ customInstructions },
 			);
 			if (reason === "threshold") this._armThresholdCompactionCooldown();
+			// Last resort: a streak of failures leaves the context over the threshold with
+			// no way back down, so the valve drops the oldest non-summary context and says
+			// so loudly. Runs before resumeAfterFailure so the continuation it schedules
+			// sees the shrunken context.
+			await this._runEmergencyContextShrink(reason, errorMessage);
 			resumeAfterFailure();
 			return false;
 		} finally {

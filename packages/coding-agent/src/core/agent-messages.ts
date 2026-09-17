@@ -29,7 +29,7 @@ export const SUBAGENT_TERMINAL_ERROR_SUMMARY_MAX_CHARS = 500;
 export type AgentSessionMessageDeliveryMode = "auto" | "steer" | "follow_up";
 export type AgentSessionMessageDeliveryStatus = "delivered" | "queued";
 /** Why a send was queued instead of delivered; reported back to the sender. */
-export type AgentMessageQueuedReason = "target_suspended" | "target_busy";
+export type AgentMessageQueuedReason = "target_suspended" | "target_busy" | "compaction_pending";
 export type AgentSessionMessageRuntimeKind = "top-level" | "subagent";
 export type AgentFamilyStatus = "running" | "idle" | "inactive";
 export type AgentFamilyRelationship = "parent" | "sibling" | "child";
@@ -836,7 +836,9 @@ export function formatAgentMessageQueuedNotice(input: {
 	const why =
 		input.reason === "target_suspended"
 			? "the target session is suspended (its turn was aborted), so nothing is reading right now"
-			: "the target session is busy with its current turn";
+			: input.reason === "compaction_pending"
+				? "the target session is compacting its context first (compaction outranks agent messages), so it is not reading right now"
+				: "the target session is busy with its current turn";
 	const position =
 		input.position !== undefined
 			? ` Position ${input.position}/${input.maxPending}.`
