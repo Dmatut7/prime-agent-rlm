@@ -1764,7 +1764,15 @@ async function ensureKernelPythonUncached(
 	// Before the warm early-return so a machine that never rebuilds still hears about the
 	// leftover pre-generation directory once (interactive boots only; see the callee).
 	reportLegacyKernelVenv(base, options);
-	if (await kernelReady(python, venv, runtimeIdentity, pythonSkills)) return claimedPython();
+	// No-skill callers (postinstall, runtime-bootstrap, bootstrap-cli) never sync skills;
+	// letting them reach syncPythonSkills would rewrite the marker with an empty list,
+	// wiping the recorded skills and forcing the next real session to re-sync every
+	// skill. They only need the base kernel to be ready.
+	const readyForCaller = async (): Promise<boolean> =>
+		pythonSkills.length === 0
+			? kernelBaseReady(python, venv, runtimeIdentity)
+			: kernelReady(python, venv, runtimeIdentity, pythonSkills);
+	if (await readyForCaller()) return claimedPython();
 
 	// The lock stays keyed on the base path, so pre- and post-generation hosts serialize
 	// on the same lock through a mixed-version window.
@@ -1773,7 +1781,7 @@ async function ensureKernelPythonUncached(
 		timeoutMs: options.lockTimeoutMs,
 	});
 	try {
-		if (await kernelReady(python, venv, runtimeIdentity, pythonSkills)) return claimedPython();
+		if (await readyForCaller()) return claimedPython();
 		if (await kernelBaseReady(python, venv, runtimeIdentity)) {
 			// The in-use invariant covers this branch too, and it used to be the one place that
 			// mutated a generation without reading its references: an editable reinstall swaps
