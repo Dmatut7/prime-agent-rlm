@@ -4785,10 +4785,12 @@ export class AgentSession {
 	 *
 	 * Deliberately not part of {@link isSessionActive}, which RLM quiescence and goal continuation
 	 * read: those wait for turn-level work, and a long-lived background handle must not park them.
-	 * Pure and O(1) - it reads the kernel client's own counters, never a file. `isKernelBashRunning`
-	 * attests the newest retained heartbeat, which stops flowing once the kernel sits idle; the
-	 * attestation then ages rather than refreshes, which errs toward keeping the session resident
-	 * until its next cell updates the facts.
+	 * Side-effect free for the caller, but not file-free: at most one cached `statSync`, because the
+	 * kernel-side `isKernelBashRunning` reads the orphan-process journal behind a cache (one bounded
+	 * read when the journal changed, or when a positive count outlived its TTL). That read is what
+	 * keeps the fact true while the kernel sits idle hosting a background script, and false once the
+	 * script exits - a heartbeat can do neither, since a runtime only sends frames while a request is
+	 * in flight.
 	 */
 	get isKernelWorkInFlight(): boolean {
 		const facts = this._kernelResidencyFacts ? this._kernelResidencyFacts() : this._kernelResidencyFactsFromClient();

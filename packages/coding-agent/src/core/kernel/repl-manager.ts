@@ -21,8 +21,17 @@ import { getLogger } from "@earendil-works/pi-ai";
 import { v4 as uuid } from "uuid";
 import { DEFAULT_SHORT_TARGET_WAIT_MS, withBound } from "../../utils/bounded-wait.js";
 import { assertRegularFileNoSymlink, ensurePrivateDirectory, requireNoFollow } from "../../utils/private-files.js";
-import { reapKernelOrphanProcesses, recordOrphanProcessState } from "../orphan-process-journal.js";
-import { shouldRetainHeartbeatSample } from "../turn-liveness.js";
+import {
+	ORPHAN_PROCESS_JOURNAL_ENV,
+	reapKernelOrphanProcesses,
+	recordOrphanProcessState,
+} from "../orphan-process-journal.js";
+import {
+	DEFAULT_KERNEL_BASH_RESIDENCY_WARN_AGE_MS,
+	kernelVouchedAlive,
+	readKernelBashResidency,
+	shouldRetainHeartbeatSample,
+} from "../turn-liveness.js";
 import { ensureKernelPython, KERNEL_PYTHON_SAFE_PATH_ARGS, managedKernelVenvDirForPython } from "./bootstrap.js";
 import {
 	classifyKernelExit,
@@ -132,6 +141,19 @@ const GATED_EVENT_KIND_MIN_PROTOCOL: Readonly<Record<string, number>> = {
 const KERNEL_LIVENESS_MAX_SAMPLES = 2;
 /** Rejection streaks are logged at 1 and then every N, so a broken runtime cannot flood the log. */
 const KERNEL_LIVENESS_REJECT_LOG_EVERY = 50;
+/**
+ * Lifetime of a *positive* journal-backed bash count (T3). The count is cached against the
+ * journal's identity (path, size, mtime), and identity alone is not quite a content key: a retire
+ * and an enrol landing inside one mtime tick with equal line lengths leave both size and mtime
+ * unchanged while the count they imply has changed. A positive count is the pinning direction, so
+ * it self-heals on this cadence instead; the idle sweep runs 30 minutes apart and therefore always
+ * reads a fact no older than this. The bound is per kernel and only paid when a reader asks, so the
+ * cost is one small bounded read per kernel per TTL - far below the roster and summary cadence the
+ * cache exists to survive.
+ */
+const KERNEL_BASH_RESIDENCY_CACHE_MS = 5_000;
+/** One warn per gap for a handle old enough to be worth naming: visible, not chatty (T2②-2). */
+const KERNEL_BASH_RESIDENCY_WARN_GAP_MS = 60 * 60 * 1000;
 /**
  * Host-callback failures are reported at 1 and then every N, so one broken handler on a stream
  * that emits thousands of frames cannot flood the log - while the accumulated count on each
@@ -483,6 +505,22 @@ export class ReplKernelManager {
 	/** Well-formed frames dropped for arriving inside the minimum sample gap. */
 	private throttledHeartbeatFrames = 0;
 	/**
+	 * Last journal-backed bash residency read, keyed on the journal identity it came from. An
+	 * unchanged file costs one `statSync`; a positive count is re-probed on a TTL as well, because
+	 * the fact it caches can go stale without the file changing (a handle killed without retiring
+	 * its record).
+	 */
+	private journaledBashHandlesCache?: {
+		path: string;
+		kernelPid: number;
+		size: number;
+		mtimeMs: number;
+		count: number;
+		readAt: number;
+	};
+	/** Last time an age-capped bash handle was reported; one warn per gap, not per read. */
+	private lastBashResidencyWarnAt = 0;
+	/**
 	 * Host callbacks and frame handling contained so far this episode. A callback runs inside a
 	 * stdout "data" handler, so an exception escaping it is an uncaught exception - which the
 	 * daemon worker turns into `process.exit(1)` for every session it hosts. They are counted,
@@ -700,12 +738,141 @@ export class ReplKernelManager {
 	}
 
 	/**
-	 * Whether the newest heartbeat reports live `bash()` handles. Deliberately not folded into the
-	 * session's `isBashRunning`, which reports the host's own bash tool: a kernel handle has a
-	 * different owner, and that field's meaning is already read by the UI.
+	 * Whether this kernel owns a live `bash()` handle right now.
+	 *
+	 * Two fact sources, because neither alone is both fresh and complete:
+	 *
+	 * - The orphan-process journal, which is the fresh one. `bash()` enrols the child before it
+	 *   returns (and fails closed when a configured journal cannot enrol it) and retires the record
+	 *   when the handle exits, so this stays true while an *idle* kernel hosts a background script
+	 *   and goes false the moment that script ends. Graded for a residency decision rather than a
+	 *   vouch - pid-probed, age-warned, fail-open: see {@link readKernelBashResidency}.
+	 * - The newest heartbeat frame, but only while that frame is still fresh. A runtime sends frames
+	 *   only while a request is in flight (`_heartbeat_frame` returns nothing for an idle kernel), so
+	 *   reading the newest frame alone distorts in *both* directions: a script that finished an hour
+	 *   ago still rides the last in-flight window's count and pins its session forever, and a handle
+	 *   spawned by a cell shorter than the frame interval never appears in any frame at all and is
+	 *   missed. Kept as a source because a host with no journal configured still gets an attestation
+	 *   from its own runtime, and a fresh attestation is worth exactly the window it covers.
+	 *
+	 * Fail-open (T2①): no journal, an unreadable journal, a kernel that is gone (`child` undefined,
+	 * including the zombie shape where journal rows were never retired) or a stale frame all read as
+	 * "no kernel work", which is the behaviour this getter had before the journal source existed. It
+	 * never throws: the callers are an eviction sweep and a summary builder.
+	 *
+	 * Both residency layers downstream of this getter inherit the change, because both read it
+	 * through `AgentSession.isKernelWorkInFlight`: the worker-local passivation snapshot carries it
+	 * as its own term (`SessionPassivationSnapshot.hasLiveKernelWork`), and the whole-worker eviction
+	 * on the supervisor side receives it inside the summary's existing `isSessionActive` field, which
+	 * `summaryForActiveSession` folds from the same getter (daemon-session-list.ts). Fixing the
+	 * getter's *reach* was the substantive half of r44 form A; wiring it into the passivation
+	 * snapshot was the other half, and neither covers the worker layer without the other's carrier.
+	 *
+	 * Deliberately not folded into the session's `isBashRunning`, which reports the host's own bash
+	 * tool (`_bashAbortControllers`): a kernel handle has a different owner, that set never sees it,
+	 * and that field's meaning is already read by the UI. Folding it into `AgentSession.isSessionActive`
+	 * is likewise forbidden - that getter feeds `waitForIdle`, RLM quiescence and goal continuation,
+	 * where a background handle is not turn work and would park them forever.
 	 */
 	get isKernelBashRunning(): boolean {
-		return (this.livenessSamples[0]?.bashHandles ?? 0) > 0;
+		const kernelPid = this.child?.pid;
+		if (kernelPid !== undefined && (this.journaledLiveBashHandles(kernelPid) ?? 0) > 0) return true;
+		const latest = this.livenessSamples[0];
+		if (latest === undefined || (latest.bashHandles ?? 0) <= 0) return false;
+		return kernelVouchedAlive(this.kernelLiveness, Date.now()).state === "fresh";
+	}
+
+	/**
+	 * Live `bash()` handles this kernel has in the orphan-process journal, or undefined when that
+	 * source cannot speak (no journal configured for this host, or a read that failed).
+	 *
+	 * Cached against the journal's identity plus a TTL: the file is shared by this host and all of
+	 * its kernels and is appended to on every spawn and exit, while the readers (summary builders,
+	 * roster composition) run far more often than handles come and go, so an unchanged file costs one
+	 * `statSync`. Identity is the fast path, not the whole key: a retire and an enrol inside one
+	 * mtime tick can leave size and mtime both unchanged while the count they imply changed (T3), so
+	 * every entry also expires on a TTL, in both directions - a stale positive would pin a session
+	 * that has nothing running, and a stale zero would miss the handle this fact exists to see. The
+	 * same TTL re-runs the pid probes behind a positive count, which is what retires a handle killed
+	 * without ever writing its exit record (D33).
+	 */
+	private journaledLiveBashHandles(kernelPid: number): number | undefined {
+		const path = process.env[ORPHAN_PROCESS_JOURNAL_ENV];
+		if (!path) return undefined;
+		let size: number;
+		let mtimeMs: number;
+		try {
+			const stats = statSync(path);
+			size = stats.size;
+			mtimeMs = stats.mtimeMs;
+		} catch {
+			// A configured journal that does not exist has no active records in it: an enrolment
+			// creates the file, so "no file" is a count of zero rather than a missing fact.
+			return 0;
+		}
+		const now = Date.now();
+		const cached = this.journaledBashHandlesCache;
+		if (
+			cached !== undefined &&
+			cached.path === path &&
+			cached.kernelPid === kernelPid &&
+			cached.size === size &&
+			cached.mtimeMs === mtimeMs &&
+			now - cached.readAt < KERNEL_BASH_RESIDENCY_CACHE_MS
+		) {
+			return cached.count;
+		}
+		const facts = readKernelBashResidency(kernelPid);
+		// Fail-open: an unreadable journal is "no fact", which leaves the heartbeat term in charge
+		// and, failing that, the behaviour this getter had before the journal source existed.
+		if (facts === undefined || "error" in facts) return undefined;
+		// Attribution on the transition, not on the state (T2②-1): residency that blocks an eviction
+		// has to be traceable to a handle count and an age, and a per-transition line is bounded by
+		// how often handles come and go rather than by how often summaries are composed.
+		const previousCount = cached?.kernelPid === kernelPid ? cached.count : undefined;
+		if (previousCount !== facts.liveBashHandles) {
+			const fields = {
+				kernelPid,
+				liveBashHandles: facts.liveBashHandles,
+				...(facts.oldestLiveAgeMs === undefined ? {} : { oldestHandleAgeMs: facts.oldestLiveAgeMs }),
+				journalProbedPids: facts.probed,
+				probeCapped: facts.capped,
+				sessionId: this.options.sessionId,
+			};
+			if (facts.liveBashHandles > 0) {
+				kernelLog.info("kernel bash handles now hold this session resident", fields);
+			} else if (previousCount !== undefined) {
+				kernelLog.info("kernel bash residency released; the session is reclaimable again", fields);
+			}
+		}
+		this.journaledBashHandlesCache = {
+			path,
+			kernelPid,
+			size,
+			mtimeMs,
+			count: facts.liveBashHandles,
+			readAt: now,
+		};
+		// Attribution (T2②): residency that outlives a day is legitimate but must not be silent, and
+		// it is a warn only - the handle is alive, so nothing here releases the pin or evicts.
+		const oldestAgeMs = facts.oldestLiveAgeMs;
+		if (
+			facts.liveBashHandles > 0 &&
+			oldestAgeMs !== undefined &&
+			oldestAgeMs >= DEFAULT_KERNEL_BASH_RESIDENCY_WARN_AGE_MS &&
+			now - this.lastBashResidencyWarnAt >= KERNEL_BASH_RESIDENCY_WARN_GAP_MS
+		) {
+			this.lastBashResidencyWarnAt = now;
+			kernelLog.warn("kernel bash handle is holding its session resident past the warn age", {
+				kernelPid,
+				liveBashHandles: facts.liveBashHandles,
+				oldestHandleAgeMs: oldestAgeMs,
+				journalProbedPids: facts.probed,
+				probeCapped: facts.capped,
+				sessionId: this.options.sessionId,
+			});
+		}
+		return facts.liveBashHandles;
 	}
 
 	/**
@@ -2510,6 +2677,9 @@ export class ReplKernelManager {
 		// its own first frame before anything vouches for it again, and a rejection streak from a
 		// broken predecessor must not pre-age the new episode's log throttling.
 		this.livenessSamples.length = 0;
+		// The journal count belongs to the child that owned those handles; a replacement kernel
+		// starts with no attested work of its own, exactly like the samples cleared above.
+		this.journaledBashHandlesCache = undefined;
 		this.rejectedHeartbeatFrames = 0;
 		this.consecutiveRejectedHeartbeatFrames = 0;
 		this.throttledHeartbeatFrames = 0;

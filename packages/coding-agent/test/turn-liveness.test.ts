@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,6 +18,7 @@ import {
 	type JournaledBashFacts,
 	kernelVouchedAlive,
 	readJournaledBashHandles,
+	readKernelBashResidency,
 	TURN_LIVENESS_REASONS,
 	type TurnLivenessEvent,
 	type TurnLivenessKernelFacts,
@@ -922,5 +924,119 @@ describe("staleness threshold vs host sample retention (r35 H-1)", () => {
 		expect(kernelVouchedAlive({ latest: sample({ receivedAt: T0, intervalMs: 5_000 }) }, T0 + 15_001).state).toBe(
 			"stale",
 		);
+	});
+});
+
+describe("readKernelBashResidency (r44 form A residency grade)", () => {
+	let tempDir = "";
+	let savedJournal: string | undefined;
+
+	function journalPath(): string {
+		return join(tempDir, "orphan-journal.jsonl");
+	}
+
+	function writeJournal(records: Record<string, unknown>[]): void {
+		writeFileSync(journalPath(), `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
+	}
+
+	function env(path?: string): NodeJS.ProcessEnv {
+		const base: NodeJS.ProcessEnv = { ...process.env };
+		delete base[ORPHAN_PROCESS_JOURNAL_ENV];
+		return path === undefined ? base : { ...base, [ORPHAN_PROCESS_JOURNAL_ENV]: path };
+	}
+
+	function record(
+		pid: number,
+		kernelPid: number | undefined,
+		recordedAt = new Date().toISOString(),
+	): Record<string, unknown> {
+		return {
+			version: 1,
+			pid,
+			ownerPid: process.pid,
+			...(kernelPid === undefined ? {} : { kernelPid }),
+			processStartId: `ps:resident-${pid}`,
+			active: true,
+			recordedAt,
+		};
+	}
+
+	beforeEach(() => {
+		savedJournal = process.env[ORPHAN_PROCESS_JOURNAL_ENV];
+		tempDir = mkdtempSync(join(tmpdir(), "prime-agent-kernel-residency-"));
+	});
+
+	afterEach(() => {
+		if (savedJournal === undefined) delete process.env[ORPHAN_PROCESS_JOURNAL_ENV];
+		else process.env[ORPHAN_PROCESS_JOURNAL_ENV] = savedJournal;
+		if (tempDir) {
+			rmSync(tempDir, { recursive: true, force: true });
+			tempDir = "";
+		}
+	});
+
+	it("counts a handle only while its pid still names a process (D33)", () => {
+		// The stale-record shape: a handle killed without retiring its record. Nothing else would
+		// ever retire it - the reaper runs when the kernel dies, and residency keeps the kernel
+		// alive - so without the probe it pins its session forever, self-sustaining.
+		writeJournal([record(1001, 4242), record(1002, 4242), record(2001, 9999), record(3001, undefined)]);
+		const facts = readKernelBashResidency(4242, {
+			env: env(journalPath()),
+			isPidAlive: (pid) => pid === 1001,
+		});
+		expect(facts).toMatchObject({ liveBashHandles: 1, probed: 2, capped: false });
+		// Positive control: with both pids alive the same file pins.
+		expect(readKernelBashResidency(4242, { env: env(journalPath()), isPidAlive: () => true })).toMatchObject({
+			liveBashHandles: 2,
+		});
+	});
+
+	it("probes a real dead pid and a real live one", async () => {
+		const deadPid = await new Promise<number>((resolve, reject) => {
+			const child = spawn(process.execPath, ["-e", "process.exit(0)"]);
+			child.on("exit", () => (child.pid === undefined ? reject(new Error("no pid")) : resolve(child.pid)));
+			child.on("error", reject);
+		});
+		writeJournal([record(deadPid, 4242), record(process.pid, 4242)]);
+		// The host's own pid is alive; the exited child's is not (pid reuse inside this window would
+		// be a machine-wide coincidence, and the identity check the reaper uses covers it in prod).
+		expect(readKernelBashResidency(4242, { env: env(journalPath()) })).toMatchObject({
+			liveBashHandles: 1,
+			probed: 2,
+		});
+	});
+
+	it("keeps an old handle resident and reports its age instead of releasing it (T2 ruling a)", () => {
+		const now = Date.parse("2026-08-02T12:00:00.000Z");
+		const old = new Date(now - 30 * 24 * 60 * 60 * 1000).toISOString();
+		writeJournal([record(1001, 4242, old)]);
+		const facts = readKernelBashResidency(4242, { env: env(journalPath()), now: () => now, isPidAlive: () => true });
+		// Alive means resident, however old: a legitimate long-running operations script is the
+		// workload this fact exists to protect. The age is reported so the caller can warn.
+		expect(facts).toMatchObject({ liveBashHandles: 1, oldestLiveAgeMs: 30 * 24 * 60 * 60 * 1000 });
+	});
+
+	it("bounds the probe cost and counts the unprobed remainder live", () => {
+		writeJournal([1001, 1002, 1003, 1004, 1005].map((pid) => record(pid, 4242)));
+		const facts = readKernelBashResidency(4242, {
+			env: env(journalPath()),
+			maxProbes: 2,
+			isPidAlive: () => true,
+		});
+		expect(facts).toMatchObject({ liveBashHandles: 5, probed: 2, capped: true });
+	});
+
+	it("fails open: no journal, no kernel pid, or an unreadable journal is never a throw", () => {
+		writeJournal([record(1001, 4242)]);
+		expect(readKernelBashResidency(4242, { env: env(undefined) })).toBeUndefined();
+		expect(readKernelBashResidency(undefined, { env: env(journalPath()) })).toBeUndefined();
+		expect(readKernelBashResidency(0, { env: env(journalPath()) })).toBeUndefined();
+
+		// A directory where the journal file should be: the read fails, the caller falls back.
+		const broken = join(tempDir, "broken-journal");
+		mkdirSync(broken);
+		const failed = readKernelBashResidency(4242, { env: env(broken) });
+		expect(failed).toBeDefined();
+		expect(failed !== undefined && "error" in failed).toBe(true);
 	});
 });

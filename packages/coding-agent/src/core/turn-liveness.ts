@@ -378,6 +378,132 @@ export function readJournaledBashHandles(
 	}
 }
 
+/** Cost bound on the pid probes behind one residency read (D33a). */
+export const DEFAULT_KERNEL_BASH_PROBE_MAX = 32;
+
+/**
+ * Age at which a residency-pinning `bash()` handle gets one forensic warn (T2②-2).
+ *
+ * A warn, not a release. The ruling behind this constant is that an *indefinite* pin is the
+ * accepted behaviour for a handle whose process is demonstrably alive: killing a legitimate
+ * long-running operations script is the bug this fact source exists to fix, and "the process is
+ * alive" is a different question from "the process died and nobody retired its record" - the pid
+ * probe below answers the second one. What the age cannot buy is silence: past this age the host
+ * says once (per gap, per kernel) that a session is being held resident by a handle of that age, so
+ * an operator who expected it to be reclaimed can see why it was not and use one of the documented
+ * exits (delete the subagent, shut the session down, or kill the script).
+ */
+export const DEFAULT_KERNEL_BASH_RESIDENCY_WARN_AGE_MS = 24 * 60 * 60 * 1000;
+
+/** What one residency read found: verified live handles, their oldest age, and the probe cost. */
+export type KernelBashResidencyFacts =
+	| {
+			/** Handles journaled active whose pid still names a process. */
+			liveBashHandles: number;
+			/** Age of the oldest live handle in ms; absent when none is live or none carries a stamp. */
+			oldestLiveAgeMs?: number;
+			/** Pids this read probed. */
+			probed: number;
+			/** True when candidates outnumbered the probe cap: the count is then a lower bound. */
+			capped: boolean;
+	  }
+	| { error: string };
+
+export interface KernelBashResidencyOptions {
+	env?: NodeJS.ProcessEnv;
+	now?: () => number;
+	/** Probe cap. Default {@link DEFAULT_KERNEL_BASH_PROBE_MAX}. */
+	maxProbes?: number;
+	/** Pid existence probe; injectable so tests need no real processes. Default `kill(pid, 0)`. */
+	isPidAlive?: (pid: number) => boolean;
+}
+
+/**
+ * Journaled `bash()` handles of one kernel, graded for a *residency* decision rather than for a
+ * stall vouch.
+ *
+ * Same source as {@link readJournaledBashHandles}, different contract, and the difference is the
+ * reason this exists. The watchdog asks "is something alive enough to excuse 20 more minutes of
+ * silence", where a stale record costs one bounded budget and skipping the pid check is a fair
+ * trade. Residency asks "may I close this session and SIGTERM its process groups", with no expiry
+ * and - since the watchdog defaults to warn-only - no other reaper behind it, so this reader pays
+ * for a pid probe per candidate: a handle that died without retiring its record (a kernel SIGKILLed
+ * mid-append, a torn line, a runtime that lost its exit hook) must not pin its session forever, and
+ * nothing else would ever retire that record, because the reaper that does runs when the kernel
+ * dies and residency is exactly what keeps that kernel alive.
+ *
+ * Fail-open by contract (T2①): no journal configured, no kernel pid, or a read that throws returns
+ * `undefined`/`{error}` rather than a guess or a throw, and the caller falls back to the behaviour
+ * it had before this fact existed. "Cannot prove live work" must mean "reclaimable as today", never
+ * "resident forever" and never an exception inside an eviction sweep.
+ *
+ * Still a lower bound, in two documented ways: the bounded tail read can miss a record whose newest
+ * line fell outside the window, and candidates past the probe cap are counted live without a probe
+ * (the direction that keeps a real script resident).
+ */
+export function readKernelBashResidency(
+	kernelPid: number | undefined,
+	options: KernelBashResidencyOptions = {},
+): KernelBashResidencyFacts | undefined {
+	const env = options.env ?? process.env;
+	const path = env[ORPHAN_PROCESS_JOURNAL_ENV];
+	if (!path || kernelPid === undefined || !Number.isInteger(kernelPid) || kernelPid <= 0) {
+		return undefined;
+	}
+	const now = (options.now ?? Date.now)();
+	const maxProbes = options.maxProbes ?? DEFAULT_KERNEL_BASH_PROBE_MAX;
+	const isPidAlive = options.isPidAlive ?? defaultPidAlive;
+	try {
+		const records = readActiveOrphanProcesses(path, process.pid, { maxBytes: DEGRADED_READ_MAX_BYTES });
+		// The journal is shared by the host and its kernels; records written by a kernel carry the
+		// host's pid as owner and the kernel's pid as kernelPid. The kernel's own record is not a
+		// bash handle.
+		const candidates = records.filter((record) => record.kernelPid === kernelPid && record.pid !== kernelPid);
+		let liveBashHandles = 0;
+		let oldestLiveAgeMs: number | undefined;
+		let probed = 0;
+		let capped = false;
+		for (const record of candidates) {
+			if (probed >= maxProbes) {
+				// Cost bound reached: count the rest as live rather than guessing they are dead.
+				capped = true;
+				liveBashHandles += 1;
+				continue;
+			}
+			probed += 1;
+			if (!isPidAlive(record.pid)) continue;
+			liveBashHandles += 1;
+			const recordedAt = record.recordedAt === undefined ? undefined : Date.parse(record.recordedAt);
+			if (recordedAt === undefined || !Number.isFinite(recordedAt)) continue;
+			const ageMs = now - recordedAt;
+			if (ageMs > 0 && (oldestLiveAgeMs === undefined || ageMs > oldestLiveAgeMs)) oldestLiveAgeMs = ageMs;
+		}
+		return {
+			liveBashHandles,
+			...(oldestLiveAgeMs === undefined ? {} : { oldestLiveAgeMs }),
+			probed,
+			capped,
+		};
+	} catch (error) {
+		return { error: error instanceof Error ? error.message : String(error) };
+	}
+}
+
+/**
+ * Does this pid still name a process. `kill(pid, 0)` never signals; EPERM means it exists and
+ * belongs to somebody else, which for a residency question is still "alive". Deliberately not the
+ * start-id identity check: that one spawns a helper process per pid on macOS/BSD, and the age warn
+ * above is the bounded answer to pid reuse instead.
+ */
+function defaultPidAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
 /** Build the aggregate. Every injected function is called at most once per sample. */
 export function createTurnLiveness(options: TurnLivenessOptions): TurnLiveness {
 	const now = options.now ?? (() => Date.now());

@@ -259,10 +259,20 @@ export function summaryForActiveSession(
 		id: activeSession.activeSessionId,
 		lifecycle: activeLifecycleForSession(activeSession),
 		activity: activeActivityForSession(activeSession),
-		// Kernel-owned work (a cell in flight, or live bash() handles the heartbeat attests)
+		// Kernel-owned work (a cell in flight, or live bash() handles the journal/heartbeat attest)
 		// keeps the row active: this field drives child passivation and whole-worker eviction,
 		// both of which close the session's kernel and with it any background script the session
 		// is hosting (LIVE-1, r44). Optional on stub sessions; undefined reads as no kernel.
+		//
+		// This fold is the load-bearing carrier of the fact across the process boundary - the
+		// supervisor has no kernel to observe, so it learns about kernel work only through here,
+		// via agent-roster.ts isSessionSummaryBusy into canEvictWorker and
+		// isEvictableEmptySessionSummary. Two consumers depend on it and neither can see it:
+		// removing the `|| isKernelWorkInFlight` term silently reopens r44 form A for whole-worker
+		// eviction and empty-session reclamation. It is locked by
+		// test/suite/live-kernel-work-residency.test.ts. The worker-side passivation snapshot also
+		// carries the fact as its own term (daemon-mode.ts sessionPassivationSnapshot ->
+		// SessionEvictionSnapshot.hasLiveKernelWork); that one is defence in depth, this one is not.
 		isSessionActive: session.isSessionActive || session.isKernelWorkInFlight === true,
 		hasActiveHeartbeat: hasActiveHeartbeat || undefined,
 		hasRegisteredHeartbeat: hasRegisteredHeartbeat || undefined,

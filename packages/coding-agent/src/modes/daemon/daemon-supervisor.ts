@@ -1777,6 +1777,26 @@ export class DaemonSupervisor {
 				.map((summary) => {
 					const activeSessionId = summary.activeSessionId ?? summary.id;
 					return {
+						// `hasLiveKernelWork` is deliberately not set here: the supervisor hosts no
+						// kernel and cannot observe one. The kernel term reaches this snapshot inside
+						// the existing `isSessionActive` field instead - the worker folds
+						// `session.isKernelWorkInFlight` into the summary it reports
+						// (daemon-session-list.ts summaryForActiveSession), `isSessionSummaryBusy`
+						// maps that summary into this row - so one session hosting a live kernel
+						// bash() handle fails canEvictWorker's `every(...)` and the whole nest stays
+						// resident (r44 form A). This is the second of the two carriers; the first is
+						// the worker-local passivation snapshot's own `hasLiveKernelWork` term
+						// (daemon-mode.ts sessionPassivationSnapshot). They are independent: either
+						// one removed silently reopens r44 form A on its own layer, so each has a
+						// lock test.
+						//
+						// Protocol ruling (T1): nothing crosses the wire here. No new field, no
+						// capability gate, no DAEMON_SCHEMA_REVISION (37) bump, no
+						// DAEMON_PROTOCOL_VERSION (7) bump. Degradation is therefore automatic and
+						// needs no code: an older worker that does not fold reports plain turn-level
+						// activity, this row reads exactly as it did before, and whole-worker eviction
+						// behaves as it does today - the pre-fix behaviour, which is the accepted cost
+						// of a mixed-version window, not a new failure.
 						isSessionActive: isSessionSummaryBusy(summary),
 						attachedClients: this.attachedClientCount(summary, activeSessionId),
 						hasRegisteredCronJob: summary.hasRegisteredCronJob === true,

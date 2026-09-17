@@ -244,6 +244,121 @@ describe("daemon supervisor whole-tree eviction", () => {
 		expect(supervisor.stopWorker).toHaveBeenCalledWith(whollyIdle, true);
 	});
 
+	it("keeps a worker resident when a session hosts live kernel bash work", async () => {
+		const now = Date.parse("2026-08-01T12:00:00.000Z");
+		const supervisor = makeSupervisor();
+		// r44 form A: a child started a background bash() inside its Python kernel and then ended its
+		// turn. Nothing at the turn level is active and the host-side bash tool is idle
+		// (isBashRunning false) - the kernel handle has a different owner - so the only carrier of the
+		// fact across the worker boundary is the summary's isSessionActive, which the worker folds
+		// from its own kernel liveness. Evicting the nest would close that kernel and SIGTERM the
+		// script's process group.
+		const kernelBash = makeWorker("kernel-bash", [
+			makeSummary("kernel-bash-root", now),
+			makeSummary("kernel-bash-child", now, {
+				runtimeKind: "subagent",
+				parentActiveSessionId: "kernel-bash-root",
+				isBashRunning: false,
+				isSessionActive: true,
+			}),
+		]);
+		kernelBash.client!.requestWorker.mockResolvedValue({
+			type: "response",
+			command: "worker_passivate_idle_children",
+			success: true,
+			data: { count: 0 },
+		});
+		const idle = makeWorker("idle", [makeSummary("idle-root", now)]);
+		for (const worker of [kernelBash, idle]) supervisor.workers.set(worker.descriptor.workerId, worker);
+		seedSupervisorRoster(supervisor, kernelBash, idle);
+
+		await supervisor.runIdleEvictionSweep(now);
+
+		// The idle nest still goes: the kernel term pins one worker, not the sweep.
+		expect(supervisor.stopWorker).toHaveBeenCalledTimes(1);
+		expect(supervisor.stopWorker).toHaveBeenCalledWith(idle, true);
+		expect(supervisor.log).toHaveBeenCalledWith(expect.stringMatching(/Evicted idle worker idle /));
+		expect(supervisor.log).not.toHaveBeenCalledWith(expect.stringMatching(/Evicted idle worker kernel-bash/));
+		expect(supervisor.workers.get("kernel-bash")).toBe(kernelBash);
+		// Not evictable, so it gets the child passivation delegation instead - where the worker's own
+		// snapshot applies the same kernel term to the child that is hosting the handle.
+		expect(kernelBash.client?.requestWorker).toHaveBeenCalledWith(
+			expect.objectContaining({ type: "worker_passivate_idle_children" }),
+			30_000,
+		);
+	});
+
+	it("keeps a worker resident when kernel bash work lands during the eviction drain", async () => {
+		const now = Date.parse("2026-08-01T12:00:00.000Z");
+		const supervisor = makeSupervisor();
+		const worker = makeWorker("kernel-late", [makeSummary("kernel-late-root", now)]);
+		supervisor.workers.set("kernel-late", worker);
+		seedSupervisorRoster(supervisor, worker);
+		// The worker starts a background bash() between the sweep's first pull and the fenced recheck.
+		// Only the summary's isSessionActive carries the fact across this boundary; the host-side bash
+		// tool is idle, so a supervisor that read isBashRunning would see nothing and stop the nest.
+		const busy = makeSummary("kernel-late-root", now, { isBashRunning: false, isSessionActive: true });
+		worker
+			.client!.request.mockImplementationOnce(async () =>
+				success(undefined, "list", { sessions: [makeSummary("kernel-late-root", now)] }),
+			)
+			.mockImplementation(async () => {
+				supervisor.writeRosterEntry(workerRosterEntryFromSummary(busy), worker);
+				return success(undefined, "list", { sessions: [busy] });
+			});
+
+		await supervisor.runIdleEvictionSweep(now);
+
+		expect(supervisor.stopWorker).not.toHaveBeenCalled();
+		expect(supervisor.workers.get("kernel-late")).toBe(worker);
+	});
+
+	it("evicts again once the kernel work is gone, so the pin is not permanent", async () => {
+		const now = Date.parse("2026-08-01T12:00:00.000Z");
+		const supervisor = makeSupervisor();
+		const busy = makeSummary("recover-root", now, { isBashRunning: false, isSessionActive: true });
+		const idle = makeSummary("recover-root", now);
+		const worker = makeWorker("recovering", [busy]);
+		worker.client!.requestWorker.mockResolvedValue({
+			type: "response",
+			command: "worker_passivate_idle_children",
+			success: true,
+			data: { count: 0 },
+		});
+		supervisor.workers.set("recovering", worker);
+		seedSupervisorRoster(supervisor, worker);
+
+		await supervisor.runIdleEvictionSweep(now);
+		expect(supervisor.stopWorker).not.toHaveBeenCalled();
+
+		// The script exited: the worker's next report carries no kernel term, and the same sweep that
+		// was blocked a moment ago now reclaims the nest. Nothing about the first pin is sticky.
+		worker.client!.request.mockImplementation(async () => success(undefined, "list", { sessions: [idle] }));
+		supervisor.writeRosterEntry(workerRosterEntryFromSummary(idle), worker);
+		await supervisor.runIdleEvictionSweep(now + 60_000);
+		expect(supervisor.stopWorker).toHaveBeenCalledWith(worker, true);
+		expect(supervisor.log).toHaveBeenCalledWith(expect.stringMatching(/Evicted idle worker recovering /));
+	});
+
+	it("evicts a worker whose own build cannot attest kernel work (mixed-version degradation)", async () => {
+		const now = Date.parse("2026-08-01T12:00:00.000Z");
+		const supervisor = makeSupervisor();
+		// T1: the kernel term rides an existing wire field, so an older worker that does not fold it
+		// reports plain turn-level activity and its rows read exactly as they did before the fix. The
+		// accepted cost of a mixed-version window is therefore the pre-fix behaviour - the script can
+		// still be evicted - and not a new failure mode. Pinned so the degradation stays a decision
+		// on the record instead of a surprise, and so no capability gate is invented for it later.
+		const oldWorker = makeWorker("old-build", [
+			makeSummary("old-build-root", now, { isSessionActive: false, isBashRunning: false }),
+		]);
+		supervisor.workers.set("old-build", oldWorker);
+		seedSupervisorRoster(supervisor, oldWorker);
+
+		await supervisor.runIdleEvictionSweep(now);
+
+		expect(supervisor.stopWorker).toHaveBeenCalledWith(oldWorker, true);
+	});
+
 	it("does not fence unrelated mutations while child passivation is in flight", async () => {
 		const now = Date.parse("2026-08-01T12:00:00.000Z");
 		const supervisor = makeSupervisor();
@@ -608,6 +723,44 @@ describe("daemon supervisor empty-session eviction on detach", () => {
 
 		await vi.waitFor(() => expect(supervisor.stopWorker).toHaveBeenCalledWith(worker, true));
 		expect(supervisor.log).toHaveBeenCalledWith(expect.stringContaining("Evicted empty session worker draft"));
+	});
+
+	it("does not reclaim an empty draft whose kernel hosts a live bash handle", async () => {
+		const now = Date.parse("2026-08-01T12:00:00.000Z");
+		const supervisor = makeSupervisor();
+		// The third harvest point: empty-session reclamation on last detach also closes the worker,
+		// and with it the kernel. It is covered by the same folded summary term - `messageCount: 0`
+		// and no name are not evidence of an empty kernel - but by a different mechanism than the
+		// idle sweep, so it is pinned separately: a future simplification of the fold would otherwise
+		// lose this layer silently.
+		const liveSummaries = [
+			makeSummary("draft-root", now, {
+				messageCount: 0,
+				directAttachedClients: 1,
+				isBashRunning: false,
+				isSessionActive: true,
+			}),
+		];
+		const worker = makeWorker("kernel-draft", liveSummaries);
+		supervisor.workers.set("kernel-draft", worker);
+		seedSupervisorRoster(supervisor, worker);
+
+		const detach = (summary: SessionSummary): void => {
+			liveSummaries[0] = summary;
+			worker.summaries.set("draft-root", summary);
+			supervisor.writeRosterEntry(workerRosterEntryFromSummary(summary), worker);
+		};
+		// The last viewer leaves while the kernel still hosts a handle.
+		detach(makeSummary("draft-root", now, { messageCount: 0, isBashRunning: false, isSessionActive: true }));
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(supervisor.stopWorker).not.toHaveBeenCalled();
+
+		// Positive control: the same draft, re-attached and detached again with no kernel work left,
+		// is reclaimed by the very path that just refused.
+		detach(makeSummary("draft-root", now, { messageCount: 0, directAttachedClients: 1 }));
+		detach(makeSummary("draft-root", now, { messageCount: 0 }));
+		await vi.waitFor(() => expect(supervisor.stopWorker).toHaveBeenCalledWith(worker, true));
+		expect(supervisor.log).toHaveBeenCalledWith(expect.stringContaining("Evicted empty session worker kernel-draft"));
 	});
 
 	it("evicts a mixed-client empty draft only when the last of both client kinds is gone", async () => {

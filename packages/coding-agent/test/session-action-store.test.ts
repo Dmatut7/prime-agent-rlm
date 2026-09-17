@@ -271,6 +271,11 @@ describe("whole-tree eviction capability", () => {
 		],
 		["attached client", { sessions: [{ ...idleSession, attachedClients: 1 }] }],
 		["cron job", { sessions: [{ ...idleSession, hasRegisteredCronJob: true }] }],
+		["session hosting a live kernel bash handle", { sessions: [{ ...idleSession, hasLiveKernelWork: true }] }],
+		[
+			"worker with one kernel-busy session among idle ones",
+			{ sessions: [idleSession, { ...idleSession, hasLiveKernelWork: true }] },
+		],
 		["missing activity timestamp", { sessions: [{ ...idleSession, lastActivityAt: Number.NaN }] }],
 		["owner client", { hasOwnerClient: true }],
 		["wake-blind schedule", { hasWakeBlindSchedule: true }],
@@ -312,12 +317,26 @@ describe("child passivation capability", () => {
 		["child with a resident descendant", { hasNonPassiveDescendants: true }],
 		["hydrating child", { isHydrating: true }],
 		["busy child", { isSessionActive: true }],
+		["child hosting live kernel bash work", { hasLiveKernelWork: true }],
 		["attached child", { attachedClients: 1 }],
 		["cron child", { hasRegisteredCronJob: true }],
 		["recent child", { lastActivityAt: now - 89 * 60_000 }],
 		["child without activity time", { lastActivityAt: Number.NaN }],
 	])("rejects a %s", (_name, override) => {
 		expect(canPassivateSession({ ...idleChild, ...override }, 90, now)).toBe(false);
+	});
+
+	it("holds a child whose kernel hosts live work while everything at the turn level reads idle", () => {
+		// The r44 form A shape: the turn ended, no host-side bash controller is live, and the
+		// kernel still owns a background script's process group. Closing the session closes the
+		// kernel, which SIGTERMs that group, so the kernel fact alone must block the passivation.
+		const kernelBusy = { ...idleChild, isSessionActive: false, hasLiveKernelWork: true };
+		expect(canPassivateSession(kernelBusy, 90, now)).toBe(false);
+
+		// Positive control: with the kernel term reporting no work - false, or absent because the
+		// snapshot's author cannot observe a kernel - the very same child passivates as before.
+		expect(canPassivateSession({ ...kernelBusy, hasLiveKernelWork: false }, 90, now)).toBe(true);
+		expect(canPassivateSession({ ...kernelBusy, hasLiveKernelWork: undefined }, 90, now)).toBe(true);
 	});
 
 	it("shares the whole-tree off and invalid threshold behavior", () => {

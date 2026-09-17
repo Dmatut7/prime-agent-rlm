@@ -306,6 +306,8 @@ const AGENT_MESSAGE_QUEUED_RUN_TRACKING_LIMIT = 500;
 const WORKER_SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS = 1_000;
 /** One line per window: a supervisor that is down is asked by every roster pass. */
 const AGENT_DIRECTORY_FAILURE_LOG_MIN_GAP_MS = 60_000;
+/** Minimum gap between two "held resident by live kernel work" lines for the same session. */
+const KERNEL_RESIDENCY_LOG_GAP_MS = 6 * 60 * 60 * 1000;
 const UPDATE_RESTART_PREPARE_TIMEOUT_MS = 90_000;
 const MAX_SESSION_SNAPSHOT_STABILIZATION_RETRIES = 3;
 /**
@@ -2885,6 +2887,25 @@ export class AgentDaemon {
 			) || state.runtime.session.hasPendingAdmissionWaiters;
 		return {
 			isSessionActive: summary.isSessionActive || summary.hasRunningRlmChildren === true || hasPendingAdmission,
+			// The same expression minus the kernel fold that summaryForActiveSession applies, so the
+			// residency attribution log can tell "the kernel fact is what holds this session" from
+			// "it was resident anyway". Attribution only; the policy reads isSessionActive.
+			isSessionActiveIgnoringKernelWork:
+				state.runtime.session.isSessionActive || summary.hasRunningRlmChildren === true || hasPendingAdmission,
+			// Kernel liveness as its own term, read straight off the session rather than inherited
+			// from the summary's isSessionActive fold: passivation closes the kernel, and the kernel
+			// SIGTERMs every live bash() process group, so a background script a finished turn left
+			// running is residency evidence even though nothing at the turn level is active. The
+			// host-side bash controllers behind isBashRunning never see kernel handles (r44 form A).
+			// Carrier 1 of 2, and the redundant one by construction: the summary this snapshot is
+			// built from already folds the same fact into isSessionActive, so this layer would hold
+			// even without the term. It is set anyway so passivation does not depend on a fold owned
+			// by another module (daemon-session-list.ts), and it is what the residency attribution
+			// below reads. Carrier 2 - the fold the supervisor consumes, since the supervisor has no
+			// kernel to observe - is the load-bearing one for whole-worker eviction and empty-session
+			// reclamation; deleting it reddens test/suite/live-kernel-work-residency.test.ts, while
+			// deleting this term reddens the policy tests in test/session-action-store.test.ts.
+			hasLiveKernelWork: state.runtime.session.isKernelWorkInFlight === true,
 			attachedClients: state.clients.size + state.pendingAttaches,
 			hasRegisteredCronJob: jobs.some((job) => !isHeartbeatCronJob(job)),
 			lastActivityAt: Date.parse(summary.lastActivityAt ?? ""),
@@ -2976,6 +2997,12 @@ export class AgentDaemon {
 	/** Last supervisor clock reading plus this side's monotonic anchor for it. */
 	private foreignPassivationClock: { wall: number; mono: number } | undefined;
 
+	/**
+	 * When each session last logged "idle, but held resident by kernel work". Residency that blocks
+	 * a sweep must be attributable (T2②-1) without becoming a line per sweep per session forever.
+	 */
+	private readonly kernelResidencyLogAt = new Map<string, number>();
+
 	private async passivateIdleChildren(
 		idleEvictionMinutes: IdleEvictionMinutes,
 		now: number,
@@ -2996,6 +3023,7 @@ export class AgentDaemon {
 				snapshot: await this.sessionPassivationSnapshot(state, passiveRlmSubagents),
 			})),
 		);
+		this.logKernelPinnedResidency(snapshots, idleEvictionMinutes, now);
 		const candidates = snapshots
 			.filter(({ snapshot }) => canPassivateSession(snapshot, idleEvictionMinutes, now))
 			.sort((left, right) => left.snapshot.lastActivityAt - right.snapshot.lastActivityAt)
@@ -3004,6 +3032,57 @@ export class AgentDaemon {
 			candidates.map(({ state, snapshot }) => this.passivateSession(state, idleEvictionMinutes, now, snapshot)),
 		);
 		return results.filter(Boolean).length;
+	}
+
+	/**
+	 * Name the sessions this sweep would have passivated on age alone but for their live kernel work.
+	 *
+	 * The idle threshold does not apply to a session whose kernel still owns a `bash()` handle:
+	 * passivating it would close the kernel, whose shutdown SIGTERMs that handle's process group, and
+	 * the transcript would look perfectly healthy afterwards (r44 form A). The pin is accepted for as
+	 * long as the handle lives - a live process is the workload this policy exists to protect - so it
+	 * is logged instead of timed out. Same carrier as the whole-worker layer, which reads the fact
+	 * inside the summary's `isSessionActive` (folded in summaryForActiveSession) rather than through
+	 * this snapshot; the two paths are independent and each has its own lock test.
+	 */
+	private logKernelPinnedResidency(
+		snapshots: readonly { state: ActiveSessionState; snapshot: SessionPassivationSnapshot }[],
+		idleEvictionMinutes: IdleEvictionMinutes,
+		now: number,
+	): void {
+		// Bounded: entries only accumulate for sessions that are still resident.
+		for (const key of this.kernelResidencyLogAt.keys()) {
+			if (!this.sessions.has(key)) this.kernelResidencyLogAt.delete(key);
+		}
+		for (const { state, snapshot } of snapshots) {
+			if (snapshot.hasLiveKernelWork !== true) continue;
+			// Attribute only what this rule actually caused: log when the sweep *would* have
+			// passivated the session had the kernel term not been there. The inverse test (skip
+			// when it would have passivated) reports sessions that are resident for their own
+			// reasons - a root session, one idle for only minutes, one held by a cron job or an
+			// attached client - as "kept resident for live kernel bash work", which is the
+			// misleading forensic this line exists to prevent.
+			if (
+				!canPassivateSession(
+					{
+						...snapshot,
+						hasLiveKernelWork: false,
+						isSessionActive: snapshot.isSessionActiveIgnoringKernelWork ?? snapshot.isSessionActive,
+					},
+					idleEvictionMinutes,
+					now,
+				)
+			) {
+				continue;
+			}
+			const key = state.activeSessionId;
+			const last = this.kernelResidencyLogAt.get(key);
+			if (last !== undefined && now - last < KERNEL_RESIDENCY_LOG_GAP_MS) continue;
+			this.kernelResidencyLogAt.set(key, now);
+			this.log(
+				`Kept idle child resident for live kernel bash work sessionId=${state.runtime.session.sessionId} name=${JSON.stringify(state.runtime.session.sessionName ?? "")} idleMinutes=${Math.floor((now - snapshot.lastActivityAt) / 60_000)}`,
+			);
+		}
 	}
 
 	private findPassivationBySessionFile(sessionFile: string): Promise<void> | undefined {

@@ -365,6 +365,55 @@ export interface SessionEvictionSnapshot {
 	attachedClients: number;
 	hasRegisteredCronJob: boolean;
 	lastActivityAt: number;
+	/**
+	 * Kernel-owned work this session is hosting: a cell executing right now, or a live `bash()`
+	 * handle its Python kernel owns (r44 form A).
+	 *
+	 * Its own term rather than a reuse of `isSessionActive` because of a sampling blind spot:
+	 * `isSessionActive`'s bash component (`AgentSession.isBashRunning`) counts only the host-side
+	 * bash tool's controllers (`_bashAbortControllers`). A handle started by `bash()` *inside the
+	 * kernel* never enters that set, so a session whose turn ended with a background script running
+	 * reports turn-idle forever while the kernel still owns live process groups - and evicting it
+	 * closes the session, which closes the kernel, whose shutdown SIGTERMs every one of those
+	 * groups. The transcript survives and the session rehydrates, so nothing ever reports the kill.
+	 *
+	 * Semantics: live kernel work means "not idle", never "idle later". `idleEvictionMinutes` is
+	 * untouched, and a session whose kernel holds no handle and executes no cell evicts exactly as
+	 * it did before this term existed.
+	 *
+	 * Optional, and absent means "no fact": a snapshot built by a side that cannot observe the
+	 * kernel (an older worker's summary, a stub row, a session with no kernel) leaves it undefined
+	 * and the policy degrades to the behaviour it had before. Never inferred from a missing fact.
+	 *
+	 * Two carriers feed the shared threshold below, one per layer, and they are NOT equally load
+	 * bearing - the difference is measured, not assumed:
+	 *
+	 * - The supervisor, which has no kernel to observe, receives the fact inside the
+	 *   `isSessionActive` its worker folded from `AgentSession.isKernelWorkInFlight`
+	 *   (daemon-session-list.ts summaryForActiveSession). That fold is the load-bearing carrier for
+	 *   whole-worker eviction and for empty-session reclamation; deleting it reddens
+	 *   test/suite/live-kernel-work-residency.test.ts.
+	 * - The worker also sets this term on its own passivation snapshot
+	 *   (daemon-mode.ts sessionPassivationSnapshot). On that layer it is defence in depth, not the
+	 *   only wall: the same snapshot's `isSessionActive` already carries the fold, so deleting this
+	 *   term alone does NOT reopen r44 form A there - which is why its lock is the policy-level test
+	 *   in test/session-action-store.test.ts (both policies read `isIdleEvictionThresholdMet`) plus
+	 *   the residency attribution log, and not a daemon-mode integration case. What the term buys is
+	 *   that passivation stops depending on a fold owned by another module.
+	 */
+	hasLiveKernelWork?: boolean;
+	/**
+	 * `isSessionActive` with the kernel-work fold taken back out. Attribution only: it is never a
+	 * policy input, and `isIdleEvictionThresholdMet` must not read it.
+	 *
+	 * It exists because the worker folds `AgentSession.isKernelWorkInFlight` into the
+	 * `isSessionActive` it reports (daemon-session-list.ts summaryForActiveSession), so a snapshot's
+	 * `isSessionActive` is already true whenever kernel work is live. Clearing `hasLiveKernelWork`
+	 * alone therefore cannot answer "would this session have been reclaimed if not for the kernel
+	 * fact", which is the only question the residency attribution log is allowed to answer. Optional:
+	 * a snapshot that does not carry it falls back to `isSessionActive`, i.e. to not attributing.
+	 */
+	isSessionActiveIgnoringKernelWork?: boolean;
 }
 
 export interface SessionPassivationSnapshot extends SessionEvictionSnapshot {
@@ -393,6 +442,10 @@ function isIdleEvictionThresholdMet(
 	}
 	return (
 		!session.isSessionActive &&
+		// Kernel-hosted work is residency evidence of its own: both this per-session policy and
+		// the whole-worker one below close the session's kernel, and the kernel takes every live
+		// bash() process group with it. See SessionEvictionSnapshot.hasLiveKernelWork.
+		session.hasLiveKernelWork !== true &&
 		session.attachedClients === 0 &&
 		!session.hasRegisteredCronJob &&
 		Number.isFinite(session.lastActivityAt) &&
@@ -434,7 +487,13 @@ export function canPassivateSession(
 	);
 }
 
-/** Pure whole-tree residency policy. Callers must supply supervisor-owned attachment state. */
+/**
+ * Pure whole-tree residency policy. Callers must supply supervisor-owned attachment state.
+ *
+ * Every session must clear the shared idle threshold, so one session hosting live kernel work
+ * pins the whole worker: `stopWorker` would close that session's kernel and SIGTERM the bash()
+ * process groups it owns, which is the same kill the per-session policy above exists to prevent.
+ */
 export function canEvictWorker(
 	worker: WorkerEvictionSnapshot,
 	idleEvictionMinutes: IdleEvictionMinutes,

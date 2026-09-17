@@ -6247,6 +6247,167 @@ describe("daemon mode helpers", () => {
 		expect(internals.passivateSession).not.toHaveBeenCalledWith(queuedLeaf, expect.anything(), expect.anything());
 	});
 
+	it("keeps an idle child resident while its kernel hosts a live bash handle", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-kernel-bash-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				passivateIdleChildren(threshold: number | "off", now: number, limit: number): Promise<number>;
+			};
+			await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const childState = await internals.createRuntime({ type: "create", sessionPath: fixture.childSessionFile });
+			const childSession = childState.runtime.session;
+			// r44 form A: the child started a background bash() inside its kernel and ended its turn.
+			// The kernel fact is the only live work; the host-side bash controllers see nothing.
+			let kernelWorkInFlight = true;
+			Object.defineProperty(childSession, "isKernelWorkInFlight", {
+				configurable: true,
+				get: () => kernelWorkInFlight,
+			});
+			expect(childSession.isSessionActive).toBe(false);
+			expect(childSession.isBashRunning).toBeFalsy();
+			const sweepNow = Date.parse("2036-08-01T12:00:00Z");
+
+			await expect(internals.passivateIdleChildren(90, sweepNow, 2)).resolves.toBe(0);
+			expect(internals.sessions.has(childState.activeSessionId)).toBe(true);
+			expect(fixture.runtimeSessions[1]?.disposeAsync).not.toHaveBeenCalled();
+
+			// Positive control: the same child, same staleness, with no kernel work left to host -
+			// the script exited - passivates exactly as it did before the kernel term existed.
+			kernelWorkInFlight = false;
+			await expect(internals.passivateIdleChildren(90, sweepNow, 2)).resolves.toBe(1);
+			expect(internals.sessions.has(childState.activeSessionId)).toBe(false);
+			expect(fixture.runtimeSessions[1]?.disposeAsync).toHaveBeenCalledOnce();
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("aborts a selected passivation when a kernel handle appears before the close", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-kernel-fence-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				passivateIdleChildren(threshold: number | "off", now: number, limit: number): Promise<number>;
+			};
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const childState = await internals.createRuntime({ type: "create", sessionPath: fixture.childSessionFile });
+			const childSession = childState.runtime.session;
+			const parentSession = parentState.runtime.session as unknown as {
+				releaseRlmChildSession: ReturnType<typeof vi.fn>;
+			};
+			// The race the fence exists for: the sweep selects this child as an idle candidate, and a
+			// cell starts a background bash() before the close runs. Snapshot reads are two per build
+			// (the summary's fold, then the snapshot's own term), so the third read is the fence's
+			// fresh re-sample - that is where the handle appears.
+			let reads = 0;
+			let kernelWorkInFlight = false;
+			Object.defineProperty(childSession, "isKernelWorkInFlight", {
+				configurable: true,
+				get: () => {
+					reads += 1;
+					if (reads >= 3) kernelWorkInFlight = true;
+					return kernelWorkInFlight;
+				},
+			});
+
+			await expect(internals.passivateIdleChildren(90, Date.parse("2036-08-01T12:00:00Z"), 2)).resolves.toBe(0);
+			// The fence really did re-sample (otherwise the child was never a candidate and this test
+			// would be proving nothing), and the close never started.
+			expect(reads).toBeGreaterThanOrEqual(3);
+			expect(parentSession.releaseRlmChildSession).not.toHaveBeenCalled();
+			expect(fixture.runtimeSessions[1]?.disposeAsync).not.toHaveBeenCalled();
+			expect(internals.sessions.has(childState.activeSessionId)).toBe(true);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("names the session it holds resident for live kernel work", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-kernel-attribution-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				passivateIdleChildren(threshold: number | "off", now: number, limit: number): Promise<number>;
+				log: ReturnType<typeof vi.fn>;
+			};
+			internals.log = vi.fn();
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const childState = await internals.createRuntime({ type: "create", sessionPath: fixture.childSessionFile });
+			// The line has to describe a session this rule actually holds. Passivation only ever
+			// considers a *subagent* (canPassivateSession requires hasParent), so give the created
+			// runtime the metadata the spawn path would have set. A session that is resident for
+			// its own reasons - a root session, one held by a cron job or an attached client -
+			// must not be credited to kernel work; that is the misleading forensic this
+			// attribution exists to avoid, and the negative case below pins it.
+			const childMetadata = childState.runtime.metadata as { kind: string; parentActiveSessionId?: string };
+			childMetadata.kind = "subagent";
+			childMetadata.parentActiveSessionId = parentState.activeSessionId;
+			Object.defineProperty(childState.runtime.session, "isKernelWorkInFlight", {
+				configurable: true,
+				get: () => true,
+			});
+			const sweepNow = Date.parse("2036-08-01T12:00:00Z");
+
+			await expect(internals.passivateIdleChildren(90, sweepNow, 2)).resolves.toBe(0);
+			// Residency that blocks a sweep must be attributable, not silent (T2②-1).
+			const attributed = internals.log.mock.calls
+				.map((call) => String(call[0]))
+				.filter((line) => line.includes("Kept idle child resident for live kernel bash work"));
+			expect(attributed.length).toBe(1);
+			expect(attributed[0]).toContain(`sessionId=${childState.runtime.session.sessionId}`);
+			expect(attributed[0]).toContain("idleMinutes=");
+
+			// Throttled: the next sweep inside the gap keeps the residency but not the line.
+			await expect(internals.passivateIdleChildren(90, sweepNow + 30 * 60_000, 2)).resolves.toBe(0);
+			expect(
+				internals.log.mock.calls
+					.map((call) => String(call[0]))
+					.filter((line) => line.includes("Kept idle child resident for live kernel bash work")).length,
+			).toBe(1);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not credit kernel work for a session that is resident for its own reasons", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-kernel-attribution-negative-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				passivateIdleChildren(threshold: number | "off", now: number, limit: number): Promise<number>;
+				log: ReturnType<typeof vi.fn>;
+			};
+			internals.log = vi.fn();
+			await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const childState = await internals.createRuntime({ type: "create", sessionPath: fixture.childSessionFile });
+			// Same live kernel fact, but swept before the idle threshold is anywhere near met: this
+			// session is resident because it is *not idle yet*, not because of the kernel rule, so
+			// nothing may be attributed to kernel work. Crediting it anyway is the misleading
+			// forensic the attribution condition exists to avoid.
+			Object.defineProperty(childState.runtime.session, "isKernelWorkInFlight", {
+				configurable: true,
+				get: () => true,
+			});
+
+			await expect(internals.passivateIdleChildren(90, Date.now(), 2)).resolves.toBe(0);
+			const attributed = internals.log.mock.calls
+				.map((call) => String(call[0]))
+				.filter((line) => line.includes("Kept idle child resident for live kernel bash work"));
+			expect(attributed).toEqual([]);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("passivates an idle leaf and makes list, attach, and message use the normal passive wake path", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-passivate-child-"));
 		try {

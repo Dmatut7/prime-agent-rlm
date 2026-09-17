@@ -17,6 +17,7 @@ import {
 	type WorkerEvictionSnapshot,
 } from "../../src/core/session-action-store.js";
 import type { ActiveSessionState } from "../../src/modes/daemon/active-session-state.js";
+import { classifySessionRosterStatus, isSessionSummaryBusy } from "../../src/modes/daemon/agent-roster.js";
 import { summaryForActiveSession } from "../../src/modes/daemon/daemon-session-list.js";
 import { createHarness, type Harness } from "./harness.js";
 
@@ -137,6 +138,44 @@ describe("LIVE-1 kernel-owned work keeps a session resident", () => {
 		const idleSummary = summaryForActiveSession(stateFor(idle.session));
 		expect(idleSummary.isSessionActive).toBe(false);
 		expect(canPassivateSession(passivationSnapshot(idleSummary.isSessionActive), 90, EVICTION_NOW)).toBe(true);
+	});
+
+	it("never lets a kernel handle reach the turn-level idle wait (red line)", async () => {
+		const harness = track(
+			await createHarness({
+				kernelResidencyFacts: () => ({ hasActiveExecution: false, isKernelBashRunning: true }),
+			}),
+		);
+		expect(harness.session.isKernelWorkInFlight).toBe(true);
+		// `waitForIdle`, RLM quiescence and goal continuation all read `isSessionActive`. Folding the
+		// residency term into it would make `wait_for_idle` never return for a session that is only
+		// hosting a background script, so the split is a red line and this is its negative control:
+		// the same session that is pinned for eviction still waits out as idle, immediately.
+		expect(harness.session.isSessionActive).toBe(false);
+		await expect(harness.session.waitForIdle()).resolves.toBeUndefined();
+	});
+
+	it("locks the summary carrier and the UI consequence it deliberately has (D35)", async () => {
+		const harness = track(
+			await createHarness({
+				kernelResidencyFacts: () => ({ hasActiveExecution: false, isKernelBashRunning: true }),
+			}),
+		);
+		const summary = summaryForActiveSession(stateFor(harness.session));
+		// Carrier 2 of 2. The supervisor hosts no kernel and the wire gains no field, so the fact
+		// crosses inside this existing one; `isSessionSummaryBusy` is what the whole-worker snapshot
+		// reads. Deleting `|| session.isKernelWorkInFlight === true` from summaryForActiveSession
+		// must turn this red - that is the lock on the whole-worker layer, and without it a future
+		// cleanup silently reopens r44 form A there.
+		expect(summary.isSessionActive).toBe(true);
+		expect(isSessionSummaryBusy(summary)).toBe(true);
+		// The blind spot the term exists for: the host-side bash tool's controllers see nothing.
+		expect(summary.isBashRunning).toBe(false);
+		// Intended consequence, pinned so nobody "fixes" it back: a session whose turn ended but
+		// whose kernel hosts a handle reads as running to the roster and the agents view, while the
+		// display activity axis - deliberately turn-level - still says idle.
+		expect(classifySessionRosterStatus(summary)).toBe("running");
+		expect(summary.activity).toBe("idle");
 	});
 
 	it("blocks whole-worker eviction through the same summary", async () => {
