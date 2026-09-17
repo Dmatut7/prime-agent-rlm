@@ -327,6 +327,17 @@ const SUBAGENT_SPEND_DEBOUNCE_MS = 500;
 const SUBAGENT_SPEND_MIN_INTERVAL_MS = 5_000;
 const SUBAGENT_SPEND_HEAVY_SCAN_MS = 100;
 const SUBAGENT_SPEND_HEAVY_INTERVAL_MS = 15_000;
+/**
+ * Idle heartbeat of a visible spend cell, in ms.
+ *
+ * The cell stays fresh while a family works without polling per event: the context
+ * tree behind it is a disk-scanning RPC, and a working family emits child updates
+ * continuously, so a per-update refresh meant a tree scan behind every burst. One
+ * tick per 15s is the freshness the figure is worth - money spent by sub-agents
+ * moves slowly compared to the update stream that used to trigger the scans - and a
+ * quiet family costs one scan per tick instead of one per update.
+ */
+const SUBAGENT_SPEND_IDLE_TICK_MS = 15_000;
 
 export const START_HINTS = [
 	'Try "refactor @<filepath>"',
@@ -1095,6 +1106,13 @@ export class InteractiveMode {
 	private subagentSpendRescanForced = false;
 	/** The armed spend-refresh timer was armed by a forced request. */
 	private subagentSpendTimerForced = false;
+	/** Idle heartbeat of the visible spend cell; undefined while the cell is off screen. */
+	private subagentSpendTickTimer: ReturnType<typeof setInterval> | undefined;
+	/**
+	 * Set while the terminal is suspended (Ctrl-Z) and the TUI is stopped: nothing is on
+	 * screen, so the spend cell neither ticks nor refreshes until SIGCONT restores it.
+	 */
+	private terminalSuspended = false;
 	private rlmNodeId: string | undefined;
 	private rosterBar: { summaries(): SessionSummary[]; dispose(): Promise<void> } | undefined;
 
@@ -6244,9 +6262,16 @@ export class InteractiveMode {
 				: countSubtreeSubagentStatuses(this.subagentSnapshots.values(), this.rlmNodeId);
 		this.subagentCounts = counts;
 		this.subagentSummaryLine.setSubagentCounts(counts);
-		// The spend cell rides the same events (rlm_child_update, roster republish,
-		// resync) but is computed from the context tree, asynchronously.
-		this.scheduleSubagentSpendRefresh();
+		// The spend cell rides the same counts, but it is NOT refreshed from here. It is
+		// computed from the context tree, which is a disk-scanning RPC, and this line runs
+		// on every child update, roster republish, heartbeat catalog change and resync: a
+		// working family therefore used to queue a tree scan behind every event burst -
+		// and, on a daemon-hosted session, do it on the daemon's event loop, where it
+		// delayed the roster/snapshot RPCs the agents view needs. Updates now only keep
+		// the cell's cadence in step with what is on screen (see syncSubagentSpendCell);
+		// the figure moves when an assistant message lands, when the turn ends, and on the
+		// idle tick.
+		this.syncSubagentSpendCell();
 		// A stalled child still counts as running, so the stall has to be visible on
 		// its own line or a wedged subagent reads as progress. Same subtree as the
 		// counts: a wedge anywhere in the family must not need a direct-child slot.
@@ -6271,7 +6296,9 @@ export class InteractiveMode {
 	 * blank, not ¥0.00, and a quiet family arms no timer at all.
 	 */
 	private scheduleSubagentSpendRefresh(force = false): void {
-		if (this.subagentCounts.total === 0) {
+		if (!this.isSubagentSpendCellVisible()) {
+			// Nothing on screen to fill (no family, the cell switched off, or the terminal
+			// suspended): a scan here would be spent on a figure nobody can see.
 			this.clearSubagentSpendRefresh();
 			this.subagentSummaryLine.setSubagentSpend(undefined);
 			return;
@@ -6306,6 +6333,76 @@ export class InteractiveMode {
 			Math.max(0, deadline - now),
 		);
 		this.subagentSpendTimer.unref?.();
+		// A refresh that is worth scheduling is also the moment to make sure the idle
+		// tick is running: it is what keeps the figure moving between events.
+		this.startSubagentSpendIdleTick();
+	}
+
+	/**
+	 * Whether the spend cell is on screen right now: the user left it enabled, the
+	 * session has a sub-agent family to total up, and the terminal is not suspended.
+	 */
+	private isSubagentSpendCellVisible(): boolean {
+		return (
+			!this.terminalSuspended && this.subagentCounts.total > 0 && this.settingsManager.getSubagentSpendCellEnabled()
+		);
+	}
+
+	/**
+	 * Keep the cell's cadence in step with whether it is on screen.
+	 *
+	 * Called from every path that can change the answer (counts, the setting, the
+	 * terminal moving in and out of suspension), and cheap on purpose: it arms the idle
+	 * tick when there is a cell to keep fresh, and tears the tick, the pending refresh
+	 * and the figure down when there is not - a disabled or empty cell must not keep
+	 * scanning, and must not leave a stale figure behind for the next family.
+	 */
+	private syncSubagentSpendCell(): void {
+		if (!this.isSubagentSpendCellVisible()) {
+			this.stopSubagentSpendIdleTick();
+			this.clearSubagentSpendRefresh();
+			this.subagentSummaryLine.setSubagentSpend(undefined);
+			return;
+		}
+		if (!this.hasSubagentSpendFigure()) {
+			// First sight of a family: fill the cell in now instead of waiting out a tick.
+			this.scheduleSubagentSpendRefresh();
+		}
+		this.startSubagentSpendIdleTick();
+	}
+
+	/**
+	 * Whether a figure is already on screen or a scan is on its way to one. Written so
+	 * that a receiver without the spend fields yet (an instance built through the
+	 * prototype) reads as "no figure" rather than as a scheduled one.
+	 */
+	private hasSubagentSpendFigure(): boolean {
+		return (
+			this.subagentSpendLastScanAt > 0 ||
+			this.subagentSpendScanning === true ||
+			this.subagentSpendTimer !== undefined
+		);
+	}
+
+	private startSubagentSpendIdleTick(): void {
+		if (this.subagentSpendTickTimer !== undefined) return;
+		this.subagentSpendTickTimer = setInterval(() => {
+			// Re-checked per tick: the setting can flip, the family can go away, and the
+			// terminal can suspend between ticks, none of which needs its own teardown path.
+			if (!this.isSubagentSpendCellVisible()) {
+				this.stopSubagentSpendIdleTick();
+				return;
+			}
+			void this.refreshSubagentSpend(false);
+		}, SUBAGENT_SPEND_IDLE_TICK_MS);
+		// A freshness nicety, never a reason to hold the process open.
+		this.subagentSpendTickTimer.unref?.();
+	}
+
+	private stopSubagentSpendIdleTick(): void {
+		if (this.subagentSpendTickTimer === undefined) return;
+		clearInterval(this.subagentSpendTickTimer);
+		this.subagentSpendTickTimer = undefined;
 	}
 
 	private clearSubagentSpendRefresh(): void {
@@ -6325,6 +6422,11 @@ export class InteractiveMode {
 	 * the cell is best-effort, the /context command remains the authoritative view.
 	 */
 	private async refreshSubagentSpend(forced = false): Promise<void> {
+		if (!this.isSubagentSpendCellVisible()) {
+			// The cell went off screen between the request and its turn (family finished,
+			// setting switched off, terminal suspended): not a scan worth starting.
+			return;
+		}
 		if (this.subagentSpendScanning) {
 			// A request arrived mid-scan: rerun once it settles, preserving urgency
 			// so a throttled follow-up never delays a turn-end refresh, while event
@@ -7397,6 +7499,8 @@ export class InteractiveMode {
 		process.once("SIGCONT", () => {
 			clearInterval(suspendKeepAlive);
 			process.removeListener("SIGINT", ignoreSigint);
+			this.terminalSuspended = false;
+			this.syncSubagentSpendCell();
 			this.ui.start();
 			// ui.stop() left the alt screen before suspending; re-enter it
 			if (this.fullscreenEnabled) {
@@ -7406,6 +7510,10 @@ export class InteractiveMode {
 		});
 
 		try {
+			// Nothing is on screen from here on: the spend cell stops ticking and
+			// refreshing so a backgrounded session burns no scans nobody can see.
+			this.terminalSuspended = true;
+			this.syncSubagentSpendCell();
 			// Stop the TUI (restore terminal to normal mode)
 			this.ui.stop();
 
@@ -7414,6 +7522,10 @@ export class InteractiveMode {
 		} catch (error) {
 			clearInterval(suspendKeepAlive);
 			process.removeListener("SIGINT", ignoreSigint);
+			// The suspension never took: the TUI is still on screen, so the spend cell
+			// must not stay frozen behind a flag nothing will clear.
+			this.terminalSuspended = false;
+			this.syncSubagentSpendCell();
 			throw error;
 		}
 	}
@@ -10735,6 +10847,7 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 		this.endFeatureHintRun();
 		this.stopWorkingPulse();
 		this.stopGoalTrayTimer();
+		this.stopSubagentSpendIdleTick();
 		this.clearSubagentSpendRefresh();
 		this.closeHeartbeatManager();
 		this.clearExtensionTerminalInputListeners();

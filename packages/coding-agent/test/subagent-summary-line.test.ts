@@ -43,6 +43,13 @@ function rosterRow(overrides: Partial<SessionSummary> & { id: string }): Session
 	};
 }
 
+/**
+ * The spend-cell seam for fixtures that exercise the counts alone: the cell is
+ * switched off, so a fixture never scans a context tree and never asserts on a figure
+ * it did not set up. The cell's own behaviour has its own fixtures below.
+ */
+const spendCellOffUiServices = { settingsManager: { getSubagentSpendCellEnabled: () => false } };
+
 describe("SubagentSummaryLine", () => {
 	beforeAll(() => {
 		initTheme("dark");
@@ -185,6 +192,7 @@ describe("SubagentSummaryLine", () => {
 			rlmNodeId: undefined,
 			heartbeatCatalog: [],
 			subagentSummaryLine: line,
+			uiServices: spendCellOffUiServices,
 			updateWorkingPulse: vi.fn(),
 			syncWorkingLoader: vi.fn(),
 			updateWorkingLoaderMessage: vi.fn(),
@@ -210,6 +218,7 @@ describe("SubagentSummaryLine", () => {
 			rlmNodeId: undefined,
 			heartbeatCatalog: [],
 			subagentSummaryLine: line,
+			uiServices: spendCellOffUiServices,
 			updateWorkingPulse: vi.fn(),
 			syncWorkingLoader: vi.fn(),
 			updateWorkingLoaderMessage: vi.fn(),
@@ -238,6 +247,7 @@ describe("SubagentSummaryLine", () => {
 			rlmNodeId: undefined,
 			heartbeatCatalog: [],
 			subagentSummaryLine: line,
+			uiServices: spendCellOffUiServices,
 			updateWorkingPulse: vi.fn(),
 			syncWorkingLoader: vi.fn(),
 			updateWorkingLoaderMessage: vi.fn(),
@@ -269,6 +279,7 @@ describe("SubagentSummaryLine", () => {
 			rlmNodeId: "me",
 			heartbeatCatalog: [],
 			subagentSummaryLine: line,
+			uiServices: spendCellOffUiServices,
 			updateWorkingPulse: vi.fn(),
 			syncWorkingLoader: vi.fn(),
 			updateWorkingLoaderMessage: vi.fn(),
@@ -303,6 +314,7 @@ describe("SubagentSummaryLine", () => {
 			rlmNodeId: undefined,
 			heartbeatCatalog: [],
 			subagentSummaryLine: line,
+			uiServices: spendCellOffUiServices,
 			updateWorkingPulse: vi.fn(),
 			syncWorkingLoader: vi.fn(),
 			updateWorkingLoaderMessage: vi.fn(),
@@ -329,6 +341,7 @@ describe("SubagentSummaryLine", () => {
 			rlmNodeId: undefined,
 			heartbeatCatalog: [],
 			subagentSummaryLine: line,
+			uiServices: spendCellOffUiServices,
 			updateWorkingPulse: vi.fn(),
 			syncWorkingLoader: vi.fn(),
 			updateWorkingLoaderMessage: vi.fn(),
@@ -426,6 +439,7 @@ describe("SubagentSummaryLine", () => {
 			rlmNodeId: undefined,
 			heartbeatCatalog: [],
 			subagentSummaryLine: line,
+			uiServices: spendCellOffUiServices,
 			connectionState: undefined,
 			scheduleHeartbeatManagerRefresh: vi.fn(),
 			updateWorkingPulse: vi.fn(),
@@ -688,46 +702,146 @@ describe("subagent spend cell", () => {
 		expect(stripAnsi(content)).toContain("Σ 子代理 ¥4.56 · 12M tok · 总 ¥5.10");
 	});
 
-	it("scans on events only: a quiet family arms no timer and rescans nothing", async () => {
+	/**
+	 * A mode whose agent connection is a spend-cell fixture: the real
+	 * `scheduleSubagentSpendRefresh` / `refreshSubagentSpend` / idle-tick code runs,
+	 * only the connection and the settings manager are stand-ins.
+	 *
+	 * `stubIdleTick` replaces the tick arm/disarm with spies, which isolates the
+	 * event-driven cadence from the heartbeat (both are real in the default).
+	 */
+	function createSpendMode(
+		options: {
+			contextTree?: ContextTreeNode;
+			getContextTree?: () => Promise<ContextTreeNode>;
+			spendCellEnabled?: boolean;
+			total?: number;
+			suspended?: boolean;
+			stubIdleTick?: boolean;
+			/** Model rates lookup behind the unpriced annotation; undefined = an unpriced model. */
+			modelCost?: { input: number; output: number; cacheRead: number; cacheWrite: number } | undefined;
+		} = {},
+	) {
+		const line = new SubagentSummaryLine();
+		const setSpend = vi.spyOn(line, "setSubagentSpend");
+		const getContextTree = vi.fn(
+			options.getContextTree ?? (async () => options.contextTree ?? tree(usage(0, 0, 0), [])),
+		);
+		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
+		Object.assign(mode, {
+			subagentSnapshots: new Map<string, AgentConnectionRlmChildAgentSnapshot>(),
+			rlmNodeId: undefined,
+			heartbeatCatalog: [],
+			subagentSummaryLine: line,
+			subagentCounts: { total: options.total ?? 1, running: options.total ?? 1, idle: 0, inactive: 0 },
+			terminalSuspended: options.suspended ?? false,
+			uiServices: {
+				// The real seam: InteractiveMode reads the settings manager and the model
+				// registry from here.
+				settingsManager: { getSubagentSpendCellEnabled: () => options.spendCellEnabled ?? true },
+				modelRegistry: { find: vi.fn(() => (options.modelCost ? { cost: options.modelCost } : undefined)) },
+			},
+			agentConnection: { getContextTree },
+			updateWorkingPulse: vi.fn(),
+			syncWorkingLoader: vi.fn(),
+			updateWorkingLoaderMessage: vi.fn(),
+			ui: { requestRender: vi.fn() },
+			...(options.stubIdleTick ? { startSubagentSpendIdleTick: vi.fn(), stopSubagentSpendIdleTick: vi.fn() } : {}),
+		});
+		const schedule = Reflect.get(InteractiveMode.prototype, "scheduleSubagentSpendRefresh") as (
+			this: typeof mode,
+			force?: boolean,
+		) => void;
+		const update = Reflect.get(InteractiveMode.prototype, "updateSubagentSummary") as (
+			this: typeof mode,
+			value: AgentConnectionRlmChildAgentSnapshot,
+		) => void;
+		return { mode, line, setSpend, getContextTree, schedule, update };
+	}
+
+	it("a burst of child updates arms no scan of its own", async () => {
 		vi.useFakeTimers();
 		try {
-			const line = new SubagentSummaryLine();
-			const getContextTree = vi.fn(async () =>
-				tree(usage(1_000, 500, 0.5), [agent("sub-1", usage(2_000, 1_000, 1.2), undefined)]),
-			);
-			const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
-			Object.assign(mode, {
-				subagentSnapshots: new Map<string, AgentConnectionRlmChildAgentSnapshot>(),
-				rlmNodeId: undefined,
-				heartbeatCatalog: [],
-				subagentSummaryLine: line,
-				uiServices: { modelRegistry: { find: vi.fn(() => undefined) } },
-				agentConnection: { getContextTree },
-				updateWorkingPulse: vi.fn(),
-				syncWorkingLoader: vi.fn(),
-				updateWorkingLoaderMessage: vi.fn(),
-				ui: { requestRender: vi.fn() },
-			});
-			const update = Reflect.get(InteractiveMode.prototype, "updateSubagentSummary") as (
-				this: typeof mode,
-				value: AgentConnectionRlmChildAgentSnapshot,
-			) => void;
+			// The tick is stubbed so the count is the event-driven cadence alone. This is
+			// the regression pin for the removed behaviour: the cell used to schedule a
+			// context-tree scan from every rlm_child_update (a working family emits them
+			// continuously, so a scan followed every burst).
+			const { mode, getContextTree, update, schedule } = createSpendMode({ stubIdleTick: true });
 
-			// One child event arms the debounce (unrefed: it cannot hold the process
-			// open), which fires exactly one scan.
-			update.call(mode, child("worker", "running"));
+			const burst = (): void => {
+				for (let index = 0; index < 50; index++) {
+					update.call(mode, child("worker", "running", { activity: { kind: "executing" } }));
+					update.call(mode, child("worker", "running", { activity: { kind: "writing" } }));
+				}
+			};
+			burst();
 			await vi.advanceTimersByTimeAsync(600);
+			// Exactly one scan: the leading one that first fills the cell in.
 			expect(getContextTree).toHaveBeenCalledTimes(1);
 
-			// A quiet minute - no child events, no turn end, no roster callback - must
-			// not rescan: the schedule is event-driven, there is no periodic timer.
+			// Further updates never rescan: the figure is already on screen.
+			burst();
 			await vi.advanceTimersByTimeAsync(60_000);
 			expect(getContextTree).toHaveBeenCalledTimes(1);
 
-			// The path is alive, not wedged: the next child event scans again.
-			update.call(mode, child("worker", "done", { activeSessionId: "resident-worker" }));
+			// The event-driven paths that remain: a landed assistant message, and the turn
+			// end (forced, so it skips the debounce and the floor).
+			schedule.call(mode);
 			await vi.advanceTimersByTimeAsync(600);
 			expect(getContextTree).toHaveBeenCalledTimes(2);
+			schedule.call(mode, true);
+			await vi.advanceTimersByTimeAsync(0);
+			expect(getContextTree).toHaveBeenCalledTimes(3);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("keeps a visible cell fresh on the idle tick, and stops ticking once it is off screen", async () => {
+		vi.useFakeTimers();
+		try {
+			const { mode, setSpend, getContextTree, update } = createSpendMode({
+				contextTree: tree(usage(1_000, 500, 0.5), [agent("sub-1", usage(2_000, 1_000, 1.2), undefined)]),
+			});
+
+			// First sight of a family fills the cell in (debounced), then the tick runs.
+			update.call(mode, child("worker", "running"));
+			await vi.advanceTimersByTimeAsync(600);
+			expect(getContextTree).toHaveBeenCalledTimes(1);
+			expect(setSpend).toHaveBeenCalled();
+
+			// A quiet minute: one scan per 15s tick, nothing per event (there are none).
+			await vi.advanceTimersByTimeAsync(60_000);
+			expect(getContextTree).toHaveBeenCalledTimes(5);
+
+			// No family left: the tick stops, the figure blanks, and nothing scans again.
+			// (A cancelled child is dropped from the snapshots, so the counts really do go
+			// to zero - a `done` child stays in the family as an inactive row.)
+			update.call(mode, child("worker", "cancelled"));
+			await vi.advanceTimersByTimeAsync(60_000);
+			expect(getContextTree).toHaveBeenCalledTimes(5);
+			expect(setSpend).toHaveBeenLastCalledWith(undefined);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("does not scan or render a figure while the cell is switched off or the terminal is suspended", async () => {
+		vi.useFakeTimers();
+		try {
+			const off = createSpendMode({ spendCellEnabled: false });
+			off.update.call(off.mode, child("worker", "running"));
+			off.schedule.call(off.mode);
+			await vi.advanceTimersByTimeAsync(60_000);
+			expect(off.getContextTree).not.toHaveBeenCalled();
+			expect(off.setSpend).toHaveBeenCalledWith(undefined);
+
+			const suspended = createSpendMode({ suspended: true });
+			suspended.update.call(suspended.mode, child("worker", "running"));
+			suspended.schedule.call(suspended.mode, true);
+			await vi.advanceTimersByTimeAsync(60_000);
+			expect(suspended.getContextTree).not.toHaveBeenCalled();
+			expect(suspended.setSpend).toHaveBeenCalledWith(undefined);
 		} finally {
 			vi.useRealTimers();
 		}
@@ -736,76 +850,49 @@ describe("subagent spend cell", () => {
 	it("backs the cadence off after a heavy scan, keeping the fast cadence for light ones", async () => {
 		vi.useFakeTimers();
 		try {
-			const line = new SubagentSummaryLine();
-			const getContextTree = vi.fn(async () =>
-				tree(usage(1_000, 500, 0.5), [agent("sub-1", usage(2_000, 1_000, 1.2), undefined)]),
-			);
-			const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
-			Object.assign(mode, {
-				subagentSnapshots: new Map<string, AgentConnectionRlmChildAgentSnapshot>(),
-				rlmNodeId: undefined,
-				heartbeatCatalog: [],
-				subagentSummaryLine: line,
-				uiServices: { modelRegistry: { find: vi.fn(() => undefined) } },
-				agentConnection: { getContextTree },
-				subagentSpendLastScanMs: 0,
-				updateWorkingPulse: vi.fn(),
-				syncWorkingLoader: vi.fn(),
-				updateWorkingLoaderMessage: vi.fn(),
-				ui: { requestRender: vi.fn() },
+			const { mode, getContextTree, schedule } = createSpendMode({
+				stubIdleTick: true,
+				contextTree: tree(usage(1_000, 500, 0.5), [agent("sub-1", usage(2_000, 1_000, 1.2), undefined)]),
 			});
-			const update = Reflect.get(InteractiveMode.prototype, "updateSubagentSummary") as (
-				this: typeof mode,
-				value: AgentConnectionRlmChildAgentSnapshot,
-			) => void;
 
-			// Light scan (5ms): the next event-driven scan is throttled to 5s.
-			update.call(mode, child("worker", "running"));
+			// Light scan (a few ms): the burst's leading scan lands after the debounce.
+			schedule.call(mode);
 			await vi.advanceTimersByTimeAsync(600);
 			expect(getContextTree).toHaveBeenCalledTimes(1);
-			update.call(mode, child("worker", "running", { activity: { kind: "waiting" } }));
-			await vi.advanceTimersByTimeAsync(4_900);
-			expect(getContextTree).toHaveBeenCalledTimes(2);
-			Reflect.set(mode, "subagentSpendLastScanMs", 320);
 
-			// Heavy last scan: the floor becomes 15s, so 5s of silence must not rescan.
-			update.call(mode, child("worker", "running", { activity: { kind: "executing" } }));
-			await vi.advanceTimersByTimeAsync(14_900);
+			// Sustained requests hold to the 5s floor from that scan.
+			schedule.call(mode);
+			await vi.advanceTimersByTimeAsync(4_000);
+			expect(getContextTree).toHaveBeenCalledTimes(1);
+			await vi.advanceTimersByTimeAsync(1_000);
 			expect(getContextTree).toHaveBeenCalledTimes(2);
-			await vi.advanceTimersByTimeAsync(200);
-			expect(getContextTree).toHaveBeenCalledTimes(3);
+
+			// A heavy last scan backs the floor off to 15s: 5s of silence must not rescan,
+			// and the wait past it must.
+			const beforeHeavy = getContextTree.mock.calls.length;
+			Reflect.set(mode, "subagentSpendLastScanMs", 320);
+			schedule.call(mode);
+			await vi.advanceTimersByTimeAsync(5_000);
+			expect(getContextTree).toHaveBeenCalledTimes(beforeHeavy);
+			await vi.advanceTimersByTimeAsync(11_000);
+			expect(getContextTree).toHaveBeenCalledTimes(beforeHeavy + 1);
 		} finally {
 			vi.useRealTimers();
 		}
 	});
 
-	it("refreshes the cell from the context tree when child updates arrive, and blanks it when they are gone", async () => {
-		const line = new SubagentSummaryLine();
-		const setSpend = vi.spyOn(line, "setSubagentSpend");
+	it("refreshes the cell from the context tree on a scheduled refresh, and blanks it when the family is gone", async () => {
 		const contextTree = tree(usage(1_000, 500, 0.5), [
 			agent("sub-1", usage(2_000, 1_000, 0), { provider: "bailian", id: "kimi-k3" }),
 		]);
-		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
-		Object.assign(mode, {
-			subagentSnapshots: new Map<string, AgentConnectionRlmChildAgentSnapshot>(),
-			rlmNodeId: undefined,
-			heartbeatCatalog: [],
-			subagentSummaryLine: line,
-			uiServices: {
-				modelRegistry: { find: vi.fn(() => ({ cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } })) },
-			},
-			agentConnection: { getContextTree: vi.fn(async () => contextTree) },
-			updateWorkingPulse: vi.fn(),
-			syncWorkingLoader: vi.fn(),
-			updateWorkingLoaderMessage: vi.fn(),
-			ui: { requestRender: vi.fn() },
+		const { mode, setSpend, update, schedule } = createSpendMode({
+			contextTree,
+			getContextTree: async () => contextTree,
+			modelCost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		});
-		const update = Reflect.get(InteractiveMode.prototype, "updateSubagentSummary") as (
-			this: typeof mode,
-			value: AgentConnectionRlmChildAgentSnapshot,
-		) => void;
 
 		update.call(mode, child("worker", "running"));
+		schedule.call(mode);
 		await vi.waitFor(
 			() => {
 				expect(setSpend).toHaveBeenCalled();
@@ -823,10 +910,6 @@ describe("subagent spend cell", () => {
 
 		// A family that goes away blanks the cell rather than freezing a stale figure.
 		setSpend.mockClear();
-		const schedule = Reflect.get(InteractiveMode.prototype, "scheduleSubagentSpendRefresh") as (
-			this: typeof mode,
-			force?: boolean,
-		) => void;
 		Reflect.set(mode, "subagentCounts", { total: 0, running: 0, idle: 0, inactive: 0 });
 		schedule.call(mode);
 		expect(setSpend).toHaveBeenCalledWith(undefined);

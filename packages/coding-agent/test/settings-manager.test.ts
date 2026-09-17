@@ -3,6 +3,7 @@ import { homedir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+	collectUnknownSettingsKeys,
 	DEFAULT_KERNEL_BOOTSTRAP_LOCK_TIMEOUT_MS,
 	DEFAULT_KERNEL_MAX_RESTARTS,
 	DEFAULT_KERNEL_RESTART_WINDOW_MINUTES,
@@ -822,6 +823,37 @@ describe("SettingsManager", () => {
 				expect(resolved.abortAfterSeconds).toBe(expectedAbort);
 				expect(resolved.toolLivenessExemption).toBe(true);
 			}
+		});
+	});
+
+	describe("ui.subagentSpendCell", () => {
+		it("defaults to on and reads an explicit opt-out from either scope", () => {
+			expect(SettingsManager.create(projectDir, agentDir).getSubagentSpendCellEnabled()).toBe(true);
+
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ ui: { subagentSpendCell: false } }));
+			expect(SettingsManager.create(projectDir, agentDir).getSubagentSpendCellEnabled()).toBe(false);
+
+			// No consent semantics here: the closest scope wins, like every other UI key.
+			writeFileSync(join(projectDir, ".prime", "agent", "settings.json"), JSON.stringify({ ui: {} }));
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ ui: { subagentSpendCell: true } }));
+			writeFileSync(
+				join(projectDir, ".prime", "agent", "settings.json"),
+				JSON.stringify({ ui: { subagentSpendCell: false } }),
+			);
+			expect(SettingsManager.create(projectDir, agentDir).getSubagentSpendCellEnabled()).toBe(false);
+		});
+
+		it("writes the opt-out to the global file and knows the key", async () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setSubagentSpendCellEnabled(false);
+			await manager.flush();
+
+			const saved = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8"));
+			expect(saved.ui).toEqual({ subagentSpendCell: false });
+
+			// The key is registered: a typo still reports as unknown, the real name does not.
+			expect(collectUnknownSettingsKeys({ ui: { subagentSpendCell: false } })).toEqual([]);
+			expect(collectUnknownSettingsKeys({ ui: { subagentSpendCel: false } })).toEqual(["ui.subagentSpendCel"]);
 		});
 	});
 });

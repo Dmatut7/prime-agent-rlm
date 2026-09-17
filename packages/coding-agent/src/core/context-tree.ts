@@ -333,15 +333,26 @@ function statusFromBranch(entries: SessionEntry[]): "done" | "error" | "cancelle
 	return "done";
 }
 
-/** A child session's newest transcript, with its size so a scan can budget it. */
+/** A child session's newest transcript, with its stat identity so a scan can budget and reuse it. */
 interface SessionFile {
 	path: string;
 	size: number;
+	/** `mtimeMs` of the file as stat'ed by the scan; the identity half of the read cache's key. */
+	mtimeMs: number;
 }
 
 function findSessionFile(dir: string): SessionFile | undefined {
+	let names: string[];
+	try {
+		names = readdirSync(dir);
+	} catch {
+		// The dir is gone (a cleaned-up child, retention, a hand-deleted tree): nothing
+		// persisted here, which is not a failed scan. A tray refresh must not break
+		// because one sub-agent's directory disappeared underneath it.
+		return undefined;
+	}
 	let newest: { path: string; mtime: number; size: number } | undefined;
-	for (const name of readdirSync(dir)) {
+	for (const name of names) {
 		if (!name.endsWith(".jsonl")) {
 			continue;
 		}
@@ -355,7 +366,7 @@ function findSessionFile(dir: string): SessionFile | undefined {
 			// Skip unreadable files.
 		}
 	}
-	return newest && { path: newest.path, size: newest.size };
+	return newest && { path: newest.path, size: newest.size, mtimeMs: newest.mtime };
 }
 
 /**
@@ -397,6 +408,301 @@ function listChildSessionDirs(rlmSessionDir: string): string[] {
 	}
 	candidates.sort((a, b) => b.mtime - a.mtime || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 	return candidates.map((candidate) => candidate.path);
+}
+
+/**
+ * Stat-only fingerprint of the `sub-*` tree under an RLM session dir.
+ *
+ * The context tree rebuilt on every UI refresh comes from reading and folding the
+ * transcripts under this dir, which is expensive (a 544-child dir measured 2.2s and
+ * ~1.08GB of reads) and usually redundant: between two refreshes of the same
+ * session, most of that tree has not moved. The fingerprint is what makes "has not
+ * moved" decidable without reading a byte of it - `readdir` + `stat` at every level
+ * the scan could reach, plus each dir's newest transcript identity (whose `mtimeMs`
+ * moves on any append), so a change anywhere the scan reads shows up here.
+ *
+ * `remainingDepth` mirrors the scan's own `maxDepth` cutoff: bytes below a depth the
+ * scan would never visit are not fingerprinted either, so a cached subtree cannot be
+ * reused past a change the scan was never going to see.
+ */
+function fingerprintRlmSessionDir(dir: string, remainingDepth: number): string {
+	const parts: string[] = [];
+	const walk = (current: string, remaining: number): void => {
+		let names: string[];
+		try {
+			names = readdirSync(current);
+		} catch {
+			// Unreadable or gone: the scan would list nothing here either.
+			parts.push(`${current}?`);
+			return;
+		}
+		for (const name of names.sort()) {
+			if (!name.startsWith("sub-")) {
+				continue;
+			}
+			const path = join(current, name);
+			let stats: ReturnType<typeof statSync>;
+			try {
+				stats = statSync(path);
+			} catch {
+				continue;
+			}
+			if (!stats.isDirectory()) {
+				continue;
+			}
+			parts.push(`${name}:${stats.mtimeMs}:${stats.size}`);
+			const transcript = newestTranscriptFingerprint(path);
+			if (transcript) {
+				parts.push(`@${transcript}`);
+			}
+			if (remaining > 1) {
+				walk(path, remaining - 1);
+			}
+		}
+	};
+	walk(dir, Math.max(1, remainingDepth));
+	return parts.join("|");
+}
+
+/** `name:mtimeMs:size` of the newest transcript in a dir, or undefined when there is none. */
+function newestTranscriptFingerprint(dir: string): string | undefined {
+	let names: string[];
+	try {
+		names = readdirSync(dir);
+	} catch {
+		return undefined;
+	}
+	let newest: { name: string; mtimeMs: number; size: number } | undefined;
+	for (const name of names) {
+		if (!name.endsWith(".jsonl")) {
+			continue;
+		}
+		try {
+			const stats = statSync(join(dir, name));
+			if (!newest || stats.mtimeMs > newest.mtimeMs) {
+				newest = { name, mtimeMs: stats.mtimeMs, size: stats.size };
+			}
+		} catch {
+			// Skip unreadable files, exactly as findSessionFile does.
+		}
+	}
+	return newest && `${newest.name}:${newest.mtimeMs}:${newest.size}`;
+}
+
+/** One transcript read this scan avoided or paid for, so a caller can report the difference. */
+interface CachedScanCharge {
+	scannedChildren: number;
+	bytesRead: number;
+	bytesPlanned: number;
+	skippedByBudget: number;
+	truncated: boolean;
+	truncatedReason: ContextTreeTruncatedReason | undefined;
+	depthLimitReached: boolean;
+}
+
+interface CachedContextNode {
+	node: ContextTreeNode;
+	/** The window the node's `contextUsage` was computed with; a different answer invalidates the entry. */
+	modelWindow: number | undefined;
+	hasModel: boolean;
+}
+
+interface CachedSubtree {
+	nodes: ContextTreeNode[];
+	charge: CachedScanCharge;
+	/**
+	 * `provider/id=window` for every distinct model in the subtree. A subtree is reused
+	 * only while every one of them still resolves to the same window: `contextUsage`
+	 * percentages are derived from the catalog, so a model whose window moved must be
+	 * re-derived rather than served with the old denominator. Usually one to three
+	 * entries, so the check is a handful of registry lookups per reuse.
+	 */
+	modelWindows: string;
+}
+
+/**
+ * Reuse for the on-disk half of the context tree, owned by the session that reads it.
+ *
+ * Two levels, because they buy different things:
+ *
+ * - **Subtree**: the children of one dir, keyed by {@link fingerprintRlmSessionDir} plus
+ *   the call's shape (level, maxDepth, budget, live ids). Unchanged fingerprint means
+ *   nothing the scan would read has changed, so the walk - every `readdir`, `stat`,
+ *   parse and fold under that dir - is skipped outright. The budget is charged from
+ *   the figures the cached miss recorded, so a truncated scan still reports the same
+ *   omission on a hit: /context must not describe less of the tree just because the
+ *   answer was remembered.
+ * - **Node**: one transcript, keyed by its own stat identity (`mtimeMs` + `size`).
+ *   This is the fallback when a subtree fingerprint moved for one reason (one child
+ *   appended) but 255 siblings did not: only the moved transcript is read again.
+ *
+ * Both levels hand back copies of the nodes they hold, and the node entries carry
+ * `children: []` - the walk owns each call's child arrays - so a remembered tree can
+ * never be mutated by the scan that reuses it. Bounded so a session that visits a very
+ * wide tree over its lifetime cannot grow this without limit.
+ */
+export class ContextTreeDiskScanCache {
+	/** Dirs whose subtree was reused / rebuilt, and transcripts reused / read. */
+	readonly stats = { subtreeHits: 0, subtreeMisses: 0, nodeHits: 0, nodeMisses: 0 };
+	private readonly subtrees = new Map<string, CachedSubtree>();
+	private readonly nodes = new Map<string, CachedContextNode>();
+
+	constructor(private readonly maxEntries = 512) {}
+
+	/**
+	 * The remembered subtree for `dir`, or undefined. `key` must cover everything
+	 * besides the on-disk tree that the walk's result depends on (level, budget, live
+	 * ids) - the fingerprint covers the tree itself. On a hit the caller's `state` is
+	 * charged what the walked miss was charged.
+	 */
+	takeSubtree(
+		dir: string,
+		remainingDepth: number,
+		key: string,
+		state: ContextTreeScanState,
+		resolveContextWindow: ContextWindowResolver,
+	): CachedSubtree | undefined {
+		const cached = this.subtrees.get(`${fingerprintRlmSessionDir(dir, remainingDepth)}#${key}`);
+		if (!cached || subtreeModelWindows(cached.nodes, resolveContextWindow) !== cached.modelWindows) {
+			this.stats.subtreeMisses++;
+			return undefined;
+		}
+		this.stats.subtreeHits++;
+		replayScanCharge(state, cached.charge);
+		return { nodes: cloneContextTreeNodes(cached.nodes), charge: cached.charge, modelWindows: cached.modelWindows };
+	}
+
+	/** Remember one walked subtree, keyed exactly as it was looked up. */
+	storeSubtree(
+		dir: string,
+		remainingDepth: number,
+		key: string,
+		nodes: ContextTreeNode[],
+		charge: CachedScanCharge,
+		resolveContextWindow: ContextWindowResolver,
+	): void {
+		this.remember(this.subtrees, `${fingerprintRlmSessionDir(dir, remainingDepth)}#${key}`, {
+			nodes: cloneContextTreeNodes(nodes),
+			charge,
+			modelWindows: subtreeModelWindows(nodes, resolveContextWindow),
+		});
+	}
+
+	/** One parsed transcript node, remembered by the transcript's own stat identity. */
+	nodeOf(
+		id: string,
+		sessionFile: SessionFile,
+		resolveContextWindow: ContextWindowResolver,
+		build: () => ContextTreeNode | undefined,
+	): ContextTreeNode | undefined {
+		const key = `${sessionFile.path}:${sessionFile.mtimeMs}:${sessionFile.size}`;
+		const cached = this.nodes.get(key);
+		if (cached) {
+			const node = cached.node;
+			// The fold is resolver-independent (usage, status, label, model), but
+			// `contextUsage` is not: a model whose catalog window changed must re-derive
+			// its percentages rather than serve the old ones.
+			const window =
+				cached.hasModel && node.model ? resolveContextWindow(node.model.provider, node.model.id) : undefined;
+			if (!cached.hasModel || window === cached.modelWindow) {
+				this.stats.nodeHits++;
+				return { ...node, id, children: [] };
+			}
+		}
+		this.stats.nodeMisses++;
+		const node = build();
+		if (node) {
+			const window = node.model ? resolveContextWindow(node.model.provider, node.model.id) : undefined;
+			this.remember(this.nodes, key, {
+				node: { ...node, children: [] },
+				modelWindow: window,
+				hasModel: node.model !== undefined,
+			});
+		}
+		return node;
+	}
+
+	/** Insertion-ordered eviction: the oldest entry goes once the map is over its cap. */
+	private remember<T>(map: Map<string, T>, key: string, value: T): void {
+		map.delete(key);
+		map.set(key, value);
+		while (map.size > this.maxEntries) {
+			const oldest = map.keys().next();
+			if (oldest.done) break;
+			map.delete(oldest.value);
+		}
+	}
+}
+
+/** `provider/id=window` for every distinct model under `nodes` (see CachedSubtree). */
+function subtreeModelWindows(nodes: readonly ContextTreeNode[], resolveContextWindow: ContextWindowResolver): string {
+	const windows = new Map<string, string>();
+	const walk = (list: readonly ContextTreeNode[]): void => {
+		for (const node of list) {
+			if (node.model) {
+				const key = `${node.model.provider}/${node.model.id}`;
+				if (!windows.has(key))
+					windows.set(key, `${key}=${resolveContextWindow(node.model.provider, node.model.id) ?? "?"}`);
+			}
+			walk(node.children);
+		}
+	};
+	walk(nodes);
+	return [...windows.values()].sort().join(",");
+}
+
+/** The scan accounting as it stands, so a walk's own charge can be measured as a delta. */
+function scanChargeOf(state: ContextTreeScanState): CachedScanCharge {
+	return {
+		scannedChildren: state.scannedChildren,
+		bytesRead: state.bytesRead,
+		bytesPlanned: state.bytesPlanned,
+		skippedByBudget: state.skippedByBudget,
+		truncated: state.truncated,
+		truncatedReason: state.truncatedReason,
+		depthLimitReached: state.depthLimitReached,
+	};
+}
+
+function subtractScanCharge(after: CachedScanCharge, before: CachedScanCharge): CachedScanCharge {
+	return {
+		scannedChildren: after.scannedChildren - before.scannedChildren,
+		bytesRead: after.bytesRead - before.bytesRead,
+		bytesPlanned: after.bytesPlanned - before.bytesPlanned,
+		skippedByBudget: after.skippedByBudget - before.skippedByBudget,
+		truncated: after.truncated && !before.truncated,
+		truncatedReason: after.truncated && !before.truncated ? after.truncatedReason : undefined,
+		depthLimitReached: after.depthLimitReached && !before.depthLimitReached,
+	};
+}
+
+/** Charge a reused subtree exactly as the walk that produced it was charged. */
+function replayScanCharge(state: ContextTreeScanState, charge: CachedScanCharge): void {
+	state.scannedChildren += charge.scannedChildren;
+	state.bytesRead += charge.bytesRead;
+	state.bytesPlanned += charge.bytesPlanned;
+	state.skippedByBudget += charge.skippedByBudget;
+	if (charge.truncated) {
+		state.truncated = true;
+		state.truncatedReason ??= charge.truncatedReason;
+	}
+	if (charge.depthLimitReached) state.depthLimitReached = true;
+}
+
+/**
+ * A copy of a walked subtree, so no caller can mutate what the cache handed out.
+ *
+ * The usage objects are copied too: they are the figures a caller displays, and a
+ * reused answer must never inherit an edit made to the answer handed out earlier.
+ */
+function cloneContextTreeNodes(nodes: ContextTreeNode[]): ContextTreeNode[] {
+	return nodes.map((node) => ({
+		...node,
+		ownUsage: cloneUsage(node.ownUsage),
+		totalUsage: cloneUsage(node.totalUsage),
+		contextUsage: node.contextUsage ? { ...node.contextUsage } : undefined,
+		children: cloneContextTreeNodes(node.children),
+	}));
 }
 
 /** Which limit stopped a disk scan from reading more session files. */
@@ -559,8 +865,25 @@ function reserveChildRead(state: ContextTreeScanState, size: number): boolean {
 	return true;
 }
 
-/** Build one disk node. Its children are filled in by the traversal, not here. */
+/**
+ * Build one disk node. Its children are filled in by the traversal, not here.
+ *
+ * With a `cache` the parse-and-fold is remembered by the transcript's stat identity
+ * (see {@link ContextTreeDiskScanCache}), which is what keeps a rescan of a wide tree
+ * from re-reading transcripts that did not move.
+ */
 function readContextTreeNode(
+	id: string,
+	sessionFile: SessionFile,
+	resolveContextWindow: ContextWindowResolver,
+	cache?: ContextTreeDiskScanCache,
+): ContextTreeNode | undefined {
+	const build = (): ContextTreeNode | undefined => readContextTreeEntry(id, sessionFile.path, resolveContextWindow);
+	return cache ? cache.nodeOf(id, sessionFile, resolveContextWindow, build) : build();
+}
+
+/** The uncached build of one disk node: parse the transcript and fold its spend. */
+function readContextTreeEntry(
 	id: string,
 	sessionFile: string,
 	resolveContextWindow: ContextWindowResolver,
@@ -616,6 +939,29 @@ interface ScanFrame {
 	level: number;
 	/** Children already represented live; set on the first frame only. */
 	skipIds?: ReadonlySet<string>;
+	/** The frame this dir was reached from; its subtree charge rolls up into this one. */
+	parent?: ScanFrame;
+	/** Everything this dir's subtree charged the scan, replayed on a cache hit. */
+	total: CachedScanCharge;
+}
+
+/** The subtree a frame's dir covers, as the cache keys and stores it. */
+function frameSubtreeKey(frame: ScanFrame, state: ContextTreeScanState): string {
+	const live = frame.skipIds ? [...frame.skipIds].sort().join(",") : "";
+	return `${frame.level}|${state.maxDepth}|${state.maxChildren}|${state.maxBytes}|${live}`;
+}
+
+/** Roll a finished frame's whole-subtree charge into its parent. */
+function addScanCharge(target: CachedScanCharge, delta: CachedScanCharge): void {
+	target.scannedChildren += delta.scannedChildren;
+	target.bytesRead += delta.bytesRead;
+	target.bytesPlanned += delta.bytesPlanned;
+	target.skippedByBudget += delta.skippedByBudget;
+	if (delta.truncated) {
+		target.truncated = true;
+		target.truncatedReason ??= delta.truncatedReason;
+	}
+	if (delta.depthLimitReached) target.depthLimitReached = true;
 }
 
 /**
@@ -627,6 +973,14 @@ interface ScanFrame {
  * summarize as "N more agents") rather than one deep branch. Frames are queued
  * only for dirs actually read, which bounds the listing work by the read budget
  * instead of by the size of the tree on disk.
+ *
+ * With a `cache`, a dir whose subtree is unchanged since the last scan is not
+ * walked at all: its children (and everything below them) come back from
+ * {@link ContextTreeDiskScanCache} with the walk's own budget charge replayed, so
+ * the reused answer and the walked one are indistinguishable to the caller -
+ * including a truncated scan's `partial` report. BFS order is what makes the
+ * seam safe: a dir's subtree is only ever queued from the dir's own frame, so a
+ * hit can fill that subtree without disturbing the frames still to come.
  */
 function scanChildrenInto(
 	rootDir: string,
@@ -634,10 +988,34 @@ function scanChildrenInto(
 	resolveContextWindow: ContextWindowResolver,
 	state: ContextTreeScanState,
 	skipIds?: ReadonlySet<string>,
+	cache?: ContextTreeDiskScanCache,
 ): void {
-	const queue: ScanFrame[] = [{ dir: rootDir, siblings: rootSiblings, level: 1, skipIds }];
+	const root: ScanFrame = {
+		dir: rootDir,
+		siblings: rootSiblings,
+		level: 1,
+		skipIds,
+		total: emptyScanCharge(),
+	};
+	const queue: ScanFrame[] = [root];
+	const misses: ScanFrame[] = [];
 	for (let index = 0; index < queue.length; index++) {
 		const frame = queue[index];
+		const remainingDepth = state.maxDepth - frame.level + 1;
+		const cached = cache?.takeSubtree(
+			frame.dir,
+			remainingDepth,
+			frameSubtreeKey(frame, state),
+			state,
+			resolveContextWindow,
+		);
+		if (cached) {
+			frame.total = cached.charge;
+			frame.siblings.push(...cached.nodes);
+			continue;
+		}
+		const before = scanChargeOf(state);
+		if (cache) misses.push(frame);
 		for (const childDir of listChildSessionDirs(frame.dir)) {
 			if (frame.skipIds?.has(basename(childDir))) {
 				continue;
@@ -658,14 +1036,50 @@ function scanChildrenInto(
 			if (!reserveChildRead(state, sessionFile.size)) {
 				continue;
 			}
-			const node = readContextTreeNode(basename(childDir), sessionFile.path, resolveContextWindow);
+			const node = readContextTreeNode(basename(childDir), sessionFile, resolveContextWindow, cache);
 			if (!node) {
 				continue;
 			}
 			frame.siblings.push(node);
-			queue.push({ dir: childDir, siblings: node.children, level: frame.level + 1 });
+			queue.push({
+				dir: childDir,
+				siblings: node.children,
+				level: frame.level + 1,
+				parent: frame,
+				total: emptyScanCharge(),
+			});
+		}
+		frame.total = subtractScanCharge(scanChargeOf(state), before);
+		if (frame.parent) addScanCharge(frame.parent.total, frame.total);
+	}
+	// The subtree is complete only after every frame below it has run, which BFS
+	// guarantees has happened by now: store what was walked, keyed by the same
+	// fingerprint the lookup used.
+	if (cache) {
+		for (const frame of misses) {
+			cache.storeSubtree(
+				frame.dir,
+				state.maxDepth - frame.level + 1,
+				frameSubtreeKey(frame, state),
+				frame.siblings,
+				frame.total,
+				resolveContextWindow,
+			);
 		}
 	}
+}
+
+/** All-zero charge, the starting point of a frame's subtree accounting. */
+function emptyScanCharge(): CachedScanCharge {
+	return {
+		scannedChildren: 0,
+		bytesRead: 0,
+		bytesPlanned: 0,
+		skippedByBudget: 0,
+		truncated: false,
+		truncatedReason: undefined,
+		depthLimitReached: false,
+	};
 }
 
 /** Options for {@link scanContextTreeChildrenFromDisk}. */
@@ -679,6 +1093,12 @@ export interface ContextTreeScanOptions {
 	 * Omitted: the scan gets its own state and `budget` applies to it alone.
 	 */
 	state?: ContextTreeScanState;
+	/**
+	 * Remembered scans of this dir tree, so a refresh that changes nothing on disk
+	 * does not re-read it. Omitted (the default for one-off callers): every scan
+	 * walks, exactly as it always did.
+	 */
+	cache?: ContextTreeDiskScanCache;
 }
 
 export interface ContextTreeScanResult {
@@ -704,7 +1124,7 @@ export function scanContextTreeChildrenFromDisk(
 		return { nodes: [], diagnostics: contextTreeScanDiagnostics(state) };
 	}
 	const nodes: ContextTreeNode[] = [];
-	scanChildrenInto(rlmSessionDir, nodes, resolveContextWindow, state, options.skipIds);
+	scanChildrenInto(rlmSessionDir, nodes, resolveContextWindow, state, options.skipIds, options.cache);
 	return { nodes, diagnostics: contextTreeScanDiagnostics(state) };
 }
 
@@ -723,16 +1143,18 @@ export function loadContextTreeChildFromDisk(
 	resolveContextWindow: ContextWindowResolver,
 	budget?: ContextTreeScanBudget,
 	state?: ContextTreeScanState,
+	cache?: ContextTreeDiskScanCache,
 ): ContextTreeNode | undefined {
 	const sessionFile = findSessionFile(childSessionDir);
 	if (!sessionFile) {
 		return undefined;
 	}
-	const node = readContextTreeNode(basename(childSessionDir), sessionFile.path, resolveContextWindow);
+	const scanState = state ?? createContextTreeScanState(budget);
+	const node = readContextTreeNode(basename(childSessionDir), sessionFile, resolveContextWindow, cache);
 	if (!node) {
 		return undefined;
 	}
-	scanChildrenInto(childSessionDir, node.children, resolveContextWindow, state ?? createContextTreeScanState(budget));
+	scanChildrenInto(childSessionDir, node.children, resolveContextWindow, scanState, undefined, cache);
 	return node;
 }
 
@@ -750,6 +1172,7 @@ export function loadContextTreeChildrenFromDisk(
 	resolveContextWindow: ContextWindowResolver,
 	skipIds?: ReadonlySet<string>,
 	budget?: ContextTreeScanBudget,
+	cache?: ContextTreeDiskScanCache,
 ): ContextTreeNode[] {
-	return scanContextTreeChildrenFromDisk(rlmSessionDir, resolveContextWindow, { budget, skipIds }).nodes;
+	return scanContextTreeChildrenFromDisk(rlmSessionDir, resolveContextWindow, { budget, skipIds, cache }).nodes;
 }

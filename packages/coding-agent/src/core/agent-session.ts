@@ -148,6 +148,7 @@ import {
 	shrunkKeepRecentTokens,
 } from "./compaction/index.js";
 import {
+	ContextTreeDiskScanCache,
 	type ContextTreeNode,
 	type ContextWindowResolver,
 	contextTreeScanDiagnostics,
@@ -17936,6 +17937,17 @@ export class AgentSession {
 	}
 
 	private _ownUsageAccumulator?: OwnUsageAccumulator;
+	/**
+	 * Remembered on-disk half of the context tree for this session's RLM children.
+	 *
+	 * The tree is rebuilt on every /context paint and on every client refresh of the
+	 * sub-agents tray, and its disk half reads and folds every child transcript under
+	 * the session dir - the expensive part (a 544-child dir measured 2.2s / ~1.08GB) and
+	 * usually the redundant one, because a UI refresh that changes nothing on disk used
+	 * to pay it again. Owned per session, so one session's cache can never answer for
+	 * another's dirs.
+	 */
+	private _contextTreeDiskCache?: ContextTreeDiskScanCache;
 	private _ownUsageMemo?: { count: number; tailId: string | undefined; ownUsage: Usage; totalUsage: Usage };
 
 	/**
@@ -17992,13 +18004,23 @@ export class AgentSession {
 		// of every live child are read for the same report, so they are charged to the
 		// same accounting and the omission published here covers all of them.
 		const scanState = createContextTreeScanState();
+		if (!this._contextTreeDiskCache) this._contextTreeDiskCache = new ContextTreeDiskScanCache();
+		const diskCache = this._contextTreeDiskCache;
 		const children: ContextTreeNode[] = [];
 		const liveIds = new Set<string>();
 		for (const run of this._activeRlmChildRuns.values()) {
 			liveIds.add(run.id);
+			// A child whose session is resident answers from memory - the usage fold the
+			// session keeps for its own /usage, in O(1) - and only its own persisted
+			// descendants come off the disk. `run.session` is unset for runs whose session
+			// this process still holds (a settled run released its run handle, a run
+			// abandoned for quiescence, a rehydrated child), and reading those transcripts
+			// back from disk was both slower and staler than asking the session that owns
+			// them: a live transcript is still growing, so every rescan re-read it.
+			const liveChildSession = run.session ?? this._rlmChildSessions.get(run.id)?.session;
 			const node =
-				run.session?.getContextTree() ??
-				loadContextTreeChildFromDisk(run.sessionDir, resolveContextWindow, undefined, scanState);
+				liveChildSession?.getContextTree() ??
+				loadContextTreeChildFromDisk(run.sessionDir, resolveContextWindow, undefined, scanState, diskCache);
 			children.push({
 				...(node ?? {
 					ownUsage: emptyUsage(),
@@ -18013,6 +18035,7 @@ export class AgentSession {
 		const diskScan = scanContextTreeChildrenFromDisk(this._rlmSessionDirForReading(), resolveContextWindow, {
 			skipIds: liveIds,
 			state: scanState,
+			cache: diskCache,
 		});
 		children.push(...diskScan.nodes);
 

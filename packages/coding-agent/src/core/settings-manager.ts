@@ -608,11 +608,25 @@ export interface Settings {
 	showHardwareCursor?: boolean; // Show terminal cursor while still positioning it for IME
 	markdown?: MarkdownSettings;
 	warnings?: WarningSettings;
+	ui?: UiSettings;
 	sessionDir?: string; // Custom session storage directory (same format as --session-dir CLI flag)
 }
 
 export interface AgentTracesSettings {
 	enabled?: boolean;
+}
+
+/**
+ * Behaviour of the interactive UI's own cells.
+ */
+export interface UiSettings {
+	/**
+	 * Show the sub-agent spend cell in the subagents tray line, and refresh it.
+	 * Default true. `false` is the emergency switch: the cell renders nothing and
+	 * the tray stops asking for the (disk-scanning) context tree at all - the
+	 * counts and stall markers keep updating from the roster stream.
+	 */
+	subagentSpendCell?: boolean;
 }
 
 export interface TelemetrySettings {
@@ -813,6 +827,7 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	showHardwareCursor: null,
 	markdown: ["codeBlockIndent", "mermaid"],
 	warnings: ["anthropicExtraUsage"],
+	ui: ["subagentSpendCell"],
 	sessionDir: null,
 };
 
@@ -2673,6 +2688,25 @@ export class SettingsManager {
 
 	getCodeBlockIndent(): string {
 		return this.settings.markdown?.codeBlockIndent ?? "  ";
+	}
+
+	/**
+	 * Whether the sub-agents tray renders its spend cell (and refreshes it).
+	 *
+	 * The cell is the tray's only consumer of the session context tree, which is a
+	 * disk-scanning RPC; `false` is the emergency switch for a session whose tray
+	 * figure is not worth that scan. Default true - the cell is on unless the user
+	 * turned it off.
+	 */
+	getSubagentSpendCellEnabled(): boolean {
+		return this.settings.ui?.subagentSpendCell ?? true;
+	}
+
+	setSubagentSpendCellEnabled(enabled: boolean): void {
+		this.globalSettings.ui ??= {};
+		this.globalSettings.ui.subagentSpendCell = enabled;
+		this.markModified("ui", "subagentSpendCell");
+		this.save();
 	}
 
 	getMermaidRenderingMode(): MermaidRenderingMode {

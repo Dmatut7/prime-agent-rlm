@@ -46,6 +46,7 @@ Unknown keys are reported: a misspelled or removed setting (for example `compact
 | `editorPaddingX` | number | `0` | Horizontal padding for input editor (0-3) |
 | `autocompleteMaxVisible` | number | `5` | Max visible items in autocomplete dropdown (3-20) |
 | `showHardwareCursor` | boolean | `false` | Show terminal cursor. `PI_HARDWARE_CURSOR` (`1`/`true`/`yes`, `0`/`false`/`no`) overrides it, and a conflict between the two is reported as a warning |
+| `ui.subagentSpendCell` | boolean | `true` | Show the spend cell (Σ sub-agents) in the subagents tray line and refresh it from the session context tree. `false` hides the cell and stops those scans (the tray counts and stall markers keep updating) |
 
 ### Update Checks
 

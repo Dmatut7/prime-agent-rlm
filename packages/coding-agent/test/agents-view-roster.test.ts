@@ -354,7 +354,15 @@ describe("supervisor roster subscription", () => {
 				]),
 				rlmNodeId: undefined,
 				heartbeatCatalog: [],
-				subagentSummaryLine: { setSubagentCounts, setStallMarkers, isSelectable: () => false, focused: false },
+				subagentSummaryLine: {
+					setSubagentCounts,
+					setStallMarkers,
+					// The spend cell is switched off for this fixture: it watches the counts.
+					setSubagentSpend: vi.fn(),
+					isSelectable: () => false,
+					focused: false,
+				},
+				uiServices: { settingsManager: { getSubagentSpendCellEnabled: () => false } },
 				scheduleHeartbeatManagerRefresh: vi.fn(),
 				updateWorkingPulse: vi.fn(),
 				syncWorkingLoader: vi.fn(),
