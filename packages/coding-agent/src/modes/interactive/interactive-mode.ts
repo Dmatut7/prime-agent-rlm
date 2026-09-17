@@ -234,8 +234,9 @@ import {
 } from "./components/slash-command-message.js";
 import { SlashCommandResultMessageComponent } from "./components/slash-command-result-message.js";
 import {
-	countDirectSubagentStatuses,
+	collectSubtreeSubagentSnapshots,
 	countRosterSubagentStatuses,
+	countSubtreeSubagentStatuses,
 	formatSubagentStallMarker,
 	type SubagentSummaryCounts,
 	SubagentSummaryLine,
@@ -6222,17 +6223,17 @@ export class InteractiveMode {
 						sessionId: this.connectionState?.sessionId,
 						sessionFile: this.connectionState?.sessionFile,
 					})
-				: countDirectSubagentStatuses(this.subagentSnapshots.values(), this.rlmNodeId);
+				: countSubtreeSubagentStatuses(this.subagentSnapshots.values(), this.rlmNodeId);
 		this.subagentCounts = counts;
 		this.subagentSummaryLine.setSubagentCounts(counts);
 		// The spend cell rides the same events (rlm_child_update, roster republish,
 		// resync) but is computed from the context tree, asynchronously.
 		this.scheduleSubagentSpendRefresh();
 		// A stalled child still counts as running, so the stall has to be visible on
-		// its own line or a wedged subagent reads as progress.
+		// its own line or a wedged subagent reads as progress. Same subtree as the
+		// counts: a wedge anywhere in the family must not need a direct-child slot.
 		const stallMarkers: string[] = [];
-		for (const child of this.subagentSnapshots.values()) {
-			if (child.parentId !== this.rlmNodeId || child.status === "cancelled") continue;
+		for (const child of collectSubtreeSubagentSnapshots(this.subagentSnapshots.values(), this.rlmNodeId)) {
 			const marker = formatSubagentStallMarker(child);
 			if (marker) stallMarkers.push(`${child.sessionName ?? child.label}: ${marker}`);
 		}

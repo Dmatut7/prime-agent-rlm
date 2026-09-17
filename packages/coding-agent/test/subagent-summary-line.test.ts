@@ -5,11 +5,12 @@ import { beforeAll, describe, expect, it, vi } from "vitest";
 import type { ContextTreeNode } from "../src/core/context-tree.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import type { AgentConnectionRlmChildAgentSnapshot } from "../src/modes/agent-connection/types.js";
-import { isDirectAgentChild } from "../src/modes/agents-view/agents-view-state.js";
+import { buildAgentsViewRows, collectSubagentDescendantSummaries } from "../src/modes/agents-view/agents-view-state.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import {
-	countDirectSubagentStatuses,
+	collectSubtreeSubagentSnapshots,
 	countRosterSubagentStatuses,
+	countSubtreeSubagentStatuses,
 	type SubagentSpendSummary,
 	SubagentSummaryLine,
 	summarizeSubagentSpend,
@@ -23,6 +24,23 @@ function child(
 	overrides: Partial<AgentConnectionRlmChildAgentSnapshot> = {},
 ): AgentConnectionRlmChildAgentSnapshot {
 	return { id, label: id, status, sessionDir: `/tmp/${id}`, ...overrides };
+}
+
+function rosterRow(overrides: Partial<SessionSummary> & { id: string }): SessionSummary {
+	return {
+		activeSessionId: overrides.id,
+		lifecycle: "live",
+		activity: "idle",
+		isSessionActive: false,
+		sessionId: `${overrides.id}-session`,
+		cwd: "/tmp/project",
+		isStreaming: false,
+		isCompacting: false,
+		attachedClients: 0,
+		messageCount: 1,
+		sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+		...overrides,
+	};
 }
 
 describe("SubagentSummaryLine", () => {
@@ -83,7 +101,7 @@ describe("SubagentSummaryLine", () => {
 		}
 	});
 
-	it("counts only direct children using running, idle, and inactive status projections", () => {
+	it("counts the whole subtree at any depth using running, idle, and inactive status projections", () => {
 		const children = [
 			child("running", "running"),
 			child("queued", "queued"),
@@ -95,13 +113,40 @@ describe("SubagentSummaryLine", () => {
 			child("inactive-error", "error"),
 			child("cancelled", "cancelled"),
 			child("grandchild", "running", { parentId: "running" }),
+			child("great-grandchild", "done", { parentId: "grandchild", activeSessionId: "great-grandchild" }),
 		];
 
-		expect(countDirectSubagentStatuses(children, undefined)).toEqual({
-			total: 8,
-			running: 3,
-			idle: 3,
+		// The cancelled row is the only one left out; every depth counts.
+		expect(countSubtreeSubagentStatuses(children, undefined)).toEqual({
+			total: 10,
+			running: 4,
+			idle: 4,
 			inactive: 2,
+		});
+	});
+
+	it("keeps a grandchild reachable through a cancelled parent and does not re-walk a duplicated link", () => {
+		const children = [
+			child("cancelled-mid", "cancelled"),
+			child("live-leaf", "running", { parentId: "cancelled-mid" }),
+			child("other-root", "done"),
+			child("dup", "running"),
+			child("mid", "done", { parentId: "dup", activeSessionId: "mid" }),
+			// A second row under the same id: the walk must not re-enter the branch it just left.
+			child("dup", "running", { parentId: "mid" }),
+		];
+
+		expect(collectSubtreeSubagentSnapshots(children, undefined).map((snapshot) => snapshot.id)).toEqual([
+			"other-root",
+			"dup",
+			"live-leaf",
+			"mid",
+		]);
+		expect(countSubtreeSubagentStatuses(children, undefined)).toEqual({
+			total: 4,
+			running: 2,
+			idle: 1,
+			inactive: 1,
 		});
 	});
 
@@ -216,6 +261,40 @@ describe("SubagentSummaryLine", () => {
 		expect(stripAnsi(line.render(100).join("\n"))).toContain("╭─ subagents ─");
 	});
 
+	it("marks a stalled grandchild without needing it to be a direct child", () => {
+		const line = new SubagentSummaryLine();
+		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
+		Object.assign(mode, {
+			subagentSnapshots: new Map<string, AgentConnectionRlmChildAgentSnapshot>(),
+			rlmNodeId: "me",
+			heartbeatCatalog: [],
+			subagentSummaryLine: line,
+			updateWorkingPulse: vi.fn(),
+			syncWorkingLoader: vi.fn(),
+			updateWorkingLoaderMessage: vi.fn(),
+			ui: { requestRender: vi.fn() },
+		});
+		const update = Reflect.get(InteractiveMode.prototype, "updateSubagentSummary") as (
+			this: typeof mode,
+			value: AgentConnectionRlmChildAgentSnapshot,
+		) => void;
+
+		update.call(mode, child("worker", "running", { parentId: "me", sessionName: "worker" }));
+		update.call(
+			mode,
+			child("grandchild", "running", {
+				parentId: "worker",
+				sessionName: "grandchild",
+				activity: { kind: "stalled" },
+				stall: { silentMs: 90_000, thresholdMs: 60_000, inFlightTools: ["bash"] },
+			}),
+		);
+
+		const rendered = stripAnsi(line.render(160).join("\n"));
+		expect(rendered).toContain("● 2 running");
+		expect(rendered).toContain("grandchild: stalled 90s, in-flight: bash");
+	});
+
 	it("clears a resident session id when a terminal update reports an evicted child", () => {
 		const line = new SubagentSummaryLine();
 		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
@@ -283,10 +362,52 @@ describe("SubagentSummaryLine", () => {
 			parentSessionId: "root-session",
 			rosterStatus: "idle",
 		} as SessionSummary;
-		expect(isDirectAgentChild(rosterChild, { sessionId: "root-session" })).toBe(true);
+		expect(collectSubagentDescendantSummaries([rosterChild], { sessionId: "root-session" })).toEqual([rosterChild]);
 		expect(countRosterSubagentStatuses([rosterChild], { sessionId: "root-session" })).toEqual({
 			total: 1,
 			running: 0,
+			idle: 1,
+			inactive: 0,
+		});
+	});
+
+	it("agrees with the agents view on the same roster input: one busy grandchild, one running", () => {
+		const summaries = [
+			rosterRow({
+				id: "parent-active",
+				activeSessionId: "parent-active",
+				sessionId: "parent-session",
+				sessionName: "Parent",
+			}),
+			rosterRow({
+				id: "child-active",
+				activeSessionId: "child-active",
+				sessionId: "child-session",
+				sessionName: "Child",
+				runtimeKind: "subagent",
+				parentActiveSessionId: "parent-active",
+			}),
+			rosterRow({
+				id: "grandchild-active",
+				activeSessionId: "grandchild-active",
+				sessionId: "grandchild-session",
+				sessionName: "Grandchild",
+				runtimeKind: "subagent",
+				parentActiveSessionId: "child-active",
+				activity: "working",
+				isSessionActive: true,
+			}),
+		];
+
+		// Reader 1: the agents view rolls a busy grandchild up to every idle ancestor.
+		const viewRows = buildAgentsViewRows(summaries);
+		expect(viewRows[0]).toMatchObject({ kind: "agent", runningSubagentCount: 1 });
+		expect(viewRows[1]).toMatchObject({ kind: "subagent-summary", title: "1 subagent running" });
+
+		// Reader 2: the tray counts the same subtree, so the two faces cannot disagree.
+		expect(countRosterSubagentStatuses(summaries, { activeSessionId: "parent-active" })).toEqual({
+			total: 2,
+			running: 1,
 			idle: 1,
 			inactive: 0,
 		});

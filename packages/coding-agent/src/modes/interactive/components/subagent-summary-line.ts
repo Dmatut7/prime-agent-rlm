@@ -2,7 +2,7 @@ import type { Usage } from "@earendil-works/pi-ai";
 import { type Component, type Focusable, getKeybindings, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { ContextTreeNode } from "../../../core/context-tree.js";
 import type { AgentConnectionRlmChildAgentSnapshot } from "../../agent-connection/index.js";
-import { isDirectAgentChild } from "../../agents-view/agents-view-state.js";
+import { collectSubagentDescendantSummaries } from "../../agents-view/agents-view-state.js";
 import { type AgentRosterStatus, classifyAgentStatus } from "../../daemon/agent-roster.js";
 import { classifySessionRosterStatus, type SessionSummary } from "../../daemon/daemon-session-list.js";
 import { formatTokenCount } from "../agent-activity.js";
@@ -19,6 +19,12 @@ const SPEND_SEPARATOR = "   ";
 /** Blank space always kept between the spend cell and the open hint. */
 const SPEND_MIN_GAP = 1;
 
+/**
+ * Running/idle/inactive counts for the subagents tray cell.
+ *
+ * 口径: the whole subagent subtree - direct children AND their descendants - so the
+ * counts describe the same agent set as the spend cell sharing this line.
+ */
 export interface SubagentSummaryCounts {
 	total: number;
 	running: number;
@@ -139,13 +145,43 @@ export function formatSubagentStallMarker(child: AgentConnectionRlmChildAgentSna
 	return `stalled ${silentSeconds}s${toolText}${unsettled}`;
 }
 
-export function countDirectSubagentStatuses(
+/**
+ * Every snapshot descending from `parentId` at any depth, breadth-first over `parentId`.
+ * A cancelled row still links its own children, so a live grandchild stays reachable when
+ * its parent's row was already dropped; it is left out of the result itself.
+ */
+export function collectSubtreeSubagentSnapshots(
+	children: Iterable<AgentConnectionRlmChildAgentSnapshot>,
+	parentId: string | undefined,
+): AgentConnectionRlmChildAgentSnapshot[] {
+	const byParent = new Map<string | undefined, AgentConnectionRlmChildAgentSnapshot[]>();
+	for (const child of children) {
+		const siblings = byParent.get(child.parentId);
+		if (siblings) siblings.push(child);
+		else byParent.set(child.parentId, [child]);
+	}
+	const descendants: AgentConnectionRlmChildAgentSnapshot[] = [];
+	const seen = new Set<string>();
+	const queue: Array<string | undefined> = [parentId];
+	for (let index = 0; index < queue.length; index++) {
+		for (const child of byParent.get(queue[index]) ?? []) {
+			// A snapshot set cannot link a node to itself, but a cycle would spin the walk forever.
+			if (seen.has(child.id)) continue;
+			seen.add(child.id);
+			queue.push(child.id);
+			if (child.status !== "cancelled") descendants.push(child);
+		}
+	}
+	return descendants;
+}
+
+/** Counts over every snapshot in this session's subtree, at any depth; the recursive roster carries the whole subtree. */
+export function countSubtreeSubagentStatuses(
 	children: Iterable<AgentConnectionRlmChildAgentSnapshot>,
 	parentId: string | undefined,
 ): SubagentSummaryCounts {
 	const counts: SubagentSummaryCounts = { total: 0, running: 0, idle: 0, inactive: 0 };
-	for (const child of children) {
-		if (child.parentId !== parentId || child.status === "cancelled") continue;
+	for (const child of collectSubtreeSubagentSnapshots(children, parentId)) {
 		counts.total += 1;
 		counts[classifySubagentSnapshotStatus(child)] += 1;
 	}
@@ -157,9 +193,9 @@ export function countRosterSubagentStatuses(
 	parent: { activeSessionId?: string | undefined; sessionId?: string | undefined; sessionFile?: string | undefined },
 ): SubagentSummaryCounts {
 	const counts: SubagentSummaryCounts = { total: 0, running: 0, idle: 0, inactive: 0 };
-	for (const child of summaries) {
-		if (child.runtimeKind !== "subagent" || child.lifecycle !== "live") continue;
-		if (!isDirectAgentChild(child, parent)) continue;
+	// The daemon roster spans every tree: count live rows in this session's subtree, at any depth.
+	for (const child of collectSubagentDescendantSummaries(summaries, parent)) {
+		if (child.lifecycle !== "live") continue;
 		counts.total += 1;
 		counts[child.rosterStatus ?? classifySessionRosterStatus(child)] += 1;
 	}
