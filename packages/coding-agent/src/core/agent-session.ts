@@ -6524,8 +6524,13 @@ export class AgentSession {
 		options?: PromptOptions,
 	): "compaction_in_flight" | "compaction_pending" | undefined {
 		if (!this.settingsManager.getCompactionPriorityOverAgentMessages()) return undefined;
-		// The suspended-pump and update-restart branches own their own queueing.
+		// The suspended-pump and update-restart branches own their own queueing, and a
+		// held admission pause means the queueing below would be refused: standing down
+		// keeps the gate from starting a compaction for a message that is never admitted
+		// (MCP-server replacement, ACP attach and the daemon's pause windows all hold one
+		// while the pump still runs).
 		if (this._sessionInputPumpSuspended || this._updateRestartFenceUp) return undefined;
+		if (this._sessionInputAdmissionPauses.size > 0) return undefined;
 		// This entry point IS the agent channel: when the caller supplied no envelope,
 		// the channel itself is the structural fact.
 		const envelope = customMessage ?? { role: "custom", customType: AGENT_MESSAGE_CUSTOM_TYPE };
@@ -12420,6 +12425,12 @@ export class AgentSession {
 			resolveCompactionOperation = resolve;
 		});
 		this._compactionOperation = compactionOperation;
+		// A compaction blocks the pump, so it blocks every queued input behind it, and
+		// the stall watchdog snoozes while compaction owns the turn boundary. Bound it
+		// whenever something is waiting - including the retry that a just-aborted
+		// compaction's queued message triggers through its own pre-turn compaction, which
+		// would otherwise hang on the same wedged summarizer with nobody left to cut it.
+		if (this.hasPendingSessionWork) this._armCompactionGateWatchdog();
 
 		try {
 			const authResult = this.model ? await this._modelRegistry.getApiKeyAndHeaders(this.model) : undefined;
