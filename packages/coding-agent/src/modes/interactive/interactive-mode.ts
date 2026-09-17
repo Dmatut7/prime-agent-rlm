@@ -249,6 +249,7 @@ import {
 	ToolExecutionComponent,
 	type ToolExecutionDefinition,
 } from "./components/tool-execution.js";
+import { TopBar } from "./components/top-bar.js";
 import { TreeSelectorComponent } from "./components/tree-selector.js";
 import { UserMessageComponent } from "./components/user-message.js";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.js";
@@ -1195,6 +1196,12 @@ export class InteractiveMode {
 	private customFooter: (Component & { dispose?(): void }) | undefined = undefined;
 
 	private headerContainer: Container;
+	/** Pinned fullscreen top bar identifying the chat by name while scrolling. */
+	private topBar: TopBar;
+	/** Cached session spend (USD) for the top bar, keyed to the session it was fetched for. */
+	private topBarCost: { sessionId?: string; total?: number } = {};
+	/** Stale-discard state for top bar cost refreshes (mirrors contextUsageRefresh). */
+	private topBarCostRefresh = { generation: 0, lastSuccessGeneration: 0 };
 
 	private builtInHeader: Component | undefined = undefined;
 
@@ -1243,6 +1250,14 @@ export class InteractiveMode {
 			void this.copyFullscreenSelection(text);
 		};
 		this.headerContainer = new Container();
+		this.topBar = new TopBar({
+			getChatName: () => this.getCurrentSessionName() ?? path.basename(this.getCurrentCwd()),
+			// Hide the cached spend unless it was fetched for the session now bound:
+			// a pending or failed refresh must not attribute the previous
+			// session's spend to the new chat.
+			getCostUsd: () =>
+				this.topBarCost.sessionId === this.connectionState?.sessionId ? this.topBarCost.total : undefined,
+		});
 		this.chatContainer = new Container();
 		this.shortcutGuideContainer = new Container();
 		this.pendingMessagesContainer = new Container();
@@ -1621,6 +1636,43 @@ export class InteractiveMode {
 		});
 
 		await this.updateAvailableProviderCount();
+	}
+
+	/**
+	 * Refresh the top bar's cached session spend from the context tree.
+	 * Results for a replaced session, or superseded by a newer successful
+	 * refresh, are discarded — mirroring refreshConnectionContextUsage.
+	 */
+	private refreshTopBarCost(): void {
+		// Partial-mode test harnesses skip the constructor, so the field
+		// initializer may be absent there; the refresh is cosmetic and must
+		// never crash a real flow on any `this`.
+		this.topBarCostRefresh ??= { generation: 0, lastSuccessGeneration: 0 };
+		const refresh = this.topBarCostRefresh;
+		const generation = ++refresh.generation;
+		const connection = this.agentConnection;
+		const sessionId = this.connectionState?.sessionId;
+		void (async () => {
+			try {
+				const tree = await connection.getContextTree();
+				const total = tree?.totalUsage?.cost?.total;
+				if (
+					typeof total !== "number" ||
+					!Number.isFinite(total) ||
+					generation < refresh.lastSuccessGeneration ||
+					this.agentConnection !== connection ||
+					this.connectionState?.sessionId !== sessionId
+				) {
+					return;
+				}
+				refresh.lastSuccessGeneration = generation;
+				this.topBarCost = { sessionId, total };
+				this.ui.requestRender();
+			} catch {
+				// Cost is cosmetic; a failed fetch keeps the previous value
+				// (the session-keyed getter still hides cross-session leaks).
+			}
+		})();
 	}
 
 	private updateTerminalTitle(): void {
@@ -2987,6 +3039,7 @@ export class InteractiveMode {
 		await this.updateAvailableProviderCount();
 		this.updateEditorBorderColor();
 		this.updateTerminalTitle();
+		this.refreshTopBarCost();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
 		this.syncGoalTray(this.getGoalState());
 		this.syncWorkingLoader();
@@ -3118,6 +3171,7 @@ export class InteractiveMode {
 			this.sideQuestionBashDiscarded = undefined;
 		}
 		this.updateTerminalTitle();
+		this.refreshTopBarCost();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
 		this.syncGoalTray(this.getGoalState());
 		this.syncWorkingLoader();
@@ -3801,6 +3855,7 @@ export class InteractiveMode {
 		this.setupAutocompleteProvider();
 		this.defaultEditor.onExtensionShortcut = undefined;
 		this.updateTerminalTitle();
+		this.refreshTopBarCost();
 		this.workingMessage = undefined;
 		this.workingVisible = true;
 		this.setWorkingIndicator();
@@ -5364,6 +5419,7 @@ export class InteractiveMode {
 					this.sessionRecap = event.recap;
 					this.patchConnectionState({ recap: event.recap });
 					this.renderRecap();
+					this.refreshTopBarCost();
 				} else if (event.type === "side_question_event") {
 					this.handleSideQuestionEvent(event.event);
 				} else if (event.type === "extension_ui_request") {
@@ -5621,6 +5677,7 @@ export class InteractiveMode {
 
 			case "session_info_changed":
 				this.updateTerminalTitle();
+				this.refreshTopBarCost();
 				this.footer.invalidate();
 				this.ui.requestRender();
 				break;
@@ -5867,6 +5924,7 @@ export class InteractiveMode {
 					this.ui.terminal.setProgress(false);
 				}
 				this.turnStartedAt = undefined;
+				this.refreshTopBarCost();
 				// Drops the loader; background subagents are shown by the tree, not the loader.
 				this.syncWorkingLoader();
 				if (this.streamingComponent) {
@@ -7839,6 +7897,7 @@ export class InteractiveMode {
 					this.widgetContainerBelow,
 				],
 				dock: this.promptDock,
+				pin: this.topBar,
 				mouse: this.settingsManager.getFullscreenMouse(),
 			});
 		} else {
