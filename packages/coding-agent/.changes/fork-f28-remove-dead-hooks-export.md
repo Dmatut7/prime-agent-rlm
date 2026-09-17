@@ -1,0 +1,2 @@
+- Removed the dead `./hooks` subpath export from the `@earendil-works/pi-coding-agent` package manifest and its two tsconfig path aliases: the `src/core/hooks` module they pointed at was deleted when hooks merged into the extensions system, so the export failed to resolve for external importers (upstream's manifest never had it; deleting it is API-breaking only for imports that already failed).
+- Added a manifest guard test that walks every `package.json` exports target and fails naming the subpath when neither the built file nor its source counterpart resolves.
