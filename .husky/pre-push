@@ -173,5 +173,20 @@ case "${1:-}" in
 		;;
 esac
 
-verdict
-exit $?
+# Snapshot git's pre-push stdin once: the fork's v-tag verdict reads it first,
+# then upstream #2446's mirror/deletion guard re-reads the same lines.
+_snapshot=$(mktemp "${TMPDIR:-/tmp}/prime-agent-pre-push.XXXXXX")
+cat > "$_snapshot"
+
+verdict < "$_snapshot"
+ban_status=$?
+if [ "$ban_status" -ne 0 ]; then
+	rm -f "$_snapshot"
+	exit "$ban_status"
+fi
+# Upstream #2446: mirror-like push / mass branch-deletion guard rides after the
+# fork's v-tag ban; its rules and escape hatch live in scripts/pre-push-guard.sh.
+sh "$(dirname "$0")/../scripts/pre-push-guard.sh" "$@" < "$_snapshot"
+guard_status=$?
+rm -f "$_snapshot"
+exit "$guard_status"
