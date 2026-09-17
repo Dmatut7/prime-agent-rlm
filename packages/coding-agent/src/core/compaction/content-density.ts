@@ -1,31 +1,59 @@
 /**
- * Content-aware token density for text the compaction pipeline generates itself.
+ * Content-aware token density: the one caliber table for the multipliers this fork quotes.
  *
- * estimateTokens prices every character at chars/4, which is right for ASCII
- * prose and wrong for the two other things a transcript is full of: CJK text
- * (roughly one token per character) and code (denser than prose). A session whose
- * user writes Chinese measured 1.4x low overall and 3-4x low on the CJK-heavy
- * slices, so a budget expressed in raw character counts silently overspends.
+ * estimateTokens prices every character at chars/4, which is right for ASCII prose
+ * and wrong for the two other things a transcript is full of: CJK text and fenced
+ * code. Compaction therefore quotes more than one multiplier, and it used to quote
+ * three that were not comparable - "1.4x overall and 3-4x on the CJK-heavy slices"
+ * in this header, "~1.6x" at the trigger. They measured different things against
+ * different bases, and the 3-4x one had no reading on disk behind it. This table
+ * replaces all three: each row says what is measured, against what, and where the
+ * number comes from.
  *
- * The summarization request budget already corrects for this with a provider
- * anchor (see summarizationInflation in compaction.ts); this module is the
- * fallback for text that has no provider count yet - the machine-generated blocks
- * compaction appends to a summary. Those blocks are sized here, so a CJK-heavy
- * verbatim user-request section cannot cost three times what its character count
- * suggests.
+ * | multiplier | what the number is | source |
+ * | --- | --- | --- |
+ * | 1.00x | ASCII prose: the chars/4 baseline itself, so the correction is not a blanket inflation | ASCII_CHARS_PER_TOKEN below |
+ * | 1.33x | fenced code, the per-class bound (4/3). A sample that also counts its fence markers reads 1.30x: this module prices the fence lines as ordinary text | CODE_CHARS_PER_TOKEN below |
+ * | 2.67x | CJK, the per-class bound (4/1.5) and the largest correction this module can produce. The 1,350-character CJK pin reads 338 tokens flat against 900 dense | CJK_CHARS_PER_TOKEN below; pin in test/compaction-trigger-density.test.ts |
+ * | 1.05-2.01x | real text on this machine, priced with this module: repository AGENTS.md 1.05x, whole system prompt 1.16x, harness digest 1.41x, ~/.prime/agent/AGENTS.md 2.01x | /tmp/wk2098/measure2.out (2026-09-17, 62,181 B system prompt); the two AGENTS.md rows re-read live on 2026-09-18 (1.05x / 1.99x) |
+ * | 1.60x | provider-measured over one whole session: 982k prompt tokens reported by the provider against 614k chars/4 tokens estimated for the same content - the session that produced the production 400 | recorded on summarizationInflation in compaction.ts |
+ * | ~~3-4x~~ | retired: "3-4x low on the CJK-heavy slices" had no reading behind it, and it is larger than the 2.67x bound this module's constants can produce. Deleted rather than restated | this header, before the cut-point relabel |
+ *
+ * The rows are not interchangeable. 2.67x is a per-class bound on a fully-CJK text,
+ * 1.05-2.01x is what real mixed segments measure, and 1.60x is one session's
+ * provider-reported aggregate. They agree on direction and disagree on scope, and
+ * none of them is a correction to apply blindly: a transcript of ASCII prose is
+ * priced at exactly 1.00x.
+ *
+ * Where each caliber applies, so the table cannot be read as "multiply anything here":
+ * - This module prices the machine-generated blocks compaction appends to a summary
+ *   (<read-files>/<modified-files>, <fact-appendix>, <user-requests>).
+ * - estimateTokensByContent is the trigger and /usage caliber, and since the
+ *   cut-point relabel it is also the caliber of the cut point, keepRecentTokens and
+ *   the emergency shrink, so a nominal retained token means an estimated real token.
+ * - The summarization request budget stays on the flat chars/4 caliber on purpose:
+ *   summarizationInflation converts that allowance with the provider's own anchor,
+ *   so pricing the same text here as well would count the correction twice.
+ *
+ * The blocks are sized here so a CJK-heavy verbatim user-request section cannot cost
+ * three times what its character count suggests.
  */
-
-/** Characters per token for ASCII prose: the same caliber as estimateTokens. */
+/** Characters per token for ASCII prose: the flat baseline, and the 1.00x row of the table above. */
 export const ASCII_CHARS_PER_TOKEN = 4;
 
 /**
  * Characters per token for CJK syllabics. BPE tokenizers for Chinese/Japanese
- * spend about one token per character to one per two; 1.5 is the middle measured
- * on the transcripts this fork runs on.
+ * spend about one token per character to one per two; 1.5 is the middle of that
+ * range, and it caps this module's correction at 2.67x (see the table above). The
+ * one provider-measured session landed at 1.60x overall, below the cap, so the
+ * per-class constants correct in the safe direction without over-correcting.
  */
 export const CJK_CHARS_PER_TOKEN = 1.5;
 
-/** Characters per token inside fenced code blocks: punctuation splits words up. */
+/**
+ * Characters per token inside fenced code blocks: punctuation splits words up.
+ * 1.33x against the flat baseline, the second row of the table above.
+ */
 export const CODE_CHARS_PER_TOKEN = 3;
 
 export interface ContentDensity {

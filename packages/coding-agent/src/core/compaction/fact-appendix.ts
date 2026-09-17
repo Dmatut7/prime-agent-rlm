@@ -137,8 +137,11 @@ export const FACT_APPENDIX_BUDGET_MINIMUM = 400;
  *
  * A fixed budget is wrong at both ends: on a 490k-token slice it retains a quarter of
  * the facts the transcript itself repeats, and on a small window it can outgrow the
- * retained context it annotates. Both inputs are in estimateTokens caliber (chars/4),
- * which reads CJK low, so the derived budget is conservative.
+ * retained context it annotates. Both inputs are in the keepRecent caliber (content
+ * density): keepRecentTokens is the budget the cut was made against, and
+ * summarizedTokens measures the slice that left the context the same way. The ledger
+ * that spends this budget is priced in that caliber too, so budget and spend agree -
+ * a chars/4 slice share would size a CJK-heavy appendix up to 2.67x below its cost.
  */
 export function factAppendixTokenBudget(keepRecentTokens: number, summarizedTokens = 0): number {
 	if (!Number.isFinite(keepRecentTokens) || keepRecentTokens <= 0) return FACT_APPENDIX_BUDGET_MINIMUM;

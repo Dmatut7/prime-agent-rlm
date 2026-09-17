@@ -73,3 +73,42 @@ describe("measureContentDensity", () => {
 		expect(measureContentDensity("").tokens).toBe(0);
 	});
 });
+
+/**
+ * The header table is the one caliber reference: rows 1-3 are the per-class bounds
+ * this module can produce, the 1,350-character CJK pin is the reading the trigger
+ * test uses, and the retired "3-4x on CJK-heavy slices" row is retired precisely
+ * because this module cannot produce it.
+ */
+describe("caliber table", () => {
+	it("bounds every correction at the per-class ratios the table quotes", () => {
+		expect(ASCII_CHARS_PER_TOKEN / ASCII_CHARS_PER_TOKEN).toBe(1);
+		expect(ASCII_CHARS_PER_TOKEN / CODE_CHARS_PER_TOKEN).toBeCloseTo(1.333, 3);
+		expect(ASCII_CHARS_PER_TOKEN / CJK_CHARS_PER_TOKEN).toBeCloseTo(2.667, 3);
+	});
+
+	it("reads the 1,350-character CJK pin as the table's 2.67x row", () => {
+		const cjk = "压缩必须在供应商输入墙之前触发，否则普通请求先收到四百错误。".repeat(45);
+		expect(cjk.length).toBe(1350);
+		// The flat caliber the trigger test compares against, and the dense reading.
+		expect(Math.ceil(cjk.length / ASCII_CHARS_PER_TOKEN)).toBe(338);
+		expect(measureContentDensity(cjk).tokens).toBe(900);
+		expect(measureContentDensity(cjk).densityRatio).toBeCloseTo(ASCII_CHARS_PER_TOKEN / CJK_CHARS_PER_TOKEN, 2);
+	});
+
+	it("cannot produce the retired 3x figure on any mix of the classes", () => {
+		const ceiling = ASCII_CHARS_PER_TOKEN / CJK_CHARS_PER_TOKEN;
+		const samples = [
+			"中文 mixed with ascii 123",
+			"```\ncode 中文 line\n```",
+			"压缩必须在供应商输入墙之前触发，否则普通请求先收到四百错误。".repeat(45),
+			`\`\`\`\n${"中".repeat(400)}\n\`\`\`\``,
+			Array.from({ length: 200 }, (_, i) => `const value${i} = compute(${i});`).join("\n"),
+		];
+		for (const text of samples) {
+			// The retired "3-4x" row is unreachable: CJK is the densest class, and it is
+			// capped by CJK_CHARS_PER_TOKEN.
+			expect(measureContentDensity(text).densityRatio).toBeLessThanOrEqual(ceiling + 0.01);
+		}
+	});
+});

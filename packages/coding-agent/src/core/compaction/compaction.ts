@@ -177,8 +177,9 @@ export interface CompactionSettings {
  *
  * The old trigger was `contextWindow - reserveTokens`, i.e. ~98.4% of a 1M window.
  * Two independent measurement errors sat under it and both pushed the same way:
- * the estimate prices text at chars/4, which under-counts CJK by ~1.6x, and the
- * catalog window can exceed what the provider accepts as input (DashScope answers
+ * the estimate priced text at chars/4, which under-counts CJK (one recorded session
+ * read 1.60x low; content-density.ts carries the table of every multiplier this fork
+ * quotes), and the catalog window can exceed what the provider accepts as input (DashScope answers
  * an oversized prompt with HTTP 400 instead of truncating). Together they let a
  * session reach the provider's wall on an ordinary request before the trigger
  * ever fired, so compaction woke up after the 400 - sometimes too late to run.
@@ -478,13 +479,16 @@ function collectMessageEstimateParts(message: AgentMessage): MessageEstimatePart
 }
 
 /**
- * Estimate token count for a message using the chars/4 heuristic.
+ * Estimate token count for a message with the flat chars/4 heuristic.
  *
- * The budgeting caliber: cut points, keepRecentTokens and the summarization
- * inflation anchor are all expressed in it, so it stays flat and cheap. It
- * under-counts dense text (CJK costs about one token per character, not per four);
- * callers that compare against a provider's real token count use
- * estimateTokensByContent instead.
+ * It is no longer the caliber of the retained slice: cut points, keepRecentTokens,
+ * the trigger and the emergency shrink are all priced by estimateTokensByContent,
+ * so a nominal token means an estimated real token everywhere the compaction
+ * decides how much context to keep. This flat caliber survives only where the
+ * provider's own count already anchors the number - budgetSummarizationInput trims
+ * the summarization request in it and summarizationInflation converts that budget
+ * back with a measured provider ratio - so the two corrections cannot
+ * double-count. See content-density.ts for the ratio table and its sources.
  */
 export function estimateTokens(message: AgentMessage): number {
 	const parts = collectMessageEstimateParts(message);
@@ -497,10 +501,13 @@ export function estimateTokens(message: AgentMessage): number {
  * Estimate token count for a message priced by content density: CJK and fenced
  * code cost what they actually cost a tokenizer instead of the flat chars/4.
  *
- * This is the caliber the compaction trigger and /usage report, because both are
- * compared against a number the provider measured. A Chinese-heavy session
- * estimated at chars/4 read ~1.6x low, so the trigger fired after the provider
- * had already rejected the request.
+ * This is the caliber of everything that decides how much context is retained or
+ * reported: the trigger and /usage (both compared against a number the provider
+ * measured), the cut point, keepRecentTokens and the emergency shrink. A
+ * Chinese-heavy session estimated at chars/4 read 1.60x low, so the trigger fired
+ * after the provider had already rejected the request; the table in
+ * content-density.ts lists every multiplier this correction may produce and where
+ * each reading comes from.
  */
 export function estimateTokensByContent(message: AgentMessage): number {
 	const parts = collectMessageEstimateParts(message);
@@ -587,12 +594,16 @@ export function isTurnStartEntry(entry: SessionEntry): boolean {
 	return entry.message.role === "user" || entry.message.role === "bashExecution";
 }
 
-/** Estimated tokens of the message entries in [fromIndex, toIndex). */
+/**
+ * Estimated tokens of the message entries in [fromIndex, toIndex), priced by
+ * content density: this is the caliber every keepRecentTokens comparison is made
+ * in, so the alignment slack below is real tokens and not chars/4 tokens.
+ */
 function estimateEntryRangeTokens(entries: SessionEntry[], fromIndex: number, toIndex: number): number {
 	let total = 0;
 	for (let i = fromIndex; i < toIndex; i++) {
 		const entry = entries[i];
-		if (entry.type === "message") total += estimateTokens(entry.message);
+		if (entry.type === "message") total += estimateTokensByContent(entry.message);
 	}
 	return total;
 }
@@ -649,6 +660,11 @@ export interface CutPointResult {
  * Algorithm: Walk backwards from newest, accumulating estimated message sizes.
  * Stop when we've accumulated >= keepRecentTokens. Cut at that point.
  *
+ * The accumulation is priced by content density (estimateTokensByContent), the same
+ * caliber as the trigger and the emergency shrink: a Chinese- or code-heavy turn
+ * costs what the provider charges for it, so the retained slice lands on the
+ * configured budget instead of on a chars/4 reading that could be 2.7x low.
+ *
  * Can cut at user OR assistant messages (never tool results). When cutting at an
  * assistant message with tool calls, its tool results come after and will be kept.
  *
@@ -676,7 +692,7 @@ export function findCutPoint(
 	for (let i = endIndex - 1; i >= startIndex; i--) {
 		const entry = entries[i];
 		if (entry.type !== "message") continue;
-		const messageTokens = estimateTokens(entry.message);
+		const messageTokens = estimateTokensByContent(entry.message);
 		accumulatedTokens += messageTokens;
 		if (accumulatedTokens >= keepRecentTokens) {
 			let nearestCut: number | undefined;
@@ -1773,7 +1789,11 @@ export function buildCompactionAppendix(preparation: CompactionPreparation): Com
 	const generation = preparation.generation !== undefined && preparation.generation > 0 ? preparation.generation : 1;
 	const keepRecentTokens = preparation.keepRecentTokens ?? capKeepRecentTokens(settings, undefined);
 	const source = turnPrefixMessages.length > 0 ? [...messagesToSummarize, ...turnPrefixMessages] : messagesToSummarize;
-	const summarizedTokens = source.reduce((total, message) => total + estimateTokens(message), 0);
+	// Same caliber as keepRecentTokens above and as the ledger that spends the
+	// budget: the facts are priced by content density when they are fitted, so a
+	// slice-share cut in the flat chars/4 caliber would size a CJK-heavy appendix
+	// up to 2.67x below what it costs.
+	const summarizedTokens = source.reduce((total, message) => total + estimateTokensByContent(message), 0);
 	const facts = buildFactLedger({
 		messages: source,
 		generation,
