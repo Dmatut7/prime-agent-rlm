@@ -313,3 +313,13 @@
 **母席拍板两项**：
 1. **symlink / read-only-open 安全取向**：保我们更严的取向（private-files 的拒 symlink / 0600 / O_NOFOLLOW），不随 #2028 放宽；与上游的偏差写进提交说明与本文档，作为 fork 安全基线。
 2. **as 块2 refine 通知形态**：采用上游 durable `refinement_notice` 的投递机制，但渲染必须保留 MV-5「被拒条目可见」（与 §3.2 #2098 裁法一致）；notice 与 outcome 不双投递（去重 pin 已有）。
+
+---
+
+## 13. 收口记账（2026-09-18 凌晨）
+
+- **压缩安全束十笔全落并推**（b407d0feb…7324d1f55）；验收按复核席口径记账 **56 例绿**（回归 8 + 准入矩阵 20 + 分类器 18 + 密度 6 + UI 抬头 4）；第 10 笔补两缺口（admission pause 白起压缩、watchdog 只有一发）。
+- **C5 = ad7024f76**（supervisor availability settle 句柄，30s 挂死复现红→确定性绿 3×104/104）；r42 flake 台账 F1 记已消。#2336 四竞态＝ec33fd473(3/4, ④ N/A)+C5。
+- **P3 承重件执行已开**：p3-exec-as（agent-session+session-manager，0902）与 p3-exec-repl（repl-manager+daemon-supervisor，K3），裁法单一来源＝/tmp/p3-plan-agentsession.md + /tmp/p3-plan-reconcile.md 终裁 + /tmp/p3-plan-repl-supervisor.md；#2284/#2334/#2098 接收侧排在 P3 的挂起批/NC 区，不另开脸。
+- **p3-plan-2 对母文档的 4 条纠正已采纳**：#2213 我方已移植（01f106f26）不重做；#1947 底座取我方 fd 直交、只吸 decoder/flush/exit-destroy/等 close 四项；步进补偿时钟不在 repl-manager（保块 7 即保住）；atomic-file 两侧逐字同、真问题是上游 wrapper 丢 fsync/fsyncDir。
+- 复核纪律升级（已入记忆）：按波复核分量比对红名单；落地闸＝纯净树 tsgo＋邻接测试集。
