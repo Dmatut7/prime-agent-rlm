@@ -194,13 +194,14 @@ describe("SessionManager append hot path", () => {
 		const file = mgr.getSessionFile()!;
 		expect(readLines(file)).toHaveLength(2);
 
-		const internals = mgr as unknown as { _persist(entry: unknown): void };
-		const originalPersist = internals._persist.bind(mgr);
-		internals._persist = () => {
+		// One failing append, injected at the fs seam: the rollback pops the
+		// failed custom entry, recomputes the guard cache from the popped
+		// entries, and repairs the file; the cached flag must still hold, so
+		// this message persists.
+		fsMocks.writeSync.mockImplementationOnce(() => {
 			throw new Error("append failed");
-		};
+		});
 		expect(() => mgr.appendCustomMessageEntryWithRollback("test.outcome", "details", false)).toThrow("append failed");
-		internals._persist = originalPersist;
 
 		// The rollback popped the failed custom entry and repaired the file;
 		// the cached guard flag must still hold, so this message persists.
