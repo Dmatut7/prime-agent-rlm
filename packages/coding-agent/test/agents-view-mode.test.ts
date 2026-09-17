@@ -994,6 +994,49 @@ describe("AgentsViewMode", () => {
 		}
 	});
 
+	it("shows an inactive saved row's recorded model — and only that row's model", () => {
+		const saved = (id: string, model?: { provider: string; modelId: string }) => ({
+			path: `/tmp/${id}.jsonl`,
+			id,
+			cwd: "/tmp",
+			created: new Date("2026-01-01T00:00:00Z"),
+			modified: new Date("2026-01-01T00:00:00Z"),
+			messageCount: 1,
+			firstMessage: "hello",
+			allMessagesText: "hello",
+			...(model ? { model } : {}),
+		});
+		// An inactive row is an off-daemon saved session, so its live summary carries no
+		// model at all: the recorded one is the only model it has (#2148).
+		const records = reconcileUnifiedSessions(
+			[],
+			[saved("with-model", { provider: "prime-inference", modelId: "glm-4.7" }), saved("bare")],
+		);
+		const rows = buildAgentsViewRows(records);
+		const view = new AgentsViewMode({ config: {}, uiServices: createUiServices() }, {});
+		Reflect.set(view, "rows", rows);
+		try {
+			const rowFor = (id: string) => rows.find((row) => row.summary.sessionId === id)!;
+			const render = (id: string) => stripAnsi(invoke("renderRow", view, rowFor(id), 120) as string);
+
+			expect(render("with-model")).toContain("prime-inference/glm-4.7");
+			// Control: a row without a recorded model stays as bare as it was, and the
+			// other row's model never leaks into it.
+			expect(render("bare")).not.toContain("glm-4.7");
+			expect(render("bare")).not.toContain("prime-inference");
+
+			// The header names the selected row's own model; the model this view would
+			// start a new session with is only the fallback, so a selected row that has
+			// one wins and a row without one leaves it undefined.
+			Reflect.set(view, "selectedIndex", rows.indexOf(rowFor("with-model")));
+			expect(invoke("getSplashModelId", view)).toBe("glm-4.7");
+			Reflect.set(view, "selectedIndex", rows.indexOf(rowFor("bare")));
+			expect(invoke("getSplashModelId", view)).toBeUndefined();
+		} finally {
+			stopThemeWatcher();
+		}
+	});
+
 	it("shows the bold usage legend on every section header", () => {
 		const running = (id: string, created: string) =>
 			summary({

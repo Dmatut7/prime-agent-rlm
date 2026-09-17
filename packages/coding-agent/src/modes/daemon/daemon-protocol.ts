@@ -227,26 +227,33 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 //   DAEMON_SCHEMA_ID unchanged - rev29 added response.retryAfterMs through exactly
 //   that gap, moving the number but not the digest. The envelope now joins the hashed
 //   source; the wire shapes themselves are unchanged and all clients degrade locally.
-// Revision 38 is the merged wire - the first number neither lineage has written.
-//   Upstream's own 29 lands here (its capability-gated abort_and_send_queued
-//   command) on top of this fork's 28-37; 27/28/29 stay unusable because both sides
-//   wrote them, so the block above records both meanings per number. Upstream's own
-//   27 (structured session_recovering failure info) is NOT on this wire: the landing
-//   tree kept DaemonSessionRecoveringError for the supervisor's in-process retry
-//   typing only (daemon-errors.ts class + daemon-supervisor's retry predicate), with
-//   no DaemonErrorInfo row and no serialize/deserialize branch, so no response this
-//   build sends can carry code "session_recovering" and the ledger row above records
-//   upstream's meaning alone. abort_and_send_queued is gated at
-//   38 rather than at upstream's 29: on this lineage a rev29 peer means
-//   response.retryAfterMs and has no such command, so a 29 floor would admit exactly
-//   the peer that cannot serve it. The capability stays the primary gate; the
-//   revision only has to be honest. Upstream's own 28 (the recorded model on
-//   saved-session rows) is deliberately NOT taken: SessionInfo carries no recorded
-//   model on this lineage, so the field would have no producer, which is the failure
-//   mode the 23-27 ledger warns about. It stays off the wire until that face is
-//   ported.
+// Revision 38 is the merged wire: the first number neither lineage has written, so this
+//   window carries both sides' faces into it.
+//   Upstream's own 29 lands here (its capability-gated abort_and_send_queued command) on
+//   top of this fork's 28-37; 27/28/29 stay unusable because both sides wrote them, so the
+//   block above records both meanings per number. abort_and_send_queued is gated at 38
+//   rather than at upstream's 29: on this lineage a rev29 peer means response.retryAfterMs
+//   and has no such command, so a 29 floor would admit exactly the peer that cannot serve
+//   it. The capability stays the primary gate; the revision only has to be honest.
+//   Upstream's own 27 (structured session_recovering failure info) is NOT on this wire: the
+//   landing tree kept DaemonSessionRecoveringError for the supervisor's in-process retry
+//   typing only (daemon-errors.ts class and daemon-supervisor's retry predicate), with no
+//   DaemonErrorInfo row and no serialize/deserialize branch, so no response this build sends
+//   can carry code "session_recovering" and the ledger row above records upstream's meaning
+//   alone.
+//   Upstream's own 28 (the recorded model on saved-session rows) rides this revision as
+//   well. This window was first written without it, on the grounds that SessionInfo carried
+//   no recorded model on this lineage and the field would have had no producer; the P3 merge
+//   brought exactly that producer in (model_change entries and assistant messages fold into
+//   SessionInfo.model), so the saved-session DTO, its serializer and the agents view's
+//   inactive rows publish the recorded model here - together with the error verdict the
+//   saved-session wire used to downshift (upstream #2310's wire half). Neither addition
+//   touches the digest's own bytes (the constants and this comment sit in no hashed slice),
+//   so one recomputation covers the whole window. The rev-37 constant came out of the P3
+//   merge advertising a digest the merged wire no longer hashed; recomputing it here is the
+//   file's documented recovery, not a hand-written value.
 export const DAEMON_SCHEMA_REVISION = 38;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-38-5847b56f15d5";
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-38-317b96808bc4";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -1429,6 +1436,8 @@ export interface DaemonSavedSessionInfo {
 	allMessagesText: string;
 	agentStatus?: AgentConnectionAgentStatus;
 	usage?: SessionUsageSummary;
+	/** Last recorded provider/model selector; absent for sessions that never ran a model. */
+	model?: { provider: string; modelId: string };
 }
 
 export type DaemonDeleteSavedSessionResult = DeleteSessionFileResult;

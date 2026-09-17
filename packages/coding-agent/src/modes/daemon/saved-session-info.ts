@@ -3,17 +3,19 @@ import type { AgentConnectionAgentStatus, AgentConnectionSavedSessionInfo } from
 import type { DaemonSavedSessionInfo } from "./daemon-protocol.js";
 
 /**
- * The saved-session wire still validates taskState against the pre-#2310 enum,
- * and a strict old client meeting `error` rejects the whole session item. Error
- * verdicts therefore cross with their recap only; the enum widens when the
- * daemon protocol takes that change (the wire half of upstream #2310, deferred).
+ * The wire half of upstream #2310: the error verdict crosses with its recap. The
+ * downshift it replaces existed because `daemon-client` refused the value and a
+ * client strict about the saved-session item dropped the whole row over it, which
+ * is what the daemon protocol revision records; the client validator has accepted
+ * `error` since 8f52777f2, so only this projection was still holding the verdict
+ * back from the archived row whose recap is about exactly that failure.
+ *
+ * The projection stays field-by-field on purpose: the wire shape is this function's
+ * output, not whatever AgentStatus grows next.
  */
 function wireAgentStatus(status: AgentStatus | undefined): AgentConnectionAgentStatus | undefined {
 	if (status === undefined) {
 		return undefined;
-	}
-	if (status.taskState === "error") {
-		return { summary: status.summary, basedOnMessageCount: status.basedOnMessageCount };
 	}
 	return {
 		summary: status.summary,
@@ -38,6 +40,7 @@ export function serializeSavedSessionInfo(session: SessionInfo): DaemonSavedSess
 		allMessagesText: session.allMessagesText,
 		agentStatus: wireAgentStatus(session.agentStatus),
 		usage: session.usage,
+		model: session.model,
 	};
 }
 
@@ -57,5 +60,6 @@ export function deserializeSavedSessionInfo(session: DaemonSavedSessionInfo): Ag
 		allMessagesText: session.allMessagesText,
 		agentStatus: session.agentStatus,
 		usage: session.usage,
+		model: session.model,
 	};
 }

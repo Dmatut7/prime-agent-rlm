@@ -2751,9 +2751,13 @@ export class AgentsViewMode implements Component, Focusable {
 				: styleRowTitle(row);
 		// Keep stable model information ahead of the variable summary so narrow rows truncate the summary first.
 		const summaryText = !pendingDelete && !pendingKill ? row.summary.summary : undefined;
+		// An inactive row has no live summary to read a model from, so its last recorded model
+		// (the saved-session catalog) is the only one it has: the row read as if the session
+		// never ran a model (#2148). Live rows keep the subagent-only suffix they always had.
+		const rowModel = rowSessionModel(row);
 		const modelLabel =
-			isSubagentSummary(row.summary) && !pendingDelete && !pendingKill && row.summary.model
-				? `${row.summary.model.provider}/${row.summary.model.id}${row.summary.thinkingLevel && row.summary.thinkingLevel !== "off" ? `:${row.summary.thinkingLevel}` : ""}`
+			!pendingDelete && !pendingKill && rowModel && (isSubagentSummary(row.summary) || row.section === "inactive")
+				? `${rowModel.provider}/${rowModel.modelId}${row.summary.thinkingLevel && row.summary.thinkingLevel !== "off" ? `:${row.summary.thinkingLevel}` : ""}`
 				: undefined;
 		const statusLabel =
 			!pendingDelete &&
@@ -2924,7 +2928,11 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private getSplashModelId(): string | undefined {
-		return this.rows[this.selectedIndex]?.summary.model?.id ?? this.options.startupModelId;
+		const selected = this.rows[this.selectedIndex];
+		// The selected row's own model, live or recorded: an inactive row's recorded model is
+		// that session's model, while the startup model belongs to a session this view would
+		// create, so it is only the fallback (#2148).
+		return (selected ? rowSessionModel(selected)?.modelId : undefined) ?? this.options.startupModelId;
 	}
 
 	private getSplashCwd(): string {
@@ -3130,6 +3138,20 @@ function styleRowTitle(row: AgentsViewRow): string {
 		return theme.italic(row.title);
 	}
 	return row.title;
+}
+
+/**
+ * The model selector a row shows, normalized across the two shapes that carry one: a live
+ * summary's `{ provider, id }` and a saved session's recorded `{ provider, modelId }`
+ * (upstream #2148). A live summary wins because it is the session's current model; the
+ * recorded one is what an inactive row has left. Undefined when the row has neither.
+ */
+function rowSessionModel(row: AgentsViewRow): { provider: string; modelId: string } | undefined {
+	const live = row.summary.model;
+	if (live) {
+		return { provider: live.provider, modelId: live.id };
+	}
+	return row.record?.saved?.model;
 }
 
 function formatTableCell(value: string, width: number): string {

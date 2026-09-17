@@ -28,23 +28,35 @@ describe("saved session agent status wire serialization", () => {
 		expect(wire).toEqual(status);
 	});
 
-	test("downshifts an error verdict: the recap crosses the wire, the enum does not", () => {
-		// The saved-session wire still validates taskState against the pre-#2310
-		// enum, and a strict old client meeting "error" rejects the whole session
-		// item. The recap text still crosses so the row is not blanked; only the
-		// verdict is held back until the wire enum widens.
-		const wire = serializeSavedSessionInfo(
-			makeSessionInfo({
-				summary: "Model request failed: 400 bad request",
-				taskState: "error",
-				basedOnMessageCount: 2,
-			}),
-		).agentStatus;
-		expect(wire).toEqual({ summary: "Model request failed: 400 bad request", basedOnMessageCount: 2 });
-		expect(wire?.taskState).toBeUndefined();
+	test("carries an error verdict across the wire: the recap and the enum together", () => {
+		// The wire half of upstream #2310. The downshift this replaces existed because
+		// daemon-client refused "error" and a client strict about the saved-session item
+		// dropped the whole row over it; the validator has accepted the value since
+		// 8f52777f2, so holding the verdict back only hid the failure from every current
+		// client - the row kept showing the terminal error text with no verdict on it.
+		const status = {
+			summary: "Model request failed: 400 bad request",
+			taskState: "error" as const,
+			basedOnMessageCount: 2,
+		};
+		const wire = serializeSavedSessionInfo(makeSessionInfo(status)).agentStatus;
+		expect(wire).toEqual(status);
+		expect(wire?.taskState).toBe("error");
 	});
 
-	test("round-trips through the client-side deserializer without an error taskState", () => {
+	test("keeps a completed verdict on the wire unchanged", () => {
+		// Control for the same projection: opening the error verdict must not move the
+		// verdicts that already crossed, or a row would read completed where it did.
+		const status = {
+			summary: "Wrote the migration and ran the suite",
+			taskState: "completed" as const,
+			basedOnMessageCount: 2,
+		};
+		const wire = serializeSavedSessionInfo(makeSessionInfo(status)).agentStatus;
+		expect(wire).toEqual(status);
+	});
+
+	test("round-trips through the client-side deserializer with the error taskState", () => {
 		const wire = serializeSavedSessionInfo(
 			makeSessionInfo({
 				summary: "Model request failed: 400 bad request",
@@ -53,6 +65,10 @@ describe("saved session agent status wire serialization", () => {
 			}),
 		);
 		const saved = deserializeSavedSessionInfo(wire);
-		expect(saved.agentStatus).toEqual({ summary: "Model request failed: 400 bad request", basedOnMessageCount: 2 });
+		expect(saved.agentStatus).toEqual({
+			summary: "Model request failed: 400 bad request",
+			taskState: "error",
+			basedOnMessageCount: 2,
+		});
 	});
 });

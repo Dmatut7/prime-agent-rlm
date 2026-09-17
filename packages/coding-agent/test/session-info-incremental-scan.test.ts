@@ -51,6 +51,19 @@ function messageLine(role: "user" | "assistant", text: string, timestamp: number
 	})}\n`;
 }
 
+function modelChangeLine(provider: string, modelId: string): string {
+	return `${JSON.stringify({ type: "model_change", id: `entry-${++counter}`, parentId: null, provider, modelId })}\n`;
+}
+
+function assistantModelLine(provider: string, model: string, text: string, timestamp: number): string {
+	return `${JSON.stringify({
+		type: "message",
+		id: `entry-${++counter}`,
+		parentId: null,
+		message: { role: "assistant", content: [{ type: "text", text }], timestamp, provider, model },
+	})}\n`;
+}
+
 function namedLine(name: string): string {
 	return `${JSON.stringify({ type: "session_info", id: `entry-${++counter}`, parentId: null, name })}\n`;
 }
@@ -414,5 +427,63 @@ describe("readSessionInfo incremental rescan", () => {
 		expect(info?.messageCount).toBe(2);
 		expect(info?.name).toBeUndefined();
 		expect(info?.firstMessage).toBe("after rewrite");
+	});
+});
+
+describe("readSessionInfo recorded model", () => {
+	/**
+	 * The recorded model is a fold of the transcript, not session metadata: a
+	 * `model_change` entry records a switch, and an assistant message records the
+	 * model that produced it, so the last one written wins (#2148).
+	 */
+	it("reports the last recorded model from model_change entries and assistant messages", async () => {
+		const path = join(dir, "recorded-model.jsonl");
+		writeFileSync(
+			path,
+			headerLine() +
+				modelChangeLine("openai", "gpt-4o") +
+				messageLine("user", "hi", 1000) +
+				assistantModelLine("prime-inference", "glm-4.7", "answer", 2000),
+			"utf8",
+		);
+		expect((await readSessionInfo(path))?.model).toEqual({ provider: "prime-inference", modelId: "glm-4.7" });
+
+		// A later switch moves the recorded model, and the resumed scan agrees with
+		// a cold one instead of keeping the value it folded first.
+		appendFileSync(path, modelChangeLine("anthropic", "claude-sonnet-4.5"));
+		expect((await expectMatchesFullScan(path))?.model).toEqual({
+			provider: "anthropic",
+			modelId: "claude-sonnet-4.5",
+		});
+	});
+
+	/**
+	 * Control side of the same fold: a session that never ran a model records
+	 * nothing, and an assistant message without a provider/model pair (older
+	 * transcripts, hand-written fixtures) must not invent one.
+	 */
+	it("leaves the recorded model undefined when the transcript carries none", async () => {
+		const bare = join(dir, "no-model.jsonl");
+		writeFileSync(bare, headerLine() + messageLine("user", "hi", 1000), "utf8");
+		expect((await readSessionInfo(bare))?.model).toBeUndefined();
+
+		const partial = join(dir, "partial-model.jsonl");
+		writeFileSync(
+			partial,
+			headerLine() +
+				`${JSON.stringify({
+					type: "message",
+					id: `entry-${++counter}`,
+					parentId: null,
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: "answer" }],
+						timestamp: 2000,
+						model: "glm-4.7",
+					},
+				})}\n`,
+			"utf8",
+		);
+		expect((await readSessionInfo(partial))?.model).toBeUndefined();
 	});
 });

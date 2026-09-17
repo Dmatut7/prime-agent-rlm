@@ -109,11 +109,11 @@ export interface AgentConnectionSavedSessionState {
 
 export interface AgentConnectionAgentStatus {
 	summary: string;
-	// Includes "error" so the connection layer can carry a transcript-derived
-	// error verdict (upstream #2310). The strictly validated saved-session wire
-	// never emits it yet: serializeSavedSessionInfo downshifts error verdicts and
-	// daemon-client's validator still rejects the value, so old clients are safe
-	// until the daemon protocol takes the enum.
+	// Includes "error" so the connection layer can carry a transcript-derived error
+	// verdict (upstream #2310). The saved-session wire carries it as well since the
+	// daemon protocol revision that removed serializeSavedSessionInfo's downshift:
+	// daemon-client accepts the value (8f52777f2), so a client older than that
+	// revision is the one that still rejects the whole session item over it.
 	taskState?: "needs_input" | "completed" | "error";
 	basedOnMessageCount: number;
 }
@@ -142,6 +142,8 @@ export interface AgentConnectionSavedSessionInfo {
 	allMessagesText: string;
 	agentStatus?: AgentConnectionAgentStatus;
 	usage?: SessionUsageSummary;
+	/** Last recorded provider/model selector; absent for sessions that never ran a model. */
+	model?: { provider: string; modelId: string };
 }
 
 export type AgentConnectionSessionListProgress = (loaded: number, total: number) => void;

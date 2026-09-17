@@ -29,12 +29,6 @@ beforeEach(() => {
 	// itself; the opt-out is set back to `1` by the test that is about the opt-out.
 	process.env.DO_NOT_TRACK = "0";
 	delete process.env.PI_SKIP_VERSION_CHECK;
-	// The suite lives inside the fork checkout, so the marker walk in detectForkInstall always
-	// fires here and checkForNewPiVersion would answer "no notice" for every case below. Same
-	// in-repo seam r36-self-update-installed-version / package-command-paths use; the gate's own
-	// behaviour is pinned by fork-self-update.test.ts and by the gate describe at the end of this
-	// file, which turns the seam back off for exactly those two cases.
-	process.env[FORK_GATE_ENV_VAR] = "off";
 });
 
 afterEach(() => {
@@ -57,6 +51,12 @@ describe("version checks", () => {
 	});
 
 	it("returns only newer versions", async () => {
+		// This example is about the upstream release face itself. The suite runs inside a
+		// fork checkout, where the fork gate suppresses the startup notice unless it is
+		// off: the gate's own behavior has its own suite (fork-self-update.test.ts) and the
+		// "fork checkout gate" describe below, so the repository's test seam for it is what
+		// keeps this example on the upstream path instead of asserting the refusal here.
+		process.env[FORK_GATE_ENV_VAR] = "off";
 		const fetchMock = vi.fn(async () => Response.json({ version: "v1.2.3" }));
 		vi.stubGlobal("fetch", fetchMock);
 
@@ -115,6 +115,11 @@ describe("version checks", () => {
 	});
 
 	it("skips the startup version check when the environment opted out of tracking", async () => {
+		// Upstream behavior face again (see the note in "returns only newer versions").
+		// Without the seam the first assertion below passes for the wrong reason - the fork
+		// gate, not the opt-out, is what returns undefined - and the positive control that
+		// shows the same call reaching the manifest with the opt-out off cannot pass at all.
+		process.env[FORK_GATE_ENV_VAR] = "off";
 		const fetchMock = vi.fn(async () => Response.json({ version: "v1.2.4" }));
 		vi.stubGlobal("fetch", fetchMock);
 
