@@ -41,7 +41,7 @@ const bashSchema = Type.Object({
 	allowDestructiveGit: Type.Optional(
 		Type.Boolean({
 			description:
-				"Skip the dirty-tree guard for destructive git discard commands. Only set when discarding uncommitted work is intentional.",
+				"Skip the dirty-tree guard for destructive git commands (discards and shared-worktree sweeps). Only set when discarding or sweeping uncommitted work is intentional.",
 		}),
 	),
 });
@@ -197,7 +197,9 @@ const MAX_DIRTY_PATHS_LISTED = 10;
 
 /**
  * Detection for git commands that discard uncommitted working-tree changes
- * (the "clean the worktree" discard idiom).
+ * (the "clean the worktree" discard idiom), plus the shared-worktree sweep
+ * commands (git add -A / git add . / git stash) that capture other lanes'
+ * uncommitted work into one index or stash.
  *
  * Conservative by design: a false positive costs one `git status` probe and
  * an explicit-bypass retry; a false negative silently loses work. Matching is
@@ -226,6 +228,45 @@ const DISCARD_RESET_PATTERN = new RegExp(
 );
 const DISCARD_CLEAN_PATTERN = new RegExp(`\\bgit\\s+${GIT_GLOBAL_OPTIONS}clean\\s+([^;&|]*)`, "g");
 
+// The sweep family: commands that stage or stash the whole shared worktree
+// (git add -A / git add . / git stash). They do not delete work by themselves,
+// but in a shared worktree they sweep other lanes' uncommitted changes into
+// one index or stash, which the parallel-agent discipline treats as destructive.
+const SWEEP_ADD_PATTERN = new RegExp(`\\bgit\\s+${GIT_GLOBAL_OPTIONS}add\\s+([^;&|]*)`, "g");
+const SWEEP_STASH_PATTERN = new RegExp(`\\bgit\\s+${GIT_GLOBAL_OPTIONS}stash(?=\\s|$|[;&|)])(?:\\s+([^;&|]*))?`, "g");
+
+function isSweepAddSegment(args: string): boolean {
+	const tokens = args.split(/\s+/).filter(Boolean);
+	// Everything after -- is a pathspec, not an option.
+	const optionEnd = tokens.indexOf("--");
+	const scan = optionEnd === -1 ? tokens : tokens.slice(0, optionEnd);
+	const pathspec = optionEnd === -1 ? [] : tokens.slice(optionEnd + 1);
+	const rootPathspecs = new Set([".", "./", ":/"]);
+	let hasAll = false;
+	let hasPathspec = pathspec.length > 0;
+	for (const token of scan) {
+		if (token === "-A" || token === "--all" || token === "--no-ignore-removal") {
+			hasAll = true;
+			continue;
+		}
+		if (token.startsWith("-")) continue; // other options
+		hasPathspec = true; // a bare pathspec token
+		if (rootPathspecs.has(token)) return true;
+	}
+	for (const token of pathspec) {
+		if (rootPathspecs.has(token)) return true;
+	}
+	// -A with an explicit non-root pathspec stays scoped (git add -A docs/).
+	return hasAll && !hasPathspec;
+}
+function isSweepStashSegment(args: string | undefined): boolean {
+	const tokens = (args ?? "").split(/\s+/).filter(Boolean);
+	if (tokens.length === 0) return true; // bare `git stash` pushes
+	const first = tokens[0];
+	// list/show/pop/apply/drop/clear/branch/create/store and help flags do not
+	// sweep the worktree into a stash.
+	return first === "push" || first === "save";
+}
 function isForcedCleanSegment(args: string): boolean {
 	const tokens = args.split(/\s+/).filter(Boolean);
 	// Everything after -- is a pathspec, not options (git clean -f -- -n is forced).
@@ -307,6 +348,12 @@ export function findDestructiveGitDiscardCommands(command: string): number[] {
 	for (const match of masked.matchAll(DISCARD_CLEAN_PATTERN)) {
 		if (isForcedCleanSegment(match[1])) indices.push(match.index);
 	}
+	for (const match of masked.matchAll(SWEEP_ADD_PATTERN)) {
+		if (isSweepAddSegment(match[1])) indices.push(match.index);
+	}
+	for (const match of masked.matchAll(SWEEP_STASH_PATTERN)) {
+		if (isSweepStashSegment(match[1])) indices.push(match.index);
+	}
 	return indices.sort((a, b) => a - b);
 }
 
@@ -351,7 +398,14 @@ export function resolveDiscardProbeTarget(
 	let subcommandIndex = -1;
 	for (const [index, token] of tokens.entries()) {
 		if (index === 0) continue; // "git"
-		if (token === "reset" || token === "checkout" || token === "clean" || token === "restore") {
+		if (
+			token === "reset" ||
+			token === "checkout" ||
+			token === "clean" ||
+			token === "restore" ||
+			token === "add" ||
+			token === "stash"
+		) {
 			subcommandIndex = index;
 			break;
 		}
@@ -731,7 +785,7 @@ export function createBashToolDefinition(
 	const definition: ToolDefinition<typeof bashSchema, BashToolDetails | undefined, BashRenderState> = {
 		name: "bash",
 		label: "bash",
-		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. ${timeoutHint} Child processes run with a sanitized environment - a fixed child-safe whitelist (PATH, HOME, TZ, locale, agent routing keys), not the full parent env - so set variables inside the command itself (\`VAR=value cmd\`) or have the user export PRIME_AGENT_ENV_PASSTHROUGH=NAME1,NAME2 to forward specific names. Destructive git discard commands (git checkout -- ., git checkout ., git clean -f..., git reset --hard, git restore .) are refused while uncommitted changes exist; retry with allowDestructiveGit: true only when the discard is intentional.`,
+		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. ${timeoutHint} Child processes run with a sanitized environment - a fixed child-safe whitelist (PATH, HOME, TZ, locale, agent routing keys), not the full parent env - so set variables inside the command itself (\`VAR=value cmd\`) or have the user export PRIME_AGENT_ENV_PASSTHROUGH=NAME1,NAME2 to forward specific names. Destructive git discard commands (git checkout -- ., git checkout ., git clean -f..., git reset --hard, git restore .) and shared-worktree sweeps (git add -A, git add ., git stash) are refused while uncommitted changes exist; retry with allowDestructiveGit: true only when it is intentional.`,
 		promptSnippet: "Execute bash commands (ls, grep, find, etc.)",
 		parameters: Type.Object({
 			command: Type.String({ description: "Bash command to execute" }),
@@ -739,7 +793,7 @@ export function createBashToolDefinition(
 			allowDestructiveGit: Type.Optional(
 				Type.Boolean({
 					description:
-						"Skip the dirty-tree guard for destructive git discard commands. Only set when discarding uncommitted work is intentional.",
+						"Skip the dirty-tree guard for destructive git commands (discards and shared-worktree sweeps). Only set when discarding or sweeping uncommitted work is intentional.",
 				}),
 			),
 		}),

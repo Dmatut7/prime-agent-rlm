@@ -14,6 +14,14 @@ function runGit(cwd: string, ...args: string[]): void {
 	execFileSync("git", args, { cwd, stdio: ["ignore", "ignore", "pipe"] });
 }
 
+/** Porcelain lines for the repo, to assert staging side effects of a refusal. */
+function gitStatus(cwd: string): string[] {
+	return execFileSync("git", ["status", "--porcelain", "--untracked-files=all"], {
+		cwd,
+		encoding: "utf8",
+	}).split("\n");
+}
+
 /** Create a git repository with one committed file plus two uncommitted changes. */
 function initDirtyGitRepo(root: string): void {
 	runGit(root, "init");
@@ -73,6 +81,24 @@ describe("isDestructiveGitDiscardCommand", () => {
 		"git checkout -f main",
 		"git checkout --force main",
 		"git clean -f -- -n",
+		"git add -A",
+		"git add --all",
+		"git add -A .",
+		"git add .",
+		"git add ./",
+		"git add :/",
+		"git add -- .",
+		"git add -A -- .",
+		"git add src .",
+		"git add -A && git status",
+		"git add -A; git commit",
+		"git -C sub add -A",
+		"git -C sub stash",
+		"git stash",
+		"git stash push",
+		"git stash push -m wip",
+		"git stash save",
+		"git stash; git status",
 	])("matches %s", (command) => {
 		expect(isDestructiveGitDiscardCommand(command)).toBe(true);
 	});
@@ -99,8 +125,23 @@ describe("isDestructiveGitDiscardCommand", () => {
 		"git clean -d",
 		"git reset",
 		"git reset --soft HEAD~1",
-		"git stash",
-		"git add .",
+		"git add src/file.ts",
+		"git add -A docs/",
+		"git add -A -- docs/",
+		"git add -u",
+		"git add -p",
+		"git add -- src/file.ts",
+		"git stash list",
+		"git stash pop",
+		"git stash apply",
+		"git stash drop",
+		"git stash show",
+		"git stash clear",
+		"git stash branch tmp",
+		"git stash -h",
+		"git stash --help",
+		"echo 'git add -A'",
+		"git commit -m 'git stash push'",
 		"echo hello world",
 		"npm run check",
 	])("does not match %s", (command) => {
@@ -192,6 +233,79 @@ describe("bash tool destructive-git dirty-tree guard", () => {
 		await expect(bash.execute("guard-bypass-env", { command: "git reset --hard" })).resolves.toBeDefined();
 
 		expect(readModifiedTracked()).toBe("committed\n");
+	});
+
+	it.each(["git add -A", "git add .", "git add --all", "git stash", "git stash push -m wip", "git add -A ."])(
+		"refuses the worktree sweep %s on a dirty tree and stages nothing",
+		async (command) => {
+			initDirtyGitRepo(testDir);
+			const bash = createBashTool(testDir);
+
+			await expect(bash.execute(`guard-sweep-${command}`, { command })).rejects.toThrow(
+				/Refusing to run this destructive git command/,
+			);
+
+			const status = gitStatus(testDir);
+			expect(status).toContain(" M tracked.txt");
+			expect(status).toContain("?? untracked.txt");
+			expect(readModifiedTracked()).toBe("modified\n");
+		},
+	);
+
+	it("refuses a git -C sweep in a dirty nested repository", async () => {
+		const sub = join(testDir, "sub");
+		mkdirSync(sub);
+		initDirtyGitRepo(sub);
+		const bash = createBashTool(testDir);
+
+		await expect(bash.execute("guard-sweep-git-c", { command: "git -C sub add -A" })).rejects.toThrow(/tracked\.txt/);
+		const status = gitStatus(sub);
+		expect(status).toContain(" M tracked.txt");
+		expect(status).toContain("?? untracked.txt");
+	});
+
+	it("runs the sweep when the tree is clean", async () => {
+		initDirtyGitRepo(testDir);
+		runGit(testDir, "add", "-A");
+		runGit(testDir, "commit", "-m", "second");
+		const bash = createBashTool(testDir);
+
+		await expect(bash.execute("guard-sweep-clean", { command: "git add -A" })).resolves.toBeDefined();
+		await expect(bash.execute("guard-sweep-clean-stash", { command: "git stash" })).resolves.toBeDefined();
+	});
+
+	it("bypasses the sweep guard with allowDestructiveGit: true", async () => {
+		initDirtyGitRepo(testDir);
+		const bash = createBashTool(testDir);
+
+		await expect(
+			bash.execute("guard-sweep-bypass-arg", { command: "git add -A", allowDestructiveGit: true }),
+		).resolves.toBeDefined();
+
+		const status = gitStatus(testDir);
+		expect(status).toContain("M  tracked.txt");
+		expect(status).toContain("A  untracked.txt");
+	});
+
+	it(`bypasses the sweep guard with ${BASH_DESTRUCTIVE_GIT_BYPASS_ENV}=1`, async () => {
+		initDirtyGitRepo(testDir);
+		process.env[BASH_DESTRUCTIVE_GIT_BYPASS_ENV] = "1";
+		const bash = createBashTool(testDir);
+
+		await expect(bash.execute("guard-sweep-bypass-env", { command: "git stash" })).resolves.toBeDefined();
+
+		// The stash saved the work instead of losing it: recoverable by design.
+		expect(readModifiedTracked()).toBe("committed\n");
+	});
+
+	it("allows scoped adds and non-sweeping stash subcommands on a dirty tree", async () => {
+		initDirtyGitRepo(testDir);
+		mkdirSync(join(testDir, "docs"));
+		writeFileSync(join(testDir, "docs", "note.md"), "doc\n");
+		const bash = createBashTool(testDir);
+
+		await expect(bash.execute("guard-scoped-add", { command: "git add -A docs/" })).resolves.toBeDefined();
+		await expect(bash.execute("guard-stash-list", { command: "git stash list" })).resolves.toBeDefined();
 	});
 
 	it("fails open outside a git repository", async () => {
