@@ -69,6 +69,7 @@ class AgentMessageBodyComponent implements Component {
 export class AgentMessageComponent extends Container {
 	private readonly content = new Container();
 	private readonly header = new Text("", 1, 0);
+	private readonly suppressLeadingSpace: boolean;
 	private expanded = false;
 
 	constructor(
@@ -77,11 +78,29 @@ export class AgentMessageComponent extends Container {
 		options: { suppressLeadingSpace?: boolean } = {},
 	) {
 		super();
-		if (!options.suppressLeadingSpace) this.addChild(new Spacer(1));
+		this.suppressLeadingSpace = options.suppressLeadingSpace ?? false;
+		if (!this.suppressLeadingSpace) this.addChild(new Spacer(1));
 		this.addChild(this.content);
 		this.updateDisplay();
 	}
 
+	override render(width: number): string[] {
+		const lines = super.render(width);
+		const leadingSpace = !this.suppressLeadingSpace;
+		this.clickRegions =
+			lines.length > 0
+				? [
+						{
+							line: leadingSpace ? 1 : 0,
+							col: 0,
+							width,
+							height: this.header.render(width).length,
+							onClick: () => this.setExpanded(!this.expanded),
+						},
+					]
+				: [];
+		return lines;
+	}
 	setExpanded(expanded: boolean): void {
 		if (this.expanded === expanded) {
 			return;

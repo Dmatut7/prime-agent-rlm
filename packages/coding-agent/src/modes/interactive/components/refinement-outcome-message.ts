@@ -1,4 +1,4 @@
-import { type Component, Spacer, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Clickable, type Component, Spacer, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { RefinementOutcomeMessage } from "../../../core/messages.js";
 import type { AppliedRefinementEdit, HarnessEntry } from "../../../core/refinement/refinement.js";
 import { generateDiffString } from "../../../core/tools/edit-diff.js";
@@ -99,11 +99,12 @@ export class RefinementOutcomeMessageComponent extends ExpandableCustomMessageBo
 		this.clear();
 
 		const { summary, edits, scope } = this.message.details;
-		this.addChild(new Text(customMessageLabel("refinement"), 0, 0));
+		const toggle = () => this.setExpanded(!this.expanded);
+		this.addChild(new Clickable(new Text(customMessageLabel("refinement"), 0, 0), toggle));
 		this.addChild(new Spacer(1));
 		if (!this.expanded) {
 			const suffix = `${theme.fg("customMessageText", `· ${editCount(edits)}`)} ${expandCollapseHint("app.tools.expand", false)}`;
-			this.addChild(new CollapsedOutcomeLine(summary, suffix));
+			this.addChild(new Clickable(new CollapsedOutcomeLine(summary, suffix), toggle));
 			return;
 		}
 

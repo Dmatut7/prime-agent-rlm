@@ -1,4 +1,10 @@
-import { type Component, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import {
+	type ClickRegion,
+	type Component,
+	truncateToWidth,
+	visibleWidth,
+	wrapTextWithAnsi,
+} from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { theme } from "../theme/theme.js";
 import { expandCollapseHint } from "./keybinding-hints.js";
@@ -84,6 +90,7 @@ export class CollapsibleErrorComponent implements Component {
 	private cachedForceCollapse?: boolean;
 	private cachedPaddingX?: number;
 	private cachedLines?: string[];
+	private clickRegions: ClickRegion[] = [];
 
 	constructor(private readonly options: CollapsibleErrorOptions) {
 		this.expanded = options.expanded ?? false;
@@ -120,6 +127,10 @@ export class CollapsibleErrorComponent implements Component {
 		return lines;
 	}
 
+	getClickRegions(): ReadonlyArray<ClickRegion> {
+		return this.clickRegions;
+	}
+
 	render(width: number): string[] {
 		if (this.cacheMatches(width)) {
 			return this.cachedLines!;
@@ -127,17 +138,23 @@ export class CollapsibleErrorComponent implements Component {
 
 		const text = normalizeErrorDetails(this.options.text);
 		if (!text) {
+			this.clickRegions = [];
 			return this.storeCache(width, []);
 		}
 
 		const collapsible = this.options.forceCollapse ?? shouldCollapseErrorDetails(text);
 		if (!collapsible || this.expanded) {
+			this.clickRegions = [{ line: 0, col: 0, width, height: 1, onClick: () => this.setExpanded(!this.expanded) }];
 			return this.storeCache(width, this.renderText(text, width));
 		}
 
 		const summary = normalizeErrorDetails(this.options.summary ?? summarizeErrorDetails(text));
 		const inlineHint = `${summary} ${expandCollapseHint("app.tools.expand", false)}`;
-		return this.storeCache(width, this.renderText(inlineHint, width, "error"));
+		const lines = this.renderText(inlineHint, width, "error");
+		this.clickRegions = [
+			{ line: 0, col: 0, width, height: lines.length, onClick: () => this.setExpanded(!this.expanded) },
+		];
+		return this.storeCache(width, lines);
 	}
 
 	private renderText(text: string, width: number, color: "error" | "muted" = "error"): string[] {
