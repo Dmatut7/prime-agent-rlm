@@ -11304,23 +11304,59 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Refinement passes (review and planning) run with their own prompts, so
+	 * issuing them on the session model evicts the provider's prefix-cache entry
+	 * for the session and forces a full context re-read on the next session
+	 * request. Route them to the configured auxiliary model when it is set and
+	 * usable; fall back to the session model otherwise.
+	 */
+	private async _resolveRefinementModel(): Promise<
+		{ model: Model<Api>; apiKey: string; headers?: Record<string, string> } | undefined
+	> {
+		const sessionModel = this.model;
+		if (!sessionModel) {
+			return undefined;
+		}
+		const selector = this.settingsManager.getAuxiliaryModel()?.trim().toLowerCase();
+		if (!selector || `${sessionModel.provider}/${sessionModel.id}`.toLowerCase() === selector) {
+			const { apiKey, headers } = await this._getRequiredRequestAuth(sessionModel);
+			return { model: sessionModel, apiKey, headers };
+		}
+		try {
+			const model = (await this._authenticatedRlmModels()).find(
+				(candidate) => `${candidate.provider}/${candidate.id}`.toLowerCase() === selector,
+			);
+			if (!model) {
+				throw new Error(`model "${selector}" is unavailable, unauthenticated, or expired`);
+			}
+			const { apiKey, headers } = await this._getRequiredRequestAuth(model);
+			return { model, apiKey, headers };
+		} catch {
+			// Error details from the auth stack can embed credential material, so only
+			// the selector is logged (CodeQL js/clear-text-logging).
+			console.warn(`Warning: auxiliaryModel "${selector}" unusable for refinement; using the session model.`);
+			const { apiKey, headers } = await this._getRequiredRequestAuth(sessionModel);
+			return { model: sessionModel, apiKey, headers };
+		}
+	}
+
 	private async _reviewAutoRefine(context: AutoRefineReviewRequest, signal?: AbortSignal): Promise<AutoRefineReview> {
 		if (this._autoRefineReviewer) {
 			return this._autoRefineReviewer(context, signal);
 		}
-		const model = this.model;
-		if (!model) {
+		const refinementModel = await this._resolveRefinementModel();
+		if (!refinementModel) {
 			return { shouldRefine: false, rationale: "No model selected." };
 		}
-		const { apiKey, headers } = await this._getRequiredRequestAuth(model);
 		return reviewAutoRefine(
 			this.agent.state.messages,
 			this._loadMergedHarnessState(),
 			this._loadRefinementHistory(),
-			model,
-			apiKey,
+			refinementModel.model,
+			refinementModel.apiKey,
 			context,
-			headers,
+			refinementModel.headers,
 			signal,
 			this.thinkingLevel,
 		);
@@ -11511,8 +11547,10 @@ export class AgentSession {
 			throw new Error(formatNoModelSelectedMessage());
 		}
 
-		const model = this.model;
-		const { apiKey, headers } = await this._getRequiredRequestAuth(model);
+		const refinementModel = await this._resolveRefinementModel();
+		if (!refinementModel) {
+			throw new Error(formatNoModelSelectedMessage());
+		}
 		const globalHarnessStateDir = getGlobalHarnessStateDir();
 		const localHarnessStateDir = this._localHarnessStateDir();
 		const requestedScope = options.global ? "global" : "local";
@@ -11574,10 +11612,10 @@ export class AgentSession {
 			this.agent.state.messages,
 			planningState,
 			history,
-			model,
-			apiKey,
+			refinementModel.model,
+			refinementModel.apiKey,
 			options,
-			headers,
+			refinementModel.headers,
 			signal,
 			this.thinkingLevel,
 		);
