@@ -1258,5 +1258,221 @@ class ScopePrefixEdgeCases(unittest.TestCase):
                 self.assertIn("[local:entry", line)
 
 
+class HarnessSearchTest(unittest.TestCase):
+    """#2241 kernel half: ranked ``HarnessState.search`` over the harness store."""
+
+    def _fixture(self, temp_dir: str) -> HarnessState:
+        # Hermetic store: a CJK entry whose text carries 登录故障 and an
+        # unrelated entry that must never be dragged in by a shared query.
+        state = HarnessState(Path(temp_dir) / "harness_state.json")
+        state.create_memory(
+            "登录故障排查",
+            "线上登录故障排查记录：排查步骤与修复顺序。",
+            id="login_fault",
+            path="ops/login",
+        )
+        state.create_memory("Tea notes", "All about oolong brewing.", id="tea")
+        return state
+
+    def test_search_matches_cjk_bigram_inside_a_longer_word(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = self._fixture(temp_dir)
+
+            # Positive control: the target entry exists and really contains the
+            # term the 登录 bigram has to reach.
+            target = state.get("memory", "login_fault")
+            self.assertIsNotNone(target)
+            self.assertIn("登录故障", target.title + target.content)
+
+            hits = state.search("修复登录")
+
+            self.assertEqual([hit.id for hit in hits], ["login_fault"])
+            self.assertNotIn("tea", [hit.id for hit in hits])
+            self.assertTrue(all(hit.score > 0 for hit in hits))
+            # The same ruler does hit the unrelated entry on its own terms, so
+            # its absence above is discrimination rather than an empty result set.
+            self.assertEqual([hit.id for hit in state.search("oolong")], ["tea"])
+
+    def test_search_treats_punctuation_as_separators(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("Worktree policy", "Use git worktrees for parallel branches.", id="worktree")
+            state.create_memory("Open question", "Anything else left open?", id="question")
+
+            control = state.search("worktree")
+            # Positive control: the term matches, so the comparisons below
+            # compare real hit sets and not two empty lists.
+            self.assertEqual([hit.id for hit in control], ["worktree"])
+
+            # Punctuation is a separator: it neither becomes a term of its own
+            # (which would match the question entry) nor perturbs scoring, so
+            # the hits are identical, snippet and order included.
+            self.assertEqual(state.search("worktree?"), control)
+            self.assertEqual(state.search("???worktree???"), control)
+
+            self.assertEqual(state.search("??? / . ,"), [])
+            self.assertEqual(state.search("..."), [])
+
+    def test_search_returns_empty_for_empty_or_punctuation_only_queries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("Worktree policy", "Use git worktrees for parallel branches.", id="worktree")
+
+            # Positive control: the same state is searchable.
+            self.assertEqual([hit.id for hit in state.search("worktree")], ["worktree"])
+
+            for query in ("", "   ", "?!。", "???/..."):
+                self.assertEqual(state.search(query), [], msg=repr(query))
+
+    def test_search_limit_and_argument_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("Worktree memory", "worktree workflow notes", id="m1")
+            state.create_prompt_note("Worktree prompt", "worktree workflow notes", id="p1")
+            state.create_prompt_note("Worktree prompt two", "worktree workflow notes", id="p2")
+
+            everything = state.search("worktree", limit=10)
+            # Positive control: three entries carry the term, so the shorter
+            # list below is limit talking, not a missing ruler.
+            self.assertEqual(sorted(hit.id for hit in everything), ["m1", "p1", "p2"])
+            scores = [hit.score for hit in everything]
+            self.assertEqual(scores, sorted(scores, reverse=True))
+
+            self.assertEqual(state.search("worktree", limit=1), everything[:1])
+            self.assertEqual([hit.kind for hit in state.search("worktree", kind="prompt")], ["prompt", "prompt"])
+            self.assertEqual([hit.kind for hit in state.search("worktree", kind="memory")], ["memory"])
+
+            for bad_limit in (0, -1):
+                with self.assertRaises(ValueError):
+                    state.search("worktree", limit=bad_limit)
+            for bad_limit in (True, 1.5, "3"):
+                with self.assertRaises(TypeError):
+                    state.search("worktree", limit=bad_limit)
+            with self.assertRaises(TypeError):
+                state.search(42)
+            with self.assertRaisesRegex(ValueError, "unknown harness kind"):
+                state.search("worktree", kind="tool")
+            # An unknown kind is an argument error, reported even when the query
+            # itself would match nothing.
+            with self.assertRaisesRegex(ValueError, "unknown harness kind"):
+                state.search("", kind="tool")
+
+    def test_search_returns_empty_when_nothing_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = self._fixture(temp_dir)
+
+            # Positive control: the store and the ruler both work.
+            self.assertTrue(state.search("登录故障"))
+
+            self.assertEqual(state.search("quantum"), [])
+            self.assertEqual(state.search("量子力学"), [])
+
+    def test_search_is_case_insensitive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("Kernel note", "rlm keeps the kernel warm.", id="lower")
+            state.create_memory("Upper note", "RLM keeps the kernel warm.", id="upper")
+
+            hits = state.search("RLM")
+            hits_by_id = {hit.id: hit for hit in hits}
+
+            # Positive control: both entries exist and both are found by the
+            # upper-case query.
+            self.assertEqual(sorted(hits_by_id), ["lower", "upper"])
+            self.assertEqual(state.search("RLM"), state.search("rlm"))
+            # Matching is case-folded, the snippet keeps the stored casing.
+            self.assertIn("rlm", hits_by_id["lower"].snippet)
+            self.assertIn("RLM", hits_by_id["upper"].snippet)
+
+    def test_search_hit_shape_snippet_and_score_weights(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory(
+                "Zorblat title",
+                "First line.\nSecond line mentions zorblat after a newline.\nThird line.",
+                id="zorblat_id",
+            )
+            state.create_memory("Other note", "Body mentions zorblat once.", id="other_entry")
+            state.create_memory(
+                "Long note",
+                ("filler\n" * 40) + "needle\n" + ("filler\n" * 40),
+                id="long",
+            )
+
+            hits = state.search("zorblat")
+
+            # Both access shapes are part of the contract.
+            kind, entry_id, score, snippet = hits[0]
+            self.assertEqual((kind, entry_id), ("memory", "zorblat_id"))
+            self.assertEqual(hits[0].snippet, snippet)
+            # title + content + path/id is three slots: 1 + 2 * 0.5.
+            self.assertEqual(score, 2.0)
+            self.assertEqual([(hit.id, hit.score) for hit in hits], [("zorblat_id", 2.0), ("other_entry", 1.0)])
+            # X-8: model-controlled content must not forge extra lines.
+            self.assertNotIn("\n", snippet)
+            self.assertIn("Zorblat title", snippet)
+            self.assertIn("zorblat after a newline", snippet)
+
+            long_snippet = state.search("needle")[0].snippet
+            self.assertIn("needle", long_snippet)
+            self.assertIn("...", long_snippet)
+            self.assertNotIn("\n", long_snippet)
+            self.assertLess(len(long_snippet), 200)
+            # The window is centred on the first hit, not the head of the text.
+            self.assertLess(abs(long_snippet.index("needle") - len(long_snippet) // 2), 60)
+
+    def test_search_orders_by_score_then_recency_then_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("Alpha tie", "shared tiebreak keyword", id="alpha")
+            state.create_memory("Beta tie", "shared tiebreak keyword", id="beta")
+
+            # Positive control: both entries match with the same score.
+            self.assertEqual(
+                {hit.id: hit.score for hit in state.search("tiebreak keyword")},
+                {"alpha": 2.0, "beta": 2.0},
+            )
+
+            state.entries["memory"]["alpha"].updated_at = "2020-01-01T00:00:00+00:00"
+            state.entries["memory"]["beta"].updated_at = "2021-01-01T00:00:00+00:00"
+            self.assertEqual(
+                [hit.id for hit in state.search("tiebreak keyword")],
+                ["beta", "alpha"],
+            )
+
+            # Identical score and timestamp: (kind, id) keeps the order stable.
+            state.entries["memory"]["alpha"].updated_at = "2021-01-01T00:00:00+00:00"
+            self.assertEqual([hit.id for hit in state.search("tiebreak keyword")], ["alpha", "beta"])
+            self.assertEqual(state.search("tiebreak keyword"), state.search("tiebreak keyword"))
+
+    def test_search_routes_to_the_global_store(self) -> None:
+        previous_local = os.environ.get("RLM_HARNESS_STATE_DIR")
+        previous_global = os.environ.get("RLM_GLOBAL_HARNESS_STATE_DIR")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            local_dir = Path(temp_dir) / "local"
+            global_dir = Path(temp_dir) / "global"
+            os.environ["RLM_HARNESS_STATE_DIR"] = str(local_dir)
+            os.environ["RLM_GLOBAL_HARNESS_STATE_DIR"] = str(global_dir)
+            try:
+                local_state = HarnessState(local_dir / "harness_state.json")
+                global_state = HarnessState(global_dir / "harness_state.json", scope="global")
+                local_state.create_memory("Local note", "worktree local note", id="local_only")
+                global_state.create_memory("Global note", "worktree global note", id="global_only")
+
+                # Positive control: each store's own view finds its own entry.
+                self.assertEqual([hit.id for hit in local_state.search("worktree")], ["local_only"])
+                self.assertEqual([hit.id for hit in global_state.search("worktree")], ["global_only"])
+                self.assertEqual([hit.id for hit in local_state.search("worktree", global_=True)], ["global_only"])
+            finally:
+                for name, previous in (
+                    ("RLM_HARNESS_STATE_DIR", previous_local),
+                    ("RLM_GLOBAL_HARNESS_STATE_DIR", previous_global),
+                ):
+                    if previous is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = previous
+
+
 if __name__ == "__main__":
     unittest.main()

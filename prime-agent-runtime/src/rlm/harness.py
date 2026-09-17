@@ -14,10 +14,11 @@ import os
 import re
 import secrets
 import stat
+import unicodedata
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple, Sequence
 
 HarnessKind = Literal["prompt", "memory", "skill", "subagent"]
 HarnessScope = Literal["local", "global"]
@@ -45,6 +46,131 @@ def _slug(raw: str, fallback: str) -> str:
     normalized = "".join(ch.lower() if ch.isalnum() else "_" for ch in raw.strip())
     normalized = "_".join(part for part in normalized.split("_") if part)
     return (normalized or fallback)[:80]
+
+
+_CJK_TERM_CHARS = re.compile(
+    r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af"
+    r"\U00020000-\U0002a6df\U0002a700-\U0002b73f\U0002b740-\U0002b81f"
+    r"\U0002b820-\U0002ceaf\U0002ceb0-\U0002ebef\U0002ebf0-\U0002ee5f"
+    r"\U0002f800-\U0002fa1f\U00030000-\U0003134f\U00031350-\U000323af"
+    r"\U000323b0-\U0003347f]"
+)
+
+
+def _harness_query_runs(text: str) -> list[str]:
+    """Split lowercase text into word runs.
+
+    Letters, digits, and combining marks of any script share a run;
+    punctuation and symbols end it. Runs break only at CJK boundaries:
+    accented Latin stays whole (naïve) while spacing-free CJK is cut
+    apart from adjacent words it would otherwise swallow (修复login).
+    """
+    runs: list[str] = []
+    run: list[str] = []
+    run_is_cjk = False
+    for ch in text:
+        if unicodedata.category(ch).startswith("M") or ch.isalnum():
+            ch_is_cjk = bool(_CJK_TERM_CHARS.match(ch))
+            if run and ch_is_cjk != run_is_cjk:
+                runs.append("".join(run))
+                run = []
+            run_is_cjk = ch_is_cjk
+            run.append(ch)
+        elif run:
+            runs.append("".join(run))
+            run = []
+    if run:
+        runs.append("".join(run))
+    return runs
+
+
+def _harness_query_terms(query: str) -> list[str]:
+    """Tokenize a search query into lowercase substring terms.
+
+    Letters and digits of every script form terms; punctuation and symbols
+    only separate them, so ``worktree?`` never ranks entries by question
+    marks. CJK runs carry no spaces between words, so each run becomes
+    overlapping bigrams: ``修复登录`` yields ``修复``/``复登``/``登录`` and
+    still matches an entry containing ``登录故障``. Each term counts once.
+    Minimum lengths stay below the digest builder's four-character cut
+    because ``search`` tokenizes explicit queries, not mined conversation:
+    three ASCII characters keep real terms (rlm, api, cli), two characters
+    keep short words of other scripts, and single characters are terms
+    only for CJK, where one character is a word.
+    """
+    terms: list[str] = []
+    seen: set[str] = set()
+    for run in _harness_query_runs(query.lower()):
+        if _CJK_TERM_CHARS.search(run):
+            # Bigrams keep whitespace-free CJK findable without single
+            # characters matching too loosely.
+            candidates = [run[i : i + 2] for i in range(len(run) - 1)] or [run]
+        elif run.isascii():
+            candidates = [run] if len(run) >= 3 else []
+        else:
+            # Other scripts space out words: lone characters match too
+            # broadly, so two characters is the floor.
+            candidates = [run] if len(run) >= 2 else []
+        for term in candidates:
+            if term not in seen:
+                seen.add(term)
+                terms.append(term)
+    return terms
+
+
+_SEARCH_SNIPPET_WIDTH = 160
+
+
+def _search_field(value: Any) -> str:
+    # Persisted state is model-influenced JSON: a malformed non-string field
+    # degrades to "no match" instead of breaking the query.
+    return value.lower() if isinstance(value, str) else ""
+
+
+def _search_recency(entry: "HarnessEntry") -> str:
+    return entry.updated_at if isinstance(entry.updated_at, str) else ""
+
+
+def _search_score(entry: "HarnessEntry", terms: Sequence[str]) -> float:
+    """Weighted term overlap over the title, content, and identifier slots."""
+    title = _search_field(entry.title)
+    content = _search_field(entry.content)
+    # The id is usually embedded in the path, so matching both is one
+    # identifier signal rather than two.
+    identifier = _search_field(f"{entry.path} {entry.id}")
+    total = 0.0
+    for term in terms:
+        slots = (term in title) + (term in content) + (term in identifier)
+        if slots:
+            total += 1 + (slots - 1) * 0.5
+    return total
+
+
+def _search_snippet(text: str, terms: Sequence[str], width: int = _SEARCH_SNIPPET_WIDTH) -> str:
+    """Return a one-line snippet centred on the first matching term.
+
+    X-8: title and content are model-controlled, so the snippet is collapsed
+    by the same whitespace rule the overview uses; a value carrying newlines
+    must not forge extra lines in a search result.
+    """
+    flat = _flatten_inline(text)
+    if not flat:
+        return ""
+    if len(flat) <= width:
+        return flat
+    lowered = flat.lower()
+    position = -1
+    for term in terms:
+        found = lowered.find(term)
+        if found >= 0 and (position < 0 or found < position):
+            position = found
+    if position < 0:
+        position = 0
+    start = max(0, min(position - width // 2, len(flat) - width))
+    end = min(len(flat), start + width)
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(flat) else ""
+    return f"{prefix}{flat[start:end]}{suffix}"
 
 
 def _agent_dir() -> Path:
@@ -254,6 +380,19 @@ class RefinementEvent:
     evidence: str = ""
     outcome: str = ""
     created_at: str = field(default_factory=_now)
+
+
+class HarnessSearchHit(NamedTuple):
+    """A ranked ``HarnessState.search`` hit: ``(kind, id, score, snippet)``.
+
+    A NamedTuple so callers can unpack ``for kind, id, score, snippet in
+    state.search(...)`` and still read ``hit.snippet`` by name.
+    """
+
+    kind: HarnessKind
+    id: str
+    score: float
+    snippet: str
 
 
 _ENTRY_FIELDS = {field.name for field in fields(HarnessEntry)}
@@ -978,6 +1117,59 @@ class HarnessState:
             lines.append("refinements: 0")
         return "\n".join(lines)
 
+    def search(
+        self,
+        query: str,
+        kind: HarnessKind | None = None,
+        limit: int = 10,
+        *,
+        global_: bool = False,
+        **kwargs: Any,
+    ) -> list[HarnessSearchHit]:
+        """Return ``(kind, id, score, snippet)`` hits ranked by term overlap.
+
+        Terms are scored against an entry's title, content, and path/id
+        identifier slots; matching more distinct slots counts more. Zero-score
+        entries are dropped. Ties fall back to the most recently updated entry
+        and then to ``(kind, id)``, so one query always returns one order.
+        """
+        if target := self._global_target(global_, kwargs):
+            return target.search(query, kind=kind, limit=limit)
+        self._sync_from_disk()
+        if not isinstance(query, str):
+            raise TypeError(f"query must be str, got {type(query).__name__}")
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            raise TypeError(f"limit must be an int, got {type(limit).__name__}")
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        if kind is not None and kind not in self.entries:
+            # An unknown kind is an argument error, reported even when the query
+            # would match nothing; the list mirrors list()'s refusal.
+            raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
+        terms = _harness_query_terms(query)
+        if not terms:
+            return []
+
+        scored: list[tuple[HarnessEntry, float]] = []
+        for entry in self.list(kind):
+            score = _search_score(entry, terms)
+            if score > 0:
+                scored.append((entry, score))
+        # Two stable passes: sort by the fallback key first, then by the primary
+        # keys descending, which yields score desc -> updated_at desc ->
+        # (kind, id) asc without making the identifier tiebreak reverse too.
+        scored.sort(key=lambda hit: (hit[0].kind, hit[0].id))
+        scored.sort(key=lambda hit: (hit[1], _search_recency(hit[0])), reverse=True)
+        return [
+            HarnessSearchHit(
+                entry.kind,
+                entry.id,
+                score,
+                _search_snippet(f"{entry.title} {entry.content}", terms),
+            )
+            for entry, score in scored[:limit]
+        ]
+
     def snapshot(self, *, global_: bool = False, **kwargs: Any) -> dict[str, Any]:
         if target := self._global_target(global_, kwargs):
             return target.snapshot()
@@ -1027,6 +1219,7 @@ __all__ = [
     "HarnessEntry",
     "HarnessKind",
     "HarnessScope",
+    "HarnessSearchHit",
     "HarnessState",
     "RefinementEvent",
     "get_harness_state",
