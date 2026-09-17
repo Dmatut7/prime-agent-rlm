@@ -3,6 +3,7 @@ import {
 	chmodSync,
 	existsSync,
 	mkdirSync,
+	mkdtempSync,
 	readdirSync,
 	readFileSync,
 	renameSync,
@@ -11,6 +12,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { createConnection, type Socket } from "node:net";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { APP_NAME, ENV_AGENT_DIR } from "../../../src/config.js";
@@ -132,8 +134,10 @@ async function createPaths(): Promise<TestPaths> {
 	// exec of that inode is SIGKILLed machine-wide. Spawn through a wrapper.
 	writeFileSync(executablePath, `#!/bin/sh\nexec "${process.execPath}" "$@"\n`, { mode: 0o700 });
 	chmodSync(executablePath, 0o700);
-	const socketTmpDir = `/tmp/eng-4603-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-	mkdirSync(socketTmpDir, { recursive: true, mode: 0o700 });
+	// Unix socket paths are length limited, so the child TMPDIR stays under a short root.
+	const socketTmpRoot = process.platform === "win32" ? tmpdir() : "/tmp";
+	mkdirSync(socketTmpRoot, { recursive: true, mode: 0o700 });
+	const socketTmpDir = mkdtempSync(join(socketTmpRoot, "eng-4603-"));
 	socketTempDirs.add(socketTmpDir);
 	fixtureDescriptorDirs.add(join(harness.tempDir, "workers"));
 	fixtureRegistryDirs.add(join(harness.tempDir, "registry"));
@@ -697,6 +701,15 @@ async function servicePidOf(launcher: ProcessHandle, label: string): Promise<Fix
 		await delay(25);
 	}
 	throw new Error(`Launcher ${launcherPid} never spawned the ${label} supervisor process`);
+}
+
+/** Every pid named in an `-F pn` lsof record stream. */
+function lsofRecordPids(lsofOutput: string): number[] {
+	const pids: number[] = [];
+	for (const line of lsofOutput.split("\n")) {
+		if (line.startsWith("p")) pids.push(Number.parseInt(line.slice(1), 10));
+	}
+	return pids;
 }
 
 /** pids whose lsof record names exactly this socket path (`-F pn` record stream). */
@@ -1346,9 +1359,16 @@ describe("ENG-4603 worker recovery convergence", () => {
 				);
 			}
 		}
-		await delay(11_000);
+		// The same fact from the listener side, and with no wall clock to pay: the scan
+		// is restricted to the fixture pids, so a clean stop must leave none of them
+		// named as a socket holder. Exact record pids, not substrings of the stream.
+		const listenersAfterShutdown = spawnSync(lsofPath, [], {
+			encoding: "utf8",
+			env: { ...process.env, ...lsofEnvironment },
+		}).stdout;
+		const pidsAfterShutdown = new Set(lsofRecordPids(listenersAfterShutdown));
 		for (const service of services) {
-			expect(exactProcessIsAlive(service.pid, service.processStartId), `pid ${service.pid}`).toBe(false);
+			expect(pidsAfterShutdown.has(service.pid), `${service.role} ${service.pid} still holds a socket`).toBe(false);
 		}
 
 		// Then the shape of the claim. One supervisor socket held by two processes and
