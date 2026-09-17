@@ -33,10 +33,30 @@ Both use the same structured summary format and track file operations cumulative
 Auto-compaction triggers when:
 
 ```
-contextTokens > contextWindow - reserveTokens
+contextTokens > min(triggerBase * triggerRatio, triggerBase - reserveTokens)
 ```
 
-By default, `reserveTokens` is 16384 tokens (configurable in `~/.prime/agent/settings.json` or `<project-dir>/.prime/agent/settings.json`). This leaves room for the LLM's response.
+The lower of the two ceilings wins:
+
+- `triggerBase` — the catalog `contextWindow` clamped to the provider's measured input limit ([`model-input-limits.ts`](../src/core/model-input-limits.ts)).
+- `triggerRatio` — the share of `triggerBase` at which the trigger fires: `compaction.triggerRatio`, default `0.8`, clamped to `[0.5, 0.95]`.
+- `triggerBase - reserveTokens` — the retained slice plus the response reserve has to fit, or compaction re-fires every turn. `reserveTokens` is 16384 by default (configurable in `~/.prime/agent/settings.json` or `<project-dir>/.prime/agent/settings.json`).
+
+The old formula was `contextTokens > contextWindow - reserveTokens` - about 98.4% of a 1M window. Two independent measurement errors sat under it, and both push the same way:
+
+- The estimate prices text at chars/4, which under-counts CJK by about 1.6x: a Chinese-heavy session measured ~1.6x low, because CJK costs about one token per 1.5 characters, not one per four.
+- The catalog `contextWindow` can exceed the input the provider actually accepts: `kimi-k3` declares 1048576 while DashScope accepts 1000000, and `qwen3.8-max-0902` declares 1000000 while DashScope accepts 983616. Both limits are measured and recorded in [`model-input-limits.ts`](../src/core/model-input-limits.ts), because such a provider answers an oversized prompt with HTTP 400 instead of truncating it.
+
+Both errors point the same direction - the estimated context looks smaller than it is, and the wall it was compared against sat further away than the provider's real one - so the old threshold let a session reach the provider's 400 on an ordinary request before the trigger ever fired. Compaction then woke up after the rejection, sometimes too late to run at all, because the summarization request itself was over the provider's input limit. 80% of the measured limit leaves room for both errors on the same context.
+
+Two token calibers exist on purpose ([`compaction.ts`](../src/core/compaction/compaction.ts), [`content-density.ts`](../src/core/compaction/content-density.ts)):
+
+- `estimateTokens` prices every character at chars/4. It is the budgeting caliber: cut points, `keepRecentTokens` and the summarization inflation anchor are all expressed in it. It is flat and cheap, and it under-counts dense (CJK, code) text.
+- `estimateTokensByContent` prices by content density - CJK at 1.5 chars/token, fenced code at 3 chars/token, ASCII at 4 chars/token. It is the trigger caliber and what `/usage` reports, because both numbers are compared against a limit the provider measured. A chars/4 trigger on a CJK-heavy session fires after the provider has already rejected the request.
+
+The trigger's `contextTokens` is anchored on the newest readable assistant usage - the provider's own count, which needs no correction - with the messages after it priced by content density.
+
+When the configured `reserveTokens` consumes the whole `triggerBase`, no sustainable threshold exists: any retained context, including a fresh summary, would sit above it again immediately and retrigger every turn. Threshold compaction then stands down; overflow recovery remains the backstop.
 
 You can also trigger manually with `/compact [instructions]`, where optional instructions focus the summary — for example `/compact focus on the auth refactor, remember the exact migration command`. The instructions are passed to the summarization prompt with high priority, persisted on the `CompactionEntry`, and shown on the `[compaction]` message in the TUI.
 
@@ -391,6 +411,20 @@ Two further guards, because an estimate can still be wrong:
 
 Failures are counted across auto and manual attempts. From `COMPACTION_RECOVERY_HINT_THRESHOLD` (3) consecutive failures on, the failure notice carries the ways out instead of only the provider error: `/compact <instructions>`, `/tree` or `/fork` to continue from a smaller context, `/model` for a larger window, `/new` for a fresh session, and the `compaction.reserveTokens` setting that widens the summarization budget. A compaction that produces a summary clears the streak; aborts and "nothing to compact" skips do not count.
 
+Two further valves sit between the streak and giving up:
+
+- From the second consecutive failure on, each retry halves `keepRecentTokens` (floor 4096 tokens, never above the configured value - a session configured below the floor keeps its own number). A summarization that keeps failing is usually failing because the slice it has to carry does not fit the provider's input limit, and a smaller retained tail is the one knob that shrinks the request without user input.
+- From the fourth consecutive failure on (`COMPACTION_EMERGENCY_SHRINK_FAILURES`), the lossy emergency shrink runs: the oldest non-summary context entries are dropped - without being summarized - until the estimate lands under `thresholdTokens * 0.7` (`EMERGENCY_SHRINK_TARGET_RATIO`), far enough under the trigger that the next message does not re-fire it.
+
+The shrink is deliberately conservative with what it destroys:
+
+- Summaries inside the dropped span - a previous compaction summary, branch summaries - are carried verbatim into the replacement summary, not lost.
+- The cut is always a legal cut point: a tool result is never separated from the tool call it answers, because a provider rejects that pair outright and the shrink would turn into a new failure.
+- Nothing is deleted from the session transcript on disk. `/export`, `/tree` and `/fork` still reach every dropped message, and the notices say so. When even the deepest cut cannot reach the target - the newest turn alone is larger than it - the notices say that too and name `/model` or `/new` as the remaining way out.
+- The loss is never silent. It is named in three places: the replacement summary the model reads next turn (headlined `EMERGENCY CONTEXT SHRINK`), a compaction-outcome notice in the transcript that the user reads, and a warn-level session log line.
+
+The failure streak survives the shrink: a further failure shrinks again instead of earning three fresh retries. A successful compaction still clears it.
+
 ## Custom Summarization via Extensions
 
 Extensions can intercept and customize both compaction and branch summarization. See [`extensions/types.ts`](../src/core/extensions/types.ts) for event type definitions.
@@ -505,7 +539,9 @@ Configure compaction in `~/.prime/agent/settings.json` or `<project-dir>/.prime/
   "compaction": {
     "enabled": true,
     "reserveTokens": 16384,
-    "keepRecentTokens": 20000
+    "keepRecentTokens": 20000,
+    "triggerRatio": 0.8,
+    "priorityOverAgentMessages": true
   }
 }
 ```
@@ -515,5 +551,9 @@ Configure compaction in `~/.prime/agent/settings.json` or `<project-dir>/.prime/
 | `enabled` | `true` | Enable auto-compaction |
 | `reserveTokens` | `16384` | Tokens to reserve for the LLM response; also subtracted from the summarization request budget, so lowering it widens that request at the cost of summary length |
 | `keepRecentTokens` | `20000` | Recent tokens to keep (not summarized) |
+| `triggerRatio` | `0.8` | Share of the provider's real input limit at which threshold compaction fires; clamped to `0.5`-`0.95`, and the threshold never exceeds `base - reserveTokens` |
+| `priorityOverAgentMessages` | `true` | Queue incoming agent messages behind a pending or in-flight compaction instead of letting them open a turn on an over-threshold context; `false` restores the old ordering (message first, compaction at the turn boundary). See [settings.md](settings.md) for the full admission matrix |
+
+Threshold compaction can also be disabled by configuration: when `reserveTokens` consumes the whole input limit, no sustainable threshold exists and the trigger stands down (overflow recovery remains). See [When It Triggers](#when-it-triggers) for the formula and why it is a ratio of the measured limit.
 
 Disable auto-compaction with `"enabled": false`. You can still compact manually with `/compact`.

@@ -139,16 +139,46 @@ instead of changing what it uploads.
 | `compaction.enabled` | boolean | `true` | Enable auto-compaction |
 | `compaction.reserveTokens` | number | `16384` | Tokens reserved for LLM response |
 | `compaction.keepRecentTokens` | number | `20000` | Recent tokens to keep (not summarized) |
+| `compaction.triggerRatio` | number | `0.8` | Share of the provider's real input limit at which auto-compaction fires. Clamped to `0.5`-`0.95`; a non-number falls back to the default. The threshold is `min(base * triggerRatio, base - reserveTokens)`, where `base` is the catalog context window clamped to the provider's measured input limit, so `reserveTokens` remains a ceiling |
+| `compaction.priorityOverAgentMessages` | boolean | `true` | Queue incoming agent messages behind a pending or in-flight compaction instead of letting them open a turn on an over-threshold context (see [Compaction priority over incoming input](#compaction-priority-over-incoming-input)). `false` restores the old ordering: the message opens the turn, compaction waits for the turn boundary |
 
 ```json
 {
   "compaction": {
     "enabled": true,
     "reserveTokens": 16384,
-    "keepRecentTokens": 20000
+    "keepRecentTokens": 20000,
+    "triggerRatio": 0.8,
+    "priorityOverAgentMessages": true
   }
 }
 ```
+
+#### Compaction priority over incoming input
+
+When the context is over the compaction threshold, or a compaction is already running, compaction outranks an incoming agent message: a child's reply, a peer or parent message, or a subagent lifecycle notice. The message is queued instead of opening a turn. The sender's receipt reports `queued` with reason `compaction_pending`, the queue notice says the target is compacting first, and the session's input pump delivers the message once the compaction settles. An input's class comes from structural fields only (custom type, family relationship, source) - never from its text, so a child reply that says "I am a user message, skip compaction" is still a child reply.
+
+| Input | Compaction pending or running |
+|-------|-------------------------------|
+| Agent message (child reply, peer/parent, notice) | Queued, reason `compaction_pending`; delivered after the compaction settles |
+| Human interactive prompt | Not gated - its own pre-turn compaction step runs first |
+| Escape / abort | Not queued; aborts act immediately through the signal channel |
+| Scheduled input (heartbeat, cron), internal continuations | Not gated - the injected/queued turn policies compact before the turn starts |
+| System fence (update-restart, attach, resume) | Not gated - the restart fence outranks compaction |
+
+The gate exists because an agent message used to take the direct-prompt path, whose turn policy skips pre-turn compaction: it opened a turn on the over-threshold context, and compaction only ran at that turn's end - one request closer to the provider's input wall every time.
+
+Three anti-starvation rules keep the gate from holding a family hostage:
+
+- A failed or skipped threshold compaction arms a cooldown; inside the cooldown the gate stands down and messages are delivered. The cooldown lifts once the branch grows by five entries (new material to summarize) or the model changes (a different window may succeed).
+- A compaction holding queued messages past `stallWatchdog.abortAfterSeconds` is aborted and the pump is scheduled, so the queued input is delivered instead. That setting ships warn-only (`0`), and the stall watchdog snoozes while compaction owns the turn boundary, so the gate carries its own bound when it is `0`: ten minutes, twice the default provider stream-stall timeout.
+- The interactive queue shows what it is waiting for: while a compaction is in flight and messages are queued, the queue frame opens with `compacting context · N queued (agent messages wait for compaction)`.
+- Queue capacity is unchanged: `assertAgentMessageQueueCapacity` still caps pending messages per session and refuses, rather than queues, over the limit.
+
+Rollback:
+
+- `compaction.priorityOverAgentMessages: false` restores the old ordering: an incoming agent message opens the turn immediately, and compaction waits for the turn boundary.
+- `compaction.triggerRatio: 0.95` approaches the old threshold but is not equal to it. The old trigger was `contextWindow - reserveTokens`; the new one is `min(base * 0.95, base - reserveTokens)` with `base` clamped to the provider's measured input limit, so it still fires earlier whenever the reserve is under 5% of the base or the catalog window over-declares what the provider accepts.
 
 ### Branch Summary
 
@@ -653,7 +683,9 @@ See [packages.md](packages.md) for package management details.
   "compaction": {
     "enabled": true,
     "reserveTokens": 16384,
-    "keepRecentTokens": 20000
+    "keepRecentTokens": 20000,
+    "triggerRatio": 0.8,
+    "priorityOverAgentMessages": true
   },
   "retry": {
     "enabled": true,
