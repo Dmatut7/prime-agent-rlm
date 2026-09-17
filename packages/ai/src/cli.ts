@@ -1,28 +1,14 @@
 #!/usr/bin/env node
 
 import { createInterface } from "node:readline";
-import { existsSync, readFileSync, writeFileSync } from "fs";
+import { AUTH_FILE, loadAuth, saveAuth } from "./utils/auth-store.js";
 import { getOAuthProvider, getOAuthProviders } from "./utils/oauth/index.js";
-import type { OAuthCredentials, OAuthProviderId } from "./utils/oauth/types.js";
+import type { OAuthProviderId } from "./utils/oauth/types.js";
 
-const AUTH_FILE = "auth.json";
 const PROVIDERS = getOAuthProviders();
 
 function prompt(rl: ReturnType<typeof createInterface>, question: string): Promise<string> {
 	return new Promise((resolve) => rl.question(question, resolve));
-}
-
-function loadAuth(): Record<string, { type: "oauth" } & OAuthCredentials> {
-	if (!existsSync(AUTH_FILE)) return {};
-	try {
-		return JSON.parse(readFileSync(AUTH_FILE, "utf-8"));
-	} catch {
-		return {};
-	}
-}
-
-function saveAuth(auth: Record<string, { type: "oauth" } & OAuthCredentials>): void {
-	writeFileSync(AUTH_FILE, JSON.stringify(auth, null, 2), "utf-8");
 }
 
 async function login(providerId: OAuthProviderId): Promise<void> {
