@@ -1,6 +1,15 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -1741,5 +1750,80 @@ describe("daemon supervisor resident workers", () => {
 		await waitForSocketGone(socketPath);
 		await waitForProcessGone(summary.workerPid);
 		workerPids.delete(summary.workerPid);
+	});
+
+	it("exits an orphaned session worker when no replacement supervisor can come up", { timeout: 120_000 }, async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		// spawnSupervisor isolates the registry root here; the test reads the
+		// supervisor's owner record from it.
+		const registryDir = join(agentDir, "supervisor-registry");
+		// The socket path must stay short: macOS rejects listen() with EINVAL past
+		// the sun_path limit, and the per-test temp dir nests too deep.
+		const socketDir = mkdtempSync(join(tmpdir(), "prime-orphan-gc-"));
+		tempDirs.push(socketDir);
+		const sessionDir = join(agentDir, "sessions");
+		const socketPath = join(socketDir, "supervisor.sock");
+		mkdirSync(projectDir, { recursive: true });
+
+		const manager = SessionManager.create(projectDir, sessionDir);
+		manager.appendMessage({ role: "user", content: "orphan gc fixture", timestamp: 1 });
+		manager.flushNow();
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile) throw new Error("Missing fixture session path");
+
+		// A 3s supervisor-lost window keeps the orphan exit inside the test budget.
+		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir, [], {
+			PRIME_AGENT_INTERNAL_WORKER_SUPERVISOR_LOST_EXIT_MS: "3000",
+		});
+		const client = await connectEventually(socketPath, supervisor);
+		const created = await client.request({
+			type: "create",
+			sessionPath: sessionFile,
+			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+		});
+		if (!created.success) throw new Error(created.error);
+		const summary = requireSummary(created.data);
+		if (!summary.workerPid) throw new Error("Session worker did not spawn");
+		workerPids.add(summary.workerPid);
+
+		// SIGKILL the registry-recorded supervisor pid: the spawned child can be a
+		// tsx wrapper, and killing the wrapper alone leaves the supervisor listening
+		// on its socket, so the worker would never orphan.
+		const ownerDirectories = readdirSync(registryDir).filter((name) => name.endsWith(".owner"));
+		expect(ownerDirectories).toHaveLength(1);
+		const owner = JSON.parse(readFileSync(join(registryDir, ownerDirectories[0], "owner.json"), "utf8")) as {
+			pid?: number;
+		};
+		if (!owner.pid) throw new Error("Supervisor owner record is missing its pid");
+		const supervisorPid = owner.pid;
+		const workerPid = summary.workerPid;
+		client.close();
+
+		// A read-only socket directory makes every replacement-launch attempt fail
+		// (lock/bind EACCES): the real-world orphan precondition where a worker
+		// cannot bring its supervisor back.
+		chmodSync(socketDir, 0o555);
+		try {
+			process.kill(supervisorPid, "SIGKILL");
+			await waitForExit(supervisor);
+			children.delete(supervisor);
+			await waitForCondition(
+				() => {
+					try {
+						process.kill(workerPid, 0);
+						return false;
+					} catch (error) {
+						return (error as NodeJS.ErrnoException).code === "ESRCH";
+					}
+				},
+				"Orphaned session worker did not exit after the supervisor-lost window",
+				60_000,
+			);
+		} finally {
+			chmodSync(socketDir, 0o755);
+		}
+		workerPids.delete(workerPid);
 	});
 });

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	checkSupervisorAvailability,
 	probeSupervisorAvailability,
@@ -56,15 +56,19 @@ function launchStub(socketPath: string): {
 
 function makeDeps(socketPath: string, overrides: Partial<SupervisorAvailabilityDeps> = {}) {
 	const stub = launchStub(socketPath);
+	const orphaned = vi.fn(async () => {});
 	const deps: SupervisorAvailabilityDeps = {
 		probe: (path) => probeSupervisorAvailability(path, { intervalMs: 1, connect: async () => false }),
 		launchReplacement: stub.launch,
 		isConnected: () => false,
 		isShuttingDown: () => false,
 		isShutdownAdmissionActive: async () => false,
+		connectAfterLaunch: async () => false,
+		isOrphanedLongEnough: () => false,
+		onOrphaned: orphaned,
 		...overrides,
 	};
-	return { deps, stub };
+	return { deps, stub, orphaned };
 }
 
 describe("P1-7b supervisor availability round", () => {
@@ -255,5 +259,116 @@ describe("P1-7b supervisor availability round", () => {
 			expect(supervisorRecheckDelayMs(testCase.failures), `${testCase.failures} failures`).toBe(testCase.expected);
 		}
 		expect(SUPERVISOR_RECHECK_MAX_MS).toBe(60_000);
+	});
+});
+
+describe("orphaned-worker window (upstream #2246)", () => {
+	// Mirrors the daemon's window policy: 5 minutes by default, elapsed measured
+	// from state.supervisorAbsentSince.
+	const LOST_EXIT_MS = 5 * 60_000;
+	const windowPolicy = (state: SupervisorAvailabilityState) => () => {
+		const absentSince = state.supervisorAbsentSince;
+		return absentSince !== undefined && Date.now() - absentSince >= LOST_EXIT_MS;
+	};
+
+	it("starts the orphan window when a whole round fails, and keeps the first stamp across rounds", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ma-orphan-start-"));
+		roots.push(root);
+		const socketPath = join(root, "supervisor.sock");
+		const { deps, orphaned } = makeDeps(socketPath);
+		const state: SupervisorAvailabilityState = { consecutiveFailures: 0 };
+
+		await checkSupervisorAvailability(socketPath, state, deps);
+		const firstStamp = state.supervisorAbsentSince;
+		expect(firstStamp).toBeTypeOf("number");
+		expect(orphaned).not.toHaveBeenCalled();
+
+		await checkSupervisorAvailability(socketPath, state, deps);
+		// `??=` semantics: the window measures from the FIRST failed round, so the
+		// exit deadline cannot slide forward forever.
+		expect(state.supervisorAbsentSince).toBe(firstStamp);
+	});
+
+	it("restarts the orphan window when a replacement answers after the launch", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ma-orphan-restart-"));
+		roots.push(root);
+		const socketPath = join(root, "supervisor.sock");
+		// The window has long elapsed on paper: without the post-launch recheck the
+		// worker would exit even though its recovery succeeded.
+		const state: SupervisorAvailabilityState = {
+			consecutiveFailures: 0,
+			supervisorAbsentSince: Date.now() - 2 * LOST_EXIT_MS,
+		};
+		const { deps, orphaned, stub } = makeDeps(socketPath, {
+			connectAfterLaunch: async () => true,
+			isOrphanedLongEnough: windowPolicy(state),
+		});
+
+		const outcome = await checkSupervisorAvailability(socketPath, state, deps);
+
+		expect(stub.calls).toBe(1);
+		expect(state.supervisorAbsentSince).toBeUndefined();
+		expect(orphaned).not.toHaveBeenCalled();
+		expect(outcome.launchedReplacement).toBe(true);
+	});
+
+	it("exits the orphaned worker once the window elapsed without a replacement", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ma-orphan-exit-"));
+		roots.push(root);
+		const socketPath = join(root, "supervisor.sock");
+		const state: SupervisorAvailabilityState = {
+			consecutiveFailures: 0,
+			supervisorAbsentSince: Date.now() - LOST_EXIT_MS - 1,
+		};
+		const { deps, orphaned } = makeDeps(socketPath, { isOrphanedLongEnough: windowPolicy(state) });
+
+		const outcome = await checkSupervisorAvailability(socketPath, state, deps);
+
+		expect(orphaned).toHaveBeenCalledOnce();
+		// The exit decision is the implementer's; the round still reports what it did.
+		expect(outcome.launchedReplacement).toBe(true);
+	});
+
+	it("clears the window when the supervisor answers again", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ma-orphan-recovered-"));
+		roots.push(root);
+		const socketPath = join(root, "supervisor.sock");
+		const state: SupervisorAvailabilityState = {
+			consecutiveFailures: 3,
+			supervisorAbsentSince: Date.now() - LOST_EXIT_MS,
+		};
+		const { deps, orphaned } = makeDeps(socketPath, {
+			probe: async () => ({ available: true, attempts: 1 }),
+			isOrphanedLongEnough: windowPolicy(state),
+		});
+
+		await checkSupervisorAvailability(socketPath, state, deps);
+
+		expect(state.supervisorAbsentSince).toBeUndefined();
+		expect(orphaned).not.toHaveBeenCalled();
+	});
+
+	it("clears the window when the monitoring ends benignly", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ma-orphan-benign-"));
+		roots.push(root);
+		const socketPath = join(root, "supervisor.sock");
+		const cases = [
+			{ name: "authenticated", overrides: { isConnected: () => true } },
+			{ name: "shutting down", overrides: { isShuttingDown: () => true } },
+			{ name: "shutdown admission in progress", overrides: { isShutdownAdmissionActive: async () => true } },
+		];
+		expect(cases.length).toBeGreaterThan(0);
+		for (const testCase of cases) {
+			const state: SupervisorAvailabilityState = {
+				consecutiveFailures: 1,
+				supervisorAbsentSince: Date.now() - 2 * LOST_EXIT_MS,
+			};
+			const { deps, orphaned } = makeDeps(socketPath, testCase.overrides);
+
+			await checkSupervisorAvailability(socketPath, state, deps);
+
+			expect(state.supervisorAbsentSince, testCase.name).toBeUndefined();
+			expect(orphaned, testCase.name).not.toHaveBeenCalled();
+		}
 	});
 });

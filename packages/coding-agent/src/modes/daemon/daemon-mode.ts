@@ -313,6 +313,19 @@ const AGENT_DIRECTORY_FAILURE_LOG_MIN_GAP_MS = 60_000;
 const KERNEL_RESIDENCY_LOG_GAP_MS = 6 * 60 * 60 * 1000;
 const UPDATE_RESTART_PREPARE_TIMEOUT_MS = 90_000;
 const MAX_SESSION_SNAPSHOT_STABILIZATION_RETRIES = 3;
+// Orphaned-worker garbage collection (upstream #2246): a session worker whose
+// supervisor stays unreachable — no supervisor claim, no successful replacement
+// launch — exits after this window instead of retrying the resurrection loop
+// forever. Sessions persist on disk, and a later supervisor spawns fresh workers
+// on demand, so an unreachable-supervisor worker serves nothing by lingering.
+const WORKER_SUPERVISOR_LOST_EXIT_MS_ENV = "PRIME_AGENT_INTERNAL_WORKER_SUPERVISOR_LOST_EXIT_MS";
+const DEFAULT_WORKER_SUPERVISOR_LOST_EXIT_MS = 5 * 60_000;
+
+function workerSupervisorLostExitMs(): number {
+	const raw = Number(process.env[WORKER_SUPERVISOR_LOST_EXIT_MS_ENV]);
+	return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_WORKER_SUPERVISOR_LOST_EXIT_MS;
+}
+
 /**
  * Transcript summaries and per-child display metadata are independent reads, so a
  * subtree walk overlaps them instead of paying one round trip per child. Kept
@@ -824,10 +837,64 @@ export class AgentDaemon {
 			isConnected: () => this.hasAuthenticatedSupervisorConnection(),
 			isShuttingDown: () => this.shuttingDown,
 			isShutdownAdmissionActive: () => isDaemonShutdownAdmissionActive(),
+			// Upstream #2246: a replacement that answers right after the launch
+			// restarts the orphan window, and the window deadline drives the exit.
+			connectAfterLaunch: (socketPath) => this.canConnectToSupervisor(socketPath),
+			isOrphanedLongEnough: () => {
+				const absentSince = this.supervisorAvailabilityState.supervisorAbsentSince;
+				return absentSince !== undefined && Date.now() - absentSince >= workerSupervisorLostExitMs();
+			},
+			onOrphaned: () => this.exitOrphanedSupervisorWorker(supervisorSocketPath),
 		});
 		if (outcome.nextDelayMs !== undefined) {
 			this.scheduleSupervisorAvailabilityCheck(supervisorSocketPath, outcome.nextDelayMs);
 		}
+	}
+
+	/**
+	 * Upstream #2246: garbage-collect an orphaned worker. The supervisor has been
+	 * unreachable for the whole bounded window — no supervisor claim, no successful
+	 * replacement launch — so retrying the resurrection loop forever only
+	 * accumulates garbage. Sessions persist on disk, so the next supervisor to
+	 * claim the socket spawns fresh workers on demand.
+	 */
+	private async exitOrphanedSupervisorWorker(supervisorSocketPath: string): Promise<void> {
+		const absentSince = this.supervisorAvailabilityState.supervisorAbsentSince;
+		if (absentSince === undefined) {
+			// The window restarted (a replacement answered): not an orphan anymore.
+			return;
+		}
+		if (this.hasAuthenticatedSupervisorConnection()) {
+			// A claim landed between the window check and the exit: recovery won.
+			this.supervisorAvailabilityState.supervisorAbsentSince = undefined;
+			return;
+		}
+		if (this.hasOngoingSessionWork()) {
+			// An active run owns the worker a little longer; its turn end lets the
+			// next availability check reconsider while the window keeps running.
+			return;
+		}
+		this.log(
+			`supervisor ${supervisorSocketPath} unreachable for ${Math.round((Date.now() - absentSince) / 1000)}s; exiting orphaned worker`,
+		);
+		await this.shutdown(0);
+	}
+
+	/**
+	 * The orphan-exit gate: the same predicate the daemon reports as session
+	 * activity — our fold is the session summary's isSessionActive (which folds
+	 * live kernel bash work, LIVE-1/r44) or running RLM children. Retrying,
+	 * refinement, compaction settlement and consumed queued actions all count
+	 * through session.isSessionActive.
+	 */
+	private hasOngoingSessionWork(): boolean {
+		for (const state of this.sessions.values()) {
+			const summary = summaryForActiveSession(state);
+			if (summary.isSessionActive || summary.hasRunningRlmChildren === true) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	private hasAuthenticatedSupervisorConnection(): boolean {

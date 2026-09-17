@@ -104,11 +104,37 @@ export interface SupervisorAvailabilityDeps {
 	isConnected(): boolean;
 	isShuttingDown(): boolean;
 	isShutdownAdmissionActive(): Promise<boolean>;
+	/**
+	 * Upstream #2246: one connect probe after the replacement launch. A supervisor
+	 * that answers here restarts the orphan window — a deadline that elapsed during
+	 * the launch must not exit a worker whose recovery succeeded.
+	 */
+	connectAfterLaunch(socketPath: string): Promise<boolean>;
+	/**
+	 * Upstream #2246: true when the supervisor has been unreachable for the whole
+	 * orphan window; the implementer owns the window policy (the daemon reads
+	 * `state.supervisorAbsentSince` against its exit deadline).
+	 */
+	isOrphanedLongEnough(): boolean;
+	/**
+	 * Upstream #2246: exit the orphaned worker. The authenticated-claim and
+	 * session-work gates are the implementer's: a claim that landed between the
+	 * window check and the exit restarts the window instead.
+	 */
+	onOrphaned(): Promise<void>;
 }
 
 /** Rounds that failed in a row; the worker owns it across checks so the backoff can grow. */
 export interface SupervisorAvailabilityState {
 	consecutiveFailures: number;
+	/**
+	 * Upstream #2246: when the worker last failed a whole round of reaching its
+	 * supervisor. The orphan window measures from here; every path where the
+	 * supervisor answers (or the monitoring ends benignly) clears it, and the
+	 * post-launch recheck restarts it when a replacement binds mid-launch. The
+	 * daemon reads it to decide the orphan exit deadline.
+	 */
+	supervisorAbsentSince?: number;
 }
 
 export interface SupervisorAvailabilityOutcome {
@@ -128,14 +154,18 @@ export async function checkSupervisorAvailability(
 	deps: SupervisorAvailabilityDeps,
 ): Promise<SupervisorAvailabilityOutcome> {
 	if (deps.isShuttingDown() || deps.isConnected()) {
+		// Upstream #2246: the monitoring ends, so the worker is not an orphan.
+		state.supervisorAbsentSince = undefined;
 		return { launchedReplacement: false };
 	}
 	if (await deps.isShutdownAdmissionActive()) {
+		state.supervisorAbsentSince = undefined;
 		return { nextDelayMs: SUPERVISOR_SHUTDOWN_ADMISSION_RECHECK_MS, launchedReplacement: false };
 	}
 	const probe = await deps.probe(socketPath);
 	if (probe.available) {
 		state.consecutiveFailures = 0;
+		state.supervisorAbsentSince = undefined;
 		// A socket that accepts is not an authenticated supervisor. Between this probe
 		// and `worker_auth` — which adoption queuing stretches to minutes, since
 		// adoptions run four at a time with a 300s request budget each — the
@@ -151,7 +181,21 @@ export async function checkSupervisorAvailability(
 		return { probe, launchedReplacement: false, nextDelayMs: SUPERVISOR_RECHECK_MAX_MS };
 	}
 	state.consecutiveFailures++;
+	// The supervisor socket is unreachable; remember when the worker last saw it so
+	// the orphan window below stays bounded (upstream #2246).
+	state.supervisorAbsentSince ??= Date.now();
 	await deps.launchReplacement(socketPath);
+	if (await deps.connectAfterLaunch(socketPath)) {
+		// A replacement came up during the launch: the orphan window must restart
+		// instead of exiting the worker. The monitor must stay armed, though — a
+		// replacement can bind and then exit before it ever claims the worker, and
+		// only an authenticated claim (or its later close) re-arms the monitor.
+		// Falling through reschedules the next round below.
+		state.supervisorAbsentSince = undefined;
+	}
+	if (deps.isOrphanedLongEnough()) {
+		await deps.onOrphaned();
+	}
 	if (deps.isShuttingDown() || deps.isConnected()) {
 		return { probe, launchedReplacement: true };
 	}

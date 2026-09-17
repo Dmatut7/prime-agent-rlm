@@ -587,6 +587,134 @@ describe("daemon mode helpers", () => {
 		expect(internals.createAgentMessageAgentSummary(state).status).toBe("idle");
 	});
 
+	it("exits an orphaned worker when the supervisor window elapsed and no session is working", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-orphan-exit-"));
+		const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			const daemon = new AgentDaemon(join(tempDir, "worker.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: vi.fn(),
+				worker: { authenticationToken: "worker-token" },
+			});
+			const state = makeOrphanGateSession("orphan-idle");
+			const internals = daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				supervisorAvailabilityState: { consecutiveFailures: number; supervisorAbsentSince?: number };
+				exitOrphanedSupervisorWorker(socketPath: string): Promise<void>;
+				shutdown: ReturnType<typeof vi.fn>;
+			};
+			internals.sessions.set(state.activeSessionId, state);
+			internals.supervisorAvailabilityState.supervisorAbsentSince = Date.now() - 10 * 60_000;
+			internals.shutdown = vi.fn(async () => undefined as never);
+
+			await internals.exitOrphanedSupervisorWorker("/tmp/supervisor.sock");
+
+			expect(internals.shutdown).toHaveBeenCalledWith(0);
+			// The window stays stamped: the worker is exiting either way.
+			expect(internals.supervisorAvailabilityState.supervisorAbsentSince).toBeDefined();
+		} finally {
+			consoleError.mockRestore();
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps an orphaned worker alive while a session is still working", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-orphan-busy-"));
+		const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			const daemon = new AgentDaemon(join(tempDir, "worker.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: vi.fn(),
+				worker: { authenticationToken: "worker-token" },
+			});
+			const internals = daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				supervisorAvailabilityState: { consecutiveFailures: number; supervisorAbsentSince?: number };
+				exitOrphanedSupervisorWorker(socketPath: string): Promise<void>;
+				shutdown: ReturnType<typeof vi.fn>;
+			};
+			// The full gate predicate (upstream #2246): the summary fold — session
+			// activity, live kernel bash work — or running RLM children.
+			const cases = [
+				{ name: "streaming session", session: { isSessionActive: true } },
+				{ name: "live kernel bash work", session: { isKernelWorkInFlight: true } },
+				{ name: "running rlm children", session: { hasRunningRlmChildren: () => true } },
+			];
+			expect(cases.length).toBeGreaterThan(0);
+			for (const testCase of cases) {
+				const state = makeOrphanGateSession("orphan-busy", testCase.session);
+				internals.sessions.set(state.activeSessionId, state);
+				internals.supervisorAvailabilityState.supervisorAbsentSince = Date.now() - 10 * 60_000;
+				internals.shutdown = vi.fn(async () => undefined as never);
+
+				await internals.exitOrphanedSupervisorWorker("/tmp/supervisor.sock");
+
+				expect(internals.shutdown, testCase.name).not.toHaveBeenCalled();
+				// An active run owns the worker a little longer; the window keeps running.
+				expect(internals.supervisorAvailabilityState.supervisorAbsentSince, testCase.name).toBeDefined();
+				internals.sessions.delete(state.activeSessionId);
+			}
+		} finally {
+			consoleError.mockRestore();
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("restarts the orphan window when the supervisor claimed the worker before the exit", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-orphan-claimed-"));
+		const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			const daemon = new AgentDaemon(join(tempDir, "worker.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: vi.fn(),
+				worker: { authenticationToken: "worker-token" },
+			});
+			const internals = daemon as unknown as {
+				supervisorClaims: Map<object, object>;
+				supervisorAvailabilityState: { consecutiveFailures: number; supervisorAbsentSince?: number };
+				exitOrphanedSupervisorWorker(socketPath: string): Promise<void>;
+				shutdown: ReturnType<typeof vi.fn>;
+			};
+			internals.supervisorClaims.set({}, {});
+			internals.supervisorAvailabilityState.supervisorAbsentSince = Date.now() - 10 * 60_000;
+			internals.shutdown = vi.fn(async () => undefined as never);
+
+			await internals.exitOrphanedSupervisorWorker("/tmp/supervisor.sock");
+
+			// A claim landed between the window check and the exit: recovery won.
+			expect(internals.shutdown).not.toHaveBeenCalled();
+			expect(internals.supervisorAvailabilityState.supervisorAbsentSince).toBeUndefined();
+		} finally {
+			consoleError.mockRestore();
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not exit an orphaned worker whose window is not running", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-orphan-nowindow-"));
+		const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			const daemon = new AgentDaemon(join(tempDir, "worker.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: vi.fn(),
+				worker: { authenticationToken: "worker-token" },
+			});
+			const internals = daemon as unknown as {
+				supervisorAvailabilityState: { consecutiveFailures: number; supervisorAbsentSince?: number };
+				exitOrphanedSupervisorWorker(socketPath: string): Promise<void>;
+				shutdown: ReturnType<typeof vi.fn>;
+			};
+			internals.shutdown = vi.fn(async () => undefined as never);
+
+			await internals.exitOrphanedSupervisorWorker("/tmp/supervisor.sock");
+
+			expect(internals.shutdown).not.toHaveBeenCalled();
+		} finally {
+			consoleError.mockRestore();
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("records live delegated child work as busy for worker recovery while activity stays idle", () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-recovery-busy-"));
 		try {
@@ -9814,6 +9942,33 @@ function makeState(activeSessionId: string, parentActiveSessionId?: string): Act
 			},
 		},
 	} as unknown as ActiveSessionState;
+}
+
+/** A minimal resident session for the orphan-exit gate: idle by default, `session` overrides the busy facts. */
+function makeOrphanGateSession(activeSessionId: string, session: Record<string, unknown> = {}): ActiveSessionState {
+	const state = makeState(activeSessionId);
+	state.runtime = {
+		...state.runtime,
+		cwd: "/tmp",
+		metadata: { kind: "top-level", createdAt: 1 },
+		diagnostics: [],
+		modelFallbackMessage: undefined,
+		session: {
+			sessionId: `${activeSessionId}-session`,
+			sessionManager: { getCwd: () => "/tmp", getHeader: () => undefined },
+			messages: [],
+			state: { streamingMessage: undefined, pendingToolCalls: new Set() },
+			unfinishedActionCount: 0,
+			getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
+			isStreaming: false,
+			isCompacting: false,
+			isSessionActive: false,
+			isKernelWorkInFlight: false,
+			hasRunningRlmChildren: () => false,
+			...session,
+		},
+	} as never;
+	return state;
 }
 
 function makeClient(id: string, activeSessionId: string, supportsExtensionUi = false): DaemonSocketClient {

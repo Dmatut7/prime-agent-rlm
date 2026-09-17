@@ -33,6 +33,7 @@ import {
 	type DaemonWorkerFrameHeader,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
 import { MutationDrainLatch } from "../src/modes/daemon/mutation-drain-latch.js";
+import { SUPERVISOR_RECHECK_MAX_MS } from "../src/modes/daemon/supervisor-availability.js";
 import { WorkerRecoveryJournal } from "../src/modes/daemon/worker-recovery-journal.js";
 import type { PrivateFrame } from "../src/modes/session-worker/private-framing.js";
 import * as childProcessModule from "../src/utils/child-process.js";
@@ -150,6 +151,10 @@ interface SupervisorMonitorHarness {
 	clients: Set<{ authenticated: boolean }>;
 	supervisorClaims: Map<object, object>;
 	shuttingDown: boolean;
+	/** The availability round's state: class fields are not initialized on Object.create harnesses. */
+	supervisorAvailabilityState: { consecutiveFailures: number; supervisorAbsentSince?: number };
+	sessions: Map<string, never>;
+	log: ReturnType<typeof vi.fn>;
 	supervisorMonitorTimer?: ReturnType<typeof setTimeout>;
 	canConnectToSupervisor: (socketPath: string) => Promise<boolean>;
 	launchReplacementSupervisor: (socketPath: string) => Promise<void>;
@@ -299,6 +304,9 @@ function createHarness(canConnect: () => Promise<boolean>): SupervisorMonitorHar
 		clients: new Set<{ authenticated: boolean }>(),
 		supervisorClaims: new Map<object, object>(),
 		shuttingDown: false,
+		supervisorAvailabilityState: { consecutiveFailures: 0 },
+		sessions: new Map<string, never>(),
+		log: vi.fn(),
 		canConnectToSupervisor: vi.fn(canConnect),
 		launchReplacementSupervisor: vi.fn(async () => undefined),
 	}) as SupervisorMonitorHarness;
@@ -1192,25 +1200,77 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(handleCommand).not.toHaveBeenCalled();
 	});
 
-	it("does not poll a healthy supervisor after the startup check", async () => {
+	it("keeps a healthy unauthenticated supervisor on the slow recheck tier", async () => {
 		vi.useFakeTimers();
-		let resolveProbe: () => void = () => undefined;
-		const probeCompleted = new Promise<void>((resolve) => {
-			resolveProbe = resolve;
-		});
+		// One waiter per probe: the round's shutdown-admission lookup reads the
+		// registry off the fake clock, so each round needs a real-time yield to finish.
+		const probeWaiters: Array<() => void> = [];
+		const probeSeen = () =>
+			new Promise<void>((resolve) => {
+				probeWaiters.push(resolve);
+			});
+		const firstProbe = probeSeen();
 		const daemon = createHarness(async () => {
-			resolveProbe();
+			probeWaiters.shift()?.();
 			return true;
 		});
 
 		daemon.scheduleSupervisorAvailabilityCheck("/tmp/supervisor.sock", 1500);
 		await vi.advanceTimersByTimeAsync(1500);
-		await probeCompleted;
+		await firstProbe;
 		expect(daemon.canConnectToSupervisor).toHaveBeenCalledOnce();
 
-		await vi.advanceTimersByTimeAsync(60_000);
+		// A socket that answers is not an authenticated claim: the round stays armed,
+		// but on the slow tier — one probe a minute, not the old 5s busy poll.
+		await vi.advanceTimersByTimeAsync(SUPERVISOR_RECHECK_MAX_MS - 1_000);
 		expect(daemon.canConnectToSupervisor).toHaveBeenCalledOnce();
-		expect(daemon.supervisorMonitorTimer).toBeUndefined();
+		const secondProbe = probeSeen();
+		await vi.advanceTimersByTimeAsync(1_000);
+		await secondProbe;
+		expect(daemon.canConnectToSupervisor).toHaveBeenCalledTimes(2);
+		// The round reschedules its next slow-tier tick after the probe resolves.
+		await vi.advanceTimersByTimeAsync(0);
+		expect(daemon.supervisorMonitorTimer).toBeDefined();
+	});
+
+	it("keeps the supervisor monitor armed after a replacement binds but exits before claiming", async () => {
+		vi.useFakeTimers();
+		// The supervisor socket is dead, answers once during the replacement launch,
+		// then dies again before the replacement ever claims the worker. Probe
+		// results are consumed by the round's failed attempts, then by the
+		// post-launch recheck.
+		const probeResults = [false, false, false, true, false, false, false, false];
+		let probeCount = 0;
+		const daemon = createHarness(async () => {
+			const result = probeResults[Math.min(probeCount, probeResults.length - 1)];
+			probeCount += 1;
+			return result;
+		});
+		// Drive the fake clock until the expected number of probes have run; one
+		// advance alone does not flush the availability check chain (the admission
+		// lookup reads the registry off the fake clock).
+		const advanceUntilProbes = async (expected: number) => {
+			for (let step = 0; probeCount < expected && step < 500; step++) {
+				await vi.advanceTimersByTimeAsync(100);
+			}
+			expect(probeCount).toBe(expected);
+		};
+
+		daemon.scheduleSupervisorAvailabilityCheck("/tmp/supervisor.sock", 1500);
+		await advanceUntilProbes(4);
+		expect(daemon.launchReplacementSupervisor).toHaveBeenCalledOnce();
+		// The replacement answering mid-launch restarts the orphan window...
+		expect(daemon.supervisorAvailabilityState.supervisorAbsentSince).toBeUndefined();
+		// ...but a bind is not an authenticated claim: the monitor must stay armed
+		// instead of orphaning the worker if the replacement exits unclaimed.
+		expect(daemon.supervisorMonitorTimer).toBeDefined();
+
+		await advanceUntilProbes(8);
+		expect(daemon.launchReplacementSupervisor).toHaveBeenCalledTimes(2);
+		expect(daemon.canConnectToSupervisor).toHaveBeenCalledTimes(8);
+		// The socket died again: the orphan window is running, the monitor stays armed.
+		expect(daemon.supervisorAvailabilityState.supervisorAbsentSince).toBeDefined();
+		expect(daemon.supervisorMonitorTimer).toBeDefined();
 	});
 
 	it("skips socket probes while an authenticated supervisor connection is active", async () => {
