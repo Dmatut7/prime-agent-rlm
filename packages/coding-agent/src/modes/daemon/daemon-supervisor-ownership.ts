@@ -802,9 +802,16 @@ export async function acquireDaemonShutdownAdmission(
 	}
 }
 
+/**
+ * Read-only probe: reclaiming here would let a bystander delete the record of a holder whose
+ * process identity merely failed to verify, so only acquireDaemonShutdownAdmission removes an
+ * abandoned admission.
+ */
 export async function isDaemonShutdownAdmissionActive(): Promise<boolean> {
 	const registryDir = defaultDaemonSupervisorRegistryDir();
-	return withDaemonSupervisorRegistryGuard(registryDir, () => readActiveShutdownAdmission(registryDir) !== undefined);
+	return withDaemonSupervisorRegistryGuard(registryDir, () =>
+		shutdownAdmissionIsActive(readShutdownAdmission(shutdownAdmissionPath(registryDir))),
+	);
 }
 
 export async function persistDaemonStartupFenceFromOwner(
@@ -1212,7 +1219,11 @@ function readLiveShutdownAdmission(registryDir: string): DaemonShutdownAdmission
 /** Advisory face ("is a shutdown running right now?"): a lapsed lease reads as no. */
 function readActiveShutdownAdmission(registryDir: string): DaemonShutdownAdmissionRecord | undefined {
 	const admission = readLiveShutdownAdmission(registryDir);
-	return admission && Date.parse(admission.expiresAt) > Date.now() ? admission : undefined;
+	return shutdownAdmissionIsActive(admission) ? admission : undefined;
+}
+
+function shutdownAdmissionIsActive(admission: DaemonShutdownAdmissionRecord | undefined): boolean {
+	return admission !== undefined && Date.parse(admission.expiresAt) > Date.now() && isProcessIdentityAlive(admission);
 }
 
 /**

@@ -1364,11 +1364,12 @@ export function protectedShutdownPids(daemons: readonly DaemonInfo[], selection:
 }
 
 /**
- * A stop command's shared state: the accounting it writes into, the gate that
- * decides what may be signalled, and the admission check that has to be re-run
- * before every signal.
+ * A stop command's shared state: the accounting it writes into, the verifier that
+ * proves a target is a daemon before it is signalled, the pids this run already
+ * handled, and the admission renewal every leg owes the ticket before it acts —
+ * the check that has to be re-run before every signal, and before every blocking scan.
  */
-interface ShutdownSweep {
+export interface ShutdownSweep {
 	report: ShutdownReport;
 	verifier: DaemonTargetVerifier;
 	handledPids: Set<number>;
@@ -1781,13 +1782,28 @@ async function stopTrackedWorkersOf(sweep: ShutdownSweep, supervisorSocketPath: 
 	}
 }
 
-async function stopHiddenSupervisors(
+/**
+ * The listener discovery scan a stop loop runs on. It is injected so the loop's own contract —
+ * renewing the ticket before it blocks on the scan — can be driven without forking the real
+ * `ps`/`lsof`/`ss`, and it defaults to the machine-wide scan the command uses.
+ */
+export type ShutdownListenerScan = (selection: StopSelection) => DiscoveredDaemonProcess[];
+
+/**
+ * Stop the same-path daemons a newer daemon replaced: every listener on one socket path that is
+ * not that path's current supervisor is a leftover of a previous generation.
+ */
+export async function stopHiddenSupervisors(
 	sweep: ShutdownSweep,
 	selection: StopSelection,
 	protectedPids: ReadonlySet<number>,
+	scan: ShutdownListenerScan = scopingListeningDaemons,
 ): Promise<void> {
 	while (true) {
-		const listeners = eligibleResidualListeners(sweep, selection, protectedPids);
+		// Renew before the scan: scanListeningDaemons blocks the event loop in synchronous
+		// ps/lsof/ss calls, and the admission lease cannot refresh itself while that runs.
+		await sweep.assertAdmission();
+		const listeners = eligibleResidualListeners(sweep, selection, protectedPids, scan);
 		const bySocket = new Map<string, DiscoveredDaemonProcess[]>();
 		for (const listener of listeners) {
 			const group = bySocket.get(listener.socketPath) ?? [];
@@ -1825,7 +1841,7 @@ async function stopHiddenSupervisors(
 				});
 			}
 		}
-		const afterHidden = scopingListeningDaemons(selection).filter((listener) =>
+		const afterHidden = scan(selection).filter((listener) =>
 			hidden.some((candidate) => candidate.pid === listener.pid && candidate.socketPath === listener.socketPath),
 		);
 		if (afterHidden.length === 0 || daemonListenerSignature(afterHidden) === before) {
@@ -1844,8 +1860,9 @@ function eligibleResidualListeners(
 	sweep: ShutdownSweep,
 	selection: StopSelection,
 	protectedPids: ReadonlySet<number>,
+	scan: ShutdownListenerScan,
 ): DiscoveredDaemonProcess[] {
-	return scopingListeningDaemons(selection).filter(
+	return scan(selection).filter(
 		(listener) =>
 			!protectedPids.has(listener.pid) &&
 			sweep.report.refusalReason(listener.socketPath, listener.pid) === undefined,
@@ -1862,7 +1879,7 @@ async function terminateVerifiedResiduals(
 	const deadline = Date.now() + SHUTDOWN_CONVERGENCE_TIMEOUT_MS;
 	while (true) {
 		await sweep.assertAdmission();
-		const listeners = eligibleResidualListeners(sweep, selection, protectedPids);
+		const listeners = eligibleResidualListeners(sweep, selection, protectedPids, scopingListeningDaemons);
 		const now = Date.now();
 		if (listeners.length === 0) {
 			previousSignature = undefined;
