@@ -19,7 +19,12 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "../messages.js";
-import { completeWithProviderRetry, type ProviderRetryPolicy } from "../provider-retry.js";
+import {
+	completeWithProviderRetry,
+	DEFAULT_PROVIDER_RETRY_POLICY,
+	type ProviderRetryPolicy,
+	providerRetryStreamOptions,
+} from "../provider-retry.js";
 import type { ReadonlySessionManager, SessionEntry } from "../session-manager.js";
 import { estimateTokens, summarizationInflation } from "./compaction.js";
 import {
@@ -377,14 +382,24 @@ export async function generateBranchSummary(
 			timestamp: Date.now(),
 		},
 	];
+	const retryPolicy = retry ?? DEFAULT_PROVIDER_RETRY_POLICY;
 	const response = await completeWithProviderRetry(
 		() =>
 			completeSimple(
 				model,
 				{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-				{ apiKey, headers, sessionId, signal, maxTokens: branchSummaryMaxTokens(model) },
+				{
+					apiKey,
+					headers,
+					sessionId,
+					signal,
+					maxTokens: branchSummaryMaxTokens(model),
+					// Module-wrapped path: the summarization call makes a single provider
+					// attempt and completeWithProviderRetry above owns the retries (and the cap).
+					...providerRetryStreamOptions(retryPolicy),
+				},
 			),
-		{ policy: retry, signal },
+		{ policy: retryPolicy, signal },
 	);
 	if (response.stopReason === "aborted") {
 		return { aborted: true };

@@ -182,7 +182,7 @@ export interface ProviderWaitSettings {
 
 export interface ProviderRetrySettings {
 	timeoutMs?: number; // SDK/provider request timeout in milliseconds
-	maxRetries?: number; // SDK/provider retry attempts
+	maxRetries?: number; // provider-failure retries; the provider-retry module's count (0 disables them), default: retry.maxRetries
 	maxRetryDelayMs?: number; // default: 60000 (max server-requested retry delay before failing; 0 disables the cap)
 	streamStallTimeoutMs?: number; // default: 300000 (5 min with zero stream events => abort + retryable error); 0 disables
 	/** Bounded wait-for-recovery loop for quota exhaustion and provider unavailability. */
@@ -2258,6 +2258,10 @@ export class SettingsManager {
 	} {
 		return {
 			timeoutMs: this.settings.retry?.provider?.timeoutMs,
+			// The merge kept the declared shape but dropped this key from the returned
+			// object, so `retry.provider.maxRetries` was silently a no-op at runtime while
+			// the type still advertised it. It is the number the provider-retry module
+			// uses as its retry count (see providerRetryPolicy).
 			maxRetries: this.settings.retry?.provider?.maxRetries,
 			maxRetryDelayMs: this.settings.retry?.provider?.maxRetryDelayMs ?? 60000,
 			streamStallTimeoutMs: this.settings.retry?.provider?.streamStallTimeoutMs ?? DEFAULT_STREAM_STALL_TIMEOUT_MS,

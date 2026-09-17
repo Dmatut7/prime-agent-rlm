@@ -13,7 +13,11 @@ import { getAgentDir } from "../../config.js";
 import { appendPrivateFile, readPrivateFile, writePrivateFileAtomic } from "../../utils/private-files.js";
 import { serializeConversation } from "../compaction/utils.js";
 import { convertToLlm } from "../messages.js";
-import type { ProviderRetryPolicy } from "../provider-retry.js";
+import {
+	DEFAULT_PROVIDER_RETRY_POLICY,
+	directProviderRetryStreamOptions,
+	type ProviderRetryPolicy,
+} from "../provider-retry.js";
 import type { CustomEntry } from "../session-manager.js";
 
 export const REFINEMENT_CUSTOM_TYPE = "prime-agent.refinement";
@@ -1601,13 +1605,21 @@ export async function planRefinement(
 	// thinking level so the model uses its output budget for the JSON object.
 	void thinkingLevel;
 	void sessionId;
+	// This call has no module layer above it, so the provider client's own retry loop is
+	// this path's outermost layer and gets the policy's count and cap.
 	const response = await completeSimple(
 		model,
 		{
 			systemPrompt: REFINEMENT_SYSTEM_PROMPT,
 			messages: [{ role: "user", content: [{ type: "text", text: userPrompt }], timestamp: Date.now() }],
 		},
-		{ maxTokens: refinementMaxOutputTokens(model), signal, apiKey, headers },
+		{
+			maxTokens: refinementMaxOutputTokens(model),
+			signal,
+			apiKey,
+			headers,
+			...directProviderRetryStreamOptions(options.retry ?? DEFAULT_PROVIDER_RETRY_POLICY),
+		},
 	);
 
 	const text = response.content
@@ -1674,15 +1686,22 @@ ${conversationText}
 	// Auto-refine review requires parseable JSON. Keep it non-reasoning so
 	// reasoning-capable models use final text budget for the JSON object.
 	void thinkingLevel;
-	void retry;
 	void sessionId;
+	// Same shape as planRefinement above: no module layer, so the provider client retries
+	// this path's failures with the policy's count and cap.
 	const response = await completeSimple(
 		model,
 		{
 			systemPrompt: AUTO_REFINE_REVIEW_SYSTEM_PROMPT,
 			messages: [{ role: "user", content: [{ type: "text", text: userPrompt }], timestamp: Date.now() }],
 		},
-		{ maxTokens: autoRefineReviewMaxOutputTokens(model), signal, apiKey, headers },
+		{
+			maxTokens: autoRefineReviewMaxOutputTokens(model),
+			signal,
+			apiKey,
+			headers,
+			...directProviderRetryStreamOptions(retry ?? DEFAULT_PROVIDER_RETRY_POLICY),
+		},
 	);
 	const text = response.content
 		.filter((content): content is { type: "text"; text: string } => content.type === "text")

@@ -11,6 +11,7 @@ import {
 	type AgentMessage,
 	type AgentState,
 	type AgentTool,
+	EMPTY_TURN_RETRY_DEFAULTS,
 	formatToolCallIdCollisions,
 	type GetContinuationMessagesContext,
 	isEmptyTurnRetryExhausted,
@@ -16566,19 +16567,22 @@ export class AgentSession {
 	}
 
 	/**
-	 * Cross-layer request budget for the current request chain: the counter the SDK-level
-	 * retries (through the provider fetch wrapper), the agent loop's in-place resends and
-	 * this session's turn retries all spend from. The ceiling is the product of the
-	 * configured per-layer budgets, which is exactly the envelope the layers used to reach
-	 * by multiplying their independent counters - now shared, so no layer can exceed it.
+	 * Cross-layer request budget for the current request chain: the counter the agent loop's
+	 * in-place resends and this session's turn retries both spend from. The ceiling is the
+	 * module's attempt count times the requests one of its attempts can spend: the session's
+	 * provider layer makes a single attempt (see providerRetryStreamOptions), and the only
+	 * layer that still turns one attempt into several requests is the loop's empty-turn
+	 * resend.
+	 *
+	 * The ceiling used to be the product of *retry counts* from two layers, one of which no
+	 * longer retries - a number that bounded a multiplication that cannot happen any more.
 	 */
 	private _crossLayerRequestBudget(): ProviderRequestBudget {
-		const retrySettings = this.settingsManager.getRetrySettings();
-		const providerSettings = this.settingsManager.getProviderRetrySettings();
-		const sessionAttempts = (retrySettings.enabled ? retrySettings.maxRetries : 0) + 1;
-		// The SDKs default to 2 retries (3 attempts) when nothing is configured.
-		const providerAttempts = (providerSettings.maxRetries ?? 2) + 1;
-		return getProviderRequestBudget(this.sessionId, sessionAttempts * providerAttempts);
+		const policy = providerRetryPolicy(this.settingsManager);
+		const sessionAttempts = (policy.enabled ? policy.maxRetries : 0) + 1;
+		const emptyTurnAttempts =
+			this.settingsManager.getEmptyTurnRetrySettings().maxAttempts ?? EMPTY_TURN_RETRY_DEFAULTS.maxAttempts;
+		return getProviderRequestBudget(this.sessionId, sessionAttempts * Math.max(1, emptyTurnAttempts));
 	}
 
 	private _isFauxProviderQueueExhausted(message: AssistantMessage): boolean {
@@ -16757,14 +16761,15 @@ export class AgentSession {
 			return;
 		}
 		if (!parent) return;
-		const retrySettings = this.settingsManager.getRetrySettings();
+		// The module's own policy: the number the retry loop below actually stops at.
+		const retryPolicy = providerRetryPolicy(this.settingsManager);
 		const attempts = this._terminalFailureAttemptCount;
 		const retrySummary =
 			attempts > 0
-				? retrySettings.enabled && attempts >= retrySettings.maxRetries
+				? retryPolicy.enabled && attempts >= retryPolicy.maxRetries
 					? `auto-retry exhausted after ${attempts} attempt(s)`
 					: `auto-retry stopped after ${attempts} attempt(s)`
-				: retrySettings.enabled
+				: retryPolicy.enabled
 					? "error classified as non-retryable; no retries attempted"
 					: "auto-retry disabled; no retries attempted";
 		const notice = formatSubagentTerminalErrorNotice({
@@ -16831,6 +16836,10 @@ export class AgentSession {
 			return false;
 		}
 
+		// One retry count for the module layer: `retry.provider.maxRetries` (when set) is a
+		// parameter of this policy, not a provider-client option any more, so the loop bound
+		// and the attempt count it reports are the same number the one-shot consumers get.
+		const retryPolicy = providerRetryPolicy(this.settingsManager);
 		const requestBudget = this._crossLayerRequestBudget();
 		// The shared chain is spent: another resend here would exceed the ceiling the
 		// layers agreed on, so the failure surfaces with the count instead. This is the
@@ -16884,7 +16893,7 @@ export class AgentSession {
 			return this._handleProviderWait(message, options, waitPolicy, "usage");
 		}
 
-		if (this._retryAttempt > settings.maxRetries) {
+		if (this._retryAttempt > retryPolicy.maxRetries) {
 			this._markProviderAuthStaleForRetryFailure(message, options);
 			const restoredModel = this._restorePrimaryModelAfterBackup();
 			this._emit({
@@ -16929,7 +16938,7 @@ export class AgentSession {
 			{
 				type: "auto_retry_start",
 				attempt: this._retryAttempt,
-				maxAttempts: settings.maxRetries,
+				maxAttempts: retryPolicy.maxRetries,
 				delayMs: delay.delayMs,
 				errorMessage: message.errorMessage || "Unknown error",
 				// Fork visibility, moved here by the merge (it used to ride in the inline
@@ -17076,7 +17085,7 @@ export class AgentSession {
 			{
 				type: "auto_retry_start",
 				attempt: this._retryAttempt,
-				maxAttempts: this.settingsManager.getRetrySettings().maxRetries,
+				maxAttempts: providerRetryPolicy(this.settingsManager).maxRetries,
 				delayMs: 0,
 				errorMessage: message.errorMessage || "Unknown error",
 				reason: "backup",

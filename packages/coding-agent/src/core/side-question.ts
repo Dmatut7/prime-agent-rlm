@@ -1,5 +1,10 @@
 import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, UserMessage } from "@earendil-works/pi-ai";
+import {
+	DEFAULT_PROVIDER_RETRY_POLICY,
+	directProviderRetryStreamOptions,
+	type ProviderRetryPolicy,
+} from "./provider-retry.js";
 import { unwrapSemanticEdgeStreamFn } from "./semantic-edges.js";
 
 export type SideQuestionStatus = "running" | "complete" | "cancelled" | "error";
@@ -46,6 +51,7 @@ export function startSideQuestion(
 	question: string,
 	onEvent: (event: SideQuestionEvent) => void | Promise<void>,
 	previousTurns: SideQuestionTurn[] = [],
+	retry: ProviderRetryPolicy = DEFAULT_PROVIDER_RETRY_POLICY,
 ): SideQuestionRun {
 	const model = parent.state.model;
 	if (!model) {
@@ -79,6 +85,9 @@ export function startSideQuestion(
 		} satisfies AssistantMessage,
 	]);
 
+	const parentStreamFn = unwrapSemanticEdgeStreamFn(parent.streamFn);
+	const providerRetryOptions = directProviderRetryStreamOptions(retry);
+
 	const sideAgent = new Agent({
 		initialState: {
 			model,
@@ -91,7 +100,11 @@ export function startSideQuestion(
 		convertToLlm: parent.convertToLlm,
 		transformContext: parent.transformContext,
 		// Side questions are excluded from session history; their calls carry no provenance.
-		streamFn: unwrapSemanticEdgeStreamFn(parent.streamFn),
+		// A side question runs its own agent loop and nothing wraps it, so there is no module
+		// layer on this path: the provider client's own retry loop is its outermost layer and
+		// gets the policy's count and cap, instead of the session's single-attempt setting.
+		streamFn: (requestModel, context, options) =>
+			parentStreamFn(requestModel, context, { ...options, ...providerRetryOptions }),
 		getApiKey: parent.getApiKey,
 		onPayload: parent.onPayload,
 		onResponse: parent.onResponse,

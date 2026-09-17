@@ -97,6 +97,7 @@ import {
 } from "../../core/cron-jobs.js";
 import { flushOrphanProcessJournal, ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
+import { providerRetryPolicy } from "../../core/provider-retry.js";
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../../core/rlm-runtime.js";
 import {
 	canPassivateSession,
@@ -4869,6 +4870,9 @@ export class AgentDaemon {
 						}
 					},
 					command.previousTurns,
+					// No module layer wraps a side question: the provider client is its
+					// outermost retry layer and retries per this session's policy.
+					providerRetryPolicy(state.runtime.session.settingsManager),
 				);
 				this.sideQuestionRuns.set(command.sideQuestionId, {
 					run,

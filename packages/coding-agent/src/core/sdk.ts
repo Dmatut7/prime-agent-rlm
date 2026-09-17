@@ -13,6 +13,7 @@ import { McpManager } from "./mcp/mcp-manager.js";
 import { convertToLlm } from "./messages.js";
 import { ModelRegistry } from "./model-registry.js";
 import { findInitialModel } from "./model-resolver.js";
+import { providerRetryPolicy, providerRetryStreamOptions } from "./provider-retry.js";
 import type { ResourceLoader } from "./resource-loader.js";
 import { DefaultResourceLoader } from "./resource-loader.js";
 import { getDefaultSessionDir, SessionManager } from "./session-manager.js";
@@ -274,6 +275,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
+	// One retry layer for the session path. The policy is read once here and used for both
+	// halves of the split: the provider-layer options handed to streamSimple below (cap) and
+	// the module that owns the retries (the AgentSession auto-retry loop, and the one-shot
+	// consumers through providerRetryPolicy).
+	const providerRetry = providerRetryPolicy(settingsManager);
+
 	agent = new Agent({
 		initialState: {
 			systemPrompt: "",
@@ -289,12 +296,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				throw new Error(auth.error);
 			}
 			const providerRetrySettings = settingsManager.getProviderRetrySettings();
+			const providerRetryOptions = providerRetryStreamOptions(providerRetry);
 			return streamSimple(model, context, {
 				...options,
 				apiKey: auth.apiKey,
 				timeoutMs: options?.timeoutMs ?? providerRetrySettings.timeoutMs,
-				maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
-				maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
+				// The session path is module-wrapped (the auto-retry loop below this streamFn
+				// owns the retries), so the client makes a single attempt. A caller that runs
+				// its own loop without a module layer - a side question - passes its count
+				// explicitly (directProviderRetryStreamOptions) and is honored here.
+				maxRetries: options?.maxRetries ?? providerRetryOptions.maxRetries,
+				// The cap is the one provider-layer option that still travels: the fetch wrapper
+				// is the only place a server-requested wait can be refused before the SDK sleeps
+				// through it, and refusing a wait adds no attempt.
+				maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetryOptions.maxRetryDelayMs,
 				headers: auth.headers || options?.headers ? { ...auth.headers, ...options?.headers } : undefined,
 			});
 		},
@@ -328,7 +343,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		followUpMode: settingsManager.getFollowUpMode(),
 		transport: settingsManager.getTransport(),
 		thinkingBudgets: settingsManager.getThinkingBudgets(),
-		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
+		maxRetryDelayMs: providerRetry.maxRetryDelayMs,
 		streamStallTimeoutMs: settingsManager.getProviderRetrySettings().streamStallTimeoutMs,
 		emptyTurnRetry: settingsManager.getEmptyTurnRetrySettings(),
 	});

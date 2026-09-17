@@ -6,6 +6,13 @@ import type { SettingsManager } from "./settings-manager.js";
  * The single retry policy (permanent kinds, Retry-After-aware capped delays),
  * shared by the AgentSession auto-retry loop and the one-shot completion
  * consumers (side questions, compaction, refinement, session summaries).
+ *
+ * Retry rule for every path: a failure is retried exactly once per path, at that path's
+ * outermost layer. A path wrapped by this module passes {@link providerRetryStreamOptions}
+ * to the provider layer (the client makes one attempt, the module retries); a path with no
+ * module layer passes {@link directProviderRetryStreamOptions} (the client's own retry loop
+ * is then the outermost layer and gets the policy's count). Two layers must never retry the
+ * same failure: that spent (1 + client retries) requests per retry the transcript counted.
  */
 export interface ProviderRetryPolicy {
 	enabled: boolean;
@@ -16,10 +23,49 @@ export interface ProviderRetryPolicy {
 }
 
 export function providerRetryPolicy(settingsManager: SettingsManager): ProviderRetryPolicy {
+	const session = settingsManager.getRetrySettings();
+	const provider = settingsManager.getProviderRetrySettings();
 	return {
-		...settingsManager.getRetrySettings(),
-		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
+		enabled: session.enabled,
+		// `retry.provider.maxRetries` used to be the provider SDK client's own retry count.
+		// With one retry layer, the number is a *parameter of this module* instead of a
+		// provider option, so a provider-scoped override still lands on the retries that
+		// actually run. It falls back to the session retry count (`retry.maxRetries`).
+		maxRetries: provider.maxRetries ?? session.maxRetries,
+		baseDelayMs: session.baseDelayMs,
+		maxRetryDelayMs: provider.maxRetryDelayMs,
 	};
+}
+
+/**
+ * Provider-layer options for a path whose retries this module owns.
+ *
+ * The provider layer makes a single attempt (`maxRetries: 0`): the module above owns
+ * every retry, so one failed attempt is exactly one provider request and the counted
+ * retry is the request that was spent - not (1 + provider retries) of them.
+ *
+ * `maxRetryDelayMs` is still handed to the provider layer, because that is the only
+ * place a server-requested wait can be refused *before* the SDK sleeps through it
+ * (`packages/ai/src/providers/retry-cap.ts` for the SDK-backed providers, the Codex
+ * SSE loop natively). Refusing a wait is not a retry: it adds no attempt to the count.
+ */
+export function providerRetryStreamOptions(policy: ProviderRetryPolicy): {
+	maxRetries: number;
+	maxRetryDelayMs: number;
+} {
+	return { maxRetries: 0, maxRetryDelayMs: policy.maxRetryDelayMs };
+}
+
+/**
+ * Provider-layer options for a path with no module layer above it (refinement requests,
+ * side questions). The client's own retry loop is that path's outermost layer, so it gets
+ * the policy's count and cap; `retry.enabled: false` still means a single attempt.
+ */
+export function directProviderRetryStreamOptions(policy: ProviderRetryPolicy): {
+	maxRetries: number;
+	maxRetryDelayMs: number;
+} {
+	return { maxRetries: policy.enabled ? policy.maxRetries : 0, maxRetryDelayMs: policy.maxRetryDelayMs };
 }
 
 /** Local listener/lifecycle crashes are not provider failures; never retry them. */
@@ -98,7 +144,9 @@ export function providerRetryDelay(
 
 /**
  * One-shot completion with the shared retry policy, for consumers outside the
- * AgentSession auto-retry loop (provider SDKs never retry internally).
+ * AgentSession auto-retry loop. Callers pair it with
+ * {@link providerRetryStreamOptions} so the provider layer itself makes a single
+ * attempt and the retries counted here are the only retries that happen.
  */
 export async function completeWithProviderRetry(
 	attemptCompletion: () => Promise<AssistantMessage>,
