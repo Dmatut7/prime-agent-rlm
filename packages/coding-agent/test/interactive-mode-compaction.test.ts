@@ -45,6 +45,8 @@ function createFakeThis(overrides: Record<string, unknown> = {}) {
 		showWarning: vi.fn(),
 		showStatus: vi.fn(),
 		settingsManager: { getShowTerminalProgress: () => false },
+		// compaction_start/end repaint the queue header ("compacting context · N queued").
+		updatePendingMessagesDisplay: vi.fn(),
 		ui: { requestRender: vi.fn(), terminal: { setProgress: vi.fn() } },
 		...overrides,
 	};

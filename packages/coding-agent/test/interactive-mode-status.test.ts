@@ -1301,6 +1301,7 @@ describe("InteractiveMode pending bash components", () => {
 			isRecognizedSlashCommand: (name: string) => name === "compact",
 			getAppKeyDisplay: () => "Ctrl+Q",
 			isAgentStreaming: () => false,
+			isAgentCompacting: () => false,
 			featureHintSuppressedByQueue: false,
 			clearFeatureHintPresentation: vi.fn(),
 		} as unknown as InteractiveMode;
@@ -1336,6 +1337,7 @@ describe("InteractiveMode pending bash components", () => {
 			isRecognizedSlashCommand: () => false,
 			getAppKeyDisplay: () => "Ctrl+Q",
 			isAgentStreaming: () => true,
+			isAgentCompacting: () => false,
 			featureHintSuppressedByQueue: true,
 			clearFeatureHintPresentation: vi.fn(),
 		} as unknown as InteractiveMode;
