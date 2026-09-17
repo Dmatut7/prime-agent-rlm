@@ -310,9 +310,22 @@ const FEATURE_HINT_DELAY_MS = 5_000;
  * disk scan is budgeted but not free, so events coalesce through a debounce and
  * live activity rescans at most once per interval; forced refreshes (turn end)
  * bypass the throttle.
+ *
+ * Measured on real session families (2026-09-17, scanContextTreeChildrenFromDisk
+ * with the default budget, this machine): an ordinary family (4 children,
+ * ~28KiB of transcripts) scans in ~0.5-3ms reading 0.02MiB - far inside the 5s
+ * cadence. Byte-budget-biting families (251 children / 220MiB and 544 children
+ * / 743MiB on disk) scan in ~150-320ms while parsing the 64MiB the budget
+ * allows, warm cache included. A scan slower than the heavy threshold therefore
+ * pushes the cadence floor up to the heavy interval: a busy huge family costs
+ * ~2% duty (320ms/15s) instead of ~6% (320ms/5s), while ordinary families keep
+ * the 5s cadence untouched. The cadence only applies while sub-agent events are
+ * firing; a quiet family schedules nothing and scans nothing.
  */
 const SUBAGENT_SPEND_DEBOUNCE_MS = 500;
 const SUBAGENT_SPEND_MIN_INTERVAL_MS = 5_000;
+const SUBAGENT_SPEND_HEAVY_SCAN_MS = 100;
+const SUBAGENT_SPEND_HEAVY_INTERVAL_MS = 15_000;
 
 export const START_HINTS = [
 	'Try "refactor @<filepath>"',
@@ -1072,9 +1085,15 @@ export class InteractiveMode {
 	private subagentSpendTimerDeadline = 0;
 	/** When the last context-tree scan finished starting (epoch ms); 0 before the first. */
 	private subagentSpendLastScanAt = 0;
+	/** Wall time of the last context-tree scan (ms); 0 before the first. */
+	private subagentSpendLastScanMs = 0;
 	private subagentSpendScanning = false;
 	/** A refresh was requested while a scan was in flight; rerun when it settles. */
 	private subagentSpendRescanRequested = false;
+	/** The pending timer / rerun was asked for by a forced request (turn end). */
+	private subagentSpendRescanForced = false;
+	/** The armed spend-refresh timer was armed by a forced request. */
+	private subagentSpendTimerForced = false;
 	private rlmNodeId: string | undefined;
 	private rosterBar: { summaries(): SessionSummary[]; dispose(): Promise<void> } | undefined;
 
@@ -6226,10 +6245,11 @@ export class InteractiveMode {
 	 * disk-scanning RPC, so it is never awaited in a render path: events schedule
 	 * a scan, the scan lands its figure on the component, and a render follows.
 	 *
-	 * Scheduling: bursts coalesce behind the debounce; a scan that already started
-	 * throttles the next to the min interval (the scan is budgeted, but a busy
-	 * roster still reads real bytes); a forced refresh (turn end) fires
-	 * immediately. Without sub-agents the cell is blank, not ¥0.00.
+	 * Scheduling: a burst gets one leading scan after the debounce; further scans
+	 * hold to the min interval (a heavy last scan backs it off further), so a busy
+	 * roster reads real bytes at most once per interval; a forced refresh (turn
+	 * end) fires immediately, bypassing both. Without sub-agents the cell is
+	 * blank, not ¥0.00, and a quiet family arms no timer at all.
 	 */
 	private scheduleSubagentSpendRefresh(force = false): void {
 		if (this.subagentCounts.total === 0) {
@@ -6238,22 +6258,31 @@ export class InteractiveMode {
 			return;
 		}
 		const now = Date.now();
-		// The throttle cap keeps sustained event bursts from starving the refresh:
-		// a scheduled deadline never sits more than one interval past the last scan.
-		const cap =
-			this.subagentSpendLastScanAt > 0
-				? this.subagentSpendLastScanAt + SUBAGENT_SPEND_MIN_INTERVAL_MS
-				: Number.POSITIVE_INFINITY;
-		const debounce = force ? 0 : SUBAGENT_SPEND_DEBOUNCE_MS;
-		const deadline = Math.min(now + debounce, cap);
+		// Leading debounce: a burst gets one scan ~500ms after it starts. The floor
+		// holds sustained bursts to one scan per interval, and a heavy last scan
+		// backs the interval off (see the constants above), so the worst families
+		// pay for their size in freshness, not in worker event-loop stalls. A
+		// forced request (turn end) bypasses both the debounce and the floor.
+		const interval =
+			this.subagentSpendLastScanMs > SUBAGENT_SPEND_HEAVY_SCAN_MS
+				? SUBAGENT_SPEND_HEAVY_INTERVAL_MS
+				: SUBAGENT_SPEND_MIN_INTERVAL_MS;
+		const deadline = force
+			? now
+			: this.subagentSpendLastScanAt > 0
+				? Math.max(now + SUBAGENT_SPEND_DEBOUNCE_MS, this.subagentSpendLastScanAt + interval)
+				: now + SUBAGENT_SPEND_DEBOUNCE_MS;
 		if (this.subagentSpendTimer !== undefined && this.subagentSpendTimerDeadline <= deadline) return;
 		this.clearSubagentSpendRefresh();
 		this.subagentSpendTimerDeadline = deadline;
+		this.subagentSpendTimerForced = force;
 		this.subagentSpendTimer = setTimeout(
 			() => {
 				this.subagentSpendTimer = undefined;
 				this.subagentSpendTimerDeadline = 0;
-				void this.refreshSubagentSpend();
+				const forced = this.subagentSpendTimerForced;
+				this.subagentSpendTimerForced = false;
+				void this.refreshSubagentSpend(forced);
 			},
 			Math.max(0, deadline - now),
 		);
@@ -6266,7 +6295,9 @@ export class InteractiveMode {
 			this.subagentSpendTimer = undefined;
 		}
 		this.subagentSpendTimerDeadline = 0;
+		this.subagentSpendTimerForced = false;
 		this.subagentSpendRescanRequested = false;
+		this.subagentSpendRescanForced = false;
 	}
 
 	/**
@@ -6274,15 +6305,21 @@ export class InteractiveMode {
 	 * figure (a blank would read as "spent nothing") and never surfaces an error:
 	 * the cell is best-effort, the /context command remains the authoritative view.
 	 */
-	private async refreshSubagentSpend(): Promise<void> {
+	private async refreshSubagentSpend(forced = false): Promise<void> {
 		if (this.subagentSpendScanning) {
+			// A request arrived mid-scan: rerun once it settles, preserving urgency
+			// so a throttled follow-up never delays a turn-end refresh, while event
+			// noise during a slow scan cannot chain back-to-back forced rescans.
 			this.subagentSpendRescanRequested = true;
+			this.subagentSpendRescanForced ||= forced;
 			return;
 		}
 		this.subagentSpendScanning = true;
 		try {
+			const scanStartedAt = Date.now();
 			const tree = await this.agentConnection.getContextTree();
 			this.subagentSpendLastScanAt = Date.now();
+			this.subagentSpendLastScanMs = this.subagentSpendLastScanAt - scanStartedAt;
 			this.subagentSummaryLine.setSubagentSpend(summarizeSubagentSpend(tree, (model) => this.isModelPriced(model)));
 			this.ui.requestRender();
 		} catch {
@@ -6290,8 +6327,10 @@ export class InteractiveMode {
 		} finally {
 			this.subagentSpendScanning = false;
 			if (this.subagentSpendRescanRequested) {
+				const rerunForced = this.subagentSpendRescanForced;
 				this.subagentSpendRescanRequested = false;
-				this.scheduleSubagentSpendRefresh(true);
+				this.subagentSpendRescanForced = false;
+				this.scheduleSubagentSpendRefresh(rerunForced);
 			}
 		}
 	}

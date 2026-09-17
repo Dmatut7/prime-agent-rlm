@@ -567,6 +567,97 @@ describe("subagent spend cell", () => {
 		expect(stripAnsi(content)).toContain("Σ 子代理 ¥4.56 · 12M tok · 总 ¥5.10");
 	});
 
+	it("scans on events only: a quiet family arms no timer and rescans nothing", async () => {
+		vi.useFakeTimers();
+		try {
+			const line = new SubagentSummaryLine();
+			const getContextTree = vi.fn(async () =>
+				tree(usage(1_000, 500, 0.5), [agent("sub-1", usage(2_000, 1_000, 1.2), undefined)]),
+			);
+			const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
+			Object.assign(mode, {
+				subagentSnapshots: new Map<string, AgentConnectionRlmChildAgentSnapshot>(),
+				rlmNodeId: undefined,
+				heartbeatCatalog: [],
+				subagentSummaryLine: line,
+				uiServices: { modelRegistry: { find: vi.fn(() => undefined) } },
+				agentConnection: { getContextTree },
+				updateWorkingPulse: vi.fn(),
+				syncWorkingLoader: vi.fn(),
+				updateWorkingLoaderMessage: vi.fn(),
+				ui: { requestRender: vi.fn() },
+			});
+			const update = Reflect.get(InteractiveMode.prototype, "updateSubagentSummary") as (
+				this: typeof mode,
+				value: AgentConnectionRlmChildAgentSnapshot,
+			) => void;
+
+			// One child event arms the debounce (unrefed: it cannot hold the process
+			// open), which fires exactly one scan.
+			update.call(mode, child("worker", "running"));
+			await vi.advanceTimersByTimeAsync(600);
+			expect(getContextTree).toHaveBeenCalledTimes(1);
+
+			// A quiet minute - no child events, no turn end, no roster callback - must
+			// not rescan: the schedule is event-driven, there is no periodic timer.
+			await vi.advanceTimersByTimeAsync(60_000);
+			expect(getContextTree).toHaveBeenCalledTimes(1);
+
+			// The path is alive, not wedged: the next child event scans again.
+			update.call(mode, child("worker", "done", { activeSessionId: "resident-worker" }));
+			await vi.advanceTimersByTimeAsync(600);
+			expect(getContextTree).toHaveBeenCalledTimes(2);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("backs the cadence off after a heavy scan, keeping the fast cadence for light ones", async () => {
+		vi.useFakeTimers();
+		try {
+			const line = new SubagentSummaryLine();
+			const getContextTree = vi.fn(async () =>
+				tree(usage(1_000, 500, 0.5), [agent("sub-1", usage(2_000, 1_000, 1.2), undefined)]),
+			);
+			const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
+			Object.assign(mode, {
+				subagentSnapshots: new Map<string, AgentConnectionRlmChildAgentSnapshot>(),
+				rlmNodeId: undefined,
+				heartbeatCatalog: [],
+				subagentSummaryLine: line,
+				uiServices: { modelRegistry: { find: vi.fn(() => undefined) } },
+				agentConnection: { getContextTree },
+				subagentSpendLastScanMs: 0,
+				updateWorkingPulse: vi.fn(),
+				syncWorkingLoader: vi.fn(),
+				updateWorkingLoaderMessage: vi.fn(),
+				ui: { requestRender: vi.fn() },
+			});
+			const update = Reflect.get(InteractiveMode.prototype, "updateSubagentSummary") as (
+				this: typeof mode,
+				value: AgentConnectionRlmChildAgentSnapshot,
+			) => void;
+
+			// Light scan (5ms): the next event-driven scan is throttled to 5s.
+			update.call(mode, child("worker", "running"));
+			await vi.advanceTimersByTimeAsync(600);
+			expect(getContextTree).toHaveBeenCalledTimes(1);
+			update.call(mode, child("worker", "running", { activity: { kind: "waiting" } }));
+			await vi.advanceTimersByTimeAsync(4_900);
+			expect(getContextTree).toHaveBeenCalledTimes(2);
+			Reflect.set(mode, "subagentSpendLastScanMs", 320);
+
+			// Heavy last scan: the floor becomes 15s, so 5s of silence must not rescan.
+			update.call(mode, child("worker", "running", { activity: { kind: "executing" } }));
+			await vi.advanceTimersByTimeAsync(14_900);
+			expect(getContextTree).toHaveBeenCalledTimes(2);
+			await vi.advanceTimersByTimeAsync(200);
+			expect(getContextTree).toHaveBeenCalledTimes(3);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("refreshes the cell from the context tree when child updates arrive, and blanks it when they are gone", async () => {
 		const line = new SubagentSummaryLine();
 		const setSpend = vi.spyOn(line, "setSubagentSpend");
