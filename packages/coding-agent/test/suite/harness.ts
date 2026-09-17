@@ -22,6 +22,7 @@ import type { SubagentRuntimeHost } from "../../src/core/rlm-runtime.js";
 import { SessionManager } from "../../src/core/session-manager.js";
 import type { Settings } from "../../src/core/settings-manager.js";
 import { SettingsManager } from "../../src/core/settings-manager.js";
+import type { StallWatchdogTimers } from "../../src/core/stall-watchdog.js";
 import type { JournaledBashFacts, TurnLivenessKernelFacts } from "../../src/core/turn-liveness.js";
 import type { ExtensionFactory, ResourceLoader } from "../../src/index.js";
 import {
@@ -83,6 +84,8 @@ export interface HarnessOptions {
 	serializedRefine?: boolean;
 	initialGoal?: { objective: string; tokenBudget?: number };
 	stallAbortSettleGraceMs?: number;
+	/** Fake-clock timers injected into the session's stall watchdog (deterministic driving). */
+	stallWatchdogTimers?: StallWatchdogTimers;
 	/** Kernel/host liveness facts behind the stall watchdog vouch (see turn-liveness.ts). */
 	stallKernelLivenessFacts?: () => TurnLivenessKernelFacts | undefined;
 	/** Degraded fact source used when the kernel heartbeat is stale or absent. */
@@ -218,6 +221,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		serializedRefine: options.serializedRefine,
 		initialGoal: options.initialGoal,
 		stallAbortSettleGraceMs: options.stallAbortSettleGraceMs,
+		stallWatchdogTimers: options.stallWatchdogTimers,
 		stallKernelLivenessFacts: options.stallKernelLivenessFacts,
 		stallJournaledBashHandles: options.stallJournaledBashHandles,
 		kernelResidencyFacts: options.kernelResidencyFacts,

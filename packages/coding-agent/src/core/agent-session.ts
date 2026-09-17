@@ -356,6 +356,7 @@ import {
 	StallWatchdog,
 	type StallWatchdogOptions,
 	type StallWatchdogStageInfo,
+	type StallWatchdogTimers,
 } from "./stall-watchdog.js";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.js";
 import { THINKING_LEVELS } from "./thinking-levels.js";
@@ -688,6 +689,13 @@ export interface AgentSessionConfig {
 	 * stopped" detection window.
 	 */
 	stallAbortSettleGraceMs?: number;
+	/**
+	 * Timers/clock the stall watchdog runs on. Injectable so tests drive the warn/abort/deferral
+	 * cascade deterministically with a fake clock instead of real 50-100ms thresholds racing a
+	 * loaded runner; defaults to real setTimeout and Date.now. The thresholds themselves still
+	 * come from settings.
+	 */
+	stallWatchdogTimers?: StallWatchdogTimers;
 	/**
 	 * Kernel/host liveness facts behind the stall watchdog's vouch (T1-2/T1-3). Injectable so the
 	 * exemption wiring is testable without a kernel; defaults to this session's ipython kernel
@@ -1941,6 +1949,8 @@ export class AgentSession {
 	private readonly _scheduledAutoRefineTimers = new Set<ReturnType<typeof setTimeout>>();
 	private _stallWatchdog: StallWatchdog | undefined;
 	private readonly _stallAbortSettleGraceMs: number | undefined;
+	/** Injected watchdog timers; undefined means real timers (production). */
+	private readonly _stallWatchdogTimers: StallWatchdogTimers | undefined;
 	/** Aggregates the kernel/host facts the watchdog's vouch samples (T1-3). */
 	private _turnLiveness: TurnLiveness | undefined;
 	private readonly _stallKernelLivenessFacts: (() => TurnLivenessKernelFacts | undefined) | undefined;
@@ -2033,6 +2043,7 @@ export class AgentSession {
 		this._autoRefineReviewer = config.autoRefineReviewer;
 		this._serializedRefine = config.serializedRefine ?? false;
 		this._stallAbortSettleGraceMs = config.stallAbortSettleGraceMs;
+		this._stallWatchdogTimers = config.stallWatchdogTimers;
 		this._stallKernelLivenessFacts = config.stallKernelLivenessFacts;
 		this._stallJournaledBashHandles = config.stallJournaledBashHandles;
 		this._kernelResidencyFacts = config.kernelResidencyFacts;
@@ -4738,6 +4749,7 @@ export class AgentSession {
 			onExemptionEvent: (event) => this._logStallExemptionEvent(event),
 			onStage: (info) => this._handleStallWatchdogStage(info),
 			...(this._stallAbortSettleGraceMs === undefined ? {} : { abortSettleGraceMs: this._stallAbortSettleGraceMs }),
+			...(this._stallWatchdogTimers === undefined ? {} : { timers: this._stallWatchdogTimers }),
 		};
 		return new StallWatchdog(options);
 	}

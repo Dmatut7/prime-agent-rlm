@@ -8,6 +8,16 @@
  * (a stuck model stream must not be excused by a healthy kernel), a throwing fact source degrades
  * to "no exemption" instead of killing the watchdog (F2), and a warn-only watchdog never claims
  * an abort was deferred when there is no abort channel to defer (F3).
+ *
+ * Timing strategy (r42 A3 / r43): every case except the real-clock smoke drives the session's
+ * watchdog through an injected fake clock (`stallWatchdogTimers`), so the warn/abort/deferral
+ * cascade fires deterministically when the clock advances instead of racing real 50/100ms
+ * thresholds against a loaded runner. Kernel facts stay stamped on the real wall clock the
+ * verdict reads: that is the production shape (frames are stamped when they arrive) and the
+ * ordering the r43 fix pinned. Negative windows are the watchdog's own deadlines - the abort
+ * stage runs and defers (its "abort_deferred" log line is that stage's receipt), and every
+ * re-check cycle the deferral schedules is another deadline that an unvouched turn would die
+ * on - so a bare sleep window cannot close before the deadline it was meant to cover.
  */
 
 import type { AgentTool } from "@earendil-works/pi-agent-core";
@@ -17,7 +27,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentSessionEvent } from "../../src/core/agent-session.js";
 import type { KernelLivenessSample } from "../../src/core/kernel/shared.js";
 import type { TurnLivenessKernelFacts } from "../../src/core/turn-liveness.js";
+import { StallFakeClock } from "../fixtures/stall-fake-clock.js";
 import { createHarness, type Harness } from "./harness.js";
+
+const WARN_AFTER_MS = 50;
+const ABORT_AFTER_MS = 100;
+/** Re-check cycles a deferral is driven through: each one re-samples the vouch and could abort. */
+const DEFERRAL_RECHECKS = 20;
 
 const hangTool: AgentTool = {
 	name: "hang_forever",
@@ -133,24 +149,23 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 		);
 	}
 
+	/** The abort deadline the deferral was meant to cover has actually run and deferred. */
+	function expectAbortDeferred(): void {
+		expect(
+			entries.some((entry) => entry.msg === "stall watchdog: exemption abort_deferred"),
+			"the abort stage never ran and deferred, so a closed negative window would prove nothing",
+		).toBe(true);
+	}
+
 	/**
-	 * Negative-window replacement for "no stall_abort": waits for the watchdog's own
-	 * deferral sample instead of a bare sleep window. The abort stage that would
-	 * kill an unvouched turn at abortAfterSeconds logs one "exemption
-	 * abort_deferred" line when it runs and defers, then re-arms at one warn
-	 * window; five more warn windows of quiet after it sample that re-check cycle
-	 * several times. A bare sleep window can close on a loaded runner before the
-	 * abort stage ever ran - proving nothing - so the negative is pinned to the
-	 * event that owns it.
+	 * Event-driven replacement for the old bare post-deferral sleep window. One advance runs the
+	 * warn stage, the abort check that defers, and then `rechecks` deferral re-check cycles - each
+	 * re-check is itself an abort deadline, so the negative assertion is pinned to the deadlines
+	 * that would have killed an unvouched turn, not to wall time a loaded runner can stretch.
 	 */
-	async function waitForDeferredAbort(warnAfterMs: number): Promise<void> {
-		await vi.waitFor(
-			() => {
-				expect(entries.some((entry) => entry.msg === "stall watchdog: exemption abort_deferred")).toBe(true);
-			},
-			{ timeout: 10_000, interval: 20 },
-		);
-		await new Promise((resolve) => setTimeout(resolve, 5 * warnAfterMs));
+	function advanceThroughDeferral(clock: StallFakeClock, warnAfterMs: number, abortAfterMs: number): void {
+		clock.advance(abortAfterMs);
+		clock.advance(DEFERRAL_RECHECKS * warnAfterMs);
 	}
 
 	async function startHungTurn(harness: Harness): Promise<void> {
@@ -163,6 +178,7 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 	}
 
 	it("defers the abort, still warns, and reports the exemption in diagnostics", async () => {
+		const clock = new StallFakeClock();
 		const harness = track(
 			await createHarness({
 				tools: [hangTool],
@@ -171,12 +187,16 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 					retry: { enabled: false },
 				},
 				stallKernelLivenessFacts: () => workingKernelFacts(),
+				stallWatchdogTimers: clock.timersImpl,
 			}),
 		);
 		await startHungTurn(harness);
 
-		const warning = await waitForEvent(harness, (event) => event.type === "stall_warning");
-		if (warning.type !== "stall_warning") throw new Error("unreachable");
+		clock.advance(WARN_AFTER_MS);
+		const warnings = harness.eventsOfType("stall_warning");
+		expect(warnings.length).toBeGreaterThan(0);
+		const warning = warnings[0];
+		if (warning === undefined) throw new Error("unreachable");
 		// The copy tells the truth: no abort deadline that the exemption will not keep.
 		expect(warning.message).toContain("deferred");
 		expect(warning.message).not.toContain("will be aborted automatically");
@@ -189,12 +209,14 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 		// The budget is max(10 x warn, 30min) for the progress tier, so nothing aborts here: the
 		// window that used to kill this turn at 100ms of silence no longer does - and the
 		// deferral sample itself is the proof that the abort stage ran and deferred.
-		await waitForDeferredAbort(50);
+		advanceThroughDeferral(clock, WARN_AFTER_MS, ABORT_AFTER_MS);
+		expectAbortDeferred();
 		expect(harness.eventsOfType("stall_abort")).toEqual([]);
 		expect(harness.eventsOfType("stall_warning").length).toBeGreaterThan(0);
 	});
 
 	it("earns the full tier for a quiet awaited bash() handle, so the existence budget cannot kill it (LIVE-1)", async () => {
+		const clock = new StallFakeClock();
 		const harness = track(
 			await createHarness({
 				tools: [hangTool],
@@ -203,12 +225,16 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 					retry: { enabled: false },
 				},
 				stallKernelLivenessFacts: () => quietAwaitedBashKernelFacts(),
+				stallWatchdogTimers: clock.timersImpl,
 			}),
 		);
 		await startHungTurn(harness);
 
-		const warning = await waitForEvent(harness, (event) => event.type === "stall_warning");
-		if (warning.type !== "stall_warning") throw new Error("unreachable");
+		clock.advance(WARN_AFTER_MS);
+		const warnings = harness.eventsOfType("stall_warning");
+		expect(warnings.length).toBeGreaterThan(0);
+		const warning = warnings[0];
+		if (warning === undefined) throw new Error("unreachable");
 		expect(warning.message).toContain("deferred");
 		// The tier is the fix: existence alone used to buy "liveness", whose twenty-minute
 		// budget aborted `await bash(job)` turns while the job was still running.
@@ -217,7 +243,8 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 		expect(warning.diagnostics.kernel).toMatchObject({ liveBashHandles: 1 });
 
 		// The abort that the unvouched shape would fire at 100ms of silence stays deferred.
-		await waitForDeferredAbort(50);
+		advanceThroughDeferral(clock, WARN_AFTER_MS, ABORT_AFTER_MS);
+		expectAbortDeferred();
 		expect(harness.eventsOfType("stall_abort")).toEqual([]);
 	});
 
@@ -227,6 +254,7 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 		// silence it is charging was explained. A cell that keeps producing new streamed output on
 		// every sample therefore stays uncharged for as long as it produces.
 		let frames = 0;
+		const clock = new StallFakeClock();
 		const harness = track(
 			await createHarness({
 				tools: [hangTool],
@@ -253,12 +281,16 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 						hasActiveExecution: true,
 					};
 				},
+				stallWatchdogTimers: clock.timersImpl,
 			}),
 		);
 		await startHungTurn(harness);
 
-		const warning = await waitForEvent(harness, (event) => event.type === "stall_warning");
-		if (warning.type !== "stall_warning") throw new Error("unreachable");
+		clock.advance(WARN_AFTER_MS);
+		const warnings = harness.eventsOfType("stall_warning");
+		expect(warnings.length).toBeGreaterThan(0);
+		const warning = warnings[0];
+		if (warning === undefined) throw new Error("unreachable");
 		expect(warning.message).toContain("deferred");
 		expect(warning.diagnostics.exemption).toMatchObject({ reason: "vouched", tier: "progress" });
 		// The segment was born at the tool's start event, so by the time the warning fires the
@@ -270,12 +302,16 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 		// Twenty warn windows of a cell that never stops producing: the exemption is still claimed and
 		// still unspent, so nothing escalates. (The cap itself has a 30min floor, which is why the
 		// settled-vs-spent arithmetic is pinned by the fake-clock tests rather than here.)
-		await waitForDeferredAbort(50);
+		advanceThroughDeferral(clock, WARN_AFTER_MS, ABORT_AFTER_MS);
+		expectAbortDeferred();
 		expect(harness.eventsOfType("stall_abort")).toEqual([]);
 		expect(harness.eventsOfType("stall_unsettled")).toEqual([]);
 		expect(frames).toBeGreaterThan(1);
 	});
 
+	// The one real-clock case left in this file (the r42 A3 conversion kept a single smoke): the
+	// full wiring - settings thresholds, real setTimeout, the vouch sampling - with event-driven
+	// positive assertions only. The r43 clock-order fix is what keeps the reason list stable here.
 	it("still aborts a wedged kernel at the ordinary threshold", async () => {
 		const harness = track(
 			await createHarness({
@@ -306,6 +342,7 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 	});
 
 	it("does not excuse a stuck model stream just because the kernel is healthy", async () => {
+		const clock = new StallFakeClock();
 		const harness = track(
 			await createHarness({
 				settings: {
@@ -316,20 +353,26 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 				},
 				stallKernelLivenessFacts: () => workingKernelFacts(),
 				stallAbortSettleGraceMs: 0,
+				stallWatchdogTimers: clock.timersImpl,
 			}),
 		);
 		// A provider step that accepts the request and never streams: no tool is in flight, so the
 		// silence belongs to the model stream and the necessary conjunction must refuse the vouch.
 		harness.setResponses([() => new Promise<never>(() => {})]);
 		void harness.session.prompt("hang the stream");
+		await waitForEvent(harness, (event) => event.type === "agent_start");
 
-		const abort = await waitForEvent(harness, (event) => event.type === "stall_abort");
-		if (abort.type !== "stall_abort") throw new Error("unreachable");
+		clock.advance(ABORT_AFTER_MS);
+		const aborts = harness.eventsOfType("stall_abort");
+		expect(aborts.length).toBeGreaterThan(0);
+		const abort = aborts[0];
+		if (abort === undefined) throw new Error("unreachable");
 		expect(abort.message).toContain("aborted automatically");
 		expect(abort.diagnostics.exemption).toBeUndefined();
 	});
 
 	it("keeps the watchdog alive when the fact source throws (F2)", async () => {
+		const clock = new StallFakeClock();
 		const harness = track(
 			await createHarness({
 				tools: [hangTool],
@@ -341,16 +384,21 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 					throw new Error("kernel client exploded");
 				},
 				stallAbortSettleGraceMs: 0,
+				stallWatchdogTimers: clock.timersImpl,
 			}),
 		);
 		await startHungTurn(harness);
 
 		// An exception inside the predicate used to escape into the watchdog's timer callback and
 		// end escalation silently. It must degrade to "no exemption" and say so once.
-		const warning = await waitForEvent(harness, (event) => event.type === "stall_warning");
-		if (warning.type !== "stall_warning") throw new Error("unreachable");
+		clock.advance(WARN_AFTER_MS);
+		const warnings = harness.eventsOfType("stall_warning");
+		expect(warnings.length).toBeGreaterThan(0);
+		const warning = warnings[0];
+		if (warning === undefined) throw new Error("unreachable");
 		expect(warning.message).toContain("will be aborted automatically");
-		await waitForEvent(harness, (event) => event.type === "stall_abort");
+		clock.advance(ABORT_AFTER_MS - WARN_AFTER_MS);
+		expect(harness.eventsOfType("stall_abort").length).toBeGreaterThan(0);
 		const failures = entries.filter(
 			(entry) => entry.msg === "stall watchdog predicate failed; treating it as no exemption",
 		);
@@ -369,6 +417,7 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 	});
 
 	it("never claims a deferred abort in warn-only mode (F3)", async () => {
+		const clock = new StallFakeClock();
 		const harness = track(
 			await createHarness({
 				tools: [hangTool],
@@ -378,24 +427,30 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 					retry: { enabled: false },
 				},
 				stallKernelLivenessFacts: () => workingKernelFacts(),
+				stallWatchdogTimers: clock.timersImpl,
 			}),
 		);
 		await startHungTurn(harness);
 
-		const warning = await waitForEvent(harness, (event) => event.type === "stall_warning");
-		if (warning.type !== "stall_warning") throw new Error("unreachable");
+		clock.advance(WARN_AFTER_MS);
+		const warnings = harness.eventsOfType("stall_warning");
+		expect(warnings.length).toBeGreaterThan(0);
+		const warning = warnings[0];
+		if (warning === undefined) throw new Error("unreachable");
 		expect(warning.message).not.toContain("deferred");
 		// The exemption is still recorded for the log, just not promised to the user.
 		expect(warning.diagnostics.exemption).toMatchObject({ reason: "vouched" });
-		// Latched negative: warn-only mode (abortAfterSeconds 0) has no abort channel
-		// at all, so "no abort" needs no timing window - two warn windows of settle
-		// cover a misconfiguration, derived from the threshold instead of 500ms.
-		await new Promise((resolve) => setTimeout(resolve, 100));
+		// Latched negative: warn-only mode (abortAfterSeconds 0) has no abort channel at all, so
+		// "no abort" needs no wall-clock window - advancing past the deadline a misconfiguration
+		// would have armed proves no abort timer exists. Deterministic on the fake clock: after
+		// the warn stage there is nothing left to fire.
+		clock.advance(2 * WARN_AFTER_MS);
 		expect(harness.eventsOfType("stall_abort")).toEqual([]);
 	});
 
 	it("falls back to the journaled bash handles when the kernel reports no heartbeat", async () => {
 		const reads: (number | undefined)[] = [];
+		const clock = new StallFakeClock();
 		const harness = track(
 			await createHarness({
 				tools: [hangTool],
@@ -417,12 +472,16 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 					reads.push(kernelPid);
 					return { liveBashHandles: 2 };
 				},
+				stallWatchdogTimers: clock.timersImpl,
 			}),
 		);
 		await startHungTurn(harness);
 
-		const warning = await waitForEvent(harness, (event) => event.type === "stall_warning");
-		if (warning.type !== "stall_warning") throw new Error("unreachable");
+		clock.advance(WARN_AFTER_MS);
+		const warnings = harness.eventsOfType("stall_warning");
+		expect(warnings.length).toBeGreaterThan(0);
+		const warning = warnings[0];
+		if (warning === undefined) throw new Error("unreachable");
 		// The read happened when the tool started, so the first warning can already vouch instead
 		// of promising an abort that the next sampling would defer.
 		expect(reads).toContain(4242);
@@ -434,7 +493,8 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 		// reports the facts (protocol, handles) and leaves the reasons empty.
 		expect(warning.diagnostics.kernel?.reasons).toEqual([]);
 
-		await waitForDeferredAbort(50);
+		advanceThroughDeferral(clock, WARN_AFTER_MS, ABORT_AFTER_MS);
+		expectAbortDeferred();
 		expect(harness.eventsOfType("stall_abort")).toEqual([]);
 		// A journal record proves existence only: the short tier, and the fallback is logged.
 		expect(
@@ -446,6 +506,7 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 	it("reads the journal at the stall stage when the heartbeat goes stale mid-turn", async () => {
 		const reads: (number | undefined)[] = [];
 		let heartbeatAlive = true;
+		const clock = new StallFakeClock();
 		const harness = track(
 			await createHarness({
 				tools: [hangTool],
@@ -471,27 +532,31 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 					reads.push(kernelPid);
 					return { liveBashHandles: 1 };
 				},
+				stallWatchdogTimers: clock.timersImpl,
 			}),
 		);
 		await startHungTurn(harness);
 		// The kernel stops reporting part-way through the turn: from here the journal is the only
 		// source of bash facts, and the stage handler is the only thing left that reads it.
-		// Clock-step compensation can age the 5s-old "previous" frame enough to reach the stale
-		// path one tick early on a loaded runner, so the "no read before stall" proposition is
-		// pinned to the flag flip itself, not the ambient reads list.
+		// The "no read before stall" proposition is pinned to the flag flip itself, not to
+		// ambient reads: the journal reader answers a heartbeat verdict, and the flip is the
+		// only thing that changed it.
 		const readsAtFlip = reads.length;
 		heartbeatAlive = false;
 		expect(readsAtFlip).toBe(0);
 
-		await waitForEvent(harness, (event) => event.type === "stall_warning");
+		clock.advance(200);
+		expect(harness.eventsOfType("stall_warning").length).toBeGreaterThan(0);
 		// The read landed in time for the abort check that follows the warning - the
 		// deferral sample proves that check ran and deferred - so the turn lives.
-		await waitForDeferredAbort(200);
+		advanceThroughDeferral(clock, 200, 400);
+		expectAbortDeferred();
 		expect(reads).toContain(4242);
 		expect(harness.eventsOfType("stall_abort")).toEqual([]);
 	});
 
 	it("honours the settings kill switch", async () => {
+		const clock = new StallFakeClock();
 		const harness = track(
 			await createHarness({
 				tools: [hangTool],
@@ -506,13 +571,17 @@ describe("P0-1c a vouched long cell survives the stall watchdog", () => {
 				},
 				stallKernelLivenessFacts: () => workingKernelFacts(),
 				stallAbortSettleGraceMs: 0,
+				stallWatchdogTimers: clock.timersImpl,
 			}),
 		);
 		await startHungTurn(harness);
 
 		// One line of settings is the documented rollback: facts vouch, the watchdog ignores them.
-		const abort = await waitForEvent(harness, (event) => event.type === "stall_abort");
-		if (abort.type !== "stall_abort") throw new Error("unreachable");
+		clock.advance(ABORT_AFTER_MS);
+		const aborts = harness.eventsOfType("stall_abort");
+		expect(aborts.length).toBeGreaterThan(0);
+		const abort = aborts[0];
+		if (abort === undefined) throw new Error("unreachable");
 		expect(abort.diagnostics.exemption).toBeUndefined();
 	});
 });

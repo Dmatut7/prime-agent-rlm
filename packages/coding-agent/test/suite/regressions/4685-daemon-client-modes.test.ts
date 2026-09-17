@@ -1,5 +1,5 @@
-import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { type ChildProcess, execSync, spawn } from "node:child_process";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
@@ -10,10 +10,14 @@ import type { AutonomousRuntimeState } from "../../../src/core/autonomous.js";
 import type { DaemonSocketClient } from "../../../src/modes/daemon/active-session-state.js";
 import { DaemonClient } from "../../../src/modes/daemon/daemon-client.js";
 import { DaemonSupervisor } from "../../../src/modes/daemon/daemon-supervisor.js";
+import { readRecordedDaemonSocketOwners } from "../../../src/modes/daemon/daemon-supervisor-ownership.js";
 import { waitForHeadlessCompletion } from "../../../src/modes/headless-completion.js";
 import { RpcClient } from "../../../src/modes/rpc/rpc-client.js";
 import { createRpcExtensionUiBridge } from "../../../src/modes/rpc/rpc-extension-ui-context.js";
-import { isolatedSupervisorRegistryEnv } from "../../fixtures/supervisor-registry-isolation.js";
+import {
+	isolatedSupervisorRegistryEnv,
+	SUPERVISOR_REGISTRY_DIR_ENV,
+} from "../../fixtures/supervisor-registry-isolation.js";
 import { createHarness, getAssistantTexts, getUserTexts, type Harness } from "../harness.js";
 
 const fixturePath = resolve(__dirname, "../../fixtures/rpc-connection-mode-fixture.ts");
@@ -24,8 +28,75 @@ const tsxPath = resolve(__dirname, "../../../../../node_modules/tsx/dist/cli.mjs
 const repoTsconfigPath = resolve(__dirname, "../../../../../tsconfig.json");
 const children = new Set<ChildProcess>();
 const harnesses: Harness[] = [];
-const daemonSockets = new Set<string>();
+/** Daemon sockets this file spawned, mapped to the isolated supervisor registry that records their pid. */
+const daemonSockets = new Map<string, string>();
 const tempRoots = new Set<string>();
+
+/** Registry dir the CLI subprocess was pointed at for `agentDir` (mirrors runCli's env). */
+function supervisorRegistryDir(agentDir: string): string {
+	return isolatedSupervisorRegistryEnv(agentDir)[SUPERVISOR_REGISTRY_DIR_ENV];
+}
+
+function isPidAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+function describeProcess(pid: number): string {
+	try {
+		return execSync(`ps -o pid,ppid,command -p ${pid}`, { encoding: "utf8", timeout: 2000 }).trim();
+	} catch {
+		return `pid ${pid} (ps unavailable)`;
+	}
+}
+
+function listTree(root: string): string {
+	const lines: string[] = [];
+	const walk = (directory: string, depth: number) => {
+		let entries: string[];
+		try {
+			entries = readdirSync(directory);
+		} catch {
+			return;
+		}
+		for (const name of entries) {
+			const full = join(directory, name);
+			let kind = "?";
+			let mtime: number | undefined;
+			try {
+				const stats = statSync(full);
+				kind = stats.isDirectory() ? "d" : "f";
+				mtime = stats.mtimeMs;
+			} catch {}
+			lines.push(`${"  ".repeat(depth)}${kind} ${name} mtime=${mtime ?? "?"}`);
+			if (kind === "d" && depth < 5) walk(full, depth + 1);
+		}
+	};
+	walk(root, 0);
+	return lines.join("\n");
+}
+
+/**
+ * The daemon pid that owns `socketPath`, from the isolated supervisor registry the CLI was
+ * pointed at. Read before shutdown is requested: the registry record is the daemon's own
+ * startup claim and is not guaranteed to outlive it.
+ */
+function daemonPidForSocket(socketPath: string, registryDir: string): number | undefined {
+	try {
+		const owners = readRecordedDaemonSocketOwners({
+			...process.env,
+			[SUPERVISOR_REGISTRY_DIR_ENV]: registryDir,
+		});
+		const owner = owners.find((candidate) => candidate.socketPath === socketPath);
+		return owner && owner.pid > 0 ? owner.pid : undefined;
+	} catch {
+		return undefined;
+	}
+}
 
 afterEach(async () => {
 	for (const child of children) {
@@ -37,7 +108,14 @@ afterEach(async () => {
 	while (harnesses.length > 0) {
 		harnesses.pop()?.cleanup();
 	}
-	for (const socketPath of daemonSockets) {
+	for (const [socketPath, registryDir] of daemonSockets) {
+		// The socket file disappearing is NOT the daemon exiting: the supervisor removes
+		// the socket, then flushes its journals and runs exit handlers before process.exit
+		// (measured locally: the process stays alive ~10ms past socket removal, and a
+		// loaded runner stretches that), and its log and registry live inside the temp
+		// root - exactly the writer an rmSync race with ENOTEMPTY needs. So the pid is
+		// read from the registry up front and the wait is for the process itself.
+		const daemonPid = daemonPidForSocket(socketPath, registryDir);
 		const client = new DaemonClient(socketPath);
 		try {
 			await client.connect(500);
@@ -50,10 +128,34 @@ afterEach(async () => {
 		for (let attempt = 0; attempt < 50 && existsSync(socketPath); attempt++) {
 			await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
 		}
+		if (daemonPid !== undefined) {
+			const deadline = Date.now() + 10_000;
+			while (isPidAlive(daemonPid) && Date.now() < deadline) {
+				await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+			}
+			if (isPidAlive(daemonPid)) {
+				// A daemon this test spawned (transitively, via the CLI) that ignores a
+				// shutdown request is a real failure, not cleanup noise: report the pid and
+				// its command line instead of silently racing it with rmSync.
+				throw new Error(
+					`daemon pid ${daemonPid} did not exit after shutdown (socket ${socketPath})\n${describeProcess(daemonPid)}\nregistry: ${registryDir}`,
+				);
+			}
+		}
 	}
 	daemonSockets.clear();
 	for (const root of tempRoots) {
-		rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+		try {
+			rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+		} catch (error) {
+			// Bounded retries already ran (Node retries ENOTEMPTY under maxRetries). If the
+			// tree still changed underneath us after the daemon exited, that is a writer
+			// this suite does not know about: fail loudly with the evidence instead of
+			// swallowing it.
+			throw new Error(
+				`temp root cleanup failed after the daemon exited: ${root}\nremaining tree:\n${listTree(root)}\n${String(error)}`,
+			);
+		}
 	}
 	tempRoots.clear();
 });
@@ -250,7 +352,7 @@ describe("ENG-4685 daemon-backed client modes", () => {
 		tempRoots.add(root);
 		const agentDir = join(root, "agent dir");
 		const socketPath = join(root, "daemon.sock");
-		daemonSockets.add(socketPath);
+		daemonSockets.set(socketPath, supervisorRegistryDir(agentDir));
 		const baseArgs = [
 			"--daemon-socket",
 			socketPath,
@@ -320,7 +422,7 @@ describe("ENG-4685 daemon-backed client modes", () => {
 		const socketPath = join(root, "daemon.sock");
 		const markerPath = join(root, "extension-loads.txt");
 		const extensionPath = join(root, "load-marker.ts");
-		daemonSockets.add(socketPath);
+		daemonSockets.set(socketPath, supervisorRegistryDir(agentDir));
 		writeFileSync(
 			extensionPath,
 			'import { appendFileSync } from "node:fs";\nexport default function() { appendFileSync(process.env.PRIME_AGENT_TEST_EXTENSION_LOAD_MARKER, "loaded\\n"); }\n',
@@ -381,7 +483,7 @@ describe("ENG-4685 daemon-backed client modes", () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-agent-4685-rpc-eof-"));
 		tempRoots.add(root);
 		const socketPath = join(root, "daemon.sock");
-		daemonSockets.add(socketPath);
+		daemonSockets.set(socketPath, supervisorRegistryDir(join(root, "agent")));
 		const result = await runCli(
 			[
 				"--mode",
