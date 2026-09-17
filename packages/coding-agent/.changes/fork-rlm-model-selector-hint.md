@@ -1,0 +1,1 @@
+- Subagent model references now resolve an unambiguous short form (a bare model id) to its full selector, and a rejected reference names the expected `provider/model-id` form plus close matches instead of only saying the model is unavailable.
