@@ -1473,6 +1473,33 @@ class HarnessSearchTest(unittest.TestCase):
                     else:
                         os.environ[name] = previous
 
+    def test_search_keeps_upstream_tokenizer_floors_and_cjk_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_memory("Russian note", "мир и согласие в команде.", id="mir")
+            state.create_memory("Book note", "किताब पढ़ रहा हूँ।", id="book")
+            state.create_memory("Review notes", "The naïve approach failed.", id="naive")
+            state.create_memory("Mixed note", "修复login 混排记录。", id="mixed")
+            state.create_memory("Ext B note", "𠀀𠀁 ideographs recorded.", id="extb")
+            state.create_memory("Short word note", "an ab then abc marker", id="short")
+
+            # Positive controls: each fixture carries a term the same ruler
+            # finds, so the empty results below are a floor talking.
+            self.assertEqual([hit.id for hit in state.search("мир")], ["mir"])
+            self.assertEqual([hit.id for hit in state.search("किताब")], ["book"])
+            self.assertEqual([hit.id for hit in state.search("naïve")], ["naive"])
+            self.assertEqual([hit.id for hit in state.search("𠀀")], ["extb"])
+            self.assertEqual([hit.id for hit in state.search("𠀀𠀁")], ["extb"])
+            self.assertEqual([hit.id for hit in state.search("abc")], ["short"])
+
+            # Runs break only at CJK boundaries, so a mixed query keeps both of
+            # its words instead of shattering into dropped fragments.
+            self.assertEqual([hit.id for hit in state.search("修复login")], ["mixed"])
+
+            # Non-CJK runs need two characters, ASCII runs need three.
+            self.assertEqual(state.search("и"), [])
+            self.assertEqual(state.search("ab"), [])
+
 
 if __name__ == "__main__":
     unittest.main()
