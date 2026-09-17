@@ -16,7 +16,7 @@ _MESSAGE_DISPLAY_MIME = "application/vnd.prime-agent.agent-message+json"
 
 
 async def list_agents() -> dict[str, Any]:
-    """List this agent's parent, siblings, and children, including inactive family."""
+    """List this agent's family in this skill's legacy shape; the same members agent_observe.list_agents() returns."""
     return await host_request("agent_message.list_agents")
 
 
