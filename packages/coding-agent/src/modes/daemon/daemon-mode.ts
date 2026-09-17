@@ -158,7 +158,6 @@ import {
 	workerRosterEntryFromSummary,
 } from "./agent-roster.js";
 import { createCompactAssistantDelta, planCompactAssistantDelta } from "./compact-session-stream.js";
-import { DaemonClient } from "./daemon-client.js";
 import { filterClientEnv, withClientEnv } from "./daemon-client-env.js";
 import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
 import { bindActiveSessionState } from "./daemon-extension-binding.js";
@@ -268,6 +267,7 @@ import {
 	SUPERVISOR_PROBE_TIMEOUT_MS,
 	type SupervisorAvailabilityState,
 } from "./supervisor-availability.js";
+import { SupervisorLink } from "./supervisor-link.js";
 import { writeUpdateRestartManifestFile } from "./update-restart-manifest.js";
 import { WorkerRecoveryJournal } from "./worker-recovery-journal.js";
 
@@ -790,6 +790,15 @@ export class AgentDaemon {
 	private supervisorSocketPathFromEnv(): string | undefined {
 		const raw = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
 		return raw ? normalizeSocketPath(raw) : undefined;
+	}
+
+	/** Persistent supervisor connection for cross-worker requests; one link per daemon process. */
+	private supervisorLinkInstance?: SupervisorLink;
+	private supervisorLink(): SupervisorLink | undefined {
+		const supervisorSocketPath = this.supervisorSocketPathFromEnv();
+		if (!supervisorSocketPath) return undefined;
+		this.supervisorLinkInstance ??= new SupervisorLink({ socketPath: supervisorSocketPath });
+		return this.supervisorLinkInstance;
 	}
 
 	private startSupervisorMonitor(): void {
@@ -5922,12 +5931,10 @@ export class AgentDaemon {
 	 */
 	private async listSupervisorAgentPeers(): Promise<AgentSessionMessageAgentSummary[]> {
 		const supervisorSocketPath = this.supervisorSocketPathFromEnv();
-		if (!this.options.worker || !supervisorSocketPath) return [];
-		const client = new DaemonClient(supervisorSocketPath);
+		const link = this.supervisorLink();
+		if (!this.options.worker || !link || !supervisorSocketPath) return [];
 		try {
-			await client.connect(1000);
-			await client.waitForHello(1000);
-			const response = await client.request(
+			const response = await link.request(
 				{ type: "list_agent_peers", workerToken: this.options.worker.authenticationToken },
 				5000,
 			);
@@ -5937,8 +5944,6 @@ export class AgentDaemon {
 		} catch (error) {
 			this.logAgentDirectoryIncomplete(supervisorSocketPath, error);
 			return [];
-		} finally {
-			client.close();
 		}
 	}
 
@@ -6157,27 +6162,20 @@ export class AgentDaemon {
 	}
 
 	private async setStateSessionNameViaSupervisor(state: ActiveSessionState, name: string): Promise<void> {
-		const supervisorSocketPath = this.supervisorSocketPathFromEnv();
-		if (!this.options.worker || !supervisorSocketPath) {
+		const link = this.supervisorLink();
+		if (!this.options.worker || !link) {
 			return this.setStateSessionName(state, name);
 		}
-		const client = new DaemonClient(supervisorSocketPath);
-		try {
-			await client.connect(1000);
-			await client.waitForHello(1000);
-			const response = await client.request(
-				{
-					type: "set_session_name",
-					activeSessionId: state.activeSessionId,
-					name,
-					workerToken: this.options.worker.authenticationToken,
-				},
-				30_000,
-			);
-			if (!response.success) throw deserializeDaemonError(response);
-		} finally {
-			client.close();
-		}
+		const response = await link.request(
+			{
+				type: "set_session_name",
+				activeSessionId: state.activeSessionId,
+				name,
+				workerToken: this.options.worker.authenticationToken,
+			},
+			30_000,
+		);
+		if (!response.success) throw deserializeDaemonError(response);
 	}
 
 	private setStateSessionNameForCommand(state: ActiveSessionState, name: string): Promise<void> {
@@ -6465,50 +6463,45 @@ export class AgentDaemon {
 		targetSelector: string,
 		message: string,
 	): Promise<AgentSessionMessageReceipt> {
-		const supervisorSocketPath = this.supervisorSocketPathFromEnv();
-		if (!supervisorSocketPath) {
+		const link = this.supervisorLink();
+		if (!link) {
 			throw new Error(`Unknown active session: ${targetSelector}`);
 		}
 		const deadline = Date.now() + 30_000;
-		let client: DaemonClient | undefined;
 		let lastError: unknown;
+		// Connect-window loop only: the supervisor may still be starting up. The
+		// message itself is sent exactly once — daemon commands are not idempotent,
+		// so a rejected or timed-out send must never be retried.
 		while (Date.now() < deadline && !this.shuttingDown) {
-			const candidate = new DaemonClient(supervisorSocketPath);
 			try {
-				await candidate.connect(1000);
-				await candidate.waitForHello(1000);
-				client = candidate;
+				await link.ensureConnected();
+				lastError = undefined;
 				break;
 			} catch (error) {
 				lastError = error;
-				candidate.close();
+				await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
 			}
-			await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
 		}
-		if (!client) {
+		if (lastError !== undefined) {
 			throw lastError instanceof Error ? lastError : new Error(`Unknown active session: ${targetSelector}`);
 		}
-		try {
-			const response = await client.request(
-				{
-					type: "send_message",
-					targetActiveSessionId: targetSelector,
-					message,
-					fromActiveSessionId: fromState.activeSessionId,
-					agentOrigin: true,
-				},
-				30_000,
-			);
-			if (!response.success) {
-				throw deserializeDaemonError(response);
-			}
-			if (!response.data || typeof response.data !== "object") {
-				throw new Error("Supervisor returned an invalid agent-message receipt");
-			}
-			return response.data as AgentSessionMessageReceipt;
-		} finally {
-			client.close();
+		const response = await link.request(
+			{
+				type: "send_message",
+				targetActiveSessionId: targetSelector,
+				message,
+				fromActiveSessionId: fromState.activeSessionId,
+				agentOrigin: true,
+			},
+			30_000,
+		);
+		if (!response.success) {
+			throw deserializeDaemonError(response);
 		}
+		if (!response.data || typeof response.data !== "object") {
+			throw new Error("Supervisor returned an invalid agent-message receipt");
+		}
+		return response.data as AgentSessionMessageReceipt;
 	}
 
 	/**
@@ -7986,6 +7979,7 @@ export class AgentDaemon {
 		this.shuttingDown = true;
 		this.peerAdmissionsFenced = true;
 		this.peerGrants.clear();
+		this.supervisorLinkInstance?.close();
 		if (this.supervisorMonitorTimer) {
 			clearTimeout(this.supervisorMonitorTimer);
 			this.supervisorMonitorTimer = undefined;
