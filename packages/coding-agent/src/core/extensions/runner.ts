@@ -582,7 +582,8 @@ export class ExtensionRunner {
 
 	/**
 	 * Await one handler with a liveness timeout. Errors are isolated unless
-	 * `isolateErrors` is false (`tool_call` keeps fail-safe throw semantics).
+	 * `isolateErrors` is false (`tool_call` keeps fail-safe throw semantics, and
+	 * `session_before_compact` fails the compaction instead of being ignored).
 	 * Timeout skips the handler (or fail-safe-blocks for tool_call). Abort
 	 * unblocks without a user-visible error so interrupt stays quiet.
 	 */
@@ -635,7 +636,14 @@ export class ExtensionRunner {
 		event: unknown,
 		ctx: ExtensionContext,
 	): Promise<unknown> {
-		const invoked = await this.invokeHandler(ext, eventType, handler, event, ctx, true);
+		// `session_before_compact` is a veto hook: swallowing its error reads as "no
+		// opinion" and the compaction then runs on as if the hook had approved it. The
+		// throw is the honest outcome - AgentSession catches it and closes the compaction
+		// as failed, naming the hook error in the transcript notice and the event. A
+		// timeout or an abort still returns quietly (see `invokeHandler`), so a wedged or
+		// interrupted hook keeps the session live instead of failing every compaction.
+		const isolateErrors = eventType !== "session_before_compact";
+		const invoked = await this.invokeHandler(ext, eventType, handler, event, ctx, isolateErrors);
 		return invoked.ok ? invoked.value : undefined;
 	}
 

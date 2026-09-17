@@ -87,9 +87,10 @@
  * against src's own `compactionThresholdTokens`, not a hardcoded figure.
  *
  * A compaction is failed by making the SUMMARIZATION REQUEST fail, not by throwing from
- * the `session_before_compact` hook: `ExtensionRunner.callHandler`
- * (extensions/runner.ts:600-609) swallows handler errors and returns undefined, so a
- * throwing hook silently becomes "no extension compaction" and the real summarizer runs.
+ * the `session_before_compact` hook: a throwing hook now fails the compaction outright
+ * (`ExtensionRunner.callHandler` rethrows for that hook), which would test the hook's
+ * error path instead of the summarizer's. Failing the summarization call itself is what
+ * keeps the summarizer and the valve under test here.
  */
 
 import { writeFileSync } from "node:fs";
@@ -313,12 +314,11 @@ const SUMMARIZER_FAILURE = "summarizer exploded";
 
 /**
  * A faux responder that fails every summarization request and answers every ordinary
- * turn. `ExtensionRunner.callHandler` swallows handler errors (runner.ts:600-609:
- * `invoked.ok ? invoked.value : undefined`), so a throwing `session_before_compact`
- * hook does NOT fail a compaction - the run falls through to the real summarizer call.
- * Failing that call is the honest way to produce a counted compaction failure, and
- * matching on the summarization system prompt keeps the turn responses intact however
- * the requests interleave.
+ * turn. The hook cannot stand in for this: a throwing `session_before_compact` handler
+ * now fails the compaction before the summarizer is ever called, so the counted failure
+ * these valve pins need has to come from the summarization call itself. Matching on the
+ * summarization system prompt keeps the turn responses intact however the requests
+ * interleave.
  */
 function summarizerFailsResponder(answer = "answer") {
 	return (context: Context) =>

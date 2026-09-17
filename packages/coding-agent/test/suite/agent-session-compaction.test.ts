@@ -1,14 +1,22 @@
 import { appendFileSync } from "node:fs";
-import { AgentContinueError, type AgentMessage, type ShouldStopAfterTurnContext } from "@earendil-works/pi-agent-core";
+import {
+	AgentContinueError,
+	type AgentMessage,
+	type AgentTool,
+	type ShouldStopAfterTurnContext,
+} from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
 	fauxAssistantMessage,
+	fauxToolCall,
 	type Model,
 	type ToolResultMessage,
 	type Usage,
 } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SnapshotResult } from "../../src/core/kernel/state-snapshot.js";
+import { isCompactionOutcomeMessage } from "../../src/core/messages.js";
 import { SessionManager } from "../../src/core/session-manager.js";
 import { createHarness, getMessageText, type Harness } from "./harness.js";
 import { createDeferred } from "./scheduling.js";
@@ -64,6 +72,76 @@ function createAssistant(
 
 function failingGateCommand(): string {
 	return `${process.execPath} -e "console.error('gate failed'); process.exit(1)"`;
+}
+
+/**
+ * A wide window with the lowest configurable trigger ratio, so the fill lands in the
+ * threshold band with room on both sides: 250k characters measure ~63.4k estimated tokens
+ * (chars/4), the trigger is 50k, and the whole window is 100k. A tighter band would make
+ * the fixture decide between "over threshold" and "context overflow" on a few hundred
+ * tokens of harness overhead.
+ */
+const OVER_THRESHOLD_CONTEXT_WINDOW = 100_000;
+const OVER_THRESHOLD_TRIGGER_RATIO = 0.5;
+const OVER_THRESHOLD_FILL_OUTPUT = `FILL-MARKER-over-threshold${"x".repeat(250_000)}`;
+/** The hook error the fail-loud pin looks for verbatim. */
+const HOOK_FAILURE = "hook exploded: provider 400 before any work ran";
+
+/** Two turns that leave the transcript over the trigger (compaction still off). */
+const OVER_THRESHOLD_FILL_RESPONSES = [
+	fauxAssistantMessage(fauxToolCall("fill", {}), { stopReason: "toolUse" }),
+	fauxAssistantMessage("fill noted"),
+	fauxAssistantMessage("more noted"),
+];
+
+function overThresholdFillTool(): AgentTool {
+	return {
+		name: "fill",
+		label: "fill",
+		description: "returns text",
+		parameters: Type.Object({}),
+		execute: async () => ({ content: [{ type: "text", text: OVER_THRESHOLD_FILL_OUTPUT }], details: {} }),
+	};
+}
+
+/**
+ * A harness whose transcript one tool result pushes past the compaction trigger, with
+ * compaction off until `fillOverThreshold` switches it on. Driven through the public turn
+ * path throughout - no private member is reached into.
+ */
+async function createOverThresholdHarness(options: { beforeCompact: "throw" | "none" }): Promise<Harness> {
+	return await createHarness({
+		tools: [overThresholdFillTool()],
+		settings: {
+			compaction: {
+				enabled: false,
+				reserveTokens: 500,
+				keepRecentTokens: 1,
+				triggerRatio: OVER_THRESHOLD_TRIGGER_RATIO,
+			},
+		},
+		models: [{ id: "faux-1", contextWindow: OVER_THRESHOLD_CONTEXT_WINDOW }],
+		extensionFactories: [
+			(pi) => {
+				pi.on("session_before_compact", async () => {
+					if (options.beforeCompact === "throw") throw new Error(HOOK_FAILURE);
+					return undefined;
+				});
+			},
+		],
+	});
+}
+
+/** Fill with compaction off, then arm it: the next prompt compacts before its turn. */
+async function fillOverThreshold(harness: Harness): Promise<void> {
+	await harness.session.prompt("run the fill tool");
+	await harness.session.waitForIdle();
+	await harness.session.prompt("note it and move on");
+	await harness.session.waitForIdle();
+	harness.session.setAutoCompactionEnabled(true);
+	// Fixture integrity: the next prompt's pre-turn compaction is the run under test.
+	expect(harness.session.isCompacting).toBe(false);
+	expect(harness.eventsOfType("compaction_start")).toEqual([]);
 }
 
 describe("AgentSession compaction characterization", () => {
@@ -1581,5 +1659,70 @@ describe("AgentSession compaction characterization", () => {
 				content: expect.stringContaining("could not be saved to session history"),
 			}),
 		);
+	});
+
+	// Fail-loud pin: the `session_before_compact` hook is a veto, so a hook that dies
+	// must fail the compaction instead of being swallowed into "no opinion" (which used
+	// to let the summarizer run behind the hook's back). Driven through the public turn
+	// path: the transcript is pushed over the trigger, auto compaction is switched on,
+	// and the next prompt's pre-turn compaction is the run under test.
+	it("fails a threshold compaction loudly when the session_before_compact hook throws", async () => {
+		const harness = await createOverThresholdHarness({ beforeCompact: "throw" });
+		harnesses.push(harness);
+		harness.setResponses([
+			...OVER_THRESHOLD_FILL_RESPONSES,
+			// The pre-turn compaction fails before this turn, and the turn still runs.
+			fauxAssistantMessage("turn after the failed compaction"),
+		]);
+		await fillOverThreshold(harness);
+
+		await harness.session.prompt("next turn");
+
+		expect(harness.eventsOfType("compaction_start").map((event) => event.reason)).toContain("threshold");
+		const ends = harness.eventsOfType("compaction_end");
+		expect(ends.length).toBeGreaterThan(0);
+		for (const end of ends) {
+			// "failed" on this event is the (result, aborted, errorMessage) triple: no
+			// summary, not a user abort, and the hook's own error text.
+			expect(end.reason).toBe("threshold");
+			expect(end.result).toBeUndefined();
+			expect(end.aborted).toBe(false);
+			expect(end.errorMessage).toContain(HOOK_FAILURE);
+		}
+
+		// The notice the user reads in the transcript carries the same string under a
+		// "failed" outcome.
+		const notices = harness.session.messages.filter(isCompactionOutcomeMessage);
+		expect(notices.length).toBeGreaterThan(0);
+		expect(notices[0]?.details).toMatchObject({ reason: "threshold", outcome: "failed" });
+		expect(notices[0]?.content).toContain(HOOK_FAILURE);
+
+		// Fail loud is not fail half-way: nothing was summarized, so the transcript has
+		// no compaction entry at all.
+		expect(harness.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(false);
+	});
+
+	// The control for the pin above: the same harness, the same turn, the same trigger -
+	// only the hook stops throwing - and the compaction goes through the summarizer.
+	it("still compacts from the same trigger when the hook returns no opinion", async () => {
+		const harness = await createOverThresholdHarness({ beforeCompact: "none" });
+		harnesses.push(harness);
+		harness.setResponses([
+			...OVER_THRESHOLD_FILL_RESPONSES,
+			// Two summarizer slots: a split-turn compaction summarizes the turn prefix and
+			// the history in two calls, and which one runs first is the cut point's business.
+			fauxAssistantMessage("summarizer answer"),
+			fauxAssistantMessage("summarizer answer"),
+			fauxAssistantMessage("turn after the compaction"),
+		]);
+		await fillOverThreshold(harness);
+
+		await harness.session.prompt("next turn");
+
+		const ends = harness.eventsOfType("compaction_end");
+		expect(ends.length).toBeGreaterThan(0);
+		expect(ends[0]?.errorMessage).toBeUndefined();
+		expect(ends[0]?.result?.summary).toContain("summarizer answer");
+		expect(harness.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(true);
 	});
 });

@@ -1460,7 +1460,11 @@ function getSessionStatusLabel(summary: SessionSummary, heartbeat?: UnifiedSessi
 		return `${summary.sessionActions.queuedCount} queued`;
 	}
 	if (summary.lifecycle === "archived") {
-		return "archived";
+		// An archived row that carries an error verdict says so. The row is already in the
+		// Inactive section (so "archived" adds nothing) and its recap is the terminal
+		// error text, which leaves the failure the recap is about as the one thing the
+		// row would hide. The other verdicts keep the lifecycle label.
+		return summary.taskState === "error" ? "error" : "archived";
 	}
 	if (summary.hasActiveHeartbeat) {
 		const next = heartbeat?.nextRunAt ? Date.parse(heartbeat.nextRunAt) : Number.NaN;

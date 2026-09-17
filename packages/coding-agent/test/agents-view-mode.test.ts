@@ -893,6 +893,126 @@ describe("AgentsViewMode", () => {
 		expect(self.rebuildRows).toHaveBeenCalledTimes(2);
 	});
 
+	// #2145 residual: the view never had a key that says "expand/collapse" outright.
+	// Right (app.agents.open) reaches it only through openSelected and only while the
+	// composer is empty and the search cursor sits at the end.
+	it("collapses and expands the selected summary row with alt+right", () => {
+		const ALT_RIGHT = "\x1b[1;3C";
+		const buildSelf = (rows: AgentsViewRow[]) => {
+			const expandedSubagentParents = new Set(["root-row"]);
+			const programShownParents = new Set(["root-row"]);
+			const self: Record<string, unknown> = {
+				keybindings: new KeybindingsManager(),
+				renameTarget: undefined,
+				replyTarget: undefined,
+				editor: { getText: () => "", handleInput: vi.fn() },
+				rows,
+				selectedIndex: 0,
+				persistentState: { expandedSubagentParents, programShownParents },
+				expandedSubagentParents,
+				programShownParents,
+				clearStickyStatusMessage: vi.fn(),
+				clearCtrlCExitHint: vi.fn(),
+				clearDeleteConfirmation: vi.fn(),
+				handleListNavigation: () => false,
+				queryChanged: vi.fn(),
+				rebuildRows: vi.fn(),
+				syncSelectedRowState: vi.fn(),
+				ui: { requestRender: vi.fn() },
+				toggleSubagentList(row: AgentsViewRow): void {
+					invoke("toggleSubagentList", self, row);
+				},
+			};
+			return self;
+		};
+
+		const summaryRow = {
+			kind: "subagent-summary",
+			parentIdentity: "root-row",
+			expanded: true,
+		} as unknown as AgentsViewRow;
+		const onSummary = buildSelf([summaryRow]);
+		invoke("handleInput", onSummary, ALT_RIGHT);
+		expect([...(onSummary.expandedSubagentParents as Set<string>)]).toEqual([]);
+		expect(onSummary.rebuildRows).toHaveBeenCalledTimes(1);
+		// The key is an affordance, not composer input.
+		expect((onSummary.editor as { handleInput: ReturnType<typeof vi.fn> }).handleInput).not.toHaveBeenCalled();
+
+		const onRowWithoutSubagents = buildSelf([
+			summary({ id: "plain", sessionId: "plain-session" }) as unknown as AgentsViewRow,
+		]);
+		invoke("handleInput", onRowWithoutSubagents, ALT_RIGHT);
+		expect([...(onRowWithoutSubagents.expandedSubagentParents as Set<string>)]).toEqual(["root-row"]);
+		expect(onRowWithoutSubagents.rebuildRows).not.toHaveBeenCalled();
+		expect(
+			(onRowWithoutSubagents.editor as { handleInput: ReturnType<typeof vi.fn> }).handleInput,
+		).not.toHaveBeenCalled();
+	});
+
+	it("persists no ghost expansion key from the synthetic summary row", () => {
+		const expandedSubagentParents = new Set<string>();
+		const rows = [
+			{
+				kind: "subagent-summary",
+				identity: "subagents:file:/tmp/root.jsonl",
+				parentIdentity: "file:/tmp/root.jsonl",
+				expanded: false,
+				summary: { sessionId: "root-session" },
+			},
+			{ kind: "agent", identity: "file:/tmp/root.jsonl", expanded: true, summary: { sessionId: "root-session" } },
+		] as unknown as AgentsViewRow[];
+		const self: Record<string, unknown> = {
+			persistentState: { pendingExpandedAncestorSessionIds: ["root-session"] },
+			rows,
+			expandedSubagentParents,
+			rebuildRows: vi.fn(),
+		};
+
+		invoke("applyPendingAncestorExpansion", self);
+
+		// Only the session row owns an expansion key: a summary line reuses its parent's
+		// summary, so matching it would persist `subagents:<parent>` for a row that is
+		// not a parent at all.
+		expect([...expandedSubagentParents]).toEqual(["file:/tmp/root.jsonl"]);
+		// One reveal pass for the session row; the summary line adds no second key.
+		expect(self.rebuildRows).toHaveBeenCalledTimes(1);
+	});
+
+	it("merges Enter and Right into one hint naming what both do on the selected row", () => {
+		const renderHintsFor = (row: AgentsViewRow): string => {
+			const self: Record<string, unknown> = {
+				isCtrlCExitHintVisible: () => false,
+				statusMessage: undefined,
+				renameTarget: undefined,
+				replyTarget: undefined,
+				rows: [row],
+				selectedIndex: 0,
+				selectedRowCanShowProgram: () => false,
+			};
+			return stripAnsi(invoke("renderHints", self, 200) as string);
+		};
+
+		const collapsedSummary = renderHintsFor({
+			kind: "subagent-summary",
+			expanded: false,
+			section: "idle",
+		} as unknown as AgentsViewRow);
+		expect(collapsedSummary).toContain("Enter/→ expand");
+		// The old shape printed a second `→ open` hint on every other row kind; on a
+		// summary line Right also collapses/expands, so the merged hint replaces it.
+		expect(collapsedSummary).not.toContain("→ open");
+
+		const expandedSummary = renderHintsFor({
+			kind: "subagent-summary",
+			expanded: true,
+			section: "idle",
+		} as unknown as AgentsViewRow);
+		expect(expandedSummary).toContain("Enter/→ collapse");
+
+		const agentRow = renderHintsFor({ kind: "agent", section: "idle" } as unknown as AgentsViewRow);
+		expect(agentRow).toContain("Enter/→ open");
+	});
+
 	it("renders roster recovery and stale-worker status labels", () => {
 		const rows = buildAgentsViewRows([
 			summary({ id: "recovering", sessionId: "recovering", statusLabel: "recovering" }),

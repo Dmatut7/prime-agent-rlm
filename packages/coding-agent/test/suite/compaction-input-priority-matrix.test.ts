@@ -405,9 +405,9 @@ describe("compaction x input-class admission matrix", () => {
 		/**
 		 * "summary" (default) answers the compaction from the hook. "none" registers no
 		 * hook at all, so the real summarization call runs and the faux response list
-		 * decides whether it succeeds or fails. A hook cannot fail a compaction itself:
-		 * ExtensionRunner.callHandler isolates handler errors and returns undefined, which
-		 * the session reads as "no opinion" and summarizes for real.
+		 * decides whether it succeeds or fails. (A hook cannot stand in for that failure:
+		 * `session_before_compact` handler errors now fail the compaction outright, so a
+		 * throwing hook never reaches the summarizer these rows need.)
 		 */
 		compactionHook?: "summary" | "none";
 		priorityOverAgentMessages?: boolean;
@@ -982,12 +982,12 @@ describe("compaction x input-class admission matrix", () => {
 	});
 
 	it("cooldown: after a failed compaction the next agent message is admitted instead of queueing", async () => {
-		// No `session_before_compact` hook here: a hook cannot fail a compaction (the
-		// extension runner isolates handler errors and the session reads "no opinion"),
-		// so the real summarization call runs and the faux provider answers it with an
-		// error. The cut lands on a turn boundary (the fill ends with two complete
-		// turns), so the summarization makes exactly one call - pinned below by
-		// `compaction_end` having exactly one entry carrying that error.
+		// No `session_before_compact` hook here: this row needs a compaction failure that
+		// comes from the summarizer, and a throwing hook would fail the compaction before
+		// the summarizer ran. The real summarization call runs and the faux provider
+		// answers it with an error. The cut lands on a turn boundary (the fill ends with
+		// two complete turns), so the summarization makes exactly one call - pinned below
+		// by `compaction_end` having exactly one entry carrying that error.
 		const harness = await createMatrixHarness({ bigContext: true, compactionHook: "none" });
 		harness.setResponses([
 			...FILL_RESPONSES,

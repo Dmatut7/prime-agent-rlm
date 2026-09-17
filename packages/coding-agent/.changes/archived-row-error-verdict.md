@@ -1,0 +1,1 @@
+- Changed an archived agents-view row to show its `error` verdict instead of the lifecycle label, so a stopped session whose last turn failed still reads as failed.

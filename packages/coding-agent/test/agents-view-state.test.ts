@@ -1194,6 +1194,23 @@ describe("agents view state", () => {
 		expect(buildAgentsViewRows([makeSummary({ taskState: "error" })])[0]?.statusLabel).toBe("error");
 	});
 
+	// The attached-daemon view shows saved sessions as archived rows (Inactive section),
+	// so a saved row is archived by construction. Its recap is the terminal error text
+	// once the error verdict crosses the saved-session wire - the row must not hide the
+	// failure behind the lifecycle it already lives in.
+	test("shows an archived row's error verdict instead of the lifecycle label", () => {
+		const archivedError = buildAgentsViewRows([makeSummary({ lifecycle: "archived", taskState: "error" })])[0];
+		expect(archivedError?.statusLabel).toBe("error");
+
+		// Control: every other archived row keeps saying what it is.
+		const archivedCompleted = buildAgentsViewRows([
+			makeSummary({ lifecycle: "archived", taskState: "completed" }),
+		])[0];
+		expect(archivedCompleted?.statusLabel).toBe("archived");
+		const archivedNeedsInput = buildAgentsViewRows([makeSummary({ lifecycle: "archived" })])[0];
+		expect(archivedNeedsInput?.statusLabel).toBe("archived");
+	});
+
 	test("does not override saved session cwd when reopening inactive agents", () => {
 		const config: AgentSessionRuntimeConfig = {
 			cwd: "/tmp/dashboard",

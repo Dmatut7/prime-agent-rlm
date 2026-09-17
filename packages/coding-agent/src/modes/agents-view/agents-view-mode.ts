@@ -1012,6 +1012,18 @@ export class AgentsViewMode implements Component, Focusable {
 			this.cycleProgramForSelected();
 			return;
 		}
+		// `app.agents.open` (Right) already collapses/expands a summary row through
+		// `openSelected`, but only when the composer is empty and the search cursor sits
+		// at the end - two conditions that make it an unreliable affordance. This key
+		// says "expand/collapse" outright and is swallowed on rows that have nothing to
+		// expand, so it never falls through to the composer as stray text.
+		if (!this.replyTarget && this.editor.getText().length === 0) {
+			if (this.keybindings.matches(data, "app.agents.expand")) {
+				const row = this.rows[this.selectedIndex];
+				if (row && (row.kind === "subagent-summary" || row.descendantCount > 0)) this.toggleSubagentList(row);
+				return;
+			}
+		}
 		if (!this.replyTarget && this.keybindings.matches(data, "app.agents.open")) {
 			if (this.editor.getText().length === 0 || this.isSearchCursorAtEnd()) {
 				this.openSelected();
@@ -1297,6 +1309,9 @@ export class AgentsViewMode implements Component, Focusable {
 		while (added) {
 			added = false;
 			for (const row of this.rows) {
+				// Summary/code rows reuse their parent's summary; only session rows own expansion keys.
+				// Without this, a revealed summary line persists a `subagents:<parent>` ghost key.
+				if (row.kind !== "agent" && row.kind !== "subagent") continue;
 				if (wanted.has(row.summary.sessionId) && !this.expandedSubagentParents.has(row.identity)) {
 					this.expandedSubagentParents.add(row.identity);
 					added = true;
@@ -2879,10 +2894,13 @@ export class AgentsViewMode implements Component, Focusable {
 		const selectedSummary = selectedRow?.kind === "subagent-summary";
 		const hints = [
 			`${keyText("tui.select.up")}/${keyText("tui.select.down")} move`,
-			selectedSummary
-				? `${keyText("tui.select.confirm")} ${selectedRow?.expanded ? "collapse" : "expand"}`
-				: `${keyText("tui.select.confirm")} open`,
-			selectedSummary ? undefined : `${keyText("app.agents.open")} open`,
+			// Enter and Right run the same action on the selected row (`openSelected`):
+			// collapse/expand on a summary line, open on every other row kind. One merged
+			// hint says both keys - the old shape printed Right only on the rows where it
+			// was not Enter's twin, which read as "Right does nothing here".
+			`${keyText("tui.select.confirm")}/${keyText("app.agents.open")} ${
+				selectedSummary ? (selectedRow?.expanded ? "collapse" : "expand") : "open"
+			}`,
 			selectedAgent
 				? `${keyText("app.agents.reply")} ${selectedRow?.section === "inactive" ? "resume" : "reply"}`
 				: undefined,
