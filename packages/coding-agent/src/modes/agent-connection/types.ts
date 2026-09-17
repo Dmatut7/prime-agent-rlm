@@ -109,7 +109,12 @@ export interface AgentConnectionSavedSessionState {
 
 export interface AgentConnectionAgentStatus {
 	summary: string;
-	taskState?: "needs_input" | "completed";
+	// Includes "error" so the connection layer can carry a transcript-derived
+	// error verdict (upstream #2310). The strictly validated saved-session wire
+	// never emits it yet: serializeSavedSessionInfo downshifts error verdicts and
+	// daemon-client's validator still rejects the value, so old clients are safe
+	// until the daemon protocol takes the enum.
+	taskState?: "needs_input" | "completed" | "error";
 	basedOnMessageCount: number;
 }
 

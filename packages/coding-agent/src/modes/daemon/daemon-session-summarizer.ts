@@ -262,6 +262,34 @@ function isSessionWorking(state: ActiveSessionState): boolean {
 	return session.isSessionActive;
 }
 
+// Recap prefix for a turn that errored; the transcript's own error text follows
+// it so the persisted verdict reports the real last event, never invented work.
+const ERROR_RECAP_PREFIX = "Model request failed";
+// Generous; the agents view truncates recaps further for display.
+const ERROR_RECAP_MAX_CHARS = 160;
+
+/**
+ * Recap for an idle session whose last turn errored, or undefined when the last
+ * turn ended normally (or never produced an assistant message). A turn that
+ * errored produced no final answer, so its verdict must come from the
+ * transcript's error — the classifier would only see the task text and invent
+ * work that never happened.
+ */
+function terminalTurnError(messages: readonly AgentMessage[]): string | undefined {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i]!;
+		if (message.role !== "assistant") {
+			continue;
+		}
+		if (message.stopReason !== "error") {
+			return undefined;
+		}
+		const detail = typeof message.errorMessage === "string" ? message.errorMessage.trim() : "";
+		return detail ? `${ERROR_RECAP_PREFIX}: ${clamp(detail, ERROR_RECAP_MAX_CHARS)}` : ERROR_RECAP_PREFIX;
+	}
+	return undefined;
+}
+
 /**
  * Background status summarization for daemon-hosted sessions, top-level and
  * subagents alike. A periodic sweep refreshes working sessions; debounced
@@ -381,15 +409,57 @@ export class DaemonSessionSummarizer {
 		const messageCount = messages.length;
 		const isWorking = isSessionWorking(state);
 		const previous = state.summaryState;
-		// Idle sessions with a current verdict need no refresh; working sessions
-		// always refresh so the recap keeps up with the in-progress turn.
+		// Idle sessions with a current verdict need no refresh — except a
+		// transcript whose terminal turn errored (owesErrorVerdict below) — while
+		// working sessions always refresh so the recap keeps up with the
+		// in-progress turn.
 		const contentUnchanged = previous?.basedOnMessageCount === messageCount;
 		const owesIdleVerdict = !isWorking && previous?.taskState === undefined;
 		// A blank recap means the model call hasn't succeeded yet (e.g. the
 		// needs_input fallback fired on a transient failure); keep retrying until a
 		// real summary lands so the recap isn't left permanently empty.
 		const owesSummary = !isWorking && !previous?.summary;
-		if (contentUnchanged && !isWorking && !owesIdleVerdict && !owesSummary) {
+		// A turn that errored produced no final answer. Only a real final answer may
+		// earn a completed verdict, so skip the classifier entirely — it sees the
+		// task text with no evidence of the failure and would invent work — and
+		// settle the verdict from the transcript's actual last event instead.
+		// The pass below is synchronous, so no stale-state discard is needed.
+		const turnError = !isWorking ? terminalTurnError(messages) : undefined;
+		// A daemon restart seeds the latest persisted verdict, which pre-fix code
+		// may have fabricated as `completed` for a transcript whose terminal turn
+		// errored at this same message count. Only the error branch below repairs
+		// it, so exempt terminal errors from the unchanged-content fast return.
+		const owesErrorVerdict = turnError !== undefined && previous?.taskState !== "error";
+		if (contentUnchanged && !isWorking && !owesIdleVerdict && !owesSummary && !owesErrorVerdict) {
+			return;
+		}
+		if (turnError !== undefined) {
+			// A transcript-derived verdict settles the session without calling the
+			// summary model, so the retry ladder for failed generations does not
+			// apply and is cleared for a later real turn.
+			this.retryBackoff.delete(id);
+			const status: AgentStatus = {
+				summary: turnError,
+				taskState: "error",
+				basedOnMessageCount: messageCount,
+			};
+			const changed =
+				previous?.summary !== status.summary ||
+				previous?.taskState !== status.taskState ||
+				(!isWorking && previous?.basedOnMessageCount !== status.basedOnMessageCount);
+			state.summaryState = status;
+			// Same persistence discipline as a real classification: a settled idle
+			// verdict, best-effort, never a fabricated fallback. The fast return
+			// above and the journal-side dedupe keep repeated sweeps from growing
+			// the file.
+			try {
+				session.sessionManager.appendAgentStatus(status);
+			} catch {
+				// best-effort; in-memory status still shows
+			}
+			if (changed) {
+				this.onStatusChanged?.(state);
+			}
 			return;
 		}
 		// Waiting out a failing summary model: an owed summary is owed on every pass

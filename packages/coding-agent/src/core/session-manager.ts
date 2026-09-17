@@ -315,7 +315,7 @@ export interface SessionStateEntry extends SessionEntryBase {
 	state: SessionState;
 }
 
-export type AgentTaskState = "needs_input" | "completed";
+export type AgentTaskState = "needs_input" | "completed" | "error";
 
 export interface AgentStatus {
 	summary: string;
