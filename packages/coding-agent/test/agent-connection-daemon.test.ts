@@ -106,6 +106,7 @@ class FakeDaemonClient {
 	rlmChildrenGate: Promise<void> | undefined;
 	abortBashUnknownCommand = false;
 	abortAndClearQueueUnknownCommand = false;
+	abortAndSendQueuedUnknownCommand = false;
 	inputPauseAcquireGate: Promise<void> | undefined;
 	resumeQueueOutcome: "success" | "empty" | "error" = "success";
 	cronAddGate: Promise<void> | undefined;
@@ -339,6 +340,8 @@ class FakeDaemonClient {
 						},
 					},
 				};
+			case "abort":
+				return { type: "response", command: command.type, success: true };
 			case "clear_queue":
 				return {
 					type: "response",
@@ -361,6 +364,16 @@ class FakeDaemonClient {
 					success: true,
 					data: { steering: ["aborted"], followUp: ["cleared"] },
 				};
+			case "abort_and_send_queued":
+				if (this.abortAndSendQueuedUnknownCommand) {
+					return {
+						type: "response",
+						command: command.type,
+						success: false,
+						error: "Unknown daemon command: abort_and_send_queued",
+					};
+				}
+				return { type: "response", command: command.type, success: true };
 			case "acquire_session_input_pause":
 				if (this.inputPauseAcquireGate) await this.inputPauseAcquireGate;
 				return {
@@ -3254,6 +3267,34 @@ describe("DaemonAgentConnection", () => {
 		await expect(connection.abortAndClearQueue()).rejects.toThrow(
 			"the daemon is running an older build; restart the daemon and try again",
 		);
+	});
+
+	it("sends abort_and_send_queued only behind the advertised daemon capability", async () => {
+		// Ported from upstream e2fb7bfa1 (#2426). Two downgrades are pinned:
+		//   (a) capability absent -> fall back to a plain abort, which every daemon has;
+		//   (b) capability advertised but the command answers "Unknown daemon command"
+		//       (a peer that computes its capability list from a newer build than its
+		//       command table) -> same fallback, so a mixed pair degrades instead of failing.
+		// The fallback is deliberately degrade-but-log, not a silent catch: the queued
+		// messages then stay queued, and daemon-agent-connection.ts writes a
+		// daemon-connection diagnostic line for it (P5 ruling, merge-doc SS11.4).
+		const send = (client: FakeDaemonClient) =>
+			new DaemonAgentConnection(asDaemonClient(client), "active-1").abortAndSendQueued();
+
+		const capable = new FakeDaemonClient();
+		capable.serverCapabilities.add("abort_and_send_queued");
+		await expect(send(capable)).resolves.toBeUndefined();
+		expect(capable.requests).toEqual([{ type: "abort_and_send_queued", activeSessionId: "active-1" }]);
+
+		const older = new FakeDaemonClient();
+		await expect(send(older)).resolves.toBeUndefined();
+		expect(older.requests).toEqual([{ type: "abort", activeSessionId: "active-1" }]);
+
+		const stale = new FakeDaemonClient();
+		stale.abortAndSendQueuedUnknownCommand = true;
+		stale.serverCapabilities.add("abort_and_send_queued");
+		await expect(send(stale)).resolves.toBeUndefined();
+		expect(stale.requests.map(({ type }) => type)).toEqual(["abort_and_send_queued", "abort"]);
 	});
 
 	it("fails closed when a daemon disconnect invalidates an input pause", async () => {

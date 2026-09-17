@@ -46,6 +46,7 @@ interface DaemonSchemaSliceSources {
 	command: string;
 	savedSession: string;
 	outbound: string;
+	connectionSavedSession: string;
 	treeWire: string;
 	stallEvent: string;
 	stallDiagnostics: string;
@@ -90,6 +91,15 @@ function readDaemonSchemaSliceSources(): DaemonSchemaSliceSources {
 		outbound: daemonProtocolSource.slice(
 			daemonProtocolSource.indexOf("export type DaemonOutbound ="),
 			daemonProtocolSource.indexOf("export const DAEMON_OUTBOUND_COMPATIBILITY"),
+		),
+		// S-1 (rev38): the connection-facing saved-session DTO mirrors DaemonSavedSessionInfo
+		// on the client side, and upstream's #2148 added its optional `model` field to both.
+		// Only the daemon-side declaration sat inside a hashed slice, so the connection
+		// mirror could gain or lose a field while DAEMON_SCHEMA_ID stayed put - the same
+		// class rev32/33/35/37 closed for the tree, stall, wrapper and envelope families.
+		connectionSavedSession: connectionTypesSource.slice(
+			connectionTypesSource.indexOf("export interface AgentConnectionSavedSessionInfo"),
+			connectionTypesSource.indexOf("export type AgentConnectionSessionListProgress"),
 		),
 		// CM-2: response payload shapes do not live in daemon-protocol.ts (DaemonResponse
 		// types its data as unknown), so hashing only the three request/event slices let
@@ -195,6 +205,7 @@ function daemonSchemaDigest(sources: DaemonSchemaSliceSources): string {
 				sources.command,
 				sources.savedSession,
 				sources.outbound,
+				sources.connectionSavedSession,
 				sources.treeWire,
 				sources.stallEvent,
 				sources.stallDiagnostics,
@@ -286,6 +297,9 @@ describe("daemon protocol helpers", () => {
 		expect(sources.outbound).toContain('type: "daemon_hello";');
 		expect(sources.outbound).toContain('type: "session_snapshot_begin";');
 		expect(sources.outbound).toContain("| CompactAssistantDelta;");
+		expect(sources.connectionSavedSession).toContain("export interface AgentConnectionSavedSessionInfo");
+		expect(sources.connectionSavedSession).toContain("allMessagesText: string;");
+		expect(sources.connectionSavedSession).toContain("usage?: SessionUsageSummary;");
 		expect(sources.stallEvent).toContain('type: "stall_warning"');
 		expect(sources.stallEvent).toContain('type: "stall_unsettled"');
 		expect(sources.stallDiagnostics).toContain("export interface StallDiagnostics");
@@ -409,6 +423,18 @@ describe("daemon protocol helpers", () => {
 				key: "responseEnvelope",
 				apply: (text) =>
 					text.replace("retryAfterMs?: number;", "retryAfterMs?: number;\n\t\t\tprobeAfterMs?: number;"),
+			},
+			{
+				// rev38 / R6: the connection-side saved-session DTO joins the digest. This is the
+				// mutation that guards the new slice - a field added to the mirror must move the
+				// identity, or a mixed old-daemon/new-client pair passes on mismatched rows again.
+				name: "connection saved-session DTO field set (covered since rev38)",
+				key: "connectionSavedSession",
+				apply: (text) =>
+					text.replace(
+						"usage?: SessionUsageSummary;",
+						"usage?: SessionUsageSummary;\n\tmodel?: { provider: string; modelId: string };",
+					),
 			},
 		];
 		expect(mutations.length).toBeGreaterThan(0);
@@ -555,6 +581,27 @@ describe("daemon protocol helpers", () => {
 			capability: "queue_message_mutation",
 		});
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("queue_message_mutation");
+	});
+
+	it("capability- and schema-gates abort-and-send-queued at its merged revision", () => {
+		// Upstream introduced the command at its rev29. That number is not usable here: 27/28/29
+		// each carry one upstream meaning and one fork meaning on the merged lineage (29 = this
+		// fork's response.retryAfterMs), so a rev29 daemon is a fork daemon WITHOUT this command.
+		// Keeping minSchemaRevision 29 would make the version gate a lie - it would admit exactly
+		// the peer that cannot serve the command. The capability stays the primary gate; the
+		// revision only has to be honest. Upstream's own ID for that revision is hand-written
+		// (cf07c5a3f deleted its digest self-check), which is why this fork's digest, not the
+		// number, is what identifies the wire.
+		expect(DAEMON_COMMAND_COMPATIBILITY.abort_and_send_queued).toEqual({
+			minProtocol: 7,
+			minSchemaRevision: 38,
+			capability: "abort_and_send_queued",
+		});
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("abort_and_send_queued");
+		// The default list is the membrane for both first-party lists; pin it here so a future
+		// refactor that stops deriving them from the default list fails loudly.
+		expect(DAEMON_FIRST_PARTY_SESSION_CAPABILITIES).toContain("abort_and_send_queued");
+		expect(DAEMON_COMMAND_PLANE.abort_and_send_queued).toBe("session");
 	});
 
 	it("schema-gates the RLM max depth commands at their introducing revision", () => {
@@ -797,6 +844,32 @@ describe("daemon protocol helpers", () => {
 				omitStreamingMessages: true,
 			}),
 		).toBe("list_without_streaming_messages");
+		// Server-side enforcement for the command this window adds. The declaration set is
+		// normalized against the known-capability set BEFORE this gate ever runs, so a
+		// capability missing from DAEMON_DEFAULT_SERVER_CAPABILITIES would be stripped and the
+		// gate would answer "undefined" (no capability required) - i.e. a declared client could
+		// send the command without declaring anything. Both halves are pinned:
+		expect(normalizeDeclaredCapabilities(["abort_and_send_queued"])).toEqual(["abort_and_send_queued"]);
+		expect(
+			missingDeclaredCommandCapability(true, new Set(["event_sequence"]), {
+				type: "abort_and_send_queued",
+				activeSessionId: "active-1",
+			}),
+		).toBe("abort_and_send_queued");
+		expect(
+			missingDeclaredCommandCapability(true, new Set(["abort_and_send_queued"]), {
+				type: "abort_and_send_queued",
+				activeSessionId: "active-1",
+			}),
+		).toBeUndefined();
+		// An undeclared (legacy) connection keeps the old path: no capability is demanded,
+		// exactly like every other capability-gated command.
+		expect(
+			missingDeclaredCommandCapability(undefined, undefined, {
+				type: "abort_and_send_queued",
+				activeSessionId: "active-1",
+			}),
+		).toBeUndefined();
 	});
 
 	it("keeps attachment routing and pure waits out of the durable mutation journal", () => {

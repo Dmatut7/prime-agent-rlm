@@ -333,6 +333,27 @@ describe("DaemonClient", () => {
 		await expect(request).rejects.toThrow("closed before the operation completed");
 	});
 
+	it("refuses abort_and_send_queued on the pre-jump fork schema revision", async () => {
+		// A fork daemon on revision 29 predates this command by nine numbers and means
+		// response.retryAfterMs there - a different wire under the same number. Gating the
+		// command at 29 would hand it exactly the peer that cannot serve it, so this pins the
+		// merged revision floor and the "nothing goes out on the wire" half of the refusal.
+		const compatibility = DAEMON_COMMAND_COMPATIBILITY.abort_and_send_queued;
+		expect(compatibility.minSchemaRevision).toBe(38);
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, ["abort_and_send_queued"], 29);
+
+		await expect(client.request({ type: "abort_and_send_queued", activeSessionId: "active-1" })).rejects.toThrow(
+			/does not support/,
+		);
+		expect(socket.writes).toEqual([]);
+		client.close();
+	});
+
 	it("isolates a message consumer failure from the rest of the client", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 		const connect = client.connect();

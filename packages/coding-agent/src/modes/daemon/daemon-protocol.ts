@@ -83,9 +83,11 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // merged lineage carries both meanings on the same number, so the number alone
 // no longer identifies the wire; DAEMON_SCHEMA_ID does. Revision 27 is consumed
 // too (the union of both sides' 24/25/26, listed below), so do not reuse 23-27
-// for anything new. The next wire change is revision 28, and its ID must be
-// recomputed over the union wire by the digest assertions in
-// test/daemon-protocol.test.ts, never hand-written.
+// for anything new, and 27 is consumed by the union above. Numbers 30-37 are this
+// fork's (28/29 are the fork's too - see the two blocks below and the collision
+// ledger), 38 is the next free number, and every ID must be recomputed over the
+// merged wire by the digest assertions in test/daemon-protocol.test.ts, never
+// hand-written.
 //   23 fork: omitStreamingMessages on list (LIST_WITHOUT_STREAMING_MESSAGES_COMMAND)
 //   23 upstream: on-demand worker agent-roster pull, list_agent_peers (ceb418049, #1861)
 //   24 fork: renumbered fork merge, carries both rev-23 features (bf542ce7e)
@@ -106,6 +108,26 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 //   25 fork 4044beb7c9f4 | upstream 585ef1102921
 //   26 fork 31fb64b6f4ee | upstream 962b8b4c5e35
 //   27 union of both sides' 24/25/26 (sync-upstream-r3 merge); see S5.1 table in docs/fork/sync-upstream-r3.md
+// Upstream's own 27/28/29 (this fork's lineage never wrote those numbers, so they
+// carry one meaning each upstream and none here). Registered here for the same reason
+// as 23-26: the next sync must be able to tell the two lineages apart by ID.
+//   27 upstream: structured session_recovering failure info for known-but-unaddressable
+//      sessions (844e85545, #2028). Its schema ID is identical to upstream's rev26
+//      (962b8b4c5e35) because DaemonErrorInfo sat outside upstream's three hashed
+//      slices: upstream's number moved and its identity did not. That blind window is
+//      the same class this fork closed for itself in rev32/33/35/37 - our recipe does
+//      move the digest for it, because the response-envelope slice (rev37) spans
+//      DaemonErrorInfo.
+//   28 upstream: last recorded model on saved-session rows (163dd5798, #2148)
+//   29 upstream: capability-gated abort_and_send_queued command (e2fb7bfa1, #2426).
+//      Its schema ID is HAND-WRITTEN: upstream deleted its digest self-check in
+//      cf07c5a3f (#2336), so from that commit on upstream's DAEMON_SCHEMA_ID is not
+//      machine-verifiable (recomputing upstream's own three-slice recipe yields
+//      71a042ac1a62, not a5c9d20f8b13). Treat upstream IDs after cf07c5a3f as
+//      self-reported, never as a value to copy.
+//   27 upstream 962b8b4c5e35 (= upstream rev26's ID, blind window)
+//   28 upstream 92bc5368a082
+//   29 upstream a5c9d20f8b13 (hand-written, not machine-verifiable)
 // Revision 28 adds the rlm_child_stall_activity capability: activity.kind
 //   "stalled", the child.stall facts on rlm_child_update snapshots, and the
 //   stall_unsettled session event (capability-gated, old clients downgrade).
@@ -205,8 +227,26 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 //   DAEMON_SCHEMA_ID unchanged - rev29 added response.retryAfterMs through exactly
 //   that gap, moving the number but not the digest. The envelope now joins the hashed
 //   source; the wire shapes themselves are unchanged and all clients degrade locally.
-export const DAEMON_SCHEMA_REVISION = 37;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-37-f14397289a30";
+// Revision 38 is the merged wire - the first number neither lineage has written.
+//   Upstream's own 29 lands here (its capability-gated abort_and_send_queued
+//   command) on top of this fork's 28-37; 27/28/29 stay unusable because both sides
+//   wrote them, so the block above records both meanings per number. Upstream's own
+//   27 (structured session_recovering failure info) is NOT on this wire: the landing
+//   tree kept DaemonSessionRecoveringError for the supervisor's in-process retry
+//   typing only (daemon-errors.ts class + daemon-supervisor's retry predicate), with
+//   no DaemonErrorInfo row and no serialize/deserialize branch, so no response this
+//   build sends can carry code "session_recovering" and the ledger row above records
+//   upstream's meaning alone. abort_and_send_queued is gated at
+//   38 rather than at upstream's 29: on this lineage a rev29 peer means
+//   response.retryAfterMs and has no such command, so a 29 floor would admit exactly
+//   the peer that cannot serve it. The capability stays the primary gate; the
+//   revision only has to be honest. Upstream's own 28 (the recorded model on
+//   saved-session rows) is deliberately NOT taken: SessionInfo carries no recorded
+//   model on this lineage, so the field would have no producer, which is the failure
+//   mode the 23-27 ledger warns about. It stays off the wire until that face is
+//   ported.
+export const DAEMON_SCHEMA_REVISION = 38;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-38-5847b56f15d5";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -280,7 +320,8 @@ export type DaemonServerCapability =
 	// Supervisor-only: the supervisor hands out short-lived peer-transport tickets
 	// (get_direct_worker_transport). Deliberately not in DAEMON_DEFAULT_SERVER_CAPABILITIES;
 	// see DAEMON_SUPERVISOR_ONLY_SERVER_CAPABILITIES.
-	| "direct_peer_transport";
+	| "direct_peer_transport"
+	| "abort_and_send_queued";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -352,6 +393,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"list_without_streaming_messages",
 	"rlm_child_stall_activity",
 	"control_plane",
+	"abort_and_send_queued",
 ];
 
 /**
@@ -778,6 +820,7 @@ export type DaemonCommand =
 	| { id?: string; type: "agent_messages_resume"; activeSessionId?: string }
 	| { id?: string; type: "agent_messages_clear"; activeSessionId: string }
 	| { id?: string; type: "abort"; activeSessionId: string }
+	| { id?: string; type: "abort_and_send_queued"; activeSessionId: string }
 	| {
 			id?: string;
 			type: "start_side_question";
@@ -1042,6 +1085,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	agent_messages_resume: LEGACY_DAEMON_COMMAND,
 	agent_messages_clear: LEGACY_DAEMON_COMMAND,
 	abort: LEGACY_DAEMON_COMMAND,
+	abort_and_send_queued: { minProtocol: 7, minSchemaRevision: 38, capability: "abort_and_send_queued" },
 	start_side_question: LEGACY_DAEMON_COMMAND,
 	abort_side_question: LEGACY_DAEMON_COMMAND,
 	execute_bash: LEGACY_DAEMON_COMMAND,
@@ -1161,6 +1205,7 @@ export const DAEMON_COMMAND_PLANE = {
 	agent_messages_resume: "control",
 	agent_messages_clear: "control",
 	abort: "session",
+	abort_and_send_queued: "session",
 	start_side_question: "session",
 	abort_side_question: "session",
 	execute_bash: "session",

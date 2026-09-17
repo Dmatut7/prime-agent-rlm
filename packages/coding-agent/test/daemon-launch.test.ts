@@ -439,6 +439,31 @@ describe("ensureInteractiveDaemonRunning", () => {
 		expect(commands).not.toContain("shutdown");
 	});
 
+	it("refuses a busy daemon from the pre-jump schema identity instead of replacing it", async () => {
+		// The merged lineage advertises protocol-7-schema-38-<digest>. A daemon still on the
+		// previous identity (37) is a wire-level mismatch, so judgeDaemonReuse answers
+		// "replace"; with a busy session present the launch path must refuse and name the old
+		// identity instead of killing work. Written against the identity that exists AFTER the
+		// jump: use DAEMON_SCHEMA_ID for "current" and hardcode the previous window's id here,
+		// never the other way around - with the pre-jump tree this test would pass while
+		// proving nothing (see the negative control in the P5-prep evidence).
+		const commands: string[] = [];
+		const daemon = await startFakeDaemon({
+			protocolVersion: DAEMON_PROTOCOL_VERSION,
+			appVersion: VERSION,
+			schemaId: "protocol-7-schema-37-f14397289a30",
+			sessions: [{ id: "active-1", activeSessionId: "active-1", isSessionActive: true }],
+			onCommand: (command) => commands.push(command.type),
+		});
+		cleanups.push(daemon.close);
+
+		await expect(ensureInteractiveDaemonRunning(daemon.socketPath)).rejects.toThrow(
+			"protocol-7-schema-37-f14397289a30",
+		);
+		expect(commands).toContain("list");
+		expect(commands).not.toContain("shutdown");
+	});
+
 	it("does not treat a live daemon as absent when cold startup delays the first connection", async () => {
 		const daemon = await startFakeDaemon({
 			protocolVersion: DAEMON_PROTOCOL_VERSION,

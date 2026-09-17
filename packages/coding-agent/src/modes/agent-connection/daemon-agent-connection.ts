@@ -1332,6 +1332,39 @@ export class DaemonAgentConnection implements AgentConnection {
 		await this.requestOk({ type: "abort", activeSessionId: this.activeSessionId });
 	}
 
+	/**
+	 * Abort the active run and start every queued user steering message in one new turn.
+	 *
+	 * Degradation is loud, not silent (P5 ruling, merge-doc SS11.4): a daemon without
+	 * abort_and_send_queued can only be asked for a plain abort, and the queued messages
+	 * then stay queued. The caller asked for a different outcome and would otherwise
+	 * never learn it got the narrower one, so the fallback logs the same
+	 * daemon-connection diagnostic line the roster degradation uses. The
+	 * abort_and_clear_queue precedent keeps its own shape (a loud refusal) because that
+	 * command answers with visible data while this one's effect is a side effect.
+	 */
+	async abortAndSendQueued(): Promise<void> {
+		if (!this.client.supportsServerCapability("abort_and_send_queued")) {
+			this.logConnection(
+				"abort-and-send-queued degraded: daemon did not advertise the capability; queued messages stay queued",
+			);
+			await this.abort();
+			return;
+		}
+		try {
+			await this.requestOk({ type: "abort_and_send_queued", activeSessionId: this.activeSessionId });
+		} catch (error) {
+			if (isUnknownDaemonCommandError(error, "abort_and_send_queued")) {
+				this.logConnection(
+					"abort-and-send-queued degraded: daemon answered Unknown daemon command; queued messages stay queued",
+				);
+				await this.abort();
+				return;
+			}
+			throw error;
+		}
+	}
+
 	async cancelRlmChild(childId: string): Promise<boolean> {
 		try {
 			const result = await this.requestData<{ cancelled: boolean }>({

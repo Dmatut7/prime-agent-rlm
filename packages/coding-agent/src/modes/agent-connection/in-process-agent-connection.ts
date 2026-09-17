@@ -441,6 +441,10 @@ export class InProcessAgentConnection implements AgentConnection {
 		this.session.requestAbort();
 	}
 
+	async abortAndSendQueued(): Promise<void> {
+		this.session.abortAndSendQueued();
+	}
+
 	async cancelRlmChild(childId: string): Promise<boolean> {
 		return this.session.cancelRlmChildRun(childId);
 	}
