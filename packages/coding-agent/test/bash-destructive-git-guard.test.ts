@@ -7,6 +7,7 @@ import {
 	BASH_DESTRUCTIVE_GIT_BYPASS_ENV,
 	type BashOperations,
 	createBashTool,
+	createBashToolDefinition,
 	isDestructiveGitDiscardCommand,
 } from "../src/core/tools/bash.js";
 
@@ -179,7 +180,7 @@ describe("bash tool destructive-git dirty-tree guard", () => {
 
 	it("lists the dirty paths and both bypasses in the refusal", async () => {
 		initDirtyGitRepo(testDir);
-		const bash = createBashTool(testDir);
+		const bash = createBashTool(testDir, { allowDestructiveGitArgument: true });
 
 		const error = await bash
 			.execute("guard-refusal-text", { command: "git checkout -- ." })
@@ -216,7 +217,7 @@ describe("bash tool destructive-git dirty-tree guard", () => {
 
 	it("bypasses the guard with allowDestructiveGit: true and discards", async () => {
 		initDirtyGitRepo(testDir);
-		const bash = createBashTool(testDir);
+		const bash = createBashTool(testDir, { allowDestructiveGitArgument: true });
 
 		await expect(
 			bash.execute("guard-bypass-arg", { command: "git reset --hard", allowDestructiveGit: true }),
@@ -233,6 +234,49 @@ describe("bash tool destructive-git dirty-tree guard", () => {
 		await expect(bash.execute("guard-bypass-env", { command: "git reset --hard" })).resolves.toBeDefined();
 
 		expect(readModifiedTracked()).toBe("committed\n");
+	});
+
+	it("ignores the allowDestructiveGit argument on the daemon/SDK face", async () => {
+		// Default face: only the env var bypasses, so an unsupervised model
+		// cannot talk the guard open by itself.
+		initDirtyGitRepo(testDir);
+		const bash = createBashTool(testDir);
+
+		await expect(
+			bash.execute("guard-daemon-arg-ignored", { command: "git reset --hard", allowDestructiveGit: true }),
+		).rejects.toThrow(/Refusing to run this destructive git command/);
+
+		expect(readModifiedTracked()).toBe("modified\n");
+	});
+
+	it("hides the allowDestructiveGit parameter from the daemon face schema", () => {
+		const definition = createBashToolDefinition(testDir);
+		expect(Object.keys(definition.parameters.properties)).toEqual(["command", "timeout"]);
+	});
+
+	it("keeps the allowDestructiveGit parameter and bypass on the interactive face", async () => {
+		const definition = createBashToolDefinition(testDir, { allowDestructiveGitArgument: true });
+		expect(Object.keys(definition.parameters.properties)).toContain("allowDestructiveGit");
+
+		initDirtyGitRepo(testDir);
+		const bash = createBashTool(testDir, { allowDestructiveGitArgument: true });
+		await expect(
+			bash.execute("guard-interactive-bypass", { command: "git reset --hard", allowDestructiveGit: true }),
+		).resolves.toBeDefined();
+		expect(readModifiedTracked()).toBe("committed\n");
+	});
+
+	it("names only the env bypass in daemon-face refusals", async () => {
+		initDirtyGitRepo(testDir);
+		const bash = createBashTool(testDir);
+
+		const error = await bash
+			.execute("guard-daemon-message", { command: "git checkout -- ." })
+			.catch((err: Error) => err);
+
+		const message = (error as Error).message;
+		expect(message).toContain(BASH_DESTRUCTIVE_GIT_BYPASS_ENV);
+		expect(message).not.toContain("allowDestructiveGit");
 	});
 
 	it.each(["git add -A", "git add .", "git add --all", "git stash", "git stash push -m wip", "git add -A ."])(
@@ -276,7 +320,7 @@ describe("bash tool destructive-git dirty-tree guard", () => {
 
 	it("bypasses the sweep guard with allowDestructiveGit: true", async () => {
 		initDirtyGitRepo(testDir);
-		const bash = createBashTool(testDir);
+		const bash = createBashTool(testDir, { allowDestructiveGitArgument: true });
 
 		await expect(
 			bash.execute("guard-sweep-bypass-arg", { command: "git add -A", allowDestructiveGit: true }),

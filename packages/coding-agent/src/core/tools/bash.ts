@@ -185,6 +185,13 @@ export interface BashToolOptions {
 	 * timeout. An explicit `timeout <= 0` from the model always means "no limit".
 	 */
 	defaultTimeoutSeconds?: number;
+	/**
+	 * Whether the tool exposes and honors the `allowDestructiveGit` argument
+	 * (the interactive face). Daemon/SDK faces omit the argument and honor only
+	 * the `PI_BASH_ALLOW_DESTRUCTIVE_GIT` env bypass, so an unsupervised model
+	 * cannot talk the guard open by itself.
+	 */
+	allowDestructiveGitArgument?: boolean;
 }
 
 /** Bypass env var for the destructive-git dirty-tree guard. */
@@ -579,7 +586,11 @@ async function probeUncommittedChanges(
 		.map((line) => line.replace(/\r$/, ""));
 }
 
-function formatDirtyTreeRefusal(dirtyPaths: string[], includesIgnoredFiles = false): string {
+function formatDirtyTreeRefusal(
+	dirtyPaths: string[],
+	includesIgnoredFiles = false,
+	allowArgumentBypass = false,
+): string {
 	const listed = dirtyPaths.slice(0, MAX_DIRTY_PATHS_LISTED);
 	const elided = dirtyPaths.length - listed.length;
 	const noun = includesIgnoredFiles ? "uncommitted or ignored file(s)" : "uncommitted change(s)";
@@ -591,16 +602,21 @@ function formatDirtyTreeRefusal(dirtyPaths: string[], includesIgnoredFiles = fal
 	lines.push("");
 	lines.push("Commit, stash, or stage your work first.");
 	lines.push(
-		`To discard these changes intentionally, retry with allowDestructiveGit: true, or set ${BASH_DESTRUCTIVE_GIT_BYPASS_ENV}=1.`,
+		allowArgumentBypass
+			? `To discard these changes intentionally, retry with allowDestructiveGit: true, or set ${BASH_DESTRUCTIVE_GIT_BYPASS_ENV}=1.`
+			: `To discard these changes intentionally, set ${BASH_DESTRUCTIVE_GIT_BYPASS_ENV}=1.`,
 	);
 	return lines.join("\n");
 }
 
-function formatRelocationRefusal(): string {
+function formatRelocationRefusal(allowArgumentBypass = false): string {
+	const bypass = allowArgumentBypass
+		? `retry with allowDestructiveGit: true, or set ${BASH_DESTRUCTIVE_GIT_BYPASS_ENV}=1`
+		: `set ${BASH_DESTRUCTIVE_GIT_BYPASS_ENV}=1`;
 	return [
 		"Refusing to run this destructive git command: it changes directory (or repository) first, and the uncommitted changes of the repository it targets cannot be checked safely.",
 		"",
-		`Run the discard as its own command from the target directory, or retry with allowDestructiveGit: true, or set ${BASH_DESTRUCTIVE_GIT_BYPASS_ENV}=1.`,
+		`Run the discard as its own command from the target directory, or ${bypass}.`,
 	].join("\n");
 }
 
@@ -782,21 +798,32 @@ export function createBashToolDefinition(
 		defaultTimeoutSeconds > 0
 			? `Commands time out after ${defaultTimeoutSeconds}s unless a different timeout (seconds) is passed; timeout: 0 disables the timeout.`
 			: "Optionally provide a timeout in seconds; there is no default timeout.";
+	const allowArgumentBypass = options?.allowDestructiveGitArgument === true;
+	const bypassHint = allowArgumentBypass
+		? "retry with allowDestructiveGit: true only when it is intentional"
+		: `set ${BASH_DESTRUCTIVE_GIT_BYPASS_ENV}=1 only when it is intentional`;
+	const parameters: typeof bashSchema = allowArgumentBypass
+		? Type.Object({
+				command: Type.String({ description: "Bash command to execute" }),
+				timeout: Type.Optional(Type.Number({ description: describeTimeout(defaultTimeoutSeconds) })),
+				allowDestructiveGit: Type.Optional(
+					Type.Boolean({
+						description:
+							"Skip the dirty-tree guard for destructive git commands (discards and shared-worktree sweeps). Only set when discarding or sweeping uncommitted work is intentional.",
+					}),
+				),
+			})
+		: (Type.Object({
+				command: Type.String({ description: "Bash command to execute" }),
+				timeout: Type.Optional(Type.Number({ description: describeTimeout(defaultTimeoutSeconds) })),
+			}) as typeof bashSchema);
+
 	const definition: ToolDefinition<typeof bashSchema, BashToolDetails | undefined, BashRenderState> = {
 		name: "bash",
 		label: "bash",
-		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. ${timeoutHint} Child processes run with a sanitized environment - a fixed child-safe whitelist (PATH, HOME, TZ, locale, agent routing keys), not the full parent env - so set variables inside the command itself (\`VAR=value cmd\`) or have the user export PRIME_AGENT_ENV_PASSTHROUGH=NAME1,NAME2 to forward specific names. Destructive git discard commands (git checkout -- ., git checkout ., git clean -f..., git reset --hard, git restore .) and shared-worktree sweeps (git add -A, git add ., git stash) are refused while uncommitted changes exist; retry with allowDestructiveGit: true only when it is intentional.`,
+		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. ${timeoutHint} Child processes run with a sanitized environment - a fixed child-safe whitelist (PATH, HOME, TZ, locale, agent routing keys), not the full parent env - so set variables inside the command itself (\`VAR=value cmd\`) or have the user export PRIME_AGENT_ENV_PASSTHROUGH=NAME1,NAME2 to forward specific names. Destructive git discard commands (git checkout -- ., git checkout ., git clean -f..., git reset --hard, git restore .) and shared-worktree sweeps (git add -A, git add ., git stash) are refused while uncommitted changes exist; ${bypassHint}.`,
 		promptSnippet: "Execute bash commands (ls, grep, find, etc.)",
-		parameters: Type.Object({
-			command: Type.String({ description: "Bash command to execute" }),
-			timeout: Type.Optional(Type.Number({ description: describeTimeout(defaultTimeoutSeconds) })),
-			allowDestructiveGit: Type.Optional(
-				Type.Boolean({
-					description:
-						"Skip the dirty-tree guard for destructive git commands (discards and shared-worktree sweeps). Only set when discarding or sweeping uncommitted work is intentional.",
-				}),
-			),
-		}),
+		parameters,
 		async execute(
 			_toolCallId,
 			{
@@ -821,7 +848,10 @@ export function createBashToolDefinition(
 			const discardIndices = findDestructiveGitDiscardCommands(resolvedCommand);
 			if (
 				discardIndices.length > 0 &&
-				allowDestructiveGit !== true &&
+				// The argument bypass belongs to the interactive face only
+				// (allowDestructiveGitArgument); daemon/SDK faces honor just the env
+				// var so an unsupervised model cannot talk the guard open by itself.
+				!(allowArgumentBypass && allowDestructiveGit === true) &&
 				// This tree sanitizes shell-child env to a fixed whitelist, so a
 				// user-exported bypass never reaches spawnContext.env; the parent
 				// process env is where a human actually sets it.
@@ -839,7 +869,7 @@ export function createBashToolDefinition(
 				for (const index of discardIndices) {
 					const target = resolveDiscardProbeTarget(resolvedCommand, index, userCommandStart);
 					if (target === UNRESOLVABLE_DISCARD_TARGET) {
-						throw new Error(formatRelocationRefusal());
+						throw new Error(formatRelocationRefusal(allowArgumentBypass));
 					}
 					const relocationPrefix = target?.relocationPrefix ?? "";
 					const gitStatus = target?.gitStatusCommand ?? GIT_STATUS_PORCELAIN_COMMAND;
@@ -868,7 +898,7 @@ export function createBashToolDefinition(
 						effectiveTimeout,
 					);
 					if (dirtyPaths && dirtyPaths.length > 0) {
-						throw new Error(formatDirtyTreeRefusal(dirtyPaths, probe.includesIgnoredFiles));
+						throw new Error(formatDirtyTreeRefusal(dirtyPaths, probe.includesIgnoredFiles, allowArgumentBypass));
 					}
 				}
 			}

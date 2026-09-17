@@ -54,7 +54,10 @@ function createReplayBuiltInToolDefinition(
 	}
 	switch (toolName) {
 		case "bash": {
-			const builtInDefinition = createBashToolDefinition(cwd);
+			// Interactive face: the replayed built-in keeps the allowDestructiveGit
+			// argument (schema entry included, matching what interactive sessions
+			// recorded); daemon/SDK faces stay env-bypass-only.
+			const builtInDefinition = createBashToolDefinition(cwd, { allowDestructiveGitArgument: true });
 			return matchesBuiltInReplayMetadata(toolName, toolDefinition) ? builtInDefinition : undefined;
 		}
 		case "edit": {
