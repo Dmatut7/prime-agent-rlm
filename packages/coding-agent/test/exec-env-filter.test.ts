@@ -57,6 +57,24 @@ describe("shell child env filtering", () => {
 		expect(env.PATH).toBeTruthy();
 	});
 
+	it("children receive non-interactive terminal defaults over inherited settings", async () => {
+		vi.stubEnv("EDITOR", "vim");
+		vi.stubEnv("PAGER", "less");
+		const dir = tempDir("exec-env-ni-");
+
+		const result = await execCommand(
+			"/bin/sh",
+			["-c", 'echo "$GIT_EDITOR|$GIT_SEQUENCE_EDITOR|$GIT_TERMINAL_PROMPTS|$SSH_ASKPASS_REQUIRE"'],
+			dir,
+			{},
+		);
+
+		expect(result.code).toBe(0);
+		// stdin is ignored for exec children, so an inherited EDITOR must not
+		// survive into the child: an interactive editor would hang the shell.
+		expect(result.stdout).toContain("true|true|0|never");
+	});
+
 	it("forwards names opted in through PRIME_AGENT_ENV_PASSTHROUGH", async () => {
 		vi.stubEnv("PRIME_AGENT_ENV_PASSTHROUGH", "SERPER_API_KEY");
 		vi.stubEnv("SERPER_API_KEY", "serper-secret-xyz");

@@ -130,3 +130,40 @@ describe("shell child env keeps routing and opt-out names", () => {
 		expect(env.PATH).toBeTruthy();
 	});
 });
+
+describe("getShellEnv non-interactive defaults", () => {
+	afterEach(() => {
+		vi.unstubAllEnvs();
+	});
+
+	it("sets non-interactive defaults for agent-spawned shells", () => {
+		const env = getShellEnv();
+		// Agent shells never have a usable stdin, so interactive prompts (git
+		// commit without -m opening $EDITOR, credential asks, pagers) can only
+		// hang; these defaults make them fail fast or no-op.
+		expect(env.GIT_EDITOR).toBe("true");
+		expect(env.GIT_SEQUENCE_EDITOR).toBe("true");
+		expect(env.GIT_TERMINAL_PROMPTS).toBe("0");
+		expect(env.GIT_ASKPASS).toBe("true");
+		expect(env.SSH_ASKPASS_REQUIRE).toBe("never");
+		expect(env.EDITOR).toBe("true");
+		expect(env.VISUAL).toBe("true");
+		expect(env.PAGER).toBe("cat");
+		expect(env.GIT_PAGER).toBe("cat");
+		expect(env.DEBIAN_FRONTEND).toBe("noninteractive");
+	});
+
+	it("overrides inherited terminal settings instead of honoring them", () => {
+		vi.stubEnv("EDITOR", "vim");
+		vi.stubEnv("PAGER", "less");
+		vi.stubEnv("GIT_SEQUENCE_EDITOR", "vim");
+		const env = getShellEnv();
+		// stdin is never a TTY for agent shells, so an inherited EDITOR/PAGER is
+		// exactly the hang this guard prevents; it must be replaced, not kept.
+		expect(env.EDITOR).toBe("true");
+		expect(env.PAGER).toBe("cat");
+		// GIT_SEQUENCE_EDITOR outranks GIT_EDITOR for `git rebase -i`, so an
+		// inherited value would still hang the interactive todo editor.
+		expect(env.GIT_SEQUENCE_EDITOR).toBe("true");
+	});
+});

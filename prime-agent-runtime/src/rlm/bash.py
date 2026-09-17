@@ -830,9 +830,38 @@ def _passthrough_env() -> dict[str, str]:
 
 
 def _child_env() -> dict[str, str]:
+    """Environment for kernel-spawned shell commands.
+
+    Same non-interactive guard as the host shell env
+    (packages/coding-agent/src/utils/shell.ts sanitizedChildEnv, which also
+    feeds getShellEnv): agent shell commands have no usable stdin, so
+    interactive prompts (git commit without -m opening $EDITOR, credential
+    asks, pagers) can only hang. Fail fast or no-op instead. Deliberately
+    overrides inherited terminal settings - a passthrough EDITOR=vim is
+    exactly the hang this prevents; a per-command inline assignment
+    (`GIT_EDITOR=vim git commit`) still wins because it replaces the
+    exported value for that command.
+    """
     env = {key: value for key in _CHILD_SAFE_ENV if (value := os.environ.get(key)) is not None}
     env.update(_passthrough_env())
-    env.update({"NO_COLOR": "1", "TERM": "dumb", "CLICOLOR": "0", "FORCE_COLOR": "0"})
+    env.update(
+        {
+            "NO_COLOR": "1",
+            "TERM": "dumb",
+            "CLICOLOR": "0",
+            "FORCE_COLOR": "0",
+            "GIT_EDITOR": "true",
+            "GIT_SEQUENCE_EDITOR": "true",
+            "GIT_TERMINAL_PROMPTS": "0",
+            "GIT_ASKPASS": "true",
+            "SSH_ASKPASS_REQUIRE": "never",
+            "EDITOR": "true",
+            "VISUAL": "true",
+            "PAGER": "cat",
+            "GIT_PAGER": "cat",
+            "DEBIAN_FRONTEND": "noninteractive",
+        }
+    )
     return env
 
 
