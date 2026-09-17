@@ -1047,6 +1047,45 @@ describe("AuthStorage", () => {
 			expect(raw).toBe("{invalid-json");
 		});
 
+		test.each([
+			["an array", "[]"],
+			["a string", '"x"'],
+			["null", "null"],
+		])("rejects %s auth file instead of silently treating it as a store", (_shape, rawContent) => {
+			writeAuthJson({
+				anthropic: { type: "api_key", key: "anthropic-key" },
+			});
+
+			authStorage = AuthStorage.create(authJsonPath);
+			writeFileSync(authJsonPath, rawContent, "utf-8");
+
+			authStorage.reload();
+
+			const errors = authStorage.drainErrors();
+			expect(errors.length).toBeGreaterThan(0);
+			expect(errors[0]?.message).toContain("Invalid auth storage");
+			// The last good store survives: malformed bytes must not read as "no credentials".
+			expect(authStorage.get("anthropic")).toEqual({ type: "api_key", key: "anthropic-key" });
+
+			// A disk-authoritative removal refuses loudly instead of reporting a no-op success.
+			expect(() => authStorage.removeVerified("anthropic")).toThrow(/Invalid auth storage/);
+		});
+
+		test("a well-formed auth file still loads and writes unchanged", () => {
+			writeAuthJson({
+				anthropic: { type: "api_key", key: "anthropic-key" },
+			});
+
+			authStorage = AuthStorage.create(authJsonPath);
+			authStorage.set("openai", { type: "api_key", key: "openai-key" });
+
+			expect(authStorage.drainErrors()).toHaveLength(0);
+			expect(authStorage.get("anthropic")).toEqual({ type: "api_key", key: "anthropic-key" });
+			expect(JSON.parse(readFileSync(authJsonPath, "utf-8"))).toEqual({
+				anthropic: { type: "api_key", key: "anthropic-key" },
+				openai: { type: "api_key", key: "openai-key" },
+			});
+		});
 		test("removeVerified deletes from disk and memory", () => {
 			writeAuthJson({
 				"mcp:remote": { type: "api_key", key: "token" },
