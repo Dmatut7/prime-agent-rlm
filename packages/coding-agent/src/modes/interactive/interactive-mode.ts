@@ -1195,7 +1195,7 @@ export class InteractiveMode {
 	// U2: trailing consecutive errored tool results; a success resets it.
 	private consecutiveToolErrors = 0;
 	private agentMessagesExpanded = false;
-	private editDiffsExpanded = false;
+	private editDiffsExpanded = true;
 
 	private hideThinkingBlock = false;
 	private readonly mermaidMarkdownTransform = createMermaidMarkdownTransform({
