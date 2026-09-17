@@ -15,6 +15,7 @@
 
 | 日期 | 这轮干了什么 |
 |---|---|
+| 2026-09-17 深夜³ | **吸收审查回炉两笔**：db3c6cc32 回补 `streamProxy` 的 maxRetryDelayMs 转发（公开 SDK 面静默丢字段，非 daemon 内部链路——全仓无内部调用者，注释按实测写；新 pin 走公开入口+stub fetch，agent 包 108 绿）、5184b9e66 补 #2215「空 extension summary=普通分支移动」针（变异正控红/净树 51 绿）。**溯源补记**（审查 A ①）：0f02b089f(#2336-C7)、c09bdd358 与 06260455d(#2153) 三笔提交说明未注明上游出处，上游对应 cf07c5a3f / 4f4d51c5b，行为等价性已由审查 A 逐行确认 | 
 | 2026-09-17 深夜² | **效果增益第三批**：93a53ef69 `harness.search` 排序查询 API（内核 Python 面，CJK 双字组/标点安全/limit/无命中五例钉死，f30fd9fa9 补 tokenizer 下限与 CJK 边界 pin）、c09bdd358 名册两入口合一（`agent_message.list_agents` 转调 family catalog，旧入口保留不报错，两入口同输出钉死）；验证 agent-observe 8/8、test_harness 60/60、钩子全绿 | 
 | 2026-09-17 深夜 | **上游合并 P1 路径级摘取六簇落地**（e7b647d81 providers/oauth、6031c788d daemon/kernel utils、1bfb35d0b interactive/tui 组件、5d7ff1de4 干净面绿色测试、84c4a46af provider docs、2ee067a20 benchmarks/evals/PR-template 资产）：机制=路径级 take（`git checkout upstream/main -- <paths>`），实测零冲突零触碰我方改过文件，不拿族（mcp 目录/native 车道/onboarding/UI 简化族/#2336 删测）一笔未碰；**效果增益两笔**：7cb6e8b6c #2226（kernel 侧文件编辑进压缩摘要，`<modified-files>` 从恒空变有内容，200 封顶）与 05c60d6eb #2215（goal 记账跨摘要单调，预算门不再被分支重建重开），两笔均带模型可见面改前→改后对照正控 | 
 | 2026-09-17 夜³ | **内核面 sweep 族入脏树守卫**：`prime-agent-runtime/src/rlm/bash.py` 把 `git add -A/--all/-A .`（根 pathspec）与裸 `git stash`（list/pop/apply/drop/clear/branch/show/-h 除外）纳入拒绝族，复用丢弃族 matcher 与 env bypass 口径；38 测试（含反向钉：定向 `git add -A docs/` 放行、stash 子命令放行）+ 回归 104/104 + 净树复验 38/38 + runtime 全量 432 仅基线既有的真网络 MCP error。至此内核面丢弃族+sweep 族均工具层机械化 | 
