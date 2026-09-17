@@ -159,6 +159,8 @@ interface SupervisorMonitorHarness {
 	canConnectToSupervisor: (socketPath: string) => Promise<boolean>;
 	launchReplacementSupervisor: (socketPath: string) => Promise<void>;
 	scheduleSupervisorAvailabilityCheck: (socketPath: string, delayMs: number) => void;
+	/** Settles when the armed availability check ran to completion or was disarmed. */
+	supervisorAvailabilityCheckSettled?: Promise<void>;
 }
 
 interface DeferredRecoveryWorker {
@@ -1202,34 +1204,28 @@ describe("daemon worker supervisor monitoring", () => {
 
 	it("keeps a healthy unauthenticated supervisor on the slow recheck tier", async () => {
 		vi.useFakeTimers();
-		// One waiter per probe: the round's shutdown-admission lookup reads the
-		// registry off the fake clock, so each round needs a real-time yield to finish.
-		const probeWaiters: Array<() => void> = [];
-		const probeSeen = () =>
-			new Promise<void>((resolve) => {
-				probeWaiters.push(resolve);
-			});
-		const firstProbe = probeSeen();
-		const daemon = createHarness(async () => {
-			probeWaiters.shift()?.();
-			return true;
-		});
+		const daemon = createHarness(async () => true);
 
 		daemon.scheduleSupervisorAvailabilityCheck("/tmp/supervisor.sock", 1500);
+		const firstRound = daemon.supervisorAvailabilityCheckSettled;
 		await vi.advanceTimersByTimeAsync(1500);
-		await firstProbe;
+		// Upstream #2336 (F1): this test used to wait on a probe promise with no deadline. When
+		// the round's real chain (registry read, socket probe) needed one more clock push than the
+		// test happened to give it, that await ran into vitest's 30s test timeout instead of
+		// failing. The armed check's own settle is the signal that the round - and the reschedule
+		// it performed - is done, so nothing here guesses at pushes or probes.
+		await firstRound;
 		expect(daemon.canConnectToSupervisor).toHaveBeenCalledOnce();
 
 		// A socket that answers is not an authenticated claim: the round stays armed,
 		// but on the slow tier — one probe a minute, not the old 5s busy poll.
 		await vi.advanceTimersByTimeAsync(SUPERVISOR_RECHECK_MAX_MS - 1_000);
 		expect(daemon.canConnectToSupervisor).toHaveBeenCalledOnce();
-		const secondProbe = probeSeen();
+		const secondRound = daemon.supervisorAvailabilityCheckSettled;
 		await vi.advanceTimersByTimeAsync(1_000);
-		await secondProbe;
+		await secondRound;
 		expect(daemon.canConnectToSupervisor).toHaveBeenCalledTimes(2);
-		// The round reschedules its next slow-tier tick after the probe resolves.
-		await vi.advanceTimersByTimeAsync(0);
+		// The round reschedules its next slow-tier tick before it settles.
 		expect(daemon.supervisorMonitorTimer).toBeDefined();
 	});
 
@@ -1246,18 +1242,28 @@ describe("daemon worker supervisor monitoring", () => {
 			probeCount += 1;
 			return result;
 		});
-		// Drive the fake clock until the expected number of probes have run; one
-		// advance alone does not flush the availability check chain (the admission
-		// lookup reads the registry off the fake clock).
-		const advanceUntilProbes = async (expected: number) => {
-			for (let step = 0; probeCount < expected && step < 500; step++) {
-				await vi.advanceTimersByTimeAsync(100);
+		/**
+		 * Run the armed round to its own settle. The round sleeps on the fake clock between its
+		 * probe attempts, so the clock is advanced in that step while the settle — not a probe
+		 * count and not a probe promise — is the termination condition.
+		 */
+		const runArmedRound = async () => {
+			const armed = daemon.supervisorAvailabilityCheckSettled;
+			let settled = false;
+			void armed?.then(() => {
+				settled = true;
+			});
+			for (let step = 0; step < 40 && !settled; step++) {
+				await vi.advanceTimersByTimeAsync(250);
 			}
-			expect(probeCount).toBe(expected);
+			if (!settled) {
+				throw new Error("the armed supervisor availability check never settled");
+			}
 		};
 
 		daemon.scheduleSupervisorAvailabilityCheck("/tmp/supervisor.sock", 1500);
-		await advanceUntilProbes(4);
+		await runArmedRound();
+		expect(probeCount).toBe(4);
 		expect(daemon.launchReplacementSupervisor).toHaveBeenCalledOnce();
 		// The replacement answering mid-launch restarts the orphan window...
 		expect(daemon.supervisorAvailabilityState.supervisorAbsentSince).toBeUndefined();
@@ -1265,12 +1271,50 @@ describe("daemon worker supervisor monitoring", () => {
 		// instead of orphaning the worker if the replacement exits unclaimed.
 		expect(daemon.supervisorMonitorTimer).toBeDefined();
 
-		await advanceUntilProbes(8);
+		// The recheck the round armed is a fresh handle: run it to its own settle.
+		await runArmedRound();
 		expect(daemon.launchReplacementSupervisor).toHaveBeenCalledTimes(2);
 		expect(daemon.canConnectToSupervisor).toHaveBeenCalledTimes(8);
 		// The socket died again: the orphan window is running, the monitor stays armed.
 		expect(daemon.supervisorAvailabilityState.supervisorAbsentSince).toBeDefined();
 		expect(daemon.supervisorMonitorTimer).toBeDefined();
+	});
+
+	it("settles an armed check after the round it owns, and hands out a fresh handle for the next one", async () => {
+		vi.useFakeTimers();
+		const daemon = createHarness(async () => true);
+
+		daemon.scheduleSupervisorAvailabilityCheck("/tmp/supervisor.sock", 1500);
+		const armed = daemon.supervisorAvailabilityCheckSettled;
+		expect(armed).toBeInstanceOf(Promise);
+		await vi.advanceTimersByTimeAsync(1500);
+		// The round is done once the handle settles - the reschedule it performed included - so a
+		// test never has to guess how many clock pushes the real chain (registry read, socket
+		// probe) needed, and never waits on a probe promise the chain cannot reach.
+		await armed;
+		expect(daemon.canConnectToSupervisor).toHaveBeenCalledOnce();
+		expect(daemon.supervisorMonitorTimer).toBeDefined();
+		// The reschedule owns a fresh settle: awaiting the old handle must not read as "the next
+		// round is done too".
+		expect(daemon.supervisorAvailabilityCheckSettled).not.toBe(armed);
+	});
+
+	it("settles the check it disarms instead of leaving an observer on a round that will never run", async () => {
+		vi.useFakeTimers();
+		const daemon = createHarness(async () => true);
+
+		daemon.scheduleSupervisorAvailabilityCheck("/tmp/supervisor.sock", 1500);
+		const disarmed = daemon.supervisorAvailabilityCheckSettled;
+		expect(disarmed).toBeInstanceOf(Promise);
+		// Re-arming disarms the pending check, so it will never run: its handle settles here.
+		daemon.scheduleSupervisorAvailabilityCheck("/tmp/supervisor.sock", 5_000);
+		await disarmed;
+		expect(daemon.canConnectToSupervisor).not.toHaveBeenCalled();
+		expect(daemon.supervisorAvailabilityCheckSettled).not.toBe(disarmed);
+
+		await vi.advanceTimersByTimeAsync(5_000);
+		await daemon.supervisorAvailabilityCheckSettled;
+		expect(daemon.canConnectToSupervisor).toHaveBeenCalledOnce();
 	});
 
 	it("skips socket probes while an authenticated supervisor connection is active", async () => {
@@ -1287,28 +1331,26 @@ describe("daemon worker supervisor monitoring", () => {
 
 	it("retries when shutdown admission lookup fails", async () => {
 		vi.useFakeTimers();
-		let resolveProbe: () => void = () => undefined;
-		const probeCompleted = new Promise<void>((resolve) => {
-			resolveProbe = resolve;
-		});
-		const daemon = createHarness(async () => {
-			resolveProbe();
-			return true;
-		});
+		const daemon = createHarness(async () => true);
 		const registryDir = process.env[supervisorRegistryDirEnv];
 		if (!registryDir) throw new Error("Supervisor registry test directory was not set");
 		rmSync(registryDir, { recursive: true, force: true });
 		writeFileSync(registryDir, "not a directory");
 
 		daemon.scheduleSupervisorAvailabilityCheck("/tmp/supervisor.sock", 0);
+		const failedRound = daemon.supervisorAvailabilityCheckSettled;
 		await vi.advanceTimersByTimeAsync(0);
+		// The round threw in its admission lookup, so the settle lands once the retry is armed:
+		// the retry is what the handle reports, not a probe promise that never answers.
+		await failedRound;
 		expect(daemon.canConnectToSupervisor).not.toHaveBeenCalled();
 		expect(daemon.supervisorMonitorTimer).toBeDefined();
 
 		rmSync(registryDir, { force: true });
 		mkdirSync(registryDir, { recursive: true });
+		const retryRound = daemon.supervisorAvailabilityCheckSettled;
 		await vi.advanceTimersByTimeAsync(5000);
-		await probeCompleted;
+		await retryRound;
 		expect(daemon.canConnectToSupervisor).toHaveBeenCalledOnce();
 	});
 
