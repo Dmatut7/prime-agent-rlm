@@ -5864,6 +5864,10 @@ export class InteractiveMode {
 
 			case "compaction_start": {
 				this.startCompactionLoader(event.reason, event.customInstructions);
+				// The queue header now reads "compacting context"; repaint it without
+				// touching statusContainer (the loader). Only queuedMessagesContainer changes.
+				this.updatePendingMessagesDisplay();
+				this.ui.requestRender();
 				break;
 			}
 
@@ -5893,6 +5897,8 @@ export class InteractiveMode {
 					if (event.errorSeverity === "warning") this.showWarning(event.errorMessage);
 					else this.showError(event.errorMessage);
 				}
+				// Drop the "compacting context" queue header now that compaction is over.
+				this.updatePendingMessagesDisplay();
 				this.ui.requestRender();
 				break;
 			}
@@ -7879,6 +7885,18 @@ export class InteractiveMode {
 		const hasQueuedMessages = steeringMessages.length > 0 || followUpMessages.length > 0;
 		if (hasQueuedMessages) {
 			this.queuedMessagesContainer.addChild(new Spacer(1));
+			// While compaction is in flight these queued turns cannot be delivered yet;
+			// open the queue frame with a header that says so. N comes from the same
+			// steering/followUp arrays rendered below (matching sessionActions.queuedCount,
+			// which is derived from them) so the number can never drift from the visible rows.
+			if (this.isAgentCompacting()) {
+				const queuedCount = steeringMessages.length + followUpMessages.length;
+				const compactionText = theme.fg(
+					"dim",
+					`╭─ compacting context · ${queuedCount} queued (agent messages wait for compaction)`,
+				);
+				this.queuedMessagesContainer.addChild(new TruncatedText(compactionText, 1, 0));
+			}
 			for (const message of steeringMessages) {
 				const text = styleQueuedMessagePreview(message, "Steering", (name) => this.isRecognizedSlashCommand(name));
 				this.queuedMessagesContainer.addChild(new TruncatedText(text, 1, 0));

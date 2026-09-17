@@ -1,0 +1,1 @@
+- Showed a "compacting context · N queued" header above the queued-message previews while context compaction is in flight, so it is clear the queued messages are waiting for compaction.
