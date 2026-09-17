@@ -106,7 +106,7 @@
 | #2246 孤儿 worker 回收 | 无 | 移植 | M | 重接到我们 deps 注入面；闸门必须用 `isSessionActive || hasRunningRlmChildren()`，否则误杀长跑脚本 worker |
 | #2242 持久 SupervisorLink | 无 | 移植 | M | 新文件直取+3 处重接；保留我们诊断/超时/pending-delivery 记账 |
 | #2426 中断后发排队消息 | 部分（缺 Esc 强制批） | 移植 | L | 手工重接 ~50 行进 agent-session；协议号用我们 38；与我们 mutate_queued_message 语义需过一道审查 |
-| #1947 内核 stderr 落盘 | 部分（09-02 fd 线） | **必做** | M | 任务 B 已触发；用上游 pipe+预算机制但保留我们 0600/no-follow/rotate/定位读 |
+| #1947 内核 stderr 落盘 | 部分（09-02 fd 线=上游第 1 迭代） | **必做** | M | **v2 终裁**：底座取上游 host 中继+写预算，我方 0600/O_NOFOLLOW/拒 FIFO/轮转/双配额施加到上游 openStderrLog；定位读退场（ring⊇file）；stderrTail 重写为双 ring 拼接（命名 A1 诚实案） |
 | #2220 精化不踢 prompt cache | 部分（auxiliaryModel 无） | **已落地 `918044273`** | S | 上游 catalog 11 行不移植（我们 provider 层已覆盖） |
 | #2282 子代理进度笔记 | 部分（快照半我们更超前） | 移植（拆 4 子项） | L | D 子项触 daemon schema 37→38；activityStaleMs 与我们 stall 判据要对齐不并存 |
 | #2276 append/fork 热路径 | 部分（fork 半我们更强） | 只摘 append 半 | M | 短写补齐漏点含 `packages/coding-agent/src/utils/private-files.ts:208` 等 4 处（勿与 packages/ai/src/utils/private-file.ts 混）；fork 半绝不照搬（会倒退原子性） |
@@ -321,5 +321,5 @@
 - **压缩安全束十笔全落并推**（b407d0feb…7324d1f55）；验收按复核席口径记账 **56 例绿**（回归 8 + 准入矩阵 20 + 分类器 18 + 密度 6 + UI 抬头 4）；第 10 笔补两缺口（admission pause 白起压缩、watchdog 只有一发）。
 - **C5 = ad7024f76**（supervisor availability settle 句柄，30s 挂死复现红→确定性绿 3×104/104）；r42 flake 台账 F1 记已消。#2336 四竞态＝ec33fd473(3/4, ④ N/A)+C5。
 - **P3 承重件执行已开**：p3-exec-as（agent-session+session-manager，0902）与 p3-exec-repl（repl-manager+daemon-supervisor，K3），裁法单一来源＝/tmp/p3-plan-agentsession.md + /tmp/p3-plan-reconcile.md 终裁 + /tmp/p3-plan-repl-supervisor.md；#2284/#2334/#2098 接收侧排在 P3 的挂起批/NC 区，不另开脸。
-- **p3-plan-2 对母文档的 4 条纠正已采纳**：#2213 我方已移植（01f106f26）不重做；#1947 底座取我方 fd 直交、只吸 decoder/flush/exit-destroy/等 close 四项；步进补偿时钟不在 repl-manager（保块 7 即保住）；atomic-file 两侧逐字同、真问题是上游 wrapper 丢 fsync/fsyncDir。
+- **p3-plan-2 纠正采纳（v2 修订版）**：#2213 我方已移植（01f106f26）不重做；**#1947 v1 的 fd 直交结论已撤回**——我方 7f5e1ba3a 是上游第 1 迭代吸收、c4f12355b 自述未取上游 pipe+budget、上游终态 5c2750bdc 明写放弃 fd 直交 ⇒ 底座取上游 host 中继+预算、我方硬化施加到 openStderrLog，定位读退场；步进补偿时钟不在 repl-manager（保块 7 即保住）；atomic-file 两侧逐字同、真问题是上游 wrapper 丢 fsync/fsyncDir（补 fsync 不照搬 wrapper）。另记 p3-exec-repl 裁示：双 ring 命名 A1、块 7 错误形状本窗案 A（typed error 案 B 入 P5 异构复核）、connect 2000→30s/90s 条件裁、4677/4602 接受删除+fixture 迁移顺修 3 红、admission 5s 租约 vs 5min 孤儿窗须测试证实或证伪。**编号警示**：p3-plan-2 的 C1-C5 是对母文档的纠正编号，与「C5=ad7024f76」同号不同物。
 - 复核纪律升级（已入记忆）：按波复核分量比对红名单；落地闸＝纯净树 tsgo＋邻接测试集。
