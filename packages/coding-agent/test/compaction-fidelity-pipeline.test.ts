@@ -102,6 +102,19 @@ function toolResultMessage(text: string): AgentMessage {
 	} as AgentMessage;
 }
 
+/** The ipython tool result shape the kernel edit skill produces: details.diffs[]. */
+function kernelEditToolResult(paths: string[]): AgentMessage {
+	return {
+		role: "toolResult",
+		toolCallId: "tc-1",
+		toolName: "ipython",
+		content: [{ type: "text", text: paths.map((path) => `Edited ${path}`).join("\n") }],
+		details: { diffs: paths.map((path) => ({ path, oldStr: "a", newStr: "b", startLine: 1 })) },
+		isError: false,
+		timestamp: Date.now(),
+	} as AgentMessage;
+}
+
 let entryCounter = 0;
 let lastId: string | null = null;
 
@@ -208,6 +221,28 @@ describe("compaction summary carries machine-generated blocks", () => {
 		// The file lists keep working alongside the new blocks.
 		expect(result.summary).toContain("<modified-files>");
 		expect(result.summary).toContain("/tmp/ma_audit/patched.ts");
+	});
+
+	it("carries kernel-reported edits into <modified-files> and the compaction details", async () => {
+		const KERNEL_EDIT = "/tmp/ma_audit/kernel-edit.ts";
+		const entries = [
+			messageEntry(userMessage("edit through the kernel")),
+			messageEntry(assistantMessage("editing", [{ name: "ipython", arguments: { code: "await edit(...)" } }])),
+			messageEntry(kernelEditToolResult([KERNEL_EDIT])),
+			messageEntry(userMessage("next task")),
+			messageEntry(assistantMessage(TAIL_FILLER)),
+		];
+		const preparation = prepareCompaction(entries, settings(), 200000);
+		expect(preparation).toBeDefined();
+
+		const result = await compact(preparation!, createModel(), "test-key");
+
+		// The default toolset performs edits inside the kernel: without the diff
+		// channel <modified-files> never renders, and the model loses the file
+		// orientation the block exists to carry across the cold boundary.
+		expect(result.summary).toContain("<modified-files>");
+		expect(result.summary).toContain(KERNEL_EDIT);
+		expect((result.details as CompactionDetails).modifiedFiles).toContain(KERNEL_EDIT);
 	});
 
 	it("harvests a split turn's prefix as well as the history it summarizes", () => {

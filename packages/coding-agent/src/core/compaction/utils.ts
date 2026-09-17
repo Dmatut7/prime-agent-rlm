@@ -3,7 +3,7 @@
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { Message } from "@earendil-works/pi-ai";
+import type { Message, ToolResultMessage } from "@earendil-works/pi-ai";
 import { getLogger } from "@earendil-works/pi-ai";
 import {
 	findMachineBlock,
@@ -43,15 +43,23 @@ function getToolCallPath(args: Record<string, unknown>): string | undefined {
 }
 
 /**
- * Extract file operations from tool calls in an assistant message.
+ * Extract file operations from tool calls in an assistant message and from
+ * structured tool results.
  *
- * Only statically recognizable writes are recorded: tools whose name indicates a
- * file modification and that expose a path-like argument (including write-style
- * extension tools). File changes made inside bash or ipython cells (redirections,
- * open(..., "w"), notebook edits) cannot be attributed statically and are
- * deliberately not tracked; <modified-files> is best-effort for those tools.
+ * Assistant side: only statically recognizable writes are recorded - tools whose
+ * name indicates a file modification and that expose a path-like argument
+ * (including write-style extension tools). Kernel side: the edit skill reports
+ * its edits as structured diff displays that ride on the ipython tool result's
+ * details, and that channel is what extractFileOpsFromToolResult records. Cell
+ * writes with no structured report (bash redirections, open(..., "w"), notebook
+ * edits) still cannot be attributed statically; <modified-files> stays
+ * best-effort for those.
  */
 export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOperations): void {
+	if (message.role === "toolResult") {
+		extractFileOpsFromToolResult(message, fileOps);
+		return;
+	}
 	if (message.role !== "assistant") return;
 	if (!("content" in message) || !Array.isArray(message.content)) return;
 
@@ -77,13 +85,48 @@ export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOp
 }
 
 /**
+ * Record kernel-performed edits reported on a tool result.
+ *
+ * The default toolset routes file edits through the ipython kernel, and the
+ * kernel's edit skill reports each edit as a structured diff display (path,
+ * oldStr, newStr) captured into the ipython tool result's details. No
+ * assistant-side tool call ever carries that path, so without this branch
+ * <modified-files> never renders in the default configuration. Live file reads
+ * stay uncaptured on purpose: parsing arbitrary Python for reads is brittle, and
+ * the structured diff channel is the one kernel signal a summary can trust.
+ */
+function extractFileOpsFromToolResult(message: ToolResultMessage, fileOps: FileOperations): void {
+	if (message.toolName !== "ipython") return;
+	const details =
+		typeof message.details === "object" && message.details !== null && !Array.isArray(message.details)
+			? (message.details as Record<string, unknown>)
+			: {};
+	const diffs = Array.isArray(details.diffs) ? details.diffs : [];
+	for (const diff of diffs) {
+		if (typeof diff !== "object" || diff === null || Array.isArray(diff)) continue;
+		const path = (diff as Record<string, unknown>).path;
+		if (typeof path === "string" && path.length > 0) fileOps.edited.add(path);
+	}
+}
+
+/**
+ * Maximum files kept per summary block, so a single oversized kernel result
+ * cannot produce a file list larger than the model context limit.
+ */
+const FILE_LIST_MAX_ENTRIES = 200;
+
+/**
  * Compute final file lists from file operations.
  * Returns readFiles (files only read, not modified) and modifiedFiles.
+ * Both lists are capped at FILE_LIST_MAX_ENTRIES (sorted, then truncated).
  */
 export function computeFileLists(fileOps: FileOperations): { readFiles: string[]; modifiedFiles: string[] } {
 	const modified = new Set([...fileOps.edited, ...fileOps.written]);
-	const readOnly = [...fileOps.read].filter((f) => !modified.has(f)).sort();
-	const modifiedFiles = [...modified].sort();
+	const readOnly = [...fileOps.read]
+		.filter((f) => !modified.has(f))
+		.sort()
+		.slice(0, FILE_LIST_MAX_ENTRIES);
+	const modifiedFiles = [...modified].sort().slice(0, FILE_LIST_MAX_ENTRIES);
 	return { readFiles: readOnly, modifiedFiles };
 }
 
