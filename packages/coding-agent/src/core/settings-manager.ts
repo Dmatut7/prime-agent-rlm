@@ -724,7 +724,10 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	onboardingCompleted: null,
 	defaultProvider: null,
 	defaultModel: null,
+	subagentDefaultModel: null,
+	updateChannel: null,
 	recentModels: null,
+	auxiliaryModel: null,
 	defaultThinkingLevel: null,
 	defaultServiceTier: null,
 	rlmMaxDepth: null,
@@ -782,11 +785,14 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	],
 	retry: ["enabled", "maxRetries", "baseDelayMs", "emptyTurn", "provider"],
 	hideThinkingBlock: null,
+	providerBackupModel: null,
+	autonomous: null,
 	shellPath: null,
 	quietStartup: null,
 	shellCommandPrefix: null,
 	npmCommand: null,
 	mcpServers: null,
+	mcpCatalogSources: null,
 	packages: null,
 	extensions: null,
 	extensionHandlerTimeoutMs: null,
@@ -812,7 +818,7 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 
 /** Deeper-than-one-level blocks, keyed by their full dotted path. */
 const KNOWN_NESTED_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
-	"retry.provider": ["timeoutMs", "maxRetries", "maxRetryDelayMs", "streamStallTimeoutMs"],
+	"retry.provider": ["timeoutMs", "maxRetries", "maxRetryDelayMs", "streamStallTimeoutMs", "waitForUsage"],
 	"retry.emptyTurn": ["maxAttempts", "baseDelayMs", "maxDelayMs", "maxTotalDelayMs"],
 };
 

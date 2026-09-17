@@ -160,6 +160,36 @@ describe("settings unknown-key diagnostics", () => {
 			expect(manager.drainWarnings()).toEqual([]);
 		});
 
+		it("does not warn for the keys the P3 merge brought in (they are real settings)", () => {
+			// The whitelist's contract is "the top level is the Settings interface verbatim".
+			// Six top-level keys the merged tree declares were missing from it, so a user who
+			// set any of them got an "unknown key" warning for a setting that does take effect
+			// (four of them are read straight out of settings by agent-session:
+			// getAutonomousLimits, getProviderWaitSettings, getProviderBackupModel,
+			// getSubagentDefaultModel). auxiliaryModel is the sixth; it was already consumed
+			// before the merge, which is what makes this test a check on the whitelist rather
+			// than on the merge. retry.provider.waitForUsage is the nested one.
+			writeGlobal({
+				subagentDefaultModel: "faux/child-model",
+				updateChannel: "nightly",
+				auxiliaryModel: "faux/aux-model",
+				providerBackupModel: "faux/backup-model",
+				autonomous: { maxContinuations: 3 },
+				mcpCatalogSources: ["/tmp/catalog.json"],
+				retry: { provider: { waitForUsage: { enabled: true, maxAttempts: 5 } } },
+			});
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.drainWarnings()).toEqual([]);
+			// Positive control for the reader: the getters really do see these values, so the
+			// silence above is "recognized and consumed", not "ignored because unknown".
+			expect(manager.getSubagentDefaultModel()).toBe("faux/child-model");
+			expect(manager.getProviderBackupModel()).toBe("faux/backup-model");
+			expect(manager.getUpdateChannel()).toBe("nightly");
+			expect(manager.getProviderWaitSettings().maxAttempts).toBe(5);
+		});
+
 		it("does not warn for a project file without unknown keys", () => {
 			writeFileSync(projectSettingsPath, JSON.stringify({ theme: "light" }));
 
