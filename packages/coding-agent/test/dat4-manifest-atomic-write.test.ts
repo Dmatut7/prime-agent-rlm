@@ -1,4 +1,4 @@
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -16,22 +16,29 @@ import { writeUpdateRestartManifestFile } from "../src/modes/daemon/update-resta
 
 const torn = vi.hoisted(() => ({ write: false }));
 
+/**
+ * The injection targets the syscall the writer actually makes. `writePrivateFileAtomic`
+ * fills a temp file with openSync + writeSync + fsyncSync and renames it into place; it
+ * never calls `writeFileSync`. Mocking `writeFileSync` therefore injected nothing once
+ * the writer switched to the looping `writeAllSync` (upstream #2276 append half,
+ * 69fb8ead6): the assertion failed with "expected [Function] to throw" - the injection
+ * was dead, not the writer torn - in CI and in an isolated run alike. Injecting at
+ * `writeSync` keeps the original crash shape (half the bytes land, then the writer dies)
+ * pointed at the code that now performs the write.
+ */
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
-	const writeFileSync = ((target: import("node:fs").PathOrFileDescriptor, content: string) => {
-		if (!torn.write) {
-			return (actual.writeFileSync as unknown as (...args: unknown[]) => void)(target, content);
-		}
-		// The crash shape the direct write exposed: half the bytes land, then the
-		// writer dies (short write / ENOSPC).
-		const text = typeof content === "string" ? content : "";
-		(actual.writeFileSync as unknown as (...args: unknown[]) => void)(
-			target,
-			text.slice(0, Math.floor(text.length / 2)),
-		);
+	const rawWriteSync = actual.writeSync as unknown as (...args: unknown[]) => number;
+	const writeSync = ((...args: unknown[]) => {
+		if (!torn.write) return rawWriteSync(...args);
+		// Half the bytes land, then the writer dies (short write / ENOSPC).
+		// `writeAllSync` loops on a short *count*, so the death has to be the throw -
+		// the same shape the original injection spelled.
+		const [fd, buffer, offset, length] = args as [number, Uint8Array, number, number];
+		rawWriteSync(fd, buffer, offset, Math.floor(length / 2));
 		throw new Error("simulated torn write");
-	}) as typeof actual.writeFileSync;
-	return { ...actual, writeFileSync };
+	}) as typeof actual.writeSync;
+	return { ...actual, writeSync };
 });
 
 function manifest(sessionId: string): DaemonUpdateRestartManifest {
@@ -60,6 +67,23 @@ describe("writeUpdateRestartManifestFile", () => {
 		const path = join(root, "manifest.json");
 		writeFileSync(path, `${JSON.stringify(manifest("old-session"))}\n`);
 		torn.write = true;
+
+		// Positive control: the injection really tears a payload that is written straight
+		// at its target - the shape this writer used to have - so the green below is the
+		// writer's temp-and-rename atomicity and not an injection that fired nothing,
+		// which is exactly how the previous injection rotted unnoticed.
+		const controlPath = join(root, "direct-write.json");
+		const controlBytes = Buffer.from(`${JSON.stringify(manifest("new-session"))}\n`);
+		const controlFd = openSync(controlPath, "w", 0o600);
+		try {
+			expect(() => writeSync(controlFd, controlBytes, 0, controlBytes.length)).toThrow("simulated torn write");
+		} finally {
+			closeSync(controlFd);
+		}
+		const tornBytes = readFileSync(controlPath);
+		expect(tornBytes.length).toBeGreaterThan(0);
+		expect(tornBytes.length).toBeLessThan(controlBytes.length);
+		expect(controlBytes.subarray(0, tornBytes.length).equals(tornBytes)).toBe(true);
 
 		expect(() => writeUpdateRestartManifestFile(path, manifest("new-session"))).toThrow("simulated torn write");
 
