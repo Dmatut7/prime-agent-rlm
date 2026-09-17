@@ -141,6 +141,13 @@ honored wherever it appears on the command line (before or after the version or 
 argument) and still respects the installer lock: a live concurrent installer is never
 overridden by it.
 
+> **Updating this line.** On a checkout of this repository `prime-agent update --self` is
+> refused: it installs the upstream release over this line's build, which does not contain this
+> line's changes (`--allow-official` overrides the refusal, loudly). Update by rebuilding the
+> checkout instead: `git pull --rebase && npm run build`, then restart the daemon
+> (`prime-agent shutdown && prime-agent`). The startup "Update available" notice reports the
+> **upstream** release - it is a signal that this line has something to sync, not a command to run.
+
 Start Prime Agent from the repository or directory you want it to work in:
 
 ```bash
@@ -161,7 +168,7 @@ prime-agent attach <agent>           # Reattach to a running session
 prime-agent --resume [path|id]       # Browse sessions or resume one directly
 prime-agent status                   # Inspect background service state
 prime-agent doctor [--fix]           # Inspect or repair background services
-prime-agent update [--force]         # Update Prime Agent
+prime-agent update [--force]         # Update extensions; --self is refused on this fork (see below)
 prime-agent shutdown [--force]       # Stop every agent, worker, and background service
 ```
 

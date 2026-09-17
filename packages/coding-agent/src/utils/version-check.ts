@@ -1,3 +1,4 @@
+import { detectForkInstall } from "../fork-self-update.js";
 import { getPiUserAgent } from "./pi-user-agent.js";
 import { backgroundNetworkOptOut } from "./privacy-opt-out.js";
 
@@ -200,6 +201,14 @@ export async function getLatestPiVersion(
  * (`prime-agent update` fetches the same manifest because you asked it to).
  */
 export async function checkForNewPiVersion(currentVersion: string): Promise<string | undefined> {
+	// On a fork checkout the announced release is the upstream line, and the self-update path is
+	// refused there (fork-self-update.ts), so the notice's "Run /update" cannot work. The check is
+	// also a background call nobody asked for, whose only answer would be "replace this build".
+	// Suppressed only while the release origin is the upstream default: point
+	// PRIME_AGENT_DOWNLOAD_BASE_URL at this line's own releases and the notice works normally.
+	if (detectForkInstall() && getPrimeAgentDownloadBaseUrl() === DEFAULT_PRIME_AGENT_DOWNLOAD_BASE_URL) {
+		return undefined;
+	}
 	if (backgroundNetworkOptOut() !== undefined) {
 		return undefined;
 	}

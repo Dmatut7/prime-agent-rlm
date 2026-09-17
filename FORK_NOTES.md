@@ -15,6 +15,7 @@
 
 | 日期 | 这轮干了什么 |
 |---|---|
+| 2026-09-18 | **上游合并 P5·版本面 lockstep + update-source 双保险**：全 workspace 抬到 **0.9.5**（`npm version 0.9.5 -ws --no-git-tag-version` → root 两处手工 → `sync-versions.js` 对齐 4 条 inter-package range → `npm install --package-lock-only` 重生成 lock；验收门 `OK 0.9.5 x5 + lock x5 + ranges x3 + root range x1`，unique 面 **17 件**；4 个 examples 包按 `-ws` 一起抬号＝偏离登记）。**update-source**：启动提示面加 fork 门（fork checkout 且发布源仍是上游默认时 `checkForNewPiVersion` 直接返回 undefined，不再让用户看到一条必然被拒的 “Run /update”）；README 明示本线更新方式是重建 checkout（`git pull --rebase && npm run build`）且提示报的是上游版本 |
 | 2026-09-17 深夜⁵ | **daemon 面两笔**：a594e71db #2246 孤儿 worker 有界回收（重接进 deps 注入的 supervisor-availability 轮，门控用我们 isSessionActive‖hasRunningRlmChildren 折叠含活内核 bash；monitor harness 隐性 throw 一并修；退出有界非即时≤60s 一轮，换机风暴防护优先）；5421bd2a7 #2242 持久 SupervisorLink（新文件直取+三处重接+shutdown close，保留 1s 握手预算/不重试契约，复用测试 3 连接→1）。C5 串行交接闭环：p2-races 撤回存 patch→p2-daemon 落库→p2-races 重放 | 
 | 2026-09-17 深夜⁴ | **压缩安全束八笔落地**（b407d0feb 触发比例制+密度校正、fb0d6496a 八类分类器、c9762ece6 压缩优先准入闸+降级阀、5067ed78a/48b5277b1/05dd41815 复现与阀 pin、2880924c5 queue 抬头、236faf357 文档）：kimi-k3 阈值 1,032,192→**800,000**、qwen3.8-max→786,892（min(窗,实收上限)×0.8，[0.5,0.95] 可配）；触发与 /usage 改中文密度口径（pin：1350 字中文扁平 338 不触发/密度 900 触发）；**压缩优先于子代理回执**（含空闲态不对称 bug 的修法：回执入口 skipPrePromptWork 导致 pre-turn 压缩被跳）；降级阀第 2 次失败起 keepRecent 减半、第 4 次有损紧急收缩+三处 loud notice；**裁示偏差一处（母席接受）**：human_interactive 未入队列——它自有 pre-turn 压缩已实现"压缩先跑"（pin0 钉 compaction_end 早于 message_start），字面排队会动 Esc/prompt-stash 语义。**#2276 append 半** 69fb8ead6（短写循环+flip-once guard，bench p50 走平）与 **#2310 限定范围** fb15fa08d（error verdict 落盘+wire 降档保老客户端）同窗落地。待办记账：keepRecent/切点仍 chars/4（CJK 保留片真实 token 约 1.6× 名义值，单开一笔重标 23 套件）、content-density 头注释口径统一、attached-daemon archived 行待 wire 枚举放开收口、append-hot-path 的 test-hygiene 探针待 p2-sessmgr 收口 | 
 | 2026-09-17 深夜³ | **吸收审查回炉两笔**：db3c6cc32 回补 `streamProxy` 的 maxRetryDelayMs 转发（公开 SDK 面静默丢字段，非 daemon 内部链路——全仓无内部调用者，注释按实测写；新 pin 走公开入口+stub fetch，agent 包 108 绿）、5184b9e66 补 #2215「空 extension summary=普通分支移动」针（变异正控红/净树 51 绿）。**溯源补记**（审查 A ①）：0f02b089f(#2336-C7)、c09bdd358 与 06260455d(#2153) 三笔提交说明未注明上游出处，上游对应 cf07c5a3f / 4f4d51c5b，行为等价性已由审查 A 逐行确认 | 
@@ -219,7 +220,11 @@ wire 纪律实况：批 1/1c 的加法全部走能力门（`rlm_child_stall_acti
 - **做了什么**：唯一主仓定为 [`Dmatut7/prime-agent-rlm`](https://github.com/Dmatut7/prime-agent-rlm)。把本线 `merge/repl-kernel` **完整 git 历史**推上去，替换 rlm 原先那个 1 提交 squash import（`7c3e4c1ac`）。squash 会让之后 `git merge upstream/main` 变成无关历史，不能在那上面继续开发。
 - **本地 remote**：`origin` → rlm；`upstream` → 官方；`fork` → 旧 `Dmatut7/prime-agent`（只读路牌）；原 `origin`（`prime-agent-x`）改名为 `archive-x`。
 - **旧仓**：fork 最后快照的 README 已改口指向 rlm，之后不再往 fork 推新提交。`prime-agent-x` 在 GitHub 上 Archive（它停在官方 0.7.3，本来就不是这条 0.9.1 REPL 线）。
-- **版本**：本线仍是 **0.9.1**。官方已发 **v0.9.3**，下一轮上游同步再跟。
+- **版本**：本线已跟到 **0.9.5**（随 2026-09-17 上游合并抬号，P5 落地）；窗尾仍有
+  `cf07c5a3f`/`b6ac5d014`/`e9d68d92c`/`e2fb7bfa1` 等提交，故实际是 **0.9.5 + 若干笔**，不发明 0.9.6。
+  默认发布源仍是上游 bucket（`PRIME_AGENT_DOWNLOAD_BASE_URL` 可覆盖）；`update --self` 被 fork 闸门
+  拒绝（`--allow-official` 可越），启动的 “Update available” 提示报的是**上游**版本——它是「本线有东西要同步」的信号，
+  不是一条要去跑的命令。
 - **为什么改**：三个仓的 README 都在抢「唯一主仓」，本地 `origin` 还指着已停更的 x。再拖只会推错地方。
 
 ### 二、根代理用户沟通契约（昨晚未提交工作，本轮入仓）
