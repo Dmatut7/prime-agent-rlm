@@ -9,6 +9,7 @@ import {
 	type CompactionSettings,
 	calculateContextTokens,
 	compact,
+	compactionThresholdTokens,
 	DEFAULT_COMPACTION_SETTINGS,
 	estimateContextTokens,
 	findCutPoint,
@@ -253,34 +254,27 @@ describe("getLastAssistantUsage", () => {
 });
 
 describe("shouldCompact", () => {
-	it("should return true when context exceeds threshold", () => {
-		const settings: CompactionSettings = {
-			enabled: true,
-			reserveTokens: 10000,
-			keepRecentTokens: 20000,
-		};
+	const settings: CompactionSettings = {
+		...DEFAULT_COMPACTION_SETTINGS,
+		reserveTokens: 10000,
+		keepRecentTokens: 20000,
+	};
 
+	it("should return true when context exceeds threshold", () => {
+		// The trigger is min(window * triggerRatio, window - reserveTokens) = 80000,
+		// not the old window - reserveTokens = 90000: the estimate under-counts dense
+		// text, so the last 10% of the window is headroom, not usable context.
+		expect(compactionThresholdTokens(100000, settings)).toBe(80000);
 		expect(shouldCompact(95000, 100000, settings)).toBe(true);
-		expect(shouldCompact(89000, 100000, settings)).toBe(false);
+		expect(shouldCompact(80001, 100000, settings)).toBe(true);
+		expect(shouldCompact(80000, 100000, settings)).toBe(false);
 	});
 
 	it("should return false when disabled", () => {
-		const settings: CompactionSettings = {
-			enabled: false,
-			reserveTokens: 10000,
-			keepRecentTokens: 20000,
-		};
-
-		expect(shouldCompact(95000, 100000, settings)).toBe(false);
+		expect(shouldCompact(95000, 100000, { ...settings, enabled: false })).toBe(false);
 	});
 
 	it("should return false when context window is unknown", () => {
-		const settings: CompactionSettings = {
-			enabled: true,
-			reserveTokens: 10000,
-			keepRecentTokens: 20000,
-		};
-
 		expect(shouldCompact(95000, 0, settings)).toBe(false);
 	});
 });

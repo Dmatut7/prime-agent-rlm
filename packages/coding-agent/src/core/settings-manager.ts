@@ -18,6 +18,7 @@ import { dirname, join, resolve } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
 import { sleepSync } from "../utils/sleep.js";
+import { clampCompactionTriggerRatio } from "./compaction/compaction.js";
 import { DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS } from "./extensions/timeout.js";
 import { RETIRED_VENV_RETENTION } from "./kernel/venv-in-use.js";
 import type { ResolvedRetentionSettings } from "./retention/types.js";
@@ -144,6 +145,18 @@ export interface CompactionSettings {
 	reserveTokens?: number; // default: 16384
 	keepRecentTokens?: number; // default: 20000
 	agentCallable?: boolean; // default: true - expose the compact skill so the model can request compaction
+	/**
+	 * Share of the provider's real input limit at which threshold compaction fires.
+	 * default: 0.8; clamped to [0.5, 0.95] (see clampCompactionTriggerRatio).
+	 */
+	triggerRatio?: number;
+	/**
+	 * default: true - an incoming agent message (a child's reply, a peer, a notice)
+	 * queues behind compaction instead of starting a turn on an over-threshold
+	 * context. false restores the old behavior, where the message wins and the
+	 * compaction waits for the next turn boundary.
+	 */
+	priorityOverAgentMessages?: boolean;
 }
 
 export interface BranchSummarySettings {
@@ -650,7 +663,14 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	steeringMode: null,
 	followUpMode: null,
 	theme: null,
-	compaction: ["enabled", "reserveTokens", "keepRecentTokens", "agentCallable"],
+	compaction: [
+		"enabled",
+		"reserveTokens",
+		"keepRecentTokens",
+		"agentCallable",
+		"triggerRatio",
+		"priorityOverAgentMessages",
+	],
 	stallWatchdog: [
 		"enabled",
 		"warnAfterSeconds",
@@ -1935,11 +1955,31 @@ export class SettingsManager {
 		return this.settings.compaction?.agentCallable ?? true;
 	}
 
-	getCompactionSettings(): { enabled: boolean; reserveTokens: number; keepRecentTokens: number } {
+	/**
+	 * Trigger ratio, validated: a non-finite or out-of-range value in settings.jsonl
+	 * clamps to [MIN_COMPACTION_TRIGGER_RATIO, MAX_COMPACTION_TRIGGER_RATIO] instead
+	 * of disabling the trigger (<= 0) or firing it every turn (>= 1).
+	 */
+	getCompactionTriggerRatio(): number {
+		return clampCompactionTriggerRatio(this.settings.compaction?.triggerRatio);
+	}
+
+	/** Whether an incoming agent message queues behind a pending/in-flight compaction. */
+	getCompactionPriorityOverAgentMessages(): boolean {
+		return this.settings.compaction?.priorityOverAgentMessages ?? true;
+	}
+
+	getCompactionSettings(): {
+		enabled: boolean;
+		reserveTokens: number;
+		keepRecentTokens: number;
+		triggerRatio: number;
+	} {
 		return {
 			enabled: this.getCompactionEnabled(),
 			reserveTokens: this.getCompactionReserveTokens(),
 			keepRecentTokens: this.getCompactionKeepRecentTokens(),
+			triggerRatio: this.getCompactionTriggerRatio(),
 		};
 	}
 

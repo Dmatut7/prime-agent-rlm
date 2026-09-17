@@ -6,6 +6,7 @@ import {
 	type CompactionSettings,
 	capKeepRecentTokens,
 	compact,
+	compactionThresholdTokens,
 	createFileOps,
 	DEFAULT_COMPACTION_SETTINGS,
 	prepareCompaction,
@@ -269,14 +270,15 @@ describe("zero-reduction compaction", () => {
 		// keepRecentTokens above the window is capped to exactly the threshold, so
 		// every retained message stays inside it and the cut cannot move.
 		const settings: CompactionSettings = {
-			enabled: true,
+			...DEFAULT_COMPACTION_SETTINGS,
 			reserveTokens: 1000,
 			keepRecentTokens: 50000,
 		};
 		const contextWindow = 6000;
-		expect(capKeepRecentTokens(settings, contextWindow)).toBe(contextWindow - settings.reserveTokens);
+		const threshold = compactionThresholdTokens(contextWindow, settings);
+		expect(capKeepRecentTokens(settings, contextWindow)).toBe(threshold);
 		// The session is over the threshold, so threshold compaction keeps firing.
-		expect(shouldCompact(contextWindow - settings.reserveTokens + 1, contextWindow, settings)).toBe(true);
+		expect(shouldCompact(threshold + 1, contextWindow, settings)).toBe(true);
 
 		// Re-summarizing nothing cannot shrink the context: skip so the caller keeps
 		// its cooldown instead of burning a summarization call every turn.

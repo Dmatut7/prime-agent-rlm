@@ -14,8 +14,10 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "../messages.js";
+import { effectiveInputLimitTokens } from "../model-input-limits.js";
 import { buildSessionContext, type CompactionEntry, type SessionEntry } from "../session-manager.js";
 import { addAssistantUsage, emptyUsage } from "../usage.js";
+import { ASCII_CHARS_PER_TOKEN, measureContentDensity } from "./content-density.js";
 import {
 	buildFactLedger,
 	type FactLedger,
@@ -161,12 +163,48 @@ export interface CompactionSettings {
 	enabled: boolean;
 	reserveTokens: number;
 	keepRecentTokens: number;
+	/**
+	 * Share of the provider's real input limit at which threshold compaction fires.
+	 * See compactionThresholdTokens for why this is a ratio of the measured limit
+	 * and not `window - reserveTokens`.
+	 */
+	triggerRatio: number;
+}
+
+/**
+ * Default trigger ratio: fire at 80% of the input limit the provider accepts.
+ *
+ * The old trigger was `contextWindow - reserveTokens`, i.e. ~98.4% of a 1M window.
+ * Two independent measurement errors sat under it and both pushed the same way:
+ * the estimate prices text at chars/4, which under-counts CJK by ~1.6x, and the
+ * catalog window can exceed what the provider accepts as input (DashScope answers
+ * an oversized prompt with HTTP 400 instead of truncating). Together they let a
+ * session reach the provider's wall on an ordinary request before the trigger
+ * ever fired, so compaction woke up after the 400 - sometimes too late to run.
+ * 80% leaves room for both errors on the same context.
+ */
+export const DEFAULT_COMPACTION_TRIGGER_RATIO = 0.8;
+
+/** Configurable bounds for compaction.triggerRatio. */
+export const MIN_COMPACTION_TRIGGER_RATIO = 0.5;
+export const MAX_COMPACTION_TRIGGER_RATIO = 0.95;
+
+/**
+ * Validate a configured trigger ratio: anything non-finite or out of
+ * [MIN_COMPACTION_TRIGGER_RATIO, MAX_COMPACTION_TRIGGER_RATIO] is clamped, so a
+ * typo in settings.jsonl degrades to a usable trigger instead of disabling
+ * compaction (ratio <= 0) or firing it every turn (ratio >= 1).
+ */
+export function clampCompactionTriggerRatio(value: number | undefined): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) return DEFAULT_COMPACTION_TRIGGER_RATIO;
+	return Math.min(MAX_COMPACTION_TRIGGER_RATIO, Math.max(MIN_COMPACTION_TRIGGER_RATIO, value));
 }
 
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	enabled: true,
 	reserveTokens: 16384,
 	keepRecentTokens: 20000,
+	triggerRatio: DEFAULT_COMPACTION_TRIGGER_RATIO,
 };
 
 /** Failed compactions in a row before the failure notice carries recovery options. */
@@ -259,7 +297,11 @@ function getLastAssistantUsageInfo(messages: AgentMessage[]): { usage: Usage; in
 
 /**
  * Estimate context tokens from messages, using the last assistant usage when available.
- * If there are messages after the last usage, estimate their tokens with estimateTokens.
+ *
+ * The anchored part is the provider's own count, so it needs no correction; the
+ * messages after it (or every message, when no assistant has reported usage yet)
+ * are priced by content density, because this number is compared against a
+ * provider-measured limit. See estimateTokensByContent.
  */
 export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEstimate {
 	const usageInfo = getLastAssistantUsageInfo(messages);
@@ -267,7 +309,7 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
 	if (!usageInfo) {
 		let estimated = 0;
 		for (const message of messages) {
-			estimated += estimateTokens(message);
+			estimated += estimateTokensByContent(message);
 		}
 		return {
 			tokens: estimated,
@@ -280,7 +322,7 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
 	const usageTokens = calculateContextTokens(usageInfo.usage);
 	let trailingTokens = 0;
 	for (let i = usageInfo.index + 1; i < messages.length; i++) {
-		trailingTokens += estimateTokens(messages[i]);
+		trailingTokens += estimateTokensByContent(messages[i]);
 	}
 
 	return {
@@ -292,98 +334,178 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
 }
 
 /**
- * Check if compaction should trigger based on context usage.
+ * Model identity for the trigger base: a catalog `contextWindow` can be larger
+ * than the input the provider actually accepts, and only the measured table in
+ * model-input-limits.ts knows that. Both fields optional because callers that
+ * have no model (a pure-function test, a settings preview) still get the declared
+ * window.
+ */
+export interface CompactionWindowLimits {
+	provider?: string;
+	modelId?: string;
+}
+
+/**
+ * The token count the compaction trigger is a ratio of: the declared window
+ * clamped to the provider's measured input limit.
+ */
+export function compactionTriggerBaseTokens(contextWindow: number, limits?: CompactionWindowLimits): number {
+	return effectiveInputLimitTokens(contextWindow, limits?.provider, limits?.modelId);
+}
+
+/**
+ * Context token count at which threshold compaction fires.
  *
- * When the configured reserve consumes the whole window (or more), no sustainable
+ * Two ceilings, the lower one wins:
+ * - `base * triggerRatio` (base = the provider's real input limit) buys headroom
+ *   for the two measurement errors that both push the same way: the estimator's
+ *   chars/4 caliber under-counts dense (CJK/code) text, and a catalog window can
+ *   over-declare what the provider accepts as input. A session that triggers at
+ *   ~98% of an over-declared window reaches the provider's 400 first.
+ * - `base - reserveTokens` keeps the old invariant: the retained slice plus the
+ *   response reserve has to fit, or compaction re-fires every turn.
+ *
+ * When the configured reserve consumes the whole base (or more), no sustainable
  * threshold exists: any retained context, including a fresh summary, would sit
  * above it again immediately and retrigger every turn. Threshold compaction is
  * then disabled; overflow recovery remains the backstop.
  */
-export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
+export function compactionThresholdTokens(
+	contextWindow: number,
+	settings: CompactionSettings,
+	limits?: CompactionWindowLimits,
+): number {
+	const base = compactionTriggerBaseTokens(contextWindow, limits);
+	if (base <= 0) return 0;
+	const reserveCeiling = base - settings.reserveTokens;
+	if (reserveCeiling <= 0) return 0;
+	return Math.floor(Math.min(base * clampCompactionTriggerRatio(settings.triggerRatio), reserveCeiling));
+}
+
+/**
+ * Check if compaction should trigger based on context usage.
+ *
+ * The single trigger predicate: the threshold-compaction hook, the agent_end
+ * check and the admission gate all call this, so one context cannot be over the
+ * threshold for one of them and under it for another.
+ */
+export function shouldCompact(
+	contextTokens: number,
+	contextWindow: number,
+	settings: CompactionSettings,
+	limits?: CompactionWindowLimits,
+): boolean {
 	if (!settings.enabled) return false;
 	if (contextWindow <= 0) return false;
-	const threshold = contextWindow - settings.reserveTokens;
+	const threshold = compactionThresholdTokens(contextWindow, settings, limits);
 	if (threshold <= 0) return false;
 	return contextTokens > threshold;
 }
 
 /**
- * Cap keepRecentTokens so the retained slice can fit under the post-reserve
- * threshold. An uncapped keepRecent above `contextWindow - reserveTokens` makes
- * every compaction re-trigger on the very next turn, because the retained
- * context already exceeds the threshold by construction.
+ * Cap keepRecentTokens so the retained slice can fit under the trigger threshold.
+ * An uncapped keepRecent above the threshold makes every compaction re-trigger on
+ * the very next turn, because the retained context already exceeds the threshold
+ * by construction.
  */
-export function capKeepRecentTokens(settings: CompactionSettings, contextWindow?: number): number {
+export function capKeepRecentTokens(
+	settings: CompactionSettings,
+	contextWindow?: number,
+	limits?: CompactionWindowLimits,
+): number {
 	if (!contextWindow || contextWindow <= 0) return settings.keepRecentTokens;
-	const threshold = contextWindow - settings.reserveTokens;
+	const threshold = compactionThresholdTokens(contextWindow, settings, limits);
 	if (threshold <= 0) return 0;
 	return Math.min(settings.keepRecentTokens, threshold);
 }
 /**
- * Estimate token count for a message using chars/4 heuristic.
- * This is conservative (overestimates tokens).
+ * The text a message contributes to a prompt, as separate runs, plus how many
+ * images it carries. One collector for both token calibers below, so the two can
+ * never disagree about *which* characters count - only about what a character
+ * costs. A run boundary costs nothing: the calibers sum run lengths, and images
+ * are priced as a flat token count rather than as characters.
  */
-export function estimateTokens(message: AgentMessage): number {
-	let chars = 0;
+export interface MessageEstimateParts {
+	texts: string[];
+	images: number;
+}
 
+/** Flat token cost of one image, in both calibers (the old 4800 chars / 4). */
+export const IMAGE_TOKEN_ESTIMATE = 1200;
+
+function pushContentBlocks(parts: MessageEstimateParts, content: unknown): void {
+	if (typeof content === "string") {
+		parts.texts.push(content);
+		return;
+	}
+	if (!Array.isArray(content)) return;
+	for (const block of content as Array<{ type: string; text?: string; thinking?: string }>) {
+		if (block.type === "text" && block.text) parts.texts.push(block.text);
+		else if (block.type === "image") parts.images += 1;
+	}
+}
+
+function collectMessageEstimateParts(message: AgentMessage): MessageEstimateParts {
+	const parts: MessageEstimateParts = { texts: [], images: 0 };
 	switch (message.role) {
-		case "user": {
-			const content = (message as { content: string | Array<{ type: string; text?: string }> }).content;
-			if (typeof content === "string") {
-				chars = content.length;
-			} else if (Array.isArray(content)) {
-				for (const block of content) {
-					if (block.type === "text" && block.text) {
-						chars += block.text.length;
-					}
-					if (block.type === "image") {
-						chars += 4800; // Same image estimate as tool results
-					}
-				}
-			}
-			return Math.ceil(chars / 4);
-		}
+		case "user":
+			pushContentBlocks(parts, (message as { content: unknown }).content);
+			break;
 		case "assistant": {
-			const assistant = message as AssistantMessage;
-			for (const block of assistant.content) {
-				if (block.type === "text") {
-					chars += block.text.length;
-				} else if (block.type === "thinking") {
-					chars += block.thinking.length;
-				} else if (block.type === "toolCall") {
-					chars += block.name.length + JSON.stringify(block.arguments).length;
+			for (const block of (message as AssistantMessage).content) {
+				if (block.type === "text") parts.texts.push(block.text);
+				else if (block.type === "thinking") parts.texts.push(block.thinking);
+				else if (block.type === "toolCall") {
+					parts.texts.push(block.name, JSON.stringify(block.arguments));
 				}
 			}
-			return Math.ceil(chars / 4);
+			break;
 		}
 		case "custom":
-		case "toolResult": {
-			if (typeof message.content === "string") {
-				chars = message.content.length;
-			} else {
-				for (const block of message.content) {
-					if (block.type === "text" && block.text) {
-						chars += block.text.length;
-					}
-					if (block.type === "image") {
-						chars += 4800; // Estimate images as 4000 chars, or 1200 tokens
-					}
-				}
-			}
-			return Math.ceil(chars / 4);
-		}
-		case "bashExecution": {
-			chars = message.command.length + message.output.length;
-			return Math.ceil(chars / 4);
-		}
+		case "toolResult":
+			pushContentBlocks(parts, message.content);
+			break;
+		case "bashExecution":
+			parts.texts.push(message.command, message.output);
+			break;
 		case "branchSummary":
-		case "compactionSummary": {
-			chars = message.summary.length;
-			return Math.ceil(chars / 4);
-		}
+		case "compactionSummary":
+			parts.texts.push(message.summary);
+			break;
 	}
+	return parts;
+}
 
-	return 0;
+/**
+ * Estimate token count for a message using the chars/4 heuristic.
+ *
+ * The budgeting caliber: cut points, keepRecentTokens and the summarization
+ * inflation anchor are all expressed in it, so it stays flat and cheap. It
+ * under-counts dense text (CJK costs about one token per character, not per four);
+ * callers that compare against a provider's real token count use
+ * estimateTokensByContent instead.
+ */
+export function estimateTokens(message: AgentMessage): number {
+	const parts = collectMessageEstimateParts(message);
+	let chars = parts.images * IMAGE_TOKEN_ESTIMATE * ASCII_CHARS_PER_TOKEN;
+	for (const text of parts.texts) chars += text.length;
+	return Math.ceil(chars / ASCII_CHARS_PER_TOKEN);
+}
+
+/**
+ * Estimate token count for a message priced by content density: CJK and fenced
+ * code cost what they actually cost a tokenizer instead of the flat chars/4.
+ *
+ * This is the caliber the compaction trigger and /usage report, because both are
+ * compared against a number the provider measured. A Chinese-heavy session
+ * estimated at chars/4 read ~1.6x low, so the trigger fired after the provider
+ * had already rejected the request.
+ */
+export function estimateTokensByContent(message: AgentMessage): number {
+	const parts = collectMessageEstimateParts(message);
+	let tokens = parts.images * IMAGE_TOKEN_ESTIMATE;
+	for (const text of parts.texts) tokens += measureContentDensity(text).tokens;
+	return Math.ceil(tokens);
 }
 
 /**
@@ -596,6 +718,303 @@ export function findCutPoint(
 		isSplitTurn: !isTurnStart && turnStartIndex !== -1,
 	};
 }
+/**
+ * How far under the trigger threshold the emergency shrink has to land, so the
+ * session does not re-trigger on the very next message.
+ */
+export const EMERGENCY_SHRINK_TARGET_RATIO = 0.7;
+
+/**
+ * Consecutive compaction failures from which the retry halves keepRecentTokens: 1,
+ * so the second attempt - the first retry - already carries a smaller tail.
+ */
+export const COMPACTION_KEEP_RECENT_SHRINK_START = 1;
+
+/** Floor for a halved keepRecentTokens budget. */
+export const MIN_SHRUNK_KEEP_RECENT_TOKENS = 4096;
+
+/** Consecutive compaction failures at which the lossy emergency shrink runs. */
+export const COMPACTION_EMERGENCY_SHRINK_FAILURES = 4;
+
+/**
+ * keepRecentTokens for a retry after `consecutiveFailures` failed compactions.
+ *
+ * A summarization request that keeps failing is often failing because the slice it
+ * has to carry is too big for the provider's input limit; halving the retained
+ * tail from the second failure on gives each retry a smaller request without
+ * touching the user's configured budget. The floor keeps the retained slice usable,
+ * and the result never exceeds the configured value - a session configured below
+ * the floor keeps its own number instead of being raised to it.
+ */
+export function shrunkKeepRecentTokens(configured: number, consecutiveFailures: number): number {
+	if (consecutiveFailures < COMPACTION_KEEP_RECENT_SHRINK_START) return configured;
+	const halvings = consecutiveFailures - COMPACTION_KEEP_RECENT_SHRINK_START + 1;
+	let value = configured;
+	for (let i = 0; i < halvings; i++) value = Math.floor(value / 2);
+	return Math.max(Math.min(configured, value), Math.min(MIN_SHRUNK_KEEP_RECENT_TOKENS, configured));
+}
+
+/** What the emergency shrink counted in the span it drops. */
+export interface EmergencyShrinkSpan {
+	/** Non-summary context entries replaced by the notice. */
+	droppedEntries: number;
+	/** Estimated tokens those entries carried. */
+	droppedTokens: number;
+	/** Roles of the dropped entries, so the notice can name what was lost. */
+	droppedRoles: Record<string, number>;
+	/** Timestamps of the oldest and newest dropped entry, when they have one. */
+	firstDroppedTimestamp?: string;
+	lastDroppedTimestamp?: string;
+}
+
+export interface EmergencyShrinkPlan {
+	/** Entry the shrunken context starts at; everything older becomes the notice. */
+	firstKeptEntryId: string;
+	/** Index of that entry in the branch handed to the planner. */
+	firstKeptEntryIndex: number;
+	/** Estimated tokens of the context before the shrink, in the planner's own caliber. */
+	tokensBefore: number;
+	/** Estimated tokens of the context the plan produces, notice text excluded. */
+	tokensAfter: number;
+	/** The target the plan aimed at: thresholdTokens * EMERGENCY_SHRINK_TARGET_RATIO. */
+	targetTokens: number;
+	/** False when even the deepest cut cannot reach the target; the notice must say so. */
+	reachedTarget: boolean;
+	span: EmergencyShrinkSpan;
+	/**
+	 * Summary text carried forward from the dropped span (the previous compaction
+	 * summary, branch summaries). A shrink drops non-summary context; summaries move
+	 * into the notice instead of being lost.
+	 */
+	carriedSummaries: Array<{ kind: "compaction" | "branch"; text: string }>;
+}
+
+/** Whether an entry is one of the summary-carrying kinds the shrink refuses to drop. */
+function isSummaryEntry(entry: SessionEntry): boolean {
+	if (entry.type === "compaction" || entry.type === "branch_summary") return true;
+	if (entry.type !== "message") return false;
+	return entry.message.role === "compactionSummary" || entry.message.role === "branchSummary";
+}
+
+function entrySummaryText(entry: SessionEntry): string {
+	if (entry.type === "compaction" || entry.type === "branch_summary") return entry.summary ?? "";
+	if (entry.type !== "message") return "";
+	const message = entry.message;
+	return message.role === "compactionSummary" || message.role === "branchSummary" ? message.summary : "";
+}
+
+function entryContextTokens(entry: SessionEntry): number {
+	const message = getMessageFromEntry(entry);
+	return message ? estimateTokensByContent(message) : 0;
+}
+
+interface ShrinkAttempt {
+	cut: number;
+	tokensAfter: number;
+	span: EmergencyShrinkSpan;
+	carriedSummaries: Array<{ kind: "compaction" | "branch"; text: string }>;
+}
+
+function measureShrinkAttempt(pathEntries: SessionEntry[], spanStart: number, cut: number): ShrinkAttempt {
+	const carriedSummaries: Array<{ kind: "compaction" | "branch"; text: string }> = [];
+	let carriedTokens = 0;
+	let droppedEntries = 0;
+	let droppedTokens = 0;
+	const droppedRoles: Record<string, number> = {};
+	let firstDroppedTimestamp: string | undefined;
+	let lastDroppedTimestamp: string | undefined;
+	let suffixTokens = 0;
+	for (let i = spanStart; i < pathEntries.length; i++) {
+		const entry = pathEntries[i];
+		if (i >= cut) {
+			suffixTokens += entryContextTokens(entry);
+			continue;
+		}
+		if (isSummaryEntry(entry)) {
+			const text = entrySummaryText(entry);
+			if (!text) continue;
+			carriedSummaries.push({ kind: summaryEntryKind(entry), text });
+			carriedTokens += entryContextTokens(entry);
+			continue;
+		}
+		const message = getMessageFromEntry(entry);
+		if (!message) continue;
+		const tokens = estimateTokensByContent(message);
+		droppedEntries += 1;
+		droppedTokens += tokens;
+		const role = entry.type === "message" ? entry.message.role : entry.type;
+		droppedRoles[role] = (droppedRoles[role] ?? 0) + 1;
+		firstDroppedTimestamp ??= entry.timestamp;
+		lastDroppedTimestamp = entry.timestamp;
+	}
+	return {
+		cut,
+		tokensAfter: carriedTokens + suffixTokens,
+		span: { droppedEntries, droppedTokens, droppedRoles, firstDroppedTimestamp, lastDroppedTimestamp },
+		carriedSummaries,
+	};
+}
+
+function summaryEntryKind(entry: SessionEntry): "compaction" | "branch" {
+	if (entry.type === "compaction") return "compaction";
+	if (entry.type === "message" && entry.message.role === "compactionSummary") return "compaction";
+	return "branch";
+}
+
+/**
+ * Plan a lossy emergency shrink: the last resort when compaction keeps failing
+ * while the context sits above the trigger threshold, so every further request is
+ * headed for the provider's input wall.
+ *
+ * It drops the oldest NON-summary context entries until the estimate lands under
+ * `thresholdTokens * EMERGENCY_SHRINK_TARGET_RATIO`, carrying any summary inside
+ * the dropped span forward instead of losing it. The cut is always a valid cut
+ * point, so no tool result is separated from the tool call it answers - a provider
+ * rejects that pair outright, which would turn the shrink into a new failure.
+ *
+ * Both token figures are pure content-density sums over the same entries, so the
+ * comparison is self-consistent; they are not the usage-anchored caliber
+ * estimateContextTokens reports while a readable assistant usage exists.
+ *
+ * Returns undefined when there is nothing to do: no threshold, already under the
+ * target, or no cut point to move to.
+ */
+export function planEmergencyShrink(
+	pathEntries: SessionEntry[],
+	thresholdTokens: number,
+	targetRatio: number = EMERGENCY_SHRINK_TARGET_RATIO,
+): EmergencyShrinkPlan | undefined {
+	if (thresholdTokens <= 0 || pathEntries.length === 0) return undefined;
+	const targetTokens = Math.floor(thresholdTokens * targetRatio);
+
+	let lastCompactionIndex = -1;
+	for (let i = pathEntries.length - 1; i >= 0; i--) {
+		if (pathEntries[i].type === "compaction") {
+			lastCompactionIndex = i;
+			break;
+		}
+	}
+	// The context a new compaction entry would replace starts at the newest
+	// boundary's retained entry (or at the head of the branch when there is none);
+	// the cut itself stays after the boundary, because entries before it are already
+	// represented by that boundary's summary.
+	let spanStart = 0;
+	let cutStart = 0;
+	if (lastCompactionIndex >= 0) {
+		const boundary = pathEntries[lastCompactionIndex] as CompactionEntry;
+		const keptIndex = pathEntries.findIndex((entry) => entry.id === boundary.firstKeptEntryId);
+		spanStart = keptIndex >= 0 ? keptIndex : lastCompactionIndex;
+		cutStart = lastCompactionIndex + 1;
+	}
+	const cutPoints = findValidCutPoints(pathEntries, cutStart, pathEntries.length).filter((index) => index > spanStart);
+	if (cutPoints.length === 0) return undefined;
+
+	const tokensBefore = measureShrinkAttempt(pathEntries, spanStart, spanStart).tokensAfter;
+	if (tokensBefore <= targetTokens) return undefined;
+
+	let deepest: ShrinkAttempt | undefined;
+	for (const cut of cutPoints) {
+		const attempt = measureShrinkAttempt(pathEntries, spanStart, cut);
+		deepest = attempt;
+		if (attempt.tokensAfter <= targetTokens) return toPlan(pathEntries, attempt, tokensBefore, targetTokens, true);
+	}
+	if (!deepest) return undefined;
+	return toPlan(pathEntries, deepest, tokensBefore, targetTokens, false);
+}
+
+function toPlan(
+	pathEntries: SessionEntry[],
+	attempt: ShrinkAttempt,
+	tokensBefore: number,
+	targetTokens: number,
+	reachedTarget: boolean,
+): EmergencyShrinkPlan {
+	const entry = pathEntries[attempt.cut];
+	return {
+		firstKeptEntryId: entry.id,
+		firstKeptEntryIndex: attempt.cut,
+		tokensBefore,
+		tokensAfter: attempt.tokensAfter,
+		targetTokens,
+		reachedTarget,
+		span: attempt.span,
+		carriedSummaries: attempt.carriedSummaries,
+	};
+}
+
+/**
+ * The loud notice that replaces the dropped span.
+ *
+ * It is the summary of a real compaction entry, so it is what the model reads next
+ * turn; it names the loss first, in caps, and states where the dropped text still
+ * exists. A silent shrink here would leave the user believing the session simply
+ * forgot, with no way to tell a bug from the valve.
+ */
+export function buildEmergencyShrinkSummary(
+	plan: EmergencyShrinkPlan,
+	context: { consecutiveFailures: number; lastError?: string; thresholdTokens: number },
+): string {
+	const roles = Object.entries(plan.span.droppedRoles)
+		.sort((a, b) => b[1] - a[1])
+		.map(([role, count]) => `${role} ${count}`)
+		.join(", ");
+	const spanned =
+		plan.span.firstDroppedTimestamp && plan.span.lastDroppedTimestamp
+			? `, spanning ${plan.span.firstDroppedTimestamp} .. ${plan.span.lastDroppedTimestamp}`
+			: "";
+	const lines = [
+		"EMERGENCY CONTEXT SHRINK - OLDEST MESSAGES WERE DROPPED WITHOUT BEING SUMMARIZED.",
+		"",
+		`Compaction failed ${context.consecutiveFailures} times in a row${
+			context.lastError ? ` (last error: ${context.lastError})` : ""
+		}, and the context stayed above the compaction threshold (${plan.tokensBefore} estimated tokens vs a ${context.thresholdTokens} threshold). Rather than keep sending requests the provider rejects, the valve dropped the oldest ${plan.span.droppedEntries} context entries (~${plan.span.droppedTokens} tokens${roles ? `: ${roles}` : ""}${spanned}) from what the model sees.`,
+		"They are NOT deleted: the session transcript on disk still holds every one of them, and /export, /tree and /fork can still reach them.",
+	];
+	if (!plan.reachedTarget) {
+		lines.push(
+			"",
+			`The shrink could not reach its ${plan.targetTokens} token target: even the deepest cut leaves ~${plan.tokensAfter} tokens, so the newest turn is larger than the target on its own. /model (a larger context window) or /new is the remaining way out.`,
+		);
+	}
+	if (plan.carriedSummaries.length > 0) {
+		lines.push("", "Summaries inside the dropped span are carried forward verbatim below, not lost:");
+		for (const carried of plan.carriedSummaries) {
+			const tag = carried.kind === "compaction" ? "carried-compaction-summary" : "carried-branch-summary";
+			lines.push("", `<${tag}>`, carried.text, `</${tag}>`);
+		}
+	}
+	return lines.join("\n");
+}
+
+/**
+ * The transcript notice for an emergency shrink: what the user reads, as opposed to
+ * the replacement summary the model reads. Same facts, without the carried summaries
+ * (the shrink just wrote those into the summary), and it states where the dropped
+ * text still exists - a shrink that reads like data loss invites the wrong recovery.
+ */
+export function buildEmergencyShrinkNotice(plan: EmergencyShrinkPlan, lastError?: string): string {
+	const roles = Object.entries(plan.span.droppedRoles)
+		.sort((a, b) => b[1] - a[1])
+		.map(([role, count]) => `${role} ${count}`)
+		.join(", ");
+	const spanned =
+		plan.span.firstDroppedTimestamp && plan.span.lastDroppedTimestamp
+			? `, spanning ${plan.span.firstDroppedTimestamp} .. ${plan.span.lastDroppedTimestamp},`
+			: ",";
+	const outcome = plan.reachedTarget
+		? `The context is now ~${plan.tokensAfter} estimated tokens, under the ${plan.targetTokens} emergency target.`
+		: `It could not reach the ${plan.targetTokens} emergency target: ~${plan.tokensAfter} estimated tokens remain, so the newest turn is larger than the target on its own. /model or /new is the remaining way out.`;
+	return [
+		`EMERGENCY CONTEXT SHRINK: compaction kept failing${
+			lastError ? ` (last error: ${lastError})` : ""
+		}, and the context stayed over the compaction threshold, so the oldest ${plan.span.droppedEntries} context entries (~${plan.span.droppedTokens} tokens${
+			roles ? `: ${roles}` : ""
+		})${spanned} were dropped from what the model sees, without being summarized.`,
+		outcome,
+		"Nothing was deleted: the session transcript on disk still holds every dropped message, and /export, /tree and /fork can still reach them. The summary that replaced them names the dropped span and carries the older summaries forward verbatim.",
+	].join("\n");
+}
+
 const SUMMARIZATION_PROMPT = `The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
 
 Use this EXACT format:
@@ -1028,6 +1447,7 @@ export function prepareCompaction(
 	pathEntries: SessionEntry[],
 	settings: CompactionSettings,
 	contextWindow?: number,
+	limits?: CompactionWindowLimits,
 ): CompactionPreparation | undefined {
 	if (pathEntries.length > 0 && pathEntries[pathEntries.length - 1].type === "compaction") {
 		return undefined;
@@ -1093,7 +1513,7 @@ export function prepareCompaction(
 
 	const tokensBefore = estimateContextTokens(buildSessionContext(pathEntries).messages).tokens;
 
-	const keepRecentTokens = capKeepRecentTokens(settings, contextWindow);
+	const keepRecentTokens = capKeepRecentTokens(settings, contextWindow, limits);
 	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, keepRecentTokens);
 	const firstKeptEntry = pathEntries[cutPoint.firstKeptEntryIndex];
 	if (!firstKeptEntry?.id) {

@@ -5,6 +5,7 @@ import {
 	type CompactionPreparation,
 	compact,
 	createFileOps,
+	DEFAULT_COMPACTION_SETTINGS,
 	generateBranchSummary,
 	generateSummary,
 } from "../src/core/compaction/index.js";
@@ -160,7 +161,12 @@ function createPreparation(messages: AgentMessage[]): CompactionPreparation {
 		isSplitTurn: false,
 		tokensBefore: 0,
 		fileOps: createFileOps(),
-		settings: { enabled: true, reserveTokens: RESERVE_TOKENS, keepRecentTokens: 20_000 },
+		settings: {
+			...DEFAULT_COMPACTION_SETTINGS,
+			enabled: true,
+			reserveTokens: RESERVE_TOKENS,
+			keepRecentTokens: 20_000,
+		},
 	};
 }
 
