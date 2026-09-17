@@ -160,7 +160,12 @@ import {
 } from "./agent-roster.js";
 import { createCompactAssistantDelta, planCompactAssistantDelta } from "./compact-session-stream.js";
 import { filterClientEnv, withClientEnv } from "./daemon-client-env.js";
-import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
+import {
+	deserializeDaemonError,
+	serializeDaemonError,
+	UPDATE_RESTART_PREPARING_ERROR_INFO,
+	UPDATE_RESTART_PREPARING_MESSAGE,
+} from "./daemon-errors.js";
 import { bindActiveSessionState } from "./daemon-extension-binding.js";
 import {
 	createDaemonEventMeta,
@@ -4116,7 +4121,12 @@ export class AgentDaemon {
 				if (this.updateRestart && !updateLifecycle) {
 					this.write(
 						client,
-						failure(workerCommand.id, workerCommand.type, "Daemon is preparing an update restart"),
+						failure(
+							workerCommand.id,
+							workerCommand.type,
+							UPDATE_RESTART_PREPARING_MESSAGE,
+							UPDATE_RESTART_PREPARING_ERROR_INFO,
+						),
 					);
 					return;
 				}
@@ -4170,7 +4180,10 @@ export class AgentDaemon {
 				: restartPhase !== undefined && command.type !== "shutdown";
 		if (mutation && restartRejected) {
 			clearParsedAdmission();
-			this.write(client, failure(command.id, command.type, "Daemon is preparing an update restart"));
+			this.write(
+				client,
+				failure(command.id, command.type, UPDATE_RESTART_PREPARING_MESSAGE, UPDATE_RESTART_PREPARING_ERROR_INFO),
+			);
 			return;
 		}
 		if (mutation) this.mutationDrain.begin();

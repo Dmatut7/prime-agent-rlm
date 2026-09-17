@@ -241,6 +241,11 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 //   DaemonErrorInfo row and no serialize/deserialize branch, so no response this build sends
 //   can carry code "session_recovering" and the ledger row above records upstream's meaning
 //   alone.
+//   Upstream #2391's update_restarting errorInfo row (the preparing-restart transient
+//   classification) rides this revision as a compatible addition: it only ever appears in
+//   failure responses alongside the plain message old clients already parse, new clients use
+//   it to wait through the update window, and unknown errorInfo codes were already ignorable
+//   on both sides. No revision bump and no capability gate for it.
 //   Upstream's own 28 (the recorded model on saved-session rows) rides this revision as
 //   well. This window was first written without it, on the grounds that SessionInfo carried
 //   no recorded model on this lineage and the field would have had no producer; the P3 merge
@@ -1385,6 +1390,7 @@ export type DaemonErrorInfo =
 	| { code: "missing_session_cwd"; issue: SessionCwdIssue }
 	| { code: "session_import_file_not_found"; filePath: string }
 	| { code: "session_already_active"; sessionPath: string; activeSessionId?: string }
+	| { code: "update_restarting" }
 	| { code: "command_result_uncertain"; clientId: DaemonClientId; commandId: DaemonCommandId };
 
 export type DaemonSessionClosedReason = "killed" | "shutdown" | "completed" | "replaced" | "update";
