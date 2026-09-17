@@ -1,0 +1,1 @@
+- Fixed goal token accounting regressing across summary branch rebuilds: the same goal's usage counter can no longer move backwards when a summary navigation reloads a stale persisted state, and a stale active snapshot can no longer revive a goal whose budget gate already fired. Ported from upstream PR #2215.

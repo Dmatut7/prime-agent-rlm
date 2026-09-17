@@ -2600,8 +2600,26 @@ export class AgentSession {
 		}
 	}
 
-	private _reloadGoalStateFromBranch(): void {
-		this._goalState = this._loadPersistedGoalState();
+	private _reloadGoalStateFromBranch(options: { monotonicTokens?: boolean } = {}): void {
+		const previous = this._goalState;
+		const reloaded = this._loadPersistedGoalState();
+		if (options.monotonicTokens && reloaded.goalId !== undefined && reloaded.goalId === previous.goalId) {
+			// A summary branch is a same-timeline rebuild, but the rebuilt branch's
+			// last persisted goal entry can lag the in-memory state (queue/flush
+			// races; an older snapshot re-persisted after newer accounting). Neither
+			// the counters nor an already-fired gate (budget limit, pause,
+			// completion) for the same logical goal may regress across the cold
+			// boundary. Plain branch moves are time travel and keep faithful branch
+			// semantics by calling without the flag.
+			this._goalState = {
+				...previous,
+				tokensUsed: Math.max(previous.tokensUsed, reloaded.tokensUsed),
+				continuationsUsed: Math.max(previous.continuationsUsed, reloaded.continuationsUsed),
+				timeUsedSeconds: Math.max(previous.timeUsedSeconds, reloaded.timeUsedSeconds),
+			};
+		} else {
+			this._goalState = reloaded;
+		}
 		this._goalAccountingStartedAt = this._goalState.status === "active" ? Date.now() : undefined;
 		this._emitGoalUpdate();
 	}
@@ -16310,7 +16328,10 @@ export class AgentSession {
 			this.agent.state.messages = sessionContext.messages;
 			this._mergeUnpersistedOutcomes(this.agent.state.messages);
 			this._restoreLateIpythonSentAgentMessages();
-			this._reloadGoalStateFromBranch();
+			// A summary branch continues the same timeline, so the same goal's
+			// accounting must never regress across the rebuild; a plain branch move
+			// is time travel and keeps faithful branch semantics.
+			this._reloadGoalStateFromBranch({ monotonicTokens: Boolean(summaryText) });
 			this._reloadRlmMaxDepthFromBranch();
 			this._invalidateQueuedPromptPreparation();
 

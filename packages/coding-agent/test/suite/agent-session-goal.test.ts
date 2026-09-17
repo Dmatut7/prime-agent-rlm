@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../../src/core/agent-session.js";
 import { AuthStorage } from "../../src/core/auth-storage.js";
 import type { ExtensionFactory } from "../../src/core/extensions/types.js";
-import type { GoalHostResponse } from "../../src/core/goals.js";
+import { GOAL_STATE_CUSTOM_TYPE, type GoalHostResponse } from "../../src/core/goals.js";
 import { ModelRegistry } from "../../src/core/model-registry.js";
 import { SessionManager } from "../../src/core/session-manager.js";
 import { SettingsManager } from "../../src/core/settings-manager.js";
@@ -552,6 +552,132 @@ describe("AgentSession goals", () => {
 			active: false,
 			status: "idle",
 		});
+	});
+
+	/**
+	 * Shared setup for the monotonic-reload tests: a goal whose budget gate has
+	 * fired in memory, a stale same-goal snapshot re-persisted after it, and one
+	 * more turn so a navigation target exists whose branch keeps the stale entry
+	 * as its last thread_goal_state.
+	 */
+	async function createGoalWithStaleBranchSnapshot(): Promise<{
+		harness: Harness;
+		goalId: string;
+		targetEntryId: string;
+	}> {
+		const harness = await createGoalHarness();
+		harness.setResponses([fauxAssistantMessage("history before the goal")]);
+		await harness.session.prompt("start");
+
+		harness.setResponses([
+			assistantWithUsage("Spent the budget.", { input: 60, output: 50, totalTokens: 110 }),
+			fauxAssistantMessage("Wrapping up."),
+		]);
+		await harness.session.prompt("/goal --budget 100 do work");
+		const goalId = harness.session.goalState.goalId;
+		if (!goalId) {
+			throw new Error("expected the created goal to have an id");
+		}
+		expect(harness.session.goalState.status).toBe("budget_limited");
+		expect(harness.session.goalState.tokensUsed).toBeGreaterThanOrEqual(110);
+
+		// A stale same-goal snapshot re-persisted after the newer accounting
+		// (queue/flush race): the branch's last thread_goal_state entry now lags
+		// the in-memory state that already burned through the budget gate.
+		harness.sessionManager.appendCustomEntry(GOAL_STATE_CUSTOM_TYPE, {
+			...harness.session.goalState,
+			active: true,
+			status: "active",
+			tokensUsed: 10,
+			continuationsUsed: 0,
+			timeUsedSeconds: 0,
+		});
+
+		harness.setResponses([fauxAssistantMessage("third turn")]);
+		await harness.session.prompt("third");
+		const targetEntry = harness.sessionManager
+			.getEntries()
+			.find(
+				(entry) =>
+					entry.type === "message" &&
+					entry.message.role === "user" &&
+					getMessageText(entry.message).includes("third"),
+			);
+		if (!targetEntry) {
+			throw new Error("expected a user entry to navigate to");
+		}
+		return { harness, goalId, targetEntryId: targetEntry.id };
+	}
+
+	it("keeps a fired budget gate when the summary branch's goal snapshot lags memory", async () => {
+		const { harness, goalId, targetEntryId } = await createGoalWithStaleBranchSnapshot();
+		harness.setResponses([fauxAssistantMessage("branch summary")]);
+
+		const result = await harness.session.navigateTree(targetEntryId, { summarize: true });
+
+		// A summary branch was really created: this is the same-timeline rebuild,
+		// not a plain branch move.
+		expect(result.cancelled).toBe(false);
+		expect(result.summaryEntry).toBeDefined();
+
+		// The stale branch snapshot can neither drop the counter nor revive the
+		// goal as active: the budget gate that already fired must survive.
+		expect(harness.session.goalState.status).toBe("budget_limited");
+		expect(harness.session.goalState.goalId).toBe(goalId);
+		expect(harness.session.goalState.tokensUsed).toBeGreaterThanOrEqual(110);
+
+		// The kernel-visible surface agrees: goal.get must not report a reopened
+		// gate with tokens left to spend.
+		const response: GoalHostResponse = harness.session.handleGoalHostRequest("goal.get");
+		expect(response.goal?.status).toBe("budget_limited");
+		expect(response.remaining_tokens).toBe(0);
+	});
+
+	it("clamps the goal counters upward when the branch snapshot is ahead of memory", async () => {
+		const { harness } = await createGoalWithStaleBranchSnapshot();
+		// A snapshot persisted ahead of memory (late-attributed usage): the
+		// monotonic reload must take the higher counters, not keep memory's.
+		const ahead = {
+			tokensUsed: harness.session.goalState.tokensUsed + 500,
+			timeUsedSeconds: harness.session.goalState.timeUsedSeconds + 999,
+			continuationsUsed: harness.session.goalState.continuationsUsed + 2,
+		};
+		harness.sessionManager.appendCustomEntry(GOAL_STATE_CUSTOM_TYPE, {
+			...harness.session.goalState,
+			...ahead,
+		});
+		harness.setResponses([fauxAssistantMessage("fourth turn")]);
+		await harness.session.prompt("fourth");
+		harness.setResponses([fauxAssistantMessage("branch summary")]);
+
+		await harness.session.navigateTree(
+			harness.sessionManager
+				.getEntries()
+				.find(
+					(entry) =>
+						entry.type === "message" &&
+						entry.message.role === "user" &&
+						getMessageText(entry.message).includes("fourth"),
+				)!.id,
+			{ summarize: true },
+		);
+
+		expect(harness.session.goalState.tokensUsed).toBe(ahead.tokensUsed);
+		expect(harness.session.goalState.timeUsedSeconds).toBe(ahead.timeUsedSeconds);
+		expect(harness.session.goalState.continuationsUsed).toBe(ahead.continuationsUsed);
+	});
+
+	it("keeps plain branch moves faithful to the branch's own goal state", async () => {
+		const { harness, targetEntryId } = await createGoalWithStaleBranchSnapshot();
+
+		const result = await harness.session.navigateTree(targetEntryId, { summarize: false });
+
+		expect(result.cancelled).toBe(false);
+		expect(result.summaryEntry).toBeUndefined();
+		// A plain branch move is time travel: the branch's own (stale) entry wins,
+		// even though it is lower than the in-memory accounting.
+		expect(harness.session.goalState.status).toBe("active");
+		expect(harness.session.goalState.tokensUsed).toBe(10);
 	});
 
 	it("normalizes queued goal context text and images", async () => {
