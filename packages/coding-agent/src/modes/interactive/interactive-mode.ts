@@ -237,7 +237,9 @@ import {
 	countDirectSubagentStatuses,
 	countRosterSubagentStatuses,
 	formatSubagentStallMarker,
+	type SubagentSummaryCounts,
 	SubagentSummaryLine,
+	summarizeSubagentSpend,
 } from "./components/subagent-summary-line.js";
 import { ThinkingSelectorComponent } from "./components/thinking-selector.js";
 import {
@@ -303,6 +305,14 @@ const HEARTBEAT_LEGACY_PROMPT_MIN_TOLERANCE_MS = 15_000;
 const HEARTBEAT_LEGACY_PROMPT_MAX_TOLERANCE_MS = 120_000;
 const MODEL_CATALOG_REFRESH_TTL_MS = 60_000;
 const FEATURE_HINT_DELAY_MS = 5_000;
+/**
+ * Spend-cell refresh cadence. The figure comes from the context tree, whose
+ * disk scan is budgeted but not free, so events coalesce through a debounce and
+ * live activity rescans at most once per interval; forced refreshes (turn end)
+ * bypass the throttle.
+ */
+const SUBAGENT_SPEND_DEBOUNCE_MS = 500;
+const SUBAGENT_SPEND_MIN_INTERVAL_MS = 5_000;
 
 export const START_HINTS = [
 	'Try "refactor @<filepath>"',
@@ -1056,6 +1066,15 @@ export class InteractiveMode {
 	// One summary line below the editor, backed by the existing child-status stream.
 	private subagentSummaryLine: SubagentSummaryLine;
 	private subagentSnapshots = new Map<string, AgentConnectionRlmChildAgentSnapshot>();
+	private subagentCounts: SubagentSummaryCounts = { total: 0, running: 0, idle: 0, inactive: 0 };
+	private subagentSpendTimer: ReturnType<typeof setTimeout> | undefined;
+	/** When the pending spend-refresh timer fires (epoch ms); 0 with no timer. */
+	private subagentSpendTimerDeadline = 0;
+	/** When the last context-tree scan finished starting (epoch ms); 0 before the first. */
+	private subagentSpendLastScanAt = 0;
+	private subagentSpendScanning = false;
+	/** A refresh was requested while a scan was in flight; rerun when it settles. */
+	private subagentSpendRescanRequested = false;
 	private rlmNodeId: string | undefined;
 	private rosterBar: { summaries(): SessionSummary[]; dispose(): Promise<void> } | undefined;
 
@@ -5690,6 +5709,9 @@ export class InteractiveMode {
 			case "message_end":
 				if (event.message.role === "user") break;
 				if (event.message.role === "assistant") {
+					// Each landed assistant message grows the mother's own usage, i.e. the
+					// secondary "总" figure; throttled, so this stays cheap mid-turn.
+					this.scheduleSubagentSpendRefresh();
 					this.streamingMessage = event.message;
 					let errorMessage: string | undefined;
 					if (this.streamingMessage.stopReason === "aborted") {
@@ -5809,6 +5831,9 @@ export class InteractiveMode {
 				// Auto-compaction can start server-side while this event is being handled.
 				// Do not hold its start event behind a stats RPC; stale refreshes are discarded.
 				void this.refreshConnectionContextUsage();
+				// Turn end is when child usage attributions settle; refresh the spend
+				// cell now instead of waiting out the activity throttle.
+				this.scheduleSubagentSpendRefresh(true);
 
 				await this.checkShutdownRequested();
 
@@ -6171,15 +6196,19 @@ export class InteractiveMode {
 		// snapshots carry the bar. A public parent with zero roster children shows zero.
 		const sessionOnRoster =
 			rosterSummaries?.some((row) => row.sessionId === this.connectionState?.sessionId) === true;
-		this.subagentSummaryLine.setSubagentCounts(
+		const counts =
 			rosterSummaries && sessionOnRoster
 				? countRosterSubagentStatuses(rosterSummaries, {
 						activeSessionId: this.connectionState?.activeSessionId,
 						sessionId: this.connectionState?.sessionId,
 						sessionFile: this.connectionState?.sessionFile,
 					})
-				: countDirectSubagentStatuses(this.subagentSnapshots.values(), this.rlmNodeId),
-		);
+				: countDirectSubagentStatuses(this.subagentSnapshots.values(), this.rlmNodeId);
+		this.subagentCounts = counts;
+		this.subagentSummaryLine.setSubagentCounts(counts);
+		// The spend cell rides the same events (rlm_child_update, roster republish,
+		// resync) but is computed from the context tree, asynchronously.
+		this.scheduleSubagentSpendRefresh();
 		// A stalled child still counts as running, so the stall has to be visible on
 		// its own line or a wedged subagent reads as progress.
 		const stallMarkers: string[] = [];
@@ -6190,6 +6219,91 @@ export class InteractiveMode {
 		}
 		this.subagentSummaryLine.setStallMarkers(stallMarkers);
 		if (!this.subagentSummaryLine.isSelectable() && this.subagentSummaryLine.focused) this.focusEditor();
+	}
+
+	/**
+	 * Event-driven refresh of the spend cell. The context tree is an async,
+	 * disk-scanning RPC, so it is never awaited in a render path: events schedule
+	 * a scan, the scan lands its figure on the component, and a render follows.
+	 *
+	 * Scheduling: bursts coalesce behind the debounce; a scan that already started
+	 * throttles the next to the min interval (the scan is budgeted, but a busy
+	 * roster still reads real bytes); a forced refresh (turn end) fires
+	 * immediately. Without sub-agents the cell is blank, not ¥0.00.
+	 */
+	private scheduleSubagentSpendRefresh(force = false): void {
+		if (this.subagentCounts.total === 0) {
+			this.clearSubagentSpendRefresh();
+			this.subagentSummaryLine.setSubagentSpend(undefined);
+			return;
+		}
+		const now = Date.now();
+		// The throttle cap keeps sustained event bursts from starving the refresh:
+		// a scheduled deadline never sits more than one interval past the last scan.
+		const cap =
+			this.subagentSpendLastScanAt > 0
+				? this.subagentSpendLastScanAt + SUBAGENT_SPEND_MIN_INTERVAL_MS
+				: Number.POSITIVE_INFINITY;
+		const debounce = force ? 0 : SUBAGENT_SPEND_DEBOUNCE_MS;
+		const deadline = Math.min(now + debounce, cap);
+		if (this.subagentSpendTimer !== undefined && this.subagentSpendTimerDeadline <= deadline) return;
+		this.clearSubagentSpendRefresh();
+		this.subagentSpendTimerDeadline = deadline;
+		this.subagentSpendTimer = setTimeout(
+			() => {
+				this.subagentSpendTimer = undefined;
+				this.subagentSpendTimerDeadline = 0;
+				void this.refreshSubagentSpend();
+			},
+			Math.max(0, deadline - now),
+		);
+		this.subagentSpendTimer.unref?.();
+	}
+
+	private clearSubagentSpendRefresh(): void {
+		if (this.subagentSpendTimer !== undefined) {
+			clearTimeout(this.subagentSpendTimer);
+			this.subagentSpendTimer = undefined;
+		}
+		this.subagentSpendTimerDeadline = 0;
+		this.subagentSpendRescanRequested = false;
+	}
+
+	/**
+	 * One context-tree scan behind the spend cell. A failure keeps the last good
+	 * figure (a blank would read as "spent nothing") and never surfaces an error:
+	 * the cell is best-effort, the /context command remains the authoritative view.
+	 */
+	private async refreshSubagentSpend(): Promise<void> {
+		if (this.subagentSpendScanning) {
+			this.subagentSpendRescanRequested = true;
+			return;
+		}
+		this.subagentSpendScanning = true;
+		try {
+			const tree = await this.agentConnection.getContextTree();
+			this.subagentSpendLastScanAt = Date.now();
+			this.subagentSummaryLine.setSubagentSpend(summarizeSubagentSpend(tree, (model) => this.isModelPriced(model)));
+			this.ui.requestRender();
+		} catch {
+			// Silent degrade: no data, no cell update.
+		} finally {
+			this.subagentSpendScanning = false;
+			if (this.subagentSpendRescanRequested) {
+				this.subagentSpendRescanRequested = false;
+				this.scheduleSubagentSpendRefresh(true);
+			}
+		}
+	}
+
+	/**
+	 * Whether a model has per-token rates. A registry miss or an all-zero `cost`
+	 * block (models.json entries without `cost` load as zeros) means the model's
+	 * usage carries no money - flagged as unpriced rather than silently free.
+	 */
+	private isModelPriced(model: { provider: string; id: string }): boolean {
+		const cost = this.modelRegistry.find(model.provider, model.id)?.cost;
+		return cost !== undefined && (cost.input > 0 || cost.output > 0 || cost.cacheRead > 0 || cost.cacheWrite > 0);
 	}
 
 	private removeSubagentSnapshot(id: string): void {
@@ -10506,6 +10620,7 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 		this.endFeatureHintRun();
 		this.stopWorkingPulse();
 		this.stopGoalTrayTimer();
+		this.clearSubagentSpendRefresh();
 		this.closeHeartbeatManager();
 		this.clearExtensionTerminalInputListeners();
 		this.footer.dispose();

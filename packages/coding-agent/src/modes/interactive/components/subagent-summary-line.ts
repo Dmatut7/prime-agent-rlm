@@ -1,19 +1,105 @@
+import type { Usage } from "@earendil-works/pi-ai";
 import { type Component, type Focusable, getKeybindings, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import type { ContextTreeNode } from "../../../core/context-tree.js";
 import type { AgentConnectionRlmChildAgentSnapshot } from "../../agent-connection/index.js";
 import { isDirectAgentChild } from "../../agents-view/agents-view-state.js";
 import { type AgentRosterStatus, classifyAgentStatus } from "../../daemon/agent-roster.js";
 import { classifySessionRosterStatus, type SessionSummary } from "../../daemon/daemon-session-list.js";
+import { formatTokenCount } from "../agent-activity.js";
+import { formatSpendCost } from "../spend-format.js";
 import { theme } from "../theme/theme.js";
 import { keyText } from "./keybinding-hints.js";
 
 /** Bound on stall marker lines so a wedged family cannot push the editor off screen. */
 const MAX_RENDERED_STALL_MARKERS = 3;
 
+/** Space between the counts and the spend cell; matches the counts' own rhythm. */
+const SPEND_SEPARATOR = "   ";
+
+/** Blank space always kept between the spend cell and the open hint. */
+const SPEND_MIN_GAP = 1;
+
 export interface SubagentSummaryCounts {
 	total: number;
 	running: number;
 	idle: number;
 	inactive: number;
+}
+
+/**
+ * Spend figures for the subagents tray cell: one total for all sub-agents of
+ * this session, in money and tokens.
+ *
+ * 口径: `cost`/`tokens` sum the OWN usage of every agent in the session's
+ * context tree except the root - direct children AND their descendants, live
+ * and persisted (the tree walk covers both) - so it is a whole-tree figure,
+ * bounded by the tree's scan budget (`partial` marks a truncated scan). Each
+ * sub-agent's spend is counted once, at its own node: the mother transcript's
+ * `child_usage_attributed` lines are already subtracted out of the root's
+ * ownUsage, so `parentCost + cost` never double-counts a child through both
+ * paths, and matches the "Total" line of /usage exactly.
+ */
+export interface SubagentSpendSummary {
+	/** Σ own cost of every sub-agent, in the models.json cost unit. */
+	cost: number;
+	/** Σ spend-relevant tokens (input+output+cacheRead+cacheWrite) of every sub-agent. */
+	tokens: number;
+	/** The root's own cost; the secondary "总" figure is parentCost + cost. */
+	parentCost: number;
+	/** Models with no per-token rates: their tokens carry no money and are flagged instead. */
+	unpriced: ReadonlyArray<{ model: string; tokens: number }>;
+	/** A scan budget truncated the tree, so every figure is a lower bound. */
+	partial: boolean;
+}
+
+/** Spend-relevant token count, matching the "Total" line of /usage. */
+function spentTokens(usage: Usage): number {
+	return usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+}
+
+/**
+ * Fold a session's context tree into the tray's spend summary (see
+ * {@link SubagentSpendSummary} for the double-counting rules).
+ *
+ * A node whose own usage already carries cost is treated as priced whatever
+ * its recorded model says: the money was computed at generation time with real
+ * rates, so flagging it would be a false warning. A node is "unpriced" only
+ * when it spent tokens, earned no money, and its model is missing or has no
+ * per-token rates (models.json entries without `cost` load as all-zero rates).
+ */
+export function summarizeSubagentSpend(
+	root: ContextTreeNode,
+	isModelPriced: (model: { provider: string; id: string }) => boolean,
+): SubagentSpendSummary {
+	let cost = 0;
+	let tokens = 0;
+	let partial = false;
+	const unpriced = new Map<string, number>();
+	const walk = (node: ContextTreeNode, isRoot: boolean): void => {
+		if (node.scan?.truncated) partial = true;
+		if (!isRoot) {
+			const nodeTokens = spentTokens(node.ownUsage);
+			cost += node.ownUsage.cost.total;
+			tokens += nodeTokens;
+			if (node.ownUsage.cost.total === 0 && nodeTokens > 0 && (!node.model || !isModelPriced(node.model))) {
+				const key = node.model?.id ?? "?";
+				unpriced.set(key, (unpriced.get(key) ?? 0) + nodeTokens);
+			}
+		}
+		for (const child of node.children) {
+			walk(child, false);
+		}
+	};
+	walk(root, true);
+	return {
+		cost,
+		tokens,
+		parentCost: root.ownUsage.cost.total,
+		unpriced: [...unpriced.entries()]
+			.map(([model, unpricedTokens]) => ({ model, tokens: unpricedTokens }))
+			.sort((a, b) => b.tokens - a.tokens || (a.model < b.model ? -1 : 1)),
+		partial,
+	};
 }
 
 export function classifySubagentSnapshotStatus(child: AgentConnectionRlmChildAgentSnapshot): AgentRosterStatus {
@@ -84,6 +170,7 @@ export function countRosterSubagentStatuses(
 export class SubagentSummaryLine implements Component, Focusable {
 	focused = false;
 	private counts: SubagentSummaryCounts = { total: 0, running: 0, idle: 0, inactive: 0 };
+	private spend: SubagentSpendSummary | undefined;
 	private stallMarkers: readonly string[] = [];
 	private openable = false;
 	private cachedWidth?: number;
@@ -102,6 +189,15 @@ export class SubagentSummaryLine implements Component, Focusable {
 
 	setSubagentCounts(counts: SubagentSummaryCounts): void {
 		this.counts = counts;
+	}
+
+	/**
+	 * Spend figure for the blank area between the counts and the open hint.
+	 * `undefined` (or an all-zero summary) keeps the cell blank: no sub-agents,
+	 * no data yet, or nothing spent - a ¥0.00 tile would be noise, not a figure.
+	 */
+	setSubagentSpend(spend: SubagentSpendSummary | undefined): void {
+		this.spend = spend;
 	}
 
 	/**
@@ -156,6 +252,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 			this.counts.running,
 			this.counts.idle,
 			this.counts.inactive,
+			this.spendKey(),
 			this.openable ? 1 : 0,
 			this.focused ? 1 : 0,
 			this.stallMarkers.join("\u0000"),
@@ -163,6 +260,19 @@ export class SubagentSummaryLine implements Component, Focusable {
 			this.getLocationLabel() ?? "",
 			this.getContextLabel() ?? "",
 		].join("\u0001");
+	}
+
+	/** Cache identity of the spend cell; the rendered figure changes with every field. */
+	private spendKey(): string {
+		const spend = this.spend;
+		if (!spend) return "";
+		return [
+			spend.cost,
+			spend.tokens,
+			spend.parentCost,
+			spend.unpriced.map((entry) => `${entry.model}:${entry.tokens}`).join(","),
+			spend.partial ? 1 : 0,
+		].join("\u0002");
 	}
 
 	private renderLines(width: number): string[] {
@@ -188,8 +298,25 @@ export class SubagentSummaryLine implements Component, Focusable {
 				? `${keyText("tui.select.confirm")}/${keyText("app.agents.open")} open`
 				: `${keyText("tui.editor.cursorDown", { primaryOnly: true })} select`
 			: "";
-		const gap = Math.max(1, inner - 2 - visibleWidth(counts) - visibleWidth(openHint));
-		const body = truncateToWidth(` ${counts}${" ".repeat(gap)}${theme.fg("dim", openHint)} `, inner, "…");
+		// The blank area between the counts and the open hint carries the family
+		// spend (Σ sub-agent money + tokens; mother included as a secondary figure
+		// when width allows). The hint stays right-anchored and the body is padded
+		// to the full inner width, so figure changes only ever eat whitespace -
+		// the money is fixed two-decimal and the tokens use the bounded k/M
+		// abbreviation, neither of which can move the hint or the line length.
+		const spendBudget =
+			inner - 2 - visibleWidth(counts) - SPEND_SEPARATOR.length - SPEND_MIN_GAP - visibleWidth(openHint);
+		const spend = this.renderSpend(spendBudget);
+		const separator = spend ? SPEND_SEPARATOR : "";
+		const gap = Math.max(
+			SPEND_MIN_GAP,
+			inner - 2 - visibleWidth(counts) - separator.length - visibleWidth(spend) - visibleWidth(openHint),
+		);
+		const body = truncateToWidth(
+			` ${counts}${separator}${spend}${" ".repeat(gap)}${theme.fg("dim", openHint)} `,
+			inner,
+			"…",
+		);
 		const pad = " ".repeat(Math.max(0, inner - visibleWidth(body)));
 		// Truncation may inject full ANSI resets; wrap each segment so the
 		// selection background survives past them (custom-editor precedent).
@@ -210,6 +337,55 @@ export class SubagentSummaryLine implements Component, Focusable {
 		return lines;
 	}
 
+	/**
+	 * The spend cell, degraded to the widest form that fits `budget` columns.
+	 *
+	 * Degradation order (each step loses exactly one thing): "总" first (the
+	 * least valuable figure by design), then the unpriced annotation's token
+	 * counts, then the annotation itself, then the whole cell - a truncated
+	 * money figure would read as a wrong number, so the cell is dropped, never
+	 * ellipsized. All-zero figures render nothing (no ¥0.00 noise), and an
+	 * all-unpriced family shows tokens plus the warning instead of ¥0.00.
+	 */
+	private renderSpend(budget: number): string {
+		const spend = this.spend;
+		if (!spend || (spend.cost === 0 && spend.tokens === 0)) return "";
+		const dot = theme.fg("dim", " · ");
+		const label = theme.fg("dim", "Σ 子代理");
+		const money =
+			spend.cost > 0
+				? `${spend.partial ? theme.fg("dim", "≈") : ""}${theme.fg("accent", formatSpendCost(spend.cost))}`
+				: "";
+		const tokens = theme.fg("dim", `${spend.partial ? "≈" : ""}${formatTokenCount(spend.tokens)} tok`);
+		const primary = money ? `${label} ${money}${dot}${tokens}` : `${label} ${tokens}`;
+		const total = spend.parentCost + spend.cost;
+		const secondary =
+			total > 0 ? `${dot}${theme.fg("dim", `总 ${spend.partial ? "≈" : ""}${formatSpendCost(total)}`)}` : "";
+		const annotate = (withTokens: boolean): string => {
+			const annotation = this.renderUnpricedAnnotation(spend, withTokens);
+			return annotation ? ` ${annotation}` : "";
+		};
+		const rungs = [
+			primary + secondary + annotate(true),
+			primary + annotate(true),
+			primary + annotate(false),
+			primary,
+		];
+		for (const rung of rungs) {
+			if (visibleWidth(rung) <= budget) return rung;
+		}
+		return "";
+	}
+
+	/** `(kimi-k3 8.1M tok 未定价)`; `withTokens: false` drops the per-model token counts. */
+	private renderUnpricedAnnotation(spend: SubagentSpendSummary, withTokens: boolean): string {
+		if (spend.unpriced.length === 0) return "";
+		const models = spend.unpriced
+			.map((entry) => (withTokens ? `${entry.model} ${formatTokenCount(entry.tokens)}` : entry.model))
+			.join(" · ");
+		return theme.fg("warning", `(${models}${withTokens ? " tok" : ""} 未定价)`);
+	}
+
 	private renderInfoLine(width: number): string[] {
 		const overrideLabel = this.getOverrideLabel()?.trim();
 		const locationLabel = this.getLocationLabel()?.trim();
@@ -228,7 +404,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 	}
 
 	invalidate(): void {
-		// Render output is derived from counts, focus state, and theme/keybindings.
+		// Render output is derived from counts, spend, focus state, and theme/keybindings.
 		this.cachedWidth = undefined;
 		this.cachedKey = undefined;
 		this.cachedLines = undefined;

@@ -7,6 +7,10 @@ import { AgentActivityTracker } from "../src/modes/interactive/agent-activity.js
 import type { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
 import type { FileChangeSummary } from "../src/modes/interactive/components/edit-summary.js";
 import { createMermaidMarkdownTransform } from "../src/modes/interactive/components/mermaid.js";
+import {
+	type SubagentSummaryCounts,
+	SubagentSummaryLine,
+} from "../src/modes/interactive/components/subagent-summary-line.js";
 import type { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { getMarkdownTheme, initTheme } from "../src/modes/interactive/theme/theme.js";
@@ -42,6 +46,8 @@ type HandleEventThis = {
 	streamingMessage: AssistantMessage | undefined;
 	pendingTools: Map<string, ToolExecutionComponent>;
 	agentRunFileChanges: Map<string, FileChangeSummary>;
+	subagentCounts: SubagentSummaryCounts;
+	subagentSummaryLine: SubagentSummaryLine;
 	updateConnectionStateFromEvent(event: AgentConnectionSessionEvent): void;
 	getMarkdownThemeWithSettings(): MarkdownTheme;
 	getOrCreatePendingToolComponent(): Promise<ToolExecutionComponent | undefined>;
@@ -76,6 +82,10 @@ function createFakeInteractiveModeThis(): HandleEventThis {
 	const fakeThis = {
 		isInitialized: true,
 		settingsManager: { getShowTerminalProgress: () => false },
+		// message_end/agent_end feed the subagent spend cell; with zero children the
+		// schedule path clears the cell and never arms a timer.
+		subagentCounts: { total: 0, running: 0, idle: 0, inactive: 0 } satisfies SubagentSummaryCounts,
+		subagentSummaryLine: new SubagentSummaryLine(),
 		connectionState: { isStreaming: false },
 		toolOutputExpanded: false,
 		footer: { invalidate: vi.fn() },
