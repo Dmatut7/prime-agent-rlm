@@ -303,3 +303,13 @@
 4. **裁决：abortAndSendQueued 的退化语义**——上游对无 capability 的老 daemon 静默退化为普通 abort；本仓裁为**退化但响亮**：退化到 abort() 的同时落一条 warn 级 notice/回执说明"排队消息未随中断发出、原因=daemon 无 abort_and_send_queued 能力"，与全仓"响亮优先"文化一致。
 5. **版本面件数纠正**：派单写 24，四种口径复算均为 **17 件**（复跑命令在 /tmp/p5-prep/）；以 17 为准，不凑数。tui 单包动版本号会 ETARGET 破坏 lockstep，恢复命令已备；`npm -ws` 够不到 root，lockstep bump 必须在根跑。
 6. **update-source 裁决**：自更新**安装路径**已有 fork 闸门（c1daaff3f 拒自更新），没闸的是**启动升级提示**；两处置 diff 草稿在 /tmp/p5-prep/（禁提示 vs 文档明示），残余洞＝marker 不进包；裁：**P5 同窗做"禁提示+文档明示"双保险**。
+
+---
+
+## 12. 承重件裁法与母席拍板（p3-plan-1/1b 双份 + p3-reconcile 对账中）
+
+裁法表：/tmp/p3-plan-agentsession.md（77 行：agent-session 60 块 + session-manager 17 块；分布 取上游 12 / 保我们 28 / 人工并集 22 / 等落地 15）；双份独立产出的分歧由 p3-reconcile 席对账（/tmp/p3-plan-reconcile.md）。
+执行顺序：P0 独立块 → P1 挂起批 → P2 十个成组批（sm17→5/8/9→6/7，导入表最后）→ P3 尾闸；每块回滚把手在表内。
+**母席拍板两项**：
+1. **symlink / read-only-open 安全取向**：保我们更严的取向（private-files 的拒 symlink / 0600 / O_NOFOLLOW），不随 #2028 放宽；与上游的偏差写进提交说明与本文档，作为 fork 安全基线。
+2. **as 块2 refine 通知形态**：采用上游 durable `refinement_notice` 的投递机制，但渲染必须保留 MV-5「被拒条目可见」（与 §3.2 #2098 裁法一致）；notice 与 outcome 不双投递（去重 pin 已有）。
