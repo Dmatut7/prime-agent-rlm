@@ -6,6 +6,7 @@
 // documented in prime-agent-runtime/src/rlm/repl.md.
 import type { ChildProcess } from "node:child_process";
 import {
+	chmodSync,
 	closeSync,
 	constants,
 	existsSync,
@@ -189,6 +190,9 @@ const NONBLOCK_FLAG = constants.O_NONBLOCK ?? 0;
 // Written into the log once when the per-spawn write budget is spent; the handler keeps
 // draining (and feeding the ring) after that, so a blocked pipe never wedges a pre-ready kernel.
 const KERNEL_STDERR_LOG_BUDGET_MARKER = "[stderr log budget exhausted]\n";
+// Owner-only file bits; kernel stderr can carry exception payloads.
+// (The log's directory is handled by ensurePrivateDirectory, which enforces 0700.)
+const KERNEL_STDERR_LOG_MODE = 0o600;
 
 /** fs.writeSync may write fewer bytes than asked (partial ENOSPC, signals); loop until done. */
 function writeFullySync(fd: number, data: Buffer): void {
@@ -1026,6 +1030,9 @@ export class ReplKernelManager {
 			let size = exists ? statSync(path).size : 0;
 			if (size > MAX_KERNEL_STDERR_LOG_BYTES) {
 				try {
+					// Tighten before the move: a renamed log keeps its mode, and the
+					// rotated file holds the exception payloads worth protecting.
+					chmodSync(path, KERNEL_STDERR_LOG_MODE);
 					// Drop any prior .old first: rename fails on Windows if it exists.
 					rmSync(`${path}.old`, { force: true });
 					renameSync(path, `${path}.old`);
@@ -1049,7 +1056,16 @@ export class ReplKernelManager {
 					NONBLOCK_FLAG,
 				0o600,
 			);
-			if (process.platform !== "win32") fchmodSync(fd, 0o600);
+			if (process.platform !== "win32") {
+				// Exact bits despite the umask; tightens a pre-existing loose log. A failed
+				// fchmod closes the descriptor so the outer catch cannot leak it.
+				try {
+					fchmodSync(fd, 0o600);
+				} catch (error) {
+					closeSync(fd);
+					throw error;
+				}
+			}
 			return { fd, budget: Math.max(0, MAX_KERNEL_STDERR_LOG_BYTES - size) };
 		} catch (error) {
 			this.appendKernelDiagnostic(`cannot open kernel stderr log: ${errorMessage(error)}`);
