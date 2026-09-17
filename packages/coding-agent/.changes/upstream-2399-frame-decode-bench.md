@@ -1,0 +1,1 @@
+- Added a `frame_decode` transport benchmark to the performance harness: a standalone node harness decodes a 32 MiB private frame with a snapshot-chunk routing header in 8 KiB chunks against the prepared source build, recorded through a new transport worker phase with report tables and schema wiring; the benchmarks suite regains `worker.py`, its README, and its test suite.
