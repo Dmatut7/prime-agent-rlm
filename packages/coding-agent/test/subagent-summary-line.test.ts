@@ -4,6 +4,7 @@ import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import type { ContextTreeNode } from "../src/core/context-tree.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
+import { createSpendPricing, type SpendPriceRates } from "../src/core/spend-pricing.js";
 import type { AgentConnectionRlmChildAgentSnapshot } from "../src/modes/agent-connection/types.js";
 import { buildAgentsViewRows, collectSubagentDescendantSummaries } from "../src/modes/agents-view/agents-view-state.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
@@ -487,6 +488,18 @@ function usage(input: number, output: number, cost: number): Usage {
 	};
 }
 
+/** Usage with all four billed fields and a recorded total, for the price-override pins. */
+function usageWithCache(input: number, output: number, cacheRead: number, cacheWrite: number, cost: number): Usage {
+	return {
+		input,
+		output,
+		cacheRead,
+		cacheWrite,
+		totalTokens: input + output + cacheRead + cacheWrite,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: cost },
+	};
+}
+
 function tree(
 	root: Usage,
 	children: ContextTreeNode[],
@@ -722,6 +735,8 @@ describe("subagent spend cell", () => {
 			intervalMs?: number;
 			/** Model rates lookup behind the unpriced annotation; undefined = an unpriced model. */
 			modelCost?: { input: number; output: number; cacheRead: number; cacheWrite: number } | undefined;
+			/** `ui.subagentSpendCell.priceOverrides`; absent = nothing overridden. */
+			priceOverrides?: Record<string, { input?: number; output?: number; cacheRead?: number; cacheWrite?: number }>;
 		} = {},
 	) {
 		const line = new SubagentSummaryLine();
@@ -743,6 +758,7 @@ describe("subagent spend cell", () => {
 				settingsManager: {
 					getSubagentSpendCellEnabled: () => options.spendCellEnabled ?? true,
 					getSubagentSpendCellIntervalMs: () => options.intervalMs ?? 15_000,
+					getSubagentSpendCellPriceOverrides: () => options.priceOverrides ?? {},
 				},
 				modelRegistry: { find: vi.fn(() => (options.modelCost ? { cost: options.modelCost } : undefined)) },
 			},
@@ -986,5 +1002,126 @@ describe("subagent spend cell", () => {
 		Reflect.set(mode, "subagentCounts", { total: 0, running: 0, idle: 0, inactive: 0 });
 		schedule.call(mode);
 		expect(setSpend).toHaveBeenCalledWith(undefined);
+	});
+
+	it("prices the cell from ui.subagentSpendCell.priceOverrides, and keeps a rate-less model billable", async () => {
+		// models.json has no rates for kimi-k3 (an all-zero cost block), so without the
+		// override its million tokens would be flagged unpriced instead of costing anything.
+		const contextTree = tree(usage(100, 50, 0.05), [
+			agent("sub-1", usage(1_000_000, 0, 0), { provider: "bailian", id: "kimi-k3" }),
+		]);
+		const { mode, setSpend, update, schedule } = createSpendMode({
+			contextTree,
+			getContextTree: async () => contextTree,
+			modelCost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			priceOverrides: { "bailian/kimi-k3": { input: 3, output: 15 } },
+		});
+
+		update.call(mode, child("worker", "running"));
+		schedule.call(mode, true);
+		await vi.waitFor(
+			() => {
+				expect(setSpend).toHaveBeenCalled();
+			},
+			{ timeout: 5_000 },
+		);
+		// The settings reached the pricing point: 1M input at the corrected 3, the
+		// recorded money for that model (0) replaced rather than added to.
+		expect(setSpend.mock.calls.at(-1)?.[0]).toEqual({
+			cost: 3,
+			tokens: 1_000_000,
+			parentCost: 0.05,
+			unpriced: [],
+			overridePriced: [{ model: "kimi-k3", tokens: 1_000_000 }],
+			partial: false,
+		});
+	});
+});
+
+/**
+ * The cell's pricing取数点: `ui.subagentSpendCell.priceOverrides` first,
+ * models.json second. A wrong rate in models.json is what the boss could not fix
+ * from inside the app, so these pins are about the figure actually moving - and
+ * about a model nobody corrected keeping the money already recorded on it.
+ */
+describe("spend price overrides", () => {
+	/** The models.json rates every fixture model is billed at unless a test says otherwise. */
+	const MODELS_JSON_RATES: SpendPriceRates = { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 4 };
+
+	function pricing(
+		overrides: Record<string, { input?: number; output?: number; cacheRead?: number; cacheWrite?: number }>,
+	) {
+		return createSpendPricing({ overrides, ratesFor: () => MODELS_JSON_RATES });
+	}
+
+	const kimi = { provider: "bailian", id: "kimi-k3" };
+
+	it("re-prices an overridden model from its tokens, so a corrected input rate moves Σ", () => {
+		// Recorded money says input billed at models.json's 1: 1M in + 1M out + 1M
+		// read = 3.5. The override says the input rate was really 7.
+		const contextTree = tree(usage(100, 50, 0.05), [
+			agent("sub-1", usageWithCache(1_000_000, 1_000_000, 1_000_000, 0, 3.5), kimi),
+		]);
+
+		const untouched = summarizeSubagentSpend(contextTree, () => true, pricing({}));
+		expect(untouched.cost).toBe(3.5);
+		expect(untouched.overridePriced).toBeUndefined();
+
+		const corrected = summarizeSubagentSpend(contextTree, () => true, pricing({ "bailian/kimi-k3": { input: 7 } }));
+		// 1M at 7 + 1M at models.json's 2 + 1M at 0.5.
+		expect(corrected.cost).toBe(9.5);
+		expect(corrected.overridePriced).toEqual([{ model: "kimi-k3", tokens: 3_000_000 }]);
+		// The mother's own money is not this cell's business unless its model is
+		// overridden too - the child's correction must not leak into it.
+		expect(corrected.parentCost).toBe(0.05);
+	});
+
+	it("leaves every model nobody corrected on the money recorded on its messages", () => {
+		const other = { provider: "bailian", id: "qwen3.8-flash" };
+		const contextTree = tree(usage(100, 50, 0.05), [
+			agent("sub-1", usageWithCache(1_000_000, 1_000_000, 0, 0, 3), kimi),
+			agent("sub-2", usageWithCache(1_000_000, 1_000_000, 0, 0, 3), other),
+		]);
+
+		const summary = summarizeSubagentSpend(contextTree, () => true, pricing({ "bailian/kimi-k3": { input: 7 } }));
+		// sub-1 re-priced to 9, sub-2 keeps its recorded 3: an override is per model,
+		// and re-pricing a model nobody complained about would invent a figure.
+		expect(summary.cost).toBe(12);
+		expect(summary.overridePriced).toEqual([{ model: "kimi-k3", tokens: 2_000_000 }]);
+	});
+
+	it("takes the fields an override leaves out from models.json, not from zero", () => {
+		const contextTree = tree(usage(0, 0, 0), [
+			agent("sub-1", usageWithCache(1_000_000, 1_000_000, 1_000_000, 1_000_000, 3.5), kimi),
+		]);
+
+		const summary = summarizeSubagentSpend(contextTree, () => true, pricing({ "bailian/kimi-k3": { input: 7 } }));
+		// input 7 (override) + output 2 + cacheRead 0.5 + cacheWrite 4 (models.json).
+		expect(summary.cost).toBe(13.5);
+	});
+
+	it("marks the re-priced model in the cell, and drops the marker before the figure", () => {
+		const line = new SubagentSummaryLine();
+		line.setSubagentCounts({ total: 1, running: 0, idle: 1, inactive: 0 });
+		line.setSubagentSpend(
+			spend({
+				cost: 9,
+				tokens: 2_000_000,
+				overridePriced: [{ model: "kimi-k3", tokens: 2_000_000 }],
+			}),
+		);
+
+		const wide = stripAnsi(line.render(120)[1]);
+		expect(wide).toContain("Σ 子代理 ¥9.00 · 2.0M tok · 总 ¥9.00 (kimi-k3 2.0M tok 已改价)");
+		expect(line.render(120)[1]).toContain(theme.fg("accent", "(kimi-k3 2.0M tok 已改价)"));
+
+		// The marker degrades with the rest of the annotation, and a truncated money
+		// figure is never shown: the cell drops whole rungs, it does not ellipsize.
+		const narrow = stripAnsi(line.render(70)[1]);
+		expect(narrow).toContain("Σ 子代理 ¥9.00 · 2.0M tok");
+		expect(narrow).not.toContain("已改价");
+		for (const width of [120, 100, 80, 70, 60]) {
+			expect(visibleWidth(line.render(width)[1])).toBeLessThanOrEqual(width);
+		}
 	});
 });

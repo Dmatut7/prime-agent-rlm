@@ -907,5 +907,124 @@ describe("SettingsManager", () => {
 			expect(collectUnknownSettingsKeys({ ui: { subagentSpendCell: false } })).toEqual([]);
 			expect(collectUnknownSettingsKeys({ ui: { subagentSpendCel: false } })).toEqual(["ui.subagentSpendCel"]);
 		});
+
+		it("reads the price overrides a user configured, and reports every value it cannot use", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					ui: {
+						subagentSpendCell: {
+							priceOverrides: {
+								"bailian/kimi-k3": { input: 3, output: "15" },
+								"bailian/qwen3.8-flash": { cacheRead: -1 },
+								"bailian/glm-5.3": 7,
+								"no-slash-key": { input: 1 },
+							},
+						},
+					},
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			// Only what can be used is handed to the pricing point: a wrong value never
+			// becomes a rate, and never takes the model's other fields down with it.
+			expect(manager.getSubagentSpendCellPriceOverrides()).toEqual({ "bailian/kimi-k3": { input: 3 } });
+
+			const warnings = manager.drainWarnings("global");
+			// Four refusals, none silent, each naming the full path and what it did instead.
+			expect(warnings).toHaveLength(4);
+			const messages = warnings.map((warning) => warning.message).join("\n");
+			expect(messages).toContain('ui.subagentSpendCell.priceOverrides["bailian/kimi-k3"].output');
+			expect(messages).toContain('"15"');
+			expect(messages).toContain('ui.subagentSpendCell.priceOverrides["bailian/qwen3.8-flash"].cacheRead');
+			expect(messages).toContain('ui.subagentSpendCell.priceOverrides["bailian/glm-5.3"]');
+			expect(messages).toContain('ui.subagentSpendCell.priceOverrides["no-slash-key"]');
+			for (const message of warnings.map((warning) => warning.message)) {
+				expect(message).toMatch(/not a usable price override/);
+			}
+			// The block itself is a known key, so a clean entry draws no key warning.
+			expect(manager.drainWarnings("global")).toEqual([]);
+		});
+
+		it("does not report a usable override, and knows the block as a nested key", () => {
+			const clean = { "bailian/kimi-k3": { input: 3, output: 15 } };
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({ ui: { subagentSpendCell: { priceOverrides: clean } } }),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getSubagentSpendCellPriceOverrides()).toEqual(clean);
+			expect(manager.drainWarnings()).toEqual([]);
+
+			// The block is registered, so its own name is not an unknown key - while a
+			// misspelling of it still reports, like every other settings name.
+			expect(collectUnknownSettingsKeys({ ui: { subagentSpendCell: { priceOverrides: clean } } })).toEqual([]);
+			expect(collectUnknownSettingsKeys({ ui: { subagentSpendCell: { priceOverride: clean } } })).toEqual([
+				"ui.subagentSpendCell.priceOverride",
+			]);
+		});
+
+		it("merges a project correction into the global one field by field", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					ui: { subagentSpendCell: { priceOverrides: { "bailian/kimi-k3": { input: 3, output: 15 } } } },
+				}),
+			);
+			writeFileSync(
+				join(projectDir, ".prime", "agent", "settings.json"),
+				JSON.stringify({ ui: { subagentSpendCell: { priceOverrides: { "bailian/kimi-k3": { input: 7 } } } } }),
+			);
+
+			// Settings merge by key at every depth, and this block is no exception: the
+			// closer scope corrects the field it names and inherits the rest.
+			expect(SettingsManager.create(projectDir, agentDir).getSubagentSpendCellPriceOverrides()).toEqual({
+				"bailian/kimi-k3": { input: 7, output: 15 },
+			});
+		});
+
+		it("keeps a hand-written correction on disk when the app saves the cadence", async () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({ ui: { subagentSpendCell: { priceOverrides: { "bailian/kimi-k3": { input: 3 } } } } }),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setSubagentSpendCellIntervalMs(30_000);
+			await manager.flush();
+
+			// The cadence write merges into the block instead of replacing it: a
+			// correction the user wrote by hand is not collateral damage of a UI setting.
+			const saved = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8"));
+			expect(saved.ui.subagentSpendCell).toEqual({
+				priceOverrides: { "bailian/kimi-k3": { input: 3 } },
+				intervalMs: 30_000,
+			});
+			expect(manager.getSubagentSpendCellPriceOverrides()).toEqual({ "bailian/kimi-k3": { input: 3 } });
+		});
+
+		it("reports a correction that changed value again, instead of counting it as a repeat", async () => {
+			const write = (input: unknown): void => {
+				writeFileSync(
+					join(agentDir, "settings.json"),
+					JSON.stringify({ ui: { subagentSpendCell: { priceOverrides: { "bailian/kimi-k3": { input } } } } }),
+				);
+			};
+
+			write("3");
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.drainWarnings("global")).toHaveLength(1);
+
+			// The same unusable value is the same problem: it does not warn twice.
+			await manager.reload();
+			expect(manager.drainWarnings("global")).toHaveLength(0);
+
+			// A different one is a new problem, and it is reported.
+			write(-1);
+			await manager.reload();
+			expect(manager.drainWarnings("global")).toHaveLength(1);
+		});
 	});
 });

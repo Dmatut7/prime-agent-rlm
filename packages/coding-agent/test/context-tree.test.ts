@@ -11,6 +11,7 @@ import { type ContextTreeNode, loadContextTreeChildrenFromDisk } from "../src/co
 import { ModelRegistry } from "../src/core/model-registry.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
+import { createSpendPricing, SPEND_PRICE_OVERRIDES_PATH, type SpendPriceRates } from "../src/core/spend-pricing.js";
 import { addAssistantUsage, cloneUsage, emptyUsage } from "../src/core/usage.js";
 import { formatContextTree } from "../src/modes/interactive/components/context-tree-format.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
@@ -458,5 +459,108 @@ describe("formatContextTree", () => {
 		expect(output).not.toContain("├");
 		expect(output).toContain("Total: 1.0k tokens · $0.01");
 		expect(output).not.toContain("across");
+	});
+});
+
+/**
+ * `/usage` (aliased to `/context`) is the detail view of the same tree the tray
+ * cell totals. Once the user corrects a price, it has to say which rate priced
+ * each model - that is the whole answer to "models.json disagrees with this
+ * figure, so where do I fix it" - and its rows and totals have to move with the
+ * cell, or two screens would report two different spends for one session.
+ */
+describe("formatContextTree with price overrides", () => {
+	const MODELS_JSON_RATES: SpendPriceRates = { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 4 };
+
+	function node(overrides: Partial<ContextTreeNode>): ContextTreeNode {
+		return {
+			id: "root",
+			label: "main agent",
+			status: "active",
+			ownUsage: emptyUsage(),
+			totalUsage: emptyUsage(),
+			children: [],
+			...overrides,
+		};
+	}
+
+	function pricing(
+		overrides: Record<string, { input?: number; output?: number; cacheRead?: number; cacheWrite?: number }>,
+	) {
+		return createSpendPricing({ overrides, ratesFor: () => MODELS_JSON_RATES });
+	}
+
+	/** The session model billed at models.json rates, with one child whose input rate was corrected. */
+	function sessionTree(): ContextTreeNode {
+		return node({
+			model: { provider: "anthropic", id: "claude-sonnet-4-5" },
+			ownUsage: createUsage(900, 100, 0.01),
+			totalUsage: createUsage(1_000_900, 100, 1.01),
+			children: [
+				node({
+					id: "sub-aaaa1111",
+					label: "worker",
+					status: "done",
+					model: { provider: "bailian", id: "kimi-k3" },
+					ownUsage: createUsage(1_000_000, 0, 1),
+					totalUsage: createUsage(1_000_000, 0, 1),
+				}),
+			],
+		});
+	}
+
+	it("marks the model the settings re-priced, and names the rate behind each other one", () => {
+		const output = stripAnsi(formatContextTree(sessionTree(), 100, pricing({ "bailian/kimi-k3": { input: 7 } })));
+		const lines = output.split("\n");
+
+		const header = lines.indexOf("Prices");
+		expect(header).toBeGreaterThan(0);
+		// The annotation names the key to edit, not just that something was overridden.
+		expect(lines[header + 1]).toContain(SPEND_PRICE_OVERRIDES_PATH);
+
+		const rows = lines.slice(header + 2).filter((line) => line.trim().length > 0);
+		expect(
+			rows
+				.find((line) => line.includes("bailian/kimi-k3"))
+				?.trimEnd()
+				.endsWith("override"),
+		).toBe(true);
+		// The model nobody corrected still says where its rates come from.
+		expect(
+			rows
+				.find((line) => line.includes("anthropic/claude-sonnet-4-5"))
+				?.trimEnd()
+				.endsWith("models.json"),
+		).toBe(true);
+	});
+
+	it("re-prices the rows and the totals, so /usage agrees with the cell", () => {
+		const corrected = stripAnsi(formatContextTree(sessionTree(), 100, pricing({ "bailian/kimi-k3": { input: 7 } })));
+		const recorded = stripAnsi(formatContextTree(sessionTree(), 100, pricing({})));
+
+		// The child's row: 1M input at the corrected 7 instead of the recorded 1.
+		expect(corrected).toContain("$7.00");
+		expect(recorded).toContain("$1.00");
+		// Row money and the grand total move together (0.01 root + 7.00 child).
+		expect(corrected).toContain("$7.01");
+		expect(corrected).toContain("Cost\nTotal: $7.0100");
+		expect(recorded).toContain("Total: 1.0M tokens · $1.01");
+	});
+
+	it("says nothing about prices while the user has configured no override", () => {
+		// The default view is unchanged: no section, no per-model noise.
+		const output = stripAnsi(formatContextTree(sessionTree(), 100, pricing({})));
+		expect(output).not.toContain("Prices");
+		expect(output).not.toContain(SPEND_PRICE_OVERRIDES_PATH);
+	});
+
+	it("says so when a configured override matches no model in the tree", () => {
+		// A key that matches nothing is the other half of "where do I fix it": the
+		// user needs to see that their correction is not the one being applied.
+		const output = stripAnsi(
+			formatContextTree(sessionTree(), 100, pricing({ "bailian/qwen3.8-flash": { input: 7 } })),
+		);
+		expect(output).toContain("Prices");
+		expect(output).toContain("bailian/qwen3.8-flash: no model in this tree matches this override key");
 	});
 });
