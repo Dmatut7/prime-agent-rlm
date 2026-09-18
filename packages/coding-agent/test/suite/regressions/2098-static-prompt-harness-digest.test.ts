@@ -827,6 +827,7 @@ describe("#2098 static system prompt with an in-context harness digest", () => {
 			fauxAssistantMessage("reply one"),
 			fauxAssistantMessage("reply two"),
 			fauxAssistantMessage("reply three"),
+			fauxAssistantMessage("reply four"),
 		]);
 		await harness.session.prompt("round one");
 		const first = digestMessages(harness.session.messages);
@@ -853,6 +854,18 @@ describe("#2098 static system prompt with an in-context harness digest", () => {
 		// One move, one re-delivery: the tool face is quiet again, so is the digest.
 		await harness.session.prompt("round three");
 		expect(digestMessages(harness.session.messages)).toHaveLength(2);
+
+		// Precision of the seam: a rebuild that moves no flag (the same empty tool set
+		// again) must invalidate nothing, so the turn stays behind the two-lstat stamp
+		// gate - no store parse, no fingerprint, no render. An unconditional
+		// invalidate at every rebuild would read the store here and go red.
+		storeReads.count = 0;
+		digestRenders.count = 0;
+		harness.session.setActiveToolsByName([]);
+		await harness.session.prompt("round four");
+		expect(digestMessages(harness.session.messages)).toHaveLength(2);
+		expect(storeReads.count).toBe(0);
+		expect(digestRenders.count).toBe(0);
 	});
 
 	it("makes another seat's write visible on the next turn, exactly once", async () => {
