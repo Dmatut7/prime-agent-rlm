@@ -718,10 +718,15 @@ function fingerprintRlmSessionDir(dir: string, remainingDepth: number, maxVisibl
  * read still cannot change under it unnoticed. Cost is unchanged in syscalls (finding the
  * newest already stat'ed all of them) and the direction of the extra invalidation is the safe
  * one - an edges flush now re-reads a subtree that used to be served, which is work, not a
- * stale answer. What it does grow is the key: about 40 bytes per extra `.jsonl`, and a child
- * dir holds one to three, so a roster's key grows by tens of bytes against an entry the
- * estimator already charges ~165 KB for (measured on the residency probe: subtree bytes
- * 379588 -> 401310, +5.7%, entry count unchanged; see NOTES).
+ * stale answer. What it does grow is the key, and the growth is measured rather than
+ * assumed: one extra `.jsonl` adds a `name:mtimeMs:size,` segment of ~43 chars, which this
+ * level charges at 3 bytes per char and `liveKeys` charges again at 2 as part of the value
+ * it mirrors, so ~215 bytes per extra file per visible candidate. On the 600-child
+ * residency probe (256 candidates visible, `--expose-gc`; both arms 257 entries and a
+ * heapUsed delta of 0.45/0.48 MB) a family with one `.jsonl` per child is unchanged at
+ * ~379.6 KB estimated - a single-file dir's identity string is byte-identical to the old
+ * one - and the same family with an edges sibling in every child dir goes 381406 -> 412132
+ * bytes, +8.1%, which is 2.5% of the 16 MiB ceiling.
  */
 function dirJsonlFingerprint(dir: string, names: string[]): string | undefined {
 	const identities: { name: string; mtimeMs: number; size: number }[] = [];
