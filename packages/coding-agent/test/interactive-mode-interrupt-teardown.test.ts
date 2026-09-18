@@ -65,10 +65,12 @@ function overlayFixture() {
 
 describe("interruptOrClearInput abort failures", () => {
 	/**
-	 * Every abort call here is fire-and-forget. `abort()` carries a .catch(); the other
-	 * four did not, so a daemon that answers an abort command with an error turned one
-	 * Escape press into an unhandled rejection - a warning or a crash, depending on the
-	 * Node rejection mode the process runs in.
+	 * Every abort call here is fire-and-forget. The streaming interrupt's call carries a
+	 * .catch() - it was `abort()` and is `abortAndSendQueued()` since the #2426 wiring, whose
+	 * degradation branch adds a .then() that must not swallow the rejection either; the other
+	 * four never had one, so a daemon that answers an abort command with an error turned one
+	 * Escape press into an unhandled rejection - a warning or a crash, depending on the Node
+	 * rejection mode the process runs in.
 	 *
 	 * The fakes return plain rejected promises on purpose: `vi.fn().mockRejectedValue()`
 	 * attaches its own handler, which would hide exactly the leak under test.
@@ -88,6 +90,7 @@ describe("interruptOrClearInput abort failures", () => {
 			const mode = interruptFake({
 				agentConnection: {
 					abort: rejecting("abort"),
+					abortAndSendQueued: rejecting("abortAndSendQueued"),
 					abortRetry: rejecting("abortRetry"),
 					abortCompaction: rejecting("abortCompaction"),
 					abortBranchSummary: rejecting("abortBranchSummary"),
@@ -102,7 +105,15 @@ describe("interruptOrClearInput abort failures", () => {
 			// Node reports a rejection once nothing can still attach a handler.
 			await new Promise((resolve) => setTimeout(resolve, 50));
 
-			expect(called.sort()).toEqual(["abort", "abortBash", "abortBranchSummary", "abortCompaction", "abortRetry"]);
+			// The streaming interrupt calls abortAndSendQueued, not abort: `abort` stays in the
+			// fake because a regression that calls both would have to show up here too.
+			expect(called.sort()).toEqual([
+				"abortAndSendQueued",
+				"abortBash",
+				"abortBranchSummary",
+				"abortCompaction",
+				"abortRetry",
+			]);
 			expect(rejections).toEqual([]);
 			// The one path that already handled its failure still surfaces it.
 			expect(mode.showError as ReturnType<typeof vi.fn>).toHaveBeenCalledOnce();

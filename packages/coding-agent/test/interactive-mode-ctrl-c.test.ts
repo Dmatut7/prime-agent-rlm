@@ -28,6 +28,7 @@ type FakeInteractiveMode = {
 	};
 	agentConnection: {
 		abort: Mock;
+		abortAndSendQueued: Mock;
 		clearQueue: Mock;
 		abortAndClearQueue: Mock;
 		abortRetry: Mock;
@@ -39,6 +40,7 @@ type FakeInteractiveMode = {
 	ui: { requestRender: Mock; onDebug?: () => void };
 	updatePendingMessagesDisplay: Mock;
 	showError: Mock;
+	showWarning: Mock;
 	showTreeSelector: Mock;
 	shutdown: Mock;
 	updateEditorBorderColor: Mock;
@@ -99,6 +101,9 @@ function createInteractiveFake(options: {
 		},
 		agentConnection: {
 			abort: vi.fn().mockResolvedValue(undefined),
+			// What the streaming interrupt calls since #2426 was wired to the key: an empty
+			// result is a peer that served the command, so no degradation warning is owed.
+			abortAndSendQueued: vi.fn().mockResolvedValue({}),
 			clearQueue: vi.fn().mockResolvedValue({ steering: [], followUp: [] }),
 			abortAndClearQueue: vi.fn().mockResolvedValue({ steering: [], followUp: [] }),
 			// Promise-returning, as the real connection is: the interrupt path attaches a
@@ -113,6 +118,7 @@ function createInteractiveFake(options: {
 		queueSelection: { isBrowsing: false, reset: () => "" },
 		updatePendingMessagesDisplay: vi.fn(),
 		showError: vi.fn(),
+		showWarning: vi.fn(),
 		showTreeSelector: vi.fn(),
 		shutdown: vi.fn().mockResolvedValue(undefined),
 		updateEditorBorderColor: vi.fn(),
@@ -138,7 +144,8 @@ describe("InteractiveMode interrupt shortcuts", () => {
 
 		Reflect.get(InteractiveMode.prototype, "handleCtrlC").call(mode);
 
-		expect(mode.agentConnection.abort).toHaveBeenCalledTimes(1);
+		expect(mode.agentConnection.abortAndSendQueued).toHaveBeenCalledTimes(1);
+		expect(mode.agentConnection.abort).not.toHaveBeenCalled();
 		expect(mode.shutdown).not.toHaveBeenCalled();
 		expect(Reflect.get(InteractiveMode.prototype, "getTrayOverrideLabel").call(mode)).toBe(
 			"Press Ctrl+C again to exit",
@@ -151,7 +158,7 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		Reflect.get(InteractiveMode.prototype, "handleCtrlC").call(mode);
 
 		expect(mode.agentConnection.abortBash).toHaveBeenCalledTimes(1);
-		expect(mode.agentConnection.abort).toHaveBeenCalledTimes(1);
+		expect(mode.agentConnection.abortAndSendQueued).toHaveBeenCalledTimes(1);
 		expect(mode.shutdown).not.toHaveBeenCalled();
 	});
 
@@ -170,13 +177,16 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		expect(mode.shutdown).not.toHaveBeenCalled();
 	});
 
-	it("preserves the queue and the draft when interrupting streaming", () => {
+	it("sends the queue with the interrupt instead of clearing it, and keeps the draft", () => {
+		// Retitled with the #2426 wiring: the interrupt no longer leaves the queue for the next
+		// submit, it carries it out - so what must not happen is a clear, and the draft is still
+		// nobody's business but the user's.
 		const mode = createInteractiveFake({ editorText: "draft", streaming: true });
 		mode.connectionState.sessionActions = { queuedCount: 2, steering: ["steer"], followUps: ["follow"] };
 
 		Reflect.get(InteractiveMode.prototype, "handleCtrlC").call(mode);
 
-		expect(mode.agentConnection.abort).toHaveBeenCalledTimes(1);
+		expect(mode.agentConnection.abortAndSendQueued).toHaveBeenCalledTimes(1);
 		expect(mode.agentConnection.abortAndClearQueue).not.toHaveBeenCalled();
 		expect(mode.agentConnection.clearQueue).not.toHaveBeenCalled();
 		expect(mode.editor.getText()).toBe("draft");
@@ -194,7 +204,7 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		handleCtrlC.call(mode);
 		handleCtrlC.call(mode);
 
-		expect(mode.agentConnection.abort).toHaveBeenCalledTimes(1);
+		expect(mode.agentConnection.abortAndSendQueued).toHaveBeenCalledTimes(1);
 		expect(mode.shutdown).toHaveBeenCalledTimes(1);
 	});
 
@@ -220,6 +230,7 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		Reflect.get(InteractiveMode.prototype, "handleCtrlC").call(mode);
 
 		expect(mode.editor.getText()).toBe("draft");
+		expect(mode.agentConnection.abortAndSendQueued).not.toHaveBeenCalled();
 		expect(mode.agentConnection.abort).not.toHaveBeenCalled();
 		expect(mode.shutdown).not.toHaveBeenCalled();
 	});
@@ -241,7 +252,7 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		Reflect.get(InteractiveMode.prototype, "setupKeyHandlers").call(mode);
 		expect(defaultEditor.onEscape).toBeDefined();
 		defaultEditor.onEscape?.();
-		expect(mode.agentConnection.abort).toHaveBeenCalledTimes(1);
+		expect(mode.agentConnection.abortAndSendQueued).toHaveBeenCalledTimes(1);
 		expect(mode.editor.getText()).toBe("draft");
 		mode.editor.setText("queued draft");
 		defaultEditor.onChange?.("queued draft");
@@ -299,6 +310,7 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		defaultEditor.onEscape?.();
 
 		expect(mode.editor.getText()).toBe("");
+		expect(mode.agentConnection.abortAndSendQueued).not.toHaveBeenCalled();
 		expect(mode.agentConnection.abort).not.toHaveBeenCalled();
 	});
 
