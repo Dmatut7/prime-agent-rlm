@@ -1,6 +1,7 @@
 import type { Context, Message } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
+import { HARNESS_DIGEST_PREFIX } from "../../src/core/messages.js";
 import { createHarness, type Harness } from "./harness.js";
 
 /**
@@ -36,10 +37,17 @@ function messageText(message: Message): string {
 		.join("\n");
 }
 
+/**
+ * The conversation面 the provider receives. The boundary-injected harness digest is
+ * excluded by its own framing prefix: these pins are about refinement receipts, and
+ * the digest is a different面 that lists recent refinement summaries of its own - it
+ * did so while it still lived in the system prompt too, so folding it in here would
+ * quietly widen every assertion below (#2098).
+ */
 function userTextIn(context: Context | undefined): string {
 	if (!context) return "";
 	return context.messages
-		.filter((message) => message.role === "user")
+		.filter((message) => message.role === "user" && !messageText(message).startsWith(HARNESS_DIGEST_PREFIX))
 		.map((message) => messageText(message))
 		.join("\n");
 }

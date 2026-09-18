@@ -1,6 +1,6 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { CustomMessage } from "../../src/core/messages.js";
+import { type CustomMessage, HARNESS_DIGEST_PREFIX } from "../../src/core/messages.js";
 import type { ActionStore, SessionAction } from "../../src/core/session-action-store.js";
 import { createHarness, getMessageText, getUserTexts, type Harness } from "./harness.js";
 import { createDeferred } from "./scheduling.js";
@@ -325,7 +325,11 @@ describe("AgentSession action commit-fence races", () => {
 		harnesses.push(harness);
 		harness.setResponses([
 			(context) => {
-				deliveredMessages.push(...context.messages.map(getMessageText));
+				// #2098 injects the harness digest as a leading boundary message; it is
+				// mechanical context, not part of the batch this pin orders.
+				deliveredMessages.push(
+					...context.messages.map(getMessageText).filter((text) => !text.startsWith(HARNESS_DIGEST_PREFIX)),
+				);
 				return fauxAssistantMessage("done");
 			},
 		]);

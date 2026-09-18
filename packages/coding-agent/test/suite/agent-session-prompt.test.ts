@@ -6,10 +6,18 @@ import { fauxAssistantMessage, fauxToolCall, type Model } from "@earendil-works/
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BashResult } from "../../src/core/bash-executor.js";
+import { HARNESS_DIGEST_PREFIX } from "../../src/core/messages.js";
 import type { PromptTemplate } from "../../src/core/prompt-templates.js";
 import { createSyntheticSourceInfo } from "../../src/core/source-info.js";
 import { createTestResourceLoader } from "../utilities.js";
-import { createHarness, getAssistantTexts, getMessageText, getUserTexts, type Harness } from "./harness.js";
+import {
+	conversationMessages,
+	createHarness,
+	getAssistantTexts,
+	getMessageText,
+	getUserTexts,
+	type Harness,
+} from "./harness.js";
 import { createDeferred, createWaitingHarness, gatedHook } from "./scheduling.js";
 
 function gateNextAgentStart(harness: Harness): { reached: Promise<void>; release(): void } {
@@ -99,8 +107,8 @@ describe("AgentSession prompt characterization", () => {
 
 		await harness.session.prompt("hi");
 
-		expect(harness.session.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
-		expect(getMessageText(harness.session.messages[0]!)).toBe("hi");
+		expect(conversationMessages(harness.session).map((message) => message.role)).toEqual(["user", "assistant"]);
+		expect(getMessageText(conversationMessages(harness.session)[0]!)).toBe("hi");
 		expect(harness.getPendingResponseCount()).toBe(0);
 		expect(harness.eventsOfType("session_action_update")).toEqual([]);
 	});
@@ -223,14 +231,14 @@ describe("AgentSession prompt characterization", () => {
 		await harness.session.prompt("start");
 
 		expect(toolRuns).toEqual(["hello"]);
-		expect(harness.session.messages.map((message) => message.role)).toEqual([
+		expect(conversationMessages(harness.session).map((message) => message.role)).toEqual([
 			"user",
 			"assistant",
 			"toolResult",
 			"assistant",
 		]);
-		expect(harness.session.messages[2]?.role).toBe("toolResult");
-		expect(harness.session.messages[3]?.role).toBe("assistant");
+		expect(conversationMessages(harness.session)[2]?.role).toBe("toolResult");
+		expect(conversationMessages(harness.session)[3]?.role).toBe("assistant");
 	});
 
 	it("executes multiple tool calls from one response and continues with a single follow-up response", async () => {
@@ -278,7 +286,11 @@ describe("AgentSession prompt characterization", () => {
 
 		harness.setResponses([
 			(context) => {
-				const user = context.messages.find((message) => message.role === "user");
+				// The digest reaches the provider as a user-role message, so the pin on the
+				// first user message has to skip it by its public framing prefix (#2098).
+				const user = context.messages.find(
+					(message) => message.role === "user" && !getMessageText(message).startsWith(HARNESS_DIGEST_PREFIX),
+				);
 				sawImage =
 					user?.role === "user" &&
 					typeof user.content !== "string" &&
@@ -335,7 +347,11 @@ describe("AgentSession prompt characterization", () => {
 
 		harness.setResponses([
 			(context) => {
-				const user = context.messages.find((message) => message.role === "user");
+				// Skip the boundary-injected digest (it reaches the provider as a user-role
+				// message) and pin the first real user message, as before (#2098).
+				const user = context.messages.find(
+					(message) => message.role === "user" && !getMessageText(message).startsWith(HARNESS_DIGEST_PREFIX),
+				);
 				expandedPrompt = user ? getMessageText(user) : "";
 				return fauxAssistantMessage("ok");
 			},
@@ -370,7 +386,11 @@ describe("AgentSession prompt characterization", () => {
 
 		harness.setResponses([
 			(context) => {
-				const user = context.messages.find((message) => message.role === "user");
+				// Skip the boundary-injected digest (it reaches the provider as a user-role
+				// message) and pin the first real user message, as before (#2098).
+				const user = context.messages.find(
+					(message) => message.role === "user" && !getMessageText(message).startsWith(HARNESS_DIGEST_PREFIX),
+				);
 				expandedPrompt = user ? getMessageText(user) : "";
 				return fauxAssistantMessage("ok");
 			},
@@ -413,8 +433,8 @@ describe("AgentSession prompt characterization", () => {
 
 		await harness.session.sendUserMessage("from extension");
 
-		expect(harness.session.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
-		expect(getMessageText(harness.session.messages[0]!)).toBe("from extension");
+		expect(conversationMessages(harness.session).map((message) => message.role)).toEqual(["user", "assistant"]);
+		expect(getMessageText(conversationMessages(harness.session)[0]!)).toBe("from extension");
 	});
 
 	it("rejects an aborted prompt while streaming instead of enqueueing it", async () => {
@@ -1100,8 +1120,14 @@ stale post-hook extension instructions`,
 		harness.setResponses([
 			fauxAssistantMessage("busy done"),
 			(context) => {
-				contextRoles.push(context.messages.map((message) => message.role));
-				contextTexts.push(context.messages.map((message) => getMessageText(message)));
+				// The provider-side view of the same conversation: drop only the
+				// boundary-injected digest, which reaches the model as a user-role message
+				// (#2098), so the recorded ordering pins keep addressing the conversation.
+				const conversation = context.messages.filter(
+					(message) => message.role !== "user" || !getMessageText(message).startsWith(HARNESS_DIGEST_PREFIX),
+				);
+				contextRoles.push(conversation.map((message) => message.role));
+				contextTexts.push(conversation.map((message) => getMessageText(message)));
 				return fauxAssistantMessage("agent message response");
 			},
 		]);

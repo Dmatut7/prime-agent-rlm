@@ -45,6 +45,7 @@ export const COMPACTION_OUTCOME_CUSTOM_TYPE = "compaction_outcome";
 export const MCP_CONNECTION_OUTCOME_CUSTOM_TYPE = "mcp_connection_outcome";
 export const REFINEMENT_OUTCOME_CUSTOM_TYPE = "refinement_outcome";
 export const REFINEMENT_NOTICE_CUSTOM_TYPE = "refinement_notice";
+export const HARNESS_DIGEST_CUSTOM_TYPE = "harness_digest";
 export const RLM_CHILD_FAILURE_CUSTOM_TYPE = "rlm_child_failure";
 export const RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE = "rlm_child_terminal_notice";
 export const ASYNC_BASH_COMPLETION_CUSTOM_TYPE = "async_bash_completion";
@@ -141,6 +142,49 @@ export interface RefinementNoticeMessage extends CustomMessage<RefinementNoticeD
 	customType: typeof REFINEMENT_NOTICE_CUSTOM_TYPE;
 	content: string;
 	details: RefinementNoticeDetails;
+}
+
+/**
+ * The compact continual-harness menu (`formatHarnessStateForPrompt`) carried as
+ * context instead of system-prompt text, so a refinement that rewrites harness
+ * state no longer invalidates the provider's cached prompt prefix. `digest` is
+ * kept verbatim next to `content` so resume-time dedupe can compare identity
+ * without re-parsing the framed text.
+ */
+export interface HarnessDigestDetails {
+	digest: string;
+}
+
+/**
+ * Framing for the harness digest delivered in-context at a cold boundary. Custom
+ * messages reach the provider as user-role messages, so the text has to say out
+ * loud that it is mechanical context and not a user instruction (the same rule
+ * REFINEMENT_OUTCOME_PREFIX follows).
+ */
+export const HARNESS_DIGEST_PREFIX = `Continual harness state as of this session's cold boundary (automatic system context injected by the harness, not a message from the user and not a new instruction: keep working on your current task and read this only as the current harness menu).
+
+<harness_state>
+`;
+
+export const HARNESS_DIGEST_SUFFIX = `
+</harness_state>`;
+
+/**
+ * Boundary-injected harness digest. `display: false` because the TUI has nothing
+ * to render: the model is the only audience.
+ */
+export function createHarnessDigestMessage(
+	digest: string,
+	timestamp = Date.now(),
+): CustomMessage<HarnessDigestDetails> {
+	return {
+		role: "custom",
+		customType: HARNESS_DIGEST_CUSTOM_TYPE,
+		content: HARNESS_DIGEST_PREFIX + digest + HARNESS_DIGEST_SUFFIX,
+		display: false,
+		details: { digest },
+		timestamp,
+	};
 }
 
 /** How an MCP connection attempt finished: verified handshake, saved but unverified, or unrecorded result. */
@@ -434,6 +478,11 @@ export interface CompactionSummaryMessage {
 	retainedMessageCount?: number;
 	/** User instructions that guided the summary (from `/compact <instructions>`) */
 	customInstructions?: string;
+	/**
+	 * Harness digest snapshot rendered before the summary in LLM context. Attached
+	 * mechanically at compaction time; it never flows through the summarizer.
+	 */
+	harnessDigest?: string;
 	timestamp: number;
 }
 
@@ -499,6 +548,7 @@ export function createCompactionSummaryMessage(
 	timestamp: string,
 	customInstructions?: string,
 	retainedMessageCount?: number,
+	harnessDigest?: string,
 ): CompactionSummaryMessage {
 	return {
 		role: "compactionSummary",
@@ -506,6 +556,7 @@ export function createCompactionSummaryMessage(
 		tokensBefore,
 		retainedMessageCount,
 		customInstructions,
+		harnessDigest,
 		timestamp: new Date(timestamp).getTime(),
 	};
 }
@@ -1002,12 +1053,17 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						timestamp: m.timestamp,
 					};
 				case "compactionSummary": {
+					// Memories first: the digest is the menu the summary assumes the
+					// model still has, and it is attached mechanically at compaction.
+					const digestBlock = m.harnessDigest
+						? `${HARNESS_DIGEST_PREFIX}${m.harnessDigest}${HARNESS_DIGEST_SUFFIX}\n\n`
+						: "";
 					return {
 						role: "user",
 						content: [
 							{
 								type: "text" as const,
-								text: COMPACTION_SUMMARY_PREFIX + m.summary + COMPACTION_SUMMARY_SUFFIX,
+								text: digestBlock + COMPACTION_SUMMARY_PREFIX + m.summary + COMPACTION_SUMMARY_SUFFIX,
 							},
 						],
 						timestamp: m.timestamp,

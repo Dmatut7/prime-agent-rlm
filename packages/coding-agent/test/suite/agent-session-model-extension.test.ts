@@ -3,8 +3,9 @@ import { fauxAssistantMessage, fauxToolCall, type Model } from "@earendil-works/
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import type { AgentCronJob } from "../../src/core/cron-jobs.js";
+import { HARNESS_DIGEST_PREFIX } from "../../src/core/messages.js";
 import type { ExtensionAPI } from "../../src/index.js";
-import { createHarness, getAssistantTexts, getMessageText, type Harness } from "./harness.js";
+import { conversationMessages, createHarness, getAssistantTexts, getMessageText, type Harness } from "./harness.js";
 
 function createDeferred<T = void>(): {
 	promise: Promise<T>;
@@ -308,7 +309,9 @@ describe("AgentSession model and extension characterization", () => {
 		}
 
 		expect(
-			harness.session.messages.slice(0, 2).map((message) => ({ role: message.role, text: getMessageText(message) })),
+			conversationMessages(harness.session)
+				.slice(0, 2)
+				.map((message) => ({ role: message.role, text: getMessageText(message) })),
 		).toEqual([
 			{ role: "custom", text: "model context" },
 			{ role: "user", text: "hi" },
@@ -359,7 +362,9 @@ describe("AgentSession model and extension characterization", () => {
 		await harness.session.agent.waitForIdle();
 
 		expect(
-			harness.session.messages.slice(0, 2).map((message) => ({ role: message.role, text: getMessageText(message) })),
+			conversationMessages(harness.session)
+				.slice(0, 2)
+				.map((message) => ({ role: message.role, text: getMessageText(message) })),
 		).toEqual([
 			{ role: "custom", text: "accepted model context" },
 			{ role: "user", text: "agent-to-agent payload" },
@@ -441,7 +446,9 @@ describe("AgentSession model and extension characterization", () => {
 		await harness.session.agent.waitForIdle();
 
 		expect(
-			harness.session.messages.slice(0, 2).map((message) => ({ role: message.role, text: getMessageText(message) })),
+			conversationMessages(harness.session)
+				.slice(0, 2)
+				.map((message) => ({ role: message.role, text: getMessageText(message) })),
 		).toEqual([
 			{ role: "custom", text: "heartbeat model context" },
 			{ role: "custom", text: "Check whether the long-running task needs another step." },
@@ -662,7 +669,11 @@ describe("AgentSession model and extension characterization", () => {
 		let providerUserText = "";
 		harness.setResponses([
 			(context) => {
-				const user = context.messages.find((message) => message.role === "user");
+				// Skip the boundary-injected digest (a custom message that reaches the provider
+				// as user role) and pin the first real user message, as before (#2098).
+				const user = context.messages.find(
+					(message) => message.role === "user" && !getMessageText(message).startsWith(HARNESS_DIGEST_PREFIX),
+				);
 				providerUserText =
 					user && typeof user.content !== "string"
 						? user.content
@@ -703,7 +714,11 @@ describe("AgentSession model and extension characterization", () => {
 		let providerUserText = "";
 		transformedHarness.setResponses([
 			(context) => {
-				const user = context.messages.find((message) => message.role === "user");
+				// Skip the boundary-injected digest (a custom message that reaches the provider
+				// as user role) and pin the first real user message, as before (#2098).
+				const user = context.messages.find(
+					(message) => message.role === "user" && !getMessageText(message).startsWith(HARNESS_DIGEST_PREFIX),
+				);
 				providerUserText =
 					user && typeof user.content !== "string"
 						? user.content

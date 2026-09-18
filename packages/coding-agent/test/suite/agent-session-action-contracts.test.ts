@@ -1,6 +1,6 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
-import { createHarness, getUserTexts, type Harness } from "./harness.js";
+import { conversationMessages, createHarness, getUserTexts, type Harness } from "./harness.js";
 import { withStreaming } from "./scheduling.js";
 
 describe("AgentSession action contracts", () => {
@@ -69,7 +69,11 @@ describe("AgentSession action contracts", () => {
 		expect(harness.getPendingResponseCount()).toBe(1);
 
 		await harness.session.prompt("consume context");
-		expect(harness.session.messages.map((message) => message.role)).toEqual(["custom", "user", "assistant"]);
+		expect(conversationMessages(harness.session).map((message) => message.role)).toEqual([
+			"custom",
+			"user",
+			"assistant",
+		]);
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { HARNESS_DIGEST_CUSTOM_TYPE } from "../../src/core/messages.js";
 import { SessionManager } from "../../src/core/session-manager.js";
 import { resolveCompleteToolPairLeaf } from "../../src/core/session-tool-pair.js";
 import { assistantMsg, createTestSession, userMsg } from "../utilities.js";
@@ -153,7 +154,14 @@ describe("navigateTree cut points", () => {
 		const result = await ctx.session.navigateTree(partial, { summarize: false });
 
 		expect(result.cancelled).toBe(false);
-		expect(ctx.sessionManager.getLeafId()).toBe(userId);
+		// Tree navigation is a cold boundary (#2098): a fresh harness digest rides on top
+		// of the navigated-to node, so the snap-back target is that entry's parent. The
+		// pin still names the exact entry the tool-pair walk landed on.
+		const leafId = ctx.sessionManager.getLeafId();
+		const leaf = leafId === null ? undefined : ctx.sessionManager.getEntry(leafId);
+		const navigatedLeafId =
+			leaf?.type === "custom_message" && leaf.customType === HARNESS_DIGEST_CUSTOM_TYPE ? leaf.parentId : leafId;
+		expect(navigatedLeafId).toBe(userId);
 		expect(unpairedToolCallIds(ctx.session.agent.state.messages)).toEqual([]);
 	});
 });

@@ -37,6 +37,7 @@ import { createSyntheticSourceInfo } from "../src/core/source-info.js";
 import type { BashOperations } from "../src/core/tools/bash.js";
 import { type ActiveSessionState, resolveActiveSessionState } from "../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
+import { conversationMessages } from "./suite/harness.js";
 import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.js";
 
 const model = getModel("anthropic", "claude-sonnet-4-5")!;
@@ -840,7 +841,8 @@ describe("AgentSession rlm recursion", () => {
 			}),
 		]);
 		const child = root.getRlmChildSession(result.rlm_child_id);
-		expect(child?.messages[0]).toMatchObject({
+		if (!child) throw new Error("Missing child session");
+		expect(conversationMessages(child)[0]).toMatchObject({
 			role: "custom",
 			customType: "agent_message",
 			content: "[task from parent]\n\nsummarize shard 1",

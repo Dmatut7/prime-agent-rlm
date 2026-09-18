@@ -2,6 +2,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { describe, expect, test } from "vitest";
+import { HARNESS_DIGEST_PREFIX } from "../../../src/core/messages.js";
 import {
 	expandPromptTemplate,
 	loadPromptTemplates,
@@ -63,7 +64,17 @@ describe("ENG-6014 literal prompt arguments", () => {
 			const providerTexts: string[] = [];
 			harness.setResponses([
 				(context) => {
-					providerTexts.push(...context.messages.filter((message) => message.role === "user").map(getMessageText));
+					// The cold-boundary harness digest reaches the provider as a user-role
+					// message (#2098); this pin is about the expanded template text only,
+					// so the digest is excluded by its own framing prefix.
+					providerTexts.push(
+						...context.messages
+							.filter(
+								(message) =>
+									message.role === "user" && !getMessageText(message).startsWith(HARNESS_DIGEST_PREFIX),
+							)
+							.map(getMessageText),
+					);
 					return fauxAssistantMessage("ok");
 				},
 			]);

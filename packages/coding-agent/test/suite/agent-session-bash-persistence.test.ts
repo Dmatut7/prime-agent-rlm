@@ -3,8 +3,9 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
+import { HARNESS_DIGEST_CUSTOM_TYPE } from "../../src/core/messages.js";
 import type { BashOperations } from "../../src/core/tools/bash.js";
-import { createHarness, getMessageText, type Harness } from "./harness.js";
+import { conversationMessages, createHarness, getMessageText, type Harness } from "./harness.js";
 
 function getEntryTypes(harness: Harness): string[] {
 	return harness.sessionManager.getEntries().map((entry) => entry.type);
@@ -158,7 +159,11 @@ describe("AgentSession bash and persistence characterization", () => {
 		});
 		await harness.session.prompt("start");
 
-		const entries = harness.sessionManager.getEntries();
+		// #2098 persists the session-start harness digest as a leading custom_message
+		// entry; this pin is about the conversation entries that follow it.
+		const entries = harness.sessionManager
+			.getEntries()
+			.filter((entry) => !(entry.type === "custom_message" && entry.customType === HARNESS_DIGEST_CUSTOM_TYPE));
 		expect(entries.map((entry) => entry.type)).toEqual([
 			"custom_message",
 			"message",
@@ -166,7 +171,7 @@ describe("AgentSession bash and persistence characterization", () => {
 			"message",
 			"message",
 		]);
-		expect(harness.session.messages.map((message) => message.role)).toEqual([
+		expect(conversationMessages(harness.session).map((message) => message.role)).toEqual([
 			"custom",
 			"user",
 			"assistant",

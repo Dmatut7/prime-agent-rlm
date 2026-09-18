@@ -45,6 +45,7 @@ import {
 	ASYNC_BASH_COMPLETION_CUSTOM_TYPE,
 	COMPACTION_OUTCOME_CUSTOM_TYPE,
 	type CustomMessage,
+	HARNESS_DIGEST_CUSTOM_TYPE,
 	HEARTBEAT_PROMPT_CUSTOM_TYPE,
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
 	MCP_CONNECTION_OUTCOME_CUSTOM_TYPE,
@@ -144,6 +145,8 @@ const CUSTOM_TYPE_INPUT_CLASSES: ReadonlyMap<string, InputClass> = new Map<strin
 	[GOAL_STATE_CUSTOM_TYPE, "internal_continuation"],
 	// Post-compaction and refinement receipts.
 	[COMPACTION_OUTCOME_CUSTOM_TYPE, "internal_continuation"],
+	// The cold-boundary harness digest (#2098): a harness-injected menu, never an input.
+	[HARNESS_DIGEST_CUSTOM_TYPE, "internal_continuation"],
 	[REFINEMENT_OUTCOME_CUSTOM_TYPE, "internal_continuation"],
 	[REFINEMENT_NOTICE_CUSTOM_TYPE, "internal_continuation"],
 	[REFINEMENT_CUSTOM_TYPE, "internal_continuation"],

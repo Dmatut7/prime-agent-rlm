@@ -1,12 +1,37 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import * as acp from "@agentclientprotocol/sdk";
 import { type AssistantMessage, fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentSession } from "../../src/core/agent-session.js";
 import type { AgentSessionRuntime } from "../../src/core/agent-session-runtime.js";
 import { PRIME_AGENT_META_NAMESPACE } from "../../src/modes/acp/acp-meta.js";
 import { runAcpModeWithConnection } from "../../src/modes/acp/index.js";
 import { InProcessAgentConnection } from "../../src/modes/agent-connection/in-process-agent-connection.js";
 import { createHarness } from "./harness.js";
+
+/**
+ * The harness digest (#2098) renders the ambient global harness store, and on a
+ * developer machine that store is megabytes: one render measured 38-41 ms of
+ * synchronous CPU here against 0.4 ms on an empty store - the same order as the
+ * queueing windows these pins assert on. Isolate the store so the pins measure ACP
+ * semantics rather than the size of whoever's memory file happened to run them.
+ */
+let isolatedAgentDir: string | undefined;
+
+beforeEach(() => {
+	isolatedAgentDir = mkdtempSync(join(tmpdir(), "acp-mode-agent-dir-"));
+	vi.stubEnv("PRIME_AGENT_CODING_AGENT_DIR", isolatedAgentDir);
+});
+
+afterEach(() => {
+	vi.unstubAllEnvs();
+	if (isolatedAgentDir) {
+		rmSync(isolatedAgentDir, { recursive: true, force: true });
+		isolatedAgentDir = undefined;
+	}
+});
 
 /** Minimal AgentSessionRuntime host over a real faux-backed AgentSession. */
 function runtimeHostFor(session: unknown): AgentSessionRuntime {

@@ -14,6 +14,7 @@ import {
 import { type AgentCronJob, shouldDeferHeartbeatCronJob } from "../../src/core/cron-jobs.js";
 import {
 	createSessionSlashCommandMessage,
+	HARNESS_DIGEST_PREFIX,
 	isRefinementOutcomeMessage,
 	REFINEMENT_OUTCOME_CUSTOM_TYPE,
 } from "../../src/core/messages.js";
@@ -30,7 +31,14 @@ import {
 } from "../../src/core/refinement/index.js";
 import { parseSessionSlashCommand } from "../../src/core/slash-commands.js";
 import type { BashOperations } from "../../src/core/tools/bash.js";
-import { createHarness, getAssistantTexts, getMessageText, getUserTexts, type Harness } from "./harness.js";
+import {
+	conversationMessages,
+	createHarness,
+	getAssistantTexts,
+	getMessageText,
+	getUserTexts,
+	type Harness,
+} from "./harness.js";
 import { createDeferred, createWaitingHarness, gatedHook, withStreaming } from "./scheduling.js";
 
 type AutoRefineReason = "turn_interval" | "compact";
@@ -2017,7 +2025,7 @@ describe("AgentSession queue characterization", () => {
 		await harness.session.prompt("normal prompt");
 
 		expect(sawCustomMessage).toBe(true);
-		expect(harness.session.messages.map((message) => message.role)).toEqual([
+		expect(conversationMessages(harness.session).map((message) => message.role)).toEqual([
 			"user",
 			"assistant",
 			"custom",
@@ -2405,7 +2413,9 @@ describe("AgentSession queue characterization", () => {
 		]);
 
 		expect(
-			harness.session.messages.filter((message) => message.role === "custom").map((message) => message.content),
+			conversationMessages(harness.session)
+				.filter((message) => message.role === "custom")
+				.map((message) => message.content),
 		).toEqual(["first", "second"]);
 	});
 
@@ -3285,9 +3295,13 @@ describe("AgentSession scheduler scenarios", () => {
 		harness.setResponses([
 			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
 			(context) => {
+				// The cold-boundary harness digest legitimately stays in the continuation
+				// context; this probe is about removed queued inputs, not the digest's text.
 				continuationSawRemoved = context.messages.some(
 					(message) =>
-						message.role === "user" && removedTexts.some((text) => getMessageText(message).includes(text)),
+						message.role === "user" &&
+						!getMessageText(message).startsWith(HARNESS_DIGEST_PREFIX) &&
+						removedTexts.some((text) => getMessageText(message).includes(text)),
 				);
 				return fauxAssistantMessage("continued clean");
 			},

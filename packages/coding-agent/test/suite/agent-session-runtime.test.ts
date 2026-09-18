@@ -30,6 +30,7 @@ import type {
 	SessionStartEvent,
 } from "../../src/index.js";
 import { createDefaultRuntimeFactory } from "../../src/main.js";
+import { conversationMessages } from "./harness.js";
 
 type RecordedSessionEvent =
 	| SessionBeforeSwitchEvent
@@ -735,7 +736,7 @@ describe("AgentSessionRuntime characterization", () => {
 
 		expect(result).toEqual({ cancelled: false, selectedText: "Say two" });
 		expect(
-			runtime.session.messages.map((message) =>
+			conversationMessages(runtime.session).map((message) =>
 				message.role === "user"
 					? typeof message.content === "string"
 						? message.content
@@ -757,7 +758,7 @@ describe("AgentSessionRuntime characterization", () => {
 		const result = await runtime.fork(userMessages[0]!.entryId);
 
 		expect(result).toEqual({ cancelled: false, selectedText: "Say one" });
-		expect(runtime.session.messages).toEqual([]);
+		expect(conversationMessages(runtime.session)).toEqual([]);
 		expect(runtime.session.sessionFile).toBeUndefined();
 	});
 
