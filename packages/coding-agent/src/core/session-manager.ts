@@ -38,6 +38,7 @@ import {
 	requireNoFollow,
 	writePrivateFileAtomicLines,
 } from "../utils/private-files.js";
+import type { AgentTaskState } from "./agent-task-state.js";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
@@ -323,7 +324,11 @@ export interface SessionStateEntry extends SessionEntryBase {
 	state: SessionState;
 }
 
-export type AgentTaskState = "needs_input" | "completed" | "error";
+// The verdict enum lives in its own leaf module (./agent-task-state.ts) so the receive side -
+// modes/daemon/daemon-client.ts's saved-session validator - derives its guard from the same array
+// instead of hand-writing a second copy of it. Re-exported here because AgentStatus, the session
+// JSONL entry that carries it, is this module's shape.
+export type { AgentTaskState };
 
 export interface AgentStatus {
 	summary: string;

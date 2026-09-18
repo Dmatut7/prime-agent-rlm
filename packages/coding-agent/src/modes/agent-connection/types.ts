@@ -1,6 +1,7 @@
 import type { AgentEvent, AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, ImageContent, Model, ServiceTier, TextContent, Transport, Usage } from "@earendil-works/pi-ai";
 import type { AgentSessionMessageReceipt, AgentSessionMessageSafetyStatus } from "../../core/agent-messages.js";
+import type { AgentTaskState } from "../../core/agent-task-state.js";
 import type { AuthSourceToken } from "../../core/auth-storage.js";
 import type { BashResult } from "../../core/bash-executor.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
@@ -109,12 +110,16 @@ export interface AgentConnectionSavedSessionState {
 
 export interface AgentConnectionAgentStatus {
 	summary: string;
-	// Includes "error" so the connection layer can carry a transcript-derived error
-	// verdict (upstream #2310). The saved-session wire carries it as well since the
-	// daemon protocol revision that removed serializeSavedSessionInfo's downshift:
-	// daemon-client accepts the value (8f52777f2), so a client older than that
-	// revision is the one that still rejects the whole session item over it.
-	taskState?: "needs_input" | "completed" | "error";
+	// Includes "error" so the connection layer can carry a transcript-derived error verdict
+	// (upstream #2310). The domain is the shared wire enum rather than a second hand-written list:
+	// modes/daemon/daemon-client.ts validates an incoming saved-session row against the same
+	// AGENT_TASK_STATES array, and a row whose taskState it does not know is dropped whole and
+	// silently. Lineage, corrected after it was cited backwards here: this fork's own pre-merge
+	// client (0.9.1, e744cfbf4) rejected "error"; upstream's has accepted it since 8f52777f2, which
+	// is not an ancestor of that build, so on this branch the value dates from the merge commit
+	// 67334bf1a. modes/daemon/saved-session-info.ts carries the full argument for why dropping the
+	// downshift is safe between same-identity pairs and what the disk face still exposes.
+	taskState?: AgentTaskState;
 	basedOnMessageCount: number;
 }
 

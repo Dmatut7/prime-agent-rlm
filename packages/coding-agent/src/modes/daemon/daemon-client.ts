@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { createConnection, type Socket } from "node:net";
 import { getDaemonLogPath } from "../../config.js";
+import { isAgentTaskState } from "../../core/agent-task-state.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import {
 	createDaemonCommandEnvelope,
@@ -875,9 +876,9 @@ function isDaemonSavedSessionAgentStatus(value: unknown): boolean {
 	return (
 		typeof candidate.summary === "string" &&
 		typeof candidate.basedOnMessageCount === "number" &&
-		(candidate.taskState === undefined ||
-			candidate.taskState === "needs_input" ||
-			candidate.taskState === "completed" ||
-			candidate.taskState === "error")
+		// Derived, not a second hand-written list: the producer's domain is AGENT_TASK_STATES in
+		// core/agent-task-state.ts, and a value this guard did not know would drop the whole
+		// progressive row without a log line (B3-09').
+		(candidate.taskState === undefined || isAgentTaskState(candidate.taskState))
 	);
 }

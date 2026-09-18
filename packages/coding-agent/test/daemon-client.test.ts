@@ -1,10 +1,16 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { AGENT_TASK_STATES, type AgentTaskState, isAgentTaskState } from "../src/core/agent-task-state.js";
+import type { SessionInfo } from "../src/core/session-manager.js";
+import type { AgentConnectionAgentStatus } from "../src/modes/agent-connection/types.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
 import {
 	DAEMON_COMMAND_COMPATIBILITY,
 	DAEMON_PROTOCOL_VERSION,
 	DAEMON_SCHEMA_REVISION,
 } from "../src/modes/daemon/daemon-protocol.js";
+import { serializeSavedSessionInfo } from "../src/modes/daemon/saved-session-info.js";
 
 const netMock = vi.hoisted(() => {
 	type Listener = (...args: unknown[]) => void;
@@ -108,6 +114,24 @@ function emitHello(
 			serverCapabilities,
 		})}\n`,
 	);
+}
+
+/** Stands in for "a value the producer's domain does not contain"; see the two pins below. */
+const NOT_A_TASK_STATE = "__no_such_verdict__";
+
+function savedSessionWithVerdict(taskState: AgentTaskState): SessionInfo {
+	return {
+		path: "/tmp/sessions/session-a.jsonl",
+		id: "session-a",
+		cwd: "/tmp",
+		created: new Date("2026-01-01T00:00:00.000Z"),
+		modified: new Date("2026-01-02T00:00:00.000Z"),
+		messageCount: 1,
+		firstMessage: "hello",
+		allMessagesText: "hello",
+		agentStatus: { summary: "verdict row", taskState, basedOnMessageCount: 1 },
+		rlmDepth: 0,
+	};
 }
 
 describe("DaemonClient", () => {
@@ -581,6 +605,110 @@ describe("DaemonClient", () => {
 
 		unsubscribe();
 		client.close();
+	});
+
+	it("carries every taskState the producer can write, and refuses one it cannot", async () => {
+		// Final-review seat B, B3-09': the receive side hand-wrote its own copy of the taskState
+		// enum, so a verdict added to the producer's domain crossed the wire and was dropped row and
+		// all - a progress frame that fails validation never reaches onProgress and nothing logs, so
+		// the loss is invisible from both ends. Both faces now derive from AGENT_TASK_STATES. This
+		// walks the shared domain through the real serializer and the real client, and keeps a
+		// strictness control: a value outside the domain must still be refused, or a guard that
+		// accepted anything would pass the first half of the pin.
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+
+		const connect = client.connect();
+		expect(netMock.sockets).toHaveLength(1);
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket);
+
+		const delivered: Array<string | undefined> = [];
+		const response = client.request(
+			{ type: "list_saved_sessions", activeSessionId: "active-1", scope: "current" },
+			30000,
+			{
+				onProgress: (message) => {
+					if (message.type === "session_list_item") {
+						delivered.push(message.session.agentStatus?.taskState);
+					}
+				},
+			},
+		);
+		const envelope = JSON.parse(socket.writes[0]!.trim()) as { id?: string };
+		const sendRow = (session: unknown) =>
+			socket.emit(
+				"data",
+				`${JSON.stringify({
+					id: envelope.id,
+					type: "session_list_item",
+					command: "list_saved_sessions",
+					activeSessionId: "active-1",
+					session,
+				})}\n`,
+			);
+
+		// The producer's own serializer, once per value in the shared domain.
+		for (const taskState of AGENT_TASK_STATES) {
+			sendRow(serializeSavedSessionInfo(savedSessionWithVerdict(taskState)));
+		}
+		// A verdict nobody can write: same row, one value outside the domain. The sentinel is
+		// deliberately not a plausible future verdict, so widening AGENT_TASK_STATES can never
+		// quietly turn this control into a row the guard accepts.
+		expect(AGENT_TASK_STATES).not.toContain(NOT_A_TASK_STATE);
+		sendRow({
+			...serializeSavedSessionInfo(savedSessionWithVerdict("error")),
+			agentStatus: { summary: "verdict row", taskState: NOT_A_TASK_STATE, basedOnMessageCount: 1 },
+		});
+
+		socket.emit(
+			"data",
+			`${JSON.stringify({
+				id: envelope.id,
+				type: "response",
+				command: "list_saved_sessions",
+				success: true,
+				data: { sessions: [] },
+			})}\n`,
+		);
+
+		await expect(response).resolves.toMatchObject({ id: envelope.id, success: true });
+		expect(delivered).toEqual([...AGENT_TASK_STATES]);
+		client.close();
+	});
+
+	it("publishes the same taskState domain on both faces of the wire", () => {
+		// The compile-time half of B3-09': the connection DTO's field is the shared type, so a
+		// verdict added to AGENT_TASK_STATES is added to the DTO by the same edit, and `tsgo` fails
+		// if either face is hand-written back into its own literal union.
+		const producerDomain: readonly AgentTaskState[] = AGENT_TASK_STATES;
+		const dtoDomain: Array<NonNullable<AgentConnectionAgentStatus["taskState"]>> = [...producerDomain];
+		expect(dtoDomain).toEqual([...AGENT_TASK_STATES]);
+
+		// The runtime half: the shared guard is total over the domain and refuses what is outside
+		// it, including the absent case the validator handles on its own.
+		for (const taskState of AGENT_TASK_STATES) {
+			expect(isAgentTaskState(taskState)).toBe(true);
+		}
+		expect(isAgentTaskState(NOT_A_TASK_STATE)).toBe(false);
+		expect(isAgentTaskState(undefined)).toBe(false);
+		expect(isAgentTaskState("")).toBe(false);
+	});
+
+	it("keeps the saved-session validator derived from the shared enum instead of hand-written", () => {
+		// Hand-writing the literals back into the validator would pass both pins above today,
+		// because today's two lists agree - that is exactly the shape B3-09' found in the tree. This
+		// is the pin that notices the revert, so the next verdict value cannot land on one side
+		// only. Reading the source is the same posture the schema-digest pins use.
+		const source = readFileSync(resolve(__dirname, "../src/modes/daemon/daemon-client.ts"), "utf8");
+		const start = source.indexOf("function isDaemonSavedSessionAgentStatus");
+		expect(start, "fixture: the receive-side validator must exist").toBeGreaterThan(0);
+		const body = source.slice(start, source.indexOf("\n}", start));
+		expect(body).toContain("isAgentTaskState(candidate.taskState)");
+		for (const taskState of AGENT_TASK_STATES) {
+			expect(body).not.toContain(`"${taskState}"`);
+		}
 	});
 
 	it("serializes per-session config for create commands", async () => {
