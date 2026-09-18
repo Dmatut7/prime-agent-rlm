@@ -56,8 +56,9 @@ const storeReads = vi.hoisted(() => ({ count: 0 }));
 const promptBuilds = vi.hoisted(() => ({ count: 0 }));
 /**
  * Perf seat C (2026-09-18): how often the digest text is actually rendered. The
- * ranked render is the expensive half of a moved stamp (0.62 s at the 48-term cap
- * on a 1268-entry store, `scripts/perf/digest-rank.bench.ts`), and the delivery
+ * ranked render is the expensive half of a moved stamp (~0.155 s mean at the
+ * 48-term cap on the 1266-entry fixture, 0.66-0.70 s before a5f4868c0;
+ * `scripts/perf/digest-rank.bench.ts`), and the delivery
  * decision only needs the state fingerprint - so a turn that appends no carrier
  * must not buy a render.
  */
