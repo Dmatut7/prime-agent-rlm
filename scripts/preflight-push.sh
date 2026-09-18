@@ -123,6 +123,35 @@ npm run check
 if [ "${1:-}" != "--skip-tests" ]; then
   echo "== tests: the CI test command (same exclusions and sharding CI uses) =="
   ( cd packages/coding-agent && npm run test:ci )
+
+  echo "== 3b/4 the specialty jobs the shards do not cover (process smoke, kernel, runtime python) =="
+  # The same commands the CI matrix runs, and why each is here instead of in a shard: `test:ci`
+  # excludes test/daemon-supervisor-process.test.ts and every `kernel-heavy` file, and the runtime
+  # python job is a separate package (see the matrix rows in .github/workflows/ci.yml). A local
+  # ladder that skipped them certified trees that three CI jobs had never seen - and the one time
+  # it mattered, the file `test:ci` excludes was the file that reddened CI.
+  # Measured in this checkout (load-dependent: process smoke read 38.0s on an idle machine and
+  # 106.6s under load): process smoke 38-57s, kernel 60s, runtime python 67s.
+  # `test:machine-wide` is deliberately NOT mirrored here: it drives `daemon ps`, which stops the
+  # developer's live daemon (ci.yml:198-205 records why it runs alone).
+  npm run check:process-smoke
+  ( cd packages/coding-agent && npm run test:kernel )
+  if ! command -v uv >/dev/null 2>&1; then
+    echo "   the runtime python job needs uv (CI installs it): refusing to push an unverified runtime"
+    exit 1
+  fi
+  if ! ( cd prime-agent-runtime && uv run python -m unittest discover -s test ); then
+    if [ -n "${PREFLIGHT_RUNTIME_PYTHON_REASON:-}" ]; then
+      echo "   overridden by PREFLIGHT_RUNTIME_PYTHON_REASON: $PREFLIGHT_RUNTIME_PYTHON_REASON"
+    else
+      echo "   refusing to push: the runtime python job is red, and CI runs it as its own job."
+      echo "   If the failure is the machine-local one (test/test_mcp.py's loopback fixture,",
+      echo "   test_real_anonymous_streamable_http, fails here while the same revision is green on CI),"
+      echo "   write that down and re-run:"
+      echo "   PREFLIGHT_RUNTIME_PYTHON_REASON='<written reason>' bash scripts/preflight-push.sh"
+      exit 1
+    fi
+  fi
 fi
 
 # Re-checked after the checks: `npm run check` writes files, and a gate that certified the tree
