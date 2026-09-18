@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,6 +33,34 @@ const rootPackage = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf
 const hygieneJob = workflow.slice(workflow.indexOf("test-hygiene:"), workflow.indexOf("build-check-test:"));
 const ciHonesty = rootPackage.scripts["check:ci-honesty"] ?? "";
 const preflight = readFileSync(join(repoRoot, "scripts", "preflight-push.sh"), "utf8");
+
+/**
+ * The shell text of every `run:` step in the hygiene job, inline or block form. Comments are left
+ * out on purpose: prose above a step is allowed to name a file that is gone (the step that ran
+ * `scripts/lib/ci-process-smoke.mjs` carries a comment saying so), a command is not.
+ */
+function hygieneRunBlocks(): string[] {
+	const blocks: string[] = [];
+	const lines = hygieneJob.split("\n");
+	for (let i = 0; i < lines.length; i++) {
+		const match = /^(\s*)run:\s*(.*)$/.exec(lines[i]);
+		if (!match) continue;
+		const indent = match[1].length;
+		const inline = match[2].trim();
+		if (inline !== "" && !/^[|>]/.test(inline)) {
+			blocks.push(inline);
+			continue;
+		}
+		const body: string[] = [];
+		for (let k = i + 1; k < lines.length; k++) {
+			const line = lines[k];
+			if (line.trim() !== "" && line.search(/\S/) <= indent) break;
+			body.push(line);
+		}
+		blocks.push(body.join("\n"));
+	}
+	return blocks;
+}
 
 /** Where a self-test is reachable from, or "nowhere". */
 function wiringFor(command: string): string {
@@ -122,6 +150,31 @@ describe("every self-test this repository relies on is reachable from an aggrega
 			const probe = spawnSync("test", ["-e", join(repoRoot, script)]);
 			expect(probe.status, `${script} is listed as an instrument but does not exist`).toBe(0);
 		}
+	});
+
+	it("the mirror's self-test runs in the job that installs nothing", () => {
+		// Asserted by name rather than by "wired somewhere": the step exists in this job because
+		// the mirror's self-test installs nothing, and the one that used to sit here pointed at
+		// `scripts/lib/ci-process-smoke.mjs` - a file 9afed3ba6 deleted, so the job died on
+		// ERR_MODULE_NOT_FOUND while `npm run check:ci-honesty` kept the same command reachable
+		// from a job that does install. Reachability alone would have called that wired.
+		expect(wiringFor("bash scripts/check-process-smoke.sh --self-test")).toBe("test-hygiene job");
+	});
+
+	it("no script a hygiene step names is missing from the checkout", () => {
+		// The shape that shipped in this batch, one level wider than the list above: the list only
+		// covers the commands *this file* names, so a step pointing at some other deleted file rots
+		// unnoticed. Only the `run:` bodies are read - a comment naming the file that is gone is
+		// documentation, not a command.
+		const referenced = new Set<string>();
+		for (const block of hygieneRunBlocks()) {
+			for (const match of block.matchAll(/(?:scripts|packages|\.husky)\/[\w./-]+/g)) {
+				referenced.add(match[0]);
+			}
+		}
+		expect(referenced.size).toBeGreaterThan(0);
+		const missing = [...referenced].filter((path) => !existsSync(join(repoRoot, path))).sort();
+		expect(missing, "every script a hygiene step runs must exist").toEqual([]);
 	});
 });
 
