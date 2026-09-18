@@ -793,6 +793,32 @@ describe("#2098 static system prompt with an in-context harness digest", () => {
 		expect(digestMessages(harness.session.messages)).toHaveLength(2);
 	});
 
+	it("renders once when a legacy carrier forces the text comparison", async () => {
+		seedEntry("memory", "seed_legacy", "Seed legacy", "Legacy carrier fixture.");
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("reply one"), fauxAssistantMessage("reply two")]);
+		await harness.session.prompt("round one");
+		const carriers = digestMessages(harness.session.messages);
+		expect(carriers).toHaveLength(1);
+
+		// A carrier persisted before digests carried a state fingerprint reads back as
+		// text only, so freshness has nothing to judge it by but the rendered digest:
+		// this turn must render. It must also render exactly once, because the string
+		// the comparison just built is the string the append delivers - the deferred
+		// render memoizes, and dropping the memo would bill the same text twice.
+		delete (carriers[0].details as { stateFingerprint?: string }).stateFingerprint;
+		digestRenders.count = 0;
+		seedEntry("memory", "seed_legacy_two", "Seed legacy two", "Second legacy fixture.");
+		await harness.session.prompt("round two");
+		expect(digestRenders.count).toBe(1);
+		const after = digestMessages(harness.session.messages);
+		expect(after).toHaveLength(2);
+		// The delivered carrier is fingerprinted again, so the legacy branch is a
+		// one-time cost and the next turn is back to comparing identities.
+		expect((after[1].details as { stateFingerprint?: string }).stateFingerprint).toBeDefined();
+	});
+
 	it("makes another seat's write visible on the next turn, exactly once", async () => {
 		seedEntry("memory", "seed_k", "Seed K", "Menu fixture.");
 		const harness = await createHarness({ persistSession: true });
