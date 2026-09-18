@@ -39,6 +39,8 @@ type MatrixRow = Record<string, unknown>;
 type ReadingRow = {
 	name: string;
 	report: string;
+	/** The gate's own reading line for this row, verbatim from the recorded run's log. */
+	log_line: string;
 	unit: string;
 	collected: number;
 	ran: number;
@@ -175,6 +177,52 @@ function smokeMismatches(
 				`the module declares ${declared} skip(s), but the recorded reading for this row is collected=${recorded.collected} ` +
 					`ran=${recorded.ran}, a gap of ${gap}`,
 			);
+		}
+	}
+	return out;
+}
+
+/**
+ * Every way a row's recorded evidence line can disagree with the numbers written next to it.
+ *
+ * `scripts/ci-floor-readings.json` carries the gate's own reading line for each row (`log_line`),
+ * copied from the recorded run's log. That makes the reading auditable from inside the tree - but
+ * only if something re-parses it: a line that no longer matches the numbers beside it (or a report
+ * path that moved) is exactly the kind of quiet drift this file exists to stop, and it would look
+ * like evidence while being decoration.
+ */
+function logLineMismatches(reading: Readings): string[] {
+	const out: string[] = [];
+	// The two shapes the two gates print: vitest (files) and `node --test` (suites, the tui row).
+	const vitest = /^### (\S+\.json): numTotalTests=(\d+) ran=(\d+) files=(\d+) nothing-files=(\d+)$/;
+	const nodeTest = /^### (\S+\.xml): tests=(\d+) ran=(\d+) suites=(\d+) nothing-suites=(\d+)$/;
+	for (const row of reading.rows) {
+		const line = row.log_line;
+		if (typeof line !== "string" || line.length === 0) {
+			out.push(`${row.name}: no log_line recorded, so its reading carries no evidence`);
+			continue;
+		}
+		const match = vitest.exec(line) ?? nodeTest.exec(line);
+		if (match === null) {
+			out.push(`${row.name}: the recorded log_line is not a gate reading line: ${line}`);
+			continue;
+		}
+		const [, report, collected, ran, files, nothing] = match;
+		if (report !== row.report) {
+			out.push(`${row.name}: the log_line names ${report}, the row names ${row.report}`);
+		}
+		const numbers: Record<string, number> = {
+			collected: Number(collected),
+			ran: Number(ran),
+			files: Number(files),
+			nothing_files: Number(nothing),
+		};
+		for (const key of ["collected", "ran", "files", "nothing_files"]) {
+			if (numbers[key] !== row[key as keyof ReadingRow]) {
+				out.push(
+					`${row.name}: the log_line says ${key}=${numbers[key]}, the row says ${row[key as keyof ReadingRow]}`,
+				);
+			}
 		}
 	}
 	return out;
@@ -432,6 +480,31 @@ describe("the floor pin can go red (planted mutations, same comparison functions
 		if (exception === undefined) throw new Error("no exception recorded");
 		exception.owner_flags.min_tests += 1;
 		expect(exceptionMismatches(mutant).join("\n")).toContain("update the recorded exception");
+	});
+
+	it("re-parses every row's recorded log line and requires it to agree with the numbers beside it", () => {
+		const mismatches = logLineMismatches(readings());
+		expect(mismatches, mismatches.join("\n")).toEqual([]);
+	});
+
+	it("is red when a recorded log line drifts from its numbers or names another report", () => {
+		const drifted = asMutable(readings());
+		const ai = drifted.rows.find((row) => row.name === "ai");
+		if (ai === undefined) throw new Error("no ai reading");
+		ai.log_line = ai.log_line.replace("numTotalTests=1365", "numTotalTests=1366");
+		expect(logLineMismatches(drifted).join("\n")).toContain("the log_line says collected=1366");
+
+		const moved = asMutable(readings());
+		const tui = moved.rows.find((row) => row.name === "tui");
+		if (tui === undefined) throw new Error("no tui reading");
+		tui.log_line = tui.log_line.replace("coverage/ci-tui.xml", "coverage/ci-something-else.xml");
+		expect(logLineMismatches(moved).join("\n")).toContain("the log_line names coverage/ci-something-else.xml");
+
+		const lost = asMutable(readings());
+		const smoke = lost.rows.find((row) => row.name === "coding-agent process smoke");
+		if (smoke === undefined) throw new Error("no smoke reading");
+		smoke.log_line = "";
+		expect(logLineMismatches(lost).join("\n")).toContain("no log_line recorded");
 	});
 
 	it("counts the floor the way the policy does, including the exact products", () => {

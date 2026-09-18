@@ -20,18 +20,20 @@
 #      read from `scripts/lib/ci-process-smoke.mjs` - the single source `.github/workflows/ci.yml`
 #      is pinned to; `crash-handlers-process` is the one file allowed to run nothing, because all
 #      four of its tests carry the `process-stress` tag).
-#   4. The CI tag-skip ledger, from the same module: 8 skips in
-#      daemon-supervisor-process.test.ts + 4 in daemon-supervisor-crash-handlers-process.test.ts.
+#   4. The CI tag-skip ledger, from the same module: every `process-stress` skip this job does not
+#      run, declared per file with a count and a reason.
 #      The judgement is the tag, not the environment: `vitest.config.ts` sets
-#      `tagsFilter: ["!process-stress", "!kernel-heavy"]` unconditionally, so those twelve
+#      `tagsFilter: ["!process-stress", "!kernel-heavy"]` unconditionally, so those
 #      tests are skipped on every platform and under every env; the nightly
 #      `nightly-process-stress.yml` is where they do run.
 #
 # Usage
 # -----
-#   bash scripts/check-process-smoke.sh                 # the CI face (green = collected 24 | ran 12 | skipped 12)
+#   bash scripts/check-process-smoke.sh                 # the CI face (green at the pinned reading:
+#                                                       # collected 24 | ran 12 | skipped 12, per
+#                                                       # scripts/ci-floor-readings.json)
 #   bash scripts/check-process-smoke.sh --with-stress   # + the nightly face (`test:process-stress`)
-#   bash scripts/check-process-smoke.sh --self-test     # prove both instruments can still go red
+#   bash scripts/check-process-smoke.sh --self-test     # prove all three instruments can still go red
 #   bash scripts/check-process-smoke.sh --report /tmp/p.json   # keep the report elsewhere
 #
 # Repository root is resolved from this script's own location, so the file works both from a
@@ -199,7 +201,7 @@ else
 	fail "coverage gate skipped: no report"
 fi
 
-step "4/4 CI tag-skip ledger (12 declared skips, 8 + 4, counted and named)"
+step "4/4 CI tag-skip ledger (every declared skip counted and named)"
 if [ -f "$REPORT" ]; then
 	bash "$ROOT/scripts/check-tag-skip-ledger.sh" "$REPORT" --ledger "$LEDGER"
 	rc=$?
@@ -209,7 +211,7 @@ else
 fi
 
 if [ "$WITH_STRESS" = "1" ]; then
-	step "5/5 nightly face: npm run test:process-stress (the 12 tag-filtered tests)"
+	step "5/5 nightly face: npm run test:process-stress (the tag-filtered tests)"
 	( cd "$PKG" && npm run test:process-stress ) > "$REPORT.stress.log" 2>&1
 	rc=$?
 	grep -E "Test Files|Tests  " "$REPORT.stress.log" | tail -3
