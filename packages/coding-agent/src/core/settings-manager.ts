@@ -23,6 +23,13 @@ import { DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS } from "./extensions/timeout.js";
 import { RETIRED_VENV_RETENTION } from "./kernel/venv-in-use.js";
 import type { ProviderWaitPolicy } from "./provider-retry.js";
 import type { ResolvedRetentionSettings } from "./retention/types.js";
+import {
+	readSpendPriceOverrides,
+	SPEND_PRICE_OVERRIDES_PATH,
+	type SpendPriceOverrideProblem,
+	type SpendPriceOverrides,
+	type SpendPriceRateOverride,
+} from "./spend-pricing.js";
 
 const RECENT_MODELS_LIMIT = 20;
 export const DEFAULT_IDLE_EVICTION_MINUTES = 90;
@@ -629,6 +636,16 @@ export interface SubagentSpendCellSettings {
 	 * discipline as `compaction.triggerRatio`).
 	 */
 	intervalMs?: number;
+	/**
+	 * Per-model price corrections, keyed `"<provider>/<model-id>"`, in the unit
+	 * `models.json` writes `cost` in (per million tokens). Use it when a rate in
+	 * `models.json` is wrong: the cell prices that model's recorded tokens with
+	 * the corrected rates instead of the rate on the message, so the figure on
+	 * screen changes too. A field left out, or a value that is not a finite
+	 * number >= 0, falls back to the `models.json` rate (the unusable value is
+	 * reported as a warning, never silently ignored). See `core/spend-pricing.ts`.
+	 */
+	priceOverrides?: Record<string, SpendPriceRateOverride>;
 }
 
 /**
@@ -859,9 +876,36 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 const KNOWN_NESTED_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	"retry.provider": ["timeoutMs", "maxRetries", "maxRetryDelayMs", "streamStallTimeoutMs", "waitForUsage"],
 	// The cell's cadence block: `ui.subagentSpendCell` is either a boolean or this object.
-	"ui.subagentSpendCell": ["intervalMs"],
+	"ui.subagentSpendCell": ["intervalMs", "priceOverrides"],
+	// The correction map is free-form in its own keys (`"<provider>/<model-id>"`), so only
+	// the model keys themselves are left unvalidated here; `reportSpendPriceOverrideProblems`
+	// reports the fields inside them.
+	"ui.subagentSpendCell.priceOverrides": null,
 	"retry.emptyTurn": ["maxAttempts", "baseDelayMs", "maxDelayMs", "maxTotalDelayMs"],
 };
+
+/**
+ * What to do about one unusable price override, in the user's terms. Each kind
+ * ends with what happens instead, because "ignored" is the fact that matters:
+ * an unusable field falls back to the models.json rate, an unusable entry
+ * corrects nothing.
+ */
+function spendPriceOverrideProblemAdvice(problem: SpendPriceOverrideProblem): string {
+	switch (problem.kind) {
+		case "value":
+			return `the field is ignored and the models.json rate stands. A rate is a finite number >= 0 in the models.json cost unit (per million tokens)`;
+		case "unknown-field":
+			return `that is not a rate field this version knows (input, output, cacheRead, cacheWrite), so it never takes effect`;
+		case "entry":
+			return `a correction is an object of rate fields, so this entry is ignored`;
+		case "key":
+			return `a correction key is "<provider>/<model-id>", so this entry can never match a model`;
+		default: {
+			const _exhaustive: never = problem.kind;
+			return _exhaustive;
+		}
+	}
+}
 
 /**
  * Full dotted paths of every key the current schema does not recognize, so a
@@ -1220,6 +1264,8 @@ export class SettingsManager {
 		}
 		manager.reportUnknownSettingsKeys("global", manager.globalSettings);
 		manager.reportUnknownSettingsKeys("project", manager.projectSettings);
+		manager.reportSpendPriceOverrideProblems("global", manager.globalSettings);
+		manager.reportSpendPriceOverrideProblems("project", manager.projectSettings);
 		manager.captureSettingsStamps();
 		return manager;
 	}
@@ -1429,6 +1475,8 @@ export class SettingsManager {
 		this.recomputeMergedSettings();
 		this.reportUnknownSettingsKeys("global", this.globalSettings);
 		this.reportUnknownSettingsKeys("project", this.projectSettings);
+		this.reportSpendPriceOverrideProblems("global", this.globalSettings);
+		this.reportSpendPriceOverrideProblems("project", this.projectSettings);
 		this.captureSettingsStamps();
 	}
 
@@ -1664,6 +1712,31 @@ export class SettingsManager {
 		this.warnings.push({ scope, message });
 	}
 
+	/**
+	 * Report every unusable price override, with its full key path.
+	 *
+	 * This setting exists because a spend figure that quietly prices from the
+	 * wrong rate is worse than no figure: so a correction that cannot be used is
+	 * loud. The identity carries the rejected value, so fixing a bad entry for a
+	 * new bad value reports again instead of being swallowed as a repeat.
+	 */
+	private reportSpendPriceOverrideProblems(scope: SettingsScope, settings: Settings): void {
+		const raw =
+			typeof settings.ui?.subagentSpendCell === "object" && settings.ui.subagentSpendCell !== null
+				? settings.ui.subagentSpendCell.priceOverrides
+				: undefined;
+		if (raw === undefined) {
+			return;
+		}
+		for (const problem of readSpendPriceOverrides(raw, SPEND_PRICE_OVERRIDES_PATH).problems) {
+			this.recordWarning(
+				scope,
+				`spend-price-override:${problem.path}=${problem.found}`,
+				`${problem.path} is not a usable price override (${problem.found}): ${spendPriceOverrideProblemAdvice(problem)}`,
+			);
+		}
+	}
+
 	/** Report every key this version does not recognize (CD-3). */
 	private reportUnknownSettingsKeys(scope: SettingsScope, settings: Settings): void {
 		for (const key of collectUnknownSettingsKeys(settings as Record<string, unknown>)) {
@@ -1734,6 +1807,7 @@ export class SettingsManager {
 
 			// A write that carries unknown keys back to disk keeps them visible.
 			this.reportUnknownSettingsKeys(scope, mergedSettings);
+			this.reportSpendPriceOverrideProblems(scope, mergedSettings);
 
 			return JSON.stringify(mergedSettings, null, 2);
 		});
@@ -2743,6 +2817,27 @@ export class SettingsManager {
 			MIN_SUBAGENT_SPEND_CELL_INTERVAL_MS,
 			Math.min(MAX_SUBAGENT_SPEND_CELL_INTERVAL_MS, Math.floor(configured)),
 		);
+	}
+
+	/**
+	 * The spend cell's price corrections, sanitized: only usable fields survive
+	 * here, so a caller never has to guard against a string, a NaN or a negative
+	 * rate. An unusable field was reported as a warning when the settings were
+	 * loaded, and falls back to the `models.json` rate, which is what makes this
+	 * getter safe to call on every refresh of the cell.
+	 */
+	getSubagentSpendCellPriceOverrides(): SpendPriceOverrides {
+		return readSpendPriceOverrides(this.rawSubagentSpendCellPriceOverrides(), SPEND_PRICE_OVERRIDES_PATH).overrides;
+	}
+
+	/**
+	 * The raw `ui.subagentSpendCell.priceOverrides` block of the merged settings.
+	 * `ui.subagentSpendCell` is either a boolean or the tuning object, so the
+	 * boolean form has nothing to read.
+	 */
+	private rawSubagentSpendCellPriceOverrides(): unknown {
+		const raw = this.settings.ui?.subagentSpendCell;
+		return typeof raw === "object" && raw !== null ? raw.priceOverrides : undefined;
 	}
 
 	setSubagentSpendCellIntervalMs(intervalMs: number): void {
