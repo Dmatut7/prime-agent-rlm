@@ -17,6 +17,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
 	COMPACT_AFTER_BYTES,
 	COMPACT_AFTER_RECORDS,
+	IDLE_COMPACT_AFTER_RECORDS,
 	WorkerRecoveryJournal,
 	type WorkerRecoveryRecord,
 } from "../src/modes/daemon/worker-recovery-journal.js";
@@ -213,7 +214,11 @@ describe("WorkerRecoveryJournal", () => {
 		expect(WorkerRecoveryJournal.readLatest(path)).toHaveLength(sessions.length);
 	});
 
-	it("compacts when the last busy session goes idle, and not before", () => {
+	it("compacts once the idle journal reaches the idle record bound, and not while busy", () => {
+		// perfB④: going idle no longer rewrites the journal on the spot - an idle
+		// worker compacts once per IDLE_COMPACT_AFTER_RECORDS records, so the bound
+		// on an idle file is that many lines. While any session is busy the journal
+		// still only appends.
 		const path = createPath();
 		const journal = new WorkerRecoveryJournal(path);
 		for (const activeSessionId of ["active-1", "active-2", "active-3"]) {
@@ -237,8 +242,41 @@ describe("WorkerRecoveryJournal", () => {
 			previousBytes = statSync(path).size;
 		}
 		journal.record({ activeSessionId: "active-3", sessionId: "session-3", busy: false, operation: "turn_end" });
-		expect(statSync(path).size).toBeLessThan(previousBytes);
+		// Idle now, but six lines are still under the idle record bound: the record
+		// lands as a plain append, no rewrite yet.
+		expect(statSync(path).size).toBeGreaterThan(previousBytes);
+		previousBytes = statSync(path).size;
+		// Two more idle-side records cross IDLE_COMPACT_AFTER_RECORDS (8 lines) and
+		// the journal rewrites down to the latest set. The operations differ because
+		// record() dedupes a record that changes nothing.
+		journal.record({ activeSessionId: "active-1", sessionId: "session-1", busy: false, operation: "idle_tick#a" });
+		expect(statSync(path).size).toBeGreaterThan(previousBytes);
+		journal.record({ activeSessionId: "active-2", sessionId: "session-2", busy: false, operation: "idle_tick#b" });
 		expect(readLines(path)).toHaveLength(3);
+	});
+
+	it("keeps an idle journal within the idle record bound", () => {
+		// The idle bound is the whole point of the interval: a worker that stays
+		// idle never lets its journal exceed IDLE_COMPACT_AFTER_RECORDS lines, and
+		// each rewrite carries the full latest set.
+		const path = createPath();
+		const journal = new WorkerRecoveryJournal(path);
+		journal.record({ activeSessionId: "active-1", sessionId: "session-1", busy: true, operation: "turn_start" });
+		journal.record({ activeSessionId: "active-1", sessionId: "session-1", busy: false, operation: "turn_end" });
+		for (let i = 0; i < IDLE_COMPACT_AFTER_RECORDS * 3; i++) {
+			// Distinct operations: record() dedupes a record that changes nothing.
+			journal.record({
+				activeSessionId: "active-1",
+				sessionId: "session-1",
+				busy: false,
+				operation: `idle_tick#${i}`,
+			});
+			expect(readLines(path).length).toBeLessThanOrEqual(IDLE_COMPACT_AFTER_RECORDS);
+		}
+		// The latest set survives every rewrite.
+		expect(WorkerRecoveryJournal.readLatest(path)).toEqual([
+			expect.objectContaining({ activeSessionId: "active-1", busy: false }),
+		]);
 	});
 
 	it("recounts busy sessions when it reloads an existing journal", () => {
@@ -254,10 +292,23 @@ describe("WorkerRecoveryJournal", () => {
 		}
 		const reopened = new WorkerRecoveryJournal(path);
 		reopened.record({ activeSessionId: "active-1", sessionId: "session-1", busy: false, operation: "turn_end" });
-		const bytesBeforeLastIdle = statSync(path).size;
 		expect(readLines(path)).toHaveLength(3);
 		reopened.record({ activeSessionId: "active-2", sessionId: "session-2", busy: false, operation: "turn_end" });
-		expect(statSync(path).size).toBeLessThan(bytesBeforeLastIdle);
+		// Idle now (the recount saw through the reload), but under the idle record
+		// bound the journal keeps appending (perfB④)...
+		expect(readLines(path)).toHaveLength(4);
+		// ...until the bound, when the rewrite proves the reloaded busy count was
+		// right: the latest set is the two idle sessions. Four lines are on disk,
+		// so the fourth append below is the eighth line and triggers the rewrite.
+		for (let i = 0; i < IDLE_COMPACT_AFTER_RECORDS - 4; i++) {
+			// Distinct operations: record() dedupes a record that changes nothing.
+			reopened.record({
+				activeSessionId: "active-1",
+				sessionId: "session-1",
+				busy: false,
+				operation: `idle_tick#${i}`,
+			});
+		}
 		expect(readLines(path)).toHaveLength(2);
 	});
 
@@ -271,12 +322,21 @@ describe("WorkerRecoveryJournal", () => {
 		const stale = `${path}.${process.pid}.tmp`;
 		mkdirSync(stale);
 		writeFileSync(join(stale, "keep"), "x");
+		// perfB④: idle compaction fires once per IDLE_COMPACT_AFTER_RECORDS records,
+		// so pad to one below the bound; the next record is the one that compacts.
+		// Distinct operations because record() dedupes a record that changes nothing.
+		for (let i = 0; i < IDLE_COMPACT_AFTER_RECORDS - 2; i++) {
+			journal.record({ activeSessionId: "active-1", sessionId: "session-1", busy: true, operation: `pad#a${i}` });
+		}
 		expect(() =>
 			journal.record({ activeSessionId: "active-1", sessionId: "session-1", busy: false, operation: "turn_end" }),
 		).not.toThrow();
 		expect(readLines(path)).toHaveLength(1);
 		expect(existsSync(stale)).toBe(true);
 		journal.record({ activeSessionId: "active-1", sessionId: "session-1", busy: true, operation: "turn_start#2" });
+		for (let i = 0; i < IDLE_COMPACT_AFTER_RECORDS - 2; i++) {
+			journal.record({ activeSessionId: "active-1", sessionId: "session-1", busy: true, operation: `pad#b${i}` });
+		}
 		expect(() =>
 			journal.record({
 				activeSessionId: "active-1",
@@ -298,6 +358,11 @@ describe("WorkerRecoveryJournal", () => {
 		for (const stale of staleNames) {
 			mkdirSync(stale);
 			writeFileSync(join(stale, "keep"), "x");
+		}
+		// perfB④: pad to one below the idle record bound so the next record compacts
+		// (distinct operations because record() dedupes a record that changes nothing).
+		for (let i = 0; i < IDLE_COMPACT_AFTER_RECORDS - 2; i++) {
+			journal.record({ activeSessionId: "active-1", sessionId: "session-1", busy: true, operation: `pad#${i}` });
 		}
 		expect(() =>
 			journal.record({ activeSessionId: "active-1", sessionId: "session-1", busy: false, operation: "turn_end" }),

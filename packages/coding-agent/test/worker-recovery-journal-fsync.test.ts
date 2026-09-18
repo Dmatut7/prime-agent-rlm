@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { type LogEntry, setLogSink } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { WorkerRecoveryJournal } from "../src/modes/daemon/worker-recovery-journal.js";
+import { IDLE_COMPACT_AFTER_RECORDS, WorkerRecoveryJournal } from "../src/modes/daemon/worker-recovery-journal.js";
 
 // The journal's durability policy is a syscall policy, so these tests observe the
 // syscalls instead of inferring them from timing: appends must not fsync, and a
@@ -118,6 +118,20 @@ describe("WorkerRecoveryJournal durability syscalls", () => {
 		// One session is still busy: the append alone must not fsync.
 		expect(calls.order).toEqual([]);
 		journal.record({ activeSessionId: "active-2", sessionId: "session-2", busy: false, operation: "turn_end" });
+		// Idle now, but idle compaction fires once per IDLE_COMPACT_AFTER_RECORDS
+		// records (perfB④): pad to one below the bound - plain appends, still no
+		// fsync - and let the next record be the one that compacts.
+		expect(calls.order).toEqual([]);
+		for (let i = 0; i < IDLE_COMPACT_AFTER_RECORDS - 5; i++) {
+			journal.record({
+				activeSessionId: "active-1",
+				sessionId: "session-1",
+				busy: false,
+				operation: `idle_tick#${i}`,
+			});
+		}
+		expect(calls.order).toEqual([]);
+		journal.record({ activeSessionId: "active-1", sessionId: "session-1", busy: false, operation: "idle_tick#z" });
 		// Compaction is exactly fsync(temp) then rename: dropping that fsync would
 		// let a crash expose a truncated file as the whole recovered state.
 		expect(calls.order).toEqual(["fsync", "rename"]);
@@ -136,6 +150,11 @@ describe("WorkerRecoveryJournal durability syscalls", () => {
 		const path = createPath();
 		const journal = new WorkerRecoveryJournal(path);
 		journal.record({ activeSessionId: "active-1", sessionId: "session-1", busy: true, operation: "turn_start" });
+		// perfB④: idle compaction fires once per IDLE_COMPACT_AFTER_RECORDS records,
+		// so pad to one below the bound; the failing record is the one that compacts.
+		for (let i = 0; i < IDLE_COMPACT_AFTER_RECORDS - 2; i++) {
+			journal.record({ activeSessionId: "active-1", sessionId: "session-1", busy: true, operation: `pad#${i}` });
+		}
 		calls.order = [];
 		calls.failRenames = 2;
 		expect(() =>
@@ -149,7 +168,7 @@ describe("WorkerRecoveryJournal durability syscalls", () => {
 		expect(String(failure?.error)).toContain("ENOSPC");
 		expect(String(failure?.firstAttemptError)).toContain("ENOSPC");
 		// The record itself is still on disk and in memory; only compaction failed.
-		expect(readLines(path)).toHaveLength(2);
+		expect(readLines(path)).toHaveLength(IDLE_COMPACT_AFTER_RECORDS);
 		expect(journal.getLatest()).toEqual([
 			expect.objectContaining({ activeSessionId: "active-1", busy: false, operation: "turn_end" }),
 		]);
@@ -160,6 +179,10 @@ describe("WorkerRecoveryJournal durability syscalls", () => {
 		const path = createPath();
 		const journal = new WorkerRecoveryJournal(path);
 		journal.record({ activeSessionId: "active-1", sessionId: "session-1", busy: true, operation: "turn_start" });
+		// perfB④: pad to one below the idle record bound so the next record compacts.
+		for (let i = 0; i < IDLE_COMPACT_AFTER_RECORDS - 2; i++) {
+			journal.record({ activeSessionId: "active-1", sessionId: "session-1", busy: true, operation: `pad#${i}` });
+		}
 		calls.order = [];
 		calls.failRenames = 1;
 		expect(() =>
