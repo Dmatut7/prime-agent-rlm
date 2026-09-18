@@ -561,7 +561,12 @@ export function readHarnessStateStamp(harnessStateDir: string): HarnessStateStam
 	}
 }
 
-function harnessStateStampsEqual(left: HarnessStateStamp | null, right: HarnessStateStamp | null): boolean {
+/**
+ * Stamp equality behind the concurrent-write guard and behind #2098's material-change
+ * gate: a harness write always goes through `writePrivateFileAtomic` (temp file plus
+ * rename), so a new inode, size or mtime is a complete "the store moved" signal.
+ */
+export function harnessStateStampsEqual(left: HarnessStateStamp | null, right: HarnessStateStamp | null): boolean {
 	if (left === null || right === null) return left === right;
 	return left.mtimeMs === right.mtimeMs && left.size === right.size && left.ino === right.ino;
 }

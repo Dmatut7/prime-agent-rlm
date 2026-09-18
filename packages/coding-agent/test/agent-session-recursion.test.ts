@@ -22,7 +22,7 @@ import { AgentSession, type RlmChildAgentSnapshot } from "../src/core/agent-sess
 import { AuthStorage } from "../src/core/auth-storage.js";
 import type { LoadExtensionsResult } from "../src/core/extensions/index.js";
 import { type HostRequestHandlers, ReplKernelManager } from "../src/core/kernel/index.js";
-import { convertToLlm } from "../src/core/messages.js";
+import { convertToLlm, HARNESS_DIGEST_CUSTOM_TYPE } from "../src/core/messages.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import {
 	createDefaultRlmSubagentSessionName,
@@ -37,7 +37,7 @@ import { createSyntheticSourceInfo } from "../src/core/source-info.js";
 import type { BashOperations } from "../src/core/tools/bash.js";
 import { type ActiveSessionState, resolveActiveSessionState } from "../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
-import { conversationMessages } from "./suite/harness.js";
+import { conversationMessages, getMessageText } from "./suite/harness.js";
 import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.js";
 
 const model = getModel("anthropic", "claude-sonnet-4-5")!;
@@ -4596,45 +4596,58 @@ describe("AgentSession RLM session dir", () => {
 		expect(env.RLM_HARNESS_STATE_DIR).toBe(join(ephemeralDir, "harness"));
 	});
 
-	it("loads the ephemeral RLM harness path into the host system prompt", () => {
-		const ephemeralDir = join(tempDir, "ephemeral-rlm");
-		mkdirSync(join(ephemeralDir, "harness"), { recursive: true });
-		writeFileSync(
-			join(ephemeralDir, "harness", "harness_state.json"),
-			JSON.stringify({
-				schema: 1,
-				entries: {
-					prompt: {},
-					memory: {
-						ephemeral_note: {
-							id: "ephemeral_note",
-							kind: "memory",
-							title: "Ephemeral note",
-							content: "Loaded from the RLM session harness path.",
-							path: "000",
-							scope: "local",
-							reference: {},
-							arguments: {},
-							metadata: {},
-							source: "test",
-							created_at: "2026-01-01T00:00:00.000Z",
-							updated_at: "2026-01-01T00:00:00.000Z",
-							version: 1,
+	it("loads the ephemeral RLM harness path into the cold-boundary harness digest", async () => {
+		// Isolate the global harness store: the digest renders the same menu the system
+		// prompt used to, and a developer's own global entries would crowd out this
+		// session's local state, which the renderer elides once the store is large.
+		vi.stubEnv("PRIME_AGENT_CODING_AGENT_DIR", join(tempDir, "isolated-agent-dir"));
+		try {
+			const ephemeralDir = join(tempDir, "ephemeral-rlm");
+			mkdirSync(join(ephemeralDir, "harness"), { recursive: true });
+			writeFileSync(
+				join(ephemeralDir, "harness", "harness_state.json"),
+				JSON.stringify({
+					schema: 1,
+					entries: {
+						prompt: {},
+						memory: {
+							ephemeral_note: {
+								id: "ephemeral_note",
+								kind: "memory",
+								title: "Ephemeral note",
+								content: "Loaded from the RLM session harness path.",
+								path: "000",
+								scope: "local",
+								reference: {},
+								arguments: {},
+								metadata: {},
+								source: "test",
+								created_at: "2026-01-01T00:00:00.000Z",
+								updated_at: "2026-01-01T00:00:00.000Z",
+								version: 1,
+							},
 						},
+						skill: {},
+						subagent: {},
 					},
-					skill: {},
-					subagent: {},
-				},
-				refinements: [],
-			}),
-			"utf8",
-		);
-		const root = createSession(SessionManager.inMemory(tempDir), undefined, undefined, false, ephemeralDir);
+					refinements: [],
+				}),
+				"utf8",
+			);
+			const root = createSession(SessionManager.inMemory(tempDir), undefined, undefined, false, ephemeralDir);
 
-		const prompt = root.systemPrompt;
-
-		expect(prompt).toContain("Ephemeral note");
-		expect(prompt).toContain("Loaded from the RLM session harness path.");
+			// #2098 moved the harness menu out of the system prompt and into a cold-boundary
+			// custom message, delivered with the first committed turn.
+			expect(root.systemPrompt).not.toContain("Ephemeral note");
+			await root.prompt("hi");
+			const digest = root.messages.find(
+				(message) => message.role === "custom" && message.customType === HARNESS_DIGEST_CUSTOM_TYPE,
+			);
+			expect(getMessageText(digest)).toContain("Ephemeral note");
+			expect(getMessageText(digest)).toContain("Loaded from the RLM session harness path.");
+		} finally {
+			vi.unstubAllEnvs();
+		}
 	});
 
 	it("exports the configured agentDir to the kernel so skills find auth.json", () => {

@@ -237,20 +237,21 @@ import {
 	convertToLlm,
 	createAsyncBashCompletionMessage,
 	createCompactionOutcomeMessage,
+	createHarnessDigestMessage,
 	createHeartbeatPromptMessage,
 	createRefinementFailureMessage,
-	createRefinementNoticeMessage,
 	createRefinementOutcomeMessage,
 	createRlmChildFailureMessage,
 	createRlmChildStallNoticeMessage,
 	createRlmChildTerminalNoticeMessage,
 	createSessionSlashCommandMessage,
 	createSessionSlashCommandResultMessage,
+	HARNESS_DIGEST_CUSTOM_TYPE,
+	type HarnessDigestDetails,
 	HEARTBEAT_PROMPT_CUSTOM_TYPE,
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
 	isSessionSlashCommandMessage,
-	type RefinementSource,
 	RLM_CHILD_FAILURE_CUSTOM_TYPE,
 	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
 	type RlmChildFailureDetails,
@@ -284,6 +285,7 @@ import {
 	type AutoRefineReview,
 	applyRefinementProposal,
 	assertHarnessStateWritable,
+	formatHarnessStateForPrompt,
 	generateRefinementId,
 	getGlobalHarnessStateDir,
 	getHarnessStatePath,
@@ -291,6 +293,8 @@ import {
 	getRefinementHistory,
 	type HarnessScope,
 	type HarnessState,
+	type HarnessStateStamp,
+	harnessStateStampsEqual,
 	inferRefinementResultScope,
 	isPersistentHarnessStorageSupported,
 	loadGlobalRefinementHistory,
@@ -1039,6 +1043,35 @@ function cloneQueuedAgentMessage(message: QueuedAgentMessage): QueuedAgentMessag
 		...message,
 		content: Array.isArray(message.content) ? message.content.map((block) => ({ ...block })) : message.content,
 	};
+}
+
+/**
+ * The two harness stores a session's digest renders from: the machine-wide global
+ * store and this session's own local store. `null` means "no state file", which is a
+ * stamp like any other (its appearance and disappearance are both material changes).
+ */
+interface HarnessStoreStamps {
+	global: HarnessStateStamp | null;
+	local: HarnessStateStamp | null;
+}
+
+function harnessStoreStampsEqual(left: HarnessStoreStamps, right: HarnessStoreStamps): boolean {
+	return harnessStateStampsEqual(left.global, right.global) && harnessStateStampsEqual(left.local, right.local);
+}
+
+/**
+ * Entry keys whose presence or version differs between two fingerprints: the
+ * added / removed / version-bumped set the material-change gate judges.
+ */
+function changedHarnessEntryKeys(previous: Map<string, number>, next: Map<string, number>): Set<string> {
+	const changed = new Set<string>();
+	for (const [key, version] of next) {
+		if (previous.get(key) !== version) changed.add(key);
+	}
+	for (const key of previous.keys()) {
+		if (!next.has(key)) changed.add(key);
+	}
+	return changed;
 }
 
 function primaryDeliveryRecord(action: QueuedSessionAction): DeliveryRecord {
@@ -2093,6 +2126,21 @@ export class AgentSession {
 	private _lateIpythonSentAgentMessages = new Map<string, KernelSentAgentMessage[]>();
 	/** Outcome disclosures whose session-file append failed; retained for context rebuilds. */
 	private readonly _unpersistedOutcomes: CustomMessage[] = [];
+	/**
+	 * Fresh/empty contexts defer digest injection to the first committed turn, so an
+	 * untouched session keeps reading as empty to every raw message-count check
+	 * (draft cleanup, daemon session list, branch seedability, hasExistingSession).
+	 */
+	private _harnessDigestPending = false;
+	/** Store stamps as of the last digest render; unchanged stamps skip the render entirely. */
+	private _harnessDigestStamps: HarnessStoreStamps | undefined;
+	/** Entry identity as of the last digest render, for the material-change difference. */
+	private _harnessDigestFingerprint: Map<string, number> | undefined;
+	/**
+	 * Entry keys this session already itemized for the model in a refinement receipt
+	 * (applied and refused), so a digest delta does not deliver the same news twice.
+	 */
+	private readonly _refinementReportedEntryKeys = new Set<string>();
 	private _bashAbortControllers = new Set<AbortController>();
 	private _userBashRunning = false;
 	private _userBashAbortRequested = false;
@@ -2432,6 +2480,9 @@ export class AgentSession {
 		// not deliver (B10: every in-memory queue answers "where is it after a
 		// restart"). No-op when the session dir holds no sidecar.
 		this._reflowUndeliveredRlmNotices();
+		// After reflow on purpose: reflow pushes messages, and the empty-context test
+		// below must see the session the way the rest of the constructor left it.
+		this._ensureHarnessDigestContext();
 	}
 
 	/** Refreshes MCP provider registrations without rebuilding the session runtime. */
@@ -3037,15 +3088,40 @@ export class AgentSession {
 						(record): record is DeliveryRecord & { message: CustomMessage } =>
 							(record.role === "next_turn" || (payload.acceptedAgentMessage && record.role === "prefix")) &&
 							record.message.role === "custom" &&
+							record.message.customType !== HARNESS_DIGEST_CUSTOM_TYPE &&
 							!record.durable,
 					)
 					.map((record) => cloneCustomMessage(record.message));
 				restorableMessages.push(...restorable);
+				// Lazy injection owns digest delivery: a cancelled turn re-arms it rather
+				// than restoring a message whose digest may already be stale.
+				if (
+					payload.records.some(
+						(record) =>
+							record.message.role === "custom" && record.message.customType === HARNESS_DIGEST_CUSTOM_TYPE,
+					)
+				) {
+					this._harnessDigestPending = true;
+					this._invalidateHarnessDigestBaselines();
+				}
 				if (dispatched) {
 					payload.captureRunMessages = new Set(payload.records.map((record) => record.message));
-					this.agent.state.messages = this.agent.state.messages.filter(
-						(message) => !payload.captureRunMessages?.has(message),
-					);
+					const retained: AgentMessage[] = [];
+					let strippedHarnessDigest = false;
+					for (const message of this.agent.state.messages) {
+						if (payload.captureRunMessages?.has(message)) {
+							if (message.role === "custom" && message.customType === HARNESS_DIGEST_CUSTOM_TYPE) {
+								strippedHarnessDigest = true;
+							}
+							continue;
+						}
+						retained.push(message);
+					}
+					this.agent.state.messages = retained;
+					// A digest that left the context with the turn also invalidates the
+					// baseline that says "this store state is already delivered": without
+					// this the moved stamp would be consumed and the delta lost for good.
+					if (strippedHarnessDigest) this._invalidateHarnessDigestBaselines();
 				}
 			}
 			if (!dispatched) {
@@ -6743,7 +6819,9 @@ export class AgentSession {
 			allowRecursion: this._rlmDepth < this._effectiveRlmMaxDepth(),
 			rlmDepth: this._rlmDepth,
 			rlmParentAgent: this._rlmParentAgent,
-			harnessState: this._loadMergedHarnessState(),
+			// No harnessState on purpose (#2098): the digest rides in-context at cold
+			// boundaries (_ensureHarnessDigestContext), so every rebuild point below is
+			// byte-identical unless tools, skills, depth or context files really changed.
 			genericMcpServers: this._mcpManager?.getEnabledPersistentGenericServers(),
 		};
 		return buildSystemPrompt(this._baseSystemPromptOptions);
@@ -9478,9 +9556,17 @@ export class AgentSession {
 		if (!firstTurn) return;
 		const executionPolicy = firstTurn.payload.executionPolicy;
 		const parkNextTurnMessages = (messages: CustomMessage[]) => {
+			// The digest is never parked as pending context: a parked copy plus a
+			// re-armed injection could double-deliver, and skip-policy turns never
+			// drain the park. Filter it out and re-arm lazy injection instead.
+			const parked = messages.filter((message) => message.customType !== HARNESS_DIGEST_CUSTOM_TYPE);
+			if (parked.length !== messages.length) {
+				this._harnessDigestPending = true;
+				this._invalidateHarnessDigestBaselines();
+			}
 			// Route through the guarded inserter so deferred RLM terminal notices keep
 			// their deferral timestamps (fork B10 guard).
-			this._unshiftPendingNextTurnMessages(...messages);
+			this._unshiftPendingNextTurnMessages(...parked);
 		};
 		const restoreNextTurnContext = () => {
 			parkNextTurnMessages(nextTurnMessages);
@@ -9548,6 +9634,24 @@ export class AgentSession {
 					}
 					if (executionPolicy.nextTurnContextTiming === "commit") {
 						nextTurnMessages = this._takePendingNextTurnMessagesForTurn(turns);
+					}
+					// Outside the timing switch on purpose: custom-triggered turns run the
+					// "skip" policy, and a fresh session whose first turn was a custom
+					// trigger still has to see the digest.
+					if (this._harnessDigestPending) {
+						this._harnessDigestPending = false;
+						const digest = this._harnessDigest();
+						this._recordHarnessDigestBaselines(this._loadMergedHarnessState());
+						if (this._latestContextHarnessDigest() !== digest) {
+							// Rides the turn's delivery records, so cancelling this first turn
+							// strips the digest with the rest of the turn and re-arms it.
+							nextTurnMessages = [createHarnessDigestMessage(digest), ...nextTurnMessages];
+						}
+					} else {
+						// Material-change re-injection: an entry written since the last
+						// delivered digest (this session's own refine excluded - its receipt
+						// already itemized it) becomes visible on this turn, append-only.
+						this._refreshHarnessDigestIfMateriallyChanged();
 					}
 					const contextRecords = nextTurnMessages.map((message) =>
 						this._createDeliveryRecord(turns[0].id, "next_turn", message),
@@ -11701,6 +11805,9 @@ export class AgentSession {
 				{
 					leafId: compactionLeafId ?? undefined,
 					usage,
+					// Attached mechanically at the new head; the digest never flows
+					// through the summarizer LLM.
+					harnessDigest: this._harnessDigest(),
 					// Issue #19 forensics: SessionManager has no logger, and these fields
 					// must not ride in `details` (the next compaction reads the previous
 					// entry's details back to seed its fact/user-request ledgers). The
@@ -12335,6 +12442,170 @@ export class AgentSession {
 	}
 
 	/** Global harness state overlaid with this session's local state, when persisted. */
+	/**
+	 * The compact harness digest delivered at cold context boundaries (session start,
+	 * resume, tree navigation, compaction head) and as a material-change delta.
+	 */
+	private _harnessDigest(): string {
+		return this._renderHarnessDigest(this._loadMergedHarnessState());
+	}
+
+	/**
+	 * Rendered from the same inputs `buildSystemPrompt` used, so the text the model
+	 * reads is byte-for-byte the menu it read when the digest still lived in the prompt.
+	 */
+	private _renderHarnessDigest(state: HarnessState): string {
+		// Same validation `_rebuildSystemPrompt` applies before handing tool names to
+		// the prompt: an unregistered name must not flip the example sections.
+		const tools = this.getActiveToolNames().filter((name) => this._toolRegistry.has(name));
+		const hasIpython = tools.includes("ipython");
+		const visibleSkills = this._modelVisibleSkills().filter((skill) => !skill.disableModelInvocation);
+		const hasRefineSkill = visibleSkills.some((skill) => skill.name === REFINE_SKILL_NAME);
+		return formatHarnessStateForPrompt(state, {
+			includeIpythonExamples: hasIpython,
+			includeShellExamples: tools.includes("bash"),
+			includeRefineExamples: hasIpython && hasRefineSkill,
+		});
+	}
+
+	/**
+	 * Cold-boundary digest delivery. An empty context defers to the first committed
+	 * turn (an untouched session must keep reading as empty); a non-empty context
+	 * appends only when the newest in-context digest no longer matches disk.
+	 */
+	private _ensureHarnessDigestContext(): void {
+		if (this.agent.state.messages.length === 0) {
+			this._harnessDigestPending = true;
+			return;
+		}
+		this._harnessDigestPending = false;
+		this._appendHarnessDigestIfStale();
+	}
+
+	private _appendHarnessDigestIfStale(): void {
+		const state = this._loadMergedHarnessState();
+		const digest = this._renderHarnessDigest(state);
+		this._recordHarnessDigestBaselines(state);
+		if (this._latestContextHarnessDigest() === digest) return;
+		this._appendHarnessDigest(digest);
+	}
+
+	/**
+	 * Material-change re-injection (merge doc 12.2, boss constraint: a long session
+	 * must never freeze the harness menu). Runs at turn preparation, so an entry
+	 * another seat wrote is model-visible on the next turn instead of at the next
+	 * cold boundary. Append-only: it adds a message at the tail and never rewrites a
+	 * byte that precedes it, so the provider's cached prefix survives.
+	 *
+	 * Cost discipline: every mutation path persists through `writePrivateFileAtomic`
+	 * (a rename, so a new inode), which makes the two store stamps a complete change
+	 * signal. When nothing moved the turn pays two `lstat` calls and reads no state
+	 * file; only a moved stamp buys the parse plus render.
+	 */
+	private _refreshHarnessDigestIfMateriallyChanged(): void {
+		const stamps = this._harnessStoreStamps();
+		if (this._harnessDigestStamps !== undefined && harnessStoreStampsEqual(this._harnessDigestStamps, stamps)) {
+			return;
+		}
+		const state = this._loadMergedHarnessState();
+		const digest = this._renderHarnessDigest(state);
+		this._harnessDigestStamps = stamps;
+		const fingerprint = this._harnessEntryFingerprint(state);
+		const previous = this._harnessDigestFingerprint;
+		this._harnessDigestFingerprint = fingerprint;
+		// The rendered menu is the criterion, not the file's mtime: a touch, or a write
+		// that restored identical content, moves the stamp and changes nothing.
+		if (this._latestContextHarnessDigest() === digest) return;
+		if (previous !== undefined) {
+			const changed = changedHarnessEntryKeys(previous, fingerprint);
+			// Every moved entry was already itemized for the model by this session's own
+			// refinement receipt (applied and refused alike), so a digest delta would
+			// deliver the same news twice (merge doc 14.2).
+			if (changed.size > 0 && [...changed].every((key) => this._refinementReportedEntryKeys.has(key))) {
+				return;
+			}
+		}
+		this._appendHarnessDigest(digest);
+	}
+
+	private _appendHarnessDigest(digest: string): void {
+		const message = createHarnessDigestMessage(digest);
+		try {
+			this.sessionManager.appendCustomMessageEntryWithRollback(
+				message.customType,
+				message.content,
+				message.display,
+				message.details,
+			);
+		} catch (error) {
+			if (this.sessionManager.getSessionFile()) {
+				// A persisted session that cannot record the digest loses it at the next
+				// context rebuild: report it instead of swallowing the failure.
+				sessionLog.warn("harness digest could not be persisted", {
+					sessionId: this.sessionId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+			// An in-memory session has nothing to persist; context-only is the design.
+		}
+		this.agent.state.messages.push(message);
+	}
+
+	/** Store stamps behind the material-change gate: the global store and this session's local one. */
+	private _harnessStoreStamps(): HarnessStoreStamps {
+		const localDir = this._localHarnessStateDir();
+		return {
+			global: readHarnessStateStamp(getGlobalHarnessStateDir()),
+			local: localDir ? readHarnessStateStamp(localDir) : null,
+		};
+	}
+
+	/** Drop the "already delivered" baselines so the next turn re-renders and re-checks. */
+	private _invalidateHarnessDigestBaselines(): void {
+		this._harnessDigestStamps = undefined;
+		this._harnessDigestFingerprint = undefined;
+	}
+
+	private _recordHarnessDigestBaselines(state: HarnessState): void {
+		this._harnessDigestStamps = this._harnessStoreStamps();
+		this._harnessDigestFingerprint = this._harnessEntryFingerprint(state);
+	}
+
+	/** Identity of every harness entry (kind, store, id) to its version: additions, deletions and version bumps all move it. */
+	private _harnessEntryFingerprint(state: HarnessState): Map<string, number> {
+		const fingerprint = new Map<string, number>();
+		for (const kind of Object.keys(state.entries) as Array<keyof HarnessState["entries"]>) {
+			for (const [id, entry] of Object.entries(state.entries[kind] ?? {})) {
+				fingerprint.set(`${kind}:${entry.scope ?? "unscoped"}:${id}`, entry.version);
+			}
+		}
+		return fingerprint;
+	}
+
+	/**
+	 * Recency is the greatest timestamp among all in-context digest carriers, not the
+	 * last array position: retained pre-compaction messages are presented after the
+	 * compaction head while being chronologically older, and an old retained digest
+	 * must not defeat dedupe.
+	 */
+	private _latestContextHarnessDigest(): string | undefined {
+		let latest: { timestamp: number; digest: string } | undefined;
+		for (const message of this.agent.state.messages) {
+			let digest: string | undefined;
+			if (message.role === "custom" && message.customType === HARNESS_DIGEST_CUSTOM_TYPE) {
+				digest = (message.details as HarnessDigestDetails | undefined)?.digest;
+			} else if (message.role === "compactionSummary") {
+				digest = message.harnessDigest;
+			} else {
+				continue;
+			}
+			if (digest !== undefined && (!latest || message.timestamp >= latest.timestamp)) {
+				latest = { timestamp: message.timestamp, digest };
+			}
+		}
+		return latest?.digest;
+	}
+
 	private _loadMergedHarnessState(): HarnessState {
 		const localHarnessStateDir = this._localHarnessStateDir();
 		return mergeHarnessStates(
@@ -12599,14 +12870,15 @@ export class AgentSession {
 	}
 
 	private _recordRefinementOutcome(result: RefinementResult): void {
+		// The receipt itemizes every edit it carries, applied and refused alike, so the
+		// material-change gate can tell "the model already heard about this entry" from
+		// "another seat moved the store" (merge doc 14.2: no double delivery).
+		const scope = result.scope ?? "local";
+		for (const edit of result.appliedEdits) {
+			const entry = edit.after ?? edit.before;
+			this._refinementReportedEntryKeys.add(`${edit.kind}:${entry?.scope ?? scope}:${edit.id}`);
+		}
 		this._appendDurableRefineMessage(createRefinementOutcomeMessage(result));
-	}
-
-	/** In-context notice for an applied refinement. Refinements with zero applied edits emit nothing. */
-	// biome-ignore lint/correctness/noUnusedPrivateClassMembers: #2098 pending batch. The notice call site is refine's apply tail, which this merge keeps on the fork's outcome receipt (MV-5/MV-6: rejected entries stay visible, docs/fork/merge-upstream-20260917.md 10.1). Wired when the digest project lands; the import createRefinementNoticeMessage is only used here.
-	private _recordRefinementNotice(result: RefinementResult, source: RefinementSource): void {
-		if (!result.appliedEdits.some((edit) => edit.applied)) return;
-		this._appendDurableRefineMessage(createRefinementNoticeMessage(result, source));
 	}
 
 	private _appendDurableRefineMessage(message: CustomMessage): void {
@@ -12722,8 +12994,10 @@ export class AgentSession {
 					: new RefinePersistScopeError(String(cause), targetScope, { cause });
 			}
 			this._recordRefinementOutcome(result);
-			this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
-			this.agent.state.systemPrompt = this._baseSystemPrompt;
+			// No rebuild and no swap here (#2098): the prompt stays byte-identical so the
+			// provider's cached prefix survives the apply. The applied and refused edits
+			// reach the model through the outcome receipt above; a harness menu that moved
+			// reaches it through the next committed turn's material-change digest delta.
 			try {
 				this._emit({ type: "refine_complete", result });
 			} catch {
@@ -13070,6 +13344,9 @@ export class AgentSession {
 				undefined,
 				{
 					leafId: leafId ?? undefined,
+					// Same cold-boundary rule as the main compaction head: the shrink
+					// writes a new head, so it carries a fresh digest snapshot.
+					harnessDigest: this._harnessDigest(),
 					onCommit: (info) => {
 						sessionLog.warn("emergency context shrink committed", {
 							sessionId: this.sessionId,
@@ -17789,6 +18066,8 @@ export class AgentSession {
 			this.agent.state.messages = sessionContext.messages;
 			this._mergeUnpersistedOutcomes(this.agent.state.messages);
 			this._restoreLateIpythonSentAgentMessages();
+			// A context rebuild is a cold boundary: refresh the digest like resume does.
+			this._ensureHarnessDigestContext();
 			// A summary branch continues the same timeline, so the same goal's
 			// accounting must never regress across the rebuild; a plain branch move
 			// is time travel and keeps faithful branch semantics.

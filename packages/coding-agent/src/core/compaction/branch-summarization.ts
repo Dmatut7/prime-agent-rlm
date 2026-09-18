@@ -18,6 +18,7 @@ import {
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
+	HARNESS_DIGEST_CUSTOM_TYPE,
 } from "../messages.js";
 import {
 	completeWithProviderRetry,
@@ -152,12 +153,19 @@ function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 			return entry.message;
 
 		case "custom_message":
+			// Harness digests are regenerated at cold boundaries; never summarizer input.
+			if (entry.customType === HARNESS_DIGEST_CUSTOM_TYPE) return undefined;
 			return createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp);
 
 		case "branch_summary":
 			return createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp);
 
 		case "compaction":
+			// No harnessDigest on purpose (F8): a branch summary's messages are only
+			// summarizer input and are never written back into a live context, so
+			// carrying the snapshot here would feed the whole harness menu to the
+			// summarizer. The compaction path keeps its pass-through, where the rebuilt
+			// head is context and the snapshot is only measured, never summarized.
 			return createCompactionSummaryMessage(
 				entry.summary,
 				entry.tokensBefore,

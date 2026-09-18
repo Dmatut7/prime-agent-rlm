@@ -13,6 +13,7 @@ import {
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
+	HARNESS_DIGEST_CUSTOM_TYPE,
 } from "../messages.js";
 import { effectiveInputLimitTokens } from "../model-input-limits.js";
 import type { ProviderRetryPolicy } from "../provider-retry.js";
@@ -136,13 +137,27 @@ function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 			entry.tokensBefore,
 			entry.timestamp,
 			entry.customInstructions,
+			undefined,
+			// Fork addition (upstream #2098 left this path untouched): a rebuilt head
+			// that drops the snapshot would silently downgrade a digest-carrying
+			// compaction entry to a digest-free one.
+			entry.harnessDigest,
 		);
 	}
 	return undefined;
 }
 
+/** A boundary-injected harness digest entry (#2098): mechanical context, never history. */
+function isHarnessDigestEntry(entry: SessionEntry | undefined): boolean {
+	return entry?.type === "custom_message" && entry.customType === HARNESS_DIGEST_CUSTOM_TYPE;
+}
+
 function getMessageFromEntryForCompaction(entry: SessionEntry): AgentMessage | undefined {
 	if (entry.type === "compaction") {
+		return undefined;
+	}
+	// Harness digests are regenerated on the new compaction head; never summarizer input.
+	if (isHarnessDigestEntry(entry)) {
 		return undefined;
 	}
 	return getMessageFromEntry(entry);
@@ -1525,6 +1540,15 @@ export function prepareCompaction(
 			renderedUserRequests;
 		const firstKeptEntryIndex = pathEntries.findIndex((entry) => entry.id === prevCompaction.firstKeptEntryId);
 		boundaryStart = firstKeptEntryIndex >= 0 ? firstKeptEntryIndex : prevCompactionIndex + 1;
+	}
+	// A leading harness digest is boundary furniture, not history. Leaving it at
+	// index 0 moves the session's first real turn off `startIndex`, which flips
+	// alignCutToTurnStart's `turnStart <= startIndex` guard: an oversized first turn
+	// then aligns the cut to its own start, the only entry left before the cut is the
+	// excluded digest, and the compaction reports "too short" instead of taking the
+	// split-turn path that summarizes the turn's prefix.
+	while (isHarnessDigestEntry(pathEntries[boundaryStart])) {
+		boundaryStart++;
 	}
 	const boundaryEnd = pathEntries.length;
 

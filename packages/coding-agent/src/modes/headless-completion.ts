@@ -9,6 +9,7 @@ import {
 import {
 	COMPACTION_OUTCOME_CUSTOM_TYPE,
 	type CompactionOutcomeMessage,
+	HARNESS_DIGEST_CUSTOM_TYPE,
 	isCompactionOutcomeMessage,
 	isSessionSlashCommandResultMessage,
 	REFINEMENT_OUTCOME_CUSTOM_TYPE,
@@ -38,10 +39,13 @@ export function selectHeadlessTerminalResult(messages: readonly AgentMessage[]):
 		}
 		// A corrupt outcome is still part of the terminal outcome suffix. Skip it
 		// without letting it hide earlier valid outcomes or their failure status.
+		// The boundary-injected harness digest is skipped for the same reason: a
+		// resume appends it at the tail, and it is never the saved final output.
 		if (
 			message.role === "custom" &&
 			(message.customType === COMPACTION_OUTCOME_CUSTOM_TYPE ||
-				message.customType === REFINEMENT_OUTCOME_CUSTOM_TYPE)
+				message.customType === REFINEMENT_OUTCOME_CUSTOM_TYPE ||
+				message.customType === HARNESS_DIGEST_CUSTOM_TYPE)
 		) {
 			index--;
 			continue;

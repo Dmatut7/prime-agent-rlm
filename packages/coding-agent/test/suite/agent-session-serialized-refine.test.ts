@@ -1823,7 +1823,7 @@ describe("P0 concurrency regressions", () => {
 		expect(applySpy).not.toHaveBeenCalled();
 	});
 
-	it("non-mocked apply pipeline: harness state persisted, prompt rebuilt, refine_complete emitted", async () => {
+	it("non-mocked apply pipeline: harness state persisted, prompt left byte-identical, refine_complete emitted", async () => {
 		// This test does NOT mock _applyRefine. It uses a faux planRefine
 		// mock but lets the real _applyRefine run, which calls
 		// applyRefinementProposal, saveHarnessState, _rebuildSystemPrompt,
@@ -1868,11 +1868,13 @@ describe("P0 concurrency regressions", () => {
 		};
 		vi.spyOn(internals, "_planRefine").mockResolvedValue(fauxPlan as never);
 
-		// Spy on _rebuildSystemPrompt (call-through) to assert it was invoked.
+		// Spy on _rebuildSystemPrompt (call-through): #2098 removed the rebuild at this
+		// seam, so the pin now asserts it stays uncalled and the prompt stays byte-identical.
 		const rebuildSpy = vi.spyOn(
 			harness.session as unknown as { _rebuildSystemPrompt: (tools: string[]) => string },
 			"_rebuildSystemPrompt",
 		);
+		const promptBeforeApply = harness.session.agent.state.systemPrompt;
 		const extensionEmit = vi.spyOn(harness.session.extensionRunner, "emit");
 
 		// Track refine_complete event
@@ -1886,8 +1888,10 @@ describe("P0 concurrency regressions", () => {
 		// Run the serialized refine (real _applyRefine runs).
 		await internals._runSerializedRefine({ instructions: "add a memory" });
 
-		// _rebuildSystemPrompt was called by _applyRefine.
-		expect(rebuildSpy).toHaveBeenCalledTimes(1);
+		// The apply seam leaves the cached prefix alone: no rebuild, no swap, and the
+		// bytes the provider already cached are the bytes it gets next turn (#2098).
+		expect(rebuildSpy).toHaveBeenCalledTimes(0);
+		expect(harness.session.agent.state.systemPrompt).toBe(promptBeforeApply);
 
 		// Harness state persisted to disk.
 		const localDir = (await import("../../src/core/refinement/index.js")).getLocalHarnessStateDir(

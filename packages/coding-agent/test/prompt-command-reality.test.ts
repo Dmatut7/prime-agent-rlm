@@ -83,15 +83,23 @@ describe("skill invocation doctrine: Python modules, not shell commands", () => 
 		expect(repl).not.toContain("in shell when a CLI exists");
 		expect(repl).toContain("not a shell command");
 
-		const shellOnly = buildSystemPrompt({
+		// Shell-only sessions get the digest without REPL examples; the prompt half is
+		// checked too, since the digest no longer rides inside it (#2098).
+		const shellOnly = formatHarnessStateForPrompt(emptyHarnessState(), {
+			includeIpythonExamples: false,
+			includeShellExamples: true,
+		});
+		expect(shellOnly).not.toContain("use installed skills as shell commands");
+
+		const shellOnlyPrompt = buildSystemPrompt({
 			selectedTools: ["bash"],
 			contextFiles: [],
 			skills: [],
 			cwd: "/repo",
 			messagesPath: "/repo/session.jsonl",
-			harnessState: emptyHarnessState(),
 		});
-		expect(shellOnly).not.toContain("use installed skills as shell commands");
+		expect(shellOnlyPrompt).not.toContain("use installed skills as shell commands");
+		expect(shellOnlyPrompt).not.toContain("# Continual Harness State");
 	});
 });
 

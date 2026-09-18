@@ -171,6 +171,12 @@ export interface CompactionEntry<T = unknown> extends SessionEntryBase {
 	fromHook?: boolean;
 	customInstructions?: string;
 	usage?: Usage;
+	/**
+	 * Harness digest snapshot taken at compaction time; rendered before the summary
+	 * in LLM context. Rides the schema-tolerant entry stream as an optional field,
+	 * so entries written before it existed simply have no snapshot.
+	 */
+	harnessDigest?: string;
 }
 
 /**
@@ -967,6 +973,7 @@ export function buildSessionContext(
 				compaction.timestamp,
 				compaction.customInstructions,
 				retainedMessages.length,
+				compaction.harnessDigest,
 			),
 			...retainedMessages,
 		);
@@ -2948,6 +2955,8 @@ export class SessionManager {
 		options?: {
 			leafId?: string;
 			usage?: Usage;
+			/** Harness digest snapshot for the new compaction head (never summarizer input). */
+			harnessDigest?: string;
 			onCommit?: (info: CompactionCommitInfo) => void;
 		},
 	): string {
@@ -2970,6 +2979,7 @@ export class SessionManager {
 			fromHook,
 			customInstructions,
 			usage: options?.usage,
+			harnessDigest: options?.harnessDigest,
 		};
 
 		// The cut point can name a deferred attribution merge, and those ids never reach

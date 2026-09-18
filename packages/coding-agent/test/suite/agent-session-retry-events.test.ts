@@ -487,6 +487,12 @@ describe("AgentSession retry and event characterization", () => {
 		await harness.session.prompt("hi");
 
 		expect(order).toEqual([
+			// The leading custom pair is the boundary-injected harness digest riding the
+			// first committed turn (#2098); the extension-before-public ordering is the pin.
+			"extension:message_start:custom",
+			"public:message_start:custom",
+			"extension:message_end:custom",
+			"public:message_end:custom",
 			"extension:message_start:user",
 			"public:message_start:user",
 			"extension:message_end:user",
@@ -508,6 +514,9 @@ describe("AgentSession retry and event characterization", () => {
 		expect(normalizeEventOrder(harness.events)).toEqual([
 			"agent_start",
 			"turn_start",
+			// The harness digest rides the first committed turn as a custom message (#2098).
+			"message_start:custom",
+			"message_end:custom",
 			"message_start:user",
 			"message_end:user",
 			"message_start:assistant",
@@ -544,6 +553,9 @@ describe("AgentSession retry and event characterization", () => {
 		expect(normalizeEventOrder(harness.events)).toEqual([
 			"agent_start",
 			"turn_start",
+			// The harness digest rides the first committed turn as a custom message (#2098).
+			"message_start:custom",
+			"message_end:custom",
 			"message_start:user",
 			"message_end:user",
 			"message_start:assistant",
