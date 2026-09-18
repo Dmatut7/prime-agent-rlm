@@ -3095,6 +3095,14 @@ export class AgentSession {
 				restorableMessages.push(...restorable);
 				// Lazy injection owns digest delivery: a cancelled turn re-arms it rather
 				// than restoring a message whose digest may already be stale.
+				// Defense in depth, and honestly labeled as such: no reachable public
+				// entry currently hits this strip branch, because the code between the
+				// delivery records and `agent.prompt` has no await point, so a mid-flight
+				// abort cannot find the action in the committing state (measured with a
+				// gated provider: identical readings with and without a mutation that
+				// deletes this re-arm). The park path below is the reachable half and is
+				// pinned; if a reachable cancel entry ever appears (likely on the daemon
+				// recovery / snapshot face), pin this branch in the same commit.
 				if (
 					payload.records.some(
 						(record) =>
