@@ -71,9 +71,9 @@ function makeFixture(): Fixture {
     printf 'agent-dir-exists=no\\n'
   fi
   for store in "${REAL_STORE}" "${LEGACY_STORE}"; do
-    if [ -f "\$HOME/\$store" ]; then printf 'store=%s present\\n' "\$store"; else printf 'store=%s MOVED-AWAY\\n' "\$store"; fi
+    if [ -f "$HOME/$store" ]; then printf 'store=%s present\\n' "$store"; else printf 'store=%s MOVED-AWAY\\n' "$store"; fi
   done
-  printf 'invoked=%s\\n' "\$*"
+  printf 'invoked=%s\\n' "$*"
 } >> "$CREDENTIAL_PROBE_LOG"
 exit 0
 `,
