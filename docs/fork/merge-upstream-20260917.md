@@ -1,8 +1,8 @@
-# 上游合并文档 · 2026-09-17（v1.0 定稿 · 2026-09-18）
+# 上游合并文档 · 2026-09-17（**v1.1** 刷新 · 2026-09-18 上午）
 
-> face: 主仓 `merge/repl-kernel` HEAD=`5adf6410a` @ 2026-09-18 07:07（本地工作树；`origin/merge/repl-kernel`=`9ff1e92c8`）。本版经 0902 与 DS 两席异构交叉复核并逐条修订（复核报告 review-qwen3.8-max-0902.md / review-deepseek-v4.1-flash.md）。每次改版更新本行。
-> **终版 sha 链**：`67334bf1a`（merge，第二父本 upstream `e2fb7bfa1`，已推 `origin/merge/repl-kernel`）→ `9ff1e92c8`（应用波十笔末端，已推）→ `5adf6410a`（tui 接线四笔，本地未推）。
-> 状态：**定稿（v1.0）**。§9 已落地清单 / §10 验收七条对照表为本版新增；§3.2/§4/§5/§6 已按 2026-09-18 盘上事实刷新；FORK_NOTES 本版不加行（母席另行统一记账）。
+> face: 主仓 `merge/repl-kernel` HEAD=`d51118e32` @ 2026-09-18 09:42（本地 = `origin/merge/repl-kernel`，`git ls-remote origin merge/repl-kernel` 实测同 sha）。v1.0 的 face 为 `5adf6410a` @ 07:07，并已过 0902 与 DS 两席异构交叉复核（review-qwen3.8-max-0902.md / review-deepseek-v4.1-flash.md）。**v1.1 只刷 §9 已落地清单 / §9.2 待办 / §10 验收七条状态与正控例数口径，机制面文字不动**；每次改版更新本行。
+> **终版 sha 链（全链已推 `origin/merge/repl-kernel`）**：`67334bf1a`（merge，第二父本 upstream `e2fb7bfa1`）→ `9ff1e92c8`（应用波 P5/UX/perf）→ `5adf6410a`（tui 接线四笔）→ `de1ad0b06`（CI 绿五笔末端）→ `78af6fc4d`（#2098 四笔末端）→ `d51118e32`（纵深防御 / 文档对账 / FORK_NOTES 记账 / F10 钉 / cancel 半标注收尾）。
+> 状态：**定稿（v1.1）**。§9 / §9.2 / §10 已按 2026-09-18 09:42 盘上事实刷新（逐笔 sha 与笔数程序化派生，不凑数）；#2098 正控例数口径＝**16 例**（13→15→16，本文件为口径源）；FORK_NOTES 记账＝`e11e4a8ca` 三行。本文档 v1.1 由本席写入、**母席提交（本席不 commit、不 push）**。
 > 目标：把上游 `PrimeIntellect-ai/prime-agent` 自我们合并基线起的 136 笔提交中**对我们有好处的部分**安全地拿进本 fork（`Dmatut7/prime-agent-rlm` @ `merge/repl-kernel`），且**合并过程本身不出问题**。
 > 输入：`/tmp/merge-doc-inputs/01-trial-merge-conflict-map.md`（试合并冲突地图，669 行）、上游 20 笔核心候选调研（母席存档：sub-b98ca323/upstream-20-survey.md）、欠账盘点 `/tmp/fork_unfinished_20260917.md`。
 
@@ -212,7 +212,7 @@
 - **P2 功能移植**：#2307 `55c2530de`、#2275 TS 面 `b0aeef69a`、#2219 `77587dcab`、#2285 `d06cac12f`、#2220 `918044273`、#2310 限定范围 `fb15fa08d`、#2246 `a594e71db`、#2242 `5421bd2a7`、#2276 append 半 `69fb8ead6`、#2215 `05c60d6eb`、压缩安全束十笔（`b407d0feb…7324d1f55`，含 C5=`ad7024f76`）、#2241 Python 半 `93a53ef69`/`f30fd9fa9`、#2153 `c09bdd358`/`06260455d`、#2336 竞态 `ec33fd473`+C5 等。
 - **P3 承重四件（合并提交）** `67334bf1a`：一次性 selective merge，裁决表 **861 行**（keep-ours 778 / accept-auto 40 / union-manual 22 / resolved-by-adhoc 16 / take-theirs 5 / delete 0；行内改判 48）；终态树相对第一父本 **92 路径**（81 M + 11 A）、相对第二父本 1957 路径；`859` 路径级删除按 AD 行 `git rm`；repl 冻结包 26 件 sha256 全验、**25 件落地**（`child-process.final.ts` 按裁决 C.3 取上游逐字版）、closure2 三件按裁决 C.6 落地（auth-storage=原件+补丁#12、messages 只取 sanitize、session-command-messages.test 取 222 行并集件）；C.4 18 个落地 blob 逐件 `hash-object` 复核 18/18 全符。**#2284 随本 merge 落地**（`_autonomousContinuationAwaitsRlmWork` 出现次数：`e744cfbf4`=0 → `67334bf1a`=6）。
 - **P5 协议与版本面**：`bae391973`（rev38）、`415b1bfa7`（0.9.5 lockstep + update 门）、`466149f48`（缝+正反钉）、`5f58846dd`（tail 三笔：#2148 / 缝窄化 / #2310 wire）；摘要见 §4.6。
-- **应用波十笔已推** `origin/merge/repl-kernel` 到 `9ff1e92c8`（`git merge-base --is-ancestor 67334bf1a origin/merge/repl-kernel` YES）；**tui 接线四笔本地到 `5adf6410a`，未推**（`is-ancestor 5adf6410a` NO）。逐笔清单见 §9。
+- **应用波十笔已推** `origin/merge/repl-kernel` 到 `9ff1e92c8`（`git merge-base --is-ancestor 67334bf1a origin/merge/repl-kernel` YES）；**tui 接线四笔本地到 `5adf6410a`，v1.0 时未推**（当时 `is-ancestor 5adf6410a` NO）。**v1.1 更新**：`5adf6410a` 及之后 CI 绿五笔 / #2098 四笔 / 收尾五笔全部已推，`origin/merge/repl-kernel` = `d51118e32` = 本地 HEAD（`git ls-remote` 实测）。逐笔清单见 §9.1 / §9.1a。
 - **纪律**：全部 `git commit --only -- <paths>` 点名提交；因 husky 的 platform-coverage 在本地报 win32 NO RUNNER（与本批无关，同 P5 席 D10）本波提交统一 `--no-verify`、六闸另行单跑；**未 amend、未 force-push、未合主干、未推任何 tag**；`git commit --only` 对未跟踪新文件会报 pathspec（老坑），处置＝先 `git add -- <文件>` 再点名。
 
 ## 6. 验证矩阵与对账（输入：merge-gates 席，05/05a/05b）
@@ -261,7 +261,7 @@
 
 - 闸④跑过两次：`1917d1049`（v1）NEW-RED=1（`footer-data-provider` 的 reftable 案例 3s waitFor 超时；与本波零交集、单文件隔离 8/8 绿、该例仅 763ms ⇒ 定级「负载型计时 flake」）；终树 `9ff1e92c8` 同一条不复现。
 - 四族邻接（母席点名，先于闸④、安静门因此自然 hold）：spend 钉 + settings 15 文件 + interactive 29 文件 + matrix/queue 3 文件，去重 **48 文件 / 555 例全绿**。
-- **CI 与本地分量的差**：CI 对 `9ff1e92c8` 的 run 35285177049 = **failure**（13 job 中 10 绿 3 红：test-hygiene、Build and check＝同因 platform-coverage registry 缺 `packages/coding-agent/test/repl-kernel-startup.test.ts` 行；coding-agent 1/3＝`dat4-manifest-atomic-write` torn-write 例，属本仓基线红名单）。本地六闸绿 ≠ CI 绿，二者未互相覆盖，缺口记 §10 ⑤。
+- **CI 与本地分量的差**：CI 对 `9ff1e92c8` 的 run 35285177049 = **failure**（13 job 中 10 绿 3 红：test-hygiene、Build and check＝同因 platform-coverage registry 缺 `packages/coding-agent/test/repl-kernel-startup.test.ts` 行；coding-agent 1/3＝`dat4-manifest-atomic-write` torn-write 例，属本仓基线红名单）。本地六闸绿 ≠ CI 绿，二者未互相覆盖，缺口记 §10 ⑤。**尾波（v1.1）**：CI 绿五笔＋#2098 四笔落地后，新头 `d51118e32` 的 run `35296425559`（09:42 触发）状态见 §10 ⑤。
 
 ## 7. 风险登记册（初始）
 
@@ -285,7 +285,8 @@
 
 ## 9. 已落地清单（逐笔 sha 表 · 程序化派生 @ 2026-09-18）
 
-派生口径（可复跑）：`git -C /Users/a1/Desktop/ai/prime-agent log --format='%h %ci %s' 67334bf1a..HEAD` → **merge 后 14 笔**（merge 1 + 应用 12 + perf 2）。**与派单所写「18 笔应用」不符**：盘上派生是 14 笔，差异只在计数口径（派单可能把合并前 P2/P3 期的上游移植件另计）；逐笔清单以本表为准，不凑数。
+派生口径（可复跑，v1.1 重派生）：`git -C /Users/a1/Desktop/ai/prime-agent log --oneline 67334bf1a..d51118e32 | wc -l` → **29 笔**（不含 merge 自身；含 merge 则 30）。分波（各自可单独复跑）：应用波 **14** 笔（`bae391973`…`5adf6410a`：P5 协议/版本 4 + 密度/retry/hook/settings 4 + perf 2 + tui 接线 4）＋文档 v1.0 **1** 笔（`082a5d37c`）＋CI 绿 **5** 笔＋#2098 **4** 笔＋收尾 **5** 笔（`b8375478c`/`b2a0d8da6`/`e11e4a8ca`/`2eb768217`/`d51118e32`）＝14+1+5+4+5＝**29 ✓**。
+**口径差异（登记，不凑数）**：派单 v1.0 写「18 笔应用」、v1.1 派单写「应用波 12 笔末端 `9ff1e92c8`」；盘上 `67334bf1a..9ff1e92c8` 派生 **10** 笔、`67334bf1a..5adf6410a`（含 tui 接线）派生 **14** 笔。派单那个「12」与表里 label 为「应用」的行数（8 应用 + 4 tui 接线）重合，但末笔是 `5adf6410a` 而非 `9ff1e92c8`——差异只在计数口径，逐笔以 §9.1 / §9.1a 两表为准。
 
 ### 9.1 逐笔 sha 表（merge + 应用 + perf + tui）
 
@@ -307,28 +308,55 @@
 | 应用 | `ae445deee` | partial harness 补 `refreshTopBarCost`（否则 rebind/render 路径抛） | — | 1 文件 +5 |
 | 应用 | `5adf6410a` | fullscreen top bar **接线负控钉**：去掉 `pin:` 该测红 | — | 新增 88 行，负控 |
 
-> 推送状态：`67334bf1a`…`9ff1e92c8` 已在 `origin/merge/repl-kernel`；`91bfa0bd2`/`a27147890`/`ae445deee`/`5adf6410a` 四笔**本地未推**（HEAD=`5adf6410a`，`ahead 4`）。
+> 推送状态（@ 2026-09-18 09:42 重核）：`67334bf1a`…`d51118e32`（§9.1 + §9.1a 全部 30 笔）均在 `origin/merge/repl-kernel`——`git ls-remote origin merge/repl-kernel` 实测 = `d51118e3297cd34e181a069ee4b04405744f09a7`，与本地 HEAD 同，工作树无 tracked 改动。**v1.0 记的「tui 四笔本地未推（ahead 4）」本轮已不复存在**。
+
+### 9.1a 收尾波逐笔 sha 表（2026-09-18 07:13–09:42 · 文档 + CI 绿 + #2098 + 收尾，共 15 笔）
+
+| 波次 | 提交 | 内容 | 上游出处 | 证据指针 |
+|---|---|---|---|---|
+| 文档 | `082a5d37c` | 合并文档定稿 **v1.0**（425 行；§9 已落地清单 / §10 验收七条对照首次成表） | 本地裁示 | 该笔 diff（+4xx 行）；FORK_NOTES `e11e4a8ca` 行内记账 |
+| CI 绿 | `49e94f491` | platform-coverage registry 登记 `packages/coding-agent/test/repl-kernel-startup.test.ts` 的平台条件（none/any，注明条件出处与文件其余部分在 linux 跑）——CI 红真因① | P3 repl 冻结件引入 | 撤掉该行即红并点名该文件；该门 7 条植入控制绿 |
+| CI 绿 | `144bfa2e2` | DAT-4 torn-write 注入改落 `writeSync`：原注入点自 `69fb8ead6`（上游 #2276 append 半）起就死了（写者不再调 `writeFileSync`）⇒ mock 打在空气上＝**仪器腐烂读成绿**——真因② | 本仓基线红名单 | 5 轮 × 3 树隔离绿；加正控（直写同 syscall 必 torn）＋变异对照（直写型写者红：`Unterminated string in JSON at position 57`） |
+| CI 绿 | `91da42b93` | supervisor monitor 回合改 **settle 闩锁**驱动：原「40 步预算」是**伪装的挂钟预算**（40 步只值 0.7–1.8ms，回合实需 15–199 步）——真因③ | 本仓 flake 台账 | 4 正控；读数为 commit body 实测 |
+| CI 绿 | `e17535e07` | startup gate 等**内容**不等存在：真因＝`writeFileSync` 的 `open` 一落地名字即可见且 size=0，测试放行后立刻 SIGKILL 子进程 ⇒ marker 永久 0 字节——真因④ | 本仓 flake | 本机 121 轮自然跑 0 红 ⇒ 正控改由确定性注入承担，显式登记「自然红未复现」，不用绿跑冒充已复现 |
+| CI 绿 | `de1ad0b06` | afterEach 等 **daemon pid 退出**再拆目录：真因＝socket 消失 ≠ 进程退出，daemon 在 `rmSync` 期间重建 `<root>/agent` 子项 ⇒ ENOTEMPTY，而 Node 的 `maxRetries` 只重试 rmdir、从不重新下钻——真因⑤ | 4685 兄弟文件既有成例 | 该文件 +117/−7 |
+| #2098 | `49b326b51` | 词汇面＋刀三准备半：`HARNESS_DIGEST_CUSTOM_TYPE` / `HARNESS_DIGEST_PREFIX` / `createHarnessDigestMessage` / `digestBlock` / `input-classification` 行（internal_continuation）；14 个钉文件迁 `conversationMessages()` 助手（无断言被删宽）；`acp-mode.test.ts` 单点隔离 `PRIME_AGENT_CODING_AGENT_DIR`；两个计数器走 `vi.mock` ⇒ **test-hygiene 基线不长** | 上游 `71766abb2` 形态（本 fork 自接缝） | 本笔无注入，所有旧钉语义不变；一次 digest render 实测 38–41ms CPU（6MB 开发库）vs 0.4ms（空库） |
+| #2098 | `abae4f9bb` | 主刀：digest 出系统提示（62,181→50,816 B）＋冷边界投递＋material-change 再注入为主路径（路 A）＋F1–F4/F8 四个 fork 侧修正（`prepareCompaction` 跳过前导 digest 修回 `alignCutToTurnStart` guard；压缩头重建时保留携带快照；`_applyRefine` 去 rebuild+swap 并删死调用点与 lint 抑制；无法持久化时 warning 而非消失） | #2098（F1 回归只有本 fork 会踩） | commit body；F1 曾让三钉红 |
+| #2098 | `bdd1ad5b7` | **正控文件 16 例**（本笔落其前身那批，`78af6fc4d` 并入 2 钉、`2eb768217` 再并 1 钉，口径见本表末注）：三效果正控（新记忆下一轮可见 / MV-5 被拒条目带非空原因可见 / 背靠背缓存读数）＋接缝钉（apply 前后 prompt 逐字节同、resume 双向去重、按时间戳而非数组位序、未动库零读、一材料变更恰一 delta、digest 不进 user-request 台账与两处摘要器、headless 终值选择排除） | — | 读数落 `/tmp/p2098/cache-readings.json`；见 §10 ③ |
+| #2098 | `78af6fc4d` | **版本感知豁免**：条目指纹由 `kind:scope:id` 键存在改为 `→version`，回执只豁免它报过的**那个版本**（修「另一写者 bump v2→v3 或删条目后永不再注入」的版本盲抑制）；同笔并入 2 钉 ⇒ 累计 **16 例**（口径见本表末注） | 两席异构复核独立撞出的同一缺陷 | 无修则再注入钉红（carrier 1≠2）；并入后该文件绿（计数口径见末注）；第二钉保豁免诚实（本会话回执已报条目不双投递） |
+| 纵深防御 | `b8375478c` | `REFINEMENT_NOTICE_CUSTOM_TYPE` 进 headless 终值跳过表：本 fork 零生产者，但上游形态写的旧 journal 不该被当终值输出 | 文档对账的落地半 | `headless-completion.ts` +6/−1；对应附录 B 的 notice 对账段 |
+| 文档对账 | `b2a0d8da6` | 本文档 notice 口径改为「落地后的样子：词汇面保留、durable 投递机制不取」（+4 行） | 本地裁示 | 本文件该笔 diff |
+| 记账 | `e11e4a8ca` | **FORK_NOTES 三行**：①merge＋应用波＋perf＋tui 与六闸终读、文档 v1.0 ②#2098 四笔（例数口径：v1.1 统一读 16 例、三正控读数、faux 是字符前缀模拟器的口径申报、自抓 F1 回归、K3 异构 PASS）③CI 绿五笔真因＋notice 纵深防御 | — | `FORK_NOTES.md` 表首三行（Δ=+3 行） |
+| F10 钉 | `2eb768217` | digest **park 后 re-arm** 的可红钉：删掉整族 re-arm 时所有旧测仍绿（设计无牙）⇒ 本钉驱动可达半——失败投递 park → park 过滤丢 Parked 副本 → re-arm → 下一轮恰一份新渲染载体（无 re-arm 计数为 2 且含 stale menu `hasLate=[true,false]`）；并入后 **正控文件 16 例** | — | 变异 `mutations/F10-revert-rearm.diff` ⇒ `1 failed / 15 passed`，唯一红＝本钉；+36 行 |
+| cancel 标注 | `d51118e32` | cancel 半 re-arm 据实标注为**不可达**纵深防御：delivery records 与 `agent.prompt` 之间无 await 点 ⇒ 中途 abort 打不到 committing-state 剥除分支（gated provider 实测：有无该变异读数相同）——**不作已解**，留待出现可达入口再补钉 | 本席自抓 | `agent-session.ts` +8 仅注释 |
+
+> **正控例数口径（本文件为唯一口径源）**：`packages/coding-agent/test/suite/regressions/2098-static-prompt-harness-digest.test.ts` ＝ **16 例**（`13 → 15 → 16`：`bdd1ad5b7` 13 例 → `78af6fc4d` 15 例 → `2eb768217` 16 例；程序化核过 `grep -c "^\s*\(it|test\)(" = 16`）。**凡写 13 / 15 处同批读作 16 例**（含 FORK_NOTES `e11e4a8ca` 行内的「正控 13 例」「15 例」两处）。
 
 ### 9.2 待办清单（含已落标注）
 
 | 项 | 状态 | 证据 / 缺口 |
 |---|---|---|
-| **#2098 三刀 + 效果正控** | **待办**（未开工） | 三刀＝① digest 出系统提示+冷边界投递 ② 删空转重建+notice 并入 outcome 渲染（保 MV-5 被拒条目可见）③ 测试+5 pin+成本正控。排序硬约束：#2241 二期必须先等的 #2098 排前面；主路径 material-change 再注入；立项前先落一组背靠背 provider 读数（§3.2 / §12） |
-| **#2241 二期**（相关性排序 digest / query 排序） | **待办**（Python 半已落 `93a53ef69`/`f30fd9fa9`：`harness.search` 与 tokenizer/CJK 钉） | 二期排序若先上，实测缓存命中率 94.3%→≈0、同批会话账单 $3,019→$14,976 ⇒ 必须排在 #2098 之后 |
-| **#2334 调和设计** | **待办**（本仓入口已落 `c9762ece6` input-classification/压缩优先） | 上游 #2334「human priority ahead of queued agent traffic」与本仓压缩优先准入的调和未定案；母席裁示见 §11 QP-4 行 |
+| ~~#2098 三刀 + 效果正控~~ | **已落**（`49b326b51`/`abae4f9bb`/`bdd1ad5b7`/`78af6fc4d`） | 三刀＝①digest 出系统提示＋冷边界投递（62,181→50,816 B）②删空转重建＋notice **不作投递**（改由本 fork 的 refinement_outcome 回执承担，MV-5 被拒条目可见）③测试＋**正控 16 例**；material-change 再注入为路 A 主路径；原「排序硬约束」保留为记账（#2241 二期仍排在 #2098 之后，见下行） |
+| **#2241 二期**（相关性排序 digest / query 排序） | **在飞** | 一期残件已补两笔待应用：`950f72a31`（refinement 排序窗 IDF 加权）/`ba5e8465b`（Python `harness.search` 按文档频次折扣），产物 `/tmp/p2241/patches/`（含 APPLY.md）；**G5 接线与 G6 指纹机制在做**；#2098 已落地 ⇒ 二期排序的前缀缓存风险已解除（原「命中率 94.3%→≈0、账单 $3,019→$14,976」不再是拦路石） |
+| **#2334 调和** | **在飞 · v2 在修**（**不得写闭环**） | 五笔已出卷 `/tmp/p2334-out/patches/0001..0005`（base `de1ad0b06`；施工克隆 HEAD `47d775592`；自报闸全绿＝邻接 75 文件 843 例 0 fail、tsgo 0、biome 0、test-hygiene OK），但**异构复核判 FAIL 可修**：**F1** `daemon-mode.test.ts:8631` 漏迁上游 hunk ⇒ **3 例真红**；**F2**「human 不被压缩闸挡」与 **F3**「Ctrl+Alt 手排不被 rank 覆盖」两条钉经**变异实测为假钉**；**F4** goal pinned 生产唯一使用点无钉；**F5** APPLY.md 未交付。**闸口径教训（登记）**：邻接集必须是「关键词邻接集 ∪ 补丁波及测试」——只跑 73 文件会全绿放行、照不出 daemon-mode 那 3 红 |
+| **#2334 G6 后果登记** | **已知一次性影响，不改实现** | 升级那一次重启窗口内旧快照无 `priority` 字段 ⇒ 已排队的 human steer/followUp 会按 `source:"internal"` 重推成 background（一次性；此后新写入的队列带字段）。登记在册，不为此改实现 |
 | **#2284** | **已落**（随 merge 并集） | `_autonomousContinuationAwaitsRlmWork` 在 `e744cfbf4`=0 / `67334bf1a`=6；agent-session.ts:2016-2026/3316/3474/3625 |
 | **P5 rev38 的 `session_recovering` 加回** | **待办** | 本线只有类 code（`daemon-errors.ts:8`），`DaemonErrorInfo` 无 wire 行（`daemon-errors.test.ts:59-61` 注释记录）；要其行为需整批 #2028（105 文件），只摘协议行会得到永不产生的错误码 |
-| **top-bar / prompt-highlight tui 接线** | **已落**（`91bfa0bd2` + `a27147890` + `ae445deee` + `5adf6410a`），**本地未推** | 见 §9 表末四行 |
-| **attached-daemon archived 行** | **已落** | wire 半 `5f58846dd`（`wireAgentStatus` 不再把 `error` 降档）+ 显示半 `5924d4d0c`（archived 行显示 error verdict） |
-| **kimi-k3 计价** | **已落（「未定价」注记形式）** | 未定价模型走 warning 色注记 `(kimi-k3 8.1M tok 未定价)`、绝不静默当 0 混进合计（FORK_NOTES:30）；老板给价后改价即可，未给价前不作价 |
-| **keepRecent / 切点密度重标** | **已落** | `ac60d4607`（含「23 套件需重标」估算不成立的实测结论） |
+| ~~top-bar / prompt-highlight tui 接线~~ | **已落且已推**（`91bfa0bd2` + `a27147890` + `ae445deee` + `5adf6410a`） | v1.0 记「本地未推」，本轮已随 `d51118e32` 到 `origin/merge/repl-kernel`（§9.1 表末四行＋§9.1a 推送态） |
+| attached-daemon archived 行 | **已落** | wire 半 `5f58846dd`（`wireAgentStatus` 不再把 `error` 降档）+ 显示半 `5924d4d0c`（archived 行显示 error verdict） |
+| kimi-k3 计价 | **已落（「未定价」注记形式）** | 未定价模型走 warning 色注记 `(kimi-k3 8.1M tok 未定价)`、绝不静默当 0 混进合计（FORK_NOTES:30）；老板给价后改价即可，未给价前不作价 |
+| keepRecent / 切点密度重标 | **已落** | `ac60d4607`（含「23 套件需重标」估算不成立的实测结论） |
 | content-density 倍率口径统一 | **已落** | 同 `ac60d4607`（带出处的单一口径表 + docs/compaction.md） |
 | provider-retry 接线 | **已落** | `0a6377d35` 把它接进 sdk/agent-session/compaction/refinement/side-question/in-process-connection |
 | #2145 残余 | **已落** | `5924d4d0c`（expand 键移到 summary line） |
 | `session_before_compact` hook 抛错裁量 | **已落（裁=fail loud）** | `5924d4d0c`：hook 抛错失败掉压缩，不再被 ExtensionRunner 吞 |
+| ~~CI 红的三条真因（platform registry 缺行 / DAT-4 注入点死 / monitor 步数预算=伪装挂钟预算）~~ ＋两条 flake 真因 | **已修落**（`49e94f491`/`144bfa2e2`/`91da42b93`/`e17535e07`/`de1ad0b06`） | 逐条真因与修法见 §9.1a 与 §10 ⑤；**待 CI 对 `d51118e32` 那轮定论** |
+| **cancel 半 re-arm 的可达入口** | **待办（观察项）** | `d51118e32` 已据实标注**不可达**（delivery records 与 `agent.prompt` 间无 await 点）；将来若在该段引入 await 点则分支变可达，须在同笔把 `2eb768217` 的钉式补到 cancel 半——在此之前不作已解 |
+| `createHarness` 不隔离 agent dir 的存量面 | **观察项** | `test/suite/harness.ts` 的 `createHarness` 不设 `PRIME_AGENT_CODING_AGENT_DIR`（本波只在 `acp-mode.test.ts` 单点隔离：一次 digest render 在 6MB 开发库上 38–41ms CPU vs 空库 0.4ms，与队列窗口同量级）；同类机器耦合可能仍在别的套件 |
+| worker 闩锁 与 hookTimeout 边界 | **观察项（两条）** | 与 `91da42b93` 同族：回合级驱动改 settle 闩锁后，「worker 闩锁超时」与 vitest `hookTimeout` 的边界未逐条钉（本波只钉了 monitor 回合） |
+| `updateChannel` / `mcpCatalogSources` getter 未接线 | **观察项** | 两键是 `Settings` 接口键、`0186a1247` 已进白名单（消掉误报），但 `getUpdateChannel` / `getMcpCatalogSources` 至今无调用点（声明无消费） |
 | update-source 残余（marker 不进包） | **观察** | §4.4 遗留风险；README 明示 + 启动提示门已做「双保险」 |
 | §4.5 第 ③ 组「服务端强制声明面正控」 | **观察** | 本次提交 5 个测试文件里未见单列（扫描面＝该提交 diff，非全仓） |
-| CI 对合并头全绿 | **待办（红）** | 见 §10 ⑤（run 35285177049 failure） |
 | opencode-headers 仍无 src 调用点（P1 死代码 4 件之一） | **观察** | 其余三件（prompt-highlight/provider-retry/top-bar）已接线 |
 
 ---
@@ -341,13 +369,13 @@ goal 原文（母席 2026-09-17 挂）：*把上游 `e2fb7bfa1` 窗（136 笔）
 |---|---|---|---|
 | ① | P3 整合 merge commit 落地并推送：per-file 裁决图覆盖全部冲突文件、整合后纯净树 tsgo/biome/邻接集/全量分量比对零归因红 | **已闭环**（主仓侧） | merge `67334bf1a` 已在 `origin/merge/repl-kernel`（`git merge-base --is-ancestor` YES）；861 行裁决表＝commit body + /tmp/p3as-file-rulings.md；六闸终读 §6.5（NEW-RED=0、四族邻接 48 文件 555 例绿）。**CI 面单列在 ⑤**（goal 原文「等 CI 绿即划掉」尚未满足） |
 | ② | P5 协议与版本面：schema 38 + digest 由测试机器重算 + 五组兼容测试绿 + 0.9.5 lockstep + update-source 双保险（禁提示+文档明示） | **已闭环** | REVISION=38 / ID `protocol-7-schema-38-317b96808bc4`（daemon-protocol.ts:255-256；两步红出 `5847b56f15d5`→`317b96808bc4`，无手写）；0.9.5 root+4 包+lock+ranges；update 门 `415b1bfa7`+正反钉 `466149f48`；兼容用例落地形态见 §4.6（第 ③ 组未见单列＝观察） |
-| ③ | 效果增益收尾：#2098 三刀落地且效果正控全绿（新记忆下一轮可见、被拒条目可见、背靠背缓存读数）、#2241 query 排序二期、#2284/#2334 落地 | **部分：在飞/待办** | #2284 随 merge 落地（marker 0→6）；#2334 只有本仓 input-classification/压缩优先入口（`c9762ece6`），上游 human-priority **调和设计待办**；**#2098 三刀+效果正控、#2241 二期待办**（§9.5；排序硬约束见 §3.2/§12） |
-| ④ | 待办笔清零：keepRecent/切点密度重标、content-density 口径统一、provider-retry 接线、top-bar/prompt-highlight 随 #2131 的 tui 接线、#2145 残余、attached-daemon archived 行、hook 抛错裁量、kimi-k3 计价落定或估价标注 | **已闭环**（八项逐条见 §9.5） | 密度+口径 `ac60d4607`；retry 接线 `0a6377d35`；#2145+archived 行+hook 裁量 `5924d4d0c`（wire 半 `5f58846dd`）；top-bar/prompt-highlight `91bfa0bd2`+`a27147890`(+`ae445deee`/`5adf6410a`，**本地未推**)；kimi-k3＝「未定价」注记形式落地（FORK_NOTES:30） |
-| ⑤ | CI 对合并头 13 job 全绿（machine-wide 在隔离时段跑绿、test-hygiene 绿、tag-skip 账对得上） | **待办（红）** | `gh run view 35285177049 -R Dmatut7/prime-agent-rlm` @ `9ff1e92c8`＝**failure**：13 job 中 10 绿 3 红＝test-hygiene、Build and check（同因 platform-coverage registry 缺 `packages/coding-agent/test/repl-kernel-startup.test.ts` 行）、coding-agent 1/3（`dat4-manifest-atomic-write` torn-write 例，属本仓基线红名单）；tui job 绿 |
-| ⑥ | 吸收审查 A/B 零未处置项 + 合并文档 v1.0 定稿推送 + FORK_NOTES 全记账 | **在飞** | 本文档＝v1.0 定稿本（本地写入，未推）；FORK_NOTES 本版不加行（母席统一记账）；吸收审查未处置项与文档/FORK_NOTES 推送由母席核 |
+| ③ | 效果增益收尾：#2098 三刀落地且效果正控全绿（新记忆下一轮可见、被拒条目可见、背靠背缓存读数）、#2241 query 排序二期、#2284/#2334 落地 | **部分闭环**（#2098 已闭环并过两席异构复核；#2241 / #2334 在飞） | 三刀＋F1 路 A 已落 `49b326b51`/`abae4f9bb`/`bdd1ad5b7`/`78af6fc4d`，正控文件 **16 例**。**三效果正控读数**（`/tmp/p2098/cache-readings.json`，faux＝字符前缀模拟器，证的是「序列化请求前缀未变」这一真 provider 赖以命中的机制）：round1 冷 input **4168**/cacheRead **0** → round2 精化后 input **322**/cacheRead **3959** → round3 故意破前缀（正控）input **1016**/cacheRead **866**（仪器能红）。**两席异构复核**：K3 与 DS **各自独立撞出同一缺陷**＝「版本盲抑制」（另一写者 bump/删条目后永不再注入），已由 `78af6fc4d` 改 `kind:scope:id→version` 指纹并以**变异实测**闭环。**F10 钉** `2eb768217` 补 digest park 后 re-arm 的可红性（变异 `mutations/F10-revert-rearm.diff` ⇒ 1 red / 15 pass）。**cancel 半**：无可达公开入口，`d51118e32` 据实标注为不可达纵深防御——**不作已解**。**#2241**＝一期残件两笔待应用（`950f72a31`/`ba5e8465b`）+ G5/G6 在做（前缀缓存风险已随 #2098 解除）；**#2334**＝五笔出卷但异构复核判 **FAIL 可修**（F1 漏迁 hunk 致 3 例真红 / F2-F3 假钉 / F4 无钉 / F5 APPLY.md 未交付），v2 在修——**不得写闭环**（详见 §9.2） |
+| ④ | 待办笔清零：keepRecent/切点密度重标、content-density 口径统一、provider-retry 接线、top-bar/prompt-highlight 随 #2131 的 tui 接线、#2145 残余、attached-daemon archived 行、hook 抛错裁量、kimi-k3 计价落定或估价标注 | **已闭环**（八项逐条见 §9.2） | 密度+口径 `ac60d4607`；retry 接线 `0a6377d35`；#2145+archived 行+hook 裁量 `5924d4d0c`（wire 半 `5f58846dd`）；top-bar/prompt-highlight `91bfa0bd2`+`a27147890`(+`ae445deee`/`5adf6410a`，本轮已推 `origin/merge/repl-kernel`)；kimi-k3＝「未定价」注记形式落地（FORK_NOTES:30）。余下真待办移 §9.2（非本行列名项） |
+| ⑤ | CI 对合并头 13 job 全绿（machine-wide 在隔离时段跑绿、test-hygiene 绿、tag-skip 账对得上） | **待办（前三轮红已逐条修落，待新头那一轮定论）** | **前三轮红＝3 处 job / 5 条真因**（派单 v1.1 记「三条」；盘上数得 5 条＝三条主因＋两条 flake），逐条真因与修法：① **platform registry 缺行**——`repl-kernel-startup.test.ts` 的 `it.skipIf(win32)` 未登记，Build and check 红（`49e94f491` 登记，撤行即红正控）② **DAT-4 注入点死**——mock 打 `writeFileSync`，写者自 `69fb8ead6` 起改 `openSync+writeSync` ⇒ 仪器腐烂读成绿（`144bfa2e2` 改打 `writeSync`＋直写正控）③ **monitor 步数预算＝伪装的挂钟预算**——40 步仅值 0.7–1.8ms、回合实需 15–199 步（`91da42b93` 改 settle 闩锁＋4 正控）④ **waitForFile 只等存在**——`open` 先落地名字可见 size=0，放行后 SIGKILL 留永久 0 字节 marker（`e17535e07` 改等内容；自然不可复现 ⇒ 正控改确定性注入并显式登记）⑤ **afterEach 等 socket 消失 ≠ 进程退出**——daemon 在 `rmSync` 期间重建 `<root>/agent` ⇒ ENOTEMPTY（`de1ad0b06` 改等 pid 退出）。红的 run：`35285177049` @ `9ff1e92c8`（test-hygiene + Build and check + coding-agent 1/3）、`35285904861` @ `082a5d37c`、`35286568968` @ `144bfa2e2`（coding-agent 2/3）、`35291808440` @ `91da42b93`。**新头那一轮**＝run `35296425559` @ `d51118e32`（09:42 触发）：写 v1.1 时仍在跑，已定论的 12 个 job 中 11 绿、1 红＝`Test (coding-agent process smoke)`，三个 coding-agent shard 未完 ⇒ **未定性，不作已绿也不作已红**（若坐实，按同表续修） |
+| ⑥ | 吸收审查 A/B 零未处置项 + 合并文档定稿推送 + FORK_NOTES 全记账 | **已闭环** | 文档＝本文件 **v1.1**（v1.0 `082a5d37c` 已入库并推；v1.1 由本席写入、**母席提交**）；FORK_NOTES＝`e11e4a8ca` **三行记账**（merge 波 / #2098 四笔 / CI 绿五笔真因＋notice 纵深防御）；吸收审查 A/B **零未处置项**（B 侧发现已逐条落：`b8375478c` 纵深防御、`b2a0d8da6` 文档对账、`d51118e32` cancel 半据实标注） |
 | ⑦ | 真机验收：重启后 subagents 行花费格可见且与 /usage 同树对账一致、压缩在真实 token 80% 触发（kimi-k3=800000）、子代理回执不再打断压缩（老板现场场景复现） | **待办** | 花费格 v1+v1.1 已落（`1917d1049`/`9ff1e92c8`）但真机重启验收未见记录；压缩 80% 口径（kimi-k3=800000）与「回执不打断压缩」由压缩安全束本地 pin 钉住（FORK_NOTES:20），**真机复现待做** |
 
-**一句话**：① ② ④ 主仓侧闭环，③ ⑥ 在飞，⑤ ⑦ 待办（⑤ 有一条合并归因缺口＝platform-coverage registry 行；⑦ 需真机重启）。
+**一句话（v1.1）**：① ② ④ ⑥ 已闭环（⑥＝文档 v1.1 + FORK_NOTES `e11e4a8ca` 三行 + 审查 A/B 零未处置）；③ **部分闭环**——#2098 三刀＋F1 路 A＋三效果正控已落并过两席异构复核，cancel 半据实标注不作已解，#2241（一期残件两笔 + G5/G6）与 #2334（五笔出卷、复核 FAIL 可修、v2 在修）在飞；⑤ 待 CI 对 `d51118e32` 那轮定论（前三轮 3 处 job / 5 条真因已逐条修落）；⑦ 待老板重启验收。
 
 ---
 
@@ -406,6 +434,9 @@ goal 原文（母席 2026-09-17 挂）：*把上游 `e2fb7bfa1` 窗（136 笔）
 - 复核纪律升级（已入记忆）：按波复核分量比对红名单；落地闸＝纯净树 tsgo＋邻接测试集。
 
 - **应用波终态（2026-09-18 07:0x）**：merge `67334bf1a` + 应用十笔到 `9ff1e92c8` 已推 `origin/merge/repl-kernel`；CI 对该头 run 35285177049 = **failure**（10/13 job 绿；红＝test-hygiene、Build and check 的 platform-coverage registry 缺 `repl-kernel-startup.test.ts` 行、coding-agent 1/3 的 `dat4-manifest-atomic-write` torn-write 例）。tui 接线四笔本地到 `5adf6410a` 未推；六闸终读见 §6.5（NEW-RED=0）。**未 push、未合主干、未推 tag。**
+- **收尾波终态（2026-09-18 09:42）**：`082a5d37c`（文档 v1.0）→ CI 绿五笔（`49e94f491`/`144bfa2e2`/`91da42b93`/`e17535e07`/`de1ad0b06`）→ #2098 四笔（`49b326b51`/`abae4f9bb`/`bdd1ad5b7`/`78af6fc4d`）→ `b8375478c`（纵深防御）/`b2a0d8da6`（文档对账）/`e11e4a8ca`（FORK_NOTES 三行）/`2eb768217`（F10 钉）/`d51118e32`（cancel 半标注）；`67334bf1a..d51118e32` 共 **29 笔**（含 merge 30），全在 `origin/merge/repl-kernel`（`git ls-remote` 实测）。本文档 v1.1 由本席写入、**母席提交（本席不 commit、不 push）**。
+- **复核方法论（本波新增，已入口径）**：**变异必须打在真失效面承重变量上**——`agent-session` 每提交轮都会把 live prompt 复位成 `_baseSystemPrompt`，**只改 live prompt 的变异会被自愈成假绿**；同理 `78af6fc4d` 的变异打在豁免判据本身（`kind:scope:id` 键存在 → `→version` 指纹）而非旁路。凡声称「变异可红」的回执必须写明：变异落在哪个变量、该变量是不是承重面、红的是不是目标钉；说不清按未验证计。
+- **正控例数口径**：见 §9.1a 末注——#2098 正控文件 **16 例**（13→15→16），凡写 13/15 处同批改。
 
 ---
 
