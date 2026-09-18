@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { isDaemonSessionSummary } from "../src/cli/daemon-launch.js";
+import { AGENT_TASK_STATES } from "../src/core/agent-task-state.js";
 import {
 	createDaemonCommandEnvelope,
 	createDaemonEventEnvelope,
@@ -1044,4 +1045,16 @@ it("carries the real failure reason into the durable descriptor, bounded to one 
 	} as unknown as DaemonWorkerDescriptor);
 	expect(durable.lastError).toBe("kernel died: out of memory");
 	expect(JSON.stringify(durable)).not.toContain("secret-");
+});
+
+it("treats a widened saved-session verdict domain as the wire change it is", () => {
+	// Deriving both faces of this build's saved-session row from AGENT_TASK_STATES
+	// (core/agent-task-state.ts) is what keeps a new verdict from landing on the producer only, but
+	// the derivation is not the whole gate: that array sits inside no DAEMON_SCHEMA_ID slice, so
+	// widening it moves no identity by itself, while every client older than this build validates the
+	// new value away and drops the whole progressive row without a log line (final-review seat B,
+	// B3-09'). This is the stop-and-read. A new verdict has to arrive with a protocol schema revision
+	// and the digest ritual documented at the head of this file, and its author updates this line as
+	// the acknowledgement that the wire - not just this build - changed.
+	expect(AGENT_TASK_STATES).toEqual(["needs_input", "completed", "error"]);
 });
