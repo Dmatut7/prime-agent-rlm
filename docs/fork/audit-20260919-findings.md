@@ -65,6 +65,10 @@
 - 【恢复安全性】恢复快照只含 queued 动作，滞留的 committing/running 不进快照 ⇒ 家族重开安全不复燃。
 - 修复补强：a) 落穿分支除 setImmediate 外加「零进展自检」（连续 N 次迭代四状态全不变 ⇒ log+break 报错）；d) supervisor 连击计数已有雏形（consecutiveFailures 字段），只差动作。
 
+## 复现双证（两席独立）
+- switch-path-2 /tmp/spin-repro.ts：99% CPU 27 分钟，自身 8s 退出定时器被饿死。
+- regression-diff 最小复现：正控通过；造出 committing 滞留后 waitForIdle 把 2s 观察与 8s 硬退定时器全部饿死。修复方向细化：停泊条件从「queued>0 && pump-busy」扩成「unfinished>0 且本轮无泵可调」，在 checkpoint waiter 上停泊。
+
 ## 舰队事故（本会话教训）
 - 3 席真死（stopReason=toolUse 后回合戛止、文本断半句）：sub-82df0ec6、sub-8a5ca4b5、sub-e4d0816e。均 K3-max。死因未定位，疑似下一会话请求未发出。
 - 2 席假完工（collect 说 done 但实际还在 streaming）：audit-switch-path、audit-regression-diff——先 observe 再判救了一次误重派。
