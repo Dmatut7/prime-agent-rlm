@@ -30,12 +30,18 @@ import { detectForkInstall, FORK_GATE_ENV_VAR, FORK_MARKER_FILE } from "../src/f
  * order, and the whole point of the case that opens the gate is that those commands are reached -
  * against stubs, in a temp directory, never against this checkout or the registry.
  *
- * The second half of the file pins the `.mjs` gate to the TypeScript one it mirrors:
- * `release.mjs` cannot import `fork-self-update.ts` (a release script must run in a checkout with
- * nothing built and no TypeScript loader), so it carries a copy of the marker walk. Copying is only
- * safe while both sides are nailed to the same marker file name, the same verdict on the same
- * directories, and different override variables - the self-update gate's `=off` test seam must
- * never open a release.
+ * This file owns the *wiring*: that `release.mjs` consults the gate at all, before it parses its
+ * arguments or spawns anything, that a refusal stops the run (exit 2, nothing written, no `git` or
+ * `npm` reached), and that the override opens it onto the real steps against stubs. Without these
+ * cases the gate module could be perfect and still never be called from the one command it exists
+ * for - the failure shape this batch kept paying for.
+ *
+ * The gate has since moved into `scripts/lib/fork-gate.mjs`, which `release.mjs` imports (it cannot
+ * import `fork-self-update.ts`: a release script must run in a checkout with nothing built and no
+ * TypeScript loader). The marker constant, the walk and the refusal wording live there and are
+ * pinned by `test/fork-release-gate.test.ts`, which imports that module directly; this file pins
+ * the last inch - that the script on the release path uses it - and the contract the two files
+ * share is one marker name, one override name, and a refusal the script turns into an exit.
  */
 const REPO_SCRIPTS_DIR = fileURLToPath(new URL("../../../scripts/", import.meta.url));
 const RELEASE_SCRIPT = join(REPO_SCRIPTS_DIR, "release.mjs");
@@ -43,10 +49,12 @@ const RELEASE_SCRIPT = join(REPO_SCRIPTS_DIR, "release.mjs");
 /**
  * The gate plus every module it imports by relative path. Staging only `release.mjs` would make the
  * passing cases unpassable on any machine: it starts with
- * `import { buildReleaseSection } from "./lib/changelog-fragments.mjs"`, which a fixture without
- * that file cannot load. A case below re-derives this list from the script's own imports.
+ * `import { buildReleaseSection } from "./lib/changelog-fragments.mjs"`, and it asks the fork gate
+ * through `./lib/fork-gate.mjs` - a fixture without either cannot load the script at all, which is
+ * what the 13 reds before this list learned the hard way. A case below re-derives this list from the
+ * script's own imports.
  */
-const GATED_SCRIPTS = ["release.mjs", "lib/changelog-fragments.mjs"];
+const GATED_SCRIPTS = ["release.mjs", "lib/changelog-fragments.mjs", "lib/fork-gate.mjs"];
 
 /**
  * The override the gate accepts, spelled out here rather than imported: it is the operator-facing
@@ -186,17 +194,21 @@ function runRelease(
 function expectRefusal(result: { status: number | null; signal: string | null; output: string }, root: string): void {
 	// Refused, and refused by itself: a killed or timed-out run proves nothing about the gate.
 	expect(result.signal).toBe(null);
-	expect(result.status).toBe(1);
+	// `ReleaseGateRefusal.exitCode` (2), the gate module's own code and the one the pre-push
+	// self-test checks - not the script's generic `process.exit(1)` for its other failures, so a
+	// red here still tells a refusal apart from a release that could not run.
+	expect(result.status).toBe(2);
 	expect(result.output).toContain("refusing to release from a fork checkout");
 	// Names the marker it found, by the shared constant, and the checkout it found it in.
 	expect(result.output).toContain(FORK_MARKER_FILE);
 	expect(result.output).toContain(root);
-	// Names the escape hatch, the public scope at stake and the workflow the tag would run.
+	// Names the escape hatch, the ban (`v*` tag, publish) and the live workflow behind it. The full
+	// wording is owned by test/fork-release-gate.test.ts, which runs the gate module against the
+	// real checkout; what this file has to see is that the script prints the refusal it gets.
 	expect(result.output).toContain(ALLOW_RELEASE_ENV_VAR);
-	expect(result.output).toContain("@earendil-works/pi-");
+	expect(result.output).toContain("npm publish");
+	expect(result.output).toContain("v*");
 	expect(result.output).toContain("build-binaries.yml");
-	expect(result.output).toContain("git tag");
-	expect(result.output).toContain("git push origin");
 }
 
 /** Runs `body` with the self-update gate's test seam unset, restoring whatever was there. */
@@ -256,7 +268,8 @@ describe("release.mjs fork gate", () => {
 		// A dry run performs no irreversible step (it prints the changelog preview and exits before
 		// the first write), so it is gated on purpose, not by accident: the refusal says so, and the
 		// preview never starts. Asserting the reason keeps the choice visible to the next reader.
-		expect(result.output).toContain("--dry-run");
+		// (`--dry-run` is refused by the same shared refusal, which does not enumerate the flag;
+		// the behavioural half is what matters here - no preview ran.)
 		expect(result.output).not.toContain("Dry run complete");
 		expect(recordedCalls(fixture)).toEqual([]);
 		expect(snapshotTree(fixture.root)).toEqual(before);
@@ -268,7 +281,7 @@ describe("release.mjs fork gate", () => {
 		for (const value of ["0", "2", "true", "yes", "on", "", "1 ", " 1", "01"]) {
 			const fixture = makeFixture({ fork: true });
 			const result = runRelease(fixture, ["patch", "--dry-run"], { [ALLOW_RELEASE_ENV_VAR]: value });
-			expect(result.status, `override value ${JSON.stringify(value)} must not release`).toBe(1);
+			expect(result.status, `override value ${JSON.stringify(value)} must not release`).toBe(2);
 			expect(result.output).toContain("refusing to release from a fork checkout");
 			expect(recordedCalls(fixture)).toEqual([]);
 		}
@@ -282,8 +295,12 @@ describe("release.mjs fork gate", () => {
 		for (const value of ["SENTINEL_DO_NOT_ECHO", "release-please-SENTINEL"]) {
 			const fixture = makeFixture({ fork: true });
 			const result = runRelease(fixture, ["patch", "--dry-run"], { [ALLOW_RELEASE_ENV_VAR]: value });
-			expect(result.status).toBe(1);
-			expect(result.output).toContain('is set, but to something other than exactly "1"');
+			expect(result.status).toBe(2);
+			// The refusal names the variable and the one value that counts (`=1`), so a mis-set
+			// operator learns what to fix...
+			expect(result.output).toContain(ALLOW_RELEASE_ENV_VAR);
+			expect(result.output).toContain("refusing to release from a fork checkout");
+			// ...while the value they set stays out of the terminal and the CI log.
 			expect(result.output, `override value ${JSON.stringify(value)} must not be echoed`).not.toContain(value);
 			expect(recordedCalls(fixture)).toEqual([]);
 		}
@@ -299,7 +316,7 @@ describe("release.mjs fork gate", () => {
 		expect(recordedCalls(fixture)).toEqual([]);
 	});
 
-	it("releases when the override is given explicitly, warning about every irreversible step", () => {
+	it("releases when the override is given explicitly, and says the ban was lifted", () => {
 		const fixture = makeFixture({ fork: true });
 		const before = snapshotTree(fixture.root);
 		const result = runRelease(fixture, ["patch", "--dry-run"], { [ALLOW_RELEASE_ENV_VAR]: "1" });
@@ -308,14 +325,12 @@ describe("release.mjs fork gate", () => {
 		expect(result.output).toContain("warning:");
 		expect(result.output).toContain(ALLOW_RELEASE_ENV_VAR);
 		expect(result.output).toContain(fixture.root);
-		// The warning is the only thing standing between the operator and the four steps, so it
-		// names all of them: commit, tag, the public scope, the push and the workflow it triggers.
-		expect(result.output).toContain("git commit");
-		expect(result.output).toContain("git tag");
-		expect(result.output).toContain("@earendil-works/pi-");
-		expect(result.output).toContain("git push origin main");
-		expect(result.output).toContain("build-binaries.yml");
-		expect(result.output).toContain("contents: write");
+		// The override is never silent: the warning names what was lifted (the `v*` tag and the
+		// publish) and the ban it overrode. It is one line - the gate module's
+		// `releaseGateOverrideLine` - and the steps themselves are asserted as *calls* in the
+		// case below, which reaches commit, tag, publish and push against the stubs.
+		expect(result.output).toContain("v* tag / npm publish");
+		expect(result.output).toContain("CHANGELOG.md");
 		// It really did go on to the dry run: the gate opened instead of the script dying on it.
 		expect(result.output).toContain("Dry run complete (no changes made)");
 		// A dry run spawns only the read-only `git log` the fragment sort order needs.
@@ -381,26 +396,36 @@ describe("release.mjs fork gate", () => {
 			expect(detectForkInstall(nested)).toEqual({ repoRoot: fork.root });
 			expect(detectForkInstall(plainScripts)).toBeUndefined();
 		});
-		expect(runRelease(fork, ["patch"]).status).toBe(1);
+		expect(runRelease(fork, ["patch"]).status).toBe(2);
 		expect(runRelease(plain, ["patch", "--dry-run"]).status).toBe(0);
 	});
 
-	it("keys on the same marker file name and a different override than the TypeScript gate", () => {
+	it("shares the gate module's marker and override, and keeps the refusal an exit", () => {
 		const source = readFileSync(RELEASE_SCRIPT, "utf8");
-		const marker = /const FORK_MARKER_FILE = "([^"]*)";/.exec(source);
-		expect(marker, "release.mjs must declare its marker constant under the shared name").not.toBeNull();
+		const importLine = source.split("\n").find((line) => line.includes('"./lib/fork-gate.mjs"')) ?? "";
+		expect(importLine, "release.mjs must import the shared gate module").not.toBe("");
+		expect(importLine).toContain("assertReleaseAllowed");
+		// The constants live in that module now, and the script has no copy of its own: one marker
+		// name (`FORK_MARKER_FILE`, the TypeScript gate's) and one override name
+		// (`ALLOW_RELEASE_ENV_VAR`).
+		const gate = readFileSync(join(REPO_SCRIPTS_DIR, "lib", "fork-gate.mjs"), "utf8");
+		const marker = /export const FORK_MARKER_FILE = "([^"]*)";/.exec(gate);
+		expect(marker, "fork-gate.mjs must declare the marker constant under the shared name").not.toBeNull();
 		expect(marker?.[1]).toBe(FORK_MARKER_FILE);
-		const override = /const RELEASE_OVERRIDE_ENV_VAR = "([^"]*)";/.exec(source);
-		expect(override, "release.mjs must declare its override constant").not.toBeNull();
+		const override = /export const RELEASE_GATE_ENV_VAR = "([^"]*)";/.exec(gate);
+		expect(override, "fork-gate.mjs must declare its override constant").not.toBeNull();
 		expect(override?.[1]).toBe(ALLOW_RELEASE_ENV_VAR);
 		// The two gates must not share a switch: `off` on the self-update gate is a test seam, and
 		// `1` on the release gate is an operator's deliberate act.
 		expect(override?.[1]).not.toBe(FORK_GATE_ENV_VAR);
+		expect(/const FORK_MARKER_FILE|RELEASE_OVERRIDE_ENV_VAR/.test(source)).toBe(false);
 		// And the refusal has to be an exit, not a logged complaint the release steps continue
-		// past. Scoped to the gate's own body: `process.exit(1)` occurs four more times in the
-		// script, so a file-wide search still passes when the gate's exit is the one removed.
-		const gateBody = /function forkReleaseGate\(\) \{[\s\S]*?\n\}\n/.exec(source)?.[0] ?? "";
-		expect(gateBody, "release.mjs must keep a forkReleaseGate() whose refusal exits").not.toBe("");
-		expect(gateBody).toContain("process.exit(1)");
+		// past. Scoped to the block that calls the gate: `process.exit(1)` occurs four more times
+		// in the script, so a file-wide search still passes when this exit is the one removed.
+		const callAt = source.indexOf("assertReleaseAllowed();");
+		const callBlock = callAt === -1 ? "" : source.slice(callAt, source.indexOf("\n}\n", callAt) + 1);
+		expect(callBlock, "release.mjs must keep the assertReleaseAllowed() call that refuses").not.toBe("");
+		expect(callBlock).toContain("ReleaseGateRefusal");
+		expect(callBlock).toContain("process.exit(error.exitCode)");
 	});
 });

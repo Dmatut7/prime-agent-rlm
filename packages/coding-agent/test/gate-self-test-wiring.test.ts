@@ -9,8 +9,9 @@ import { describe, expect, it } from "vitest";
  * A `--self-test` that nothing runs is decoration, and this repository has already paid for that
  * twice in one batch: the process-smoke floor module grew a six-control self-test that no aggregate
  * entry invoked (`grep -rn "ci-process-smoke.mjs --self-test"` found nothing but its own usage
- * line), and the coverage gate's self-test - the only exercise of the recompute controls - was in
- * the hygiene job while nothing said so.
+ * line; that module is gone now - the row it mirrored lives in ci.yml and the mirror's self-test
+ * carries the same controls), and the coverage gate's self-test - the only exercise of the
+ * recompute controls - was in the hygiene job while nothing said so.
  *
  * This pin makes the wiring visible: every gate script in `scripts/` that can prove itself must be
  * invoked by an aggregate (a workflow step, `check:ci-honesty`, or the pre-push gate), and the
@@ -60,8 +61,14 @@ const INSTRUMENTS: { command: string; why: string }[] = [
 		why: "planted npm 10.9.4 has to go red without network access",
 	},
 	{
-		command: "node scripts/lib/ci-process-smoke.mjs --self-test",
-		why: "the process-smoke floors and tag-skip ledger have one source, and this keeps it honest",
+		// The process-smoke row's floors and tag-skip ledger are read out of `.github/workflows/ci.yml`
+		// by `scripts/lib/ci-matrix-row.mjs`; the mirror's self-test is the only run that plants drift
+		// in the row, the ledger and the coverage recompute at once. It used to be spelled
+		// `node scripts/lib/ci-process-smoke.mjs --self-test`, and when that module was deleted with the
+		// row-as-source change this list kept naming the file until the "instruments exist" case below
+		// went red - which is why the command here is the mirror's, not a module's.
+		command: "bash scripts/check-process-smoke.sh --self-test",
+		why: "the process-smoke row is read out of ci.yml, and this keeps the reader and the floors honest",
 	},
 	{
 		command: "bash scripts/check-tag-skip-ledger.sh --self-test",

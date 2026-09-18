@@ -120,6 +120,37 @@ function createThrottleMode(options: HarnessOptions = {}) {
 	};
 }
 
+/**
+ * A mode built through the prototype and nothing else: the constructor never runs, so
+ * `uiServices` - and the settings surface the emergency switch is read from - is absent.
+ * That is exactly what the resync regression harnesses look like, and the refresh called
+ * from `renderResyncedSession` has to survive it: the figure on screen is cosmetic, the
+ * TypeError it threw there was not (it aborted the render path a reconnect runs).
+ */
+function createUiservicelessMode() {
+	const getContextTree = vi.fn(async () => branchTree(usage(100, 50, 0.05), usage(100, 50, 0.05)));
+	const requestRender = vi.fn();
+	const published = { sessionId: "session-1", total: 1.25 };
+	const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
+	Object.assign(mode, {
+		connectionState: { sessionId: "session-1" },
+		agentConnection: { getContextTree, getSessionStats: vi.fn(async () => ({ cost: 0 })) },
+		// The figure a real session's header already holds, and the refresh bookkeeping
+		// that goes with it: both must come back untouched.
+		topBarCost: published,
+		topBarCostRefresh: { generation: 3, lastSuccessGeneration: 3 },
+		ui: { requestRender },
+	});
+	return {
+		mode,
+		getContextTree,
+		requestRender,
+		published,
+		topBarCost: () => Reflect.get(mode, "topBarCost"),
+		refreshTopBarCost: () => (Reflect.get(InteractiveMode.prototype, "refreshTopBarCost") as () => void).call(mode),
+	};
+}
+
 describe("top bar cost refresh sharing", () => {
 	beforeAll(() => {
 		initTheme("dark");
@@ -415,5 +446,22 @@ describe("top bar cost refresh sharing", () => {
 			},
 		});
 		expect(stripAnsi(bar.render(21)[0] ?? "")).toContain("$1.01");
+	});
+
+	it("a harness with no uiServices keeps the figure it holds instead of throwing", async () => {
+		// The negative control for the emergency-switch wiring: the switch is read through
+		// `this.uiServices`, and a partial harness has none. `renderResyncedSession` runs
+		// this refresh on a reconnect, so the missing surface used to surface as a
+		// TypeError inside a rendering path (4509's resync case is the behavioural half of
+		// this pin; this is the focused one, on the method itself).
+		const h = createUiservicelessMode();
+		expect(() => h.refreshTopBarCost()).not.toThrow();
+		await flush();
+		// The header keeps the figure it already had - neither blanked nor replaced...
+		expect(h.topBarCost()).toBe(h.published);
+		// ... and neither reading costs anything: no context-tree scan was asked for, and
+		// the frame was not invalidated to show a figure nobody produced.
+		expect(h.getContextTree).not.toHaveBeenCalled();
+		expect(h.requestRender).not.toHaveBeenCalled();
 	});
 });

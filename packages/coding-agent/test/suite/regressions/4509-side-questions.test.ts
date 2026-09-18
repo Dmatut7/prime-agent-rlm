@@ -869,12 +869,18 @@ describe("ENG-4509 side questions", () => {
 	it("releases side-bash state when a resync proves the run ended", async () => {
 		const bashComponent = { setComplete: vi.fn() };
 		const finishBash = vi.fn();
+		// The header's published figure, as a session that has been running holds one. This
+		// harness is built through the prototype, so it has no `uiServices` - and the resync
+		// runs `refreshTopBarCost`, which reads the emergency switch off that surface. The
+		// refresh has to leave this figure alone rather than throw out of the render path.
+		const publishedTopBarCost = { sessionId: "session-1", total: 1.25 };
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
 			sideQuestionBash: { runId: "side-run-1", input: "!sleep 5", seedTranscript: true },
 			sideQuestionBashComponent: bashComponent,
 			sideQuestionBashDiscarded: undefined,
 			sideQuestionComponent: { finishBash },
 			activeBashComponent: bashComponent,
+			topBarCost: publishedTopBarCost,
 			isAgentCompacting: () => false,
 			isBashRunning: () => true,
 			applyConnectionStateSnapshot: vi.fn(),
@@ -919,6 +925,10 @@ describe("ENG-4509 side questions", () => {
 		expect(fakeThis.activeBashComponent).toBeUndefined();
 		expect(fakeThis.sideQuestionBash).toBeUndefined();
 		expect(fakeThis.sideQuestionBashComponent).toBeUndefined();
+		// The resync came through to the end with the header's figure untouched: the
+		// refresh stops at the missing settings surface instead of crashing the render or
+		// blanking a number it cannot recompute.
+		expect(Reflect.get(fakeThis, "topBarCost")).toBe(publishedTopBarCost);
 	});
 
 	it("re-aborts a discarded side bash when its bash_start arrives late", async () => {
