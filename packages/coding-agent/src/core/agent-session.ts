@@ -7261,6 +7261,22 @@ export class AgentSession {
 				streamingBehavior: options?.streamingBehavior,
 			}),
 		);
+		// Defense in depth, and honestly labeled as such: no reachable public entry gets a
+		// human-class or system-fence input to this line. The gate has exactly one caller
+		// (`acceptAgentMessagePrompt`), which drops an envelope that fails
+		// `isAgentSessionMessage()` before it gets here, and the default envelope above
+		// makes the channel itself the structural fact - every source that can reach this
+		// point (interactive, rpc, extension, internal, unspecified) classifies with origin
+		// "agent", because the classifier's agent-message rule fires before any human
+		// marking. `system_fence` is a context flag that `incomingInputFactsFromMessage`
+		// never sets, so that half is unreachable the same way. Deleting this line is
+		// therefore not observable (measured: the 27 compaction/priority pin cases stay
+		// green with it removed), and it is kept because `compaction-during-child-reply`
+		// states the stand-down as a contract, not because a pin holds it. The observable
+		// half - a human prompt is never gated, and human priority never preempts a
+		// running compaction - is pinned in `2334-human-priority-lane-scoped.test.ts`. If a
+		// reachable human entry ever appears (most likely by moving this ruling into
+		// `_admitSessionInput`, which every input passes through), pin it in the same commit.
 		if (inputClassOrigin(inputClass) === "human" || inputClass === "system_fence") return undefined;
 		if (this.isCompacting) return "compaction_in_flight";
 		// A turn in flight compacts at its own agent_end; starting a second compaction
