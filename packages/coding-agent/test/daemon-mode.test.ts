@@ -642,6 +642,7 @@ describe("daemon mode helpers", () => {
 				supervisorAvailabilityState: { consecutiveFailures: number; supervisorAbsentSince?: number };
 				exitOrphanedSupervisorWorker(socketPath: string): Promise<void>;
 				shutdown: ReturnType<typeof vi.fn>;
+				orphanExitDeferredLogAt: number | undefined;
 			};
 			// The full gate predicate (upstream #2246): the summary fold — session
 			// activity, live kernel bash work — or running RLM children.
@@ -656,14 +657,100 @@ describe("daemon mode helpers", () => {
 				internals.sessions.set(state.activeSessionId, state);
 				internals.supervisorAvailabilityState.supervisorAbsentSince = Date.now() - 10 * 60_000;
 				internals.shutdown = vi.fn(async () => undefined as never);
+				consoleError.mockClear();
+				// Each case must see its own attribution line: reset the 60s throttle.
+				internals.orphanExitDeferredLogAt = undefined;
 
 				await internals.exitOrphanedSupervisorWorker("/tmp/supervisor.sock");
 
 				expect(internals.shutdown, testCase.name).not.toHaveBeenCalled();
 				// An active run owns the worker a little longer; the window keeps running.
 				expect(internals.supervisorAvailabilityState.supervisorAbsentSince, testCase.name).toBeDefined();
+				// The deferral is attributable (B2-C07): one log line names the gate
+				// that said no, instead of a silent skip that reads as a stuck loop.
+				// log() emits the raw line plus a JSON structured twin; startsWith
+				// selects the raw one (the twin starts with `{"ts":`).
+				expect(
+					consoleError.mock.calls.filter((call) => String(call[0]).startsWith("orphan exit deferred:")),
+					testCase.name,
+				).toHaveLength(1);
 				internals.sessions.delete(state.activeSessionId);
 			}
+		} finally {
+			consoleError.mockRestore();
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("throttles the orphan-exit deferred attribution log to one line per gap", async () => {
+		// The availability wheel rechecks at most once a minute; the attribution line
+		// must not become one line per recheck for a worker that stays busy for hours.
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-orphan-deferlog-"));
+		const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			const daemon = new AgentDaemon(join(tempDir, "worker.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: vi.fn(),
+				worker: { authenticationToken: "worker-token" },
+			});
+			const state = makeOrphanGateSession("orphan-busy-throttle", { isSessionActive: true });
+			const internals = daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				supervisorAvailabilityState: { consecutiveFailures: number; supervisorAbsentSince?: number };
+				exitOrphanedSupervisorWorker(socketPath: string): Promise<void>;
+				shutdown: ReturnType<typeof vi.fn>;
+			};
+			internals.sessions.set(state.activeSessionId, state);
+			internals.supervisorAvailabilityState.supervisorAbsentSince = Date.now() - 10 * 60_000;
+			internals.shutdown = vi.fn(async () => undefined as never);
+
+			await internals.exitOrphanedSupervisorWorker("/tmp/supervisor.sock");
+			await internals.exitOrphanedSupervisorWorker("/tmp/supervisor.sock");
+			await internals.exitOrphanedSupervisorWorker("/tmp/supervisor.sock");
+
+			expect(internals.shutdown).not.toHaveBeenCalled();
+			// startsWith selects the raw line; log() also emits a JSON structured twin.
+			const lines = consoleError.mock.calls.filter((call) => String(call[0]).startsWith("orphan exit deferred:"));
+			expect(lines).toHaveLength(1);
+		} finally {
+			consoleError.mockRestore();
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("never lets the orphan-exit path cut a shutdown already in flight", async () => {
+		// shutdown() treats re-entry as an immediate process.exit(exitCode), so an
+		// orphan verdict landing mid-shutdown would truncate the graceful close
+		// (per-session closeSession, server.close, flushOrphanProcessJournal - the
+		// journal drain has no exit-hook fallback). The orphan path defers to the
+		// in-flight shutdown instead: shuttingDown is checked first, before any
+		// window/claim/work reasoning (B2-C06).
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-orphan-shutdown-"));
+		const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			const daemon = new AgentDaemon(join(tempDir, "worker.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: vi.fn(),
+				worker: { authenticationToken: "worker-token" },
+			});
+			const internals = daemon as unknown as {
+				shuttingDown: boolean;
+				supervisorAvailabilityState: { consecutiveFailures: number; supervisorAbsentSince?: number };
+				exitOrphanedSupervisorWorker(socketPath: string): Promise<void>;
+				shutdown: ReturnType<typeof vi.fn>;
+			};
+			// Every other gate is wide open on purpose: the window elapsed, no claim,
+			// no session work - only the in-flight shutdown may stand between this
+			// call and shutdown(0).
+			internals.supervisorAvailabilityState.supervisorAbsentSince = Date.now() - 10 * 60_000;
+			internals.shutdown = vi.fn(async () => undefined as never);
+			internals.shuttingDown = true;
+
+			await internals.exitOrphanedSupervisorWorker("/tmp/supervisor.sock");
+
+			expect(internals.shutdown).not.toHaveBeenCalled();
+			// The window stamp is the in-flight shutdown's bookkeeping, not ours.
+			expect(internals.supervisorAvailabilityState.supervisorAbsentSince).toBeDefined();
 		} finally {
 			consoleError.mockRestore();
 			rmSync(tempDir, { recursive: true, force: true });
@@ -6651,6 +6738,64 @@ describe("daemon mode helpers", () => {
 				.map((call) => String(call[0]))
 				.filter((line) => line.includes("Kept idle child resident for live kernel bash work"));
 			expect(attributed).toEqual([]);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("logs when the per-sweep passivation cap leaves idle children behind", async () => {
+		// The per-sweep cap used to truncate the candidate list silently (B2-C07): a
+		// worker whose idle children outnumber the cap drained them over many sweeps
+		// with nothing in the log to attribute the slow drain to. One line per capped
+		// sweep names the split. Two resident idle subagents + limit 1 is the smallest
+		// shape that overflows the cap.
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-passivation-cap-log-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				passivateIdleChildren(threshold: number | "off", now: number, limit: number): Promise<number>;
+				log: ReturnType<typeof vi.fn>;
+			};
+			internals.log = vi.fn();
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			await internals.createRuntime({ type: "create", sessionPath: fixture.childSessionFile });
+			// A second resident subagent of the same parent, so the eligible set (2)
+			// overflows the limit (1).
+			const child2SessionDir = join(fixture.parentArtifactDir, "sub-cafef00d");
+			const child2Manager = SessionManager.create(tempDir, child2SessionDir);
+			child2Manager.newSession({ parentSession: fixture.parentSessionFile });
+			child2Manager.appendMessage({ role: "user", content: "second child task", timestamp: 3 });
+			child2Manager.flushNow();
+			const child2SessionFile = child2Manager.getSessionFile();
+			if (!child2SessionFile) throw new Error("Missing second child session file");
+			await internals.createRuntime({ type: "create", sessionPath: child2SessionFile });
+			// Only subagents passivate (canPassivateSession requires a parent). Mutate
+			// the states the daemon actually filed, and override rather than assign:
+			// the runtime metadata accessor hands out a copy
+			// (agent-session-runtime.ts `get metadata() { return { ...this._metadata } }`),
+			// so a plain assignment mutates the copy and is lost.
+			for (const state of internals.sessions.values()) {
+				if (state === parentState) continue;
+				Object.defineProperty(state.runtime, "metadata", {
+					configurable: true,
+					value: {
+						...state.runtime.metadata,
+						kind: "subagent",
+						parentActiveSessionId: parentState.activeSessionId,
+					},
+				});
+			}
+
+			const passivated = await internals.passivateIdleChildren(90, Date.parse("2036-08-01T12:00:00Z"), 1);
+
+			expect(passivated).toBe(1);
+			const capped = internals.log.mock.calls
+				.map((call) => String(call[0]))
+				.filter((line) => line.includes("child passivation capped:"));
+			expect(capped).toHaveLength(1);
+			expect(capped[0]).toContain("1 of 2");
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
