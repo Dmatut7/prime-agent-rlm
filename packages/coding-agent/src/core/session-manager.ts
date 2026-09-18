@@ -36,6 +36,7 @@ import {
 	assertRegularFileNoSymlink,
 	ensurePrivateDirectory,
 	requireNoFollow,
+	UnterminatedTailError,
 	writePrivateFileAtomicLines,
 } from "../utils/private-files.js";
 import type { AgentTaskState } from "./agent-task-state.js";
@@ -2825,18 +2826,29 @@ export class SessionManager {
 			this.flushed = true;
 		} else {
 			try {
-				// K3P-45: never append onto an unterminated tail. The open-time repair
-				// completes whole-record tails and truncates torn ones, but an oversized
-				// trailing record is left in place (K3P-4) and appending onto it would
-				// glue both lines into one unparsable interior line. Re-repair first (a
-				// tail torn by a crash since open is still fixable), then refuse loudly.
-				if (this.sessionFile && !endsWithNewlineSync(this.sessionFile)) {
+				// K3P-45: never append onto an unterminated tail. The check now rides
+				// the append descriptor (O_RDWR|O_APPEND + fstat + one pread of the
+				// last byte, perfB③), which removes a stat/open/read/close pass per
+				// append and closes the window between the check and the write. An
+				// oversized trailing record is still left in place (K3P-4), so the
+				// refusal path below is unchanged: re-repair once (a tail torn by a
+				// crash since open is still fixable), then refuse loudly.
+				try {
+					appendPrivateFile(this.sessionFile, `${JSON.stringify(entry)}\n`, {
+						privateParent: this.ownsSessionDir,
+						requireTerminatedTail: true,
+					});
+				} catch (error) {
+					if (!(error instanceof UnterminatedTailError)) throw error;
 					const repair = repairOwnedSessionFile(this.sessionFile);
 					if (repair !== "repaired" || !endsWithNewlineSync(this.sessionFile)) {
 						throw new SessionTailUnverifiableError(this.sessionFile);
 					}
+					appendPrivateFile(this.sessionFile, `${JSON.stringify(entry)}\n`, {
+						privateParent: this.ownsSessionDir,
+						requireTerminatedTail: true,
+					});
 				}
-				appendPrivateFile(this.sessionFile, `${JSON.stringify(entry)}\n`, { privateParent: this.ownsSessionDir });
 			} catch (error) {
 				if (error instanceof SessionTailUnverifiableError) {
 					// Deliberately NOT clearing `flushed`: the self-heal path below

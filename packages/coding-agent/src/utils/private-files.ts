@@ -12,6 +12,7 @@ import {
 	mkdtempSync,
 	openSync,
 	readFileSync,
+	readSync,
 	realpathSync,
 	renameSync,
 	rmSync,
@@ -396,9 +397,34 @@ export function writePrivateFileAtomicLines(
 	}
 }
 
-export function appendPrivateFile(path: string, content: string, options: { privateParent?: boolean } = {}): void {
+/** Thrown when an append is refused because the file's last byte is not a newline. */
+export class UnterminatedTailError extends Error {
+	constructor(readonly path: string) {
+		super(`refusing to append onto an unterminated tail: ${path}`);
+		this.name = "UnterminatedTailError";
+	}
+}
+
+/** Whether the byte at `size - 1` on this descriptor is a newline (same rule as endsWithNewlineSync). */
+function fdEndsWithNewline(fd: number, size: number): boolean {
+	const lastByte = Buffer.allocUnsafe(1);
+	return readSync(fd, lastByte, 0, 1, size - 1) === 1 && lastByte[0] === 0x0a;
+}
+
+export function appendPrivateFile(
+	path: string,
+	content: string,
+	options: { privateParent?: boolean; requireTerminatedTail?: boolean } = {},
+): void {
 	ensureParentDirectory(path, options.privateParent !== false);
-	let flags = constants.O_WRONLY | constants.O_APPEND | requireNoFollow(constants.O_NOFOLLOW) | NONBLOCK_FLAG;
+	// requireTerminatedTail reads the tail from the same descriptor it appends
+	// through, so that variant opens read-write (a private 0600 file the caller
+	// owns) - the check and the write share one fd and one fstat.
+	let flags =
+		(options.requireTerminatedTail === true ? constants.O_RDWR : constants.O_WRONLY) |
+		constants.O_APPEND |
+		requireNoFollow(constants.O_NOFOLLOW) |
+		NONBLOCK_FLAG;
 	const exists = pathExistsLexical(path);
 	if (exists) {
 		assertRegularFileNoSymlink(path);
@@ -410,11 +436,22 @@ export function appendPrivateFile(path: string, content: string, options: { priv
 		fd = openSync(path, flags, PRIVATE_FILE_MODE);
 	} catch (error) {
 		if (!isAlreadyExistsError(error) || exists) throw error;
-		fd = openRegularFileNoSymlink(path, constants.O_WRONLY | constants.O_APPEND);
+		fd = openRegularFileNoSymlink(
+			path,
+			(options.requireTerminatedTail === true ? constants.O_RDWR : constants.O_WRONLY) | constants.O_APPEND,
+		);
 	}
 	try {
 		const stats = fstatSync(fd);
 		if (!stats.isFile()) throw new Error(`Refusing to use non-regular private file: ${path}`);
+		// K3P-45 on the append descriptor: one pread of the last byte on the fd we
+		// are about to append through, instead of a separate stat/open/read/close
+		// pass (3 fewer syscalls) and without a window between the check and the
+		// write (perfB③).
+		if (options.requireTerminatedTail === true && stats.size > 0 && !fdEndsWithNewline(fd, stats.size)) {
+			throw new UnterminatedTailError(path);
+		}
+
 		// The fstat is already paid for, so only chmod when the mode actually drifted.
 		// win32 keeps the unconditional chmod: its mode bits do not report 0600.
 		if (process.platform === "win32" || (stats.mode & 0o777) !== PRIVATE_FILE_MODE) {
