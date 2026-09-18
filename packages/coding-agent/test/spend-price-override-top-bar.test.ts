@@ -87,4 +87,44 @@ describe("top bar spend under a price override", () => {
 			expect(reportedCost(mode)).toEqual({ sessionId: "session-1", total: 1.01 });
 		});
 	});
+	it("clamps the header at zero when the correction outruns an attribution-gap total", async () => {
+		// Attribution-gap tree: the child's recorded money never reached
+		// root.totalUsage (parent lookup miss), so zeroing its rate makes the
+		// additive correction -5 against a recorded 0.01. Publishing -4.99
+		// would show wrong money; the header clamps at zero instead.
+		const child: ContextTreeNode = {
+			id: "sub-gap",
+			label: "worker",
+			status: "done",
+			model: { provider: "bailian", id: "kimi-k3" },
+			ownUsage: usage(1_000_000, 0, 5),
+			totalUsage: usage(1_000_000, 0, 5),
+			children: [],
+		};
+		const tree: ContextTreeNode = {
+			id: "root",
+			label: "main agent",
+			status: "active",
+			model: { provider: "anthropic", id: "claude-sonnet-4-5" },
+			ownUsage: usage(900, 100, 0.01),
+			totalUsage: usage(900, 100, 0.01),
+			children: [child],
+		};
+		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
+		Object.assign(mode, {
+			topBarCostRefresh: { generation: 0, lastSuccessGeneration: 0 },
+			connectionState: { sessionId: "session-gap" },
+			agentConnection: { getContextTree: vi.fn(async () => tree) },
+			uiServices: {
+				settingsManager: { getSubagentSpendCellPriceOverrides: () => ({ "bailian/kimi-k3": { input: 0 } }) },
+				modelRegistry: { find: vi.fn(() => ({ cost: MODELS_JSON_RATES })) },
+			},
+			ui: { requestRender: vi.fn() },
+		});
+		const refresh = Reflect.get(InteractiveMode.prototype, "refreshTopBarCost") as (this: typeof mode) => void;
+		refresh.call(mode);
+		await vi.waitFor(() => {
+			expect(reportedCost(mode)).toEqual({ sessionId: "session-gap", total: 0 });
+		});
+	});
 });

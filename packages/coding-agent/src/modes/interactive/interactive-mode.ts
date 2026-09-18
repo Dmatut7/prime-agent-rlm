@@ -1661,9 +1661,14 @@ export class InteractiveMode {
 			try {
 				const tree = await connection.getContextTree();
 				const recorded = tree?.totalUsage?.cost?.total;
+				// The additive correction can outrun the recorded total on an
+				// attribution-gap tree (a child whose money never reached
+				// root.totalUsage because the parent lookup missed): publishing
+				// a negative header figure would show wrong money, so clamp at
+				// zero (review-price FAIL-1).
 				const total =
 					tree && typeof recorded === "number"
-						? recorded + spendOverrideCorrection(tree, this.spendPricing())
+						? Math.max(0, recorded + spendOverrideCorrection(tree, this.spendPricing()))
 						: recorded;
 				if (
 					typeof total !== "number" ||
