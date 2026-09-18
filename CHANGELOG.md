@@ -12,7 +12,7 @@
 - **会话写入漏点补齐**：append/fork 热路径的短写补齐 4 处漏点，会话文件不再可能"写一半丢记录"。
 - **孤儿 worker 回收**：无主 worker 有界回收；闸门用"有活会话或有在跑的子代理"判定，不会误杀长跑脚本。
 - **内核崩溃日志落盘**：stderr 中继 + 写预算 + 轮转 + 双配额，出事能查因。
-- **中断后发排队消息**：`abort_and_send_queued`（协议 schema 38 起），Esc 中断时可把已排队消息一并发出；老 daemon 退化但会响亮说明。
+- **中断后发排队消息**：`abort_and_send_queued`（协议 schema 38 起），Esc 中断时可把已排队消息一并发出；老 daemon 退化为普通中断，并在聊天区给一行 ⚠ 说明「已中断、排队消息仍在队列、下次提交时发出」（不只是写日志）。
 - **非交互 stdin 守卫**：脚本/管道调用不再因为等 stdin 挂住。
 - **shell 非交互默认值**：非交互环境的终端变量默认值收敛，不再污染输出。
 - **全屏顶栏与输入高亮**：top-bar 接线、prompt-highlight token 高亮进编辑器与排队预览。
@@ -43,7 +43,7 @@
 - `session_recovering` 结构化错误需整批 #2028（105 文件）才有意义，只摘协议行会得到永不产生的错误码。
 - `createHarness` 不隔离 agent dir（测试会渲染开发机真库，700+ 测试面，另开一笔）。
 - `build-binaries.yml` 的活体发布面未裁决，故仍**禁推 `v*` 标签**。
-- 升级那一次重启窗口内旧快照无 priority 字段，已排队的 human steer/followUp 会一次性降成 background（已知、不改实现）。
+- 升级那一次重启窗口内，#2334 之前写的快照没有 priority 字段，恢复时按记录的 source 与信封**重导出**（不是一律降档）：TUI 提交排队的输入（source=interactive，含 steer 与 follow-up 两条 lane）保持 user，不会被机器流量插队；记成 internal 的行（RPC/daemon `steer`/`follow_up` 命令走的 steer()/followUp() API，以及子代理回执/心跳等机器流量）落 background。已知、不改实现；针见 test/suite/regressions/2334-human-priority-lane-scoped.test.ts。
 
 
 ## 历史更新（fork 未单独发版期间，按施工日期记）
