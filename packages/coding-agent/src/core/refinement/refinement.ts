@@ -365,20 +365,53 @@ function entryRecency(entry: HarnessEntry): string {
 }
 
 /**
+ * Locale-independent three-way string compare (code-unit order: a < b -> -1,
+ * a > b -> 1, equal -> 0).
+ *
+ * The tie-breaks it serves claim to be stable ("an ordering that drifts
+ * between turns would invalidate the prompt cache"), but `localeCompare`
+ * without an explicit locale resolves its collator from the process
+ * environment and flips the order of non-ASCII keys across machines:
+ * `"修复登录".localeCompare("登录故障")` is -1 under `LC_ALL=C`/`en_US.UTF-8`
+ * and +1 under `LC_ALL=zh_CN.UTF-8` (Node ICU resolves it as zh-CN), and
+ * Chinese ids are real data, not a synthetic case (`_slug` keeps CJK titles
+ * as CJK ids and production stores already hold them). Three call sites are
+ * load-bearing for that stability: this function's id/scope keys (injection
+ * order), the ranked-window tie-break in `rankHarnessEntriesWithRelevance`
+ * (window order drifting by LANG defeats the #2098 prompt-prefix cache), and
+ * `harnessDigestFingerprint`'s material sort (the fingerprint itself must not
+ * move with LANG, or two agents with different LANGs disagree about digest
+ * freshness and re-deliver each other's digests). The remaining two keys
+ * (ISO-8601 recency strings, "global"/"local" scopes) are always ASCII in
+ * practice and switch only for uniformity, so no future key shape change
+ * reintroduces a half-locale dependency. `Intl.Collator` was rejected on the
+ * same grounds: still locale-data dependent, with a wider option surface;
+ * plain code-unit order is total, cheap, and identical in every process.
+ */
+function compareCodePoints(a: string, b: string): number {
+	if (a < b) return -1;
+	if (a > b) return 1;
+	return 0;
+}
+
+/**
  * Injection order is "most recently updated first", with the id as a tie-break so the
  * same state always renders the same text: an ordering that drifts between turns would
  * invalidate the prompt cache and let a fresh fact fall out of view.
  */
 function compareEntriesForInjection(a: HarnessEntry, b: HarnessEntry): number {
-	const recency = entryRecency(b).localeCompare(entryRecency(a));
+	// ISO-8601 is ASCII, so this key is locale-invariant in practice; switched
+	// for uniformity with the code-point order every other tie-break uses.
+	const recency = compareCodePoints(entryRecency(b), entryRecency(a));
 	if (recency !== 0) {
 		return recency;
 	}
-	const byId = String(a.id ?? "").localeCompare(String(b.id ?? ""));
+	const byId = compareCodePoints(String(a.id ?? ""), String(b.id ?? ""));
 	if (byId !== 0) {
 		return byId;
 	}
-	return (a.scope ?? "").localeCompare(b.scope ?? "");
+	// "global"/"local" only, so ASCII in practice; same uniformity note as recency.
+	return compareCodePoints(a.scope ?? "", b.scope ?? "");
 }
 
 function entriesForInjection(state: HarnessState, kind: RefinementKind): HarnessEntry[] {
@@ -1019,7 +1052,7 @@ function rankHarnessEntriesWithRelevance(entries: HarnessEntry[], terms: Harness
 		// Tie-break on the stable identifier order only: calling a score
 		// comparator here would recompute both sides' scores on every
 		// comparison and reintroduce the O(N log N) full-text sweep.
-		return rankedIdentifier(x.entry).localeCompare(rankedIdentifier(y.entry));
+		return compareCodePoints(rankedIdentifier(x.entry), rankedIdentifier(y.entry));
 	});
 	// The sort is score-descending, so the first element holds the maximum.
 	return { entries: scored.map((item) => item.entry), anyEntryScored: scored.length > 0 && scored[0].score > 0 };
@@ -1220,7 +1253,7 @@ export function harnessDigestFingerprint(
 			reference: entry.kind === "skill" ? entry.reference : undefined,
 			arguments: entry.kind === "skill" ? entry.arguments : undefined,
 		}))
-		.sort((a, b) => [a.scope, a.kind, a.id].join("\0").localeCompare([b.scope, b.kind, b.id].join("\0")));
+		.sort((a, b) => compareCodePoints([a.scope, a.kind, a.id].join("\0"), [b.scope, b.kind, b.id].join("\0")));
 	// Refinements keep their stored order: the formatter renders the newest
 	// tail of the array, so an order-only change renders differently and must
 	// not reuse the previous digest.
