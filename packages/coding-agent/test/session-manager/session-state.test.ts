@@ -235,6 +235,38 @@ describe("SessionManager session state", () => {
 		}
 	});
 
+	it("repairs a tail torn after open, then appends through the same descriptor's check", () => {
+		// perfB③: the K3P-45 tail check rides the append descriptor now. A crash
+		// since open can leave a torn tail behind the flushed state; the persist
+		// path must catch the refusal, repair, and land the entry - never glue the
+		// new record onto the torn one.
+		const tempDir = mkdtempSync(join(tmpdir(), "session-state-torn-append-"));
+		try {
+			const cwd = join(tempDir, "project");
+			const sessionDir = join(tempDir, "sessions");
+			const session = SessionManager.create(cwd, sessionDir);
+
+			session.appendMessage(userMsg("hello"));
+			session.appendMessage(assistantMsg("hi"));
+			const sessionFile = session.getSessionFile();
+			expect(sessionFile).toBeDefined();
+			expect(existsSync(sessionFile!)).toBe(true);
+
+			// A crash between records leaves a torn final line (no terminator).
+			appendFileSync(sessionFile!, '{"type":"message","id":"torn"');
+
+			session.appendSessionState({ status: "archived" });
+
+			// The torn tail was repaired away and the new entry landed after the two
+			// intact messages; nothing glued onto the torn line.
+			const entries = loadEntriesFromFile(sessionFile!);
+			expect(entries.filter((entry) => entry.type === "message")).toHaveLength(2);
+			expect(entries.filter((entry) => entry.type === "session_state")).toHaveLength(1);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("rewrites the full session if the session file disappears after flushing", () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "session-state-missing-file-"));
 		try {
