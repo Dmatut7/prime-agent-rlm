@@ -514,3 +514,111 @@ describe("ContextTreeDiskScanCache budget window", () => {
 		// above reads the stale 0.1.
 	});
 });
+
+/** A child whose branch declares a model, so a catalog move is visible in its subtree key. */
+function writeChildWithModel(parentDir: string, name: string, cost: number): string {
+	const dir = join(parentDir, name);
+	mkdirSync(dir, { recursive: true });
+	const modelChange = JSON.stringify({
+		type: "model_change",
+		id: "m1",
+		parentId: null,
+		timestamp: new Date().toISOString(),
+		provider: "anthropic",
+		modelId: "claude-sonnet-4-5",
+	});
+	writeFileSync(join(dir, "session.jsonl"), `${sessionHeader(name)}${modelChange}\n${turn("u1", "m1", cost)}`);
+	return dir;
+}
+
+describe("ContextTreeDiskScanCache store gate", () => {
+	it("stores nothing for a bypassed dir whose busy record was evicted before the store", () => {
+		const root = makeTempDir();
+		const child = writeChildDir(root, "sub-aaaa1111", 0.1);
+		// One entry per level is the whole point: the busy record a take leaves behind is
+		// exactly what the next `recordSubtreeMiss` of the same scan evicts, so a gate that
+		// reads that record cannot survive from the take to the store. The scan's fingerprint
+		// memo can: it is a plain Map owned by the walk, so it is not bounded at all.
+		const cache = new ContextTreeDiskScanCache({ maxEntries: 1, busyMissThreshold: 1, busyCooldownMs: 60_000 });
+
+		scan(root, cache);
+		// The root and its one leaf frame both probed and both stored.
+		expect(cache.stats.subtreeStores).toBe(2);
+
+		// The leaf's entry is the survivor of the ceiling above, so this scan hits on it and
+		// misses on the root (whose entry the store just evicted): one miss, which arms the
+		// root's cooldown, and one store. Nothing else touches the busy level, so the root's
+		// record is what is alive when the next scan asks.
+		scan(root, cache);
+		expect(cache.stats.subtreeBypasses).toBe(0);
+		expect(cache.stats.subtreeStores).toBe(3);
+		// The gate is not a blanket refusal to store: two of the three stores above are the
+		// same leaf and root frames a bypass-less scan stores.
+
+		// The child appends. The root's take is inside its cooldown, so it is bypassed: no
+		// fingerprint taken, and therefore no key to store under. The leaf frame then misses
+		// (its entry was evicted by the store above) and its own `recordSubtreeMiss` evicts the
+		// root's busy record - by the store phase nothing is left that says the root was
+		// bypassed, except the memo.
+		appendTurn(child, 0.4);
+		const afterAppend = totalCost(scan(root, cache));
+		expect(cache.stats.subtreeBypasses).toBe(1);
+		// Only the leaf frame stored. The bypassed root stored nothing, so it cannot be served
+		// later under a fingerprint taken after the disk was read.
+		expect(cache.stats.subtreeStores).toBe(4);
+		// A bypass walks the disk, so the gate costs no freshness: the appended turn is there.
+		expect(afterAppend).toBeCloseTo(0.5, 5);
+		// Mutation: gating on the busy record's `bypassed` flag finds the record evicted and
+		// stores the bypassed root anyway, under a fingerprint taken *after* the walk - so
+		// subtreeStores reads 5 here and the next scan can hit nodes that predate their key.
+	});
+});
+
+describe("ContextTreeDiskScanCache catalog moves", () => {
+	it("counts a moved model window as a miss without calling the dir busy", () => {
+		const root = makeTempDir();
+		const child = writeChildWithModel(root, "sub-aaaa1111", 0.1);
+		let window = 200_000;
+		const resolver = (): number => window;
+		const cache = new ContextTreeDiskScanCache();
+		const scanWith = (): ContextTreeNode[] =>
+			loadContextTreeChildrenFromDisk(root, resolver, undefined, undefined, cache);
+
+		const first = scanWith();
+		expect(first[0].contextUsage?.contextWindow).toBe(200_000);
+		const missesAfterFirst = cache.stats.subtreeMisses;
+
+		// The catalog moves under a family that is perfectly still. The fingerprint matches, so
+		// the entry is found, and its model window is not what the resolver now says: the
+		// percentages have to be re-derived rather than served with the old denominator.
+		window = 400_000;
+		const second = scanWith();
+		expect(second[0].contextUsage?.contextWindow).toBe(400_000);
+		expect(second[0].ownUsage.cost.total).toBeCloseTo(0.1, 5);
+		// One miss for the one frame whose window moved; the leaf frame below it holds no model
+		// and hits. And no bypass: a catalog that moved says nothing about this dir appending.
+		expect(cache.stats.subtreeMisses).toBe(missesAfterFirst + 1);
+		expect(cache.stats.subtreeBypasses).toBe(0);
+
+		// Nothing moved on disk, so the family is served again: a catalog move must not switch a
+		// still family off the cache, which is what arming the cooldown would have done.
+		const hitsBefore = cache.stats.subtreeHits;
+		const third = scanWith();
+		expect(third[0].contextUsage?.contextWindow).toBe(400_000);
+		expect(cache.stats.subtreeHits).toBeGreaterThan(hitsBefore);
+		expect(cache.stats.subtreeBypasses).toBe(0);
+		// Mutation: feeding the window mismatch to `recordSubtreeMiss` as well reaches the
+		// threshold of 2 with the first scan's ordinary miss, so this third scan is bypassed
+		// instead of a hit and subtreeBypasses reads 1. Deleting the shared `recordSubtreeMiss`
+		// call outright is not the fix either: it also feeds the "no entry at all" miss, and
+		// the two busy-family pins above then read subtreeBypasses 0 instead of 6 and 2.
+
+		// Positive control, so the zeros above are not a bypass that can never arm: the same
+		// cache bypasses a family that really does keep moving.
+		for (let tick = 0; tick < 3; tick++) {
+			appendTurn(child, 1 + tick);
+			scanWith();
+		}
+		expect(cache.stats.subtreeBypasses).toBeGreaterThan(0);
+	});
+});
