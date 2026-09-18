@@ -802,6 +802,25 @@ export interface AgentConnectionHeadlessCompletionOptions {
 	waitForRlmQuiescence?: boolean;
 }
 
+/**
+ * Why an abort-and-send-queued came back as a plain abort. `capability` is a peer that never
+ * advertised abort_and_send_queued; `unknown-command` is one that advertised it but answered
+ * "Unknown daemon command" (a peer whose capability list is newer than its command table).
+ */
+export type AgentConnectionAbortAndSendQueuedDegradation = "capability" | "unknown-command";
+
+/**
+ * Outcome of an interrupt that was asked to carry the queued messages out with it. `degraded` is
+ * the caller's only view of the narrower outcome - the run was aborted, the queue stayed queued -
+ * and it exists because a diagnostic log line is not a notice: the person who pressed the interrupt
+ * key never reads the daemon-connection log, and left uninformed they conclude the interrupt
+ * swallowed their words and type them again (P5 ruling, docs/fork/merge-upstream-20260917.md §13.4
+ * asks for a warn-level notice on exactly this path).
+ */
+export interface AgentConnectionAbortAndSendQueuedResult {
+	degraded?: AgentConnectionAbortAndSendQueuedDegradation;
+}
+
 export interface AgentConnectionDisposeOptions {
 	/**
 	 * Leave the session and its still-running RLM descendants alive instead of
@@ -918,8 +937,12 @@ export interface AgentConnection {
 	steer(message: string, images?: ImageContent[]): Promise<void>;
 	followUp(message: string, images?: ImageContent[]): Promise<void>;
 	abort(): Promise<void>;
-	/** Abort the active run and start all queued user steering together in one new turn; abort-only when the queue is empty. */
-	abortAndSendQueued(): Promise<void>;
+	/**
+	 * Abort the active run and start all queued user steering together in one new turn;
+	 * abort-only when the queue is empty. A peer too old for the command still aborts, and says so
+	 * through `degraded` instead of leaving the caller to guess why the queue is still there.
+	 */
+	abortAndSendQueued(): Promise<AgentConnectionAbortAndSendQueuedResult>;
 	cancelRlmChild(childId: string): Promise<boolean>;
 	waitForIdle(): Promise<void>;
 	waitForHeadlessCompletion(options?: AgentConnectionHeadlessCompletionOptions): Promise<HeadlessCompletionResult>;

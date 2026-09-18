@@ -3275,25 +3275,27 @@ describe("DaemonAgentConnection", () => {
 		//   (b) capability advertised but the command answers "Unknown daemon command"
 		//       (a peer that computes its capability list from a newer build than its
 		//       command table) -> same fallback, so a mixed pair degrades instead of failing.
-		// The fallback is deliberately degrade-but-log, not a silent catch: the queued
-		// messages then stay queued, and daemon-agent-connection.ts writes a
-		// daemon-connection diagnostic line for it (P5 ruling, merge-doc SS11.4).
+		// The fallback is deliberately degrade-and-report, not a silent catch: the queued
+		// messages then stay queued, and daemon-agent-connection.ts both writes a
+		// daemon-connection diagnostic line for it and returns the reason, because a log file
+		// is not a notice - the caller of the interrupt key owes the user a warning that their
+		// queued words did not go out (P5 ruling, merge-upstream-20260917.md SS13.4).
 		const send = (client: FakeDaemonClient) =>
 			new DaemonAgentConnection(asDaemonClient(client), "active-1").abortAndSendQueued();
 
 		const capable = new FakeDaemonClient();
 		capable.serverCapabilities.add("abort_and_send_queued");
-		await expect(send(capable)).resolves.toBeUndefined();
+		await expect(send(capable)).resolves.toEqual({});
 		expect(capable.requests).toEqual([{ type: "abort_and_send_queued", activeSessionId: "active-1" }]);
 
 		const older = new FakeDaemonClient();
-		await expect(send(older)).resolves.toBeUndefined();
+		await expect(send(older)).resolves.toEqual({ degraded: "capability" });
 		expect(older.requests).toEqual([{ type: "abort", activeSessionId: "active-1" }]);
 
 		const stale = new FakeDaemonClient();
 		stale.abortAndSendQueuedUnknownCommand = true;
 		stale.serverCapabilities.add("abort_and_send_queued");
-		await expect(send(stale)).resolves.toBeUndefined();
+		await expect(send(stale)).resolves.toEqual({ degraded: "unknown-command" });
 		expect(stale.requests.map(({ type }) => type)).toEqual(["abort_and_send_queued", "abort"]);
 	});
 

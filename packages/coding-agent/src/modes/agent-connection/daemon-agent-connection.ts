@@ -58,6 +58,7 @@ import {
 import type { HeadlessCompletionResult } from "../headless-completion.js";
 import type {
 	AgentConnection,
+	AgentConnectionAbortAndSendQueuedResult,
 	AgentConnectionBeforeSessionInvalidateListener,
 	AgentConnectionDisposeOptions,
 	AgentConnectionDisposeOutcome,
@@ -1335,31 +1336,36 @@ export class DaemonAgentConnection implements AgentConnection {
 	/**
 	 * Abort the active run and start every queued user steering message in one new turn.
 	 *
-	 * Degradation is loud, not silent (P5 ruling, merge-doc SS11.4): a daemon without
-	 * abort_and_send_queued can only be asked for a plain abort, and the queued messages
-	 * then stay queued. The caller asked for a different outcome and would otherwise
-	 * never learn it got the narrower one, so the fallback logs the same
-	 * daemon-connection diagnostic line the roster degradation uses. The
-	 * abort_and_clear_queue precedent keeps its own shape (a loud refusal) because that
-	 * command answers with visible data while this one's effect is a side effect.
+	 * Degradation is loud, not silent (P5 ruling, merge-upstream-20260917.md §13.4): a daemon
+	 * without abort_and_send_queued can only be asked for a plain abort, and the queued messages
+	 * then stay queued. The caller asked for a different outcome and would otherwise never learn
+	 * it got the narrower one, so the fallback does both halves of "loud": it logs the same
+	 * daemon-connection diagnostic line the roster degradation uses, and it reports `degraded` so
+	 * the caller can put a warning in front of the user. The log half alone is not a notice - the
+	 * person who pressed the interrupt key never reads ~/.prime/agent/log, and left uninformed they
+	 * conclude the interrupt ate their words and type them again. The abort_and_clear_queue
+	 * precedent keeps its own shape (a loud refusal) because that command answers with visible data
+	 * while this one's effect is a side effect: throwing here would report the abort itself, which
+	 * did happen, as the failure.
 	 */
-	async abortAndSendQueued(): Promise<void> {
+	async abortAndSendQueued(): Promise<AgentConnectionAbortAndSendQueuedResult> {
 		if (!this.client.supportsServerCapability("abort_and_send_queued")) {
 			this.logConnection(
 				"abort-and-send-queued degraded: daemon did not advertise the capability; queued messages stay queued",
 			);
 			await this.abort();
-			return;
+			return { degraded: "capability" };
 		}
 		try {
 			await this.requestOk({ type: "abort_and_send_queued", activeSessionId: this.activeSessionId });
+			return {};
 		} catch (error) {
 			if (isUnknownDaemonCommandError(error, "abort_and_send_queued")) {
 				this.logConnection(
 					"abort-and-send-queued degraded: daemon answered Unknown daemon command; queued messages stay queued",
 				);
 				await this.abort();
-				return;
+				return { degraded: "unknown-command" };
 			}
 			throw error;
 		}

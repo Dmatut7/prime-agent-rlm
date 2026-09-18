@@ -31,6 +31,7 @@ import {
 import { createAgentConnectionToolDefinition } from "./tool-definition.js";
 import type {
 	AgentConnection,
+	AgentConnectionAbortAndSendQueuedResult,
 	AgentConnectionBeforeSessionInvalidateListener,
 	AgentConnectionDisposeOptions,
 	AgentConnectionDisposeOutcome,
@@ -445,8 +446,12 @@ export class InProcessAgentConnection implements AgentConnection {
 		this.session.requestAbort();
 	}
 
-	async abortAndSendQueued(): Promise<void> {
+	async abortAndSendQueued(): Promise<AgentConnectionAbortAndSendQueuedResult> {
+		// In-process there is no peer that could be too old for the command: the session either
+		// carries the queued steering out with the interrupt or the queue was empty, and an empty
+		// queue is the documented abort-only case, not a degradation.
 		this.session.abortAndSendQueued();
+		return {};
 	}
 
 	async cancelRlmChild(childId: string): Promise<boolean> {
