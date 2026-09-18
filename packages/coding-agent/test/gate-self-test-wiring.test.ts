@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -15,6 +16,12 @@ import { describe, expect, it } from "vitest";
  * invoked by an aggregate (a workflow step, `check:ci-honesty`, or the pre-push gate), and the
  * aggregate that runs it is asserted by name. Deleting the invocation is how an instrument rots,
  * and that is exactly what this test refuses.
+ *
+ * The second half refuses the quieter rot: an instrument that runs but cannot prove anything, and
+ * does not say so. The `test-hygiene` job runs `node scripts/check-browser-smoke.mjs --self-test`
+ * and never runs `npm ci`, so that step died on `Error [ERR_MODULE_NOT_FOUND]: Cannot find package
+ * 'esbuild'` with exit 1 - a red that reads like "a planted drift was not caught" while meaning
+ * "this runner had no node_modules", and the bundle reds were never planted there at all.
  */
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
@@ -107,6 +114,100 @@ describe("every self-test this repository relies on is reachable from an aggrega
 			if (script === undefined) continue;
 			const probe = spawnSync("test", ["-e", join(repoRoot, script)]);
 			expect(probe.status, `${script} is listed as an instrument but does not exist`).toBe(0);
+		}
+	});
+});
+
+const browserSmokeScript = join(repoRoot, "scripts", "check-browser-smoke.mjs");
+
+/** Node's own answer for a bare specifier resolved from `cwd`, which is how `-e` code resolves one. */
+function importProbe(cwd: string, specifier: string): { status: number | null; output: string } {
+	const result = spawnSync(
+		process.execPath,
+		["--input-type=module", "-e", `await import(${JSON.stringify(specifier)})`],
+		{
+			cwd,
+			encoding: "utf8",
+		},
+	);
+	return { status: result.status, output: `${result.stdout}${result.stderr}` };
+}
+
+/**
+ * A copy of the bundle gate sitting in a directory whose nearest `node_modules` holds an `esbuild`
+ * whose main file does not exist: the resolution failure a job that never ran `npm ci` gets, made
+ * deterministic (a nearer `node_modules` always wins over the repository's own), and without
+ * touching the checkout's install.
+ */
+function withoutBundleDependency(): { root: string; script: string } {
+	const root = mkdtempSync(join(tmpdir(), "browser-smoke-without-deps-"));
+	mkdirSync(join(root, "node_modules", "esbuild"), { recursive: true });
+	writeFileSync(
+		join(root, "node_modules", "esbuild", "package.json"),
+		JSON.stringify({ name: "esbuild", version: "0.0.0", type: "module", main: "missing.js" }),
+	);
+	const script = join(root, "scripts", "check-browser-smoke.mjs");
+	mkdirSync(dirname(script), { recursive: true });
+	copyFileSync(browserSmokeScript, script);
+	return { root, script };
+}
+
+function runBrowserSmoke(script: string, args: string[]): { status: number | null; stdout: string; stderr: string } {
+	const result = spawnSync(process.execPath, [script, ...args], { encoding: "utf8" });
+	return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+}
+
+describe("a self-test whose aggregate installs nothing says so instead of dying", () => {
+	it("the fixture really makes the dependency unresolvable, and this repository really has it", () => {
+		const fixture = withoutBundleDependency();
+		try {
+			const inFixture = importProbe(fixture.root, "esbuild");
+			expect(inFixture.status, `the fixture must break esbuild resolution:\n${inFixture.output}`).not.toBe(0);
+			const inRepo = importProbe(repoRoot, "esbuild");
+			expect(inRepo.status, `the repository's install must still resolve esbuild:\n${inRepo.output}`).toBe(0);
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	it("skips the legs that need a bundle, loudly and counted, and still runs the ones that do not", () => {
+		const fixture = withoutBundleDependency();
+		try {
+			const run = runBrowserSmoke(fixture.script, ["--self-test"]);
+			expect(run.status, `expected a skip, not a failure:\n${run.stdout}\n${run.stderr}`).toBe(0);
+			expect(run.stderr, "the missing dependency must not reach the operator as a node crash").toBe("");
+			// Loud: one SKIP line per bundle leg, each naming the package and the resolution failure.
+			const skips = run.stdout.match(/^SKIP /gm) ?? [];
+			expect(skips.length, "exactly the six bundle-planting legs need the dependency").toBe(6);
+			expect(run.stdout).toContain('the bundle dependency "esbuild" is not installed');
+			// Counted: the tally separates what ran from what could not, and nothing else is red.
+			expect(run.stdout).toContain("6 skipped");
+			expect(run.stdout).not.toMatch(/^FAIL /m);
+			expect(run.stdout).toContain("0 mismatch(es)");
+			// The legs that need no bundle still ran and still judged something.
+			expect(run.stdout).toContain("ok   the dependency notice names the package");
+			expect(run.stdout).toContain("ok   an unresolvable bundle dependency is reported as a value");
+			// And the verdict says how much of itself it managed to prove.
+			expect(run.stdout).toContain("check-browser-smoke self-test: OK (6 of 9 legs skipped");
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	it("the gate itself never answers green when it cannot look at a bundle at all", () => {
+		const fixture = withoutBundleDependency();
+		try {
+			const run = runBrowserSmoke(fixture.script, []);
+			expect(run.status, `expected the refusal exit code, not a crash:\n${run.stdout}\n${run.stderr}`).toBe(2);
+			expect(run.stderr).toContain(
+				'Browser smoke check cannot run: the bundle dependency "esbuild" is not installed',
+			);
+			expect(run.stderr).toContain("npm ci");
+			// "cannot run" must not be dressed up as the gate's own red, or as a green silence.
+			expect(run.stderr).not.toContain("Browser smoke check failed");
+			expect(run.stdout).toBe("");
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
 		}
 	});
 });
