@@ -12,6 +12,7 @@ import {
 	HARNESS_DIGEST_CUSTOM_TYPE,
 	isCompactionOutcomeMessage,
 	isSessionSlashCommandResultMessage,
+	REFINEMENT_NOTICE_CUSTOM_TYPE,
 	REFINEMENT_OUTCOME_CUSTOM_TYPE,
 	type SessionSlashCommandResultMessage,
 } from "../core/messages.js";
@@ -41,11 +42,15 @@ export function selectHeadlessTerminalResult(messages: readonly AgentMessage[]):
 		// without letting it hide earlier valid outcomes or their failure status.
 		// The boundary-injected harness digest is skipped for the same reason: a
 		// resume appends it at the tail, and it is never the saved final output.
+		// The refinement-notice vocabulary is skipped as defense in depth: this
+		// fork has no producer for it, but a journal written by an upstream build
+		// could carry one, and a notice is never the saved final output either.
 		if (
 			message.role === "custom" &&
 			(message.customType === COMPACTION_OUTCOME_CUSTOM_TYPE ||
 				message.customType === REFINEMENT_OUTCOME_CUSTOM_TYPE ||
-				message.customType === HARNESS_DIGEST_CUSTOM_TYPE)
+				message.customType === HARNESS_DIGEST_CUSTOM_TYPE ||
+				message.customType === REFINEMENT_NOTICE_CUSTOM_TYPE)
 		) {
 			index--;
 			continue;
