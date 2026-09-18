@@ -34,6 +34,14 @@ export interface WorkerRecoveryRecord {
  */
 export const COMPACT_AFTER_RECORDS = 4096;
 export const COMPACT_AFTER_BYTES = 4 * 1024 * 1024;
+/**
+ * Idle workers still compact - that is what keeps an idle journal bounded - but
+ * the rewrite does not have to happen on every single record: one per this many
+ * records leaves at most this many lines on disk while idle and turns a
+ * per-record rewrite+fsync+rename (measured ~3.8ms apiece, perfB B1-6) into one
+ * every N records (perfB④).
+ */
+export const IDLE_COMPACT_AFTER_RECORDS = 8;
 
 const structuredLog = getLogger("coding-agent.daemon.worker-recovery-journal");
 
@@ -173,7 +181,11 @@ export class WorkerRecoveryJournal {
 
 	/** Counters keep this off the per-record path: no walk over every session. */
 	private shouldCompact(): boolean {
-		return this.busyCount === 0 || this.lineCount >= COMPACT_AFTER_RECORDS || this.byteLength >= COMPACT_AFTER_BYTES;
+		return (
+			(this.busyCount === 0 && this.lineCount >= IDLE_COMPACT_AFTER_RECORDS) ||
+			this.lineCount >= COMPACT_AFTER_RECORDS ||
+			this.byteLength >= COMPACT_AFTER_BYTES
+		);
 	}
 
 	getLatest(): WorkerRecoveryRecord[] {
