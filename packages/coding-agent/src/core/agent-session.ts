@@ -1181,13 +1181,14 @@ const IPYTHON_SENT_AGENT_MESSAGE_CUSTOM_ENTRY = "ipython_sent_agent_message";
 const THRESHOLD_COMPACTION_RETRY_MIN_NEW_ENTRIES = 5;
 
 /**
- * How long a compaction may hold queued agent messages before the admission gate
- * aborts it and lets them through.
+ * How long a compaction may hold queued input before the session aborts it and lets
+ * that input through.
  *
  * The stall watchdog cannot be this bound: it ships warn-only (`abortAfterSeconds`
  * defaults to 0) and it snoozes while a host phase owns the turn boundary, which
  * compaction does. Without a bound of its own, a gate that ranks compaction above
- * agent messages would turn one hung summarization call into a starved family. Two
+ * agent messages would turn one hung summarization call into a starved family - and
+ * a person typing during one would wait it out with no upper bound at all. Two
  * times the default provider stream-stall timeout, so a genuinely slow 1M-token
  * summary still finishes while a wedged stream is cut.
  */
@@ -2122,7 +2123,7 @@ export class AgentSession {
 	// must treat it differently from abortCompaction()/requestAbort().
 	private _autoCompactionPreemptedByManual: AbortController | undefined = undefined;
 	private _compactionOperation: Promise<void> | undefined = undefined;
-	/** Timer that aborts a compaction holding queued agent messages for too long. */
+	/** Timer that aborts a compaction holding queued input for too long. */
 	private _compactionGateWatchdog: ReturnType<typeof setTimeout> | undefined = undefined;
 	/** In-flight manual compact() (r25-1): synchronous admission for mutual exclusion. */
 	private _manualCompactionInFlight:
@@ -7268,15 +7269,26 @@ export class AgentSession {
 		// makes the channel itself the structural fact - every source that can reach this
 		// point (interactive, rpc, extension, internal, unspecified) classifies with origin
 		// "agent", because the classifier's agent-message rule fires before any human
-		// marking. `system_fence` is a context flag that `incomingInputFactsFromMessage`
-		// never sets, so that half is unreachable the same way. Deleting this line is
-		// therefore not observable (measured: the 27 compaction/priority pin cases stay
-		// green with it removed), and it is kept because `compaction-during-child-reply`
-		// states the stand-down as a contract, not because a pin holds it. The observable
-		// half - a human prompt is never gated, and human priority never preempts a
-		// running compaction - is pinned in `2334-human-priority-lane-scoped.test.ts`. If a
-		// reachable human entry ever appears (most likely by moving this ruling into
+		// marking. `system_fence` needs `facts.isSystemFence`, which only a caller-side
+		// context can supply and the context literal above never does, so that half is
+		// unreachable the same way. Deleting this line is therefore not observable
+		// (re-measured with the two admission-bound rows in place: the 29
+		// compaction/priority pin cases - 22 in `compaction-input-priority-matrix` and 7 in
+		// `2334-human-priority-lane-scoped` - stay green with it removed), and it is kept
+		// because `compaction-during-child-reply` states the stand-down as a contract, not
+		// because a pin holds it. The observable half - a human prompt is never gated, and
+		// human priority never preempts a running compaction - is pinned in
+		// `2334-human-priority-lane-scoped.test.ts` and by the matrix's two "admitted INTO a
+		// hung compaction" watchdog rows, which read `preflight.reason` as undefined for the
+		// human prompt while a child reply in the same window gets `compaction_pending`. If
+		// a reachable human entry ever appears (most likely by moving this ruling into
 		// `_admitSessionInput`, which every input passes through), pin it in the same commit.
+		//
+		// `_admitSessionInput` did grow a compaction-related call - it arms
+		// `_armCompactionGateWatchdog` for input admitted into a compaction that is already
+		// running - and that is deliberately NOT the move above: a ceiling neither ranks nor
+		// defers anything and does not route input through this function, so the caller set
+		// is still one entry wide and both halves of the next line stay unreachable.
 		if (inputClassOrigin(inputClass) === "human" || inputClass === "system_fence") return undefined;
 		if (this.isCompacting) return "compaction_in_flight";
 		// A turn in flight compacts at its own agent_end; starting a second compaction
@@ -7315,7 +7327,7 @@ export class AgentSession {
 	}
 
 	/**
-	 * Bound how long a compaction may hold queued agent messages.
+	 * Bound how long a compaction may hold queued input.
 	 *
 	 * The stall watchdog snoozes while a host phase owns the turn boundary
 	 * (stall-watchdog.ts: `isPaused()` covers compaction), so a hung summarization
@@ -7323,6 +7335,12 @@ export class AgentSession {
 	 * compaction first must not become a way to starve the family. After the
 	 * configured stall budget the compaction is aborted and the pump is scheduled, so
 	 * the queued input is delivered instead.
+	 *
+	 * One bound, three arming points, so that neither ordering leaves a gap: the
+	 * agent-message gate (it either starts the compaction or finds one running),
+	 * `_runAutoCompaction` (the work already queued when a compaction begins) and
+	 * `_admitSessionInput` (input admitted into a compaction that is already running,
+	 * which is how a person typing during a hung compaction used to wait forever).
 	 */
 	private _armCompactionGateWatchdog(): void {
 		if (this._compactionGateWatchdog !== undefined) return;
@@ -7330,14 +7348,14 @@ export class AgentSession {
 		if (!operation) return;
 		const configured = this.settingsManager.getStallWatchdogSettings().abortAfterSeconds;
 		// The stall watchdog ships warn-only (abortAfterSeconds 0), and it snoozes while
-		// compaction owns the turn boundary anyway, so the gate carries its own bound.
+		// compaction owns the turn boundary anyway, so this bound carries its own budget.
 		const abortAfterSeconds =
 			Number.isFinite(configured) && configured > 0 ? configured : COMPACTION_GATE_ABORT_AFTER_SECONDS;
 		const timer = setTimeout(() => {
 			this._compactionGateWatchdog = undefined;
 			if (this._disposed || this._disposing) return;
 			if (!this.isCompacting) return;
-			sessionLog.warn("compaction holding queued agent messages exceeded the stall budget; aborting it", {
+			sessionLog.warn("compaction holding queued input exceeded the stall budget; aborting it", {
 				sessionId: this.sessionId,
 				abortAfterSeconds,
 			});
@@ -9303,6 +9321,17 @@ export class AgentSession {
 		});
 		this._sessionInputArrivalEpoch++;
 		this._emitQueueUpdate();
+		// A running compaction defers every queued input (`canSelectSessionAction`), but
+		// only the work that was ALREADY waiting when the compaction started was bounded:
+		// `_runAutoCompaction` arms the gate watchdog from `hasPendingSessionWork`, and the
+		// agent-message gate arms it for its own channel. Input admitted *into* a running
+		// compaction had no bound, and the stall watchdog snoozes while compaction owns the
+		// turn boundary, so a wedged summarization call held it forever - the boss typing
+		// during a hung compaction is the observed case, and machine traffic (a heartbeat,
+		// a child terminal notice) stalls the same way. Admission is the one choke point
+		// every input passes through, so the bound is armed here and stops depending on
+		// which of the two happened first.
+		if (this.isCompacting) this._armCompactionGateWatchdog();
 		if (
 			!options.restore &&
 			options.wake !== false &&
