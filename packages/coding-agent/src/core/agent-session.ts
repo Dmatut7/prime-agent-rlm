@@ -2140,7 +2140,7 @@ export class AgentSession {
 	 * Entry keys this session already itemized for the model in a refinement receipt
 	 * (applied and refused), so a digest delta does not deliver the same news twice.
 	 */
-	private readonly _refinementReportedEntryKeys = new Set<string>();
+	private readonly _refinementReportedEntryVersions = new Map<string, number>();
 	private _bashAbortControllers = new Set<AbortController>();
 	private _userBashRunning = false;
 	private _userBashAbortRequested = false;
@@ -12521,7 +12521,10 @@ export class AgentSession {
 			// Every moved entry was already itemized for the model by this session's own
 			// refinement receipt (applied and refused alike), so a digest delta would
 			// deliver the same news twice (merge doc 14.2).
-			if (changed.size > 0 && [...changed].every((key) => this._refinementReportedEntryKeys.has(key))) {
+			if (
+				changed.size > 0 &&
+				[...changed].every((key) => this._refinementReportedEntryVersions.get(key) === fingerprint.get(key))
+			) {
 				return;
 			}
 		}
@@ -12876,7 +12879,11 @@ export class AgentSession {
 		const scope = result.scope ?? "local";
 		for (const edit of result.appliedEdits) {
 			const entry = edit.after ?? edit.before;
-			this._refinementReportedEntryKeys.add(`${edit.kind}:${entry?.scope ?? scope}:${edit.id}`);
+			// Version-aware on purpose: the receipt itemized THIS version, so a later bump
+			// by another writer is fresh news and must still re-inject (merge doc 12.2).
+			if (entry) {
+				this._refinementReportedEntryVersions.set(`${edit.kind}:${entry.scope ?? scope}:${edit.id}`, entry.version);
+			}
 		}
 		this._appendDurableRefineMessage(createRefinementOutcomeMessage(result));
 	}

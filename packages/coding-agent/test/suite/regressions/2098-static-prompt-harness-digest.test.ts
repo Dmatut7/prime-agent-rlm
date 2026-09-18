@@ -186,6 +186,28 @@ function seedEntry(
 	return;
 }
 
+/**
+ * Another writer's edit to an entry that already exists: the id stays, the version
+ * moves. This is the shape a sibling seat's refine leaves on a shared store.
+ */
+function bumpEntry(id: string, title: string, content: string): void {
+	const dir = getGlobalHarnessStateDir();
+	const state = loadHarnessState(dir, "global");
+	const result = applyRefinementProposal(
+		state,
+		{
+			summary: `external bump ${id}`,
+			rationale: "a different writer",
+			expectedOutcome: "the entry version moves",
+			edits: [{ action: "update", kind: "memory", id, title, content }],
+		},
+		{ id: `bump_${id}`, scope: "global" },
+	);
+	// A refused bump would leave the menu unmoved and both pins below would test nothing.
+	expect(result.appliedEdits.every((edit) => edit.applied)).toBe(true);
+	saveHarnessState(dir, state);
+}
+
 function digestMessages(messages: readonly AgentMessage[]): CustomMessage[] {
 	return messages.filter(
 		(message): message is CustomMessage =>
@@ -488,6 +510,77 @@ describe("#2098 static system prompt with an in-context harness digest", () => {
 			digestMessages(harness.session.messages).at(-1) &&
 				getMessageText(digestMessages(harness.session.messages).at(-1)!),
 		).not.toContain("refused:");
+	});
+
+	it("re-injects when another writer bumps an entry this session already reported", async () => {
+		seedEntry("memory", "reported_seed", "Reported seed", "Menu fixture.");
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("reply one")]);
+		await harness.session.prompt("round one");
+		expect(digestMessages(harness.session.messages)).toHaveLength(1);
+
+		// This session's own refine: its receipt itemizes the entry, so the next turn owes
+		// the model no digest delta for it (merge doc 14.2, no double delivery).
+		harness.setResponses([
+			fauxAssistantMessage(
+				refinePlanJson("Record the reported lesson", [
+					{
+						action: "create",
+						kind: "memory",
+						id: "reported_entry",
+						title: "Reported entry",
+						content: "v1 written by this session",
+					},
+				]),
+			),
+		]);
+		const refined = await harness.session.refine({ instructions: "record the reported lesson", global: true });
+		expect(refined.appliedEdits.some((edit) => edit.applied)).toBe(true);
+
+		// Another writer bumps the SAME entry afterwards. The receipt itemized version 1,
+		// not version 2, so its exemption must not swallow this one: a long session that
+		// went quiet here is exactly the frozen menu merge doc 12.2 forbids.
+		bumpEntry("reported_entry", "Reported entry", "v2 written by another writer");
+
+		const carriersBefore = digestMessages(harness.session.messages).length;
+		harness.setResponses([fauxAssistantMessage("reply two")]);
+		await harness.session.prompt("round two");
+		const carriers = digestMessages(harness.session.messages);
+		expect(carriers).toHaveLength(carriersBefore + 1);
+		expect(getMessageText(carriers.at(-1) as CustomMessage)).toContain("v2 written by another writer");
+	});
+
+	it("does not double-deliver the entry its own receipt already itemized", async () => {
+		seedEntry("memory", "own_seed", "Own seed", "Menu fixture.");
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("reply one")]);
+		await harness.session.prompt("round one");
+		const carriersBefore = digestMessages(harness.session.messages).length;
+
+		harness.setResponses([
+			fauxAssistantMessage(
+				refinePlanJson("Record the own lesson", [
+					{
+						action: "create",
+						kind: "memory",
+						id: "own_entry",
+						title: "Own entry",
+						content: "written by this session",
+					},
+				]),
+			),
+		]);
+		const refined = await harness.session.refine({ instructions: "record my own lesson", global: true });
+		expect(refined.appliedEdits.some((edit) => edit.applied)).toBe(true);
+
+		harness.setResponses([fauxAssistantMessage("reply two")]);
+		await harness.session.prompt("round two");
+		// The receipt already itemized this exact version, so the digest stays quiet. This
+		// is the positive control for the exemption the pin above narrows: drop the
+		// reported-entry check and this one goes red while the one above stays green.
+		expect(digestMessages(harness.session.messages)).toHaveLength(carriersBefore);
 	});
 
 	it("appends a fresh digest on resume only when disk state moved", async () => {
