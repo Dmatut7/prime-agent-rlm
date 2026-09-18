@@ -398,6 +398,27 @@ describe("summarization request stays inside the provider's real input limit", (
 		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
 	});
 
+	it("a branch summary whose signal is already aborted spends no wire call", async () => {
+		// The gate watchdog can cut a hung branch summary while the caller is still
+		// parked in the `session_before_tree` hook, so `generateBranchSummary` can be
+		// entered with the signal already aborted. Issuing the request anyway would
+		// burn a paid provider call (and consume a faux response in tests) for a
+		// summary nobody will read; the abort must be honoured before the attempt.
+		const controller = new AbortController();
+		controller.abort();
+
+		const result = await generateBranchSummary(branchEntries(4, false), {
+			model: createModel({ contextWindow: CONTEXT_WINDOW }),
+			apiKey: "test-key",
+			signal: controller.signal,
+			reserveTokens: RESERVE_TOKENS,
+		});
+
+		expect(result.aborted).toBe(true);
+		expect(result.summary).toBeUndefined();
+		expect(completeSimpleMock).not.toHaveBeenCalled();
+	});
+
 	it("keeps a branch summary request inside the provider's input limit", async () => {
 		const { recorded } = createLimitProvider({ hardInputLimit: HARD_INPUT_LIMIT, perMessageTokens: 4 });
 

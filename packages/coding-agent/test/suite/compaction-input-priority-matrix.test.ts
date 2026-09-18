@@ -1448,14 +1448,10 @@ describe("compaction x input-class admission matrix", () => {
 		// One turn, so the navigation has something to summarize and a target to
 		// navigate to.
 		// Response accounting: the watchdog aborts the summary while it is parked in
-		// the hook, and the LLM summary call after the hook still dequeues one faux
-		// response before it notices the aborted signal - the middle slot belongs to
-		// that aborted summary call, not to the queued reply's turn.
-		harness.setResponses([
-			fauxAssistantMessage("first turn"),
-			fauxAssistantMessage("slot consumed by the aborted branch summary call"),
-			fauxAssistantMessage(REPLY_TURN_TEXT),
-		]);
+		// the hook, and the summary honours the already-aborted signal BEFORE its
+		// wire call (an aborted summary spends no provider request), so the next
+		// faux response belongs to the queued reply's own turn.
+		harness.setResponses([fauxAssistantMessage("first turn"), fauxAssistantMessage(REPLY_TURN_TEXT)]);
 		await harness.session.prompt("first");
 		const targetEntry = harness.sessionManager
 			.getEntries()
