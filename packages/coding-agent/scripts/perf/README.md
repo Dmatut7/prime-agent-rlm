@@ -16,8 +16,13 @@ recorded instead of smoothed over.
 
 Neither driver spawns the other language, and neither is part of a test face:
 `packages/coding-agent/scripts/perf/**` is outside both `biome.json`'s
-`files.includes` and the root `tsconfig.json`'s `include`, so this directory is
-checked only by running it. The sealed needles that CI does run are
+`files.includes` and the root `tsconfig.json`'s `include` (verified:
+`npx biome check packages/coding-agent/scripts/perf/` answers "These paths were
+provided but ignored", and `npx tsgo --noEmit` never loads these files). **No repo
+gate therefore covers this directory: after editing anything here you must run
+`node packages/coding-agent/scripts/perf/harness-parity.mjs --python=<python3.11+>
+--verify` by hand and read its exit code** (0 = both faces and the reference scorer
+still agree and the golden still reproduces). The sealed needles that CI does run are
 `packages/coding-agent/test/harness-search-parity.test.ts` (vitest, never spawns
 Python) and `prime-agent-runtime/test/test_harness_search_parity.py` (unittest,
 never spawns Node); both pin the golden this instrument writes.

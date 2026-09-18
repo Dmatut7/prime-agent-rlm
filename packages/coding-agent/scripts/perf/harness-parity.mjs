@@ -38,6 +38,8 @@
  *   node packages/coding-agent/scripts/perf/harness-parity.mjs --help
  *
  * Options:
+ *   --verify              the default mode, spelled out: compare both faces and
+ *                         the reference scorer, then compare against expected.json
  *   --write               rewrite expected.json from the live run (only after
  *                         every side-vs-side and reference check passed)
  *   --report=<path>       where to write parity-report.json
@@ -89,12 +91,14 @@ const VOLATILE_KEYS = new Set(["generated_at", "base_sha", "child_timings", "rep
 
 const HELP = readFileSync(fileURLToPath(import.meta.url), "utf8")
 	.split("*/")[0]
+	.replace(/^#!.*\n/, "")
 	.replace(/^\/\*\*/, "harness-parity - TS digest window vs Python harness.search")
 	.replace(/^ \* ?/gm, "")
 	.trim();
 
 function parseArgs(argv) {
 	const options = {
+		verify: false,
 		write: false,
 		breakName: null,
 		caseName: null,
@@ -108,6 +112,7 @@ function parseArgs(argv) {
 	};
 	for (const arg of argv) {
 		if (arg === "--help" || arg === "-h") options.help = true;
+		else if (arg === "--verify") options.verify = true; // explicit spelling of the default mode
 		else if (arg === "--write") options.write = true;
 		else if (arg === "--json") options.json = true;
 		else if (arg === "--keep-workdir") options.keepWorkdir = true;
