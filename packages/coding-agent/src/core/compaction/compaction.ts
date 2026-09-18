@@ -513,6 +513,185 @@ export function estimateTokens(message: AgentMessage): number {
 }
 
 /**
+ * The content a price was computed from, in numbers cheap enough to re-read on every
+ * call: how many blocks the message has, how many characters those blocks hold, how
+ * many images, and a hash of the tool-call arguments.
+ */
+interface ContentFootprint {
+	blocks: number;
+	chars: number;
+	images: number;
+	argsHash: number;
+	/** Sampled character codes, so a rewrite that keeps every length still shows. */
+	sample: number;
+}
+
+interface PricedContent extends ContentFootprint {
+	tokens: number;
+}
+
+/**
+ * Prices already computed, per message object.
+ *
+ * The trigger reads the whole context at every turn boundary - three sites, and five
+ * full reads when the tail has to be repriced - and with no provider usage anchor
+ * each read prices every character of every message (measured: 50MB branch, one read
+ * p50 468ms / max 1180ms, a turn boundary p50 1342ms, all of it synchronous;
+ * perfC EVIDENCE/compaction/trigger-idle.json). A transcript grows by appending, so
+ * almost all of that work is repricing messages that were priced a moment ago and
+ * have not changed. The memo keeps the price on the message object it was computed
+ * from and re-reads it when the object still holds the same content, which turns a
+ * repeated full read into one cheap footprint pass per message.
+ *
+ * A WeakMap, so a price lives exactly as long as the message it belongs to: a
+ * compaction that drops the head of a transcript drops its prices with it.
+ */
+const pricedContent = new WeakMap<AgentMessage, PricedContent>();
+
+/** Identity of each tool-call arguments object, so a footprint can tell two apart without serializing them. */
+const argumentObjectIds = new WeakMap<object, number>();
+let argumentObjectCount = 0;
+
+/**
+ * Fold eight character codes of one priced text into the footprint sample.
+ *
+ * Length alone would let a rewrite that keeps the length pass as unchanged, so the
+ * first and last code unit and six spread through the interior are read as well. It
+ * is a sample, not a hash of the text: reading every character is the walk this memo
+ * exists to avoid. The shape it cannot see is a rewrite confined to the unsampled
+ * positions of one block that also keeps its length - and the writers in the tree do
+ * not produce it: the stream replaces a tool call's `arguments` with a fresh object,
+ * the daemon's compact stream appends to `text`, the queue replaces a whole `content`
+ * array, and the failure-receipt path appends to a string. Eight reads per text cost
+ * a fraction of a millisecond on a 20k-message transcript, which is the whole point.
+ */
+function mixTextSample(hash: number, text: string): number {
+	const last = text.length - 1;
+	if (last < 0) return (hash * 31 + 1) >>> 0;
+	let mixed = (hash * 31 + text.charCodeAt(0) + text.charCodeAt(last)) >>> 0;
+	for (let step = 1; step <= 6; step++) {
+		mixed = (mixed * 31 + text.charCodeAt(Math.floor((last * step) / 7))) >>> 0;
+	}
+	return mixed;
+}
+
+/**
+ * Fold one tool call's arguments into a footprint hash.
+ *
+ * Serializing them is what the price itself does and is a large part of what the memo
+ * saves, so the hash reads the object's identity plus a one-level probe of its keys
+ * instead. That covers both shapes a tool call changes by: the stream replaces
+ * `block.arguments` with a freshly parsed object (new identity), and a writer that
+ * puts a value into the existing object changes a key set or a value length. It does
+ * not cover a value rewritten in place to another value of the same length and type;
+ * seeing that would cost the serialization the hash exists to avoid.
+ */
+function mixArguments(hash: number, args: unknown): number {
+	if (!args || typeof args !== "object") {
+		return (hash * 31 + (args === undefined ? 1 : 2)) >>> 0;
+	}
+	let id = argumentObjectIds.get(args);
+	if (id === undefined) {
+		argumentObjectCount += 1;
+		id = argumentObjectCount;
+		argumentObjectIds.set(args, id);
+	}
+	let mixed = (hash * 31 + id) >>> 0;
+	const record = args as Record<string, unknown>;
+	// Every key is probed, so the footprint is O(keys) - which for every tool call in
+	// this tree is a handful, and in general is bounded by the serialization the price
+	// itself pays for the same object. A cap would trade that for a blind spot past the
+	// cap, and the shape that actually changes arguments (the stream replacing the
+	// object wholesale) is caught by identity, not by the probe.
+	for (const key in record) {
+		if (!Object.hasOwn(record, key)) continue;
+		const value = record[key];
+		if (typeof value === "string") {
+			mixed = mixTextSample((mixed * 31 + key.length + value.length) >>> 0, value);
+			continue;
+		}
+		const probe = typeof value === "number" ? Math.trunc(value) : typeof value === "boolean" ? 1 : 0;
+		mixed = (mixed * 31 + key.length + probe) >>> 0;
+	}
+	return mixed;
+}
+
+/**
+ * What collectMessageEstimateParts would price, counted without building the strings.
+ *
+ * The two have to stay in step: a character this misses is a character a stale price
+ * can keep, so every shape collectMessageEstimateParts reads appears here, and
+ * test/compaction-price-memo.test.ts pins the pairing per message shape. Block count
+ * and character count are O(1) reads, so the whole footprint costs one pass over the
+ * block list and no allocation.
+ */
+function messageContentFootprint(message: AgentMessage): ContentFootprint {
+	let blocks = 0;
+	let chars = 0;
+	let images = 0;
+	let argsHash = 0;
+	let sample = 7;
+	const addText = (text: string): void => {
+		chars += text.length;
+		sample = mixTextSample(sample, text);
+	};
+	const addContent = (content: unknown): void => {
+		if (typeof content === "string") {
+			blocks += 1;
+			addText(content);
+			return;
+		}
+		if (!Array.isArray(content)) return;
+		for (const block of content as Array<{ type: string; text?: string }>) {
+			blocks += 1;
+			if (block.type === "text" && block.text) addText(block.text);
+			else if (block.type === "image") images += 1;
+		}
+	};
+	switch (message.role) {
+		case "user":
+			addContent((message as { content: unknown }).content);
+			break;
+		case "assistant":
+			for (const block of (message as AssistantMessage).content) {
+				blocks += 1;
+				if (block.type === "text") addText(block.text);
+				else if (block.type === "thinking") addText(block.thinking);
+				else if (block.type === "toolCall") {
+					addText(block.name);
+					argsHash = mixArguments(argsHash, block.arguments);
+				}
+			}
+			break;
+		case "custom":
+		case "toolResult":
+			addContent(message.content);
+			break;
+		case "bashExecution":
+			blocks += 2;
+			addText(message.command);
+			addText(message.output);
+			break;
+		case "branchSummary":
+		case "compactionSummary":
+			blocks += 1;
+			addText(message.summary);
+			break;
+	}
+	return { blocks, chars, images, argsHash, sample };
+}
+
+function sameFootprint(a: ContentFootprint, b: ContentFootprint): boolean {
+	return (
+		a.blocks === b.blocks &&
+		a.chars === b.chars &&
+		a.images === b.images &&
+		a.argsHash === b.argsHash &&
+		a.sample === b.sample
+	);
+}
+
+/**
  * Estimate token count for a message priced by content density: CJK and fenced
  * code cost what they actually cost a tokenizer instead of the flat chars/4.
  *
@@ -525,10 +704,15 @@ export function estimateTokens(message: AgentMessage): number {
  * each reading comes from.
  */
 export function estimateTokensByContent(message: AgentMessage): number {
+	const footprint = messageContentFootprint(message);
+	const priced = pricedContent.get(message);
+	if (priced && sameFootprint(priced, footprint)) return priced.tokens;
 	const parts = collectMessageEstimateParts(message);
 	let tokens = parts.images * IMAGE_TOKEN_ESTIMATE;
 	for (const text of parts.texts) tokens += measureContentDensity(text).tokens;
-	return Math.ceil(tokens);
+	const total = Math.ceil(tokens);
+	pricedContent.set(message, { ...footprint, tokens: total });
+	return total;
 }
 
 /**
