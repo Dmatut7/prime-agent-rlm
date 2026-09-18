@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setImmediate as realSetImmediate } from "node:timers";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as orphanProcessModule from "../src/core/orphan-process-journal.js";
@@ -33,7 +34,10 @@ import {
 	type DaemonWorkerFrameHeader,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
 import { MutationDrainLatch } from "../src/modes/daemon/mutation-drain-latch.js";
-import { SUPERVISOR_RECHECK_MAX_MS } from "../src/modes/daemon/supervisor-availability.js";
+import {
+	SUPERVISOR_PROBE_INTERVAL_MS,
+	SUPERVISOR_RECHECK_MAX_MS,
+} from "../src/modes/daemon/supervisor-availability.js";
 import { WorkerRecoveryJournal } from "../src/modes/daemon/worker-recovery-journal.js";
 import type { PrivateFrame } from "../src/modes/session-worker/private-framing.js";
 import * as childProcessModule from "../src/utils/child-process.js";
@@ -145,6 +149,25 @@ vi.mock("../src/core/session-lease.js", async (importOriginal) => {
 const supervisorRegistryDirEnv = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR";
 const previousSupervisorRegistryDir = process.env[supervisorRegistryDirEnv];
 const supervisorRegistryDirs = new Set<string>();
+
+/**
+ * Fake timers replace the globals, not the `node:timers` module, so these two stay real
+ * while `vi.useFakeTimers()` is installed: a fake-clock test can still hand control back
+ * to the event loop and read a wall clock. The global `setImmediate` is faked, which is
+ * why an apparent step of the fake clock used to be mistaken for progress.
+ */
+const realEventLoopTurn = (): Promise<void> =>
+	new Promise<void>((resolveTurn) => {
+		realSetImmediate(resolveTurn);
+	});
+const realTimeMs = (): number => process.uptime() * 1000;
+
+/**
+ * Hang guard for a driven round, not a progress budget: a watched round settles in
+ * single-digit milliseconds of real time, and the round's own settle is the termination
+ * condition. This deadline only fires when the round genuinely stopped progressing.
+ */
+const ARMED_AVAILABILITY_CHECK_DEADLINE_MS = 10_000;
 
 interface SupervisorMonitorHarness {
 	options: { worker: object };
@@ -1243,21 +1266,43 @@ describe("daemon worker supervisor monitoring", () => {
 			return result;
 		});
 		/**
-		 * Run the armed round to its own settle. The round sleeps on the fake clock between its
-		 * probe attempts, so the clock is advanced in that step while the settle — not a probe
-		 * count and not a probe promise — is the termination condition.
+		 * Run the armed round to its own settle. The settle is the condition, not a step
+		 * count: the round's registry guard takes a real file lock, and that I/O only makes
+		 * progress while the driver is back on the event loop. Stepping the fake clock without
+		 * handing control over was a wall-clock budget in disguise — the forty steps this used
+		 * to drive with cost about two milliseconds of real time — so a loaded machine spent
+		 * the budget before the round's first lock attempt returned, and the round read as
+		 * "never settled".
+		 *
+		 * Every iteration hands control to the event loop and steps the clock one probe
+		 * interval, and only while the round itself has a timer waiting: the clock follows the
+		 * round instead of running ahead of it, so a round that stalls on real I/O never drags
+		 * the clock into the next round's window (or past the orphan deadline). The termination
+		 * is the same settle handle the other armed-round tests in this file await; the deadline
+		 * is a hang guard, not a progress budget.
 		 */
 		const runArmedRound = async () => {
 			const armed = daemon.supervisorAvailabilityCheckSettled;
+			if (!armed) {
+				throw new Error("the supervisor monitor had no armed availability check to drive");
+			}
 			let settled = false;
-			void armed?.then(() => {
+			void armed.then(() => {
 				settled = true;
 			});
-			for (let step = 0; step < 40 && !settled; step++) {
-				await vi.advanceTimersByTimeAsync(250);
-			}
-			if (!settled) {
-				throw new Error("the armed supervisor availability check never settled");
+			const deadline = realTimeMs() + ARMED_AVAILABILITY_CHECK_DEADLINE_MS;
+			while (!settled) {
+				await realEventLoopTurn();
+				// Once the round settles, the timer it armed is the *next* round's: firing it here
+				// would spend it, and the assertions below require it still armed.
+				if (!settled && vi.getTimerCount() > 0) {
+					await vi.advanceTimersByTimeAsync(SUPERVISOR_PROBE_INTERVAL_MS);
+				}
+				if (realTimeMs() >= deadline) {
+					throw new Error(
+						`the armed supervisor availability check did not settle within ${ARMED_AVAILABILITY_CHECK_DEADLINE_MS}ms`,
+					);
+				}
 			}
 		};
 
