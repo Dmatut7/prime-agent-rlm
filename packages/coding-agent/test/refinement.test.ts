@@ -1818,6 +1818,67 @@ describe("harness digest relevance ranking (#2241 phase 2 / upstream #2392 IDF /
 		}
 	});
 
+	it("falls back to recency order and drops the ranked marker when no entry matches (OBS-1)", () => {
+		// Recency order (m3, m2, m1) disagrees with the identifier tie-break
+		// (m1, m2, m3), so a window that still shows the tie-break order
+		// proves the fallback is missing. The window truncates, so the old
+		// behavior would also have stamped the ranked marker on it.
+		const state = rankedState([
+			makeRankedEntry("m1", "Alpha note", "Session material.", "2026-08-01T00:00:00.000Z"),
+			makeRankedEntry("m2", "Beta note", "Session material.", "2026-08-02T00:00:00.000Z"),
+			makeRankedEntry("m3", "Gamma note", "Session material.", "2026-08-03T00:00:00.000Z"),
+		]);
+		const rendered = formatHarnessStateForPrompt(state, {
+			maxEntriesPerKind: 2,
+			queryTerms: new Map([["quantum", 1]]),
+		});
+		const ids = [...rendered.matchAll(/\[global:(m[123])\]/g)].map((match) => match[1]);
+		expect(ids).toEqual(["m3", "m2"]);
+		expect(rendered).not.toContain("entries ranked by relevance");
+		// The truncation stays visible: falling back must not hide the gap.
+		expect(rendered).toContain("+1 more memory entries (3 recorded");
+	});
+
+	it("keeps score order and the marker per kind when only some kinds match (OBS-1)", () => {
+		const state = rankedState([
+			// Memory kind: one matching entry (oldest, last in identifier
+			// order) must win the ranked window over newer non-matching ones.
+			makeRankedEntry("zq", "Quantum note", "Only quantum annealing matters.", "2026-08-01T00:00:00.000Z"),
+			makeRankedEntry("a_old", "Alpha note", "Session material.", "2026-08-02T00:00:00.000Z"),
+			makeRankedEntry("m_new", "Middle note", "Session material.", "2026-08-03T00:00:00.000Z"),
+		]);
+		for (const [id, day] of [
+			["p1", "2026-08-01"],
+			["p2", "2026-08-02"],
+			["p3", "2026-08-03"],
+		] as const) {
+			state.entries.prompt[id] = {
+				...makeRankedEntry(id, "Prompt note", "Prompt material.", `${day}T00:00:00.000Z`),
+				kind: "prompt",
+			};
+		}
+		const rendered = formatHarnessStateForPrompt(state, {
+			maxEntriesPerKind: 2,
+			queryTerms: new Map([["quantum", 1]]),
+		});
+		// Memory kind keeps the ranked window: the matching entry leads.
+		const memoryIds = [...rendered.matchAll(/\[global:(zq|a_old|m_new)\]/g)].map((match) => match[1]);
+		expect(memoryIds).toEqual(["zq", "a_old"]);
+		// The prompt kind matched nothing: recency order (p3, p2) instead of
+		// the identifier tie-break (p1, p2).
+		const promptIds = [...rendered.matchAll(/\[global:(p[123])\]/g)].map((match) => match[1]);
+		expect(promptIds).toEqual(["p3", "p2"]);
+		// The marker follows the kind it belongs to, not the render as a whole.
+		const lines = rendered.split("\n");
+		expect(lines).toContain("memory: 3");
+		expect(lines).toContain("prompt: 3");
+		const markerLineAfter = (kind: string) => lines[lines.indexOf(`${kind}: 3`) + 1];
+		expect(markerLineAfter("memory")).toBe("(entries ranked by relevance to the current task; see harness.search)");
+		expect(markerLineAfter("prompt")).not.toBe(
+			"(entries ranked by relevance to the current task; see harness.search)",
+		);
+	});
+
 	it.each<[string, string[]]>([
 		["Worktree?", ["worktree"]],
 		["path/to/skill", ["path", "skill"]],
