@@ -396,7 +396,11 @@ describe("release.mjs fork gate", () => {
 		// The two gates must not share a switch: `off` on the self-update gate is a test seam, and
 		// `1` on the release gate is an operator's deliberate act.
 		expect(override?.[1]).not.toBe(FORK_GATE_ENV_VAR);
-		// And the refusal has to be an exit, not a logged complaint the steps continue past.
-		expect(source).toContain("process.exit(1)");
+		// And the refusal has to be an exit, not a logged complaint the release steps continue
+		// past. Scoped to the gate's own body: `process.exit(1)` occurs four more times in the
+		// script, so a file-wide search still passes when the gate's exit is the one removed.
+		const gateBody = /function forkReleaseGate\(\) \{[\s\S]*?\n\}\n/.exec(source)?.[0] ?? "";
+		expect(gateBody, "release.mjs must keep a forkReleaseGate() whose refusal exits").not.toBe("");
+		expect(gateBody).toContain("process.exit(1)");
 	});
 });
