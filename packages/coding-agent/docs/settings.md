@@ -48,6 +48,29 @@ Unknown keys are reported: a misspelled or removed setting (for example `compact
 | `showHardwareCursor` | boolean | `false` | Show terminal cursor. `PI_HARDWARE_CURSOR` (`1`/`true`/`yes`, `0`/`false`/`no`) overrides it, and a conflict between the two is reported as a warning |
 | `ui.subagentSpendCell` | boolean \| object | `true` | Show the spend cell (Σ sub-agents) in the subagents tray line and refresh it from the session context tree. `false` hides the cell and stops those scans (the tray counts and stall markers keep updating); an object tunes the cadence (next row) |
 | `ui.subagentSpendCell.intervalMs` | number | `15000` | How stale the cell's figure may get while a family works, in ms. Clamped to `5000`-`120000`; a non-number falls back to the default. The figure also refreshes whenever an assistant message lands and at turn end, and a figure that outlives the interval is refreshed by the next event, so this bounds the age without adding timer-driven scans |
+| `ui.subagentSpendCell.priceOverrides` | object | - | Correct a model's price without editing `models.json`: `{ "<provider>/<model-id>": { "input"?: number, "output"?: number, "cacheRead"?: number, "cacheWrite"?: number } }`, in the same unit `models.json` writes `cost` in (per million tokens). A field left out falls back to the `models.json` rate; a value that is not a finite number `>= 0` is ignored with a warning (never silently). The spend cell and `/usage` re-price that model's recorded tokens with the corrected rates, so the figure changes for work already done; `已改价` marks it in the cell and `/usage` lists each model with its source (`override` or `models.json`) |
+
+#### ui.subagentSpendCell.priceOverrides
+
+When a model's `cost` in `models.json` is wrong, override it here - a wrong price
+otherwise shows up only as a wrong spend figure with nowhere to fix it.
+
+```json
+{
+  "ui": {
+    "subagentSpendCell": {
+      "priceOverrides": {
+        "bailian/kimi-k3": { "input": 3, "output": 15 },
+        "bailian/deepseek-v4.1-flash": { "cacheRead": 0.3 }
+      }
+    }
+  }
+}
+```
+
+Corrections take effect on the next refresh of the figure (the cell refreshes on
+its own cadence and at turn end, `/usage` on every run), and an override that
+names a field for a model still gets the rest of its rates from `models.json`.
 
 ### Update Checks
 
