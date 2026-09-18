@@ -955,6 +955,17 @@ function rankedIdentifier(entry: HarnessEntry): string {
 }
 
 /**
+ * A kind's query ranking: the ranked entries plus whether any of them scored
+ * above zero. All-zero scores mean no entry matched a weighted term, so the
+ * "ranked" order is only the stable identifier tie-break and carries no
+ * relevance signal.
+ */
+interface HarnessQueryRanking {
+	entries: HarnessEntry[];
+	anyEntryScored: boolean;
+}
+
+/**
  * Rank once, sort the scores: normalize each entry's searchable fields a
  * single time, record which of the three fields every query term hits in one
  * entries-x-terms sweep, derive both the idf map and every entry's score from
@@ -965,7 +976,7 @@ function rankedIdentifier(entry: HarnessEntry): string {
  * real 1266-entry store. Scores, the stable identifier tie-break and the top-k
  * window are unchanged.
  */
-export function rankHarnessEntriesForQuery(entries: HarnessEntry[], terms: HarnessQueryTerms): HarnessEntry[] {
+function rankHarnessEntriesWithRelevance(entries: HarnessEntry[], terms: HarnessQueryTerms): HarnessQueryRanking {
 	const fields = entries.map(normalizeHarnessEntryFields);
 	const termList = [...terms.entries()];
 	// One byte per term per entry: a packed bitmask would alias past 16 terms
@@ -1010,7 +1021,14 @@ export function rankHarnessEntriesForQuery(entries: HarnessEntry[], terms: Harne
 		// comparison and reintroduce the O(N log N) full-text sweep.
 		return rankedIdentifier(x.entry).localeCompare(rankedIdentifier(y.entry));
 	});
-	return scored.map((item) => item.entry);
+	// The sort is score-descending, so the first element holds the maximum.
+	return { entries: scored.map((item) => item.entry), anyEntryScored: scored.length > 0 && scored[0].score > 0 };
+}
+
+/** The ranked entries alone; callers that also need the all-zero fact use
+ * `rankHarnessEntriesWithRelevance` directly. */
+export function rankHarnessEntriesForQuery(entries: HarnessEntry[], terms: HarnessQueryTerms): HarnessEntry[] {
+	return rankHarnessEntriesWithRelevance(entries, terms).entries;
 }
 
 export function formatHarnessStateForPrompt(
@@ -1025,7 +1043,10 @@ export function formatHarnessStateForPrompt(
 		/** Select entries by relevance to these terms instead of the
 		 * default injection order. Ranked windows discount each term by
 		 * its document frequency within the kind and break score ties on
-		 * stable identifier order, never recency. */
+		 * stable identifier order, never recency. A kind where no entry
+		 * matches any term falls back to the injection (recency) order and
+		 * loses the ranked marker instead of passing an alphabetical slice
+		 * off as relevance. */
 		queryTerms?: HarnessQueryTerms;
 	} = {},
 ): string {
@@ -1066,11 +1087,18 @@ export function formatHarnessStateForPrompt(
 		// The ranked corpus is the kind's own entries: they compete for the
 		// same top-k slots, so document frequency discounts terms ubiquitous
 		// within the kind rather than across unrelated kinds.
-		const ranked = Object.values(state.entries[kind]);
-		const entries =
+		const corpus = Object.values(state.entries[kind]);
+		const ranking =
 			queryTerms !== undefined && queryTerms.size > 0
-				? rankHarnessEntriesForQuery(ranked, queryTerms)
-				: entriesForInjection(state, kind);
+				? rankHarnessEntriesWithRelevance(corpus, queryTerms)
+				: undefined;
+		// OBS-1: a query no entry of this kind matches leaves every score at
+		// zero, so the ranked order is only the stable identifier tie-break - an
+		// alphabetical slice wearing a "ranked by relevance" marker. Fall back
+		// to the recency order the no-query window uses and keep the marker
+		// silent: the model must not read alphabetical noise as relevance.
+		const entries = ranking?.anyEntryScored ? ranking.entries : entriesForInjection(state, kind);
+		const rankedByRelevance = ranking !== undefined && ranking.anyEntryScored;
 		totalEntries += entries.length;
 		// Render subagent specs as a task-shaped roster the model can match against — the
 		// analogue of Claude Code's agent-type menu — rather than a bare count. In
@@ -1082,7 +1110,7 @@ export function formatHarnessStateForPrompt(
 		} else {
 			lines.push(`${kind}: ${entries.length}`);
 		}
-		if (queryTerms !== undefined && queryTerms.size > 0 && entries.length > maxEntriesPerKind) {
+		if (rankedByRelevance && entries.length > maxEntriesPerKind) {
 			lines.push("(entries ranked by relevance to the current task; see harness.search)");
 		}
 		for (const entry of entries.slice(0, maxEntriesPerKind)) {
