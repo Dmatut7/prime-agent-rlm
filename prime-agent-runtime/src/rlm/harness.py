@@ -10,6 +10,7 @@ Execution still belongs to Prime Agent's TypeScript host and the existing
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import secrets
@@ -18,7 +19,7 @@ import unicodedata
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, NamedTuple, Sequence
+from typing import Any, Literal, Mapping, NamedTuple, Sequence
 
 HarnessKind = Literal["prompt", "memory", "skill", "subagent"]
 HarnessScope = Literal["local", "global"]
@@ -131,8 +132,16 @@ def _search_recency(entry: "HarnessEntry") -> str:
     return entry.updated_at if isinstance(entry.updated_at, str) else ""
 
 
-def _search_score(entry: "HarnessEntry", terms: Sequence[str]) -> float:
-    """Weighted term overlap over the title, content, and identifier slots."""
+def _search_score(
+    entry: "HarnessEntry",
+    terms: Sequence[str],
+    idf: Mapping[str, float] | None = None,
+) -> float:
+    """Weighted term overlap over the title, content, and identifier slots.
+
+    Each matched term is discounted by its document frequency in the ranked
+    corpus (``idf``); a missing map weights every term at 1.
+    """
     title = _search_field(entry.title)
     content = _search_field(entry.content)
     # The id is usually embedded in the path, so matching both is one
@@ -142,7 +151,7 @@ def _search_score(entry: "HarnessEntry", terms: Sequence[str]) -> float:
     for term in terms:
         slots = (term in title) + (term in content) + (term in identifier)
         if slots:
-            total += 1 + (slots - 1) * 0.5
+            total += (idf.get(term, 1.0) if idf is not None else 1.0) * (1 + (slots - 1) * 0.5)
     return total
 
 
@@ -1129,7 +1138,10 @@ class HarnessState:
         """Return ``(kind, id, score, snippet)`` hits ranked by term overlap.
 
         Terms are scored against an entry's title, content, and path/id
-        identifier slots; matching more distinct slots counts more. Zero-score
+        identifier slots; matching more distinct slots counts more. Each
+        matched term is discounted by its document frequency across the
+        ranked corpus (tf-idf style, ``log(1 + N / df)``), so a rare,
+        distinctive term outranks terms present in most entries. Zero-score
         entries are dropped. Ties fall back to the most recently updated entry
         and then to ``(kind, id)``, so one query always returns one order.
         """
@@ -1150,9 +1162,28 @@ class HarnessState:
         if not terms:
             return []
 
+        entries = self.list(kind)
+
+        # Document frequency per term over the ranked corpus: a term in
+        # every entry weighs log(2), a term in one entry of N weighs
+        # log(1 + N), so rare distinctive terms outrank ubiquitous ones.
+        matches: dict[str, int] = {term: 0 for term in terms}
+        for entry in entries:
+            title = _search_field(entry.title)
+            content = _search_field(entry.content)
+            identifier = _search_field(f"{entry.path} {entry.id}")
+            for term in terms:
+                if term in title or term in content or term in identifier:
+                    matches[term] += 1
+        term_idf = {
+            term: math.log(1 + len(entries) / count)
+            for term, count in matches.items()
+            if count > 0
+        }
+
         scored: list[tuple[HarnessEntry, float]] = []
-        for entry in self.list(kind):
-            score = _search_score(entry, terms)
+        for entry in entries:
+            score = _search_score(entry, terms, term_idf)
             if score > 0:
                 scored.append((entry, score))
         # Two stable passes: sort by the fallback key first, then by the primary

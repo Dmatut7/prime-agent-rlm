@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import math
 import os
 import stat
 import subprocess
@@ -1357,6 +1358,35 @@ class HarnessSearchTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unknown harness kind"):
                 state.search("", kind="tool")
 
+    def test_search_discounts_common_terms_and_keeps_frequency_ties(self) -> None:
+        """#2392 kernel half: tf-idf discounts ubiquitous terms in ``search``."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+
+            # An empty corpus scores nothing, and a lone entry (N=1, df=1 -> log(2)) still scores.
+            self.assertEqual(state.search("session"), [])
+            state.create_memory("Session notes", "Session signal.", id="solo")
+            solo_hits = state.search("session")
+            # Positive control: the lone match really scores above zero, so the
+            # orderings below compare real ranks, not empty lists.
+            self.assertEqual([hit.id for hit in solo_hits], ["solo"])
+            self.assertGreater(solo_hits[0].score, 0)
+            state.entries["memory"]["solo"].updated_at = "2026-07-01T00:00:00+00:00"
+
+            # Equal frequency discounts every match alike, so recency still orders them: id order
+            # alone would put aa_older first.
+            for entry_id, day in (("aa_older", "08-01"), ("zz_newer", "09-01")):
+                state.create_memory("Session notes", "Same session signal.", id=entry_id)
+                state.entries["memory"][entry_id].updated_at = f"2026-{day}T00:00:00+00:00"
+            self.assertEqual([hit.id for hit in state.search("session")], ["zz_newer", "aa_older", "solo"])
+
+            # "session" matches 3 of 4 (log(1 + 4/3)), "quantum" 1 of 4 (log(1 + 4)): the rare
+            # distinctive term outranks the common-term-dense entries despite being oldest.
+            state.create_memory("Quantum note", "Only quantum annealing matters once.", id="rare")
+            state.entries["memory"]["rare"].updated_at = "2026-07-01T00:00:00+00:00"
+            hits = state.search("session quantum")
+            self.assertEqual([hit.id for hit in hits], ["rare", "zz_newer", "aa_older", "solo"])
+
     def test_search_returns_empty_when_nothing_matches(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             state = self._fixture(temp_dir)
@@ -1405,9 +1435,14 @@ class HarnessSearchTest(unittest.TestCase):
             kind, entry_id, score, snippet = hits[0]
             self.assertEqual((kind, entry_id), ("memory", "zorblat_id"))
             self.assertEqual(hits[0].snippet, snippet)
-            # title + content + path/id is three slots: 1 + 2 * 0.5.
-            self.assertEqual(score, 2.0)
-            self.assertEqual([(hit.id, hit.score) for hit in hits], [("zorblat_id", 2.0), ("other_entry", 1.0)])
+            # title + content + path/id is three slots: 1 + 2 * 0.5, discounted
+            # by the term's document frequency (df=2 of N=3): log(1 + 3/2).
+            idf = math.log(1 + 3 / 2)
+            self.assertEqual(score, idf * 2.0)
+            self.assertEqual(
+                [(hit.id, hit.score) for hit in hits],
+                [("zorblat_id", idf * 2.0), ("other_entry", idf * 1.0)],
+            )
             # X-8: model-controlled content must not forge extra lines.
             self.assertNotIn("\n", snippet)
             self.assertIn("Zorblat title", snippet)
@@ -1427,10 +1462,13 @@ class HarnessSearchTest(unittest.TestCase):
             state.create_memory("Alpha tie", "shared tiebreak keyword", id="alpha")
             state.create_memory("Beta tie", "shared tiebreak keyword", id="beta")
 
-            # Positive control: both entries match with the same score.
+            # Positive control: both entries match with the same score. Both
+            # terms are in every entry (df=N=2 -> log(2)), so the discount is
+            # uniform and the recency/identity tie-breaks below stay reachable.
+            uniform = 2 * math.log(2)
             self.assertEqual(
                 {hit.id: hit.score for hit in state.search("tiebreak keyword")},
-                {"alpha": 2.0, "beta": 2.0},
+                {"alpha": uniform, "beta": uniform},
             )
 
             state.entries["memory"]["alpha"].updated_at = "2020-01-01T00:00:00+00:00"
