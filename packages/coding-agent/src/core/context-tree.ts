@@ -2,6 +2,7 @@ import { existsSync, readdirSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
 import { BoundedCache } from "../utils/bounded-cache.js";
+import { readBytesSync, readFirstLineSync } from "../utils/file-lines.js";
 import type { RlmChildAgentStatus } from "./agent-session.js";
 import { calculateContextTokens, estimateContextTokens } from "./compaction/index.js";
 import type { ContextUsage } from "./extensions/index.js";
@@ -338,10 +339,110 @@ function statusFromBranch(entries: SessionEntry[]): "done" | "error" | "cancelle
 interface SessionFile {
 	path: string;
 	size: number;
-	/** `mtimeMs` of the file as stat'ed by the scan; the identity half of the read cache's key. */
+	/**
+	 * Full-precision `mtimeMs` of the file as stat'ed by the scan; the identity half of the
+	 * read cache's key. Identity, not ordering: the selector below orders candidates on the
+	 * walk's own ms-rounded `mtime`, while this is compared against nothing but itself, so it
+	 * keeps every bit the filesystem reports - the same precision the subtree fingerprint
+	 * records. A key coarser than the change it has to notice is how a stale node survives an
+	 * invalidation (see {@link dirJsonlFingerprint}).
+	 */
 	mtimeMs: number;
 }
 
+/**
+ * Bytes of a candidate's head the selection pre-reads to see its first line.
+ *
+ * A session header is one short record: across the measured corpus (4622 `.jsonl` under
+ * `session-artifacts`) the longest first line is 471 bytes and none exceeds 4 KiB, so this
+ * window holds every header with 8x to spare and costs one small read instead of the 64 KiB
+ * chunk {@link readFirstLineSync} reads and allocates. A file whose first line does not end
+ * inside the window is *not* rejected on that evidence - it falls back to the real
+ * first-line reader, which enforces the repo's own `MAX_FIRST_LINE_BYTES` ceiling. The window
+ * is a fast path, not a judgement.
+ */
+const HEADER_PREREAD_BYTES = 4096;
+
+/**
+ * The first line of `path`, read within `size` (which the caller already stat'ed) so the read
+ * is one syscall and no bigger than the window. Undefined when the file has no first line.
+ */
+function firstLineWithin(path: string, size: number): string | undefined {
+	if (size <= 0) {
+		return undefined;
+	}
+	const head = readBytesSync(path, 0, Math.min(size, HEADER_PREREAD_BYTES));
+	const newline = head.indexOf(0x0a);
+	if (newline < 0) {
+		// No terminator inside the window: either the whole (short, unterminated) file, or a
+		// first line longer than the window. Both are the real reader's call, not this one's.
+		return readFirstLineSync(path);
+	}
+	// Cutting at the byte 0x0a cannot split a character: every UTF-8 continuation byte is at
+	// or above 0x80. A CRLF file loses its carriage return, as the reader this stands in for
+	// does.
+	const end = newline > 0 && head[newline - 1] === 0x0d ? newline - 1 : newline;
+	return head.subarray(0, end).toString("utf8");
+}
+
+/**
+ * Whether `path` holds a session transcript, judged by the only thing that says so: its own
+ * first line. Every writer of these files puts a `{"type":"session", "id": ...}` header
+ * there before anything else, and this is the same shape the session listing
+ * (`session-manager`'s `isValidSessionFile`) and the trace walk (`agent-traces`'
+ * `findSessionFilesUnder`) accept.
+ *
+ * A `sub-*` dir holds more than the transcript: an RLM child also flushes its semantic
+ * edges next to it, and that file's first record is `{"type":"session_registered", ...}` -
+ * a line that parses fine and is not a session. Selecting on the `.jsonl` suffix alone
+ * therefore read the edge file whenever teardown flushed it after the last transcript
+ * append, which is the ordinary order, and folding 30 KB of edges yields no branch at all:
+ * the child vanished from `/context` and its spend from the top bar, while
+ * `scannedChildren` had already charged for reading it. 60 of the 2374 `sub-*` dirs in the
+ * measured corpus were in that state.
+ *
+ * One open, one bounded read, one close, and no write: `session-manager.readSessionHeaderId`
+ * reads the same header but runs `enforcePrivateTranscriptMode`, which `chmod`s legacy
+ * transcripts to 0600, and a path that only *selects* a file must not change the files it
+ * selects from.
+ */
+function isSessionTranscript(path: string, size: number): boolean {
+	let firstLine: string | undefined;
+	try {
+		firstLine = firstLineWithin(path, size);
+	} catch {
+		// Gone, unreadable, not a regular file, or a first line past the ceiling: none of
+		// those is a transcript this scan could fold.
+		return false;
+	}
+	if (!firstLine?.trim()) {
+		return false;
+	}
+	let header: unknown;
+	try {
+		header = JSON.parse(firstLine);
+	} catch {
+		return false;
+	}
+	return (
+		typeof header === "object" &&
+		header !== null &&
+		(header as { type?: unknown }).type === "session" &&
+		typeof (header as { id?: unknown }).id === "string"
+	);
+}
+
+/**
+ * The newest transcript in a child session dir, or undefined when the dir holds none.
+ *
+ * Candidates are every `.jsonl`, ordered the way the walk orders dirs
+ * ({@link listChildSessionDirs}: ms-rounded mtime descending, path as the tie-break, so one
+ * listing selects the same file every run instead of depending on `readdir` order), and the
+ * first one whose own header says it is a session wins. A dir with a single candidate is not
+ * pre-read at all - see the branch below for what that costs and why it is nothing. With two
+ * or more, the ordinary case is one header pre-read on top of the parse the walk was going to
+ * do anyway, and a dir whose edges were flushed over its transcript pays a second.
+ */
 function findSessionFile(dir: string): SessionFile | undefined {
 	let names: string[];
 	try {
@@ -352,7 +453,7 @@ function findSessionFile(dir: string): SessionFile | undefined {
 		// because one sub-agent's directory disappeared underneath it.
 		return undefined;
 	}
-	let newest: { path: string; mtime: number; size: number } | undefined;
+	const candidates: { path: string; mtime: number; mtimeMs: number; size: number }[] = [];
 	for (const name of names) {
 		if (!name.endsWith(".jsonl")) {
 			continue;
@@ -360,14 +461,37 @@ function findSessionFile(dir: string): SessionFile | undefined {
 		const path = join(dir, name);
 		try {
 			const stats = statSync(path);
-			if (!newest || stats.mtime.getTime() > newest.mtime) {
-				newest = { path, mtime: stats.mtime.getTime(), size: stats.size };
-			}
+			candidates.push({ path, mtime: stats.mtime.getTime(), mtimeMs: stats.mtimeMs, size: stats.size });
 		} catch {
 			// Skip unreadable files.
 		}
 	}
-	return newest && { path: newest.path, size: newest.size, mtimeMs: newest.mtime };
+	if (candidates.length === 1) {
+		// Nothing to choose between, so nothing is pre-read. The fold opens this file anyway;
+		// if it turns out not to be a transcript it folds to no branch and yields no node, so
+		// the roster is exactly what the header check would have produced - while the dir is
+		// still charged to `scannedChildren`/`bytesRead`, which is what the pre-check walk did
+		// and what `ContextTreeScanDiagnostics.scannedChildren` documents ("opened and folded,
+		// whether or not they yielded a node"). A dir whose newest `.jsonl` is not its
+		// transcript has at least two of them, so every ambiguous dir still pays the check.
+		//
+		// Corpus口径 for that last sentence, all from the second eye's read-only probe over
+		// `/Users/a1/.prime/agent/session-artifacts` (`/tmp/fix-perf-final/probe-selectors-postfix.mjs`,
+		// readings in `/tmp/fix-perf-final/f2-ctx2-pre.json` and this seat's
+		// `EVIDENCE/corpus-postfix-v3.json`): 2374 dirs hold a `.jsonl`, 379 hold exactly one
+		// and 1995 hold two; the 60 dirs whose newest `.jsonl` was not a session all held two;
+		// and `f1.post_readFileUncovered = 0` means no dir held *only* non-session `.jsonl`,
+		// i.e. the shape this branch waves through has 0 instances in the measured corpus.
+		const only = candidates[0];
+		return { path: only.path, size: only.size, mtimeMs: only.mtimeMs };
+	}
+	candidates.sort((a, b) => b.mtime - a.mtime || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+	for (const candidate of candidates) {
+		if (isSessionTranscript(candidate.path, candidate.size)) {
+			return { path: candidate.path, size: candidate.size, mtimeMs: candidate.mtimeMs };
+		}
+	}
+	return undefined;
 }
 
 /**
@@ -412,6 +536,17 @@ function listChildSessionDirs(rlmSessionDir: string): string[] {
 }
 
 /**
+ * The key one dir-and-shape fingerprint is memoized under, in a scan's `fingerprints` map.
+ *
+ * Exported to nobody: both the taking and the storing side of a scan ask for the fingerprint
+ * through it, and a store has to be able to ask "did the lookup for *this* dir and shape
+ * actually take one?" - which is only decidable if the two spell the question identically.
+ */
+function subtreeMemoKey(dir: string, remainingDepth: number, maxVisible: number): string {
+	return `${dir}#${remainingDepth}#${maxVisible}`;
+}
+
+/**
  * The fingerprint `dir` should be keyed by, memoized for the duration of one scan.
  *
  * `memory` is created per {@link scanChildrenInto} call and never outlives it, so the memo
@@ -428,7 +563,7 @@ function subtreeFingerprint(
 	if (!memory) {
 		return fingerprintRlmSessionDir(dir, remainingDepth, maxVisible);
 	}
-	const memoKey = `${dir}#${remainingDepth}#${maxVisible}`;
+	const memoKey = subtreeMemoKey(dir, remainingDepth, maxVisible);
 	const remembered = memory.get(memoKey);
 	if (remembered !== undefined) {
 		return remembered;
@@ -455,12 +590,18 @@ function subtreeFingerprint(
  *   order - `listChildSessionDirs` sorts by dir mtime, and creating or removing a file
  *   inside a candidate moves it - so a candidate the scan refused still has to be covered,
  *   or a promoted one would be served from a subtree that never saw it. A refused
- *   candidate also reports whether it holds a transcript at all (`@?`), because that is
- *   what `skippedByBudget` counts and a user reads that count as "N more agents not shown".
- * - **Content**: for the first `maxVisible` candidates that hold a transcript, the newest
- *   transcript's identity (whose `mtimeMs` moves on any append) and the descent below it.
- *   This is the prefix a walk can consume, and nothing else: an append inside a candidate
- *   the budget refuses cannot change the answer, so it must not throw the subtree away.
+ *   candidate also reports whether it holds a `.jsonl` at all (`@?`), because that is what
+ *   `skippedByBudget` counts and a user reads that count as "N more agents not shown". The
+ *   suffix is all `@?` can look at - deciding whether a file is a *transcript* costs an
+ *   open, and this fingerprint is stat-only by contract. It therefore over-covers one shape:
+ *   a refused dir holding two or more `.jsonl` and no transcript among them reports `@?`
+ *   although the walk charges no read for it (a refused dir with a single `.jsonl` is charged
+ *   either way, since the walk does not pre-read those). Over-covering invalidates too often,
+ *   which is the safe side of wrong.
+ * - **Content**: for the first `maxVisible` candidates that hold a `.jsonl`, the identity of
+ *   *every* file in them (see {@link dirJsonlFingerprint}) and the descent below it. This is
+ *   the prefix a walk can consume, and nothing else: an append inside a candidate the budget
+ *   refuses cannot change the answer, so it must not throw the subtree away.
  *
  * `maxVisible` is therefore the scan's own `maxChildren`, widened by the live ids the root
  * frame skips (those cost no budget but do occupy positions). The window counts
@@ -541,8 +682,7 @@ function fingerprintRlmSessionDir(dir: string, remainingDepth: number, maxVisibl
 				}
 				continue;
 			}
-			const transcript =
-				childNames === undefined ? undefined : newestTranscriptFingerprint(candidate.path, childNames);
+			const transcript = childNames === undefined ? undefined : dirJsonlFingerprint(candidate.path, childNames);
 			if (transcript) {
 				parts.push(`@${transcript}`);
 				readable++;
@@ -560,25 +700,47 @@ function fingerprintRlmSessionDir(dir: string, remainingDepth: number, maxVisibl
 }
 
 /**
- * `name:mtimeMs:size` of the newest transcript in a dir, from a listing the caller already has,
- * or undefined when there is none.
+ * `name:mtimeMs:size` of *every* `.jsonl` in a dir, sorted by name and comma-joined, from a
+ * listing the caller already has; undefined when the dir holds none.
+ *
+ * Every file rather than the newest one, because "which is newest" is a question this
+ * fingerprint and the walk answer with different keys - and they must not both answer it.
+ * The selector ordered candidates by `mtime.getTime()` (ms-rounded) and this one by
+ * `mtimeMs` (full precision), over the same candidate set: a child's teardown appends its
+ * last transcript bytes and flushes `semantic-edges.jsonl` inside one millisecond, the two
+ * keys then round together and separate differently, and the two picked different files. The
+ * consequence was money: an append to the transcript left the fingerprint - which was
+ * watching the edge file - untouched, so the reuse served the previous refresh's roster and
+ * spend as current. 48 of the 2374 `sub-*` dirs in the measured corpus disagreed that way.
+ *
+ * Recording every candidate removes the premise instead of aligning the keys: nothing here
+ * depends on an ordering, so no ordering can disagree with it, and a file the walk will never
+ * read still cannot change under it unnoticed. Cost is unchanged in syscalls (finding the
+ * newest already stat'ed all of them) and the direction of the extra invalidation is the safe
+ * one - an edges flush now re-reads a subtree that used to be served, which is work, not a
+ * stale answer. What it does grow is the key: about 40 bytes per extra `.jsonl`, and a child
+ * dir holds one to three, so a roster's key grows by tens of bytes against an entry the
+ * estimator already charges ~165 KB for (measured on the residency probe: subtree bytes
+ * 379588 -> 401310, +5.7%, entry count unchanged; see NOTES).
  */
-function newestTranscriptFingerprint(dir: string, names: string[]): string | undefined {
-	let newest: { name: string; mtimeMs: number; size: number } | undefined;
+function dirJsonlFingerprint(dir: string, names: string[]): string | undefined {
+	const identities: { name: string; mtimeMs: number; size: number }[] = [];
 	for (const name of names) {
 		if (!name.endsWith(".jsonl")) {
 			continue;
 		}
 		try {
 			const stats = statSync(join(dir, name));
-			if (!newest || stats.mtimeMs > newest.mtimeMs) {
-				newest = { name, mtimeMs: stats.mtimeMs, size: stats.size };
-			}
+			identities.push({ name, mtimeMs: stats.mtimeMs, size: stats.size });
 		} catch {
 			// Skip unreadable files, exactly as findSessionFile does.
 		}
 	}
-	return newest && `${newest.name}:${newest.mtimeMs}:${newest.size}`;
+	if (identities.length === 0) {
+		return undefined;
+	}
+	identities.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+	return identities.map((entry) => `${entry.name}:${entry.mtimeMs}:${entry.size}`).join(",");
 }
 
 /** One transcript read this scan avoided or paid for, so a caller can report the difference. */
@@ -622,23 +784,46 @@ interface BusySubtreeState {
 	misses: number;
 	/** Walk this dir without a fingerprint until this instant; 0 when it is not bypassed. */
 	cooldownUntil: number;
-	/** The last reuse check was bypassed, so the walk behind it has no key to be stored under. */
-	bypassed: boolean;
 }
 
 /**
- * Retained bytes of one cloned disk node, measured rather than guessed: storing one
- * 256-child roster and dividing the `--expose-gc` heap delta by the node count gives
- * ~640 bytes per node (the node object, its two `Usage` objects with their nested `cost`,
- * the optional `contextUsage`, the children array, and V8's per-object slack). The
- * estimate below charges that plus the two variable-length strings it actually holds, at
- * 2 bytes per char - V8 keeps ASCII at 1 and CJK at 2, and a label is user text, so 2 is
- * the conservative side of the truth. It is an estimate for a ceiling, not an account:
- * what matters is that it grows with what is retained, so a roster of long labels cannot
- * hide under a per-entry constant.
+ * Retained bytes of one cloned disk node, measured rather than guessed.
+ *
+ * Sample shape, since a per-node constant means nothing without one: the roster a capped
+ * scan stores - 257 nodes, being the `maxChildren: 256` children plus the dir's own node -
+ * stored into an empty cache under `--expose-gc`, `heapUsed` delta divided by that node
+ * count. It measured ~640 bytes per node (the node object, its two `Usage` objects with
+ * their nested `cost`, the optional `contextUsage`, the children array, and V8's per-object
+ * slack), and the leak the ceiling was sized from agrees from the other end: 79 MB retained
+ * over 512 live entries is ~158 KB per entry, and 158 KB over 257 nodes is ~615 B.
+ *
+ * The estimate charges that constant plus the variable-length strings a node actually holds,
+ * at 2 bytes per char - V8 keeps ASCII at 1 and CJK at 2, and a label is user text, so 2 is
+ * the conservative side of the truth. It is an estimate for a ceiling, not an account: what
+ * matters is that it grows with what is retained, so a roster of long labels cannot hide
+ * under a per-entry constant.
+ *
+ * The inventory, because a ceiling is only as honest as what it admits to not counting:
+ *
+ * - Counted: 640 B per node, 2 B per char of every string a node holds (`id`, `label`, model
+ *   `provider` and `id`), {@link CACHE_ENTRY_BYTES} per entry, and 2 B per char of the key.
+ * - Counted again, on purpose: `BoundedCache.set` adds a bare `key.length` on top of whatever
+ *   `estimateBytes` returned (bounded-cache.ts:87), so a subtree key costs 3 B per char at
+ *   this level, and the same fingerprint string is charged once more - 2 B per char - as the
+ *   *value* of the `liveKeys` entry that reclaims it. Real retention of a shared immutable
+ *   string is 1-2 B per char, so the one part of a key that can grow is the part charged 3-5x.
+ * - Not counted: a {@link CachedSubtree}'s other two fields - `charge` (eight numbers and
+ *   flags, ~80 B with its object header) and `modelWindows` (one `provider/id=window` per
+ *   distinct model in the subtree, tens of bytes). Both are per-entry constants of the same
+ *   order as the 128 B already charged, and both are smaller than the key over-count on any
+ *   entry whose fingerprint covers a real roster.
+ *
+ * Net direction: conservative, which is the side a ceiling has to err on. What is missed is a
+ * constant per entry; what is inflated grows with the fingerprint, i.e. with exactly the thing
+ * that could otherwise hide under a constant.
  */
 const CACHE_NODE_BYTES = 640;
-/** One cache record's own overhead (key string, record object, map slot). */
+/** One cache record's own overhead (record object, map slot; the key is charged per char on top). */
 const CACHE_ENTRY_BYTES = 128;
 const CACHE_BYTES_PER_CHAR = 2;
 
@@ -684,11 +869,19 @@ export interface ContextTreeDiskScanCacheOptions {
  *   budgeted tree stores one entry per dir it read (a root plus at most `maxChildren`
  *   leaves), so the population is the roster width, not the number of refreshes.
  * - `maxBytes: 16 MiB` per level is the new hard part. The entry cap alone let 560 busy
- *   scans of a 600-child family retain 79 MB (`heapUsed` delta, `--expose-gc`): a busy
- *   family stores a fresh root entry every tick under a fingerprint that will never be
- *   looked up again, and 512 of those at ~164 KB each is the whole leak. 16 MiB holds
- *   ~100 rosters of that size, i.e. the working set with room to spare, and binds long
- *   before the entry cap does.
+ *   scans of a 600-child family retain 79 MB (`heapUsed` delta, `--expose-gc`, 512 entries
+ *   live at the end): a busy family stores a fresh root entry every tick under a fingerprint
+ *   that will never be looked up again, and 512 of those is the whole leak. Per entry that
+ *   measures 79 MB / 512 ~= 158 KB, and per node 158 KB / 257 ~= 615 B - the shape
+ *   {@link CACHE_NODE_BYTES} was set from, arriving from the other direction. What the
+ *   estimator charges for the same entry is higher than what was measured (~165 KB of nodes
+ *   plus 3 B per char of a ~16 KB fingerprint, so ~215 KB), which is the side a ceiling wants.
+ *   16 MiB therefore holds ~100 rosters of the measured size and ~77 of the charged one: the
+ *   working set with room to spare either way, and it binds long before the entry cap does
+ *   (512 entries at 158 KB is 79 MB). One口径 trap worth naming, because it changes the
+ *   answer by 3x: the roster an entry holds is the *capped* one (256 children), not the
+ *   family's 600. Sizing a roster at 600 nodes gives ~466 KB and ~36 rosters, which is not
+ *   what a stored entry contains - a scan never stores children the budget refused.
  * - `idleTtlMs: 15 min` matches the two other {@link BoundedCache} consumers. It is what
  *   reclaims a dir nobody reads again (a finished family, a closed tray), and it is
  *   expiry, not freshness: every hit is still revalidated by the fingerprint.
@@ -738,8 +931,14 @@ export const DEFAULT_CONTEXT_TREE_DISK_CACHE_LIMITS = {
  * without reclaim each of those keeps a whole roster copy alive until some ceiling evicts
  * it. A dir whose subtree keeps moving is also walked without a fingerprint at all for a
  * cooldown (see `busyMissThreshold`): for such a dir the probe cannot hit, and paying it
- * made a cached scan *slower* than no cache - measured +52% at 200 children and +116% at
- * 600, against a walk that reads nothing twice.
+ * made a cached scan *slower* than no cache. Two windows measured that, same paired
+ * same-process口径 (both arms in one process, alternating, with a calibration ring per
+ * round), and the syscall counts agree item by item while the ratios are of one order:
+ * the loaded window (loadavg 30-40) read +52% at 200 children and +116% at 600; a quiet
+ * window (loadavg 2.35 -> 2.56, calibration ring median 1.73 ms) read +55% at 200 and +65%
+ * at 600. With the bypass in place the quiet window reversed direction - 55% cheaper than
+ * no cache at 200 children, 40% at 600 - which is the point of the policy: a probe that can
+ * only miss is pure cost, and the bypass is what stops paying it every tick.
  */
 export class ContextTreeDiskScanCache {
 	/**
@@ -851,7 +1050,8 @@ export class ContextTreeDiskScanCache {
 	 * serves anything: it returns undefined, so the caller walks the disk and gets the
 	 * current tree. What it must not do is store - the walk behind a bypass has no
 	 * fingerprint to be keyed by, and taking one afterwards would key pre-append nodes
-	 * under a post-append identity.
+	 * under a post-append identity. {@link storeSubtree} enforces that off the scan's own
+	 * fingerprint memo, which is the only record of a bypass that cannot be evicted.
 	 */
 	takeSubtree(
 		dir: string,
@@ -864,11 +1064,7 @@ export class ContextTreeDiskScanCache {
 	): CachedSubtree | undefined {
 		const pointerKey = `${dir}\n${key}`;
 		const known = this.busy.get(pointerKey);
-		if (known !== undefined) {
-			known.bypassed = false;
-		}
 		if (known !== undefined && known.cooldownUntil > Date.now()) {
-			known.bypassed = true;
 			this.stats.subtreeBypasses++;
 			this.stats.subtreeMisses++;
 			return undefined;
@@ -877,13 +1073,26 @@ export class ContextTreeDiskScanCache {
 		this.stats.subtreeProbes++;
 		const fullKey = `${pointerKey}\n${fingerprint}`;
 		const cached = this.subtrees.get(fullKey);
-		if (!cached || subtreeModelWindows(cached.nodes, resolveContextWindow) !== cached.modelWindows) {
+		if (cached && subtreeModelWindows(cached.nodes, resolveContextWindow) !== cached.modelWindows) {
 			// A window mismatch is not a transient miss: the same key can only become usable
 			// again if the catalog moves back, and the store below replaces the entry anyway.
 			// Dropping it here is what keeps a resolver change from parking dead rosters.
-			if (cached) {
-				this.subtrees.delete(fullKey);
-			}
+			//
+			//
+			// It is not a *busy* miss either, which is why this is its own branch and not the
+			// one below: the streak answers "does this dir keep moving under me", and a model
+			// catalog that moved says nothing about the dir. Feeding it let two resolver
+			// changes - one per probe, with the disk perfectly still - arm the 60 s bypass,
+			// i.e. let the catalog switch a family off the cache. Deleting the shared
+			// `recordSubtreeMiss` call outright is not the fix either: the branch this came
+			// from also handled "no entry at all", and that miss is the only thing allowed to
+			// arm the bypass (measured: dropping the call for both drops `subtreeBypasses` to 0
+			// and turns the two busy-family pins red).
+			this.subtrees.delete(fullKey);
+			this.stats.subtreeMisses++;
+			return undefined;
+		}
+		if (!cached) {
 			this.stats.subtreeMisses++;
 			this.recordSubtreeMiss(pointerKey);
 			return undefined;
@@ -918,7 +1127,17 @@ export class ContextTreeDiskScanCache {
 		fingerprints?: Map<string, string>,
 	): void {
 		const pointerKey = `${dir}\n${key}`;
-		if (this.busy.get(pointerKey)?.bypassed) {
+		// "The lookup took a fingerprint for this dir and shape" is a fact about *this scan*,
+		// so the scan's own memo is where it is read - not the busy record's `bypassed` flag,
+		// which is what this used to ask. That flag lives in a bounded, evictable cache: lose
+		// the record between the take and the store (one `maxEntries` worth of other dirs is
+		// enough) and a bypassed walk - which by definition took no fingerprint - falls
+		// through to taking one *here*, after the disk was read, and files the nodes it read
+		// under a post-walk identity. That is precisely the staleness the memo exists to
+		// prevent, arriving through the bookkeeping that was supposed to prevent it. The memo
+		// cannot be evicted, so a missing entry is a bypassed (or memo-less) lookup, and there
+		// is nothing to key a store by.
+		if (fingerprints === undefined || !fingerprints.has(subtreeMemoKey(dir, remainingDepth, maxVisible))) {
 			return;
 		}
 		const fingerprint = subtreeFingerprint(dir, remainingDepth, maxVisible, fingerprints);
@@ -977,6 +1196,9 @@ export class ContextTreeDiskScanCache {
 	 * Count a probe that found nothing usable, and start the bypass once a dir has missed
 	 * {@link busyMissThreshold} probes in a row. A hit clears the state instead (see
 	 * `takeSubtree`), so a family that settles gets its hits back after one cooldown.
+	 *
+	 * Only a probe that looked at the disk counts: a reuse refused because the model catalog
+	 * moved is not this dir being busy (see the mismatch branch in `takeSubtree`).
 	 */
 	private recordSubtreeMiss(pointerKey: string): void {
 		const misses = (this.busy.get(pointerKey)?.misses ?? 0) + 1;
@@ -984,7 +1206,6 @@ export class ContextTreeDiskScanCache {
 		this.busy.set(pointerKey, {
 			misses,
 			cooldownUntil: bypass ? Date.now() + this.busyCooldownMs : 0,
-			bypassed: false,
 		});
 	}
 }
