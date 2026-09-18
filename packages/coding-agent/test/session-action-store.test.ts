@@ -9,18 +9,24 @@ import {
 	type DeliveryPolicy,
 	type RuntimeActivity,
 	type SessionAction,
+	type SessionActionPriority,
 	transitionSessionAction,
 } from "../src/core/session-action-store.js";
 
 let nextId = 0;
 
-function turn(text: string, delivery: DeliveryPolicy = "when_run_idle"): SessionAction {
+function turn(
+	text: string,
+	delivery: DeliveryPolicy = "when_run_idle",
+	priority: SessionActionPriority = "background",
+): SessionAction {
 	const id = `action-${nextId++}`;
 	const message: UserMessage = { role: "user", content: text, timestamp: nextId };
 	return {
 		id,
 		source: "internal",
 		delivery,
+		priority,
 		wake: "external_resume",
 		payload: {
 			kind: "turn",
@@ -31,11 +37,16 @@ function turn(text: string, delivery: DeliveryPolicy = "when_run_idle"): Session
 	};
 }
 
-function command(text: string, delivery: DeliveryPolicy = "when_run_idle"): SessionAction {
+function command(
+	text: string,
+	delivery: DeliveryPolicy = "when_run_idle",
+	priority: SessionActionPriority = "background",
+): SessionAction {
 	return {
 		id: `action-${nextId++}`,
 		source: "internal",
 		delivery,
+		priority,
 		wake: "immediate",
 		payload: {
 			kind: "session_command",
@@ -115,6 +126,88 @@ describe("ActionStore selection", () => {
 		expect(store.activeActions()).toEqual([compact]);
 	});
 
+	it("queues human input ahead of background work and behind earlier human input", () => {
+		const store = new ActionStore();
+		const agentOne = turn("a1", "next_turn_boundary");
+		const agentTwo = turn("a2", "next_turn_boundary");
+		const humanOne = turn("h1", "next_turn_boundary", "user");
+		const agentThree = turn("a3", "next_turn_boundary");
+		const humanTwo = turn("h2", "next_turn_boundary", "user");
+		for (const action of [agentOne, agentTwo, humanOne, agentThree, humanTwo]) store.enqueue(action);
+
+		// Human input overtakes queued machine traffic; machine-to-machine order is untouched.
+		expect(store.queuedActions("next_turn_boundary")).toEqual([humanOne, humanTwo, agentOne, agentTwo, agentThree]);
+	});
+
+	it("never inserts ahead of an action that already left the queue", () => {
+		const store = new ActionStore();
+		const running = turn("running", "next_turn_boundary");
+		const agent = turn("a1", "next_turn_boundary");
+		store.enqueue(running);
+		store.enqueue(agent);
+		expect(store.selectFirst()).toBe(running);
+		const human = turn("h1", "next_turn_boundary", "user");
+		store.enqueue(human);
+
+		expect(store.ownedActions()).toEqual([running, human, agent]);
+	});
+
+	it("keeps pinned actions ahead of later human input", () => {
+		const store = new ActionStore();
+		const agent = turn("a1");
+		store.enqueue(agent);
+		const pinned = turn("goal context", "when_run_idle", "pinned");
+		store.enqueue(pinned, "front");
+		const human = turn("h1", "when_run_idle", "user");
+		store.enqueue(human);
+
+		expect(store.queuedActions()).toEqual([pinned, human, agent]);
+	});
+
+	it("appends restored actions verbatim", () => {
+		const store = new ActionStore();
+		const agent = turn("a1");
+		const human = turn("h1", "when_run_idle", "user");
+		store.enqueue(agent, "tail");
+		store.enqueue(human, "tail");
+
+		expect(store.queuedActions()).toEqual([agent, human]);
+	});
+
+	it("keeps the lane ahead of priority: a human follow-up never overtakes a queued steering reply", () => {
+		// r39 QP-4 x #2334: the lane is the first axis, priority the second one. A human
+		// follow-up outranks machine traffic inside its own lane and nothing more.
+		const store = new ActionStore();
+		const agentReply = turn("child reply", "next_turn_boundary");
+		store.enqueue(agentReply);
+		const humanFollowUp = turn("human follow-up", "when_run_idle", "user");
+		store.enqueue(humanFollowUp);
+
+		expect(store.selectFirst()).toBe(agentReply);
+		expect(store.queuedActions("when_run_idle")).toEqual([humanFollowUp]);
+	});
+
+	it("never re-sorts a queue the user reordered by hand", () => {
+		// Ctrl+Alt+Up/Down is an explicit instruction about these items; a later arrival
+		// picks an insertion point and leaves the existing relative order alone.
+		const store = new ActionStore();
+		const first = turn("h1", "when_run_idle", "user");
+		const second = turn("h2", "when_run_idle", "user");
+		store.enqueue(first);
+		store.enqueue(second);
+		store.moveQueued(first, "when_run_idle", 1);
+		expect(store.queuedActions("when_run_idle")).toEqual([second, first]);
+
+		const third = turn("h3", "when_run_idle", "user");
+		store.enqueue(third);
+		expect(store.queuedActions("when_run_idle")).toEqual([second, first, third]);
+
+		// A machine arrival does not climb over the hand-set order either.
+		const background = turn("b1", "when_run_idle");
+		store.enqueue(background);
+		expect(store.queuedActions("when_run_idle")).toEqual([second, first, third, background]);
+	});
+
 	it("supports front insertion without changing rollback-at-original-position", () => {
 		const store = new ActionStore();
 		const selected = turn("selected");
@@ -123,7 +216,7 @@ describe("ActionStore selection", () => {
 		store.enqueue(tail);
 		expect(store.selectFirst()).toBe(selected);
 		const front = turn("goal context");
-		store.enqueueFront(front);
+		store.enqueue(front, "front");
 
 		store.rollback(selected);
 		expect(store.queuedActions()).toEqual([selected, front, tail]);
