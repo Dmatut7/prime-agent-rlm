@@ -106,4 +106,9 @@ cd /tmp/fixL3a-wt/e1 && node packages/coding-agent/scripts/perf/harness-parity.m
 
 - `harness-search-parity.md` §9 的「只报不修」由本笔消除；该文档 §9 与金标准的后续更新归 E 席（remint runbook `e-REMINT-RUNBOOK.md` §2）；本席不写那两处。
 - `scripts/perf/**` 一个字未动（只读跑 `--verify`）；`prime-agent-runtime` / `agent-session.ts` / `FORK_NOTES.md` / `CHANGELOG.md` 未动。
-- 全仓 `src/` 其余 **40 处** `localeCompare`（**24 个文件**；口径＝`grep -rn "localeCompare" packages/*/src --include="*.ts"` 得 42 处，其中 `refinement.ts` 的 2 处是本文件与源码文档字符串里的引用，其余 40 处逐条清单在 OBS-E1 交付 `EVIDENCE/localeCompare-rest-of-src.txt`）**只报不改**，交母席裁。值得优先裁的六处（digest/装配邻接）：`compaction/fact-appendix.ts:611,622`、`system-prompt.ts:182`（enabled servers 排序，直接进 system prompt 渲染）、`rlm-runtime.ts:260`（selector 序）、`core/kernel/bootstrap.ts`＋`core/retention/kernel-snapshot.ts`（内核装配序）、`utils/version-check.ts:42,48`（版本比较，`localeCompare` 语义与语义化版本不同）。其中 `model-selector.ts:364,407` 是 `localeCompare(x, undefined, { numeric: true })`＝**刻意的数字序用法**，若将来统一码点比较要单独裁。
+- 全仓 `src/` 其余 **40 处** `localeCompare`（**24 个文件**；口径＝`grep -rn "localeCompare" packages/*/src --include="*.ts"` 得 42 处，其中 `refinement.ts` 的 2 处是本文件与源码文档字符串里的引用，其余 40 处逐条清单在 OBS-E1 交付 `EVIDENCE/localeCompare-rest-of-src.txt`）**只报不改**。**母席已裁（2026-09-18）**：40 处全部入 backlog、本批不动，按下述分层处置——
+  - **优先第一＝`system-prompt.ts:182`**：enabled servers 排序**直接进 system prompt 渲染**，跨 locale 漂会作废**所有会话**的前缀缓存，影响面大于 digest 邻接面。
+  - **其次＝`compaction/fact-appendix.ts:611,622`**：进压缩摘要文本。
+  - **其余按 backlog 排**：`rlm-runtime.ts:260`（selector 序）、`core/kernel/bootstrap.ts` ＋ `core/retention/kernel-snapshot.ts`（内核装配序）。
+  - **`model-selector.ts:364,407` 不动**：`localeCompare(x, undefined, { numeric: true })` 是**给人看的排序、刻意用法**（数字序正是它要的行为），不属"平手序必须 locale 无关"这一类；**禁止**在统一码点比较时顺手改掉。
+  - **`utils/version-check.ts:42,48` 单独裁、不入此批**：那是**版本比较**，与"平手序排序"语义不同，不能混为一谈。
