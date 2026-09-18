@@ -411,6 +411,28 @@ function listChildSessionDirs(rlmSessionDir: string): string[] {
 }
 
 /**
+ * The fingerprint `dir` should be keyed by, memoized for the duration of one scan.
+ *
+ * `memory` is created per {@link scanChildrenInto} call and never outlives it, so the memo
+ * can only save the duplicate pass inside a single scan - never a lookup against a
+ * fingerprint the tree has since moved past. Without it (a one-off probe with no memo), the
+ * fingerprint is taken as it always was.
+ */
+function subtreeFingerprint(dir: string, remainingDepth: number, memory?: Map<string, string>): string {
+	if (!memory) {
+		return fingerprintRlmSessionDir(dir, remainingDepth);
+	}
+	const memoKey = `${dir}#${remainingDepth}`;
+	const remembered = memory.get(memoKey);
+	if (remembered !== undefined) {
+		return remembered;
+	}
+	const value = fingerprintRlmSessionDir(dir, remainingDepth);
+	memory.set(memoKey, value);
+	return value;
+}
+
+/**
  * Stat-only fingerprint of the `sub-*` tree under an RLM session dir.
  *
  * The context tree rebuilt on every UI refresh comes from reading and folding the
@@ -427,14 +449,23 @@ function listChildSessionDirs(rlmSessionDir: string): string[] {
  */
 function fingerprintRlmSessionDir(dir: string, remainingDepth: number): string {
 	const parts: string[] = [];
-	const walk = (current: string, remaining: number): void => {
+	// `listed` carries the names a caller already read, so one listing of a child dir serves
+	// both the transcript identity and the descent into it. The two used to be separate
+	// `readdir` calls, which doubled the syscall count of every fingerprint - and a fingerprint
+	// is paid on every reuse check as well as on every miss. `undefined` means "not listed
+	// yet, read it here", which keeps the unreadable-dir branch below exactly as it was.
+	const walk = (current: string, remaining: number, listed?: string[]): void => {
 		let names: string[];
-		try {
-			names = readdirSync(current);
-		} catch {
-			// Unreadable or gone: the scan would list nothing here either.
-			parts.push(`${current}?`);
-			return;
+		if (listed !== undefined) {
+			names = listed;
+		} else {
+			try {
+				names = readdirSync(current);
+			} catch {
+				// Unreadable or gone: the scan would list nothing here either.
+				parts.push(`${current}?`);
+				return;
+			}
 		}
 		for (const name of names.sort()) {
 			if (!name.startsWith("sub-")) {
@@ -451,12 +482,20 @@ function fingerprintRlmSessionDir(dir: string, remainingDepth: number): string {
 				continue;
 			}
 			parts.push(`${name}:${stats.mtimeMs}:${stats.size}`);
-			const transcript = newestTranscriptFingerprint(path);
+			let childNames: string[] | undefined;
+			try {
+				childNames = readdirSync(path);
+			} catch {
+				// An unreadable child is not listable: the descent below re-lists it and records
+				// the same `?` marker it always did, and it contributes no transcript identity.
+				childNames = undefined;
+			}
+			const transcript = childNames === undefined ? undefined : newestTranscriptFingerprint(path, childNames);
 			if (transcript) {
 				parts.push(`@${transcript}`);
 			}
 			if (remaining > 1) {
-				walk(path, remaining - 1);
+				walk(path, remaining - 1, childNames);
 			}
 		}
 	};
@@ -464,14 +503,11 @@ function fingerprintRlmSessionDir(dir: string, remainingDepth: number): string {
 	return parts.join("|");
 }
 
-/** `name:mtimeMs:size` of the newest transcript in a dir, or undefined when there is none. */
-function newestTranscriptFingerprint(dir: string): string | undefined {
-	let names: string[];
-	try {
-		names = readdirSync(dir);
-	} catch {
-		return undefined;
-	}
+/**
+ * `name:mtimeMs:size` of the newest transcript in a dir, from a listing the caller already has,
+ * or undefined when there is none.
+ */
+function newestTranscriptFingerprint(dir: string, names: string[]): string | undefined {
 	let newest: { name: string; mtimeMs: number; size: number } | undefined;
 	for (const name of names) {
 		if (!name.endsWith(".jsonl")) {
@@ -554,6 +590,12 @@ export class ContextTreeDiskScanCache {
 	 * besides the on-disk tree that the walk's result depends on (level, budget, live
 	 * ids) - the fingerprint covers the tree itself. On a hit the caller's `state` is
 	 * charged what the walked miss was charged.
+	 *
+	 * `fingerprints` is the calling scan's own memo of this dir's fingerprint (see
+	 * {@link subtreeFingerprint}): a miss is probed here and stored after the walk, and
+	 * both used to fingerprint the same tree, so a miss paid for the whole readdir/stat
+	 * pass twice. The memo lives for exactly one scan, so a later call re-fingerprints
+	 * and cannot reuse a lookup key that is no longer current.
 	 */
 	takeSubtree(
 		dir: string,
@@ -561,8 +603,9 @@ export class ContextTreeDiskScanCache {
 		key: string,
 		state: ContextTreeScanState,
 		resolveContextWindow: ContextWindowResolver,
+		fingerprints?: Map<string, string>,
 	): CachedSubtree | undefined {
-		const cached = this.subtrees.get(`${fingerprintRlmSessionDir(dir, remainingDepth)}#${key}`);
+		const cached = this.subtrees.get(`${subtreeFingerprint(dir, remainingDepth, fingerprints)}#${key}`);
 		if (!cached || subtreeModelWindows(cached.nodes, resolveContextWindow) !== cached.modelWindows) {
 			this.stats.subtreeMisses++;
 			return undefined;
@@ -572,7 +615,14 @@ export class ContextTreeDiskScanCache {
 		return { nodes: cloneContextTreeNodes(cached.nodes), charge: cached.charge, modelWindows: cached.modelWindows };
 	}
 
-	/** Remember one walked subtree, keyed exactly as it was looked up. */
+	/**
+	 * Remember one walked subtree, keyed exactly as it was looked up.
+	 *
+	 * The key is the fingerprint the lookup used when the scan passed it, not a fresh one
+	 * taken after the walk: a child that appended while the walk was reading is then a
+	 * fingerprint the stored nodes predate, so the next scan misses and re-walks, instead
+	 * of storing the post-append identity over pre-append nodes and serving them as fresh.
+	 */
 	storeSubtree(
 		dir: string,
 		remainingDepth: number,
@@ -580,8 +630,9 @@ export class ContextTreeDiskScanCache {
 		nodes: ContextTreeNode[],
 		charge: CachedScanCharge,
 		resolveContextWindow: ContextWindowResolver,
+		fingerprints?: Map<string, string>,
 	): void {
-		this.remember(this.subtrees, `${fingerprintRlmSessionDir(dir, remainingDepth)}#${key}`, {
+		this.remember(this.subtrees, `${subtreeFingerprint(dir, remainingDepth, fingerprints)}#${key}`, {
 			nodes: cloneContextTreeNodes(nodes),
 			charge,
 			modelWindows: subtreeModelWindows(nodes, resolveContextWindow),
@@ -997,6 +1048,10 @@ function scanChildrenInto(
 		skipIds,
 		total: emptyScanCharge(),
 	};
+	// One memo for this scan only: the lookup and the store of the same miss are two
+	// fingerprints of the same tree, and the tree cannot change between them without an
+	// await in a synchronous walk.
+	const fingerprints = new Map<string, string>();
 	const queue: ScanFrame[] = [root];
 	const misses: ScanFrame[] = [];
 	for (let index = 0; index < queue.length; index++) {
@@ -1008,6 +1063,7 @@ function scanChildrenInto(
 			frameSubtreeKey(frame, state),
 			state,
 			resolveContextWindow,
+			fingerprints,
 		);
 		if (cached) {
 			frame.total = cached.charge;
@@ -1064,6 +1120,7 @@ function scanChildrenInto(
 				frame.siblings,
 				frame.total,
 				resolveContextWindow,
+				fingerprints,
 			);
 		}
 	}
