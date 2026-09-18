@@ -1268,6 +1268,18 @@ export class InteractiveMode {
 		return this.uiServices.modelRegistry;
 	}
 
+	/**
+	 * `uiServices` as a partial-mode harness leaves it. The field is private and assigned by
+	 * the constructor, so a mode built through the prototype (how the resync and throttle
+	 * harnesses are built) has none; reading `this.uiServices` directly there throws out of
+	 * whatever path called in. The cosmetic paths ask here instead, and stop when the answer
+	 * is undefined - a real mode always has it, since the constructor refuses to build one
+	 * without.
+	 */
+	private get uiServicesOrUndefined(): InteractiveModeUiServices | undefined {
+		return (this as unknown as { uiServices?: InteractiveModeUiServices }).uiServices;
+	}
+
 	constructor(private options: InteractiveModeOptions) {
 		const uiServices = options.uiServices ?? options.localSessionHost?.createUiServices();
 		if (!uiServices) {
@@ -1704,6 +1716,15 @@ export class InteractiveMode {
 		// initializer may be absent there; the refresh is cosmetic and must
 		// never crash a real flow on any `this`.
 		this.topBarCostRefresh ??= { generation: 0, lastSuccessGeneration: 0 };
+		// The settings surface behind the emergency switch is reached through
+		// `this.uiServices`, and the same partial harnesses have neither (the field is
+		// assigned by the constructor, which they do not run). Reading it there throws a
+		// TypeError out of whatever path called in - `renderResyncedSession` calls this on
+		// a reconnect, so the crash would land in a real rendering path. The refresh is
+		// cosmetic, so it stops here and the header keeps the figure it already holds; a
+		// mode built by the constructor always has uiServices, which it refuses to build
+		// without.
+		if (this.uiServicesOrUndefined === undefined) return;
 		const generation = ++this.topBarCostRefresh.generation;
 		const connection = this.agentConnection;
 		const sessionId = this.connectionState?.sessionId;
