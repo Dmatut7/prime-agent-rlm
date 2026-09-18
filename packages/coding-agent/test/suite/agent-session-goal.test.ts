@@ -12,7 +12,15 @@ import { ModelRegistry } from "../../src/core/model-registry.js";
 import { SessionManager } from "../../src/core/session-manager.js";
 import { SettingsManager } from "../../src/core/settings-manager.js";
 import { createTestResourceLoader } from "../utilities.js";
-import { createHarness, getAssistantTexts, getMessageText, type Harness, type HarnessOptions } from "./harness.js";
+import {
+	conversationMessages,
+	createHarness,
+	getAssistantTexts,
+	getMessageText,
+	type Harness,
+	type HarnessOptions,
+} from "./harness.js";
+import { createDeferred } from "./scheduling.js";
 
 function assistantWithUsage(message: string | AssistantMessage, usage: Partial<Usage>): AssistantMessage {
 	const base = typeof message === "string" ? fauxAssistantMessage(message) : message;
@@ -790,6 +798,94 @@ describe("AgentSession goals", () => {
 		expect(visibleAssistantTexts(harness)).toEqual([]);
 		expect(harness.session.goalState.status).toBe(status);
 		expect(harness.getPendingResponseCount()).toBe(1);
+	});
+
+	// #2334: the goal context is the queue's only `pinned` producer, and `pinned` is the one
+	// rank above a human's `user`. This is the pin for that single production use
+	// (`_runOrQueueGoalContext`): the goal context takes the front insertion point, and a
+	// human prompt arriving after it outranks every piece of machine traffic in the lane
+	// without outranking the goal context. Mutation M7 (dropping `priority: "pinned"` there
+	// and leaving the front insertion in place) turns it red, because the arrival scan then
+	// walks straight past the demoted goal context and inserts the human ahead of it.
+	it("keeps a queued goal context ahead of a human follow-up that arrives after it", async () => {
+		// One gate per tool call: the goal context has to be queued while a turn is still
+		// running, so the first blocked turn is released and the second one is held.
+		const phases = [createDeferred<void>(), createDeferred<void>()];
+		const entered = [createDeferred<void>(), createDeferred<void>()];
+		let waitCalls = 0;
+		const phasedWait: AgentTool = {
+			name: "wait",
+			label: "Wait",
+			description: "Wait for release.",
+			parameters: Type.Object({}),
+			execute: async () => {
+				const index = Math.min(waitCalls++, phases.length - 1);
+				entered[index].resolve();
+				await phases[index].promise;
+				return { content: [{ type: "text", text: "released" }], details: {} };
+			},
+		};
+		const harness = await createGoalHarness([phasedWait]);
+		harness.setResponses([
+			// turn A: the blocked turn both queued inputs land behind
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			// turn B: the human steer that keeps the session busy while the goal context waits
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("held turn done"),
+			// the queued goal context's own turn, completing the goal so no continuation follows
+			fauxAssistantMessage(fauxToolCall("ipython", COMPLETE_GOAL_CELL), { stopReason: "toolUse" }),
+			fauxAssistantMessage("Goal complete."),
+			// the human follow-up that arrived after the goal context
+			fauxAssistantMessage("human turn"),
+			fauxAssistantMessage("spare turn"),
+		]);
+
+		const firstTurn = harness.session.prompt("start a blocking turn");
+		await entered[0].promise;
+
+		// A session command is dispatched by the pump once the agent is idle, so both of
+		// these are queued while the first turn is still running. Same lane, same priority,
+		// so FIFO keeps the command ahead of the human prompt that will hold the next turn.
+		await harness.session.prompt("/goal finish the long task");
+		await harness.session.prompt("hold the next turn", { streamingBehavior: "steer", queueIfBusy: true });
+		phases[0].resolve();
+
+		// The command ran at the boundary and queued the goal context; the human steer then
+		// took the next turn, so the goal context is still queued while the session is busy.
+		await entered[1].promise;
+		const queuedGoal = harness.session.getSessionActionRecoverySnapshot().actions;
+		expect(queuedGoal.map((action) => action.priority)).toEqual(["pinned"]);
+		expect(queuedGoal[0]?.payload.text).toContain("<goal_context>");
+
+		// The user types while the goal context is queued, deferring to the same lane. Human
+		// input outranks machine traffic there; `pinned` is the one rank above it, so the
+		// goal context keeps the head of the lane and the human takes the next slot.
+		await harness.session.prompt("human after the goal", { streamingBehavior: "followUp", queueIfBusy: true });
+		const queued = harness.session.getSessionActionRecoverySnapshot().actions;
+		expect(queued.map((action) => action.priority)).toEqual(["pinned", "user"]);
+		expect(queued[0]?.payload.text, "the pinned goal context must hold the head of the lane").toContain(
+			"<goal_context>",
+		);
+		expect(queued[1]?.payload.text).toBe("human after the goal");
+
+		phases[1].resolve();
+		await firstTurn;
+		await harness.session.waitForIdle();
+		expect(harness.session.getSessionActionRecoverySnapshot().actions).toEqual([]);
+
+		// Ordering, not dropping: the goal context reached the transcript, the human prompt
+		// reached it too, and the goal context got there first. (The queue-level assertions
+		// above are the M7-sensitive half; this half says the rank did not swallow anything.)
+		const delivered = conversationMessages(harness.session);
+		const goalIndex = delivered.findIndex(
+			(message) => message.role === "custom" && message.customType === "goal_context",
+		);
+		const humanIndex = delivered.findIndex((message) => getMessageText(message) === "human after the goal");
+		expect(goalIndex).toBeGreaterThan(-1);
+		expect(humanIndex).toBeGreaterThan(-1);
+		expect(goalIndex).toBeLessThan(humanIndex);
+		expect(visibleAssistantTexts(harness)).toContain("Goal complete.");
+		expect(visibleAssistantTexts(harness)).toContain("human turn");
 	});
 
 	it("pauses an active goal with /goal pause", async () => {
