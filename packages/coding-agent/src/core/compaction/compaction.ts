@@ -1299,6 +1299,14 @@ async function completeSummarizationRequest(options: SummarizationCallOptions): 
 		previousSummary,
 		errorLabel,
 	} = options;
+	// An abort that landed while the caller was parked - the gate watchdog cutting
+	// a hung hook is the live example - must not still spend a wire call. Throw the
+	// same AbortError shape the aborted request itself produces, so every catch
+	// site (manual and auto compaction alike) settles this as a cancellation, and
+	// the retry loop's own signal check keeps covering mid-flight aborts.
+	if (signal?.aborted) {
+		throw new DOMException("This operation was aborted", "AbortError");
+	}
 	const inflation = clampSummarizationInflation(options.inflation ?? summarizationInflation(currentMessages));
 	const wrapperText = summarizationFrameText({
 		style,
