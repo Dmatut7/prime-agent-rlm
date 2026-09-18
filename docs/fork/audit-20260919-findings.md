@@ -27,9 +27,9 @@
 
 ## 审查发现账（按严重度）
 ### 中
-- M1 context-tree.ts:1611-1615 缓存命中分支漏 addScanCharge → 父帧缓存永久少算命中子树统计，/context 截断标记可丢（review-topbar-scan）。
+- M1 context-tree.ts:1611-1615 缓存命中分支漏 addScanCharge → 父帧缓存永久少算命中子树统计，/context 截断标记可丢（review-topbar-scan）。**已机械实锤**：复现器 /tmp/charge-rollup-proof3.mts（三层树混合命中场景），回放 scannedChildren=3/bytesRead=2871 vs 真值 4/3613；若丢的 charge 带 truncated=true，暖命中会把截断树报成完整。引入 1917d1049，后续五笔未碰，测试无 mixed-scan charge 断言。
 - M2 preflight-push.sh:179-187 PRIME_AGENT_KERNEL_PYTHON 给错时 fail-open（自称 fail-closed）；且不查 PREFLIGHT_KERNEL_REASON 逃生门，PREFLIGHT_REQUIRE_ALL_FACES=1 也拦不住（review-ci-release）。
-### 低（12 条）
+### 低（14 条）
 - L1 删 harness 条目后删除新闻被重复投递 ~7KB（78af6fc4d 豁免覆盖不到自删；review-digest-ranking）。
 - L2 指纹严于渲染的过度投递（180 字符截断后改动照样重投；方向安全）。
 - L3 05c8f2972 位掩码串位（18 分钟窗口内已修 a5f4868c0，备案）。
@@ -44,6 +44,8 @@
 - L12 定价面 6 条：互斥标注同挂（subagent-summary-line.ts:101）、缓存浅拷贝共享引用（context-tree.ts:1184/1190）、回放绕过预算闸（:1111）、归因差口只钳负向、巨率溢出 $Infinity、subagentSpendCell 配置用 !==false。
 - L13 凭证隔离 SIGKILL 用例空转（stub 立即 exit，杀的是已退进程，名义命题不可证伪）；waitForProbe existsSync 已知 flake 类（f93cd9a4e，review-daemon-reliability）。
 - L14 压缩闸 watchdog 单槽位：branch summary 与 compaction 真并发时后者有窄窗无看门狗（9efce5abd）。
+- L15 主案两发现升级【高】：自旋本体（_waitForIdleOrSettlement 落穿微任务环）+ 第二独立触发（deferred 错误路径漏 committing/running 态，活会话即可自燃，agent-session.ts:9641-9656）。
+- L16 tool-output-budget.ts 首行超预算按 UTF-16 码元切，可切裂代理对（装饰面）。
 ### 窗口内已修备案
 - 8ed6d73bc 的 mkdir 搬进循环 $REPORT 未绑定（4612e8953 已修）。
 
@@ -55,6 +57,13 @@
 - 候选3【低】resumeDeferredWorkerRecovery 每 5s 真定时器空转（不饿死，只贫转）。
 - 触发路径二（topbar-scan 实锤）：_pumpSessionInputs 的 deferred 错误路径（agent-session.ts:9641-9656）对已落盘动作不回滚不置败 ⇒ 永久漏在 committing/running ⇒ unfinishedActionCount 永 ≥1 ⇒ **活会话无需 teardown 也会在此后任何 waitForIdle 调用上自旋**（慢性病，人人有份）。
 - 修复四候选：a) 落穿分支加 setImmediate 宏任务让出（保险丝）；b) dispose 窗口禁入 waitForIdle 族；c) deferred 路径已落盘动作显式置 failed；d) supervisor 超时连击 N 次强杀+广播死因。
+
+## 收官补遗（switch-path-2）
+- 自旋复现成功：/tmp/spin-repro.ts 手造 committing 滞留+waitForIdle ⇒ 99% CPU 27 分钟、自身退出定时器被饿死——与线上签名逐帧吻合（红测雏形在此）。
+- 【关键补强】dispose() 也清不动 committing/running：_cancelSessionActions 默认只取 {queued,selected,preparing}（store 262-267）⇒ 修复项(c)（deferred 路径显式终态化已落盘动作）是**必修**不是选修。
+- 【历史复发机制】_prompt 非排队准入结尾 await waitForSessionInputIdle()（agent-session.ts:8602/8711）⇒ 一旦有动作滞留，老板按一次 Enter 活会话即自旋——08-24/08-25/09-10/09-17 同型 30s attach 超时大概率同根。
+- 【恢复安全性】恢复快照只含 queued 动作，滞留的 committing/running 不进快照 ⇒ 家族重开安全不复燃。
+- 修复补强：a) 落穿分支除 setImmediate 外加「零进展自检」（连续 N 次迭代四状态全不变 ⇒ log+break 报错）；d) supervisor 连击计数已有雏形（consecutiveFailures 字段），只差动作。
 
 ## 舰队事故（本会话教训）
 - 3 席真死（stopReason=toolUse 后回合戛止、文本断半句）：sub-82df0ec6、sub-8a5ca4b5、sub-e4d0816e。均 K3-max。死因未定位，疑似下一会话请求未发出。
