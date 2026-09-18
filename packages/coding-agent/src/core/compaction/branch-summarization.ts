@@ -390,6 +390,13 @@ export async function generateBranchSummary(
 			timestamp: Date.now(),
 		},
 	];
+	// An abort that landed while the caller was still parked - the gate watchdog
+	// cutting a hung `session_before_tree` hook is the live example - must not
+	// still spend a wire call: the request would burn a paid provider call for a
+	// summary nobody will read. Check before the attempt, not only after it.
+	if (signal?.aborted) {
+		return { aborted: true };
+	}
 	const retryPolicy = retry ?? DEFAULT_PROVIDER_RETRY_POLICY;
 	const response = await completeWithProviderRetry(
 		() =>
