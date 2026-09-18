@@ -134,6 +134,7 @@ import {
 	parseSlashCommand,
 	resolveBuiltinSlashCommandName,
 } from "../../core/slash-commands.js";
+import { createSpendPricing, type SpendPricing, spendOverrideCorrection } from "../../core/spend-pricing.js";
 import { formatStallEventLines } from "../../core/stall-diagnostics-render.js";
 import {
 	captureAgentCommandUsed,
@@ -1642,6 +1643,10 @@ export class InteractiveMode {
 	 * Refresh the top bar's cached session spend from the context tree.
 	 * Results for a replaced session, or superseded by a newer successful
 	 * refresh, are discarded — mirroring refreshConnectionContextUsage.
+	 *
+	 * The tree's own total is the recorded spend; `spendOverrideCorrection` adds
+	 * back the difference a price override makes to the same nodes, so the header
+	 * agrees with /usage instead of keeping the rate the user just corrected.
 	 */
 	private refreshTopBarCost(): void {
 		// Partial-mode test harnesses skip the constructor, so the field
@@ -1655,7 +1660,11 @@ export class InteractiveMode {
 		void (async () => {
 			try {
 				const tree = await connection.getContextTree();
-				const total = tree?.totalUsage?.cost?.total;
+				const recorded = tree?.totalUsage?.cost?.total;
+				const total =
+					tree && typeof recorded === "number"
+						? recorded + spendOverrideCorrection(tree, this.spendPricing())
+						: recorded;
 				if (
 					typeof total !== "number" ||
 					!Number.isFinite(total) ||
@@ -6535,7 +6544,10 @@ export class InteractiveMode {
 			const tree = await this.agentConnection.getContextTree();
 			this.subagentSpendLastScanAt = Date.now();
 			this.subagentSpendLastScanMs = this.subagentSpendLastScanAt - scanStartedAt;
-			this.subagentSummaryLine.setSubagentSpend(summarizeSubagentSpend(tree, (model) => this.isModelPriced(model)));
+			const pricing = this.spendPricing();
+			this.subagentSummaryLine.setSubagentSpend(
+				summarizeSubagentSpend(tree, (model) => pricing.isPriced(model), pricing),
+			);
 			this.ui.requestRender();
 		} catch {
 			// Silent degrade: no data, no cell update.
@@ -6551,13 +6563,16 @@ export class InteractiveMode {
 	}
 
 	/**
-	 * Whether a model has per-token rates. A registry miss or an all-zero `cost`
-	 * block (models.json entries without `cost` load as zeros) means the model's
-	 * usage carries no money - flagged as unpriced rather than silently free.
+	 * The price book behind every spend figure in this mode: a model's
+	 * `ui.subagentSpendCell.priceOverrides` correction wins field by field, and
+	 * the `models.json` rate (through the registry) fills the rest. Rates are
+	 * read per refresh, so an edited override lands on the next one.
 	 */
-	private isModelPriced(model: { provider: string; id: string }): boolean {
-		const cost = this.modelRegistry.find(model.provider, model.id)?.cost;
-		return cost !== undefined && (cost.input > 0 || cost.output > 0 || cost.cacheRead > 0 || cost.cacheWrite > 0);
+	private spendPricing(): SpendPricing {
+		return createSpendPricing({
+			overrides: this.settingsManager.getSubagentSpendCellPriceOverrides(),
+			ratesFor: (model) => this.modelRegistry.find(model.provider, model.id)?.cost,
+		});
 	}
 
 	private removeSubagentSnapshot(id: string): void {
@@ -10411,7 +10426,7 @@ export class InteractiveMode {
 		try {
 			const tree = await this.agentConnection.getContextTree();
 			const width = Math.max(60, Math.min(this.ui.terminal.columns - 2, 120));
-			info = formatContextTree(tree, width);
+			info = formatContextTree(tree, width, this.spendPricing());
 		} catch (error) {
 			this.showError(error instanceof Error ? error.message : String(error));
 			return;

@@ -1,6 +1,6 @@
-import type { Usage } from "@earendil-works/pi-ai";
 import { type Component, type Focusable, getKeybindings, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { ContextTreeNode } from "../../../core/context-tree.js";
+import { nodeSpendMoney, type SpendPricing, spendRelevantTokens } from "../../../core/spend-pricing.js";
 import type { AgentConnectionRlmChildAgentSnapshot } from "../../agent-connection/index.js";
 import { collectSubagentDescendantSummaries } from "../../agents-view/agents-view-state.js";
 import { type AgentRosterStatus, classifyAgentStatus } from "../../daemon/agent-roster.js";
@@ -54,18 +54,25 @@ export interface SubagentSpendSummary {
 	parentCost: number;
 	/** Models with no per-token rates: their tokens carry no money and are flagged instead. */
 	unpriced: ReadonlyArray<{ model: string; tokens: number }>;
+	/**
+	 * Models whose money was re-priced by `ui.subagentSpendCell.priceOverrides`
+	 * instead of by the rate recorded on their messages. Absent while no override
+	 * applies, so a session without overrides reads exactly as it did before.
+	 */
+	overridePriced?: ReadonlyArray<{ model: string; tokens: number }>;
 	/** A scan budget truncated the tree, so every figure is a lower bound. */
 	partial: boolean;
-}
-
-/** Spend-relevant token count, matching the "Total" line of /usage. */
-function spentTokens(usage: Usage): number {
-	return usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
 }
 
 /**
  * Fold a session's context tree into the tray's spend summary (see
  * {@link SubagentSpendSummary} for the double-counting rules).
+ *
+ * Money comes from `pricing` for the models it has an override for (the
+ * override wins field by field over the models.json rate) and from the money
+ * recorded on the message otherwise: a session with no overrides therefore
+ * totals exactly what it totalled before, while a corrected rate moves the
+ * figure for work already on screen.
  *
  * A node whose own usage already carries cost is treated as priced whatever
  * its recorded model says: the money was computed at generation time with real
@@ -76,20 +83,27 @@ function spentTokens(usage: Usage): number {
 export function summarizeSubagentSpend(
 	root: ContextTreeNode,
 	isModelPriced: (model: { provider: string; id: string }) => boolean,
+	pricing?: SpendPricing,
 ): SubagentSpendSummary {
 	let cost = 0;
 	let tokens = 0;
 	let partial = false;
 	const unpriced = new Map<string, number>();
+	const overridePriced = new Map<string, number>();
 	const walk = (node: ContextTreeNode, isRoot: boolean): void => {
 		if (node.scan?.truncated) partial = true;
 		if (!isRoot) {
-			const nodeTokens = spentTokens(node.ownUsage);
-			cost += node.ownUsage.cost.total;
+			const nodeTokens = spendRelevantTokens(node.ownUsage);
+			const attributed = pricing?.attribute(node.model, node.ownUsage);
+			const nodeCost = nodeSpendMoney(node, pricing);
+			cost += nodeCost;
 			tokens += nodeTokens;
-			if (node.ownUsage.cost.total === 0 && nodeTokens > 0 && (!node.model || !isModelPriced(node.model))) {
+			if (nodeCost === 0 && nodeTokens > 0 && (!node.model || !isModelPriced(node.model))) {
 				const key = node.model?.id ?? "?";
 				unpriced.set(key, (unpriced.get(key) ?? 0) + nodeTokens);
+			}
+			if (attributed && node.model) {
+				overridePriced.set(node.model.id, (overridePriced.get(node.model.id) ?? 0) + nodeTokens);
 			}
 		}
 		for (const child of node.children) {
@@ -100,10 +114,20 @@ export function summarizeSubagentSpend(
 	return {
 		cost,
 		tokens,
-		parentCost: root.ownUsage.cost.total,
+		parentCost: nodeSpendMoney(root, pricing),
 		unpriced: [...unpriced.entries()]
 			.map(([model, unpricedTokens]) => ({ model, tokens: unpricedTokens }))
 			.sort((a, b) => b.tokens - a.tokens || (a.model < b.model ? -1 : 1)),
+		// Only present when an override actually priced something: the marker is
+		// about this family, and a field that is always there would read as "no
+		// overrides" in every consumer that includes it.
+		...(overridePriced.size > 0
+			? {
+					overridePriced: [...overridePriced.entries()]
+						.map(([model, pricedTokens]) => ({ model, tokens: pricedTokens }))
+						.sort((a, b) => b.tokens - a.tokens || (a.model < b.model ? -1 : 1)),
+				}
+			: {}),
 		partial,
 	};
 }
@@ -307,6 +331,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 			spend.tokens,
 			spend.parentCost,
 			spend.unpriced.map((entry) => `${entry.model}:${entry.tokens}`).join(","),
+			(spend.overridePriced ?? []).map((entry) => `${entry.model}:${entry.tokens}`).join(","),
 			spend.partial ? 1 : 0,
 		].join("\u0002");
 	}
@@ -377,8 +402,9 @@ export class SubagentSummaryLine implements Component, Focusable {
 	 * The spend cell, degraded to the widest form that fits `budget` columns.
 	 *
 	 * Degradation order (each step loses exactly one thing): "总" first (the
-	 * least valuable figure by design), then the unpriced annotation's token
-	 * counts, then the annotation itself, then the whole cell - a truncated
+	 * least valuable figure by design), then the annotations' token counts
+	 * (unpriced and override markers alike), then the annotations themselves,
+	 * then the whole cell - a truncated
 	 * money figure would read as a wrong number, so the cell is dropped, never
 	 * ellipsized. All-zero figures render nothing (no ¥0.00 noise), and an
 	 * all-unpriced family shows tokens plus the warning instead of ¥0.00.
@@ -398,8 +424,12 @@ export class SubagentSummaryLine implements Component, Focusable {
 		const secondary =
 			total > 0 ? `${dot}${theme.fg("dim", `总 ${spend.partial ? "≈" : ""}${formatSpendCost(total)}`)}` : "";
 		const annotate = (withTokens: boolean): string => {
-			const annotation = this.renderUnpricedAnnotation(spend, withTokens);
-			return annotation ? ` ${annotation}` : "";
+			const annotations = [
+				this.renderUnpricedAnnotation(spend, withTokens),
+				this.renderOverrideAnnotation(spend, withTokens),
+			];
+			const text = annotations.filter((annotation) => annotation.length > 0).join(" ");
+			return text ? ` ${text}` : "";
 		};
 		const rungs = [
 			primary + secondary + annotate(true),
@@ -420,6 +450,20 @@ export class SubagentSummaryLine implements Component, Focusable {
 			.map((entry) => (withTokens ? `${entry.model} ${formatTokenCount(entry.tokens)}` : entry.model))
 			.join(" · ");
 		return theme.fg("warning", `(${models}${withTokens ? " tok" : ""} 未定价)`);
+	}
+
+	/**
+	 * `(qwen3.8-flash 8.1M tok 已改价)` for models the settings re-priced. The
+	 * marker is what makes a corrected price legible where the money is read: the
+	 * figure is right, and `/usage` names the override behind it.
+	 */
+	private renderOverrideAnnotation(spend: SubagentSpendSummary, withTokens: boolean): string {
+		const priced = spend.overridePriced ?? [];
+		if (priced.length === 0) return "";
+		const models = priced
+			.map((entry) => (withTokens ? `${entry.model} ${formatTokenCount(entry.tokens)}` : entry.model))
+			.join(" · ");
+		return theme.fg("accent", `(${models}${withTokens ? " tok" : ""} 已改价)`);
 	}
 
 	private renderInfoLine(width: number): string[] {

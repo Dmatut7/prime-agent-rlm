@@ -2,6 +2,13 @@ import type { Usage } from "@earendil-works/pi-ai";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { ContextTreeNode, ContextTreeTruncatedReason } from "../../../core/context-tree.js";
 import type { ContextUsage } from "../../../core/extensions/index.js";
+import {
+	collectSpendPriceSources,
+	nodeSpendMoney,
+	SPEND_PRICE_OVERRIDES_PATH,
+	type SpendPricing,
+	spendRelevantTokens,
+} from "../../../core/spend-pricing.js";
 import { addAssistantUsage, emptyUsage } from "../../../core/usage.js";
 import { formatTokenCount } from "../agent-activity.js";
 import { theme } from "../theme/theme.js";
@@ -46,11 +53,6 @@ function flattenContextTree(root: ContextTreeNode): ContextTreeRow[] {
 	};
 	walk(root.children, "");
 	return rows;
-}
-
-/** Spend-relevant token count, matching the "Total" line of /usage. */
-function spentTokens(usage: Usage): number {
-	return usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
 }
 
 function formatCost(cost: number): string {
@@ -131,6 +133,59 @@ function formatScannedBytes(bytes: number): string {
 	return `${Math.max(1, Math.round(bytes / 1024))} KiB`;
 }
 
+/**
+ * Own money summed over the whole tree, each node priced by the rates its own
+ * model uses - the same figure the row above it shows, so the column adds up to
+ * the total even when an override re-priced one of the models.
+ */
+function sumPricedOwnCost(root: ContextTreeNode, pricing: SpendPricing | undefined): number {
+	let total = 0;
+	const walk = (node: ContextTreeNode): void => {
+		total += nodeSpendMoney(node, pricing);
+		for (const child of node.children) {
+			walk(child);
+		}
+	};
+	walk(root);
+	return total;
+}
+
+/**
+ * Which rates priced each model's money, printed once the user configured an
+ * override: the answer to "the figure disagrees with models.json, so where do I
+ * fix it" is "here is the model, and here is which rate it was billed at".
+ */
+function formatPriceSources(root: ContextTreeNode, pricing: SpendPricing | undefined): string[] {
+	if (!pricing?.hasOverrides) {
+		return [];
+	}
+	const rows = collectSpendPriceSources(root, pricing);
+	const lines = [
+		"",
+		"Prices",
+		theme.fg("dim", `  source: override = ${SPEND_PRICE_OVERRIDES_PATH} · models.json = the model's cost block`),
+	];
+	if (rows.length === 0) {
+		lines.push(theme.fg("dim", "  no model in this tree has spent anything yet"));
+	}
+	// A key that matches no model here means the correction the user wrote is not
+	// the one being applied: naming it is the other half of "where do I fix it".
+	for (const key of pricing.overrideKeys) {
+		if (!rows.some((row) => row.model === key)) {
+			lines.push(theme.fg("warning", `  ${key}: no model in this tree matches this override key`));
+		}
+	}
+	if (rows.length === 0) {
+		return lines;
+	}
+	const modelWidth = Math.max(...rows.map((row) => row.model.length));
+	for (const row of rows) {
+		const source = row.source === "override" ? theme.fg("accent", "override") : theme.fg("dim", "models.json");
+		lines.push(`${theme.fg("dim", `  ${row.model.padEnd(modelWidth)}`)}  ${source}`);
+	}
+	return lines;
+}
+
 /** Own usage summed over the whole tree: exact even while children are mid-run. */
 function sumOwnUsage(root: ContextTreeNode): Usage {
 	const total = emptyUsage();
@@ -155,11 +210,12 @@ function sumOwnUsage(root: ContextTreeNode): Usage {
  * rollback cannot make already-paid work look unspent), while context is the
  * active branch's model-facing utilization.
  */
-export function formatContextTree(root: ContextTreeNode, width: number): string {
+export function formatContextTree(root: ContextTreeNode, width: number, pricing?: SpendPricing): string {
 	const rows = flattenContextTree(root);
 
-	const tokenCells = rows.map((row) => formatTokenCount(spentTokens(row.node.ownUsage)));
-	const costCells = rows.map((row) => formatCost(row.node.ownUsage.cost.total));
+	const tokenCells = rows.map((row) => formatTokenCount(spendRelevantTokens(row.node.ownUsage)));
+	const costCells = rows.map((row) => formatCost(nodeSpendMoney(row.node, pricing)));
+	const totalCost = sumPricedOwnCost(root, pricing);
 	const tokenHeader = "tokens";
 	const costHeader = "cost";
 	const contextHeader = "context";
@@ -216,8 +272,8 @@ export function formatContextTree(root: ContextTreeNode, width: number): string 
 	const agentCount = countNodes(root);
 	lines.push("");
 	lines.push(
-		`${theme.fg("dim", "Total:")} ${formatTokenCount(spentTokens(totals))} tokens ${theme.fg("dim", "·")} ${formatCost(
-			totals.cost.total,
+		`${theme.fg("dim", "Total:")} ${formatTokenCount(spendRelevantTokens(totals))} tokens ${theme.fg("dim", "·")} ${formatCost(
+			totalCost,
 		)}${agentCount > 1 ? theme.fg("dim", ` across ${agentCount} agents`) : ""}`,
 	);
 
@@ -231,13 +287,15 @@ export function formatContextTree(root: ContextTreeNode, width: number): string 
 	if (totals.cacheWrite > 0) {
 		lines.push(`${theme.fg("dim", "Cache Write:")} ${totals.cacheWrite.toLocaleString()}`);
 	}
-	lines.push(`${theme.fg("dim", "Total:")} ${spentTokens(totals).toLocaleString()}`);
+	lines.push(`${theme.fg("dim", "Total:")} ${spendRelevantTokens(totals).toLocaleString()}`);
 
-	if (totals.cost.total > 0) {
+	if (totalCost > 0) {
 		lines.push("");
 		lines.push("Cost");
-		lines.push(`${theme.fg("dim", "Total:")} $${totals.cost.total.toFixed(4)}`);
+		lines.push(`${theme.fg("dim", "Total:")} $${totalCost.toFixed(4)}`);
 	}
+
+	lines.push(...formatPriceSources(root, pricing));
 
 	const rootContext = root.contextUsage;
 	if (rootContext) {
