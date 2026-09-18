@@ -153,6 +153,8 @@ export interface RefinementNoticeMessage extends CustomMessage<RefinementNoticeD
  */
 export interface HarnessDigestDetails {
 	digest: string;
+	/** Fingerprint of the harness state at delivery time; cold boundaries skip re-delivery when it still matches. */
+	stateFingerprint?: string;
 }
 
 /**
@@ -176,13 +178,14 @@ export const HARNESS_DIGEST_SUFFIX = `
 export function createHarnessDigestMessage(
 	digest: string,
 	timestamp = Date.now(),
+	stateFingerprint?: string,
 ): CustomMessage<HarnessDigestDetails> {
 	return {
 		role: "custom",
 		customType: HARNESS_DIGEST_CUSTOM_TYPE,
 		content: HARNESS_DIGEST_PREFIX + digest + HARNESS_DIGEST_SUFFIX,
 		display: false,
-		details: { digest },
+		details: { digest, ...(stateFingerprint ? { stateFingerprint } : {}) },
 		timestamp,
 	};
 }
@@ -483,6 +486,8 @@ export interface CompactionSummaryMessage {
 	 * mechanically at compaction time; it never flows through the summarizer.
 	 */
 	harnessDigest?: string;
+	/** Fingerprint of the harness state behind `harnessDigest` at compaction time; lets cold boundaries skip re-delivery. */
+	harnessStateFingerprint?: string;
 	timestamp: number;
 }
 
@@ -549,6 +554,7 @@ export function createCompactionSummaryMessage(
 	customInstructions?: string,
 	retainedMessageCount?: number,
 	harnessDigest?: string,
+	harnessStateFingerprint?: string,
 ): CompactionSummaryMessage {
 	return {
 		role: "compactionSummary",
@@ -557,6 +563,7 @@ export function createCompactionSummaryMessage(
 		retainedMessageCount,
 		customInstructions,
 		harnessDigest,
+		harnessStateFingerprint,
 		timestamp: new Date(timestamp).getTime(),
 	};
 }

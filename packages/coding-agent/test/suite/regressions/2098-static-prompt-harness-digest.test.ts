@@ -899,13 +899,84 @@ describe("#2098 static system prompt with an in-context harness digest", () => {
 		expect(getMessageText(first[0] as CustomMessage)).not.toContain("[global:zz_distinctive]");
 	});
 
+	it("does not re-deliver on a cold boundary when only the wording drifted, and re-delivers on a real state change", async () => {
+		// Regression pin for the recursion-suite red ("falls through an invalid
+		// global max depth..."): with the ranking wired, a cold boundary rendered
+		// with drifted wording produced different bytes than the in-context
+		// digest, and the text compare stacked a fresh carrier - moving the leaf
+		// under a plain navigateTree. Freshness is the state fingerprint now.
+		seedEntry("memory", "zz_distinctive", "Quantum annealing note", "Only quantum annealing matters.");
+		for (let i = 0; i < 6; i += 1) {
+			seedEntry("memory", `drift_${i}`, `Drift note ${i}`, "Neutral material about tea varieties.");
+		}
+		const first = await createHarness({ persistSession: true });
+		harnesses.push(first);
+		first.setResponses([fauxAssistantMessage("ack one")]);
+		await first.session.prompt("hello there");
+		first.setResponses([fauxAssistantMessage("ack two")]);
+		await first.session.prompt("tell me about quantum annealing");
+		// No harness write between turns: the material gate stays shut.
+		const carriers = digestMessages(first.session.messages);
+		expect(carriers).toHaveLength(1);
+		const sessionFile = first.sessionManager.getSessionFile();
+		expect(sessionFile).toBeTruthy();
+
+		// Resume with unchanged state. The committed conversation now talks about
+		// quantum annealing, so a fresh render would re-rank the window and the
+		// bytes would differ (the ranking pin above proves these terms move the
+		// render); only the state fingerprint can dedupe the delivery.
+		const resumed = await createHarness({ existingSessionFile: sessionFile as string });
+		harnesses.push(resumed);
+		const afterResume = digestMessages(resumed.session.messages);
+		expect(afterResume).toHaveLength(1);
+		expect(getMessageText(afterResume[0] as CustomMessage)).toBe(getMessageText(carriers[0] as CustomMessage));
+
+		// The interlocked other half: a real state change re-delivers exactly one
+		// digest, ranked by the drifted wording.
+		seedEntry("memory", "zz_new", "Newer note", "Written while the session was closed.");
+		const resumedAgain = await createHarness({ existingSessionFile: sessionFile as string });
+		harnesses.push(resumedAgain);
+		const afterChange = digestMessages(resumedAgain.session.messages);
+		expect(afterChange).toHaveLength(2);
+		expect(getMessageText(afterChange[1] as CustomMessage)).toContain("[global:zz_distinctive]");
+	});
+
+	it("stamps every digest carrier with the state fingerprint, including the compaction head", async () => {
+		seedEntry("memory", "seed_fp", "Seed FP", "Fingerprint carrier fixture.");
+		const harness = await createHarness({ persistSession: true, settings: { compaction: { keepRecentTokens: 1 } } });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("reply one")]);
+		await harness.session.prompt("round one");
+		const carrier = digestMessages(harness.session.messages).at(-1) as CustomMessage;
+		const details = carrier.details as { digest?: string; stateFingerprint?: string } | undefined;
+		expect(details?.digest).toBeTruthy();
+		expect(details?.stateFingerprint).toMatch(/^[0-9a-f]{64}$/);
+
+		harness.setResponses([fauxAssistantMessage("summary text"), fauxAssistantMessage("after compaction")]);
+		await harness.session.compact();
+		const head = harness.session.messages.find((message) => message.role === "compactionSummary");
+		expect(head && head.role === "compactionSummary" ? head.harnessStateFingerprint : undefined).toMatch(
+			/^[0-9a-f]{64}$/,
+		);
+
+		// The next cold boundary trusts the compaction head's fingerprint: resume
+		// with unchanged state appends nothing.
+		const carriersAfterCompact = digestMessages(harness.session.messages).length;
+		const sessionFile = harness.sessionManager.getSessionFile();
+		expect(sessionFile).toBeTruthy();
+		const resumed = await createHarness({ existingSessionFile: sessionFile as string });
+		harnesses.push(resumed);
+		expect(digestMessages(resumed.session.messages)).toHaveLength(carriersAfterCompact);
+	});
+
 	it("renders the same harness state byte-identically on every call", async () => {
 		seedEntry("memory", "seed_i", "Seed I", "Determinism fixture.");
 		const options = { includeIpythonExamples: true, includeShellExamples: true, includeRefineExamples: true };
 		const first = formatHarnessStateForPrompt(loadHarnessState(getGlobalHarnessStateDir(), "global"), options);
 		const second = formatHarnessStateForPrompt(loadHarnessState(getGlobalHarnessStateDir(), "global"), options);
-		// Resume dedupe compares rendered text byte for byte; a drifting sort would
-		// read as "stale" and append a duplicate digest at every cold boundary.
+		// Delivery dedupe compares the state fingerprint over exactly these rendered
+		// bytes; a drifting render would desynchronize the two and re-deliver an
+		// unchanged digest at every cold boundary.
 		expect(second).toBe(first);
 		expect(first).toContain("[global:seed_i] Seed I");
 	});

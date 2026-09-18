@@ -177,6 +177,8 @@ export interface CompactionEntry<T = unknown> extends SessionEntryBase {
 	 * so entries written before it existed simply have no snapshot.
 	 */
 	harnessDigest?: string;
+	/** Fingerprint of the harness state behind `harnessDigest` at compaction time; lets cold boundaries skip re-delivery. */
+	harnessStateFingerprint?: string;
 }
 
 /**
@@ -974,6 +976,7 @@ export function buildSessionContext(
 				compaction.customInstructions,
 				retainedMessages.length,
 				compaction.harnessDigest,
+				compaction.harnessStateFingerprint,
 			),
 			...retainedMessages,
 		);
@@ -2957,6 +2960,8 @@ export class SessionManager {
 			usage?: Usage;
 			/** Harness digest snapshot for the new compaction head (never summarizer input). */
 			harnessDigest?: string;
+			/** Fingerprint of the harness state behind `harnessDigest`. */
+			harnessStateFingerprint?: string;
 			onCommit?: (info: CompactionCommitInfo) => void;
 		},
 	): string {
@@ -2980,6 +2985,7 @@ export class SessionManager {
 			customInstructions,
 			usage: options?.usage,
 			harnessDigest: options?.harnessDigest,
+			harnessStateFingerprint: options?.harnessStateFingerprint,
 		};
 
 		// The cut point can name a deferred attribution merge, and those ids never reach

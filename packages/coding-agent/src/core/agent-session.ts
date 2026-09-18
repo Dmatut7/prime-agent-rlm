@@ -295,6 +295,7 @@ import {
 	type HarnessScope,
 	type HarnessState,
 	type HarnessStateStamp,
+	harnessDigestFingerprint,
 	harnessQueryTerms,
 	harnessStateStampsEqual,
 	inferRefinementResultScope,
@@ -9650,12 +9651,16 @@ export class AgentSession {
 					// trigger still has to see the digest.
 					if (this._harnessDigestPending) {
 						this._harnessDigestPending = false;
-						const digest = this._harnessDigest();
-						this._recordHarnessDigestBaselines(this._loadMergedHarnessState());
-						if (this._latestContextHarnessDigest() !== digest) {
+						const { digest, stateFingerprint, state } = this._harnessDigestWithFingerprint();
+						this._recordHarnessDigestBaselines(state);
+						const latest = this._latestContextHarnessDigestDetails();
+						if (!latest || !this._harnessDigestIsFresh(latest, digest, stateFingerprint)) {
 							// Rides the turn's delivery records, so cancelling this first turn
 							// strips the digest with the rest of the turn and re-arms it.
-							nextTurnMessages = [createHarnessDigestMessage(digest), ...nextTurnMessages];
+							nextTurnMessages = [
+								createHarnessDigestMessage(digest, Date.now(), stateFingerprint),
+								...nextTurnMessages,
+							];
 						}
 					} else {
 						// Material-change re-injection: an entry written since the last
@@ -11805,6 +11810,11 @@ export class AgentSession {
 				this._semanticEdges.finishRequest(requestId);
 			}
 			this._semanticEdges.finishCompaction(semanticCompaction.compactionId, "completed");
+			// Attached mechanically at the new head; the digest never flows through
+			// the summarizer LLM, and its fingerprint lets the next cold boundary
+			// skip re-delivering an unchanged state.
+			const { digest: harnessDigest, stateFingerprint: harnessStateFingerprint } =
+				this._harnessDigestWithFingerprint();
 			this.sessionManager.appendCompaction(
 				summary,
 				firstKeptEntryId,
@@ -11815,9 +11825,8 @@ export class AgentSession {
 				{
 					leafId: compactionLeafId ?? undefined,
 					usage,
-					// Attached mechanically at the new head; the digest never flows
-					// through the summarizer LLM.
-					harnessDigest: this._harnessDigest(),
+					harnessDigest,
+					harnessStateFingerprint,
 					// Issue #19 forensics: SessionManager has no logger, and these fields
 					// must not ride in `details` (the next compaction reads the previous
 					// entry's details back to seed its fact/user-request ledgers). The
@@ -12456,25 +12465,54 @@ export class AgentSession {
 	 * The compact harness digest delivered at cold context boundaries (session start,
 	 * resume, tree navigation, compaction head) and as a material-change delta.
 	 */
-	private _harnessDigest(): string {
-		return this._renderHarnessDigest(this._loadMergedHarnessState());
+	/**
+	 * Digest plus the fingerprint of the state that produced it. Delivery decisions
+	 * compare fingerprints, not rendered text (#2400): relevance query terms drift
+	 * per turn, so a rendered-text comparison would re-deliver an unchanged digest
+	 * at every boundary and stack near-duplicates into the context.
+	 */
+	private _harnessDigestWithFingerprint(): { digest: string; stateFingerprint: string; state: HarnessState } {
+		const state = this._loadMergedHarnessState();
+		const renderFlags = this._harnessDigestRenderFlags();
+		return {
+			digest: this._renderHarnessDigest(state, renderFlags),
+			stateFingerprint: harnessDigestFingerprint(state, renderFlags),
+			state,
+		};
 	}
 
-	/**
-	 * Rendered from the same inputs `buildSystemPrompt` used, so the text the model
-	 * reads is byte-for-byte the menu it read when the digest still lived in the prompt.
-	 */
-	private _renderHarnessDigest(state: HarnessState): string {
+	private _harnessDigestRenderFlags(): {
+		includeIpythonExamples: boolean;
+		includeShellExamples: boolean;
+		includeRefineExamples: boolean;
+	} {
 		// Same validation `_rebuildSystemPrompt` applies before handing tool names to
 		// the prompt: an unregistered name must not flip the example sections.
 		const tools = this.getActiveToolNames().filter((name) => this._toolRegistry.has(name));
 		const hasIpython = tools.includes("ipython");
 		const visibleSkills = this._modelVisibleSkills().filter((skill) => !skill.disableModelInvocation);
 		const hasRefineSkill = visibleSkills.some((skill) => skill.name === REFINE_SKILL_NAME);
-		return formatHarnessStateForPrompt(state, {
+		return {
 			includeIpythonExamples: hasIpython,
 			includeShellExamples: tools.includes("bash"),
 			includeRefineExamples: hasIpython && hasRefineSkill,
+		};
+	}
+
+	/**
+	 * Rendered from the same inputs `buildSystemPrompt` used, so the text the model
+	 * reads is byte-for-byte the menu it read when the digest still lived in the prompt.
+	 */
+	private _renderHarnessDigest(
+		state: HarnessState,
+		renderFlags: {
+			includeIpythonExamples: boolean;
+			includeShellExamples: boolean;
+			includeRefineExamples: boolean;
+		},
+	): string {
+		return formatHarnessStateForPrompt(state, {
+			...renderFlags,
 			queryTerms: this._buildHarnessDigestQueryTerms(),
 		});
 	}
@@ -12536,11 +12574,27 @@ export class AgentSession {
 	}
 
 	private _appendHarnessDigestIfStale(): void {
-		const state = this._loadMergedHarnessState();
-		const digest = this._renderHarnessDigest(state);
+		const { digest, stateFingerprint, state } = this._harnessDigestWithFingerprint();
 		this._recordHarnessDigestBaselines(state);
-		if (this._latestContextHarnessDigest() === digest) return;
-		this._appendHarnessDigest(digest);
+		const latest = this._latestContextHarnessDigestDetails();
+		if (latest && this._harnessDigestIsFresh(latest, digest, stateFingerprint)) return;
+		this._appendHarnessDigest(digest, stateFingerprint);
+	}
+
+	/**
+	 * Whether the newest in-context digest already reflects the current harness
+	 * state. A digest is fresh when its state fingerprint matches the current
+	 * one; a carrier written before fingerprints existed is compared by rendered
+	 * text instead, so it can be superseded once and then carries a fingerprint.
+	 */
+	private _harnessDigestIsFresh(
+		latest: { digest: string; stateFingerprint?: string },
+		freshDigest: string,
+		freshFingerprint: string,
+	): boolean {
+		return latest.stateFingerprint !== undefined
+			? latest.stateFingerprint === freshFingerprint
+			: latest.digest === freshDigest;
 	}
 
 	/**
@@ -12560,15 +12614,16 @@ export class AgentSession {
 		if (this._harnessDigestStamps !== undefined && harnessStoreStampsEqual(this._harnessDigestStamps, stamps)) {
 			return;
 		}
-		const state = this._loadMergedHarnessState();
-		const digest = this._renderHarnessDigest(state);
+		const { digest, stateFingerprint, state } = this._harnessDigestWithFingerprint();
 		this._harnessDigestStamps = stamps;
 		const fingerprint = this._harnessEntryFingerprint(state);
 		const previous = this._harnessDigestFingerprint;
 		this._harnessDigestFingerprint = fingerprint;
-		// The rendered menu is the criterion, not the file's mtime: a touch, or a write
-		// that restored identical content, moves the stamp and changes nothing.
-		if (this._latestContextHarnessDigest() === digest) return;
+		// The harness state is the criterion, not the file's mtime or the rendered
+		// text: a touch, or a write that restored identical content, moves the stamp
+		// and changes nothing; query-term drift moves the text and changes nothing.
+		const latest = this._latestContextHarnessDigestDetails();
+		if (latest && this._harnessDigestIsFresh(latest, digest, stateFingerprint)) return;
 		if (previous !== undefined) {
 			const changed = changedHarnessEntryKeys(previous, fingerprint);
 			// Every moved entry was already itemized for the model by this session's own
@@ -12581,11 +12636,11 @@ export class AgentSession {
 				return;
 			}
 		}
-		this._appendHarnessDigest(digest);
+		this._appendHarnessDigest(digest, stateFingerprint);
 	}
 
-	private _appendHarnessDigest(digest: string): void {
-		const message = createHarnessDigestMessage(digest);
+	private _appendHarnessDigest(digest: string, stateFingerprint?: string): void {
+		const message = createHarnessDigestMessage(digest, Date.now(), stateFingerprint);
 		try {
 			this.sessionManager.appendCustomMessageEntryWithRollback(
 				message.customType,
@@ -12644,22 +12699,31 @@ export class AgentSession {
 	 * compaction head while being chronologically older, and an old retained digest
 	 * must not defeat dedupe.
 	 */
-	private _latestContextHarnessDigest(): string | undefined {
-		let latest: { timestamp: number; digest: string } | undefined;
+	private _latestContextHarnessDigestDetails():
+		| { timestamp: number; digest: string; stateFingerprint?: string }
+		| undefined {
+		let latest: { timestamp: number; digest: string; stateFingerprint?: string } | undefined;
 		for (const message of this.agent.state.messages) {
-			let digest: string | undefined;
 			if (message.role === "custom" && message.customType === HARNESS_DIGEST_CUSTOM_TYPE) {
-				digest = (message.details as HarnessDigestDetails | undefined)?.digest;
+				const details = message.details as HarnessDigestDetails | undefined;
+				if (details?.digest !== undefined && (!latest || message.timestamp >= latest.timestamp)) {
+					latest = {
+						timestamp: message.timestamp,
+						digest: details.digest,
+						stateFingerprint: details.stateFingerprint,
+					};
+				}
 			} else if (message.role === "compactionSummary") {
-				digest = message.harnessDigest;
-			} else {
-				continue;
-			}
-			if (digest !== undefined && (!latest || message.timestamp >= latest.timestamp)) {
-				latest = { timestamp: message.timestamp, digest };
+				if (message.harnessDigest !== undefined && (!latest || message.timestamp >= latest.timestamp)) {
+					latest = {
+						timestamp: message.timestamp,
+						digest: message.harnessDigest,
+						stateFingerprint: message.harnessStateFingerprint,
+					};
+				}
 			}
 		}
-		return latest?.digest;
+		return latest;
 	}
 
 	private _loadMergedHarnessState(): HarnessState {
@@ -13395,6 +13459,10 @@ export class AgentSession {
 		});
 		const leafId = this.sessionManager.getLeafId();
 		try {
+			// Same cold-boundary rule as the main compaction head: the shrink
+			// writes a new head, so it carries a fresh digest snapshot.
+			const { digest: shrinkDigest, stateFingerprint: shrinkStateFingerprint } =
+				this._harnessDigestWithFingerprint();
 			this.sessionManager.appendCompaction(
 				summary,
 				plan.firstKeptEntryId,
@@ -13404,9 +13472,8 @@ export class AgentSession {
 				undefined,
 				{
 					leafId: leafId ?? undefined,
-					// Same cold-boundary rule as the main compaction head: the shrink
-					// writes a new head, so it carries a fresh digest snapshot.
-					harnessDigest: this._harnessDigest(),
+					harnessDigest: shrinkDigest,
+					harnessStateFingerprint: shrinkStateFingerprint,
 					onCommit: (info) => {
 						sessionLog.warn("emergency context shrink committed", {
 							sessionId: this.sessionId,
