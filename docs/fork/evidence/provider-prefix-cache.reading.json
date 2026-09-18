@@ -1,0 +1,40 @@
+{
+  "generatedAt": "2026-09-18T12:08:28.675Z",
+  "baseSha": "8ed6d73bc",
+  "provider": "faux (packages/ai/src/providers/faux.ts withUsageEstimate: prefix-cache simulation keyed by stream sessionId, tokens = ceil(chars/4))",
+  "workload": "same session, same prompt text, one landed refinement between round 1 and round 2",
+  "verdict": {
+    "round2CacheReadCoversRound1Prefix": true,
+    "round2InputCollapsed": true,
+    "positiveControlCollapses": true
+  },
+  "readings": [
+    {
+      "label": "round1-cold",
+      "input": 4168,
+      "cacheRead": 0,
+      "cacheWrite": 4168,
+      "promptTokens": 4168,
+      "systemPromptBytes": 12360,
+      "messageCount": 3
+    },
+    {
+      "label": "round2-after-refine",
+      "input": 322,
+      "cacheRead": 3959,
+      "cacheWrite": 322,
+      "promptTokens": 4281,
+      "systemPromptBytes": 12360,
+      "messageCount": 6
+    },
+    {
+      "label": "round3-prefix-broken-positive-control",
+      "input": 1016,
+      "cacheRead": 866,
+      "cacheWrite": 1016,
+      "promptTokens": 1882,
+      "systemPromptBytes": 3564,
+      "messageCount": 8
+    }
+  ]
+}
