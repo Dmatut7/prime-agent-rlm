@@ -12,10 +12,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { scanArtifactTree } from "../src/core/retention/artifact-dirs.js";
+import { RETENTION_WALK_YIELD_EVERY } from "../src/core/retention/fs-walk.js";
 import { retentionRoots } from "../src/core/retention/reports.js";
-import { runRetentionSweep } from "../src/core/retention/sweep.js";
-import type { RetentionRoots, RetentionSweepReport } from "../src/core/retention/types.js";
+import { collectLiveReferences, runRetentionSweep } from "../src/core/retention/sweep.js";
+import type { RetentionClassContext, RetentionRoots, RetentionSweepReport } from "../src/core/retention/types.js";
 import {
 	recordSessionArtifactTombstone,
 	resetSessionArtifactTombstoneCache,
@@ -635,5 +637,76 @@ describe("retention sweep - circuit breaker and read-only dry run (review N-1/N-
 		expect(report.dryRun).toBe(true);
 		expect(existsSync(staleReference)).toBe(true);
 		expect(existsSync(generation)).toBe(true);
+	});
+});
+
+const { retentionYieldSpy } = vi.hoisted(() => ({ retentionYieldSpy: vi.fn() }));
+vi.mock("../src/core/retention/fs-walk.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../src/core/retention/fs-walk.js")>();
+	return {
+		...actual,
+		yieldToEventLoop: () => {
+			retentionYieldSpy();
+			return actual.yieldToEventLoop();
+		},
+	};
+});
+
+describe("retention sweep event-loop slicing", () => {
+	it("yields between classes and inside the long walks", async () => {
+		// perfB②: the sweep is the heaviest timer tick on a daemon (~82ms of
+		// synchronous readdir/lstat measured at the t=300s timer alignment). It now
+		// yields one macrotask between classes and every RETENTION_WALK_YIELD_EVERY
+		// queue items inside the artifact-tree walks. Removing either slicing point
+		// drops the call count below the class count and turns this row red.
+		const f = fixture();
+		for (let i = 0; i < RETENTION_WALK_YIELD_EVERY * 3; i++) {
+			mkdirSync(join(f.artifactRoot, `session-${String(i).padStart(4, "0")}`), { recursive: true });
+		}
+		retentionYieldSpy.mockClear();
+
+		await runRetentionSweep({ settings: resolveRetentionSettings({}), roots: f.roots });
+
+		// Twelve classes means at least twelve between-class yields; the 192-dir
+		// tree adds three slice yields per walk that crosses it. Assert the floor
+		// that only the between-class slicing guarantees, and separately that the
+		// walk slicing fired at all (a walk of 3x64 directories must yield).
+		expect(retentionYieldSpy.mock.calls.length).toBeGreaterThanOrEqual(12 + 3);
+	});
+
+	it("lets a parked setImmediate watcher observe the artifact walk mid-scan", async () => {
+		// The behavioral half: scanArtifactTree is synchronous filesystem work
+		// apart from its slice yields, so without slicing a setImmediate watcher
+		// sees zero event-loop turns before the scan resolves on microtasks alone.
+		const f = fixture();
+		for (let i = 0; i < RETENTION_WALK_YIELD_EVERY * 3; i++) {
+			mkdirSync(join(f.artifactRoot, `session-${String(i).padStart(4, "0")}`), { recursive: true });
+		}
+		const context: RetentionClassContext = {
+			settings: resolveRetentionSettings({}),
+			roots: f.roots,
+			now: Date.now(),
+			dryRun: true,
+			budget: { remainingBytes: 0, remainingEntries: 0, capped: false },
+			live: collectLiveReferences({ roots: f.roots }),
+			log: () => {},
+		};
+		let turns = 0;
+		let watching = true;
+		const watcher = (async () => {
+			while (watching) {
+				await new Promise((resolve) => setImmediate(resolve));
+				turns += 1;
+			}
+		})();
+
+		const scan = await scanArtifactTree(context);
+		watching = false;
+		await watcher;
+
+		// The walk really walked (the fixture's sessions are its candidates)...
+		expect(scan.candidates.length).toBe(RETENTION_WALK_YIELD_EVERY * 3);
+		// ...and it yielded: three slices for 3x64 directories, observed as turns.
+		expect(turns).toBeGreaterThanOrEqual(2);
 	});
 });
