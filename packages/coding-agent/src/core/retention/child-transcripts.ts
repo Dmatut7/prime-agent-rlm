@@ -12,7 +12,14 @@
 import type { Stats } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { reclaimWithinBudget } from "./delete.js";
-import { aggregateTree, listDirectory, quietLstat, type TreeAggregate } from "./fs-walk.js";
+import {
+	aggregateTree,
+	listDirectory,
+	quietLstat,
+	RETENTION_WALK_YIELD_EVERY,
+	type TreeAggregate,
+	yieldToEventLoop,
+} from "./fs-walk.js";
 import {
 	type RetentionClassContext,
 	type RetentionClassModule,
@@ -31,11 +38,18 @@ const MAX_WALK_DEPTH = 8;
 const CHILD_TRANSCRIPT_TREE_MAX_DEPTH = 2;
 
 /** Every `sub-*` session directory under the artifact tree, bounded. */
-function findChildSessionDirs(artifactRoot: string): string[] {
+async function findChildSessionDirs(artifactRoot: string): Promise<string[]> {
 	const found: string[] = [];
 	const queue: { path: string; depth: number }[] = [{ path: artifactRoot, depth: 0 }];
+	let sinceYield = 0;
 	while (queue.length > 0) {
 		const current = queue.shift()!;
+		// Slice the walk (perfB②): the sweep is a timer tick on the daemon's event
+		// loop, so a large artifact tree must not be one synchronous block.
+		if (++sinceYield >= RETENTION_WALK_YIELD_EVERY) {
+			sinceYield = 0;
+			await yieldToEventLoop();
+		}
 		const entries = listDirectory(current.path);
 		if (!entries) continue;
 		for (const entry of entries) {
@@ -93,7 +107,7 @@ export const childTranscriptsModule: RetentionClassModule = {
 	id: "child-transcripts",
 	async scanAndReclaim(context: RetentionClassContext): Promise<RetentionClassResult> {
 		const days = context.settings.childTranscriptDays;
-		const dirs = findChildSessionDirs(resolve(context.roots.artifactRoot));
+		const dirs = await findChildSessionDirs(resolve(context.roots.artifactRoot));
 		if (days <= 0) {
 			return {
 				class: "child-transcripts",

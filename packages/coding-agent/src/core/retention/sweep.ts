@@ -14,6 +14,7 @@ import { activeSessionLeaseDirectories, classifyLeaseDirectory } from "../sessio
 import { artifactEmptyDirsModule, artifactResidueModule } from "./artifact-dirs.js";
 import { bashTempFilesModule } from "./bash-temp.js";
 import { childTranscriptsModule } from "./child-transcripts.js";
+import { yieldToEventLoop } from "./fs-walk.js";
 import { kernelSnapshotGenerationsModule } from "./kernel-snapshot.js";
 import { staleLeasesModule } from "./leases.js";
 import { scanRlmLedgerDirectory } from "./ledger-scan.js";
@@ -168,6 +169,11 @@ export async function runRetentionSweep(options: RunRetentionSweepOptions): Prom
 	};
 	const classes: RetentionClassResult[] = [];
 	for (const module of CLASS_MODULES) {
+		// One macrotask of air between classes (perfB②): each class scan is bounded,
+		// but twelve of them back to back measured ~82ms of synchronous fs on a real
+		// tree at the t=300s timer alignment, and the daemon's event loop serves
+		// sessions on that same tick.
+		await yieldToEventLoop();
 		try {
 			const result = await module.scanAndReclaim(context);
 			classes.push(result);

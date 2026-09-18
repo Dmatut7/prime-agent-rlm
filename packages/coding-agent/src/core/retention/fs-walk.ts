@@ -69,6 +69,20 @@ export function listDirectory(path: string): Dirent[] | undefined {
 }
 
 /**
+ * How many queue items a retention walk processes before it yields one macrotask.
+ * The sweep is the heaviest timer tick on a daemon (measured ~82ms of synchronous
+ * readdir/lstat at the t=300s timer alignment, perfB B2-H4), so the long walks
+ * slice themselves: a boundary every this many items turns one long event-loop
+ * block into short ones without touching any judgement.
+ */
+export const RETENTION_WALK_YIELD_EVERY = 64;
+
+/** One macrotask of event-loop air for a long synchronous walk. */
+export function yieldToEventLoop(): Promise<void> {
+	return new Promise((resolve) => setImmediate(resolve));
+}
+
+/**
  * Aggregate one subtree. `maxDepth` bounds the walk (a scan must not follow a
  * pathological layout forever); a walk that hits the bound reports `unreadable`
  * so the caller keeps the candidate instead of judging a partial tree.

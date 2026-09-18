@@ -22,7 +22,14 @@ import { readSessionArtifactTombstones, tombstoneInForce } from "../session-arti
 import { isValidSessionId } from "../session-id.js";
 import { judgeChildTranscriptAge } from "./child-transcripts.js";
 import { RETENTION_TRASH_PREFIX, reclaimWithinBudget, statSignature } from "./delete.js";
-import { aggregateTree, listDirectory, quietLstat, type TreeAggregate } from "./fs-walk.js";
+import {
+	aggregateTree,
+	listDirectory,
+	quietLstat,
+	RETENTION_WALK_YIELD_EVERY,
+	type TreeAggregate,
+	yieldToEventLoop,
+} from "./fs-walk.js";
 import { readKernelSnapshotGenerationState } from "./kernel-snapshot.js";
 import {
 	type RetentionClassContext,
@@ -80,7 +87,7 @@ function isSessionDirectoryName(name: string): boolean {
  * artifact roots it contains. One walk answers both questions: the multi-root
  * transcript set (D-2) and the set of roots whose children are candidates.
  */
-export function scanArtifactTree(context: RetentionClassContext): ArtifactScan {
+export async function scanArtifactTree(context: RetentionClassContext): Promise<ArtifactScan> {
 	const scan: ArtifactScan = {
 		candidates: [],
 		trash: [],
@@ -99,8 +106,15 @@ export function scanArtifactTree(context: RetentionClassContext): ArtifactScan {
 	// The root itself: its children are this agent dir's own sessions. Nested roots
 	// (a child session's `<parentArtifactDir>/session-artifacts`) are found below.
 	const roots: string[] = [start];
+	let sinceYield = 0;
 	while (queue.length > 0) {
 		const current = queue.shift()!;
+		// Slice the walk (perfB②): this is the sweep's biggest directory traversal,
+		// and the sweep runs on the daemon's event loop as a timer tick.
+		if (++sinceYield >= RETENTION_WALK_YIELD_EVERY) {
+			sinceYield = 0;
+			await yieldToEventLoop();
+		}
 		const entries = listDirectory(current.path);
 		if (!entries) {
 			if (current.depth === 0) scan.unreadableRoots += 1;
@@ -305,9 +319,9 @@ function result(
  * Without these, one sweep can write `in-use:resident` for a grandchild in its own
  * report and delete that path in the same pass (adversarial review F-1).
  */
-function planArtifactDirs(context: RetentionClassContext, mode: "empty" | "residue"): ArtifactPlan {
+async function planArtifactDirs(context: RetentionClassContext, mode: "empty" | "residue"): Promise<ArtifactPlan> {
 	const days = mode === "empty" ? context.settings.emptyArtifactDirDays : context.settings.deletedSessionResidueDays;
-	const scan = scanArtifactTree(context);
+	const scan = await scanArtifactTree(context);
 	const plan: ArtifactPlan = { scanned: scan.candidates.length, requests: [], skipped: [] };
 	if (days <= 0) return plan;
 	const holdsContent = (candidate: ArtifactCandidate): boolean =>
@@ -428,7 +442,7 @@ function descendantBlocker(
 export const artifactEmptyDirsModule: RetentionClassModule = {
 	id: "artifact-empty-dirs",
 	async scanAndReclaim(context: RetentionClassContext): Promise<RetentionClassResult> {
-		const plan = planArtifactDirs(context, "empty");
+		const plan = await planArtifactDirs(context, "empty");
 		if (context.settings.emptyArtifactDirDays <= 0) {
 			return {
 				class: "artifact-empty-dirs",
@@ -443,7 +457,7 @@ export const artifactEmptyDirsModule: RetentionClassModule = {
 		// Our own crashed-delete leftovers are reclaimed by the sweep's own class; a
 		// trash entry next to an artifact root is removed by this class as well.
 		const requests = [...plan.requests];
-		for (const trash of scanArtifactTree(context).trash) {
+		for (const trash of (await scanArtifactTree(context)).trash) {
 			const stats = quietLstat(trash);
 			const signature = statSignature(trash);
 			requests.push({
@@ -477,7 +491,7 @@ export const artifactEmptyDirsModule: RetentionClassModule = {
 export const artifactResidueModule: RetentionClassModule = {
 	id: "artifact-residue-dirs",
 	async scanAndReclaim(context: RetentionClassContext): Promise<RetentionClassResult> {
-		const plan = planArtifactDirs(context, "residue");
+		const plan = await planArtifactDirs(context, "residue");
 		if (context.settings.deletedSessionResidueDays <= 0) {
 			return {
 				class: "artifact-residue-dirs",
