@@ -20,9 +20,25 @@
  *     only reorders a lane, it never preempts a running compaction (Esc is still the only
  *     abort path) and it never lets a receipt jump the compaction.
  *
- * Positive controls: every ordering assertion below names the line whose removal turns it
- * red (see APPLY.md). The derivation pins read the exported mapper, so deleting the
- * `inputClassOrigin` derivation - or reintroducing a text-based rule - goes red here.
+ * Positive controls, measured rather than eyeballed: each mutation below was applied as a
+ * single-line change and re-run through the JSON reporter, and the readings are tabulated in
+ * APPLY.md ("positive controls"). What this file answers:
+ *   - M1 (`insertionIndex` back to a plain tail push), M2 (the `agentmsg_` id guard dropped)
+ *     and M3 (every class mapped to `user`, i.e. the `inputClassOrigin` derivation deleted)
+ *     all go red here - the derivation pins read the exported mapper, so reintroducing a
+ *     text-based rule or a constant goes red too;
+ *   - M5 (a restored queue no longer replayed verbatim) goes red in
+ *     `6158-human-message-priority.test.ts`, which pins the recovery half;
+ *   - the hand-reorder pin below is cross-rank, so M6 (a lane-wide `PRIORITY_RANK` re-sort
+ *     appended to `swapQueued`) goes red here and in `session-action-store.test.ts`. A
+ *     same-rank reorder cannot see it: a rank sort is stable, so equal ranks come out
+ *     unchanged;
+ *   - the compaction half below pins what is observable - a human prompt is never held by
+ *     the gate, and human priority never preempts a running compaction (mutations C6/C7).
+ *     The gate's own human stand-down is unreachable defense in depth and is labeled as such
+ *     at the gate; this file claims no pin for it;
+ *   - the goal context's `pinned` rank, the one rank above the `user` asserted here, is
+ *     pinned through its production call site in `agent-session-goal.test.ts` (mutation M7).
  */
 import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall, type UserMessage } from "@earendil-works/pi-ai";
