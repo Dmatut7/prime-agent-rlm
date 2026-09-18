@@ -57,6 +57,10 @@ function command(
 	};
 }
 
+function queuedTexts(store: ActionStore, delivery: DeliveryPolicy): string[] {
+	return store.queuedActions(delivery).map((action) => action.payload.text);
+}
+
 function selectBatch(store: ActionStore, mode: "one-at-a-time" | "all"): SessionAction[] {
 	const first = store.selectFirst();
 	if (!first) return [];
@@ -189,23 +193,69 @@ describe("ActionStore selection", () => {
 
 	it("never re-sorts a queue the user reordered by hand", () => {
 		// Ctrl+Alt+Up/Down is an explicit instruction about these items; a later arrival
-		// picks an insertion point and leaves the existing relative order alone.
+		// picks an insertion point and leaves the existing relative order alone. The hand
+		// move crosses priority ranks on purpose: three equal ranks survive any stable
+		// re-sort unchanged, so a same-rank reorder cannot tell "left alone" from
+		// "re-sorted by rank behind the user's back" (#2334 review, mutation M6).
 		const store = new ActionStore();
+		const receipt = turn("b1", "when_run_idle");
 		const first = turn("h1", "when_run_idle", "user");
-		const second = turn("h2", "when_run_idle", "user");
+		store.enqueue(receipt);
 		store.enqueue(first);
-		store.enqueue(second);
-		store.moveQueued(first, "when_run_idle", 1);
-		expect(store.queuedActions("when_run_idle")).toEqual([second, first]);
+		// Arrival order alone would leave [b1, h1]; the priority axis puts the human first.
+		expect(store.queuedActions("when_run_idle")).toEqual([first, receipt]);
 
-		const third = turn("h3", "when_run_idle", "user");
-		store.enqueue(third);
-		expect(store.queuedActions("when_run_idle")).toEqual([second, first, third]);
+		// The user moves the machine receipt ahead of their own prompt.
+		store.moveQueued(receipt, "when_run_idle", 0);
+		expect(store.queuedActions("when_run_idle")).toEqual([receipt, first]);
+
+		// A later human arrival takes an insertion point behind the hand-placed pair:
+		// equal rank stays FIFO, and the backward scan stops at the first queued entry
+		// whose rank is already >= the arrival's, so it never crosses the moved receipt.
+		const second = turn("h2", "when_run_idle", "user");
+		store.enqueue(second);
+		expect(store.queuedActions("when_run_idle")).toEqual([receipt, first, second]);
 
 		// A machine arrival does not climb over the hand-set order either.
-		const background = turn("b1", "when_run_idle");
+		const background = turn("b2", "when_run_idle");
 		store.enqueue(background);
-		expect(store.queuedActions("when_run_idle")).toEqual([second, first, third, background]);
+		expect(store.queuedActions("when_run_idle")).toEqual([receipt, first, second, background]);
+
+		// The property itself, stated independently of the exact insertion points: the pair
+		// the user ordered by hand keeps its relative order through every later arrival.
+		const order = store.queuedActions("when_run_idle");
+		expect(order.indexOf(receipt)).toBeLessThan(order.indexOf(first));
+	});
+
+	it("never lets a rank re-sort undo a hand swap across ranks", () => {
+		// `swapQueued` is the primitive Ctrl+Alt+Up/Down actually drives
+		// (`mutateQueuedMessage(..., { type: "move" })` -> `swapQueued`), so it is where a
+		// "keep the lane ranked" change would land. Swapping a background receipt past a
+		// user prompt is the only shape that can distinguish such a re-sort from leaving
+		// the queue alone (#2334 review, mutation M6: a lane-wide `PRIORITY_RANK` sort
+		// appended to `swapQueued` must turn this red).
+		const store = new ActionStore();
+		const receipt = turn("b1", "next_turn_boundary");
+		const human = turn("h1", "next_turn_boundary", "user");
+		store.enqueue(receipt);
+		store.enqueue(human);
+		expect(store.queuedActions("next_turn_boundary")).toEqual([human, receipt]);
+
+		store.swapQueued(receipt, human);
+		expect(store.queuedActions("next_turn_boundary")).toEqual([receipt, human]);
+
+		// Later arrivals of both ranks pick insertion points; neither re-sorts the lane.
+		store.enqueue(turn("h2", "next_turn_boundary", "user"));
+		store.enqueue(turn("b2", "next_turn_boundary"));
+		expect(queuedTexts(store, "next_turn_boundary")).toEqual(["b1", "h1", "h2", "b2"]);
+
+		// The lane stays the first axis (r39 QP-4): a hand reorder in one lane is untouched
+		// by arrivals in the other, and reordering is never a way to jump a lane.
+		store.enqueue(turn("f-h1", "when_run_idle", "user"));
+		store.enqueue(turn("f-b1", "when_run_idle"));
+		expect(queuedTexts(store, "next_turn_boundary")).toEqual(["b1", "h1", "h2", "b2"]);
+		expect(queuedTexts(store, "when_run_idle")).toEqual(["f-h1", "f-b1"]);
+		expect(store.selectFirst()?.payload.text).toBe("b1");
 	});
 
 	it("supports front insertion without changing rollback-at-original-position", () => {

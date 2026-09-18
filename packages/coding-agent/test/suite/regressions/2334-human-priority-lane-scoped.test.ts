@@ -214,36 +214,74 @@ describe("#2334 lane-scoped priority inside a session queue", () => {
 			fauxAssistantMessage("reply 1"),
 			fauxAssistantMessage("reply 2"),
 			fauxAssistantMessage("reply 3"),
+			fauxAssistantMessage("reply 4"),
+			fauxAssistantMessage("reply 5"),
 		]);
 		await waitForToolStart;
 
+		// A child reply (machine traffic, background) arrives first; the human prompt still
+		// leads the lane. That is the #2334 axis doing its job.
+		const replyOne = childReply("agentmsg_reorder_one", "child report one");
+		await harness.session.queueAgentMessagePrompt(replyOne.content, "steer", replyOne);
 		await harness.session.steer("first human");
-		await harness.session.steer("second human");
-		expect(harness.session.getSteeringMessages()).toEqual(["first human", "second human"]);
+		expect(harness.session.getSteeringMessages()).toEqual(["first human", replyOne.content]);
 
-		// Ctrl+Alt+Up on the second entry: an explicit instruction about these items.
-		expect(harness.session.mutateQueuedMessage("steering", 1, "second human", { type: "move", direction: -1 })).toBe(
+		// Ctrl+Alt+Up on the receipt: an explicit instruction about THESE two items, sent
+		// through the only public reorder entry point the interactive client has
+		// (`mutateQueuedMessage(..., { type: "move" })` -> `ActionStore.swapQueued`). The
+		// move crosses priority ranks on purpose: a lane-wide re-sort by rank is a stable
+		// sort, so reordering two human prompts (one rank) survives it unchanged and could
+		// never detect one.
+		const previews = harness.session.getSteeringMessagePreviews();
+		expect(previews).toHaveLength(2);
+		const receiptPreview = previews[1];
+		expect(receiptPreview).toBeDefined();
+		if (receiptPreview === undefined) throw new Error("fixture: the receipt must hold steering index 1");
+		expect(receiptPreview, "fixture: index 1 must be the child's receipt").toContain("child report one");
+		expect(harness.session.mutateQueuedMessage("steering", 1, receiptPreview, { type: "move", direction: -1 })).toBe(
 			"applied",
 		);
-		expect(harness.session.getSteeringMessages()).toEqual(["second human", "first human"]);
-
-		// A later human arrival picks an insertion point; it does not re-sort the lane.
-		await harness.session.steer("third human");
-		expect(harness.session.getSteeringMessages()).toEqual(["second human", "first human", "third human"]);
-
-		// Machine traffic does not climb over the hand-set order either.
-		const reply = childReply("agentmsg_reorder", "child report");
-		await harness.session.queueAgentMessagePrompt(reply.content, "steer", reply);
-		expect(harness.session.getSteeringMessages()).toEqual([
-			"second human",
+		expect(harness.session.getSteeringMessages(), "the hand reorder must hold").toEqual([
+			replyOne.content,
 			"first human",
+		]);
+
+		// A later human arrival picks an insertion point; it does not re-sort the lane and
+		// it does not undo the receipt the user just placed ahead of their own prompt.
+		await harness.session.steer("second human");
+		expect(harness.session.getSteeringMessages()).toEqual([replyOne.content, "first human", "second human"]);
+
+		// Neither does later machine traffic, and human-to-human order stays FIFO.
+		await harness.session.steer("third human");
+		const replyTwo = childReply("agentmsg_reorder_two", "child report two");
+		await harness.session.queueAgentMessagePrompt(replyTwo.content, "steer", replyTwo);
+		const order = harness.session.getSteeringMessages();
+		expect(order).toEqual([replyOne.content, "first human", "second human", "third human", replyTwo.content]);
+		// The property itself, stated independently of the exact insertion points: the pair
+		// the user ordered by hand keeps its relative order through every later arrival.
+		expect(order.indexOf(replyOne.content)).toBeLessThan(order.indexOf("first human"));
+
+		// A restart replays the hand-set order instead of re-deriving it from the ranks.
+		const snapshot = harness.session.getSessionActionRecoverySnapshot();
+		expect(snapshot.actions.map((action) => action.priority)).toEqual([
+			"background",
+			"user",
+			"user",
+			"user",
+			"background",
+		]);
+		expect(snapshot.actions.map((action) => action.payload.text)).toEqual([
+			replyOne.content,
+			"first human",
+			"second human",
 			"third human",
-			reply.content,
+			replyTwo.content,
 		]);
 
 		releaseToolExecution();
 		await promptPromise;
 		await harness.session.waitForIdle();
+		expect(harness.session.getSteeringMessages()).toEqual([]);
 	});
 });
 
