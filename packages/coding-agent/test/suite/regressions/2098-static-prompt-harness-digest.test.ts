@@ -54,6 +54,14 @@ import { conversationMessages, createHarness, getMessageText, type Harness } fro
  */
 const storeReads = vi.hoisted(() => ({ count: 0 }));
 const promptBuilds = vi.hoisted(() => ({ count: 0 }));
+/**
+ * Perf seat C (2026-09-18): how often the digest text is actually rendered. The
+ * ranked render is the expensive half of a moved stamp (0.62 s at the 48-term cap
+ * on a 1268-entry store, `scripts/perf/digest-rank.bench.ts`), and the delivery
+ * decision only needs the state fingerprint - so a turn that appends no carrier
+ * must not buy a render.
+ */
+const digestRenders = vi.hoisted(() => ({ count: 0 }));
 
 vi.mock("../../../src/utils/private-files.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../../../src/utils/private-files.js")>();
@@ -62,6 +70,19 @@ vi.mock("../../../src/utils/private-files.js", async (importOriginal) => {
 		readPrivateFile: (...args: Parameters<typeof actual.readPrivateFile>) => {
 			if (String(args[0]).endsWith("harness_state.json")) storeReads.count += 1;
 			return actual.readPrivateFile(...args);
+		},
+	};
+});
+
+vi.mock("../../../src/core/refinement/index.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../../../src/core/refinement/index.js")>();
+	return {
+		...actual,
+		formatHarnessStateForPrompt: (...args: Parameters<typeof actual.formatHarnessStateForPrompt>) => {
+			// Only the injected digest face is a render this counter owns; the refiner's
+			// own overview goes through a different formatter.
+			digestRenders.count += 1;
+			return actual.formatHarnessStateForPrompt(...args);
 		},
 	};
 });
@@ -736,6 +757,40 @@ describe("#2098 static system prompt with an in-context harness digest", () => {
 		// and no render, which is the per-turn cost this whole cut exists to remove.
 		expect(storeReads.count).toBe(0);
 		expect(digestMessages(harness.session.messages)).toHaveLength(1);
+	});
+
+	it("buys no ranked render on a moved stamp that prints nothing new (perf seat C)", async () => {
+		seedEntry("memory", "seed_perf", "Seed perf", "Render-cost fixture.");
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("reply one"),
+			fauxAssistantMessage("reply two"),
+			fauxAssistantMessage("reply three"),
+		]);
+
+		await harness.session.prompt("round one");
+		// Positive control: the first delivery really does render the digest face.
+		expect(digestRenders.count).toBeGreaterThan(0);
+		expect(digestMessages(harness.session.messages)).toHaveLength(1);
+
+		// A touch moves the stamp exactly like another seat's rename-based write does,
+		// while changing nothing the digest prints.
+		digestRenders.count = 0;
+		const statePath = join(getGlobalHarnessStateDir(), "harness_state.json");
+		const touched = new Date(Date.now() + 60_000);
+		utimesSync(statePath, touched, touched);
+		await harness.session.prompt("round two");
+		expect(digestMessages(harness.session.messages)).toHaveLength(1);
+		// Freshness is the state fingerprint, so the turn pays the parse plus the
+		// fingerprint and skips the ranked render entirely.
+		expect(digestRenders.count).toBe(0);
+
+		// Positive control on the same session: a real state change renders and delivers.
+		seedEntry("memory", "seed_perf_two", "Seed perf two", "Second fixture.");
+		await harness.session.prompt("round three");
+		expect(digestRenders.count).toBeGreaterThan(0);
+		expect(digestMessages(harness.session.messages)).toHaveLength(2);
 	});
 
 	it("makes another seat's write visible on the next turn, exactly once", async () => {

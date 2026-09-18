@@ -1075,6 +1075,22 @@ function harnessStoreStampsEqual(left: HarnessStoreStamps, right: HarnessStoreSt
 }
 
 /**
+ * Harness state plus the fingerprint of the material a digest would render, with
+ * the render itself deferred. Delivery decisions compare fingerprints (and the
+ * per-entry version map), so the common "a store stamp moved but nothing the
+ * digest prints moved" turn pays the state load and the fingerprint only - the
+ * ranked render (0.62 s at the 48-term cap on a 1268-entry store, perf seat C
+ * 2026-09-18) is bought only by a turn that actually appends a carrier. The
+ * render is memoized: the legacy text-comparison branch and the append both read
+ * the same string.
+ */
+interface PreparedHarnessDigest {
+	readonly state: HarnessState;
+	readonly stateFingerprint: string;
+	render(): string;
+}
+
+/**
  * Entry keys whose presence or version differs between two fingerprints: the
  * added / removed / version-bumped set the material-change gate judges.
  */
@@ -9802,14 +9818,14 @@ export class AgentSession {
 					// trigger still has to see the digest.
 					if (this._harnessDigestPending) {
 						this._harnessDigestPending = false;
-						const { digest, stateFingerprint, state } = this._harnessDigestWithFingerprint();
-						this._recordHarnessDigestBaselines(state);
+						const prepared = this._prepareHarnessDigest();
+						this._recordHarnessDigestBaselines(prepared.state);
 						const latest = this._latestContextHarnessDigestDetails();
-						if (!latest || !this._harnessDigestIsFresh(latest, digest, stateFingerprint)) {
+						if (!latest || !this._harnessDigestIsFresh(latest, prepared)) {
 							// Rides the turn's delivery records, so cancelling this first turn
 							// strips the digest with the rest of the turn and re-arms it.
 							nextTurnMessages = [
-								createHarnessDigestMessage(digest, Date.now(), stateFingerprint),
+								createHarnessDigestMessage(prepared.render(), Date.now(), prepared.stateFingerprint),
 								...nextTurnMessages,
 							];
 						}
@@ -12623,13 +12639,27 @@ export class AgentSession {
 	 * per turn, so a rendered-text comparison would re-deliver an unchanged digest
 	 * at every boundary and stack near-duplicates into the context.
 	 */
-	private _harnessDigestWithFingerprint(): { digest: string; stateFingerprint: string; state: HarnessState } {
+	private _prepareHarnessDigest(): PreparedHarnessDigest {
 		const state = this._loadMergedHarnessState();
 		const renderFlags = this._harnessDigestRenderFlags();
+		let rendered: string | undefined;
 		return {
-			digest: this._renderHarnessDigest(state, renderFlags),
-			stateFingerprint: harnessDigestFingerprint(state, renderFlags),
 			state,
+			stateFingerprint: harnessDigestFingerprint(state, renderFlags),
+			render: () => {
+				if (rendered === undefined) rendered = this._renderHarnessDigest(state, renderFlags);
+				return rendered;
+			},
+		};
+	}
+
+	/** Digest plus fingerprint for the callers that always carry the text (compaction heads). */
+	private _harnessDigestWithFingerprint(): { digest: string; stateFingerprint: string; state: HarnessState } {
+		const prepared = this._prepareHarnessDigest();
+		return {
+			digest: prepared.render(),
+			stateFingerprint: prepared.stateFingerprint,
+			state: prepared.state,
 		};
 	}
 
@@ -12728,11 +12758,11 @@ export class AgentSession {
 	}
 
 	private _appendHarnessDigestIfStale(): void {
-		const { digest, stateFingerprint, state } = this._harnessDigestWithFingerprint();
-		this._recordHarnessDigestBaselines(state);
+		const prepared = this._prepareHarnessDigest();
+		this._recordHarnessDigestBaselines(prepared.state);
 		const latest = this._latestContextHarnessDigestDetails();
-		if (latest && this._harnessDigestIsFresh(latest, digest, stateFingerprint)) return;
-		this._appendHarnessDigest(digest, stateFingerprint);
+		if (latest && this._harnessDigestIsFresh(latest, prepared)) return;
+		this._appendHarnessDigest(prepared.render(), prepared.stateFingerprint);
 	}
 
 	/**
@@ -12743,12 +12773,14 @@ export class AgentSession {
 	 */
 	private _harnessDigestIsFresh(
 		latest: { digest: string; stateFingerprint?: string },
-		freshDigest: string,
-		freshFingerprint: string,
+		prepared: PreparedHarnessDigest,
 	): boolean {
+		// A fingerprinted carrier is judged without rendering; only a carrier written
+		// before fingerprints existed forces the render (it has nothing else to
+		// compare), and it is superseded once, after which it carries a fingerprint.
 		return latest.stateFingerprint !== undefined
-			? latest.stateFingerprint === freshFingerprint
-			: latest.digest === freshDigest;
+			? latest.stateFingerprint === prepared.stateFingerprint
+			: latest.digest === prepared.render();
 	}
 
 	/**
@@ -12761,23 +12793,27 @@ export class AgentSession {
 	 * Cost discipline: every mutation path persists through `writePrivateFileAtomic`
 	 * (a rename, so a new inode), which makes the two store stamps a complete change
 	 * signal. When nothing moved the turn pays two `lstat` calls and reads no state
-	 * file; only a moved stamp buys the parse plus render.
+	 * file; a moved stamp buys the parse plus the state fingerprint, and only a turn
+	 * that actually appends a carrier buys the ranked render (perf seat C: on a
+	 * 1268-entry store the render alone was 0.62 s of synchronous event-loop time at
+	 * the 48-term cap, paid on every moved stamp whether or not anything was
+	 * delivered).
 	 */
 	private _refreshHarnessDigestIfMateriallyChanged(): void {
 		const stamps = this._harnessStoreStamps();
 		if (this._harnessDigestStamps !== undefined && harnessStoreStampsEqual(this._harnessDigestStamps, stamps)) {
 			return;
 		}
-		const { digest, stateFingerprint, state } = this._harnessDigestWithFingerprint();
+		const prepared = this._prepareHarnessDigest();
 		this._harnessDigestStamps = stamps;
-		const fingerprint = this._harnessEntryFingerprint(state);
+		const fingerprint = this._harnessEntryFingerprint(prepared.state);
 		const previous = this._harnessDigestFingerprint;
 		this._harnessDigestFingerprint = fingerprint;
 		// The harness state is the criterion, not the file's mtime or the rendered
 		// text: a touch, or a write that restored identical content, moves the stamp
 		// and changes nothing; query-term drift moves the text and changes nothing.
 		const latest = this._latestContextHarnessDigestDetails();
-		if (latest && this._harnessDigestIsFresh(latest, digest, stateFingerprint)) return;
+		if (latest && this._harnessDigestIsFresh(latest, prepared)) return;
 		if (previous !== undefined) {
 			const changed = changedHarnessEntryKeys(previous, fingerprint);
 			// Every moved entry was already itemized for the model by this session's own
@@ -12790,7 +12826,7 @@ export class AgentSession {
 				return;
 			}
 		}
-		this._appendHarnessDigest(digest, stateFingerprint);
+		this._appendHarnessDigest(prepared.render(), prepared.stateFingerprint);
 	}
 
 	private _appendHarnessDigest(digest: string, stateFingerprint?: string): void {
