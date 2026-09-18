@@ -1983,7 +1983,9 @@ describe("AgentSession queue characterization", () => {
 			{ deliverAs: "nextTurn" },
 		);
 		await harness.session.queueAgentMessagePrompt(firstPrompt, "followUp");
-		await harness.session.followUp("surviving");
+		// #2334: both inputs stay in one priority class so the agent message keeps the
+		// batch anchor this case is about (the case is next-turn context, not ordering).
+		await harness.session.followUp("surviving", undefined, { priority: "background" });
 		pause.release();
 		await harness.session.waitForIdle();
 
@@ -2106,9 +2108,11 @@ describe("AgentSession queue characterization", () => {
 		gatePreparation = false;
 		expect(pause).toBeDefined();
 
+		// #2334: the first prompt carries an `agentmsg_` delivery id and is therefore
+		// agent traffic; the second has no id, so it is human input and queues ahead.
 		expect(harness.session.clearQueue()).toEqual({
 			steering: [],
-			followUp: ["clear first while preparing", "clear second while preparing"],
+			followUp: ["clear second while preparing", "clear first while preparing"],
 		});
 		pause?.release();
 		await firstCompletionRejection;
@@ -3182,6 +3186,10 @@ describe("AgentSession scheduler scenarios", () => {
 				);
 				return fauxAssistantMessage(sawSteer ? "handled s1" : "missing s1");
 			},
+			// #2334: inside the steering lane an extension's user-role message is human
+			// input, while a custom message injected through sendCustomMessage is machine
+			// traffic (source "internal"), so the extension message drains first now.
+			fauxAssistantMessage("handled extension steer"),
 			(context) => {
 				const sawCustom = context.messages.some(
 					(message) =>
@@ -3191,7 +3199,6 @@ describe("AgentSession scheduler scenarios", () => {
 				);
 				return fauxAssistantMessage(sawCustom ? "handled steer custom" : "missing steer custom");
 			},
-			fauxAssistantMessage("handled extension steer"),
 			fauxAssistantMessage("f1 done"),
 			(context) => {
 				batchedUsers = context.messages
@@ -3247,8 +3254,8 @@ describe("AgentSession scheduler scenarios", () => {
 		expect(getAssistantTexts(harness)).toEqual([
 			"",
 			"handled s1",
-			"handled steer custom",
 			"handled extension steer",
+			"handled steer custom",
 			"f1 done",
 			"f2 batch done",
 		]);
@@ -3427,7 +3434,12 @@ describe("AgentSession scheduler scenarios", () => {
 		await harness.session.followUp("ordinary");
 		await harness.session.queueAgentMessagePrompt(removedAgentMessage, "followUp", undefined);
 		await harness.session.queueAgentMessagePrompt(keptAgentMessage, "followUp", undefined);
-		await harness.session.followUp("last anchor", undefined, { queueKey: "heartbeat:one" });
+		await harness.session.followUp("last anchor", undefined, {
+			queueKey: "heartbeat:one",
+			// #2334: a heartbeat follow-up is machine input, so it queues behind the agent
+			// messages and stays the batch anchor this case is about.
+			priority: "background",
+		});
 		expect(prepared).toEqual([]);
 		expect(getUserTexts(harness)).toEqual([]);
 
