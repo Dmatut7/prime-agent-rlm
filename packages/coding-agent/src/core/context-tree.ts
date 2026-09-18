@@ -749,9 +749,11 @@ export class ContextTreeDiskScanCache {
 	 * that handed back none (a leaf frame, or a frame the budget had already emptied), which
 	 * saves one `readdir` and would otherwise flood the hit figure - a 200-child family
 	 * measured 12207 "hits" against 262 misses, all but 200 of them empty. `subtreeProbes`
-	 * is how many fingerprints a reuse check actually paid for, and `subtreeBypasses` how
-	 * many reuse checks were skipped as known-busy, so the two together say what the busy
-	 * policy cost and saved. A bypass is also counted as a miss: nothing was reused.
+	 * is how many fingerprints a reuse check actually paid for, `subtreeBypasses` how many
+	 * reuse checks were skipped as known-busy and `subtreeStores` how many walked subtrees
+	 * were handed to the cache, so together they say what the busy policy cost and saved. A
+	 * bypass is also counted as a miss: nothing was reused. A store counts as one whether or
+	 * not a ceiling then kept it.
 	 */
 	readonly stats = {
 		subtreeHits: 0,
@@ -759,6 +761,7 @@ export class ContextTreeDiskScanCache {
 		subtreeMisses: 0,
 		subtreeBypasses: 0,
 		subtreeProbes: 0,
+		subtreeStores: 0,
 		nodeHits: 0,
 		nodeMisses: 0,
 	};
@@ -933,6 +936,7 @@ export class ContextTreeDiskScanCache {
 			charge,
 			modelWindows: subtreeModelWindows(nodes, resolveContextWindow),
 		});
+		this.stats.subtreeStores++;
 	}
 
 	/** One parsed transcript node, remembered by the transcript's own stat identity. */
