@@ -1219,11 +1219,18 @@ const THRESHOLD_COMPACTION_RETRY_MIN_NEW_ENTRIES = 5;
  * defaults to 0) and it snoozes while a host phase owns the turn boundary, which
  * compaction does. Without a bound of its own, a gate that ranks compaction above
  * agent messages would turn one hung summarization call into a starved family - and
- * a person typing during one would wait it out with no upper bound at all. Two
- * times the default provider stream-stall timeout, so a genuinely slow 1M-token
- * summary still finishes while a wedged stream is cut.
+ * a person typing during one would wait it out with no upper bound at all.
+ *
+ * Caliber honesty (B2-03): this is the ONLY wall-clock bound on the compaction wire
+ * call. `streamStallTimeoutMs` lives in the agent loop and never reaches
+ * `completeSimple`/`streamSimple`, so the "2x the stream-stall timeout" reading is
+ * about sharing one operator knob, not about stacking behind another cut - a slow
+ * but healthy giant summary and a wedged stream get the same budget. Exported
+ * because the matrix pins the caliber: shrinking this constant (or the stream-stall
+ * default it derives from) shrinks the bound every queued input gets, and that must
+ * turn a test red (B2-15).
  */
-const COMPACTION_GATE_ABORT_AFTER_SECONDS = (DEFAULT_STREAM_STALL_TIMEOUT_MS / 1000) * 2;
+export const COMPACTION_GATE_ABORT_AFTER_SECONDS = (DEFAULT_STREAM_STALL_TIMEOUT_MS / 1000) * 2;
 
 interface PersistedIpythonSentAgentMessage {
 	toolCallId: string;
@@ -2155,7 +2162,9 @@ export class AgentSession {
 	private _autoCompactionPreemptedByManual: AbortController | undefined = undefined;
 	private _compactionOperation: Promise<void> | undefined = undefined;
 	/** Timer that aborts a compaction holding queued input for too long. */
-	private _compactionGateWatchdog: ReturnType<typeof setTimeout> | undefined = undefined;
+	// `unknown`, not `ReturnType<typeof setTimeout>`: when `stallWatchdogTimers` is
+	// injected the handle belongs to that clock (a fake-clock id), not to Node.
+	private _compactionGateWatchdog: unknown = undefined;
 	/** In-flight manual compact() (r25-1): synchronous admission for mutual exclusion. */
 	private _manualCompactionInFlight:
 		| { operation: Promise<CompactionResult>; customInstructions: string | undefined }
@@ -6562,6 +6571,9 @@ export class AgentSession {
 		}
 		this._disposed = true;
 		this._stallWatchdog?.dispose();
+		// B2-16: the gate watchdog may still be armed against an in-flight compaction;
+		// a disposed session must not keep a live timer (or a fake-clock registration).
+		this._clearCompactionGateWatchdog();
 		this._clearRlmTerminalNoticeAbandonTimer();
 		for (const run of this._unsettledRlmChildRuns) run.suppressTerminalNotice = true;
 		for (const controller of this._rlmQuiescenceWaitAborts) controller.abort();
@@ -7383,41 +7395,83 @@ export class AgentSession {
 	 * configured stall budget the compaction is aborted and the pump is scheduled, so
 	 * the queued input is delivered instead.
 	 *
-	 * One bound, three arming points, so that neither ordering leaves a gap: the
+	 * One bound, four arming points, so that neither ordering leaves a gap: the
 	 * agent-message gate (it either starts the compaction or finds one running),
-	 * `_runAutoCompaction` (the work already queued when a compaction begins) and
+	 * `_runAutoCompaction` (the work already queued when a compaction begins),
+	 * `_compact` (the manual `/compact` start point, same queue-first ordering) and
 	 * `_admitSessionInput` (input admitted into a compaction that is already running,
 	 * which is how a person typing during a hung compaction used to wait forever).
+	 * An abort is a cancellation, not a summarization failure: both compaction paths
+	 * settle it without touching the consecutive-failure streak or the emergency
+	 * shrink valve.
 	 */
 	private _armCompactionGateWatchdog(): void {
 		if (this._compactionGateWatchdog !== undefined) return;
-		const operation = this._compactionOperation;
+		// Branch summary counts as compacting (it blocks the same pump and pauses the
+		// same stall watchdog), so it gets the same bound: without it a hung
+		// `session_before_tree` handler or wedged summary stream held every queued
+		// input forever with no warn and no log (B2-C02). The abort reaches it
+		// through `abortBranchSummary()` in the callback below.
+		const operation = this._compactionOperation ?? this._branchSummaryOperation;
 		if (!operation) return;
 		const configured = this.settingsManager.getStallWatchdogSettings().abortAfterSeconds;
 		// The stall watchdog ships warn-only (abortAfterSeconds 0), and it snoozes while
 		// compaction owns the turn boundary anyway, so this bound carries its own budget.
 		const abortAfterSeconds =
 			Number.isFinite(configured) && configured > 0 ? configured : COMPACTION_GATE_ABORT_AFTER_SECONDS;
-		const timer = setTimeout(() => {
+		// Run on the injected stall-watchdog clock when one is present: the bound is a
+		// watchdog timer like the warn/abort cascade, so tests drive it through the
+		// same deterministic seam instead of racing real 50ms budgets on a loaded
+		// runner. With no injection the real timers are used and the handle is unref'd.
+		const timers = this._stallWatchdogTimers;
+		const schedule: (callback: () => void, delayMs: number) => unknown = timers
+			? (callback, delayMs) => timers.setTimeout(callback, delayMs)
+			: (callback, delayMs) => setTimeout(callback, delayMs);
+		const unschedule: (handle: unknown) => void = timers
+			? (handle) => timers.clearTimeout(handle)
+			: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>);
+		const operationKind = operation === this._compactionOperation ? "compaction" : "branch_summary";
+		const timer = schedule(() => {
 			this._compactionGateWatchdog = undefined;
 			if (this._disposed || this._disposing) return;
 			if (!this.isCompacting) return;
 			sessionLog.warn("compaction holding queued input exceeded the stall budget; aborting it", {
 				sessionId: this.sessionId,
 				abortAfterSeconds,
+				operationKind,
 			});
 			this.abortCompaction();
+			this.abortBranchSummary();
+			// The manual path parked the pump behind its own abort() for the whole
+			// summarization (K3R-11), so scheduling alone no-ops there: lifting that
+			// suspension is what actually lets the queued input through once the
+			// watchdog has cut the compaction. An ordinary Esc suspension cannot
+			// co-exist with a live compaction (Esc cancels it at once), and the
+			// update-restart fence still refuses the wake inside.
+			this.wakeSuspendedSessionInput();
 			this._scheduleSessionInputPump();
 		}, abortAfterSeconds * 1000);
-		timer.unref?.();
+		if (timers === undefined) (timer as ReturnType<typeof setTimeout>).unref?.();
 		this._compactionGateWatchdog = timer;
 		const clear = (): void => {
 			if (this._compactionGateWatchdog === timer) {
-				clearTimeout(timer);
+				unschedule(timer);
 				this._compactionGateWatchdog = undefined;
 			}
 		};
 		void operation.then(clear, clear);
+	}
+
+	/** Disarm the compaction gate watchdog (dispose path; the identity guard lives in the armer). */
+	private _clearCompactionGateWatchdog(): void {
+		if (this._compactionGateWatchdog === undefined) return;
+		const timers = this._stallWatchdogTimers;
+		if (timers) {
+			timers.clearTimeout(this._compactionGateWatchdog);
+		} else {
+			clearTimeout(this._compactionGateWatchdog as ReturnType<typeof setTimeout>);
+		}
+		this._compactionGateWatchdog = undefined;
 	}
 
 	async promptHeartbeat(job: AgentCronJob, options?: PromptOptions): Promise<AgentHeartbeatPromptResult> {
@@ -11756,6 +11810,10 @@ export class AgentSession {
 			resolveCompactionOperation = resolve;
 		});
 		this._compactionOperation = compactionOperation;
+		// The manual path is a compaction start point too (B2-C01): input that was
+		// already queued when /compact began is this ordering's gap, and the gate
+		// watchdog is its bound, exactly as in `_runAutoCompaction`.
+		if (this.hasPendingSessionWork) this._armCompactionGateWatchdog();
 		this._emit({
 			type: "compaction_start",
 			reason: "manual",
@@ -18315,6 +18373,9 @@ export class AgentSession {
 			resolveBranchSummaryOperation = resolve;
 		});
 		this._branchSummaryOperation = branchSummaryOperation;
+		// Branch summary is a compaction-state start point as well: input already
+		// queued when the summary begins gets the same bound (B2-C02).
+		if (this.hasPendingSessionWork) this._armCompactionGateWatchdog();
 
 		try {
 			let extensionSummary: { summary: string; details?: unknown } | undefined;

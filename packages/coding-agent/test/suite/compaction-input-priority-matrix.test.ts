@@ -54,6 +54,7 @@ import {
 	createAgentSessionMessage,
 	isAgentSessionMessage,
 } from "../../src/core/agent-messages.js";
+import { COMPACTION_GATE_ABORT_AFTER_SECONDS } from "../../src/core/agent-session.js";
 import type { AgentAutonomousConfig } from "../../src/core/autonomous.js";
 import { estimateContextTokens, shouldCompact } from "../../src/core/compaction/index.js";
 import type { AgentCronJob } from "../../src/core/cron-jobs.js";
@@ -72,6 +73,8 @@ import {
 	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
 } from "../../src/core/messages.js";
 import { SessionInputAdmissionPausedError } from "../../src/core/prompt-admission.js";
+import { DEFAULT_STREAM_STALL_TIMEOUT_MS } from "../../src/core/settings-manager.js";
+import { StallFakeClock } from "../fixtures/stall-fake-clock.js";
 import { createHarness, getAssistantTexts, getMessageText, type Harness } from "./harness.js";
 
 /** Marker so "the oversized fill is still in the context" stays decidable without token maths. */
@@ -429,6 +432,12 @@ describe("compaction x input-class admission matrix", () => {
 		priorityOverAgentMessages?: boolean;
 		/** `stallWatchdog.abortAfterSeconds`, i.e. the compaction gate watchdog budget. */
 		gateWatchdogSeconds?: number;
+		/**
+		 * Deterministic clock the gate watchdog runs on (`stallWatchdogTimers`). The
+		 * watchdog rows drive it instead of racing real 50-200ms budgets; the budget
+		 * settings stay the same, only the time source changes.
+		 */
+		gateClock?: StallFakeClock;
 		autonomous?: AgentAutonomousConfig;
 	}
 
@@ -443,6 +452,7 @@ describe("compaction x input-class admission matrix", () => {
 		};
 		const harness = await createHarness({
 			tools: [fillTool],
+			...(options.gateClock ? { stallWatchdogTimers: options.gateClock.timersImpl } : {}),
 			settings: {
 				compaction: {
 					enabled: options.compactionEnabled ?? false,
@@ -1165,10 +1175,12 @@ describe("compaction x input-class admission matrix", () => {
 		// input's own pre-turn compaction retries and this time the summarizer answers.
 		const gate = createCompactionGate({ hangEntries: 1 });
 		gates.push(gate);
+		const clock = new StallFakeClock();
 		const harness = await createMatrixHarness({
 			bigContext: true,
 			gate,
 			gateWatchdogSeconds: GATE_WATCHDOG_SECONDS,
+			gateClock: clock,
 		});
 		harness.setResponses([...FILL_RESPONSES, fauxAssistantMessage(REPLY_TURN_TEXT), fauxAssistantMessage("spare")]);
 		await fillContext(harness, true);
@@ -1193,6 +1205,9 @@ describe("compaction x input-class admission matrix", () => {
 		expect(harness.session.isCompacting).toBe(true);
 
 		// The test never releases the gate: the watchdog has to be what ends the hang.
+		// The watchdog runs on the injected fake clock, so the budget expiring is a
+		// synchronous fact here, not a race against a real 50ms timer on a loaded runner.
+		clock.advance(GATE_WATCHDOG_SECONDS * 1000 + 1);
 		await vi.waitFor(() => expect(harness.session.isCompacting).toBe(false), { timeout: 20_000, interval: 10 });
 		expect(gate.isReleased()).toBe(false);
 		const aborted = harness.eventsOfType("compaction_end").filter((end) => end.aborted === true);
@@ -1237,11 +1252,13 @@ describe("compaction x input-class admission matrix", () => {
 		// which is what makes the row about the bound rather than about the timer.
 		const gate = createCompactionGate({ hangEntries: 1 });
 		gates.push(gate);
+		const clock = new StallFakeClock();
 		const harness = await createMatrixHarness({
 			bigContext: true,
 			compactionEnabled: true,
 			gate,
 			gateWatchdogSeconds: ADMISSION_WATCHDOG_SECONDS,
+			gateClock: clock,
 		});
 		// Compaction is on from the start, so the fill turn ends at the tool-result
 		// boundary (that is where a cut can land) and consumes exactly one response: the
@@ -1293,6 +1310,8 @@ describe("compaction x input-class admission matrix", () => {
 		expect(harness.eventsOfType("compaction_end")).toEqual([]);
 
 		// The test never releases the gate: the bound has to be what ends the hang.
+		// Fake clock: advancing past the budget IS the time passing.
+		clock.advance(ADMISSION_WATCHDOG_SECONDS * 1000 + 1);
 		await vi.waitFor(() => expect(harness.session.isCompacting).toBe(false), { timeout: 20_000, interval: 10 });
 		expect(gate.isReleased()).toBe(false);
 		const aborted = harness.eventsOfType("compaction_end").filter((end) => end.aborted === true);
@@ -1328,11 +1347,13 @@ describe("compaction x input-class admission matrix", () => {
 		// the invariant rather than one class's symptom.
 		const gate = createCompactionGate({ hangEntries: 1 });
 		gates.push(gate);
+		const clock = new StallFakeClock();
 		const harness = await createMatrixHarness({
 			bigContext: true,
 			compactionEnabled: true,
 			gate,
 			gateWatchdogSeconds: ADMISSION_WATCHDOG_SECONDS,
+			gateClock: clock,
 		});
 		// Same response accounting as the human row above: the fill turn stops at the
 		// tool-result boundary, so one response is the fill and the next is the heartbeat.
@@ -1368,6 +1389,7 @@ describe("compaction x input-class admission matrix", () => {
 		});
 		expect(harness.session.isCompacting).toBe(true);
 
+		clock.advance(ADMISSION_WATCHDOG_SECONDS * 1000 + 1);
 		await vi.waitFor(() => expect(harness.session.isCompacting).toBe(false), { timeout: 20_000, interval: 10 });
 		expect(gate.isReleased()).toBe(false);
 		expect(harness.eventsOfType("compaction_end").filter((end) => end.aborted === true)).toHaveLength(1);
@@ -1381,5 +1403,333 @@ describe("compaction x input-class admission matrix", () => {
 		expect(customMessagesOfType(harness, HEARTBEAT_PROMPT_CUSTOM_TYPE)).toHaveLength(1);
 		expect(getAssistantTexts(harness)).toContain(HEARTBEAT_TURN_TEXT);
 		expect(harness.session.hasPendingSessionWork).toBe(false);
+	});
+
+	it("watchdog: a hung branch summary with input queued BEFORE it is aborted after the stall budget", async () => {
+		// Branch summary counts as compacting (it blocks the same pump and pauses the
+		// same stall watchdog) but only set `_branchSummaryOperation`, which the gate
+		// watchdog used to ignore: a `session_before_tree` handler that never returns
+		// held every queued input forever with no warn and no log. The same bound now
+		// covers it (B2-C02) and reaches it through abortBranchSummary(). Measured
+		// mutation: deleting the `?? this._branchSummaryOperation` fallback (or the
+		// arming in `_navigateTreeUnderPause`) leaves this row hanging.
+		const gate = createCompactionGate({ hangEntries: 1 });
+		gates.push(gate);
+		const clock = new StallFakeClock();
+		const harness = await createHarness({
+			stallWatchdogTimers: clock.timersImpl,
+			settings: {
+				compaction: {
+					enabled: false,
+					reserveTokens: RESERVE_TOKENS,
+					keepRecentTokens: KEEP_RECENT_TOKENS,
+					triggerRatio: TRIGGER_RATIO,
+				},
+				stallWatchdog: { enabled: false, warnAfterSeconds: 0, abortAfterSeconds: ADMISSION_WATCHDOG_SECONDS },
+			},
+			models: [{ id: "faux-1", contextWindow: CONTEXT_WINDOW }],
+			persistSession: true,
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_tree", async (event) => {
+						const entry = gate.enteredCount() + 1;
+						gate.markEntered();
+						if (gate.shouldHang(entry)) {
+							await Promise.race([gate.open, abortedOnce(event.signal)]);
+						}
+						return undefined;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		expect(harness.settingsManager.getStallWatchdogSettings().abortAfterSeconds).toBe(ADMISSION_WATCHDOG_SECONDS);
+
+		// One turn, so the navigation has something to summarize and a target to
+		// navigate to.
+		// Response accounting: the watchdog aborts the summary while it is parked in
+		// the hook, and the LLM summary call after the hook still dequeues one faux
+		// response before it notices the aborted signal - the middle slot belongs to
+		// that aborted summary call, not to the queued reply's turn.
+		harness.setResponses([
+			fauxAssistantMessage("first turn"),
+			fauxAssistantMessage("slot consumed by the aborted branch summary call"),
+			fauxAssistantMessage(REPLY_TURN_TEXT),
+		]);
+		await harness.session.prompt("first");
+		const targetEntry = harness.sessionManager
+			.getEntries()
+			.find(
+				(entry) =>
+					entry.type === "message" && entry.message.role === "user" && getMessageText(entry.message) === "first",
+			);
+		if (!targetEntry) throw new Error("expected a user entry to navigate to");
+
+		// Queue a child reply behind a suspended pump (no in-flight turn needed), so
+		// the summary starts with work already waiting on it.
+		harness.session.requestAbort();
+		expect(harness.session.isQueuedWorkSuspended).toBe(true);
+		const id = "agentmsg_matrix_branch_summary";
+		const message = createAgentSessionMessage(agentPayload(id, "child", "report while a branch summary hangs"));
+		expect(classifyIncomingInput(incomingInputFactsFromMessage(message, { source: "agent" }))).toBe(
+			"agent_child_reply",
+		);
+		const timeline = watch(harness, (candidate) => isAgentMessageWithId(candidate, id));
+		const preflight = createPreflightRecord();
+		const admit = harness.session.acceptAgentMessagePrompt(message.content, {
+			expandPromptTemplates: false,
+			streamingBehavior: "steer",
+			queueIfBusy: true,
+			customMessage: message,
+			preflightResult: capturePreflight(preflight),
+		});
+		track(admit);
+		await settledPreflight(preflight);
+		expect(preflight.queued).toBe(true);
+		expect(harness.session.hasPendingSessionWork).toBe(true);
+		expect(harness.session.isCompacting).toBe(false);
+
+		// The tree navigation hangs inside the session_before_tree hook; only the
+		// gate watchdog can end it.
+		const navigateRun = harness.session.navigateTree(targetEntry.id, { summarize: true });
+		track(navigateRun);
+		await vi.waitFor(() => expect(gate.enteredCount()).toBe(1), { timeout: 20_000, interval: 10 });
+		expect(harness.session.isCompacting).toBe(true);
+		expect(harness.session.hasPendingSessionWork).toBe(true);
+
+		// The test never releases the gate: the bound has to be what ends the hang.
+		clock.advance(ADMISSION_WATCHDOG_SECONDS * 1000 + 1);
+		const result = await navigateRun;
+		expect(gate.isReleased()).toBe(false);
+		expect(result.aborted).toBe(true);
+		expect(harness.session.isCompacting).toBe(false);
+
+		// No external wake: the watchdog fired while a compaction held queued input,
+		// so it owns lifting the Esc-class suspension its abort caused (an Esc-class
+		// abort suspends the pump on purpose; the watchdog is not the user). With the
+		// wake removed from the callback this row hangs here instead.
+		await harness.session.waitForIdle();
+
+		expect(timeline.count("input_delivered")).toBe(1);
+		expect(harness.session.messages.filter((item) => isAgentMessageWithId(item, id))).toHaveLength(1);
+		expect(harness.session.queuedActionCount).toBe(0);
+		expect(getAssistantTexts(harness)).toContain(REPLY_TURN_TEXT);
+	});
+
+	it("watchdog: a manual compact() that hangs with input queued BEFORE it is aborted after the stall budget", async () => {
+		// The fourth compaction start point is the manual one (`/compact`,
+		// `compact.run`, a programmatic `session.compact()`): `_compact()` sets
+		// `_compactionOperation` without going through the admission gate, so the
+		// queue-first ordering needs its own arming there. A child reply parked
+		// behind a busy turn is the queued input; with the arming removed this row
+		// hangs forever (the hook never releases and no watchdog ever fires), which
+		// is exactly the review-B probe that went red on base.
+		const gate = createCompactionGate({ hangEntries: 1 });
+		gates.push(gate);
+		const clock = new StallFakeClock();
+		const hangTool: AgentTool = {
+			name: "hang",
+			label: "hang",
+			description: "never returns on its own",
+			parameters: Type.Object({}),
+			execute: async (_args: unknown, _ctx: unknown, signal?: AbortSignal) => {
+				await abortedOnce(signal ?? new AbortController().signal);
+				return { content: [{ type: "text", text: "aborted" }], details: {} };
+			},
+		} as unknown as AgentTool;
+		const harness = await createHarness({
+			tools: [hangTool],
+			stallWatchdogTimers: clock.timersImpl,
+			settings: {
+				compaction: {
+					enabled: false,
+					reserveTokens: RESERVE_TOKENS,
+					keepRecentTokens: KEEP_RECENT_TOKENS,
+					triggerRatio: TRIGGER_RATIO,
+				},
+				stallWatchdog: { enabled: false, warnAfterSeconds: 0, abortAfterSeconds: ADMISSION_WATCHDOG_SECONDS },
+			},
+			models: [{ id: "faux-1", contextWindow: CONTEXT_WINDOW }],
+			persistSession: true,
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => {
+						const entry = gate.enteredCount() + 1;
+						gate.markEntered();
+						if (gate.shouldHang(entry)) {
+							await Promise.race([gate.open, abortedOnce(event.signal)]);
+						}
+						return {
+							compaction: {
+								summary: COMPACTION_SUMMARY,
+								firstKeptEntryId: event.preparation.firstKeptEntryId,
+								tokensBefore: event.preparation.tokensBefore,
+								details: {},
+							},
+						};
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		expect(harness.settingsManager.getStallWatchdogSettings().abortAfterSeconds).toBe(ADMISSION_WATCHDOG_SECONDS);
+
+		// A turn that stays in flight until the manual compact aborts it, so an
+		// incoming child reply has no choice but to queue.
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("hang", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage(REPLY_TURN_TEXT),
+			fauxAssistantMessage("spare turn"),
+		]);
+		const turnRun = harness.session.prompt("run the hang tool");
+		track(turnRun);
+		await vi.waitFor(() => expect(harness.session.isStreaming).toBe(true), { timeout: 20_000, interval: 10 });
+
+		const id = "agentmsg_matrix_manual_compact";
+		const message = createAgentSessionMessage(agentPayload(id, "child", "report while a manual compact hangs"));
+		expect(classifyIncomingInput(incomingInputFactsFromMessage(message, { source: "agent" }))).toBe(
+			"agent_child_reply",
+		);
+		const timeline = watch(harness, (candidate) => isAgentMessageWithId(candidate, id));
+		const preflight = createPreflightRecord();
+		const admit = harness.session.acceptAgentMessagePrompt(message.content, {
+			expandPromptTemplates: false,
+			streamingBehavior: "steer",
+			queueIfBusy: true,
+			customMessage: message,
+			preflightResult: capturePreflight(preflight),
+		});
+		track(admit);
+		await settledPreflight(preflight);
+		expect(preflight.queued).toBe(true);
+		// Fixture integrity: something really is waiting, and no compaction is running yet.
+		expect(harness.session.hasPendingSessionWork).toBe(true);
+		expect(harness.session.isCompacting).toBe(false);
+
+		// The manual path. The compact() abort ends the held turn; the compaction
+		// itself parks inside the hook, and only the gate watchdog can end it.
+		const compactRun = harness.session.compact();
+		track(compactRun);
+		await vi.waitFor(() => expect(gate.enteredCount()).toBe(1), { timeout: 20_000, interval: 10 });
+		expect(harness.session.isCompacting).toBe(true);
+		expect(harness.session.hasPendingSessionWork).toBe(true);
+
+		// The test never releases the gate: the bound has to be what ends the hang.
+		clock.advance(ADMISSION_WATCHDOG_SECONDS * 1000 + 1);
+		await vi.waitFor(() => expect(harness.session.isCompacting).toBe(false), { timeout: 20_000, interval: 10 });
+		expect(gate.isReleased()).toBe(false);
+		const aborted = harness.eventsOfType("compaction_end").filter((end) => end.aborted === true);
+		expect(aborted).toHaveLength(1);
+		expect(aborted[0]?.reason).toBe("manual");
+
+		// No external wake: compact()'s abort() suspended the pump on purpose, and the
+		// watchdog - not the user - cut the hang, so the callback itself must lift that
+		// suspension. Removing the wake from the watchdog callback turns this row red.
+		await harness.session.waitForIdle();
+
+		// The queued reply was not starved: the abort let it through.
+		expect(timeline.first("compaction_end")).toBeLessThan(timeline.first("input_delivered"));
+		expect(timeline.count("input_delivered")).toBe(1);
+		expect(harness.session.messages.filter((item) => isAgentMessageWithId(item, id))).toHaveLength(1);
+		expect(harness.session.queuedActionCount).toBe(0);
+		expect(getAssistantTexts(harness)).toContain(REPLY_TURN_TEXT);
+	});
+
+	it("watchdog: a healthy compaction inside the default budget is never aborted (real clock)", async () => {
+		// B2-15 budget pin: no injected clock and no stallWatchdog override, so the
+		// bound resolves to the exported default (COMPACTION_GATE_ABORT_AFTER_SECONDS,
+		// 600s) on real timers. The hook yields one real macrotask before answering, so
+		// the compaction is provably alive-and-progressing rather than synchronous -
+		// and it must finish untouched: zero aborted compaction_end events, the queued
+		// reply delivered. Mutating the caliber down to ~0 (the M-gate) makes the
+		// watchdog fire during that single macrotask hop and turns this row red; so
+		// does any regression that lets the bound cut healthy work.
+		const harness = await createHarness({
+			tools: [
+				{
+					name: "fill",
+					label: "fill",
+					description: "returns text",
+					parameters: Type.Object({}),
+					execute: async () => ({ content: [{ type: "text", text: BIG_OUTPUT }], details: {} }),
+				} as unknown as AgentTool,
+			],
+			settings: {
+				compaction: {
+					enabled: false,
+					reserveTokens: RESERVE_TOKENS,
+					keepRecentTokens: KEEP_RECENT_TOKENS,
+					triggerRatio: TRIGGER_RATIO,
+				},
+			},
+			models: [{ id: "faux-1", contextWindow: CONTEXT_WINDOW }],
+			persistSession: true,
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => {
+						// A live macrotask hop: the event loop is provably responsive while
+						// this compaction runs, so killing it cannot be mistaken for cutting
+						// a wedge.
+						await new Promise((resolve) => setTimeout(resolve, 0));
+						return {
+							compaction: {
+								summary: COMPACTION_SUMMARY,
+								firstKeptEntryId: event.preparation.firstKeptEntryId,
+								tokensBefore: event.preparation.tokensBefore,
+								details: {},
+							},
+						};
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([...FILL_RESPONSES, fauxAssistantMessage(REPLY_TURN_TEXT), fauxAssistantMessage("spare")]);
+		await fillContext(harness, true);
+		// No override anywhere: the stall watchdog ships warn-only, so the gate bound
+		// is the exported default - the caliber the pin below fixes at 600s.
+		expect(harness.settingsManager.getStallWatchdogSettings().abortAfterSeconds).toBe(0);
+		expect(COMPACTION_GATE_ABORT_AFTER_SECONDS).toBe(600);
+
+		const id = "agentmsg_matrix_budget_pin";
+		const message = createAgentSessionMessage(agentPayload(id, "child", "report behind a healthy compaction"));
+		expect(classifyIncomingInput(incomingInputFactsFromMessage(message, { source: "agent" }))).toBe(
+			"agent_child_reply",
+		);
+		const timeline = watch(harness, (candidate) => isAgentMessageWithId(candidate, id));
+		const preflight = createPreflightRecord();
+		const admit = harness.session.acceptAgentMessagePrompt(message.content, {
+			expandPromptTemplates: false,
+			streamingBehavior: "steer",
+			queueIfBusy: true,
+			customMessage: message,
+			preflightResult: capturePreflight(preflight),
+		});
+		track(admit);
+		await settledPreflight(preflight);
+		// Over threshold and idle: the gate queues the reply and compacts first.
+		expect(preflight.queued).toBe(true);
+		await harness.session.waitForIdle();
+
+		// The healthy compaction ran and was NOT cut: every compaction_end is a
+		// completion, none an abort.
+		const ends = harness.eventsOfType("compaction_end");
+		expect(ends.length).toBeGreaterThan(0);
+		expect(ends.filter((end) => end.aborted === true)).toEqual([]);
+		expect(timeline.first("compaction_end")).toBeLessThan(timeline.first("input_delivered"));
+		expect(timeline.count("input_delivered")).toBe(1);
+		expect(harness.session.messages.filter((item) => isAgentMessageWithId(item, id))).toHaveLength(1);
+		expect(harness.session.queuedActionCount).toBe(0);
+		expect(getAssistantTexts(harness)).toContain(REPLY_TURN_TEXT);
+		expect(harness.session.hasPendingSessionWork).toBe(false);
+	});
+
+	it("caliber: the compaction gate budget stays pinned at 2x the default stream-stall timeout (B2-15)", () => {
+		// Pin the literal as well as the derivation: shrinking either the constant or
+		// the stream-stall default it derives from shrinks the bound every queued
+		// input gets, and both directions must turn a test red.
+		expect(DEFAULT_STREAM_STALL_TIMEOUT_MS).toBe(300_000);
+		expect(COMPACTION_GATE_ABORT_AFTER_SECONDS).toBe((DEFAULT_STREAM_STALL_TIMEOUT_MS / 1000) * 2);
+		expect(COMPACTION_GATE_ABORT_AFTER_SECONDS).toBe(600);
 	});
 });
