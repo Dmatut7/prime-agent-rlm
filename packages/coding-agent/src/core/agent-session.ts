@@ -7278,10 +7278,11 @@ export class AgentSession {
 		// because `compaction-during-child-reply` states the stand-down as a contract, not
 		// because a pin holds it. The observable half - a human prompt is never gated, and
 		// human priority never preempts a running compaction - is pinned in
-		// `2334-human-priority-lane-scoped.test.ts` and by the matrix's two "admitted INTO a
-		// hung compaction" watchdog rows, which read `preflight.reason` as undefined for the
-		// human prompt while a child reply in the same window gets `compaction_pending`. If
-		// a reachable human entry ever appears (most likely by moving this ruling into
+		// `2334-human-priority-lane-scoped.test.ts`, which admits a child reply and a human
+		// prompt into the same in-flight window and reads `compaction_pending` for the
+		// receipt against `undefined` for the person; the matrix's two "admitted INTO a hung
+		// compaction" watchdog rows add the bound to that same window shape. If a reachable
+		// human entry ever appears (most likely by moving this ruling into
 		// `_admitSessionInput`, which every input passes through), pin it in the same commit.
 		//
 		// `_admitSessionInput` did grow a compaction-related call - it arms
@@ -9327,10 +9328,11 @@ export class AgentSession {
 		// agent-message gate arms it for its own channel. Input admitted *into* a running
 		// compaction had no bound, and the stall watchdog snoozes while compaction owns the
 		// turn boundary, so a wedged summarization call held it forever - the boss typing
-		// during a hung compaction is the observed case, and machine traffic (a heartbeat,
-		// a child terminal notice) stalls the same way. Admission is the one choke point
-		// every input passes through, so the bound is armed here and stops depending on
-		// which of the two happened first.
+		// during a hung compaction is the observed case, and machine traffic stalls the
+		// same way (measured with a heartbeat; an RLM child terminal notice is admitted
+		// through the identical call). Admission is the one choke point every input passes
+		// through, so the bound is armed here and stops depending on which of the two
+		// happened first.
 		if (this.isCompacting) this._armCompactionGateWatchdog();
 		if (
 			!options.restore &&
