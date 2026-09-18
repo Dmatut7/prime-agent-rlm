@@ -1,3 +1,6 @@
+# Version policy: this Python runtime is OUTSIDE the npm lockstep (root + packages/*).
+# It evolves independently; see docs/fork/lockstep-scope.md for the boundary and the
+# reason (consumed by content sha256, not by npm version; not a node workspace).
 [project]
 name = "prime-agent-runtime"
 version = "0.1.0"
