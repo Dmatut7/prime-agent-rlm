@@ -228,14 +228,35 @@ async function waitForCapturedChildClose(child: ChildProcess): Promise<void> {
 	await new Promise<void>((resolveClose) => child.once("close", () => resolveClose()));
 }
 
-async function waitForFile(path: string): Promise<void> {
+/**
+ * Wait for the fixture worker's gate marker to *hold the gate commit*, not merely to exist.
+ *
+ * The child publishes that marker with one `writeFileSync`, which is `open` + `write` + `close`:
+ * the path is already there — and reads as an empty file — from the moment the `open` (O_CREAT)
+ * lands, before a single byte is stored. A wait that only asks for existence therefore walks
+ * past the marker while the writer is still between those two syscalls. That matters here
+ * because every test that waits on this marker goes on to drive the supervisor's cancellation
+ * rollback, which kills the child: a kill delivered inside the open->write window leaves the
+ * marker empty for good, and the `start\n` assertion below then reads `""`. The assertions
+ * require that content anyway, so wait for exactly it and report what was last seen.
+ */
+async function waitForFileContent(path: string, expected: string): Promise<void> {
 	const deadline = Date.now() + 1000;
-	while (!existsSync(path) && Date.now() < deadline) {
+	let observed = "";
+	while (Date.now() < deadline) {
+		try {
+			observed = readFileSync(path, "utf8");
+		} catch {
+			observed = "";
+		}
+		if (observed === expected) {
+			return;
+		}
 		await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
 	}
-	if (!existsSync(path)) {
-		throw new Error(`Timed out waiting for ${path}`);
-	}
+	throw new Error(
+		`Timed out waiting for ${path} to hold ${JSON.stringify(expected)}; last read ${JSON.stringify(observed)}`,
+	);
 }
 
 function createExistingLaunchWorker(root: string, descriptorDir: string) {
@@ -758,7 +779,7 @@ describe("daemon worker supervisor monitoring", () => {
 		workerLaunchTestState.gateMarkerPath = markerPath;
 		const workers = new Map<string, unknown>();
 		const connectWorker = vi.fn(async (worker: { descriptor: { rootActiveSessionId: string } }) => {
-			await waitForFile(markerPath);
+			await waitForFileContent(markerPath, DAEMON_WORKER_STARTUP_GATE_COMMIT);
 			return {
 				request: vi.fn(async () => ({
 					success: true,
@@ -825,7 +846,7 @@ describe("daemon worker supervisor monitoring", () => {
 		let persistenceCalls = 0;
 		const workers = new Map<string, unknown>();
 		const connectWorker = vi.fn(async () => {
-			await waitForFile(markerPath);
+			await waitForFileContent(markerPath, DAEMON_WORKER_STARTUP_GATE_COMMIT);
 			throw cancellation;
 		});
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
@@ -884,7 +905,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const workers = new Map<string, object>([[existing.descriptor.workerId, existing]]);
 		const deferWorkerRecovery = vi.fn();
 		const connectWorker = vi.fn(async () => {
-			await waitForFile(markerPath);
+			await waitForFileContent(markerPath, DAEMON_WORKER_STARTUP_GATE_COMMIT);
 			throw cancellation;
 		});
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
@@ -975,7 +996,7 @@ describe("daemon worker supervisor monitoring", () => {
 			]);
 		});
 		const connectWorker = vi.fn(async () => {
-			await waitForFile(markerPath);
+			await waitForFileContent(markerPath, DAEMON_WORKER_STARTUP_GATE_COMMIT);
 			throw cancellation;
 		});
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
