@@ -51,7 +51,11 @@ import {
 	createAgentSessionMessage,
 	isAgentSessionMessage,
 } from "../../../src/core/agent-messages.js";
-import { sessionActionPriorityFor, sessionActionPriorityForInputClass } from "../../../src/core/agent-session.js";
+import {
+	sessionActionPriorityFor,
+	sessionActionPriorityForInputClass,
+	type SessionActionRecoverySnapshot,
+} from "../../../src/core/agent-session.js";
 import {
 	classifyIncomingInput,
 	INPUT_CLASSES,
@@ -216,6 +220,107 @@ describe("#2334 lane-scoped priority inside a session queue", () => {
 		expect(count).toBe(2);
 		expect(restored.session.getSteeringMessages()).toEqual(["human after the reply", reply.content]);
 
+		releaseToolExecution();
+		await promptPromise;
+		await harness.session.waitForIdle();
+	});
+
+	it("re-derives the priority a pre-#2334 snapshot never wrote, instead of demoting it", async () => {
+		// Final-review seat B, B3-08': the `??` right value in restoreSessionActions had no pin at
+		// all - swapping the re-derivation for a constant "background" kept 367 tests green across
+		// seven files. CHANGELOG.md's 0.10.0 known-issues row describes exactly that constant
+		// ("已排队的 human steer/followUp 会一次性降成 background"), so the ledger and the code
+		// disagreed with nothing testing either side. This is the code's pin, and it is also what
+		// settles the ledger: the backfill re-derives from the recorded source and envelope, so the
+		// answer per row is
+		//   - a prompt the interactive submit path queued (recorded source "interactive", which is
+		//     what Enter does while the agent streams, in either lane) comes back "user";
+		//   - machine traffic comes back "background";
+		//   - a row recorded as "internal" - the direct steer()/followUp() API the RPC and daemon
+		//     `steer` commands use - comes back "background" even when a person typed it, because
+		//     the recorded source is the only vote the restore path has. That last row is the whole
+		//     truth in the CHANGELOG line, and it is not the row the TUI writes.
+		// The format version deliberately did not move with #2334, so this branch is the upgrade
+		// path (prepare_update_restart -> restore_next_turn), not a hypothetical.
+		const { harness, releaseToolExecution, promptPromise, waitForToolStart } = await createWaitingHarness();
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("reply 0"),
+			fauxAssistantMessage("reply 1"),
+			fauxAssistantMessage("reply 2"),
+		]);
+		await waitForToolStart;
+
+		// What the TUI's Enter does while the agent is streaming.
+		await harness.session.prompt("typed before the upgrade", { streamingBehavior: "steer", queueIfBusy: true });
+		// The steer() API a machine caller (or an RPC client) uses: same words, recorded "internal".
+		await harness.session.steer("queued through the steer API");
+		const reply = childReply("agentmsg_pre2334", "child report");
+		await harness.session.queueAgentMessagePrompt(reply.content, "steer", reply);
+		await harness.session.prompt("followed up before the upgrade", {
+			streamingBehavior: "followUp",
+			queueIfBusy: true,
+		});
+
+		const snapshot = harness.session.getSessionActionRecoverySnapshot();
+		expect(snapshot.actions.map((action) => action.source)).toEqual([
+			"interactive",
+			"internal",
+			"internal",
+			"interactive",
+		]);
+		// Live priorities: both human rows are "user" at admission, because steer() asks the
+		// classifier the way a human client would even though it records the source as internal.
+		expect(snapshot.actions.map((action) => action.priority)).toEqual(["user", "user", "background", "user"]);
+
+		// The pre-#2334 shape: byte-identical rows with the priority field never written.
+		const pre2334: SessionActionRecoverySnapshot = {
+			formatVersion: snapshot.formatVersion,
+			actions: snapshot.actions.map(({ priority: _priority, ...action }) => action),
+		};
+		expect(pre2334.actions.every((action) => action.priority === undefined)).toBe(true);
+
+		// The restore target is mid-run, so a later arrival has to queue and the backfilled rank
+		// becomes observable instead of being drained away immediately.
+		const restored = await createWaitingHarness();
+		harnesses.push(restored.harness);
+		restored.harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("reply 0"),
+			fauxAssistantMessage("reply 1"),
+			fauxAssistantMessage("reply 2"),
+			fauxAssistantMessage("reply 3"),
+		]);
+		await restored.waitForToolStart;
+		expect(await restored.harness.session.restoreSessionActions(pre2334)).toBe(4);
+
+		// The backfilled right values, read back off the restored queue: re-derived per row, not a
+		// constant. A constant "background" - the CHANGELOG's claim - fails here on both human rows.
+		expect(
+			restored.harness.session.getSessionActionRecoverySnapshot().actions.map((action) => action.priority),
+		).toEqual(["user", "background", "background", "user"]);
+
+		// ...and in force in the store, which is what a constant would change for the user: a new
+		// human prompt inserts behind the restored interactive row and ahead of both restored
+		// background rows. Under a constant backfill every restored row would rank below it and the
+		// new prompt would jump to the head of the lane. The follow-up lane is untouched - priority
+		// never crosses lanes (r39 QP-4).
+		await restored.harness.session.prompt("typed after the restart", {
+			streamingBehavior: "steer",
+			queueIfBusy: true,
+		});
+		expect(restored.harness.session.getSteeringMessages()).toEqual([
+			"typed before the upgrade",
+			"typed after the restart",
+			"queued through the steer API",
+			reply.content,
+		]);
+		expect(restored.harness.session.getFollowUpMessages()).toEqual(["followed up before the upgrade"]);
+
+		restored.releaseToolExecution();
+		await restored.promptPromise;
+		await restored.harness.session.waitForIdle();
 		releaseToolExecution();
 		await promptPromise;
 		await harness.session.waitForIdle();
