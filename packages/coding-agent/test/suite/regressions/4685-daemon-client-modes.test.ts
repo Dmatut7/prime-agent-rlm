@@ -93,7 +93,14 @@ function daemonPidForSocket(socketPath: string, registryDir: string): number | u
 		});
 		const owner = owners.find((candidate) => candidate.socketPath === socketPath);
 		return owner && owner.pid > 0 ? owner.pid : undefined;
-	} catch {
+	} catch (error) {
+		// FA-8: this daemonSockets entry means the socket existed at some point, so
+		// a registry read failure here silently returns the cleanup to the old
+		// race (rmSync against a live daemon). Say so instead of swallowing it.
+		console.warn(
+			`4685-daemon-client-modes: could not read the supervisor registry for ${socketPath} ` +
+				`(registry ${registryDir}); daemon pid unknown, cleanup falls back to socket-file watching: ${String(error)}`,
+		);
 		return undefined;
 	}
 }
