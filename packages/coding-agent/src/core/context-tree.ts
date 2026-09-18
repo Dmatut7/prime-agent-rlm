@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
+import { BoundedCache } from "../utils/bounded-cache.js";
 import type { RlmChildAgentStatus } from "./agent-session.js";
 import { calculateContextTokens, estimateContextTokens } from "./compaction/index.js";
 import type { ContextUsage } from "./extensions/index.js";
@@ -418,43 +419,69 @@ function listChildSessionDirs(rlmSessionDir: string): string[] {
  * fingerprint the tree has since moved past. Without it (a one-off probe with no memo), the
  * fingerprint is taken as it always was.
  */
-function subtreeFingerprint(dir: string, remainingDepth: number, memory?: Map<string, string>): string {
+function subtreeFingerprint(
+	dir: string,
+	remainingDepth: number,
+	maxVisible: number,
+	memory?: Map<string, string>,
+): string {
 	if (!memory) {
-		return fingerprintRlmSessionDir(dir, remainingDepth);
+		return fingerprintRlmSessionDir(dir, remainingDepth, maxVisible);
 	}
-	const memoKey = `${dir}#${remainingDepth}`;
+	const memoKey = `${dir}#${remainingDepth}#${maxVisible}`;
 	const remembered = memory.get(memoKey);
 	if (remembered !== undefined) {
 		return remembered;
 	}
-	const value = fingerprintRlmSessionDir(dir, remainingDepth);
+	const value = fingerprintRlmSessionDir(dir, remainingDepth, maxVisible);
 	memory.set(memoKey, value);
 	return value;
 }
 
 /**
- * Stat-only fingerprint of the `sub-*` tree under an RLM session dir.
+ * Stat-only fingerprint of the part of the `sub-*` tree under an RLM session dir that a
+ * scan of it can actually reach.
  *
  * The context tree rebuilt on every UI refresh comes from reading and folding the
  * transcripts under this dir, which is expensive (a 544-child dir measured 2.2s and
  * ~1.08GB of reads) and usually redundant: between two refreshes of the same
  * session, most of that tree has not moved. The fingerprint is what makes "has not
- * moved" decidable without reading a byte of it - `readdir` + `stat` at every level
- * the scan could reach, plus each dir's newest transcript identity (whose `mtimeMs`
- * moves on any append), so a change anywhere the scan reads shows up here.
+ * moved" decidable without reading a byte of it.
+ *
+ * Every dir contributes two segments, because they answer two different questions:
+ *
+ * - **Identity**: `name:mtimeMs:size` of *every* `sub-*` candidate, in the walk's own
+ *   newest-first order. Which candidates a budget lets the scan read depends on that whole
+ *   order - `listChildSessionDirs` sorts by dir mtime, and creating or removing a file
+ *   inside a candidate moves it - so a candidate the scan refused still has to be covered,
+ *   or a promoted one would be served from a subtree that never saw it. A refused
+ *   candidate also reports whether it holds a transcript at all (`@?`), because that is
+ *   what `skippedByBudget` counts and a user reads that count as "N more agents not shown".
+ * - **Content**: for the first `maxVisible` candidates that hold a transcript, the newest
+ *   transcript's identity (whose `mtimeMs` moves on any append) and the descent below it.
+ *   This is the prefix a walk can consume, and nothing else: an append inside a candidate
+ *   the budget refuses cannot change the answer, so it must not throw the subtree away.
+ *
+ * `maxVisible` is therefore the scan's own `maxChildren`, widened by the live ids the root
+ * frame skips (those cost no budget but do occupy positions). The window counts
+ * *transcript-bearing* candidates rather than positions, which is what makes it a superset
+ * of the read set: a dir with no readable `.jsonl` costs the walk no budget either, so a
+ * run of empty dirs pushes the reads further down the listing than `maxChildren` slots.
+ * Covering more than the walk reads only invalidates too often, which is the safe direction;
+ * covering less would serve a subtree the scan has since outgrown.
  *
  * `remainingDepth` mirrors the scan's own `maxDepth` cutoff: bytes below a depth the
  * scan would never visit are not fingerprinted either, so a cached subtree cannot be
  * reused past a change the scan was never going to see.
  */
-function fingerprintRlmSessionDir(dir: string, remainingDepth: number): string {
+function fingerprintRlmSessionDir(dir: string, remainingDepth: number, maxVisible: number): string {
 	const parts: string[] = [];
 	// `listed` carries the names a caller already read, so one listing of a child dir serves
 	// both the transcript identity and the descent into it. The two used to be separate
 	// `readdir` calls, which doubled the syscall count of every fingerprint - and a fingerprint
 	// is paid on every reuse check as well as on every miss. `undefined` means "not listed
 	// yet, read it here", which keeps the unreadable-dir branch below exactly as it was.
-	const walk = (current: string, remaining: number, listed?: string[]): void => {
+	const walk = (current: string, remaining: number, visible: number, listed?: string[]): void => {
 		let names: string[];
 		if (listed !== undefined) {
 			names = listed;
@@ -467,7 +494,8 @@ function fingerprintRlmSessionDir(dir: string, remainingDepth: number): string {
 				return;
 			}
 		}
-		for (const name of names.sort()) {
+		const candidates: { name: string; path: string; mtimeMs: number; size: number; mtime: number }[] = [];
+		for (const name of names) {
 			if (!name.startsWith("sub-")) {
 				continue;
 			}
@@ -481,25 +509,53 @@ function fingerprintRlmSessionDir(dir: string, remainingDepth: number): string {
 			if (!stats.isDirectory()) {
 				continue;
 			}
-			parts.push(`${name}:${stats.mtimeMs}:${stats.size}`);
+			candidates.push({
+				name,
+				path,
+				mtimeMs: stats.mtimeMs,
+				size: stats.size,
+				// The walk sorts on the ms-truncated mtime (see listChildSessionDirs), so the
+				// window has to select on the same precision or the two would disagree about
+				// which candidate sits on the boundary.
+				mtime: stats.mtime.getTime(),
+			});
+		}
+		candidates.sort((a, b) => b.mtime - a.mtime || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+		let readable = 0;
+		for (const candidate of candidates) {
+			parts.push(`${candidate.name}:${candidate.mtimeMs}:${candidate.size}`);
 			let childNames: string[] | undefined;
 			try {
-				childNames = readdirSync(path);
+				childNames = readdirSync(candidate.path);
 			} catch {
-				// An unreadable child is not listable: the descent below re-lists it and records
-				// the same `?` marker it always did, and it contributes no transcript identity.
+				// An unreadable child is not listable: the walk's findSessionFile fails on it too,
+				// so it contributes neither a read nor a budget skip.
 				childNames = undefined;
 			}
-			const transcript = childNames === undefined ? undefined : newestTranscriptFingerprint(path, childNames);
+			if (readable >= visible) {
+				// Outside the read prefix. The listing is still read, because whether a refused
+				// dir holds a transcript is what the walk charges to `skippedByBudget`, but
+				// nothing below it can reach the answer.
+				if (childNames?.some((name) => name.endsWith(".jsonl"))) {
+					parts.push("@?");
+				}
+				continue;
+			}
+			const transcript =
+				childNames === undefined ? undefined : newestTranscriptFingerprint(candidate.path, childNames);
 			if (transcript) {
 				parts.push(`@${transcript}`);
+				readable++;
 			}
-			if (remaining > 1) {
-				walk(path, remaining - 1, childNames);
+			// A dir with no readable transcript is not queued by the walk either, so its own
+			// subtree cannot reach the answer: descending into it would only invalidate the
+			// parent over a change nothing reads.
+			if (transcript !== undefined && remaining > 1) {
+				walk(candidate.path, remaining - 1, visible, childNames);
 			}
 		}
 	};
-	walk(dir, Math.max(1, remainingDepth));
+	walk(dir, Math.max(1, remainingDepth), Math.max(0, maxVisible));
 	return parts.join("|");
 }
 
@@ -557,60 +613,284 @@ interface CachedSubtree {
 }
 
 /**
+ * What one dir's reuse policy currently knows. Keyed by the pointer key (dir + call shape),
+ * not by the fingerprint: the policy has to survive the fingerprint moving, that is the only
+ * thing it observes.
+ */
+interface BusySubtreeState {
+	/** Consecutive reuse checks that found nothing usable for this dir and shape. */
+	misses: number;
+	/** Walk this dir without a fingerprint until this instant; 0 when it is not bypassed. */
+	cooldownUntil: number;
+	/** The last reuse check was bypassed, so the walk behind it has no key to be stored under. */
+	bypassed: boolean;
+}
+
+/**
+ * Retained bytes of one cloned disk node, measured rather than guessed: storing one
+ * 256-child roster and dividing the `--expose-gc` heap delta by the node count gives
+ * ~640 bytes per node (the node object, its two `Usage` objects with their nested `cost`,
+ * the optional `contextUsage`, the children array, and V8's per-object slack). The
+ * estimate below charges that plus the two variable-length strings it actually holds, at
+ * 2 bytes per char - V8 keeps ASCII at 1 and CJK at 2, and a label is user text, so 2 is
+ * the conservative side of the truth. It is an estimate for a ceiling, not an account:
+ * what matters is that it grows with what is retained, so a roster of long labels cannot
+ * hide under a per-entry constant.
+ */
+const CACHE_NODE_BYTES = 640;
+/** One cache record's own overhead (key string, record object, map slot). */
+const CACHE_ENTRY_BYTES = 128;
+const CACHE_BYTES_PER_CHAR = 2;
+
+function estimateNodeBytes(node: ContextTreeNode): number {
+	let bytes = CACHE_NODE_BYTES + CACHE_BYTES_PER_CHAR * (node.id.length + node.label.length);
+	if (node.model) {
+		bytes += CACHE_BYTES_PER_CHAR * (node.model.provider.length + node.model.id.length);
+	}
+	for (const child of node.children) {
+		bytes += estimateNodeBytes(child);
+	}
+	return bytes;
+}
+
+function estimateSubtreeBytes(nodes: readonly ContextTreeNode[]): number {
+	let bytes = CACHE_ENTRY_BYTES;
+	for (const node of nodes) {
+		bytes += estimateNodeBytes(node);
+	}
+	return bytes;
+}
+
+/** Ceilings and policy for {@link ContextTreeDiskScanCache}; omitted fields take these. */
+export interface ContextTreeDiskScanCacheOptions {
+	/** Ceiling on cached keys, per level (subtrees and nodes each get this many). */
+	maxEntries?: number;
+	/** Ceiling on summed estimated retained bytes, per level. One value above it is not cached. */
+	maxBytes?: number;
+	/** Drop entries nobody touched for this long, at the next insert. 0 disables idle expiry. */
+	idleTtlMs?: number;
+	/** Minimum distance between idle sweeps. */
+	sweepIntervalMs?: number;
+	/** Consecutive misses on one dir and shape that mark it busy. 0 disables the bypass. */
+	busyMissThreshold?: number;
+	/** How long a busy dir is walked without a fingerprint at all. 0 disables the bypass. */
+	busyCooldownMs?: number;
+}
+
+/**
+ * Sizing, from the measurements that motivated each ceiling:
+ *
+ * - `maxEntries: 512` is the historical cap and still the right shape: one scan of a
+ *   budgeted tree stores one entry per dir it read (a root plus at most `maxChildren`
+ *   leaves), so the population is the roster width, not the number of refreshes.
+ * - `maxBytes: 16 MiB` per level is the new hard part. The entry cap alone let 560 busy
+ *   scans of a 600-child family retain 79 MB (`heapUsed` delta, `--expose-gc`): a busy
+ *   family stores a fresh root entry every tick under a fingerprint that will never be
+ *   looked up again, and 512 of those at ~164 KB each is the whole leak. 16 MiB holds
+ *   ~100 rosters of that size, i.e. the working set with room to spare, and binds long
+ *   before the entry cap does.
+ * - `idleTtlMs: 15 min` matches the two other {@link BoundedCache} consumers. It is what
+ *   reclaims a dir nobody reads again (a finished family, a closed tray), and it is
+ *   expiry, not freshness: every hit is still revalidated by the fingerprint.
+ * - `busyMissThreshold: 2` / `busyCooldownMs: 60_000`: two probes in a row that both found
+ *   the tree moved means a child is appending between refreshes, and for such a dir the
+ *   fingerprint is pure overhead - it can only report a miss. One miss is not enough (a
+ *   child that appends once and settles must keep its hits), and the cooldown is what
+ *   bounds the re-probe to one per minute per dir instead of one per tick.
+ */
+export const DEFAULT_CONTEXT_TREE_DISK_CACHE_LIMITS = {
+	maxEntries: 512,
+	maxBytes: 16 * 1024 * 1024,
+	idleTtlMs: 15 * 60 * 1000,
+	sweepIntervalMs: 1000,
+	busyMissThreshold: 2,
+	busyCooldownMs: 60_000,
+} satisfies Required<ContextTreeDiskScanCacheOptions>;
+
+/**
  * Reuse for the on-disk half of the context tree, owned by the session that reads it.
  *
  * Two levels, because they buy different things:
  *
- * - **Subtree**: the children of one dir, keyed by {@link fingerprintRlmSessionDir} plus
- *   the call's shape (level, maxDepth, budget, live ids). Unchanged fingerprint means
- *   nothing the scan would read has changed, so the walk - every `readdir`, `stat`,
- *   parse and fold under that dir - is skipped outright. The budget is charged from
- *   the figures the cached miss recorded, so a truncated scan still reports the same
- *   omission on a hit: /context must not describe less of the tree just because the
- *   answer was remembered.
+ * - **Subtree**: the children of one dir, keyed by the dir, the call's shape (level,
+ *   maxDepth, budget, live ids) and {@link fingerprintRlmSessionDir} of the part of the
+ *   tree that shape can read. Unchanged fingerprint means nothing the scan would read has
+ *   changed, so the walk - every `readdir`, `stat`, parse and fold under that dir - is
+ *   skipped outright. The budget is charged from the figures the cached miss recorded, so
+ *   a truncated scan still reports the same omission on a hit: /context must not describe
+ *   less of the tree just because the answer was remembered. The dir is part of the key
+ *   because the fingerprint alone is not identity: two leaf dirs at the same level with the
+ *   same shape fingerprint the same empty string, and sharing one entry between them would
+ *   serve one dir's children for another's.
  * - **Node**: one transcript, keyed by its own stat identity (`mtimeMs` + `size`).
  *   This is the fallback when a subtree fingerprint moved for one reason (one child
  *   appended) but 255 siblings did not: only the moved transcript is read again.
  *
  * Both levels hand back copies of the nodes they hold, and the node entries carry
  * `children: []` - the walk owns each call's child arrays - so a remembered tree can
- * never be mutated by the scan that reuses it. Bounded so a session that visits a very
- * wide tree over its lifetime cannot grow this without limit.
+ * never be mutated by the scan that reuses it.
+ *
+ * Residency is bounded four ways, all of them insert-triggered (no timer, no handle, no
+ * reason for the event loop to stay alive): a key ceiling and an estimated-byte ceiling per
+ * level, least-recently-used eviction under pressure, idle expiry, and - for subtrees -
+ * reclamation of the entry a moved fingerprint orphans. That last one matters because a
+ * fingerprint is part of the key: a busy family produces a fresh key every tick, and
+ * without reclaim each of those keeps a whole roster copy alive until some ceiling evicts
+ * it. A dir whose subtree keeps moving is also walked without a fingerprint at all for a
+ * cooldown (see `busyMissThreshold`): for such a dir the probe cannot hit, and paying it
+ * made a cached scan *slower* than no cache - measured +52% at 200 children and +116% at
+ * 600, against a walk that reads nothing twice.
  */
 export class ContextTreeDiskScanCache {
-	/** Dirs whose subtree was reused / rebuilt, and transcripts reused / read. */
-	readonly stats = { subtreeHits: 0, subtreeMisses: 0, nodeHits: 0, nodeMisses: 0 };
-	private readonly subtrees = new Map<string, CachedSubtree>();
-	private readonly nodes = new Map<string, CachedContextNode>();
+	/**
+	 * Dirs whose subtree was reused / rebuilt, and transcripts reused / read.
+	 *
+	 * `subtreeHits` counts a reuse that handed back children; `subtreeEmptyHits` counts one
+	 * that handed back none (a leaf frame, or a frame the budget had already emptied), which
+	 * saves one `readdir` and would otherwise flood the hit figure - a 200-child family
+	 * measured 12207 "hits" against 262 misses, all but 200 of them empty. `subtreeProbes`
+	 * is how many fingerprints a reuse check actually paid for, and `subtreeBypasses` how
+	 * many reuse checks were skipped as known-busy, so the two together say what the busy
+	 * policy cost and saved. A bypass is also counted as a miss: nothing was reused.
+	 */
+	readonly stats = {
+		subtreeHits: 0,
+		subtreeEmptyHits: 0,
+		subtreeMisses: 0,
+		subtreeBypasses: 0,
+		subtreeProbes: 0,
+		nodeHits: 0,
+		nodeMisses: 0,
+	};
+	private readonly subtrees: BoundedCache<CachedSubtree>;
+	private readonly nodes: BoundedCache<CachedContextNode>;
+	/** Pointer key -> the full key currently live for it, so a moved fingerprint reclaims the old one. */
+	private readonly liveKeys: BoundedCache<string>;
+	/** Pointer key -> reuse policy for that dir and shape. */
+	private readonly busy: BoundedCache<BusySubtreeState>;
+	private readonly busyMissThreshold: number;
+	private readonly busyCooldownMs: number;
 
-	constructor(private readonly maxEntries = 512) {}
+	constructor(options: ContextTreeDiskScanCacheOptions = {}) {
+		const defaults = DEFAULT_CONTEXT_TREE_DISK_CACHE_LIMITS;
+		const limits = {
+			maxEntries: options.maxEntries ?? defaults.maxEntries,
+			maxBytes: options.maxBytes ?? defaults.maxBytes,
+			idleTtlMs: options.idleTtlMs ?? defaults.idleTtlMs,
+			sweepIntervalMs: options.sweepIntervalMs ?? defaults.sweepIntervalMs,
+			busyMissThreshold: options.busyMissThreshold ?? defaults.busyMissThreshold,
+			busyCooldownMs: options.busyCooldownMs ?? defaults.busyCooldownMs,
+		};
+		this.busyMissThreshold = limits.busyMissThreshold;
+		this.busyCooldownMs = limits.busyCooldownMs;
+		this.subtrees = new BoundedCache<CachedSubtree>({
+			maxEntries: limits.maxEntries,
+			maxBytes: limits.maxBytes,
+			estimateBytes: (value, key) => estimateSubtreeBytes(value.nodes) + CACHE_BYTES_PER_CHAR * key.length,
+			idleTtlMs: limits.idleTtlMs,
+			sweepIntervalMs: limits.sweepIntervalMs,
+		});
+		this.nodes = new BoundedCache<CachedContextNode>({
+			maxEntries: limits.maxEntries,
+			maxBytes: limits.maxBytes,
+			estimateBytes: (value, key) =>
+				estimateNodeBytes(value.node) + CACHE_ENTRY_BYTES + CACHE_BYTES_PER_CHAR * key.length,
+			idleTtlMs: limits.idleTtlMs,
+			sweepIntervalMs: limits.sweepIntervalMs,
+		});
+		// Metadata, not payload: a few hundred bytes per dir. The entry ceiling binds first;
+		// the byte ceiling is the backstop that keeps a pathological key length bounded too.
+		const metadata = {
+			maxEntries: limits.maxEntries,
+			maxBytes: 1024 * 1024,
+			idleTtlMs: limits.idleTtlMs,
+			sweepIntervalMs: limits.sweepIntervalMs,
+		};
+		this.liveKeys = new BoundedCache<string>({
+			...metadata,
+			estimateBytes: (value, key) => CACHE_BYTES_PER_CHAR * (value.length + key.length),
+		});
+		this.busy = new BoundedCache<BusySubtreeState>({
+			...metadata,
+			estimateBytes: (_value, key) => CACHE_ENTRY_BYTES + CACHE_BYTES_PER_CHAR * key.length,
+		});
+	}
+
+	/** Subtree entries currently retained. */
+	get subtreeEntries(): number {
+		return this.subtrees.size;
+	}
+
+	/** Estimated retained bytes of the subtree level (see {@link estimateNodeBytes}). */
+	get subtreeEstimatedBytes(): number {
+		return this.subtrees.estimatedBytes;
+	}
+
+	/** Transcript node entries currently retained. */
+	get nodeEntries(): number {
+		return this.nodes.size;
+	}
+
+	/** Estimated retained bytes of the node level. */
+	get nodeEstimatedBytes(): number {
+		return this.nodes.estimatedBytes;
+	}
 
 	/**
 	 * The remembered subtree for `dir`, or undefined. `key` must cover everything
 	 * besides the on-disk tree that the walk's result depends on (level, budget, live
-	 * ids) - the fingerprint covers the tree itself. On a hit the caller's `state` is
+	 * ids) - the fingerprint covers the tree itself, and `maxVisible` tells it how far
+	 * down the listing that budget can read. On a hit the caller's `state` is
 	 * charged what the walked miss was charged.
 	 *
-	 * `fingerprints` is the calling scan's own memo of this dir's fingerprint (see
-	 * {@link subtreeFingerprint}): a miss is probed here and stored after the walk, and
-	 * both used to fingerprint the same tree, so a miss paid for the whole readdir/stat
-	 * pass twice. The memo lives for exactly one scan, so a later call re-fingerprints
-	 * and cannot reuse a lookup key that is no longer current.
+	 * A dir that missed {@link busyMissThreshold} probes in a row is walked without a
+	 * fingerprint at all until the cooldown ends (`subtreeBypasses`). The bypass never
+	 * serves anything: it returns undefined, so the caller walks the disk and gets the
+	 * current tree. What it must not do is store - the walk behind a bypass has no
+	 * fingerprint to be keyed by, and taking one afterwards would key pre-append nodes
+	 * under a post-append identity.
 	 */
 	takeSubtree(
 		dir: string,
 		remainingDepth: number,
+		maxVisible: number,
 		key: string,
 		state: ContextTreeScanState,
 		resolveContextWindow: ContextWindowResolver,
 		fingerprints?: Map<string, string>,
 	): CachedSubtree | undefined {
-		const cached = this.subtrees.get(`${subtreeFingerprint(dir, remainingDepth, fingerprints)}#${key}`);
-		if (!cached || subtreeModelWindows(cached.nodes, resolveContextWindow) !== cached.modelWindows) {
+		const pointerKey = `${dir}\n${key}`;
+		const known = this.busy.get(pointerKey);
+		if (known !== undefined) {
+			known.bypassed = false;
+		}
+		if (known !== undefined && known.cooldownUntil > Date.now()) {
+			known.bypassed = true;
+			this.stats.subtreeBypasses++;
 			this.stats.subtreeMisses++;
 			return undefined;
 		}
-		this.stats.subtreeHits++;
+		const fingerprint = subtreeFingerprint(dir, remainingDepth, maxVisible, fingerprints);
+		this.stats.subtreeProbes++;
+		const fullKey = `${pointerKey}\n${fingerprint}`;
+		const cached = this.subtrees.get(fullKey);
+		if (!cached || subtreeModelWindows(cached.nodes, resolveContextWindow) !== cached.modelWindows) {
+			// A window mismatch is not a transient miss: the same key can only become usable
+			// again if the catalog moves back, and the store below replaces the entry anyway.
+			// Dropping it here is what keeps a resolver change from parking dead rosters.
+			if (cached) {
+				this.subtrees.delete(fullKey);
+			}
+			this.stats.subtreeMisses++;
+			this.recordSubtreeMiss(pointerKey);
+			return undefined;
+		}
+		if (cached.nodes.length === 0) {
+			this.stats.subtreeEmptyHits++;
+		} else {
+			this.stats.subtreeHits++;
+		}
+		this.busy.delete(pointerKey);
 		replayScanCharge(state, cached.charge);
 		return { nodes: cloneContextTreeNodes(cached.nodes), charge: cached.charge, modelWindows: cached.modelWindows };
 	}
@@ -622,17 +902,33 @@ export class ContextTreeDiskScanCache {
 	 * taken after the walk: a child that appended while the walk was reading is then a
 	 * fingerprint the stored nodes predate, so the next scan misses and re-walks, instead
 	 * of storing the post-append identity over pre-append nodes and serving them as fresh.
+	 * A bypassed lookup left no fingerprint behind, and this stores nothing.
 	 */
 	storeSubtree(
 		dir: string,
 		remainingDepth: number,
+		maxVisible: number,
 		key: string,
 		nodes: ContextTreeNode[],
 		charge: CachedScanCharge,
 		resolveContextWindow: ContextWindowResolver,
 		fingerprints?: Map<string, string>,
 	): void {
-		this.remember(this.subtrees, `${subtreeFingerprint(dir, remainingDepth, fingerprints)}#${key}`, {
+		const pointerKey = `${dir}\n${key}`;
+		if (this.busy.get(pointerKey)?.bypassed) {
+			return;
+		}
+		const fingerprint = subtreeFingerprint(dir, remainingDepth, maxVisible, fingerprints);
+		const fullKey = `${pointerKey}\n${fingerprint}`;
+		// Reclaim the entry this dir's previous fingerprint is holding: one dir and shape has
+		// exactly one current fingerprint, so the old key can never be looked up again, and
+		// leaving it to a ceiling is what let a busy family retain 79 MB of dead rosters.
+		const previous = this.liveKeys.get(pointerKey);
+		if (previous !== undefined && previous !== fullKey) {
+			this.subtrees.delete(previous);
+		}
+		this.liveKeys.set(pointerKey, fullKey);
+		this.subtrees.set(fullKey, {
 			nodes: cloneContextTreeNodes(nodes),
 			charge,
 			modelWindows: subtreeModelWindows(nodes, resolveContextWindow),
@@ -664,7 +960,7 @@ export class ContextTreeDiskScanCache {
 		const node = build();
 		if (node) {
 			const window = node.model ? resolveContextWindow(node.model.provider, node.model.id) : undefined;
-			this.remember(this.nodes, key, {
+			this.nodes.set(key, {
 				node: { ...node, children: [] },
 				modelWindow: window,
 				hasModel: node.model !== undefined,
@@ -673,15 +969,19 @@ export class ContextTreeDiskScanCache {
 		return node;
 	}
 
-	/** Insertion-ordered eviction: the oldest entry goes once the map is over its cap. */
-	private remember<T>(map: Map<string, T>, key: string, value: T): void {
-		map.delete(key);
-		map.set(key, value);
-		while (map.size > this.maxEntries) {
-			const oldest = map.keys().next();
-			if (oldest.done) break;
-			map.delete(oldest.value);
-		}
+	/**
+	 * Count a probe that found nothing usable, and start the bypass once a dir has missed
+	 * {@link busyMissThreshold} probes in a row. A hit clears the state instead (see
+	 * `takeSubtree`), so a family that settles gets its hits back after one cooldown.
+	 */
+	private recordSubtreeMiss(pointerKey: string): void {
+		const misses = (this.busy.get(pointerKey)?.misses ?? 0) + 1;
+		const bypass = this.busyCooldownMs > 0 && this.busyMissThreshold > 0 && misses >= this.busyMissThreshold;
+		this.busy.set(pointerKey, {
+			misses,
+			cooldownUntil: bypass ? Date.now() + this.busyCooldownMs : 0,
+			bypassed: false,
+		});
 	}
 }
 
@@ -996,6 +1296,18 @@ interface ScanFrame {
 	total: CachedScanCharge;
 }
 
+/**
+ * How far down a frame's listing the scan can read, i.e. the fingerprint's visible window.
+ *
+ * `maxChildren` is the reads the budget allows, and the root frame's live ids occupy
+ * listing positions without costing a read, so they widen the window: a candidate behind
+ * them can still be read. Overestimating only invalidates too often, which is safe; the
+ * window is never narrower than the prefix the walk consumes.
+ */
+function frameMaxVisible(frame: ScanFrame, state: ContextTreeScanState): number {
+	return state.maxChildren + (frame.skipIds?.size ?? 0);
+}
+
 /** The subtree a frame's dir covers, as the cache keys and stores it. */
 function frameSubtreeKey(frame: ScanFrame, state: ContextTreeScanState): string {
 	const live = frame.skipIds ? [...frame.skipIds].sort().join(",") : "";
@@ -1060,6 +1372,7 @@ function scanChildrenInto(
 		const cached = cache?.takeSubtree(
 			frame.dir,
 			remainingDepth,
+			frameMaxVisible(frame, state),
 			frameSubtreeKey(frame, state),
 			state,
 			resolveContextWindow,
@@ -1116,6 +1429,7 @@ function scanChildrenInto(
 			cache.storeSubtree(
 				frame.dir,
 				state.maxDepth - frame.level + 1,
+				frameMaxVisible(frame, state),
 				frameSubtreeKey(frame, state),
 				frame.siblings,
 				frame.total,
