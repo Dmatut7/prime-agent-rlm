@@ -168,7 +168,9 @@ describe("fork checkout gate", () => {
 		// The seam above is off for this case: the subject is what a fork build does. One
 		// checkout cannot fix itself by installing upstream's package over it, so the
 		// background notice - whose only answer is "replace this build" - is suppressed, and
-		// the suppression is not silent (detectForkInstall logs the checkout it skipped).
+		// the refusal is loud only inside the PRIME_AGENT_FORK_GATE=off seam; on a real fork
+		// checkout the suppression itself stays silent by design (version-check.ts returns
+		// undefined without logging), so this pin asserts the absence of the notice, not a log.
 		delete process.env[FORK_GATE_ENV_VAR];
 		const fetchMock = vi.fn(async () => Response.json({ version: "v1.2.3" }));
 		vi.stubGlobal("fetch", fetchMock);
