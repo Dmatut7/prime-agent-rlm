@@ -2568,6 +2568,20 @@ export class DaemonSupervisor {
 			) {
 				return;
 			}
+			// Attribution (B2-C09): this cleanup has no idle/activity gate by design -
+			// an owned tree follows its owner - so a stop that takes live work down
+			// with it must at least say so. Read the same folded roster summaries the
+			// eviction gates read (live kernel bash and running children fold into
+			// isSessionActive / hasRunningRlmChildren worker-side).
+			const busySessions = this.workerRosterEntries(worker)
+				.filter((entry) => !entry.queuedChild)
+				.map(sessionSummaryFromRosterEntry)
+				.filter((summary) => isSessionSummaryBusy(summary)).length;
+			if (busySessions > 0) {
+				this.log(
+					`Stopping client-owned worker ${worker.descriptor.workerId} ${Math.round(OWNED_WORKER_DISCONNECT_GRACE_MS / 1000)}s after owner disconnect with ${busySessions} busy session(s) still on it`,
+				);
+			}
 			void this.stopWorker(worker, true).catch((error) =>
 				this.log(`Could not clean up client-owned worker ${worker.descriptor.workerId}: ${String(error)}`),
 			);
