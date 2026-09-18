@@ -14,6 +14,18 @@
 #      has a finished non-green run the push is refused unless PREFLIGHT_RED_REVISION_REASON
 #      says why the verdict is unrelated.
 #
+# Which repository steps 2 and 4 are about is decided once, before anything is asked: this checkout
+# carries four remotes (origin, fork, upstream, archive-x) and bare `gh` resolved its default
+# repository to `upstream`, so both questions were answered about a repository that never sees these
+# branches - step 2 read "no run in flight" forever, and step 4 read "never pushed" for a revision
+# that had a green run on origin. `latest-ci-run.sh --print-repo` owns that rule; this script asks
+# for it and refuses when origin cannot be resolved.
+#
+# Step 3b mirrors the three specialty CI jobs the local shards do not cover (process smoke, kernel,
+# runtime python): `test:ci` excludes the process-smoke file and every `kernel-heavy` file, and the
+# Python runtime is its own job, so a preflight without this step certified trees three CI jobs had
+# never seen.
+#
 # Every check here is fail-closed. A gate that cannot tell "verified" from "could not verify"
 # prints a certificate it has not earned, so `gh` being missing, failing or answering something
 # that is not a run count refuses the push, as does a worktree that differs from HEAD.
@@ -23,6 +35,24 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 BRANCH="${PREFLIGHT_BRANCH:-$(git rev-parse --abbrev-ref HEAD)}"
+
+echo "== 0/4 the repository these gh questions are about =="
+# The rule lives in latest-ci-run.sh (`--print-repo`), which is also the script that asks step 4's
+# question, so "which repository does this checkout push to" has one implementation.
+if ! repo_output=$(bash "$(dirname "$0")/latest-ci-run.sh" --print-repo 2>&1); then
+  echo "   refusing to push: cannot resolve the repository the CI questions are about"
+  echo "$repo_output" | sed 's/^/     /'
+  exit 1
+fi
+REPO="$repo_output"
+echo "   gh questions are pinned to: $REPO"
+# Reported, not enforced: with every question pinned above, a differing default repository only
+# changes what a *bare* gh (a human, another script) would answer. Enforcing it here would refuse
+# every push from this checkout, which keeps an `upstream` remote on purpose.
+if default_repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null) &&
+  [ -n "$default_repo" ] && [ "$default_repo" != "$REPO" ]; then
+  echo "   note: bare gh in this checkout resolves to $default_repo, not origin; every question below names $REPO"
+fi
 
 echo "== 1/4 the tree that is about to be pushed =="
 if [ -n "${PREFLIGHT_BRANCH:-}" ]; then
@@ -50,7 +80,7 @@ echo "== 2/4 waiting for any in-flight run on $BRANCH =="
 for attempt in $(seq 1 60); do
   # Fail-closed: the status of `gh` is read, not discarded. An unavailable or failing `gh` used to
   # read as "nothing in flight" and still print the success line at the end.
-  if ! gh_output=$(gh run list --branch "$BRANCH" --status in_progress --limit 1 --json databaseId --jq 'length' 2>&1); then
+  if ! gh_output=$(gh run list -R "$REPO" --branch "$BRANCH" --status in_progress --limit 1 --json databaseId --jq 'length' 2>&1); then
     echo "   gh run list failed: refusing to push"
     echo "$gh_output" | sed 's/^/     /'
     exit 1
@@ -63,7 +93,7 @@ for attempt in $(seq 1 60); do
       ;;
   esac
   running="$gh_output"
-  if ! gh_queued=$(gh run list --branch "$BRANCH" --status queued --limit 1 --json databaseId --jq 'length' 2>&1); then
+  if ! gh_queued=$(gh run list -R "$REPO" --branch "$BRANCH" --status queued --limit 1 --json databaseId --jq 'length' 2>&1); then
     echo "   gh run list failed: refusing to push"
     echo "$gh_queued" | sed 's/^/     /'
     exit 1

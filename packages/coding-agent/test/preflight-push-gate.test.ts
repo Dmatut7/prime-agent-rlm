@@ -19,13 +19,23 @@ import { afterEach, describe, expect, it } from "vitest";
 const SCRIPTS_DIR = fileURLToPath(new URL("../../../scripts/", import.meta.url));
 
 /**
- * The gate plus the step-4 helper it runs. Staging only the gate made the passing case
- * unpassable: `preflight-push.sh` starts with `cd "$(dirname "$0")/.."` and then runs
- * `bash scripts/latest-ci-run.sh`, so a fixture repository without that file cannot reach the
- * success line on any machine - the helper is part of what the gate invokes, so it is part of what
- * a fixture repository has to carry.
+ * The gate plus the helper it runs twice: step 0 asks `latest-ci-run.sh --print-repo` which
+ * repository the questions are about, and step 4 asks it for the revision's verdict. Staging only
+ * the gate made the passing case unpassable - `preflight-push.sh` starts with
+ * `cd "$(dirname "$0")/.."` and then runs `bash scripts/latest-ci-run.sh`, so a fixture repository
+ * without that file cannot reach the success line on any machine. The helper is part of what the
+ * gate invokes, so it is part of what a fixture repository has to carry.
  */
 const GATED_SCRIPTS = ["preflight-push.sh", "latest-ci-run.sh"];
+
+/**
+ * The remote the fixture repository pushes to. Step 0 resolves it and every gh question is pinned
+ * to it: this checkout carries four remotes and bare `gh` resolved its default repository to
+ * `upstream`, which made "no run in flight" and "never pushed" the answers for a branch CI runs on
+ * every day. A fixture without an origin cannot exercise the pinned path at all.
+ */
+const FIXTURE_ORIGIN = "https://github.com/fixture/example.git";
+const FIXTURE_REPO = "fixture/example";
 
 /**
  * Host state that changes what "a healthy gh" or "a clean tree" means, stripped from every gate
@@ -64,6 +74,7 @@ function makeFixture(): Fixture {
 	// the repository that started the test run, and `git add` then dies outside a work tree.
 	const git = { env: hostEnv() };
 	execFileSync("git", ["init", "-q", root], git);
+	execFileSync("git", ["-C", root, "remote", "add", "origin", FIXTURE_ORIGIN], git);
 	writeFileSync(join(root, "tracked.txt"), "committed\n");
 	execFileSync("git", ["-C", root, "add", "tracked.txt"], git);
 	execFileSync(
@@ -104,6 +115,10 @@ function writeFixtureTool(bin: string, name: string, contents: string): void {
  */
 function ghStub(inFlight: string, verdict: string): string {
 	return `#!/bin/sh
+if [ -n "\${GH_ARGS_LOG:-}" ]; then
+  printf '#ARGS\n' >> "$GH_ARGS_LOG"
+  printf '%s\n' "$@" >> "$GH_ARGS_LOG"
+fi
 for arg in "$@"; do
   if [ "$arg" = "--jq" ]; then
 ${inFlight}
@@ -341,6 +356,66 @@ describe("preflight-push gate", () => {
 		expect(result.signal).toBe(null);
 		expect(result.status).toBe(1);
 		expect(result.output).toMatch(/worktree|HEAD/i);
+	});
+
+	/** A `gh` that knows nothing about any run: the answer shape of asking the wrong repository. */
+	function emptyRepoGh(bin: string): void {
+		writeFixtureTool(bin, "gh", ghStub(IN_FLIGHT_NONE, "printf '%s' '[]'\nexit 0"));
+	}
+
+	it("refuses to push when the repository its questions are about cannot be resolved", () => {
+		const fixture = makeFixture();
+		// Step 0 resolves `origin`; a checkout without one must not fall back to whatever repository
+		// bare `gh` would pick out of the other remotes.
+		execFileSync("git", ["-C", fixture.root, "remote", "remove", "origin"], { env: hostEnv() });
+		healthyGh(fixture.bin);
+		passingNpm(fixture.bin);
+		const result = runPreflight(fixture);
+		expect(result.output).not.toContain("safe to push");
+		expect(result.signal).toBe(null);
+		expect(result.status).toBe(1);
+		expect(result.output).toMatch(/cannot resolve the repository/i);
+	});
+
+	it("pins every gh question to origin instead of letting gh choose a repository", () => {
+		const fixture = makeFixture();
+		healthyGh(fixture.bin);
+		passingNpm(fixture.bin);
+		const argsLog = join(fixture.root, "gh-args.log");
+		const result = runPreflight(fixture, { planted: { GH_ARGS_LOG: argsLog } });
+		// The pass is the gate's own: the fixture's gh answered the pinned question.
+		expect(result.status).toBe(0);
+		expect(result.output).toContain(`gh questions are pinned to: ${FIXTURE_REPO}`);
+		// Every recorded call, not just the first one: a single unpinned query is how the verdict
+		// was once asked about `upstream` while the branch lived on the fork.
+		const calls = readFileSync(argsLog, "utf8")
+			.split("#ARGS\n")
+			.slice(1)
+			.map((call) => call.trim().split("\n"));
+		const runQueries = calls.filter((args) => args[0] === "run" && args[1] === "list");
+		expect(runQueries.length).toBeGreaterThanOrEqual(2);
+		for (const args of runQueries) {
+			expect(args).toContain("-R");
+			expect(args).toContain(FIXTURE_REPO);
+		}
+		// The one call that is deliberately unpinned is the diagnostic that reports which repository
+		// *bare* gh would pick; it answers no verdict.
+		for (const args of calls.filter((entry) => !entry.includes("-R"))) {
+			expect(args.slice(0, 2)).toEqual(["repo", "view"]);
+		}
+	});
+
+	it("refuses to push when the pinned repository reports no CI runs at all", () => {
+		const fixture = makeFixture();
+		emptyRepoGh(fixture.bin);
+		passingNpm(fixture.bin);
+		// An empty run list used to read as "never pushed - push away". Here the repository cannot
+		// answer about any run, which is the shape of the wrong repository, so it is a refusal.
+		const result = runPreflight(fixture);
+		expect(result.output).not.toContain("safe to push");
+		expect(result.signal).toBe(null);
+		expect(result.status).toBe(1);
+		expect(result.output).toMatch(/reports no CI runs at all/i);
 	});
 
 	it("passes on a clean tree with a healthy gh and green checks", () => {
