@@ -112,7 +112,12 @@ for attempt in $(seq 1 60); do
   if [ "$attempt" = "60" ]; then echo "   still busy after 20min: refusing to push"; exit 1; fi
 done
 
-echo "== 3/4 repo checks (biome + tsgo + installer + browser smoke) =="
+echo "== 3/4 repo checks (biome + tsgo + installer + browser smoke + lockstep) =="
+# The lockstep check runs inside `npm run check` too (check:ci-honesty); naming it here means the
+# gate's output says which version boundary it verified, and which manifests that boundary covers.
+# `--check` writes nothing - a gate that rewrote manifests while certifying a tree would certify
+# bytes it changed itself.
+npm run check:lockstep
 npm run check
 
 if [ "${1:-}" != "--skip-tests" ]; then
