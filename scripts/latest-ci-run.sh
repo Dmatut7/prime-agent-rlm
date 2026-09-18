@@ -161,11 +161,12 @@ if (!Array.isArray(runs)) {
 const line = (run) =>
 	`  #${run.databaseId} ${run.status}/${run.conclusion ?? "-"} ${String(run.headSha ?? "").slice(0, 9)} ` +
 	`${run.workflowName ?? "?"} ${run.createdAt ?? "?"} ${run.url ?? ""}`;
-// The repository is part of every line: an answer about the wrong repository used to be
-// indistinguishable from an answer about this one (both printed "0 returned").
-console.log(
-	`latest CI runs on ${branch ? `branch ${branch}` : "(commit query)"} in ${repo}: ${runs.length} returned`,
-);
+// The repository is part of every line, and so is the question that was asked: an answer about the
+// wrong repository used to be indistinguishable from an answer about this one (both printed
+// "0 returned"), and with `--branch B --commit SHA` the question is the revision, so a line that
+// named the branch while counting revision runs read like a branch with no runs.
+const asked = commit ? `revision ${commit.slice(0, 9)}` : `branch ${branch}`;
+console.log(`latest CI runs for ${asked} in ${repo}: ${runs.length} returned`);
 for (const run of runs) console.log(line(run));
 
 // Empty answer: say which repository answered, and refuse when that repository cannot answer at all.
@@ -280,6 +281,10 @@ self_test() {
 		report main "$sha" 5
 	expect "the answer names the repository it is about" 0 "in selftest/fixture-repo" "$dir/gh-success" \
 		report main "$sha" 5
+	expect "the answer says which question it asked (revision, not branch)" 0 "for revision 111111111 in selftest/fixture-repo" "$dir/gh-success" \
+		report main "$sha" 5
+	expect "a branch-only question says so" 0 "for branch main in selftest/fixture-repo" "$dir/gh-success" \
+		report main "" 5
 	expect "a cancelled latest run refuses to be quoted as green" 1 "concluded cancelled" "$dir/gh-cancelled" \
 		report_required main "$sha" 5
 	expect "an unpushed revision says so instead of claiming green" 0 "it has never been pushed" "$dir/gh-unpushed" \
