@@ -440,13 +440,18 @@ jobs:
       - name: Gate self-test (planted violations must turn the gate red)
         run: node scripts/check-test-private-probes.mjs --self-test
 
-      # The process smoke row's floors and tag-skip ledger live in scripts/lib/ci-process-smoke.mjs,
-      # and the local mirror reads them from there. Its self-test is what keeps the single source
-      # honest (a `;;` inside a reason field breaks the joined --ledger spec, and a floor that stops
-      # matching the reading has to go red), so it runs here: this job installs nothing, and the
-      # module's self-test is pure node.
-      - name: Process-smoke floor module self-test (planted spec and floor drift must turn it red)
-        run: node scripts/lib/ci-process-smoke.mjs --self-test
+      # The process smoke row's floors and tag-skip ledger live in this file (the `coding-agent
+      # process smoke` matrix row), and scripts/check-process-smoke.sh reads them out of it through
+      # scripts/lib/ci-matrix-row.mjs - one carrier, one reader, no copy to drift. The mirror's own
+      # self-test is what keeps that reading honest: a `;;` inside a reason field breaks the joined
+      # --ledger spec, and a floor that stops matching the reading has to go red. It reaches the
+      # coverage gate's recompute controls, the tag-skip ledger gate and the matrix reader, all of
+      # which plant their own red. This job installs nothing, and none of them needs a dependency.
+      # (The module this step used to run, scripts/lib/ci-process-smoke.mjs, was deleted when the
+      # row became the source; a step that runs a deleted file is an ERR_MODULE_NOT_FOUND red on
+      # every CI run, which is how this line was found.)
+      - name: Process-smoke row reader self-test (planted spec and floor drift must turn it red)
+        run: bash scripts/check-process-smoke.sh --self-test
 
       # The installer gate reads install.sh, which is the only entry an outside user has, and it had
       # no self-test at all until this batch. It takes ~27s here (it spawns the installer under `sh`
