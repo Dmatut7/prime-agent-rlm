@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,7 +25,17 @@ import { parse } from "yaml";
  *   - a row whose floors live in another file must be written down as an exception with that
  *     file's real numbers, so "the floors are 90% of the reading" has no silent hole in it;
  *   - every matrix row must appear either in `rows` (with a reading) or in `ungated_rows` (with a
- *     reason), so a new row cannot be added without deciding what gates it.
+ *     reason), so a new row cannot be added without deciding what gates it;
+ *   - the provenance record must be checkable *in the checkout the test runs in*: the record's own
+ *     shape and the floors it derives are checked in any depth, while "the recorded sha is a commit
+ *     in this repository" is checked only where the object database can answer it - CI's `test` job
+ *     checks out at depth one, where every commit but the tip is absent and `git cat-file -e` exits
+ *     128 for a sha that is perfectly fine (read two ways: git's own `--is-shallow-repository`, and
+ *     the reachable commit count, which stays right even when such a checkout is not marked
+ *     shallow). The leg stands down there, and that is *not* a skip: the floors comparison it keeps
+ *     is what makes pulling the floors out of ci.yml red in a shallow tree too. All three states run
+ *     on fixtures at the bottom of this file, so the depth-aware leg cannot rot in either direction
+ *     (vacuous where history exists, unrun where it does not).
  *
  * The planted-mutation controls at the bottom run the same comparison functions against mutated
  * copies: a pin that cannot go red is decoration, and these prove this one can.
@@ -365,6 +375,105 @@ afterAll(() => rmSync(plantDir, { recursive: true, force: true }));
 
 const asMutable = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
+/**
+ * What *this* checkout can answer about a commit, read instead of assumed. `actions/checkout` in
+ * CI's `test` job fetches at depth one, so `cat-file -e` on a sha recorded days ago is 128 in a
+ * depth-limited tree and 0 in a full one: the same pin, two different answers, and neither of them
+ * is a property of the recorded reading. Two readings decide which set of checks is runnable here,
+ * because they answer slightly different questions: `--is-shallow-repository` (git 2.15+) is git's
+ * own word for "objects may be missing because the fetch was depth-limited", and the reachable
+ * commit count catches the same state when it is not marked as shallow at all - a checkout holding
+ * only the tip has no object database to ask about an ancestor, whatever git calls it. A full clone
+ * answers "not shallow" and thousands of commits, so the sha leg runs there.
+ */
+type CheckoutProbe = { shallow: boolean; hasCommit: (sha: string) => boolean; reachableCommits: string };
+
+function probeCheckout(root: string): CheckoutProbe {
+	const shallowProbe = spawnSync("git", ["rev-parse", "--is-shallow-repository"], { cwd: root, encoding: "utf8" });
+	const countProbe = spawnSync("git", ["rev-list", "--count", "HEAD"], { cwd: root, encoding: "utf8" });
+	const commits = countProbe.status === 0 ? Number.parseInt(countProbe.stdout.trim(), 10) : Number.NaN;
+	return {
+		// A git too old for the flag, or a cwd that is not a repository, answers "not shallow" and
+		// then has its sha leg run and fail loudly - the safe direction for a pin to be wrong in.
+		shallow:
+			(shallowProbe.status === 0 && shallowProbe.stdout.trim() === "true") ||
+			(Number.isFinite(commits) && commits <= 1),
+		hasCommit: (sha) => spawnSync("git", ["cat-file", "-e", `${sha}^{commit}`], { cwd: root }).status === 0,
+		reachableCommits: Number.isFinite(commits) ? String(commits) : "unreadable",
+	};
+}
+
+/**
+ * Every way the recorded provenance stops being checkable against this tree. Two legs, with
+ * different audiences: the record's shape and the floors it derives are checked in *any* depth (a
+ * shallow checkout can still tell that the recorded reading is the one ci.yml's rows are derived
+ * from, so emptying the floors reddens this pin there too), while the sha leg runs only where the
+ * object database can answer it - asserting existence in a depth-one tree would be asserting a
+ * property of the clone rather than of the record.
+ */
+function provenanceMismatches(reading: Readings, rows: MatrixRow[], checkout: CheckoutProbe): string[] {
+	const out: string[] = [];
+	const { run_id: runId, run_url: runUrl, head_sha: headSha } = reading.source;
+	if (!Number.isInteger(runId) || runId <= 0) out.push(`the recorded run_id ${String(runId)} is not a run id`);
+	if (!runUrl.includes(String(runId))) out.push(`the recorded run_url "${runUrl}" does not name run ${runId}`);
+	if (!/^[0-9a-f]{40}$/.test(headSha)) out.push(`the recorded head_sha "${headSha}" is not a full sha`);
+	out.push(...floorMismatches(rows, reading));
+	if (!checkout.shallow && !checkout.hasCommit(headSha)) {
+		out.push(`${headSha} is not a commit in this repository`);
+	}
+	return out;
+}
+
+/** `git` in a fixture, loud on failure: a helper that swallows its exit code hides the fixture. */
+function gitIn(cwd: string, args: string[]): string {
+	const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+	if (result.status !== 0)
+		throw new Error(`git ${args.join(" ")} in ${cwd} exited ${result.status}: ${result.stderr}`);
+	return result.stdout.trim();
+}
+
+/** Commits need an identity, and a developer's global `commit.gpgsign` must not reach a fixture. */
+const FIXTURE_IDENTITY = [
+	"-c",
+	"user.name=ci-floor-pin",
+	"-c",
+	"user.email=ci-floor-pin@example.invalid",
+	"-c",
+	"commit.gpgsign=false",
+];
+
+type FixtureRepo = { root: string; full: string; ancestorSha: string; headSha: string };
+
+/**
+ * A throwaway repository with `commitCount` commits: the tip, and (from the second commit on) an
+ * ancestor that only a clone with history has. That ancestor is the stand-in for `8ed6d73bc` - a sha
+ * the recorded reading legitimately names and a depth-one checkout legitimately cannot resolve.
+ */
+function makeFixtureRepo(prefix: string, commitCount = 2): FixtureRepo {
+	const root = mkdtempSync(join(tmpdir(), prefix));
+	const full = join(root, "full");
+	mkdirSync(full);
+	gitIn(full, ["init", "-q", "."]);
+	let ancestorSha = "";
+	for (let index = 0; index < commitCount; index += 1) {
+		writeFileSync(join(full, `${index}.txt`), `${index}\n`);
+		gitIn(full, ["add", "-A"]);
+		gitIn(full, [...FIXTURE_IDENTITY, "commit", "-q", "-m", `commit ${index}`]);
+		if (index === 0) ancestorSha = gitIn(full, ["rev-parse", "HEAD"]);
+	}
+	return { root, full, ancestorSha, headSha: gitIn(full, ["rev-parse", "HEAD"]) };
+}
+
+/**
+ * The same fixture cloned at depth one through the file transport, which is the shape CI's `test`
+ * job is in when it runs this file. The transport matters: a local path clone ignores `--depth`.
+ */
+function shallowCloneOf(fixture: FixtureRepo): string {
+	const shallow = join(fixture.root, "shallow");
+	gitIn(fixture.root, ["clone", "-q", "--depth", "1", `file://${fixture.full}`, shallow]);
+	return shallow;
+}
+
 describe("the ci.yml floors are derived from the recorded CI reading, not from memory", () => {
 	it("records which run the floors came from, and a sha this repository has", () => {
 		const reading = readings();
@@ -372,8 +481,10 @@ describe("the ci.yml floors are derived from the recorded CI reading, not from m
 		expect(reading.source.run_id).toBe(35341768020);
 		expect(reading.source.run_url).toContain(String(reading.source.run_id));
 		// The reading and the tree it gates must be the same tree: the sha is the base of this work.
-		const known = spawnSync("git", ["cat-file", "-e", `${reading.source.head_sha}^{commit}`], { cwd: repoRoot });
-		expect(known.status, `${reading.source.head_sha} is not a commit in this repository`).toBe(0);
+		// CI checks out at depth one, so this pin reads its own checkout and keeps the sha leg only
+		// where the object database has the history to answer it (see provenanceMismatches).
+		const mismatches = provenanceMismatches(reading, workflowRows(), probeCheckout(repoRoot));
+		expect(mismatches, mismatches.join("\n")).toEqual([]);
 	});
 
 	it("carries exactly ceil(0.9 * reading) in every row whose floors live in ci.yml", () => {
@@ -605,6 +716,104 @@ describe("the floor pin can go red (planted mutations, same comparison functions
 		];
 		for (const [value, ratio, want] of cases) {
 			expect(floorFor(value, ratio), `floorFor(${value}, ${ratio})`).toBe(want);
+		}
+	});
+});
+
+/**
+ * The provenance pin reads the checkout it runs in, and a depth-aware pin is exactly the kind that
+ * rots quietly: one direction makes the sha leg vacuous everywhere, the other makes it run where it
+ * cannot be answered and reddens CI for a clone-shaped reason. Three states are pinned below on
+ * purpose-built fixtures: full history (the check still bites), `--depth 1` (the shape CI is in,
+ * where the leg stands down and the floors leg still reddens), and a single-commit checkout git does
+ * not call shallow (the state the reachable-commit reading exists for).
+ */
+describe("the provenance pin checks what the checkout in front of it can answer", () => {
+	it("in a full-history checkout: an ancestor is a commit, so the sha leg runs and can go red", () => {
+		const fixture = makeFixtureRepo("ci-floor-pin-full-");
+		try {
+			const checkout = probeCheckout(fixture.full);
+			expect(checkout.shallow, "a repository with full history must not read as shallow").toBe(false);
+			expect(checkout.reachableCommits, "the depth reading must see both commits, not just the tip").toBe("2");
+			expect(checkout.hasCommit(fixture.ancestorSha), "the fixture must have history, not just a tip").toBe(true);
+			expect(checkout.hasCommit(fixture.headSha)).toBe(true);
+
+			// A reading whose provenance names a real ancestor of this tree: everything agrees.
+			const reading = asMutable(readings());
+			reading.source.head_sha = fixture.ancestorSha;
+			expect(provenanceMismatches(reading, workflowRows(), checkout)).toEqual([]);
+
+			// The same legs, one planted mutation: a sha this repository does not have.
+			const planted = asMutable(reading);
+			planted.source.head_sha = "0".repeat(40);
+			const mismatches = provenanceMismatches(planted, workflowRows(), checkout);
+			expect(mismatches.join("\n")).toContain(`${"0".repeat(40)} is not a commit in this repository`);
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	it("in a --depth 1 checkout: the ancestor is missing, and the shallow leg still gates the floors", () => {
+		const fixture = makeFixtureRepo("ci-floor-pin-shallow-");
+		try {
+			const checkout = probeCheckout(shallowCloneOf(fixture));
+			expect(checkout.shallow, "a --depth 1 clone must read as shallow").toBe(true);
+			expect(checkout.reachableCommits, "a --depth 1 clone reaches exactly one commit").toBe("1");
+			// The state CI's `test` job is really in: the recorded sha is not in this object database.
+			expect(checkout.hasCommit(fixture.ancestorSha), "the fixture must reproduce CI's missing-ancestor state").toBe(
+				false,
+			);
+			expect(checkout.hasCommit(fixture.headSha), "the tip is the one commit a depth-one clone has").toBe(true);
+
+			// A reading naming that ancestor is the CI case: the sha leg stands down instead of reddening.
+			const reading = asMutable(readings());
+			reading.source.head_sha = fixture.ancestorSha;
+			expect(provenanceMismatches(reading, workflowRows(), checkout)).toEqual([]);
+
+			// Standing down is not a skip: the floors leg still runs, so emptying the floors is red here.
+			const stripped = asMutable(workflowRows());
+			const row = rowNamed(stripped, "ai");
+			if (row === undefined) throw new Error("no ai row to strip");
+			delete row.min_tests;
+			expect(provenanceMismatches(reading, stripped, checkout).join("\n")).toContain(
+				"ai: ci.yml min_tests=undefined",
+			);
+
+			// And the shape legs keep biting in a shallow tree too, since they need no history at all.
+			const abbreviated = asMutable(reading);
+			abbreviated.source.head_sha = "8ed6d73bc";
+			expect(provenanceMismatches(abbreviated, workflowRows(), checkout).join("\n")).toContain("is not a full sha");
+			const unnamedRun = asMutable(reading);
+			unnamedRun.source.run_url = "https://github.com/Dmatut7/prime-agent-rlm/actions";
+			expect(provenanceMismatches(unnamedRun, workflowRows(), checkout).join("\n")).toContain(
+				`does not name run ${reading.source.run_id}`,
+			);
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	it("a single-commit checkout git does not call shallow is still read as depth-limited", () => {
+		const fixture = makeFixtureRepo("ci-floor-pin-one-commit-", 1);
+		try {
+			// git's own answer is "false" here, which is why the reachable-commit count is read as
+			// well: one commit means there is no object database to ask about an ancestor, however
+			// the checkout came to be that way.
+			const gitSays = spawnSync("git", ["rev-parse", "--is-shallow-repository"], {
+				cwd: fixture.full,
+				encoding: "utf8",
+			}).stdout.trim();
+			expect(gitSays, "this fixture is the case --is-shallow-repository does not cover").toBe("false");
+			const checkout = probeCheckout(fixture.full);
+			expect(checkout.reachableCommits).toBe("1");
+			expect(checkout.shallow, "one reachable commit is a depth-limited checkout").toBe(true);
+
+			// And the leg still stands down instead of reddening for a sha no object database here has.
+			const reading = asMutable(readings());
+			reading.source.head_sha = "0".repeat(40);
+			expect(provenanceMismatches(reading, workflowRows(), checkout)).toEqual([]);
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
 		}
 	});
 });
