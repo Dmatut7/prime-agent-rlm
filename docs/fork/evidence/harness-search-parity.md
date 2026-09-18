@@ -311,41 +311,44 @@ G8/G9 是「分歧被抹平也要红」的针：它们证明分歧针不是恒�
 
 **覆盖**：TS 侧 11 个 `it`（13 例）与 Python 侧 11 例，每一例都至少被一条变异打红（见上表用例名）。
 
-### 7.4 仪器正控（`--break=<side>:<name>`，5/5 被抓，全部 exit=1）
+### 7.4 仪器正控（`--break=<side>:<name>`，5/5 被抓，全部 exit=1，最终 HEAD `c95f023bc` 上重跑）
 
 一次只弄坏一面（同时弄坏两面会一起动，只有金标准能抓到，证明不了跨语言比较器）：
 
-| 开关 | 弄坏什么 | 抓到它的检查（原文摘要） |
-|---|---|---|
-| `ts:idf` | TS 面打分不乘 idf | `FAIL parity/score parity: [{"key":"mem_worktree_discipline","ts":4,"python":7.909428283798453}, …]`（13 failures） |
-| `ts:slot-factor` | TS 面多槽因子改 `0.25` | `FAIL parity/score parity: … "ts":6.741740825889936,"python":7.909428283798453`（15 failures） |
-| `py:idf` | Python 面 `_search_score(…, idf=None)` | `FAIL parity/score parity: … "ts":7.909428283798453,"python":4`（13 failures） |
-| `py:zero-drop` | Python 面把零分行留在结果里 | `FAIL parity/python drops zero-score rows: search returned mem_font_metrics,mem_numeric_path,mem_parallel_lanes,mem_prompt_cache at score 0`（face invariant，与金标准无关也抓得到） |
-| `py:tiebreak` | Python 面平手改按 id 排 | `FAIL parity/top-6 order parity: ts mem_quantum_harness,… != python mem_harness_digest_window,…`（16 failures） |
+| 开关 | 弄坏什么 | 抓到它的检查（原文摘要） | failures |
+|---|---|---|---|
+| `ts:idf` | TS 面打分不乘 idf | `FAIL parity/score parity: [{"key":"mem_worktree_discipline","ts":4,"python":7.909428283798453}, …]` | 15 |
+| `ts:slot-factor` | TS 面多槽因子改 `0.25` | `FAIL parity/score parity: … "ts":6.741740825889936,"python":7.909428283798453` | 15 |
+| `py:idf` | Python 面 `_search_score(…, idf=None)` | `FAIL parity/score parity: … "ts":7.909428283798453,"python":4` | 15 |
+| `py:zero-drop` | Python 面把零分行留在结果里 | `FAIL parity/python drops zero-score rows: search returned mem_font_metrics,mem_numeric_path,mem_parallel_lanes,mem_prompt_cache at score 0`（face invariant，与金标准无关也抓得到） | 19 |
+| `py:tiebreak` | Python 面平手改按 id 排 | `FAIL parity/top-6 order parity: ts mem_quantum_harness,… != python mem_harness_digest_window,mem_login_fix,…` | 16 |
 
-每条都打印 `harness-parity: positive control held - --break=<name> produced N failure(s)` 并 exit 1；若某条开关**没被抓到**，仪器会打印 `--break=<name> was NOT caught; the comparator is vacuous` 并同样 exit 1（空转比红更坏）。开关名必须带面（`ts:` / `py:`），不带面的 `--break=idf` 会被拒并说明理由。
+每条都打印 `harness-parity: positive control held - --break=<name> produced N failure(s)` 并 exit 1；若某条开关**没被抓到**，仪器会打印 `--break=<name> was NOT caught; the comparator is vacuous` 并同样 exit 1（空转比红更坏）。开关名必须带面（`ts:` / `py:`），不带面的 `--break=idf` 会被拒并说明理由：同时弄坏两面会一起动，只有金标准抓得到，证明不了跨语言比较器。
 
-### 7.5 金标准可再生（删掉 → 重跑 → 两侧针仍绿）
+### 7.5 金标准可再生（删掉 → 重跑 → 生成回来且两侧针仍绿）
 
-在第二个 scratch worktree（`/tmp/fixL3a-e-regen` @`189d5b3c5`）里做的，交付树全程未动：
+在第三个 scratch worktree（`/tmp/fixL3a-e-regen`，checkout 到最终 SHA `c95f023bc`，净树）里做，交付树全程未动：
 
 ```
+0) 交付树金标准 sha256 = 55df71b5f2b18007db4720c6df35f15417e8edf3b6f3ce0136b5cfe72feac67c
 1) rm expected.json
-2) TS 针 → EXIT=1（Test Files 1 failed / Tests no tests：金标准不在就起不来）
-   PY 针 → EXIT=1
+2) TS 针 → EXIT=1：Error: ENOENT: no such file or directory, open '…/harness-parity/expected.json'
+              Test Files 1 failed (1) / Tests no tests
+   PY 针 → EXIT=1：FileNotFoundError: [Errno 2] No such file or directory: '…/expected.json'
+   ⇒ 正控：金标准不在场时两侧针立刻红，它们真的在读金标准，不是空断言
 3) node packages/coding-agent/scripts/perf/harness-parity.mjs --python=<py3.11> --write
    → "harness-parity: wrote …/expected.json"，91 checks 0 failure，EXIT=0
    （91 而不是 92：金标准不存在时少一条 "live run reproduces expected.json"）
-4) 重铸件 vs 已提交件逐字段对比（排除 generated_at）：differing fields = 1
-   → 唯一差异是 base_sha（'4c6623868a39…' vs '189d5b3c5e99…'），因为重铸发生在
-     更晚的 HEAD 上；两个 provenance 字段（generated_at / base_sha）都在仪器
-     漂移比较的 VOLATILE_KEYS 里，所以不影响判红
-5) TS 针 → 13 passed，EXIT=0；PY 针 → Ran 11 tests OK，EXIT=0
-6) 仪器默认模式复跑 → "PASS golden/live run reproduces expected.json: 6 cases"，
-   92 checks 0 failure，EXIT=0
+4) 重铸件 vs 交付件逐字段对比（排除 generated_at）：differing fields = 1
+   → 唯一差异是 base_sha（'3be999154969…' vs 'c95f023bcb8a…'）：金标准记的是**铸造时的 HEAD**，
+     重铸发生在更晚的 HEAD 上；generated_at 与 base_sha 都在仪器漂移比较的 VOLATILE_KEYS 里
+5) TS 针（用重铸件）→ 13 passed，EXIT=0
+6) PY 针（用重铸件）→ Ran 11 tests OK，EXIT=0
+7) 仪器 --verify 复跑 → 92 checks 0 failure（含 "PASS golden/live run reproduces expected.json: 6 cases"），EXIT=0
+8) 重铸件 sha256 = 7a1de65fd064a67074be149abbf96a803be03f684a790022f0c47e29e6fca8e6（与第 0 步只差两条 provenance）
 ```
 
-⇒ 金标准里**没有一个手打数字**：删掉能原样长回来（除两条 provenance），两侧针照绿。
+⇒ 金标准里**没有一个手打数字**：删掉能原样长回来，两侧针照绿，仪器复跑判「live run reproduces expected.json」。
 
 ---
 
