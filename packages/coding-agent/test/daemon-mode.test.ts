@@ -46,6 +46,7 @@ import {
 	createDefaultRlmSubagentSessionName,
 	type SubagentRuntimeHost,
 } from "../src/core/rlm-runtime.js";
+import type { SessionActionPriority } from "../src/core/session-action-store.js";
 import { canonicalSessionPath } from "../src/core/session-lease.js";
 import {
 	getSessionArtifactPathForFile,
@@ -8628,7 +8629,10 @@ describe("daemon mode helpers", () => {
 
 		await fixture.runCronJob(makeCronJob({ id: "cron-1", source: "cron", activeSessionId: fixture.activeSessionId }));
 
-		expect(fixture.followUp).toHaveBeenCalledWith("heartbeat prompt", undefined, { resumeIfIdle: true });
+		expect(fixture.followUp).toHaveBeenCalledWith("heartbeat prompt", undefined, {
+			resumeIfIdle: true,
+			priority: "background",
+		});
 		expect(fixture.prompt).not.toHaveBeenCalled();
 		expect(fixture.promptHeartbeat).not.toHaveBeenCalled();
 	});
@@ -8670,6 +8674,9 @@ describe("daemon mode helpers", () => {
 		} else {
 			expect(fixture.prompt).toHaveBeenCalledWith("heartbeat prompt", expectedOptions);
 			expect(fixture.prompt.mock.calls[0]?.[1]).not.toHaveProperty("followUpQueueKey");
+			// #2334: an idle generic cron tick reaches the session through promptUntilAccepted,
+			// and a scheduled prompt is machine-triggered, so it must not outrank live human input.
+			expect(fixture.prompt.mock.calls[0]?.[1]).toMatchObject({ priority: "background" });
 			expect(fixture.promptHeartbeat).not.toHaveBeenCalled();
 		}
 		expect(fixture.followUp).not.toHaveBeenCalled();
@@ -9642,7 +9649,12 @@ function makeCronAdmissionFixture(
 	const prompt = vi.fn(
 		async (
 			_message: string,
-			_options?: { streamingBehavior?: "steer" | "followUp"; followUpQueueKey?: string; source?: string },
+			_options?: {
+				streamingBehavior?: "steer" | "followUp";
+				followUpQueueKey?: string;
+				source?: string;
+				priority?: SessionActionPriority;
+			},
 		) => {},
 	);
 	const promptHeartbeat = vi.fn(
