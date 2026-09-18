@@ -41,7 +41,7 @@
     "prepublishOnly": "npm run clean && npm run build",
     "bundle": "node scripts/bundle.mjs",
     "test:kernel": "vitest --run --no-file-parallelism --tagsFilter kernel-heavy test/acp-kernel-features.test.ts test/acp-cold-cli.test.ts test/kernel-goal-skill.test.ts test/repl-kernel-state-roundtrip.test.ts test/repl-kernel-snapshot-honesty.test.ts test/repl-kernel-pipe-errors.test.ts test/repl-kernel-safe-path.test.ts test/repl-kernel-mcp-shutdown.test.ts test/repl-kernel-bash-interrupt.test.ts test/repl-kernel-shutdown-escalation.test.ts test/repl-kernel-mcp-reconnect.test.ts test/repl-kernel-generation-isolation.test.ts test/repl-kernel-partial-restore-snapshot.test.ts test/repl-kernel-heartbeat-live.test.ts test/repl-kernel-output-boundary.test.ts",
-    "test:kernel:ci": "npm run test:kernel -- --reporter=default --reporter=json --outputFile.json=coverage/kernel-coverage.json && node ../../scripts/check-vitest-coverage.mjs coverage/kernel-coverage.json --min-tests 30 --min-ran-tests 29 --max-nothing-files 0"
+    "test:kernel:ci": "npm run test:kernel -- --reporter=default --reporter=json --outputFile.json=coverage/kernel-coverage.json && node ../../scripts/check-vitest-coverage.mjs coverage/kernel-coverage.json --min-tests 47 --min-ran-tests 39 --max-nothing-files 0"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^1.3.0",

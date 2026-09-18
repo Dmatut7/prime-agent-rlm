@@ -1,258 +1,258 @@
 {
-  "why": "The floors in .github/workflows/ci.yml are a policy: `a floor is 90% of what the job really produces in CI`. A policy with no reading behind it drifts - the floors sat at 64%-87% of the real numbers, so the sentence and the matrix disagreed in the direction that hides a lost face. This file is the reading the floors are derived from. packages/coding-agent/test/ci-floor-policy.test.ts recomputes ceil(floor_ratio * collected/ran) from it and fails when ci.yml (or scripts/lib/ci-process-smoke.mjs) disagrees, so the numbers cannot drift away from the sentence again, and when a row whose floors live in another file stops being recorded in `exceptions` with that file's real numbers.",
-  "floor_ratio": 0.9,
-  "rounding": "ceil - a floor is never below the policy share, and ceil(0.9*6)=6 is why the machine-wide row has no slack",
-  "source": {
-    "repo": "Dmatut7/prime-agent-rlm",
-    "branch": "merge/repl-kernel",
-    "run_id": 35341768020,
-    "run_url": "https://github.com/Dmatut7/prime-agent-rlm/actions/runs/35341768020",
-    "head_sha": "8ed6d73bc813891679dec7bd11f2160ff218abda",
-    "conclusion": "success",
-    "fetched_at": "2026-09-18T12:20:18Z",
-    "command": "gh run view 35341768020 -R Dmatut7/prime-agent-rlm --log | grep -E 'numTotalTests=|tests=[0-9]+ ran='",
-    "why_this_run": "Its head sha is the exact commit these floors are committed on, so the readings and the tree being gated are the same tree.",
-    "log_grep": "each row's `log_line` is the gate's own reading line, verbatim from that run's log; packages/coding-agent/test/ci-floor-policy.test.ts re-parses it and fails when it disagrees with the numbers next to it"
+ "why": "The floors in .github/workflows/ci.yml are a policy: `a floor is 90% of what the job really produces in CI`. A policy with no reading behind it drifts - the floors sat at 64%-87% of the real numbers, so the sentence and the matrix disagreed in the direction that hides a lost face. This file is the reading the floors are derived from. packages/coding-agent/test/ci-floor-policy.test.ts recomputes ceil(floor_ratio * collected/ran) from it and fails when ci.yml (or scripts/lib/ci-process-smoke.mjs) disagrees, so the numbers cannot drift away from the sentence again, and when a row whose floors live in another file stops being recorded in `exceptions` with that file's real numbers.",
+ "floor_ratio": 0.9,
+ "rounding": "ceil - a floor is never below the policy share, and ceil(0.9*6)=6 is why the machine-wide row has no slack",
+ "source": {
+  "repo": "Dmatut7/prime-agent-rlm",
+  "branch": "merge/repl-kernel",
+  "run_id": 35341768020,
+  "run_url": "https://github.com/Dmatut7/prime-agent-rlm/actions/runs/35341768020",
+  "head_sha": "8ed6d73bc813891679dec7bd11f2160ff218abda",
+  "conclusion": "success",
+  "fetched_at": "2026-09-18T12:20:18Z",
+  "command": "gh run view 35341768020 -R Dmatut7/prime-agent-rlm --log | grep -E 'numTotalTests=|tests=[0-9]+ ran='",
+  "why_this_run": "Its head sha is the exact commit these floors are committed on, so the readings and the tree being gated are the same tree.",
+  "log_grep": "each row's `log_line` is the gate's own reading line, verbatim from that run's log; packages/coding-agent/test/ci-floor-policy.test.ts re-parses it and fails when it disagrees with the numbers next to it"
+ },
+ "rows": [
+  {
+   "name": "agent-core",
+   "report": "coverage/ci-agent-core.json",
+   "log_line": "### coverage/ci-agent-core.json: numTotalTests=108 ran=108 files=9 nothing-files=0",
+   "gate": "scripts/check-vitest-coverage.mjs",
+   "unit": "files",
+   "collected": 108,
+   "ran": 108,
+   "files": 9,
+   "nothing_files": 0,
+   "max_nothing_budget": 0,
+   "floors_owner": ".github/workflows/ci.yml"
   },
-  "rows": [
-    {
-      "name": "agent-core",
-      "report": "coverage/ci-agent-core.json",
-      "log_line": "### coverage/ci-agent-core.json: numTotalTests=108 ran=108 files=9 nothing-files=0",
-      "gate": "scripts/check-vitest-coverage.mjs",
-      "unit": "files",
-      "collected": 108,
-      "ran": 108,
-      "files": 9,
-      "nothing_files": 0,
-      "max_nothing_budget": 0,
-      "floors_owner": ".github/workflows/ci.yml"
+  {
+   "name": "ai",
+   "report": "coverage/ci-ai.json",
+   "log_line": "### coverage/ci-ai.json: numTotalTests=1365 ran=643 files=112 nothing-files=19",
+   "gate": "scripts/check-vitest-coverage.mjs",
+   "unit": "files",
+   "collected": 1365,
+   "ran": 643,
+   "files": 112,
+   "nothing_files": 19,
+   "max_nothing_budget": 19,
+   "floors_owner": ".github/workflows/ci.yml",
+   "note": "19 nothing-files are the live-provider suites: they need credentials this job has none of, and the budget is exactly 19."
+  },
+  {
+   "name": "tui",
+   "report": "coverage/ci-tui.xml",
+   "log_line": "### coverage/ci-tui.xml: tests=863 ran=863 suites=134 nothing-suites=0",
+   "gate": "scripts/check-node-test-coverage.mjs",
+   "unit": "suites",
+   "collected": 863,
+   "ran": 863,
+   "files": 134,
+   "nothing_files": 0,
+   "max_nothing_budget": 0,
+   "floors_owner": ".github/workflows/ci.yml",
+   "note": "`node --test`, not vitest: the junit XML feeds check-node-test-coverage.mjs and the budget key is max_nothing_suites."
+  },
+  {
+   "name": "coding-agent 1/3",
+   "report": "coverage/ci-shard-1.json",
+   "log_line": "### coverage/ci-shard-1.json: numTotalTests=2720 ran=2695 files=240 nothing-files=3",
+   "gate": "scripts/check-vitest-coverage.mjs",
+   "unit": "files",
+   "collected": 2720,
+   "ran": 2695,
+   "files": 240,
+   "nothing_files": 3,
+   "max_nothing_budget": 3,
+   "floors_owner": ".github/workflows/ci.yml"
+  },
+  {
+   "name": "coding-agent 2/3",
+   "report": "coverage/ci-shard-2.json",
+   "log_line": "### coverage/ci-shard-2.json: numTotalTests=3117 ran=3107 files=240 nothing-files=1",
+   "gate": "scripts/check-vitest-coverage.mjs",
+   "unit": "files",
+   "collected": 3117,
+   "ran": 3107,
+   "files": 240,
+   "nothing_files": 1,
+   "max_nothing_budget": 6,
+   "floors_owner": ".github/workflows/ci.yml",
+   "note": "The budget says six kernel-heavy files; this run produced one nothing-file. Left as authored (the budget's semantics are out of scope here) and recorded so the gap is visible: the tight min_ran_tests floor is what catches five more files going quiet."
+  },
+  {
+   "name": "coding-agent 3/3",
+   "report": "coverage/ci-shard-3.json",
+   "log_line": "### coverage/ci-shard-3.json: numTotalTests=2058 ran=2022 files=239 nothing-files=5",
+   "gate": "scripts/check-vitest-coverage.mjs",
+   "unit": "files",
+   "collected": 2058,
+   "ran": 2022,
+   "files": 239,
+   "nothing_files": 5,
+   "max_nothing_budget": 7,
+   "floors_owner": ".github/workflows/ci.yml"
+  },
+  {
+   "name": "coding-agent process smoke",
+   "report": "coverage/ci-process-smoke.json",
+   "log_line": "### coverage/ci-process-smoke.json: numTotalTests=24 ran=12 files=2 nothing-files=1",
+   "gate": "scripts/check-vitest-coverage.mjs",
+   "unit": "files",
+   "collected": 24,
+   "ran": 12,
+   "files": 2,
+   "nothing_files": 1,
+   "max_nothing_budget": 1,
+   "floors_owner": "scripts/lib/ci-process-smoke.mjs (mirrored into .github/workflows/ci.yml)",
+   "note": "The 12 skips are declared one by one in PROCESS_SMOKE_TAG_SKIP_LEDGER and counted by scripts/check-tag-skip-ledger.sh."
+  },
+  {
+   "name": "coding-agent machine-wide",
+   "report": "coverage/ci-machine-wide.json",
+   "log_line": "### coverage/ci-machine-wide.json: numTotalTests=6 ran=6 files=1 nothing-files=0",
+   "gate": "scripts/check-vitest-coverage.mjs",
+   "unit": "files",
+   "collected": 6,
+   "ran": 6,
+   "files": 1,
+   "nothing_files": 0,
+   "max_nothing_budget": 0,
+   "floors_owner": ".github/workflows/ci.yml",
+   "note": "Six tests in one file: ceil(0.9*6) is 6, so this row has no slack at all. Deliberate - it is the machine-wide discovery face and losing a test here must be loud."
+  },
+  {
+   "name": "coding-agent kernel",
+   "report": "coverage/kernel-coverage.json",
+   "log_line": "### coverage/kernel-coverage.json: numTotalTests=52 ran=43 files=15 nothing-files=0",
+   "gate": "scripts/check-vitest-coverage.mjs",
+   "unit": "files",
+   "collected": 52,
+   "ran": 43,
+   "files": 15,
+   "nothing_files": 0,
+   "max_nothing_budget": 0,
+   "floors_owner": "packages/coding-agent/package.json (test:kernel:ci)",
+   "note": "`test:kernel:ci` writes the report and runs the gate itself, so ci.yml carries no floors for this row: they live in packages/coding-agent/package.json and are held to the same policy share as every other row (--min-tests 47 --min-ran-tests 39 = 90.4%/90.7% of this reading). The exception entry below pins that file's flags to this reading, so the row cannot drift away from the policy in either direction."
+  }
+ ],
+ "exceptions": [
+  {
+   "name": "coding-agent kernel",
+   "owner_file": "packages/coding-agent/package.json",
+   "owner_script": "test:kernel:ci",
+   "owner_flags": {
+    "min_tests": 47,
+    "min_ran_tests": 39
+   },
+   "policy_share": "90.4%/90.7%",
+   "reason": "This row is not gated by ci.yml: `test:kernel:ci` writes the report and runs scripts/check-vitest-coverage.mjs itself, so its floors live in packages/coding-agent/package.json. The entry exists to pin that file's flags to the reading in this file (they were --min-tests 30 --min-ran-tests 29 = 57.7%/67.4%, below the 90% policy, while the sentence said 90%; they are now --min-tests 47 --min-ran-tests 39 = 90.4%/90.7%). Change either side and this test fails, which is the point: the row that ci.yml cannot carry is the row most likely to keep a stale floor. The kernel job's `ran` count depends on the interpreter the suite finds, so the floor has ~9% slack on the runner and is recomputed by editing both numbers together (command in `how_to_refresh`)."
+  }
+ ],
+ "ungated_rows": [
+  {
+   "name": "runtime python",
+   "reason": "`uv run python -m unittest discover -s test`: no JSON/junit report, so the only gate is the runner's own exit code. Recorded here so a new matrix row cannot be ungated silently - the pin requires every row to appear either in `rows` or in this list."
+  }
+ ],
+ "cross_check": [
+  {
+   "run_id": 35312234709,
+   "head_sha": "a103ebc65b526779c302ea175b9de7994a158c9b",
+   "conclusion": "success",
+   "note": "The run the audit quoted. Same readings for every row except the three shards: vitest re-shards by file list, so a shard's own count moves when files are added or removed (shard2 2985->3117, shard3 2176->2058 between this run and the pinned one, total 7869->7895).",
+   "rows": {
+    "agent-core": {
+     "collected": 108,
+     "ran": 108
     },
-    {
-      "name": "ai",
-      "report": "coverage/ci-ai.json",
-      "log_line": "### coverage/ci-ai.json: numTotalTests=1365 ran=643 files=112 nothing-files=19",
-      "gate": "scripts/check-vitest-coverage.mjs",
-      "unit": "files",
-      "collected": 1365,
-      "ran": 643,
-      "files": 112,
-      "nothing_files": 19,
-      "max_nothing_budget": 19,
-      "floors_owner": ".github/workflows/ci.yml",
-      "note": "19 nothing-files are the live-provider suites: they need credentials this job has none of, and the budget is exactly 19."
+    "ai": {
+     "collected": 1365,
+     "ran": 643
     },
-    {
-      "name": "tui",
-      "report": "coverage/ci-tui.xml",
-      "log_line": "### coverage/ci-tui.xml: tests=863 ran=863 suites=134 nothing-suites=0",
-      "gate": "scripts/check-node-test-coverage.mjs",
-      "unit": "suites",
-      "collected": 863,
-      "ran": 863,
-      "files": 134,
-      "nothing_files": 0,
-      "max_nothing_budget": 0,
-      "floors_owner": ".github/workflows/ci.yml",
-      "note": "`node --test`, not vitest: the junit XML feeds check-node-test-coverage.mjs and the budget key is max_nothing_suites."
+    "tui": {
+     "collected": 863,
+     "ran": 863
     },
-    {
-      "name": "coding-agent 1/3",
-      "report": "coverage/ci-shard-1.json",
-      "log_line": "### coverage/ci-shard-1.json: numTotalTests=2720 ran=2695 files=240 nothing-files=3",
-      "gate": "scripts/check-vitest-coverage.mjs",
-      "unit": "files",
-      "collected": 2720,
-      "ran": 2695,
-      "files": 240,
-      "nothing_files": 3,
-      "max_nothing_budget": 3,
-      "floors_owner": ".github/workflows/ci.yml"
+    "coding-agent 1/3": {
+     "collected": 2708,
+     "ran": 2683
     },
-    {
-      "name": "coding-agent 2/3",
-      "report": "coverage/ci-shard-2.json",
-      "log_line": "### coverage/ci-shard-2.json: numTotalTests=3117 ran=3107 files=240 nothing-files=1",
-      "gate": "scripts/check-vitest-coverage.mjs",
-      "unit": "files",
-      "collected": 3117,
-      "ran": 3107,
-      "files": 240,
-      "nothing_files": 1,
-      "max_nothing_budget": 6,
-      "floors_owner": ".github/workflows/ci.yml",
-      "note": "The budget says six kernel-heavy files; this run produced one nothing-file. Left as authored (the budget's semantics are out of scope here) and recorded so the gap is visible: the tight min_ran_tests floor is what catches five more files going quiet."
+    "coding-agent 2/3": {
+     "collected": 2985,
+     "ran": 2975
     },
-    {
-      "name": "coding-agent 3/3",
-      "report": "coverage/ci-shard-3.json",
-      "log_line": "### coverage/ci-shard-3.json: numTotalTests=2058 ran=2022 files=239 nothing-files=5",
-      "gate": "scripts/check-vitest-coverage.mjs",
-      "unit": "files",
-      "collected": 2058,
-      "ran": 2022,
-      "files": 239,
-      "nothing_files": 5,
-      "max_nothing_budget": 7,
-      "floors_owner": ".github/workflows/ci.yml"
+    "coding-agent 3/3": {
+     "collected": 2176,
+     "ran": 2140
     },
-    {
-      "name": "coding-agent process smoke",
-      "report": "coverage/ci-process-smoke.json",
-      "log_line": "### coverage/ci-process-smoke.json: numTotalTests=24 ran=12 files=2 nothing-files=1",
-      "gate": "scripts/check-vitest-coverage.mjs",
-      "unit": "files",
-      "collected": 24,
-      "ran": 12,
-      "files": 2,
-      "nothing_files": 1,
-      "max_nothing_budget": 1,
-      "floors_owner": "scripts/lib/ci-process-smoke.mjs (mirrored into .github/workflows/ci.yml)",
-      "note": "The 12 skips are declared one by one in PROCESS_SMOKE_TAG_SKIP_LEDGER and counted by scripts/check-tag-skip-ledger.sh."
+    "coding-agent process smoke": {
+     "collected": 24,
+     "ran": 12
     },
-    {
-      "name": "coding-agent machine-wide",
-      "report": "coverage/ci-machine-wide.json",
-      "log_line": "### coverage/ci-machine-wide.json: numTotalTests=6 ran=6 files=1 nothing-files=0",
-      "gate": "scripts/check-vitest-coverage.mjs",
-      "unit": "files",
-      "collected": 6,
-      "ran": 6,
-      "files": 1,
-      "nothing_files": 0,
-      "max_nothing_budget": 0,
-      "floors_owner": ".github/workflows/ci.yml",
-      "note": "Six tests in one file: ceil(0.9*6) is 6, so this row has no slack at all. Deliberate - it is the machine-wide discovery face and losing a test here must be loud."
+    "coding-agent machine-wide": {
+     "collected": 6,
+     "ran": 6
     },
-    {
-      "name": "coding-agent kernel",
-      "report": "coverage/kernel-coverage.json",
-      "log_line": "### coverage/kernel-coverage.json: numTotalTests=52 ran=43 files=15 nothing-files=0",
-      "gate": "scripts/check-vitest-coverage.mjs",
-      "unit": "files",
-      "collected": 52,
-      "ran": 43,
-      "files": 15,
-      "nothing_files": 0,
-      "max_nothing_budget": 0,
-      "floors_owner": "packages/coding-agent/package.json (test:kernel:ci)",
-      "note": "`test:kernel:ci` writes the report and runs the gate itself, so ci.yml carries no floors for this row. At the pinned run it gated at --min-tests 30 --min-ran-tests 29 = 58%/67% of the reading; the policy floors are 47/39. Not changed here: that file belongs to another lane (handed over in REPORT.md)."
+    "coding-agent kernel": {
+     "collected": 52,
+     "ran": 43
     }
-  ],
-  "exceptions": [
-    {
-      "name": "coding-agent kernel",
-      "owner_file": "packages/coding-agent/package.json",
-      "owner_script": "test:kernel:ci",
-      "owner_flags": {
-        "min_tests": 30,
-        "min_ran_tests": 29
-      },
-      "policy_share": "57.7%/67.4%",
-      "reason": "This row is not gated by ci.yml: `test:kernel:ci` writes the report and runs scripts/check-vitest-coverage.mjs itself, so its floors live in packages/coding-agent/package.json. At the pinned run they are --min-tests 30 --min-ran-tests 29 against 52 collected / 43 ran, i.e. 57.7% / 67.4% - below the 90% policy, and the one place where the policy sentence and the numbers still disagree. The policy floors for this row are --min-tests 47 --min-ran-tests 39. It is a one-line change in that file, left to the lane that owns it so two lanes do not write the same file; packages/coding-agent/test/ci-floor-policy.test.ts fails whenever these recorded numbers stop matching that file, so the gap cannot be forgotten, and it fails the same way once the file is fixed - update this entry then (the exception becomes an ordinary reading)."
-    }
-  ],
-  "ungated_rows": [
-    {
-      "name": "runtime python",
-      "reason": "`uv run python -m unittest discover -s test`: no JSON/junit report, so the only gate is the runner's own exit code. Recorded here so a new matrix row cannot be ungated silently - the pin requires every row to appear either in `rows` or in this list."
-    }
-  ],
-  "cross_check": [
-    {
-      "run_id": 35312234709,
-      "head_sha": "a103ebc65b526779c302ea175b9de7994a158c9b",
-      "conclusion": "success",
-      "note": "The run the audit quoted. Same readings for every row except the three shards: vitest re-shards by file list, so a shard's own count moves when files are added or removed (shard2 2985->3117, shard3 2176->2058 between this run and the pinned one, total 7869->7895).",
-      "rows": {
-        "agent-core": {
-          "collected": 108,
-          "ran": 108
-        },
-        "ai": {
-          "collected": 1365,
-          "ran": 643
-        },
-        "tui": {
-          "collected": 863,
-          "ran": 863
-        },
-        "coding-agent 1/3": {
-          "collected": 2708,
-          "ran": 2683
-        },
-        "coding-agent 2/3": {
-          "collected": 2985,
-          "ran": 2975
-        },
-        "coding-agent 3/3": {
-          "collected": 2176,
-          "ran": 2140
-        },
-        "coding-agent process smoke": {
-          "collected": 24,
-          "ran": 12
-        },
-        "coding-agent machine-wide": {
-          "collected": 6,
-          "ran": 6
-        },
-        "coding-agent kernel": {
-          "collected": 52,
-          "ran": 43
-        }
-      }
+   }
+  },
+  {
+   "run_id": 35341313505,
+   "head_sha": "94ff3aaff12a14563ca4d7bddbb07f5c9e83f215",
+   "conclusion": "success",
+   "note": "The run immediately before the pinned one: every row identical to it, which is why one run is enough to derive the floors.",
+   "rows": {
+    "agent-core": {
+     "collected": 108,
+     "ran": 108
     },
-    {
-      "run_id": 35341313505,
-      "head_sha": "94ff3aaff12a14563ca4d7bddbb07f5c9e83f215",
-      "conclusion": "success",
-      "note": "The run immediately before the pinned one: every row identical to it, which is why one run is enough to derive the floors.",
-      "rows": {
-        "agent-core": {
-          "collected": 108,
-          "ran": 108
-        },
-        "ai": {
-          "collected": 1365,
-          "ran": 643
-        },
-        "tui": {
-          "collected": 863,
-          "ran": 863
-        },
-        "coding-agent 1/3": {
-          "collected": 2720,
-          "ran": 2695
-        },
-        "coding-agent 2/3": {
-          "collected": 3117,
-          "ran": 3107
-        },
-        "coding-agent 3/3": {
-          "collected": 2058,
-          "ran": 2022
-        },
-        "coding-agent process smoke": {
-          "collected": 24,
-          "ran": 12
-        },
-        "coding-agent machine-wide": {
-          "collected": 6,
-          "ran": 6
-        },
-        "coding-agent kernel": {
-          "collected": 52,
-          "ran": 43
-        }
-      }
+    "ai": {
+     "collected": 1365,
+     "ran": 643
+    },
+    "tui": {
+     "collected": 863,
+     "ran": 863
+    },
+    "coding-agent 1/3": {
+     "collected": 2720,
+     "ran": 2695
+    },
+    "coding-agent 2/3": {
+     "collected": 3117,
+     "ran": 3107
+    },
+    "coding-agent 3/3": {
+     "collected": 2058,
+     "ran": 2022
+    },
+    "coding-agent process smoke": {
+     "collected": 24,
+     "ran": 12
+    },
+    "coding-agent machine-wide": {
+     "collected": 6,
+     "ran": 6
+    },
+    "coding-agent kernel": {
+     "collected": 52,
+     "ran": 43
     }
-  ],
-  "how_to_refresh": [
-    "1. pick a green run: gh run list -R Dmatut7/prime-agent-rlm --branch merge/repl-kernel --limit 5 --json databaseId,headSha,conclusion",
-    "2. read it: gh run view <run id> -R Dmatut7/prime-agent-rlm --log | grep -E 'numTotalTests=|tests=[0-9]+ ran='",
-    "3. per job, print the floors the policy asks for: node scripts/check-vitest-coverage.mjs --recompute-floors <report.json> --row \"<matrix row name>\"",
-    "4. paste the reading into `rows`, the floors into ci.yml (or scripts/lib/ci-process-smoke.mjs for the process smoke row), and update `source`",
-    "5. npx vitest --run packages/coding-agent/test/ci-floor-policy.test.ts must be green"
-  ]
+   }
+  }
+ ],
+ "how_to_refresh": [
+  "1. pick a green run: gh run list -R Dmatut7/prime-agent-rlm --branch merge/repl-kernel --limit 5 --json databaseId,headSha,conclusion",
+  "2. read it: gh run view <run id> -R Dmatut7/prime-agent-rlm --log | grep -E 'numTotalTests=|tests=[0-9]+ ran='",
+  "3. per job, print the floors the policy asks for: node scripts/check-vitest-coverage.mjs --recompute-floors <report.json> --row \"<matrix row name>\"",
+  "4. paste the reading into `rows`, the floors into ci.yml (or scripts/lib/ci-process-smoke.mjs for the process smoke row), and update `source`",
+  "5. npx vitest --run packages/coding-agent/test/ci-floor-policy.test.ts must be green"
+ ]
 }
