@@ -1,124 +1,91 @@
 #!/usr/bin/env node
 /**
- * Browser smoke check: the browser-facing entry point has to bundle.
+ * check-browser-smoke.mjs - the gate behind `npm run check:browser-smoke`, which the husky
+ * pre-commit hook (`npm run check`) and CI's `build-check` job both run.
  *
- * Why this exists
- * ---------------
- * `scripts/browser-smoke-entry.ts` imports the published package surface (`@earendil-works/pi-ai`)
- * the way a browser bundle does. If that import stops resolving - a rename, a `node:`-only module
- * pulled into the browser graph, an export that moved - the package is broken for every browser
- * consumer, and nothing else in `npm run check` builds for the browser. This gate is one esbuild
- * bundle of that entry: success is exit 0, a bundle that cannot be built writes esbuild's errors to
- * `--error-log` and exits 1.
- *
- * What it does not check
- * ----------------------
- * esbuild does not typecheck, so a type error in the graph still bundles and this gate stays green:
- * `tsgo --noEmit` (which `npm run check` runs before this gate) is the type gate. The self-test
- * holds a control for that blind spot, so it is a tested fact rather than an assumed one.
+ * What it judges
+ * --------------
+ * One reading, mechanically: `scripts/browser-smoke-entry.ts` - which imports `complete` and
+ * `getModel` from `@earendil-works/pi-ai` - must still bundle with esbuild at
+ * `platform: "browser"`, `format: "esm"`, `bundle: true`. Resolution goes through the root
+ * `tsconfig.json` `paths`, so what is bundled is pi-ai's TypeScript source graph (1,977 modules,
+ * ~5 MB of output), not the published `dist`. The drift this catches is therefore "something
+ * entered `@earendil-works/pi-ai`'s import graph that a browser bundle cannot resolve" - a Node
+ * builtin (`node:fs`, `node:child_process`, ...), a node-only dependency, or a broken entry - and
+ * it catches it without starting a browser or opening a socket: esbuild resolves and transpiles,
+ * nothing is executed. A red build writes the per-error `file:line:col text` detail plus the raw
+ * error to a log and names that log on stderr, because esbuild's own `logLevel: "silent"` would
+ * otherwise leave the operator with nothing.
  *
  * Usage
  * -----
- *   node scripts/check-browser-smoke.mjs
- *   node scripts/check-browser-smoke.mjs --self-test
- *   node scripts/check-browser-smoke.mjs [--entry <path>] [--outfile <path>] [--error-log <path>]
+ *   node scripts/check-browser-smoke.mjs              # the gate (green exits 0 silently)
+ *   node scripts/check-browser-smoke.mjs --self-test  # prove the gate can still go red
  *
- * Exit codes: 0 = the entry bundled, 1 = it did not (or a self-test mismatch), 2 = usage.
- * The self-test runs the same build path on planted entries, so it needs esbuild - that is, the
- * repository's node_modules - and cannot ride the dependency-free CI test-hygiene job.
+ * --self-test contract
+ * --------------------
+ * Seven controls plus a side-effect reading. The reds are planted for real: throwaway fixtures in
+ * `mkdtempSync` are handed to the *same* `runBuild` the gate uses, so a control passes only when
+ * that build really fails and its log really names the planted drift. Two green controls keep the
+ * reds honest - the shipped entry must still bundle, and a browser-safe fixture written next to
+ * the `node:fs` one must still bundle, so "everything is red" (a broken esbuild, an unresolvable
+ * workspace) cannot masquerade as detection. The formatter and the failure report are driven by
+ * canned esbuild-shaped errors as well, since those shapes (a location-less error, a non-Error
+ * throw) cannot be produced by a real bundle on demand.
+ * It writes nothing into the checkout, starts no browser, opens no socket and performs no network
+ * I/O; every artifact goes into one throwaway directory that is removed before exit, and the two
+ * production paths in `tmpdir()` are verified untouched. Exit codes: 0 = green, 1 = red, 2 = usage.
  */
-
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 
-const DEFAULT_ENTRY_PATH = "scripts/browser-smoke-entry.ts";
-const DEFAULT_OUTPUT_PATH = join(tmpdir(), "pi-browser-smoke.js");
-const DEFAULT_ERROR_LOG_PATH = join(tmpdir(), "pi-browser-smoke-errors.log");
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const entryPoint = join(repoRoot, "scripts", "browser-smoke-entry.ts");
+const outputPath = join(tmpdir(), "pi-browser-smoke.js");
+const errorLogPath = join(tmpdir(), "pi-browser-smoke-errors.log");
 
 class UsageError extends Error {}
 
-function usage() {
-	return [
-		"usage: check-browser-smoke.mjs [--self-test]",
-		"       [--entry <path>] [--outfile <path>] [--error-log <path>]",
-		"",
-		`  (no phase flag)  bundle ${DEFAULT_ENTRY_PATH} for the browser`,
-		"--self-test      plant entries that cannot bundle and require exit 1, then bundle the real",
-		"                 entry and require exit 0 (needs node_modules: the same esbuild path runs)",
-		"",
-		`  --entry, --outfile and --error-log default to ${DEFAULT_ENTRY_PATH},`,
-		`  ${DEFAULT_OUTPUT_PATH} and ${DEFAULT_ERROR_LOG_PATH}.`,
-		"  The self-test uses them to keep a planted run inside its own temporary directory.",
-	].join("\n");
-}
-
-/** `--flag value` and `--flag=value` both work. */
-function takeValue(argv, index, flag) {
-	const inline = argv[index].startsWith(`${flag}=`);
-	const value = inline ? argv[index].slice(flag.length + 1) : argv[index + 1];
-	if (value === undefined || value === "" || value.startsWith("-")) {
-		throw new UsageError(`${flag} needs a path`);
-	}
-	return { value, index: inline ? index : index + 1 };
-}
-
 function parseArgs(argv) {
-	const options = {
-		selfTest: false,
-		entryPath: DEFAULT_ENTRY_PATH,
-		outfile: DEFAULT_OUTPUT_PATH,
-		errorLogPath: DEFAULT_ERROR_LOG_PATH,
-	};
-	for (let index = 0; index < argv.length; index += 1) {
-		const arg = argv[index];
-		if (arg === "--self-test") {
-			options.selfTest = true;
-			continue;
-		}
-		let taken;
-		if (arg === "--entry" || arg.startsWith("--entry=")) {
-			taken = takeValue(argv, index, "--entry");
-			options.entryPath = taken.value;
-		} else if (arg === "--outfile" || arg.startsWith("--outfile=")) {
-			taken = takeValue(argv, index, "--outfile");
-			options.outfile = taken.value;
-		} else if (arg === "--error-log" || arg.startsWith("--error-log=")) {
-			taken = takeValue(argv, index, "--error-log");
-			options.errorLogPath = taken.value;
-		} else if (arg === "--help" || arg === "-h") {
-			options.help = true;
-			continue;
-		} else if (arg.startsWith("-")) {
-			throw new UsageError(`unknown option "${arg}"`);
-		} else {
-			throw new UsageError(`unexpected argument "${arg}"`);
-		}
-		index = taken.index;
+	const options = { selfTest: false };
+	for (const arg of argv) {
+		if (arg === "--self-test") options.selfTest = true;
+		else if (arg === "-h" || arg === "--help") options.help = true;
+		else throw new UsageError(`check-browser-smoke: unknown argument ${arg}`);
 	}
 	return options;
 }
 
-/** One bundle attempt. The one path both the gate and its self-test build through. */
-async function bundleEntry(entryPath, outfile) {
-	try {
-		await build({
-			entryPoints: [entryPath],
-			bundle: true,
-			platform: "browser",
-			format: "esm",
-			logLevel: "silent",
-			outfile,
-		});
-		return { ok: true, error: undefined };
-	} catch (error) {
-		return { ok: false, error };
-	}
+function usage() {
+	console.error("usage: node scripts/check-browser-smoke.mjs [--self-test]");
 }
 
-/** esbuild's error list flattened to `file:line:column <text>` lines, plus the stack. */
-function describeBuildError(error) {
+/**
+ * The gate's build options. `outfile` is a parameter because that is the only thing a self-test
+ * control may redirect; entry, platform, format and working directory stay the gate's own.
+ */
+function buildOptions(outfile, overrides = {}) {
+	return {
+		entryPoints: [entryPoint],
+		bundle: true,
+		platform: "browser",
+		format: "esm",
+		logLevel: "silent",
+		absWorkingDir: repoRoot,
+		outfile,
+		...overrides,
+	};
+}
+
+/**
+ * esbuild's thrown failure -> the text the gate writes to its error log. Pure (no I/O), so a
+ * canned error can drive it: a location-less entry formats as its text alone, and a throw that is
+ * not an Error formats as its string form.
+ */
+function formatBuildFailure(error) {
 	let detailedErrors = "";
 	if (error && typeof error === "object" && "errors" in error && Array.isArray(error.errors)) {
 		detailedErrors = error.errors
@@ -135,205 +102,238 @@ function describeBuildError(error) {
 	return [detailedErrors, baseError].filter(Boolean).join("\n\n");
 }
 
+/** One build, reported as a value: the gate and every self-test control run this same function. */
+async function runBuild(options) {
+	try {
+		const result = await build(options);
+		return { ok: true, warnings: result.warnings };
+	} catch (error) {
+		return { ok: false, log: formatBuildFailure(error) };
+	}
+}
+
+/** The operator-facing half of a red gate: write the detail log, return the line printed on stderr. */
+function reportFailure(logPath, log) {
+	writeFileSync(logPath, log, "utf-8");
+	return `Browser smoke check failed. See ${logPath}`;
+}
+
+// ---------------------------------------------------------------------------
+// self-test: planted bundles must turn the gate red, the shipped one must not
+// ---------------------------------------------------------------------------
+
+/** A control's own judgement: run something, return the failures it produced ([] = green). */
+async function buildControl(workDir, name, body, outfile, expectation) {
+	const entry = join(workDir, name);
+	writeFileSync(entry, body, "utf8");
+	return evaluateBuild(await runBuild(buildOptions(join(workDir, outfile), { entryPoints: [entry] })), expectation);
+}
+
+function evaluateBuild(result, expectation) {
+	const failures = [];
+	if (expectation.ok && !result.ok) {
+		failures.push(`expected a green browser bundle, got a red one:\n${result.log}`);
+		return failures;
+	}
+	if (!expectation.ok && result.ok) failures.push("expected a red browser bundle, got a green one");
+	for (const needle of expectation.logNames ?? []) {
+		if (result.ok) failures.push(`expected the failure log to name ${JSON.stringify(needle)}, got no failure at all`);
+		else if (!result.log.includes(needle)) {
+			failures.push(`expected the failure log to name ${JSON.stringify(needle)}, got:\n${result.log}`);
+		}
+	}
+	return failures;
+}
+
+/** The formatter, driven by canned esbuild-shaped failures it cannot be made to produce on demand. */
+function formatterControls() {
+	const failures = [];
+	const stack = 'Error: Build failed with 1 error\n    at failureFailure (/x/esbuild/lib/main.js:1:1)';
+	const canned = Object.assign(new Error("Build failed with 1 error"), {
+		errors: [
+			{
+				location: { file: "scripts/browser-smoke-entry.ts", line: 1, column: 29 },
+				text: 'Could not resolve "node:fs"',
+			},
+		],
+		stack,
+	});
+	const expect = (actual, wanted, label) => {
+		if (actual !== wanted) failures.push(`${label}: expected\n${JSON.stringify(wanted)}\ngot\n${JSON.stringify(actual)}`);
+	};
+	expect(
+		formatBuildFailure(canned),
+		`scripts/browser-smoke-entry.ts:1:29 Could not resolve "node:fs"\n\n${stack}`,
+		"a located error formats as file:line:col text plus the raw error",
+	);
+	expect(
+		formatBuildFailure(
+			Object.assign(new Error("Build failed with 1 error"), {
+				errors: [{ location: null, text: "The entry point is missing" }],
+				stack: "raw",
+			}),
+		),
+		"The entry point is missing\n\nraw",
+		"a location-less error still formats (no undefined:null)",
+	);
+	// Pinned as-is, not "fixed": a throw that is not an Error stringifies opaquely, and the gate
+	// still keeps the actionable part because the detailed errors are formatted first.
+	expect(
+		formatBuildFailure({ errors: [{ location: null, text: "The entry point is missing" }], stack: "raw" }),
+		"The entry point is missing\n\n[object Object]",
+		"a plain-object throw keeps its detailed part even though its string form is opaque",
+	);
+	expect(formatBuildFailure("esbuild exploded"), "esbuild exploded", "a non-Error throw formats as its string form");
+	expect(formatBuildFailure(undefined), "undefined", "an undefined throw formats instead of crashing");
+	return failures;
+}
+
+function selfTestControls(workDir) {
+	return [
+		{
+			name: "the shipped browser-smoke entry still bundles for the browser (green control)",
+			run: async () => evaluateBuild(await runBuild(buildOptions(join(workDir, "shipped.js"))), { ok: true }),
+		},
+		{
+			name: "a Node builtin entering the graph reddens the gate and names it (the drift this gate exists for)",
+			run: () =>
+				buildControl(
+					workDir,
+					"node-builtin.ts",
+					'import { readFileSync } from "node:fs";\nconsole.log(readFileSync);\n',
+					"node-builtin.js",
+					{ ok: false, logNames: ['Could not resolve "node:fs"', "node-builtin.ts:1:"] },
+				),
+		},
+		{
+			name: "a browser-safe fixture next to it still bundles (attribution control for the red above)",
+			run: () =>
+				buildControl(workDir, "browser-safe.ts", "export const answer = 41 + 1;\nconsole.log(answer);\n", "browser-safe.js", {
+					ok: true,
+				}),
+		},
+		{
+			name: "a syntax error inside the bundled graph reddens the gate",
+			run: () =>
+				buildControl(workDir, "syntax-error.ts", "export const broken = ;\n", "syntax-error.js", {
+					ok: false,
+					logNames: ['Unexpected ";"', "syntax-error.ts:1:"],
+				}),
+		},
+		{
+			name: "a vanished entry file reddens the gate instead of passing silently",
+			run: async () =>
+				evaluateBuild(
+					await runBuild(buildOptions(join(workDir, "vanished.js"), { entryPoints: [join(workDir, "gone.ts")] })),
+					{ ok: false, logNames: ["gone.ts"] },
+				),
+		},
+		{
+			name: "the failure formatter reports file:line:col text plus the raw error (canned shapes)",
+			run: () => formatterControls(),
+		},
+		{
+			name: "a red build writes its detail log and names it on stderr",
+			run: async () => {
+				const failures = [];
+				const logPath = join(workDir, "planted-errors.log");
+				const entry = join(workDir, "report-entry.ts");
+				writeFileSync(entry, 'import { spawnSync } from "node:child_process";\nconsole.log(spawnSync);\n', "utf8");
+				const result = await runBuild(buildOptions(join(workDir, "report.js"), { entryPoints: [entry] }));
+				if (result.ok) {
+					failures.push("expected the planted node:child_process entry to be red for this control");
+					return failures;
+				}
+				const line = reportFailure(logPath, result.log);
+				if (!existsSync(logPath)) failures.push(`expected the detail log to be written at ${logPath}`);
+				else if (!line.endsWith(logPath)) failures.push(`expected the stderr line to name the log path, got: ${line}`);
+				else if (line !== `Browser smoke check failed. See ${logPath}`) {
+					failures.push(`expected the gate's own failure sentence, got: ${line}`);
+				}
+				return failures;
+			},
+		},
+	];
+}
+
+async function runSelfTest() {
+	const workDir = mkdtempSync(join(tmpdir(), "prime-agent-browser-smoke-selftest-"));
+	// The production artifacts: the self-test must neither create nor rewrite them.
+	const productionArtifacts = [outputPath, errorLogPath].map((path) => [path, fingerprint(path)]);
+	const controls = selfTestControls(workDir);
+	let mismatches = 0;
+	try {
+		for (const control of controls) {
+			let failures;
+			let threw;
+			try {
+				failures = await control.run();
+			} catch (error) {
+				threw = error;
+			}
+			const passed = threw === undefined && failures.length === 0;
+			if (!passed) mismatches += 1;
+			console.log(`${passed ? "ok  " : "FAIL"} ${control.name} (${threw ? `threw ${threw.message}` : `${failures.length} failure(s)`})`);
+			if (!passed && failures) for (const failure of failures) console.log(`       ${failure}`);
+		}
+	} finally {
+		rmSync(workDir, { recursive: true, force: true });
+	}
+
+	const sideEffectFailures = [];
+	if (existsSync(workDir)) sideEffectFailures.push(`the throwaway directory survived: ${workDir}`);
+	if (workDir.startsWith(`${repoRoot}/`)) sideEffectFailures.push(`the throwaway directory is inside the checkout: ${workDir}`);
+	for (const [path, before] of productionArtifacts) {
+		const after = fingerprint(path);
+		if (before !== after) sideEffectFailures.push(`a production artifact changed: ${path} (${before} -> ${after})`);
+	}
+	if (sideEffectFailures.length > 0) mismatches += 1;
+	console.log(
+		`${sideEffectFailures.length === 0 ? "ok  " : "FAIL"} the self-test is side-effect free (throwaway dir removed, ${
+			productionArtifacts.length
+		} production artifact(s) untouched)`,
+	);
+	for (const failure of sideEffectFailures) console.log(`       ${failure}`);
+
+	console.log(`self-test: ${controls.length + 1} controls, ${mismatches} mismatch(es)`);
+	return mismatches === 0 ? 0 : 1;
+}
+
+/** "absent" or "present at this size and mtime": enough to prove the self-test did not rewrite it. */
+function fingerprint(path) {
+	try {
+		const stats = statSync(path);
+		return `size=${stats.size} mtime=${stats.mtimeMs}`;
+	} catch {
+		return "absent";
+	}
+}
+
 async function main(argv) {
 	let options;
 	try {
 		options = parseArgs(argv);
 	} catch (error) {
-		console.error(error instanceof UsageError ? error.message : String(error));
-		console.error(usage());
+		if (!(error instanceof UsageError)) throw error;
+		console.error(error.message);
+		usage();
 		return 2;
 	}
 	if (options.help) {
-		console.log(usage());
+		usage();
 		return 0;
 	}
-	if (options.selfTest) return await runSelfTest(options);
+	if (options.selfTest) {
+		const status = await runSelfTest();
+		if (status === 0) console.log("check-browser-smoke self-test: OK (the gate still plants its own red)");
+		else console.error("check-browser-smoke self-test: RED (a planted drift was not detected, or a green control failed)");
+		return status;
+	}
 
-	const result = await bundleEntry(options.entryPath, options.outfile);
+	const result = await runBuild(buildOptions(outputPath));
 	if (result.ok) return 0;
-
-	writeFileSync(options.errorLogPath, describeBuildError(result.error), "utf-8");
-	console.error(`Browser smoke check failed. See ${options.errorLogPath}`);
+	console.error(reportFailure(errorLogPath, result.log));
 	return 1;
-}
-
-// ---------------------------------------------------------------------------
-// self-test: planted entries that cannot bundle must turn the gate red
-// ---------------------------------------------------------------------------
-//
-// The controls drive `main`, not `bundleEntry`, so what is proven is the verdict the wiring sees:
-// the exit code and the error log. Planted entries live in one temporary directory and the output
-// and error log are pointed into it, so a self-test run leaves nothing behind outside the OS temp
-// directory and never touches `scripts/browser-smoke-entry.ts` (which it only reads and bundles).
-//
-// Summary line: `self-test: N controls, M mismatch(es)`.
-
-/** Collect what the gate prints, so the self-test's own report stays readable. */
-async function withCapturedOutput(run) {
-	const captured = [];
-	const log = console.log;
-	const error = console.error;
-	const record = (...args) => captured.push(args.map((value) => String(value)).join(" "));
-	console.log = record;
-	console.error = record;
-	try {
-		const code = await run();
-		return { code, output: captured.join("\n") };
-	} finally {
-		console.log = log;
-		console.error = error;
-	}
-}
-
-/** What the gate's `--self-test` plants. `source === null` plants nothing (the path stays absent). */
-const SELF_TEST_ENTRIES = [
-	{
-		name: "the real browser smoke entry bundles (green)",
-		expectPass: true,
-		fileName: null,
-		realEntry: true,
-	},
-	{
-		name: "a planted syntax error is red",
-		expectPass: false,
-		fileName: "planted-syntax-error.ts",
-		source: "const broken: = ;\n",
-		needle: 'Unexpected "="',
-	},
-	{
-		name: "a planted missing import is red",
-		expectPass: false,
-		fileName: "planted-missing-import.ts",
-		source: 'import { nothing } from "./planted-absent-module.js";\nconsole.log(nothing);\n',
-		needle: 'Could not resolve "./planted-absent-module.js"',
-	},
-	{
-		name: "a planted entry that does not exist is red",
-		expectPass: false,
-		fileName: null,
-		source: null,
-		needle: "Could not resolve",
-	},
-	{
-		name: "esbuild does not typecheck: a planted type error still bundles (the gate's blind spot)",
-		expectPass: true,
-		fileName: "planted-type-error.ts",
-		source: 'const count: number = "seven";\nconsole.log(count);\n',
-	},
-];
-
-async function judgeSelfTestEntry(entry, options, dir) {
-	const label = entry.realEntry ? "real-entry" : entry.fileName === null ? "planted-absent-entry" : entry.fileName.replace(/\.ts$/, "");
-	const entryPath = entry.realEntry ? options.entryPath : join(dir, entry.fileName ?? "planted-absent-entry.ts");
-	if (!entry.realEntry && entry.fileName !== null) {
-		writeFileSync(entryPath, entry.source, "utf-8");
-	}
-	const errorLogPath = join(dir, `${label}-errors.log`);
-	const { code, output } = await withCapturedOutput(() =>
-		main(["--entry", entryPath, "--outfile", join(dir, `${label}.js`), "--error-log", errorLogPath]),
-	);
-
-	if (entry.expectPass) {
-		const problems = [];
-		if (code !== 0) {
-			problems.push(`expected exit 0, got exit ${code}: ${[output, readIfPresent(errorLogPath)].filter(Boolean).join(" ")}`);
-		}
-		if (existsSync(errorLogPath)) {
-			problems.push(`a green bundle wrote an error log (${errorLogPath}): ${readIfPresent(errorLogPath)}`);
-		}
-		return { code, problems };
-	}
-
-	const problems = [];
-	if (code !== 1) {
-		problems.push(`expected exit 1, got exit ${code}: ${output}`);
-		return { code, problems };
-	}
-	if (!output.includes("Browser smoke check failed. See ")) {
-		problems.push(`exit 1 without telling the reader where the errors are: ${output}`);
-	}
-	const log = readIfPresent(errorLogPath, "utf-8");
-	if (log === undefined) {
-		problems.push(`exit 1 without writing the error log at ${errorLogPath}`);
-	} else if (entry.needle !== undefined && !log.includes(entry.needle)) {
-		problems.push(`the error log does not say ${JSON.stringify(entry.needle)}: ${log.split("\n")[0]}`);
-	}
-	return { code, problems };
-}
-
-/** Read a file, or `undefined` when it is not there (the file not existing is a verdict of its own). */
-function readIfPresent(path, encoding) {
-	try {
-		return readFileSync(path, encoding);
-	} catch {
-		return undefined;
-	}
-}
-
-/** How a path looked at one moment: its content, or "absent". */
-function describePath(path) {
-	const content = readIfPresent(path, "utf-8");
-	return content === undefined ? "absent" : `${content.length} bytes`;
-}
-
-/**
- * The state the self-test must leave exactly as it found it: the entry it plants nothing into, and
- * the two shared temp paths the real gate writes. A run of this self-test that edits the entry or
- * writes the shared error log is a red control, not something a reader has to trust.
- */
-function selfTestWitness() {
-	return Object.fromEntries([DEFAULT_ENTRY_PATH, DEFAULT_OUTPUT_PATH, DEFAULT_ERROR_LOG_PATH].map((path) => [path, describePath(path)]));
-}
-
-function witnessProblems(before, after) {
-	const problems = [];
-	for (const path of Object.keys(before)) {
-		if (before[path] !== after[path]) {
-			problems.push(`${path} changed during the self-test (${before[path]} -> ${after[path]})`);
-		}
-	}
-	return problems;
-}
-
-async function runSelfTest(options) {
-	const controls = [...SELF_TEST_ENTRIES];
-	const dir = mkdtempSync(join(tmpdir(), "browser-smoke-selftest-"));
-	const before = selfTestWitness();
-	try {
-		const results = [];
-		for (const entry of controls) {
-			let judged;
-			try {
-				judged = await judgeSelfTestEntry(entry, options, dir);
-			} catch (error) {
-				judged = { code: "n/a", problems: [`the control threw: ${error instanceof Error ? error.message : String(error)}`] };
-			}
-			results.push(judged);
-		}
-
-		// The last control judges the run itself: planting entries must not touch the real entry or
-		// the temp paths the real gate uses.
-		const problems = witnessProblems(before, selfTestWitness());
-		controls.push({
-			name: "the self-test left the real entry and the shared temp paths alone",
-			expectPass: true,
-		});
-		results.push({ code: "n/a", problems });
-
-		let mismatches = 0;
-		for (const [index, control] of controls.entries()) {
-			const { code, problems } = results[index];
-			const passed = problems.length === 0;
-			if (!passed) mismatches += 1;
-			console.log(`${passed ? "ok  " : "FAIL"} ${control.name} (expected ${control.expectPass ? "green" : "red"}, got exit ${code})`);
-			for (const problem of problems) console.log(`       ${problem}`);
-		}
-		console.log(`self-test: ${controls.length} controls, ${mismatches} mismatch(es)`);
-		return mismatches === 0 ? 0 : 1;
-	} finally {
-		rmSync(dir, { recursive: true, force: true });
-	}
 }
 
 process.exit(await main(process.argv.slice(2)));
