@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gate-process-smoke.sh - the local mirror of CI job "Test (coding-agent process smoke)".
+# check-process-smoke.sh - the local mirror of CI job "Test (coding-agent process smoke)".
 #
 # Why this file exists
 # --------------------
@@ -28,10 +28,10 @@
 #
 # Usage
 # -----
-#   bash scripts/gate-process-smoke.sh                 # the CI face (green = 12 passed | 8 skipped)
-#   bash scripts/gate-process-smoke.sh --with-stress   # + the nightly face (`test:process-stress`)
-#   bash scripts/gate-process-smoke.sh --self-test     # prove both instruments can still go red
-#   bash scripts/gate-process-smoke.sh --report /tmp/p.json   # keep the report elsewhere
+#   bash scripts/check-process-smoke.sh                 # the CI face (green = 12 passed | 8 skipped)
+#   bash scripts/check-process-smoke.sh --with-stress   # + the nightly face (`test:process-stress`)
+#   bash scripts/check-process-smoke.sh --self-test     # prove both instruments can still go red
+#   bash scripts/check-process-smoke.sh --report /tmp/p.json   # keep the report elsewhere
 #
 # Repository root is resolved from this script's own location, so the file works both from a
 # checkout's `scripts/` and from a throwaway copy outside the tree (REPO_ROOT=<path> overrides).
@@ -44,7 +44,7 @@ REPORT_OVERRIDE=""
 
 usage() {
 	cat >&2 <<'USAGE'
-usage: bash scripts/gate-process-smoke.sh [--with-stress] [--self-test] [--report <path>]
+usage: bash scripts/check-process-smoke.sh [--with-stress] [--self-test] [--report <path>]
 USAGE
 }
 
@@ -55,8 +55,9 @@ while [ $# -gt 0 ]; do
 		--report) [ $# -ge 2 ] || { usage; exit 2; }; REPORT_OVERRIDE="$2"; shift 2 ;;
 		--report=*) REPORT_OVERRIDE="${1#--report=}"; shift ;;
 		-h|--help) usage; exit 0 ;;
-		*) echo "gate-process-smoke: unknown argument $1" >&2; usage; exit 2 ;;
+		*) echo "check-process-smoke: unknown argument $1" >&2; usage; exit 2 ;;
 	esac
+[ -n "$REPORT_OVERRIDE" ] || [ "$SELF_TEST" = "1" ] || mkdir -p "$(dirname "$REPORT")"
 done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -73,17 +74,16 @@ else
 		if [ -f "$candidate/packages/coding-agent/package.json" ]; then ROOT="$candidate"; break; fi
 		candidate="$(cd "$candidate/.." && pwd)"
 	done
-	[ -n "$ROOT" ] || { echo "gate-process-smoke: cannot locate the checkout; set REPO_ROOT=<path>" >&2; exit 2; }
+	[ -n "$ROOT" ] || { echo "check-process-smoke: cannot locate the checkout; set REPO_ROOT=<path>" >&2; exit 2; }
 fi
 PKG="$ROOT/packages/coding-agent"
 AGENT_TEST="$PKG/test/daemon-supervisor-process.test.ts"
 HANDLERS_TEST="$PKG/test/daemon-supervisor-crash-handlers-process.test.ts"
 [ -f "$AGENT_TEST" ] && [ -f "$HANDLERS_TEST" ] || {
-	echo "gate-process-smoke: not a prime-agent checkout (missing $AGENT_TEST)" >&2
+	echo "check-process-smoke: not a prime-agent checkout (missing $AGENT_TEST)" >&2
 	exit 2
 }
 REPORT="${REPORT_OVERRIDE:-$PKG/coverage/ci-process-smoke.json}"
-[ -n "$REPORT_OVERRIDE" ] || mkdir -p "$(dirname "$REPORT")"
 
 # Copied verbatim from .github/workflows/ci.yml (matrix row "coding-agent process smoke").
 LEDGER="packages/coding-agent/test/daemon-supervisor-process.test.ts=8:process-stress tag-filtered by vitest.config.ts; nightly-process-stress.yml runs it;;packages/coding-agent/test/daemon-supervisor-crash-handlers-process.test.ts=4:process-stress tag-filtered by vitest.config.ts; nightly-process-stress.yml runs it"
@@ -101,10 +101,10 @@ if [ "$SELF_TEST" = "1" ]; then
 	node "$ROOT/scripts/check-vitest-coverage.mjs" --self-test || rc=1
 	bash "$ROOT/scripts/check-tag-skip-ledger.sh" --self-test || rc=1
 	if [ "$rc" != "0" ]; then
-		echo "gate-process-smoke: self-test RED (an instrument can no longer detect its drift)" >&2
+		echo "check-process-smoke: self-test RED (an instrument can no longer detect its drift)" >&2
 		exit 1
 	fi
-	echo "gate-process-smoke: self-test GREEN (coverage gate and tag-skip ledger both plant their own red)"
+	echo "check-process-smoke: self-test GREEN (coverage gate and tag-skip ledger both plant their own red)"
 	exit 0
 fi
 
@@ -188,7 +188,7 @@ fi
 
 printf '\n'
 if [ -n "$FAILED_STEP" ]; then
-	printf 'gate-process-smoke: RED - %s\n' "$FAILED_STEP" >&2
+	printf 'check-process-smoke: RED - %s\n' "$FAILED_STEP" >&2
 	exit 1
 fi
-printf 'gate-process-smoke: GREEN (process smoke face matches CI; every skip declared, counted and named)\n'
+printf 'check-process-smoke: GREEN (process smoke face matches CI; every skip declared, counted and named)\n'
