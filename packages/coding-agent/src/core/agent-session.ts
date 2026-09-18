@@ -75,6 +75,7 @@ import {
 	formatAgentSessionNameUnavailable,
 	formatSubagentTerminalErrorNotice,
 	isAgentSessionMessage,
+	isAgentSessionMessageId,
 	isAgentSessionMessagePrompt,
 	isChildReplyToThisSession,
 	normalizeAgentSessionMessage,
@@ -209,7 +210,12 @@ import {
 	validateGoalBudget,
 	validateGoalObjective,
 } from "./goals.js";
-import { classifyIncomingInput, incomingInputFactsFromMessage, inputClassOrigin } from "./input-classification.js";
+import {
+	classifyIncomingInput,
+	type InputClass,
+	incomingInputFactsFromMessage,
+	inputClassOrigin,
+} from "./input-classification.js";
 import type {
 	HostRequestHandlers,
 	KernelDeathCause,
@@ -374,6 +380,8 @@ import {
 	queuedMessageLaneDeliveryPolicy,
 	type RuntimeActivity,
 	type SessionAction,
+	type SessionActionPlacement,
+	type SessionActionPriority,
 	type SessionActionSnapshot,
 	type SessionCommandPayload,
 	type SessionTurnPayload,
@@ -864,6 +872,8 @@ export interface PromptOptions {
 	agentMessageId?: string;
 	content?: (TextContent | ImageContent)[];
 	customMessage?: CustomMessage;
+	/** Overrides the queue priority derived from the input classification. */
+	priority?: SessionActionPriority;
 }
 
 interface InternalPromptOptions extends PromptOptions {
@@ -1021,6 +1031,8 @@ export interface SessionActionRecoveryAction {
 	id: string;
 	source: InputSource | "internal";
 	delivery: DeliveryPolicy;
+	/** Absent in snapshots written before #2334: the restore path re-derives it. */
+	priority?: SessionActionPriority;
 	wake: WakePolicy;
 	payload: SessionActionRecoveryPayload;
 	queueKey?: string;
@@ -1075,6 +1087,44 @@ function changedHarnessEntryKeys(previous: Map<string, number>, next: Map<string
 		if (!next.has(key)) changed.add(key);
 	}
 	return changed;
+}
+
+/**
+ * Queue priority is derived from the fork's single input-classification point instead of
+ * carrying its own heuristic (#2334 reconciliation). `classifyIncomingInput` reads structure
+ * only - never the message text - so a child reply cannot forge its way to the front of the
+ * queue, and its human default means an input nobody recognizes keeps human priority instead
+ * of being silently demoted. Agent-to-agent delivery ids demote unconditionally: that check is
+ * structural too, and it is what keeps `promptAndWait`'s self-minted `prompt-wait:<uuid>` id
+ * (which is not agent traffic) at human priority.
+ *
+ * `source` is optional on purpose: the parked-queue restore path records `source: "internal"`
+ * for input a person typed, so a caller that cannot vouch for the source leaves it out and lets
+ * the message envelope decide.
+ */
+/**
+ * The single class -> priority mapping. Deriving it from `inputClassOrigin` (which is
+ * compile-time exhaustive over `InputClass`) is what keeps the two faces from drifting:
+ * a machine class added later - the harness digest row #2098 added is exactly that case -
+ * lands in `background` without anyone having to remember this function.
+ */
+export function sessionActionPriorityForInputClass(inputClass: InputClass): SessionActionPriority {
+	return inputClassOrigin(inputClass) === "human" ? "user" : "background";
+}
+
+export function sessionActionPriorityFor(facts: {
+	source?: InputSource | "internal";
+	message?: QueuedAgentMessage;
+	agentMessageId?: string;
+}): SessionActionPriority {
+	if (isAgentSessionMessageId(facts.agentMessageId)) return "background";
+	const classification = classifyIncomingInput(
+		incomingInputFactsFromMessage(facts.message ?? { role: "user" }, {
+			...(facts.source === undefined ? {} : { source: facts.source }),
+			...(facts.agentMessageId === undefined ? {} : { agentMessageId: facts.agentMessageId }),
+		}),
+	);
+	return sessionActionPriorityForInputClass(classification);
 }
 
 function primaryDeliveryRecord(action: QueuedSessionAction): DeliveryRecord {
@@ -3785,6 +3835,8 @@ export class AgentSession {
 		const action = this._createPreparedTurnAction("followUp", normalized.text, normalized.images, {
 			message,
 			resumeIfIdle: true,
+			// Front insertion only holds while nothing can be admitted ahead of it.
+			priority: "pinned",
 		});
 		this._admitSessionInput(action, { front: true, wake: false });
 	}
@@ -8397,6 +8449,7 @@ export class AgentSession {
 						{
 							agentMessageId: options?.agentMessageId,
 							source: isInternalPrompt ? "internal" : (options?.source ?? "interactive"),
+							priority: options?.priority,
 						},
 					);
 					const result = this._admitSessionInput(action, {
@@ -8451,6 +8504,7 @@ export class AgentSession {
 						options?.resumeIfIdle ||
 						(options?.queueIfBusy === true && canSelectSessionAction(this._runtimeActivity())),
 					source: isInternalPrompt ? "internal" : (options?.source ?? "interactive"),
+					priority: options?.priority,
 					executionPolicy: visibleQueued
 						? this._turnExecutionPolicy("queued")
 						: this._turnExecutionPolicy("directPrompt", {
@@ -8598,6 +8652,8 @@ export class AgentSession {
 			queueKey?: string;
 			agentMessageId?: string;
 			resumeIfIdle?: boolean;
+			/** Machine callers (cron, heartbeats) opt out; the default caller of this API is a person. */
+			priority?: SessionActionPriority;
 		} = {},
 	): Promise<void> {
 		const normalized = this._normalizeSubmission(text, images, {
@@ -8614,6 +8670,12 @@ export class AgentSession {
 			queueKey: options.queueKey,
 			agentMessageId: options.agentMessageId,
 			resumeIfIdle: options.resumeIfIdle,
+			// A live steering submission is a person typing unless the caller says otherwise.
+			// The action keeps the queue path's recorded source; only the priority asks the
+			// classifier the way a human client would (an agent delivery id still demotes).
+			priority:
+				options.priority ??
+				sessionActionPriorityFor({ source: "interactive", agentMessageId: options.agentMessageId }),
 		});
 	}
 
@@ -8631,6 +8693,8 @@ export class AgentSession {
 			queueKey?: string;
 			agentMessageId?: string;
 			resumeIfIdle?: boolean;
+			/** Machine callers (cron, heartbeats) opt out; the default caller of this API is a person. */
+			priority?: SessionActionPriority;
 		} = {},
 	): Promise<boolean> {
 		const normalized = this._normalizeSubmission(text, images, {
@@ -8647,6 +8711,11 @@ export class AgentSession {
 			queueKey: options.queueKey,
 			agentMessageId: options.agentMessageId,
 			resumeIfIdle: options.resumeIfIdle,
+			// Same contract as steer(): a live follow-up submission is a person typing unless
+			// the caller says otherwise, and the lane still decides who drains first (QP-4).
+			priority:
+				options.priority ??
+				sessionActionPriorityFor({ source: "interactive", agentMessageId: options.agentMessageId }),
 		});
 	}
 
@@ -8719,10 +8788,22 @@ export class AgentSession {
 									}
 								: {}),
 						};
+			const primaryMessage =
+				payload.kind === "turn" ? payload.records.find((record) => record.role === "primary")?.message : undefined;
 			return {
 				id: recovered.id,
 				source: recovered.source,
 				delivery: recovered.delivery,
+				// Snapshots written before #2334 carry no priority: re-derive it from the
+				// recorded source and envelope. Restored actions replay in stored order
+				// (placement "tail"), so this only matters once new input joins the queue.
+				priority:
+					recovered.priority ??
+					sessionActionPriorityFor({
+						source: recovered.source,
+						message: primaryMessage,
+						agentMessageId: recovered.agentMessageId,
+					}),
 				wake: recovered.wake,
 				payload,
 				lifecycle: { state: "queued" },
@@ -8761,6 +8842,9 @@ export class AgentSession {
 			this._createSessionCommandAction(text, customMessage.details.command, images, schedule, {
 				agentMessageId,
 				source: "internal",
+				// A session slash command is a person's command; the restore path rewrites the
+				// recorded source to "internal", so the source cannot vouch for it here.
+				priority: "user",
 			}),
 			{ restore: true },
 		).accepted;
@@ -8774,6 +8858,14 @@ export class AgentSession {
 			message: snapshot.customMessage,
 			prefixMessages: snapshot.prefixMessages,
 			source: "internal",
+			// The parked-queue snapshot records source "internal" for input a person typed, so
+			// the source gets no vote here: the message envelope decides. No envelope means a
+			// parked human prompt (machine traffic always carries a custom message), and an
+			// agent/heartbeat/digest envelope classifies as machine traffic.
+			priority: sessionActionPriorityFor({
+				message: snapshot.customMessage,
+				agentMessageId: snapshot.agentMessageId,
+			}),
 			// The snapshot already captured this action, so admission-pause leases
 			// (QP-2, r39) must not refuse the restore; coalesce still dedupes it.
 			admissionPauseExempt: true,
@@ -8960,6 +9052,7 @@ export class AgentSession {
 			suppressAutonomousContinuation?: boolean;
 			resumeIfIdle?: boolean;
 			source?: InputSource | "internal";
+			priority?: SessionActionPriority;
 			executionPolicy?: TurnExecutionPolicy;
 			queueVisible?: boolean;
 			acceptedAgentMessage?: boolean;
@@ -8998,6 +9091,8 @@ export class AgentSession {
 			id,
 			source,
 			delivery: this._deliveryPolicy(schedule),
+			priority:
+				options.priority ?? sessionActionPriorityFor({ source, message, agentMessageId: options.agentMessageId }),
 			wake:
 				options.resumeIfIdle === true
 					? "immediate"
@@ -9020,6 +9115,7 @@ export class AgentSession {
 		options: {
 			agentMessageId?: string;
 			source?: InputSource | "internal";
+			priority?: SessionActionPriority;
 		} = {},
 	): QueuedSessionAction {
 		const source = options.source ?? "internal";
@@ -9027,6 +9123,7 @@ export class AgentSession {
 			id: randomUUID(),
 			source,
 			delivery: this._deliveryPolicy(schedule),
+			priority: options.priority ?? sessionActionPriorityFor({ source, agentMessageId: options.agentMessageId }),
 			wake: "immediate",
 			payload: { kind: "session_command", text, command, images },
 			lifecycle: { state: "queued" },
@@ -9172,8 +9269,14 @@ export class AgentSession {
 		const canStartImmediately =
 			options.immediatelyEligible === true &&
 			(this._actionStore.unfinishedActions().length === 0 || options.front === true);
-		if (options.front) this._actionStore.enqueueFront(action);
-		else this._actionStore.enqueue(action);
+		// A restore replays the order it was persisted in, so priority must not reorder it;
+		// everything else joins the lane at its priority slot (#2334, lane-scoped by QP-4).
+		const placement: SessionActionPlacement = options.front
+			? "front"
+			: options.restore || options.preserveOrder
+				? "tail"
+				: "priority";
+		this._actionStore.enqueue(action, placement);
 		let disposition: "starts_when_admitted" | "queued" = "queued";
 		if (canStartImmediately && this._actionStore.selectFirst() === action) disposition = "starts_when_admitted";
 		const controller = this._actionStore.ticketFor(action);
@@ -9216,6 +9319,7 @@ export class AgentSession {
 			suppressAutonomousContinuation?: boolean;
 			resumeIfIdle?: boolean;
 			source?: InputSource | "internal";
+			priority?: SessionActionPriority;
 			/** A manifest restore re-admits captured work; pause leases do not refuse it. */
 			admissionPauseExempt?: boolean;
 			preserveOrder?: boolean;
@@ -10280,6 +10384,7 @@ export class AgentSession {
 				id: action.id,
 				source: action.source,
 				delivery: action.delivery,
+				priority: action.priority,
 				wake: action.wake,
 				...(action.queueKey ? { queueKey: action.queueKey } : {}),
 				...(action.agentMessageId ? { agentMessageId: action.agentMessageId } : {}),

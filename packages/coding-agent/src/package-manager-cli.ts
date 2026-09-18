@@ -796,6 +796,9 @@ function isSessionActionRecoveryAction(value: unknown): value is SessionActionRe
 		typeof value.source !== "string" ||
 		(value.delivery !== "next_turn_boundary" && value.delivery !== "when_run_idle") ||
 		(value.wake !== "immediate" && value.wake !== "on_lower_boundary" && value.wake !== "external_resume") ||
+		// Optional for snapshots written before #2334; an unknown value is a corrupt
+		// snapshot, not a default: refuse it instead of guessing a queue priority.
+		(value.priority !== undefined && !isStringEnum(value.priority, ["pinned", "user", "background"])) ||
 		!isRecord(value.payload) ||
 		typeof value.payload.text !== "string" ||
 		(value.payload.images !== undefined &&
