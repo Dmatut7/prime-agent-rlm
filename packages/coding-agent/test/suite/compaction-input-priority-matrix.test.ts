@@ -1264,8 +1264,12 @@ describe("compaction x input-class admission matrix", () => {
 		expect(preflight.success).toBe(true);
 		expect(preflight.queued).toBe(true);
 		// Not gated: human input queues through ordinary busy-queueing, so the reason a
-		// child reply gets must not appear here. The stand-down the gate's own comment
-		// calls unreachable from the agent channel is observable on this side of it.
+		// child reply gets must not appear here. The same-window positive control for that
+		// reading - a child reply admitted into an identical in-flight window does get
+		// `compaction_pending` - is `2334-human-priority-lane-scoped.test.ts`; the
+		// agent-channel rows above carry it for both compaction states. The stand-down the
+		// gate's own comment calls unreachable from the agent channel is observable on this
+		// side of it.
 		expect(preflight.reason).toBeUndefined();
 		expect(harness.session.getSteeringMessages()).toEqual([HUMAN_PROMPT]);
 		// Human priority is an ordering fact, not a preemption: the admission does not
