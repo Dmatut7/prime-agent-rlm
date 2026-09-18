@@ -206,7 +206,8 @@ TS  top-6: mem_quantum_annealing, mem_quantum_harness, mem_quantum_session, tie_
 PY  top-6: mem_quantum_harness, mem_quantum_session, mem_quantum_annealing, tie_beta, tie_gamma, tie_alpha
 ```
 ⇒ **同一 state 同一 query，两侧「模型看到的 6 条」完全不同**（既有同分三胞胎的序差，也有上面那组 3 条同分 quantum 行的序差）。这条不是数值细节，是可见面差。
-判定：**故意分歧，母席已裁不对齐**（TS=渲染确定性/前缀缓存；PY=交互查询的新鲜度）。两侧各自的既有针也锁着这条：`refinement.test.ts:1789`（`breaks score ties by stable identifier order, not recency`）、`refinement.test.ts:1912-1948`（参考比较器写死 identifier 序）、`test_harness.py:1459-1484`（`test_search_orders_by_score_then_recency_then_identity`）。本席新针与它们同向，不冲突。
+判定：**故意分歧，母席已裁不对齐**（TS=渲染确定性/前缀缓存；PY=交互查询的新鲜度）。
+**但 TS 这条平手键本身有一处环境依赖，见 §9 的顺带发现**：`localeCompare` 没传 locale，非 ASCII 排序键的序会随进程 ICU locale 变（实测 zh_CN 与 en_US 相反），而它被选中的理由正是「渲染确定性」。两侧各自的既有针也锁着这条：`refinement.test.ts:1789`（`breaks score ties by stable identifier order, not recency`）、`refinement.test.ts:1912-1948`（参考比较器写死 identifier 序）、`test_harness.py:1459-1484`（`test_search_orders_by_score_then_recency_then_identity`）。本席新针与它们同向，不冲突。
 钉：TS 针 `holds the identifier tie-break…`；PY 针 `test_ties_fall_back_to_recency_which_the_ts_face_deliberately_does_not`。
 
 ### 附：top-k 参数面（不是分歧）
@@ -353,3 +354,39 @@ G8/G9 是「分歧被抹平也要红」的针：它们证明分歧针不是恒�
 - **全零 kind 的渲染面与 ranked 标记**：归 OBS-1（fix-perf-digest-2 item46，`/tmp/fixL3a-delivery/item46/000{1,2}-*.patch`，base `4c6623868`）。本仪器的 TS 驱动在「该 kind 全零分」时把 `digest_window` 记成 `null` 并写明让面理由，两侧针都不断言零分行的位置、不断言标记有无。
 - **`rankHarnessEntriesWithRelevance`**：OBS-1 新增且**不导出**。需要「这个 kind 是不是全零分」这个事实时，用已导出的 `scoreHarnessEntryForQuery` + `harnessQueryTermIdf` 自算（本席针与驱动都是这么做的），不为拿这个事实去改导出面。
 - **打分公式本身**：本席未改 `refinement.ts` / `harness.py` 一个字（母席硬纪律）。§3 的六条分歧一律「只钉不修」；要修哪条，先按 §3 的判定走裁定。
+
+---
+
+## 9. 顺带发现（不在本条目面内，**只报不修**，交母席裁）
+
+### OBS-E1：TS 侧 5 处 `localeCompare` 都没传 locale ⇒ digest 的**序与指纹**随进程 locale 变
+
+**现象（实测，node v22.22.0，同机同串只改环境）**：
+
+| 比较 | `LC_ALL=en_US.UTF-8` | `LC_ALL=C` | `LC_ALL=zh_CN.UTF-8` |
+|---|---|---|---|
+| `"修复顺序".localeCompare("登录超时")` | `-1` | `-1` | **`+1`** |
+| `"登录".localeCompare("修复")` | `+1` | `+1` | **`-1`** |
+| `"登录".localeCompare("世界")` | `+1` | `+1` | **`-1`** |
+| `"general\0修复顺序\0mem_fix_order"` vs `"general\0登录超时\0mem_login_timeout"`（`rankedIdentifier` 形状） | `-1` | `-1` | **`+1`** |
+
+（`LC_ALL=C` 时 Node 的 ICU 解析成 `en-US`，所以「C 与 en_US 同」不代表 locale 无关；探针脚本与三份原始输出见 `/tmp/L3a/children/e-probe/locale-probe{,2}.mjs`、`locale-*.log`。）
+
+**触碰面（全部在 `refinement.ts`，本席禁区，一个字未动）**：
+- `:1011` ranked 平手键 `rankedIdentifier(x).localeCompare(rankedIdentifier(y))`，键含 **title**（模型写的，中文常态）；注释 `:1008-1010` 明写选它是为了不再扫全文，而 `:1025-1028` 的 docstring 明写「break score ties on stable identifier order, never recency」，`compareEntriesForInjection` 的注释 `:367-370` 更直说理由是「an ordering that drifts between turns would invalidate the prompt cache」。
+- `:373/:377/:381` 默认注入序（recency → id → scope），**无查询词的普通会话每一回合都走这条**；id 可以是中文：`harness.py:46-49 _slug` 用 `ch.isalnum()` 过滤，而中文字符 `isalnum()` 为真 ⇒ 实测 `_slug("登录故障") == "登录故障"`、`_slug("世界书") == "世界书"`（不显式给 id 时由标题生成）。
+- `:1195` `harnessDigestFingerprint` 的 material 排序键 `[scope, kind, id].join("\0").localeCompare(...)`。
+
+**两个后果（都可复现，未在生产验证）**：
+1. **digest 字节漂**：两条同分（或同 `updated_at`）且排序键首次在非 ASCII 处分岔的条目，在 zh_CN 进程下与 en_US 进程下**顺序相反** ⇒ 同一 harness state 渲染出不同字节 ⇒ prompt 前缀缓存失效（这正是 `:367-370` 注释要避免的事）。
+2. **digest 重复交付**：`:1195` 的排序也随 locale 变 ⇒ 同一 state 的**指纹不同** ⇒ `_harnessDigestIsFresh` 判为不新鲜 ⇒ 冷边界重新追加一条 carrier（内容可能与上一条只有顺序差）。
+
+**触发条件（窄但真实）**：需要「排序键含非 ASCII」+「同分或同时间戳」+「两次渲染的进程 locale 不同」。本机 boss 环境是中文 locale 可得的（`LANG=zh_CN.UTF-8` 一设即触发），daemon 与其 worker 的 locale 由启动环境继承，重启/换 shell/换 launchd 都可能变。
+
+**建议修法（不属本席面，需母席裁 + 与 item46 的独占面协调）**：把 5 处比较换成 locale 无关的形式——`localeCompare(other, "en")`（或复用一个 `new Intl.Collator("en")`，比每次 `localeCompare` 快）、或直接 code-point 比较（`a < b ? -1 : a > b ? 1 : 0`）。**注意**：任何一种都会移动现有平手序 ⇒ 会打红 `refinement.test.ts:1789`（`breaks score ties by stable identifier order, not recency`）、`:1912-1948`（参考比较器写死 identifier 序）与本席 `tie_window` 那枚针的金标准，属「有意改口径」，必须走裁定而不是顺手改。
+
+**本席面的自保（已做）**：夹具的平手组 identifier 全为 ASCII（`tie_alpha/beta/gamma` 同 path 同 title，只差 id 后缀），`weights` case 里唯一一对含中文标题的正分平手（`mem_session_ledger` vs `mem_cjk_login_session`）在 identifier 的 ASCII 前缀（`docs/…` vs `notes`）就分出胜负、不落到中文；仪器与两侧针在 `LC_ALL=en_US.UTF-8 / zh_CN.UTF-8 / C` 三种 locale 下**各自全绿**（TS 13 passed ×3、PY 11 OK ×3、仪器 92 checks 0 failure ×3）。仪器**不记录零分尾序**（零分区只由 `localeCompare` 决定，是唯一真正 locale 敏感的区），只记录零分行的**集合**；参考面的 TS 全序同样只存正分前缀。
+
+### OBS-E2：母席公式对读表的一处机制更正（已认账）
+
+见 §3③：非字符串字段那条不是「Python 会 `str()` 出 123/none」。`_search_field`（`harness.py:125-128`）对非字符串**同样返回空串**，与 TS 的 `searchableField`（`refinement.ts:828-830`）对称；真分歧只有两处：identifier「先拼后归一」（`harness.py:149`）与 loader 把非字符串 `path` 兜底成 `"general"`（`harness.py:541-542`）。
