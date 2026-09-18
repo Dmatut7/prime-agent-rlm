@@ -864,6 +864,41 @@ describe("#2098 static system prompt with an in-context harness digest", () => {
 		expect(llmText.indexOf("# Continual Harness State")).toBeLessThan(llmText.indexOf("The branch summary text."));
 	});
 
+	it("ranks the digest window by relevance to the current wording (#2241 phase-2 wiring)", async () => {
+		// The distinctive entry is seeded FIRST (oldest) and named to sort last, so
+		// the no-query injection order (recency desc, then id) drops it from the
+		// six-slot window: its appearance later can only be the ranking's doing.
+		seedEntry("memory", "zz_distinctive", "Quantum annealing note", "Only quantum annealing matters.");
+		for (let i = 0; i < 6; i += 1) {
+			seedEntry("memory", `generic_${i}`, `Generic note ${i}`, "Neutral material about tea varieties.");
+		}
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("ack one")]);
+		await harness.session.prompt("tell me about quantum annealing");
+		const first = digestMessages(harness.session.messages);
+		expect(first).toHaveLength(1);
+		// The first turn's digest is built before the user message lands, so its
+		// terms are empty and the window is the plain injection order.
+		expect(getMessageText(first[0] as CustomMessage)).not.toContain("[global:zz_distinctive]");
+
+		// A state change (another seat's write) triggers a material-change delta.
+		// Its terms come from the committed conversation - the current turn's
+		// wording lands too late, so turn one's quantum wording is what ranks
+		// this window (same lag upstream #2241 accepted): the distinctive entry
+		// enters and the overflow names the ranking.
+		seedEntry("memory", "aa_new", "Fresh note", "Written mid-session.");
+		harness.setResponses([fauxAssistantMessage("ack two")]);
+		await harness.session.prompt("a follow-up about tea");
+		const digests = digestMessages(harness.session.messages);
+		expect(digests).toHaveLength(2);
+		const delta = getMessageText(digests[1] as CustomMessage);
+		expect(delta).toContain("[global:zz_distinctive]");
+		expect(delta).toContain("(entries ranked by relevance to the current task; see harness.search)");
+		// Append-only still holds: the first carrier is untouched.
+		expect(getMessageText(first[0] as CustomMessage)).not.toContain("[global:zz_distinctive]");
+	});
+
 	it("renders the same harness state byte-identically on every call", async () => {
 		seedEntry("memory", "seed_i", "Seed I", "Determinism fixture.");
 		const options = { includeIpythonExamples: true, includeShellExamples: true, includeRefineExamples: true };
