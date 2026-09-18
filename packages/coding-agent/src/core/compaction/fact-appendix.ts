@@ -180,7 +180,6 @@ export function factKey(kind: FactKind, value: string): string {
 /* Extraction                                                                  */
 /* -------------------------------------------------------------------------- */
 
-const FULL_SHA_PATTERN = /(?<![0-9a-fA-F])[0-9a-f]{40}(?![0-9a-fA-F])/g;
 const SHORT_SHA_PATTERN = /(?<![0-9a-fA-F-])([0-9a-f]{7,10})(?![0-9a-fA-F-])/g;
 const GIT_CONTEXT_PATTERN =
 	/\b(?:commit|commits|sha|head|revert|cherry-pick|checkout|merge|rebase|push|tag|blame|bisect|archive|reset|show|diff|rev-parse|git)\b/i;
@@ -273,12 +272,42 @@ function clipContext(source: string, index: number): string {
 		.trim();
 }
 
-function extractShas(text: string, out: RawFact[], prose: boolean): void {
-	for (const match of text.matchAll(FULL_SHA_PATTERN)) {
-		const value = match[0].toLowerCase();
-		out.push({ kind: "sha", value, key: value });
+/**
+ * Whether a character code is a hex digit in either case: [0-9], [a-f] or [A-F].
+ */
+function isHexDigit(code: number): boolean {
+	return (
+		(code >= 0x30 && code <= 0x39) || // 0-9
+		(code >= 0x61 && code <= 0x66) || // a-f
+		(code >= 0x41 && code <= 0x46) // A-F
+	);
+}
+
+function extractShas(text: string, lines: readonly string[], out: RawFact[], prose: boolean): void {
+	// A FULL_SHA_PATTERN match is exactly a maximal hex-digit run of length 40 whose
+	// characters are all [0-9a-f]: the lookarounds force the match to span the whole
+	// run, and any A-F lengthens the run past what [0-9a-f]{40} can cover, so scanning
+	// maximal runs emits the same SHAs without a match object per SHA.
+	let index = 0;
+	while (index < text.length) {
+		if (!isHexDigit(text.charCodeAt(index))) {
+			index++;
+			continue;
+		}
+		const runStart = index;
+		let uppercase = false;
+		while (index < text.length) {
+			const code = text.charCodeAt(index);
+			if (!isHexDigit(code)) break;
+			if (code >= 0x41 && code <= 0x46) uppercase = true;
+			index++;
+		}
+		if (index - runStart === 40 && !uppercase) {
+			const value = text.slice(runStart, index);
+			out.push({ kind: "sha", value, key: value });
+		}
 	}
-	for (const line of splitReportLines(text)) {
+	for (const line of lines) {
 		// An abbreviated hash in prose somebody wrote is a commit; the same token in a
 		// log is usually an id fragment. Only prose gets to skip the git-context test.
 		if (!prose && !GIT_CONTEXT_PATTERN.test(line)) continue;
@@ -418,8 +447,8 @@ function splitReportLines(text: string): string[] {
 	return text.split(/\n|\\n/);
 }
 
-function extractErrors(text: string, out: RawFact[]): void {
-	for (const rawLine of splitReportLines(text)) {
+function extractErrors(lines: readonly string[], out: RawFact[]): void {
+	for (const rawLine of lines) {
 		if (!ERROR_LINE_PATTERN.test(rawLine)) continue;
 		const line = rawLine.replace(/^\s*(?:\[[^\]]{0,60}\]\s*)+/, "").trim();
 		if (line.length < 10) continue;
@@ -444,10 +473,15 @@ function extractIssues(text: string, out: RawFact[]): void {
 export function extractFactsFromText(text: string, options?: { prose?: boolean }): RawFact[] {
 	const out: RawFact[] = [];
 	if (!text) return out;
-	extractShas(text, out, options?.prose ?? false);
+	// extractShas and extractErrors walk the same line decomposition, so the lines are
+	// split once here and passed to both. Each pass only reads the array and still runs
+	// at its original position in the sequence, so every fact and their order in `out`
+	// are unchanged; only the second full line-array allocation per text is gone.
+	const lines = splitReportLines(text);
+	extractShas(text, lines, out, options?.prose ?? false);
 	extractPaths(text, out);
 	extractNumbers(text, out);
-	extractErrors(text, out);
+	extractErrors(lines, out);
 	extractIssues(text, out);
 	return out;
 }
