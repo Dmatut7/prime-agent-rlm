@@ -202,7 +202,7 @@
 **P3 承重四件**：agent-session → session-manager → repl-manager → daemon-supervisor，**每文件单一席位持牌**，裁法照 §2.3；每件完成后跑该包全量+pristine-tree tsgo。
 **P4 删除面与生成物**：44 个 UD 逐个裁；models.generated 走 §2.4 流程；package-lock 重装生成。
 **P5 协议与版本**：schema 取号 38、digest 重算与钉死测试更新、compat 矩阵测试补齐；版本是否跟到 0.9.5 单独决策（见 §4）。
-**每阶段出口**：全量分片绿 + kernel/machine-wide/python 三专 job 绿 + pristine tsgo EXIT 0 + 对账三表无意外差异（见 §6）。**并执行 AGENTS.md 合并纪律四条**：禁 amend/force-push（补内容一律新提交）、提交一律 `git commit --only -- <paths>` 点名、**冲突回执表逐块记录（块号/取谁/理由/翻回把手；承重四件 99 块优先）落审查报告**、钩子红时等绿窗且任何情况禁 `--no-verify`（冻结期别席 WIP 会让全仓检查变红）。
+**每阶段出口**：全量分片绿 + kernel/machine-wide/python/process-smoke 四专 job 绿 + pristine tsgo EXIT 0 + 对账三表无意外差异（见 §6）。**并执行 AGENTS.md 合并纪律四条**：禁 amend/force-push（补内容一律新提交）、提交一律 `git commit --only -- <paths>` 点名、**冲突回执表逐块记录（块号/取谁/理由/翻回把手；承重四件 99 块优先）落审查报告**、钩子红时等绿窗且任何情况禁 `--no-verify`（冻结期别席 WIP 会让全仓检查变红）。
 
 ---
 
@@ -223,7 +223,7 @@
 2. `npm run check`（biome+tsgo+installer+browser-smoke+ci-honesty）。
 3. 单文件/包级 vitest（净化环境 `env -u RLM_*`）；**packages/tui 走 `node --test --import tsx test/*.test.ts`，无 vitest JSON**（其 vitest include 仅 wrap-ansi）。
 4. 全量三片（`test:ci`，注意排除项清单见 05 §1.2）。
-5. 三专 job：kernel（**collected 数必须取真实 run 的 JSON，不能取 `vitest list`**——别名 describe 在 list/run 判定不一致，实测探针在 /tmp/mdi-05/p4-*.json；**kernel 没有手动重启命令**，command-registry 无 kernel 子命令，只能随 daemon 重启）、machine-wide（**共享工作站禁跑**，它会 reap 同机其它 supervisor 并 kill 本机 daemon）、runtime python。
+5. **四专 job**：kernel（**collected 数必须取真实 run 的 JSON，不能取 `vitest list`**——别名 describe 在 list/run 判定不一致，实测探针在 /tmp/mdi-05/p4-*.json；**kernel 没有手动重启命令**，command-registry 无 kernel 子命令，只能随 daemon 重启）、machine-wide（**共享工作站禁跑**，它会 reap 同机其它 supervisor 并 kill 本机 daemon）、runtime python、**process smoke**（`npm run check:process-smoke`＝`scripts/check-process-smoke.sh`：CI job `test:process` 的本地同形镜像，四步＝跑 `test:process` 出 JSON → 逐文件 collected/ran/passed/failed/skipped 台账 → `check-vitest-coverage.mjs --min-tests 20 --min-ran-tests 11 --max-nothing-files 1` → `check-tag-skip-ledger.sh` 对账 8+4；带 `--self-test` 与 `--with-stress`。**这一面必须本地跑**：`test:ci` 有 11 个 `--exclude`、第一个就是 `daemon-supervisor-process.test.ts`，本地阶梯原先只镜像三专 job ⇒ 该文件两套本地口径都不在场、NEW-RED=0 对它零信息，2026-09-18 的 process smoke CI 红就是这么漏的。地板数与 ledger 串抄自 `.github/workflows/ci.yml` 原文，改口径要同批改两处）。
 6. 纯净树 tsgo（`git archive HEAD | tar -x` + symlink node_modules + `tsgo --noEmit`，EXIT 必须 0）——冻结窗口没有钩子保底时，**这是唯一能证明"这批提交自洽"的机器门**（半提交对 pre-commit 钩子免疫）。
 7. 真机手测 10 条（入口清单见 `/tmp/merge-doc-inputs/05c-manual-test-entrypoints.md`）。**前置：手测前必须 build 或 `./prime-agent.sh` 并重启 daemon**——`prime-agent` 跑的是 bundle 不是工作树（05c 实测两个 buildId 不同）。
 8. CI 期望：全 job 绿；`scripts/latest-ci-run.sh --require-success` 问 GitHub 拿结论（不许凭记忆说绿）。
