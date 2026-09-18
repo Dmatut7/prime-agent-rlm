@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import type { QueuedMessageMutation } from "../src/core/session-action-store.js";
+import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
 import type { AgentConnectionSessionEvent } from "../src/modes/agent-connection/index.js";
+import type { DaemonTransportClient } from "../src/modes/daemon/daemon-client.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { QueueSelection } from "../src/modes/interactive/queue-selection.js";
 
@@ -596,22 +598,124 @@ describe("interactive queued-message editing", () => {
 	});
 });
 
-describe("interactive interrupt preserves the queue", () => {
-	it("aborts without clearing or restoring queued messages", () => {
-		const abort = vi.fn(async () => {});
-		const harness = {
+describe("interactive interrupt sends the queued messages", () => {
+	/**
+	 * This describe replaced a pin on the pre-#2426 behaviour ("aborts without clearing or
+	 * restoring queued messages", harness offering `abort` only). Upstream e2fb7bfa1 changed the
+	 * Esc call site and that pin in the same commit; the merge took the src half of every other
+	 * file in it and resolved this hunk back to `abort()`, which left `abort_and_send_queued`
+	 * with zero producers in the shipping path while CHANGELOG.md 0.10.0 advertised it (final-review seat B,
+	 * B3-01/B3-02). The conflict is resolved in the open, in the direction the merge document
+	 * already ruled (#2426 移植, merge-upstream-20260917.md §3.1): the interrupt sends the queue,
+	 * the draft is still untouched, and a daemon too old for the command says so on screen.
+	 */
+	function createInterruptHarness(agentConnection: unknown) {
+		return {
 			traceUploadAllAbortController: undefined,
 			sideQuestionEvent: undefined,
 			getRetryAttempt: () => 0,
 			isAgentCompacting: () => false,
 			isBashRunning: () => false,
 			isAgentStreaming: () => true,
-			agentConnection: { abort },
+			agentConnection,
 			showError: vi.fn(),
+			showWarning: vi.fn(),
 			editor: { getText: () => "", setText: vi.fn() },
 		};
-		(proto.interruptOrClearInput as (this: unknown) => void).call(harness);
-		expect(abort).toHaveBeenCalledOnce();
+	}
+
+	/**
+	 * A daemon transport that records the commands the connection writes. `capabilities` is what
+	 * the peer advertises in its hello; `unknownCommand` makes it answer the way a peer whose
+	 * capability list is newer than its command table does - it does not know that one command,
+	 * while every other command (including the fallback abort) still works.
+	 */
+	function fakeDaemonTransport(options: { capabilities: readonly string[]; unknownCommand?: boolean }) {
+		const requests: string[] = [];
+		const client = {
+			hello: undefined,
+			isConnected: true,
+			supportsServerCapability: (capability: string) => options.capabilities.includes(capability),
+			onMessage: () => () => {},
+			onClose: () => () => {},
+			request: async (command: { type: string }) => {
+				requests.push(command.type);
+				return options.unknownCommand === true && command.type === "abort_and_send_queued"
+					? {
+							type: "response",
+							command: command.type,
+							success: false,
+							error: `Unknown daemon command: ${command.type}`,
+						}
+					: { type: "response", command: command.type, success: true };
+			},
+		} as unknown as DaemonTransportClient;
+		return { requests, client };
+	}
+
+	const interrupt = (harness: unknown) => (proto.interruptOrClearInput as (this: unknown) => void).call(harness);
+
+	it("aborts by sending the queued messages instead of leaving them for the next submit", () => {
+		const abort = vi.fn(async () => {});
+		const abortAndSendQueued = vi.fn(async () => ({}));
+		const harness = createInterruptHarness({ abort, abortAndSendQueued });
+		interrupt(harness);
+		expect(abortAndSendQueued).toHaveBeenCalledOnce();
+		expect(abort).not.toHaveBeenCalled();
 		expect(harness.editor.setText).not.toHaveBeenCalled();
+		expect(harness.showWarning).not.toHaveBeenCalled();
+		expect(harness.showError).not.toHaveBeenCalled();
+	});
+
+	it("puts abort_and_send_queued on the daemon wire from the interrupt key", async () => {
+		// Cross-layer on purpose: the real interrupt method over the real daemon adapter, so
+		// "the Esc path produces this command" is a claim about the shipping call graph and not
+		// about a mock shaped to match it (the zero-producer hole B3-01 found was exactly the
+		// difference between those two).
+		const { requests, client } = fakeDaemonTransport({ capabilities: ["abort_and_send_queued"] });
+		const harness = createInterruptHarness(new DaemonAgentConnection(client, "active-1"));
+		interrupt(harness);
+		await vi.waitFor(() => expect(requests).toEqual(["abort_and_send_queued"]));
+		expect(harness.showWarning).not.toHaveBeenCalled();
+		expect(harness.showError).not.toHaveBeenCalled();
+	});
+
+	it("warns the user when the daemon cannot send the queued messages with the interrupt", async () => {
+		// Degradation is loud (P5 ruling, merge-upstream-20260917.md §13.4). A log line is not a
+		// notice: without this the queued words silently wait for the next submit and the person
+		// who pressed Esc retypes them (final-review seat B, B3-04).
+		const { requests, client } = fakeDaemonTransport({ capabilities: [] });
+		const harness = createInterruptHarness(new DaemonAgentConnection(client, "active-1"));
+		interrupt(harness);
+		await vi.waitFor(() => expect(requests).toEqual(["abort"]));
+		await vi.waitFor(() => expect(harness.showWarning).toHaveBeenCalledOnce());
+		expect(harness.showWarning.mock.calls[0]?.[0]).toContain("queued messages stay queued");
+		expect(harness.showError).not.toHaveBeenCalled();
+	});
+
+	it("warns the user when the daemon answers Unknown daemon command", async () => {
+		const { requests, client } = fakeDaemonTransport({
+			capabilities: ["abort_and_send_queued"],
+			unknownCommand: true,
+		});
+		const harness = createInterruptHarness(new DaemonAgentConnection(client, "active-1"));
+		interrupt(harness);
+		await vi.waitFor(() => expect(requests).toEqual(["abort_and_send_queued", "abort"]));
+		await vi.waitFor(() => expect(harness.showWarning).toHaveBeenCalledOnce());
+		expect(harness.showError).not.toHaveBeenCalled();
+	});
+
+	it("reports a failed interrupt as an error, not as a degradation", async () => {
+		// The other half of the same face: a real failure must still reach showError, or the new
+		// warn branch would have swallowed it.
+		const failing = {
+			abortAndSendQueued: async () => {
+				throw new Error("connection is closed");
+			},
+		};
+		const harness = createInterruptHarness(failing);
+		interrupt(harness);
+		await vi.waitFor(() => expect(harness.showError).toHaveBeenCalledWith("connection is closed"));
+		expect(harness.showWarning).not.toHaveBeenCalled();
 	});
 });

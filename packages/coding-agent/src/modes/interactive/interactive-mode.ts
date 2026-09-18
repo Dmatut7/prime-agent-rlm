@@ -7397,11 +7397,25 @@ export class InteractiveMode {
 			void this.agentConnection.abortBash().catch(() => undefined);
 		}
 		if (this.isAgentStreaming()) {
-			// The queue is preserved server-side; draining resumes on the next
-			// submit or queued-message edit.
-			void this.agentConnection.abort().catch((error) => {
-				this.showError(error instanceof Error ? error.message : String(error));
-			});
+			// Upstream #2426: the interrupt carries the queued steering messages out with it, so
+			// "stop - and here is what I meant instead" is one key press instead of an interrupt
+			// plus a resubmit. The queue is still preserved server-side, and a daemon too old for
+			// the command aborts only and reports why through `degraded`: the queued messages then
+			// wait for the next submit, which the user is told about instead of being left to
+			// conclude the interrupt swallowed their words (P5 ruling,
+			// docs/fork/merge-upstream-20260917.md §13.4).
+			void this.agentConnection
+				.abortAndSendQueued()
+				.then((result) => {
+					if (result.degraded !== undefined) {
+						this.showWarning(
+							"The daemon is running an older build without abort_and_send_queued: interrupted, and the queued messages stay queued until the next submit.",
+						);
+					}
+				})
+				.catch((error) => {
+					this.showError(error instanceof Error ? error.message : String(error));
+				});
 		}
 	}
 
