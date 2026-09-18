@@ -24,6 +24,7 @@ export interface AppKeybindings {
 	"app.configuration.previousTab": true;
 	"app.configuration.exit": true;
 	"app.tools.expand": true;
+	"app.tools.expandFull": true;
 	"app.messages.expand": true;
 	"app.edits.expand": true;
 	"app.thinking.toggle": true;
@@ -96,6 +97,11 @@ export const KEYBINDINGS = {
 	"app.configuration.previousTab": { defaultKeys: "shift+tab", description: "Select previous configuration tab" },
 	"app.configuration.exit": { defaultKeys: "ctrl+c", description: "Exit configuration selector" },
 	"app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output", defaultKeyScope: "editor" },
+	"app.tools.expandFull": {
+		defaultKeys: "alt+o",
+		description: "Show tool output in full (ignore the expanded render budget)",
+		defaultKeyScope: "editor",
+	},
 	"app.messages.expand": {
 		defaultKeys: "ctrl+p",
 		description: "Toggle agent message expansion",

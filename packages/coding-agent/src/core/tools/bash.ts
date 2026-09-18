@@ -10,7 +10,12 @@ import {
 } from "@earendil-works/pi-tui";
 import { spawn } from "child_process";
 import { type Static, Type } from "typebox";
-import { expandCollapseHint } from "../../modes/interactive/components/keybinding-hints.js";
+import { expandCollapseHint, keyHint } from "../../modes/interactive/components/keybinding-hints.js";
+import {
+	expandedOutputSkippedDetail,
+	expandedOutputWindow,
+	toolOutputFull,
+} from "../../modes/interactive/components/tool-output-budget.js";
 import type { VisualTruncateResult } from "../../modes/interactive/components/visual-truncate.js";
 import { theme, themeToken } from "../../modes/interactive/theme/theme.js";
 import { waitForChildProcess } from "../../utils/child-process.js";
@@ -664,8 +669,11 @@ type BashResultRenderState = {
 	cachedExpandedOutput: string | undefined;
 	cachedExpandedWidth: number | undefined;
 	cachedExpandedLines: string[] | undefined;
-	/** Theme the cached expanded lines were styled with. */
+	/** Identity of everything else that shapes those lines: theme, shortcuts, budget mode, hint. */
 	cachedExpandedTheme: unknown;
+	cachedExpandedKeybindings: unknown;
+	cachedExpandedFull: boolean | undefined;
+	cachedExpandedHint: boolean | undefined;
 };
 
 class BashResultRenderComponent extends Container {
@@ -679,6 +687,9 @@ class BashResultRenderComponent extends Container {
 		cachedExpandedWidth: undefined,
 		cachedExpandedLines: undefined,
 		cachedExpandedTheme: undefined,
+		cachedExpandedKeybindings: undefined,
+		cachedExpandedFull: undefined,
+		cachedExpandedHint: undefined,
 	};
 }
 
@@ -743,16 +754,30 @@ function bashPreviewTail(lines: string[], maxVisualLines: number, width: number)
 	};
 }
 
+/** Bracketed shortcut hint for the block tail, matching expandCollapseHint's shape. */
+function showAllHint(): string {
+	return `${theme.fg("dim", "(")}${keyHint("app.tools.expandFull", "for full output")}${theme.fg("dim", ")")}`;
+}
+
 /**
  * The cached expanded lines, when they still describe what a render would produce.
  * Every part of the key is an identity or value compare - no color is resolved here,
- * because this runs for every block on every frame.
+ * because this runs for every block on every frame, and the shortcut text (keybindings
+ * are user-configurable) is only rebuilt on a miss.
  */
-function cachedExpandedLines(state: BashResultRenderState, output: string, width: number): string[] | undefined {
+function cachedExpandedLines(
+	state: BashResultRenderState,
+	output: string,
+	width: number,
+	showExpandHint: boolean,
+): string[] | undefined {
 	const holds =
 		state.cachedExpandedOutput === output &&
 		state.cachedExpandedWidth === width &&
-		state.cachedExpandedTheme === themeToken();
+		state.cachedExpandedTheme === themeToken() &&
+		state.cachedExpandedKeybindings === getKeybindings() &&
+		state.cachedExpandedFull === toolOutputFull() &&
+		state.cachedExpandedHint === showExpandHint;
 	return holds ? state.cachedExpandedLines : undefined;
 }
 
@@ -763,13 +788,23 @@ function collapsedPreviewHint(skipped: number, showExpandHint: boolean): string 
 		: theme.fg("muted", `... (${skipped} earlier lines)`);
 }
 
-/** The expanded body: the whole output, styled and wrapped exactly like before. */
-function bashExpandedLines(output: string, width: number): string[] {
-	const styledOutput = output
-		.split("\n")
-		.map((line) => theme.fg("toolOutput", line))
-		.join("\n");
-	return new Text(`\n${styledOutput}`, 0, 0).render(width);
+/**
+ * The expanded body: the budget window of the output (tool-output-budget.ts), styled
+ * and wrapped exactly like the unbounded view did, plus - when the budget held
+ * something back - the line that says how much and how to see all of it.
+ */
+function bashExpandedLines(output: string, width: number, showExpandHint: boolean): string[] {
+	const window = expandedOutputWindow(output.split("\n"));
+	const styledOutput = window.lines.map((line) => theme.fg("toolOutput", line)).join("\n");
+	const body = new Text(`\n${styledOutput}`, 0, 0).render(width);
+	if (!window.truncated) {
+		return body;
+	}
+	const detail = expandedOutputSkippedDetail(window);
+	const hint = showExpandHint
+		? `${theme.fg("muted", `... ${detail}`)} ${showAllHint()}`
+		: theme.fg("muted", `... (${detail})`);
+	return [...body, truncateToWidth(hint, width, "...")];
 }
 
 function rebuildBashResultRenderComponent(
@@ -811,28 +846,36 @@ function rebuildBashResultRenderComponent(
 		if (options.expanded) {
 			// The expanded body is what a ctrl+o press actually pays for: every block
 			// restyles and rewraps whatever it holds, so the keystroke scales with the
-			// bytes released. Cache the result on the persistent render state, which
-			// survives the rebuilds that a press, the 1s tick of a running command and a
-			// chat-level invalidate all trigger for an unchanged body. Body, width and
-			// theme are the whole key, so a theme change still re-renders.
+			// bytes released. Two bounds keep it cheap - the window itself
+			// (tool-output-budget.ts) and this cache, which survives the rebuilds that a
+			// press, the 1s tick of a running command and a chat-level invalidate all
+			// trigger for an unchanged body. Body, width, theme, shortcuts, budget mode and
+			// the hint flag are the whole key, so a change to any of them still re-renders.
 			component.addChild({
 				render: (width: number) => {
-					const cached = cachedExpandedLines(state, output, width);
+					const cached = cachedExpandedLines(state, output, width, showExpandHint);
 					if (cached) {
 						return cached;
 					}
-					const lines = bashExpandedLines(output, width);
+					const lines = bashExpandedLines(output, width, showExpandHint);
 					state.cachedExpandedOutput = output;
 					state.cachedExpandedWidth = width;
 					state.cachedExpandedTheme = themeToken();
+					state.cachedExpandedKeybindings = getKeybindings();
+					state.cachedExpandedFull = toolOutputFull();
+					state.cachedExpandedHint = showExpandHint;
 					state.cachedExpandedLines = lines;
 					return lines;
 				},
 				invalidate: () => {
 					// render() revalidates the whole key (width included) on every call, so all
-					// an invalidate can add is dropping lines styled with a theme that went
-					// stale while nobody was rendering.
-					if (state.cachedExpandedTheme !== themeToken()) {
+					// an invalidate can add is dropping lines whose theme, shortcuts or budget
+					// mode went stale while nobody was rendering.
+					if (
+						state.cachedExpandedTheme !== themeToken() ||
+						state.cachedExpandedKeybindings !== getKeybindings() ||
+						state.cachedExpandedFull !== toolOutputFull()
+					) {
 						state.cachedExpandedLines = undefined;
 					}
 				},

@@ -250,6 +250,7 @@ import {
 	ToolExecutionComponent,
 	type ToolExecutionDefinition,
 } from "./components/tool-execution.js";
+import { setToolOutputFull, toolOutputFull } from "./components/tool-output-budget.js";
 import { TopBar } from "./components/top-bar.js";
 import { TreeSelectorComponent } from "./components/tree-selector.js";
 import { UserMessageComponent } from "./components/user-message.js";
@@ -4444,6 +4445,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.model.cycleForward", () => this.handleModelCycle("forward"));
 		this.defaultEditor.onAction("app.model.cycleBackward", () => this.handleModelCycle("backward"));
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
+		this.defaultEditor.onAction("app.tools.expandFull", () => this.toggleToolOutputFull());
 		this.defaultEditor.onAction("app.messages.expand", () => this.toggleAgentMessageExpansion());
 		this.defaultEditor.onAction("app.edits.expand", () => this.toggleEditDiffExpansion());
 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
@@ -6624,6 +6626,10 @@ export class InteractiveMode {
 			this.toggleToolOutputExpansion();
 			return;
 		}
+		if (this.keybindings.matches(data, "app.tools.expandFull")) {
+			this.toggleToolOutputFull();
+			return;
+		}
 		if (this.keybindings.matches(data, "app.messages.expand")) {
 			this.toggleAgentMessageExpansion();
 			return;
@@ -7970,6 +7976,26 @@ export class InteractiveMode {
 
 	private toggleToolOutputExpansion(): void {
 		this.setToolsExpanded(!this.toolOutputExpanded);
+	}
+
+	/**
+	 * Lift or restore the expanded-output render budget (tool-output-budget.ts).
+	 * Expanded blocks revalidate their cached lines against the budget mode when they
+	 * render, so this only has to ask for a frame - applyChatExpansion does that and
+	 * keeps the viewport anchored exactly like the ctrl+o toggle.
+	 */
+	private toggleToolOutputFull(): void {
+		if (!setToolOutputFull(!toolOutputFull())) {
+			return;
+		}
+		const full = toolOutputFull();
+		this.applyChatExpansion();
+		const key = keyText("app.tools.expandFull");
+		this.showStatus(
+			full
+				? `Full tool output on - expanded blocks render everything (${key} restores the budget)`
+				: `Expanded tool output budget on - long blocks render a window (${key} for full output)`,
+		);
 	}
 
 	private toggleAgentMessageExpansion(): void {
@@ -10696,6 +10722,7 @@ export class InteractiveMode {
 		const shortcutsKey = this.getAppKeyDisplay("app.shortcuts");
 		const selectModel = this.getAppKeyDisplay("app.model.select");
 		const expandTools = this.getAppKeyDisplay("app.tools.expand");
+		const expandToolsFull = this.getAppKeyDisplay("app.tools.expandFull");
 		const expandMessages = this.getAppKeyDisplay("app.messages.expand");
 		const expandEdits = this.getAppKeyDisplay("app.edits.expand");
 		const toggleThinking = this.getAppKeyDisplay("app.thinking.toggle");
@@ -10710,7 +10737,7 @@ export class InteractiveMode {
 \`${clearInput}\` interrupt · press twice to rewind or clear the prompt
 
 **Controls**
-\`${selectModel}\` select model · \`/effort\` set reasoning · \`${expandTools}\` tool output
+\`${selectModel}\` select model · \`/effort\` set reasoning · \`${expandTools}\` tool output${expandToolsFull ? ` · \`${expandToolsFull}\` full output` : ""}
 \`${expandMessages}\` agent messages · \`${expandEdits}\` edit diffs · \`${toggleThinking}\` thinking blocks · \`${promptStash}\` stash prompt · \`${externalEditor}\` edit in \`$EDITOR\`
 \`${pasteImage}\` paste image
 
@@ -10749,6 +10776,7 @@ ${shortcutsKey ? `\`${shortcutsKey}\` quick shortcuts · ` : ""}\`/hotkeys\` ful
 		const exit = this.getAppKeyDisplay("app.exit");
 		const selectModel = this.getAppKeyDisplay("app.model.select");
 		const expandTools = this.getAppKeyDisplay("app.tools.expand");
+		const expandToolsFull = this.getAppKeyDisplay("app.tools.expandFull");
 		const expandMessages = this.getAppKeyDisplay("app.messages.expand");
 		const expandEdits = this.getAppKeyDisplay("app.edits.expand");
 		const toggleThinking = this.getAppKeyDisplay("app.thinking.toggle");
@@ -10799,7 +10827,7 @@ ${shortcutsKey ? `\`${shortcutsKey}\` quick shortcuts · ` : ""}\`/hotkeys\` ful
 ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shortcutsKey ? `| \`${shortcutsKey}\` | Show quick shortcuts |\n` : ""}| \`${exit}\` | Exit (when editor is empty) |
 | \`${selectModel}\` | Open model selector |
 | \`${expandTools}\` | Toggle tool output expansion |
-| \`${expandMessages}\` | Toggle agent message expansion |
+${expandToolsFull ? `| \`${expandToolsFull}\` | Show tool output in full, ignoring the expanded render budget |\n` : ""}| \`${expandMessages}\` | Toggle agent message expansion |
 | \`${expandEdits}\` | Toggle edit diff expansion |
 | \`${toggleThinking}\` | Toggle thinking block visibility |
 | \`${focusSubagents}\` | Focus the subagent summary / open the scoped agents view |

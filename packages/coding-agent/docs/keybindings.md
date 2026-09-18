@@ -163,6 +163,7 @@ Use `tab` to cycle forward and `shift+tab` to cycle backward through Providers, 
 | Keybinding id | Default | Description |
 |--------|---------|-------------|
 | `app.tools.expand` | `ctrl+o` | Collapse or expand tool output |
+| `app.tools.expandFull` | `alt+o` | Show tool output in full, ignoring the expanded render budget |
 | `app.messages.expand` | `ctrl+p` | Collapse or expand agent-to-agent messages |
 | `app.edits.expand` | `ctrl+j` | Collapse or expand edit diffs |
 | `app.message.followUp` | `alt+enter` | Queue follow-up message |
