@@ -30,6 +30,7 @@ import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	AGENT_MESSAGE_SOURCE,
+	type AgentSessionMessage,
 	type AgentSessionMessagePayload,
 	createAgentSessionMessage,
 	isAgentSessionMessage,
@@ -61,7 +62,7 @@ function childReplyPayload(id: string, message: string): AgentSessionMessagePayl
 	};
 }
 
-function childReply(id: string, message: string): CustomMessage {
+function childReply(id: string, message: string): AgentSessionMessage {
 	return createAgentSessionMessage(childReplyPayload(id, message));
 }
 
@@ -182,7 +183,7 @@ describe("#2334 lane-scoped priority inside a session queue", () => {
 		await waitForToolStart;
 
 		const reply = childReply("agentmsg_snapshot", "child report");
-		await harness.session.queueAgentMessagePrompt(reply.content as string, "steer", reply as never);
+		await harness.session.queueAgentMessagePrompt(reply.content, "steer", reply);
 		await harness.session.steer("human after the reply");
 
 		// The reply arrived first, the human prompt still leads its lane.
@@ -232,7 +233,7 @@ describe("#2334 lane-scoped priority inside a session queue", () => {
 
 		// Machine traffic does not climb over the hand-set order either.
 		const reply = childReply("agentmsg_reorder", "child report");
-		await harness.session.queueAgentMessagePrompt(reply.content as string, "steer", reply as never);
+		await harness.session.queueAgentMessagePrompt(reply.content, "steer", reply);
 		expect(harness.session.getSteeringMessages()).toEqual([
 			"second human",
 			"first human",
@@ -378,11 +379,11 @@ describe("#2334 x compaction: human priority and 'receipts do not interrupt comp
 		//    a turn on the oversized context (the ranking pinned by symptom B).
 		const reply = childReply("agentmsg_boss_scene", "child report while you compact");
 		const replyPreflight = createPreflightRecord();
-		await harness.session.acceptAgentMessagePrompt(reply.content as string, {
+		await harness.session.acceptAgentMessagePrompt(reply.content, {
 			expandPromptTemplates: false,
 			streamingBehavior: "steer",
 			queueIfBusy: true,
-			customMessage: reply as never,
+			customMessage: reply,
 			preflightResult: capturePreflight(replyPreflight),
 		});
 		await vi.waitFor(() => expect(replyPreflight.calls).toBe(1), { timeout: 5_000, interval: 10 });

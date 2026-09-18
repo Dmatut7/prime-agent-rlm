@@ -2,12 +2,14 @@
  * Upstream #6158 / PR #2334 regression pins, ported to this fork.
  *
  * Upstream's file is `6158-human-message-priority.test.ts`; the name is kept so a future
- * upstream merge finds it. Two adaptations were needed and both are mechanical:
- *   - this fork's harness exposes `session.messages` rather than a `conversationMessages`
- *     helper, so the delivered-order assertion reads the transcript directly;
- *   - the queue assertions compare whole strings instead of `text.split("\n").pop()`,
- *     because a child reply's queued text is the full agent-message prompt and comparing
- *     it exactly is the stronger claim.
+ * upstream merge finds it. One adaptation was needed and it is mechanical: the queue
+ * assertions compare whole strings instead of `text.split("\n").pop()`, because a child
+ * reply's queued text is the full agent-message prompt and comparing it exactly is the
+ * stronger claim. The delivered-order assertion reads the conversation through this
+ * fork's `conversationMessages()` helper (the live-conversation view, #2098) exactly as
+ * upstream does, and identifies each delivered receipt by its agent-message id rather
+ * than by searching for its body text, so a transcript entry that mentions two bodies
+ * cannot be credited to the wrong one.
  * The semantics asserted are upstream's, unchanged: human input overtakes queued agent
  * traffic inside its own lane, human-to-human order is preserved, a `promptAndWait` id is
  * not agent traffic, the lane still outranks priority, and a restored queue replays its
@@ -17,15 +19,31 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	AGENT_MESSAGE_SOURCE,
+	type AgentSessionMessage,
 	type AgentSessionMessagePayload,
 	createAgentSessionMessage,
+	isAgentSessionMessage,
 } from "../../../src/core/agent-messages.js";
-import { createHarness, getMessageText, type Harness } from "../harness.js";
+import { conversationMessages, createHarness, getMessageText, type Harness } from "../harness.js";
 import { createWaitingHarness } from "../scheduling.js";
 
-/** This fork's harness has no `conversationMessages`; the transcript is public. */
-function conversationTexts(harness: Harness): string[] {
-	return harness.session.messages.map((message) => getMessageText(message));
+/**
+ * The delivered order, read off the live conversation: an agent receipt is identified by
+ * its own message id, a human prompt by its exact text, and anything else is ignored.
+ */
+function deliveredKeys(harness: Harness, humanTexts: readonly string[]): string[] {
+	const keys: string[] = [];
+	for (const message of conversationMessages(harness.session)) {
+		if (isAgentSessionMessage(message)) {
+			keys.push(message.details.id);
+			continue;
+		}
+		if (message.role === "user") {
+			const text = getMessageText(message);
+			if (humanTexts.includes(text)) keys.push(text);
+		}
+	}
+	return keys;
 }
 
 function agentMessagePayload(id: string, message: string): AgentSessionMessagePayload {
@@ -39,17 +57,17 @@ function agentMessagePayload(id: string, message: string): AgentSessionMessagePa
 	};
 }
 
-function agentMessage(id: string, body: string) {
+function agentMessage(id: string, body: string): AgentSessionMessage {
 	return createAgentSessionMessage(agentMessagePayload(id, body));
 }
 
 async function queueAgentMessage(harness: Harness, id: string, body: string): Promise<void> {
 	const message = agentMessage(id, body);
-	await harness.session.acceptAgentMessagePrompt(message.content as string, {
+	await harness.session.acceptAgentMessagePrompt(message.content, {
 		expandPromptTemplates: false,
 		streamingBehavior: "steer",
 		queueIfBusy: true,
-		customMessage: message as never,
+		customMessage: message,
 	});
 }
 
@@ -88,11 +106,15 @@ describe("#6158 human messages outrank agent messages in the queue", () => {
 		await waiting.promptPromise;
 		await session.waitForIdle();
 
-		const bodies = ["human one", "human two", "agent one", "agent two", "agent three"];
-		const delivered = conversationTexts(waiting.harness)
-			.map((text) => bodies.find((body) => text.includes(body)))
-			.filter((body): body is string => body !== undefined);
-		expect(delivered).toEqual(bodies);
+		// Delivery order, not just queue order: both humans were delivered before any
+		// receipt, and no receipt was swallowed by the human overtaking it.
+		expect(deliveredKeys(waiting.harness, ["human one", "human two"])).toEqual([
+			"human one",
+			"human two",
+			"agentmsg_one",
+			"agentmsg_two",
+			"agentmsg_three",
+		]);
 	});
 
 	it("keeps a prompt that waits for its own completion at human priority", async () => {
@@ -144,7 +166,7 @@ describe("#6158 human messages outrank agent messages in the queue", () => {
 		const session = harness.session;
 		await session.restoreSteeringMessage("agent restored", undefined, {
 			agentMessageId: "agentmsg_restored",
-			customMessage: agentMessage("agentmsg_restored", "agent restored") as never,
+			customMessage: agentMessage("agentmsg_restored", "agent restored"),
 		});
 		await session.restoreSteeringMessage("human restored");
 
