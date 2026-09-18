@@ -887,6 +887,61 @@ function measureShrinkAttempt(pathEntries: SessionEntry[], spanStart: number, cu
 	};
 }
 
+/**
+ * The two running totals the cut search reads, so the span is priced once.
+ *
+ * measureShrinkAttempt walks spanStart..end for one cut; the search used to call it
+ * for every candidate, which is O(cutPoints x entries) content-density scans and
+ * fully synchronous - measured 27.5s at 2025 entries and 54.8s at 3200 on a real
+ * threshold, i.e. the event loop froze for the whole walk at exactly the moment the
+ * context was largest (perfC, EVIDENCE/compaction/shrink-idle.txt). Both halves of
+ * `tokensAfter` are running sums over the same per-entry prices, so one pricing pass
+ * plus two folds makes the search O(entries), and the chosen cut stays the only one
+ * that pays a full walk for the span details the plan reports.
+ */
+interface ShrinkSpanTotals {
+	/** suffixTokens[i]: price of entries i..end, the context a cut at i keeps. */
+	suffixTokens: Float64Array;
+	/** carriedTokens[i]: price of the summary entries in spanStart..i that a cut after i carries forward. */
+	carriedTokens: Float64Array;
+}
+
+/**
+ * Price every entry of the span once and fold both running totals.
+ *
+ * Each price is an integer (estimateTokensByContent ends in Math.ceil), so the folds
+ * are exact and a cut reads the same total the per-cut walk produced whichever order
+ * its two halves were summed in - that is what makes the search equivalent rather
+ * than merely close.
+ */
+function measureShrinkSpanTotals(pathEntries: SessionEntry[], spanStart: number): ShrinkSpanTotals {
+	const count = pathEntries.length;
+	const entryTokens = new Float64Array(count);
+	// One slot past the end so the fold at the last entry reads a zero.
+	const suffixTokens = new Float64Array(count + 1);
+	const carriedTokens = new Float64Array(count);
+	let carried = 0;
+	for (let i = spanStart; i < count; i++) {
+		const entry = pathEntries[i];
+		const tokens = entryContextTokens(entry);
+		entryTokens[i] = tokens;
+		// The condition measureShrinkAttempt carries a summary under: an empty
+		// summary text has nothing to carry forward, so it does not add to the total.
+		if (isSummaryEntry(entry) && entrySummaryText(entry)) carried += tokens;
+		carriedTokens[i] = carried;
+	}
+	for (let i = count - 1; i >= spanStart; i--) {
+		suffixTokens[i] = suffixTokens[i + 1] + entryTokens[i];
+	}
+	return { suffixTokens, carriedTokens };
+}
+
+/** What a cut leaves behind, read off the folded totals instead of a span walk. */
+function shrinkTokensAfter(totals: ShrinkSpanTotals, spanStart: number, cut: number): number {
+	const carried = cut > spanStart ? totals.carriedTokens[cut - 1] : 0;
+	return totals.suffixTokens[cut] + carried;
+}
+
 function summaryEntryKind(entry: SessionEntry): "compaction" | "branch" {
 	if (entry.type === "compaction") return "compaction";
 	if (entry.type === "message" && entry.message.role === "compactionSummary") return "compaction";
@@ -907,6 +962,11 @@ function summaryEntryKind(entry: SessionEntry): "compaction" | "branch" {
  * Both token figures are pure content-density sums over the same entries, so the
  * comparison is self-consistent; they are not the usage-anchored caliber
  * estimateContextTokens reports while a readable assistant usage exists.
+ *
+ * The search is linear in the span: every entry is priced once, each candidate cut
+ * reads a folded total, and only the chosen cut walks the span again for the details
+ * the notice reports. It has to be - this valve runs on the largest context the
+ * session ever reaches, synchronously, with the event loop frozen for its duration.
  *
  * Returns undefined when there is nothing to do: no threshold, already under the
  * target, or no cut point to move to.
@@ -941,17 +1001,25 @@ export function planEmergencyShrink(
 	const cutPoints = findValidCutPoints(pathEntries, cutStart, pathEntries.length).filter((index) => index > spanStart);
 	if (cutPoints.length === 0) return undefined;
 
-	const tokensBefore = measureShrinkAttempt(pathEntries, spanStart, spanStart).tokensAfter;
+	const totals = measureShrinkSpanTotals(pathEntries, spanStart);
+	const tokensBefore = shrinkTokensAfter(totals, spanStart, spanStart);
 	if (tokensBefore <= targetTokens) return undefined;
 
-	let deepest: ShrinkAttempt | undefined;
-	for (const cut of cutPoints) {
-		const attempt = measureShrinkAttempt(pathEntries, spanStart, cut);
-		deepest = attempt;
-		if (attempt.tokensAfter <= targetTokens) return toPlan(pathEntries, attempt, tokensBefore, targetTokens, true);
+	// The deepest cut is the fallback, which is what the per-cut walk this replaced
+	// ended up holding: it kept the last candidate it measured.
+	let cut = cutPoints[cutPoints.length - 1];
+	let reachedTarget = false;
+	for (const candidate of cutPoints) {
+		if (shrinkTokensAfter(totals, spanStart, candidate) <= targetTokens) {
+			cut = candidate;
+			reachedTarget = true;
+			break;
+		}
 	}
-	if (!deepest) return undefined;
-	return toPlan(pathEntries, deepest, tokensBefore, targetTokens, false);
+	// Only the chosen cut pays a span walk, for the dropped-span details (roles,
+	// timestamps, carried summaries) the plan and its notice report.
+	const attempt = measureShrinkAttempt(pathEntries, spanStart, cut);
+	return toPlan(pathEntries, attempt, tokensBefore, targetTokens, reachedTarget);
 }
 
 function toPlan(
