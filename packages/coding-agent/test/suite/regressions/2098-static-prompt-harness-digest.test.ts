@@ -583,6 +583,42 @@ describe("#2098 static system prompt with an in-context harness digest", () => {
 		expect(digestMessages(harness.session.messages)).toHaveLength(carriersBefore);
 	});
 
+	it("re-arms injection when a failed delivery parks the digest it just rendered", async () => {
+		seedEntry("memory", "park_seed", "Park seed", "Re-arm fixture.");
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+
+		// The digest is rendered into the turn's next-turn context before the agent is
+		// asked to deliver it, so a delivery that throws leaves the session holding a
+		// menu it never showed the model. `agent.prompt` is public, and this is the seam
+		// the handoff-rollback pins already drive.
+		vi.spyOn(harness.session.agent, "prompt").mockImplementationOnce(async () => {
+			throw new Error("delivery failed before the digest landed");
+		});
+		await harness.session.prompt("round one").catch(() => {});
+		await harness.session.waitForIdle();
+
+		// Nothing reached the context and nothing durable reached the journal: the digest
+		// left with the failed turn instead of being parked as stale pending context.
+		expect(digestMessages(harness.session.messages)).toHaveLength(0);
+		expect(digestEntries(harness)).toEqual([]);
+
+		// Another writer moves the store while this session has no delivered digest. The
+		// re-armed injection owes the model one freshly rendered menu - not the copy
+		// rendered before the failure, and not both (that double delivery is exactly what
+		// the park filter exists to prevent).
+		seedEntry("memory", "late_entry", "Late entry", "Written while the turn was parked.");
+		harness.setResponses([fauxAssistantMessage("reply two")]);
+		await harness.session.prompt("round two");
+
+		const carriers = digestMessages(harness.session.messages);
+		expect(carriers).toHaveLength(1);
+		expect(getMessageText(carriers[0] as CustomMessage)).toContain("[global:park_seed] Park seed");
+		expect(getMessageText(carriers[0] as CustomMessage)).toContain("[global:late_entry] Late entry");
+		expect(digestEntries(harness)).toHaveLength(1);
+		expect(conversationMessages(harness.session).map((message) => message.role)).toEqual(["user", "assistant"]);
+	});
+
 	it("appends a fresh digest on resume only when disk state moved", async () => {
 		seedEntry("memory", "seed_e", "Seed E", "Resume fixture.");
 		const first = await createHarness({ persistSession: true });
