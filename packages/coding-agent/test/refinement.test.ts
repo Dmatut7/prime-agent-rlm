@@ -27,7 +27,10 @@ import {
 	getRefinementHistory,
 	getRefinementHistoryPath,
 	HARNESS_CONCURRENT_WRITE_ERROR,
+	type HarnessEntry,
 	type HarnessState,
+	harnessQueryTermIdf,
+	harnessQueryTerms,
 	inferRefinementResultScope,
 	isPersistentHarnessStorageSupported,
 	loadGlobalRefinementHistory,
@@ -43,6 +46,7 @@ import {
 	readHarnessStateStamp,
 	refineHarness,
 	saveHarnessState,
+	scoreHarnessEntryForQuery,
 	WINDOWS_HARNESS_PERSISTENCE_UNSUPPORTED_ERROR,
 } from "../src/core/refinement/index.js";
 import type { CustomEntry } from "../src/core/session-manager.js";
@@ -1704,5 +1708,136 @@ describe("harness storage beneath a symlinked home layout", () => {
 			const state = loadHarnessState(linkedHarness);
 			expect(state.persistentWriteError).toContain("non-directory private path");
 		});
+	});
+});
+
+describe("harness digest relevance ranking (#2241 phase 2 / upstream #2392 IDF / #2400 stable ties)", () => {
+	function makeRankedEntry(id: string, title: string, content: string, updatedAt: string): HarnessEntry {
+		return {
+			id,
+			kind: "memory",
+			title,
+			content,
+			path: "general",
+			scope: "global",
+			reference: {},
+			arguments: {},
+			metadata: {},
+			source: "test",
+			created_at: updatedAt,
+			updated_at: updatedAt,
+			version: 1,
+		};
+	}
+
+	function rankedState(entries: HarnessEntry[]): HarnessState {
+		const state = loadHarnessState(join(makeTempDir(), "harness"), "global");
+		for (const entry of entries) {
+			state.entries.memory[entry.id] = entry;
+		}
+		return state;
+	}
+
+	it("computes document-frequency discounts over the ranked corpus", () => {
+		const at = "2026-08-01T00:00:00.000Z";
+		const terms = new Map([
+			["session", 1],
+			["quantum", 1],
+			["missing", 1],
+		]);
+		const common = ["common0", "common1"].map((id) => makeRankedEntry(id, "Session notes", "session text", at));
+		const rare = makeRankedEntry("rare", "Quantum note", "quantum text", at);
+		// "session" matches 2 of 3 entries, "quantum" 1 of 3, "missing" none.
+		const idf = harnessQueryTermIdf([...common, rare], terms);
+		expect([...idf.keys()]).toEqual(["session", "quantum"]);
+		expect(idf.get("session")).toBeCloseTo(Math.log(1 + 3 / 2));
+		expect(idf.get("quantum")).toBeCloseTo(Math.log(1 + 3 / 1));
+		// The discount scales the weighted overlap: "quantum" covers 2 fields of 1 entry.
+		expect(scoreHarnessEntryForQuery(rare, terms, idf)).toBeCloseTo(Math.log(1 + 3 / 1) * 1.5);
+		// A term in every entry still weighs log(2); degenerate corpora stay inert.
+		expect(harnessQueryTermIdf([rare], terms).get("quantum")).toBeCloseTo(Math.log(2));
+		expect(harnessQueryTermIdf([], terms).size).toBe(0);
+		expect(harnessQueryTermIdf([...common, rare], new Map()).size).toBe(0);
+		// A missing idf map keeps the pre-#2392 weighting, so old callers are unchanged.
+		expect(scoreHarnessEntryForQuery(rare, terms)).toBeCloseTo(1.5);
+	});
+
+	it("ranks a rare distinctive term over a common-term-dense entry", () => {
+		const state = rankedState([
+			makeRankedEntry("common0", "Session notes", "Session state notes.", "2026-08-01T00:00:00.000Z"),
+			makeRankedEntry("common1", "Session notes", "Session state notes.", "2026-08-02T00:00:00.000Z"),
+			makeRankedEntry("rare", "Quantum note", "Only quantum annealing matters.", "2026-07-01T00:00:00.000Z"),
+		]);
+		const ranked = formatHarnessStateForPrompt(state, {
+			maxEntriesPerKind: 2,
+			queryTerms: new Map([
+				["session", 1],
+				["quantum", 1],
+			]),
+		});
+		// Rare wins the window; recency order (the no-query path) would have
+		// shown common1 + common0 and dropped rare entirely.
+		expect(ranked).toContain("[global:rare]");
+		expect(ranked).toContain("[global:common0]");
+		expect(ranked).not.toContain("[global:common1]");
+		// The overflow window names the ranking and points at harness.search.
+		expect(ranked).toContain("(entries ranked by relevance to the current task; see harness.search)");
+	});
+
+	it("breaks score ties by stable identifier order, not recency", () => {
+		const state = rankedState([
+			makeRankedEntry("aaa", "Worktree policy", "Same worktree signal.", "2026-08-01T00:00:00.000Z"),
+			makeRankedEntry("zzz", "Worktree policy", "Same worktree signal.", "2026-09-01T00:00:00.000Z"),
+		]);
+		const ranked = formatHarnessStateForPrompt(state, {
+			maxEntriesPerKind: 1,
+			queryTerms: new Map([["worktree", 1]]),
+		});
+		// Equal scores render in stable identifier order ([path, title, id]);
+		// updated_at recency must not hoist the newer entry into the window.
+		expect(ranked).toContain("[global:aaa]");
+		expect(ranked).not.toContain("[global:zzz]");
+	});
+
+	it("keeps recency injection order and no ranked marker when no query terms are given", () => {
+		const state = rankedState([
+			makeRankedEntry("common0", "Session notes", "Session state notes.", "2026-08-01T00:00:00.000Z"),
+			makeRankedEntry("common1", "Session notes", "Session state notes.", "2026-08-02T00:00:00.000Z"),
+			makeRankedEntry("rare", "Quantum note", "Only quantum annealing matters.", "2026-07-01T00:00:00.000Z"),
+		]);
+		for (const queryTerms of [undefined, new Map()]) {
+			const rendered = formatHarnessStateForPrompt(state, { maxEntriesPerKind: 2, queryTerms });
+			// The default path is the fork's injection order: newest first, so
+			// the stale rare entry falls out of the window and nothing is marked.
+			expect(rendered).toContain("[global:common1]");
+			expect(rendered).toContain("[global:common0]");
+			expect(rendered).not.toContain("[global:rare]");
+			expect(rendered).not.toContain("entries ranked by relevance");
+		}
+	});
+
+	it.each<[string, string[]]>([
+		["Worktree?", ["worktree"]],
+		["path/to/skill", ["path", "skill"]],
+		["harness_search", ["harness", "search"]],
+		["??? / . ,", []],
+		// Short ASCII runs stay noise; other non-ASCII scripts stay whole.
+		["Fix the LOGIN bug", ["login"]],
+		["Привет мир", ["привет"]],
+		// Combining marks stay in their run: mark-heavy scripts spell whole words.
+		["किताब notes", ["किताब", "notes"]],
+		["naïve approach", ["naïve", "approach"]],
+		// CJK has no spaces between words: runs become overlapping bigrams, so
+		// partial matches stay findable and single characters count.
+		["修复login", ["修复", "login"]],
+		["修复登录", ["修复", "复登", "登录"]],
+		["修复登录？", ["修复", "复登", "登录"]],
+		["東京会議 login", ["東京", "京会", "会議", "login"]],
+		["登", ["登"]],
+		// Supplementary-plane ideographs count as CJK.
+		["𠀀", ["𠀀"]],
+		["𠀀𠀁𠀂", ["𠀀𠀁", "𠀁𠀂"]],
+	])("tokenizes %j into %j", (query, expected) => {
+		expect(harnessQueryTerms(query)).toEqual(expected);
 	});
 });
