@@ -1,5 +1,5 @@
-import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -29,7 +29,8 @@ const preflight = readFileSync(join(repoRoot, "scripts", "preflight-push.sh"), "
 /** Where a self-test is reachable from, or "nowhere". */
 function wiringFor(command: string): string {
 	if (hygieneJob.includes(command)) return "test-hygiene job";
-	if (ciHonesty.includes(command)) return "check:ci-honesty (npm run check, husky pre-commit and the CI build-check job)";
+	if (ciHonesty.includes(command))
+		return "check:ci-honesty (npm run check, husky pre-commit and the CI build-check job)";
 	if (preflight.includes(command)) return "scripts/preflight-push.sh";
 	return "nowhere";
 }
@@ -99,7 +100,10 @@ describe("every self-test this repository relies on is reachable from an aggrega
 
 	it("the instruments it lists actually exist as files", () => {
 		for (const instrument of INSTRUMENTS) {
-			const script = instrument.command.split(" ").slice(1).find((part) => part.startsWith("scripts/"));
+			const script = instrument.command
+				.split(" ")
+				.slice(1)
+				.find((part) => part.startsWith("scripts/"));
 			if (script === undefined) continue;
 			const probe = spawnSync("test", ["-e", join(repoRoot, script)]);
 			expect(probe.status, `${script} is listed as an instrument but does not exist`).toBe(0);
