@@ -419,6 +419,35 @@ describe("summarization request stays inside the provider's real input limit", (
 		expect(completeSimpleMock).not.toHaveBeenCalled();
 	});
 
+	it("a summary whose signal is already aborted spends no wire call", async () => {
+		// Same gap as the branch-summary sibling: the gate watchdog can abort a
+		// compaction while its hook is still parked, so the request builder can be
+		// entered with the signal already aborted. The funnel must throw the
+		// cancellation shape before the attempt - a paid provider call nobody will
+		// read - and the mock must see zero calls. generateSummary and
+		// generateTurnPrefixSummary share the funnel, so one pin covers both.
+		const controller = new AbortController();
+		controller.abort();
+
+		let thrown: unknown;
+		try {
+			await generateSummary(
+				[bigUserMessage("x")],
+				createModel({ contextWindow: CONTEXT_WINDOW }),
+				RESERVE_TOKENS,
+				"test-key",
+				undefined,
+				controller.signal,
+			);
+		} catch (error) {
+			thrown = error;
+		}
+
+		expect(thrown).toBeInstanceOf(Error);
+		expect((thrown as Error).name).toBe("AbortError");
+		expect(completeSimpleMock).not.toHaveBeenCalled();
+	});
+
 	it("keeps a branch summary request inside the provider's input limit", async () => {
 		const { recorded } = createLimitProvider({ hardInputLimit: HARD_INPUT_LIMIT, perMessageTokens: 4 });
 
