@@ -16,10 +16,11 @@
 #   1. `npm run test:process -- --reporter=default --reporter=json --outputFile.json=...`
 #      exactly as `.github/workflows/ci.yml` runs it, and fails on a non-zero exit.
 #   2. Prints the per-file collected/ran/passed/failed/skipped ledger from that report.
-#   3. The CI coverage gate at the CI floors: --min-tests 20 --min-ran-tests 11
-#      --max-nothing-files 1 (`crash-handlers-process` is the one file allowed to run
-#      nothing, because all four of its tests carry the `process-stress` tag).
-#   4. The CI tag-skip ledger, with the declaration copied verbatim from `ci.yml`: 8 skips in
+#   3. The CI coverage gate at the CI floors (min_tests / min_ran_tests / max_nothing_files,
+#      read from `scripts/lib/ci-process-smoke.mjs` - the single source `.github/workflows/ci.yml`
+#      is pinned to; `crash-handlers-process` is the one file allowed to run nothing, because all
+#      four of its tests carry the `process-stress` tag).
+#   4. The CI tag-skip ledger, from the same module: 8 skips in
 #      daemon-supervisor-process.test.ts + 4 in daemon-supervisor-crash-handlers-process.test.ts.
 #      The judgement is the tag, not the environment: `vitest.config.ts` sets
 #      `tagsFilter: ["!process-stress", "!kernel-heavy"]` unconditionally, so those twelve
@@ -28,7 +29,7 @@
 #
 # Usage
 # -----
-#   bash scripts/check-process-smoke.sh                 # the CI face (green = 12 passed | 8 skipped)
+#   bash scripts/check-process-smoke.sh                 # the CI face (green = collected 24 | ran 12 | skipped 12)
 #   bash scripts/check-process-smoke.sh --with-stress   # + the nightly face (`test:process-stress`)
 #   bash scripts/check-process-smoke.sh --self-test     # prove both instruments can still go red
 #   bash scripts/check-process-smoke.sh --report /tmp/p.json   # keep the report elsewhere
@@ -57,7 +58,6 @@ while [ $# -gt 0 ]; do
 		-h|--help) usage; exit 0 ;;
 		*) echo "check-process-smoke: unknown argument $1" >&2; usage; exit 2 ;;
 	esac
-[ -n "$REPORT_OVERRIDE" ] || [ "$SELF_TEST" = "1" ] || mkdir -p "$(dirname "$REPORT")"
 done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -84,27 +84,65 @@ HANDLERS_TEST="$PKG/test/daemon-supervisor-crash-handlers-process.test.ts"
 	exit 2
 }
 REPORT="${REPORT_OVERRIDE:-$PKG/coverage/ci-process-smoke.json}"
+# The report's directory does not exist in a fresh checkout (`coverage/` is gitignored), and vitest
+# writes neither the report nor its log without it. This line used to sit inside the argument loop
+# above, where `$REPORT` was still unbound: `set -u` aborted the assignment, so `--with-stress` on
+# its own ran every step against a path nobody had created.
+[ "$SELF_TEST" = "1" ] || mkdir -p "$(dirname "$REPORT")"
 
-# Copied verbatim from .github/workflows/ci.yml (matrix row "coding-agent process smoke").
-LEDGER="packages/coding-agent/test/daemon-supervisor-process.test.ts=8:process-stress tag-filtered by vitest.config.ts; nightly-process-stress.yml runs it;;packages/coding-agent/test/daemon-supervisor-crash-handlers-process.test.ts=4:process-stress tag-filtered by vitest.config.ts; nightly-process-stress.yml runs it"
-MIN_TESTS=20
-MIN_RAN_TESTS=11
-MAX_NOTHING_FILES=1
+# The floors and the declared skips come from scripts/lib/ci-process-smoke.mjs - the single source
+# that `.github/workflows/ci.yml`'s matrix row "coding-agent process smoke" is pinned to by
+# packages/coding-agent/test/ci-floor-policy.test.ts. They used to be hand-copied into this file,
+# and the only thing holding the two copies together was a sentence in a doc telling the next
+# editor to change both. No fallback here on purpose: a missing or unreadable module aborts the
+# gate instead of letting it run at some invented default.
+CONFIG_MODULE="$ROOT/scripts/lib/ci-process-smoke.mjs"
+[ -f "$CONFIG_MODULE" ] || {
+	echo "check-process-smoke: missing $CONFIG_MODULE (the floors and the tag-skip ledger live there)" >&2
+	exit 2
+}
+SMOKE_CONFIG="$(node "$CONFIG_MODULE" --shell)" || {
+	echo "check-process-smoke: cannot read $CONFIG_MODULE (node exit $?)" >&2
+	exit 2
+}
+MIN_TESTS=""; MIN_RAN_TESTS=""; MAX_NOTHING_FILES=""; LEDGER=""
+while IFS= read -r config_line; do
+	[ -n "$config_line" ] || continue
+	# Split on the first `=` only: the ledger value is `path=count:reason;;path=count:reason`.
+	case "${config_line%%=*}" in
+		MIN_TESTS) MIN_TESTS="${config_line#*=}" ;;
+		MIN_RAN_TESTS) MIN_RAN_TESTS="${config_line#*=}" ;;
+		MAX_NOTHING_FILES) MAX_NOTHING_FILES="${config_line#*=}" ;;
+		LEDGER) LEDGER="${config_line#*=}" ;;
+		*) echo "check-process-smoke: $CONFIG_MODULE printed an unknown key ${config_line%%=*}" >&2; exit 2 ;;
+	esac
+done <<< "$SMOKE_CONFIG"
+for config_key in MIN_TESTS MIN_RAN_TESTS MAX_NOTHING_FILES LEDGER; do
+	[ -n "${!config_key}" ] || {
+		echo "check-process-smoke: $CONFIG_MODULE returned no $config_key" >&2
+		exit 2
+	}
+done
+echo "floors from ${CONFIG_MODULE#"$ROOT"/}: min_tests=$MIN_TESTS min_ran_tests=$MIN_RAN_TESTS max_nothing_files=$MAX_NOTHING_FILES"
 
 FAILED_STEP=""
 step() { printf '\n== %s ==\n' "$1"; }
 fail() { FAILED_STEP="$1"; printf 'FAIL: %s\n' "$1"; }
 
 if [ "$SELF_TEST" = "1" ]; then
-	step "self-test: the two instruments this gate depends on must still be able to go red"
+	step "self-test: the instruments this gate depends on must still be able to go red"
 	rc=0
 	node "$ROOT/scripts/check-vitest-coverage.mjs" --self-test || rc=1
 	bash "$ROOT/scripts/check-tag-skip-ledger.sh" --self-test || rc=1
+	# The floors and the ledger this gate runs at are read from a module, so the module's own
+	# shape is an instrument too: a `;;` inside a reason, or a shell surface missing a key, would
+	# otherwise show up as a silently mis-parsed gate.
+	node "$CONFIG_MODULE" --self-test || rc=1
 	if [ "$rc" != "0" ]; then
 		echo "check-process-smoke: self-test RED (an instrument can no longer detect its drift)" >&2
 		exit 1
 	fi
-	echo "check-process-smoke: self-test GREEN (coverage gate and tag-skip ledger both plant their own red)"
+	echo "check-process-smoke: self-test GREEN (coverage gate, tag-skip ledger and the floor module all plant their own red)"
 	exit 0
 fi
 
