@@ -819,6 +819,42 @@ describe("#2098 static system prompt with an in-context harness digest", () => {
 		expect((after[1].details as { stateFingerprint?: string }).stateFingerprint).toBeDefined();
 	});
 
+	it("re-renders the digest when the tool face moves mid-session", async () => {
+		seedEntry("memory", "seed_tools", "Seed tools", "Tool-face fixture.");
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("reply one"),
+			fauxAssistantMessage("reply two"),
+			fauxAssistantMessage("reply three"),
+		]);
+		await harness.session.prompt("round one");
+		const first = digestMessages(harness.session.messages);
+		expect(first).toHaveLength(1);
+		// The delivered menu describes the tool face it was rendered for: this session
+		// boots with the Python REPL, so the call contract teaches the REPL form.
+		expect(getMessageText(first[0] as CustomMessage)).toContain(
+			"read each installed Python skill's SKILL.md and call its documented module function in the Python REPL",
+		);
+
+		// Dropping the tools rebuilds the system prompt but moves neither store stamp,
+		// so the material-change gate on its own would leave the model reading a call
+		// contract for tools it no longer has until the next cold boundary.
+		digestRenders.count = 0;
+		harness.session.setActiveToolsByName([]);
+		await harness.session.prompt("round two");
+		const second = digestMessages(harness.session.messages);
+		expect(second).toHaveLength(2);
+		expect(digestRenders.count).toBeGreaterThan(0);
+		expect(getMessageText(second[1] as CustomMessage)).toContain(
+			"routing/context hints only in sessions without the Python REPL or shell access",
+		);
+
+		// One move, one re-delivery: the tool face is quiet again, so is the digest.
+		await harness.session.prompt("round three");
+		expect(digestMessages(harness.session.messages)).toHaveLength(2);
+	});
+
 	it("makes another seat's write visible on the next turn, exactly once", async () => {
 		seedEntry("memory", "seed_k", "Seed K", "Menu fixture.");
 		const harness = await createHarness({ persistSession: true });
