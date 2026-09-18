@@ -121,8 +121,12 @@ jobs:
         # readings (ai ran-floor 412 against 643 tests actually run, shard 2/3 2118 against 3107),
         # which is drift in the direction that hides a lost face. It cannot drift back:
         # packages/coding-agent/test/ci-floor-policy.test.ts recomputes ceil(0.9 * reading) from
-        # that file and fails when a row disagrees, when a row has no recorded reading, or when the
-        # recorded run's sha does not exist in this repository.
+        # that file and fails when a row disagrees, when a row has no recorded reading, or - where
+        # the checkout has the history to answer it - when the recorded run's sha does not exist in
+        # this repository. This job checks out at depth one, so the test reads its own checkout:
+        # `git cat-file -e` on an ancestor sha is 128 there while the sha is perfectly fine, and the
+        # sha leg runs only in a clone with history. It is not a skip - the floors comparison it
+        # keeps in every depth is what stays red when a floor is pulled out of this file.
         #
         # max_nothing_files is how many files are allowed to run nothing in this job's environment;
         # every non-zero value is a deliberate skip with a reason, and one more skipping file fails
@@ -452,7 +456,12 @@ jobs:
         run: node scripts/check-installer.mjs --self-test
 
       # The bundle-smoke gate's only failure face used to be an esbuild throw, so its planted-red
-      # controls are what say it can still tell a broken bundle from a good one.
+      # controls are what say it can still tell a broken bundle from a good one. This job installs
+      # nothing, so the six controls that plant a real bundle cannot run here: the self-test prints
+      # one SKIP line per leg and counts them in its tally (a leg that cannot run must never be
+      # silent - before that, this step died on "Cannot find package 'esbuild'" with exit 1, a red
+      # that read like a missed drift while meaning "this runner had no node_modules"). All nine
+      # legs run with the dependency installed, in `build-check` through `npm run check`.
       - name: Browser bundle-smoke gate self-test (planted bundle drift must turn the gate red)
         run: node scripts/check-browser-smoke.mjs --self-test
 
