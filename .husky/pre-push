@@ -1,0 +1,177 @@
+#!/bin/sh
+#
+# Machine half of this fork's release ban: refuse a hand-pushed `v*` tag.
+#
+# The ban is on record in prose only - CHANGELOG.md:45 ("build-binaries.yml 的活体发布面
+# 未裁决，故仍**禁推 `v*` 标签**") and docs/fork/merge-upstream-20260917.md:180/192 (risk R1) -
+# and the forbidden path is one command wide. `.github/workflows/build-binaries.yml` is live
+# in this tree on `push: tags: ['v*']` with a `publish` job holding
+# `permissions: contents: write`, origin has never run it, and the lane still lacks three
+# upstream fixes, so a `v*` tag reaching origin runs an unadjudicated release lane.
+# scripts/lib/fork-gate.mjs closes the `npm run release:*` half of that path; this hook closes
+# the half git itself offers: a hand-typed `git push origin v0.10.1`.
+#
+# Rules:
+#   - any ref of the shape `refs/tags/v*` in the remote or the local column is refused,
+#     whether the push creates it, updates it or deletes it;
+#   - every other ref - branches, non-`v` tags - passes, and a passing push prints nothing;
+#   - PRIME_AGENT_ALLOW_VTAG=1 lifts the ban for that one push and prints a warning.
+# No tests, no network, no writes: it reads git's stdin, matches patterns and exits.
+#
+# Self-test (never part of a real push): bash .husky/pre-push --self-test
+
+set -u
+
+ALLOW_ENV_VAR="PRIME_AGENT_ALLOW_VTAG"
+ZERO_SHA="0000000000000000000000000000000000000000"
+BAN_ANCHOR_CHANGELOG="CHANGELOG.md:45"
+BAN_ANCHOR_DOC="docs/fork/merge-upstream-20260917.md:180"
+BAN_ANCHOR_WORKFLOW=".github/workflows/build-binaries.yml (on: push: tags: [v*])"
+
+# Verdict on one push. Reads git's pre-push stdin - "<local ref> <local sha> <remote ref>
+# <remote sha>" per line (git 2.x: a created ref carries an all-zero *remote* sha, a deletion
+# carries "(delete)" and an all-zero *local* sha) - and returns 0 to allow, 1 to refuse.
+# The decision is made on the ref shape alone, so create/update/delete are all covered.
+verdict() {
+	blocked=""
+	action=""
+	line_action=""
+	# The `|| [ -n ... ]` arm is the POSIX idiom for a final line that arrives without a
+	# trailing LF: git always ends its stdin with LF, a hand-fed harness may not.
+	while read -r local_ref local_sha remote_ref remote_sha || [ -n "${remote_ref:-}${local_ref:-}" ]; do
+		[ -n "${remote_ref:-}" ] || continue
+		line_action="update"
+		case "${local_ref:-}" in
+			"(delete)") line_action="delete" ;;
+		esac
+		case "${local_sha:-}" in
+			"$ZERO_SHA") line_action="delete" ;;
+		esac
+		case "${remote_sha:-}" in
+			"$ZERO_SHA"|"") line_action="create" ;;
+		esac
+		for ref in "${remote_ref:-}" "${local_ref:-}"; do
+			case "$ref" in
+				refs/tags/v*)
+					case " $blocked " in
+						*" $ref "*) ;;
+						*)
+							blocked="$blocked $ref"
+							action="$action $line_action"
+							;;
+					esac
+					;;
+			esac
+		done
+	done
+
+	if [ -z "$blocked" ]; then
+		return 0
+	fi
+
+	blocked_refs=$(printf '%s' "$blocked" | sed 's/^ //')
+	blocked_actions=$(printf '%s' "$action" | sed 's/^ //' | tr ' ' ',')
+
+	if [ "${PRIME_AGENT_ALLOW_VTAG:-}" = "1" ]; then
+		echo "warning: ${ALLOW_ENV_VAR}=1 given; pushing ${blocked_actions} ${blocked_refs} from this fork, whose release ban (${BAN_ANCHOR_CHANGELOG}) is still in force."
+		return 0
+	fi
+
+	echo "error: refusing to push ${blocked_actions} ${blocked_refs} from this fork."
+	echo "本线禁推 v* 标签、禁 npm publish：发布面未裁决 (no v* tag, no npm publish from this fork)."
+	echo "A v* tag reaching origin runs .github/workflows/build-binaries.yml - live here on"
+	echo "push: tags: ['v*'], with a publish job holding 'permissions: contents: write' - and that"
+	echo "release lane is unadjudicated (origin has never run it; it still lacks three upstream fixes)."
+	echo "On record at:"
+	echo "  ${BAN_ANCHOR_CHANGELOG}"
+	echo "  ${BAN_ANCHOR_DOC} and :192"
+	echo "  ${BAN_ANCHOR_WORKFLOW}"
+	echo "To push it anyway (prints a warning, lifts the ban for that one push):"
+	echo "  ${ALLOW_ENV_VAR}=1 git push <remote> <ref>"
+	return 1
+}
+
+# ---- self-test: canned stdin, no side effects on disk, no network, no git ----
+
+run_case() {
+	# run_case <name> <expected exit> <expected substring or -> <stdin> [allow]
+	case_name="$1"
+	case_expected_rc="$2"
+	case_expected_text="$3"
+	case_input="$4"
+	case_allow="${5:-}"
+
+	case_rc=0
+	if [ "$case_allow" = "1" ]; then
+		case_out=$(printf '%s\n' "$case_input" | (PRIME_AGENT_ALLOW_VTAG=1; verdict) 2>&1) || case_rc=$?
+	else
+		case_out=$(printf '%s\n' "$case_input" | verdict 2>&1) || case_rc=$?
+	fi
+
+	case_failed=""
+	if [ "$case_rc" -ne "$case_expected_rc" ]; then
+		case_failed="exit ${case_rc}, expected ${case_expected_rc}"
+	fi
+	if [ -z "$case_failed" ] && [ -n "$case_expected_text" ]; then
+		case "$case_out" in
+			*"$case_expected_text"*) ;;
+			*) case_failed="output does not mention: ${case_expected_text}" ;;
+		esac
+	fi
+	if [ -z "$case_failed" ] && [ -z "$case_expected_text" ] && [ -n "$case_out" ]; then
+		case_failed="expected no output, got: ${case_out}"
+	fi
+
+	if [ -n "$case_failed" ]; then
+		echo "  FAIL ${case_name}: ${case_failed}"
+		echo "    output: ${case_out}"
+		failures=$((failures + 1))
+		return 0
+	fi
+	passes=$((passes + 1))
+	echo "  ok   ${case_name}"
+	return 0
+}
+
+self_test() {
+	passes=0
+	failures=0
+
+	heads_branch="refs/heads/main 1111111111111111111111111111111111111111 refs/heads/main 0000000000000000000000000000000000000000"
+	non_v_tag="refs/tags/nightly-2026 2222222222222222222222222222222222222222 refs/tags/nightly-2026 0000000000000000000000000000000000000000"
+	v_tag="refs/tags/v0.10.1 3333333333333333333333333333333333333333 refs/tags/v0.10.1 0000000000000000000000000000000000000000"
+	v_tag_delete="(delete) 0000000000000000000000000000000000000000 refs/tags/v0.10.1 3333333333333333333333333333333333333333"
+	v_tag_update="refs/tags/v0.10.1 4444444444444444444444444444444444444444 refs/tags/v0.10.1 3333333333333333333333333333333333333333"
+
+	echo "pre-push self-test"
+	run_case "branch push passes silently" 0 "" "$heads_branch"
+	run_case "non-v tag push passes silently" 0 "" "$non_v_tag"
+	run_case "branch + non-v tag passes silently" 0 "" "$heads_branch
+$non_v_tag"
+	run_case "v* tag creation is refused" 1 "禁推 v* 标签" "$v_tag"
+	run_case "refusal names the ban anchors" 1 "${BAN_ANCHOR_CHANGELOG}" "$v_tag"
+	run_case "refusal names the workflow trigger" 1 "build-binaries.yml" "$v_tag"
+	run_case "v* tag deletion is refused" 1 "delete" "$v_tag_delete"
+	run_case "v* tag update is refused" 1 "update" "$v_tag_update"
+	run_case "one v* tag among branches is refused" 1 "v0.10.1" "$heads_branch
+$v_tag"
+	run_case "escape hatch allows the v* tag and warns" 0 "warning: PRIME_AGENT_ALLOW_VTAG=1" "$v_tag" 1
+	run_case "escape hatch says which refs it lifted the ban for" 0 "v0.10.1" "$v_tag" 1
+
+	total=$((passes + failures))
+	echo "pre-push self-test: ${passes}/${total} control cases passed"
+	if [ "$failures" -ne 0 ]; then
+		return 1
+	fi
+	return 0
+}
+
+case "${1:-}" in
+	--self-test)
+		self_test
+		exit $?
+		;;
+esac
+
+verdict
+exit $?

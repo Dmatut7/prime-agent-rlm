@@ -8,175 +8,44 @@
  *   node scripts/release.mjs <target> --dry-run   (preview changelog updates only)
  *
  * Steps:
- * 1. Refuse to run at all when this checkout is a fork (FORK RELEASE GATE below)
- * 2. Check for uncommitted changes
- * 3. Bump version via npm run version:xxx or set an explicit version
- * 4. Update CHANGELOG.md files: aggregate .changes/*.md fragments into a
+ * 1. Check for uncommitted changes
+ * 2. Bump version via npm run version:xxx or set an explicit version
+ * 3. Update CHANGELOG.md files: aggregate .changes/*.md fragments into a
  *    [version] - date section, git rm the consumed fragments
- * 5. Commit and tag
- * 6. Publish to npm
- * 7. Push the branch and the tag
+ * 4. Commit and tag
+ * 5. Publish to npm
  *
- * ───────────────────────────────── FORK RELEASE GATE ─────────────────────────────────
- *
- * What one `npm run release:*` does that cannot be undone, in the order it does it:
- *
- *   1. `git commit -m "Release v$ver"` - a release commit on this line's history, on top of a
- *      version bump that already rewrote every workspace `package.json` (and, for an explicit
- *      `x.y.z` target, already deleted and reinstalled `node_modules` + `package-lock.json`).
- *   2. `git tag v$ver` - the tag the registry, GitHub and every installer read as "a release".
- *   3. `npm run publish` -> `npm publish -ws --access public` - publishes `@earendil-works/pi-*`,
- *      i.e. the UPSTREAM public npm scope. npm never lets a version be unpublished again, so a
- *      fork build published from here is permanent and is what upstream users then install.
- *   4. `git push origin main` + `git push origin v$ver` - and pushing a `v*` tag is what triggers
- *      `.github/workflows/build-binaries.yml` (`on: push: tags: ['v*']`; its `publish` job runs
- *      with `permissions: contents: write` and `secrets.R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY`
- *      / `R2_BUCKET` / `R2_ENDPOINT_URL`), which uploads release artifacts to R2, rewrites
- *      `latest.json`, `stable` and `install.sh`, and creates or updates the GitHub release.
- *
- * Why this line must not do that: this checkout is the maintained fork
- * `Dmatut7/prime-agent-rlm`, not the upstream release channel. Its `build-binaries.yml` release
- * surface is live but unadjudicated (`docs/fork/merge-upstream-20260917.md` §4.4 risk R1), and
- * `CHANGELOG.md` §已知挂账 carries the ban as prose only ("仍禁推 `v*` 标签"). Prose is not a
- * guardrail - nothing in the repository stopped `npm run release:patch` from running all four
- * steps - so the gate below is that guardrail.
- *
- * How the fork is detected: walk up from this file's own directory for the marker file
- * `FORK_MARKER_FILE`, exactly like `detectForkInstall()` in
- * `packages/coding-agent/src/fork-self-update.ts` does for the self-update refusal. This is a
- * deliberate copy of a four-line walk, not an import: `npm run release:*` runs
- * `node scripts/release.mjs`, so importing the TypeScript side would need a loader (`tsx`/`jiti`)
- * plus a built `dist/` for its `@earendil-works/pi-ai` import - a gate that can fail to load is
- * not a gate. The two sides are pinned together instead by
- * `packages/coding-agent/test/release-fork-gate.test.ts`, which imports the TS constants, runs
- * both detectors over the same directories, and fails if either name drifts.
- *
- * How to release from a fork checkout anyway - explicitly, and only explicitly:
- *
- *   PRIME_AGENT_ALLOW_RELEASE=1 node scripts/release.mjs <major|minor|patch|x.y.z>
- *
- * Any other value (`true`, `yes`, `0`, empty, `1 `) keeps the refusal; per this repository's
- * "explicitly provided" rule there is no fallback and nothing is guessed. The override stops the
- * refusal and nothing else: it prints a warning naming every step above, and the run then goes on
- * to commit, tag, `npm publish` `@earendil-works/pi-*` to the public registry, push `main`, push
- * the tag, and thereby run `build-binaries.yml` with `contents: write` and the R2 secrets.
- *
- * The gate fires before argument parsing and before anything is read, written or spawned, and it
- * fires on `--dry-run` too. A dry run performs no irreversible step (it prints the changelog
- * preview and exits before the first write), so gating it is not about protecting the tree: it is
- * because a rehearsal that looks and reads like a normal release is how a forbidden release gets
- * run, and because a refusal that depends on a flag is a hole the size of that flag. `--dry-run`
- * with the override set is the supported way to look at what a release would fold together.
- * ─────────────────────────────────────────────────────────────────────────────────────
+ * Release gate (first statement, before argument validation and before any step above):
+ * this one command is the whole forbidden path. Step 4 tags `v$version` and step 5 runs
+ * `npm publish -ws --access public` under the upstream public scope, and both are banned
+ * in this fork - `.github/workflows/build-binaries.yml` is live here on `push: tags: ['v*']`
+ * with a publish job holding `permissions: contents: write`, origin has never run it, and
+ * the lane still lacks three upstream fixes, so a `v*` tag from here publishes release
+ * artifacts from an unadjudicated lane (CHANGELOG.md:45, docs/fork/merge-upstream-20260917.md:180/192).
+ * Until that is adjudicated, `assertReleaseAllowed()` refuses on a fork checkout and says
+ * why; the one way out prints a warning. See scripts/lib/fork-gate.mjs.
  */
 
 import { execSync } from "child_process";
 import { readFileSync, writeFileSync, readdirSync, existsSync } from "fs";
-import { dirname, join, resolve } from "path";
-import { fileURLToPath } from "url";
+import { dirname, join } from "path";
 import { buildReleaseSection } from "./lib/changelog-fragments.mjs";
+import { assertReleaseAllowed, ReleaseGateRefusal } from "./lib/fork-gate.mjs";
 
-/**
- * Marker this fork keeps at its repository root.
- *
- * Must stay equal to the `FORK_MARKER_FILE` export of
- * `packages/coding-agent/src/fork-self-update.ts`; the needle named in the header asserts the
- * equality and runs both marker walks over the same fixture directories, so neither side can be
- * renamed or repointed on its own.
- */
-const FORK_MARKER_FILE = "FORK_NOTES.md";
-
-/**
- * The only override this gate accepts, and deliberately not `PRIME_AGENT_FORK_GATE`: that variable
- * is the self-update gate's test seam (`=off`), and a seam that exists so suites can exercise the
- * official update path must never open a release. Pinned behaviourally by the same needle.
- */
-const RELEASE_OVERRIDE_ENV_VAR = "PRIME_AGENT_ALLOW_RELEASE";
-
-/** The irreversible steps, printed by both gate outcomes so neither can be read as harmless. */
-const IRREVERSIBLE_RELEASE_STEPS = [
-	'1. git commit -m "Release v<ver>"  (the version bump already rewrote every package.json)',
-	"2. git tag v<ver>",
-	"3. npm run publish -> npm publish -ws --access public: publishes @earendil-works/pi-*,",
-	"   the UPSTREAM public npm scope, where a version can never be unpublished again",
-	"4. git push origin main && git push origin v<ver>: pushing a v* tag runs",
-	"   .github/workflows/build-binaries.yml (publish job: permissions contents: write,",
-	"   secrets.R2_ACCESS_KEY_ID) -> release artifacts to R2, latest.json/stable/install.sh",
-	"   rewritten, GitHub release created or updated",
-];
-
-/** Walk up from `startDir` for the fork marker; mirrors `findForkInstall()` on the TypeScript side. */
-function findForkRoot(startDir) {
-	let dir = resolve(startDir);
-	for (;;) {
-		if (existsSync(join(dir, FORK_MARKER_FILE))) {
-			return dir;
+// The gate runs before the usage check below on purpose: a refused release must say why it
+// is refused, not print a usage line. It walks up from scripts/lib, so it answers "which
+// checkout owns this script" rather than "where was it started from".
+try {
+	assertReleaseAllowed();
+} catch (error) {
+	if (error instanceof ReleaseGateRefusal) {
+		for (const line of error.lines) {
+			console.error(line);
 		}
-		const parent = dirname(dir);
-		if (parent === dir) {
-			return undefined;
-		}
-		dir = parent;
+		process.exit(error.exitCode);
 	}
+	throw error;
 }
-
-/**
- * The gate itself: refuse on a fork checkout, warn loudly when the override is given, and do
- * nothing at all on an installation that is not a fork checkout. Called before any argument is
- * parsed, so no invocation shape can reach the steps below without passing it.
- */
-function forkReleaseGate() {
-	const forkRoot = findForkRoot(dirname(fileURLToPath(import.meta.url)));
-	if (forkRoot === undefined) {
-		return;
-	}
-
-	const override = process.env[RELEASE_OVERRIDE_ENV_VAR];
-	if (override === "1") {
-		console.warn(`warning: ${RELEASE_OVERRIDE_ENV_VAR}=1 given; releasing from a fork checkout.`);
-		console.warn(`warning: fork marker ${FORK_MARKER_FILE} at ${forkRoot}`);
-		console.warn("warning: the flag stops this refusal and nothing else. This run will still:");
-		for (const step of IRREVERSIBLE_RELEASE_STEPS) {
-			console.warn(`   ${step}`);
-		}
-		console.warn("");
-		return;
-	}
-
-	const lines = [
-		`error: refusing to release from a fork checkout (marker ${FORK_MARKER_FILE} at ${forkRoot}).`,
-		"",
-		"One `npm run release:*` performs, in this order, steps that cannot be undone:",
-		...IRREVERSIBLE_RELEASE_STEPS.map((step) => `   ${step}`),
-		"",
-		"This checkout is the maintained fork Dmatut7/prime-agent-rlm, not the upstream release",
-		"channel, and its build-binaries.yml release surface is live but unadjudicated",
-		"(docs/fork/merge-upstream-20260917.md §4.4 R1; CHANGELOG.md 已知挂账 records the `v*` tag",
-		"ban as prose only). Publishing from here would put a fork build into the public",
-		"@earendil-works/pi-* scope for good and cut a release nobody adjudicated.",
-		"",
-		"Nothing was read, written, committed, tagged, published or pushed: the gate runs before",
-		"argument parsing and applies to --dry-run as well.",
-		"",
-		"To release from this checkout anyway, say so explicitly:",
-		`   ${RELEASE_OVERRIDE_ENV_VAR}=1 node scripts/release.mjs <major|minor|patch|x.y.z>`,
-	];
-	// Named but not echoed: a mis-set variable's value has no business ending up in a CI log, and
-	// "set to something that is not 1" is the whole reason the run was refused.
-	if (override !== undefined) {
-		lines.push(
-			"",
-			`note: ${RELEASE_OVERRIDE_ENV_VAR} is set, but to something other than exactly "1", so the`,
-			"refusal stands. There is no fallback value.",
-		);
-	}
-	for (const line of lines) {
-		console.error(line);
-	}
-	process.exit(1);
-}
-
-forkReleaseGate();
 
 const DRY_RUN = process.argv.includes("--dry-run");
 const RELEASE_TARGET = process.argv.slice(2).find((arg) => !arg.startsWith("--"));
