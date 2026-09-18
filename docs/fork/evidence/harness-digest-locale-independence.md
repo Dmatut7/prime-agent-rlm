@@ -106,4 +106,4 @@ cd /tmp/fixL3a-wt/e1 && node packages/coding-agent/scripts/perf/harness-parity.m
 
 - `harness-search-parity.md` §9 的「只报不修」由本笔消除；该文档 §9 与金标准的后续更新归 E 席（remint runbook `e-REMINT-RUNBOOK.md` §2）；本席不写那两处。
 - `scripts/perf/**` 一个字未动（只读跑 `--verify`）；`prime-agent-runtime` / `agent-session.ts` / `FORK_NOTES.md` / `CHANGELOG.md` 未动。
-- 全仓 `src/` 其余 ~47 处 `localeCompare`（model-resolver、cron-jobs、fact-appendix、system-prompt 等）**只报不改**，清单在 OBS-E1 交付 NOTES，交母席裁。
+- 全仓 `src/` 其余 **40 处** `localeCompare`（**24 个文件**；口径＝`grep -rn "localeCompare" packages/*/src --include="*.ts"` 得 42 处，其中 `refinement.ts` 的 2 处是本文件与源码文档字符串里的引用，其余 40 处逐条清单在 OBS-E1 交付 `EVIDENCE/localeCompare-rest-of-src.txt`）**只报不改**，交母席裁。值得优先裁的六处（digest/装配邻接）：`compaction/fact-appendix.ts:611,622`、`system-prompt.ts:182`（enabled servers 排序，直接进 system prompt 渲染）、`rlm-runtime.ts:260`（selector 序）、`core/kernel/bootstrap.ts`＋`core/retention/kernel-snapshot.ts`（内核装配序）、`utils/version-check.ts:42,48`（版本比较，`localeCompare` 语义与语义化版本不同）。其中 `model-selector.ts:364,407` 是 `localeCompare(x, undefined, { numeric: true })`＝**刻意的数字序用法**，若将来统一码点比较要单独裁。
