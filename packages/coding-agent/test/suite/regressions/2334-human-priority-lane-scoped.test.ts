@@ -52,9 +52,9 @@ import {
 	isAgentSessionMessage,
 } from "../../../src/core/agent-messages.js";
 import {
+	type SessionActionRecoverySnapshot,
 	sessionActionPriorityFor,
 	sessionActionPriorityForInputClass,
-	type SessionActionRecoverySnapshot,
 } from "../../../src/core/agent-session.js";
 import {
 	classifyIncomingInput,
