@@ -12,7 +12,14 @@ jobs:
   changelog-fragment:
     name: Check changelog fragment
     runs-on: ubuntu-latest
-    if: github.event.pull_request.user.type != 'Bot'
+    # Upstream's PR-time convention, scoped to the repository whose release path consumes it.
+    # A fragment is only ever read by `scripts/release.mjs`, which folds fragments into a release
+    # section; on this fork checkout that script refuses to run (fork gate: no `npm publish`, no
+    # `v*` tag - see `scripts/lib/fork-gate.mjs`) and this line's CHANGELOG is written by hand from
+    # the fork ledger, so a requirement here would make people write files that no step ever folds
+    # in. The fragments already in the tree are kept (each packages/*/.changes/README.md says so),
+    # and deleting this condition opts the line back in.
+    if: github.repository == 'PrimeIntellect-ai/prime-agent' && github.event.pull_request.user.type != 'Bot'
     steps:
       - name: Require a changelog fragment for changed packages or an explicit opt-out
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
