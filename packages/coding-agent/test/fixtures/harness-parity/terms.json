@@ -1,0 +1,117 @@
+{
+  "$comment": "Explicit term lists for the cross-language harness parity fixture. Both needles and scripts/perf/harness-parity.mjs read this file; expected.json in the same directory is machine-generated from it and must never be hand-edited. mode=explicit: both sides bypass their own tokenizer (TS gets a weight-1 term map, Python gets _search_score with the same list) so the scores are comparable. mode=tokenized: both sides run their own production tokenizer over python_query, which is where the documented divergences live.",
+  "cases": [
+    {
+      "name": "parity",
+      "mode": "explicit",
+      "kind": "memory",
+      "top_k": [
+        6,
+        10
+      ],
+      "terms": [
+        "worktree",
+        "session",
+        "quantum",
+        "harness",
+        "ledger",
+        "digest",
+        "登录",
+        "修复",
+        "rlm",
+        "embedded"
+      ],
+      "python_query": "worktree session quantum harness ledger digest 登录 修复 rlm embedded",
+      "expect": "same_order",
+      "note": "One kind as the corpus, explicit terms, every weight 1, every field a string, distinct positive scores above the cut: the digest window and harness.search must return the same ids in the same order."
+    },
+    {
+      "name": "tie_window",
+      "mode": "explicit",
+      "kind": "memory",
+      "top_k": [
+        6
+      ],
+      "terms": [
+        "quantum",
+        "ledger"
+      ],
+      "python_query": "quantum ledger",
+      "expect": "divergent_tiebreak",
+      "note": "The tie group lands inside the visible window, so the two documented tie-breaks (TS identifier order, Python updated_at desc) pick different rows."
+    },
+    {
+      "name": "tokenizer_floor",
+      "mode": "tokenized",
+      "kind": "memory",
+      "top_k": [
+        6
+      ],
+      "terms": [
+        "rlm",
+        "api",
+        "мир",
+        "世界",
+        "worktree"
+      ],
+      "python_query": "rlm api мир 世界 worktree",
+      "expect": "divergent_tokenizer",
+      "note": "Python keeps three-character ASCII and two-character non-ASCII runs; the TS digest tokenizer cuts everything non-CJK below four characters."
+    },
+    {
+      "name": "nonstring_path",
+      "mode": "explicit",
+      "kind": "memory",
+      "top_k": [
+        6
+      ],
+      "terms": [
+        "general"
+      ],
+      "python_query": "general",
+      "expect": "divergent_field_normalization",
+      "note": "mem_numeric_path persists path as a number: the Python loader coerces it to 'general', the TS loader leaves it non-string and the identifier slot loses it."
+    },
+    {
+      "name": "df_corpus",
+      "mode": "explicit",
+      "kind": null,
+      "top_k": [
+        6,
+        10
+      ],
+      "terms": [
+        "worktree",
+        "session",
+        "quantum",
+        "harness",
+        "ledger",
+        "digest",
+        "登录",
+        "修复",
+        "rlm",
+        "embedded"
+      ],
+      "python_query": "worktree session quantum harness ledger digest 登录 修复 rlm embedded",
+      "expect": "divergent_df_corpus",
+      "note": "Python search(kind=None) merges every kind into one document-frequency corpus; the TS digest always ranks one kind at a time."
+    },
+    {
+      "name": "weights",
+      "mode": "explicit_weighted",
+      "kind": "memory",
+      "top_k": [
+        6
+      ],
+      "terms": {
+        "worktree": 3,
+        "session": 2,
+        "digest": 1.5,
+        "quantum": 1
+      },
+      "python_query": "worktree session digest quantum",
+      "expect": "divergent_term_weights",
+      "note": "The production digest weights goal terms 3 and recent-message terms 2 -> 1.5 -> 1 (agent-session.ts _buildHarnessDigestQueryTerms); harness.search has no weight face."
+    }
+  ]
+}
