@@ -4,7 +4,7 @@
 
 ## 0.10.0（2026-09-18）
 
-吸收上游 `e2fb7bfa1` 窗（136 笔）的择取部分，加上本 fork 的一批效果与安全修复。CI **14 个 job**（10 matrix + Contributor trust + build-check + test-hygiene + build-check-test）全绿。
+吸收上游 `e2fb7bfa1` 窗（136 笔）的择取部分，加上本 fork 的一批效果与安全修复。CI **14 个 job**（10 matrix + Contributor trust + build-check + test-hygiene + build-check-test）：收口批的头 CI 曾是**红的**（run `35359758914`、`35360701254`，四条真因＝旧 release 针没跟 `b040da84d` 的契约迁移 / `ci.yml` 还在跑 `9afed3ba6` 删掉的 floor 模块 / resync 路径在 `uiServices` 缺席时抛 TypeError / 扫描计数仪器的 turnEnd 期望没跟着共享扫描重锚），修好后 run `RUN_ID_PENDING` 全绿。
 
 ### 从上游吸收
 
@@ -23,12 +23,12 @@
 
 ### 本 fork 新增 / 修复
 
-- **子代理花费格**：subagents 行显示 `Σ 子代理 ¥… · …tok · 总 ¥…`；节拍可配（`ui.subagentSpendCell.intervalMs`，默认 15s、5–120s 可配；`false` 才关扫描，`intervalMs: 0` 会被 clamp 到 5000 而不是关）；价格标错可在 `ui.subagentSpendCell.priceOverrides` 覆盖，cell 与 /usage 都会标明来源。性能修复（读数口径＝仓内可复跑仪器 `scripts/perf/`，见 `docs/fork/evidence/`）：节流派生后每 60s 约 **5 次**扫描（变异拆掉节流变 28 次）；单次扫描 p50 仪器复现 **2.36×/3.27×** 更快；缓存上界/LRU/忙退避修复后（`f86807bf0`/`0237e01f7`/`14d40f67f`/`649f6a074`/`199646bf4`）：驻留 80.06MB→0.48MB、忙家族一拍 syscall 降到比不开缓存还便宜、预算外失效比值 0.19；**净效应随目录形状与测量窗口变号**——单文件形状快 36%（paired 成对口径），两文件形状（真语料 84% 的形态）以每目录 +1 次 4KB 头预读换同一批命中，实测幅度两例 +56% 与 +12.6%（两例的修前臂绝对值本身差 55%，故幅度不作定数、机制确定）；顶栏与花费格合流后一拍只取一次上下文树（3→1），应急开关 `false` 两个面都停扫。
+- **子代理花费格**：subagents 行显示 `Σ 子代理 ¥… · …tok · 总 ¥…`；节拍可配（`ui.subagentSpendCell.intervalMs`，默认 15s、5–120s 可配；`false` 才关扫描，`intervalMs: 0` 会被 clamp 到 5000 而不是关）；价格标错可在 `ui.subagentSpendCell.priceOverrides` 覆盖，cell 与 /usage 都会标明来源。性能修复（读数口径＝仓内可复跑仪器 `docs/fork/evidence/spend-cell-scan-count.test.mjs`（扫描计数，假时钟、负控带 5s 节拍/关扫描/家族消失三腿）与 `packages/coding-agent/scripts/perf/`（bench），见 `docs/fork/evidence/`）：节流派生后每 60s 约 **5 次**扫描（同一夹具在节流前树测得 **12 次**）；缓存上界/LRU/忙退避修复后（`1f8ab25d3`，针 `54c0e9979`/`38a041995`；驻留与比值是车道一次性量测）：驻留 80.06MB→0.48MB、忙家族一拍 syscall 降到比不开缓存还便宜、预算外失效比值 0.19；**净效应随目录形状与测量窗口变号**——单文件形状快 36%（paired 成对口径），两文件形状（真语料 84% 的形态）以每目录 +1 次 4KB 头预读换同一批命中，实测幅度两例 +56% 与 +12.6%（两例的修前臂绝对值本身差 55%，故幅度不作定数、机制确定）；顶栏与花费格合流后一拍只取一次上下文树（3→1），应急开关 `false` 两个面都停扫。
 - **压缩面增量**：keepRecent 与切点按**内容密度**重标（`ac60d4607`）；压缩 hung 时排队输入（含你的打字与 heartbeat）有了 **stall 上界**（`ede1f8da8`，以前可能无限期不落地且 CI 全绿）。触发 80%／准入门／降级阀／"压缩优先于子代理回执"属 0.9.5 压缩束，见下节。
 - **provider retry 单层化**：每条路径只在最外层重试一次（`0a6377d35`），SDK 层在被包装时 maxRetries=0，模块移除时 SDK 按策略重试。
 - **before-compact hook 抛错改响亮失败**＋expand 键搬家＋archived 行带 error verdict（`5924d4d0c`）。
 - **refinement notice 不进 headless 终局结果**（`b8375478c`，纵深防御：上游形态写的旧 journal 里 notice 不会被当终值输出）。
-- **harness 菜单搬出系统提示**（#2098）：系统提示 62,181→50,816 字节；前缀不再每轮作废——背靠背第二轮缓存命中读数 **faux 前缀模拟器 0.9499 / 真转录中位 0.9975**（仪器在仓内 2098 测试的 `P2098_CACHE_READINGS`，带"故意破前缀"正控；该读数的 systemPromptBytes=12,358 与上面 50,816 不是同一个面，前者只含被缓存命中的前缀段）；新记忆/新技能**下一轮可见**；被拒的精修条目模型可见；修掉"别席改了你报过的同一条目就永不再注入"的版本盲洞；排序单次打分＋字节存命中（1/16/17/48/58 词等价针）；投递先判后渲染（moved-stamp 但不投递的回合零渲染，针带两侧正控）。
+- **harness 菜单搬出系统提示**（#2098）：系统提示 62,181→50,816 字节（**一次性真机读数**，出处 `docs/fork/merge-upstream-20260917.md:133`，仓内无仪器可复跑）；前缀不再每轮作废——背靠背第二轮缓存命中读数 **faux 前缀模拟器 0.9499**（＝cacheRead 3959 / 冷输入 4168；仪器在仓内 2098 测试 `packages/coding-agent/test/suite/regressions/2098-static-prompt-harness-digest.test.ts` 的 `P2098_CACHE_READINGS` 读数件，带"故意破前缀"正控；该读数的 systemPromptBytes=12,358 与上面 50,816 不是同一个面，前者只含被缓存命中的前缀段）；新记忆/新技能**下一轮可见**；被拒的精修条目模型可见；修掉"别席改了你报过的同一条目就永不再注入"的版本盲洞；排序单次打分＋字节存命中（1/16/17/48/58 词等价针）；投递先判后渲染（moved-stamp 但不投递的回合零渲染，针带两侧正控）。
 - **真 bug 修复**：digest 占 index 0 曾让"超大首回合"的压缩被整段跳过（上下文继续涨），已修。
 - **CI 六条红逐条挖真因修好**：platform registry 缺行、DAT-4 注入点死（仪器腐烂读成绿）、monitor"40 步预算"＝伪装挂钟预算、waitForFile 只等存在不等内容、afterEach 把 socket 消失当进程退出、process smoke 计数随 digest 进上下文的预期变化。
 - **新增第四专 job 本地镜像闸** `npm run check:process-smoke`：兜住"一个测试面悄悄消失"（偷偷加 tag 时 vitest 与 coverage 闸都仍绿，只有 tag-skip ledger 闸会红）。
