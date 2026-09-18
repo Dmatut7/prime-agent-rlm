@@ -1,7 +1,7 @@
 {
- "generated_at": "2026-09-18T13:10:31.411Z",
+ "generated_at": "2026-09-18T13:45:37.895Z",
  "generated_by": "node packages/coding-agent/scripts/perf/harness-parity.mjs --write",
- "base_sha": "4c6623868a39a292e8cc5e022b7f5fd811af0eb5",
+ "base_sha": "3be99915496969d10a4f533256b0693c5732774c",
  "python_version": "3.11",
  "tolerance": 1e-12,
  "implementations": {
@@ -118,12 +118,9 @@
       "mem_login_timeout",
       "mem_kernel_bridge",
       "mem_bilingual_fix",
-      "mem_world_book",
-      "mem_numeric_path",
-      "mem_font_metrics",
-      "mem_parallel_lanes",
-      "mem_prompt_cache"
-     ]
+      "mem_world_book"
+     ],
+     "order_note": "positive prefix only; the zero-score tail is ICU-locale dependent"
     },
     "python": {
      "corpus_count": 28,
@@ -296,7 +293,7 @@
      "tie_gamma": 3.2386784521643808,
      "mem_numeric_path": 0
     },
-    "rank": [
+    "rank_positive": [
      "mem_quantum_harness",
      "mem_session_worktree",
      "mem_worktree_discipline",
@@ -320,12 +317,15 @@
      "mem_login_timeout",
      "mem_kernel_bridge",
      "mem_bilingual_fix",
-     "mem_world_book",
-     "mem_numeric_path",
+     "mem_world_book"
+    ],
+    "zero_ids": [
      "mem_font_metrics",
+     "mem_numeric_path",
      "mem_parallel_lanes",
      "mem_prompt_cache"
     ],
+    "rank_note": "zero-score tail not recorded: localeCompare without a locale is ICU-locale dependent",
     "top_k": {
      "6": [
       "mem_quantum_harness",
@@ -638,25 +638,9 @@
       "mem_worktree_discipline",
       "mem_digest_bytes",
       "mem_harness_refine",
-      "mem_worktree_cleanup",
-      "mem_numeric_path",
-      "mem_api_rlm_contract",
-      "mem_harness_digest_window",
-      "mem_harness_search_parity",
-      "mem_login_fix",
-      "mem_session_prefix_cache",
-      "mem_embedded_id",
-      "mem_bilingual_fix",
-      "mem_font_metrics",
-      "mem_kernel_bridge",
-      "mem_parallel_lanes",
-      "mem_prompt_cache",
-      "mem_session_worktree",
-      "mem_world_book",
-      "mem_fix_order",
-      "mem_cjk_login_session",
-      "mem_login_timeout"
-     ]
+      "mem_worktree_cleanup"
+     ],
+     "order_note": "positive prefix only; the zero-score tail is ICU-locale dependent"
     },
     "python": {
      "corpus_count": 28,
@@ -785,7 +769,7 @@
      "tie_gamma": 3.2386784521643808,
      "mem_numeric_path": 0
     },
-    "rank": [
+    "rank_positive": [
      "mem_quantum_annealing",
      "mem_quantum_harness",
      "mem_quantum_session",
@@ -796,25 +780,28 @@
      "mem_worktree_discipline",
      "mem_digest_bytes",
      "mem_harness_refine",
-     "mem_worktree_cleanup",
-     "mem_numeric_path",
+     "mem_worktree_cleanup"
+    ],
+    "zero_ids": [
      "mem_api_rlm_contract",
+     "mem_bilingual_fix",
+     "mem_cjk_login_session",
+     "mem_embedded_id",
+     "mem_fix_order",
+     "mem_font_metrics",
      "mem_harness_digest_window",
      "mem_harness_search_parity",
-     "mem_login_fix",
-     "mem_session_prefix_cache",
-     "mem_embedded_id",
-     "mem_bilingual_fix",
-     "mem_font_metrics",
      "mem_kernel_bridge",
+     "mem_login_fix",
+     "mem_login_timeout",
+     "mem_numeric_path",
      "mem_parallel_lanes",
      "mem_prompt_cache",
+     "mem_session_prefix_cache",
      "mem_session_worktree",
-     "mem_world_book",
-     "mem_fix_order",
-     "mem_cjk_login_session",
-     "mem_login_timeout"
+     "mem_world_book"
     ],
+    "rank_note": "zero-score tail not recorded: localeCompare without a locale is ICU-locale dependent",
     "top_k": {
      "6": [
       "mem_quantum_annealing",
@@ -1020,32 +1007,9 @@
       "mem_world_book",
       "mem_worktree_discipline",
       "mem_session_worktree",
-      "mem_worktree_cleanup",
-      "mem_numeric_path",
-      "mem_api_rlm_contract",
-      "mem_harness_digest_window",
-      "mem_harness_search_parity",
-      "mem_login_fix",
-      "mem_session_prefix_cache",
-      "mem_session_ledger",
-      "mem_embedded_id",
-      "mem_bilingual_fix",
-      "mem_digest_bytes",
-      "mem_font_metrics",
-      "mem_kernel_bridge",
-      "mem_parallel_lanes",
-      "mem_prompt_cache",
-      "mem_quantum_annealing",
-      "mem_quantum_harness",
-      "mem_quantum_session",
-      "mem_harness_refine",
-      "tie_alpha",
-      "tie_beta",
-      "tie_gamma",
-      "mem_fix_order",
-      "mem_cjk_login_session",
-      "mem_login_timeout"
-     ]
+      "mem_worktree_cleanup"
+     ],
+     "order_note": "positive prefix only; the zero-score tail is ICU-locale dependent"
     },
     "python": {
      "corpus_count": 28,
@@ -1171,36 +1135,39 @@
      "tie_gamma": 0,
      "mem_numeric_path": 0
     },
-    "rank": [
+    "rank_positive": [
      "mem_world_book",
      "mem_worktree_discipline",
      "mem_session_worktree",
-     "mem_worktree_cleanup",
-     "mem_numeric_path",
+     "mem_worktree_cleanup"
+    ],
+    "zero_ids": [
      "mem_api_rlm_contract",
-     "mem_harness_digest_window",
-     "mem_harness_search_parity",
-     "mem_login_fix",
-     "mem_session_prefix_cache",
-     "mem_session_ledger",
-     "mem_embedded_id",
      "mem_bilingual_fix",
+     "mem_cjk_login_session",
      "mem_digest_bytes",
+     "mem_embedded_id",
+     "mem_fix_order",
      "mem_font_metrics",
+     "mem_harness_digest_window",
+     "mem_harness_refine",
+     "mem_harness_search_parity",
      "mem_kernel_bridge",
+     "mem_login_fix",
+     "mem_login_timeout",
+     "mem_numeric_path",
      "mem_parallel_lanes",
      "mem_prompt_cache",
      "mem_quantum_annealing",
      "mem_quantum_harness",
      "mem_quantum_session",
-     "mem_harness_refine",
+     "mem_session_ledger",
+     "mem_session_prefix_cache",
      "tie_alpha",
      "tie_beta",
-     "tie_gamma",
-     "mem_fix_order",
-     "mem_cjk_login_session",
-     "mem_login_timeout"
+     "tie_gamma"
     ],
+    "rank_note": "zero-score tail not recorded: localeCompare without a locale is ICU-locale dependent",
     "top_k": {
      "6": [
       "mem_world_book",
@@ -1417,36 +1384,8 @@
       "tie_gamma": 0,
       "mem_numeric_path": 0
      },
-     "order": [
-      "mem_numeric_path",
-      "mem_api_rlm_contract",
-      "mem_harness_digest_window",
-      "mem_harness_search_parity",
-      "mem_worktree_discipline",
-      "mem_login_fix",
-      "mem_session_prefix_cache",
-      "mem_session_ledger",
-      "mem_embedded_id",
-      "mem_bilingual_fix",
-      "mem_digest_bytes",
-      "mem_font_metrics",
-      "mem_kernel_bridge",
-      "mem_parallel_lanes",
-      "mem_prompt_cache",
-      "mem_quantum_annealing",
-      "mem_quantum_harness",
-      "mem_quantum_session",
-      "mem_harness_refine",
-      "mem_session_worktree",
-      "tie_alpha",
-      "tie_beta",
-      "tie_gamma",
-      "mem_worktree_cleanup",
-      "mem_world_book",
-      "mem_fix_order",
-      "mem_cjk_login_session",
-      "mem_login_timeout"
-     ]
+     "order": [],
+     "order_note": "positive prefix only; the zero-score tail is ICU-locale dependent"
     },
     "python": {
      "corpus_count": 28,
@@ -1559,36 +1498,38 @@
      "tie_gamma": 0,
      "mem_numeric_path": 0
     },
-    "rank": [
-     "mem_numeric_path",
+    "rank_positive": [],
+    "zero_ids": [
      "mem_api_rlm_contract",
-     "mem_harness_digest_window",
-     "mem_harness_search_parity",
-     "mem_worktree_discipline",
-     "mem_login_fix",
-     "mem_session_prefix_cache",
-     "mem_session_ledger",
-     "mem_embedded_id",
      "mem_bilingual_fix",
+     "mem_cjk_login_session",
      "mem_digest_bytes",
+     "mem_embedded_id",
+     "mem_fix_order",
      "mem_font_metrics",
+     "mem_harness_digest_window",
+     "mem_harness_refine",
+     "mem_harness_search_parity",
      "mem_kernel_bridge",
+     "mem_login_fix",
+     "mem_login_timeout",
+     "mem_numeric_path",
      "mem_parallel_lanes",
      "mem_prompt_cache",
      "mem_quantum_annealing",
      "mem_quantum_harness",
      "mem_quantum_session",
-     "mem_harness_refine",
+     "mem_session_ledger",
+     "mem_session_prefix_cache",
      "mem_session_worktree",
+     "mem_worktree_cleanup",
+     "mem_worktree_discipline",
+     "mem_world_book",
      "tie_alpha",
      "tie_beta",
-     "tie_gamma",
-     "mem_worktree_cleanup",
-     "mem_world_book",
-     "mem_fix_order",
-     "mem_cjk_login_session",
-     "mem_login_timeout"
+     "tie_gamma"
     ],
+    "rank_note": "zero-score tail not recorded: localeCompare without a locale is ICU-locale dependent",
     "top_k": {
      "6": [
       "mem_numeric_path",
@@ -1803,12 +1744,9 @@
       "mem_login_timeout",
       "mem_kernel_bridge",
       "mem_bilingual_fix",
-      "mem_world_book",
-      "mem_numeric_path",
-      "mem_font_metrics",
-      "mem_parallel_lanes",
-      "mem_prompt_cache"
-     ]
+      "mem_world_book"
+     ],
+     "order_note": "positive prefix only; the zero-score tail is ICU-locale dependent"
     },
     "python": {
      "corpus_count": 32,
@@ -1989,7 +1927,7 @@
      "tie_gamma": 3.2386784521643808,
      "mem_numeric_path": 0
     },
-    "rank": [
+    "rank_positive": [
      "mem_quantum_harness",
      "mem_session_worktree",
      "mem_worktree_discipline",
@@ -2013,12 +1951,15 @@
      "mem_login_timeout",
      "mem_kernel_bridge",
      "mem_bilingual_fix",
-     "mem_world_book",
-     "mem_numeric_path",
+     "mem_world_book"
+    ],
+    "zero_ids": [
      "mem_font_metrics",
+     "mem_numeric_path",
      "mem_parallel_lanes",
      "mem_prompt_cache"
     ],
+    "rank_note": "zero-score tail not recorded: localeCompare without a locale is ICU-locale dependent",
     "top_k": {
      "6": [
       "mem_quantum_harness",
@@ -2349,21 +2290,9 @@
       "mem_harness_search_parity",
       "tie_alpha",
       "tie_beta",
-      "tie_gamma",
-      "mem_numeric_path",
-      "mem_api_rlm_contract",
-      "mem_login_fix",
-      "mem_embedded_id",
-      "mem_bilingual_fix",
-      "mem_font_metrics",
-      "mem_kernel_bridge",
-      "mem_parallel_lanes",
-      "mem_prompt_cache",
-      "mem_harness_refine",
-      "mem_world_book",
-      "mem_fix_order",
-      "mem_login_timeout"
-     ]
+      "tie_gamma"
+     ],
+     "order_note": "positive prefix only; the zero-score tail is ICU-locale dependent"
     },
     "python": {
      "corpus_count": 28,
@@ -2504,7 +2433,7 @@
      "tie_gamma": 1.7346010553881064,
      "mem_numeric_path": 0
     },
-    "rank": [
+    "rank_positive": [
      "mem_session_worktree",
      "mem_worktree_discipline",
      "mem_worktree_cleanup",
@@ -2519,21 +2448,24 @@
      "mem_harness_search_parity",
      "tie_alpha",
      "tie_beta",
-     "tie_gamma",
-     "mem_numeric_path",
+     "tie_gamma"
+    ],
+    "zero_ids": [
      "mem_api_rlm_contract",
-     "mem_login_fix",
-     "mem_embedded_id",
      "mem_bilingual_fix",
+     "mem_embedded_id",
+     "mem_fix_order",
      "mem_font_metrics",
+     "mem_harness_refine",
      "mem_kernel_bridge",
+     "mem_login_fix",
+     "mem_login_timeout",
+     "mem_numeric_path",
      "mem_parallel_lanes",
      "mem_prompt_cache",
-     "mem_harness_refine",
-     "mem_world_book",
-     "mem_fix_order",
-     "mem_login_timeout"
+     "mem_world_book"
     ],
+    "rank_note": "zero-score tail not recorded: localeCompare without a locale is ICU-locale dependent",
     "top_k": {
      "6": [
       "mem_session_worktree",

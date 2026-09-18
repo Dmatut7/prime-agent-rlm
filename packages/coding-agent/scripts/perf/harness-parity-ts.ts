@@ -49,7 +49,9 @@ interface CaseReport {
 	tokenizer_terms: string[];
 	idf: Record<string, number>;
 	scores: Record<string, number>;
-	rank: string[];
+	rank_positive: string[];
+	zero_ids: string[];
+	rank_note: string;
 	top_k: Record<string, string[]>;
 	digest_window: Record<string, string[] | null>;
 	digest_face: string;
@@ -195,7 +197,17 @@ function main(): void {
 			tokenizer_terms: harnessQueryTerms(parityCase.python_query),
 			idf: idfRecord,
 			scores,
-			rank: ranked.map((entry) => entry.id),
+			// Only the positive-score prefix of the ranking is recorded. The
+			// zero-score tail is ordered by `localeCompare` without an explicit
+			// locale, and ICU collation of non-ASCII identifiers follows the
+			// process locale (measured: "修复顺序".localeCompare("登录超时") is -1
+			// under LC_ALL=en_US.UTF-8 and +1 under LC_ALL=zh_CN.UTF-8), so
+			// recording that tail would make the golden locale-dependent. The set
+			// of zero-score rows is locale-free and is recorded instead; where the
+			// digest puts them is OBS-1's face anyway.
+			rank_positive: ranked.map((entry) => entry.id).filter((id) => scores[id] > 0),
+			zero_ids: entries.map((entry) => entry.id).filter((id) => scores[id] === 0).sort(),
+			rank_note: "zero-score tail not recorded: localeCompare without a locale is ICU-locale dependent",
 			top_k: topK,
 			digest_window: windows,
 			digest_face: anyEntryScored

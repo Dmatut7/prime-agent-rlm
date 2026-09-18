@@ -444,9 +444,12 @@ function run(options, workdirs) {
 			const tsIdfDrift = equalNumbers(tsCase.idf, referenceTs.idf);
 			if (tsIdfDrift.length > 0) record(findings, "fail", name, "reference ts idf", JSON.stringify(tsIdfDrift.slice(0, 4)));
 			else record(findings, "pass", name, "reference ts idf", `${Object.keys(referenceTs.idf).length} terms`);
-			if (!equalLists(tsCase.rank, referenceTs.order)) {
-				record(findings, "fail", name, "reference ts order", `${tsCase.rank.join(",")} != ${referenceTs.order.join(",")}`);
-			} else record(findings, "pass", name, "reference ts order", `${referenceTs.order.length} ids`);
+			// The reference's zero tail is locale-dependent for the same reason, so
+			// only the positive prefix is compared.
+			const referencePositive = referenceTs.order.filter((id) => (referenceTs.scores[id] ?? 0) > 0);
+			if (!equalLists(tsCase.rank_positive, referencePositive)) {
+				record(findings, "fail", name, "reference ts order", `${tsCase.rank_positive.join(",")} != ${referencePositive.join(",")}`);
+			} else record(findings, "pass", name, "reference ts order", `${referencePositive.length} positive ids`);
 		}
 		if (!pyBroken) {
 			if (pyScoreDrift.length > 0) record(findings, "fail", name, "reference python scores", JSON.stringify(pyScoreDrift.slice(0, 4)));
@@ -475,10 +478,23 @@ function run(options, workdirs) {
 		} else {
 			record(findings, "pass", name, "python drops zero-score rows", `${pyCase.order.length} hits, all scored above 0`);
 		}
-		if (tsCase.rank.length !== tsCase.corpus_count) {
-			record(findings, "fail", name, "ts ranks the whole kind corpus", `${tsCase.rank.length} of ${tsCase.corpus_count}`);
+		const tsPositiveTotal = tsCase.rank_positive.length + tsCase.zero_ids.length;
+		if (tsPositiveTotal !== tsCase.corpus_count) {
+			record(
+				findings,
+				"fail",
+				name,
+				"ts scores the whole kind corpus",
+				`${tsCase.rank_positive.length} positive + ${tsCase.zero_ids.length} zero != ${tsCase.corpus_count}`,
+			);
 		} else {
-			record(findings, "pass", name, "ts ranks the whole kind corpus", `${tsCase.rank.length} rows, zero-score rows included`);
+			record(
+				findings,
+				"pass",
+				name,
+				"ts scores the whole kind corpus",
+				`${tsCase.rank_positive.length} positive + ${tsCase.zero_ids.length} zero rows`,
+			);
 		}
 
 		// --- side vs side, per the case's documented expectation ---------------
@@ -587,7 +603,19 @@ function run(options, workdirs) {
 			note: parityCase.note ?? "",
 			python_query: parityCase.python_query,
 			top_k_limits: parityCase.top_k,
-			reference: { ts: referenceTs, python: referencePy },
+			reference: {
+				ts: {
+					...referenceTs,
+					// Positive prefix only, for the same reason the TS driver does not
+					// record its zero tail: `localeCompare` without a locale follows the
+					// process ICU locale, and the zero-score region is ordered by nothing
+					// else. Measured: this golden differs under LC_ALL=zh_CN.UTF-8 if the
+					// tail is stored.
+					order: referenceTs.order.filter((id) => (referenceTs.scores[id] ?? 0) > 0),
+					order_note: "positive prefix only; the zero-score tail is ICU-locale dependent",
+				},
+				python: referencePy,
+			},
 			ts: tsCase,
 			python: pyCase,
 		};
