@@ -5,10 +5,13 @@
 # ---------------
 # `packages/coding-agent/vitest.config.ts` filters every run with
 # `tagsFilter: ["!process-stress", "!kernel-heavy"]`, and vitest exits 0 when a filter
-# turns a collected test into `skipped`. The process smoke job therefore reports
-# `11 passed | 12 skipped` and the coverage gate only asks for `min_ran_tests: 9`: the
-# twelve process-stress tests are invisible, and any *further* filter, `describe.skipIf`
-# or silently dropped file leaves the job green as long as 9 tests still run.
+# turns a collected test into `skipped`. The process smoke job therefore reports half of
+# what it collects as skipped (`12 passed | 12 skipped` in the run recorded in
+# scripts/ci-floor-readings.json) while its `min_ran_tests` floor deliberately leaves a
+# test of slack: the process-stress tests are invisible to that floor, and any *further*
+# filter, `describe.skipIf` or silently dropped file leaves the job green as long as the
+# floor is still met. This gate is what closes that hole - it reads the same report and
+# compares it with the declared ledger entry by entry, in both directions.
 #
 # This gate reads the job's own vitest JSON report and compares the skip ledger it
 # actually produced with the ledger the job declares in `.github/workflows/ci.yml`:
