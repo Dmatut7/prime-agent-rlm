@@ -423,3 +423,7 @@ goal 原文（母席 2026-09-17 挂）：*把上游 `e2fb7bfa1` 窗（136 笔）
 ## 附录 B · 标红移出全表
 
 见输入件 `/tmp/merge-doc-inputs/06-p1-clusters.md` 附录 B（119/136 笔逐笔表，其中 51 笔只命中我方 1-2 个文件）。
+
+> **对账（母席 2026-09-18，§3.2 与 §14.2 的 notice 口径收口）**：本窗**不取**上游 durable `refinement_notice` 的投递机制——死调用点 `_recordRefinementNotice` 与其 lint 抑制已删净（`grep -rn "_recordRefinementNotice|noUnusedPrivateClassMembers" src` 零命中）；但**词汇面保留**作上游同步预留（`REFINEMENT_NOTICE_CUSTOM_TYPE`、`RefinementNoticeMessage`、`createRefinementNoticeMessage`、`formatRefinementNoticeBody`、input-classification 分类行仍在，当前**零生产者**）。refinement 回执渲染保留 MV-5（refused 条目带非空原因可见）。纵深防御：headless-completion 的终值跳过表已加入 `REFINEMENT_NOTICE_CUSTOM_TYPE`，若读到上游形态写的旧 journal，notice 不会被当成终值输出。
+>
+> material-change 再注入为 §12.2 的主路径（路 A）：`readHarnessStateStamp` 廉价扳机（stamp 未动那轮 harness_state.json 读取次数为零，用读取计数钉而非计时钉）＋条目 `kind:scope:id→version` 指纹差集（并排掉本会话回执已报过的**同一版本**）＋全程复用 `HARNESS_DIGEST_CUSTOM_TYPE`＋cancel/park 剥到 digest 即 invalidate baselines 并 re-arm＋只尾追不改写在前载体；冷边界（构造尾/主压缩头/emergency shrink/树导航）只作兜底。
