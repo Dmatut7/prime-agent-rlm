@@ -16,6 +16,7 @@ import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ENV_AGENT_DIR, getCronJobsPath } from "../src/config.js";
 import { AgentCronJobStore } from "../src/core/cron-jobs.js";
+import { HARNESS_DIGEST_CUSTOM_TYPE, HARNESS_DIGEST_PREFIX } from "../src/core/messages.js";
 import { readActiveOrphanProcesses } from "../src/core/orphan-process-journal.js";
 import {
 	acquireSessionLeaseAsync,
@@ -160,6 +161,26 @@ function readDaemonLogs(agentDir: string): string {
 	} catch {
 		return "no daemon logs";
 	}
+}
+
+/**
+ * #2098 cold-boundary delivery: a session whose journal carries no digest gains exactly
+ * one at the first cold boundary (session start, resume, worker adoption). Both pins
+ * below count the carriers instead of trusting a hardcoded total, so a duplicate
+ * delivery shows up as a failure rather than as an off-by-one nobody attributes.
+ */
+function harnessDigestEntries(sessionPath: string): string[] {
+	return readFileSync(sessionPath, "utf8")
+		.trim()
+		.split("\n")
+		.map((line) => JSON.parse(line) as { type?: string; customType?: string; content?: unknown })
+		.filter((entry) => entry.type === "custom_message" && entry.customType === HARNESS_DIGEST_CUSTOM_TYPE)
+		.map((entry) => (typeof entry.content === "string" ? entry.content : ""));
+}
+
+function harnessDigestMessages(messages: readonly { role?: string; customType?: string }[]): number {
+	return messages.filter((message) => message.role === "custom" && message.customType === HARNESS_DIGEST_CUSTOM_TYPE)
+		.length;
 }
 
 function readWorkerDescriptor(agentDir: string): DaemonWorkerDescriptor {
@@ -498,7 +519,15 @@ describe("daemon supervisor resident workers", () => {
 		// A fresh current-binary worker owns the reloaded idle session; the fake pre-roster pid is not adopted.
 		expect(restarted.workerPid).not.toBe(legacyProcess.pid);
 		expect(restarted.isSessionActive).toBe(false);
-		expect(restarted.messageCount).toBe(1);
+		// The restart is a cold boundary, so the reloaded session gains exactly one
+		// in-context harness digest (#2098): the fixture's own message plus the carrier,
+		// and only one carrier - the digest is deduped against the journal, so a second
+		// adoption of the same session does not append another copy.
+		expect(restarted.messageCount).toBe(2);
+		const restartedDigests = harnessDigestEntries(sessionPath);
+		expect(restartedDigests).toHaveLength(1);
+		expect(restartedDigests[0]).toContain(HARNESS_DIGEST_PREFIX);
+		expect(restartedDigests[0]).toContain("</harness_state>");
 		await waitForProcessGone(legacyProcess.pid);
 		fakeWorker.close();
 		client.close();
@@ -1550,8 +1579,16 @@ describe("daemon supervisor resident workers", () => {
 			}
 		});
 		const snapshot = await connection.getInitialSnapshot();
-		expect(snapshot.messages).toHaveLength(2);
+		// The fixture journal was written by this test, so it carries no digest; attaching
+		// a worker to it is a cold boundary and #2098 delivers one carrier at the tail.
+		// The two fixture messages stay first and the count is exact, so neither a missing
+		// delivery nor a duplicate one passes.
+		expect(snapshot.messages).toHaveLength(3);
 		expect(snapshot.messages[0]).toMatchObject({ role: "user", content: largePrompt });
+		expect(snapshot.messages[1]).toMatchObject({ role: "assistant" });
+		expect(snapshot.messages[2]).toMatchObject({ role: "custom", customType: HARNESS_DIGEST_CUSTOM_TYPE });
+		expect(harnessDigestMessages(snapshot.messages)).toBe(1);
+		expect(snapshot.messages[2]).toMatchObject({ content: expect.stringContaining(HARNESS_DIGEST_PREFIX) });
 
 		const activeSessionId = createdSummary.activeSessionId ?? createdSummary.id;
 		const createdNew = await client.request({ type: "new_session", activeSessionId });
@@ -1564,10 +1601,13 @@ describe("daemon supervisor resident workers", () => {
 		const switchedBack = await client.request({ type: "switch_session", activeSessionId, sessionPath: sessionFile });
 		expect(switchedBack.success).toBe(true);
 		const restoredReplacementDeadline = Date.now() + 5000;
-		while (replacementMessageCounts.at(-1) !== 2 && Date.now() < restoredReplacementDeadline) {
+		while (replacementMessageCounts.at(-1) !== 3 && Date.now() < restoredReplacementDeadline) {
 			await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
 		}
-		expect(replacementMessageCounts.at(-1)).toBe(2);
+		// Switching back re-reads the same journal: the digest persisted by the first cold
+		// boundary is already the newest in-context carrier, so this boundary adds none.
+		// 3 (and not 4, 5, ...) is the no-duplicate pin.
+		expect(replacementMessageCounts.at(-1)).toBe(3);
 
 		firstSupervisor.kill("SIGTERM");
 		await waitForExit(firstSupervisor);
