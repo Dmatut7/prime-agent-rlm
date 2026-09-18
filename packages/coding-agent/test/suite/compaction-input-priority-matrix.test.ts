@@ -98,6 +98,20 @@ const COMPACTION_SUMMARY = "auto compacted";
 const COMPACTION_FAILURE = "summarization exploded (matrix fixture)";
 /** Stall budget for the compaction gate watchdog, in (fractional) seconds. */
 const GATE_WATCHDOG_SECONDS = 0.05;
+/**
+ * Stall budget for the two "admitted INTO a running compaction" rows, deliberately
+ * looser than GATE_WATCHDOG_SECONDS.
+ *
+ * One budget covers both the hung compaction and the retry that follows its abort (the
+ * queued turn's own pre-turn compaction, which `_runAutoCompaction` arms from
+ * `hasPendingSessionWork`), and that retry does real work - hook, branch commit,
+ * kernel-state sync - measured at ~31ms here. Inside a 50ms budget that is ~19ms of
+ * margin, so a loaded runner would abort the retry too and the row would fail reading
+ * as "the bound fired twice" instead of what it actually is. 200ms keeps the rows fast
+ * and the margin near 6x. It changes nothing about what they discriminate: with the
+ * arming removed there is no bound at all, so any budget hangs forever.
+ */
+const ADMISSION_WATCHDOG_SECONDS = 0.2;
 
 const REPLY_TURN_TEXT = "agent message handled";
 const FIRST_REPLY_TURN_TEXT = "first agent message handled";
@@ -1227,7 +1241,7 @@ describe("compaction x input-class admission matrix", () => {
 			bigContext: true,
 			compactionEnabled: true,
 			gate,
-			gateWatchdogSeconds: GATE_WATCHDOG_SECONDS,
+			gateWatchdogSeconds: ADMISSION_WATCHDOG_SECONDS,
 		});
 		// Compaction is on from the start, so the fill turn ends at the tool-result
 		// boundary (that is where a cut can land) and consumes exactly one response: the
@@ -1251,7 +1265,8 @@ describe("compaction x input-class admission matrix", () => {
 		// arming this row measures cannot be `_runAutoCompaction`'s.
 		expect(harness.session.hasPendingSessionWork).toBe(false);
 		expect(harness.session.queuedActionCount).toBe(0);
-		expect(harness.settingsManager.getStallWatchdogSettings().abortAfterSeconds).toBe(GATE_WATCHDOG_SECONDS);
+		// The bound reads the stall budget, so pin the resolved value it sees.
+		expect(harness.settingsManager.getStallWatchdogSettings().abortAfterSeconds).toBe(ADMISSION_WATCHDOG_SECONDS);
 
 		const preflight = createPreflightRecord();
 		const humanRun = harness.session.prompt(HUMAN_PROMPT, {
@@ -1317,7 +1332,7 @@ describe("compaction x input-class admission matrix", () => {
 			bigContext: true,
 			compactionEnabled: true,
 			gate,
-			gateWatchdogSeconds: GATE_WATCHDOG_SECONDS,
+			gateWatchdogSeconds: ADMISSION_WATCHDOG_SECONDS,
 		});
 		// Same response accounting as the human row above: the fill turn stops at the
 		// tool-result boundary, so one response is the fill and the next is the heartbeat.
