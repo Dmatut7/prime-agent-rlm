@@ -12672,7 +12672,9 @@ export class AgentSession {
 	/**
 	 * Relevance signal for the harness digest: terms from the active goal
 	 * objective (strongest) and the last few user/assistant messages,
-	 * newest first. Term overlap is cheap and capped so scoring stays trivial.
+	 * newest first. Scores are precomputed once per render and the sort compares
+	 * numbers (rankHarnessEntriesForQuery), so the ranked window stays cheap even
+	 * on a large shared store; the 48-term cap bounds the per-entry sweep.
 	 * A digest render happens before the current turn's message is committed,
 	 * so the terms lag one turn behind the wording (same tradeoff upstream
 	 * #2241 accepted); the next delivery picks the new wording up.

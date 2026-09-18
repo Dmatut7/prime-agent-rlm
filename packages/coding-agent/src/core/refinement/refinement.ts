@@ -877,17 +877,38 @@ export function harnessQueryTerms(text: string): string[] {
  * Terms matching no entry are absent (they cannot score anything).
  */
 export function harnessQueryTermIdf(entries: HarnessEntry[], terms: HarnessQueryTerms): Map<string, number> {
+	return harnessQueryTermIdfOverFields(entries.map(normalizeHarnessEntryFields), terms);
+}
+
+/** Normalized searchable fields, computed once per entry per render. */
+interface NormalizedHarnessEntry {
+	entry: HarnessEntry;
+	title: string;
+	content: string;
+	identifier: string;
+}
+
+function normalizeHarnessEntryFields(entry: HarnessEntry): NormalizedHarnessEntry {
+	return {
+		entry,
+		title: searchableField(entry.title),
+		content: searchableField(entry.content),
+		identifier: `${searchableField(entry.path)} ${searchableField(entry.id)}`,
+	};
+}
+
+function harnessQueryTermIdfOverFields(
+	fields: NormalizedHarnessEntry[],
+	terms: HarnessQueryTerms,
+): Map<string, number> {
 	const idf = new Map<string, number>();
 	if (terms.size === 0) return idf;
 	let documents = 0;
 	const matches = new Map<string, number>();
-	for (const entry of entries) {
+	for (const f of fields) {
 		documents += 1;
-		const title = searchableField(entry.title);
-		const content = searchableField(entry.content);
-		const identifier = `${searchableField(entry.path)} ${searchableField(entry.id)}`;
 		for (const term of terms.keys()) {
-			if (title.includes(term) || content.includes(term) || identifier.includes(term)) {
+			if (f.title.includes(term) || f.content.includes(term) || f.identifier.includes(term)) {
 				matches.set(term, (matches.get(term) ?? 0) + 1);
 			}
 		}
@@ -929,20 +950,65 @@ export function scoreHarnessEntryForQuery(
 	return score;
 }
 
-function compareRankedHarnessEntries(
-	a: HarnessEntry,
-	b: HarnessEntry,
-	terms: HarnessQueryTerms,
-	idf?: Map<string, number>,
-): number {
-	const scoreDifference = scoreHarnessEntryForQuery(b, terms, idf) - scoreHarnessEntryForQuery(a, terms, idf);
-	if (scoreDifference !== 0) return scoreDifference;
-	// Equal scores tie on stable identifier order (path, title, id), so
-	// touching unrelated entries never reshuffles equal-score siblings and the
-	// rendered digest keeps a stable prefix for provider prompt-cache reuse
-	// (upstream #2400; recency tie-breaks reshuffled the visible top-k window
-	// on every unrelated update).
-	return [a.path, a.title, a.id].join("\0").localeCompare([b.path, b.title, b.id].join("\0"));
+function rankedIdentifier(entry: HarnessEntry): string {
+	return [entry.path, entry.title, entry.id].join("\0");
+}
+
+/**
+ * Rank once, sort the scores: normalize each entry's searchable fields a
+ * single time, record which of the three fields every query term hits in one
+ * entries-x-terms sweep, derive both the idf map and every entry's score from
+ * that record, then sort precomputed numbers. The old comparator form
+ * recomputed both sides' weighted overlap on every comparison (O(N log N)
+ * full-text `includes` sweeps) and swept the corpus twice more, which turned a
+ * 1-15ms digest render into 0.5-2.6s of synchronous event-loop blocking on a
+ * real 1266-entry store. Scores, the stable identifier tie-break and the top-k
+ * window are unchanged.
+ */
+export function rankHarnessEntriesForQuery(entries: HarnessEntry[], terms: HarnessQueryTerms): HarnessEntry[] {
+	const fields = entries.map(normalizeHarnessEntryFields);
+	const termList = [...terms.entries()];
+	const hitsPerEntry: number[] = new Array(fields.length).fill(0);
+	const docFreq = new Map<string, number>();
+	for (let index = 0; index < fields.length; index += 1) {
+		const f = fields[index];
+		let bitmask = 0;
+		for (let t = 0; t < termList.length; t += 1) {
+			const term = termList[t][0];
+			const fieldHits =
+				(f.title.includes(term) ? 1 : 0) +
+				(f.content.includes(term) ? 1 : 0) +
+				(f.identifier.includes(term) ? 1 : 0);
+			if (fieldHits > 0) {
+				bitmask |= fieldHits << (t * 2);
+				docFreq.set(term, (docFreq.get(term) ?? 0) + 1);
+			}
+		}
+		hitsPerEntry[index] = bitmask;
+	}
+	const idf = new Map<string, number>();
+	for (const [term, documentFrequency] of docFreq) {
+		idf.set(term, Math.log(1 + fields.length / documentFrequency));
+	}
+	const scored = fields.map((f, index) => {
+		let score = 0;
+		const bitmask = hitsPerEntry[index];
+		for (let t = 0; t < termList.length; t += 1) {
+			const fieldHits = (bitmask >> (t * 2)) & 3;
+			if (fieldHits > 0) {
+				score += termList[t][1] * (idf.get(termList[t][0]) ?? 1) * (1 + (fieldHits - 1) * 0.5);
+			}
+		}
+		return { entry: f.entry, score };
+	});
+	scored.sort((x, y) => {
+		if (y.score !== x.score) return y.score - x.score;
+		// Tie-break on the stable identifier order only: calling a score
+		// comparator here would recompute both sides' scores on every
+		// comparison and reintroduce the O(N log N) full-text sweep.
+		return rankedIdentifier(x.entry).localeCompare(rankedIdentifier(y.entry));
+	});
+	return scored.map((item) => item.entry);
 }
 
 export function formatHarnessStateForPrompt(
@@ -999,10 +1065,9 @@ export function formatHarnessStateForPrompt(
 		// same top-k slots, so document frequency discounts terms ubiquitous
 		// within the kind rather than across unrelated kinds.
 		const ranked = Object.values(state.entries[kind]);
-		const idf = queryTerms !== undefined && queryTerms.size > 0 ? harnessQueryTermIdf(ranked, queryTerms) : undefined;
 		const entries =
 			queryTerms !== undefined && queryTerms.size > 0
-				? ranked.sort((a, b) => compareRankedHarnessEntries(a, b, queryTerms, idf))
+				? rankHarnessEntriesForQuery(ranked, queryTerms)
 				: entriesForInjection(state, kind);
 		totalEntries += entries.length;
 		// Render subagent specs as a task-shaped roster the model can match against — the
