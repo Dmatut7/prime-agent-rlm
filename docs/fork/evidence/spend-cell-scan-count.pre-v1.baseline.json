@@ -1,0 +1,66 @@
+{
+  "generatedAt": "2026-09-18T12:23:31.794Z",
+  "baseSha": "0186a1247",
+  "expectations": {
+    "tick": false,
+    "quiet": 1,
+    "busy": 12,
+    "gone": 1
+  },
+  "leg": "pre-v1",
+  "command": "cd /tmp/spend-base-wt && SPEND_CELL_LEG=pre-v1 npx vitest run --root . --config packages/coding-agent/vitest.config.ts docs/fork/evidence/spend-cell-scan-count.test.mjs",
+  "window": "60000 ms of fake time",
+  "scenarios": [
+    {
+      "label": "quiet-visible-60s",
+      "scans": 1,
+      "scanStamps": [
+        1789734212238
+      ],
+      "gapsMs": [],
+      "leadingFill": 1,
+      "intervalFrom": "DEFAULT_SUBAGENT_SPEND_CELL_INTERVAL_MS"
+    },
+    {
+      "label": "busy-visible-60s",
+      "scans": 12,
+      "scanStamps": [
+        1789734212243,
+        1789734217243,
+        1789734222243,
+        1789734227243,
+        1789734232243,
+        1789734237243,
+        1789734242243,
+        1789734247243,
+        1789734252243,
+        1789734257243,
+        1789734262243,
+        1789734267243
+      ],
+      "gapsMs": [
+        5000,
+        5000,
+        5000,
+        5000,
+        5000,
+        5000,
+        5000,
+        5000,
+        5000,
+        5000,
+        5000
+      ],
+      "eventsPerSecond": 10
+    },
+    {
+      "label": "negative-control-family-gone-60s",
+      "scans": 1,
+      "scanStamps": [
+        1789734212291
+      ],
+      "gapsMs": [],
+      "scansBeforeExit": 1
+    }
+  ]
+}

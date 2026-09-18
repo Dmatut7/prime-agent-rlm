@@ -1,0 +1,146 @@
+{
+  "generatedAt": "2026-09-18T12:23:27.259Z",
+  "baseSha": "6e1e4e95b73a419fc85af4d1b8b85f724a2fa871",
+  "expectations": {
+    "tick": true,
+    "quiet": 5,
+    "busy": 5,
+    "turnEnd": 6,
+    "tick5s": 13,
+    "gone": 2
+  },
+  "leg": "current",
+  "command": "npx vitest run --root . --config packages/coding-agent/vitest.config.ts docs/fork/evidence/spend-cell-scan-count.test.mjs",
+  "window": "60000 ms of fake time",
+  "scenarios": [
+    {
+      "label": "quiet-visible-60s",
+      "scans": 5,
+      "scanStamps": [
+        1789734207709,
+        1789734222209,
+        1789734237209,
+        1789734252209,
+        1789734267209
+      ],
+      "gapsMs": [
+        14500,
+        15000,
+        15000,
+        15000
+      ],
+      "leadingFill": 1,
+      "intervalMs": 15000,
+      "intervalFrom": "DEFAULT_SUBAGENT_SPEND_CELL_INTERVAL_MS"
+    },
+    {
+      "label": "fallback-constant-60s",
+      "scans": 5,
+      "scanStamps": [
+        1789734207714,
+        1789734222214,
+        1789734237214,
+        1789734252214,
+        1789734267214
+      ],
+      "gapsMs": [
+        14500,
+        15000,
+        15000,
+        15000
+      ],
+      "intervalFrom": "SUBAGENT_SPEND_IDLE_TICK_MS (no settings method)"
+    },
+    {
+      "label": "busy-visible-60s",
+      "scans": 5,
+      "scanStamps": [
+        1789734207716,
+        1789734222216,
+        1789734237216,
+        1789734252216,
+        1789734267216
+      ],
+      "gapsMs": [
+        14500,
+        15000,
+        15000,
+        15000
+      ],
+      "eventsPerSecond": 10
+    },
+    {
+      "label": "quiet-visible-60s-one-turn-end",
+      "scans": 6,
+      "scanStamps": [
+        1789734207751,
+        1789734222251,
+        1789734237251,
+        1789734237251,
+        1789734252251,
+        1789734267251
+      ],
+      "gapsMs": [
+        14500,
+        15000,
+        0,
+        15000,
+        15000
+      ],
+      "forcedRefreshes": 1
+    },
+    {
+      "label": "negative-control-5s-tick-60s",
+      "scans": 13,
+      "scanStamps": [
+        1789734207755,
+        1789734212255,
+        1789734217255,
+        1789734222255,
+        1789734227255,
+        1789734232255,
+        1789734237255,
+        1789734242255,
+        1789734247255,
+        1789734252255,
+        1789734257255,
+        1789734262255,
+        1789734267255
+      ],
+      "gapsMs": [
+        4500,
+        5000,
+        5000,
+        5000,
+        5000,
+        5000,
+        5000,
+        5000,
+        5000,
+        5000,
+        5000,
+        5000
+      ],
+      "intervalMs": 5000
+    },
+    {
+      "label": "negative-control-cell-off-60s",
+      "scans": 0,
+      "scanStamps": [],
+      "gapsMs": [],
+      "enabled": false
+    },
+    {
+      "label": "negative-control-family-gone-60s",
+      "scans": 2,
+      "scanStamps": [
+        1789734207757,
+        1789734222257
+      ],
+      "gapsMs": [
+        14500
+      ],
+      "scansBeforeExit": 2
+    }
+  ]
+}
