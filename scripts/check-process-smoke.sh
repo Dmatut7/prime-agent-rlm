@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# gate-process-smoke.sh - the local mirror of CI job "Test (coding-agent process smoke)".
+#
+# Why this file exists
+# --------------------
+# The local full component (the three `npm run test:ci -- --shard=i/3` runs) does NOT cover
+# `test/daemon-supervisor-process.test.ts`: `packages/coding-agent/package.json`'s `test:ci`
+# excludes it (one of 11 `--exclude` flags) because CI runs it in its own job. The local
+# ladder mirrored the kernel / machine-wide / runtime-python specialty jobs and missed this
+# one, so the file was in neither local face - CI run 35296425559 reddened two of its tests
+# (the #2098 in-context harness digest adds exactly one carrier to a resumed session) with
+# zero local signal. This script is that missing face, spelled as the same command CI runs.
+#
+# What it does (four readings, all of them mechanical)
+# ---------------------------------------------------
+#   1. `npm run test:process -- --reporter=default --reporter=json --outputFile.json=...`
+#      exactly as `.github/workflows/ci.yml` runs it, and fails on a non-zero exit.
+#   2. Prints the per-file collected/ran/passed/failed/skipped ledger from that report.
+#   3. The CI coverage gate at the CI floors: --min-tests 20 --min-ran-tests 11
+#      --max-nothing-files 1 (`crash-handlers-process` is the one file allowed to run
+#      nothing, because all four of its tests carry the `process-stress` tag).
+#   4. The CI tag-skip ledger, with the declaration copied verbatim from `ci.yml`: 8 skips in
+#      daemon-supervisor-process.test.ts + 4 in daemon-supervisor-crash-handlers-process.test.ts.
+#      The judgement is the tag, not the environment: `vitest.config.ts` sets
+#      `tagsFilter: ["!process-stress", "!kernel-heavy"]` unconditionally, so those twelve
+#      tests are skipped on every platform and under every env; the nightly
+#      `nightly-process-stress.yml` is where they do run.
+#
+# Usage
+# -----
+#   bash scripts/gate-process-smoke.sh                 # the CI face (green = 12 passed | 8 skipped)
+#   bash scripts/gate-process-smoke.sh --with-stress   # + the nightly face (`test:process-stress`)
+#   bash scripts/gate-process-smoke.sh --self-test     # prove both instruments can still go red
+#   bash scripts/gate-process-smoke.sh --report /tmp/p.json   # keep the report elsewhere
+#
+# Repository root is resolved from this script's own location, so the file works both from a
+# checkout's `scripts/` and from a throwaway copy outside the tree (REPO_ROOT=<path> overrides).
+# Exit codes: 0 = every reading green, 1 = red (the failing step is named), 2 = usage.
+set -uo pipefail
+
+WITH_STRESS=0
+SELF_TEST=0
+REPORT_OVERRIDE=""
+
+usage() {
+	cat >&2 <<'USAGE'
+usage: bash scripts/gate-process-smoke.sh [--with-stress] [--self-test] [--report <path>]
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--with-stress) WITH_STRESS=1; shift ;;
+		--self-test) SELF_TEST=1; shift ;;
+		--report) [ $# -ge 2 ] || { usage; exit 2; }; REPORT_OVERRIDE="$2"; shift 2 ;;
+		--report=*) REPORT_OVERRIDE="${1#--report=}"; shift ;;
+		-h|--help) usage; exit 0 ;;
+		*) echo "gate-process-smoke: unknown argument $1" >&2; usage; exit 2 ;;
+	esac
+done
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -n "${REPO_ROOT:-}" ]; then
+	ROOT="$REPO_ROOT"
+elif git -C "$SCRIPT_DIR" rev-parse --show-toplevel >/dev/null 2>&1; then
+	ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+else
+	# A copy that sits outside any checkout (this file is also handed around as /tmp/...): walk
+	# up for the package it drives. REPO_ROOT= is the explicit override above.
+	ROOT=""
+	candidate="$SCRIPT_DIR"
+	for _ in 1 2 3 4; do
+		if [ -f "$candidate/packages/coding-agent/package.json" ]; then ROOT="$candidate"; break; fi
+		candidate="$(cd "$candidate/.." && pwd)"
+	done
+	[ -n "$ROOT" ] || { echo "gate-process-smoke: cannot locate the checkout; set REPO_ROOT=<path>" >&2; exit 2; }
+fi
+PKG="$ROOT/packages/coding-agent"
+AGENT_TEST="$PKG/test/daemon-supervisor-process.test.ts"
+HANDLERS_TEST="$PKG/test/daemon-supervisor-crash-handlers-process.test.ts"
+[ -f "$AGENT_TEST" ] && [ -f "$HANDLERS_TEST" ] || {
+	echo "gate-process-smoke: not a prime-agent checkout (missing $AGENT_TEST)" >&2
+	exit 2
+}
+REPORT="${REPORT_OVERRIDE:-$PKG/coverage/ci-process-smoke.json}"
+[ -n "$REPORT_OVERRIDE" ] || mkdir -p "$(dirname "$REPORT")"
+
+# Copied verbatim from .github/workflows/ci.yml (matrix row "coding-agent process smoke").
+LEDGER="packages/coding-agent/test/daemon-supervisor-process.test.ts=8:process-stress tag-filtered by vitest.config.ts; nightly-process-stress.yml runs it;;packages/coding-agent/test/daemon-supervisor-crash-handlers-process.test.ts=4:process-stress tag-filtered by vitest.config.ts; nightly-process-stress.yml runs it"
+MIN_TESTS=20
+MIN_RAN_TESTS=11
+MAX_NOTHING_FILES=1
+
+FAILED_STEP=""
+step() { printf '\n== %s ==\n' "$1"; }
+fail() { FAILED_STEP="$1"; printf 'FAIL: %s\n' "$1"; }
+
+if [ "$SELF_TEST" = "1" ]; then
+	step "self-test: the two instruments this gate depends on must still be able to go red"
+	rc=0
+	node "$ROOT/scripts/check-vitest-coverage.mjs" --self-test || rc=1
+	bash "$ROOT/scripts/check-tag-skip-ledger.sh" --self-test || rc=1
+	if [ "$rc" != "0" ]; then
+		echo "gate-process-smoke: self-test RED (an instrument can no longer detect its drift)" >&2
+		exit 1
+	fi
+	echo "gate-process-smoke: self-test GREEN (coverage gate and tag-skip ledger both plant their own red)"
+	exit 0
+fi
+
+step "1/4 run the CI job's command: npm run test:process (packages/coding-agent)"
+( cd "$PKG" && npm run test:process -- --reporter=default --reporter=json --outputFile.json="$REPORT" ) \
+	> "$REPORT.human.log" 2>&1
+rc=$?
+grep -E "Test Files|Tests  " "$REPORT.human.log" | tail -3
+if [ "$rc" != "0" ]; then
+	tail -40 "$REPORT.human.log"
+	fail "the process smoke suite itself is red (vitest exit $rc); full output: $REPORT.human.log"
+else
+	echo "vitest: exit 0"
+fi
+
+step "2/4 readings from the report (collected / ran / passed / failed / skipped)"
+if [ -f "$REPORT" ]; then
+	node -e '
+const fs = require("node:fs");
+const report = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+const rel = (name) => {
+  const at = name.lastIndexOf("/packages/");
+  return at === -1 ? name : name.slice(at + 1);
+};
+let collected = 0, ran = 0, passed = 0, failed = 0, skipped = 0;
+for (const file of report.testResults || []) {
+  const assertions = file.assertionResults || [];
+  const p = assertions.filter((a) => a.status === "passed").length;
+  const f = assertions.filter((a) => a.status === "failed").length;
+  const s = assertions.length - p - f;
+  console.log(
+    "  " + rel(file.name) + ": collected=" + assertions.length + " ran=" + (p + f) +
+    " passed=" + p + " failed=" + f + " skipped=" + s +
+    (p + f === 0 ? "  (nothing-file: this file ran nothing)" : ""),
+  );
+  collected += assertions.length; ran += p + f; passed += p; failed += f; skipped += s;
+}
+console.log("  TOTAL: collected=" + collected + " ran=" + ran + " passed=" + passed +
+  " failed=" + failed + " skipped=" + skipped +
+  "  (CI floors: min_tests=" + process.argv[2] + " min_ran_tests=" + process.argv[3] +
+  " max_nothing_files=" + process.argv[4] + ")");
+' "$REPORT" "$MIN_TESTS" "$MIN_RAN_TESTS" "$MAX_NOTHING_FILES"
+else
+	fail "no report at $REPORT (vitest writes it only when it could run)"
+fi
+
+step "3/4 CI coverage gate at the CI floors"
+if [ -f "$REPORT" ]; then
+	node "$ROOT/scripts/check-vitest-coverage.mjs" "$REPORT" \
+		--min-tests "$MIN_TESTS" --min-ran-tests "$MIN_RAN_TESTS" --max-nothing-files "$MAX_NOTHING_FILES"
+	rc=$?
+	[ "$rc" = "0" ] || fail "check-vitest-coverage.mjs exit $rc"
+else
+	fail "coverage gate skipped: no report"
+fi
+
+step "4/4 CI tag-skip ledger (12 declared skips, 8 + 4, counted and named)"
+if [ -f "$REPORT" ]; then
+	bash "$ROOT/scripts/check-tag-skip-ledger.sh" "$REPORT" --ledger "$LEDGER"
+	rc=$?
+	[ "$rc" = "0" ] || fail "check-tag-skip-ledger.sh exit $rc"
+else
+	fail "ledger gate skipped: no report"
+fi
+
+if [ "$WITH_STRESS" = "1" ]; then
+	step "5/5 nightly face: npm run test:process-stress (the 12 tag-filtered tests)"
+	( cd "$PKG" && npm run test:process-stress ) > "$REPORT.stress.log" 2>&1
+	rc=$?
+	grep -E "Test Files|Tests  " "$REPORT.stress.log" | tail -3
+	if [ "$rc" != "0" ]; then
+		if grep -q "ERR_MODULE_NOT_FOUND" "$REPORT.stress.log"; then
+			echo "hint: the real-process cases import workspace builds; run npm run build in ai/agent/tui first" >&2
+		fi
+		tail -40 "$REPORT.stress.log"
+		fail "the process-stress (nightly) face is red (vitest exit $rc); full output: $REPORT.stress.log"
+	else
+		echo "vitest: exit 0"
+	fi
+fi
+
+printf '\n'
+if [ -n "$FAILED_STEP" ]; then
+	printf 'gate-process-smoke: RED - %s\n' "$FAILED_STEP" >&2
+	exit 1
+fi
+printf 'gate-process-smoke: GREEN (process smoke face matches CI; every skip declared, counted and named)\n'

@@ -18,6 +18,7 @@
     "check:installer": "node scripts/check-installer.mjs",
     "check:browser-smoke": "node scripts/check-browser-smoke.mjs",
     "check:test-hygiene": "node scripts/check-test-private-probes.mjs",
+    "check:process-smoke": "bash scripts/check-process-smoke.sh",
     "check:ci-honesty": "bash scripts/check-tag-skip-ledger.sh --self-test && bash scripts/check-platform-coverage.sh --self-test && bash scripts/check-platform-coverage.sh && bash scripts/latest-ci-run.sh --self-test",
     "ci:last-run": "bash scripts/latest-ci-run.sh",
     "check:test-hygiene:self-test": "node scripts/check-test-private-probes.mjs --self-test",
