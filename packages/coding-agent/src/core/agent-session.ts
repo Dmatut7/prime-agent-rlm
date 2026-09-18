@@ -1091,6 +1091,21 @@ interface PreparedHarnessDigest {
 }
 
 /**
+ * Identity of the three digest render flags. A rebuild that leaves them alone (an
+ * rlm depth cap, a reloaded agents file) must not invalidate a delivered digest, so
+ * the tool-face seam compares a key instead of a fresh object.
+ */
+function harnessDigestRenderFlagsKey(flags: {
+	includeIpythonExamples: boolean;
+	includeShellExamples: boolean;
+	includeRefineExamples: boolean;
+}): string {
+	return [flags.includeIpythonExamples, flags.includeShellExamples, flags.includeRefineExamples]
+		.map((flag) => (flag ? "1" : "0"))
+		.join("");
+}
+
+/**
  * Entry keys whose presence or version differs between two fingerprints: the
  * added / removed / version-bumped set the material-change gate judges.
  */
@@ -2206,6 +2221,13 @@ export class AgentSession {
 	private _harnessDigestStamps: HarnessStoreStamps | undefined;
 	/** Entry identity as of the last digest render, for the material-change difference. */
 	private _harnessDigestFingerprint: Map<string, number> | undefined;
+	/**
+	 * Tool-face identity as of the last system-prompt rebuild (OBS-2). The digest's
+	 * call-contract wording follows the render flags, and a mid-session tool change
+	 * rebuilds the prompt without moving either store stamp, so the material-change
+	 * gate on its own would never notice.
+	 */
+	private _harnessDigestRenderFlagsKey: string | undefined;
 	/**
 	 * Entry keys this session already itemized for the model in a refinement receipt
 	 * (applied and refused), so a digest delta does not deliver the same news twice.
@@ -6904,6 +6926,14 @@ export class AgentSession {
 			// byte-identical unless tools, skills, depth or context files really changed.
 			genericMcpServers: this._mcpManager?.getEnabledPersistentGenericServers(),
 		};
+		// OBS-2: a rebuild is the seam where the tool face moves, and the digest's
+		// call-contract wording is derived from it. The digest rides in context behind a
+		// gate that watches only the two store stamps, so without this the delivered menu
+		// would keep describing tools the model no longer has until the next cold
+		// boundary. Dropping the baselines here costs nothing per turn, and the next
+		// turn's fingerprint - which covers the render flags - decides whether a fresh
+		// carrier is owed.
+		this._noteHarnessDigestToolFaceChange();
 		return buildSystemPrompt(this._baseSystemPromptOptions);
 	}
 
@@ -12679,6 +12709,25 @@ export class AgentSession {
 			includeShellExamples: tools.includes("bash"),
 			includeRefineExamples: hasIpython && hasRefineSkill,
 		};
+	}
+
+	/**
+	 * OBS-2: drop the "already delivered" baselines when the tool face behind the
+	 * render flags moved. Hooked into `_rebuildSystemPrompt` - the single seam every
+	 * tool and skill change already goes through (nine call sites: construction, tool
+	 * add/remove, `setActiveToolsByName`, two rlm-depth paths, extension resources) -
+	 * so nothing has to be enumerated per call site and no turn pays for it. The next
+	 * turn then re-renders and gate A rejects or delivers on the fingerprint, which
+	 * already covers these flags. The first observation is construction, not a change:
+	 * nothing has been delivered yet.
+	 */
+	private _noteHarnessDigestToolFaceChange(): void {
+		const key = harnessDigestRenderFlagsKey(this._harnessDigestRenderFlags());
+		const previous = this._harnessDigestRenderFlagsKey;
+		this._harnessDigestRenderFlagsKey = key;
+		if (previous !== undefined && previous !== key) {
+			this._invalidateHarnessDigestBaselines();
+		}
 	}
 
 	/**
