@@ -1079,7 +1079,8 @@ function harnessStoreStampsEqual(left: HarnessStoreStamps, right: HarnessStoreSt
  * the render itself deferred. Delivery decisions compare fingerprints (and the
  * per-entry version map), so the common "a store stamp moved but nothing the
  * digest prints moved" turn pays the state load and the fingerprint only - the
- * ranked render (0.62 s at the 48-term cap on a 1268-entry store, perf seat C
+ * ranked render (~0.155 s mean at the 48-term cap on the 1266-entry fixture
+ * since a5f4868c0, and 0.66-0.70 s before that score-once rewrite; perf seats B/C
  * 2026-09-18) is bought only by a turn that actually appends a carrier. The
  * render is memoized: the legacy text-comparison branch and the append both read
  * the same string.
@@ -12901,10 +12902,11 @@ export class AgentSession {
 	 * (a rename, so a new inode), which makes the two store stamps a complete change
 	 * signal. When nothing moved the turn pays two `lstat` calls and reads no state
 	 * file; a moved stamp buys the parse plus the state fingerprint, and only a turn
-	 * that actually appends a carrier buys the ranked render (perf seat C: on a
-	 * 1268-entry store the render alone was 0.62 s of synchronous event-loop time at
-	 * the 48-term cap, paid on every moved stamp whether or not anything was
-	 * delivered).
+	 * that actually appends a carrier buys the ranked render (perf seats B/C
+	 * 2026-09-18: on the 1266-entry fixture the render alone is ~0.155 s mean of
+	 * synchronous event-loop time at the 48-term cap - 0.66-0.70 s before the
+	 * score-once rewrite - and every moved stamp used to pay it whether or not
+	 * anything was delivered).
 	 */
 	private _refreshHarnessDigestIfMateriallyChanged(): void {
 		const stamps = this._harnessStoreStamps();
