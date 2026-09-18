@@ -22,7 +22,7 @@
  *
  * Positive controls, measured rather than eyeballed: each mutation below was applied as a
  * single-line change and re-run through the JSON reporter, and the readings are tabulated in
- * APPLY.md ("positive controls"). What this file answers:
+ * `docs/fork/designs/2334-human-priority-APPLY.md` ("positive controls"). What this file answers:
  *   - M1 (`insertionIndex` back to a plain tail push), M2 (the `agentmsg_` id guard dropped)
  *     and M3 (every class mapped to `user`, i.e. the `inputClassOrigin` derivation deleted)
  *     all go red here - the derivation pins read the exported mapper, so reintroducing a
