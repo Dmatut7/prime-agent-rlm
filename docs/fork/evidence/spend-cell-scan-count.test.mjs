@@ -54,8 +54,14 @@
  *   - `DEFAULT_SUBAGENT_SPEND_CELL_INTERVAL_MS` 15_000 -> 5_000: default leg goes red.
  *   - `SUBAGENT_SPEND_IDLE_TICK_MS` 15_000 -> 5_000: fallback leg goes red, default stays green.
  *   - `isSubagentSpendCellVisible()` -> `true`: the two visibility controls go red.
+ *   - `fetchSharedContextTree` no longer reusing an at-or-after scan (or the forced path made
+ *     to ignore the memo): the turn-end-on-tick leg goes red (six, not five).
+ *   - `scheduleSubagentSpendRefresh(true)` not arming its timeout: the turn-end-past-shared
+ *     leg goes red (five, not six) - which is the case that keeps the shared reading from
+ *     passing on a forced path that stopped doing anything.
  */
 import { mkdirSync, writeFileSync } from "node:fs";
+import { loadavg } from "node:os";
 import { dirname } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 const LEG = process.env.SPEND_CELL_LEG === "pre-v1" ? "pre-v1" : "current";
@@ -69,13 +75,22 @@ const DEFAULT_SUBAGENT_SPEND_CELL_INTERVAL_MS = settingsManager?.DEFAULT_SUBAGEN
 const MIN_SUBAGENT_SPEND_CELL_INTERVAL_MS = settingsManager?.MIN_SUBAGENT_SPEND_CELL_INTERVAL_MS;
 
 /**
- * Measured on 2026-09-18 with this file, one row per leg. `tick` says whether the tree
- * under test has the idle tick at all: the pre-v1 tree scans from events alone, so the
- * tick scenarios are skipped there instead of being asserted against a cadence that
- * does not exist.
+ * One row per leg, re-read with this file at `SPEND_CELL_BASE_SHA` (the run that produced
+ * the `spend-cell-scan-count.baseline.json` next to it). `tick` says whether the tree under
+ * test has the idle tick at all: the pre-v1 tree scans from events alone, so the tick
+ * scenarios are skipped there instead of being asserted against a cadence that does not
+ * exist.
+ *
+ * The turn-end pair was re-anchored on 2026-09-18 (late): the top bar and the spend cell now
+ * share one scan, so a turn end whose aim lands on the moment a tick already scanned is
+ * served by that scan instead of buying a second one. `turnEnd` is that case (five, i.e. the
+ * tick-only reading) and `turnEndPast` is a turn end aiming past the shared scan, which still
+ * pays its own (six). Both halves are kept because each covers the other's blind spot: a
+ * shared read that stopped sharing shows six in the first, and a forced refresh that stopped
+ * being scheduled at all drops the second back to five.
  */
 const LEGS = {
-	current: { tick: true, quiet: 5, busy: 5, turnEnd: 6, tick5s: 13, gone: 2 },
+	current: { tick: true, quiet: 5, busy: 5, turnEnd: 5, turnEndPast: 6, tick5s: 13, gone: 2 },
 	"pre-v1": { tick: false, quiet: 1, busy: 12, gone: 1 },
 };
 const expectations = LEGS[LEG];
@@ -197,6 +212,17 @@ afterAll(() => {
 				? "cd /tmp/spend-base-wt && SPEND_CELL_LEG=pre-v1 npx vitest run --root . --config packages/coding-agent/vitest.config.ts docs/fork/evidence/spend-cell-scan-count.test.mjs"
 				: "npx vitest run --root . --config packages/coding-agent/vitest.config.ts docs/fork/evidence/spend-cell-scan-count.test.mjs",
 		window: `${WINDOW_MS} ms of fake time`,
+		// What this row is and what it was re-read for, so a reader of the JSON does not have to
+		// reconstruct it from the expectations alone.
+		note:
+			LEG === "pre-v1"
+				? "baseline side: the tree before the spend-cell patch set (run in a worktree at 0186a1247)"
+				: "current side: re-anchored for the shared top-bar scan - turn-end-on-tick reuses the tick's scan (5), turn-end-past-shared pays its own (6)",
+		// Recorded for the record only: the clock here is vitest's fake timer, so the counts are
+		// deterministic under any load and this instrument has no wall-clock leg to be biased.
+		// It is written down anyway so two runs can be compared with the machine state that
+		// produced them in hand.
+		loadavg: loadavg(),
 		scenarios,
 	};
 	mkdirSync(dirname(READINGS_PATH), { recursive: true });
@@ -273,7 +299,7 @@ describe("subagent spend cell: context-tree scans per 60s", () => {
 		}
 	});
 
-	it.skipIf(tickOnly())("a turn end adds exactly one forced scan on top of the tick", async () => {
+	it.skipIf(tickOnly())("a turn end landing on a tick's own scan costs no second scan", async () => {
 		vi.useFakeTimers();
 		try {
 			const { mode, getContextTree, update, schedule } = createMode();
@@ -281,15 +307,43 @@ describe("subagent spend cell: context-tree scans per 60s", () => {
 			update.call(mode, child("worker", "running"));
 			await vi.advanceTimersByTimeAsync(LEADING_FILL_MS);
 			await vi.advanceTimersByTimeAsync(30_000 - LEADING_FILL_MS);
-			// A landed assistant message / turn end forces a refresh past the debounce and floor.
+			// A landed assistant message / turn end forces a refresh past the debounce and the
+			// floor, at the same 30s beat the idle tick's own scan lands on.
 			schedule.call(mode, true);
 			await vi.advanceTimersByTimeAsync(WINDOW_MS - 30_000);
 
-			const total = recordScenario("quiet-visible-60s-one-turn-end", scans, { forcedRefreshes: 1 });
-			// 1 leading fill + 4 ticks + 1 forced turn-end refresh. This is the only shape
-			// this instrument reaches six scans in - which is how the changelog's "6" can be
-			// read (5 idle/event + 1 turn end); the tick legs alone give five.
+			const total = recordScenario("quiet-visible-60s-turn-end-on-tick", scans, { forcedRefreshes: 1 });
+			// 1 leading fill + the four ticks = 5, the tick-only reading above: the scan the
+			// tick paid for is at-or-after the moment this refresh aimed for, so
+			// `fetchSharedContextTree` hands it back rather than scanning twice for one beat.
 			expect(total).toBe(expectations.turnEnd);
+			expect(total).toBe(expectations.quiet);
+			// Direct evidence that nothing was paid twice: the pre-share instrument recorded
+			// two scans in the same millisecond here (gapsMs: [...,0,...]); one beat, one stamp.
+			expect(new Set(scans).size).toBe(scans.length);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it.skipIf(tickOnly())("a turn end past the shared scan still pays one of its own", async () => {
+		vi.useFakeTimers();
+		try {
+			const { mode, getContextTree, update, schedule } = createMode();
+			const scans = spyScanTimes(getContextTree);
+			update.call(mode, child("worker", "running"));
+			await vi.advanceTimersByTimeAsync(LEADING_FILL_MS);
+			await vi.advanceTimersByTimeAsync(31_000 - LEADING_FILL_MS);
+			// One second after the 30s tick's scan: the shared result landed *before* the moment
+			// this refresh aims for, so it is not the answer to this request.
+			schedule.call(mode, true);
+			await vi.advanceTimersByTimeAsync(WINDOW_MS - 31_000);
+
+			const total = recordScenario("quiet-visible-60s-turn-end-past-shared", scans, { forcedRefreshes: 1 });
+			// 1 leading fill + 4 ticks + 1 forced. The turn end still forces a real scan when its
+			// aim is past the shared result - which is what keeps the case above from staying
+			// green on a forced refresh that stopped being scheduled at all.
+			expect(total).toBe(expectations.turnEndPast);
 		} finally {
 			vi.useRealTimers();
 		}

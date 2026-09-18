@@ -222,3 +222,24 @@ over:
 Neither point is a reason to keep this instrument out: it is what makes the *scan-count* claim
 reproducible in-repo, which was the ask for B4-ops-16. It is a reason for the parent to decide which
 instrument the sentence should name, and to make the sentence name one that exists.
+
+### Closed on base `4feacb5ce` (2026-09-18 late, the 0.10.0 closure lane)
+
+Both points above are now actions rather than observations:
+
+1. **The sentence names instruments that exist.** `CHANGELOG.md:26` reads its readings from
+   `docs/fork/evidence/spend-cell-scan-count.test.mjs` (this scan count) and from
+   `packages/coding-agent/scripts/perf/` (the bench instruments), not from a `scripts/perf/` that was
+   never there.
+2. **The numbers are this instrument's.** The mutation leg is stated as **12** (its `pre-v1` row,
+   measured on the same fixture), and the `p50 2.36×/3.27×` claim is gone: no instrument in this tree
+   produces it, and this one deliberately does not measure wall clock.
+
+The turn-end expectation was re-anchored in the same lane. `3f7e0f228` made the top bar and the spend
+cell share one scan, so a turn end whose aim lands on the moment a tick has already scanned is served
+by that scan: the leg that expected `turnEnd: 6` now reads **5** (equal to the tick-only reading, and
+with no two stamps in one millisecond - the pre-share baseline recorded two at the same ms). Because
+that reading would also come out 5 if the forced refresh stopped being scheduled at all, a second leg
+was added: a turn end aiming one second *past* the shared scan still pays its own (**6**). Both rows
+and the two runs behind them are in `spend-cell-scan-count.baseline.json`; each leg's mutation is named
+in the instrument header.
