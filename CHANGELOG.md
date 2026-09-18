@@ -4,7 +4,7 @@
 
 ## 0.10.0（2026-09-18）
 
-吸收上游 `e2fb7bfa1` 窗（136 笔）的择取部分，加上本 fork 的一批效果与安全修复。CI **14 个 job**（10 matrix + Contributor trust + build-check + test-hygiene + build-check-test）：收口批的头 CI 曾是**红的**（run `35359758914`、`35360701254`，四条真因＝旧 release 针没跟 `b040da84d` 的契约迁移 / `ci.yml` 还在跑 `9afed3ba6` 删掉的 floor 模块 / resync 路径在 `uiServices` 缺席时抛 TypeError / 扫描计数仪器的 turnEnd 期望没跟着共享扫描重锚），修好后 run `RUN_ID_PENDING` 全绿。
+吸收上游 `e2fb7bfa1` 窗（136 笔）的择取部分，加上本 fork 的一批效果与安全修复。CI **14 个 job**（10 matrix + Contributor trust + build-check + test-hygiene + build-check-test）：收口批的头 CI 曾是**红的**（run `35359758914`、`35360701254`，四条真因＝旧 release 针没跟 `b040da84d` 的契约迁移 / `ci.yml` 还在跑 `9afed3ba6` 删掉的 floor 模块 / resync 路径在 `uiServices` 缺席时抛 TypeError / 扫描计数仪器的 turnEnd 期望没跟着共享扫描重锚），修好后 run `35366778047` **14 job 全绿**（jobs 实测 14）。**代码冻结**：0.10.0 的代码面到此冻结于 `9f06b4eff`；本笔及之后只允许 docs/evidence 类提交，直到 final SHA 宣告。
 
 ### 从上游吸收
 
