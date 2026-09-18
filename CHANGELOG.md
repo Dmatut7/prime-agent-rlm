@@ -23,7 +23,7 @@
 
 ### 本 fork 新增 / 修复
 
-- **子代理花费格**：subagents 行显示 `Σ 子代理 ¥… · …tok · 总 ¥…`；节拍可配（`ui.subagentSpendCell.intervalMs`，默认 15s、5–120s 可配；`false` 才关扫描，`intervalMs: 0` 会被 clamp 到 5000 而不是关）；价格标错可在 `ui.subagentSpendCell.priceOverrides` 覆盖，cell 与 /usage 都会标明来源。性能修复（读数口径＝仓内可复跑仪器 `scripts/perf/`，见 `docs/fork/evidence/`）：节流派生后每 60s 约 **5 次**扫描（变异拆掉节流变 28 次）；单次扫描 p50 仪器复现 **2.36×/3.27×** 更快；阻塞面**按家族分档**——静默与重家族档赢（−11.7% 且随负载翻转），忙家族中间档反慢（N=200 +47.4%、N=600@20KiB +155.9%），该档的缓存上界/LRU/忙退避修复在收口窗口在飞；顶栏与花费格合流后一拍只取一次上下文树。
+- **子代理花费格**：subagents 行显示 `Σ 子代理 ¥… · …tok · 总 ¥…`；节拍可配（`ui.subagentSpendCell.intervalMs`，默认 15s、5–120s 可配；`false` 才关扫描，`intervalMs: 0` 会被 clamp 到 5000 而不是关）；价格标错可在 `ui.subagentSpendCell.priceOverrides` 覆盖，cell 与 /usage 都会标明来源。性能修复（读数口径＝仓内可复跑仪器 `scripts/perf/`，见 `docs/fork/evidence/`）：节流派生后每 60s 约 **5 次**扫描（变异拆掉节流变 28 次）；单次扫描 p50 仪器复现 **2.36×/3.27×** 更快；缓存上界/LRU/忙退避修复后（`f86807bf0`/`0237e01f7`/`14d40f67f`/`649f6a074`/`199646bf4`）：驻留 80.06MB→0.48MB、忙家族一拍 syscall 降到比不开缓存还便宜、预算外失效比值 0.19；**净效应随目录形状与测量窗口变号**——单文件形状快 36%（paired 成对口径），两文件形状（真语料 84% 的形态）以每目录 +1 次 4KB 头预读换同一批命中，实测幅度两例 +56% 与 +12.6%（两例的修前臂绝对值本身差 55%，故幅度不作定数、机制确定）；顶栏与花费格合流后一拍只取一次上下文树（3→1），应急开关 `false` 两个面都停扫。
 - **压缩面增量**：keepRecent 与切点按**内容密度**重标（`ac60d4607`）；压缩 hung 时排队输入（含你的打字与 heartbeat）有了 **stall 上界**（`ede1f8da8`，以前可能无限期不落地且 CI 全绿）。触发 80%／准入门／降级阀／"压缩优先于子代理回执"属 0.9.5 压缩束，见下节。
 - **provider retry 单层化**：每条路径只在最外层重试一次（`0a6377d35`），SDK 层在被包装时 maxRetries=0，模块移除时 SDK 按策略重试。
 - **before-compact hook 抛错改响亮失败**＋expand 键搬家＋archived 行带 error verdict（`5924d4d0c`）。
