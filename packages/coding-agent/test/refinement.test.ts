@@ -50,6 +50,7 @@ import {
 	scoreHarnessEntryForQuery,
 	WINDOWS_HARNESS_PERSISTENCE_UNSUPPORTED_ERROR,
 } from "../src/core/refinement/index.js";
+import { rankHarnessEntriesForQuery } from "../src/core/refinement/refinement.js";
 import type { CustomEntry } from "../src/core/session-manager.js";
 
 const { completeSimpleMock } = vi.hoisted(() => ({
@@ -1905,5 +1906,47 @@ describe("harnessDigestFingerprint (#2400)", () => {
 		// The shell flag is normalized out while IPython examples take precedence:
 		// the formatter never reads it then, so the digest cannot change either.
 		expect(harnessDigestFingerprint(fpState([a, b]), { ...FLAGS, includeShellExamples: false })).toBe(forward);
+	});
+});
+
+describe("rankHarnessEntriesForQuery", () => {
+	const entry = (id: string, content: string): HarnessEntry => ({
+		kind: "memory",
+		scope: "global",
+		id,
+		version: 1,
+		title: `title ${id}`,
+		content,
+		path: `/harness/${id}.md`,
+		reference: {},
+		arguments: {},
+		metadata: {},
+		source: "test",
+		created_at: "2026-09-18T00:00:00.000Z",
+		updated_at: "2026-09-18T00:00:00.000Z",
+	});
+
+	// The single-sweep scorer must agree with the exported per-entry scorer at
+	// every term count that matters, including the first count where a packed
+	// 32-bit bitmask would alias (17) and the production cap (48): a silent
+	// ranking regression here changes which six entries the model sees.
+	it.each([1, 16, 17, 48, 58])("ranks %i terms identically to the reference scorer", (termCount) => {
+		const words = Array.from({ length: termCount }, (_, i) => `term${String(i).padStart(2, "0")}`);
+		const entries = Array.from({ length: 40 }, (_, i) =>
+			entry(
+				`m${i}`,
+				`body ${words.slice(0, (i % words.length) + 1).join(" ")} filler ${i} ${words[i % words.length]}`,
+			),
+		);
+		const terms = new Map<string, number>(words.map((w, i) => [w, 1 + (i % 3)]));
+		const ranked = rankHarnessEntriesForQuery(entries, terms);
+		const reference = [...entries]
+			.map((e) => ({ e, s: scoreHarnessEntryForQuery(e, terms, harnessQueryTermIdf(entries, terms)) }))
+			.sort((x, y) => {
+				if (y.s !== x.s) return y.s - x.s;
+				return [x.e.path, x.e.title, x.e.id].join("\0").localeCompare([y.e.path, y.e.title, y.e.id].join("\0"));
+			})
+			.map((x) => x.e);
+		expect(ranked.map((e) => e.id)).toEqual(reference.map((e) => e.id));
 	});
 });

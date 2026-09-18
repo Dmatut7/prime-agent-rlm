@@ -968,11 +968,14 @@ function rankedIdentifier(entry: HarnessEntry): string {
 export function rankHarnessEntriesForQuery(entries: HarnessEntry[], terms: HarnessQueryTerms): HarnessEntry[] {
 	const fields = entries.map(normalizeHarnessEntryFields);
 	const termList = [...terms.entries()];
-	const hitsPerEntry: number[] = new Array(fields.length).fill(0);
+	// One byte per term per entry: a packed bitmask would alias past 16 terms
+	// (2-bit slots in a 32-bit word) while the production cap is 48 terms, so
+	// the default window would rank silently wrong from term 17 on.
+	const hitsPerEntry: Uint8Array[] = fields.map(() => new Uint8Array(termList.length));
 	const docFreq = new Map<string, number>();
 	for (let index = 0; index < fields.length; index += 1) {
 		const f = fields[index];
-		let bitmask = 0;
+		const hits = hitsPerEntry[index];
 		for (let t = 0; t < termList.length; t += 1) {
 			const term = termList[t][0];
 			const fieldHits =
@@ -980,11 +983,10 @@ export function rankHarnessEntriesForQuery(entries: HarnessEntry[], terms: Harne
 				(f.content.includes(term) ? 1 : 0) +
 				(f.identifier.includes(term) ? 1 : 0);
 			if (fieldHits > 0) {
-				bitmask |= fieldHits << (t * 2);
+				hits[t] = fieldHits;
 				docFreq.set(term, (docFreq.get(term) ?? 0) + 1);
 			}
 		}
-		hitsPerEntry[index] = bitmask;
 	}
 	const idf = new Map<string, number>();
 	for (const [term, documentFrequency] of docFreq) {
@@ -992,9 +994,9 @@ export function rankHarnessEntriesForQuery(entries: HarnessEntry[], terms: Harne
 	}
 	const scored = fields.map((f, index) => {
 		let score = 0;
-		const bitmask = hitsPerEntry[index];
+		const hits = hitsPerEntry[index];
 		for (let t = 0; t < termList.length; t += 1) {
-			const fieldHits = (bitmask >> (t * 2)) & 3;
+			const fieldHits = hits[t];
 			if (fieldHits > 0) {
 				score += termList[t][1] * (idf.get(termList[t][0]) ?? 1) * (1 + (fieldHits - 1) * 0.5);
 			}
