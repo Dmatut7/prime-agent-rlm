@@ -303,6 +303,93 @@ describe("ENG-4685 daemon-backed client modes", () => {
 		clearTimeout(timer);
 	});
 
+	it("attributes an owned-worker cleanup that stops busy sessions", async () => {
+		// B2-C09: the owner-disconnect cleanup has no activity gate by design (owned
+		// trees follow their owner), so a stop that takes live work down with it must
+		// at least be attributable in the log. The roster summary fold (live kernel
+		// bash / running children -> isSessionActive / hasRunningRlmChildren) is the
+		// same one the eviction gates read.
+		vi.useFakeTimers();
+		try {
+			const worker = {
+				descriptor: { ownerClientId: "owner-1", workerId: "worker-1" },
+				ownerCleanupTimer: undefined,
+			};
+			const busyEntry = {
+				agentId: "agent-1",
+				workerId: "worker-1",
+				queuedChild: false,
+				summary: { sessionId: "session-1", isSessionActive: true, hasRunningRlmChildren: false },
+			};
+			const stopWorker = vi.fn(async () => {});
+			const log = vi.fn();
+			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+				clients: new Set(),
+				workers: new Map([[worker.descriptor.workerId, worker]]),
+				protocolClientId: () => "nobody-here",
+				workerRosterEntries: () => [busyEntry],
+				stopWorker,
+				log,
+			}) as unknown as {
+				scheduleOwnedWorkerCleanup(resident: typeof worker): void;
+			};
+
+			supervisor.scheduleOwnedWorkerCleanup(worker);
+			await vi.advanceTimersByTimeAsync(30_000);
+
+			expect(stopWorker).toHaveBeenCalledWith(worker, true);
+			const lines = log.mock.calls.map((call) => String(call[0]));
+			const attribution = lines.filter((line) => line.includes("Stopping client-owned worker worker-1"));
+			expect(attribution).toHaveLength(1);
+			expect(attribution[0]).toContain("1 busy session(s)");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("stays quiet when an owned-worker cleanup stops only idle sessions", async () => {
+		// Negative control for the attribution above: with nothing busy on the worker
+		// the cleanup must not cry wolf - the line exists to name live work, and an
+		// always-on line would train operators to ignore it.
+		vi.useFakeTimers();
+		try {
+			const worker = {
+				descriptor: { ownerClientId: "owner-1", workerId: "worker-1" },
+				ownerCleanupTimer: undefined,
+			};
+			const idleEntry = {
+				agentId: "agent-1",
+				workerId: "worker-1",
+				queuedChild: false,
+				summary: { sessionId: "session-1", isSessionActive: false, hasRunningRlmChildren: false },
+			};
+			const stopWorker = vi.fn(async () => {});
+			const log = vi.fn();
+			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+				clients: new Set(),
+				workers: new Map([[worker.descriptor.workerId, worker]]),
+				protocolClientId: () => "nobody-here",
+				workerRosterEntries: () => [idleEntry],
+				stopWorker,
+				log,
+			}) as unknown as {
+				scheduleOwnedWorkerCleanup(resident: typeof worker): void;
+			};
+
+			supervisor.scheduleOwnedWorkerCleanup(worker);
+			await vi.advanceTimersByTimeAsync(30_000);
+
+			expect(stopWorker).toHaveBeenCalledWith(worker, true);
+			expect(
+				log.mock.calls
+					.map((call) => String(call[0]))
+					.filter((line) => line.includes("Stopping client-owned worker")),
+			).toEqual([]);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("runs host-owned autonomous gate retries through the shared completion loop", async () => {
 		const gate = `${process.execPath} -e "process.exit(0)"`;
 		const harness = await createHarness({
