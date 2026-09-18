@@ -312,6 +312,12 @@ const WORKER_SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS = 1_000;
 const AGENT_DIRECTORY_FAILURE_LOG_MIN_GAP_MS = 60_000;
 /** Minimum gap between two "held resident by live kernel work" lines for the same session. */
 const KERNEL_RESIDENCY_LOG_GAP_MS = 6 * 60 * 60 * 1000;
+/**
+ * Minimum gap between two "orphan exit deferred" lines. The availability wheel
+ * rechecks at most once a minute (backoff caps at 60s), so one line per minute
+ * attributes the hold without spamming the log for a long-busy worker.
+ */
+const ORPHAN_EXIT_DEFERRED_LOG_GAP_MS = 60_000;
 const UPDATE_RESTART_PREPARE_TIMEOUT_MS = 90_000;
 const MAX_SESSION_SNAPSHOT_STABILIZATION_RETRIES = 3;
 // Orphaned-worker garbage collection (upstream #2246): a session worker whose
@@ -898,6 +904,12 @@ export class AgentDaemon {
 	 * claim the socket spawns fresh workers on demand.
 	 */
 	private async exitOrphanedSupervisorWorker(supervisorSocketPath: string): Promise<void> {
+		// A shutdown already in flight owns the exit: re-entering through the orphan
+		// path would hit shutdown()'s re-entry branch (an immediate process.exit) and
+		// cut the graceful close short, skipping closeSession and the orphan-journal
+		// flush (B2-C06). The availability wheel re-checks shuttingDown per round, so
+		// deferring here cannot resurrect the loop.
+		if (this.shuttingDown) return;
 		const absentSince = this.supervisorAvailabilityState.supervisorAbsentSince;
 		if (absentSince === undefined) {
 			// The window restarted (a replacement answered): not an orphan anymore.
@@ -911,12 +923,39 @@ export class AgentDaemon {
 		if (this.hasOngoingSessionWork()) {
 			// An active run owns the worker a little longer; its turn end lets the
 			// next availability check reconsider while the window keeps running.
+			this.logOrphanExitDeferred(absentSince);
 			return;
 		}
 		this.log(
 			`supervisor ${supervisorSocketPath} unreachable for ${Math.round((Date.now() - absentSince) / 1000)}s; exiting orphaned worker`,
 		);
 		await this.shutdown(0);
+	}
+
+	/**
+	 * Attribution for the orphan-exit gate saying no (B2-C07): a worker kept alive
+	 * by busy sessions used to be log-silent, indistinguishable from a stuck
+	 * resurrection loop. One throttled line names the reason and the window age.
+	 */
+	private logOrphanExitDeferred(absentSince: number): void {
+		const now = Date.now();
+		if (
+			this.orphanExitDeferredLogAt !== undefined &&
+			now - this.orphanExitDeferredLogAt < ORPHAN_EXIT_DEFERRED_LOG_GAP_MS
+		) {
+			return;
+		}
+		this.orphanExitDeferredLogAt = now;
+		let activeSessions = 0;
+		let sessionsWithRunningChildren = 0;
+		for (const state of this.sessions.values()) {
+			const summary = summaryForActiveSession(state);
+			if (summary.isSessionActive) activeSessions++;
+			if (summary.hasRunningRlmChildren === true) sessionsWithRunningChildren++;
+		}
+		this.log(
+			`orphan exit deferred: ${activeSessions} active session(s), ${sessionsWithRunningChildren} session(s) with running children; supervisor unreachable for ${Math.round((now - absentSince) / 1000)}s`,
+		);
 	}
 
 	/**
@@ -3112,6 +3151,8 @@ export class AgentDaemon {
 	 * a sweep must be attributable (T2②-1) without becoming a line per sweep per session forever.
 	 */
 	private readonly kernelResidencyLogAt = new Map<string, number>();
+	/** Last time an "orphan exit deferred" line was logged (throttle for B2-C07). */
+	private orphanExitDeferredLogAt: number | undefined = undefined;
 
 	private async passivateIdleChildren(
 		idleEvictionMinutes: IdleEvictionMinutes,
@@ -3134,10 +3175,18 @@ export class AgentDaemon {
 			})),
 		);
 		this.logKernelPinnedResidency(snapshots, idleEvictionMinutes, now);
-		const candidates = snapshots
+		const eligible = snapshots
 			.filter(({ snapshot }) => canPassivateSession(snapshot, idleEvictionMinutes, now))
-			.sort((left, right) => left.snapshot.lastActivityAt - right.snapshot.lastActivityAt)
-			.slice(0, limit);
+			.sort((left, right) => left.snapshot.lastActivityAt - right.snapshot.lastActivityAt);
+		const candidates = eligible.slice(0, limit);
+		if (eligible.length > candidates.length) {
+			// The per-sweep cap leaving idle children behind used to be silent (B2-C07):
+			// one line names how many were skipped so a slow drain is attributable.
+			// Bounded by the sweep cadence (at most one line per sweep).
+			this.log(
+				`child passivation capped: passivating ${candidates.length} of ${eligible.length} idle child session(s) this sweep (limit ${limit})`,
+			);
+		}
 		const results = await Promise.all(
 			candidates.map(({ state, snapshot }) => this.passivateSession(state, idleEvictionMinutes, now, snapshot)),
 		);
