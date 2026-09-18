@@ -22,7 +22,9 @@
  * cooldown (anti-starvation), `priorityOverAgentMessages: false` (the documented
  * escape hatch, and the negative control that makes the ordering rows falsifiable),
  * a user abort (immediate, never queued behind the compaction), and the gate watchdog
- * (a hung compaction is aborted after the stall budget).
+ * (a hung compaction is aborted after the stall budget) - pinned in both orderings: the
+ * input queued before the compaction started, and the input admitted into a compaction
+ * that is already running, for a human prompt and for machine traffic alike.
  *
  * The three compaction states are `pending` (idle, over the trigger threshold, no
  * compaction running), `in_flight` (a threshold compaction parked inside a
@@ -1188,8 +1190,13 @@ describe("compaction x input-class admission matrix", () => {
 		// The queued input was not starved: it went in once the retry compacted, and the
 		// retry is visible as a second hook entry the test never released either. Note
 		// what this also documents: the retry is the queued action's OWN pre-turn
-		// compaction, and `_armCompactionGateWatchdog` is only armed from the admission
-		// gate, so a summarizer that hangs again on the second attempt is unbounded.
+		// compaction, and it is bounded too - the action is still unfinished while its own
+		// pre-turn compaction runs, so `_runAutoCompaction`'s `hasPendingSessionWork`
+		// arming covers the second attempt. (Measured with every hook entry hanging: two
+		// watchdog aborts 53ms apart at this row's 0.05s budget, then the reply delivered.
+		// An earlier revision of this comment claimed the retry was unbounded; it was
+		// already stale when written, and the two rows below pin the ordering that was
+		// genuinely missing - input admitted INTO a running compaction.)
 		expect(gate.enteredCount()).toBe(2);
 		expect(timeline.first("compaction_end")).toBeLessThan(timeline.first("input_delivered"));
 		expect(timeline.count("input_delivered")).toBe(1);
@@ -1199,5 +1206,161 @@ describe("compaction x input-class admission matrix", () => {
 		const settled = harness.eventsOfType("compaction_end").filter((end) => end.aborted !== true);
 		expect(settled).toHaveLength(1);
 		expect(settled[0]?.result?.summary).toBe(COMPACTION_SUMMARY);
+	});
+
+	it("watchdog: a human prompt admitted INTO a hung compaction is not starved", async () => {
+		// The other ordering, and the one the boss hits. The row above queues the input
+		// first, so the admission gate arms the bound. Here the compaction is already
+		// running - it started at the fill turn's agent_end with an empty queue, so
+		// `_runAutoCompaction`'s `hasPendingSessionWork` arming had nothing to arm for -
+		// and a person types into it. The stall watchdog snoozes while compaction owns the
+		// turn boundary, so before `_admitSessionInput` armed the same watchdog this
+		// prompt waited forever and every pin stayed green (measured: this row is red at
+		// 96af873b2, where `isCompacting` is still true 20s after the admission).
+		//
+		// Measured mutations behind this row: deleting the arming in `_admitSessionInput`
+		// turns it red; so does deleting the `abortCompaction()` call inside the watchdog,
+		// which is what makes the row about the bound rather than about the timer.
+		const gate = createCompactionGate({ hangEntries: 1 });
+		gates.push(gate);
+		const harness = await createMatrixHarness({
+			bigContext: true,
+			compactionEnabled: true,
+			gate,
+			gateWatchdogSeconds: GATE_WATCHDOG_SECONDS,
+		});
+		// Compaction is on from the start, so the fill turn ends at the tool-result
+		// boundary (that is where a cut can land) and consumes exactly one response: the
+		// next one belongs to the turn this row is about.
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("fill", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage(HUMAN_TURN_TEXT),
+			fauxAssistantMessage("spare turn"),
+		]);
+		expect(classifyIncomingInput({ source: "interactive", text: HUMAN_PROMPT })).toBe("human_interactive");
+		const timeline = watch(
+			harness,
+			(candidate) => candidate.role === "user" && getMessageText(candidate) === HUMAN_PROMPT,
+		);
+
+		const fillRun = harness.session.prompt("run the fill tool").catch(() => undefined);
+		track(fillRun);
+		await vi.waitFor(() => expect(gate.enteredCount()).toBe(1), { timeout: 20_000, interval: 10 });
+		expect(harness.session.isCompacting).toBe(true);
+		// Fixture integrity: this compaction really did start with nothing waiting, so the
+		// arming this row measures cannot be `_runAutoCompaction`'s.
+		expect(harness.session.hasPendingSessionWork).toBe(false);
+		expect(harness.session.queuedActionCount).toBe(0);
+		expect(harness.settingsManager.getStallWatchdogSettings().abortAfterSeconds).toBe(GATE_WATCHDOG_SECONDS);
+
+		const preflight = createPreflightRecord();
+		const humanRun = harness.session.prompt(HUMAN_PROMPT, {
+			streamingBehavior: "steer",
+			queueIfBusy: true,
+			preflightResult: capturePreflight(preflight),
+		});
+		track(humanRun);
+		await settledPreflight(preflight);
+		expect(preflight.success).toBe(true);
+		expect(preflight.queued).toBe(true);
+		// Not gated: human input queues through ordinary busy-queueing, so the reason a
+		// child reply gets must not appear here. The stand-down the gate's own comment
+		// calls unreachable from the agent channel is observable on this side of it.
+		expect(preflight.reason).toBeUndefined();
+		expect(harness.session.getSteeringMessages()).toEqual([HUMAN_PROMPT]);
+		// Human priority is an ordering fact, not a preemption: the admission does not
+		// interrupt the compaction, it only puts a ceiling on it.
+		expect(harness.session.isCompacting).toBe(true);
+		expect(harness.eventsOfType("compaction_end")).toEqual([]);
+
+		// The test never releases the gate: the bound has to be what ends the hang.
+		await vi.waitFor(() => expect(harness.session.isCompacting).toBe(false), { timeout: 20_000, interval: 10 });
+		expect(gate.isReleased()).toBe(false);
+		const aborted = harness.eventsOfType("compaction_end").filter((end) => end.aborted === true);
+		expect(aborted).toHaveLength(1);
+		expect(aborted[0]?.reason).toBe("threshold");
+
+		await fillRun;
+		await harness.session.waitForIdle();
+
+		// The prompt was not starved: it went in once the retry compacted, and the retry is
+		// the queued turn's own pre-turn compaction (a second hook entry the test never
+		// released either).
+		expect(gate.enteredCount()).toBe(2);
+		expect(timeline.first("compaction_end")).toBeLessThan(timeline.first("input_delivered"));
+		expect(timeline.count("input_delivered")).toBe(1);
+		expect(harness.session.messages.filter((message) => getMessageText(message) === HUMAN_PROMPT)).toHaveLength(1);
+		expect(harness.session.queuedActionCount).toBe(0);
+		expect(getAssistantTexts(harness)).toContain(HUMAN_TURN_TEXT);
+		const settledHuman = harness.eventsOfType("compaction_end").filter((end) => end.aborted !== true);
+		expect(settledHuman).toHaveLength(1);
+		expect(settledHuman[0]?.result?.summary).toBe(COMPACTION_SUMMARY);
+	});
+
+	it("watchdog: machine traffic admitted INTO a hung compaction is bounded the same way", async () => {
+		// The bound is not a human-only privilege, and pinning that is what keeps the
+		// arming at `_admitSessionInput` class-independent: a heartbeat injected into the
+		// same window (its own `injected` policy, `preTurnCompaction: "beforeModelSelection"`)
+		// waited behind the hung compaction forever on base too.
+		//
+		// Measured mutation behind this row: narrowing the arming to
+		// `action.priority === "user"` - the human-only reading of the same fix - turns
+		// this row red and leaves the human row above green, so the two rows together pin
+		// the invariant rather than one class's symptom.
+		const gate = createCompactionGate({ hangEntries: 1 });
+		gates.push(gate);
+		const harness = await createMatrixHarness({
+			bigContext: true,
+			compactionEnabled: true,
+			gate,
+			gateWatchdogSeconds: GATE_WATCHDOG_SECONDS,
+		});
+		// Same response accounting as the human row above: the fill turn stops at the
+		// tool-result boundary, so one response is the fill and the next is the heartbeat.
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("fill", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage(HEARTBEAT_TURN_TEXT),
+			fauxAssistantMessage("spare turn"),
+		]);
+
+		const fillRun = harness.session.prompt("run the fill tool").catch(() => undefined);
+		track(fillRun);
+		await vi.waitFor(() => expect(gate.enteredCount()).toBe(1), { timeout: 20_000, interval: 10 });
+		expect(harness.session.isCompacting).toBe(true);
+		expect(harness.session.hasPendingSessionWork).toBe(false);
+
+		const job = heartbeatJob("heartbeat-matrix-watchdog", HEARTBEAT_PROMPT);
+		const heartbeatMessage = createHeartbeatPromptMessage(job);
+		expect(heartbeatMessage.customType).toBe(HEARTBEAT_PROMPT_CUSTOM_TYPE);
+		expect(classifyIncomingInput(incomingInputFactsFromMessage(heartbeatMessage, { source: "internal" }))).toBe(
+			"scheduled",
+		);
+		const timeline = watch(
+			harness,
+			(candidate) => candidate.role === "custom" && candidate.customType === HEARTBEAT_PROMPT_CUSTOM_TYPE,
+		);
+		const heartbeatRun = harness.session.promptHeartbeat(job);
+		track(heartbeatRun);
+		// The injected turn is queue-invisible, so the admission witness is the session's
+		// own pending-work fact, not the visible queue.
+		await vi.waitFor(() => expect(harness.session.hasPendingSessionWork).toBe(true), {
+			timeout: 20_000,
+			interval: 10,
+		});
+		expect(harness.session.isCompacting).toBe(true);
+
+		await vi.waitFor(() => expect(harness.session.isCompacting).toBe(false), { timeout: 20_000, interval: 10 });
+		expect(gate.isReleased()).toBe(false);
+		expect(harness.eventsOfType("compaction_end").filter((end) => end.aborted === true)).toHaveLength(1);
+
+		await fillRun;
+		await harness.session.waitForIdle();
+
+		expect(gate.enteredCount()).toBe(2);
+		expect(timeline.first("compaction_end")).toBeLessThan(timeline.first("input_delivered"));
+		expect(timeline.count("input_delivered")).toBe(1);
+		expect(customMessagesOfType(harness, HEARTBEAT_PROMPT_CUSTOM_TYPE)).toHaveLength(1);
+		expect(getAssistantTexts(harness)).toContain(HEARTBEAT_TURN_TEXT);
+		expect(harness.session.hasPendingSessionWork).toBe(false);
 	});
 });
