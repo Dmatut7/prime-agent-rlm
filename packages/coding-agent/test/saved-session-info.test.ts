@@ -29,11 +29,15 @@ describe("saved session agent status wire serialization", () => {
 	});
 
 	test("carries an error verdict across the wire: the recap and the enum together", () => {
-		// The wire half of upstream #2310. The downshift this replaces existed because
-		// daemon-client refused "error" and a client strict about the saved-session item
-		// dropped the whole row over it; the validator has accepted the value since
-		// 8f52777f2, so holding the verdict back only hid the failure from every current
-		// client - the row kept showing the terminal error text with no verdict on it.
+		// The wire half of upstream #2310. The downshift this replaces existed because a client
+		// strict about the saved-session item dropped the whole row over a taskState it did not
+		// know, and in this fork's lineage that client was our own pre-merge build (0.9.1,
+		// e744cfbf4), whose validator accepted only undefined | "needs_input" | "completed".
+		// Upstream's validator has accepted "error" since 8f52777f2, but that commit is not an
+		// ancestor of our pre-merge build, so it is upstream evidence only; this branch's client
+		// has accepted the value since the merge commit 67334bf1a. Holding the verdict back
+		// therefore only hid the failure from every current client - the row kept showing the
+		// terminal error text with no verdict on it.
 		const status = {
 			summary: "Model request failed: 400 bad request",
 			taskState: "error" as const,
