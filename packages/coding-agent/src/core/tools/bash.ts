@@ -1,11 +1,18 @@
 import { existsSync } from "node:fs";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Container, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import {
+	Container,
+	getKeybindings,
+	Text,
+	truncateToWidth,
+	visibleWidth,
+	wrapTextWithAnsi,
+} from "@earendil-works/pi-tui";
 import { spawn } from "child_process";
 import { type Static, Type } from "typebox";
 import { expandCollapseHint } from "../../modes/interactive/components/keybinding-hints.js";
 import type { VisualTruncateResult } from "../../modes/interactive/components/visual-truncate.js";
-import { theme } from "../../modes/interactive/theme/theme.js";
+import { theme, themeToken } from "../../modes/interactive/theme/theme.js";
 import { waitForChildProcess } from "../../utils/child-process.js";
 import {
 	getShellConfig,
@@ -14,7 +21,7 @@ import {
 	trackDetachedChildPid,
 	untrackDetachedChildPid,
 } from "../../utils/shell.js";
-import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.js";
+import type { ToolDefinition, ToolRenderContext, ToolRenderResultOptions } from "../extensions/types.js";
 import { previewBashCommand } from "./code-preview.js";
 import { OutputAccumulator } from "./output-accumulator.js";
 import { getTextOutput, invalidArgText, replaceTabs, str } from "./render-utils.js";
@@ -628,12 +635,37 @@ type BashRenderState = {
 	startedAt: number | undefined;
 	endedAt: number | undefined;
 	interval: NodeJS.Timeout | undefined;
+	/**
+	 * The mounted "Elapsed" label of a running command, when one is on screen. The
+	 * 1s tick rewrites it in place instead of rebuilding the whole block.
+	 */
+	elapsedComponent: Text | undefined;
+};
+
+/** The assembled collapsed frame, while nothing that shapes it has moved. */
+type BashPreviewFrame = {
+	source: string[];
+	width: number;
+	showExpandHint: boolean;
+	theme: unknown;
+	keybindings: unknown;
+	lines: string[];
 };
 
 type BashResultRenderState = {
 	cachedWidth: number | undefined;
 	cachedLines: string[] | undefined;
 	cachedSkipped: number | undefined;
+	/** The body the collapsed preview cache was built from. */
+	cachedBodyOutput: string | undefined;
+	/** Blank line + hint + preview, assembled once instead of on every frame. */
+	cachedPreviewFrame: BashPreviewFrame | undefined;
+	/** Expanded view: the body the cached lines were built from. */
+	cachedExpandedOutput: string | undefined;
+	cachedExpandedWidth: number | undefined;
+	cachedExpandedLines: string[] | undefined;
+	/** Theme the cached expanded lines were styled with. */
+	cachedExpandedTheme: unknown;
 };
 
 class BashResultRenderComponent extends Container {
@@ -641,6 +673,12 @@ class BashResultRenderComponent extends Container {
 		cachedWidth: undefined,
 		cachedLines: undefined,
 		cachedSkipped: undefined,
+		cachedBodyOutput: undefined,
+		cachedPreviewFrame: undefined,
+		cachedExpandedOutput: undefined,
+		cachedExpandedWidth: undefined,
+		cachedExpandedLines: undefined,
+		cachedExpandedTheme: undefined,
 	};
 }
 
@@ -705,8 +743,38 @@ function bashPreviewTail(lines: string[], maxVisualLines: number, width: number)
 	};
 }
 
+/**
+ * The cached expanded lines, when they still describe what a render would produce.
+ * Every part of the key is an identity or value compare - no color is resolved here,
+ * because this runs for every block on every frame.
+ */
+function cachedExpandedLines(state: BashResultRenderState, output: string, width: number): string[] | undefined {
+	const holds =
+		state.cachedExpandedOutput === output &&
+		state.cachedExpandedWidth === width &&
+		state.cachedExpandedTheme === themeToken();
+	return holds ? state.cachedExpandedLines : undefined;
+}
+
+/** The collapsed "... N earlier lines" line, with the shortcut on the row that shows it. */
+function collapsedPreviewHint(skipped: number, showExpandHint: boolean): string {
+	return showExpandHint
+		? `${theme.fg("muted", `... ${skipped} earlier lines`)} ${expandCollapseHint("app.tools.expand", false)}`
+		: theme.fg("muted", `... (${skipped} earlier lines)`);
+}
+
+/** The expanded body: the whole output, styled and wrapped exactly like before. */
+function bashExpandedLines(output: string, width: number): string[] {
+	const styledOutput = output
+		.split("\n")
+		.map((line) => theme.fg("toolOutput", line))
+		.join("\n");
+	return new Text(`\n${styledOutput}`, 0, 0).render(width);
+}
+
 function rebuildBashResultRenderComponent(
 	component: BashResultRenderComponent,
+	renderState: BashRenderState,
 	result: {
 		content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
 		details?: BashToolDetails;
@@ -715,21 +783,60 @@ function rebuildBashResultRenderComponent(
 	showImages: boolean,
 	includeImageDimensions: boolean,
 	showExpandHint: boolean,
-	startedAt: number | undefined,
-	endedAt: number | undefined,
 ): void {
 	const state = component.state;
+	const startedAt = renderState.startedAt;
+	const endedAt = renderState.endedAt;
 	component.clear();
+	// The label instance belongs to the block that holds it; re-arm it every rebuild
+	// so the 1s tick of a running command never writes into a detached component.
+	renderState.elapsedComponent = undefined;
 
 	const output = getTextOutput(result as any, showImages, { includeImageDimensions }).trim();
 
+	// The collapsed preview cache is keyed on width alone, so it has to go whenever the
+	// body moved. Everything else in this block is either recreated by the rebuild above or
+	// validates its own cache key on render, so the unconditional component.invalidate()
+	// this replaces was overhead on the streaming path, which re-delivers a result every
+	// BASH_UPDATE_THROTTLE_MS whether or not the text advanced.
+	if (state.cachedBodyOutput !== output) {
+		state.cachedBodyOutput = output;
+		state.cachedWidth = undefined;
+		state.cachedLines = undefined;
+		state.cachedSkipped = undefined;
+		state.cachedPreviewFrame = undefined;
+	}
+
 	if (output) {
 		if (options.expanded) {
-			const styledOutput = output
-				.split("\n")
-				.map((line) => theme.fg("toolOutput", line))
-				.join("\n");
-			component.addChild(new Text(`\n${styledOutput}`, 0, 0));
+			// The expanded body is what a ctrl+o press actually pays for: every block
+			// restyles and rewraps whatever it holds, so the keystroke scales with the
+			// bytes released. Cache the result on the persistent render state, which
+			// survives the rebuilds that a press, the 1s tick of a running command and a
+			// chat-level invalidate all trigger for an unchanged body. Body, width and
+			// theme are the whole key, so a theme change still re-renders.
+			component.addChild({
+				render: (width: number) => {
+					const cached = cachedExpandedLines(state, output, width);
+					if (cached) {
+						return cached;
+					}
+					const lines = bashExpandedLines(output, width);
+					state.cachedExpandedOutput = output;
+					state.cachedExpandedWidth = width;
+					state.cachedExpandedTheme = themeToken();
+					state.cachedExpandedLines = lines;
+					return lines;
+				},
+				invalidate: () => {
+					// render() revalidates the whole key (width included) on every call, so all
+					// an invalidate can add is dropping lines styled with a theme that went
+					// stale while nobody was rendering.
+					if (state.cachedExpandedTheme !== themeToken()) {
+						state.cachedExpandedLines = undefined;
+					}
+				},
+			});
 		} else {
 			// The preview shows only the last BASH_PREVIEW_LINES visual lines;
 			// restyling and re-wrapping the whole accumulated output on every
@@ -742,19 +849,49 @@ function rebuildBashResultRenderComponent(
 						state.cachedLines = preview.visualLines;
 						state.cachedSkipped = preview.skippedCount;
 						state.cachedWidth = width;
+						state.cachedPreviewFrame = undefined;
 					}
-					if (state.cachedSkipped && state.cachedSkipped > 0) {
-						const hint = showExpandHint
-							? `${theme.fg("muted", `... ${state.cachedSkipped} earlier lines`)} ${expandCollapseHint("app.tools.expand", false)}`
-							: theme.fg("muted", `... (${state.cachedSkipped} earlier lines)`);
-						return ["", truncateToWidth(hint, width, "..."), ...(state.cachedLines ?? [])];
+					// Assembling the frame is per-frame work that every collapsed block pays,
+					// and resolving the shortcut text is the expensive part of it. Hand back
+					// one stable array while body, width, hint flag, theme and shortcuts hold,
+					// so a steady frame neither recomputes nor allocates here - and so the
+					// panel above can take its own identity fast path.
+					const previewLines = state.cachedLines ?? [];
+					const frame = state.cachedPreviewFrame;
+					if (
+						frame !== undefined &&
+						frame.source === previewLines &&
+						frame.width === width &&
+						frame.showExpandHint === showExpandHint &&
+						frame.theme === themeToken() &&
+						frame.keybindings === getKeybindings()
+					) {
+						return frame.lines;
 					}
-					return ["", ...(state.cachedLines ?? [])];
+					const skipped = state.cachedSkipped ?? 0;
+					const assembled =
+						skipped > 0
+							? [
+									"",
+									truncateToWidth(collapsedPreviewHint(skipped, showExpandHint), width, "..."),
+									...previewLines,
+								]
+							: ["", ...previewLines];
+					state.cachedPreviewFrame = {
+						source: previewLines,
+						width,
+						showExpandHint,
+						theme: themeToken(),
+						keybindings: getKeybindings(),
+						lines: assembled,
+					};
+					return assembled;
 				},
 				invalidate: () => {
 					state.cachedWidth = undefined;
 					state.cachedLines = undefined;
 					state.cachedSkipped = undefined;
+					state.cachedPreviewFrame = undefined;
 				},
 			});
 		}
@@ -780,10 +917,37 @@ function rebuildBashResultRenderComponent(
 	}
 
 	if (startedAt !== undefined) {
-		const label = options.isPartial ? "Elapsed" : "Took";
-		const endTime = endedAt ?? Date.now();
-		component.addChild(new Text(`\n${theme.fg("muted", `${label} ${formatDuration(endTime - startedAt)}`)}`, 0, 0));
+		const running = options.isPartial && endedAt === undefined;
+		const elapsed = new Text(elapsedLineText(running ? "Elapsed" : "Took", startedAt, endedAt), 0, 0);
+		if (running) {
+			renderState.elapsedComponent = elapsed;
+		}
+		component.addChild(elapsed);
 	}
+}
+
+/** The "Elapsed"/"Took" label body, shared by the rebuild and the 1s tick of a running command. */
+function elapsedLineText(label: string, startedAt: number, endedAt: number | undefined): string {
+	const endTime = endedAt ?? Date.now();
+	return `\n${theme.fg("muted", `${label} ${formatDuration(endTime - startedAt)}`)}`;
+}
+
+/**
+ * One 1s tick of a running command. The only thing that moved is its "Elapsed"
+ * label, so rewrite that label in place and ask for a frame; this used to invalidate
+ * the whole tool block, which rebuilt and rewrapped the entire output - expanded
+ * bodies included - once a second for as long as the command ran. Falls back to the
+ * full invalidate when no label is mounted or the host cannot request a frame on its
+ * own, so a tick still refreshes blocks this path cannot patch in place.
+ */
+function refreshRunningElapsed(context: ToolRenderContext<BashRenderState>, state: BashRenderState): void {
+	const elapsed = state.elapsedComponent;
+	if (elapsed && context.requestRender && state.startedAt !== undefined && state.endedAt === undefined) {
+		elapsed.setText(elapsedLineText("Elapsed", state.startedAt, undefined));
+		context.requestRender();
+		return;
+	}
+	context.invalidate();
 }
 
 export function createBashToolDefinition(
@@ -1038,7 +1202,7 @@ export function createBashToolDefinition(
 		renderResult(result, options, _theme, context) {
 			const state = context.state;
 			if (state.startedAt !== undefined && options.isPartial && !state.interval) {
-				state.interval = setInterval(() => context.invalidate(), 1000);
+				state.interval = setInterval(() => refreshRunningElapsed(context, state), 1000);
 			}
 			if (!options.isPartial || context.isError) {
 				state.endedAt ??= Date.now();
@@ -1051,15 +1215,13 @@ export function createBashToolDefinition(
 				(context.lastComponent as BashResultRenderComponent | undefined) ?? new BashResultRenderComponent();
 			rebuildBashResultRenderComponent(
 				component,
+				state,
 				result as any,
 				options,
 				context.showImages,
 				context.includeImageDimensions,
 				context.showExpandHint !== false,
-				state.startedAt,
-				state.endedAt,
 			);
-			component.invalidate();
 			return component;
 		},
 	};

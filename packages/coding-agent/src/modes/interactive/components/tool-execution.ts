@@ -213,6 +213,9 @@ export class ToolExecutionComponent extends Container {
 				this.invalidate();
 				this.ui.requestRender();
 			},
+			requestRender: () => {
+				this.ui.requestRender();
+			},
 			lastComponent,
 			state: this.rendererState,
 			cwd: this.cwd,
@@ -327,6 +330,12 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	setExpanded(expanded: boolean): void {
+		// Same guard setAgentMessagesExpanded/setEditDiffsExpanded below already have:
+		// expansion state is applied to every chat component on each toggle and on each
+		// rebuild, and a rebuild of an unchanged block re-renders its whole body.
+		if (this.expanded === expanded) {
+			return;
+		}
 		this.expanded = expanded;
 		this.updateDisplay();
 	}

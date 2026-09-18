@@ -837,6 +837,21 @@ function setGlobalTheme(t: Theme): void {
 	(globalThis as Record<symbol, Theme>)[THEME_KEY] = t;
 }
 
+/**
+ * Identity of the active theme object: it changes exactly when the global theme is
+ * (re)set, because every setter installs a freshly loaded instance. Renderers that
+ * style their own lines can use it as a cheap cache key - reading a color through the
+ * proxy above costs an order of magnitude more per call, and a cache that has to be
+ * checked on every frame of every block adds that up. Undefined until initTheme() ran.
+ *
+ * Not a guard against a caller mutating a Theme it handed to setThemeInstance() in
+ * place; nothing in this repo does, and ToolPanel's background sample stays as the
+ * belt-and-braces check on the panel side.
+ */
+export function themeToken(): Theme | undefined {
+	return (globalThis as Record<symbol, Theme>)[THEME_KEY];
+}
+
 let currentThemeName: string | undefined;
 let currentThemeIsAutomatic = false;
 let themeWatcher: fs.FSWatcher | undefined;

@@ -391,6 +391,14 @@ export interface ToolRenderContext<TState = any, TArgs = any> {
 	toolCallId: string;
 	/** Invalidate just this tool execution component for redraw. */
 	invalidate: () => void;
+	/**
+	 * Ask for a frame without rebuilding this tool execution component. For renderers
+	 * that keep a periodic label alive (a running command's elapsed time): rewriting
+	 * the mounted component in place and requesting a frame costs one label, where
+	 * invalidate() rebuilds and rewraps the whole block. Optional, so callers must
+	 * fall back to invalidate() when it is absent.
+	 */
+	requestRender?: () => void;
 	/** Previously returned component for this render slot, if any. */
 	lastComponent: Component | undefined;
 	/** Shared renderer state for this tool row. Initialized by tool-execution.ts. */
