@@ -1,8 +1,9 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { parse } from "yaml";
 
 /**
@@ -16,9 +17,11 @@ import { parse } from "yaml";
  *
  *   - every matrix row whose floors live in ci.yml must carry exactly floorFor(reading), the
  *     reading being the recorded run's collected/ran counts, not a local run and not a guess;
- *   - the process smoke row must be strictly equal to `scripts/lib/ci-process-smoke.mjs`, the
- *     single source the local mirror `scripts/check-process-smoke.sh` reads (so the mirror cannot
- *     gate at floors CI stopped using);
+ *   - the process smoke row is the row the local mirror `scripts/check-process-smoke.sh` gates at:
+ *     the mirror reads `ci.yml` through `scripts/lib/ci-matrix-row.mjs`, and this file compares what
+ *     that reader hands the shell against a real YAML parse of the same row - so the mirror cannot
+ *     gate at numbers the workflow stopped carrying, and a row that loses a key or a name is a
+ *     refusal (exit 2) rather than a silent default;
  *   - a row whose floors live in another file must be written down as an exception with that
  *     file's real numbers, so "the floors are 90% of the reading" has no silent hole in it;
  *   - every matrix row must appear either in `rows` (with a reading) or in `ungated_rows` (with a
@@ -31,7 +34,15 @@ import { parse } from "yaml";
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const workflowPath = join(repoRoot, ".github", "workflows", "ci.yml");
 const readingsPath = join(repoRoot, "scripts", "ci-floor-readings.json");
-const smokeModulePath = join(repoRoot, "scripts", "lib", "ci-process-smoke.mjs");
+/**
+ * The reader the local mirror uses, and the mirror itself. The reader is the only thing that turns
+ * the workflow row into the four values `scripts/check-process-smoke.sh` gates at, so the pin below
+ * compares a real YAML parse of that row against what this reader hands the shell - and drives the
+ * mirror against planted copies for the refusals.
+ */
+const readerPath = join(repoRoot, "scripts", "lib", "ci-matrix-row.mjs");
+const mirrorPath = join(repoRoot, "scripts", "check-process-smoke.sh");
+const SMOKE_ROW = "coding-agent process smoke";
 const CI_OWNER = ".github/workflows/ci.yml";
 
 type MatrixRow = Record<string, unknown>;
@@ -150,7 +161,7 @@ function floorMismatches(rows: MatrixRow[], reading: Readings): string[] {
 	return out;
 }
 
-/** Every way the process smoke row can disagree with the module both it and the local mirror read. */
+/** Every way the process smoke row can disagree with what the local mirror reads out of it. */
 function smokeMismatches(
 	rows: MatrixRow[],
 	config: { floors: Record<string, number>; tag_skip_ledger: string; tag_skip_entries: { count: number }[] },
@@ -162,12 +173,12 @@ function smokeMismatches(
 	for (const [key, value] of Object.entries(config.floors)) {
 		if (row[key] !== value) {
 			out.push(
-				`ci.yml ${key}=${String(row[key])}, but scripts/lib/ci-process-smoke.mjs exports ${key}=${String(value)}`,
+				`ci.yml ${key}=${String(row[key])}, but the mirror's reader (scripts/lib/ci-matrix-row.mjs) reads ${key}=${String(value)}`,
 			);
 		}
 	}
 	if (row.tag_skip_ledger !== config.tag_skip_ledger) {
-		out.push("the ci.yml tag_skip_ledger string is not the one scripts/lib/ci-process-smoke.mjs exports");
+		out.push("the ci.yml tag_skip_ledger string is not the one the mirror's reader hands the shell");
 	}
 	if (recorded !== undefined) {
 		const declared = config.tag_skip_entries.reduce((sum, entry) => sum + entry.count, 0);
@@ -280,17 +291,77 @@ function exceptionMismatches(reading: Readings): string[] {
 }
 
 /** The module's own values, read through the CLI the shell mirror uses rather than by import. */
-function smokeConfig(): {
+/**
+ * The four values the local mirror gates at, read the way the shell reads them: the reader's
+ * `<key>\t<value>` lines for the process smoke row of `workflow`. A refusal (exit 2) is thrown,
+ * because "the reader could not answer" is not a config this pin may compare against.
+ */
+function smokeConfigFrom(workflow: string): {
 	floors: Record<string, number>;
 	tag_skip_ledger: string;
 	tag_skip_entries: { count: number }[];
 } {
-	const result = spawnSync(process.execPath, [smokeModulePath, "--json"], { encoding: "utf8" });
+	const result = spawnSync(process.execPath, [readerPath, "--row", SMOKE_ROW, "--file", workflow], {
+		encoding: "utf8",
+	});
 	if (result.status !== 0) {
-		throw new Error(`node scripts/lib/ci-process-smoke.mjs --json exited ${result.status}: ${result.stderr}`);
+		throw new Error(`the row reader exited ${result.status} for ${workflow}: ${result.stderr}`);
 	}
-	return JSON.parse(result.stdout) as ReturnType<typeof smokeConfig>;
+	const values = new Map<string, string>();
+	for (const line of result.stdout.split("\n")) {
+		if (line.length === 0) continue;
+		const at = line.indexOf("\t");
+		values.set(line.slice(0, at), line.slice(at + 1));
+	}
+	const numberFor = (key: string): number => {
+		const raw = values.get(key);
+		if (raw === undefined) throw new Error(`the row reader printed no ${key}`);
+		return Number(raw);
+	};
+	const ledger = values.get("tag_skip_ledger") ?? "";
+	const entries = ledger
+		.split(";;")
+		.filter((entry) => entry.length > 0)
+		.map((entry) => {
+			const count = entry.slice(entry.indexOf("=") + 1).split(":")[0];
+			return { count: Number(count) };
+		});
+	return {
+		floors: {
+			min_tests: numberFor("min_tests"),
+			min_ran_tests: numberFor("min_ran_tests"),
+			max_nothing_files: numberFor("max_nothing_files"),
+		},
+		tag_skip_ledger: ledger,
+		tag_skip_entries: entries,
+	};
 }
+
+function smokeConfig(): ReturnType<typeof smokeConfigFrom> {
+	return smokeConfigFrom(workflowPath);
+}
+
+/** A copy of the workflow with one edit, so a refusal can be attributed to that edit. */
+function plantWorkflow(edit: (text: string) => string): string {
+	const planted = join(plantDir, "ci-planted.yml");
+	writeFileSync(planted, edit(readFileSync(workflowPath, "utf8")), "utf8");
+	return planted;
+}
+
+/** The local mirror against a planted workflow: it refuses before any test runs, so no npm needed. */
+function runMirror(workflow: string): { status: number | null; output: string } {
+	// `--report` points the mirror's report path at the scratch directory: a refusal must not create
+	// anything inside the checkout under test.
+	const result = spawnSync("bash", [mirrorPath, "--report", join(plantDir, "planted-report.json")], {
+		encoding: "utf8",
+		cwd: repoRoot,
+		env: { ...process.env, CI_WORKFLOW_FILE: workflow },
+	});
+	return { status: result.status, output: `${result.stdout ?? ""}${result.stderr ?? ""}` };
+}
+
+const plantDir = mkdtempSync(join(tmpdir(), "ci-floor-policy-"));
+afterAll(() => rmSync(plantDir, { recursive: true, force: true }));
 
 const asMutable = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
@@ -352,7 +423,7 @@ describe("the ci.yml floors are derived from the recorded CI reading, not from m
 		expect(undecided, undecided.join("\n")).toEqual([]);
 	});
 
-	it("pins the process smoke row to the module the local mirror also reads, field for field", () => {
+	it("pins the process smoke row to what the local mirror reads out of it, field for field", () => {
 		const config = smokeConfig();
 		const reading = readings();
 		const mismatches = smokeMismatches(
@@ -363,26 +434,35 @@ describe("the ci.yml floors are derived from the recorded CI reading, not from m
 		expect(mismatches, mismatches.join("\n")).toEqual([]);
 	});
 
-	it("agrees with the module through the --shell surface the mirror parses, not just --json", () => {
-		const lines = spawnSync(process.execPath, [smokeModulePath, "--shell"], { encoding: "utf8" });
-		expect(lines.status).toBe(0);
-		const values = new Map(
-			lines.stdout
-				.split("\n")
-				.filter((line) => line.length > 0)
-				.map((line) => {
-					const at = line.indexOf("=");
-					return [line.slice(0, at), line.slice(at + 1)] as const;
-				}),
+	it("refuses a workflow row that lost a floor instead of gating at a default", () => {
+		// The mirror's whole point is that its floors are the workflow's floors. A row that loses one
+		// has to be a refusal (exit 2) before any test runs, not a fallback constant.
+		const planted = plantWorkflow((text) => text.replace("            min_tests: 22\n", ""));
+		const result = runMirror(planted);
+		expect(result.status, result.output).toBe(2);
+		expect(result.output).toContain("has no min_tests");
+	});
+
+	it("refuses a workflow whose row is not there under that name", () => {
+		const planted = plantWorkflow((text) =>
+			text.replace("name: coding-agent process smoke", "name: coding-agent smoke (renamed)"),
 		);
-		const config = smokeConfig();
-		expect(Number(values.get("MIN_TESTS"))).toBe(config.floors.min_tests);
-		expect(Number(values.get("MIN_RAN_TESTS"))).toBe(config.floors.min_ran_tests);
-		expect(Number(values.get("MAX_NOTHING_FILES"))).toBe(config.floors.max_nothing_files);
-		expect(values.get("LEDGER")).toBe(config.tag_skip_ledger);
-		const row = rowNamed(workflowRows(), "coding-agent process smoke");
-		expect(row?.min_tests).toBe(config.floors.min_tests);
-		expect(row?.tag_skip_ledger).toBe(config.tag_skip_ledger);
+		const result = runMirror(planted);
+		expect(result.status, result.output).toBe(2);
+		expect(result.output).toContain("cannot read the");
+	});
+
+	it("refuses a workflow with two rows under that name rather than picking one", () => {
+		const planted = plantWorkflow((text) => {
+			const row = text.slice(text.indexOf("          - name: coding-agent process smoke"));
+			const end = row.indexOf("install_uv: true");
+			return `${text}${row.slice(0, end + "install_uv: true\n".length)}`;
+		});
+		const result = spawnSync(process.execPath, [readerPath, "--row", SMOKE_ROW, "--file", planted], {
+			encoding: "utf8",
+		});
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("want exactly one");
 	});
 
 	it("writes down every row whose floors live in another file, with that file's real numbers", () => {
@@ -444,34 +524,37 @@ describe("the floor pin can go red (planted mutations, same comparison functions
 		expect(floorMismatches(workflowRows(), mutant).join("\n")).toContain("tui: the workflow row has no reading");
 	});
 
-	it("is red when the ci.yml smoke row and the module disagree", () => {
-		const config = smokeConfig();
-		const recorded = readings().rows.find((row) => row.name === "coding-agent process smoke");
-		const mutant = plantedRow(workflowRows(), "coding-agent process smoke", "min_tests", config.floors.min_tests + 1);
-		expect(smokeMismatches(mutant, config, recorded).join("\n")).toContain(
-			"scripts/lib/ci-process-smoke.mjs exports min_tests",
-		);
+	it("refuses a renamed floor key, which is the shape a copy-paste produces", () => {
+		// `min_tests` and `min_ran_tests` differ by one word: renaming one leaves a row that still
+		// looks complete. The reader has to name the missing key rather than gate with three of four.
+		const planted = plantWorkflow((text) => text.replace("min_ran_tests: 11", "min_ran_tests_renamed: 11"));
+		const result = runMirror(planted);
+		expect(result.status, result.output).toBe(2);
+		expect(result.output).toContain("has no min_ran_tests");
 	});
 
-	it("is red when the module's floor moves away from the row", () => {
-		const config = asMutable(smokeConfig());
-		config.floors.min_ran_tests += 1;
-		const recorded = readings().rows.find((row) => row.name === "coding-agent process smoke");
-		expect(smokeMismatches(workflowRows(), config, recorded).join("\n")).toContain("exports min_ran_tests");
+	it("refuses a non-numeric floor before it can compare strings", () => {
+		const planted = plantWorkflow((text) => text.replace("min_tests: 22", "min_tests: twenty-two"));
+		const result = runMirror(planted);
+		expect(result.status, result.output).toBe(2);
+		expect(result.output).toContain("which is not a number");
 	});
 
-	it("is red when the module's declared skips stop accounting for collected-ran", () => {
-		const config = asMutable(smokeConfig());
-		config.tag_skip_entries[0].count += 1;
-		config.tag_skip_ledger = config.tag_skip_ledger.replace(
-			"daemon-supervisor-process.test.ts=8",
-			"daemon-supervisor-process.test.ts=9",
+	it("is red when the workflow's declared skips stop accounting for what the reading collected", () => {
+		// A ledger whose counts no longer fill the gap between collected and ran is the shape that
+		// used to pass: the skip budget was fine, so nobody asked what the twelve skips were.
+		const planted = plantWorkflow((text) =>
+			text.replace("daemon-supervisor-process.test.ts=8", "daemon-supervisor-process.test.ts=9"),
 		);
-		const row = rowNamed(workflowRows(), "coding-agent process smoke");
-		if (row === undefined) throw new Error("no smoke row");
-		row.tag_skip_ledger = config.tag_skip_ledger;
-		const recorded = readings().rows.find((entry) => entry.name === "coding-agent process smoke");
-		expect(smokeMismatches(workflowRows(), config, recorded).join("\n")).toContain("declares 13 skip(s)");
+		const config = smokeConfigFrom(planted);
+		const rows =
+			(
+				parse(readFileSync(planted, "utf8")) as {
+					jobs?: { test?: { strategy?: { matrix?: { include?: MatrixRow[] } } } };
+				}
+			).jobs?.test?.strategy?.matrix?.include ?? [];
+		const recorded = readings().rows.find((row) => row.name === SMOKE_ROW);
+		expect(smokeMismatches(rows, config, recorded).join("\n")).toContain("declares 13 skip(s)");
 	});
 
 	it("is red when an exception's recorded numbers stop matching the owner file", () => {

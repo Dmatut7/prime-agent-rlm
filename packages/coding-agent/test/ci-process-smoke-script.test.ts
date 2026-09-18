@@ -22,13 +22,15 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
  * script (mkdir deleted / mkdir put back inside the loop) and require both to go red: without them,
  * a rewrite that quietly stops exercising this path would still leave a green pin.
  *
- * The stub also proves where the floors come from: a mutated copy of `scripts/lib/ci-process-smoke.mjs`
- * must move the mirror's gate, so the local mirror cannot gate at numbers the module no longer has.
+ * The stub also proves where the floors come from: a mutated copy of `.github/workflows/ci.yml` in
+ * the checkout must move the mirror's gate, so the local mirror reads the workflow CI runs rather
+ * than a copy of its numbers - and a workflow row that lost a floor must be a refusal (exit 2), not
+ * a gate at some other number.
  */
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const scriptPath = join(repoRoot, "scripts", "check-process-smoke.sh");
-const moduleRelative = join("scripts", "lib", "ci-process-smoke.mjs");
+const workflowRelative = join(".github", "workflows", "ci.yml");
 
 type Call = {
 	script: string;
@@ -136,8 +138,9 @@ function runScript(args: string[], overrides: { checkout?: string; script?: stri
 
 /**
  * A throwaway checkout that looks enough like this repository for the mirror: the two test files it
- * insists on, and a real copy of `scripts/` (a copy, not a symlink, so a test can mutate the module
- * the mirror reads without touching the checkout under test).
+ * insists on, a real copy of `scripts/` (a copy, not a symlink, so a test can mutate what the mirror
+ * reads without touching the checkout under test) and a real copy of the workflow whose row carries
+ * the floors (a copy for the same reason).
  */
 function makeCheckout(): string {
 	const root = join(workspace, "checkout");
@@ -146,6 +149,8 @@ function makeCheckout(): string {
 		writeFileSync(join(root, "packages", "coding-agent", "test", name), "", "utf8");
 	}
 	cpSync(join(repoRoot, "scripts"), join(root, "scripts"), { recursive: true });
+	mkdirSync(join(root, ".github", "workflows"), { recursive: true });
+	cpSync(join(repoRoot, ".github", "workflows", "ci.yml"), join(root, workflowRelative));
 	return root;
 }
 
@@ -211,20 +216,26 @@ describe("the local process-smoke mirror creates its report directory before it 
 		expect(existsSync(dirname(nested))).toBe(true);
 	});
 
-	it("gates at the floors the module carries, and follows the module when it changes", () => {
+	it("gates at the floors the workflow carries, and follows the workflow when it changes", () => {
 		const run = runScript([]);
 		expect(run.status, run.output).toBe(0);
 		expect(run.output).toContain("min_tests=22 min_ran_tests=11 max_nothing_files=1");
 
-		// The mirror reads $ROOT/scripts/lib/ci-process-smoke.mjs at run time: raise the floor in
-		// the copy and the same green report (24 collected) must stop passing the gate.
-		const modulePath = join(checkout, moduleRelative);
-		const text = readFileSync(modulePath, "utf8");
+		// The mirror reads $ROOT/.github/workflows/ci.yml at run time: raise the floor in the copy
+		// and the same green report (24 collected) must stop passing the gate.
+		const workflowPath = join(checkout, workflowRelative);
+		const text = readFileSync(workflowPath, "utf8");
 		expect(text).toContain("min_tests: 22");
-		writeFileSync(modulePath, text.replace("min_tests: 22", "min_tests: 999"), "utf8");
+		writeFileSync(workflowPath, text.replace("min_tests: 22", "min_tests: 999"), "utf8");
 		const raised = runScript([]);
 		expect(raised.status, raised.output).not.toBe(0);
 		expect(raised.output).toContain("below the --min-tests floor of 999");
+
+		// A row that lost a floor is a refusal, not a gate at whatever else the row happens to say.
+		writeFileSync(workflowPath, text.replace("            min_tests: 22\n", ""), "utf8");
+		const missing = runScript([]);
+		expect(missing.status, missing.output).toBe(2);
+		expect(missing.output).toContain("has no min_tests");
 	});
 });
 

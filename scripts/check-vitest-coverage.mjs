@@ -34,6 +34,13 @@
  * `scripts/ci-floor-readings.json` (the file that records which run the floors were derived from,
  * and that `packages/coding-agent/test/ci-floor-policy.test.ts` pins `ci.yml` against).
  *
+ * This file is a tool, not a source of floors: it writes nothing, and no gate reads a number out of
+ * it. `ci.yml` is the only carrier of the floors and `scripts/lib/ci-matrix-row.mjs` the reader the
+ * gates use; `scanCiRow` below is the tolerant, advisory reader this tool needs (it must survive a
+ * row name that is not there to say so), while that module is the fail-closed one. The recipe for a
+ * recompute, with the arithmetic and the commands, is in
+ * `docs/fork/evidence/ci-floor-recompute-recipe.md`.
+ *
  * Usage
  * -----
  *   node scripts/check-vitest-coverage.mjs <report.json> [...] \

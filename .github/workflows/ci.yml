@@ -134,8 +134,10 @@ jobs:
         #   gh run view <run id> -R Dmatut7/prime-agent-rlm --log \
         #     | grep -E 'numTotalTests=|tests=[0-9]+ ran='
         #   node scripts/check-vitest-coverage.mjs --recompute-floors <report.json> --row "<row name>"
-        # then paste the reading into scripts/ci-floor-readings.json and the floors it prints here
-        # (for the process smoke row, into scripts/lib/ci-process-smoke.mjs - ci.yml is pinned to it).
+        # then paste the reading into scripts/ci-floor-readings.json and the floors it prints here.
+        # For the process smoke row, "here" is this row: `scripts/check-process-smoke.sh` reads these
+        # four values out of it through scripts/lib/ci-matrix-row.mjs at run time, so this row is the
+        # only carrier of the numbers the local mirror gates at (a row that loses one refuses).
         # The three shard rows move whenever vitest re-shards: between two consecutive green runs
         # shard 2/3 gained 132 collected tests and shard 3/3 lost 118, with the suite total up 26.
         # A shard floor going stale is that churn, not a regression - recompute it.
@@ -221,11 +223,12 @@ jobs:
             package: packages/coding-agent
             command: npm run test:process --
             report: coverage/ci-process-smoke.json
-            # run 35341768020: collected=24 ran=12 files=2 nothing-files=1 -> 22/11. These four
-            # values and the ledger string below have one source: scripts/lib/ci-process-smoke.mjs,
-            # which scripts/check-process-smoke.sh (the local mirror of this job) also reads. The
-            # pin fails when this row and that module disagree, so the local mirror can no longer
-            # gate at floors CI stopped using.
+            # run 35341768020: collected=24 ran=12 files=2 nothing-files=1 -> 22/11. This row is
+            # the only carrier of these four values and of the ledger string below:
+            # scripts/check-process-smoke.sh (the local mirror of this job) reads them out of this
+            # row at run time through scripts/lib/ci-matrix-row.mjs, and refuses when the row or one
+            # of its keys is not there. The pin fails when this row disagrees with the recorded
+            # reading, so the local mirror can no longer gate at floors CI stopped using.
             min_tests: 22
             # This job runs 12 of the 24 tests it collects: the other 12 carry the `process-stress`
             # tag that vitest.config.ts filters out. The floor leaves one test of slack on purpose -
@@ -484,6 +487,24 @@ jobs:
           bash scripts/check-platform-coverage.sh
           bash scripts/check-platform-coverage.sh --self-test
           bash scripts/latest-ci-run.sh --self-test
+
+      # The gates the local ladder leans on, run in the job that installs nothing: every
+      # one of these is plain node, bash or git, and each plants its own red first, so a matcher
+      # that stopped matching cannot pass as green. Two of them are new here:
+      #   - `check-process-smoke.sh` reads the floors out of ci.yml through
+      #     `scripts/lib/ci-matrix-row.mjs`, and that reader is one of the self-tests below;
+      #   - the fork's release ban has no other machine guard at all, so its pre-push hook's planted
+      #     cases (create, update and delete of a `v*` tag, plus the escape hatch) run here.
+      # `check-browser-smoke.mjs --self-test` needs esbuild, so it runs in build-check's
+      # `npm run check` instead of here.
+      - name: Gate self-tests (process smoke, ci.yml matrix reader, version lockstep, installer, release ban)
+        run: |
+          bash scripts/check-process-smoke.sh --self-test
+          node scripts/lib/ci-matrix-row.mjs --self-test
+          node scripts/sync-versions.js --self-test
+          node scripts/sync-versions.js --check
+          node scripts/check-installer.mjs --self-test
+          bash .husky/pre-push --self-test
 
       - name: No new private-member probes in tests
         env:

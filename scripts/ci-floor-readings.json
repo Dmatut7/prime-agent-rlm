@@ -1,5 +1,5 @@
 {
- "why": "The floors in .github/workflows/ci.yml are a policy: `a floor is 90% of what the job really produces in CI`. A policy with no reading behind it drifts - the floors sat at 64%-87% of the real numbers, so the sentence and the matrix disagreed in the direction that hides a lost face. This file is the reading the floors are derived from. packages/coding-agent/test/ci-floor-policy.test.ts recomputes ceil(floor_ratio * collected/ran) from it and fails when ci.yml (or scripts/lib/ci-process-smoke.mjs) disagrees, so the numbers cannot drift away from the sentence again, and when a row whose floors live in another file stops being recorded in `exceptions` with that file's real numbers.",
+ "why": "The floors in .github/workflows/ci.yml are a policy: `a floor is 90% of what the job really produces in CI`. A policy with no reading behind it drifts - the floors sat at 64%-87% of the real numbers, so the sentence and the matrix disagreed in the direction that hides a lost face. This file is the reading the floors are derived from. packages/coding-agent/test/ci-floor-policy.test.ts recomputes ceil(floor_ratio * collected/ran) from it and fails when ci.yml disagrees (the process smoke row is compared against what the local mirror's reader, scripts/lib/ci-matrix-row.mjs, hands the shell), so the numbers cannot drift away from the sentence again, and when a row whose floors live in another file stops being recorded in `exceptions` with that file's real numbers.",
  "floor_ratio": 0.9,
  "rounding": "ceil - a floor is never below the policy share, and ceil(0.9*6)=6 is why the machine-wide row has no slack",
  "source": {
@@ -107,7 +107,7 @@
    "files": 2,
    "nothing_files": 1,
    "max_nothing_budget": 1,
-   "floors_owner": "scripts/lib/ci-process-smoke.mjs (mirrored into .github/workflows/ci.yml)",
+   "floors_owner": ".github/workflows/ci.yml (read at run time by scripts/check-process-smoke.sh through scripts/lib/ci-matrix-row.mjs)",
    "note": "The 12 skips are declared one by one in PROCESS_SMOKE_TAG_SKIP_LEDGER and counted by scripts/check-tag-skip-ledger.sh."
   },
   {
@@ -252,7 +252,7 @@
   "1. pick a green run: gh run list -R Dmatut7/prime-agent-rlm --branch merge/repl-kernel --limit 5 --json databaseId,headSha,conclusion",
   "2. read it: gh run view <run id> -R Dmatut7/prime-agent-rlm --log | grep -E 'numTotalTests=|tests=[0-9]+ ran='",
   "3. per job, print the floors the policy asks for: node scripts/check-vitest-coverage.mjs --recompute-floors <report.json> --row \"<matrix row name>\"",
-  "4. paste the reading into `rows`, the floors into ci.yml (or scripts/lib/ci-process-smoke.mjs for the process smoke row), and update `source`",
+  "4. paste the reading into `rows`, the floors into the matching ci.yml matrix row (the process smoke row included: ci.yml is the only carrier, and scripts/check-process-smoke.sh reads it at run time), and update `source`",
   "5. npx vitest --run packages/coding-agent/test/ci-floor-policy.test.ts must be green"
  ]
 }

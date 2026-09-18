@@ -16,24 +16,22 @@
 #   1. `npm run test:process -- --reporter=default --reporter=json --outputFile.json=...`
 #      exactly as `.github/workflows/ci.yml` runs it, and fails on a non-zero exit.
 #   2. Prints the per-file collected/ran/passed/failed/skipped ledger from that report.
-#   3. The CI coverage gate at the CI floors (min_tests / min_ran_tests / max_nothing_files,
-#      read from `scripts/lib/ci-process-smoke.mjs` - the single source `.github/workflows/ci.yml`
-#      is pinned to; `crash-handlers-process` is the one file allowed to run nothing, because all
-#      four of its tests carry the `process-stress` tag).
-#   4. The CI tag-skip ledger, from the same module: every `process-stress` skip this job does not
-#      run, declared per file with a count and a reason.
+#   3. The CI coverage gate at the CI floors (min_tests / min_ran_tests / max_nothing_files) exactly
+#      as `.github/workflows/ci.yml`'s row for this job carries them - read out of that row at run
+#      time by `scripts/lib/ci-matrix-row.mjs`; `crash-handlers-process` is the one file allowed to
+#      run nothing, because all four of its tests carry the `process-stress` tag.
+#   4. The CI tag-skip ledger, out of the same row: 8 skips in
+#      daemon-supervisor-process.test.ts + 4 in daemon-supervisor-crash-handlers-process.test.ts.
 #      The judgement is the tag, not the environment: `vitest.config.ts` sets
-#      `tagsFilter: ["!process-stress", "!kernel-heavy"]` unconditionally, so those
+#      `tagsFilter: ["!process-stress", "!kernel-heavy"]` unconditionally, so those twelve
 #      tests are skipped on every platform and under every env; the nightly
 #      `nightly-process-stress.yml` is where they do run.
 #
 # Usage
 # -----
-#   bash scripts/check-process-smoke.sh                 # the CI face (green at the pinned reading:
-#                                                       # collected 24 | ran 12 | skipped 12, per
-#                                                       # scripts/ci-floor-readings.json)
+#   bash scripts/check-process-smoke.sh                 # the CI face (green = collected 24 | ran 12 | skipped 12)
 #   bash scripts/check-process-smoke.sh --with-stress   # + the nightly face (`test:process-stress`)
-#   bash scripts/check-process-smoke.sh --self-test     # prove all three instruments can still go red
+#   bash scripts/check-process-smoke.sh --self-test     # prove both instruments can still go red
 #   bash scripts/check-process-smoke.sh --report /tmp/p.json   # keep the report elsewhere
 #
 # Repository root is resolved from this script's own location, so the file works both from a
@@ -92,40 +90,61 @@ REPORT="${REPORT_OVERRIDE:-$PKG/coverage/ci-process-smoke.json}"
 # its own ran every step against a path nobody had created.
 [ "$SELF_TEST" = "1" ] || mkdir -p "$(dirname "$REPORT")"
 
-# The floors and the declared skips come from scripts/lib/ci-process-smoke.mjs - the single source
-# that `.github/workflows/ci.yml`'s matrix row "coding-agent process smoke" is pinned to by
-# packages/coding-agent/test/ci-floor-policy.test.ts. They used to be hand-copied into this file,
-# and the only thing holding the two copies together was a sentence in a doc telling the next
-# editor to change both. No fallback here on purpose: a missing or unreadable module aborts the
-# gate instead of letting it run at some invented default.
-CONFIG_MODULE="$ROOT/scripts/lib/ci-process-smoke.mjs"
-[ -f "$CONFIG_MODULE" ] || {
-	echo "check-process-smoke: missing $CONFIG_MODULE (the floors and the tag-skip ledger live there)" >&2
+# The floors and the declared skips are read out of `.github/workflows/ci.yml` itself - the matrix
+# row CI runs is the source, not a copy of it. They used to be hand-copied into this file, then
+# moved into a module (`scripts/lib/ci-process-smoke.mjs`) whose values a test kept equal to the
+# workflow: two carriers of one number, held together by a third file. The workflow is now the only
+# carrier and `scripts/lib/ci-matrix-row.mjs` the only reader the gate uses, so "the floor CI runs"
+# and "the floor this mirror gates at" are the same bytes by construction.
+#
+# No fallback on purpose: a workflow that cannot be read, a row that is not there under that name,
+# two rows with that name, or a row missing one of the four values all abort (exit 2) instead of
+# letting the mirror gate at some invented default.
+ROW_NAME="coding-agent process smoke"
+CI_WORKFLOW="${CI_WORKFLOW_FILE:-$ROOT/.github/workflows/ci.yml}"
+[ -f "$CI_WORKFLOW" ] || {
+	echo "check-process-smoke: no $CI_WORKFLOW to read the floors out of" >&2
 	exit 2
 }
-SMOKE_CONFIG="$(node "$CONFIG_MODULE" --shell)" || {
-	echo "check-process-smoke: cannot read $CONFIG_MODULE (node exit $?)" >&2
+SMOKE_CONFIG="$(node "$ROOT/scripts/lib/ci-matrix-row.mjs" --row "$ROW_NAME" --file "$CI_WORKFLOW")" || {
+	echo "check-process-smoke: cannot read the \"$ROW_NAME\" row from $CI_WORKFLOW (node exit $?)" >&2
 	exit 2
 }
 MIN_TESTS=""; MIN_RAN_TESTS=""; MAX_NOTHING_FILES=""; LEDGER=""
-while IFS= read -r config_line; do
-	[ -n "$config_line" ] || continue
-	# Split on the first `=` only: the ledger value is `path=count:reason;;path=count:reason`.
-	case "${config_line%%=*}" in
-		MIN_TESTS) MIN_TESTS="${config_line#*=}" ;;
-		MIN_RAN_TESTS) MIN_RAN_TESTS="${config_line#*=}" ;;
-		MAX_NOTHING_FILES) MAX_NOTHING_FILES="${config_line#*=}" ;;
-		LEDGER) LEDGER="${config_line#*=}" ;;
-		*) echo "check-process-smoke: $CONFIG_MODULE printed an unknown key ${config_line%%=*}" >&2; exit 2 ;;
+while IFS=$'\t' read -r config_key config_value; do
+	[ -n "$config_key" ] || continue
+	# The reader prints one `<key>\t<value>` line, values verbatim: the ledger is
+	# `path=count:reason;;path=count:reason` and must not be split on anything but the tab.
+	case "$config_key" in
+		min_tests) MIN_TESTS="$config_value" ;;
+		min_ran_tests) MIN_RAN_TESTS="$config_value" ;;
+		max_nothing_files) MAX_NOTHING_FILES="$config_value" ;;
+		tag_skip_ledger) LEDGER="$config_value" ;;
+		# Other scalars in the row (`package`, `command`, `report`, `install_uv`) are not this
+		# gate's business; a *missing* one of the four below is, and is caught next.
+		*) ;;
 	esac
 done <<< "$SMOKE_CONFIG"
-for config_key in MIN_TESTS MIN_RAN_TESTS MAX_NOTHING_FILES LEDGER; do
-	[ -n "${!config_key}" ] || {
-		echo "check-process-smoke: $CONFIG_MODULE returned no $config_key" >&2
+# Explicit labels rather than ${var,,}: /bin/bash on macOS is 3.2, and this file has to run there.
+require_row_value() {
+	[ -n "$2" ] || {
+		echo "check-process-smoke: the $ROW_NAME row in $CI_WORKFLOW has no $1; refusing to gate without it" >&2
 		exit 2
 	}
-done
-echo "floors from ${CONFIG_MODULE#"$ROOT"/}: min_tests=$MIN_TESTS min_ran_tests=$MIN_RAN_TESTS max_nothing_files=$MAX_NOTHING_FILES"
+}
+require_row_number() {
+	case "$2" in
+		''|*[!0-9]*) echo "check-process-smoke: $1 came out of $CI_WORKFLOW as \"$2\", which is not a number" >&2; exit 2 ;;
+	esac
+}
+require_row_value min_tests "$MIN_TESTS"
+require_row_value min_ran_tests "$MIN_RAN_TESTS"
+require_row_value max_nothing_files "$MAX_NOTHING_FILES"
+require_row_value tag_skip_ledger "$LEDGER"
+require_row_number min_tests "$MIN_TESTS"
+require_row_number min_ran_tests "$MIN_RAN_TESTS"
+require_row_number max_nothing_files "$MAX_NOTHING_FILES"
+echo "floors from ${CI_WORKFLOW#"$ROOT"/} ($ROW_NAME): min_tests=$MIN_TESTS min_ran_tests=$MIN_RAN_TESTS max_nothing_files=$MAX_NOTHING_FILES"
 
 FAILED_STEP=""
 step() { printf '\n== %s ==\n' "$1"; }
@@ -139,12 +158,15 @@ if [ "$SELF_TEST" = "1" ]; then
 	# The floors and the ledger this gate runs at are read from a module, so the module's own
 	# shape is an instrument too: a `;;` inside a reason, or a shell surface missing a key, would
 	# otherwise show up as a silently mis-parsed gate.
-	node "$CONFIG_MODULE" --self-test || rc=1
+	# The floors this file gates against are read out of ci.yml at run time, so the reader itself
+	# has to be able to go red: it plants a missing row, two rows with one name, a row whose keys
+	# are all block values and a changed value, and requires the right answer for each.
+	node "$ROOT/scripts/lib/ci-matrix-row.mjs" --self-test || rc=1
 	if [ "$rc" != "0" ]; then
 		echo "check-process-smoke: self-test RED (an instrument can no longer detect its drift)" >&2
 		exit 1
 	fi
-	echo "check-process-smoke: self-test GREEN (coverage gate, tag-skip ledger and the floor module all plant their own red)"
+	echo "check-process-smoke: self-test GREEN (coverage gate, tag-skip ledger and the ci.yml matrix reader each plant their own red)"
 	exit 0
 fi
 
@@ -201,7 +223,7 @@ else
 	fail "coverage gate skipped: no report"
 fi
 
-step "4/4 CI tag-skip ledger (every declared skip counted and named)"
+step "4/4 CI tag-skip ledger (12 declared skips, 8 + 4, counted and named)"
 if [ -f "$REPORT" ]; then
 	bash "$ROOT/scripts/check-tag-skip-ledger.sh" "$REPORT" --ledger "$LEDGER"
 	rc=$?
@@ -211,7 +233,7 @@ else
 fi
 
 if [ "$WITH_STRESS" = "1" ]; then
-	step "5/5 nightly face: npm run test:process-stress (the tag-filtered tests)"
+	step "5/5 nightly face: npm run test:process-stress (the 12 tag-filtered tests)"
 	( cd "$PKG" && npm run test:process-stress ) > "$REPORT.stress.log" 2>&1
 	rc=$?
 	grep -E "Test Files|Tests  " "$REPORT.stress.log" | tail -3
