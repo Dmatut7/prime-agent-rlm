@@ -1603,6 +1603,12 @@ export type DaemonOutbound =
 	| CompactAssistantDelta;
 
 export const DAEMON_OUTBOUND_COMPATIBILITY = {
+	// Registry of record, not a gate: no production code reads this map. The command path's
+	// DAEMON_COMMAND_COMPATIBILITY is read in daemon-client.ts (:416), daemon-routed-client.ts
+	// (:159), daemon-supervisor.ts (:2746) and daemon-mode.ts (:4061); the outbound gate is
+	// written by hand at each emitter instead, so adding a row here buys no machine effect.
+	// Current readers: test/daemon-protocol.test.ts (import at :17, assertions at :543, :740,
+	// :769, :894) and the fork docs. Wire a read site before relying on a row.
 	response: LEGACY_DAEMON_COMMAND,
 	session_list_progress: LEGACY_DAEMON_COMMAND,
 	session_list_item: LEGACY_DAEMON_COMMAND,
