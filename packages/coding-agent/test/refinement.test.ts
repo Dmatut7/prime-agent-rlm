@@ -29,6 +29,7 @@ import {
 	HARNESS_CONCURRENT_WRITE_ERROR,
 	type HarnessEntry,
 	type HarnessState,
+	harnessDigestFingerprint,
 	harnessQueryTermIdf,
 	harnessQueryTerms,
 	inferRefinementResultScope,
@@ -1839,5 +1840,70 @@ describe("harness digest relevance ranking (#2241 phase 2 / upstream #2392 IDF /
 		["𠀀𠀁𠀂", ["𠀀𠀁", "𠀁𠀂"]],
 	])("tokenizes %j into %j", (query, expected) => {
 		expect(harnessQueryTerms(query)).toEqual(expected);
+	});
+});
+
+describe("harnessDigestFingerprint (#2400)", () => {
+	const FLAGS = {
+		includeIpythonExamples: true,
+		includeShellExamples: true,
+		includeRefineExamples: true,
+	};
+
+	function fpState(entries: HarnessEntry[]): HarnessState {
+		const state = loadHarnessState(join(makeTempDir(), "harness"), "global");
+		for (const entry of entries) {
+			// Clone: the assertions below mutate the stored entry, and a shared
+			// reference would leak that mutation into every later re-render.
+			state.entries.memory[entry.id] = structuredClone(entry);
+		}
+		return state;
+	}
+
+	function fpEntry(id: string, title: string, content: string, updatedAt: string): HarnessEntry {
+		return {
+			id,
+			kind: "memory",
+			title,
+			content,
+			path: "general",
+			scope: "global",
+			reference: {},
+			arguments: {},
+			metadata: {},
+			source: "test",
+			created_at: updatedAt,
+			updated_at: updatedAt,
+			version: 1,
+		};
+	}
+
+	it("is stable across entry order and invisible bookkeeping, and moves on rendered fields", () => {
+		const a = fpEntry("a", "Alpha", "Alpha content.", "2026-08-01T00:00:00.000Z");
+		const b = fpEntry("b", "Beta", "Beta content.", "2026-08-02T00:00:00.000Z");
+		const forward = harnessDigestFingerprint(fpState([a, b]), FLAGS);
+		// Insertion order is normalized away.
+		expect(harnessDigestFingerprint(fpState([b, a]), FLAGS)).toBe(forward);
+		// metadata/source/created_at/updated_at never render, so they never move it.
+		const bookkeeping = fpState([a, b]);
+		bookkeeping.entries.memory.a.metadata = { note: "invisible" };
+		bookkeeping.entries.memory.a.source = "elsewhere";
+		bookkeeping.entries.memory.a.updated_at = "2026-09-01T00:00:00.000Z";
+		expect(harnessDigestFingerprint(bookkeeping, FLAGS)).toBe(forward);
+		// Rendered fields move it: content, title, and version all print.
+		const moved = fpState([a, b]);
+		moved.entries.memory.a.content = "Alpha content, revised.";
+		expect(harnessDigestFingerprint(moved, FLAGS)).not.toBe(forward);
+		const retitled = fpState([a, b]);
+		retitled.entries.memory.a.title = "Alpha II";
+		expect(harnessDigestFingerprint(retitled, FLAGS)).not.toBe(forward);
+		const bumped = fpState([a, b]);
+		bumped.entries.memory.a.version = 2;
+		expect(harnessDigestFingerprint(bumped, FLAGS)).not.toBe(forward);
+		// Render flags are part of the material.
+		expect(harnessDigestFingerprint(fpState([a, b]), { ...FLAGS, includeRefineExamples: false })).not.toBe(forward);
+		// The shell flag is normalized out while IPython examples take precedence:
+		// the formatter never reads it then, so the digest cannot change either.
+		expect(harnessDigestFingerprint(fpState([a, b]), { ...FLAGS, includeShellExamples: false })).toBe(forward);
 	});
 });
