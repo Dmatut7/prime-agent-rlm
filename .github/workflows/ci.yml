@@ -110,26 +110,55 @@ jobs:
         # reported 458 passed | 722 skipped with 19 files running nothing, and shard 3 collected
         # test/repl-kernel-execute.test.ts as `6 skipped` although no job ever ran it.
         #
-        # min_tests / min_ran_tests are floors at 90% of what the job produces in CI, so ordinary
-        # test churn passes and a collapse (a suite that stops collecting, a job that collects but
-        # never runs) does not. max_nothing_files is how many files are allowed to run nothing in
-        # this job's environment; every non-zero value is a deliberate skip with a reason, and one
-        # more skipping file fails the job and names the file.
+        # min_tests / min_ran_tests are floors, and the policy behind them is one sentence: a floor
+        # is ceil(0.9 * what the job really produced) in the CI run recorded in
+        # scripts/ci-floor-readings.json - run 35341768020, whose head sha (8ed6d73bc) is the commit
+        # these floors were set on, so the reading and the tree being gated are the same tree. 90%
+        # gives ordinary test churn room and makes a collapse (a suite that stops collecting, a job
+        # that collects but never runs) red. Each row carries its own reading next to its floor.
+        #
+        # This sentence used to claim 90% while the numbers below it were 64%-87% of the real
+        # readings (ai ran-floor 412 against 643 tests actually run, shard 2/3 2118 against 3107),
+        # which is drift in the direction that hides a lost face. It cannot drift back:
+        # packages/coding-agent/test/ci-floor-policy.test.ts recomputes ceil(0.9 * reading) from
+        # that file and fails when a row disagrees, when a row has no recorded reading, or when the
+        # recorded run's sha does not exist in this repository.
+        #
+        # max_nothing_files is how many files are allowed to run nothing in this job's environment;
+        # every non-zero value is a deliberate skip with a reason, and one more skipping file fails
+        # the job and names the file.
+        #
+        # Re-deriving a floor after test churn is mechanical, not a judgement call:
+        #   gh run list -R Dmatut7/prime-agent-rlm --branch merge/repl-kernel --limit 5 \
+        #     --json databaseId,headSha,conclusion
+        #   gh run view <run id> -R Dmatut7/prime-agent-rlm --log \
+        #     | grep -E 'numTotalTests=|tests=[0-9]+ ran='
+        #   node scripts/check-vitest-coverage.mjs --recompute-floors <report.json> --row "<row name>"
+        # then paste the reading into scripts/ci-floor-readings.json and the floors it prints here
+        # (for the process smoke row, into scripts/lib/ci-process-smoke.mjs - ci.yml is pinned to it).
+        # The three shard rows move whenever vitest re-shards: between two consecutive green runs
+        # shard 2/3 gained 132 collected tests and shard 3/3 lost 118, with the suite total up 26.
+        # A shard floor going stale is that churn, not a regression - recompute it.
         include:
           - name: agent-core
             package: packages/agent
             command: npm test --
             report: coverage/ci-agent-core.json
-            min_tests: 79
-            min_ran_tests: 79
+            # run 35341768020: collected=108 ran=108 files=9 nothing-files=0 -> ceil(0.9*x) = 98/98.
+            min_tests: 98
+            min_ran_tests: 98
             max_nothing_files: 0
             install_uv: false
           - name: ai
             package: packages/ai
             command: npm test --
             report: coverage/ci-ai.json
-            min_tests: 1062
-            min_ran_tests: 412
+            # run 35341768020: collected=1365 ran=643 files=112 nothing-files=19 -> 1229/579. The
+            # ran floor was 412, i.e. 64% of what the job runs: 167 tests (a third of this job's
+            # running face) could have stopped running and the gate would still have said green.
+            # The gap between collected and ran is the 19 nothing-files below, not hidden skips.
+            min_tests: 1229
+            min_ran_tests: 579
             # 19 files are the live-provider suites, which need credentials this job has none of.
             max_nothing_files: 19
             install_uv: false
@@ -144,17 +173,20 @@ jobs:
             command: node --test --import tsx --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination=coverage/ci-tui.xml test/*.test.ts
             report: ""
             node_test_report: coverage/ci-tui.xml
-            # 831 tests / 831 ran / 0 all-skipped suites on a full local run; floors at 90%.
-            min_tests: 748
-            min_ran_tests: 748
+            # run 35341768020: tests=863 ran=863 suites=134 nothing-suites=0 -> 777/777. The
+            # floors here are derived from the CI reading, not from a local run: this row used to
+            # quote "831 tests on a full local run", a number no gate reads and no runner produces.
+            min_tests: 777
+            min_ran_tests: 777
             max_nothing_suites: 0
             install_uv: false
           - name: coding-agent 1/3
             package: packages/coding-agent
             command: npm run test:ci -- --shard=1/3
             report: coverage/ci-shard-1.json
-            min_tests: 1924
-            min_ran_tests: 1902
+            # run 35341768020: collected=2720 ran=2695 files=240 nothing-files=3 -> 2448/2426.
+            min_tests: 2448
+            min_ran_tests: 2426
             # compaction-extensions, rpc (both opt-in), bash-close-hang-windows (win32-only).
             max_nothing_files: 3
             install_uv: true
@@ -162,8 +194,11 @@ jobs:
             package: packages/coding-agent
             command: npm run test:ci -- --shard=2/3
             report: coverage/ci-shard-2.json
-            min_tests: 2130
-            min_ran_tests: 2118
+            # run 35341768020: collected=3117 ran=3107 files=240 nothing-files=1 -> 2806/2797.
+            # This row's budget says six kernel-heavy files but the run produced one nothing-file;
+            # the budget is left as authored and the gap is recorded in scripts/ci-floor-readings.json.
+            min_tests: 2806
+            min_ran_tests: 2797
             # Six `kernel-heavy` files (tag-filtered here, run by the kernel job).
             max_nothing_files: 6
             install_uv: true
@@ -171,8 +206,11 @@ jobs:
             package: packages/coding-agent
             command: npm run test:ci -- --shard=3/3
             report: coverage/ci-shard-3.json
-            min_tests: 1534
-            min_ran_tests: 1493
+            # run 35341768020: collected=2058 ran=2022 files=239 nothing-files=5 -> 1853/1820.
+            # The previous green run collected 2176 here, so this row is the one most exposed to
+            # re-sharding; 205 collected tests of slack absorb one more move of that size.
+            min_tests: 1853
+            min_ran_tests: 1820
             # Six `kernel-heavy` files (run by the kernel job) and agent-session-tree-navigation
             # (describe.skipIf(!API_KEY)). test/repl-kernel-execute.test.ts was the eighth until its
             # interpreter resolution was fixed; it runs here now, so this budget is what catches it
@@ -183,10 +221,15 @@ jobs:
             package: packages/coding-agent
             command: npm run test:process --
             report: coverage/ci-process-smoke.json
-            min_tests: 20
-            # This job runs 11 of the 23 tests it collects: the other 12 carry the `process-stress`
-            # tag that vitest.config.ts filters out, and the floor used to be 9, so two of them
-            # could disappear unnoticed. The ledger step below pins the twelve exactly.
+            # run 35341768020: collected=24 ran=12 files=2 nothing-files=1 -> 22/11. These four
+            # values and the ledger string below have one source: scripts/lib/ci-process-smoke.mjs,
+            # which scripts/check-process-smoke.sh (the local mirror of this job) also reads. The
+            # pin fails when this row and that module disagree, so the local mirror can no longer
+            # gate at floors CI stopped using.
+            min_tests: 22
+            # This job runs 12 of the 24 tests it collects: the other 12 carry the `process-stress`
+            # tag that vitest.config.ts filters out. The floor leaves one test of slack on purpose -
+            # the ledger step below pins the twelve exactly and names any skip that moves.
             min_ran_tests: 11
             # The process-stress tests in these two files are the nightly job's face, not this one's.
             max_nothing_files: 1
@@ -207,15 +250,22 @@ jobs:
             package: packages/coding-agent
             command: npm run test:machine-wide --
             report: coverage/ci-machine-wide.json
-            min_tests: 5
-            min_ran_tests: 5
+            # run 35341768020: collected=6 ran=6 files=1 nothing-files=0 -> 6/6. ceil(0.9*6) is 6,
+            # so this row has zero slack: it is one file with six tests that drive the machine-wide
+            # discovery commands, and losing any of them must be loud rather than absorbed.
+            min_tests: 6
+            min_ran_tests: 6
             max_nothing_files: 0
             install_uv: true
           - name: coding-agent kernel
             package: packages/coding-agent
             command: npm run test:kernel:ci
-            # `test:kernel:ci` writes the report and runs the same gate itself (--min-tests 30,
-            # --min-ran-tests 29, --max-nothing-files 0), so this row is not gated twice.
+            # `test:kernel:ci` writes the report and runs the same gate itself, so this row is not
+            # gated twice and carries no floors here - they live in that script, in
+            # packages/coding-agent/package.json. Its reading is recorded in
+            # scripts/ci-floor-readings.json (row "coding-agent kernel") like every other row's and
+            # the same 90% policy applies to it, but the numbers are deliberately not repeated in
+            # this comment: a copy no gate compares is a copy that rots.
             report: ""
             install_uv: true
             seed_kernel_python: true
