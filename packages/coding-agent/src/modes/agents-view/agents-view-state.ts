@@ -167,7 +167,16 @@ function canonicalSessionPath(path: string): string {
 	let canonical: string;
 	try {
 		canonical = resolve(realpathSync(path));
-	} catch {
+	} catch (error) {
+		// A path that is not there cannot be resolved, so canonicalizePath() would
+		// only repeat the same failing syscall and pay a second thrown-error stack
+		// capture for the same answer. This is the hot case for a roster listing
+		// sessions whose files are gone: a failure is deliberately not memoized (the
+		// file may appear later), so every pass used to pay both syscalls per row.
+		const code = (error as NodeJS.ErrnoException | undefined)?.code;
+		if (code === "ENOENT" || code === "ENOTDIR") {
+			return resolve(path);
+		}
 		return resolve(canonicalizePath(path));
 	}
 	if (canonicalPathCache.size >= CANONICAL_PATH_CACHE_LIMIT) canonicalPathCache.clear();

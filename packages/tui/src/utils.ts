@@ -44,6 +44,20 @@ const rgiEmojiRegex = /^\p{RGI_Emoji}$/v;
 // than entry count: strings here range from single graphemes to whole
 // unwrapped lines, and an entry cap cannot keep long lines from inflating it.
 const WIDTH_CACHE_MAX_CHARS = 4_000_000;
+
+/**
+ * Length cap on truncateToWidth's "does it already fit?" early-out.
+ *
+ * Rendered lines are wrapped, so the ones that reach truncateToWidth are a few
+ * hundred characters at most (measured max over a 1MB transcript with 50 tool
+ * outputs expanded: 135). A caller that hands over a multi-megabyte single line
+ * - an 8MB paste rendered as one row, a minified blob - cannot fit any terminal
+ * width anyway, and measuring it first would put a megabyte-scale key into the
+ * width cache and evict the whole cache to make room. Above this cap the
+ * function goes straight to the general path, which is where such input was
+ * already handled.
+ */
+const FIT_CHECK_MAX_CHARS = 4_096;
 const widthCache = new Map<string, number>();
 let widthCacheChars = 0;
 
@@ -1171,6 +1185,21 @@ export function truncateToWidth(
 	let exhaustedInput = false;
 	const hasAnsi = text.includes("\x1b");
 	const hasTabs = text.includes("\t");
+
+	if ((hasAnsi || hasTabs) && text.length <= FIT_CHECK_MAX_CHARS) {
+		// The general path below walks the text as per-character units so it can
+		// stop at a grapheme-cluster boundary, which costs an object per character.
+		// Almost every caller passes a line that was already wrapped to this width,
+		// and for those the walk provably ends with `!overflowed && exhaustedInput`
+		// and returns `text` untouched (visibleSoFar then equals visibleWidth(text),
+		// tabs included). Measuring once and returning early is the same answer
+		// without building the units, and it is what a styled panel line pays per
+		// line otherwise.
+		const textWidth = visibleWidth(text);
+		if (textWidth <= maxWidth) {
+			return pad ? text + " ".repeat(Math.max(0, maxWidth - textWidth)) : text;
+		}
+	}
 
 	if (!hasAnsi && !hasTabs) {
 		for (const { segment } of segmenter.segment(text)) {

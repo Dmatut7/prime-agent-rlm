@@ -63,6 +63,23 @@ class TreeList implements Component {
 	private visibleChildrenMap: Map<string | null, string[]> = new Map();
 	private lastSelectedId: string | null = null;
 	private foldedNodes: Set<string> = new Set();
+	/**
+	 * entry id -> flat node. `flatNodes` is built once in the constructor and never
+	 * reassigned, so this index is built once too: applyFilter() used to rebuild the
+	 * same map twice per keystroke (findNearestVisibleIndex and
+	 * recalculateVisualStructure), which is O(nodes) allocation per key on top of the
+	 * filtering itself.
+	 */
+	private readonly entryById: Map<string, FlatNode>;
+	/**
+	 * Searchable text per node, and its lowercase form, memoized on node identity.
+	 * Both are derived from immutable entry data plus `node.label`, so the only
+	 * invalidation is a label edit (see updateNodeLabel). Without the memo every
+	 * printable key re-derives and re-lowercases the text of every node in the
+	 * session: the filter loop is O(nodes x transcript text) per keystroke.
+	 */
+	private readonly searchTextCache = new WeakMap<AgentConnectionSessionTreeNode, string>();
+	private readonly searchTextLowerCache = new WeakMap<AgentConnectionSessionTreeNode, string>();
 
 	public onSelect?: (entryId: string) => void;
 	public onCancel?: () => void;
@@ -80,6 +97,7 @@ class TreeList implements Component {
 		this.filterMode = initialFilterMode ?? "default";
 		this.multipleRoots = tree.length > 1;
 		this.flatNodes = this.flattenTree(tree);
+		this.entryById = new Map(this.flatNodes.map((flatNode) => [flatNode.node.entry.id, flatNode]));
 		this.buildActivePath();
 		this.applyFilter();
 
@@ -96,11 +114,8 @@ class TreeList implements Component {
 	private findNearestVisibleIndex(entryId: string | null): number {
 		if (this.filteredNodes.length === 0) return 0;
 
-		// Build a map for parent lookup
-		const entryMap = new Map<string, FlatNode>();
-		for (const flatNode of this.flatNodes) {
-			entryMap.set(flatNode.node.entry.id, flatNode);
-		}
+		// Parent lookup uses the constructor-built index (same contents, built once).
+		const entryMap = this.entryById;
 
 		// Build a map of visible entry IDs to their indices in filteredNodes
 		const visibleIdToIndex = new Map<string, number>(this.filteredNodes.map((node, i) => [node.node.entry.id, i]));
@@ -337,7 +352,7 @@ class TreeList implements Component {
 
 			// Apply search filter
 			if (searchTokens.length > 0) {
-				const nodeText = this.getSearchableText(flatNode.node).toLowerCase();
+				const nodeText = this.getSearchableTextLower(flatNode.node);
 				return searchTokens.every((token) => nodeText.includes(token));
 			}
 
@@ -384,11 +399,8 @@ class TreeList implements Component {
 
 		const visibleIds = new Set(this.filteredNodes.map((n) => n.node.entry.id));
 
-		// Build entry map for efficient parent lookup (using full tree)
-		const entryMap = new Map<string, FlatNode>();
-		for (const flatNode of this.flatNodes) {
-			entryMap.set(flatNode.node.entry.id, flatNode);
-		}
+		// Efficient parent lookup (using full tree): the constructor-built index.
+		const entryMap = this.entryById;
 
 		// Find nearest visible ancestor for a node
 		const findVisibleAncestor = (nodeId: string): string | null => {
@@ -506,6 +518,23 @@ class TreeList implements Component {
 
 	/** Get searchable text content from a node */
 	private getSearchableText(node: AgentConnectionSessionTreeNode): string {
+		const cached = this.searchTextCache.get(node);
+		if (cached !== undefined) return cached;
+		const text = this.buildSearchableText(node);
+		this.searchTextCache.set(node, text);
+		return text;
+	}
+
+	/** Lowercase form the search filter matches on; memoized next to the raw text. */
+	private getSearchableTextLower(node: AgentConnectionSessionTreeNode): string {
+		const cached = this.searchTextLowerCache.get(node);
+		if (cached !== undefined) return cached;
+		const lower = this.getSearchableText(node).toLowerCase();
+		this.searchTextLowerCache.set(node, lower);
+		return lower;
+	}
+
+	private buildSearchableText(node: AgentConnectionSessionTreeNode): string {
 		const entry = node.entry;
 		const parts: string[] = [];
 
@@ -586,6 +615,9 @@ class TreeList implements Component {
 		for (const flatNode of this.flatNodes) {
 			if (flatNode.node.entry.id === entryId) {
 				flatNode.node.label = label;
+				// The label is part of the searchable text: drop both memos for this node.
+				this.searchTextCache.delete(flatNode.node);
+				this.searchTextLowerCache.delete(flatNode.node);
 				flatNode.node.labelTimestamp = label ? (labelTimestamp ?? new Date().toISOString()) : undefined;
 				break;
 			}
