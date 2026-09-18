@@ -24,7 +24,7 @@
  *
  * --self-test contract
  * --------------------
- * Seven controls plus a side-effect reading. The reds are planted for real: throwaway fixtures in
+ * Nine controls plus a side-effect reading. The reds are planted for real: throwaway fixtures in
  * `mkdtempSync` are handed to the *same* `runBuild` the gate uses, so a control passes only when
  * that build really fails and its log really names the planted drift. Two green controls keep the
  * reds honest - the shipped entry must still bundle, and a browser-safe fixture written next to
@@ -34,13 +34,33 @@
  * throw) cannot be produced by a real bundle on demand.
  * It writes nothing into the checkout, starts no browser, opens no socket and performs no network
  * I/O; every artifact goes into one throwaway directory that is removed before exit, and the two
- * production paths in `tmpdir()` are verified untouched. Exit codes: 0 = green, 1 = red, 2 = usage.
+ * production paths in `tmpdir()` are verified untouched.
+ *
+ * The bundle dependency
+ * ---------------------
+ * The gate judges bundles with esbuild, so it cannot judge anything without it - but a job that
+ * installs nothing still runs `--self-test` on purpose (CI's `test-hygiene` job: no `npm ci`, no
+ * registry, seconds of wall clock), and there an uncaught `ERR_MODULE_NOT_FOUND` is a red that says
+ * "the runner had no node_modules" while looking exactly like "a planted drift was not caught".
+ * Three of the controls need no bundle at all (the formatter, the dependency notice, and the probe
+ * that proves an unresolvable dependency is reported rather than thrown); the six that plant real
+ * bundles cannot run without it. So the dependency is loaded as a *value* and each caller decides:
+ *
+ *   - the gate refuses to answer green without it: the operator gets "cannot run" plus the install
+ *     line on stderr and exit 2, because not judging must never look like judging it clean;
+ *   - `--self-test` runs every control it can, prints one `SKIP <control> (<reason>)` line per leg
+ *     that needs the dependency, and counts them in its tally (`N ran, M skipped`), so a green
+ *     self-test still says exactly how much of itself it could prove. The same self-test runs with
+ *     the dependency installed in the jobs that do `npm ci` (`build-check` through `npm run check`),
+ *     where all nine legs run and the tally reads `0 skipped`.
+ *
+ * Exit codes: 0 = green, 1 = red (the bundle is broken), 2 = could not run (usage, or the bundle
+ * dependency is missing).
  */
 import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { build } from "esbuild";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const entryPoint = join(repoRoot, "scripts", "browser-smoke-entry.ts");
@@ -61,6 +81,43 @@ function parseArgs(argv) {
 
 function usage() {
 	console.error("usage: node scripts/check-browser-smoke.mjs [--self-test]");
+}
+
+/**
+ * The bundle dependency. Loaded through a variable specifier so a missing one is a value this
+ * script can report on, instead of an uncaught import failure at module load that prints a node
+ * stack trace and exits 1 - a red that names nothing about the bundles this gate judges.
+ */
+const BUNDLE_DEPENDENCY = "esbuild";
+
+/** `undefined` until `main` installs it; every build goes through it, so nothing may run before. */
+let build;
+
+/**
+ * The probe `--self-test` uses to decide which of its legs are runnable, and that the gate uses to
+ * refuse to answer green. `specifier` is a parameter so the self-test can hand it something that
+ * cannot resolve and check that the answer is a value rather than a throw.
+ */
+async function loadBundleDependency(specifier = BUNDLE_DEPENDENCY) {
+	try {
+		const loaded = await import(specifier);
+		if (typeof loaded.build !== "function") {
+			return { ok: false, reason: `${specifier} resolved but exports no build() function` };
+		}
+		return { ok: true, build: loaded.build };
+	} catch (error) {
+		const code = error && typeof error === "object" && "code" in error ? String(error.code) : "no error code";
+		return { ok: false, reason: `${code}: ${error instanceof Error ? error.message : String(error)}` };
+	}
+}
+
+/** One sentence per unproven leg, and one line saying what to do about it. */
+function dependencyNotice(reason) {
+	return `the bundle dependency "${BUNDLE_DEPENDENCY}" is not installed (${reason})`;
+}
+
+function installHint() {
+	return `install it with \`npm ci\` (${BUNDLE_DEPENDENCY} is a devDependency of packages/coding-agent) and re-run`;
 }
 
 /**
@@ -104,6 +161,7 @@ function formatBuildFailure(error) {
 
 /** One build, reported as a value: the gate and every self-test control run this same function. */
 async function runBuild(options) {
+	if (typeof build !== "function") throw new Error(`runBuild called before ${BUNDLE_DEPENDENCY} was loaded`);
 	try {
 		const result = await build(options);
 		return { ok: true, warnings: result.warnings };
@@ -142,6 +200,29 @@ function evaluateBuild(result, expectation) {
 			failures.push(`expected the failure log to name ${JSON.stringify(needle)}, got:\n${result.log}`);
 		}
 	}
+	return failures;
+}
+
+/**
+ * The two sentences a skipped leg and a refused gate print. Driven by a canned reason, and pinned
+ * word for word: this is what an operator reads in the job that installs nothing, and the pin is
+ * what stops "the dependency is missing" from decaying into a line nobody can act on.
+ */
+function dependencyNoticeControls() {
+	const failures = [];
+	const expect = (actual, wanted, label) => {
+		if (actual !== wanted) failures.push(`${label}: expected\n${JSON.stringify(wanted)}\ngot\n${JSON.stringify(actual)}`);
+	};
+	expect(
+		dependencyNotice("ERR_MODULE_NOT_FOUND: Cannot find package 'esbuild'"),
+		`the bundle dependency "esbuild" is not installed (ERR_MODULE_NOT_FOUND: Cannot find package 'esbuild')`,
+		"the notice names the package and carries the unpacked reason",
+	);
+	expect(
+		installHint(),
+		"install it with `npm ci` (esbuild is a devDependency of packages/coding-agent) and re-run",
+		"the hint says what to do about it",
+	);
 	return failures;
 }
 
@@ -188,14 +269,21 @@ function formatterControls() {
 	return failures;
 }
 
+/**
+ * The control manifest. `needsBundleDependency: true` marks a leg that plants a real bundle through
+ * `runBuild`, so it is the ones marked here that `--self-test` skips (loudly, and counted) when the
+ * dependency is absent; the rest run anywhere node runs.
+ */
 function selfTestControls(workDir) {
 	return [
 		{
 			name: "the shipped browser-smoke entry still bundles for the browser (green control)",
+			needsBundleDependency: true,
 			run: async () => evaluateBuild(await runBuild(buildOptions(join(workDir, "shipped.js"))), { ok: true }),
 		},
 		{
 			name: "a Node builtin entering the graph reddens the gate and names it (the drift this gate exists for)",
+			needsBundleDependency: true,
 			run: () =>
 				buildControl(
 					workDir,
@@ -207,6 +295,7 @@ function selfTestControls(workDir) {
 		},
 		{
 			name: "a browser-safe fixture next to it still bundles (attribution control for the red above)",
+			needsBundleDependency: true,
 			run: () =>
 				buildControl(workDir, "browser-safe.ts", "export const answer = 41 + 1;\nconsole.log(answer);\n", "browser-safe.js", {
 					ok: true,
@@ -214,6 +303,7 @@ function selfTestControls(workDir) {
 		},
 		{
 			name: "a syntax error inside the bundled graph reddens the gate",
+			needsBundleDependency: true,
 			run: () =>
 				buildControl(workDir, "syntax-error.ts", "export const broken = ;\n", "syntax-error.js", {
 					ok: false,
@@ -222,6 +312,7 @@ function selfTestControls(workDir) {
 		},
 		{
 			name: "a vanished entry file reddens the gate instead of passing silently",
+			needsBundleDependency: true,
 			run: async () =>
 				evaluateBuild(
 					await runBuild(buildOptions(join(workDir, "vanished.js"), { entryPoints: [join(workDir, "gone.ts")] })),
@@ -234,6 +325,7 @@ function selfTestControls(workDir) {
 		},
 		{
 			name: "a red build writes its detail log and names it on stderr",
+			needsBundleDependency: true,
 			run: async () => {
 				const failures = [];
 				const logPath = join(workDir, "planted-errors.log");
@@ -253,17 +345,44 @@ function selfTestControls(workDir) {
 				return failures;
 			},
 		},
+		{
+			name: "the dependency notice names the package, the reason and the install line (no bundle needed)",
+			run: () => dependencyNoticeControls(),
+		},
+		{
+			name: "an unresolvable bundle dependency is reported as a value, not thrown (no bundle needed)",
+			run: async () => {
+				const probe = await loadBundleDependency("esbuild-that-this-control-never-installs");
+				if (probe.ok) return ["expected an unresolvable dependency to be reported as unavailable, got ok"];
+				if (!probe.reason.includes("esbuild-that-this-control-never-installs")) {
+					return [`expected the reason to name the specifier, got: ${probe.reason}`];
+				}
+				return [];
+			},
+		},
 	];
 }
 
-async function runSelfTest() {
+async function runSelfTest(dependency) {
 	const workDir = mkdtempSync(join(tmpdir(), "prime-agent-browser-smoke-selftest-"));
 	// The production artifacts: the self-test must neither create nor rewrite them.
 	const productionArtifacts = [outputPath, errorLogPath].map((path) => [path, fingerprint(path)]);
 	const controls = selfTestControls(workDir);
+	// A missing dependency is decided once, here, and every decision below reads it: the legs that
+	// need it are named in the SKIP lines and counted, which is the difference between "this run did
+	// not prove that" and "this run proved it and said nothing".
+	const unavailable = dependency.ok ? undefined : dependencyNotice(dependency.reason);
+	let ran = 0;
+	let skipped = 0;
 	let mismatches = 0;
 	try {
 		for (const control of controls) {
+			if (control.needsBundleDependency && unavailable !== undefined) {
+				skipped += 1;
+				console.log(`SKIP ${control.name} (${unavailable})`);
+				continue;
+			}
+			ran += 1;
 			let failures;
 			let threw;
 			try {
@@ -278,6 +397,19 @@ async function runSelfTest() {
 		}
 	} finally {
 		rmSync(workDir, { recursive: true, force: true });
+	}
+
+	if (skipped > 0) {
+		// Loud on purpose: a job that installs nothing (CI's test-hygiene job is one) must not look
+		// like a job that proved the planted reds. The line is also a CI annotation, so the skip is
+		// visible in the run summary rather than only inside one step's log.
+		const line =
+			`check-browser-smoke self-test: ${skipped} of ${controls.length} legs cannot run here - ${unavailable}. ` +
+			`${installHint()}`;
+		console.log(line);
+		if (process.env.GITHUB_ACTIONS === "true") {
+			console.log(`::warning title=browser-smoke self-test legs skipped::${line}`);
+		}
 	}
 
 	const sideEffectFailures = [];
@@ -295,8 +427,12 @@ async function runSelfTest() {
 	);
 	for (const failure of sideEffectFailures) console.log(`       ${failure}`);
 
-	console.log(`self-test: ${controls.length + 1} controls, ${mismatches} mismatch(es)`);
-	return mismatches === 0 ? 0 : 1;
+	console.log(
+		`self-test: ${controls.length + 1} controls (${ran + 1} ran, ${skipped} skipped${
+			skipped > 0 ? ` - ${unavailable}` : ""
+		}), ${mismatches} mismatch(es)`,
+	);
+	return { status: mismatches === 0 ? 0 : 1, total: controls.length, skipped, unavailable };
 }
 
 /** "absent" or "present at this size and mtime": enough to prove the self-test did not rewrite it. */
@@ -323,11 +459,26 @@ async function main(argv) {
 		usage();
 		return 0;
 	}
+	const dependency = await loadBundleDependency();
+	if (!dependency.ok && !options.selfTest) {
+		// Not judging must never be reported as judging it clean: without the dependency the gate has
+		// no way to look at a bundle, so it says so and exits 2 instead of a green 0.
+		console.error(`Browser smoke check cannot run: ${dependencyNotice(dependency.reason)}`);
+		console.error(installHint());
+		return 2;
+	}
+	build = dependency.build;
+
 	if (options.selfTest) {
-		const status = await runSelfTest();
-		if (status === 0) console.log("check-browser-smoke self-test: OK (the gate still plants its own red)");
-		else console.error("check-browser-smoke self-test: RED (a planted drift was not detected, or a green control failed)");
-		return status;
+		const outcome = await runSelfTest(dependency);
+		if (outcome.status === 0) {
+			console.log(
+				outcome.skipped === 0
+					? "check-browser-smoke self-test: OK (the gate still plants its own red)"
+					: `check-browser-smoke self-test: OK (${outcome.skipped} of ${outcome.total} legs skipped: ${outcome.unavailable}; every leg that could run planted its red)`,
+			);
+		} else console.error("check-browser-smoke self-test: RED (a planted drift was not detected, or a green control failed)");
+		return outcome.status;
 	}
 
 	const result = await runBuild(buildOptions(outputPath));
