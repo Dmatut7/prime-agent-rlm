@@ -1203,6 +1203,56 @@ function visibleSessionActionProjection(actions: readonly QueuedSessionAction[])
 	);
 }
 
+/**
+ * waitForIdle's macrotask fuse. A cycle that made progress yields with `setImmediate`,
+ * which is enough to keep timers and IO alive without adding latency to a draining
+ * queue; a cycle that made none waits this long instead, so a stranded state costs a
+ * bounded poll rather than a hot loop.
+ */
+const WAIT_FOR_IDLE_POLL_MS = 50;
+
+/**
+ * Consecutive progress-free cycles after which waitForIdle stops waiting and reports the
+ * wedge. Only consulted while nothing owns the wait (see
+ * {@link AgentSession._waitForIdleBlockOwner}), so a long compaction, retry, bash or
+ * pause never trips it; 16 polls is under a second of a state that cannot advance.
+ */
+const WAIT_FOR_IDLE_STAGNANT_CYCLE_LIMIT = 16;
+
+/** One waitForIdle cycle's observable state; two equal snapshots mean the loop made no progress. */
+interface WaitForIdleProgress {
+	agentEventQueue: Promise<void>;
+	pumpRequested: boolean;
+	streaming: boolean;
+	queuedActions: number;
+	unfinishedActions: number;
+	blockOwner: string | undefined;
+}
+
+function sameWaitForIdleProgress(left: WaitForIdleProgress, right: WaitForIdleProgress): boolean {
+	return (
+		left.agentEventQueue === right.agentEventQueue &&
+		left.pumpRequested === right.pumpRequested &&
+		left.streaming === right.streaming &&
+		left.queuedActions === right.queuedActions &&
+		left.unfinishedActions === right.unfinishedActions &&
+		left.blockOwner === right.blockOwner
+	);
+}
+
+/** Hand the turn to the event loop so timers, IO and other sessions' work get a slice. */
+function nextEventLoopTurn(): Promise<void> {
+	return new Promise<void>((resolve) => {
+		setImmediate(resolve);
+	});
+}
+
+function waitForIdlePoll(): Promise<void> {
+	return new Promise<void>((resolve) => {
+		setTimeout(resolve, WAIT_FOR_IDLE_POLL_MS);
+	});
+}
+
 const IPYTHON_SENT_AGENT_MESSAGE_CUSTOM_ENTRY = "ipython_sent_agent_message";
 
 /**
@@ -6507,6 +6557,11 @@ export class AgentSession {
 	}
 
 	private async _disposeAsyncOnce(kernelSnapshot: boolean): Promise<void> {
+		// Queue settlement goes first, before any await: a wedged child session or kernel
+		// below can only make progress on the event loop, and a waitForIdle waiter that still
+		// sees unfinished work keeps starving it (the 2026-09-19 self-locking teardown).
+		// dispose() repeats the pass at the end; see _settleQueuedSessionWorkForDisposal.
+		this._settleQueuedSessionWorkForDisposal();
 		// Flush kernels/traces for both still-running and retained children; the sync
 		// dispose() below only tears them down synchronously.
 		for (const run of [...this._activeRlmChildRuns.values()]) {
@@ -6566,6 +6621,41 @@ export class AgentSession {
 		return this._disposeCallbacksPromise;
 	}
 
+	/**
+	 * Settle everything the session still owes its queue: persist undelivered work, fail
+	 * the deliveries and completions waiting on it, cancel the clearable actions, and drop
+	 * the agent's own queues.
+	 *
+	 * Idempotent by construction - every step consumes the state it settles, and the
+	 * sidecar writer de-duplicates by key - because disposeAsync() runs it before its first
+	 * await and dispose() runs it again at the end of the teardown. The early pass is the
+	 * point: the awaits below it (child sessions, the ipython kernel) can block on IO, and
+	 * a waitForIdle waiter that still sees unfinished work is exactly what starves the event
+	 * loop that IO needs. Settling first breaks that self-locking chain, and work a child
+	 * enqueues during the teardown is settled by the late pass.
+	 */
+	private _settleQueuedSessionWorkForDisposal(): void {
+		// A deferred `!cmd` result never reaches a turn boundary when the session
+		// ends first, so it is persisted here instead of being dropped.
+		this._flushPendingBashMessagesBeforeDispose();
+		// B1 后半: dropping the queue here used to be silent, which made "queued"
+		// blinder than the hard failure it replaced. Persist first, then clear.
+		this._persistUndeliveredWorkBeforeDispose();
+		this._pendingNextTurnMessages = [];
+		const deliveryError = new Error("Session disposed before prompt delivery.");
+		const completionError = new Error("Session disposed before prompt completion.");
+		this._rejectQueuedAgentMessageDeliveries(deliveryError, completionError);
+		// Undelivered replies stop being owed a credit; the persisted queue above is
+		// what survives, and a re-flowed message starts with an empty ledger.
+		this._queuedChildReplyBackfills.clear();
+		for (const [agentMessageId, outcome] of this._agentMessageOutcomes) {
+			if (outcome.delivery) this._settleAgentMessage(agentMessageId, "delivery", deliveryError);
+			if (outcome.completion) this._settleAgentMessage(agentMessageId, "completion", completionError);
+		}
+		this._cancelSessionActions(() => true, deliveryError);
+		this.agent.clearAllQueues();
+	}
+
 	dispose(): void {
 		if (this._disposed) {
 			return;
@@ -6606,25 +6696,7 @@ export class AgentSession {
 			this._rlmChildSessions.clear();
 			this._rlmChildCleanupFailures.clear();
 			this._deletedRlmChildIds.clear();
-			// A deferred `!cmd` result never reaches a turn boundary when the session
-			// ends first, so it is persisted here instead of being dropped.
-			this._flushPendingBashMessagesBeforeDispose();
-			// B1 后半: dropping the queue here used to be silent, which made "queued"
-			// blinder than the hard failure it replaced. Persist first, then clear.
-			this._persistUndeliveredWorkBeforeDispose();
-			this._pendingNextTurnMessages = [];
-			const deliveryError = new Error("Session disposed before prompt delivery.");
-			const completionError = new Error("Session disposed before prompt completion.");
-			this._rejectQueuedAgentMessageDeliveries(deliveryError, completionError);
-			// Undelivered replies stop being owed a credit; the persisted queue above is
-			// what survives, and a re-flowed message starts with an empty ledger.
-			this._queuedChildReplyBackfills.clear();
-			for (const [agentMessageId, outcome] of this._agentMessageOutcomes) {
-				if (outcome.delivery) this._settleAgentMessage(agentMessageId, "delivery", deliveryError);
-				if (outcome.completion) this._settleAgentMessage(agentMessageId, "completion", completionError);
-			}
-			this._cancelSessionActions(() => true, deliveryError);
-			this.agent.clearAllQueues();
+			this._settleQueuedSessionWorkForDisposal();
 			this._extensionRunner.invalidate(
 				"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
 			);
@@ -9649,6 +9721,14 @@ export class AgentSession {
 								this._actionStore.rollback(action);
 							}
 						}
+						// The rollback above is the undelivered half. The delivered half has
+						// nowhere to go: `committing`/`running` is outside CLEARABLE_STATES, so
+						// no later cancel (not even dispose()) can reach it, and a "deferred"
+						// error is never re-driven for work whose dispatch already settled. Left
+						// alone it pinned unfinishedActionCount above zero for the rest of the
+						// session's life - every idle wait, RLM quiescence check and eviction
+						// decision behind it. The batch's finally releases the terminal actions.
+						this._settleDeferredDeliveredTurnActions(actions, transcript, this._asError(error));
 						if (undelivered.length > 0) this._emitQueueUpdate();
 						blocked = epoch !== this._sessionInputPumpEpoch || this._isBusyForSessionInput("pump");
 						if (blocked) return;
@@ -10903,6 +10983,8 @@ export class AgentSession {
 	 * blocks daemon passivation).
 	 */
 	private async _waitForIdleOrSettlement(settlement?: PostCompactionContinuationSettlement): Promise<void> {
+		let previousProgress: WaitForIdleProgress | undefined;
+		let stagnantCycles = 0;
 		while (settlement === undefined || this._postCompactionContinuationSettlement === settlement) {
 			if (this._actionStore.queuedActions().length > 0) {
 				// Park while the pump would refuse scheduling or selection: rescheduling
@@ -10912,15 +10994,25 @@ export class AgentSession {
 				// teardown that cancels the queue, and that teardown can block on a wedged
 				// kernel, so parking here would pin a checkpoint waiter (and
 				// hasPendingAdmissionWaiters) for the whole teardown. The fall-through below
-				// resolves once dispose() cancels the queue.
+				// resolves once dispose() cancels the queue - and disposeAsync() now settles
+				// it before its first await, so that release does not depend on the teardown
+				// making progress.
 				if (this._isBusyForSessionInput("pump") && !this._disposed && !this._disposing) {
 					let wake = () => {};
 					const changed = new Promise<void>((resolve) => {
 						wake = resolve;
 						this._sessionInputCheckpointWaiters.add(resolve);
 					});
+					// Bounded: the park normally ends on a checkpoint notification, and every
+					// clear site sends one, but a state that never transitions again would
+					// leave this waiter registered forever - which is what
+					// hasPendingAdmissionWaiters reports to daemon passivation. One macrotask
+					// per poll is the price of not depending on that invariant holding.
+					const poll = waitForIdlePoll();
 					try {
-						await (settlement ? Promise.race([changed, settlement.promise]) : changed);
+						await (settlement
+							? Promise.race([changed, settlement.promise, poll])
+							: Promise.race([changed, poll]));
 					} finally {
 						this._sessionInputCheckpointWaiters.delete(wake);
 					}
@@ -10942,7 +11034,78 @@ export class AgentSession {
 			) {
 				return;
 			}
+			// Fuse. Every await above can be an already-settled promise: an action stranded
+			// outside the queue (a delivered dispatch a deferred error left in `committing`,
+			// a turn the pump selected and then refused) makes the exit condition permanently
+			// false while nothing here blocks, and the loop then never returns to the event
+			// loop. Timers, IO and the teardown that would clear the state all starve
+			// together - the 2026-09-19 worker spun 40 minutes at 100% CPU with every RPC
+			// timing out and its own stall watchdog silent. So: yield a macrotask per cycle,
+			// pace that yield down to a poll once cycles stop making progress, and stop
+			// waiting entirely when no operation owns the wait.
+			const progress = this._waitForIdleProgress();
+			const stagnant = previousProgress !== undefined && sameWaitForIdleProgress(previousProgress, progress);
+			previousProgress = progress;
+			stagnantCycles = stagnant ? stagnantCycles + 1 : 0;
+			if (stagnantCycles >= WAIT_FOR_IDLE_STAGNANT_CYCLE_LIMIT && progress.blockOwner === undefined) {
+				// Self-heal. Nothing in flight can still advance this state, so waiting on it
+				// is unbounded; report and return instead. waitForIdle never rejects (see
+				// waitForHeadlessIdle), and a released waiter is what lets daemon passivation
+				// and the next idle check proceed on a session that is wedged either way.
+				sessionLog.error("waitForIdle gave up on a session input state that cannot advance", {
+					sessionId: this.sessionId,
+					unfinishedActions: progress.unfinishedActions,
+					queuedActions: progress.queuedActions,
+					streaming: progress.streaming,
+					stagnantCycles,
+				});
+				return;
+			}
+			await (stagnant ? waitForIdlePoll() : nextEventLoopTurn());
 		}
+	}
+
+	/** The observable state one waitForIdle cycle ended on; see {@link sameWaitForIdleProgress}. */
+	private _waitForIdleProgress(): WaitForIdleProgress {
+		return {
+			// The pump promise identity is deliberately absent: a pump that refuses to select
+			// work is rescheduled every cycle, so a fresh identity each time is the symptom of
+			// a wedge, not progress. A processed agent event is progress, so that identity
+			// is kept.
+			agentEventQueue: this._agentEventQueue,
+			pumpRequested: this._sessionInputPumpRequested,
+			streaming: this.agent.state.isStreaming,
+			queuedActions: this._actionStore.queuedActions().length,
+			unfinishedActions: this.unfinishedActionCount,
+			blockOwner: this._waitForIdleBlockOwner(),
+		};
+	}
+
+	/**
+	 * The operation that owns a waitForIdle wait, when one does. The stagnation break in
+	 * {@link _waitForIdleOrSettlement} fires only when this is undefined: everything listed
+	 * here has an owner that ends it and notifies the checkpoint waiters, so giving up early
+	 * would report a busy session as idle.
+	 *
+	 * A live agent run is deliberately absent. The loop awaits `agent.waitForIdle()` itself,
+	 * so a cycle that completes with the streaming flag still up is a contradiction to stop
+	 * waiting on, not an operation to respect. Disposal is absent for the mirror reason:
+	 * disposeAsync() settles the queue before its first await, so a waiter still stuck here
+	 * is waiting on something the teardown can no longer clear, and holding it pins
+	 * hasPendingAdmissionWaiters for a session that is going away.
+	 */
+	private _waitForIdleBlockOwner(): string | undefined {
+		if (this.isCompacting) return "compaction";
+		if (this.isRetrying) return "retry";
+		if (this.isBashRunning) return "bash";
+		if (this._refineInFlight !== undefined) return "refinement";
+		if (this._branchSummaryOperation !== undefined) return "branch-summary";
+		if (this._postCompactionContinuationSettlement !== undefined) return "post-compaction-continuation";
+		if (this._queuedWorkPauses.size > 0) return "queued-work-pause";
+		if (this._sessionInputPumpSuspended) {
+			return this._sessionInputSuspendedForUpdateRestart ? "update-restart-fence" : "abort-suspension";
+		}
+		return undefined;
 	}
 
 	/** Waits out any owned post-compaction continuation and rejects when one cannot start; {@link waitForIdle} never rejects. */
@@ -11107,6 +11270,39 @@ export class AgentSession {
 		// (a second release here would make that path look the ticket up twice).
 		this._notifySessionInputCheckpointChange();
 		this._emitQueueUpdate();
+	}
+
+	/**
+	 * Terminalize the delivered half of a pump batch whose dispatch closed on a deferred
+	 * error - the mirror of {@link _settleAbortedDispatchedTurnActions} for the pump's own
+	 * error path, which only ever rolled undelivered work back. Same contract: the
+	 * delivered messages stay in the transcript, only the action lifecycle ends, and the
+	 * dispatching batch's finally is what releases the terminal actions from the store.
+	 *
+	 * `failed` is the honest state: the primary message reached the context, and the
+	 * dispatch that owned it did not settle. Its ticket and any agent-message outcome
+	 * reject with the same error, so a caller waiting on the completion learns why instead
+	 * of waiting forever.
+	 */
+	private _settleDeferredDeliveredTurnActions(
+		actions: readonly QueuedSessionAction[],
+		transcript: readonly AgentMessage[],
+		error: Error,
+	): void {
+		for (const action of actions) {
+			if (action.payload.kind !== "turn") continue;
+			const state = action.lifecycle.state;
+			if (state !== "committing" && state !== "running") continue;
+			const primary = primaryDeliveryRecord(action);
+			if (!primary.durable && !transcript.includes(primary.message)) continue;
+			primary.durable = true;
+			transitionSessionAction(action, { state: "failed", error });
+			const ticket = this._actionStore.ticketFor(action);
+			ticket.rejectDelivered(error);
+			ticket.settleCompleted(error);
+			this._settleAgentMessage(action.agentMessageId, "delivery", error);
+			this._settleAgentMessage(action.agentMessageId, "completion", error);
+		}
 	}
 
 	async abort(): Promise<void> {
