@@ -1683,3 +1683,105 @@ describe("agents view startup notices", () => {
 		expect(runs).toBe(2);
 	});
 });
+
+describe("agents view session-switch handoff", () => {
+	type FinishHarness = Record<string, unknown>;
+
+	/**
+	 * finish() stops the renderer, and stop() freezes the last painted frame: that frame is
+	 * what the user watches while the session they picked is resumed and attached, which is
+	 * seconds of work. So the placeholder has to be painted *synchronously* before stop() -
+	 * requestRender defers past `stopped` and would never fire.
+	 */
+	function finishHarness(): { self: FinishHarness; frames: string[]; resolveRun: ReturnType<typeof vi.fn> } {
+		const frames: string[] = [];
+		// finish() clears the field after resolving, so the witness has to be held here.
+		const resolveRun = vi.fn();
+		const self: FinishHarness = {
+			stopped: false,
+			savedCatalogGeneration: 0,
+			heartbeatCatalogGeneration: 0,
+			clearScheduledCatalogReconcile: vi.fn(),
+			heartbeatPollTimer: undefined,
+			animationTimer: undefined,
+			clearCtrlCExitHint: vi.fn(),
+			clearDeleteConfirmation: vi.fn(),
+			statusMessageTimer: undefined,
+			unsubscribeClientClose: undefined,
+			unsubscribeClientMessage: undefined,
+			unsubscribeRosterUpdate: undefined,
+			client: undefined,
+			resolveRun,
+		};
+		self.ui = {
+			requestRender: vi.fn(),
+			flushRender: vi.fn(() => frames.push(`paint:${String(self.statusMessage)}`)),
+			stop: vi.fn(() => frames.push(`stop:${String(self.statusMessage)}`)),
+		};
+		// The real setStatusMessage: the proposition is what the frozen frame says, so the
+		// formatting and the sticky flag have to be the production ones.
+		Object.setPrototypeOf(self, AgentsViewMode.prototype);
+		return { self, frames, resolveRun };
+	}
+
+	it("paints an opening placeholder into the frozen frame before stopping", () => {
+		const { self, frames, resolveRun } = finishHarness();
+
+		invoke("finish", self, { type: "open", summary: summary({ sessionName: "worker-a" }) });
+
+		expect(frames).toEqual(["paint:Opening worker-a…", "stop:Opening worker-a…"]);
+		expect(self.stopped).toBe(true);
+		expect(resolveRun).toHaveBeenCalledWith(
+			expect.objectContaining({ type: "open", summary: expect.objectContaining({ sessionName: "worker-a" }) }),
+		);
+		// Sticky, so the placeholder armed no expiry timer the stopped renderer cannot run.
+		expect(self.statusMessageTimer).toBeUndefined();
+	});
+
+	it("names the session a scope-back returns to", () => {
+		const { self, frames } = finishHarness();
+
+		invoke("finish", self, {
+			type: "scope_back",
+			selection: summary({ sessionName: "parent" }),
+			expandedAncestorSessionIds: [],
+			returnChat: summary({ sessionName: "child-chat" }),
+			hasChildren: false,
+		});
+
+		expect(frames).toEqual(["paint:Opening child-chat…", "stop:Opening child-chat…"]);
+	});
+
+	it("still hands the terminal over when the placeholder cannot paint", () => {
+		const { self, frames, resolveRun } = finishHarness();
+		const ui = self.ui as { flushRender: ReturnType<typeof vi.fn> };
+		ui.flushRender.mockImplementation(() => {
+			throw new Error("paint blew up");
+		});
+
+		invoke("finish", self, { type: "open", summary: summary({ sessionName: "worker-a" }) });
+
+		expect(frames).toEqual(["stop:Opening worker-a…"]);
+		expect(resolveRun).toHaveBeenCalledOnce();
+	});
+
+	it.each([
+		["exit", { type: "exit" }],
+		[
+			"a scope back that only rebuilds the list",
+			{
+				type: "scope_back",
+				selection: summary({ sessionName: "parent" }),
+				expandedAncestorSessionIds: [],
+				hasChildren: false,
+			},
+		],
+	])("clears the status without a placeholder for %s", (_label, result) => {
+		const { self, frames } = finishHarness();
+		self.statusMessage = "Left over from a keypress";
+
+		invoke("finish", self, result);
+
+		expect(frames).toEqual(["stop:undefined"]);
+	});
+});

@@ -1,0 +1,1 @@
+- Added `TUI.flushRender()` to paint the pending frame synchronously, for callers that stop the renderer in the same turn and would otherwise freeze the frame from before their last change.

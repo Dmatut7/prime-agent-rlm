@@ -310,6 +310,12 @@ interface PendingToolCallRenderInput {
 const HEARTBEAT_LEGACY_PROMPT_MIN_TOLERANCE_MS = 15_000;
 const HEARTBEAT_LEGACY_PROMPT_MAX_TOLERANCE_MS = 120_000;
 const MODEL_CATALOG_REFRESH_TTL_MS = 60_000;
+/**
+ * Frozen into the session's last frame when the terminal is handed back to the agents
+ * view (F5). That view rebuilds its catalogs before it paints anything, so without this
+ * the user watches a session that still looks live and typed-into.
+ */
+export const AGENTS_VIEW_HANDOFF_STATUS_MESSAGE = "Opening the agents view…";
 const FEATURE_HINT_DELAY_MS = 5_000;
 /**
  * Spend-cell refresh cadence. The figure comes from the context tree, whose
@@ -3265,17 +3271,32 @@ export class InteractiveMode {
 			await this.bindCurrentSessionExtensions();
 		} else {
 			setRegisteredThemes(this.uiServices.getThemes());
+			// Awaited on purpose: the first frame renders this snapshot (session, model, cwd,
+			// queue, recap), and the two calls below read the command and resource catalogs it
+			// fetches. All four are single RPCs to this session's own worker, never a fanout.
 			await this.refreshConnectionCatalog();
 			this.setupAutocompleteProvider();
 			this.showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true });
 		}
 		this.subscribeToAgent();
+		// Awaited on purpose: the handle it stores is what the next rebind disposes, so a
+		// late landing would leak the previous session's roster bar. The supervisor answers
+		// it from its own in-memory roster, so there is no worker fanout to wait for.
 		await this.subscribeToRosterBar();
 		// A session_action_update in the unsubscribed gap above is lost; re-sync the queue post-subscription.
+		// Awaited on purpose: the first frame renders this queue, and it is one RPC to this
+		// session's own worker.
 		this.patchConnectionState({ sessionActions: (await this.agentConnection.getState()).sessionActions });
 		this.refreshQueueSelectionFromState();
 		this.updatePendingMessagesDisplay();
-		await this.refreshHeartbeatCatalog().catch(() => undefined);
+		// Fire-and-forget (F4). The catalog is the one entry in this rebind that leaves the
+		// session's own worker: the daemon fans it out to every resident worker and waits
+		// for all of them, so one wedged worker used to hold the first frame of every
+		// session switch for the whole fanout budget. Nothing on that frame depends on it -
+		// applyHeartbeatCatalog requests its own render when the rows land, so the heartbeat
+		// badges fill in a moment later instead of gating the switch.
+		void this.refreshHeartbeatCatalog().catch(() => undefined);
+		// Awaited on purpose: a single RPC to this session's own worker, never a fanout.
 		await this.updateAvailableProviderCount();
 		this.updateEditorBorderColor();
 		this.updateTerminalTitle();
@@ -7750,8 +7771,29 @@ export class InteractiveMode {
 	async teardownSessionUi(options: { preserveAltScreen?: boolean } = {}): Promise<void> {
 		await this.ui.terminal.drainInput(1000).catch(() => undefined);
 		this.releasePromptStashSession();
+		// Preserving the alt screen is what hands the frozen frame to the agents view, and
+		// only a fullscreen session has such a frame to freeze: inline, the same line would
+		// just be printed into scrollback.
+		if (options.preserveAltScreen === true && this.fullscreenEnabled) {
+			this.showAgentsViewHandoffStatus();
+		}
 		this.stop({ preserveAltScreen: options.preserveAltScreen });
 		stopThemeWatcher();
+	}
+
+	/**
+	 * Paint the handoff line into the frame stop() is about to freeze. Synchronous on
+	 * purpose: stop() sets `stopped`, and every deferred render bails on it. Guarded
+	 * because it is cosmetic - a line that cannot paint must not cost the teardown, or the
+	 * session UI keeps fighting the agents view for the terminal.
+	 */
+	private showAgentsViewHandoffStatus(): void {
+		try {
+			this.showStatus(AGENTS_VIEW_HANDOFF_STATUS_MESSAGE);
+			this.ui.flushRender();
+		} catch {
+			// The frozen frame keeps the transcript it already had.
+		}
 	}
 
 	private handleAgentsBack(): boolean {

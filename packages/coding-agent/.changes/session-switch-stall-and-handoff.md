@@ -1,0 +1,3 @@
+- Fixed a session switch stalling for five seconds whenever any resident worker was unresponsive: the switch's first frame no longer waits on the heartbeat catalog, which the daemon fans out to every worker.
+- Changed the daemon's global heartbeat list to settle each worker on its own inside a one-second budget, so an unresponsive worker is a counted absence in the daemon log instead of a failure that hides every healthy heartbeat.
+- Added a loading line to the frame a session switch freezes: "Opening <session name>…" while the picked session attaches, and "Opening the agents view…" while the agents view rebuilds on the way back.

@@ -867,3 +867,82 @@ describe("TUI above-viewport changes on a tall transcript", () => {
 		tui.stop();
 	});
 });
+
+describe("TUI synchronous flush", () => {
+	it("paints a pending change without waiting for the scheduled render", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 10);
+		const tui = new TUI(terminal);
+		const component = new TestComponent();
+		tui.addChild(component);
+
+		component.lines = ["Before"];
+		tui.start();
+		await terminal.waitForRender();
+		terminal.clearWrites();
+
+		// The session-switch handoff shape: content changes and the renderer is about to
+		// stop, so the deferred render would never run. Nothing is awaited between the
+		// change and the assertion - the flush has to have written the frame already.
+		component.lines = ["Opening worker…"];
+		tui.requestRender();
+		tui.flushRender();
+
+		assert.ok(
+			terminal.getWrites().includes("Opening worker…"),
+			`Expected the flushed frame in the terminal writes, got: ${JSON.stringify(terminal.getWrites())}`,
+		);
+
+		await terminal.waitForRender();
+		assert.ok(
+			terminal.getViewport().some((line) => line.includes("Opening worker…")),
+			`Expected the flushed frame on screen, got: ${terminal.getViewport().join(" | ")}`,
+		);
+
+		tui.stop();
+	});
+
+	it("leaves no scheduled render behind", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 10);
+		const tui = new TUI(terminal);
+		const component = new TestComponent();
+		tui.addChild(component);
+
+		component.lines = ["First"];
+		tui.start();
+		await terminal.waitForRender();
+
+		component.lines = ["Second"];
+		tui.requestRender();
+		tui.flushRender();
+		assert.ok(terminal.getWrites().includes("Second"), "The flush painted the change");
+
+		// A render left scheduled would fire ~16ms later and paint whatever the component
+		// holds by then, so this change must never reach the screen on its own.
+		component.lines = ["Third"];
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		assert.ok(
+			!terminal.getViewport().some((line) => line.includes("Third")),
+			`A cancelled render painted anyway: ${terminal.getViewport().join(" | ")}`,
+		);
+
+		tui.stop();
+	});
+
+	it("is a no-op after stop", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 10);
+		const tui = new TUI(terminal);
+		const component = new TestComponent();
+		tui.addChild(component);
+
+		component.lines = ["Before"];
+		tui.start();
+		await terminal.waitForRender();
+		tui.stop();
+		terminal.clearWrites();
+
+		component.lines = ["After stop"];
+		tui.flushRender();
+
+		assert.strictEqual(terminal.getWrites(), "", "A stopped renderer paints nothing");
+	});
+});

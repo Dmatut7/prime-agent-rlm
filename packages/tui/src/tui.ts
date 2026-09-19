@@ -738,6 +738,28 @@ export class TUI extends Container {
 	}
 
 	/**
+	 * Paint the current frame synchronously.
+	 *
+	 * requestRender defers through nextTick and a throttle timer, and both bail once
+	 * `stopped` is set, so a caller that edits content and stops the renderer in the same
+	 * turn freezes the frame from *before* that edit. Callers handing their last frame to
+	 * the next UI (a session switch) flush first. The scheduled render is dropped because
+	 * this already painted it.
+	 */
+	flushRender(): void {
+		if (this.stopped) {
+			return;
+		}
+		if (this.renderTimer) {
+			clearTimeout(this.renderTimer);
+			this.renderTimer = undefined;
+		}
+		this.renderRequested = false;
+		this.doRender();
+		this.lastRenderAt = performance.now();
+	}
+
+	/**
 	 * Render a scrollable transcript window on the alternate screen with `dock`
 	 * pinned to the bottom rows; the primary screen stays untouched until exit.
 	 * Wheel tracking is enabled blind — probing is not viable (tmux never

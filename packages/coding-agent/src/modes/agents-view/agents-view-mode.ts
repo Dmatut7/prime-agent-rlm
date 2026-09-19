@@ -270,6 +270,20 @@ export function combineAgentsViewStartupNotices(...notices: readonly (string | u
 	return formatted.length > 0 ? formatted.join(" · ") : undefined;
 }
 
+/**
+ * The status line frozen into this view's last frame while the session it handed off is
+ * resumed and attached - seconds during which the frame is all the user gets to look at.
+ * Undefined for results that open no session, where the stale status is cleared instead.
+ */
+export function agentsViewHandoffStatusMessage(result: AgentsViewRunResult): string | undefined {
+	const opening =
+		result.type === "open" ? result.summary : result.type === "scope_back" ? result.returnChat : undefined;
+	if (!opening) {
+		return undefined;
+	}
+	return `Opening ${getAgentsViewSessionTitle(opening)}…`;
+}
+
 export function shouldReconnectAgentsViewDaemon(reason: DaemonClosingReason | undefined): boolean {
 	return reason !== "shutdown";
 }
@@ -2551,7 +2565,24 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 		this.clearCtrlCExitHint({ render: false });
 		this.clearDeleteConfirmation({ render: false });
-		this.setStatusMessage(undefined, { render: false });
+		// stop() below freezes this frame, and it is what the user watches while the picked
+		// session is resumed and attached. Hand it over saying so instead of showing a status
+		// from the keypress that opened it. Sticky because the renderer is stopping: an expiry
+		// timer could never clear it, and none is armed. flushRender paints it now, since
+		// requestRender defers past `stopped` and would never fire.
+		const handoffMessage = agentsViewHandoffStatusMessage(result);
+		if (handoffMessage === undefined) {
+			this.setStatusMessage(undefined, { render: false });
+		} else {
+			// Cosmetic, so it is guarded: a placeholder that cannot be set or painted must
+			// not cost the handoff itself, which is the stop() and the resolved run below.
+			try {
+				this.setStatusMessage(handoffMessage, { render: false, sticky: true });
+				this.ui.flushRender();
+			} catch {
+				// The frozen frame keeps the status it already had.
+			}
+		}
 		this.ui.stop({
 			preserveAltScreen: result.type !== "exit",
 			flushFullscreen: false,

@@ -6,6 +6,7 @@ import type { DaemonSocketClient } from "../src/modes/daemon/active-session-stat
 import { type DaemonCommand, type DaemonResponse, failure, success } from "../src/modes/daemon/daemon-protocol.js";
 import {
 	DaemonSupervisor,
+	HEARTBEAT_LIST_FANOUT_TIMEOUT_MS,
 	HEARTBEAT_LIST_FORWARD_TIMEOUT_MS,
 	HEARTBEAT_LIST_LAUNCH_WAIT_MS,
 } from "../src/modes/daemon/daemon-supervisor.js";
@@ -15,6 +16,7 @@ interface SupervisorHarness {
 	openingWorkers: Map<string, Promise<unknown>>;
 	catalogOpeningWorkers: Map<string, Promise<unknown>>;
 	findWorkerForClient(client: DaemonSocketClient, selector: string): Promise<{ worker: unknown }>;
+	log(message: string): void;
 	forwardToWorker(worker: unknown, command: DaemonCommand, timeoutMs?: number): Promise<DaemonResponse>;
 	handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<DaemonResponse | undefined>;
 	handleWorkerFrame(worker: unknown, frame: unknown): void;
@@ -37,9 +39,9 @@ function createSupervisorHarness(): SupervisorHarness {
 	}) as unknown as SupervisorHarness;
 }
 
-function worker(lifecycle: "starting" | "ready" | "recovering" | "failed", connected = true) {
+function worker(lifecycle: "starting" | "ready" | "recovering" | "failed", connected = true, workerId = "worker") {
 	return {
-		descriptor: { lifecycle },
+		descriptor: { lifecycle, workerId },
 		...(connected ? { client: {} } : {}),
 	};
 }
@@ -130,13 +132,14 @@ describe("daemon supervisor heartbeat aggregation", () => {
 		}
 	});
 
-	it("reports a still-starting worker after the launch wait instead of omitting it", async () => {
+	it("counts a still-starting worker as absent instead of failing the launch-wait list", async () => {
 		vi.useFakeTimers();
 		try {
 			const supervisor = createSupervisorHarness();
-			supervisor.workers.set("public", worker("ready"));
+			supervisor.workers.set("public", worker("ready", true, "public"));
 			supervisor.openingWorkers.set("slow", new Promise<unknown>(() => {}));
 			supervisor.catalogOpeningWorkers.set("slow", new Promise<unknown>(() => {}));
+			supervisor.log = vi.fn();
 			supervisor.forwardToWorker = vi.fn(async (_worker, command) =>
 				success(command.id, command.type, { heartbeats: [{ job: { id: "heartbeat-1" } }] }),
 			);
@@ -147,13 +150,16 @@ describe("daemon supervisor heartbeat aggregation", () => {
 			});
 			await vi.advanceTimersByTimeAsync(0);
 			// The slow launch registers mid-wait but never becomes ready.
-			supervisor.workers.set("slow", worker("starting"));
+			supervisor.workers.set("slow", worker("starting", true, "slow"));
 
 			await vi.advanceTimersByTimeAsync(HEARTBEAT_LIST_LAUNCH_WAIT_MS);
+			// The ready worker's catalog is still the answer; the worker that never came
+			// up is reported as a counted absence rather than taking the list down with it.
 			await expect(pending).resolves.toMatchObject({
-				success: false,
-				error: "Cannot list heartbeats while session worker is starting",
+				success: true,
+				data: { heartbeats: [{ job: { id: "heartbeat-1" } }] },
 			});
+			expect(supervisor.log).toHaveBeenCalledWith(expect.stringContaining("slow"));
 		} finally {
 			vi.useRealTimers();
 		}
@@ -238,15 +244,16 @@ describe("daemon supervisor heartbeat aggregation", () => {
 		expect(supervisor.forwardToWorker).toHaveBeenCalledTimes(3);
 	});
 
-	it("returns a worker failure instead of a partial catalog", async () => {
+	it("keeps the healthy workers when one worker's list fails", async () => {
 		const supervisor = createSupervisorHarness();
-		const first = worker("ready");
-		const second = worker("ready");
+		const first = worker("ready", true, "first");
+		const second = worker("ready", true, "second");
 		supervisor.workers.set("first", first);
 		supervisor.workers.set("second", second);
+		supervisor.log = vi.fn();
 		supervisor.forwardToWorker = vi.fn(async (target, command) =>
 			target === first
-				? success(command.id, command.type, { heartbeats: [] })
+				? success(command.id, command.type, { heartbeats: [{ job: { id: "heartbeat-1" } }] })
 				: failure(command.id, command.type, "worker unavailable"),
 		);
 
@@ -255,8 +262,33 @@ describe("daemon supervisor heartbeat aggregation", () => {
 			type: "heartbeats_list",
 		});
 
-		expect(response).toMatchObject({ success: false, error: "worker unavailable" });
+		// One worker's failure is that worker's absence, not the whole catalog's: the
+		// healthy worker's heartbeats are the answer and the failure is counted.
+		expect(response).toMatchObject({
+			success: true,
+			data: { heartbeats: [{ job: { id: "heartbeat-1" } }] },
+		});
 		expect(supervisor.forwardToWorker).toHaveBeenCalledTimes(2);
+		expect(supervisor.log).toHaveBeenCalledWith(expect.stringContaining("second"));
+	});
+
+	it("fails when no worker can answer at all", async () => {
+		const supervisor = createSupervisorHarness();
+		supervisor.workers.set("first", worker("ready", true, "first"));
+		supervisor.workers.set("second", worker("ready", true, "second"));
+		supervisor.log = vi.fn();
+		supervisor.forwardToWorker = vi.fn(async (_target, command) =>
+			failure(command.id, command.type, "worker unavailable"),
+		);
+
+		const response = await supervisor.handleCommand({} as DaemonSocketClient, {
+			id: "list-blind",
+			type: "heartbeats_list",
+		});
+
+		// Total blindness stays a failure: an empty success would tell every client
+		// "no heartbeats armed" when nothing could be asked.
+		expect(response).toMatchObject({ success: false, error: "worker unavailable" });
 	});
 
 	it("does not fall back to a snapshot after the worker reports heartbeat changes", async () => {
@@ -284,10 +316,11 @@ describe("daemon supervisor heartbeat aggregation", () => {
 		expect(response).toMatchObject({ success: false, error: "worker unavailable" });
 	});
 
-	it("fails rather than returning a partial catalog without a cached snapshot", async () => {
+	it("counts a recovering worker without a snapshot instead of failing the list", async () => {
 		const supervisor = createSupervisorHarness();
-		supervisor.workers.set("ready", worker("ready"));
-		supervisor.workers.set("recovering", worker("recovering", false));
+		supervisor.workers.set("ready", worker("ready", true, "ready"));
+		supervisor.workers.set("recovering", worker("recovering", false, "recovering"));
+		supervisor.log = vi.fn();
 		supervisor.forwardToWorker = vi.fn(async (_target, command) =>
 			success(command.id, command.type, { heartbeats: [] }),
 		);
@@ -297,11 +330,11 @@ describe("daemon supervisor heartbeat aggregation", () => {
 			type: "heartbeats_list",
 		});
 
-		expect(response).toMatchObject({
-			success: false,
-			error: "Cannot list heartbeats while session worker is recovering",
-		});
+		expect(response).toMatchObject({ success: true, data: { heartbeats: [] } });
 		expect(supervisor.forwardToWorker).toHaveBeenCalledOnce();
+		expect(supervisor.log).toHaveBeenCalledWith(
+			expect.stringContaining("Cannot list heartbeats while session worker is recovering"),
+		);
 	});
 
 	it("skips terminally failed workers without blocking healthy heartbeats", async () => {
@@ -322,6 +355,81 @@ describe("daemon supervisor heartbeat aggregation", () => {
 			data: { heartbeats: [{ job: { id: "heartbeat-1" } }] },
 		});
 		expect(supervisor.forwardToWorker).toHaveBeenCalledOnce();
+	});
+
+	it("answers inside the fanout budget while one worker never responds", async () => {
+		const supervisor = createSupervisorHarness();
+		const healthy = worker("ready", true, "healthy");
+		const wedged = worker("ready", true, "wedged");
+		supervisor.workers.set("healthy", healthy);
+		supervisor.workers.set("wedged", wedged);
+		supervisor.log = vi.fn();
+		supervisor.forwardToWorker = vi.fn(async (target, command) => {
+			if (target === wedged) {
+				// The 2026-09-19 incident: a worker spinning inside its own event loop
+				// never answers the forward, and no client budget is going to fire first.
+				return new Promise<DaemonResponse>(() => {});
+			}
+			return success(command.id, command.type, { heartbeats: [{ job: { id: "heartbeat-healthy" } }] });
+		});
+
+		const startedAt = Date.now();
+		const response = await supervisor.handleCommand({} as DaemonSocketClient, {
+			id: "list-wedged",
+			type: "heartbeats_list",
+		});
+		const elapsedMs = Date.now() - startedAt;
+
+		// A literal, not the constant: the budget is a policy about what a session switch
+		// may cost, and a self-referential bound moves with the number it is meant to pin.
+		expect(elapsedMs).toBeLessThan(2_500);
+		expect(response).toMatchObject({
+			success: true,
+			data: { heartbeats: [{ job: { id: "heartbeat-healthy" } }] },
+		});
+		expect(supervisor.log).toHaveBeenCalledWith(expect.stringContaining("wedged"));
+	}, 10_000);
+
+	it("bounds the whole fanout attempt, not just the worker request", async () => {
+		vi.useFakeTimers();
+		try {
+			const supervisor = createSupervisorHarness();
+			const healthy = worker("ready", true, "healthy");
+			// Stuck joining an in-flight recovery: forwardToWorker awaits that before the
+			// request is ever sent, so the request budget alone would not bound the attempt.
+			const recovering = worker("ready", true, "recovering");
+			supervisor.workers.set("healthy", healthy);
+			supervisor.workers.set("recovering", recovering);
+			supervisor.log = vi.fn();
+			supervisor.forwardToWorker = vi.fn(async (target, command) => {
+				if (target === recovering) return new Promise<DaemonResponse>(() => {});
+				return success(command.id, command.type, { heartbeats: [{ job: { id: "heartbeat-healthy" } }] });
+			});
+
+			const pending = supervisor.handleCommand({} as DaemonSocketClient, {
+				id: "list-budget",
+				type: "heartbeats_list",
+			});
+			await vi.advanceTimersByTimeAsync(0);
+			// The policy half of the pin: one second is already generous for a read of
+			// in-memory cron state, and it is what keeps a wedged worker from becoming a
+			// session switch's latency.
+			expect(HEARTBEAT_LIST_FANOUT_TIMEOUT_MS).toBeLessThanOrEqual(1_000);
+			expect(supervisor.forwardToWorker).toHaveBeenCalledWith(
+				recovering,
+				expect.objectContaining({ type: "heartbeats_list" }),
+				HEARTBEAT_LIST_FANOUT_TIMEOUT_MS,
+			);
+
+			await vi.advanceTimersByTimeAsync(HEARTBEAT_LIST_FANOUT_TIMEOUT_MS);
+			await expect(pending).resolves.toMatchObject({
+				success: true,
+				data: { heartbeats: [{ job: { id: "heartbeat-healthy" } }] },
+			});
+			expect(supervisor.log).toHaveBeenCalledWith(expect.stringContaining("recovering"));
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("routes management by cached job ownership after a session unloads", async () => {

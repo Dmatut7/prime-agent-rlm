@@ -1,7 +1,8 @@
 import { Container, Loader, type TUI } from "@earendil-works/pi-tui";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { CountdownTimer } from "../src/modes/interactive/components/countdown-timer.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
+import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
 type ModeFake = Record<string, unknown>;
 
@@ -277,5 +278,80 @@ describe("transient status overlays on teardown and session replacement", () => 
 		Reflect.get(InteractiveMode.prototype, "resetCurrentSessionRenderState").call(mode);
 
 		expectOverlaysDisposed(fixture);
+	});
+});
+
+describe("teardownSessionUi handoff placeholder", () => {
+	// showStatus colors the line through the global theme proxy.
+	beforeAll(() => initTheme("dark"));
+
+	function teardownFake(fields: ModeFake = {}) {
+		const frames: string[] = [];
+		const chatContainer = new Container();
+		const painted = (): string => chatContainer.render(80).join("\n");
+		const mode = modeFake({
+			chatContainer,
+			fullscreenEnabled: true,
+			lastStatusText: undefined,
+			lastStatusSpacer: undefined,
+			releasePromptStashSession: vi.fn(),
+			ui: {
+				terminal: { drainInput: vi.fn(async () => undefined) },
+				requestRender: vi.fn(),
+				flushRender: vi.fn(() => frames.push(`paint:${painted()}`)),
+			},
+			// stop() is what freezes the frame, so it is the ordering witness here.
+			stop: vi.fn(() => frames.push(`stop:${painted()}`)),
+			...fields,
+		});
+		const teardown = (options?: { preserveAltScreen?: boolean }): Promise<void> =>
+			Reflect.get(InteractiveMode.prototype, "teardownSessionUi").call(mode, options) as Promise<void>;
+		return { mode, frames, chatContainer, teardown };
+	}
+
+	/**
+	 * The agents view rebuilds its catalogs before it paints anything, so the frame this
+	 * session freezes is what the user watches during that gap. The placeholder has to be
+	 * painted synchronously: stop() sets `stopped`, and every deferred render bails on it.
+	 */
+	it("paints the handoff line into the frozen frame before stopping", async () => {
+		const { frames, teardown } = teardownFake();
+
+		await teardown({ preserveAltScreen: true });
+
+		expect(frames).toHaveLength(2);
+		expect(frames[0]?.startsWith("paint:")).toBe(true);
+		expect(frames[0]).toContain("Opening the agents view…");
+		expect(frames[1]?.startsWith("stop:")).toBe(true);
+		expect(frames[1]).toContain("Opening the agents view…");
+	});
+
+	it("still stops the session UI when the placeholder cannot paint", async () => {
+		const { mode, frames, teardown } = teardownFake();
+		const ui = mode.ui as { flushRender: ReturnType<typeof vi.fn> };
+		ui.flushRender.mockImplementation(() => {
+			throw new Error("paint blew up");
+		});
+
+		await teardown({ preserveAltScreen: true });
+
+		expect(frames).toHaveLength(1);
+		expect(frames[0]).toContain("Opening the agents view…");
+	});
+
+	it("leaves the frame alone when the terminal is not handed over", async () => {
+		const { frames, teardown } = teardownFake();
+
+		await teardown({});
+
+		expect(frames).toEqual(["stop:"]);
+	});
+
+	it("does not print into scrollback when the session never went fullscreen", async () => {
+		const { frames, teardown } = teardownFake({ fullscreenEnabled: false });
+
+		await teardown({ preserveAltScreen: true });
+
+		expect(frames).toEqual(["stop:"]);
 	});
 });

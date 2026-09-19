@@ -54,6 +54,90 @@ interface HeartbeatRefreshHarness {
 	scheduleHeartbeatManagerRefresh(): void;
 }
 
+interface SessionRebindHarness {
+	unsubscribe: (() => void) | undefined;
+	rosterBar: { dispose(): Promise<void> } | undefined;
+	localSessionHost: undefined;
+	bindLocalSessionExtensions: boolean;
+	toolDefinitionCache: { clear(): void };
+	uiServices: { getThemes(): unknown[] };
+	agentConnection: {
+		getState(): Promise<{ sessionActions: AgentConnectionSessionActions }>;
+		listHeartbeats(): Promise<AgentConnectionHeartbeat[]>;
+	};
+	connectionState: { sessionId: string; activeSessionId: string; sessionActions: AgentConnectionSessionActions };
+	heartbeatCatalog: AgentConnectionHeartbeat[];
+	heartbeatRefreshPromise: Promise<void> | undefined;
+	heartbeatRefreshRequested: boolean;
+	subagentSnapshots: Map<string, AgentConnectionRlmChildAgentSnapshot>;
+	ui: { requestRender(): void };
+	// Real: the two methods under test.
+	rebindCurrentSession(): Promise<void>;
+	refreshHeartbeatCatalog(): Promise<void>;
+	applyHeartbeatCatalog(heartbeats: AgentConnectionHeartbeat[]): void;
+	patchConnectionState(patch: { sessionActions: AgentConnectionSessionActions }): void;
+	// Stubs for the rest of the rebind, so the only outstanding work is the catalog.
+	applyRuntimeSettings(): void;
+	refreshConnectionCatalog(): Promise<void>;
+	setupAutocompleteProvider(): void;
+	showLoadedResources(options: { force: boolean; showDiagnosticsWhenQuiet: boolean }): void;
+	subscribeToAgent(): void;
+	subscribeToRosterBar(): Promise<void>;
+	updateWorkingPulse(): void;
+	refreshQueueSelectionFromState(): void;
+	updatePendingMessagesDisplay(): void;
+	updateAvailableProviderCount(): Promise<void>;
+	updateEditorBorderColor(): void;
+	updateTerminalTitle(): void;
+	refreshTopBarCost(): void;
+	getGoalState(): unknown;
+	setGoalAnnouncementBaseline(goal: unknown): void;
+	syncGoalTray(goal: unknown): void;
+	syncWorkingLoader(): void;
+	scheduleHeartbeatManagerRefresh(): void;
+	updateSubagentSummaryLine(): void;
+}
+
+type AgentConnectionSessionActions = { queuedCount: number; steering: unknown[]; followUps: unknown[] };
+
+function createSessionRebindHarness(listHeartbeats: () => Promise<AgentConnectionHeartbeat[]>): SessionRebindHarness {
+	const harness = Object.create(InteractiveMode.prototype) as SessionRebindHarness;
+	const sessionActions: AgentConnectionSessionActions = { queuedCount: 0, steering: [], followUps: [] };
+	harness.unsubscribe = undefined;
+	harness.rosterBar = undefined;
+	harness.localSessionHost = undefined;
+	harness.bindLocalSessionExtensions = false;
+	harness.toolDefinitionCache = { clear: vi.fn() };
+	harness.uiServices = { getThemes: () => [] };
+	harness.agentConnection = { getState: vi.fn(async () => ({ sessionActions })), listHeartbeats };
+	harness.connectionState = { sessionId: "session-1", activeSessionId: "active-1", sessionActions };
+	harness.heartbeatCatalog = [];
+	harness.heartbeatRefreshPromise = undefined;
+	harness.heartbeatRefreshRequested = false;
+	harness.subagentSnapshots = new Map();
+	harness.ui = { requestRender: vi.fn() };
+	harness.applyRuntimeSettings = vi.fn();
+	harness.refreshConnectionCatalog = vi.fn(async () => {});
+	harness.setupAutocompleteProvider = vi.fn();
+	harness.showLoadedResources = vi.fn();
+	harness.subscribeToAgent = vi.fn();
+	harness.subscribeToRosterBar = vi.fn(async () => {});
+	harness.updateWorkingPulse = vi.fn();
+	harness.refreshQueueSelectionFromState = vi.fn();
+	harness.updatePendingMessagesDisplay = vi.fn();
+	harness.updateAvailableProviderCount = vi.fn(async () => {});
+	harness.updateEditorBorderColor = vi.fn();
+	harness.updateTerminalTitle = vi.fn();
+	harness.refreshTopBarCost = vi.fn();
+	harness.getGoalState = vi.fn(() => ({}));
+	harness.setGoalAnnouncementBaseline = vi.fn();
+	harness.syncGoalTray = vi.fn();
+	harness.syncWorkingLoader = vi.fn();
+	harness.scheduleHeartbeatManagerRefresh = vi.fn();
+	harness.updateSubagentSummaryLine = vi.fn();
+	return harness;
+}
+
 function heartbeat(overrides: Partial<AgentCronJob> = {}): AgentCronJob {
 	return {
 		id: "heartbeat-1",
@@ -243,6 +327,69 @@ describe("interactive heartbeat management", () => {
 			expect(harness.refreshHeartbeatCatalog).toHaveBeenCalledOnce();
 		} finally {
 			vi.useRealTimers();
+		}
+	});
+});
+
+describe("interactive session rebind", () => {
+	/**
+	 * The 2026-09-19 switch stall: rebindCurrentSession awaited the heartbeat catalog,
+	 * which fans out to every resident worker through the daemon, so one wedged worker
+	 * held the first frame of every session switch for the full fanout budget. The
+	 * catalog is decoration on that frame - applyHeartbeatCatalog requests its own
+	 * render when the rows land - so the rebind must not wait for it.
+	 */
+	it("settles the session switch without waiting for the heartbeat catalog", async () => {
+		let releaseCatalog: ((heartbeats: AgentConnectionHeartbeat[]) => void) | undefined;
+		const listHeartbeats = vi.fn(
+			() =>
+				new Promise<AgentConnectionHeartbeat[]>((resolve) => {
+					releaseCatalog = resolve;
+				}),
+		);
+		const harness = createSessionRebindHarness(listHeartbeats);
+
+		const rebind = harness.rebindCurrentSession();
+		const outcome = await Promise.race([
+			rebind.then(() => "settled" as const),
+			new Promise<"blocked">((resolve) => {
+				const timer = setTimeout(() => resolve("blocked"), 500);
+				timer.unref?.();
+			}),
+		]);
+
+		expect(outcome).toBe("settled");
+		expect(listHeartbeats).toHaveBeenCalledOnce();
+		// The rest of the rebind, including everything the first frame reads, still ran.
+		expect(harness.refreshConnectionCatalog).toHaveBeenCalledOnce();
+		expect(harness.updateAvailableProviderCount).toHaveBeenCalledOnce();
+		expect(harness.syncWorkingLoader).toHaveBeenCalledOnce();
+		// The catalog is still outstanding, and nothing was painted for it yet.
+		expect(harness.heartbeatCatalog).toEqual([]);
+		expect(harness.ui.requestRender).not.toHaveBeenCalled();
+
+		// Fire-and-forget must still deliver: the rows land on their own and repaint.
+		releaseCatalog?.([{ job: heartbeat() }]);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(harness.heartbeatCatalog).toEqual([{ job: heartbeat() }]);
+		expect(harness.updateSubagentSummaryLine).toHaveBeenCalled();
+		expect(harness.ui.requestRender).toHaveBeenCalled();
+	});
+
+	it("keeps a failing catalog from rejecting the session switch", async () => {
+		const rejections: unknown[] = [];
+		const onRejection = (reason: unknown): void => {
+			rejections.push(reason);
+		};
+		const harness = createSessionRebindHarness(() => Promise.reject(new Error("worker recovering")));
+		process.on("unhandledRejection", onRejection);
+		try {
+			await expect(harness.rebindCurrentSession()).resolves.toBeUndefined();
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			expect(rejections).toEqual([]);
+			expect(harness.heartbeatCatalog).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onRejection);
 		}
 	});
 });

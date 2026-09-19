@@ -282,9 +282,24 @@ const ADOPTION_CONCURRENCY = 4;
 // parked failed, so an unattended heartbeat does not silently stop at startup.
 const ADOPTION_RETRY_DELAYS_MS: readonly number[] = [30_000, 120_000, 600_000];
 // The daemon client's default request budget is 30s and each ready-worker heartbeat
-// forward gets 5s, so waiting longer than this on in-flight launches would only
-// surface as a client transport timeout instead of a bounded per-worker state error.
+// attempt is bounded by HEARTBEAT_LIST_FANOUT_TIMEOUT_MS below, so waiting longer than
+// this on in-flight launches would only surface as a client transport timeout instead
+// of a bounded per-worker absence.
 export const HEARTBEAT_LIST_LAUNCH_WAIT_MS = 15_000;
+/**
+ * One worker's share of the *global* heartbeat list (F4).
+ *
+ * This is a fanout budget, not a request tier: the global list is fetched on every
+ * session switch and asks every resident worker at once, so the budget is what one
+ * wedged worker costs a switch. What it waits for is a read of in-memory cron state
+ * that a healthy worker answers in milliseconds - the whole fanout measured 199ms
+ * once the spinning worker behind the 2026-09-19 incident was killed, against the 5s
+ * it had been given, which made that one worker the switch's latency. It bounds the
+ * per-worker *attempt*, not just the request, because forwardToWorker first joins an
+ * in-flight recovery whose own budget is far larger. A worker that misses it is a
+ * counted absence, never a failure of the list.
+ */
+export const HEARTBEAT_LIST_FANOUT_TIMEOUT_MS = 1_000;
 // Session-scoped listing must fail inside the client's request budget too; the
 // worker request default (24h) would turn a stuck worker into a client transport
 // timeout instead of a daemon-side failure.
@@ -1096,6 +1111,17 @@ function cronJobsFromResponse(response: DaemonResponse): AgentCronJob[] {
 	const jobs = (response.data as { jobs?: unknown }).jobs;
 	return Array.isArray(jobs) ? (jobs as AgentCronJob[]) : [];
 }
+
+/**
+ * One worker's share of a global heartbeats_list: the rows it answered with, or the
+ * response explaining why it answered with none. A share never fails the list on its
+ * own (F4) - it is either merged or counted absent.
+ */
+type HeartbeatFanoutShare = {
+	workerId: string;
+	heartbeats?: AgentConnectionHeartbeat[];
+	absence?: DaemonResponse;
+};
 
 function heartbeatsFromResponse(response: DaemonResponse): AgentConnectionHeartbeat[] {
 	if (!response.success || !response.data || typeof response.data !== "object") {
@@ -3374,41 +3400,91 @@ export class DaemonSupervisor {
 						selectedWorkers.has(worker) && this.isLiveWorker(worker) && worker.descriptor.lifecycle !== "failed",
 				);
 				const heartbeats = new Map<string, AgentConnectionHeartbeat>();
-				const snapshots: Array<{ heartbeats?: AgentConnectionHeartbeat[]; response?: DaemonResponse }> =
-					await Promise.all(
-						workers.map(async (worker) => {
-							if (worker.client && worker.descriptor.lifecycle === "ready") {
-								const response = await this.forwardToWorker(worker, command, 5000).catch((error: unknown) =>
-									failure(command.id, command.type, error, serializeDaemonError(error)),
+				// Per-worker independence (F4). This was a Promise.all whose first failure
+				// response became the whole list's response and whose slowest worker set the
+				// latency, so one wedged worker burned the full forward budget on every
+				// session switch and one recovering worker hid every healthy heartbeat.
+				// Each worker now settles on its own and answers with its live list or, when
+				// that fails, its last complete snapshot; anything else is a counted absence.
+				const shares = await Promise.allSettled(
+					workers.map(async (worker): Promise<HeartbeatFanoutShare> => {
+						const workerId = worker.descriptor.workerId;
+						// A last complete snapshot answers whenever the worker has not said its
+						// heartbeats changed since; one it declared stale must not. Read at the
+						// point of use, because a heartbeats_changed frame can land mid-forward.
+						const freshSnapshot = (): AgentConnectionHeartbeat[] | undefined =>
+							worker.heartbeatSnapshot !== undefined && worker.heartbeatSnapshotStale !== true
+								? worker.heartbeatSnapshot
+								: undefined;
+						if (worker.client && worker.descriptor.lifecycle === "ready") {
+							const deadline = unrefDelay(HEARTBEAT_LIST_FANOUT_TIMEOUT_MS).then(() => {
+								throw new Error(
+									`Timed out listing heartbeats on worker ${workerId} within ${HEARTBEAT_LIST_FANOUT_TIMEOUT_MS}ms`,
 								);
-								if (response.success) {
-									const snapshot = heartbeatsFromResponse(response);
-									worker.heartbeatSnapshot = snapshot;
-									worker.heartbeatSnapshotStale = false;
-									return { heartbeats: snapshot };
-								}
-								this.log(`Could not list heartbeats from a worker: ${response.error}`);
-								if (worker.heartbeatSnapshot === undefined || worker.heartbeatSnapshotStale === true) {
-									return { response };
-								}
+							});
+							// Bounded as a whole, not just the request: the forward first joins an
+							// in-flight recovery whose budget is not ours to set.
+							const response = await Promise.race([
+								this.forwardToWorker(worker, command, HEARTBEAT_LIST_FANOUT_TIMEOUT_MS),
+								deadline,
+							]).catch((error: unknown) =>
+								failure(command.id, command.type, error, serializeDaemonError(error)),
+							);
+							if (response.success) {
+								const listed = heartbeatsFromResponse(response);
+								worker.heartbeatSnapshot = listed;
+								worker.heartbeatSnapshotStale = false;
+								return { workerId, heartbeats: listed };
 							}
-							if (worker.heartbeatSnapshot !== undefined && worker.heartbeatSnapshotStale !== true) {
-								return { heartbeats: worker.heartbeatSnapshot };
-							}
-							const state =
-								worker.descriptor.lifecycle === "ready" ? "disconnected" : worker.descriptor.lifecycle;
-							const error = new Error(`Cannot list heartbeats while session worker is ${state}`);
-							return { response: failure(command.id, command.type, error, serializeDaemonError(error)) };
-						}),
-					);
-				const failed = snapshots.find((snapshot) => snapshot.response)?.response;
-				if (failed) {
-					return failed;
-				}
-				for (const snapshot of snapshots) {
-					for (const heartbeat of snapshot.heartbeats ?? []) {
-						heartbeats.set(heartbeat.job.id, heartbeat);
+							const cached = freshSnapshot();
+							return cached === undefined
+								? { workerId, absence: response }
+								: { workerId, heartbeats: cached, absence: response };
+						}
+						const cached = freshSnapshot();
+						if (cached !== undefined) {
+							return { workerId, heartbeats: cached };
+						}
+						const state = worker.descriptor.lifecycle === "ready" ? "disconnected" : worker.descriptor.lifecycle;
+						const error = new Error(`Cannot list heartbeats while session worker is ${state}`);
+						return { workerId, absence: failure(command.id, command.type, error, serializeDaemonError(error)) };
+					}),
+				);
+				const absent: string[] = [];
+				let answered = 0;
+				let firstAbsence: DaemonResponse | undefined;
+				for (const share of shares) {
+					if (share.status === "rejected") {
+						// The attempt above catches its own failures, so a rejection is a defect:
+						// cost that worker's rows, never the healthy workers'.
+						firstAbsence ??= failure(command.id, command.type, share.reason, serializeDaemonError(share.reason));
+						absent.push(
+							`unknown worker (${share.reason instanceof Error ? share.reason.message : String(share.reason)})`,
+						);
+						continue;
 					}
+					if (share.value.heartbeats !== undefined) {
+						answered += 1;
+						for (const heartbeat of share.value.heartbeats) {
+							heartbeats.set(heartbeat.job.id, heartbeat);
+						}
+					}
+					const absence = share.value.absence;
+					if (absence === undefined) {
+						continue;
+					}
+					firstAbsence ??= absence;
+					absent.push(`${share.value.workerId} (${absence.success ? "no error reported" : absence.error})`);
+				}
+				// Total blindness is still a failure: an empty success would tell every
+				// client "no heartbeats armed" when in fact nothing could be asked.
+				if (answered === 0 && firstAbsence !== undefined) {
+					return firstAbsence;
+				}
+				if (absent.length > 0) {
+					this.log(
+						`heartbeats_list is partial: ${absent.length} of ${workers.length} workers could not answer: ${absent.join(", ")}`,
+					);
 				}
 				// Passivated sessions keep their armed heartbeats; no worker can list them.
 				for (const { job, info } of await this.collectPassiveScheduledJobs()) {
