@@ -2,20 +2,33 @@
 窗口：09-18 00:00 起 198 笔提交（HEAD 6c907da66）；12 席 K3（5 席围卡顿+7 席分面）+ 3 席 DS/GLM 异构复核。**窗口内提交零高危**（限读口径：窗内引入、在 12 席全审＋GLM 席 20 笔最高风险抽查可及面上未发现；抽样率 10%，67334bf1a 合并大单 4.7k 行无法行级完备——作为完备断言可信度评中偏上）；两条高危在主案的老代码里（见主案节）。
 
 ## 主案：TUI 主↔子切换卡 5-6 秒（已破案，双席独立证实）
-- 直接凶手：interactive-mode.ts:3278 `await refreshHeartbeatCatalog()` → daemon-supervisor.ts:3339/3378-3382 heartbeats_list 全员扇出、每 worker 5000ms、Promise.all 等最慢；一台 worker 楔死 ⇒ 每次切换烧满 5s。单 worker 失败还拖垮整次列表（:3404-3407）。
-- 楔死真身：worker 068f98d2df0f (pid 19503) 03:17 起 promise 自旋 100% CPU 40+ 分钟；**代码级定位：agent-session.ts:10905 `_waitForIdleOrSettlement`**——退出需 5 条件同真，而停泊分支(:10916)只在 pump-busy 时生效；_isBusyForSessionInput("pump")(:9764) 不含 isStreaming/refinementApply 但 canSelectSessionAction(:552-563) 含 ⇒ 「有排队动作+isStreaming 卡真+pump 不忙」时每圈追加新泵链永不退出。触发：杀子代理 teardown(_cancelRlmChildRun:15169)×终态通知入队(_enqueueRlmTerminalNoticeAction)×回合续跑，同 100ms 窗口叠加。CDP 三采同函数实锤。
+- 直接凶手：interactive-mode.ts:3278 `await refreshHeartbeatCatalog()` → daemon-supervisor.ts:3339/3378-3382 heartbeats_list 全员扇出、每 worker 5000ms、Promise.all 等最慢 ⇒ 每次切换烧满 5s（**复核订正：5s 是下限非上限**，扇出前可等 launch≤15s/recovery/被动任务收集；单 worker 失败拖垮整次列表代码属实但**本次大概率未触发**——楔死前的 fresh 缓存走了降档。5s 字面量引入订正：90b841996a **2026-07-16**，非 09-11）。
+- 楔死真身：worker 068f98d2df0f (pid 19503) 03:17 起 promise 自旋 100% CPU 40+ 分钟；**代码级定位：agent-session.ts:10905 `_waitForIdleOrSettlement`**——退出需 5 条件同真。DS 复核席反证订正：isStreaming/refinementApply「卡真⇒自旋」不成立（isStreaming=true ⇒ activeRun 在 ⇒ agent.waitForIdle() 返回未落定 promise ⇒ 自然停泊）。真实自旋形态只有两种：①unfinishedActionCount>0 且 queued==0（本轮无泵可调，三 await 全瞬时 resolve）；②disposing 期间仍有排队动作（park 被 !\_disposing 排除 + \_scheduleSessionInputPump 在 disposing 下提前 return）。触发：杀子代理 teardown(_cancelRlmChildRun:15169)×终态通知入队(_enqueueRlmTerminalNoticeAction)×回合续跑，同 100ms 窗口叠加。CDP 三采同函数实锤。
 - 待钉死：谁调的 waitForIdle（候选 wait_for_idle RPC/waitForRlmQuiescence/refine apply/压缩后续跑）、5 条件里谁卡死（isStreaming 卡真 vs 半途 notice 动作不算完）。
 - 历史复发：08-24/08-25/09-10/09-17 同型 attach 30s 超时。
 - 处置：僵尸已 SIGKILL（03:56），扇出回落 199ms，老板界面已恢复。
 
 
 ## 主案补完（review-daemon-reliability 阶段1）：自旋的自锁结构
-- 完整死锁环：①follow-up 注入留下 unfinished action；②teardown 置 _disposing=true，但 _disposeAsyncOnce(agent-session.ts:6509) 先 await 子会话/内核 dispose、最后才 this.dispose() 清队列；③waitForIdle 等待者落进 10906 循环——park 条件 10916 刻意排除 disposing（注释自证），三个 await 全立即 resolve，出口条件因 unfinishedActionCount!==0 永假；④**自锁：内核 dispose 需要事件循环跑 I/O，自旋饿死它 ⇒ dispose() 永不执行 ⇒ 队列永不清 ⇒ 环永续**。唯一出口＝外部杀 worker。一个会话自旋＝整 worker 死（共享事件循环）。
+- 完整死锁环：①follow-up 注入留下 unfinished action；②teardown 置 _disposing=true，但 _disposeAsyncOnce(agent-session.ts:6509) 先 await 子会话/内核 dispose、最后才 this.dispose() 清队列；③waitForIdle 等待者落进 10906 循环——park 条件 10916 刻意排除 disposing（注释自证），三个 await 全立即 resolve，出口条件因 unfinishedActionCount!==0 永假；④**自锁：内核 dispose 需要事件循环跑 I/O，自旋饿死它 ⇒ dispose() 永不执行**。DS 复核订正归因：「队列永不清」仅当滞留物是 queued 时成立；若滞留物是 committing/running 则 dispose() 跑完也清不动（CLEARABLE_STATES 只含 queued/selected/preparing）——结论更强但归因而异。唯一出口＝外部杀 worker。一个会话自旋＝整 worker 死（共享事件循环）。
 - supervisor 半侧实锤：forwardToWorker 对 probe 超时只 log+rethrow（daemon-supervisor.ts:7317-7326），socket 不断 ⇒ handleWorkerClose 不触发 ⇒ 永不判死。109 次超时零处置由此而来。
 - 两段病码都不是本窗口引入（park 来自 a31d520ce 09-12；超时档 09-11）⇒ 09-18/19 批次彻底洗清。
 - 修复候选（施工席二选一或并用）：a) 10916 park 不排除 disposing（dispose() 的 _cancelSessionActions 会经 _notifySessionInputCheckpointChange 唤醒 park）；b) disposeAsync 开头先同步 _cancelSessionActions 再 await 内核。
 
-## 修复方案（待老板拍板后施工）
+## DS 复核新发现（一行级可修）
+- _settleAbortedDispatchedTurnActions 谓词（queueVisible ‖ durable-notice 集合）漏 stall-notice 类动作（:8083-8094 建的 queueVisible:false 且不在集合）⇒ abort 当刻无人结算（实测 unfinished=1），只是被泵收尾兜住。修法：谓词放宽为「所有无 await 调用方的已落盘 dispatched turn」。
+- R1/FIX-Q8 提交信息里的 "stayed committing/running forever" 只有同步断言支撑，"立刻"是真价值、"否则永久"未钉。
+- supervisor「永不判死」表述要打折：既有恢复梯（adoption/recovery 置 recovering、recoverWorker 关 client、5 分钟 failed reaper）在，且设计取向是「identity 仍 current 的活 worker 故意继续探」⇒ 修复应限定为目录/请求面熔断＋记账降权，**不能无条件强杀活 worker**。
+
+## 修复方案（按 DS 复核重排：能验/低风险/止血快优先）
+a. interactive-mode.ts:3278 心跳目录改 fire-and-forget（一行级，消确定性 5s）【fix-switch-stall 席施工中，含扇出 per-worker 容错+部分结果】
+b. abort 结算谓词放宽（上条新发现）
+c. deferred 路径终态化已落盘动作 + disposeAsync 开头先同步清队列（**两者必配同批**）
+d. 保险丝：_waitForIdleOrSettlement 末尾 setImmediate 让出 + 零进展自检 log/break
+e. park 条件扩容放最后，且必须配超时轮询（落宏任务）或新唤醒源——否则把自旋换成 waiter 长挂、挡 passivation
+（原 5-8 项：切换占位 / supervisor 熔断改降权式 / 盘扫 stale-while-revalidate / session-info-cache schema bump 顺延）
+
+## 修复方案旧档（待老板拍板后施工）
 1. refreshHeartbeatCatalog 改 fire-and-forget（:3278 不 await，徽章后补）——消确定性 5s。【一行级】
 2. 扇出容错：per-worker 独立成败+先用缓存快照应答+超时降档。
 3. 切换加载占位（"正在打开…"），切入/切回双向。
@@ -54,13 +67,13 @@
 ## 补充环审查（daemon-reliability 终报）
 - 候选2【低】daemon-supervisor.ts:7426 attach validation 等待环：同 generation 的 begin 分支直接置 undefined 不结算旧 promise ⇒ 等待者挂起至 24h 档。
 - 候选3【低】resumeDeferredWorkerRecovery 每 5s 真定时器空转（不饿死，只贫转）。
-- 触发路径二（topbar-scan 实锤）：_pumpSessionInputs 的 deferred 错误路径（agent-session.ts:9641-9656）对已落盘动作不回滚不置败 ⇒ 永久漏在 committing/running ⇒ unfinishedActionCount 永 ≥1 ⇒ **活会话无需 teardown 也会在此后任何 waitForIdle 调用上自旋**（慢性病，人人有份）。
+- 触发路径二（topbar-scan 实锤）：_pumpSessionInputs 的 deferred 错误路径（agent-session.ts:9641-9656）对已落盘动作不回滚不置败 ⇒ 永久漏在 committing/running ⇒ unfinishedActionCount 永 ≥1 ⇒ 结构与dispose盲区成立（必修）；**但 DS 复核席实测：abort 路径的滞留 1-2 拍内被泵的普通收尾结算（非永久），「活会话自燃」的自然触发未证**（两个复现器均为手工造态，证明机制成立而非状态自然出现）。
 - 修复四候选：a) 落穿分支加 setImmediate 宏任务让出（保险丝）；b) dispose 窗口禁入 waitForIdle 族；c) deferred 路径已落盘动作显式置 failed；d) supervisor 超时连击 N 次强杀+广播死因。
 
 ## 收官补遗（switch-path-2）
 - 自旋复现成功：/tmp/spin-repro.ts 手造 committing 滞留+waitForIdle ⇒ 99% CPU 27 分钟、自身退出定时器被饿死——与线上签名逐帧吻合（红测雏形在此）。
 - 【关键补强】dispose() 也清不动 committing/running：_cancelSessionActions 默认只取 {queued,selected,preparing}（store 262-267）⇒ 修复项(c)（deferred 路径显式终态化已落盘动作）是**必修**不是选修。
-- 【历史复发机制】_prompt 非排队准入结尾 await waitForSessionInputIdle()（agent-session.ts:8602/8711）⇒ 一旦有动作滞留，老板按一次 Enter 活会话即自旋——08-24/08-25/09-10/09-17 同型 30s attach 超时大概率同根。
+- 【历史复发机制·已被复核推翻】「按 Enter 即自旋」不成立——waitForSessionInputIdle(:10887) 只等泵链，不是自旋函数；真实入口是 waitForIdle 族（wait_for_idle RPC、headless-completion、扩展 ctx 等）。08-24/25、09-10/17 的同型超时是否同根**未证**。
 - 【恢复安全性】恢复快照只含 queued 动作，滞留的 committing/running 不进快照 ⇒ 家族重开安全不复燃。
 - 修复补强：a) 落穿分支除 setImmediate 外加「零进展自检」（连续 N 次迭代四状态全不变 ⇒ log+break 报错）；d) supervisor 连击计数已有雏形（consecutiveFailures 字段），只差动作。
 
