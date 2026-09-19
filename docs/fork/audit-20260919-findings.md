@@ -28,6 +28,11 @@ d. 保险丝：_waitForIdleOrSettlement 末尾 setImmediate 让出 + 零进展�
 e. park 条件扩容放最后，且必须配超时轮询（落宏任务）或新唤醒源——否则把自旋换成 waiter 长挂、挡 passivation
 （原 5-8 项：切换占位 / supervisor 熔断改降权式 / 盘扫 stale-while-revalidate / session-info-cache schema bump 顺延）
 
+## 第二批备案（施工席建议、母席裁准）
+- 泵 blocked 早退回滚 preselected：会改变 accepted agent message 的 deferred 判定语义（10625/8689-8696），收尾期风险>收益，单独批次。
+- _settleAbortedDispatchedTurnActions 谓词放宽：需新增「caller-awaited」判别位，直接放宽会误纳 direct prompt、撞 R1 既有针，单独批次。
+- F6 supervisor 熔断降权、F7 盘扫 stale-while-revalidate、M1+L12-3 同批修、M2 preflight 拒绝补上、session-info-cache schema bump。
+
 ## 修复方案旧档（待老板拍板后施工）
 1. refreshHeartbeatCatalog 改 fire-and-forget（:3278 不 await，徽章后补）——消确定性 5s。【一行级】
 2. 扇出容错：per-worker 独立成败+先用缓存快照应答+超时降档。
@@ -66,7 +71,7 @@ e. park 条件扩容放最后，且必须配超时轮询（落宏任务）或新
 ## 补充环审查（daemon-reliability 终报）
 - 候选2【低】daemon-supervisor.ts:7426 attach validation 等待环：同 generation 的 begin 分支直接置 undefined 不结算旧 promise ⇒ 等待者挂起至 24h 档。
 - 候选3【低】resumeDeferredWorkerRecovery 每 5s 真定时器空转（不饿死，只贫转）。
-- 触发路径二（topbar-scan 实锤）：_pumpSessionInputs 的 deferred 错误路径（agent-session.ts:9641-9656）对已落盘动作不回滚不置败 ⇒ 永久漏在 committing/running ⇒ unfinishedActionCount 永 ≥1 ⇒ 结构与dispose盲区成立（必修）；**但 DS 复核席实测：abort 路径的滞留 1-2 拍内被泵的普通收尾结算（非永久），「活会话自燃」的自然触发未证**（两个复现器均为手工造态，证明机制成立而非状态自然出现）。
+- 触发路径二（topbar-scan 实锤）：_pumpSessionInputs 的 deferred 错误路径（agent-session.ts:9641-9656）对已落盘动作不回滚不置败 ⇒ 永久漏在 committing/running ⇒ unfinishedActionCount 永 ≥1 ⇒ 结构与dispose盲区成立（必修）；**DS 复核席曾判「自然触发未证」，fix-spin-core 席随后用纯公有 API 复现成功**（prompt 先落盘再抛错 + acquireQueuedWorkPause 推 epoch 判 deferred ⇒ unfinished 永为 1；test/suite/regressions/spin-deadlock-wait-for-idle.test.ts 针2）——自然触发链闭环。另实测补证 DS 推论：isStreaming 卡真形态只永挂不自旋（定时器不饿死）。。
 - 修复四候选：a) 落穿分支加 setImmediate 宏任务让出（保险丝）；b) dispose 窗口禁入 waitForIdle 族；c) deferred 路径已落盘动作显式置 failed；d) supervisor 超时连击 N 次强杀+广播死因。
 
 ## 收官补遗（switch-path-2）
