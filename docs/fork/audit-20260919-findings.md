@@ -28,6 +28,13 @@ d. 保险丝：_waitForIdleOrSettlement 末尾 setImmediate 让出 + 零进展�
 e. park 条件扩容放最后，且必须配超时轮询（落宏任务）或新唤醒源——否则把自旋换成 waiter 长挂、挡 passivation
 （原 5-8 项：切换占位 / supervisor 熔断改降权式 / 盘扫 stale-while-revalidate / session-info-cache schema bump 顺延）
 
+## F4/F5 复审结论（DS 席，带条件 PASS，无阻断）
+- 语义反转方向正确：新语义在每种可比情形下 ≥ 旧语义（健康 worker 拿最新、失败 worker 拿自己的最后完整快照）；「全瞎才失败」守住空目录语义。已另派 GLM 第二席专查「徽章缺席有无动作级后果」。
+- 生效面口径：F4a（fire-and-forget）覆盖两条切换路径；F4b（1s 扇出预算）只覆盖全局扇出，client-owned 会话的 25s 档不受其管。
+- 四个记账条件（入第二批）：C1 部分目录客户端不可区分（UI 弱提示或入文档）；C2 1s 预算「未被证伪≠被证成」，补边界针+成功时延打点；C3 超时日志 tier 名与实传预算不一致（一行级）；C4 「失败但有新鲜快照」新分支缺专属针。
+- 顺带发现的既有小缺口：连接被替换时新连接的 rebind 会并进旧连接的僵死 promise、本次刷新被静默吞（一行级可修，入第二批）。
+- 复审抽查 4 档变异复跑全部咬得住；占位残留实测为零（VirtualTerminal 双帧实证）。
+
 ## 第二批备案（施工席建议、母席裁准）
 - 泵 blocked 早退回滚 preselected：会改变 accepted agent message 的 deferred 判定语义（10625/8689-8696），收尾期风险>收益，单独批次。
 - _settleAbortedDispatchedTurnActions 谓词放宽：需新增「caller-awaited」判别位，直接放宽会误纳 direct prompt、撞 R1 既有针，单独批次。
