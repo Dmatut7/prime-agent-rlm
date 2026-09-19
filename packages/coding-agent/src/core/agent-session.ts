@@ -1933,7 +1933,44 @@ function parseAutonomousBudgetOptions(tokens: string[]): AgentAutonomousConfig {
 	return config;
 }
 
+/**
+ * Derivation counters for the RLM child streaming-scaling needle: the invariant
+ * "a streaming chunk pays O(delta), never a re-derive over the full text" is
+ * asserted by counting the derivations one run pays instead of timing them, so
+ * a loaded CI runner cannot flake the bound. Module-global on purpose: the
+ * derivations are module-level functions, so every call site counts - the
+ * streaming handler, the snapshot builder, or a regressed re-introduction of
+ * the pre-fix per-chunk re-derive. Production never reads or resets these;
+ * tests reset before a run and read after (StallFakeClock-style test seam).
+ */
+export interface RlmChildDeriveCounts {
+	/** Full-text preview derivations: compactRlmText calls plus the streaming accumulator's structural full-text fallback. */
+	fullTextPreview: number;
+	/** Label derivations: rlmChildLabel calls over a run's task brief. */
+	label: number;
+	/** Snapshot builds that reached the serializer in the child-update emitter. */
+	snapshotSerialize: number;
+	/** Characters the streaming fold actually processed: the consumed-length tracking keeps the run total O(text), never text-per-chunk. */
+	foldedChars: number;
+}
+
+export const rlmChildDeriveCounts: RlmChildDeriveCounts = {
+	fullTextPreview: 0,
+	label: 0,
+	snapshotSerialize: 0,
+	foldedChars: 0,
+};
+
+/** Reset {@link rlmChildDeriveCounts}. Test seam: production never resets it. */
+export function resetRlmChildDeriveCounts(): void {
+	rlmChildDeriveCounts.fullTextPreview = 0;
+	rlmChildDeriveCounts.label = 0;
+	rlmChildDeriveCounts.snapshotSerialize = 0;
+	rlmChildDeriveCounts.foldedChars = 0;
+}
+
 export function compactRlmText(text: string, maxLength = 160): string {
+	rlmChildDeriveCounts.fullTextPreview += 1;
 	const compact = text.replace(/\s+/g, " ").trim();
 	if (compact.length <= maxLength) {
 		return compact;
@@ -1945,6 +1982,7 @@ export function compactRlmText(text: string, maxLength = 160): string {
 // truncates to the visible width and elides shared prefixes, so capping here
 // would only hide the divergence between near-identical sibling prompts.
 export function rlmChildLabel(prompt: string): string {
+	rlmChildDeriveCounts.label += 1;
 	return prompt.replace(/\s+/g, " ").trim() || "child agent";
 }
 
@@ -1985,10 +2023,16 @@ class RlmChildStreamPreview {
 			lengths.push(block.text.length);
 		}
 		if (structural || lengths.length < this.foldedTextBlockLengths.length) {
+			// One exact full-text pass: counted like a compactRlmText call, with its
+			// length folded in, so a regression that pays this fallback per chunk
+			// re-derives O(text so far) visibly.
+			rlmChildDeriveCounts.fullTextPreview += 1;
+			const fullText = readAssistantText(message);
+			rlmChildDeriveCounts.foldedChars += fullText.length;
 			this.foldedTextBlockLengths = message.content
 				.filter((block) => block.type === "text")
 				.map((block) => (block.type === "text" ? block.text.length : 0));
-			this.buf = readAssistantText(message).replace(/\s+/g, " ");
+			this.buf = fullText.replace(/\s+/g, " ");
 			this.cappedResult = undefined;
 			this.applyCap();
 			return this.preview();
@@ -1997,6 +2041,11 @@ class RlmChildStreamPreview {
 		if (this.cappedResult === undefined) {
 			for (const delta of deltas) {
 				if (delta.length === 0) continue;
+				// Count the chars the fold processes: the needle bounds the total over a
+				// run, so a regression that re-folds the accumulated text every chunk
+				// (e.g. a per-chunk accumulator reset) is visible even without a
+				// compactRlmText call.
+				rlmChildDeriveCounts.foldedChars += delta.length;
 				// The window may carry one trailing space so a delta that opens with
 				// whitespace collapses against it, exactly like the full-text regex would.
 				this.buf = `${this.buf}${delta}`.replace(/\s+/g, " ");
@@ -16970,6 +17019,7 @@ export class AgentSession {
 			if (rlmChildEmitFieldsEqual(fields, run.lastEmittedFields)) return;
 			const snapshot = this._rlmChildSnapshotForRun(run, child);
 			const serialized = JSON.stringify(snapshot);
+			rlmChildDeriveCounts.snapshotSerialize += 1;
 			run.lastEmittedFields = fields;
 			if (serialized === run.lastEmittedUpdate) return;
 			run.lastEmittedUpdate = serialized;

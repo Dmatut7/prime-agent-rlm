@@ -1,0 +1,1 @@
+- Fixed the stream-scaling CI flake by replacing the wall-clock ratio assertion with deterministic derive counters (new `rlmChildDeriveCounts` test seam; zero production behavior change).

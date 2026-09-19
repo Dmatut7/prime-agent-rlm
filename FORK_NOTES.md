@@ -154,6 +154,7 @@
 
 | 段 | 机制 | 生产/活体实证 |
 |---|---|---|
+| 2026-09-19 中午 | **重启窗生效＋三件附带落地**：`6a5fbcc32` 教 harness 认识自己的工具面（系统提示补 `rlm.collect()` 完整字段清单——5 天 73 次猜错绝迹；`Tool not found` 报错附可用工具清单——幻觉调用一回合自愈）；flake 治理：`rlm-child-stream-scaling` 的计时比例针（三次加固仍在 CI 抖动）整维删除，改确定性计数探针（新 `rlmChildDeriveCounts` 测试缝，6 递增点，生产零行为变化；变异 4/4 红、10 连跑全绿）。窗后自证：扇出 315ms（案发时 ≥5000ms）、attach 即时应答 |
 | 2026-09-19 凌晨 | **主↔子切换卡死大审查＋首批修复**：老板报「切换视图 5-6 秒不显示」，12 席 K3 全审 09-18 全天 198 笔（窗内零高危；GLM 抽查 20 笔最高风险无误判）＋DS/GLM 三席异构复核（删 1 条陈旧发现、降 2 条过度断言、改 4 条措辞、0 条低估）。根因三证钉死（复现器 ×3 含 dist 真码注入）：`_waitForIdleOrSettlement` 在「非终态动作滞留＋本轮无泵可调／disposing 期有排队」时纯微任务自旋烧死 worker 事件循环（agent-session.ts:10905）；`heartbeats_list` 全员扇出 5s 硬超时被它拖满 ⇒ 每次切换必卡 5s（90b841996a，07-16 上游祖传）。**已交付 `58d0db497`（F4/F5）**：心跳目录从切换关键路径拿下改 fire-and-forget（interactive-mode.ts:3298）、扇出 5s→1s＋Promise.allSettled 部分目录＋失败 worker 回退自身最后快照（全瞎才失败）、切视图加「Opening…」占位（tui.ts 新 `flushRender()`）；红→绿→变异 10 档全咬得住、DS 复审带条件 PASS（C1-C6 记账入台账）。**F1-F3 治本同晚落地 `a9023f569`**（_waitForIdleOrSettlement 宏任务让出+16 圈零进展自愈报错、deferred 路径已落盘动作终态化、disposeAsync 前置幂等清算队列；红→绿→变异四档咬得住、DS 复审带条件 PASS）。台账 `docs/fork/audit-20260919-findings.md`（含复现器路径与回滚把手 `git revert 58d0db497`）。用户可感变化：worker 再楔死时心跳徽章可能短暂缺席（自治愈），切换不再卡死 |
 | ① 误杀 | stall 活性判据 =「当前 cell 最近写没写自己 stdout」；健康长活儿与死锁的可观测历史逐字节相同 | 43 次 abort 全部 silentMs≈900000、在飞工具 144/144 全是 ipython；37 个被砍 cell 只剩 19 字符「Request was aborted.」；活体探针 900.0 秒整被杀 |
 | ② 焊死 | requestAbort 不级联子代理、反而挂起父代理输入泵：子代理 send(parent) 一律硬抛、终态通知 5 分钟后静默丢弃、无法自愈 | 内核死后连 agent_message 都发不出（活体复现） |

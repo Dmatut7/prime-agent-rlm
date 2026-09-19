@@ -1,7 +1,6 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { performance } from "node:perf_hooks";
 import { Agent, type AgentTool, type StreamFn } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
@@ -18,6 +17,9 @@ import {
 	type AgentSessionEvent,
 	compactRlmText,
 	type RlmChildAgentSnapshot,
+	type RlmChildDeriveCounts,
+	resetRlmChildDeriveCounts,
+	rlmChildDeriveCounts,
 	rlmChildLabel,
 } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
@@ -185,36 +187,28 @@ describe("RLM child streaming parent-side cost", () => {
 	}
 
 	/**
-	 * Times the parent-side per-event listener work by wrapping the hosted child's
-	 * public subscribe(): the parent's streaming handler is one of its listeners and
-	 * runs synchronously inside the child's event emission, so the accumulated
-	 * listener wall time is the parent-side CPU the roster updates pay per chunk.
+	 * Hosts the child behind a subscribe() wrapper that runs perEvent inside the
+	 * child's event emission: the parent's streaming handler is one of its listeners
+	 * and runs synchronously inside the emission, so a control can inject work
+	 * exactly where the pre-fix implementation paid its per-chunk re-derive.
 	 */
-	function timedHostedChild(
-		streamFn: StreamFn,
-		perEvent?: (event: AgentSessionEvent) => void,
-	): { session: AgentSession; parentListenerMs(): number } {
+	function hookedHostedChild(streamFn: StreamFn, perEvent?: (event: AgentSessionEvent) => void): AgentSession {
 		const child = createSession(streamFn);
 		const originalSubscribe = child.subscribe.bind(child);
-		let listenerMs = 0;
 		vi.spyOn(child, "subscribe").mockImplementation((listener) =>
 			originalSubscribe((event) => {
-				const started = performance.now();
-				try {
-					perEvent?.(event);
-					listener(event);
-				} finally {
-					listenerMs += performance.now() - started;
-				}
+				perEvent?.(event);
+				listener(event);
 			}),
 		);
-		return { session: child, parentListenerMs: () => listenerMs };
+		return child;
 	}
 
 	/**
-	 * The pre-fix per-chunk work, replicated for calibration: re-derive the preview
-	 * from the whole accumulated text, re-derive the label over the 5k-char task
-	 * brief, and re-stringify the whole snapshot, once per chunk.
+	 * The pre-fix per-chunk work, replicated for the control leg: re-derive the
+	 * preview from the whole accumulated text and the label over the 5k-char task
+	 * brief, once per chunk, through the real derivation functions so the counting
+	 * probe sees exactly what a regressed implementation would pay.
 	 */
 	function preFixPerChunkWork(prompt: string): (text: string) => void {
 		return (text: string) => {
@@ -224,27 +218,16 @@ describe("RLM child streaming parent-side cost", () => {
 		};
 	}
 
-	/** Times the pre-fix re-derive over the same growing prefixes the stream produces. */
-	function timePreFixWork(prompt: string, finalText: string, chunkCount: number): number {
-		const preFixPerChunk = preFixPerChunkWork(prompt);
-		const chunkSize = Math.ceil(finalText.length / chunkCount);
-		const start = performance.now();
-		for (let offset = chunkSize; offset <= finalText.length; offset += chunkSize) {
-			preFixPerChunk(finalText.slice(0, offset));
-		}
-		return performance.now() - start;
-	}
-
 	it("does not re-derive the preview, label and snapshot from the full text per chunk", async () => {
 		const chunkText = "detail line about the quarterly numbers. ";
 		const chunkCount = 400;
 		const finalText = `quarterly summary: ${chunkText.repeat(chunkCount)}`;
 		const prompt = `Analyze the following report and produce a long answer: ${chunkText.repeat(120)}`;
-		// ~430 chunks of 40 chars: the answer grows past 17k characters.
-		const hosted = timedHostedChild(streamingAnswer(finalText, Math.ceil(finalText.length / chunkCount)));
+		// ~390 chunks of 42 chars: the answer grows past 16k characters.
+		const hosted = createSession(streamingAnswer(finalText, Math.ceil(finalText.length / chunkCount)));
 		const root = createSession(streamingAnswer("", 1), {
 			subagentRuntimeHost: {
-				createRlmSubagentRuntime: async () => ({ session: hosted.session }),
+				createRlmSubagentRuntime: async () => ({ session: hosted }),
 				deleteRlmSubagentRuntime: async () => {},
 			},
 		});
@@ -261,9 +244,10 @@ describe("RLM child streaming parent-side cost", () => {
 			}
 		});
 
+		resetRlmChildDeriveCounts();
 		await root.runRlmChild(prompt);
 		await done;
-		const parentListenerMs = hosted.parentListenerMs();
+		const counts: RlmChildDeriveCounts = { ...rlmChildDeriveCounts };
 
 		// Positive controls: the update channel keeps its semantics.
 		expect(updates.length).toBeGreaterThan(0);
@@ -276,30 +260,36 @@ describe("RLM child streaming parent-side cost", () => {
 		expect(updates.some((update) => update.activity?.kind === "writing")).toBe(true);
 		expect(updates.every((update) => update.label === finalUpdate?.label)).toBe(true);
 
-		// Before the incremental preview/label/snapshot work, each of the ~430 chunks
-		// re-joined the accumulated text, re-regexed it and the 5k-char task brief,
-		// and re-stringified the whole snapshot, so the parent-side listener work
-		// cost dozens of milliseconds. The fixed path folds only the new text, so
-		// the same stream costs a fraction of that. Relative bound, both sides
-		// measured in the same run: the replicated pre-fix work must cost at least
-		// 3x the live listener work. A regressed implementation pays the re-derive
-		// inside the listener itself, collapsing the ratio toward 1, while runner
-		// load stretches both sides together - so the ratio discriminates where an
-		// absolute ms ceiling flakes in both directions (too slow a runner, or a
-		// control that no longer clears a fixed floor on a fast one).
-		const preFixMs = timePreFixWork(prompt, finalText, chunkCount);
-		expect(preFixMs).toBeGreaterThanOrEqual(parentListenerMs * 3);
+		// The invariant, counted instead of timed: over the ~390-chunk stream the
+		// parent pays each O(full-text) derivation a bounded, chunk-independent
+		// number of times - the message_end recompute of the preview, the run-level
+		// label, and the handful of snapshot serializations a status or preview
+		// transition needs - and the fold's total work stays O(text): the length
+		// tracking makes every event fold only text it has not consumed yet, so
+		// each character is folded at most a couple of times over the whole run
+		// (a first event that carries the message ahead of its deltas pays one
+		// full pass; true-delta streams pay one pass total). The pre-fix path paid
+		// one derivation of each per chunk (~390 of each) and re-folded the whole
+		// accumulated text on every chunk (~390 full passes), so every counter
+		// must stay far below the stream's own scale. Counts are load-independent
+		// integers: the timing forms this replaced (absolute ms, then a 3x ratio)
+		// flaked on loaded CI runners (CI #296: expected 84.42 >= 92.81) because
+		// runner load stretches both sides of a wall-clock comparison, while
+		// nothing can stretch a counter.
+		expect(counts.fullTextPreview).toBeLessThan(chunkCount / 10);
+		expect(counts.label).toBeLessThan(chunkCount / 10);
+		expect(counts.snapshotSerialize).toBeLessThan(chunkCount / 10);
+		expect(counts.foldedChars).toBeLessThan(finalText.length * 2);
 	});
 
-	it("the relative bound still catches the pre-fix re-derive paid inside the listener", async () => {
-		// Bound control: the ratio above only discriminates if the work it forbids,
-		// paid where the pre-fix implementation paid it (inside the parent's
-		// listener, on every chunk), collapses it. Drive a hosted child whose
-		// stream runs the same per-chunk re-derive through the listener path and
-		// assert the listener cost itself rises above a third of the replicated
-		// re-derive - i.e. the 3x ratio the main test requires is impossible in the
-		// pre-fix world. A red control means the bound lost its discriminative
-		// power, not that the implementation regressed.
+	it("the derive counters see the pre-fix re-derive when it is paid per chunk", async () => {
+		// Control for the counting needle above: the bound only discriminates if
+		// the work it forbids, paid where the pre-fix implementation paid it (inside
+		// the parent's listener, on every chunk), lands in the counters. Drive a
+		// hosted child whose stream runs the same per-chunk re-derive through the
+		// listener path and assert both derivation counters saw it. A red control
+		// means the needle went vacuous (a regressed implementation could pay the
+		// re-derive uncounted), not that the implementation regressed.
 		const chunkText = "detail line about the quarterly numbers. ";
 		const chunkCount = 400;
 		const finalText = `quarterly summary: ${chunkText.repeat(chunkCount)}`;
@@ -307,16 +297,18 @@ describe("RLM child streaming parent-side cost", () => {
 		const chunkSize = Math.ceil(finalText.length / chunkCount);
 		const preFixPerChunk = preFixPerChunkWork(prompt);
 		let accumulatedText = "";
-		const hosted = timedHostedChild(streamingAnswer(finalText, chunkSize), (event) => {
+		let injectedDerives = 0;
+		const hosted = hookedHostedChild(streamingAnswer(finalText, chunkSize), (event) => {
 			if (event.type !== "message_update" || event.message.role !== "assistant") return;
 			for (const block of event.message.content) {
 				if (block.type === "text") accumulatedText = block.text;
 			}
 			preFixPerChunk(accumulatedText);
+			injectedDerives += 1;
 		});
 		const root = createSession(streamingAnswer("", 1), {
 			subagentRuntimeHost: {
-				createRlmSubagentRuntime: async () => ({ session: hosted.session }),
+				createRlmSubagentRuntime: async () => ({ session: hosted }),
 				deleteRlmSubagentRuntime: async () => {},
 			},
 		});
@@ -327,11 +319,50 @@ describe("RLM child streaming parent-side cost", () => {
 		root.subscribe((event) => {
 			if (event.type === "rlm_child_update" && event.child.status === "done" && resolveDone) resolveDone();
 		});
+		resetRlmChildDeriveCounts();
 		await root.runRlmChild(prompt);
 		await done;
-		const injectedListenerMs = hosted.parentListenerMs();
-		const preFixMs = timePreFixWork(prompt, finalText, chunkCount);
-		expect(injectedListenerMs).toBeGreaterThan(preFixMs / 3);
+		const counts: RlmChildDeriveCounts = { ...rlmChildDeriveCounts };
+		// The stream really carried chunk-scale assistant updates, and each
+		// injected derive paid one compactRlmText plus one rlmChildLabel: the
+		// counters must have seen at least that many.
+		expect(injectedDerives).toBeGreaterThan(chunkCount / 2);
+		expect(counts.fullTextPreview).toBeGreaterThanOrEqual(injectedDerives);
+		expect(counts.label).toBeGreaterThanOrEqual(injectedDerives);
+	});
+
+	it("counts the snapshot serialization and folded characters a below-cap stream pays", async () => {
+		// Controls for the snapshotSerialize and foldedChars legs of the counting
+		// needle: a below-cap answer still pays real serializations (every delivered
+		// update was preceded by one) and the fold really processes the answer (at
+		// least once over, whether the events carry deltas or the whole text ahead
+		// of them). If this reds while the main needle stays green, those bounds
+		// have gone vacuous - the counters no longer count what the emitter and
+		// the fold pay.
+		const chunkText = "word ";
+		const chunkCount = 8;
+		const finalText = `short answer: ${chunkText.repeat(chunkCount)}`;
+		const root = createSession(streamingAnswer(finalText, 5));
+		const updates: RlmChildAgentSnapshot[] = [];
+		let resolveDone: (() => void) | undefined;
+		const done = new Promise<void>((resolve) => {
+			resolveDone = resolve;
+		});
+		root.subscribe((event) => {
+			if (event.type === "rlm_child_update") {
+				updates.push(event.child);
+				if (event.child.status === "done" && resolveDone) resolveDone();
+			}
+		});
+		resetRlmChildDeriveCounts();
+		await root.runRlmChild("count words");
+		await done;
+		const counts: RlmChildDeriveCounts = { ...rlmChildDeriveCounts };
+		// Each delivered update was preceded by one counted serialization, and the
+		// fold processed the whole answer at least once.
+		expect(updates.length).toBeGreaterThan(5);
+		expect(counts.snapshotSerialize).toBeGreaterThanOrEqual(updates.length);
+		expect(counts.foldedChars).toBeGreaterThanOrEqual(finalText.length);
 	});
 
 	it("emits correct previews while the answer is still short", async () => {
