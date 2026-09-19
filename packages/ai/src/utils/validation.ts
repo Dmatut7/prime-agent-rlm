@@ -270,7 +270,7 @@ function formatValidationPath(error: TLocalizedValidationError): string {
 export function validateToolCall(tools: Tool[], toolCall: ToolCall): any {
 	const tool = tools.find((t) => t.name === toolCall.name);
 	if (!tool) {
-		throw new Error(`Tool "${toolCall.name}" not found`);
+		throw new Error(`Tool "${toolCall.name}" not found. Available tools: ${tools.map((t) => t.name).join(", ")}`);
 	}
 	return validateToolArguments(tool, toolCall);
 }

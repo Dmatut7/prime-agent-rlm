@@ -1,0 +1,1 @@
+- Documented the exact `rlm.collect()` snapshot fields in the system prompt (`session_name`, not `name`; dataclass attributes, not dict access), ending the recurring `.get`/`.name` guess errors.

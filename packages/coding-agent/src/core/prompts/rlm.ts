@@ -194,7 +194,7 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 			parts.push("Use `await rlm.list_subagents()` to recover direct child handles after admission.");
 		}
 		parts.push(
-			"Collect typed results with `await rlm.collect(targets=None, timeout_ms=0)`: one snapshot per direct child (status, settled, answer preview, error, `terminal_kind`, `stall_abort`) without steering anyone and without spending message caps. `timeout_ms` bounds only that call and never rejects - a timeout returns the current snapshots, so waiting is a poll, not a commitment.",
+			"Collect typed results with `await rlm.collect(targets=None, timeout_ms=0)`: one snapshot per direct child (status, settled, answer preview, error, `terminal_kind`, `stall_abort`) without steering anyone and without spending message caps. Snapshots are frozen dataclass instances, not dicts: read fields by attribute (`.session_name`, never `.get()`), and the field list is `rlm_child_id`, `session_name` (not `name`), `session_dir`, `status`, `settled`, `answer_preview`, `error`, `duration_ms`, `tool_use_count`, `replied_since_task`, `activity_kind`, `terminal_kind`, `terminal_reason`, `stall_abort`. `timeout_ms` bounds only that call and never rejects - a timeout returns the current snapshots, so waiting is a poll, not a commitment.",
 		);
 		if (hasAgentObserve) {
 			parts.push(
@@ -247,7 +247,7 @@ export function buildSubagentGuidance(
 		lines.push("Use `agent_observe` for bounded transcript inspection.");
 	}
 	lines.push(
-		"Fan in results with `await rlm.collect(targets=None, timeout_ms=0)`: it returns typed snapshots of your direct children (status, settled, answer preview, error, and this fork's `terminal_kind` / `stall_abort` markers) without steering anyone and without spending message caps. `timeout_ms` bounds only that call - a timeout returns the current snapshots instead of failing, the host caps one wait at its read-only request budget, and nothing is cancelled by it.",
+		"Fan in results with `await rlm.collect(targets=None, timeout_ms=0)`: it returns typed snapshots of your direct children (status, settled, answer preview, error, and this fork's `terminal_kind` / `stall_abort` markers) without steering anyone and without spending message caps. Snapshots are frozen dataclass instances, not dicts: read fields by attribute (`.session_name`, never `.get()`), and the field list is `rlm_child_id`, `session_name` (not `name`), `session_dir`, `status`, `settled`, `answer_preview`, `error`, `duration_ms`, `tool_use_count`, `replied_since_task`, `activity_kind`, `terminal_kind`, `terminal_reason`, `stall_abort`. `timeout_ms` bounds only that call - a timeout returns the current snapshots instead of failing, the host caps one wait at its read-only request budget, and nothing is cancelled by it.",
 		"Large child outputs belong in files that you read selectively; `collect` previews are compact by design, and a child that was killed by the stall watchdog still reports `status='done'`, so read `terminal_kind` before trusting a completion.",
 		"Delegate parallel context-heavy research or independent implementation; do a single known lookup, edit, or command inline.",
 	);
