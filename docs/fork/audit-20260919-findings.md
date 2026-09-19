@@ -28,6 +28,9 @@ d. 保险丝：_waitForIdleOrSettlement 末尾 setImmediate 让出 + 零进展�
 e. park 条件扩容放最后，且必须配超时轮询（落宏任务）或新唤醒源——否则把自旋换成 waiter 长挂、挡 passivation
 （原 5-8 项：切换占位 / supervisor 熔断改降权式 / 盘扫 stale-while-revalidate / session-info-cache schema bump 顺延）
 
+- 提交书两条断言收紧（DS 席订正）：「empty catalog 不发布」只在全员无应答时成立（空数组算 answered）；「徽章消失」限定为 stale+miss 组合窗口。
+- 回滚把手：`git revert 58d0db497`。复审指派：DS（review-f4f5-diff）主审 + GLM 二席查徽章缺席后果。
+
 ## F4/F5 复审结论（DS 席，带条件 PASS，无阻断）
 - 语义反转方向正确：新语义在每种可比情形下 ≥ 旧语义（健康 worker 拿最新、失败 worker 拿自己的最后完整快照）；「全瞎才失败」守住空目录语义。已另派 GLM 第二席专查「徽章缺席有无动作级后果」。
 - 生效面口径：F4a（fire-and-forget）覆盖两条切换路径；F4b（1s 扇出预算）只覆盖全局扇出，client-owned 会话的 25s 档不受其管。
