@@ -42,21 +42,20 @@ e. park 条件扩容放最后，且必须配超时轮询（落宏任务）或新
 ### 中
 - M1 context-tree.ts:1611-1615 缓存命中分支漏 addScanCharge → 父帧缓存永久少算命中子树统计，/context 截断标记可丢（review-topbar-scan）。**已机械实锤**：复现器 /tmp/charge-rollup-proof3.mts（三层树混合命中场景），回放 scannedChildren=3/bytesRead=2871 vs 真值 4/3613；**DS 复核席把后果证成**：暖命中后 truncated 标记消失、/context 的「还有 N 个未显示」警告不再打印而名册确实缺员（/tmp/recheck-m1-truncation.mts 三采实证）。引入 1917d1049，后续五笔未碰，测试无 mixed-scan charge 断言。
 - M2 preflight-push.sh:179-187 PRIME_AGENT_KERNEL_PYTHON 给错时 fail-open（自称 fail-closed）；——DS 复核订正措辞：真缺陷是**不拒绝**（该分支既不断 push 也不进 NOT-RUN 名单，收尾只打一行 faces red 仍印 preflight OK）；正控证明拒绝机制本身在别处是好的（review-ci-release 发现，xcheck-findings 机械复现）。
-### 低（15 条：L1-L14 + L16）
+### 低（14 条：L1-L14 中删 L5、L8 降备案，+ L16）
 - L1 删 harness 条目后删除新闻被重复投递 ~7KB（78af6fc4d 豁免覆盖不到自删；review-digest-ranking）。
 - L2 指纹严于渲染的过度投递（180 字符截断后改动照样重投；方向安全）。
 - L3 05c8f2972 位掩码串位（18 分钟窗口内已修 a5f4868c0，备案）。
 - L4 harness-search-parity 接口字段陈旧（rank→rank_positive）。
-- L5 check-process-smoke.sh usage 注释写错名。
 - L6 价格 memo 对摘要类条目永不命中（compaction.ts:124-148 每次新建对象；纯 perf 缺口）。
 - L7 fact-appendix prune 注释口径 overstated（localeCompare 决胜跨 locale 漂移；已有裁决 4feacb5ce）。
-- L8 _recoverSessionActions 恢复快照时人类 prompt 被降 background（agent-session.ts:8937-8944，触发链窄）。
+- L8【降为备案】_recoverSessionActions 掉档只影响 source=internal 行（RPC/daemon）；TUI 提交不受影响；有 pin 且 CHANGELOG 0.10.0 已登记为已知行为（DS 复核降级）。
 - L9 压缩闸 watchdog 单次触发自清，abort 被吞时 isCompacting 永真无重武装（:7428-7462，需更深故障叠加）。
 - L10 ci.yml hygiene job 两处自测双跑+一条腐注释（:454/:516, :461/:520, :512）。
 - L11 preflight-push.sh step2 第 60 次白等 20s。
 - L12 定价面 6 条：互斥标注同挂（subagent-summary-line.ts:101）、缓存浅拷贝共享引用（context-tree.ts:1184/1190）、回放绕过预算闸（:1111）、归因差口只钳负向、巨率溢出 $Infinity、subagentSpendCell 配置用 !==false。
-- L13 凭证隔离 SIGKILL 用例空转（stub 立即 exit，杀的是已退进程，名义命题不可证伪）；waitForProbe existsSync 已知 flake 类（f93cd9a4e，review-daemon-reliability）。
-- L14 压缩闸 watchdog 单槽位：branch summary 与 compaction 真并发时后者有窄窗无看门狗（9efce5abd）。
+- L13 凭证隔离 SIGKILL 用例空转（stub 立即 exit，杀的是已退进程，名义命题不可证伪）；waitForProbe existsSync 已知 flake 类（f93cd9a4e；DS 复核收窄：kill 腿空转属实但整用例仍有鉴别力，waitForProbe exists≠写完为真实 flake 类）。
+- L14 压缩闸 watchdog 单槽位：branch summary 与 compaction 真并发时后者有窄窗无看门狗（9efce5abd；DS 复核订正：窗口实为「后者整段无守卫」，实测可永久，窄的是触发条件）。
 - L16 tool-output-budget.ts 首行超预算按 UTF-16 码元切，可切裂代理对（装饰面）。
 ### 窗口内已修备案
 - 8ed6d73bc 的 mkdir 搬进循环 $REPORT 未绑定（4612e8953 已修）。
@@ -89,3 +88,13 @@ e. park 条件扩容放最后，且必须配超时轮询（落宏任务）或新
 ## 舰队事故（本会话教训）
 - 3 席真死（stopReason=toolUse 后回合戛止、文本断半句）：sub-82df0ec6、sub-8a5ca4b5、sub-e4d0816e。均 K3-max。死因未定位，疑似下一会话请求未发出。
 - 2 席假完工（collect 说 done 但实际还在 streaming）：audit-switch-path、audit-regression-diff——先 observe 再判救了一次误重派。
+
+
+## 异构复核终判（DS 席五路并行 + 亲验，2026-09-19）
+- M1/M2 维持中危（双机械复现；M1 后果证得更实：暖命中后「还有 N 个未显示」警告消失而名册缺员）。**M1 与 L12-3（回放绕过预算闸）是同一个 replay/rollup 记账面，修复必须同批**。
+- 删除 1 条：L5（错名在审查窗前 6.5 小时已被 8ed6d73bc 修掉，陈旧结论）。
+- 降级 2 条：L8（→备案）、L15-b（「活会话自燃/永久」不成立，泵 1-2 拍内自行终态化；残留仅 queueVisible:false 且未注册进 durable-notice 集合的两类动作）。
+- 措辞订正 4 条：L13/L14/候选2/L9（「无重武装」不成立，多处独立重武装）。
+- 拆分 2 条：L12-6（①不成立=成文设计 ②畸形值读成 true 成立）；L15（a 高维持但触发理由改写为「非终态动作+三 await 全 resolve ⇒ 不可自愈+处置窗自锁」）。
+- 升级：0 条（含 2 万次 fuzz 否掉两条升级假设）。备案1 症状订正：set -uo pipefail 无 -e，不是中止而是静默空转。
+- 复核自证口径：M1/M2/L12-3 走真实模块导入复现；判"低"且靠"当前无调用方"支撑的条目（L12-2、L8）只保证读码+pin 范围内成立。
