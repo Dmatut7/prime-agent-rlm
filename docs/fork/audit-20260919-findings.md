@@ -38,7 +38,21 @@ e. park 条件扩容放最后，且必须配超时轮询（落宏任务）或新
 - 顺带发现的既有小缺口：连接被替换时新连接的 rebind 会并进旧连接的僵死 promise、本次刷新被静默吞（一行级可修，入第二批）。
 - 复审抽查 4 档变异复跑全部咬得住；占位残留实测为零（VirtualTerminal 双帧实证）。
 
+## 主案修复落地记录
+- F4/F5＝58d0db497（切换卡 5s），DS 复审带条件 PASS，已推远程。
+- F1/F2/F3＝a9023f569（自旋死锁治本），红→绿→变异三发咬得住；M4（park 有界轮询 6 行）为无针防御纵深，母席裁决保留（所有通知点实测齐备，该轮询防未来新增路径忘通知）。4603-worker-recovery 的 1 红定性为先前存在（该针字典序/数值序不自洽，HEAD 与 HEAD~1 单跑均绿），另派修复。
+- 回滚把手：`git revert a9023f569`、`git revert 58d0db497`。
+
+## 主案修复复审条件（a9023f569，DS+GLM 双席，带条件 PASS 无阻断）
+- C1 保险丝负半边无针（机械实证：白名单删 bash 项，针仍绿、等待 4490→1607ms 提前返回）——补「有主在跑不许放弃」针。
+- C2 保险丝放弃是静默 return——建议随调用方结果走或 headless 侧复核 hasPendingSessionWork（K3Q-1 先例）。
+- C3 自愈的 sessionLog.error 报告半边无针——补针或明写防御纵深。
+- C4 前置清算把 undelivered sidecar 窗口加宽 ⇒ 重启可能重复投递一条 agent 消息/终态通知（可见重复、非死锁）——修法：persist 保持晚位或加 durable 门控。
+- C5 前置清算不在 try 内——抛错会跳过后续 teardown（静态未见抛点；加 3 行 try/catch 保险）。
+- fixture 注释与实现不符（strandSelectedOrphan 注释说会派发，实测靠保险丝返回）——改注释；该 fixture 同时登记为「泵 blocked 早退 selected 孤儿」未修项的复现件。
+
 ## 第二批备案（施工席建议、母席裁准）
+- 【升级·批首】泵 blocked 早退的 selected 孤儿＝**静默丢一轮用户输入**（实测无任何派发源，等下次输入才救活；/tmp/orphan_dbg.mts 配方可直接复用当针）——修法 rollback preselected，注意 _observeSessionActionDeferral 语义波及面。
 - 泵 blocked 早退回滚 preselected：会改变 accepted agent message 的 deferred 判定语义（10625/8689-8696），收尾期风险>收益，单独批次。
 - _settleAbortedDispatchedTurnActions 谓词放宽：需新增「caller-awaited」判别位，直接放宽会误纳 direct prompt、撞 R1 既有针，单独批次。
 - F6 supervisor 熔断降权、F7 盘扫 stale-while-revalidate、M1+L12-3 同批修、M2 preflight 拒绝补上、session-info-cache schema bump。
