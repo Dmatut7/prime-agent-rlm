@@ -1,5 +1,5 @@
 # 2026-09-19 凌晨大审查·发现汇总台账（母席维护，持续更新）
-窗口：09-18 00:00 起 198 笔提交（HEAD 6c907da66）；12 席 K3（5 席围卡顿+7 席分面）。全场零高危。
+窗口：09-18 00:00 起 198 笔提交（HEAD 6c907da66）；12 席 K3（5 席围卡顿+7 席分面）+ 3 席 DS/GLM 异构复核。**窗口内提交零高危**（限读口径：窗内引入、在 12 席全审＋GLM 席 20 笔最高风险抽查可及面上未发现；抽样率 10%，67334bf1a 合并大单 4.7k 行无法行级完备——作为完备断言可信度评中偏上）；两条高危在主案的老代码里（见主案节）。
 
 ## 主案：TUI 主↔子切换卡 5-6 秒（已破案，双席独立证实）
 - 直接凶手：interactive-mode.ts:3278 `await refreshHeartbeatCatalog()` → daemon-supervisor.ts:3339/3378-3382 heartbeats_list 全员扇出、每 worker 5000ms、Promise.all 等最慢；一台 worker 楔死 ⇒ 每次切换烧满 5s。单 worker 失败还拖垮整次列表（:3404-3407）。
@@ -27,9 +27,9 @@
 
 ## 审查发现账（按严重度）
 ### 中
-- M1 context-tree.ts:1611-1615 缓存命中分支漏 addScanCharge → 父帧缓存永久少算命中子树统计，/context 截断标记可丢（review-topbar-scan）。**已机械实锤**：复现器 /tmp/charge-rollup-proof3.mts（三层树混合命中场景），回放 scannedChildren=3/bytesRead=2871 vs 真值 4/3613；若丢的 charge 带 truncated=true，暖命中会把截断树报成完整。引入 1917d1049，后续五笔未碰，测试无 mixed-scan charge 断言。
-- M2 preflight-push.sh:179-187 PRIME_AGENT_KERNEL_PYTHON 给错时 fail-open（自称 fail-closed）；且不查 PREFLIGHT_KERNEL_REASON 逃生门，PREFLIGHT_REQUIRE_ALL_FACES=1 也拦不住（review-ci-release）。
-### 低（14 条）
+- M1 context-tree.ts:1611-1615 缓存命中分支漏 addScanCharge → 父帧缓存永久少算命中子树统计，/context 截断标记可丢（review-topbar-scan）。**已机械实锤**：复现器 /tmp/charge-rollup-proof3.mts（三层树混合命中场景），回放 scannedChildren=3/bytesRead=2871 vs 真值 4/3613；**DS 复核席把后果证成**：暖命中后 truncated 标记消失、/context 的「还有 N 个未显示」警告不再打印而名册确实缺员（/tmp/recheck-m1-truncation.mts 三采实证）。引入 1917d1049，后续五笔未碰，测试无 mixed-scan charge 断言。
+- M2 preflight-push.sh:179-187 PRIME_AGENT_KERNEL_PYTHON 给错时 fail-open（自称 fail-closed）；——DS 复核订正措辞：真缺陷是**不拒绝**（该分支既不断 push 也不进 NOT-RUN 名单，收尾只打一行 faces red 仍印 preflight OK）；正控证明拒绝机制本身在别处是好的（review-ci-release 发现，xcheck-findings 机械复现）。
+### 低（15 条：L1-L14 + L16）
 - L1 删 harness 条目后删除新闻被重复投递 ~7KB（78af6fc4d 豁免覆盖不到自删；review-digest-ranking）。
 - L2 指纹严于渲染的过度投递（180 字符截断后改动照样重投；方向安全）。
 - L3 05c8f2972 位掩码串位（18 分钟窗口内已修 a5f4868c0，备案）。
@@ -44,7 +44,6 @@
 - L12 定价面 6 条：互斥标注同挂（subagent-summary-line.ts:101）、缓存浅拷贝共享引用（context-tree.ts:1184/1190）、回放绕过预算闸（:1111）、归因差口只钳负向、巨率溢出 $Infinity、subagentSpendCell 配置用 !==false。
 - L13 凭证隔离 SIGKILL 用例空转（stub 立即 exit，杀的是已退进程，名义命题不可证伪）；waitForProbe existsSync 已知 flake 类（f93cd9a4e，review-daemon-reliability）。
 - L14 压缩闸 watchdog 单槽位：branch summary 与 compaction 真并发时后者有窄窗无看门狗（9efce5abd）。
-- L15 主案两发现升级【高】：自旋本体（_waitForIdleOrSettlement 落穿微任务环）+ 第二独立触发（deferred 错误路径漏 committing/running 态，活会话即可自燃，agent-session.ts:9641-9656）。
 - L16 tool-output-budget.ts 首行超预算按 UTF-16 码元切，可切裂代理对（装饰面）。
 ### 窗口内已修备案
 - 8ed6d73bc 的 mkdir 搬进循环 $REPORT 未绑定（4612e8953 已修）。
@@ -65,7 +64,12 @@
 - 【恢复安全性】恢复快照只含 queued 动作，滞留的 committing/running 不进快照 ⇒ 家族重开安全不复燃。
 - 修复补强：a) 落穿分支除 setImmediate 外加「零进展自检」（连续 N 次迭代四状态全不变 ⇒ log+break 报错）；d) supervisor 连击计数已有雏形（consecutiveFailures 字段），只差动作。
 
-## 复现双证（两席独立）
+## 复现三证（三席独立）
+- switch-path-2 /tmp/spin-repro.ts：99% CPU 27 分钟，自身 8s 退出定时器被饿死。
+- regression-diff 最小复现：正控通过；造出 committing 滞留后 waitForIdle 把 2s 观察与 8s 硬退定时器全部饿死。修复方向细化：停泊条件从「queued>0 && pump-busy」扩成「unfinished>0 且本轮无泵可调」，在 checkpoint waiter 上停泊。
+- block-qualia-2 /tmp/spin_proof.mjs：**用 dist 真码注入假 this 复现**（agent.waitForIdle 被调数十万次、setTimeout/setImmediate 全饿死 1.5s+）。
+- 触发链精化：abort 的两张终结网漏「queueVisible 的 selected 动作」——取消网要 !queueVisible（:11038-42）、终结网要 committing/running（:11091-92），selected 落缝成孤儿；孤儿生产者=泵 blocked 早退（:9566-72，preselected 不回滚且不重排泵）。
+- 修复细化（block-qualia-2）：queued==0 时注册 _sessionInputCheckpointWaiters 停车（26 处既有通知点必唤醒）；泵 blocked 早退时对 preselected 回滚；get_context_tree 改 stale-while-revalidate（先回旧树+异步重扫）。
 - switch-path-2 /tmp/spin-repro.ts：99% CPU 27 分钟，自身 8s 退出定时器被饿死。
 - regression-diff 最小复现：正控通过；造出 committing 滞留后 waitForIdle 把 2s 观察与 8s 硬退定时器全部饿死。修复方向细化：停泊条件从「queued>0 && pump-busy」扩成「unfinished>0 且本轮无泵可调」，在 checkpoint waiter 上停泊。
 
