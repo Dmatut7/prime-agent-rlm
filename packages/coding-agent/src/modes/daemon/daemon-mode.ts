@@ -203,6 +203,7 @@ import {
 	inactiveLifecycleForSession,
 	type SessionSummary,
 	scheduledJobRegistrations,
+	sessionDisplayLabels,
 	summaryForActiveSession,
 	summaryWithoutStreamingMessage,
 } from "./daemon-session-list.js";
@@ -2387,11 +2388,14 @@ export class AgentDaemon {
 			.filter((job) => isHeartbeatCronJob(job) && (job.status === "active" || job.status === "paused"))
 			.map((job) => {
 				const state = this.sessions.get(job.activeSessionId);
-				const summary = state ? summaryForActiveSession(state) : undefined;
+				// Only the two display fields are needed here, and this runs per
+				// registered job per poll: composing a full summary for each one made the
+				// heartbeat poll cost scale with sessions x messages.
+				const labels = state ? sessionDisplayLabels(state) : undefined;
 				return {
 					job,
-					...(summary?.sessionName ? { sessionName: summary.sessionName } : {}),
-					...(summary?.firstMessage ? { firstMessage: summary.firstMessage } : {}),
+					...(labels?.sessionName ? { sessionName: labels.sessionName } : {}),
+					...(labels?.firstMessage ? { firstMessage: labels.firstMessage } : {}),
 				};
 			});
 	}

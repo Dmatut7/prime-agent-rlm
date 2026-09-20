@@ -529,6 +529,32 @@ describe("worker roster reporter", () => {
 		await new Promise((resolveSettle) => setImmediate(resolveSettle));
 		expect(internals.rosterReporter.lastComposed.get(agentId)?.summary.model).toMatchObject({ id: "m2" });
 	});
+
+	it("republishes busy-state flips that arrive without any append", () => {
+		const { daemon, sentDeltas } = makeWorkerReporter();
+		const state = makeState({ activeSessionId: "busy-active", sessionId: "busy-session", messages: [] });
+		daemon.sessions.set(state.activeSessionId, state);
+
+		daemon.flushRoster();
+		expect(sentDeltas.at(-1)?.entries.some((entry) => entry.summary.isStreaming === false)).toBe(true);
+
+		// turn_start / bash_start / compaction_start schedule flushes with no message
+		// appended. The compose memo keys on the busy bits as well as the message count, so
+		// the row must recompose and republish rather than reuse the idle snapshot.
+		const session = state.runtime.session as unknown as { isStreaming: boolean; isSessionActive: boolean };
+		session.isStreaming = true;
+		session.isSessionActive = true;
+		daemon.flushRoster();
+		const delta = sentDeltas.at(-1);
+		expect(delta?.entries).toHaveLength(1);
+		expect(delta?.entries[0]?.summary).toMatchObject({ isStreaming: true, activity: "working" });
+
+		// Back to idle: the row recomposes again, still with no append.
+		session.isStreaming = false;
+		session.isSessionActive = false;
+		daemon.flushRoster();
+		expect(sentDeltas.at(-1)?.entries[0]?.summary).toMatchObject({ isStreaming: false, activity: "idle" });
+	});
 });
 
 // --- Supervisor-side roster ledger ---

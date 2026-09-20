@@ -234,6 +234,98 @@ export function buildSessionList(
 	return entries;
 }
 
+// Compose memos, keyed weakly by session state so entries die with the session.
+// Roster flushes and the eleven non-flush compose sites re-compose every active session
+// summary on every event; with large sessions that meant a full message walk plus a full
+// compose per session per call. The activity memo keeps the timestamp scan incremental, and
+// the fingerprint memo returns the last composed summary (same object) whenever every input
+// that feeds it is unchanged.
+const messageActivityMemos = new WeakMap<ActiveSessionState, MessageActivityMemo>();
+const summaryComposeMemos = new WeakMap<
+	ActiveSessionState,
+	{ fingerprint: SummaryComposeFingerprint; summary: SessionSummary }
+>();
+
+/**
+ * Cheap snapshot of every summary input; any difference forces a fresh compose.
+ *
+ * Leaf id and message count alone are not a sufficient key: isStreaming, isBashRunning,
+ * isCompacting, attachment counts, the summary verdict, and the heartbeat/cron flags all
+ * change without a single append, and the daemon schedules roster flushes at exactly those
+ * edges. Comparing the full input set keeps the memoized summary byte-identical to a fresh
+ * compose.
+ *
+ * The three fork-only inputs are load-bearing, not decoration:
+ * - `isKernelWorkInFlight` is folded into `isSessionActive` below, which is the carrier of the
+ *   kernel-residency fact across the process boundary (LIVE-1, r44: canEvictWorker and
+ *   isEvictableEmptySessionSummary read it and cannot see a kernel themselves). It changes
+ *   with the orphan-process journal and its TTL cache, i.e. with wall-clock time and no other
+ *   summary input, so freezing it would silently reopen r44 form A.
+ * - `stall` is this fork's summary field, read by the agents view for the stall label and
+ *   driven by the stall watchdog's own timers. It is compared by value: the watchdog replaces
+ *   the object, and a reference compare would either miss an in-place change or, if the object
+ *   were rebuilt per read, never hit the memo at all.
+ * - `spawnCode` is this fork's spawn-cell source on the summary.
+ */
+interface SummaryComposeFingerprint {
+	// Caller inputs: registration flags vary per compose site, and the saved catalog entry
+	// (when present) feeds created/modified/firstMessage/parentSessionPath.
+	hasActiveHeartbeat: boolean;
+	hasRegisteredHeartbeat: boolean;
+	hasRegisteredCronJob: boolean;
+	savedSession: SessionInfo | undefined;
+	// Busy-state bits flip without appends (turn, bash, compaction, tool edges).
+	isStreaming: boolean;
+	isCompacting: boolean;
+	isBashRunning: boolean;
+	pendingToolCallsSize: number;
+	isSessionActive: boolean;
+	isKernelWorkInFlight: boolean;
+	hasRunningRlmChildren: boolean;
+	unfinishedActionCount: number;
+	attachedClients: number;
+	directAttachedClients: number;
+	messageCount: number;
+	// References: replaced on change (model, summaryState, streamingMessage), or structural
+	// (sessionActions, diagnostics: post-construction changes replace the array or append).
+	// `usage` and `stall` are compared by value, not identity: in this fork
+	// getOwnUsageSummary() builds a fresh SessionUsageSummary per call (upstream caches one),
+	// so an identity compare would make the memo unreachable for every session that has spent
+	// anything - the whole optimization would silently no-op.
+	usage: SessionUsageSummary | undefined;
+	model: Model<Api> | undefined;
+	thinkingLevel: ThinkingLevel | undefined;
+	streamingMessage: AgentMessage | undefined;
+	summaryState: ActiveSessionState["summaryState"];
+	diagnostics: readonly AgentSessionRuntimeDiagnostic[];
+	repliedSinceTask: boolean | undefined;
+	sessionActions: SessionActionSnapshot;
+	// A copy, compared by value: the stall watchdog owns the live object, so a fingerprint
+	// holding the same reference could not see an in-place edit (left === right would be true),
+	// and a getter that rebuilt the object per read would never hit the memo at all.
+	stall: RlmChildStallState | undefined;
+	// Identity and display inputs: the metadata getter returns a fresh copy on every read, so
+	// its summary-relevant fields compare by value.
+	metadataKind: string;
+	metadataParentActiveSessionId: string | undefined;
+	metadataParentSessionId: string | undefined;
+	metadataParentSessionFile: string | undefined;
+	metadataRlmChildId: string | undefined;
+	metadataRlmParentNodeId: string | undefined;
+	sessionName: string | undefined;
+	sessionId: string;
+	sessionFile: string | undefined;
+	cwd: string;
+	rlmDepth: number | undefined;
+	spawnCode: string | undefined;
+	modelFallbackMessage: string | undefined;
+	// Values computed once per attempt and shared with the compose.
+	headerTimestamp: string | undefined;
+	modified: string | undefined;
+	lastActivityAt: string | undefined;
+	firstMessage: string | undefined;
+}
+
 export function summaryForActiveSession(
 	activeSession: ActiveSessionState,
 	savedSession?: SessionInfo,
@@ -255,7 +347,78 @@ export function summaryForActiveSession(
 	const directAttachedClients = [...activeSession.clients].filter(
 		(client) => client.authenticationRole === "session_client",
 	).length;
-	return {
+	// Read once and shared between the fingerprint and the compose, so a memo hit cannot
+	// disagree with what the summary says and an expensive getter is not called twice.
+	const isKernelWorkInFlight = session.isKernelWorkInFlight === true;
+	const stall = session.stallState;
+	const spawnCode = metadata.spawnCode ? metadata.spawnCode.slice(0, SPAWN_CODE_MAX_CHARS) : undefined;
+	// The activity memo folds only messages appended since the last scan.
+	let activityMemo = messageActivityMemos.get(activeSession);
+	if (activityMemo === undefined) {
+		activityMemo = { source: undefined, scannedLength: 0, tailRef: undefined, latest: undefined };
+		messageActivityMemos.set(activeSession, activityMemo);
+	}
+	const headerTimestamp = session.sessionManager.getHeader?.()?.timestamp;
+	const lastActivityAt = latestMessageActivityAt(session.messages, activityMemo) ?? modified ?? headerTimestamp;
+	// Subagent sessions live in artifact dirs that the saved-session scan never sees; their
+	// spawn prompt is the most identifying title we have. A freshly created top-level session
+	// has neither yet - its jsonl is not scanned until it flushes - so derive from the live
+	// first user message to avoid titling the chat with its session ID until the file lands.
+	const firstMessage =
+		savedSession?.firstMessage ??
+		(metadata.prompt ? compactRlmText(metadata.prompt, 120) : undefined) ??
+		firstUserMessageText(session);
+
+	const fingerprint: SummaryComposeFingerprint = {
+		hasActiveHeartbeat,
+		hasRegisteredHeartbeat,
+		hasRegisteredCronJob,
+		savedSession,
+		isStreaming: session.isStreaming,
+		isCompacting: session.isCompacting,
+		isBashRunning: session.isBashRunning,
+		pendingToolCallsSize: session.state.pendingToolCalls.size,
+		isSessionActive: session.isSessionActive,
+		isKernelWorkInFlight,
+		hasRunningRlmChildren: session.hasRunningRlmChildren(),
+		unfinishedActionCount: session.unfinishedActionCount,
+		attachedClients: activeSession.clients.size,
+		directAttachedClients,
+		messageCount: session.messages.length,
+		usage: session.getOwnUsageSummary?.(),
+		model: session.model as Model<Api> | undefined,
+		thinkingLevel: session.thinkingLevel,
+		streamingMessage: session.state.streamingMessage,
+		summaryState: activeSession.summaryState,
+		diagnostics: activeSession.runtime.diagnostics,
+		repliedSinceTask: metadata.kind === "subagent" ? session.repliedToParentSinceTask : undefined,
+		sessionActions: session.getSessionActionSnapshot(),
+		stall: snapshotStallState(stall),
+		metadataKind: metadata.kind,
+		metadataParentActiveSessionId: metadata.parentActiveSessionId,
+		metadataParentSessionId: metadata.parentSessionId,
+		metadataParentSessionFile: metadata.parentSessionFile,
+		metadataRlmChildId: metadata.rlmChildId,
+		metadataRlmParentNodeId: metadata.rlmParentNodeId,
+		sessionName: session.sessionName,
+		sessionId: session.sessionId,
+		sessionFile: session.sessionFile,
+		cwd: session.sessionManager.getCwd(),
+		rlmDepth: session.rlmDepth,
+		spawnCode,
+		modelFallbackMessage: activeSession.runtime.modelFallbackMessage,
+		headerTimestamp,
+		modified,
+		lastActivityAt,
+		firstMessage,
+	};
+
+	const memo = summaryComposeMemos.get(activeSession);
+	if (memo && summaryComposeFingerprintsEqual(memo.fingerprint, fingerprint)) {
+		return memo.summary;
+	}
+
+	const summary: SessionSummary = {
 		id: activeSession.activeSessionId,
 		lifecycle: activeLifecycleForSession(activeSession),
 		activity: activeActivityForSession(activeSession),
@@ -273,12 +436,11 @@ export function summaryForActiveSession(
 		// test/suite/live-kernel-work-residency.test.ts. The worker-side passivation snapshot also
 		// carries the fact as its own term (daemon-mode.ts sessionPassivationSnapshot ->
 		// SessionEvictionSnapshot.hasLiveKernelWork); that one is defence in depth, this one is not.
-		isSessionActive: session.isSessionActive || session.isKernelWorkInFlight === true,
+		isSessionActive: session.isSessionActive || isKernelWorkInFlight,
 		hasActiveHeartbeat: hasActiveHeartbeat || undefined,
 		hasRegisteredHeartbeat: hasRegisteredHeartbeat || undefined,
 		hasRegisteredCronJob: hasRegisteredCronJob || undefined,
-		lastActivityAt:
-			latestMessageActivityAt(session.messages) ?? modified ?? session.sessionManager.getHeader?.()?.timestamp,
+		lastActivityAt,
 		runtimeKind: metadata.kind,
 		rlmDepth: session.rlmDepth,
 		activeSessionId: activeSession.activeSessionId,
@@ -292,7 +454,7 @@ export function summaryForActiveSession(
 		isCompacting: session.isCompacting,
 		isBashRunning: session.isBashRunning,
 		hasRunningRlmChildren: session.hasRunningRlmChildren(),
-		stall: session.stallState,
+		stall,
 		usage: session.getOwnUsageSummary?.(),
 		isRunningTools: session.isStreaming && session.state.pendingToolCalls.size > 0,
 		attachedClients: activeSession.clients.size,
@@ -301,17 +463,9 @@ export function summaryForActiveSession(
 		unfinishedActionCount: session.unfinishedActionCount,
 		sessionActions: session.getSessionActionSnapshot(),
 		streamingMessage: session.state.streamingMessage,
-		created: savedSession?.created.toISOString() ?? session.sessionManager.getHeader?.()?.timestamp,
+		created: savedSession?.created.toISOString() ?? headerTimestamp,
 		modified,
-		// Subagent sessions live in artifact dirs that the saved-session scan
-		// never sees; their spawn prompt is the most identifying title we have.
-		// A freshly created top-level session has neither yet — its jsonl is not
-		// scanned until it flushes — so derive from the live first user message to
-		// avoid titling the chat with its session ID until the file lands.
-		firstMessage:
-			savedSession?.firstMessage ??
-			(metadata.prompt ? compactRlmText(metadata.prompt, 120) : undefined) ??
-			firstUserMessageText(session),
+		firstMessage,
 		parentActiveSessionId: metadata.parentActiveSessionId,
 		parentSessionId: metadata.parentSessionId,
 		parentSessionPath: savedSession?.parentSessionPath ?? metadata.parentSessionFile,
@@ -320,9 +474,9 @@ export function summaryForActiveSession(
 			? { repliedSinceTask: session.repliedToParentSinceTask }
 			: {}),
 		rlmParentNodeId: metadata.rlmParentNodeId,
-		// Cap the cell source so the summary stays small on the daemon wire; the
-		// agents view truncates further for display.
-		spawnCode: metadata.spawnCode ? metadata.spawnCode.slice(0, SPAWN_CODE_MAX_CHARS) : undefined,
+		// Capped above so the summary stays small on the daemon wire; the agents view
+		// truncates further for display.
+		spawnCode,
 		modelFallbackMessage: activeSession.runtime.modelFallbackMessage,
 		diagnostics: [...activeSession.runtime.diagnostics],
 		// Keep the last recap visible across turns so the view never blanks, but
@@ -331,20 +485,221 @@ export function summaryForActiveSession(
 		summary: activeSession.summaryState?.summary,
 		...(isSummaryCurrent(activeSession) ? { taskState: activeSession.summaryState?.taskState } : {}),
 	};
+	// The memo hands this same object to every later caller, so it must not be mutable:
+	// an in-place edit would change what unrelated reads report and could be persisted by
+	// an unrelated mutation. Shallow, deliberately - nested values such as `stall` and
+	// `usage` are live objects the session still owns.
+	summaryComposeMemos.set(activeSession, { fingerprint, summary: Object.freeze(summary) });
+	return summary;
 }
 
-function latestMessageActivityAt(messages: readonly AgentMessage[]): string | undefined {
+function summaryComposeFingerprintsEqual(left: SummaryComposeFingerprint, right: SummaryComposeFingerprint): boolean {
+	return (
+		left.hasActiveHeartbeat === right.hasActiveHeartbeat &&
+		left.hasRegisteredHeartbeat === right.hasRegisteredHeartbeat &&
+		left.hasRegisteredCronJob === right.hasRegisteredCronJob &&
+		left.savedSession === right.savedSession &&
+		left.isStreaming === right.isStreaming &&
+		left.isCompacting === right.isCompacting &&
+		left.isBashRunning === right.isBashRunning &&
+		left.pendingToolCallsSize === right.pendingToolCallsSize &&
+		left.isSessionActive === right.isSessionActive &&
+		left.isKernelWorkInFlight === right.isKernelWorkInFlight &&
+		left.hasRunningRlmChildren === right.hasRunningRlmChildren &&
+		left.unfinishedActionCount === right.unfinishedActionCount &&
+		left.attachedClients === right.attachedClients &&
+		left.directAttachedClients === right.directAttachedClients &&
+		left.messageCount === right.messageCount &&
+		usageSummariesEqual(left.usage, right.usage) &&
+		left.model === right.model &&
+		left.thinkingLevel === right.thinkingLevel &&
+		left.streamingMessage === right.streamingMessage &&
+		left.summaryState === right.summaryState &&
+		left.repliedSinceTask === right.repliedSinceTask &&
+		left.metadataKind === right.metadataKind &&
+		left.metadataParentActiveSessionId === right.metadataParentActiveSessionId &&
+		left.metadataParentSessionId === right.metadataParentSessionId &&
+		left.metadataParentSessionFile === right.metadataParentSessionFile &&
+		left.metadataRlmChildId === right.metadataRlmChildId &&
+		left.metadataRlmParentNodeId === right.metadataRlmParentNodeId &&
+		left.sessionName === right.sessionName &&
+		left.sessionId === right.sessionId &&
+		left.sessionFile === right.sessionFile &&
+		left.cwd === right.cwd &&
+		left.rlmDepth === right.rlmDepth &&
+		left.spawnCode === right.spawnCode &&
+		left.modelFallbackMessage === right.modelFallbackMessage &&
+		left.headerTimestamp === right.headerTimestamp &&
+		left.modified === right.modified &&
+		left.lastActivityAt === right.lastActivityAt &&
+		left.firstMessage === right.firstMessage &&
+		stallStatesEqual(left.stall, right.stall) &&
+		diagnosticsEqual(left.diagnostics, right.diagnostics) &&
+		sessionActionSnapshotsEqual(left.sessionActions, right.sessionActions)
+	);
+}
+
+/** This fork's usage summary is rebuilt per call, so equality is the three numbers it carries. */
+function usageSummariesEqual(left: SessionUsageSummary | undefined, right: SessionUsageSummary | undefined): boolean {
+	if (left === right) return true;
+	if (left === undefined || right === undefined) return false;
+	return (
+		left.inputTokens === right.inputTokens && left.outputTokens === right.outputTokens && left.cost === right.cost
+	);
+}
+
+/**
+ * Copy the live stall state into the fingerprint. The summary keeps the session's own object
+ * (its values must stay live for whoever holds the summary), while the fingerprint needs an
+ * immutable reading to compare against: by value, so both an in-place edit and a rebuilt
+ * object are seen.
+ */
+function snapshotStallState(stall: RlmChildStallState | undefined): RlmChildStallState | undefined {
+	if (stall === undefined) return undefined;
+	return {
+		silentMs: stall.silentMs,
+		thresholdMs: stall.thresholdMs,
+		inFlightTools: [...stall.inFlightTools],
+		...(stall.unsettled !== undefined ? { unsettled: stall.unsettled } : {}),
+		...(stall.excused !== undefined ? { excused: stall.excused } : {}),
+		...(stall.excusedReasons !== undefined ? { excusedReasons: [...stall.excusedReasons] } : {}),
+	};
+}
+
+/**
+ * The stall watchdog replaces its state object and the summary carries it verbatim, so the
+ * comparison is by value: a reference compare would either miss an in-place update or, if the
+ * getter ever rebuilt the object, make the memo unreachable for a stalled session.
+ */
+function stallStatesEqual(left: RlmChildStallState | undefined, right: RlmChildStallState | undefined): boolean {
+	if (left === right) return true;
+	if (left === undefined || right === undefined) return false;
+	return (
+		left.silentMs === right.silentMs &&
+		left.thresholdMs === right.thresholdMs &&
+		left.unsettled === right.unsettled &&
+		left.excused === right.excused &&
+		stringArraysEqual(left.inFlightTools, right.inFlightTools) &&
+		stringArraysEqual(left.excusedReasons, right.excusedReasons)
+	);
+}
+
+// Runtime diagnostics change by wholesale replacement or by append; a stable length and tail
+// element covers both without a deep compare.
+function diagnosticsEqual(
+	left: readonly AgentSessionRuntimeDiagnostic[],
+	right: readonly AgentSessionRuntimeDiagnostic[],
+): boolean {
+	if (left === right) return true;
+	if (left.length !== right.length) return false;
+	return left.length === 0 || left[left.length - 1] === right[right.length - 1];
+}
+
+function sessionActionSnapshotsEqual(left: SessionActionSnapshot, right: SessionActionSnapshot): boolean {
+	if (left === right) return true;
+	if (left.queuedCount !== right.queuedCount) return false;
+	if (
+		left.active?.kind !== right.active?.kind ||
+		left.active?.phase !== right.active?.phase ||
+		left.active?.label !== right.active?.label
+	) {
+		return false;
+	}
+	return stringArraysEqual(left.steering, right.steering) && stringArraysEqual(left.followUps, right.followUps);
+}
+
+function stringArraysEqual(left: readonly string[] | undefined, right: readonly string[] | undefined): boolean {
+	if (left === right) return true;
+	if (left === undefined || right === undefined) return false;
+	if (left.length !== right.length) return false;
+	for (let index = 0; index < left.length; index += 1) {
+		if (left[index] !== right[index]) return false;
+	}
+	return true;
+}
+
+/**
+ * Cheap display labels for callers that need only the session's identity (the heartbeats list
+ * polls once per registered job); avoids the full summary compose. Mirrors the
+ * sessionName/firstMessage fields summaryForActiveSession produces for a session without a
+ * saved catalog entry.
+ */
+export function sessionDisplayLabels(activeSession: ActiveSessionState): {
+	sessionName: string | undefined;
+	firstMessage: string | undefined;
+} {
+	const session = activeSession.runtime.session;
+	const metadata = activeSession.runtime.metadata ?? { kind: "top-level" as const };
+	return {
+		sessionName: session.sessionName,
+		firstMessage:
+			(metadata.prompt ? compactRlmText(metadata.prompt, 120) : undefined) ?? firstUserMessageText(session),
+	};
+}
+
+/**
+ * Incremental max-message-timestamp tracker for one active session.
+ *
+ * Sessions only append to their message array in place (full reassignments replace the array
+ * object), so the memo folds just the messages appended since the last scan. It falls back to a
+ * full walk whenever the array is replaced, shrinks, or shifts: a mid-array insert changes the
+ * element at the previous scan boundary, which the tail reference detects.
+ */
+export interface MessageActivityMemo {
+	/** Live messages array the memo last scanned; an identity change forces a full walk. */
+	source: readonly AgentMessage[] | undefined;
+	/** Number of leading elements already folded into `latest`. */
+	scannedLength: number;
+	/** Element at `scannedLength - 1` at the last scan; detects mid-array inserts. */
+	tailRef: AgentMessage | undefined;
+	/** Largest valid message timestamp seen so far, or undefined before the first valid one. */
+	latest: number | undefined;
+}
+
+function messageActivityTimestamp(message: AgentMessage): number | undefined {
+	// Tool results and custom messages are real session activity too. Looking at
+	// every timestamp also keeps this correct for future AgentMessage variants.
+	if (
+		typeof message.timestamp === "number" &&
+		Number.isFinite(message.timestamp) &&
+		Math.abs(message.timestamp) <= MAX_DATE_TIMESTAMP_MS
+	) {
+		return message.timestamp;
+	}
+	return undefined;
+}
+
+function foldMessageActivity(
+	messages: readonly AgentMessage[],
+	from: number,
+	latest: number | undefined,
+): number | undefined {
+	for (let index = from; index < messages.length; index += 1) {
+		const timestamp = messageActivityTimestamp(messages[index]!);
+		if (timestamp === undefined) continue;
+		latest = latest === undefined ? timestamp : Math.max(latest, timestamp);
+	}
+	return latest;
+}
+
+export function latestMessageActivityAt(
+	messages: readonly AgentMessage[],
+	memo?: MessageActivityMemo,
+): string | undefined {
 	let latest: number | undefined;
-	for (const message of messages) {
-		// Tool results and custom messages are real session activity too. Looking at
-		// every timestamp also keeps this correct for future AgentMessage variants.
-		if (
-			typeof message.timestamp === "number" &&
-			Number.isFinite(message.timestamp) &&
-			Math.abs(message.timestamp) <= MAX_DATE_TIMESTAMP_MS
-		) {
-			latest = latest === undefined ? message.timestamp : Math.max(latest, message.timestamp);
-		}
+	if (memo === undefined || memo.source !== messages || messages.length < memo.scannedLength) {
+		latest = foldMessageActivity(messages, 0, undefined);
+	} else if (memo.scannedLength > 0 && messages[memo.scannedLength - 1] !== memo.tailRef) {
+		// A mid-array insert shifted the scanned prefix; rescan everything.
+		latest = foldMessageActivity(messages, 0, undefined);
+	} else {
+		latest = foldMessageActivity(messages, memo.scannedLength, memo.latest);
+	}
+	if (memo !== undefined) {
+		memo.source = messages;
+		memo.scannedLength = messages.length;
+		memo.tailRef = messages.length > 0 ? messages[messages.length - 1] : undefined;
+		memo.latest = latest;
 	}
 	return latest === undefined ? undefined : new Date(latest).toISOString();
 }
