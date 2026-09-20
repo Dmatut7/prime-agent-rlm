@@ -7,6 +7,7 @@ import {
 	openSync,
 	readFileSync,
 	renameSync,
+	statSync,
 	writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -150,6 +151,22 @@ interface AgentCronDispatchRecord {
 interface CronJobsState {
 	jobs: AgentCronJob[];
 	dispatches: AgentCronDispatchRecord[];
+}
+
+/**
+ * Stat identity of a jobs file. Every writer replaces the inode and bumps the mtime, so an
+ * unchanged identity means a parse of this file is still current.
+ */
+interface CronJobsFileIdentity {
+	dev: number;
+	ino: number;
+	size: number;
+	mtimeMs: number;
+}
+
+interface CronJobsStateSnapshot {
+	identity: CronJobsFileIdentity;
+	state: CronJobsState;
 }
 
 /**
@@ -298,6 +315,11 @@ export class AgentCronJobStore {
 	/** Registered sessions whose jobs file this store has seen on disk; only those can vanish. */
 	private readonly observedSessionArtifactFiles = new Set<string>();
 	private readonly heartbeatChangeListeners = new Set<() => void>();
+	/**
+	 * Parsed-state snapshot per jobs file, keyed by path. The stat identity decides when a
+	 * snapshot is still current, so a poll costs one stat instead of a full read and parse.
+	 */
+	private readonly stateSnapshots = new Map<string, CronJobsStateSnapshot>();
 
 	constructor(
 		private readonly filePath?: string,
@@ -342,11 +364,13 @@ export class AgentCronJobStore {
 			return [];
 		}
 		return withCronJobsStateLocks([path], () => {
-			const state = readJobsState(path);
+			// Recovery mutates what it read, so it works on a private clone: the published
+			// snapshot is frozen and must never carry an unpersisted edit.
+			const state = roundTripJobsState(this.readState(path));
 			const recovered: AgentCronJob[] = [];
 			if (state.dispatches.length > 0) {
 				recoverInterruptedInState(state, now, recovered);
-				writeJobsState(path, state);
+				this.writeState(path, state);
 			}
 			return recovered;
 		});
@@ -1002,6 +1026,82 @@ export class AgentCronJobStore {
 		return times[0];
 	}
 
+	/**
+	 * Read the parsed state of one jobs file, serving the in-memory snapshot while the file's
+	 * stat identity is unchanged. Polls (agents view every 15s, the scheduler, heartbeat
+	 * catalog signatures) then cost one stat instead of a full read and parse; a changed
+	 * identity - an external writer's new inode, size or mtime - falls back to the disk.
+	 *
+	 * A parse is only cached when it is bracketed by one file identity, so a writer that
+	 * replaces the file during the read cannot poison the snapshot. Every returned state is
+	 * deeply frozen: callers get a read-only view, so an in-place edit of a listed job can
+	 * reach neither the snapshot nor a later publish. Mutators clone first.
+	 *
+	 * Returns undefined for a file that is not there, which callers use to tell "nothing
+	 * scheduled yet" from "empty store" (registration pruning depends on the difference).
+	 */
+	private readStateIfPresent(path: string): CronJobsState | undefined {
+		const identity = statJobsFileIdentity(path);
+		if (!identity) {
+			this.stateSnapshots.delete(path);
+			return undefined;
+		}
+		const snapshot = this.stateSnapshots.get(path);
+		if (snapshot && isSameJobsFileIdentity(snapshot.identity, identity)) {
+			return snapshot.state;
+		}
+		const parsed = readJobsStateIfPresent(path);
+		if (!parsed) {
+			// Vanished between the stat and the read: no snapshot, and the caller's
+			// present-or-absent decision stays honest.
+			this.stateSnapshots.delete(path);
+			return undefined;
+		}
+		const state = deepFreezeJobsState(parsed);
+		const after = statJobsFileIdentity(path);
+		if (after && isSameJobsFileIdentity(identity, after)) {
+			this.stateSnapshots.set(path, { identity: after, state });
+		} else {
+			this.stateSnapshots.delete(path);
+		}
+		return state;
+	}
+
+	/** {@link readStateIfPresent} with the missing file served as the shared frozen empty state. */
+	private readState(path: string): CronJobsState {
+		return this.readStateIfPresent(path) ?? EMPTY_JOBS_STATE;
+	}
+
+	/**
+	 * Persist a state and publish it as the snapshot subsequent reads serve, so a mutation
+	 * does not re-read what it just wrote. Runs under the state lock, where conforming writers
+	 * cannot replace the file between the write and the stat.
+	 *
+	 * The snapshot is published only when the post-write stat matches the identity this write
+	 * produced (sampled from the temp file before the rename, which preserves dev/ino/size/
+	 * mtime): an external replacement landing between the rename and the stat invalidates the
+	 * snapshot instead of pairing that writer's identity with our state. A failed write drops
+	 * the snapshot rather than serving a state that never reached disk.
+	 */
+	private writeState(path: string, state: CronJobsState): void {
+		let written: CronJobsFileIdentity | undefined;
+		try {
+			written = writeJobsState(path, state);
+		} catch (error) {
+			this.stateSnapshots.delete(path);
+			throw error;
+		}
+		const identity = statJobsFileIdentity(path);
+		if (identity && written && isSameJobsFileIdentity(written, identity)) {
+			// The published state is a round trip of the bytes just written, so serving it
+			// is indistinguishable from parsing them again - and it is frozen, because the
+			// object a mutator edited is not.
+			this.stateSnapshots.set(path, { identity, state: deepFreezeJobsState(roundTripJobsState(state)) });
+		} else {
+			this.stateSnapshots.delete(path);
+		}
+	}
+
 	private readJobs(): AgentCronJob[] {
 		return this.readStates().flatMap((state) => state.jobs);
 	}
@@ -1017,11 +1117,11 @@ export class AgentCronJobStore {
 	 */
 	private readStates(): CronJobsState[] {
 		if (!this.sessionArtifactMode) {
-			return [readJobsState(this.requireFilePath())];
+			return [this.readState(this.requireFilePath())];
 		}
 		const states: CronJobsState[] = [];
 		for (const [sessionId, path] of this.sessionArtifactFiles) {
-			const state = readJobsStateIfPresent(path);
+			const state = this.readStateIfPresent(path);
 			if (state) {
 				this.observedSessionArtifactFiles.add(sessionId);
 				states.push(state);
@@ -1051,13 +1151,15 @@ export class AgentCronJobStore {
 			const beforeJobs: AgentCronJob[] = [];
 			const afterJobs: AgentCronJob[] = [];
 			for (const path of paths) {
-				const state = readJobsState(path);
+				// Mutators edit a private clone, so a mid-edit throw never leaves an
+				// unpersisted state in the snapshot and a frozen view is never assigned to.
+				const state = roundTripJobsState(this.readState(path));
 				const before = JSON.stringify(state);
 				beforeJobs.push(...state.jobs);
 				claimed.push(...mutator(state));
 				state.jobs = pruneTerminalJobs(state.jobs, state.dispatches);
 				if (JSON.stringify(state) !== before) {
-					writeJobsState(path, state);
+					this.writeState(path, state);
 				}
 				afterJobs.push(...state.jobs);
 			}
@@ -1101,7 +1203,7 @@ export class AgentCronJobStore {
 				() => {
 					const currentBySessionId = new Map<string, CronJobsState>();
 					for (const [sessionId, path] of targets) {
-						const current = readJobsStateIfPresent(path);
+						const current = this.readStateIfPresent(path);
 						if (current) {
 							this.observedSessionArtifactFiles.add(sessionId);
 						}
@@ -1143,10 +1245,12 @@ export class AgentCronJobStore {
 						beforeJobs.push(...current.jobs);
 						afterJobs.push(...nextState.jobs);
 						if (JSON.stringify(current) !== JSON.stringify(nextState)) {
-							writeJobsState(path, nextState);
+							this.writeState(path, nextState);
 							this.observedSessionArtifactFiles.add(sessionId);
 						}
-						persistedJobs.push(...readJobsState(path).jobs);
+						// The read-back is the caller's authority; the write just published it
+						// as the snapshot, so this costs one stat instead of a re-parse.
+						persistedJobs.push(...this.readState(path).jobs);
 					}
 					// Both signatures come from the states already read under the lock;
 					// separate passes over the files would triple the read cost of a write.
@@ -1164,16 +1268,16 @@ export class AgentCronJobStore {
 		let previousHeartbeats = "";
 		let nextHeartbeats = "";
 		const outcome = withCronJobsStateLocks([path], () => {
-			const current = readJobsState(path);
+			const current = roundTripJobsState(this.readState(path));
 			const next = mergedJobsState(current, jobs);
 			previousHeartbeats = heartbeatCatalogSignature(current.jobs);
 			nextHeartbeats = heartbeatCatalogSignature(next.jobs);
 			if (JSON.stringify(current) !== JSON.stringify(next)) {
-				writeJobsState(path, next);
+				this.writeState(path, next);
 			}
 			// The read-back is the caller's answer: a merge that kept another writer's copy, or a
 			// write that did not survive the rename, must not be reported as an applied change.
-			return jobsWriteOutcome(readJobsState(path).jobs, jobs);
+			return jobsWriteOutcome(this.readState(path).jobs, jobs);
 		});
 		if (previousHeartbeats !== nextHeartbeats) {
 			this.notifyHeartbeatChange();
@@ -2067,6 +2171,51 @@ function readJobsState(path: string): CronJobsState {
 	return readJobsStateIfPresent(path) ?? { jobs: [], dispatches: [] };
 }
 
+/** Stat a jobs file for snapshot identity; a missing or unreadable file has no identity. */
+function statJobsFileIdentity(path: string): CronJobsFileIdentity | undefined {
+	try {
+		const stats = statSync(path);
+		return { dev: stats.dev, ino: stats.ino, size: stats.size, mtimeMs: stats.mtimeMs };
+	} catch {
+		return undefined;
+	}
+}
+
+function isSameJobsFileIdentity(left: CronJobsFileIdentity, right: CronJobsFileIdentity): boolean {
+	return (
+		left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeMs === right.mtimeMs
+	);
+}
+
+/**
+ * The bytes a write persists parse back to this shape, so a published snapshot must equal a
+ * fresh read of them: a private clone that also drops undefined-valued keys the way
+ * serialization does, and detaches the caller's (mutable) object from the frozen view.
+ */
+function roundTripJobsState(state: CronJobsState): CronJobsState {
+	return JSON.parse(JSON.stringify(state)) as CronJobsState;
+}
+
+/**
+ * Freeze a state graph in place so every read serves a read-only view: an in-place edit of a
+ * listed job throws instead of reaching the snapshot or a later publish.
+ */
+function deepFreezeJobsState(state: CronJobsState): CronJobsState {
+	for (const job of state.jobs) {
+		Object.freeze(job.schedule);
+		Object.freeze(job);
+	}
+	for (const dispatch of state.dispatches) {
+		Object.freeze(dispatch);
+	}
+	Object.freeze(state.jobs);
+	Object.freeze(state.dispatches);
+	return Object.freeze(state);
+}
+
+/** Served while a jobs file is missing; frozen like every other read view. */
+const EMPTY_JOBS_STATE = deepFreezeJobsState({ jobs: [], dispatches: [] });
+
 /** Store files already reported unreadable, so one wrecked file warns once per incident. */
 const reportedUnreadableJobsFiles = new Set<string>();
 
@@ -2166,7 +2315,13 @@ function isTerminalJobStatus(status: AgentCronJobStatus): boolean {
 	return status === "cancelled" || status === "completed";
 }
 
-function writeJobsState(path: string, state: CronJobsState): void {
+/**
+ * Persist a state atomically and report the stat identity the written file carries after the
+ * rename. The identity is sampled from the temp file immediately before the rename, which
+ * preserves dev/ino/size/mtimeMs, so a caller can verify that a later stat still shows this
+ * write's file rather than an external writer's replacement.
+ */
+function writeJobsState(path: string, state: CronJobsState): CronJobsFileIdentity | undefined {
 	const directory = dirname(path);
 	mkdirSync(directory, { recursive: true, mode: 0o700 });
 	const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
@@ -2177,6 +2332,7 @@ function writeJobsState(path: string, state: CronJobsState): void {
 	} finally {
 		closeSync(descriptor);
 	}
+	const written = statJobsFileIdentity(tempPath);
 	renameSync(tempPath, path);
 	try {
 		const directoryDescriptor = openSync(directory, "r");
@@ -2188,6 +2344,7 @@ function writeJobsState(path: string, state: CronJobsState): void {
 	} catch {
 		// Directory fsync is unavailable on some platforms; the atomic rename still protects readers.
 	}
+	return written;
 }
 
 /**
