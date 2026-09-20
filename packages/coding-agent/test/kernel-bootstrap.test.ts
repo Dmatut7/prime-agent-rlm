@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	activeKernelVenvDir,
@@ -44,6 +45,32 @@ function writeBootstrapVersion(venv: string, pythonSkills: readonly KernelPython
 			})),
 		})}\n`,
 	);
+}
+
+/** The marker content the fake uv saw at each editable install, in install order. */
+function markerProbes(logPath: string): string[] {
+	return readFileSync(logPath, "utf8")
+		.split("\n")
+		.filter((line) => line.startsWith("MARKER "))
+		.map((line) => line.slice("MARKER ".length));
+}
+
+function skillNames(version: { pythonSkills: Array<{ importName: string }> }): string[] {
+	return version.pythonSkills.map((skill) => skill.importName);
+}
+
+/**
+ * Waits for one line in the fake uv's log. The fake uv is an external process, so there is no
+ * in-process signal to await; the deadline only bites on the failure path and it throws rather
+ * than passing silently.
+ */
+async function waitForFakeUvLog(logPath: string, needle: string, timeoutMs = 20_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (existsSync(logPath) && readFileSync(logPath, "utf8").includes(needle)) return;
+		await sleep(25);
+	}
+	throw new Error(`the fake uv log never contained: ${needle}`);
 }
 
 function createPythonSkill(name = "web-search"): KernelPythonSkill {
@@ -149,11 +176,33 @@ function installFakeUv(options: { venvUnreadyImports?: readonly string[]; venvRu
 			"  exit 0",
 			"fi",
 			'if [ "$1" = "pip" ]; then',
+			'  marker_file=""',
+			'  seen_editable=""',
+			'  prev=""',
 			'  for arg in "$@"; do',
+			'    if [ "$prev" = "--python" ]; then',
+			'      marker_file="$(dirname "$arg")/../.bootstrap-version"',
+			"    fi",
+			'    if [ "$arg" = "--editable" ]; then',
+			"      seen_editable=1",
+			"    fi",
+			'    if [ "$UV_HANG_ARG" != "" ] && [ "$arg" = "$UV_HANG_ARG" ]; then',
+			"      sleep 30",
+			"    fi",
 			'    if [ "$UV_FAIL_ARG" != "" ] && [ "$arg" = "$UV_FAIL_ARG" ]; then',
 			"      exit 1",
 			"    fi",
+			'    prev="$arg"',
 			"  done",
+			// The marker as this install sees it: recorded after the install ran, so
+			// probe N shows what the sync had persisted before skill N's own write.
+			'  if [ "$seen_editable" != "" ] && [ "$marker_file" != "" ]; then',
+			'    if [ -f "$marker_file" ]; then',
+			'      printf "MARKER %s\n" "$(cat "$marker_file")" >> "$UV_LOG"',
+			"    else",
+			'      printf "MARKER missing\n" >> "$UV_LOG"',
+			"    fi",
+			"  fi",
 			"  exit 0",
 			"fi",
 			"exit 2",
@@ -415,6 +464,127 @@ dependencies = ["httpx"]
 		expect(
 			retryLog.split("\n").filter((line) => line.includes(`--editable ${brokenSkill.packagePath}`)),
 		).toHaveLength(2);
+	});
+
+	it("lands the base marker before the first skill install and persists each completed one", async () => {
+		const logPath = installFakeUv();
+		const base = join(tempDir, "kernel-venv");
+		const venv = await activeKernelVenvDir(base);
+		const first = createPythonSkill("agent-a");
+		const second = createPythonSkill("agent-b");
+		const broken = createPythonSkill("agent-c");
+		process.env.PRIME_AGENT_KERNEL_VENV = base;
+		process.env.UV_FAIL_ARG = broken.packagePath;
+
+		await expect(ensureKernelPython({ pythonSkills: [first, second, broken] })).resolves.toBe(
+			join(venv, "bin", "python"),
+		);
+
+		// The failing install exits before the fake uv records its probe, so there is
+		// one probe per completed-or-attempted-and-logged install: the first sees the
+		// base marker, the second sees the first skill already persisted.
+		const probes = markerProbes(logPath);
+		expect(probes).toHaveLength(2);
+		expect(skillNames(JSON.parse(probes[0] as string))).toEqual([]);
+		expect(skillNames(JSON.parse(probes[1] as string))).toEqual([first.importName]);
+		const version = JSON.parse(readFileSync(join(venv, ".bootstrap-version"), "utf8"));
+		expect(skillNames(version)).toEqual([first.importName, second.importName]);
+	});
+
+	it("keeps a resumable marker when the skill sync is cancelled mid-install", async () => {
+		const logPath = installFakeUv();
+		const base = join(tempDir, "kernel-venv");
+		const venv = await activeKernelVenvDir(base);
+		const first = createPythonSkill("agent-a");
+		const second = createPythonSkill("agent-b");
+		const hanging = createPythonSkill("agent-c");
+		process.env.PRIME_AGENT_KERNEL_VENV = base;
+		process.env.UV_HANG_ARG = hanging.packagePath;
+		const controller = new AbortController();
+		const cancelled = ensureKernelPython({
+			pythonSkills: [first, second, hanging],
+			signal: controller.signal,
+		});
+		// Attached immediately: the abort below is the expected rejection path.
+		cancelled.catch(() => undefined);
+		try {
+			await waitForFakeUvLog(logPath, `--editable ${hanging.packagePath}`);
+			// Mid-sync, with the third install still running: the marker on disk is
+			// already a valid base record carrying the two completed installs, which
+			// is what lets a session killed here resume instead of rebuilding.
+			const midSync = JSON.parse(readFileSync(join(venv, ".bootstrap-version"), "utf8"));
+			expect(midSync.runtime).toBe(runtimeIdentity);
+			expect(skillNames(midSync)).toEqual([first.importName, second.importName]);
+		} finally {
+			controller.abort();
+			await expect(cancelled).rejects.toThrow();
+		}
+
+		delete process.env.UV_HANG_ARG;
+		await expect(ensureKernelPython({ pythonSkills: [first, second] })).resolves.toBe(join(venv, "bin", "python"));
+
+		const lines = readFileSync(logPath, "utf8").split("\n");
+		// One build, ever: the resume took the skills-only path and reinstalled nothing.
+		expect(lines.filter((line) => line.startsWith(`venv ${venv} `))).toHaveLength(1);
+		expect(lines.filter((line) => line.includes(`--editable ${first.packagePath}`))).toHaveLength(1);
+		expect(lines.filter((line) => line.includes(`--editable ${second.packagePath}`))).toHaveLength(1);
+	});
+
+	it("resumes from the base marker when the sync is cancelled before the first install finishes", async () => {
+		const logPath = installFakeUv();
+		const base = join(tempDir, "kernel-venv");
+		const venv = await activeKernelVenvDir(base);
+		const first = createPythonSkill("agent-a");
+		process.env.PRIME_AGENT_KERNEL_VENV = base;
+		process.env.UV_HANG_ARG = first.packagePath;
+		const controller = new AbortController();
+		const cancelled = ensureKernelPython({ pythonSkills: [first], signal: controller.signal });
+		cancelled.catch(() => undefined);
+		try {
+			await waitForFakeUvLog(logPath, `--editable ${first.packagePath}`);
+			// No skill has finished yet, so the base marker is all that is on disk -
+			// and it is enough: it records the runtime identity this venv was built
+			// for, which is what the next boot's skills-only path checks.
+			const midSync = JSON.parse(readFileSync(join(venv, ".bootstrap-version"), "utf8"));
+			expect(midSync.runtime).toBe(runtimeIdentity);
+			expect(skillNames(midSync)).toEqual([]);
+		} finally {
+			controller.abort();
+			await expect(cancelled).rejects.toThrow();
+		}
+
+		delete process.env.UV_HANG_ARG;
+		await expect(ensureKernelPython({ pythonSkills: [first] })).resolves.toBe(join(venv, "bin", "python"));
+
+		const lines = readFileSync(logPath, "utf8").split("\n");
+		// One build, ever: the resume re-synced the single missing skill instead of
+		// wiping the venv and re-paying the runtime install.
+		expect(lines.filter((line) => line.startsWith(`venv ${venv} `))).toHaveLength(1);
+		expect(lines.filter((line) => line.includes(`--editable ${first.packagePath}`))).toHaveLength(2);
+	});
+
+	it("leaves the previous marker intact when the atomic swap cannot complete", async () => {
+		installFakeUv();
+		const base = join(tempDir, "kernel-venv");
+		const venv = await activeKernelVenvDir(base);
+		const python = join(venv, "bin", "python");
+		const recorded = createPythonSkill("agent-a");
+		const fresh = createPythonSkill("agent-b");
+		mkdirSync(join(venv, "bin"), { recursive: true });
+		writeFakePython(python, ["rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
+		writeBootstrapVersion(venv, [recorded]);
+		const before = readFileSync(join(venv, ".bootstrap-version"), "utf8");
+		// Block the swap: the temp path is a non-empty directory, so the temp write
+		// fails on every bounded retry and the rename never runs.
+		mkdirSync(join(venv, ".bootstrap-version.tmp", "blocker"), { recursive: true });
+		process.env.PRIME_AGENT_KERNEL_VENV = base;
+
+		await expect(ensureKernelPython({ pythonSkills: [recorded, fresh] })).rejects.toThrow();
+
+		// The in-place overwrite this replaces would have truncated the marker here,
+		// and a partial marker reads as absent: the next boot would rebuild the venv
+		// and re-pay the runtime install instead of re-syncing one skill.
+		expect(readFileSync(join(venv, ".bootstrap-version"), "utf8")).toBe(before);
 	});
 
 	it("rebuilds a warm venv with legacy unhashed Python skill manifest entries", async () => {
