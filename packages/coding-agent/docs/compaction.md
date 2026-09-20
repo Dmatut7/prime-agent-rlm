@@ -376,11 +376,14 @@ Before summarization, messages are serialized to text via [`serializeConversatio
 [User]: What they said
 [Assistant thinking]: Internal reasoning
 [Assistant]: Response text
-[Assistant tool calls]: ipython(code="open('foo.ts').read()"); edit(path="bar.ts", ...)
-[Tool result]: Output from tool
+[Assistant tool calls]: #1 ipython(code="open('foo.ts').read()"); #2 bash(command="npm test")
+[Tool result (ipython) #1]: Output from tool
+[Tool result (bash, error) #2]: Output from a failed tool call
 ```
 
 This prevents the model from treating it as a conversation to continue.
+
+Each tool call carries a sequential `#N` prefix and its result repeats the matching index, so repeated calls of the same tool in one turn pair unambiguously and a failed result stays attributable to the call that produced it. The index stands in for the raw provider `toolCallId`, which can exceed 450 characters and would eat the summarizer's token budget. Branch summaries drop tool-result entries before serialization (their context remains attached to the assistant tool call), so they show the `#N` call prefixes without any result lines. When the serialized input lacks the matching call - possible for extension callers passing partial message lists, since `serializeConversation` is exported - the result falls back to the name-only label.
 
 Tool results are truncated in the middle during serialization: the first `TOOL_RESULT_HEAD_CHARS` (2000) and the last `TOOL_RESULT_TAIL_CHARS` (500) characters are kept, and the dropped span is replaced with a marker saying how many characters went. The tail matters because that is where a tool run's verdict lives — a test runner prints its failure list last, a build prints the stopping error last, a stack trace puts the innermost frame last. Head-only truncation discarded all of it: on one measured session 183 facts existed only past the 2000-character cut, across 62 results whose dropped tails totalled 80k characters. Truncation still keeps summarization requests within budget, since tool results, especially from `ipython` and optional `bash`, are typically the largest contributors to context size.
 
@@ -480,8 +483,8 @@ pi.on("session_before_compact", async (event, ctx) => {
   // [User]: message text
   // [Assistant thinking]: thinking content
   // [Assistant]: response text
-  // [Assistant tool calls]: ipython(code="open('...').read()"); bash(command="...")
-  // [Tool result]: output text
+  // [Assistant tool calls]: #1 ipython(code="open('...').read()"); #2 bash(command="...")
+  // [Tool result (ipython) #1]: output text
 
   // Now send to your model for summarization
   const summary = await myModel.summarize(conversationText);
