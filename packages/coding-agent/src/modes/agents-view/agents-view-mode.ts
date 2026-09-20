@@ -2940,8 +2940,10 @@ export class AgentsViewMode implements Component, Focusable {
 			selectedAgent
 				? `${keyText("app.agents.delete")} ${selectedRow?.section === "inactive" ? "delete" : "stop/deactivate"}`
 				: undefined,
+			// Same gate as the action itself: the legend must not offer "delete" for a row that reads
+			// Idle on the display axis while its kernel still hosts live work.
 			selectedSubagent
-				? `${keyText("app.agents.delete")} ${selectedRow.section === "running" ? "stop" : "delete"}`
+				? `${keyText("app.agents.delete")} ${hasLiveWork(selectedRow) ? "stop" : "delete"}`
 				: undefined,
 			this.selectedRowCanShowProgram() ? `${keyText("app.agents.program")} program` : undefined,
 		]
@@ -3079,9 +3081,18 @@ function rowHasSpawnCode(row: AgentsViewRow): boolean {
 	return typeof code === "string" && code.trim().length > 0;
 }
 
-// Destructive actions gate on live work anywhere in the subtree, never on the display section.
+// Destructive actions gate on live work anywhere in the subtree, never on the display section
+// alone: a row can read Idle on the display axis and still host kernel-owned background work
+// (isSessionActive folds in isKernelWorkInFlight, LIVE-1/r44) or a host-side bash tool the kernel
+// journal cannot see. Stopping such a row is safe; deleting it kills work that is still running.
 function hasLiveWork(row: AgentsViewRow): boolean {
-	return row.section === "running" || row.runningSubagentCount > 0 || row.summary.hasRunningRlmChildren === true;
+	return (
+		row.section === "running" ||
+		row.summary.isSessionActive === true ||
+		row.summary.isBashRunning === true ||
+		row.runningSubagentCount > 0 ||
+		row.summary.hasRunningRlmChildren === true
+	);
 }
 
 interface AgentsViewUsageParts {

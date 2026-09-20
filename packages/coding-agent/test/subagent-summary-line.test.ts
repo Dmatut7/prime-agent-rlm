@@ -427,6 +427,45 @@ describe("SubagentSummaryLine", () => {
 		});
 	});
 
+	it("counts a finished child that only hosts kernel background work as idle on both faces", () => {
+		// Case linkrefund-post2-ds (2026-09-20): the child's turn ended, but its kernel still hosts
+		// a live bash() handle, which summaryForActiveSession folds into isSessionActive (LIVE-1,
+		// r44). The tray and the agents view read one formula, so both call it idle; the residency
+		// fact is not lost, it is what the stop/delete gate reads instead.
+		const summaries = [
+			rosterRow({ id: "parent-active", sessionId: "parent-session", sessionName: "Parent" }),
+			rosterRow({
+				id: "hosting-child",
+				sessionId: "hosting-child-session",
+				sessionName: "Hosting child",
+				runtimeKind: "subagent",
+				parentActiveSessionId: "parent-active",
+				activity: "idle",
+				isSessionActive: true,
+			}),
+			// Positive control: a child mid-turn still counts as running on both faces.
+			rosterRow({
+				id: "working-child",
+				sessionId: "working-child-session",
+				sessionName: "Working child",
+				runtimeKind: "subagent",
+				parentActiveSessionId: "parent-active",
+				activity: "working",
+				isSessionActive: true,
+			}),
+		];
+
+		expect(countRosterSubagentStatuses(summaries, { activeSessionId: "parent-active" })).toEqual({
+			total: 2,
+			running: 1,
+			idle: 1,
+			inactive: 0,
+		});
+		const viewRows = buildAgentsViewRows(summaries);
+		expect(viewRows[0]).toMatchObject({ kind: "agent", runningSubagentCount: 1 });
+		expect(viewRows[1]).toMatchObject({ kind: "subagent-summary", title: "1 subagent running" });
+	});
+
 	it("keeps chat alive with the snapshot-fed bar when the roster subscribe fails", async () => {
 		const line = new SubagentSummaryLine();
 		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;

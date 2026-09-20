@@ -1454,8 +1454,9 @@ function getSessionStatusLabel(summary: SessionSummary, heartbeat?: UnifiedSessi
 	if (summary.isStreaming) {
 		return summary.isRunningTools ? "running tools" : "thinking";
 	}
-	// These classify the session as Running (isAgentsViewSessionBusy); the label
-	// must agree with the section instead of claiming the session needs input.
+	// Both imply a turn in flight, so the display axis (isSessionSummaryDisplayBusy) already
+	// classifies the session as Running; the label must agree with the section instead of
+	// claiming the session needs input.
 	if (summary.isRunningTools === true) {
 		return "running tools";
 	}

@@ -155,7 +155,7 @@ describe("LIVE-1 kernel-owned work keeps a session resident", () => {
 		await expect(harness.session.waitForIdle()).resolves.toBeUndefined();
 	});
 
-	it("locks the summary carrier and the UI consequence it deliberately has (D35)", async () => {
+	it("locks the summary carrier and keeps the section axis off it (D35, reversed 2026-09-20)", async () => {
 		const harness = track(
 			await createHarness({
 				kernelResidencyFacts: () => ({ hasActiveExecution: false, isKernelBashRunning: true }),
@@ -171,11 +171,18 @@ describe("LIVE-1 kernel-owned work keeps a session resident", () => {
 		expect(isSessionSummaryBusy(summary)).toBe(true);
 		// The blind spot the term exists for: the host-side bash tool's controllers see nothing.
 		expect(summary.isBashRunning).toBe(false);
-		// Intended consequence, pinned so nobody "fixes" it back: a session whose turn ended but
-		// whose kernel hosts a handle reads as running to the roster and the agents view, while the
-		// display activity axis - deliberately turn-level - still says idle.
-		expect(classifySessionRosterStatus(summary)).toBe("running");
+		// The display activity axis - deliberately turn-level - says idle, and that is now also
+		// what the roster and the agents view report.
 		expect(summary.activity).toBe("idle");
+		// Reversed on purpose (ruling 2026-09-20: a finished child is finished, and its icon stops
+		// spinning). This assertion used to pin `"running"` as an intended consequence with a
+		// "pinned so nobody 'fixes' it back" note, because the section classifier read the
+		// residency axis. It now reads the display axis: `classifySessionRosterStatus` takes
+		// `activity`, while every residency consumer above (`isSessionSummaryBusy`, the
+		// passivation snapshot, the whole-worker eviction snapshot) keeps reading `isSessionActive`.
+		// The four assertions above are the r44 lock and did not move; deleting the kernel fold in
+		// summaryForActiveSession still turns them red.
+		expect(classifySessionRosterStatus(summary)).toBe("idle");
 	});
 
 	it("blocks whole-worker eviction through the same summary", async () => {

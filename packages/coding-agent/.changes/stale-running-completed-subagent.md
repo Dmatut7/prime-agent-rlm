@@ -1,0 +1,3 @@
+- Fixed subagents staying in the agents view "Running" section forever after they had finished, when their kernel still hosted a background `bash()` process: the section now reports what the agent is doing, so a finished child moves to "Idle" and its icon stops spinning.
+- Changed the agents view stop/delete gate to read live work directly instead of the row's section, so an idle-looking row whose kernel still hosts background work is still offered as "stop" and is never deleted as if it were inert.
+- Fixed a finished subagent's roster row not being recomputed until an unrelated event touched it, so its terminal state now reaches the agents view immediately.

@@ -1013,6 +1013,42 @@ describe("AgentsViewMode", () => {
 		expect(agentRow).toContain("Enter/→ open");
 	});
 
+	it("keeps the destructive-action gate on live work when the section reads Idle", () => {
+		const renderHintsFor = (row: AgentsViewRow): string => {
+			const self: Record<string, unknown> = {
+				isCtrlCExitHintVisible: () => false,
+				statusMessage: undefined,
+				renameTarget: undefined,
+				replyTarget: undefined,
+				rows: [row],
+				selectedIndex: 0,
+				selectedRowCanShowProgram: () => false,
+			};
+			return stripAnsi(invoke("renderHints", self, 200) as string);
+		};
+		const subagentRow = (section: AgentsViewRow["section"], summary: Record<string, unknown>): AgentsViewRow =>
+			({ kind: "subagent", section, runningSubagentCount: 0, summary }) as unknown as AgentsViewRow;
+
+		// Case linkrefund-post2-ds (2026-09-20): the section now follows the display axis, so a
+		// finished subagent whose kernel still hosts a live bash() handle reads Idle. Deleting it
+		// would kill that background work, which is exactly what r44 forbids - so the legend keeps
+		// offering "stop", gated on the residency axis instead of on the section.
+		const hostingOnly = subagentRow("idle", { isSessionActive: true });
+		expect(renderHintsFor(hostingOnly)).toContain("stop");
+		expect(renderHintsFor(hostingOnly)).not.toContain("delete");
+
+		// Same shape through the host-side bash term, which the kernel journal cannot see.
+		const bashOnly = subagentRow("idle", { isSessionActive: false, isBashRunning: true });
+		expect(renderHintsFor(bashOnly)).toContain("stop");
+
+		// Positive control 1: a genuinely finished child with nothing live anywhere offers delete.
+		const finished = subagentRow("idle", { isSessionActive: false });
+		expect(renderHintsFor(finished)).toContain("delete");
+		expect(renderHintsFor(finished)).not.toContain("stop");
+		// Positive control 2: the mid-turn row is unchanged.
+		expect(renderHintsFor(subagentRow("running", { isSessionActive: true }))).toContain("stop");
+	});
+
 	it("renders roster recovery and stale-worker status labels", () => {
 		const rows = buildAgentsViewRows([
 			summary({ id: "recovering", sessionId: "recovering", statusLabel: "recovering" }),

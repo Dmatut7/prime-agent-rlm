@@ -2730,7 +2730,7 @@ export class AgentDaemon {
 				if (state.runtime.metadata.rehydratedCompleted) return true;
 				const metadata = state.runtime.metadata;
 				const model = session.model;
-				return this.recordRlmSubagentState(parentState, {
+				const recorded = this.recordRlmSubagentState(parentState, {
 					childId,
 					sessionName: session.sessionName ?? childId,
 					sessionDir: metadata.sessionDir ?? dirname(state.runtime.session.sessionFile),
@@ -2744,6 +2744,15 @@ export class AgentDaemon {
 					status: "completed",
 					createdAt: metadata.createdAt,
 				});
+				// Completion is a roster fact the way deletion is (recordRlmSubagentDeletion broadcasts
+				// one). Without a flush here the child's row keeps whatever the last session event
+				// composed: the incremental path reuses a non-dirty row verbatim, and a child that
+				// finished its turn without emitting a roster trigger - one that only ever hosted
+				// kernel work - would never be recomputed. The parent's row moves with it, since its
+				// hasRunningRlmChildren term and its subagent rollups count this child.
+				this.scheduleRosterFlush({ activeSessionId: state.activeSessionId });
+				this.scheduleRosterFlush({ activeSessionId: parentState.activeSessionId });
+				return recorded;
 			},
 			releaseRlmSubagentRuntime: async (runtime, options, status) => {
 				// Persist the deletion boundary first, but never let a registry failure

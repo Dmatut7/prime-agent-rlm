@@ -21,6 +21,7 @@ import {
 	resolveAgentsViewSessionUiServices,
 	shouldReconnectAgentsViewDaemon,
 } from "../src/modes/agents-view/agents-view-mode.js";
+import { isSessionSummaryBusy } from "../src/modes/daemon/agent-roster.js";
 import {
 	type AgentsViewScopeFrame,
 	aggregateSessionHeartbeats,
@@ -109,6 +110,83 @@ describe("agents view state", () => {
 		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", taskState: "needs_input" }))).toBe("idle");
 		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", taskState: "completed" }))).toBe("idle");
 		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", taskState: undefined }))).toBe("idle");
+	});
+
+	test("a finished subagent that only hosts kernel background work is Idle, not Running", () => {
+		// Case linkrefund-post2-ds (2026-09-20): the turn ended 7h ago and rlm-subagent.json says
+		// "completed", but the child's kernel still hosts a live bash() handle (the rig host the
+		// child left running). summaryForActiveSession folds that residency fact into
+		// isSessionActive while activeActivityForSession keeps the display axis at "idle" - a
+		// finished subagent never receives a summarizer verdict, so it must not be held at working.
+		const finished = makeSummary({
+			id: "finished-child",
+			activeSessionId: "finished-child",
+			sessionId: "finished-child-session",
+			sessionFile: "/tmp/project/finished-child.jsonl",
+			sessionName: "Finished child",
+			runtimeKind: "subagent",
+			rlmChildId: "sub-7c40ed68",
+			parentActiveSessionId: "parent-active",
+			parentSessionId: "parent-session",
+			parentSessionPath: "/tmp/project/parent.jsonl",
+			activity: "idle",
+			isSessionActive: true, // the residency fold, not a turn in flight
+			isStreaming: false,
+			repliedSinceTask: true,
+		});
+		const parent = makeSummary({
+			id: "parent-active",
+			activeSessionId: "parent-active",
+			sessionId: "parent-session",
+			sessionFile: "/tmp/project/parent.jsonl",
+			sessionName: "Parent",
+			activity: "idle",
+		});
+		// The two axes disagree by construction. That is the input to the proposition, not the
+		// proposition itself.
+		expect(finished.activity).toBe("idle");
+		expect(finished.isSessionActive).toBe(true);
+
+		// The proposition: the section follows the display axis.
+		expect(classifyAgentsViewSession(finished)).toBe("idle");
+
+		// Both row-placement points must agree, otherwise a fix at the classifier alone still
+		// leaves the record path (reconcileUnifiedSessions) bucketing the row as Running.
+		const records = reconcileUnifiedSessions([parent, finished], []);
+		expect(records.length).toBe(2);
+		const parentRecord = records.find((record) => record.daemon?.sessionId === "parent-session");
+		const childRecord = records.find((record) => record.daemon?.rlmChildId === "sub-7c40ed68");
+		expect(childRecord?.section).toBe("idle");
+
+		const rows = buildAgentsViewRows(records, new Set([parentRecord?.identity ?? ""]));
+		expect(rows.length).toBeGreaterThan(0);
+		const childRow = rows.find((row) => row.summary.rlmChildId === "sub-7c40ed68");
+		expect(childRow?.section).toBe("idle");
+		// The rollup counts Running children only, and the synthetic summary line inherits the
+		// parent's section instead of the busiest child's.
+		const summaryRow = rows.find((row) => row.kind === "subagent-summary");
+		expect(summaryRow?.section).toBe("idle");
+		expect(summaryRow?.runningSubagentCount).toBe(0);
+		const parentRow = rows.find((row) => row.summary.sessionId === "parent-session" && row.kind === "agent");
+		expect(parentRow?.runningSubagentCount).toBe(0);
+
+		// Positive control 1: the same child mid-turn is still Running, and still counts.
+		const working = makeSummary({ ...finished, activity: "working", isStreaming: true });
+		expect(classifyAgentsViewSession(working)).toBe("running");
+		const workingRows = buildAgentsViewRows(reconcileUnifiedSessions([parent, working], []));
+		expect(workingRows.length).toBeGreaterThan(0);
+		expect(workingRows.find((row) => row.kind === "agent")?.runningSubagentCount).toBe(1);
+
+		// Positive control 2: a queued child reaches the view carrying the roster's own verdict
+		// (classifyAgentStatus short-circuits on queuedChild, which neither axis expresses), so
+		// an admitted-but-not-yet-resident child stays in Running.
+		expect(classifyAgentsViewSession(makeSummary({ statusLabel: "queued", rosterStatus: "running" }))).toBe(
+			"running",
+		);
+
+		// Positive control 3: the residency axis is untouched, so r44 (LIVE-1) still holds - the
+		// same row that reads Idle to the viewer still blocks passivation and worker eviction.
+		expect(isSessionSummaryBusy(finished)).toBe(true);
 	});
 
 	test("armed heartbeats stay Idle between firings; only real work is Running", () => {
@@ -772,11 +850,16 @@ describe("agents view state", () => {
 		);
 		const rows = buildAgentsViewRows([
 			...heartbeatChildren,
+			// Both axes agree on this one, as they do in production: a child running tools has a
+			// turn in flight, so activeActivityForSession reports "working" and the summary's
+			// isSessionActive is the raw turn term, not the kernel-residency fold. Expressing busy
+			// through isSessionActive alone would describe a finished child that merely hosts
+			// background work - which is Idle on the display axis by design.
 			makeSummary({
 				id: "busy-child",
 				runtimeKind: "subagent",
 				parentActiveSessionId: "parent-active",
-				activity: "idle",
+				activity: "working",
 				isSessionActive: true,
 				isRunningTools: true,
 			}),

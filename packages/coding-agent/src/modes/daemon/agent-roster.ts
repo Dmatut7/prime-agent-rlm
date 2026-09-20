@@ -9,7 +9,7 @@ export interface AgentStatusInput {
 	resident: boolean;
 	/** Admitted child run whose session has not materialized yet. */
 	queuedChild: boolean;
-	/** Actively working: streaming or running tools/bash. */
+	/** Display-axis work: a turn in flight (streaming or running tools/bash). */
 	busy: boolean;
 }
 
@@ -26,14 +26,25 @@ export function isSessionSummaryBusy(
 	return summary.isSessionActive || summary.hasRunningRlmChildren === true;
 }
 
+/**
+ * Display busy: what an agent surface means by "Running". Deliberately excludes kernel-hosted
+ * background work and delegated child work - both are residency facts about the session, not
+ * activity of the agent. `isSessionActive` folds in `isKernelWorkInFlight` (LIVE-1, r44) so a
+ * child that finished its turn hours ago but left a `bash()` handle alive would otherwise read as
+ * Running forever; the residency axis that has to see that handle stays `isSessionSummaryBusy()`.
+ */
+export function isSessionSummaryDisplayBusy(summary: Pick<SessionSummary, "activity">): boolean {
+	return summary.activity === "working";
+}
+
 export function classifySessionRosterStatus(
-	summary: Pick<SessionSummary, "activeSessionId" | "activity" | "isSessionActive">,
+	summary: Pick<SessionSummary, "activeSessionId" | "activity">,
 	queuedChild = false,
 ): AgentRosterStatus {
 	return classifyAgentStatus({
 		resident: !!summary.activeSessionId,
 		queuedChild,
-		busy: summary.activity === "working" || summary.isSessionActive === true,
+		busy: isSessionSummaryDisplayBusy(summary),
 	});
 }
 

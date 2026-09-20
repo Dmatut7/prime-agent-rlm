@@ -534,10 +534,14 @@ describe("worker roster reporter", () => {
 // --- Supervisor-side roster ledger ---
 
 function summary(overrides: Partial<SessionSummary> & Pick<SessionSummary, "id" | "sessionId">): SessionSummary {
+	// Both axes agree unless a fixture separates them on purpose. `isSessionActive` on its own is a
+	// residency fact (it folds in kernel-hosted background work, LIVE-1/r44) and the section
+	// classifier does not read it, so a busy row has to say so on the display axis as well.
+	const isSessionActive = overrides.isSessionActive ?? false;
 	return {
 		lifecycle: "live",
-		activity: "idle",
-		isSessionActive: false,
+		activity: isSessionActive ? "working" : "idle",
+		isSessionActive,
 		cwd: "/tmp/project",
 		isStreaming: false,
 		isCompacting: false,
