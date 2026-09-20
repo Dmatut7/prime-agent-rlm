@@ -70,6 +70,17 @@ describe("ReplKernelManager kernel pipe errors", () => {
 		expect(internals.kernelDiagnostics).toContain("kernel stdout error: read ECONNRESET");
 	});
 
+	it("absorbs a stderr pipe error as a diagnostic instead of throwing it at the worker", () => {
+		const { internals, child } = wiredManager();
+		// The read side is guarded for the same reason as the write side: an
+		// 'error' with no listener is rethrown by Node as an uncaught exception,
+		// and the worker's crash handler turns that into process.exit(1) for every
+		// session it hosts. wireChild also destroys stderr one turn after 'exit',
+		// which is itself an error source.
+		expect(() => child.stderr.emit("error", new Error("read ECONNRESET"))).not.toThrow();
+		expect(internals.kernelDiagnostics).toContain("kernel stderr error: read ECONNRESET");
+	});
+
 	it("ignores pipe errors from a child a newer spawn superseded", () => {
 		const { internals, child } = wiredManager();
 		const replacement = fakeKernelChild();
@@ -79,6 +90,7 @@ describe("ReplKernelManager kernel pipe errors", () => {
 
 		expect(() => child.stdin.emit("error", new Error("write EPIPE"))).not.toThrow();
 		expect(() => child.stdout.emit("error", new Error("read ECONNRESET"))).not.toThrow();
+		expect(() => child.stderr.emit("error", new Error("read ECONNRESET"))).not.toThrow();
 		expect(internals.kernelDiagnostics).toBe("");
 
 		// The live child still reports: the guard is about attribution, not silence.
@@ -157,11 +169,13 @@ describeIfKernel("ReplKernelManager pipe errors (real runtime)", { tags: ["kerne
 		const child = (manager as unknown as { child?: ChildProcess }).child;
 		expect(child?.stdin).toBeDefined();
 		expect(child?.stdout).toBeDefined();
+		expect(child?.stderr).toBeDefined();
 		// A write racing the kernel's death lands as an 'error' event on the pipe;
 		// without a listener Node crashes the worker (observed in production as
-		// "uncaught exception: Error: write EPIPE").
+		// "write EPIPE"). Read-side pipes need the same guard.
 		expect(() => child?.stdin?.emit("error", new Error("write EPIPE"))).not.toThrow();
 		expect(() => child?.stdout?.emit("error", new Error("read ECONNRESET"))).not.toThrow();
+		expect(() => child?.stderr?.emit("error", new Error("read ECONNRESET"))).not.toThrow();
 
 		// The kernel is still healthy: further cells keep executing and shutdown
 		// (afterEach) still completes.
