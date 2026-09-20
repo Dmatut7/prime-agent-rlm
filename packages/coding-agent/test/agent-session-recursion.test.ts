@@ -16,6 +16,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	type AgentSessionMessageController,
 	createAgentSessionMessage,
+	formatAgentSessionNameReserved,
+	formatAgentSessionNameUnavailable,
 	isAgentSessionMessage,
 } from "../src/core/agent-messages.js";
 import { AgentSession, type RlmChildAgentSnapshot } from "../src/core/agent-session.js";
@@ -555,6 +557,47 @@ describe("AgentSession rlm recursion", () => {
 		);
 		releaseChild();
 		await runPromise;
+	});
+
+	it("holds a spawn name reservation until admission settles, then frees it", async () => {
+		const releaseAdmission = deferred<void>();
+		let admissions = 0;
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => {
+					admissions += 1;
+					if (admissions === 1) {
+						await releaseAdmission.promise;
+						throw new Error("kernel startup failed");
+					}
+					return { session: createSession() };
+				},
+				deleteRlmSubagentRuntime: async () => {},
+			},
+		});
+		const spawned = await root.runRlmChild("slow admitting child", { name: "slow-worker" });
+
+		// Admission is in flight and nothing durable records the name yet, so the
+		// reservation is what fails a parallel same-name spawn closed. It has its
+		// own copy: the "already registered" one would claim a child exists.
+		await expect(root.runRlmChild("racing spawn", { name: "slow-worker" })).rejects.toThrow(
+			formatAgentSessionNameReserved("slow-worker", root.rlmDepth + 1),
+		);
+
+		releaseAdmission.resolve();
+		await waitFor(() => {
+			const status = root.getRlmChildRunStatus(spawned.rlm_child_id);
+			return status === undefined || status === "error";
+		});
+
+		// The failed admission released the reservation: the errored run still holds
+		// the name, so the respawn is refused by the retained-child rule and its copy
+		// is the "already registered" one, not the in-flight-reservation one. A
+		// leaked reservation would answer with the reserved copy instead.
+		await expect(root.runRlmChild("respawn after the failed admission", { name: "slow-worker" })).rejects.toThrow(
+			formatAgentSessionNameUnavailable("slow-worker", root.rlmDepth + 1),
+		);
+		expect(admissions).toBe(1);
 	});
 
 	it("makes an externally restored retained child listable and deletable", async () => {

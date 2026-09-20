@@ -16941,7 +16941,20 @@ export class AgentSession {
 			}
 			this._pendingRlmSubagentSessionNames.add(requestedSessionName);
 		}
+		// The name stays reserved until the spawn admission settles: the detached
+		// runtime task releases it when admission completes (success or failure),
+		// and every pre-admission failure path releases it here. Nothing durable
+		// records the checked name in between - the child run is not registered yet
+		// and the ledger spawn edge only lands at daemon admission - so releasing
+		// earlier lets two parallel same-name spawns both pass availability and both
+		// append a durable edge, leaving delete/agent_message selectors ambiguous.
+		const releaseReservedSessionName = () => {
+			if (requestedSessionName) this._pendingRlmSubagentSessionNames.delete(requestedSessionName);
+		};
 		let modelSelection: RlmSubagentModelSelection;
+		let childSessionDir = "";
+		let childNodeId = "";
+		let sessionName = "";
 		try {
 			if (requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(requestedSessionName, true);
 			// An unpinned spawn model resolves against the persisted subagent
@@ -16950,25 +16963,26 @@ export class AgentSession {
 			modelSelection = await this._resolveRlmSubagentModel(
 				requestedModel ?? this.settingsManager.getSubagentDefaultModel(),
 			);
-		} finally {
-			if (requestedSessionName) this._pendingRlmSubagentSessionNames.delete(requestedSessionName);
-		}
-		signal?.throwIfAborted();
-		if (requestedThinkingLevel !== undefined) {
-			const supported = getSupportedThinkingLevels(modelSelection.model) as ThinkingLevel[];
-			if (!supported.includes(requestedThinkingLevel)) {
-				throw new Error(
-					`Requested thinking level "${requestedThinkingLevel}" is not supported by model "${modelSelection.model.provider}/${modelSelection.model.id}"; supported levels: ${supported.join(", ")}`,
-				);
+			signal?.throwIfAborted();
+			if (requestedThinkingLevel !== undefined) {
+				const supported = getSupportedThinkingLevels(modelSelection.model) as ThinkingLevel[];
+				if (!supported.includes(requestedThinkingLevel)) {
+					throw new Error(
+						`Requested thinking level "${requestedThinkingLevel}" is not supported by model "${modelSelection.model.provider}/${modelSelection.model.id}"; supported levels: ${supported.join(", ")}`,
+					);
+				}
 			}
+			if (this._disposed || this._disposing) {
+				throw new Error("Cannot spawn a subagent after its parent was disposed");
+			}
+			const admitted = await this._admitChildRlmSessionDir(requestedSessionName, prompt, signal);
+			childSessionDir = admitted.childSessionDir;
+			childNodeId = admitted.childNodeId;
+			sessionName = admitted.sessionName;
+		} catch (error) {
+			releaseReservedSessionName();
+			throw error;
 		}
-		if (this._disposed || this._disposing) throw new Error("Cannot spawn a subagent after its parent was disposed");
-
-		const { childSessionDir, childNodeId, sessionName } = await this._admitChildRlmSessionDir(
-			requestedSessionName,
-			prompt,
-			signal,
-		);
 		const startedAt = Date.now();
 		const parentAssistantForUsage = this._findLastAssistantMessage();
 		let runningToolCount = 0;
@@ -17111,7 +17125,14 @@ export class AgentSession {
 			// success and the failure branch and needs the reply baseline either way.
 			let parentReplyCountBeforeRun = 0;
 			try {
-				childRuntime = await this._createRlmSubagentRuntime(subagentOptions);
+				try {
+					childRuntime = await this._createRlmSubagentRuntime(subagentOptions);
+				} finally {
+					// Admission settled: in daemon mode the spawn edge is now
+					// durable, so the name transfers from the pending reservation
+					// to the admitted run. A failed admission frees the name.
+					releaseReservedSessionName();
+				}
 				const child = childRuntime.session;
 				if (run.status === "cancelled") throw new Error(run.error ?? "RLM child cancelled");
 				if (child.sessionName !== sessionName) child.setSessionName(sessionName);

@@ -1225,6 +1225,7 @@ describe("daemon mode helpers", () => {
 					saved: Awaited<ReturnType<typeof SessionManager.listAll>>,
 					jobs: AgentCronJob[],
 				): Promise<Array<{ sessionFile?: string; rlmChildId?: string }>>;
+				rlmSpawnLedger(): { liveEdges(): Promise<Array<{ childId: string; name: string }>> };
 			};
 			const parentState = await internals.createRuntime({ type: "create", sessionPath: parentSessionFile });
 			Object.assign(parentState.runtime.session, {
@@ -1237,24 +1238,36 @@ describe("daemon mode helpers", () => {
 				hasRunningRlmChildren: () => false,
 				getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
 			});
-			const childRuntime = await internals.createRlmSubagentRuntime(parentState, {
-				parentSession: parentState.runtime.session,
-				id: "child-1",
-				prompt: "complete and persist",
-				sessionName: "real-worker",
-				sessionDir: childSessionDir,
-				model: { provider: "test", id: "model" } as Model<Api>,
-				thinkingLevel: "off",
-				serviceTier: null,
-				scopedModels: [],
-				activeToolNames: [],
-				customTools: [],
-				includeGoals: false,
-				includeCompactSkill: false,
-				rlmDepth: 1,
-				rlmMaxDepth: 4,
-				rlmParentNodeId: "child-1",
-			});
+			const spawn = (id: string) =>
+				internals.createRlmSubagentRuntime(parentState, {
+					parentSession: parentState.runtime.session,
+					id,
+					prompt: "complete and persist",
+					sessionName: "real-worker",
+					sessionDir: join(parentManager.getSessionArtifactDir()!, id),
+					model: { provider: "test", id: "model" } as Model<Api>,
+					thinkingLevel: "off" as const,
+					serviceTier: null,
+					scopedModels: [],
+					activeToolNames: [],
+					customTools: [],
+					includeGoals: false,
+					includeCompactSkill: false,
+					rlmDepth: 1,
+					rlmMaxDepth: 4,
+					rlmParentNodeId: id,
+				});
+			// A same-name sibling admitted in parallel must fail closed at the
+			// admission boundary: both parents' availability checks passed before
+			// either edge was durable, so without a reservation held across the
+			// admission the ledger ends up with two live edges for one name and
+			// every delete/agent_message selector for it stays ambiguous forever.
+			const admission = spawn("child-1");
+			await expect(spawn("child-2")).rejects.toThrow('Agent name "real-worker" is unavailable');
+			const childRuntime = await admission;
+			const namedEdges = async () =>
+				(await internals.rlmSpawnLedger().liveEdges()).filter((edge) => edge.name === "real-worker");
+			expect(await namedEdges()).toHaveLength(1);
 			const childState = [...internals.sessions.values()].find(
 				(state) => state.runtime.session === childRuntime.session,
 			);
@@ -1292,6 +1305,14 @@ describe("daemon mode helpers", () => {
 				status: "completed",
 				prompt: "complete and persist",
 			});
+			// The admission's reservation is cleaned up, not leaked: after the child
+			// is deleted the same name can be admitted again, and the ledger still
+			// carries exactly one live edge for it.
+			await host.deleteRlmSubagentRuntime?.("child-1", childRuntime.session);
+			await spawn("child-3");
+			const edgesAfter = await namedEdges();
+			expect(edgesAfter).toHaveLength(1);
+			expect(edgesAfter[0]?.childId).toBe("child-3");
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
