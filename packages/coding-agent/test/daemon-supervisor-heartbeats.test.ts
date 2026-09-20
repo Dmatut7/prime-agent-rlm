@@ -2,6 +2,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { AgentCronJob } from "../src/core/cron-jobs.js";
+import type { SessionInfo } from "../src/core/session-manager.js";
 import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import { type DaemonCommand, type DaemonResponse, failure, success } from "../src/modes/daemon/daemon-protocol.js";
 import {
@@ -20,6 +22,19 @@ interface SupervisorHarness {
 	forwardToWorker(worker: unknown, command: DaemonCommand, timeoutMs?: number): Promise<DaemonResponse>;
 	handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<DaemonResponse | undefined>;
 	handleWorkerFrame(worker: unknown, frame: unknown): void;
+	passiveScheduledJobs?: {
+		rows: Array<{ rootSessionFile: string; job: AgentCronJob; info: SessionInfo }>;
+		scannedAt: number;
+	};
+}
+
+/** The passive half of a heartbeat list: an armed job whose session has no resident worker. */
+function passiveHeartbeatRow(id: string, sessionName: string) {
+	return {
+		rootSessionFile: `/tmp/${id}-root.jsonl`,
+		job: { id, source: "heartbeat", status: "active" } as AgentCronJob,
+		info: { id: `${id}-session`, path: `/tmp/${id}.jsonl`, name: sessionName } as SessionInfo,
+	};
 }
 
 const tempDirs: string[] = [];
@@ -386,6 +401,44 @@ describe("daemon supervisor heartbeat aggregation", () => {
 		expect(response).toMatchObject({
 			success: true,
 			data: { heartbeats: [{ job: { id: "heartbeat-healthy" } }] },
+		});
+		expect(supervisor.log).toHaveBeenCalledWith(expect.stringContaining("wedged"));
+	}, 10_000);
+
+	it("serves the passive snapshot while a wedged worker still costs only its fanout budget", async () => {
+		const supervisor = createSupervisorHarness();
+		const healthy = worker("ready", true, "healthy");
+		const wedged = worker("ready", true, "wedged");
+		supervisor.workers.set("healthy", healthy);
+		supervisor.workers.set("wedged", wedged);
+		supervisor.log = vi.fn();
+		supervisor.forwardToWorker = vi.fn(async (target, command) => {
+			if (target === wedged) return new Promise<DaemonResponse>(() => {});
+			return success(command.id, command.type, { heartbeats: [{ job: { id: "heartbeat-healthy" } }] });
+		});
+		// The two halves of the global list must not trade latency: a warm catalog
+		// snapshot means the passive rows cost no disk scan, and a wedged worker still
+		// costs only its bounded fanout absence instead of failing the list.
+		supervisor.passiveScheduledJobs = {
+			rows: [passiveHeartbeatRow("heartbeat-passive", "passive-worker")],
+			scannedAt: Date.now(),
+		};
+
+		const startedAt = Date.now();
+		const response = await supervisor.handleCommand({} as DaemonSocketClient, {
+			id: "list-passive",
+			type: "heartbeats_list",
+		});
+		const elapsedMs = Date.now() - startedAt;
+
+		expect(elapsedMs).toBeLessThan(2_500);
+		const heartbeats = (response as { data?: { heartbeats?: Array<{ job: { id: string } }> } })?.data?.heartbeats;
+		expect(heartbeats?.map((heartbeat) => heartbeat.job.id).sort()).toEqual([
+			"heartbeat-healthy",
+			"heartbeat-passive",
+		]);
+		expect(heartbeats?.find((heartbeat) => heartbeat.job.id === "heartbeat-passive")).toMatchObject({
+			sessionName: "passive-worker",
 		});
 		expect(supervisor.log).toHaveBeenCalledWith(expect.stringContaining("wedged"));
 	}, 10_000);

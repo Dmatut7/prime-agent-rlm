@@ -1,0 +1,1 @@
+- Fixed `heartbeats_list` timing out on busy daemons: the supervisor now answers the passive half of the catalog from a shared in-memory scheduled-jobs snapshot - one in-flight disk scan serves every concurrent catalog request, daemon-owned heartbeat mutations drop it, and an aged snapshot refreshes in the background instead of blocking a response.
