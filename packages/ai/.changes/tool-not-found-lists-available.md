@@ -1,1 +1,0 @@
-- Improved the tool-not-found error to list the available tools, so agents self-correct in one turn instead of retrying blindly.

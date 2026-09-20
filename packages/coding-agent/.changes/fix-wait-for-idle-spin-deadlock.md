@@ -1,3 +1,0 @@
-- Fixed a wedged session spinning at 100% CPU inside `waitForIdle`: the loop now yields to the event loop every cycle, polls instead of hot-looping once a cycle stops making progress, and gives up with an error in the session log when nothing in flight can still advance the state, so a stranded action can no longer starve every other request on that worker.
-- Fixed a dispatched turn whose delivery failed after its message reached the context staying unfinished forever, which pinned idle waits, subagent quiescence checks and session eviction behind it.
-- Changed session teardown to settle queued work before awaiting child-session and kernel disposal, so a teardown that blocks on IO no longer keeps idle waiters (and daemon passivation) pinned behind it.
