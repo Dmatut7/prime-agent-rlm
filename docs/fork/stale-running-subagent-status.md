@@ -633,3 +633,68 @@ $ git show --stat --format='%h %s' e311d6495
 | `RlmLedgerEdge` / record 词表 | `core/rlm-ledger-compaction.ts:45-84` | ledger **无完成态** |
 | `registerRlmChildSession` | `core/agent-session.ts:16192-16210` | 完成后保留子会话（"kernel 不死"的出处） |
 | D35 锁测 | `test/suite/live-kernel-work-residency.test.ts` | "卡 Running" 被钉为预期行为 |
+
+---
+
+## 12. 落地记录（施工席 fix-stale-running，2026-09-20 13:25 CST 提交）
+
+- **修复提交 = `f617503fd`**（`fix(coding-agent): let a finished subagent leave the agents view Running section`，13 files，+823/-21）。回滚把手：`git revert f617503fd`（单提交、无 env 开关、无数据迁移、无协议 bump）。**未 push**（push 前需另补 `FORK_NOTES.md` 一览行）。
+- **落地范围**＝§10 裁定后的方案 A ＋ §4.5 安全闸 ＋ 方案 B 第 1 条：
+  - `modes/daemon/agent-roster.ts`：新增导出 `isSessionSummaryDisplayBusy(summary) = activity === "working"`；`classifySessionRosterStatus` 的 busy 改读它，`Pick` 收窄掉 `isSessionActive`。**`isSessionSummaryBusy`（驻留轴）与 `daemon-session-list.ts:276` 的 `|| session.isKernelWorkInFlight === true` 折入逐字未改**——r44 两个载体都没碰。
+  - `modes/agents-view/agents-view-mode.ts`：`hasLiveWork` 补 `summary.isSessionActive === true` 与 `summary.isBashRunning === true` 两腿（§4.5）；并按 §5 针 5 的点名，把 `:2944` 的 subagent legend 从直读 `selectedRow.section === "running"` 改走 `hasLiveWork(selectedRow)`（否则 legend 说 delete、动作却 stop）。
+  - `modes/daemon/daemon-mode.ts`：`completeRlmSubagentRuntime` 落完 display 文件后补两次 `scheduleRosterFlush`（子行 + 父行），比照删除路径。
+  - `modes/agents-view/agents-view-state.ts`：doc-only，`:1457` 注释里全仓不存在的 `isAgentsViewSessionBusy` 改引真实谓词（§2 的附带发现）。
+- **§10 裁定执行情况**：第 1 条按默认值（显示轴）；第 2 条获准反转 D35 段位断言，同用例的 4 条 r44 驻留断言（`isSessionActive`/`isSessionSummaryBusy`/`isBashRunning`/`activity`）与 "the split is a red line"、"blocks whole-worker eviction" 两条用例**一字未改**；第 3 条（标签文案）母席裁**不做**，故方案 B 第 2 条未落地，已交差子代理的行标签仍可能是 `replied`/`needs input`；第 4 条按默认值做；第 5 条（`e311d6495` 合并时机）未动，仍待母席排窗。
+
+### 12.1 针与红绿证据
+
+| 针 | 文件 | 说明 |
+|---|---|---|
+| 针 1 | `test/agents-view-state.test.ts`「a finished subagent that only hosts kernel background work is Idle, not Running」 | 分类器 + record 路径（`reconcileUnifiedSessions`）+ 行路径（`buildAgentsViewRows`）三处同判；正控＝mid-turn 仍 running 且父行计数 1、queued 行按**真实线上形状** `{ statusLabel:"queued", rosterStatus:"running" }`、驻留轴 `isSessionSummaryBusy` 仍 true |
+| 针 1b（规格外补） | `test/subagent-summary-line.test.ts`「counts a finished child that only hosts kernel background work as idle on both faces」 | 补 §4.6 第 4 行要求的 footer/tray 断言：tray 计数与 agents 视图同一份输入必须同判 |
+| 针 2 | `test/agent-roster.test.ts`「reads the display axis for the section and the residency axis for eviction」 | 一个公式两条轴并排断言；helper 改两轴一致后原循环期望值一字未改 |
+| 针 3 | `test/suite/live-kernel-work-residency.test.ts` D35 | 段位断言 `"running"`→`"idle"`，标题与注释改写为新裁定记录 |
+| 针 4 | `test/suite/regressions/stale-running-completed-subagent.test.ts`（新增 573 行，0902 子席产出，sha256 `343cbb59a1277404ea324e3e495f757a03f70d76e59c6720bd8ee673b7b07d2d`） | 三个真 faux-provider 会话（root→被测 mid→mid 自己的 leaf）真跑 turn、真 `runRlmChild`、真 `registerRlmChildSession`，kernel 句柄走 harness `kernelResidencyFacts` 注入；逐跳过 `buildSessionList`→`workerRosterEntryFromSummary`→`AgentRoster.write`→`sessionSummaryFromRosterEntry`→`reconcileUnifiedSessions`→`buildAgentsViewRows`；终态用真 reader 从磁盘读回；同口气断言 `canEvictWorker === false`。树必须三层：断言 3 要被测行是别人的**子**（父行才数得到），断言 4 要它是别人的**父**（`:1154` 才有它继承的 section）。无私有成员探测 |
+| 针 5 | `test/agents-view-mode.test.ts`「keeps the destructive-action gate on live work when the section reads Idle」 | 通过公开渲染入口（legend 文案）断言，不导出 `hasLiveWork` |
+| 针 6 | 变异实测，见 12.2 | — |
+
+- **先红后绿**：红证据取自 pristine worktree @ `07d07dfdb`（未修 src）——本席 7 文件 **5 failed | 207 passed**（一红一针）；针 4 在同形 worktree 连跑 7 轮均 **4 failed | 5 passed (9)**，无抖动。绿证据：7 文件 212 passed、针 4 9 passed、提交态复跑 **217 passed (217) EXIT=0**。
+- **被本次修复打红的 3 个既有夹具**（都是"用驻留轴单独表达忙"的生产不可达形状：`activity:"idle"` + `isSessionActive:true`，而 `activeActivityForSession` 在原始 `isSessionActive` 为真时直接 return `"working"`）：`test/agents-view-state.test.ts`「keeps idle heartbeating subagents out of the running count」的 busy-child、`test/agents-view-roster.test.ts` 与 `test/daemon-agent-roster.test.ts` 的 `summary()` helper。按 §5 针 2 的同一原则**只改夹具两轴一致、期望值一字不改**；两个 roster helper 文件在修前修后**都全绿**，自证 turn 级活跃语义零回归。
+
+### 12.2 变异实测（针 6）
+
+复原一律 `git checkout --` 从提交态取，并用 `git hash-object` 与提交时记录的 blob 哈希逐一比对，6 条 × 4 文件全部 restore_ok。基线（未变异）217 passed / EXIT=0。
+
+| 变异 | 红 | 咬到谁 |
+|---|---|---|
+| M1 段位判据改回 `\|\| summary.isSessionActive === true` | **8** | 针 1、针 1b、针 2、针 3(D35)、针 4×4 |
+| M2 删 `hasLiveWork` 的 `isSessionActive` 腿 | **1** | 针 5 |
+| M3 legend 改回 `selectedRow.section === "running"` | **1** | 针 5 |
+| M4 删 `daemon-session-list.ts:276` 的 kernel 折入（r44 载体 2） | **5** | `live-kernel-work-residency`×3（passivation / D35 / whole-worker eviction）+ 针 4×2 ⇒ 本次修复没有顺手拆掉 r44 的锁 |
+| M5 删 `daemon-session-list.ts:460-462` 的"已完成 subagent 提前 return idle" | **9** | `daemon-session-list.test.ts`×2 + 针 4×7 ⇒ 显示轴本身有牙 |
+| **M6 删完成时的 roster flush（方案 B 第 1 条）** | **0** | **无针——见 12.3** |
+
+- 与 §5 针 6 表的偏差（据实登记）：M5 该行预期"针 1 的正控／针 4"，实测**只有针 4 咬到**——针 1 用合成 summary，不经过 `activeActivityForSession`。
+
+### 12.3 已登记技术债：方案 B 第 1 条无针（母席 2026-09-20 裁定接受）
+
+- **事实**：M6（撤掉 `completeRlmSubagentRuntime` 里补的两次 `scheduleRosterFlush`）→ 7 文件 217 例全绿，0 红。§5 的 6 针与针 6 的变异表都没有为方案 B 第 1 条设计针。
+- **为什么没顺手补**：仓内唯一能驱动到该钩子的入口是私有方法 `AgentDaemon.createSubagentRuntimeHost`；`test/daemon-mode.test.ts` 有 10+ 处冻结旧账用 `daemon as unknown as { createSubagentRuntimeHost(...) }` 这种同文件 shadow-type 私有探测。**`scripts/check-test-private-probes.mjs` 的 `PRIVATE_MEMBER_RE` 只认 `_` 前缀成员，抓不到它，所以"门禁零新增"不等于"合规"**；AGENTS.md 明文禁新测试这么写，故未抄。
+- **母席裁定（2026-09-20）**：接受该缺口。失效后果只是"延迟翻篇"（下一次该会话的 roster 事件或 passivate/close 仍会重算），不是"状态错误"，与断点 5 的原状同级。
+- **将来要补真针的公开面路线（已勘查）**：真 `AgentDaemon(worker)` + 注入 `createRuntime` 供 faux 运行时 + 真 socket 客户端收 `roster_delta` 帧，断言"终态落盘后确实来了一帧"。独立中等工作量，不夹带进收尾窗。
+
+### 12.4 六道闸读数
+
+1. `npm run check` **EXIT=0**（改中 / 含针 4 / 提交钩子内各一次），零 error/warning/info。
+2. `node scripts/check-test-private-probes.mjs` → **OK (no new private-member probes)**；scanned 962 files / 497 probes（private-cast=105、alias=243、spyon=149）/ frozen 474 / allowed 23，加针 4 前后同读数。
+3. 全量 vitest（提交态）：**Test Files 751（729 passed / 4 failed / 18 skipped）**，**Tests 8189 = 8087 passed + 4 failed + 98 pending + 0 todo**（对账平），178.9s，EXIT=1（非 9、非整数秒腰斩）。
+4. **零新增红的定性**：在 pristine worktree @ `07d07dfdb`（本修复的父提交，跑前先 `git checkout -- packages/coding-agent/test` 清掉拷进去的针）用**同一命令同一消毒 env** 复跑全量作基线 → 基线轮 **5 files / 5 tests 红 + 1 个 suite 级失败**（`compaction-emergency-shrink-linear`×2、`git-context`、`settings-ancestor-scope-resilience`、`agent-session-compaction-navigate`、`6006-bundled-bedrock`，另 `r35-impl-rt` 2 例被记 pending）。**基线轮比修复后任何一轮都红**，且它红到的三个文件在修复后的四轮里根本没红 ⇒ 满载 flaky 的红名单是"当轮负载"的函数。修复后连跑四轮的红名单逐轮轮换；逐条定性：`git-context`＝确定性红且 HEAD 原样逐字同红（本机 git 把 `git@github.com:` 重写成 `https://github.com/`），其余四个文件（`compaction-emergency-shrink-linear`/`settings-ancestor-scope-resilience`/`daemon-supervisor-crash-handlers`/`exec`）在 pristine 与修复后两棵树隔离复跑**都全绿**（18 passed / 23 passed），且与 roster·agents-view 无语义交集。
+5. SKIP 98 的对照面说明：18 个整文件 skip 全是 `kernel-heavy`/`process`/windows-only 专 job 面（只在 `npm run test:kernel` / `test:process` / `test:machine-wide` 跑），部分 skip 6 个文件（`daemon-supervisor-process` 8、`ipython-bootstrap` 5、`repl-kernel-snapshot-honesty` 5、`compaction` 2 真 provider 面、`repl-kernel-parent-watchdog` 2、`repl-kernel-pipe-errors` 1）。**本次改动的对照面（roster 分类、agents 视图段位与安全闸、kernel 驻留锁测、tray 计数）全部在场并跑了**，无一条落在 skip 里。
+6. **pristine 树 tsgo**：`git archive HEAD | tar -x -C <tmpdir>` + symlink `node_modules`（根 + `packages/*`），`npx tsgo --noEmit` → **EXIT=0 零输出**；**带正控**：副本内注入 `const x: number = "s"` 后 tsgo 精确报 `agent-roster.ts(247,7) error TS2322`，撤回后复跑净 ⇒ 零输出是真绿、不是没检查到。主树 `tsgo --noEmit` 亦 EXIT=0。
+
+### 12.5 尚未验证 / 待办
+
+- **§6-B 端到端真 daemon 人工验（第 8-11 条）未做**：第 11 条要 `prime-agent shutdown` 重启 daemon，会打断在飞席，按「重启窗前不夹带／一次一窗」归母席统一开窗；开窗后自证清单已交母席存档（四件：uptime_s 归零 + handbook/load 自证、抽一场真聊天、agents 视图核四件事、r44 侧日志与"没被 passivate/驱逐"）。
+- **§8 的两个活病例进程未处置**（pid 49275 / kernel 47462，pid 39790 / kernel 32553）：属运维动作，需先确认 rig 不再需要；本次只修码，未杀进程。它们正好可当开窗后的现成验证物——修复生效后这两行都应离开 Running 区。
+- **§10 第 5 条（`e311d6495` 合并时机）未动**：本修复已先落地，合并该笔时仍需按 §6-B 第 9 条单独跑端到端复核。
+- **异构复审**：针 4 出自 0902 席，按 2026-09-20 老板令（复杂/高风险活 K3 与 0902 双模型交叉）由母席另派 K3 复审；施工席已独立核过 sha256 逐字节一致、9/9 绿、门禁零新增、M1/M4/M5 三条变异分别咬到它 4 红 / 2 红 / 7 红 ⇒ 非恒绿针。
