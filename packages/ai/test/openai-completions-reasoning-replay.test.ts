@@ -33,10 +33,16 @@ const compat = {
 	enableSearch: false,
 	searchStrategy: undefined,
 	forcedSearch: false,
-} satisfies Required<Omit<OpenAICompletionsCompat, "cacheControlFormat" | "searchStrategy" | "toolStream">> & {
+} satisfies Required<
+	Omit<
+		OpenAICompletionsCompat,
+		"cacheControlFormat" | "searchStrategy" | "toolStream" | "reasoningCountsTowardMaxTokens"
+	>
+> & {
 	cacheControlFormat?: OpenAICompletionsCompat["cacheControlFormat"];
 	searchStrategy?: OpenAICompletionsCompat["searchStrategy"];
 	toolStream?: boolean;
+	reasoningCountsTowardMaxTokens?: boolean;
 };
 
 function buildModel(): Model<"openai-completions"> {

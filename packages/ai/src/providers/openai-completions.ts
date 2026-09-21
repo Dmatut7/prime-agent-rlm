@@ -121,11 +121,12 @@ interface OpenAICompatCacheControl {
 
 type ResolvedOpenAICompletionsCompat = Omit<
 	Required<OpenAICompletionsCompat>,
-	"cacheControlFormat" | "searchStrategy" | "toolStream"
+	"cacheControlFormat" | "searchStrategy" | "toolStream" | "reasoningCountsTowardMaxTokens"
 > & {
 	cacheControlFormat?: OpenAICompletionsCompat["cacheControlFormat"];
 	searchStrategy?: OpenAICompletionsCompat["searchStrategy"];
 	toolStream?: boolean;
+	reasoningCountsTowardMaxTokens?: boolean;
 };
 
 type ChatCompletionInstructionMessageParam = ChatCompletionDeveloperMessageParam | ChatCompletionSystemMessageParam;
@@ -764,6 +765,17 @@ export const streamSimpleOpenAICompletions: StreamFunction<"openai-completions",
 	}
 
 	const base = buildBaseOptions(model, options, apiKey);
+	// GLM-5.3 family on Bailian: reasoning tokens count inside max_tokens, so the shared
+	// streamSimple default (min(model.maxTokens, 32k)) can be burned by reasoning alone and
+	// the turn ends with finish_reason "length" and zero content. An explicit compat opt-in
+	// honors model.maxTokens instead; an explicit options.maxTokens is never overridden.
+	if (
+		getCompat(model).reasoningCountsTowardMaxTokens === true &&
+		!options?.maxTokens &&
+		model.maxTokens > (base.maxTokens ?? 0)
+	) {
+		base.maxTokens = model.maxTokens;
+	}
 	const requestedReasoning = options?.reasoning;
 	const reasoningSpecified = requestedReasoning !== undefined;
 	const clampedReasoning = reasoningSpecified ? clampThinkingLevel(model, requestedReasoning) : undefined;
@@ -1541,6 +1553,7 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
 		vercelGatewayRouting: {},
 		zaiToolStream: false,
 		toolStream: undefined,
+		reasoningCountsTowardMaxTokens: false,
 		supportsStrictMode: !isMoonshot && !isCloudflareAiGateway && !isPrimeInference,
 		cacheControlFormat,
 		sendSessionAffinityHeaders: false,
@@ -1578,6 +1591,8 @@ function getCompat(model: Model<"openai-completions">): ResolvedOpenAICompletion
 		vercelGatewayRouting: model.compat.vercelGatewayRouting ?? detected.vercelGatewayRouting,
 		zaiToolStream: model.compat.zaiToolStream ?? detected.zaiToolStream,
 		toolStream: model.compat.toolStream ?? detected.toolStream,
+		reasoningCountsTowardMaxTokens:
+			model.compat.reasoningCountsTowardMaxTokens ?? detected.reasoningCountsTowardMaxTokens,
 		supportsStrictMode: model.compat.supportsStrictMode ?? detected.supportsStrictMode,
 		cacheControlFormat: model.compat.cacheControlFormat ?? detected.cacheControlFormat,
 		sendSessionAffinityHeaders: model.compat.sendSessionAffinityHeaders ?? detected.sendSessionAffinityHeaders,

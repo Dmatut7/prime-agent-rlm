@@ -364,6 +364,14 @@ export interface OpenAICompletionsCompat {
 	 * single-shot form as more accurate for complex shapes. `undefined` (default) sends nothing.
 	 */
 	toolStream?: boolean;
+	/**
+	 * Whether reasoning/thinking tokens are counted inside the output token limit, so the
+	 * shared streamSimple default (min(model.maxTokens, 32k)) can be exhausted by reasoning
+	 * alone and the turn ends with `finish_reason: "length"` and zero content. Bailian's
+	 * GLM-5.3 family behaves this way and supports 128k output tokens, so models with this
+	 * flag honor `model.maxTokens` instead of the 32k clamp. Default: false.
+	 */
+	reasoningCountsTowardMaxTokens?: boolean;
 	/** Whether the provider supports the `strict` field in tool definitions. Default: true. */
 	supportsStrictMode?: boolean;
 	/** Cache control convention for prompt caching. "anthropic" applies Anthropic-style `cache_control` markers to the system prompt, last tool definition, and last user/assistant text content. */

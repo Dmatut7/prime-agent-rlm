@@ -19,7 +19,10 @@ const emptyUsage: Usage = {
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 
-const compat: Required<Omit<OpenAICompletionsCompat, "toolStream">> & { toolStream?: boolean } = {
+const compat: Required<Omit<OpenAICompletionsCompat, "toolStream" | "reasoningCountsTowardMaxTokens">> & {
+	toolStream?: boolean;
+	reasoningCountsTowardMaxTokens?: boolean;
+} = {
 	supportsStore: true,
 	supportsDeveloperRole: true,
 	supportsReasoningEffort: true,
