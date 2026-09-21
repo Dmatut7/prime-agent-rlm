@@ -93,6 +93,15 @@ def kernel_capabilities() -> list[str]:
 DEFAULT_SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024
 DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES = 16 * 1024 * 1024
 
+# Stream frames are bounded by the coalescer (_STREAM_FRAME_MAX_CHARS, 64 KiB,
+# upstream #2423's cap), so no separate stream cap is needed here.
+# The host truncates results at a smaller per-execution maxChars, so this only
+# bounds a pathological repr in transit.
+_RESULT_TEXT_CAP = 1_048_576
+_RESULT_TRUNCATION_MARKER = f"\n[... result truncated at {_RESULT_TEXT_CAP} characters ...]"
+# Oversized display payloads fail the cell instead of wedging host memory.
+_DISPLAY_PAYLOAD_CAP = 16 * 1024 * 1024
+
 # Names the session bootstrap re-creates on every start; never snapshotted.
 _ALWAYS_SKIP = {"rlm", "mcp", "bash", "asyncio", "In", "Out", "get_ipython", "exit", "quit", "open"}
 # IPython-injected names that may appear in a snapshot payload; never restored.
@@ -225,11 +234,16 @@ class _StreamCoalescer:
                 self._deadline = None
 
     def _send_entry(self, key: tuple[str, str | None]) -> None:
-        # Callers hold _cond, so the pop-to-wire order cannot interleave.
+        # Callers hold _cond, so the pop-to-wire order cannot interleave. The
+        # joined text ships in _STREAM_FRAME_MAX_CHARS chunks (upstream #2423's
+        # frame cap): a single oversized write must not become one unbounded
+        # frame, while short writes still coalesce into one frame per window.
         parts = self._entries.pop(key, None)
         self._sizes.pop(key, None)
         if parts:
-            _send({"event": key[0], "id": key[1], "text": "".join(parts)})
+            text = "".join(parts)
+            for start in range(0, len(text), _STREAM_FRAME_MAX_CHARS):
+                _send({"event": key[0], "id": key[1], "text": text[start : start + _STREAM_FRAME_MAX_CHARS]})
 
     def _run(self) -> None:
         try:
@@ -262,9 +276,11 @@ def emit(data: dict[str, Any]) -> None:
     # Strict-dumps validation: default allow_nan=True would let NaN/Infinity
     # serialize as non-JSON text and tear the host's protocol framing (a
     # non-serializable value already raises in _send before any bytes are
-    # written, so NaN is the only corruption vector). Payloads are small, so
-    # the throwaway serialization here is cheap; _send re-serializes.
-    json.dumps(data, allow_nan=False)
+    # written, so NaN is the only corruption vector). The encoded length
+    # enforces the display frame cap; _send re-serializes.
+    encoded = json.dumps(data, allow_nan=False)
+    if len(encoded) > _DISPLAY_PAYLOAD_CAP:
+        raise ValueError(f"display payload exceeds the {_DISPLAY_PAYLOAD_CAP}-character frame cap")
     # Same-context causality: text this cell printed before the emit precedes the frame.
     _stream_coalescer.flush()
     _send({"event": "display", "id": _current_cell.get(), "data": data})
@@ -475,7 +491,10 @@ class _TaggedWriter(io.TextIOBase):
             raise TypeError(f"write() argument must be str, not {type(text).__name__}")
         if text:
             # Buffered and coalesced into one frame per short window (see
-            # _StreamCoalescer); the id is captured here, at write time.
+            # _StreamCoalescer); the id is captured here, at write time. The
+            # coalescer bounds every frame at _STREAM_FRAME_MAX_CHARS (64 KiB,
+            # upstream #2423's cap) and flushes on threshold, so a burst cannot
+            # produce an unbounded single stream frame.
             _stream_coalescer.append(self._stream, _current_cell.get(), text)
         return len(text)
 
@@ -783,6 +802,8 @@ async def _handle_execute(req: dict[str, Any], ns: dict[str, Any]) -> None:
                     result_text = repr(value)
                 except BaseException as exc:  # noqa: BLE001 - a broken __repr__ is a cell error
                     status, error = "error", _error_event(cell_id, exc)
+            if result_text is not None and len(result_text) > _RESULT_TEXT_CAP:
+                result_text = result_text[:_RESULT_TEXT_CAP] + _RESULT_TRUNCATION_MARKER
             _drain_output()
         finally:
             # Close the interrupt window before the protocol sends so a
