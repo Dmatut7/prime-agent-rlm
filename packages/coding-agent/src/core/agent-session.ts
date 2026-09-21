@@ -13422,6 +13422,24 @@ export class AgentSession {
 			}
 			// An in-memory session has nothing to persist; context-only is the design.
 		}
+		// The fresh digest is authoritative and older in-context copies are
+		// regenerable redundancy, so the append replaces them instead of stacking.
+		const withoutOlderDigests = this.agent.state.messages.filter(
+			(existing) => !(existing.role === "custom" && existing.customType === HARNESS_DIGEST_CUSTOM_TYPE),
+		);
+		if (withoutOlderDigests.length !== this.agent.state.messages.length) {
+			this.agent.state.messages = withoutOlderDigests;
+		}
+		// The fresh append outranks the compaction snapshot the same way a newer
+		// digest entry does at rebuild time, so the live summary must yield its
+		// snapshot now: the context would otherwise render both the superseded
+		// snapshot and the fresh digest until the next rebuild.
+		for (const existing of this.agent.state.messages) {
+			if (existing.role === "compactionSummary" && existing.harnessDigest !== undefined) {
+				existing.harnessDigest = undefined;
+				existing.harnessStateFingerprint = undefined;
+			}
+		}
 		this.agent.state.messages.push(message);
 	}
 
