@@ -123,6 +123,10 @@ const skillReference = {
 	callable: "run",
 	call_pattern: "await run(...)",
 };
+const skillContract = {
+	reference: skillReference,
+	arguments: { input: { type: "string", required: true, description: "Task input" } },
+};
 
 function proposal(summary: string, edits: RefinementProposal["edits"]): RefinementProposal {
 	return {
@@ -600,6 +604,176 @@ describe("harness refinement", () => {
 		});
 		expect(state.entries.skill.unbacked_skill).toBeUndefined();
 		expect(state.entries.skill.shell_skill).toBeUndefined();
+	});
+
+	// Every rejected edit must leave harness state and the refinement log untouched.
+	type InvalidCase = {
+		label: string;
+		edit: RefinementProposal["edits"][number];
+		error: string;
+		seed?: RefinementKind;
+	};
+	const skillFieldsFor = (kind: RefinementKind) => (kind === "skill" ? skillContract : {});
+	// Raw (unnormalized) edit shapes for apply-time validation; overrides carry the violation.
+	const editWith = (
+		action: RefinementAction,
+		kind: RefinementKind,
+		id: string,
+		overrides: Record<string, unknown> = {},
+	): RefinementProposal["edits"][number] =>
+		({
+			action,
+			kind,
+			id,
+			title: "t",
+			content: "c",
+			...skillFieldsFor(kind),
+			...overrides,
+		}) as RefinementProposal["edits"][number];
+	it.each<InvalidCase>([
+		...kinds.map(
+			(kind): InvalidCase => ({
+				label: `duplicate create for ${kind}`,
+				seed: kind,
+				edit: { action: "create", kind, id: `${kind}_entry`, title: "t", content: "c", ...skillFieldsFor(kind) },
+				error: "entry already exists",
+			}),
+		),
+		...kinds.map(
+			(kind): InvalidCase => ({
+				label: `update of a missing ${kind}`,
+				edit: { action: "update", kind, id: `${kind}_missing`, title: "t", content: "c", ...skillFieldsFor(kind) },
+				error: "entry not found",
+			}),
+		),
+		...kinds.map(
+			(kind): InvalidCase => ({
+				label: `delete of a missing ${kind}`,
+				edit: { action: "delete", kind, id: `${kind}_missing` },
+				error: "entry not found",
+			}),
+		),
+		{
+			label: "create without content",
+			edit: { action: "create", kind: "memory", id: "missing_fields", title: "t" },
+			error: "create requires title and content",
+		},
+		{
+			label: "update without content",
+			seed: "memory",
+			edit: { action: "update", kind: "memory", id: "memory_entry", title: "t" },
+			error: "update requires title and content",
+		},
+		{
+			label: "update without an id",
+			edit: { action: "update", kind: "skill", title: "t", content: "c" },
+			error: "update requires id",
+		},
+		{ label: "delete without an id", edit: { action: "delete", kind: "skill" }, error: "delete requires id" },
+		{
+			label: "an unsupported action",
+			edit: { action: "rename" as RefinementAction, kind: "memory", id: "bad_action", title: "t", content: "c" },
+			error: "unsupported action rename",
+		},
+		{
+			label: "an unsupported kind",
+			edit: { action: "create", kind: "tool" as RefinementKind, id: "bad_kind", title: "t", content: "c" },
+			error: "unsupported kind tool",
+		},
+		{
+			label: "a skill without an argument contract",
+			edit: {
+				action: "create",
+				kind: "skill",
+				id: "argumentless",
+				title: "t",
+				content: "c",
+				reference: skillReference,
+			},
+			error: "create skill requires arguments",
+		},
+		{
+			label: "a skill without a Python reference",
+			edit: { action: "create", kind: "skill", id: "unbacked", title: "t", content: "c", arguments: {} },
+			error: "create skill requires python reference",
+		},
+		{
+			label: "a skill backed by a non-Python reference",
+			edit: {
+				action: "create",
+				kind: "skill",
+				id: "shell_skill",
+				title: "t",
+				content: "c",
+				reference: { type: "shell", command: "edit" },
+				arguments: {},
+			},
+			error: "create skill reference.type must be python",
+		},
+		{
+			label: "an update of the base system prompt",
+			edit: { action: "update", kind: "prompt", id: "base_system_prompt", title: "t", content: "c" },
+			error: "base system prompt",
+		},
+		{
+			label: "a create whose title derives the base system prompt id",
+			edit: { action: "create", kind: "prompt", title: "Base System Prompt", content: "c" },
+			error: "base system prompt",
+		},
+		{
+			label: "a create with list content",
+			edit: editWith("create", "memory", "list_content", { content: ["one string"] }),
+			error: "create requires title and content to be non-empty strings",
+		},
+		{
+			label: "a create with list title",
+			edit: editWith("create", "prompt", "list_title", { title: ["t"] }),
+			error: "create requires title and content to be non-empty strings",
+		},
+		{
+			label: "an update restoring list content",
+			seed: "memory",
+			edit: editWith("update", "memory", "memory_entry", { content: ["one string"] }),
+			error: "update requires title and content to be non-empty strings",
+		},
+		{
+			label: "a create with a numeric id",
+			edit: editWith("create", "memory", "numeric_id", { id: 7 }),
+			error: "create requires id to be a non-empty string when provided",
+		},
+		{
+			label: "a skill with a list reference",
+			edit: editWith("create", "skill", "list_reference", { reference: ["bad"] }),
+			error: "create requires reference to be an object when provided",
+		},
+		{
+			label: "a create with a numeric path",
+			edit: editWith("create", "memory", "bad_path", { path: 7 }),
+			error: "create requires path to be a non-empty string when provided",
+		},
+		{
+			label: "a skill with list arguments",
+			edit: editWith("create", "skill", "list_arguments", { arguments: ["a"] }),
+			error: "create requires arguments to be an object when provided",
+		},
+		{
+			label: "an update with list metadata",
+			seed: "memory",
+			edit: editWith("update", "memory", "memory_entry", { metadata: ["m"] }),
+			error: "update requires metadata to be an object when provided",
+		},
+	])("rejects $label without mutating state", ({ seed, edit, error }) => {
+		const state = loadHarnessState(makeTempDir());
+		if (seed) seedEntry(state, seed);
+		const before = structuredClone(state.entries);
+
+		const result = applyRefinementProposal(state, proposal("Invalid edit", [edit]), { id: "refine_invalid" });
+
+		expect(result.appliedEdits).toHaveLength(1);
+		expect(result.appliedEdits[0].applied).toBe(false);
+		expect(result.appliedEdits[0].error).toContain(error);
+		expect(state.entries).toEqual(before);
+		expect(state.refinements.at(-1)?.changes).toEqual([]);
 	});
 
 	it("uses a global harness state directory under the agent dir by default", () => {

@@ -4,10 +4,16 @@ import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall, type Model } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { BashResult } from "../../src/core/bash-executor.js";
-import { HARNESS_DIGEST_PREFIX } from "../../src/core/messages.js";
+import {
+	convertToLlm,
+	HARNESS_DIGEST_CUSTOM_TYPE,
+	HARNESS_DIGEST_PREFIX,
+	HARNESS_DIGEST_SUFFIX,
+} from "../../src/core/messages.js";
 import type { PromptTemplate } from "../../src/core/prompt-templates.js";
+import { getLocalHarnessStateDir, loadHarnessState, saveHarnessState } from "../../src/core/refinement/refinement.js";
 import { createSyntheticSourceInfo } from "../../src/core/source-info.js";
 import { createTestResourceLoader } from "../utilities.js";
 import {
@@ -2095,5 +2101,193 @@ stale post-hook extension instructions`,
 		harness.setResponses([fauxAssistantMessage("clean after")]);
 		await harness.session.prompt("normal prompt");
 		expect(getAssistantTexts(harness)).toContain("clean after");
+	});
+});
+
+describe("Harness digest at cold boundaries", () => {
+	const harnesses: Harness[] = [];
+	const tempDirs: string[] = [];
+
+	afterEach(() => {
+		while (harnesses.length > 0) {
+			harnesses.pop()?.cleanup();
+		}
+		while (tempDirs.length > 0) {
+			const dir = tempDirs.pop();
+			if (dir) rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	function digestMessages(harness: Harness) {
+		return harness.session.messages.filter(
+			(message) => message.role === "custom" && message.customType === HARNESS_DIGEST_CUSTOM_TYPE,
+		);
+	}
+
+	it("keeps untouched sessions empty and injects the digest at the first committed turn", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+
+		// Untouched sessions must stay empty for draft cleanup and emptiness checks.
+		expect(harness.session.messages).toHaveLength(0);
+		expect(
+			harness.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom_message" || entry.type === "message"),
+		).toHaveLength(0);
+
+		harness.setResponses([fauxAssistantMessage("hi")]);
+		await harness.session.prompt("hello");
+
+		const first = harness.session.messages[0];
+		expect(first).toMatchObject({ role: "custom", customType: HARNESS_DIGEST_CUSTOM_TYPE });
+		expect(harness.session.messages[1]).toMatchObject({ role: "user" });
+		expect(getMessageText(first)).toContain(HARNESS_DIGEST_PREFIX);
+		// Passes through to the model as a user message and is durably persisted.
+		expect(convertToLlm([first!])[0]?.role).toBe("user");
+		expect(
+			harness.sessionManager
+				.getEntries()
+				.some((entry) => entry.type === "custom_message" && entry.customType === HARNESS_DIGEST_CUSTOM_TYPE),
+		).toBe(true);
+	});
+
+	it("strips the digest with a cleared first turn and re-delivers it on the next turn", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		const agentMessageId = "agentmsg_digest_clear";
+		const agentPrompt = `Agent-to-agent message received.\nSource: agent_message\nTo: T, active t, session s\nMessage id: ${agentMessageId}\n\nagent text`;
+		harness.setResponses([fauxAssistantMessage("never delivered")]);
+		const admission = gateNextAgentStart(harness);
+
+		const accepted = harness.session.acceptAgentMessagePrompt(agentPrompt, { expandPromptTemplates: false });
+		const acceptedRejection = expect(accepted).rejects.toThrow("cleared before delivery");
+		await admission.reached;
+		harness.session.clearQueuedUserMessagesMatching((text) => text.includes(agentMessageId));
+		admission.release();
+		await acceptedRejection;
+		await harness.session.agent.waitForIdle();
+
+		// The cleared first turn takes its digest with it: the session is empty again.
+		expect(harness.session.messages).toHaveLength(0);
+
+		harness.setResponses([fauxAssistantMessage("hi")]);
+		await harness.session.prompt("hello");
+		expect(digestMessages(harness)).toHaveLength(1);
+		expect(harness.session.messages[0]).toMatchObject({ role: "custom", customType: HARNESS_DIGEST_CUSTOM_TYPE });
+	});
+
+	function isolatedAgentDir(prefix: string): string {
+		const previousAgentDir = process.env.PRIME_AGENT_CODING_AGENT_DIR;
+		const agentDir = join(tmpdir(), `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(agentDir, { recursive: true });
+		tempDirs.push(agentDir);
+		process.env.PRIME_AGENT_CODING_AGENT_DIR = agentDir;
+		onTestFinished(() => {
+			if (previousAgentDir === undefined) delete process.env.PRIME_AGENT_CODING_AGENT_DIR;
+			else process.env.PRIME_AGENT_CODING_AGENT_DIR = previousAgentDir;
+		});
+		return agentDir;
+	}
+
+	function seedMemory(
+		state: ReturnType<typeof loadHarnessState>,
+		id: string,
+		title: string,
+		content: string,
+		scope: "local" | "global" = "local",
+	): void {
+		state.entries.memory[id] = {
+			id,
+			kind: "memory",
+			title,
+			content,
+			path: "general",
+			scope,
+			reference: {},
+			arguments: {},
+			metadata: {},
+			source: "refine",
+			created_at: "2026-09-07T00:00:00.000Z",
+			updated_at: "2026-09-07T00:00:00.000Z",
+			version: 1,
+		};
+	}
+
+	it("delivers a diagnostic digest instead of crashing on a malformed global entry", async () => {
+		// Regression for the fleet-wide incident: one entry with list content in
+		// the global store bricked all child spawn creation via the digest crash.
+		const agentDir = isolatedAgentDir("pi-digest-malformed");
+		mkdirSync(join(agentDir, "harness"), { recursive: true });
+		writeFileSync(
+			join(agentDir, "harness", "harness_state.json"),
+			'{"schema":1,"entries":{"prompt":{},"skill":{},"subagent":{},"memory":{"broken_memory":{"id":"broken_memory","kind":"memory","title":"Breaking memory","content":["one string"],"path":"arc","scope":"global","version":1},"valid_memory":{"id":"valid_memory","kind":"memory","title":"Valid memory","content":"Worktree workflow notes.","path":"general","scope":"global","version":1}}},"refinements":[{"id":"refine_bad","trigger":["not a string"],"changes":[],"evidence":"","outcome":""},null,"RAWLEAK-5f1e",{"id":null,"trigger":"t","changes":["update memory:m"]},{"id":"bad_changes","trigger":"t","changes":[7]}]}',
+		);
+
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("hi")]);
+		await harness.session.prompt("hello");
+
+		const digests = digestMessages(harness);
+		expect(digests).toHaveLength(1);
+		const digest = getMessageText(digests[0]);
+		expect(digest).toContain("harness: skipped malformed entry broken_memory (content not a string)");
+		expect(digest).toContain("harness: skipped malformed refinement event refine_bad (trigger not a string)");
+		expect(digest).toContain("harness: skipped malformed refinement event null (event not an object)");
+		// Non-object elements are labeled by type only: the raw value must not leak.
+		expect(digest).toContain("harness: skipped malformed refinement event a string (event not an object)");
+		expect(digest).not.toContain("RAWLEAK-5f1e");
+		// Non-string ids and non-string change elements are skipped by type label, not rendered.
+		expect(digest).toContain("harness: skipped malformed refinement event a object id (id not a string)");
+		expect(digest).toContain(
+			"harness: skipped malformed refinement event bad_changes (changes contain a non-string)",
+		);
+		expect(digest).toContain("[global:valid_memory]");
+		// The malformed content itself must never leak into the digest.
+		expect(digest).not.toContain("one string");
+	});
+
+	it("skips digest re-delivery on resume when only query terms drifted and the state is unchanged", async () => {
+		// Hermetic store: the ambient developer harness would crowd the ranked window.
+		isolatedAgentDir("pi-digest-resume");
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		// Local material whose entries the resume-time query terms re-rank: the
+		// fresh render would differ, so only a state fingerprint can dedupe.
+		const localDir = getLocalHarnessStateDir(harness.sessionManager.getSessionArtifactDir());
+		expect(localDir).toBeDefined();
+		const state = loadHarnessState(localDir, "local");
+		seedMemory(state, "alpha_relevant", "Alpha second turn note", "Mentions second turns.");
+		seedMemory(state, "middle_plain", "Middle plain note", "Neutral material about tea varieties.");
+		seedMemory(state, "zeta_relevant", "Zeta hello note", "Greets with hello.");
+		saveHarnessState(localDir!, state);
+
+		harness.setResponses([fauxAssistantMessage("ack"), fauxAssistantMessage("ack")]);
+		await harness.session.prompt("hello");
+		await harness.session.prompt("second turn with different wording");
+		const before = digestMessages(harness);
+		expect(before).toHaveLength(1);
+		const digestTextBefore = getMessageText(before[0]);
+		expect(digestTextBefore).toContain("[local:alpha_relevant]");
+		const sessionFile = harness.sessionManager.getSessionFile();
+		expect(sessionFile).toBeDefined();
+		harness.session.dispose();
+
+		// Identical disk state, drifted query terms: the fresh render would
+		// differ, so only the fingerprint can dedupe. Exactly one byte-identical
+		// digest, with no copy stacked by the resume.
+		const resumed = await createHarness({ existingSessionFile: sessionFile });
+		harnesses.push(resumed);
+		const after = digestMessages(resumed);
+		expect(after).toHaveLength(1);
+		expect(getMessageText(after[0])).toBe(digestTextBefore);
+		const freshDigest = (
+			resumed.session as unknown as {
+				_harnessDigestWithFingerprint(): { digest: string; stateFingerprint: string };
+			}
+		)._harnessDigestWithFingerprint().digest;
+		expect(HARNESS_DIGEST_PREFIX + freshDigest + HARNESS_DIGEST_SUFFIX).not.toBe(getMessageText(after[0]));
+		resumed.session.dispose();
 	});
 });
