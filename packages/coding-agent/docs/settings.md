@@ -497,6 +497,12 @@ old one is reclaimed only after its references drop to zero.
 }
 ```
 
+### Diagnostics
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `requestTiming` | boolean | `false` | Log per-request provider timing phases to the diagnostic log (see [Development: Request timing](development.md#request-timing)); `PI_REQUEST_TIMING=1` also enables it |
+
 ### Message Delivery
 
 | Setting | Type | Default | Description |
