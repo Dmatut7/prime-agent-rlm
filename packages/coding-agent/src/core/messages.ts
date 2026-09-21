@@ -363,6 +363,12 @@ export interface RlmChildStallNoticeDetails {
 	workEvidence?: readonly string[];
 	/** Silence after which the watchdog would abort the turn; 0 or absent means warn-only. */
 	abortAfterMs?: number;
+	/**
+	 * Set only by an emitter whose build serves the agent abort lever
+	 * (agent_message.abort): the notice then names that lever before the destructive
+	 * delete. Absent on the in-process emitter, whose text stays exactly as before.
+	 */
+	canAbortAgentTarget?: boolean;
 }
 
 /**
@@ -387,6 +393,14 @@ export function createRlmChildStallNoticeMessage(
 		details.abortAfterMs !== undefined && details.abortAfterMs > 0
 			? ` The watchdog will abort the turn after ${Math.max(1, Math.round(details.abortAfterMs / 1000))}s of silence unless the work resumes or you cancel it first.`
 			: " No turn is killed for silence while the watchdog is warn-only, so letting it run is a valid answer.";
+	// Both levers interpolate the name into quoted call sites, so it carries the same
+	// header sanitization the terminal notice applies.
+	const childName = sanitizeMessageHeaderValue(details.sessionName);
+	const levers = details.canAbortAgentTarget
+		? `abort just the stuck turn with \`await agent_message.abort(receiver_role="child", receiver_name="${childName}")\` ` +
+			"(the child stays alive and its queued work is delivered in one new turn), " +
+			`or cancel the whole child with \`await rlm.delete_subagent("${childName}")\`, or re-dispatch the task.`
+		: `cancel it with \`await rlm.delete_subagent("${childName}")\` or re-dispatch the task.`;
 	return {
 		role: "custom",
 		customType: RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE,
@@ -394,7 +408,7 @@ export function createRlmChildStallNoticeMessage(
 			`RLM child ${details.sessionName} (${details.childId}) has been silent for ${silentSeconds}s while its turn is running ` +
 			`(silence threshold ${thresholdSeconds}s). In-flight tools: ${inFlight}. ${evidence}` +
 			`${deadline} Check its status: if it is genuinely working, let it continue; if it looks wedged, ` +
-			`cancel it with \`await rlm.delete_subagent("${details.sessionName}")\` or re-dispatch the task.`,
+			levers,
 		display: true,
 		details,
 		timestamp,

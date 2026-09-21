@@ -257,8 +257,14 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 //   so one recomputation covers the whole window. The rev-37 constant came out of the P3
 //   merge advertising a digest the merged wire no longer hashed; recomputing it here is the
 //   file's documented recovery, not a hand-written value.
-export const DAEMON_SCHEMA_REVISION = 38;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-38-317b96808bc4";
+// Revision 39 adds the agent-origin abort shape: optional fromActiveSessionId on the
+//   abort and abort_and_send_queued commands (agent_message.abort's wire half), gated
+//   behind the abort_agent_target capability. The bare commands are byte-identical to
+//   rev 38, so an old client is unaffected; the capability is what refuses a new client
+//   against a rev-38 peer, because that peer forwards the field without enforcing the
+//   nuclear-family reach the field promises.
+export const DAEMON_SCHEMA_REVISION = 39;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-39-24bfa75bec24";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -333,7 +339,11 @@ export type DaemonServerCapability =
 	// (get_direct_worker_transport). Deliberately not in DAEMON_DEFAULT_SERVER_CAPABILITIES;
 	// see DAEMON_SUPERVISOR_ONLY_SERVER_CAPABILITIES.
 	| "direct_peer_transport"
-	| "abort_and_send_queued";
+	| "abort_and_send_queued"
+	// Agent-originated aborts (agent_message.abort -> abort/abort_and_send_queued
+	// with fromActiveSessionId). Gated at rev 39; absent on older daemons, which is
+	// the rejection that tells a new client the daemon cannot serve agent aborts.
+	| "abort_agent_target";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -406,6 +416,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"rlm_child_stall_activity",
 	"control_plane",
 	"abort_and_send_queued",
+	"abort_agent_target",
 ];
 
 /**
@@ -831,8 +842,27 @@ export type DaemonCommand =
 	| { id?: string; type: "agent_messages_pause"; activeSessionId?: string }
 	| { id?: string; type: "agent_messages_resume"; activeSessionId?: string }
 	| { id?: string; type: "agent_messages_clear"; activeSessionId: string }
-	| { id?: string; type: "abort"; activeSessionId: string }
-	| { id?: string; type: "abort_and_send_queued"; activeSessionId: string }
+	| {
+			id?: string;
+			type: "abort";
+			activeSessionId: string;
+			/**
+			 * Agent-origin marker: the active session of the agent requesting the abort.
+			 * Present only when a model-side caller (agent_message.abort) drives the
+			 * command, which is exactly when nuclear-family reach must be enforced
+			 * before the abort runs. Gated behind the `abort_agent_target` capability
+			 * (rev 39): a peer without it cannot interpret the field, so the sender is
+			 * refused rather than trusted.
+			 */
+			fromActiveSessionId?: string;
+	  }
+	| {
+			id?: string;
+			type: "abort_and_send_queued";
+			activeSessionId: string;
+			/** Agent-origin marker; see the `abort` arm. */
+			fromActiveSessionId?: string;
+	  }
 	| {
 			id?: string;
 			type: "start_side_question";
@@ -1066,6 +1096,15 @@ const DIRECT_PEER_TRANSPORT_COMMAND = {
 	minProtocol: 7,
 	minSchemaRevision: 25,
 	capability: "direct_peer_transport",
+} as const;
+// Agent-originated aborts ride the plain abort/abort_and_send_queued commands with
+// fromActiveSessionId set (the owned_prompt_cancellation pattern: the optional field
+// is the gated shape, the bare command stays exactly as before). A rev-38 peer has
+// both commands but no reach enforcement for the field, so the floor is 39.
+const ABORT_AGENT_TARGET_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 39,
+	capability: "abort_agent_target",
 } as const;
 
 export const DAEMON_COMMAND_COMPATIBILITY = {
@@ -1323,6 +1362,12 @@ export function getDaemonCommandCompatibilities(command: DaemonCommand): readonl
 	}
 	if (command.type === "list" && command.omitStreamingMessages === true) {
 		requirements.push(LIST_WITHOUT_STREAMING_MESSAGES_COMMAND);
+	}
+	if (
+		(command.type === "abort" || command.type === "abort_and_send_queued") &&
+		command.fromActiveSessionId !== undefined
+	) {
+		requirements.push(ABORT_AGENT_TARGET_COMMAND);
 	}
 	return [...requirements, DAEMON_COMMAND_COMPATIBILITY[command.type]];
 }

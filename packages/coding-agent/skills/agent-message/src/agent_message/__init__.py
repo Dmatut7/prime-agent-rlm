@@ -94,3 +94,61 @@ def _emit_sent_message(receipt: dict[str, Any], receiver_role: str | None = None
         )
     except Exception:
         pass
+
+
+async def abort(
+    receiver_role: ReceiverRole | str,
+    receiver_name: str | None = None,
+    *,
+    send_queued: bool = True,
+) -> dict[str, Any]:
+    """Abort one family target's active run without deleting the agent.
+
+    Use this when a child or sibling is stuck mid-turn: the target's active run
+    stops, the agent itself stays alive with its context, and (with
+    ``send_queued=True``, the default) its queued steering messages are delivered
+    in one new turn. With ``send_queued=False`` the abort leaves the queue
+    untouched, matching a plain interrupt.
+
+    Falls back loudly: on a daemon too old to serve agent aborts the call raises
+    with a message naming the missing capability and no abort is issued.
+    """
+    roles = ("parent", "sibling", "child")
+    if receiver_role not in roles:
+        raise ValueError('receiver_role must be "parent", "sibling", or "child"')
+    if receiver_role == "parent":
+        if receiver_name is not None:
+            raise ValueError("receiver_name must be omitted for parent targets")
+    elif not isinstance(receiver_name, str) or not receiver_name.strip():
+        raise ValueError("receiver_name is required for sibling and child targets")
+    payload: dict[str, Any] = {
+        "receiver_role": receiver_role,
+        "receiver_name": receiver_name,
+        "send_queued": send_queued,
+    }
+    receipt = await host_request("agent_message.abort", payload)
+    _emit_abort_message(receipt, receiver_role)
+    return receipt
+
+
+def _emit_abort_message(receipt: dict[str, Any], receiver_role: str | None = None) -> None:
+    try:
+        from rlm import emit
+
+        resumed = receipt.get("resumedQueued") is True
+        label = (
+            "Agent message abort (queued work flushed into a new turn)"
+            if resumed
+            else "Agent message abort (active run stopped)"
+        )
+        display_receipt = dict(receipt) if isinstance(receipt, dict) else {}
+        if receiver_role in ("parent", "sibling", "child"):
+            display_receipt["receiverRole"] = receiver_role
+        emit(
+            {
+                _MESSAGE_DISPLAY_MIME: display_receipt,
+                "text/plain": label,
+            }
+        )
+    except Exception:
+        pass
