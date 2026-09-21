@@ -101,7 +101,7 @@ export function buildChildAgentDoctrine(options: ChildAgentDoctrineOptions): str
  * run the result, so this string cannot drift back into a command that fails.
  */
 export const KERNEL_PACKAGE_INSTALL_PROMPT =
-	'Install additional packages into the kernel environment by naming its interpreter: `uv pip install --python "<kernel-python>" <pkg>`. `<kernel-python>` is the interpreter running this REPL, so pass `sys.executable`. The kernel venv is created unseeded, so it has no pip of its own; `uv pip install` with no interpreter finds no activated environment and exits, and building a `.venv` to work around that puts the package where the kernel cannot import it. To satisfy an external project\'s imports, use that project\'s own environment instead.';
+	"Install additional packages into the kernel environment by naming its interpreter: `uv pip install --python \"<kernel-python>\" <pkg>`. `<kernel-python>` is the interpreter running this REPL, so pass `sys.executable`. The kernel venv is created unseeded, so it has no pip of its own; `uv pip install` with no interpreter finds no activated environment and exits, and building a `.venv` to work around that puts the package where the kernel cannot import it. To satisfy an external project's imports, use that project's own environment instead.";
 
 export function buildRlmPrompt(options: RlmPromptOptions): string {
 	const { cwd, skillsDir, messagesPath } = options;
