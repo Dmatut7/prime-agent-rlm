@@ -9,6 +9,7 @@ import {
 	AgentContinueError,
 	type AgentEvent,
 	type AgentMessage,
+	type AgentModelOverride,
 	type AgentState,
 	type AgentTool,
 	EMPTY_TURN_RETRY_DEFAULTS,
@@ -210,6 +211,7 @@ import {
 	validateGoalBudget,
 	validateGoalObjective,
 } from "./goals.js";
+import { resolveImageModelOverride } from "./image-model-routing.js";
 import {
 	classifyIncomingInput,
 	type InputClass,
@@ -1177,6 +1179,15 @@ function normalizeMessageContent(content: string | (TextContent | ImageContent)[
 		.join("\n");
 	const images = content.filter((part): part is ImageContent => part.type === "image");
 	return { text, ...(images.length > 0 ? { images } : {}) };
+}
+
+/**
+ * Whether a delivered message attaches image content. Used to route
+ * image-carrying turns off session models without image input.
+ */
+function messageCarriesImages(message: QueuedAgentMessage | AgentMessage): boolean {
+	const content = (message as { content?: unknown }).content;
+	return Array.isArray(content) && content.some((part: { type?: string }) => part?.type === "image");
 }
 
 function queuedAgentMessagePreview(action: QueuedSessionAction): string {
@@ -2308,6 +2319,8 @@ export class AgentSession {
 				primary: Model<any>;
 				thinkingLevel: ThinkingLevel;
 				serviceTier: ServiceTier;
+				/** Image-model routing active when the backup took over; restored on return. */
+				routedOverride?: AgentModelOverride;
 		  }
 		| undefined = undefined;
 	private _agentMessageClearEpoch = 0;
@@ -3647,6 +3660,87 @@ export class AgentSession {
 	}
 
 	/**
+	 * Routing decision for a dispatched turn batch: when any delivered message
+	 * attaches images and the session model has no image input, serve the turn
+	 * on the user-configured imageModel (settings.imageModel) instead.
+	 *
+	 * The override is stored on the agent, so retries and post-compaction
+	 * continuations of the routed turn keep serving it; the next dispatch
+	 * re-evaluates it, so later image-free turns return to the session model.
+	 * A missing session model is reported by _validateCanStartAgentRun.
+	 */
+	private _imageModelOverrideForTurns(
+		turns: SessionAction<PreparedTurnPayload>[],
+		extraMessages: AgentMessage[] = [],
+	): AgentModelOverride | undefined {
+		const sessionModel = this.model;
+		if (!sessionModel) return undefined;
+		const carriesImages =
+			extraMessages.some((message) => messageCarriesImages(message)) ||
+			turns.some((action) => action.payload.records.some((record) => messageCarriesImages(record.message)));
+		if (!carriesImages) return undefined;
+		return resolveImageModelOverride({
+			sessionModel,
+			thinkingLevel: this.thinkingLevel,
+			serviceTier: this.serviceTier,
+			imageModelReference: this.settingsManager.getImageModel(),
+			availableModels: this._modelRegistry.getAvailable(),
+			hasConfiguredAuth: (model) => this._modelRegistry.hasConfiguredAuth(model),
+			blockImages: this.settingsManager.getBlockImages(),
+		});
+	}
+
+	/**
+	 * Model serving the current run: the routed image model while a routed
+	 * turn (or its retries/continuations) is active, the session model
+	 * otherwise. Compaction decisions compare context against the model that
+	 * actually serves the requests, so a routed run uses the routed model's
+	 * context window and accepts its assistant messages as its own.
+	 */
+	private _runModel(): Model<any> | undefined {
+		return this.agent.modelOverride?.model ?? this.model;
+	}
+
+	/**
+	 * Whether a dispatched turn is still in flight: streaming, retrying with
+	 * backoff, compacting before a continuation, an overflow recovery or
+	 * provider wait still settling, or a post-compaction continuation that
+	 * has been scheduled but not yet dispatched. Model selection during any
+	 * of these must not tear down a routed run's override, or the run's
+	 * retries, continuations, and failure attribution would leave the
+	 * image-capable model mid-turn.
+	 */
+	private get _hasActiveTurnLifecycle(): boolean {
+		return (
+			this.isStreaming ||
+			this.isRetrying ||
+			this.isCompacting ||
+			this._postCompactionContinuationScheduled ||
+			// Covers the whole submission-to-settled window: preflight (before the
+			// action enqueues), the queued turn, and any in-flight run - without
+			// latching on stale overflow-recovery state.
+			this._promptSubmissionInFlight ||
+			this._hasPendingOrRunningTurnAction
+		);
+	}
+
+	private get _hasPendingOrRunningTurnAction(): boolean {
+		return this._actionStore.unfinishedActions().some((action) => action.payload.kind === "turn");
+	}
+
+	/**
+	 * An explicit selection wins over image-model routing still lingering from
+	 * the last dispatched turn, but not over the model already serving an
+	 * active run. Cycling or switching mid-stream keeps the routed override
+	 * until the turn settles; the next dispatch re-evaluates the routing
+	 * against the new selection.
+	 */
+	private _clearModelOverrideWhenIdle(): void {
+		if (this._hasActiveTurnLifecycle) return;
+		this.agent.modelOverride = undefined;
+	}
+
+	/**
 	 * Goals are pursued through the kernel goal skill, so the only tool the
 	 * model needs is ipython. Force-activate it (including into a live
 	 * continuation context) so the model can always reach `goal.complete()`.
@@ -4612,7 +4706,7 @@ export class AgentSession {
 		const settings = this.settingsManager.getCompactionSettings();
 		if (!settings.enabled) return false;
 
-		const contextWindow = this.model?.contextWindow ?? 0;
+		const contextWindow = this._runModel()?.contextWindow ?? 0;
 		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
 		const compactionTimestamp = compactionEntry ? new Date(compactionEntry.timestamp).getTime() : undefined;
 		if (compactionTimestamp !== undefined && context.message.timestamp <= compactionTimestamp) {
@@ -8633,7 +8727,21 @@ export class AgentSession {
 		}
 	}
 
+	private _promptSubmissionInFlight = false;
+
 	private async _prompt(text: string, options?: InternalPromptOptions): Promise<void> {
+		// Synchronous preflight guard: from submission until the prompt promise
+		// settles, a model switch must not tear down a routed turn's override
+		// (the routing decision for this turn's images may already be made).
+		this._promptSubmissionInFlight = true;
+		try {
+			return await this._promptInner(text, options);
+		} finally {
+			this._promptSubmissionInFlight = false;
+		}
+	}
+
+	private async _promptInner(text: string, options?: InternalPromptOptions): Promise<void> {
 		const resumeSuspendedInput = options?.resumeIfIdle !== false;
 		if (!this.isStreaming) {
 			// QP-1 (r39): never let an idle resume lift the update-restart fence - a
@@ -9970,6 +10078,12 @@ export class AgentSession {
 					if (this._isSessionInputHandoffDeferred(epoch)) {
 						throw new DeferredSessionInputError("Session input paused before preflight");
 					}
+					// Re-evaluate image routing for this batch before any pre-commit read of
+					// the serving model: pre-turn compaction must not follow the previous
+					// turn's override. Retries and post-compaction continuations of a routed
+					// turn re-read the override, so they keep serving it; the next dispatch
+					// overwrites it with its fresh decision.
+					this.agent.modelOverride = this._imageModelOverrideForTurns(activeTurns());
 				},
 				prepare: async () => {
 					if (executionPolicy.nextTurnContextTiming === "preparation") {
@@ -10076,6 +10190,10 @@ export class AgentSession {
 					for (const action of turns) transitionSessionAction(action, { state: "committing" });
 					this._notifySessionInputCheckpointChange();
 					this._emitQueueUpdate();
+					// Re-evaluate image routing for the exact message set being sent:
+					// before_agent_start injections land after the earlier per-turn
+					// decision and may carry images the session model cannot serve.
+					this.agent.modelOverride = this._imageModelOverrideForTurns(turns, preparedMessages);
 					return turns.some((action) => action.suppressAutonomousContinuation)
 						? this._runWithAutonomousContinuationSuppressed(() => this.agent.prompt(preparedMessages))
 						: this.agent.prompt(preparedMessages);
@@ -11507,6 +11625,7 @@ export class AgentSession {
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		const serviceTier = this._getServiceTierForModelSwitch();
 		this.agent.state.model = model;
+		this._clearModelOverrideWhenIdle();
 		this.sessionManager.appendModelChange(model.provider, model.id);
 		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 
@@ -11574,6 +11693,7 @@ export class AgentSession {
 		const serviceTier = this._getServiceTierForModelSwitch();
 
 		this.agent.state.model = next.model;
+		this._clearModelOverrideWhenIdle();
 		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
 		this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
 
@@ -11613,6 +11733,7 @@ export class AgentSession {
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		const serviceTier = this._getServiceTierForModelSwitch();
 		this.agent.state.model = nextModel;
+		this._clearModelOverrideWhenIdle();
 		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
 		this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
 
@@ -13785,14 +13906,18 @@ export class AgentSession {
 		}
 
 		const settings = this.settingsManager.getCompactionSettings();
-		const contextWindow = this.model?.contextWindow ?? 0;
+		const runModel = this._runModel();
+		const contextWindow = runModel?.contextWindow ?? 0;
 
 		// Skip overflow check if the message came from a different model.
 		// This handles the case where user switched from a smaller-context model (e.g. opus)
 		// to a larger-context model (e.g. codex) - the overflow error from the old model
-		// shouldn't trigger compaction for the new model.
+		// shouldn't trigger compaction for the new model. A routed image-model turn keeps
+		// its override, so its overflow errors recover like the session model's own.
 		const sameModel =
-			this.model && assistantMessage.provider === this.model.provider && assistantMessage.model === this.model.id;
+			runModel !== undefined &&
+			assistantMessage.provider === runModel.provider &&
+			assistantMessage.model === runModel.id;
 
 		// Skip overflow/threshold checks if this assistant message is older than the
 		// latest compaction boundary. This prevents a stale pre-compaction usage/error
@@ -17503,7 +17628,7 @@ export class AgentSession {
 	private _isRetryableError(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error" || !message.errorMessage) return false;
 
-		const contextWindow = this.model?.contextWindow ?? 0;
+		const contextWindow = this._runModel()?.contextWindow ?? 0;
 		if (isContextOverflow(message, contextWindow)) return false;
 
 		// The agent loop already retried this in-place; a session-level retry would
@@ -17846,10 +17971,13 @@ export class AgentSession {
 
 		// User-defined backup model (settings.providerBackupModel, default none):
 		// route the failed turn to the backup instead of waiting while the
-		// primary is quota-blocked or its provider is unavailable.
+		// primary is quota-blocked or its provider is unavailable. The guard
+		// compares against the model serving the run, so a backup equal to a
+		// routed turn's image model is recognized as the duplicate it is instead
+		// of reporting a no-op backup switch with a zero-delay retry.
 		if (waitClass !== "permanent") {
 			const backupModel = this._resolveBackupModel();
-			if (backupModel && !modelsAreEqual(this.model, backupModel)) {
+			if (backupModel && !modelsAreEqual(this._runModel(), backupModel)) {
 				return this._handleBackupModelRetry(message, options, backupModel);
 			}
 		}
@@ -18008,13 +18136,19 @@ export class AgentSession {
 	/**
 	 * Resolve the user-configured backup model reference against the available
 	 * models. Unknown or unauthenticated references resolve to undefined: the
-	 * wait loop runs instead, and never surprises the user with a switch.
+	 * wait loop runs instead, and never surprises the user with a switch. A
+	 * run routed for images also rejects a text-only backup the same way: the
+	 * retry then stays on the routed model instead of serving the turn's
+	 * images to a model that would silently downgrade them to placeholders.
 	 */
 	private _resolveBackupModel(): Model<any> | undefined {
 		const reference = this.settingsManager.getProviderBackupModel();
 		if (!reference) return undefined;
 		const backupModel = findExactModelReferenceMatch(reference, this._modelRegistry.getAvailable());
 		if (!backupModel || !this._modelRegistry.hasConfiguredAuth(backupModel)) {
+			return undefined;
+		}
+		if (this.agent.modelOverride && !backupModel.input.includes("image")) {
 			return undefined;
 		}
 		return backupModel;
@@ -18034,11 +18168,22 @@ export class AgentSession {
 		const previousModel = this.agent.state.model;
 		const previousThinkingLevel = this.agent.state.thinkingLevel;
 		const previousServiceTier = this.agent.state.serviceTier;
+		// A routed image-model turn keeps serving on the override, so the backup
+		// must take the override too or the retry would silently return to the
+		// routed model while reporting the backup.
+		const routedOverride = this.agent.modelOverride;
 		this.agent.state.model = backupModel;
 		// Clamp per-request fields to what the backup supports; all of them are
 		// restored when the turn returns to the primary.
 		this.agent.state.thinkingLevel = clampThinkingLevel(backupModel, previousThinkingLevel) as ThinkingLevel;
 		this._clampServiceTierForModel();
+		if (routedOverride) {
+			this.agent.modelOverride = {
+				model: backupModel,
+				thinkingLevel: this.agent.state.thinkingLevel,
+				serviceTier: this.agent.state.serviceTier,
+			};
+		}
 		// Session-log the switch so primary->backup->primary transitions stay debuggable.
 		this.sessionManager.appendModelChange(backupModel.provider, backupModel.id);
 		this._backupModel = {
@@ -18046,6 +18191,7 @@ export class AgentSession {
 			primary: previousModel,
 			thinkingLevel: previousThinkingLevel,
 			serviceTier: previousServiceTier,
+			routedOverride,
 		};
 		this._retryAttempt++;
 		this._providerWait = undefined;
@@ -18132,6 +18278,7 @@ export class AgentSession {
 		if (!backup || !modelsAreEqual(this.model, backup.backup)) return undefined;
 		this.agent.state.model = backup.primary;
 		this.agent.state.thinkingLevel = backup.thinkingLevel;
+		this.agent.modelOverride = backup.routedOverride;
 		// Restore the saved effective tier: reclamping from the current state
 		// would keep the tier the backup clamped it to.
 		this._clampServiceTierForModel(backup.serviceTier);

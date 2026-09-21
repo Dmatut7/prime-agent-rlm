@@ -588,6 +588,13 @@ export interface Settings {
 	 * Default: none - requests never silently switch models.
 	 */
 	providerBackupModel?: string;
+	/**
+	 * Model ("provider/model-id" or a bare model id) that serves turns
+	 * attaching images when the session model does not accept image input.
+	 * Default: none - image turns on a text-only model fail with a
+	 * configuration hint instead of silently dropping the images.
+	 */
+	imageModel?: string;
 	autonomous?: AutonomousSettings;
 	shellPath?: string; // Custom shell path (e.g., for Cygwin users on Windows)
 	quietStartup?: boolean;
@@ -2439,6 +2446,14 @@ export class SettingsManager {
 		this.globalSettings.hideThinkingBlock = hide;
 		this.markModified("hideThinkingBlock");
 		this.save();
+	}
+
+	getImageModel(): string | undefined {
+		// Same shape as providerBackupModel: malformed values behave as unset
+		// and the image-turn refusal names the setting instead.
+		const reference = this.settings.imageModel;
+		if (typeof reference !== "string") return undefined;
+		return reference.trim() ? reference.trim() : undefined;
 	}
 
 	getShellPath(): string | undefined {

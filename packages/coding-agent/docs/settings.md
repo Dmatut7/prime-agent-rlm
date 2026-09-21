@@ -19,10 +19,49 @@ Unknown keys are reported: a misspelled or removed setting (for example `compact
 |---------|------|---------|-------------|
 | `defaultProvider` | string | - | Default provider (e.g., `"anthropic"`, `"openai"`) |
 | `defaultModel` | string | - | Default model ID |
+| `subagentDefaultModel` | string | - | Model selector (`"provider/id"`) used when `rlm.spawn` does not pin a model; unset inherits the parent model |
+| `imageModel` | string | none | Model (`"provider/model-id"` or a bare id) that serves turns attaching images when the session model does not accept image input |
 | `defaultThinkingLevel` | string | `"medium"` | `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` |
 | `hideThinkingBlock` | boolean | `false` | Hide thinking blocks in output |
 | `footer.telemetry` | string | `"compact"` | Persistent footer watermark line density: `"off"` hides it, `"compact"` shows `模型名 · ctx 312k/1M(38%) ▍压缩线80%` plus the GLM storm-zone marker on glm models, `"full"` adds the proportional bar. `/usage` stays a one-shot report regardless |
 | `thinkingBudgets` | object | - | Custom token budgets per thinking level |
+
+`subagentDefaultModel` applies only to spawned subagents whose `rlm.spawn` call omits `model=`. An explicit `model=` per spawn always wins, and an unset setting keeps the inherit-parent behavior. If the configured default is unavailable, unauthenticated, or expired, the spawn fails with that error instead of silently falling back.
+
+When `defaultThinkingLevel` is unset, new sessions start at `"medium"` reasoning, clamped to the levels each model supports.
+
+`imageModel` routes image turns on text-only session or subagent models. When a
+turn attaches images and the selected model has no image input, that turn (and
+its retries and post-compaction continuations) is served by the configured
+image-capable model instead; the session model selection stays unchanged, and
+the routed assistant messages record the model that served them. Later
+image-free turns return to the session model, where images already in the
+transcript appear as "(image omitted: model does not support images)"
+placeholders. With no `imageModel` set (default), image turns on a text-only
+model fail with an actionable error instead of silently dropping the images:
+switch the session model with `/model` or configure `imageModel`. Set
+`images.blockImages: true` to drop images everywhere instead of routing or
+refusing.
+
+### Autonomous Runs
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `autonomous.maxContinuations` | number or `"unlimited"` | `3` | Continuation budget for autonomous runs |
+| `autonomous.maxTurns` | number or `"unlimited"` | `12` | Turn budget for autonomous runs |
+| `autonomous.maxTokens` | number or `"unlimited"` | `80000` | Token budget for autonomous runs |
+| `autonomous.timeoutMs` | number or `"unlimited"` | `1800000` | Wall-clock budget in milliseconds |
+
+```json
+{
+  "autonomous": {
+    "maxContinuations": "unlimited",
+    "maxTokens": 1000000
+  }
+}
+```
+
+These are the persisted defaults for the same limits as the `--autonomous-*` CLI flags and `/autonomous on` budget flags. Set them once so every autonomous run starts with your budget instead of the built-in defaults; explicit flags on a given run still win. Invalid values are ignored per-field, falling back to the built-in defaults.
 
 #### thinkingBudgets
 
