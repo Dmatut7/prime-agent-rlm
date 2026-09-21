@@ -47,7 +47,7 @@
 ## 3. 怎么搞：三波战役＋一次重启窗
 
 ### Wave 1（先行，低风险高价值）：B 批 14 笔 ＋ A 批 1 笔 ＋ UI 自研 U1/U2
-- 席位：`lane-b`（B/A 批择取）、`lane-tui`（U1/U2 自研＋/speed 取上游）、`lane-audit`（对账与测试看护）。
+- 席位：`lane-b`（B/A 批择取）、`lane-tui`（U1/U2/U4 自研＋/speed 取上游，四件同车道串行：U4→U1→U2→/speed）、`lane-audit`（对账与测试看护）。
 - 动刀位置见 §2/§4。收口：`npm run check`＋定向测试＋净树 tsgo＋build。
 
 ### Wave 2（核心子系统，深冲突主体）
@@ -74,6 +74,17 @@
 - **为什么**：GLM 风暴那次老板盯了 11 分钟不知道发生了什么；「在干活」vs「在空转」需要一眼分辨。
 - **怎么搞**：会话层维护连续工具错误计数（toolResult 为错误类文本即 +1，成功归零），≥3 时底栏警示并与 U1 同行显示；数据源与 U1 共用 footer 状态。
 - **动刀**：`core/agent-session.ts`（错误流水分桶——**热点文件，排 lane-core 串行**）＋ `components/footer.ts`。与上游 `/speed`（`eee9d814b`）合并在同一底栏改造里做。
+
+### U4 会话可读性改造：默认视图降噪（老板 2026-09-21 亲贴病灶，优先级与 U1 并列）
+- **为什么**：老板亲贴现网渲染——一屏 7 行里 5 行是机件（「Thinking... (Ctrl+T to expand)」逐块插行、`✓ bash · git diff --name-only $MB HEAD | head -60 · ↑ 3 ↓ 62 lines · 378ms` 原始命令/行数/耗糊脸、英文机件词混中文、按键提示逐块重复）。对话主线被机械噪音淹没。
+- **怎么搞（四刀）**：
+  1. **轮内机械聚合**：同一轮的 thinking＋tool 序列默认聚成一行「⚙ 本轮 N 步 · 总耗时 —— 动词优先摘要（git×2 · python×3 · 最后动作）」，Ctrl+O 展开今天的逐行明细；复用/对齐上游 detail-level 机制（#2447/#2193 细节档），默认档调低。
+  2. **工具行语义化**：默认显示语义摘要（「写文件 docs/fork/…」「git 提交 812876c7b」），原始命令与 ↑↓ 行数进展开态；时长右对齐置灰。
+  3. **thinking 一行化**：默认「▍思考 N 段（Ctrl+T 展开）」一行摘要，不逐块占行。
+  4. **机件词中文化＋提示去重**：思考/命令/行/毫秒全部中文；Ctrl+T/O 提示只进底栏图例一次，不逐块重复。
+- **动刀**：`components/conversation-components.ts`（聚合渲染主战场）、`components/assistant-message.ts`（thinking 行）、`components/bash-execution.ts`、`components/ipython-cell.ts`、`components/tool-execution.ts`、`components/feature-hints.ts`（提示去重）。测试：新增假 provider 快照测试（渲染一轮含 3 思考段＋5 工具步的消息，断言聚合行与展开态），挂 `test/interactive-mode-command-usage.test.ts` 同目录。
+- **工作量**：中等（单席一天内），归 lane-tui；与 U1/U2 不同文件、同车道串行。
+- **验证法**：改前后各截同一会话渲染（tmux capture-pane 文本比对），行数下降＋主线文字占比上升为硬指标。
 
 ### U3 agents-view 扩展：子席活状态面板
 - **为什么**：老板打法＝母席带一堆子席；现有 agents-view 是会话浏览器（open/kill/name），没有「跑着/交卷/卡死/耗时/最后一拍」的活状态。有了它老板不用问「还没查完吗」。
