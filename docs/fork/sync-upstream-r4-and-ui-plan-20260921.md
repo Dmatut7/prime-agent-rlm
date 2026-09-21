@@ -55,6 +55,12 @@
 - `lane-core`（**串行热点席**）：agent-session/session-manager/settings 系（`a8ae6269a`、`0498deb43`、`0597614e0`、`27f32ddb7`、`5fb3d9acb`、`6d2c57d72`、`2883a7843`、`b08f08efa`、`b3e04b58b`、`126fe7010`、`690e23d8c`）。
 - 两车道文件面不相交，可并行；`agent-session.ts` 全程只在 lane-core。
 
+### 并行机制（老板 2026-09-21 提议采纳）：车道＝分支＝独立工作树
+- 每车道 `git worktree add ../pa-r4-<lane> -b r4/<lane>`（同仓对象库、独立检出），node_modules 以符号链指向主仓——各车道改各的文件、跑各的测试、提交各的分支，**不抢共享绿窗**（提交钩子全仓检查按工作树隔离）。
+- 合流序（一次一条，每条并完跑全量 `npm run check`，绿了才并下一条）：lane-b → lane-tui → lane-ai → lane-kernel → lane-core → lane-daemon → lane-tui2。热文件所在车道（lane-core 的 agent-session.ts 链）**最后并入**，冲突面最小。
+- 任何一笔出问题＝单笔 revert，不连坐；工作树用毕由各席自清（/tmp 留尸除外）。
+- 墙钟预算：车道并行后 ≈ max(车道工时) + 合流检查 + 构建重启 ≈ **3-5 小时**（burst 模式）；「一小时第一批」＝lane-tui＋lane-b 先合流先行重启一次。
+
 ### Wave 3（daemon 与 TUI 大件）
 - `lane-daemon`：`2e9ab77b8`、`54da82e97`、`3dfb0276b`、`e311d6495`、`e1f4ae5bd`、`c37f5eb39`、`126fe7010`(daemon 面)。
 - `lane-tui2`：`b6fb29850`（31 文件，全战役最大单笔风险，放最后）、`f2a9ad661`、`3b1aa5ff3`（图路由）、U3 agents-view 扩展。
