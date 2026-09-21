@@ -121,10 +121,11 @@ interface OpenAICompatCacheControl {
 
 type ResolvedOpenAICompletionsCompat = Omit<
 	Required<OpenAICompletionsCompat>,
-	"cacheControlFormat" | "searchStrategy"
+	"cacheControlFormat" | "searchStrategy" | "toolStream"
 > & {
 	cacheControlFormat?: OpenAICompletionsCompat["cacheControlFormat"];
 	searchStrategy?: OpenAICompletionsCompat["searchStrategy"];
+	toolStream?: boolean;
 };
 
 type ChatCompletionInstructionMessageParam = ChatCompletionDeveloperMessageParam | ChatCompletionSystemMessageParam;
@@ -882,7 +883,9 @@ function buildParams(
 
 	if (context.tools && context.tools.length > 0) {
 		params.tools = convertTools(context.tools, compat);
-		if (compat.zaiToolStream) {
+		if (compat.toolStream !== undefined) {
+			(params as any).tool_stream = compat.toolStream;
+		} else if (compat.zaiToolStream) {
 			(params as any).tool_stream = true;
 		}
 	} else if (hasToolHistory(context.messages)) {
@@ -1537,6 +1540,7 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
 		openRouterRouting: {},
 		vercelGatewayRouting: {},
 		zaiToolStream: false,
+		toolStream: undefined,
 		supportsStrictMode: !isMoonshot && !isCloudflareAiGateway && !isPrimeInference,
 		cacheControlFormat,
 		sendSessionAffinityHeaders: false,
@@ -1573,6 +1577,7 @@ function getCompat(model: Model<"openai-completions">): ResolvedOpenAICompletion
 		openRouterRouting: model.compat.openRouterRouting ?? {},
 		vercelGatewayRouting: model.compat.vercelGatewayRouting ?? detected.vercelGatewayRouting,
 		zaiToolStream: model.compat.zaiToolStream ?? detected.zaiToolStream,
+		toolStream: model.compat.toolStream ?? detected.toolStream,
 		supportsStrictMode: model.compat.supportsStrictMode ?? detected.supportsStrictMode,
 		cacheControlFormat: model.compat.cacheControlFormat ?? detected.cacheControlFormat,
 		sendSessionAffinityHeaders: model.compat.sendSessionAffinityHeaders ?? detected.sendSessionAffinityHeaders,

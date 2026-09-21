@@ -1,0 +1,1 @@
+- Added a per-model `toolStream` compat override that sends an explicit `tool_stream` value, so Bailian-hosted GLM-5.3 models can opt out of fragmented tool-call streaming that accumulated into malformed tool calls.

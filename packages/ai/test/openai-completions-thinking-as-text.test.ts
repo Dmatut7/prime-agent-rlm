@@ -43,9 +43,10 @@ const compat = {
 	enableSearch: false,
 	searchStrategy: undefined,
 	forcedSearch: false,
-} satisfies Required<Omit<OpenAICompletionsCompat, "cacheControlFormat" | "searchStrategy">> & {
+} satisfies Required<Omit<OpenAICompletionsCompat, "cacheControlFormat" | "searchStrategy" | "toolStream">> & {
 	cacheControlFormat?: OpenAICompletionsCompat["cacheControlFormat"];
 	searchStrategy?: OpenAICompletionsCompat["searchStrategy"];
+	toolStream?: boolean;
 };
 
 function buildModel(baseUrl = "http://127.0.0.1:1"): Model<"openai-completions"> {

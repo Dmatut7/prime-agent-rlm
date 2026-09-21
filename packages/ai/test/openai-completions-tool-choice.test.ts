@@ -340,6 +340,96 @@ describe("openai-completions tool_choice", () => {
 		expect(params.tool_stream).toBeUndefined();
 	});
 
+	it("sends an explicit tool_stream false even when the zai shorthand is on", async () => {
+		const baseModel = getZaiTestModel();
+		const model = {
+			...baseModel,
+			compat: {
+				...baseModel.compat,
+				zaiToolStream: true,
+				toolStream: false,
+			},
+		} as const;
+		const tools: Tool[] = [
+			{
+				name: "ping",
+				description: "Ping tool",
+				parameters: Type.Object({
+					ok: Type.Boolean(),
+				}),
+			},
+		];
+		let payload: unknown;
+
+		await streamSimple(
+			model,
+			{
+				messages: [
+					{
+						role: "user",
+						content: "Call ping with ok=true",
+						timestamp: Date.now(),
+					},
+				],
+				tools,
+			},
+			{
+				apiKey: "test",
+				onPayload: (params: unknown) => {
+					payload = params;
+				},
+			},
+		).result();
+
+		const params = (payload ?? mockState.lastParams) as { tool_stream?: boolean };
+		expect(params.tool_stream).toBe(false);
+	});
+
+	it("sends an explicit tool_stream true from compat alone", async () => {
+		const baseModel = getZaiTestModel();
+		const model = {
+			...baseModel,
+			compat: {
+				...baseModel.compat,
+				zaiToolStream: false,
+				toolStream: true,
+			},
+		} as const;
+		const tools: Tool[] = [
+			{
+				name: "ping",
+				description: "Ping tool",
+				parameters: Type.Object({
+					ok: Type.Boolean(),
+				}),
+			},
+		];
+		let payload: unknown;
+
+		await streamSimple(
+			model,
+			{
+				messages: [
+					{
+						role: "user",
+						content: "Call ping with ok=true",
+						timestamp: Date.now(),
+					},
+				],
+				tools,
+			},
+			{
+				apiKey: "test",
+				onPayload: (params: unknown) => {
+					payload = params;
+				},
+			},
+		).result();
+
+		const params = (payload ?? mockState.lastParams) as { tool_stream?: boolean };
+		expect(params.tool_stream).toBe(true);
+	});
+
 	it("maps non-standard provider finish_reason values to stopReason error", async () => {
 		mockState.chunks = [
 			{
