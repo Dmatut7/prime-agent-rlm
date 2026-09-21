@@ -462,3 +462,13 @@ fork 工作文档统一搬入 `docs/fork/`：审计总账 `audit-findings.md`、
 
 | 2026-09-18 夜 | **#2426 的 UI hunk 在合并时被解回 fork 侧**：rev38 的头号命令 `abort_and_send_queued` 在出货路径上零生产者（interactive-mode 的 Esc 仍调 `abort()`），CHANGELOG 却宣称可用；已接线（流式中断换回 `abortAndSendQueued()`）并补 8 针（含真 interruptOrClearInput × 真 DaemonAgentConnection × 假 transport 的跨层 wire 针）。教训：路径级 take 的范围表要含**生产者端**——六闸里没有一道核"上游该笔的调用点是否也过来了" |
 | 2026-09-18 夜 | **steer()/followUp() 记 `source:"internal"` 而 priority 按 "interactive" 派生**：pre-#2334 快照恢复时这类人打的行降 background；TUI 的 Enter 走 `prompt()`（记 interactive）不受影响。未修（动 source 记录口径影响所有恢复/审计面），已钉针；另 `AGENT_TASK_STATES` 未进 digest 切片（加第 18 片会改 DAEMON_SCHEMA_ID、所有混合版本对 replace/refuse），现用扩域承认针顶着，代价不擅自付 |
+
+## 2026-09-22 R4 上游同步＋UI/自愈一役
+
+- TUI 大幅降噪（U4）：轮内工具活动折叠为一行摘要（Ctrl+O 展开）、thinking 一行化、bash 完成收行、提示全中文化去重——同屏机械行 24→1、正文占比 0.23→0.75，展开视图零内容丢失。
+- agents view 三新列（U3）：settled（收口/开口）、会话时长、最后答案预览行（可搜索）；旧 daemon 无字段自动降级。
+- 底栏常驻遥测（U1）：模型名＋上下文水位＋压缩线，GLM 系带 390k 风暴警戒线；连续工具错误 ≥3 显示 ⚠ 徽标（U2）；/speed 显示输出速率。
+- 卡住的子代理现在会主动通知父会话（stall→父通知，U5）；agent_message 新增 abort 能力（U5 合流后）。
+- GLM 修复双激活：toolStream=false 关工具分片流坏调用＋思考 token 不再被 32K 夹死；新增探针测试钉死生产配置。
+- 吸收上游 43 笔计划：实拾 30 笔，8 笔实测 fork 已在场、2 笔按当年合并裁定跳过（机制成死码）；每笔独立可回滚，五次合流全零冲突、六道闸全绿。
+- 修了 imageModel 设置误报、上游测试带来的 10 处私有探针已全部带理由登记。
