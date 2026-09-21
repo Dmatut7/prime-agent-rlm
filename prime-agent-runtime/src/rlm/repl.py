@@ -1030,6 +1030,11 @@ def _is_open_disk_handle(value: Any) -> bool:
     no live descriptor either: it stays in the snapshot and the restore-side
     reopen guard reports it as a per-name failure instead of a silent skip.
     """
+    # Upstream #2379 moved the module-level `import tempfile` into
+    # _snapshot_state, leaving this fork helper without a binding; import it
+    # locally so the snapshot guard keeps working (K3G-2 regression).
+    import tempfile
+
     if not isinstance(value, io.IOBase):
         return False
     if isinstance(value, tempfile.SpooledTemporaryFile) and not getattr(value, "_rolled", False):
