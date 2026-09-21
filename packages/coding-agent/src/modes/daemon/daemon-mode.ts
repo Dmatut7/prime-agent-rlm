@@ -30,6 +30,7 @@ import {
 	type AgentFamilyDirectory,
 	type AgentFamilyRelationship,
 	type AgentMessageQueuedReason,
+	type AgentSessionMessageAbortReceipt,
 	type AgentSessionMessageAgentSummary,
 	type AgentSessionMessageController,
 	type AgentSessionMessageDeliveryStatus,
@@ -160,6 +161,7 @@ import {
 	workerRosterEntryFromSummary,
 } from "./agent-roster.js";
 import { createCompactAssistantDelta, planCompactAssistantDelta } from "./compact-session-stream.js";
+import { DaemonCapabilityUnavailableError } from "./daemon-client.js";
 import { filterClientEnv, withClientEnv } from "./daemon-client-env.js";
 import {
 	deserializeDaemonError,
@@ -3637,6 +3639,12 @@ export class AgentDaemon {
 					fromState: requireCurrentState(),
 					origin: "agent",
 				}),
+			abortAgentMessage: (input) =>
+				this.abortAgentSessionMessage({
+					targetSelector: input.target,
+					sendQueued: input.sendQueued ?? true,
+					fromState: requireCurrentState(),
+				}),
 		};
 	}
 
@@ -4947,12 +4955,14 @@ export class AgentDaemon {
 
 			case "abort": {
 				const state = this.getSessionState(command.activeSessionId);
+				this.assertAgentOriginAbortReach(command.fromActiveSessionId, state);
 				state.runtime.session.requestAbort();
 				return success(command.id, "abort");
 			}
 
 			case "abort_and_send_queued": {
 				const state = this.getSessionState(command.activeSessionId);
+				this.assertAgentOriginAbortReach(command.fromActiveSessionId, state);
 				state.runtime.session.abortAndSendQueued();
 				return success(command.id, "abort_and_send_queued");
 			}
@@ -6604,6 +6614,140 @@ export class AgentDaemon {
 		}
 	}
 
+	/**
+	 * Reach proof for an agent-originated abort (abort/abort_and_send_queued carrying
+	 * fromActiveSessionId). The sender is resolvable in this worker exactly when it is
+	 * local; a cross-worker sender was already gated by the supervisor before the
+	 * forward, the same trust worker_deliver_message places in the supervisor-computed
+	 * relationship. A direct client connection (CLI one-shot) that carries the field
+	 * gets the local check whenever the claimed sender lives here.
+	 */
+	private assertAgentOriginAbortReach(fromActiveSessionId: string | undefined, targetState: ActiveSessionState): void {
+		if (fromActiveSessionId === undefined) return;
+		if (fromActiveSessionId === targetState.activeSessionId) {
+			throw new Error("Agent abort cannot target the sending session");
+		}
+		const fromState = this.sessions.get(fromActiveSessionId);
+		if (fromState) {
+			this.assertAgentFamilyReachable(fromState, targetState);
+		}
+	}
+
+	/**
+	 * Abort one family target's active run - the lever a parent agent holds for a stuck
+	 * child. Local targets resolve like a send does and get the same nuclear-family reach
+	 * proof; a target this worker cannot resolve belongs to another worker, and the
+	 * supervisor proves reach there before forwarding. `sendQueued` picks between the two
+	 * wire semantics: abort_and_send_queued (flush the queued steering into one new turn)
+	 * or a plain abort.
+	 */
+	private async abortAgentSessionMessage(options: {
+		targetSelector: string;
+		sendQueued: boolean;
+		fromState: ActiveSessionState;
+	}): Promise<AgentSessionMessageAbortReceipt> {
+		const targetSelector = assertDirectAgentMessageTarget(options.targetSelector);
+		if (options.fromState.activeSessionId === targetSelector) {
+			throw new Error("Agent abort cannot target the sending session");
+		}
+		let targetState: ActiveSessionState;
+		try {
+			targetState = this.getBoundSessionState(targetSelector);
+		} catch (error) {
+			// Ambiguity is a hard error (two sessions match the selector); any other
+			// resolution failure means the target is not resident here, and a worker
+			// session asks the supervisor - which resolves the selector and enforces
+			// family reach - the same way sendAgentSessionMessage's remote half does.
+			// Send's passive-hydration ladder is deliberately absent: a passive child
+			// has no active turn, so there is nothing to abort.
+			if (error instanceof AmbiguousActiveSessionError) throw error;
+			if (this.options.worker && options.fromState) {
+				return this.sendRemoteAgentAbort(options.fromState, targetSelector, options.sendQueued);
+			}
+			throw error;
+		}
+		if (options.fromState.activeSessionId === targetState.activeSessionId) {
+			throw new Error("Agent abort cannot target the sending session");
+		}
+		this.assertAgentFamilyReachable(options.fromState, targetState);
+		let resumedQueued: boolean | undefined;
+		if (options.sendQueued) {
+			resumedQueued = targetState.runtime.session.abortAndSendQueued();
+		} else {
+			targetState.runtime.session.requestAbort();
+		}
+		return {
+			target: this.createAgentSessionMessageEndpoint(targetState),
+			sendQueued: options.sendQueued,
+			...(resumedQueued ? { resumedQueued: true } : {}),
+		};
+	}
+
+	/**
+	 * Cross-worker half of an agent abort. The capability gate is the client-side one in
+	 * DaemonClient.request: a supervisor that does not advertise `abort_agent_target`
+	 * (schema < 39) refuses the command before it is sent, and the refusal is reported to
+	 * the model as "this daemon cannot serve agent aborts" instead of a generic failure.
+	 */
+	private async sendRemoteAgentAbort(
+		fromState: ActiveSessionState,
+		targetSelector: string,
+		sendQueued: boolean,
+	): Promise<AgentSessionMessageAbortReceipt> {
+		const link = this.supervisorLink();
+		if (!link) {
+			throw new Error(`Unknown active session: ${targetSelector}`);
+		}
+		const deadline = Date.now() + 30_000;
+		let lastError: unknown;
+		// Connect-window loop only, mirroring sendRemoteAgentSessionMessage: the command
+		// itself is sent exactly once.
+		while (Date.now() < deadline && !this.shuttingDown) {
+			try {
+				await link.ensureConnected();
+				lastError = undefined;
+				break;
+			} catch (error) {
+				lastError = error;
+				await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
+			}
+		}
+		if (lastError !== undefined) {
+			throw lastError instanceof Error ? lastError : new Error(`Unknown active session: ${targetSelector}`);
+		}
+		try {
+			const response = await link.request(
+				{
+					type: sendQueued ? "abort_and_send_queued" : "abort",
+					activeSessionId: targetSelector,
+					fromActiveSessionId: fromState.activeSessionId,
+				},
+				30_000,
+			);
+			if (!response.success) {
+				throw deserializeDaemonError(response);
+			}
+		} catch (error) {
+			if (error instanceof DaemonCapabilityUnavailableError) {
+				throw new Error(
+					`Agent abort is not supported by the connected daemon (missing the "${error.capability}" capability): ` +
+						"no abort was issued. The target may still be running. Restart the Prime Agent daemon with a build " +
+						"that advertises abort_agent_target, or fall back to rlm.delete_subagent.",
+				);
+			}
+			throw error;
+		}
+		// The supervisor resolved the selector and enforced family reach; the target worker
+		// ran the abort. The receipt reports the selector it asked for.
+		return {
+			target: {
+				activeSessionId: targetSelector,
+				sessionId: targetSelector,
+			},
+			sendQueued,
+		};
+	}
+
 	private async sendRemoteAgentSessionMessage(
 		fromState: ActiveSessionState,
 		targetSelector: string,
@@ -7481,6 +7625,9 @@ export class AgentDaemon {
 			inFlightTools,
 			...(workEvidence.length > 0 ? { workEvidence } : {}),
 			...(abortAfterMs > 0 ? { abortAfterMs } : {}),
+			// This daemon build serves agent_message.abort; the in-process emitter does
+			// not set the field, so its notice keeps the delete-only lever text.
+			canAbortAgentTarget: true,
 		});
 		parentState.runtime.session.sendCustomMessage(notice, { deliverAs: "followUp" }).catch((error: unknown) => {
 			// A notice that could not be admitted (paused pump, disposing parent) must not

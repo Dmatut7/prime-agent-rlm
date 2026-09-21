@@ -3876,6 +3876,23 @@ export class DaemonSupervisor {
 			return this.forwardToWorker(target.worker, { ...command, targetActiveSessionId });
 		}
 
+		// Agent-originated aborts (agent_message.abort's cross-worker half): the plain
+		// abort commands would fall through to the generic forward below with no family
+		// gate, so the agent-origin shape gets the same reach proof a send_message gets.
+		// The sender is a worker link connection, which already authenticated with its
+		// supervisor token; the family check here is the only place both endpoints are
+		// visible. send's catalog-wake ladder is deliberately absent: an abort only makes
+		// sense against an active session, so an unknown target is an error, not a wake.
+		if (
+			(command.type === "abort" || command.type === "abort_and_send_queued") &&
+			command.fromActiveSessionId !== undefined
+		) {
+			return await this.routeAgentOriginAbort(client, {
+				...command,
+				fromActiveSessionId: command.fromActiveSessionId,
+			});
+		}
+
 		if (!("activeSessionId" in command) || typeof command.activeSessionId !== "string") {
 			throw new Error(`Supervisor cannot route daemon command: ${command.type}`);
 		}
@@ -7525,6 +7542,35 @@ export class DaemonSupervisor {
 				.map((entry) => `${entry.deliveryId}->${entry.targetActiveSessionId}`)
 				.join(", ")}`,
 		);
+	}
+
+	/**
+	 * Agent-originated abort routing: prove nuclear-family reach between the sending
+	 * session's worker and the target session's worker, then forward the abort to the
+	 * worker that owns the target with its resolved active session id. The fromActiveSessionId
+	 * field is trusted only because this is a supervisor-authenticated worker link or an
+	 * operator-level client connection (which already holds kill); the reach proof here is
+	 * what keeps a model-side abort inside the family.
+	 */
+	private async routeAgentOriginAbort(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "abort" | "abort_and_send_queued" }> & {
+			fromActiveSessionId: string;
+		},
+	): Promise<DaemonResponse> {
+		assertDirectAgentMessageTarget(command.activeSessionId);
+		const source = await this.findWorkerForClient(client, command.fromActiveSessionId);
+		const target = await this.findWorkerForClient(client, command.activeSessionId);
+		if (
+			(source.summary.activeSessionId ?? source.summary.id) === (target.summary.activeSessionId ?? target.summary.id)
+		) {
+			throw new Error("Agent abort cannot target the sending session");
+		}
+		assertAgentFamilyReach(this.familyCatalogEntry(source.summary), this.familyCatalogEntry(target.summary));
+		return await this.forwardToWorker(target.worker, {
+			...command,
+			activeSessionId: target.summary.activeSessionId ?? target.summary.id,
+		});
 	}
 
 	private async forwardToWorker(

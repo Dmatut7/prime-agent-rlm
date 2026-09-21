@@ -215,6 +215,27 @@ export interface AgentSessionMessageSendInput {
 	messageId?: string;
 }
 
+export interface AgentSessionMessageAbortInput {
+	target: string;
+	/**
+	 * Abort and flush the target's queued steering messages into one new turn
+	 * (the abort_and_send_queued semantics); false asks for a plain abort that
+	 * leaves the queue untouched. Defaults to true at every caller that omits it.
+	 */
+	sendQueued?: boolean;
+}
+
+export interface AgentSessionMessageAbortReceipt {
+	target: AgentSessionMessageEndpoint;
+	sendQueued: boolean;
+	/**
+	 * Present when sendQueued was true and the target actually had a queued steering
+	 * batch to resume. Absent means the abort ran without a batch (a plain stop, or
+	 * the queue was empty, or the session could not resume right now).
+	 */
+	resumedQueued?: boolean;
+}
+
 export interface AgentSessionMessageController {
 	listAgents(): AgentSessionMessageListResult | Promise<AgentSessionMessageListResult>;
 	roster?(): AgentFamilyRosterResult | Promise<AgentFamilyRosterResult>;
@@ -223,6 +244,12 @@ export interface AgentSessionMessageController {
 	assertSessionNameAvailable?(input: AgentSessionNameAvailabilityInput): void | Promise<void>;
 	setSessionName?(name: string): void | Promise<void>;
 	sendAgentMessage(input: AgentSessionMessageSendInput): Promise<AgentSessionMessageReceipt>;
+	/**
+	 * Abort one family target's active run. Optional because the daemon-side lever is
+	 * new: a session whose controller does not implement it reports a clean
+	 * unavailable error instead of pretending to abort.
+	 */
+	abortAgentMessage?(input: AgentSessionMessageAbortInput): Promise<AgentSessionMessageAbortReceipt>;
 }
 
 export interface AgentSessionMessageSafetyStatus {
@@ -1173,7 +1200,10 @@ export function formatUncertainAgentMessageResendError(input: {
 }
 
 export function createAgentMessageHostHandlers(
-	controller: Pick<AgentSessionMessageController, "roster" | "sendAgentMessage" | "awaitPendingChildPublication"> & {
+	controller: Pick<
+		AgentSessionMessageController,
+		"roster" | "sendAgentMessage" | "awaitPendingChildPublication" | "abortAgentMessage"
+	> & {
 		/**
 		 * Second discovery entry (#2153). Optional: a fork session exposes the roster
 		 * entry point only, and familyMembers() projects it into the same member shape.
@@ -1372,6 +1402,68 @@ export function createAgentMessageHostHandlers(
 				throw error;
 			}
 			remember(messageId, receipt.deliveryStatus, receipt.target?.activeSessionId ?? target);
+			return receipt as unknown as Record<string, unknown>;
+		},
+		"agent_message.abort": async (payload, signal) => {
+			// The lever exists only when the session's controller implements it; a session
+			// without the daemon-side abort must say so instead of failing late.
+			const abort = controller.abortAgentMessage;
+			if (!abort) {
+				throw new Error(
+					"agent abort is not available in this session: the daemon controller does not expose the abort lever",
+				);
+			}
+			signal?.throwIfAborted();
+			const role = payload.receiver_role;
+			if (role !== "parent" && role !== "sibling" && role !== "child") {
+				throw new Error('agent_message.abort receiver_role must be "parent", "sibling", or "child"');
+			}
+			const receiverName = payload.receiver_name;
+			if (role === "parent" && receiverName !== undefined && receiverName !== null) {
+				throw new Error("agent_message.abort receiver_name must be omitted for parent targets");
+			}
+			if (role !== "parent" && (typeof receiverName !== "string" || !receiverName.trim())) {
+				throw new Error("agent_message.abort receiver_name is required for sibling and child targets");
+			}
+			if (payload.target !== undefined) {
+				throw new Error("agent_message.abort does not accept a raw target; use receiver_role and receiver_name");
+			}
+			// No broadcast: an abort is destructive per target, so every target is named.
+			const selector = typeof receiverName === "string" ? receiverName.trim() : undefined;
+			// Same bounded publication wait as send: a child that is still publishing its
+			// session is the one case where a just-dispatched task is worth aborting early.
+			const publishedId =
+				role === "child" && selector && controller.awaitPendingChildPublication
+					? await withBound(controller.awaitPendingChildPublication(selector, signal), {
+							timeoutMs: publicationWaitMs,
+							phase: "publication",
+							target: selector,
+							label: "Agent abort target",
+							targetState: () => `child ${selector} has not published its session yet`,
+							...(signal ? { signal } : {}),
+							...(options.onWaitTimeout ? { onTimeout: options.onWaitTimeout } : {}),
+						}).catch((error: unknown) => {
+							if (error instanceof WaitTimeoutError) return undefined;
+							throw error;
+						})
+					: undefined;
+			const matches = (await familyMembers()).filter(
+				(member) =>
+					member.relationship === role &&
+					(role === "parent" ||
+						agentFamilyMemberName(member.entry) === selector ||
+						member.entry.id === selector ||
+						member.entry.id === publishedId),
+			);
+			if (matches.length !== 1) {
+				throw new Error(
+					matches.length === 0
+						? `No ${role} matches ${role === "parent" ? "the current agent" : JSON.stringify(receiverName)}`
+						: `${role} selector ${JSON.stringify(receiverName)} is ambiguous`,
+				);
+			}
+			const sendQueued = payload.send_queued !== false;
+			const receipt = await abort({ target: matches[0]!.entry.id, sendQueued });
 			return receipt as unknown as Record<string, unknown>;
 		},
 	};

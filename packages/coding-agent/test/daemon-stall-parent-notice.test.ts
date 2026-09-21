@@ -180,6 +180,9 @@ describe("daemon-level stall notice to the parent session", () => {
 		});
 		expect(notice.content).toContain("child-1");
 		expect(notice.content).toContain("hang_forever");
+		// This daemon build serves the agent abort lever, so the notice names it.
+		expect(notice.content).toContain('agent_message.abort(receiver_role="child", receiver_name="name-child-active")');
+		expect(notice.details).toMatchObject({ canAbortAgentTarget: true });
 		expect(options).toEqual({ deliverAs: "followUp" });
 		// The notice goes to the parent only; the wedged child gets nothing injected.
 		expect(fixture.childSendCustomMessage).not.toHaveBeenCalled();
