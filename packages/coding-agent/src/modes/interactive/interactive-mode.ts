@@ -214,7 +214,7 @@ import { ExtensionEditorComponent } from "./components/extension-editor.js";
 import { ExtensionInputComponent } from "./components/extension-input.js";
 import { ExtensionSelectorComponent } from "./components/extension-selector.js";
 import { FEATURE_HINT_ANIMATION_INTERVAL_MS, FeatureHintComponent } from "./components/feature-hint.js";
-import { FooterComponent } from "./components/footer.js";
+import { FooterComponent, type FooterTelemetrySnapshot } from "./components/footer.js";
 import { HeartbeatManagerComponent } from "./components/heartbeat-manager.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./components/injected-prompt-message.js";
 import { formatKeyText, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.js";
@@ -1331,6 +1331,8 @@ export class InteractiveMode {
 			// session's spend to the new chat.
 			getCostUsd: () =>
 				this.topBarCost.sessionId === this.connectionState?.sessionId ? this.topBarCost.total : undefined,
+			// U1: pin the current model on the bar next to the spend.
+			getModel: () => this.getCurrentModel()?.id,
 		});
 		this.chatContainer = new Container();
 		this.shortcutGuideContainer = new Container();
@@ -1376,6 +1378,8 @@ export class InteractiveMode {
 		this.footerDataProvider = new FooterDataProvider(this.uiServices.getInitialCwd());
 		this.footer = new FooterComponent(this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(this.settingsManager.getCompactionEnabled());
+		// U1: persistent telemetry watermark line; density from footer.telemetry.
+		this.footer.setTelemetryMode(this.settingsManager.getFooterTelemetry());
 		this.setGoalAnnouncementBaseline(emptyGoalState());
 
 		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
@@ -3056,6 +3060,7 @@ export class InteractiveMode {
 	// Bake this attempt's output into the snapshot so the tray doesn't dip in the gap between
 	// isStreaming clearing and the async refresh landing.
 	private applyOptimisticContextUsage(): void {
+		this.updateFooterTelemetry();
 		const snapshot = this.connectionState?.contextUsage;
 		if (!snapshot || snapshot.tokens === null || snapshot.contextWindow <= 0) return;
 		const completed = Math.max(0, this.activityTracker.getStatus().tokens - this.contextUsageTokenBaseline);
@@ -3071,7 +3076,37 @@ export class InteractiveMode {
 	}
 
 	/** Refresh the tray's context usage from the session after a turn or compaction completes. */
+	/**
+	 * U1: refresh the persistent footer watermark line (model · context usage ·
+	 * compaction line · GLM storm zone). Cheap: recomputes from connection
+	 * state; call after context usage or model changes and on settings reload.
+	 */
+	private updateFooterTelemetry(): void {
+		// Partial-mode test harnesses skip the constructor, so these fields can be
+		// absent there; the watermark is cosmetic and must never crash a real flow.
+		const footer = (this as { footer?: FooterComponent }).footer;
+		const settingsManager = this.uiServicesOrUndefined?.settingsManager;
+		if (!footer || !settingsManager) {
+			return;
+		}
+		// Re-read the density too: a settings-file reload lands on the next refresh.
+		footer.setTelemetryMode(settingsManager.getFooterTelemetry());
+		const model = this.getCurrentModel();
+		const usage = this.getConnectionContextUsage();
+		const snapshot: FooterTelemetrySnapshot = {
+			modelName: model?.id,
+			contextTokens: usage?.tokens ?? undefined,
+			contextWindow: usage?.contextWindow,
+			compactionTriggerRatio: settingsManager.getCompactionTriggerRatio(),
+			// GLM-family tool-call corruption historically storms from ~390k tokens of
+			// accumulated context; mark that zone while a glm model is bound.
+			glmStormTokens: model?.id.toLowerCase().includes("glm") ? 390_000 : undefined,
+		};
+		footer.setTelemetry(snapshot);
+	}
+
 	private async refreshConnectionContextUsage(): Promise<void> {
+		this.updateFooterTelemetry();
 		const generation = ++this.contextUsageRefresh.generation;
 		const connection = this.agentConnection;
 		const sessionId = this.connectionState?.sessionId;
@@ -3272,6 +3307,7 @@ export class InteractiveMode {
 		// and clears the readout left over from the previous session.
 		this.speedStats = undefined;
 		this.footer?.setSpeedText?.(undefined);
+		(this as { updateFooterTelemetry?: () => void }).updateFooterTelemetry?.();
 		void this.rosterBar?.dispose();
 		this.rosterBar = undefined;
 		if (this.localSessionHost) {
@@ -6174,6 +6210,7 @@ export class InteractiveMode {
 					this.streamingComponent = undefined;
 					this.streamingMessage = undefined;
 					this.footer.invalidate();
+					this.updateFooterTelemetry();
 				}
 				this.ui.requestRender();
 				break;

@@ -577,6 +577,7 @@ export interface Settings {
 	autoRefine?: AutoRefineSettings;
 	agentTraces?: AgentTracesSettings;
 	telemetry?: TelemetrySettings;
+	footer?: FooterSettings;
 	branchSummary?: BranchSummarySettings;
 	retention?: RetentionSettings;
 	retry?: RetrySettings;
@@ -673,6 +674,14 @@ export const MAX_SUBAGENT_SPEND_CELL_INTERVAL_MS = 120_000;
 export interface TelemetrySettings {
 	enabled?: boolean;
 	noticeShown?: boolean;
+}
+
+/** U1 persistent footer telemetry line density (footer.ts renders the watermark). */
+export type FooterTelemetrySetting = "off" | "compact" | "full";
+
+export interface FooterSettings {
+	/** Default: "compact" — one line: model · ctx tokens/window(%) · compaction line. */
+	telemetry?: FooterTelemetrySetting;
 }
 
 /** A JSON object that merges key-by-key; arrays and nulls replace wholesale. */
@@ -814,6 +823,7 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	autoRefine: ["enabled", "turnInterval", "compact", "cooldownMs"],
 	agentTraces: ["enabled"],
 	telemetry: ["enabled", "noticeShown"],
+	footer: ["telemetry"],
 	branchSummary: ["reserveTokens", "skipPrompt"],
 	retention: [
 		"enabled",
@@ -2074,6 +2084,17 @@ export class SettingsManager {
 
 	getTransport(): TransportSetting {
 		return this.settings.transport ?? "auto";
+	}
+
+	getFooterTelemetry(): FooterTelemetrySetting {
+		const value = this.settings.footer?.telemetry;
+		return value === "off" || value === "compact" || value === "full" ? value : "compact";
+	}
+
+	setFooterTelemetry(telemetry: FooterTelemetrySetting): void {
+		this.globalSettings.footer = { ...this.globalSettings.footer, telemetry };
+		this.markModified("footer", "telemetry");
+		this.save();
 	}
 
 	setTransport(transport: TransportSetting): void {
