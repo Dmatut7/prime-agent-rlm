@@ -13,6 +13,7 @@ import {
 	combineAgentsViewStartupNotices,
 	createInitialAgentsViewPersistentState,
 	runAgentsViewMode,
+	waitThroughDaemonUpdateRestart,
 } from "../src/modes/agents-view/agents-view-mode.js";
 import {
 	type AgentsViewRow,
@@ -22,10 +23,12 @@ import {
 } from "../src/modes/agents-view/agents-view-state.js";
 import { type AgentsViewRosterStore, STALE_ROSTER_DAEMON_MESSAGE } from "../src/modes/agents-view/roster-store.js";
 import type { DaemonClient } from "../src/modes/daemon/daemon-client.js";
+import { DaemonSessionRecoveringError, DaemonUpdateRestartingError } from "../src/modes/daemon/daemon-errors.js";
 import {
 	DAEMON_FIRST_PARTY_SESSION_CAPABILITIES,
 	type DaemonDeclaredCapability,
 } from "../src/modes/daemon/daemon-protocol.js";
+import { DaemonControlPlaneTransportError } from "../src/modes/daemon/daemon-routed-client.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import type { InteractiveModeUiServices } from "../src/modes/interactive/interactive-mode-services.js";
 import { stopThemeWatcher, theme } from "../src/modes/interactive/theme/theme.js";
@@ -45,21 +48,25 @@ vi.mock("../src/config.js", async (importOriginal) => {
 	return { ...actual, appendRotatingLog: vi.fn() };
 });
 
-vi.mock("../src/modes/daemon/daemon-client.js", () => ({
-	DaemonClient: class {
-		constructor(socketPath: string, options?: { declaredCapabilities?: readonly DaemonDeclaredCapability[] }) {
-			modeMocks.clientConstructions.push({ socketPath, declaredCapabilities: options?.declaredCapabilities });
-		}
-		connect = vi.fn(async () => undefined);
-		close = vi.fn();
-		request = modeMocks.clientRequest;
-		isConnected = true;
-		reconnect = vi.fn(async () => undefined);
-		onMessage = vi.fn(() => () => {});
-		onClose = vi.fn(() => () => {});
-	},
-	getDaemonSocketCloseReason: vi.fn(),
-}));
+vi.mock("../src/modes/daemon/daemon-client.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../src/modes/daemon/daemon-client.js")>();
+	return {
+		...actual,
+		DaemonClient: class {
+			constructor(socketPath: string, options?: { declaredCapabilities?: readonly DaemonDeclaredCapability[] }) {
+				modeMocks.clientConstructions.push({ socketPath, declaredCapabilities: options?.declaredCapabilities });
+			}
+			connect = vi.fn(async () => undefined);
+			close = vi.fn();
+			request = modeMocks.clientRequest;
+			isConnected = true;
+			reconnect = vi.fn(async () => undefined);
+			onMessage = vi.fn(() => () => {});
+			onClose = vi.fn(() => () => {});
+		},
+		getDaemonSocketCloseReason: vi.fn(),
+	};
+});
 
 vi.mock("../src/modes/agent-connection/daemon-agent-connection.js", () => ({
 	DaemonAgentConnection: Object.assign(function DaemonAgentConnection() {}, {
@@ -1819,5 +1826,571 @@ describe("agents view session-switch handoff", () => {
 		invoke("finish", self, result);
 
 		expect(frames).toEqual(["stop:undefined"]);
+	});
+});
+
+describe("agents view reply delivery on inactive sessions", () => {
+	function replySummary(overrides: Partial<SessionSummary>): SessionSummary {
+		return {
+			id: "saved-1",
+			lifecycle: "archived",
+			activity: "idle",
+			sessionId: "saved-1",
+			cwd: process.cwd(),
+			isStreaming: false,
+			isCompacting: false,
+			attachedClients: 0,
+			messageCount: 3,
+			sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+			...overrides,
+			isSessionActive: overrides.isSessionActive ?? false,
+		};
+	}
+
+	function editorWithText(initial: string) {
+		let text = initial;
+		return {
+			getText: () => text,
+			setText: vi.fn((next: string) => {
+				text = next;
+			}),
+		};
+	}
+
+	const savedSummary = replySummary({
+		sessionFile: "/tmp/sessions/saved-1.jsonl",
+		cwd: process.cwd(),
+		summary: "Persisted recap text",
+		firstMessage: "opener",
+	});
+
+	it("arms a saved reply from its persisted recap and lets ctrl+c disarm it", async () => {
+		const requestRender = vi.fn();
+		const handleCtrlC = vi.fn();
+		const self: Record<string, unknown> = {
+			rows: [
+				{ kind: "agent", selectable: true, identity: "file:/tmp/sessions/saved-1.jsonl", summary: savedSummary },
+			],
+			selectedIndex: 0,
+			pendingDeleteAgent: undefined,
+			replyTarget: undefined,
+			renameTarget: undefined,
+			setReplyTarget: vi.fn((target: unknown) => {
+				self.replyTarget = target;
+			}),
+			ui: { requestRender },
+			clearStickyStatusMessage: vi.fn(),
+			keybindings: { matches: (_data: string, action: string) => action === "app.clear" },
+			handleCtrlC,
+		};
+
+		await invoke("toggleReplyTarget", self);
+		expect(self.replyTarget).toEqual({ key: "saved-1", summary: savedSummary });
+		expect(self.replyLastAssistantText).toBe("Persisted recap text");
+		expect(requestRender).toHaveBeenCalledOnce();
+
+		invoke("handleInput", self, "\x03");
+		expect(self.replyTarget).toBeUndefined();
+		expect(handleCtrlC).not.toHaveBeenCalled();
+	});
+
+	it("keeps the cwd-fallback notice visible after the reply is sent", async () => {
+		const savedWithMissingCwd = { ...savedSummary, cwd: "/definitely/not/a/real/dir/for/this/test" };
+		const request = vi.fn(async () => ({
+			success: true,
+			data: { ...savedWithMissingCwd, lifecycle: "live", activeSessionId: "active-9" },
+		}));
+		const setStatusMessage = vi.fn();
+		const self: Record<string, unknown> = {
+			options: { config: { cwd: process.cwd() } },
+			requireClient: () => ({ request }),
+			findSummaryByActiveSessionId: () => undefined,
+			inactiveAgentIdentities: new Set(["file:/tmp/sessions/saved-1.jsonl"]),
+			setStatusMessage,
+			selectSummary: vi.fn(),
+			sendPrompt: vi.fn(async () => {}),
+		};
+
+		await invoke("sendReply", self, { key: "saved-1", summary: savedWithMissingCwd }, "wake up");
+
+		expect(setStatusMessage).toHaveBeenLastCalledWith(expect.stringContaining("Original directory is missing"), {
+			sticky: true,
+		});
+	});
+
+	it("submits alt+enter as a follow-up only for an armed non-empty reply", () => {
+		const submit = vi.fn(async () => {});
+		invoke("handleReplyFollowUp", { replyTarget: undefined, editor: { getExpandedText: () => "text" }, submit });
+		invoke("handleReplyFollowUp", {
+			replyTarget: { key: "active-1", summary: savedSummary },
+			editor: { getExpandedText: () => "   " },
+			submit,
+		});
+		expect(submit).not.toHaveBeenCalled();
+
+		invoke("handleReplyFollowUp", {
+			replyTarget: { key: "active-1", summary: savedSummary },
+			editor: { getExpandedText: () => "expanded paste body" },
+			submit,
+		});
+		expect(submit).toHaveBeenCalledWith("expanded paste body", "followUp");
+	});
+
+	// [the view finishes mid-create, the requests the dedicated connection carries]
+	it.each([
+		["opens it", false, ["create"]],
+		["kills a session created after the view already finished", true, ["create", "kill"]],
+	] as const)(
+		"creates a new daemon session over a dedicated connection and %s",
+		async (_name, stopsDuringCreate, requestTypes) => {
+			const created = replySummary({ id: "active-new", activeSessionId: "active-new", lifecycle: "live" });
+			const requests: { type: string }[] = [];
+			const close = vi.fn();
+			const self: Record<string, unknown> = {
+				creatingNewSession: false,
+				stopped: false,
+				options: { config: {} },
+				connectDedicatedClient: vi.fn(async () => ({
+					close,
+					request: vi.fn(async (command: { type: string }) => {
+						requests.push(command);
+						// The view finishes while create is in flight.
+						if (stopsDuringCreate) self.stopped = true;
+						return { success: true, data: created };
+					}),
+				})),
+				setStatusMessage: vi.fn(),
+				selectSummary: vi.fn(),
+				finish: vi.fn(),
+			};
+
+			const result = await invoke("createNewSession", self);
+
+			expect(requests.map((r) => r.type)).toEqual(requestTypes);
+			if (stopsDuringCreate) {
+				expect(self.finish).not.toHaveBeenCalled();
+				expect(self.selectSummary).not.toHaveBeenCalled();
+			} else {
+				expect(result).toBe(true);
+				expect(self.selectSummary).toHaveBeenCalledWith(created);
+				expect(self.finish).toHaveBeenCalledWith({ type: "open", summary: created });
+				expect(close).toHaveBeenCalledOnce();
+				expect(self.creatingNewSession).toBe(false);
+			}
+		},
+	);
+
+	it("resumes a saved session before delivering the reply", async () => {
+		const request = vi.fn(async (command: { type: string }) => {
+			if (command.type === "create") {
+				return {
+					success: true,
+					data: { ...savedSummary, lifecycle: "live", activeSessionId: "active-9", isStreaming: true },
+				};
+			}
+			return { success: true, data: {} };
+		});
+		const target = { key: "saved-1", summary: savedSummary };
+		const self: Record<string, unknown> = {
+			options: { config: { cwd: process.cwd() } },
+			requireClient: () => ({ request }),
+			replyTarget: target,
+			// Stale pre-resume rows do not know the resumed session; scheduling must
+			// come from the resume response instead.
+			findSummaryByActiveSessionId: () => undefined,
+			inactiveAgentIdentities: new Set(["file:/tmp/sessions/saved-1.jsonl"]),
+			setStatusMessage: vi.fn(),
+			setReplyTarget: vi.fn(),
+			refreshSessions: vi.fn(async () => true),
+			selectSummary: vi.fn(),
+			sendPrompt: vi.fn(async () => {}),
+		};
+
+		await invoke("sendReply", self, target, "wake up");
+
+		expect(request).toHaveBeenCalledWith(
+			expect.objectContaining({ type: "create", sessionPath: savedSummary.sessionFile }),
+		);
+		expect(self.sendPrompt).toHaveBeenCalledWith("active-9", "wake up", "steer");
+		expect(self.selectSummary).toHaveBeenCalledWith(expect.objectContaining({ activeSessionId: "active-9" }));
+		expect(self.inactiveAgentIdentities).not.toContain("file:/tmp/sessions/saved-1.jsonl");
+		expect(self.setReplyTarget).not.toHaveBeenCalled();
+	});
+
+	it("does not select a resumed session after its reply target is cancelled", async () => {
+		let finishResume: ((result: { success: true; data: SessionSummary }) => void) | undefined;
+		let signalResumeStarted!: () => void;
+		const resumeStarted = new Promise<void>((resolve) => {
+			signalResumeStarted = resolve;
+		});
+		const request = vi.fn(
+			() =>
+				new Promise<{ success: true; data: SessionSummary }>((resolve) => {
+					finishResume = resolve;
+					signalResumeStarted();
+				}),
+		);
+		const target = { key: "saved-1", summary: savedSummary };
+		const selection = { activeSessionId: "active-2" };
+		const selectSummary = vi.fn((next: SessionSummary) => {
+			selection.activeSessionId = next.activeSessionId ?? next.id;
+		});
+		const sendPrompt = vi.fn(async () => {});
+		const self: Record<string, unknown> = {
+			options: { config: { cwd: process.cwd() } },
+			requireClient: () => ({ request }),
+			findSummaryByActiveSessionId: () => undefined,
+			inactiveAgentIdentities: new Set(["file:/tmp/sessions/saved-1.jsonl"]),
+			replyTarget: target,
+			setStatusMessage: vi.fn(),
+			selectSummary,
+			sendPrompt,
+		};
+
+		const reply = invoke("sendReply", self, target, "wake up") as Promise<boolean>;
+		await resumeStarted;
+		expect(request).toHaveBeenCalledOnce();
+		self.replyTarget = undefined;
+		finishResume?.({
+			success: true,
+			data: { ...savedSummary, lifecycle: "live", activeSessionId: "active-9" },
+		});
+
+		await expect(reply).resolves.toBe(true);
+		expect(selectSummary).not.toHaveBeenCalled();
+		expect(selection.activeSessionId).toBe("active-2");
+		expect(sendPrompt).toHaveBeenCalledWith("active-9", "wake up", undefined);
+		expect(self.inactiveAgentIdentities).not.toContain("file:/tmp/sessions/saved-1.jsonl");
+	});
+
+	// [re-armed target survives, text entered mid-send survives]
+	it.each([
+		["preserves a replacement composer when an older reply succeeds", true],
+		["preserves new text entered while the same reply succeeds", false],
+	] as const)("%s", async (_name, rearmed) => {
+		const editor = editorWithText("old reply");
+		const oldTarget = { key: "saved-1", summary: savedSummary };
+		const newTarget = {
+			key: "active-2",
+			summary: replySummary({ id: "active-2", activeSessionId: "active-2", lifecycle: "live" }),
+		};
+		const self: Record<string, unknown> = {
+			replyTarget: oldTarget,
+			options: {},
+			editor,
+			setReplyTarget: vi.fn(),
+			refreshSessions: vi.fn(async () => true),
+			sendReply: vi.fn(async () => {
+				if (rearmed) self.replyTarget = newTarget;
+				editor.setText("next reply");
+				return true;
+			}),
+		};
+
+		await invoke("submit", self, "old reply");
+
+		expect(self.replyTarget).toBe(rearmed ? newTarget : oldTarget);
+		expect(editor.getText()).toBe("next reply");
+		expect(self.setReplyTarget).not.toHaveBeenCalled();
+		if (rearmed) expect(self.refreshSessions).toHaveBeenCalledWith();
+	});
+
+	it.each([
+		{ name: "resume failure", failure: "resume", remainsInactive: true },
+		{ name: "send failure", failure: "send", remainsInactive: false },
+		{
+			name: "replacement text entered during send failure",
+			failure: "send",
+			replacement: "replacement",
+			remainsInactive: false,
+		},
+	] as const)("handles $name", async ({ failure, replacement, remainsInactive }) => {
+		const editor = editorWithText("wake up");
+		const target = { key: "saved-1", summary: savedSummary };
+		const inactiveAgentIdentities = new Set(["file:/tmp/sessions/saved-1.jsonl"]);
+		const request = vi.fn(async () => {
+			if (failure === "resume") throw new Error("resume failed");
+			return {
+				success: true,
+				data: { ...savedSummary, lifecycle: "live", activeSessionId: "active-9" },
+			};
+		});
+		const sendPrompt = vi.fn(async () => {
+			if (replacement) editor.setText(replacement);
+			throw new Error("send failed");
+		});
+		const self: Record<string, unknown> = {
+			options: { config: { cwd: process.cwd() } },
+			requireClient: () => ({ request }),
+			findSummaryByActiveSessionId: () => undefined,
+			inactiveAgentIdentities,
+			replyTarget: target,
+			editor,
+			setStatusMessage: vi.fn(),
+			setReplyTarget: vi.fn(),
+			refreshSessions: vi.fn(async () => true),
+			selectSummary: vi.fn(),
+			sendPrompt,
+			sendReply: (replyTarget: unknown, text: string) => invoke("sendReply", self, replyTarget, text),
+		};
+
+		await invoke("submit", self, "wake up");
+
+		expect(request).toHaveBeenCalledOnce();
+		expect(request).toHaveBeenCalledWith(
+			expect.objectContaining({ type: "create", sessionPath: savedSummary.sessionFile }),
+		);
+		expect(sendPrompt).toHaveBeenCalledTimes(failure === "resume" ? 0 : 1);
+		expect(self.selectSummary).toHaveBeenCalledTimes(failure === "resume" ? 0 : 1);
+		expect(self.setStatusMessage).toHaveBeenLastCalledWith(`Failed to send reply: ${failure} failed`);
+		expect(self.replyTarget).toBe(target);
+		expect(self.setReplyTarget).not.toHaveBeenCalled();
+		expect(editor.setText).toHaveBeenNthCalledWith(1, "");
+		expect(editor.getText()).toBe(replacement ?? "wake up");
+		expect(inactiveAgentIdentities.has("file:/tmp/sessions/saved-1.jsonl")).toBe(remainsInactive);
+		expect(self.refreshSessions).toHaveBeenCalledTimes(remainsInactive ? 0 : 1);
+		if (!remainsInactive) {
+			expect(self.refreshSessions).toHaveBeenCalledWith();
+		}
+	});
+
+	it("resumes the current saved row when an armed live target becomes inactive", async () => {
+		const capturedLive = replySummary({
+			activeSessionId: "active-dead",
+			lifecycle: "live",
+			sessionFile: savedSummary.sessionFile,
+		});
+		const currentSaved = { ...savedSummary, activeSessionId: undefined };
+		const request = vi.fn(async () => ({
+			success: true,
+			data: { ...currentSaved, lifecycle: "live", activeSessionId: "active-new" },
+		}));
+		const self: Record<string, unknown> = {
+			options: { config: { cwd: process.cwd() } },
+			requireClient: () => ({ request }),
+			unifiedRecords: [
+				{
+					daemon: currentSaved,
+					identity: "file:/tmp/sessions/saved-1.jsonl",
+					identityAliases: ["file:/tmp/sessions/saved-1.jsonl"],
+					section: "inactive",
+					searchableText: "",
+				},
+			],
+			findSummaryByActiveSessionId: () => undefined,
+			inactiveAgentIdentities: new Set<string>(),
+			replyTarget: undefined,
+			setStatusMessage: vi.fn(),
+			selectSummary: vi.fn(),
+			sendPrompt: vi.fn(async () => {}),
+		};
+
+		await invoke("sendReply", self, { key: "active-dead", summary: capturedLive }, "wake up");
+
+		expect(request).toHaveBeenCalledWith(
+			expect.objectContaining({ type: "create", sessionPath: savedSummary.sessionFile }),
+		);
+		expect(self.sendPrompt).toHaveBeenCalledWith("active-new", "wake up", undefined);
+		expect(self.sendPrompt).not.toHaveBeenCalledWith("active-dead", expect.anything(), expect.anything());
+	});
+
+	it("replies to live sessions without resuming, steering or queueing per delivery", async () => {
+		let liveSummary = replySummary({ activeSessionId: "active-1", lifecycle: "live" });
+		const request = vi.fn();
+		const self: Record<string, unknown> = {
+			options: { config: {} },
+			requireClient: () => ({ request }),
+			findSummaryByActiveSessionId: () => liveSummary,
+			setStatusMessage: vi.fn(),
+			selectSummary: vi.fn(),
+			sendPrompt: vi.fn(async () => {}),
+		};
+		const target = () => ({ key: "active-1", summary: liveSummary });
+
+		await invoke("sendReply", self, target(), "hello");
+		expect(self.sendPrompt).toHaveBeenCalledWith("active-1", "hello", undefined);
+
+		liveSummary = replySummary({ activeSessionId: "active-1", lifecycle: "live", isStreaming: true });
+		await invoke("sendReply", self, target(), "change course");
+		expect(self.sendPrompt).toHaveBeenCalledWith("active-1", "change course", "steer");
+
+		await invoke("sendReply", self, target(), "later please", "followUp");
+		expect(self.sendPrompt).toHaveBeenCalledWith("active-1", "later please", "followUp");
+
+		expect(request).not.toHaveBeenCalled();
+		expect(self.selectSummary).not.toHaveBeenCalled();
+	});
+
+	it("does not disarm a composer that was re-armed during the command", async () => {
+		const live = replySummary({ activeSessionId: "active-1", lifecycle: "live" });
+		const originalTarget = { key: "active-1", summary: live };
+		const newTarget = { key: "active-2", summary: replySummary({ activeSessionId: "active-2" }) };
+		const setReplyTarget = vi.fn();
+		const self: Record<string, unknown> = {
+			requireClient: () => ({
+				request: vi.fn(async () => {
+					// The user re-arms against a different agent mid-RPC.
+					self.replyTarget = newTarget;
+					return { success: true, data: {} };
+				}),
+			}),
+			editor: editorWithText(""),
+			setStatusMessage: vi.fn(),
+			setReplyTarget,
+			replyTarget: originalTarget,
+			refreshSessions: vi.fn(async () => true),
+		};
+
+		await invoke("runAgentsViewCommand", self, { name: "kill", args: "" }, live);
+
+		expect(setReplyTarget).not.toHaveBeenCalled();
+	});
+
+	it("re-resolves the armed target before dispatching a view command", async () => {
+		const stale = replySummary({ sessionFile: "/tmp/sessions/saved-1.jsonl" });
+		const liveNow = replySummary({
+			sessionFile: "/tmp/sessions/saved-1.jsonl",
+			activeSessionId: "active-9",
+			lifecycle: "live",
+		});
+		const runAgentsViewCommand = vi.fn(async () => true);
+		const self: Record<string, unknown> = {
+			replyTarget: { key: "saved-1", summary: stale },
+			options: {},
+			unifiedRecords: [
+				{
+					daemon: liveNow,
+					identity: "file:/tmp/sessions/saved-1.jsonl",
+					identityAliases: ["file:/tmp/sessions/saved-1.jsonl"],
+					section: "idle",
+					searchableText: "",
+				},
+			],
+			findSummaryByActiveSessionId: () => undefined,
+			editor: editorWithText(""),
+			runAgentsViewCommand,
+		};
+
+		await invoke("submit", self, "/kill");
+
+		expect(runAgentsViewCommand).toHaveBeenCalledWith(
+			{ name: "kill", args: "" },
+			expect.objectContaining({ activeSessionId: "active-9" }),
+		);
+	});
+});
+describe("agents view open during a daemon update restart", () => {
+	beforeEach(() => vi.clearAllMocks());
+
+	it.each([
+		[
+			"waits through the update restart and surfaces the wait notice",
+			true,
+			"Waited for the Prime Agent daemon update restart to finish",
+		],
+		[
+			"surfaces a permanent create failure unmasked by the wait",
+			false,
+			"Failed to open agent: File not found: /tmp/scope.jsonl",
+		],
+	] as const)("%s", async (_name, reachesSession, expectedMessage) => {
+		const saved = summary({ activeSessionId: undefined, lifecycle: "archived" });
+		let runs = 0;
+		vi.spyOn(AgentsViewMode.prototype, "run").mockImplementation(async function (this: AgentsViewMode) {
+			runs += 1;
+			if (runs === 1) return { type: "open", summary: saved, hasChildren: false };
+			expect(String(Reflect.get(this, "persistentState").statusMessage)).toContain(expectedMessage);
+			return { type: "exit" };
+		});
+		modeMocks.clientRequest
+			.mockResolvedValueOnce({
+				success: false,
+				error: "Daemon is preparing an update restart",
+			})
+			.mockResolvedValueOnce(
+				reachesSession
+					? { success: true, data: { ...saved, activeSessionId: "resumed-after-update", lifecycle: "live" } }
+					: { success: false, error: "File not found: /tmp/scope.jsonl" },
+			);
+		modeMocks.interactiveRun.mockResolvedValue({
+			type: "agents_view",
+			source: { activeSessionId: "resumed-after-update", sessionId: saved.sessionId, cwd: saved.cwd },
+		} as never);
+
+		await runAgentsViewMode({
+			config: { cwd: process.cwd() },
+			socketPath: "/tmp/agents-view-test.sock",
+			uiServices: createUiServices(),
+		});
+
+		expect(modeMocks.clientRequest).toHaveBeenCalledTimes(2);
+		expect(modeMocks.interactiveRun).toHaveBeenCalledTimes(reachesSession ? 1 : 0);
+		expect(runs).toBe(2);
+	});
+});
+
+describe("waitThroughDaemonUpdateRestart", () => {
+	const updateRestartDeadline =
+		/The Prime Agent daemon did not finish its update restart within \d+ seconds\. Try opening this agent again once the update finishes\. Last error: Daemon is preparing an update restart/;
+
+	// Post-arm transient shapes only; arming is pinned at the loop/deadline layers.
+	it("retries every restart-transient failure and reports that it waited", async () => {
+		const transientFailures = [
+			() => new Error("Failed to connect to the Prime Agent daemon: connect ENOENT"),
+			() => Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }),
+			() => new Error("Connection to the Prime Agent daemon closed."),
+			() => new Error('Timed out after 30000ms waiting for the Prime Agent daemon response to "create".'),
+			() => new DaemonControlPlaneTransportError(new Error("Connection to the Prime Agent daemon closed.")),
+			() => new Error("Unknown active session: update-restart-session"),
+			() => new DaemonSessionRecoveringError("update-restart-session"),
+		];
+		let attempts = 0;
+		const outcome = await waitThroughDaemonUpdateRestart(
+			async () => {
+				attempts += 1;
+				if (attempts === 1) throw new DaemonUpdateRestartingError();
+				const failure = transientFailures[attempts - 2];
+				if (failure) throw failure();
+				return "opened";
+			},
+			{ waitMs: 5_000, retryMs: 1 },
+		);
+		expect(outcome).toEqual({ result: "opened", waitedForUpdateRestart: true });
+	});
+
+	it("propagates a non-update failure before any update-restart signal", async () => {
+		let attempts = 0;
+		await expect(
+			waitThroughDaemonUpdateRestart(async () => {
+				attempts += 1;
+				throw new Error("spawn EMFILE");
+			}),
+		).rejects.toThrow("spawn EMFILE");
+		expect(attempts).toBe(1);
+	});
+
+	// The deadline races every attempt so an in-flight create cannot hold the open past the budget.
+	it("fails at the deadline even when an in-flight attempt would block past it", async () => {
+		vi.useFakeTimers();
+		const inFlight = new Promise<string>(() => {});
+		let attempts = 0;
+		try {
+			const opening = waitThroughDaemonUpdateRestart(
+				async () => {
+					attempts += 1;
+					if (attempts === 1) throw new DaemonUpdateRestartingError();
+					return inFlight;
+				},
+				{ waitMs: 60, retryMs: 5 },
+			).then(
+				() => "unexpectedly opened",
+				(error: Error) => error.message,
+			);
+			await vi.advanceTimersByTimeAsync(60);
+			expect(await opening).toMatch(updateRestartDeadline);
+			expect(attempts).toBe(2);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });

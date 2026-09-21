@@ -652,3 +652,52 @@ describe("session info usage totals", () => {
 		}
 	});
 });
+
+describe("tool-result entries counted from their headers", () => {
+	let tempDir: string;
+
+	beforeEach(() => {
+		tempDir = join(tmpdir(), `session-scan-count-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(tempDir, { recursive: true });
+	});
+
+	afterEach(() => {
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	const header = { type: "session", version: 3, id: "scan1", timestamp: "2026-01-01T00:00:00Z", cwd: "/tmp" };
+	const msg = (id: string, parentId: string | null, role: string, text: string) => ({
+		type: "message",
+		id,
+		parentId,
+		timestamp: "2026-01-01T00:00:01Z",
+		message: { role, content: text, timestamp: 1 },
+	});
+	const line = (entry: unknown) => `${JSON.stringify(entry)}\n`;
+	const prompt = line(header) + line(msg("u", null, "user", "hello")) + line(msg("a", "u", "assistant", "reply"));
+	const tool = (idFirst = false, tear = false, payload = "x") =>
+		`${idFirst ? `{"id":"t1","parentId":"a1","timestamp":"${header.timestamp}","type":"message",` : `{"type":"message","id":"t1","parentId":"a1","timestamp":"${header.timestamp}",`}"message":{"role":"toolResult","content":"${payload}"${tear ? "" : "}"}\n`;
+	const scan = (body: string) => {
+		const file = join(tempDir, "counted.jsonl");
+		writeFileSync(file, body);
+		return readSessionInfo(file);
+	};
+	const shadowed = `{"type":"message","meta":{"message":{"role":"toolResult"}},"message":{"role":"user","content":"kept","timestamp":1}}`;
+	const boundary = (length: number) =>
+		`{"type":"message","id":"${"x".repeat(length)}","parentId":null,"timestamp":"${header.timestamp}","message":{"role":"user","content":"kept","timestamp":1}}`;
+	const boundaryId = 512 - 19 - boundary(0).indexOf('"message":{"role":"');
+
+	it.each([
+		["an unparsed tool result", prompt + tool(false, true), 3, "hello reply"],
+		["an oversized tool result", prompt + tool(false, false, "y".repeat(1024 * 1024)), 3, "hello reply"],
+		["id-first tool results", prompt + tool(true) + tool(true, true), 4, "hello reply"],
+		["a container before the role marker", `${line(header)}${shadowed}\n`, 1, "kept"],
+		["the role at the prefix boundary", `${line(header)}${boundary(boundaryId)}\n`, 1, "kept"],
+	])("counts %s from its header", async (_case, body, messageCount, allMessagesText) => {
+		expect(await scan(body)).toMatchObject({ messageCount, allMessagesText });
+	});
+	it("drops a damaged session whose first entry is a tool result", async () => {
+		expect(await scan(tool())).toBeNull();
+		expect(await SessionManager.listAll(undefined, tempDir)).toEqual([]);
+	});
+});

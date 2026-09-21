@@ -99,7 +99,13 @@ import {
 	isFragmentOnlyToolCallDelta,
 } from "./compact-session-stream.js";
 import { DAEMON_CATALOG_ROLE_ENV, DaemonCatalogClient } from "./daemon-catalog-process.js";
-import { DaemonSessionRecoveringError, deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
+import {
+	DaemonSessionRecoveringError,
+	deserializeDaemonError,
+	serializeDaemonError,
+	UPDATE_RESTART_PREPARING_ERROR_INFO,
+	UPDATE_RESTART_PREPARING_MESSAGE,
+} from "./daemon-errors.js";
 import {
 	collectDaemonClientEnv,
 	createDaemonEventMeta,
@@ -1538,7 +1544,6 @@ export class DaemonSupervisor {
 				// artifact layout) must never keep the supervisor from starting.
 				this.log(`Could not migrate legacy cron jobs: ${error instanceof Error ? error.message : String(error)}`);
 			}
-			await this.catalog.start().catch((error) => this.log(`Could not start daemon catalog: ${String(error)}`));
 			this.assertSocketLeaseHeld();
 			await this.seedRosterLedger();
 			this.seedAdoptingWorkerRosterRows();
@@ -2858,7 +2863,10 @@ export class DaemonSupervisor {
 		const command = preParsed.command;
 		const parsedAdmission = preParsed.admission;
 		if (command.type === "cancel_prompt_admission" && this.updateRestartPhase !== undefined) {
-			this.write(client, failure(command.id, command.type, "Daemon is preparing an update restart"));
+			this.write(
+				client,
+				failure(command.id, command.type, UPDATE_RESTART_PREPARING_MESSAGE, UPDATE_RESTART_PREPARING_ERROR_INFO),
+			);
 			return;
 		}
 		const cancellationAdmission =
@@ -2969,7 +2977,10 @@ export class DaemonSupervisor {
 					!(phase === "prepared" && (command.type === "shutdown" || command.type === "prepare_update_restart"));
 		if (restartRejected && mutation) {
 			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
-			this.write(client, failure(command.id, command.type, "Daemon is preparing an update restart"));
+			this.write(
+				client,
+				failure(command.id, command.type, UPDATE_RESTART_PREPARING_MESSAGE, UPDATE_RESTART_PREPARING_ERROR_INFO),
+			);
 			return;
 		}
 		if (mutation && !UPDATE_RESTART_DRAIN_COMMANDS.has(command.type)) {
@@ -3417,11 +3428,16 @@ export class DaemonSupervisor {
 			case "restart":
 				setImmediate(() => this.background(this.shutdown(0, false, true, false, "update"), "restart shutdown"));
 				return success(command.id, command.type);
-			case "shutdown":
+			case "shutdown": {
+				// An update-restart coordinator stops a prepared daemon with this command;
+				// attached windows need the "update" reason to recover instead of dying.
+				// Capture the reason now: a later phase change must not rewrite it.
+				const closingReason: DaemonClosingReason = this.updateRestartPhase === "prepared" ? "update" : "shutdown";
 				setImmediate(() =>
-					this.background(this.shutdown(0, true, false, command.force === true, "shutdown"), "daemon shutdown"),
+					this.background(this.shutdown(0, true, false, command.force === true, closingReason), "daemon shutdown"),
 				);
 				return success(command.id, "shutdown");
+			}
 			case "prepare_update_restart": {
 				const manifest = await this.prepareUpdateRestart();
 				return success(command.id, "prepare_update_restart", manifest);
@@ -5927,11 +5943,19 @@ export class DaemonSupervisor {
 			throw new SupervisorRecoveryCancelledError("Worker recovery was cancelled before interruption was recorded");
 		}
 		await Promise.all(
-			[...interruptedSessions.values()].map((interrupted) =>
-				this.catalog.markInterrupted(interrupted.sessionFile, interrupted.activeSessionId, [
-					...interrupted.operations,
-				]),
-			),
+			[...interruptedSessions.values()].map(async (interrupted) => {
+				try {
+					await this.catalog.markInterrupted(interrupted.sessionFile, interrupted.activeSessionId, [
+						...interrupted.operations,
+					]);
+				} catch (error) {
+					// The notice is advisory: an unwritable session file must not abort
+					// the orphan reap, the journal resolution, or the recovery retry.
+					this.log(
+						`Could not record the interrupted session notice for ${interrupted.sessionFile}: ${String(error)}`,
+					);
+				}
+			}),
 		);
 		await this.assertRecoveryAllowed();
 		if (this.isWorkerCleanupCancelled(worker)) {

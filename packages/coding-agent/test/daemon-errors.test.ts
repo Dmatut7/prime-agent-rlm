@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 import { SessionAlreadyActiveError } from "../src/core/session-lease.js";
 import {
 	DaemonSessionCreateError,
+	DaemonUpdateRestartingError,
 	deserializeDaemonCreateError,
 	deserializeDaemonError,
+	isDaemonUpdateRestartingError,
+	serializeDaemonError,
 } from "../src/modes/daemon/daemon-errors.js";
 import type { DaemonResponse } from "../src/modes/daemon/daemon-protocol.js";
 
@@ -102,5 +105,31 @@ describe("unknown errorInfo downgrade (rev38 contract)", () => {
 		const plain = deserializeDaemonCreateError(unknownTyped);
 		expect(plain).not.toBeInstanceOf(DaemonSessionCreateError);
 		expect(plain.message).toBe("create said no");
+	});
+});
+
+describe("update_restarting wire round-trip", () => {
+	it("serializes for old clients (readable message) and deserializes for new clients (typed, retryable)", () => {
+		const error = new DaemonUpdateRestartingError();
+		const errorInfo = serializeDaemonError(error);
+		expect(errorInfo).toEqual({ code: "update_restarting" });
+		expect(error.message).toBe("Daemon is preparing an update restart");
+		const roundTripped = deserializeDaemonError({
+			type: "response",
+			command: "create",
+			success: false,
+			error: error.message,
+			errorInfo,
+		});
+		expect(roundTripped).toBeInstanceOf(DaemonUpdateRestartingError);
+		const legacy = deserializeDaemonError({
+			type: "response",
+			command: "create",
+			success: false,
+			error: "Daemon is preparing an update restart",
+		});
+		expect(legacy).not.toBeInstanceOf(DaemonUpdateRestartingError);
+		expect(isDaemonUpdateRestartingError(legacy)).toBe(true);
+		expect(isDaemonUpdateRestartingError(new Error("Unknown active session: active-gap"))).toBe(false);
 	});
 });

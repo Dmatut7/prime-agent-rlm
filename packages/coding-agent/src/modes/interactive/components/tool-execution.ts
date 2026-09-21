@@ -14,6 +14,7 @@ import { ToolPanel } from "./tool-panel.js";
 import type { TurnActivityState } from "./turn-activity.js";
 
 export interface ToolExecutionOptions {
+	shouldAddLeadingSpace?: () => boolean;
 	showImages?: boolean;
 	/** Whether image metadata may parse dimensions from base64 data. */
 	includeImageDimensions?: boolean;
@@ -104,6 +105,7 @@ export class ToolExecutionComponent extends Container {
 	private showExpandHint = true;
 	private showImages: boolean;
 	private includeImageDimensions: boolean;
+	private readonly shouldAddLeadingSpace?: () => boolean;
 	private isPartial = true;
 	private toolDefinition?: ToolExecutionDefinition;
 	private builtInToolDefinition?: ToolDefinition<any, any>;
@@ -143,6 +145,7 @@ export class ToolExecutionComponent extends Container {
 		this.builtInToolDefinition = createReplayBuiltInToolDefinition(toolName, cwd, toolDefinition);
 		this.showImages = options.showImages ?? true;
 		this.includeImageDimensions = options.includeImageDimensions ?? true;
+		this.shouldAddLeadingSpace = options.shouldAddLeadingSpace;
 		this.ui = ui;
 		this.cwd = cwd;
 
@@ -401,6 +404,7 @@ export class ToolExecutionComponent extends Container {
 
 	override render(width: number): string[] {
 		if (this.hideComponent || this.isHiddenByTurnSummary()) {
+			this.clickRegions = [];
 			return this.hiddenLines;
 		}
 		// Refresh the animated glyph without rebuilding the whole panel, for as long
@@ -408,7 +412,20 @@ export class ToolExecutionComponent extends Container {
 		if (this.isStatusAnimating() && !this.usesSelfRenderShell()) {
 			this.contentPanel.setHeader(this.panelHeader());
 		}
-		return super.render(width);
+		const lines = super.render(width);
+		// The header row toggles only this component: panel header line for the
+		// default shell, the fixed summary line for self-rendered ipython cells.
+		// That ipython shell prepends a blank row, so aggregated child regions
+		// shift with it.
+		const leadingBlank = this.expanded && this.shouldUseIpythonRenderer() && this.shouldAddLeadingSpace?.() ? 1 : 0;
+		this.clickRegions =
+			lines.length > 0
+				? [
+						...this.clickRegions.map((region) => ({ ...region, line: region.line + leadingBlank })),
+						{ line: leadingBlank, col: 0, width, height: 1, onClick: () => this.setExpanded(!this.expanded) },
+					]
+				: [];
+		return leadingBlank ? ["", ...lines] : lines;
 	}
 
 	private isStatusAnimating(): boolean {

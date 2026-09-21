@@ -26,6 +26,7 @@ import type {
 	SlashCommand,
 } from "@earendil-works/pi-tui";
 import {
+	type ClickRegion,
 	CombinedAutocompleteProvider,
 	type Component,
 	Container,
@@ -452,6 +453,9 @@ function hasEditDiffsExpansion(obj: unknown): obj is EditDiffsExpandable {
 }
 
 class ExpandableText extends Text implements Expandable {
+	private expandedState: boolean;
+	private clickRegions: ClickRegion[] = [];
+
 	constructor(
 		private readonly getCollapsedText: () => string,
 		private readonly getExpandedText: () => string,
@@ -460,10 +464,25 @@ class ExpandableText extends Text implements Expandable {
 		paddingY = 0,
 	) {
 		super(expanded ? getExpandedText() : getCollapsedText(), paddingX, paddingY);
+		this.expandedState = expanded;
 	}
 
 	setExpanded(expanded: boolean): void {
+		this.expandedState = expanded;
 		this.setText(expanded ? this.getExpandedText() : this.getCollapsedText());
+	}
+
+	override render(width: number): string[] {
+		const lines = super.render(width);
+		this.clickRegions =
+			lines.length > 0
+				? [{ line: 0, col: 0, width, height: 1, onClick: () => this.setExpanded(!this.expandedState) }]
+				: [];
+		return lines;
+	}
+
+	getClickRegions(): ReadonlyArray<ClickRegion> {
+		return this.clickRegions;
 	}
 }
 
@@ -829,6 +848,78 @@ function getPayloadWorkingIndicatorOptions(
 	};
 }
 
+export interface DaemonReconnectBanner {
+	message: string;
+	tone: "dim" | "warning";
+}
+
+/**
+ * One-line banner for a recovered daemon connection. When the restarted daemon
+ * is NEWER than this window's binary, say so instead of pretending the window
+ * is updated; the user restarts the window to pick up the new version. An
+ * older or unorderable daemon version is reported without the advice (restarting
+ * this window would pick up nothing).
+ */
+export function formatDaemonReconnectBanner(
+	daemonVersion: string | undefined,
+	clientVersion: string,
+): DaemonReconnectBanner {
+	if (!daemonVersion) {
+		return { message: "Daemon reconnected", tone: "dim" };
+	}
+	if (daemonVersion === clientVersion) {
+		return { message: `Daemon restarted (v${daemonVersion}) - reconnected`, tone: "dim" };
+	}
+	if (isDaemonVersionNewer(daemonVersion, clientVersion)) {
+		return {
+			message: `Daemon restarted (v${daemonVersion}), this window still runs v${clientVersion} - restart the window to pick up the update.`,
+			tone: "warning",
+		};
+	}
+	return { message: `Daemon restarted (v${daemonVersion}), this window runs v${clientVersion}.`, tone: "dim" };
+}
+
+/**
+ * Numeric version-prefix comparison ("0.9.5-beta.7" orders by 0.9.5); unparseable segments
+ * end the comparison. A numeric-equal release outranks the same version's prereleases.
+ */
+function isDaemonVersionNewer(daemonVersion: string, clientVersion: string): boolean {
+	const daemon = parseNumericVersionPrefix(daemonVersion);
+	const client = parseNumericVersionPrefix(clientVersion);
+	for (let index = 0; index < Math.max(daemon.length, client.length); index++) {
+		const difference = (daemon[index] ?? 0) - (client[index] ?? 0);
+		if (difference !== 0) {
+			return difference > 0;
+		}
+	}
+	// Semver orders a release ahead of its own prereleases ("1.2.3" > "1.2.3-beta.1"),
+	// so a numeric-equal daemon without a prerelease suffix outranks a client with one.
+	return !hasPrereleaseSuffix(daemonVersion) && hasPrereleaseSuffix(clientVersion);
+}
+
+/** The dot- and dash-separated segments of a version: "1.2.3-beta.1" -> ["1", "2", "3", "beta", "1"]. */
+function splitVersionSegments(value: string): string[] {
+	return value.split(/[.-]/);
+}
+
+/** The leading numeric segments of a version string; the first unparseable segment ends the prefix. */
+function parseNumericVersionPrefix(value: string): number[] {
+	const segments: number[] = [];
+	for (const segment of splitVersionSegments(value)) {
+		const parsed = Number(segment);
+		if (!Number.isFinite(parsed)) break;
+		segments.push(parsed);
+	}
+	return segments;
+}
+
+/** Whether a version string continues past its numeric prefix with a prerelease suffix. */
+function hasPrereleaseSuffix(version: string): boolean {
+	const segments = splitVersionSegments(version);
+	const prefixLength = parseNumericVersionPrefix(version).length;
+	return prefixLength > 0 && prefixLength < segments.length;
+}
+
 export function updateArgsIncludeSelf(args: readonly string[]): boolean {
 	let selfFlag = false;
 	let extensionsOnlyFlag = false;
@@ -1176,7 +1267,7 @@ export class InteractiveMode {
 	// U2: trailing consecutive errored tool results; a success resets it.
 	private consecutiveToolErrors = 0;
 	private agentMessagesExpanded = false;
-	private editDiffsExpanded = false;
+	private editDiffsExpanded = true;
 
 	private hideThinkingBlock = false;
 	private readonly mermaidMarkdownTransform = createMermaidMarkdownTransform({
@@ -5008,8 +5099,15 @@ export class InteractiveMode {
 			this.ui.requestRender();
 
 			const model = this.getCurrentModel();
-			if (model && !model.input.includes("image")) {
-				this.showStatus("Current model does not support images; the attachment will be omitted.");
+			if (
+				model &&
+				!model.input.includes("image") &&
+				!this.settingsManager.getImageModel() &&
+				!this.settingsManager.getBlockImages()
+			) {
+				this.showStatus(
+					"Current model does not support images; set imageModel in settings.json or the turn will fail with setup guidance.",
+				);
 			}
 		} catch {
 			// Silently ignore clipboard errors (may not have permission, etc.)
@@ -5062,15 +5160,11 @@ export class InteractiveMode {
 	 * dequeue) brings it back. Marker presence in the sent text is the single
 	 * source of truth.
 	 *
-	 * Resolved against the current model: if it has no image input, attachments
-	 * are dropped here (matching the paste-time hint) rather than sent and
-	 * downgraded downstream.
+	 * Attachments always reach the session: a text-only session model is either
+	 * routed to settings.imageModel at dispatch or the turn fails there with an
+	 * actionable setup error, so nothing is silently downgraded downstream.
 	 */
 	private collectImagesFor(text: string): ImageContent[] | undefined {
-		const model = this.getCurrentModel();
-		if (model && !model.input.includes("image")) {
-			return undefined;
-		}
 		const images = collectMarkedImages(this.pastedImages, text);
 		return images.length > 0 ? images : undefined;
 	}
@@ -5781,14 +5875,17 @@ export class InteractiveMode {
 				} else if (event.type === "extension_ui_request") {
 					await this.handleConnectionExtensionUiRequest(event.request);
 				} else if (event.type === "connection_status") {
-					this.showStatus(
-						event.status === "connected"
-							? "Daemon reconnected"
-							: event.backgroundAttempt !== undefined
-								? `Daemon connection lost; retrying in the background (attempt ${event.backgroundAttempt})`
-								: "Daemon connection lost; reconnecting…",
-						event.status === "reconnecting" ? "warning" : "dim",
-					);
+					if (event.status === "connected") {
+						const banner = formatDaemonReconnectBanner(event.daemonVersion, VERSION);
+						this.showStatus(banner.message, banner.tone);
+					} else if (event.backgroundAttempt !== undefined) {
+						this.showStatus(
+							`Daemon connection lost; retrying in the background (attempt ${event.backgroundAttempt})`,
+							"warning",
+						);
+					} else {
+						this.showStatus("Daemon connection lost; reconnecting…", "warning");
+					}
 					if (event.status === "connected") {
 						await this.refreshHeartbeatCatalog();
 					}

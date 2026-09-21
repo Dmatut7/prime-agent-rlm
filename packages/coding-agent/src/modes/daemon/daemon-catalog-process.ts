@@ -1,4 +1,4 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -9,11 +9,15 @@ import { getAgentDir, getPackageDir, isBunBinary } from "../../config.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
 import {
-	appendOwnedSessionLineAsync,
+	appendCustomMessageToExistingFile,
+	appendOwnedFastEntryAsync,
+	appendSessionInfoToExistingFile,
+	appendSessionStateToExistingFile,
 	readSessionInfo,
 	type SessionInfo,
 	SessionManager,
 } from "../../core/session-manager.js";
+import { spawnHidden } from "../../utils/child-process.js";
 
 export const DAEMON_CATALOG_ROLE_ENV = "PRIME_AGENT_INTERNAL_DAEMON_CATALOG";
 const DAEMON_CATALOG_START_TIMEOUT_MS = 30_000;
@@ -158,11 +162,16 @@ export function isDaemonCatalogProcess(environment: NodeJS.ProcessEnv = process.
  * return undefined and these branches would fall back to the blind append this
  * helper exists to prevent.
  */
-async function appendOwnedSessionEntry(sessionPath: string, append: (manager: SessionManager) => void): Promise<void> {
-	// K3P-5: the lease/repair/append sequence now lives in one place
-	// (`appendOwnedSessionLineAsync` in session-manager.ts); the two rename paths
-	// use it too, so all three out-of-session appenders share the same discipline.
-	await appendOwnedSessionLineAsync(sessionPath, getAgentDir(), append);
+async function appendOwnedFastEntry(
+	sessionPath: string,
+	fastAppend: () => string | undefined,
+	fallback: (manager: SessionManager) => void,
+): Promise<void> {
+	// K3P-5: the lease/repair/append sequence stays in one place
+	// (`appendOwnedFastEntryAsync` in session-manager.ts). Upstream #2433's
+	// no-parse fast path runs under that same lease/repair discipline, with the
+	// full-open fallback for windows the fast path cannot resolve.
+	await appendOwnedFastEntryAsync(sessionPath, getAgentDir(), fastAppend, fallback);
 }
 
 export async function runDaemonCatalogProcess(): Promise<never> {
@@ -228,8 +237,10 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 				throw new Error(`No session found matching '${request.selector}'`);
 			}
 			case "rename":
-				await appendOwnedSessionEntry(request.sessionPath, (manager) =>
-					manager.appendSessionInfo(request.name.trim()),
+				await appendOwnedFastEntry(
+					request.sessionPath,
+					() => appendSessionInfoToExistingFile(request.sessionPath, request.name.trim()),
+					(manager) => manager.appendSessionInfo(request.name.trim()),
 				);
 				sendCatalogMessage({ type: "response", id: request.id, success: true });
 				return;
@@ -253,8 +264,10 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 					return;
 				}
 				if (session.state?.status !== "archived") {
-					await appendOwnedSessionEntry(request.sessionPath, (manager) =>
-						manager.appendSessionState({ status: "archived" }),
+					await appendOwnedFastEntry(
+						request.sessionPath,
+						() => appendSessionStateToExistingFile(request.sessionPath, { status: "archived" }),
+						(manager) => manager.appendSessionState({ status: "archived" }),
 					);
 				}
 				sendCatalogMessage({
@@ -266,16 +279,29 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 				return;
 			}
 			case "mark_interrupted":
-				await appendOwnedSessionEntry(request.sessionPath, (manager) =>
-					manager.appendCustomMessageEntry(
-						"prime-agent.worker_recovery",
-						"<prime_agent_worker_interrupted>\nThe isolated session worker stopped during in-flight work. The saved transcript was recovered, but uncertain model, tool, bash, or child-agent work was not replayed. Inspect external side effects before continuing.\n</prime_agent_worker_interrupted>",
-						false,
-						{
-							activeSessionId: request.activeSessionId,
-							operations: request.operations,
-						},
-					),
+				await appendOwnedFastEntry(
+					request.sessionPath,
+					() =>
+						appendCustomMessageToExistingFile(
+							request.sessionPath,
+							"prime-agent.worker_recovery",
+							"<prime_agent_worker_interrupted>\nThe isolated session worker stopped during in-flight work. The saved transcript was recovered, but uncertain model, tool, bash, or child-agent work was not replayed. Inspect external side effects before continuing.\n</prime_agent_worker_interrupted>",
+							false,
+							{
+								activeSessionId: request.activeSessionId,
+								operations: request.operations,
+							},
+						),
+					(manager) =>
+						manager.appendCustomMessageEntry(
+							"prime-agent.worker_recovery",
+							"<prime_agent_worker_interrupted>\nThe isolated session worker stopped during in-flight work. The saved transcript was recovered, but uncertain model, tool, bash, or child-agent work was not replayed. Inspect external side effects before continuing.\n</prime_agent_worker_interrupted>",
+							false,
+							{
+								activeSessionId: request.activeSessionId,
+								operations: request.operations,
+							},
+						),
 				);
 				sendCatalogMessage({ type: "response", id: request.id, success: true });
 				return;
@@ -400,7 +426,7 @@ export class DaemonCatalogClient {
 			args = launch.args;
 			environment = createCliSubprocessEnv(environment, catalogEntry, execArgs);
 		}
-		const child = spawn(command, args, {
+		const child = spawnHidden(command, args, {
 			cwd: process.cwd(),
 			env: environment,
 			stdio: ["ignore", "ignore", "ignore", "ipc"],

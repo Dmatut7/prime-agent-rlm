@@ -1,4 +1,4 @@
-import { Container, Loader, Spacer, Text, type TUI } from "@earendil-works/pi-tui";
+import { Clickable, Container, Loader, Spacer, Text, type TUI } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { BASH_UPDATE_THROTTLE_MS } from "../../../core/tools/bash.js";
 import {
@@ -47,8 +47,9 @@ export class BashExecutionComponent extends Container {
 		this.contentContainer = new Container();
 		this.addChild(this.contentContainer);
 
-		const header = new Text(theme.fg(colorKey, `$ ${command}`), 1, 0);
-		this.contentContainer.addChild(header);
+		this.contentContainer.addChild(
+			new Clickable(new Text(theme.fg(colorKey, `$ ${command}`), 1, 0), () => this.setExpanded(!this.expanded)),
+		);
 
 		this.loader = new Loader(
 			ui,
@@ -174,8 +175,11 @@ export class BashExecutionComponent extends Container {
 
 		this.contentContainer.clear();
 
-		const header = new Text(theme.fg("bashMode", `$ ${this.command}`), 1, 0);
-		this.contentContainer.addChild(header);
+		this.contentContainer.addChild(
+			new Clickable(new Text(theme.fg("bashMode", `$ ${this.command}`), 1, 0), () =>
+				this.setExpanded(!this.expanded),
+			),
+		);
 
 		if (streamingPreview) {
 			if (previewLogicalLines.length > 0) {

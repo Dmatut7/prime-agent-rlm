@@ -93,6 +93,12 @@ describe("ReplKernelManager startup", () => {
 			await manager.shutdown({ snapshot: true, drainHostRequests: true });
 			expect(statSync(`${stderrLogPath}.old`).size).toBe(previous.length);
 			expect(readFileSync(stderrLogPath, "utf8")).toBe("fresh incarnation\n");
+			// Upstream #2425: a rotated log keeps its mode, and the .old file holds the
+			// historical exception payloads worth protecting, so it must tighten to 0600.
+			if (process.platform !== "win32") {
+				expect(statSync(`${stderrLogPath}.old`).mode & 0o777).toBe(0o600);
+				expect(statSync(stderrLogPath).mode & 0o777).toBe(0o600);
+			}
 		} finally {
 			errorSpy.mockRestore();
 		}

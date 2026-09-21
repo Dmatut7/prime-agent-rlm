@@ -1,4 +1,4 @@
-import { Markdown, type MarkdownTheme, Spacer, Text } from "@earendil-works/pi-tui";
+import { Clickable, Markdown, type MarkdownTheme, Spacer, Text } from "@earendil-works/pi-tui";
 import type { CompactionSummaryMessage } from "../../../core/messages.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
 import { customMessageLabel, ExpandableCustomMessageBox } from "./expandable-custom-message.js";
@@ -16,10 +16,11 @@ export class CompactionSummaryMessageComponent extends ExpandableCustomMessageBo
 
 	protected updateDisplay(): void {
 		this.clear();
+		const toggle = () => this.setExpanded(!this.expanded);
 
 		const tokenStr = this.message.tokensBefore.toLocaleString();
 		const label = customMessageLabel("compaction");
-		this.addChild(new Text(label, 0, 0));
+		this.addChild(new Clickable(new Text(label, 0, 0), toggle));
 		this.addChild(new Spacer(1));
 
 		const instructions = this.message.customInstructions;
@@ -36,10 +37,13 @@ export class CompactionSummaryMessageComponent extends ExpandableCustomMessageBo
 		} else {
 			const focus = instructions ? ` · focus: ${instructions}` : "";
 			this.addChild(
-				new Text(
-					`${theme.fg("customMessageText", `Compacted from ${tokenStr} tokens${focus}`)} ${expandCollapseHint("app.tools.expand", false)}`,
-					0,
-					0,
+				new Clickable(
+					new Text(
+						`${theme.fg("customMessageText", `Compacted from ${tokenStr} tokens${focus}`)} ${expandCollapseHint("app.tools.expand", false)}`,
+						0,
+						0,
+					),
+					toggle,
 				),
 			);
 		}

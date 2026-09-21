@@ -14,6 +14,12 @@ import { convertToLlm } from "./messages.js";
 import { ModelRegistry } from "./model-registry.js";
 import { findInitialModel } from "./model-resolver.js";
 import { providerRetryPolicy, providerRetryStreamOptions } from "./provider-retry.js";
+import {
+	instrumentConvertToLlm,
+	instrumentStreamFn,
+	instrumentTransformContext,
+	isRequestTimingEnabled,
+} from "./request-timing.js";
 import type { ResourceLoader } from "./resource-loader.js";
 import { DefaultResourceLoader } from "./resource-loader.js";
 import { getDefaultSessionDir, SessionManager } from "./session-manager.js";
@@ -240,6 +246,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	let agent: Agent;
 
+	const requestTimingEnabled = (): boolean => isRequestTimingEnabled(settingsManager.getRequestTiming());
+
 	const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
 		const converted = convertToLlm(messages);
 		if (!settingsManager.getBlockImages()) {
@@ -289,9 +297,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			serviceTier,
 			tools: [],
 		},
-		convertToLlm: convertToLlmWithBlockImages,
-		streamFn: async (model, context, options) => {
-			const auth = await modelRegistry.getApiKeyAndHeaders(model);
+		convertToLlm: instrumentConvertToLlm(requestTimingEnabled, convertToLlmWithBlockImages),
+		streamFn: instrumentStreamFn(requestTimingEnabled, async (model, context, options) => {
+			const auth = await modelRegistry.getApiKeyAndHeaders(model, options?.headers);
 			if (!auth.ok) {
 				throw new Error(auth.error);
 			}
@@ -312,7 +320,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetryOptions.maxRetryDelayMs,
 				headers: auth.headers || options?.headers ? { ...auth.headers, ...options?.headers } : undefined,
 			});
-		},
+		}),
 		onPayload: async (payload, _model) => {
 			const runner = extensionRunnerRef.current;
 			if (!runner?.hasHandlers("before_provider_request")) {
@@ -332,13 +340,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			});
 		},
 		sessionId: sessionManager.getSessionId(),
-		transformContext: async (messages) => {
+		transformContext: instrumentTransformContext(requestTimingEnabled, async (messages) => {
 			const runner = extensionRunnerRef.current;
 			if (!runner?.hasHandlers("context")) {
 				return messages;
 			}
 			return runner.emitContext(messages);
-		},
+		}),
 		steeringMode: settingsManager.getSteeringMode(),
 		followUpMode: settingsManager.getFollowUpMode(),
 		transport: settingsManager.getTransport(),
