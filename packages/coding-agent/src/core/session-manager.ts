@@ -2857,6 +2857,12 @@ export class SessionManager {
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
+	// Cache of the live leaf's branch path, so the per-turn compaction check and the
+	// context-usage state build get an O(1) lookup instead of a leaf-to-root walk.
+	// Appends extend the cached array in place; every other leafId write drops the
+	// cache. The array is handed out as-is, so callers must treat it as read-only
+	// and must not hold it across an append.
+	private leafBranchCache: { leafId: string | null; entries: SessionEntry[] } | null = null;
 	private persistListeners = new Set<SessionPersistListener>();
 	private persistFailureListeners = new Set<SessionPersistFailureListener>();
 	/** LAT-3: per-target attribution deltas not yet written to the file; see PendingAttributionWrite. */
@@ -3026,6 +3032,7 @@ export class SessionManager {
 		this.deferredAttributionIds.clear();
 		this.lastAgentStatusWrite = undefined;
 		this._rescanEntryStats();
+		this.leafBranchCache = null;
 		this.flushed = false;
 
 		if (this.persist) {
@@ -3041,6 +3048,7 @@ export class SessionManager {
 		this.leafId = null;
 		this.lastAgentStatusWrite = undefined;
 		this._rescanEntryStats();
+		this.leafBranchCache = null;
 		for (const entry of this.fileEntries) {
 			if (entry.type === "session") continue;
 			this.byId.set(entry.id, entry);
@@ -3333,6 +3341,21 @@ export class SessionManager {
 		this._pushIndexedEntry(entry);
 		this.leafId = entry.id;
 		this._persist(entry);
+		// After _persist: a throwing persist rolls the append back, and the cache must
+		// not grow past a leaf that never survived it.
+		this._extendLeafBranchCache(entry);
+	}
+
+	// Appends only ever extend the live branch path, so the leaf branch cache grows
+	// in place. Anything other than a straight append off the cached leaf drops it.
+	private _extendLeafBranchCache(entry: SessionEntry): void {
+		const cache = this.leafBranchCache;
+		if (cache && cache.leafId === entry.parentId) {
+			cache.leafId = entry.id;
+			cache.entries.push(entry);
+		} else {
+			this.leafBranchCache = null;
+		}
 	}
 
 	/**
@@ -3917,10 +3940,18 @@ export class SessionManager {
 		} catch (error) {
 			// The append indexes the entry before persisting it; undo exactly that.
 			if (this.leafId !== null && this.leafId !== previousLeafId) {
-				this.byId.delete(this.leafId);
+				const rolledBackId = this.leafId;
+				this.byId.delete(rolledBackId);
 				this.fileEntries.pop();
 				this._rescanEntryStats();
+				// A cache extended by the append is live, so drop the rolled-back entry from
+				// the array a caller may already hold before invalidating the cache.
+				const cache = this.leafBranchCache;
+				if (cache && cache.entries[cache.entries.length - 1]?.id === rolledBackId) {
+					cache.entries.pop();
+				}
 				this.leafId = previousLeafId;
+				this.leafBranchCache = null;
 				// The failed append may have left a torn line on disk. Restore the file
 				// from the rolled-back entries now; if that also fails (e.g. the disk is
 				// still full), fall back to forcing the next persist to rewrite.
@@ -3984,7 +4015,18 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	/**
+	 * Entries on the active branch, root to leaf. A leaf read returns the live
+	 * leaf-branch cache: treat the result as read-only and do not hold it across
+	 * appends.
+	 */
 	getBranch(fromId?: string): SessionEntry[] {
+		// Leaf-path reads are the per-turn hot path (compaction checks, context
+		// usage); a read for another entry walks the chain instead.
+		const isLeafPath = fromId === undefined || fromId === this.leafId;
+		if (isLeafPath && this.leafBranchCache?.leafId === this.leafId) {
+			return this.leafBranchCache.entries;
+		}
 		// push+reverse, not unshift-per-entry: unshift is O(n), which makes this O(n^2) on long sessions.
 		const path: SessionEntry[] = [];
 		const startId = fromId ?? this.leafId;
@@ -3994,6 +4036,9 @@ export class SessionManager {
 			current = current.parentId ? this.byId.get(current.parentId) : undefined;
 		}
 		path.reverse();
+		if (isLeafPath) {
+			this.leafBranchCache = { leafId: this.leafId, entries: path };
+		}
 		return path;
 	}
 
@@ -4397,11 +4442,13 @@ export class SessionManager {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
 		this._setLeaf(resolveCompleteToolPairLeaf(this.getBranch(branchFromId))?.id ?? null);
+		this.leafBranchCache = null;
 	}
 
 	/** Clear the leaf (rewind past the first entry) and record that position. */
 	resetLeaf(): void {
 		this._setLeaf(null);
+		this.leafBranchCache = null;
 	}
 
 	/**
@@ -4477,6 +4524,7 @@ export class SessionManager {
 		// summarized away.
 		this.flushChildUsageAttributions();
 		this.leafId = snappedId;
+		this.leafBranchCache = null;
 		const entry: BranchSummaryEntry = {
 			type: "branch_summary",
 			id: generateId(this.byId),
