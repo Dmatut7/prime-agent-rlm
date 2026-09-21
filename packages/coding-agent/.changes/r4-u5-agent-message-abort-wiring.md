@@ -1,0 +1,1 @@
+- Wired the agent_message.abort host request into the session's kernel host bridge, so the agent-message skill's abort lever reaches the daemon controller.

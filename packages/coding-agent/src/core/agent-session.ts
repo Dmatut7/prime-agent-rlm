@@ -60,6 +60,7 @@ import {
 	type AgentFamilyRosterResult,
 	type AgentMessageQueuedReason,
 	type AgentSessionMessage,
+	type AgentSessionMessageAbortReceipt,
 	type AgentSessionMessageAgentSummary,
 	type AgentSessionMessageController,
 	type AgentSessionMessageListResult,
@@ -5286,7 +5287,12 @@ export class AgentSession {
 		type: string,
 		payload: Record<string, unknown> = {},
 	):
-		| Promise<AgentSessionMessageListResult | AgentSessionMessageReceipt | AgentFamilyRosterResult>
+		| Promise<
+				| AgentSessionMessageListResult
+				| AgentSessionMessageReceipt
+				| AgentFamilyRosterResult
+				| AgentSessionMessageAbortReceipt
+		  >
 		| AgentSessionMessageListResult
 		| AgentFamilyRosterResult {
 		if (!this._agentMessageController) {
@@ -5320,6 +5326,18 @@ export class AgentSession {
 						throw this._terminalizeRepeatedAgentMessageSendFailure(target, error);
 					}
 				})();
+			}
+			case "agent_message.abort": {
+				if (typeof payload.target !== "string") {
+					throw new Error("agent_message.abort target must be a string");
+				}
+				const target = assertDirectAgentMessageTarget(payload.target);
+				const sendQueued = payload.send_queued !== false;
+				const controller = this._agentMessageController;
+				if (!controller.abortAgentMessage) {
+					throw new Error("agent abort is not available in this session");
+				}
+				return controller.abortAgentMessage({ target, sendQueued });
 			}
 			default:
 				throw new Error(`unknown agent message request type "${type}"`);
@@ -15198,6 +15216,11 @@ export class AgentSession {
 							(await this.handleAgentMessageHostRequest("agent_message.list_agents")) as AgentFamilyRosterResult,
 						awaitPendingChildPublication: (selector, signal) =>
 							this._awaitPendingRlmChildPublication(selector, signal),
+						abortAgentMessage: (input) =>
+							this.handleAgentMessageHostRequest("agent_message.abort", {
+								target: input.target,
+								send_queued: input.sendQueued,
+							}) as Promise<AgentSessionMessageAbortReceipt>,
 						sendAgentMessage: async (input) => {
 							const receipt = (await this.handleAgentMessageHostRequest("agent_message.send", {
 								target: input.target,
