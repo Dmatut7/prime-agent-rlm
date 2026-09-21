@@ -1544,7 +1544,6 @@ export class DaemonSupervisor {
 				// artifact layout) must never keep the supervisor from starting.
 				this.log(`Could not migrate legacy cron jobs: ${error instanceof Error ? error.message : String(error)}`);
 			}
-			await this.catalog.start().catch((error) => this.log(`Could not start daemon catalog: ${String(error)}`));
 			this.assertSocketLeaseHeld();
 			await this.seedRosterLedger();
 			this.seedAdoptingWorkerRosterRows();
