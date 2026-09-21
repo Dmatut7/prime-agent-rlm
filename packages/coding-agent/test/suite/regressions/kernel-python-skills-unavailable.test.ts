@@ -17,13 +17,11 @@ describe("Python skills unavailable message", () => {
 				},
 			]);
 
-			// test-hygiene-allow: upstream #2381 test verbatim; skills-unavailable path has no public hook
-			(
-				harness.session as unknown as { _onPythonSkillsUnavailable(errors: Record<string, string>): void }
-			)._onPythonSkillsUnavailable({
-				websearch: "No module named 'websearch'",
-				edit: "boom",
-			});
+			(harness.session as unknown as { _onPythonSkillsUnavailable(errors: Record<string, string>): void }) // test-hygiene-allow: upstream #2381 test verbatim; skills-unavailable path has no public hook
+				._onPythonSkillsUnavailable({
+					websearch: "No module named 'websearch'",
+					edit: "boom",
+				});
 			await harness.session.prompt("go");
 
 			const delivered = harness.session.messages.find(
