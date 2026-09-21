@@ -1,0 +1,1 @@
+- Added a consecutive tool-error warning: the footer shows `⚠ 工具错误×N` once three or more tool results in a row failed (any success clears it), fed by the session stats and live tool events.

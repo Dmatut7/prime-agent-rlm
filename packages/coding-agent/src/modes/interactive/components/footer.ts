@@ -5,6 +5,9 @@ import { theme } from "../theme/theme.js";
 /** U1 footer telemetry density (settings `footer.telemetry`). */
 export type FooterTelemetryMode = "off" | "compact" | "full";
 
+/** U2: consecutive errored tool results at which the warning badge appears. */
+export const TOOL_ERROR_WARN_THRESHOLD = 3;
+
 /** Context watermark data for the persistent footer line. */
 export interface FooterTelemetrySnapshot {
 	modelName?: string;
@@ -70,6 +73,7 @@ export class FooterComponent implements Component {
 	private speedText: string | undefined;
 	private telemetryMode: FooterTelemetryMode = "off";
 	private telemetry: FooterTelemetrySnapshot | undefined;
+	private toolErrorCount = 0;
 
 	constructor(private footerData: ReadonlyFooterDataProvider) {
 		void this.footerData;
@@ -100,6 +104,11 @@ export class FooterComponent implements Component {
 	/** U1: latest context watermark snapshot; undefined clears the numbers. */
 	setTelemetry(snapshot: FooterTelemetrySnapshot | undefined): void {
 		this.telemetry = snapshot;
+	}
+
+	/** U2: trailing consecutive tool errors; the badge renders from TOOL_ERROR_WARN_THRESHOLD. */
+	setToolErrorCount(count: number): void {
+		this.toolErrorCount = count;
 	}
 
 	private telemetryText(): string | undefined {
@@ -159,12 +168,20 @@ export class FooterComponent implements Component {
 		// aggregator's identity check hitting while the footer is empty.
 		const safeWidth = Math.max(1, width);
 		const telemetry = this.telemetryText();
-		if (!telemetry && (!this.speedEnabled || !this.speedText)) {
+		const toolErrorBadge =
+			this.toolErrorCount >= TOOL_ERROR_WARN_THRESHOLD ? `⚠ 工具错误×${this.toolErrorCount}` : undefined;
+		if (!telemetry && !toolErrorBadge && (!this.speedEnabled || !this.speedText)) {
 			return this.emptyLines;
 		}
 		const lines: string[] = [];
-		if (telemetry) {
+		if (telemetry && toolErrorBadge) {
+			lines.push(
+				`${theme.fg("dim", truncateToWidth(telemetry, safeWidth, ""))} ${theme.fg("warning", toolErrorBadge)}`,
+			);
+		} else if (telemetry) {
 			lines.push(theme.fg("dim", truncateToWidth(telemetry, safeWidth, "")));
+		} else if (toolErrorBadge) {
+			lines.push(theme.fg("warning", truncateToWidth(` ${toolErrorBadge}`, safeWidth, "")));
 		}
 		if (this.speedEnabled && this.speedText) {
 			const text =

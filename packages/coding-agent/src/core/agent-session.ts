@@ -395,7 +395,7 @@ import {
 	type SessionHeader,
 	SessionManager,
 } from "./session-manager.js";
-import type { SessionStats } from "./session-stats.js";
+import { consecutiveToolErrorsFromMessages, type SessionStats } from "./session-stats.js";
 import { resolveCompleteToolPairLeaf } from "./session-tool-pair.js";
 import { DEFAULT_STREAM_STALL_TIMEOUT_MS, type SettingsManager } from "./settings-manager.js";
 import { getPythonSkillRuntimeInfo, type Skill } from "./skills.js";
@@ -18854,6 +18854,10 @@ export class AgentSession {
 			},
 			cost: ownUsage.cost.total,
 			contextUsage: this.getContextUsage(),
+			// U2: the trailing tool-error streak, derived from the transcript tail
+			// (a successful tool result ends it). Derived, not accumulated: the
+			// transcript is the event-sourced truth and restores for free.
+			consecutiveToolErrors: consecutiveToolErrorsFromMessages(state.messages),
 		};
 	}
 

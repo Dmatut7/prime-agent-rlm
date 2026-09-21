@@ -121,6 +121,7 @@ import { parseCommandArgs } from "../../core/prompt-templates.js";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.js";
 import { SessionImportFileNotFoundError } from "../../core/session-import-errors.js";
 import { resolveSessionPath, SessionSelectorError, SessionSelectorNotFoundError } from "../../core/session-resolver.js";
+import { consecutiveToolErrorsFromMessages } from "../../core/session-stats.js";
 import {
 	confirmShareIfSecrets,
 	createShareTempHtmlFile,
@@ -1172,6 +1173,8 @@ export class InteractiveMode {
 	// U4 turn aggregation for the live run: one aggregate line per agent turn.
 	private currentTurnState: TurnActivityState | undefined;
 	private currentTurnSummary: TurnSummaryComponent | undefined;
+	// U2: trailing consecutive errored tool results; a success resets it.
+	private consecutiveToolErrors = 0;
 	private agentMessagesExpanded = false;
 	private editDiffsExpanded = false;
 
@@ -3103,6 +3106,7 @@ export class InteractiveMode {
 			glmStormTokens: model?.id.toLowerCase().includes("glm") ? 390_000 : undefined,
 		};
 		footer.setTelemetry(snapshot);
+		footer.setToolErrorCount?.((this as { consecutiveToolErrors?: number }).consecutiveToolErrors ?? 0);
 	}
 
 	private async refreshConnectionContextUsage(): Promise<void> {
@@ -3124,6 +3128,12 @@ export class InteractiveMode {
 		// Anything counted so far is now reflected in the snapshot; only later output is in-flight.
 		this.contextUsageTokenBaseline = this.activityTracker.getStatus().tokens;
 		this.patchConnectionState({ contextUsage: stats.contextUsage });
+		// U2: the session's trailing tool-error streak is authoritative; an older
+		// daemon without the field keeps the locally counted value.
+		if (typeof stats.consecutiveToolErrors === "number") {
+			this.consecutiveToolErrors = stats.consecutiveToolErrors;
+			this.footer?.setToolErrorCount?.(this.consecutiveToolErrors);
+		}
 	}
 
 	private refreshQueueSelectionFromState(): void {
@@ -6249,8 +6259,12 @@ export class InteractiveMode {
 					this.pendingTools.delete(event.toolCallId);
 					this.startedToolCalls.delete(event.toolCallId);
 					this.currentTurnState?.setStepStatus(event.toolCallId, event.isError ? "error" : "done");
-					this.ui.requestRender();
 				}
+				// U2: consecutive tool errors; a success resets the streak. Counted
+				// outside the component lookup: an unknown id still settled a tool.
+				this.consecutiveToolErrors = event.isError ? this.consecutiveToolErrors + 1 : 0;
+				this.footer?.setToolErrorCount?.(this.consecutiveToolErrors);
+				this.ui.requestRender();
 				break;
 			}
 
@@ -7576,6 +7590,9 @@ export class InteractiveMode {
 			this.currentTurnState = replayTurnState;
 			this.currentTurnSummary = replayTurnSummary;
 		}
+		// U2: seed the tool-error streak from the replayed transcript tail.
+		this.consecutiveToolErrors = consecutiveToolErrorsFromMessages(messagesToRender);
+		this.footer?.setToolErrorCount?.(this.consecutiveToolErrors);
 		this.ui.requestRender();
 	}
 
