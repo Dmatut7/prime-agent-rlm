@@ -68,11 +68,16 @@ export function buildSummarizationPromptText(options: {
 	style: SummarizationNoteStyle;
 	instructions: string;
 	previousSummary?: string;
+	/** Newest retained assistant text; anchors the summary to kept-tail state (upstream #2385). */
+	recentStateAnchor?: string;
 }): string {
 	let text = elidedNote(options.elided, options.style);
 	text += `<conversation>\n${options.conversationText}\n</conversation>\n\n`;
 	if (options.previousSummary) {
 		text += `<previous-summary>\n${options.previousSummary}\n</previous-summary>\n\n`;
+	}
+	if (options.recentStateAnchor) {
+		text += `<recent-state-anchor>\nNewest assistant message that stays retained below the summary. The conversation to summarize is older than this anchor; the retained messages below are authoritative, so treat this anchor, not the conversation above, as the current state.\n\n${options.recentStateAnchor}\n</recent-state-anchor>\n\n`;
 	}
 	return `${text}${options.instructions}`;
 }
@@ -90,6 +95,7 @@ export function summarizationFrameText(options: {
 	instructions: string;
 	previousSummary?: string;
 	maxElidedMessages: number;
+	recentStateAnchor?: string;
 }): string {
 	return buildSummarizationPromptText({
 		conversationText: "",
@@ -97,6 +103,7 @@ export function summarizationFrameText(options: {
 		style: options.style,
 		instructions: options.instructions,
 		previousSummary: options.previousSummary,
+		recentStateAnchor: options.recentStateAnchor,
 	});
 }
 
