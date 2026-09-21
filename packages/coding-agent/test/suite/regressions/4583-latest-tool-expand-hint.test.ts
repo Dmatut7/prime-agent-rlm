@@ -6,6 +6,7 @@ import { Type } from "typebox";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { buildConversationComponents } from "../../../src/modes/interactive/components/conversation-components.js";
 import { ToolExecutionComponent } from "../../../src/modes/interactive/components/tool-execution.js";
+import { TurnSummaryComponent } from "../../../src/modes/interactive/components/turn-activity.js";
 import { initTheme } from "../../../src/modes/interactive/theme/theme.js";
 import { createHarness, type Harness } from "../harness.js";
 
@@ -66,15 +67,23 @@ describe("ENG-4583 latest tool expand hint", () => {
 		if (!latest) {
 			throw new Error("Expected a latest tool component");
 		}
-		expect(render(tools.slice(0, -1))).not.toContain("to expand");
-		expect(render([latest])).toContain("to expand");
-		expect(render(tools).match(/to expand/g)).toHaveLength(1);
+		// U4: collapsed, the turn's tool rows hide behind one aggregate line that
+		// carries the single expand hint.
+		const summary = components.find(
+			(component): component is TurnSummaryComponent => component instanceof TurnSummaryComponent,
+		);
+		expect(summary).toBeDefined();
+		const collapsedChat = stripAnsi(components.flatMap((component) => component.render(120)).join("\n"));
+		expect(collapsedChat).toContain("本轮 3 步");
+		expect(collapsedChat.match(/展开/g)?.length).toBe(1);
+		expect(render(tools)).not.toContain("展开");
 
 		for (const tool of tools) {
 			tool.setExpanded(true);
 		}
-		expect(render(tools.slice(0, -1))).not.toContain("to collapse");
-		expect(render(tools).match(/to collapse/g)).toHaveLength(1);
+		summary?.setExpanded(true);
+		expect(render(tools.slice(0, -1))).not.toContain("收起");
+		expect(render(tools).match(/收起/g)).toHaveLength(1);
 	});
 });
 

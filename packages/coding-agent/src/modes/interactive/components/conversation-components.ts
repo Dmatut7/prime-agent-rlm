@@ -32,6 +32,7 @@ import {
 	type ToolExecutionDefinition,
 	type ToolExecutionOptions,
 } from "./tool-execution.js";
+import { TurnActivityState, type TurnStep, TurnSummaryComponent } from "./turn-activity.js";
 import { UserMessageComponent } from "./user-message.js";
 
 export interface ConversationComponentsOptions {
@@ -79,8 +80,25 @@ export function buildConversationComponents(
 	const expanded = options.toolsExpanded ?? false;
 	const agentMessagesExpanded = options.agentMessagesExpanded ?? false;
 	const editDiffsExpanded = options.editDiffsExpanded ?? false;
+	// U4: one aggregate line per agent turn (the tool activity between two user
+	// prompts). Settled tools hide themselves while the group is collapsed.
+	let turnState: TurnActivityState | undefined;
+	let turnSummary: TurnSummaryComponent | undefined;
+
+	const ensureTurn = (startedAt: number): TurnActivityState => {
+		if (!turnState) {
+			turnState = new TurnActivityState(startedAt);
+		}
+		return turnState;
+	};
 
 	for (const message of messages) {
+		if (message.role === "user") {
+			// A user prompt starts a new turn; the previous group is settled by
+			// then, so resetting the state only affects grouping from here on.
+			turnState = undefined;
+			turnSummary = undefined;
+		}
 		if (message.role === "assistant") {
 			components.push(
 				new AssistantMessageComponent(
@@ -101,6 +119,19 @@ export function buildConversationComponents(
 				if (content.type !== "toolCall") {
 					continue;
 				}
+				const state = ensureTurn(Number(message.timestamp) || Date.now());
+				const step: TurnStep = {
+					toolCallId: content.id,
+					toolName: content.name,
+					args: content.arguments,
+					status: "queued",
+				};
+				state.addStep(step);
+				if (!turnSummary) {
+					turnSummary = new TurnSummaryComponent(state);
+					turnSummary.setExpanded(expanded);
+					components.push(turnSummary);
+				}
 				const tool = new ToolExecutionComponent(
 					content.name,
 					content.id,
@@ -110,11 +141,13 @@ export function buildConversationComponents(
 					options.ui,
 					options.cwd,
 				);
+				tool.setTurnActivity(state);
 				tool.setExpanded(expanded);
 				tool.setAgentMessagesExpanded(agentMessagesExpanded);
 				tool.setEditDiffsExpanded(editDiffsExpanded);
 				tool.markExecutionStarted();
 				tool.setArgsComplete();
+				state.markRunning(content.id, Number(message.timestamp) || Date.now());
 				selectLatestToolExpandHint(components, tool);
 				components.push(tool);
 				if (message.stopReason === "aborted" || message.stopReason === "error") {
@@ -122,6 +155,7 @@ export function buildConversationComponents(
 						content: [{ type: "text", text: message.errorMessage || "Operation aborted" }],
 						isError: true,
 					});
+					state.setStepStatus(content.id, "error");
 				} else {
 					pendingTools.set(content.id, tool);
 				}
@@ -129,6 +163,11 @@ export function buildConversationComponents(
 		} else if (message.role === "toolResult") {
 			pendingTools.get(message.toolCallId)?.updateResult(message);
 			pendingTools.delete(message.toolCallId);
+			turnState?.setStepStatus(
+				message.toolCallId,
+				message.isError ? "error" : "done",
+				Number(message.timestamp) || Date.now(),
+			);
 		} else if (
 			message.role === "custom" &&
 			(message.customType === SESSION_SLASH_COMMAND_CUSTOM_TYPE ||

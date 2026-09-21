@@ -462,15 +462,15 @@ describe("ToolExecutionComponent parity", () => {
 		expect(collapsed).toContain("+1 -1");
 		// The collapsed `╰─ path +N -M` summary line carries the ctrl+j hint —
 		// and it is the only carrier: the header must not duplicate it.
-		expect(collapsed.split("\n").find((line) => line.includes("╰─"))).toContain("to expand");
-		expect(collapsed.split("to expand").length - 1).toBe(1);
+		expect(collapsed.split("\n").find((line) => line.includes("╰─"))).toContain("展开");
+		expect(collapsed.split("展开").length - 1).toBe(1);
 
 		component.setEditDiffsExpanded(true);
 		const withDiffLines = stripAnsi(component.render(120).join("\n")).split("\n");
 		// The summary line stays put; the diff renders under it, indented to its text column.
 		const summaryIndex = withDiffLines.findIndex((line) => line.includes("╰─ README.md +1 -1"));
 		expect(summaryIndex).toBeGreaterThanOrEqual(0);
-		expect(withDiffLines[summaryIndex]).toContain("to collapse");
+		expect(withDiffLines[summaryIndex]).toContain("收起");
 		const textColumn = withDiffLines[summaryIndex].indexOf("README.md");
 		const removed = withDiffLines.find((line) => line.includes("-1 before"));
 		const added = withDiffLines.find((line) => line.includes("+1 after"));
@@ -547,7 +547,7 @@ describe("ToolExecutionComponent parity", () => {
 		expect(summaryLines.length).toBe(1);
 		expect(summaryLines[0]).toContain("…");
 		expect(summaryLines[0]).toContain("+1 -1");
-		expect(summaryLines[0]).toContain("to expand");
+		expect(summaryLines[0]).toContain("展开");
 		for (const line of lines) {
 			expect(line.length).toBeLessThanOrEqual(40);
 		}
@@ -605,12 +605,12 @@ describe("ToolExecutionComponent parity", () => {
 			component.render(120);
 			// The preview computes asynchronously; poll until it lands.
 			await vi.waitFor(() => {
-				expect(stripAnsi(component.render(120).join("\n"))).toContain("to expand");
+				expect(stripAnsi(component.render(120).join("\n"))).toContain("展开");
 			});
 			// Pre-result: the preview's summary line already carries the hint.
 			const preResult = stripAnsi(component.render(120).join("\n"));
-			expect(preResult.split("\n").find((line) => line.includes("╰─"))).toContain("to expand");
-			expect(preResult.split("to expand").length - 1).toBe(1);
+			expect(preResult.split("\n").find((line) => line.includes("╰─"))).toContain("展开");
+			expect(preResult.split("展开").length - 1).toBe(1);
 
 			// A successful result keeps a single hint on the summary line.
 			component.updateResult(
@@ -618,8 +618,8 @@ describe("ToolExecutionComponent parity", () => {
 				false,
 			);
 			const settled = stripAnsi(component.render(120).join("\n"));
-			expect(settled.split("\n").find((line) => line.includes("╰─"))).toContain("to expand");
-			expect(settled.split("to expand").length - 1).toBe(1);
+			expect(settled.split("\n").find((line) => line.includes("╰─"))).toContain("展开");
+			expect(settled.split("展开").length - 1).toBe(1);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}

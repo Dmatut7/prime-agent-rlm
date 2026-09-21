@@ -231,7 +231,7 @@ export class AssistantMessageComponent extends Container {
 				parts.push(`${i}:text:${content.text.trim() ? 1 : 0}`);
 			} else if (content?.type === "thinking") {
 				parts.push(`${i}:thinking:${content.thinking.trim() ? 1 : 0}`);
-				if (this.hideThinkingBlock && content.thinking.trim()) {
+				if (!this.expanded && content.thinking.trim()) {
 					// The collapsed row bakes the recap into a static line, so a recap
 					// change must count as a structural change during streaming.
 					// JSON-encode the free text so it cannot forge part boundaries.
@@ -313,20 +313,23 @@ export class AssistantMessageComponent extends Container {
 				this.lastBlockTexts.set(i, content.text.trim());
 				this.contentContainer.addChild(markdown);
 			} else if (content?.type === "thinking" && content.thinking.trim()) {
-				// Add spacing only when another visible assistant content block follows.
-				// This avoids a superfluous blank line before separately-rendered tool execution blocks.
+				// U4 noise cut: a visible thinking block renders as ONE recap row by
+				// default; the full Markdown trace only renders in the expanded detail
+				// view (Ctrl+O). hideThinkingBlock hides the row entirely.
 				const hasVisibleContentAfter = message.content
 					.slice(i + 1)
 					.some((c) => (c?.type === "text" && c.text.trim()) || (c?.type === "thinking" && c.thinking.trim()));
 
 				const thinkingLabel = theme.bold(theme.fg("thinkingText", this.hiddenThinkingLabel));
 				if (this.hideThinkingBlock) {
-					// Collapsed row: bold label, a one-line recap of the trace, and the
-					// hint. The row truncates the recap to the render width so it never
-					// wraps onto a second line on narrow terminals.
+					// Hidden: nothing at all, not even the recap row.
+				} else if (!this.expanded) {
+					// One-line row: bold label, the trace recap, and the expand hint.
+					// The row truncates the recap to the render width so it never wraps
+					// onto a second line on narrow terminals.
 					const recap = thinkingRecap(content.thinking, this.hiddenThinkingLabel);
 					this.contentContainer.addChild(
-						new CollapsedThinkingRow(thinkingLabel, recap, expandCollapseHint("app.thinking.toggle", false)),
+						new CollapsedThinkingRow(thinkingLabel, recap, expandCollapseHint("app.tools.expand", false)),
 					);
 					if (hasVisibleContentAfter) {
 						this.contentContainer.addChild(new Spacer(1));
@@ -335,7 +338,7 @@ export class AssistantMessageComponent extends Container {
 					// Expanded: the same label line with the collapse hint, then the trace.
 					// Thinking traces keep Markdown structure but stay visually quiet.
 					this.contentContainer.addChild(
-						new Text(`${thinkingLabel} ${expandCollapseHint("app.thinking.toggle", true)}`, 1, 0),
+						new Text(`${thinkingLabel} ${expandCollapseHint("app.tools.expand", true)}`, 1, 0),
 					);
 					const markdown = new Markdown(
 						content.thinking.trim(),

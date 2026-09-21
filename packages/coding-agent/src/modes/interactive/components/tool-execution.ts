@@ -11,6 +11,7 @@ import { type Theme, theme } from "../theme/theme.js";
 import { getWorkingPulseFrame, workingIconFrame } from "../theme/working-icon.js";
 import { getIpythonCodeFromArgs, IPythonCellComponent } from "./ipython-cell.js";
 import { ToolPanel } from "./tool-panel.js";
+import type { TurnActivityState } from "./turn-activity.js";
 
 export interface ToolExecutionOptions {
 	showImages?: boolean;
@@ -119,6 +120,10 @@ export class ToolExecutionComponent extends Container {
 	private hideComponent = false;
 	// Stable reference so a hidden tool cannot defeat the parent aggregator's identity check.
 	private readonly hiddenLines: string[] = [];
+	// U4 turn aggregation: when set and the turn group is collapsed, a settled
+	// tool renders nothing (the TurnSummaryComponent line replaces it). The
+	// live (running) tool keeps its body so the run stays watchable.
+	private turnActivity?: TurnActivityState;
 
 	constructor(
 		toolName: string,
@@ -340,6 +345,21 @@ export class ToolExecutionComponent extends Container {
 		this.updateDisplay();
 	}
 
+	/** U4: attach this tool to its turn's aggregate line (see TurnActivityState). */
+	setTurnActivity(state: TurnActivityState | undefined): void {
+		this.turnActivity = state;
+	}
+
+	private isHiddenByTurnSummary(): boolean {
+		const state = this.turnActivity;
+		if (!state || !state.isCollapsed || this.expanded) {
+			return false;
+		}
+		// Hide only settled steps: the block a running turn is watching must stay
+		// live even when it already holds a partial result (live attach).
+		return state.isStepSettled(this.toolCallId);
+	}
+
 	setAgentMessagesExpanded(expanded: boolean): void {
 		if (this.agentMessagesExpanded === expanded) {
 			return;
@@ -380,7 +400,7 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	override render(width: number): string[] {
-		if (this.hideComponent) {
+		if (this.hideComponent || this.isHiddenByTurnSummary()) {
 			return this.hiddenLines;
 		}
 		// Refresh the animated glyph without rebuilding the whole panel, for as long

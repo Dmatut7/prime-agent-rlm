@@ -9,10 +9,12 @@ import {
 } from "../../../core/tools/truncate.js";
 import { theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
-import { keyText } from "./keybinding-hints.js";
+import { expandCollapseHint, keyText } from "./keybinding-hints.js";
 import { truncateToVisualLines } from "./visual-truncate.js";
 
 const PREVIEW_LINES = 20;
+/** Completed collapsed blocks still show their body up to this many lines. */
+const COMPLETED_BODY_MAX_LINES = 3;
 
 export class BashExecutionComponent extends Container {
 	private command: string;
@@ -183,9 +185,14 @@ export class BashExecutionComponent extends Container {
 			if (this.expanded) {
 				const displayText = availableLines.map((line) => theme.fg("muted", line)).join("\n");
 				this.contentContainer.addChild(new Text(`\n${displayText}`, 1, 0));
-			} else {
-				this.addPreviewChild(previewLogicalLines);
+			} else if (availableLines.length <= COMPLETED_BODY_MAX_LINES) {
+				// Short output stays visible: for a 1-3 line result the tally line
+				// would save nothing and hide the answer the command was run for.
+				this.addPreviewChild(availableLines);
 			}
+			// U4 noise cut: a longer completed collapsed block shows only the
+			// command line and a one-line output tally; the output body lives in
+			// the expanded view. The running preview keeps its live tail above.
 		}
 
 		if (this.status === "running") {
@@ -194,7 +201,13 @@ export class BashExecutionComponent extends Container {
 			const statusParts: string[] = [];
 
 			if (hiddenLineCount > 0 && !this.expanded) {
-				statusParts.push(theme.fg("muted", `... ${hiddenLineCount} more lines`));
+				statusParts.push(
+					theme.fg("muted", `… ${availableLines.length} 行输出 ${expandCollapseHint("app.tools.expand", false)}`),
+				);
+			} else if (availableLines.length > COMPLETED_BODY_MAX_LINES && !this.expanded) {
+				statusParts.push(
+					theme.fg("muted", `… ${availableLines.length} 行输出 ${expandCollapseHint("app.tools.expand", false)}`),
+				);
 			}
 
 			if (this.status === "cancelled") {

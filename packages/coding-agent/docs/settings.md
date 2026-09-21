@@ -21,6 +21,7 @@ Unknown keys are reported: a misspelled or removed setting (for example `compact
 | `defaultModel` | string | - | Default model ID |
 | `defaultThinkingLevel` | string | `"medium"` | `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` |
 | `hideThinkingBlock` | boolean | `false` | Hide thinking blocks in output |
+| `footer.telemetry` | string | `"compact"` | Persistent footer watermark line density: `"off"` hides it, `"compact"` shows `模型名 · ctx 312k/1M(38%) ▍压缩线80%` plus the GLM storm-zone marker on glm models, `"full"` adds the proportional bar. `/usage` stays a one-shot report regardless |
 | `thinkingBudgets` | object | - | Custom token budgets per thinking level |
 
 #### thinkingBudgets

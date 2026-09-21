@@ -18,90 +18,77 @@ export interface FeatureHint {
 export const FEATURE_HINTS: readonly FeatureHintDefinition[] = [
 	{
 		id: "side-question",
-		getText: () => "Use /btw <question> to ask questions without interrupting your agent.",
+		getText: () => "用 /btw <问题> 随时插问，不打断正在工作的代理。",
 	},
 	{
 		id: "prompt-stash",
 		getText: ({ getKeybinding }) => {
 			const key = getKeybinding("app.prompt.stash");
-			return key ? `Press ${key} to stash your prompt and restore it later.` : undefined;
+			return key ? `按 ${key} 暂存当前输入，之后可恢复。` : undefined;
 		},
 	},
 	{
 		id: "follow-up",
 		getText: ({ getKeybinding }) => {
 			const key = getKeybinding("app.message.followUp");
-			return key ? `Press ${key} to send a message after your agent finishes.` : undefined;
+			return key ? `按 ${key} 在代理完成后接着发消息。` : undefined;
 		},
 	},
 	{
 		id: "heartbeat",
-		getText: () => "Use /heartbeat every 10m <instruction> to repeat a task on a schedule.",
+		getText: () => "用 /heartbeat every 10m <指令> 按周期重复执行任务。",
 	},
 	{
 		id: "subagents",
-		getText: () => "Prime Agent can delegate tasks to subagents and run them in parallel.",
+		getText: () => "可把任务拆给子代理并行执行，代理之间能互发消息协作。",
 	},
 	{
 		id: "agents-view",
 		getText: ({ getKeybinding, isResidentSession }) => {
 			if (!isResidentSession) return undefined;
 			const key = getKeybinding("app.agents.back");
-			return key ? `Hit ${key} for Session View: search running, idle, and inactive sessions.` : undefined;
+			return key ? `按 ${key} 打开会话视图：查看运行中/空闲/不活跃会话。` : undefined;
 		},
 	},
 	{
 		id: "session-rewind",
-		getText: () => "Run /tree to open the session tree and return to a previous message.",
+		getText: () => "用 /tree 打开会话树，回到任意历史消息继续。",
 	},
 	{
 		id: "steering",
-		getText: () => "Send a message while your agent works to steer its current task.",
-	},
-	{
-		id: "agent-messaging",
-		getText: () => "Agents can message each other to share context and coordinate their work.",
+		getText: () => "代理工作时随时发消息即可转向调整当前任务。",
 	},
 	{
 		id: "goal",
-		getText: () => "Use /goal <objective> to keep your agent working until the goal is complete.",
+		getText: () => "用 /goal <目标> 让代理持续工作直到目标完成。",
 	},
 	{
 		id: "refine",
-		getText: () => "Use /refine to turn useful lessons into reusable skills, memory, and prompts.",
+		getText: () => "用 /refine 把经验沉淀成可复用的技能、记忆与提示词。",
 	},
 	{
 		id: "trace-sharing",
-		getText: () => "Share traces with Prime Intellect using /traces on to train open-source LLMs.",
+		getText: () => "用 /traces on 分享轨迹给 Prime Intellect，训练开源模型。",
 	},
 	{
 		id: "persistent-ipython",
-		getText: () => "Compaction removes kernel variables over 16 MiB; smaller state persists.",
+		getText: () => "压缩会清掉超 16 MiB 的内核变量，更小的状态会保留。",
 	},
 	{
 		id: "context-usage",
-		getText: () => "Use /context to check token usage, cost, and remaining context.",
+		getText: () => "用 /context 查看用量、成本与剩余上下文。",
 	},
 	{
 		id: "session-fork",
-		getText: () => "Use /fork to start a new session from an earlier prompt.",
+		getText: () => "用 /fork 从任意历史提示词分叉出新会话。",
 	},
 	{
 		id: "compaction",
-		getText: () => "Use /compact <instructions> to summarize old messages and free up context.",
-	},
-	{
-		id: "auto-compaction",
-		getText: () => "Prime Agent automatically compacts long sessions before context fills up.",
-	},
-	{
-		id: "auto-refine",
-		getText: () => "Prime Agent self-improves by refining skills, memories, prompts, and subagents.",
+		getText: () => "用 /compact <指引> 压缩旧消息释放上下文；超长会话也会自动压缩。",
 	},
 	{
 		id: "background-running",
-		getText: ({ isResidentSession }) =>
-			isResidentSession ? "You can close the terminal while your agent keeps running in the background." : undefined,
+		getText: ({ isResidentSession }) => (isResidentSession ? "可以关掉终端，代理会在后台继续运行。" : undefined),
 	},
 ] as const;
 

@@ -121,6 +121,7 @@ import { parseCommandArgs } from "../../core/prompt-templates.js";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.js";
 import { SessionImportFileNotFoundError } from "../../core/session-import-errors.js";
 import { resolveSessionPath, SessionSelectorError, SessionSelectorNotFoundError } from "../../core/session-resolver.js";
+import { consecutiveToolErrorsFromMessages } from "../../core/session-stats.js";
 import {
 	confirmShareIfSecrets,
 	createShareTempHtmlFile,
@@ -214,7 +215,7 @@ import { ExtensionEditorComponent } from "./components/extension-editor.js";
 import { ExtensionInputComponent } from "./components/extension-input.js";
 import { ExtensionSelectorComponent } from "./components/extension-selector.js";
 import { FEATURE_HINT_ANIMATION_INTERVAL_MS, FeatureHintComponent } from "./components/feature-hint.js";
-import { FooterComponent } from "./components/footer.js";
+import { FooterComponent, type FooterTelemetrySnapshot } from "./components/footer.js";
 import { HeartbeatManagerComponent } from "./components/heartbeat-manager.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./components/injected-prompt-message.js";
 import { formatKeyText, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.js";
@@ -254,6 +255,7 @@ import {
 import { setToolOutputFull, toolOutputFull } from "./components/tool-output-budget.js";
 import { TopBar } from "./components/top-bar.js";
 import { TreeSelectorComponent } from "./components/tree-selector.js";
+import { TurnActivityState, type TurnStep, TurnSummaryComponent } from "./components/turn-activity.js";
 import { UserMessageComponent } from "./components/user-message.js";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.js";
 import { FeatureHintDeck } from "./feature-hints.js";
@@ -1034,6 +1036,10 @@ export class InteractiveMode {
 	// wraps the active footer so custom-footer swaps reflect in both layouts
 	private footerSlot: Container;
 	private fullscreenEnabled = false;
+	// /speed state: display flag plus per-session output tok/sec tracking (see recordSpeedSample).
+	private speedDisplayEnabled = false;
+	// Accumulated output-token/duration totals; allocated on the first recorded sample.
+	private speedStats: { tokens: number; durationMs: number; samples: number } | undefined;
 	private editorContainer: Container;
 	private footer: FooterComponent;
 	private footerDataProvider: FooterDataProvider;
@@ -1164,6 +1170,11 @@ export class InteractiveMode {
 	private rosterBar: { summaries(): SessionSummary[]; dispose(): Promise<void> } | undefined;
 
 	private toolOutputExpanded = false;
+	// U4 turn aggregation for the live run: one aggregate line per agent turn.
+	private currentTurnState: TurnActivityState | undefined;
+	private currentTurnSummary: TurnSummaryComponent | undefined;
+	// U2: trailing consecutive errored tool results; a success resets it.
+	private consecutiveToolErrors = 0;
 	private agentMessagesExpanded = false;
 	private editDiffsExpanded = false;
 
@@ -1323,6 +1334,8 @@ export class InteractiveMode {
 			// session's spend to the new chat.
 			getCostUsd: () =>
 				this.topBarCost.sessionId === this.connectionState?.sessionId ? this.topBarCost.total : undefined,
+			// U1: pin the current model on the bar next to the spend.
+			getModel: () => this.getCurrentModel()?.id,
 		});
 		this.chatContainer = new Container();
 		this.shortcutGuideContainer = new Container();
@@ -1368,6 +1381,8 @@ export class InteractiveMode {
 		this.footerDataProvider = new FooterDataProvider(this.uiServices.getInitialCwd());
 		this.footer = new FooterComponent(this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(this.settingsManager.getCompactionEnabled());
+		// U1: persistent telemetry watermark line; density from footer.telemetry.
+		this.footer.setTelemetryMode(this.settingsManager.getFooterTelemetry());
 		this.setGoalAnnouncementBaseline(emptyGoalState());
 
 		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
@@ -3048,6 +3063,7 @@ export class InteractiveMode {
 	// Bake this attempt's output into the snapshot so the tray doesn't dip in the gap between
 	// isStreaming clearing and the async refresh landing.
 	private applyOptimisticContextUsage(): void {
+		this.updateFooterTelemetry();
 		const snapshot = this.connectionState?.contextUsage;
 		if (!snapshot || snapshot.tokens === null || snapshot.contextWindow <= 0) return;
 		const completed = Math.max(0, this.activityTracker.getStatus().tokens - this.contextUsageTokenBaseline);
@@ -3063,7 +3079,38 @@ export class InteractiveMode {
 	}
 
 	/** Refresh the tray's context usage from the session after a turn or compaction completes. */
+	/**
+	 * U1: refresh the persistent footer watermark line (model · context usage ·
+	 * compaction line · GLM storm zone). Cheap: recomputes from connection
+	 * state; call after context usage or model changes and on settings reload.
+	 */
+	private updateFooterTelemetry(): void {
+		// Partial-mode test harnesses skip the constructor, so these fields can be
+		// absent there; the watermark is cosmetic and must never crash a real flow.
+		const footer = (this as unknown as { footer?: FooterComponent }).footer;
+		const settingsManager = this.uiServicesOrUndefined?.settingsManager;
+		if (!footer || !settingsManager) {
+			return;
+		}
+		// Re-read the density too: a settings-file reload lands on the next refresh.
+		footer.setTelemetryMode(settingsManager.getFooterTelemetry());
+		const model = this.getCurrentModel();
+		const usage = this.getConnectionContextUsage();
+		const snapshot: FooterTelemetrySnapshot = {
+			modelName: model?.id,
+			contextTokens: usage?.tokens ?? undefined,
+			contextWindow: usage?.contextWindow,
+			compactionTriggerRatio: settingsManager.getCompactionTriggerRatio(),
+			// GLM-family tool-call corruption historically storms from ~390k tokens of
+			// accumulated context; mark that zone while a glm model is bound.
+			glmStormTokens: model?.id.toLowerCase().includes("glm") ? 390_000 : undefined,
+		};
+		footer.setTelemetry(snapshot);
+		footer.setToolErrorCount?.((this as unknown as { consecutiveToolErrors?: number }).consecutiveToolErrors ?? 0);
+	}
+
 	private async refreshConnectionContextUsage(): Promise<void> {
+		this.updateFooterTelemetry();
 		const generation = ++this.contextUsageRefresh.generation;
 		const connection = this.agentConnection;
 		const sessionId = this.connectionState?.sessionId;
@@ -3081,6 +3128,12 @@ export class InteractiveMode {
 		// Anything counted so far is now reflected in the snapshot; only later output is in-flight.
 		this.contextUsageTokenBaseline = this.activityTracker.getStatus().tokens;
 		this.patchConnectionState({ contextUsage: stats.contextUsage });
+		// U2: the session's trailing tool-error streak is authoritative; an older
+		// daemon without the field keeps the locally counted value.
+		if (typeof stats.consecutiveToolErrors === "number") {
+			this.consecutiveToolErrors = stats.consecutiveToolErrors;
+			this.footer?.setToolErrorCount?.(this.consecutiveToolErrors);
+		}
 	}
 
 	private refreshQueueSelectionFromState(): void {
@@ -3260,6 +3313,11 @@ export class InteractiveMode {
 	private async rebindCurrentSession(): Promise<void> {
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
+		// Sessions are independent: a rebind (new/resume/switch) restarts tok/sec stats
+		// and clears the readout left over from the previous session.
+		this.speedStats = undefined;
+		this.footer?.setSpeedText?.(undefined);
+		(this as unknown as { updateFooterTelemetry?: () => void }).updateFooterTelemetry?.();
 		void this.rosterBar?.dispose();
 		this.rosterBar = undefined;
 		if (this.localSessionHost) {
@@ -3471,6 +3529,19 @@ export class InteractiveMode {
 		}
 	}
 
+	/** Create the run's turn-summary line once, before its first tool block. */
+	private ensureCurrentTurnSummary(): void {
+		if (this.currentTurnSummary) {
+			return;
+		}
+		const state = new TurnActivityState(this.workingStartedAt ?? Date.now());
+		const summary = new TurnSummaryComponent(state);
+		summary.setExpanded(this.toolOutputExpanded);
+		this.currentTurnState = state;
+		this.currentTurnSummary = summary;
+		this.chatContainer.addChild(summary);
+	}
+
 	private async getOrCreatePendingToolComponent(
 		toolCall: PendingToolCallRenderInput,
 	): Promise<ToolExecutionComponent | undefined> {
@@ -3509,6 +3580,14 @@ export class InteractiveMode {
 				this.ui,
 				this.getCurrentCwd(),
 			);
+			this.ensureCurrentTurnSummary();
+			this.currentTurnState?.addStep({
+				toolCallId: latestToolCall.id,
+				toolName: latestToolCall.name,
+				args: latestToolCall.arguments,
+				status: this.startedToolCalls.has(latestToolCall.id) ? "running" : "queued",
+			});
+			component.setTurnActivity(this.currentTurnState);
 			component.setExpanded(this.toolOutputExpanded);
 			component.setAgentMessagesExpanded(this.agentMessagesExpanded);
 			component.setEditDiffsExpanded(this.editDiffsExpanded);
@@ -3732,6 +3811,10 @@ export class InteractiveMode {
 
 	private startWorkingLoader(): void {
 		this.stopWorkingLoader();
+		// A new agent run starts a fresh turn group; the settled summary line of
+		// the previous run stays in the chat as history.
+		this.currentTurnState = undefined;
+		this.currentTurnSummary = undefined;
 		this.workingStartedAt = this.turnStartedAt ?? Date.now();
 		this.loadingAnimation = this.createWorkingLoader();
 		this.statusContainer.addChild(this.loadingAnimation);
@@ -5421,6 +5504,17 @@ export class InteractiveMode {
 					this.setFullscreenMode(enable);
 					return;
 				}
+				if (commandName === "speed") {
+					this.editor.setText("");
+					const arg = commandArgs?.trim().toLowerCase();
+					if (arg && arg !== "on" && arg !== "off") {
+						this.showError("Usage: /speed [on|off]");
+						return;
+					}
+					const enable = arg === "on" ? true : arg === "off" ? false : !this.speedDisplayEnabled;
+					this.setSpeedDisplay(enable);
+					return;
+				}
 				if (commandName === "debug" && !commandArgs) {
 					await this.handleDebugCommand();
 					this.editor.setText("");
@@ -6122,9 +6216,11 @@ export class InteractiveMode {
 							component.setArgsComplete();
 						}
 					}
+					this.recordSpeedSample(event.message);
 					this.streamingComponent = undefined;
 					this.streamingMessage = undefined;
 					this.footer.invalidate();
+					this.updateFooterTelemetry();
 				}
 				this.ui.requestRender();
 				break;
@@ -6142,6 +6238,7 @@ export class InteractiveMode {
 				if (component) {
 					component.markExecutionStarted();
 				}
+				this.currentTurnState?.markRunning(event.toolCallId);
 				this.ui.requestRender();
 				break;
 			}
@@ -6161,8 +6258,13 @@ export class InteractiveMode {
 					component.updateResult({ ...event.result, isError: event.isError });
 					this.pendingTools.delete(event.toolCallId);
 					this.startedToolCalls.delete(event.toolCallId);
-					this.ui.requestRender();
+					this.currentTurnState?.setStepStatus(event.toolCallId, event.isError ? "error" : "done");
 				}
+				// U2: consecutive tool errors; a success resets the streak. Counted
+				// outside the component lookup: an unknown id still settled a tool.
+				this.consecutiveToolErrors = event.isError ? this.consecutiveToolErrors + 1 : 0;
+				this.footer?.setToolErrorCount?.(this.consecutiveToolErrors);
+				this.ui.requestRender();
 				break;
 			}
 
@@ -7351,6 +7453,10 @@ export class InteractiveMode {
 		this.ipythonToolComponents.clear();
 		this.lateIpythonSentAgentMessages.clear();
 		const renderedPendingTools = new Map<string, ToolExecutionComponent>();
+		// U4: the startup replay mirrors buildConversationComponents' turn grouping:
+		// one aggregate line per agent turn, settled tools hidden while collapsed.
+		let replayTurnState: TurnActivityState | undefined;
+		let replayTurnSummary: TurnSummaryComponent | undefined;
 		const toolNames: string[] = [];
 		for (const message of messagesToRender) {
 			if (message.role !== "assistant") {
@@ -7396,12 +7502,28 @@ export class InteractiveMode {
 		}
 
 		for (const message of messagesToRender) {
+			if (message.role === "user") {
+				replayTurnState = undefined;
+				replayTurnSummary = undefined;
+			}
 			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
 				this.addMessageToChat(message);
 				// Render tool call components
 				for (const content of message.content) {
 					if (content.type === "toolCall") {
+						if (!replayTurnState) {
+							replayTurnState = new TurnActivityState(Number(message.timestamp) || Date.now());
+							replayTurnSummary = new TurnSummaryComponent(replayTurnState);
+							replayTurnSummary.setExpanded(this.toolOutputExpanded);
+							this.chatContainer.addChild(replayTurnSummary);
+						}
+						replayTurnState.addStep({
+							toolCallId: content.id,
+							toolName: content.name,
+							args: content.arguments,
+							status: "running",
+						} satisfies TurnStep);
 						const component = new ToolExecutionComponent(
 							content.name,
 							content.id,
@@ -7414,6 +7536,7 @@ export class InteractiveMode {
 							this.ui,
 							this.getCurrentCwd(),
 						);
+						component.setTurnActivity(replayTurnState);
 						component.setExpanded(this.toolOutputExpanded);
 						component.setAgentMessagesExpanded(this.agentMessagesExpanded);
 						component.setEditDiffsExpanded(this.editDiffsExpanded);
@@ -7447,6 +7570,11 @@ export class InteractiveMode {
 					component.updateResult(message);
 					renderedPendingTools.delete(message.toolCallId);
 				}
+				replayTurnState?.setStepStatus(
+					message.toolCallId,
+					message.isError ? "error" : "done",
+					Number(message.timestamp) || Date.now(),
+				);
 			} else {
 				// All other messages use standard rendering
 				this.addMessageToChat(message, renderOptions);
@@ -7457,6 +7585,14 @@ export class InteractiveMode {
 			component.setIncludeImageDimensions(true);
 			this.pendingTools.set(toolCallId, component);
 		}
+		if (renderedPendingTools.size > 0 && replayTurnState) {
+			// Attaching mid-run: live tool events keep settling this turn's steps.
+			this.currentTurnState = replayTurnState;
+			this.currentTurnSummary = replayTurnSummary;
+		}
+		// U2: seed the tool-error streak from the replayed transcript tail.
+		this.consecutiveToolErrors = consecutiveToolErrorsFromMessages(messagesToRender);
+		this.footer?.setToolErrorCount?.(this.consecutiveToolErrors);
 		this.ui.requestRender();
 	}
 
@@ -8256,6 +8392,56 @@ export class InteractiveMode {
 					: "Fullscreen rendering off",
 			);
 		})();
+	}
+
+	/** /speed on/off: toggles the footer tok/sec readout for this session. */
+	private setSpeedDisplay(enabled: boolean): void {
+		this.speedDisplayEnabled = enabled;
+		if (!enabled) {
+			this.resetSpeedStats();
+		}
+		this.footer.setSpeedEnabled(enabled);
+		this.showStatus(
+			enabled
+				? "Speed display on — footer shows output tok/s per model response and a session average"
+				: "Speed display off",
+		);
+		this.ui.requestRender();
+	}
+
+	/** Clears per-session tok/sec stats and the footer readout; keeps the display flag. */
+	private resetSpeedStats(): void {
+		this.speedStats = undefined;
+		this.footer.setSpeedText(undefined);
+	}
+
+	/**
+	 * Updates the footer tok/sec readout from a completed assistant message:
+	 * output tokens over the wall-clock span from the message timestamp (set at
+	 * provider stream start) to this message_end arrival. Timestamps keep the span
+	 * true even when buffered session events replay back-to-back on attach.
+	 * Aborted/failed responses and samples without a finite positive span or token
+	 * count are skipped: some providers only fill usage at stream end, and extension
+	 * message replacements may strip fields, so they never produce a bogus rate.
+	 */
+	private recordSpeedSample(message: AssistantMessage): void {
+		if (!this.speedDisplayEnabled || message.stopReason === "aborted" || message.stopReason === "error") {
+			return;
+		}
+		const durationMs = Date.now() - Number(message.timestamp);
+		const outputTokens = Number(message.usage?.output ?? 0);
+		if (!(durationMs > 0) || !(outputTokens > 0)) {
+			return;
+		}
+		this.speedStats ??= { tokens: 0, durationMs: 0, samples: 0 };
+		this.speedStats.tokens += outputTokens;
+		this.speedStats.durationMs += durationMs;
+		this.speedStats.samples++;
+		const formatRate = (tokensPerSecond: number): string =>
+			tokensPerSecond >= 100 ? tokensPerSecond.toFixed(0) : tokensPerSecond.toFixed(1);
+		const last = formatRate(outputTokens / (durationMs / 1000));
+		const average = formatRate(this.speedStats.tokens / (this.speedStats.durationMs / 1000));
+		this.footer.setSpeedText(this.speedStats.samples > 1 ? `${last} tok/s · avg ${average}` : `${last} tok/s`);
 	}
 
 	private toggleToolOutputExpansion(): void {

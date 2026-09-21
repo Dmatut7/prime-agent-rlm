@@ -88,7 +88,12 @@ function renderToolRows(harness: Harness): string[] {
 	});
 	return components
 		.filter((component) => component instanceof ToolExecutionComponent)
-		.map((component) => stripAnsi(component.render(120).join(" ")).replace(/\s+/g, " "));
+		.map((component) => {
+			// U4: settled tools hide under the turn summary line; expand the row
+			// to assert the call/result pairing the test is about.
+			component.setExpanded(true);
+			return stripAnsi(component.render(120).join(" ")).replace(/\s+/g, " ");
+		});
 }
 
 describe("assistant messages that reuse a tool call id", () => {

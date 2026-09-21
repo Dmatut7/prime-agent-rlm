@@ -5,6 +5,8 @@ export interface TopBarOptions {
 	getChatName: () => string | undefined;
 	/** Total session spend in USD (branch total, subagents included). */
 	getCostUsd?: () => number | undefined;
+	/** Current model id (U1: pinned on the bar next to the spend). */
+	getModel?: () => string | undefined;
 }
 
 /**
@@ -43,8 +45,12 @@ export class TopBar implements Component {
 		const cost = this.options.getCostUsd?.();
 		const costText =
 			typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? theme.fg("dim", `$${cost.toFixed(2)}`) : "";
+		const model = (this.options.getModel?.() ?? "").replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim();
+		const modelText = model ? theme.fg("dim", model) : "";
 		const start = Math.max(0, Math.floor((safeWidth - nameWidth) / 2));
-		const line = `${" ".repeat(start)}${theme.fg("text", name)}${costText ? `  ${costText}` : ""}`;
+		const line = `${" ".repeat(start)}${theme.fg("text", name)}${costText ? `  ${costText}` : ""}${
+			modelText ? `  ${modelText}` : ""
+		}`;
 		return [truncateToWidth(line, safeWidth, "")];
 	}
 }
