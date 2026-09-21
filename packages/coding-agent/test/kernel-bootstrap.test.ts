@@ -1,7 +1,8 @@
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -14,6 +15,9 @@ import {
 	pythonSkillContentHash,
 	resolveRuntimeIdentity,
 } from "../src/core/kernel/bootstrap.js";
+
+const tsxPath = resolve(__dirname, "../../../node_modules/tsx/dist/cli.mjs");
+const kernelSyncChildPath = resolve(__dirname, "helpers/kernel-sync-child.ts");
 
 let tempDir = "";
 let originalEnv: NodeJS.ProcessEnv;
@@ -107,9 +111,17 @@ dependencies = ["${dependencyName}"]
 	return skill;
 }
 
-function writeFakePython(filePath: string, importableModules: readonly string[]): void {
+function writeFakePython(
+	filePath: string,
+	importableModules: readonly string[],
+	deniedProbes: readonly string[] = [],
+): void {
 	const cases = importableModules.map((moduleName) => `    "import ${moduleName}") exit 0 ;;`).join("\n");
-	const runtimeCase = importableModules.includes("rlm") ? '    *"_harness_methods"*) exit 0 ;;' : "";
+	const denyCases = deniedProbes.map((probe) => `    *"${probe}"*) exit 1 ;;`).join("\n");
+	const runtimeCase =
+		importableModules.includes("rlm") && !deniedProbes.includes("_harness_methods")
+			? '    *"_harness_methods"*) exit 0 ;;'
+			: "";
 	writeExecutable(
 		filePath,
 		[
@@ -117,6 +129,7 @@ function writeFakePython(filePath: string, importableModules: readonly string[])
 			'if [ "$1" = "-P" ] && [ "$2" = "-c" ]; then',
 			'  case "$3" in',
 			cases,
+			denyCases,
 			runtimeCase,
 			"    *) exit 1 ;;",
 			"  esac",
@@ -251,7 +264,8 @@ describe("kernel bootstrap", () => {
 
 		const log = readFileSync(logPath, "utf8");
 		expect(log).toContain("python install 3.11");
-		expect(log).toContain(`venv ${venv} --python 3.11 --seed`);
+		expect(log).toContain(`venv ${venv} --python 3.11`);
+		expect(log).not.toContain("--seed");
 		expect(log).toContain("pip install --python");
 		expect(log).not.toContain("ipykernel");
 		expect(log).toContain("prime-agent-runtime");
@@ -420,10 +434,55 @@ dependencies = ["httpx"]
 		await expect(ensureKernelPython({ pythonSkills: [pythonSkill] })).resolves.toBe(python);
 
 		const log = readFileSync(logPath, "utf8");
-		expect(log).not.toContain(`venv ${venv} --python 3.11 --seed`);
+		expect(log).not.toContain(`venv ${venv} --python 3.11`);
 		expect(log).toContain(`--editable ${pythonSkill.packagePath}`);
 		const version = JSON.parse(readFileSync(join(venv, ".bootstrap-version"), "utf8"));
 		expect(version.pythonSkills[0].pyprojectHash).toBe(pyprojectHash(pythonSkill.pyprojectPath));
+	});
+
+	it("preserves recorded Python skills when a no-skill bootstrap call reuses a warm venv", async () => {
+		installFakeUv();
+		const base = join(tempDir, "kernel-venv");
+		// Bootstrap builds into a generation directory next to the base; the base itself
+		// only names the family and holds the lock.
+		const venv = await activeKernelVenvDir(base);
+		const python = join(venv, "bin", "python");
+		const pythonSkill = createPythonSkill();
+		mkdirSync(join(venv, "bin"), { recursive: true });
+		writeFakePython(python, ["rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
+		writeBootstrapVersion(venv, [pythonSkill]);
+		process.env.PRIME_AGENT_KERNEL_VENV = base;
+
+		await expect(ensureKernelPython()).resolves.toBe(python);
+
+		const version = JSON.parse(readFileSync(join(venv, ".bootstrap-version"), "utf8"));
+		expect(version.pythonSkills).toEqual([
+			{
+				importName: pythonSkill.importName,
+				packagePath: pythonSkill.packagePath,
+				pyprojectPath: pythonSkill.pyprojectPath,
+				pyprojectHash: pyprojectHash(pythonSkill.pyprojectPath),
+				contentHash: pythonSkillContentHash(pythonSkill.packagePath),
+			},
+		]);
+	});
+
+	it("keeps a skill-synced venv fast for real sessions after a no-skill bootstrap call", async () => {
+		const logPath = installFakeUv();
+		const base = join(tempDir, "kernel-venv");
+		// Bootstrap builds into a generation directory next to the base; the base itself
+		// only names the family and holds the lock.
+		const venv = await activeKernelVenvDir(base);
+		const pythonSkill = createPythonSkill();
+		process.env.PRIME_AGENT_KERNEL_VENV = base;
+
+		await expect(ensureKernelPython({ pythonSkills: [pythonSkill] })).resolves.toBe(join(venv, "bin", "python"));
+		const syncedLog = readFileSync(logPath, "utf8");
+
+		await expect(ensureKernelPython()).resolves.toBe(join(venv, "bin", "python"));
+		await expect(ensureKernelPython({ pythonSkills: [pythonSkill] })).resolves.toBe(join(venv, "bin", "python"));
+
+		expect(readFileSync(logPath, "utf8")).toBe(syncedLog);
 	});
 
 	it("continues when a Python skill editable install fails and retries it next startup", async () => {
@@ -464,6 +523,82 @@ dependencies = ["httpx"]
 		expect(
 			retryLog.split("\n").filter((line) => line.includes(`--editable ${brokenSkill.packagePath}`)),
 		).toHaveLength(2);
+	});
+
+	// test-policy: allow explicit-test-timeout -- bounds real killed tsx respawn and resume variance, not the assertion
+	it("resumes a real killed mid-sync process without rebuilding the venv", { timeout: 60_000 }, async () => {
+		const logPath = installFakeUv();
+		const base = join(tempDir, "kernel-venv");
+		// Bootstrap builds into a generation directory next to the base; the base itself
+		// only names the family and holds the lock.
+		const venv = await activeKernelVenvDir(base);
+		const python = join(venv, "bin", "python");
+		const staleSkill = createPythonSkill("agent-a");
+		const recordedSkill = createPythonSkill("agent-b");
+		const hangingSkill = createPythonSkill("agent-c");
+		mkdirSync(join(venv, "bin"), { recursive: true });
+		writeFakePython(python, ["rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
+		writeBootstrapVersion(venv, [staleSkill, recordedSkill]);
+		writeFileSync(staleSkill.pyprojectPath, `[project]\nname = "${staleSkill.name}"\nversion = "0.2.0"\n`);
+		process.env.PRIME_AGENT_KERNEL_VENV = base;
+
+		const child = spawn(process.execPath, [tsxPath, kernelSyncChildPath], {
+			env: {
+				...process.env,
+				KERNEL_SYNC_CHILD_SKILLS: JSON.stringify([staleSkill, recordedSkill, hangingSkill]),
+				TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
+				UV_HANG_ARG: hangingSkill.packagePath,
+			},
+			stdio: "ignore",
+			detached: true,
+		});
+		try {
+			const deadline = Date.now() + 30_000;
+			while (Date.now() < deadline) {
+				if (child.exitCode !== null || child.signalCode !== null) break;
+				const log = existsSync(logPath) ? readFileSync(logPath, "utf8") : "";
+				if (
+					log.includes(`--editable ${staleSkill.packagePath}`) &&
+					log.includes(`--editable ${hangingSkill.packagePath}`)
+				) {
+					break;
+				}
+				// test-policy: allow wall-clock-sleep -- polls the external fake-uv log appends; no in-process signal exists
+				await sleep(50);
+			}
+		} finally {
+			const pid = child.pid;
+			if (pid !== undefined) {
+				try {
+					process.kill(-pid, "SIGKILL");
+				} catch {
+					child.kill("SIGKILL");
+				}
+			}
+			await new Promise((resolve) => child.once("exit", resolve));
+		}
+		const versionAtKill = JSON.parse(readFileSync(join(venv, ".bootstrap-version"), "utf8"));
+		expect(versionAtKill.pythonSkills.map((skill: { importName: string }) => skill.importName)).toEqual([
+			staleSkill.importName,
+			recordedSkill.importName,
+		]);
+		expect(versionAtKill.pythonSkills[0].pyprojectHash).toBe(pyprojectHash(staleSkill.pyprojectPath));
+
+		await expect(ensureKernelPython({ pythonSkills: [staleSkill, recordedSkill, hangingSkill] })).resolves.toBe(
+			python,
+		);
+
+		const lines = readFileSync(logPath, "utf8").split("\n");
+		expect(lines.some((line) => line.startsWith(`venv ${venv} `))).toBe(false);
+		expect(lines.filter((line) => line.includes(`--editable ${staleSkill.packagePath}`))).toHaveLength(1);
+		expect(lines.filter((line) => line.includes(`--editable ${recordedSkill.packagePath}`))).toHaveLength(0);
+		expect(lines.filter((line) => line.includes(`--editable ${hangingSkill.packagePath}`))).toHaveLength(2);
+		const version = JSON.parse(readFileSync(join(venv, ".bootstrap-version"), "utf8"));
+		expect(version.pythonSkills.map((skill: { importName: string }) => skill.importName)).toEqual([
+			staleSkill.importName,
+			recordedSkill.importName,
+			hangingSkill.importName,
+		]);
 	});
 
 	it("lands the base marker before the first skill install and persists each completed one", async () => {
@@ -616,7 +751,7 @@ dependencies = ["httpx"]
 
 		await expect(ensureKernelPython()).resolves.toBe(python);
 
-		expect(readFileSync(logPath, "utf8")).toContain(`venv ${venv} --python 3.11 --seed`);
+		expect(readFileSync(logPath, "utf8")).toContain(`venv ${venv} --python 3.11`);
 	});
 
 	it("shares concurrent bootstrap work in one process", async () => {
@@ -671,7 +806,7 @@ dependencies = ["httpx"]
 
 		await expect(ensureKernelPython()).resolves.toBe(python);
 
-		expect(readFileSync(logPath, "utf8")).toContain(`venv ${venv} --python 3.11 --seed`);
+		expect(readFileSync(logPath, "utf8")).toContain(`venv ${venv} --python 3.11`);
 		const version = JSON.parse(readFileSync(join(venv, ".bootstrap-version"), "utf8"));
 		expect(version.runtime).toBe(runtimeIdentity);
 	});
@@ -703,7 +838,7 @@ dependencies = ["httpx"]
 
 		await expect(ensureKernelPython()).resolves.toBe(python);
 
-		expect(readFileSync(logPath, "utf8")).toContain(`venv ${venv} --python 3.11 --seed`);
+		expect(readFileSync(logPath, "utf8")).toContain(`venv ${venv} --python 3.11`);
 	});
 
 	it("rebuilds a broken venv", async () => {
@@ -718,7 +853,7 @@ dependencies = ["httpx"]
 
 		await expect(ensureKernelPython()).resolves.toBe(join(venv, "bin", "python"));
 
-		expect(readFileSync(logPath, "utf8")).toContain(`venv ${venv} --python 3.11 --seed`);
+		expect(readFileSync(logPath, "utf8")).toContain(`venv ${venv} --python 3.11`);
 	});
 
 	it("rejects a freshly installed venv whose runtime is not ready", async () => {

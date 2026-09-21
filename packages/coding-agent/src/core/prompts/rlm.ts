@@ -94,14 +94,14 @@ export function buildChildAgentDoctrine(options: ChildAgentDoctrineOptions): str
 
 /**
  * Package installation for the kernel interpreter. Every complete command taught here names the
- * interpreter it installs into: the kernel venv is built by `uv venv --seed` (bootstrap.ts), so it
- * really does have pip, and a bare `uv pip install` exits 2 in a shell child because nothing
- * activates that venv. `<kernel-python>` is the kernel's own `sys.executable`; `<pkg>` is the only
- * other placeholder. The reality tests in test/prompt-command-reality.test.ts substitute both and
+ * interpreter it installs into: the kernel venv is created unseeded (bootstrap.ts), so it has no
+ * pip of its own, and a bare `uv pip install` exits 2 in a shell child because nothing activates
+ * that venv. `<kernel-python>` is the kernel's own `sys.executable`; `<pkg>` is the only other
+ * placeholder. The reality tests in test/prompt-command-reality.test.ts substitute both and
  * run the result, so this string cannot drift back into a command that fails.
  */
 export const KERNEL_PACKAGE_INSTALL_PROMPT =
-	'Install additional packages into the kernel environment by naming its interpreter: `uv pip install --python "<kernel-python>" <pkg>`, or with the venv\'s own pip: `"<kernel-python>" -m pip install <pkg>`. `<kernel-python>` is the interpreter running this REPL, so pass `sys.executable`. The kernel venv is created by `uv venv --seed`, so pip really is there; `uv pip install` with no interpreter finds no activated environment and exits, and building a `.venv` to work around that puts the package where the kernel cannot import it. To satisfy an external project\'s imports, use that project\'s own environment instead.';
+	"Install additional packages into the kernel environment by naming its interpreter: `uv pip install --python \"<kernel-python>\" <pkg>`. `<kernel-python>` is the interpreter running this REPL, so pass `sys.executable`. The kernel venv is created unseeded, so it has no pip of its own; `uv pip install` with no interpreter finds no activated environment and exits, and building a `.venv` to work around that puts the package where the kernel cannot import it. To satisfy an external project's imports, use that project's own environment instead.";
 
 export function buildRlmPrompt(options: RlmPromptOptions): string {
 	const { cwd, skillsDir, messagesPath } = options;
