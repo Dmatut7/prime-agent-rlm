@@ -2282,11 +2282,13 @@ describe("Harness digest at cold boundaries", () => {
 		const after = digestMessages(resumed);
 		expect(after).toHaveLength(1);
 		expect(getMessageText(after[0])).toBe(digestTextBefore);
-		const freshDigest = (
-			resumed.session as unknown as {
-				_harnessDigestWithFingerprint(): { digest: string; stateFingerprint: string };
-			}
-		)._harnessDigestWithFingerprint().digest;
+		const freshDigest =
+			// test-hygiene-allow: upstream #2463 test verbatim; the resume-digest dedupe assertion needs the private digest builder's fresh render, no public seam exists
+			(
+				resumed.session as unknown as {
+					_harnessDigestWithFingerprint(): { digest: string; stateFingerprint: string };
+				}
+			)._harnessDigestWithFingerprint().digest;
 		expect(HARNESS_DIGEST_PREFIX + freshDigest + HARNESS_DIGEST_SUFFIX).not.toBe(getMessageText(after[0]));
 		resumed.session.dispose();
 	});

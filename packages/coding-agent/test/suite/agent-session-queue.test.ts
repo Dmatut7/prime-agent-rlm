@@ -12,7 +12,9 @@ import {
 	createAgentSessionMessagePrompt,
 } from "../../src/core/agent-messages.js";
 import { type AgentCronJob, shouldDeferHeartbeatCronJob } from "../../src/core/cron-jobs.js";
+import type { HostRequestHandlers } from "../../src/core/kernel/index.js";
 import {
+	ASYNC_BASH_COMPLETION_CUSTOM_TYPE,
 	createSessionSlashCommandMessage,
 	HARNESS_DIGEST_PREFIX,
 	isRefinementOutcomeMessage,
@@ -3786,5 +3788,94 @@ describe("AgentSession scheduler scenarios", () => {
 		// blocks daemon passivation for the rest of the worker's life.
 		expect(session.hasPendingAdmissionWaiters).toBe(false);
 		await bashPromise.catch(() => undefined);
+	});
+});
+
+type KernelHostSession = {
+	_createKernelHostHandlers(): HostRequestHandlers;
+};
+
+const shellCompletion = { pid: 42, command: "npm test", exitCode: 0 };
+
+function kernelHandlers(harness: Harness): HostRequestHandlers {
+	return (
+		// test-hygiene-allow: upstream #2386 regression harness; driving the kernel host handlers directly is the only seam for notice withdrawal in a kernel-less harness
+		(harness.session as unknown as KernelHostSession)._createKernelHostHandlers()
+	);
+}
+
+function completeShell(harness: Harness): Promise<unknown> {
+	return kernelHandlers(harness)["bash.completed"]!(shellCompletion) as Promise<unknown>;
+}
+
+function readShellResult(harness: Harness, command = shellCompletion.command): Promise<unknown> {
+	return kernelHandlers(harness)["bash.consumed"]!({ pid: shellCompletion.pid, command }) as Promise<unknown>;
+}
+
+function parkNextTurn(harness: Harness, content: string): Promise<void> {
+	return harness.session.sendCustomMessage(
+		{ customType: "next-turn", content, display: true, details: {} },
+		{ deliverAs: "nextTurn" },
+	);
+}
+
+function shellMessages(harness: Harness): unknown[] {
+	return harness.session.messages.filter(
+		(message) => message.role === "custom" && message.customType === ASYNC_BASH_COMPLETION_CUSTOM_TYPE,
+	);
+}
+
+describe("AgentSession withdrawn completion notices", () => {
+	const harnesses: Harness[] = [];
+
+	afterEach(() => {
+		while (harnesses.length > 0) {
+			harnesses.pop()?.session.dispose();
+		}
+	});
+
+	it("#2068: re-parks pending next-turn messages a withdrawn notice captured as prefixes", async () => {
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = await createWaitingHarness();
+		harnesses.push(harness);
+		let providerSawParkedContext = false;
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("Finished the original work."),
+			(context) => {
+				providerSawParkedContext = context.messages.some((message) => getMessageText(message) === "carry this");
+				return fauxAssistantMessage("Follow-up turn complete.");
+			},
+		]);
+		await waitForToolStart;
+		// A parked next-turn message waits for the next turn; the queued notice
+		// captures it as a prefix record while it waits in the steering lane.
+		await parkNextTurn(harness, "carry this");
+		await completeShell(harness);
+		const [notice] = harness.session.getSessionActionRecoverySnapshot().actions;
+		const prefixes =
+			notice?.payload.kind === "turn" ? notice.payload.records.filter((record) => record.role === "prefix") : [];
+		expect(prefixes.map((record) => getMessageText(record.message))).toEqual(["carry this"]);
+		expect(harness.session.getSteeringMessages()).toHaveLength(1);
+		// pids are reused across handles, so another command must not withdraw this notice.
+		await readShellResult(harness, "other command");
+		expect(harness.session.getSteeringMessages()).toHaveLength(1);
+		// pid reuse can queue an identical key twice; one read withdraws one notice.
+		await completeShell(harness);
+		expect(harness.session.getSteeringMessages()).toHaveLength(2);
+		await readShellResult(harness);
+		expect(harness.session.getSteeringMessages()).toHaveLength(1);
+		await readShellResult(harness);
+		expect(harness.session.getSteeringMessages()).toEqual([]);
+		// Withdrawing the notice hands its captured prefix records back to the next turn.
+		expect(harness.session.getPendingNextTurnMessageSnapshots().map(getMessageText)).toEqual(["carry this"]);
+
+		releaseToolExecution();
+		await promptPromise;
+		await harness.session.waitForIdle();
+		expect(shellMessages(harness)).toEqual([]);
+		expect(harness.session.getPendingNextTurnMessageSnapshots().map(getMessageText)).toEqual(["carry this"]);
+		await harness.session.prompt("next turn");
+		await harness.session.waitForIdle();
+		expect(providerSawParkedContext).toBe(true);
 	});
 });
