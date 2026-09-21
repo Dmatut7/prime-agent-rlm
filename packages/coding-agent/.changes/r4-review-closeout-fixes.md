@@ -1,0 +1,1 @@
+- Fixed the unknown-key warning that fired for the new imageModel setting: it is now registered in KNOWN_SETTINGS_KEYS and no longer reported as "never takes effect" (R4 DS review W-8).

@@ -800,6 +800,7 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	onboardingCompleted: null,
 	defaultProvider: null,
 	defaultModel: null,
+	imageModel: null,
 	subagentDefaultModel: null,
 	updateChannel: null,
 	recentModels: null,

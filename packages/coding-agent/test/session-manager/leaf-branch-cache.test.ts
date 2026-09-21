@@ -117,6 +117,7 @@ describe("SessionManager leaf branch cache", () => {
 		const firstId = session.appendMessage(userMsg("one"));
 		expect(ids(session)).toEqual([firstId]); // populates the cache
 
+		// test-hygiene-allow: upstream #2414 test verbatim; _persist has no public seam
 		vi.spyOn(session, "_persist").mockImplementationOnce(() => {
 			throw new Error("disk full");
 		});
@@ -147,6 +148,7 @@ describe("SessionManager leaf branch cache", () => {
 
 		// A failing persist never extends the cache in the first place.
 		const heldAgain = session.getBranch();
+		// test-hygiene-allow: upstream #2414 test verbatim; _persist has no public seam
 		vi.spyOn(session, "_persist").mockImplementationOnce(() => {
 			throw new Error("disk full");
 		});
