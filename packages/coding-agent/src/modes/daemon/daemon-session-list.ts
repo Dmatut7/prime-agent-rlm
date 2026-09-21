@@ -94,6 +94,29 @@ export interface SessionSummary {
 	 * snapshot cannot see the watchdog fire.
 	 */
 	stall?: RlmChildStallState;
+	/**
+	 * U3: whether the session's current task has settled — no own work in flight
+	 * (turn, streaming, kernel-hosted work) and a terminal outcome on record: a
+	 * completed/error verdict for a top-level session (needs_input is an open
+	 * loop, not a conclusion), or a subagent's reply to its parent. Optional on
+	 * the wire: an older daemon omits it and the agents view derives the same
+	 * rule from the fields it already carries.
+	 */
+	settled?: boolean;
+	/**
+	 * U3: wall-clock session duration in ms, from `created` to the last activity
+	 * (or to compose time while work is in flight; recomposed on every roster
+	 * event, the same cadence as every other summary field). Optional on the
+	 * wire; the view recomputes the span from created/lastActivityAt when an
+	 * older daemon omits it.
+	 */
+	durationMs?: number;
+	/**
+	 * U3: compacted first line of the last assistant reply, capped for the wire
+	 * (the view truncates further to its row width). Optional: an older daemon
+	 * omits it and the view shows no answer preview.
+	 */
+	answerPreview?: string;
 	/** Resident session-host process state, populated by the global supervisor. */
 	workerState?: "starting" | "ready" | "recovering" | "stopping" | "failed";
 	/** Diagnostic process identity; clients must not use this as a stable session identifier. */
@@ -234,6 +257,78 @@ export function buildSessionList(
 	return entries;
 }
 
+/** U3: cap on the wire-carried answer preview; the agents view truncates further to its width. */
+const ANSWER_PREVIEW_MAX_CHARS = 200;
+/**
+ * U3: only the preview's first line matters, so the message text is read up to
+ * this many characters: even the one walk a message pays is bounded, whatever
+ * the reply's length.
+ */
+const ANSWER_PREVIEW_SCAN_CHARS = 512;
+
+// U3: one preview per message object. Messages are replaced (never edited in
+// place) once complete, so the scan is paid once per message and every later
+// compose is a lookup.
+const answerPreviewByMessage = new WeakMap<AgentMessage, string>();
+
+/** First non-empty line of a message text, compacted and capped. */
+function previewFromText(text: string, maxChars: number): string {
+	for (const line of text.split("\n")) {
+		const compact = compactRlmText(line, maxChars);
+		if (compact) return compact;
+	}
+	return "";
+}
+
+/**
+ * U3: the last assistant reply's preview, preferring the message still streaming
+ * (the answer being written is the row's current story), then walking completed
+ * messages backwards for the newest reply that has text. Tool-result rounds in
+ * between are skipped, so the cost is role checks plus one cached lookup per
+ * assistant message.
+ */
+function lastAssistantAnswerPreview(
+	messages: readonly AgentMessage[],
+	streamingMessage: AgentMessage | undefined,
+): string | undefined {
+	if (streamingMessage?.role === "assistant") {
+		const preview = assistantAnswerPreview(streamingMessage);
+		if (preview) return preview;
+	}
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index]!;
+		if (message.role !== "assistant") continue;
+		const preview = assistantAnswerPreview(message);
+		if (preview) return preview;
+	}
+	return undefined;
+}
+
+// Narrowed through the role check at every call site; the WeakMap keys the
+// message object itself, not its content.
+function assistantAnswerPreview(message: AgentMessage & { role: "assistant" }): string {
+	const cached = answerPreviewByMessage.get(message);
+	if (cached !== undefined) return cached;
+	const preview = previewFromText(
+		readMessageText(message.content).slice(0, ANSWER_PREVIEW_SCAN_CHARS),
+		ANSWER_PREVIEW_MAX_CHARS,
+	);
+	answerPreviewByMessage.set(message, preview);
+	return preview;
+}
+
+/** U3: ISO timestamp to epoch ms, undefined when absent or unparsable. */
+function parseTimestamp(value: string | undefined): number | undefined {
+	if (!value) return undefined;
+	const timestamp = Date.parse(value);
+	return Number.isNaN(timestamp) ? undefined : timestamp;
+}
+
+/** U3: a timestamp pair's span in ms, or undefined when either end is missing or inverted. */
+function sessionSpanMs(start: number | undefined, end: number | undefined): number | undefined {
+	return start !== undefined && end !== undefined && end >= start ? end - start : undefined;
+}
+
 // Compose memos, keyed weakly by session state so entries die with the session.
 // Roster flushes and the eleven non-flush compose sites re-compose every active session
 // summary on every event; with large sessions that meant a full message walk plus a full
@@ -324,6 +419,12 @@ interface SummaryComposeFingerprint {
 	modified: string | undefined;
 	lastActivityAt: string | undefined;
 	firstMessage: string | undefined;
+	// U3: derived roster facts, compared by value — a memo holding them must not
+	// outlive the facts it froze (duration advances with the clock while busy,
+	// settled flips with the verdict, the preview follows the transcript tail).
+	settled: boolean;
+	durationMs: number | undefined;
+	answerPreview: string | undefined;
 }
 
 export function summaryForActiveSession(
@@ -369,6 +470,20 @@ export function summaryForActiveSession(
 		(metadata.prompt ? compactRlmText(metadata.prompt, 120) : undefined) ??
 		firstUserMessageText(session);
 
+	// U3 roster facts, computed once per compose and shared with the fingerprint:
+	// duration advances with the wall clock while work is in flight, settled flips
+	// on the verdict/reply it reads, and the preview follows the transcript tail.
+	const busy = session.isStreaming || session.isSessionActive || isKernelWorkInFlight;
+	const currentTaskVerdict = isSummaryCurrent(activeSession) ? activeSession.summaryState?.taskState : undefined;
+	const settled =
+		!busy &&
+		(currentTaskVerdict !== undefined && currentTaskVerdict !== "needs_input"
+			? true
+			: metadata.kind === "subagent" && session.repliedToParentSinceTask === true);
+	const durationStart = savedSession?.created.getTime() ?? parseTimestamp(headerTimestamp);
+	const durationMs = sessionSpanMs(durationStart, busy ? Date.now() : (parseTimestamp(lastActivityAt) ?? Date.now()));
+	const answerPreview = lastAssistantAnswerPreview(session.messages, session.state.streamingMessage);
+
 	const fingerprint: SummaryComposeFingerprint = {
 		hasActiveHeartbeat,
 		hasRegisteredHeartbeat,
@@ -411,6 +526,9 @@ export function summaryForActiveSession(
 		modified,
 		lastActivityAt,
 		firstMessage,
+		settled,
+		durationMs,
+		answerPreview,
 	};
 
 	const memo = summaryComposeMemos.get(activeSession);
@@ -455,6 +573,11 @@ export function summaryForActiveSession(
 		isBashRunning: session.isBashRunning,
 		hasRunningRlmChildren: session.hasRunningRlmChildren(),
 		stall,
+		// U3 agents-view roster facts: optional on the wire, so an older client
+		// reading this summary simply does not know them.
+		settled,
+		...(durationMs !== undefined ? { durationMs } : {}),
+		...(answerPreview ? { answerPreview } : {}),
 		usage: session.getOwnUsageSummary?.(),
 		isRunningTools: session.isStreaming && session.state.pendingToolCalls.size > 0,
 		attachedClients: activeSession.clients.size,
@@ -533,6 +656,9 @@ function summaryComposeFingerprintsEqual(left: SummaryComposeFingerprint, right:
 		left.modified === right.modified &&
 		left.lastActivityAt === right.lastActivityAt &&
 		left.firstMessage === right.firstMessage &&
+		left.settled === right.settled &&
+		left.durationMs === right.durationMs &&
+		left.answerPreview === right.answerPreview &&
 		stallStatesEqual(left.stall, right.stall) &&
 		diagnosticsEqual(left.diagnostics, right.diagnostics) &&
 		sessionActionSnapshotsEqual(left.sessionActions, right.sessionActions)
@@ -714,6 +840,11 @@ export function summaryForInactiveSession(
 	hasRegisteredHeartbeat = false,
 	hasRegisteredCronJob = false,
 ): SessionSummary {
+	// U3: the persisted span and the currency-gated verdict, shared by the literal below.
+	const durationMs = sessionSpanMs(session.created.getTime(), session.modified.getTime());
+	const verdictCurrent =
+		session.agentStatus?.basedOnMessageCount === session.messageCount &&
+		(session.agentStatus.taskState === "completed" || session.agentStatus.taskState === "error");
 	return {
 		id: session.id,
 		lifecycle: inactiveLifecycleForSession(session),
@@ -745,6 +876,10 @@ export function summaryForInactiveSession(
 		...(session.agentStatus?.basedOnMessageCount === session.messageCount
 			? { summary: session.agentStatus.summary, taskState: session.agentStatus.taskState }
 			: {}),
+		// U3: an off-daemon row keeps its recorded span and its verdict-gated
+		// settled fact; no transcript tail is read here, so no answer preview.
+		...(durationMs !== undefined ? { durationMs } : {}),
+		...(verdictCurrent ? { settled: true } : {}),
 	};
 }
 

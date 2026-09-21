@@ -1,0 +1,1 @@
+- Added settled, duration, and answer-preview columns to the agents view: each agent row now shows whether its current task settled (`✓`/`…`), how long the session ran (`dur`), and a muted one-line preview of its last reply, fed by new optional roster fields (older daemons degrade to local derivation and hide the preview).
