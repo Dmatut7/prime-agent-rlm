@@ -49,6 +49,7 @@ import {
 	HEARTBEAT_PROMPT_CUSTOM_TYPE,
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
 	MCP_CONNECTION_OUTCOME_CUSTOM_TYPE,
+	PYTHON_SKILLS_UNAVAILABLE_CUSTOM_TYPE,
 	REFINEMENT_NOTICE_CUSTOM_TYPE,
 	REFINEMENT_OUTCOME_CUSTOM_TYPE,
 	RLM_CHILD_FAILURE_CUSTOM_TYPE,
@@ -153,6 +154,7 @@ const CUSTOM_TYPE_INPUT_CLASSES: ReadonlyMap<string, InputClass> = new Map<strin
 	// Harness bookkeeping receipts.
 	[THINKING_LEVEL_CLAMPED_CUSTOM_TYPE, "internal_continuation"],
 	[IPYTHON_STATE_RESTORED_CUSTOM_TYPE, "internal_continuation"],
+	[PYTHON_SKILLS_UNAVAILABLE_CUSTOM_TYPE, "internal_continuation"],
 	[SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE, "internal_continuation"],
 	// Tool-infrastructure receipts: an MCP connection outcome and a finished
 	// background command are machine records, never a human or an agent turn.
