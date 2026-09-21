@@ -795,6 +795,8 @@ export type AgentConnectionEvent =
 			 * recovery is still going instead of showing a dead connection.
 			 */
 			backgroundAttempt?: number;
+			/** App version of the restarted daemon; set when recovery re-attached to it. */
+			daemonVersion?: string;
 	  }
 	| { type: "heartbeats_changed" }
 	| { type: "closed"; error?: string };

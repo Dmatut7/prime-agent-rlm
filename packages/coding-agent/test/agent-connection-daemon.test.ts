@@ -1076,7 +1076,10 @@ describe("DaemonAgentConnection", () => {
 			if (command.type === "roster_subscribe") {
 				rosterSubscribes++;
 				if (rosterSubscribes === 2) {
+					// The daemon stops for good exactly when the shutdown close fires: the
+					// bounded shutdown recovery polls, exhausts, and terminal-closes.
 					supervisor.connected = false;
+					supervisor.reconnectError = new Error("socket gone");
 					supervisor.emitClose(new DaemonSocketClosedError("/tmp/prime-agent.sock", "shutdown"));
 				}
 			}
@@ -1097,7 +1100,9 @@ describe("DaemonAgentConnection", () => {
 			close: () => {},
 		} as unknown as DaemonWorkerClient;
 		const routed = new DaemonRoutedClient(asDaemonClient(supervisor), direct);
-		const connection = await DaemonAgentConnection.attach(routed, "active-1");
+		// A short reconnect bound: the daemon never comes back once it stops, so the
+		// bounded shutdown recovery exhausts and the terminal close still lands.
+		const connection = await DaemonAgentConnection.attach(routed, "active-1", { reconnectTimeoutMs: 100 });
 		await connection.subscribeAgentRoster(() => {});
 		const events: AgentConnectionEvent[] = [];
 		connection.subscribe(async (event) => {
@@ -1306,20 +1311,24 @@ describe("DaemonAgentConnection", () => {
 		const routed = new DaemonRoutedClient(asDaemonClient(supervisor), direct);
 		const connection = await DaemonAgentConnection.attach(routed, "active-1", {
 			recoverDaemon: async () => {},
+			reconnectTimeoutMs: 100,
 		});
 		const events: AgentConnectionEvent[] = [];
 		connection.subscribe(async (event) => {
 			events.push(event);
 		});
 
+		// The daemon stops for good: the bounded shutdown recovery polls the stopped
+		// socket, exhausts its budget, and only then terminal-closes.
 		supervisor.connected = false;
+		supervisor.reconnectError = new Error("socket gone");
 		supervisor.emitClose(new DaemonSocketClosedError("/tmp/prime-agent.sock", "shutdown"));
 		await vi.waitFor(() => expect(events.some((event) => event.type === "closed")).toBe(true));
 
 		expect(events.find((event) => event.type === "closed")).toMatchObject({
 			error: expect.stringContaining("daemon shut down"),
 		});
-		expect(supervisor.reconnectCount).toBe(0);
+		expect(supervisor.reconnectCount).toBeGreaterThan(0);
 		await connection.dispose();
 	});
 
@@ -1897,13 +1906,9 @@ describe("DaemonAgentConnection", () => {
 		const fakeClient = new FakeDaemonClient();
 		fakeClient.emitCloseOnClose = true;
 		const restoredMessages: AgentMessage[] = [{ role: "user", content: "restored prompt", timestamp: 2 }];
+		// The restarted daemon lists the same session under a new active id.
 		fakeClient.updateRestartSessions = [
-			{
-				id: "active-restored",
-				activeSessionId: "active-restored",
-				sessionId: "session-current",
-				sessionFile: "/tmp/session-current.jsonl",
-			},
+			{ id: "r1", activeSessionId: "active-restored", sessionId: "session-current", sessionFile: "/tmp/f.jsonl" },
 		];
 		fakeClient.attachResultFactory = (command) =>
 			createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 1, {
@@ -2065,22 +2070,16 @@ describe("DaemonAgentConnection", () => {
 		expect(fakeClient.reconnectCount).toBe(1);
 	});
 
-	it("does not reconnect after an explicit shutdown session close", async () => {
+	it("does not reconnect after a shutdown session stop that never announced the daemon closing", async () => {
 		const fakeClient = new FakeDaemonClient();
 		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original");
 		const closedEvents: AgentConnectionEvent[] = [];
 		connection.subscribe((event) => {
-			if (event.type === "closed") {
-				closedEvents.push(event);
-			}
+			if (event.type === "closed") closedEvents.push(event);
 		});
 		await connection.attach();
-
-		fakeClient.emitMessage({
-			type: "session_closed",
-			activeSessionId: "active-original",
-			reason: "shutdown",
-		});
+		// No daemon_closing notice: an explicit session stop stays stopped.
+		fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-original", reason: "shutdown" });
 		fakeClient.emitClose(new Error("Daemon socket closed"));
 		await Promise.resolve();
 
@@ -2096,24 +2095,119 @@ describe("DaemonAgentConnection", () => {
 		expect(closedError).toContain("Diagnostic log:");
 	});
 
-	it("does not infer an update when shutdown closes the socket before the session notice", async () => {
+	function announceClose(reason: "shutdown" | "killed", fakeClient: FakeDaemonClient) {
+		fakeClient.emitMessage({ type: "daemon_closing", reason: "shutdown" });
+		fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-original", reason });
+	}
+
+	it.each([
+		[
+			"shutdown socket close",
+			(fakeClient: FakeDaemonClient) =>
+				fakeClient.emitClose(new DaemonSocketClosedError("/tmp/prime-agent.sock", "shutdown")),
+		],
+		// An orderly supervisor shutdown archive-stops its workers, so attached windows
+		// read the relayed close as "killed"; a direct worker link closes as "shutdown".
+		["announced daemon shutdown", (fakeClient: FakeDaemonClient) => announceClose("shutdown", fakeClient)],
+		["announced supervisor shutdown", (fakeClient: FakeDaemonClient) => announceClose("killed", fakeClient)],
+	])("recovers a %s by reconnecting to the restarted daemon", async (_closeKind, triggerClose) => {
 		const fakeClient = new FakeDaemonClient();
+		fakeClient.hello = { ...fakeClient.hello!, appVersion: "test-daemon-version" };
+		// The restarted daemon lists the same session under a new active id.
+		fakeClient.updateRestartSessions = [{ id: "r1", activeSessionId: "restored", sessionId: "session-current" }];
 		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original");
-		const closedEvents: AgentConnectionEvent[] = [];
-		connection.subscribe((event) => {
-			if (event.type === "closed") {
-				closedEvents.push(event);
-			}
+		const events: AgentConnectionEvent[] = [];
+		const connected = new Promise<AgentConnectionEvent>((resolveConnected) => {
+			connection.subscribe((event) => {
+				events.push(event);
+				if (event.type === "connection_status" && event.status === "connected") resolveConnected(event);
+			});
 		});
 		await connection.attach();
 
-		fakeClient.emitClose(new DaemonSocketClosedError("/tmp/prime-agent.sock", "shutdown"));
-		await Promise.resolve();
+		triggerClose(fakeClient);
 
-		expect(fakeClient.reconnectCount).toBe(0);
-		expect(closedEvents).toHaveLength(1);
-		const closedError = closedEvents[0]?.type === "closed" ? closedEvents[0].error : undefined;
-		expect(closedError).toContain("The Prime Agent daemon shut down while this window was attached.");
+		await expect(connected).resolves.toMatchObject({ daemonVersion: "test-daemon-version" });
+		expect(events.filter((event) => event.type === "closed")).toEqual([]);
+		expect(events.filter((event) => event.type === "session_resynced").length).toBeGreaterThan(0);
+		await connection.dispose();
+	});
+
+	it("a generic reconnect yields once a restart recovery restored the session", async () => {
+		vi.useFakeTimers();
+		try {
+			const fakeClient = new FakeDaemonClient();
+			fakeClient.updateRestartSessions = [{ id: "r1", activeSessionId: "restored", sessionId: "session-current" }];
+			const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original", {
+				reconnectTimeoutMs: 1000,
+				recoverDaemon: async () => undefined,
+			});
+			const events: AgentConnectionEvent[] = [];
+			connection.subscribe((event) => {
+				events.push(event);
+			});
+			await connection.attach();
+
+			fakeClient.emitClose(new Error("Daemon socket closed"));
+			fakeClient.emitClose(new DaemonSocketClosedError("/tmp/prime-agent.sock", "shutdown"));
+			await vi.advanceTimersByTimeAsync(2_000);
+			// The restart recovery owns the outcome: one resync, no duplicate, no terminal close.
+			expect(events.filter((event) => event.type === "session_resynced")).toHaveLength(1);
+			expect(events.filter((event) => event.type === "closed")).toEqual([]);
+			await connection.dispose();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("a shutdown recovery does not duplicate an update recovery's resync", async () => {
+		vi.useFakeTimers();
+		try {
+			const fakeClient = new FakeDaemonClient();
+			const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original");
+			const events: AgentConnectionEvent[] = [];
+			connection.subscribe((event) => void events.push(event));
+			await connection.attach();
+			fakeClient.emitClose(new DaemonSocketClosedError("/tmp/prime-agent.sock", "shutdown"));
+			await vi.advanceTimersByTimeAsync(50); // parks the shutdown recovery on its retry delay
+			fakeClient.updateRestartSessions = [{ id: "r1", activeSessionId: "restored", sessionId: "session-current" }];
+			fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-original", reason: "update" });
+			await vi.advanceTimersByTimeAsync(150); // the update recovery restores before the shutdown loop wakes
+			const connected = events.filter((event) => event.type === "connection_status" && event.status === "connected");
+			expect(events.filter((event) => event.type === "session_resynced")).toHaveLength(1);
+			expect(connected).toHaveLength(1);
+			await connection.dispose();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("keeps the saved-transcript close after shutdown recovery times out", async () => {
+		vi.useFakeTimers();
+		try {
+			const fakeClient = new FakeDaemonClient();
+			fakeClient.reconnectError = new Error("daemon unavailable");
+			const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original", {
+				reconnectTimeoutMs: 5000,
+			});
+			const closedEvents: AgentConnectionEvent[] = [];
+			connection.subscribe((event) => {
+				if (event.type === "closed") {
+					closedEvents.push(event);
+				}
+			});
+			await connection.attach();
+
+			fakeClient.emitClose(new DaemonSocketClosedError("/tmp/prime-agent.sock", "shutdown"));
+			await vi.advanceTimersByTimeAsync(5100);
+
+			expect(closedEvents).toHaveLength(1);
+			const closedError = closedEvents[0]?.type === "closed" ? closedEvents[0].error : undefined;
+			expect(closedError).toContain("The Prime Agent daemon shut down while this window was attached.");
+			await connection.dispose();
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it.each([
