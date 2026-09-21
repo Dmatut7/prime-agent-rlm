@@ -1027,4 +1027,19 @@ describe("SettingsManager", () => {
 			expect(manager.drainWarnings("global")).toHaveLength(1);
 		});
 	});
+
+	// Park bounds are clamped like the other wait bounds: one week per park at most,
+	// and non-finite park settings fall back to the defaults.
+	describe("provider park bounds", () => {
+		it("clamps park bounds and falls back to defaults on invalid values", () => {
+			const wait = SettingsManager.inMemory({
+				retry: { provider: { waitForUsage: { maxPauseMs: 365 * 86_400_000, maxParks: 99 } } },
+			}).getProviderWaitSettings();
+			expect([wait.pauseUntilReset, wait.maxPauseMs, wait.maxParks]).toEqual([true, 7 * 86_400_000, 99]);
+			const invalid = SettingsManager.inMemory({
+				retry: { provider: { waitForUsage: { maxPauseMs: Number.NaN, maxParks: -1 } } },
+			}).getProviderWaitSettings();
+			expect([invalid.maxPauseMs, invalid.maxParks]).toEqual([86_400_000, 0]);
+		});
+	});
 });

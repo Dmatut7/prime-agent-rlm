@@ -21,7 +21,7 @@ import { sleepSync } from "../utils/sleep.js";
 import { clampCompactionTriggerRatio } from "./compaction/compaction.js";
 import { DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS } from "./extensions/timeout.js";
 import { RETIRED_VENV_RETENTION } from "./kernel/venv-in-use.js";
-import type { ProviderWaitPolicy } from "./provider-retry.js";
+import { MAX_PROVIDER_PAUSE_MS, type ProviderWaitPolicy } from "./provider-retry.js";
 import type { ResolvedRetentionSettings } from "./retention/types.js";
 import {
 	readSpendPriceOverrides,
@@ -185,6 +185,9 @@ export interface ProviderWaitSettings {
 	maxDelayMs?: number; // default: 300000 (per-ping ceiling, 5m)
 	maxAttempts?: number; // default: 30 (abort bound: max pings)
 	maxWaitMs?: number; // default: 900000 (abort bound: max total wait, 15m)
+	pauseUntilReset?: boolean; // default: true - park quota-blocked sessions until the provider-reported reset
+	maxPauseMs?: number; // default: 86400000 (abort bound: max single park, 24h; clamped to 7d)
+	maxParks?: number; // default: 8 (abort bound: max parks per quota episode)
 }
 
 export interface ProviderRetrySettings {
@@ -2427,6 +2430,11 @@ export class SettingsManager {
 			maxDelayMs: bound(wait?.maxDelayMs, 300_000),
 			maxAttempts: bound(wait?.maxAttempts, 30),
 			maxWaitMs: bound(wait?.maxWaitMs, 900_000),
+			pauseUntilReset: wait?.pauseUntilReset ?? true,
+			// Very large parks are clamped to MAX_PROVIDER_PAUSE_MS instead of
+			// silently waiting weeks for a stale reset.
+			maxPauseMs: Math.min(bound(wait?.maxPauseMs, 86_400_000), MAX_PROVIDER_PAUSE_MS),
+			maxParks: bound(wait?.maxParks, 8),
 		};
 	}
 
