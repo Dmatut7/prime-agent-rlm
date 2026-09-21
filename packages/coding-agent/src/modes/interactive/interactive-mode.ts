@@ -254,6 +254,7 @@ import {
 import { setToolOutputFull, toolOutputFull } from "./components/tool-output-budget.js";
 import { TopBar } from "./components/top-bar.js";
 import { TreeSelectorComponent } from "./components/tree-selector.js";
+import { TurnActivityState, type TurnStep, TurnSummaryComponent } from "./components/turn-activity.js";
 import { UserMessageComponent } from "./components/user-message.js";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.js";
 import { FeatureHintDeck } from "./feature-hints.js";
@@ -1168,6 +1169,9 @@ export class InteractiveMode {
 	private rosterBar: { summaries(): SessionSummary[]; dispose(): Promise<void> } | undefined;
 
 	private toolOutputExpanded = false;
+	// U4 turn aggregation for the live run: one aggregate line per agent turn.
+	private currentTurnState: TurnActivityState | undefined;
+	private currentTurnSummary: TurnSummaryComponent | undefined;
 	private agentMessagesExpanded = false;
 	private editDiffsExpanded = false;
 
@@ -3479,6 +3483,19 @@ export class InteractiveMode {
 		}
 	}
 
+	/** Create the run's turn-summary line once, before its first tool block. */
+	private ensureCurrentTurnSummary(): void {
+		if (this.currentTurnSummary) {
+			return;
+		}
+		const state = new TurnActivityState(this.workingStartedAt ?? Date.now());
+		const summary = new TurnSummaryComponent(state);
+		summary.setExpanded(this.toolOutputExpanded);
+		this.currentTurnState = state;
+		this.currentTurnSummary = summary;
+		this.chatContainer.addChild(summary);
+	}
+
 	private async getOrCreatePendingToolComponent(
 		toolCall: PendingToolCallRenderInput,
 	): Promise<ToolExecutionComponent | undefined> {
@@ -3517,6 +3534,14 @@ export class InteractiveMode {
 				this.ui,
 				this.getCurrentCwd(),
 			);
+			this.ensureCurrentTurnSummary();
+			this.currentTurnState?.addStep({
+				toolCallId: latestToolCall.id,
+				toolName: latestToolCall.name,
+				args: latestToolCall.arguments,
+				status: this.startedToolCalls.has(latestToolCall.id) ? "running" : "queued",
+			});
+			component.setTurnActivity(this.currentTurnState);
 			component.setExpanded(this.toolOutputExpanded);
 			component.setAgentMessagesExpanded(this.agentMessagesExpanded);
 			component.setEditDiffsExpanded(this.editDiffsExpanded);
@@ -3740,6 +3765,10 @@ export class InteractiveMode {
 
 	private startWorkingLoader(): void {
 		this.stopWorkingLoader();
+		// A new agent run starts a fresh turn group; the settled summary line of
+		// the previous run stays in the chat as history.
+		this.currentTurnState = undefined;
+		this.currentTurnSummary = undefined;
 		this.workingStartedAt = this.turnStartedAt ?? Date.now();
 		this.loadingAnimation = this.createWorkingLoader();
 		this.statusContainer.addChild(this.loadingAnimation);
@@ -6162,6 +6191,7 @@ export class InteractiveMode {
 				if (component) {
 					component.markExecutionStarted();
 				}
+				this.currentTurnState?.markRunning(event.toolCallId);
 				this.ui.requestRender();
 				break;
 			}
@@ -6181,6 +6211,7 @@ export class InteractiveMode {
 					component.updateResult({ ...event.result, isError: event.isError });
 					this.pendingTools.delete(event.toolCallId);
 					this.startedToolCalls.delete(event.toolCallId);
+					this.currentTurnState?.setStepStatus(event.toolCallId, event.isError ? "error" : "done");
 					this.ui.requestRender();
 				}
 				break;
@@ -7371,6 +7402,10 @@ export class InteractiveMode {
 		this.ipythonToolComponents.clear();
 		this.lateIpythonSentAgentMessages.clear();
 		const renderedPendingTools = new Map<string, ToolExecutionComponent>();
+		// U4: the startup replay mirrors buildConversationComponents' turn grouping:
+		// one aggregate line per agent turn, settled tools hidden while collapsed.
+		let replayTurnState: TurnActivityState | undefined;
+		let replayTurnSummary: TurnSummaryComponent | undefined;
 		const toolNames: string[] = [];
 		for (const message of messagesToRender) {
 			if (message.role !== "assistant") {
@@ -7416,12 +7451,28 @@ export class InteractiveMode {
 		}
 
 		for (const message of messagesToRender) {
+			if (message.role === "user") {
+				replayTurnState = undefined;
+				replayTurnSummary = undefined;
+			}
 			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
 				this.addMessageToChat(message);
 				// Render tool call components
 				for (const content of message.content) {
 					if (content.type === "toolCall") {
+						if (!replayTurnState) {
+							replayTurnState = new TurnActivityState(Number(message.timestamp) || Date.now());
+							replayTurnSummary = new TurnSummaryComponent(replayTurnState);
+							replayTurnSummary.setExpanded(this.toolOutputExpanded);
+							this.chatContainer.addChild(replayTurnSummary);
+						}
+						replayTurnState.addStep({
+							toolCallId: content.id,
+							toolName: content.name,
+							args: content.arguments,
+							status: "running",
+						} satisfies TurnStep);
 						const component = new ToolExecutionComponent(
 							content.name,
 							content.id,
@@ -7434,6 +7485,7 @@ export class InteractiveMode {
 							this.ui,
 							this.getCurrentCwd(),
 						);
+						component.setTurnActivity(replayTurnState);
 						component.setExpanded(this.toolOutputExpanded);
 						component.setAgentMessagesExpanded(this.agentMessagesExpanded);
 						component.setEditDiffsExpanded(this.editDiffsExpanded);
@@ -7467,6 +7519,11 @@ export class InteractiveMode {
 					component.updateResult(message);
 					renderedPendingTools.delete(message.toolCallId);
 				}
+				replayTurnState?.setStepStatus(
+					message.toolCallId,
+					message.isError ? "error" : "done",
+					Number(message.timestamp) || Date.now(),
+				);
 			} else {
 				// All other messages use standard rendering
 				this.addMessageToChat(message, renderOptions);
@@ -7476,6 +7533,11 @@ export class InteractiveMode {
 		for (const [toolCallId, component] of renderedPendingTools) {
 			component.setIncludeImageDimensions(true);
 			this.pendingTools.set(toolCallId, component);
+		}
+		if (renderedPendingTools.size > 0 && replayTurnState) {
+			// Attaching mid-run: live tool events keep settling this turn's steps.
+			this.currentTurnState = replayTurnState;
+			this.currentTurnSummary = replayTurnSummary;
 		}
 		this.ui.requestRender();
 	}

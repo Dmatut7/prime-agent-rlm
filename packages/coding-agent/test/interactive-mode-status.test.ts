@@ -2164,7 +2164,8 @@ describe("InteractiveMode tool event rendering", () => {
 		await Promise.all([firstUpdate, secondUpdate]);
 
 		expect(fakeThis.pendingTools.size).toBe(1);
-		expect(fakeThis.chatContainer.children).toHaveLength(1);
+		// U4: the live tool creation also mounts the run's turn-summary line.
+		expect(fakeThis.chatContainer.children).toHaveLength(2);
 	});
 });
 

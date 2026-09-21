@@ -112,7 +112,7 @@ export function formatFileChangeSummaryLine(
 		diffsExpanded === undefined
 			? ""
 			: `${theme.fg("dim", " · ")}${expandCollapseHint("app.edits.expand", diffsExpanded)}`;
-	// Size the path against the wider hint variant ("to collapse") so toggling
+	// Size the path against the widest hint variant ("收起", same width as "展开") so toggling
 	// ctrl+j never re-truncates it — the summary line is a stable anchor.
 	const widestHint =
 		diffsExpanded === undefined ? "" : `${theme.fg("dim", " · ")}${expandCollapseHint("app.edits.expand", true)}`;

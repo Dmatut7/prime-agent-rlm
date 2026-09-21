@@ -85,9 +85,16 @@ describe("BashExecutionComponent streaming updates", () => {
 		expect(running).not.toContain("more lines");
 
 		component.setComplete(0, false);
+		// U4: a completed collapsed block drops the preview body for a one-line
+		// tally; the full tail is reachable by expanding.
 		const done = renderedText(component);
-		expect(done).toContain("... 10 more lines");
-		expect(done).toContain("line-30");
+		expect(done).toContain("… 30 行输出");
+		expect(done).toContain("展开");
+		expect(done).not.toContain("line-30");
+		component.setExpanded(true);
+		const expanded = renderedText(component);
+		expect(expanded).toContain("line-30");
+		expect(expanded).toContain("line-01");
 	});
 
 	it("still renders the tail of an oversized single line while running", () => {

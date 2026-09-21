@@ -120,7 +120,7 @@ describe("AssistantMessageComponent", () => {
 		const rendered = stripAnsi(component.render(100).join("\n"));
 
 		expect(rendered).toContain("/tmp/internal.py");
-		expect(rendered).not.toContain("Ctrl+O to expand");
+		expect(rendered).not.toContain("Ctrl+O 展开");
 	});
 
 	test("renders auth recovery guidance inline for simple provider errors", () => {
@@ -136,7 +136,7 @@ describe("AssistantMessageComponent", () => {
 		const rendered = stripAnsi(raw);
 
 		expect(rendered).toContain("Error: 401 status code (no body) · Run /login to update credentials.");
-		expect(rendered).not.toContain("Ctrl+O to expand");
+		expect(rendered).not.toContain("Ctrl+O 展开");
 		expect(raw).toContain(theme.getFgAnsi("error"));
 	});
 
@@ -158,7 +158,7 @@ describe("AssistantMessageComponent", () => {
 		const rendered = stripAnsi(raw);
 
 		expect(rendered).toContain("Error: Provider request failed");
-		expect(rendered).toContain("to expand");
+		expect(rendered).toContain("展开");
 		expect(raw).toContain(theme.getFgAnsi("error"));
 	});
 });
@@ -251,13 +251,22 @@ describe("AssistantMessageComponent streaming identity", () => {
 			{ type: "thinking", thinking },
 			{ type: "text", text: "Answer." },
 		]);
-		const rendered = stripAnsi(new AssistantMessageComponent(message, true).render(120).join("\n"));
+		// U4: a visible thinking block is one recap line by default; hideThinkingBlock
+		// renders nothing; only the expanded detail view shows the full trace.
+		const rendered = stripAnsi(new AssistantMessageComponent(message, false).render(120).join("\n"));
 
-		expect(rendered).toContain("Thinking... · Deciding the approach (Ctrl+T to expand)");
+		expect(rendered).toContain("Thinking... · Deciding the approach (Ctrl+O 展开)");
 		expect(rendered).not.toContain("Some detail");
 
-		const expanded = stripAnsi(new AssistantMessageComponent(message, false).render(120).join("\n"));
-		expect(expanded).toContain("Thinking... (Ctrl+T to collapse)");
+		const hidden = stripAnsi(new AssistantMessageComponent(message, true).render(120).join("\n"));
+		expect(hidden).not.toContain("Thinking...");
+
+		const expanded = stripAnsi(
+			new AssistantMessageComponent(message, false, undefined, "Thinking...", { expanded: true })
+				.render(120)
+				.join("\n"),
+		);
+		expect(expanded).toContain("Thinking... (Ctrl+O 收起)");
 		expect(expanded).toContain("Some detail about the options.");
 
 		// A whitespace-only trace falls back to the label instead of an empty recap.
@@ -271,7 +280,7 @@ describe("AssistantMessageComponent streaming identity", () => {
 		// Unescaped, the first recap "X|1:text:1" makes this signature identical
 		// to the next structure's (recap "X" plus a real text block), so the
 		// rebuild that renders the new text block would be skipped.
-		const component = new AssistantMessageComponent(undefined, true);
+		const component = new AssistantMessageComponent(undefined, false);
 		component.updateContent(createAssistantMessage([{ type: "thinking", thinking: "X|1:text:1" }]));
 		component.render(120);
 
@@ -292,14 +301,14 @@ describe("AssistantMessageComponent streaming identity", () => {
 
 		const thinking = `**${"A deliberately verbose reasoning summary header that keeps going ".repeat(3).trim()}**`;
 		const message = createAssistantMessage([{ type: "thinking", thinking }]);
-		const lines = new AssistantMessageComponent(message, true)
+		const lines = new AssistantMessageComponent(message, false)
 			.render(60)
 			.map((line) => stripAnsi(line))
 			.filter((line) => line.trim().length > 0);
 
 		expect(lines).toHaveLength(1);
 		expect(lines[0]).toContain("Thinking...");
-		expect(lines[0]).toContain("to expand");
+		expect(lines[0]).toContain("展开");
 	});
 
 	test("setHideThinkingBlock and setExpanded mid-stream render identically", () => {
