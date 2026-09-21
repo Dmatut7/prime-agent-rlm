@@ -214,52 +214,69 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 				recordWebSocketSseFallback(options?.sessionId);
 			}
 
-			if (transport !== "sse" && !websocketDisabledForSession) {
+						if (transport !== "sse" && !websocketDisabledForSession) {
 				let websocketStarted = false;
-				try {
-					await processWebSocketStream(
-						resolveCodexWebSocketUrl(model.baseUrl),
-						body,
-						websocketHeaders,
-						output,
-						stream,
-						model,
-						() => {
-							websocketStarted = true;
-						},
-						options,
-					);
+				// Retry a stale previous_response_id once on a fresh full body: the failed
+				// attempt's error cleanup already dropped the cached continuation, so the
+				// retry resends the whole request. Any further failure takes the shared
+				// error handling below (SSE fallback for transport failures).
+				let chainResetRetried = false;
+				for (;;) {
+					try {
+						await processWebSocketStream(
+							resolveCodexWebSocketUrl(model.baseUrl),
+							body,
+							websocketHeaders,
+							output,
+							stream,
+							model,
+							() => {
+								websocketStarted = true;
+							},
+							options,
+						);
 
-					if (options?.signal?.aborted) {
-						throw new Error("Request was aborted");
+						if (options?.signal?.aborted) {
+							throw new Error("Request was aborted");
+						}
+						stream.push({
+							type: "done",
+							reason: output.stopReason as "stop" | "length" | "toolUse",
+							message: output,
+						});
+						stream.end();
+						return;
+					} catch (error) {
+						const aborted = options?.signal?.aborted;
+						// Only reset the chain before visible output starts; retrying after
+						// content events would duplicate streamed assistant output.
+						if (!aborted && !websocketStarted && !chainResetRetried && isStaleCodexContinuationError(error)) {
+							chainResetRetried = true;
+							// A failed attempt may have supplied response metadata before
+							// rejecting the continuation. Do not retain that dead anchor.
+							delete output.responseId;
+							continue;
+						}
+						if (aborted || isCodexNonTransportError(error)) {
+							throw error;
+						}
+						appendAssistantMessageDiagnostic(
+							output,
+							createAssistantMessageDiagnostic("provider_transport_failure", error, {
+								configuredTransport: transport,
+								fallbackTransport: websocketStarted ? undefined : "sse",
+								eventsEmitted: websocketStarted,
+								phase: websocketStarted ? "after_message_stream_start" : "before_message_stream_start",
+								requestBytes: new TextEncoder().encode(bodyJson).byteLength,
+							}),
+						);
+						recordWebSocketFailure(options?.sessionId, error);
+						if (websocketStarted) {
+							throw error;
+						}
+						recordWebSocketSseFallback(options?.sessionId);
+						break;
 					}
-					stream.push({
-						type: "done",
-						reason: output.stopReason as "stop" | "length" | "toolUse",
-						message: output,
-					});
-					stream.end();
-					return;
-				} catch (error) {
-					const aborted = options?.signal?.aborted;
-					if (aborted || isCodexNonTransportError(error)) {
-						throw error;
-					}
-					appendAssistantMessageDiagnostic(
-						output,
-						createAssistantMessageDiagnostic("provider_transport_failure", error, {
-							configuredTransport: transport,
-							fallbackTransport: websocketStarted ? undefined : "sse",
-							eventsEmitted: websocketStarted,
-							phase: websocketStarted ? "after_message_stream_start" : "before_message_stream_start",
-							requestBytes: new TextEncoder().encode(bodyJson).byteLength,
-						}),
-					);
-					recordWebSocketFailure(options?.sessionId, error);
-					if (websocketStarted) {
-						throw error;
-					}
-					recordWebSocketSseFallback(options?.sessionId);
 				}
 			}
 
@@ -547,6 +564,16 @@ class CodexProtocolError extends Error {
 
 function isCodexNonTransportError(error: unknown): boolean {
 	return error instanceof CodexApiError || error instanceof CodexProtocolError;
+}
+
+const STALE_CONTINUATION_ERROR_CODE = "previous_response_not_found";
+
+/**
+ * Codex API error for a previous_response_id the server does not recognize;
+ * the request must be resent in full instead of chained.
+ */
+function isStaleCodexContinuationError(error: unknown): boolean {
+	return error instanceof CodexApiError && error.code?.toLowerCase() === STALE_CONTINUATION_ERROR_CODE;
 }
 
 async function* mapCodexEvents(events: AsyncIterable<Record<string, unknown>>): AsyncGenerator<ResponseStreamEvent> {
@@ -1217,7 +1244,19 @@ function buildCachedWebSocketRequestBody(entry: CachedWebSocketConnection, body:
 	};
 }
 
-async function* startWebSocketOutputOnFirstEvent(
+function isCodexVisibleResponseEvent(event: ResponseStreamEvent): boolean {
+	return (
+		event.type === "response.completed" ||
+		event.type === "response.incomplete" ||
+		event.type.startsWith("response.output_") ||
+		event.type.startsWith("response.reasoning_") ||
+		event.type.startsWith("response.content_") ||
+		event.type.startsWith("response.refusal.") ||
+		event.type.startsWith("response.function_")
+	);
+}
+
+async function* startWebSocketOutputOnFirstVisibleEvent(
 	events: AsyncIterable<ResponseStreamEvent>,
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
@@ -1225,7 +1264,10 @@ async function* startWebSocketOutputOnFirstEvent(
 ): AsyncGenerator<ResponseStreamEvent> {
 	let started = false;
 	for await (const event of events) {
-		if (!started) {
+		// Codex can emit lifecycle, telemetry, or vendor metadata before rejecting
+		// a stale continuation. Keep the attempt retryable until an event can
+		// produce output consumed by processResponsesStream.
+		if (!started && isCodexVisibleResponseEvent(event)) {
 			started = true;
 			onStart();
 			stream.push({ type: "start", partial: output });
@@ -1272,7 +1314,7 @@ async function processWebSocketStream(
 	try {
 		socket.send(JSON.stringify({ type: "response.create", ...requestBody }));
 		await processResponsesStream(
-			startWebSocketOutputOnFirstEvent(
+			startWebSocketOutputOnFirstVisibleEvent(
 				mapCodexEvents(parseWebSocket(socket, options?.signal)),
 				output,
 				stream,

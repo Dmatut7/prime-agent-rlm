@@ -1,0 +1,1 @@
+- Fixed Codex stale-continuation recovery: a `previous_response_not_found` rejection now retries once with the full request body instead of failing the turn, and WebSocket lifecycle or metadata events arriving before the provider error no longer block that retry or leave a dead response anchor behind.
