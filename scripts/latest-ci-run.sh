@@ -232,6 +232,11 @@ self_test() {
 	# checkout it runs in (and must not read an inherited PREFLIGHT_GH_REPO, which would change what
 	# every control below asserts).
 	unset PREFLIGHT_GH_REPO
+	# Same independence for git itself: hooks run with GIT_DIR (absolute in a linked worktree) and
+	# GIT_INDEX_FILE exported, and both override `git -C <nested-repo>` discovery, so the resolver
+	# controls' nested repositories would resolve against this checkout's repo instead (git init
+	# no-ops, `remote add origin` reports "already exists" and exits 3).
+	unset GIT_DIR GIT_INDEX_FILE
 	REPO="selftest/fixture-repo"
 	export GH_ARGS_LOG="$dir/gh-args.log"
 	: >"$GH_ARGS_LOG"

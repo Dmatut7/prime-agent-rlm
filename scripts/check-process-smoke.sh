@@ -63,8 +63,10 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -n "${REPO_ROOT:-}" ]; then
 	ROOT="$REPO_ROOT"
-elif git -C "$SCRIPT_DIR" rev-parse --show-toplevel >/dev/null 2>&1; then
-	ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+elif git_root="$(unset GIT_DIR GIT_INDEX_FILE; git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)" && [ -n "$git_root" ]; then
+	# Discovery strips the hook-exported GIT_DIR/GIT_INDEX_FILE: in a linked worktree they make
+	# rev-parse --show-toplevel answer the cwd (this scripts/ dir) instead of the checkout root.
+	ROOT="$git_root"
 else
 	# A copy that sits outside any checkout (this file is also handed around as /tmp/...): walk
 	# up for the package it drives. REPO_ROOT= is the explicit override above.
