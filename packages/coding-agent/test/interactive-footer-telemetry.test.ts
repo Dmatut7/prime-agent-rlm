@@ -151,7 +151,11 @@ describe("interactive-mode telemetry snapshot wiring", () => {
 			getFooterTelemetry: vi.fn(() => "compact"),
 			getCompactionTriggerRatio: vi.fn(() => 0.8),
 		};
-		const mode = {
+		type FakeConnectionState = {
+			model: { id: string };
+			contextUsage?: { tokens: number; contextWindow: number; percent: number };
+		};
+		const mode: Record<string, unknown> & { connectionState: FakeConnectionState } = {
 			footer,
 			uiServices: { settingsManager },
 			connectionState: {

@@ -76,8 +76,7 @@ function bailianGlmModel(
 		contextWindow: 1_000_000,
 		maxTokens: 8192,
 		input: ["text"],
-		tools: true,
-		thinking: true,
+		reasoning: true,
 		// Zeroed rates keep the stream's cost accounting from reading undefined.
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		compat,

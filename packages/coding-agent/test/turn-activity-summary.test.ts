@@ -1,4 +1,5 @@
-import type { AgentMessage, AssistantMessage, ToolResultMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AssistantMessage, ToolResultMessage } from "@earendil-works/pi-ai";
 import type { TUI } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, it, vi } from "vitest";
@@ -38,6 +39,7 @@ function toolResult(toolCallId: string, toolName: string, text: string, timestam
 		toolCallId,
 		toolName,
 		content: [{ type: "text", text }],
+		isError: false,
 		timestamp,
 	};
 }

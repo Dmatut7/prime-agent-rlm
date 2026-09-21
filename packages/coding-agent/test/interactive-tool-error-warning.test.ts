@@ -2,13 +2,14 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
-import { convertToLlm, type Model } from "@earendil-works/pi-ai";
+import { getModel } from "@earendil-works/pi-ai";
 import { Container, setKeybindings } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
+import { convertToLlm } from "../src/core/messages.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { consecutiveToolErrorsFromMessages } from "../src/core/session-stats.js";
@@ -190,18 +191,7 @@ describe("AgentSession stats carry the streak (U2)", () => {
 			mkdirSync(join(tempDir, "sessions"), { recursive: true });
 			const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 			authStorage.setRuntimeApiKey("anthropic", "test-key");
-			const model: Model<any> = {
-				id: "anthropic/claude-sonnet-4-5",
-				api: "anthropic-messages",
-				provider: "anthropic",
-				name: "Claude Sonnet 4.5",
-				input: ["text"],
-				tools: true,
-				contextWindow: 200_000,
-				maxTokens: 8192,
-				thinking: false,
-				cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
-			};
+			const model = getModel("anthropic", "claude-sonnet-4-5")!;
 			const agent = new Agent({
 				convertToLlm,
 				getApiKey: () => "test-key",

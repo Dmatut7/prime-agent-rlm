@@ -3087,7 +3087,7 @@ export class InteractiveMode {
 	private updateFooterTelemetry(): void {
 		// Partial-mode test harnesses skip the constructor, so these fields can be
 		// absent there; the watermark is cosmetic and must never crash a real flow.
-		const footer = (this as { footer?: FooterComponent }).footer;
+		const footer = (this as unknown as { footer?: FooterComponent }).footer;
 		const settingsManager = this.uiServicesOrUndefined?.settingsManager;
 		if (!footer || !settingsManager) {
 			return;
@@ -3106,7 +3106,7 @@ export class InteractiveMode {
 			glmStormTokens: model?.id.toLowerCase().includes("glm") ? 390_000 : undefined,
 		};
 		footer.setTelemetry(snapshot);
-		footer.setToolErrorCount?.((this as { consecutiveToolErrors?: number }).consecutiveToolErrors ?? 0);
+		footer.setToolErrorCount?.((this as unknown as { consecutiveToolErrors?: number }).consecutiveToolErrors ?? 0);
 	}
 
 	private async refreshConnectionContextUsage(): Promise<void> {
@@ -3317,7 +3317,7 @@ export class InteractiveMode {
 		// and clears the readout left over from the previous session.
 		this.speedStats = undefined;
 		this.footer?.setSpeedText?.(undefined);
-		(this as { updateFooterTelemetry?: () => void }).updateFooterTelemetry?.();
+		(this as unknown as { updateFooterTelemetry?: () => void }).updateFooterTelemetry?.();
 		void this.rosterBar?.dispose();
 		this.rosterBar = undefined;
 		if (this.localSessionHost) {
