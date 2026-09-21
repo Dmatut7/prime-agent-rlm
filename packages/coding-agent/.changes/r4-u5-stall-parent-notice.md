@@ -1,0 +1,1 @@
+- Fixed a silent gap where a retained subagent that stalled during follow-up work never told its parent session: the daemon now delivers the same stall notice the live-run path produces into the parent's transcript.

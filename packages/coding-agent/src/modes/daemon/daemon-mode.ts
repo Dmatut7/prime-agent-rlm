@@ -95,6 +95,7 @@ import {
 	resolveHeartbeatStreamingBehavior,
 	shouldDeferHeartbeatCronJob,
 } from "../../core/cron-jobs.js";
+import { createRlmChildStallNoticeMessage } from "../../core/messages.js";
 import { flushOrphanProcessJournal, ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
 import { providerRetryPolicy } from "../../core/provider-retry.js";
@@ -313,6 +314,15 @@ const structuredLog = getLogger("coding-agent.daemon");
 
 /** Cap on tracked sender→target queued runs (M5 repeat notice); oldest entries are dropped. */
 const AGENT_MESSAGE_QUEUED_RUN_TRACKING_LIMIT = 500;
+/**
+ * Minimum gap between two daemon-level stall notices for the same child. The
+ * parent's own in-process notice path (agent-session.ts, live `rlm()` runs) keeps
+ * its own clock with the same value; this one only covers the retained/passive
+ * follow-up turns that path no longer subscribes to.
+ */
+const DAEMON_CHILD_STALL_NOTICE_MIN_INTERVAL_MS = 10 * 60_000;
+/** Rate-limit map capacity for {@link DAEMON_CHILD_STALL_NOTICE_MIN_INTERVAL_MS} keys. */
+const DAEMON_CHILD_STALL_NOTICE_TRACKING_LIMIT = 256;
 const WORKER_SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS = 1_000;
 /** One line per window: a supervisor that is down is asked by every roster pass. */
 const AGENT_DIRECTORY_FAILURE_LOG_MIN_GAP_MS = 60_000;
@@ -6646,6 +6656,11 @@ export class AgentDaemon {
 	 * so a long-lived daemon cannot accumulate one row per historical pair.
 	 */
 	private readonly agentMessageQueuedRuns = new Map<string, { count: number; firstQueuedAt: number }>();
+	/**
+	 * Last daemon-level stall notice per child id: the rate-limit stamps for
+	 * notifyParentOfAgentStall. Bounded like agentMessageQueuedRuns.
+	 */
+	private readonly childStallNoticeAt = new Map<string, number>();
 
 	private recordQueuedAgentMessage(
 		senderKey: string,
@@ -7357,6 +7372,9 @@ export class AgentDaemon {
 			if (RECOVERY_CHECKPOINT_EVENTS.has(eventType)) {
 				this.recordWorkerRecoveryState(state, eventType);
 			}
+			if (eventType === "stall_warning") {
+				this.notifyParentOfAgentStall(state, message.event);
+			}
 		}
 		this.stampRlmChildActiveSessionId(message);
 		this.observeRosterEvent(state, message);
@@ -7403,6 +7421,76 @@ export class AgentDaemon {
 				this.writeSerialized(client, serialized, sequencedMessage);
 			}
 		}
+	}
+
+	/**
+	 * Daemon-level half of the parent-facing stall notice. When a subagent session in
+	 * this worker trips the watchdog's warn stage, the parent session receives the same
+	 * `rlm_child_stall_notice` the live-run path delivers. The in-process subscription in
+	 * agent-session.ts covers only an active `rlm()` run - it is parked once the run
+	 * settles - so a retained child working a follow-up turn (agent_message.send) used to
+	 * go silent with no parent-facing signal at all: only a roster row the parent never
+	 * polls for.
+	 *
+	 * Duplication is the one thing this method must not do. While the parent tracks a
+	 * live run (queued or running) for the child, its own subscription delivers the
+	 * notice and the daemon stays out of it. Delivery reuses the notice pipeline the
+	 * completed_without_reply terminal notices ride: a custom message with followUp
+	 * semantics, delivered on the parent's next activity rather than waking it.
+	 */
+	private notifyParentOfAgentStall(
+		state: ActiveSessionState,
+		event: Extract<DaemonOutbound, { type: "session_event" }>["event"] & { type: "stall_warning" },
+	): void {
+		const metadata = state.runtime.metadata;
+		if (metadata.kind !== "subagent" || metadata.parentActiveSessionId === undefined) return;
+		const rlmChildId = metadata.rlmChildId;
+		if (rlmChildId === undefined) return;
+		const parentState = this.sessions.get(metadata.parentActiveSessionId);
+		if (!parentState || parentState === state) return;
+		const parentTracked = parentState.runtime.session
+			.getRlmChildSnapshots()
+			.find((snapshot) => snapshot.id === rlmChildId);
+		if (parentTracked !== undefined && (parentTracked.status === "running" || parentTracked.status === "queued")) {
+			// The parent's in-process run subscription is armed and delivers its own notice.
+			return;
+		}
+		const now = Date.now();
+		const previous = this.childStallNoticeAt.get(rlmChildId);
+		if (previous !== undefined && now - previous < DAEMON_CHILD_STALL_NOTICE_MIN_INTERVAL_MS) return;
+		this.childStallNoticeAt.set(rlmChildId, now);
+		while (this.childStallNoticeAt.size > DAEMON_CHILD_STALL_NOTICE_TRACKING_LIMIT) {
+			const oldest = this.childStallNoticeAt.keys().next().value;
+			if (oldest === undefined) break;
+			this.childStallNoticeAt.delete(oldest);
+		}
+		const diagnostics = event.diagnostics;
+		const inFlightTools = (diagnostics?.inFlightToolCalls ?? []).map((call) =>
+			call.elapsedMs > 0 ? `${call.toolName} (${Math.max(1, Math.round(call.elapsedMs / 1000))}s)` : call.toolName,
+		);
+		const exemption = diagnostics?.exemption;
+		const workEvidence = exemption !== undefined && exemption.exhausted !== true ? [...exemption.reasons] : [];
+		// The deadline that matters is the child's own watchdog - the one that can abort
+		// this turn - so the notice describes the child's configuration, not the parent's.
+		const abortAfterMs = state.runtime.session.settingsManager.getStallWatchdogSettings().abortAfterSeconds * 1000;
+		const notice = createRlmChildStallNoticeMessage({
+			childId: rlmChildId,
+			sessionName: state.runtime.session.sessionName ?? state.activeSessionId,
+			silentMs: event.silentMs,
+			thresholdMs: event.thresholdMs,
+			inFlightTools,
+			...(workEvidence.length > 0 ? { workEvidence } : {}),
+			...(abortAfterMs > 0 ? { abortAfterMs } : {}),
+		});
+		parentState.runtime.session.sendCustomMessage(notice, { deliverAs: "followUp" }).catch((error: unknown) => {
+			// A notice that could not be admitted (paused pump, disposing parent) must not
+			// burn the rate-limit window: release the stamp so the next stall_warning
+			// retries instead of waiting out ten silent minutes.
+			this.childStallNoticeAt.delete(rlmChildId);
+			this.log(
+				`could not deliver stall notice to parent ${parentState.activeSessionId} for child ${rlmChildId}: ${String(error)}`,
+			);
+		});
 	}
 
 	private beginReplacementSnapshot(
