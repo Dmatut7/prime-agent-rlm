@@ -265,6 +265,7 @@ import {
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
 	isSessionSlashCommandMessage,
+	PYTHON_SKILLS_UNAVAILABLE_CUSTOM_TYPE,
 	RLM_CHILD_FAILURE_CUSTOM_TYPE,
 	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
 	type RlmChildFailureDetails,
@@ -440,7 +441,12 @@ import { THINKING_LEVELS } from "./thinking-levels.js";
 import { acpMcpToolNames, createAcpMcpToolDefinitions } from "./tools/acp-mcp.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
 import { createAllToolDefinitions } from "./tools/index.js";
-import { formatIpythonAbortCause, type IpythonAbortCause, IpythonKernelProvisioner } from "./tools/ipython.js";
+import {
+	formatIpythonAbortCause,
+	type IpythonAbortCause,
+	IpythonKernelProvisioner,
+	type UnavailablePythonSkills,
+} from "./tools/ipython.js";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.js";
 import {
 	createTurnLiveness,
@@ -12176,6 +12182,34 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Tell the model which pre-imported Python skills failed to import into the
+	 * freshly started kernel, before it spends turns reading their SKILL.md and
+	 * calling them (the placeholder objects only raise on first call).
+	 */
+	private _onPythonSkillsUnavailable(errors: UnavailablePythonSkills): void {
+		const lines = ["[python-skills-unavailable]", ""];
+		lines.push(
+			"These installed Python skill modules failed to import into the Python kernel, so calling them raises an error:",
+		);
+		for (const [name, error] of Object.entries(errors)) {
+			lines.push(`- ${name}: ${error}`);
+		}
+		lines.push(
+			"",
+			"Their shell command forms fail the same way. Fix the import error first (for example install the missing dependency with `uv pip install <pkg>` or reinstall the skill into the kernel venv), or use another approach.",
+		);
+		void this.sendCustomMessage(
+			{
+				customType: PYTHON_SKILLS_UNAVAILABLE_CUSTOM_TYPE,
+				content: lines.join("\n"),
+				display: true,
+				details: { skills: Object.keys(errors) },
+			},
+			{ deliverAs: "nextTurn" },
+		).catch(() => {});
+	}
+
 	setSteeringMode(mode: "all" | "one-at-a-time"): void {
 		this.agent.steeringMode = mode;
 		this.settingsManager.setSteeringMode(mode);
@@ -14929,6 +14963,7 @@ export class AgentSession {
 				onUnexpectedExit: (cause, facts) => this._reportUnexpectedKernelExit(cause, facts),
 				onSnapshotFailure: (detail) => this._onKernelSnapshotWriteFailure(detail),
 				onStartupFailure: (error) => this._onIpythonStartupFailure(error),
+				onUnavailableSkills: (errors) => this._onPythonSkillsUnavailable(errors),
 				restartPolicy: () => {
 					const restart = this.settingsManager.getKernelRestartSettings();
 					return { maxRestarts: restart.maxUnexpectedRestarts, windowMs: restart.windowMs };
