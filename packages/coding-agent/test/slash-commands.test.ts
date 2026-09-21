@@ -132,6 +132,15 @@ describe("slash command aliases", () => {
 		});
 	});
 
+	test("carries the alias argument requirement over to the canonical command", () => {
+		expect(builtinSlashCommandTakesArgument("side")).toBe(builtinSlashCommandTakesArgument("btw"));
+		expect(builtinSlashCommandTakesArgument("thinking")).toBe(builtinSlashCommandTakesArgument("effort"));
+		expect(builtinSlashCommandTakesArgument("clear")).toBe(false);
+		expect(builtinSlashCommandTakesArgument("new")).toBe(true);
+		expect(BUILTIN_SLASH_COMMANDS.find((c) => c.name === "speed")?.argumentHint).toBe("[on|off]");
+		expect(BUILTIN_SLASH_COMMANDS.find((c) => c.name === "speed")?.takesArgument).toBe(true);
+	});
+
 	test("resolves /clear to /new through the alias path", () => {
 		const parsed = parseSlashCommand("/clear");
 

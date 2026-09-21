@@ -1034,6 +1034,10 @@ export class InteractiveMode {
 	// wraps the active footer so custom-footer swaps reflect in both layouts
 	private footerSlot: Container;
 	private fullscreenEnabled = false;
+	// /speed state: display flag plus per-session output tok/sec tracking (see recordSpeedSample).
+	private speedDisplayEnabled = false;
+	// Accumulated output-token/duration totals; allocated on the first recorded sample.
+	private speedStats: { tokens: number; durationMs: number; samples: number } | undefined;
 	private editorContainer: Container;
 	private footer: FooterComponent;
 	private footerDataProvider: FooterDataProvider;
@@ -3260,6 +3264,10 @@ export class InteractiveMode {
 	private async rebindCurrentSession(): Promise<void> {
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
+		// Sessions are independent: a rebind (new/resume/switch) restarts tok/sec stats
+		// and clears the readout left over from the previous session.
+		this.speedStats = undefined;
+		this.footer?.setSpeedText?.(undefined);
 		void this.rosterBar?.dispose();
 		this.rosterBar = undefined;
 		if (this.localSessionHost) {
@@ -5421,6 +5429,17 @@ export class InteractiveMode {
 					this.setFullscreenMode(enable);
 					return;
 				}
+				if (commandName === "speed") {
+					this.editor.setText("");
+					const arg = commandArgs?.trim().toLowerCase();
+					if (arg && arg !== "on" && arg !== "off") {
+						this.showError("Usage: /speed [on|off]");
+						return;
+					}
+					const enable = arg === "on" ? true : arg === "off" ? false : !this.speedDisplayEnabled;
+					this.setSpeedDisplay(enable);
+					return;
+				}
 				if (commandName === "debug" && !commandArgs) {
 					await this.handleDebugCommand();
 					this.editor.setText("");
@@ -6122,6 +6141,7 @@ export class InteractiveMode {
 							component.setArgsComplete();
 						}
 					}
+					this.recordSpeedSample(event.message);
 					this.streamingComponent = undefined;
 					this.streamingMessage = undefined;
 					this.footer.invalidate();
@@ -8256,6 +8276,56 @@ export class InteractiveMode {
 					: "Fullscreen rendering off",
 			);
 		})();
+	}
+
+	/** /speed on/off: toggles the footer tok/sec readout for this session. */
+	private setSpeedDisplay(enabled: boolean): void {
+		this.speedDisplayEnabled = enabled;
+		if (!enabled) {
+			this.resetSpeedStats();
+		}
+		this.footer.setSpeedEnabled(enabled);
+		this.showStatus(
+			enabled
+				? "Speed display on — footer shows output tok/s per model response and a session average"
+				: "Speed display off",
+		);
+		this.ui.requestRender();
+	}
+
+	/** Clears per-session tok/sec stats and the footer readout; keeps the display flag. */
+	private resetSpeedStats(): void {
+		this.speedStats = undefined;
+		this.footer.setSpeedText(undefined);
+	}
+
+	/**
+	 * Updates the footer tok/sec readout from a completed assistant message:
+	 * output tokens over the wall-clock span from the message timestamp (set at
+	 * provider stream start) to this message_end arrival. Timestamps keep the span
+	 * true even when buffered session events replay back-to-back on attach.
+	 * Aborted/failed responses and samples without a finite positive span or token
+	 * count are skipped: some providers only fill usage at stream end, and extension
+	 * message replacements may strip fields, so they never produce a bogus rate.
+	 */
+	private recordSpeedSample(message: AssistantMessage): void {
+		if (!this.speedDisplayEnabled || message.stopReason === "aborted" || message.stopReason === "error") {
+			return;
+		}
+		const durationMs = Date.now() - Number(message.timestamp);
+		const outputTokens = Number(message.usage?.output ?? 0);
+		if (!(durationMs > 0) || !(outputTokens > 0)) {
+			return;
+		}
+		this.speedStats ??= { tokens: 0, durationMs: 0, samples: 0 };
+		this.speedStats.tokens += outputTokens;
+		this.speedStats.durationMs += durationMs;
+		this.speedStats.samples++;
+		const formatRate = (tokensPerSecond: number): string =>
+			tokensPerSecond >= 100 ? tokensPerSecond.toFixed(0) : tokensPerSecond.toFixed(1);
+		const last = formatRate(outputTokens / (durationMs / 1000));
+		const average = formatRate(this.speedStats.tokens / (this.speedStats.durationMs / 1000));
+		this.footer.setSpeedText(this.speedStats.samples > 1 ? `${last} tok/s · avg ${average}` : `${last} tok/s`);
 	}
 
 	private toggleToolOutputExpansion(): void {
