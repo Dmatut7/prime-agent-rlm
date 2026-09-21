@@ -80,6 +80,8 @@ import {
 	computeRecursiveRollups,
 	createUnattachableChildOpenResult,
 	filterUnifiedSessions,
+	formatAgentsViewDurationMs,
+	formatAgentsViewSettledCell,
 	formatHeartbeatBadge,
 	getAgentsViewSelectionKey,
 	getAgentsViewSessionTitle,
@@ -95,6 +97,8 @@ import {
 	resolveAgentsViewLeftResult,
 	resolveAgentsViewScopeFrames,
 	resolveAgentsViewSelectionState,
+	resolveAgentsViewSessionDurationMs,
+	resolveAgentsViewSettled,
 	scopeToSessionSubtree,
 	sectionTitle,
 	shouldApplyScopeResolution,
@@ -2942,6 +2946,9 @@ export class AgentsViewMode implements Component, Focusable {
 		if (row.kind === "subagent-code") {
 			return this.renderCodeRow(row);
 		}
+		if (row.kind === "answer") {
+			return this.renderAnswerRow(row);
+		}
 		if (row.kind === "subagent-summary") {
 			const indent = "  ".repeat(row.depth);
 			const hint = row.hasSpawnCode ? theme.fg("dim", ` · ${keyText("app.agents.program")} show program`) : "";
@@ -3028,6 +3035,14 @@ export class AgentsViewMode implements Component, Focusable {
 		const indent = "  ".repeat(row.depth);
 		const body = theme.fg("muted", row.code || " ");
 		return `${CODE_ROW_MARKER}${indent}  ${body}`;
+	}
+
+	// U3: the row's last answer, one muted preview line directly under its
+	// session row. Context like the spawn-code rows — never selectable, and the
+	// shared line finalizer truncates it to the terminal width.
+	private renderAnswerRow(row: AgentsViewRow): string {
+		const indent = "  ".repeat(row.depth);
+		return `${indent}${theme.fg("muted", `↳ ${row.title}`)}`;
 	}
 
 	private finalizeRenderedLine(line: string, width: number): string {
@@ -3278,6 +3293,8 @@ function hasLiveWork(row: AgentsViewRow): boolean {
 }
 
 interface AgentsViewUsageParts {
+	set: string;
+	dur: string;
 	inTokens: string;
 	outTokens: string;
 	agentCost: string;
@@ -3286,7 +3303,12 @@ interface AgentsViewUsageParts {
 	age: string;
 }
 
+// U3: `set`/`dur` lead the block (settled ✓/…, session duration) ahead of the
+// usage columns, so the trailing layout every existing pin expects (…$total ·
+// age) keeps its columns and the new facts read as the row's state, not its bill.
 const AGENTS_VIEW_USAGE_LABELS: AgentsViewUsageParts = {
+	set: "set",
+	dur: "dur",
 	inTokens: "↑in",
 	outTokens: "↓out",
 	agentCost: "$agent",
@@ -3329,6 +3351,8 @@ export function buildAgentsViewUsageLayout(rows: readonly AgentsViewRow[]): Agen
 		const entries = (rowsBySection.get(section) ?? []).map((row) => {
 			const usage = row.summary.usage;
 			const parts: AgentsViewUsageParts = {
+				set: formatAgentsViewSettledCell(resolveAgentsViewSettled(row.summary)),
+				dur: formatAgentsViewDurationMs(resolveAgentsViewSessionDurationMs(row.summary)),
 				inTokens: `↑${formatTokenCount(usage?.inputTokens ?? 0)}`,
 				outTokens: `↓${formatTokenCount(usage?.outputTokens ?? 0)}`,
 				agentCost: `$${(usage?.cost ?? 0).toFixed(2)}`,
@@ -3352,6 +3376,8 @@ export function buildAgentsViewUsageLayout(rows: readonly AgentsViewRow[]): Agen
 			padCellStart(parts[column], widths[column]);
 		const formatLine = (parts: AgentsViewUsageParts): string =>
 			[
+				pad(parts, "set"),
+				pad(parts, "dur"),
 				`${pad(parts, "inTokens")} ${pad(parts, "outTokens")}`,
 				pad(parts, "agentCost"),
 				pad(parts, "count"),

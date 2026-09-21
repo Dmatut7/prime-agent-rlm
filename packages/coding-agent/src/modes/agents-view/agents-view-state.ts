@@ -70,7 +70,7 @@ export interface UnattachableChildOpenResult {
 	statusMessage: string;
 }
 
-export type AgentsViewRowKind = "agent" | "subagent-summary" | "subagent" | "subagent-code";
+export type AgentsViewRowKind = "agent" | "subagent-summary" | "subagent" | "subagent-code" | "answer";
 
 // Hard cap on spawn-code lines shown so a large program never floods the view.
 const MAX_SPAWN_CODE_LINES = 10;
@@ -245,6 +245,8 @@ function daemonSearchCorpus(daemon: SessionSummary): string {
 		daemon.cwd,
 		daemon.sessionFile,
 		daemon.summary,
+		// U3: an agent's last answer is searchable text for the row.
+		daemon.answerPreview,
 	]);
 }
 
@@ -1089,6 +1091,11 @@ export function buildAgentsViewRows(
 	const emit = (row: MutableAgentsViewRow, depth: number): void => {
 		row.depth = depth;
 		flattened.push(row);
+		// U3: the row's last answer, one muted preview line directly under it
+		// (before its subagent list, so the row's own reply reads as its own).
+		if (row.summary.answerPreview) {
+			flattened.push(createAnswerRow(row, row.summary.answerPreview, depth));
+		}
 		const children = childrenByParent.get(row) ?? [];
 		if (children.length === 0) {
 			return;
@@ -1126,6 +1133,29 @@ function isUnifiedSessionRecord(value: SessionSummary | UnifiedSessionRecord): v
 }
 
 type MutableAgentsViewRow = AgentsViewRow;
+
+/**
+ * U3: one muted, non-selectable preview line under its session row, mirroring the
+ * spawn-code rows: it carries its parent's summary for context but is never a
+ * navigation target.
+ */
+function createAnswerRow(parent: AgentsViewRow, preview: string, depth: number): AgentsViewRow {
+	return {
+		kind: "answer",
+		section: parent.section,
+		summary: parent.summary,
+		title: preview,
+		subtitle: "",
+		statusLabel: "",
+		depth,
+		selectable: false,
+		runningSubagentCount: 0,
+		recursiveCost: 0,
+		descendantCount: 0,
+		identity: `answer:${parent.identity}`,
+		parentIdentity: parent.identity,
+	};
+}
 
 function createSubagentSummaryRow(
 	parent: AgentsViewRow,
@@ -1402,6 +1432,72 @@ function getQuietDurationLabel(summary: SessionSummary): string {
 	const minutes = Math.floor(quietMs / 60_000);
 	const duration = minutes >= 60 ? `${Math.floor(minutes / 60)}h ${minutes % 60}m` : `${minutes}m`;
 	return ` (no activity ${duration})`;
+}
+
+/**
+ * U3: whether the session's current task has settled — the daemon roster fact
+ * when the daemon sends it (newer daemons), otherwise the same rule derived from
+ * the fields every daemon already carries: no work in flight (turn, streaming,
+ * kernel-hosted work folded into `isSessionActive`) and a terminal outcome on
+ * record (a completed/error verdict, or a subagent's reply to its parent;
+ * needs_input is an open loop, not a conclusion). Undefined when neither side can
+ * say — the column renders blank instead of guessing.
+ */
+export function resolveAgentsViewSettled(summary: SessionSummary): boolean | undefined {
+	if (summary.settled !== undefined) return summary.settled;
+	if (summary.isStreaming === true || summary.isSessionActive === true || summary.activity === "working") {
+		return false;
+	}
+	// A terminal verdict settles the row; a non-terminal one (needs_input) is an
+	// open loop the rule can name, while no verdict at all is unknown.
+	if (summary.taskState === "completed" || summary.taskState === "error" || summary.repliedSinceTask === true) {
+		return true;
+	}
+	return summary.taskState !== undefined ? false : undefined;
+}
+
+/**
+ * U3: the session's wall-clock span in ms — the daemon roster fact when present,
+ * otherwise recomputed locally from the timestamps every daemon already carries:
+ * created → last activity, or created → now while work is in flight.
+ */
+export function resolveAgentsViewSessionDurationMs(
+	summary: SessionSummary,
+	now: number = Date.now(),
+): number | undefined {
+	if (summary.durationMs !== undefined) return summary.durationMs;
+	const start = getTimestamp(summary.created);
+	if (start === 0) return undefined;
+	const busy = summary.isStreaming === true || summary.isSessionActive === true || summary.activity === "working";
+	const end = busy ? now : getTimestamp(summary.lastActivityAt ?? summary.modified) || now;
+	return end >= start ? end - start : undefined;
+}
+
+/** U3: the settled column's cell — settled, in flight, or unknown (blank). */
+export function formatAgentsViewSettledCell(settled: boolean | undefined): string {
+	if (settled === true) return "✓";
+	if (settled === false) return "…";
+	return "";
+}
+
+/**
+ * U3: duration cell, two units at most (45s, 12m, 1h05m, 3d, 2d4h) so the column
+ * stays narrow; blank when the span is unknown.
+ */
+export function formatAgentsViewDurationMs(durationMs: number | undefined): string {
+	if (durationMs === undefined || !Number.isFinite(durationMs) || durationMs < 0) return "";
+	const seconds = Math.floor(durationMs / 1000);
+	if (seconds < 60) return `${seconds}s`;
+	const minutes = Math.floor(seconds / 60);
+	if (minutes < 60) return `${minutes}m`;
+	const hours = Math.floor(minutes / 60);
+	if (hours < 24) {
+		const rest = minutes % 60;
+		return rest > 0 ? `${hours}h${String(rest).padStart(2, "0")}m` : `${hours}h`;
+	}
+	const days = Math.floor(hours / 24);
+	const rest = hours % 24;
+	return rest > 0 ? `${days}d${rest}h` : `${days}d`;
 }
 
 export function getAgentsViewSessionTitle(summary: SessionSummary): string {
