@@ -214,7 +214,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 				recordWebSocketSseFallback(options?.sessionId);
 			}
 
-						if (transport !== "sse" && !websocketDisabledForSession) {
+			if (transport !== "sse" && !websocketDisabledForSession) {
 				let websocketStarted = false;
 				// Retry a stale previous_response_id once on a fresh full body: the failed
 				// attempt's error cleanup already dropped the cached continuation, so the
