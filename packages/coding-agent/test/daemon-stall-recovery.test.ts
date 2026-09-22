@@ -5,8 +5,17 @@
  * sweep method on session doubles, so the policy itself is what is pinned.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+	AGENT_MESSAGE_SOURCE,
+	type AgentSessionMessageDeliveryStatus,
+	type AgentSessionMessagePayload,
+} from "../src/core/agent-messages.js";
 import type { RlmChildStallState } from "../src/core/agent-session.js";
-import { RLM_CHILD_RECOVERY_ACTION_CUSTOM_TYPE, SYSTEM_INTERRUPTION_CUSTOM_TYPE } from "../src/core/messages.js";
+import {
+	RLM_CHILD_RECOVERY_ACTION_CUSTOM_TYPE,
+	STALL_RECOVERY_ESCALATION_CUSTOM_TYPE,
+	SYSTEM_INTERRUPTION_CUSTOM_TYPE,
+} from "../src/core/messages.js";
 import type { ActiveSessionState } from "../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
 import type { DaemonOutbound } from "../src/modes/daemon/daemon-protocol.js";
@@ -46,6 +55,12 @@ interface DaemonDoubleSession {
 	turnLifecycleEpoch: number;
 	isStreaming: boolean;
 	messages: unknown[];
+	/** r4-p2 fix A: the measured event clock, live liveness facts, and the watchdog's live verdict. */
+	lastAgentEventAt?: number;
+	isBashRunning?: boolean;
+	isRetrying?: boolean;
+	isCompacting?: boolean;
+	excusedNow?: boolean;
 	settingsManager: {
 		getSubagentStallRecoverySettings(): {
 			enabled: boolean;
@@ -61,6 +76,14 @@ interface DaemonDoubleSession {
 	sendCustomMessage: ReturnType<typeof vi.fn>;
 	abortAndSendQueued: ReturnType<typeof vi.fn>;
 	resumeQueuedWork: ReturnType<typeof vi.fn>;
+	/** Command-surface stubs: the user-input wiring tests drive the real handleCommand against these. */
+	requestAbort: ReturnType<typeof vi.fn>;
+	promptUntilAccepted: ReturnType<typeof vi.fn>;
+	promptAndWait: ReturnType<typeof vi.fn>;
+	steer: ReturnType<typeof vi.fn>;
+	followUp: ReturnType<typeof vi.fn>;
+	resumeQueuedWorkFromConnection: ReturnType<typeof vi.fn>;
+	acceptAgentMessagePrompt: ReturnType<typeof vi.fn>;
 	sessionName?: string;
 	sessionManager: { getSessionDir(): string };
 	getRlmChildRerouteCandidate?: (childId: string) => { prompt: string; model: string } | undefined;
@@ -97,6 +120,13 @@ function makeSessionDouble(
 		sendCustomMessage: vi.fn(async () => {}),
 		abortAndSendQueued: vi.fn(() => false),
 		resumeQueuedWork: vi.fn(() => true),
+		requestAbort: vi.fn(),
+		promptUntilAccepted: vi.fn(async () => {}),
+		promptAndWait: vi.fn(async () => {}),
+		steer: vi.fn(async () => {}),
+		followUp: vi.fn(async () => true),
+		resumeQueuedWorkFromConnection: vi.fn(() => true),
+		acceptAgentMessagePrompt: vi.fn(async () => {}),
 		sessionName: options.sessionName ?? `name-${options.activeSessionId}`,
 		sessionManager: { getSessionDir: () => "/tmp/child-session" },
 	};
@@ -125,18 +155,32 @@ interface Fixture {
 		sessions: Map<string, ActiveSessionState>;
 		childSessions(): DaemonDoubleSession[];
 		log: ReturnType<typeof vi.fn>;
+		write: ReturnType<typeof vi.fn>;
+		promptAdmissions: Map<string, unknown>;
 		sweepStallRecovery(now?: number): Promise<void>;
 		noteExternalSessionInput(state: ActiveSessionState): void;
 		noteStallForRecovery(
 			state: ActiveSessionState,
 			event: StallWarningEvent & { type: "stall_warning" | "stall_abort" | "stall_unsettled" },
 		): void;
+		getBoundSessionState(activeSessionId: string): ActiveSessionState;
+		getSessionState(activeSessionId: string): ActiveSessionState;
+		handleCommand(client: unknown, command: unknown, onPromptHandlerOwnsAdmission?: () => void): Promise<unknown>;
+		acceptAgentSessionMessage(
+			targetState: ActiveSessionState,
+			payload: AgentSessionMessagePayload,
+		): Promise<{ status: AgentSessionMessageDeliveryStatus }>;
 	};
 	states: Map<string, ActiveSessionState & { runtime: { session: DaemonDoubleSession } }>;
 }
 
 function makeFixture(states: ActiveSessionState[]): Fixture {
 	const sessions = new Map(states.map((state) => [state.activeSessionId, state]));
+	const resolveState = (activeSessionId: string): ActiveSessionState => {
+		const state = sessions.get(activeSessionId);
+		if (!state) throw new Error(`Unknown active session: ${activeSessionId}`);
+		return state;
+	};
 	const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
 		options: {},
 		sessions,
@@ -147,6 +191,10 @@ function makeFixture(states: ActiveSessionState[]): Fixture {
 		stallRecoveryNoticedAt: new Map(),
 		scheduleRosterFlush: vi.fn(),
 		log: vi.fn(),
+		write: vi.fn(),
+		promptAdmissions: new Map(),
+		getBoundSessionState: resolveState,
+		getSessionState: resolveState,
 	});
 	return {
 		daemon: daemon as unknown as Fixture["daemon"],
@@ -154,8 +202,23 @@ function makeFixture(states: ActiveSessionState[]): Fixture {
 	};
 }
 
+/** A minimal command-sending client: the command cases under test only need an addressable peer. */
+function makeClient(): unknown {
+	return { id: "client-1", transport: "private-framed" };
+}
+
 function childMetadata(parentActiveSessionId: string, rlmChildId: string) {
 	return { kind: "subagent", createdAt: 1, rlmChildId, parentActiveSessionId } as const;
+}
+
+/** A minimal agent-message payload for the delivery-path pins. */
+function nudgePayload(activeSessionId: string): AgentSessionMessagePayload {
+	return {
+		id: "agentmsg_pin-1",
+		source: AGENT_MESSAGE_SOURCE,
+		message: "status?",
+		target: { activeSessionId, sessionId: `${activeSessionId}-session` },
+	};
 }
 
 function stallWarning(silentMs: number, thresholdMs: number): StallWarningEvent {
@@ -264,7 +327,7 @@ describe("daemon stall recovery sweep", () => {
 		expect(child.runtime.session.abortAndSendQueued).toHaveBeenCalledTimes(1);
 	});
 
-	it("never kills an excused stall: the watchdog's exemption is the single arbiter", async () => {
+	it("never kills an excused stall while the watchdog's exemption still holds (live arbiter)", async () => {
 		const child = makeSessionDouble({
 			activeSessionId: "child-active",
 			metadata: childMetadata("parent-active", "child-1"),
@@ -272,12 +335,34 @@ describe("daemon stall recovery sweep", () => {
 		const parent = makeSessionDouble({ activeSessionId: "parent-active" });
 		const fixture = makeFixture([child, parent]);
 		child.runtime.session.stallState = stallMarker({ excused: true, excusedReasons: ["live_bash_handles"] });
+		// A (blind-3 P8 fix): the sweep asks the watchdog now - `excusedNow` is its
+		// live, unexhausted verdict, not the marker's warn-time snapshot.
+		child.runtime.session.excusedNow = true;
 		const now = 1_000_000;
 
 		await fixture.daemon.sweepStallRecovery(now);
 		await fixture.daemon.sweepStallRecovery(now + 15_000);
 		await fixture.daemon.sweepStallRecovery(now + 3_000_000);
 		expect(child.runtime.session.abortAndSendQueued).not.toHaveBeenCalled();
+	});
+
+	it("P8: an excused stall whose watchdog budget has run out is still acted on", async () => {
+		const child = makeSessionDouble({
+			activeSessionId: "child-active",
+			metadata: childMetadata("parent-active", "child-1"),
+			settings: { childGraceSeconds: 0 },
+		});
+		const parent = makeSessionDouble({ activeSessionId: "parent-active" });
+		const fixture = makeFixture([child, parent]);
+		// The marker still carries the warn-time excuse; the live sample says the
+		// budget is spent. The single arbiter has spoken: the sweep acts.
+		child.runtime.session.stallState = stallMarker({ excused: true, excusedReasons: ["live_bash_handles"] });
+		child.runtime.session.excusedNow = false;
+		const now = 1_000_000;
+
+		await fixture.daemon.sweepStallRecovery(now);
+		await fixture.daemon.sweepStallRecovery(now + 15_000);
+		expect(child.runtime.session.abortAndSendQueued).toHaveBeenCalledTimes(1);
 	});
 
 	it("depth-0 with no attached client acts as soon as the evidence confirms; 119s is too early", async () => {
@@ -338,7 +423,7 @@ describe("daemon stall recovery sweep", () => {
 		expect(root.runtime.session.abortAndSendQueued).not.toHaveBeenCalled();
 	});
 
-	it("advancing messages refresh the observation instead of acting on stale evidence", async () => {
+	it("advancing events refresh the observation instead of acting on stale evidence", async () => {
 		const child = makeSessionDouble({
 			activeSessionId: "child-active",
 			metadata: childMetadata("parent-active", "child-1"),
@@ -349,8 +434,10 @@ describe("daemon stall recovery sweep", () => {
 		const now = 1_000_000;
 
 		await fixture.daemon.sweepStallRecovery(now);
-		// The model produced output: the transcript moved, so the episode is
-		// refreshed (the wait window restarts) rather than concluded.
+		// The model produced output: agent events flowed (message_end would land
+		// too), so the episode is refreshed (the wait window restarts) rather than
+		// concluded - the moved check is measured, not transcript-inferred.
+		child.runtime.session.lastAgentEventAt = now + 14_000;
 		child.runtime.session.messages.push({ role: "assistant", content: "progress" });
 		await fixture.daemon.sweepStallRecovery(now + 15_000);
 		await fixture.daemon.sweepStallRecovery(now + 30_000);
@@ -498,6 +585,7 @@ describe("daemon stall recovery sweep", () => {
 		const root = makeSessionDouble({ activeSessionId: "root-active" });
 		const fixture = makeFixture([root]);
 		root.runtime.session.stallState = stallMarker({ excused: true });
+		root.runtime.session.excusedNow = true;
 		await fixture.daemon.sweepStallRecovery(1_000_000);
 		await fixture.daemon.sweepStallRecovery(1_060_000);
 		expect(root.runtime.session.abortAndSendQueued).not.toHaveBeenCalled();
@@ -505,9 +593,427 @@ describe("daemon stall recovery sweep", () => {
 		root.runtime.session.stallState = undefined;
 		await fixture.daemon.sweepStallRecovery(1_120_000);
 		root.runtime.session.stallState = stallMarker();
+		root.runtime.session.excusedNow = false;
 		await fixture.daemon.sweepStallRecovery(1_180_000);
 		await fixture.daemon.sweepStallRecovery(1_195_000);
 		expect(root.runtime.session.abortAndSendQueued).toHaveBeenCalledTimes(1);
+	});
+
+	it("probe B (blind-2 F1): a streaming turn is never killed by the transcript-freeze heuristic", async () => {
+		const child = makeSessionDouble({
+			activeSessionId: "child-active",
+			metadata: childMetadata("parent-active", "child-1"),
+			settings: { childGraceSeconds: 0 },
+		});
+		const parent = makeSessionDouble({ activeSessionId: "parent-active" });
+		const fixture = makeFixture([child, parent]);
+		// An earlier warn left the marker; the model recovered and is streaming:
+		// token deltas keep arriving while messages.length stays frozen.
+		child.runtime.session.stallState = stallMarker();
+		const now = 1_000_000;
+
+		await fixture.daemon.sweepStallRecovery(now); // first sighting: the episode exists
+		for (let i = 1; i <= 10; i++) {
+			// Events keep flowing (deltas, tool starts/ends) - none landed a message yet.
+			child.runtime.session.lastAgentEventAt = now + i * 15_000 - 1_000;
+			await fixture.daemon.sweepStallRecovery(now + i * 15_000);
+		}
+		expect(child.runtime.session.abortAndSendQueued).not.toHaveBeenCalled();
+
+		// True silence still acts: events stop, the measured silence crosses the
+		// threshold, the wait window (0 here) is spent.
+		const stillAt = now + 11 * 15_000;
+		child.runtime.session.lastAgentEventAt = stillAt - 301_000;
+		await fixture.daemon.sweepStallRecovery(stillAt);
+		expect(child.runtime.session.abortAndSendQueued).toHaveBeenCalledTimes(1);
+		// A: the notice and the marker report the measured action-time silence,
+		// not the warn-time snapshot (312s) the marker still carries.
+		const [notice] = child.runtime.session.sendCustomMessage.mock.calls[0]!;
+		expect(notice.details).toMatchObject({ silentMs: 301_000 });
+		expect(child.stallRecovery).toMatchObject({ silentMs: 301_000 });
+	});
+
+	it("P6 (blind-3): a healthy turn running a legal long bash is never acted on", async () => {
+		const child = makeSessionDouble({
+			activeSessionId: "child-active",
+			metadata: childMetadata("parent-active", "child-1"),
+			settings: { childGraceSeconds: 0 },
+		});
+		const parent = makeSessionDouble({ activeSessionId: "parent-active" });
+		const fixture = makeFixture([child, parent]);
+		child.runtime.session.stallState = stallMarker();
+		child.runtime.session.isBashRunning = true;
+		const now = 1_000_000;
+
+		await fixture.daemon.sweepStallRecovery(now);
+		await fixture.daemon.sweepStallRecovery(now + 15_000);
+		// Deep past every window: the liveness fact owns the silence, no action.
+		await fixture.daemon.sweepStallRecovery(now + 3_000_000);
+		expect(child.runtime.session.abortAndSendQueued).not.toHaveBeenCalled();
+		expect(child.runtime.session.sendCustomMessage).not.toHaveBeenCalled();
+	});
+
+	it("P7 (blind-3): a depth-0 session in a provider retry is never acted on", async () => {
+		const root = makeSessionDouble({ activeSessionId: "root-active", clients: 0 });
+		const fixture = makeFixture([root]);
+		root.runtime.session.stallState = stallMarker();
+		root.runtime.session.isRetrying = true;
+		const now = 1_000_000;
+
+		await fixture.daemon.sweepStallRecovery(now);
+		await fixture.daemon.sweepStallRecovery(now + 15_000);
+		await fixture.daemon.sweepStallRecovery(now + 3_000_000);
+		expect(root.runtime.session.abortAndSendQueued).not.toHaveBeenCalled();
+		expect(root.runtime.session.sendCustomMessage).not.toHaveBeenCalled();
+	});
+
+	it("B (blind-3 finding 2): a slow admission cannot stack executors - three ticks, one action", async () => {
+		const child = makeSessionDouble({
+			activeSessionId: "child-active",
+			metadata: childMetadata("parent-active", "child-1"),
+			settings: { childGraceSeconds: 0 },
+		});
+		const parent = makeSessionDouble({ activeSessionId: "parent-active" });
+		const fixture = makeFixture([child, parent]);
+		child.runtime.session.stallState = stallMarker();
+		const now = 1_000_000;
+		// A controlled admission that stays pending across three sweep ticks.
+		let release!: () => void;
+		const pending = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		child.runtime.session.sendCustomMessage.mockImplementation(() => pending);
+
+		await fixture.daemon.sweepStallRecovery(now); // first sighting
+		await fixture.daemon.sweepStallRecovery(now + 15_000); // claim + launch; admission pends
+		await fixture.daemon.sweepStallRecovery(now + 30_000); // tick 2 while pending
+		await fixture.daemon.sweepStallRecovery(now + 45_000); // tick 3 while pending
+		expect(child.runtime.session.sendCustomMessage).toHaveBeenCalledTimes(1);
+		expect(child.runtime.session.abortAndSendQueued).not.toHaveBeenCalled();
+		expect(child.stallRecovery).toBeUndefined();
+
+		release();
+		await vi.waitFor(() => {
+			expect(child.runtime.session.abortAndSendQueued).toHaveBeenCalledTimes(1);
+		});
+		// One action, one stop-line count, one receipt - not three.
+		expect(child.stallRecovery).toMatchObject({ count: 1 });
+		expect(parent.runtime.session.sendCustomMessage).toHaveBeenCalledTimes(1);
+	});
+
+	it("C (blind-3 finding 4): a queued agent message does not disarm the episode", async () => {
+		const child = makeSessionDouble({
+			activeSessionId: "child-active",
+			metadata: childMetadata("parent-active", "child-1"),
+			settings: { childGraceSeconds: 0 },
+		});
+		const parent = makeSessionDouble({ activeSessionId: "parent-active" });
+		const fixture = makeFixture([child, parent]);
+		child.runtime.session.stallState = stallMarker();
+		const now = 1_000_000;
+		await fixture.daemon.sweepStallRecovery(now); // first sighting: the episode exists
+
+		// The parent nudges the wedged child; the message queues behind the wedged
+		// turn (the target never read it).
+		child.runtime.session.acceptAgentMessagePrompt.mockImplementation(
+			async (
+				_content: unknown,
+				options: { preflightResult?: (didSucceed: boolean, didQueue?: boolean) => void },
+			) => {
+				options.preflightResult?.(true, true);
+			},
+		);
+		const receipt = await fixture.daemon.acceptAgentSessionMessage(child, nudgePayload("child-active"));
+		expect(receipt.status).toBe("queued");
+		// The nudge did not mark kept-alive: the sweep still acts, and its action
+		// is what delivers the queued nudge in the first place.
+		await fixture.daemon.sweepStallRecovery(now + 15_000);
+		expect(child.runtime.session.abortAndSendQueued).toHaveBeenCalledTimes(1);
+	});
+
+	it("C: an agent message that was actually delivered marks the episode kept-alive", async () => {
+		const child = makeSessionDouble({
+			activeSessionId: "child-active",
+			metadata: childMetadata("parent-active", "child-1"),
+			settings: { childGraceSeconds: 0 },
+		});
+		const parent = makeSessionDouble({ activeSessionId: "parent-active" });
+		const fixture = makeFixture([child, parent]);
+		child.runtime.session.stallState = stallMarker();
+		const now = 1_000_000;
+		await fixture.daemon.sweepStallRecovery(now); // first sighting: the episode exists
+
+		// The target read the message: delivery, not queueing.
+		child.runtime.session.acceptAgentMessagePrompt.mockImplementation(
+			async (
+				_content: unknown,
+				options: { preflightResult?: (didSucceed: boolean, didQueue?: boolean) => void },
+			) => {
+				options.preflightResult?.(true, false);
+			},
+		);
+		const receipt = await fixture.daemon.acceptAgentSessionMessage(child, nudgePayload("child-active"));
+		expect(receipt.status).toBe("delivered");
+		await fixture.daemon.sweepStallRecovery(now + 15_000);
+		await fixture.daemon.sweepStallRecovery(now + 3_000_000);
+		expect(child.runtime.session.abortAndSendQueued).not.toHaveBeenCalled();
+	});
+
+	it("C (blind-1 F1): every user-source command marks external input at case entry", async () => {
+		const commands: Array<{
+			name: string;
+			build: (activeSessionId: string) => Record<string, unknown>;
+			driven: (session: DaemonDoubleSession) => ReturnType<typeof vi.fn>;
+		}> = [
+			{
+				name: "prompt",
+				build: (id) => ({ type: "prompt", activeSessionId: id, message: "keep going" }),
+				driven: (session) => session.promptUntilAccepted,
+			},
+			{
+				name: "prompt_and_wait",
+				build: (id) => ({ type: "prompt_and_wait", activeSessionId: id, message: "keep going" }),
+				driven: (session) => session.promptAndWait,
+			},
+			{
+				name: "steer",
+				build: (id) => ({ type: "steer", activeSessionId: id, message: "try another approach" }),
+				driven: (session) => session.steer,
+			},
+			{
+				name: "follow_up",
+				build: (id) => ({ type: "follow_up", activeSessionId: id, message: "queued follow-up" }),
+				driven: (session) => session.followUp,
+			},
+			{
+				name: "resume_queue",
+				build: (id) => ({ type: "resume_queue", activeSessionId: id }),
+				driven: (session) => session.resumeQueuedWorkFromConnection,
+			},
+			{
+				name: "abort",
+				build: (id) => ({ type: "abort", activeSessionId: id }),
+				driven: (session) => session.requestAbort,
+			},
+			{
+				name: "abort_and_send_queued",
+				build: (id) => ({ type: "abort_and_send_queued", activeSessionId: id }),
+				driven: (session) => session.abortAndSendQueued,
+			},
+		];
+		// Guard the data-driven loop: an empty list would pass without asserting.
+		expect(commands.length).toBeGreaterThan(0);
+		const now = 1_000_000;
+		for (const command of commands) {
+			const child = makeSessionDouble({
+				activeSessionId: "child-active",
+				metadata: childMetadata("parent-active", "child-1"),
+				settings: { childGraceSeconds: 0 },
+			});
+			const parent = makeSessionDouble({ activeSessionId: "parent-active" });
+			const fixture = makeFixture([child, parent]);
+			child.runtime.session.stallState = stallMarker();
+			await fixture.daemon.sweepStallRecovery(now); // first sighting: the episode exists
+			// The real command surface, not a direct private call.
+			await fixture.daemon.handleCommand(makeClient(), command.build("child-active"));
+			// Positive control: the command really drove the session.
+			expect(command.driven(child.runtime.session), command.name).toHaveBeenCalled();
+			// The abort_and_send_queued command itself calls the abort lever: clear
+			// it so the remaining assertion sees only what the sweep would do.
+			if (command.name === "abort_and_send_queued") child.runtime.session.abortAndSendQueued.mockClear();
+			await fixture.daemon.sweepStallRecovery(now + 15_000);
+			await fixture.daemon.sweepStallRecovery(now + 30_000);
+			// External input marked the episode kept-alive: never auto-acted.
+			expect(child.runtime.session.abortAndSendQueued, command.name).not.toHaveBeenCalled();
+		}
+	});
+
+	it("C: a user steer inside the human window keeps a depth-0 episode alive - never auto-acted", async () => {
+		const root = makeSessionDouble({ activeSessionId: "root-active", clients: 1 });
+		const fixture = makeFixture([root]);
+		root.runtime.session.stallState = stallMarker();
+		const now = 1_000_000;
+		await fixture.daemon.sweepStallRecovery(now); // first sighting: the episode exists
+
+		await fixture.daemon.handleCommand(makeClient(), {
+			type: "steer",
+			activeSessionId: "root-active",
+			message: "try a different approach",
+		});
+		expect(root.runtime.session.steer).toHaveBeenCalledTimes(1);
+		// Past the 120s human window and far beyond: a human-driven episode is
+		// never auto-acted.
+		await fixture.daemon.sweepStallRecovery(now + 121_000);
+		await fixture.daemon.sweepStallRecovery(now + 3_000_000);
+		expect(root.runtime.session.abortAndSendQueued).not.toHaveBeenCalled();
+	});
+
+	it("C: an abort command resets the stop-line count", async () => {
+		const child = makeSessionDouble({
+			activeSessionId: "child-active",
+			metadata: childMetadata("parent-active", "child-1"),
+			settings: { childGraceSeconds: 0 },
+		});
+		const parent = makeSessionDouble({ activeSessionId: "parent-active" });
+		const fixture = makeFixture([child, parent]);
+		const now = 1_000_000;
+		// Three stall episodes, each a fresh epoch, all without external input.
+		for (let episode = 0; episode < 3; episode++) {
+			child.runtime.session.stallState = stallMarker();
+			child.runtime.session.turnLifecycleEpoch = 7 + episode;
+			await fixture.daemon.sweepStallRecovery(now + episode * 100_000);
+			await fixture.daemon.sweepStallRecovery(now + episode * 100_000 + 15_000);
+		}
+		expect(child.runtime.session.abortAndSendQueued).toHaveBeenCalledTimes(3);
+		// The fourth episode hits the stop line: notify only.
+		child.runtime.session.stallState = stallMarker();
+		child.runtime.session.turnLifecycleEpoch = 10;
+		await fixture.daemon.sweepStallRecovery(now + 400_000);
+		await fixture.daemon.sweepStallRecovery(now + 415_000);
+		expect(child.runtime.session.abortAndSendQueued).toHaveBeenCalledTimes(3);
+		// The user aborts: the count resets, so the mechanism is re-armed.
+		await fixture.daemon.handleCommand(makeClient(), { type: "abort", activeSessionId: "child-active" });
+		expect(child.runtime.session.requestAbort).toHaveBeenCalledTimes(1);
+		child.runtime.session.stallState = stallMarker();
+		child.runtime.session.turnLifecycleEpoch = 11;
+		await fixture.daemon.sweepStallRecovery(now + 500_000);
+		await fixture.daemon.sweepStallRecovery(now + 515_000);
+		expect(child.runtime.session.abortAndSendQueued).toHaveBeenCalledTimes(4);
+	});
+
+	it("stop line 0: an explicit maxPerSession of 0 means notify-only, zero actions", async () => {
+		const child = makeSessionDouble({
+			activeSessionId: "child-active",
+			metadata: childMetadata("parent-active", "child-1"),
+			settings: { childGraceSeconds: 0, maxPerSession: 0 },
+		});
+		const parent = makeSessionDouble({ activeSessionId: "parent-active" });
+		const fixture = makeFixture([child, parent]);
+		child.runtime.session.stallState = stallMarker();
+		const now = 1_000_000;
+
+		await fixture.daemon.sweepStallRecovery(now);
+		await fixture.daemon.sweepStallRecovery(now + 15_000);
+		expect(child.runtime.session.abortAndSendQueued).not.toHaveBeenCalled();
+		expect(child.runtime.session.sendCustomMessage).not.toHaveBeenCalled();
+		const stopLine = fixture.daemon.log.mock.calls.find((call) => String(call[0]).includes("stop line reached"));
+		expect(stopLine).toBeDefined();
+		expect(String(stopLine?.[0])).toContain("(limit 0)");
+	});
+
+	it("G (blind-3 finding 9): the escalation is reachable with the injected clock alone", async () => {
+		const child = makeSessionDouble({
+			activeSessionId: "child-active",
+			metadata: childMetadata("parent-active", "child-1"),
+			settings: { childGraceSeconds: 0 },
+		});
+		const parent = makeSessionDouble({ activeSessionId: "parent-active" });
+		parent.runtime.session.getRlmChildRerouteCandidate = () => ({
+			prompt: "hang inside a tool",
+			model: "faux/mini",
+			sessionName: "name-child-active",
+		});
+		const fixture = makeFixture([child, parent]);
+		child.runtime.session.stallState = stallMarker();
+		const now = 1_000_000;
+		// No Date.now mock anywhere: the only clock is the injected sweep `now`.
+		// (Pre-fix, actedAt came from the real clock and now - actedAt was a huge
+		// negative, so this escalation could never fire under a test clock.)
+
+		await fixture.daemon.sweepStallRecovery(now);
+		await fixture.daemon.sweepStallRecovery(now + 15_000);
+		expect(parent.runtime.session.sendCustomMessage).toHaveBeenCalledTimes(1);
+		await fixture.daemon.sweepStallRecovery(now + 15_000 + 15 * 60_000 + 1_000);
+		expect(parent.runtime.session.sendCustomMessage).toHaveBeenCalledTimes(2);
+		const [escalation] = parent.runtime.session.sendCustomMessage.mock.calls[1]!;
+		expect(escalation.details).toMatchObject({
+			escalated: true,
+			// G (blind-3 finding 10): the policy window and the measured gap are
+			// separate fields now.
+			escalateAfterMs: 15 * 60_000,
+			silentSinceActionMs: 15 * 60_000 + 1_000,
+		});
+		expect(escalation.content).toContain("still silent 901s after the automatic stall-recovery action");
+	});
+
+	it("G (blind-3 finding 5): the escalation receipt reports the action that actually ran", async () => {
+		const child = makeSessionDouble({
+			activeSessionId: "child-active",
+			metadata: childMetadata("parent-active", "child-1"),
+			settings: { childGraceSeconds: 0 },
+		});
+		const parent = makeSessionDouble({ activeSessionId: "parent-active" });
+		const fixture = makeFixture([child, parent]);
+		child.runtime.session.stallState = stallMarker();
+		// The queue cannot deliver: the action degrades to a plain abort.
+		child.runtime.session.abortAndSendQueued.mockImplementation(() => false);
+		child.runtime.session.resumeQueuedWork.mockImplementation(() => false);
+		const now = 1_000_000;
+
+		await fixture.daemon.sweepStallRecovery(now);
+		await fixture.daemon.sweepStallRecovery(now + 15_000);
+		const [receipt] = parent.runtime.session.sendCustomMessage.mock.calls[0]!;
+		expect(receipt.details).toMatchObject({ action: "abort" });
+		await fixture.daemon.sweepStallRecovery(now + 15_000 + 15 * 60_000 + 1_000);
+		const [escalation] = parent.runtime.session.sendCustomMessage.mock.calls[1]!;
+		// The escalation variant reports the same truth (pre-fix: hardcoded
+		// "abort_and_send", which lied about the degrade).
+		expect(escalation.details).toMatchObject({ action: "abort", escalated: true });
+		expect(escalation.content).toContain("action: abort");
+	});
+
+	it("F2 (blind-1): a depth-0 escalation lands in the session's own transcript once the turn has ended", async () => {
+		const root = makeSessionDouble({ activeSessionId: "root-active", clients: 0 });
+		const fixture = makeFixture([root]);
+		root.runtime.session.stallState = stallMarker();
+		const now = 1_000_000;
+
+		await fixture.daemon.sweepStallRecovery(now);
+		await fixture.daemon.sweepStallRecovery(now + 15_000);
+		expect(root.runtime.session.abortAndSendQueued).toHaveBeenCalledTimes(1);
+		// Call 1 was the action's own system instruction; the escalation is call 2.
+		const [interruption] = root.runtime.session.sendCustomMessage.mock.calls[0]!;
+		expect(interruption.customType).toBe(SYSTEM_INTERRUPTION_CUSTOM_TYPE);
+		// The abort degrade: the turn ended, nothing restarted, the marker stayed.
+		root.runtime.session.isStreaming = false;
+		await fixture.daemon.sweepStallRecovery(now + 15_000 + 15 * 60_000 + 1_000);
+		expect(root.runtime.session.sendCustomMessage).toHaveBeenCalledTimes(2);
+		const [notice] = root.runtime.session.sendCustomMessage.mock.calls[1]!;
+		expect(notice.customType).toBe(STALL_RECOVERY_ESCALATION_CUSTOM_TYPE);
+		expect(notice.details).toMatchObject({
+			executor: "daemon",
+			actedAt: now + 15_000,
+			silentSinceActionMs: 15 * 60_000 + 1_000,
+			action: "abort_and_send",
+			count: 1,
+		});
+		expect(notice.content).toContain("still silent 15m after the automatic stall-recovery action");
+		expect(notice.content).toContain("prime-agent attach name-root-active");
+		// One-shot: a later sweep does not repeat the notice.
+		await fixture.daemon.sweepStallRecovery(now + 40 * 60_000);
+		expect(root.runtime.session.sendCustomMessage).toHaveBeenCalledTimes(2);
+	});
+
+	it("F2: a depth-0 escalation never lands while a turn is still streaming, and is not lost when it ends", async () => {
+		const root = makeSessionDouble({ activeSessionId: "root-active", clients: 0 });
+		const fixture = makeFixture([root]);
+		root.runtime.session.stallState = stallMarker();
+		const now = 1_000_000;
+
+		await fixture.daemon.sweepStallRecovery(now);
+		await fixture.daemon.sweepStallRecovery(now + 15_000);
+		// Call 1 is the action's own system instruction; nothing else may land.
+		expect(root.runtime.session.sendCustomMessage).toHaveBeenCalledTimes(1);
+		// The abort did not settle: the run is still "streaming" 15 minutes later.
+		await fixture.daemon.sweepStallRecovery(now + 15_000 + 15 * 60_000 + 1_000);
+		expect(root.runtime.session.sendCustomMessage).toHaveBeenCalledTimes(1);
+		// The stream finally ends: the deferred notice goes out on a later tick
+		// (the one-shot was not burned by the streaming deferral).
+		root.runtime.session.isStreaming = false;
+		await fixture.daemon.sweepStallRecovery(now + 15_000 + 16 * 60_000);
+		expect(root.runtime.session.sendCustomMessage).toHaveBeenCalledTimes(2);
+		const [notice] = root.runtime.session.sendCustomMessage.mock.calls[1]!;
+		expect(notice.customType).toBe(STALL_RECOVERY_ESCALATION_CUSTOM_TYPE);
 	});
 });
 

@@ -1,0 +1,1 @@
+- Fixed the daemon stall-recovery sweep judging deaths from a stale warn-time snapshot: sessions streaming or mid-bash/retry/compaction are never auto-killed, the watchdog's live exemption verdict (not the marker) decides excuses, action-time silence is measured, and a slow admission can no longer stack multiple interventions.
