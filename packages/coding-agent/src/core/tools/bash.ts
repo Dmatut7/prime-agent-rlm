@@ -782,8 +782,7 @@ function cachedExpandedLines(
 }
 
 /** The collapsed "... N earlier lines" line (U6: no per-line expand hint anymore). */
-function collapsedPreviewHint(skipped: number, showExpandHint: boolean): string {
-	void showExpandHint;
+function collapsedPreviewHint(skipped: number): string {
 	return theme.fg("muted", `... (${skipped} earlier lines)`);
 }
 
@@ -913,11 +912,7 @@ function rebuildBashResultRenderComponent(
 					const skipped = state.cachedSkipped ?? 0;
 					const assembled =
 						skipped > 0
-							? [
-									"",
-									truncateToWidth(collapsedPreviewHint(skipped, showExpandHint), width, "..."),
-									...previewLines,
-								]
+							? ["", truncateToWidth(collapsedPreviewHint(skipped), width, "..."), ...previewLines]
 							: ["", ...previewLines];
 					state.cachedPreviewFrame = {
 						source: previewLines,

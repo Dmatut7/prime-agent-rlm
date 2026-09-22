@@ -97,18 +97,15 @@ function formatFileChangePath(path: string, cwd: string): string {
 
 /**
  * One `    ╰─ <path> +N -M` row, truncated to width; the path renders relative
- * to cwd where possible.
+ * to cwd where possible. U6 removed the per-row expand hint (the global tail
+ * line owns the keys).
  */
 export function formatFileChangeSummaryLine(
 	rawPath: string,
 	cwd: string | undefined,
 	change: Pick<FileChangeSummary, "added" | "removed">,
-	diffsExpanded: boolean | undefined,
 	width: number,
 ): string {
-	// Kept in the signature: callers pass the O-key lane; the row itself no
-	// longer renders an expand hint (U6 removed all per-line hints).
-	void diffsExpanded;
 	const prefix = theme.fg("dim", FILE_CHANGE_SUMMARY_PREFIX);
 	const counts = `${theme.fg("dim", " ")}${formatChangeCounts(change)}`;
 	const safeWidth = Math.max(1, width);

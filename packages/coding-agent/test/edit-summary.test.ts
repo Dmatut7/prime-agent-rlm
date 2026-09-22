@@ -141,14 +141,15 @@ describe("edit summaries", () => {
 describe("formatFileChangeSummaryLine", () => {
 	beforeAll(() => initTheme("dark"));
 
-	test("keeps the truncated path stable when the ctrl+j hint flips", () => {
+	test("keeps the truncated path stable across renders", () => {
 		const change = { added: 3, removed: 1 };
 		const path = "src/some/deeply/nested/directory/with-a-long-file-name.ts";
 		const width = 44;
 		const pathPart = (line: string) => stripAnsi(line).replace(/\s*\+\d+ -\d+.*$/, "");
-		const expanded = formatFileChangeSummaryLine(path, undefined, change, true, width);
-		const collapsed = formatFileChangeSummaryLine(path, undefined, change, false, width);
-		expect(stripAnsi(expanded)).toContain("…");
-		expect(pathPart(expanded)).toBe(pathPart(collapsed));
+		// U6: the per-row ctrl+j hint is gone; the row is lane-independent.
+		const first = formatFileChangeSummaryLine(path, undefined, change, width);
+		const second = formatFileChangeSummaryLine(path, undefined, change, width);
+		expect(stripAnsi(first)).toContain("…");
+		expect(pathPart(first)).toBe(pathPart(second));
 	});
 });
