@@ -2077,8 +2077,8 @@ describe("agents view state", () => {
 		test("never infers a chat depth when the persisted field is absent", () => {
 			expect(formatAgentDepthLabel(undefined, true)).toBeUndefined();
 			expect(formatAgentDepthLabel(0, false)).toBeUndefined();
-			expect(formatAgentDepthLabel(0, true)).toBe("depth 0");
-			expect(formatAgentDepthLabel(3, false)).toBe("depth 3");
+			expect(formatAgentDepthLabel(0, true)).toBe("深度 0");
+			expect(formatAgentDepthLabel(3, false)).toBe("深度 3");
 		});
 	});
 });

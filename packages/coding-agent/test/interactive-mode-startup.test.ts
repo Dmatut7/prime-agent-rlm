@@ -77,11 +77,13 @@ describe("InteractiveMode startup hints", () => {
 		}
 	});
 
-	it("places the fresh-chat shortcut hint after the model and effort", () => {
+	it("renders a pure navigation tray label without model or shortcuts", () => {
 		const mode = createMode();
 		const label = Reflect.get(InteractiveMode.prototype, "getTrayLocationLabel").call(mode);
 
-		expect(stripAnsi(label)).toBe("test-model • high  ? for shortcuts");
+		// U6 ①: the model name and fresh-chat shortcuts hint moved out; the
+		// label is navigation only.
+		expect(stripAnsi(label)).toBe("");
 	});
 
 	it("keeps fresh-chat guidance hidden when a mid-turn snapshot still has no committed messages", () => {
@@ -233,10 +235,12 @@ describe("InteractiveMode startup hints", () => {
 		const mode = createMode(0, true, () => editorText);
 		const getLabel = () => Reflect.get(InteractiveMode.prototype, "getTrayLocationLabel").call(mode);
 
-		expect(stripAnsi(getLabel())).toBe("← agents/resume  test-model • high  ? for shortcuts");
+		// U6 ①: navigation only; the label no longer reacts to editor text
+		// (no shortcuts hint to hide) and carries no model segment.
+		expect(stripAnsi(getLabel())).toBe("← agents/resume");
 
 		editorText = "draft prompt";
-		expect(stripAnsi(getLabel())).toBe("← agents/resume  test-model • high");
+		expect(stripAnsi(getLabel())).toBe("← agents/resume");
 	});
 
 	it("hides the fresh-chat shortcut hint while the prompt has text", () => {
@@ -244,23 +248,26 @@ describe("InteractiveMode startup hints", () => {
 		const mode = createMode(0, false, () => editorText);
 		const getLabel = () => Reflect.get(InteractiveMode.prototype, "getTrayLocationLabel").call(mode);
 
-		expect(stripAnsi(getLabel())).toBe("test-model • high  ? for shortcuts");
+		// U6 ①: no model segment, no shortcuts hint — the label is empty for a
+		// plain session and stays empty through edits.
+		expect(stripAnsi(getLabel())).toBe("");
 
 		editorText = "draft prompt";
-		expect(stripAnsi(getLabel())).toBe("test-model • high");
+		expect(stripAnsi(getLabel())).toBe("");
 
 		editorText = " ";
-		expect(stripAnsi(getLabel())).toBe("test-model • high");
+		expect(stripAnsi(getLabel())).toBe("");
 
 		editorText = "";
-		expect(stripAnsi(getLabel())).toBe("test-model • high  ? for shortcuts");
+		expect(stripAnsi(getLabel())).toBe("");
 	});
 
 	it("hides the tray shortcut guidance for chats with history", () => {
 		const mode = createMode(1);
 		const label = Reflect.get(InteractiveMode.prototype, "getTrayLocationLabel").call(mode);
 
-		expect(stripAnsi(label)).toBe("test-model • high");
+		// U6 ①: navigation only — nothing renders for a plain session.
+		expect(stripAnsi(label)).toBe("");
 	});
 
 	it("keeps the question-mark shortcut guide compact", () => {

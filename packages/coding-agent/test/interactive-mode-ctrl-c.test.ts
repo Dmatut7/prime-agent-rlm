@@ -220,7 +220,8 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		await vi.advanceTimersByTimeAsync(2000);
 
 		expect(Reflect.get(InteractiveMode.prototype, "getTrayOverrideLabel").call(mode)).toBeUndefined();
-		expect(mode.subagentSummaryLine.invalidate).toHaveBeenCalled();
+		// U6: the override label rides the uncached tray info line; a frame
+		// request repaints it (no summary-line cache to drop).
 		expect(mode.ui.requestRender).toHaveBeenCalled();
 	});
 

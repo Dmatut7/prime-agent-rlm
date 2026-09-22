@@ -78,7 +78,6 @@ type FastCommandContext = {
 type FastInteractiveModePrototype = {
 	currentModelSupportsFastMode(this: FastCommandContext): boolean;
 	handleFastCommand(this: FastCommandContext): void;
-	getModelTrayLabel(this: FastCommandContext): string;
 };
 
 const fastInteractiveModePrototype = InteractiveMode.prototype as unknown as FastInteractiveModePrototype;
@@ -364,7 +363,6 @@ describe("InteractiveMode /effort", () => {
 			expect(patch.availableThinkingLevels).toContain("high");
 			expect(setupAutocompleteProvider).toHaveBeenCalledTimes(1);
 			expect(context.footer.invalidate).toHaveBeenCalled();
-			expect(context.subagentSummaryLine.invalidate).toHaveBeenCalled();
 			expect(context.updateEditorBorderColor).toHaveBeenCalled();
 		});
 
@@ -446,7 +444,6 @@ describe("InteractiveMode /effort", () => {
 			expect(context.agentConnection.setServiceTier).toHaveBeenCalledWith("priority");
 			expect(context.patchConnectionState).toHaveBeenCalledWith({ serviceTier: "priority" });
 			expect(context.footer.invalidate).toHaveBeenCalledWith();
-			expect(context.subagentSummaryLine.invalidate).toHaveBeenCalledWith();
 		});
 
 		it("disables Fast mode when it is already enabled", async () => {
@@ -553,13 +550,6 @@ describe("InteractiveMode /effort", () => {
 			expect(context.showStatus).toHaveBeenCalledWith(
 				"Fast mode requires GPT-5.4, GPT-5.5, or GPT-5.6 with ChatGPT or OpenAI API key authentication",
 			);
-		});
-
-		it("shows Fast mode beside the model and effort level", () => {
-			const context = makeFastContext();
-			context.connectionState = { sessionId: "session-1", serviceTier: "priority", thinkingLevel: "high" };
-
-			expect(fastInteractiveModePrototype.getModelTrayLabel.call(context)).toBe("gpt-5.5 • high • fast");
 		});
 	});
 });

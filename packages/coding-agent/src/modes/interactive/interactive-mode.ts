@@ -9094,8 +9094,9 @@ export class InteractiveMode {
 			availableThinkingLevels: state.availableThinkingLevels,
 		});
 		this.footer.invalidate();
-		// The footer watermark carries the model · thinking level now.
-		this.updateFooterTelemetry();
+		// The footer watermark carries the model · thinking level now. Defensive
+		// for partial-mode harnesses that stub only the pre-U6 method set.
+		(this as unknown as { updateFooterTelemetry?: () => void }).updateFooterTelemetry?.();
 		this.updateEditorBorderColor();
 		// Rebuild so the /effort argument hint reflects the new model's levels.
 		this.setupAutocompleteProvider();

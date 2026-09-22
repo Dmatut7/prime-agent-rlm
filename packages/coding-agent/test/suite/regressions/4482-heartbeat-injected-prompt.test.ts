@@ -496,7 +496,8 @@ describe("ENG-4482 heartbeat injected prompt UI", () => {
 		expect(collapsed).toContain("♥");
 		expect(collapsed).toContain("Heartbeat prompt");
 		expect(collapsed).toContain("every 5m");
-		expect(collapsed).toContain("展开");
+		// U6: no per-line expand hint — the global tail line owns the keys.
+		expect(collapsed).not.toContain("展开");
 		expect(collapsed).not.toContain("Check whether the long-running task needs another step.");
 
 		component.setExpanded(true);

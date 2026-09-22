@@ -125,15 +125,15 @@ describe("IPythonCellComponent diff rendering", () => {
 
 		const hidden = renderCell({ ...state, editDiffsExpanded: false }).split("\n");
 		const hiddenSummary = hidden.find((l) => l.includes("╰─ a.ts"));
-		expect(hiddenSummary).toMatch(/^ {4}╰─ a\.ts \+1 -1 · .*展开\)$/);
+		expect(hiddenSummary).toBe("    ╰─ a.ts +1 -1");
 
 		const notLatest = renderCell({ ...state, editDiffsExpanded: false, showExpandHint: false }).split("\n");
-		expect(notLatest.find((l) => l.includes("╰─ a.ts"))).toMatch(/展开\)$/);
+		expect(notLatest.find((l) => l.includes("╰─ a.ts"))).toBe("    ╰─ a.ts +1 -1");
 		expect(hidden.some((l) => /1 - .*x/.test(l))).toBe(false);
 
 		const shown = renderCell({ ...state, editDiffsExpanded: true }).split("\n");
 		const summary = shown.find((l) => l.includes("╰─ a.ts"));
-		expect(summary).toMatch(/^ {4}╰─ a\.ts \+1 -1 · .*收起\)$/);
+		expect(summary).toBe("    ╰─ a.ts +1 -1");
 		const textColumn = (summary ?? "").indexOf("a.ts");
 		const removed = shown.find((l) => /1 - .*x/.test(l));
 		const added = shown.find((l) => /1 \+ .*X/.test(l));
@@ -230,7 +230,7 @@ describe("IPythonCellComponent diff rendering", () => {
 		expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
 		const summary = lines.map(stripAnsi).find((line) => line.includes("…"));
 		expect(summary).toBeDefined();
-		expect(summary).toMatch(/\+1 -1 · /);
+		expect(summary).toMatch(/\+1 -1$/);
 	});
 
 	it("advertises the collapse key once per cell when diffs are expanded", () => {
@@ -249,9 +249,10 @@ describe("IPythonCellComponent diff rendering", () => {
 			editDiffsExpanded: true,
 		}).render(120);
 		const plain = lines.map(stripAnsi);
+		// U6: no per-line collapse key hints — the latest diff row carries no
+		// hint, same as the rest.
 		const hinted = plain.filter((line) => line.includes("收起") && /[+]\d+ -\d+/.test(line));
-		expect(hinted).toHaveLength(1);
-		expect(hinted[0]).toContain("b.ts");
+		expect(hinted).toHaveLength(0);
 	});
 
 	it("never overflows a narrow pane when expanded diffs render", () => {
@@ -311,7 +312,7 @@ describe("IPythonCellComponent diff rendering", () => {
 			expanded: true,
 			editDiffsExpanded: true,
 		}).split("\n");
-		expect(out[0]).toContain("收起");
+		expect(out[0]).not.toContain("收起");
 		expect(out[1].trim()).toBe("");
 		expect(out[2]).toContain("await edit(...)");
 		expect(out.findIndex((line) => line.includes("a.ts"))).toBeGreaterThan(2);
@@ -326,7 +327,8 @@ describe("IPythonCellComponent diff rendering", () => {
 			expanded: false,
 		});
 		expect(collapsed).toContain("╰─ big.py +1 -1");
-		expect(collapsed).toContain("展开");
+		// U6: no per-line expand hint.
+		expect(collapsed).not.toContain("展开");
 		expect(collapsed).not.toContain("old");
 		expect(collapsed).not.toContain("NEW");
 	});
@@ -360,7 +362,7 @@ describe("IPythonCellComponent diff rendering", () => {
 			expanded: false,
 		});
 		expect(collapsed.split("\n")).toHaveLength(1);
-		expect(collapsed).toContain("展开");
+		expect(collapsed).not.toContain("展开");
 		expect(collapsed).not.toContain("world");
 	});
 
@@ -396,8 +398,8 @@ describe("IPythonCellComponent diff rendering", () => {
 		const collapsed = new IPythonCellComponent({ ...state, expanded: false }).render(80);
 		const expanded = new IPythonCellComponent({ ...state, expanded: true }).render(80);
 
-		expect(stripAnsi(collapsed[0])).toMatch(/^ ✓ python · .* · ↑ 1 ↓ 1 lines · 780\.0s · \(.*展开\)$/);
-		expect(stripAnsi(expanded[0])).toMatch(/^ ✓ python · .* · ↑ 1 ↓ 1 lines · 780\.0s · \(.*收起\)$/);
+		expect(stripAnsi(collapsed[0])).toMatch(/^ ✓ python · .* · ↑ 1 ↓ 1 lines · 780\.0s$/);
+		expect(stripAnsi(expanded[0])).toMatch(/^ ✓ python · .* · ↑ 1 ↓ 1 lines · 780\.0s$/);
 		const upToHint = (line: string) => stripAnsi(line).replace(/· \([^·]*(展开|收起)\)$/, "");
 		expect(upToHint(expanded[0])).toBe(upToHint(collapsed[0]));
 
