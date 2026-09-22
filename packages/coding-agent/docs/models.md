@@ -40,6 +40,32 @@ Some OpenAI-compatible servers do not understand the `developer` role used for r
 
 You can set `compat` at the provider level to apply to all models, or at the model level to override a specific model. This commonly applies to Ollama, vLLM, SGLang, and similar OpenAI-compatible servers.
 
+#### `compat.toolStream` (required for Bailian GLM models)
+
+Some OpenAI-compatible gateways stream tool-call arguments in fragments (`tool_stream`). Bailian's GLM-5.3 family does this by default, and on long contexts the fragments accumulate into corrupted tool calls: garbled tool names ("Tool ipythyscheduler not found"), empty arguments, and self-amplifying retry storms. Set `compat.toolStream: false` on every Bailian GLM model entry so tool calls ship as complete JSON:
+
+```json
+{
+  "providers": {
+    "bailian": {
+      "baseUrl": "https://.../compatible-mode/v1",
+      "api": "openai-completions",
+      "apiKey": "...",
+      "models": [
+        {
+          "id": "glm-5.3-prime",
+          "contextWindow": 1048576,
+          "maxTokens": 131072,
+          "compat": { "toolStream": false }
+        }
+      ]
+    }
+  }
+}
+```
+
+Without this key the provider default applies and GLM tool calls degrade on long sessions; a repo test (`openai-completions-bailian-glm-toolstream.test.ts`) pins the payload so regressions surface immediately.
+
 ```json
 {
   "providers": {

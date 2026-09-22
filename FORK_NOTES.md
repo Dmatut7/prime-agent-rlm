@@ -472,3 +472,9 @@ fork 工作文档统一搬入 `docs/fork/`：审计总账 `audit-findings.md`、
 - GLM 修复双激活：toolStream=false 关工具分片流坏调用＋思考 token 不再被 32K 夹死；新增探针测试钉死生产配置。
 - 吸收上游 43 笔计划：实拾 30 笔，8 笔实测 fork 已在场、2 笔按当年合并裁定跳过（机制成死码）；每笔独立可回滚，六次合流全零冲突、六道闸全绿。
 - 修了 imageModel 设置误报、上游测试带来的 10 处私有探针已全部带理由登记。
+
+## 2026-09-22 GLM 坏调用根治的用户侧迁移说明
+
+- 根因（已修代码侧 cc4a17379）：百炼 GLM 家族默认 tool_stream 分片流，长上下文分片累积成乱码工具名＋空参数（实测修复前 269 条坏调用，82% 来自 GLM 两模；修复后 6304 次调用仅 4 条边缘形态）。
+- **用户必配**：`~/.prime/agent/models.json` 里每枚 Bailian GLM 条目加 `"compat": { "toolStream": false }`——拉新版不配此键，坏调用依旧（网关默认仍开分片）。文档已进 packages/coding-agent/docs/models.md（compat.toolStream 节，含配置示例与探针测试说明），发版 fragment 已落（glm-toolstream-migration-note.md）。
+- 探针测试 openai-completions-bailian-glm-toolstream.test.ts 钉死 payload `tool_stream===false`（含生产 models.json 实读断言，防配置漂移）。
