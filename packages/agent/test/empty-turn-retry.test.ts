@@ -322,6 +322,88 @@ describe("empty-turn retry escalated slow tier", () => {
 		expect(details.terminatedBy).toBe("attempts");
 	});
 
+	it("the base never pierces the cap: a single slow wait stays under the configured max", async () => {
+		const { streamFn, calls, gapsMs } = emptyStreamFn();
+
+		const { assistant } = await run(
+			{
+				emptyTurnRetry: {
+					maxAttempts: 1,
+					escalatedAttempts: 2,
+					// The reviewer's probe shape: base 400 above cap 50 must not
+					// resolve to a 400ms wait.
+					escalatedBaseDelayMs: 400,
+					escalatedMaxDelayMs: 50,
+				},
+			},
+			streamFn,
+		);
+
+		expect(calls()).toBe(3); // 1 fast + 2 slow
+		const gaps = gapsMs();
+		expect(gaps).toHaveLength(2);
+		for (const gap of gaps) {
+			expect(gap).toBeLessThanOrEqual(60); // 50ms cap plus scheduler slack
+		}
+		const details = emptyExhaustionDiagnostic(assistant);
+		expect(details.terminatedBy).toBe("attempts");
+	});
+
+	it("the loop-side clamp bounds base and cap together below the host's silence threshold", async () => {
+		const { streamFn, calls, gapsMs } = emptyStreamFn();
+
+		const { assistant } = await run(
+			{
+				emptyTurnRetry: {
+					maxAttempts: 1,
+					escalatedAttempts: 2,
+					escalatedBaseDelayMs: 400,
+					escalatedMaxDelayMs: 50,
+					// What a host derives from a 46ms warn threshold: 45ms with headroom.
+					escalatedMaxDelayClampMs: 45,
+				},
+			},
+			streamFn,
+		);
+
+		expect(calls()).toBe(3);
+		for (const gap of gapsMs()) {
+			expect(gap).toBeLessThanOrEqual(55); // the 45ms clamp plus scheduler slack
+		}
+		const details = emptyExhaustionDiagnostic(assistant);
+		expect(details.terminatedBy).toBe("attempts");
+	});
+
+	it("the slow tier's own budget is distinguishable from the fast tier's total budget", async () => {
+		const { streamFn, calls } = emptyStreamFn();
+
+		const { assistant } = await run(
+			{
+				emptyTurnRetry: {
+					maxAttempts: 2,
+					baseDelayMs: 5,
+					maxDelayMs: 5,
+					// The fast tier's total wait budget is spent after one gap; if the
+					// slow tier read the same pool, the chain would stop right there.
+					maxTotalDelayMs: 5,
+					escalatedAttempts: 2,
+					escalatedBaseDelayMs: 20,
+					escalatedMaxDelayMs: 80,
+					escalatedMaxTotalDelayMs: 5000,
+				},
+			},
+			streamFn,
+		);
+
+		// 2 fast attempts, then the slow tier spends its own (large) budget.
+		expect(calls()).toBe(4);
+		const details = emptyExhaustionDiagnostic(assistant);
+		expect(details.terminatedBy).toBe("attempts");
+		expect(details.escalatedAttempts).toBe(2);
+		expect(details.fastWaitedMs).toBe(5);
+		expect(details.escalatedWaitedMs).toBe(60);
+	});
+
 	it("a run abort during a slow-tier wait settles the run immediately", async () => {
 		const { streamFn, calls } = emptyStreamFn();
 		const controller = new AbortController();

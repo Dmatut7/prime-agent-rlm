@@ -66,9 +66,11 @@ export const TOOL_TIMEOUT_CAUSE_PREFIX = "tool_timeout:";
 
 /** Cause text for a tool call cancelled by the per-call deadline; carried on the scoped abort signal. */
 export function formatToolTimeoutAbortCause(toolName: string, elapsedMs: number, timeoutMs: number): string {
+	// Milliseconds, not rounded seconds: per-tool budgets can be far below one
+	// second, and "for 0s (per-call budget 0s)" would say nothing.
 	return (
-		`${TOOL_TIMEOUT_CAUSE_PREFIX} ${toolName} produced no settled result for ${Math.round(elapsedMs / 1000)}s ` +
-		`(per-call budget ${Math.round(timeoutMs / 1000)}s) with no progress evidence, so this call was cancelled - the turn was not. ` +
+		`${TOOL_TIMEOUT_CAUSE_PREFIX} ${toolName} produced no settled result for ${Math.round(elapsedMs)}ms ` +
+		`(per-call budget ${Math.round(timeoutMs)}ms) with no progress evidence, so this call was cancelled - the turn was not. ` +
 		"Do not repeat the identical call. Change approach instead: shrink the input, bound the command with its own timeout, " +
 		"run it as a background job and poll, or check its current state first."
 	);
@@ -95,6 +97,10 @@ const TOOL_TIMEOUT_HARVEST_LABELS = {
 function resolveToolTimeoutMs(tool: AgentTool<any>, config?: AgentLoopConfig): number | undefined {
 	const fallback = config?.toolTimeout?.afterMs;
 	if (typeof fallback !== "number" || fallback <= 0) return undefined;
+	// Operator-side budgets outrank the tool author's own declaration; both rank
+	// above the shared default, and 0 keeps its "this tool never times out" meaning.
+	const operatorBudget = config?.toolTimeout?.perTool?.[tool.name];
+	if (typeof operatorBudget === "number") return operatorBudget > 0 ? operatorBudget : undefined;
 	const perTool = tool.executionTimeoutMs;
 	if (typeof perTool === "number") return perTool > 0 ? perTool : undefined; // 0 = this tool never times out
 	return fallback;
@@ -850,14 +856,28 @@ function resolveEmptyTurnRetryPolicy(options?: EmptyTurnRetryConfig): {
 		0,
 		Math.floor(options?.escalatedAttempts ?? ESCALATED_EMPTY_TURN_RETRY_DEFAULTS.escalatedAttempts),
 	);
-	const escalatedBaseDelayMs = Math.max(
+	const escalatedClampMs =
+		typeof options?.escalatedMaxDelayClampMs === "number" && options.escalatedMaxDelayClampMs > 0
+			? options.escalatedMaxDelayClampMs
+			: undefined;
+	let escalatedBaseDelayMs = Math.max(
 		0,
 		options?.escalatedBaseDelayMs ?? ESCALATED_EMPTY_TURN_RETRY_DEFAULTS.escalatedBaseDelayMs,
 	);
-	const escalatedMaxDelayMs = Math.max(
-		escalatedBaseDelayMs,
+	let escalatedMaxDelayMs = Math.max(
+		0,
 		options?.escalatedMaxDelayMs ?? ESCALATED_EMPTY_TURN_RETRY_DEFAULTS.escalatedMaxDelayMs,
 	);
+	// The single-wait invariant lives here, not in any one host: a planned slow-tier
+	// wait must stay under the caller's silence-watchdog threshold, so the clamp
+	// bounds both the base and the cap - a base above the cap would pierce both.
+	if (escalatedClampMs !== undefined) {
+		escalatedBaseDelayMs = Math.min(escalatedBaseDelayMs, escalatedClampMs);
+		escalatedMaxDelayMs = Math.min(escalatedMaxDelayMs, escalatedClampMs);
+	}
+	// The cap is the cap: clamping the base to it keeps the first slow wait (which is
+	// the base) from breaking a configured cap that sits below the base.
+	escalatedBaseDelayMs = Math.min(escalatedBaseDelayMs, escalatedMaxDelayMs);
 	const escalatedMaxTotalDelayMs = Math.max(
 		0,
 		options?.escalatedMaxTotalDelayMs ?? ESCALATED_EMPTY_TURN_RETRY_DEFAULTS.escalatedMaxTotalDelayMs,
@@ -1733,7 +1753,11 @@ async function executePreparedToolCall(
 			try {
 				verdict = config?.toolTimeout?.vouch?.(info);
 			} catch {
-				verdict = undefined; // a throwing arbiter fails towards cancelling the call
+				// K3 asymmetry: the watchdog's own predicate failing fails towards
+				// killing (deadlock defense); the deadline's arbiter failing fails
+				// towards NOT killing (a broken judge must not execute the sentence).
+				// The turn-level watchdog still guards the call.
+				verdict = { action: "extend", recheckMs: timeoutMs! };
 			}
 			if (verdict?.action === "extend") {
 				armToolTimeout(Math.max(0, verdict.recheckMs));
@@ -1792,6 +1816,10 @@ async function executePreparedToolCall(
 		}
 		return { result, isError: false };
 	} catch (error) {
+		// The operation settled by failing: a deadline timer that fires during the
+		// flush below must not rewrite a real tool error into a deadline cancellation
+		// (the operation is not "in flight" any more, whatever the race said).
+		operationSettled = true;
 		acceptingUpdates = false;
 		await raceWithAbort(
 			Promise.all(updateEvents).then(() => undefined),

@@ -333,6 +333,14 @@ export interface EmptyTurnRetryConfig {
 	 * against `stallWatchdog.warnAfterSeconds` for that reason.
 	 */
 	escalatedMaxDelayMs?: number;
+	/**
+	 * Hard ceiling the loop clamps BOTH the slow tier's base and cap to, so neither
+	 * can pierce the single-wait invariant - including callers that never pass
+	 * through a settings manager (SDK construction, tests, other hosts). Hosts that
+	 * run a silence watchdog derive this from their warn threshold minus
+	 * time-to-first-event headroom; unset means no loop-side clamp.
+	 */
+	escalatedMaxDelayClampMs?: number;
 	/** Upper bound for the summed slow-tier waits of one turn, in ms. */
 	escalatedMaxTotalDelayMs?: number;
 }
@@ -368,9 +376,18 @@ export interface ToolTimeoutConfig {
 	/** Default wall-clock budget for one tool call, in ms. `0` disables the deadline. */
 	afterMs?: number;
 	/**
+	 * Operator-side per-tool budgets, keyed by tool name, in ms. An entry overrides
+	 * the tool's own `executionTimeoutMs` and the shared default; `0` exempts that
+	 * one tool from the deadline entirely. Only consulted while the loop-level
+	 * deadline is armed, so the global handles stay the master switches.
+	 */
+	perTool?: Record<string, number>;
+	/**
 	 * Host-side adjudication when the deadline fires: the single place that can
 	 * extend a deadline (progress evidence) or let it stand. Returning `undefined`
-	 * or throwing both mean "let the deadline stand".
+	 * means "let the deadline stand"; a throwing callback is treated the opposite
+	 * way - as an extension - because a failing judge must not execute the
+	 * sentence (K3 asymmetry; the turn-level watchdog still guards the call).
 	 */
 	vouch?: (info: ToolTimeoutVouchInfo) => ToolTimeoutVerdict | undefined;
 }

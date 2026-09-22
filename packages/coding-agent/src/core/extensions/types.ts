@@ -458,6 +458,14 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	 */
 	executionMode?: ToolExecutionMode;
 
+	/**
+	 * Per-call wall-clock budget this tool asks the agent loop to enforce, in ms
+	 * (see `AgentTool.executionTimeoutMs` in pi-agent-core). `0` opts this tool out
+	 * of the deadline; only consulted while the loop-level deadline is armed
+	 * (`tools.timeout`), so the global handles stay the master switches.
+	 */
+	executionTimeoutMs?: number;
+
 	/** Execute the tool. */
 	execute(
 		toolCallId: string,

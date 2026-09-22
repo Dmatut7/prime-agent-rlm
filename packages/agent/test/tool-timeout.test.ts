@@ -102,13 +102,20 @@ function toolResultOf(messages: AgentMessage[]): Extract<AgentMessage, { role: "
  * shape: the first stream answers with tool calls, the second sees the tool result
  * and finishes the turn. The number of stream calls is the "turn continued" receipt.
  */
-async function runToolTurn(options: {
+interface ToolTurnOptions {
 	tools: AgentTool<any>[];
 	toolCalls: Array<{ id: string; name: string }>;
 	config?: Partial<AgentLoopConfig>;
 	signal?: AbortSignal;
-	onEvent?: (event: AgentEvent) => void;
-}): Promise<{ messages: AgentMessage[]; events: AgentEvent[]; streamCalls: () => number }> {
+	/** Async observers hold the loop's update flush open, which races the deadline timer. */
+	onEvent?: (event: AgentEvent) => void | Promise<void>;
+}
+
+async function runToolTurn(options: ToolTurnOptions): Promise<{
+	messages: AgentMessage[];
+	events: AgentEvent[];
+	streamCalls: () => number;
+}> {
 	const context: AgentContext = { systemPrompt: "You are helpful.", messages: [], tools: options.tools };
 	const config: AgentLoopConfig = {
 		model: createModel(),
@@ -143,9 +150,10 @@ async function runToolTurn(options: {
 		[createUserMessage("Hello")],
 		context,
 		config,
-		(event) => {
+		// Async so a slow observer in a test can hold the loop's update flush open.
+		async (event) => {
 			events.push(event);
-			options.onEvent?.(event);
+			await options.onEvent?.(event);
 		},
 		options.signal,
 		streamFn,
@@ -227,7 +235,11 @@ describe("per-tool-call deadline", () => {
 
 		const toolResult = toolResultOf(messages);
 		expect(textOf(toolResult)).toContain(TOOL_ABORT_FALLBACK_MESSAGE);
+		expect(textOf(toolResult)).toContain("Abort cause: stall watchdog");
 		expect(textOf(toolResult)).not.toContain(TOOL_TIMEOUT_CAUSE_PREFIX);
+		// The deadline's own wording is a superset of the abort stub, so the stub
+		// alone cannot tell the two producers apart: the distinctive parts must.
+		expect(textOf(toolResult)).not.toContain("per-call deadline");
 	});
 
 	it("an extension buys exactly one window: the next fire re-asks and fails", async () => {
@@ -251,18 +263,21 @@ describe("per-tool-call deadline", () => {
 		expect(first.elapsedMs).toBeGreaterThanOrEqual(20);
 	});
 
-	it("a throwing vouch fails towards cancelling the call", async () => {
+	it("a throwing vouch defers instead of cancelling (the judge must not execute the sentence)", async () => {
 		const vouch = () => {
 			throw new Error("arbiter unavailable");
 		};
+		// The tool settles well after the deadline: only the throwing arbiter's
+		// extension keeps the call alive to complete.
 		const { messages } = await runToolTurn({
-			tools: [hangTool()],
-			toolCalls: [{ id: "tool_1", name: "hang" }],
+			tools: [slowTool(150)],
+			toolCalls: [{ id: "tool_1", name: "slow" }],
 			config: { toolTimeout: { afterMs: 25, vouch } },
 		});
 		const toolResult = toolResultOf(messages);
-		expect(toolResult.isError).toBe(true);
-		expect(textOf(toolResult)).toContain(TOOL_TIMEOUT_CAUSE_PREFIX);
+		expect(toolResult.isError).toBe(false);
+		expect(textOf(toolResult)).toContain("late partial output");
+		expect(textOf(toolResult)).not.toContain(TOOL_TIMEOUT_CAUSE_PREFIX);
 	});
 
 	it("afterMs 0 arms no deadline (the rollback handle)", async () => {
@@ -329,6 +344,91 @@ describe("per-tool-call deadline", () => {
 		// The batch kept going: the run-level signal never aborted, so the next call ran.
 		expect(second.isError).toBe(false);
 		expect(textOf(second)).toContain("follow-up ran");
+	});
+
+	it("a real tool error is not rewritten into a deadline cancellation (same-frame double trigger)", async () => {
+		// The tool settles by failing; a slow update flush keeps the catch inside the
+		// function when the deadline timer fires. The settled failure must win: its
+		// error text is the result, not the deadline's "produced no settled result".
+		const tool: AgentTool<any> = {
+			name: "failing",
+			label: "Failing",
+			description: "Emits an update then fails",
+			parameters: toolSchema,
+			execute: async (_id, _args, _signal, onUpdate) => {
+				onUpdate?.({ content: [{ type: "text", text: "partial" }], details: {} });
+				await new Promise((resolve) => setTimeout(resolve, 5));
+				throw new Error("real tool failure");
+			},
+		};
+		const { messages, streamCalls } = await runToolTurn({
+			tools: [tool],
+			toolCalls: [{ id: "tool_1", name: "failing" }],
+			config: { toolTimeout: { afterMs: 40 } },
+			// Slow event delivery keeps the update flush pending past the deadline.
+			onEvent: async (event) => {
+				if (event.type === "tool_execution_update") {
+					await new Promise((resolve) => setTimeout(resolve, 120));
+				}
+			},
+		});
+		const toolResult = toolResultOf(messages);
+		expect(toolResult.isError).toBe(true);
+		expect(textOf(toolResult)).toContain("real tool failure");
+		expect(textOf(toolResult)).not.toContain(TOOL_TIMEOUT_CAUSE_PREFIX);
+		expect(streamCalls()).toBe(2);
+	});
+
+	it("the tool itself receives the deadline's abort signal with the timeout cause", async () => {
+		let observedReason: string | undefined;
+		const tool: AgentTool<any> = {
+			name: "observing",
+			label: "Observing",
+			description: "Records the abort reason",
+			parameters: toolSchema,
+			execute: (_id, _args, signal) => {
+				signal?.addEventListener("abort", () => {
+					observedReason = String(signal.reason);
+				});
+				return new Promise<AgentToolResult<Record<string, unknown>>>(() => {});
+			},
+		};
+		await runToolTurn({
+			tools: [tool],
+			toolCalls: [{ id: "tool_1", name: "observing" }],
+			config: { toolTimeout: { afterMs: 25 } },
+		});
+		// The tool saw the cancellation itself (so it can interrupt its own
+		// subprocess), and the reason carries the machine-greppable cause.
+		expect(observedReason).toBeDefined();
+		expect(observedReason).toContain(TOOL_TIMEOUT_CAUSE_PREFIX);
+		expect(observedReason).toContain("observing");
+	});
+
+	it("an operator perTool budget outranks the tool's own declaration", async () => {
+		const quicker = { ...slowTool(90, "budgeted"), executionTimeoutMs: 5_000 };
+		const { messages } = await runToolTurn({
+			tools: [quicker],
+			toolCalls: [{ id: "tool_1", name: "budgeted" }],
+			config: { toolTimeout: { afterMs: 60_000, perTool: { budgeted: 20 } } },
+		});
+		const toolResult = toolResultOf(messages);
+		expect(toolResult.isError).toBe(true);
+		expect(textOf(toolResult)).toContain(TOOL_TIMEOUT_CAUSE_PREFIX);
+		// The budget the deadline enforced was the operator's, not the tool's.
+		expect(textOf(toolResult)).toContain("per-call budget 20ms");
+	});
+
+	it("an operator perTool 0 exempts one tool while the shared deadline stays armed", async () => {
+		const exempt = { ...slowTool(90, "exempt"), executionTimeoutMs: 20 };
+		const { messages } = await runToolTurn({
+			tools: [exempt],
+			toolCalls: [{ id: "tool_1", name: "exempt" }],
+			config: { toolTimeout: { afterMs: 60_000, perTool: { exempt: 0 } } },
+		});
+		const toolResult = toolResultOf(messages);
+		expect(toolResult.isError).toBe(false);
+		expect(textOf(toolResult)).toContain("late partial output");
 	});
 
 	it("clears the deadline timer when the call settles (no per-call timer leak)", async () => {

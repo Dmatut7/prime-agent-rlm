@@ -45,6 +45,7 @@ import {
 	ASYNC_BASH_COMPLETION_CUSTOM_TYPE,
 	COMPACTION_OUTCOME_CUSTOM_TYPE,
 	type CustomMessage,
+	EMPTY_RESPONSE_RECOVERY_CUSTOM_TYPE,
 	HARNESS_DIGEST_CUSTOM_TYPE,
 	HEARTBEAT_PROMPT_CUSTOM_TYPE,
 	IMAGE_DELIVERY_SUSPICION_CUSTOM_TYPE,
@@ -152,6 +153,9 @@ const CUSTOM_TYPE_INPUT_CLASSES: ReadonlyMap<string, InputClass> = new Map<strin
 	[REFINEMENT_OUTCOME_CUSTOM_TYPE, "internal_continuation"],
 	[REFINEMENT_NOTICE_CUSTOM_TYPE, "internal_continuation"],
 	[REFINEMENT_CUSTOM_TYPE, "internal_continuation"],
+	// One-shot recovery continuation for an exhausted empty-response ladder: machine
+	// bookkeeping that wakes the session, never a human turn.
+	[EMPTY_RESPONSE_RECOVERY_CUSTOM_TYPE, "internal_continuation"],
 	// Harness bookkeeping receipts.
 	[THINKING_LEVEL_CLAMPED_CUSTOM_TYPE, "internal_continuation"],
 	[IMAGE_DELIVERY_SUSPICION_CUSTOM_TYPE, "internal_continuation"],

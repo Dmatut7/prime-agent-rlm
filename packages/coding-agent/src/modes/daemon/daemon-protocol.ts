@@ -263,8 +263,14 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 //   rev 38, so an old client is unaffected; the capability is what refuses a new client
 //   against a rev-38 peer, because that peer forwards the field without enforcing the
 //   nuclear-family reach the field promises.
+// The empty_response_exhausted session event (r4 recovery: an exhausted empty-response
+//   retry ladder reported with its real attempt counts) rides this revision as a
+//   compatible addition: it is a new member of the session_event payload union, old
+//   clients have no case for the type and already ignore unknown ones, and no command,
+//   capability, or response shape changes with it, so no revision bump and no
+//   capability gate - only the digest recomputation that covers the union growth.
 export const DAEMON_SCHEMA_REVISION = 39;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-39-24bfa75bec24";
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-39-192b0a5ab17a";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
