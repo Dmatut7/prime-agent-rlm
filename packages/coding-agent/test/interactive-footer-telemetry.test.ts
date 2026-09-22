@@ -203,6 +203,35 @@ describe("footer telemetry watermark (U6)", () => {
 		expect(off).toContain("950k/1M");
 	});
 
+	it("drops the bar before the figures; the warning never stands alone (F8, DS2)", () => {
+		const footer = new FooterComponent(provider);
+		// A 43-character model name at the 80-column floor: the full form
+		// overflows, and the ladder keeps the figures (numbers) while dropping
+		// the bar - never bar-without-numbers.
+		footer.setTelemetrySource(() => ({
+			mode: "on",
+			snapshot: {
+				modelName: "anthropic/claude-3-7-sonnet-20250219-x-max-ffn",
+				thinkingLevel: "max",
+				contextTokens: 850_000,
+				contextWindow: 1_048_576,
+				compactionThresholdTokens: 800_000,
+			},
+		}));
+		const line = footerLine(footer, 84);
+		expect(line).toContain("850k/1M · 81%");
+		expect(line).toContain("压缩在即");
+		expect(line).not.toContain("●");
+		expect(line).not.toContain("│");
+
+		// Narrower still: the model alone - no 压缩在即 and no figures at all
+		// (the model id's digits are not usage numbers).
+		const bare = footerLine(footer, 30);
+		expect(bare).not.toContain("压缩在即");
+		expect(bare).not.toContain("%");
+		expect(bare).not.toContain("/1M");
+	});
+
 	it("never renders a 1000k figure next to a 1M window (F6, DS2)", () => {
 		const footer = new FooterComponent(provider);
 		footer.setTelemetrySource(() => ({ mode: "on", snapshot: { ...SNAPSHOT, contextTokens: 999_600 } }));

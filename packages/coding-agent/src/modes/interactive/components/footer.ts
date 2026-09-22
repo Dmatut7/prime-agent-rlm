@@ -186,25 +186,25 @@ export class FooterComponent implements Component {
 				? watermarkBar(tokens, windowTokens, threshold, imminent)
 				: "";
 
-		// Degradation ladder, richest first: bar and figures, bar only, figures only,
-		// model alone. A truncated figure would read as a wrong number, so segments
-		// drop whole instead of ellipsizing.
+		// Degradation ladder, richest first (F8, DS2 review): full form, then
+		// the figures WITHOUT the bar, then the model alone. The bar is the
+		// decoration - it drops before the numbers, never after; and the
+		// 压缩在即 tail only renders with the figures beside it, so a warning
+		// never stands without the numbers that justify it. A truncated figure
+		// would read as a wrong number, so segments drop whole.
 		const candidates = [
 			`${model}${bar ? `${GROUP_GAP}${bar}` : ""}${figures ? `${GROUP_GAP}${figures}` : ""}${tail}`,
 		];
-		if (bar) {
-			candidates.push(`${model}${GROUP_GAP}${bar}${tail}`);
-		}
 		if (figures) {
 			candidates.push(`${model}${GROUP_GAP}${figures}${tail}`);
 		}
-		candidates.push(`${model}${tail}`);
+		candidates.push(`${model}`);
 		for (const candidate of candidates) {
 			if (visibleWidth(candidate) <= safeWidth) {
 				return candidate;
 			}
 		}
-		return truncateToWidth(`${model}${tail}`, safeWidth, "");
+		return truncateToWidth(`${model}`, safeWidth, "");
 	}
 
 	/**
