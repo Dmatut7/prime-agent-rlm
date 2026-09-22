@@ -22,7 +22,7 @@ Unknown keys are reported: a misspelled or removed setting (for example `compact
 | `subagentDefaultModel` | string | - | Model selector (`"provider/id"`) used when `rlm.spawn` does not pin a model; unset inherits the parent model |
 | `imageModel` | string | none | Model (`"provider/model-id"` or a bare id) that serves turns attaching images when the session model does not accept image input |
 | `defaultThinkingLevel` | string | `"medium"` | `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` |
-| `hideThinkingBlock` | boolean | `false` | Hide thinking blocks in output |
+| `hideThinkingBlock` | boolean | `false` | Hide thinking traces entirely (the turn's 思考 header still renders; Ctrl+T then shows guidance instead of expanding) |
 | `footer.telemetry` | string | `"on"` | Persistent footer watermark line: `"off"` hides it, `"on"` shows `glm-5.3-prime · max    ──────●───────│──    518k/1M · 49%` (● = context level, │ = auto-compaction notch; reaching the notch brightens it and appends `压缩在即`). Legacy `"compact"`/`"full"` values read as `"on"`. `/usage` stays a one-shot report regardless |
 | `thinkingBudgets` | object | - | Custom token budgets per thinking level |
 

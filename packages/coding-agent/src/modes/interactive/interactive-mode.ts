@@ -8488,8 +8488,14 @@ export class InteractiveMode {
 
 	private toggleThinkingBlockVisibility(): void {
 		// U6 (boss's two-key model): Ctrl+T owns the thinking block — it
-		// expands/collapses the turn's thinking traces. hideThinkingBlock (the
-		// never-show setting) stays reachable from settings, not a key.
+		// expands/collapses the turn's thinking traces. The turn header stays
+		// visible either way; the persisted hideThinkingBlock setting (never
+		// show traces) is no longer bound to the key, and a press while it is
+		// on guides the user to it instead of silently doing nothing (K3 ④).
+		if (this.hideThinkingBlock) {
+			this.showStatus("思考 trace 被 hideThinkingBlock 设置隐藏：关闭该设置后 Ctrl+T 可展开");
+			return;
+		}
 		this.thinkingExpanded = !this.thinkingExpanded;
 		this.applyChatExpansion();
 		this.showStatus(`思考块: ${this.thinkingExpanded ? "展开" : "收起"}`);

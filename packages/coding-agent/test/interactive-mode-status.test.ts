@@ -4732,6 +4732,24 @@ describe("InteractiveMode.setToolsExpanded", () => {
 		expect(setThinkingExpanded).toHaveBeenCalledWith(false);
 	});
 
+	test("Ctrl+T with hideThinkingBlock on guides to the setting instead of flipping (K3 ④)", () => {
+		const assistantChild = new AssistantMessageComponent();
+		const setThinkingExpanded = vi.spyOn(assistantChild, "setThinkingExpanded");
+		const fakeThis = createExpansionFakeThis([assistantChild]);
+		fakeThis.showStatus = vi.fn();
+		fakeThis.hideThinkingBlock = true;
+
+		fakeThis.toggleThinkingBlockVisibility();
+
+		// The lane never flips while the setting hides the traces; the press
+		// tells the user where the switch is. The turn header still renders.
+		expect(fakeThis.thinkingExpanded).toBe(false);
+		expect(setThinkingExpanded).not.toHaveBeenCalled();
+		expect(fakeThis.showStatus).toHaveBeenCalledWith(
+			"思考 trace 被 hideThinkingBlock 设置隐藏：关闭该设置后 Ctrl+T 可展开",
+		);
+	});
+
 	test("Ctrl+T owns the thinking block: only the thinking lane flips", () => {
 		const assistantChild = new AssistantMessageComponent();
 		const setThinkingExpanded = vi.spyOn(assistantChild, "setThinkingExpanded");
