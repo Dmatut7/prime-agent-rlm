@@ -203,6 +203,25 @@ describe("footer telemetry watermark (U6)", () => {
 		expect(off).toContain("950k/1M");
 	});
 
+	it("keeps the notch visible through the whole collision band around the threshold (F3, DS2)", () => {
+		const footer = new FooterComponent(provider);
+		let snapshot: FooterTelemetrySnapshot = { ...SNAPSHOT, contextTokens: 800_000 };
+		footer.setTelemetrySource(() => ({ mode: "on", snapshot }));
+		// Around the threshold (78%-84% with a 0.8 ratio) the level rounds onto
+		// the notch's cell; the notch keeps its cell and the level takes the
+		// next - the crossing stays readable instead of the ● eating the │.
+		for (const tokens of [795_000, 800_000, 805_000, 810_000, 840_000]) {
+			snapshot = { ...SNAPSHOT, contextTokens: tokens };
+			const line = footerLine(footer, 100);
+			expect(line).toContain("│");
+			if (tokens >= 800_000) {
+				expect(line).toContain("压缩在即");
+			} else {
+				expect(line).not.toContain("压缩在即");
+			}
+		}
+	});
+
 	it("pulls the source once per render (评审②: one frame, one value)", () => {
 		const footer = new FooterComponent(provider);
 		const telemetry = makeSource();

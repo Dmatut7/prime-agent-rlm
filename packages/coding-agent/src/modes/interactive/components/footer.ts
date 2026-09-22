@@ -69,12 +69,18 @@ function watermarkBar(tokens: number, windowTokens: number, thresholdTokens: num
 	const cells = WATERMARK_BAR_CELLS;
 	const levelCell = Math.max(0, Math.min(cells - 1, Math.round((tokens / windowTokens) * cells)));
 	const notchCell = Math.max(0, Math.min(cells - 1, Math.round((thresholdTokens / windowTokens) * cells)));
+	// F3 (DS2 review): when the level rounds onto the notch, the NOTCH keeps its
+	// cell and the level marker takes the next one - the notch is the static
+	// scale and must stay readable in the whole band around the threshold, or
+	// the crossing itself is invisible.
+	const notchWins = levelCell === notchCell;
+	const levelAt = notchWins ? Math.min(cells - 1, levelCell + 1) : levelCell;
 	let bar = "";
 	for (let i = 0; i < cells; i++) {
-		if (i === levelCell) {
-			bar += theme.fg("accent", "●");
-		} else if (i === notchCell) {
+		if (i === notchCell) {
 			bar += theme.fg(imminent ? "warning" : "dim", "│");
+		} else if (i === levelAt) {
+			bar += theme.fg("accent", "●");
 		} else {
 			bar += theme.fg("dim", "─");
 		}
