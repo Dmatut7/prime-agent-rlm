@@ -50,7 +50,6 @@ import {
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
-	HARNESS_DIGEST_CUSTOM_TYPE,
 } from "./messages.js";
 import {
 	artifactDirectoryWriteMs,
@@ -944,30 +943,6 @@ export function buildSessionContext(
 		}
 	}
 
-	// Harness digests are regenerable snapshots of persistent state, so only the
-	// newest one belongs in the built context: older digest custom messages are
-	// skipped at assembly time, and a compaction-entry snapshot yields to any
-	// digest appended after the compaction. Persisted entries keep every copy;
-	// the newest digest is authoritative and is re-delivered at cold boundaries.
-	let newestDigestEntryId: string | undefined;
-	let newestDigestIdx = -1;
-	for (let i = path.length - 1; i >= 0; i--) {
-		const entry = path[i];
-		if (entry.type === "custom_message" && entry.customType === HARNESS_DIGEST_CUSTOM_TYPE) {
-			newestDigestEntryId = entry.id;
-			newestDigestIdx = i;
-			break;
-		}
-	}
-
-	const compactionIdx = compaction ? path.findIndex((e) => e.type === "compaction" && e.id === compaction.id) : -1;
-	// True when the compaction snapshot is the newest digest in context, so every
-	// digest custom message is older and skipped entirely.
-	const snapshotOutranksDigest =
-		compaction?.harnessDigest !== undefined && (newestDigestIdx === -1 || newestDigestIdx < compactionIdx);
-	const keepDigestEntryId = snapshotOutranksDigest ? undefined : newestDigestEntryId;
-	const summaryHarnessDigest = newestDigestIdx > compactionIdx ? undefined : compaction?.harnessDigest;
-
 	// Build messages and collect corresponding entries
 	// When there's a compaction, model context remains summary-first while the
 	// summary records where clients should present it among retained messages.
@@ -977,9 +952,6 @@ export function buildSessionContext(
 		if (entry.type === "message") {
 			target.push(entry.message);
 		} else if (entry.type === "custom_message") {
-			if (entry.customType === HARNESS_DIGEST_CUSTOM_TYPE && entry.id !== keepDigestEntryId) {
-				return;
-			}
 			target.push(
 				createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp),
 			);
@@ -989,6 +961,8 @@ export function buildSessionContext(
 	};
 
 	if (compaction) {
+		const compactionIdx = path.findIndex((e) => e.type === "compaction" && e.id === compaction.id);
+
 		// Collect kept messages (before compaction, starting from firstKeptEntryId).
 		// The context remains summary-first for the model; retainedMessageCount records
 		// the exact chronological presentation boundary for clients.
@@ -1011,8 +985,8 @@ export function buildSessionContext(
 				compaction.timestamp,
 				compaction.customInstructions,
 				retainedMessages.length,
-				summaryHarnessDigest,
-				summaryHarnessDigest === undefined ? undefined : compaction.harnessStateFingerprint,
+				compaction.harnessDigest,
+				compaction.harnessStateFingerprint,
 			),
 			...retainedMessages,
 		);
