@@ -13,8 +13,12 @@ import { keyText } from "./keybinding-hints.js";
 /** Bound on stall marker lines so a wedged family cannot push the editor off screen. */
 const MAX_RENDERED_STALL_MARKERS = 3;
 
-/** U6 group gap: four spaces between the line's groups (counts · spend · open hint). */
-const GROUP_GAP = "    ";
+/**
+ * U6 group gap (评审④): two spaces between the line's groups. The full second
+ * line - counts, spend cell with annotations, and the hint - measures 78
+ * columns, so the classic 80-column floor never truncates it.
+ */
+const GROUP_GAP = "  ";
 
 /** Blank space always kept between the spend cell and the open hint. */
 const SPEND_MIN_GAP = 1;

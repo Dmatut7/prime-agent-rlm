@@ -214,6 +214,38 @@ describe("U6 status area layout", () => {
 		expect(line.render(100)).toHaveLength(1);
 	});
 
+	it("keeps the full ③ line inside 80 columns with no truncation fragments (评审④)", () => {
+		const subagents = new SubagentSummaryLine();
+		subagents.setSubagentCounts({ total: 3, running: 1, idle: 0, inactive: 2 });
+		subagents.setSubagentSpend({
+			cost: 961.72,
+			tokens: 592_000_000,
+			parentCost: 273.44,
+			unpriced: [],
+			partial: false,
+		});
+		subagents.setOpenable(true);
+		// The DS-measured 82-column overflow is gone: every group renders at 80.
+		const at80 = stripAnsi(subagents.render(80)[0] ?? "");
+		expect(at80).toContain("运行 1 · 收口 2");
+		expect(at80).toContain("子代理 ¥961.72 · 592M tok ｜ 全部 ¥1235.16");
+		expect(at80).toContain("↓ 选择");
+		expect(at80).not.toContain("…");
+
+		// The degradation ladder is the ③ line's primary constraint (评审④):
+		// every width fits, and money drops whole rungs - never a half figure.
+		for (const width of [100, 80, 72, 56, 40, 30, 12]) {
+			const lines = subagents.render(width).map(stripAnsi);
+			for (const line of lines) {
+				expect(line.length).toBeLessThanOrEqual(width);
+				expect(line).not.toMatch(/¥[0-9]*…/);
+			}
+		}
+		// At a width where the cell no longer fits, it is dropped whole.
+		const tight = stripAnsi(subagents.render(30)[0] ?? "");
+		expect(tight).not.toContain("¥9");
+	});
+
 	it("focused ③ keeps the Enter/→ open affordance without the ↓ hint", () => {
 		const subagents = new SubagentSummaryLine();
 		subagents.setSubagentCounts({ total: 3, running: 1, idle: 0, inactive: 2 });
