@@ -150,6 +150,45 @@ describe("turn activity summary (U4)", () => {
 		expect(nonEmpty[1]).toContain("⚙ 6 步");
 	});
 
+	it("failed steps never fold: the ✗ row stays visible and the aggregate counts it (第五批)", () => {
+		const messages: AgentMessage[] = [
+			{ role: "user", content: "read and validate", timestamp: 900 },
+			assistant(
+				[
+					{ type: "thinking", thinking: "Read the config first." },
+					{ type: "toolCall", id: "read-1", name: "read", arguments: { path: "config.yaml" } },
+				],
+				1_000,
+			),
+			toolResult("read-1", "read", "debug: true", 1_100),
+			assistant(
+				[
+					{ type: "thinking", thinking: "Now the schema." },
+					{ type: "toolCall", id: "read-2", name: "read", arguments: { path: "schema.json" } },
+				],
+				1_200,
+			),
+			{
+				...toolResult("read-2", "read", "FileNotFoundError: schema.json not found", 1_300),
+				isError: true,
+			},
+			assistant([{ type: "text", text: "The schema is missing." }], 1_400),
+		];
+		const collapsed = renderAll(messages, false);
+
+		// The aggregate line alarms on its own: ✗1 beside the step count.
+		expect(collapsed).toContain("⚙ 2 步");
+		expect(collapsed).toContain("✗1");
+		// The failed step's ✗ row keeps its readable error on screen (exactly
+		// as pre-U4); the SUCCESSFUL step folds behind the aggregate line.
+		expect(collapsed).toContain("FileNotFoundError: schema.json not found");
+		expect(collapsed).not.toContain("debug: true");
+
+		// A clean turn reports no ✗ marker.
+		const clean = renderAll([{ role: "user", content: "run the checks", timestamp: 900 }, ...toolHeavyTurn()], false);
+		expect(clean).not.toContain("✗");
+	});
+
 	it("keeps the blank-line wall out: density reads total/non-empty/empty (F2, DS2)", () => {
 		const messages: AgentMessage[] = [{ role: "user", content: "fix the CI reds", timestamp: 900 }];
 		for (let i = 1; i <= 10; i++) {

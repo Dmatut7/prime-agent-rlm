@@ -122,6 +122,22 @@ export class TurnActivityState {
 		return step !== undefined && (step.status === "done" || step.status === "error");
 	}
 
+	/**
+	 * Whether the given call's step SUCCEEDED. The hiding predicate behind the
+	 * aggregate line reads this (第五批: errors never fold) - a failed tool's
+	 * collapsed ✗ row stays visible with its readable error, exactly as
+	 * pre-U4; only successful work folds into the ⚙ line.
+	 */
+	isStepDone(toolCallId: string): boolean {
+		const step = this.steps.find((candidate) => candidate.toolCallId === toolCallId);
+		return step !== undefined && step.status === "done";
+	}
+
+	/** Failed steps in this turn; the aggregate line reports the count. */
+	get errorStepCount(): number {
+		return this.steps.filter((step) => step.status === "error").length;
+	}
+
 	private verbSummary(): string {
 		const counts = new Map<string, number>();
 		for (const step of this.steps) {
@@ -156,13 +172,19 @@ export class TurnActivityState {
 		return segments > 1 ? `思考 ${segments} 段 · ${this.durationSeconds()}` : `思考 ${this.durationSeconds()}`;
 	}
 
-	/** U6 ②: the process line — steps, duration, verb summary. */
+	/** U6 ②: the process line — steps, duration, verb summary, error count. */
 	summaryText(): string {
 		const count = this.steps.length;
 		if (count === 0) {
 			return "";
 		}
 		const parts = [`⚙ ${count} 步 · ${this.durationSeconds()}`];
+		// 第五批: the aggregate line reports its own failures - a collapsed turn
+		// with a broken step shows ✗N beside the counts, so the error surface is
+		// self-alarming even while the successful rows fold.
+		if (this.errorStepCount > 0) {
+			parts.push(theme.fg("error", `✗${this.errorStepCount}`));
+		}
 		const verbs = this.verbSummary();
 		if (verbs) {
 			parts.push(verbs);
