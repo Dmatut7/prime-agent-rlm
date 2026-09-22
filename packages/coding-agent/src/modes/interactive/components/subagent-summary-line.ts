@@ -390,14 +390,14 @@ export class SubagentSummaryLine implements Component, Focusable {
 		// to the full width, so figure changes only ever eat whitespace - the
 		// money is fixed two-decimal and the tokens use the bounded k/M
 		// abbreviation, neither of which can move the hint or the line length.
-		const spendBudget =
-			safeWidth -
-			visibleWidth(LINE_INDENT) -
-			visibleWidth(counts) -
-			GROUP_GAP.length -
-			SPEND_MIN_GAP -
-			visibleWidth(openHint);
-		const spend = this.renderSpend(spendBudget);
+		// F5 (DS2 review): the open hint never participates in truncation. The
+		// counts and the spend cell get the width the hint leaves; a wide family
+		// truncates its figures (whole segments, money drops rungs) instead of
+		// squeezing the agents-view entry off the line.
+		const hintReserve = visibleWidth(openHint) > 0 ? visibleWidth(openHint) + SPEND_MIN_GAP : 0;
+		const contentBudget = Math.max(1, safeWidth - visibleWidth(LINE_INDENT) - hintReserve);
+		const spendBudget = contentBudget - visibleWidth(counts) - GROUP_GAP.length - SPEND_MIN_GAP;
+		const spend = this.renderSpend(Math.max(0, spendBudget));
 		const separator = spend ? GROUP_GAP : "";
 		const gap = Math.max(
 			SPEND_MIN_GAP,
@@ -409,9 +409,11 @@ export class SubagentSummaryLine implements Component, Focusable {
 				visibleWidth(openHint),
 		);
 		const body = truncateToWidth(
-			`${LINE_INDENT}${counts}${separator}${spend}${" ".repeat(gap)}${theme.fg("dim", openHint)}`,
+			`${LINE_INDENT}${truncateToWidth(`${counts}${separator}${spend}`, contentBudget, "…")}${" ".repeat(
+				gap,
+			)}${theme.fg("dim", openHint)}`,
 			safeWidth,
-			"…",
+			"",
 		);
 		const pad = " ".repeat(Math.max(0, safeWidth - visibleWidth(body)));
 		// Truncation may inject full ANSI resets; wrap each segment so the

@@ -277,6 +277,32 @@ describe("U6 status area layout", () => {
 		}
 	});
 
+	it("protects the ↓ 选择 entry: figures truncate before the hint does (F5, DS2)", () => {
+		const subagents = new SubagentSummaryLine();
+		// A wide family - dynamic, long count string (the case a fixed-width
+		// pin cannot catch).
+		subagents.setSubagentCounts({ total: 60, running: 12, idle: 3, inactive: 45 });
+		subagents.setSubagentSpend({
+			cost: 961.72,
+			tokens: 592_000_000,
+			parentCost: 273.44,
+			unpriced: [],
+			partial: false,
+		});
+		subagents.setOpenable(true);
+		for (const width of [40, 36, 32, 30, 28, 26]) {
+			const line = stripAnsi(subagents.render(width)[0] ?? "");
+			expect(line.length).toBeLessThanOrEqual(width);
+			// The entry survives at every width; the counts/spend truncate.
+			expect(line).toContain("↓ 选择");
+		}
+		const at30 = stripAnsi(subagents.render(30)[0] ?? "");
+		// The 60-strong family's counts no longer fit whole at 30 - they
+		// truncate, and the entry still ends the line's content.
+		expect(at30).toContain("…");
+		expect(at30.trimEnd().endsWith("↓ 选择")).toBe(true);
+	});
+
 	it("matches the watermark line's four-space group rhythm and still fits 80 (F7, DS2)", () => {
 		const subagents = new SubagentSummaryLine();
 		subagents.setSubagentCounts({ total: 3, running: 1, idle: 0, inactive: 2 });
