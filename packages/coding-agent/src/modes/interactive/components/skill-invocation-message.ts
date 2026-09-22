@@ -28,7 +28,7 @@ export class SkillInvocationMessageComponent extends ExpandableCustomMessageBox 
 		} else {
 			// U6: no per-line expand hint — the global tail line states the keys;
 			// the row stays clickable.
-			const line = `${customMessageLabel("skill")} ` + theme.fg("customMessageText", this.skillBlock.name);
+			const line = `${customMessageLabel("skill")} ${theme.fg("customMessageText", this.skillBlock.name)}`;
 			this.addChild(new Clickable(new Text(line, 0, 0), toggle));
 		}
 	}

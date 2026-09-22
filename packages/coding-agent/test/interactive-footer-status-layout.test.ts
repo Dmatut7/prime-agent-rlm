@@ -36,7 +36,7 @@ function statusStack(options: {
 	width?: number;
 }): string[] {
 	const width = options.width ?? 110;
-	const topBar = new TopBar({ getChatName: () => "调试会话-003", getCostUsd: () => 12.3456 });
+	const topBar = new TopBar({ getChatName: () => "调试会话-003" });
 	const info = new TrayInfoLine(
 		() => options.locationLabel ?? "← agents/resume · 深度 0",
 		() => options.contextLabel,
@@ -85,9 +85,12 @@ describe("U6 status area layout", () => {
 		expect(joined.match(/glm-5\.3-prime/g)).toHaveLength(1);
 		expect(joined.match(/518k\/1M/g)).toHaveLength(1);
 		expect(joined.match(/49%/g)).toHaveLength(1);
-		// The top bar carries neither the model nor the context figures.
+		// The top bar carries neither the model, the context figures, nor money
+		// (评审①: the spend cell is money's only home; /usage carries the detail).
 		expect(lines[0]).not.toContain("glm");
 		expect(lines[0]).not.toContain("518k");
+		expect(lines[0]).not.toContain("$");
+		expect(joined.match(/¥/g)).toHaveLength(2); // the ③ line's two figures only
 		// ① carries neither while the footer line is on.
 		expect(lines[1]).not.toContain("518k");
 		expect(lines[1]).not.toContain("glm");

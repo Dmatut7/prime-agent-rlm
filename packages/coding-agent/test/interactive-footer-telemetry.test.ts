@@ -124,21 +124,15 @@ describe("footer telemetry watermark (U6)", () => {
 describe("top bar (U6: model pin removed)", () => {
 	beforeAll(() => initTheme("dark"));
 
-	it("centers the chat name with the spend and no model segment", () => {
+	it("centers the chat name with no model and no spend segment", () => {
 		const bar = new TopBar({
 			getChatName: () => "chat",
-			getCostUsd: () => 0.42,
 		});
 		const line = stripAnsi(bar.render(120).join("\n"));
 		expect(line).toContain("chat");
-		expect(line).toContain("$0.42");
+		expect(line).not.toContain("$");
+		expect(line).not.toContain("¥");
 		expect(line).not.toContain("glm");
-	});
-
-	it("omits the spend segment when unset", () => {
-		const bar = new TopBar({ getChatName: () => "chat" });
-		const line = stripAnsi(bar.render(120).join("\n"));
-		expect(line).toContain("chat");
 	});
 });
 

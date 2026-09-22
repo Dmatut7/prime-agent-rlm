@@ -137,7 +137,7 @@ import {
 	parseSlashCommand,
 	resolveBuiltinSlashCommandName,
 } from "../../core/slash-commands.js";
-import { createSpendPricing, type SpendPricing, spendOverrideCorrection } from "../../core/spend-pricing.js";
+import { createSpendPricing, type SpendPricing } from "../../core/spend-pricing.js";
 import { formatStallEventLines } from "../../core/stall-diagnostics-render.js";
 import {
 	captureAgentCommandUsed,
@@ -372,18 +372,6 @@ interface SharedContextTree {
 	ms: number;
 	tree: ContextTreeNode | undefined;
 	promise: Promise<ContextTreeNode> | undefined;
-}
-
-/**
- * The session's own spend, read while `ui.subagentSpendCell: false` keeps the tree
- * unscanned: the header's degraded figure, windowed like the shared scan above.
- */
-interface TopBarOwnCostMemo {
-	connection: AgentConnection;
-	sessionId: string | undefined;
-	/** When the stats read landed (epoch ms); 0 while there is no result. */
-	at: number;
-	cost: number | undefined;
 }
 
 export const START_HINTS = [
@@ -1346,10 +1334,6 @@ export class InteractiveMode {
 	private headerContainer: Container;
 	/** Pinned fullscreen top bar identifying the chat by name while scrolling. */
 	private topBar: TopBar;
-	/** Cached session spend (USD) for the top bar, keyed to the session it was fetched for. */
-	private topBarCost: { sessionId?: string; total?: number } = {};
-	/** Stale-discard state for top bar cost refreshes (mirrors contextUsageRefresh). */
-	private topBarCostRefresh = { generation: 0, lastSuccessGeneration: 0 };
 	/**
 	 * The last context-tree scan, shared by every figure read from it.
 	 *
@@ -1361,11 +1345,6 @@ export class InteractiveMode {
 	 * serve one chat's spend to the next.
 	 */
 	private contextTreeShare: SharedContextTree | undefined;
-	/**
-	 * The session's own spend behind the header while `ui.subagentSpendCell: false`
-	 * keeps the tree unscanned; keyed and windowed like the tree memo above.
-	 */
-	private topBarOwnCost: TopBarOwnCostMemo | undefined;
 
 	private builtInHeader: Component | undefined = undefined;
 
@@ -1428,11 +1407,6 @@ export class InteractiveMode {
 		this.headerContainer = new Container();
 		this.topBar = new TopBar({
 			getChatName: () => this.getCurrentSessionName() ?? path.basename(this.getCurrentCwd()),
-			// Hide the cached spend unless it was fetched for the session now bound:
-			// a pending or failed refresh must not attribute the previous
-			// session's spend to the new chat.
-			getCostUsd: () =>
-				this.topBarCost.sessionId === this.connectionState?.sessionId ? this.topBarCost.total : undefined,
 		});
 		this.chatContainer = new Container();
 		this.shortcutGuideContainer = new Container();
@@ -1823,108 +1797,6 @@ export class InteractiveMode {
 		await this.updateAvailableProviderCount();
 	}
 
-	/**
-	 * Refresh the top bar's cached session spend.
-	 *
-	 * The header is the context tree's second consumer, so it reads through the same
-	 * shared scan as the spend cell (fetchSharedContextTree) instead of paying for a
-	 * disk-scanning RPC of its own: one window, one result, both figures. Results for
-	 * a replaced session, or superseded by a newer successful refresh, are discarded —
-	 * mirroring refreshConnectionContextUsage.
-	 *
-	 * `ui.subagentSpendCell: false` is the emergency stop for that scan, and it stops
-	 * the header too: down means the session's own usage total, which the connection
-	 * keeps in memory, instead of a scan per event (see refreshTopBarOwnCost).
-	 */
-	private refreshTopBarCost(): void {
-		// Partial-mode test harnesses skip the constructor, so the field
-		// initializer may be absent there; the refresh is cosmetic and must
-		// never crash a real flow on any `this`.
-		this.topBarCostRefresh ??= { generation: 0, lastSuccessGeneration: 0 };
-		// The settings surface behind the emergency switch is reached through
-		// `this.uiServices`, and the same partial harnesses have neither (the field is
-		// assigned by the constructor, which they do not run). Reading it there throws a
-		// TypeError out of whatever path called in - `renderResyncedSession` calls this on
-		// a reconnect, so the crash would land in a real rendering path. The refresh is
-		// cosmetic, so it stops here and the header keeps the figure it already holds; a
-		// mode built by the constructor always has uiServices, which it refuses to build
-		// without.
-		if (this.uiServicesOrUndefined === undefined) return;
-		const generation = ++this.topBarCostRefresh.generation;
-		const connection = this.agentConnection;
-		const sessionId = this.connectionState?.sessionId;
-		if (!this.isTopBarTreeCostEnabled()) {
-			this.refreshTopBarOwnCost(generation, connection, sessionId);
-			return;
-		}
-		void (async () => {
-			try {
-				// A scan that landed inside the shared window would read the same bytes, so
-				// an event burst costs one scan instead of one per event.
-				const tree = await this.fetchSharedContextTree(Date.now() - this.contextTreeShareWindowMs());
-				this.publishTopBarCost(tree, connection, sessionId, generation);
-			} catch {
-				// Cost is cosmetic; a failed fetch keeps the previous value
-				// (the session-keyed getter still hides cross-session leaks).
-			}
-		})();
-	}
-
-	/**
-	 * Whether the header may pay for a context-tree scan: the spend cell's emergency
-	 * switch (`ui.subagentSpendCell: false`) governs both consumers of that scan. Read
-	 * through an optional call because a settings surface predating the cell has
-	 * nothing to switch off, and the header must not lose its figure over it.
-	 */
-	private isTopBarTreeCostEnabled(): boolean {
-		const settings = this.settingsManager as { getSubagentSpendCellEnabled?: () => boolean };
-		return settings.getSubagentSpendCellEnabled?.() !== false;
-	}
-
-	/**
-	 * The header's figure while the tree is not being scanned: the session's own usage
-	 * total, which the connection already keeps in memory, held to the same window as
-	 * the tree path so an event burst costs one cheap read instead of one per event.
-	 *
-	 * Two limits, both the price of not scanning and neither an invented number: the
-	 * figure covers this session alone (sub-agent spend is what the tree scan adds),
-	 * and it carries no `priceOverrides` correction - `SessionStats` reports one
-	 * aggregate token total with no per-model breakdown, so re-pricing it would mean
-	 * attributing tokens to a model the session may not have spent them on.
-	 */
-	private refreshTopBarOwnCost(generation: number, connection: AgentConnection, sessionId: string | undefined): void {
-		const memo = this.topBarOwnCostMemo(connection, sessionId);
-		if (memo.at > 0 && typeof memo.cost === "number" && Date.now() - memo.at < this.contextTreeShareWindowMs()) {
-			this.publishTopBarTotal(memo.cost, connection, sessionId, generation);
-			return;
-		}
-		void (async () => {
-			try {
-				const stats = await connection.getSessionStats?.();
-				const cost = stats?.cost;
-				if (typeof cost !== "number" || !Number.isFinite(cost)) return;
-				// Keyed by connection and session, so a rebind mid-read cannot publish the
-				// previous chat's spend as this one's.
-				if (this.topBarOwnCost === memo) {
-					memo.at = Date.now();
-					memo.cost = cost;
-				}
-				this.publishTopBarTotal(cost, connection, sessionId, generation);
-			} catch {
-				// Cosmetic: a failed read keeps the previous figure.
-			}
-		})();
-	}
-
-	/** The session-cost memo above, dropped whenever the connection or the session moved. */
-	private topBarOwnCostMemo(connection: AgentConnection, sessionId: string | undefined): TopBarOwnCostMemo {
-		const memo = this.topBarOwnCost;
-		if (memo && memo.connection === connection && memo.sessionId === sessionId) return memo;
-		const fresh: TopBarOwnCostMemo = { connection, sessionId, at: 0, cost: undefined };
-		this.topBarOwnCost = fresh;
-		return fresh;
-	}
-
 	/** The shared scan memo, dropped whenever the connection or the bound session moved. */
 	private contextTreeShareMemo(): SharedContextTree {
 		const connection = this.agentConnection;
@@ -1934,19 +1806,6 @@ export class InteractiveMode {
 		const fresh: SharedContextTree = { connection, sessionId, at: 0, ms: 0, tree: undefined, promise: undefined };
 		this.contextTreeShare = fresh;
 		return fresh;
-	}
-
-	/**
-	 * How long one shared scan answers a new request, in ms: the spend cell's cadence
-	 * floor (`SUBAGENT_SPEND_MIN_INTERVAL_MS`), widened to its heavy-scan interval
-	 * (`SUBAGENT_SPEND_HEAVY_INTERVAL_MS`) once the last shared scan was slow. The same
-	 * two constants the cell throttles with, so the header can never be the consumer
-	 * that makes a heavy family pay for a second scan inside one window.
-	 */
-	private contextTreeShareWindowMs(): number {
-		return (this.contextTreeShare?.ms ?? 0) > SUBAGENT_SPEND_HEAVY_SCAN_MS
-			? SUBAGENT_SPEND_HEAVY_INTERVAL_MS
-			: SUBAGENT_SPEND_MIN_INTERVAL_MS;
 	}
 
 	/**
@@ -1983,63 +1842,6 @@ export class InteractiveMode {
 		);
 		return promise;
 	}
-
-	/**
-	 * Land the header's figure from a context tree. The tree's own total is the
-	 * recorded spend; `spendOverrideCorrection` adds back the difference a price
-	 * override makes to the same nodes, so the header agrees with /usage instead of
-	 * keeping the rate the user just corrected. Callers that already hold a price book
-	 * pass it, so one scan cannot publish a corrected figure and an uncorrected one.
-	 */
-	private publishTopBarCost(
-		tree: ContextTreeNode | undefined,
-		connection: AgentConnection,
-		sessionId: string | undefined,
-		generation: number,
-		pricing: SpendPricing = this.spendPricing(),
-	): void {
-		const recorded = tree?.totalUsage?.cost?.total;
-		// The additive correction can outrun the recorded total on an attribution-gap
-		// tree (a child whose money never reached root.totalUsage because the parent
-		// lookup missed); publishTopBarTotal clamps the header at zero.
-		const total = tree && typeof recorded === "number" ? recorded + spendOverrideCorrection(tree, pricing) : recorded;
-		this.publishTopBarTotal(total, connection, sessionId, generation);
-	}
-
-	/**
-	 * Publish a header figure, discarding one that is stale or belongs to another
-	 * session. Money on screen clamps at zero, whichever path produced it: the additive
-	 * override correction on an attribution-gap tree (review-price FAIL-1), and the
-	 * degraded own-cost read while the tree is not being scanned.
-	 */
-	private publishTopBarTotal(
-		total: number | undefined,
-		connection: AgentConnection,
-		sessionId: string | undefined,
-		generation: number,
-	): void {
-		this.topBarCostRefresh ??= { generation: 0, lastSuccessGeneration: 0 };
-		const refresh = this.topBarCostRefresh;
-		if (
-			typeof total !== "number" ||
-			!Number.isFinite(total) ||
-			generation < refresh.lastSuccessGeneration ||
-			this.agentConnection !== connection ||
-			this.connectionState?.sessionId !== sessionId
-		) {
-			return;
-		}
-		refresh.lastSuccessGeneration = generation;
-		this.topBarCost = { sessionId, total: Math.max(0, total) };
-		this.ui.requestRender();
-	}
-
-	/** A figure from a shared scan is the newest data there is, so it takes the next generation. */
-	private nextTopBarCostGeneration(): number {
-		this.topBarCostRefresh ??= { generation: 0, lastSuccessGeneration: 0 };
-		return ++this.topBarCostRefresh.generation;
-	}
-
 	private updateTerminalTitle(): void {
 		const cwdBasename = path.basename(this.getCurrentCwd());
 		const sessionName = this.getCurrentSessionName();
@@ -3465,7 +3267,6 @@ export class InteractiveMode {
 		await this.updateAvailableProviderCount();
 		this.updateEditorBorderColor();
 		this.updateTerminalTitle();
-		this.refreshTopBarCost();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
 		this.syncGoalTray(this.getGoalState());
 		this.syncWorkingLoader();
@@ -3597,7 +3398,6 @@ export class InteractiveMode {
 			this.sideQuestionBashDiscarded = undefined;
 		}
 		this.updateTerminalTitle();
-		this.refreshTopBarCost();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
 		this.syncGoalTray(this.getGoalState());
 		this.syncWorkingLoader();
@@ -4302,7 +4102,6 @@ export class InteractiveMode {
 		this.setupAutocompleteProvider();
 		this.defaultEditor.onExtensionShortcut = undefined;
 		this.updateTerminalTitle();
-		this.refreshTopBarCost();
 		this.workingMessage = undefined;
 		this.workingVisible = true;
 		this.setWorkingIndicator();
@@ -5881,7 +5680,6 @@ export class InteractiveMode {
 					this.sessionRecap = event.recap;
 					this.patchConnectionState({ recap: event.recap });
 					this.renderRecap();
-					this.refreshTopBarCost();
 				} else if (event.type === "side_question_event") {
 					this.handleSideQuestionEvent(event.event);
 				} else if (event.type === "extension_ui_request") {
@@ -6149,7 +5947,6 @@ export class InteractiveMode {
 
 			case "session_info_changed":
 				this.updateTerminalTitle();
-				this.refreshTopBarCost();
 				this.footer.invalidate();
 				this.ui.requestRender();
 				break;
@@ -6417,7 +6214,6 @@ export class InteractiveMode {
 				// The run is over; a thinking-only turn's clock stops here (a tool
 				// turn already froze on its last settled step).
 				this.currentTurnState?.markTurnEnded(Date.now());
-				this.refreshTopBarCost();
 				// Drops the loader; background subagents are shown by the tree, not the loader.
 				this.syncWorkingLoader();
 				if (this.streamingComponent) {
@@ -7034,8 +6830,6 @@ export class InteractiveMode {
 			return;
 		}
 		this.subagentSpendScanning = true;
-		const connection = this.agentConnection;
-		const sessionId = this.connectionState?.sessionId;
 		try {
 			const tree = await this.fetchSharedContextTree(notBefore);
 			// The scan may have been the header's: the cadence then reads when that scan
@@ -7047,9 +6841,6 @@ export class InteractiveMode {
 			this.subagentSummaryLine.setSubagentSpend(
 				summarizeSubagentSpend(tree, (model) => pricing.isPriced(model), pricing),
 			);
-			// One scan, two figures: the header reads the same tree priced from the same
-			// book, so a turn end never pays for a second scan of its own.
-			this.publishTopBarCost(tree, connection, sessionId, this.nextTopBarCostGeneration(), pricing);
 			this.ui.requestRender();
 		} catch {
 			// Silent degrade: no data, no cell update.
