@@ -203,6 +203,17 @@ describe("footer telemetry watermark (U6)", () => {
 		expect(off).toContain("950k/1M");
 	});
 
+	it("never renders a 1000k figure next to a 1M window (F6, DS2)", () => {
+		const footer = new FooterComponent(provider);
+		footer.setTelemetrySource(() => ({ mode: "on", snapshot: { ...SNAPSHOT, contextTokens: 999_600 } }));
+		const line = footerLine(footer, 100);
+		expect(line).toContain("1M/1M · 100%");
+		expect(line).not.toContain("1000k");
+		// 999,400 still reads as k - the promotion is only the half-k edge.
+		footer.setTelemetrySource(() => ({ mode: "on", snapshot: { ...SNAPSHOT, contextTokens: 999_400 } }));
+		expect(footerLine(footer, 100)).toContain("999k/1M");
+	});
+
 	it("keeps the notch visible through the whole collision band around the threshold (F3, DS2)", () => {
 		const footer = new FooterComponent(provider);
 		let snapshot: FooterTelemetrySnapshot = { ...SNAPSHOT, contextTokens: 800_000 };
