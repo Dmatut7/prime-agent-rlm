@@ -198,6 +198,57 @@ describe("U6 status area layout", () => {
 		expect(statusLines).toContain("收口 2");
 	});
 
+	it("relocates every signal to its home line and loses none when ③ hides (评审⑤)", () => {
+		// ① carries the transient override notices (Ctrl+C exit / queue hint) on
+		// its left even with no navigation, no goal, and no context fallback:
+		// the only content on the line.
+		const overrideOnly = new TrayInfoLine(
+			() => undefined,
+			() => undefined,
+			() => "Press Ctrl+C again to exit",
+		);
+		const overrideLine = stripAnsi(overrideOnly.render(110).join("\n"));
+		expect(overrideLine).toContain("Press Ctrl+C again to exit");
+
+		// ①'s right side carries goal/heartbeat while they run (K3 S3).
+		const withGoal = new TrayInfoLine(
+			() => "← agents/resume · 深度 0",
+			() => "Pursuing goal (12m) · 2 heartbeats",
+			() => undefined,
+		);
+		const goalLine = stripAnsi(withGoal.render(110).join("\n"));
+		expect(goalLine).toContain("← agents/resume · 深度 0");
+		expect(goalLine).toContain("Pursuing goal (12m) · 2 heartbeats");
+
+		// The U2 badge owns ②'s tail while telemetry is on and stands alone
+		// when it is off - either way the signal survives ③ hiding.
+		const badgeWithTelemetry = new FooterComponent(provider);
+		badgeWithTelemetry.setTelemetrySource(() => ({ mode: "on", snapshot: SNAPSHOT }));
+		badgeWithTelemetry.setToolErrorCount(4);
+		expect(stripAnsi(badgeWithTelemetry.render(110).join("\n"))).toContain("⚠ 工具错误×4");
+
+		const badgeAlone = new FooterComponent(provider);
+		badgeAlone.setTelemetrySource(() => ({ mode: "off", snapshot: SNAPSHOT }));
+		badgeAlone.setToolErrorCount(4);
+		const alone = stripAnsi(badgeAlone.render(110).join("\n"));
+		expect(alone).toContain("⚠ 工具错误×4");
+
+		// /speed owns its own line under ② while enabled.
+		badgeWithTelemetry.setSpeedEnabled(true);
+		badgeWithTelemetry.setSpeedText("88 tok/s · avg 66");
+		const speedLines = badgeWithTelemetry.render(110).map(stripAnsi);
+		expect(speedLines).toHaveLength(2);
+		expect(speedLines[1]).toBe("88 tok/s · avg 66");
+
+		// Stall markers ride under ③ - which is exactly when subagents exist.
+		const stalled = new SubagentSummaryLine();
+		stalled.setSubagentCounts({ total: 2, running: 2, idle: 0, inactive: 0 });
+		stalled.setStallMarkers(["stalled 214s, in-flight: ipython"]);
+		const stallLines = stalled.render(110).map(stripAnsi);
+		expect(stallLines[0]).toContain("运行 2");
+		expect(stallLines[1]).toContain("⚠ stalled 214s");
+	});
+
 	it("states the two-key division in one global hint line at the chat tail", async () => {
 		const { ExpandKeysHintLine } = await import("../src/modes/interactive/components/expand-keys-hint.js");
 		let hasContent = false;
