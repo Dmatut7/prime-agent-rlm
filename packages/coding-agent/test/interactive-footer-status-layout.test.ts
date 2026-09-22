@@ -22,7 +22,7 @@ const SNAPSHOT: FooterTelemetrySnapshot = {
 	thinkingLevel: "max",
 	contextTokens: 518_000,
 	contextWindow: 1_048_576,
-	compactionTriggerRatio: 0.8,
+	compactionThresholdTokens: 838_861,
 };
 
 const provider = { getGitBranch: () => null } as never;

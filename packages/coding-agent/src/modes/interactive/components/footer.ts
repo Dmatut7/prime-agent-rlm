@@ -33,8 +33,13 @@ export interface FooterTelemetrySnapshot {
 	thinkingLevel?: string;
 	contextTokens?: number | null;
 	contextWindow?: number;
-	/** Auto-compaction trigger ratio (0..1); the bar's notch and the imminent tail. */
-	compactionTriggerRatio?: number;
+	/**
+	 * The REAL auto-compaction threshold in tokens, from
+	 * compactionThresholdTokens (ratio × base, minus the reserve ceiling). 0 or
+	 * undefined means threshold compaction is off: no notch, no imminent tail
+	 * (评审③ - the bar never reports a threshold that does not exist).
+	 */
+	compactionThresholdTokens?: number;
 }
 
 /**
@@ -57,13 +62,13 @@ function formatTokens(tokens: number): string {
 
 /**
  * The watermark bar: a rail of `─` with `●` at the current level and `│` at
- * the compaction notch. The notch brightens once the level reaches it (the
- * tail text carries the same state).
+ * the compaction notch (the threshold's fraction of the window). The notch
+ * brightens once the level reaches it (the tail text carries the same state).
  */
-function watermarkBar(tokens: number, windowTokens: number, ratio: number, imminent: boolean): string {
+function watermarkBar(tokens: number, windowTokens: number, thresholdTokens: number, imminent: boolean): string {
 	const cells = WATERMARK_BAR_CELLS;
 	const levelCell = Math.max(0, Math.min(cells - 1, Math.round((tokens / windowTokens) * cells)));
-	const notchCell = Math.max(0, Math.min(cells - 1, Math.round(ratio * cells)));
+	const notchCell = Math.max(0, Math.min(cells - 1, Math.round((thresholdTokens / windowTokens) * cells)));
 	let bar = "";
 	for (let i = 0; i < cells; i++) {
 		if (i === levelCell) {
@@ -156,8 +161,10 @@ export class FooterComponent implements Component {
 		const tokens = snapshot.contextTokens;
 		const windowTokens = snapshot.contextWindow ?? 0;
 		const knownContext = tokens !== undefined && tokens !== null && windowTokens > 0;
-		const ratio = snapshot.compactionTriggerRatio;
-		const imminent = knownContext && ratio !== undefined && ratio > 0 && tokens >= Math.round(windowTokens * ratio);
+		const threshold = snapshot.compactionThresholdTokens ?? 0;
+		// 评审③: the notch and the tail read the real threshold (settings-driven,
+		// reserve-capped); threshold compaction off means neither renders.
+		const imminent = knownContext && threshold > 0 && tokens >= threshold;
 		const tail = imminent ? `${GROUP_GAP}${theme.fg("warning", "压缩在即")}` : "";
 		const figures = knownContext
 			? theme.fg(
@@ -166,8 +173,8 @@ export class FooterComponent implements Component {
 				)
 			: "";
 		const bar =
-			knownContext && ratio !== undefined && ratio > 0 && safeWidth >= WATERMARK_BAR_MIN_WIDTH
-				? watermarkBar(tokens, windowTokens, ratio, imminent)
+			knownContext && threshold > 0 && safeWidth >= WATERMARK_BAR_MIN_WIDTH
+				? watermarkBar(tokens, windowTokens, threshold, imminent)
 				: "";
 
 		// Degradation ladder, richest first: bar and figures, bar only, figures only,

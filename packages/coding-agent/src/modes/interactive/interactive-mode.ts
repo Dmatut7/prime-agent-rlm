@@ -77,6 +77,7 @@ import {
 	uploadAllAgentTraces,
 } from "../../core/agent-traces.js";
 import { isNoModelsAvailableMessage } from "../../core/auth-guidance.js";
+import { compactionThresholdTokens } from "../../core/compaction/compaction.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
 import {
 	type AgentCronJob,
@@ -3033,12 +3034,26 @@ export class InteractiveMode {
 			model?.reasoning && this.connectionState?.thinkingLevel && this.connectionState.thinkingLevel !== "off"
 				? this.connectionState.thinkingLevel
 				: undefined;
+		// 评审③: the notch and 压缩在即 read the real threshold - the configured
+		// ratio over the model's effective input limit, minus the reserve
+		// ceiling. A disabled threshold (settings off, or the reserve consuming
+		// the whole base) renders neither; the 80% default is just the default.
+		const compactionSettings = settingsManager?.getCompactionSettings?.();
+		const windowTokens = usage?.contextWindow ?? 0;
+		const thresholdTokens =
+			compactionSettings && (compactionSettings.enabled ?? true) && windowTokens > 0
+				? compactionThresholdTokens(
+						windowTokens,
+						compactionSettings,
+						model ? { provider: model.provider, modelId: model.id } : undefined,
+					)
+				: 0;
 		const snapshot: FooterTelemetrySnapshot = {
 			modelName: model?.id,
 			thinkingLevel,
 			contextTokens: usage?.tokens ?? undefined,
 			contextWindow: usage?.contextWindow,
-			compactionTriggerRatio: settingsManager?.getCompactionTriggerRatio?.(),
+			compactionThresholdTokens: thresholdTokens,
 		};
 		return { mode, snapshot };
 	}

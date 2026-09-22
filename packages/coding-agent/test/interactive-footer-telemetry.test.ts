@@ -25,7 +25,7 @@ const SNAPSHOT: FooterTelemetrySnapshot = {
 	thinkingLevel: "max",
 	contextTokens: 312_000,
 	contextWindow: 1_000_000,
-	compactionTriggerRatio: 0.8,
+	compactionThresholdTokens: 800_000,
 };
 
 describe("footer telemetry watermark (U6)", () => {
@@ -146,6 +146,32 @@ describe("footer telemetry watermark (U6)", () => {
 		expect(footerLine(footer).trim()).toBe("bailian/deepseek-v4.1-flash");
 	});
 
+	it("reads the real compaction threshold: ratio-driven, reserve-capped, off when disabled (评审③)", () => {
+		const footer = new FooterComponent(provider);
+		let snapshot: FooterTelemetrySnapshot = {
+			...SNAPSHOT,
+			compactionThresholdTokens: 600_000,
+			contextTokens: 620_000,
+		};
+		footer.setTelemetrySource(() => ({ mode: "on", snapshot }));
+		// A 0.6-configured threshold lights 压缩在即 at 62%, not only at 80%.
+		const ratioSix = footerLine(footer);
+		expect(ratioSix).toContain("压缩在即");
+		expect(ratioSix).toContain("620k/1M · 62%");
+
+		// Below that same threshold: quiet.
+		snapshot = { ...SNAPSHOT, compactionThresholdTokens: 600_000, contextTokens: 560_000 };
+		expect(footerLine(footer)).not.toContain("压缩在即");
+
+		snapshot = { ...SNAPSHOT, compactionThresholdTokens: 0, contextTokens: 950_000 };
+		footer.setTelemetrySource(() => ({ mode: "on", snapshot }));
+		// Threshold compaction off: no notch, no tail - even at 95%.
+		const off = footerLine(footer, 100);
+		expect(off).not.toContain("压缩在即");
+		expect(off).not.toContain("│");
+		expect(off).toContain("950k/1M");
+	});
+
 	it("pulls the source once per render (评审②: one frame, one value)", () => {
 		const footer = new FooterComponent(provider);
 		const telemetry = makeSource();
@@ -207,7 +233,12 @@ describe("interactive-mode telemetry source wiring (评审②)", () => {
 		const { InteractiveMode } = await import("../src/modes/interactive/interactive-mode.js");
 		const settingsManager = {
 			getFooterTelemetry: vi.fn(() => "on"),
-			getCompactionTriggerRatio: vi.fn(() => 0.8),
+			getCompactionSettings: vi.fn(() => ({
+				enabled: true,
+				reserveTokens: 0,
+				keepRecentTokens: 0,
+				triggerRatio: 0.8,
+			})),
 		};
 		type FakeConnectionState = {
 			model: { id: string; reasoning?: boolean };
@@ -245,7 +276,7 @@ describe("interactive-mode telemetry source wiring (评审②)", () => {
 				thinkingLevel: "max",
 				contextTokens: 312_000,
 				contextWindow: 1_000_000,
-				compactionTriggerRatio: 0.8,
+				compactionThresholdTokens: 800_000,
 			},
 		});
 		// Memoized: every reader this frame gets the same object identity.

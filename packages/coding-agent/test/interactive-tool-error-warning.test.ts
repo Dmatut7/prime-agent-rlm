@@ -94,7 +94,7 @@ describe("footer tool-error badge (U2)", () => {
 				modelName: "bailian/glm-5.3-prime",
 				contextTokens: 10_000,
 				contextWindow: 100_000,
-				compactionTriggerRatio: 0.8,
+				compactionThresholdTokens: 80_000,
 			},
 		}));
 		footer.setToolErrorCount(3);
