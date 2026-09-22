@@ -1976,6 +1976,9 @@ describe("empty assistant turn retry", () => {
 		return {
 			model: createModel(),
 			convertToLlm: identityConverter,
+			// These tests pin the fast tier's accounting; the escalated slow tier has
+			// its own suite in empty-turn-retry.test.ts.
+			emptyTurnRetry: { escalatedAttempts: 0 },
 		};
 	}
 

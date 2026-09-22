@@ -174,7 +174,13 @@ describe("agent loop spends from the shared provider request budget", () => {
 
 		const { assistant } = await run(
 			{
-				emptyTurnRetry: { maxAttempts: 4, baseDelayMs: 1, maxDelayMs: 1, maxTotalDelayMs: 10 },
+				emptyTurnRetry: {
+					maxAttempts: 4,
+					baseDelayMs: 1,
+					maxDelayMs: 1,
+					maxTotalDelayMs: 10,
+					escalatedAttempts: 0,
+				},
 				requestBudget: budget,
 			} as Partial<AgentLoopConfig>,
 			streamFn,
@@ -200,7 +206,13 @@ describe("agent loop spends from the shared provider request budget", () => {
 
 		const { assistant } = await run(
 			{
-				emptyTurnRetry: { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1, maxTotalDelayMs: 10 },
+				emptyTurnRetry: {
+					maxAttempts: 2,
+					baseDelayMs: 1,
+					maxDelayMs: 1,
+					maxTotalDelayMs: 10,
+					escalatedAttempts: 0,
+				},
 				requestBudget: budget,
 			} as Partial<AgentLoopConfig>,
 			streamFn,
@@ -212,13 +224,51 @@ describe("agent loop spends from the shared provider request budget", () => {
 		expect((diagnostic?.details as { terminatedBy?: string }).terminatedBy).toBe("attempts");
 	});
 
+	it("the escalated slow tier spends from the same shared ceiling, not a second pool", async () => {
+		const budget = createBudgetShape(9);
+		const { streamFn, requests } = budgetedEmptyStreamFn(budget);
+
+		const { assistant } = await run(
+			{
+				emptyTurnRetry: {
+					maxAttempts: 2,
+					baseDelayMs: 1,
+					maxDelayMs: 1,
+					maxTotalDelayMs: 10,
+					// The slow tier must run on the same pool: with 3 SDK requests per
+					// loop attempt and a 9-request ceiling, the chain dies inside the
+					// slow tier instead of multiplying the layers.
+					escalatedAttempts: 3,
+					escalatedBaseDelayMs: 1,
+					escalatedMaxDelayMs: 1,
+					escalatedMaxTotalDelayMs: 100,
+				},
+				requestBudget: budget,
+			} as Partial<AgentLoopConfig>,
+			streamFn,
+		);
+
+		expect(requests()).toBe(9);
+		expect(budget.exhausted).toBe(true);
+		const diagnostic = assistant.diagnostics?.find((d) => d.type === EMPTY_TURN_RETRY_EXHAUSTED_DIAGNOSTIC_TYPE);
+		expect((diagnostic?.details as { terminatedBy?: string }).terminatedBy).toBe("request_budget");
+		expect((diagnostic?.details as { attempts?: number }).attempts).toBe(3);
+		expect((diagnostic?.details as { escalatedAttempts?: number }).escalatedAttempts).toBeGreaterThanOrEqual(1);
+	});
+
 	it("records the attempt list on the message without any transcript-visible retry count before", async () => {
 		const budget = createBudgetShape(3);
 		const { streamFn } = budgetedEmptyStreamFn(budget);
 
 		const { assistant } = await run(
 			{
-				emptyTurnRetry: { maxAttempts: 4, baseDelayMs: 1, maxDelayMs: 1, maxTotalDelayMs: 10 },
+				emptyTurnRetry: {
+					maxAttempts: 4,
+					baseDelayMs: 1,
+					maxDelayMs: 1,
+					maxTotalDelayMs: 10,
+					escalatedAttempts: 0,
+				},
 				requestBudget: budget,
 			} as Partial<AgentLoopConfig>,
 			streamFn,

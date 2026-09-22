@@ -28,6 +28,7 @@ import type {
 	StreamFn,
 	ThinkingLevel,
 	ToolExecutionMode,
+	ToolTimeoutConfig,
 } from "./types.js";
 
 function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
@@ -121,6 +122,8 @@ export interface AgentOptions {
 	streamStallTimeoutMs?: number;
 	/** See `AgentLoopConfig.emptyTurnRetry`. */
 	emptyTurnRetry?: EmptyTurnRetryConfig;
+	/** See `AgentLoopConfig.toolTimeout`. Hosts refresh this per run for hot settings. */
+	toolTimeout?: ToolTimeoutConfig;
 }
 
 class PendingMessageQueue {
@@ -246,6 +249,7 @@ export class Agent {
 	public toolExecution: ToolExecutionMode;
 	public streamStallTimeoutMs?: number;
 	public emptyTurnRetry?: EmptyTurnRetryConfig;
+	public toolTimeout?: ToolTimeoutConfig;
 
 	constructor(options: AgentOptions = {}) {
 		this._state = createMutableAgentState(options.initialState);
@@ -269,6 +273,7 @@ export class Agent {
 		this.toolExecution = options.toolExecution ?? "parallel";
 		this.streamStallTimeoutMs = options.streamStallTimeoutMs;
 		this.emptyTurnRetry = options.emptyTurnRetry;
+		this.toolTimeout = options.toolTimeout;
 	}
 
 	/**
@@ -510,6 +515,7 @@ export class Agent {
 			toolExecution: this.toolExecution,
 			streamStallTimeoutMs: this.streamStallTimeoutMs,
 			emptyTurnRetry: this.emptyTurnRetry,
+			toolTimeout: this.toolTimeout,
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
 			shouldStopAfterTurn: async (context) => this.shouldStopAfterTurn?.(context) ?? false,

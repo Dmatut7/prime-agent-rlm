@@ -11,6 +11,7 @@ import {
 	EMPTY_TURN_RETRY_DEFAULTS,
 	EMPTY_TURN_RETRY_EXHAUSTED_DIAGNOSTIC_TYPE,
 	EMPTY_TURN_RETRY_EXHAUSTED_STOP_REASON_RAW,
+	ESCALATED_EMPTY_TURN_RETRY_DEFAULTS,
 	isEmptyTurnRetryExhausted,
 	runAgentLoop,
 } from "../src/agent-loop.js";
@@ -87,25 +88,54 @@ function emptyStreamFn() {
 	return { streamFn, calls: () => startedAtMs.length, gapsMs };
 }
 
-async function run(config: Partial<AgentLoopConfig>, streamFn: unknown) {
+async function run(config: Partial<AgentLoopConfig>, streamFn: unknown, signal?: AbortSignal) {
 	const context: AgentContext = { systemPrompt: "sys", messages: [], tools: [] };
 	const messages = await runAgentLoop(
 		[createUserMessage("hello")],
 		context,
 		{ model: createModel(), convertToLlm: identityConverter, ...config } as AgentLoopConfig,
 		async () => {},
-		undefined,
+		signal,
 		streamFn as never,
 	);
 	const assistant = messages.filter((m) => m.role === "assistant").at(-1) as AssistantMessage;
 	return { assistant, messages };
 }
 
+/** A stream that answers empty N times, then a real answer: pins how deep the ladder runs. */
+function recoveringStreamFn(emptyTimes: number) {
+	let calls = 0;
+	const streamFn = vi.fn(() => {
+		calls += 1;
+		const stream = new MockAssistantStream();
+		const message =
+			calls <= emptyTimes
+				? emptyTurn()
+				: { ...emptyTurn(), content: [{ type: "text" as const, text: "recovered" }] };
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "done", reason: "stop", message });
+		return stream;
+	});
+	return { streamFn, calls: () => calls };
+}
+
+function emptyExhaustionDiagnostic(assistant: AssistantMessage) {
+	const diagnostic = assistant.diagnostics?.find((d) => d.type === EMPTY_TURN_RETRY_EXHAUSTED_DIAGNOSTIC_TYPE);
+	return (diagnostic?.details ?? {}) as {
+		attempts?: number;
+		waitedMs?: number;
+		escalatedAttempts?: number;
+		escalatedWaitedMs?: number;
+		fastWaitedMs?: number;
+		terminatedBy?: string;
+	};
+}
+
 describe("empty-turn retry policy", () => {
 	it("spaces the in-place retries out instead of firing them back-to-back", async () => {
 		const { streamFn, calls, gapsMs } = emptyStreamFn();
 
-		const { assistant } = await run({}, streamFn);
+		const { assistant } = await run({ emptyTurnRetry: { escalatedAttempts: 0 } }, streamFn);
 
 		expect(calls()).toBe(EMPTY_TURN_RETRY_DEFAULTS.maxAttempts);
 		const gaps = gapsMs();
@@ -136,7 +166,7 @@ describe("empty-turn retry policy", () => {
 		const { streamFn, calls, gapsMs } = emptyStreamFn();
 
 		const { assistant } = await run(
-			{ emptyTurnRetry: { maxAttempts: 2, baseDelayMs: 20, maxDelayMs: 40 } },
+			{ emptyTurnRetry: { maxAttempts: 2, baseDelayMs: 20, maxDelayMs: 40, escalatedAttempts: 0 } },
 			streamFn,
 		);
 
@@ -149,7 +179,15 @@ describe("empty-turn retry policy", () => {
 		const { streamFn, calls, gapsMs } = emptyStreamFn();
 
 		const { assistant } = await run(
-			{ emptyTurnRetry: { maxAttempts: 6, baseDelayMs: 20, maxDelayMs: 20, maxTotalDelayMs: 30 } },
+			{
+				emptyTurnRetry: {
+					maxAttempts: 6,
+					baseDelayMs: 20,
+					maxDelayMs: 20,
+					maxTotalDelayMs: 30,
+					escalatedAttempts: 0,
+				},
+			},
 			streamFn,
 		);
 
@@ -164,11 +202,149 @@ describe("empty-turn retry policy", () => {
 		const { streamFn, calls, gapsMs } = emptyStreamFn();
 		const startedAt = Date.now();
 
-		const { assistant } = await run({ emptyTurnRetry: { maxAttempts: 1, baseDelayMs: 500 } }, streamFn);
+		const { assistant } = await run(
+			{ emptyTurnRetry: { maxAttempts: 1, baseDelayMs: 500, escalatedAttempts: 0 } },
+			streamFn,
+		);
 
 		expect(calls()).toBe(1);
 		expect(gapsMs()).toHaveLength(0);
 		expect(Date.now() - startedAt).toBeLessThan(400);
 		expect(isEmptyTurnRetryExhausted(assistant)).toBe(true);
+	});
+});
+
+describe("empty-turn retry escalated slow tier", () => {
+	it("keeps resending with longer waits after the fast attempts are spent", async () => {
+		const { streamFn, calls, gapsMs } = emptyStreamFn();
+
+		const { assistant } = await run(
+			{
+				emptyTurnRetry: {
+					maxAttempts: 2,
+					baseDelayMs: 5,
+					maxDelayMs: 10,
+					escalatedAttempts: 3,
+					escalatedBaseDelayMs: 20,
+					escalatedMaxDelayMs: 80,
+					escalatedMaxTotalDelayMs: 500,
+				},
+			},
+			streamFn,
+		);
+
+		// 2 fast attempts, then 3 slow ones: the ladder is an extension of the count.
+		expect(calls()).toBe(5);
+		const gaps = gapsMs();
+		expect(gaps).toHaveLength(4);
+		// The first gap is fast-tier; every gap after the fast attempts is slow-tier,
+		// strictly longer than the whole fast budget.
+		expect(gaps[0]).toBeLessThan(20);
+		for (const gap of gaps.slice(1)) {
+			expect(gap).toBeGreaterThanOrEqual(15);
+		}
+		// The slow waits double, capped by escalatedMaxDelayMs.
+		expect(gaps[3]).toBeGreaterThanOrEqual(gaps[2]);
+		expect(gaps[3]).toBeLessThanOrEqual(90);
+
+		expect(isEmptyTurnRetryExhausted(assistant)).toBe(true);
+		const details = emptyExhaustionDiagnostic(assistant);
+		expect(details.attempts).toBe(5);
+		expect(details.escalatedAttempts).toBe(3);
+		expect(details.terminatedBy).toBe("attempts");
+		expect(details.escalatedWaitedMs ?? 0).toBeGreaterThanOrEqual(15 * 3);
+		expect(details.escalatedWaitedMs ?? 0).toBeLessThanOrEqual(300);
+		expect(details.fastWaitedMs ?? 0).toBeLessThan(20);
+		expect(details.waitedMs ?? 0).toBe((details.fastWaitedMs ?? 0) + (details.escalatedWaitedMs ?? 0));
+		// The terminal message reports the tier split so the post-mortem can tell a
+		// fast-only exhaustion from one that already escalated.
+		expect(assistant.errorMessage).toMatch(/slow-tier gap\(s\) waited \d+ms/);
+	});
+
+	it("stops the slow tier at its own total wait budget and names the budget", async () => {
+		const { streamFn, calls } = emptyStreamFn();
+
+		const { assistant } = await run(
+			{
+				emptyTurnRetry: {
+					maxAttempts: 2,
+					baseDelayMs: 5,
+					maxDelayMs: 10,
+					escalatedAttempts: 3,
+					escalatedBaseDelayMs: 20,
+					escalatedMaxDelayMs: 80,
+					// One 20ms slow wait fits; the second would not.
+					escalatedMaxTotalDelayMs: 30,
+				},
+			},
+			streamFn,
+		);
+
+		expect(calls()).toBe(3); // 2 fast + 1 slow
+		const details = emptyExhaustionDiagnostic(assistant);
+		expect(details.terminatedBy).toBe("budget");
+		expect(details.escalatedAttempts).toBe(1);
+		expect(assistant.errorMessage).toMatch(/budget/);
+	});
+
+	it("the default policy escalates after the fast attempts are spent", async () => {
+		const { streamFn, calls } = recoveringStreamFn(EMPTY_TURN_RETRY_DEFAULTS.maxAttempts);
+
+		const { assistant } = await run(
+			{ emptyTurnRetry: { escalatedBaseDelayMs: 5, escalatedMaxDelayMs: 10 } },
+			streamFn,
+		);
+
+		// The first non-empty answer arrives after the fast attempts, inside the slow
+		// tier: the default ladder is deep enough to catch a minutes-long outage.
+		expect(calls()).toBe(EMPTY_TURN_RETRY_DEFAULTS.maxAttempts + 1);
+		expect(assistant.stopReason).toBe("stop");
+		expect(isEmptyTurnRetryExhausted(assistant)).toBe(false);
+		// Escalation defaults ship far below a typical stall-watchdog warn threshold.
+		expect(ESCALATED_EMPTY_TURN_RETRY_DEFAULTS.escalatedMaxDelayMs).toBeLessThan(300_000);
+	});
+
+	it("escalatedAttempts 0 rolls the ladder back to fast-only", async () => {
+		const { streamFn, calls, gapsMs } = emptyStreamFn();
+
+		const { assistant } = await run(
+			{ emptyTurnRetry: { escalatedAttempts: 0, maxAttempts: 3, baseDelayMs: 5, maxDelayMs: 10 } },
+			streamFn,
+		);
+
+		expect(calls()).toBe(3);
+		expect(gapsMs()).toHaveLength(2);
+		for (const gap of gapsMs()) {
+			expect(gap).toBeLessThan(20);
+		}
+		const details = emptyExhaustionDiagnostic(assistant);
+		expect(details.escalatedAttempts).toBe(0);
+		expect(details.terminatedBy).toBe("attempts");
+	});
+
+	it("a run abort during a slow-tier wait settles the run immediately", async () => {
+		const { streamFn, calls } = emptyStreamFn();
+		const controller = new AbortController();
+		const startedAt = Date.now();
+		setTimeout(() => controller.abort(), 15);
+
+		const { assistant } = await run(
+			{
+				emptyTurnRetry: {
+					maxAttempts: 1,
+					escalatedAttempts: 2,
+					// The next slow wait would be 60s: the abort must cut through it.
+					escalatedBaseDelayMs: 60_000,
+					escalatedMaxDelayMs: 60_000,
+				},
+			},
+			streamFn,
+			controller.signal,
+		);
+
+		expect(Date.now() - startedAt).toBeLessThan(5_000);
+		expect(calls()).toBeLessThanOrEqual(2);
+		expect(assistant.stopReason).toBe("aborted");
+		expect(isEmptyTurnRetryExhausted(assistant)).toBe(false);
 	});
 });
