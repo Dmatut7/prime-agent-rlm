@@ -60,6 +60,7 @@ import {
 	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
 	SESSION_SLASH_COMMAND_CUSTOM_TYPE,
 	SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
+	STALL_RECOVERY_ESCALATION_CUSTOM_TYPE,
 	SYSTEM_INTERRUPTION_CUSTOM_TYPE,
 	THINKING_LEVEL_CLAMPED_CUSTOM_TYPE,
 } from "./messages.js";
@@ -163,6 +164,9 @@ const CUSTOM_TYPE_INPUT_CLASSES: ReadonlyMap<string, InputClass> = new Map<strin
 	// r4 recovery-shell: the stall-recovery executor's system interruption is the
 	// queued input of the recovery turn - machine-generated, never a human turn.
 	[SYSTEM_INTERRUPTION_CUSTOM_TYPE, "internal_continuation"],
+	// r4 p2 fix lanes: the depth-0 escalation notice lands in the owner's own
+	// transcript (machine-generated visibility, never a human turn input).
+	[STALL_RECOVERY_ESCALATION_CUSTOM_TYPE, "internal_continuation"],
 	// Harness bookkeeping receipts.
 	[THINKING_LEVEL_CLAMPED_CUSTOM_TYPE, "internal_continuation"],
 	[IMAGE_DELIVERY_SUSPICION_CUSTOM_TYPE, "internal_continuation"],
