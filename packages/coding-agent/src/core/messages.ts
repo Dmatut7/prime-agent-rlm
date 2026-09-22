@@ -626,22 +626,44 @@ export interface RlmChildReDispatchFacts {
 }
 
 /**
- * The one-line re-dispatch command the receipt carries. The prompt is truncated
- * and any triple-quote sequence is neutralized, so pasting the line into a
- * Python REPL cannot break out of the string literal; the truncation marker
- * tells the parent the task may need restating.
+ * Token-slot sanitizer for the pasteable re-dispatch line (r4-p2: blind-2 F3 /
+ * blind-3 finding 6 / blind-1 F4). Token slots (name, model, thinking) only
+ * need to stay inside one double-quoted string argument: strip quotes, the
+ * backslash, statement separators, parentheses, and the comment character, so a
+ * slot can neither close its string, chain a second statement, nor comment out
+ * the rest of the line.
+ */
+function sanitizeRlmReDispatchToken(value: string): string {
+	return value.replace(/["'\\:;()#\x00-\x1f\x7f]/g, "").trim();
+}
+
+/**
+ * The one-line re-dispatch command the receipt carries. The prompt is truncated,
+ * any triple-quote sequence is neutralized, and a trailing quote or backslash is
+ * padded with a space; token slots carry the token sanitizer above, and the
+ * truncation marker rides as a trailing Python comment - so pasting the line
+ * into a Python REPL always parses as exactly one `await rlm(...)` call. The
+ * truncation marker tells the parent the task may need restating.
  */
 export function formatRlmReDispatchLine(facts: RlmChildReDispatchFacts): string {
-	const name = sanitizeMessageHeaderValue(facts.sessionName ?? "") || "child";
+	const name = sanitizeRlmReDispatchToken(sanitizeMessageHeaderValue(facts.sessionName ?? "")) || "child";
+	const model = sanitizeRlmReDispatchToken(facts.model);
+	const thinkingLevel = facts.thinkingLevel ? sanitizeRlmReDispatchToken(facts.thinkingLevel) : undefined;
 	const truncated = facts.prompt.length > RLM_RE_DISPATCH_PROMPT_MAX_CHARS;
-	const prompt = facts.prompt
+	let prompt = facts.prompt
 		.slice(0, RLM_RE_DISPATCH_PROMPT_MAX_CHARS)
 		.replace(/"""+/g, "'''")
-		.replace(/\n+/g, " ")
+		.replace(/[\n\r]+/g, " ")
+		.replace(/\x00/g, "")
 		.trim();
-	const thinking = facts.thinkingLevel ? `, thinking="${facts.thinkingLevel}"` : "";
-	const truncationNote = truncated ? " (first 800 chars - restate the full task if this is truncated)" : "";
-	return `await rlm("""${prompt}""", name="${name}-retry", model="${facts.model}"${thinking})${truncationNote}`;
+	// A trailing quote or backslash abuts the closing delimiter and would break
+	// out of (or escape) it: pad with a space so the literal always closes.
+	if (prompt.endsWith('"') || prompt.endsWith("\\")) prompt += " ";
+	const thinking = thinkingLevel ? `, thinking="${thinkingLevel}"` : "";
+	// The truncation marker is a trailing Python comment, never a bare suffix:
+	// anything after the closing paren would parse as a second (invalid) call.
+	const truncationNote = truncated ? "  # first 800 chars - restate the full task if this is truncated" : "";
+	return `await rlm("""${prompt}""", name="${name}-retry", model="${model}"${thinking})${truncationNote}`;
 }
 
 /** Cap for the prompt carried in the receipt's re-dispatch line. */
@@ -669,8 +691,15 @@ export interface RlmChildRecoveryActionDetails {
 	inFlightTools: readonly string[];
 	/** True on the escalation variant (still silent `escalateAfterMs` after the action). */
 	escalated?: boolean;
-	/** The escalation delay the receipt quotes, in ms. */
+	/**
+	 * The escalation window the policy guarantees, in ms - the same constant on
+	 * both variants. r4-p2 (blind-3 finding 10): this field is no longer the
+	 * measured action-to-escalation gap; that value lives in
+	 * `silentSinceActionMs`, so the two semantics do not share one field.
+	 */
 	escalateAfterMs?: number;
+	/** Measured action-to-escalation gap, on the escalation variant only. */
+	silentSinceActionMs?: number;
 	/** Re-dispatch facts when the parent's live run for the child is known; absent for retained children. */
 	reDispatch?: RlmChildReDispatchFacts;
 	/** The child's session dir, for inspection after an escalation. */
@@ -691,7 +720,13 @@ export function createRlmChildRecoveryActionMessage(
 	const silentSeconds = Math.max(1, Math.round(details.silentMs / 1000));
 	const thresholdSeconds = Math.max(1, Math.round(details.thresholdMs / 1000));
 	const inFlight = details.inFlightTools.length > 0 ? details.inFlightTools.join(", ") : "none recorded";
-	const escalateSeconds = Math.max(1, Math.round((details.escalateAfterMs ?? 0) / 1000));
+	// r4-p2 (blind-3 finding 10): the escalation variant quotes the measured
+	// action-to-escalation gap; the action variant quotes the policy window.
+	const quotedSilenceMs =
+		details.escalated === true
+			? (details.silentSinceActionMs ?? details.escalateAfterMs ?? 0)
+			: (details.escalateAfterMs ?? 0);
+	const escalateSeconds = Math.max(1, Math.round(quotedSilenceMs / 1000));
 	const reDispatchLine = details.reDispatch ? formatRlmReDispatchLine(details.reDispatch) : undefined;
 	const lines: string[] = [];
 	if (details.escalated === true) {
@@ -726,6 +761,66 @@ export function createRlmChildRecoveryActionMessage(
 	return {
 		role: "custom",
 		customType: RLM_CHILD_RECOVERY_ACTION_CUSTOM_TYPE,
+		content: lines.join("\n"),
+		display: true,
+		details,
+		timestamp,
+	};
+}
+
+/**
+ * r4-p2 (blind-1 F2 / blind-3 findings 2 and 5): the depth-0 (root) escalation
+ * notice. A main session that is still silent after its automatic
+ * stall-recovery action has no parent to notify, so the notice lands in the
+ * session's own transcript (append-only, never turn input). The details carry
+ * the marker's real values - the action the sweep actually took and the
+ * measured silence since it - so the notice cannot misreport an abort-only
+ * degrade. Custom-type data is additive: an older reader degrades the message
+ * to plain transcript text.
+ */
+export const STALL_RECOVERY_ESCALATION_CUSTOM_TYPE = "stall_recovery_escalation";
+
+export interface StallRecoveryEscalationDetails {
+	/** Who performed the action this escalation reports on. */
+	executor: "daemon";
+	/** Epoch ms the automatic action executed. */
+	actedAt: number;
+	/** Measured milliseconds between the action and this escalation. */
+	silentSinceActionMs: number;
+	/** The action the sweep took: "abort_and_send", or "abort" when the queue could not deliver. */
+	action: "abort_and_send" | "abort";
+	/** Consecutive automatic actions on this session since the last external input. */
+	count: number;
+	/** Display name of the session, for the pasteable attach line. */
+	sessionName: string;
+}
+
+export function createStallRecoveryEscalationMessage(
+	details: StallRecoveryEscalationDetails,
+	timestamp = Date.now(),
+): CustomMessage<StallRecoveryEscalationDetails> {
+	const silentMinutes = Math.max(1, Math.round(details.silentSinceActionMs / 60_000));
+	// The name is interpolated into a pasteable CLI line, so it carries the same
+	// header sanitization the other notices apply.
+	const name = sanitizeMessageHeaderValue(details.sessionName);
+	const lines: string[] = [
+		`This session${name ? ` (${name})` : ""} is still silent ${silentMinutes}m after the automatic stall-recovery action (executor: ${details.executor}; action: ${details.action}; action ${details.count} of this chain).`,
+		"Automatic intervention stops here: there will be no further interrupts and no automatic re-dispatch. The session, its context, and its transcript are intact.",
+		"Your move - attach and prompt it, steer it, or close it:",
+	];
+	if (name) {
+		lines.push(`  prime-agent attach ${name}`);
+	} else {
+		lines.push("  prime-agent agents (find this session in the list)");
+	}
+	if (details.action === "abort") {
+		lines.push(
+			"The last action was abort-only: nothing was queued as this session's next input, so a new prompt is needed to restart the work.",
+		);
+	}
+	return {
+		role: "custom",
+		customType: STALL_RECOVERY_ESCALATION_CUSTOM_TYPE,
 		content: lines.join("\n"),
 		display: true,
 		details,
