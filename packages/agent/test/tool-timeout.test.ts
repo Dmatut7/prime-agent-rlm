@@ -336,6 +336,29 @@ describe("per-tool-call deadline", () => {
 		expect(textOf(toolResult)).not.toContain(TOOL_TIMEOUT_CAUSE_PREFIX);
 	});
 
+	it("a broken arbiter's NaN or Infinity recheck cannot spin the extension loop", async () => {
+		// Blind-2, medium: Math.max(1000, NaN) is NaN and setTimeout(NaN) clamps to
+		// ~1ms, so a NaN-rechecking arbiter hot-spins the vouch (measured 277/s). The
+		// floor must sanitize first. The pin counts vouch calls per deferred window:
+		// a sanitized floor keeps the re-arm at >= 1000ms, so two windows of a 150ms
+		// tool see at most a couple of vouches, not hundreds.
+		let vouchCalls = 0;
+		const vouch = () => {
+			vouchCalls += 1;
+			return { action: "extend", recheckMs: Number.NaN } as ToolTimeoutVerdict;
+		};
+		const { messages } = await runToolTurn({
+			tools: [slowTool(120)],
+			toolCalls: [{ id: "tool_1", name: "slow" }],
+			config: { toolTimeout: { afterMs: 25, vouch } },
+		});
+		const toolResult = toolResultOf(messages);
+		// The deferred call still completes (the extension held), and the arbiter
+		// was re-asked at the floored cadence, not at setTimeout(NaN)'s 1ms.
+		expect(textOf(toolResult)).toContain("late partial output");
+		expect(vouchCalls).toBeLessThanOrEqual(5);
+	});
+
 	it("afterMs 0 arms no deadline (the rollback handle)", async () => {
 		const { messages, streamCalls } = await runToolTurn({
 			tools: [slowTool(60)],

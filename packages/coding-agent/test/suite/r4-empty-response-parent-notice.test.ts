@@ -143,7 +143,12 @@ describe("empty-response terminal notice reports the real ladder facts", () => {
 		// The retry chain armed and finished, and the recovery turn actually ran:
 		// three provider calls - the failing run, the retry run, the recovery turn.
 		// The recovery dispatch is a scheduled pump hop after the retry chain settles.
+		// Blind-2, high: the FAILED retry chain must close its ledger here - a
+		// success:false end event, no false success:true credited to it later, and
+		// nothing left on the books for the next chain to inherit.
 		expect(retryEvents).toContain("start:1");
+		expect(retryEvents).toContain("end:false");
+		expect(retryEvents.filter((e) => e === "end:true")).toHaveLength(0);
 		expect(harness.session.isRetrying).toBe(false);
 		await vi.waitFor(
 			() => {

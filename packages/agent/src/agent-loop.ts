@@ -1765,9 +1765,14 @@ async function executePreparedToolCall(
 				verdict = { action: "extend", recheckMs: timeoutMs! };
 			}
 			if (verdict?.action === "extend") {
-				// Loop-level floor: a broken arbiter that returns recheckMs 0/NaN must not turn
-				// the extension check into a hot spin (measured 227 vouch/s without this).
-				armToolTimeout(Math.max(1000, verdict.recheckMs));
+				// Loop-level floor: a broken arbiter that returns 0/NaN/Infinity must not turn
+				// the extension check into a hot spin. Math.max(1000, NaN) is NaN and
+				// setTimeout(NaN) clamps to 1ms (measured 277 vouch/s), so sanitize first,
+				// then floor, then cap below the setTimeout overflow bound.
+				const sanitizedRecheckMs = Number.isFinite(verdict.recheckMs)
+					? Math.min(Math.max(1000, verdict.recheckMs), 2_147_483_000)
+					: 1000;
+				armToolTimeout(sanitizedRecheckMs);
 				return;
 			}
 			timeoutAbortCause = formatToolTimeoutAbortCause(info.toolName, info.elapsedMs, timeoutMs!);

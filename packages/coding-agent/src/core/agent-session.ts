@@ -6650,8 +6650,14 @@ export class AgentSession {
 				// still pending leaves isRetrying true, the pump gate (:10320) blocks the
 				// queued recovery turn, and the session deadlocks with no Esc escape for
 				// children (episode semantics live in _emptyTurnRecoveryUsed/_retryAttempt).
-				// _resolveRetry is a no-op without a pending promise, so the plain path
-				// below resolving again is harmless.
+				// Blind-2, high: closing the promise alone leaves the retry LEDGER
+				// (_retryAttempt/_providerWait/auth sources) on the books - the failed chain
+				// never emits auto_retry_end success:false, the recovery turn's real answer
+				// later emits a FALSE auto_retry_end success:true credited to this failed
+				// chain, and a retryable error inside the recovery turn starts at
+				// attempt=2, permanently eating a maxRetries slot per turn.
+				// _finishActiveRetryWithFailure is idempotent (no-op without a live chain).
+				this._finishActiveRetryWithFailure(msg);
 				this._resolveRetry();
 				if (this._queueEmptyTurnRecoveryTurn(msg)) return;
 				this._emitEmptyResponseExhausted(msg);
