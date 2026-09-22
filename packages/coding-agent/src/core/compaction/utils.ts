@@ -299,7 +299,15 @@ export function serializeConversation(messages: Message[]): string {
 							.filter((c): c is { type: "text"; text: string } => c.type === "text")
 							.map((c) => c.text)
 							.join("");
-			if (content) parts.push(`[User]: ${content}`);
+			// A user message can carry images only (pasted images, attach_image
+			// deliveries): text-only serialization dropped such messages entirely, so
+			// the summarizer lost the fact that an image was in the conversation.
+			// Count them as a placeholder instead - honest count, no content invented.
+			const imageCount = typeof msg.content === "string" ? 0 : msg.content.filter((c) => c.type === "image").length;
+			const pieces = [content, ...(imageCount > 0 ? [`[image x${imageCount}]`] : [])].filter(
+				(piece) => piece.length > 0,
+			);
+			if (pieces.length > 0) parts.push(`[User]: ${pieces.join(" ")}`);
 		} else if (msg.role === "assistant") {
 			const textParts: string[] = [];
 			const thinkingParts: string[] = [];

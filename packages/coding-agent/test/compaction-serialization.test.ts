@@ -186,6 +186,40 @@ describe("serializeConversation", () => {
 		expect(serialized.length - bodies.length).toBeLessThan(serialized.length * 0.02);
 	});
 
+	it("keeps a pure-image user message as a counted placeholder", () => {
+		// The measured defect: a user message that only carried images serialized
+		// to nothing, so the summarizer's input lost the message entirely.
+		const messages: Message[] = [
+			{
+				role: "user",
+				content: [{ type: "image", data: "aGk=", mimeType: "image/png" }],
+				timestamp: Date.now(),
+			},
+		];
+
+		const serialized = serializeConversation(messages);
+
+		expect(serialized).toBe("[User]: [image x1]");
+	});
+
+	it("counts the images of a mixed user message without touching its text", () => {
+		const messages: Message[] = [
+			{
+				role: "user",
+				content: [
+					{ type: "text", text: "look at these" },
+					{ type: "image", data: "aGk=", mimeType: "image/png" },
+					{ type: "image", data: "aGk=", mimeType: "image/png" },
+				],
+				timestamp: Date.now(),
+			},
+		];
+
+		const serialized = serializeConversation(messages);
+
+		expect(serialized).toBe("[User]: look at these [image x2]");
+	});
+
 	it("should not truncate assistant or user messages", () => {
 		const longText = "y".repeat(5000);
 		const messages: Message[] = [
