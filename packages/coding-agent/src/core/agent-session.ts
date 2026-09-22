@@ -1667,7 +1667,7 @@ export const CANCELLABLE_KERNEL_HOST_REQUEST_TYPES: readonly string[] = [
 	"rlm.list_subagents", // reads this session's own child roster
 	"rlm.collect", // bounded read-only wait for this session's own children; cancelling it cancels no child
 	"agent_observe.*", // list/get/recent: reads transcripts and status
-	"model.info", // reads this session's model
+	"model.info", // reads the model serving the current run (routed image turns included)
 	"agent_message.list_agents", // reads the family roster
 ];
 const SESSION_PERSIST_FAILURE_REPORT_BASE_MS = 30_000;
@@ -15152,11 +15152,18 @@ export class AgentSession {
 			),
 			"rlm.progress.note": createRlmProgressNoteHostHandler((message) => this.noteRlmProgress(message)),
 			"rlm.delete_subagent": createRlmDeleteSubagentHostHandler((target) => this.deleteRlmSubagent(target)),
-			"model.info": async () => ({
-				id: this.model?.id ?? null,
-				provider: this.model?.provider ?? null,
-				input: this.model?.input ?? [],
-			}),
+			"model.info": async () => {
+				// Report the model serving the current run, not the session model:
+				// a routed image turn serves on settings.imageModel, and kernel
+				// preflights (attach_image's vision check) must judge the model that
+				// will receive the messages submitted while the override is in force.
+				const servingModel = this._runModel();
+				return {
+					id: servingModel?.id ?? null,
+					provider: servingModel?.provider ?? null,
+					input: servingModel?.input ?? [],
+				};
+			},
 		};
 		if (this._includeGoals) {
 			for (const type of ["goal.get", "goal.create", "goal.complete"]) {

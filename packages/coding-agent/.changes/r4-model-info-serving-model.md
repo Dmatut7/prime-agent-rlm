@@ -1,0 +1,1 @@
+- Fixed `model.info` (used by the attach-image skill's vision preflight) to report the model serving the current run instead of the session model, so attaching images mid-turn now works on turns routed to `settings.imageModel` while text-only session models still reject.
