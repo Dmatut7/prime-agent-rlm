@@ -1,7 +1,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import type { ModelRegistry } from "../src/core/model-registry.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
@@ -358,6 +358,36 @@ describe("agents view settled/duration/answer columns (U3)", () => {
 			}),
 		);
 		expect(silentSubagent.settled).toBe(false);
+	});
+
+	it("quantizes a busy session's durationMs to whole seconds so the compose fingerprint only moves once a second", () => {
+		// 18a12dc6c pinned the mechanism only indirectly: the existing whole-day
+		// pins pass with or without the quantization. This pins the boundary
+		// itself (K3/DS reviews, C2-3): 990ms in flight reads as 0, 1999ms reads
+		// as 1000, and two unscoped flushes inside the same second compose the
+		// same fingerprint (the memo serves the same summary object), so a busy
+		// row stops republishing on every flush.
+		const busy = makeState({ activeSessionId: "quantized", sessionFile: "/tmp/quantized.jsonl", isStreaming: true });
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(new Date("2026-05-01T00:00:00.990Z"));
+			expect(summaryForActiveSession(busy).durationMs).toBe(0);
+			vi.setSystemTime(new Date("2026-05-01T00:00:01.999Z"));
+			expect(summaryForActiveSession(busy).durationMs).toBe(1000);
+
+			vi.setSystemTime(new Date("2026-05-01T00:00:05.000Z"));
+			const first = summaryForActiveSession(busy);
+			// 400ms later, still the same second: same fingerprint, memo hit.
+			vi.setSystemTime(new Date("2026-05-01T00:00:05.400Z"));
+			expect(summaryForActiveSession(busy)).toBe(first);
+			// Crossing the whole-second boundary is the one permitted flip.
+			vi.setSystemTime(new Date("2026-05-01T00:00:06.000Z"));
+			const crossed = summaryForActiveSession(busy);
+			expect(crossed).not.toBe(first);
+			expect(crossed.durationMs).toBe(6000);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("formats the duration cell across unit boundaries", () => {
