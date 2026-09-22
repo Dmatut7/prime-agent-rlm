@@ -129,7 +129,11 @@ describe("assistant Markdown file links", () => {
 		setCapabilities({ images: null, trueColor: true, hyperlinks: false });
 		const component = new AssistantMessageComponent(message, false, undefined, undefined, { cwd });
 		const lines = component.render(80);
-		expect(linkTargets(lines)).toEqual([]);
+		// ENG-6126 (#2430): the renderer keeps OSC 8 wrappers in the fallback so
+		// labeled links stay clickable on terminals that consume unknown OSC
+		// silently. The pin keeps its real propositions: the resolved target is
+		// exact and the visible path fallback text is unchanged.
+		expect(linkTargets(lines)).toEqual([reportUrl]);
 		expect(stripAnsi(lines.join("\n")).trim()).toBe("Audit report (audit-out/report.md)");
 	});
 });
