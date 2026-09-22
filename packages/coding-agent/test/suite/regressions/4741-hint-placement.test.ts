@@ -68,6 +68,7 @@ describe("ENG-4741 hint placement", () => {
 		const queuedMessagesContainer = new Container();
 		const sideQuestionContainer = new Container();
 		const editorContainer = new Container();
+		const trayInfoLine = new Container();
 		const subagentSummaryLine = new Container();
 		const footerSlot = new Container();
 		const mode = Object.assign(Object.create(InteractiveMode.prototype), {
@@ -76,6 +77,7 @@ describe("ENG-4741 hint placement", () => {
 			queuedMessagesContainer,
 			sideQuestionContainer,
 			editorContainer,
+			trayInfoLine,
 			subagentSummaryLine,
 			footerSlot,
 		});
@@ -86,7 +88,13 @@ describe("ENG-4741 hint placement", () => {
 			queuedMessagesContainer,
 			sideQuestionContainer,
 		]);
-		expect(callPrivate(mode, "getPromptDockComponents")).toEqual([editorContainer, subagentSummaryLine, footerSlot]);
+		// U6: the dock stacks ① tray info line, ② footer watermark, ③ subagents line.
+		expect(callPrivate(mode, "getPromptDockComponents")).toEqual([
+			editorContainer,
+			trayInfoLine,
+			footerSlot,
+			subagentSummaryLine,
+		]);
 	});
 
 	it("keeps hints in the fullscreen transcript instead of the prompt dock", () => {

@@ -1,6 +1,5 @@
 import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { theme } from "../theme/theme.js";
-import { expandCollapseHint } from "./keybinding-hints.js";
 
 export type TurnStepStatus = "queued" | "running" | "done" | "error";
 
@@ -17,19 +16,30 @@ export function turnStepVerb(toolName: string): string {
 }
 
 /**
- * U4 turn aggregation: the tool activity of one agent turn (every tool call
- * between two user prompts) collapses to a single line — step count, total
- * wall time, and a verb summary — with Ctrl+O expanding the individual tool
- * blocks. Settled tools hide themselves while the group is collapsed; the
- * summary component owns the visible line. While the turn is still running,
- * a live tool keeps its own body (the running preview stays watchable) and
- * merges into the line once it settles.
+ * U4/U6 turn aggregation: one agent turn (every tool call between two user
+ * prompts) renders a two-line mechanical surface at the turn head — ① the
+ * thinking block header `思考 12.3s` / `思考 5 段 · 96.3s` (one header for the
+ * whole turn, always visible while it has thinking; Ctrl+T expands the
+ * traces) and ② the process line `⚙ 10 步 · 1.0s · python×10` (Ctrl+O expands
+ * the tool calls, outputs, and edit diffs). The collapsed view renders no
+ * per-block thinking rows; the full traces only appear expanded. Settled
+ * tools hide themselves while the group is collapsed; the summary component
+ * owns the visible lines. While the turn is still running, a live tool keeps
+ * its own body (the running preview stays watchable) and merges into the
+ * line once it settles.
  */
 export class TurnActivityState {
 	readonly steps: TurnStep[] = [];
 	readonly startedAt: number;
 	private lastSettledAt: number | undefined;
+	private turnEndedAt: number | undefined;
+	private thinkingSegments = 0;
+	private liveThinkingSegments = 0;
 	private collapsed = true;
+	/** U6 K3 ②: the turn's own Ctrl+T lane (the traces inside this turn's span). */
+	thinkingExpanded = false;
+	/** U6 K3 ②: the turn's own Ctrl+P lane (agent message rows inside this turn's span). */
+	agentMessagesExpanded = false;
 
 	constructor(startedAt = Date.now()) {
 		this.startedAt = startedAt;
@@ -48,6 +58,32 @@ export class TurnActivityState {
 
 	addStep(step: TurnStep): void {
 		this.steps.push(step);
+	}
+
+	/** Thinking blocks of a settled assistant message land here (U6). */
+	addThinkingSegments(count: number): void {
+		if (count > 0) {
+			this.thinkingSegments += count;
+		}
+	}
+
+	/**
+	 * The run ended (agent_end / replay turn boundary). A tool turn already
+	 * freezes its duration on the last settled step; a thinking-only turn has
+	 * no steps, so this stamp is what stops its `思考 Xs` clock.
+	 */
+	markTurnEnded(timestamp = Date.now()): void {
+		this.turnEndedAt = timestamp;
+	}
+
+	/** Thinking blocks of the message still streaming (U6); the live count is replaced, not accumulated. */
+	setLiveThinkingSegments(count: number): void {
+		this.liveThinkingSegments = Math.max(0, count);
+	}
+
+	/** Thinking segments counted so far: settled messages plus the streaming one. */
+	get totalThinkingSegments(): number {
+		return this.thinkingSegments + this.liveThinkingSegments;
 	}
 
 	markRunning(toolCallId: string, timestamp = Date.now()): void {
@@ -86,6 +122,22 @@ export class TurnActivityState {
 		return step !== undefined && (step.status === "done" || step.status === "error");
 	}
 
+	/**
+	 * Whether the given call's step SUCCEEDED. The hiding predicate behind the
+	 * aggregate line reads this (第五批: errors never fold) - a failed tool's
+	 * collapsed ✗ row stays visible with its readable error, exactly as
+	 * pre-U4; only successful work folds into the ⚙ line.
+	 */
+	isStepDone(toolCallId: string): boolean {
+		const step = this.steps.find((candidate) => candidate.toolCallId === toolCallId);
+		return step !== undefined && step.status === "done";
+	}
+
+	/** Failed steps in this turn; the aggregate line reports the count. */
+	get errorStepCount(): number {
+		return this.steps.filter((step) => step.status === "error").length;
+	}
+
 	private verbSummary(): string {
 		const counts = new Map<string, number>();
 		for (const step of this.steps) {
@@ -95,17 +147,49 @@ export class TurnActivityState {
 		return [...counts.entries()].map(([verb, count]) => (count > 1 ? `${verb}×${count}` : verb)).join(" · ");
 	}
 
+	private durationSeconds(): string {
+		// A tool turn freezes on its last settled step; a thinking-only turn
+		// freezes on markTurnEnded (agent_end / replay turn boundary).
+		const end = this.steps.length > 0 ? (this.lastSettledAt ?? Date.now()) : (this.turnEndedAt ?? Date.now());
+		return `${(Math.max(0, end - this.startedAt) / 1000).toFixed(1)}s`;
+	}
+
+	/**
+	 * U6 ①: the turn's thinking block header — one line, always visible while
+	 * the turn has thinking. 评审短账: with steps the duration belongs to the ⚙
+	 * line (the header carries the segment count alone); a thinking-only turn
+	 * has no ⚙ line, so the header keeps the duration - `思考 36.3s` for one
+	 * segment, `思考 5 段 · 96.3s` for several.
+	 */
+	thinkingHeaderText(): string {
+		const segments = this.totalThinkingSegments;
+		if (segments <= 0) {
+			return "";
+		}
+		if (this.steps.length > 0) {
+			return `思考 ${segments} 段`;
+		}
+		return segments > 1 ? `思考 ${segments} 段 · ${this.durationSeconds()}` : `思考 ${this.durationSeconds()}`;
+	}
+
+	/** U6 ②: the process line — steps, duration, verb summary, error count. */
 	summaryText(): string {
 		const count = this.steps.length;
-		const running = this.steps.some((step) => step.status === "running" || step.status === "queued");
-		const duration =
-			this.lastSettledAt !== undefined
-				? Math.max(0, this.lastSettledAt - this.startedAt)
-				: Date.now() - this.startedAt;
-		const middle = running
-			? `运行中 —— ${this.verbSummary()}`
-			: `${(duration / 1000).toFixed(1)}s —— ${this.verbSummary()}`;
-		return `⚙ 本轮 ${count} 步 · ${middle}`;
+		if (count === 0) {
+			return "";
+		}
+		const parts = [`⚙ ${count} 步 · ${this.durationSeconds()}`];
+		// 第五批: the aggregate line reports its own failures - a collapsed turn
+		// with a broken step shows ✗N beside the counts, so the error surface is
+		// self-alarming even while the successful rows fold.
+		if (this.errorStepCount > 0) {
+			parts.push(theme.fg("error", `✗${this.errorStepCount}`));
+		}
+		const verbs = this.verbSummary();
+		if (verbs) {
+			parts.push(verbs);
+		}
+		return parts.join(" · ");
 	}
 }
 
@@ -114,7 +198,12 @@ export class TurnSummaryComponent implements Component {
 	private cachedWidth?: number;
 	private cachedLines?: string[];
 
-	constructor(private readonly state: TurnActivityState) {}
+	constructor(private readonly turnState: TurnActivityState) {}
+
+	/** The turn's state - the per-turn lanes (K3 ②) live on it. */
+	get state(): TurnActivityState {
+		return this.turnState;
+	}
 
 	setExpanded(expanded: boolean): void {
 		if (this.expanded === expanded) {
@@ -134,15 +223,24 @@ export class TurnSummaryComponent implements Component {
 		if (this.cachedLines && this.cachedWidth === width && this.state.isSettled) {
 			return this.cachedLines;
 		}
-		const hint = expandCollapseHint("app.tools.expand", this.expanded);
-		const line = ` ${this.state.summaryText()} ${hint}`;
 		const safeWidth = Math.max(1, width);
-		const lines = [theme.fg("muted", truncateToWidth(line, safeWidth, "")), " ".repeat(safeWidth)];
+		// U6 two-line mechanical surface, both pinned at the turn head: the
+		// thinking block header (①, always visible while the turn has thinking)
+		// above the process line (②). No per-line expand hints — the single
+		// global hint line at the chat tail carries the key division.
+		const textLines = [this.state.thinkingHeaderText(), this.state.summaryText()].filter((text) => text.length > 0);
+		// F2 (DS2 review): one blank line between the two text lines, none
+		// trailing each - the turn head is 3 lines for a full turn, 1 for a
+		// thinking-only one, and the following content carries its own spacing.
+		const lines = textLines.flatMap((text, index) => {
+			const rendered = [theme.fg("muted", truncateToWidth(` ${text}`, safeWidth, ""))];
+			return index < textLines.length - 1 ? [...rendered, " ".repeat(safeWidth)] : rendered;
+		});
 		if (this.state.isSettled) {
 			this.cachedWidth = width;
 			this.cachedLines = lines;
 		} else {
-			// A live run keeps mutating; only the settled line is cacheable.
+			// A live run keeps mutating; only the settled lines are cacheable.
 			this.cachedWidth = undefined;
 			this.cachedLines = undefined;
 		}

@@ -9,7 +9,7 @@ import {
 } from "../../../core/tools/truncate.js";
 import { theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
-import { expandCollapseHint, keyText } from "./keybinding-hints.js";
+import { keyText } from "./keybinding-hints.js";
 import { truncateToVisualLines } from "./visual-truncate.js";
 
 const PREVIEW_LINES = 20;
@@ -205,13 +205,10 @@ export class BashExecutionComponent extends Container {
 			const statusParts: string[] = [];
 
 			if (hiddenLineCount > 0 && !this.expanded) {
-				statusParts.push(
-					theme.fg("muted", `… ${availableLines.length} 行输出 ${expandCollapseHint("app.tools.expand", false)}`),
-				);
+				// U6: no per-line expand hint — the global tail line states the keys.
+				statusParts.push(theme.fg("muted", `… ${availableLines.length} 行输出`));
 			} else if (availableLines.length > COMPLETED_BODY_MAX_LINES && !this.expanded) {
-				statusParts.push(
-					theme.fg("muted", `… ${availableLines.length} 行输出 ${expandCollapseHint("app.tools.expand", false)}`),
-				);
+				statusParts.push(theme.fg("muted", `… ${availableLines.length} 行输出`));
 			}
 
 			if (this.status === "cancelled") {

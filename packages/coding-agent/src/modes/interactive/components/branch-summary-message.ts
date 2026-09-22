@@ -1,7 +1,6 @@
 import { Box, Clickable, Markdown, type MarkdownTheme, Spacer, Text } from "@earendil-works/pi-tui";
 import type { BranchSummaryMessage } from "../../../core/messages.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
-import { expandCollapseHint } from "./keybinding-hints.js";
 
 /**
  * Component that renders a branch summary message with collapsed/expanded state.
@@ -44,14 +43,10 @@ export class BranchSummaryMessageComponent extends Box {
 				}),
 			);
 		} else {
+			// U6: no per-line expand hint — the global tail line states the keys.
 			this.addChild(
-				new Clickable(
-					new Text(
-						`${theme.fg("customMessageText", "Branch summary")} ${expandCollapseHint("app.tools.expand", false)}`,
-						0,
-						0,
-					),
-					() => this.setExpanded(!this.expanded),
+				new Clickable(new Text(theme.fg("customMessageText", "Branch summary"), 0, 0), () =>
+					this.setExpanded(!this.expanded),
 				),
 			);
 		}

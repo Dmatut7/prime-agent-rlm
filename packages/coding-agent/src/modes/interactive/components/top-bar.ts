@@ -3,17 +3,14 @@ import { theme } from "../theme/theme.js";
 
 export interface TopBarOptions {
 	getChatName: () => string | undefined;
-	/** Total session spend in USD (branch total, subagents included). */
-	getCostUsd?: () => number | undefined;
-	/** Current model id (U1: pinned on the bar next to the spend). */
-	getModel?: () => string | undefined;
 }
 
 /**
  * Pinned top bar for fullscreen chats: the chat name centered in plain text on
- * the terminal background, with the session's spend beside it. Rendered as the
- * fullscreen viewport's pinned header, so it stays on screen in every scroll
- * position.
+ * the terminal background. Rendered as the fullscreen viewport's pinned header,
+ * so it stays on screen in every scroll position. U6: the model pin and the
+ * session spend moved out (the money lives only in the subagents line's spend
+ * cell, one fact one home; /usage carries the detailed breakdown).
  */
 export class TopBar implements Component {
 	private readonly options: TopBarOptions;
@@ -39,18 +36,11 @@ export class TopBar implements Component {
 		if (!name) {
 			return [""];
 		}
-		// Center the name; the cost trails it with a small gap. No background,
-		// no rules: the bar should read as plain text on the terminal.
+		// Center the name. No background, no rules: the bar should read as plain
+		// text on the terminal.
 		const nameWidth = visibleWidth(name);
-		const cost = this.options.getCostUsd?.();
-		const costText =
-			typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? theme.fg("dim", `$${cost.toFixed(2)}`) : "";
-		const model = (this.options.getModel?.() ?? "").replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim();
-		const modelText = model ? theme.fg("dim", model) : "";
 		const start = Math.max(0, Math.floor((safeWidth - nameWidth) / 2));
-		const line = `${" ".repeat(start)}${theme.fg("text", name)}${costText ? `  ${costText}` : ""}${
-			modelText ? `  ${modelText}` : ""
-		}`;
+		const line = `${" ".repeat(start)}${theme.fg("text", name)}`;
 		return [truncateToWidth(line, safeWidth, "")];
 	}
 }

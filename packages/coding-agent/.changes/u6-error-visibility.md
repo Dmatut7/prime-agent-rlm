@@ -1,0 +1,1 @@
+- Error visibility fix (user-reported regression): a failed tool's collapsed ✗ row stays visible with its readable error instead of folding into the ⚙ line, and the aggregate line itself reports the failure count (`⚙ 4 步 · 1.0s · ✗1 · python×4`), so a broken step is visible both in detail and in summary.

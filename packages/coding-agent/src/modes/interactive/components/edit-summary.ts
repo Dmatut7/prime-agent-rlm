@@ -8,7 +8,6 @@ import type { IpythonToolDetails } from "../../../core/tools/ipython.js";
 import { resolveToCwd } from "../../../core/tools/path-utils.js";
 import { canonicalizePath, formatPathRelativeToCwdOrAbsolute } from "../../../utils/paths.js";
 import { theme } from "../theme/theme.js";
-import { expandCollapseHint } from "./keybinding-hints.js";
 
 export interface FileChangeSummary {
 	path: string;
@@ -98,31 +97,22 @@ function formatFileChangePath(path: string, cwd: string): string {
 
 /**
  * One `    ╰─ <path> +N -M` row, truncated to width; the path renders relative
- * to cwd where possible and the hint renders only when diffsExpanded is defined.
+ * to cwd where possible. U6 removed the per-row expand hint (the global tail
+ * line owns the keys).
  */
 export function formatFileChangeSummaryLine(
 	rawPath: string,
 	cwd: string | undefined,
 	change: Pick<FileChangeSummary, "added" | "removed">,
-	diffsExpanded: boolean | undefined,
 	width: number,
 ): string {
 	const prefix = theme.fg("dim", FILE_CHANGE_SUMMARY_PREFIX);
-	const hint =
-		diffsExpanded === undefined
-			? ""
-			: `${theme.fg("dim", " · ")}${expandCollapseHint("app.edits.expand", diffsExpanded)}`;
-	// Size the path against the widest hint variant ("收起", same width as "展开") so toggling
-	// ctrl+j never re-truncates it — the summary line is a stable anchor.
-	const widestHint =
-		diffsExpanded === undefined ? "" : `${theme.fg("dim", " · ")}${expandCollapseHint("app.edits.expand", true)}`;
 	const counts = `${theme.fg("dim", " ")}${formatChangeCounts(change)}`;
-	const suffix = `${counts}${hint}`;
 	const safeWidth = Math.max(1, width);
-	const available = Math.max(1, safeWidth - visibleWidth(prefix) - visibleWidth(counts) - visibleWidth(widestHint));
+	const available = Math.max(1, safeWidth - visibleWidth(prefix) - visibleWidth(counts));
 	const displayPath = cwd === undefined ? rawPath : formatFileChangePath(rawPath, cwd);
 	const path = truncateToWidth(displayPath, available, "…");
-	return truncateToWidth(`${prefix}${theme.fg("muted", path)}${suffix}`, safeWidth, "");
+	return truncateToWidth(`${prefix}${theme.fg("muted", path)}${counts}`, safeWidth, "");
 }
 
 export function formatTotalChangeSummary(changes: readonly FileChangeSummary[]): string {

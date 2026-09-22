@@ -8,7 +8,6 @@ import {
 	readSpendPriceOverrides,
 	SPEND_PRICE_OVERRIDES_PATH,
 	type SpendPriceRates,
-	spendOverrideCorrection,
 } from "../src/core/spend-pricing.js";
 
 /**
@@ -180,19 +179,6 @@ describe("spend price overrides", () => {
 		const overridden = node({ model, ownUsage: usage(1_000_000, 0, 0, 0, 1.2) });
 		// 1M input at the corrected 3, not the recorded 1.2.
 		expect(nodeSpendMoney(overridden, pricing({ "bailian/kimi-k3": { input: 3 } }))).toBe(3);
-	});
-
-	it("sums every node's correction, so a published total can be corrected by the same amount", () => {
-		const root = node({
-			id: "root",
-			model: { provider: "bailian", id: "kimi-k3" },
-			ownUsage: usage(1_000_000, 0, 0, 0, 1),
-			children: [node({ id: "sub-1", model, ownUsage: usage(1_000_000, 0, 0, 0, 1) })],
-		});
-		// Root and child both move from 1 (recorded) to 3 (corrected): +2 each.
-		expect(spendOverrideCorrection(root, pricing({ "bailian/kimi-k3": { input: 3 } }))).toBeCloseTo(4);
-		// Nothing overridden, nothing corrected: the header figure is untouched.
-		expect(spendOverrideCorrection(root, pricing({}))).toBe(0);
 	});
 
 	it("lists each model that spent money with the rates that priced it", () => {

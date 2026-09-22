@@ -98,7 +98,7 @@ describe("marquee TUI components", () => {
 		expect(collapsed).toContain("ValueError");
 		expect(collapsed).not.toContain("ValueError: bad");
 		expect(collapsed).not.toContain("ipython");
-		expect(collapsed).toContain("Ctrl+O 展开");
+		expect(collapsed).not.toContain("Ctrl+O");
 		expect(collapsed).not.toContain("traceback collapsed");
 		expect(collapsed).not.toContain('File "<stdin>"');
 
@@ -147,7 +147,7 @@ describe("marquee TUI components", () => {
 
 		const collapsed = stripAnsi(component.render(100).join("\n"));
 		expect(collapsed).toContain("cat /tmp/missing-file");
-		expect(collapsed).toContain("CalledProcessError · (Ctrl+O 展开)");
+		expect(collapsed).toContain("CalledProcessError");
 		expect(collapsed).not.toContain("No such file or directory");
 		expect(collapsed).not.toContain("returned non-zero exit status 1.");
 		expect(collapsed).not.toContain("traceback collapsed");
@@ -182,7 +182,7 @@ describe("marquee TUI components", () => {
 		const component = new IPythonCellComponent(state);
 
 		const collapsed = stripAnsi(component.render(100).join("\n"));
-		expect(collapsed).toContain("RuntimeError · (Ctrl+O 展开)");
+		expect(collapsed).toContain("RuntimeError");
 		expect(collapsed).not.toContain("no output");
 		expect(collapsed).not.toContain("/tmp/internal.py");
 		expect(collapsed).not.toContain("line 12");
@@ -230,7 +230,8 @@ describe("marquee TUI components", () => {
 		expect(collapsed).toContain("line_0 = 0");
 		expect(collapsed).not.toContain("line_7 = 7");
 		expect(collapsed).toContain("↑ 8");
-		expect(collapsed.match(/展开/g)?.length).toBe(1);
+		// U6: no per-line expand hint.
+		expect(collapsed).not.toContain("展开");
 
 		component.update({ ...state, expanded: true });
 		const expanded = stripAnsi(component.render(100).join("\n"));
@@ -238,7 +239,7 @@ describe("marquee TUI components", () => {
 		expect(expanded).toContain("line_7 = 7");
 	});
 
-	test("shows one expand hint when ipython input and output are both collapsed", () => {
+	test("renders no expand hint when ipython input and output are both collapsed", () => {
 		const code = Array.from({ length: 8 }, (_, index) => `line_${index} = ${index}`).join("\n");
 		const output = Array.from({ length: 8 }, (_, index) => `out_${index}`).join("\n");
 		const component = new IPythonCellComponent({
@@ -250,9 +251,11 @@ describe("marquee TUI components", () => {
 			expanded: false,
 		});
 
+		// U6: no per-line expand hint — the global tail line states the keys.
 		const collapsed = stripAnsi(component.render(100).join("\n"));
 		expect(collapsed).toContain("↑ 8 ↓ 8 lines");
-		expect(collapsed.match(/展开/g)?.length).toBe(1);
+		expect(collapsed).not.toContain("展开");
+		expect(collapsed).not.toContain("Ctrl+");
 	});
 
 	test("reflows cached ipython cells when terminal width changes", () => {
@@ -305,7 +308,7 @@ describe("marquee TUI components", () => {
 
 		const collapsed = component.render(100);
 		const collapsedText = stripAnsi(collapsed.join("\n"));
-		expect(collapsedText).toContain("Ctrl+O 展开");
+		expect(collapsedText).not.toContain("Ctrl+O");
 		expect(collapsedText).not.toContain("traceback collapsed");
 		expect(collapsedText).not.toContain('File "<stdin>"');
 
@@ -321,11 +324,11 @@ describe("marquee TUI components", () => {
 	test("renders assistant thinking as quiet text without background styling", () => {
 		const component = new AssistantMessageComponent(
 			createAssistantMessage("answer", "Check **bold** and `code` first.\n```ts\nconst value = 1;\n```"),
-			// U4: the full quiet Markdown trace only renders in the expanded view.
+			// U6: the full quiet Markdown trace only renders in the T lane.
 			false,
 			undefined,
 			"Thinking...",
-			{ expanded: true },
+			{ thinkingExpanded: true },
 		);
 
 		const rendered = component.render(80).join("\n");
@@ -356,7 +359,7 @@ describe("marquee TUI components", () => {
 
 		const collapsed = stripAnsi(component.render(100).join("\n"));
 		expect(collapsed).toContain("Error: Provider request failed");
-		expect(collapsed).toContain("Ctrl+O 展开");
+		expect(collapsed).not.toContain("Ctrl+O");
 		expect(collapsed).not.toContain("error details collapsed");
 		expect(collapsed).not.toContain("/tmp/internal.py");
 
@@ -427,7 +430,7 @@ describe("marquee TUI components", () => {
 		const collapsed = stripAnsi(collapsedLines.join("\n"));
 		expect(collapsed).toContain("python");
 		expect(collapsed).toContain("12ms");
-		expect(collapsed).toContain("Ctrl+O 展开");
+		expect(collapsed).not.toContain("Ctrl+O");
 		expect(collapsed).not.toContain("ipython");
 		expect(collapsed).not.toContain('"code"');
 
@@ -436,7 +439,8 @@ describe("marquee TUI components", () => {
 		const expanded = stripAnsi(expandedLines.join("\n"));
 		const expandedStatus = expandedLines.map(stripAnsi).find((line) => line.includes("python · print(55)"));
 		expect(expandedStatus).toContain("↑ 1 ↓ 1 lines · 12ms");
-		expect(expanded).toContain("Ctrl+O 收起");
+		// U6: no per-line expand hint, expanded or collapsed.
+		expect(expanded).not.toContain("Ctrl+O");
 		expect(expanded).toContain("print(55)");
 		expect(expanded).toContain("55");
 		expect(expanded).not.toContain('"code"');

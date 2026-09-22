@@ -26,7 +26,6 @@ import {
 	type RlmChildTerminalNoticeDetails,
 } from "../../../core/messages.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
-import { expandCollapseHint } from "./keybinding-hints.js";
 
 type InjectedPromptDetails =
 	| GoalContextDetails
@@ -150,45 +149,40 @@ export class InjectedPromptMessageComponent extends Container {
 			return `${theme.fg("accent", "◆")} ${theme.fg("muted", label)}`;
 		}
 		if (this.message.customType === RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE) {
-			const hint = this.expanded ? "" : ` ${expandCollapseHint("app.tools.expand", false)}`;
 			// Not an error: the silence may be healthy long work. The label says what is
 			// known ("still running"), and the expanded body carries the facts.
-			return theme.fg("muted", "RLM child still running") + theme.fg("dim", hint);
+			return theme.fg("muted", "RLM child still running");
 		}
 		if (this.message.customType === PYTHON_SKILLS_UNAVAILABLE_CUSTOM_TYPE) {
 			const details = this.message.details as PythonSkillsUnavailableDetails | undefined;
 			const skills = details?.skills?.length
 				? ` · ${truncateToWidth(details.skills.join(", "), Math.max(20, 90 - "Python skills unavailable · ".length))}`
 				: "";
-			const hint = this.expanded ? "" : ` ${expandCollapseHint("app.tools.expand", false)}`;
-			return theme.fg("muted", "Python skills unavailable") + theme.fg("dim", skills + hint);
+			return theme.fg("muted", "Python skills unavailable") + theme.fg("dim", skills);
 		}
 		if (
 			this.message.customType === RLM_CHILD_FAILURE_CUSTOM_TYPE ||
 			this.message.customType === RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE
 		) {
-			const hint = this.expanded ? "" : ` ${expandCollapseHint("app.tools.expand", false)}`;
 			const failure = rlmChildFailureLabel(this.message);
 			// Failure kinds (stall_killed/aborted/error) are the parent's only signal
 			// that a child died; rendering them in the same muted color as a routine
 			// "completed without reply" notice hides exactly the case that matters.
-			if (failure) return theme.fg("error", failure) + theme.fg("dim", hint);
-			return theme.fg("muted", "RLM child status") + theme.fg("dim", hint);
+			if (failure) return theme.fg("error", failure);
+			return theme.fg("muted", "RLM child status");
 		}
 
 		const details = this.message.details;
 		const title = goalLabel(details as GoalContextDetails | undefined);
 		const meta = this.metaText();
-		const hint = this.expanded ? "" : ` ${expandCollapseHint("app.tools.expand", false)}`;
-		return theme.fg("muted", title) + meta + theme.fg("dim", hint);
+		return theme.fg("muted", title) + meta;
 	}
 
 	private heartbeatHeaderText(): string {
 		const details = this.message.details as HeartbeatPromptDetails | undefined;
 		const pulse = theme.fg("error", "♥");
 		const schedule = theme.fg("muted", heartbeatPromptSchedule(details?.schedule));
-		const hint = this.expanded ? "" : ` ${expandCollapseHint("app.tools.expand", false)}`;
-		return `${pulse} ${theme.fg("muted", "Heartbeat prompt")}${theme.fg("dim", " · ")}${schedule}${theme.fg("dim", hint)}`;
+		return `${pulse} ${theme.fg("muted", "Heartbeat prompt")}${theme.fg("dim", " · ")}${schedule}`;
 	}
 
 	private metaText(): string {

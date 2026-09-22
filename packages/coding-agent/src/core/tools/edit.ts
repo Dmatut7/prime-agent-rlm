@@ -304,13 +304,12 @@ class EditChangeSummaryComponent implements Component {
 		private readonly rawPath: string,
 		private readonly cwd: string,
 		private readonly change: { added: number; removed: number },
-		private readonly diffsExpanded: boolean | undefined,
 		private readonly diffLines: readonly string[] | undefined,
 	) {}
 
 	render(width: number): string[] {
 		const safeWidth = Math.max(1, width);
-		const lines = [formatFileChangeSummaryLine(this.rawPath, this.cwd, this.change, this.diffsExpanded, safeWidth)];
+		const lines = [formatFileChangeSummaryLine(this.rawPath, this.cwd, this.change, safeWidth)];
 		if (this.diffLines !== undefined) {
 			const indent = FILE_CHANGE_DIFF_INDENT.slice(0, Math.max(0, safeWidth - 1));
 			const contentWidth = Math.max(1, safeWidth - indent.length);
@@ -357,10 +356,7 @@ function buildEditCallComponent(
 			rawPath ?? "...",
 			cwd,
 			change,
-			// The ctrl+j hint renders on every edit summary row (unlike the ctrl+o
-			// hint, which the latest tool row owns), matching thinking and
-			// agent-message hints.
-			expanded,
+			// U6: no per-row expand hint - the global tail line owns the keys.
 			expanded ? renderDiff(component.preview.diff).split("\n") : undefined,
 		),
 	);

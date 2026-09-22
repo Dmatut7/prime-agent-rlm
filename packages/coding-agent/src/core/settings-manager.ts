@@ -688,11 +688,11 @@ export interface TelemetrySettings {
 	noticeShown?: boolean;
 }
 
-/** U1 persistent footer telemetry line density (footer.ts renders the watermark). */
-export type FooterTelemetrySetting = "off" | "compact" | "full";
+/** U6 footer telemetry switch (footer.ts renders the watermark line). */
+export type FooterTelemetrySetting = "off" | "on";
 
 export interface FooterSettings {
-	/** Default: "compact" — one line: model · ctx tokens/window(%) · compaction line. */
+	/** Default: "on" — one line: model · thinking level · watermark bar · context figures. */
 	telemetry?: FooterTelemetrySetting;
 }
 
@@ -2100,8 +2100,10 @@ export class SettingsManager {
 	}
 
 	getFooterTelemetry(): FooterTelemetrySetting {
+		// U6 collapsed compact/full into "on" (one watermark line, no density
+		// split); unknown values land on the visible default, never throw.
 		const value = this.settings.footer?.telemetry;
-		return value === "off" || value === "compact" || value === "full" ? value : "compact";
+		return value === "off" ? "off" : "on";
 	}
 
 	setFooterTelemetry(telemetry: FooterTelemetrySetting): void {

@@ -22,8 +22,8 @@ Unknown keys are reported: a misspelled or removed setting (for example `compact
 | `subagentDefaultModel` | string | - | Model selector (`"provider/id"`) used when `rlm.spawn` does not pin a model; unset inherits the parent model |
 | `imageModel` | string | none | Model (`"provider/model-id"` or a bare id) that serves turns attaching images when the session model does not accept image input |
 | `defaultThinkingLevel` | string | `"medium"` | `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` |
-| `hideThinkingBlock` | boolean | `false` | Hide thinking blocks in output |
-| `footer.telemetry` | string | `"compact"` | Persistent footer watermark line density: `"off"` hides it, `"compact"` shows `模型名 · ctx 312k/1M(38%) ▍压缩线80%` plus the GLM storm-zone marker on glm models, `"full"` adds the proportional bar. `/usage` stays a one-shot report regardless |
+| `hideThinkingBlock` | boolean | `false` | Hide thinking traces entirely (the turn's 思考 header still renders; Ctrl+T then shows guidance instead of expanding) |
+| `footer.telemetry` | string | `"on"` | Persistent footer watermark line: `"off"` hides it, `"on"` shows `glm-5.3-prime · max    ──────●───────│──    518k/1M · 49%` (● = context level, │ = auto-compaction notch; reaching the notch brightens it and appends `压缩在即`). Legacy `"compact"`/`"full"` values read as `"on"`. `/usage` stays a one-shot report regardless |
 | `thinkingBudgets` | object | - | Custom token budgets per thinking level |
 
 `subagentDefaultModel` applies only to spawned subagents whose `rlm.spawn` call omits `model=`. An explicit `model=` per spawn always wins, and an unset setting keeps the inherit-parent behavior. If the configured default is unavailable, unauthenticated, or expired, the spawn fails with that error instead of silently falling back.

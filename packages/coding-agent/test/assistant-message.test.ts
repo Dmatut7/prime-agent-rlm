@@ -3,7 +3,7 @@ import { setKeybindings } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { describe, expect, test } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
-import { AssistantMessageComponent, thinkingRecap } from "../src/modes/interactive/components/assistant-message.js";
+import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
 import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
@@ -158,7 +158,8 @@ describe("AssistantMessageComponent", () => {
 		const rendered = stripAnsi(raw);
 
 		expect(rendered).toContain("Error: Provider request failed");
-		expect(rendered).toContain("展开");
+		// U6: no per-line expand hint; the collapsed error row stays clickable.
+		expect(rendered).not.toContain("Ctrl+");
 		expect(raw).toContain(theme.getFgAnsi("error"));
 	});
 });
@@ -234,7 +235,7 @@ describe("AssistantMessageComponent streaming identity", () => {
 		}
 	});
 
-	test("collapsed thinking shows a bold label, recap, and bracketed hint", () => {
+	test("collapsed thinking renders no rows at all; the expanded view shows the trace", () => {
 		initTheme("dark");
 		setKeybindings(new KeybindingsManager());
 
@@ -251,26 +252,30 @@ describe("AssistantMessageComponent streaming identity", () => {
 			{ type: "thinking", thinking },
 			{ type: "text", text: "Answer." },
 		]);
-		// U4: a visible thinking block is one recap line by default; hideThinkingBlock
-		// renders nothing; only the expanded detail view shows the full trace.
+		// U6: the collapsed view renders NO thinking rows - the turn's aggregate
+		// line carries the segment count. hideThinkingBlock hides it even
+		// expanded; only the expanded detail view shows the full trace.
 		const rendered = stripAnsi(new AssistantMessageComponent(message, false).render(120).join("\n"));
 
-		expect(rendered).toContain("Thinking... · Deciding the approach (Ctrl+O 展开)");
+		expect(rendered).not.toContain("Thinking");
+		expect(rendered).not.toContain("思考");
+		expect(rendered).not.toContain("Deciding");
 		expect(rendered).not.toContain("Some detail");
+		expect(rendered).toContain("Answer.");
 
 		const hidden = stripAnsi(new AssistantMessageComponent(message, true).render(120).join("\n"));
-		expect(hidden).not.toContain("Thinking...");
+		expect(hidden).not.toContain("Thinking");
 
 		const expanded = stripAnsi(
-			new AssistantMessageComponent(message, false, undefined, "Thinking...", { expanded: true })
+			new AssistantMessageComponent(message, false, undefined, "思考", { thinkingExpanded: true })
 				.render(120)
 				.join("\n"),
 		);
-		expect(expanded).toContain("Thinking... (Ctrl+O 收起)");
+		expect(expanded).toContain("思考");
+		// No per-line expand hint suffixes: the global tail hint owns the affordance.
+		expect(expanded).not.toContain("Ctrl+");
+		expect(expanded).not.toContain("收起");
 		expect(expanded).toContain("Some detail about the options.");
-
-		// A whitespace-only trace falls back to the label instead of an empty recap.
-		expect(thinkingRecap("   \n\t\n", "Thinking...")).toBe("Thinking...");
 	});
 
 	test("recap text with delimiters cannot mask structural changes", () => {
@@ -295,7 +300,7 @@ describe("AssistantMessageComponent streaming identity", () => {
 		expect(rendered).toContain("Visible answer.");
 	});
 
-	test("collapsed thinking row truncates instead of wrapping on narrow widths", () => {
+	test("collapsed thinking renders nothing on narrow widths either", () => {
 		initTheme("dark");
 		setKeybindings(new KeybindingsManager());
 
@@ -306,9 +311,8 @@ describe("AssistantMessageComponent streaming identity", () => {
 			.map((line) => stripAnsi(line))
 			.filter((line) => line.trim().length > 0);
 
-		expect(lines).toHaveLength(1);
-		expect(lines[0]).toContain("Thinking...");
-		expect(lines[0]).toContain("展开");
+		// U6: no thinking rows exist in the collapsed view, narrow or wide.
+		expect(lines).toHaveLength(0);
 	});
 
 	test("setHideThinkingBlock and setExpanded mid-stream render identically", () => {

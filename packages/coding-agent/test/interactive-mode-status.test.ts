@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import * as path from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import {
 	type AutocompleteProvider,
 	CombinedAutocompleteProvider,
@@ -45,10 +46,13 @@ import { AgentConnectionPromptAdmissionError } from "../src/modes/agent-connecti
 import { AgentActivityTracker } from "../src/modes/interactive/agent-activity.js";
 import type { AuthenticationResult } from "../src/modes/interactive/auth-flows.js";
 import { AgentMessageComponent } from "../src/modes/interactive/components/agent-message.js";
+import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
 import { BashExecutionComponent } from "../src/modes/interactive/components/bash-execution.js";
 import type { ConfigurationMenuComponent } from "../src/modes/interactive/components/configuration-menu.js";
+import { buildConversationComponents } from "../src/modes/interactive/components/conversation-components.js";
 import type { AuthSelectorProvider } from "../src/modes/interactive/components/oauth-selector.js";
 import type { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
+import { TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
 import { formatSplashCwd, InteractiveMode, truncatePathMiddle } from "../src/modes/interactive/interactive-mode.js";
 import { ClientPromptStashStore, type PromptStashState } from "../src/modes/interactive/prompt-stash-state.js";
 import { QueueSelection } from "../src/modes/interactive/queue-selection.js";
@@ -1521,7 +1525,6 @@ describe("InteractiveMode connection events", () => {
 			updateAvailableProviderCount: vi.fn(async () => {}),
 			updateEditorBorderColor: vi.fn(),
 			updateTerminalTitle: vi.fn(),
-			refreshTopBarCost: vi.fn(),
 			setGoalAnnouncementBaseline: vi.fn(),
 			syncGoalTray: vi.fn(),
 			syncWorkingLoader: vi.fn(),
@@ -1764,7 +1767,6 @@ describe("InteractiveMode connection events", () => {
 			restoreStreamingMessageFromSnapshot: vi.fn(),
 			updatePendingMessagesDisplay: vi.fn(),
 			updateTerminalTitle: vi.fn(),
-			refreshTopBarCost: vi.fn(),
 			setGoalAnnouncementBaseline: vi.fn(),
 			syncGoalTray: vi.fn(),
 			syncWorkingLoader: vi.fn(),
@@ -1831,7 +1833,6 @@ describe("InteractiveMode connection events", () => {
 			updatePendingMessagesDisplay: vi.fn(),
 			flushPendingBashComponents: vi.fn(),
 			updateTerminalTitle: vi.fn(),
-			refreshTopBarCost: vi.fn(),
 			setGoalAnnouncementBaseline: vi.fn(),
 			syncGoalTray: vi.fn(),
 			syncWorkingLoader: vi.fn(),
@@ -1889,7 +1890,6 @@ describe("InteractiveMode connection events", () => {
 			updatePendingMessagesDisplay: vi.fn(),
 			flushPendingBashComponents,
 			updateTerminalTitle: vi.fn(),
-			refreshTopBarCost: vi.fn(),
 			setGoalAnnouncementBaseline: vi.fn(),
 			syncGoalTray: vi.fn(),
 			syncWorkingLoader: vi.fn(),
@@ -3247,7 +3247,6 @@ describe("InteractiveMode session switch command catalog", () => {
 				updateAvailableProviderCount: vi.fn(async () => {}),
 				updateEditorBorderColor: vi.fn(),
 				updateTerminalTitle: vi.fn(),
-				refreshTopBarCost: vi.fn(),
 				setGoalAnnouncementBaseline: vi.fn(),
 				syncGoalTray: vi.fn(),
 				getGoalState: () => emptyGoalState(),
@@ -4321,7 +4320,15 @@ describe("InteractiveMode tray goal label", () => {
 			heartbeat?: AgentCronJob | null;
 			contextUsage: TrayUsage | undefined;
 		};
-		uiServices: { getContextUsage(): TrayUsage | undefined };
+		uiServices: {
+			getContextUsage(): TrayUsage | undefined;
+			settingsManager: { getFooterTelemetry(): string };
+		};
+		footerTelemetryDirty?: boolean;
+		footerTelemetryCached?: {
+			mode: string;
+			snapshot?: { contextTokens?: number; contextWindow?: number; modelName?: string };
+		};
 		getTrayContextLabel(): string | undefined;
 	};
 	const getTrayContextLabel = (InteractiveMode.prototype as unknown as TrayLabelHarness).getTrayContextLabel;
@@ -4361,12 +4368,15 @@ describe("InteractiveMode tray goal label", () => {
 			} satisfies GoalState,
 			contextUsage: undefined,
 		};
-		fakeThis.uiServices = { getContextUsage: () => undefined };
+		fakeThis.uiServices = {
+			getContextUsage: () => undefined,
+			settingsManager: { getFooterTelemetry: () => "on" },
+		};
 
 		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s)");
 	});
 
-	test("combines active goals with token/context usage in one lower-tray label", () => {
+	test("keeps context figures off the tray label while the footer watermark is on", () => {
 		const fakeThis = Object.create(InteractiveMode.prototype) as TrayLabelHarness;
 		fakeThis.heartbeatCatalog = [];
 		fakeThis.subagentSnapshots = new Map<string, never>();
@@ -4383,12 +4393,21 @@ describe("InteractiveMode tray goal label", () => {
 			} satisfies GoalState,
 			contextUsage: { contextWindow: 100_000, tokens: 75_000, percent: 75 },
 		};
-		fakeThis.uiServices = { getContextUsage: () => undefined };
+		fakeThis.uiServices = {
+			getContextUsage: () => undefined,
+			settingsManager: { getFooterTelemetry: () => "on" },
+		};
+		fakeThis.footerTelemetryDirty = false;
+		fakeThis.footerTelemetryCached = {
+			mode: "on",
+			snapshot: { modelName: "bailian/glm-5.3-prime", contextTokens: 75_000, contextWindow: 100_000 },
+		};
 
-		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s) · 75k (75%)");
+		// U6 single source: the watermark line carries the figures, not the tray.
+		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s)");
 	});
 
-	test("combines active goals, active heartbeats, and context usage in one lower-tray label", () => {
+	test("combines goals, heartbeats, and the snapshot fallback while the watermark is off", () => {
 		const fakeThis = Object.create(InteractiveMode.prototype) as TrayLabelHarness;
 		fakeThis.heartbeatCatalog = [{ job: createHeartbeat("active") }];
 		fakeThis.subagentSnapshots = new Map<string, never>();
@@ -4406,9 +4425,19 @@ describe("InteractiveMode tray goal label", () => {
 			heartbeat: createHeartbeat("active"),
 			contextUsage: { contextWindow: 100_000, tokens: 75_000, percent: 75 },
 		};
-		fakeThis.uiServices = { getContextUsage: () => undefined };
+		fakeThis.uiServices = {
+			getContextUsage: () => undefined,
+			settingsManager: { getFooterTelemetry: () => "off" },
+		};
+		// The fallback reads the footer's own memoized pair, not a fresh usage
+		// query (评审②: one frame, one value).
+		fakeThis.footerTelemetryDirty = false;
+		fakeThis.footerTelemetryCached = {
+			mode: "off",
+			snapshot: { modelName: "bailian/glm-5.3-prime", contextTokens: 75_000, contextWindow: 100_000 },
+		};
 
-		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s) · 1 heartbeat · 75k (75%)");
+		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s) · 1 heartbeat · 75k/100k (75%)");
 	});
 
 	test("omits the usage segment when token count is unknown", () => {
@@ -4428,7 +4457,10 @@ describe("InteractiveMode tray goal label", () => {
 			} satisfies GoalState,
 			contextUsage: { contextWindow: 100_000, tokens: null, percent: null },
 		};
-		fakeThis.uiServices = { getContextUsage: () => undefined };
+		fakeThis.uiServices = {
+			getContextUsage: () => undefined,
+			settingsManager: { getFooterTelemetry: () => "on" },
+		};
 
 		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s)");
 	});
@@ -4594,9 +4626,34 @@ describe("truncatePathMiddle", () => {
 });
 
 describe("InteractiveMode.setToolsExpanded", () => {
+	/** One assistant message with a thinking block (for the K3 ② scope fixtures). */
+	function assistantThinking(marker: string): AssistantMessage {
+		return {
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: `thinking for ${marker}` },
+				{ type: "text", text: `answer for ${marker}` },
+			],
+			api: "test",
+			provider: "test-provider",
+			model: "test-model",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: 1_000,
+		};
+	}
+
 	function createExpansionFakeThis(chatChildren: unknown[]): any {
 		const fakeThis: any = {
 			toolOutputExpanded: false,
+			thinkingExpanded: false,
 			agentMessagesExpanded: false,
 			editDiffsExpanded: false,
 			customHeader: undefined,
@@ -4676,6 +4733,146 @@ describe("InteractiveMode.setToolsExpanded", () => {
 		expect(fakeThis.editDiffsExpanded).toBe(true);
 		expect(child.setEditDiffsExpanded).toHaveBeenLastCalledWith(true);
 		expect(child.setExpanded).toHaveBeenLastCalledWith(true);
+	});
+
+	test("Ctrl+O owns the process surface: tools and edit diffs flip together, thinking and messages stay put", () => {
+		const assistantChild = new AssistantMessageComponent();
+		const setThinkingExpanded = vi.spyOn(assistantChild, "setThinkingExpanded");
+		const child = { setExpanded: vi.fn(), setAgentMessagesExpanded: vi.fn(), setEditDiffsExpanded: vi.fn() };
+		const fakeThis = createExpansionFakeThis([child, assistantChild]);
+
+		fakeThis.toggleToolOutputExpansion();
+
+		expect(fakeThis.toolOutputExpanded).toBe(true);
+		expect(fakeThis.editDiffsExpanded).toBe(true);
+		expect(fakeThis.agentMessagesExpanded).toBe(false);
+		expect(fakeThis.thinkingExpanded).toBe(false);
+		expect(child.setExpanded).toHaveBeenCalledWith(true);
+		expect(child.setEditDiffsExpanded).toHaveBeenCalledWith(true);
+		expect(child.setAgentMessagesExpanded).toHaveBeenCalledWith(false);
+		// The O lane never touches the thinking lane.
+		expect(setThinkingExpanded).toHaveBeenCalledWith(false);
+	});
+
+	test("the thinking lane survives a chat rebuild (F2: addMessageToChat threads it)", () => {
+		const chatContainer = new Container();
+		const mode = Object.assign(Object.create(InteractiveMode.prototype), {
+			chatContainer,
+			thinkingExpanded: true,
+			toolOutputExpanded: false,
+			hideThinkingBlock: false,
+			hiddenThinkingLabel: "思考",
+			mermaidMarkdownTransform: undefined,
+			getMarkdownThemeWithSettings: () => undefined,
+			getCurrentCwd: () => "/tmp",
+		});
+		const addMessageToChat = (
+			InteractiveMode.prototype as unknown as {
+				addMessageToChat(this: unknown, message: unknown): void;
+			}
+		).addMessageToChat;
+		const assistant = assistantThinking("rebuild");
+		addMessageToChat.call(mode, assistant);
+		const child = chatContainer.children.find((c) => c instanceof AssistantMessageComponent);
+		expect(child).toBeInstanceOf(AssistantMessageComponent);
+		const rendered = ((child as AssistantMessageComponent).render(100).join("\n") as string).replace(
+			/\u001b\[[0-9;]*[A-Za-z]/g,
+			"",
+		);
+		// The global thinking lane held through the (re)build: the trace shows.
+		expect(rendered).toContain("thinking for rebuild");
+	});
+
+	test("plain keys act on the latest turn only; Alt keys act globally (K3 ②)", () => {
+		// Three turns in a real container, each with an assistant message and a
+		// thinking block, plus the TurnSummaryComponent at each turn head.
+		const chatContainer = new Container();
+		const built = buildConversationComponents(
+			[
+				{ role: "user", content: "one", timestamp: 900 },
+				assistantThinking("t1"),
+				{ role: "user", content: "two", timestamp: 2_000 },
+				assistantThinking("t2"),
+				{ role: "user", content: "three", timestamp: 3_000 },
+				assistantThinking("t3"),
+			],
+			{
+				ui: { requestRender: vi.fn() } as never,
+				cwd: "/tmp",
+				toolOptions: {},
+				getToolDefinition: () => undefined,
+			},
+		);
+		for (const component of built) {
+			chatContainer.addChild(component);
+		}
+		const summaries = built.filter((c): c is TurnSummaryComponent => c instanceof TurnSummaryComponent);
+		expect(summaries).toHaveLength(3);
+		const assistants = built.filter((c): c is AssistantMessageComponent => c instanceof AssistantMessageComponent);
+		expect(assistants).toHaveLength(3);
+		const spies = assistants.map((component) => vi.spyOn(component, "setThinkingExpanded"));
+
+		const fakeThis = createExpansionFakeThis(chatContainer.children);
+		fakeThis.showStatus = vi.fn();
+
+		// Plain Ctrl+T: only the latest turn's lane flips.
+		fakeThis.toggleThinkingBlockVisibility();
+		expect(summaries[2]?.state.thinkingExpanded).toBe(true);
+		expect(summaries[0]?.state.thinkingExpanded).toBe(false);
+		expect(summaries[1]?.state.thinkingExpanded).toBe(false);
+		expect(spies[2]).toHaveBeenCalledWith(true);
+		expect(spies[0]).not.toHaveBeenCalledWith(true);
+		expect(spies[1]).not.toHaveBeenCalledWith(true);
+
+		// Alt+T: every turn flips together.
+		fakeThis.toggleThinkingBlockVisibility(true);
+		expect(summaries[0]?.state.thinkingExpanded).toBe(true);
+		expect(summaries[1]?.state.thinkingExpanded).toBe(true);
+		expect(summaries[2]?.state.thinkingExpanded).toBe(true);
+		expect(fakeThis.thinkingExpanded).toBe(true);
+
+		// Plain Ctrl+O: only the latest turn's process surface expands.
+		const before = summaries.map((s) => s.state.isCollapsed);
+		fakeThis.toggleToolOutputExpansion();
+		expect(summaries[2]?.state.isCollapsed).toBe(false);
+		expect(summaries[0]?.state.isCollapsed).toBe(before[0]);
+		expect(fakeThis.toolOutputExpanded).toBe(false);
+	});
+
+	test("Ctrl+T with hideThinkingBlock on guides to the setting instead of flipping (K3 ④)", () => {
+		const assistantChild = new AssistantMessageComponent();
+		const setThinkingExpanded = vi.spyOn(assistantChild, "setThinkingExpanded");
+		const fakeThis = createExpansionFakeThis([assistantChild]);
+		fakeThis.showStatus = vi.fn();
+		fakeThis.hideThinkingBlock = true;
+
+		fakeThis.toggleThinkingBlockVisibility();
+
+		// The lane never flips while the setting hides the traces; the press
+		// tells the user where the switch is. The turn header still renders.
+		expect(fakeThis.thinkingExpanded).toBe(false);
+		expect(setThinkingExpanded).not.toHaveBeenCalled();
+		expect(fakeThis.showStatus).toHaveBeenCalledWith(
+			"思考 trace 被 hideThinkingBlock 设置隐藏：关闭该设置后 Ctrl+T 可展开",
+		);
+	});
+
+	test("Ctrl+T owns the thinking block: only the thinking lane flips", () => {
+		const assistantChild = new AssistantMessageComponent();
+		const setThinkingExpanded = vi.spyOn(assistantChild, "setThinkingExpanded");
+		const child = { setExpanded: vi.fn(), setAgentMessagesExpanded: vi.fn(), setEditDiffsExpanded: vi.fn() };
+		const fakeThis = createExpansionFakeThis([child, assistantChild]);
+		fakeThis.showStatus = vi.fn();
+
+		fakeThis.toggleThinkingBlockVisibility();
+
+		expect(fakeThis.thinkingExpanded).toBe(true);
+		expect(fakeThis.toolOutputExpanded).toBe(false);
+		expect(fakeThis.editDiffsExpanded).toBe(false);
+		expect(fakeThis.agentMessagesExpanded).toBe(false);
+		expect(setThinkingExpanded).toHaveBeenCalledWith(true);
+		expect(child.setExpanded).toHaveBeenCalledWith(false);
+		expect(fakeThis.showStatus).toHaveBeenCalledWith("思考块: 全部展开");
 	});
 });
 

@@ -1,16 +1,7 @@
 import { resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import {
-	type Component,
-	Container,
-	Markdown,
-	type MarkdownTheme,
-	Spacer,
-	Text,
-	truncateToWidth,
-	visibleWidth,
-} from "@earendil-works/pi-tui";
+import { type Component, Container, Markdown, type MarkdownTheme, Spacer, Text } from "@earendil-works/pi-tui";
 import { LOGIN_RECOVERY_MESSAGE } from "../../../core/auth-guidance.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
 import {
@@ -19,7 +10,6 @@ import {
 	shouldCollapseErrorDetails,
 	summarizeErrorDetails,
 } from "./collapsible-error.js";
-import { expandCollapseHint } from "./keybinding-hints.js";
 import type { MermaidMarkdownTransform } from "./mermaid.js";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
@@ -29,7 +19,9 @@ const LOGIN_RECOVERY_SUFFIX = `\n\n${LOGIN_RECOVERY_MESSAGE}`;
 
 export interface AssistantMessageComponentOptions {
 	cwd?: string;
+	/** U6 two-key model: Ctrl+T's thinking-trace lane (O's `expanded` covers the error surface). */
 	expanded?: boolean;
+	thinkingExpanded?: boolean;
 	precededByToolActivity?: boolean;
 	/** Replaces Mermaid code blocks in assistant text (never thinking) with Unicode diagrams. */
 	mermaidTransform?: MermaidMarkdownTransform;
@@ -51,49 +43,6 @@ function getThinkingMarkdownTheme(baseTheme: MarkdownTheme): MarkdownTheme {
 		listBullet: quiet,
 		highlightCode: (code: string) => code.split("\n").map((line) => quiet(line)),
 	};
-}
-
-/** Single collapsed-thinking row that truncates the recap to the render width instead of wrapping. */
-class CollapsedThinkingRow implements Component {
-	constructor(
-		private readonly label: string,
-		private readonly recap: string,
-		private readonly hint: string,
-	) {}
-
-	render(width: number): string[] {
-		const safeWidth = Math.max(1, width);
-		const separator = theme.fg("dim", " · ");
-		const fixedWidth = visibleWidth(` ${this.label}${separator} ${this.hint}`);
-		const recapWidth = Math.max(8, safeWidth - fixedWidth);
-		const recap = theme.fg("thinkingText", truncateToWidth(this.recap, recapWidth));
-		return [truncateToWidth(` ${this.label}${separator}${recap} ${this.hint}`, safeWidth, "")];
-	}
-
-	invalidate(): void {}
-}
-
-/**
- * One-line recap for a collapsed thinking block: the last bold section header
- * when the trace has one (reasoning summaries usually do), otherwise the first
- * non-empty line, stripped of markdown emphasis and truncated.
- */
-export function thinkingRecap(thinking: string, fallback: string, maxWidth = 120): string {
-	const lines = thinking
-		.split("\n")
-		.map((line) => line.trim())
-		.filter((line) => line.length > 0);
-	const lastHeader = [...lines].reverse().find((line) => /^\*\*[^*]+\*\*:?$/.test(line) || /^#{1,6}\s+\S/.test(line));
-	const source = lastHeader ?? lines[0] ?? fallback;
-	const plain = source
-		.replace(/^#{1,6}\s+/, "")
-		.replace(/\*\*([^*]+)\*\*/g, "$1")
-		.replace(/\*([^*]+)\*/g, "$1")
-		.replace(/`([^`]+)`/g, "$1")
-		.replace(/\s+/g, " ")
-		.replace(/:$/, "")
-		.trim();
-	return truncateToWidth(plain || fallback, Math.max(20, maxWidth));
 }
 
 function formatInlineLoginRecoveryMessage(message: string): string | undefined {
@@ -124,6 +73,7 @@ export class AssistantMessageComponent extends Container {
 	private lastMessage?: AssistantMessage;
 	private hasToolCalls = false;
 	private expanded = false;
+	private thinkingExpanded = false;
 	private dirty = false;
 	private lastSignature?: string;
 	private blockMarkdowns = new Map<number, Markdown>();
@@ -139,7 +89,7 @@ export class AssistantMessageComponent extends Container {
 		message?: AssistantMessage,
 		hideThinkingBlock = false,
 		markdownTheme: MarkdownTheme = getMarkdownTheme(),
-		hiddenThinkingLabel = "Thinking...",
+		hiddenThinkingLabel = "思考",
 		options: AssistantMessageComponentOptions = {},
 	) {
 		super();
@@ -148,6 +98,7 @@ export class AssistantMessageComponent extends Container {
 		this.markdownTheme = markdownTheme;
 		this.hiddenThinkingLabel = hiddenThinkingLabel;
 		this.expanded = options.expanded ?? false;
+		this.thinkingExpanded = options.thinkingExpanded ?? false;
 		this.precededByToolActivity = options.precededByToolActivity ?? false;
 		this.mermaidTransform = options.mermaidTransform;
 		this.baseUrl = options.cwd ? pathToFileURL(`${resolve(options.cwd)}${sep}`).href : undefined;
@@ -181,6 +132,14 @@ export class AssistantMessageComponent extends Container {
 	setExpanded(expanded: boolean): void {
 		if (this.expanded !== expanded) {
 			this.expanded = expanded;
+			this.dirty = true;
+		}
+	}
+
+	/** U6: Ctrl+T's lane — show the thinking traces (hideThinkingBlock still wins). */
+	setThinkingExpanded(expanded: boolean): void {
+		if (this.thinkingExpanded !== expanded) {
+			this.thinkingExpanded = expanded;
 			this.dirty = true;
 		}
 	}
@@ -231,12 +190,6 @@ export class AssistantMessageComponent extends Container {
 				parts.push(`${i}:text:${content.text.trim() ? 1 : 0}`);
 			} else if (content?.type === "thinking") {
 				parts.push(`${i}:thinking:${content.thinking.trim() ? 1 : 0}`);
-				if (!this.expanded && content.thinking.trim()) {
-					// The collapsed row bakes the recap into a static line, so a recap
-					// change must count as a structural change during streaming.
-					// JSON-encode the free text so it cannot forge part boundaries.
-					parts.push(`${i}:recap:${JSON.stringify(thinkingRecap(content.thinking, this.hiddenThinkingLabel))}`);
-				}
 			} else {
 				parts.push(`${i}:${content?.type ?? "invalid"}`);
 			}
@@ -245,6 +198,7 @@ export class AssistantMessageComponent extends Container {
 			`hide:${this.hideThinkingBlock}`,
 			`label:${this.hiddenThinkingLabel}`,
 			`expanded:${this.expanded}`,
+			`thinkingExpanded:${this.thinkingExpanded}`,
 			// In the signature so the streaming->final transition rebuilds (mermaid renders differently).
 			`streaming:${this.isStreaming}`,
 			`stop:${message.stopReason ?? ""}`,
@@ -288,9 +242,22 @@ export class AssistantMessageComponent extends Container {
 		this.blockMarkdowns.clear();
 		this.lastBlockTexts.clear();
 
-		const hasVisibleContent = message.content.some(
-			(c) => (c?.type === "text" && c.text.trim()) || (c?.type === "thinking" && c.thinking.trim()),
-		);
+		// F2 (DS2 review): a block only counts as visible content if it actually
+		// renders - thinking blocks draw nothing while collapsed (or while
+		// hideThinkingBlock wins), so they must not earn a Spacer either. The
+		// old count left a 2-blank-line wall behind every "thinking + toolCall"
+		// message in the default collapsed view.
+		const rendersThinking = (c: AssistantMessage["content"][number]) =>
+			c?.type === "thinking" && c.thinking.trim() && !this.hideThinkingBlock && this.thinkingExpanded;
+		const hasVisibleContent =
+			message.content.some(
+				(c) => (c?.type === "text" && c.text.trim()) || (c?.type === "thinking" && rendersThinking(c)),
+			) ||
+			// The error surfaces render in both lanes (aborted, or a
+			// non-tool-call error); toolCall blocks render as separate
+			// components, not here.
+			message.stopReason === "aborted" ||
+			(message.stopReason === "error" && !message.content.some((c) => c?.type === "toolCall"));
 
 		if (hasVisibleContent) {
 			this.contentContainer.addChild(new Spacer(1));
@@ -313,33 +280,26 @@ export class AssistantMessageComponent extends Container {
 				this.lastBlockTexts.set(i, content.text.trim());
 				this.contentContainer.addChild(markdown);
 			} else if (content?.type === "thinking" && content.thinking.trim()) {
-				// U4 noise cut: a visible thinking block renders as ONE recap row by
-				// default; the full Markdown trace only renders in the expanded detail
-				// view (Ctrl+O). hideThinkingBlock hides the row entirely.
+				// U6 noise cut: the collapsed view renders NO thinking rows at all -
+				// the turn's aggregate line carries the segment count (`思考 N 段`).
+				// The full Markdown trace only renders in the expanded detail view
+				// (Ctrl+O). hideThinkingBlock hides it even there.
+				// F2: same "actually renders" rule - a following thinking block
+				// that stays collapsed must not earn this one a spacer either.
 				const hasVisibleContentAfter = message.content
 					.slice(i + 1)
-					.some((c) => (c?.type === "text" && c.text.trim()) || (c?.type === "thinking" && c.thinking.trim()));
+					.some((c) => (c?.type === "text" && c.text.trim()) || (c?.type === "thinking" && rendersThinking(c)));
 
 				const thinkingLabel = theme.bold(theme.fg("thinkingText", this.hiddenThinkingLabel));
 				if (this.hideThinkingBlock) {
-					// Hidden: nothing at all, not even the recap row.
-				} else if (!this.expanded) {
-					// One-line row: bold label, the trace recap, and the expand hint.
-					// The row truncates the recap to the render width so it never wraps
-					// onto a second line on narrow terminals.
-					const recap = thinkingRecap(content.thinking, this.hiddenThinkingLabel);
-					this.contentContainer.addChild(
-						new CollapsedThinkingRow(thinkingLabel, recap, expandCollapseHint("app.tools.expand", false)),
-					);
-					if (hasVisibleContentAfter) {
-						this.contentContainer.addChild(new Spacer(1));
-					}
+					// Hidden: nothing at all, not even in the expanded view.
+				} else if (!this.thinkingExpanded) {
+					// Collapsed: no rows here - the turn's 思考 block header at the
+					// turn head owns the summary and the Ctrl+T affordance.
 				} else {
-					// Expanded: the same label line with the collapse hint, then the trace.
-					// Thinking traces keep Markdown structure but stay visually quiet.
-					this.contentContainer.addChild(
-						new Text(`${thinkingLabel} ${expandCollapseHint("app.tools.expand", true)}`, 1, 0),
-					);
+					// Expanded: the label line, then the trace. Thinking traces keep
+					// Markdown structure but stay visually quiet.
+					this.contentContainer.addChild(new Text(`${thinkingLabel}`, 1, 0));
 					const markdown = new Markdown(
 						content.thinking.trim(),
 						1,

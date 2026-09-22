@@ -378,7 +378,9 @@ describe("ENG-4531 agent message UI", () => {
 			[fauxAssistantMessage("intervening response"), second],
 			options,
 		);
-		expect(assistantThenMessage[1]?.render(120)[0]).toBe("");
+		// U6: the turn summary line rides at the turn head (index 0), so the
+		// agent message follows the assistant component at index 2.
+		expect(assistantThenMessage[2]?.render(120)[0]).toBe("");
 	});
 
 	it("suppresses live spacing between agent messages and following tool activity", () => {
@@ -478,14 +480,15 @@ describe("ENG-4531 agent message UI", () => {
 		const collapsed = render(component);
 
 		expect(collapsed).toContain("◆ Agent message received · from Planner");
-		expect(collapsed).toContain("展开");
+		// U6: no per-line expand hint — the global tail line owns the keys.
+		expect(collapsed).not.toContain("展开");
 		expect(collapsed).not.toContain("Then wait for more work.");
 
 		component.setExpanded(true);
 		const expanded = render(component);
-		expect(expanded).toContain("收起");
+		expect(expanded).not.toContain("收起");
 		const expandedLines = expanded.split("\n");
-		expect(expandedLines[1]?.trimEnd()).toMatch(/^ ◆ Agent message received · from Planner \(.*收起\)$/);
+		expect(expandedLines[1]?.trimEnd()).toMatch(/^ ◆ Agent message received · from Planner$/);
 		expect(expandedLines.slice(2)).toEqual([
 			" ╰─ Reply to your parent with exactly: hi",
 			"    Then wait for more work.",
@@ -532,7 +535,7 @@ describe("ENG-4531 agent message UI", () => {
 		expect(lines).toEqual([
 			expect.stringContaining("python"),
 			expect.stringContaining("await agent_message.send"),
-			expect.stringMatching(/^ ◆ Agent message sent · to parent Worker \(.*收起\)$/),
+			expect.stringMatching(/^ ◆ Agent message sent · to parent Worker$/),
 			" ╰─ Continue with shard eight.",
 			"    Then report back.",
 		]);

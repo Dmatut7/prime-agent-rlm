@@ -77,6 +77,7 @@ import {
 	uploadAllAgentTraces,
 } from "../../core/agent-traces.js";
 import { isNoModelsAvailableMessage } from "../../core/auth-guidance.js";
+import { compactionThresholdTokens } from "../../core/compaction/compaction.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
 import {
 	type AgentCronJob,
@@ -137,7 +138,7 @@ import {
 	parseSlashCommand,
 	resolveBuiltinSlashCommandName,
 } from "../../core/slash-commands.js";
-import { createSpendPricing, type SpendPricing, spendOverrideCorrection } from "../../core/spend-pricing.js";
+import { createSpendPricing, type SpendPricing } from "../../core/spend-pricing.js";
 import { formatStallEventLines } from "../../core/stall-diagnostics-render.js";
 import {
 	captureAgentCommandUsed,
@@ -204,7 +205,7 @@ import {
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.js";
 import { ConfigurationMenuComponent, type ConfigurationMenuTab } from "./components/configuration-menu.js";
 import { formatContextTree } from "./components/context-tree-format.js";
-import { isCompactAgentMessageNeighbor } from "./components/conversation-components.js";
+import { countThinkingSegments, isCompactAgentMessageNeighbor } from "./components/conversation-components.js";
 import { CountdownTimer } from "./components/countdown-timer.js";
 import { CustomEditor } from "./components/custom-editor.js";
 import { CustomMessageComponent } from "./components/custom-message.js";
@@ -212,11 +213,17 @@ import { DaxnutsComponent } from "./components/daxnuts.js";
 import { DynamicBorder } from "./components/dynamic-border.js";
 import { EarendilAnnouncementComponent } from "./components/earendil-announcement.js";
 import { type FileChangeSummary, formatTotalChangeSummary, mergeTurnFileChanges } from "./components/edit-summary.js";
+import { ExpandKeysHintLine } from "./components/expand-keys-hint.js";
 import { ExtensionEditorComponent } from "./components/extension-editor.js";
 import { ExtensionInputComponent } from "./components/extension-input.js";
 import { ExtensionSelectorComponent } from "./components/extension-selector.js";
 import { FEATURE_HINT_ANIMATION_INTERVAL_MS, FeatureHintComponent } from "./components/feature-hint.js";
-import { FooterComponent, type FooterTelemetrySnapshot } from "./components/footer.js";
+import {
+	FooterComponent,
+	type FooterTelemetrySnapshot,
+	type FooterTelemetrySource,
+	formatContextTokens,
+} from "./components/footer.js";
 import { HeartbeatManagerComponent } from "./components/heartbeat-manager.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./components/injected-prompt-message.js";
 import { formatKeyText, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.js";
@@ -246,6 +253,7 @@ import {
 	type SubagentSummaryCounts,
 	SubagentSummaryLine,
 	summarizeSubagentSpend,
+	TrayInfoLine,
 } from "./components/subagent-summary-line.js";
 import { ThinkingSelectorComponent } from "./components/thinking-selector.js";
 import {
@@ -372,18 +380,6 @@ interface SharedContextTree {
 	promise: Promise<ContextTreeNode> | undefined;
 }
 
-/**
- * The session's own spend, read while `ui.subagentSpendCell: false` keeps the tree
- * unscanned: the header's degraded figure, windowed like the shared scan above.
- */
-interface TopBarOwnCostMemo {
-	connection: AgentConnection;
-	sessionId: string | undefined;
-	/** When the stats read landed (epoch ms); 0 while there is no result. */
-	at: number;
-	cost: number | undefined;
-}
-
 export const START_HINTS = [
 	'Try "refactor @<filepath>"',
 	'Try "fix bugs in @<filepath>"',
@@ -424,6 +420,31 @@ export function styleQueuedMessagePreview(
 
 function isExpandable(obj: unknown): obj is Expandable {
 	return typeof obj === "object" && obj !== null && "setExpanded" in obj && typeof obj.setExpanded === "function";
+}
+
+/**
+ * One lane bundle: where each expansion surface reads its state from. The
+ * per-turn values come from the owning turn's TurnActivityState; the globals
+ * serve turn-less children and the header (K3 ②).
+ */
+function applyExpansionLanes(
+	child: unknown,
+	lanes: { thinking: boolean; tools: boolean; agentMessages: boolean; editDiffs: boolean },
+): void {
+	if (child instanceof AssistantMessageComponent) {
+		// U6 two-key model: T drives the thinking traces; O drives the error
+		// detail surface.
+		child.setThinkingExpanded(lanes.thinking);
+	}
+	if (isExpandable(child)) {
+		child.setExpanded(child instanceof AgentMessageComponent ? lanes.agentMessages : lanes.tools);
+	}
+	if (hasAgentMessagesExpansion(child)) {
+		child.setAgentMessagesExpanded(lanes.agentMessages);
+	}
+	if (hasEditDiffsExpansion(child)) {
+		child.setEditDiffsExpanded(lanes.editDiffs);
+	}
 }
 
 interface AgentMessagesExpandable {
@@ -1090,9 +1111,15 @@ export interface InteractiveModeRunResult {
 	source: Pick<AgentConnectionState, "activeSessionId" | "sessionFile" | "sessionId" | "sessionName" | "cwd">;
 }
 
+/**
+ * U6 评审短账: `深度 0` is zero-information decoration - the label renders only
+ * for non-zero depths (a sub-agent's own nest level). `hasChildren` stays in
+ * the signature for call-site compatibility and no longer widens the rule.
+ */
 export function formatAgentDepthLabel(depth: number | undefined, hasChildren: boolean): string | undefined {
-	if (depth === undefined || (depth === 0 && !hasChildren)) return undefined;
-	return `depth ${depth}`;
+	void hasChildren;
+	if (depth === undefined || depth < 1) return undefined;
+	return `深度 ${depth}`;
 }
 
 export class InteractiveMode {
@@ -1173,7 +1200,7 @@ export class InteractiveMode {
 	private contextUsageTokenBaseline = 0;
 	// Refresh ordering: a stale failure must never clobber a newer success.
 	private contextUsageRefresh = { generation: 0, lastSuccessGeneration: 0 };
-	private readonly defaultHiddenThinkingLabel = "Thinking...";
+	private readonly defaultHiddenThinkingLabel = "思考";
 	private hiddenThinkingLabel = this.defaultHiddenThinkingLabel;
 
 	private ctrlCExitHintExpiresAt = 0;
@@ -1189,6 +1216,14 @@ export class InteractiveMode {
 	private goalTrayTimer: NodeJS.Timeout | undefined = undefined;
 
 	private streamingComponent: AssistantMessageComponent | undefined = undefined;
+	/**
+	 * U6 评审②: the memoized watermark pair. One frame, one value: the footer
+	 * and the tray fallback both read this, and it only recomputes after an
+	 * invalidation (turn end, usage refresh, rebind, model/thinking change,
+	 * settings reload) - never per-component.
+	 */
+	private footerTelemetryDirty = true;
+	private footerTelemetryCached: FooterTelemetrySource | undefined;
 	private streamingMessage: AssistantMessage | undefined = undefined;
 	private sideQuestionComponent: SideQuestionComponent | undefined;
 	private sideQuestionEvent: AgentConnectionSideQuestionEvent | undefined;
@@ -1232,6 +1267,8 @@ export class InteractiveMode {
 
 	// One summary line below the editor, backed by the existing child-status stream.
 	private subagentSummaryLine: SubagentSummaryLine;
+	private trayInfoLine: TrayInfoLine;
+	private expandKeysHintLine: ExpandKeysHintLine;
 	private subagentSnapshots = new Map<string, AgentConnectionRlmChildAgentSnapshot>();
 	private subagentCounts: SubagentSummaryCounts = { total: 0, running: 0, idle: 0, inactive: 0 };
 	private subagentSpendTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1270,6 +1307,8 @@ export class InteractiveMode {
 	private editDiffsExpanded = true;
 
 	private hideThinkingBlock = false;
+	/** U6 (two-key model): Ctrl+T's lane — the thinking traces of assistant messages. */
+	private thinkingExpanded = false;
 	private readonly mermaidMarkdownTransform = createMermaidMarkdownTransform({
 		getMode: () => this.settingsManager.getMermaidRenderingMode(),
 		theme,
@@ -1338,10 +1377,6 @@ export class InteractiveMode {
 	private headerContainer: Container;
 	/** Pinned fullscreen top bar identifying the chat by name while scrolling. */
 	private topBar: TopBar;
-	/** Cached session spend (USD) for the top bar, keyed to the session it was fetched for. */
-	private topBarCost: { sessionId?: string; total?: number } = {};
-	/** Stale-discard state for top bar cost refreshes (mirrors contextUsageRefresh). */
-	private topBarCostRefresh = { generation: 0, lastSuccessGeneration: 0 };
 	/**
 	 * The last context-tree scan, shared by every figure read from it.
 	 *
@@ -1353,11 +1388,6 @@ export class InteractiveMode {
 	 * serve one chat's spend to the next.
 	 */
 	private contextTreeShare: SharedContextTree | undefined;
-	/**
-	 * The session's own spend behind the header while `ui.subagentSpendCell: false`
-	 * keeps the tree unscanned; keyed and windowed like the tree memo above.
-	 */
-	private topBarOwnCost: TopBarOwnCostMemo | undefined;
 
 	private builtInHeader: Component | undefined = undefined;
 
@@ -1420,13 +1450,6 @@ export class InteractiveMode {
 		this.headerContainer = new Container();
 		this.topBar = new TopBar({
 			getChatName: () => this.getCurrentSessionName() ?? path.basename(this.getCurrentCwd()),
-			// Hide the cached spend unless it was fetched for the session now bound:
-			// a pending or failed refresh must not attribute the previous
-			// session's spend to the new chat.
-			getCostUsd: () =>
-				this.topBarCost.sessionId === this.connectionState?.sessionId ? this.topBarCost.total : undefined,
-			// U1: pin the current model on the bar next to the spend.
-			getModel: () => this.getCurrentModel()?.id,
 		});
 		this.chatContainer = new Container();
 		this.shortcutGuideContainer = new Container();
@@ -1455,16 +1478,23 @@ export class InteractiveMode {
 		this.promptDock = new Container();
 		this.footerSlot = new Container();
 		this.mainViewContainer.addChild(this.chatContainer);
+		// U6: the single global expand-hint line at the conversation's tail —
+		// the only place the Ctrl+T/O/P division is stated.
+		this.expandKeysHintLine = new ExpandKeysHintLine(() => this.chatContainer.children.length > 0);
+		this.mainViewContainer.addChild(this.expandKeysHintLine);
 		this.mainViewContainer.addChild(this.shortcutGuideContainer);
 		this.mainViewContainer.addChild(this.pendingMessagesContainer);
 		this.mainViewContainer.addChild(this.statusContainer);
 		this.editorContainer = new Container();
 		this.editorContainer.addChild(this.editor as Component);
-		this.subagentSummaryLine = new SubagentSummaryLine(
+		// U6 status area: ① tray info line (pure navigation), then the footer
+		// watermark (②), then the subagents line (③).
+		this.trayInfoLine = new TrayInfoLine(
 			() => this.getTrayLocationLabel(),
 			() => this.getTrayContextLabel(),
 			() => this.getTrayOverrideLabel(),
 		);
+		this.subagentSummaryLine = new SubagentSummaryLine();
 		this.subagentSummaryLine.setOpenable(this.options.returnToAgentsView === true);
 		this.subagentSummaryLine.onOpen = () => void this.openScopedAgentsView();
 		this.subagentSummaryLine.onCancel = () => this.focusEditor();
@@ -1472,8 +1502,9 @@ export class InteractiveMode {
 		this.footerDataProvider = new FooterDataProvider(this.uiServices.getInitialCwd());
 		this.footer = new FooterComponent(this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(this.settingsManager.getCompactionEnabled());
-		// U1: persistent telemetry watermark line; density from footer.telemetry.
-		this.footer.setTelemetryMode(this.settingsManager.getFooterTelemetry());
+		// U6 评审②: the watermark pulls its mode and snapshot from the memoized
+		// source below - same frame, same value as the tray fallback.
+		this.footer.setTelemetrySource(() => this.getFooterTelemetrySource());
 		this.setGoalAnnouncementBaseline(emptyGoalState());
 
 		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
@@ -1730,10 +1761,9 @@ export class InteractiveMode {
 						keyHint("tui.editor.deleteToLineEnd", "to delete to end"),
 						rawKeyHint("/effort", "to set thinking level"),
 						hint("app.model.select", "to select model"),
-						hint("app.tools.expand", "to expand tools"),
-						hint("app.messages.expand", "to expand agent messages"),
-						hint("app.edits.expand", "to expand edit diffs"),
+						hint("app.tools.expand", "to expand tool calls, outputs and edit diffs"),
 						hint("app.thinking.toggle", "to expand thinking"),
+						hint("app.messages.expand", "to expand agent messages"),
 						hint("app.subagents.focus", "to inspect subagents"),
 						hint("app.editor.external", "for external editor"),
 						hint("app.prompt.stash", "to stash prompt"),
@@ -1771,10 +1801,11 @@ export class InteractiveMode {
 			this.mainContainer.addChild(container);
 		}
 		this.mainContainer.addChild(this.editorContainer);
-		this.mainContainer.addChild(this.subagentSummaryLine);
-		this.mainContainer.addChild(this.widgetContainerBelow);
+		this.mainContainer.addChild(this.trayInfoLine);
 		this.footerSlot.addChild(this.footer);
 		this.mainContainer.addChild(this.footerSlot);
+		this.mainContainer.addChild(this.subagentSummaryLine);
+		this.mainContainer.addChild(this.widgetContainerBelow);
 		for (const component of this.getPromptDockComponents()) {
 			this.promptDock.addChild(component);
 		}
@@ -1810,108 +1841,6 @@ export class InteractiveMode {
 		await this.updateAvailableProviderCount();
 	}
 
-	/**
-	 * Refresh the top bar's cached session spend.
-	 *
-	 * The header is the context tree's second consumer, so it reads through the same
-	 * shared scan as the spend cell (fetchSharedContextTree) instead of paying for a
-	 * disk-scanning RPC of its own: one window, one result, both figures. Results for
-	 * a replaced session, or superseded by a newer successful refresh, are discarded —
-	 * mirroring refreshConnectionContextUsage.
-	 *
-	 * `ui.subagentSpendCell: false` is the emergency stop for that scan, and it stops
-	 * the header too: down means the session's own usage total, which the connection
-	 * keeps in memory, instead of a scan per event (see refreshTopBarOwnCost).
-	 */
-	private refreshTopBarCost(): void {
-		// Partial-mode test harnesses skip the constructor, so the field
-		// initializer may be absent there; the refresh is cosmetic and must
-		// never crash a real flow on any `this`.
-		this.topBarCostRefresh ??= { generation: 0, lastSuccessGeneration: 0 };
-		// The settings surface behind the emergency switch is reached through
-		// `this.uiServices`, and the same partial harnesses have neither (the field is
-		// assigned by the constructor, which they do not run). Reading it there throws a
-		// TypeError out of whatever path called in - `renderResyncedSession` calls this on
-		// a reconnect, so the crash would land in a real rendering path. The refresh is
-		// cosmetic, so it stops here and the header keeps the figure it already holds; a
-		// mode built by the constructor always has uiServices, which it refuses to build
-		// without.
-		if (this.uiServicesOrUndefined === undefined) return;
-		const generation = ++this.topBarCostRefresh.generation;
-		const connection = this.agentConnection;
-		const sessionId = this.connectionState?.sessionId;
-		if (!this.isTopBarTreeCostEnabled()) {
-			this.refreshTopBarOwnCost(generation, connection, sessionId);
-			return;
-		}
-		void (async () => {
-			try {
-				// A scan that landed inside the shared window would read the same bytes, so
-				// an event burst costs one scan instead of one per event.
-				const tree = await this.fetchSharedContextTree(Date.now() - this.contextTreeShareWindowMs());
-				this.publishTopBarCost(tree, connection, sessionId, generation);
-			} catch {
-				// Cost is cosmetic; a failed fetch keeps the previous value
-				// (the session-keyed getter still hides cross-session leaks).
-			}
-		})();
-	}
-
-	/**
-	 * Whether the header may pay for a context-tree scan: the spend cell's emergency
-	 * switch (`ui.subagentSpendCell: false`) governs both consumers of that scan. Read
-	 * through an optional call because a settings surface predating the cell has
-	 * nothing to switch off, and the header must not lose its figure over it.
-	 */
-	private isTopBarTreeCostEnabled(): boolean {
-		const settings = this.settingsManager as { getSubagentSpendCellEnabled?: () => boolean };
-		return settings.getSubagentSpendCellEnabled?.() !== false;
-	}
-
-	/**
-	 * The header's figure while the tree is not being scanned: the session's own usage
-	 * total, which the connection already keeps in memory, held to the same window as
-	 * the tree path so an event burst costs one cheap read instead of one per event.
-	 *
-	 * Two limits, both the price of not scanning and neither an invented number: the
-	 * figure covers this session alone (sub-agent spend is what the tree scan adds),
-	 * and it carries no `priceOverrides` correction - `SessionStats` reports one
-	 * aggregate token total with no per-model breakdown, so re-pricing it would mean
-	 * attributing tokens to a model the session may not have spent them on.
-	 */
-	private refreshTopBarOwnCost(generation: number, connection: AgentConnection, sessionId: string | undefined): void {
-		const memo = this.topBarOwnCostMemo(connection, sessionId);
-		if (memo.at > 0 && typeof memo.cost === "number" && Date.now() - memo.at < this.contextTreeShareWindowMs()) {
-			this.publishTopBarTotal(memo.cost, connection, sessionId, generation);
-			return;
-		}
-		void (async () => {
-			try {
-				const stats = await connection.getSessionStats?.();
-				const cost = stats?.cost;
-				if (typeof cost !== "number" || !Number.isFinite(cost)) return;
-				// Keyed by connection and session, so a rebind mid-read cannot publish the
-				// previous chat's spend as this one's.
-				if (this.topBarOwnCost === memo) {
-					memo.at = Date.now();
-					memo.cost = cost;
-				}
-				this.publishTopBarTotal(cost, connection, sessionId, generation);
-			} catch {
-				// Cosmetic: a failed read keeps the previous figure.
-			}
-		})();
-	}
-
-	/** The session-cost memo above, dropped whenever the connection or the session moved. */
-	private topBarOwnCostMemo(connection: AgentConnection, sessionId: string | undefined): TopBarOwnCostMemo {
-		const memo = this.topBarOwnCost;
-		if (memo && memo.connection === connection && memo.sessionId === sessionId) return memo;
-		const fresh: TopBarOwnCostMemo = { connection, sessionId, at: 0, cost: undefined };
-		this.topBarOwnCost = fresh;
-		return fresh;
-	}
-
 	/** The shared scan memo, dropped whenever the connection or the bound session moved. */
 	private contextTreeShareMemo(): SharedContextTree {
 		const connection = this.agentConnection;
@@ -1921,19 +1850,6 @@ export class InteractiveMode {
 		const fresh: SharedContextTree = { connection, sessionId, at: 0, ms: 0, tree: undefined, promise: undefined };
 		this.contextTreeShare = fresh;
 		return fresh;
-	}
-
-	/**
-	 * How long one shared scan answers a new request, in ms: the spend cell's cadence
-	 * floor (`SUBAGENT_SPEND_MIN_INTERVAL_MS`), widened to its heavy-scan interval
-	 * (`SUBAGENT_SPEND_HEAVY_INTERVAL_MS`) once the last shared scan was slow. The same
-	 * two constants the cell throttles with, so the header can never be the consumer
-	 * that makes a heavy family pay for a second scan inside one window.
-	 */
-	private contextTreeShareWindowMs(): number {
-		return (this.contextTreeShare?.ms ?? 0) > SUBAGENT_SPEND_HEAVY_SCAN_MS
-			? SUBAGENT_SPEND_HEAVY_INTERVAL_MS
-			: SUBAGENT_SPEND_MIN_INTERVAL_MS;
 	}
 
 	/**
@@ -1970,63 +1886,6 @@ export class InteractiveMode {
 		);
 		return promise;
 	}
-
-	/**
-	 * Land the header's figure from a context tree. The tree's own total is the
-	 * recorded spend; `spendOverrideCorrection` adds back the difference a price
-	 * override makes to the same nodes, so the header agrees with /usage instead of
-	 * keeping the rate the user just corrected. Callers that already hold a price book
-	 * pass it, so one scan cannot publish a corrected figure and an uncorrected one.
-	 */
-	private publishTopBarCost(
-		tree: ContextTreeNode | undefined,
-		connection: AgentConnection,
-		sessionId: string | undefined,
-		generation: number,
-		pricing: SpendPricing = this.spendPricing(),
-	): void {
-		const recorded = tree?.totalUsage?.cost?.total;
-		// The additive correction can outrun the recorded total on an attribution-gap
-		// tree (a child whose money never reached root.totalUsage because the parent
-		// lookup missed); publishTopBarTotal clamps the header at zero.
-		const total = tree && typeof recorded === "number" ? recorded + spendOverrideCorrection(tree, pricing) : recorded;
-		this.publishTopBarTotal(total, connection, sessionId, generation);
-	}
-
-	/**
-	 * Publish a header figure, discarding one that is stale or belongs to another
-	 * session. Money on screen clamps at zero, whichever path produced it: the additive
-	 * override correction on an attribution-gap tree (review-price FAIL-1), and the
-	 * degraded own-cost read while the tree is not being scanned.
-	 */
-	private publishTopBarTotal(
-		total: number | undefined,
-		connection: AgentConnection,
-		sessionId: string | undefined,
-		generation: number,
-	): void {
-		this.topBarCostRefresh ??= { generation: 0, lastSuccessGeneration: 0 };
-		const refresh = this.topBarCostRefresh;
-		if (
-			typeof total !== "number" ||
-			!Number.isFinite(total) ||
-			generation < refresh.lastSuccessGeneration ||
-			this.agentConnection !== connection ||
-			this.connectionState?.sessionId !== sessionId
-		) {
-			return;
-		}
-		refresh.lastSuccessGeneration = generation;
-		this.topBarCost = { sessionId, total: Math.max(0, total) };
-		this.ui.requestRender();
-	}
-
-	/** A figure from a shared scan is the newest data there is, so it takes the next generation. */
-	private nextTopBarCostGeneration(): number {
-		this.topBarCostRefresh ??= { generation: 0, lastSuccessGeneration: 0 };
-		return ++this.topBarCostRefresh.generation;
-	}
-
 	private updateTerminalTitle(): void {
 		const cwdBasename = path.basename(this.getCurrentCwd());
 		const sessionName = this.getCurrentSessionName();
@@ -3060,6 +2919,12 @@ export class InteractiveMode {
 		this.footer.setAutoCompactEnabled(
 			this.connectionState?.autoCompactionEnabled ?? this.settingsManager.getCompactionEnabled(),
 		);
+		// P2-D (Qwen review): a settings reload can change footer.telemetry and
+		// the compaction settings the watermark reads - drop the memo so the
+		// next frame recomputes (the c2332 message listed this trigger; the
+		// wiring was missing).
+		this.invalidateFooterTelemetry();
+
 		this.footerDataProvider.setCwd(this.getCurrentCwd());
 		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
 		this.ui.setShowHardwareCursor(this.settingsManager.getShowHardwareCursor());
@@ -3154,7 +3019,7 @@ export class InteractiveMode {
 	// Bake this attempt's output into the snapshot so the tray doesn't dip in the gap between
 	// isStreaming clearing and the async refresh landing.
 	private applyOptimisticContextUsage(): void {
-		this.updateFooterTelemetry();
+		this.invalidateFooterTelemetry();
 		const snapshot = this.connectionState?.contextUsage;
 		if (!snapshot || snapshot.tokens === null || snapshot.contextWindow <= 0) return;
 		const completed = Math.max(0, this.activityTracker.getStatus().tokens - this.contextUsageTokenBaseline);
@@ -3171,37 +3036,67 @@ export class InteractiveMode {
 
 	/** Refresh the tray's context usage from the session after a turn or compaction completes. */
 	/**
-	 * U1: refresh the persistent footer watermark line (model · context usage ·
-	 * compaction line · GLM storm zone). Cheap: recomputes from connection
-	 * state; call after context usage or model changes and on settings reload.
+	 * U6 评审②: drop the memoized watermark pair. The next read - footer or tray
+	 * - recomputes from the connection state once and the two stay identical
+	 * until the next invalidation.
 	 */
-	private updateFooterTelemetry(): void {
-		// Partial-mode test harnesses skip the constructor, so these fields can be
-		// absent there; the watermark is cosmetic and must never crash a real flow.
-		const footer = (this as unknown as { footer?: FooterComponent }).footer;
-		const settingsManager = this.uiServicesOrUndefined?.settingsManager;
-		if (!footer || !settingsManager) {
-			return;
+	private invalidateFooterTelemetry(): void {
+		this.footerTelemetryDirty = true;
+		this.footerTelemetryCached = undefined;
+		// Partial-mode harnesses skip the constructor; the watermark is cosmetic
+		// and must never crash a real flow.
+		(this as unknown as { footer?: { invalidate?: () => void } }).footer?.invalidate?.();
+	}
+
+	/**
+	 * The memoized watermark pair (评审②: one frame, one value). Recomputes only
+	 * after invalidateFooterTelemetry; every reader - the footer line's pull
+	 * source and the tray fallback - gets the same object, so the two context
+	 * readouts can never disagree again.
+	 */
+	private getFooterTelemetrySource(): FooterTelemetrySource {
+		if (this.footerTelemetryDirty || this.footerTelemetryCached === undefined) {
+			this.footerTelemetryCached = this.computeFooterTelemetry();
+			this.footerTelemetryDirty = false;
 		}
-		// Re-read the density too: a settings-file reload lands on the next refresh.
-		footer.setTelemetryMode(settingsManager.getFooterTelemetry());
+		return this.footerTelemetryCached;
+	}
+
+	private computeFooterTelemetry(): FooterTelemetrySource {
+		const settingsManager = this.uiServicesOrUndefined?.settingsManager;
+		const mode = settingsManager?.getFooterTelemetry?.() ?? "on";
 		const model = this.getCurrentModel();
 		const usage = this.getConnectionContextUsage();
+		const thinkingLevel =
+			model?.reasoning && this.connectionState?.thinkingLevel && this.connectionState.thinkingLevel !== "off"
+				? this.connectionState.thinkingLevel
+				: undefined;
+		// 评审③: the notch and 压缩在即 read the real threshold - the configured
+		// ratio over the model's effective input limit, minus the reserve
+		// ceiling. A disabled threshold (settings off, or the reserve consuming
+		// the whole base) renders neither; the 80% default is just the default.
+		const compactionSettings = settingsManager?.getCompactionSettings?.();
+		const windowTokens = usage?.contextWindow ?? 0;
+		const thresholdTokens =
+			compactionSettings && (compactionSettings.enabled ?? true) && windowTokens > 0
+				? compactionThresholdTokens(
+						windowTokens,
+						compactionSettings,
+						model ? { provider: model.provider, modelId: model.id } : undefined,
+					)
+				: 0;
 		const snapshot: FooterTelemetrySnapshot = {
 			modelName: model?.id,
+			thinkingLevel,
 			contextTokens: usage?.tokens ?? undefined,
 			contextWindow: usage?.contextWindow,
-			compactionTriggerRatio: settingsManager.getCompactionTriggerRatio(),
-			// GLM-family tool-call corruption historically storms from ~390k tokens of
-			// accumulated context; mark that zone while a glm model is bound.
-			glmStormTokens: model?.id.toLowerCase().includes("glm") ? 390_000 : undefined,
+			compactionThresholdTokens: thresholdTokens,
 		};
-		footer.setTelemetry(snapshot);
-		footer.setToolErrorCount?.((this as unknown as { consecutiveToolErrors?: number }).consecutiveToolErrors ?? 0);
+		return { mode, snapshot };
 	}
 
 	private async refreshConnectionContextUsage(): Promise<void> {
-		this.updateFooterTelemetry();
+		this.invalidateFooterTelemetry();
 		const generation = ++this.contextUsageRefresh.generation;
 		const connection = this.agentConnection;
 		const sessionId = this.connectionState?.sessionId;
@@ -3219,6 +3114,12 @@ export class InteractiveMode {
 		// Anything counted so far is now reflected in the snapshot; only later output is in-flight.
 		this.contextUsageTokenBaseline = this.activityTracker.getStatus().tokens;
 		this.patchConnectionState({ contextUsage: stats.contextUsage });
+		// P2-D (Qwen review): the leading invalidation happened before the await
+		// - a frame that rendered while the RPC was in flight re-memoized the
+		// OLD usage, and this patch would land behind it. Drop the memo again
+		// now that the fresh numbers are in the connection state.
+		this.invalidateFooterTelemetry();
+
 		// U2: the session's trailing tool-error streak is authoritative; an older
 		// daemon without the field keeps the locally counted value.
 		if (typeof stats.consecutiveToolErrors === "number") {
@@ -3244,7 +3145,6 @@ export class InteractiveMode {
 				this.patchConnectionState({ isStreaming: true, activeToolNames: [] });
 				if (wasNewChat) {
 					this.builtInHeader?.invalidate();
-					this.subagentSummaryLine.invalidate();
 				}
 				break;
 			}
@@ -3253,7 +3153,6 @@ export class InteractiveMode {
 				this.patchConnectionState({ messageCount: this.connectionState.messageCount + 1 });
 				if (wasNewChat) {
 					this.builtInHeader?.invalidate();
-					this.subagentSummaryLine.invalidate();
 				}
 				break;
 			}
@@ -3408,7 +3307,7 @@ export class InteractiveMode {
 		// and clears the readout left over from the previous session.
 		this.speedStats = undefined;
 		this.footer?.setSpeedText?.(undefined);
-		(this as unknown as { updateFooterTelemetry?: () => void }).updateFooterTelemetry?.();
+		(this as unknown as { invalidateFooterTelemetry?: () => void }).invalidateFooterTelemetry?.();
 		void this.rosterBar?.dispose();
 		this.rosterBar = undefined;
 		if (this.localSessionHost) {
@@ -3449,7 +3348,6 @@ export class InteractiveMode {
 		await this.updateAvailableProviderCount();
 		this.updateEditorBorderColor();
 		this.updateTerminalTitle();
-		this.refreshTopBarCost();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
 		this.syncGoalTray(this.getGoalState());
 		this.syncWorkingLoader();
@@ -3581,7 +3479,6 @@ export class InteractiveMode {
 			this.sideQuestionBashDiscarded = undefined;
 		}
 		this.updateTerminalTitle();
-		this.refreshTopBarCost();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
 		this.syncGoalTray(this.getGoalState());
 		this.syncWorkingLoader();
@@ -3679,8 +3576,9 @@ export class InteractiveMode {
 				status: this.startedToolCalls.has(latestToolCall.id) ? "running" : "queued",
 			});
 			component.setTurnActivity(this.currentTurnState);
-			component.setExpanded(this.toolOutputExpanded);
-			component.setAgentMessagesExpanded(this.agentMessagesExpanded);
+			// The live turn's own lanes (K3 ②), falling back to the globals.
+			component.setExpanded(this.currentTurnState ? !this.currentTurnState.isCollapsed : this.toolOutputExpanded);
+			component.setAgentMessagesExpanded(this.currentTurnState?.agentMessagesExpanded ?? this.agentMessagesExpanded);
 			component.setEditDiffsExpanded(this.editDiffsExpanded);
 			if (this.startedToolCalls.has(latestToolCall.id)) {
 				component.markExecutionStarted();
@@ -3902,10 +3800,6 @@ export class InteractiveMode {
 
 	private startWorkingLoader(): void {
 		this.stopWorkingLoader();
-		// A new agent run starts a fresh turn group; the settled summary line of
-		// the previous run stays in the chat as history.
-		this.currentTurnState = undefined;
-		this.currentTurnSummary = undefined;
 		this.workingStartedAt = this.turnStartedAt ?? Date.now();
 		this.loadingAnimation = this.createWorkingLoader();
 		this.statusContainer.addChild(this.loadingAnimation);
@@ -4290,7 +4184,6 @@ export class InteractiveMode {
 		this.setupAutocompleteProvider();
 		this.defaultEditor.onExtensionShortcut = undefined;
 		this.updateTerminalTitle();
-		this.refreshTopBarCost();
 		this.workingMessage = undefined;
 		this.workingVisible = true;
 		this.setWorkingIndicator();
@@ -4865,10 +4758,13 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.model.cycleForward", () => this.handleModelCycle("forward"));
 		this.defaultEditor.onAction("app.model.cycleBackward", () => this.handleModelCycle("backward"));
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
+		this.defaultEditor.onAction("app.tools.expandAll", () => this.toggleToolOutputExpansion(true));
 		this.defaultEditor.onAction("app.tools.expandFull", () => this.toggleToolOutputFull());
 		this.defaultEditor.onAction("app.messages.expand", () => this.toggleAgentMessageExpansion());
+		this.defaultEditor.onAction("app.messages.expandAll", () => this.toggleAgentMessageExpansion(true));
 		this.defaultEditor.onAction("app.edits.expand", () => this.toggleEditDiffExpansion());
 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
+		this.defaultEditor.onAction("app.thinking.toggleAll", () => this.toggleThinkingBlockVisibility(true));
 		this.defaultEditor.onAction("app.subagents.focus", () => this.focusSubagentSummary());
 		this.defaultEditor.onAction("app.heartbeats.open", () => {
 			void this.showHeartbeatManager();
@@ -5869,7 +5765,6 @@ export class InteractiveMode {
 					this.sessionRecap = event.recap;
 					this.patchConnectionState({ recap: event.recap });
 					this.renderRecap();
-					this.refreshTopBarCost();
 				} else if (event.type === "side_question_event") {
 					this.handleSideQuestionEvent(event.event);
 				} else if (event.type === "extension_ui_request") {
@@ -6115,6 +6010,13 @@ export class InteractiveMode {
 					this.retryLoader.stop();
 					this.retryLoader = undefined;
 				}
+				// A new agent run starts a fresh turn group here — and only here:
+				// mid-turn remounts (returning from the agents view, re-attach)
+				// route through startWorkingLoader without this edge and must keep
+				// the in-flight group intact (K3-2 remount finding). The settled
+				// summary line of the previous run stays in the chat as history.
+				this.currentTurnState = undefined;
+				this.currentTurnSummary = undefined;
 				this.stopWorkingLoader();
 				if (this.workingVisible) {
 					this.startWorkingLoader();
@@ -6130,20 +6032,19 @@ export class InteractiveMode {
 
 			case "session_info_changed":
 				this.updateTerminalTitle();
-				this.refreshTopBarCost();
 				this.footer.invalidate();
 				this.ui.requestRender();
 				break;
 
 			case "thinking_level_changed":
-				this.footer.invalidate();
-				this.subagentSummaryLine.invalidate();
+				// The footer watermark carries the model · thinking level now;
+				// the invalidation repaints the footer itself.
+				this.invalidateFooterTelemetry();
 				this.updateEditorBorderColor();
 				break;
 
 			case "service_tier_changed":
 				this.footer.invalidate();
-				this.subagentSummaryLine.invalidate();
 				break;
 
 			case "bash_start": {
@@ -6255,6 +6156,10 @@ export class InteractiveMode {
 					this.addMessageToChat(event.message);
 					this.ui.requestRender();
 				} else if (event.message.role === "assistant") {
+					// U6: the turn's aggregate line is created at the turn head,
+					// before the first streaming assistant component.
+					this.ensureCurrentTurnSummary();
+					this.currentTurnState?.setLiveThinkingSegments(countThinkingSegments(event.message));
 					this.startAssistantStreamingMessage(event.message);
 					this.ui.requestRender();
 				}
@@ -6264,6 +6169,7 @@ export class InteractiveMode {
 				if (event.message.role === "assistant") {
 					this.streamingMessage = event.message;
 					this.ensureAssistantStreamingComponent(event.message).updateContent(this.streamingMessage, true);
+					this.currentTurnState?.setLiveThinkingSegments(countThinkingSegments(event.message));
 
 					for (const content of this.streamingMessage.content) {
 						if (content.type === "toolCall") {
@@ -6280,6 +6186,11 @@ export class InteractiveMode {
 					// Each landed assistant message grows the mother's own usage, i.e. the
 					// secondary "总" figure; throttled, so this stays cheap mid-turn.
 					this.scheduleSubagentSpendRefresh();
+					// U6: the landed message's thinking blocks settle into the turn count.
+					if (this.currentTurnState) {
+						this.currentTurnState.addThinkingSegments(countThinkingSegments(event.message));
+						this.currentTurnState.setLiveThinkingSegments(0);
+					}
 					this.streamingMessage = event.message;
 					let errorMessage: string | undefined;
 					if (this.streamingMessage.stopReason === "aborted") {
@@ -6300,12 +6211,25 @@ export class InteractiveMode {
 						if (!errorMessage) {
 							errorMessage = this.streamingMessage.errorMessage || "Error";
 						}
+						// P1-B (Qwen review): a message that dies mid-turn leaves its
+						// steps "running" forever in the live path (the replay marks
+						// them error from stopReason) - the ⚙ line never settles and
+						// the live tool rows stay unfolded. Mark every still-pending
+						// step error so the aggregate ends with ✗N, exactly like the
+						// replay face, and stamp the turn's clock.
+						const endedAt = Number(event.message.timestamp) || Date.now();
+						for (const step of this.currentTurnState?.steps ?? []) {
+							if (step.status === "queued" || step.status === "running") {
+								this.currentTurnState?.setStepStatus(step.toolCallId, "error", endedAt);
+							}
+						}
 						for (const [, component] of this.pendingTools.entries()) {
 							component.updateResult({
 								content: [{ type: "text", text: errorMessage }],
 								isError: true,
 							});
 						}
+						this.currentTurnState?.markTurnEnded(endedAt);
 						this.resetPendingToolState();
 					} else {
 						// Args are now complete - trigger diff computation for edit tools
@@ -6317,7 +6241,7 @@ export class InteractiveMode {
 					this.streamingComponent = undefined;
 					this.streamingMessage = undefined;
 					this.footer.invalidate();
-					this.updateFooterTelemetry();
+					this.invalidateFooterTelemetry();
 				}
 				this.ui.requestRender();
 				break;
@@ -6385,7 +6309,9 @@ export class InteractiveMode {
 					this.ui.terminal.setProgress(false);
 				}
 				this.turnStartedAt = undefined;
-				this.refreshTopBarCost();
+				// The run is over; a thinking-only turn's clock stops here (a tool
+				// turn already froze on its last settled step).
+				this.currentTurnState?.markTurnEnded(Date.now());
 				// Drops the loader; background subagents are shown by the tree, not the loader.
 				this.syncWorkingLoader();
 				if (this.streamingComponent) {
@@ -6578,7 +6504,9 @@ export class InteractiveMode {
 			this.getMarkdownThemeWithSettings(),
 			this.hiddenThinkingLabel,
 			{
-				expanded: this.toolOutputExpanded,
+				// The live turn's own lanes (K3 ②), falling back to the globals.
+				expanded: this.currentTurnState ? !this.currentTurnState.isCollapsed : this.toolOutputExpanded,
+				thinkingExpanded: this.currentTurnState?.thinkingExpanded ?? this.thinkingExpanded,
 				precededByToolActivity:
 					this.chatContainer.children.at(-1) instanceof ToolExecutionComponent ||
 					this.chatContainer.children.at(-1) instanceof AgentMessageComponent,
@@ -6613,7 +6541,8 @@ export class InteractiveMode {
 	}
 
 	private syncGoalTray(goal: GoalState): void {
-		this.subagentSummaryLine.invalidate();
+		// The goal label rides the uncached tray info line; a frame request
+		// repaints it, no cache to drop.
 		this.updateGoalTrayTimer(goal);
 	}
 
@@ -6621,7 +6550,6 @@ export class InteractiveMode {
 		if (goal.status === "active") {
 			if (!this.goalTrayTimer) {
 				this.goalTrayTimer = setInterval(() => {
-					this.subagentSummaryLine.invalidate();
 					this.ui.requestRender();
 				}, 1000);
 				this.goalTrayTimer.unref?.();
@@ -7001,8 +6929,6 @@ export class InteractiveMode {
 			return;
 		}
 		this.subagentSpendScanning = true;
-		const connection = this.agentConnection;
-		const sessionId = this.connectionState?.sessionId;
 		try {
 			const tree = await this.fetchSharedContextTree(notBefore);
 			// The scan may have been the header's: the cadence then reads when that scan
@@ -7014,9 +6940,6 @@ export class InteractiveMode {
 			this.subagentSummaryLine.setSubagentSpend(
 				summarizeSubagentSpend(tree, (model) => pricing.isPriced(model), pricing),
 			);
-			// One scan, two figures: the header reads the same tree priced from the same
-			// book, so a turn end never pays for a second scan of its own.
-			this.publishTopBarCost(tree, connection, sessionId, this.nextTopBarCostGeneration(), pricing);
 			this.ui.requestRender();
 		} catch {
 			// Silent degrade: no data, no cell update.
@@ -7088,12 +7011,20 @@ export class InteractiveMode {
 			this.toggleToolOutputExpansion();
 			return;
 		}
+		if (this.keybindings.matches(data, "app.tools.expandAll")) {
+			this.toggleToolOutputExpansion(true);
+			return;
+		}
 		if (this.keybindings.matches(data, "app.tools.expandFull")) {
 			this.toggleToolOutputFull();
 			return;
 		}
 		if (this.keybindings.matches(data, "app.messages.expand")) {
 			this.toggleAgentMessageExpansion();
+			return;
+		}
+		if (this.keybindings.matches(data, "app.messages.expandAll")) {
+			this.toggleAgentMessageExpansion(true);
 			return;
 		}
 		// A raw "\n" is a newline for the editor, not ctrl+j.
@@ -7103,6 +7034,10 @@ export class InteractiveMode {
 		}
 		if (this.keybindings.matches(data, "app.thinking.toggle")) {
 			this.toggleThinkingBlockVisibility();
+			return;
+		}
+		if (this.keybindings.matches(data, "app.thinking.toggleAll")) {
+			this.toggleThinkingBlockVisibility(true);
 			return;
 		}
 		this.focusEditor();
@@ -7122,43 +7057,16 @@ export class InteractiveMode {
 	}
 
 	private getTrayLocationLabel(): string | undefined {
-		const modelLabel = this.getModelTrayLabel();
+		// U6 ①: pure navigation - the model name and context figures moved to the
+		// footer watermark line; the new-chat shortcuts hint is gone with them.
 		const hasChildren = this.options.sessionHasChildren === true || (this.subagentSnapshots?.size ?? 0) > 0;
 		const depthLabel = formatAgentDepthLabel(this.options.sessionDepth, hasChildren);
-		const shortcutsHint = this.getShortcutsTrayHint();
 		const agentsHint = this.getAgentsViewTrayHint();
-		return [agentsHint, depthLabel, modelLabel, shortcutsHint]
-			.filter((label): label is string => label !== undefined)
-			.join("  ");
-	}
-
-	private getShortcutsTrayHint(): string | undefined {
-		if (!this.isNewChat() || this.editor.getText().length > 0) {
-			return undefined;
-		}
-		return keyText("app.shortcuts") ? keyHint("app.shortcuts", "for shortcuts") : "/hotkeys for shortcuts";
+		return [agentsHint, depthLabel].filter((label): label is string => label !== undefined).join(" · ");
 	}
 
 	private isNewChat(): boolean {
 		return (this.connectionState?.messageCount ?? 0) === 0 && this.connectionState?.isStreaming !== true;
-	}
-
-	private getModelTrayLabel(): string {
-		const model = this.getCurrentModel();
-		if (!model) {
-			return "—";
-		}
-		const parts = [model.name];
-		if (model.reasoning) {
-			const level = this.connectionState?.thinkingLevel ?? "off";
-			if (level !== "off") {
-				parts.push(level);
-			}
-		}
-		if (this.connectionState?.serviceTier === "priority") {
-			parts.push("fast");
-		}
-		return parts.join(" • ");
 	}
 
 	private getAgentsViewTrayHint(): string | undefined {
@@ -7171,12 +7079,29 @@ export class InteractiveMode {
 	private getTrayContextLabel(): string | undefined {
 		const goalLabel = this.getTrayGoalLabel();
 		const heartbeatLabel = this.getTrayHeartbeatLabel();
-		const usage = this.getConnectionContextUsage();
-		const contextLabel =
-			usage && typeof usage.tokens === "number" && typeof usage.percent === "number"
-				? `${formatTokenCount(usage.tokens)} (${Math.round(usage.percent)}%)`
-				: undefined;
+		const contextLabel = this.getTrayContextFallbackLabel();
 		return [goalLabel, heartbeatLabel, contextLabel].filter((label) => label !== undefined).join(" · ") || undefined;
+	}
+
+	/**
+	 * U6 ① right side: the context figures, only while the footer watermark is
+	 * off. Reads the footer's own snapshot - not a fresh usage query - so the
+	 * tray and the footer can never disagree (the boss's 478k vs 518k defect).
+	 */
+	private getTrayContextFallbackLabel(): string | undefined {
+		// 评审②: reads the same memoized pair the footer line renders - one
+		// frame, one value; the 478k-vs-518k double readout cannot recur.
+		const source = this.getFooterTelemetrySource();
+		if (source.mode !== "off") {
+			return undefined;
+		}
+		const snapshot = source.snapshot;
+		const tokens = snapshot?.contextTokens;
+		const windowTokens = snapshot?.contextWindow ?? 0;
+		if (!snapshot?.modelName || tokens == null || windowTokens <= 0) {
+			return undefined;
+		}
+		return `${formatContextTokens(tokens, windowTokens)} (${Math.round((tokens / windowTokens) * 100)}%)`;
 	}
 
 	private getTrayHeartbeatLabel(): string | undefined {
@@ -7400,12 +7325,12 @@ export class InteractiveMode {
 			case "custom": {
 				if (message.display) {
 					const component = this.createDisplayedCustomMessageComponent(message);
-					if (isExpandable(component)) {
-						component.setExpanded(this.expansionStateFor(component));
-					}
-					if (hasEditDiffsExpansion(component)) {
-						component.setEditDiffsExpanded(this.editDiffsExpanded);
-					}
+					applyExpansionLanes(component, {
+						thinking: this.thinkingExpanded,
+						tools: this.toolOutputExpanded,
+						agentMessages: this.agentMessagesExpanded,
+						editDiffs: this.editDiffsExpanded,
+					});
 					if (isSessionSlashCommandMessage(message) && this.chatContainer.children.length > 0) {
 						this.chatContainer.addChild(new Spacer(1));
 					}
@@ -7485,6 +7410,10 @@ export class InteractiveMode {
 					this.hiddenThinkingLabel,
 					{
 						expanded: this.toolOutputExpanded,
+						// F2: the thinking lane must survive a rebuild too - without
+						// it, a compaction or chat-cap window rebuild silently collapses
+						// the traces the user had expanded.
+						thinkingExpanded: this.thinkingExpanded,
 						precededByToolActivity:
 							this.chatContainer.children.at(-1) instanceof ToolExecutionComponent ||
 							this.chatContainer.children.at(-1) instanceof AgentMessageComponent,
@@ -7600,21 +7529,27 @@ export class InteractiveMode {
 
 		for (const message of messagesToRender) {
 			if (message.role === "user") {
+				// Freeze the previous turn's clock (thinking-only turns have no
+				// steps to settle) before the next turn starts.
+				replayTurnState?.markTurnEnded(Number(message.timestamp) || Date.now());
 				replayTurnState = undefined;
 				replayTurnSummary = undefined;
 			}
 			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
+				// U6: the turn's aggregate line renders at the turn head, before the
+				// first assistant component, and counts this message's thinking.
+				if (!replayTurnState) {
+					replayTurnState = new TurnActivityState(Number(message.timestamp) || Date.now());
+					replayTurnSummary = new TurnSummaryComponent(replayTurnState);
+					replayTurnSummary.setExpanded(this.toolOutputExpanded);
+					this.chatContainer.addChild(replayTurnSummary);
+				}
+				replayTurnState.addThinkingSegments(countThinkingSegments(message));
 				this.addMessageToChat(message);
 				// Render tool call components
 				for (const content of message.content) {
 					if (content.type === "toolCall") {
-						if (!replayTurnState) {
-							replayTurnState = new TurnActivityState(Number(message.timestamp) || Date.now());
-							replayTurnSummary = new TurnSummaryComponent(replayTurnState);
-							replayTurnSummary.setExpanded(this.toolOutputExpanded);
-							this.chatContainer.addChild(replayTurnSummary);
-						}
 						replayTurnState.addStep({
 							toolCallId: content.id,
 							toolName: content.name,
@@ -7682,8 +7617,11 @@ export class InteractiveMode {
 			component.setIncludeImageDimensions(true);
 			this.pendingTools.set(toolCallId, component);
 		}
-		if (renderedPendingTools.size > 0 && replayTurnState) {
-			// Attaching mid-run: live tool events keep settling this turn's steps.
+		// The last replayed turn has no following user prompt; freeze its clock.
+		replayTurnState?.markTurnEnded(Number(messagesToRender.at(-1)?.timestamp) || Date.now());
+		if (replayTurnState && (renderedPendingTools.size > 0 || this.isAgentStreaming())) {
+			// Attaching mid-run: live tool and thinking events keep feeding this
+			// turn's group, so the replayed state stays the live one.
 			this.currentTurnState = replayTurnState;
 			this.currentTurnSummary = replayTurnSummary;
 		}
@@ -7930,12 +7868,10 @@ export class InteractiveMode {
 			this.ctrlCExitHintTimer = undefined;
 			if (!this.isCtrlCExitHintVisible()) {
 				this.ctrlCExitHintExpiresAt = 0;
-				this.subagentSummaryLine.invalidate();
 				this.ui.requestRender();
 			}
 		}, InteractiveMode.EXIT_HINT_DURATION_MS);
 		this.ctrlCExitHintTimer.unref?.();
-		this.subagentSummaryLine.invalidate();
 		this.ui.requestRender();
 	}
 
@@ -7949,7 +7885,6 @@ export class InteractiveMode {
 		}
 		this.ctrlCExitHintExpiresAt = 0;
 		if (options.render !== false) {
-			this.subagentSummaryLine.invalidate();
 			this.ui.requestRender();
 		}
 	}
@@ -8438,7 +8373,8 @@ export class InteractiveMode {
 	}
 
 	private getPromptDockComponents(): Component[] {
-		return [this.editorContainer, this.subagentSummaryLine, this.footerSlot];
+		// U6: ① tray info line, ② footer watermark, ③ subagents line.
+		return [this.editorContainer, this.trayInfoLine, this.footerSlot, this.subagentSummaryLine];
 	}
 
 	/** Enter or leave fullscreen rendering without touching the persisted setting. */
@@ -8541,7 +8477,66 @@ export class InteractiveMode {
 		this.footer.setSpeedText(this.speedStats.samples > 1 ? `${last} tok/s · avg ${average}` : `${last} tok/s`);
 	}
 
-	private toggleToolOutputExpansion(): void {
+	/**
+	 * U6 K3 ②: the latest turn in the chat tree (chat-tail anchored - the
+	 * viewport-bottom turn in the common case; a session with no turns yet
+	 * returns undefined and callers fall back to the global lanes).
+	 */
+	private latestTurnSummary(): TurnSummaryComponent | undefined {
+		const children = this.chatContainer.children;
+		for (let i = children.length - 1; i >= 0; i--) {
+			const child = children[i];
+			if (child instanceof TurnSummaryComponent) {
+				return child;
+			}
+		}
+		return undefined;
+	}
+
+	/**
+	 * Applies the lanes to one turn's span: the summary itself and every child
+	 * after it until the next turn's summary. Turn-less children (before the
+	 * first summary) read the global lanes.
+	 */
+	private applyTurnExpansion(summary: TurnSummaryComponent): void {
+		const children = this.chatContainer.children;
+		const start = children.indexOf(summary);
+		if (start < 0) {
+			this.applyChatExpansion();
+			return;
+		}
+		const state = summary.state;
+		summary.setExpanded(!state.isCollapsed);
+		for (let i = start + 1; i < children.length; i++) {
+			const child = children[i];
+			if (child instanceof TurnSummaryComponent) {
+				break;
+			}
+			applyExpansionLanes(child, {
+				thinking: state.thinkingExpanded,
+				tools: !state.isCollapsed,
+				agentMessages: state.agentMessagesExpanded,
+				editDiffs: !state.isCollapsed,
+			});
+		}
+		this.requestExpansionRender();
+	}
+
+	private toggleToolOutputExpansion(global = false): void {
+		// U6 (boss's two-key model): Ctrl+O owns the process surface — tool
+		// calls, outputs, and edit diffs ride the same expanded state. The plain
+		// key acts on the latest turn; Alt+O acts globally (K3 ②).
+		if (!global) {
+			const summary = this.latestTurnSummary();
+			if (summary) {
+				const next = summary.state.isCollapsed;
+				summary.setExpanded(next);
+				this.applyTurnExpansion(summary);
+				return;
+			}
+		}
+		this.editDiffsExpanded = !this.toolOutputExpanded;
+		this.syncAllTurnLanes(!this.toolOutputExpanded, "tools");
 		this.setToolsExpanded(!this.toolOutputExpanded);
 	}
 
@@ -8565,8 +8560,20 @@ export class InteractiveMode {
 		);
 	}
 
-	private toggleAgentMessageExpansion(): void {
+	private toggleAgentMessageExpansion(global = false): void {
+		// U6: Ctrl+P keeps its own lane - agent message rows only. The plain key
+		// acts on the latest turn; Alt+P acts globally (K3 ②).
+		if (!global) {
+			const summary = this.latestTurnSummary();
+			if (summary) {
+				const next = !summary.state.agentMessagesExpanded;
+				summary.state.agentMessagesExpanded = next;
+				this.applyTurnExpansion(summary);
+				return;
+			}
+		}
 		this.agentMessagesExpanded = !this.agentMessagesExpanded;
+		this.syncAllTurnLanes(this.agentMessagesExpanded, "agentMessages");
 		this.applyChatExpansion();
 	}
 
@@ -8580,9 +8587,15 @@ export class InteractiveMode {
 		this.applyChatExpansion();
 	}
 
-	/** Expansion state for a chat component: agent messages toggle separately from tools. */
-	private expansionStateFor(component: unknown): boolean {
-		return component instanceof AgentMessageComponent ? this.agentMessagesExpanded : this.toolOutputExpanded;
+	/** Writes one lane's value into every turn's state (the Alt-global path, K3 ②). */
+	private syncAllTurnLanes(value: boolean, lane: "thinking" | "tools" | "agentMessages"): void {
+		for (const child of this.chatContainer.children) {
+			if (child instanceof TurnSummaryComponent) {
+				if (lane === "thinking") child.state.thinkingExpanded = value;
+				if (lane === "agentMessages") child.state.agentMessagesExpanded = value;
+				if (lane === "tools") child.setExpanded(value);
+			}
+		}
 	}
 
 	private applyChatExpansion(): void {
@@ -8590,21 +8603,29 @@ export class InteractiveMode {
 		if (isExpandable(activeHeader)) {
 			activeHeader.setExpanded(this.toolOutputExpanded);
 		}
+		// K3 ②: the walk is turn-aware - each turn's children read that turn's
+		// lanes; children before the first summary (turn-less) read the globals.
+		const globalLanes = {
+			thinking: this.thinkingExpanded,
+			tools: this.toolOutputExpanded,
+			agentMessages: this.agentMessagesExpanded,
+			editDiffs: this.editDiffsExpanded,
+		};
+		let turnLanes: { thinking: boolean; tools: boolean; agentMessages: boolean; editDiffs: boolean } | undefined;
 		for (const child of this.chatContainer.children) {
-			if (isExpandable(child)) {
-				child.setExpanded(this.expansionStateFor(child));
+			if (child instanceof TurnSummaryComponent) {
+				const state = child.state;
+				child.setExpanded(!state.isCollapsed);
+				turnLanes = {
+					thinking: state.thinkingExpanded,
+					tools: !state.isCollapsed,
+					agentMessages: state.agentMessagesExpanded,
+					editDiffs: !state.isCollapsed,
+				};
+				continue;
 			}
-			if (hasAgentMessagesExpansion(child)) {
-				child.setAgentMessagesExpanded(this.agentMessagesExpanded);
-			}
-			if (hasEditDiffsExpansion(child)) {
-				child.setEditDiffsExpanded(this.editDiffsExpanded);
-			}
+			applyExpansionLanes(child, turnLanes ?? globalLanes);
 		}
-		// Expanding/collapsing changes blocks above the viewport, which would
-		// otherwise force a full redraw that scrolls to the top and replays the
-		// whole transcript. Keep the user anchored at their current position.
-		// Fullscreen frames have no scrollback to preserve.
 		if (this.ui.isFullscreen()) {
 			this.ui.requestRender();
 		} else {
@@ -8612,23 +8633,45 @@ export class InteractiveMode {
 		}
 	}
 
-	private toggleThinkingBlockVisibility(): void {
-		this.hideThinkingBlock = !this.hideThinkingBlock;
-		this.settingsManager.setHideThinkingBlock(this.hideThinkingBlock);
+	/**
+	 * Expanding/collapsing changes blocks above the viewport, which would
+	 * otherwise force a full redraw that scrolls to the top and replays the
+	 * whole transcript. Keep the user anchored at their current position.
+	 * Fullscreen frames have no scrollback to preserve.
+	 */
+	private requestExpansionRender(): void {
+		if (this.ui.isFullscreen()) {
+			this.ui.requestRender();
+		} else {
+			this.ui.requestRenderPreservingViewport();
+		}
+	}
 
-		void (async () => {
-			// Rebuild chat from session messages
-			await this.rebuildChatFromMessages();
-
-			if (this.streamingComponent && this.streamingMessage) {
-				this.streamingComponent.setHideThinkingBlock(this.hideThinkingBlock);
-				this.streamingComponent.updateContent(this.streamingMessage);
+	private toggleThinkingBlockVisibility(global = false): void {
+		// U6 (boss's two-key model): Ctrl+T owns the thinking block — it
+		// expands/collapses the turn's thinking traces. The turn header stays
+		// visible either way; the persisted hideThinkingBlock setting (never
+		// show traces) is no longer bound to the key, and a press while it is
+		// on guides the user to it instead of silently doing nothing (K3 ④).
+		// The plain key acts on the latest turn; Alt+T acts globally (K3 ②).
+		if (this.hideThinkingBlock) {
+			this.showStatus("思考 trace 被 hideThinkingBlock 设置隐藏：关闭该设置后 Ctrl+T 可展开");
+			return;
+		}
+		if (!global) {
+			const summary = this.latestTurnSummary();
+			if (summary) {
+				const next = !summary.state.thinkingExpanded;
+				summary.state.thinkingExpanded = next;
+				this.applyTurnExpansion(summary);
+				this.showStatus(`思考块: ${next ? "展开" : "收起"}${next ? "（最近一轮）" : ""}`);
+				return;
 			}
-
-			this.showStatus(`Thinking blocks: ${this.hideThinkingBlock ? "hidden" : "visible"}`);
-		})().catch((error) => {
-			this.showError(error instanceof Error ? error.message : String(error));
-		});
+		}
+		this.thinkingExpanded = !this.thinkingExpanded;
+		this.syncAllTurnLanes(this.thinkingExpanded, "thinking");
+		this.applyChatExpansion();
+		this.showStatus(`思考块: ${this.thinkingExpanded ? "全部展开" : "全部收起"}`);
 	}
 
 	private openExternalEditor(): void {
@@ -9066,8 +9109,10 @@ export class InteractiveMode {
 			serviceTier: state.serviceTier,
 			availableThinkingLevels: state.availableThinkingLevels,
 		});
-		this.footer.invalidate();
-		this.subagentSummaryLine.invalidate();
+		// The footer watermark carries the model · thinking level now; the
+		// invalidation repaints the footer. Defensive for partial-mode harnesses
+		// that stub only the pre-U6 method set.
+		(this as unknown as { invalidateFooterTelemetry?: () => void }).invalidateFooterTelemetry?.();
 		this.updateEditorBorderColor();
 		// Rebuild so the /effort argument hint reflects the new model's levels.
 		this.setupAutocompleteProvider();
@@ -9333,7 +9378,6 @@ export class InteractiveMode {
 				}
 				this.patchConnectionState({ serviceTier: state.serviceTier });
 				this.footer.invalidate();
-				this.subagentSummaryLine.invalidate();
 				this.showStatus(`Fast mode: ${state.serviceTier === "priority" ? "on" : "off"}`);
 			})
 			.catch((error) => {

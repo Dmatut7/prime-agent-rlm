@@ -42,7 +42,7 @@ describe("fullscreen top bar wiring", () => {
 		const sideQuestionContainer = new Container();
 		const widgetContainerBelow = new Container();
 		const promptDock = new Container();
-		const topBar = new TopBar({ getChatName: () => "demo", getCostUsd: () => 1.42 });
+		const topBar = new TopBar({ getChatName: () => "demo" });
 		const enterFullscreen = vi.fn();
 		const exitFullscreen = vi.fn();
 		const mode = Object.assign(Object.create(InteractiveMode.prototype), {

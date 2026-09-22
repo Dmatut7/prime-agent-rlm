@@ -242,26 +242,6 @@ export function nodeSpendMoney(
 	return pricing?.attribute(node.model, node.ownUsage)?.cost ?? node.ownUsage.cost.total;
 }
 
-/**
- * How much a tree's recorded spend moves under the overrides: the sum of every
- * node's correction, so a figure published from the tree's own totals (the top
- * bar reads `totalUsage`) can be corrected by the same amount the rows are.
- */
-export function spendOverrideCorrection(root: ContextTreeNode, pricing: SpendPricing): number {
-	let correction = 0;
-	const walk = (node: ContextTreeNode): void => {
-		const attributed = pricing.attribute(node.model, node.ownUsage);
-		if (attributed) {
-			correction += attributed.cost - node.ownUsage.cost.total;
-		}
-		for (const child of node.children) {
-			walk(child);
-		}
-	};
-	walk(root);
-	return correction;
-}
-
 /** One model's money in a tree, with the rates that priced it. */
 export interface SpendPriceSourceRow {
 	/** `"<provider>/<model-id>"`. */

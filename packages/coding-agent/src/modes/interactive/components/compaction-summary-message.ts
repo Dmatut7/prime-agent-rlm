@@ -2,7 +2,6 @@ import { Clickable, Markdown, type MarkdownTheme, Spacer, Text } from "@earendil
 import type { CompactionSummaryMessage } from "../../../core/messages.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
 import { customMessageLabel, ExpandableCustomMessageBox } from "./expandable-custom-message.js";
-import { expandCollapseHint } from "./keybinding-hints.js";
 
 /** Compaction summary card: full markdown summary when expanded. */
 export class CompactionSummaryMessageComponent extends ExpandableCustomMessageBox {
@@ -36,13 +35,10 @@ export class CompactionSummaryMessageComponent extends ExpandableCustomMessageBo
 			);
 		} else {
 			const focus = instructions ? ` · focus: ${instructions}` : "";
+			// U6: no per-line expand hint — the global tail line states the keys.
 			this.addChild(
 				new Clickable(
-					new Text(
-						`${theme.fg("customMessageText", `Compacted from ${tokenStr} tokens${focus}`)} ${expandCollapseHint("app.tools.expand", false)}`,
-						0,
-						0,
-					),
+					new Text(theme.fg("customMessageText", `Compacted from ${tokenStr} tokens${focus}`), 0, 0),
 					toggle,
 				),
 			);

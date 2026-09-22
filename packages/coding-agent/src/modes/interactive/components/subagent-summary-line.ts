@@ -13,11 +13,19 @@ import { keyText } from "./keybinding-hints.js";
 /** Bound on stall marker lines so a wedged family cannot push the editor off screen. */
 const MAX_RENDERED_STALL_MARKERS = 3;
 
-/** Space between the counts and the spend cell; matches the counts' own rhythm. */
-const SPEND_SEPARATOR = "   ";
+/**
+ * U6 group gap (DS2 F7): the same four-space rhythm as the watermark line
+ * above - the two status lines read as one block. The full second line -
+ * counts, spend cell with annotations, and the hint - still fits 78 columns
+ * with the wider gaps, under the 80-column floor.
+ */
+const GROUP_GAP = "    ";
 
 /** Blank space always kept between the spend cell and the open hint. */
 const SPEND_MIN_GAP = 1;
+
+/** Leading indent of the borderless subagents line. */
+const LINE_INDENT = "  ";
 
 /**
  * Running/idle/inactive counts for the subagents tray cell.
@@ -227,6 +235,40 @@ export function countRosterSubagentStatuses(
 }
 
 /** One-line entry into the current session's scoped agents view. */
+/**
+ * U6 ①: the status area's top line — pure navigation (agents/resume · 深度 N)
+ * with the context figures on the right only while the footer watermark is
+ * off (the fallback reads the footer's own snapshot, so both readouts agree).
+ */
+export class TrayInfoLine implements Component {
+	constructor(
+		private readonly getLocationLabel: () => string | undefined = () => undefined,
+		private readonly getContextLabel: () => string | undefined = () => undefined,
+		private readonly getOverrideLabel: () => string | undefined = () => undefined,
+	) {}
+
+	invalidate(): void {
+		// Render output is derived from live getters.
+	}
+
+	render(width: number): string[] {
+		const overrideLabel = this.getOverrideLabel()?.trim();
+		const locationLabel = this.getLocationLabel()?.trim();
+		const contextLabel = this.getContextLabel()?.trim();
+		const left = overrideLabel || locationLabel || "";
+		if (!left && !contextLabel) return [];
+		const safeWidth = Math.max(1, width);
+		const right = contextLabel ?? "";
+		const gap = left && right ? 2 : 0;
+		const rightWidth = Math.min(visibleWidth(right), Math.max(0, safeWidth - gap));
+		const leftWidth = Math.max(0, safeWidth - rightWidth - gap);
+		const renderedLeft = truncateToWidth(left, leftWidth, "…");
+		const renderedRight = truncateToWidth(right, rightWidth, "…");
+		const padding = Math.max(0, safeWidth - visibleWidth(renderedLeft) - visibleWidth(renderedRight));
+		return [theme.fg("muted", `${renderedLeft}${" ".repeat(padding)}${renderedRight}`)];
+	}
+}
+
 export class SubagentSummaryLine implements Component, Focusable {
 	focused = false;
 	private counts: SubagentSummaryCounts = { total: 0, running: 0, idle: 0, inactive: 0 };
@@ -240,12 +282,6 @@ export class SubagentSummaryLine implements Component, Focusable {
 	onOpen?: () => void;
 	onCancel?: () => void;
 	onChatAction?: (data: string) => void;
-
-	constructor(
-		private readonly getLocationLabel: () => string | undefined = () => undefined,
-		private readonly getContextLabel: () => string | undefined = () => undefined,
-		private readonly getOverrideLabel: () => string | undefined = () => undefined,
-	) {}
 
 	setSubagentCounts(counts: SubagentSummaryCounts): void {
 		this.counts = counts;
@@ -316,9 +352,6 @@ export class SubagentSummaryLine implements Component, Focusable {
 			this.openable ? 1 : 0,
 			this.focused ? 1 : 0,
 			this.stallMarkers.join("\u0000"),
-			this.getOverrideLabel() ?? "",
-			this.getLocationLabel() ?? "",
-			this.getContextLabel() ?? "",
 		].join("\u0001");
 	}
 
@@ -336,49 +369,53 @@ export class SubagentSummaryLine implements Component, Focusable {
 		].join("\u0002");
 	}
 
+	/**
+	 * U6 ③: one borderless line under the watermark line —
+	 * `  运行 1 · 空闲 0 · 收口 2    子代理 ¥961.72 · 592M tok ｜ 全部 ¥1235.16    ↓ 选择`.
+	 * Zero-count classes render nothing; no subagents at all hides the whole
+	 * line. The words match the agents view (收口 = settled rows).
+	 */
 	private renderLines(width: number): string[] {
-		const lines = this.renderInfoLine(width);
-		if (this.counts.total === 0) return lines;
-		if (width < 2) return lines;
-		const safeWidth = width;
-		const inner = safeWidth - 2;
-		const label = theme.fg("accent", "[1msubagents[22m");
-		const top = truncateToWidth(
-			`${theme.fg("border", "╭─ ")}${label}${theme.fg("border", ` ${"─".repeat(Math.max(0, inner - 3 - visibleWidth(label)))}╮`)}`,
-			safeWidth,
-			"…",
-		);
-		const counts =
-			theme.fg("success", `● ${this.counts.running} running`) +
-			"   " +
-			theme.fg("warning", `◐ ${this.counts.idle} idle`) +
-			"   " +
-			theme.fg("dim", `○ ${this.counts.inactive} inactive`);
+		if (this.counts.total === 0) return [];
+		const safeWidth = Math.max(1, width);
+		const counts = this.renderCounts();
 		const openHint = this.openable
 			? this.focused
-				? `${keyText("tui.select.confirm")}/${keyText("app.agents.open")} open`
-				: `${keyText("tui.editor.cursorDown", { primaryOnly: true })} select`
+				? `${keyText("tui.select.confirm")}/${keyText("app.agents.open")} 打开`
+				: `${keyText("tui.editor.cursorDown", { primaryOnly: true })} 选择`
 			: "";
 		// The blank area between the counts and the open hint carries the family
-		// spend (Σ sub-agent money + tokens; mother included as a secondary figure
+		// spend (sub-agent money + tokens; the whole family as a secondary figure
 		// when width allows). The hint stays right-anchored and the body is padded
-		// to the full inner width, so figure changes only ever eat whitespace -
-		// the money is fixed two-decimal and the tokens use the bounded k/M
+		// to the full width, so figure changes only ever eat whitespace - the
+		// money is fixed two-decimal and the tokens use the bounded k/M
 		// abbreviation, neither of which can move the hint or the line length.
-		const spendBudget =
-			inner - 2 - visibleWidth(counts) - SPEND_SEPARATOR.length - SPEND_MIN_GAP - visibleWidth(openHint);
-		const spend = this.renderSpend(spendBudget);
-		const separator = spend ? SPEND_SEPARATOR : "";
+		// F5 (DS2 review): the open hint never participates in truncation. The
+		// counts and the spend cell get the width the hint leaves; a wide family
+		// truncates its figures (whole segments, money drops rungs) instead of
+		// squeezing the agents-view entry off the line.
+		const hintReserve = visibleWidth(openHint) > 0 ? visibleWidth(openHint) + SPEND_MIN_GAP : 0;
+		const contentBudget = Math.max(1, safeWidth - visibleWidth(LINE_INDENT) - hintReserve);
+		const spendBudget = contentBudget - visibleWidth(counts) - GROUP_GAP.length - SPEND_MIN_GAP;
+		const spend = this.renderSpend(Math.max(0, spendBudget));
+		const separator = spend ? GROUP_GAP : "";
 		const gap = Math.max(
 			SPEND_MIN_GAP,
-			inner - 2 - visibleWidth(counts) - separator.length - visibleWidth(spend) - visibleWidth(openHint),
+			safeWidth -
+				visibleWidth(LINE_INDENT) -
+				visibleWidth(counts) -
+				separator.length -
+				visibleWidth(spend) -
+				visibleWidth(openHint),
 		);
 		const body = truncateToWidth(
-			` ${counts}${separator}${spend}${" ".repeat(gap)}${theme.fg("dim", openHint)} `,
-			inner,
-			"…",
+			`${LINE_INDENT}${truncateToWidth(`${counts}${separator}${spend}`, contentBudget, "…")}${" ".repeat(
+				gap,
+			)}${theme.fg("dim", openHint)}`,
+			safeWidth,
+			"",
 		);
-		const pad = " ".repeat(Math.max(0, inner - visibleWidth(body)));
+		const pad = " ".repeat(Math.max(0, safeWidth - visibleWidth(body)));
 		// Truncation may inject full ANSI resets; wrap each segment so the
 		// selection background survives past them (custom-editor precedent).
 		const content = this.focused
@@ -387,22 +424,33 @@ export class SubagentSummaryLine implements Component, Focusable {
 					.map((segment) => theme.bg("selectedBg", segment))
 					.join("\x1b[0m")
 			: `${body}${pad}`;
-		lines.push(
-			top,
-			`${theme.fg("border", "│")}${content}${theme.fg("border", "│")}`,
-			theme.fg("border", `╰${"─".repeat(inner)}╯`),
-		);
+		const lines = [content];
 		for (const marker of this.stallMarkers.slice(0, MAX_RENDERED_STALL_MARKERS)) {
 			lines.push(theme.fg("error", truncateToWidth(`  ⚠ ${marker}`, safeWidth, "…")));
 		}
 		return lines;
 	}
 
+	/** `运行 1 · 空闲 0 · 收口 2` — zero-count classes are skipped entirely. */
+	private renderCounts(): string {
+		const parts: string[] = [];
+		if (this.counts.running > 0) {
+			parts.push(theme.fg("success", `运行 ${this.counts.running}`));
+		}
+		if (this.counts.idle > 0) {
+			parts.push(theme.fg("warning", `空闲 ${this.counts.idle}`));
+		}
+		if (this.counts.inactive > 0) {
+			parts.push(theme.fg("dim", `收口 ${this.counts.inactive}`));
+		}
+		return parts.join(theme.fg("dim", " · "));
+	}
+
 	/**
 	 * The spend cell, degraded to the widest form that fits `budget` columns.
 	 *
-	 * Degradation order (each step loses exactly one thing): "总" first (the
-	 * least valuable figure by design), then the annotations' token counts
+	 * Degradation order (each step loses exactly one thing): the "全部" figure
+	 * first (the least valuable by design), then the annotations' token counts
 	 * (unpriced and override markers alike), then the annotations themselves,
 	 * then the whole cell - a truncated
 	 * money figure would read as a wrong number, so the cell is dropped, never
@@ -413,7 +461,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 		const spend = this.spend;
 		if (!spend || (spend.cost === 0 && spend.tokens === 0)) return "";
 		const dot = theme.fg("dim", " · ");
-		const label = theme.fg("dim", "Σ 子代理");
+		const label = theme.fg("dim", "子代理");
 		const money =
 			spend.cost > 0
 				? `${spend.partial ? theme.fg("dim", "≈") : ""}${theme.fg("accent", formatSpendCost(spend.cost))}`
@@ -421,8 +469,12 @@ export class SubagentSummaryLine implements Component, Focusable {
 		const tokens = theme.fg("dim", `${spend.partial ? "≈" : ""}${formatTokenCount(spend.tokens)} tok`);
 		const primary = money ? `${label} ${money}${dot}${tokens}` : `${label} ${tokens}`;
 		const total = spend.parentCost + spend.cost;
+		// `｜` separates the two spend groups (sub-agents vs the whole family);
+		// `·` stays inside a group.
 		const secondary =
-			total > 0 ? `${dot}${theme.fg("dim", `总 ${spend.partial ? "≈" : ""}${formatSpendCost(total)}`)}` : "";
+			total > 0
+				? `${theme.fg("dim", " ｜ ")}${theme.fg("dim", `全部 ${spend.partial ? "≈" : ""}${formatSpendCost(total)}`)}`
+				: "";
 		const annotate = (withTokens: boolean): string => {
 			const annotations = [
 				this.renderUnpricedAnnotation(spend, withTokens),
@@ -464,23 +516,6 @@ export class SubagentSummaryLine implements Component, Focusable {
 			.map((entry) => (withTokens ? `${entry.model} ${formatTokenCount(entry.tokens)}` : entry.model))
 			.join(" · ");
 		return theme.fg("accent", `(${models}${withTokens ? " tok" : ""} 已改价)`);
-	}
-
-	private renderInfoLine(width: number): string[] {
-		const overrideLabel = this.getOverrideLabel()?.trim();
-		const locationLabel = this.getLocationLabel()?.trim();
-		const contextLabel = this.getContextLabel()?.trim();
-		const left = overrideLabel || locationLabel || "";
-		if (!left && !contextLabel) return [];
-		const safeWidth = Math.max(1, width);
-		const right = contextLabel ?? "";
-		const gap = left && right ? 2 : 0;
-		const rightWidth = Math.min(visibleWidth(right), Math.max(0, safeWidth - gap));
-		const leftWidth = Math.max(0, safeWidth - rightWidth - gap);
-		const renderedLeft = truncateToWidth(left, leftWidth, "…");
-		const renderedRight = truncateToWidth(right, rightWidth, "…");
-		const padding = Math.max(0, safeWidth - visibleWidth(renderedLeft) - visibleWidth(renderedRight));
-		return [theme.fg("muted", `${renderedLeft}${" ".repeat(padding)}${renderedRight}`)];
 	}
 
 	invalidate(): void {

@@ -10,7 +10,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { spawn } from "child_process";
 import { type Static, Type } from "typebox";
-import { expandCollapseHint, keyHint } from "../../modes/interactive/components/keybinding-hints.js";
+import { keyHint } from "../../modes/interactive/components/keybinding-hints.js";
 import {
 	expandedOutputSkippedDetail,
 	expandedOutputWindow,
@@ -754,7 +754,7 @@ function bashPreviewTail(lines: string[], maxVisualLines: number, width: number)
 	};
 }
 
-/** Bracketed shortcut hint for the block tail, matching expandCollapseHint's shape. */
+/** Bracketed shortcut hint for the block tail. */
 function showAllHint(): string {
 	return `${theme.fg("dim", "(")}${keyHint("app.tools.expandFull", "for full output")}${theme.fg("dim", ")")}`;
 }
@@ -781,11 +781,9 @@ function cachedExpandedLines(
 	return holds ? state.cachedExpandedLines : undefined;
 }
 
-/** The collapsed "... N earlier lines" line, with the shortcut on the row that shows it. */
-function collapsedPreviewHint(skipped: number, showExpandHint: boolean): string {
-	return showExpandHint
-		? `${theme.fg("muted", `... ${skipped} earlier lines`)} ${expandCollapseHint("app.tools.expand", false)}`
-		: theme.fg("muted", `... (${skipped} earlier lines)`);
+/** The collapsed "... N earlier lines" line (U6: no per-line expand hint anymore). */
+function collapsedPreviewHint(skipped: number): string {
+	return theme.fg("muted", `... (${skipped} earlier lines)`);
 }
 
 /**
@@ -914,11 +912,7 @@ function rebuildBashResultRenderComponent(
 					const skipped = state.cachedSkipped ?? 0;
 					const assembled =
 						skipped > 0
-							? [
-									"",
-									truncateToWidth(collapsedPreviewHint(skipped, showExpandHint), width, "..."),
-									...previewLines,
-								]
+							? ["", truncateToWidth(collapsedPreviewHint(skipped), width, "..."), ...previewLines]
 							: ["", ...previewLines];
 					state.cachedPreviewFrame = {
 						source: previewLines,

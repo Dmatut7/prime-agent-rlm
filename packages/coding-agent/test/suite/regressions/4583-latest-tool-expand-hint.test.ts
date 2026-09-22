@@ -67,15 +67,17 @@ describe("ENG-4583 latest tool expand hint", () => {
 		if (!latest) {
 			throw new Error("Expected a latest tool component");
 		}
-		// U4: collapsed, the turn's tool rows hide behind one aggregate line that
-		// carries the single expand hint.
+		// U6: collapsed, the turn's tool rows hide behind one process line; no
+		// per-row expand hints exist at all (the global tail hint line owns the
+		// Ctrl+O affordance), which subsumes ENG-4583's "only the latest row
+		// carries the hint" concern.
 		const summary = components.find(
 			(component): component is TurnSummaryComponent => component instanceof TurnSummaryComponent,
 		);
 		expect(summary).toBeDefined();
 		const collapsedChat = stripAnsi(components.flatMap((component) => component.render(120)).join("\n"));
-		expect(collapsedChat).toContain("本轮 3 步");
-		expect(collapsedChat.match(/展开/g)?.length).toBe(1);
+		expect(collapsedChat).toContain("⚙ 3 步");
+		expect(collapsedChat).not.toContain("展开");
 		expect(render(tools)).not.toContain("展开");
 
 		for (const tool of tools) {
@@ -83,7 +85,7 @@ describe("ENG-4583 latest tool expand hint", () => {
 		}
 		summary?.setExpanded(true);
 		expect(render(tools.slice(0, -1))).not.toContain("收起");
-		expect(render(tools).match(/收起/g)).toHaveLength(1);
+		expect(render(tools).match(/收起/g)).toBe(null);
 	});
 });
 

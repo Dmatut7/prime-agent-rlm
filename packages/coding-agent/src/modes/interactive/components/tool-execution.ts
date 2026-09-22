@@ -358,9 +358,10 @@ export class ToolExecutionComponent extends Container {
 		if (!state || !state.isCollapsed || this.expanded) {
 			return false;
 		}
-		// Hide only settled steps: the block a running turn is watching must stay
-		// live even when it already holds a partial result (live attach).
-		return state.isStepSettled(this.toolCallId);
+		// Hide only SUCCEEDED steps (第五批: errors never fold). A failed tool's
+		// collapsed ✗ row keeps its readable error on screen, exactly as
+		// pre-U4; a running block also stays live even with a partial result.
+		return state.isStepDone(this.toolCallId);
 	}
 
 	setAgentMessagesExpanded(expanded: boolean): void {

@@ -11,7 +11,7 @@ import { DynamicBorder } from "../src/modes/interactive/components/dynamic-borde
 import { FeatureHintComponent } from "../src/modes/interactive/components/feature-hint.js";
 import { FooterComponent } from "../src/modes/interactive/components/footer.js";
 import { RefinementOutcomeMessageComponent } from "../src/modes/interactive/components/refinement-outcome-message.js";
-import { SubagentSummaryLine } from "../src/modes/interactive/components/subagent-summary-line.js";
+import { SubagentSummaryLine, TrayInfoLine } from "../src/modes/interactive/components/subagent-summary-line.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
 // LineAggregator treats array identity as its change signal, so a leaf that
@@ -80,12 +80,7 @@ describe("component render caching", () => {
 	});
 
 	test("SubagentSummaryLine keys the cache on values, not setter identity", () => {
-		let contextLabel: string | undefined = "42% ctx";
-		const line = new SubagentSummaryLine(
-			() => undefined,
-			() => contextLabel,
-			() => undefined,
-		);
+		const line = new SubagentSummaryLine();
 		const first = line.render(120);
 		expect(line.render(120)).toBe(first);
 
@@ -99,11 +94,6 @@ describe("component render caching", () => {
 		line.setSubagentCounts({ total: 3, running: 2, idle: 1, inactive: 0 });
 		expect(line.render(120)).not.toBe(withCounts);
 
-		// Labels come from getters and can drift without any setter call.
-		const before = line.render(120);
-		contextLabel = "43% ctx";
-		expect(line.render(120)).not.toBe(before);
-
 		const relabeled = line.render(120);
 		line.focused = true;
 		expect(line.render(120)).not.toBe(relabeled);
@@ -113,6 +103,22 @@ describe("component render caching", () => {
 		const refreshed = line.render(120);
 		expect(refreshed).not.toBe(focused);
 		expect(refreshed).toEqual(focused);
+	});
+
+	test("TrayInfoLine re-renders its getters on every frame (no cache)", () => {
+		let contextLabel: string | undefined = "518k/1M (49%)";
+		const line = new TrayInfoLine(
+			() => undefined,
+			() => contextLabel,
+			() => undefined,
+		);
+		const first = line.render(120);
+		expect(first.join("")).toContain("518k/1M (49%)");
+
+		// Labels come from getters and can drift without any setter call.
+		contextLabel = "530k/1M (51%)";
+		expect(line.render(120)[0]).not.toBe(first[0]);
+		expect(line.render(120).join("")).toContain("530k/1M (51%)");
 	});
 
 	test("FooterComponent returns a stable empty array", () => {

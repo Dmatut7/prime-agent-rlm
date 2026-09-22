@@ -118,17 +118,21 @@ describe("InteractiveMode feature hints", () => {
 		expect(featureHintContainer.children).toHaveLength(1);
 		const lines = featureHintContainer.children[0]?.render(24) ?? [];
 		expect(lines).toHaveLength(2);
-		expect(stripAnsi(lines[0] ?? "")).toContain("提示：");
+		// U6: the hint line starts with a chevron, no 提示： prefix.
+		expect(stripAnsi(lines[0] ?? "")).toContain("›");
+		expect(stripAnsi(lines[0] ?? "")).not.toContain("提示：");
 		expect(lines[1]?.trim()).toBe("");
 		expect(visibleWidth(lines[0] ?? "")).toBeLessThanOrEqual(24);
 		expect(featureHintDeck.next).toHaveBeenCalledTimes(1);
 		expect(requestRender).toHaveBeenCalledTimes(1);
 
-		vi.advanceTimersByTime(FEATURE_HINT_ANIMATION_INTERVAL_MS);
+		// A single-char chevron label only leaves the shimmer's bright window
+		// after a few frames; the line identity changes once it does.
+		vi.advanceTimersByTime(FEATURE_HINT_ANIMATION_INTERVAL_MS * 3);
 		const animatedLines = featureHintContainer.children[0]?.render(24) ?? [];
 		expect(stripAnsi(animatedLines[0] ?? "")).toBe(stripAnsi(lines[0] ?? ""));
 		expect(animatedLines[0]).not.toBe(lines[0]);
-		expect(requestRender).toHaveBeenCalledTimes(2);
+		expect(requestRender).toHaveBeenCalledTimes(4);
 	});
 
 	it("cancels a pending hint when the loader stops", () => {
