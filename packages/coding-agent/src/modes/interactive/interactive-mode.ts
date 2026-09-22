@@ -217,7 +217,12 @@ import { ExtensionEditorComponent } from "./components/extension-editor.js";
 import { ExtensionInputComponent } from "./components/extension-input.js";
 import { ExtensionSelectorComponent } from "./components/extension-selector.js";
 import { FEATURE_HINT_ANIMATION_INTERVAL_MS, FeatureHintComponent } from "./components/feature-hint.js";
-import { FooterComponent, type FooterTelemetrySnapshot, formatContextTokens } from "./components/footer.js";
+import {
+	FooterComponent,
+	type FooterTelemetrySnapshot,
+	type FooterTelemetrySource,
+	formatContextTokens,
+} from "./components/footer.js";
 import { HeartbeatManagerComponent } from "./components/heartbeat-manager.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./components/injected-prompt-message.js";
 import { formatKeyText, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.js";
@@ -1179,8 +1184,14 @@ export class InteractiveMode {
 	private goalTrayTimer: NodeJS.Timeout | undefined = undefined;
 
 	private streamingComponent: AssistantMessageComponent | undefined = undefined;
-	/** U6: the footer watermark's latest snapshot - the single context source shared with the tray fallback. */
-	private footerTelemetrySnapshot: FooterTelemetrySnapshot | undefined;
+	/**
+	 * U6 评审②: the memoized watermark pair. One frame, one value: the footer
+	 * and the tray fallback both read this, and it only recomputes after an
+	 * invalidation (turn end, usage refresh, rebind, model/thinking change,
+	 * settings reload) - never per-component.
+	 */
+	private footerTelemetryDirty = true;
+	private footerTelemetryCached: FooterTelemetrySource | undefined;
 	private streamingMessage: AssistantMessage | undefined = undefined;
 	private sideQuestionComponent: SideQuestionComponent | undefined;
 	private sideQuestionEvent: AgentConnectionSideQuestionEvent | undefined;
@@ -1459,8 +1470,9 @@ export class InteractiveMode {
 		this.footerDataProvider = new FooterDataProvider(this.uiServices.getInitialCwd());
 		this.footer = new FooterComponent(this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(this.settingsManager.getCompactionEnabled());
-		// U1: persistent telemetry watermark line; density from footer.telemetry.
-		this.footer.setTelemetryMode(this.settingsManager.getFooterTelemetry());
+		// U6 评审②: the watermark pulls its mode and snapshot from the memoized
+		// source below - same frame, same value as the tray fallback.
+		this.footer.setTelemetrySource(() => this.getFooterTelemetrySource());
 		this.setGoalAnnouncementBaseline(emptyGoalState());
 
 		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
@@ -2969,7 +2981,7 @@ export class InteractiveMode {
 	// Bake this attempt's output into the snapshot so the tray doesn't dip in the gap between
 	// isStreaming clearing and the async refresh landing.
 	private applyOptimisticContextUsage(): void {
-		this.updateFooterTelemetry();
+		this.invalidateFooterTelemetry();
 		const snapshot = this.connectionState?.contextUsage;
 		if (!snapshot || snapshot.tokens === null || snapshot.contextWindow <= 0) return;
 		const completed = Math.max(0, this.activityTracker.getStatus().tokens - this.contextUsageTokenBaseline);
@@ -2986,22 +2998,35 @@ export class InteractiveMode {
 
 	/** Refresh the tray's context usage from the session after a turn or compaction completes. */
 	/**
-	 * U6: refresh the persistent footer watermark line (model · thinking level ·
-	 * bar · context figures). Cheap: recomputes from connection state; call
-	 * after context usage, model, or thinking-level changes and on settings
-	 * reload. The snapshot is stored once so the tray fallback reads the same
-	 * figures (single context source).
+	 * U6 评审②: drop the memoized watermark pair. The next read - footer or tray
+	 * - recomputes from the connection state once and the two stay identical
+	 * until the next invalidation.
 	 */
-	private updateFooterTelemetry(): void {
-		// Partial-mode test harnesses skip the constructor, so these fields can be
-		// absent there; the watermark is cosmetic and must never crash a real flow.
-		const footer = (this as unknown as { footer?: FooterComponent }).footer;
-		const settingsManager = this.uiServicesOrUndefined?.settingsManager;
-		if (!footer || !settingsManager) {
-			return;
+	private invalidateFooterTelemetry(): void {
+		this.footerTelemetryDirty = true;
+		this.footerTelemetryCached = undefined;
+		// Partial-mode harnesses skip the constructor; the watermark is cosmetic
+		// and must never crash a real flow.
+		(this as unknown as { footer?: { invalidate?: () => void } }).footer?.invalidate?.();
+	}
+
+	/**
+	 * The memoized watermark pair (评审②: one frame, one value). Recomputes only
+	 * after invalidateFooterTelemetry; every reader - the footer line's pull
+	 * source and the tray fallback - gets the same object, so the two context
+	 * readouts can never disagree again.
+	 */
+	private getFooterTelemetrySource(): FooterTelemetrySource {
+		if (this.footerTelemetryDirty || this.footerTelemetryCached === undefined) {
+			this.footerTelemetryCached = this.computeFooterTelemetry();
+			this.footerTelemetryDirty = false;
 		}
-		// Re-read the switch too: a settings-file reload lands on the next refresh.
-		footer.setTelemetryMode?.(settingsManager.getFooterTelemetry?.() ?? "on");
+		return this.footerTelemetryCached;
+	}
+
+	private computeFooterTelemetry(): FooterTelemetrySource {
+		const settingsManager = this.uiServicesOrUndefined?.settingsManager;
+		const mode = settingsManager?.getFooterTelemetry?.() ?? "on";
 		const model = this.getCurrentModel();
 		const usage = this.getConnectionContextUsage();
 		const thinkingLevel =
@@ -3013,15 +3038,13 @@ export class InteractiveMode {
 			thinkingLevel,
 			contextTokens: usage?.tokens ?? undefined,
 			contextWindow: usage?.contextWindow,
-			compactionTriggerRatio: settingsManager.getCompactionTriggerRatio?.(),
+			compactionTriggerRatio: settingsManager?.getCompactionTriggerRatio?.(),
 		};
-		this.footerTelemetrySnapshot = snapshot;
-		footer.setTelemetry?.(snapshot);
-		footer.setToolErrorCount?.((this as unknown as { consecutiveToolErrors?: number }).consecutiveToolErrors ?? 0);
+		return { mode, snapshot };
 	}
 
 	private async refreshConnectionContextUsage(): Promise<void> {
-		this.updateFooterTelemetry();
+		this.invalidateFooterTelemetry();
 		const generation = ++this.contextUsageRefresh.generation;
 		const connection = this.agentConnection;
 		const sessionId = this.connectionState?.sessionId;
@@ -3226,7 +3249,7 @@ export class InteractiveMode {
 		// and clears the readout left over from the previous session.
 		this.speedStats = undefined;
 		this.footer?.setSpeedText?.(undefined);
-		(this as unknown as { updateFooterTelemetry?: () => void }).updateFooterTelemetry?.();
+		(this as unknown as { invalidateFooterTelemetry?: () => void }).invalidateFooterTelemetry?.();
 		void this.rosterBar?.dispose();
 		this.rosterBar = undefined;
 		if (this.localSessionHost) {
@@ -5952,9 +5975,9 @@ export class InteractiveMode {
 				break;
 
 			case "thinking_level_changed":
-				this.footer.invalidate();
-				// The footer watermark carries the model · thinking level now.
-				this.updateFooterTelemetry();
+				// The footer watermark carries the model · thinking level now;
+				// the invalidation repaints the footer itself.
+				this.invalidateFooterTelemetry();
 				this.updateEditorBorderColor();
 				break;
 
@@ -6143,7 +6166,7 @@ export class InteractiveMode {
 					this.streamingComponent = undefined;
 					this.streamingMessage = undefined;
 					this.footer.invalidate();
-					this.updateFooterTelemetry();
+					this.invalidateFooterTelemetry();
 				}
 				this.ui.requestRender();
 				break;
@@ -6978,11 +7001,13 @@ export class InteractiveMode {
 	 * tray and the footer can never disagree (the boss's 478k vs 518k defect).
 	 */
 	private getTrayContextFallbackLabel(): string | undefined {
-		const settingsManager = this.uiServicesOrUndefined?.settingsManager;
-		if (!settingsManager || settingsManager.getFooterTelemetry() !== "off") {
+		// 评审②: reads the same memoized pair the footer line renders - one
+		// frame, one value; the 478k-vs-518k double readout cannot recur.
+		const source = this.getFooterTelemetrySource();
+		if (source.mode !== "off") {
 			return undefined;
 		}
-		const snapshot = this.footerTelemetrySnapshot;
+		const snapshot = source.snapshot;
 		const tokens = snapshot?.contextTokens;
 		const windowTokens = snapshot?.contextWindow ?? 0;
 		if (!snapshot?.modelName || tokens == null || windowTokens <= 0) {
@@ -8884,10 +8909,10 @@ export class InteractiveMode {
 			serviceTier: state.serviceTier,
 			availableThinkingLevels: state.availableThinkingLevels,
 		});
-		this.footer.invalidate();
-		// The footer watermark carries the model · thinking level now. Defensive
-		// for partial-mode harnesses that stub only the pre-U6 method set.
-		(this as unknown as { updateFooterTelemetry?: () => void }).updateFooterTelemetry?.();
+		// The footer watermark carries the model · thinking level now; the
+		// invalidation repaints the footer. Defensive for partial-mode harnesses
+		// that stub only the pre-U6 method set.
+		(this as unknown as { invalidateFooterTelemetry?: () => void }).invalidateFooterTelemetry?.();
 		this.updateEditorBorderColor();
 		// Rebuild so the /effort argument hint reflects the new model's levels.
 		this.setupAutocompleteProvider();

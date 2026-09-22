@@ -43,8 +43,7 @@ function statusStack(options: {
 		() => undefined,
 	);
 	const footer = new FooterComponent(provider);
-	footer.setTelemetryMode(options.telemetry);
-	footer.setTelemetry(SNAPSHOT);
+	footer.setTelemetrySource(() => ({ mode: options.telemetry, snapshot: SNAPSHOT }));
 	const subagents = new SubagentSummaryLine();
 	if (options.counts) subagents.setSubagentCounts(options.counts);
 	if (options.spend) subagents.setSubagentSpend(options.spend);
@@ -105,21 +104,21 @@ describe("U6 status area layout", () => {
 		).getTrayContextFallbackLabel;
 		const mode: Record<string, unknown> = {
 			uiServices: { settingsManager: { getFooterTelemetry: () => "on" } },
-			footerTelemetrySnapshot: SNAPSHOT,
+			footerTelemetryDirty: false,
+			footerTelemetryCached: { mode: "on", snapshot: SNAPSHOT },
 		};
 		Object.setPrototypeOf(mode, InteractiveMode.prototype);
 		expect(fallback.call(mode)).toBeUndefined();
 
-		mode.uiServices = { settingsManager: { getFooterTelemetry: () => "off" } };
-		// Same figures the footer line renders: 518k/1M and the same percent,
-		// parenthesized per the ① spec.
+		// Same memoized pair the footer line renders (评审②): the fallback reads
+		// the cache, not a fresh query, so the two readouts share one frame.
+		mode.footerTelemetryCached = { mode: "off", snapshot: SNAPSHOT };
 		expect(fallback.call(mode)).toBe("518k/1M (49%)");
 
-		// A stale-less single source: the label tracks the snapshot, not a fresh query.
-		mode.footerTelemetrySnapshot = { ...SNAPSHOT, contextTokens: 530_000 };
+		mode.footerTelemetryCached = { mode: "off", snapshot: { ...SNAPSHOT, contextTokens: 530_000 } };
 		expect(fallback.call(mode)).toBe("530k/1M (51%)");
 
-		mode.footerTelemetrySnapshot = undefined;
+		mode.footerTelemetryCached = { mode: "off", snapshot: undefined };
 		expect(fallback.call(mode)).toBeUndefined();
 	});
 
@@ -141,8 +140,7 @@ describe("U6 status area layout", () => {
 
 	it("degrades gracefully: footer drops the bar first then the figures; ③ truncates", () => {
 		const footer = new FooterComponent(provider);
-		footer.setTelemetryMode("on");
-		footer.setTelemetry(SNAPSHOT);
+		footer.setTelemetrySource(() => ({ mode: "on", snapshot: SNAPSHOT }));
 		expect(stripAnsi(footer.render(80).join(""))).toContain("●");
 		const below80 = stripAnsi(footer.render(79).join(""));
 		expect(below80).not.toContain("●");
@@ -160,13 +158,13 @@ describe("U6 status area layout", () => {
 
 	it("keeps the compaction state the only threshold: 压缩在仅 at the notch", () => {
 		const footer = new FooterComponent(provider);
-		footer.setTelemetryMode("on");
-		footer.setTelemetry({ ...SNAPSHOT, contextTokens: 900_000 });
+		let snapshot: FooterTelemetrySnapshot = { ...SNAPSHOT, contextTokens: 900_000 };
+		footer.setTelemetrySource(() => ({ mode: "on", snapshot }));
 		const imminent = stripAnsi(footer.render(110).join(""));
 		expect(imminent).toContain("压缩在即");
 		expect(imminent).toContain("86%");
 
-		footer.setTelemetry({ ...SNAPSHOT, contextTokens: 200_000 });
+		snapshot = { ...SNAPSHOT, contextTokens: 200_000 };
 		expect(stripAnsi(footer.render(110).join(""))).not.toContain("压缩在即");
 	});
 

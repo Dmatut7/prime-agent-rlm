@@ -88,13 +88,15 @@ describe("footer tool-error badge (U2)", () => {
 
 	it("rides on the telemetry line when both are present", () => {
 		const footer = new FooterComponent({ getGitBranch: () => null } as never);
-		footer.setTelemetryMode("on");
-		footer.setTelemetry({
-			modelName: "bailian/glm-5.3-prime",
-			contextTokens: 10_000,
-			contextWindow: 100_000,
-			compactionTriggerRatio: 0.8,
-		});
+		footer.setTelemetrySource(() => ({
+			mode: "on",
+			snapshot: {
+				modelName: "bailian/glm-5.3-prime",
+				contextTokens: 10_000,
+				contextWindow: 100_000,
+				compactionTriggerRatio: 0.8,
+			},
+		}));
 		footer.setToolErrorCount(3);
 		const line = stripAnsi(footer.render(120).join("\n"));
 		expect(footer.render(120)).toHaveLength(1);

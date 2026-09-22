@@ -4326,7 +4326,11 @@ describe("InteractiveMode tray goal label", () => {
 			getContextUsage(): TrayUsage | undefined;
 			settingsManager: { getFooterTelemetry(): string };
 		};
-		footerTelemetrySnapshot?: { contextTokens?: number; contextWindow?: number; modelName?: string };
+		footerTelemetryDirty?: boolean;
+		footerTelemetryCached?: {
+			mode: string;
+			snapshot?: { contextTokens?: number; contextWindow?: number; modelName?: string };
+		};
 		getTrayContextLabel(): string | undefined;
 	};
 	const getTrayContextLabel = (InteractiveMode.prototype as unknown as TrayLabelHarness).getTrayContextLabel;
@@ -4395,10 +4399,10 @@ describe("InteractiveMode tray goal label", () => {
 			getContextUsage: () => undefined,
 			settingsManager: { getFooterTelemetry: () => "on" },
 		};
-		fakeThis.footerTelemetrySnapshot = {
-			modelName: "bailian/glm-5.3-prime",
-			contextTokens: 75_000,
-			contextWindow: 100_000,
+		fakeThis.footerTelemetryDirty = false;
+		fakeThis.footerTelemetryCached = {
+			mode: "on",
+			snapshot: { modelName: "bailian/glm-5.3-prime", contextTokens: 75_000, contextWindow: 100_000 },
 		};
 
 		// U6 single source: the watermark line carries the figures, not the tray.
@@ -4427,11 +4431,12 @@ describe("InteractiveMode tray goal label", () => {
 			getContextUsage: () => undefined,
 			settingsManager: { getFooterTelemetry: () => "off" },
 		};
-		// The fallback reads the footer's own snapshot, not a fresh usage query.
-		fakeThis.footerTelemetrySnapshot = {
-			modelName: "bailian/glm-5.3-prime",
-			contextTokens: 75_000,
-			contextWindow: 100_000,
+		// The fallback reads the footer's own memoized pair, not a fresh usage
+		// query (评审②: one frame, one value).
+		fakeThis.footerTelemetryDirty = false;
+		fakeThis.footerTelemetryCached = {
+			mode: "off",
+			snapshot: { modelName: "bailian/glm-5.3-prime", contextTokens: 75_000, contextWindow: 100_000 },
 		};
 
 		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s) · 1 heartbeat · 75k/100k (75%)");

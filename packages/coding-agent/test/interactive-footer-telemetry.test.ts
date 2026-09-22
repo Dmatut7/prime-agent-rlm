@@ -6,7 +6,11 @@ import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
-import { FooterComponent, type FooterTelemetrySnapshot } from "../src/modes/interactive/components/footer.js";
+import {
+	FooterComponent,
+	type FooterTelemetrySnapshot,
+	type FooterTelemetrySource,
+} from "../src/modes/interactive/components/footer.js";
 import { TopBar } from "../src/modes/interactive/components/top-bar.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
@@ -30,10 +34,29 @@ describe("footer telemetry watermark (U6)", () => {
 		setKeybindings(new KeybindingsManager());
 	});
 
+	/** 评审②: a mutable pull source - the pair re-reads on every render. */
+	function makeSource(mode: "off" | "on" = "on") {
+		let snapshot: FooterTelemetrySnapshot | undefined = SNAPSHOT;
+		let reads = 0;
+		const source = (): FooterTelemetrySource => {
+			reads += 1;
+			return { mode, snapshot };
+		};
+		return {
+			source,
+			get reads() {
+				return reads;
+			},
+			set(next: FooterTelemetrySnapshot | undefined) {
+				snapshot = next;
+			},
+		};
+	}
+
 	it("renders one persistent line: model · level, watermark bar, context figures", () => {
 		const footer = new FooterComponent(provider);
-		footer.setTelemetryMode("on");
-		footer.setTelemetry(SNAPSHOT);
+		const telemetry = makeSource();
+		footer.setTelemetrySource(telemetry.source);
 		const lines = footer.render(120);
 		expect(lines).toHaveLength(1);
 		const line = stripAnsi(lines[0] ?? "");
@@ -52,14 +75,15 @@ describe("footer telemetry watermark (U6)", () => {
 
 	it("marks the compaction state: reaching the notch adds 压缩在即, below it stays quiet", () => {
 		const footer = new FooterComponent(provider);
-		footer.setTelemetryMode("on");
+		const telemetry = makeSource();
+		footer.setTelemetrySource(telemetry.source);
 
-		footer.setTelemetry({ ...SNAPSHOT, contextTokens: 850_000 });
+		telemetry.set({ ...SNAPSHOT, contextTokens: 850_000 });
 		const imminent = footerLine(footer);
 		expect(imminent).toContain("850k/1M · 85%");
 		expect(imminent).toContain("压缩在即");
 
-		footer.setTelemetry({ ...SNAPSHOT, contextTokens: 790_000 });
+		telemetry.set({ ...SNAPSHOT, contextTokens: 790_000 });
 		const below = footerLine(footer);
 		expect(below).toContain("79%");
 		expect(below).not.toContain("压缩在即");
@@ -67,8 +91,8 @@ describe("footer telemetry watermark (U6)", () => {
 
 	it("degrades below 80 columns: the bar goes first, then the token figures", () => {
 		const footer = new FooterComponent(provider);
-		footer.setTelemetryMode("on");
-		footer.setTelemetry(SNAPSHOT);
+		const telemetry = makeSource();
+		footer.setTelemetrySource(telemetry.source);
 
 		const wide = footerLine(footer, 100);
 		expect(wide).toContain("●");
@@ -87,15 +111,15 @@ describe("footer telemetry watermark (U6)", () => {
 
 	it("off mode renders nothing", () => {
 		const footer = new FooterComponent(provider);
-		footer.setTelemetryMode("off");
-		footer.setTelemetry(SNAPSHOT);
+		const telemetry = makeSource("off");
+		footer.setTelemetrySource(telemetry.source);
 		expect(footer.render(120)).toEqual([]);
 	});
 
 	it("coexists with the /speed line: telemetry first, speed second, both truncated", () => {
 		const footer = new FooterComponent(provider);
-		footer.setTelemetryMode("on");
-		footer.setTelemetry(SNAPSHOT);
+		const telemetry = makeSource();
+		footer.setTelemetrySource(telemetry.source);
 		footer.setSpeedEnabled(true);
 		footer.setSpeedText("88 tok/s · avg 66");
 		const lines = footer.render(120).map(stripAnsi);
@@ -111,13 +135,25 @@ describe("footer telemetry watermark (U6)", () => {
 
 	it("unknown tokens render the model without figures; no level renders the bare model", () => {
 		const footer = new FooterComponent(provider);
-		footer.setTelemetryMode("on");
-		footer.setTelemetry({ modelName: "bailian/glm-5.3-prime", contextTokens: null });
+		const telemetry = makeSource();
+		footer.setTelemetrySource(telemetry.source);
+
+		telemetry.set({ modelName: "bailian/glm-5.3-prime", contextTokens: null });
 		const line = footerLine(footer);
 		expect(line.trim()).toBe("bailian/glm-5.3-prime");
 
-		footer.setTelemetry({ modelName: "bailian/deepseek-v4.1-flash" });
+		telemetry.set({ modelName: "bailian/deepseek-v4.1-flash" });
 		expect(footerLine(footer).trim()).toBe("bailian/deepseek-v4.1-flash");
+	});
+
+	it("pulls the source once per render (评审②: one frame, one value)", () => {
+		const footer = new FooterComponent(provider);
+		const telemetry = makeSource();
+		footer.setTelemetrySource(telemetry.source);
+		footer.render(120);
+		expect(telemetry.reads).toBe(1);
+		footer.render(120);
+		expect(telemetry.reads).toBe(2);
 	});
 });
 
@@ -164,15 +200,11 @@ describe("footer.telemetry setting", () => {
 	});
 });
 
-describe("interactive-mode telemetry snapshot wiring", () => {
+describe("interactive-mode telemetry source wiring (评审②)", () => {
 	beforeAll(() => initTheme("dark"));
 
-	it("updateFooterTelemetry composes model, level, usage, and compaction ratio", async () => {
+	it("getFooterTelemetrySource memoizes one pair and recomputes only after invalidation", async () => {
 		const { InteractiveMode } = await import("../src/modes/interactive/interactive-mode.js");
-		const footer = {
-			setTelemetryMode: vi.fn(),
-			setTelemetry: vi.fn(),
-		};
 		const settingsManager = {
 			getFooterTelemetry: vi.fn(() => "on"),
 			getCompactionTriggerRatio: vi.fn(() => 0.8),
@@ -183,7 +215,6 @@ describe("interactive-mode telemetry snapshot wiring", () => {
 			contextUsage?: { tokens: number; contextWindow: number; percent: number };
 		};
 		const mode: Record<string, unknown> & { connectionState: FakeConnectionState } = {
-			footer,
 			uiServices: { settingsManager },
 			connectionState: {
 				model: { id: "bailian/glm-5.3-prime", reasoning: true },
@@ -195,40 +226,77 @@ describe("interactive-mode telemetry snapshot wiring", () => {
 			contextUsageTokenBaseline: 0,
 		};
 		Object.setPrototypeOf(mode, InteractiveMode.prototype);
-		const update = (InteractiveMode.prototype as unknown as { updateFooterTelemetry(this: unknown): void })
-			.updateFooterTelemetry;
-		update.call(mode);
+		const source = (
+			InteractiveMode.prototype as unknown as {
+				getFooterTelemetrySource(this: unknown): FooterTelemetrySource;
+			}
+		).getFooterTelemetrySource;
+		const invalidate = (
+			InteractiveMode.prototype as unknown as {
+				invalidateFooterTelemetry(this: unknown): void;
+			}
+		).invalidateFooterTelemetry;
 
-		expect(footer.setTelemetryMode).toHaveBeenCalledWith("on");
-		expect(footer.setTelemetry).toHaveBeenCalledWith({
-			modelName: "bailian/glm-5.3-prime",
-			thinkingLevel: "max",
-			contextTokens: 312_000,
-			contextWindow: 1_000_000,
-			compactionTriggerRatio: 0.8,
+		const first = source.call(mode);
+		expect(first).toEqual({
+			mode: "on",
+			snapshot: {
+				modelName: "bailian/glm-5.3-prime",
+				thinkingLevel: "max",
+				contextTokens: 312_000,
+				contextWindow: 1_000_000,
+				compactionTriggerRatio: 0.8,
+			},
 		});
-		// The snapshot is the single context source shared with the tray fallback.
-		expect(mode.footerTelemetrySnapshot).toEqual({
-			modelName: "bailian/glm-5.3-prime",
-			thinkingLevel: "max",
-			contextTokens: 312_000,
-			contextWindow: 1_000_000,
-			compactionTriggerRatio: 0.8,
-		});
+		// Memoized: every reader this frame gets the same object identity.
+		expect(source.call(mode)).toBe(first);
+		expect(settingsManager.getFooterTelemetry).toHaveBeenCalledTimes(1);
 
-		// Non-glm models compose identically: no per-model markers remain.
+		// Invalidate + changed state -> one recomputation for the next frame.
+		invalidate.call(mode);
 		mode.connectionState = {
 			model: { id: "bailian/deepseek-v4.1-flash", reasoning: true },
 			thinkingLevel: "high",
 			contextUsage: undefined,
 		};
-		update.call(mode);
-		expect(footer.setTelemetry).toHaveBeenLastCalledWith(
+		const second = source.call(mode);
+		expect(second).not.toBe(first);
+		expect(second.snapshot).toEqual(
 			expect.objectContaining({
 				modelName: "bailian/deepseek-v4.1-flash",
 				thinkingLevel: "high",
 				contextTokens: undefined,
 			}),
 		);
+		expect(settingsManager.getFooterTelemetry).toHaveBeenCalledTimes(2);
+	});
+
+	it("the tray fallback renders the same memoized pair the footer line renders", async () => {
+		const { InteractiveMode } = await import("../src/modes/interactive/interactive-mode.js");
+		const settingsManager = {
+			getFooterTelemetry: vi.fn(() => "off"),
+			getCompactionTriggerRatio: vi.fn(() => 0.8),
+		};
+		const mode: Record<string, unknown> = {
+			uiServices: { settingsManager },
+			connectionState: {
+				model: { id: "bailian/glm-5.3-prime", reasoning: true },
+				thinkingLevel: "max",
+				contextUsage: { tokens: 518_000, contextWindow: 1_048_576, percent: 49 },
+			},
+			activityTracker: { getStatus: () => ({ tokens: 0 }) },
+			isAgentStreaming: () => false,
+			contextUsageTokenBaseline: 0,
+		};
+		Object.setPrototypeOf(mode, InteractiveMode.prototype);
+		const fallback = (
+			InteractiveMode.prototype as unknown as {
+				getTrayContextFallbackLabel(this: unknown): string | undefined;
+			}
+		).getTrayContextFallbackLabel;
+
+		// Same figures the footer line would render (one frame, one value):
+		// 518k/1M and the same percent, parenthesized per the ① spec.
+		expect(fallback.call(mode)).toBe("518k/1M (49%)");
 	});
 });

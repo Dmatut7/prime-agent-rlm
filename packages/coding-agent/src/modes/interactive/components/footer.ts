@@ -20,6 +20,12 @@ const GROUP_GAP = "    ";
  */
 const WATERMARK_BAR_MIN_WIDTH = 80;
 
+/** U6 评审②: the pull source behind the watermark line - mode and snapshot as one frame-consistent pair. */
+export interface FooterTelemetrySource {
+	mode: FooterTelemetryMode;
+	snapshot?: FooterTelemetrySnapshot;
+}
+
 /** Context watermark data for the persistent footer line. */
 export interface FooterTelemetrySnapshot {
 	modelName?: string;
@@ -80,15 +86,16 @@ function watermarkBar(tokens: number, windowTokens: number, ratio: number, immin
  * `/usage` can expose telemetry without re-plumbing. `/speed` opts the footer into a
  * compact tok/sec readout; see setSpeedEnabled/setSpeedText. The U6 watermark line
  * (`glm-5.3-prime · max    ──────●───────│──    518k/1M · 49%`) is a persistent
- * one-liner driven by setTelemetryMode/setTelemetry.
+ * one-liner driven by a pull source (评审②): the mode and the snapshot are read
+ * at render time from the same getter the tray fallback reads, so the two lines
+ * can never disagree — one frame, one value.
  */
 export class FooterComponent implements Component {
 	// Stable reference so the parent aggregator's identity check can hit while the footer is empty.
 	private readonly emptyLines: string[] = [];
 	private speedEnabled = false;
 	private speedText: string | undefined;
-	private telemetryMode: FooterTelemetryMode = "off";
-	private telemetry: FooterTelemetrySnapshot | undefined;
+	private telemetrySource: (() => FooterTelemetrySource) | undefined;
 	private toolErrorCount = 0;
 
 	constructor(private footerData: ReadonlyFooterDataProvider) {
@@ -112,14 +119,13 @@ export class FooterComponent implements Component {
 		this.speedText = text;
 	}
 
-	/** U6: persistent telemetry line switch; off hides the watermark entirely. */
-	setTelemetryMode(mode: FooterTelemetryMode): void {
-		this.telemetryMode = mode;
-	}
-
-	/** U6: latest context watermark snapshot; undefined clears the numbers. */
-	setTelemetry(snapshot: FooterTelemetrySnapshot | undefined): void {
-		this.telemetry = snapshot;
+	/**
+	 * U6 评审②: the watermark's pull source, read once per render. The tray
+	 * fallback reads the same getter, so both faces of the context usage show
+	 * one frame's value.
+	 */
+	setTelemetrySource(source: () => FooterTelemetrySource): void {
+		this.telemetrySource = source;
 	}
 
 	/** U2: trailing consecutive tool errors; the badge renders from TOOL_ERROR_WARN_THRESHOLD. */
@@ -136,10 +142,11 @@ export class FooterComponent implements Component {
 	 * figures; the model segment is never dropped.
 	 */
 	private telemetryText(safeWidth: number): string | undefined {
-		if (this.telemetryMode === "off" || !this.telemetry) {
+		const source = this.telemetrySource?.();
+		if (!source || source.mode === "off" || !source.snapshot) {
 			return undefined;
 		}
-		const snapshot = this.telemetry;
+		const snapshot = source.snapshot;
 		const modelName = snapshot.modelName;
 		if (!modelName) {
 			return undefined;
