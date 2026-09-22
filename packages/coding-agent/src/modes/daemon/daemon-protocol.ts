@@ -360,17 +360,24 @@ export type DaemonServerCapability =
 	// the rejection that tells a new client the daemon cannot serve agent aborts.
 	| "abort_agent_target"
 	// r4 recovery-shell: the daemon sweeps stalled sessions and acts on them
-	// (interrupt + queued system instruction, exactly once per turn). Clients can
-	// check this to know the rlm_child_recovery_action receipts and the roster
-	// stallRecovery markers describe real auto interventions by this build.
+	// (interrupt + queued system instruction, exactly once per turn). Build
+	// support, not an enabled verdict: this and the two recovery capabilities
+	// below are advertised unconditionally by this daemon build regardless of
+	// the per-policy kill switches (subagents.stallRecovery.enabled,
+	// stallWatchdog.rootRecovery.enabled), so a client must not infer armed
+	// auto-recovery from the capability alone. The receipts and roster markers
+	// it gates only ever describe interventions this build actually performed.
 	| "child_stall_auto_recovery"
 	// r4 recovery-shell: the roster row's stallRecovery marker (at, action,
 	// silentMs, count). Optional on the wire; clients without the capability
-	// simply never render the marker.
+	// simply never render the marker. Build support, not an enabled verdict -
+	// see child_stall_auto_recovery above.
 	| "stall_recovery_state"
 	// r4 recovery-shell: stall_warning events may carry the optional actions
 	// field (canAbort/canDiagnose/autoRecoveryArmed/...). Additive; a client that
 	// does not know the field degrades to its existing plain-text stall render.
+	// Build support, not an enabled verdict - the actions field itself carries
+	// the live armed/disarmed facts (autoRecoveryArmed), not the capability.
 	| "stall_action_bar";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";

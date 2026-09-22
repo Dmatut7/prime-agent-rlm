@@ -5944,6 +5944,30 @@ export class AgentSession {
 	}
 
 	/**
+	 * Wall-clock ms of the last agent event this session observed (r4 phase-2
+	 * blind fix A): the signal a sweep measures true silence against. Every
+	 * event refreshes it - token deltas and tool starts/ends included - while
+	 * `messages.length` only moves on `message_end`, so a streaming reply or a
+	 * long tool call leaves the transcript frozen while the session is alive.
+	 */
+	get lastAgentEventAt(): number | undefined {
+		return this._stallLastEvent?.at;
+	}
+
+	/**
+	 * The watchdog's own exemption verdict, sampled right now (r4 phase-2 blind
+	 * fix A): the single arbiter of "is this silence owned work". Reads the live
+	 * exemption segment against the clock without re-sampling the predicates,
+	 * so a diagnostic read cannot perturb the watchdog, and the budget running
+	 * out - not the marker written when the warn fired - is what ends the
+	 * excuse. Undefined/disarmed watchdog or no exemption: false.
+	 */
+	get excusedNow(): boolean {
+		const exemption = this._stallWatchdog?.exemption;
+		return exemption !== undefined && !exemption.exhausted;
+	}
+
+	/**
 	 * Turns this session has started; advances on every agent_start. The
 	 * stall-recovery claim key scopes auto actions to one per (session, epoch).
 	 */

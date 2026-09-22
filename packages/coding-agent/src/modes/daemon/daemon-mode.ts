@@ -99,6 +99,7 @@ import {
 import {
 	createRlmChildRecoveryActionMessage,
 	createRlmChildStallNoticeMessage,
+	createStallRecoveryEscalationMessage,
 	createSystemInterruptionMessage,
 	type RlmChildReDispatchFacts,
 } from "../../core/messages.js";
@@ -600,6 +601,14 @@ interface StallRecoveryEpisode {
 	messageCount: number;
 	/** Whether the first observation saw a turn in flight; a change refreshes the episode. */
 	isStreaming: boolean;
+	/**
+	 * When an executor claimed this episode (B, blind-3 finding 2): written
+	 * synchronously before the executor is launched, so a 15s tick that lands
+	 * while the admission is still pending sees the claim and stands down
+	 * instead of stacking a second action. Released with the episode on
+	 * admission failure.
+	 */
+	claimingAt?: number;
 	/** When the recovery action executed, once it has (the epoch claim). */
 	actedAt?: number;
 	/** Transcript length when the action executed; the escalation requires no movement past it. */
@@ -4827,6 +4836,12 @@ export class AgentDaemon {
 					clearAdmission();
 					throw error;
 				}
+				// C (blind-1 F1 / blind-3 finding 3): a client prompt is external
+				// input. Marked once the target session is resolved, whether the
+				// admission later delivers or queues it: the human is driving this
+				// session, so the live stall episode is kept alive and the
+				// consecutive-action count resets here, not only for agent messages.
+				this.noteExternalSessionInput(state);
 				const options: PromptOptions = {
 					content: command.content,
 					images: command.images,
@@ -4902,6 +4917,8 @@ export class AgentDaemon {
 
 			case "steer": {
 				const state = this.getBoundSessionState(command.activeSessionId);
+				// C: a client steer is external input - same rule as the prompt case.
+				this.noteExternalSessionInput(state);
 				if (command.expandPromptTemplates === false) {
 					await state.runtime.session.restoreSteeringMessage(command.message, command.images, {
 						queueKey: command.queueKey,
@@ -4923,6 +4940,8 @@ export class AgentDaemon {
 
 			case "follow_up": {
 				const state = this.getBoundSessionState(command.activeSessionId);
+				// C: a client follow-up is external input - same rule as the prompt case.
+				this.noteExternalSessionInput(state);
 				let queued = true;
 				let admitted = true;
 				if (command.expandPromptTemplates === false) {
@@ -4969,6 +4988,9 @@ export class AgentDaemon {
 
 			case "resume_queue": {
 				const state = this.getSessionState(command.activeSessionId);
+				// C: a client asking to resume queued work is external input - someone
+				// is minding this session even though the queue never drained.
+				this.noteExternalSessionInput(state);
 				// Connection-facing resume: the update-restart fence stays up (the
 				// false result maps to the "No queued work to resume" no-op below).
 				if (!state.runtime.session.resumeQueuedWorkFromConnection()) {
@@ -5019,6 +5041,11 @@ export class AgentDaemon {
 			case "abort": {
 				const state = this.getSessionState(command.activeSessionId);
 				this.assertAgentOriginAbortReach(command.fromActiveSessionId, state);
+				// C: an abort command is external input, and it resets the
+				// consecutive-action stop line - whoever issued it (a client Esc or
+				// a supervising agent) is attending this session, so the chain of
+				// "auto actions without external input" restarts from zero.
+				this.noteExternalSessionInput(state);
 				state.runtime.session.requestAbort();
 				return success(command.id, "abort");
 			}
@@ -5026,6 +5053,8 @@ export class AgentDaemon {
 			case "abort_and_send_queued": {
 				const state = this.getSessionState(command.activeSessionId);
 				this.assertAgentOriginAbortReach(command.fromActiveSessionId, state);
+				// C: same external-input rule as the plain abort above.
+				this.noteExternalSessionInput(state);
 				state.runtime.session.abortAndSendQueued();
 				return success(command.id, "abort_and_send_queued");
 			}
@@ -6886,8 +6915,10 @@ export class AgentDaemon {
 	private readonly stallRecoveryEpisodes = new Map<string, StallRecoveryEpisode>();
 	/**
 	 * r4 recovery-shell: consecutive auto actions per session since the last
-	 * external input (a prompt, a steered agent message). The stop line: at
-	 * maxPerSession the sweep only notifies. Reset by noteExternalSessionInput.
+	 * external input (a client prompt/steer/follow-up/abort/resume command, or
+	 * an agent message that was actually delivered - not one merely queued).
+	 * The stop line: at maxPerSession the sweep only notifies. Reset by
+	 * noteExternalSessionInput.
 	 */
 	private readonly stallRecoveryActionCounts = new Map<string, number>();
 	/**
@@ -6952,10 +6983,6 @@ export class AgentDaemon {
 		queuedReason?: AgentMessageQueuedReason;
 		queuedPosition?: number;
 	}> {
-		// r4 recovery-shell: a parent's steered message is external input for the
-		// target session - it resets the stop-line count and keeps a live stall
-		// episode from being auto-acted (the parent answered the stall itself).
-		this.noteExternalSessionInput(targetState);
 		const message = createAgentSessionMessage(payload);
 		let preflightFailed = false;
 		let preflightQueued = false;
@@ -6988,7 +7015,15 @@ export class AgentDaemon {
 		if (preflightFailed) {
 			throw new Error("Agent message was not accepted");
 		}
-		if (!preflightQueued) return { status: "delivered" };
+		if (!preflightQueued) {
+			// C (blind-3 finding 4 / blind-1 F1): only a message the target actually
+			// read counts as external input. Marking at the top armed a queued or a
+			// refused send with the same "someone is driving" verdict: a parent's
+			// nudge into a wedged child disarmed the very recovery that would have
+			// delivered it, permanently for the episode.
+			this.noteExternalSessionInput(targetState);
+			return { status: "delivered" };
+		}
 		return {
 			status: "queued",
 			queuedReason,
@@ -7766,14 +7801,18 @@ export class AgentDaemon {
 	 * - Depth-0: no attached client means nobody is watching, so act as soon as
 	 *   the evidence confirms (dual evidence still needs a second sighting);
 	 *   an attached client gets `stallWatchdog.rootRecovery.humanWindowSeconds`
-	 *   (default 120) to react, and any external input inside that window marks
-	 *   the episode kept-alive: never auto-acted.
+	 *   (default 120) to react, and external input inside that window marks the
+	 *   episode kept-alive: never auto-acted. "External input" is a client
+	 *   command (prompt, steer, follow-up, abort, resume) or an agent message
+	 *   that was actually delivered; an agent message that merely queues behind
+	 *   the wedged turn is not - the action delivers it.
 	 *
 	 * The action is exactly once per (session, turn) - the claim key carries the
 	 * turn epoch - and bounded per session by the consecutive-action stop line
 	 * (default 3): after that the sweep only notifies. A session still dead
 	 * {@link STALL_RECOVERY_ESCALATE_AFTER_MS} after its action gets one
-	 * escalation notice, never a second action.
+	 * escalation notice, never a second action; the escalation check runs on the
+	 * episode's own facts even when the turn has already ended (F2, blind-1).
 	 */
 	private async sweepStallRecovery(now = Date.now()): Promise<void> {
 		if (this.shuttingDown) return;
@@ -7802,20 +7841,35 @@ export class AgentDaemon {
 			this.forgetStallRecoverySession(state.activeSessionId);
 			return;
 		}
+		// A (blind-3 finding 1, P6/P7): a live host-owned phase owns the silence -
+		// a legal long bash, a provider retry, an in-flight compaction. The warn
+		// marker only says the watchdog fired once; it cannot veto a phase that is
+		// still running, so the sweep re-checks the liveness facts and holds.
+		if (session.isBashRunning || session.isRetrying || session.isCompacting) return;
+		// A: the watchdog's exemption, sampled live. I3 keeps the watchdog the
+		// single arbiter of how long an excuse lasts, so the sweep asks it now
+		// instead of trusting the marker's warn-time verdict: the budget may have
+		// run out since the warn, and once it has the sweep is free to act.
+		if (session.excusedNow) return;
 		if (stall.silentMs < stall.thresholdMs) return; // not even warn-worthy yet
-		// Excused silence is owned work, not a wedge: the watchdog's own exemption
-		// budget is the single arbiter of how long that excuse lasts (I3), so the
-		// sweep never second-guesses it with a second budget (r4 synthesis rule 1).
-		if (stall.excused === true) return;
-		// I4 dual evidence, second half: a turn in flight whose transcript froze.
-		// isStreaming false means no turn to abort - the marker is the residue of
-		// a previous turn waiting for the next agent_start.
 		const isStreaming = session.isStreaming === true;
-		if (!isStreaming) return;
 		const epoch = session.turnLifecycleEpoch;
 		const key = `${state.activeSessionId}:${epoch}`;
 		const messageCount = session.messages.length;
 		let episode = this.stallRecoveryEpisodes.get(key);
+		// F2 (blind-1): the escalation candidacy is checked before the streaming
+		// gate, on the episode's own facts (epoch unchanged, transcript frozen).
+		// The abort-degrade shape - the action killed the turn, nothing restarted,
+		// the session sits idle with a stale marker - is exactly "still dead after
+		// the action", and it never has a live stream to gate on.
+		if (episode !== undefined && episode.actedAt !== undefined) {
+			this.maybeEscalateStallRecovery(state, episode, stall, now);
+			return;
+		}
+		// I4 dual evidence, second half: a turn in flight whose transcript froze.
+		// isStreaming false means no turn to abort - the marker is the residue of
+		// a previous turn waiting for the next agent_start.
+		if (!isStreaming) return;
 		if (episode === undefined) {
 			const notice = this.stallRecoveryNoticedAt.get(state.activeSessionId);
 			episode = {
@@ -7831,9 +7885,15 @@ export class AgentDaemon {
 			this.stallRecoveryEpisodes.set(key, episode);
 			return; // first sighting: record, act on the next confirmation
 		}
-		if (messageCount !== episode.messageCount || isStreaming !== episode.isStreaming) {
-			// The session moved: not dead. Refresh the observation (a new silence
-			// measurement starts from here) instead of acting on stale evidence.
+		// A (blind-2 F1 / blind-3 finding 1): "the session moved" is measured, not
+		// inferred from the transcript. `messages.length` only moves on
+		// message_end, so a reply that is still streaming - or a tool call that
+		// just started or ended - froze the count while the session kept producing
+		// events. An agent event inside the warn threshold means the turn is alive:
+		// refresh the observation (a new silence measurement starts from here)
+		// instead of acting on stale evidence.
+		const lastAgentEventAt = session.lastAgentEventAt;
+		if (lastAgentEventAt !== undefined && now - lastAgentEventAt < stall.thresholdMs) {
 			episode.firstSeenAt = now;
 			episode.messageCount = messageCount;
 			episode.isStreaming = isStreaming;
@@ -7843,10 +7903,11 @@ export class AgentDaemon {
 		// episode is never auto-acted (GLM presence rule: human/model choice beats
 		// the machine's judgment), and the transcript freeze it caused is expected.
 		if (episode.keptAlive === true) return;
-		if (episode.actedAt !== undefined) {
-			this.maybeEscalateStallRecovery(state, episode, stall, now);
-			return;
-		}
+		// B (blind-3 finding 2): an executor is mid-admission for this episode.
+		// The next tick must stand down while the first is still queued behind a
+		// slow send - each stacked executor would send its own instruction, burn
+		// its own stop-line count, and receipt the parent on its own.
+		if (episode.claimingAt !== undefined) return;
 		if (now - episode.firstSeenAt < policy.windowMs) return;
 		const count = this.stallRecoveryActionCounts.get(state.activeSessionId) ?? 0;
 		if (count >= policy.maxPerSession) {
@@ -7854,11 +7915,14 @@ export class AgentDaemon {
 				episode.stopNotifiedAt = now;
 				this.log(
 					`stall recovery stop line reached for ${policy.isChild ? "child" : "root"} ${state.activeSessionId}: ` +
-						`${count} consecutive auto actions without external input; notifying only`,
+						`${count} consecutive auto actions without external input (limit ${policy.maxPerSession}); notifying only`,
 				);
 			}
 			return;
 		}
+		// B: claim the episode synchronously, before the executor can be queued
+		// behind a slow admission - this mark is what the next 15s tick sees.
+		episode.claimingAt = now;
 		void this.executeStallRecovery(state, episode, stall, { isChild: policy.isChild, now });
 	}
 
@@ -7882,13 +7946,24 @@ export class AgentDaemon {
 		if (this.shuttingDown || this.sessions.get(state.activeSessionId) !== state) return;
 		if (session.stallState === undefined || session.isStreaming !== true) return;
 		if (session.turnLifecycleEpoch !== episode.epoch) return;
+		// B: the claim is synchronous now, so reaching here with the episode
+		// already acted or claimed by another tick means this executor is a
+		// duplicate - stand down before touching the session.
+		if (episode.actedAt !== undefined) return;
+		if (episode.claimingAt !== undefined && episode.claimingAt !== context.now) return;
+		// A: the silence the notice reports and the markers record is measured at
+		// the moment of the action. The snapshot the sweep keyed on carries the
+		// warn-time reading (blind-3 P7: a 300s figure reported as a live fact
+		// while the session had been active since the warn).
+		const lastAgentEventAt = session.lastAgentEventAt;
+		const silentMs = lastAgentEventAt !== undefined ? Math.max(0, context.now - lastAgentEventAt) : stall.silentMs;
 		const notice = createSystemInterruptionMessage({
 			trigger: "stall_recovery",
 			isChild: context.isChild,
-			silentMs: stall.silentMs,
+			silentMs,
 			thresholdMs: stall.thresholdMs,
 			inFlightTools: [...stall.inFlightTools],
-			excused: stall.excused === true,
+			excused: session.excusedNow,
 			executor: "daemon",
 		});
 		try {
@@ -7912,19 +7987,22 @@ export class AgentDaemon {
 			delivered = session.resumeQueuedWork();
 		}
 		const action = delivered ? "abort_and_send" : "abort";
-		const at = Date.now();
+		// G (blind-3 finding 9): one clock for the whole action - the injected
+		// sweep `now` owns `actedAt` and the markers too, so the escalation that
+		// reads it back is reachable under a test clock, not only Date.now().
+		const at = context.now;
 		episode.actedAt = at;
 		episode.messageCountAtAction = session.messages.length;
 		const count = (this.stallRecoveryActionCounts.get(state.activeSessionId) ?? 0) + 1;
 		this.stallRecoveryActionCounts.set(state.activeSessionId, count);
-		state.stallRecovery = { at, action, silentMs: stall.silentMs, count };
+		state.stallRecovery = { at, action, silentMs, count };
 		this.markRosterRowDirty(state);
 		this.log(
 			`stall recovery: ${context.isChild ? "child" : "root"} ${state.activeSessionId} silent ` +
-				`${Math.round(stall.silentMs / 1000)}s -> ${action} (action ${count} of this chain)`,
+				`${Math.round(silentMs / 1000)}s -> ${action} (action ${count} of this chain)`,
 		);
 		if (context.isChild) {
-			this.notifyParentOfChildRecoveryAction(state, stall, action, at, false);
+			this.notifyParentOfChildRecoveryAction(state, { ...stall, silentMs }, action, at, false);
 		}
 	}
 
@@ -7933,9 +8011,12 @@ export class AgentDaemon {
 	 * {@link STALL_RECOVERY_ESCALATE_AFTER_MS} after the action. "Still dead"
 	 * means the turn's epoch never advanced (no new turn started - the queued
 	 * instruction was never consumed) and nothing entered the transcript since
-	 * the action. The escalation notifies - never acts again (the claim for that
-	 * epoch is spent, and per synthesis rule 2 nothing re-dispatches
-	 * automatically).
+	 * the action; a turn that ended without restarting (the abort degrade) is the
+	 * same verdict, so the check runs without the streaming gate. The escalation
+	 * notifies - never acts again (the claim for that epoch is spent, and per
+	 * synthesis rule 2 nothing re-dispatches automatically). Children receipt
+	 * their parent; a depth-0 session gets one notice in its own transcript,
+	 * never while a turn is still streaming (F2, blind-1).
 	 */
 	private maybeEscalateStallRecovery(
 		state: ActiveSessionState,
@@ -7949,19 +8030,54 @@ export class AgentDaemon {
 		const session = state.runtime.session;
 		if (session.turnLifecycleEpoch !== episode.epoch) return;
 		if (session.messages.length > (episode.messageCountAtAction ?? 0)) return;
-		episode.escalatedAt = now;
 		const marker = state.stallRecovery;
-		if (marker) state.stallRecovery = { ...marker, escalated: true };
-		this.markRosterRowDirty(state);
 		const metadata = state.runtime.metadata;
 		const isChild = metadata.kind === "subagent" && metadata.parentActiveSessionId !== undefined;
+		// F2 (blind-1): a depth-0 escalation never lands inside a live stream - a
+		// custom message inserted mid-turn would ride queue state the wedged turn
+		// owns. Deferring here also leaves escalatedAt unspent, so the notice goes
+		// out on a later tick once the stream ends instead of being lost.
+		if (!isChild && session.isStreaming === true) return;
+		episode.escalatedAt = now;
+		if (marker) state.stallRecovery = { ...marker, escalated: true };
+		this.markRosterRowDirty(state);
 		this.log(
 			`stall recovery escalation: ${isChild ? "child" : "root"} ${state.activeSessionId} still silent ` +
 				`${Math.round((now - actedAt) / 1000)}s after the auto action; notifying only`,
 		);
 		if (isChild) {
-			this.notifyParentOfChildRecoveryAction(state, stall, "abort_and_send", actedAt, true, now);
+			// G (blind-1 F6 / blind-3 finding 5): the escalation receipt reports the
+			// action that actually ran - a plain abort when the queue could not
+			// deliver - instead of a hardcoded abort_and_send. The marker the
+			// action wrote is the record; its silentMs is the action-time
+			// measurement, not the warn-time snapshot.
+			this.notifyParentOfChildRecoveryAction(
+				state,
+				{ ...stall, silentMs: marker?.silentMs ?? stall.silentMs },
+				marker?.action ?? "abort",
+				actedAt,
+				true,
+				now,
+			);
+			return;
 		}
+		// F2 (blind-1): a depth-0 session has no parent to receipt, so the
+		// escalation lands in its own transcript (append-only, never turn input)
+		// where a returning user sees it: still silent, what the action actually
+		// was, and how to take the session back over.
+		const notice = createStallRecoveryEscalationMessage({
+			executor: "daemon",
+			actedAt,
+			silentSinceActionMs: Math.max(0, now - actedAt),
+			action: marker?.action ?? "abort",
+			count: marker?.count ?? 1,
+			sessionName: session.sessionName ?? state.activeSessionId,
+		});
+		session.sendCustomMessage(notice).catch((error: unknown) => {
+			// Best-effort like every other notice: the roster marker and the log
+			// already carry the fact, so a refused admission is logged, not retried.
+			this.log(`could not deliver stall-recovery escalation notice to ${state.activeSessionId}: ${String(error)}`);
+		});
 	}
 
 	/**
@@ -7995,9 +8111,11 @@ export class AgentDaemon {
 			silentMs: stall.silentMs,
 			thresholdMs: stall.thresholdMs,
 			inFlightTools: [...stall.inFlightTools],
-			...(escalated
-				? { escalated: true, escalateAfterMs: now - actedAt }
-				: { escalateAfterMs: STALL_RECOVERY_ESCALATE_AFTER_MS }),
+			// G (blind-3 finding 10): the escalation variant quotes the measured
+			// action-to-escalation gap in silentSinceActionMs; escalateAfterMs stays
+			// the policy window on both variants.
+			escalateAfterMs: STALL_RECOVERY_ESCALATE_AFTER_MS,
+			...(escalated ? { escalated: true, silentSinceActionMs: Math.max(0, now - actedAt) } : {}),
 			...(reDispatch ? { reDispatch: this.toReDispatchFacts(reDispatch) } : {}),
 			...(escalated ? { sessionDir: state.runtime.session.sessionManager.getSessionDir() } : {}),
 		});
@@ -8059,10 +8177,14 @@ export class AgentDaemon {
 	}
 
 	/**
-	 * External input reached this session (a client prompt, a steered agent
-	 * message). Two effects: the live episode is marked kept-alive (never
+	 * External input reached this session: a client command (prompt, steer,
+	 * follow-up, abort, resume) or an agent message that was actually
+	 * delivered. Two effects: the live episode is marked kept-alive (never
 	 * auto-acted - someone is driving), and the consecutive-action counter
 	 * resets (the stop line counts interventions *without* external input).
+	 * Callers mark client commands as soon as the target session resolves; the
+	 * agent-message path marks only after delivery, never for a queued or
+	 * refused send.
 	 */
 	private noteExternalSessionInput(state: ActiveSessionState): void {
 		this.stallRecoveryActionCounts.delete(state.activeSessionId);
