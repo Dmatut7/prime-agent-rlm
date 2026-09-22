@@ -7,7 +7,6 @@ import {
 } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { theme } from "../theme/theme.js";
-import { expandCollapseHint } from "./keybinding-hints.js";
 
 export interface CollapsibleErrorOptions {
 	text: string;
@@ -149,8 +148,9 @@ export class CollapsibleErrorComponent implements Component {
 		}
 
 		const summary = normalizeErrorDetails(this.options.summary ?? summarizeErrorDetails(text));
-		const inlineHint = `${summary} ${expandCollapseHint("app.tools.expand", false)}`;
-		const lines = this.renderText(inlineHint, width, "error");
+		// U6: no per-line expand hint — the global tail line states the keys; the
+		// row stays clickable.
+		const lines = this.renderText(summary, width, "error");
 		this.clickRegions = [
 			{ line: 0, col: 0, width, height: lines.length, onClick: () => this.setExpanded(!this.expanded) },
 		];

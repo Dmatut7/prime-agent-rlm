@@ -45,6 +45,7 @@ import { AgentConnectionPromptAdmissionError } from "../src/modes/agent-connecti
 import { AgentActivityTracker } from "../src/modes/interactive/agent-activity.js";
 import type { AuthenticationResult } from "../src/modes/interactive/auth-flows.js";
 import { AgentMessageComponent } from "../src/modes/interactive/components/agent-message.js";
+import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
 import { BashExecutionComponent } from "../src/modes/interactive/components/bash-execution.js";
 import type { ConfigurationMenuComponent } from "../src/modes/interactive/components/configuration-menu.js";
 import type { AuthSelectorProvider } from "../src/modes/interactive/components/oauth-selector.js";
@@ -4625,6 +4626,7 @@ describe("InteractiveMode.setToolsExpanded", () => {
 	function createExpansionFakeThis(chatChildren: unknown[]): any {
 		const fakeThis: any = {
 			toolOutputExpanded: false,
+			thinkingExpanded: false,
 			agentMessagesExpanded: false,
 			editDiffsExpanded: false,
 			customHeader: undefined,
@@ -4704,6 +4706,43 @@ describe("InteractiveMode.setToolsExpanded", () => {
 		expect(fakeThis.editDiffsExpanded).toBe(true);
 		expect(child.setEditDiffsExpanded).toHaveBeenLastCalledWith(true);
 		expect(child.setExpanded).toHaveBeenLastCalledWith(true);
+	});
+
+	test("Ctrl+O owns the process surface: tools and edit diffs flip together, thinking and messages stay put", () => {
+		const assistantChild = new AssistantMessageComponent();
+		const setThinkingExpanded = vi.spyOn(assistantChild, "setThinkingExpanded");
+		const child = { setExpanded: vi.fn(), setAgentMessagesExpanded: vi.fn(), setEditDiffsExpanded: vi.fn() };
+		const fakeThis = createExpansionFakeThis([child, assistantChild]);
+
+		fakeThis.toggleToolOutputExpansion();
+
+		expect(fakeThis.toolOutputExpanded).toBe(true);
+		expect(fakeThis.editDiffsExpanded).toBe(true);
+		expect(fakeThis.agentMessagesExpanded).toBe(false);
+		expect(fakeThis.thinkingExpanded).toBe(false);
+		expect(child.setExpanded).toHaveBeenCalledWith(true);
+		expect(child.setEditDiffsExpanded).toHaveBeenCalledWith(true);
+		expect(child.setAgentMessagesExpanded).toHaveBeenCalledWith(false);
+		// The O lane never touches the thinking lane.
+		expect(setThinkingExpanded).toHaveBeenCalledWith(false);
+	});
+
+	test("Ctrl+T owns the thinking block: only the thinking lane flips", () => {
+		const assistantChild = new AssistantMessageComponent();
+		const setThinkingExpanded = vi.spyOn(assistantChild, "setThinkingExpanded");
+		const child = { setExpanded: vi.fn(), setAgentMessagesExpanded: vi.fn(), setEditDiffsExpanded: vi.fn() };
+		const fakeThis = createExpansionFakeThis([child, assistantChild]);
+		fakeThis.showStatus = vi.fn();
+
+		fakeThis.toggleThinkingBlockVisibility();
+
+		expect(fakeThis.thinkingExpanded).toBe(true);
+		expect(fakeThis.toolOutputExpanded).toBe(false);
+		expect(fakeThis.editDiffsExpanded).toBe(false);
+		expect(fakeThis.agentMessagesExpanded).toBe(false);
+		expect(setThinkingExpanded).toHaveBeenCalledWith(true);
+		expect(child.setExpanded).toHaveBeenCalledWith(false);
+		expect(fakeThis.showStatus).toHaveBeenCalledWith("思考块: 展开");
 	});
 });
 

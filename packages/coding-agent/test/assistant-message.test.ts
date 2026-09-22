@@ -158,7 +158,8 @@ describe("AssistantMessageComponent", () => {
 		const rendered = stripAnsi(raw);
 
 		expect(rendered).toContain("Error: Provider request failed");
-		expect(rendered).toContain("展开");
+		// U6: no per-line expand hint; the collapsed error row stays clickable.
+		expect(rendered).not.toContain("Ctrl+");
 		expect(raw).toContain(theme.getFgAnsi("error"));
 	});
 });
@@ -266,7 +267,9 @@ describe("AssistantMessageComponent streaming identity", () => {
 		expect(hidden).not.toContain("Thinking");
 
 		const expanded = stripAnsi(
-			new AssistantMessageComponent(message, false, undefined, "思考", { expanded: true }).render(120).join("\n"),
+			new AssistantMessageComponent(message, false, undefined, "思考", { thinkingExpanded: true })
+				.render(120)
+				.join("\n"),
 		);
 		expect(expanded).toContain("思考");
 		// No per-line expand hint suffixes: the global tail hint owns the affordance.

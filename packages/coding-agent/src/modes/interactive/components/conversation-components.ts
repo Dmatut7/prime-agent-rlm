@@ -44,6 +44,7 @@ export interface ConversationComponentsOptions {
 	hideThinkingBlock?: boolean;
 	hiddenThinkingLabel?: string;
 	toolsExpanded?: boolean;
+	thinkingExpanded?: boolean;
 	agentMessagesExpanded?: boolean;
 	editDiffsExpanded?: boolean;
 	isRecognizedSlashCommand?: (name: string) => boolean;
@@ -78,6 +79,7 @@ export function buildConversationComponents(
 	const components: Component[] = [];
 	const pendingTools = new Map<string, ToolExecutionComponent>();
 	const expanded = options.toolsExpanded ?? false;
+	const thinkingExpanded = options.thinkingExpanded ?? false;
 	const agentMessagesExpanded = options.agentMessagesExpanded ?? false;
 	const editDiffsExpanded = options.editDiffsExpanded ?? false;
 	// U4/U6: one aggregate line per agent turn (the tool activity between two
@@ -124,6 +126,7 @@ export function buildConversationComponents(
 					{
 						cwd: options.cwd,
 						expanded,
+						thinkingExpanded,
 						precededByToolActivity:
 							components.at(-1) instanceof ToolExecutionComponent ||
 							components.at(-1) instanceof AgentMessageComponent,

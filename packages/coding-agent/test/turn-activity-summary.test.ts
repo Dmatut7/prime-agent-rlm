@@ -69,6 +69,24 @@ function toolHeavyTurn(): AgentMessage[] {
 	return out;
 }
 
+function renderAllWith(
+	messages: readonly AgentMessage[],
+	options: { toolsExpanded: boolean; thinkingExpanded: boolean },
+): string {
+	const components = buildConversationComponents(messages, {
+		ui,
+		cwd: "/tmp",
+		toolOptions: {},
+		getToolDefinition: () => undefined,
+		toolsExpanded: options.toolsExpanded,
+		thinkingExpanded: options.thinkingExpanded,
+	});
+	return components
+		.flatMap((component) => component.render(120))
+		.map(stripAnsi)
+		.join("\n");
+}
+
 function collapsedLinesWithoutUserLine(nonEmpty: string[]): number {
 	return nonEmpty.filter((line) => !line.includes("fix the CI reds")).length;
 }
@@ -131,7 +149,7 @@ describe("turn activity summary (U4)", () => {
 		expect(nonEmpty[1]).toContain("⚙ 6 步");
 	});
 
-	it("folds the turn's thinking into the ⚙ line and renders zero thinking rows collapsed", () => {
+	it("renders one thinking header plus one process line per turn, zero thinking rows collapsed", () => {
 		// The boss's live scenario: a 10-step turn, one thinking block per step.
 		const messages: AgentMessage[] = [{ role: "user", content: "fix the CI reds", timestamp: 900 }];
 		for (let i = 1; i <= 10; i++) {
@@ -150,18 +168,22 @@ describe("turn activity summary (U4)", () => {
 
 		const collapsed = renderAll(messages, false);
 		const nonEmpty = collapsed.split("\n").filter((line) => line.trim().length > 0);
-		// One mechanical line for the whole turn: steps, duration, verbs, thinking.
-		expect(nonEmpty[1]).toBe(" ⚙ 10 步 · 1.0s · python×10 · 思考 10 段");
-		// Zero thinking rows anywhere in the collapsed view.
+		// Two mechanical lines at the turn head: the thinking block header (①)
+		// above the process line (②).
+		expect(nonEmpty[1]).toBe(" 思考 10 段 · 1.0s");
+		expect(nonEmpty[2]).toBe(" ⚙ 10 步 · 1.0s · python×10");
+		// Zero per-block thinking rows anywhere in the collapsed view.
 		expect(collapsed).not.toContain("Thinking");
 		expect(collapsed).not.toContain("weigh the options");
 		expect(collapsed).not.toContain("展开");
-		expect(collapsedLinesWithoutUserLine(nonEmpty)).toBe(2); // ⚙ line + final prose
+		expect(collapsedLinesWithoutUserLine(nonEmpty)).toBe(3); // 思考 header + ⚙ line + final prose
 
-		const expanded = renderAll(messages, true);
-		expect(expanded).toContain("weigh the options");
+		// The thinking traces appear with the T lane, not the O lane.
+		const toolsExpanded = renderAll(messages, true);
+		expect(toolsExpanded).not.toContain("weigh the options");
+		const thinkingExpanded = renderAllWith(messages, { toolsExpanded: true, thinkingExpanded: true });
+		expect(thinkingExpanded).toContain("weigh the options");
 	});
-
 	it("renders a thinking-only turn as one 思考 line and freezes its clock at the boundary", () => {
 		const messages: AgentMessage[] = [
 			{ role: "user", content: "just think", timestamp: 900 },

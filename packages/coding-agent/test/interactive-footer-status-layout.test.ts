@@ -197,6 +197,22 @@ describe("U6 status area layout", () => {
 		expect(statusLines).toContain("收口 2");
 	});
 
+	it("states the two-key division in one global hint line at the chat tail", async () => {
+		const { ExpandKeysHintLine } = await import("../src/modes/interactive/components/expand-keys-hint.js");
+		let hasContent = false;
+		const line = new ExpandKeysHintLine(() => hasContent);
+		expect(line.render(100)).toEqual([]);
+
+		hasContent = true;
+		const rendered = stripAnsi(line.render(100).join("\n"));
+		// `Ctrl+T 思考 · Ctrl+O 过程 · Ctrl+P 消息` — one dim line, the only
+		// place the key division is stated.
+		expect(rendered).toContain("Ctrl+T 思考 · Ctrl+O 过程 · Ctrl+P 消息");
+		expect(rendered).not.toContain("展开");
+		// It never grows beyond one line.
+		expect(line.render(100)).toHaveLength(1);
+	});
+
 	it("focused ③ keeps the Enter/→ open affordance without the ↓ hint", () => {
 		const subagents = new SubagentSummaryLine();
 		subagents.setSubagentCounts({ total: 3, running: 1, idle: 0, inactive: 2 });

@@ -16,16 +16,17 @@ export function turnStepVerb(toolName: string): string {
 }
 
 /**
- * U4/U6 turn aggregation: the tool activity of one agent turn (every tool call
- * between two user prompts) collapses to a single line — step count, total
- * wall time, and a verb summary — with Ctrl+O expanding the individual tool
- * blocks. U6 folds the turn's thinking into the same line: thinking segments
- * count into `思考 N 段` (collapsed view renders no per-block thinking rows at
- * all; the full traces only appear expanded), and a thinking-only turn
- * renders the line without the ⚙ prefix. Settled tools hide themselves while
- * the group is collapsed; the summary component owns the visible line. While
- * the turn is still running, a live tool keeps its own body (the running
- * preview stays watchable) and merges into the line once it settles.
+ * U4/U6 turn aggregation: one agent turn (every tool call between two user
+ * prompts) renders a two-line mechanical surface at the turn head — ① the
+ * thinking block header `思考 12.3s` / `思考 5 段 · 96.3s` (one header for the
+ * whole turn, always visible while it has thinking; Ctrl+T expands the
+ * traces) and ② the process line `⚙ 10 步 · 1.0s · python×10` (Ctrl+O expands
+ * the tool calls, outputs, and edit diffs). The collapsed view renders no
+ * per-block thinking rows; the full traces only appear expanded. Settled
+ * tools hide themselves while the group is collapsed; the summary component
+ * owns the visible lines. While the turn is still running, a live tool keeps
+ * its own body (the running preview stays watchable) and merges into the
+ * line once it settles.
  */
 export class TurnActivityState {
 	readonly steps: TurnStep[] = [];
@@ -133,24 +134,26 @@ export class TurnActivityState {
 		return `${(Math.max(0, end - this.startedAt) / 1000).toFixed(1)}s`;
 	}
 
+	/** U6 ①: the turn's thinking block header — one line, always visible while the turn has thinking. */
+	thinkingHeaderText(): string {
+		const segments = this.totalThinkingSegments;
+		if (segments <= 0) {
+			return "";
+		}
+		// `思考 36.3s` for a single segment, `思考 5 段 · 96.3s` for several.
+		return segments > 1 ? `思考 ${segments} 段 · ${this.durationSeconds()}` : `思考 ${this.durationSeconds()}`;
+	}
+
+	/** U6 ②: the process line — steps, duration, verb summary. */
 	summaryText(): string {
 		const count = this.steps.length;
-		const segments = this.totalThinkingSegments;
 		if (count === 0) {
-			// A thinking-only turn: `思考 36.3s` / `思考 5 段 · 96.3s`.
-			return segments > 0
-				? segments > 1
-					? `思考 ${segments} 段 · ${this.durationSeconds()}`
-					: `思考 ${this.durationSeconds()}`
-				: "";
+			return "";
 		}
 		const parts = [`⚙ ${count} 步 · ${this.durationSeconds()}`];
 		const verbs = this.verbSummary();
 		if (verbs) {
 			parts.push(verbs);
-		}
-		if (segments > 0) {
-			parts.push(`思考 ${segments} 段`);
 		}
 		return parts.join(" · ");
 	}
@@ -181,17 +184,21 @@ export class TurnSummaryComponent implements Component {
 		if (this.cachedLines && this.cachedWidth === width && this.state.isSettled) {
 			return this.cachedLines;
 		}
-		const text = this.state.summaryText();
 		const safeWidth = Math.max(1, width);
-		// Renders nothing until the turn has something to aggregate; no per-line
-		// expand hint — the single global hint line at the chat tail carries the
-		// Ctrl+O affordance.
-		const lines = text ? [theme.fg("muted", truncateToWidth(` ${text}`, safeWidth, "")), " ".repeat(safeWidth)] : [];
+		// U6 two-line mechanical surface, both pinned at the turn head: the
+		// thinking block header (①, always visible while the turn has thinking)
+		// above the process line (②). No per-line expand hints — the single
+		// global hint line at the chat tail carries the key division.
+		const textLines = [this.state.thinkingHeaderText(), this.state.summaryText()].filter((text) => text.length > 0);
+		const lines = textLines.flatMap((text) => [
+			theme.fg("muted", truncateToWidth(` ${text}`, safeWidth, "")),
+			" ".repeat(safeWidth),
+		]);
 		if (this.state.isSettled) {
 			this.cachedWidth = width;
 			this.cachedLines = lines;
 		} else {
-			// A live run keeps mutating; only the settled line is cacheable.
+			// A live run keeps mutating; only the settled lines are cacheable.
 			this.cachedWidth = undefined;
 			this.cachedLines = undefined;
 		}

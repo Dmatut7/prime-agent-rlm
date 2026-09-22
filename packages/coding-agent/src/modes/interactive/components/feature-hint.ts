@@ -1,7 +1,8 @@
 import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { theme } from "../theme/theme.js";
 
-const LABEL = "提示：";
+// U6: the hint line starts with a chevron instead of a 提示： prefix.
+const LABEL = "›";
 const SHIMMER_RADIUS = 1;
 const SHIMMER_PAUSE_FRAMES = 14;
 

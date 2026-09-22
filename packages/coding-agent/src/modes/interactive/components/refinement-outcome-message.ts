@@ -5,7 +5,6 @@ import { generateDiffString } from "../../../core/tools/edit-diff.js";
 import { theme } from "../theme/theme.js";
 import { renderDiff } from "./diff.js";
 import { customMessageLabel, ExpandableCustomMessageBox } from "./expandable-custom-message.js";
-import { expandCollapseHint } from "./keybinding-hints.js";
 
 function editableEntry(entry: HarnessEntry): Record<string, unknown> {
 	return {
@@ -103,7 +102,8 @@ export class RefinementOutcomeMessageComponent extends ExpandableCustomMessageBo
 		this.addChild(new Clickable(new Text(customMessageLabel("refinement"), 0, 0), toggle));
 		this.addChild(new Spacer(1));
 		if (!this.expanded) {
-			const suffix = `${theme.fg("customMessageText", `· ${editCount(edits)}`)} ${expandCollapseHint("app.tools.expand", false)}`;
+			// U6: no per-line expand hint — the global tail line states the keys.
+			const suffix = theme.fg("customMessageText", `· ${editCount(edits)}`);
 			this.addChild(new Clickable(new CollapsedOutcomeLine(summary, suffix), toggle));
 			return;
 		}

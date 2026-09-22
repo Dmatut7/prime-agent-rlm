@@ -212,6 +212,7 @@ import { DaxnutsComponent } from "./components/daxnuts.js";
 import { DynamicBorder } from "./components/dynamic-border.js";
 import { EarendilAnnouncementComponent } from "./components/earendil-announcement.js";
 import { type FileChangeSummary, formatTotalChangeSummary, mergeTurnFileChanges } from "./components/edit-summary.js";
+import { ExpandKeysHintLine } from "./components/expand-keys-hint.js";
 import { ExtensionEditorComponent } from "./components/extension-editor.js";
 import { ExtensionInputComponent } from "./components/extension-input.js";
 import { ExtensionSelectorComponent } from "./components/extension-selector.js";
@@ -1236,6 +1237,7 @@ export class InteractiveMode {
 	// One summary line below the editor, backed by the existing child-status stream.
 	private subagentSummaryLine: SubagentSummaryLine;
 	private trayInfoLine: TrayInfoLine;
+	private expandKeysHintLine: ExpandKeysHintLine;
 	private subagentSnapshots = new Map<string, AgentConnectionRlmChildAgentSnapshot>();
 	private subagentCounts: SubagentSummaryCounts = { total: 0, running: 0, idle: 0, inactive: 0 };
 	private subagentSpendTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1274,6 +1276,8 @@ export class InteractiveMode {
 	private editDiffsExpanded = true;
 
 	private hideThinkingBlock = false;
+	/** U6 (two-key model): Ctrl+T's lane — the thinking traces of assistant messages. */
+	private thinkingExpanded = false;
 	private readonly mermaidMarkdownTransform = createMermaidMarkdownTransform({
 		getMode: () => this.settingsManager.getMermaidRenderingMode(),
 		theme,
@@ -1457,6 +1461,10 @@ export class InteractiveMode {
 		this.promptDock = new Container();
 		this.footerSlot = new Container();
 		this.mainViewContainer.addChild(this.chatContainer);
+		// U6: the single global expand-hint line at the conversation's tail —
+		// the only place the Ctrl+T/O/P division is stated.
+		this.expandKeysHintLine = new ExpandKeysHintLine(() => this.chatContainer.children.length > 0);
+		this.mainViewContainer.addChild(this.expandKeysHintLine);
 		this.mainViewContainer.addChild(this.shortcutGuideContainer);
 		this.mainViewContainer.addChild(this.pendingMessagesContainer);
 		this.mainViewContainer.addChild(this.statusContainer);
@@ -1735,10 +1743,9 @@ export class InteractiveMode {
 						keyHint("tui.editor.deleteToLineEnd", "to delete to end"),
 						rawKeyHint("/effort", "to set thinking level"),
 						hint("app.model.select", "to select model"),
-						hint("app.tools.expand", "to expand tools"),
-						hint("app.messages.expand", "to expand agent messages"),
-						hint("app.edits.expand", "to expand edit diffs"),
+						hint("app.tools.expand", "to expand tool calls, outputs and edit diffs"),
 						hint("app.thinking.toggle", "to expand thinking"),
+						hint("app.messages.expand", "to expand agent messages"),
 						hint("app.subagents.focus", "to inspect subagents"),
 						hint("app.editor.external", "for external editor"),
 						hint("app.prompt.stash", "to stash prompt"),
@@ -6604,6 +6611,7 @@ export class InteractiveMode {
 			this.hiddenThinkingLabel,
 			{
 				expanded: this.toolOutputExpanded,
+				thinkingExpanded: this.thinkingExpanded,
 				precededByToolActivity:
 					this.chatContainer.children.at(-1) instanceof ToolExecutionComponent ||
 					this.chatContainer.children.at(-1) instanceof AgentMessageComponent,
@@ -8562,6 +8570,9 @@ export class InteractiveMode {
 	}
 
 	private toggleToolOutputExpansion(): void {
+		// U6 (boss's two-key model): Ctrl+O owns the process surface — tool
+		// calls, outputs, and edit diffs ride the same expanded state.
+		this.editDiffsExpanded = !this.toolOutputExpanded;
 		this.setToolsExpanded(!this.toolOutputExpanded);
 	}
 
@@ -8586,6 +8597,7 @@ export class InteractiveMode {
 	}
 
 	private toggleAgentMessageExpansion(): void {
+		// U6: Ctrl+P keeps its own lane — agent message rows only.
 		this.agentMessagesExpanded = !this.agentMessagesExpanded;
 		this.applyChatExpansion();
 	}
@@ -8611,6 +8623,11 @@ export class InteractiveMode {
 			activeHeader.setExpanded(this.toolOutputExpanded);
 		}
 		for (const child of this.chatContainer.children) {
+			if (child instanceof AssistantMessageComponent) {
+				// U6 two-key model: T drives the thinking traces; O drives the
+				// error detail surface.
+				child.setThinkingExpanded(this.thinkingExpanded);
+			}
 			if (isExpandable(child)) {
 				child.setExpanded(this.expansionStateFor(child));
 			}
@@ -8633,22 +8650,12 @@ export class InteractiveMode {
 	}
 
 	private toggleThinkingBlockVisibility(): void {
-		this.hideThinkingBlock = !this.hideThinkingBlock;
-		this.settingsManager.setHideThinkingBlock(this.hideThinkingBlock);
-
-		void (async () => {
-			// Rebuild chat from session messages
-			await this.rebuildChatFromMessages();
-
-			if (this.streamingComponent && this.streamingMessage) {
-				this.streamingComponent.setHideThinkingBlock(this.hideThinkingBlock);
-				this.streamingComponent.updateContent(this.streamingMessage);
-			}
-
-			this.showStatus(`Thinking blocks: ${this.hideThinkingBlock ? "hidden" : "visible"}`);
-		})().catch((error) => {
-			this.showError(error instanceof Error ? error.message : String(error));
-		});
+		// U6 (boss's two-key model): Ctrl+T owns the thinking block — it
+		// expands/collapses the turn's thinking traces. hideThinkingBlock (the
+		// never-show setting) stays reachable from settings, not a key.
+		this.thinkingExpanded = !this.thinkingExpanded;
+		this.applyChatExpansion();
+		this.showStatus(`思考块: ${this.thinkingExpanded ? "展开" : "收起"}`);
 	}
 
 	private openExternalEditor(): void {

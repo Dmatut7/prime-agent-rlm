@@ -16,7 +16,6 @@ import { agentMessageBodyLines, agentMessagePreview, agentMessageSummaryLine } f
 import { normalizeErrorDetails, summarizeErrorDetails } from "./collapsible-error.js";
 import { renderDiffSeparator, renderRichDiff } from "./diff.js";
 import { countChangedLines, FILE_CHANGE_DIFF_INDENT, formatFileChangeSummaryLine } from "./edit-summary.js";
-import { expandCollapseHint } from "./keybinding-hints.js";
 
 export interface IPythonCellContentBlock {
 	type: string;
@@ -417,9 +416,6 @@ export class IPythonCellComponent implements Component {
 			parts.push(theme.fg("error", errorName));
 		}
 
-		if (this.state.showExpandHint !== false) {
-			parts.push(expandCollapseHint("app.tools.expand", this.state.expanded === true));
-		}
 		return parts.join(theme.fg("dim", " · "));
 	}
 
@@ -655,12 +651,12 @@ export class IPythonCellComponent implements Component {
 		for (const message of messages) {
 			const label = message.deliveryStatus === "delivered" ? "Agent message sent" : "Agent message queued";
 			const recipient = formatAgentMessageParticipant("sent", message.receiverRole, message.target);
-			const hint = expandCollapseHint("app.messages.expand", this.state.agentMessagesExpanded === true);
+			// U6: no per-line expand hint — the global tail line states the keys.
 			if (this.state.agentMessagesExpanded) {
 				this.addBlank(lines, width);
 				this.addPlain(
 					lines,
-					truncateToWidth(`${agentMessageSummaryLine(label, recipient)} ${hint}`, Math.max(1, width - 1), "…"),
+					truncateToWidth(agentMessageSummaryLine(label, recipient), Math.max(1, width - 1), "…"),
 				);
 				for (const bodyLine of agentMessageBodyLines(message.message, width)) {
 					lines.push(bodyLine);
@@ -671,11 +667,7 @@ export class IPythonCellComponent implements Component {
 			const preview = agentMessagePreview(prefixWidth, message.message);
 			this.addPlain(
 				lines,
-				truncateToWidth(
-					`${agentMessageSummaryLine(label, recipient, preview)} ${hint}`,
-					Math.max(1, width - 1),
-					"…",
-				),
+				truncateToWidth(agentMessageSummaryLine(label, recipient, preview), Math.max(1, width - 1), "…"),
 			);
 		}
 	}

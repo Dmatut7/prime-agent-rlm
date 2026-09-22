@@ -2,7 +2,6 @@ import { Clickable, Markdown, type MarkdownTheme, Text } from "@earendil-works/p
 import type { ParsedSkillBlock } from "../../../core/skill-blocks.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
 import { customMessageLabel, ExpandableCustomMessageBox } from "./expandable-custom-message.js";
-import { expandCollapseHint } from "./keybinding-hints.js";
 
 /** Skill invocation card; the user message is rendered separately. */
 export class SkillInvocationMessageComponent extends ExpandableCustomMessageBox {
@@ -27,10 +26,9 @@ export class SkillInvocationMessageComponent extends ExpandableCustomMessageBox 
 				}),
 			);
 		} else {
-			const line =
-				`${customMessageLabel("skill")} ` +
-				theme.fg("customMessageText", this.skillBlock.name) +
-				` ${expandCollapseHint("app.tools.expand", false)}`;
+			// U6: no per-line expand hint — the global tail line states the keys;
+			// the row stays clickable.
+			const line = `${customMessageLabel("skill")} ` + theme.fg("customMessageText", this.skillBlock.name);
 			this.addChild(new Clickable(new Text(line, 0, 0), toggle));
 		}
 	}

@@ -19,7 +19,9 @@ const LOGIN_RECOVERY_SUFFIX = `\n\n${LOGIN_RECOVERY_MESSAGE}`;
 
 export interface AssistantMessageComponentOptions {
 	cwd?: string;
+	/** U6 two-key model: Ctrl+T's thinking-trace lane (O's `expanded` covers the error surface). */
 	expanded?: boolean;
+	thinkingExpanded?: boolean;
 	precededByToolActivity?: boolean;
 	/** Replaces Mermaid code blocks in assistant text (never thinking) with Unicode diagrams. */
 	mermaidTransform?: MermaidMarkdownTransform;
@@ -71,6 +73,7 @@ export class AssistantMessageComponent extends Container {
 	private lastMessage?: AssistantMessage;
 	private hasToolCalls = false;
 	private expanded = false;
+	private thinkingExpanded = false;
 	private dirty = false;
 	private lastSignature?: string;
 	private blockMarkdowns = new Map<number, Markdown>();
@@ -95,6 +98,7 @@ export class AssistantMessageComponent extends Container {
 		this.markdownTheme = markdownTheme;
 		this.hiddenThinkingLabel = hiddenThinkingLabel;
 		this.expanded = options.expanded ?? false;
+		this.thinkingExpanded = options.thinkingExpanded ?? false;
 		this.precededByToolActivity = options.precededByToolActivity ?? false;
 		this.mermaidTransform = options.mermaidTransform;
 		this.baseUrl = options.cwd ? pathToFileURL(`${resolve(options.cwd)}${sep}`).href : undefined;
@@ -128,6 +132,14 @@ export class AssistantMessageComponent extends Container {
 	setExpanded(expanded: boolean): void {
 		if (this.expanded !== expanded) {
 			this.expanded = expanded;
+			this.dirty = true;
+		}
+	}
+
+	/** U6: Ctrl+T's lane — show the thinking traces (hideThinkingBlock still wins). */
+	setThinkingExpanded(expanded: boolean): void {
+		if (this.thinkingExpanded !== expanded) {
+			this.thinkingExpanded = expanded;
 			this.dirty = true;
 		}
 	}
@@ -186,6 +198,7 @@ export class AssistantMessageComponent extends Container {
 			`hide:${this.hideThinkingBlock}`,
 			`label:${this.hiddenThinkingLabel}`,
 			`expanded:${this.expanded}`,
+			`thinkingExpanded:${this.thinkingExpanded}`,
 			// In the signature so the streaming->final transition rebuilds (mermaid renders differently).
 			`streaming:${this.isStreaming}`,
 			`stop:${message.stopReason ?? ""}`,
@@ -265,8 +278,9 @@ export class AssistantMessageComponent extends Container {
 				const thinkingLabel = theme.bold(theme.fg("thinkingText", this.hiddenThinkingLabel));
 				if (this.hideThinkingBlock) {
 					// Hidden: nothing at all, not even in the expanded view.
-				} else if (!this.expanded) {
-					// Collapsed: nothing - the turn's ⚙/思考 line owns the summary.
+				} else if (!this.thinkingExpanded) {
+					// Collapsed: no rows here - the turn's 思考 block header at the
+					// turn head owns the summary and the Ctrl+T affordance.
 				} else {
 					// Expanded: the label line, then the trace. Thinking traces keep
 					// Markdown structure but stay visually quiet.
