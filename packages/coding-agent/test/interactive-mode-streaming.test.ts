@@ -183,16 +183,21 @@ describe("InteractiveMode streaming events", () => {
 		// for the dropped one. That message was popped and never persisted, so settling
 		// it here would leave a bubble that /resume does not show.
 		await handleEvent.call(fakeThis, { type: "message_start", message: droppedAttempt });
-		expect(fakeThis.chatContainer.children).toHaveLength(1);
-		expect(renderChat(fakeThis.chatContainer)).toContain("pondering the discarded turn");
+		// U6: the turn's aggregate line rides at the turn head and carries the live
+		// thinking count; the dropped attempt's thinking text itself never renders.
+		expect(fakeThis.chatContainer.children).toHaveLength(2);
+		expect(renderChat(fakeThis.chatContainer)).toContain("思考");
+		expect(renderChat(fakeThis.chatContainer)).not.toContain("pondering the discarded turn");
 
 		await handleEvent.call(fakeThis, {
 			type: "message_start",
 			message: createAssistantMessage("second attempt"),
 		});
 
-		expect(fakeThis.chatContainer.children).toHaveLength(1);
+		expect(fakeThis.chatContainer.children).toHaveLength(2);
 		expect(renderChat(fakeThis.chatContainer)).not.toContain("pondering the discarded turn");
+		// The replaced live message has no thinking: the count resets with it.
+		expect(renderChat(fakeThis.chatContainer)).not.toContain("思考");
 	});
 
 	test("renders assistant end events when attaching after all updates", async () => {

@@ -80,8 +80,11 @@ export function buildConversationComponents(
 	const expanded = options.toolsExpanded ?? false;
 	const agentMessagesExpanded = options.agentMessagesExpanded ?? false;
 	const editDiffsExpanded = options.editDiffsExpanded ?? false;
-	// U4: one aggregate line per agent turn (the tool activity between two user
-	// prompts). Settled tools hide themselves while the group is collapsed.
+	// U4/U6: one aggregate line per agent turn (the tool activity between two
+	// user prompts), pinned at the turn head - the first line after the user
+	// prompt. Settled tools hide themselves while the group is collapsed; the
+	// turn's thinking blocks count into the same line (`思考 N 段`) and render
+	// no rows of their own while collapsed.
 	let turnState: TurnActivityState | undefined;
 	let turnSummary: TurnSummaryComponent | undefined;
 
@@ -95,17 +98,29 @@ export function buildConversationComponents(
 	for (const message of messages) {
 		if (message.role === "user") {
 			// A user prompt starts a new turn; the previous group is settled by
-			// then, so resetting the state only affects grouping from here on.
+			// then, so freeze its clock (thinking-only turns have no steps to
+			// settle) and reset the grouping from here on.
+			turnState?.markTurnEnded(Number(message.timestamp) || Date.now());
 			turnState = undefined;
 			turnSummary = undefined;
 		}
 		if (message.role === "assistant") {
+			// The turn summary is created at the turn head, before the first
+			// assistant component; it renders nothing until the turn has steps
+			// or thinking to aggregate.
+			const state = ensureTurn(Number(message.timestamp) || Date.now());
+			state.addThinkingSegments(countThinkingSegments(message));
+			if (!turnSummary) {
+				turnSummary = new TurnSummaryComponent(state);
+				turnSummary.setExpanded(expanded);
+				components.push(turnSummary);
+			}
 			components.push(
 				new AssistantMessageComponent(
 					message,
 					options.hideThinkingBlock ?? false,
 					options.markdownTheme,
-					options.hiddenThinkingLabel ?? "Thinking...",
+					options.hiddenThinkingLabel ?? "思考",
 					{
 						cwd: options.cwd,
 						expanded,
@@ -119,7 +134,6 @@ export function buildConversationComponents(
 				if (content.type !== "toolCall") {
 					continue;
 				}
-				const state = ensureTurn(Number(message.timestamp) || Date.now());
 				const step: TurnStep = {
 					toolCallId: content.id,
 					toolName: content.name,
@@ -127,11 +141,6 @@ export function buildConversationComponents(
 					status: "queued",
 				};
 				state.addStep(step);
-				if (!turnSummary) {
-					turnSummary = new TurnSummaryComponent(state);
-					turnSummary.setExpanded(expanded);
-					components.push(turnSummary);
-				}
 				const tool = new ToolExecutionComponent(
 					content.name,
 					content.id,
@@ -217,5 +226,16 @@ export function buildConversationComponents(
 		}
 		// Non-conversational messages (bash/branch-summary/compaction/other custom) aren't shown.
 	}
+	// The last turn has no following user prompt; freeze its clock at the last
+	// message so a thinking-only line stops ticking.
+	turnState?.markTurnEnded(Number(messages.at(-1)?.timestamp) || Date.now());
 	return components;
+}
+
+/** Non-empty thinking blocks of one assistant message (U6 segment counting). */
+export function countThinkingSegments(message: {
+	content: ReadonlyArray<{ type: string; thinking?: string }>;
+}): number {
+	return message.content.filter((block) => block.type === "thinking" && (block.thinking ?? "").trim().length > 0)
+		.length;
 }

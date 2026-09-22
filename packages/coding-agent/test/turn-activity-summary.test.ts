@@ -69,6 +69,10 @@ function toolHeavyTurn(): AgentMessage[] {
 	return out;
 }
 
+function collapsedLinesWithoutUserLine(nonEmpty: string[]): number {
+	return nonEmpty.filter((line) => !line.includes("fix the CI reds")).length;
+}
+
 function renderAll(messages: readonly AgentMessage[], expanded: boolean): string {
 	const components = buildConversationComponents(messages, {
 		ui,
@@ -94,11 +98,13 @@ describe("turn activity summary (U4)", () => {
 		const collapsed = renderAll(messages, false);
 		const collapsedLines = collapsed.split("\n").filter((line) => line.trim().length > 0);
 
-		// The aggregate line: step count, duration, verb summary, expand hint.
-		expect(collapsed).toContain("本轮 6 步");
-		expect(collapsed).toContain("bash×3");
-		expect(collapsed).toContain("edit×3");
-		expect(collapsed).toContain("展开");
+		// The aggregate line: step count, duration, verb summary. No 本轮 prefix,
+		// no running marker, and no per-line expand hint - the global tail hint
+		// owns the Ctrl+O affordance.
+		expect(collapsed).toContain("⚙ 6 步 · 0.6s · edit×3 · bash×3");
+		expect(collapsed).not.toContain("本轮");
+		expect(collapsed).not.toContain("运行中");
+		expect(collapsed).not.toContain("展开");
 		// Settled tool bodies are hidden; the assistant prose stays.
 		expect(collapsed).toContain("All six checks passed");
 		expect(collapsed).not.toContain("npm test --grep 2");
@@ -113,6 +119,99 @@ describe("turn activity summary (U4)", () => {
 		expect(collapsedLines.length).toBeLessThan(expandedLines.length);
 	});
 
+	it("pins the aggregate line at the turn head, before any thinking or prose", () => {
+		const messages: AgentMessage[] = [
+			{ role: "user", content: "run the checks", timestamp: 900 },
+			...toolHeavyTurn(),
+		];
+		const collapsed = renderAll(messages, false);
+		const nonEmpty = collapsed.split("\n").filter((line) => line.trim().length > 0);
+		// Line 0 is the user prompt; the ⚙ line is the very next line.
+		expect(nonEmpty[0]).toContain("run the checks");
+		expect(nonEmpty[1]).toContain("⚙ 6 步");
+	});
+
+	it("folds the turn's thinking into the ⚙ line and renders zero thinking rows collapsed", () => {
+		// The boss's live scenario: a 10-step turn, one thinking block per step.
+		const messages: AgentMessage[] = [{ role: "user", content: "fix the CI reds", timestamp: 900 }];
+		for (let i = 1; i <= 10; i++) {
+			messages.push(
+				assistant(
+					[
+						{ type: "thinking", thinking: `Step ${i}: weigh the options first.` },
+						{ type: "toolCall", id: `py-${i}`, name: "ipython", arguments: { code: `check(${i})` } },
+					],
+					1_000 + i * 100,
+				),
+			);
+			messages.push(toolResult(`py-${i}`, "ipython", `ok ${i}`, 1_000 + i * 110));
+		}
+		messages.push(assistant([{ type: "text", text: "All three reds closed." }], 2_600));
+
+		const collapsed = renderAll(messages, false);
+		const nonEmpty = collapsed.split("\n").filter((line) => line.trim().length > 0);
+		// One mechanical line for the whole turn: steps, duration, verbs, thinking.
+		expect(nonEmpty[1]).toBe(" ⚙ 10 步 · 1.0s · python×10 · 思考 10 段");
+		// Zero thinking rows anywhere in the collapsed view.
+		expect(collapsed).not.toContain("Thinking");
+		expect(collapsed).not.toContain("weigh the options");
+		expect(collapsed).not.toContain("展开");
+		expect(collapsedLinesWithoutUserLine(nonEmpty)).toBe(2); // ⚙ line + final prose
+
+		const expanded = renderAll(messages, true);
+		expect(expanded).toContain("weigh the options");
+	});
+
+	it("renders a thinking-only turn as one 思考 line and freezes its clock at the boundary", () => {
+		const messages: AgentMessage[] = [
+			{ role: "user", content: "just think", timestamp: 900 },
+			assistant(
+				[
+					{ type: "thinking", thinking: "First segment." },
+					{ type: "thinking", thinking: "Second segment." },
+					{ type: "text", text: "Concluded." },
+				],
+				1_000,
+			),
+			{ role: "user", content: "next", timestamp: 3_000 },
+			assistant([{ type: "text", text: "No thinking here." }], 3_500),
+		];
+		const collapsed = renderAll(messages, false);
+		const nonEmpty = collapsed.split("\n").filter((line) => line.trim().length > 0);
+		// A single segment renders without the count; several render `思考 N 段`.
+		expect(nonEmpty[1]).toBe(" 思考 2 段 · 2.0s");
+		expect(collapsed).toContain("Concluded.");
+		expect(collapsed).not.toContain("First segment");
+		// The second turn has neither steps nor thinking: no mechanical line.
+		expect(collapsed).not.toContain("思考 1 段");
+
+		const single = renderAll(
+			[
+				{ role: "user", content: "one segment", timestamp: 900 },
+				assistant([{ type: "thinking", thinking: "Only segment." }], 1_000),
+				{ role: "user", content: "next", timestamp: 3_000 },
+			],
+			false,
+		);
+		const singleNonEmpty = single.split("\n").filter((line) => line.trim().length > 0);
+		expect(singleNonEmpty[1]).toBe(" 思考 2.0s");
+	});
+
+	it("hides a live tool's body only after it settles, and the verb summary keeps one fragment per verb", () => {
+		const state = new TurnActivityState(1_000);
+		state.addStep({ toolCallId: "t1", toolName: "bash", args: { command: "npm test" }, status: "done" });
+		state.addStep({ toolCallId: "t2", toolName: "bash", args: { command: "npm run build" }, status: "running" });
+		const summary = new TurnSummaryComponent(state);
+		const line = stripAnsi(summary.render(120).join("\n"));
+		expect(line).toContain("⚙ 2 步");
+		expect(line).toContain("bash×2");
+		// A settled turn pins its line; the verb summary keeps one fragment per verb.
+		state.setStepStatus("t2", "done", 2_500);
+		const settled = stripAnsi(summary.render(120).join("\n"));
+		expect(settled).toContain("1.5s");
+		expect(settled).toContain("bash×2");
+	});
+
 	it("groups per user turn: two prompts get two independent summary lines", () => {
 		const messages: AgentMessage[] = [
 			{ role: "user", content: "first", timestamp: 900 },
@@ -123,25 +222,11 @@ describe("turn activity summary (U4)", () => {
 			assistant([{ type: "text", text: "Done." }], 3_200),
 		];
 		const collapsed = renderAll(messages, false);
-		const summaries = collapsed.split("\n").filter((line) => line.includes("本轮"));
+		const summaries = collapsed.split("\n").filter((line) => line.includes("⚙"));
 		expect(summaries).toHaveLength(2);
-		expect(collapsed).toContain("本轮 1 步");
+		expect(collapsed).toContain("⚙ 6 步");
+		expect(collapsed).toContain("⚙ 1 步");
 		expect(collapsed).not.toContain("contents");
-	});
-
-	it("running steps never hide their live tool body while a later step runs", () => {
-		const state = new TurnActivityState(1_000);
-		state.addStep({ toolCallId: "t1", toolName: "bash", args: { command: "npm test" }, status: "done" });
-		state.addStep({ toolCallId: "t2", toolName: "bash", args: { command: "npm run build" }, status: "running" });
-		const summary = new TurnSummaryComponent(state);
-		const line = stripAnsi(summary.render(120).join("\n"));
-		expect(line).toContain("本轮 2 步");
-		expect(line).toContain("运行中");
-		// A settled turn pins its line; the verb summary keeps one fragment per verb.
-		state.setStepStatus("t2", "done", 2_500);
-		const settled = stripAnsi(summary.render(120).join("\n"));
-		expect(settled).toContain("1.5s");
-		expect(settled).toContain("bash×2");
 	});
 
 	it("turnStepVerb maps ipython cells to python and keeps other names", () => {

@@ -204,7 +204,7 @@ import {
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.js";
 import { ConfigurationMenuComponent, type ConfigurationMenuTab } from "./components/configuration-menu.js";
 import { formatContextTree } from "./components/context-tree-format.js";
-import { isCompactAgentMessageNeighbor } from "./components/conversation-components.js";
+import { countThinkingSegments, isCompactAgentMessageNeighbor } from "./components/conversation-components.js";
 import { CountdownTimer } from "./components/countdown-timer.js";
 import { CustomEditor } from "./components/custom-editor.js";
 import { CustomMessageComponent } from "./components/custom-message.js";
@@ -1174,7 +1174,7 @@ export class InteractiveMode {
 	private contextUsageTokenBaseline = 0;
 	// Refresh ordering: a stale failure must never clobber a newer success.
 	private contextUsageRefresh = { generation: 0, lastSuccessGeneration: 0 };
-	private readonly defaultHiddenThinkingLabel = "Thinking...";
+	private readonly defaultHiddenThinkingLabel = "思考";
 	private hiddenThinkingLabel = this.defaultHiddenThinkingLabel;
 
 	private ctrlCExitHintExpiresAt = 0;
@@ -3911,10 +3911,6 @@ export class InteractiveMode {
 
 	private startWorkingLoader(): void {
 		this.stopWorkingLoader();
-		// A new agent run starts a fresh turn group; the settled summary line of
-		// the previous run stays in the chat as history.
-		this.currentTurnState = undefined;
-		this.currentTurnSummary = undefined;
 		this.workingStartedAt = this.turnStartedAt ?? Date.now();
 		this.loadingAnimation = this.createWorkingLoader();
 		this.statusContainer.addChild(this.loadingAnimation);
@@ -6124,6 +6120,13 @@ export class InteractiveMode {
 					this.retryLoader.stop();
 					this.retryLoader = undefined;
 				}
+				// A new agent run starts a fresh turn group here — and only here:
+				// mid-turn remounts (returning from the agents view, re-attach)
+				// route through startWorkingLoader without this edge and must keep
+				// the in-flight group intact (K3-2 remount finding). The settled
+				// summary line of the previous run stays in the chat as history.
+				this.currentTurnState = undefined;
+				this.currentTurnSummary = undefined;
 				this.stopWorkingLoader();
 				if (this.workingVisible) {
 					this.startWorkingLoader();
@@ -6264,6 +6267,10 @@ export class InteractiveMode {
 					this.addMessageToChat(event.message);
 					this.ui.requestRender();
 				} else if (event.message.role === "assistant") {
+					// U6: the turn's aggregate line is created at the turn head,
+					// before the first streaming assistant component.
+					this.ensureCurrentTurnSummary();
+					this.currentTurnState?.setLiveThinkingSegments(countThinkingSegments(event.message));
 					this.startAssistantStreamingMessage(event.message);
 					this.ui.requestRender();
 				}
@@ -6273,6 +6280,7 @@ export class InteractiveMode {
 				if (event.message.role === "assistant") {
 					this.streamingMessage = event.message;
 					this.ensureAssistantStreamingComponent(event.message).updateContent(this.streamingMessage, true);
+					this.currentTurnState?.setLiveThinkingSegments(countThinkingSegments(event.message));
 
 					for (const content of this.streamingMessage.content) {
 						if (content.type === "toolCall") {
@@ -6289,6 +6297,11 @@ export class InteractiveMode {
 					// Each landed assistant message grows the mother's own usage, i.e. the
 					// secondary "总" figure; throttled, so this stays cheap mid-turn.
 					this.scheduleSubagentSpendRefresh();
+					// U6: the landed message's thinking blocks settle into the turn count.
+					if (this.currentTurnState) {
+						this.currentTurnState.addThinkingSegments(countThinkingSegments(event.message));
+						this.currentTurnState.setLiveThinkingSegments(0);
+					}
 					this.streamingMessage = event.message;
 					let errorMessage: string | undefined;
 					if (this.streamingMessage.stopReason === "aborted") {
@@ -6394,6 +6407,9 @@ export class InteractiveMode {
 					this.ui.terminal.setProgress(false);
 				}
 				this.turnStartedAt = undefined;
+				// The run is over; a thinking-only turn's clock stops here (a tool
+				// turn already froze on its last settled step).
+				this.currentTurnState?.markTurnEnded(Date.now());
 				this.refreshTopBarCost();
 				// Drops the loader; background subagents are shown by the tree, not the loader.
 				this.syncWorkingLoader();
@@ -7597,21 +7613,27 @@ export class InteractiveMode {
 
 		for (const message of messagesToRender) {
 			if (message.role === "user") {
+				// Freeze the previous turn's clock (thinking-only turns have no
+				// steps to settle) before the next turn starts.
+				replayTurnState?.markTurnEnded(Number(message.timestamp) || Date.now());
 				replayTurnState = undefined;
 				replayTurnSummary = undefined;
 			}
 			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
+				// U6: the turn's aggregate line renders at the turn head, before the
+				// first assistant component, and counts this message's thinking.
+				if (!replayTurnState) {
+					replayTurnState = new TurnActivityState(Number(message.timestamp) || Date.now());
+					replayTurnSummary = new TurnSummaryComponent(replayTurnState);
+					replayTurnSummary.setExpanded(this.toolOutputExpanded);
+					this.chatContainer.addChild(replayTurnSummary);
+				}
+				replayTurnState.addThinkingSegments(countThinkingSegments(message));
 				this.addMessageToChat(message);
 				// Render tool call components
 				for (const content of message.content) {
 					if (content.type === "toolCall") {
-						if (!replayTurnState) {
-							replayTurnState = new TurnActivityState(Number(message.timestamp) || Date.now());
-							replayTurnSummary = new TurnSummaryComponent(replayTurnState);
-							replayTurnSummary.setExpanded(this.toolOutputExpanded);
-							this.chatContainer.addChild(replayTurnSummary);
-						}
 						replayTurnState.addStep({
 							toolCallId: content.id,
 							toolName: content.name,
@@ -7679,8 +7701,11 @@ export class InteractiveMode {
 			component.setIncludeImageDimensions(true);
 			this.pendingTools.set(toolCallId, component);
 		}
-		if (renderedPendingTools.size > 0 && replayTurnState) {
-			// Attaching mid-run: live tool events keep settling this turn's steps.
+		// The last replayed turn has no following user prompt; freeze its clock.
+		replayTurnState?.markTurnEnded(Number(messagesToRender.at(-1)?.timestamp) || Date.now());
+		if (replayTurnState && (renderedPendingTools.size > 0 || this.isAgentStreaming())) {
+			// Attaching mid-run: live tool and thinking events keep feeding this
+			// turn's group, so the replayed state stays the live one.
 			this.currentTurnState = replayTurnState;
 			this.currentTurnSummary = replayTurnSummary;
 		}

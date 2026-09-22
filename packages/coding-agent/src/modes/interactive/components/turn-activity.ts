@@ -1,6 +1,5 @@
 import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { theme } from "../theme/theme.js";
-import { expandCollapseHint } from "./keybinding-hints.js";
 
 export type TurnStepStatus = "queued" | "running" | "done" | "error";
 
@@ -17,18 +16,24 @@ export function turnStepVerb(toolName: string): string {
 }
 
 /**
- * U4 turn aggregation: the tool activity of one agent turn (every tool call
+ * U4/U6 turn aggregation: the tool activity of one agent turn (every tool call
  * between two user prompts) collapses to a single line — step count, total
  * wall time, and a verb summary — with Ctrl+O expanding the individual tool
- * blocks. Settled tools hide themselves while the group is collapsed; the
- * summary component owns the visible line. While the turn is still running,
- * a live tool keeps its own body (the running preview stays watchable) and
- * merges into the line once it settles.
+ * blocks. U6 folds the turn's thinking into the same line: thinking segments
+ * count into `思考 N 段` (collapsed view renders no per-block thinking rows at
+ * all; the full traces only appear expanded), and a thinking-only turn
+ * renders the line without the ⚙ prefix. Settled tools hide themselves while
+ * the group is collapsed; the summary component owns the visible line. While
+ * the turn is still running, a live tool keeps its own body (the running
+ * preview stays watchable) and merges into the line once it settles.
  */
 export class TurnActivityState {
 	readonly steps: TurnStep[] = [];
 	readonly startedAt: number;
 	private lastSettledAt: number | undefined;
+	private turnEndedAt: number | undefined;
+	private thinkingSegments = 0;
+	private liveThinkingSegments = 0;
 	private collapsed = true;
 
 	constructor(startedAt = Date.now()) {
@@ -48,6 +53,32 @@ export class TurnActivityState {
 
 	addStep(step: TurnStep): void {
 		this.steps.push(step);
+	}
+
+	/** Thinking blocks of a settled assistant message land here (U6). */
+	addThinkingSegments(count: number): void {
+		if (count > 0) {
+			this.thinkingSegments += count;
+		}
+	}
+
+	/**
+	 * The run ended (agent_end / replay turn boundary). A tool turn already
+	 * freezes its duration on the last settled step; a thinking-only turn has
+	 * no steps, so this stamp is what stops its `思考 Xs` clock.
+	 */
+	markTurnEnded(timestamp = Date.now()): void {
+		this.turnEndedAt = timestamp;
+	}
+
+	/** Thinking blocks of the message still streaming (U6); the live count is replaced, not accumulated. */
+	setLiveThinkingSegments(count: number): void {
+		this.liveThinkingSegments = Math.max(0, count);
+	}
+
+	/** Thinking segments counted so far: settled messages plus the streaming one. */
+	get totalThinkingSegments(): number {
+		return this.thinkingSegments + this.liveThinkingSegments;
 	}
 
 	markRunning(toolCallId: string, timestamp = Date.now()): void {
@@ -95,17 +126,33 @@ export class TurnActivityState {
 		return [...counts.entries()].map(([verb, count]) => (count > 1 ? `${verb}×${count}` : verb)).join(" · ");
 	}
 
+	private durationSeconds(): string {
+		// A tool turn freezes on its last settled step; a thinking-only turn
+		// freezes on markTurnEnded (agent_end / replay turn boundary).
+		const end = this.steps.length > 0 ? (this.lastSettledAt ?? Date.now()) : (this.turnEndedAt ?? Date.now());
+		return `${(Math.max(0, end - this.startedAt) / 1000).toFixed(1)}s`;
+	}
+
 	summaryText(): string {
 		const count = this.steps.length;
-		const running = this.steps.some((step) => step.status === "running" || step.status === "queued");
-		const duration =
-			this.lastSettledAt !== undefined
-				? Math.max(0, this.lastSettledAt - this.startedAt)
-				: Date.now() - this.startedAt;
-		const middle = running
-			? `运行中 —— ${this.verbSummary()}`
-			: `${(duration / 1000).toFixed(1)}s —— ${this.verbSummary()}`;
-		return `⚙ 本轮 ${count} 步 · ${middle}`;
+		const segments = this.totalThinkingSegments;
+		if (count === 0) {
+			// A thinking-only turn: `思考 36.3s` / `思考 5 段 · 96.3s`.
+			return segments > 0
+				? segments > 1
+					? `思考 ${segments} 段 · ${this.durationSeconds()}`
+					: `思考 ${this.durationSeconds()}`
+				: "";
+		}
+		const parts = [`⚙ ${count} 步 · ${this.durationSeconds()}`];
+		const verbs = this.verbSummary();
+		if (verbs) {
+			parts.push(verbs);
+		}
+		if (segments > 0) {
+			parts.push(`思考 ${segments} 段`);
+		}
+		return parts.join(" · ");
 	}
 }
 
@@ -134,10 +181,12 @@ export class TurnSummaryComponent implements Component {
 		if (this.cachedLines && this.cachedWidth === width && this.state.isSettled) {
 			return this.cachedLines;
 		}
-		const hint = expandCollapseHint("app.tools.expand", this.expanded);
-		const line = ` ${this.state.summaryText()} ${hint}`;
+		const text = this.state.summaryText();
 		const safeWidth = Math.max(1, width);
-		const lines = [theme.fg("muted", truncateToWidth(line, safeWidth, "")), " ".repeat(safeWidth)];
+		// Renders nothing until the turn has something to aggregate; no per-line
+		// expand hint — the single global hint line at the chat tail carries the
+		// Ctrl+O affordance.
+		const lines = text ? [theme.fg("muted", truncateToWidth(` ${text}`, safeWidth, "")), " ".repeat(safeWidth)] : [];
 		if (this.state.isSettled) {
 			this.cachedWidth = width;
 			this.cachedLines = lines;

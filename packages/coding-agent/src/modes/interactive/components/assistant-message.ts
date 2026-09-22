@@ -1,16 +1,7 @@
 import { resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import {
-	type Component,
-	Container,
-	Markdown,
-	type MarkdownTheme,
-	Spacer,
-	Text,
-	truncateToWidth,
-	visibleWidth,
-} from "@earendil-works/pi-tui";
+import { type Component, Container, Markdown, type MarkdownTheme, Spacer, Text } from "@earendil-works/pi-tui";
 import { LOGIN_RECOVERY_MESSAGE } from "../../../core/auth-guidance.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
 import {
@@ -19,7 +10,6 @@ import {
 	shouldCollapseErrorDetails,
 	summarizeErrorDetails,
 } from "./collapsible-error.js";
-import { expandCollapseHint } from "./keybinding-hints.js";
 import type { MermaidMarkdownTransform } from "./mermaid.js";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
@@ -51,49 +41,6 @@ function getThinkingMarkdownTheme(baseTheme: MarkdownTheme): MarkdownTheme {
 		listBullet: quiet,
 		highlightCode: (code: string) => code.split("\n").map((line) => quiet(line)),
 	};
-}
-
-/** Single collapsed-thinking row that truncates the recap to the render width instead of wrapping. */
-class CollapsedThinkingRow implements Component {
-	constructor(
-		private readonly label: string,
-		private readonly recap: string,
-		private readonly hint: string,
-	) {}
-
-	render(width: number): string[] {
-		const safeWidth = Math.max(1, width);
-		const separator = theme.fg("dim", " · ");
-		const fixedWidth = visibleWidth(` ${this.label}${separator} ${this.hint}`);
-		const recapWidth = Math.max(8, safeWidth - fixedWidth);
-		const recap = theme.fg("thinkingText", truncateToWidth(this.recap, recapWidth));
-		return [truncateToWidth(` ${this.label}${separator}${recap} ${this.hint}`, safeWidth, "")];
-	}
-
-	invalidate(): void {}
-}
-
-/**
- * One-line recap for a collapsed thinking block: the last bold section header
- * when the trace has one (reasoning summaries usually do), otherwise the first
- * non-empty line, stripped of markdown emphasis and truncated.
- */
-export function thinkingRecap(thinking: string, fallback: string, maxWidth = 120): string {
-	const lines = thinking
-		.split("\n")
-		.map((line) => line.trim())
-		.filter((line) => line.length > 0);
-	const lastHeader = [...lines].reverse().find((line) => /^\*\*[^*]+\*\*:?$/.test(line) || /^#{1,6}\s+\S/.test(line));
-	const source = lastHeader ?? lines[0] ?? fallback;
-	const plain = source
-		.replace(/^#{1,6}\s+/, "")
-		.replace(/\*\*([^*]+)\*\*/g, "$1")
-		.replace(/\*([^*]+)\*/g, "$1")
-		.replace(/`([^`]+)`/g, "$1")
-		.replace(/\s+/g, " ")
-		.replace(/:$/, "")
-		.trim();
-	return truncateToWidth(plain || fallback, Math.max(20, maxWidth));
 }
 
 function formatInlineLoginRecoveryMessage(message: string): string | undefined {
@@ -139,7 +86,7 @@ export class AssistantMessageComponent extends Container {
 		message?: AssistantMessage,
 		hideThinkingBlock = false,
 		markdownTheme: MarkdownTheme = getMarkdownTheme(),
-		hiddenThinkingLabel = "Thinking...",
+		hiddenThinkingLabel = "思考",
 		options: AssistantMessageComponentOptions = {},
 	) {
 		super();
@@ -231,12 +178,6 @@ export class AssistantMessageComponent extends Container {
 				parts.push(`${i}:text:${content.text.trim() ? 1 : 0}`);
 			} else if (content?.type === "thinking") {
 				parts.push(`${i}:thinking:${content.thinking.trim() ? 1 : 0}`);
-				if (!this.expanded && content.thinking.trim()) {
-					// The collapsed row bakes the recap into a static line, so a recap
-					// change must count as a structural change during streaming.
-					// JSON-encode the free text so it cannot forge part boundaries.
-					parts.push(`${i}:recap:${JSON.stringify(thinkingRecap(content.thinking, this.hiddenThinkingLabel))}`);
-				}
 			} else {
 				parts.push(`${i}:${content?.type ?? "invalid"}`);
 			}
@@ -313,33 +254,23 @@ export class AssistantMessageComponent extends Container {
 				this.lastBlockTexts.set(i, content.text.trim());
 				this.contentContainer.addChild(markdown);
 			} else if (content?.type === "thinking" && content.thinking.trim()) {
-				// U4 noise cut: a visible thinking block renders as ONE recap row by
-				// default; the full Markdown trace only renders in the expanded detail
-				// view (Ctrl+O). hideThinkingBlock hides the row entirely.
+				// U6 noise cut: the collapsed view renders NO thinking rows at all -
+				// the turn's aggregate line carries the segment count (`思考 N 段`).
+				// The full Markdown trace only renders in the expanded detail view
+				// (Ctrl+O). hideThinkingBlock hides it even there.
 				const hasVisibleContentAfter = message.content
 					.slice(i + 1)
 					.some((c) => (c?.type === "text" && c.text.trim()) || (c?.type === "thinking" && c.thinking.trim()));
 
 				const thinkingLabel = theme.bold(theme.fg("thinkingText", this.hiddenThinkingLabel));
 				if (this.hideThinkingBlock) {
-					// Hidden: nothing at all, not even the recap row.
+					// Hidden: nothing at all, not even in the expanded view.
 				} else if (!this.expanded) {
-					// One-line row: bold label, the trace recap, and the expand hint.
-					// The row truncates the recap to the render width so it never wraps
-					// onto a second line on narrow terminals.
-					const recap = thinkingRecap(content.thinking, this.hiddenThinkingLabel);
-					this.contentContainer.addChild(
-						new CollapsedThinkingRow(thinkingLabel, recap, expandCollapseHint("app.tools.expand", false)),
-					);
-					if (hasVisibleContentAfter) {
-						this.contentContainer.addChild(new Spacer(1));
-					}
+					// Collapsed: nothing - the turn's ⚙/思考 line owns the summary.
 				} else {
-					// Expanded: the same label line with the collapse hint, then the trace.
-					// Thinking traces keep Markdown structure but stay visually quiet.
-					this.contentContainer.addChild(
-						new Text(`${thinkingLabel} ${expandCollapseHint("app.tools.expand", true)}`, 1, 0),
-					);
+					// Expanded: the label line, then the trace. Thinking traces keep
+					// Markdown structure but stay visually quiet.
+					this.contentContainer.addChild(new Text(`${thinkingLabel}`, 1, 0));
 					const markdown = new Markdown(
 						content.thinking.trim(),
 						1,
