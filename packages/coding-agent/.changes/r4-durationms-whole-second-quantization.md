@@ -1,0 +1,1 @@
+- Fixed roster session duration to quantize to whole seconds, so a busy session no longer flips the roster compose fingerprint on every unscoped flush and the incremental roster stops degrading to full deltas on slow machines.

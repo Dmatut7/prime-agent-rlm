@@ -484,3 +484,9 @@ fork 工作文档统一搬入 `docs/fork/`：审计总账 `audit-findings.md`、
 - 主模型无视觉时，带图轮自动路由到 settings.imageModel（现为 deepseek-v4.1-flash）；追问轮看不到历史图（官方文档既定设计）。
 - **追问带一张新图＝历史里所有旧图一起重看**（实测 wireImages=2）——"改→再看→对照"零成本成立。
 - 反复看图的活（UI 仿图、验收审查）派视觉子代理工位；playwright 截图传 filename 落盘再 attach（内联超 64K 截断）。
+
+## 2026-09-22 日终补丁批（三席复审对撞欠账闭环）
+
+- **丢图可疑告警补轮内工具结果图**：b89236119 的判据只算派发批携带的图，漏掉本仓旗舰送图路径（attach_image 落进轮内 toolResult、由续跑请求重放的图块）——现在「批带图 ∨ 轮内工具结果带图」任一即武装告警；正反两钉已落（撤修变异实测转红）。
+- **0.11.0 更新日志中『只保留最新 harness digest』条目已随 revert 失效**：发布（10:57 折叠）早于 revert（11:03，`9cf71140f`），已发布段按仓规不可改——下次发版折叠反向 fragment `r4-revert-keep-newest-harness-digest.md` 更正（动机＝与 fork 自研 digest 窗口机制设计冲突、2098 套件 10 红实测；代价＝built context 回多 digest 堆叠约 1.5-2.5k token）；pick 台账 #38 行已同步改记 revert。
+- 三笔欠账 fragment 补齐（digest revert 反向、agents-view 空字段区收起 set/dur 列、时长整秒量化）；五组复审点名缺钉补齐（blockImages 跳过、aborted 跳过、时长量化边界、收起分支、混合区列对齐），全部带变异红正控。

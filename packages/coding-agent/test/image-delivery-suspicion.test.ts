@@ -52,6 +52,7 @@ function createSuspicionSession(
 ): {
 	session: AgentSession;
 	streamCalls: () => number;
+	settingsManager: SettingsManager;
 	dir: string;
 } {
 	const dir = mkdtempSync(join(tmpdir(), "pi-image-delivery-suspicion-"));
@@ -81,10 +82,11 @@ function createSuspicionSession(
 	});
 	const auth = AuthStorage.create(join(dir, "auth.json"));
 	auth.setRuntimeApiKey("anthropic", "test-key");
+	const settingsManager = SettingsManager.create(dir, dir);
 	const session = new AgentSession({
 		agent,
 		sessionManager: SessionManager.inMemory(),
-		settingsManager: SettingsManager.create(dir, dir),
+		settingsManager,
 		cwd: dir,
 		modelRegistry: ModelRegistry.create(auth, join(dir, "models.json")),
 		resourceLoader: createTestResourceLoader(),
@@ -96,9 +98,21 @@ function createSuspicionSession(
 				parameters: Type.Object({}),
 				execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
 			},
+			{
+				// The attach_image shape: a tool result that appends image blocks next
+				// to its text, mirroring the kernel path (imageBlocksFromAttachments).
+				name: "attach",
+				label: "Attach",
+				description: "Returns an image to the model",
+				parameters: Type.Object({}),
+				execute: async () => ({
+					content: [{ type: "text", text: "Loaded 1 image into context" }, IMAGE],
+					details: {},
+				}),
+			},
 		],
 	});
-	return { session, streamCalls, dir };
+	return { session, streamCalls, settingsManager, dir };
 }
 
 function suspicionNotices(session: AgentSession): CustomMessage[] {
@@ -173,6 +187,72 @@ it("does not notice on image-free turns or on responses that did not complete cl
 	} finally {
 		errored.session.dispose();
 		rmSync(errored.dir, { recursive: true, force: true });
+	}
+});
+
+it("does not notice when blockImages replaced the images with placeholders", async () => {
+	// blockImages swaps every image for a text placeholder before the request,
+	// so the provider truthfully counts no image tokens: no suspicion.
+	const fixture = createSuspicionSession([{ usage: {} }]);
+	try {
+		fixture.settingsManager.setBlockImages(true);
+		await fixture.session.prompt("describe", { images: [IMAGE] });
+		expect(suspicionNotices(fixture.session)).toHaveLength(0);
+	} finally {
+		fixture.session.dispose();
+		rmSync(fixture.dir, { recursive: true, force: true });
+	}
+});
+
+it("does not notice on an aborted response", async () => {
+	// An aborted run is not a clean completion either; its usage frame says
+	// nothing about whether images were counted.
+	const fixture = createSuspicionSession([{ usage: {}, stopReason: "aborted" }]);
+	try {
+		await fixture.session.prompt("describe", { images: [IMAGE] });
+		expect(suspicionNotices(fixture.session)).toHaveLength(0);
+	} finally {
+		fixture.session.dispose();
+		rmSync(fixture.dir, { recursive: true, force: true });
+	}
+});
+
+it("notices when a mid-run tool result delivers images the committed batch never carried", async () => {
+	// The flagship attach_image path: the committed batch is image-free, the
+	// model calls a tool whose result carries image blocks, and the continuation
+	// request replays them - so a missing image token count is still suspicious.
+	const fixture = createSuspicionSession([{ usage: {} }, { usage: {} }], {
+		firstResponse: {
+			stopReason: "toolUse",
+			content: [{ type: "toolCall", id: "call-1", name: "attach", arguments: {} }],
+		},
+	});
+	try {
+		await fixture.session.prompt("look at this");
+		expect(fixture.streamCalls()).toBe(2);
+		const notices = suspicionNotices(fixture.session);
+		expect(notices).toHaveLength(1);
+		expect(notices[0].content).toContain("may not have received the images");
+	} finally {
+		fixture.session.dispose();
+		rmSync(fixture.dir, { recursive: true, force: true });
+	}
+});
+
+it("does not notice when the mid-run tool result carries no images", async () => {
+	const fixture = createSuspicionSession([{ usage: {} }, { usage: {} }], {
+		firstResponse: {
+			stopReason: "toolUse",
+			content: [{ type: "toolCall", id: "call-1", name: "noop", arguments: {} }],
+		},
+	});
+	try {
+		await fixture.session.prompt("run the tool");
+		expect(fixture.streamCalls()).toBe(2);
+		expect(suspicionNotices(fixture.session)).toHaveLength(0);
+	} finally {
+		fixture.session.dispose();
+		rmSync(fixture.dir, { recursive: true, force: true });
 	}
 });
 

@@ -1,7 +1,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import type { ModelRegistry } from "../src/core/model-registry.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
@@ -243,6 +243,93 @@ describe("agents view settled/duration/answer columns (U3)", () => {
 		}
 	});
 
+	it("collapses the settled/duration columns when no row in the section carries them", () => {
+		// The 67331915a collapse branch: bare summaries (an older daemon, or a wire
+		// shape without the optional fields) carry neither settled nor duration, so
+		// the section spends no width on the state columns at all.
+		const bareA = summary({
+			id: "bare-a",
+			activeSessionId: "bare-a",
+			sessionId: "bare-a-session",
+			sessionName: "bare-a",
+		});
+		const bareB = summary({
+			id: "bare-b",
+			activeSessionId: "bare-b",
+			sessionId: "bare-b-session",
+			sessionName: "bare-b",
+		});
+		// The trigger state itself: both state cells read blank for every row.
+		for (const bare of [bareA, bareB]) {
+			expect(formatAgentsViewSettledCell(resolveAgentsViewSettled(bare))).toBe("");
+			expect(formatAgentsViewDurationMs(resolveAgentsViewSessionDurationMs(bare))).toBe("");
+		}
+
+		const rows = buildAgentsViewRows([bareA, bareB]);
+		const layout = buildAgentsViewUsageLayout(rows);
+		const legend = stripAnsi(layout.legends.get("idle")!);
+		// The legend leads with the usage block: no set/dur labels, no blank cells.
+		expect(legend).toMatch(/^↑in +↓out · +\$agent · +#sub · +\$total · +age$/);
+		const detail = stripAnsi(layout.details.get(rows[0]!.identity)!);
+		expect(detail).toMatch(/^ +↑0 +↓0 · +\$0\.00 · +0 · +\$0\.00 · *$/);
+		const dotColumns = (text: string) => [...text].flatMap((ch, index) => (ch === "·" ? [index] : []));
+		expect(dotColumns(detail)).toEqual(dotColumns(legend));
+		expect(dotColumns(stripAnsi(layout.details.get(rows[1]!.identity)!))).toEqual(dotColumns(legend));
+
+		// Width actually saved: the same section with one facts-bearing row spends
+		// the state columns' width - the responsive budget the #502 pins protect.
+		const factsRow = summary({
+			id: "facts",
+			activeSessionId: "facts",
+			sessionId: "facts-session",
+			sessionName: "facts",
+			settled: true,
+			durationMs: 7_200_000, // 2h
+		});
+		const factsRows = buildAgentsViewRows([factsRow]);
+		const expanded = buildAgentsViewUsageLayout(factsRows);
+		expect(stripAnsi(expanded.legends.get("idle")!)).toMatch(/^set · +dur · +↑in/);
+		const expandedDetail = stripAnsi(expanded.details.get(factsRows[0]!.identity)!);
+		expect(visibleWidth(expandedDetail)).toBeGreaterThan(visibleWidth(detail));
+	});
+
+	it("keeps the state columns in a mixed section and pads blank cells to the section width", () => {
+		// One row with facts, one bare: `some()` keeps the columns, and the bare
+		// row renders blank cells aligned to the section's column widths instead
+		// of shifting the usage block.
+		const facts = summary({
+			id: "facts",
+			activeSessionId: "facts",
+			sessionId: "facts-session",
+			sessionName: "facts",
+			settled: true,
+			durationMs: 7_200_000, // 2h
+		});
+		const bare = summary({
+			id: "bare",
+			activeSessionId: "bare",
+			sessionId: "bare-session",
+			sessionName: "bare",
+		});
+		const rows = buildAgentsViewRows([facts, bare]);
+		const factsRow = rows.find((row) => row.summary.sessionId === "facts-session")!;
+		const bareRow = rows.find((row) => row.summary.sessionId === "bare-session")!;
+		const layout = buildAgentsViewUsageLayout(rows);
+		const legend = stripAnsi(layout.legends.get("idle")!);
+		expect(legend).toMatch(/^set · +dur · +↑in/);
+		const factsDetail = stripAnsi(layout.details.get(factsRow.identity)!);
+		expect(factsDetail).toContain("✓");
+		expect(factsDetail).toContain("2h");
+		const bareDetail = stripAnsi(layout.details.get(bareRow.identity)!);
+		expect(bareDetail).not.toContain("✓");
+		expect(bareDetail).not.toContain("…");
+		// The blank state cells still occupy the section's columns: the separators
+		// land in the same terminal columns for the legend and both rows.
+		const dotColumns = (text: string) => [...text].flatMap((ch, index) => (ch === "·" ? [index] : []));
+		expect(dotColumns(bareDetail)).toEqual(dotColumns(legend));
+		expect(dotColumns(factsDetail)).toEqual(dotColumns(legend));
+	});
+
 	it("truncates the answer preview line to the terminal width", () => {
 		const preview = `${"A".repeat(300)}TAILMARKER`;
 		const rows = buildAgentsViewRows([
@@ -358,6 +445,36 @@ describe("agents view settled/duration/answer columns (U3)", () => {
 			}),
 		);
 		expect(silentSubagent.settled).toBe(false);
+	});
+
+	it("quantizes a busy session's durationMs to whole seconds so the compose fingerprint only moves once a second", () => {
+		// 18a12dc6c pinned the mechanism only indirectly: the existing whole-day
+		// pins pass with or without the quantization. This pins the boundary
+		// itself (K3/DS reviews, C2-3): 990ms in flight reads as 0, 1999ms reads
+		// as 1000, and two unscoped flushes inside the same second compose the
+		// same fingerprint (the memo serves the same summary object), so a busy
+		// row stops republishing on every flush.
+		const busy = makeState({ activeSessionId: "quantized", sessionFile: "/tmp/quantized.jsonl", isStreaming: true });
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(new Date("2026-05-01T00:00:00.990Z"));
+			expect(summaryForActiveSession(busy).durationMs).toBe(0);
+			vi.setSystemTime(new Date("2026-05-01T00:00:01.999Z"));
+			expect(summaryForActiveSession(busy).durationMs).toBe(1000);
+
+			vi.setSystemTime(new Date("2026-05-01T00:00:05.000Z"));
+			const first = summaryForActiveSession(busy);
+			// 400ms later, still the same second: same fingerprint, memo hit.
+			vi.setSystemTime(new Date("2026-05-01T00:00:05.400Z"));
+			expect(summaryForActiveSession(busy)).toBe(first);
+			// Crossing the whole-second boundary is the one permitted flip.
+			vi.setSystemTime(new Date("2026-05-01T00:00:06.000Z"));
+			const crossed = summaryForActiveSession(busy);
+			expect(crossed).not.toBe(first);
+			expect(crossed.durationMs).toBe(6000);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("formats the duration cell across unit boundaries", () => {
