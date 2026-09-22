@@ -203,6 +203,36 @@ describe("footer telemetry watermark (U6)", () => {
 		expect(off).toContain("950k/1M");
 	});
 
+	it("renders the level at the bar-end notch and ellipsizes the model (P1-A edge, P1-C)", () => {
+		const footer = new FooterComponent(provider);
+		// A 0.95 threshold puts the notch on the last cell; from ~93% the level
+		// also rounds there. The level renders IN the notch cell (warning once
+		// imminent) instead of vanishing off the bar.
+		let snapshot: FooterTelemetrySnapshot = {
+			...SNAPSHOT,
+			contextTokens: 940_000,
+			compactionThresholdTokens: 950_000,
+		};
+		footer.setTelemetrySource(() => ({ mode: "on", snapshot }));
+		const below = footerLine(footer, 100);
+		expect(below).toContain("940k/1M · 94%");
+		expect(below).not.toContain("压缩在即");
+
+		snapshot = { ...SNAPSHOT, contextTokens: 960_000, compactionThresholdTokens: 950_000 };
+		const imminent = footerLine(footer, 100);
+		expect(imminent).toContain("压缩在即");
+		// The level marker survives at the fused cell (plain-text ● present).
+		expect(imminent).toContain("●");
+
+		// P1-C: the model-name truncation carries an ellipsis, never a hard cut.
+		const long = new FooterComponent(provider);
+		long.setTelemetrySource(() => ({
+			mode: "on",
+			snapshot: { ...SNAPSHOT, modelName: "anthropic/claude-3-7-sonnet-20250219" },
+		}));
+		expect(footerLine(long, 40)).toContain("…");
+	});
+
 	it("drops the bar before the figures; the warning never stands alone (F8, DS2)", () => {
 		const footer = new FooterComponent(provider);
 		// A 43-character model name at the 80-column floor: the full form

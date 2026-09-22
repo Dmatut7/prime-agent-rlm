@@ -77,11 +77,19 @@ function watermarkBar(tokens: number, windowTokens: number, thresholdTokens: num
 	// scale and must stay readable in the whole band around the threshold, or
 	// the crossing itself is invisible.
 	const notchWins = levelCell === notchCell;
-	const levelAt = notchWins ? Math.min(cells - 1, levelCell + 1) : levelCell;
+	let levelAt = notchWins ? Math.min(cells - 1, levelCell + 1) : levelCell;
+	// P1-A edge: the displacement clamps back onto the notch when the notch is
+	// the last cell (a 0.95 ratio) - there is no room to the right, so the level
+	// renders IN the notch cell wearing the imminent color: the crossing stays
+	// visible exactly where the scale ends.
+	const fused = notchWins && levelAt === notchCell;
+	if (fused) {
+		levelAt = -1;
+	}
 	let bar = "";
 	for (let i = 0; i < cells; i++) {
 		if (i === notchCell) {
-			bar += theme.fg(imminent ? "warning" : "dim", "│");
+			bar += fused ? theme.fg(imminent ? "warning" : "accent", "●") : theme.fg(imminent ? "warning" : "dim", "│");
 		} else if (i === levelAt) {
 			bar += theme.fg("accent", "●");
 		} else {
@@ -204,7 +212,7 @@ export class FooterComponent implements Component {
 				return candidate;
 			}
 		}
-		return truncateToWidth(`${model}`, safeWidth, "");
+		return truncateToWidth(`${model}`, safeWidth, "…");
 	}
 
 	/**
