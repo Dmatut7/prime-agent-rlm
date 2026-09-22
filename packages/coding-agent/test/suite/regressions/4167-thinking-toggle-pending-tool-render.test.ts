@@ -8,7 +8,7 @@ import type {
 	AgentConnectionSessionEvent,
 } from "../../../src/modes/agent-connection/index.js";
 import { AgentActivityTracker } from "../../../src/modes/interactive/agent-activity.js";
-import type { ToolExecutionComponent } from "../../../src/modes/interactive/components/tool-execution.js";
+import { ToolExecutionComponent } from "../../../src/modes/interactive/components/tool-execution.js";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../../../src/modes/interactive/theme/theme.js";
 
@@ -148,6 +148,17 @@ function renderChat(container: Container): string {
 	return stripAnsi(container.render(120).join("\n"));
 }
 
+function expandRenderedToolComponents(container: Container): void {
+	for (const child of container.children) {
+		if (child instanceof ToolExecutionComponent) {
+			// U4 (41a4bdf24): settled tool blocks hide behind the turn's aggregate
+			// line while collapsed; expand the row to assert the result the live
+			// event / replay delivered. Mirrors the id3 adaptation of the same lane.
+			child.setExpanded(true);
+		}
+	}
+}
+
 describe("InteractiveMode.renderSessionContext", () => {
 	beforeAll(() => {
 		initTheme("dark");
@@ -173,6 +184,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 		});
 
 		expect(fakeThis.pendingTools.has(TOOL_CALL_ID)).toBe(false);
+		expandRenderedToolComponents(fakeThis.chatContainer);
 		expect(renderChat(fakeThis.chatContainer)).toContain("FINAL_RESULT");
 	});
 
@@ -188,6 +200,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 		);
 
 		expect(fakeThis.pendingTools.size).toBe(0);
+		expandRenderedToolComponents(fakeThis.chatContainer);
 		expect(renderChat(fakeThis.chatContainer)).toContain("HISTORICAL_RESULT");
 	});
 });

@@ -21,6 +21,7 @@ import {
 	type CustomMessage,
 	createRlmChildTerminalNoticeMessage,
 	RLM_CHILD_FAILURE_CUSTOM_TYPE,
+	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
 } from "../../src/core/messages.js";
 import { createHarness, getAssistantTexts, getUserTexts, type Harness } from "./harness.js";
 
@@ -302,7 +303,23 @@ describe("P0-3b Esc, failure wakes and queue pinning", () => {
 
 		parent.session.requestAbort();
 		parent.session.maybeAbandonStaleDeferredRlmTerminalNotices(Date.now() + 6 * 60_000);
-		expect(parent.session.rlmTerminalNoticeAbandonment).toMatchObject({ count: 1 });
+		// #2386/#33 (57bdfed04): a cancelled turn now hands its undelivered prefix
+		// records back, so the Esc above returns the wake's folded failure notice
+		// to the deferred queue before the wake turn ever dispatched (its text
+		// never reached the transcript). The abandonment driver then settles both
+		// classes: the routine notice is abandoned and must not reach the
+		// transcript, while the failure notice - the only record the child died -
+		// is persisted instead of dropped (the pre-#33 silent drop was the bug).
+		expect(parent.session.rlmTerminalNoticeAbandonment).toMatchObject({ count: 2 });
+		expect(failureNotices(parent.session)).toHaveLength(1);
+		expect(
+			parent.session.messages.filter(
+				(message) =>
+					typeof message === "object" &&
+					message !== null &&
+					(message as { customType?: unknown }).customType === RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
+			),
+		).toHaveLength(0);
 		expect(parent.session.getPendingNextTurnMessageSnapshots()).toEqual([]);
 		expect(parent.session.isSessionActive).toBe(false);
 	});

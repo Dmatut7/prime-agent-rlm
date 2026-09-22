@@ -417,13 +417,22 @@ describe("planEmergencyShrink equivalence with the pre-linearization walk", () =
 	});
 });
 
-/** Smallest of the runs: the least contaminated by GC and by whatever else is on the machine. */
+/**
+ * Smallest of the runs in CPU time (user+system), converted to ms: the least
+ * contaminated by GC, and immune to preemption by whatever else is on the
+ * machine. Wall-clock made the decade ratio load-sensitive - the small tiers
+ * best-of'd a clean scheduler slice while the 100k tier could not, inflating
+ * growthOverLinear past 2 on a fully loaded host (measured 0.91/2.21 under
+ * 10-core saturation); the planner itself stayed linear. The judge's budget
+ * (at most 2x per decade on top of linear) is unchanged - only the clock is.
+ */
 function timeBestOf(fn: () => unknown, iters: number): number {
 	let best = Number.POSITIVE_INFINITY;
 	for (let i = 0; i < iters; i++) {
-		const started = performance.now();
+		const started = process.cpuUsage();
 		fn();
-		best = Math.min(best, performance.now() - started);
+		const spent = process.cpuUsage(started);
+		best = Math.min(best, (spent.user + spent.system) / 1000);
 	}
 	return best;
 }
@@ -469,7 +478,7 @@ describe("planEmergencyShrink cost", () => {
 			growthOverLinear(times[0], times[1], tiers[1] / tiers[0]),
 			growthOverLinear(times[1], times[2], tiers[2] / tiers[1]),
 		];
-		const detail = `tiers=${tiers.join("/")} ms=${times.map((t) => t.toFixed(1)).join("/")} growthOverLinear=${growths
+		const detail = `tiers=${tiers.join("/")} cpuMs=${times.map((t) => t.toFixed(1)).join("/")} growthOverLinear=${growths
 			.map((g) => g.toFixed(2))
 			.join("/")}`;
 		// The judge: per decade of entries, time may at most double on top of the
@@ -497,7 +506,7 @@ describe("planEmergencyShrink cost", () => {
 		}
 		const refGrowth = growthOverLinear(reference[0], reference[2], tiers[2] / tiers[0]);
 		const newGrowth = growthOverLinear(linearized[0], linearized[2], tiers[2] / tiers[0]);
-		const detail = `reference ms=${reference.map((t) => t.toFixed(1)).join("/")} linearized ms=${linearized
+		const detail = `reference cpuMs=${reference.map((t) => t.toFixed(1)).join("/")} linearized cpuMs=${linearized
 			.map((t) => t.toFixed(1))
 			.join("/")}`;
 		// cuts x entries: quadrupling the branch multiplies the walk by ~16, so the
