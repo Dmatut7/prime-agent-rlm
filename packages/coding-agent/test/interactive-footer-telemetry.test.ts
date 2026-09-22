@@ -207,6 +207,12 @@ describe("footer telemetry watermark (U6)", () => {
 		const { InteractiveMode } = await import("../src/modes/interactive/interactive-mode.js");
 		const settingsManager = {
 			getFooterTelemetry: vi.fn(() => "on"),
+			getCompactionEnabled: vi.fn(() => true),
+			getHideThinkingBlock: vi.fn(() => false),
+			getShowHardwareCursor: vi.fn(() => true),
+			getClearOnShrink: vi.fn(() => false),
+			getEditorPaddingX: vi.fn(() => 1),
+			getAutocompleteMaxVisible: vi.fn(() => 5),
 			getCompactionSettings: vi.fn(() => ({
 				enabled: true,
 				reserveTokens: 0,
@@ -215,7 +221,7 @@ describe("footer telemetry watermark (U6)", () => {
 			})),
 		};
 		const mode: Record<string, unknown> = {
-			uiServices: { settingsManager },
+			uiServices: { settingsManager, getInitialCwd: vi.fn(() => "/tmp") },
 			connectionState: {
 				model: { id: "bailian/glm-5.3-prime", reasoning: true },
 				thinkingLevel: "max",
@@ -232,8 +238,9 @@ describe("footer telemetry watermark (U6)", () => {
 				setClearOnShrink: vi.fn(),
 			},
 			defaultEditor: { setPaddingX: vi.fn(), setAutocompleteMaxVisible: vi.fn() },
-			editor: undefined,
 		};
+		// `editor` defaults to `defaultEditor`: the rebind branch stays skipped.
+		mode.editor = mode.defaultEditor;
 		Object.setPrototypeOf(mode, InteractiveMode.prototype);
 		const source = (
 			InteractiveMode.prototype as unknown as {
