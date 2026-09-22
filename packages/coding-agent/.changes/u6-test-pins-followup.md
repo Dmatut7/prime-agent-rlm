@@ -1,0 +1,1 @@
+- Follow-up test pins for the U6 suffix removal: the bash execution tally, the refinement outcome one-liner, and the ENG-4583 regression now assert the hint-free rows instead of the deleted per-line expand hints.
