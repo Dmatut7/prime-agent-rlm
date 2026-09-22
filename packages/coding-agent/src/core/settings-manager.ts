@@ -2550,7 +2550,18 @@ export class SettingsManager {
 	getToolTimeoutSettings(): { enabled: boolean; afterMs: number; perTool?: Record<string, number> } {
 		const timeout = this.settings.tools?.timeout;
 		const enabled = timeout?.enabled ?? true;
-		const raw = timeout?.afterMs ?? DEFAULT_TOOL_TIMEOUT_AFTER_MS;
+		// Blind-1, medium: a non-numeric `afterMs` (e.g. "not-a-number" in
+		// settings.json) survives every `<= 0` gate (NaN comparisons are false) and
+		// lands in setTimeout(NaN) ~ 1ms - every tool call killed instantly, with
+		// "per-call budget NaNms" and no warning. Coerce, then require a finite
+		// positive number; anything else falls back to the documented default.
+		const raw = Number(timeout?.afterMs ?? DEFAULT_TOOL_TIMEOUT_AFTER_MS);
+		if (!Number.isFinite(raw))
+			return {
+				enabled,
+				afterMs: DEFAULT_TOOL_TIMEOUT_AFTER_MS,
+				...(timeout?.perTool === undefined ? {} : { perTool: timeout.perTool }),
+			};
 		if (raw <= 0)
 			return { enabled, afterMs: 0, ...(timeout?.perTool === undefined ? {} : { perTool: timeout.perTool }) };
 		const afterMs = Math.min(TOOL_TIMEOUT_MAX_AFTER_MS, Math.max(TOOL_TIMEOUT_MIN_AFTER_MS, raw));

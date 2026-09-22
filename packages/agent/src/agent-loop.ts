@@ -95,14 +95,18 @@ const TOOL_TIMEOUT_HARVEST_LABELS = {
  * `tools.timeout` handles stay the single rollback lever.
  */
 function resolveToolTimeoutMs(tool: AgentTool<any>, config?: AgentLoopConfig): number | undefined {
+	// Blind-1, medium: NaN is `typeof "number"` and NaN <= 0 is false, so a
+	// non-numeric budget slipped past every `<= 0` gate and setTimeout(NaN) fired
+	// at ~1ms. Finite-and-positive is the real "armed" predicate at every rank.
 	const fallback = config?.toolTimeout?.afterMs;
-	if (typeof fallback !== "number" || fallback <= 0) return undefined;
+	if (typeof fallback !== "number" || !Number.isFinite(fallback) || fallback <= 0) return undefined;
 	// Operator-side budgets outrank the tool author's own declaration; both rank
 	// above the shared default, and 0 keeps its "this tool never times out" meaning.
 	const operatorBudget = config?.toolTimeout?.perTool?.[tool.name];
-	if (typeof operatorBudget === "number") return operatorBudget > 0 ? operatorBudget : undefined;
+	if (typeof operatorBudget === "number")
+		return Number.isFinite(operatorBudget) && operatorBudget > 0 ? operatorBudget : undefined;
 	const perTool = tool.executionTimeoutMs;
-	if (typeof perTool === "number") return perTool > 0 ? perTool : undefined; // 0 = this tool never times out
+	if (typeof perTool === "number") return Number.isFinite(perTool) && perTool > 0 ? perTool : undefined; // 0 = this tool never times out
 	return fallback;
 }
 /**

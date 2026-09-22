@@ -391,6 +391,9 @@ export interface EmptyResponseRecoveryDetails {
 	terminatedBy: string;
 	/** 1 for the first recovery continuation of this episode; the hard stop is at 2. */
 	recoveryGeneration: number;
+	/** Episode continuation cap the session configured; the message wording must not
+	 * claim "no another one" when the cap allows a second generation. */
+	maxContinuations?: number;
 	provider?: string;
 	model?: string;
 	requestBudget?: { used: number; maxRequests?: number };
@@ -425,7 +428,9 @@ export function createEmptyResponseRecoveryMessage(
 			"2. Save any in-progress work now (files, notes) so a later failure does not lose it.",
 			"3. Continue the task. If the provider still answers empty, say what is blocking you in your reply instead of ending the turn silently.",
 			"4. If you are a subagent, report this state to your parent with one short status line.",
-			`This is an automatic one-shot continuation (generation ${details.recoveryGeneration}); the system will not send another for this episode.`,
+			Number.isFinite(details.maxContinuations) && (details.maxContinuations ?? 1) > details.recoveryGeneration
+				? `This is an automatic continuation (generation ${details.recoveryGeneration} of at most ${details.maxContinuations}); a further one may follow only if this turn itself exhausts the ladder.`
+				: `This is an automatic one-shot continuation (generation ${details.recoveryGeneration}); the system will not send another for this episode.`,
 		].join("\n"),
 		display: true,
 		details,

@@ -171,6 +171,66 @@ describe("empty-response terminal notice reports the real ladder facts", () => {
 		expect(lastText).toContain("recovered after the recovery turn");
 	});
 
+	it("the recovery wording tells the truth about the episode cap", async () => {
+		// Blind-1, low: the message hardcodes "the system will not send another for
+		// this episode", which lies when maxContinuations allows a second generation.
+		// Default cap 1 keeps the one-shot wording; cap 2 must say a further one may
+		// follow. The pin reads the queued custom message's own text.
+		const oneShot = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1, emptyTurn: { escalatedAttempts: 0 } } },
+		});
+		harnesses.push(oneShot);
+		oneShot.setResponses([exhaustedEmptyTurn(), fauxAssistantMessage("done")]);
+		await oneShot.session.promptAndWait("do the task");
+		await vi.waitFor(
+			() => {
+				expect(
+					oneShot.session.messages.some(
+						(m) => (m as { customType?: string }).customType === EMPTY_RESPONSE_RECOVERY_CUSTOM_TYPE,
+					),
+				).toBe(true);
+			},
+			{ timeout: 5_000, interval: 20 },
+		);
+		const oneShotText = JSON.stringify(
+			oneShot.session.messages.find(
+				(m) => (m as { customType?: string }).customType === EMPTY_RESPONSE_RECOVERY_CUSTOM_TYPE,
+			) ?? null,
+		);
+		expect(oneShotText).toContain("will not send another for this episode");
+
+		const capped = await createHarness({
+			settings: {
+				retry: {
+					enabled: true,
+					maxRetries: 3,
+					baseDelayMs: 1,
+					emptyTurn: { escalatedAttempts: 0, recovery: { enabled: true, maxContinuations: 2 } },
+				},
+			},
+		});
+		harnesses.push(capped);
+		capped.setResponses([exhaustedEmptyTurn(), fauxAssistantMessage("done")]);
+		await capped.session.promptAndWait("do the task");
+		await vi.waitFor(
+			() => {
+				expect(
+					capped.session.messages.some(
+						(m) => (m as { customType?: string }).customType === EMPTY_RESPONSE_RECOVERY_CUSTOM_TYPE,
+					),
+				).toBe(true);
+			},
+			{ timeout: 5_000, interval: 20 },
+		);
+		const cappedText = JSON.stringify(
+			capped.session.messages.find(
+				(m) => (m as { customType?: string }).customType === EMPTY_RESPONSE_RECOVERY_CUSTOM_TYPE,
+			) ?? null,
+		);
+		expect(cappedText).toContain("generation 1 of at most 2");
+		expect(cappedText).not.toContain("will not send another for this episode");
+	});
+
 	it("counts the recovery continuations that already failed when it reports the terminal", async () => {
 		const sendAgentMessage = terminalNoticeSpy();
 		const harness = await createHarness({

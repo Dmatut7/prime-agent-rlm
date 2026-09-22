@@ -18268,6 +18268,7 @@ export class AgentSession {
 			escalatedAttempts: details.escalatedAttempts,
 			escalatedWaitedMs: details.escalatedWaitedMs,
 			terminatedBy: details.terminatedBy,
+			maxContinuations: settings.maxContinuations,
 			recoveryGeneration,
 			...(message.provider === undefined ? {} : { provider: message.provider }),
 			...(message.model === undefined ? {} : { model: message.model }),

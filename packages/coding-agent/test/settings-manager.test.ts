@@ -925,6 +925,14 @@ describe("SettingsManager", () => {
 					{ enabled: false, afterMs: 0 },
 					{ enabled: false, afterMs: 0 },
 				],
+				// Blind-1, medium: non-numeric afterMs must fall back to the default,
+				// not survive every `<= 0` gate as NaN and fire setTimeout(NaN) at ~1ms.
+				[
+					{ afterMs: "not-a-number" as unknown as number },
+					{ enabled: true, afterMs: DEFAULT_TOOL_TIMEOUT_AFTER_MS },
+				],
+				[{ afterMs: Number.NaN }, { enabled: true, afterMs: DEFAULT_TOOL_TIMEOUT_AFTER_MS }],
+				[{ afterMs: Number.POSITIVE_INFINITY }, { enabled: true, afterMs: DEFAULT_TOOL_TIMEOUT_AFTER_MS }],
 			];
 			expect(cases.length).toBeGreaterThan(0);
 			for (const [configured, expected] of cases) {
