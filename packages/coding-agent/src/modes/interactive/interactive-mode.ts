@@ -2894,6 +2894,7 @@ export class InteractiveMode {
 		this.footer.setAutoCompactEnabled(
 			this.connectionState?.autoCompactionEnabled ?? this.settingsManager.getCompactionEnabled(),
 		);
+
 		this.footerDataProvider.setCwd(this.getCurrentCwd());
 		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
 		this.ui.setShowHardwareCursor(this.settingsManager.getShowHardwareCursor());
@@ -3083,6 +3084,7 @@ export class InteractiveMode {
 		// Anything counted so far is now reflected in the snapshot; only later output is in-flight.
 		this.contextUsageTokenBaseline = this.activityTracker.getStatus().tokens;
 		this.patchConnectionState({ contextUsage: stats.contextUsage });
+
 		// U2: the session's trailing tool-error streak is authoritative; an older
 		// daemon without the field keeps the locally counted value.
 		if (typeof stats.consecutiveToolErrors === "number") {
@@ -6174,12 +6176,25 @@ export class InteractiveMode {
 						if (!errorMessage) {
 							errorMessage = this.streamingMessage.errorMessage || "Error";
 						}
+						// P1-B (Qwen review): a message that dies mid-turn leaves its
+						// steps "running" forever in the live path (the replay marks
+						// them error from stopReason) - the ⚙ line never settles and
+						// the live tool rows stay unfolded. Mark every still-pending
+						// step error so the aggregate ends with ✗N, exactly like the
+						// replay face, and stamp the turn's clock.
+						const endedAt = Number(event.message.timestamp) || Date.now();
+						for (const step of this.currentTurnState?.steps ?? []) {
+							if (step.status === "queued" || step.status === "running") {
+								this.currentTurnState?.setStepStatus(step.toolCallId, "error", endedAt);
+							}
+						}
 						for (const [, component] of this.pendingTools.entries()) {
 							component.updateResult({
 								content: [{ type: "text", text: errorMessage }],
 								isError: true,
 							});
 						}
+						this.currentTurnState?.markTurnEnded(endedAt);
 						this.resetPendingToolState();
 					} else {
 						// Args are now complete - trigger diff computation for edit tools
