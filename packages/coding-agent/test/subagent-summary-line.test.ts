@@ -63,26 +63,28 @@ describe("SubagentSummaryLine", () => {
 
 		line.setSubagentCounts({ total: 1, running: 1, idle: 0, inactive: 0 });
 		let rendered = line.render(120).map(stripAnsi);
-		expect(rendered).toHaveLength(3);
-		expect(rendered[0]).toContain("╭─ subagents ─");
-		expect(rendered[1]).toContain("● 1 running   ◐ 0 idle   ○ 0 inactive");
+		expect(rendered).toHaveLength(1);
+		expect(rendered[0]).toContain("运行 1");
+		expect(rendered[0]).toContain("运行 1");
+		expect(rendered[0]).not.toContain("空闲");
 
 		line.setSubagentCounts({ total: 2, running: 1, idle: 1, inactive: 0 });
 		rendered = line.render(120).map(stripAnsi);
-		expect(rendered[1]).toContain("● 1 running   ◐ 1 idle   ○ 0 inactive");
+		expect(rendered[0]).toContain("运行 1 · 空闲 1");
+		expect(rendered[0]).not.toContain("收口");
 	});
 
-	it("hints ↓ select when unfocused and Enter/→ open when focused", () => {
+	it("hints ↓ 选择 when unfocused and Enter/→ 打开 when focused", () => {
 		const line = new SubagentSummaryLine();
 		line.setSubagentCounts({ total: 1, running: 1, idle: 0, inactive: 0 });
 		line.setOpenable(true);
 
-		expect(stripAnsi(line.render(120)[1])).toContain("↓ select");
+		expect(stripAnsi(line.render(120)[0])).toContain("↓ 选择");
 
 		line.focused = true;
-		const focused = stripAnsi(line.render(120)[1]);
-		expect(focused).toContain("open");
-		expect(focused).not.toContain("↓ select");
+		const focused = stripAnsi(line.render(120)[0]);
+		expect(focused).toContain("打开");
+		expect(focused).not.toContain("↓ 选择");
 	});
 
 	it("keeps the selection background across truncation resets when focused", () => {
@@ -91,7 +93,7 @@ describe("SubagentSummaryLine", () => {
 		line.setOpenable(true);
 		line.focused = true;
 		// Narrow enough that the colored counts truncate and inject a full reset.
-		const content = line.render(20)[1];
+		const content = line.render(20)[0];
 		expect(content).toContain("\x1b[0m");
 		for (const segment of content.split("\x1b[0m").slice(1, -1)) {
 			expect(segment.startsWith("\x1b[4") || segment.startsWith("\x1b[10")).toBe(true);
@@ -178,7 +180,7 @@ describe("SubagentSummaryLine", () => {
 		line.setSubagentCounts({ total: 1, running: 0, idle: 0, inactive: 1 });
 		line.setOpenable(false);
 
-		expect(stripAnsi(line.render(100).join("\n"))).toContain("● 0 running   ◐ 0 idle   ○ 1 inactive");
+		expect(stripAnsi(line.render(100).join("\n"))).toContain("收口 1");
 		expect(line.isSelectable()).toBe(false);
 		line.handleInput("\r");
 		expect(onOpen).not.toHaveBeenCalled();
@@ -205,10 +207,10 @@ describe("SubagentSummaryLine", () => {
 		) => void;
 
 		update.call(mode, child("worker", "running"));
-		expect(stripAnsi(line.render(100).join("\n"))).toContain("● 1 running   ◐ 0 idle   ○ 0 inactive");
+		expect(stripAnsi(line.render(100).join("\n"))).toContain("运行 1");
 
 		update.call(mode, child("worker", "done", { activeSessionId: "active-worker" }));
-		expect(stripAnsi(line.render(100).join("\n"))).toContain("● 0 running   ◐ 1 idle   ○ 0 inactive");
+		expect(stripAnsi(line.render(100).join("\n"))).toContain("空闲 1");
 	});
 
 	it("counts a retained completed child as running while a follow-up turn is active", () => {
@@ -231,13 +233,13 @@ describe("SubagentSummaryLine", () => {
 		) => void;
 
 		update.call(mode, child("worker", "done", { activeSessionId: "resident-worker" }));
-		expect(stripAnsi(line.render(100).join("\n"))).toContain("● 0 running   ◐ 1 idle   ○ 0 inactive");
+		expect(stripAnsi(line.render(100).join("\n"))).toContain("空闲 1");
 
 		update.call(mode, child("worker", "done", { activeSessionId: "resident-worker", activity: { kind: "waiting" } }));
-		expect(stripAnsi(line.render(100).join("\n"))).toContain("● 1 running   ◐ 0 idle   ○ 0 inactive");
+		expect(stripAnsi(line.render(100).join("\n"))).toContain("运行 1");
 
 		update.call(mode, child("worker", "done", { activeSessionId: "resident-worker" }));
-		expect(stripAnsi(line.render(100).join("\n"))).toContain("● 0 running   ◐ 1 idle   ○ 0 inactive");
+		expect(stripAnsi(line.render(100).join("\n"))).toContain("空闲 1");
 	});
 
 	it("refreshes counts when startup seeding follows an early live child update", () => {
@@ -269,7 +271,7 @@ describe("SubagentSummaryLine", () => {
 		Reflect.set(mode, "rlmNodeId", "me");
 		seed.call(mode, [worker]);
 
-		expect(stripAnsi(line.render(100).join("\n"))).toContain("╭─ subagents ─");
+		expect(stripAnsi(line.render(100).join("\n"))).toContain("收口 1");
 	});
 
 	it("marks a stalled grandchild without needing it to be a direct child", () => {
@@ -303,7 +305,7 @@ describe("SubagentSummaryLine", () => {
 		);
 
 		const rendered = stripAnsi(line.render(160).join("\n"));
-		expect(rendered).toContain("● 2 running");
+		expect(rendered).toContain("运行 2");
 		expect(rendered).toContain("grandchild: stalled 90s, in-flight: bash");
 	});
 
@@ -331,7 +333,7 @@ describe("SubagentSummaryLine", () => {
 		update.call(mode, child("worker", "running"));
 		update.call(mode, child("worker", "done"));
 
-		expect(stripAnsi(line.render(100).join("\n"))).toContain("● 0 running   ◐ 0 idle   ○ 1 inactive");
+		expect(stripAnsi(line.render(100).join("\n"))).toContain("收口 1");
 	});
 
 	it("removes a run on the producer's cancelled signal and keeps transcript-backed rows through repeated dones", () => {
@@ -363,7 +365,7 @@ describe("SubagentSummaryLine", () => {
 		update.call(mode, child("worker", "done"));
 		update.call(mode, child("worker", "done"));
 		expect(snapshots.has("worker")).toBe(true);
-		expect(stripAnsi(line.render(100).join("\n"))).toContain("● 0 running   ◐ 0 idle   ○ 1 inactive");
+		expect(stripAnsi(line.render(100).join("\n"))).toContain("收口 1");
 	});
 
 	it("counts parentSessionId-only roster children exactly like the agents view", () => {
@@ -642,21 +644,21 @@ describe("subagent spend cell", () => {
 		line.setSubagentCounts({ total: 2, running: 1, idle: 1, inactive: 0 });
 		line.setSubagentSpend(spend({ cost: 4.56, tokens: 12_300_000, parentCost: 0.54 }));
 
-		const body = stripAnsi(line.render(120)[1]);
-		expect(body).toContain("Σ 子代理 ¥4.56 · 12M tok · 总 ¥5.10");
-		expect(body).toContain("● 1 running   ◐ 1 idle");
+		const body = stripAnsi(line.render(120)[0]);
+		expect(body).toContain("子代理 ¥4.56 · 12M tok ｜ 全部 ¥5.10");
+		expect(body).toContain("运行 1 · 空闲 1");
 	});
 
 	it("keeps the cell blank for an all-zero summary and never shows ¥0.00", () => {
 		const line = new SubagentSummaryLine();
 		line.setSubagentCounts({ total: 1, running: 0, idle: 1, inactive: 0 });
 		line.setSubagentSpend(spend({}));
-		expect(stripAnsi(line.render(120)[1])).not.toContain("¥");
+		expect(stripAnsi(line.render(120)[0])).not.toContain("¥");
 
 		// An all-unpriced family: tokens plus the warning, no ¥0.00 figure.
 		line.setSubagentSpend(spend({ tokens: 8_100_000, unpriced: [{ model: "kimi-k3", tokens: 8_100_000 }] }));
-		const body = stripAnsi(line.render(120)[1]);
-		expect(body).toContain("Σ 子代理 8.1M tok (kimi-k3 8.1M tok 未定价)");
+		const body = stripAnsi(line.render(120)[0]);
+		expect(body).toContain("子代理 8.1M tok (kimi-k3 8.1M tok 未定价)");
 		expect(body).not.toContain("¥");
 	});
 
@@ -672,9 +674,9 @@ describe("subagent spend cell", () => {
 				unpriced: [{ model: "kimi-k3", tokens: 8_100_000 }],
 			}),
 		);
-		const body = stripAnsi(line.render(120)[1]);
-		expect(body).toContain("Σ 子代理 ≈¥4.56 · ≈12M tok · 总 ≈¥5.10");
-		const raw = line.render(120)[1];
+		const body = stripAnsi(line.render(120)[0]);
+		expect(body).toContain("子代理 ≈¥4.56 · ≈12M tok ｜ 全部 ≈¥5.10");
+		const raw = line.render(120)[0];
 		expect(raw).toContain(theme.fg("warning", "(kimi-k3 8.1M tok 未定价)"));
 		expect(raw).toContain(theme.fg("accent", "¥4.56"));
 	});
@@ -693,26 +695,29 @@ describe("subagent spend cell", () => {
 		line.setOpenable(true);
 
 		// 120: everything fits.
-		const wide = stripAnsi(line.render(120)[1]);
-		expect(wide).toContain("Σ 子代理 ¥4.56 · 12M tok · 总 ¥5.10 (kimi-k3 8.1M tok 未定价)");
-		// 100: "总" is the first cut, then the annotation's token counts.
-		const medium = stripAnsi(line.render(100)[1]);
-		expect(medium).toContain("Σ 子代理 ¥4.56 · 12M tok");
-		expect(medium).not.toContain("总 ¥");
-		expect(medium).toContain("(kimi-k3 未定价)");
-		expect(medium).not.toContain("8.1M");
-		// 80: annotation gone, primary survives.
-		const narrow = stripAnsi(line.render(80)[1]);
-		expect(narrow).toContain("Σ 子代理 ¥4.56 · 12M tok");
+		const wide = stripAnsi(line.render(120)[0]);
+		expect(wide).toContain("子代理 ¥4.56 · 12M tok ｜ 全部 ¥5.10 (kimi-k3 8.1M tok 未定价)");
+		// 90: the 全部 figure is the first cut.
+		const medium = stripAnsi(line.render(90)[0]);
+		expect(medium).toContain("子代理 ¥4.56 · 12M tok");
+		expect(medium).not.toContain("全部 ¥");
+		expect(medium).toContain("(kimi-k3 8.1M tok 未定价)");
+		// 80: then the annotation's token counts.
+		const annotationlessTokens = stripAnsi(line.render(80)[0]);
+		expect(annotationlessTokens).toContain("(kimi-k3 未定价)");
+		expect(annotationlessTokens).not.toContain("8.1M");
+		// 70: annotation gone, primary survives.
+		const narrow = stripAnsi(line.render(70)[0]);
+		expect(narrow).toContain("子代理 ¥4.56 · 12M tok");
 		expect(narrow).not.toContain("未定价");
-		// 60: with three count groups there is no room; the cell is dropped, never half-truncated.
-		const tight = stripAnsi(line.render(60)[1]);
-		expect(tight).not.toContain("Σ");
-		expect(tight).toContain("↓ select");
-		for (const width of [120, 100, 80, 60]) {
-			const body = stripAnsi(line.render(width)[1]);
-			expect(body).toContain("↓ select");
-			expect(visibleWidth(line.render(width)[1])).toBeLessThanOrEqual(width);
+		// 55: with three count groups there is no room; the cell is dropped, never half-truncated.
+		const tight = stripAnsi(line.render(55)[0]);
+		expect(tight).not.toContain("¥");
+		expect(tight).toContain("↓ 选择");
+		for (const width of [120, 90, 70, 55]) {
+			const body = stripAnsi(line.render(width)[0]);
+			expect(body).toContain("↓ 选择");
+			expect(visibleWidth(line.render(width)[0])).toBeLessThanOrEqual(width);
 		}
 	});
 
@@ -721,19 +726,19 @@ describe("subagent spend cell", () => {
 		line.setSubagentCounts({ total: 1, running: 1, idle: 0, inactive: 0 });
 		line.setSubagentSpend(spend({ cost: 4.56, tokens: 999_000, parentCost: 0.2 }));
 		line.setOpenable(true);
-		const before = stripAnsi(line.render(120)[1]);
-		const beforeRaw = line.render(120)[1];
+		const before = stripAnsi(line.render(120)[0]);
+		const beforeRaw = line.render(120)[0];
 
 		line.setSubagentSpend(spend({ cost: 12.34, tokens: 1_020_000, parentCost: 1.2 }));
-		const after = stripAnsi(line.render(120)[1]);
-		const afterRaw = line.render(120)[1];
+		const after = stripAnsi(line.render(120)[0]);
+		const afterRaw = line.render(120)[0];
 
 		expect(before).toContain("¥4.56");
 		expect(after).toContain("¥12.34");
 		// Line length is padded to the inner width and the hint is right-anchored:
 		// growth only eats the blank gap between them.
 		expect(before.length).toBe(after.length);
-		expect(before.indexOf("↓ select")).toBe(after.indexOf("↓ select"));
+		expect(before.indexOf("↓ 选择")).toBe(after.indexOf("↓ 选择"));
 		expect(visibleWidth(beforeRaw)).toBe(visibleWidth(afterRaw));
 	});
 
@@ -744,14 +749,14 @@ describe("subagent spend cell", () => {
 		line.setOpenable(true);
 		line.focused = true;
 
-		const content = line.render(100)[1];
+		const content = line.render(100)[0];
 		expect(content).toContain(theme.fg("accent", "¥4.56"));
-		expect(content).toContain(theme.fg("dim", "总 ¥5.10"));
+		expect(content).toContain(theme.fg("dim", "全部 ¥5.10"));
 		// The selection background wraps the whole row (also across the fg resets
 		// the spend segment emits, which never clear the background).
 		const selectedBg = theme.bg("selectedBg", "");
 		expect(content).toContain(selectedBg.slice(0, selectedBg.indexOf("\x1b[49m")));
-		expect(stripAnsi(content)).toContain("Σ 子代理 ¥4.56 · 12M tok · 总 ¥5.10");
+		expect(stripAnsi(content)).toContain("子代理 ¥4.56 · 12M tok ｜ 全部 ¥5.10");
 	});
 
 	/**
@@ -1150,17 +1155,17 @@ describe("spend price overrides", () => {
 			}),
 		);
 
-		const wide = stripAnsi(line.render(120)[1]);
-		expect(wide).toContain("Σ 子代理 ¥9.00 · 2.0M tok · 总 ¥9.00 (kimi-k3 2.0M tok 已改价)");
-		expect(line.render(120)[1]).toContain(theme.fg("accent", "(kimi-k3 2.0M tok 已改价)"));
+		const wide = stripAnsi(line.render(120)[0]);
+		expect(wide).toContain("子代理 ¥9.00 · 2.0M tok ｜ 全部 ¥9.00 (kimi-k3 2.0M tok 已改价)");
+		expect(line.render(120)[0]).toContain(theme.fg("accent", "(kimi-k3 2.0M tok 已改价)"));
 
 		// The marker degrades with the rest of the annotation, and a truncated money
 		// figure is never shown: the cell drops whole rungs, it does not ellipsize.
-		const narrow = stripAnsi(line.render(70)[1]);
-		expect(narrow).toContain("Σ 子代理 ¥9.00 · 2.0M tok");
+		const narrow = stripAnsi(line.render(50)[0]);
+		expect(narrow).toContain("子代理 ¥9.00 · 2.0M tok");
 		expect(narrow).not.toContain("已改价");
-		for (const width of [120, 100, 80, 70, 60]) {
-			expect(visibleWidth(line.render(width)[1])).toBeLessThanOrEqual(width);
+		for (const width of [120, 100, 80, 70, 60, 50]) {
+			expect(visibleWidth(line.render(width)[0])).toBeLessThanOrEqual(width);
 		}
 	});
 });

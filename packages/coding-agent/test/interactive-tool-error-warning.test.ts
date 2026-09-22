@@ -88,7 +88,7 @@ describe("footer tool-error badge (U2)", () => {
 
 	it("rides on the telemetry line when both are present", () => {
 		const footer = new FooterComponent({ getGitBranch: () => null } as never);
-		footer.setTelemetryMode("compact");
+		footer.setTelemetryMode("on");
 		footer.setTelemetry({
 			modelName: "bailian/glm-5.3-prime",
 			contextTokens: 10_000,
@@ -98,7 +98,7 @@ describe("footer tool-error badge (U2)", () => {
 		footer.setToolErrorCount(3);
 		const line = stripAnsi(footer.render(120).join("\n"));
 		expect(footer.render(120)).toHaveLength(1);
-		expect(line).toContain("ctx 10k/100k(10%)");
+		expect(line).toContain("10k/100k · 10%");
 		expect(line).toContain("⚠ 工具错误×3");
 	});
 });

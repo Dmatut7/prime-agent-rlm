@@ -216,7 +216,7 @@ import { ExtensionEditorComponent } from "./components/extension-editor.js";
 import { ExtensionInputComponent } from "./components/extension-input.js";
 import { ExtensionSelectorComponent } from "./components/extension-selector.js";
 import { FEATURE_HINT_ANIMATION_INTERVAL_MS, FeatureHintComponent } from "./components/feature-hint.js";
-import { FooterComponent, type FooterTelemetrySnapshot } from "./components/footer.js";
+import { FooterComponent, type FooterTelemetrySnapshot, formatContextTokens } from "./components/footer.js";
 import { HeartbeatManagerComponent } from "./components/heartbeat-manager.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./components/injected-prompt-message.js";
 import { formatKeyText, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.js";
@@ -246,6 +246,7 @@ import {
 	type SubagentSummaryCounts,
 	SubagentSummaryLine,
 	summarizeSubagentSpend,
+	TrayInfoLine,
 } from "./components/subagent-summary-line.js";
 import { ThinkingSelectorComponent } from "./components/thinking-selector.js";
 import {
@@ -1092,7 +1093,7 @@ export interface InteractiveModeRunResult {
 
 export function formatAgentDepthLabel(depth: number | undefined, hasChildren: boolean): string | undefined {
 	if (depth === undefined || (depth === 0 && !hasChildren)) return undefined;
-	return `depth ${depth}`;
+	return `深度 ${depth}`;
 }
 
 export class InteractiveMode {
@@ -1189,6 +1190,8 @@ export class InteractiveMode {
 	private goalTrayTimer: NodeJS.Timeout | undefined = undefined;
 
 	private streamingComponent: AssistantMessageComponent | undefined = undefined;
+	/** U6: the footer watermark's latest snapshot - the single context source shared with the tray fallback. */
+	private footerTelemetrySnapshot: FooterTelemetrySnapshot | undefined;
 	private streamingMessage: AssistantMessage | undefined = undefined;
 	private sideQuestionComponent: SideQuestionComponent | undefined;
 	private sideQuestionEvent: AgentConnectionSideQuestionEvent | undefined;
@@ -1232,6 +1235,7 @@ export class InteractiveMode {
 
 	// One summary line below the editor, backed by the existing child-status stream.
 	private subagentSummaryLine: SubagentSummaryLine;
+	private trayInfoLine: TrayInfoLine;
 	private subagentSnapshots = new Map<string, AgentConnectionRlmChildAgentSnapshot>();
 	private subagentCounts: SubagentSummaryCounts = { total: 0, running: 0, idle: 0, inactive: 0 };
 	private subagentSpendTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1425,8 +1429,6 @@ export class InteractiveMode {
 			// session's spend to the new chat.
 			getCostUsd: () =>
 				this.topBarCost.sessionId === this.connectionState?.sessionId ? this.topBarCost.total : undefined,
-			// U1: pin the current model on the bar next to the spend.
-			getModel: () => this.getCurrentModel()?.id,
 		});
 		this.chatContainer = new Container();
 		this.shortcutGuideContainer = new Container();
@@ -1460,11 +1462,14 @@ export class InteractiveMode {
 		this.mainViewContainer.addChild(this.statusContainer);
 		this.editorContainer = new Container();
 		this.editorContainer.addChild(this.editor as Component);
-		this.subagentSummaryLine = new SubagentSummaryLine(
+		// U6 status area: ① tray info line (pure navigation), then the footer
+		// watermark (②), then the subagents line (③).
+		this.trayInfoLine = new TrayInfoLine(
 			() => this.getTrayLocationLabel(),
 			() => this.getTrayContextLabel(),
 			() => this.getTrayOverrideLabel(),
 		);
+		this.subagentSummaryLine = new SubagentSummaryLine();
 		this.subagentSummaryLine.setOpenable(this.options.returnToAgentsView === true);
 		this.subagentSummaryLine.onOpen = () => void this.openScopedAgentsView();
 		this.subagentSummaryLine.onCancel = () => this.focusEditor();
@@ -1771,10 +1776,11 @@ export class InteractiveMode {
 			this.mainContainer.addChild(container);
 		}
 		this.mainContainer.addChild(this.editorContainer);
-		this.mainContainer.addChild(this.subagentSummaryLine);
-		this.mainContainer.addChild(this.widgetContainerBelow);
+		this.mainContainer.addChild(this.trayInfoLine);
 		this.footerSlot.addChild(this.footer);
 		this.mainContainer.addChild(this.footerSlot);
+		this.mainContainer.addChild(this.subagentSummaryLine);
+		this.mainContainer.addChild(this.widgetContainerBelow);
 		for (const component of this.getPromptDockComponents()) {
 			this.promptDock.addChild(component);
 		}
@@ -3171,9 +3177,11 @@ export class InteractiveMode {
 
 	/** Refresh the tray's context usage from the session after a turn or compaction completes. */
 	/**
-	 * U1: refresh the persistent footer watermark line (model · context usage ·
-	 * compaction line · GLM storm zone). Cheap: recomputes from connection
-	 * state; call after context usage or model changes and on settings reload.
+	 * U6: refresh the persistent footer watermark line (model · thinking level ·
+	 * bar · context figures). Cheap: recomputes from connection state; call
+	 * after context usage, model, or thinking-level changes and on settings
+	 * reload. The snapshot is stored once so the tray fallback reads the same
+	 * figures (single context source).
 	 */
 	private updateFooterTelemetry(): void {
 		// Partial-mode test harnesses skip the constructor, so these fields can be
@@ -3183,20 +3191,23 @@ export class InteractiveMode {
 		if (!footer || !settingsManager) {
 			return;
 		}
-		// Re-read the density too: a settings-file reload lands on the next refresh.
-		footer.setTelemetryMode(settingsManager.getFooterTelemetry());
+		// Re-read the switch too: a settings-file reload lands on the next refresh.
+		footer.setTelemetryMode?.(settingsManager.getFooterTelemetry?.() ?? "on");
 		const model = this.getCurrentModel();
 		const usage = this.getConnectionContextUsage();
+		const thinkingLevel =
+			model?.reasoning && this.connectionState?.thinkingLevel && this.connectionState.thinkingLevel !== "off"
+				? this.connectionState.thinkingLevel
+				: undefined;
 		const snapshot: FooterTelemetrySnapshot = {
 			modelName: model?.id,
+			thinkingLevel,
 			contextTokens: usage?.tokens ?? undefined,
 			contextWindow: usage?.contextWindow,
-			compactionTriggerRatio: settingsManager.getCompactionTriggerRatio(),
-			// GLM-family tool-call corruption historically storms from ~390k tokens of
-			// accumulated context; mark that zone while a glm model is bound.
-			glmStormTokens: model?.id.toLowerCase().includes("glm") ? 390_000 : undefined,
+			compactionTriggerRatio: settingsManager.getCompactionTriggerRatio?.(),
 		};
-		footer.setTelemetry(snapshot);
+		this.footerTelemetrySnapshot = snapshot;
+		footer.setTelemetry?.(snapshot);
 		footer.setToolErrorCount?.((this as unknown as { consecutiveToolErrors?: number }).consecutiveToolErrors ?? 0);
 	}
 
@@ -3244,7 +3255,6 @@ export class InteractiveMode {
 				this.patchConnectionState({ isStreaming: true, activeToolNames: [] });
 				if (wasNewChat) {
 					this.builtInHeader?.invalidate();
-					this.subagentSummaryLine.invalidate();
 				}
 				break;
 			}
@@ -3253,7 +3263,6 @@ export class InteractiveMode {
 				this.patchConnectionState({ messageCount: this.connectionState.messageCount + 1 });
 				if (wasNewChat) {
 					this.builtInHeader?.invalidate();
-					this.subagentSummaryLine.invalidate();
 				}
 				break;
 			}
@@ -6137,13 +6146,13 @@ export class InteractiveMode {
 
 			case "thinking_level_changed":
 				this.footer.invalidate();
-				this.subagentSummaryLine.invalidate();
+				// The footer watermark carries the model · thinking level now.
+				this.updateFooterTelemetry();
 				this.updateEditorBorderColor();
 				break;
 
 			case "service_tier_changed":
 				this.footer.invalidate();
-				this.subagentSummaryLine.invalidate();
 				break;
 
 			case "bash_start": {
@@ -6613,7 +6622,8 @@ export class InteractiveMode {
 	}
 
 	private syncGoalTray(goal: GoalState): void {
-		this.subagentSummaryLine.invalidate();
+		// The goal label rides the uncached tray info line; a frame request
+		// repaints it, no cache to drop.
 		this.updateGoalTrayTimer(goal);
 	}
 
@@ -6621,7 +6631,6 @@ export class InteractiveMode {
 		if (goal.status === "active") {
 			if (!this.goalTrayTimer) {
 				this.goalTrayTimer = setInterval(() => {
-					this.subagentSummaryLine.invalidate();
 					this.ui.requestRender();
 				}, 1000);
 				this.goalTrayTimer.unref?.();
@@ -7122,43 +7131,16 @@ export class InteractiveMode {
 	}
 
 	private getTrayLocationLabel(): string | undefined {
-		const modelLabel = this.getModelTrayLabel();
+		// U6 ①: pure navigation - the model name and context figures moved to the
+		// footer watermark line; the new-chat shortcuts hint is gone with them.
 		const hasChildren = this.options.sessionHasChildren === true || (this.subagentSnapshots?.size ?? 0) > 0;
 		const depthLabel = formatAgentDepthLabel(this.options.sessionDepth, hasChildren);
-		const shortcutsHint = this.getShortcutsTrayHint();
 		const agentsHint = this.getAgentsViewTrayHint();
-		return [agentsHint, depthLabel, modelLabel, shortcutsHint]
-			.filter((label): label is string => label !== undefined)
-			.join("  ");
-	}
-
-	private getShortcutsTrayHint(): string | undefined {
-		if (!this.isNewChat() || this.editor.getText().length > 0) {
-			return undefined;
-		}
-		return keyText("app.shortcuts") ? keyHint("app.shortcuts", "for shortcuts") : "/hotkeys for shortcuts";
+		return [agentsHint, depthLabel].filter((label): label is string => label !== undefined).join(" · ");
 	}
 
 	private isNewChat(): boolean {
 		return (this.connectionState?.messageCount ?? 0) === 0 && this.connectionState?.isStreaming !== true;
-	}
-
-	private getModelTrayLabel(): string {
-		const model = this.getCurrentModel();
-		if (!model) {
-			return "—";
-		}
-		const parts = [model.name];
-		if (model.reasoning) {
-			const level = this.connectionState?.thinkingLevel ?? "off";
-			if (level !== "off") {
-				parts.push(level);
-			}
-		}
-		if (this.connectionState?.serviceTier === "priority") {
-			parts.push("fast");
-		}
-		return parts.join(" • ");
 	}
 
 	private getAgentsViewTrayHint(): string | undefined {
@@ -7171,12 +7153,27 @@ export class InteractiveMode {
 	private getTrayContextLabel(): string | undefined {
 		const goalLabel = this.getTrayGoalLabel();
 		const heartbeatLabel = this.getTrayHeartbeatLabel();
-		const usage = this.getConnectionContextUsage();
-		const contextLabel =
-			usage && typeof usage.tokens === "number" && typeof usage.percent === "number"
-				? `${formatTokenCount(usage.tokens)} (${Math.round(usage.percent)}%)`
-				: undefined;
+		const contextLabel = this.getTrayContextFallbackLabel();
 		return [goalLabel, heartbeatLabel, contextLabel].filter((label) => label !== undefined).join(" · ") || undefined;
+	}
+
+	/**
+	 * U6 ① right side: the context figures, only while the footer watermark is
+	 * off. Reads the footer's own snapshot - not a fresh usage query - so the
+	 * tray and the footer can never disagree (the boss's 478k vs 518k defect).
+	 */
+	private getTrayContextFallbackLabel(): string | undefined {
+		const settingsManager = this.uiServicesOrUndefined?.settingsManager;
+		if (!settingsManager || settingsManager.getFooterTelemetry() !== "off") {
+			return undefined;
+		}
+		const snapshot = this.footerTelemetrySnapshot;
+		const tokens = snapshot?.contextTokens;
+		const windowTokens = snapshot?.contextWindow ?? 0;
+		if (!snapshot?.modelName || tokens == null || windowTokens <= 0) {
+			return undefined;
+		}
+		return `${formatContextTokens(tokens, windowTokens)} (${Math.round((tokens / windowTokens) * 100)}%)`;
 	}
 
 	private getTrayHeartbeatLabel(): string | undefined {
@@ -7930,12 +7927,10 @@ export class InteractiveMode {
 			this.ctrlCExitHintTimer = undefined;
 			if (!this.isCtrlCExitHintVisible()) {
 				this.ctrlCExitHintExpiresAt = 0;
-				this.subagentSummaryLine.invalidate();
 				this.ui.requestRender();
 			}
 		}, InteractiveMode.EXIT_HINT_DURATION_MS);
 		this.ctrlCExitHintTimer.unref?.();
-		this.subagentSummaryLine.invalidate();
 		this.ui.requestRender();
 	}
 
@@ -7949,7 +7944,6 @@ export class InteractiveMode {
 		}
 		this.ctrlCExitHintExpiresAt = 0;
 		if (options.render !== false) {
-			this.subagentSummaryLine.invalidate();
 			this.ui.requestRender();
 		}
 	}
@@ -8438,7 +8432,8 @@ export class InteractiveMode {
 	}
 
 	private getPromptDockComponents(): Component[] {
-		return [this.editorContainer, this.subagentSummaryLine, this.footerSlot];
+		// U6: ① tray info line, ② footer watermark, ③ subagents line.
+		return [this.editorContainer, this.trayInfoLine, this.footerSlot, this.subagentSummaryLine];
 	}
 
 	/** Enter or leave fullscreen rendering without touching the persisted setting. */
@@ -9067,7 +9062,8 @@ export class InteractiveMode {
 			availableThinkingLevels: state.availableThinkingLevels,
 		});
 		this.footer.invalidate();
-		this.subagentSummaryLine.invalidate();
+		// The footer watermark carries the model · thinking level now.
+		this.updateFooterTelemetry();
 		this.updateEditorBorderColor();
 		// Rebuild so the /effort argument hint reflects the new model's levels.
 		this.setupAutocompleteProvider();
@@ -9333,7 +9329,6 @@ export class InteractiveMode {
 				}
 				this.patchConnectionState({ serviceTier: state.serviceTier });
 				this.footer.invalidate();
-				this.subagentSummaryLine.invalidate();
 				this.showStatus(`Fast mode: ${state.serviceTier === "priority" ? "on" : "off"}`);
 			})
 			.catch((error) => {

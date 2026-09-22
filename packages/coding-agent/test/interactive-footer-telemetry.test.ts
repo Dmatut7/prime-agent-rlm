@@ -18,61 +18,89 @@ function footerLine(component: FooterComponent, width = 120): string {
 
 const SNAPSHOT: FooterTelemetrySnapshot = {
 	modelName: "bailian/glm-5.3-prime",
+	thinkingLevel: "max",
 	contextTokens: 312_000,
 	contextWindow: 1_000_000,
 	compactionTriggerRatio: 0.8,
-	glmStormTokens: 390_000,
 };
 
-describe("footer telemetry watermark (U1)", () => {
+describe("footer telemetry watermark (U6)", () => {
 	beforeAll(() => {
 		initTheme("dark");
 		setKeybindings(new KeybindingsManager());
 	});
 
-	it("renders one persistent compact line: model, ctx usage, compaction line, storm zone", () => {
+	it("renders one persistent line: model · level, watermark bar, context figures", () => {
 		const footer = new FooterComponent(provider);
-		footer.setTelemetryMode("compact");
+		footer.setTelemetryMode("on");
 		footer.setTelemetry(SNAPSHOT);
-		const line = footerLine(footer);
-		expect(footer.render(120)).toHaveLength(1);
-		expect(line).toContain("bailian/glm-5.3-prime");
-		expect(line).toContain("ctx 312k/1M(31%)");
-		expect(line).toContain("压缩线80%");
-		expect(line).toContain("⚡风暴线390k");
+		const lines = footer.render(120);
+		expect(lines).toHaveLength(1);
+		const line = stripAnsi(lines[0] ?? "");
+		expect(line).toContain("bailian/glm-5.3-prime · max");
+		expect(line).toContain("312k/1M · 31%");
+		expect(line).toMatch(/─+●─*│/);
+		expect(line).not.toContain("ctx");
+		// 2026-09-22 老板令: the storm zone (⚡/390k/已越风暴线) is deleted
+		// entirely from the status area - the compaction notch is the only
+		// threshold state left.
+		expect(line).not.toContain("⚡");
+		expect(line).not.toContain("风暴");
+		expect(line).not.toContain("390k");
+		expect(line).not.toContain("压缩线");
 	});
 
-	it("full mode appends the proportional bar; off mode renders nothing", () => {
-		const full = new FooterComponent(provider);
-		full.setTelemetryMode("full");
-		full.setTelemetry(SNAPSHOT);
-		expect(footerLine(full)).toMatch(/\[[█·┊⌁]+\]/);
-
-		const off = new FooterComponent(provider);
-		off.setTelemetryMode("off");
-		off.setTelemetry(SNAPSHOT);
-		expect(off.render(120)).toEqual([]);
-	});
-
-	it("drops the storm marker below the GLM threshold and for non-glm-shaped windows", () => {
+	it("marks the compaction state: reaching the notch adds 压缩在即, below it stays quiet", () => {
 		const footer = new FooterComponent(provider);
-		footer.setTelemetryMode("compact");
-		footer.setTelemetry({ ...SNAPSHOT, contextWindow: 200_000 });
-		expect(footerLine(footer)).not.toContain("风暴线");
+		footer.setTelemetryMode("on");
 
-		footer.setTelemetry({ ...SNAPSHOT, glmStormTokens: undefined });
-		expect(footerLine(footer)).not.toContain("风暴线");
+		footer.setTelemetry({ ...SNAPSHOT, contextTokens: 850_000 });
+		const imminent = footerLine(footer);
+		expect(imminent).toContain("850k/1M · 85%");
+		expect(imminent).toContain("压缩在即");
+
+		footer.setTelemetry({ ...SNAPSHOT, contextTokens: 790_000 });
+		const below = footerLine(footer);
+		expect(below).toContain("79%");
+		expect(below).not.toContain("压缩在即");
+	});
+
+	it("degrades below 80 columns: the bar goes first, then the token figures", () => {
+		const footer = new FooterComponent(provider);
+		footer.setTelemetryMode("on");
+		footer.setTelemetry(SNAPSHOT);
+
+		const wide = footerLine(footer, 100);
+		expect(wide).toContain("●");
+		expect(wide).toContain("312k/1M · 31%");
+
+		const narrow = footerLine(footer, 79);
+		expect(narrow).not.toContain("●");
+		expect(narrow).toContain("312k/1M · 31%");
+		expect(narrow).toContain("bailian/glm-5.3-prime");
+
+		const veryNarrow = footerLine(footer, 24);
+		expect(veryNarrow).not.toContain("312k");
+		expect(veryNarrow).toContain("glm-5.3-prime");
+		expect(veryNarrow.length).toBeLessThanOrEqual(24);
+	});
+
+	it("off mode renders nothing", () => {
+		const footer = new FooterComponent(provider);
+		footer.setTelemetryMode("off");
+		footer.setTelemetry(SNAPSHOT);
+		expect(footer.render(120)).toEqual([]);
 	});
 
 	it("coexists with the /speed line: telemetry first, speed second, both truncated", () => {
 		const footer = new FooterComponent(provider);
-		footer.setTelemetryMode("compact");
-		footer.setTelemetry({ ...SNAPSHOT, glmStormTokens: undefined });
+		footer.setTelemetryMode("on");
+		footer.setTelemetry(SNAPSHOT);
 		footer.setSpeedEnabled(true);
 		footer.setSpeedText("88 tok/s · avg 66");
 		const lines = footer.render(120).map(stripAnsi);
 		expect(lines).toHaveLength(2);
-		expect(lines[0]).toContain("ctx 312k/1M");
+		expect(lines[0]).toContain("312k/1M");
 		expect(lines[1]).toBe("88 tok/s · avg 66");
 		const narrow = footer.render(24).map(stripAnsi);
 		expect(narrow).toHaveLength(2);
@@ -81,32 +109,33 @@ describe("footer telemetry watermark (U1)", () => {
 		}
 	});
 
-	it("unknown tokens render the model without a ctx segment", () => {
+	it("unknown tokens render the model without figures; no level renders the bare model", () => {
 		const footer = new FooterComponent(provider);
-		footer.setTelemetryMode("compact");
+		footer.setTelemetryMode("on");
 		footer.setTelemetry({ modelName: "bailian/glm-5.3-prime", contextTokens: null });
 		const line = footerLine(footer);
-		expect(line).toContain("glm-5.3-prime");
-		expect(line).not.toContain("ctx");
+		expect(line.trim()).toBe("bailian/glm-5.3-prime");
+
+		footer.setTelemetry({ modelName: "bailian/deepseek-v4.1-flash" });
+		expect(footerLine(footer).trim()).toBe("bailian/deepseek-v4.1-flash");
 	});
 });
 
-describe("top bar model pin (U1)", () => {
+describe("top bar (U6: model pin removed)", () => {
 	beforeAll(() => initTheme("dark"));
 
-	it("shows the model dimly next to the spend", () => {
+	it("centers the chat name with the spend and no model segment", () => {
 		const bar = new TopBar({
 			getChatName: () => "chat",
 			getCostUsd: () => 0.42,
-			getModel: () => "bailian/glm-5.3-prime",
 		});
 		const line = stripAnsi(bar.render(120).join("\n"));
 		expect(line).toContain("chat");
 		expect(line).toContain("$0.42");
-		expect(line).toContain("glm-5.3-prime");
+		expect(line).not.toContain("glm");
 	});
 
-	it("omits the model segment when unset", () => {
+	it("omits the spend segment when unset", () => {
 		const bar = new TopBar({ getChatName: () => "chat" });
 		const line = stripAnsi(bar.render(120).join("\n"));
 		expect(line).toContain("chat");
@@ -114,24 +143,27 @@ describe("top bar model pin (U1)", () => {
 });
 
 describe("footer.telemetry setting", () => {
-	it("defaults to compact, persists set values, and falls back on unknown values", async () => {
+	it("defaults to on, persists set values, and folds legacy/garbage values", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "footer-telemetry-"));
 		try {
 			const manager = SettingsManager.create(dir, dir);
-			expect(manager.getFooterTelemetry()).toBe("compact");
+			expect(manager.getFooterTelemetry()).toBe("on");
 
-			manager.setFooterTelemetry("full");
-			expect(manager.getFooterTelemetry()).toBe("full");
+			manager.setFooterTelemetry("off");
+			expect(manager.getFooterTelemetry()).toBe("off");
 			await manager.flush();
 
 			// A fresh manager over the persisted file keeps the value.
 			const reloaded = SettingsManager.create(dir, dir);
-			expect(reloaded.getFooterTelemetry()).toBe("full");
+			expect(reloaded.getFooterTelemetry()).toBe("off");
 
-			// Garbage in the file falls back to compact, never throws.
+			// Legacy compact/full merge to "on"; garbage falls back to "on", never throws.
+			writeFileSync(join(dir, "settings.json"), JSON.stringify({ footer: { telemetry: "compact" } }));
+			expect(SettingsManager.create(dir, dir).getFooterTelemetry()).toBe("on");
+			writeFileSync(join(dir, "settings.json"), JSON.stringify({ footer: { telemetry: "full" } }));
+			expect(SettingsManager.create(dir, dir).getFooterTelemetry()).toBe("on");
 			writeFileSync(join(dir, "settings.json"), JSON.stringify({ footer: { telemetry: "loud" } }));
-			const garbage = SettingsManager.create(dir, dir);
-			expect(garbage.getFooterTelemetry()).toBe("compact");
+			expect(SettingsManager.create(dir, dir).getFooterTelemetry()).toBe("on");
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
@@ -141,25 +173,27 @@ describe("footer.telemetry setting", () => {
 describe("interactive-mode telemetry snapshot wiring", () => {
 	beforeAll(() => initTheme("dark"));
 
-	it("updateFooterTelemetry composes model, usage, compaction ratio, and the glm storm zone", async () => {
+	it("updateFooterTelemetry composes model, level, usage, and compaction ratio", async () => {
 		const { InteractiveMode } = await import("../src/modes/interactive/interactive-mode.js");
 		const footer = {
 			setTelemetryMode: vi.fn(),
 			setTelemetry: vi.fn(),
 		};
 		const settingsManager = {
-			getFooterTelemetry: vi.fn(() => "compact"),
+			getFooterTelemetry: vi.fn(() => "on"),
 			getCompactionTriggerRatio: vi.fn(() => 0.8),
 		};
 		type FakeConnectionState = {
-			model: { id: string };
+			model: { id: string; reasoning?: boolean };
+			thinkingLevel?: string;
 			contextUsage?: { tokens: number; contextWindow: number; percent: number };
 		};
 		const mode: Record<string, unknown> & { connectionState: FakeConnectionState } = {
 			footer,
 			uiServices: { settingsManager },
 			connectionState: {
-				model: { id: "bailian/glm-5.3-prime" },
+				model: { id: "bailian/glm-5.3-prime", reasoning: true },
+				thinkingLevel: "max",
 				contextUsage: { tokens: 312_000, contextWindow: 1_000_000, percent: 31 },
 			},
 			activityTracker: { getStatus: () => ({ tokens: 0 }) },
@@ -171,20 +205,36 @@ describe("interactive-mode telemetry snapshot wiring", () => {
 			.updateFooterTelemetry;
 		update.call(mode);
 
-		expect(footer.setTelemetryMode).toHaveBeenCalledWith("compact");
+		expect(footer.setTelemetryMode).toHaveBeenCalledWith("on");
 		expect(footer.setTelemetry).toHaveBeenCalledWith({
 			modelName: "bailian/glm-5.3-prime",
+			thinkingLevel: "max",
 			contextTokens: 312_000,
 			contextWindow: 1_000_000,
 			compactionTriggerRatio: 0.8,
-			glmStormTokens: 390_000,
+		});
+		// The snapshot is the single context source shared with the tray fallback.
+		expect(mode.footerTelemetrySnapshot).toEqual({
+			modelName: "bailian/glm-5.3-prime",
+			thinkingLevel: "max",
+			contextTokens: 312_000,
+			contextWindow: 1_000_000,
+			compactionTriggerRatio: 0.8,
 		});
 
-		// Non-glm models drop the storm zone marker.
-		mode.connectionState = { model: { id: "bailian/deepseek-v4.1-flash" }, contextUsage: undefined };
+		// Non-glm models compose identically: no per-model markers remain.
+		mode.connectionState = {
+			model: { id: "bailian/deepseek-v4.1-flash", reasoning: true },
+			thinkingLevel: "high",
+			contextUsage: undefined,
+		};
 		update.call(mode);
 		expect(footer.setTelemetry).toHaveBeenLastCalledWith(
-			expect.objectContaining({ modelName: "bailian/deepseek-v4.1-flash", glmStormTokens: undefined }),
+			expect.objectContaining({
+				modelName: "bailian/deepseek-v4.1-flash",
+				thinkingLevel: "high",
+				contextTokens: undefined,
+			}),
 		);
 	});
 });

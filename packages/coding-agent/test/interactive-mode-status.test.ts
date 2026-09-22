@@ -4321,7 +4321,11 @@ describe("InteractiveMode tray goal label", () => {
 			heartbeat?: AgentCronJob | null;
 			contextUsage: TrayUsage | undefined;
 		};
-		uiServices: { getContextUsage(): TrayUsage | undefined };
+		uiServices: {
+			getContextUsage(): TrayUsage | undefined;
+			settingsManager: { getFooterTelemetry(): string };
+		};
+		footerTelemetrySnapshot?: { contextTokens?: number; contextWindow?: number; modelName?: string };
 		getTrayContextLabel(): string | undefined;
 	};
 	const getTrayContextLabel = (InteractiveMode.prototype as unknown as TrayLabelHarness).getTrayContextLabel;
@@ -4361,12 +4365,15 @@ describe("InteractiveMode tray goal label", () => {
 			} satisfies GoalState,
 			contextUsage: undefined,
 		};
-		fakeThis.uiServices = { getContextUsage: () => undefined };
+		fakeThis.uiServices = {
+			getContextUsage: () => undefined,
+			settingsManager: { getFooterTelemetry: () => "on" },
+		};
 
 		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s)");
 	});
 
-	test("combines active goals with token/context usage in one lower-tray label", () => {
+	test("keeps context figures off the tray label while the footer watermark is on", () => {
 		const fakeThis = Object.create(InteractiveMode.prototype) as TrayLabelHarness;
 		fakeThis.heartbeatCatalog = [];
 		fakeThis.subagentSnapshots = new Map<string, never>();
@@ -4383,12 +4390,21 @@ describe("InteractiveMode tray goal label", () => {
 			} satisfies GoalState,
 			contextUsage: { contextWindow: 100_000, tokens: 75_000, percent: 75 },
 		};
-		fakeThis.uiServices = { getContextUsage: () => undefined };
+		fakeThis.uiServices = {
+			getContextUsage: () => undefined,
+			settingsManager: { getFooterTelemetry: () => "on" },
+		};
+		fakeThis.footerTelemetrySnapshot = {
+			modelName: "bailian/glm-5.3-prime",
+			contextTokens: 75_000,
+			contextWindow: 100_000,
+		};
 
-		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s) · 75k (75%)");
+		// U6 single source: the watermark line carries the figures, not the tray.
+		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s)");
 	});
 
-	test("combines active goals, active heartbeats, and context usage in one lower-tray label", () => {
+	test("combines goals, heartbeats, and the snapshot fallback while the watermark is off", () => {
 		const fakeThis = Object.create(InteractiveMode.prototype) as TrayLabelHarness;
 		fakeThis.heartbeatCatalog = [{ job: createHeartbeat("active") }];
 		fakeThis.subagentSnapshots = new Map<string, never>();
@@ -4406,9 +4422,18 @@ describe("InteractiveMode tray goal label", () => {
 			heartbeat: createHeartbeat("active"),
 			contextUsage: { contextWindow: 100_000, tokens: 75_000, percent: 75 },
 		};
-		fakeThis.uiServices = { getContextUsage: () => undefined };
+		fakeThis.uiServices = {
+			getContextUsage: () => undefined,
+			settingsManager: { getFooterTelemetry: () => "off" },
+		};
+		// The fallback reads the footer's own snapshot, not a fresh usage query.
+		fakeThis.footerTelemetrySnapshot = {
+			modelName: "bailian/glm-5.3-prime",
+			contextTokens: 75_000,
+			contextWindow: 100_000,
+		};
 
-		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s) · 1 heartbeat · 75k (75%)");
+		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s) · 1 heartbeat · 75k/100k (75%)");
 	});
 
 	test("omits the usage segment when token count is unknown", () => {
@@ -4428,7 +4453,10 @@ describe("InteractiveMode tray goal label", () => {
 			} satisfies GoalState,
 			contextUsage: { contextWindow: 100_000, tokens: null, percent: null },
 		};
-		fakeThis.uiServices = { getContextUsage: () => undefined };
+		fakeThis.uiServices = {
+			getContextUsage: () => undefined,
+			settingsManager: { getFooterTelemetry: () => "on" },
+		};
 
 		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s)");
 	});
