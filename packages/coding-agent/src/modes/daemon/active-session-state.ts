@@ -9,6 +9,7 @@ import type {
 	DaemonExtensionUIResponse,
 } from "./daemon-protocol.js";
 import { formatSessionDisplayId, matchesSessionIdSuffix } from "./daemon-session-id.js";
+import type { RlmChildStallRecoveryMarker } from "./daemon-session-list.js";
 
 export interface DaemonSocketClient {
 	id: string;
@@ -92,6 +93,12 @@ export interface ActiveSessionState {
 	unsubscribe?: () => void;
 	/** Latest background status summary, surfaced in the agents view. */
 	summaryState?: AgentStatus;
+	/**
+	 * Latest automatic stall-recovery action on this session (r4 recovery-shell).
+	 * Written by the daemon sweep after each action (and escalation); read by the
+	 * summary compose so the roster row shows the intervention and its tally.
+	 */
+	stallRecovery?: RlmChildStallRecoveryMarker;
 	/**
 	 * Client env (e.g. herdr pane identity), merged over process.env for this
 	 * session's pi.exec() subprocesses. Bound when the runtime is created (or

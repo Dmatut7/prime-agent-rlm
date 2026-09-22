@@ -123,7 +123,12 @@ describe("stall action keybinding registration", () => {
 
 describe("StallActions component", () => {
 	it("renders the action lines and pads them to the given width", () => {
-		const bar = new StallActions(actionableEvent, { interruptKeyLabel });
+		// F1: hint lines only render for actions that have a callback behind them.
+		const bar = new StallActions(actionableEvent, {
+			interruptKeyLabel,
+			onInterrupt: () => {},
+			onDiagnostics: () => {},
+		});
 
 		const lines = bar.render(80);
 
@@ -260,7 +265,11 @@ describe("StallActions component", () => {
 	});
 
 	it("drops a click region whose hint line wraps below the terminal width", () => {
-		const bar = new StallActions(actionableEvent, { interruptKeyLabel });
+		const bar = new StallActions(actionableEvent, {
+			interruptKeyLabel,
+			onInterrupt: () => {},
+			onDiagnostics: () => {},
+		});
 
 		// Width 30 keeps the interrupt hint on one line but wraps the
 		// diagnostics hint across two, so only the interrupt region survives.
@@ -274,6 +283,69 @@ describe("StallActions component", () => {
 		const interruptHint = `${interruptKeyLabel} = interrupt this turn`;
 		const regionLine = lines[regions[0]!.line]!;
 		assert.strictEqual(regionLine.indexOf(interruptHint), regions[0]!.col);
+	});
+
+	it("F1: an action without a callback renders no hint and consumes no key", () => {
+		// The event offers both actions, but the host provides neither handler:
+		// the bar must not advertise or consume either one.
+		const bar = new StallActions(actionableEvent, {
+			interruptKeyLabel,
+			matchesInterruptKey: (data) => matchesKey(data, "escape"),
+		});
+
+		const lines = bar.render(80);
+		assert.deepStrictEqual(
+			lines.map((line) => line.trimEnd()),
+			[
+				"\u26a0 stall: silent 312s (threshold 300s)",
+				"Possible stall: no session activity for 312s while a turn is running.",
+			],
+		);
+		assert.deepStrictEqual(bar.getClickRegions(), []);
+		assert.strictEqual(bar.handleInput(ESCAPE), false);
+		assert.strictEqual(bar.handleInput(CTRL_Y), false);
+	});
+
+	it("F1: only the action with a callback renders its hint line", () => {
+		const bar = new StallActions(actionableEvent, {
+			interruptKeyLabel,
+			onDiagnostics: () => {},
+		});
+
+		const lines = bar.render(80);
+		assert.ok(lines.some((line) => line.includes("ctrl+y = show stall diagnostics")));
+		assert.ok(!lines.some((line) => line.includes("interrupt this turn")));
+		// The unhandled action's key is not consumed: the host's own interrupt
+		// binding stays the only trigger for it.
+		assert.strictEqual(bar.handleInput(ESCAPE), false);
+		assert.strictEqual(bar.handleInput(CTRL_Y), true);
+	});
+
+	it("F2: an unbound diagnostics key keeps the hint line but renders no click region", () => {
+		// "Unbound" is an empty resolved key set: the default table declares no
+		// key for the action (the same shape app.interrupt has). The hint line
+		// still renders - it says "unbound" - but the click region is suppressed.
+		const keybindings = new KeybindingsManager({
+			...TUI_KEYBINDINGS,
+			"app.stall.diagnostics": {
+				...TUI_KEYBINDINGS["app.stall.diagnostics"]!,
+				defaultKeys: [],
+			},
+		});
+		setKeybindings(keybindings);
+		const bar = new StallActions(actionableEvent, {
+			interruptKeyLabel,
+			onInterrupt: () => {},
+			onDiagnostics: () => {},
+		});
+
+		const lines = bar.render(80);
+		assert.ok(lines.some((line) => line.includes("unbound = show stall diagnostics")));
+		const regions = bar.getClickRegions();
+		// Only the interrupt region survives: the unbound action has no click target.
+		assert.strictEqual(regions.length, 1);
+		const interruptHint = `${interruptKeyLabel} = interrupt this turn`;
+		assert.ok(lines[regions[0]!.line]!.includes(interruptHint));
 	});
 
 	it("wraps long degraded messages instead of overflowing the width", () => {

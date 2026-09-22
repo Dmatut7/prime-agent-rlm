@@ -27,7 +27,7 @@ import type {
 } from "../../core/session-action-store.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import type { SessionStats } from "../../core/session-stats.js";
-import type { StallDiagnostics } from "../../core/stall-diagnostics.js";
+import type { StallDiagnostics, StallEventActions } from "../../core/stall-diagnostics.js";
 import type { SessionUsageSummary } from "../../core/usage.js";
 import type { SessionSummary } from "../daemon/daemon-session-list.js";
 import type { HeadlessCompletionResult } from "../headless-completion.js";
@@ -747,6 +747,13 @@ export type AgentConnectionSessionEvent =
 			 * can actually carry, so a new consumer cannot assume the field exists.
 			 */
 			diagnostics?: StallDiagnostics;
+			/**
+			 * Actions the daemon offers once its stall-recovery sweep has the session
+			 * under observation (r4 recovery-shell). Additive and optional; older
+			 * daemons never send it and renderers degrade to plain text. Terminal
+			 * stages never carry it (S1).
+			 */
+			actions?: StallEventActions;
 	  }
 	| {
 			type: "stall_abort";
@@ -761,6 +768,8 @@ export type AgentConnectionSessionEvent =
 			 * can actually carry, so a new consumer cannot assume the field exists.
 			 */
 			diagnostics?: StallDiagnostics;
+			/** Never populated: the turn is dead, there is nothing left to act on (S1). */
+			actions?: StallEventActions;
 	  }
 	| {
 			type: "stall_unsettled";
@@ -775,6 +784,8 @@ export type AgentConnectionSessionEvent =
 			 * can actually carry, so a new consumer cannot assume the field exists.
 			 */
 			diagnostics?: StallDiagnostics;
+			/** Never populated: the turn is dead, there is nothing left to act on (S1). */
+			actions?: StallEventActions;
 	  }
 	| {
 			/**

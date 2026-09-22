@@ -30,12 +30,15 @@ import {
 	CombinedAutocompleteProvider,
 	type Component,
 	Container,
+	isKeyRelease,
+	isMouseSequence,
 	Loader,
 	type LoaderIndicatorOptions,
 	Markdown,
 	matchesKey,
 	ProcessTerminal,
 	Spacer,
+	StallActions,
 	setKeybindings,
 	Text,
 	TruncatedText,
@@ -139,7 +142,7 @@ import {
 	resolveBuiltinSlashCommandName,
 } from "../../core/slash-commands.js";
 import { createSpendPricing, type SpendPricing } from "../../core/spend-pricing.js";
-import { formatStallEventLines } from "../../core/stall-diagnostics-render.js";
+import { formatStallEventLines, type StallEventView, stallActionBarView } from "../../core/stall-diagnostics-render.js";
 import {
 	captureAgentCommandUsed,
 	captureOnboardingCompleted,
@@ -1216,6 +1219,15 @@ export class InteractiveMode {
 	private goalTrayTimer: NodeJS.Timeout | undefined = undefined;
 
 	private streamingComponent: AssistantMessageComponent | undefined = undefined;
+	/**
+	 * r4 recovery-shell: the live stall action bar. Non-modal, no focus grab; the
+	 * input listener below routes keys to it while it is visible (B1) and every
+	 * other key dismisses it and flows on. Replaced by the next stall_warning,
+	 * torn down by the terminal stall stages (S1).
+	 */
+	private stallActionBar: StallActions | undefined;
+	/** B1: the stall bar's input route, registered once and unregistered on teardown. */
+	private removeStallActionInputListener: (() => void) | undefined = undefined;
 	/**
 	 * U6 评审②: the memoized watermark pair. One frame, one value: the footer
 	 * and the tray fallback both read this, and it only recomputes after an
@@ -6463,19 +6475,30 @@ export class InteractiveMode {
 				);
 				break;
 
-			case "stall_warning":
+			case "stall_warning": {
 				// The event carries the full forensic snapshot; the message alone tells the
 				// operator that something was silent but not what to interrupt or where to look.
+				// The forensic text stays on the loud channel; the action bar (r4
+				// recovery-shell) adds the actionable strip on top of it - it never
+				// re-reports the message text, so the two channels cannot double-report
+				// (B3), and a bar that cannot mount leaves exactly the old behavior.
 				this.showError(formatStallEventLines(event).join("\n"));
+				this.mountStallActionBar(event);
 				break;
+			}
 
 			case "stall_abort":
+				// S1: the turn is dead, there is no action left to offer - never a
+				// bar, and any live one is torn down so it stops promising an
+				// interrupt that can no longer happen.
+				this.removeStallActionBar();
 				this.showError(formatStallEventLines(event).join("\n"));
 				break;
 
 			case "stall_unsettled":
 				// "Killed but still running" is a different failure than "looks
 				// stuck": it needs the same loud channel, not a warning color.
+				this.removeStallActionBar();
 				this.showError(formatStallEventLines(event).join("\n"));
 				break;
 
@@ -7858,6 +7881,88 @@ export class InteractiveMode {
 				});
 		}
 	}
+
+	/**
+	 * Mount the stall action bar for one stall event (r4 recovery-shell).
+	 *
+	 * The host resolves the view locally from its own state: the interrupt label
+	 * comes from the real `app.input.clear` binding (B2 - an empty label means
+	 * unbound, and the action is then not offered), and both actions require a
+	 * handler behind them (F1). A bar that cannot mount leaves exactly the
+	 * pre-bar behavior - the forensic showError already fired (B3).
+	 */
+	private mountStallActionBar(event: StallEventView): void {
+		const interruptKeyLabel = keyText("app.input.clear");
+		const view = stallActionBarView(event, {
+			interruptKeyLabel,
+			canInterrupt: true,
+			canDiagnose: true,
+		});
+		if (view === undefined) {
+			// B3: no usable action means the plain error channel is the whole
+			// report; mounting a degraded bar here would double-report the same
+			// text through two channels.
+			return;
+		}
+		this.removeStallActionBar();
+		const bar = new StallActions(
+			{ ...event, actions: view },
+			{
+				interruptKeyLabel,
+				matchesInterruptKey: (data) => this.keybindings.matches(data, "app.input.clear"),
+				onInterrupt: () => {
+					this.removeStallActionBar();
+					// The same path an Esc would take: interrupt the turn (and send the
+					// queued steering with it), not just clear the editor.
+					this.interruptOrClearInput();
+				},
+				onDiagnostics: () => {
+					this.removeStallActionBar();
+					// Re-show the full forensic text: the original error lines may
+					// have scrolled away, and the diagnostics pointer inside them is
+					// where the evidence lives.
+					this.showError(formatStallEventLines(event).join("\n"));
+				},
+			},
+		);
+		this.stallActionBar = bar;
+		this.chatContainer.addChild(bar);
+		if (this.removeStallActionInputListener === undefined) {
+			this.removeStallActionInputListener = this.ui.addInputListener(this.stallActionInputRoute);
+		}
+		this.ui.requestRender();
+	}
+
+	/** Tear the live stall action bar down (if any). Safe when no bar is live. */
+	private removeStallActionBar(options: { render?: boolean } = {}): void {
+		const bar = this.stallActionBar;
+		if (bar === undefined) return;
+		this.stallActionBar = undefined;
+		bar.dismiss();
+		this.chatContainer.removeChild(bar);
+		if (this.removeStallActionInputListener !== undefined) {
+			this.removeStallActionInputListener();
+			this.removeStallActionInputListener = undefined;
+		}
+		if (options.render !== false) this.ui.requestRender();
+	}
+
+	/**
+	 * B1: the stall bar's input route, ahead of the editor. While a bar is live,
+	 * a key goes to the bar first; an action key is consumed there, every other
+	 * key dismisses the bar and flows on to its normal destination (the editor
+	 * keeps focus the whole time - the bar never grabs it). Mouse reports and
+	 * key-release frames are not "any other key": clicks must reach the bar's
+	 * click regions, and a release must not re-trigger an action.
+	 */
+	private readonly stallActionInputRoute = (data: string): { consume?: boolean } | undefined => {
+		const bar = this.stallActionBar;
+		if (bar === undefined || bar.isDismissed) return undefined;
+		if (isMouseSequence(data) || isKeyRelease(data)) return undefined;
+		if (bar.handleInput(data)) return { consume: true };
+		this.removeStallActionBar();
+		return undefined;
+	};
 
 	private showCtrlCExitHint(): void {
 		if (this.ctrlCExitHintTimer) {
@@ -11606,6 +11711,7 @@ ${expandToolsFull ? `| \`${expandToolsFull}\` | Show tool output in full, ignori
 		this.unregisterSignalHandlers();
 		this.clearCtrlCExitHint({ render: false });
 		this.clearEscapeRepeat();
+		this.removeStallActionBar({ render: false });
 		if (this.settingsManager.getShowTerminalProgress()) {
 			this.ui.terminal.setProgress(false);
 		}

@@ -95,6 +95,14 @@ export interface SessionSummary {
 	 */
 	stall?: RlmChildStallState;
 	/**
+	 * Latest automatic stall-recovery action on this session (r4 recovery-shell,
+	 * gated by the `stall_recovery_state` capability): what the executor did,
+	 * when, and how many times it has acted without an intervening input. Lets
+	 * an operator who comes back see "the system intervened, here is the tally"
+	 * instead of a session that looks merely idle.
+	 */
+	stallRecovery?: RlmChildStallRecoveryMarker;
+	/**
 	 * U3: whether the session's current task has settled — no own work in flight
 	 * (turn, streaming, kernel-hosted work) and a terminal outcome on record: a
 	 * completed/error verdict for a top-level session (needs_input is an open
@@ -121,6 +129,24 @@ export interface SessionSummary {
 	workerState?: "starting" | "ready" | "recovering" | "stopping" | "failed";
 	/** Diagnostic process identity; clients must not use this as a stable session identifier. */
 	workerPid?: number;
+}
+
+/**
+ * Roster marker for one automatic stall-recovery action (r4 recovery-shell).
+ * Written by the daemon sweep, read by the summary compose; compared by value
+ * like `stall`.
+ */
+export interface RlmChildStallRecoveryMarker {
+	/** Epoch ms of the action. */
+	at: number;
+	/** "abort_and_send" (turn killed, system instruction queued as the next input) or "abort" (turn killed only). */
+	action: "abort_and_send" | "abort";
+	/** The measured silence that armed the recovery. */
+	silentMs: number;
+	/** Consecutive auto actions on this session since the last external input. */
+	count: number;
+	/** True when the post-action escalation notice went out (still silent after the escalation window). */
+	escalated?: boolean;
 }
 
 /**
@@ -399,6 +425,8 @@ interface SummaryComposeFingerprint {
 	// holding the same reference could not see an in-place edit (left === right would be true),
 	// and a getter that rebuilt the object per read would never hit the memo at all.
 	stall: RlmChildStallState | undefined;
+	// r4 recovery-shell: same value-compare contract for the recovery marker.
+	stallRecovery: RlmChildStallRecoveryMarker | undefined;
 	// Identity and display inputs: the metadata getter returns a fresh copy on every read, so
 	// its summary-relevant fields compare by value.
 	metadataKind: string;
@@ -516,6 +544,7 @@ export function summaryForActiveSession(
 		repliedSinceTask: metadata.kind === "subagent" ? session.repliedToParentSinceTask : undefined,
 		sessionActions: session.getSessionActionSnapshot(),
 		stall: snapshotStallState(stall),
+		stallRecovery: activeSession.stallRecovery,
 		metadataKind: metadata.kind,
 		metadataParentActiveSessionId: metadata.parentActiveSessionId,
 		metadataParentSessionId: metadata.parentSessionId,
@@ -580,6 +609,7 @@ export function summaryForActiveSession(
 		isBashRunning: session.isBashRunning,
 		hasRunningRlmChildren: session.hasRunningRlmChildren(),
 		stall,
+		stallRecovery: activeSession.stallRecovery,
 		// U3 agents-view roster facts: optional on the wire, so an older client
 		// reading this summary simply does not know them.
 		settled,
@@ -667,6 +697,7 @@ function summaryComposeFingerprintsEqual(left: SummaryComposeFingerprint, right:
 		left.durationMs === right.durationMs &&
 		left.answerPreview === right.answerPreview &&
 		stallStatesEqual(left.stall, right.stall) &&
+		stallRecoveryMarkersEqual(left.stallRecovery, right.stallRecovery) &&
 		diagnosticsEqual(left.diagnostics, right.diagnostics) &&
 		sessionActionSnapshotsEqual(left.sessionActions, right.sessionActions)
 	);
@@ -687,6 +718,21 @@ function usageSummariesEqual(left: SessionUsageSummary | undefined, right: Sessi
  * immutable reading to compare against: by value, so both an in-place edit and a rebuilt
  * object are seen.
  */
+function stallRecoveryMarkersEqual(
+	left: RlmChildStallRecoveryMarker | undefined,
+	right: RlmChildStallRecoveryMarker | undefined,
+): boolean {
+	if (left === right) return true;
+	if (left === undefined || right === undefined) return false;
+	return (
+		left.at === right.at &&
+		left.action === right.action &&
+		left.silentMs === right.silentMs &&
+		left.count === right.count &&
+		left.escalated === right.escalated
+	);
+}
+
 function snapshotStallState(stall: RlmChildStallState | undefined): RlmChildStallState | undefined {
 	if (stall === undefined) return undefined;
 	return {

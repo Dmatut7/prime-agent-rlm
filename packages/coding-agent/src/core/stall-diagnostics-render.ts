@@ -166,3 +166,60 @@ export function formatStallEventLines(event: StallEventView): string[] {
 		...formatStallDiagnosticsLines(event.diagnostics).map((line) => `  ${line}`),
 	];
 }
+
+/**
+ * The action view the interactive host mounts for one stall event (r4
+ * recovery-shell), or undefined when no action bar mounts.
+ *
+ * Kept beside the stall renderers because it is the same degrade family: an
+ * event without usable actions must fall back to the plain error text the host
+ * already shows. The host resolves the two facts from its own state - the
+ * interrupt key label from its real `app.input.clear` binding (B2), the
+ * diagnostics availability from the registered handler - so the view always
+ * reflects what this host actually honors, never a hardcoded key.
+ */
+export interface StallActionBarView {
+	/** Whether the current turn can still be interrupted. */
+	canAbort: boolean;
+	/** Whether stall diagnostics can be shown for the current turn. */
+	canDiagnose: boolean;
+}
+
+/** Host facts the view resolution needs; all three are local to the host. */
+export interface StallActionBarHostFacts {
+	/**
+	 * Label of the host's real interrupt binding, resolved from the binding the
+	 * host honors (B2). Empty or blank means unbound: the interrupt action is
+	 * not offered, because a hint naming a key that does nothing is a lie.
+	 */
+	interruptKeyLabel: string;
+	/** Whether the host currently has an interrupt handler behind that key. */
+	canInterrupt: boolean;
+	/** Whether the host can show stall diagnostics. */
+	canDiagnose: boolean;
+}
+
+/**
+ * S1: terminal stall stages never offer actions - the turn is already dead, so
+ * an "interrupt this turn" hint would promise an action that cannot happen.
+ */
+const STALL_TERMINAL_EVENT_TYPES = new Set(["stall_abort", "stall_unsettled"]);
+
+/**
+ * Resolve the action-bar view for one stall event. Returns undefined when no
+ * bar should mount: a terminal stage (S1), or an event whose only offered
+ * actions are unusable in this host (B2's empty interrupt label, F1's missing
+ * handler). The caller then keeps its existing plain-text error channel, which
+ * is the old-client degrade - not a second, bar-shaped report of the same text
+ * (B3: the two channels never double-report).
+ */
+export function stallActionBarView(
+	event: { type: string },
+	host: StallActionBarHostFacts,
+): StallActionBarView | undefined {
+	if (STALL_TERMINAL_EVENT_TYPES.has(event.type)) return undefined;
+	const canAbort = host.canInterrupt && host.interruptKeyLabel.trim().length > 0;
+	const canDiagnose = host.canDiagnose;
+	if (!canAbort && !canDiagnose) return undefined;
+	return { canAbort, canDiagnose };
+}

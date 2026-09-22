@@ -72,7 +72,7 @@ import {
 	normalizeObserveLimit,
 	normalizeObserveMaxChars,
 } from "../../core/agent-observe.js";
-import { type PromptOptions, rlmChildLabel } from "../../core/agent-session.js";
+import { type PromptOptions, type RlmChildStallState, rlmChildLabel } from "../../core/agent-session.js";
 import { type AgentSessionRuntimeConfig, mergeAgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import {
 	type AgentSessionRuntime,
@@ -96,7 +96,12 @@ import {
 	resolveHeartbeatStreamingBehavior,
 	shouldDeferHeartbeatCronJob,
 } from "../../core/cron-jobs.js";
-import { createRlmChildStallNoticeMessage } from "../../core/messages.js";
+import {
+	createRlmChildRecoveryActionMessage,
+	createRlmChildStallNoticeMessage,
+	createSystemInterruptionMessage,
+	type RlmChildReDispatchFacts,
+} from "../../core/messages.js";
 import { flushOrphanProcessJournal, ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
 import { providerRetryPolicy } from "../../core/provider-retry.js";
@@ -126,6 +131,7 @@ import {
 	SettingsManager,
 } from "../../core/settings-manager.js";
 import { type SideQuestionRun, startSideQuestion } from "../../core/side-question.js";
+import type { StallEventActions } from "../../core/stall-diagnostics.js";
 import {
 	type AttemptBudget,
 	consumeAttempt,
@@ -323,6 +329,22 @@ const AGENT_MESSAGE_QUEUED_RUN_TRACKING_LIMIT = 500;
  * follow-up turns that path no longer subscribes to.
  */
 const DAEMON_CHILD_STALL_NOTICE_MIN_INTERVAL_MS = 10 * 60_000;
+/**
+ * r4 recovery-shell: the stall-recovery sweep cadence. Same order as the roster
+ * heartbeat (15s) so the daemon's periodic work keeps one rhythm; every session
+ * is checked with O(1) early-outs (no stall marker -> next), so a worker with
+ * hundreds of sessions pays only the map walk.
+ */
+const STALL_RECOVERY_SWEEP_INTERVAL_MS = 15_000;
+/**
+ * r4 recovery-shell: how long the sweep watches after an action before the
+ * one-time escalation notice. Still dead here means the intervention did not
+ * revive the turn; the answer is a notification with the manual levers, never
+ * a second automatic action (the claim for that epoch is already spent).
+ */
+const STALL_RECOVERY_ESCALATE_AFTER_MS = 15 * 60_000;
+/** Bound for the per-episode map, sized like the notice rate-limit maps. */
+const STALL_RECOVERY_EPISODE_TRACKING_LIMIT = 256;
 /** Rate-limit map capacity for {@link DAEMON_CHILD_STALL_NOTICE_MIN_INTERVAL_MS} keys. */
 const DAEMON_CHILD_STALL_NOTICE_TRACKING_LIMIT = 256;
 const WORKER_SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS = 1_000;
@@ -562,6 +584,33 @@ type PassiveRlmSubagent = PassiveRlmRoot & {
 	info: SessionInfo;
 	chain: PassiveRlmSubagentEntry[];
 };
+
+/**
+ * One live stall episode the sweep is watching (r4 recovery-shell). Scoped to a
+ * (session, turn) pair via the claim key; every field is sweep-private.
+ */
+interface StallRecoveryEpisode {
+	/** `${activeSessionId}:${turnLifecycleEpoch}` - the epoch claim key. */
+	key: string;
+	/** The turn epoch the key was built from; a mismatch means the episode is over. */
+	epoch: number;
+	/** When the sweep first observed this episode (seeded from the stall event when it fired first). */
+	firstSeenAt: number;
+	/** Transcript length at first observation; movement past this refreshes the episode (dual evidence). */
+	messageCount: number;
+	/** Whether the first observation saw a turn in flight; a change refreshes the episode. */
+	isStreaming: boolean;
+	/** When the recovery action executed, once it has (the epoch claim). */
+	actedAt?: number;
+	/** Transcript length when the action executed; the escalation requires no movement past it. */
+	messageCountAtAction?: number;
+	/** When the one-time post-action escalation notice went out. */
+	escalatedAt?: number;
+	/** External input arrived during the wait window: this episode is never auto-acted. */
+	keptAlive?: boolean;
+	/** When the stop-line notice went out (count exhausted); once per episode. */
+	stopNotifiedAt?: number;
+}
 
 class RuntimeOpenCancelledError extends Error {}
 class BoundSessionUnavailableError extends Error {}
@@ -819,6 +868,20 @@ export class AgentDaemon {
 			);
 			this.rosterHeartbeatTimer.unref();
 		}
+		// r4 recovery-shell: the sweep runs wherever sessions live (worker or
+		// standalone daemon). DaemonMode has no background() helper, so the sweep
+		// owns its own in-flight guard: a sweep that crosses the next tick is
+		// skipped, never stacked (two sweeps must never act on the same claim).
+		this.stallRecoveryTimer = setInterval(() => {
+			if (this.stallRecoverySweepInFlight) return;
+			this.stallRecoverySweepInFlight = true;
+			void this.sweepStallRecovery()
+				.catch((error) => this.log(`stall recovery sweep failed: ${String(error)}`))
+				.finally(() => {
+					this.stallRecoverySweepInFlight = false;
+				});
+		}, STALL_RECOVERY_SWEEP_INTERVAL_MS);
+		this.stallRecoveryTimer.unref();
 		this.startSupervisorMonitor();
 	}
 
@@ -6806,6 +6869,35 @@ export class AgentDaemon {
 	 */
 	private readonly childStallNoticeAt = new Map<string, number>();
 
+	/**
+	 * r4 recovery-shell: the 15s stall-recovery sweep timer. Unref'd like the
+	 * roster heartbeat: a shutdown must not wait for it.
+	 */
+	private stallRecoveryTimer?: ReturnType<typeof setInterval>;
+	/** Re-entry guard: one sweep at a time, so a slow sweep cannot stack on the next tick. */
+	private stallRecoverySweepInFlight = false;
+	/**
+	 * r4 recovery-shell: one live stall episode per session, keyed by the claim
+	 * key `${activeSessionId}:${turnLifecycleEpoch}`. The epoch in the key is the
+	 * anti-double-run lock: a claim stops matching the session the moment a new
+	 * turn starts, so the same (session, turn) is acted on at most once no
+	 * matter how many executors race (I2).
+	 */
+	private readonly stallRecoveryEpisodes = new Map<string, StallRecoveryEpisode>();
+	/**
+	 * r4 recovery-shell: consecutive auto actions per session since the last
+	 * external input (a prompt, a steered agent message). The stop line: at
+	 * maxPerSession the sweep only notifies. Reset by noteExternalSessionInput.
+	 */
+	private readonly stallRecoveryActionCounts = new Map<string, number>();
+	/**
+	 * r4 recovery-shell: event-seeded observation per session. The stall event
+	 * fires up to a sweep interval before the sweep first polls, so the wait
+	 * window is measured from the event, and an external input that lands in
+	 * that gap still counts as "the user is here" (keptAlive).
+	 */
+	private readonly stallRecoveryNoticedAt = new Map<string, { at: number; unsettled: boolean; keptAlive: boolean }>();
+
 	private recordQueuedAgentMessage(
 		senderKey: string,
 		targetActiveSessionId: string,
@@ -6860,6 +6952,10 @@ export class AgentDaemon {
 		queuedReason?: AgentMessageQueuedReason;
 		queuedPosition?: number;
 	}> {
+		// r4 recovery-shell: a parent's steered message is external input for the
+		// target session - it resets the stop-line count and keeps a live stall
+		// episode from being auto-acted (the parent answered the stall itself).
+		this.noteExternalSessionInput(targetState);
 		const message = createAgentSessionMessage(payload);
 		let preflightFailed = false;
 		let preflightQueued = false;
@@ -7497,7 +7593,11 @@ export class AgentDaemon {
 		return cascadeError;
 	}
 
-	private broadcastToSession(state: ActiveSessionState, message: DaemonOutbound): void {
+	private broadcastToSession(state: ActiveSessionState, inboundMessage: DaemonOutbound): void {
+		// r4 recovery-shell: stall_warning may be enriched with the actions field
+		// below; the parameter stays const and the enriched copy flows on from
+		// here.
+		let message = inboundMessage;
 		if (message.type === "session_event") {
 			const eventType = message.event.type;
 			// A finished turn/compaction is the cue to refresh status.
@@ -7518,6 +7618,19 @@ export class AgentDaemon {
 			}
 			if (eventType === "stall_warning") {
 				this.notifyParentOfAgentStall(state, message.event);
+				// r4 recovery-shell: the same event seeds the sweep's observation
+				// (depth-0 sessions included - notifyParentOfAgentStall stops at
+				// subagents, the observation does not) and, when recovery is armed,
+				// carries the actions field for wire clients. Terminal stall stages
+				// only update the observation (unsettled bookkeeping); they never
+				// gain actions - the turn is dead, there is nothing left to act on.
+				this.noteStallForRecovery(state, message.event);
+				const actions = this.stallRecoveryActionsFor(state);
+				if (actions !== undefined) {
+					message = { ...message, event: { ...message.event, actions } };
+				}
+			} else if (eventType === "stall_abort" || eventType === "stall_unsettled") {
+				this.noteStallForRecovery(state, message.event);
 			}
 		}
 		this.stampRlmChildActiveSessionId(message);
@@ -7638,6 +7751,428 @@ export class AgentDaemon {
 				`could not deliver stall notice to parent ${parentState.activeSessionId} for child ${rlmChildId}: ${String(error)}`,
 			);
 		});
+	}
+
+	/**
+	 * r4 recovery-shell: the stall-recovery sweep. One pass over the worker's
+	 * sessions every {@link STALL_RECOVERY_SWEEP_INTERVAL_MS}; sessions without a
+	 * live stall marker are an O(1) map hit and a continue.
+	 *
+	 * The policy, shared by children (③) and depth-0 sessions (④-B) with two
+	 * wait strategies:
+	 * - Child: wait `subagents.stallRecovery.graceSeconds` (default 300) after
+	 *   the episode is first observed - the window in which the parent model may
+	 *   answer the stall notice itself.
+	 * - Depth-0: no attached client means nobody is watching, so act as soon as
+	 *   the evidence confirms (dual evidence still needs a second sighting);
+	 *   an attached client gets `stallWatchdog.rootRecovery.humanWindowSeconds`
+	 *   (default 120) to react, and any external input inside that window marks
+	 *   the episode kept-alive: never auto-acted.
+	 *
+	 * The action is exactly once per (session, turn) - the claim key carries the
+	 * turn epoch - and bounded per session by the consecutive-action stop line
+	 * (default 3): after that the sweep only notifies. A session still dead
+	 * {@link STALL_RECOVERY_ESCALATE_AFTER_MS} after its action gets one
+	 * escalation notice, never a second action.
+	 */
+	private async sweepStallRecovery(now = Date.now()): Promise<void> {
+		if (this.shuttingDown) return;
+		for (const state of [...this.sessions.values()]) {
+			try {
+				this.sweepStallRecoveryForSession(state, now);
+			} catch (error) {
+				this.log(`stall recovery sweep skipped session ${state.activeSessionId}: ${String(error)}`);
+			}
+		}
+		this.pruneStallRecoveryTracking();
+	}
+
+	/** One session's half of the sweep. Synchronous on purpose: every check is a map read. */
+	private sweepStallRecoveryForSession(state: ActiveSessionState, now: number): void {
+		const session = state.runtime.session;
+		const stall = session.stallState;
+		if (stall === undefined) {
+			// The stall cleared (a new turn started, or the marker never landed):
+			// the episode, its claim, and the notice seed all close with it.
+			this.forgetStallRecoverySession(state.activeSessionId);
+			return;
+		}
+		const policy = this.stallRecoveryPolicyFor(state);
+		if (!policy.enabled) {
+			this.forgetStallRecoverySession(state.activeSessionId);
+			return;
+		}
+		if (stall.silentMs < stall.thresholdMs) return; // not even warn-worthy yet
+		// Excused silence is owned work, not a wedge: the watchdog's own exemption
+		// budget is the single arbiter of how long that excuse lasts (I3), so the
+		// sweep never second-guesses it with a second budget (r4 synthesis rule 1).
+		if (stall.excused === true) return;
+		// I4 dual evidence, second half: a turn in flight whose transcript froze.
+		// isStreaming false means no turn to abort - the marker is the residue of
+		// a previous turn waiting for the next agent_start.
+		const isStreaming = session.isStreaming === true;
+		if (!isStreaming) return;
+		const epoch = session.turnLifecycleEpoch;
+		const key = `${state.activeSessionId}:${epoch}`;
+		const messageCount = session.messages.length;
+		let episode = this.stallRecoveryEpisodes.get(key);
+		if (episode === undefined) {
+			const notice = this.stallRecoveryNoticedAt.get(state.activeSessionId);
+			episode = {
+				key,
+				epoch,
+				// Seed from the event when it fired before this sweep: the wait
+				// window belongs to whoever saw the stall first, not to the poll.
+				firstSeenAt: notice?.at ?? now,
+				messageCount,
+				isStreaming,
+				...(notice?.keptAlive ? { keptAlive: true } : {}),
+			};
+			this.stallRecoveryEpisodes.set(key, episode);
+			return; // first sighting: record, act on the next confirmation
+		}
+		if (messageCount !== episode.messageCount || isStreaming !== episode.isStreaming) {
+			// The session moved: not dead. Refresh the observation (a new silence
+			// measurement starts from here) instead of acting on stale evidence.
+			episode.firstSeenAt = now;
+			episode.messageCount = messageCount;
+			episode.isStreaming = isStreaming;
+			return;
+		}
+		// Kept alive: an external input arrived during the wait window. The
+		// episode is never auto-acted (GLM presence rule: human/model choice beats
+		// the machine's judgment), and the transcript freeze it caused is expected.
+		if (episode.keptAlive === true) return;
+		if (episode.actedAt !== undefined) {
+			this.maybeEscalateStallRecovery(state, episode, stall, now);
+			return;
+		}
+		if (now - episode.firstSeenAt < policy.windowMs) return;
+		const count = this.stallRecoveryActionCounts.get(state.activeSessionId) ?? 0;
+		if (count >= policy.maxPerSession) {
+			if (episode.stopNotifiedAt === undefined) {
+				episode.stopNotifiedAt = now;
+				this.log(
+					`stall recovery stop line reached for ${policy.isChild ? "child" : "root"} ${state.activeSessionId}: ` +
+						`${count} consecutive auto actions without external input; notifying only`,
+				);
+			}
+			return;
+		}
+		void this.executeStallRecovery(state, episode, stall, { isChild: policy.isChild, now });
+	}
+
+	/**
+	 * The intervention itself (I6, the safe half). Re-checks aliveness right
+	 * before acting (the sweep may have been queued behind anything), then runs
+	 * the load-bearing order: queue the system instruction first, abort second -
+	 * "abort and send", not "abort and park". A delivery failure releases the
+	 * claim so the next sweep can try again; a successful action records the
+	 * claim, the marker, and the parent receipt.
+	 */
+	private async executeStallRecovery(
+		state: ActiveSessionState,
+		episode: StallRecoveryEpisode,
+		stall: RlmChildStallState,
+		context: { isChild: boolean; now: number },
+	): Promise<void> {
+		const session = state.runtime.session;
+		// I4 re-check: the state may have closed or the turn may have ended between
+		// the sweep's sighting and this action.
+		if (this.shuttingDown || this.sessions.get(state.activeSessionId) !== state) return;
+		if (session.stallState === undefined || session.isStreaming !== true) return;
+		if (session.turnLifecycleEpoch !== episode.epoch) return;
+		const notice = createSystemInterruptionMessage({
+			trigger: "stall_recovery",
+			isChild: context.isChild,
+			silentMs: stall.silentMs,
+			thresholdMs: stall.thresholdMs,
+			inFlightTools: [...stall.inFlightTools],
+			excused: stall.excused === true,
+			executor: "daemon",
+		});
+		try {
+			await session.sendCustomMessage(notice, { deliverAs: "followUp" });
+		} catch (error) {
+			// An admission refusal (paused pump, disposing session) must not burn
+			// the claim: release it so the next sweep retries instead of waiting
+			// out the episode silently.
+			this.stallRecoveryEpisodes.delete(episode.key);
+			this.log(
+				`stall recovery could not queue the system instruction for ${state.activeSessionId}: ${String(error)}`,
+			);
+			return;
+		}
+		const resumed = session.abortAndSendQueued({ reason: "stall_recovery" });
+		// abortAndSendQueued only flushes visible USER steering; the system
+		// instruction rides the queue as a custom message, so a no-steering
+		// degrade needs the explicit resume to deliver it as the new turn.
+		let delivered = resumed;
+		if (!resumed) {
+			delivered = session.resumeQueuedWork();
+		}
+		const action = delivered ? "abort_and_send" : "abort";
+		const at = Date.now();
+		episode.actedAt = at;
+		episode.messageCountAtAction = session.messages.length;
+		const count = (this.stallRecoveryActionCounts.get(state.activeSessionId) ?? 0) + 1;
+		this.stallRecoveryActionCounts.set(state.activeSessionId, count);
+		state.stallRecovery = { at, action, silentMs: stall.silentMs, count };
+		this.markRosterRowDirty(state);
+		this.log(
+			`stall recovery: ${context.isChild ? "child" : "root"} ${state.activeSessionId} silent ` +
+				`${Math.round(stall.silentMs / 1000)}s -> ${action} (action ${count} of this chain)`,
+		);
+		if (context.isChild) {
+			this.notifyParentOfChildRecoveryAction(state, stall, action, at, false);
+		}
+	}
+
+	/**
+	 * The one-time post-action escalation: still dead
+	 * {@link STALL_RECOVERY_ESCALATE_AFTER_MS} after the action. "Still dead"
+	 * means the turn's epoch never advanced (no new turn started - the queued
+	 * instruction was never consumed) and nothing entered the transcript since
+	 * the action. The escalation notifies - never acts again (the claim for that
+	 * epoch is spent, and per synthesis rule 2 nothing re-dispatches
+	 * automatically).
+	 */
+	private maybeEscalateStallRecovery(
+		state: ActiveSessionState,
+		episode: StallRecoveryEpisode,
+		stall: RlmChildStallState,
+		now: number,
+	): void {
+		if (episode.escalatedAt !== undefined) return;
+		const actedAt = episode.actedAt;
+		if (actedAt === undefined || now - actedAt < STALL_RECOVERY_ESCALATE_AFTER_MS) return;
+		const session = state.runtime.session;
+		if (session.turnLifecycleEpoch !== episode.epoch) return;
+		if (session.messages.length > (episode.messageCountAtAction ?? 0)) return;
+		episode.escalatedAt = now;
+		const marker = state.stallRecovery;
+		if (marker) state.stallRecovery = { ...marker, escalated: true };
+		this.markRosterRowDirty(state);
+		const metadata = state.runtime.metadata;
+		const isChild = metadata.kind === "subagent" && metadata.parentActiveSessionId !== undefined;
+		this.log(
+			`stall recovery escalation: ${isChild ? "child" : "root"} ${state.activeSessionId} still silent ` +
+				`${Math.round((now - actedAt) / 1000)}s after the auto action; notifying only`,
+		);
+		if (isChild) {
+			this.notifyParentOfChildRecoveryAction(state, stall, "abort_and_send", actedAt, true, now);
+		}
+	}
+
+	/**
+	 * Parent-facing receipt (capability `child_stall_auto_recovery`): delivered
+	 * in-process into the parent's transcript when the parent lives in this
+	 * worker, which is the topology the sweep can act in. Cross-worker parents
+	 * are covered by the roster marker and the log; the receipt is a custom
+	 * message, so it degrades as plain transcript text on any older reader.
+	 */
+	private notifyParentOfChildRecoveryAction(
+		state: ActiveSessionState,
+		stall: RlmChildStallState,
+		action: "abort_and_send" | "abort",
+		actedAt: number,
+		escalated: boolean,
+		now = Date.now(),
+	): void {
+		const metadata = state.runtime.metadata;
+		if (metadata.kind !== "subagent" || metadata.parentActiveSessionId === undefined) return;
+		const rlmChildId = metadata.rlmChildId;
+		if (rlmChildId === undefined) return;
+		const parentState = this.sessions.get(metadata.parentActiveSessionId);
+		if (!parentState || parentState === state) return;
+		const reDispatch = parentState.runtime.session.getRlmChildRerouteCandidate?.(rlmChildId);
+		const receipt = createRlmChildRecoveryActionMessage({
+			childId: rlmChildId,
+			sessionName: state.runtime.session.sessionName ?? rlmChildId,
+			executor: "daemon",
+			action,
+			at: actedAt,
+			silentMs: stall.silentMs,
+			thresholdMs: stall.thresholdMs,
+			inFlightTools: [...stall.inFlightTools],
+			...(escalated
+				? { escalated: true, escalateAfterMs: now - actedAt }
+				: { escalateAfterMs: STALL_RECOVERY_ESCALATE_AFTER_MS }),
+			...(reDispatch ? { reDispatch: this.toReDispatchFacts(reDispatch) } : {}),
+			...(escalated ? { sessionDir: state.runtime.session.sessionManager.getSessionDir() } : {}),
+		});
+		parentState.runtime.session.sendCustomMessage(receipt, { deliverAs: "followUp" }).catch((error: unknown) => {
+			// Best-effort, like every parent-facing notice: the roster marker and
+			// the log already carry the fact, so a refused admission is logged,
+			// not retried.
+			this.log(
+				`could not deliver stall-recovery receipt to parent ${parentState.activeSessionId} for child ${rlmChildId}: ${String(error)}`,
+			);
+		});
+	}
+
+	private toReDispatchFacts(candidate: {
+		prompt: string;
+		model: string;
+		sessionName: string;
+		thinkingLevel?: string;
+	}): RlmChildReDispatchFacts {
+		return {
+			prompt: candidate.prompt,
+			model: candidate.model,
+			sessionName: candidate.sessionName,
+			...(candidate.thinkingLevel !== undefined ? { thinkingLevel: candidate.thinkingLevel } : {}),
+		};
+	}
+
+	/**
+	 * Event-seeded observation (④-B accounting): every stall stage lands here,
+	 * depth-0 sessions included. Records when the daemon first saw this episode
+	 * and whether the watchdog's own abort ever went unsettled (the case the
+	 * sweep's evidence naturally covers: still marked, still frozen, still
+	 * streaming). Bookkeeping only - actions happen in the sweep, never here.
+	 */
+	private noteStallForRecovery(
+		state: ActiveSessionState,
+		event: Extract<DaemonOutbound, { type: "session_event" }>["event"] & {
+			type: "stall_warning" | "stall_abort" | "stall_unsettled";
+		},
+	): void {
+		const existing = this.stallRecoveryNoticedAt.get(state.activeSessionId);
+		if (event.type === "stall_warning") {
+			// A fresh warn re-arms the silence clock (and may follow a recovered
+			// earlier episode): the seed restarts with it. keptAlive does not
+			// carry over - the input that kept the last episode alive was consumed
+			// by it, and this new silence is a new question.
+			this.stallRecoveryNoticedAt.set(state.activeSessionId, {
+				at: Date.now(),
+				unsettled: existing?.unsettled ?? false,
+				keptAlive: false,
+			});
+			return;
+		}
+		// stall_abort / stall_unsettled: the episode continues; remember the
+		// unsettled shape so the sweep's later verdict has the full picture.
+		if (existing !== undefined) {
+			this.stallRecoveryNoticedAt.set(state.activeSessionId, { ...existing, unsettled: true });
+		}
+	}
+
+	/**
+	 * External input reached this session (a client prompt, a steered agent
+	 * message). Two effects: the live episode is marked kept-alive (never
+	 * auto-acted - someone is driving), and the consecutive-action counter
+	 * resets (the stop line counts interventions *without* external input).
+	 */
+	private noteExternalSessionInput(state: ActiveSessionState): void {
+		this.stallRecoveryActionCounts.delete(state.activeSessionId);
+		const episode = this.findLiveEpisodeFor(state.activeSessionId);
+		if (episode !== undefined && episode.actedAt === undefined) {
+			episode.keptAlive = true;
+		}
+		const notice = this.stallRecoveryNoticedAt.get(state.activeSessionId);
+		if (notice !== undefined) {
+			this.stallRecoveryNoticedAt.set(state.activeSessionId, { ...notice, keptAlive: true });
+		}
+	}
+
+	/** The session's live episode, if any (at most one exists per session by construction). */
+	private findLiveEpisodeFor(activeSessionId: string): StallRecoveryEpisode | undefined {
+		for (const episode of this.stallRecoveryEpisodes.values()) {
+			if (episode.key.startsWith(`${activeSessionId}:`)) return episode;
+		}
+		return undefined;
+	}
+
+	/** Drop every piece of recovery tracking for one session. */
+	private forgetStallRecoverySession(activeSessionId: string): void {
+		this.stallRecoveryNoticedAt.delete(activeSessionId);
+		for (const key of [...this.stallRecoveryEpisodes.keys()]) {
+			if (key.startsWith(`${activeSessionId}:`)) this.stallRecoveryEpisodes.delete(key);
+		}
+	}
+
+	/** Cap the tracking maps and drop entries whose sessions are gone. */
+	private pruneStallRecoveryTracking(): void {
+		for (const key of [...this.stallRecoveryEpisodes.keys()]) {
+			const activeSessionId = key.slice(0, key.lastIndexOf(":"));
+			if (!this.sessions.has(activeSessionId)) this.stallRecoveryEpisodes.delete(key);
+		}
+		for (const activeSessionId of [...this.stallRecoveryNoticedAt.keys()]) {
+			if (!this.sessions.has(activeSessionId)) this.stallRecoveryNoticedAt.delete(activeSessionId);
+		}
+		while (this.stallRecoveryEpisodes.size > STALL_RECOVERY_EPISODE_TRACKING_LIMIT) {
+			const oldest = this.stallRecoveryEpisodes.keys().next().value;
+			if (oldest === undefined) break;
+			this.stallRecoveryEpisodes.delete(oldest);
+		}
+		while (this.stallRecoveryActionCounts.size > STALL_RECOVERY_EPISODE_TRACKING_LIMIT) {
+			const oldest = this.stallRecoveryActionCounts.keys().next().value;
+			if (oldest === undefined) break;
+			this.stallRecoveryActionCounts.delete(oldest);
+		}
+	}
+
+	/**
+	 * The actions a stall event carries for wire clients (r4 recovery-shell):
+	 * what the daemon offers once the sweep has the session under observation.
+	 * The interactive TUI resolves its own view from its own keybindings and
+	 * never depends on this field; other clients read it to render an action
+	 * surface without inventing one.
+	 */
+	private stallRecoveryActionsFor(state: ActiveSessionState): StallEventActions | undefined {
+		const policy = this.stallRecoveryPolicyFor(state);
+		const notice = this.stallRecoveryNoticedAt.get(state.activeSessionId);
+		const keptAlive = notice?.keptAlive === true;
+		const armed = policy.enabled && !keptAlive;
+		return {
+			canAbort: true,
+			canDiagnose: true,
+			autoRecoveryArmed: armed,
+			executor: "daemon",
+			...(armed && notice !== undefined ? { autoRecoveryAtMs: notice.at + policy.windowMs } : {}),
+		};
+	}
+
+	/**
+	 * The session's effective recovery policy: which half of the mechanism it is
+	 * (child vs depth-0), the kill switch, the stop line, and the wait window in
+	 * ms. Children wait their grace regardless of attached clients (the parent
+	 * model is the responder); a depth-0 session waits only while a client is
+	 * attached - with nobody watching, the window collapses to 0.
+	 */
+	private stallRecoveryPolicyFor(state: ActiveSessionState): {
+		isChild: boolean;
+		enabled: boolean;
+		maxPerSession: number;
+		windowMs: number;
+	} {
+		const session = state.runtime.session;
+		const settings = session.settingsManager;
+		const metadata = state.runtime.metadata;
+		const isChild = metadata.kind === "subagent" && metadata.parentActiveSessionId !== undefined;
+		if (isChild) {
+			const policy = settings.getSubagentStallRecoverySettings();
+			return {
+				isChild,
+				enabled: policy.enabled,
+				maxPerSession: policy.maxPerSession,
+				windowMs: policy.graceSeconds * 1000,
+			};
+		}
+		const policy = settings.getRootStallRecoverySettings();
+		const hasUser = state.clients.size > 0;
+		return {
+			isChild,
+			enabled: policy.enabled,
+			maxPerSession: policy.maxPerSession,
+			windowMs: hasUser ? policy.humanWindowSeconds * 1000 : 0,
+		};
+	}
+
+	/** Force the session's roster row recompute so the recovery marker reaches clients. */
+	private markRosterRowDirty(state: ActiveSessionState): void {
+		this.scheduleRosterFlush({ activeSessionId: state.activeSessionId });
 	}
 
 	private beginReplacementSnapshot(
@@ -8359,6 +8894,10 @@ export class AgentDaemon {
 		if (this.rosterHeartbeatTimer) {
 			clearInterval(this.rosterHeartbeatTimer);
 			this.rosterHeartbeatTimer = undefined;
+		}
+		if (this.stallRecoveryTimer) {
+			clearInterval(this.stallRecoveryTimer);
+			this.stallRecoveryTimer = undefined;
 		}
 		this.log(`shutting down (exit ${exitCode}); closing ${this.sessions.size} active session(s)`);
 		const closingReason = this.getShutdownClosingReason();

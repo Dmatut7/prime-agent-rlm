@@ -79,6 +79,23 @@ export const DEFAULT_STALL_WARN_AFTER_SECONDS = 300;
  */
 export const DEFAULT_STALL_ABORT_AFTER_SECONDS = 0;
 
+/** r4 recovery-shell: how long the sweep waits after first observing a child's stall before acting. */
+export const DEFAULT_SUBAGENT_STALL_RECOVERY_GRACE_SECONDS = 300;
+
+/** r4 recovery-shell: human window for a depth-0 session with an attached client; 0 in effect means "no human wait". */
+export const DEFAULT_ROOT_STALL_RECOVERY_HUMAN_WINDOW_SECONDS = 120;
+
+/** r4 recovery-shell: consecutive auto actions per session before the stop line (children and roots alike). */
+export const DEFAULT_STALL_RECOVERY_MAX_PER_SESSION = 3;
+
+function nonNegativeFinite(value: number | undefined, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+function positiveFinite(value: number | undefined, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
 /**
  * Bound on waiting for the shared kernel-venv bootstrap lock before the boot
  * fails with an actionable error. Without it a wedged lock holder hangs the
@@ -294,6 +311,13 @@ export interface StallWatchdogSettings {
 	 * without a schema change later. Default false.
 	 */
 	treatKernelCpuProgressAsActivity?: boolean;
+	/** Automatic recovery of depth-0 sessions (r4 recovery-shell, mechanism ④-B). */
+	rootRecovery?: RootStallRecoverySettings;
+}
+
+/** Parent block for the subagent-facing recovery settings (r4 recovery-shell). */
+export interface SubagentsSettings {
+	stallRecovery?: SubagentStallRecoverySettings;
 }
 
 /**
@@ -307,6 +331,55 @@ export interface ResolvedStallWatchdogSettings {
 	abortAfterSeconds: number;
 	toolLivenessExemption?: boolean;
 	treatKernelCpuProgressAsActivity?: boolean;
+}
+
+/**
+ * Automatic stall recovery for RLM subagents (r4 recovery-shell, mechanism ③).
+ * After the watchdog warns and the session stays dead for `graceSeconds`, the
+ * daemon sweep interrupts the turn and queues a system instruction asking the
+ * child to change approach - once per (session, turn), never an automatic
+ * re-dispatch. `subagents.stallRecovery.enabled: false` is the rollback handle
+ * that returns to "notify only".
+ */
+export interface SubagentStallRecoverySettings {
+	/** Default true. Off means the daemon never acts on a silent child - notice only, exactly as before. */
+	enabled?: boolean;
+	/** How long the sweep waits after first observing the stall before acting, in seconds. Default 300. */
+	graceSeconds?: number;
+	/** Consecutive auto actions per session before the stop line: only notifications after that. Default 3. */
+	maxPerSession?: number;
+}
+
+/** Resolved {@link SubagentStallRecoverySettings} with the documented defaults filled in. */
+export interface ResolvedSubagentStallRecoverySettings {
+	enabled: boolean;
+	graceSeconds: number;
+	maxPerSession: number;
+}
+
+/**
+ * Automatic stall recovery for depth-0 sessions (r4 recovery-shell, mechanism
+ * ④-B): the same sweep, the same bounded action (interrupt + system
+ * instruction), a different wait policy. No attached client means nobody is
+ * watching, so the wait collapses; an attached client gets a human window in
+ * which any input cancels the auto action for that episode. `stallWatchdog.
+ * rootRecovery.enabled: false` is the rollback handle that returns a main
+ * session to warn-only.
+ */
+export interface RootStallRecoverySettings {
+	/** Default true. Off means the daemon never acts on a silent main session - warn only, exactly as before. */
+	enabled?: boolean;
+	/** Human window while a client is attached, in seconds; 0 means act as soon as the evidence confirms. Default 120. */
+	humanWindowSeconds?: number;
+	/** Consecutive auto actions per session before the stop line: only notifications after that. Default 3. */
+	maxPerSession?: number;
+}
+
+/** Resolved {@link RootStallRecoverySettings} with the documented defaults filled in. */
+export interface RootStallRecoverySettingsResolved {
+	enabled: boolean;
+	humanWindowSeconds: number;
+	maxPerSession: number;
 }
 
 /**
@@ -645,6 +718,8 @@ export interface Settings {
 	theme?: string;
 	compaction?: CompactionSettings;
 	stallWatchdog?: StallWatchdogSettings;
+	/** RLM subagent stall-recovery policy (r4 recovery-shell, mechanism ③). */
+	subagents?: SubagentsSettings;
 	subagentWake?: SubagentWakeSettings;
 	kernelBootstrap?: KernelBootstrapSettings;
 	kernelRestart?: KernelRestartSettings;
@@ -900,7 +975,9 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 		"abortAfterSeconds",
 		"toolLivenessExemption",
 		"treatKernelCpuProgressAsActivity",
+		"rootRecovery",
 	],
+	subagents: ["stallRecovery"],
 	subagentWake: ["policy"],
 	kernelBootstrap: ["lockTimeoutMs"],
 	kernelRestart: ["maxUnexpectedRestarts", "windowMinutes", "revivalVouchMaxAgeSeconds"],
@@ -991,6 +1068,8 @@ const KNOWN_NESTED_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	],
 	"retry.emptyTurn.recovery": ["enabled", "maxContinuations", "useBackupModel"],
 	"tools.timeout": ["enabled", "afterMs", "perTool"],
+	"subagents.stallRecovery": ["enabled", "graceSeconds", "maxPerSession"],
+	"stallWatchdog.rootRecovery": ["enabled", "humanWindowSeconds", "maxPerSession"],
 };
 
 /**
@@ -2400,6 +2479,29 @@ export class SettingsManager {
 			abortAfterSeconds,
 			toolLivenessExemption: this.settings.stallWatchdog?.toolLivenessExemption ?? true,
 			treatKernelCpuProgressAsActivity: this.settings.stallWatchdog?.treatKernelCpuProgressAsActivity ?? false,
+		};
+	}
+
+	/** Subagent stall-recovery policy (r4 recovery-shell ③), with defaults. */
+	getSubagentStallRecoverySettings(): ResolvedSubagentStallRecoverySettings {
+		const settings = this.settings.subagents?.stallRecovery ?? {};
+		return {
+			enabled: settings.enabled ?? true,
+			graceSeconds: nonNegativeFinite(settings.graceSeconds, DEFAULT_SUBAGENT_STALL_RECOVERY_GRACE_SECONDS),
+			maxPerSession: positiveFinite(settings.maxPerSession, DEFAULT_STALL_RECOVERY_MAX_PER_SESSION),
+		};
+	}
+
+	/** Depth-0 stall-recovery policy (r4 recovery-shell ④-B), with defaults. */
+	getRootStallRecoverySettings(): RootStallRecoverySettingsResolved {
+		const settings = this.settings.stallWatchdog?.rootRecovery ?? {};
+		return {
+			enabled: settings.enabled ?? true,
+			humanWindowSeconds: nonNegativeFinite(
+				settings.humanWindowSeconds,
+				DEFAULT_ROOT_STALL_RECOVERY_HUMAN_WINDOW_SECONDS,
+			),
+			maxPerSession: positiveFinite(settings.maxPerSession, DEFAULT_STALL_RECOVERY_MAX_PER_SESSION),
 		};
 	}
 

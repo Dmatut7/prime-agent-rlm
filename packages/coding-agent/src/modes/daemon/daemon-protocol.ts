@@ -269,8 +269,17 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 //   clients have no case for the type and already ignore unknown ones, and no command,
 //   capability, or response shape changes with it, so no revision bump and no
 //   capability gate - only the digest recomputation that covers the union growth.
-export const DAEMON_SCHEMA_REVISION = 39;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-39-192b0a5ab17a";
+// Revision 40 is the r4 recovery-shell window, claimed once for the whole
+//   feature rather than per-field: three additive server capabilities
+//   (child_stall_auto_recovery, stall_recovery_state, stall_action_bar), the
+//   optional actions field on the stall_warning event (the stall event and
+//   connection stall contract slices below hash it), and the optional
+//   stallRecovery marker on the session summary. No command changes, no event
+//   or response required-field changes: an older client ignores every one of
+//   these additions, exactly as it ignored empty_response_exhausted at rev 39,
+//   so the revision is a window marker with the digest as the identity.
+export const DAEMON_SCHEMA_REVISION = 40;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-40-ac8dd6b7277f";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -349,7 +358,20 @@ export type DaemonServerCapability =
 	// Agent-originated aborts (agent_message.abort -> abort/abort_and_send_queued
 	// with fromActiveSessionId). Gated at rev 39; absent on older daemons, which is
 	// the rejection that tells a new client the daemon cannot serve agent aborts.
-	| "abort_agent_target";
+	| "abort_agent_target"
+	// r4 recovery-shell: the daemon sweeps stalled sessions and acts on them
+	// (interrupt + queued system instruction, exactly once per turn). Clients can
+	// check this to know the rlm_child_recovery_action receipts and the roster
+	// stallRecovery markers describe real auto interventions by this build.
+	| "child_stall_auto_recovery"
+	// r4 recovery-shell: the roster row's stallRecovery marker (at, action,
+	// silentMs, count). Optional on the wire; clients without the capability
+	// simply never render the marker.
+	| "stall_recovery_state"
+	// r4 recovery-shell: stall_warning events may carry the optional actions
+	// field (canAbort/canDiagnose/autoRecoveryArmed/...). Additive; a client that
+	// does not know the field degrades to its existing plain-text stall render.
+	| "stall_action_bar";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -423,6 +445,9 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"control_plane",
 	"abort_and_send_queued",
 	"abort_agent_target",
+	"child_stall_auto_recovery",
+	"stall_recovery_state",
+	"stall_action_bar",
 ];
 
 /**

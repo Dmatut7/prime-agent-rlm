@@ -47,7 +47,14 @@ export interface RlmChildStallAbortFacts {
 	settled: boolean;
 }
 
-export type RlmChildTurnAbortReason = "user" | "stall_watchdog";
+/**
+ * "stall_recovery" (r4 recovery-shell): the turn was killed by the automatic
+ * stall-recovery executor, not by the watchdog and not by the user. It is
+ * "someone took over", not "the child failed on its own" - the classifier
+ * ranks it with the stall kills so a reply cannot swallow it, and the reason
+ * text says the child was auto-recovered, not merely killed.
+ */
+export type RlmChildTurnAbortReason = "user" | "stall_watchdog" | "stall_recovery";
 
 export interface RlmChildTerminalFacts {
 	runStatus: RlmChildRunStatus;
@@ -80,6 +87,14 @@ export type RlmChildTerminalOutcome =
 	| { kind: RlmChildFailureKind; channel: "failure"; reason: string };
 
 const DEFAULT_ABORTED_REASON = "turn aborted before completion";
+/**
+ * The no-facts form of an automatic stall-recovery interrupt: the parent saw no
+ * watchdog kill facts, only the abort reason. "auto-recovered" is the load-
+ * bearing word - the parent must read this as an intervention that kept the
+ * child alive, not as a death report.
+ */
+const STALL_RECOVERY_REASON =
+	"auto-recovered: interrupted by automatic stall recovery and given a system instruction to change approach; work in the aborted turn was lost, the session was kept";
 const DEFAULT_ERROR_REASON = "Assistant turn failed";
 const COMPLETED_WITHOUT_REPLY_REASON = "completed without sending a reply";
 
@@ -103,9 +118,14 @@ export function readStallKernelReasons(diagnostics: RlmChildStallDiagnosticsInpu
 export function formatStallKilledReason(
 	stall: Pick<RlmChildStallAbortFacts, "silentMs" | "inFlightTools" | "kernelReasons">,
 	diagnostics?: RlmChildStallDiagnosticsInput,
+	trigger: "stall_watchdog" | "stall_recovery" = "stall_watchdog",
 ): string {
 	const silentSeconds = Math.max(1, Math.round(stall.silentMs / 1000));
-	const parts = [`killed by the stall watchdog after ${silentSeconds}s of silence (silentMs=${stall.silentMs})`];
+	const parts = [
+		trigger === "stall_recovery"
+			? `auto-recovered: interrupted by automatic stall recovery after ${silentSeconds}s of silence (silentMs=${stall.silentMs}); a system instruction was queued so the child can retry with a changed approach`
+			: `killed by the stall watchdog after ${silentSeconds}s of silence (silentMs=${stall.silentMs})`,
+	];
 	const inFlight = diagnostics?.inFlightToolCalls ?? [];
 	if (inFlight.length > 0) {
 		const tools = inFlight
@@ -144,7 +164,10 @@ function legacyTwoStateOutcome(facts: RlmChildTerminalFacts): RlmChildTerminalOu
  *    the caller's suppressTerminalNotice, so a parent that aborted itself is not
  *    woken by its own kill).
  * 2. `stall_killed` - before `repliedDuringRun` on purpose: "it replied" is not
- *    evidence it was not killed, and a reply used to swallow the kill.
+ *    evidence it was not killed, and a reply used to swallow the kill. A
+ *    `stall_recovery` abort reason lands here too: the automatic recovery
+ *    executor owned the interrupt, which is a kill-class fact even though the
+ *    child was kept alive to retry.
  * 3. `aborted` - a user Esc or an aborted stop reason.
  * 4. `error` - provider/model failure.
  * 5. replied => nothing to synthesize.
@@ -161,7 +184,12 @@ export function classifyRlmChildTerminalOutcome(facts: RlmChildTerminalFacts): R
 		return { kind: "cancelled", channel: "notice", reason: facts.runError ?? "cancelled" };
 	}
 	const stallAbort = facts.stallAbort;
-	if (stallAbort || facts.turnAbortReason === "stall_watchdog") {
+	const stallRecovery = facts.turnAbortReason === "stall_recovery";
+	// stall_recovery ranks with the kills (not with the user aborts) on purpose:
+	// the recovery executor took the turn over, and "it replied" is not evidence
+	// that the intervention did not happen. The reason text differs so the parent
+	// reads an auto-recovery, not a plain watchdog kill.
+	if (stallAbort || facts.turnAbortReason === "stall_watchdog" || stallRecovery) {
 		if (stallAbort && !stallAbort.settled && facts.repliedDuringRun) {
 			return { kind: "none", channel: "none", reason: "stall_survived" };
 		}
@@ -171,7 +199,11 @@ export function classifyRlmChildTerminalOutcome(facts: RlmChildTerminalFacts): R
 		return {
 			kind: "stall_killed",
 			channel: "failure",
-			reason: stallAbort ? formatStallKilledReason(stallAbort) : DEFAULT_ABORTED_REASON,
+			reason: stallAbort
+				? formatStallKilledReason(stallAbort, undefined, stallRecovery ? "stall_recovery" : "stall_watchdog")
+				: stallRecovery
+					? STALL_RECOVERY_REASON
+					: DEFAULT_ABORTED_REASON,
 		};
 	}
 	if (facts.turnAbortReason === "user" || facts.lastStopReason === "aborted") {

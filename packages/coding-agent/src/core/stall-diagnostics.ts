@@ -32,3 +32,28 @@ export interface StallDiagnostics {
 	 */
 	kernel?: StallKernelDiagnostics;
 }
+
+/**
+ * The actions a stall event offers to whoever is watching (r4 recovery-shell).
+ * Optional and additive on the wire: an older emitter sends the stall events
+ * without it, and every renderer degrades to its existing plain-text behavior
+ * instead of showing actions that are not actually available.
+ *
+ * The emitter that fills this field is the daemon, once its stall-recovery sweep
+ * has the session under observation; the in-process interactive host resolves
+ * the same question locally from its own keybindings, so it never depends on
+ * the field. Terminal stall stages (`stall_abort`/`stall_unsettled`) never
+ * carry it: the turn is already dead and there is nothing left to act on.
+ */
+export interface StallEventActions {
+	/** The current turn can still be interrupted (abort command / host interrupt key). */
+	canAbort: boolean;
+	/** Stall diagnostics can be shown for the current turn. */
+	canDiagnose: boolean;
+	/** True once an auto-recovery executor has this session under observation. */
+	autoRecoveryArmed: boolean;
+	/** Who performs the auto action when the wait window closes. */
+	executor: "daemon" | "in-process";
+	/** Epoch ms when the auto action is expected (firstSeen + wait window), when armed. */
+	autoRecoveryAtMs?: number;
+}

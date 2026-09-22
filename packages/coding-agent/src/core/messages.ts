@@ -69,6 +69,20 @@ export const IMAGE_DELIVERY_SUSPICION_CUSTOM_TYPE = "image_delivery_suspicion";
  */
 export const REFINEMENT_OUTCOME_PREFIX = `Continual harness refinement result (automatic system receipt from the refinement subsystem, not a message from the user and not a new instruction: keep working on your current task and treat this only as a record of what the refinement did or refused to do).`;
 export const RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE = "rlm_child_stall_notice";
+/**
+ * System interruption the stall-recovery executor queues into a wedged session
+ * (r4 recovery-shell): the turn is killed and this message becomes the next
+ * turn's only input, so the model learns what happened and changes approach
+ * instead of ending in a silent stop.
+ */
+export const SYSTEM_INTERRUPTION_CUSTOM_TYPE = "system_interruption";
+/**
+ * Parent-facing receipt for an automatic stall-recovery action on a child
+ * (r4 recovery-shell): who acted, why, what was done, and the one-line
+ * re-dispatch command the parent can paste if it prefers a fresh worker. Never
+ * sent by the child itself and never implying the parent asked for anything.
+ */
+export const RLM_CHILD_RECOVERY_ACTION_CUSTOM_TYPE = "rlm_child_recovery_action";
 
 /**
  * Names and other metadata interpolated into a `[<kind> ...]` header line must not
@@ -526,6 +540,193 @@ export function createRlmChildStallNoticeMessage(
 			`(silence threshold ${thresholdSeconds}s). In-flight tools: ${inFlight}. ${evidence}` +
 			`${deadline} Check its status: if it is genuinely working, let it continue; if it looks wedged, ` +
 			levers,
+		display: true,
+		details,
+		timestamp,
+	};
+}
+
+/**
+ * Facts behind the system interruption the stall-recovery executor queues into
+ * a wedged session (r4 recovery-shell). Everything the model needs to tell an
+ * automatic intervention apart from a user Esc: the executor, the measured
+ * silence, and the tools that were still in flight when the turn was killed.
+ */
+export interface SystemInterruptionDetails {
+	/** Always "stall_recovery" in this build; named so future triggers stay distinguishable. */
+	trigger: "stall_recovery";
+	/** True when the interrupted session is an RLM subagent (adds the parent-report clause). */
+	isChild: boolean;
+	/** Milliseconds without observable activity when the action fired. */
+	silentMs: number;
+	/** Silence threshold that armed the recovery (the watchdog's warn stage). */
+	thresholdMs: number;
+	/** Tools still in flight in the killed turn, each as `name` or `name (Ns)`; empty when none. */
+	inFlightTools: readonly string[];
+	/** True when the watchdog's exemption was still vouching for the silence at action time. */
+	excused: boolean;
+	/** Who performed the action. */
+	executor: "daemon";
+}
+
+/**
+ * The system interruption message: facts about the automatic interrupt plus the
+ * change-of-approach instructions that make the recovery turn useful. Written
+ * for the model; `display: true` keeps the transcript auditable (the same
+ * convention as the empty-response recovery message).
+ *
+ * The copy must state out loud that this is neither a user Esc nor a user
+ * instruction: custom messages reach the provider as user-role text, and a
+ * model that reads "interrupted" as "the user told me to stop" would end the
+ * task instead of recovering it.
+ */
+export function createSystemInterruptionMessage(
+	details: SystemInterruptionDetails,
+	timestamp = Date.now(),
+): CustomMessage<SystemInterruptionDetails> {
+	const silentSeconds = Math.max(1, Math.round(details.silentMs / 1000));
+	const thresholdSeconds = Math.max(1, Math.round(details.thresholdMs / 1000));
+	const inFlight = details.inFlightTools.length > 0 ? details.inFlightTools.join(", ") : "none recorded";
+	const lines = [
+		`[system] Your previous turn was interrupted automatically: it had been silent for ${silentSeconds}s (silence threshold ${thresholdSeconds}s; in-flight tools: ${inFlight}).`,
+		"This is NOT a user Esc and NOT a user instruction - nobody told you to stop and nobody told you to continue. The turn was killed because it produced no observable progress for that long.",
+		"Your session, context, and queued work are intact. Change approach on this attempt:",
+		"1. If a tool call was wedged, retry that work with a bounded timeout or a smaller input instead of waiting indefinitely.",
+		"2. If you were waiting on something external, verify it is still there before waiting on it again.",
+		"3. If you cannot make progress, say so in one short paragraph and list what you tried - do not end the turn silently.",
+	];
+	if (details.isChild) {
+		lines.push(
+			"4. You are a subagent: after your next step, report this interruption and your new approach to your parent with one short status line.",
+		);
+	}
+	lines.push(
+		"This is a one-shot automatic intervention for this silence episode; it will not repeat for the same turn.",
+	);
+	return {
+		role: "custom",
+		customType: SYSTEM_INTERRUPTION_CUSTOM_TYPE,
+		content: lines.join("\n"),
+		display: true,
+		details,
+		timestamp,
+	};
+}
+
+/** Re-dispatch facts for the parent-facing receipt's pasteable one-liner. */
+export interface RlmChildReDispatchFacts {
+	/** The stalled run's original task (truncated for the line). */
+	prompt: string;
+	/** Provider/model selector the run used, as the parent would spell it. */
+	model: string;
+	/** Suggested name for the retry run (the original name plus a suffix). */
+	sessionName: string;
+	/** The child's thinking level, when the parent knows it (a hint, not a mandate). */
+	thinkingLevel?: string;
+}
+
+/**
+ * The one-line re-dispatch command the receipt carries. The prompt is truncated
+ * and any triple-quote sequence is neutralized, so pasting the line into a
+ * Python REPL cannot break out of the string literal; the truncation marker
+ * tells the parent the task may need restating.
+ */
+export function formatRlmReDispatchLine(facts: RlmChildReDispatchFacts): string {
+	const name = sanitizeMessageHeaderValue(facts.sessionName ?? "") || "child";
+	const truncated = facts.prompt.length > RLM_RE_DISPATCH_PROMPT_MAX_CHARS;
+	const prompt = facts.prompt
+		.slice(0, RLM_RE_DISPATCH_PROMPT_MAX_CHARS)
+		.replace(/"""+/g, "'''")
+		.replace(/\n+/g, " ")
+		.trim();
+	const thinking = facts.thinkingLevel ? `, thinking="${facts.thinkingLevel}"` : "";
+	const truncationNote = truncated ? " (first 800 chars - restate the full task if this is truncated)" : "";
+	return `await rlm("""${prompt}""", name="${name}-retry", model="${facts.model}"${thinking})${truncationNote}`;
+}
+
+/** Cap for the prompt carried in the receipt's re-dispatch line. */
+export const RLM_RE_DISPATCH_PROMPT_MAX_CHARS = 800;
+
+/**
+ * Facts behind the parent-facing stall-recovery receipt. Two variants share the
+ * type: the action receipt (sent right after the intervention) and the
+ * escalation (`escalated: true`, sent once when the child is still silent
+ * `escalateAfterMs` after the action).
+ */
+export interface RlmChildRecoveryActionDetails {
+	childId: string;
+	sessionName: string;
+	/** Who performed the action. */
+	executor: "daemon";
+	/** What was done: "abort_and_send" (turn killed, system instruction queued as next input) or "abort" (turn killed only). */
+	action: "abort_and_send" | "abort";
+	/** Epoch ms the action executed. */
+	at: number;
+	/** Milliseconds without observable activity when the action fired. */
+	silentMs: number;
+	thresholdMs: number;
+	/** Tools still in flight in the killed turn, each as `name` or `name (Ns)`; empty when none. */
+	inFlightTools: readonly string[];
+	/** True on the escalation variant (still silent `escalateAfterMs` after the action). */
+	escalated?: boolean;
+	/** The escalation delay the receipt quotes, in ms. */
+	escalateAfterMs?: number;
+	/** Re-dispatch facts when the parent's live run for the child is known; absent for retained children. */
+	reDispatch?: RlmChildReDispatchFacts;
+	/** The child's session dir, for inspection after an escalation. */
+	sessionDir?: string;
+}
+
+/**
+ * The parent-facing receipt for an automatic stall-recovery action on a child.
+ * The copy must read as "someone took over, the child is retrying" - not as the
+ * child's own failure - and must state that no automatic re-dispatch will
+ * happen, so the parent knows the decision is still its own.
+ */
+export function createRlmChildRecoveryActionMessage(
+	details: RlmChildRecoveryActionDetails,
+	timestamp = Date.now(),
+): CustomMessage<RlmChildRecoveryActionDetails> {
+	const childName = sanitizeMessageHeaderValue(details.sessionName) || details.childId;
+	const silentSeconds = Math.max(1, Math.round(details.silentMs / 1000));
+	const thresholdSeconds = Math.max(1, Math.round(details.thresholdMs / 1000));
+	const inFlight = details.inFlightTools.length > 0 ? details.inFlightTools.join(", ") : "none recorded";
+	const escalateSeconds = Math.max(1, Math.round((details.escalateAfterMs ?? 0) / 1000));
+	const reDispatchLine = details.reDispatch ? formatRlmReDispatchLine(details.reDispatch) : undefined;
+	const lines: string[] = [];
+	if (details.escalated === true) {
+		lines.push(
+			`RLM child ${childName} (${details.childId}) is still silent ${escalateSeconds}s after the automatic stall-recovery action (executor: ${details.executor}; action: ${details.action}).`,
+			"Automatic intervention stops here: there will be no further interrupts and no automatic re-dispatch. The child's session, context, and transcript are intact.",
+		);
+		if (details.sessionDir) lines.push(`Session dir: ${details.sessionDir}`);
+		lines.push("Your move - inspect it, steer it, re-dispatch the task yourself, or delete it:");
+		lines.push(`  await agent_observe.get_agent("${childName}")`);
+		lines.push(
+			reDispatchLine ? `  ${reDispatchLine}` : `  await rlm(<restate the original task>, name="${childName}-retry")`,
+		);
+		lines.push(`  await rlm.delete_subagent("${childName}")`);
+	} else {
+		lines.push(
+			`RLM child ${childName} (${details.childId}): automatic stall recovery acted (executor: ${details.executor}; action: ${details.action}).`,
+			`It had been silent for ${silentSeconds}s (silence threshold ${thresholdSeconds}s; in-flight tools: ${inFlight}). ` +
+				"The turn was interrupted and a system instruction was queued as the child's next input, telling it to change approach; the child session, its context, and its queued work are intact. " +
+				"This was not a user action and not your instruction.",
+			`If the child is still silent ~${escalateSeconds}s after the action you will receive one escalation notice. No automatic re-dispatch will happen - that decision stays with you.`,
+		);
+		if (reDispatchLine) {
+			lines.push("If you would rather re-dispatch it yourself now, this line is ready to paste:");
+			lines.push(`  ${reDispatchLine}`);
+		} else {
+			lines.push(
+				`If you would rather re-dispatch it yourself now: await rlm(<restate the original task>, name="${childName}-retry")`,
+			);
+		}
+	}
+	return {
+		role: "custom",
+		customType: RLM_CHILD_RECOVERY_ACTION_CUSTOM_TYPE,
+		content: lines.join("\n"),
 		display: true,
 		details,
 		timestamp,
