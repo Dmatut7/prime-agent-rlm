@@ -89,7 +89,6 @@ interface SessionRebindHarness {
 	updateAvailableProviderCount(): Promise<void>;
 	updateEditorBorderColor(): void;
 	updateTerminalTitle(): void;
-	refreshTopBarCost(): void;
 	getGoalState(): unknown;
 	setGoalAnnouncementBaseline(goal: unknown): void;
 	syncGoalTray(goal: unknown): void;
@@ -128,7 +127,6 @@ function createSessionRebindHarness(listHeartbeats: () => Promise<AgentConnectio
 	harness.updateAvailableProviderCount = vi.fn(async () => {});
 	harness.updateEditorBorderColor = vi.fn();
 	harness.updateTerminalTitle = vi.fn();
-	harness.refreshTopBarCost = vi.fn();
 	harness.getGoalState = vi.fn(() => ({}));
 	harness.setGoalAnnouncementBaseline = vi.fn();
 	harness.syncGoalTray = vi.fn();
