@@ -4,11 +4,15 @@ import { Markdown } from "../src/components/markdown.js";
 import { getCapabilities, resetCapabilitiesCache, setCapabilities } from "../src/terminal-image.js";
 import { defaultMarkdownTheme } from "./test-themes.js";
 
-// OSC 8 probe: with hyperlinks the renderer wraps the link text in
-// "\x1b]8;;url\x1b\...\x1b]8;;\x1b\"; without them it falls back to
-// "text (url)". Both forms are in the same line, so a plain includes() check
-// separates capability-blind stale caches from a re-render.
+// Flip probe: the renderer now always emits OSC 8 wrappers (unsupported
+// terminals consume unknown OSC silently, so labeled links stay clickable in
+// the fallback form - ENG-6126). The visible difference between the two
+// capability forms is the URL fallback: hyperlinks off renders
+// "text (url)" beside the wrapper, hyperlinks on renders the wrapper alone.
+// Probing both the wrapper and the visible URL separates capability-blind
+// stale caches from a re-render.
 const OSC8 = "\x1b]8;;";
+const URL_FALLBACK = "(http://example.com/page)";
 
 const DOC = "see [x](http://example.com/page) here\n\ntrailing text that keeps growing while the stream continues";
 
@@ -26,13 +30,17 @@ describe("markdown capability flip", () => {
 				streamed.setText(DOC.slice(0, pos));
 				streamed.render(80);
 			}
-			assert.ok(!streamed.render(80).join("\n").includes(OSC8));
+			assert.ok(
+				streamed.render(80).join("\n").includes(URL_FALLBACK),
+				"pre-flip render must show the URL fallback form",
+			);
 			setCapabilities({ ...getCapabilities(), hyperlinks: true });
 			// The link block's raw text is unchanged by this append; a
 			// capability-blind block cache would keep serving the fallback lines.
 			streamed.setText(`${DOC} tail`);
 			const got = streamed.render(80).join("\n");
 			assert.ok(got.includes(OSC8), "frame after the flip must emit OSC 8 hyperlinks");
+			assert.ok(!got.includes(URL_FALLBACK), "frame after the flip must drop the visible URL fallback");
 			assert.strictEqual(got, freshRender(`${DOC} tail`, 80));
 			// Positive control: a fresh component under the flipped capabilities
 			// emits OSC 8, proving the probe detects the hyperlink form at all.
@@ -47,13 +55,14 @@ describe("markdown capability flip", () => {
 		try {
 			const md = new Markdown(DOC, 1, 0, defaultMarkdownTheme);
 			const before = md.render(80).join("\n");
-			assert.ok(!before.includes(OSC8));
+			assert.ok(before.includes(URL_FALLBACK), "pre-flip render must show the URL fallback form");
 			setCapabilities({ ...getCapabilities(), hyperlinks: true });
 			// No setText: the whole-result fast path (cachedText === text &&
 			// cachedWidth === width) is the only thing that can serve the stale
 			// pre-flip lines here.
 			const after = md.render(80).join("\n");
 			assert.ok(after.includes(OSC8), "second render at the same width must not replay the cached pre-flip form");
+			assert.ok(!after.includes(URL_FALLBACK), "post-flip render must drop the visible URL fallback");
 			assert.strictEqual(after, freshRender(DOC, 80));
 			// Positive control: the probe can detect the hyperlink form.
 			assert.ok(freshRender(DOC, 80).includes(OSC8));
