@@ -52,6 +52,7 @@ function createSuspicionSession(
 ): {
 	session: AgentSession;
 	streamCalls: () => number;
+	settingsManager: SettingsManager;
 	dir: string;
 } {
 	const dir = mkdtempSync(join(tmpdir(), "pi-image-delivery-suspicion-"));
@@ -81,10 +82,11 @@ function createSuspicionSession(
 	});
 	const auth = AuthStorage.create(join(dir, "auth.json"));
 	auth.setRuntimeApiKey("anthropic", "test-key");
+	const settingsManager = SettingsManager.create(dir, dir);
 	const session = new AgentSession({
 		agent,
 		sessionManager: SessionManager.inMemory(),
-		settingsManager: SettingsManager.create(dir, dir),
+		settingsManager,
 		cwd: dir,
 		modelRegistry: ModelRegistry.create(auth, join(dir, "models.json")),
 		resourceLoader: createTestResourceLoader(),
@@ -110,7 +112,7 @@ function createSuspicionSession(
 			},
 		],
 	});
-	return { session, streamCalls, dir };
+	return { session, streamCalls, settingsManager, dir };
 }
 
 function suspicionNotices(session: AgentSession): CustomMessage[] {
@@ -185,6 +187,33 @@ it("does not notice on image-free turns or on responses that did not complete cl
 	} finally {
 		errored.session.dispose();
 		rmSync(errored.dir, { recursive: true, force: true });
+	}
+});
+
+it("does not notice when blockImages replaced the images with placeholders", async () => {
+	// blockImages swaps every image for a text placeholder before the request,
+	// so the provider truthfully counts no image tokens: no suspicion.
+	const fixture = createSuspicionSession([{ usage: {} }]);
+	try {
+		fixture.settingsManager.setBlockImages(true);
+		await fixture.session.prompt("describe", { images: [IMAGE] });
+		expect(suspicionNotices(fixture.session)).toHaveLength(0);
+	} finally {
+		fixture.session.dispose();
+		rmSync(fixture.dir, { recursive: true, force: true });
+	}
+});
+
+it("does not notice on an aborted response", async () => {
+	// An aborted run is not a clean completion either; its usage frame says
+	// nothing about whether images were counted.
+	const fixture = createSuspicionSession([{ usage: {}, stopReason: "aborted" }]);
+	try {
+		await fixture.session.prompt("describe", { images: [IMAGE] });
+		expect(suspicionNotices(fixture.session)).toHaveLength(0);
+	} finally {
+		fixture.session.dispose();
+		rmSync(fixture.dir, { recursive: true, force: true });
 	}
 });
 
