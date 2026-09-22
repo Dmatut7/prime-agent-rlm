@@ -7360,6 +7360,10 @@ export class InteractiveMode {
 					this.hiddenThinkingLabel,
 					{
 						expanded: this.toolOutputExpanded,
+						// F2: the thinking lane must survive a rebuild too - without
+						// it, a compaction or chat-cap window rebuild silently collapses
+						// the traces the user had expanded.
+						thinkingExpanded: this.thinkingExpanded,
 						precededByToolActivity:
 							this.chatContainer.children.at(-1) instanceof ToolExecutionComponent ||
 							this.chatContainer.children.at(-1) instanceof AgentMessageComponent,
