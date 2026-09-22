@@ -1,2 +1,0 @@
-- Added an escalated slow tier to the in-place empty-turn retry ladder: after the fast attempts are spent, up to three more resends wait 30s/60s/120s, with per-tier wait budgets and tier-split exhaustion diagnostics.
-- Added a per-tool-call deadline (`AgentLoopConfig.toolTimeout`, refinable per tool via `AgentTool.executionTimeoutMs`): a call that settles nothing before the deadline is cancelled through the abort harvest, the model receives a `tool_timeout:` tool result, and the turn continues.

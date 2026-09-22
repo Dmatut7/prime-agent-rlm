@@ -1,1 +1,0 @@
-- Fixed the stall-recovery stop-line keys (`subagents.stallRecovery.maxPerSession`, `stallWatchdog.rootRecovery.maxPerSession`) to honor an explicit 0 as notify-only instead of silently restoring the default of 3, aligning their 0 semantics with `graceSeconds` and `humanWindowSeconds`.

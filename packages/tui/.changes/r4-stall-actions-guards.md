@@ -1,1 +1,0 @@
-- Hardened the stall action bar: an action without a callback renders no hint and consumes no key, and an unbound diagnostics key renders no click region.

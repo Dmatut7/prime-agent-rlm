@@ -1,1 +1,0 @@
-- Added a TUI stall action bar: a non-modal strip that renders stall events carrying an `actions` field as clickable "interrupt this turn" / "show stall diagnostics" hints (diagnostics bound to the new, configurable `app.stall.diagnostics` keybinding, default ctrl+y; the interrupt hint reuses the host's existing interrupt key) and degrades events without the field to plain text.

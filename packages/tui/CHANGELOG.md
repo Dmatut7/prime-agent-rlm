@@ -2,6 +2,12 @@
 
 ## [0.11.0] - 2026-09-22
 
+- Added a TUI stall action bar: a non-modal strip that renders stall events carrying an `actions` field as clickable "interrupt this turn" / "show stall diagnostics" hints (diagnostics bound to the new, configurable `app.stall.diagnostics` keybinding, default ctrl+y; the interrupt hint reuses the host's existing interrupt key) and degrades events without the field to plain text.
+- Hardened the stall action bar: an action without a callback renders no hint and consumes no key, and an unbound diagnostics key renders no click region.
+- Added an auto-recovery countdown line to the TUI stall action bar: when a stall event carries the daemon's armed `autoRecoveryAtMs`, the bar shows "machine will act at HH:MM:SS (in Xs)" under the action hints, and an event without that field renders exactly the lines it did before.
+
+## [0.11.0] - 2026-09-22
+
 - Fixed input and rendering lag in long sessions written in CJK and other non-Latin scripts, where the terminal width cache was too small to hold a session's text and re-segmented it every frame.
 - Changed the fullscreen transcript and container rendering to reuse the previous frame's lines when no component changed, so cost tracks what moved instead of how long the session is.
 - Changed the editor to reuse word-wrapped lines across frames and keystrokes, so typing re-wraps only the edited line rather than the whole input.
