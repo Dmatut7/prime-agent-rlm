@@ -115,7 +115,10 @@ export function startSideQuestion(
 		maxRetryDelayMs: parent.maxRetryDelayMs,
 		toolExecution: parent.toolExecution,
 		streamStallTimeoutMs: parent.streamStallTimeoutMs,
-		emptyTurnRetry: parent.emptyTurnRetry,
+		// Side questions are user-visible lookups: they inherit the fast retry tier but
+		// never the slow escalation (30/60/120s backoff) — a side panel must not sit
+		// silent for minutes the way autonomous work may.
+		emptyTurnRetry: { ...parent.emptyTurnRetry, escalatedAttempts: 0 },
 	});
 
 	let answer = "";

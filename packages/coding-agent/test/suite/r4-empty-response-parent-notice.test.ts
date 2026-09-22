@@ -4,6 +4,7 @@ import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentFamilyRosterResult, AgentSessionMessageReceipt } from "../../src/core/agent-messages.js";
 import { SUBAGENT_TERMINAL_ERROR_NOTICE_PREFIX } from "../../src/core/agent-messages.js";
+import { EMPTY_RESPONSE_RECOVERY_CUSTOM_TYPE } from "../../src/core/messages.js";
 import { createHarness, type Harness } from "./harness.js";
 
 /**
@@ -111,6 +112,58 @@ describe("empty-response terminal notice reports the real ladder facts", () => {
 		expect(input.message).toContain("stopped by attempts");
 		// The misreport this replaces.
 		expect(input.message).not.toContain("no retries attempted");
+	});
+
+	it("dispatches the recovery turn when the empty ladder exhausted inside a retry run (no isRetrying deadlock)", async () => {
+		// K3 deep review, must-1: a retryable error arms the session retry chain, the
+		// retry run then ends with the empty ladder exhausted, and the recovery turn is
+		// admitted. The retry promise must resolve BEFORE the early return, or
+		// isRetrying stays true, the pump gate blocks the admitted recovery turn, and
+		// the session deadlocks (no third provider call, promptAndWait never settles,
+		// and a child has no Esc escape). This sequence - 5xx and empty responses
+		// interleaved - is exactly the incident window the feature targets.
+		const harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1, emptyTurn: { escalatedAttempts: 0 } } },
+		});
+		harnesses.push(harness);
+		const retryEvents: string[] = [];
+		harness.session.subscribe((event) => {
+			if (event.type === "auto_retry_start") retryEvents.push(`start:${event.attempt}`);
+			if (event.type === "auto_retry_end") retryEvents.push(`end:${event.success}`);
+		});
+
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			exhaustedEmptyTurn(),
+			fauxAssistantMessage("recovered after the recovery turn"),
+		]);
+
+		await harness.session.promptAndWait("do the task");
+
+		// The retry chain armed and finished, and the recovery turn actually ran:
+		// three provider calls - the failing run, the retry run, the recovery turn.
+		// The recovery dispatch is a scheduled pump hop after the retry chain settles.
+		expect(retryEvents).toContain("start:1");
+		expect(harness.session.isRetrying).toBe(false);
+		await vi.waitFor(
+			() => {
+				expect(harness.faux.state.callCount).toBe(3);
+			},
+			{ timeout: 5_000, interval: 20 },
+		);
+		expect(
+			harness.session.messages.some(
+				(message) =>
+					message.role === "custom" &&
+					(message as { customType?: string }).customType === EMPTY_RESPONSE_RECOVERY_CUSTOM_TYPE,
+			),
+		).toBe(true);
+		const last = [...harness.session.messages].reverse().find((m) => m.role === "assistant");
+		const lastText = ((last as { content?: Array<{ type: string; text?: string }> } | undefined)?.content ?? [])
+			.filter((part) => part.type === "text")
+			.map((part) => part.text ?? "")
+			.join("");
+		expect(lastText).toContain("recovered after the recovery turn");
 	});
 
 	it("counts the recovery continuations that already failed when it reports the terminal", async () => {

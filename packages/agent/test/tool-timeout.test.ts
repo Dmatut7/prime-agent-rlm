@@ -242,6 +242,62 @@ describe("per-tool-call deadline", () => {
 		expect(textOf(toolResult)).not.toContain("per-call deadline");
 	});
 
+	it("a deadline-cancelled tool result never carries terminate back into a live turn", async () => {
+		// 0902 deep review, must-2: the tool settled `terminate: true` in flight, and the
+		// deadline harvested its partial output. The harvested result must NOT spread
+		// `terminate` - only the run-abort harvest (the turn is already dying) does - or
+		// the turn ends retroactively and the model loses the "same turn, different
+		// approach" contract the types.ts invariant promises.
+		const terminator = slowTool(60, "terminator");
+		const originalExecute = terminator.execute;
+		terminator.execute = async (...args) => {
+			const result = await originalExecute(...args);
+			return { ...result, terminate: true } as Awaited<ReturnType<typeof originalExecute>>;
+		};
+		const { messages, streamCalls } = await runToolTurn({
+			tools: [terminator],
+			toolCalls: [{ id: "tool_1", name: "terminator" }],
+			config: { toolTimeout: { afterMs: 20 } },
+		});
+
+		const toolResult = toolResultOf(messages);
+		// The harvest still caught the late output and tagged the deadline cause.
+		expect(textOf(toolResult)).toContain(TOOL_TIMEOUT_CAUSE_PREFIX);
+		// But the turn stayed alive: terminate must not survive the timeout harvest.
+		expect(streamCalls()).toBe(2);
+		const last = messages.at(-1);
+		expect(last?.role).toBe("assistant");
+	});
+
+	it("a run-aborted tool result still carries terminate (the turn is dying anyway)", async () => {
+		// Negative control for the same guard: the run-abort harvest path keeps the
+		// tool's own terminate so a run abort cannot resurrect a turn the tool ended.
+		const controller = new AbortController();
+		const terminator = slowTool(60, "terminator");
+		const originalExecute = terminator.execute;
+		terminator.execute = async (...args) => {
+			const result = await originalExecute(...args);
+			return { ...result, terminate: true } as Awaited<ReturnType<typeof originalExecute>>;
+		};
+		setTimeout(() => controller.abort("Abort cause: watchdog"), 10);
+		const { messages } = await runToolTurn({
+			tools: [terminator],
+			toolCalls: [{ id: "tool_1", name: "terminator" }],
+			signal: controller.signal,
+			config: { toolTimeout: { afterMs: 60_000 } },
+		});
+
+		const toolResult = toolResultOf(messages);
+		// The abort fired at 10ms; the tool settled at 60ms, so the harvest caught the
+		// late partial output (marker + abort cause), not the fallback message. The
+		// run-abort harvest is the path that still carries the tool's own terminate
+		// internally (createToolResultMessage never puts it on the wire, so the pin
+		// asserts the observable surface; the deadline pin above is the load-bearing one).
+		expect(textOf(toolResult)).toContain(ABORT_TRUNCATION_MARKER);
+		expect(textOf(toolResult)).toContain("Abort cause: watchdog");
+		expect(toolResult.isError).toBe(true);
+	});
+
 	it("an extension buys exactly one window: the next fire re-asks and fails", async () => {
 		const vouch = vi.fn<(info: { elapsedMs: number; timeoutMs: number }) => ToolTimeoutVerdict | undefined>();
 		vouch.mockReturnValueOnce({ action: "extend", recheckMs: 15 }).mockReturnValueOnce(undefined);

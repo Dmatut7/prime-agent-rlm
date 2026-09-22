@@ -6644,6 +6644,15 @@ export class AgentSession {
 			// run was aborted between attempts - the failure is terminal and must be
 			// heard: an event and a log line instead of the silent stop this was.
 			if (isEmptyTurnRetryExhausted(msg)) {
+				// K3 deep review, must-1: the retry chain must resolve before the recovery
+				// turn is queued. When the empty ladder exhausted inside a retry run, this
+				// run WAS the retry outcome - the promise's job is done. Returning with it
+				// still pending leaves isRetrying true, the pump gate (:10320) blocks the
+				// queued recovery turn, and the session deadlocks with no Esc escape for
+				// children (episode semantics live in _emptyTurnRecoveryUsed/_retryAttempt).
+				// _resolveRetry is a no-op without a pending promise, so the plain path
+				// below resolving again is harmless.
+				this._resolveRetry();
 				if (this._queueEmptyTurnRecoveryTurn(msg)) return;
 				this._emitEmptyResponseExhausted(msg);
 			}

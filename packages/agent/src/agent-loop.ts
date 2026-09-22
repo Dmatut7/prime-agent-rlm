@@ -301,6 +301,11 @@ async function preserveAbortedToolResult(
 			abortCause === undefined ? labels.fallbackMessage : `${labels.fallbackMessage} ${abortCause}`,
 		);
 	}
+	// The per-call deadline keeps the turn alive: a tool that settled `terminate` in
+	// flight must not end the turn retroactively through the harvested result, or the
+	// model loses the "same turn, different approach" contract (types.ts invariant).
+	// Only the run-abort harvest path (the turn is already dying) preserves it.
+	const carryTerminate = labels === TURN_ABORT_HARVEST_LABELS;
 	return {
 		content: [
 			...preserved.content,
@@ -310,7 +315,7 @@ async function preserveAbortedToolResult(
 			},
 		],
 		details: preserved.details,
-		...(preserved.terminate === undefined ? {} : { terminate: preserved.terminate }),
+		...(carryTerminate && preserved.terminate !== undefined ? { terminate: preserved.terminate } : {}),
 	};
 }
 
@@ -1760,7 +1765,9 @@ async function executePreparedToolCall(
 				verdict = { action: "extend", recheckMs: timeoutMs! };
 			}
 			if (verdict?.action === "extend") {
-				armToolTimeout(Math.max(0, verdict.recheckMs));
+				// Loop-level floor: a broken arbiter that returns recheckMs 0/NaN must not turn
+				// the extension check into a hot spin (measured 227 vouch/s without this).
+				armToolTimeout(Math.max(1000, verdict.recheckMs));
 				return;
 			}
 			timeoutAbortCause = formatToolTimeoutAbortCause(info.toolName, info.elapsedMs, timeoutMs!);
