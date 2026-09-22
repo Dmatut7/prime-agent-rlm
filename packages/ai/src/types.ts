@@ -235,6 +235,15 @@ export interface Usage {
 	output: number;
 	cacheRead: number;
 	cacheWrite: number;
+	/**
+	 * Image tokens the provider counted inside the prompt, when the provider
+	 * reports them (OpenAI-completions `usage.prompt_tokens_details.image_tokens`).
+	 * Absent when the provider does not report image tokens at all - which some
+	 * vision-capable providers genuinely never do - so absence alone is a
+	 * suspicion signal, never proof that images did not arrive. Already included
+	 * in `input`/`totalTokens`; informational, not additive.
+	 */
+	imageTokens?: number;
 	totalTokens: number;
 	cost: {
 		input: number;

@@ -1,0 +1,1 @@
+- Added a level-one image-delivery suspicion notice: when an image-carrying turn completes on an OpenAI-completions API whose usage reported no image token count, the session records a user-visible receipt saying the model may not have received the images (suspicion only; some vision providers never report the count; no settings change).

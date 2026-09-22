@@ -1,10 +1,22 @@
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Agent } from "@earendil-works/pi-agent-core";
+import type { ImageContent, ToolResultMessage } from "@earendil-works/pi-ai";
+import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getBundledSkillsDir } from "../src/config.js";
-import type { PythonSkillRuntimeInfo } from "../src/core/skills.js";
+import { AgentSession } from "../src/core/agent-session.js";
+import { AuthStorage } from "../src/core/auth-storage.js";
+import { ModelRegistry } from "../src/core/model-registry.js";
+import { SessionManager } from "../src/core/session-manager.js";
+import { SettingsManager } from "../src/core/settings-manager.js";
+import type { PythonSkillRuntimeInfo, Skill } from "../src/core/skills.js";
+import { createSyntheticSourceInfo } from "../src/core/source-info.js";
 import { IpythonKernelProvisioner, imageBlocksFromAttachments } from "../src/core/tools/ipython.js";
+import { assistantMsg, createTestResourceLoader } from "./utilities.js";
+
+const IMAGE: ImageContent = { type: "image", mimeType: "image/png", data: "aGk=" };
 
 const PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==";
 
@@ -271,5 +283,150 @@ print("done")
 		expect(result.status).toBe("error");
 		expect(result.stderr).toContain("attachment dropped");
 		expect(result.attachments).toBeUndefined();
+	});
+});
+
+function attachToolCallMessage(id: string, code: string): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [{ type: "toolCall", id, name: "ipython", arguments: { code } }],
+		api: "anthropic-messages",
+		provider: "anthropic",
+		model: "test",
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "toolUse",
+		timestamp: Date.now(),
+	};
+}
+
+describe("model.info over a session's kernel host bridge", () => {
+	// attach_image's preflight asks the host for model.info and rejects when the
+	// reported model has no image input. The handler must answer with the model
+	// serving the current run: a routed image turn serves on settings.imageModel,
+	// so an in-turn attach is allowed there, while an image-free turn of a
+	// text-only session model still reports that model and still rejects.
+	interface SessionFixture {
+		session: AgentSession;
+		servedIds: string[];
+		dir: string;
+	}
+
+	function createAttachSession(settings: Record<string, unknown>): SessionFixture {
+		const dir = mkdtempSync(join(tmpdir(), "pi-attach-image-session-"));
+		writeFileSync(join(dir, "settings.json"), JSON.stringify(settings));
+		writeFileSync(join(dir, "sample.png"), Buffer.from(PNG_BASE64, "base64"));
+		const base = getModel("anthropic", "claude-opus-4-7")!;
+		const sessionModel = { ...base, id: "claude-opus-4-7-text-only", input: ["text"] } as typeof base;
+		const packagePath = join(getBundledSkillsDir(), "attach-image");
+		const skillFilePath = join(packagePath, "SKILL.md");
+		const attachImageSkill: Skill = {
+			name: "attach-image",
+			description: "test",
+			filePath: skillFilePath,
+			baseDir: packagePath,
+			sourceInfo: createSyntheticSourceInfo(skillFilePath, { source: "test" }),
+			disableModelInvocation: false,
+			kind: "python",
+			python: {
+				importName: "attach_image",
+				packagePath,
+				pyprojectPath: join(packagePath, "pyproject.toml"),
+			},
+		};
+		const servedIds: string[] = [];
+		let call = 0;
+		const attachCode = `print(await attach_image(${JSON.stringify(join(dir, "sample.png"))}))`;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model: sessionModel, systemPrompt: "Test", tools: [] },
+			streamFn: (model) => {
+				servedIds.push(model.id);
+				call += 1;
+				const stream = new EventStream<AssistantMessageEvent, AssistantMessage>(
+					(e) => e.type === "done",
+					(e: any) => e.message,
+				);
+				const message = call === 1 ? attachToolCallMessage("call-1", attachCode) : assistantMsg("ok");
+				stream.push({ type: "done", reason: message.stopReason as "stop" | "toolUse", message });
+				return stream;
+			},
+		});
+		const auth = AuthStorage.create(join(dir, "auth.json"));
+		auth.setRuntimeApiKey("anthropic", "test-key");
+		const session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settingsManager: SettingsManager.create(dir, dir),
+			cwd: dir,
+			modelRegistry: ModelRegistry.create(auth, join(dir, "models.json")),
+			resourceLoader: createTestResourceLoader({ skills: [attachImageSkill] }),
+		});
+		return { session, servedIds, dir };
+	}
+
+	function ipythonToolResults(session: AgentSession): ToolResultMessage[] {
+		return session.messages.filter(
+			(message): message is ToolResultMessage => message.role === "toolResult" && message.toolName === "ipython",
+		);
+	}
+
+	function cleanupSessionDir(dir: string): void {
+		// A disposed kernel can still be flushing its final snapshot writes; retry
+		// briefly so a green suite never fails on ENOTEMPTY.
+		for (let attempt = 0; attempt < 20; attempt++) {
+			try {
+				rmSync(dir, { recursive: true, force: true });
+				return;
+			} catch (error) {
+				if (attempt === 19) throw error;
+				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+			}
+		}
+	}
+
+	it("lets a routed image turn attach images: model.info reports the serving image model", async () => {
+		const fixture = createAttachSession({ imageModel: "claude-haiku-4-5" });
+		try {
+			await fixture.session.prompt("describe", { images: [IMAGE] });
+			expect(fixture.servedIds).toEqual(["claude-haiku-4-5", "claude-haiku-4-5"]);
+			const results = ipythonToolResults(fixture.session);
+			expect(results).toHaveLength(1);
+			expect(results[0].isError).toBe(false);
+			expect(results[0].content).toEqual([
+				{ type: "text", text: expect.stringContaining("Loaded 1 image(s) into context") },
+				{ type: "image", data: PNG_BASE64, mimeType: "image/png" },
+			]);
+		} finally {
+			fixture.session.dispose();
+			cleanupSessionDir(fixture.dir);
+		}
+	});
+
+	it("still rejects attach on an image-free turn of a text-only session model", async () => {
+		const fixture = createAttachSession({ imageModel: "claude-haiku-4-5" });
+		try {
+			await fixture.session.prompt("describe");
+			expect(fixture.servedIds).toEqual(["claude-opus-4-7-text-only", "claude-opus-4-7-text-only"]);
+			const results = ipythonToolResults(fixture.session);
+			expect(results).toHaveLength(1);
+			// A failed cell reports its traceback in the result text: the vision
+			// rejection must be there, and no image block may ride along.
+			expect(results[0].content[0]).toMatchObject({
+				type: "text",
+				text: expect.stringContaining("claude-opus-4-7-text-only does not support vision"),
+			});
+			expect(results[0].content.some((block) => block.type === "image")).toBe(false);
+			expect((results[0].details as { status?: string }).status).toBe("error");
+		} finally {
+			fixture.session.dispose();
+			cleanupSessionDir(fixture.dir);
+		}
 	});
 });

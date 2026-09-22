@@ -1407,7 +1407,11 @@ type ChunkUsageFrame = {
 	prompt_tokens?: number;
 	completion_tokens?: number;
 	prompt_cache_hit_tokens?: number;
-	prompt_tokens_details?: { cached_tokens?: number; cache_write_tokens?: number };
+	prompt_tokens_details?: {
+		cached_tokens?: number;
+		cache_write_tokens?: number;
+		image_tokens?: number;
+	};
 };
 
 /**
@@ -1427,6 +1431,7 @@ function mergeChunkUsage(previous: ChunkUsageFrame | undefined, current: ChunkUs
 				? {
 						cached_tokens: currentDetails?.cached_tokens ?? previousDetails?.cached_tokens,
 						cache_write_tokens: currentDetails?.cache_write_tokens ?? previousDetails?.cache_write_tokens,
+						image_tokens: currentDetails?.image_tokens ?? previousDetails?.image_tokens,
 					}
 				: undefined,
 	};
@@ -1457,6 +1462,11 @@ function parseChunkUsage(
 		output: outputTokens,
 		cacheRead: cacheReadTokens,
 		cacheWrite: cacheWriteTokens,
+		// Zero is a legitimate report (an image-free prompt on a provider that
+		// counts image tokens), so only an absent field stays absent.
+		...(rawUsage.prompt_tokens_details?.image_tokens !== undefined
+			? { imageTokens: rawUsage.prompt_tokens_details.image_tokens }
+			: {}),
 		totalTokens: input + outputTokens + cacheReadTokens + cacheWriteTokens,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};

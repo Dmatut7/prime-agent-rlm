@@ -253,6 +253,7 @@ import {
 	createCompactionOutcomeMessage,
 	createHarnessDigestMessage,
 	createHeartbeatPromptMessage,
+	createImageDeliverySuspicionMessage,
 	createRefinementFailureMessage,
 	createRefinementOutcomeMessage,
 	createRlmChildFailureMessage,
@@ -1203,6 +1204,19 @@ function messageCarriesImages(message: QueuedAgentMessage | AgentMessage): boole
 	return Array.isArray(content) && content.some((part: { type?: string }) => part?.type === "image");
 }
 
+/**
+ * Whether the messages a dispatch commits (its turn records plus any prepared
+ * extra messages) attach image content. Image routing and the image-delivery
+ * suspicion check both read this off the committed batch, so the two agree on
+ * what "this run's request carried images" means.
+ */
+function batchCarriesImages(turns: SessionAction<PreparedTurnPayload>[], extraMessages: AgentMessage[]): boolean {
+	return (
+		extraMessages.some((message) => messageCarriesImages(message)) ||
+		turns.some((action) => action.payload.records.some((record) => messageCarriesImages(record.message)))
+	);
+}
+
 function queuedAgentMessagePreview(action: QueuedSessionAction): string {
 	const payload = action.payload;
 	if (payload.kind === "session_command") return payload.text;
@@ -1667,7 +1681,7 @@ export const CANCELLABLE_KERNEL_HOST_REQUEST_TYPES: readonly string[] = [
 	"rlm.list_subagents", // reads this session's own child roster
 	"rlm.collect", // bounded read-only wait for this session's own children; cancelling it cancels no child
 	"agent_observe.*", // list/get/recent: reads transcripts and status
-	"model.info", // reads this session's model
+	"model.info", // reads the model serving the current run (routed image turns included)
 	"agent_message.list_agents", // reads the family roster
 ];
 const SESSION_PERSIST_FAILURE_REPORT_BASE_MS = 30_000;
@@ -3750,6 +3764,11 @@ export class AgentSession {
 		}
 	}
 
+	/** Whether the batch committed for the current run carried image content. */
+	private _dispatchedBatchCarriedImages = false;
+	/** Whether the current run already emitted an image-delivery suspicion notice. */
+	private _imageDeliverySuspicionNotified = false;
+
 	/**
 	 * Routing decision for a dispatched turn batch: when any delivered message
 	 * attaches images and the session model has no image input, serve the turn
@@ -3766,10 +3785,7 @@ export class AgentSession {
 	): AgentModelOverride | undefined {
 		const sessionModel = this.model;
 		if (!sessionModel) return undefined;
-		const carriesImages =
-			extraMessages.some((message) => messageCarriesImages(message)) ||
-			turns.some((action) => action.payload.records.some((record) => messageCarriesImages(record.message)));
-		if (!carriesImages) return undefined;
+		if (!batchCarriesImages(turns, extraMessages)) return undefined;
 		return resolveImageModelOverride({
 			sessionModel,
 			thinkingLevel: this.thinkingLevel,
@@ -3790,6 +3806,39 @@ export class AgentSession {
 	 */
 	private _runModel(): Model<any> | undefined {
 		return this.agent.modelOverride?.model ?? this.model;
+	}
+
+	/**
+	 * Level-one image-delivery suspicion: the committed batch carried images,
+	 * the response completed cleanly on an OpenAI-completions API (the only
+	 * usage schema that carries image token counts), and the usage frame had no
+	 * image token count - the provider may have silently dropped the images.
+	 * Observed both ways: a catalog entry claiming image input can serve 2xx
+	 * and answer blind, while some vision-capable providers never report the
+	 * count (stepfun), so this stays a suspicion, fires at most once per
+	 * committed batch, and never changes configuration.
+	 */
+	private _maybeNoticeImageDeliverySuspicion(message: AssistantMessage): void {
+		if (!this._dispatchedBatchCarriedImages || this._imageDeliverySuspicionNotified) return;
+		// blockImages replaces every image with a text placeholder before the
+		// request, so the provider truthfully counts no image tokens.
+		if (this.settingsManager.getBlockImages()) return;
+		if (message.api !== "openai-completions") return;
+		if (message.usage.imageTokens !== undefined) return;
+		this._imageDeliverySuspicionNotified = true;
+		try {
+			this._appendCustomMessageToTranscript(
+				createImageDeliverySuspicionMessage({
+					model: message.model,
+					provider: message.provider,
+					stopReason: message.stopReason,
+				}),
+			);
+		} catch (error) {
+			// Same contract as the message persist above: a failed transcript
+			// write is reported and must not fail the turn.
+			this._reportSessionPersistFailure(error);
+		}
 	}
 
 	/**
@@ -6407,6 +6456,12 @@ export class AgentSession {
 					this._providerWait = undefined;
 					this._retryAuthFailureSources = [];
 				}
+				if (assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") {
+					// An errored or aborted response is not a clean 2xx completion, so
+					// its usage frame says nothing about whether images were counted.
+				} else {
+					this._maybeNoticeImageDeliverySuspicion(assistantMsg);
+				}
 				if (assistantMsg.stopReason === "aborted") {
 					this._handleAbortedQuotaPark();
 				} else if (assistantMsg.stopReason !== "error" && this._quotaPark) {
@@ -8125,7 +8180,8 @@ export class AgentSession {
 	 * streaming the same call becomes a steer/follow-up queue entry, i.e. exactly the
 	 * "wait for the pump" path an undeliverable terminal notice must not take (the
 	 * pump may never come back). This is the unconditional form of the same three
-	 * steps, and the only writer used by the abandonment path.
+	 * steps, used by the abandonment path and by receipts that must not queue
+	 * behind a turn (the image-delivery suspicion notice).
 	 */
 	private _appendCustomMessageToTranscript(message: CustomMessage): void {
 		const entry = cloneCustomMessage(message);
@@ -10316,6 +10372,11 @@ export class AgentSession {
 					// before_agent_start injections land after the earlier per-turn
 					// decision and may carry images the session model cannot serve.
 					this.agent.modelOverride = this._imageModelOverrideForTurns(turns, preparedMessages);
+					// Same batch, same authority: the image-delivery suspicion check
+					// reads at message_end whether the request this run actually sends
+					// carries images, and re-arms its one-notice-per-batch budget.
+					this._dispatchedBatchCarriedImages = batchCarriesImages(turns, preparedMessages);
+					this._imageDeliverySuspicionNotified = false;
 					return turns.some((action) => action.suppressAutonomousContinuation)
 						? this._runWithAutonomousContinuationSuppressed(() => this.agent.prompt(preparedMessages))
 						: this.agent.prompt(preparedMessages);
@@ -15152,11 +15213,18 @@ export class AgentSession {
 			),
 			"rlm.progress.note": createRlmProgressNoteHostHandler((message) => this.noteRlmProgress(message)),
 			"rlm.delete_subagent": createRlmDeleteSubagentHostHandler((target) => this.deleteRlmSubagent(target)),
-			"model.info": async () => ({
-				id: this.model?.id ?? null,
-				provider: this.model?.provider ?? null,
-				input: this.model?.input ?? [],
-			}),
+			"model.info": async () => {
+				// Report the model serving the current run, not the session model:
+				// a routed image turn serves on settings.imageModel, and kernel
+				// preflights (attach_image's vision check) must judge the model that
+				// will receive the messages submitted while the override is in force.
+				const servingModel = this._runModel();
+				return {
+					id: servingModel?.id ?? null,
+					provider: servingModel?.provider ?? null,
+					input: servingModel?.input ?? [],
+				};
+			},
 		};
 		if (this._includeGoals) {
 			for (const type of ["goal.get", "goal.create", "goal.complete"]) {
