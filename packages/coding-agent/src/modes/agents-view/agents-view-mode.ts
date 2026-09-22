@@ -3362,8 +3362,17 @@ export function buildAgentsViewUsageLayout(rows: readonly AgentsViewRow[]): Agen
 			};
 			return { identity: row.identity, empty: isEmptyAgentsViewSession(row.summary), parts };
 		});
+		// U3 degradation: when no row in the section carries settled/duration facts
+		// (an older daemon, or a summary without the optional fields), the state
+		// columns collapse entirely instead of spending width on blank cells - the
+		// responsive tail (model/effort ahead of summaries, age last) keeps the
+		// column budget the 502 pins expect.
+		const hasStateColumns = entries.some(
+			(entry) => !entry.empty && (entry.parts.set !== "" || entry.parts.dur !== ""),
+		);
 		const widths = {} as Record<keyof AgentsViewUsageParts, number>;
 		for (const column of AGENTS_VIEW_USAGE_COLUMNS) {
+			if (!hasStateColumns && (column === "set" || column === "dur")) continue;
 			let width = visibleWidth(AGENTS_VIEW_USAGE_LABELS[column]);
 			for (const entry of entries) {
 				// Empty sessions render no usage segment; only their age takes space.
@@ -3376,8 +3385,7 @@ export function buildAgentsViewUsageLayout(rows: readonly AgentsViewRow[]): Agen
 			padCellStart(parts[column], widths[column]);
 		const formatLine = (parts: AgentsViewUsageParts): string =>
 			[
-				pad(parts, "set"),
-				pad(parts, "dur"),
+				...(hasStateColumns ? [pad(parts, "set"), pad(parts, "dur")] : []),
 				`${pad(parts, "inTokens")} ${pad(parts, "outTokens")}`,
 				pad(parts, "agentCost"),
 				pad(parts, "count"),
