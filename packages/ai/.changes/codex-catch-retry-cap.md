@@ -1,1 +1,0 @@
-- Capped OpenAI Codex SSE retry backoff on thrown network errors with `maxRetryDelayMs`, matching the HTTP 429 path.

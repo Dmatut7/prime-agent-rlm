@@ -1,1 +1,0 @@
-- Wrote `auth.json` login credentials through an atomic private write (0600 mode, symlink refusal, temp-file rename) instead of a bare `writeFileSync` that landed the file world-readable on a 0644 mode and followed symlinks.

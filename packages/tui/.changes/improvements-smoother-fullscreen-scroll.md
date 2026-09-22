@@ -1,1 +1,0 @@
-- Changed fullscreen mouse-wheel scrolling to move one transcript row per wheel step.

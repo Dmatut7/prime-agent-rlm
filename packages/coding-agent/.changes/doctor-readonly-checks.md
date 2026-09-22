@@ -1,1 +1,0 @@
-- Added read-only health checks to `doctor`: stored auth credentials, kernel venv readiness, and session transcript headers each get a verdict and a next step, while `doctor --fix` is unchanged.

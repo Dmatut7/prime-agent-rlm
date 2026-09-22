@@ -1,4 +1,0 @@
-- Fixed the kernel heartbeat staleness threshold so a healthy kernel reporting intervals under 334ms is no longer judged stale between retained samples.
-- Changed kernel heartbeat bash facts to full-fleet sums so buffered-byte movement reports real output instead of set-membership churn.
-- Fixed the snapshot write failure receipt to describe its actual per-episode re-arm semantics instead of claiming it repeats while writes keep failing.
-- Added read-side staleness demotion for subagent rows whose display file still says running after their transcript has been silent over 6 hours.

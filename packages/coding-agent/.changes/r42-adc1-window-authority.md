@@ -1,1 +1,0 @@
-- Fixed a deleted sub-agent's transcript being reclaimed after 7 days instead of its promised 30 when its parent session's residue directory was swept: a mixed directory is now kept until the last protected byte inside it has passed its own window.

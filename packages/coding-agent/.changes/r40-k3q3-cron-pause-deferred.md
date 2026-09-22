@@ -1,1 +1,0 @@
-- Fixed scheduled jobs and heartbeats whose tick lands in a retryable admission-pause or committing window: the dispatch is recorded as deferred (no run counted, no error stamped) and a one-shot job stays scheduled to run after the window instead of being marked completed without ever running.

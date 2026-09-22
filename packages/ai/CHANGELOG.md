@@ -1,5 +1,62 @@
 # Changelog
 
+## [0.11.0] - 2026-09-22
+
+- Fixed Anthropic-compatible endpoints receiving empty record-valued tool arguments by converting catch-all `patternProperties` schemas to `additionalProperties`.
+- Fixed OpenAI Codex SSE retries to skip non-429 4xx responses, honor `Retry-After`, and respect `maxRetries`.
+- Wired `maxRetryDelayMs` as the Codex SSE `Retry-After` cap (default 60000ms; `0` disables). Documented that Mistral, Google, and Vertex AI currently do not retry HTTP 429.
+- Capped OpenAI Codex SSE retry backoff on thrown network errors with `maxRetryDelayMs`, matching the HTTP 429 path.
+- Fixed Claude Fable 5.x failing over Anthropic OAuth with "Claude Code 2.1.75 does not support this model" by bumping the impersonated Claude Code version to 2.1.257 ([#1962](https://github.com/PrimeIntellect-ai/prime-agent/issues/1962))
+- Fixed Google and Vertex providers overwriting `length` and `error` stop reasons with `toolUse` when a response contained tool calls, so malformed or blocked responses become retryable errors instead of executing the tool call, and truncated responses are correctly marked as `length`.
+- Fixed Anthropic and Amazon Bedrock providers replaying a stale thinking signature after surrogate sanitization modified the thinking text, which caused non-retryable 400 invalid_request errors; such blocks now degrade to plain text on the wire while the stored signature is preserved.
+- Added `preserveThinking` and `enableSearch` compat flags so Bailian/DashScope Qwen models replay prior `reasoning_content` and can run built-in web search.
+- Refreshed the model catalog.
+- Fixed orphaned tool results in provider history after aborted or errored assistant turns.
+- Changed the build to compile from the committed model catalog instead of refetching it; run `npm run generate-models` explicitly to refresh `models.generated.ts`.
+- Fixed detection of LiteLLM context-limit errors when input plus requested output exceed the model's context window.
+- Changed the model catalog generator to resolve Prime Inference ids through OpenRouter route renames (qwen/qwen3.8-max -> qwen/qwen3.8-max-0902), classify gpt-6 reasoning levels, and route Copilot gpt-6 models through the Responses API. The committed catalog is unchanged until the next explicit `npm run generate-models`.
+- Bumped the impersonated client versions - Claude Code 2.1.257 -> 2.1.261 and GitHub Copilot Chat 0.35.0 -> 0.48.1 on VS Code 1.136.1 - and gave the Copilot client identity a single owner shared by the OAuth flow and the catalog generator. Generated Copilot catalog rows keep their baked-in headers until the next explicit `npm run generate-models`.
+- Added log sink configuration to the Bedrock provider entry so bundled consumers can preserve structured diagnostics.
+- Changed the live provider tests to require the `PI_LIVE_TESTS=1` opt-in and a dedicated `PI_TEST_AUTH_FILE`, so running the test suite no longer reads, refreshes, or rewrites credentials in `~/.prime/agent` or `~/.pi/agent`.
+- Reduced streaming CPU usage by throttling incremental tool-call argument parsing instead of re-parsing the full accumulated buffer on every delta.
+- Reduced OpenRouter streaming CPU usage by encoding accumulated reasoning_details once at stream end instead of after every chunk.
+- Fixed context-overflow detection to recognize Alibaba DashScope (Bailian compatible-mode) input-length rejections ("Range of input length should be [1, N]"), so an oversized turn triggers overflow recovery instead of surfacing a bare 400.
+- Fixed Google and Vertex providers treating Gemini's `TOO_MANY_TOOL_CALLS` finish reason as an unhandled stop reason, so a tool-call loop the provider aborts now surfaces as a structured provider stream failure with the raw reason recorded.
+- Fixed OpenAI Codex token exchange and refresh failures printing the whole token response, which put the access and refresh tokens into the error message; the error now reports field names, types and which field is missing.
+- Fixed the openai-completions stream parser so a provider that reuses a tool-call index, drops an id or a name, or splits one call across fragments no longer merges unrelated calls together; an unattributable fragment is dropped with a diagnostic on the message instead of corrupting the call/result pairing.
+- Changed `maxRetryDelayMs` so it is enforced by the OpenAI, Anthropic and Azure SDK-backed providers, not only Codex: a server-requested wait above the cap now fails immediately instead of sleeping, and `onProviderRetry` reports every such wait.
+- Added a shared per-chain provider request budget so SDK-level retries are counted and reported instead of multiplying with the agent and session retries.
+- Fixed credential material leaking into structured log entries and persisted assistant-message diagnostics when a provider error echoes the request's key, Authorization header, or a URL with userinfo.
+- Fixed log and transcript redaction to cover `session=` assignments, `Cookie`/`Set-Cookie` credential values and non-bearer authentication schemes such as `Token <value>`, and to keep the username in a URL with userinfo while washing only the password.
+- Fixed secret redaction so a cookie value containing quotes (plain `Cookie: session="v"` or a JSON-serialized `"cookie": "session=\"abc\""` field) is washed without breaking the JSON log line, and extended it to redact `https://<token>:@host` userinfo (npm private registry style) and `session=` values of eight or more characters.
+- Kept a bounded trace of the abort cause for aborted assistant turns in the next request instead of dropping the whole turn, so the model can see that (and why) the previous turn was cut short; partial reasoning and incomplete tool calls are still stripped.
+- Fixed credential redaction missing the first `key=value` pair after a JSON-escaped newline inside a serialized multiline value (the escape letter glued onto the key name).
+- Added a 30s abort timeout to the OpenAI Codex OAuth refresh request so a silent token endpoint can no longer hold the auth.json lock open-ended.
+- Fixed the Codex SSE parser to flush a trailing event frame and to fail streams that never deliver a terminal response event, so truncated or failed responses no longer end as successful empty turns.
+- Fixed the Codex SSE parser to accept CRLF line terminators, so CRLF-framed streams parse instead of returning empty responses.
+- Fixed the OpenAI Responses event dispatcher to route item-scoped events by item_id/output_index, so interleaved tool calls keep their own arguments and reasoning deltas are not dropped.
+- Fixed the OpenAI Responses stream to recover text, refusal, and reasoning-summary deltas that arrive without their part-added events, and to record diagnostics for deltas that cannot be routed.
+- Fixed the Anthropic SSE guard to fail streams that delivered data frames but never reached message_stop, and to record a diagnostic for frames missing their event line.
+- Fixed usage accounting across providers: a partial late usage frame no longer zeroes earlier token counts, and google/vertex/responses fall back to the component sum when the provider reports no totalTokens.
+- Fixed truncated provider streams being reported as successful stops: openai-completions, responses (and azure), google, vertex, mistral, and bedrock now error with a malformed_response diagnostic when the stream ends without a terminal event, matching the existing anthropic guard.
+- Fixed openai-responses ignoring response.incomplete: the stop reason is now mapped from incomplete_details.reason with usage preserved.
+- Fixed anthropic message_delta usage frames that normalize fields to an explicit 0 wiping the message_start counts.
+- Fixed openai-codex stream failures bypassing the shared classifier: 401/429 errors now record a provider_stream_failure diagnostic (auth/rate_limit kinds) and the upstream body is redacted before it reaches the transcript.
+- Fixed provider thinking streams so the transcript matches what streamed live: Responses reasoning keeps the streamed text when the item-done payload conflicts, completions reasoning/text blocks keep their arrival order instead of being flattened, and plaintext reasoning_details surface as thinking text (redacted stays reserved for encrypted reasoning).
+- Kept Mistral reasoning signatures so they replay across turns, and stopped the Bedrock stream tail from persisting the internal block index when contentBlockStop is missing.
+- Fixed a duplicate or out-of-order `output_item.done` in the OpenAI Responses stream from stamping another item's reasoning JSON onto a live thinking block's signature; unrouted done events now record a diagnostic and are skipped.
+- Changed `clampThinkingLevel` to clamp downward on the enabled side (never silently crossing the on/off boundary or rounding up to a more expensive tier), using the minimum enabled tier below the model's floor.
+- Fixed a hard 400 ("The value of the enable_thinking parameter is restricted to True") for models that cannot turn thinking off: the `zai`, `qwen`, `qwen-chat-template`, and `deepseek` request builders now omit the thinking toggle for those models instead of forcing it off, and keep sending the off signal for models whose capability table allows it.
+- Added `modelCannotDisableThinking()` to the public API as the single source of truth for "this reasoning model cannot disable thinking".
+- Added `adjustMaxTokensForThinking()` to the public API so callers outside `packages/ai` can reserve output room for thinking they cannot suppress.
+- Made the synthesized Responses message item id unique per text block (`msg_<message>_<block>`), so unsigned cross-provider handoff history no longer shares one item id and gets silently deduplicated by the API on replay.
+- Clamped the non-cached usage input at zero in the OpenAI Responses and Google usage parsers, so a proxy reporting more cached tokens than input tokens can no longer produce a negative input count that discounts billed cost and corrupts overflow decisions (the completions parser already clamped).
+- Wrote `auth.json` login credentials through an atomic private write (0600 mode, symlink refusal, temp-file rename) instead of a bare `writeFileSync` that landed the file world-readable on a 0644 mode and followed symlinks.
+- Added a per-model `toolStream` compat override that sends an explicit `tool_stream` value, so Bailian-hosted GLM-5.3 models can opt out of fragmented tool-call streaming that accumulated into malformed tool calls.
+- Added a `reasoningCountsTowardMaxTokens` compat flag so models whose reasoning tokens count inside max_tokens (Bailian GLM-5.3 family) honor the model's full output budget instead of the shared 32k default, which deep thinking could exhaust into a zero-content `finish_reason: "length"` turn.
+- Fixed Codex stale-continuation recovery: a `previous_response_not_found` rejection now retries once with the full request body instead of failing the turn, and WebSocket lifecycle or metadata events arriving before the provider error no longer block that retry or leave a dead response anchor behind.
+- Added a regression probe that pins `tool_stream: false` on the wire for Bailian GLM models whose compat pins it, with a live check that both glm-5.3 family entries in `~/.prime/agent/models.json` carry the key.
+
 ## [0.9.0] - 2026-09-01
 
 - Refreshed the model catalog from live provider catalogs (pricing updates, new and removed models); fixed OpenCode Go Qwen routes mislabeled as Anthropic and excluded private dev/ Prime Inference routes.

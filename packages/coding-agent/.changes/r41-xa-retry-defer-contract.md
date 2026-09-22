@@ -1,2 +1,0 @@
-- Fixed cron and heartbeat ticks that hit an update-restart admission fence being recorded as burned runs: the refusal now defers the tick on a bounded retry cadence (fast attempts, doubling backoff, escalation visibility) instead of completing a once job that never ran.
-- Split the admission-refusal contract into `deliveredNothing` and `retryNowSucceeds`, and made the cross-process string fallback decode both, so a fenced target's retry-exhausted guidance says "resend after the restart" instead of inviting another in-process retry.

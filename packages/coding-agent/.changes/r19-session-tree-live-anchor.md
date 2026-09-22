@@ -1,1 +1,0 @@
-- Fixed the session tree view so a rewound or forked session keeps the live branch's ancestor chain (not just a detached leaf) while still bounding tree depth, and stopped double-counting the detached leaf in the tree's returned/omitted stats.

@@ -1,4 +1,0 @@
-- Added `rlm.collect`, a typed non-steering fan-in for subagent results: it waits for direct children with a bounded timeout and returns one envelope per child (status, settled, answer preview, error, duration, tool count) without growing the parent's message queue. Ported from upstream PR #2223.
-- Added `terminal_kind` and `stall_abort` to the collect envelope, so a child the stall watchdog killed is distinguishable from one that finished without replying - both report `status: "done"`.
-- Made a collect wait cancellable with its cell and capped inside the kernel's read-only host-request bound, so it returns current snapshots instead of a timeout error and cancels no child.
-- Documented `rlm.collect` in the subagent prompt guidance and the RLM runtime, RLM, long-running-agent, and usage docs.

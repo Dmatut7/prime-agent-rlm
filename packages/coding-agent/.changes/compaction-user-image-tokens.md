@@ -1,1 +1,0 @@
-- Fixed context token estimation to count image blocks in user messages so trailing pasted images are not under-counted before threshold compaction checks.

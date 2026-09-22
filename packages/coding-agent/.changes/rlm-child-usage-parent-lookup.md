@@ -1,1 +1,0 @@
-- Fixed long child runs spending minutes of CPU: the parent entry a child's usage is attributed to is resolved once per run instead of re-scanning the whole transcript for every assistant message the child emits.

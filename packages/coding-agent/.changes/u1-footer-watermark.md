@@ -1,1 +1,0 @@
-- Added a persistent footer context watermark (`模型名 · ctx 312k/1M(31%) ▍压缩线80%`, plus a GLM storm-zone marker on glm models) with density controlled by the new `footer.telemetry` setting (`off`/`compact`/`full`, default `compact`), and pinned the current model on the fullscreen top bar.

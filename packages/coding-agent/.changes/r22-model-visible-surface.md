@@ -1,1 +1,0 @@
-- Fixed harness-overview id copying: a verbatim `[global:foo]` (brackets and clipped variants included) now routes like the bare `global:foo` prefix instead of failing as "entry not found" or minting a bracketed id on create, and the overflow hint now points at `rlm.harness.overview(max_entries_per_kind=...)` whose output the REPL can read.

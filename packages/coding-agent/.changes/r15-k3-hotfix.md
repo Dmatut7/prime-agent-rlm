@@ -1,5 +1,0 @@
-- Fixed the bounded path caches leaking their byte ceiling on a repeated key write, which emptied the cache and left it refusing every later write.
-- Fixed the trace privacy gate leaving part of a URL password behind when the password contains an `@`.
-- Added percent-encoded and base64 forms to the trace gate's exact-value comparison, so a configured credential is removed in the encoding it was written in.
-- Changed the trace privacy gate to leave a URL whose userinfo carries no credential (`ssh://git@github.com/...`) exactly as written.
-- Changed `scripts/preflight-push.sh` to refuse a push when it cannot read in-flight runs or when the worktree differs from HEAD, instead of printing a successful preflight.

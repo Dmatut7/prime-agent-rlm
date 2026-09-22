@@ -1,1 +1,0 @@
-- Moved remaining hardcoded selector key checks into configurable app and TUI keybindings.

@@ -1,1 +1,0 @@
-- Fixed markdown caches surviving a terminal-capability flip, so streaming messages re-render with hyperlinks after capabilities change instead of keeping the stale form.

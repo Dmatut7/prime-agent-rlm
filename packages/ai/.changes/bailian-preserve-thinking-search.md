@@ -1,2 +1,0 @@
-- Added `preserveThinking` and `enableSearch` compat flags so Bailian/DashScope Qwen models replay prior `reasoning_content` and can run built-in web search.
-- Refreshed the model catalog.

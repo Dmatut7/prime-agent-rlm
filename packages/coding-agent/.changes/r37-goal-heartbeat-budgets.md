@@ -1,3 +1,0 @@
-- Capped automatic goal continuations (goal stops as `budget_limited` with a visible reason instead of opening unbounded turns) and restricted goal pursuit to top-level sessions; subagents can no longer create self-continuing goals.
-- Added a per-session limit of 8 model-created rlm_heartbeats and raised their minimum interval to 60 seconds.
-- Fixed goal accounting so a failed threshold-compaction admission rolls back its continuation count, and coalesced or rejected heartbeat follow-ups now record as skipped instead of counted as runs.

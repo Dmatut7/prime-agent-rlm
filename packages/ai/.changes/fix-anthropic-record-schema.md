@@ -1,1 +1,0 @@
-- Fixed Anthropic-compatible endpoints receiving empty record-valued tool arguments by converting catch-all `patternProperties` schemas to `additionalProperties`.

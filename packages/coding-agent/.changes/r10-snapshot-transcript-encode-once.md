@@ -1,1 +1,0 @@
-- Fixed the daemon serializing the same session transcript twice on attach: the worker's encoded chunk transfer is now the only encoding, so a client that cannot consume chunks is served by decoding the cached transfer instead of a second supervisor-side serialization, and a legacy attach after a chunked one no longer reloads the whole snapshot from the worker.

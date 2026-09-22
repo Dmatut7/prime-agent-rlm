@@ -1,1 +1,0 @@
-- Changed refinement results to reach the model as a system receipt in the conversation, so the model can see which harness entries a refinement wrote and why a refused edit was rejected, while refinements that recorded nothing stay out of context.

@@ -1,3 +1,0 @@
-- Fixed queue-mutation and mid-compaction resumes lifting the update-restart teardown fence, so parked input stays parked until the restart instead of opening a turn mid-shutdown.
-- Made admission refusals retryable for agent-message senders: a reply landing in an admission-pause window or in the update-restart teardown no longer burns its message id as uncertain, and late replies behind the teardown fence are refused with "retry later" instead of being accepted and lost.
-- Made coalesce hits visible (a settled ticket plus a log line naming the surviving queue key) and refused same-key follow-ups that arrive while their owner is committing, instead of double-queueing and double-delivering them.

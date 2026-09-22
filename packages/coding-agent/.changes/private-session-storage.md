@@ -1,2 +1,0 @@
-- Hardened session transcripts, session-artifact directories, rotating logs, auth storage, harness state, HTML exports, and editor temp files to private 0600/0700 modes with symlink-safe exclusive creates ([#1249](https://github.com/PrimeIntellect-ai/prime-agent/pull/1249)).
-- Rejected unsafe session ids, symlinked transcripts, and non-private artifact directories in session storage paths ([#1249](https://github.com/PrimeIntellect-ai/prime-agent/pull/1249)).

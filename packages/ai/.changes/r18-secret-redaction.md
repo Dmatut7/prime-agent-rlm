@@ -1,1 +1,0 @@
-- Fixed credential material leaking into structured log entries and persisted assistant-message diagnostics when a provider error echoes the request's key, Authorization header, or a URL with userinfo.

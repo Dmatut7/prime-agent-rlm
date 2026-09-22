@@ -1,2 +1,0 @@
-- Folded the stall watchdog's activity-sampled exemption transitions into one merged stall-evidence line per minute, ending the exemption started/cleared pair emitted on every tool-call boundary that buried real stall records.
-- Added the session id to every stall-watchdog exemption log line so daemon-shared stall evidence can be attributed to the session it vouched for.

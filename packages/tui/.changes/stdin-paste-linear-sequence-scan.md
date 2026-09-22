@@ -1,1 +1,0 @@
-- Fixed stdin sequence extraction re-slicing the whole remaining buffer once per character, which made bulk input such as a large non-bracketed paste quadratic; printable runs are now located and sliced in a single pass.

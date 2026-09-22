@@ -1,1 +1,0 @@
-- Added a `reasoningCountsTowardMaxTokens` compat flag so models whose reasoning tokens count inside max_tokens (Bailian GLM-5.3 family) honor the model's full output budget instead of the shared 32k default, which deep thinking could exhaust into a zero-content `finish_reason: "length"` turn.

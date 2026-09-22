@@ -1,1 +1,0 @@
-- Added a regression probe that pins `tool_stream: false` on the wire for Bailian GLM models whose compat pins it, with a live check that both glm-5.3 family entries in `~/.prime/agent/models.json` carry the key.

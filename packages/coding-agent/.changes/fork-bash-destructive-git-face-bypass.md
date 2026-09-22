@@ -1,1 +1,0 @@
-- Tightened the bash tool guard's bypass ownership: daemon/SDK faces now honor only the `PI_BASH_ALLOW_DESTRUCTIVE_GIT` env var (the `allowDestructiveGit` argument is ignored and hidden from the schema, and refusals name only the env var), while interactive faces keep the argument via `BashToolOptions.allowDestructiveGitArgument`.

@@ -1,1 +1,0 @@
-- Changed the kernel venv readiness check to a superset test and its manifest write to a union of every skill installed so far, so sessions with different Python skill sets share one venv instead of rewriting the manifest back and forth and reinstalling on every boot; the manifest schema moves to 10, which costs each existing venv one rebuild.

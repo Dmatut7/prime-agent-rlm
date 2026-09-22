@@ -1,1 +1,0 @@
-- Clamped the non-cached usage input at zero in the OpenAI Responses and Google usage parsers, so a proxy reporting more cached tokens than input tokens can no longer produce a negative input count that discounts billed cost and corrupts overflow decisions (the completions parser already clamped).

@@ -1,1 +1,0 @@
-- Fixed a crash when an attach client renders stall events from an older daemon: a missing diagnostics payload now degrades to an explicit unknown line instead of throwing, and the stall event shapes joined the daemon schema digest so mixed-version pairs fail the handshake instead of passing it.

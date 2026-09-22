@@ -1,1 +1,0 @@
-- Added the sub-agent spend total (money and tokens) to the subagents tray line, flagging unpriced models instead of silently summing them as free.

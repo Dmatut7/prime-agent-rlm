@@ -1,1 +1,0 @@
-- Bumped the impersonated client versions - Claude Code 2.1.257 -> 2.1.261 and GitHub Copilot Chat 0.35.0 -> 0.48.1 on VS Code 1.136.1 - and gave the Copilot client identity a single owner shared by the OAuth flow and the catalog generator. Generated Copilot catalog rows keep their baked-in headers until the next explicit `npm run generate-models`.

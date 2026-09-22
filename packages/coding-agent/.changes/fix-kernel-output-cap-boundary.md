@@ -1,1 +1,0 @@
-- Fixed kernel cell output that landed exactly on the per-cell output cap being dropped silently instead of being reported as truncated

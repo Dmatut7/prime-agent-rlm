@@ -1,5 +1,0 @@
-- Changed the auto-compaction trigger to fire at `compaction.triggerRatio` (default 0.8, validated to 0.5-0.95) of the provider's real input limit instead of `contextWindow - reserveTokens`, so a session no longer reaches the provider's 400 before compaction wakes up.
-- Priced the context estimate that drives the trigger and `/usage` by content density (CJK and fenced code cost what they cost a tokenizer) instead of a flat chars/4, which under-counted Chinese-heavy sessions by ~1.6x.
-- Added `compaction.priorityOverAgentMessages` (default true): an incoming agent message queues behind a pending or in-flight compaction instead of opening a turn on an over-threshold context, and reports `compaction_pending` to the sender.
-- Added a compaction failure valve: from the second consecutive failure each retry halves `keepRecentTokens` (floor 4096), and the fourth drops the oldest non-summary context with a loud notice in the transcript instead of leaving the session stuck above the threshold.
-- Added `classifyIncomingInput`, the single structural classifier behind the admission matrix (eight input classes, message text never consulted).

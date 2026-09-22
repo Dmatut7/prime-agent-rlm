@@ -1,1 +1,0 @@
-- Fixed the kernel snapshot sweep reading a truncated or unparseable reference as a stale one: it is now kept like a live reference, so the generation a running kernel reads from is no longer reclaimed.

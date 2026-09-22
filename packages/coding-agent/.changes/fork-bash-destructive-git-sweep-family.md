@@ -1,2 +1,0 @@
-- Extended the bash tool's dirty-tree guard to shared-worktree sweeps: `git add -A`, `git add .` and `git stash` are refused with the dirty paths while uncommitted changes exist, with the same `allowDestructiveGit: true` / `PI_BASH_ALLOW_DESTRUCTIVE_GIT=1` bypasses.
-- Kept scoped adds (`git add -A docs/`) and non-sweeping stash subcommands (`git stash list`, `pop`, `apply`) unguarded.

@@ -1,2 +1,0 @@
-- Fixed the daemon shutdown admission lease so a holder whose lease lapses while the event loop is blocked (a `ps`/`lsof` fork, a machine sleep) renews or re-acquires it instead of failing the shutdown with `admission was lost`, and a waiter whose holder's lease lapses now waits or is refused loudly instead of stealing the ticket.
-- Fixed the daemon catalog's session-transcript appends to take the session lease and repair a torn trailing line before appending, so an archived status or worker-recovery note is no longer glued onto an unparsable tail and silently lost.

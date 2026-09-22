@@ -1,1 +1,0 @@
-- Fixed a throwing `session_before_compact` extension hook being treated as "no opinion": the compaction now fails and names the hook's error in the transcript instead of summarizing behind the hook's back.

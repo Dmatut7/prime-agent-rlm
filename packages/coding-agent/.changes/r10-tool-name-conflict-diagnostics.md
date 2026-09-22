@@ -1,1 +1,0 @@
-- Added tool-name conflict diagnostics: when an extension or SDK tool shadows a built-in tool, or two sources register the same tool name, the session now names both sources, says which one is reachable, and suggests a free name instead of silently letting one tool win.

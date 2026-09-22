@@ -1,1 +1,0 @@
-- Fixed a race where navigating the session tree while a compaction summary was being generated attached the summary to the wrong branch; the compaction entry now pins the branch it summarized.

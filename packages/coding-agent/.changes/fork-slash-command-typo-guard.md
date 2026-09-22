@@ -1,1 +1,0 @@
-- Rejected typo'd slash commands with a suggested correction instead of sending them to the model as prompts; genuine messages that merely start with a slash still pass through.

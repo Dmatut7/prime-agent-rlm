@@ -1,1 +1,0 @@
-- Added a structured `abortCause` (silence, reasons, kernel pid) and a "the kernel may still be running this cell" hint to aborted ipython results, so the model reads a killed cell as partial evidence instead of re-running the same long command blind.

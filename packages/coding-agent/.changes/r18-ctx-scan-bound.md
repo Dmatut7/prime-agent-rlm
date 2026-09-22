@@ -1,1 +1,0 @@
-- Changed `/context` to scan persisted sub-agent sessions with a budget (children, bytes, nesting depth) and report what it left out instead of reading the whole session directory every time.

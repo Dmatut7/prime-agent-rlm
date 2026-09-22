@@ -1,1 +1,0 @@
-- Changed the stall watchdog default to warn-only (`stallWatchdog.abortAfterSeconds` now defaults to `0`), so a silent turn is reported instead of aborted; set a positive value to opt back into the automatic abort.

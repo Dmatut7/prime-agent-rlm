@@ -1,1 +1,0 @@
-- Fixed /share letting real credentials into a shared document: the precheck now recognizes current key shapes, name-driven assignments, anchored high-entropy strings and the values this process has actually loaded, and reports a masked hit that has to be confirmed before sharing.

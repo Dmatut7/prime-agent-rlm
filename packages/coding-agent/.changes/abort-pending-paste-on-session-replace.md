@@ -1,1 +1,0 @@
-- Cleared in-flight terminal paste when replacing a session so leftover paste terminators cannot land in the new editor.

@@ -1,1 +1,0 @@
-- Fixed live usage totals drifting below the real spend in sessions with subagent usage attribution: the incremental fold now follows the in-place aggregate rewrite of the target assistant message.

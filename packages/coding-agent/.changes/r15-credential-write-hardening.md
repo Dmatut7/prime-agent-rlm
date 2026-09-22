@@ -1,3 +1,0 @@
-- Hardened the shared Prime CLI config write: a symlinked config path is refused instead of replaced, and the file is written 0600 inside a 0700 directory with `O_NOFOLLOW`, `fsync` and an atomic rename.
-- Made the Prime Inference logout say what it took: when the credential came from the shared Prime CLI config, the logout message now names that file and warns that other tools reading it lost their api_key too.
-- Wrote the agent-trace outbox through the private-store helpers (0700 directory, 0600 entries) and repaired the mode of entries left loose by earlier versions on the startup catch-up pass.

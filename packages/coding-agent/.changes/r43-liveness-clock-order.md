@@ -1,1 +1,0 @@
-- Fixed the turn-liveness verdict reading its clock before the kernel facts, which could misreport a heartbeat stamped at read time as stale and mask the real stall reasons in watchdog warnings and aborts.

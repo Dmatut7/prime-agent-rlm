@@ -1,1 +1,0 @@
-- Added an `app.agents.expand` keybinding (default `alt+right`) that collapses or expands the selected agent's subagent list, merged the Enter and Right hints into one line, and stopped revealed summary rows from persisting a ghost expansion key.

@@ -1,1 +1,0 @@
-- Added an abort() call surface to the agent-message skill (and documented it in SKILL.md): one call stops a stuck family agent's active run, flushes its queued steering on request, and reports the daemon capability degrade when the connected daemon predates the lever.

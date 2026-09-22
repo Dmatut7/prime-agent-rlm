@@ -1,3 +1,0 @@
-- Fixed the event-log tail repair blanking a record a live writer was still appending: a torn tail is blanked only after it stops changing, and the append is refused when it keeps growing.
-- Fixed a legacy cron-job migration and interrupted-dispatch recovery being dropped when the local clock lags the copies on disk.
-- Fixed scheduled-job run bookkeeping stamping a copy older than the one it replaced when the local clock stepped back.

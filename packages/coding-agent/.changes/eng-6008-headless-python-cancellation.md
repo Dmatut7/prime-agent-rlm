@@ -1,3 +1,0 @@
-- Fixed headless Python cancellation leaving an unresponsive kernel running: after the interrupt grace period the kernel is now killed (tagged as an intentional exit, so it is not reported as a crash), and the next cell provisions a replacement and says that live state was lost.
-- Fixed the cancellation diagnostic ignoring the configured output limit, so an aborted cell's stderr can no longer exceed `maxOutputChars` without the truncation notice.
-- Changed the interactive wait/kill choice to stay interactive: with a UI the kernel is still preserved for the user to decide, and a headless run now kills instead of only failing the cell.

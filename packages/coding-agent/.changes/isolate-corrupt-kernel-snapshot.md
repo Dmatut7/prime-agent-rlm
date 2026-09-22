@@ -1,1 +1,0 @@
-- Isolated a kernel snapshot that failed to restore so a rebuilt namespace can persist again instead of leaving `restoreFailed` latched forever.

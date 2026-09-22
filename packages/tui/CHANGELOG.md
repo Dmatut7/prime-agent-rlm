@@ -1,5 +1,50 @@
 # Changelog
 
+## [0.11.0] - 2026-09-22
+
+- Fixed input and rendering lag in long sessions written in CJK and other non-Latin scripts, where the terminal width cache was too small to hold a session's text and re-segmented it every frame.
+- Changed the fullscreen transcript and container rendering to reuse the previous frame's lines when no component changed, so cost tracks what moved instead of how long the session is.
+- Changed the editor to reuse word-wrapped lines across frames and keystrokes, so typing re-wraps only the edited line rather than the whole input.
+- Changed Ghostty inline images to use a safe text fallback by default, with explicit opt-in via `PI_ENABLE_GHOSTTY_IMAGES`.
+- Changed fullscreen mouse-wheel scrolling to move one transcript row per wheel step.
+- Capped the editor undo stack at 500 snapshots and the kill ring at 60 entries, and cleared undo on an empty `setText` so session resets cannot restore the previous buffer.
+- Stopped fallback-only image components from retaining their base64 payload after construction.
+- Recovered from stuck bracketed paste mode when `201~` never arrives, by timing out and capping the paste buffer; bytes that arrive while the paste is open stay paste text, so a control sequence inside the paste neither ends it nor reaches the key parser (Ctrl+C, the user's own interrupt, is the exception).
+- Recovered from stuck bracketed paste by keeping every received byte as paste text: the idle timeout and the part budget close or split the paste, and no control sequence inside it can end it early (Ctrl+C, the user's own interrupt, is the exception).
+- Added `TUI.isFullscreenReviewing()` so callers can tell live fullscreen follow from a scrolled-away review.
+- Discarded in-flight bracketed paste on session switch and stdin drain so a late `201~` cannot insert into the next session.
+- Treated two Escape presses within the sequence timeout as two `escape` keys instead of `ctrl+alt+[`, while keeping Esc+letter as `alt+letter`.
+- Interrupted an in-flight bracketed paste with Ctrl+C so the key is not swallowed for up to 30s; every other control byte in the paste stays paste text.
+- Recognized a Kitty Esc abort split across paste chunks, and stopped discarding in-flight paste when a chunk ended in ESC before an ANSI sequence finished.
+- Kept keystrokes that follow a Kitty Esc abort inside a paste chunk, instead of discarding the rest of the chunk with the paste.
+- Moved remaining hardcoded editor, selector, and debug key checks into configurable TUI keybindings.
+- Fixed a double-Escape keypress from swallowing a following CSI sequence in the same stdin chunk, so Esc then an arrow key still moves the cursor instead of inserting `[A`.
+- Preserved editor undo across a manual empty `setText` (Ctrl+C / Esc clear) while still dropping undo on session reset and slash-command clears.
+- Fixed the editor word-wrap recursing forever on a grapheme wider than the line, which crashed the TUI with a stack overflow when typing CJK characters or emoji in a narrow terminal.
+- Added support for opening file links from the fullscreen terminal UI.
+- Added a base URL option for resolving relative Markdown links ([#2108](https://github.com/PrimeIntellect-ai/prime-agent/issues/2108)).
+- Fixed Windows drive paths in Markdown links to open as file URLs ([#2108](https://github.com/PrimeIntellect-ai/prime-agent/issues/2108)).
+- Fixed stdin sequence extraction re-slicing the whole remaining buffer once per character, which made bulk input such as a large non-bracketed paste quadratic; printable runs are now located and sliced in a single pass.
+- Made the truncated-text leaf component render-cache compliant (rendered lines reused until its text, width or an invalidate call changes), so a fullscreen transcript stops re-deriving those lines every frame.
+- Unref'd the Loader animation interval so an indicator nobody stopped cannot keep the process alive.
+- Fixed bracketed paste truncating at an end marker inside the pasted bytes and running the rest as key input; a paste now ends when its byte stream settles, and everything received is inserted as text.
+- Fixed large non-bracketed input (a paste without bracketed-paste support, a pipe, an oversized paste) being delivered one character at a time, which re-copied the whole prompt per character; bulk input now arrives as a few large sequences and is inserted in one pass.
+- Fixed a paste whose bytes hold a complete Kitty escape sequence ending the paste early and sending the rest of the paste to the key parser.
+- Fixed a bulk paste losing its first character when it repeated the last Kitty key event.
+- Fixed a bracketed paste that carried a Kitty Esc sequence ending the paste early: no byte of the paste can reach the key parser, and none of the already buffered content is dropped.
+- Fixed bulk input losing up to 64 KiB when a slice boundary landed on a newline, and mangling an emoji split across a 64 KiB slice boundary.
+- Fixed long-session idle CPU spikes and streaming slowdowns: the line reset cache now evicts its oldest entry instead of clearing all 20k lines at once, and unchanged transcript lines are reused by identity so spinner and streaming frames no longer re-scan the whole transcript.
+- Fixed the 16ms render throttle so slow frames are spaced apart instead of rendering back-to-back.
+- Fixed the editor freezing for ~150ms and spiking memory on large pastes: control-character filtering now runs as one pass with no per-character array.
+- Changed markdown rendering to re-lex only the trailing blocks of a streaming message, cutting per-frame parse cost for long transcripts from linear in the document to bounded by the growing tail.
+- Fixed markdown caches surviving a terminal-capability flip, so streaming messages re-render with hyperlinks after capabilities change instead of keeping the stale form.
+- Fixed markdown block caching to key on the parsed token object, so streaming text whose raw block text is unchanged but re-parsed (lazy continuations) no longer renders stale lines.
+- Changed markdown per-frame block caching to a token-identity slot array, removing the per-frame cache-key construction that scaled with the whole document.
+- Added `TUI.flushRender()` to paint the pending frame synchronously, for callers that stop the renderer in the same turn and would otherwise freeze the frame from before their last change.
+- Added render-time click regions to the TUI: components expose them after render, containers aggregate them, and the fullscreen viewport projects them through the pinned header, scrolling transcript, clipped dock, and overlays (painted overlay pixels block click-through, and regions clipped at a viewport edge stay clickable on their visible rows). A clean unmodified left press/release pair dispatches the click; drag selection, shift/alt/ctrl clicks, and OSC-8 hyperlinks keep precedence, and fullscreen mouse stays opt-in.
+- Editor clicks now focus the editor and place the cursor from the authoritative rendered layout, handling wrapped lines, editor scroll, prompt and padding offsets, the CustomEditor header row, hidden `!`/`!!` prefixes, wide graphemes, and atomic paste/image markers.
+- Made Markdown link labels clickable in fullscreen while retaining visible URL fallbacks for terminals without native hyperlink support.
+
 ## [0.9.0] - 2026-09-01
 
 - Add an optional `transform` hook to `Markdown` so callers can rewrite markdown with the exact content width before rendering.

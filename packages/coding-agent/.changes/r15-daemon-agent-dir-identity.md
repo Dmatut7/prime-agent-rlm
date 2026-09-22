@@ -1,2 +1,0 @@
-- Fixed daemon identity so `list`/`attach`/`stop` reach the daemon that owns this agent directory from any `$TMPDIR`, instead of failing with ENOENT when `$TMPDIR` differs.
-- Fixed a second daemon starting on an agent directory already owned by a live daemon (different `$TMPDIR` meant a different socket path): it is now refused with the running daemon's pid and socket instead of both processes writing the same sessions, harness state and leases.

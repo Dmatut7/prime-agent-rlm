@@ -1,1 +1,0 @@
-- Changed image output to report when the current terminal cannot render inline images.

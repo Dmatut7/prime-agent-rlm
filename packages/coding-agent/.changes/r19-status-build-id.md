@@ -1,1 +1,0 @@
-- Added the build id and the code path of every background service to the `status` and `ps` tables, and made a stop confirmation name the build ids, versions, protocol, schema or code path that differ instead of saying "not this build" without a criterion.

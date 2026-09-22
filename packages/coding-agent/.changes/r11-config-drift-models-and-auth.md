@@ -1,3 +1,0 @@
-- Fixed `models.json` being adopted unvalidated on a process's first load and discarded by the next refresh: every load now runs the same schema check, so an invalid file is rejected (and reported) up front instead of its `baseUrl`/`apiKey` being used and the provider vanishing later.
-- Changed the startup credential migration to merge legacy `oauth.json` and `settings.json` apiKeys into an existing `auth.json` and to delete a legacy store only once every provider it holds is readable back from `auth.json`; a store it cannot take over is kept (mode 0600) with a warning instead of being destroyed.
-- Clarified that a `cost` in `models.json` must list all four subkeys when present, matching the schema that rejects partial costs.

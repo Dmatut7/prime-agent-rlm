@@ -1,1 +1,0 @@
-- Changed `prime-agent update` to refuse any self-update source whose bytes are not pinned: an artifact URL is only accepted from the configured release download base with a `#sha256=` digest, is downloaded and digest-checked before the package manager runs, and every other URL, `file:` spec, or unverified local tarball is refused with the reason.

@@ -1,1 +1,0 @@
-- Added `TUI.isFullscreenReviewing()` so callers can tell live fullscreen follow from a scrolled-away review.

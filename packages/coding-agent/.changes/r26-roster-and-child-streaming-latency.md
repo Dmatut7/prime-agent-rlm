@@ -1,1 +1,0 @@
-- Fixed long sessions slowing down over time: the agents roster no longer rescans the whole transcript on every session-name read, and streaming subagent answers no longer re-compact and re-serialize the full text and task brief on every token.

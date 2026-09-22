@@ -1,1 +1,0 @@
-- Changed streaming tool-call argument change detection in the TUI to O(1) object identity instead of re-serializing the full arguments on every delta.

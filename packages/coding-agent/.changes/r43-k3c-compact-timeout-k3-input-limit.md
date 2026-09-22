@@ -1,2 +1,0 @@
-- Fixed manual compaction over the daemon wire reporting a client-side 30s timeout while the compaction kept succeeding server-side; compact requests now wait up to 10 minutes and a timeout error says the daemon is likely still compacting.
-- Fixed the Bailian kimi-k3 effective input limit to the measured 1,000,000 tokens the provider accepts (catalog declared 1,048,576), so compaction budgeting no longer plans for tokens the provider rejects.

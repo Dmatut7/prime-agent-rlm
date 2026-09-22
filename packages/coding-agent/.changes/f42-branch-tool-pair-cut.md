@@ -1,1 +1,0 @@
-- Fixed session fork and tree navigation so they cut at complete tool-call/result boundaries instead of leaving unpaired tool calls in the new branch context.

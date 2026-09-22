@@ -1,1 +1,0 @@
-- Added session logging for a provider that reuses tool-call ids: the per-call rewrite (original id, tool name, replacement) is written to the session log, so a repaired id is never silent in the transcript.

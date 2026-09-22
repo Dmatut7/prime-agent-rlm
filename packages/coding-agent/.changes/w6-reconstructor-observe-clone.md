@@ -1,1 +1,0 @@
-- Fixed CompactAssistantStreamReconstructor.observe() storing the message_start partial by reference instead of cloning it, causing reconstruct() to mutate the original event message in place.

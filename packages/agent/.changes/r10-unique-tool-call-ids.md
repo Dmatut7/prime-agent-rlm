@@ -1,1 +1,0 @@
-- Added deterministic repair of a reused tool-call id inside one assistant message: the first occurrence keeps its id, later duplicates get a length-capped unique suffix, the streamed events and the final message are renamed together, and the rewrite is reported as a `tool_call_id_collision` diagnostic on the message instead of being silent.

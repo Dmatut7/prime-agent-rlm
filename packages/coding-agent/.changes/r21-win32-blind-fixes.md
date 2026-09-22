@@ -1,3 +1,0 @@
-- Fixed the Python kernel venv interpreter path on Windows so the kernel can boot there (`Scripts\python.exe` instead of a POSIX `bin/python` literal).
-- Hardened the Windows process-tree kill to the absolute System32 `taskkill.exe` with an error listener, matching the orphan reaper.
-- Documented the remaining Windows-only gaps (shutdown signals, daemon discovery, private-file permissions, persistent harness storage) as known limits.

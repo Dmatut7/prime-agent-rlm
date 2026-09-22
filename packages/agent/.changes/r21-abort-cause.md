@@ -1,1 +1,0 @@
-- Carried the abort cause attached to a run's abort signal into aborted tool results and the aborted assistant message, so a model told "aborted" can also see why.

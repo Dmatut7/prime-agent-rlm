@@ -1,1 +1,0 @@
-- Changed the `PRIME_AGENT_FORK_GATE=off` fork self-update bypass from silent to logged: every fork detection while the variable is set now writes a warning naming the checkout whose gate was skipped.

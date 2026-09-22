@@ -1,3 +1,0 @@
-- Fixed a hard 400 ("The value of the enable_thinking parameter is restricted to True") for models that cannot turn thinking off: the `zai`, `qwen`, `qwen-chat-template`, and `deepseek` request builders now omit the thinking toggle for those models instead of forcing it off, and keep sending the off signal for models whose capability table allows it.
-- Added `modelCannotDisableThinking()` to the public API as the single source of truth for "this reasoning model cannot disable thinking".
-- Added `adjustMaxTokensForThinking()` to the public API so callers outside `packages/ai` can reserve output room for thinking they cannot suppress.

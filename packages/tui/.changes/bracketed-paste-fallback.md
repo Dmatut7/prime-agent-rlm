@@ -1,1 +1,0 @@
-- Recovered from stuck bracketed paste mode when `201~` never arrives, by timing out and capping the paste buffer; bytes that arrive while the paste is open stay paste text, so a control sequence inside the paste neither ends it nor reaches the key parser (Ctrl+C, the user's own interrupt, is the exception).

@@ -1,5 +1,0 @@
-- Changed the session-lease guard contention retry from a blocking `Atomics.wait` loop to an async timer backoff, and made the exhausted-retry error name the holder (pid, owner id) with a wait-or-force suggestion; lease acquisition, release cleanup, and candidate preparation (mkdir + owner-record fsyncs) moved off the guard's critical section.
-- Added a stale `worker-*.sock` sweep at supervisor startup and worker-death finalization: sockets of provably dead pids are removed, live pids are kept, and orphaned sockets past a 60s age gate are reclaimed.
-- Added `EventLog.appendAsync`: the torn-tail observation window now awaits instead of sleeping the event loop, and an append refused against a live writer retries once after a backoff so the record is not silently lost.
-- Removed the session's ephemeral `prime-agent-rlm-*` temp directory when the session is disposed.
-- Refused appends onto an unverifiable oversized trailing transcript record (`appendOwnedSessionLineAsync` and the in-session persist path now fail loudly instead of gluing lines together).

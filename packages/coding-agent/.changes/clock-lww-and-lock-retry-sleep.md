@@ -1,2 +1,0 @@
-- Fixed a scheduled-job pause, resume, or stop being dropped, and reported as applied, when the local clock lags the stored copy.
-- Fixed settings and credential writes hanging the process when the system clock steps backwards during a file-lock retry.

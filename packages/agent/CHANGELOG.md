@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.11.0] - 2026-09-22
+
+- Added optional stream stall detection to the agent loop: `AgentLoopConfig.streamStallTimeoutMs` aborts a provider stream that produces no events for the configured duration and settles the turn with a retryable `stopReason: "error"` message instead of hanging on a dead connection.
+- Fixed the agent loop treating an empty final assistant turn (no output content and no tool calls, e.g. a provider ending the stream thinking-only with a normal stop reason) as successful completion: the request is silently resent up to 3 attempts without the empty turns polluting the retry context or transcript, and a turn error is surfaced after the third consecutive empty response.
+- Added `isEmptyTurnRetryExhausted()` and `EMPTY_TURN_RETRY_EXHAUSTED_STOP_REASON_RAW` so the terminal empty-turn retry is detectable by the session layer.
+- Fixed discarded empty-turn attempts losing their cost and output tokens from the reported usage.
+- Changed aborted tool calls to keep the evidence instead of replacing the result with "Request was aborted": partial output is preserved, a still-running tool gets a bounded 1.25s harvest (tail capped at 8KB), and the result is marked as an error with a truncation note. This can delay the visible end of an aborted turn by up to 1.25s when there was no output to preserve.
+- Added deterministic repair of a reused tool-call id inside one assistant message: the first occurrence keeps its id, later duplicates get a length-capped unique suffix, the streamed events and the final message are renamed together, and the rewrite is reported as a `tool_call_id_collision` diagnostic on the message instead of being silent.
+- Changed stream-stall diagnosis to tell a provider that asked us to wait apart from a dead connection, and the stalled turn now carries a structured `rate_limit` diagnostic.
+- Changed empty-response retries to wait with a capped, configurable backoff instead of firing attempts back-to-back, and to report the attempts and waits when they run out.
+- Fixed a stream stall after output had already arrived being reported as provider throttling - and left out of the automatic full resend - when an earlier 429 happened in the same attempt.
+- Carried the abort cause attached to a run's abort signal into aborted tool results and the aborted assistant message, so a model told "aborted" can also see why.
+- Fixed `streamProxy()` to forward `maxRetryDelayMs` again, so the retry-delay cap configured through settings still reaches proxied providers.
+- Added an optional `modelOverride` run field: when set, prompt and continuation runs use that model (with its own thinking level and service tier) while `state.model` keeps identifying the session model; failures are tagged with the model that served the run.
+
 ## [0.8.0] - 2026-08-21
 
 - Added `AgentContinueError` with stable codes (`busy`, `nothing-to-continue`) for `Agent.continue()` precondition failures, so callers classify without matching message text.

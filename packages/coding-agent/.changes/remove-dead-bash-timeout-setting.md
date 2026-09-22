@@ -1,1 +1,0 @@
-- Removed `tools.bashTimeoutSeconds`: the setting was documented but never wired to any caller on the RLM line (the classic bash tool is SDK-only), so editing it did nothing. SDK consumers can pass `defaultTimeoutSeconds` to `createBashToolDefinition` directly.

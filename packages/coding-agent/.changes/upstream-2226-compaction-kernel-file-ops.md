@@ -1,2 +1,0 @@
-- Fixed compaction summaries never recording kernel-performed file edits: ipython tool results now contribute their structured edit diffs to the tracked file operations, so `<modified-files>` reflects the default toolset's edits. Ported from upstream PR #2226.
-- Capped the read/modified file lists rendered in summary blocks at 200 entries, so one bulk-editing kernel result cannot grow a summary block without bound. Ported from upstream PR #2226.

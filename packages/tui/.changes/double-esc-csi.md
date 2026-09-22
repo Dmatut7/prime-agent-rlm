@@ -1,1 +1,0 @@
-- Fixed a double-Escape keypress from swallowing a following CSI sequence in the same stdin chunk, so Esc then an arrow key still moves the cursor instead of inserting `[A`.

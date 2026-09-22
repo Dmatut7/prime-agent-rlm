@@ -1,2 +1,0 @@
-- Fixed `prime-agent shutdown` leaving a live daemon running while reporting a clean stop: every process on a socket path is now its own named target, a daemon whose socket file was unlinked underneath it is still stopped through its supervisor owner record, and the final report checks process liveness instead of only the socket file.
-- Changed the stop report so `stopped`, `failed`, `skipped` and `leftRunning` name the pid they are about, and a socket file is only removed when no live process is serving that path any more.

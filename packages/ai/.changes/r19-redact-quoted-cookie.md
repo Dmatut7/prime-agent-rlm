@@ -1,1 +1,0 @@
-- Fixed secret redaction so a cookie value containing quotes (plain `Cookie: session="v"` or a JSON-serialized `"cookie": "session=\"abc\""` field) is washed without breaking the JSON log line, and extended it to redact `https://<token>:@host` userinfo (npm private registry style) and `session=` values of eight or more characters.

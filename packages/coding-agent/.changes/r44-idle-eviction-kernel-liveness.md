@@ -1,3 +1,0 @@
-- Fixed the 90-minute idle eviction killing background scripts: a session whose Python kernel still owns a live `bash()` handle (or is executing a cell) is no longer idle for child passivation or whole-worker eviction, so the kernel is not closed out from under a running script.
-- Changed the kernel's live-`bash()` fact to be read from the orphan-process journal with a pid check, with the heartbeat frame kept as a freshness-bounded fallback, so the fact stays true while an idle kernel hosts a script and stops being true when that script exits.
-- Added a daemon log line naming each session held resident by live kernel work, and one warn per kernel per hour once such a handle passes 24 hours.

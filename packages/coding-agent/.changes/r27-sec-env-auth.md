@@ -1,2 +1,0 @@
-- Fixed a stolen auth.json lock discarding a successfully rotated OAuth token pair: fresh credentials are now persisted before the compromise error surfaces, so a mid-refresh lock theft no longer strands a revoked refresh token until a manual re-login.
-- Changed bash/exec child processes to run on a sanitized environment allowlist (worker auth tokens, RLM bookkeeping, provider keys like SERPER_API_KEY, and SSH_AUTH_SOCK no longer ride into model-run commands); opt specific names back in via the comma-separated PRIME_AGENT_ENV_PASSTHROUGH.

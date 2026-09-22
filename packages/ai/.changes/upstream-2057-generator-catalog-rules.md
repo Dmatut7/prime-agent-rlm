@@ -1,1 +1,0 @@
-- Changed the model catalog generator to resolve Prime Inference ids through OpenRouter route renames (qwen/qwen3.8-max -> qwen/qwen3.8-max-0902), classify gpt-6 reasoning levels, and route Copilot gpt-6 models through the Responses API. The committed catalog is unchanged until the next explicit `npm run generate-models`.

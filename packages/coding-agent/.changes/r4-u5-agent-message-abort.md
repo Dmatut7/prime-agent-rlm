@@ -1,1 +1,0 @@
-- Added an agent abort lever to the daemon protocol: agent_message.abort can stop a stuck family agent's active turn (and flush its queued work) through a capability-gated agent-origin form of the abort commands, with nuclear-family reach enforced at the routing layer.

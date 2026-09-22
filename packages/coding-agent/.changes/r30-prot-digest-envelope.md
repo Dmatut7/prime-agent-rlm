@@ -1,1 +1,0 @@
-- Extended the daemon schema identity to also cover the response envelope (DaemonResponse and its error payload), so an envelope field edit can no longer ride an unchanged schema id and pass a mixed-version handshake; the historical rev30 blind window (the bounded session-tree wire change) is now pinned by a replay guard test and registered in the protocol header.

@@ -1,3 +1,0 @@
-- Fixed the kernel snapshot lagging behind an errored cell: a cell that changed the namespace and then raised (or was interrupted) now refreshes the saved state instead of leaving the snapshot at the last successful cell.
-- Fixed the kernel revival notices claiming the snapshot was "written up to about 1.5s before the death" regardless of its real age; the reset notice now reports the measured write age, or says it cannot tell.
-- Fixed names the snapshot could not serialize (a generator, an open socket, an oversized value) disappearing without a word: both the reset notice and the resume notice now name them with the reason, and the write-side drop is logged.

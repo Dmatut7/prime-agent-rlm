@@ -1,2 +1,0 @@
-- Fixed nested Prime Agent CLI runs and self-updates launched through the bash tool silently losing the non-secret routing names (agent/session directories, supervisor socket, origin session id) and privacy opt-outs (`DO_NOT_TRACK`, `PI_OFFLINE`, `PRIME_AGENT_TELEMETRY`) to the shell child env allowlist, while worker tokens and provider keys stay stripped.
-- Documented `PRIME_AGENT_ENV_PASSTHROUGH` in the README and settings docs and repositioned the shell child env filter in the security docs as passive-leak hygiene rather than a model-facing confidentiality boundary.

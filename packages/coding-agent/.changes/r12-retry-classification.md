@@ -1,2 +1,0 @@
-- Fixed a rate-limited provider stall from being retried as a dead-connection error, which resent the whole conversation into the limiter.
-- Added `retry.emptyTurn.maxAttempts`/`baseDelayMs`/`maxDelayMs`/`maxTotalDelayMs` to configure the empty-reply retries, which now also honor `retry.enabled`.

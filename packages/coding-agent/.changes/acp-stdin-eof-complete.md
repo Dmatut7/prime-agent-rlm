@@ -1,1 +1,0 @@
-- Changed the ACP lifecycle default so stdin EOF completes the owned session instead of detaching a resident worker; added `--acp-resident` to retain the old resident behavior for editor reconnect.

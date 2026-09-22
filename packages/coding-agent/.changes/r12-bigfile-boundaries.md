@@ -1,3 +1,0 @@
-- Fixed a session file whose only line is a valid header that lost its terminating newline being rewritten in place as a brand-new session: it now keeps its id, parent session and RLM depth, and the write side puts the missing newline back.
-- Fixed one unparseable-shape line (a `null`, or a message entry with no message) aborting the load of an entire transcript and making the session vanish from every listing without a diagnostic; such lines are now skipped, counted and named by `getTranscriptLineSkips()`.
-- Fixed tool output that ends with a newline being counted as one line longer than it is, so a run of exactly 2000 lines is no longer reported as truncated.

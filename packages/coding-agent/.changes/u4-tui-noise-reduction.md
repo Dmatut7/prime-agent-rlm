@@ -1,1 +1,0 @@
-- Reduced TUI noise: one `⚙ 本轮 N 步 · 用时 —— 动词摘要` line collapses each turn's tool activity (Ctrl+O expands), thinking blocks render as a single recap line by default, completed `!` bash blocks show a one-line output tally instead of a 20-line preview, and feature/keybinding hints are deduplicated and localized to Chinese.

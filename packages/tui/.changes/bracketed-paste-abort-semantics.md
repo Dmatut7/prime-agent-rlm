@@ -1,1 +1,0 @@
-- Recovered from stuck bracketed paste by keeping every received byte as paste text: the idle timeout and the part budget close or split the paste, and no control sequence inside it can end it early (Ctrl+C, the user's own interrupt, is the exception).

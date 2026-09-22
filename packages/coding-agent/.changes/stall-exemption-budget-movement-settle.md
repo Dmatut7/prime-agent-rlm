@@ -1,2 +1,0 @@
-- Fixed the stall watchdog aborting healthy long-running tools once the exemption budget ran out: the budget now charges only silence the kernel's reported movement does not explain, so a job that keeps producing survives while a wedged one is still killed inside its budget.
-- Added `settledByMovementMs` to the stall exemption diagnostics, recording how much exempt silence a job's own movement paid for.

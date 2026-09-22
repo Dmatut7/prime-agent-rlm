@@ -1,2 +1,0 @@
-- Fixed print and json mode completing the owned session as soon as the root turn went idle, which aborted RLM subagents that were still running before the root could consume their results.
-- Documented that print and json mode now wait for in-flight subagents to settle before exiting, so a subagent that never settles holds the run until the long-running request timeout (24 hours in daemon mode) unless interrupted.

@@ -1,1 +1,0 @@
-- Made the truncated-text leaf component render-cache compliant (rendered lines reused until its text, width or an invalidate call changes), so a fullscreen transcript stops re-deriving those lines every frame.

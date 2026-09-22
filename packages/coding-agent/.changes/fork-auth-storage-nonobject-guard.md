@@ -1,1 +1,0 @@
-- Fixed auth storage reload to reject non-object JSON (array/string/null) with a drained error and keep the last good store, instead of silently reading malformed bytes as an empty credential store.

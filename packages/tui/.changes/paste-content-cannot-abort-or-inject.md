@@ -1,2 +1,0 @@
-- Fixed a paste whose bytes hold a complete Kitty escape sequence ending the paste early and sending the rest of the paste to the key parser.
-- Fixed a bulk paste losing its first character when it repeated the last Kitty key event.

@@ -1,1 +1,0 @@
-- Fixed the openai-completions stream parser so a provider that reuses a tool-call index, drops an id or a name, or splits one call across fragments no longer merges unrelated calls together; an unattributable fragment is dropped with a diagnostic on the message instead of corrupting the call/result pairing.

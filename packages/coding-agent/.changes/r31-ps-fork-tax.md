@@ -1,1 +1,0 @@
-- Removed a synchronous `ps` fork from each daemon worker launch and batched the per-reference process identity lookups of kernel venv in-use reads into one helper invocation, so concurrent session launches and mixed-generation kernel boots no longer block the supervisor or add ~55ms per live reference.

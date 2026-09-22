@@ -1,1 +1,0 @@
-- Changed markdown rendering to re-lex only the trailing blocks of a streaming message, cutting per-frame parse cost for long transcripts from linear in the document to bounded by the growing tail.

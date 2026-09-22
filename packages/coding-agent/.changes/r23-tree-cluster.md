@@ -1,3 +1,0 @@
-- Fixed the session tree views to keep the entry the session resumes on inside their size caps, so a rewound branch no longer disappears from the tree while the selection still points at it.
-- Changed the tree's node cap to a hard limit that is reported in the bound stats (`maxNodes`) instead of silently returning more nodes than the cap declared.
-- Typed the stall event's diagnostics payload as optional on the daemon wire, matching the renderer's existing handling of a missing payload.

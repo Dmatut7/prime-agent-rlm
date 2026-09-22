@@ -1,1 +1,0 @@
-- Fixed the editor freezing for ~150ms and spiking memory on large pastes: control-character filtering now runs as one pass with no per-character array.

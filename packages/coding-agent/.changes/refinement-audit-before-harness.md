@@ -1,1 +1,0 @@
-- Changed refinement persistence to write the rollback audit before harness state and refuse to overwrite a concurrent kernel write.

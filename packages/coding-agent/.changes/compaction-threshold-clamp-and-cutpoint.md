@@ -1,1 +1,0 @@
-- Fixed threshold-compaction storms: skip threshold triggering when the reserve consumes the whole window, cap keepRecentTokens to the post-reserve threshold, and cut at the closest valid point before an oversized trailing tool result instead of keeping everything.

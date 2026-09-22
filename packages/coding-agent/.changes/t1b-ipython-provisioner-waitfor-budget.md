@@ -1,1 +1,0 @@
-- Raised the `vi.waitFor` budget in two ipython-provisioner tests (prewarm retry, gated-dispose snapshot skip) from the 1s default to 5s, so they no longer fail spuriously when the suite runs in parallel with other kernel-booting tests.

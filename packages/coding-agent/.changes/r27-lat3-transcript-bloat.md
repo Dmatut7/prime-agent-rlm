@@ -1,1 +1,0 @@
-- Reduced long-session transcript bloat: streamed child usage attributions now coalesce into one ledger line per window instead of one line per child message, and byte-identical consecutive agent status verdicts are no longer re-persisted.

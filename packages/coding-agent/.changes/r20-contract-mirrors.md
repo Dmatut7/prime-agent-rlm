@@ -1,4 +1,0 @@
-- Added a truncation notice to the branch tree selector ("Tree truncated to N of M entries") that shows what the session-tree wire bound left out, wired end to end from the daemon response.
-- Bounded wide (many-branch) session trees by total node count in addition to depth, so a snapshot or tree view of a branching session reports truncation instead of shipping every node.
-- Renamed the `--json --dry-run` shutdown output field `leftRunning` to `keptInScope` so the plan output cannot be confused with the full stop report's `leftRunning` bucket.
-- Extended the daemon schema digest to cover the session-tree response payload shapes, so response-shape edits can no longer ride an unchanged schema identity.

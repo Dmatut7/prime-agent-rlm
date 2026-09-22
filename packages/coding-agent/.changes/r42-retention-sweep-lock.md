@@ -1,1 +1,0 @@
-- Fixed two retention sweeps running at once on one agent dir (a daemon tick and `prime-agent retention sweep`, or two daemons), which spent the per-sweep delete cap twice and could drop a line from `retention/history.jsonl`; a contended trigger now reports the last sweep instead, and `retention.sweepLockEnabled: false` restores the old concurrent behaviour.

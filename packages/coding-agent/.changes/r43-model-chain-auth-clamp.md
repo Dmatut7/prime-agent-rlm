@@ -1,4 +1,0 @@
-- Changed CLI `--model` resolution to pick from providers with configured credentials first, and to fail with the configured provider list (plus /login or --provider guidance) when a fuzzy match only hits unauthenticated providers.
-- Added a 15-minute cooldown to stale auth marks (401/403-disabled credentials now self-heal, and a same-value /login from another process or in-process recovers them), with a truthful "credentials rejected and disabled" message replacing the misleading "No API key found" error.
-- Recorded a model_change ledger entry when a resumed session falls back from its saved model to a different one.
-- Kept the user's requested thinking level as the saved intent (instead of the clamped value), re-clamped it on model switches, and made every clamp emit a visible "requested X, using Y" diagnostic.

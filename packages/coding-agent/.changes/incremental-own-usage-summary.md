@@ -1,1 +1,0 @@
-- Fixed long sessions spending minutes of CPU republishing their roster: the per-session usage summary is now folded incrementally instead of re-walking the whole transcript on every event.

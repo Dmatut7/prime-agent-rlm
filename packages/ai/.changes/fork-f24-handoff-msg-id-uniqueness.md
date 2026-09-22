@@ -1,1 +1,0 @@
-- Made the synthesized Responses message item id unique per text block (`msg_<message>_<block>`), so unsigned cross-provider handoff history no longer shares one item id and gets silently deduplicated by the API on replay.

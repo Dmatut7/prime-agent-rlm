@@ -1,1 +1,0 @@
-- Fixed private files created under restrictive umasks ending up mode 000 (bricking `auth.json` and session stores): `ensurePrivateFile`, `writePrivateFileAtomic`, `writePrivateFileAtomicLines`, and private-directory creation now enforce the exact 0600/0700 bits after creation.

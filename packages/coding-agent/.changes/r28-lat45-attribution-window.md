@@ -1,2 +1,0 @@
-- Fixed session reloads splicing the attribution ledger into abandoned branches: deferred child-usage windows now flush before every leaf move, persisted entry and new attribution, and the flush row parent is resolved to the nearest on-disk ancestor, so rewinds, compactions and interleaved child runs can no longer drop or resurrect messages in the model context.
-- Fixed agent status recaps disappearing after a rewind: the no-op dedupe key now resets when the session leaf moves, so re-publishing the same verdict on the active branch lands again.

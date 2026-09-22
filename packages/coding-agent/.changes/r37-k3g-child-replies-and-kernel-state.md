@@ -1,3 +1,0 @@
-- Fixed compaction harvesting child-agent replies as the user's own words: a subagent reply no longer enters the verbatim user-request ledger or survives compaction as a live user obligation.
-- Fixed kernel state snapshots discarding in-memory streams (BytesIO/StringIO/unrolled spooled files) as if they were open file handles, so working buffers now survive a kernel restart with content and cursor position.
-- Deepened the cross-version restore quarantine: functions and class instances nested inside dicts, lists, or object attributes are now quarantined together with bare names instead of reviving foreign bytecode.

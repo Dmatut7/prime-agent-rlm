@@ -1,1 +1,0 @@
-- Fixed a wedged update restart: a prepared daemon whose handoff stalled now re-issues its checkpoint to a retried prepare instead of failing with "already preparing", and a fully rejected fallback restore keeps the manifest for the next attempt.
