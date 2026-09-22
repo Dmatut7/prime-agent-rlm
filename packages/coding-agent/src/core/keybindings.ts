@@ -24,10 +24,13 @@ export interface AppKeybindings {
 	"app.configuration.previousTab": true;
 	"app.configuration.exit": true;
 	"app.tools.expand": true;
+	"app.tools.expandAll": true;
 	"app.tools.expandFull": true;
 	"app.messages.expand": true;
+	"app.messages.expandAll": true;
 	"app.edits.expand": true;
 	"app.thinking.toggle": true;
+	"app.thinking.toggleAll": true;
 	"app.subagents.focus": true;
 	"app.heartbeats.open": true;
 	"app.heartbeats.openSelected": true;
@@ -96,21 +99,43 @@ export const KEYBINDINGS = {
 	"app.model.cycleBackward": { defaultKeys: "shift+alt+m", description: "Cycle to the previous scoped model" },
 	"app.configuration.previousTab": { defaultKeys: "shift+tab", description: "Select previous configuration tab" },
 	"app.configuration.exit": { defaultKeys: "ctrl+c", description: "Exit configuration selector" },
-	"app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output", defaultKeyScope: "editor" },
-	"app.tools.expandFull": {
+	// U6 two-key model (K3 ②): the plain keys act on the latest turn; the
+	// alt-combos act globally (every turn). expandFull moved off alt+o to make
+	// room for the global lane.
+	"app.tools.expand": {
+		defaultKeys: "ctrl+o",
+		description: "Expand the latest turn's process surface (tools, outputs, diffs)",
+		defaultKeyScope: "editor",
+	},
+	"app.tools.expandAll": {
 		defaultKeys: "alt+o",
+		description: "Expand every turn's process surface",
+		defaultKeyScope: "editor",
+	},
+	"app.tools.expandFull": {
+		defaultKeys: "alt+shift+o",
 		description: "Show tool output in full (ignore the expanded render budget)",
 		defaultKeyScope: "editor",
 	},
 	"app.messages.expand": {
 		defaultKeys: "ctrl+p",
-		description: "Toggle agent message expansion",
+		description: "Expand the latest turn's agent messages",
+		defaultKeyScope: "editor",
+	},
+	"app.messages.expandAll": {
+		defaultKeys: "alt+p",
+		description: "Expand agent messages in every turn",
 		defaultKeyScope: "editor",
 	},
 	"app.edits.expand": { defaultKeys: "ctrl+j", description: "Toggle edit diffs", defaultKeyScope: "editor" },
 	"app.thinking.toggle": {
 		defaultKeys: "ctrl+t",
-		description: "Toggle thinking blocks",
+		description: "Expand the latest turn's thinking traces",
+		defaultKeyScope: "editor",
+	},
+	"app.thinking.toggleAll": {
+		defaultKeys: "alt+t",
+		description: "Expand thinking traces in every turn",
 		defaultKeyScope: "editor",
 	},
 	"app.subagents.focus": {

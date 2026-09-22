@@ -36,6 +36,10 @@ export class TurnActivityState {
 	private thinkingSegments = 0;
 	private liveThinkingSegments = 0;
 	private collapsed = true;
+	/** U6 K3 ②: the turn's own Ctrl+T lane (the traces inside this turn's span). */
+	thinkingExpanded = false;
+	/** U6 K3 ②: the turn's own Ctrl+P lane (agent message rows inside this turn's span). */
+	agentMessagesExpanded = false;
 
 	constructor(startedAt = Date.now()) {
 		this.startedAt = startedAt;
@@ -172,7 +176,12 @@ export class TurnSummaryComponent implements Component {
 	private cachedWidth?: number;
 	private cachedLines?: string[];
 
-	constructor(private readonly state: TurnActivityState) {}
+	constructor(private readonly turnState: TurnActivityState) {}
+
+	/** The turn's state - the per-turn lanes (K3 ②) live on it. */
+	get state(): TurnActivityState {
+		return this.turnState;
+	}
 
 	setExpanded(expanded: boolean): void {
 		if (this.expanded === expanded) {

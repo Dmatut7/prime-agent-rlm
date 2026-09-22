@@ -3539,8 +3539,9 @@ export class InteractiveMode {
 				status: this.startedToolCalls.has(latestToolCall.id) ? "running" : "queued",
 			});
 			component.setTurnActivity(this.currentTurnState);
-			component.setExpanded(this.toolOutputExpanded);
-			component.setAgentMessagesExpanded(this.agentMessagesExpanded);
+			// The live turn's own lanes (K3 ②), falling back to the globals.
+			component.setExpanded(this.currentTurnState ? !this.currentTurnState.isCollapsed : this.toolOutputExpanded);
+			component.setAgentMessagesExpanded(this.currentTurnState?.agentMessagesExpanded ?? this.agentMessagesExpanded);
 			component.setEditDiffsExpanded(this.editDiffsExpanded);
 			if (this.startedToolCalls.has(latestToolCall.id)) {
 				component.markExecutionStarted();
@@ -4720,10 +4721,13 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.model.cycleForward", () => this.handleModelCycle("forward"));
 		this.defaultEditor.onAction("app.model.cycleBackward", () => this.handleModelCycle("backward"));
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
+		this.defaultEditor.onAction("app.tools.expandAll", () => this.toggleToolOutputExpansion(true));
 		this.defaultEditor.onAction("app.tools.expandFull", () => this.toggleToolOutputFull());
 		this.defaultEditor.onAction("app.messages.expand", () => this.toggleAgentMessageExpansion());
+		this.defaultEditor.onAction("app.messages.expandAll", () => this.toggleAgentMessageExpansion(true));
 		this.defaultEditor.onAction("app.edits.expand", () => this.toggleEditDiffExpansion());
 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
+		this.defaultEditor.onAction("app.thinking.toggleAll", () => this.toggleThinkingBlockVisibility(true));
 		this.defaultEditor.onAction("app.subagents.focus", () => this.focusSubagentSummary());
 		this.defaultEditor.onAction("app.heartbeats.open", () => {
 			void this.showHeartbeatManager();
@@ -6450,8 +6454,9 @@ export class InteractiveMode {
 			this.getMarkdownThemeWithSettings(),
 			this.hiddenThinkingLabel,
 			{
-				expanded: this.toolOutputExpanded,
-				thinkingExpanded: this.thinkingExpanded,
+				// The live turn's own lanes (K3 ②), falling back to the globals.
+				expanded: this.currentTurnState ? !this.currentTurnState.isCollapsed : this.toolOutputExpanded,
+				thinkingExpanded: this.currentTurnState?.thinkingExpanded ?? this.thinkingExpanded,
 				precededByToolActivity:
 					this.chatContainer.children.at(-1) instanceof ToolExecutionComponent ||
 					this.chatContainer.children.at(-1) instanceof AgentMessageComponent,
@@ -6956,12 +6961,20 @@ export class InteractiveMode {
 			this.toggleToolOutputExpansion();
 			return;
 		}
+		if (this.keybindings.matches(data, "app.tools.expandAll")) {
+			this.toggleToolOutputExpansion(true);
+			return;
+		}
 		if (this.keybindings.matches(data, "app.tools.expandFull")) {
 			this.toggleToolOutputFull();
 			return;
 		}
 		if (this.keybindings.matches(data, "app.messages.expand")) {
 			this.toggleAgentMessageExpansion();
+			return;
+		}
+		if (this.keybindings.matches(data, "app.messages.expandAll")) {
+			this.toggleAgentMessageExpansion(true);
 			return;
 		}
 		// A raw "\n" is a newline for the editor, not ctrl+j.
@@ -6971,6 +6984,10 @@ export class InteractiveMode {
 		}
 		if (this.keybindings.matches(data, "app.thinking.toggle")) {
 			this.toggleThinkingBlockVisibility();
+			return;
+		}
+		if (this.keybindings.matches(data, "app.thinking.toggleAll")) {
+			this.toggleThinkingBlockVisibility(true);
 			return;
 		}
 		this.focusEditor();
@@ -7258,12 +7275,12 @@ export class InteractiveMode {
 			case "custom": {
 				if (message.display) {
 					const component = this.createDisplayedCustomMessageComponent(message);
-					if (isExpandable(component)) {
-						component.setExpanded(this.expansionStateFor(component));
-					}
-					if (hasEditDiffsExpansion(component)) {
-						component.setEditDiffsExpanded(this.editDiffsExpanded);
-					}
+					this.applyExpansionLanes(component, {
+						thinking: this.thinkingExpanded,
+						tools: this.toolOutputExpanded,
+						agentMessages: this.agentMessagesExpanded,
+						editDiffs: this.editDiffsExpanded,
+					});
 					if (isSessionSlashCommandMessage(message) && this.chatContainer.children.length > 0) {
 						this.chatContainer.addChild(new Spacer(1));
 					}
@@ -8406,10 +8423,66 @@ export class InteractiveMode {
 		this.footer.setSpeedText(this.speedStats.samples > 1 ? `${last} tok/s · avg ${average}` : `${last} tok/s`);
 	}
 
-	private toggleToolOutputExpansion(): void {
+	/**
+	 * U6 K3 ②: the latest turn in the chat tree (chat-tail anchored - the
+	 * viewport-bottom turn in the common case; a session with no turns yet
+	 * returns undefined and callers fall back to the global lanes).
+	 */
+	private latestTurnSummary(): TurnSummaryComponent | undefined {
+		const children = this.chatContainer.children;
+		for (let i = children.length - 1; i >= 0; i--) {
+			const child = children[i];
+			if (child instanceof TurnSummaryComponent) {
+				return child;
+			}
+		}
+		return undefined;
+	}
+
+	/**
+	 * Applies the lanes to one turn's span: the summary itself and every child
+	 * after it until the next turn's summary. Turn-less children (before the
+	 * first summary) read the global lanes.
+	 */
+	private applyTurnExpansion(summary: TurnSummaryComponent): void {
+		const children = this.chatContainer.children;
+		const start = children.indexOf(summary);
+		if (start < 0) {
+			this.applyChatExpansion();
+			return;
+		}
+		const state = summary.state;
+		summary.setExpanded(!state.isCollapsed);
+		for (let i = start + 1; i < children.length; i++) {
+			const child = children[i];
+			if (child instanceof TurnSummaryComponent) {
+				break;
+			}
+			this.applyExpansionLanes(child, {
+				thinking: state.thinkingExpanded,
+				tools: !state.isCollapsed,
+				agentMessages: state.agentMessagesExpanded,
+				editDiffs: !state.isCollapsed,
+			});
+		}
+		this.requestExpansionRender();
+	}
+
+	private toggleToolOutputExpansion(global = false): void {
 		// U6 (boss's two-key model): Ctrl+O owns the process surface — tool
-		// calls, outputs, and edit diffs ride the same expanded state.
+		// calls, outputs, and edit diffs ride the same expanded state. The plain
+		// key acts on the latest turn; Alt+O acts globally (K3 ②).
+		if (!global) {
+			const summary = this.latestTurnSummary();
+			if (summary) {
+				const next = summary.state.isCollapsed;
+				summary.setExpanded(next);
+				this.applyTurnExpansion(summary);
+				return;
+			}
+		}
 		this.editDiffsExpanded = !this.toolOutputExpanded;
+		this.syncAllTurnLanes(!this.toolOutputExpanded, "tools");
 		this.setToolsExpanded(!this.toolOutputExpanded);
 	}
 
@@ -8433,9 +8506,20 @@ export class InteractiveMode {
 		);
 	}
 
-	private toggleAgentMessageExpansion(): void {
-		// U6: Ctrl+P keeps its own lane — agent message rows only.
+	private toggleAgentMessageExpansion(global = false): void {
+		// U6: Ctrl+P keeps its own lane - agent message rows only. The plain key
+		// acts on the latest turn; Alt+P acts globally (K3 ②).
+		if (!global) {
+			const summary = this.latestTurnSummary();
+			if (summary) {
+				const next = !summary.state.agentMessagesExpanded;
+				summary.state.agentMessagesExpanded = next;
+				this.applyTurnExpansion(summary);
+				return;
+			}
+		}
 		this.agentMessagesExpanded = !this.agentMessagesExpanded;
+		this.syncAllTurnLanes(this.agentMessagesExpanded, "agentMessages");
 		this.applyChatExpansion();
 	}
 
@@ -8449,9 +8533,40 @@ export class InteractiveMode {
 		this.applyChatExpansion();
 	}
 
-	/** Expansion state for a chat component: agent messages toggle separately from tools. */
-	private expansionStateFor(component: unknown): boolean {
-		return component instanceof AgentMessageComponent ? this.agentMessagesExpanded : this.toolOutputExpanded;
+	/**
+	 * One lane bundle: where each expansion surface reads its state from. The
+	 * per-turn values come from the owning turn's TurnActivityState; the
+	 * globals serve turn-less children and the header.
+	 */
+	private applyExpansionLanes(
+		child: unknown,
+		lanes: { thinking: boolean; tools: boolean; agentMessages: boolean; editDiffs: boolean },
+	): void {
+		if (child instanceof AssistantMessageComponent) {
+			// U6 two-key model: T drives the thinking traces; O drives the
+			// error detail surface.
+			child.setThinkingExpanded(lanes.thinking);
+		}
+		if (isExpandable(child)) {
+			child.setExpanded(child instanceof AgentMessageComponent ? lanes.agentMessages : lanes.tools);
+		}
+		if (hasAgentMessagesExpansion(child)) {
+			child.setAgentMessagesExpanded(lanes.agentMessages);
+		}
+		if (hasEditDiffsExpansion(child)) {
+			child.setEditDiffsExpanded(lanes.editDiffs);
+		}
+	}
+
+	/** Writes one lane's value into every turn's state (the Alt-global path, K3 ②). */
+	private syncAllTurnLanes(value: boolean, lane: "thinking" | "tools" | "agentMessages"): void {
+		for (const child of this.chatContainer.children) {
+			if (child instanceof TurnSummaryComponent) {
+				if (lane === "thinking") child.state.thinkingExpanded = value;
+				if (lane === "agentMessages") child.state.agentMessagesExpanded = value;
+				if (lane === "tools") child.setExpanded(value);
+			}
+		}
 	}
 
 	private applyChatExpansion(): void {
@@ -8459,26 +8574,39 @@ export class InteractiveMode {
 		if (isExpandable(activeHeader)) {
 			activeHeader.setExpanded(this.toolOutputExpanded);
 		}
+		// K3 ②: the walk is turn-aware - each turn's children read that turn's
+		// lanes; children before the first summary (turn-less) read the globals.
+		const globalLanes = {
+			thinking: this.thinkingExpanded,
+			tools: this.toolOutputExpanded,
+			agentMessages: this.agentMessagesExpanded,
+			editDiffs: this.editDiffsExpanded,
+		};
+		let turnLanes: { thinking: boolean; tools: boolean; agentMessages: boolean; editDiffs: boolean } | undefined;
 		for (const child of this.chatContainer.children) {
-			if (child instanceof AssistantMessageComponent) {
-				// U6 two-key model: T drives the thinking traces; O drives the
-				// error detail surface.
-				child.setThinkingExpanded(this.thinkingExpanded);
+			if (child instanceof TurnSummaryComponent) {
+				const state = child.state;
+				child.setExpanded(!state.isCollapsed);
+				turnLanes = {
+					thinking: state.thinkingExpanded,
+					tools: !state.isCollapsed,
+					agentMessages: state.agentMessagesExpanded,
+					editDiffs: !state.isCollapsed,
+				};
+				continue;
 			}
-			if (isExpandable(child)) {
-				child.setExpanded(this.expansionStateFor(child));
-			}
-			if (hasAgentMessagesExpansion(child)) {
-				child.setAgentMessagesExpanded(this.agentMessagesExpanded);
-			}
-			if (hasEditDiffsExpansion(child)) {
-				child.setEditDiffsExpanded(this.editDiffsExpanded);
-			}
+			this.applyExpansionLanes(child, turnLanes ?? globalLanes);
 		}
-		// Expanding/collapsing changes blocks above the viewport, which would
-		// otherwise force a full redraw that scrolls to the top and replays the
-		// whole transcript. Keep the user anchored at their current position.
-		// Fullscreen frames have no scrollback to preserve.
+		this.requestExpansionRender();
+	}
+
+	/**
+	 * Expanding/collapsing changes blocks above the viewport, which would
+	 * otherwise force a full redraw that scrolls to the top and replays the
+	 * whole transcript. Keep the user anchored at their current position.
+	 * Fullscreen frames have no scrollback to preserve.
+	 */
+	private requestExpansionRender(): void {
 		if (this.ui.isFullscreen()) {
 			this.ui.requestRender();
 		} else {
@@ -8486,19 +8614,31 @@ export class InteractiveMode {
 		}
 	}
 
-	private toggleThinkingBlockVisibility(): void {
+	private toggleThinkingBlockVisibility(global = false): void {
 		// U6 (boss's two-key model): Ctrl+T owns the thinking block — it
 		// expands/collapses the turn's thinking traces. The turn header stays
 		// visible either way; the persisted hideThinkingBlock setting (never
 		// show traces) is no longer bound to the key, and a press while it is
 		// on guides the user to it instead of silently doing nothing (K3 ④).
+		// The plain key acts on the latest turn; Alt+T acts globally (K3 ②).
 		if (this.hideThinkingBlock) {
 			this.showStatus("思考 trace 被 hideThinkingBlock 设置隐藏：关闭该设置后 Ctrl+T 可展开");
 			return;
 		}
+		if (!global) {
+			const summary = this.latestTurnSummary();
+			if (summary) {
+				const next = !summary.state.thinkingExpanded;
+				summary.state.thinkingExpanded = next;
+				this.applyTurnExpansion(summary);
+				this.showStatus(`思考块: ${next ? "展开" : "收起"}${next ? "（最近一轮）" : ""}`);
+				return;
+			}
+		}
 		this.thinkingExpanded = !this.thinkingExpanded;
+		this.syncAllTurnLanes(this.thinkingExpanded, "thinking");
 		this.applyChatExpansion();
-		this.showStatus(`思考块: ${this.thinkingExpanded ? "展开" : "收起"}`);
+		this.showStatus(`思考块: ${this.thinkingExpanded ? "全部展开" : "全部收起"}`);
 	}
 
 	private openExternalEditor(): void {

@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import * as path from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import {
 	type AutocompleteProvider,
 	CombinedAutocompleteProvider,
@@ -48,8 +49,10 @@ import { AgentMessageComponent } from "../src/modes/interactive/components/agent
 import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
 import { BashExecutionComponent } from "../src/modes/interactive/components/bash-execution.js";
 import type { ConfigurationMenuComponent } from "../src/modes/interactive/components/configuration-menu.js";
+import { buildConversationComponents } from "../src/modes/interactive/components/conversation-components.js";
 import type { AuthSelectorProvider } from "../src/modes/interactive/components/oauth-selector.js";
 import type { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
+import { TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
 import { formatSplashCwd, InteractiveMode, truncatePathMiddle } from "../src/modes/interactive/interactive-mode.js";
 import { ClientPromptStashStore, type PromptStashState } from "../src/modes/interactive/prompt-stash-state.js";
 import { QueueSelection } from "../src/modes/interactive/queue-selection.js";
@@ -1522,7 +1525,6 @@ describe("InteractiveMode connection events", () => {
 			updateAvailableProviderCount: vi.fn(async () => {}),
 			updateEditorBorderColor: vi.fn(),
 			updateTerminalTitle: vi.fn(),
-			refreshTopBarCost: vi.fn(),
 			setGoalAnnouncementBaseline: vi.fn(),
 			syncGoalTray: vi.fn(),
 			syncWorkingLoader: vi.fn(),
@@ -1765,7 +1767,6 @@ describe("InteractiveMode connection events", () => {
 			restoreStreamingMessageFromSnapshot: vi.fn(),
 			updatePendingMessagesDisplay: vi.fn(),
 			updateTerminalTitle: vi.fn(),
-			refreshTopBarCost: vi.fn(),
 			setGoalAnnouncementBaseline: vi.fn(),
 			syncGoalTray: vi.fn(),
 			syncWorkingLoader: vi.fn(),
@@ -1832,7 +1833,6 @@ describe("InteractiveMode connection events", () => {
 			updatePendingMessagesDisplay: vi.fn(),
 			flushPendingBashComponents: vi.fn(),
 			updateTerminalTitle: vi.fn(),
-			refreshTopBarCost: vi.fn(),
 			setGoalAnnouncementBaseline: vi.fn(),
 			syncGoalTray: vi.fn(),
 			syncWorkingLoader: vi.fn(),
@@ -1890,7 +1890,6 @@ describe("InteractiveMode connection events", () => {
 			updatePendingMessagesDisplay: vi.fn(),
 			flushPendingBashComponents,
 			updateTerminalTitle: vi.fn(),
-			refreshTopBarCost: vi.fn(),
 			setGoalAnnouncementBaseline: vi.fn(),
 			syncGoalTray: vi.fn(),
 			syncWorkingLoader: vi.fn(),
@@ -3248,7 +3247,6 @@ describe("InteractiveMode session switch command catalog", () => {
 				updateAvailableProviderCount: vi.fn(async () => {}),
 				updateEditorBorderColor: vi.fn(),
 				updateTerminalTitle: vi.fn(),
-				refreshTopBarCost: vi.fn(),
 				setGoalAnnouncementBaseline: vi.fn(),
 				syncGoalTray: vi.fn(),
 				getGoalState: () => emptyGoalState(),
@@ -4628,6 +4626,30 @@ describe("truncatePathMiddle", () => {
 });
 
 describe("InteractiveMode.setToolsExpanded", () => {
+	/** One assistant message with a thinking block (for the K3 ② scope fixtures). */
+	function assistantThinking(marker: string): AssistantMessage {
+		return {
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: `thinking for ${marker}` },
+				{ type: "text", text: `answer for ${marker}` },
+			],
+			api: "test",
+			provider: "test-provider",
+			model: "test-model",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: 1_000,
+		};
+	}
+
 	function createExpansionFakeThis(chatChildren: unknown[]): any {
 		const fakeThis: any = {
 			toolOutputExpanded: false,
@@ -4732,6 +4754,62 @@ describe("InteractiveMode.setToolsExpanded", () => {
 		expect(setThinkingExpanded).toHaveBeenCalledWith(false);
 	});
 
+	test("plain keys act on the latest turn only; Alt keys act globally (K3 ②)", () => {
+		// Three turns in a real container, each with an assistant message and a
+		// thinking block, plus the TurnSummaryComponent at each turn head.
+		const chatContainer = new Container();
+		const built = buildConversationComponents(
+			[
+				{ role: "user", content: "one", timestamp: 900 },
+				assistantThinking("t1"),
+				{ role: "user", content: "two", timestamp: 2_000 },
+				assistantThinking("t2"),
+				{ role: "user", content: "three", timestamp: 3_000 },
+				assistantThinking("t3"),
+			],
+			{
+				ui: { requestRender: vi.fn() } as never,
+				cwd: "/tmp",
+				toolOptions: {},
+				getToolDefinition: () => undefined,
+			},
+		);
+		for (const component of built) {
+			chatContainer.addChild(component);
+		}
+		const summaries = built.filter((c): c is TurnSummaryComponent => c instanceof TurnSummaryComponent);
+		expect(summaries).toHaveLength(3);
+		const assistants = built.filter((c): c is AssistantMessageComponent => c instanceof AssistantMessageComponent);
+		expect(assistants).toHaveLength(3);
+		const spies = assistants.map((component) => vi.spyOn(component, "setThinkingExpanded"));
+
+		const fakeThis = createExpansionFakeThis(chatContainer.children);
+		fakeThis.showStatus = vi.fn();
+
+		// Plain Ctrl+T: only the latest turn's lane flips.
+		fakeThis.toggleThinkingBlockVisibility();
+		expect(summaries[2]?.state.thinkingExpanded).toBe(true);
+		expect(summaries[0]?.state.thinkingExpanded).toBe(false);
+		expect(summaries[1]?.state.thinkingExpanded).toBe(false);
+		expect(spies[2]).toHaveBeenCalledWith(true);
+		expect(spies[0]).not.toHaveBeenCalledWith(true);
+		expect(spies[1]).not.toHaveBeenCalledWith(true);
+
+		// Alt+T: every turn flips together.
+		fakeThis.toggleThinkingBlockVisibility(true);
+		expect(summaries[0]?.state.thinkingExpanded).toBe(true);
+		expect(summaries[1]?.state.thinkingExpanded).toBe(true);
+		expect(summaries[2]?.state.thinkingExpanded).toBe(true);
+		expect(fakeThis.thinkingExpanded).toBe(true);
+
+		// Plain Ctrl+O: only the latest turn's process surface expands.
+		const before = summaries.map((s) => s.state.isCollapsed);
+		fakeThis.toggleToolOutputExpansion();
+		expect(summaries[2]?.state.isCollapsed).toBe(false);
+		expect(summaries[0]?.state.isCollapsed).toBe(before[0]);
+		expect(fakeThis.toolOutputExpanded).toBe(false);
+	});
+
 	test("Ctrl+T with hideThinkingBlock on guides to the setting instead of flipping (K3 ④)", () => {
 		const assistantChild = new AssistantMessageComponent();
 		const setThinkingExpanded = vi.spyOn(assistantChild, "setThinkingExpanded");
@@ -4765,7 +4843,7 @@ describe("InteractiveMode.setToolsExpanded", () => {
 		expect(fakeThis.agentMessagesExpanded).toBe(false);
 		expect(setThinkingExpanded).toHaveBeenCalledWith(true);
 		expect(child.setExpanded).toHaveBeenCalledWith(false);
-		expect(fakeThis.showStatus).toHaveBeenCalledWith("思考块: 展开");
+		expect(fakeThis.showStatus).toHaveBeenCalledWith("思考块: 全部展开");
 	});
 });
 
