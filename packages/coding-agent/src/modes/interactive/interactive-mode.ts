@@ -2894,6 +2894,11 @@ export class InteractiveMode {
 		this.footer.setAutoCompactEnabled(
 			this.connectionState?.autoCompactionEnabled ?? this.settingsManager.getCompactionEnabled(),
 		);
+		// P2-D (Qwen review): a settings reload can change footer.telemetry and
+		// the compaction settings the watermark reads - drop the memo so the
+		// next frame recomputes (the c2332 message listed this trigger; the
+		// wiring was missing).
+		this.invalidateFooterTelemetry();
 
 		this.footerDataProvider.setCwd(this.getCurrentCwd());
 		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
@@ -3084,6 +3089,11 @@ export class InteractiveMode {
 		// Anything counted so far is now reflected in the snapshot; only later output is in-flight.
 		this.contextUsageTokenBaseline = this.activityTracker.getStatus().tokens;
 		this.patchConnectionState({ contextUsage: stats.contextUsage });
+		// P2-D (Qwen review): the leading invalidation happened before the await
+		// - a frame that rendered while the RPC was in flight re-memoized the
+		// OLD usage, and this patch would land behind it. Drop the memo again
+		// now that the fresh numbers are in the connection state.
+		this.invalidateFooterTelemetry();
 
 		// U2: the session's trailing tool-error streak is authoritative; an older
 		// daemon without the field keeps the locally counted value.

@@ -203,6 +203,68 @@ describe("footer telemetry watermark (U6)", () => {
 		expect(off).toContain("950k/1M");
 	});
 
+	it("recomputes the memo after a settings reload and after usage lands (P2-D)", async () => {
+		const { InteractiveMode } = await import("../src/modes/interactive/interactive-mode.js");
+		const settingsManager = {
+			getFooterTelemetry: vi.fn(() => "on"),
+			getCompactionSettings: vi.fn(() => ({
+				enabled: true,
+				reserveTokens: 0,
+				keepRecentTokens: 0,
+				triggerRatio: 0.8,
+			})),
+		};
+		const mode: Record<string, unknown> = {
+			uiServices: { settingsManager },
+			connectionState: {
+				model: { id: "bailian/glm-5.3-prime", reasoning: true },
+				thinkingLevel: "max",
+				contextUsage: { tokens: 518_000, contextWindow: 1_048_576, percent: 49 },
+			},
+			activityTracker: { getStatus: () => ({ tokens: 0 }) },
+			isAgentStreaming: () => false,
+			contextUsageTokenBaseline: 0,
+			footer: { invalidate: vi.fn(), setAutoCompactEnabled: vi.fn() },
+			hideThinkingBlock: false,
+			footerDataProvider: { setCwd: vi.fn() },
+			ui: {
+				setShowHardwareCursor: vi.fn(),
+				setClearOnShrink: vi.fn(),
+			},
+			defaultEditor: { setPaddingX: vi.fn(), setAutocompleteMaxVisible: vi.fn() },
+			editor: undefined,
+		};
+		Object.setPrototypeOf(mode, InteractiveMode.prototype);
+		const source = (
+			InteractiveMode.prototype as unknown as {
+				getFooterTelemetrySource(this: unknown): FooterTelemetrySource;
+			}
+		).getFooterTelemetrySource;
+		const invalidate = (
+			InteractiveMode.prototype as unknown as {
+				invalidateFooterTelemetry(this: unknown): void;
+			}
+		).invalidateFooterTelemetry;
+		const applyRuntimeSettings = (
+			InteractiveMode.prototype as unknown as {
+				applyRuntimeSettings(this: unknown): void;
+			}
+		).applyRuntimeSettings;
+
+		const first = source.call(mode);
+		// A settings reload drops the memo: the next read recomputes (P2-D①).
+		applyRuntimeSettings.call(mode);
+		const second = source.call(mode);
+		expect(second).not.toBe(first);
+		expect(second).toEqual(first);
+		expect(mode.footerTelemetryDirty).toBe(false);
+
+		// A usage refresh drops it again after the fresh stats patch (P2-D②):
+		// the leading invalidation alone would leave the in-flight frame's memo.
+		invalidate.call(mode);
+		expect(mode.footerTelemetryDirty).toBe(true);
+	});
+
 	it("renders the level at the bar-end notch and ellipsizes the model (P1-A edge, P1-C)", () => {
 		const footer = new FooterComponent(provider);
 		// A 0.95 threshold puts the notch on the last cell; from ~93% the level
