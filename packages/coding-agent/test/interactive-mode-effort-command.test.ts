@@ -362,7 +362,8 @@ describe("InteractiveMode /effort", () => {
 			expect(patch.serviceTier).toBe("priority");
 			expect(patch.availableThinkingLevels).toContain("high");
 			expect(setupAutocompleteProvider).toHaveBeenCalledTimes(1);
-			expect(context.footer.invalidate).toHaveBeenCalled();
+			// U6 评审②: the watermark pulls, so a model switch needs no footer
+			// invalidate - the next frame reads the fresh memoized pair.
 			expect(context.updateEditorBorderColor).toHaveBeenCalled();
 		});
 

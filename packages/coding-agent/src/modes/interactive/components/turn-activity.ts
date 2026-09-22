@@ -134,13 +134,21 @@ export class TurnActivityState {
 		return `${(Math.max(0, end - this.startedAt) / 1000).toFixed(1)}s`;
 	}
 
-	/** U6 ①: the turn's thinking block header — one line, always visible while the turn has thinking. */
+	/**
+	 * U6 ①: the turn's thinking block header — one line, always visible while
+	 * the turn has thinking. 评审短账: with steps the duration belongs to the ⚙
+	 * line (the header carries the segment count alone); a thinking-only turn
+	 * has no ⚙ line, so the header keeps the duration - `思考 36.3s` for one
+	 * segment, `思考 5 段 · 96.3s` for several.
+	 */
 	thinkingHeaderText(): string {
 		const segments = this.totalThinkingSegments;
 		if (segments <= 0) {
 			return "";
 		}
-		// `思考 36.3s` for a single segment, `思考 5 段 · 96.3s` for several.
+		if (this.steps.length > 0) {
+			return `思考 ${segments} 段`;
+		}
 		return segments > 1 ? `思考 ${segments} 段 · ${this.durationSeconds()}` : `思考 ${this.durationSeconds()}`;
 	}
 

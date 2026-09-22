@@ -1086,8 +1086,14 @@ export interface InteractiveModeRunResult {
 	source: Pick<AgentConnectionState, "activeSessionId" | "sessionFile" | "sessionId" | "sessionName" | "cwd">;
 }
 
+/**
+ * U6 评审短账: `深度 0` is zero-information decoration - the label renders only
+ * for non-zero depths (a sub-agent's own nest level). `hasChildren` stays in
+ * the signature for call-site compatibility and no longer widens the rule.
+ */
 export function formatAgentDepthLabel(depth: number | undefined, hasChildren: boolean): string | undefined {
-	if (depth === undefined || (depth === 0 && !hasChildren)) return undefined;
+	void hasChildren;
+	if (depth === undefined || depth < 1) return undefined;
 	return `深度 ${depth}`;
 }
 

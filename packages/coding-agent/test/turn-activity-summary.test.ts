@@ -169,8 +169,9 @@ describe("turn activity summary (U4)", () => {
 		const collapsed = renderAll(messages, false);
 		const nonEmpty = collapsed.split("\n").filter((line) => line.trim().length > 0);
 		// Two mechanical lines at the turn head: the thinking block header (①)
-		// above the process line (②).
-		expect(nonEmpty[1]).toBe(" 思考 10 段 · 1.0s");
+		// above the process line (②). 评审短账: the duration lives on the ⚙ line
+		// only - the header carries the segment count.
+		expect(nonEmpty[1]).toBe(" 思考 10 段");
 		expect(nonEmpty[2]).toBe(" ⚙ 10 步 · 1.0s · python×10");
 		// Zero per-block thinking rows anywhere in the collapsed view.
 		expect(collapsed).not.toContain("Thinking");
