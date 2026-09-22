@@ -1197,4 +1197,62 @@ describe("SettingsManager", () => {
 			expect([invalid.maxPauseMs, invalid.maxParks]).toEqual([86_400_000, 0]);
 		});
 	});
+
+	// r4-p2 blind review (blind2 F4 / blind3 finding 12): an explicit
+	// maxPerSession of 0 means "notify only" and must round-trip as 0, not fold
+	// back to the default of 3 - the same 0-allowed semantics graceSeconds and
+	// humanWindowSeconds already have.
+	describe("stall recovery stop line", () => {
+		it("honors an explicit maxPerSession 0 as notify-only instead of folding it back to the default", () => {
+			const manager = SettingsManager.inMemory({
+				subagents: { stallRecovery: { maxPerSession: 0 } },
+				stallWatchdog: { rootRecovery: { maxPerSession: 0 } },
+			});
+
+			expect(manager.getSubagentStallRecoverySettings()).toMatchObject({ maxPerSession: 0 });
+			expect(manager.getRootStallRecoverySettings()).toMatchObject({ maxPerSession: 0 });
+		});
+
+		it("keeps the 0-allowed semantics aligned across the recovery keys", () => {
+			const manager = SettingsManager.inMemory({
+				subagents: { stallRecovery: { graceSeconds: 0, maxPerSession: 0 } },
+				stallWatchdog: { rootRecovery: { humanWindowSeconds: 0, maxPerSession: 0 } },
+			});
+
+			expect(manager.getSubagentStallRecoverySettings()).toEqual({
+				enabled: true,
+				graceSeconds: 0,
+				maxPerSession: 0,
+			});
+			expect(manager.getRootStallRecoverySettings()).toEqual({
+				enabled: true,
+				humanWindowSeconds: 0,
+				maxPerSession: 0,
+			});
+		});
+
+		it("round-trips an explicit 0 through the on-disk settings file", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					subagents: { stallRecovery: { maxPerSession: 0 } },
+					stallWatchdog: { rootRecovery: { maxPerSession: 0 } },
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getSubagentStallRecoverySettings()).toMatchObject({ maxPerSession: 0 });
+			expect(manager.getRootStallRecoverySettings()).toMatchObject({ maxPerSession: 0 });
+		});
+
+		it("still falls back to the default count on non-finite or negative values", () => {
+			const manager = SettingsManager.inMemory({
+				subagents: { stallRecovery: { maxPerSession: Number.NaN } },
+				stallWatchdog: { rootRecovery: { maxPerSession: -1 } },
+			});
+
+			expect(manager.getSubagentStallRecoverySettings()).toMatchObject({ maxPerSession: 3 });
+			expect(manager.getRootStallRecoverySettings()).toMatchObject({ maxPerSession: 3 });
+		});
+	});
 });

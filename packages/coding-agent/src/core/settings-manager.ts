@@ -85,15 +85,11 @@ export const DEFAULT_SUBAGENT_STALL_RECOVERY_GRACE_SECONDS = 300;
 /** r4 recovery-shell: human window for a depth-0 session with an attached client; 0 in effect means "no human wait". */
 export const DEFAULT_ROOT_STALL_RECOVERY_HUMAN_WINDOW_SECONDS = 120;
 
-/** r4 recovery-shell: consecutive auto actions per session before the stop line (children and roots alike). */
+/** r4 recovery-shell: consecutive auto actions per session before the stop line (children and roots alike); 0 arms the line immediately (notify only). */
 export const DEFAULT_STALL_RECOVERY_MAX_PER_SESSION = 3;
 
 function nonNegativeFinite(value: number | undefined, fallback: number): number {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
-}
-
-function positiveFinite(value: number | undefined, fallback: number): number {
-	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }
 
 /**
@@ -344,9 +340,18 @@ export interface ResolvedStallWatchdogSettings {
 export interface SubagentStallRecoverySettings {
 	/** Default true. Off means the daemon never acts on a silent child - notice only, exactly as before. */
 	enabled?: boolean;
-	/** How long the sweep waits after first observing the stall before acting, in seconds. Default 300. */
+	/**
+	 * How long the sweep waits after first observing the stall before acting, in seconds.
+	 * Default 300. Like every numeric key in this block, 0 is honored rather than folded
+	 * back to the default: the sweep acts as soon as the evidence confirms.
+	 */
 	graceSeconds?: number;
-	/** Consecutive auto actions per session before the stop line: only notifications after that. Default 3. */
+	/**
+	 * Consecutive auto actions per session before the stop line: only notifications
+	 * after that. Default 3. 0 = notify only: the stop line arms before any action,
+	 * so the sweep never acts on this session - the notify-only variant of the
+	 * `enabled` rollback handle.
+	 */
 	maxPerSession?: number;
 }
 
@@ -371,7 +376,13 @@ export interface RootStallRecoverySettings {
 	enabled?: boolean;
 	/** Human window while a client is attached, in seconds; 0 means act as soon as the evidence confirms. Default 120. */
 	humanWindowSeconds?: number;
-	/** Consecutive auto actions per session before the stop line: only notifications after that. Default 3. */
+	/**
+	 * Consecutive auto actions per session before the stop line: only notifications
+	 * after that. Default 3. 0 = notify only: the stop line arms before any action,
+	 * so the sweep never acts on this session - the notify-only variant of the
+	 * `enabled` rollback handle. Key semantics stay aligned with humanWindowSeconds:
+	 * every numeric key in this block honors an explicit 0.
+	 */
 	maxPerSession?: number;
 }
 
@@ -2488,7 +2499,7 @@ export class SettingsManager {
 		return {
 			enabled: settings.enabled ?? true,
 			graceSeconds: nonNegativeFinite(settings.graceSeconds, DEFAULT_SUBAGENT_STALL_RECOVERY_GRACE_SECONDS),
-			maxPerSession: positiveFinite(settings.maxPerSession, DEFAULT_STALL_RECOVERY_MAX_PER_SESSION),
+			maxPerSession: nonNegativeFinite(settings.maxPerSession, DEFAULT_STALL_RECOVERY_MAX_PER_SESSION),
 		};
 	}
 
@@ -2501,7 +2512,7 @@ export class SettingsManager {
 				settings.humanWindowSeconds,
 				DEFAULT_ROOT_STALL_RECOVERY_HUMAN_WINDOW_SECONDS,
 			),
-			maxPerSession: positiveFinite(settings.maxPerSession, DEFAULT_STALL_RECOVERY_MAX_PER_SESSION),
+			maxPerSession: nonNegativeFinite(settings.maxPerSession, DEFAULT_STALL_RECOVERY_MAX_PER_SESSION),
 		};
 	}
 
