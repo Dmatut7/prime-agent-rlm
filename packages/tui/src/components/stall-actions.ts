@@ -16,6 +16,17 @@ export interface StallActionsView {
 	canAbort: boolean;
 	/** Whether stall diagnostics can be shown for the current turn. */
 	canDiagnose: boolean;
+	/**
+	 * True once an auto-recovery executor (the daemon's stall-recovery sweep)
+	 * has this session under observation (r4 phase-2, F3). Informational, not
+	 * an action: it adds one hint line, consumes no key, and has no click
+	 * region. Filled by the daemon on the wire; absent when unarmed.
+	 */
+	autoRecoveryArmed?: boolean;
+	/** Who performs the auto action when the wait window closes, when armed. */
+	executor?: "daemon" | "in-process";
+	/** Epoch ms when the auto action is expected, when armed. */
+	autoRecoveryAtMs?: number;
 }
 
 /**
@@ -54,6 +65,34 @@ function secondsOf(ms: number): string {
 	return `${Math.max(1, Math.round(ms / 1000))}s`;
 }
 
+/** Locale-independent wall-clock rendering (HH:MM:SS) of an epoch-ms moment. */
+function clockOf(ms: number): string {
+	const date = new Date(ms);
+	const pad = (value: number): string => String(value).padStart(2, "0");
+	return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+/**
+ * The auto-recovery hint line, or undefined when the facts are not renderable
+ * (unarmed, or the moment is missing/non-finite). Static: the wall-clock
+ * moment to the second plus a countdown against this paint's own `nowMs`, both
+ * recomputed on every paint (see the cache key in render()); the wall-clock
+ * part stays honest even if nothing repaints for a while.
+ *
+ * The copy promises the machine's own deadline. It must not say "any input
+ * keeps this turn alive": that second claim belongs to the daemon's input
+ * accounting (blind1 F1) and cannot ship from here before it exists.
+ */
+function autoRecoveryLine(actions: StallActionsView, nowMs: number): string | undefined {
+	if (actions.autoRecoveryArmed !== true) return undefined;
+	const atMs = actions.autoRecoveryAtMs;
+	if (typeof atMs !== "number" || !Number.isFinite(atMs)) return undefined;
+	const who = actions.executor === undefined ? "auto-recovery" : `auto-recovery (${actions.executor})`;
+	const remainingMs = atMs - nowMs;
+	const countdown = remainingMs <= 0 ? "due now" : `in ${Math.max(1, Math.round(remainingMs / 1000))}s`;
+	return `  ${who}: machine will act at ${clockOf(atMs)} (${countdown})`;
+}
+
 function isActionable(actions: StallActionsView | undefined): actions is StallActionsView {
 	return actions !== undefined && (actions.canAbort || actions.canDiagnose);
 }
@@ -71,7 +110,21 @@ function effectiveActions(event: StallActionEvent, options: StallActionsOptions)
 	const canAbort = actions.canAbort && options.onInterrupt !== undefined;
 	const canDiagnose = actions.canDiagnose && options.onDiagnostics !== undefined;
 	if (!canAbort && !canDiagnose) return undefined;
-	return { canAbort, canDiagnose };
+	// F3: the auto-recovery facts are informational, not host-gated, so they
+	// survive this AND - the countdown keeps showing even when only one action
+	// is deliverable here.
+	return { canAbort, canDiagnose, ...autoRecoveryFactsOf(actions) };
+}
+
+/** The daemon's auto-recovery facts, verbatim: this layer never invents them. */
+function autoRecoveryFactsOf(
+	actions: StallActionsView,
+): Pick<StallActionsView, "autoRecoveryArmed" | "executor" | "autoRecoveryAtMs"> {
+	return {
+		autoRecoveryArmed: actions.autoRecoveryArmed,
+		executor: actions.executor,
+		autoRecoveryAtMs: actions.autoRecoveryAtMs,
+	};
 }
 
 /**
@@ -84,13 +137,19 @@ function effectiveActions(event: StallActionEvent, options: StallActionsOptions)
  * Two render directions:
  * - With an `actions` field that offers at least one action: the summary line
  *   plus one hint line per offered action (the hint lines double as the
- *   clickable buttons of the {@link StallActions} component) and the dismiss
- *   note.
+ *   clickable buttons of the {@link StallActions} component), the armed
+ *   auto-recovery line when the emitter filled one (F3: wall-clock moment plus
+ *   a countdown against `nowMs`, not an action and not clickable), and the
+ *   dismiss note.
  * - Without usable actions (older emitter, or a terminal stall stage): the
  *   summary plus the plain event message - the degraded plain-text render the
  *   old error channel produced before the action bar existed.
  */
-export function formatStallActionLines(event: StallActionEvent, keys: StallActionKeyHints): string[] {
+export function formatStallActionLines(
+	event: StallActionEvent,
+	keys: StallActionKeyHints,
+	nowMs: number = Date.now(),
+): string[] {
 	const summary = `\u26a0 stall: silent ${secondsOf(event.silentMs)} (threshold ${secondsOf(event.thresholdMs)})`;
 	if (!isActionable(event.actions)) {
 		return [summary, event.message];
@@ -101,6 +160,10 @@ export function formatStallActionLines(event: StallActionEvent, keys: StallActio
 	}
 	if (event.actions.canDiagnose) {
 		lines.push(`  ${keys.diagnostics} = show stall diagnostics`);
+	}
+	const autoRecovery = autoRecoveryLine(event.actions, nowMs);
+	if (autoRecovery !== undefined) {
+		lines.push(autoRecovery);
 	}
 	lines.push("  any other key = dismiss (the turn keeps running)");
 	return lines;
@@ -144,7 +207,7 @@ export class StallActions implements Component {
 	private readonly options: StallActionsOptions;
 	private dismissed = false;
 	private regions: ClickRegion[] = [];
-	private cache?: { width: number; hintKey: string; lines: string[] };
+	private cache?: { width: number; hintKey: string; countdownKey: string; lines: string[] };
 
 	constructor(event: StallActionEvent, options: StallActionsOptions) {
 		this.event = event;
@@ -194,14 +257,23 @@ export class StallActions implements Component {
 		}
 		const hints = this.resolveKeyHints();
 		const hintKey = `${hints.interrupt}\u0000${hints.diagnostics}`;
+		const actions = effectiveActions(this.event, this.options);
+		// F3: an armed countdown line is measured against the paint's clock, so
+		// the cache key carries the current second and any ordinary repaint
+		// re-renders the countdown. No timer lives here: while a turn streams the
+		// host already repaints (the working loader's spinner and the chat pulse
+		// both run), and inventing a second ticker would only duplicate them.
+		// Without an armed countdown the key is constant, so the cache behaves
+		// exactly as it did before this feature.
+		const countdownKey =
+			actions?.autoRecoveryArmed === true && typeof actions.autoRecoveryAtMs === "number"
+				? String(Math.floor(Date.now() / 1000))
+				: "";
 		const cache = this.cache;
-		if (cache && cache.width === width && cache.hintKey === hintKey) {
+		if (cache && cache.width === width && cache.hintKey === hintKey && cache.countdownKey === countdownKey) {
 			return cache.lines;
 		}
-		const rawLines = formatStallActionLines(
-			{ ...this.event, actions: effectiveActions(this.event, this.options) },
-			hints,
-		);
+		const rawLines = formatStallActionLines({ ...this.event, actions }, hints);
 		const lines: string[] = [];
 		for (const raw of rawLines) {
 			for (const wrapped of wrapTextWithAnsi(raw, Math.max(1, width))) {
@@ -209,7 +281,7 @@ export class StallActions implements Component {
 				lines.push(wrapped + " ".repeat(padding));
 			}
 		}
-		this.cache = { width, hintKey, lines };
+		this.cache = { width, hintKey, countdownKey, lines };
 		this.regions = this.regionsFor(lines, hints);
 		return lines;
 	}

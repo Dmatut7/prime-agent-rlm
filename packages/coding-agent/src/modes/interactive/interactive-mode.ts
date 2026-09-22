@@ -142,6 +142,7 @@ import {
 	resolveBuiltinSlashCommandName,
 } from "../../core/slash-commands.js";
 import { createSpendPricing, type SpendPricing } from "../../core/spend-pricing.js";
+import type { StallEventActions } from "../../core/stall-diagnostics.js";
 import { formatStallEventLines, type StallEventView, stallActionBarView } from "../../core/stall-diagnostics-render.js";
 import {
 	captureAgentCommandUsed,
@@ -1223,7 +1224,9 @@ export class InteractiveMode {
 	 * r4 recovery-shell: the live stall action bar. Non-modal, no focus grab; the
 	 * input listener below routes keys to it while it is visible (B1) and every
 	 * other key dismisses it and flows on. Replaced by the next stall_warning,
-	 * torn down by the terminal stall stages (S1).
+	 * torn down by the terminal stall stages (S1), by turn_end (the warning's
+	 * turn is over mid-run) and by agent_end (the run is over) - a bar must never
+	 * outlive the turn it speaks for.
 	 */
 	private stallActionBar: StallActions | undefined;
 	/** B1: the stall bar's input route, registered once and unregistered on teardown. */
@@ -6314,6 +6317,14 @@ export class InteractiveMode {
 
 			case "turn_end":
 				mergeTurnFileChanges(this.agentRunFileChanges, event.message, event.toolResults, this.getCurrentCwd());
+				// The warning's turn is over: a stalled turn emits no turn_end, so one
+				// arriving while a bar is live means the turn recovered and finished.
+				// The bar's "interrupt this turn" now refers to a turn that already
+				// ended and its diagnostics captured that turn's snapshot, so it goes
+				// with the turn - the same reasoning as agent_end below (blind3 7 / the
+				// joint fix draft's N4, which takes both teardown points). The next
+				// turn that stalls mounts a fresh bar: teardown is not a latch.
+				this.removeStallActionBar();
 				break;
 
 			case "agent_end":
@@ -6335,6 +6346,14 @@ export class InteractiveMode {
 					this.streamingComponent = undefined;
 					this.streamingMessage = undefined;
 				}
+				// A live stall bar promises "interrupt this turn" - an action that
+				// can no longer happen once the turn is over. The daemon's recovery
+				// abort and a naturally finished turn both land here, and neither
+				// emits a terminal stall stage by itself, so this is the teardown
+				// the bar actually depends on (blind2 F6 / blind3 7). The bar's
+				// input route goes with it. A render is already requested at the
+				// end of this case, so the teardown skips its own.
+				this.removeStallActionBar({ render: false });
 				this.flushPendingBashComponents();
 				this.resetPendingToolState();
 				this.renderRecap();
@@ -7885,16 +7904,31 @@ export class InteractiveMode {
 	/**
 	 * Mount the stall action bar for one stall event (r4 recovery-shell).
 	 *
-	 * The host resolves the view locally from its own state: the interrupt label
-	 * comes from the real `app.input.clear` binding (B2 - an empty label means
-	 * unbound, and the action is then not offered), and both actions require a
-	 * handler behind them (F1). A bar that cannot mount leaves exactly the
-	 * pre-bar behavior - the forensic showError already fired (B3).
+	 * The interrupt label is resolved locally from the real `app.input.clear`
+	 * binding (B2 - an empty label means unbound, and the action is then not
+	 * offered). The two handler facts are constants in this host, not lookups:
+	 * this method wires both callbacks unconditionally below, so `canInterrupt`
+	 * and `canDiagnose` are always true here. That is not the general "host
+	 * resolves its own state" contract `stallActionBarView` documents - the
+	 * real per-mount resolution is deferred (r4 phase-3, blind3 8); the layer
+	 * that actually gates the promises today is the TUI's callback AND
+	 * (`effectiveActions`), which drops any action without a handler. A bar
+	 * that cannot mount leaves exactly the pre-bar behavior - the forensic
+	 * showError already fired (B3).
+	 *
+	 * F3: the daemon may have filled auto-recovery facts on the event's
+	 * `actions`. Those are pass-through facts about the sweep, not actions this
+	 * host resolves, so they are merged into the mounted view instead of being
+	 * replaced by it - the bar then shows when the sweep will act, and the TUI
+	 * re-derives the countdown from its own clock on every repaint (this host
+	 * owns no countdown timer).
 	 */
-	private mountStallActionBar(event: StallEventView): void {
+	private mountStallActionBar(event: StallEventView & { actions?: StallEventActions }): void {
 		const interruptKeyLabel = keyText("app.input.clear");
+		const daemonActions = event.actions;
 		const view = stallActionBarView(event, {
 			interruptKeyLabel,
+			// Constant-true host facts, not resolutions - see the doc comment above.
 			canInterrupt: true,
 			canDiagnose: true,
 		});
@@ -7906,7 +7940,19 @@ export class InteractiveMode {
 		}
 		this.removeStallActionBar();
 		const bar = new StallActions(
-			{ ...event, actions: view },
+			{
+				...event,
+				actions: {
+					...view,
+					...(daemonActions?.autoRecoveryArmed === true
+						? {
+								autoRecoveryArmed: true,
+								executor: daemonActions.executor,
+								autoRecoveryAtMs: daemonActions.autoRecoveryAtMs,
+							}
+						: {}),
+				},
+			},
 			{
 				interruptKeyLabel,
 				matchesInterruptKey: (data) => this.keybindings.matches(data, "app.input.clear"),

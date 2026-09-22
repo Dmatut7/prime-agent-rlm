@@ -83,6 +83,78 @@ describe("formatStallActionLines", () => {
 		assert.ok(lines.some((line) => line.includes("ctrl+g = show stall diagnostics")));
 		assert.ok(!lines.some((line) => line.includes("Esc")));
 	});
+
+	it("F3: renders the armed auto-recovery moment (wall clock) plus a countdown", () => {
+		const nowMs = 1_000_000_000;
+		const atMs = nowMs + 90_000;
+		const lines = formatStallActionLines(
+			{
+				...actionableEvent,
+				actions: {
+					canAbort: true,
+					canDiagnose: true,
+					autoRecoveryArmed: true,
+					executor: "daemon",
+					autoRecoveryAtMs: atMs,
+				},
+			},
+			{ interrupt: interruptKeyLabel, diagnostics: "ctrl+y" },
+			nowMs,
+		);
+
+		const expectedClock = new Date(atMs);
+		const pad = (value: number): string => String(value).padStart(2, "0");
+		const clock = `${pad(expectedClock.getHours())}:${pad(expectedClock.getMinutes())}:${pad(expectedClock.getSeconds())}`;
+		assert.deepStrictEqual(lines, [
+			"\u26a0 stall: silent 312s (threshold 300s)",
+			"  Esc = interrupt this turn",
+			"  ctrl+y = show stall diagnostics",
+			`  auto-recovery (daemon): machine will act at ${clock} (in 90s)`,
+			"  any other key = dismiss (the turn keeps running)",
+		]);
+	});
+
+	it("F3: renders 'due now' once the expected moment has passed", () => {
+		const lines = formatStallActionLines(
+			{
+				...actionableEvent,
+				actions: { canAbort: true, canDiagnose: true, autoRecoveryArmed: true, autoRecoveryAtMs: 999_000 },
+			},
+			{ interrupt: interruptKeyLabel, diagnostics: "ctrl+y" },
+			1_000_000_000,
+		);
+
+		assert.ok(
+			lines.some((line) => line.includes("auto-recovery: machine will act at") && line.includes("(due now)")),
+		);
+	});
+
+	it("F3: an unarmed or moment-less actions field renders no auto-recovery line", () => {
+		// Unarmed even though the moment is present: armed is the gate, so a
+		// malformed/absent flag can never invent a countdown.
+		const unarmed = formatStallActionLines(
+			{ ...actionableEvent, actions: { canAbort: true, canDiagnose: true, autoRecoveryAtMs: 1_000_090_000 } },
+			{ interrupt: interruptKeyLabel, diagnostics: "ctrl+y" },
+			1_000_000_000,
+		);
+		const disarmed = formatStallActionLines(
+			{ ...actionableEvent, actions: { canAbort: true, canDiagnose: true, autoRecoveryArmed: false } },
+			{ interrupt: interruptKeyLabel, diagnostics: "ctrl+y" },
+			1_000_000_000,
+		);
+		const momentless = formatStallActionLines(
+			{ ...actionableEvent, actions: { canAbort: true, canDiagnose: true, autoRecoveryArmed: true } },
+			{ interrupt: interruptKeyLabel, diagnostics: "ctrl+y" },
+			1_000_000_000,
+		);
+
+		for (const lines of [unarmed, disarmed, momentless]) {
+			assert.ok(!lines.some((line) => line.includes("auto-recovery")));
+			// Line-count pin: without the armed facts the render is exactly the
+			// pre-F3 shape - summary, one hint per offered action, dismiss note.
+			assert.strictEqual(lines.length, 4);
+		}
+	});
 });
 
 describe("stall action keybinding registration", () => {
@@ -242,6 +314,65 @@ describe("StallActions component", () => {
 		assert.deepStrictEqual(bar.getClickRegions(), []);
 		assert.strictEqual(bar.handleInput(CTRL_Y), false);
 		assert.strictEqual(bar.handleInput(ESCAPE), false);
+	});
+
+	it("F3: renders the armed auto-recovery line after the action hints, unclickable", () => {
+		// The countdown is a fact, not an action: it adds a line but no key and
+		// no click region, so the two action regions are the only ones.
+		const bar = new StallActions(
+			{
+				...actionableEvent,
+				actions: {
+					canAbort: true,
+					canDiagnose: true,
+					autoRecoveryArmed: true,
+					executor: "daemon",
+					autoRecoveryAtMs: Date.now() + 90_000,
+				},
+			},
+			{
+				interruptKeyLabel,
+				onInterrupt: () => {},
+				onDiagnostics: () => {},
+			},
+		);
+
+		const lines = bar.render(80);
+
+		assert.strictEqual(lines.length, 5);
+		const countdownLine = lines[3]!;
+		assert.ok(countdownLine.includes("auto-recovery (daemon): machine will act at"), countdownLine);
+		assert.ok(countdownLine.includes("(in 90s)"), countdownLine);
+		assert.strictEqual(bar.getClickRegions().length, 2);
+	});
+
+	it("F3: the auto-recovery facts survive the callback AND (informational, not host-gated)", () => {
+		// Only the diagnostics callback is provided, so the interrupt hint is
+		// gone - but the daemon's countdown still renders: dropping it with the
+		// unusable action would hide when the sweep will act.
+		const bar = new StallActions(
+			{
+				...actionableEvent,
+				actions: {
+					canAbort: true,
+					canDiagnose: true,
+					autoRecoveryArmed: true,
+					executor: "daemon",
+					autoRecoveryAtMs: Date.now() + 45_000,
+				},
+			},
+			{ interruptKeyLabel, onDiagnostics: () => {} },
+		);
+
+		const lines = bar.render(80);
+
+		assert.ok(!lines.some((line) => line.includes("interrupt this turn")));
+		assert.ok(
+			lines.some(
+				(line) => line.includes("auto-recovery (daemon): machine will act at") && line.includes("(in 45s)"),
+			),
+		);
+		assert.strictEqual(bar.getClickRegions().length, 1);
 	});
 
 	it("renders nothing and consumes no input after dismiss", () => {
