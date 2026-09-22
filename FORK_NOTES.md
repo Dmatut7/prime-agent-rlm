@@ -478,3 +478,9 @@ fork 工作文档统一搬入 `docs/fork/`：审计总账 `audit-findings.md`、
 - 根因（已修代码侧 cc4a17379）：百炼 GLM 家族默认 tool_stream 分片流，长上下文分片累积成乱码工具名＋空参数（实测修复前 269 条坏调用，82% 来自 GLM 两模；修复后 6304 次调用仅 4 条边缘形态）。
 - **用户必配**：`~/.prime/agent/models.json` 里每枚 Bailian GLM 条目加 `"compat": { "toolStream": false }`——拉新版不配此键，坏调用依旧（网关默认仍开分片）。文档已进 packages/coding-agent/docs/models.md（compat.toolStream 节，含配置示例与探针测试说明），发版 fragment 已落（glm-toolstream-migration-note.md）。
 - 探针测试 openai-completions-bailian-glm-toolstream.test.ts 钉死 payload `tool_stream===false`（含生产 models.json 实读断言，防配置漂移）。
+
+## 2026-09-22 看图工作法（四家研究收口）
+
+- 主模型无视觉时，带图轮自动路由到 settings.imageModel（现为 deepseek-v4.1-flash）；追问轮看不到历史图（官方文档既定设计）。
+- **追问带一张新图＝历史里所有旧图一起重看**（实测 wireImages=2）——"改→再看→对照"零成本成立。
+- 反复看图的活（UI 仿图、验收审查）派视觉子代理工位；playwright 截图传 filename 落盘再 attach（内联超 64K 截断）。
