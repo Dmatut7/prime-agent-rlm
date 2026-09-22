@@ -263,6 +263,18 @@ describe("U6 status area layout", () => {
 		expect(rendered).not.toContain("展开");
 		// It never grows beyond one line.
 		expect(line.render(100)).toHaveLength(1);
+
+		// F4 (DS2): the hint degrades by whole segments - no mid-key fragments.
+		const twoSegments = stripAnsi(line.render(30).join("\n"));
+		expect(twoSegments).toBe(" Ctrl+T 思考 · Ctrl+O 过程");
+		const oneSegment = stripAnsi(line.render(20).join("\n"));
+		expect(oneSegment).toBe(" Ctrl+T 思考");
+		// Below one full segment: nothing - no half keys.
+		expect(line.render(10)).toEqual([]);
+		for (const width of [40, 34, 30, 24, 20, 16, 12, 8]) {
+			const text = stripAnsi(line.render(width).join("\n"));
+			expect(text).not.toMatch(/Ctrl\+$/);
+		}
 	});
 
 	it("matches the watermark line's four-space group rhythm and still fits 80 (F7, DS2)", () => {

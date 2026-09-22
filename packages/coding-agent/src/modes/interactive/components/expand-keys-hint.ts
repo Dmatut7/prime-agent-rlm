@@ -1,4 +1,4 @@
-import { type Component, truncateToWidth } from "@earendil-works/pi-tui";
+import { type Component, visibleWidth } from "@earendil-works/pi-tui";
 import { theme } from "../theme/theme.js";
 import { keyText } from "./keybinding-hints.js";
 
@@ -29,8 +29,17 @@ export class ExpandKeysHintLine implements Component {
 			process ? `${process} 过程` : undefined,
 			messages ? `${messages} 消息` : undefined,
 		].filter((part): part is string => part !== undefined);
+		// F4 (DS2 review): this line is the only statement of the T/O/P
+		// division, so it degrades by whole segments - never a mid-key
+		// truncation that would read as a broken render. Two segments fit
+		// where three do not; one below that; nothing under ~16 columns.
 		const safeWidth = Math.max(1, width);
-		const line = theme.fg("dim", truncateToWidth(` ${parts.join(" · ")}`, safeWidth, ""));
-		return [line];
+		for (let count = parts.length; count >= 1; count--) {
+			const text = ` ${parts.slice(0, count).join(" · ")}`;
+			if (visibleWidth(text) <= safeWidth) {
+				return [theme.fg("dim", text)];
+			}
+		}
+		return [];
 	}
 }
