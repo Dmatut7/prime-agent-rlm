@@ -112,8 +112,22 @@ Prime Agent combines a persistent Python control environment with durable harnes
 ## Getting Started
 
 > **This repository is an independently maintained line, not the upstream release channel.**
-> The one-line installer below installs the **upstream** release, which does **not** include this
-> line's fixes (see [FORK_NOTES.md](FORK_NOTES.md)). To run *this* line, build from source:
+> The official one-line installer installs the **upstream** release, which does **not** include
+> this line's fixes (see [FORK_NOTES.md](FORK_NOTES.md)). Install **this** line with its own
+> one-liner - it clones, builds, and installs the `prime-agent` command from this tree:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Dmatut7/prime-agent-rlm/merge/repl-kernel/install-fork.sh | sh
+```
+
+Custom checkout dir (`$HOME/prime-agent-rlm` by default), or build an existing clone:
+
+```bash
+INSTALL_DIR=~/pa sh install-fork.sh          # custom dir
+sh install-fork.sh /path/to/existing/clone   # update + rebuild a checkout
+```
+
+Manual equivalent of the one-liner:
 
 ```bash
 git clone https://github.com/Dmatut7/prime-agent-rlm.git   # default branch merge/repl-kernel

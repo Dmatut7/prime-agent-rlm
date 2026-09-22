@@ -1,0 +1,1 @@
+- Added a one-line installer for this fork line (`install-fork.sh`): clone, `npm ci`, build, and `npm link` in one command, so users no longer fall into the upstream one-liner that ships none of this line's fixes.
