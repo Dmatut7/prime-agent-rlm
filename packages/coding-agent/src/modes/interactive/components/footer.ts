@@ -219,17 +219,22 @@ export class FooterComponent implements Component {
 		// line when enabled. The stable empty reference keeps the parent
 		// aggregator's identity check hitting while the footer is empty.
 		const safeWidth = Math.max(1, width);
-		const telemetry = this.telemetryText(safeWidth);
 		const toolErrorBadge =
 			this.toolErrorCount >= TOOL_ERROR_WARN_THRESHOLD ? `⚠ 工具错误×${this.toolErrorCount}` : undefined;
+		// F1 (DS2 review): one width ledger. The badge rides the watermark line,
+		// so the watermark's own ladder runs against the width the badge leaves
+		// - segments still drop whole, never a truncated "5" that reads as a
+		// number. (The badge's visible width is the plain string; the color
+		// wrapper adds zero columns.)
+		const telemetry = this.telemetryText(
+			toolErrorBadge ? Math.max(1, safeWidth - toolErrorBadge.length - 1) : safeWidth,
+		);
 		if (!telemetry && !toolErrorBadge && (!this.speedEnabled || !this.speedText)) {
 			return this.emptyLines;
 		}
 		const lines: string[] = [];
 		if (telemetry && toolErrorBadge) {
-			lines.push(
-				`${truncateToWidth(telemetry, Math.max(1, safeWidth - visibleWidth(toolErrorBadge) - 1), "")} ${theme.fg("warning", toolErrorBadge)}`,
-			);
+			lines.push(`${telemetry} ${theme.fg("warning", toolErrorBadge)}`);
 		} else if (telemetry) {
 			lines.push(truncateToWidth(telemetry, safeWidth, ""));
 		} else if (toolErrorBadge) {

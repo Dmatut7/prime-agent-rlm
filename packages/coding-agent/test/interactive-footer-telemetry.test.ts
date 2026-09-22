@@ -116,6 +116,37 @@ describe("footer telemetry watermark (U6)", () => {
 		expect(footer.render(120)).toEqual([]);
 	});
 
+	it("never lets the error badge truncate the watermark into a fake number (F1, DS2)", () => {
+		// The badge shares the line, so the watermark's ladder runs against the
+		// width the badge leaves - whole segments drop, never half figures.
+		const footer = new FooterComponent(provider);
+		footer.setTelemetrySource(() => ({
+			mode: "on",
+			snapshot: {
+				modelName: "anthropic/claude-3-7-sonnet-20250219",
+				thinkingLevel: "max",
+				contextTokens: 518_000,
+				contextWindow: 1_048_576,
+				compactionThresholdTokens: 800_000,
+			},
+		}));
+		footer.setToolErrorCount(3);
+		for (const width of [80, 82, 84]) {
+			const line = stripAnsi(footer.render(width).join("\n"));
+			// The badge present, the figures whole-or-absent: no lone "5", no
+			// "518k/1M · 5", no dangling separator.
+			expect(line).toContain("⚠ 工具错误×3");
+			expect(line).not.toMatch(/\d[ ·]*⚠/);
+			if (line.includes("518k/1M")) {
+				expect(line).toContain("518k/1M · 49%");
+			} else {
+				expect(line).not.toContain("518k");
+				expect(line).not.toMatch(/\b\d+\b(?!\.\d)/);
+			}
+			expect(line.length).toBeLessThanOrEqual(width);
+		}
+	});
+
 	it("coexists with the /speed line: telemetry first, speed second, both truncated", () => {
 		const footer = new FooterComponent(provider);
 		const telemetry = makeSource();
