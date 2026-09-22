@@ -3,6 +3,7 @@ import type { AssistantMessage, ToolResultMessage } from "@earendil-works/pi-ai"
 import type { TUI } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, it, vi } from "vitest";
+import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
 import { buildConversationComponents } from "../src/modes/interactive/components/conversation-components.js";
 import {
 	TurnActivityState,
@@ -147,6 +148,44 @@ describe("turn activity summary (U4)", () => {
 		// Line 0 is the user prompt; the ⚙ line is the very next line.
 		expect(nonEmpty[0]).toContain("run the checks");
 		expect(nonEmpty[1]).toContain("⚙ 6 步");
+	});
+
+	it("keeps the blank-line wall out: density reads total/non-empty/empty (F2, DS2)", () => {
+		const messages: AgentMessage[] = [{ role: "user", content: "fix the CI reds", timestamp: 900 }];
+		for (let i = 1; i <= 10; i++) {
+			messages.push(
+				assistant(
+					[
+						{ type: "thinking", thinking: `Step ${i}: weigh the options first.` },
+						{ type: "toolCall", id: `py-${i}`, name: "ipython", arguments: { code: `check(${i})` } },
+					],
+					1_000 + i * 100,
+				),
+			);
+			messages.push(toolResult(`py-${i}`, "ipython", `ok ${i}`, 1_000 + i * 110));
+		}
+		messages.push(assistant([{ type: "text", text: "All three reds closed." }], 2_600));
+
+		const collapsed = renderAll(messages, false);
+		const all = collapsed.split("\n");
+		const total = all.length;
+		const nonEmpty = all.filter((line) => line.trim().length > 0).length;
+		const empty = total - nonEmpty;
+		// The DS2 review's same fixture measured 29 total / 25 blank before F2
+		// (the collapsed thinking blocks still earned their spacers). Now: nine
+		// total, five structural blanks (user padding, the turn head's inner
+		// blank, the final message's leading spacer).
+		expect(total).toBe(9);
+		expect(nonEmpty).toBe(4);
+		expect(empty).toBe(5);
+
+		// The same message renders zero lines while fully collapsed (thinking
+		// hidden, no text) - and still zero under hideThinkingBlock.
+		const thinkingToolMessage = messages[1] as AssistantMessage;
+		const component = new AssistantMessageComponent(thinkingToolMessage, false, undefined, "思考");
+		expect(component.render(100).filter((line) => line.trim().length > 0)).toHaveLength(0);
+		const hidden = new AssistantMessageComponent(thinkingToolMessage, true, undefined, "思考");
+		expect(hidden.render(100).filter((line) => line.trim().length > 0)).toHaveLength(0);
 	});
 
 	it("renders one thinking header plus one process line per turn, zero thinking rows collapsed", () => {

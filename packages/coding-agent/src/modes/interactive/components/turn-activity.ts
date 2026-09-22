@@ -207,10 +207,13 @@ export class TurnSummaryComponent implements Component {
 		// above the process line (②). No per-line expand hints — the single
 		// global hint line at the chat tail carries the key division.
 		const textLines = [this.state.thinkingHeaderText(), this.state.summaryText()].filter((text) => text.length > 0);
-		const lines = textLines.flatMap((text) => [
-			theme.fg("muted", truncateToWidth(` ${text}`, safeWidth, "")),
-			" ".repeat(safeWidth),
-		]);
+		// F2 (DS2 review): one blank line between the two text lines, none
+		// trailing each - the turn head is 3 lines for a full turn, 1 for a
+		// thinking-only one, and the following content carries its own spacing.
+		const lines = textLines.flatMap((text, index) => {
+			const rendered = [theme.fg("muted", truncateToWidth(` ${text}`, safeWidth, ""))];
+			return index < textLines.length - 1 ? [...rendered, " ".repeat(safeWidth)] : rendered;
+		});
 		if (this.state.isSettled) {
 			this.cachedWidth = width;
 			this.cachedLines = lines;

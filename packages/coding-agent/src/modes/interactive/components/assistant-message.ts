@@ -242,9 +242,22 @@ export class AssistantMessageComponent extends Container {
 		this.blockMarkdowns.clear();
 		this.lastBlockTexts.clear();
 
-		const hasVisibleContent = message.content.some(
-			(c) => (c?.type === "text" && c.text.trim()) || (c?.type === "thinking" && c.thinking.trim()),
-		);
+		// F2 (DS2 review): a block only counts as visible content if it actually
+		// renders - thinking blocks draw nothing while collapsed (or while
+		// hideThinkingBlock wins), so they must not earn a Spacer either. The
+		// old count left a 2-blank-line wall behind every "thinking + toolCall"
+		// message in the default collapsed view.
+		const rendersThinking = (c: AssistantMessage["content"][number]) =>
+			c?.type === "thinking" && c.thinking.trim() && !this.hideThinkingBlock && this.thinkingExpanded;
+		const hasVisibleContent =
+			message.content.some(
+				(c) => (c?.type === "text" && c.text.trim()) || (c?.type === "thinking" && rendersThinking(c)),
+			) ||
+			// The error surfaces render in both lanes (aborted, or a
+			// non-tool-call error); toolCall blocks render as separate
+			// components, not here.
+			message.stopReason === "aborted" ||
+			(message.stopReason === "error" && !message.content.some((c) => c?.type === "toolCall"));
 
 		if (hasVisibleContent) {
 			this.contentContainer.addChild(new Spacer(1));
@@ -271,9 +284,11 @@ export class AssistantMessageComponent extends Container {
 				// the turn's aggregate line carries the segment count (`思考 N 段`).
 				// The full Markdown trace only renders in the expanded detail view
 				// (Ctrl+O). hideThinkingBlock hides it even there.
+				// F2: same "actually renders" rule - a following thinking block
+				// that stays collapsed must not earn this one a spacer either.
 				const hasVisibleContentAfter = message.content
 					.slice(i + 1)
-					.some((c) => (c?.type === "text" && c.text.trim()) || (c?.type === "thinking" && c.thinking.trim()));
+					.some((c) => (c?.type === "text" && c.text.trim()) || (c?.type === "thinking" && rendersThinking(c)));
 
 				const thinkingLabel = theme.bold(theme.fg("thinkingText", this.hiddenThinkingLabel));
 				if (this.hideThinkingBlock) {
