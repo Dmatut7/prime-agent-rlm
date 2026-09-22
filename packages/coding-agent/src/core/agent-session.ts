@@ -539,7 +539,7 @@ export type CompactionReason = "manual" | "threshold" | "overflow" | "requested"
 
 const sessionLog = getLogger("coding-agent.agent-session");
 
-import type { StallDiagnostics } from "./stall-diagnostics.js";
+import type { StallDiagnostics, StallEventActions } from "./stall-diagnostics.js";
 import { detectToolNameConflicts, type ToolNameSource } from "./tool-name-conflicts.js";
 
 export type { StallDiagnostics };
@@ -651,6 +651,14 @@ export type AgentSessionEvent =
 			silentMs: number;
 			thresholdMs: number;
 			diagnostics: StallDiagnostics;
+			/**
+			 * Actions the event offers to whoever is watching (r4 recovery-shell).
+			 * Optional and additive: the in-process emitter never sets it (the
+			 * interactive host resolves its own keys), the daemon fills it once its
+			 * stall-recovery sweep has the session under observation, and an older
+			 * client ignores it. Terminal stages never carry it (S1).
+			 */
+			actions?: StallEventActions;
 	  }
 	| {
 			type: "stall_abort";
@@ -658,6 +666,8 @@ export type AgentSessionEvent =
 			silentMs: number;
 			thresholdMs: number;
 			diagnostics: StallDiagnostics;
+			/** Never populated: the turn is dead, there is nothing left to act on (S1). */
+			actions?: StallEventActions;
 	  }
 	/**
 	 * The stall watchdog aborted the turn but it never settled (no `agent_end`).
@@ -670,6 +680,8 @@ export type AgentSessionEvent =
 			silentMs: number;
 			thresholdMs: number;
 			diagnostics: StallDiagnostics;
+			/** Never populated: the turn is dead, there is nothing left to act on (S1). */
+			actions?: StallEventActions;
 	  }
 	| {
 			/**
@@ -2575,6 +2587,14 @@ export class AgentSession {
 	 * lives in another worker.
 	 */
 	private _stallState: RlmChildStallState | undefined;
+	/**
+	 * Turns this session has started (r4 recovery-shell). Incremented on every
+	 * agent_start; the stall-recovery executor uses it to scope "exactly one
+	 * auto action per (session, turn)": a claim keyed by this epoch stops
+	 * matching the moment a new turn begins, so a recovered session that stalls
+	 * again in a later turn is a new episode, never a skipped or repeated one.
+	 */
+	private _turnLifecycleEpoch = 0;
 	/** Why the last abort of this session was requested; cleared by the next agent_start. */
 	private _lastTurnAbortReason: RlmChildTurnAbortReason | undefined;
 	/** The child already delivered its own terminal-error notice to the parent. */
@@ -5924,6 +5944,14 @@ export class AgentSession {
 	}
 
 	/**
+	 * Turns this session has started; advances on every agent_start. The
+	 * stall-recovery claim key scopes auto actions to one per (session, epoch).
+	 */
+	get turnLifecycleEpoch(): number {
+		return this._turnLifecycleEpoch;
+	}
+
+	/**
 	 * Why the last abort of this session was requested, until the next turn starts.
 	 * Published for diagnostics and for a parent classifying a child's terminal
 	 * state: a stale reason would turn a healthy follow-up turn into a reported
@@ -6245,6 +6273,10 @@ export class AgentSession {
 			// stall marker for a session that recovered.
 			this._lastTurnAbortReason = undefined;
 			this._stallState = undefined;
+			// A new turn also closes every stall-recovery claim scoped to the
+			// previous epoch: the episode that claimed it either recovered (this
+			// turn is its evidence) or ended, and neither may act again.
+			this._turnLifecycleEpoch += 1;
 			// Same rule for the vouch's own state: a degraded journal read from the previous turn
 			// must not excuse this one, and the once-per-turn log throttles restart with the turn.
 			this._lastStallAbortCause = undefined;
@@ -11822,8 +11854,13 @@ export class AgentSession {
 	 * Abort the active run and deliver every queued user steering message in one new turn.
 	 * Abort-only when the visible steering queue is empty or the scheduler must stay
 	 * suspended; an update-restart suspension is left untouched. steeringMode is never changed.
+	 *
+	 * `reason` (r4 recovery-shell) is forwarded to the abort so the terminal
+	 * classifier can tell an automatic stall-recovery interrupt from a user Esc
+	 * (see RlmChildTurnAbortReason); callers that omit it keep the exact
+	 * previous behavior.
 	 */
-	abortAndSendQueued(): boolean {
+	abortAndSendQueued(options?: { reason?: RlmChildTurnAbortReason }): boolean {
 		// requestAbort would clear the restart flag, letting later admissions resume
 		// work during the restart window; abortForUpdateRestart already aborted the run.
 		if (this._sessionInputSuspendedForUpdateRestart) {
@@ -11843,11 +11880,11 @@ export class AgentSession {
 			this._sessionInputAdmissionPauses.size === 0 &&
 			this._queuedWorkPauses.size === 0;
 		if (queuedSteering.length === 0 || !canResume) {
-			this.requestAbort();
+			this.requestAbort(options);
 			return false;
 		}
 		this._forcedAllSteeringActionIds = new Set(queuedSteering.map((action) => action.id));
-		this.requestAbort();
+		this.requestAbort(options);
 		this.resumeQueuedWork();
 		return true;
 	}
@@ -17022,6 +17059,28 @@ export class AgentSession {
 	private _isUnboundTerminalRlmChildRun(run: RlmChildRun): boolean {
 		if (run.session !== undefined || this._rlmChildSessions.has(run.id)) return false;
 		return run.status === "done" || run.status === "error" || run.status === "cancelled";
+	}
+
+	/**
+	 * Re-dispatch facts for one live child run (r4 recovery-shell): the original
+	 * task and the model the run used, so the daemon's stall-recovery receipt can
+	 * carry a pasteable one-liner for a parent that prefers a fresh worker. Reads
+	 * the run registry only - a retained child (no live run) has no candidate,
+	 * and the receipt then asks the parent to restate the task instead of
+	 * inventing one. Exposed for the daemon executor; deliberately not on the
+	 * roster snapshot, where a full prompt would ride every update event.
+	 */
+	getRlmChildRerouteCandidate(
+		childId: string,
+	): { prompt: string; model: string; sessionName: string; thinkingLevel?: ThinkingLevel } | undefined {
+		const run = this._activeRlmChildRuns.get(childId);
+		if (!run || run.detachedDeletion) return undefined;
+		return {
+			prompt: run.prompt,
+			model: `${run.model.provider}/${run.model.id}`,
+			sessionName: run.sessionName,
+			...(run.session?.thinkingLevel !== undefined ? { thinkingLevel: run.session.thinkingLevel } : {}),
+		};
 	}
 
 	/** Live recursive child roster from lifecycle state, including nested work under retained parents. */

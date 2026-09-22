@@ -55,10 +55,12 @@ import {
 	REFINEMENT_NOTICE_CUSTOM_TYPE,
 	REFINEMENT_OUTCOME_CUSTOM_TYPE,
 	RLM_CHILD_FAILURE_CUSTOM_TYPE,
+	RLM_CHILD_RECOVERY_ACTION_CUSTOM_TYPE,
 	RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE,
 	RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
 	SESSION_SLASH_COMMAND_CUSTOM_TYPE,
 	SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
+	SYSTEM_INTERRUPTION_CUSTOM_TYPE,
 	THINKING_LEVEL_CLAMPED_CUSTOM_TYPE,
 } from "./messages.js";
 import { REFINEMENT_CUSTOM_TYPE } from "./refinement/refinement.js";
@@ -141,6 +143,8 @@ const CUSTOM_TYPE_INPUT_CLASSES: ReadonlyMap<string, InputClass> = new Map<strin
 	[RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE, "agent_notice"],
 	[RLM_CHILD_FAILURE_CUSTOM_TYPE, "agent_notice"],
 	[RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE, "agent_notice"],
+	// r4 recovery-shell: the daemon's action receipt for a child's parent.
+	[RLM_CHILD_RECOVERY_ACTION_CUSTOM_TYPE, "agent_notice"],
 	// Cron/heartbeat dispatch (createHeartbeatPromptMessage).
 	[HEARTBEAT_PROMPT_CUSTOM_TYPE, "scheduled"],
 	// Goal continuation / budget limit / objective update, and the goal state row.
@@ -156,6 +160,9 @@ const CUSTOM_TYPE_INPUT_CLASSES: ReadonlyMap<string, InputClass> = new Map<strin
 	// One-shot recovery continuation for an exhausted empty-response ladder: machine
 	// bookkeeping that wakes the session, never a human turn.
 	[EMPTY_RESPONSE_RECOVERY_CUSTOM_TYPE, "internal_continuation"],
+	// r4 recovery-shell: the stall-recovery executor's system interruption is the
+	// queued input of the recovery turn - machine-generated, never a human turn.
+	[SYSTEM_INTERRUPTION_CUSTOM_TYPE, "internal_continuation"],
 	// Harness bookkeeping receipts.
 	[THINKING_LEVEL_CLAMPED_CUSTOM_TYPE, "internal_continuation"],
 	[IMAGE_DELIVERY_SUSPICION_CUSTOM_TYPE, "internal_continuation"],

@@ -59,6 +59,22 @@ function isActionable(actions: StallActionsView | undefined): actions is StallAc
 }
 
 /**
+ * The actions this instance can actually deliver (r4 recovery-shell F1): an
+ * action without a callback is not offered - it renders no hint line and
+ * consumes no key - because a hint that names a key which then does nothing is
+ * a promise the bar cannot keep. The event's offer is ANDed with the host's
+ * handlers here, once, so render, input, and click regions cannot disagree.
+ */
+function effectiveActions(event: StallActionEvent, options: StallActionsOptions): StallActionsView | undefined {
+	const actions = event.actions;
+	if (actions === undefined) return undefined;
+	const canAbort = actions.canAbort && options.onInterrupt !== undefined;
+	const canDiagnose = actions.canDiagnose && options.onDiagnostics !== undefined;
+	if (!canAbort && !canDiagnose) return undefined;
+	return { canAbort, canDiagnose };
+}
+
+/**
  * Render the stall action bar lines from a stall event payload.
  *
  * Pure function (no keybindings manager, no TUI): the caller resolves the key
@@ -153,14 +169,14 @@ export class StallActions implements Component {
 	 * consumed/not-consumed answer.
 	 */
 	handleInput(data: string): boolean {
-		if (this.dismissed || !isActionable(this.event.actions)) {
-			return false;
-		}
-		if (this.event.actions.canAbort && this.options.matchesInterruptKey?.(data)) {
+		if (this.dismissed) return false;
+		const actions = effectiveActions(this.event, this.options);
+		if (!actions) return false;
+		if (actions.canAbort && this.options.matchesInterruptKey?.(data)) {
 			this.options.onInterrupt?.();
 			return true;
 		}
-		if (this.event.actions.canDiagnose && getKeybindings().matches(data, "app.stall.diagnostics")) {
+		if (actions.canDiagnose && getKeybindings().matches(data, "app.stall.diagnostics")) {
 			this.options.onDiagnostics?.();
 			return true;
 		}
@@ -182,7 +198,10 @@ export class StallActions implements Component {
 		if (cache && cache.width === width && cache.hintKey === hintKey) {
 			return cache.lines;
 		}
-		const rawLines = formatStallActionLines(this.event, hints);
+		const rawLines = formatStallActionLines(
+			{ ...this.event, actions: effectiveActions(this.event, this.options) },
+			hints,
+		);
 		const lines: string[] = [];
 		for (const raw of rawLines) {
 			for (const wrapped of wrapTextWithAnsi(raw, Math.max(1, width))) {
@@ -203,7 +222,7 @@ export class StallActions implements Component {
 		const keys = getKeybindings().getKeys("app.stall.diagnostics");
 		return {
 			interrupt: this.options.interruptKeyLabel,
-			diagnostics: keys.length > 0 ? keys.join("/") : "unbound",
+			diagnostics: keys.some((key) => key.trim().length > 0) ? keys.join("/") : "unbound",
 		};
 	}
 
@@ -213,15 +232,19 @@ export class StallActions implements Component {
 	 * key path still works, only the click target is gone.
 	 */
 	private regionsFor(lines: string[], hints: StallActionKeyHints): ClickRegion[] {
-		const actions = this.event.actions;
-		if (!isActionable(actions)) return [];
+		const actions = effectiveActions(this.event, this.options);
+		if (!actions) return [];
 		const regions: ClickRegion[] = [];
 		if (actions.canAbort) {
 			this.addHintRegion(regions, lines, `${hints.interrupt} = interrupt this turn`, () => {
 				this.options.onInterrupt?.();
 			});
 		}
-		if (actions.canDiagnose) {
+		// F2: an unbound diagnostics key (the user cleared it) renders the hint
+		// line - it honestly says "unbound" - but no click region: a clickable
+		// affordance for an action with no key behind it invites a dead click.
+		const diagnosticsKeys = getKeybindings().getKeys("app.stall.diagnostics");
+		if (actions.canDiagnose && diagnosticsKeys.some((key) => key.trim().length > 0)) {
 			this.addHintRegion(regions, lines, `${hints.diagnostics} = show stall diagnostics`, () => {
 				this.options.onDiagnostics?.();
 			});

@@ -45,6 +45,11 @@ function makeDaemon(sessions: Map<string, ActiveSessionState>): NoticeFixture["d
 		options: {},
 		sessions,
 		childStallNoticeAt: new Map<string, number>(),
+		// r4 recovery-shell: the sweep's tracking maps the doubles must carry so
+		// broadcastToSession's observation hook can run.
+		stallRecoveryNoticedAt: new Map(),
+		stallRecoveryEpisodes: new Map(),
+		stallRecoveryActionCounts: new Map(),
 		rosterReporter: {
 			lastComposed: new Map(),
 			lastComposedJson: new Map(),
@@ -106,6 +111,18 @@ function makeSessionDouble(options: {
 						warnAfterSeconds: 30,
 						abortAfterSeconds: 120,
 						toolLivenessExemption: true,
+					}),
+					// r4 recovery-shell: the sweep's policy reads these from the
+					// session's settings manager.
+					getSubagentStallRecoverySettings: () => ({
+						enabled: true,
+						graceSeconds: 300,
+						maxPerSession: 3,
+					}),
+					getRootStallRecoverySettings: () => ({
+						enabled: true,
+						humanWindowSeconds: 120,
+						maxPerSession: 3,
 					}),
 				},
 				sendCustomMessage: options.sendCustomMessage ?? vi.fn(async () => {}),
