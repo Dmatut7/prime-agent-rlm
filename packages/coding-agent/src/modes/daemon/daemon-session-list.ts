@@ -481,7 +481,14 @@ export function summaryForActiveSession(
 			? true
 			: metadata.kind === "subagent" && session.repliedToParentSinceTask === true);
 	const durationStart = savedSession?.created.getTime() ?? parseTimestamp(headerTimestamp);
-	const durationMs = sessionSpanMs(durationStart, busy ? Date.now() : (parseTimestamp(lastActivityAt) ?? Date.now()));
+	// Quantize to whole seconds: the UI renders seconds, and a raw wall-clock span would
+	// flip the fingerprint on every unscoped flush (any busy session looks dirty a few ms
+	// later), republishing every row and defeating the incremental roster.
+	const rawDurationMs = sessionSpanMs(
+		durationStart,
+		busy ? Date.now() : (parseTimestamp(lastActivityAt) ?? Date.now()),
+	);
+	const durationMs = rawDurationMs === undefined ? undefined : Math.floor(rawDurationMs / 1000) * 1000;
 	const answerPreview = lastAssistantAnswerPreview(session.messages, session.state.streamingMessage);
 
 	const fingerprint: SummaryComposeFingerprint = {
