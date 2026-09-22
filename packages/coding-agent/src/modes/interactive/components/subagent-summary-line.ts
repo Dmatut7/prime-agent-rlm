@@ -14,11 +14,12 @@ import { keyText } from "./keybinding-hints.js";
 const MAX_RENDERED_STALL_MARKERS = 3;
 
 /**
- * U6 group gap (评审④): two spaces between the line's groups. The full second
- * line - counts, spend cell with annotations, and the hint - measures 78
- * columns, so the classic 80-column floor never truncates it.
+ * U6 group gap (DS2 F7): the same four-space rhythm as the watermark line
+ * above - the two status lines read as one block. The full second line -
+ * counts, spend cell with annotations, and the hint - still fits 78 columns
+ * with the wider gaps, under the 80-column floor.
  */
-const GROUP_GAP = "  ";
+const GROUP_GAP = "    ";
 
 /** Blank space always kept between the spend cell and the open hint. */
 const SPEND_MIN_GAP = 1;

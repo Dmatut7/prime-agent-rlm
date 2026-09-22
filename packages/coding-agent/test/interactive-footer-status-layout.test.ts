@@ -265,6 +265,26 @@ describe("U6 status area layout", () => {
 		expect(line.render(100)).toHaveLength(1);
 	});
 
+	it("matches the watermark line's four-space group rhythm and still fits 80 (F7, DS2)", () => {
+		const subagents = new SubagentSummaryLine();
+		subagents.setSubagentCounts({ total: 3, running: 1, idle: 0, inactive: 2 });
+		subagents.setSubagentSpend({
+			cost: 961.72,
+			tokens: 592_000_000,
+			parentCost: 273.44,
+			unpriced: [],
+			partial: false,
+		});
+		subagents.setOpenable(true);
+		const at80 = stripAnsi(subagents.render(80)[0] ?? "");
+		// The same GROUP_GAP rhythm as ②: four spaces between the counts and
+		// the spend cell (the hint stays right-anchored, padding flexes).
+		expect(at80).toContain("收口 2    子代理");
+		expect(at80).toContain("全部 ¥1235.16");
+		expect(at80).toContain("↓ 选择");
+		expect(at80).not.toContain("…");
+	});
+
 	it("keeps the full ③ line inside 80 columns with no truncation fragments (评审④)", () => {
 		const subagents = new SubagentSummaryLine();
 		subagents.setSubagentCounts({ total: 3, running: 1, idle: 0, inactive: 2 });
