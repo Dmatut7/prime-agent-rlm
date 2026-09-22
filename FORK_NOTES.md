@@ -1,3 +1,8 @@
+## 2026-09-22（晚）0.11.1 发版与远程发布页启用
+
+- 根 CHANGELOG.md 补 0.11.1 节（U6 重做／看图三件／提示词两笔／一键安装／日终补丁批），并把 GitHub Releases 页作为用户可读更新说明的主入口（v0.11.1 起每个 release 附升级须知）。
+- 发版自伤记录：`npm version -ws` 的连带安装把依赖树从锁钉的 mistralai 2.2.1 漂到 2.7.1 并剪掉手工补的 @opentelemetry/api（bundle 炸）——`npm ci` 按锁还原即愈；版本同步补跑 `scripts/sync-versions.js`（8 包锁步＋examples 范围对账）。
+
 # Fork 更新记录
 
 本文件是这个独立维护版本的**更新日志，最新的在最上面**。每条记录写清楚：改了什么、为什么改、对用户 / AI 能力的影响。深入细节见每节末尾链接的 `docs/fork/` 文档。
