@@ -23,6 +23,14 @@ export {
 } from "./components/select-list.js";
 export { type SettingItem, SettingsList, type SettingsListTheme } from "./components/settings-list.js";
 export { Spacer } from "./components/spacer.js";
+export {
+	formatStallActionLines,
+	type StallActionEvent,
+	type StallActionKeyHints,
+	StallActions,
+	type StallActionsOptions,
+	type StallActionsView,
+} from "./components/stall-actions.js";
 export { Text } from "./components/text.js";
 export { TruncatedText } from "./components/truncated-text.js";
 export type { EditorComponent, EditorPasteSnapshot } from "./editor-component.js";

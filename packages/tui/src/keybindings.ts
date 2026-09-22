@@ -45,6 +45,13 @@ export interface Keybindings {
 	"tui.select.upSecondary": true;
 	"tui.select.downSecondary": true;
 	"tui.debug.dump": true;
+	/**
+	 * App-level action owned by the tui-side stall action bar component. It
+	 * lives in this table (not only in the app layer's merged table) because
+	 * the StallActions component must match it through the global
+	 * KeybindingsManager without importing the app package.
+	 */
+	"app.stall.diagnostics": true;
 }
 
 export type Keybinding = keyof Keybindings;
@@ -181,6 +188,15 @@ export const TUI_KEYBINDINGS = {
 	"tui.select.upSecondary": { defaultKeys: "k", description: "Move selection up (secondary)" },
 	"tui.select.downSecondary": { defaultKeys: "j", description: "Move selection down (secondary)" },
 	"tui.debug.dump": { defaultKeys: "shift+ctrl+d", description: "Dump TUI debug information" },
+	// Deliberately no defaultKeyScope: the stall action bar is up while a turn
+	// is streaming and the editor is not necessarily focused, so the host
+	// matches this globally (only while the bar is visible; when no bar is up,
+	// the app does not route the key here and ctrl+y keeps its editor-scope
+	// yank meaning). See components/stall-actions.ts for the full contract.
+	"app.stall.diagnostics": {
+		defaultKeys: "ctrl+y",
+		description: "Show the stall diagnostics for the current turn",
+	},
 } as const satisfies KeybindingDefinitions;
 
 export interface KeybindingConflict {
