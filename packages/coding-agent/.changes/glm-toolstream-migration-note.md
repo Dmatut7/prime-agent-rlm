@@ -1,1 +1,0 @@
-- **Migration for Bailian GLM users**: add `"compat": { "toolStream": false }` to every Bailian GLM-5.3-family model entry in `~/.prime/agent/models.json`. Without it the gateway streams tool-call arguments in fragments, which corrupt tool names on long sessions (garbled "Tool ... not found" calls). See docs/models.md, "compat.toolStream".

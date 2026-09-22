@@ -1,1 +1,0 @@
-- Fixed the image-delivery suspicion notice to also count image blocks that tool results deliver mid-run (the attach_image path), so a turn whose committed batch was image-free still records the notice when its in-turn image attach goes uncounted.

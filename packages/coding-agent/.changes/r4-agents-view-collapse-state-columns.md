@@ -1,1 +1,0 @@
-- Fixed the agents view to collapse the settled/duration columns entirely when no row in a section carries them (older daemons, bare summaries), instead of spending their width on blank cells that squeezed the trailing age and model columns at narrow widths.

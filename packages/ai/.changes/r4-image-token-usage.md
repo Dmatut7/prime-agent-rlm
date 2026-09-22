@@ -1,1 +1,0 @@
-- Added `imageTokens` to usage: OpenAI-completions now surfaces the provider-reported `prompt_tokens_details.image_tokens` count (absent when the provider does not report one), so callers can tell a counted image turn from an uncounted one.

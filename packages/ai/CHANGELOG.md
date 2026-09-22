@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.11.1] - 2026-09-22
+
+- Added `imageTokens` to usage: OpenAI-completions now surfaces the provider-reported `prompt_tokens_details.image_tokens` count (absent when the provider does not report one), so callers can tell a counted image turn from an uncounted one.
+
 ## [0.11.0] - 2026-09-22
 
 - Fixed Anthropic-compatible endpoints receiving empty record-valued tool arguments by converting catch-all `patternProperties` schemas to `additionalProperties`.

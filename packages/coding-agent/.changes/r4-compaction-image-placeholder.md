@@ -1,1 +1,0 @@
-- Fixed compaction serialization dropping user messages that only carried images: they now serialize as a `[image xN]` placeholder with the honest image count instead of vanishing from the summarizer input.
