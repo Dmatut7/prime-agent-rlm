@@ -13,6 +13,8 @@ import {
 	type AgentState,
 	type AgentTool,
 	EMPTY_TURN_RETRY_DEFAULTS,
+	EMPTY_TURN_RETRY_EXHAUSTED_DIAGNOSTIC_TYPE,
+	ESCALATED_EMPTY_TURN_RETRY_DEFAULTS,
 	formatToolCallIdCollisions,
 	type GetContinuationMessagesContext,
 	isEmptyTurnRetryExhausted,
@@ -21,6 +23,9 @@ import {
 	type ShouldStopAfterTurnContext,
 	type ThinkingLevel,
 	TOOL_CALL_ID_COLLISION_DIAGNOSTIC_TYPE,
+	type ToolTimeoutConfig,
+	type ToolTimeoutVerdict,
+	type ToolTimeoutVouchInfo,
 } from "@earendil-works/pi-agent-core";
 import type {
 	Api,
@@ -251,6 +256,7 @@ import {
 	convertToLlm,
 	createAsyncBashCompletionMessage,
 	createCompactionOutcomeMessage,
+	createEmptyResponseRecoveryMessage,
 	createHarnessDigestMessage,
 	createHeartbeatPromptMessage,
 	createImageDeliverySuspicionMessage,
@@ -664,6 +670,29 @@ export type AgentSessionEvent =
 			silentMs: number;
 			thresholdMs: number;
 			diagnostics: StallDiagnostics;
+	  }
+	| {
+			/**
+			 * The empty-response retry ladder (fast tier, escalated slow tier, and any
+			 * recovery continuation) is exhausted and the run ended without model output.
+			 * The loud, structured form of a failure that used to end in a silent stop;
+			 * parents, clients, and logs all see the real attempt counts.
+			 */
+			type: "empty_response_exhausted";
+			message: string;
+			/** Total provider attempts the ladder spent. */
+			attempts: number;
+			/** Total wait between attempts, in ms. */
+			waitedMs: number;
+			/** Slow-tier (escalated) attempts and wait, in ms. */
+			escalatedAttempts: number;
+			escalatedWaitedMs: number;
+			/** Which limit stopped the ladder: attempts, budget, abort, or request_budget. */
+			terminatedBy: string;
+			/** Recovery continuations spent in this episode before the terminal. */
+			recoveryContinuations: number;
+			provider?: string;
+			model?: string;
 	  };
 
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
@@ -2376,6 +2405,12 @@ export class AgentSession {
 
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
+	/**
+	 * Recovery continuations spent in the current empty-response failure episode
+	 * (r4 recovery): reset by any non-error assistant message, spent one per episode,
+	 * and the second exhaustion in the same episode is the hard stop.
+	 */
+	private _emptyTurnRecoveryUsed = 0;
 	/** Bumped by every retry resolution; stale scheduled-continue callbacks check it before touching retry state. */
 	private _retryGeneration = 0;
 	private _retryPromise: Promise<void> | undefined = undefined;
@@ -2780,6 +2815,7 @@ export class AgentSession {
 		this._installAgentToolHooks();
 		this._installAgentTurnHook();
 		this._installAgentContinuationHook();
+		this._refreshAgentLoopRuntimeSettings();
 
 		this._buildRuntime({
 			activeToolNames: this._initialActiveToolNames,
@@ -3013,6 +3049,20 @@ export class AgentSession {
 
 	private _installAgentContinuationHook(): void {
 		this.agent.getContinuationMessages = (context, signal) => this._getContinuationMessages(context, signal);
+	}
+
+	/**
+	 * Re-resolve the loop-facing retry and deadline knobs from live settings (r4
+	 * recovery). The four rollback handles - `retry.emptyTurn.escalatedAttempts: 0`,
+	 * `retry.emptyTurn.recovery.enabled: false`, `tools.timeout.enabled: false`, and
+	 * `tools.timeout.afterMs: 0` - must take effect on the next turn without a daemon
+	 * restart, so every run dispatch rebuilds them: the input pump, the post-compaction
+	 * continuation, and the delayed retry each call this before handing the agent a
+	 * turn.
+	 */
+	private _refreshAgentLoopRuntimeSettings(): void {
+		this.agent.emptyTurnRetry = this.settingsManager.getEmptyTurnRetrySettings();
+		this.agent.toolTimeout = this._resolvedToolTimeoutConfig();
 	}
 
 	private _installAgentTurnHook(): void {
@@ -6032,6 +6082,67 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Loop-level per-tool-call deadline config (r4 recovery). Both rollback handles
+	 * resolve here on every read: `tools.timeout.enabled: false` and
+	 * `tools.timeout.afterMs: 0` both yield no deadline at all, which also disarms the
+	 * per-tool `executionTimeoutMs` budgets - the global handles are the master switch.
+	 */
+	private _resolvedToolTimeoutConfig(): ToolTimeoutConfig | undefined {
+		const settings = this.settingsManager.getToolTimeoutSettings();
+		if (!settings.enabled || settings.afterMs <= 0) return undefined;
+		return {
+			afterMs: settings.afterMs,
+			...(settings.perTool === undefined ? {} : { perTool: settings.perTool }),
+			vouch: (info) => this._toolTimeoutVouch(info),
+		};
+	}
+
+	/**
+	 * Three-bucket verdict for a fired per-call deadline, with the stall watchdog as
+	 * the single arbiter (r4 recovery): the extension consumes the same exemption
+	 * budget the abort stage defers by - never a second pool. Progress evidence buys a
+	 * full window, liveness half of one, a paused turn boundary defers like the abort
+	 * stage does, and no evidence cancels the call.
+	 */
+	private _toolTimeoutVouch(info: ToolTimeoutVouchInfo): ToolTimeoutVerdict | undefined {
+		try {
+			const exemption = this._stallWatchdog?.deferToolTimeout(info.toolCallId);
+			if (exemption === undefined || exemption.exhausted === true) return { action: "fail" };
+			if (exemption.reason === "paused") {
+				return {
+					action: "extend",
+					recheckMs: this._boundToolTimeoutRecheck(info.timeoutMs, exemption.remainingMs),
+				};
+			}
+			if (exemption.tier === "progress") {
+				return {
+					action: "extend",
+					recheckMs: this._boundToolTimeoutRecheck(info.timeoutMs, exemption.remainingMs),
+				};
+			}
+			if (exemption.tier === "liveness") {
+				// Mere existence is weaker evidence: half a window, and never past the
+				// budget the watchdog still has.
+				const halfWindow = Math.max(1_000, Math.round(info.timeoutMs / 2));
+				return { action: "extend", recheckMs: this._boundToolTimeoutRecheck(halfWindow, exemption.remainingMs) };
+			}
+			return { action: "fail" };
+		} catch (error) {
+			this._reportStallPredicateFailure("toolTimeout", error);
+			// K3 asymmetry: the deadline's judge failing fails towards NOT killing
+			// (the turn-level watchdog still guards the call), the way the loop-side
+			// vouch throw path does.
+			return { action: "extend", recheckMs: info.timeoutMs };
+		}
+	}
+
+	/** Re-arm delay for a granted extension: never past the remaining budget, never sub-second. */
+	private _boundToolTimeoutRecheck(recheckMs: number, remainingMs: number | undefined): number {
+		if (typeof remainingMs !== "number" || !Number.isFinite(remainingMs) || remainingMs <= 0) return recheckMs;
+		return Math.max(1_000, Math.min(recheckMs, remainingMs));
+	}
+
 	private _reportStallPredicateFailure(predicate: string, error: unknown): void {
 		// One line per predicate per turn: the failure has to be loud (a silently dead watchdog is
 		// worse than the bug it was guarding) but sampling happens on every touch.
@@ -6456,6 +6567,9 @@ export class AgentSession {
 					// clean pool. The loop resets the same counter; doing it here as well
 					// keeps the accounting correct for callers that stream without the loop.
 					resetProviderRequestBudget(this.sessionId);
+					// It also ends the empty-response failure episode: the recovery
+					// continuation budget is per-episode, so a fresh ladder starts fresh.
+					this._emptyTurnRecoveryUsed = 0;
 				}
 				if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) {
 					const restoredModel = this._restorePrimaryModelAfterBackup();
@@ -6520,6 +6634,18 @@ export class AgentSession {
 					authSourceTokens: retryConcreteAuthFailure ? this._retryAuthFailureSources : undefined,
 				});
 				if (didRetry) return; // Retry was initiated, don't proceed to compaction
+			}
+
+			// The empty-response ladder ends here (r4 recovery). One recovery
+			// continuation per failure episode hands the failure shape back to the
+			// model, so the episode is not terminal while that turn is pending: goal
+			// finalization and the parent terminal notice wait for the recovery turn's
+			// own agent_end. When no continuation is queued - disabled, spent, or the
+			// run was aborted between attempts - the failure is terminal and must be
+			// heard: an event and a log line instead of the silent stop this was.
+			if (isEmptyTurnRetryExhausted(msg)) {
+				if (this._queueEmptyTurnRecoveryTurn(msg)) return;
+				this._emitEmptyResponseExhausted(msg);
 			}
 
 			const compactionWillRetry = await this._checkCompaction(msg);
@@ -10382,6 +10508,9 @@ export class AgentSession {
 					for (const action of turns) transitionSessionAction(action, { state: "committing" });
 					this._notifySessionInputCheckpointChange();
 					this._emitQueueUpdate();
+					// Loop-facing knobs are re-read here so settings changes apply to the
+					// next turn (the four r4 rollback handles included).
+					this._refreshAgentLoopRuntimeSettings();
 					// Re-evaluate image routing for the exact message set being sent:
 					// before_agent_start injections land after the earlier per-turn
 					// decision and may carry images the session model cannot serve.
@@ -13019,6 +13148,7 @@ export class AgentSession {
 					waitForSessionInput = true;
 				} else {
 					this._postCompactionContinuationScheduled = false;
+					this._refreshAgentLoopRuntimeSettings();
 					continuation = this.agent.continue();
 				}
 			} finally {
@@ -17925,8 +18055,12 @@ export class AgentSession {
 	private _crossLayerRequestBudget(): ProviderRequestBudget {
 		const policy = providerRetryPolicy(this.settingsManager);
 		const sessionAttempts = (policy.enabled ? policy.maxRetries : 0) + 1;
+		// The ceiling covers the whole in-place ladder, slow tier included: a deeper
+		// ladder buys a proportionally higher ceiling instead of silently tripping it.
+		const emptyTurnSettings = this.settingsManager.getEmptyTurnRetrySettings();
 		const emptyTurnAttempts =
-			this.settingsManager.getEmptyTurnRetrySettings().maxAttempts ?? EMPTY_TURN_RETRY_DEFAULTS.maxAttempts;
+			(emptyTurnSettings.maxAttempts ?? EMPTY_TURN_RETRY_DEFAULTS.maxAttempts) +
+			(emptyTurnSettings.escalatedAttempts ?? ESCALATED_EMPTY_TURN_RETRY_DEFAULTS.escalatedAttempts);
 		return getProviderRequestBudget(this.sessionId, sessionAttempts * Math.max(1, emptyTurnAttempts));
 	}
 
@@ -18087,6 +18221,152 @@ export class AgentSession {
 	}
 
 	/**
+	 * Queue the one-shot recovery continuation for an exhausted empty-response ladder
+	 * (r4 recovery): the failure shape goes back to the model as a custom message that
+	 * wakes an idle session, so the task gets a turn to recover itself instead of a
+	 * silent stop. Returns false - and leaves the episode terminal - when the budget is
+	 * spent, the feature is off, the run was aborted between attempts, or admission is
+	 * paused; every one of those still gets the exhausted event and the caller's
+	 * terminal flow.
+	 */
+	private _queueEmptyTurnRecoveryTurn(message: AssistantMessage): boolean {
+		if (this._disposed || this._disposing) return false;
+		const settings = this.settingsManager.getEmptyTurnRecoverySettings();
+		if (!settings.enabled) return false;
+		// One continuation per failure episode. A recovery turn that itself exhausts
+		// the ladder is the second generation; the hard stop is what keeps a provider
+		// that answers empty forever from turning recovery into a self-loop.
+		if (this._emptyTurnRecoveryUsed >= settings.maxContinuations) return false;
+		const details = this._readEmptyTurnExhaustionDetails(message);
+		// An aborted run is an intentional stop: a recovery turn would fight the abort
+		// the user or the watchdog already chose.
+		if (details.terminatedBy === "abort") return false;
+		const recoveryGeneration = this._emptyTurnRecoveryUsed + 1;
+		// r4 v1 hook (default off, key reserved): when the backup-model gear lands, the
+		// switch happens here - route this recovery turn through
+		// `_resolveBackupModel()` + the switch half of `_handleBackupModelRetry`, so
+		// the restore-after-success bookkeeping stays the one mechanism. The
+		// `useBackupModel` setting is registered but consumes nothing in this build.
+		const recoveryMessage = createEmptyResponseRecoveryMessage({
+			attempts: details.attempts,
+			waitedMs: details.waitedMs,
+			escalatedAttempts: details.escalatedAttempts,
+			escalatedWaitedMs: details.escalatedWaitedMs,
+			terminatedBy: details.terminatedBy,
+			recoveryGeneration,
+			...(message.provider === undefined ? {} : { provider: message.provider }),
+			...(message.model === undefined ? {} : { model: message.model }),
+			...(details.requestBudget === undefined ? {} : { requestBudget: details.requestBudget }),
+		});
+		try {
+			const action = this._createPreparedTurnAction("followUp", recoveryMessage.content as string, undefined, {
+				message: recoveryMessage,
+				suppressAutonomousContinuation: true,
+				// An idle session must be woken to run the recovery turn (the async-bash
+				// completion notices admit with the same shape).
+				resumeIfIdle: true,
+				source: "internal",
+				executionPolicy: this._turnExecutionPolicy("injected"),
+				queueVisible: false,
+			});
+			const result = this._admitSessionInput(action, { wake: false });
+			if (!result.accepted) {
+				sessionLog.warn("empty-response recovery continuation was not admitted", {
+					sessionId: this.sessionId,
+				});
+				return false;
+			}
+		} catch (error) {
+			// A paused admission window (compaction, update restart) must not silently
+			// burn the budget: leave the episode terminal instead of parking a
+			// half-admitted turn that may never run.
+			sessionLog.warn("empty-response recovery continuation could not be admitted; the run stays terminal", {
+				sessionId: this.sessionId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return false;
+		}
+		this._emptyTurnRecoveryUsed = recoveryGeneration;
+		this._scheduleSessionInputPump();
+		return true;
+	}
+
+	/** The exhaustion diagnostic's facts, with safe defaults when a fixture omits it. */
+	private _readEmptyTurnExhaustionDetails(message: AssistantMessage): {
+		attempts: number;
+		waitedMs: number;
+		escalatedAttempts: number;
+		escalatedWaitedMs: number;
+		terminatedBy: string;
+		requestBudget?: { used: number; maxRequests?: number };
+	} {
+		const diagnostic = message.diagnostics?.find(
+			(candidate) => candidate.type === EMPTY_TURN_RETRY_EXHAUSTED_DIAGNOSTIC_TYPE,
+		);
+		const details = (diagnostic?.details ?? {}) as {
+			attempts?: number;
+			waitedMs?: number;
+			escalatedAttempts?: number;
+			escalatedWaitedMs?: number;
+			terminatedBy?: string;
+			requestBudget?: { used: number; maxRequests?: number };
+		};
+		return {
+			attempts: details.attempts ?? 1,
+			waitedMs: details.waitedMs ?? 0,
+			escalatedAttempts: details.escalatedAttempts ?? 0,
+			escalatedWaitedMs: details.escalatedWaitedMs ?? 0,
+			terminatedBy: details.terminatedBy ?? "attempts",
+			...(details.requestBudget === undefined ? {} : { requestBudget: details.requestBudget }),
+		};
+	}
+
+	/**
+	 * The terminal form of an exhausted ladder: a structured event plus one log line.
+	 * Emitted only when no recovery continuation was queued - while a recovery turn is
+	 * pending, the episode is still live.
+	 */
+	private _emitEmptyResponseExhausted(message: AssistantMessage): void {
+		const details = this._readEmptyTurnExhaustionDetails(message);
+		this._emit({
+			type: "empty_response_exhausted",
+			message: message.errorMessage ?? "Model returned empty responses until the retry ladder was exhausted.",
+			attempts: details.attempts,
+			waitedMs: details.waitedMs,
+			escalatedAttempts: details.escalatedAttempts,
+			escalatedWaitedMs: details.escalatedWaitedMs,
+			terminatedBy: details.terminatedBy,
+			recoveryContinuations: this._emptyTurnRecoveryUsed,
+			...(message.provider === undefined ? {} : { provider: message.provider }),
+			...(message.model === undefined ? {} : { model: message.model }),
+		});
+		sessionLog.error("empty-response retry ladder exhausted; the run ended without model output", {
+			sessionId: this.sessionId,
+			...details,
+			recoveryContinuations: this._emptyTurnRecoveryUsed,
+		});
+	}
+
+	/**
+	 * Real retry facts for an empty-response terminal (r4 recovery, K3 ①-C): replaces
+	 * the "non-retryable; no retries attempted" misreport - the ladder did retry, in
+	 * place, and the parent can act on the actual counts.
+	 */
+	private _emptyTurnTerminalRetrySummary(message: AssistantMessage): string | undefined {
+		if (!isEmptyTurnRetryExhausted(message)) return undefined;
+		const details = this._readEmptyTurnExhaustionDetails(message);
+		const recoverySuffix =
+			this._emptyTurnRecoveryUsed > 0
+				? ` plus ${this._emptyTurnRecoveryUsed} recovery continuation(s) that also came back empty`
+				: "";
+		return (
+			`empty-response ladder exhausted after ${details.attempts} in-place provider attempt(s) ` +
+			`(${details.escalatedAttempts} in the slow tier, waited ${Math.round(details.waitedMs / 1000)}s, ` +
+			`stopped by ${details.terminatedBy})${recoverySuffix}`
+		);
+	}
+
+	/**
 	 * Tell the parent agent when a turn ends in a terminal model/provider failure.
 	 * Without this, a subagent session parks silently in needs_input and the parent
 	 * only sees the synthesized completed_without_reply notice, which carries no
@@ -18107,16 +18387,21 @@ export class AgentSession {
 		}
 		if (!parent) return;
 		// The module's own policy: the number the retry loop below actually stops at.
+		// An empty-response terminal is the one class that never reaches this loop, so
+		// its summary comes from the ladder's own diagnostic instead of the misreport
+		// "non-retryable; no retries attempted" (K3 ①-C).
+		const emptyTurnSummary = this._emptyTurnTerminalRetrySummary(message);
 		const retryPolicy = providerRetryPolicy(this.settingsManager);
 		const attempts = this._terminalFailureAttemptCount;
 		const retrySummary =
-			attempts > 0
+			emptyTurnSummary ??
+			(attempts > 0
 				? retryPolicy.enabled && attempts >= retryPolicy.maxRetries
 					? `auto-retry exhausted after ${attempts} attempt(s)`
 					: `auto-retry stopped after ${attempts} attempt(s)`
 				: retryPolicy.enabled
 					? "error classified as non-retryable; no retries attempted"
-					: "auto-retry disabled; no retries attempted";
+					: "auto-retry disabled; no retries attempted");
 		const notice = formatSubagentTerminalErrorNotice({
 			errorMessage: message.errorMessage,
 			provider: message.provider,
@@ -18363,6 +18648,7 @@ export class AgentSession {
 			// A retry aborted between the sleep and this scheduled start must not
 			// re-issue the turn (e.g. onto a quota-blocked primary after a restore).
 			if (this._retryGeneration !== retryGeneration || !this.isRetrying) return;
+			this._refreshAgentLoopRuntimeSettings();
 			this.agent.continue().catch((error: unknown) => {
 				// A continue that never starts must still resolve the retry (else isRetrying
 				// sticks forever) — unless a newer retry owns the state by now.

@@ -4,7 +4,9 @@ import {
 	AgentContinueError,
 	type AgentEvent,
 	type AgentTool,
+	EMPTY_TURN_RETRY_EXHAUSTED_DIAGNOSTIC_TYPE,
 	EMPTY_TURN_RETRY_EXHAUSTED_STOP_REASON_RAW,
+	isEmptyTurnRetryExhausted,
 	SERVER_DIRECTED_RETRY_STALL_STOP_REASON_RAW,
 	type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
@@ -19,6 +21,7 @@ import {
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentCronJobStore } from "../../src/core/cron-jobs.js";
+import { EMPTY_RESPONSE_RECOVERY_CUSTOM_TYPE } from "../../src/core/messages.js";
 import type { Settings } from "../../src/core/settings-manager.js";
 import { createHarness, getAssistantTexts, getUserTexts, type Harness } from "./harness.js";
 
@@ -267,27 +270,196 @@ describe("AgentSession retry and event characterization", () => {
 		});
 	}
 
-	it("does not retry the terminal empty-turn failure", async () => {
-		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
+	/** The loop's terminal empty-turn failure, with the ladder's diagnostic facts. */
+	function exhaustedEmptyTurn(
+		details: {
+			attempts?: number;
+			waitedMs?: number;
+			escalatedAttempts?: number;
+			escalatedWaitedMs?: number;
+			terminatedBy?: string;
+		} = {},
+	): AssistantMessage {
+		return {
+			...fauxAssistantMessage("", {
+				stopReason: "error",
+				errorMessage:
+					"Model returned an empty response 6 times in a row: the provider answered 6 times with no output content or tool calls.",
+			}),
+			stopReasonRaw: EMPTY_TURN_RETRY_EXHAUSTED_STOP_REASON_RAW,
+			diagnostics: [
+				{
+					type: EMPTY_TURN_RETRY_EXHAUSTED_DIAGNOSTIC_TYPE,
+					timestamp: Date.now(),
+					details: {
+						attempts: 6,
+						waitedMs: 211_500,
+						escalatedAttempts: 3,
+						escalatedWaitedMs: 210_000,
+						fastWaitedMs: 1_500,
+						terminatedBy: "attempts",
+						...details,
+					},
+				},
+			],
+		};
+	}
+
+	function recoveryMessages(harness: Harness): Array<Extract<AssistantMessage, { role: "custom" }>> {
+		return harness.session.messages.filter(
+			(message) =>
+				message.role === "custom" &&
+				(message as { customType?: string }).customType === EMPTY_RESPONSE_RECOVERY_CUSTOM_TYPE,
+		) as Array<Extract<AssistantMessage, { role: "custom" }>>;
+	}
+
+	it("retry.enabled false means a single attempt with zero slow-tier resends (wiring pin)", async () => {
+		const harness = await createHarness({
+			settings: { retry: { enabled: false, emptyTurn: { escalatedBaseDelayMs: 50, escalatedMaxDelayMs: 50 } } },
+		});
+		harnesses.push(harness);
+		// Real empty turns straight from the faux provider: the loop's ladder is the
+		// only retry machinery in play, and settings must collapse it to one request.
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "stop" }),
+			fauxAssistantMessage("", { stopReason: "stop" }),
+		]);
+
+		const startedAt = Date.now();
+		await harness.session.prompt("test");
+		await harness.session.waitForIdle();
+
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(Date.now() - startedAt).toBeLessThan(5_000); // no 30s+ slow-tier waits
+		const last = harness.session.messages.at(-1);
+		expect(last?.role).toBe("assistant");
+		if (last?.role === "assistant") {
+			expect(isEmptyTurnRetryExhausted(last)).toBe(true);
+		}
+		// The ladder is terminal, and with recovery off the whole feature is off:
+		// one exhausted event, no recovery message, no session retry.
+		expect(harness.eventsOfType("empty_response_exhausted")).toHaveLength(1);
+		expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
+		expect(
+			harness.session.messages.some(
+				(message) =>
+					message.role === "custom" &&
+					(message as { customType?: string }).customType === EMPTY_RESPONSE_RECOVERY_CUSTOM_TYPE,
+			),
+		).toBe(false);
+	});
+
+	it("queues exactly one recovery continuation for the terminal empty-turn failure", async () => {
+		const harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1, emptyTurn: { escalatedAttempts: 0 } } },
+		});
+		harnesses.push(harness);
+		harness.setResponses([exhaustedEmptyTurn(), fauxAssistantMessage("recovered after the recovery turn")]);
+
+		await harness.session.prompt("test");
+		await harness.session.waitForIdle();
+
+		// The agent loop already retried this in place; a session-level retry would
+		// resend the whole context. The recovery continuation is not that: it is one
+		// injected message, and the model answers it in a second request.
+		expect(harness.faux.state.callCount).toBe(2);
+		expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
+		const recoveries = recoveryMessages(harness);
+		expect(recoveries).toHaveLength(1);
+		// The failure shape goes back to the model with the real ladder facts.
+		const recovery = recoveries[0] as unknown as {
+			content: string;
+			details: { attempts: number; escalatedAttempts: number; recoveryGeneration: number; terminatedBy: string };
+		};
+		expect(recovery.content).toContain("empty-response recovery");
+		expect(recovery.content).toContain("attempts: 6");
+		expect(recovery.content).toContain("slow tier: 3");
+		expect(recovery.content).toContain("stopped by: attempts");
+		expect(recovery.details).toMatchObject({ attempts: 6, escalatedAttempts: 3, recoveryGeneration: 1 });
+		// The episode recovered, so it never had to be heard as a terminal failure.
+		expect(harness.eventsOfType("empty_response_exhausted")).toEqual([]);
+		expect(harness.session.isRetrying).toBe(false);
+	});
+
+	it("does not queue a recovery continuation when recovery is disabled (rollback handle)", async () => {
+		const harness = await createHarness({
+			settings: {
+				retry: {
+					enabled: true,
+					maxRetries: 3,
+					baseDelayMs: 1,
+					emptyTurn: { escalatedAttempts: 0, recovery: { enabled: false } },
+				},
+			},
+		});
+		harnesses.push(harness);
+		harness.setResponses([exhaustedEmptyTurn(), fauxAssistantMessage("must not be called")]);
+
+		await harness.session.prompt("test");
+		await harness.session.waitForIdle();
+
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(recoveryMessages(harness)).toHaveLength(0);
+		expect(harness.session.isRetrying).toBe(false);
+		// The exhaustion is terminal and loud: the real attempt counts reach the
+		// clients instead of the old silent stop.
+		const exhausted = harness.eventsOfType("empty_response_exhausted");
+		expect(exhausted).toHaveLength(1);
+		expect(exhausted[0]).toMatchObject({
+			attempts: 6,
+			waitedMs: 211_500,
+			escalatedAttempts: 3,
+			escalatedWaitedMs: 210_000,
+			terminatedBy: "attempts",
+			recoveryContinuations: 0,
+		});
+	});
+
+	it("hard-stops at the second exhaustion in the same episode (recovery generation 2)", async () => {
+		const harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1, emptyTurn: { escalatedAttempts: 0 } } },
+		});
 		harnesses.push(harness);
 		harness.setResponses([
-			{
-				...fauxAssistantMessage("", {
-					stopReason: "error",
-					errorMessage: "Model returned an empty response (no output content or tool calls) 3 times in a row",
-				}),
-				stopReasonRaw: EMPTY_TURN_RETRY_EXHAUSTED_STOP_REASON_RAW,
-			},
-			fauxAssistantMessage("retry should not happen"),
+			exhaustedEmptyTurn(),
+			exhaustedEmptyTurn({ attempts: 12, escalatedAttempts: 3, waitedMs: 423_000, terminatedBy: "request_budget" }),
+			fauxAssistantMessage("never"),
 		]);
 
 		await harness.session.prompt("test");
+		await harness.session.waitForIdle();
 
-		// The agent loop already retried this three times in place; a session-level
-		// retry would resend the whole context without ever reaching compaction.
-		expect(harness.faux.state.callCount).toBe(1);
-		expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
-		expect(harness.session.isRetrying).toBe(false);
+		// Initial turn + the one recovery turn; the second exhaustion is terminal.
+		expect(harness.faux.state.callCount).toBe(2);
+		expect(recoveryMessages(harness)).toHaveLength(1);
+		const exhausted = harness.eventsOfType("empty_response_exhausted");
+		expect(exhausted).toHaveLength(1);
+		expect(exhausted[0]).toMatchObject({ attempts: 12, terminatedBy: "request_budget", recoveryContinuations: 1 });
+	});
+
+	it("a real answer resets the episode, so a later exhaustion gets a fresh continuation", async () => {
+		const harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1, emptyTurn: { escalatedAttempts: 0 } } },
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			exhaustedEmptyTurn(),
+			fauxAssistantMessage("recovered once"),
+			exhaustedEmptyTurn(),
+			fauxAssistantMessage("recovered twice"),
+		]);
+
+		// Two separate prompts, each exhausting its own ladder: the success in
+		// between is what ends the first episode and re-arms the budget.
+		await harness.session.prompt("test");
+		await harness.session.waitForIdle();
+		await harness.session.prompt("test again");
+		await harness.session.waitForIdle();
+
+		expect(harness.faux.state.callCount).toBe(4);
+		// One continuation per episode: the success in between ended the first one.
+		expect(recoveryMessages(harness)).toHaveLength(2);
+		expect(harness.eventsOfType("empty_response_exhausted")).toEqual([]);
 	});
 
 	it("does not resend the whole context when a provider retry wait turns into a stall", async () => {

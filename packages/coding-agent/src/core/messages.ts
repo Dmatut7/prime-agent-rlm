@@ -51,6 +51,12 @@ export const HARNESS_DIGEST_CUSTOM_TYPE = "harness_digest";
 export const RLM_CHILD_FAILURE_CUSTOM_TYPE = "rlm_child_failure";
 export const RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE = "rlm_child_terminal_notice";
 export const ASYNC_BASH_COMPLETION_CUSTOM_TYPE = "async_bash_completion";
+/**
+ * One-shot recovery continuation the session queues after the empty-response retry
+ * ladder is exhausted: the failure shape goes back to the model itself, so the task
+ * gets a turn to be recovered instead of ending in a silent stop.
+ */
+export const EMPTY_RESPONSE_RECOVERY_CUSTOM_TYPE = "empty_response_recovery";
 export const ASYNC_BASH_COMPLETION_PREVIEW_LABEL = "Background command finished";
 
 export const THINKING_LEVEL_CLAMPED_CUSTOM_TYPE = "thinking_level_clamped";
@@ -367,6 +373,60 @@ export function createAsyncBashCompletionMessage(
 		content: `[bash-done pid:${details.pid} exit:${details.exitCode}]
 
 Command: ${JSON.stringify(details.command)}`,
+		display: true,
+		details,
+		timestamp,
+	};
+}
+
+export interface EmptyResponseRecoveryDetails {
+	/** Total provider attempts the ladder spent (fast tier + slow tier). */
+	attempts: number;
+	/** Total wait between attempts, in ms. */
+	waitedMs: number;
+	/** Slow-tier (escalated) attempts and wait, in ms. */
+	escalatedAttempts: number;
+	escalatedWaitedMs: number;
+	/** Which limit stopped the ladder: attempts, budget, abort, or request_budget. */
+	terminatedBy: string;
+	/** 1 for the first recovery continuation of this episode; the hard stop is at 2. */
+	recoveryGeneration: number;
+	provider?: string;
+	model?: string;
+	requestBudget?: { used: number; maxRequests?: number };
+}
+
+/**
+ * The recovery continuation message: facts about the exhausted ladder plus the
+ * instructions that make the turn useful (verify state, save progress, continue or
+ * report). Written for the model; `display: true` keeps the transcript auditable.
+ */
+export function createEmptyResponseRecoveryMessage(
+	details: EmptyResponseRecoveryDetails,
+	timestamp = Date.now(),
+): CustomMessage<EmptyResponseRecoveryDetails> {
+	const facts = [
+		`attempts: ${details.attempts} (slow tier: ${details.escalatedAttempts}, waited ${Math.round(details.waitedMs / 1000)}s)`,
+		`stopped by: ${details.terminatedBy}`,
+		`recovery generation: ${details.recoveryGeneration}`,
+	];
+	if (details.requestBudget) {
+		facts.push(`request budget: ${details.requestBudget.used}/${details.requestBudget.maxRequests ?? "unbounded"}`);
+	}
+	if (details.provider && details.model) facts.push(`model: ${details.provider}/${details.model}`);
+	return {
+		role: "custom",
+		customType: EMPTY_RESPONSE_RECOVERY_CUSTOM_TYPE,
+		content: [
+			`[empty-response recovery] The previous request chain returned empty model turns until the retry ladder was exhausted (${facts.join("; ")}).`,
+			"The context is intact and the task is still open. This is not a user instruction and not a connection failure: the provider answered with clean but empty turns.",
+			"Continue the task yourself:",
+			"1. Do not assume the last intended action or tool call happened; verify the current state before redoing anything.",
+			"2. Save any in-progress work now (files, notes) so a later failure does not lose it.",
+			"3. Continue the task. If the provider still answers empty, say what is blocking you in your reply instead of ending the turn silently.",
+			"4. If you are a subagent, report this state to your parent with one short status line.",
+			`This is an automatic one-shot continuation (generation ${details.recoveryGeneration}); the system will not send another for this episode.`,
+		].join("\n"),
 		display: true,
 		details,
 		timestamp,
