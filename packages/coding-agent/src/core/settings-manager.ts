@@ -1,3 +1,4 @@
+import { ESCALATED_EMPTY_TURN_RETRY_DEFAULTS } from "@earendil-works/pi-agent-core";
 import type { ServiceTier, Transport } from "@earendil-works/pi-ai";
 import {
 	closeSync,
@@ -43,6 +44,18 @@ export const DEFAULT_SETTINGS_WATCH_INTERVAL_MS = 1000;
 
 /** Abort a provider stream after this long without any events (0 = disabled). */
 export const DEFAULT_STREAM_STALL_TIMEOUT_MS = 300_000;
+
+/**
+ * Default per-tool-call wall-clock deadline (0 = disabled). Configurable within
+ * [TOOL_TIMEOUT_MIN_AFTER_MS, TOOL_TIMEOUT_MAX_AFTER_MS]; a tool can refine its own
+ * budget via `AgentTool.executionTimeoutMs`, but the `tools.timeout` handles here
+ * stay the master switches.
+ */
+export const DEFAULT_TOOL_TIMEOUT_AFTER_MS = 180_000;
+/** Soft floor for `tools.timeout.afterMs` (one minute): below this, deadlines fire mid-handshake. */
+export const TOOL_TIMEOUT_MIN_AFTER_MS = 60_000;
+/** Soft ceiling for `tools.timeout.afterMs` (ten minutes): beyond this, the stall watchdog owns the call. */
+export const TOOL_TIMEOUT_MAX_AFTER_MS = 600_000;
 
 /** Session stall watchdog: warn after this long without any session activity. */
 export const DEFAULT_STALL_WARN_AFTER_SECONDS = 300;
@@ -204,6 +217,43 @@ export interface EmptyTurnRetrySettings {
 	baseDelayMs?: number; // default: 500, doubled per attempt
 	maxDelayMs?: number; // default: 4000 cap for a single wait
 	maxTotalDelayMs?: number; // default: bounded by the remaining attempts
+	/**
+	 * Escalated slow tier (r4 recovery): additional provider attempts after the fast
+	 * ones are spent, with much longer waits. `0` disables the tier; default 3
+	 * attempts at 30s/60s/120s. The session clamps the single-wait cap below
+	 * `stallWatchdog.warnAfterSeconds` so a planned recovery wait is never reported
+	 * as a stall.
+	 */
+	escalatedAttempts?: number; // default: 3
+	escalatedBaseDelayMs?: number; // default: 30000, doubled per slow attempt
+	escalatedMaxDelayMs?: number; // default: 120000, clamped below the stall warn threshold
+	/** Resolved single-wait ceiling the loop clamps base and cap to (see EmptyTurnRetryConfig). */
+	escalatedMaxDelayClampMs?: number;
+	escalatedMaxTotalDelayMs?: number; // default: 300000 summed slow-tier waits
+	/**
+	 * Recovery continuation (r4 recovery): when the whole ladder is exhausted, the
+	 * session queues one custom message so the model gets a turn to recover the task
+	 * itself instead of the run ending silently.
+	 */
+	recovery?: EmptyTurnRecoverySettings;
+}
+
+export interface EmptyTurnRecoverySettings {
+	/** Default true. Off means an exhausted ladder ends the run with the terminal error only. */
+	enabled?: boolean;
+	/**
+	 * Recovery continuations allowed per failure episode (default 1). The second
+	 * exhaustion in the same episode is the hard stop - a recovery turn that also
+	 * comes back empty must not spawn another one.
+	 */
+	maxContinuations?: number;
+	/**
+	 * Reserved, no effect (r4 v1): the backup-model gear of the ladder - running the
+	 * recovery continuation on `providerBackupModel` instead of the primary - is off
+	 * by default and not wired in this build. Registered so the key round-trips
+	 * through settings without a schema change when the gear lands.
+	 */
+	useBackupModel?: boolean;
 }
 
 export interface RetrySettings {
@@ -476,8 +526,31 @@ export interface BundledSkillsSettings {
 }
 
 export interface ToolsSettings {
-	// Reserved for future tool-level settings. The classic bash tool is not part of
-	// the RLM model surface, so there is currently nothing configurable here.
+	/**
+	 * Per-tool-call wall-clock deadline (r4 recovery): a tool call that settles
+	 * nothing before this budget is cancelled on its own - through the same abort
+	 * harvest the run abort uses - and the model receives the cancellation as an
+	 * error tool result so it can change approach inside the same turn. The turn
+	 * itself is never aborted by this deadline.
+	 */
+	timeout?: ToolTimeoutSettings;
+}
+
+export interface ToolTimeoutSettings {
+	/** Default true. The master rollback handle: false disables deadlines everywhere, including per-tool budgets. */
+	enabled?: boolean;
+	/**
+	 * Default 180000 (3 minutes), configurable within 60s-600s. `0` disables the
+	 * deadline (the second rollback handle). Extensions on a live deadline are
+	 * granted only by the stall watchdog's exemption evidence, never by a second budget.
+	 */
+	afterMs?: number;
+	/**
+	 * Operator-side per-tool budgets keyed by tool name, in ms. An entry outranks the
+	 * tool's own `executionTimeoutMs`; `0` exempts that one tool from the deadline.
+	 * Still gated by the master handles: with the deadline disabled, these do nothing.
+	 */
+	perTool?: Record<string, number>;
 }
 
 export interface WarningSettings {
@@ -879,7 +952,7 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	themes: null,
 	enableSkillCommands: null,
 	bundledSkills: ["websearch"],
-	tools: [],
+	tools: ["timeout"],
 	enableBuiltinSkills: null,
 	terminal: ["showImages", "clearOnShrink", "showTerminalProgress", "fullscreen", "fullscreenMouse"],
 	images: ["autoResize", "blockImages"],
@@ -904,7 +977,20 @@ const KNOWN_NESTED_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	// the model keys themselves are left unvalidated here; `reportSpendPriceOverrideProblems`
 	// reports the fields inside them.
 	"ui.subagentSpendCell.priceOverrides": null,
-	"retry.emptyTurn": ["maxAttempts", "baseDelayMs", "maxDelayMs", "maxTotalDelayMs"],
+	"retry.emptyTurn": [
+		"maxAttempts",
+		"baseDelayMs",
+		"maxDelayMs",
+		"maxTotalDelayMs",
+		"escalatedAttempts",
+		"escalatedBaseDelayMs",
+		"escalatedMaxDelayMs",
+		"escalatedMaxDelayClampMs",
+		"escalatedMaxTotalDelayMs",
+		"recovery",
+	],
+	"retry.emptyTurn.recovery": ["enabled", "maxContinuations", "useBackupModel"],
+	"tools.timeout": ["enabled", "afterMs", "perTool"],
 };
 
 /**
@@ -1218,6 +1304,8 @@ export class SettingsManager {
 	private modifiedNestedFields = new Map<keyof Settings, Set<string>>(); // Track global nested field modifications
 	private modifiedProjectFields = new Set<keyof Settings>(); // Track project fields modified during session
 	private modifiedProjectNestedFields = new Map<keyof Settings, Set<string>>(); // Track project nested field modifications
+	/** One-shot guard for the empty-turn slow-tier clamp warning (see _clampEscalatedEmptyTurnWaits). */
+	private emptyTurnClampWarned = false;
 	private globalSettingsLoadError: Error | null = null; // Track if global settings file had parse errors
 	private projectSettingsLoadError: Error | null = null; // Track if project settings file had parse errors
 	private writeQueue: Promise<void> = Promise.resolve();
@@ -2402,9 +2490,73 @@ export class SettingsManager {
 	getEmptyTurnRetrySettings(): EmptyTurnRetrySettings {
 		const emptyTurn = this.settings.retry?.emptyTurn ?? {};
 		// `retry.enabled: false` must mean "no automatic resends anywhere", including the
-		// loop's in-place empty-turn retries, so it collapses to a single attempt here.
-		// Omitted numbers are left undefined: the agent loop owns the defaults.
-		return this.getRetryEnabled() ? { ...emptyTurn } : { ...emptyTurn, maxAttempts: 1 };
+		// loop's in-place empty-turn retries and the escalated slow tier, so it collapses
+		// to a single attempt with no slow tier here. Omitted numbers are left undefined:
+		// the agent loop owns the defaults.
+		if (!this.getRetryEnabled()) {
+			return { ...emptyTurn, maxAttempts: 1, escalatedAttempts: 0 };
+		}
+		return this._clampEscalatedEmptyTurnWaits({ ...emptyTurn });
+	}
+
+	/**
+	 * Keep every slow-tier wait strictly below the stall watchdog's warn threshold:
+	 * the watchdog measures silence since the last session event, and each retry
+	 * attempt emits one, so a gap of wait + time-to-first-event at or above the warn
+	 * threshold would misreport a planned recovery wait as a stall. The resolved cap
+	 * (not the raw stored key) is what the loop consumes, so the clamp holds even for
+	 * the defaults whenever the warn threshold is lowered below them.
+	 */
+	private _clampEscalatedEmptyTurnWaits(settings: EmptyTurnRetrySettings): EmptyTurnRetrySettings {
+		const watchdog = this.getStallWatchdogSettings();
+		if (!watchdog.enabled || watchdog.warnAfterSeconds <= 0) return settings;
+		// One second of headroom for the next attempt's time-to-first-event.
+		const clampMs = Math.max(1_000, watchdog.warnAfterSeconds * 1000 - 1_000);
+		const resolvedCap = Math.max(
+			settings.escalatedBaseDelayMs ?? ESCALATED_EMPTY_TURN_RETRY_DEFAULTS.escalatedBaseDelayMs,
+			settings.escalatedMaxDelayMs ?? ESCALATED_EMPTY_TURN_RETRY_DEFAULTS.escalatedMaxDelayMs,
+		);
+		if (resolvedCap <= clampMs) return { ...settings, escalatedMaxDelayClampMs: clampMs };
+		if (!this.emptyTurnClampWarned) {
+			this.emptyTurnClampWarned = true;
+			// A warn, once per settings manager: the clamp is a correctness guard, but a
+			// silently rewritten number is indistinguishable from an ignored one.
+			console.warn(
+				`retry.emptyTurn.escalatedMaxDelayMs clamped to ${clampMs}ms to stay under stallWatchdog.warnAfterSeconds (${watchdog.warnAfterSeconds}s).`,
+			);
+		}
+		// The clamp field is what the loop enforces (on base AND cap); rewriting the
+		// stored cap on top is double insurance for consumers that only read the cap.
+		return { ...settings, escalatedMaxDelayMs: clampMs, escalatedMaxDelayClampMs: clampMs };
+	}
+
+	/**
+	 * Recovery continuation policy for an exhausted empty-response ladder. Honors
+	 * `retry.enabled` the same way the in-place tiers do: switching retries off is
+	 * switching the whole automatic-recovery ladder off.
+	 */
+	getEmptyTurnRecoverySettings(): { enabled: boolean; maxContinuations: number } {
+		const recovery = this.settings.retry?.emptyTurn?.recovery;
+		const enabled = this.getRetryEnabled() && (recovery?.enabled ?? true);
+		const maxContinuations = Math.max(0, Math.floor(recovery?.maxContinuations ?? 1));
+		return { enabled, maxContinuations };
+	}
+
+	/**
+	 * Resolved per-tool-call deadline policy. `afterMs` is clamped into the
+	 * documented 60s-600s window when positive; `enabled: false` and `afterMs: 0`
+	 * both resolve to a disabled deadline (the two rollback handles).
+	 */
+	getToolTimeoutSettings(): { enabled: boolean; afterMs: number; perTool?: Record<string, number> } {
+		const timeout = this.settings.tools?.timeout;
+		const enabled = timeout?.enabled ?? true;
+		const raw = timeout?.afterMs ?? DEFAULT_TOOL_TIMEOUT_AFTER_MS;
+		if (raw <= 0)
+			return { enabled, afterMs: 0, ...(timeout?.perTool === undefined ? {} : { perTool: timeout.perTool }) };
+		const afterMs = Math.min(TOOL_TIMEOUT_MAX_AFTER_MS, Math.max(TOOL_TIMEOUT_MIN_AFTER_MS, raw));
+		// Per-tool entries pass through unclamped: an operator budgeting a specific
+		// long-running tool past the shared window is the documented exemption use.
+		return { enabled, afterMs, ...(timeout?.perTool === undefined ? {} : { perTool: timeout.perTool }) };
 	}
 
 	getProviderRetrySettings(): {

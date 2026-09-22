@@ -513,6 +513,26 @@ export class StallWatchdog {
 		};
 	}
 
+	/**
+	 * Per-tool-call deadline adjudication (r4 recovery). The watchdog is the single
+	 * arbiter of whether externally owned work excuses a silent tool call: the verdict
+	 * re-samples the same paused/vouch predicates with timer-fire semantics, and the
+	 * extension it grants is bounded by the same exemption budget the abort stage
+	 * defers by - never a second pool.
+	 *
+	 * Returns the exemption snapshot in effect (reason, tier, budget state), or
+	 * undefined when there is no live exemption to extend by. The caller decides the
+	 * bucket mapping; the budget facts come only from here.
+	 */
+	deferToolTimeout(toolCallId: string): StallExemptionSnapshot | undefined {
+		// The toolCallId is carried for log attribution; the verdict is per-session
+		// today because the vouch facts are sampled per-session.
+		void toolCallId;
+		if (!this.active || this.state === "idle") return undefined;
+		const now = this.stepNow();
+		return this.evaluateExemption(now, false);
+	}
+
 	/** Exemption + kernel segment for a stall diagnostics payload. */
 	collectExemptionDiagnostics(): StallExemptionDiagnostics {
 		const kernel = this.lastKernelFacts ? normalizeStallKernelFacts(this.lastKernelFacts) : undefined;

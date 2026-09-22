@@ -1,3 +1,4 @@
+import { ESCALATED_EMPTY_TURN_RETRY_DEFAULTS } from "@earendil-works/pi-agent-core";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
@@ -10,6 +11,7 @@ import {
 	DEFAULT_KERNEL_REVIVAL_VOUCH_MAX_AGE_SECONDS,
 	DEFAULT_STALL_ABORT_AFTER_SECONDS,
 	DEFAULT_STALL_WARN_AFTER_SECONDS,
+	DEFAULT_TOOL_TIMEOUT_AFTER_MS,
 	readAgentMessageWaitSettings,
 	readKernelBootstrapSettings,
 	SettingsManager,
@@ -823,6 +825,151 @@ describe("SettingsManager", () => {
 				expect(resolved.abortAfterSeconds).toBe(expectedAbort);
 				expect(resolved.toolLivenessExemption).toBe(true);
 			}
+		});
+	});
+
+	describe("r4 recovery settings", () => {
+		it("resolves the escalated slow tier defaults and clamps them below the stall warn threshold", () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			const resolved = manager.getEmptyTurnRetrySettings();
+			// Defaults pass through to the loop untouched: the default cap (120s) sits
+			// safely below the default warn threshold (300s), so there is nothing to
+			// rewrite - but the clamp field is always resolved, because the loop (not
+			// the settings layer) enforces it on the base AND the cap.
+			expect(resolved.escalatedAttempts).toBeUndefined();
+			expect(resolved.escalatedMaxDelayMs).toBeUndefined();
+			expect(resolved.escalatedMaxDelayClampMs).toBe(DEFAULT_STALL_WARN_AFTER_SECONDS * 1000 - 1_000);
+			expect(ESCALATED_EMPTY_TURN_RETRY_DEFAULTS.escalatedMaxDelayMs).toBeLessThan(
+				DEFAULT_STALL_WARN_AFTER_SECONDS * 1000,
+			);
+
+			// A warn threshold below the slow tier's cap clamps the cap (with one
+			// second of headroom for the next attempt's time-to-first-event).
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ stallWatchdog: { warnAfterSeconds: 60 } }));
+			expect(SettingsManager.create(projectDir, agentDir).getEmptyTurnRetrySettings()).toMatchObject({
+				escalatedMaxDelayMs: 59_000,
+				escalatedMaxDelayClampMs: 59_000,
+			});
+
+			// An explicitly raised cap is clamped the same way, and a base above the
+			// clamp rides along untouched: the loop clamps both, so the base cannot
+			// pierce it.
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					stallWatchdog: { warnAfterSeconds: 60 },
+					retry: {
+						emptyTurn: { escalatedMaxDelayMs: 400_000, escalatedBaseDelayMs: 300_000 },
+					},
+				}),
+			);
+			expect(SettingsManager.create(projectDir, agentDir).getEmptyTurnRetrySettings()).toMatchObject({
+				escalatedBaseDelayMs: 300_000,
+				escalatedMaxDelayMs: 59_000,
+				escalatedMaxDelayClampMs: 59_000,
+			});
+		});
+
+		it("retry.enabled false collapses the whole ladder, slow tier and recovery included", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					retry: {
+						enabled: false,
+						emptyTurn: { escalatedAttempts: 3, recovery: { enabled: true } },
+					},
+				}),
+			);
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getEmptyTurnRetrySettings()).toMatchObject({ maxAttempts: 1, escalatedAttempts: 0 });
+			expect(manager.getEmptyTurnRecoverySettings()).toEqual({ enabled: false, maxContinuations: 1 });
+		});
+
+		it("round-trips the reserved backup-model gear key without consuming it", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({ retry: { emptyTurn: { recovery: { useBackupModel: true } } } }),
+			);
+			expect(collectUnknownSettingsKeys(JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf8")))).toEqual(
+				[],
+			);
+			// Reserved in v1: the recovery policy itself must not change.
+			expect(SettingsManager.create(projectDir, agentDir).getEmptyTurnRecoverySettings()).toEqual({
+				enabled: true,
+				maxContinuations: 1,
+			});
+		});
+
+		it("resolves the recovery continuation policy with maxContinuations floored", () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getEmptyTurnRecoverySettings()).toEqual({ enabled: true, maxContinuations: 1 });
+
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({ retry: { emptyTurn: { recovery: { enabled: false, maxContinuations: 2.7 } } } }),
+			);
+			expect(SettingsManager.create(projectDir, agentDir).getEmptyTurnRecoverySettings()).toEqual({
+				enabled: false,
+				maxContinuations: 2,
+			});
+		});
+
+		it("resolves the tool timeout defaults, clamp range, and both rollback handles", () => {
+			const cases: [{ enabled?: boolean; afterMs?: number }, { enabled: boolean; afterMs: number }][] = [
+				[{}, { enabled: true, afterMs: DEFAULT_TOOL_TIMEOUT_AFTER_MS }],
+				[{ afterMs: 1000 }, { enabled: true, afterMs: 60_000 }],
+				[{ afterMs: 9_000_000 }, { enabled: true, afterMs: 600_000 }],
+				[{ enabled: false }, { enabled: false, afterMs: DEFAULT_TOOL_TIMEOUT_AFTER_MS }],
+				[{ afterMs: 0 }, { enabled: true, afterMs: 0 }],
+				[
+					{ enabled: false, afterMs: 0 },
+					{ enabled: false, afterMs: 0 },
+				],
+			];
+			expect(cases.length).toBeGreaterThan(0);
+			for (const [configured, expected] of cases) {
+				writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ tools: { timeout: configured } }));
+				expect(SettingsManager.create(projectDir, agentDir).getToolTimeoutSettings()).toEqual(expected);
+			}
+		});
+
+		it("registers every r4 key so none reads as unknown", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					retry: {
+						emptyTurn: {
+							maxAttempts: 3,
+							baseDelayMs: 500,
+							maxDelayMs: 4000,
+							maxTotalDelayMs: 8000,
+							escalatedAttempts: 3,
+							escalatedBaseDelayMs: 30_000,
+							escalatedMaxDelayMs: 120_000,
+							escalatedMaxDelayClampMs: 299_000,
+							escalatedMaxTotalDelayMs: 300_000,
+							recovery: { enabled: true, maxContinuations: 1, useBackupModel: false },
+						},
+					},
+					tools: {
+						timeout: { enabled: true, afterMs: 180_000, perTool: { mcp__slow: 600_000 } },
+					},
+				}),
+			);
+			expect(collectUnknownSettingsKeys(JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf8")))).toEqual(
+				[],
+			);
+			// The per-tool map passes through to the resolved policy unclamped: an
+			// operator budgeting one long tool past the shared window is the documented
+			// exemption use.
+			expect(SettingsManager.create(projectDir, agentDir).getToolTimeoutSettings().perTool).toEqual({
+				mcp__slow: 600_000,
+			});
+			// Misspelled keys stay visible instead of silently doing nothing.
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ tools: { timeout: { afterMsX: 1 } } }));
+			expect(collectUnknownSettingsKeys(JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf8")))).toEqual([
+				"tools.timeout.afterMsX",
+			]);
 		});
 	});
 

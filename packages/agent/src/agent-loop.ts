@@ -32,6 +32,7 @@ import type {
 	AgentToolResult,
 	EmptyTurnRetryConfig,
 	StreamFn,
+	ToolTimeoutVerdict,
 } from "./types.js";
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
@@ -55,6 +56,54 @@ export const ABORT_TRUNCATION_MARKER = "[tool result truncated: the turn was abo
 export function abortCauseFromSignal(signal: AbortSignal | undefined): string | undefined {
 	const reason: unknown = signal?.reason;
 	return typeof reason === "string" && reason.trim().length > 0 ? reason.trim() : undefined;
+}
+
+/**
+ * Prefix of the cause text a per-call deadline attaches, so a cancelled tool call is
+ * greppable apart from a turn abort in any transcript or log.
+ */
+export const TOOL_TIMEOUT_CAUSE_PREFIX = "tool_timeout:";
+
+/** Cause text for a tool call cancelled by the per-call deadline; carried on the scoped abort signal. */
+export function formatToolTimeoutAbortCause(toolName: string, elapsedMs: number, timeoutMs: number): string {
+	// Milliseconds, not rounded seconds: per-tool budgets can be far below one
+	// second, and "for 0s (per-call budget 0s)" would say nothing.
+	return (
+		`${TOOL_TIMEOUT_CAUSE_PREFIX} ${toolName} produced no settled result for ${Math.round(elapsedMs)}ms ` +
+		`(per-call budget ${Math.round(timeoutMs)}ms) with no progress evidence, so this call was cancelled - the turn was not. ` +
+		"Do not repeat the identical call. Change approach instead: shrink the input, bound the command with its own timeout, " +
+		"run it as a background job and poll, or check its current state first."
+	);
+}
+
+/** Harvest-path labels for the run abort (the original producer of `preserveAbortedToolResult`). */
+const TURN_ABORT_HARVEST_LABELS = {
+	fallbackMessage: TOOL_ABORT_FALLBACK_MESSAGE,
+	truncationMarker: ABORT_TRUNCATION_MARKER,
+} as const;
+
+/** Harvest-path labels for the per-call deadline: the turn keeps running, only this call died. */
+const TOOL_TIMEOUT_HARVEST_LABELS = {
+	fallbackMessage: "Tool execution aborted by the per-call deadline",
+	truncationMarker: "[tool result truncated: this tool call was cancelled by the per-call deadline while in flight]",
+} as const;
+
+/**
+ * The per-call deadline for one tool call: `executionTimeoutMs` on the tool refines the
+ * loop-level default, and both yield to the master switch - when the loop carries no
+ * positive `toolTimeout.afterMs`, no deadline is armed at all, so the global
+ * `tools.timeout` handles stay the single rollback lever.
+ */
+function resolveToolTimeoutMs(tool: AgentTool<any>, config?: AgentLoopConfig): number | undefined {
+	const fallback = config?.toolTimeout?.afterMs;
+	if (typeof fallback !== "number" || fallback <= 0) return undefined;
+	// Operator-side budgets outrank the tool author's own declaration; both rank
+	// above the shared default, and 0 keeps its "this tool never times out" meaning.
+	const operatorBudget = config?.toolTimeout?.perTool?.[tool.name];
+	if (typeof operatorBudget === "number") return operatorBudget > 0 ? operatorBudget : undefined;
+	const perTool = tool.executionTimeoutMs;
+	if (typeof perTool === "number") return perTool > 0 ? perTool : undefined; // 0 = this tool never times out
+	return fallback;
 }
 /**
  * How long the abort path waits for an in-flight tool to settle so its partial
@@ -236,6 +285,7 @@ async function preserveAbortedToolResult(
 	executed: ExecutedToolCallOutcome,
 	result: AgentToolResult<any>,
 	abortCause: string | undefined,
+	labels: { fallbackMessage: string; truncationMarker: string } = TURN_ABORT_HARVEST_LABELS,
 ): Promise<AgentToolResult<any>> {
 	// A result synthesized by the abort path is a stub, not tool output: go straight
 	// to the harvest for it.
@@ -248,7 +298,7 @@ async function preserveAbortedToolResult(
 	}
 	if (!preserved) {
 		return createErrorToolResult(
-			abortCause === undefined ? TOOL_ABORT_FALLBACK_MESSAGE : `${TOOL_ABORT_FALLBACK_MESSAGE} ${abortCause}`,
+			abortCause === undefined ? labels.fallbackMessage : `${labels.fallbackMessage} ${abortCause}`,
 		);
 	}
 	return {
@@ -256,7 +306,7 @@ async function preserveAbortedToolResult(
 			...preserved.content,
 			{
 				type: "text",
-				text: abortCause === undefined ? ABORT_TRUNCATION_MARKER : `${ABORT_TRUNCATION_MARKER} ${abortCause}`,
+				text: abortCause === undefined ? labels.truncationMarker : `${labels.truncationMarker} ${abortCause}`,
 			},
 		],
 		details: preserved.details,
@@ -737,6 +787,21 @@ async function runLoop(
 export const EMPTY_TURN_RETRY_DEFAULTS = { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 4000 } as const;
 
 /**
+ * Defaults for the escalated slow tier that follows the fast one: after the fast
+ * attempts are spent, up to this many more resends wait tens of seconds instead of
+ * milliseconds, for providers whose empty turns mean a queued request that clears
+ * in minutes. The single-wait cap (120s) is deliberately far below a typical
+ * silence-watchdog warn threshold (300s): a planned recovery wait must not read as
+ * a stall. Hosts with a lower warn threshold clamp this through settings.
+ */
+export const ESCALATED_EMPTY_TURN_RETRY_DEFAULTS = {
+	escalatedAttempts: 3,
+	escalatedBaseDelayMs: 30_000,
+	escalatedMaxDelayMs: 120_000,
+	escalatedMaxTotalDelayMs: 300_000,
+} as const;
+
+/**
  * Wait between in-place empty-turn retries. Resolves early when the run signal fires,
  * so an abort is never delayed by the backoff (the next attempt takes the abort path).
  */
@@ -775,43 +840,119 @@ function resolveEmptyTurnRetryPolicy(options?: EmptyTurnRetryConfig): {
 	baseDelayMs: number;
 	maxDelayMs: number;
 	maxTotalDelayMs: number;
+	escalatedAttempts: number;
+	escalatedBaseDelayMs: number;
+	escalatedMaxDelayMs: number;
+	escalatedMaxTotalDelayMs: number;
 } {
 	const maxAttempts = Math.max(1, Math.floor(options?.maxAttempts ?? EMPTY_TURN_RETRY_DEFAULTS.maxAttempts));
 	const baseDelayMs = Math.max(0, options?.baseDelayMs ?? EMPTY_TURN_RETRY_DEFAULTS.baseDelayMs);
 	const maxDelayMs = Math.max(baseDelayMs, options?.maxDelayMs ?? EMPTY_TURN_RETRY_DEFAULTS.maxDelayMs);
 	const maxTotalDelayMs = Math.max(0, options?.maxTotalDelayMs ?? maxDelayMs * Math.max(0, maxAttempts - 1));
-	return { maxAttempts, baseDelayMs, maxDelayMs, maxTotalDelayMs };
+	// The slow tier is an extension of the attempt count, not a second retry loop:
+	// its waits budget separately from the fast tier's so a small fast budget cannot
+	// starve it and a long slow wait cannot exceed the fast tier's cap.
+	const escalatedAttempts = Math.max(
+		0,
+		Math.floor(options?.escalatedAttempts ?? ESCALATED_EMPTY_TURN_RETRY_DEFAULTS.escalatedAttempts),
+	);
+	const escalatedClampMs =
+		typeof options?.escalatedMaxDelayClampMs === "number" && options.escalatedMaxDelayClampMs > 0
+			? options.escalatedMaxDelayClampMs
+			: undefined;
+	let escalatedBaseDelayMs = Math.max(
+		0,
+		options?.escalatedBaseDelayMs ?? ESCALATED_EMPTY_TURN_RETRY_DEFAULTS.escalatedBaseDelayMs,
+	);
+	let escalatedMaxDelayMs = Math.max(
+		0,
+		options?.escalatedMaxDelayMs ?? ESCALATED_EMPTY_TURN_RETRY_DEFAULTS.escalatedMaxDelayMs,
+	);
+	// The single-wait invariant lives here, not in any one host: a planned slow-tier
+	// wait must stay under the caller's silence-watchdog threshold, so the clamp
+	// bounds both the base and the cap - a base above the cap would pierce both.
+	if (escalatedClampMs !== undefined) {
+		escalatedBaseDelayMs = Math.min(escalatedBaseDelayMs, escalatedClampMs);
+		escalatedMaxDelayMs = Math.min(escalatedMaxDelayMs, escalatedClampMs);
+	}
+	// The cap is the cap: clamping the base to it keeps the first slow wait (which is
+	// the base) from breaking a configured cap that sits below the base.
+	escalatedBaseDelayMs = Math.min(escalatedBaseDelayMs, escalatedMaxDelayMs);
+	const escalatedMaxTotalDelayMs = Math.max(
+		0,
+		options?.escalatedMaxTotalDelayMs ?? ESCALATED_EMPTY_TURN_RETRY_DEFAULTS.escalatedMaxTotalDelayMs,
+	);
+	return {
+		maxAttempts,
+		baseDelayMs,
+		maxDelayMs,
+		maxTotalDelayMs,
+		escalatedAttempts,
+		escalatedBaseDelayMs,
+		escalatedMaxDelayMs,
+		escalatedMaxTotalDelayMs,
+	};
 }
 
 function emptyTurnExhaustedMessage(
 	attempts: number,
-	discarded: { waitedMs: number },
+	discarded: {
+		attempts: number;
+		waitedMs: number;
+		fastWaitedMs: number;
+		escalatedAttempts: number;
+		escalatedWaitedMs: number;
+	},
 	terminatedBy: "attempts" | "budget" | "abort" | "request_budget",
 	requestBudget: { used: number; maxRequests?: number } = { used: 0 },
 ): string {
 	const waited = `waited ${discarded.waitedMs}ms between attempts`;
+	// Tier facts, only when the slow tier actually ran: the post-mortem has to tell a
+	// fast-tier-only exhaustion from one that already escalated, because the recovery
+	// levers differ (wait longer vs. resend).
+	const slowTier =
+		discarded.escalatedAttempts > 0
+			? ` (${discarded.attempts - discarded.escalatedAttempts} fast-tier gap(s) waited ${discarded.fastWaitedMs}ms, then ` +
+				`${discarded.escalatedAttempts} slow-tier gap(s) waited ${discarded.escalatedWaitedMs}ms)`
+			: "";
 	const why =
 		terminatedBy === "request_budget"
 			? `the shared provider request budget ran out after ${requestBudget.used} request(s) in this chain` +
 				(requestBudget.maxRequests === undefined ? "" : ` (ceiling ${requestBudget.maxRequests})`) +
-				`, so the resends stopped instead of spending more (attempted ${attempts} replies, ${waited})`
+				`, so the resends stopped instead of spending more (attempted ${attempts} replies, ${waited}${slowTier})`
 			: terminatedBy === "budget"
-				? `the retry wait budget ran out (attempted ${attempts} replies, ${waited})`
+				? `the retry wait budget ran out (attempted ${attempts} replies, ${waited}${slowTier})`
 				: terminatedBy === "abort"
-					? `the run was aborted between attempts (got ${attempts} empty replies, ${waited})`
-					: `the provider answered ${attempts} times in a row with no output content or tool calls (${waited})`;
+					? `the run was aborted between attempts (got ${attempts} empty replies, ${waited}${slowTier})`
+					: `the provider answered ${attempts} times in a row with no output content or tool calls (${waited}${slowTier})`;
 	return (
 		`Model returned an empty response ${attempts} times in a row: ${why}. ` +
 		"This is the provider returning a clean stop turn with nothing in it, not a connection failure. " +
-		"Adjust retry.emptyTurn.maxAttempts/baseDelayMs/maxTotalDelayMs for more or longer in-place retries, or resend the turn when the upstream recovers."
+		"Adjust retry.emptyTurn.maxAttempts/baseDelayMs/maxTotalDelayMs for more or longer in-place retries, " +
+		"retry.emptyTurn.escalatedAttempts/escalatedMaxDelayMs for the slow tier, or resend the turn when the upstream recovers."
 	);
 }
 
 function recordEmptyTurnExhaustion(
 	message: AssistantMessage,
 	attempts: number,
-	discarded: { waitedMs: number },
-	policy: { maxAttempts: number; baseDelayMs: number; maxDelayMs: number; maxTotalDelayMs: number },
+	discarded: {
+		attempts: number;
+		waitedMs: number;
+		fastWaitedMs: number;
+		escalatedAttempts: number;
+		escalatedWaitedMs: number;
+	},
+	policy: {
+		maxAttempts: number;
+		baseDelayMs: number;
+		maxDelayMs: number;
+		maxTotalDelayMs: number;
+		escalatedAttempts: number;
+		escalatedBaseDelayMs: number;
+		escalatedMaxDelayMs: number;
+		escalatedMaxTotalDelayMs: number;
+	},
 	requestBudget: { used: number; maxRequests?: number },
 	terminatedBy: "attempts" | "budget" | "abort" | "request_budget",
 ): void {
@@ -827,6 +968,13 @@ function recordEmptyTurnExhaustion(
 			maxTotalDelayMs: policy.maxTotalDelayMs,
 			terminatedBy,
 			requestBudget,
+			// Slow-tier facts, segmented so the fast tier stays readable on its own:
+			// sessions and notices report the real attempt count from these fields.
+			escalatedAttempts: discarded.escalatedAttempts,
+			escalatedWaitedMs: discarded.escalatedWaitedMs,
+			fastWaitedMs: discarded.fastWaitedMs,
+			escalatedMaxDelayMs: policy.escalatedMaxDelayMs,
+			escalatedMaxTotalDelayMs: policy.escalatedMaxTotalDelayMs,
 		},
 	});
 }
@@ -899,7 +1047,15 @@ async function streamAssistantResponse(
 	// reads input + cacheRead on stop turns and its case 3 reads output on length
 	// turns. Inflating the context fields would therefore misclassify a real stop turn
 	// as an overflow, which is why they are never summed on any path.
-	const discarded = { cost: { ...EMPTY_USAGE.cost }, output: 0, attempts: 0, waitedMs: 0 };
+	const discarded = {
+		cost: { ...EMPTY_USAGE.cost },
+		output: 0,
+		attempts: 0,
+		waitedMs: 0,
+		fastWaitedMs: 0,
+		escalatedAttempts: 0,
+		escalatedWaitedMs: 0,
+	};
 	const emptyTurnPolicy = resolveEmptyTurnRetryPolicy(config.emptyTurnRetry);
 	// One request budget for every layer that can issue a provider request for this
 	// chain: the SDK's own retries (via the provider fetch wrapper) and the in-place
@@ -938,15 +1094,32 @@ async function streamAssistantResponse(
 			// overloaded, and three requests inside the same millisecond are the worst
 			// thing to do to it. The wait is exponential, capped per wait and per turn,
 			// and honors the run signal (an abort continues into the attempt's own abort
-			// path instead of being delayed by us).
-			const delayMs = Math.min(emptyTurnPolicy.baseDelayMs * 2 ** (attempt - 1), emptyTurnPolicy.maxDelayMs);
-			const withinAttempts = attempt < emptyTurnPolicy.maxAttempts;
-			const withinWaitBudget = discarded.waitedMs + delayMs <= emptyTurnPolicy.maxTotalDelayMs;
+			// path instead of being delayed by us). Attempts past `maxAttempts` enter the
+			// escalated slow tier (tens-of-seconds waits, its own wait budget), for
+			// providers whose empty turns clear in minutes; a fast-tier budget stop
+			// still ends the chain like it always did.
+			const slowTier = attempt >= emptyTurnPolicy.maxAttempts;
+			const delayMs = slowTier
+				? Math.min(
+						emptyTurnPolicy.escalatedBaseDelayMs * 2 ** (attempt - emptyTurnPolicy.maxAttempts),
+						emptyTurnPolicy.escalatedMaxDelayMs,
+					)
+				: Math.min(emptyTurnPolicy.baseDelayMs * 2 ** (attempt - 1), emptyTurnPolicy.maxDelayMs);
+			const withinAttempts = attempt < emptyTurnPolicy.maxAttempts + emptyTurnPolicy.escalatedAttempts;
+			const withinWaitBudget = slowTier
+				? discarded.escalatedWaitedMs + delayMs <= emptyTurnPolicy.escalatedMaxTotalDelayMs
+				: discarded.fastWaitedMs + delayMs <= emptyTurnPolicy.maxTotalDelayMs;
 			// The shared budget is the outer bound: when the SDK already spent the chain's
 			// last request, this layer must not start another one.
 			if (withinAttempts && withinWaitBudget && !requestBudget.exhausted) {
 				discarded.attempts += 1;
 				discarded.waitedMs += delayMs;
+				if (slowTier) {
+					discarded.escalatedAttempts += 1;
+					discarded.escalatedWaitedMs += delayMs;
+				} else {
+					discarded.fastWaitedMs += delayMs;
+				}
 				discarded.output += message.usage.output;
 				discarded.cost.input += message.usage.cost.input;
 				discarded.cost.output += message.usage.cost.output;
@@ -1343,7 +1516,7 @@ async function executeToolCallsSequential(
 				isError: preparation.isError,
 			};
 		} else {
-			const executed = await executePreparedToolCall(preparation, signal, emit);
+			const executed = await executePreparedToolCall(preparation, signal, emit, config);
 			finalized = await finalizeExecutedToolCall(
 				currentContext,
 				assistantMessage,
@@ -1360,6 +1533,8 @@ async function executeToolCallsSequential(
 		finalizedCalls.push(finalized);
 		messages.push(toolResultMessage);
 
+		// The run-level signal only: a per-call deadline that cancelled one tool must
+		// not stop the batch - the model decides what to do with the next call.
 		if (signal?.aborted) {
 			break;
 		}
@@ -1402,7 +1577,7 @@ async function executeToolCallsParallel(
 		}
 
 		finalizedCalls.push(async () => {
-			const executed = await executePreparedToolCall(preparation, signal, emit);
+			const executed = await executePreparedToolCall(preparation, signal, emit, config);
 			const finalized = await finalizeExecutedToolCall(
 				currentContext,
 				assistantMessage,
@@ -1452,6 +1627,12 @@ type ExecutedToolCallOutcome = {
 	abortedInFlight?: boolean;
 	/** The still-running execute promise; harvested (bounded) for partial output on the abort path. */
 	pendingOperation?: Promise<AgentToolResult<any>>;
+	/**
+	 * Cause text for a per-call deadline cancellation: present only when the scoped
+	 * deadline (not the run abort) cancelled this call. The turn keeps running; the
+	 * finalize step routes this through the same harvest with deadline-specific labels.
+	 */
+	timeoutAbortCause?: string;
 };
 
 type FinalizedToolCallOutcome = {
@@ -1539,53 +1720,127 @@ async function executePreparedToolCall(
 	prepared: PreparedToolCall,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
+	config?: AgentLoopConfig,
 ): Promise<ExecutedToolCallOutcome> {
 	const updateEvents: Promise<void>[] = [];
 	let acceptingUpdates = true;
 	/** The raw execute promise, kept so an abort can still harvest what the tool produced. */
 	let operation: Promise<AgentToolResult<any>> | undefined;
 
-	try {
-		throwIfAborted(signal);
-		operation = prepared.tool.execute(prepared.toolCall.id, prepared.args as never, signal, (partialResult) => {
-			if (!acceptingUpdates || signal?.aborted) {
+	// Per-call deadline: a scoped abort source so one wedged call can be cancelled
+	// without killing the turn. The timer asks the host (`toolTimeout.vouch`) at every
+	// fire; a granted extension only re-arms this timer, never the run. `undefined`
+	// budget means no deadline (the tools.timeout handles are the master switch).
+	const timeoutMs = resolveToolTimeoutMs(prepared.tool, config);
+	const timeoutController = timeoutMs === undefined ? undefined : new AbortController();
+	let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+	const startedAt = Date.now();
+	let timeoutAbortCause: string | undefined;
+	let operationSettled = false;
+	const armToolTimeout = (delayMs: number): void => {
+		if (timeoutController === undefined) return;
+		timeoutTimer = setTimeout(() => {
+			// The call already settled (or the run aborted): a late fire must neither
+			// cancel a completed call nor race the abort path for a dead run.
+			if (operationSettled || signal?.aborted) return;
+			const info = {
+				toolCallId: prepared.toolCall.id,
+				toolName: prepared.toolCall.name,
+				elapsedMs: Date.now() - startedAt,
+				timeoutMs: timeoutMs!,
+			};
+			let verdict: ToolTimeoutVerdict | undefined;
+			try {
+				verdict = config?.toolTimeout?.vouch?.(info);
+			} catch {
+				// K3 asymmetry: the watchdog's own predicate failing fails towards
+				// killing (deadlock defense); the deadline's arbiter failing fails
+				// towards NOT killing (a broken judge must not execute the sentence).
+				// The turn-level watchdog still guards the call.
+				verdict = { action: "extend", recheckMs: timeoutMs! };
+			}
+			if (verdict?.action === "extend") {
+				armToolTimeout(Math.max(0, verdict.recheckMs));
 				return;
 			}
-			updateEvents.push(
-				Promise.resolve(
-					emit({
-						type: "tool_execution_update",
-						toolCallId: prepared.toolCall.id,
-						toolName: prepared.toolCall.name,
-						args: prepared.toolCall.arguments,
-						partialResult,
-					}),
-				),
-			);
-		});
+			timeoutAbortCause = formatToolTimeoutAbortCause(info.toolName, info.elapsedMs, timeoutMs!);
+			timeoutController.abort(timeoutAbortCause);
+		}, delayMs);
+	};
+	const effectiveSignal =
+		timeoutController === undefined
+			? signal
+			: signal === undefined
+				? timeoutController.signal
+				: AbortSignal.any([signal, timeoutController.signal]);
+	armToolTimeout(timeoutMs === undefined ? 0 : timeoutMs);
+
+	try {
+		throwIfAborted(signal);
+		operation = prepared.tool.execute(
+			prepared.toolCall.id,
+			prepared.args as never,
+			effectiveSignal,
+			(partialResult) => {
+				if (!acceptingUpdates || effectiveSignal?.aborted) {
+					return;
+				}
+				updateEvents.push(
+					Promise.resolve(
+						emit({
+							type: "tool_execution_update",
+							toolCallId: prepared.toolCall.id,
+							toolName: prepared.toolCall.name,
+							args: prepared.toolCall.arguments,
+							partialResult,
+						}),
+					),
+				);
+			},
+		);
 		// Sink: the abort can settle the race long before the tool does, and a late
 		// rejection must never escape as an unhandledRejection.
 		void operation.catch(() => undefined);
-		const result = await raceWithAbort(operation, signal);
+		const result = await raceWithAbort(operation, effectiveSignal);
+		operationSettled = true;
 		acceptingUpdates = false;
 		try {
 			await raceWithAbort(
 				Promise.all(updateEvents).then(() => undefined),
-				signal,
+				effectiveSignal,
 			);
 		} catch (error) {
-			if (!signal?.aborted || !isAbortError(error)) {
+			if (!effectiveSignal?.aborted || !isAbortError(error)) {
 				throw error;
 			}
 		}
 		return { result, isError: false };
 	} catch (error) {
+		// The operation settled by failing: a deadline timer that fires during the
+		// flush below must not rewrite a real tool error into a deadline cancellation
+		// (the operation is not "in flight" any more, whatever the race said).
+		operationSettled = true;
 		acceptingUpdates = false;
 		await raceWithAbort(
 			Promise.all(updateEvents).then(() => undefined),
-			signal,
+			effectiveSignal,
 		).catch(() => undefined);
 		const abortedInFlight = signal?.aborted === true;
+		// A per-call deadline fired while the run signal is still live: the turn keeps
+		// running and the cancellation becomes a tool result. It flows through the same
+		// abort harvest (pendingOperation kept, partial output preserved); only the
+		// labels and cause differ, so the model can tell this apart from a turn abort.
+		const timeoutCause = timeoutAbortCause; // captured let: narrow once for this branch
+		const timedOutBySystem = !abortedInFlight && timeoutCause !== undefined;
+		if (timedOutBySystem) {
+			return {
+				result: createErrorToolResult(timeoutCause),
+				isError: true,
+				abortedInFlight: true,
+				...(operation ? { pendingOperation: operation } : {}),
+				timeoutAbortCause,
+			};
+		}
 		return {
 			result: createErrorToolResult(
 				abortedInFlight ? TOOL_ABORT_FALLBACK_MESSAGE : error instanceof Error ? error.message : String(error),
@@ -1596,6 +1851,10 @@ async function executePreparedToolCall(
 			...(abortedInFlight && operation ? { abortedInFlight: true, pendingOperation: operation } : {}),
 			...(abortedInFlight && !operation ? { abortedInFlight: true } : {}),
 		};
+	} finally {
+		// Every settled call must drop its deadline timer: a long session otherwise
+		// accumulates one pending timer per tool call and keeps the process alive.
+		if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
 	}
 }
 
@@ -1650,9 +1909,17 @@ async function finalizeExecutedToolCall(
 	}
 
 	if (abortedDuringFinalize || executed.abortedInFlight === true) {
+		// The run abort keeps its cause when both producers fired: an intentional
+		// interrupt outranks the deadline. A deadline cancellation carries its own
+		// cause and labels, so the model reads "this call was cancelled", not "the
+		// turn was aborted".
+		const timeoutCause = executed.timeoutAbortCause;
+		const cause = abortCauseFromSignal(signal) ?? timeoutCause;
+		const labels =
+			timeoutCause !== undefined && cause === timeoutCause ? TOOL_TIMEOUT_HARVEST_LABELS : TURN_ABORT_HARVEST_LABELS;
 		return {
 			toolCall: prepared.toolCall,
-			result: await preserveAbortedToolResult(executed, result, abortCauseFromSignal(signal)),
+			result: await preserveAbortedToolResult(executed, result, cause, labels),
 			isError: true,
 		};
 	}

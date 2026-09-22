@@ -775,6 +775,23 @@ export type AgentConnectionSessionEvent =
 			 * can actually carry, so a new consumer cannot assume the field exists.
 			 */
 			diagnostics?: StallDiagnostics;
+	  }
+	| {
+			/**
+			 * The empty-response retry ladder is exhausted and the run ended without
+			 * model output (r4 recovery). Additive on the wire: older clients have no
+			 * case for it and ignore it, exactly like every other unknown event type.
+			 */
+			type: "empty_response_exhausted";
+			message: string;
+			attempts: number;
+			waitedMs: number;
+			escalatedAttempts: number;
+			escalatedWaitedMs: number;
+			terminatedBy: string;
+			recoveryContinuations: number;
+			provider?: string;
+			model?: string;
 	  };
 
 export type AgentConnectionEvent =

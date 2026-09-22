@@ -296,6 +296,15 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * `EMPTY_TURN_RETRY_DEFAULTS` from the loop.
 	 */
 	emptyTurnRetry?: EmptyTurnRetryConfig;
+
+	/**
+	 * Per-tool-call wall-clock deadline. A tool call that produces no settle before
+	 * the deadline is cancelled on its own - through the same abort harvest the run
+	 * abort uses - and the model gets the cancellation as an error tool result so it
+	 * can change approach inside the same turn. The turn itself is never aborted by
+	 * this deadline.
+	 */
+	toolTimeout?: ToolTimeoutConfig;
 }
 
 /** Backoff budget for the loop's empty-turn retries; see `AgentLoopConfig.emptyTurnRetry`. */
@@ -306,8 +315,81 @@ export interface EmptyTurnRetryConfig {
 	baseDelayMs?: number;
 	/** Upper bound for a single wait, in ms. */
 	maxDelayMs?: number;
-	/** Upper bound for the summed waits of one turn, in ms. */
+	/** Upper bound for the summed fast-tier waits of one turn, in ms. */
 	maxTotalDelayMs?: number;
+	/**
+	 * Escalated slow tier: after the fast attempts are spent, the loop keeps resending
+	 * this many more times with much longer waits, for providers whose empty turns
+	 * mean a queue that clears in minutes, not milliseconds. `0` disables the tier
+	 * (the previous behavior); unset uses `ESCALATED_EMPTY_TURN_RETRY_DEFAULTS`.
+	 */
+	escalatedAttempts?: number;
+	/** First (and doubling base) slow-tier wait, in ms. */
+	escalatedBaseDelayMs?: number;
+	/**
+	 * Upper bound for a single slow-tier wait, in ms. The resolved value must stay
+	 * strictly below the host's silence-watchdog warn threshold, or a planned recovery
+	 * wait reads as a stall: `SettingsManager.getEmptyTurnRetrySettings` clamps it
+	 * against `stallWatchdog.warnAfterSeconds` for that reason.
+	 */
+	escalatedMaxDelayMs?: number;
+	/**
+	 * Hard ceiling the loop clamps BOTH the slow tier's base and cap to, so neither
+	 * can pierce the single-wait invariant - including callers that never pass
+	 * through a settings manager (SDK construction, tests, other hosts). Hosts that
+	 * run a silence watchdog derive this from their warn threshold minus
+	 * time-to-first-event headroom; unset means no loop-side clamp.
+	 */
+	escalatedMaxDelayClampMs?: number;
+	/** Upper bound for the summed slow-tier waits of one turn, in ms. */
+	escalatedMaxTotalDelayMs?: number;
+}
+
+/**
+ * Facts the loop hands the host when a per-call deadline fires, so the host can
+ * decide with fresh evidence whether externally owned work is still in flight.
+ */
+export interface ToolTimeoutVouchInfo {
+	toolCallId: string;
+	toolName: string;
+	/** Wall clock since this call started, in ms. */
+	elapsedMs: number;
+	/** The budget this call was armed with, in ms. */
+	timeoutMs: number;
+}
+
+/**
+ * The host's verdict for a fired deadline. `"extend"` re-arms the deadline for
+ * `recheckMs` and asks again when it fires next - the extension budget is the
+ * host's to own, never the loop's. `"fail"` (or returning nothing) cancels this
+ * one call: the turn keeps running and the model receives the cancellation as a
+ * tool result.
+ */
+export type ToolTimeoutVerdict = { action: "extend"; recheckMs: number } | { action: "fail" };
+
+/**
+ * Per-tool-call deadline policy; see `AgentLoopConfig.toolTimeout`. `afterMs` of
+ * `0` or a missing config means no deadline. The `vouch` callback is invoked from
+ * the deadline timer, synchronously, once per fire.
+ */
+export interface ToolTimeoutConfig {
+	/** Default wall-clock budget for one tool call, in ms. `0` disables the deadline. */
+	afterMs?: number;
+	/**
+	 * Operator-side per-tool budgets, keyed by tool name, in ms. An entry overrides
+	 * the tool's own `executionTimeoutMs` and the shared default; `0` exempts that
+	 * one tool from the deadline entirely. Only consulted while the loop-level
+	 * deadline is armed, so the global handles stay the master switches.
+	 */
+	perTool?: Record<string, number>;
+	/**
+	 * Host-side adjudication when the deadline fires: the single place that can
+	 * extend a deadline (progress evidence) or let it stand. Returning `undefined`
+	 * means "let the deadline stand"; a throwing callback is treated the opposite
+	 * way - as an extension - because a failing judge must not execute the
+	 * sentence (K3 asymmetry; the turn-level watchdog still guards the call).
+	 */
+	vouch?: (info: ToolTimeoutVouchInfo) => ToolTimeoutVerdict | undefined;
 }
 
 /**
@@ -406,6 +488,13 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 	 * If omitted, the default execution mode applies.
 	 */
 	executionMode?: ToolExecutionMode;
+	/**
+	 * Per-call wall-clock budget this tool asks the loop to enforce, in ms. `0` opts
+	 * this tool out of the deadline entirely. Only consulted while the loop-level
+	 * deadline is armed (`AgentLoopConfig.toolTimeout`), so the global `tools.timeout`
+	 * handles stay the master switches; otherwise the tool refines the shared default.
+	 */
+	executionTimeoutMs?: number;
 }
 
 /** Context snapshot passed to the low-level agent loop and tool hooks. */
