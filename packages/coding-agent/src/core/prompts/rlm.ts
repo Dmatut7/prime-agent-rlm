@@ -49,6 +49,7 @@ const REPL_CONTROL_PROMPT = [
 	"",
 	"Python is the orchestration language: use Python for loops, conditionals, parsing, and state. Use `bash()` to invoke programs, not to write shell programs — no shell loops or heredocs; do those in Python.",
 	"The model-facing tool surface is exactly one tool: ipython. There is no bash, edit, read, or write tool to call - a tool call for any other name fails with \"Tool not found\". Shell commands run inside the kernel via `bash('cmd')`; file work is Python in the same REPL.",
+	"String payloads that contain quotes (shell commands, generated code, commit messages) use triple-quoted delimiters, `shlex.quote(...)`, and `json.dumps(...)` instead of hand-escaped quotes, and never combine f-strings with backslash-escaped quotes - nested quoting is the most common syntax failure.",
 	"",
 	"Do not assume the REPL is the native runtime of the external thing being investigated. A repository, package, service, dataset, paper, website, benchmark, or API may have its own environment and normal interface. Evaluate external systems through their own interface, then use the REPL to coordinate the process and analyze what comes back.",
 	"",
