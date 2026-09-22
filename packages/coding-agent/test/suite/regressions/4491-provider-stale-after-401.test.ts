@@ -201,7 +201,21 @@ describe("issue #4491 provider stale after repeated 401", () => {
 
 	it("marks captured auth failures stale when the final retryable error is not auth", async () => {
 		const harness = await createHarness({
-			settings: { retry: { enabled: true, maxRetries: 2, baseDelayMs: 1 } },
+			settings: {
+				retry: {
+					enabled: true,
+					maxRetries: 2,
+					baseDelayMs: 1,
+					// #2375/#35 (60f7ff393): quick-retry exhaustion on a transient
+					// error now enters the unavailable-wait loop (bounded pings)
+					// instead of ending the turn, so a final 500 no longer stops at
+					// exhaustion. This probe is about the auth-stale marking when
+					// the final error is not auth; the wait loop has its own
+					// coverage in agent-session-retry-events.test.ts, so isolate
+					// the exhaustion path from it here.
+					provider: { waitForUsage: { enabled: false } },
+				},
+			},
 		});
 		harnesses.push(harness);
 		harness.setResponses([provider401Message(), provider500Message(), provider500Message()]);
