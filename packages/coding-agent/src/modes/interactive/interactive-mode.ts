@@ -422,6 +422,31 @@ function isExpandable(obj: unknown): obj is Expandable {
 	return typeof obj === "object" && obj !== null && "setExpanded" in obj && typeof obj.setExpanded === "function";
 }
 
+/**
+ * One lane bundle: where each expansion surface reads its state from. The
+ * per-turn values come from the owning turn's TurnActivityState; the globals
+ * serve turn-less children and the header (K3 ②).
+ */
+function applyExpansionLanes(
+	child: unknown,
+	lanes: { thinking: boolean; tools: boolean; agentMessages: boolean; editDiffs: boolean },
+): void {
+	if (child instanceof AssistantMessageComponent) {
+		// U6 two-key model: T drives the thinking traces; O drives the error
+		// detail surface.
+		child.setThinkingExpanded(lanes.thinking);
+	}
+	if (isExpandable(child)) {
+		child.setExpanded(child instanceof AgentMessageComponent ? lanes.agentMessages : lanes.tools);
+	}
+	if (hasAgentMessagesExpansion(child)) {
+		child.setAgentMessagesExpanded(lanes.agentMessages);
+	}
+	if (hasEditDiffsExpansion(child)) {
+		child.setEditDiffsExpanded(lanes.editDiffs);
+	}
+}
+
 interface AgentMessagesExpandable {
 	setAgentMessagesExpanded(expanded: boolean): void;
 }
@@ -7300,7 +7325,7 @@ export class InteractiveMode {
 			case "custom": {
 				if (message.display) {
 					const component = this.createDisplayedCustomMessageComponent(message);
-					this.applyExpansionLanes(component, {
+					applyExpansionLanes(component, {
 						thinking: this.thinkingExpanded,
 						tools: this.toolOutputExpanded,
 						agentMessages: this.agentMessagesExpanded,
@@ -8487,7 +8512,7 @@ export class InteractiveMode {
 			if (child instanceof TurnSummaryComponent) {
 				break;
 			}
-			this.applyExpansionLanes(child, {
+			applyExpansionLanes(child, {
 				thinking: state.thinkingExpanded,
 				tools: !state.isCollapsed,
 				agentMessages: state.agentMessagesExpanded,
@@ -8562,31 +8587,6 @@ export class InteractiveMode {
 		this.applyChatExpansion();
 	}
 
-	/**
-	 * One lane bundle: where each expansion surface reads its state from. The
-	 * per-turn values come from the owning turn's TurnActivityState; the
-	 * globals serve turn-less children and the header.
-	 */
-	private applyExpansionLanes(
-		child: unknown,
-		lanes: { thinking: boolean; tools: boolean; agentMessages: boolean; editDiffs: boolean },
-	): void {
-		if (child instanceof AssistantMessageComponent) {
-			// U6 two-key model: T drives the thinking traces; O drives the
-			// error detail surface.
-			child.setThinkingExpanded(lanes.thinking);
-		}
-		if (isExpandable(child)) {
-			child.setExpanded(child instanceof AgentMessageComponent ? lanes.agentMessages : lanes.tools);
-		}
-		if (hasAgentMessagesExpansion(child)) {
-			child.setAgentMessagesExpanded(lanes.agentMessages);
-		}
-		if (hasEditDiffsExpansion(child)) {
-			child.setEditDiffsExpanded(lanes.editDiffs);
-		}
-	}
-
 	/** Writes one lane's value into every turn's state (the Alt-global path, K3 ②). */
 	private syncAllTurnLanes(value: boolean, lane: "thinking" | "tools" | "agentMessages"): void {
 		for (const child of this.chatContainer.children) {
@@ -8624,9 +8624,13 @@ export class InteractiveMode {
 				};
 				continue;
 			}
-			this.applyExpansionLanes(child, turnLanes ?? globalLanes);
+			applyExpansionLanes(child, turnLanes ?? globalLanes);
 		}
-		this.requestExpansionRender();
+		if (this.ui.isFullscreen()) {
+			this.ui.requestRender();
+		} else {
+			this.ui.requestRenderPreservingViewport();
+		}
 	}
 
 	/**
