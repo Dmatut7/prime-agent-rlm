@@ -1,0 +1,1 @@
+- Added an auto-recovery countdown line to the TUI stall action bar: when a stall event carries the daemon's armed `autoRecoveryAtMs`, the bar shows "machine will act at HH:MM:SS (in Xs)" under the action hints, and an event without that field renders exactly the lines it did before.
