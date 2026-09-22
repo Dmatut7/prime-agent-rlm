@@ -54,6 +54,7 @@ export const ASYNC_BASH_COMPLETION_CUSTOM_TYPE = "async_bash_completion";
 export const ASYNC_BASH_COMPLETION_PREVIEW_LABEL = "Background command finished";
 
 export const THINKING_LEVEL_CLAMPED_CUSTOM_TYPE = "thinking_level_clamped";
+export const IMAGE_DELIVERY_SUSPICION_CUSTOM_TYPE = "image_delivery_suspicion";
 
 /**
  * Framing for a refinement outcome that is rendered back into the model's
@@ -109,6 +110,57 @@ export interface CompactionOutcomeMessage extends CustomMessage<CompactionOutcom
 	customType: typeof COMPACTION_OUTCOME_CUSTOM_TYPE;
 	content: string;
 	details: CompactionOutcomeDetails;
+}
+
+/**
+ * Level-one (suspicion, not confirmed) image-delivery receipt: the committed
+ * turn batch carried images, the response completed cleanly on an
+ * OpenAI-completions API, and the usage frame had no image token count. The
+ * measured defect behind it: a provider whose catalog entry claims image input
+ * can serve 2xx and silently drop the images. Some vision-capable providers
+ * never report image token counts (stepfun), so the receipt stays worded as a
+ * suspicion and never changes configuration on its own.
+ */
+export interface ImageDeliverySuspicionDetails {
+	/** Model that served the request, as the assistant message recorded it. */
+	model: string;
+	/** Provider of the serving model. */
+	provider: string;
+	/** Stop reason of the completed response that carried the usage. */
+	stopReason: string;
+	/** What was observed, spelled so it can be re-verified against the usage frame. */
+	evidence: "usage.prompt_tokens_details.image_tokens absent";
+	/** ISO timestamp of the observation. */
+	measuredAt: string;
+}
+
+export interface ImageDeliverySuspicionMessage extends CustomMessage<ImageDeliverySuspicionDetails> {
+	customType: typeof IMAGE_DELIVERY_SUSPICION_CUSTOM_TYPE;
+	content: string;
+	details: ImageDeliverySuspicionDetails;
+}
+
+export function createImageDeliverySuspicionMessage(
+	observed: Pick<ImageDeliverySuspicionDetails, "model" | "provider" | "stopReason">,
+	timestamp = Date.now(),
+): ImageDeliverySuspicionMessage {
+	return {
+		role: "custom",
+		customType: IMAGE_DELIVERY_SUSPICION_CUSTOM_TYPE,
+		content: [
+			"[Image delivery suspicion] Automatic session notice, not a message from the user: the request for this turn carried image content, but the response usage reported no image token count, so the model may not have received the images. Treat any claim to have seen them accordingly.",
+			"Suspicion only, never a confirmed failure: some vision-capable providers do not report image token counts, so a missing count alone proves nothing. No settings were changed. If the answers ignore the images, verify with a question that is answerable only from the image.",
+		].join("\n\n"),
+		display: true,
+		details: {
+			model: observed.model,
+			provider: observed.provider,
+			stopReason: observed.stopReason,
+			evidence: "usage.prompt_tokens_details.image_tokens absent",
+			measuredAt: new Date(timestamp).toISOString(),
+		},
+		timestamp,
+	};
 }
 
 export interface RefinementOutcomeDetails {
