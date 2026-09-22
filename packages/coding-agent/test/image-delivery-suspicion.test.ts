@@ -96,6 +96,18 @@ function createSuspicionSession(
 				parameters: Type.Object({}),
 				execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
 			},
+			{
+				// The attach_image shape: a tool result that appends image blocks next
+				// to its text, mirroring the kernel path (imageBlocksFromAttachments).
+				name: "attach",
+				label: "Attach",
+				description: "Returns an image to the model",
+				parameters: Type.Object({}),
+				execute: async () => ({
+					content: [{ type: "text", text: "Loaded 1 image into context" }, IMAGE],
+					details: {},
+				}),
+			},
 		],
 	});
 	return { session, streamCalls, dir };
@@ -173,6 +185,45 @@ it("does not notice on image-free turns or on responses that did not complete cl
 	} finally {
 		errored.session.dispose();
 		rmSync(errored.dir, { recursive: true, force: true });
+	}
+});
+
+it("notices when a mid-run tool result delivers images the committed batch never carried", async () => {
+	// The flagship attach_image path: the committed batch is image-free, the
+	// model calls a tool whose result carries image blocks, and the continuation
+	// request replays them - so a missing image token count is still suspicious.
+	const fixture = createSuspicionSession([{ usage: {} }, { usage: {} }], {
+		firstResponse: {
+			stopReason: "toolUse",
+			content: [{ type: "toolCall", id: "call-1", name: "attach", arguments: {} }],
+		},
+	});
+	try {
+		await fixture.session.prompt("look at this");
+		expect(fixture.streamCalls()).toBe(2);
+		const notices = suspicionNotices(fixture.session);
+		expect(notices).toHaveLength(1);
+		expect(notices[0].content).toContain("may not have received the images");
+	} finally {
+		fixture.session.dispose();
+		rmSync(fixture.dir, { recursive: true, force: true });
+	}
+});
+
+it("does not notice when the mid-run tool result carries no images", async () => {
+	const fixture = createSuspicionSession([{ usage: {} }, { usage: {} }], {
+		firstResponse: {
+			stopReason: "toolUse",
+			content: [{ type: "toolCall", id: "call-1", name: "noop", arguments: {} }],
+		},
+	});
+	try {
+		await fixture.session.prompt("run the tool");
+		expect(fixture.streamCalls()).toBe(2);
+		expect(suspicionNotices(fixture.session)).toHaveLength(0);
+	} finally {
+		fixture.session.dispose();
+		rmSync(fixture.dir, { recursive: true, force: true });
 	}
 });
 

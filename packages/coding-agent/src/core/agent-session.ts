@@ -1207,8 +1207,10 @@ function messageCarriesImages(message: QueuedAgentMessage | AgentMessage): boole
 /**
  * Whether the messages a dispatch commits (its turn records plus any prepared
  * extra messages) attach image content. Image routing and the image-delivery
- * suspicion check both read this off the committed batch, so the two agree on
- * what "this run's request carried images" means.
+ * suspicion check both read this off the committed batch; the suspicion check
+ * additionally counts image blocks that tool results deliver mid-run
+ * (attach_image replies), so a run that only receives images in-turn still
+ * reports on them.
  */
 function batchCarriesImages(turns: SessionAction<PreparedTurnPayload>[], extraMessages: AgentMessage[]): boolean {
 	return (
@@ -3766,6 +3768,8 @@ export class AgentSession {
 
 	/** Whether the batch committed for the current run carried image content. */
 	private _dispatchedBatchCarriedImages = false;
+	/** Whether a tool result delivered during the current run attached image content. */
+	private _runToolResultsCarriedImages = false;
 	/** Whether the current run already emitted an image-delivery suspicion notice. */
 	private _imageDeliverySuspicionNotified = false;
 
@@ -3809,17 +3813,23 @@ export class AgentSession {
 	}
 
 	/**
-	 * Level-one image-delivery suspicion: the committed batch carried images,
-	 * the response completed cleanly on an OpenAI-completions API (the only
-	 * usage schema that carries image token counts), and the usage frame had no
-	 * image token count - the provider may have silently dropped the images.
+	 * Level-one image-delivery suspicion: this run's requests carried image
+	 * content (the committed batch, or image blocks a tool result delivered
+	 * mid-run), the response completed cleanly on an OpenAI-completions API (the
+	 * only usage schema that carries image token counts), and the usage frame had
+	 * no image token count - the provider may have silently dropped the images.
 	 * Observed both ways: a catalog entry claiming image input can serve 2xx
 	 * and answer blind, while some vision-capable providers never report the
 	 * count (stepfun), so this stays a suspicion, fires at most once per
 	 * committed batch, and never changes configuration.
 	 */
 	private _maybeNoticeImageDeliverySuspicion(message: AssistantMessage): void {
-		if (!this._dispatchedBatchCarriedImages || this._imageDeliverySuspicionNotified) return;
+		if (
+			(!this._dispatchedBatchCarriedImages && !this._runToolResultsCarriedImages) ||
+			this._imageDeliverySuspicionNotified
+		) {
+			return;
+		}
 		// blockImages replaces every image with a text placeholder before the
 		// request, so the provider truthfully counts no image tokens.
 		if (this.settingsManager.getBlockImages()) return;
@@ -6336,6 +6346,10 @@ export class AgentSession {
 		let clearedDispatchEnded = false;
 		if ((event.type === "message_start" || event.type === "message_end") && event.message.role === "toolResult") {
 			this._applyLateIpythonSentAgentMessages(event.message);
+			// Mid-run tool results (attach_image through the kernel) attach image
+			// blocks to this run's continuation requests; the suspicion check counts
+			// them as carried images even when the committed batch had none.
+			if (messageCarriesImages(event.message)) this._runToolResultsCarriedImages = true;
 		}
 		if (event.type === "message_start" || event.type === "message_end") {
 			const cleared = this._capturingCancelledAction(event.message);
@@ -10374,8 +10388,10 @@ export class AgentSession {
 					this.agent.modelOverride = this._imageModelOverrideForTurns(turns, preparedMessages);
 					// Same batch, same authority: the image-delivery suspicion check
 					// reads at message_end whether the request this run actually sends
-					// carries images, and re-arms its one-notice-per-batch budget.
+					// carries images (the committed batch plus image blocks tool results
+					// deliver mid-run), and re-arms its one-notice-per-batch budget.
 					this._dispatchedBatchCarriedImages = batchCarriesImages(turns, preparedMessages);
+					this._runToolResultsCarriedImages = false;
 					this._imageDeliverySuspicionNotified = false;
 					return turns.some((action) => action.suppressAutonomousContinuation)
 						? this._runWithAutonomousContinuationSuppressed(() => this.agent.prompt(preparedMessages))
