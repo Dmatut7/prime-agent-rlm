@@ -492,7 +492,11 @@ describe("planEmergencyShrink cost", () => {
 		// Positive control for the linearity judge above: the same fixture shape,
 		// the same timing, the same threshold, run against the checked-in old
 		// planner. If this does not come out superlinear, the judge is decoration.
-		const tiers = [500, 1_000, 2_000];
+		// Tiers start at 1k: below that the walk's per-entry constant dilutes the
+		// quadratic term on slow runners (CI measured 2.76 growth at [500..2k],
+		// under the >3 pin), and bigger tiers put the O(cuts x entries) term in
+		// charge so the growth lands near the theoretical 4 with headroom.
+		const tiers = [1_000, 2_000, 4_000];
 		const reference: number[] = [];
 		const linearized: number[] = [];
 		for (const count of tiers) {
