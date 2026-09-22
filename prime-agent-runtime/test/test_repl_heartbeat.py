@@ -288,7 +288,22 @@ class HeartbeatProcessTest(unittest.TestCase):
         events = proc.execute("c1", "import time\ntime.sleep(0.6)")
         frames = heartbeats(events)
         self.assertGreaterEqual(len(frames), 2)
-        self.assertTrue(all(frame["id"] == "c1" for frame in frames))
+        # A tick that lands between the request's receipt (`_inflight.add` on the
+        # reader thread) and its activation (`_run_guarded` setting `_active["rid"]`
+        # on the loop thread) builds an id-less frame by contract: the runtime
+        # deliberately attributes nothing to a request it has not started serving
+        # (pinned by HeartbeatGateTest.test_no_frame_while_the_kernel_is_idle), and
+        # the host accepts id:null with cellId read as "absent when it reported
+        # none". On a loaded CI runner that dispatch window can span an interval, so
+        # the strict all-c1 claim flakes there. The ordering claim below keeps the
+        # same teeth on the contract's actual shape: un-attributed frames are only
+        # the queued prefix, every frame after activation names the request, and a
+        # run that never attributes (or loses attribution mid-request) still fails.
+        ids = [frame["id"] for frame in frames]
+        first_c1 = ids.index("c1") if "c1" in ids else len(ids)
+        self.assertTrue(all(frame["id"] is None for frame in frames[:first_c1]))
+        self.assertTrue(all(frame["id"] == "c1" for frame in frames[first_c1:]))
+        self.assertLess(first_c1, len(frames))
         # And the kernel goes quiet again once the cell is done. A frame built microseconds
         # before the finish may still land after `done`; what must not happen is the idle
         # kernel keeping up a 10Hz stream (four intervals pass in this window).
