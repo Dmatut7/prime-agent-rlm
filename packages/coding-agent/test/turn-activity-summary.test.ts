@@ -185,6 +185,41 @@ describe("turn activity summary (U4)", () => {
 		const thinkingExpanded = renderAllWith(messages, { toolsExpanded: true, thinkingExpanded: true });
 		expect(thinkingExpanded).toContain("weigh the options");
 	});
+	it("keeps mid-turn assistant text in place - it is content, not noise (K3 ①)", () => {
+		// A real long turn interleaves thinking, tools, and assistant prose; the
+		// collapsed surface hides only thinking rows, never the prose between
+		// tools.
+		const messages: AgentMessage[] = [
+			{ role: "user", content: "fix the CI reds", timestamp: 900 },
+			assistant(
+				[
+					{ type: "thinking", thinking: "Reproduce the failure first." },
+					{ type: "toolCall", id: "py-1", name: "ipython", arguments: { code: "check(1)" } },
+				],
+				1_000,
+			),
+			toolResult("py-1", "ipython", "red: 3 failures", 1_100),
+			assistant([{ type: "text", text: "红了，三个断言的 pin 需要贴契约改。先改第一个。" }], 1_200),
+			assistant(
+				[
+					{ type: "thinking", thinking: "The second red comes from the queue prefix." },
+					{ type: "toolCall", id: "py-2", name: "ipython", arguments: { code: "check(2)" } },
+				],
+				1_300,
+			),
+			toolResult("py-2", "ipython", "green", 1_400),
+			assistant([{ type: "text", text: "改 pin 让断言贴合真实契约，最后全绿。" }], 1_500),
+		];
+		const collapsed = renderAll(messages, false);
+		const nonEmpty = collapsed.split("\n").filter((line) => line.trim().length > 0);
+		expect(nonEmpty[1]).toBe(" 思考 2 段");
+		expect(nonEmpty[2]).toBe(" ⚙ 2 步 · 0.4s · python×2");
+		// The mid-turn prose renders in place, between the mechanical lines and
+		// the final answer - K3 ①: content is never collapsed away.
+		expect(collapsed).toContain("红了，三个断言的 pin 需要贴契约改。先改第一个。");
+		expect(collapsed).toContain("改 pin 让断言贴合真实契约，最后全绿。");
+	});
+
 	it("renders a thinking-only turn as one 思考 line and freezes its clock at the boundary", () => {
 		const messages: AgentMessage[] = [
 			{ role: "user", content: "just think", timestamp: 900 },
