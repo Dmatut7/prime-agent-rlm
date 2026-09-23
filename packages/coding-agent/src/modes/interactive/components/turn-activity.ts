@@ -296,10 +296,17 @@ export class TurnSummaryComponent implements Component {
 			cols: safeWidth,
 		});
 		const steps = new Set(this.turnState.steps.map((step) => step.toolCallId)).size;
+		const thinkSegments = this.turnState.totalThinkingSegments;
+		const commMessages = this.commMessages;
+		// R5-P2③: an all-zero turn still renders 想了想 - the model is always
+		// reasoning, so a turn with no explicit thinking block counts as one
+		// thought. The footnote component stays a pure props renderer; this
+		// policy belongs to the wiring.
+		const effectiveThinkSegments = steps === 0 && commMessages === 0 && thinkSegments === 0 ? 1 : thinkSegments;
 		this.footnote.update({
 			steps,
-			thinkSegments: this.turnState.totalThinkingSegments,
-			commMessages: this.commMessages,
+			thinkSegments: effectiveThinkSegments,
+			commMessages,
 			durationMs: this.turnState.turnDurationMs(),
 			cols: safeWidth,
 		});

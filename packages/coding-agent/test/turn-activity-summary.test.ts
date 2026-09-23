@@ -429,8 +429,24 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 		// The empty-state turn: only 想了想, no counts, no keys, no duration.
 		expect(nonEmpty[1]).toBe("想了想");
 		expect(collapsed).toContain("Concluded.");
-		// A turn with neither steps, thinking, nor comms renders no footnote.
-		expect(collapsed.split("\n").filter((line) => line.includes("想了想"))).toHaveLength(1);
+		// R5-P2③: the thinking-less turn renders 想了想 too - the model is
+		// always reasoning, so every turn carries the footnote.
+		expect(collapsed.split("\n").filter((line) => line.includes("想了想"))).toHaveLength(2);
+	});
+
+	it("renders 想了想 for an all-zero turn (R5-P2③: every turn carries the footnote)", () => {
+		const state = new TurnActivityState(1_000);
+		state.markTurnEnded(1_500);
+		const summary = new TurnSummaryComponent(state);
+		summary.setQuiet(true);
+		// No steps, no thinking, no comms: still one 想了想 line, not nothing.
+		const line = summary
+			.render(120)
+			.join("\n")
+			.replace(/\u001b\[[0-9;]*m/g, "");
+		expect(line).toContain("想了想");
+		expect(line).not.toContain("步");
+		expect(line).not.toContain("[");
 	});
 
 	it("counts comms from received agent rows plus sent agent messages in tool details", () => {
