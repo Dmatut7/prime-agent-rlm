@@ -78,7 +78,11 @@ describe("assistant Markdown file links", () => {
 			const mode = Object.assign(Object.create(InteractiveMode.prototype), {
 				chatContainer,
 				connectionState: { cwd },
-				uiServices: { getInitialCwd: () => resolve("/tmp/different-launch-directory") },
+				// TUI v4: both render paths read the process mode off the settings manager.
+				uiServices: {
+					getInitialCwd: () => resolve("/tmp/different-launch-directory"),
+					settingsManager: { getProcessMode: () => "quiet" },
+				},
 				getMarkdownThemeWithSettings: getMarkdownTheme,
 			}) as {
 				addMessageToChat(message: AssistantMessage): void;

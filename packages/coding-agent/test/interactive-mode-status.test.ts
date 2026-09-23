@@ -4763,6 +4763,8 @@ describe("InteractiveMode.setToolsExpanded", () => {
 			hideThinkingBlock: false,
 			hiddenThinkingLabel: "思考",
 			mermaidMarkdownTransform: undefined,
+			// TUI v4: addMessageToChat reads the process mode off the settings manager.
+			uiServices: { settingsManager: { getProcessMode: () => "quiet" } },
 			getMarkdownThemeWithSettings: () => undefined,
 			getCurrentCwd: () => "/tmp",
 		});

@@ -388,6 +388,8 @@ describe("ENG-4531 agent message UI", () => {
 		const mode = {
 			chatContainer,
 			toolOutputExpanded: false,
+			// TUI v4: addMessageToChat reads the process mode off the settings manager.
+			uiServices: { settingsManager: { getProcessMode: () => "quiet" } },
 			getCurrentCwd: () => "/tmp",
 			getMarkdownThemeWithSettings: () => undefined,
 		};

@@ -25,6 +25,13 @@ export interface AssistantMessageComponentOptions {
 	precededByToolActivity?: boolean;
 	/** Replaces Mermaid code blocks in assistant text (never thinking) with Unicode diagrams. */
 	mermaidTransform?: MermaidMarkdownTransform;
+	/**
+	 * TUI v4 quiet conversation: fold this message's text when it carries tool
+	 * calls (intermediate narration - "先说再做" preamble), because the turn
+	 * footnote carries the process surface instead. The turn's final output
+	 * (no tool calls) always renders in full.
+	 */
+	quiet?: boolean;
 }
 
 function getThinkingMarkdownTheme(baseTheme: MarkdownTheme): MarkdownTheme {
@@ -79,6 +86,8 @@ export class AssistantMessageComponent extends Container {
 	private blockMarkdowns = new Map<number, Markdown>();
 	private lastBlockTexts = new Map<number, string>();
 	private precededByToolActivity: boolean;
+	/** TUI v4 quiet-conversation gate; see {@link AssistantMessageComponentOptions.quiet}. */
+	private quiet = false;
 	private mermaidTransform?: MermaidMarkdownTransform;
 	private baseUrl?: string;
 	private isStreaming = false;
@@ -100,6 +109,7 @@ export class AssistantMessageComponent extends Container {
 		this.expanded = options.expanded ?? false;
 		this.thinkingExpanded = options.thinkingExpanded ?? false;
 		this.precededByToolActivity = options.precededByToolActivity ?? false;
+		this.quiet = options.quiet ?? false;
 		this.mermaidTransform = options.mermaidTransform;
 		this.baseUrl = options.cwd ? pathToFileURL(`${resolve(options.cwd)}${sep}`).href : undefined;
 
@@ -199,6 +209,8 @@ export class AssistantMessageComponent extends Container {
 			`label:${this.hiddenThinkingLabel}`,
 			`expanded:${this.expanded}`,
 			`thinkingExpanded:${this.thinkingExpanded}`,
+			// TUI v4: a quiet-mode flip must rebuild so the narration fold applies.
+			`quiet:${this.quiet}`,
 			// In the signature so the streaming->final transition rebuilds (mermaid renders differently).
 			`streaming:${this.isStreaming}`,
 			`stop:${message.stopReason ?? ""}`,
@@ -247,17 +259,26 @@ export class AssistantMessageComponent extends Container {
 		// hideThinkingBlock wins), so they must not earn a Spacer either. The
 		// old count left a 2-blank-line wall behind every "thinking + toolCall"
 		// message in the default collapsed view.
+		const hasToolCalls = message.content.some((c) => c?.type === "toolCall");
+		this.hasToolCalls = hasToolCalls;
+		// TUI v4 quiet gate: a message that carries tool calls is intermediate
+		// narration; quiet mode folds its text into the turn stats (the
+		// footnote owns the process surface). The turn's final output (no
+		// tool calls) and every error surface still render in full.
+		const foldsNarration = this.quiet && hasToolCalls;
 		const rendersThinking = (c: AssistantMessage["content"][number]) =>
 			c?.type === "thinking" && c.thinking.trim() && !this.hideThinkingBlock && this.thinkingExpanded;
 		const hasVisibleContent =
 			message.content.some(
-				(c) => (c?.type === "text" && c.text.trim()) || (c?.type === "thinking" && rendersThinking(c)),
+				(c) =>
+					(c?.type === "text" && c.text.trim() && !foldsNarration) ||
+					(c?.type === "thinking" && rendersThinking(c)),
 			) ||
 			// The error surfaces render in both lanes (aborted, or a
 			// non-tool-call error); toolCall blocks render as separate
 			// components, not here.
 			message.stopReason === "aborted" ||
-			(message.stopReason === "error" && !message.content.some((c) => c?.type === "toolCall"));
+			(message.stopReason === "error" && !hasToolCalls);
 
 		if (hasVisibleContent) {
 			this.contentContainer.addChild(new Spacer(1));
@@ -266,7 +287,7 @@ export class AssistantMessageComponent extends Container {
 		// Render content in order
 		for (let i = 0; i < message.content.length; i++) {
 			const content = message.content[i];
-			if (content?.type === "text" && content.text.trim()) {
+			if (content?.type === "text" && content.text.trim() && !foldsNarration) {
 				// Assistant text messages with no background - trim the text
 				// Set paddingY=0 to avoid extra spacing before tool executions
 				const mermaidTransform = this.mermaidTransform;
@@ -288,7 +309,11 @@ export class AssistantMessageComponent extends Container {
 				// that stays collapsed must not earn this one a spacer either.
 				const hasVisibleContentAfter = message.content
 					.slice(i + 1)
-					.some((c) => (c?.type === "text" && c.text.trim()) || (c?.type === "thinking" && rendersThinking(c)));
+					.some(
+						(c) =>
+							(c?.type === "text" && c.text.trim() && !foldsNarration) ||
+							(c?.type === "thinking" && rendersThinking(c)),
+					);
 
 				const thinkingLabel = theme.bold(theme.fg("thinkingText", this.hiddenThinkingLabel));
 				if (this.hideThinkingBlock) {
@@ -320,8 +345,6 @@ export class AssistantMessageComponent extends Container {
 			}
 		}
 
-		const hasToolCalls = message.content.some((c) => c?.type === "toolCall");
-		this.hasToolCalls = hasToolCalls;
 		if (message.stopReason === "aborted") {
 			const abortMessage =
 				message.errorMessage && message.errorMessage !== "Request was aborted"
@@ -335,7 +358,13 @@ export class AssistantMessageComponent extends Container {
 			this.contentContainer.addChild(this.createErrorComponent(errorMsg, "Error"));
 		}
 
-		if (hasToolCalls && (hasVisibleContent || message.stopReason === "aborted" || !this.precededByToolActivity)) {
+		// A fully folded narration message renders no lines at all, so it must
+		// not earn this trailing Spacer either (the leading-separation clause
+		// only fires while the message still has a visible face).
+		if (
+			hasToolCalls &&
+			(hasVisibleContent || message.stopReason === "aborted" || (!this.precededByToolActivity && !foldsNarration))
+		) {
 			this.contentContainer.addChild(new Spacer(1));
 		}
 	}

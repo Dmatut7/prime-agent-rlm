@@ -6554,6 +6554,8 @@ export class InteractiveMode {
 					this.chatContainer.children.at(-1) instanceof AgentMessageComponent,
 				mermaidTransform: this.mermaidMarkdownTransform,
 				cwd: this.getCurrentCwd(),
+				// TUI v4: quiet folds live intermediate narration into the turn stats.
+				quiet: this.settingsManager.getProcessMode() === "quiet",
 			},
 		);
 		this.streamingMessage = message;
@@ -7461,6 +7463,8 @@ export class InteractiveMode {
 							this.chatContainer.children.at(-1) instanceof AgentMessageComponent,
 						mermaidTransform: this.mermaidMarkdownTransform,
 						cwd: this.getCurrentCwd(),
+						// TUI v4: the replay path folds intermediate narration in quiet mode.
+						quiet: this.settingsManager.getProcessMode() === "quiet",
 					},
 				);
 				this.chatContainer.addChild(assistantComponent);

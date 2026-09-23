@@ -34,7 +34,7 @@ const EMPTY_USAGE: Usage = {
 
 type HandleEventThis = {
 	isInitialized: boolean;
-	settingsManager: { getShowTerminalProgress(): boolean };
+	settingsManager: { getShowTerminalProgress(): boolean; getProcessMode(): "quiet" | "legacy" };
 	connectionState: { isStreaming: boolean };
 	toolOutputExpanded: boolean;
 	footer: { invalidate(): void };
@@ -83,7 +83,7 @@ type HandleSubagentSummaryChatAction = (
 function createFakeInteractiveModeThis(): HandleEventThis {
 	const fakeThis = {
 		isInitialized: true,
-		settingsManager: { getShowTerminalProgress: () => false },
+		settingsManager: { getShowTerminalProgress: () => false, getProcessMode: () => "quiet" as const },
 		// message_end/agent_end feed the subagent spend cell; with zero children the
 		// schedule path clears the cell and never arms a timer.
 		subagentCounts: { total: 0, running: 0, idle: 0, inactive: 0 } satisfies SubagentSummaryCounts,

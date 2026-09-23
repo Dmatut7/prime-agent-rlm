@@ -11,6 +11,7 @@ import {
 	SESSION_SLASH_COMMAND_CUSTOM_TYPE,
 	SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
 } from "../../../core/messages.js";
+import type { ProcessModeSetting } from "../../../core/settings-manager.js";
 import { AgentMessageComponent } from "./agent-message.js";
 import { AssistantMessageComponent } from "./assistant-message.js";
 import { BashExecutionComponent } from "./bash-execution.js";
@@ -48,6 +49,8 @@ export interface ConversationComponentsOptions {
 	agentMessagesExpanded?: boolean;
 	editDiffsExpanded?: boolean;
 	isRecognizedSlashCommand?: (name: string) => boolean;
+	/** TUI v4: quiet folds intermediate narration behind the turn footnote; legacy keeps the old face. */
+	processMode?: ProcessModeSetting;
 }
 
 export function isCompactAgentMessageNeighbor(component: Component | undefined): boolean {
@@ -130,6 +133,8 @@ export function buildConversationComponents(
 						precededByToolActivity:
 							components.at(-1) instanceof ToolExecutionComponent ||
 							components.at(-1) instanceof AgentMessageComponent,
+						// TUI v4: the same quiet gate covers the test builder path.
+						quiet: options.processMode === "quiet",
 					},
 				),
 			);
