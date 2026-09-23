@@ -119,6 +119,7 @@ export function buildConversationComponents(
 			// or thinking to aggregate.
 			const state = ensureTurn(Number(message.timestamp) || Date.now());
 			state.addThinkingSegments(countThinkingSegments(message));
+			state.latestThinking = latestThinkingText(message) || state.latestThinking;
 			if (!turnSummary) {
 				turnSummary = new TurnSummaryComponent(state);
 				turnSummary.setExpanded(expanded);
@@ -131,7 +132,7 @@ export function buildConversationComponents(
 					message,
 					options.hideThinkingBlock ?? false,
 					options.markdownTheme,
-					options.hiddenThinkingLabel ?? "思考",
+					options.hiddenThinkingLabel ?? "Thinking",
 					{
 						cwd: options.cwd,
 						expanded,
@@ -264,6 +265,16 @@ export function buildConversationComponents(
 	// message so a thinking-only line stops ticking.
 	turnState?.markTurnEnded(Number(messages.at(-1)?.timestamp) || Date.now());
 	return components;
+}
+
+/** The last non-empty thinking trace of one assistant message, or "". */
+export function latestThinkingText(message: { content: ReadonlyArray<{ type: string; thinking?: string }> }): string {
+	for (let index = message.content.length - 1; index >= 0; index--) {
+		const block = message.content[index];
+		const text = block?.type === "thinking" ? (block.thinking ?? "").trim() : "";
+		if (text) return text;
+	}
+	return "";
 }
 
 /** Non-empty thinking blocks of one assistant message (U6 segment counting). */

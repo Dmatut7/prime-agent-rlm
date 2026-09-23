@@ -9,9 +9,11 @@ import type { AgentConnectionRlmChildAgentSnapshot } from "../src/modes/agent-co
 import { buildAgentsViewRows, collectSubagentDescendantSummaries } from "../src/modes/agents-view/agents-view-state.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import {
+	buildSubagentPanelRows,
 	collectSubtreeSubagentSnapshots,
 	countRosterSubagentStatuses,
 	countSubtreeSubagentStatuses,
+	formatSubagentElapsed,
 	type SubagentSpendSummary,
 	SubagentSummaryLine,
 	summarizeSubagentSpend,
@@ -306,7 +308,20 @@ describe("SubagentSummaryLine", () => {
 
 		const rendered = stripAnsi(line.render(160).join("\n"));
 		expect(rendered).toContain("运行 2");
-		expect(rendered).toContain("grandchild: stalled 90s, in-flight: bash");
+		// The stalled grandchild gets its own row, marked 卡住 in the error color.
+		const row = rendered.split("\n").find((text) => text.includes("grandchild"));
+		expect(row).toContain("✗");
+		expect(row).toContain("卡住");
+	});
+
+	it("keeps the stall marker of a stalled session that has no row of its own", () => {
+		const line = new SubagentSummaryLine();
+		line.setSubagentCounts({ total: 2, running: 2, idle: 0, inactive: 0 });
+		line.setSubagentRows([{ id: "w", name: "worker", state: "running" }]);
+		line.setStallMarkers(["worker: stalled 70s", "roster-only: stalled 90s, in-flight: bash"]);
+		const rendered = stripAnsi(line.render(160).join("\n"));
+		expect(rendered).toContain("roster-only: stalled 90s, in-flight: bash");
+		expect(rendered).not.toContain("worker: stalled 70s");
 	});
 
 	it("clears a resident session id when a terminal update reports an evicted child", () => {
@@ -645,7 +660,7 @@ describe("subagent spend cell", () => {
 		line.setSubagentSpend(spend({ cost: 4.56, tokens: 12_300_000, parentCost: 0.54 }));
 
 		const body = stripAnsi(line.render(120)[0]);
-		expect(body).toContain("子代理 ¥4.56 · 12M tok ｜ 全部 ¥5.10");
+		expect(body).toContain("¥4.56 · 12M tok ｜ 全部 ¥5.10");
 		expect(body).toContain("运行 1 · 空闲 1");
 	});
 
@@ -658,7 +673,7 @@ describe("subagent spend cell", () => {
 		// An all-unpriced family: tokens plus the warning, no ¥0.00 figure.
 		line.setSubagentSpend(spend({ tokens: 8_100_000, unpriced: [{ model: "kimi-k3", tokens: 8_100_000 }] }));
 		const body = stripAnsi(line.render(120)[0]);
-		expect(body).toContain("子代理 8.1M tok (kimi-k3 8.1M tok 未定价)");
+		expect(body).toContain("8.1M tok (kimi-k3 8.1M tok 未定价)");
 		expect(body).not.toContain("¥");
 	});
 
@@ -675,7 +690,7 @@ describe("subagent spend cell", () => {
 			}),
 		);
 		const body = stripAnsi(line.render(120)[0]);
-		expect(body).toContain("子代理 ≈¥4.56 · ≈12M tok ｜ 全部 ≈¥5.10");
+		expect(body).toContain("≈¥4.56 · ≈12M tok ｜ 全部 ≈¥5.10");
 		const raw = line.render(120)[0];
 		expect(raw).toContain(theme.fg("warning", "(kimi-k3 8.1M tok 未定价)"));
 		expect(raw).toContain(theme.fg("accent", "¥4.56"));
@@ -694,27 +709,27 @@ describe("subagent spend cell", () => {
 		);
 		line.setOpenable(true);
 
-		// 120: everything fits.
-		const wide = stripAnsi(line.render(120)[0]);
-		expect(wide).toContain("子代理 ¥4.56 · 12M tok ｜ 全部 ¥5.10 (kimi-k3 8.1M tok 未定价)");
-		// 90: the 全部 figure is the first cut.
-		const medium = stripAnsi(line.render(90)[0]);
-		expect(medium).toContain("子代理 ¥4.56 · 12M tok");
+		// 110: everything fits.
+		const wide = stripAnsi(line.render(110)[0]);
+		expect(wide).toContain("¥4.56 · 12M tok ｜ 全部 ¥5.10 (kimi-k3 8.1M tok 未定价)");
+		// 95: the 全部 figure is the first cut.
+		const medium = stripAnsi(line.render(95)[0]);
+		expect(medium).toContain("¥4.56 · 12M tok");
 		expect(medium).not.toContain("全部 ¥");
 		expect(medium).toContain("(kimi-k3 8.1M tok 未定价)");
-		// 80: then the annotation's token counts.
-		const annotationlessTokens = stripAnsi(line.render(80)[0]);
+		// 85: then the annotation's token counts.
+		const annotationlessTokens = stripAnsi(line.render(85)[0]);
 		expect(annotationlessTokens).toContain("(kimi-k3 未定价)");
 		expect(annotationlessTokens).not.toContain("8.1M");
 		// 70: annotation gone, primary survives.
 		const narrow = stripAnsi(line.render(70)[0]);
-		expect(narrow).toContain("子代理 ¥4.56 · 12M tok");
+		expect(narrow).toContain("¥4.56 · 12M tok");
 		expect(narrow).not.toContain("未定价");
 		// 55: with three count groups there is no room; the cell is dropped, never half-truncated.
 		const tight = stripAnsi(line.render(55)[0]);
 		expect(tight).not.toContain("¥");
 		expect(tight).toContain("↓ 选择");
-		for (const width of [120, 90, 70, 55]) {
+		for (const width of [110, 95, 85, 70, 55]) {
 			const body = stripAnsi(line.render(width)[0]);
 			expect(body).toContain("↓ 选择");
 			expect(visibleWidth(line.render(width)[0])).toBeLessThanOrEqual(width);
@@ -756,7 +771,7 @@ describe("subagent spend cell", () => {
 		// the spend segment emits, which never clear the background).
 		const selectedBg = theme.bg("selectedBg", "");
 		expect(content).toContain(selectedBg.slice(0, selectedBg.indexOf("\x1b[49m")));
-		expect(stripAnsi(content)).toContain("子代理 ¥4.56 · 12M tok ｜ 全部 ¥5.10");
+		expect(stripAnsi(content)).toContain("¥4.56 · 12M tok ｜ 全部 ¥5.10");
 	});
 
 	/**
@@ -1156,16 +1171,128 @@ describe("spend price overrides", () => {
 		);
 
 		const wide = stripAnsi(line.render(120)[0]);
-		expect(wide).toContain("子代理 ¥9.00 · 2.0M tok ｜ 全部 ¥9.00 (kimi-k3 2.0M tok 已改价)");
+		expect(wide).toContain("¥9.00 · 2.0M tok ｜ 全部 ¥9.00 (kimi-k3 2.0M tok 已改价)");
 		expect(line.render(120)[0]).toContain(theme.fg("accent", "(kimi-k3 2.0M tok 已改价)"));
 
 		// The marker degrades with the rest of the annotation, and a truncated money
 		// figure is never shown: the cell drops whole rungs, it does not ellipsize.
 		const narrow = stripAnsi(line.render(50)[0]);
-		expect(narrow).toContain("子代理 ¥9.00 · 2.0M tok");
+		expect(narrow).toContain("¥9.00 · 2.0M tok");
 		expect(narrow).not.toContain("已改价");
 		for (const width of [120, 100, 80, 70, 60, 50]) {
 			expect(visibleWidth(line.render(width)[0])).toBeLessThanOrEqual(width);
 		}
+	});
+});
+
+describe("subagent panel rows (design board 06)", () => {
+	beforeAll(() => {
+		initTheme("dark");
+		setKeybindings(new KeybindingsManager());
+	});
+
+	const rows = [
+		{ id: "a", name: "review", state: "running" as const, elapsedMs: 134_000, activity: "读取 footer.ts" },
+		{ id: "b", name: "docs", state: "running" as const, elapsedMs: 41_000, activity: "编辑 FORK_NOTES.md" },
+		{ id: "c", name: "lint", state: "done" as const, elapsedMs: 62_000, activity: "无问题" },
+	];
+
+	function panel(): SubagentSummaryLine {
+		const line = new SubagentSummaryLine();
+		line.setSubagentCounts({ total: 3, running: 2, idle: 0, inactive: 1 });
+		line.setSubagentRows(rows);
+		line.setOpenable(true);
+		return line;
+	}
+
+	it("renders a rule header then one row per child with state glyph, name column, state and activity", () => {
+		const lines = panel().render(100).map(stripAnsi);
+		expect(lines).toHaveLength(4);
+		expect(lines[0]).toMatch(/^ 子代理 3 {2}运行 2 · 收口 1 ─+ ↓ 选择 ─ *$/);
+		expect(lines[1]).toBe("   ● review   运行 2:14    读取 footer.ts");
+		expect(lines[2]).toBe("   ● docs     运行 0:41    编辑 FORK_NOTES.md");
+		expect(lines[3]).toBe("   ✓ lint     完成 1:02    无问题");
+	});
+
+	it("moves a › selector over the rows while focused and shows the row action", () => {
+		const line = panel();
+		line.focused = true;
+		let lines = line.render(100).map(stripAnsi);
+		expect(lines[1]?.startsWith(" › ● review")).toBe(true);
+		expect(lines[1]?.trimEnd().endsWith("Enter 打开")).toBe(true);
+		expect(lines[0]).not.toContain("选择");
+		line.handleInput("\x1b[B");
+		lines = line.render(100).map(stripAnsi);
+		expect(lines[1]?.startsWith("   ● review")).toBe(true);
+		expect(lines[2]?.startsWith(" › ● docs")).toBe(true);
+		const onCancel = vi.fn();
+		line.onCancel = onCancel;
+		line.handleInput("\x1b[A");
+		expect(onCancel).not.toHaveBeenCalled();
+		expect(stripAnsi(line.render(100)[1] ?? "").startsWith(" › ● review")).toBe(true);
+		line.handleInput("\x1b[A");
+		expect(onCancel).toHaveBeenCalledTimes(1);
+	});
+
+	it("folds rows past four into a count row and drops stall marker lines while rows carry the state", () => {
+		const line = new SubagentSummaryLine();
+		line.setSubagentCounts({ total: 6, running: 6, idle: 0, inactive: 0 });
+		line.setSubagentRows(
+			Array.from({ length: 6 }, (_, index) => ({ id: `c${index}`, name: `w${index}`, state: "running" as const })),
+		);
+		line.setStallMarkers(["w0: stalled 30s"]);
+		const lines = line.render(80).map(stripAnsi);
+		expect(lines).toHaveLength(6);
+		expect(lines[5]).toBe("   … 还有 2 个");
+		expect(lines.join("\n")).not.toContain("⚠");
+	});
+
+	it("never exceeds the width and drops the activity column before anything else", () => {
+		const line = panel();
+		line.focused = true;
+		for (const width of [100, 60, 40, 28, 20, 12, 6]) {
+			for (const rendered of line.render(width)) {
+				expect(visibleWidth(rendered)).toBeLessThanOrEqual(width);
+			}
+		}
+		const narrow = line.render(28).map(stripAnsi);
+		expect(narrow[2]).toContain("docs");
+		expect(narrow[2]).not.toContain("FORK");
+	});
+
+	it("builds rows from snapshots, most relevant first, with Chinese states", () => {
+		const built = buildSubagentPanelRows(
+			[
+				child("done-1", "done", { sessionName: "lint", durationMs: 62_000, answerPreview: "无问题\nmore" }),
+				child("run-1", "running", {
+					sessionName: "review",
+					durationMs: 5_000,
+					activity: { kind: "executing", toolName: "ipython" },
+				}),
+				child("err-1", "error", { sessionName: "broken", error: "boom\ntrace" }),
+				child("stall-1", "running", {
+					sessionName: "stuck",
+					activity: { kind: "stalled" },
+					stall: { silentMs: 95_000, thresholdMs: 60_000, inFlightTools: ["ipython"] },
+				}),
+			],
+			undefined,
+		);
+		expect(built.map((row) => [row.name, row.state])).toEqual([
+			["stuck", "stalled"],
+			["broken", "failed"],
+			["review", "running"],
+			["lint", "done"],
+		]);
+		expect(built[0]?.activity).toBe("95s 没有动静 · 在跑 ipython");
+		expect(built[1]?.activity).toBe("boom");
+		expect(built[2]?.activity).toBe("执行 ipython");
+		expect(built[3]?.activity).toBe("无问题");
+	});
+
+	it("formats elapsed time as m:ss and h:mm:ss", () => {
+		expect(formatSubagentElapsed(41_000)).toBe("0:41");
+		expect(formatSubagentElapsed(134_000)).toBe("2:14");
+		expect(formatSubagentElapsed(3_723_000)).toBe("1:02:03");
 	});
 });

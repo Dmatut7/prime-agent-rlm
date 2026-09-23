@@ -103,7 +103,7 @@ export async function checkTmuxKeyboardSetup(): Promise<string | undefined> {
 	if (extendedKeys === undefined) return undefined;
 
 	if (extendedKeys !== "on" && extendedKeys !== "always") {
-		return "tmux 没开 extended-keys，Shift+Enter 换行可能不灵。在 ~/.tmux.conf 加一行 `set -g extended-keys on` 再重启 tmux。";
+		return "tmux 未开启 extended-keys，Shift+Enter 换行可能失效 · 修复：~/.tmux.conf 加 `set -g extended-keys on` 后重启 tmux";
 	}
 
 	if (extendedKeysFormat === "xterm") {

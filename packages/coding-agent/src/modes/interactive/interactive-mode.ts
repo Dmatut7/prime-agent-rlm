@@ -60,6 +60,7 @@ import {
 	getAgentTracesLogPath,
 	getDebugLogPath,
 	getLogsDir,
+	getSessionsDir,
 	getShareViewerUrl,
 	SELF_UPDATE_INTERACTIVE_CHILD_ENV,
 	SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE,
@@ -208,7 +209,11 @@ import {
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.js";
 import { ConfigurationMenuComponent, type ConfigurationMenuTab } from "./components/configuration-menu.js";
 import { formatContextTree } from "./components/context-tree-format.js";
-import { countThinkingSegments, isCompactAgentMessageNeighbor } from "./components/conversation-components.js";
+import {
+	countThinkingSegments,
+	isCompactAgentMessageNeighbor,
+	latestThinkingText,
+} from "./components/conversation-components.js";
 import { CountdownTimer } from "./components/countdown-timer.js";
 import { CustomEditor } from "./components/custom-editor.js";
 import { CustomMessageComponent } from "./components/custom-message.js";
@@ -254,6 +259,7 @@ import {
 } from "./components/slash-command-message.js";
 import { SlashCommandResultMessageComponent } from "./components/slash-command-result-message.js";
 import {
+	buildSubagentPanelRows,
 	collectSubtreeSubagentSnapshots,
 	countRosterSubagentStatuses,
 	countSubtreeSubagentStatuses,
@@ -302,6 +308,7 @@ import {
 } from "./onboarding.js";
 import type { ClientPromptStashStore, PromptStash, PromptStashState } from "./prompt-stash-state.js";
 import { QueueSelection, type QueueSelectionItem } from "./queue-selection.js";
+import { findRecentSession, formatAgo, type RecentSession } from "./recent-session.js";
 import { formatResumeHint } from "./resume-hint.js";
 import {
 	getAvailableThemes,
@@ -319,7 +326,12 @@ import {
 	type ThemeColor,
 	theme,
 } from "./theme/theme.js";
-import { setWorkingPulseFrame, WORKING_ICON_INTERVAL_MS } from "./theme/working-icon.js";
+import {
+	getWorkingPulseFrame,
+	setWorkingPulseFrame,
+	WORKING_ICON_INTERVAL_MS,
+	workingIconFrame,
+} from "./theme/working-icon.js";
 
 interface Expandable {
 	setExpanded(expanded: boolean): void;
@@ -392,6 +404,9 @@ interface SharedContextTree {
 	tree: ContextTreeNode | undefined;
 	promise: Promise<ContextTreeNode> | undefined;
 }
+
+/** The prompt's placeholder while a turn runs: Enter steers the running turn. */
+const WORKING_PROMPT_PLACEHOLDER = "随时补充或纠正，Enter 立即告诉 AI";
 
 export const START_HINTS = [
 	"描述任务，@ 引用文件，/ 看命令",
@@ -1176,6 +1191,7 @@ export class InteractiveMode {
 	private agentsViewRequest: InteractiveModeRunResult["type"] | undefined;
 	private loadingAnimation: Loader | undefined = undefined;
 	private workingMessage: string | undefined = undefined;
+	private recentSession: RecentSession | undefined;
 	private workingVisible = true;
 	private workingIndicatorOptions: LoaderIndicatorOptions | undefined = undefined;
 	private workingStartedAt: number | undefined = undefined;
@@ -1198,7 +1214,7 @@ export class InteractiveMode {
 	private contextUsageTokenBaseline = 0;
 	// Refresh ordering: a stale failure must never clobber a newer success.
 	private contextUsageRefresh = { generation: 0, lastSuccessGeneration: 0 };
-	private readonly defaultHiddenThinkingLabel = "思考";
+	private readonly defaultHiddenThinkingLabel = "Thinking";
 	private hiddenThinkingLabel = this.defaultHiddenThinkingLabel;
 
 	private ctrlCExitHintExpiresAt = 0;
@@ -1512,6 +1528,17 @@ export class InteractiveMode {
 		// U6 评审②: the watermark pulls its mode and snapshot from the memoized
 		// source below - same frame, same value as the tray fallback.
 		this.footer.setTelemetrySource(() => this.getFooterTelemetrySource());
+		// The status line carries the run's liveness: `● 运行中 12s` (an
+		// extension's own working message wins over the plain label).
+		this.footer.setActivitySource(() => {
+			const started = this.workingStartedAt;
+			if (!this.loadingAnimation || started === undefined || this.settingsManager.getProcessMode() !== "quiet") {
+				return undefined;
+			}
+			const label = this.workingMessage ?? "运行中";
+			const spinner = theme.fg("accent", workingIconFrame(getWorkingPulseFrame()));
+			return `${spinner} ${theme.fg("muted", `${label} ${this.formatWorkingElapsed(Date.now() - started)}`)}`;
+		});
 		this.footer.setLocationSource(() => ({
 			cwd: this.getCurrentCwd(),
 			branch: this.footerDataProvider.getGitBranch(),
@@ -1794,9 +1821,11 @@ export class InteractiveMode {
 				verboseInstructions,
 				{
 					topPadding: true,
+					getExtraMetadata: () => this.getContinueMetadata(),
 				},
 			);
 			this.headerContainer.addChild(this.builtInHeader);
+			void this.loadRecentSession();
 			this.headerContainer.addChild(new Spacer(1));
 		} else {
 			// Quiet startup: skip the splash and surrounding padding entirely.
@@ -3843,13 +3872,19 @@ export class InteractiveMode {
 		this.stopWorkingLoader();
 		this.workingStartedAt = this.turnStartedAt ?? Date.now();
 		this.loadingAnimation = this.createWorkingLoader();
-		this.statusContainer.addChild(this.loadingAnimation);
+		// The quiet face shows the live activity in the status line instead of
+		// a row of its own in the conversation.
+		if (this.settingsManager.getProcessMode() !== "quiet") {
+			this.statusContainer.addChild(this.loadingAnimation);
+		}
 		this.startWorkingTimer();
 		this.startFeatureHintPresentation();
+		this.defaultEditor.setPlaceholder(WORKING_PROMPT_PLACEHOLDER);
 	}
 
 	private stopWorkingLoader(): void {
 		this.clearFeatureHintPresentation();
+		this.defaultEditor?.setPlaceholder(this.startHint);
 		if (this.workingTimer) {
 			clearInterval(this.workingTimer);
 			this.workingTimer = undefined;
@@ -6219,6 +6254,16 @@ export class InteractiveMode {
 					this.streamingMessage = event.message;
 					this.ensureAssistantStreamingComponent(event.message).updateContent(this.streamingMessage, true);
 					this.currentTurnState?.setLiveThinkingSegments(countThinkingSegments(event.message));
+					if (this.currentTurnState) {
+						const kind = event.assistantMessageEvent.type;
+						if (kind === "thinking_start" || kind === "thinking_delta") {
+							this.currentTurnState.noteThinking(true);
+						} else if (kind === "thinking_end" || kind === "text_start" || kind === "toolcall_start") {
+							this.currentTurnState.noteThinking(false);
+						}
+						this.currentTurnState.latestThinking =
+							latestThinkingText(event.message) || this.currentTurnState.latestThinking;
+					}
 
 					for (const content of this.streamingMessage.content) {
 						if (content.type === "toolCall") {
@@ -6239,6 +6284,7 @@ export class InteractiveMode {
 					if (this.currentTurnState) {
 						this.currentTurnState.addThinkingSegments(countThinkingSegments(event.message));
 						this.currentTurnState.setLiveThinkingSegments(0);
+						this.currentTurnState.noteThinking(false);
 					}
 					this.streamingMessage = event.message;
 					let errorMessage: string | undefined;
@@ -6822,6 +6868,7 @@ export class InteractiveMode {
 			if (marker) stallMarkers.push(`${child.sessionName ?? child.label}: ${marker}`);
 		}
 		this.subagentSummaryLine.setStallMarkers(stallMarkers);
+		this.subagentSummaryLine.setSubagentRows(buildSubagentPanelRows(this.subagentSnapshots.values(), this.rlmNodeId));
 		if (!this.subagentSummaryLine.isSelectable() && this.subagentSummaryLine.focused) this.focusEditor();
 	}
 
@@ -7162,16 +7209,38 @@ export class InteractiveMode {
 		};
 		const agentsBack = this.options.returnToAgentsView ? hint("app.agents.back", "会话列表") : undefined;
 		const hints = this.isAgentStreaming()
-			? [hint("app.input.clear", "中断"), hint("app.tools.expand", "过程"), hint("app.thinking.toggle", "思考")]
+			? [hint("app.input.clear", "中断"), hint("app.tools.expand", "过程"), hint("app.thinking.toggle", "Thinking")]
 			: !this.isNewChat()
 				? [
 						hint("app.tools.expand", "过程"),
-						hint("app.thinking.toggle", "思考"),
+						hint("app.thinking.toggle", "Thinking"),
 						agentsBack,
 						hint("app.shortcuts", "快捷键"),
 					]
 				: ["/ 命令", "@ 文件", agentsBack, hint("app.shortcuts", "快捷键")];
 		return hints.filter((entry): entry is string => entry !== undefined);
+	}
+
+	/** The splash's `继续` row: the last session in this directory, while the chat is still empty. */
+	private getContinueMetadata(): BrandSplashMetadataLine[] {
+		const recent = this.recentSession;
+		if (!recent || !this.isNewChat()) return [];
+		const open = this.options.returnToAgentsView ? keyText("app.agents.back", { primaryOnly: true }) : "";
+		const how = open ? `${open} 会话列表继续` : "prime-agent --resume 继续";
+		return [{ label: "继续", value: `「${recent.title}」 ${formatAgo(recent.modified)} · ${how}` }];
+	}
+
+	private async loadRecentSession(): Promise<void> {
+		try {
+			this.recentSession = await findRecentSession(
+				getSessionsDir(),
+				this.getCurrentCwd(),
+				this.connectionState?.sessionFile,
+			);
+			if (this.recentSession) this.ui.requestRender();
+		} catch {
+			// The row is optional; a scan failure leaves the splash as it was.
+		}
 	}
 
 	private isNewChat(): boolean {
@@ -7657,6 +7726,7 @@ export class InteractiveMode {
 					this.chatContainer.addChild(replayTurnSummary);
 				}
 				replayTurnState.addThinkingSegments(countThinkingSegments(message));
+				replayTurnState.latestThinking = latestThinkingText(message) || replayTurnState.latestThinking;
 				this.addMessageToChat(message);
 				// Render tool call components
 				for (const content of message.content) {
@@ -9031,7 +9101,7 @@ export class InteractiveMode {
 		// on guides the user to it instead of silently doing nothing (K3 ④).
 		// The plain key acts on the latest turn; Alt+T acts globally (K3 ②).
 		if (this.hideThinkingBlock) {
-			this.showStatus("思考 trace 被 hideThinkingBlock 设置隐藏：关闭该设置后 Ctrl+T 可展开");
+			this.showStatus("Thinking 已被 hideThinkingBlock 设置隐藏：关闭该设置后 Ctrl+T 可展开");
 			return;
 		}
 		if (!global) {
@@ -9046,14 +9116,14 @@ export class InteractiveMode {
 					this.forgetProcessBlock(summary, "thinking");
 				}
 				this.applyTurnExpansion(summary);
-				this.showStatus(`思考块: ${next ? "展开" : "收起"}${next ? "（最近一轮）" : ""}`);
+				this.showStatus(`Thinking: ${next ? "展开" : "收起"}${next ? "（最近一轮）" : ""}`);
 				return;
 			}
 		}
 		this.thinkingExpanded = !this.thinkingExpanded;
 		this.syncAllTurnLanes(this.thinkingExpanded, "thinking");
 		this.applyChatExpansion();
-		this.showStatus(`思考块: ${this.thinkingExpanded ? "全部展开" : "全部收起"}`);
+		this.showStatus(`Thinking: ${this.thinkingExpanded ? "全部展开" : "全部收起"}`);
 	}
 
 	private openExternalEditor(): void {

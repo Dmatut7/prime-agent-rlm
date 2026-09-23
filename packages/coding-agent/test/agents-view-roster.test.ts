@@ -361,6 +361,7 @@ describe("supervisor roster subscription", () => {
 				subagentSummaryLine: {
 					setSubagentCounts,
 					setStallMarkers,
+					setSubagentRows: vi.fn(),
 					// The spend cell is switched off for this fixture: it watches the counts.
 					setSubagentSpend: vi.fn(),
 					isSelectable: () => false,

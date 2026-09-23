@@ -290,11 +290,11 @@ describe("CustomEditor", () => {
 
 	it("embeds key hints at the right end of the top rule", () => {
 		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager());
-		editor.getBorderHints = () => ["Ctrl+O 过程", "Ctrl+T 思考"];
+		editor.getBorderHints = () => ["Ctrl+O 过程", "Ctrl+T Thinking"];
 		const [top, , bottom] = editor.render(40);
 
 		expect(top).toBe(
-			`${"─".repeat(40 - 2 - visibleWidth(" Ctrl+O 过程 · Ctrl+T 思考 "))} Ctrl+O 过程 · Ctrl+T 思考 ──`,
+			`${"─".repeat(40 - 2 - visibleWidth(" Ctrl+O 过程 · Ctrl+T Thinking "))} Ctrl+O 过程 · Ctrl+T Thinking ──`,
 		);
 		expect(visibleWidth(top ?? "")).toBe(40);
 		expect(bottom).toBe("─".repeat(40));
@@ -302,11 +302,11 @@ describe("CustomEditor", () => {
 
 	it("drops hints whole from the end when the rule is too narrow", () => {
 		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager());
-		editor.getBorderHints = () => ["Ctrl+O 过程", "Ctrl+T 思考", "? 快捷键"];
+		editor.getBorderHints = () => ["Ctrl+O 过程", "Ctrl+T Thinking", "? 快捷键"];
 
 		const narrow = editor.render(24)[0] ?? "";
 		expect(narrow).toContain(" Ctrl+O 过程 ");
-		expect(narrow).not.toContain("思考");
+		expect(narrow).not.toContain("Thinking");
 		expect(visibleWidth(narrow)).toBe(24);
 		expect(editor.render(10)[0]).toBe("─".repeat(10));
 	});

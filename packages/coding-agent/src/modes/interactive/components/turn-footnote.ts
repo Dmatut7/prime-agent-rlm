@@ -1,15 +1,22 @@
-import { type ClickRegion, type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import {
+	type ClickRegion,
+	type Component,
+	truncateToWidth,
+	visibleWidth,
+	wrapTextWithAnsi,
+} from "@earendil-works/pi-tui";
 import { theme } from "../theme/theme.js";
 import type { FileChangeSummary } from "./edit-summary.js";
+import { keyText } from "./keybinding-hints.js";
 
 /**
  * The per-turn process line: one line at the turn head that says what the
  * turn did, in plain words -
- * `▸ 思考 · 5 步 · 14.8s   运行 npm check · 写入 footer.ts` - followed, while
+ * `▸ Thinking 6.2s · 5 步 · 14.8s   运行 npm check · 写入 footer.ts` - followed, while
  * the process block is closed, by one row per changed file
  * (`   改动 src/footer.ts  +3 −5`), so edits stay visible without expanding.
  * Stats render muted, the plain-words summary dim; the summary drops first
- * when the line overflows. A thinking-only turn reads `▸ 思考 · 3.2s`; an
+ * when the line overflows. A thinking-only turn reads `▸ Thinking 3.2s`; an
  * all-zero turn renders nothing.
  */
 
@@ -18,6 +25,9 @@ export const TURN_FOOT_NOTE_CARETS = { collapsed: "▸", expanded: "▾" } as co
 
 /** Changed-file rows shown under a closed process line before the rest fold into one count row. */
 export const TURN_FOOT_NOTE_MAX_FILE_ROWS = 5;
+
+/** Rows the open process block gives the latest thinking trace. */
+const THINKING_PREVIEW_ROWS = 2;
 
 /** Narrowest room left for the plain-words summary before it drops entirely. */
 const SUMMARY_MIN_WIDTH = 12;
@@ -38,6 +48,10 @@ export interface TurnFootNoteProps {
 	summary?: string;
 	/** Files the turn changed, with display paths; rendered as rows under the line. */
 	fileChanges?: readonly FileChangeSummary[];
+	/** Measured thinking time; undefined when unknown (the `Thinking` segment then drops). */
+	thinkingMs?: number;
+	/** The latest thinking trace, shown as a two-row preview under the line while the block is open. */
+	thinkingPreview?: string;
 	/** The turn is still running: the line reads `进行中 · 第 N 步 · 9.4s` with an accent caret. */
 	running?: boolean;
 	/** Optional caret glyph (▸/▾) rendered in the line's indent column; the wiring owns the state. Default: none. */
@@ -164,7 +178,7 @@ export class TurnFootNote implements Component {
 			...this.caretRegions(caret),
 			...this.segmentRegions(this.segmentSpans(segments, budget), indentWidth),
 		];
-		return [styledIndent + line, ...this.fileChangeRows(cols)];
+		return [styledIndent + line, ...this.thinkingPreviewRows(cols), ...this.fileChangeRows(cols)];
 	}
 
 	private buildSegments(): FootNoteSegment[] {
@@ -178,8 +192,17 @@ export class TurnFootNote implements Component {
 			segments.push({ text: turnFootNoteDurationText(durationMs) });
 			return segments;
 		}
-		if (thinkSegments > 0) {
-			segments.push({ text: "思考", clickTarget: "think" });
+		const thinkingMs = this.props.thinkingMs;
+		if (steps <= 0 && commMessages <= 0) {
+			// An answer-only turn: its whole span is the model thinking and writing.
+			segments.push({
+				text: `Thinking ${turnFootNoteDurationText(thinkingMs ?? durationMs)}`,
+				clickTarget: "think",
+			});
+			return segments;
+		}
+		if (thinkSegments > 0 && thinkingMs !== undefined && thinkingMs >= 50) {
+			segments.push({ text: `Thinking ${turnFootNoteDurationText(thinkingMs)}`, clickTarget: "think" });
 		}
 		if (steps > 0) {
 			segments.push({ text: `${steps} 步`, clickTarget: "steps" });
@@ -189,6 +212,28 @@ export class TurnFootNote implements Component {
 			segments.push({ text: `通讯 ${commMessages} 条`, clickTarget: "comm" });
 		}
 		return segments;
+	}
+
+	private thinkingPreviewRows(cols: number): string[] {
+		const preview = this.props.thinkingPreview?.replace(/\s+/g, " ").trim();
+		if (!preview) {
+			return [];
+		}
+		const label = `   ${theme.fg("dim", "Thinking")}  `;
+		const indent = " ".repeat(visibleWidth(label));
+		const hint = keyText("app.thinking.toggle", { primaryOnly: true });
+		const hintText = hint ? `  ${hint} 全文` : "";
+		const width = Math.max(8, cols - visibleWidth(label) - visibleWidth(hintText));
+		const wrapped = wrapTextWithAnsi(preview, width);
+		const shown = wrapped.slice(0, THINKING_PREVIEW_ROWS);
+		if (wrapped.length > shown.length && shown.length > 0) {
+			shown[shown.length - 1] = truncateToWidth(`${shown.at(-1)}…`, width, "…");
+		}
+		return shown.map((row, index) => {
+			const body = theme.italic(theme.fg("dim", row));
+			const tail = index === shown.length - 1 ? theme.fg("dim", hintText) : "";
+			return truncateToWidth(`${index === 0 ? label : indent}${body}${tail}`, cols, "");
+		});
 	}
 
 	private fileChangeRows(cols: number): string[] {

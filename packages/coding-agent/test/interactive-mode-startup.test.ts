@@ -131,12 +131,12 @@ describe("InteractiveMode startup hints", () => {
 		updateConnectionStateFromEvent.call(mode, { type: "message_start", message });
 		Object.assign(mode.connectionState, { messageCount: 0, isStreaming: true });
 		// A running turn offers the interrupt, even before any message is committed.
-		expect(getHints()).toEqual(["Esc 中断", "Ctrl+O 过程", "Ctrl+T 思考"]);
+		expect(getHints()).toEqual(["Esc 中断", "Ctrl+O 过程", "Ctrl+T Thinking"]);
 
 		updateConnectionStateFromEvent.call(mode, { type: "message_end", message });
 		updateConnectionStateFromEvent.call(mode, { type: "agent_end", messages: [message] });
 		Object.assign(mode.connectionState, { messageCount: 1, isStreaming: false });
-		expect(getHints()).toEqual(["Ctrl+O 过程", "Ctrl+T 思考", "? 快捷键"]);
+		expect(getHints()).toEqual(["Ctrl+O 过程", "Ctrl+T Thinking", "? 快捷键"]);
 	});
 
 	it("routes session-view requests through the existing agents-view return path", async () => {
@@ -262,13 +262,13 @@ describe("InteractiveMode startup hints", () => {
 		const daemonChat = createMode(1, true, () => editorText);
 		const getHints = (mode: object) => Reflect.get(InteractiveMode.prototype, "getTrayHints").call(mode) as string[];
 
-		expect(getHints(daemonChat)).toEqual(["Ctrl+O 过程", "Ctrl+T 思考", "← 会话列表", "? 快捷键"]);
+		expect(getHints(daemonChat)).toEqual(["Ctrl+O 过程", "Ctrl+T Thinking", "← 会话列表", "? 快捷键"]);
 		// The hints do not react to editor text.
 		editorText = "draft prompt";
-		expect(getHints(daemonChat)).toEqual(["Ctrl+O 过程", "Ctrl+T 思考", "← 会话列表", "? 快捷键"]);
+		expect(getHints(daemonChat)).toEqual(["Ctrl+O 过程", "Ctrl+T Thinking", "← 会话列表", "? 快捷键"]);
 
 		expect(getHints(createMode(0, true))).toEqual(["/ 命令", "@ 文件", "← 会话列表", "? 快捷键"]);
-		expect(getHints(createMode(1, false))).toEqual(["Ctrl+O 过程", "Ctrl+T 思考", "? 快捷键"]);
+		expect(getHints(createMode(1, false))).toEqual(["Ctrl+O 过程", "Ctrl+T Thinking", "? 快捷键"]);
 	});
 
 	it("keeps the status side empty through edits for a plain session", () => {

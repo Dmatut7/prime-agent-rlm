@@ -3,3 +3,5 @@
 - Changed the status area: key hints now sit above the prompt and show only the keys usable right now; the footer line shows model, directory, branch, and right-aligned context figures, with the watermark bar only near the compaction threshold.
 - Changed the startup header to a compact wordmark with model and directory rows, and translated start hints, loader labels, and the tmux notice to Chinese.
 - Removed the chat-tail `Ctrl+T 思考 · Ctrl+O 过程 · Ctrl+P 通讯` hint line and the `[O]/[T]/[P]` bracket hints.
+- Changed the quiet running face to match the design: the live activity (`◈ 运行中 12s`) moved into the status line, the prompt reads 随时补充或纠正 while a turn runs, and the process line shows measured Thinking time.
+- Added a two-row Thinking preview at the top of an opened process block, a 继续 row on the startup header for the last session in this directory, and a per-child subagent panel.

@@ -19,13 +19,25 @@ const MAX_RENDERED_STALL_MARKERS = 3;
  * counts, spend cell with annotations, and the hint - still fits 78 columns
  * with the wider gaps, under the 80-column floor.
  */
-const GROUP_GAP = "    ";
-
 /** Blank space always kept between the spend cell and the open hint. */
 const SPEND_MIN_GAP = 1;
 
-/** Leading indent of the borderless subagents line. */
-const LINE_INDENT = "  ";
+/** Leading indent of the panel header. */
+const LINE_INDENT = " ";
+
+/** Widest name column before names truncate. */
+const ROW_NAME_MAX_WIDTH = 16;
+
+/** Narrowest activity column worth showing; below it the column drops. */
+const ROW_ACTIVITY_MIN_WIDTH = 8;
+
+const ROW_STATE_WORDS: Record<SubagentPanelRowState, string> = {
+	running: "运行",
+	idle: "空闲",
+	done: "完成",
+	failed: "出错",
+	stalled: "卡住",
+};
 
 /**
  * Running/idle/inactive counts for the subagents tray cell.
@@ -177,6 +189,102 @@ export function formatSubagentStallMarker(child: AgentConnectionRlmChildAgentSna
 	return `stalled ${silentSeconds}s${toolText}${unsettled}`;
 }
 
+/** One child row of the subagent panel. */
+export type SubagentPanelRowState = "running" | "idle" | "done" | "failed" | "stalled";
+
+export interface SubagentPanelRow {
+	id: string;
+	/** Display name (session name, else label). */
+	name: string;
+	state: SubagentPanelRowState;
+	/** Run time so far, when the snapshot reports it. */
+	elapsedMs?: number;
+	/** What the child is doing or how it ended, in plain words. */
+	activity?: string;
+}
+
+/** Rows shown before the rest fold into `… 还有 N 个`. */
+export const SUBAGENT_PANEL_MAX_ROWS = 4;
+
+const ROW_STATE_ORDER: Record<SubagentPanelRowState, number> = {
+	stalled: 0,
+	failed: 1,
+	running: 2,
+	idle: 3,
+	done: 4,
+};
+
+function firstLine(text: string | undefined): string | undefined {
+	const line = text
+		?.split("\n")
+		.map((part) => part.trim())
+		.find((part) => part.length > 0);
+	return line || undefined;
+}
+
+function rowActivity(child: AgentConnectionRlmChildAgentSnapshot, state: SubagentPanelRowState): string | undefined {
+	if (state === "stalled") {
+		const silent = Math.max(1, Math.round((child.stall?.silentMs ?? 0) / 1000));
+		const tools = child.stall?.inFlightTools ?? [];
+		return `${silent}s 没有动静${tools.length > 0 ? ` · 在跑 ${tools.join(", ")}` : ""}`;
+	}
+	if (state === "failed") return firstLine(child.error) ?? "出错";
+	if (state === "done") return firstLine(child.answerPreview) ?? firstLine(child.recap);
+	switch (child.activity?.kind) {
+		case "executing":
+			return child.activity.toolName ? `执行 ${child.activity.toolName}` : "执行中";
+		case "writing":
+			return "回答中";
+		case "waiting":
+			return "等待模型";
+		default:
+			return firstLine(child.recap);
+	}
+}
+
+/**
+ * The panel rows for this session's subtree (see collectSubtreeSubagentSnapshots),
+ * most relevant first: stalled, failed, running, idle, finished.
+ */
+export function buildSubagentPanelRows(
+	children: Iterable<AgentConnectionRlmChildAgentSnapshot>,
+	parentId: string | undefined,
+): SubagentPanelRow[] {
+	const rows = collectSubtreeSubagentSnapshots(children, parentId).map((child) => {
+		const roster = classifySubagentSnapshotStatus(child);
+		const state: SubagentPanelRowState = isStalledSubagentSnapshot(child)
+			? "stalled"
+			: child.status === "error"
+				? "failed"
+				: roster === "running"
+					? "running"
+					: roster === "idle"
+						? "idle"
+						: "done";
+		const row: SubagentPanelRow = { id: child.id, name: child.sessionName ?? child.label, state };
+		if (child.durationMs !== undefined) row.elapsedMs = child.durationMs;
+		const activity = rowActivity(child, state);
+		if (activity) row.activity = activity;
+		return row;
+	});
+	return rows.sort((a, b) => ROW_STATE_ORDER[a.state] - ROW_STATE_ORDER[b.state]);
+}
+
+/** The session a stall marker names: the text before its first `: `. */
+function stallMarkerName(marker: string): string {
+	const at = marker.indexOf(": ");
+	return at === -1 ? marker : marker.slice(0, at);
+}
+
+/** `2:14`, `1:02:03`. */
+export function formatSubagentElapsed(ms: number): string {
+	const total = Math.max(0, Math.floor(ms / 1000));
+	const seconds = String(total % 60).padStart(2, "0");
+	const minutes = Math.floor(total / 60);
+	if (minutes < 60) return `${minutes}:${seconds}`;
+	return `${Math.floor(minutes / 60)}:${String(minutes % 60).padStart(2, "0")}:${seconds}`;
+}
+
 /**
  * Every snapshot descending from `parentId` at any depth, breadth-first over `parentId`.
  * A cancelled row still links its own children, so a live grandchild stays reachable when
@@ -280,6 +388,8 @@ export class SubagentSummaryLine implements Component, Focusable {
 	private counts: SubagentSummaryCounts = { total: 0, running: 0, idle: 0, inactive: 0 };
 	private spend: SubagentSpendSummary | undefined;
 	private stallMarkers: readonly string[] = [];
+	private rows: readonly SubagentPanelRow[] = [];
+	private selectedRow = 0;
 	private openable = false;
 	private cachedWidth?: number;
 	private cachedKey?: string;
@@ -311,6 +421,16 @@ export class SubagentSummaryLine implements Component, Focusable {
 		this.stallMarkers = markers;
 	}
 
+	/**
+	 * Per-child rows (see buildSubagentPanelRows). With rows the panel lists each
+	 * child and a stall shows as the row's state; without them (a roster-only
+	 * family) the header stands alone and stall markers keep their own lines.
+	 */
+	setSubagentRows(rows: readonly SubagentPanelRow[]): void {
+		this.rows = rows;
+		this.selectedRow = Math.min(this.selectedRow, Math.max(0, this.visibleRowCount() - 1));
+	}
+
 	setOpenable(openable: boolean): void {
 		this.openable = openable;
 	}
@@ -325,11 +445,22 @@ export class SubagentSummaryLine implements Component, Focusable {
 			if (this.isSelectable()) this.onOpen?.();
 			return;
 		}
+		if (keybindings.matches(data, "tui.select.up") && this.selectedRow > 0) {
+			this.selectedRow -= 1;
+			this.invalidate();
+			return;
+		}
+		if (keybindings.matches(data, "tui.select.down") && this.selectedRow < this.visibleRowCount() - 1) {
+			this.selectedRow += 1;
+			this.invalidate();
+			return;
+		}
 		if (
 			keybindings.matches(data, "tui.select.up") ||
 			keybindings.matches(data, "tui.select.cancel") ||
 			keybindings.matches(data, "app.agents.back")
 		) {
+			this.selectedRow = 0;
 			this.onCancel?.();
 			return;
 		}
@@ -358,6 +489,10 @@ export class SubagentSummaryLine implements Component, Focusable {
 			this.openable ? 1 : 0,
 			this.focused ? 1 : 0,
 			this.stallMarkers.join("\u0000"),
+			this.selectedRow,
+			this.rows
+				.map((row) => [row.id, row.name, row.state, row.elapsedMs ?? "", row.activity ?? ""].join("\u0003"))
+				.join("\u0000"),
 		].join("\u0001");
 	}
 
@@ -375,66 +510,114 @@ export class SubagentSummaryLine implements Component, Focusable {
 		].join("\u0002");
 	}
 
+	private visibleRowCount(): number {
+		return Math.min(this.rows.length, SUBAGENT_PANEL_MAX_ROWS);
+	}
+
 	/**
-	 * U6 ③: one borderless line under the watermark line —
-	 * `  运行 1 · 空闲 0 · 收口 2    子代理 ¥961.72 · 592M tok ｜ 全部 ¥1235.16    ↓ 选择`.
-	 * Zero-count classes render nothing; no subagents at all hides the whole
-	 * line. The words match the agents view (收口 = settled rows).
+	 * The subagent panel: a dim rule header with the family counts on the left
+	 * and the spend plus the open hint on the right -
+	 * ` 子代理 3  运行 2 · 收口 1 ────── 子代理 ¥12.40 · 592M tok ｜ 全部 ¥18.95  ↓ 选择 ─` -
+	 * then one row per child, most relevant first:
+	 * `   ● review   运行 2:14   读取 footer.ts`. Focus moves a ` › ` selector
+	 * over the rows. No children hides the panel.
 	 */
 	private renderLines(width: number): string[] {
 		if (this.counts.total === 0) return [];
 		const safeWidth = Math.max(1, width);
-		const counts = this.renderCounts();
-		const openHint = this.openable
-			? this.focused
-				? `${keyText("tui.select.confirm")}/${keyText("app.agents.open")} 打开`
-				: `${keyText("tui.editor.cursorDown", { primaryOnly: true })} 选择`
-			: "";
-		// The blank area between the counts and the open hint carries the family
-		// spend (sub-agent money + tokens; the whole family as a secondary figure
-		// when width allows). The hint stays right-anchored and the body is padded
-		// to the full width, so figure changes only ever eat whitespace - the
-		// money is fixed two-decimal and the tokens use the bounded k/M
-		// abbreviation, neither of which can move the hint or the line length.
-		// F5 (DS2 review): the open hint never participates in truncation. The
-		// counts and the spend cell get the width the hint leaves; a wide family
-		// truncates its figures (whole segments, money drops rungs) instead of
-		// squeezing the agents-view entry off the line.
-		const hintReserve = visibleWidth(openHint) > 0 ? visibleWidth(openHint) + SPEND_MIN_GAP : 0;
-		const contentBudget = Math.max(1, safeWidth - visibleWidth(LINE_INDENT) - hintReserve);
-		const spendBudget = contentBudget - visibleWidth(counts) - GROUP_GAP.length - SPEND_MIN_GAP;
-		const spend = this.renderSpend(Math.max(0, spendBudget));
-		const separator = spend ? GROUP_GAP : "";
-		const gap = Math.max(
-			SPEND_MIN_GAP,
-			safeWidth -
-				visibleWidth(LINE_INDENT) -
-				visibleWidth(counts) -
-				separator.length -
-				visibleWidth(spend) -
-				visibleWidth(openHint),
-		);
-		const body = truncateToWidth(
-			`${LINE_INDENT}${truncateToWidth(`${counts}${separator}${spend}`, contentBudget, "…")}${" ".repeat(
-				gap,
-			)}${theme.fg("dim", openHint)}`,
-			safeWidth,
-			"",
-		);
-		const pad = " ".repeat(Math.max(0, safeWidth - visibleWidth(body)));
-		// Truncation may inject full ANSI resets; wrap each segment so the
-		// selection background survives past them (custom-editor precedent).
-		const content = this.focused
-			? `${body}${pad}`
-					.split("\x1b[0m")
-					.map((segment) => theme.bg("selectedBg", segment))
-					.join("\x1b[0m")
-			: `${body}${pad}`;
-		const lines = [content];
-		for (const marker of this.stallMarkers.slice(0, MAX_RENDERED_STALL_MARKERS)) {
+		const lines = [this.renderHeader(safeWidth)];
+		const shown = this.rows.slice(0, SUBAGENT_PANEL_MAX_ROWS);
+		shown.forEach((row, index) => {
+			lines.push(this.renderRow(row, safeWidth, this.focused && index === this.selectedRow));
+		});
+		if (this.rows.length > shown.length) {
+			lines.push(theme.fg("dim", truncateToWidth(`   … 还有 ${this.rows.length - shown.length} 个`, safeWidth, "")));
+		}
+		// A stalled session with a row already reads 卡住 there; one without a row
+		// (roster-only, or folded past the row cap) keeps its marker line, so a
+		// wedged descendant is never invisible.
+		const shownNames = new Set(shown.map((row) => row.name));
+		const orphanMarkers = this.stallMarkers.filter((marker) => !shownNames.has(stallMarkerName(marker)));
+		for (const marker of orphanMarkers.slice(0, MAX_RENDERED_STALL_MARKERS)) {
 			lines.push(theme.fg("error", truncateToWidth(`  ⚠ ${marker}`, safeWidth, "…")));
 		}
 		return lines;
+	}
+
+	private renderHeader(safeWidth: number): string {
+		const counts = this.renderCounts();
+		const left = `${LINE_INDENT}${theme.fg("muted", `子代理 ${this.counts.total}`)}${counts ? `  ${counts}` : ""}`;
+		const rowsSelectable = this.rows.length > 0;
+		const openHint = this.openable
+			? this.focused
+				? rowsSelectable
+					? ""
+					: `${keyText("tui.select.confirm")}/${keyText("app.agents.open")} 打开`
+				: `${keyText("tui.editor.cursorDown", { primaryOnly: true })} 选择`
+			: "";
+		// F5 (DS2 review): the open hint never participates in truncation; the
+		// spend cell degrades (whole rungs) inside what the hint leaves, and a
+		// truncated money figure is never shown.
+		const tail = ` ${theme.fg("dim", "─")}`;
+		const hint = openHint ? `  ${theme.fg("dim", openHint)}` : "";
+		const minRule = 2;
+		const spendBudget =
+			safeWidth - visibleWidth(left) - visibleWidth(hint) - visibleWidth(tail) - minRule - 2 - SPEND_MIN_GAP;
+		const spend = this.renderSpend(Math.max(0, spendBudget));
+		const right = `${spend}${spend ? hint : hint.trimStart()}${tail}`;
+		const ruleWidth = safeWidth - visibleWidth(left) - visibleWidth(right) - 2;
+		const header =
+			ruleWidth >= minRule
+				? `${left} ${theme.fg("dim", "─".repeat(ruleWidth))} ${right}`
+				: `${truncateToWidth(left, Math.max(1, safeWidth - visibleWidth(hint)), "…")}${hint}`;
+		const fitted = truncateToWidth(header, safeWidth, "");
+		const padded = fitted + " ".repeat(Math.max(0, safeWidth - visibleWidth(fitted)));
+		// Without rows the header itself is the focus target.
+		if (this.focused && !rowsSelectable) {
+			return padded
+				.split("\x1b[0m")
+				.map((segment) => theme.bg("selectedBg", segment))
+				.join("\x1b[0m");
+		}
+		return padded;
+	}
+
+	private renderRow(row: SubagentPanelRow, safeWidth: number, selected: boolean): string {
+		const glyph =
+			row.state === "running"
+				? theme.fg("accent", "●")
+				: row.state === "idle"
+					? theme.fg("dim", "○")
+					: row.state === "done"
+						? theme.fg("success", "✓")
+						: theme.fg("error", "✗");
+		const prefix = selected ? ` ${theme.fg("accent", "›")} ` : "   ";
+		const nameWidth = Math.min(
+			ROW_NAME_MAX_WIDTH,
+			Math.max(...this.rows.slice(0, SUBAGENT_PANEL_MAX_ROWS).map((entry) => visibleWidth(entry.name)), 4),
+		);
+		const name = truncateToWidth(row.name, nameWidth, "…");
+		const namePadded = name + " ".repeat(Math.max(0, nameWidth - visibleWidth(name)));
+		const stateText = `${ROW_STATE_WORDS[row.state]}${row.elapsedMs !== undefined ? ` ${formatSubagentElapsed(row.elapsedMs)}` : ""}`;
+		const stateColor = row.state === "failed" || row.state === "stalled" ? "error" : "muted";
+		const statePadded = stateText + " ".repeat(Math.max(0, 10 - visibleWidth(stateText)));
+		const head = `${prefix}${glyph} ${theme.fg("text", namePadded)}   ${theme.fg(stateColor, statePadded)}`;
+		const actions = selected && this.openable ? `${keyText("tui.select.confirm")} 打开 ` : "";
+		const available = safeWidth - visibleWidth(head) - 3 - (actions ? visibleWidth(actions) + 2 : 0);
+		const activity =
+			row.activity && available >= ROW_ACTIVITY_MIN_WIDTH
+				? `   ${theme.fg(row.state === "stalled" ? "error" : "dim", truncateToWidth(row.activity, available, "…"))}`
+				: "";
+		let line = truncateToWidth(`${head}${activity}`, safeWidth, "");
+		if (actions && visibleWidth(line) + visibleWidth(actions) + 1 <= safeWidth) {
+			line += " ".repeat(safeWidth - visibleWidth(line) - visibleWidth(actions)) + theme.fg("dim", actions);
+		}
+		if (!selected) return line;
+		const padded = line + " ".repeat(Math.max(0, safeWidth - visibleWidth(line)));
+		return padded
+			.split("\x1b[0m")
+			.map((segment) => theme.bg("selectedBg", segment))
+			.join("\x1b[0m");
 	}
 
 	/** `运行 1 · 空闲 0 · 收口 2` — zero-count classes are skipped entirely. */
@@ -467,13 +650,13 @@ export class SubagentSummaryLine implements Component, Focusable {
 		const spend = this.spend;
 		if (!spend || (spend.cost === 0 && spend.tokens === 0)) return "";
 		const dot = theme.fg("dim", " · ");
-		const label = theme.fg("dim", "子代理");
+		// The header already names the family (`子代理 3`); the cell carries figures only.
 		const money =
 			spend.cost > 0
 				? `${spend.partial ? theme.fg("dim", "≈") : ""}${theme.fg("accent", formatSpendCost(spend.cost))}`
 				: "";
 		const tokens = theme.fg("dim", `${spend.partial ? "≈" : ""}${formatTokenCount(spend.tokens)} tok`);
-		const primary = money ? `${label} ${money}${dot}${tokens}` : `${label} ${tokens}`;
+		const primary = money ? `${money}${dot}${tokens}` : tokens;
 		const total = spend.parentCost + spend.cost;
 		// `｜` separates the two spend groups (sub-agents vs the whole family);
 		// `·` stays inside a group.

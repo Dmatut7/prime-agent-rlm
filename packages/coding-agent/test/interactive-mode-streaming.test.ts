@@ -188,7 +188,7 @@ describe("InteractiveMode streaming events", () => {
 		// U6: the turn's aggregate line rides at the turn head and carries the live
 		// thinking count; the dropped attempt's thinking text itself never renders.
 		expect(fakeThis.chatContainer.children).toHaveLength(2);
-		expect(renderChat(fakeThis.chatContainer)).toContain("思考");
+		expect(renderChat(fakeThis.chatContainer)).toContain("Thinking");
 		expect(renderChat(fakeThis.chatContainer)).not.toContain("pondering the discarded turn");
 
 		await handleEvent.call(fakeThis, {
@@ -199,7 +199,7 @@ describe("InteractiveMode streaming events", () => {
 		expect(fakeThis.chatContainer.children).toHaveLength(2);
 		expect(renderChat(fakeThis.chatContainer)).not.toContain("pondering the discarded turn");
 		// The replaced live message has no thinking: the count resets with it.
-		expect(renderChat(fakeThis.chatContainer)).not.toContain("思考");
+		expect(renderChat(fakeThis.chatContainer)).not.toContain("Thinking");
 	});
 
 	test("renders assistant end events when attaching after all updates", async () => {

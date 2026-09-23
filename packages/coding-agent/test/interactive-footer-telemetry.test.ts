@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { setKeybindings } from "@earendil-works/pi-tui";
+import { setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
@@ -70,6 +70,39 @@ describe("footer telemetry watermark (U6)", () => {
 		expect(line).not.toContain("⚡");
 		expect(line).not.toContain("风暴");
 		expect(line).not.toContain("390k");
+	});
+
+	it("puts the live activity right-aligned just before the context figures", () => {
+		const footer = new FooterComponent(provider);
+		footer.setTelemetrySource(makeSource().source);
+		footer.setLocationSource(() => ({ cwd: "/srv/app", branch: "main" }));
+		let activity: string | undefined = "● 运行中 12s";
+		footer.setActivitySource(() => activity);
+		const line = footerLine(footer, 120);
+		expect(visibleWidth(line)).toBe(120);
+		expect(line).toContain("/srv/app · main");
+		expect(line.endsWith("● 运行中 12s   312k/1M · 31% ")).toBe(true);
+		activity = undefined;
+		expect(footerLine(footer, 120).endsWith("/1M · 31% ")).toBe(true);
+		expect(footerLine(footer, 120)).not.toContain("运行中");
+	});
+
+	it("drops the location before the activity, and the activity before the figures", () => {
+		const footer = new FooterComponent(provider);
+		footer.setTelemetrySource(makeSource().source);
+		footer.setLocationSource(() => ({ cwd: "/srv/some/long/project/path", branch: "feature/branch" }));
+		footer.setActivitySource(() => "● 运行中 1m 05s");
+		const widths = [120, 80, 60, 50, 42];
+		const lines = widths.map((width) => footerLine(footer, width));
+		for (const [index, line] of lines.entries()) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(widths[index] ?? 0);
+		}
+		expect(lines[0]).toContain("/srv/some/long/project/path");
+		expect(lines[1]).not.toContain("/srv/some");
+		expect(lines[1]).toContain("运行中");
+		const noActivity = lines.findIndex((line) => !line.includes("运行中"));
+		expect(noActivity).toBeGreaterThan(1);
+		expect(lines[noActivity]).toContain("312k/1M · 31%");
 	});
 
 	it("shows the watermark bar before the figures from half the compaction threshold", () => {

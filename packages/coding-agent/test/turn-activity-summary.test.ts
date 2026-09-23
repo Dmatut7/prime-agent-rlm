@@ -251,13 +251,14 @@ describe("turn activity summary (U4)", () => {
 		// Two mechanical lines at the turn head: the thinking block header (①)
 		// above the process line (②). 评审短账: the duration lives on the ⚙ line
 		// only - the header carries the segment count.
-		expect(nonEmpty[1]).toBe(" 思考 10 段");
+		expect(nonEmpty[1]).toBe(" Thinking ×10");
 		expect(nonEmpty[2]).toBe(" ⚙ 10 步 · 1.0s · python×10");
-		// Zero per-block thinking rows anywhere in the collapsed view.
-		expect(collapsed).not.toContain("Thinking");
+		// Zero per-block thinking rows anywhere in the collapsed view: the
+		// header is the only line that names the thinking.
+		expect(collapsed.split("\n").filter((line) => line.includes("Thinking"))).toHaveLength(1);
 		expect(collapsed).not.toContain("weigh the options");
 		expect(collapsed).not.toContain("展开");
-		expect(collapsedLinesWithoutUserLine(nonEmpty)).toBe(3); // 思考 header + ⚙ line + final prose
+		expect(collapsedLinesWithoutUserLine(nonEmpty)).toBe(3); // Thinking header + ⚙ line + final prose
 
 		// The thinking traces appear with the T lane, not the O lane.
 		const toolsExpanded = renderAll(messages, true);
@@ -292,7 +293,7 @@ describe("turn activity summary (U4)", () => {
 		];
 		const collapsed = renderAll(messages, false);
 		const nonEmpty = collapsed.split("\n").filter((line) => line.trim().length > 0);
-		expect(nonEmpty[1]).toBe(" 思考 2 段");
+		expect(nonEmpty[1]).toBe(" Thinking ×2");
 		expect(nonEmpty[2]).toBe(" ⚙ 2 步 · 0.4s · python×2");
 		// The mid-turn prose renders in place, between the mechanical lines and
 		// the final answer - K3 ①: content is never collapsed away.
@@ -316,12 +317,12 @@ describe("turn activity summary (U4)", () => {
 		];
 		const collapsed = renderAll(messages, false);
 		const nonEmpty = collapsed.split("\n").filter((line) => line.trim().length > 0);
-		// A single segment renders without the count; several render `思考 N 段`.
-		expect(nonEmpty[1]).toBe(" 思考 2 段 · 2.0s");
+		// A single segment renders without the count; several render `Thinking ×N`.
+		expect(nonEmpty[1]).toBe(" Thinking ×2 · 2.0s");
 		expect(collapsed).toContain("Concluded.");
 		expect(collapsed).not.toContain("First segment");
 		// The second turn has neither steps nor thinking: no mechanical line.
-		expect(collapsed).not.toContain("思考 1 段");
+		expect(collapsed).not.toContain("Thinking ×1");
 
 		const single = renderAll(
 			[
@@ -332,7 +333,7 @@ describe("turn activity summary (U4)", () => {
 			false,
 		);
 		const singleNonEmpty = single.split("\n").filter((line) => line.trim().length > 0);
-		expect(singleNonEmpty[1]).toBe(" 思考 2.0s");
+		expect(singleNonEmpty[1]).toBe(" Thinking 2.0s");
 	});
 
 	it("hides a live tool's body only after it settles, and the verb summary keeps one fragment per verb", () => {
@@ -409,7 +410,7 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 		expect(nonEmpty.filter((line) => line.includes("步"))).toHaveLength(1);
 		// The legacy two-line surface is gone.
 		expect(collapsed).not.toContain("⚙");
-		expect(collapsed).not.toContain("思考 ");
+		expect(collapsed).not.toContain("Thinking ×");
 	});
 
 	it("renders a thinking-only quiet turn as 思考 with its duration, and a bare turn the same way", () => {
@@ -429,11 +430,11 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 		const collapsed = renderQuiet(messages);
 		const nonEmpty = collapsed.split("\n").filter((line) => line.trim().length > 0);
 		// The thinking-only turn: 思考 plus the frozen duration, no step count.
-		expect(nonEmpty[1]).toBe(" ▸ 思考 · 2.0s");
+		expect(nonEmpty[1]).toBe(" ▸ Thinking 2.0s");
 		expect(collapsed).toContain("Concluded.");
 		// R5-P2③: the thinking-less turn renders 思考 too - the model is
 		// always reasoning, so every turn carries the process line.
-		const heads = collapsed.split("\n").filter((line) => line.startsWith(" ▸ 思考"));
+		const heads = collapsed.split("\n").filter((line) => line.startsWith(" ▸ Thinking"));
 		expect(heads).toHaveLength(2);
 		expect(collapsed).not.toContain("想了想");
 	});
@@ -445,7 +446,7 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 		summary.setQuiet(true);
 		// No steps, no thinking, no comms: still one 思考 line, not nothing.
 		const line = stripAnsi(summary.render(120).join("\n"));
-		expect(line).toBe(" ▸ 思考 · 0.5s");
+		expect(line).toBe(" ▸ Thinking 0.5s");
 	});
 
 	it("counts comms from received agent rows plus sent agent messages in tool details", () => {
@@ -489,9 +490,10 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 			assistant([{ type: "text", text: "Reported." }], 1_300),
 		];
 		const collapsed = renderQuiet(messages);
-		// 1 step, 1 thinking segment, 3 comms (2 sent + 1 received).
+		// 1 step, 1 thinking segment, 3 comms (2 sent + 1 received). A replay never
+		// measured the thinking time, so the 思考 segment stays out.
 		const head = collapsed.split("\n").find((line) => line.startsWith(" ▸ "));
-		expect(head?.startsWith(" ▸ 思考 · 1 步 · ")).toBe(true);
+		expect(head?.startsWith(" ▸ 1 步 · ")).toBe(true);
 		expect(head).toContain(" · 通讯 3 条");
 		expect(head).not.toContain("[P]");
 	});
@@ -740,5 +742,35 @@ describe("turn state for the process line", () => {
 		} finally {
 			vi.useRealTimers();
 		}
+	});
+
+	it("measures live thinking time and leaves a replayed turn's unknown", () => {
+		const live = new TurnActivityState(1_000);
+		expect(live.thinkingDurationMs(1_000)).toBeUndefined();
+		live.noteThinking(true, 1_000);
+		live.noteThinking(true, 1_500);
+		expect(live.thinkingDurationMs(2_000)).toBe(1_000);
+		live.noteThinking(false, 3_000);
+		expect(live.thinkingDurationMs(9_000)).toBe(2_000);
+		live.noteThinking(true, 10_000);
+		live.noteThinking(false, 10_400);
+		expect(live.thinkingDurationMs(20_000)).toBe(2_400);
+		const replay = new TurnActivityState(1_000);
+		replay.addThinkingSegments(2);
+		replay.noteThinking(false, 5_000);
+		expect(replay.thinkingDurationMs(9_000)).toBeUndefined();
+	});
+
+	it("previews the latest thinking only while the process block is open", () => {
+		const state = new TurnActivityState(1_000);
+		state.addStep({ toolCallId: "t1", toolName: "bash", args: { command: "npm test" }, status: "done" });
+		state.markTurnEnded(2_000);
+		state.latestThinking = "Check both data sources before changing anything.";
+		const summary = new TurnSummaryComponent(state);
+		summary.setQuiet(true);
+		expect(summary.render(120).map(stripAnsi).join("\n")).not.toContain("Check both data sources");
+		summary.setExpanded(true);
+		const open = summary.render(120).map(stripAnsi);
+		expect(open[1]).toContain("Thinking  Check both data sources");
 	});
 });

@@ -98,7 +98,7 @@ export class AssistantMessageComponent extends Container {
 		message?: AssistantMessage,
 		hideThinkingBlock = false,
 		markdownTheme: MarkdownTheme = getMarkdownTheme(),
-		hiddenThinkingLabel = "思考",
+		hiddenThinkingLabel = "Thinking",
 		options: AssistantMessageComponentOptions = {},
 	) {
 		super();

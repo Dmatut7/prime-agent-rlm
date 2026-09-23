@@ -75,6 +75,33 @@ export class TurnActivityState {
 	/** Set on the live run's turn: its clock ticks until agent_end stamps it. */
 	live = false;
 
+	/** The latest non-empty thinking trace, for the open process block's preview. */
+	latestThinking = "";
+	private thinkingMs = 0;
+	private thinkingStartedAt: number | undefined;
+	private thinkingMeasured = false;
+
+	/** Live streams report whether the model is thinking right now; the time accumulates. */
+	noteThinking(active: boolean, now = Date.now()): void {
+		if (active) {
+			this.thinkingMeasured = true;
+			this.thinkingStartedAt ??= now;
+			return;
+		}
+		if (this.thinkingStartedAt !== undefined) {
+			this.thinkingMs += Math.max(0, now - this.thinkingStartedAt);
+			this.thinkingStartedAt = undefined;
+		}
+	}
+
+	/** Measured thinking time; undefined when the turn was not watched live (a replay). */
+	thinkingDurationMs(now = Date.now()): number | undefined {
+		if (!this.thinkingMeasured) {
+			return undefined;
+		}
+		return this.thinkingMs + (this.thinkingStartedAt !== undefined ? Math.max(0, now - this.thinkingStartedAt) : 0);
+	}
+
 	/** Files the turn changed, keyed by path; the collapsed process line lists them. */
 	private readonly changedFiles = new Map<string, FileChangeSummary>();
 
@@ -348,9 +375,9 @@ export class TurnActivityState {
 			return "";
 		}
 		if (this.steps.length > 0) {
-			return `思考 ${segments} 段`;
+			return `Thinking ×${segments}`;
 		}
-		return segments > 1 ? `思考 ${segments} 段 · ${this.durationSeconds()}` : `思考 ${this.durationSeconds()}`;
+		return segments > 1 ? `Thinking ×${segments} · ${this.durationSeconds()}` : `Thinking ${this.durationSeconds()}`;
 	}
 
 	/** U6 ②: the process line — steps, duration, verb summary, error count. */
@@ -505,6 +532,8 @@ export class TurnSummaryComponent implements Component {
 			cols: safeWidth,
 			summary: turnStepsSummary(this.turnState.steps),
 			running: !this.turnState.isTurnEnded,
+			thinkingMs: this.turnState.thinkingDurationMs(),
+			thinkingPreview: this.turnState.processBlockExpanded ? this.turnState.latestThinking : undefined,
 			// An open process block shows every diff itself; the rows are the closed view's stand-in.
 			fileChanges: this.turnState.processBlockExpanded ? [] : this.turnState.fileChanges,
 			// P3-2: the caret glyph — ▸ while every detail block is collapsed,

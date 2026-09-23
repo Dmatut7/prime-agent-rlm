@@ -131,6 +131,7 @@ export class FooterComponent implements Component {
 	private speedText: string | undefined;
 	private telemetrySource: (() => FooterTelemetrySource) | undefined;
 	private locationSource: (() => FooterLocation | undefined) | undefined;
+	private activitySource: (() => string | undefined) | undefined;
 	private toolErrorCount = 0;
 
 	constructor(private footerData: ReadonlyFooterDataProvider) {
@@ -166,6 +167,11 @@ export class FooterComponent implements Component {
 	/** The cwd and git branch shown between the model and the context figures. */
 	setLocationSource(source: () => FooterLocation | undefined): void {
 		this.locationSource = source;
+	}
+
+	/** The live activity (`◈ 运行中 12s`) shown right-aligned before the context figures while a turn runs. */
+	setActivitySource(source: () => string | undefined): void {
+		this.activitySource = source;
 	}
 
 	/** U2: trailing consecutive tool errors; the badge renders from TOOL_ERROR_WARN_THRESHOLD. */
@@ -214,9 +220,12 @@ export class FooterComponent implements Component {
 				? `${watermarkBar(tokens, windowTokens, threshold, imminent)}  `
 				: "";
 
+		const activityText = this.activitySource?.()?.trim();
+		const activity = activityText ? `${activityText}${GROUP_GAP}` : "";
 		const layouts: Array<[string, string]> = [
-			[`${model}${locationGroup}`, `${bar}${figures}`],
-			[model, `${bar}${figures}`],
+			[`${model}${locationGroup}`, `${activity}${bar}${figures}`],
+			[model, `${activity}${bar}${figures}`],
+			[model, `${activity}${figures}`],
 			[model, figures],
 			[model, ""],
 		];

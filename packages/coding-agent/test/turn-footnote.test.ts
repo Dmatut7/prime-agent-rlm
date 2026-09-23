@@ -10,9 +10,9 @@ import {
 } from "../src/modes/interactive/components/turn-footnote.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
-/** Reference turn: 1m05s, 14 steps, 7 thinking segments, 2 comms. */
-const reference = { steps: 14, thinkSegments: 7, commMessages: 2, durationMs: 65_000 };
-const STATS = "思考 · 14 步 · 1m05s · 通讯 2 条";
+/** Reference turn: 1m05s, 14 steps, 7 thinking segments measured at 6.2s, 2 comms. */
+const reference = { steps: 14, thinkSegments: 7, commMessages: 2, durationMs: 65_000, thinkingMs: 6_200 };
+const STATS = "Thinking 6.2s · 14 步 · 1m05s · 通讯 2 条";
 
 function render(props: TurnFootNoteProps): string[] {
 	return new TurnFootNote(props).render(200).map((line) => stripAnsi(line));
@@ -55,10 +55,10 @@ describe("turn footnote (process line)", () => {
 			" 14 步 · 14.8s",
 		);
 		expect(renderLine({ steps: 0, thinkSegments: 7, commMessages: 2, durationMs: 3_200, cols: 120 })).toBe(
-			" 思考 · 3.2s · 通讯 2 条",
+			" 3.2s · 通讯 2 条",
 		);
 		expect(renderLine({ steps: 0, thinkSegments: 3, commMessages: 0, durationMs: 3_200, cols: 120 })).toBe(
-			" 思考 · 3.2s",
+			" Thinking 3.2s",
 		);
 	});
 
@@ -133,7 +133,7 @@ describe("turn footnote (process line)", () => {
 		const note = new TurnFootNote({ ...reference, cols: 120 });
 		expect(stripAnsi(note.render(120)[0] ?? "")).toBe(` ${STATS}`);
 		note.update({ ...reference, steps: 3, cols: 120 });
-		expect(stripAnsi(note.render(120)[0] ?? "")).toBe(" 思考 · 3 步 · 1m05s · 通讯 2 条");
+		expect(stripAnsi(note.render(120)[0] ?? "")).toBe(" Thinking 6.2s · 3 步 · 1m05s · 通讯 2 条");
 		note.update({ ...reference, cols: 0 });
 		const line = stripAnsi(note.render(8)[0] ?? "");
 		expect(visibleWidth(line)).toBeLessThanOrEqual(8);
@@ -146,7 +146,7 @@ describe("turn footnote (process line)", () => {
 		const regions = note.getClickRegions();
 		expect(regions).toHaveLength(3);
 		const expected = [
-			{ text: "思考", segment: "think" },
+			{ text: "Thinking 6.2s", segment: "think" },
 			{ text: "14 步", segment: "steps" },
 			{ text: "通讯 2 条", segment: "comm" },
 		];
@@ -170,7 +170,7 @@ describe("turn footnote (process line)", () => {
 		caret?.onClick?.({ line: 0, col: 0 } as never);
 		expect(onCaretClick).toHaveBeenCalledTimes(1);
 		expect(think?.col).toBe(3);
-		expect(columnOf(line, "思考")).toBe(3);
+		expect(columnOf(line, "Thinking")).toBe(3);
 	});
 
 	it("registers no click regions without callbacks", () => {
@@ -213,5 +213,40 @@ describe("turn footnote (process line)", () => {
 			.map((line) => stripAnsi(line));
 		expect(row).toMatch(/^ {3}改动 {2}…\/.*shop\.md {2}\+1 −1$/);
 		expect(visibleWidth(row ?? "")).toBeLessThanOrEqual(50);
+	});
+
+	it("names thinking only when it was measured, and an answer-only turn by its thinking time", () => {
+		expect(renderLine({ steps: 2, thinkSegments: 1, commMessages: 0, durationMs: 4_000, cols: 120 })).toBe(
+			" 2 步 · 4.0s",
+		);
+		expect(
+			renderLine({ steps: 2, thinkSegments: 1, commMessages: 0, durationMs: 4_000, thinkingMs: 20, cols: 120 }),
+		).toBe(" 2 步 · 4.0s");
+		expect(
+			renderLine({ steps: 2, thinkSegments: 0, commMessages: 0, durationMs: 4_000, thinkingMs: 900, cols: 120 }),
+		).toBe(" 2 步 · 4.0s");
+		expect(
+			renderLine({ steps: 2, thinkSegments: 1, commMessages: 0, durationMs: 4_000, thinkingMs: 900, cols: 120 }),
+		).toBe(" Thinking 0.9s · 2 步 · 4.0s");
+		expect(
+			renderLine({ steps: 0, thinkSegments: 1, commMessages: 0, durationMs: 4_000, thinkingMs: 1_500, cols: 120 }),
+		).toBe(" Thinking 1.5s");
+		expect(renderLine({ steps: 0, thinkSegments: 1, commMessages: 0, durationMs: 4_000, cols: 120 })).toBe(
+			" Thinking 4.0s",
+		);
+	});
+
+	it("previews the latest thinking in two dim rows under the line", () => {
+		const preview = "先确认两个数据源。".repeat(20);
+		const lines = render({ ...reference, cols: 80, caret: "▾", thinkingPreview: preview });
+		expect(lines).toHaveLength(3);
+		expect(lines[1]?.startsWith("   Thinking  ")).toBe(true);
+		expect(lines[2]?.startsWith("             ")).toBe(true);
+		expect(lines[2]).toContain("…");
+		for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(80);
+	});
+
+	it("renders no preview rows for an empty trace", () => {
+		expect(render({ ...reference, cols: 80, thinkingPreview: "   " })).toHaveLength(1);
 	});
 });

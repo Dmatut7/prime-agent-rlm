@@ -11,7 +11,7 @@ import { initTheme } from "../src/modes/interactive/theme/theme.js";
  * Status-area layout pins, top to bottom around the editor:
  * ① the hint line above the editor - status on the left (`深度 0`, goal,
  *    heartbeats, the context fallback only while footer.telemetry=off), the
- *    keys that work right now on the right (`Ctrl+O 过程 · Ctrl+T 思考`),
+ *    keys that work right now on the right (`Ctrl+O 过程 · Ctrl+T Thinking`),
  * ② (under the editor) the status line `glm-5.3-prime · max   ~/repo · main   ──●──│──  518k/1M · 49%`,
  * ③ `  运行 1 · 空闲 0 · 收口 2    子代理 ¥961.72 · 592M tok ｜ 全部 ¥1235.16    ↓ 选择`.
  * One fact one home: the model lives only in ②, the context figures only in ②
@@ -40,7 +40,7 @@ function statusStack(options: {
 	const topBar = new TopBar({ getChatName: () => "调试会话-003" });
 	const info = new TrayInfoLine(
 		() => options.statusLabel ?? "深度 0",
-		() => options.hints ?? ["Ctrl+O 过程", "Ctrl+T 思考", "← 会话列表", "? 快捷键"],
+		() => options.hints ?? ["Ctrl+O 过程", "Ctrl+T Thinking", "← 会话列表", "? 快捷键"],
 		() => undefined,
 	);
 	const footer = new FooterComponent(provider);
@@ -66,13 +66,13 @@ describe("U6 status area layout", () => {
 		});
 		const nonEmpty = lines.map((line) => line.trimEnd()).filter((line) => line.trim().length > 0);
 		expect(nonEmpty).toHaveLength(4); // top bar, ①, ②, ③
-		expect(nonEmpty[1]).toMatch(/^ 深度 0 +Ctrl\+O 过程 · Ctrl\+T 思考 · ← 会话列表 · \? 快捷键$/);
+		expect(nonEmpty[1]).toMatch(/^ 深度 0 +Ctrl\+O 过程 · Ctrl\+T Thinking · ← 会话列表 · \? 快捷键$/);
 		expect(visibleWidth(lines[1] ?? "")).toBe(110);
 		expect(nonEmpty[2]).toContain("glm-5.3-prime · max");
 		expect(nonEmpty[2]).toMatch(/●/);
 		expect(nonEmpty[2]).toContain("518k/1M · 49%");
 		expect(nonEmpty[3]).toContain("运行 1 · 收口 2");
-		expect(nonEmpty[3]).toContain("子代理 ¥961.72 · 592M tok ｜ 全部 ¥1235.16");
+		expect(nonEmpty[3]).toContain("¥961.72 · 592M tok ｜ 全部 ¥1235.16");
 		expect(nonEmpty[3]).toContain("↓ 选择");
 	});
 
@@ -275,13 +275,13 @@ describe("U6 status area layout", () => {
 	it("drops hints whole from the end when the hint line is too narrow", () => {
 		const line = new TrayInfoLine(
 			() => "深度 0",
-			() => ["Ctrl+O 过程", "Ctrl+T 思考", "? 快捷键"],
+			() => ["Ctrl+O 过程", "Ctrl+T Thinking", "? 快捷键"],
 			() => undefined,
 		);
 		const full = stripAnsi(line.render(60).join(""));
-		expect(full.endsWith("Ctrl+O 过程 · Ctrl+T 思考 · ? 快捷键 ")).toBe(true);
-		const two = stripAnsi(line.render(36).join(""));
-		expect(two.endsWith("Ctrl+O 过程 · Ctrl+T 思考 ")).toBe(true);
+		expect(full.endsWith("Ctrl+O 过程 · Ctrl+T Thinking · ? 快捷键 ")).toBe(true);
+		const two = stripAnsi(line.render(42).join(""));
+		expect(two.endsWith("Ctrl+O 过程 · Ctrl+T Thinking ")).toBe(true);
 		expect(two).not.toContain("快捷键");
 		const none = stripAnsi(line.render(10).join(""));
 		expect(none.trim()).toBe("深度 0");
@@ -318,7 +318,7 @@ describe("U6 status area layout", () => {
 		expect(at30.trimEnd().endsWith("↓ 选择")).toBe(true);
 	});
 
-	it("matches the watermark line's four-space group rhythm and still fits 80 (F7, DS2)", () => {
+	it("reads as a rule header with the family name, counts, spend and hint, and still fits 80 (F7, DS2)", () => {
 		const subagents = new SubagentSummaryLine();
 		subagents.setSubagentCounts({ total: 3, running: 1, idle: 0, inactive: 2 });
 		subagents.setSubagentSpend({
@@ -330,9 +330,10 @@ describe("U6 status area layout", () => {
 		});
 		subagents.setOpenable(true);
 		const at80 = stripAnsi(subagents.render(80)[0] ?? "");
-		// The same GROUP_GAP rhythm as ②: four spaces between the counts and
-		// the spend cell (the hint stays right-anchored, padding flexes).
-		expect(at80).toContain("收口 2    子代理");
+		// ` 子代理 3  运行 1 · 收口 2 ── ¥… ｜ 全部 ¥…  ↓ 选择 ─`: a dim rule joins the
+		// counts to the spend cell, and the hint stays right-anchored.
+		expect(at80).toMatch(/^ 子代理 3 {2}运行 1 · 收口 2 ─+ ¥961\.72/);
+		expect(at80.trimEnd().endsWith("↓ 选择 ─")).toBe(true);
 		expect(at80).toContain("全部 ¥1235.16");
 		expect(at80).toContain("↓ 选择");
 		expect(at80).not.toContain("…");
@@ -352,7 +353,7 @@ describe("U6 status area layout", () => {
 		// The DS-measured 82-column overflow is gone: every group renders at 80.
 		const at80 = stripAnsi(subagents.render(80)[0] ?? "");
 		expect(at80).toContain("运行 1 · 收口 2");
-		expect(at80).toContain("子代理 ¥961.72 · 592M tok ｜ 全部 ¥1235.16");
+		expect(at80).toContain("¥961.72 · 592M tok ｜ 全部 ¥1235.16");
 		expect(at80).toContain("↓ 选择");
 		expect(at80).not.toContain("…");
 

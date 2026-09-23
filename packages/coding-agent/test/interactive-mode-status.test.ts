@@ -839,6 +839,8 @@ describe("InteractiveMode working timer", () => {
 			statusContainer: { addChild: vi.fn() },
 			startWorkingTimer: vi.fn(),
 			startFeatureHintPresentation: vi.fn(),
+			uiServices: { settingsManager: { getProcessMode: () => "quiet" } },
+			defaultEditor: { setPlaceholder: vi.fn() },
 		});
 	}
 
@@ -903,6 +905,19 @@ describe("InteractiveMode working timer", () => {
 
 		expect(harness.turnStartedAt).toBeUndefined();
 		expect(harness.workingStartedAt).toBe(500);
+	});
+
+	test("quiet mode keeps the loader out of the conversation and tells the prompt the turn is running", () => {
+		const harness = createInitialTimerHarness({ state: createConnectionState({ isStreaming: true }), messages: [] });
+		(
+			InteractiveMode.prototype as unknown as { startWorkingLoader(this: InitialTimerHarness): void }
+		).startWorkingLoader.call(harness);
+		const probe = harness as unknown as {
+			statusContainer: { addChild: ReturnType<typeof vi.fn> };
+			defaultEditor: { setPlaceholder: ReturnType<typeof vi.fn> };
+		};
+		expect(probe.statusContainer.addChild).not.toHaveBeenCalled();
+		expect(probe.defaultEditor.setPlaceholder).toHaveBeenCalledWith("随时补充或纠正，Enter 立即告诉 AI");
 	});
 });
 
@@ -4597,7 +4612,7 @@ describe("InteractiveMode working loader message", () => {
 
 	test("labels the activity in Chinese with the elapsed time", () => {
 		expect(loaderMessage({ activity: "executing", direction: "up", tokens: 0 })).toBe("执行中 · 12s");
-		expect(loaderMessage({ activity: "thinking", direction: "down", tokens: 0 })).toBe("思考中 · 12s");
+		expect(loaderMessage({ activity: "thinking", direction: "down", tokens: 0 })).toBe("Thinking · 12s");
 		expect(loaderMessage({ activity: "waiting", direction: "up", tokens: 0 })).toBe("等待模型 · 12s");
 		expect(loaderMessage({ activity: "writing", direction: "down", tokens: 0 })).toBe("回答中 · 12s");
 		expect(loaderMessage({ activity: "writing-code", direction: "down", tokens: 0 })).toBe("写代码 · 12s");
@@ -5203,7 +5218,7 @@ describe("InteractiveMode.setToolsExpanded", () => {
 		expect(fakeThis.thinkingExpanded).toBe(false);
 		expect(setThinkingExpanded).not.toHaveBeenCalled();
 		expect(fakeThis.showStatus).toHaveBeenCalledWith(
-			"思考 trace 被 hideThinkingBlock 设置隐藏：关闭该设置后 Ctrl+T 可展开",
+			"Thinking 已被 hideThinkingBlock 设置隐藏：关闭该设置后 Ctrl+T 可展开",
 		);
 	});
 
@@ -5222,7 +5237,7 @@ describe("InteractiveMode.setToolsExpanded", () => {
 		expect(fakeThis.agentMessagesExpanded).toBe(false);
 		expect(setThinkingExpanded).toHaveBeenCalledWith(true);
 		expect(child.setExpanded).toHaveBeenCalledWith(false);
-		expect(fakeThis.showStatus).toHaveBeenCalledWith("思考块: 全部展开");
+		expect(fakeThis.showStatus).toHaveBeenCalledWith("Thinking: 全部展开");
 	});
 });
 
