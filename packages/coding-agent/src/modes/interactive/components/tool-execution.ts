@@ -355,7 +355,17 @@ export class ToolExecutionComponent extends Container {
 
 	private isHiddenByTurnSummary(): boolean {
 		const state = this.turnActivity;
-		if (!state || this.expanded) {
+		if (!state) {
+			return false;
+		}
+		// TUI v4 T6: the key-steps view folds middle settled steps behind the ⋯
+		// row regardless of the per-tool expanded flag - applyTurnExpansion maps
+		// an open block to every tool's expanded=true, which would otherwise
+		// short-circuit the fold before it is ever consulted. Errors never fold.
+		if (state.processKeyStepsView && state.isStepFolded(this.toolCallId)) {
+			return true;
+		}
+		if (this.expanded) {
 			return false;
 		}
 		// The block closed: hide only SUCCEEDED steps (第五批: errors never
@@ -365,9 +375,7 @@ export class ToolExecutionComponent extends Container {
 		if (state.isCollapsed) {
 			return state.isStepDone(this.toolCallId);
 		}
-		// TUI v4 T6: the block is open in the key-steps view (>8 steps) - the
-		// middle settled steps fold behind the ⋯ row; errors never fold.
-		return state.isStepFolded(this.toolCallId);
+		return false;
 	}
 
 	setAgentMessagesExpanded(expanded: boolean): void {

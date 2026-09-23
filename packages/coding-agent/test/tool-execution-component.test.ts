@@ -18,6 +18,7 @@ import {
 import { createEditToolDefinition } from "../src/core/tools/edit.js";
 import { createAgentConnectionToolDefinition } from "../src/modes/agent-connection/tool-definition.js";
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
+import { TurnActivityState } from "../src/modes/interactive/components/turn-activity.js";
 import {
 	truncateToVisualLines,
 	type VisualTruncateResult,
@@ -1038,5 +1039,39 @@ describe("bash preview tail-window parity", () => {
 			throw new Error("streaming updates must produce a component");
 		}
 		expectParity(output, width, component);
+	});
+});
+
+describe("key-steps fold outranks the per-tool expanded flag (TUI v4 T6 regression)", () => {
+	test("an expanded middle step still folds while the key-steps view is armed", () => {
+		// Regression: applyTurnExpansion maps an open block to every tool's
+		// expanded=true; isHiddenByTurnSummary() used to short-circuit on that
+		// flag before consulting the key-steps fold, so the fold never fired.
+		const state = new TurnActivityState(Date.now());
+		state.setCollapsed(false);
+		state.setProcessKeySteps(true);
+		for (let i = 0; i < 12; i++) {
+			state.addStep({ toolCallId: `call_${i}`, toolName: "bash", args: {}, status: "queued" });
+			state.setStepStatus(`call_${i}`, "done", Date.now() + i);
+		}
+		const mk = (id: string) => {
+			const tool = new ToolExecutionComponent(
+				"bash",
+				id,
+				{},
+				{},
+				createBaseToolDefinition(),
+				createFakeTui(),
+				process.cwd(),
+			);
+			tool.setTurnActivity(state);
+			tool.setExpanded(true); // the lane wiring opens every tool
+			tool.updateResult({ content: [{ type: "text", text: `out ${id}` }], isError: false });
+			return tool;
+		};
+		const middle = mk("call_5").render(80);
+		const edge = mk("call_0").render(80);
+		expect(middle.join("").includes("out call_5")).toBe(false); // folded away
+		expect(edge.join("").includes("out call_0")).toBe(true); // edge stays
 	});
 });
