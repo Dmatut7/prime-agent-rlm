@@ -1,0 +1,1 @@
+- Added a `bailian-web-search` kernel skill: web search through Bailian with `enable_search`, defaulting to the `max` search strategy and always using the public compatible endpoint, with the API key resolved from `DASHSCOPE_API_KEY` or `~/.prime/agent/models.json`.
