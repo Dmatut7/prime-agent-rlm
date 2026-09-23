@@ -47,7 +47,7 @@ describe("turnStepLabel", () => {
 	});
 
 	it("reads an unrecognized python cell, or one without code, as python", () => {
-		expect(turnStepLabel(cell("for i in range(3):\n    total += i"))).toBe("python");
+		expect(turnStepLabel(cell("for i in range(3):\n    total += i"))).toBe("遍历 i");
 		expect(turnStepLabel({ toolName: "ipython", args: {} })).toBe("python");
 		expect(turnStepLabel({ toolName: "ipython", args: undefined })).toBe("python");
 	});
@@ -180,7 +180,9 @@ describe("shell and helper labels (QA M3)", () => {
 			expect(turnStepLabel(cell("print(type(agent_message).__name__, callable(agent_message.send))"))).toBe(
 				"查看 agent_message",
 			);
-			expect(turnStepLabel(cell("for i in range(3):\n    pass"))).toBe("python");
+			expect(turnStepLabel(cell("for i in range(3):\n    pass"))).toBe("遍历 i");
+			expect(turnStepLabel(cell("def helper(x):\n    return x"))).toBe("定义 helper");
+			expect(turnStepLabel(cell("while True:\n    break"))).toBe("python");
 		});
 
 		it("counts two different commands after a wait as two commands", () => {

@@ -342,7 +342,8 @@ const WRAPPER_NAMES = new Set([
 
 /**
  * A python cell with no recognised effect, still in plain words: its first
- * statement assigns (`设置 base`) or looks at a value (`查看 agent_message`).
+ * statement assigns (`设置 base`), loops (`遍历 f`), defines (`定义 helper`) or looks
+ * at a value (`查看 agent_message`).
  * Never the raw source.
  */
 function plainPythonLabel(code: string): string | undefined {
@@ -351,7 +352,11 @@ function plainPythonLabel(code: string): string | undefined {
 		if (!line || line.startsWith("#") || /^(?:import|from)\s/.test(line)) continue;
 		const assignment = /^([A-Za-z_][A-Za-z0-9_]*)(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*\s*(?::[^=]+)?=(?!=)/.exec(line);
 		if (assignment?.[1]) return `设置 ${assignment[1]}`;
-		if (/^(?:def|class|for|while|if|with|try|async)\b/.test(line)) return undefined;
+		const loop = /^(?:async\s+)?for\s+([A-Za-z_][A-Za-z0-9_]*)/.exec(line);
+		if (loop?.[1]) return `遍历 ${loop[1]}`;
+		const definition = /^(?:async\s+)?(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)/.exec(line);
+		if (definition?.[1]) return `定义 ${definition[1]}`;
+		if (/^(?:while|if|with|try|async)\b/.test(line)) return undefined;
 		for (const match of line.matchAll(/[A-Za-z_][A-Za-z0-9_]*/g)) {
 			const name = match[0];
 			const before = line[(match.index ?? 0) - 1];

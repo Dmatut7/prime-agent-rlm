@@ -141,4 +141,23 @@ describe("IPythonCellComponent QA fixes", () => {
 		expect(rendered).toContain("│ x = 1");
 		expect(rendered).not.toContain("› ");
 	});
+
+	it("keeps the code gutter on wrapped continuation rows", () => {
+		const cell = new IPythonCellComponent({
+			code: `for f in ['${"packages/coding-agent/src/modes/daemon/daemon-mode.ts', '".repeat(3)}x']:\n    print(f)`,
+			details: { status: "ok", durationMs: 3 },
+			executionStarted: true,
+			argsComplete: true,
+			expanded: true,
+		});
+		const code = cell
+			.render(60)
+			.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""))
+			.slice(1)
+			.filter((line) => line.trim().length > 0);
+		expect(code.length).toBeGreaterThan(2);
+		for (const line of code.slice(0, -1)) {
+			expect(line.trimStart().startsWith("│")).toBe(true);
+		}
+	});
 });

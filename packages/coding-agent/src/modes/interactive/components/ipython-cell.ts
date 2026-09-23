@@ -545,7 +545,6 @@ export class IPythonCellComponent implements Component {
 			return false;
 		}
 
-		this.addBlank(lines, width);
 		const isBashCell = parseIpythonBashCell(code) !== undefined;
 		const rawLines = code.split("\n");
 		// Highlight the whole cell at once so multi-line strings keep their color.
@@ -557,7 +556,8 @@ export class IPythonCellComponent implements Component {
 				isBashCell || MAGIC_LINE_PATTERN.test(rawLine) || parseIpythonBashCell(rawLine) !== undefined
 					? theme.fg("bashMode", rawLine)
 					: (highlightedLines[index] ?? theme.fg("mdCodeBlock", rawLine));
-			this.addWrapped(lines, prefix, highlighted || " ", width);
+			// Wrapped continuation rows keep the gutter so a long line still reads as code.
+			this.addWrapped(lines, prefix, highlighted || " ", width, prefix);
 		}
 
 		return true;
@@ -809,11 +809,11 @@ export class IPythonCellComponent implements Component {
 	}
 
 	// Backgroundless line, indented one space to align under the fixed top line.
-	private addWrapped(lines: string[], prefix: string, text: string, width: number): void {
+	private addWrapped(lines: string[], prefix: string, text: string, width: number, continuation?: string): void {
 		const available = Math.max(1, width - 1 - visibleWidth(prefix));
 		const wrapped = wrapTextWithAnsi(text, available);
 		for (const [index, line] of (wrapped.length > 0 ? wrapped : [""]).entries()) {
-			const linePrefix = index === 0 ? prefix : " ".repeat(visibleWidth(prefix));
+			const linePrefix = index === 0 ? prefix : (continuation ?? " ".repeat(visibleWidth(prefix)));
 			// Truncate the composed line so a narrow pane can't exceed width (fatal in the renderer).
 			lines.push(truncateToWidth(` ${linePrefix}${closeOpenSgr(line)}`, width, ""));
 		}

@@ -317,9 +317,9 @@ describe("IPythonCellComponent diff rendering", () => {
 			editDiffsExpanded: true,
 		}).split("\n");
 		expect(out[0]).not.toContain("收起");
-		expect(out[1].trim()).toBe("");
-		expect(out[2]).toContain("await edit(...)");
-		expect(out.findIndex((line) => line.includes("a.ts"))).toBeGreaterThan(2);
+		// The code sits directly under the top line, like every other cell body.
+		expect(out[1]).toContain("await edit(...)");
+		expect(out.findIndex((line) => line.includes("a.ts"))).toBeGreaterThan(1);
 	});
 
 	it("keeps the summary line but hides diff rows when edit diffs are collapsed", () => {
