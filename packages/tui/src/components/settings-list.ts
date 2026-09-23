@@ -29,6 +29,8 @@ export interface SettingsListTheme {
 
 export interface SettingsListOptions {
 	enableSearch?: boolean;
+	/** Display text for a stored value (e.g. a translation); the stored value itself is unchanged. */
+	formatValue?: (value: string) => string;
 }
 
 export class SettingsList implements Component {
@@ -41,6 +43,7 @@ export class SettingsList implements Component {
 	private onCancel: () => void;
 	private searchInput?: Input;
 	private searchEnabled: boolean;
+	private formatValue: (value: string) => string;
 
 	private submenuComponent: Component | null = null;
 	private submenuItemIndex: number | null = null;
@@ -58,6 +61,7 @@ export class SettingsList implements Component {
 		this.maxVisible = maxVisible;
 		this.theme = theme;
 		this.onChange = onChange;
+		this.formatValue = options.formatValue ?? ((value) => value);
 		this.onCancel = onCancel;
 		this.searchEnabled = options.enableSearch ?? false;
 		if (this.searchEnabled) {
@@ -130,7 +134,10 @@ export class SettingsList implements Component {
 			const usedWidth = prefixWidth + maxLabelWidth + visibleWidth(separator);
 			const valueMaxWidth = width - usedWidth - 2;
 
-			const valueText = this.theme.value(truncateToWidth(item.currentValue, valueMaxWidth, ""), isSelected);
+			const valueText = this.theme.value(
+				truncateToWidth(this.formatValue(item.currentValue), valueMaxWidth, ""),
+				isSelected,
+			);
 
 			lines.push(truncateToWidth(prefix + labelText + separator + valueText, width));
 		}

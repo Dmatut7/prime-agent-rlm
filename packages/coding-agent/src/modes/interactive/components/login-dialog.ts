@@ -345,7 +345,7 @@ export class LoginDialogComponent extends Container implements Focusable {
 		const copyHint =
 			copyKeys.length > 0
 				? theme.fg("dim", formatKeyText(copyKeys.join("/"))) +
-					theme.fg("muted", ` ${status === "failed" ? "retry" : "copy"}`)
+					theme.fg("muted", ` ${status === "failed" ? "重试" : "复制"}`)
 				: undefined;
 		const statusText =
 			status === "copied"

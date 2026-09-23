@@ -563,7 +563,7 @@ export class ProviderAuthFlows {
 				{
 					onAuth: (info) => {
 						dialog.showAuth(info.url, info.instructions);
-						armManualInput("Complete the sign-in in your browser, or paste an API key below:");
+						armManualInput("请在浏览器中完成登录，或在下方粘贴 API key：");
 					},
 					onProgress: (message) => {
 						dialog.showProgress(message);
@@ -583,7 +583,7 @@ export class ProviderAuthFlows {
 				const errorMsg = error instanceof Error ? error.message : String(error);
 				dialog.showProgress(`Browser sign-in unavailable (${errorMsg}).`);
 				if (!manualInputArmed) {
-					armManualInput("Paste a Prime API key below:");
+					armManualInput("在下方粘贴 Prime API key：");
 				}
 				return manualKeyEntry;
 			});
@@ -677,7 +677,7 @@ export class ProviderAuthFlows {
 			const browserLogin = loginPrimeAgentTraces({
 				onAuth: (info) => {
 					dialog.showAuth(info.url, info.instructions);
-					armManualInput("Complete the sign-in in your browser, or paste a Prime API key below:");
+					armManualInput("请在浏览器中完成登录，或在下方粘贴 Prime API key：");
 				},
 				onProgress: (message) => {
 					dialog.showProgress(message);
@@ -691,7 +691,7 @@ export class ProviderAuthFlows {
 				const errorMsg = error instanceof Error ? error.message : String(error);
 				dialog.showProgress(`Browser sign-in unavailable (${errorMsg}).`);
 				if (!manualInputArmed) {
-					armManualInput("Paste a Prime API key below:");
+					armManualInput("在下方粘贴 Prime API key：");
 				}
 				return manualKeyEntry;
 			});

@@ -57,7 +57,7 @@ describe("LoginDialogComponent", () => {
 		expect(output).toContain("浏览器登录");
 		expect(output).toContain("登录链接");
 		expect(output).toContain("https://example.com/oauth?client_id=test");
-		expect(output).toContain("C copy");
+		expect(output).toContain("C 复制");
 		expect(output).toContain("下一步");
 		expect(output).toContain("Complete login in your browser.");
 		expect(output).not.toContain("click to open");
@@ -82,7 +82,7 @@ describe("LoginDialogComponent", () => {
 		const url = "https://example.com/oauth";
 
 		dialog.showAuth(url);
-		expect(stripAnsi(dialog.render(88).join("\n"))).toContain("Ctrl+Y copy");
+		expect(stripAnsi(dialog.render(88).join("\n"))).toContain("Ctrl+Y 复制");
 		dialog.handleInput("c");
 		expect(mocks.copyToClipboard).not.toHaveBeenCalled();
 

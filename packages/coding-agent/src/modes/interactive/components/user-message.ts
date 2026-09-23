@@ -2,10 +2,10 @@ import {
 	Box,
 	type Component,
 	Container,
-	Markdown,
 	type MarkdownTheme,
 	type TableCellSelectionRegion,
 	visibleWidth,
+	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { builtinSlashCommandTakesArgument, parseSlashCommand } from "../../../core/slash-commands.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
@@ -15,36 +15,54 @@ const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
 const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
 
-class HighlightedMarkdown implements Component {
-	private readonly markdown: Markdown;
+/**
+ * The user's text exactly as typed: wrapped, never parsed as Markdown (a
+ * `__name__` stays `__name__`, not a bold `name`). Slash-command and argument
+ * tokens keep their highlight through the PromptTokenMask round trip.
+ */
+class HighlightedText implements Component {
 	private readonly mask: PromptTokenMask;
+	private cachedWidth?: number;
+	private cachedLines?: string[];
 
-	constructor(text: string, markdownTheme: MarkdownTheme, commandEnd = 0, includeBareSeparator = false) {
-		this.mask = new PromptTokenMask(text, commandEnd, includeBareSeparator);
-		this.markdown = new Markdown(this.mask.text, 0, 0, markdownTheme, {
-			color: (content: string) => theme.fg("userMessageText", content),
-		});
+	constructor(text: string, commandEnd = 0, includeBareSeparator = false) {
+		this.mask = new PromptTokenMask(
+			text.replace(/\r\n?/g, "\n").replace(/\s+$/, ""),
+			commandEnd,
+			includeBareSeparator,
+		);
 	}
 
 	render(width: number): string[] {
-		return this.markdown.render(width).map((line) => this.mask.restoreLine(line));
+		if (this.cachedLines && this.cachedWidth === width) {
+			return this.cachedLines;
+		}
+		const safeWidth = Math.max(1, width);
+		const lines: string[] = [];
+		for (const raw of this.mask.text.split("\n")) {
+			const expanded = raw.replace(/\t/g, "   ");
+			for (const wrapped of wrapTextWithAnsi(expanded, safeWidth)) {
+				lines.push(this.mask.restoreLine(theme.fg("userMessageText", wrapped)));
+			}
+		}
+		this.cachedWidth = width;
+		this.cachedLines = lines.length > 0 ? lines : [""];
+		return this.cachedLines;
 	}
 
 	getSelectionRegions(): ReadonlyArray<TableCellSelectionRegion> {
-		return this.markdown.getSelectionRegions().map((region) => ({
-			...region,
-			content: this.mask.restoreText(region.content),
-		}));
+		return [];
 	}
 
 	invalidate(): void {
-		this.markdown.invalidate();
+		this.cachedWidth = undefined;
+		this.cachedLines = undefined;
 	}
 }
 
 /** The user's turn marker: an accent `›` on the first line, a matching indent on the rest. */
 class MarkedLines implements Component {
-	constructor(private readonly child: HighlightedMarkdown) {}
+	constructor(private readonly child: HighlightedText) {}
 
 	render(width: number): string[] {
 		const marker = ` ${theme.fg("accent", "›")} `;
@@ -74,7 +92,7 @@ export class UserMessageComponent extends Container {
 
 	constructor(
 		text: string,
-		markdownTheme: MarkdownTheme = getMarkdownTheme(),
+		_markdownTheme: MarkdownTheme = getMarkdownTheme(),
 		isRecognizedSlashCommand: (name: string) => boolean = () => false,
 	) {
 		super();
@@ -83,9 +101,7 @@ export class UserMessageComponent extends Container {
 		const includeBareSeparator =
 			command !== undefined && commandEnd > 0 && builtinSlashCommandTakesArgument(command.name);
 		this.contentBox = new Box(0, 1, (content: string) => theme.getUserMessageBackgroundColor()(content));
-		this.contentBox.addChild(
-			new MarkedLines(new HighlightedMarkdown(text, markdownTheme, commandEnd, includeBareSeparator)),
-		);
+		this.contentBox.addChild(new MarkedLines(new HighlightedText(text, commandEnd, includeBareSeparator)));
 		this.addChild(this.contentBox);
 	}
 

@@ -1195,6 +1195,8 @@ export class InteractiveMode {
 	private loadingAnimation: Loader | undefined = undefined;
 	private workingMessage: string | undefined = undefined;
 	private recentSession: RecentSession | undefined;
+	/** When the current agent run started (agent_start), the floor for its turn clock. */
+	private agentRunStartedAt: number | undefined;
 	private workingVisible = true;
 	private workingIndicatorOptions: LoaderIndicatorOptions | undefined = undefined;
 	private workingStartedAt: number | undefined = undefined;
@@ -6072,6 +6074,7 @@ export class InteractiveMode {
 
 		switch (event.type) {
 			case "agent_start":
+				this.agentRunStartedAt = Date.now();
 				this.featureHintRunPending = this.getRetryAttempt() === 0;
 				this.resetPendingToolState();
 				this.renderRecap();
@@ -6211,9 +6214,12 @@ export class InteractiveMode {
 			case "message_start":
 				// The run's first starter anchors the elapsed display; mid-turn steering must not restart it.
 				if (this.turnStartedAt === undefined && startsAgentRun(event.message)) {
-					this.turnStartedAt = event.message.timestamp;
+					// A queued follow-up carries the time it was typed; its run starts
+					// when the agent picks it up, not while the previous run was going.
+					const anchor = Math.max(event.message.timestamp, this.agentRunStartedAt ?? 0);
+					this.turnStartedAt = anchor;
 					if (this.workingStartedAt !== undefined) {
-						this.workingStartedAt = event.message.timestamp;
+						this.workingStartedAt = anchor;
 						this.updateWorkingLoaderMessage();
 					}
 				}

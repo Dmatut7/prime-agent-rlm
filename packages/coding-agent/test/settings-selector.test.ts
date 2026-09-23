@@ -2,6 +2,7 @@ import { resetCapabilitiesCache, setCapabilities } from "@earendil-works/pi-tui"
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, test, vi } from "vitest";
 import {
+	formatSettingValue,
 	type SettingsCallbacks,
 	type SettingsConfig,
 	SettingsSelectorComponent,
@@ -83,6 +84,22 @@ describe("SettingsSelectorComponent", () => {
 		} finally {
 			resetCapabilitiesCache();
 		}
+	});
+
+	test("shows values in Chinese while the stored values stay unchanged", () => {
+		const onProcessModeChange = vi.fn();
+		const component = new SettingsSelectorComponent(config, { ...callbacks, onProcessModeChange });
+		const list = component.getSettingsList();
+		for (const character of "process") list.handleInput(character);
+		const before = stripAnsi(component.render(120).join("\n"));
+		expect(before).toContain("安静");
+		expect(before).not.toMatch(/\bquiet\b/);
+		list.handleInput("\r");
+		expect(onProcessModeChange).toHaveBeenCalledWith("legacy");
+		expect(stripAnsi(component.render(120).join("\n"))).toContain("经典");
+		expect(formatSettingValue("true")).toBe("开");
+		expect(formatSettingValue("false")).toBe("关");
+		expect(formatSettingValue("some-theme")).toBe("some-theme");
 	});
 
 	test("renders the process-mode row and cycles quiet to legacy", () => {

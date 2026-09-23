@@ -6152,6 +6152,42 @@ test("only the queued user /refine settlement stops its loader", async () => {
 	expect(statusContainer.children.length).toBe(0);
 });
 
+test("a queued follow-up's turn clock starts when its run starts, not when it was typed", async () => {
+	initTheme("dark");
+	const fakeThis = {
+		ui: { requestRender: vi.fn() } as unknown as TUI,
+		statusContainer: new Container(),
+		stopWorkingLoader: vi.fn(),
+		syncWorkingLoader: vi.fn(),
+		addMessageToChat: vi.fn(),
+		showError: vi.fn(),
+		isInitialized: true,
+		footer: { invalidate: vi.fn() },
+		updateConnectionStateFromEvent: vi.fn(),
+		prepareFeatureHintRun: vi.fn(),
+		activityTracker: { handleEvent: vi.fn(), reset: vi.fn() },
+		updateWorkingLoaderMessage: vi.fn(),
+		renderRecap: vi.fn(),
+		chatContainer: new Container(),
+		shortcutGuideContainer: new Container(),
+		agentRunFileChanges: new Map(),
+		turnStartedAt: undefined,
+		workingStartedAt: 4_000,
+		agentRunStartedAt: 5_000,
+	} as unknown as InteractiveMode;
+	Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+	const prototype = InteractiveMode.prototype as unknown as {
+		handleEvent(this: InteractiveMode, event: unknown): Promise<void>;
+	};
+	await prototype.handleEvent.call(fakeThis, {
+		type: "message_start",
+		message: { role: "user", content: "and add a greeting", timestamp: 1_000 },
+	});
+	const state = fakeThis as unknown as { turnStartedAt?: number; workingStartedAt?: number };
+	expect(state.turnStartedAt).toBe(5_000);
+	expect(state.workingStartedAt).toBe(5_000);
+});
+
 test("session teardown removes a running refine loader without remounting anything", () => {
 	initTheme("dark");
 	const statusContainer = new Container();

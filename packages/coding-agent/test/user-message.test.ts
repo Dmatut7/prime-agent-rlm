@@ -60,6 +60,17 @@ describe("UserMessageComponent", () => {
 		expect(lines[2].endsWith(BG_RESET)).toBe(true);
 	});
 
+	test("renders the user's text verbatim: no Markdown, newlines and spacing kept", () => {
+		initTheme("dark");
+		const text = "print(type(agent_message).__name__)\n  - not a list\n# not a heading";
+		const plain = new UserMessageComponent(text)
+			.render(60)
+			.map((line) => line.replace(/\x1b\[[0-9;]*m|\x1b\]133;[ABC]\x07/g, "").trimEnd());
+		expect(plain).toContain(" › print(type(agent_message).__name__)");
+		expect(plain).toContain("     - not a list");
+		expect(plain).toContain("   # not a heading");
+	});
+
 	test("colors only recognized leading slash commands", () => {
 		clearDefaultTerminalColors();
 		initTheme("dark");
@@ -72,7 +83,8 @@ describe("UserMessageComponent", () => {
 		const embedded = new UserMessageComponent("Explain /compact", undefined, recognized).render(40).join("\n");
 
 		expect(command).toContain(theme.fg("accent", "/compact"));
-		expect(command).not.toContain("**errors**");
+		// The user's text is shown verbatim, never parsed as Markdown.
+		expect(command).toContain("**errors**");
 		expect(command).not.toBe(unknown);
 		expect(unknown).not.toContain(theme.fg("accent", "/unknown"));
 		expect(embedded).not.toContain(theme.fg("accent", "/compact"));
@@ -83,7 +95,7 @@ describe("UserMessageComponent", () => {
 			name: "wide and multi-code-point command graphemes",
 			message: "/命é令 arg **bold**",
 			commandName: "命é令",
-			expectedLines: ["", "› /命é", "令", "arg", "bold", ""],
+			expectedLines: ["", "› /命é", "令", "arg", "**bo", "ld**", ""],
 		},
 		{
 			name: "width-three command graphemes atomically",

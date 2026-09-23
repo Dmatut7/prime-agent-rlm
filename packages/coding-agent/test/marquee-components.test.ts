@@ -226,8 +226,9 @@ describe("marquee TUI components", () => {
 		const component = new IPythonCellComponent(state);
 
 		const collapsed = stripAnsi(component.render(100).join("\n"));
-		expect(collapsed).toContain("line_0 = 0");
-		expect(collapsed).not.toContain("line_7 = 7");
+		// The label names the first assignment; the source stays out of the collapsed row.
+		expect(collapsed).toContain("设置 line_0");
+		expect(collapsed).not.toContain("line_0 = 0");
 		expect(collapsed).toContain("1 行输出");
 		// U6: no per-line expand hint.
 		expect(collapsed).not.toContain("展开");
@@ -436,7 +437,7 @@ describe("marquee TUI components", () => {
 		component.setExpanded(true);
 		const expandedLines = component.render(100);
 		const expanded = stripAnsi(expandedLines.join("\n"));
-		const expandedStatus = expandedLines.map(stripAnsi).find((line) => line.includes("python print(55)"));
+		const expandedStatus = expandedLines.map(stripAnsi).find((line) => line.startsWith(" ✓ python"));
 		expect(expandedStatus).toContain("1 行输出 · 12ms");
 		// U6: no per-line expand hint, expanded or collapsed.
 		expect(expanded).not.toContain("Ctrl+O");

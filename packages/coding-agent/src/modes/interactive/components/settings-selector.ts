@@ -30,6 +30,35 @@ const THINKING_DESCRIPTIONS: Record<ThinkingLevel, string> = {
 	max: "最深思考",
 };
 
+/** What the settings list shows for a stored value; the stored value itself is unchanged. */
+const SETTING_VALUE_LABELS: Record<string, string> = {
+	true: "开",
+	false: "关",
+	off: "关",
+	all: "全部",
+	auto: "自动",
+	default: "默认",
+	final: "完成后",
+	streaming: "流式",
+	quiet: "安静",
+	legacy: "经典",
+	"one-at-a-time": "逐条",
+	"no-tools": "不含工具",
+	"user-only": "只看我的",
+	"labeled-only": "只看标记",
+	configure: "去设置",
+	minimal: "极少",
+	low: "低",
+	medium: "中",
+	high: "高",
+	xhigh: "很高",
+	max: "最高",
+};
+
+export function formatSettingValue(value: string): string {
+	return SETTING_VALUE_LABELS[value] ?? value;
+}
+
 export interface SettingsConfig {
 	autoCompact: boolean;
 	idleEvictionMinutes: IdleEvictionMinutes;
@@ -120,6 +149,7 @@ class WarningSettingsSubmenu extends Container {
 				}
 			},
 			onCancel,
+			{ formatValue: formatSettingValue },
 		);
 
 		this.addChild(this.settingsList);
@@ -219,14 +249,14 @@ export class SettingsSelectorComponent extends Container {
 			{
 				id: "steering-mode",
 				label: "插话方式",
-				description: "运行中按 Enter 插话。one-at-a-time：一次送一条，等回应再送下一条；all：一次全部送达。",
+				description: "运行中按 Enter 插话。逐条：一次送一条，等回应再送下一条；全部：一次全部送达。",
 				currentValue: config.steeringMode,
 				values: ["one-at-a-time", "all"],
 			},
 			{
 				id: "follow-up-mode",
 				label: "排队方式",
-				description: "Alt+Enter 排队的消息在本轮结束后发送。one-at-a-time：一次一条；all：一次全部。",
+				description: "Alt+Enter 排队的消息在本轮结束后发送。逐条：一次一条；全部：一次全部。",
 				currentValue: config.followUpMode,
 				values: ["one-at-a-time", "all"],
 			},
@@ -254,7 +284,7 @@ export class SettingsSelectorComponent extends Container {
 			{
 				id: "process-mode",
 				label: "过程显示",
-				description: "quiet：每轮收成一行过程；legacy：显示完整过程",
+				description: "安静：每轮收成一行过程；经典：显示完整过程",
 				currentValue: config.processMode,
 				values: ["quiet", "legacy"],
 			},
@@ -523,7 +553,7 @@ export class SettingsSelectorComponent extends Container {
 				}
 			},
 			callbacks.onCancel,
-			{ enableSearch: true },
+			{ enableSearch: true, formatValue: formatSettingValue },
 		);
 
 		this.addChild(this.settingsList);

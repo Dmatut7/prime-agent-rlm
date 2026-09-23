@@ -10,3 +10,5 @@
 - Fixed tests writing fake sessions into the real agent directory.
 - Fixed Python skills being reported unavailable (and so avoided by the model) after a kernel re-bootstrap or restored state.
 - Changed the settings menu, login dialog, model and provider pickers, slash-command descriptions and list scroll indicators to Chinese.
+- Changed user messages to render verbatim instead of as Markdown.
+- Changed setting values, provider subtitles and remaining login-dialog text to Chinese, and unrecognised Python steps to short labels such as 设置 x / 查看 x.

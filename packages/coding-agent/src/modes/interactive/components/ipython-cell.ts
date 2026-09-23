@@ -7,7 +7,6 @@ import {
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { formatAgentMessageParticipant } from "../../../core/agent-messages.js";
-import { previewIpythonCode } from "../../../core/tools/code-preview.js";
 import { generateDiffString } from "../../../core/tools/edit-diff.js";
 import { parseIpythonBashCell } from "../../../core/tools/ipython-cell-code.js";
 import { getLanguageFromPath, highlightCode, theme } from "../theme/theme.js";
@@ -17,7 +16,7 @@ import { normalizeErrorDetails, summarizeErrorDetails } from "./collapsible-erro
 import { renderDiffSeparator, renderRichDiff } from "./diff.js";
 import { countChangedLines, FILE_CHANGE_DIFF_INDENT, formatFileChangeSummaryLine } from "./edit-summary.js";
 import { keyText } from "./keybinding-hints.js";
-import { turnStepLabel } from "./step-label.js";
+import { isFallbackPythonLabel, turnStepLabel } from "./step-label.js";
 import { QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES, quietConversationBudget, toolOutputFull } from "./tool-output-budget.js";
 
 export interface IPythonCellContentBlock {
@@ -393,7 +392,7 @@ export class IPythonCellComponent implements Component {
 
 		// An expanded step shows what it produced; its code joins only in the full
 		// view, or when the label could not say what the cell does.
-		const showCode = this.state.expanded && (toolOutputFull() || this.stepLabel() === "python");
+		const showCode = this.state.expanded && (toolOutputFull() || isFallbackPythonLabel(this.state.code));
 		const hasCode = showCode ? this.renderCode(lines, safeWidth) : false;
 		if ((details.diffs?.length ?? 0) > 0) {
 			this.renderDiffs(lines, safeWidth, details.diffs ?? [], hasCode);
@@ -416,17 +415,14 @@ export class IPythonCellComponent implements Component {
 	 */
 	/**
 	 * The cell's fixed top line, in plain words, with its facts right-aligned:
-	 * `✓ 运行 npm check                      12 行输出 · 1.2s`. A cell without a
-	 * recognizable effect shows its most telling code line after the label.
+	 * `✓ 运行 npm check                      12 行输出 · 1.2s`. The label never
+	 * carries raw source; the code is in the expanded view.
 	 */
 	private topLine(details: IpythonDetails, width: number): string {
 		const code = this.state.code.trimEnd();
-		const preview = previewIpythonCode(code);
 		const label = this.stepLabel();
 		let left = ` ${this.marker(details)} ${theme.fg("text", label)}`;
-		if (label === "python" && preview.text) {
-			left += ` ${this.highlightInputLine(preview.text, preview.language === "bash")}`;
-		} else if (!code && !this.state.executionStarted) {
+		if (!code && !this.state.executionStarted) {
 			left += ` ${theme.fg("muted", "等待代码")}`;
 		}
 
@@ -565,14 +561,6 @@ export class IPythonCellComponent implements Component {
 		}
 
 		return true;
-	}
-
-	private highlightInputLine(line: string, isBashCell: boolean): string {
-		if (isBashCell || MAGIC_LINE_PATTERN.test(line) || parseIpythonBashCell(line) !== undefined) {
-			return theme.fg("bashMode", line);
-		}
-		const highlighted = highlightCode(line, "python");
-		return highlighted[0] ?? theme.fg("mdCodeBlock", line);
 	}
 
 	// Only runs when expanded — shows full output below the code, no previews.

@@ -422,7 +422,7 @@ describe("IPythonCellComponent diff rendering", () => {
 		const collapsed = new IPythonCellComponent({ ...state, expanded: false }).render(80);
 		const expanded = new IPythonCellComponent({ ...state, expanded: true }).render(80);
 
-		expect(stripAnsi(collapsed[0])).toMatch(/^ ✓ python print\(55\) {2,}1 行输出 · 780\.0s $/);
+		expect(stripAnsi(collapsed[0])).toMatch(/^ ✓ python {2,}1 行输出 · 780\.0s $/);
 		expect(visibleWidth(collapsed[0])).toBe(80);
 		expect(stripAnsi(expanded[0])).toBe(stripAnsi(collapsed[0]));
 		const upToHint = (line: string) => stripAnsi(line).replace(/· \([^·]*(展开|收起)\)$/, "");

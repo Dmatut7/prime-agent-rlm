@@ -47,7 +47,7 @@ describe("turnStepLabel", () => {
 	});
 
 	it("reads an unrecognized python cell, or one without code, as python", () => {
-		expect(turnStepLabel(cell("x = 1 + 2\nprint(x)"))).toBe("python");
+		expect(turnStepLabel(cell("for i in range(3):\n    total += i"))).toBe("python");
 		expect(turnStepLabel({ toolName: "ipython", args: {} })).toBe("python");
 		expect(turnStepLabel({ toolName: "ipython", args: undefined })).toBe("python");
 	});
@@ -170,5 +170,25 @@ describe("shell and helper labels (QA M3)", () => {
 		);
 		expect(cell("await agent_message.send('hi', receiver_role='parent')")).toBe("发消息");
 		expect(cell("h = bash('npm run check')\nprint(h.tail(20))")).toBe("运行 npm run check");
+	});
+
+	describe("round-3 labels", () => {
+		const cell = (code: string) => ({ toolName: "ipython", args: { code } });
+		it("names otherwise-unrecognised python cells in plain words, never raw source", () => {
+			expect(turnStepLabel(cell("base='/Users/a1/work'\nprint(base)"))).toBe("设置 base");
+			expect(turnStepLabel(cell("p = os.path.join(root, 'x')"))).toBe("设置 p");
+			expect(turnStepLabel(cell("print(type(agent_message).__name__, callable(agent_message.send))"))).toBe(
+				"查看 agent_message",
+			);
+			expect(turnStepLabel(cell("for i in range(3):\n    pass"))).toBe("python");
+		});
+
+		it("counts two different commands after a wait as two commands", () => {
+			const step = (id: string, command: string) => ({ toolCallId: id, toolName: "bash", args: { command } });
+			expect(turnStepsSummary([step("a", "sleep 3 && echo step-1"), step("b", "sleep 3 && echo step-3")])).toBe(
+				"运行 2 条命令",
+			);
+			expect(turnStepsSummary([step("a", "seq 1 30")])).toBe("运行 seq 1 30");
+		});
 	});
 });

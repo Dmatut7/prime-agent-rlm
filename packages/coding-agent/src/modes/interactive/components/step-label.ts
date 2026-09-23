@@ -317,6 +317,64 @@ export function turnStepLabel(step: StepLabelInput): string {
 	return withoutTemplateHoles(rawStepLabel(step));
 }
 
+/** Builtins that wrap the value a reader cares about (`print(type(x).__name__)` looks at `x`). */
+const WRAPPER_NAMES = new Set([
+	"print",
+	"type",
+	"len",
+	"str",
+	"repr",
+	"list",
+	"dict",
+	"set",
+	"tuple",
+	"sorted",
+	"sum",
+	"int",
+	"float",
+	"bool",
+	"isinstance",
+	"callable",
+	"dir",
+	"vars",
+	"await",
+]);
+
+/**
+ * A python cell with no recognised effect, still in plain words: its first
+ * statement assigns (`设置 base`) or looks at a value (`查看 agent_message`).
+ * Never the raw source.
+ */
+function plainPythonLabel(code: string): string | undefined {
+	for (const raw of code.split("\n")) {
+		const line = raw.trim();
+		if (!line || line.startsWith("#") || /^(?:import|from)\s/.test(line)) continue;
+		const assignment = /^([A-Za-z_][A-Za-z0-9_]*)(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*\s*(?::[^=]+)?=(?!=)/.exec(line);
+		if (assignment?.[1]) return `设置 ${assignment[1]}`;
+		if (/^(?:def|class|for|while|if|with|try|async)\b/.test(line)) return undefined;
+		for (const match of line.matchAll(/[A-Za-z_][A-Za-z0-9_]*/g)) {
+			const name = match[0];
+			const before = line[(match.index ?? 0) - 1];
+			if (before === "." || WRAPPER_NAMES.has(name)) continue;
+			return `查看 ${name}`;
+		}
+		return undefined;
+	}
+	return undefined;
+}
+
+/**
+ * Whether a python cell's label is only a stand-in (`python`, `设置 x`, `查看 y`)
+ * rather than a recognised effect; such a cell shows its code once expanded.
+ */
+export function isFallbackPythonLabel(code: string): boolean {
+	if (!code.trim() || parseIpythonBashCell(code)) return false;
+	if (pythonEffects(code).length > 0) return false;
+	const preview = previewIpythonCode(code);
+	if (preview.language === "bash") return false;
+	return !/^(read|write|delete|mkdir|rename|replace|touch) (\S+)$/.test(preview.text);
+}
+
 function rawStepLabel(step: StepLabelInput): string {
 	if (step.toolName === "ipython") {
 		const code = argString(step.args, "code");
@@ -339,7 +397,7 @@ function rawStepLabel(step: StepLabelInput): string {
 		if (fileOp?.[1] && fileOp[2]) {
 			return `${PYTHON_FILE_VERBS[fileOp[1]] ?? fileOp[1]} ${pathTail(fileOp[2])}`;
 		}
-		return "python";
+		return plainPythonLabel(code) ?? "python";
 	}
 	const path = argString(step.args, "path", "file_path");
 	switch (step.toolName) {
@@ -379,7 +437,9 @@ const GROUP_COUNT_NOUN: Record<string, string> = {
 
 /** A command in a summary keeps its program and subcommand: `git status`, `npm run check`. */
 function shortCommand(command: string): string {
-	const words = command.split("|")[0]?.trim().split(/\s+/) ?? [];
+	// `sleep 3 → echo step-1` is keyed by what runs after the wait.
+	const main = command.includes(" → ") ? (command.split(" → ").at(-1) ?? command) : command;
+	const words = main.split("|")[0]?.trim().split(/\s+/) ?? [];
 	const head = words
 		.slice(0, words[0] === "npm" && words[1] === "run" ? 3 : 2)
 		.filter((word) => !word.startsWith("-"));

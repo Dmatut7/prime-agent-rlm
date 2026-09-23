@@ -293,7 +293,7 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 			this.listContainer.addChild(
 				new MenuRow({
 					primary: provider.name,
-					secondary: provider.authType === "oauth" ? "subscription" : "api key",
+					secondary: provider.authType === "oauth" ? "订阅" : "API key",
 					meta: this.formatStatusIndicator(provider),
 					selected: isSelected,
 				}),
