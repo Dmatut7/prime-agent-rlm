@@ -6170,8 +6170,12 @@ export class InteractiveMode {
 						this.stopRefineLoader();
 					}
 					// TUI v4: a received agent-message row is one comm in this turn.
+					// A steering comm resets the turn group before the new summary
+					// exists (lazy creation), so fall back to the latest turn - the
+					// rebuild path counts the same row into the same turn span,
+					// keeping the live and replay comm counts equal (T6).
 					if (isAgentSessionMessage(event.message) && event.message.display) {
-						this.currentTurnSummary?.addCommMessage();
+						(this.currentTurnSummary ?? this.latestTurnSummary())?.addCommMessage();
 					}
 					this.addMessageToChat(event.message);
 					this.ui.requestRender();
