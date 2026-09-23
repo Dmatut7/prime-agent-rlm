@@ -234,16 +234,17 @@ export function countRosterSubagentStatuses(
 	return counts;
 }
 
-/** One-line entry into the current session's scoped agents view. */
 /**
- * U6 ①: the status area's top line — pure navigation (agents/resume · 深度 N)
- * with the context figures on the right only while the footer watermark is
- * off (the fallback reads the footer's own snapshot, so both readouts agree).
+ * The hint line above the prompt: status on the left (the Ctrl+C exit
+ * warning, the queue hint, goal, heartbeats, agent depth) and, on the right,
+ * only the keys that work right now (`Esc 中断 · Ctrl+O 过程` while a turn
+ * runs). Hints drop whole from the end when the line is too narrow; the
+ * left side never truncates a key hint into noise.
  */
 export class TrayInfoLine implements Component {
 	constructor(
-		private readonly getLocationLabel: () => string | undefined = () => undefined,
-		private readonly getContextLabel: () => string | undefined = () => undefined,
+		private readonly getStatusLabel: () => string | undefined = () => undefined,
+		private readonly getHints: () => readonly string[] = () => [],
 		private readonly getOverrideLabel: () => string | undefined = () => undefined,
 	) {}
 
@@ -252,20 +253,25 @@ export class TrayInfoLine implements Component {
 	}
 
 	render(width: number): string[] {
-		const overrideLabel = this.getOverrideLabel()?.trim();
-		const locationLabel = this.getLocationLabel()?.trim();
-		const contextLabel = this.getContextLabel()?.trim();
-		const left = overrideLabel || locationLabel || "";
-		if (!left && !contextLabel) return [];
 		const safeWidth = Math.max(1, width);
-		const right = contextLabel ?? "";
-		const gap = left && right ? 2 : 0;
-		const rightWidth = Math.min(visibleWidth(right), Math.max(0, safeWidth - gap));
-		const leftWidth = Math.max(0, safeWidth - rightWidth - gap);
-		const renderedLeft = truncateToWidth(left, leftWidth, "…");
-		const renderedRight = truncateToWidth(right, rightWidth, "…");
-		const padding = Math.max(0, safeWidth - visibleWidth(renderedLeft) - visibleWidth(renderedRight));
-		return [theme.fg("muted", `${renderedLeft}${" ".repeat(padding)}${renderedRight}`)];
+		const override = this.getOverrideLabel()?.trim();
+		const left = override || this.getStatusLabel()?.trim() || "";
+		const leftText = left ? ` ${left}` : "";
+		const leftStyled = override ? theme.fg("warning", leftText) : theme.fg("muted", leftText);
+		const hints = [...this.getHints()].filter((hint) => hint.trim().length > 0);
+		for (let count = hints.length; count >= 0; count--) {
+			const right = count > 0 ? `${hints.slice(0, count).join(" · ")} ` : "";
+			const gap = leftText && right ? 2 : 0;
+			if (visibleWidth(leftText) + gap + visibleWidth(right) > safeWidth) {
+				continue;
+			}
+			if (!leftText && !right) {
+				return [];
+			}
+			const padding = " ".repeat(Math.max(0, safeWidth - visibleWidth(leftText) - visibleWidth(right)));
+			return [`${leftStyled}${padding}${theme.fg("dim", right)}`];
+		}
+		return [truncateToWidth(leftStyled, safeWidth, "…")];
 	}
 }
 

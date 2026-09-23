@@ -1,37 +1,26 @@
-import {
-	type ClickRegion,
-	type Component,
-	type Keybinding,
-	truncateToWidth,
-	visibleWidth,
-} from "@earendil-works/pi-tui";
+import { type ClickRegion, type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { theme } from "../theme/theme.js";
-import { keyText } from "./keybinding-hints.js";
+import type { FileChangeSummary } from "./edit-summary.js";
 
 /**
- * TUI v4 quiet conversation (T2b): the per-turn footnote. One line under the
- * turn's final answer that carries all process stats the v4 conversation flow
- * removed - `干了 1 分 05 秒 · 14 步 [O] · 想 7 段 [T] · → 通讯 2 条 [P]` - with
- * the key hints in the prototype's accent blue and the rest dim. Narrow
- * screens (<100 columns, R2.1: 100 exactly keeps the full form) switch to the
- * compressed form `干了 1分05秒 · 14步 · 7想 · 2讯`; a thinking-only turn shows
- * `想了想`; an all-zero turn renders nothing. When the line overflows, the key
- * hints go first, then the text truncates at the right edge by display
- * columns (CJK = 2 columns). The body starts one column in, aligned with the
- * turn-head aggregate lines; a caret glyph (P3: ▸ collapsed / ▾ once any
- * detail block is open, passed by the wiring) occupies that column.
+ * The per-turn process line: one line at the turn head that says what the
+ * turn did, in plain words -
+ * `▸ 思考 · 5 步 · 14.8s   运行 npm check · 写入 footer.ts` - followed, while
+ * the process block is closed, by one row per changed file
+ * (`   改动 src/footer.ts  +3 −5`), so edits stay visible without expanding.
+ * Stats render muted, the plain-words summary dim; the summary drops first
+ * when the line overflows. A thinking-only turn reads `▸ 思考 · 3.2s`; an
+ * all-zero turn renders nothing.
  */
 
-/** Below this column count the footnote switches to the compressed narrow form (R2.1: the boundary itself stays wide). */
-export const TURN_FOOT_NOTE_NARROW_COLS = 100;
-
-/**
- * The canonical caret glyphs (P3): ▸ while every detail block is collapsed,
- * ▾ once any of the three blocks is open. The wiring owns the state and
- * passes the glyph via `props.caret`; the component never renders a caret by
- * default.
- */
+/** The caret glyphs: ▸ while every detail block is collapsed, ▾ once any block is open. */
 export const TURN_FOOT_NOTE_CARETS = { collapsed: "▸", expanded: "▾" } as const;
+
+/** Changed-file rows shown under a closed process line before the rest fold into one count row. */
+export const TURN_FOOT_NOTE_MAX_FILE_ROWS = 5;
+
+/** Narrowest room left for the plain-words summary before it drops entirely. */
+const SUMMARY_MIN_WIDTH = 12;
 
 /** Turn statistics the footnote summarizes; counts are non-negative, duration in ms. */
 export interface TurnFootNoteProps {
@@ -45,97 +34,48 @@ export interface TurnFootNoteProps {
 	durationMs: number;
 	/** Available terminal columns; the line truncates to this display width (CJK = 2 columns). */
 	cols: number;
-	/** Whether to render the [O]/[T]/[P] key hints (default true). Overwide lines drop them first. */
-	showKeys?: boolean;
+	/** Plain-words summary of the steps (`运行 npm check · 读取 footer.ts`). */
+	summary?: string;
+	/** Files the turn changed, with display paths; rendered as rows under the line. */
+	fileChanges?: readonly FileChangeSummary[];
 	/** Optional caret glyph (▸/▾) rendered in the line's indent column; the wiring owns the state. Default: none. */
 	caret?: string;
-	/**
-	 * Optional segment-click handler (T12): fired with the lane id when a
-	 * stats segment (`14 步 [O]` etc., hints or not) is clicked. Zero-value
-	 * segments never render and so never fire.
-	 */
+	/** Fired with the lane id when a stats segment is clicked. Zero-value segments never render and so never fire. */
 	onSegmentClick?: (segment: TurnFootNoteSegment) => void;
 	/** Optional caret-click handler - the caret glyph's own click lane. */
 	onCaretClick?: () => void;
 }
 
-/** The footnote's clickable stats segments (T12 component side). */
+/** The footnote's clickable stats segments. */
 export type TurnFootNoteSegment = "steps" | "think" | "comm";
 
-/** One dot-separated piece of the footnote line. */
 interface FootNoteSegment {
-	/** Visible text of the segment, e.g. `14 步`. */
 	text: string;
-	/** Key hint suffix (wide form only), e.g. ` [O]`. */
-	hint?: string;
-	/** Which stats lane the piece belongs to, when it is clickable. */
 	clickTarget?: TurnFootNoteSegment;
 }
 
-/** Which app keybinding opens each footnote detail block (R2.2: no hardcoded key letters). */
-const SEGMENT_KEYS = {
-	steps: "app.tools.expand",
-	think: "app.thinking.toggle",
-	comm: "app.messages.expand",
-} as const satisfies Record<string, Keybinding>;
-
-/**
- * The bracket hint for one detail block: the final key part of the binding's
- * display name (`Ctrl+O` → ` [O]`), so a rebound key shows its real letter
- * instead of the shipped default. When keyText() resolves to nothing - the
- * keybindings manager is not installed yet (bare test environments) or the
- * key is unbound - the shipped default's literal letter is the fallback.
- */
-function segmentHint(appKey: Keybinding, fallback: string): string {
-	const display = keyText(appKey, { primaryOnly: true });
-	const last = display.split("+").pop()?.trim() ?? "";
-	return last ? ` [${last}]` : fallback;
-}
-
-/**
- * The key-hint highlight (P3): the v4 prototype's --accent blue, #6ba7ff. No
- * terminal theme variable carries that exact color (the dark theme's accent
- * slot is #8abeb7 and adaptively blends toward purple), so the literal from
- * the prototype applies, in the theme's active color depth; 256-color
- * terminals approximate it as xterm cube index 75.
- */
-const KEY_HINT_COLOR = { rgb: { r: 107, g: 167, b: 255 }, ansi256: 75 } as const;
-
-function keyHintFg(text: string): string {
-	if (theme.colorMode === "truecolor") {
-		return `\x1b[38;2;${KEY_HINT_COLOR.rgb.r};${KEY_HINT_COLOR.rgb.g};${KEY_HINT_COLOR.rgb.b}m${text}\x1b[39m`;
+/** Compact turn duration: `14.8s`, `1m05s`, `1h07m`. */
+export function turnFootNoteDurationText(durationMs: number): string {
+	const ms = Math.max(0, durationMs);
+	if (ms < 59_950) {
+		return `${(ms / 1000).toFixed(1)}s`;
 	}
-	return `\x1b[38;5;${KEY_HINT_COLOR.ansi256}m${text}\x1b[39m`;
-}
-
-/**
- * The duration segment in the three pinned tiers: `干了 45 秒` / `干了 1 分 05 秒`
- * / `干了 1 时 07 分` - minutes unpadded, seconds two digits; the narrow form
- * drops the inner spaces (`干了 45秒` / `干了 1分05秒` / `干了 1时07分`).
- */
-export function turnFootNoteDurationText(durationMs: number, narrow: boolean): string {
-	const totalSeconds = Math.max(0, Math.round(durationMs / 1000));
-	if (totalSeconds < 60) {
-		return narrow ? `干了 ${totalSeconds}秒` : `干了 ${totalSeconds} 秒`;
-	}
+	const totalSeconds = Math.round(ms / 1000);
 	const totalMinutes = Math.floor(totalSeconds / 60);
 	if (totalMinutes < 60) {
-		const seconds = String(totalSeconds % 60).padStart(2, "0");
-		return narrow ? `干了 ${totalMinutes}分${seconds}秒` : `干了 ${totalMinutes} 分 ${seconds} 秒`;
+		return `${totalMinutes}m${String(totalSeconds % 60).padStart(2, "0")}s`;
 	}
-	const hours = Math.floor(totalMinutes / 60);
-	const minutes = String(totalMinutes % 60).padStart(2, "0");
-	return narrow ? `干了 ${hours}时${minutes}分` : `干了 ${hours} 时 ${minutes} 分`;
+	return `${Math.floor(totalMinutes / 60)}h${String(totalMinutes % 60).padStart(2, "0")}m`;
 }
 
-/** A clickable stats span within the body, in body coordinates (after the indent column). */
 interface FootNoteSpan {
 	segment: TurnFootNoteSegment;
-	/** Zero-based visible column of the span's left edge within the body. */
 	col: number;
-	/** Visible width in columns. */
 	width: number;
 }
+
+const JOINER = " · ";
+const SUMMARY_GAP = "   ";
 
 export class TurnFootNote implements Component {
 	private props: TurnFootNoteProps;
@@ -147,12 +87,11 @@ export class TurnFootNote implements Component {
 		this.props = props;
 	}
 
-	/** Click regions from the last render() (T12): one per rendered stats segment, plus the caret. */
+	/** Click regions from the last render(): one per rendered stats segment, plus the caret. */
 	getClickRegions(): ReadonlyArray<ClickRegion> {
 		return this.clickRegions;
 	}
 
-	/** Replace the stats (and columns/key flags); the next render recomputes the line. */
 	update(props: TurnFootNoteProps): void {
 		this.props = props;
 		this.invalidate();
@@ -164,60 +103,95 @@ export class TurnFootNote implements Component {
 	}
 
 	render(width: number): string[] {
-		// props.cols is the authoritative budget; a non-positive value falls
-		// back to the viewport width the protocol passes in.
 		const cols = this.props.cols > 0 ? Math.floor(this.props.cols) : Math.max(1, Math.floor(width));
 		if (this.cachedLines && this.cachedCols === cols) {
 			return this.cachedLines;
 		}
-		const lines = this.renderLine(cols);
+		const lines = this.renderLines(cols);
 		this.cachedCols = cols;
 		this.cachedLines = lines;
 		return lines;
 	}
 
-	private renderLine(cols: number): string[] {
-		const { steps, thinkSegments, commMessages, durationMs } = this.props;
+	private renderLines(cols: number): string[] {
+		const { steps, thinkSegments, commMessages } = this.props;
 		if (steps <= 0 && thinkSegments <= 0 && commMessages <= 0) {
 			this.clickRegions = [];
 			return [];
 		}
-		const narrow = cols < TURN_FOOT_NOTE_NARROW_COLS;
-		// 空态: thinking only - no counts, no keys, no duration, just 想了想.
-		const segments: FootNoteSegment[] =
-			steps <= 0 && commMessages <= 0
-				? [{ text: "想了想" }]
-				: this.buildSegments(steps, thinkSegments, commMessages, durationMs, narrow);
-		// P3 indent alignment: the body starts one column in, level with the
-		// turn-head aggregate lines (` ⚙ N 步`); the caret glyph occupies that
-		// column when the wiring passes one, a plain space otherwise.
 		const caret = this.props.caret ?? "";
-		const indent = caret !== "" ? caret : " ";
+		const indent = caret !== "" ? ` ${caret} ` : " ";
 		const indentWidth = visibleWidth(indent);
 		if (indentWidth >= cols) {
-			// Degenerate terminal: the indent column alone fills the width -
-			// keep the line bounded instead of overflowing.
-			const line = theme.fg("dim", truncateToWidth(indent, cols, "…"));
-			// visibleWidth counts ANSI as zero, so this is the truncated caret width.
-			this.clickRegions = this.caretRegions(visibleWidth(line), caret);
-			return [line];
+			this.clickRegions = [];
+			return [theme.fg("dim", truncateToWidth(indent, cols, ""))];
 		}
-		const styledIndent = caret !== "" ? theme.fg("dim", caret) : " ";
-		const fitted = this.fitSegments(segments, narrow, cols - indentWidth);
-		this.clickRegions = [...this.caretRegions(indentWidth, caret), ...this.segmentRegions(fitted.spans, indentWidth)];
-		return [styledIndent + fitted.line];
+		const styledIndent = caret !== "" ? ` ${theme.fg("dim", caret)} ` : " ";
+		const segments = this.buildSegments();
+		const statsPlain = segments.map((segment) => segment.text).join(JOINER);
+		const budget = cols - indentWidth;
+		let line: string;
+		if (visibleWidth(statsPlain) > budget) {
+			line = theme.fg("muted", truncateToWidth(statsPlain, budget, "…"));
+		} else {
+			line = theme.fg("muted", statsPlain);
+			const summary = this.props.summary?.trim();
+			const summaryBudget = budget - visibleWidth(statsPlain) - SUMMARY_GAP.length;
+			if (summary && summaryBudget >= SUMMARY_MIN_WIDTH) {
+				line += `${SUMMARY_GAP}${theme.fg("dim", truncateToWidth(summary, summaryBudget, "…"))}`;
+			}
+		}
+		this.clickRegions = [
+			...this.caretRegions(caret),
+			...this.segmentRegions(this.segmentSpans(segments, budget), indentWidth),
+		];
+		return [styledIndent + line, ...this.fileChangeRows(cols)];
 	}
 
-	/** The caret's click lane, when the wiring passed both a glyph and a handler. */
-	private caretRegions(width: number, caret: string): ClickRegion[] {
-		const onCaretClick = this.props.onCaretClick;
-		if (!onCaretClick || caret === "" || width <= 0) {
+	private buildSegments(): FootNoteSegment[] {
+		const { steps, thinkSegments, commMessages, durationMs } = this.props;
+		const segments: FootNoteSegment[] = [];
+		if (thinkSegments > 0) {
+			segments.push({ text: "思考", clickTarget: "think" });
+		}
+		if (steps > 0) {
+			segments.push({ text: `${steps} 步`, clickTarget: "steps" });
+		}
+		segments.push({ text: turnFootNoteDurationText(durationMs) });
+		if (commMessages > 0) {
+			segments.push({ text: `通讯 ${commMessages} 条`, clickTarget: "comm" });
+		}
+		return segments;
+	}
+
+	private fileChangeRows(cols: number): string[] {
+		const changes = this.props.fileChanges ?? [];
+		if (changes.length === 0) {
 			return [];
 		}
-		return [{ line: 0, col: 0, width, height: 1, onClick: () => onCaretClick() }];
+		const rows: string[] = [];
+		const shown = changes.length > TURN_FOOT_NOTE_MAX_FILE_ROWS ? TURN_FOOT_NOTE_MAX_FILE_ROWS - 1 : changes.length;
+		for (const change of changes.slice(0, shown)) {
+			const prefix = `   ${theme.fg("dim", "改动")}  `;
+			const counts = `  ${theme.fg("toolDiffAdded", `+${change.added}`)} ${theme.fg("toolDiffRemoved", `−${change.removed}`)}`;
+			const available = Math.max(1, cols - visibleWidth(prefix) - visibleWidth(counts));
+			const path = theme.fg("muted", truncateToWidth(change.path, available, "…"));
+			rows.push(truncateToWidth(`${prefix}${path}${counts}`, cols, ""));
+		}
+		if (shown < changes.length) {
+			rows.push(theme.fg("dim", truncateToWidth(`   … 还有 ${changes.length - shown} 个文件`, cols, "")));
+		}
+		return rows;
 	}
 
-	/** One region per rendered (and not fully truncated-away) stats segment. */
+	private caretRegions(caret: string): ClickRegion[] {
+		const onCaretClick = this.props.onCaretClick;
+		if (!onCaretClick || caret === "") {
+			return [];
+		}
+		return [{ line: 0, col: 0, width: visibleWidth(caret) + 1, height: 1, onClick: () => onCaretClick() }];
+	}
+
 	private segmentRegions(spans: FootNoteSpan[], indentWidth: number): ClickRegion[] {
 		const onSegmentClick = this.props.onSegmentClick;
 		if (!onSegmentClick) {
@@ -232,92 +206,16 @@ export class TurnFootNote implements Component {
 		}));
 	}
 
-	/**
-	 * The normal-form segments: duration first, then steps [O], thinking [T],
-	 * comms [P] - zero-value segments are omitted entirely, mirroring the
-	 * TurnActivity convention that empty means invisible.
-	 */
-	private buildSegments(
-		steps: number,
-		thinkSegments: number,
-		commMessages: number,
-		durationMs: number,
-		narrow: boolean,
-	): FootNoteSegment[] {
-		const segments: FootNoteSegment[] = [{ text: turnFootNoteDurationText(durationMs, narrow) }];
-		if (steps > 0) {
-			segments.push({
-				text: narrow ? `${steps}步` : `${steps} 步`,
-				hint: segmentHint(SEGMENT_KEYS.steps, " [O]"),
-				clickTarget: "steps",
-			});
-		}
-		if (thinkSegments > 0) {
-			segments.push({
-				text: narrow ? `${thinkSegments}想` : `想 ${thinkSegments} 段`,
-				hint: segmentHint(SEGMENT_KEYS.think, " [T]"),
-				clickTarget: "think",
-			});
-		}
-		if (commMessages > 0) {
-			segments.push({
-				text: narrow ? `${commMessages}讯` : `→ 通讯 ${commMessages} 条`,
-				hint: segmentHint(SEGMENT_KEYS.comm, " [P]"),
-				clickTarget: "comm",
-			});
-		}
-		return segments;
-	}
-
-	/**
-	 * Fit the segments into the budget: keep the key hints if the full line
-	 * fits, drop every hint if the bare line fits, otherwise truncate the bare
-	 * line from the right with an ellipsis. The width math is display columns
-	 * (CJK = 2), never character counts. Alongside the styled line the
-	 * clickable stats spans come back in body coordinates, clipped to the
-	 * budget - a segment cut away entirely has no span.
-	 */
-	private fitSegments(
-		segments: FootNoteSegment[],
-		narrow: boolean,
-		budget: number,
-	): { line: string; spans: FootNoteSpan[] } {
-		const joiner = " · ";
-		const showKeys = this.props.showKeys !== false && !narrow;
-		const pieces = segments.map((s) => s.text + (showKeys && s.hint ? s.hint : ""));
-		const plain = pieces.join(joiner);
-		if (visibleWidth(plain) <= budget) {
-			const line = segments
-				.map((s) => theme.fg("dim", s.text) + (showKeys && s.hint ? keyHintFg(s.hint) : ""))
-				.join(theme.fg("dim", joiner));
-			return { line, spans: this.segmentSpans(segments, pieces, budget) };
-		}
-		const barePieces = segments.map((s) => s.text);
-		const bare = barePieces.join(joiner);
-		if (visibleWidth(bare) > budget) {
-			return {
-				line: theme.fg("dim", truncateToWidth(bare, budget, "…")),
-				spans: this.segmentSpans(segments, barePieces, budget),
-			};
-		}
-		return { line: theme.fg("dim", bare), spans: this.segmentSpans(segments, barePieces, budget) };
-	}
-
-	/**
-	 * Span math in plain-text coordinates (ANSI is zero-width, so plain
-	 * columns map 1:1 onto the styled line): walk the pieces with the joiner
-	 * widths, clip each clickable segment to the budget.
-	 */
-	private segmentSpans(segments: FootNoteSegment[], pieces: string[], budget: number): FootNoteSpan[] {
-		const joinerWidth = 3;
+	/** Clickable stats spans in body coordinates, clipped to the budget. */
+	private segmentSpans(segments: FootNoteSegment[], budget: number): FootNoteSpan[] {
 		const spans: FootNoteSpan[] = [];
 		let cursor = 0;
 		for (let index = 0; index < segments.length; index++) {
 			if (index > 0) {
-				cursor += joinerWidth;
+				cursor += JOINER.length;
 			}
 			const segment = segments[index];
-			const width = visibleWidth(pieces[index] ?? "");
+			const width = visibleWidth(segment?.text ?? "");
 			if (segment?.clickTarget && width > 0) {
 				const start = Math.min(cursor, budget);
 				const end = Math.min(cursor + width, budget);

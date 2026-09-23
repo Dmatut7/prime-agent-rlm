@@ -1,348 +1,196 @@
-import { KeybindingsManager as PiKeybindingsManager, setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, it, vi } from "vitest";
-import { KeybindingsManager as AppKeybindingsManager } from "../src/core/keybindings.js";
 import {
 	TURN_FOOT_NOTE_CARETS,
-	TURN_FOOT_NOTE_NARROW_COLS,
+	TURN_FOOT_NOTE_MAX_FILE_ROWS,
 	TurnFootNote,
 	type TurnFootNoteProps,
 	turnFootNoteDurationText,
 } from "../src/modes/interactive/components/turn-footnote.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
-/** The v4 prototype's reference turn: 1m05s, 14 steps, 7 thinking segments, 2 comms. */
+/** Reference turn: 1m05s, 14 steps, 7 thinking segments, 2 comms. */
 const reference = { steps: 14, thinkSegments: 7, commMessages: 2, durationMs: 65_000 };
+const STATS = "思考 · 14 步 · 1m05s · 通讯 2 条";
 
-const BODY_WIDE = "干了 1 分 05 秒 · 14 步 [O] · 想 7 段 [T] · → 通讯 2 条 [P]";
-const BODY_NARROW = "干了 1分05秒 · 14步 · 7想 · 2讯";
-/** The reference body with every key hint stripped (the overwide fallback). */
-const BODY_BARE = "干了 1 分 05 秒 · 14 步 · 想 7 段 · → 通讯 2 条";
-/** Indent-aligned lines: the body starts one column in (P3), caret-less. */
-const WIDE_LINE = ` ${BODY_WIDE}`;
-const NARROW_LINE = ` ${BODY_NARROW}`;
-
-function renderLine(props: TurnFootNoteProps): string {
-	const note = new TurnFootNote(props);
-	return note.render(200).map(stripAnsi).join("\n");
+function render(props: TurnFootNoteProps): string[] {
+	return new TurnFootNote(props).render(200).map((line) => stripAnsi(line));
 }
 
-/** Visible-column offset of a substring within a (stripped) line. */
+function renderLine(props: TurnFootNoteProps): string {
+	return render(props)[0] ?? "";
+}
+
 function columnOf(line: string, substr: string): number {
 	return visibleWidth(line.slice(0, line.indexOf(substr)));
 }
 
-describe("turn footnote (TUI v4 T2b)", () => {
+describe("turn footnote (process line)", () => {
 	beforeAll(() => initTheme("dark"));
 
-	it("renders the reference turn as exactly one line in the wide form", () => {
-		const note = new TurnFootNote({ ...reference, cols: 120 });
-		const lines = note.render(120);
-		expect(lines).toHaveLength(1);
-		expect(stripAnsi(lines[0] ?? "")).toBe(WIDE_LINE);
-		// Key hints carry the prototype accent blue #6ba7ff (P3), in the
-		// theme's active color depth: truecolor RGB, or xterm 75 in 256-color.
-		expect(lines[0]).toMatch(/\x1b\[38;2;107;167;255m \[O\]\x1b\[39m|\x1b\[38;5;75m \[O\]\x1b\[39m/);
+	it("renders the reference turn as one stats line with no key hints", () => {
+		const lines = render({ ...reference, cols: 120 });
+		expect(lines).toEqual([` ${STATS}`]);
+		expect(lines[0]).not.toMatch(/\[[OTP]\]/);
 	});
 
-	it("formats the three duration tiers, wide and narrow", () => {
-		expect(turnFootNoteDurationText(45_000, false)).toBe("干了 45 秒");
-		expect(turnFootNoteDurationText(45_000, true)).toBe("干了 45秒");
-		expect(turnFootNoteDurationText(45_400, false)).toBe("干了 45 秒");
-		expect(turnFootNoteDurationText(65_000, false)).toBe("干了 1 分 05 秒");
-		expect(turnFootNoteDurationText(65_000, true)).toBe("干了 1分05秒");
-		expect(turnFootNoteDurationText(4_020_000, false)).toBe("干了 1 时 07 分");
-		expect(turnFootNoteDurationText(4_020_000, true)).toBe("干了 1时07分");
-		// Minutes stay unpadded; seconds are two digits.
-		expect(turnFootNoteDurationText(61_000, false)).toBe("干了 1 分 01 秒");
-		expect(turnFootNoteDurationText(0, false)).toBe("干了 0 秒");
+	it("puts the caret at column 1 followed by a space", () => {
+		expect(renderLine({ ...reference, cols: 120, caret: TURN_FOOT_NOTE_CARETS.collapsed })).toBe(` ▸ ${STATS}`);
+		expect(renderLine({ ...reference, cols: 120, caret: TURN_FOOT_NOTE_CARETS.expanded })).toBe(` ▾ ${STATS}`);
 	});
 
-	it("switches to the compressed narrow form below 100 columns, same stats (R2.1)", () => {
-		// 99 compressed / 100 full / 101 full: the boundary column itself
-		// belongs to the wide form (R2.1, matches the prototype's 100ch chat).
-		expect(renderLine({ ...reference, cols: TURN_FOOT_NOTE_NARROW_COLS - 1 })).toBe(NARROW_LINE);
-		expect(renderLine({ ...reference, cols: TURN_FOOT_NOTE_NARROW_COLS })).toBe(WIDE_LINE);
-		expect(renderLine({ ...reference, cols: TURN_FOOT_NOTE_NARROW_COLS + 1 })).toBe(WIDE_LINE);
+	it("formats durations as 14.8s, 1m05s and 1h07m", () => {
+		expect(turnFootNoteDurationText(0)).toBe("0.0s");
+		expect(turnFootNoteDurationText(14_800)).toBe("14.8s");
+		expect(turnFootNoteDurationText(59_900)).toBe("59.9s");
+		expect(turnFootNoteDurationText(59_950)).toBe("1m00s");
+		expect(turnFootNoteDurationText(65_000)).toBe("1m05s");
+		expect(turnFootNoteDurationText(4_020_000)).toBe("1h07m");
+		expect(turnFootNoteDurationText(-5)).toBe("0.0s");
 	});
 
 	it("omits zero-value segments instead of rendering zero counts", () => {
-		expect(renderLine({ steps: 14, thinkSegments: 0, commMessages: 0, durationMs: 45_000, cols: 120 })).toBe(
-			" 干了 45 秒 · 14 步 [O]",
+		expect(renderLine({ steps: 14, thinkSegments: 0, commMessages: 0, durationMs: 14_800, cols: 120 })).toBe(
+			" 14 步 · 14.8s",
 		);
-		expect(renderLine({ steps: 0, thinkSegments: 7, commMessages: 2, durationMs: 45_000, cols: 120 })).toBe(
-			" 干了 45 秒 · 想 7 段 [T] · → 通讯 2 条 [P]",
+		expect(renderLine({ steps: 0, thinkSegments: 7, commMessages: 2, durationMs: 3_200, cols: 120 })).toBe(
+			" 思考 · 3.2s · 通讯 2 条",
 		);
-		expect(renderLine({ steps: 0, thinkSegments: 0, commMessages: 2, durationMs: 45_000, cols: 120 })).toBe(
-			" 干了 45 秒 · → 通讯 2 条 [P]",
-		);
-		// The narrow form omits the same way.
-		expect(renderLine({ steps: 14, thinkSegments: 0, commMessages: 0, durationMs: 45_000, cols: 80 })).toBe(
-			" 干了 45秒 · 14步",
+		expect(renderLine({ steps: 0, thinkSegments: 3, commMessages: 0, durationMs: 3_200, cols: 120 })).toBe(
+			" 思考 · 3.2s",
 		);
 	});
 
-	it("renders no line at all for an all-zero turn", () => {
-		const note = new TurnFootNote({ steps: 0, thinkSegments: 0, commMessages: 0, durationMs: 0, cols: 120 });
+	it("renders nothing for an all-zero turn", () => {
+		const note = new TurnFootNote({ steps: 0, thinkSegments: 0, commMessages: 0, durationMs: 9_000, cols: 120 });
 		expect(note.render(120)).toEqual([]);
+		expect(note.getClickRegions()).toEqual([]);
 	});
 
-	it("renders 想了想 for a thinking-only turn, both widths", () => {
-		const thinkingOnly = { steps: 0, thinkSegments: 3, commMessages: 0, durationMs: 36_300 };
-		expect(renderLine({ ...thinkingOnly, cols: 120 })).toBe(" 想了想");
-		expect(renderLine({ ...thinkingOnly, cols: 80 })).toBe(" 想了想");
+	it("appends the plain-words summary after the stats, dim", () => {
+		const props = { ...reference, cols: 120, caret: "▸", summary: "运行 npm check · 读取 footer.ts" };
+		const raw = new TurnFootNote(props).render(120)[0] ?? "";
+		expect(stripAnsi(raw)).toBe(` ▸ ${STATS}   运行 npm check · 读取 footer.ts`);
+		const dimOnly = new TurnFootNote({ ...props, summary: undefined }).render(120)[0] ?? "";
+		expect(raw.length).toBeGreaterThan(dimOnly.length + "   运行 npm check · 读取 footer.ts".length);
 	});
 
-	it("drops every key hint first when the line overflows, without an ellipsis", () => {
-		// Long-stats stress at the safe-integer ceiling: the wide line with
-		// hints spans 103 display columns, the bare body 91. At 102 columns
-		// (still wide) every hint disappears but the body stays complete - no
-		// ellipsis, every count still readable. Counts at or below
-		// Number.MAX_SAFE_INTEGER cannot push the bare wide body past ~91
-		// columns, so dropping the hints is always sufficient in wide form;
-		// the ellipsis branch is the narrow form's territory.
-		const max = Number.MAX_SAFE_INTEGER;
-		const lines = new TurnFootNote({
-			steps: max,
-			thinkSegments: max,
-			commMessages: max,
-			durationMs: 4_020_000,
-			cols: 102,
-		}).render(102);
-		expect(lines).toHaveLength(1);
-		const line = stripAnsi(lines[0] ?? "");
-		const bare = ` 干了 1 时 07 分 · ${max} 步 · 想 ${max} 段 · → 通讯 ${max} 条`;
-		expect(line).toBe(bare);
-		expect(visibleWidth(line)).toBe(92);
-		expect(line).not.toContain("[O]");
-		expect(line).not.toContain("[T]");
-		expect(line).not.toContain("[P]");
-		expect(line).not.toContain("…");
-		// Two columns wider (the indent column costs one) and the hints come back.
-		const withKeys = stripAnsi(
-			new TurnFootNote({
-				steps: max,
-				thinkSegments: max,
-				commMessages: max,
-				durationMs: 4_020_000,
-				cols: 104,
-			}).render(104)[0] ?? "",
-		);
-		expect(withKeys).toBe(` 干了 1 时 07 分 · ${max} 步 [O] · 想 ${max} 段 [T] · → 通讯 ${max} 条 [P]`);
-		expect(visibleWidth(withKeys)).toBe(104);
+	it("truncates the summary with an ellipsis and drops it below 12 columns", () => {
+		const summary = "运行 npm run check · 读取 src/modes/interactive/components/footer.ts";
+		const base = { steps: 2, thinkSegments: 0, commMessages: 0, durationMs: 1_000, summary, caret: "▸" };
+		const stats = " ▸ 2 步 · 1.0s";
+		const statsWidth = visibleWidth(stats);
+		// Exactly 12 columns of summary room: it renders, truncated.
+		const fit = renderLine({ ...base, cols: statsWidth + 3 + 12 });
+		expect(fit.startsWith(`${stats}   `)).toBe(true);
+		expect(fit.endsWith("…")).toBe(true);
+		expect(visibleWidth(fit)).toBeLessThanOrEqual(statsWidth + 15);
+		// 11 columns: the summary drops whole.
+		expect(renderLine({ ...base, cols: statsWidth + 3 + 11 })).toBe(stats);
 	});
 
-	it("truncates at display columns (CJK = 2), not character counts", () => {
-		// The narrow reference line is 25 characters but 31 display columns: a
-		// 27-column budget fits by character count and must still truncate by
-		// display columns.
-		const lines = new TurnFootNote({ ...reference, cols: 27 }).render(27);
-		const line = stripAnsi(lines[0] ?? "");
-		expect(line.endsWith("…")).toBe(true);
-		expect(line.startsWith(" 干了")).toBe(true);
-		expect(visibleWidth(line)).toBeLessThanOrEqual(27);
-	});
-
-	it("derives the bracket hints from the live keybindings, with a literal fallback (R2.2)", () => {
-		const line = () => stripAnsi(new TurnFootNote({ ...reference, cols: 120 }).render(120)[0] ?? "");
-		// No app keybindings installed: the shipped defaults' literal letters.
-		setKeybindings(new PiKeybindingsManager({}));
-		expect(line()).toBe(WIDE_LINE);
-		// The app defaults (ctrl+o/t/p) derive the same letters - no hardcoding.
-		setKeybindings(new AppKeybindingsManager({}));
-		expect(line()).toBe(WIDE_LINE);
-		// A rebind shows the real letter: ctrl+k → [K].
-		setKeybindings(new AppKeybindingsManager({ "app.tools.expand": "ctrl+k" }));
-		const rebound = line();
-		expect(rebound).toContain("14 步 [K]");
-		expect(rebound).not.toContain("[O]");
-		expect(rebound).toContain("想 7 段 [T]");
-		expect(rebound).toContain("→ 通讯 2 条 [P]");
-		// A modifier-less binding renders its bare key in the brackets.
-		setKeybindings(new AppKeybindingsManager({ "app.thinking.toggle": "f2" }));
-		expect(line()).toContain("想 7 段 [F2]");
-		// Restore the bare manager so the remaining tests exercise the fallback.
-		setKeybindings(new PiKeybindingsManager({}));
-		expect(line()).toBe(WIDE_LINE);
-	});
-
-	it("respects showKeys=false by never rendering hints", () => {
-		const line = renderLine({ ...reference, cols: 120, showKeys: false });
-		expect(line).toBe(` ${BODY_BARE}`);
-		expect(renderLine({ ...reference, cols: 120, showKeys: true })).toBe(WIDE_LINE);
-	});
-
-	it("renders the caret in the indent column and counts it against the budget (P3)", () => {
-		// The canonical glyphs: ▸ while every block is collapsed, ▾ once any
-		// of the three detail blocks is open (the wiring owns the flip).
-		expect(TURN_FOOT_NOTE_CARETS.collapsed).toBe("▸");
-		expect(TURN_FOOT_NOTE_CARETS.expanded).toBe("▾");
-		// The caret occupies the indent column - the body column does not move.
-		expect(renderLine({ ...reference, cols: 120, caret: TURN_FOOT_NOTE_CARETS.collapsed })).toBe(`▸${BODY_WIDE}`);
-		expect(renderLine({ ...reference, cols: 120, caret: TURN_FOOT_NOTE_CARETS.expanded })).toBe(`▾${BODY_WIDE}`);
-		// The caret consumes its column: at 59 columns the full line no longer
-		// fits even though a caretless footnote would (body bare at 47+1=48).
-		const withCaret = stripAnsi(new TurnFootNote({ ...reference, cols: 59, caret: "▸" }).render(59)[0] ?? "");
-		expect(visibleWidth(withCaret)).toBeLessThanOrEqual(59);
-		expect(withCaret.startsWith("▸")).toBe(true);
-		// Default: no caret, a plain space keeps the indent column.
-		expect(renderLine({ ...reference, cols: 120 })).toBe(` ${BODY_WIDE}`);
-		// Degenerate terminal: the caret column alone fills the width - the
-		// line stays bounded instead of overflowing.
-		const tiny = stripAnsi(new TurnFootNote({ ...reference, cols: 1, caret: "▸" }).render(1)[0] ?? "");
-		expect(visibleWidth(tiny)).toBeLessThanOrEqual(1);
-	});
-
-	it("truncates the 空态 line when the terminal is narrower than 想了想", () => {
-		// 想了想 is 3 characters but 6 display columns: at 3 columns (one
-		// spent on the indent) only the ellipsis survives beside the indent.
-		const line = stripAnsi(
-			new TurnFootNote({ steps: 0, thinkSegments: 2, commMessages: 0, durationMs: 1_000, cols: 3 }).render(3)[0] ??
-				"",
-		);
-		expect(line).toBe(" …");
-		expect(visibleWidth(line)).toBeLessThanOrEqual(3);
-	});
-
-	it("registers one click region per rendered stats segment, positions exact (T12)", () => {
-		const onSegmentClick = vi.fn();
-		const note = new TurnFootNote({ ...reference, cols: 120, onSegmentClick });
-		const lines = note.render(120);
-		const line = stripAnsi(lines[0] ?? "");
-		const regions = note.getClickRegions();
-		expect(regions).toHaveLength(3);
-		// Region order follows the line: steps, think, comm; each covers its
-		// stats text plus key hint, at the exact visible columns.
-		const pieces = ["14 步 [O]", "想 7 段 [T]", "→ 通讯 2 条 [P]"];
-		for (let index = 0; index < 3; index++) {
-			const region = regions[index];
-			expect(region?.line).toBe(0);
-			expect(region?.height).toBe(1);
-			expect(region?.col).toBe(columnOf(line, pieces[index]!));
-			expect(region?.width).toBe(visibleWidth(pieces[index]!));
-			region?.onClick({ row: 0, col: 0 });
+	it("truncates at display columns (CJK = 2) when the stats alone overflow", () => {
+		for (const cols of [6, 9, 12, 15]) {
+			const line = renderLine({ ...reference, cols, caret: "▸" });
+			expect(visibleWidth(line), `cols ${cols}`).toBeLessThanOrEqual(cols);
+			expect(line.endsWith("…"), `cols ${cols}`).toBe(true);
 		}
-		expect(onSegmentClick.mock.calls.map((call) => call[0])).toEqual(["steps", "think", "comm"]);
 	});
 
-	it("registers no click regions without callbacks, and zero-value segments have none (T12)", () => {
-		const plain = new TurnFootNote({ ...reference, cols: 120 });
-		plain.render(120);
-		expect(plain.getClickRegions()).toEqual([]);
-		// Unrendered (zero-value) segments stay absent: a steps-less turn
-		// keeps only the thinking and comm lanes.
-		const onSegmentClick = vi.fn();
-		const partial = new TurnFootNote({
-			steps: 0,
-			thinkSegments: 7,
-			commMessages: 2,
-			durationMs: 45_000,
-			cols: 120,
-			onSegmentClick,
-		});
-		partial.render(120);
-		const regions = partial.getClickRegions();
-		expect(regions).toHaveLength(2);
-		expect(regions[0]?.width).toBe(visibleWidth("想 7 段 [T]"));
-		regions[0]?.onClick({ row: 0, col: 0 });
-		expect(onSegmentClick).toHaveBeenCalledWith("think");
-		regions[1]?.onClick({ row: 0, col: 0 });
-		expect(onSegmentClick).toHaveBeenLastCalledWith("comm");
-	});
+	it("lists changed files under the line, capped with a count row", () => {
+		const change = (i: number) => ({ path: `src/file-${i}.ts`, added: i, removed: 1 });
+		const two = render({ ...reference, cols: 120, fileChanges: [change(1), change(2)] });
+		expect(two.slice(1)).toEqual(["   改动  src/file-1.ts  +1 −1", "   改动  src/file-2.ts  +2 −1"]);
 
-	it("gives the caret its own click lane and shifts the segment columns (T12)", () => {
-		const onCaretClick = vi.fn();
-		const onSegmentClick = vi.fn();
-		const note = new TurnFootNote({
+		const exact = render({
 			...reference,
 			cols: 120,
-			caret: TURN_FOOT_NOTE_CARETS.collapsed,
-			onCaretClick,
-			onSegmentClick,
+			fileChanges: Array.from({ length: TURN_FOOT_NOTE_MAX_FILE_ROWS }, (_, i) => change(i)),
 		});
-		const line = stripAnsi(note.render(120)[0] ?? "");
-		const regions = note.getClickRegions();
-		// The caret region comes first, over the indent column.
-		expect(regions).toHaveLength(4);
-		expect(regions[0]?.col).toBe(0);
-		expect(regions[0]?.width).toBe(1);
-		regions[0]?.onClick({ row: 0, col: 0 });
-		expect(onCaretClick).toHaveBeenCalledTimes(1);
-		expect(onSegmentClick).not.toHaveBeenCalled();
-		// The segment columns shift right by the caret's column.
-		expect(regions[1]?.col).toBe(columnOf(line, "14 步 [O]"));
-		expect(regions[2]?.col).toBe(columnOf(line, "想 7 段 [T]"));
-		expect(regions[3]?.col).toBe(columnOf(line, "→ 通讯 2 条 [P]"));
-		// No caret, only a caret handler: nothing to click.
-		const noCaret = new TurnFootNote({ ...reference, cols: 120, onCaretClick: vi.fn() });
-		noCaret.render(120);
-		expect(noCaret.getClickRegions()).toEqual([]);
+		expect(exact).toHaveLength(1 + TURN_FOOT_NOTE_MAX_FILE_ROWS);
+		expect(exact.some((line) => line.includes("还有"))).toBe(false);
+
+		const many = render({ ...reference, cols: 120, fileChanges: Array.from({ length: 8 }, (_, i) => change(i)) });
+		expect(many).toHaveLength(1 + TURN_FOOT_NOTE_MAX_FILE_ROWS);
+		expect(many.at(-1)).toBe("   … 还有 4 个文件");
 	});
 
-	it("keeps the regions accurate through the overflow cascade (T12)", () => {
-		// Keys stripped (bare body): the regions follow the bare pieces.
-		const max = Number.MAX_SAFE_INTEGER;
-		const stripped = new TurnFootNote({
-			steps: max,
-			thinkSegments: max,
-			commMessages: max,
-			durationMs: 4_020_000,
-			cols: 102,
-			onSegmentClick: vi.fn(),
-		});
-		const strippedLine = stripAnsi(stripped.render(102)[0] ?? "");
-		const strippedRegions = stripped.getClickRegions();
-		expect(strippedRegions).toHaveLength(3);
-		expect(strippedRegions[0]?.col).toBe(columnOf(strippedLine, `${max} 步`));
-		expect(strippedRegions[0]?.width).toBe(visibleWidth(`${max} 步`));
-		expect(strippedRegions[2]?.col).toBe(columnOf(strippedLine, `→ 通讯 ${max} 条`));
-		// Hard truncation: the segment cut away entirely has no region, and
-		// every region stays inside the width budget.
-		const truncated = new TurnFootNote({ ...reference, cols: 27, onSegmentClick: vi.fn() });
-		const truncatedLine = stripAnsi(truncated.render(27)[0] ?? "");
-		const truncatedRegions = truncated.getClickRegions();
-		expect(truncatedRegions).toHaveLength(2);
-		expect(truncatedRegions[0]?.col).toBe(columnOf(truncatedLine, "14步"));
-		expect(truncatedRegions[0]?.width).toBe(visibleWidth("14步"));
-		expect(truncatedRegions[1]?.col).toBe(columnOf(truncatedLine, "7想"));
-		expect(truncatedRegions[1]?.width).toBe(visibleWidth("7想"));
-		for (const region of truncatedRegions) {
-			expect(region.col + region.width).toBeLessThanOrEqual(27);
-		}
-		// 空态: nothing clickable.
-		const empty = new TurnFootNote({
-			steps: 0,
-			thinkSegments: 2,
-			commMessages: 0,
-			durationMs: 0,
-			cols: 120,
-			onSegmentClick: vi.fn(),
-		});
-		empty.render(120);
-		expect(empty.getClickRegions()).toEqual([]);
-		// Degenerate width: the caret lane alone, bounded.
-		const tiny = new TurnFootNote({
+	it("keeps changed-file rows within the width, truncating the path", () => {
+		const rows = render({
 			...reference,
-			cols: 1,
-			caret: "▸",
-			onCaretClick: vi.fn(),
-			onSegmentClick: vi.fn(),
+			cols: 30,
+			fileChanges: [
+				{ path: "packages/coding-agent/src/modes/interactive/components/footer.ts", added: 3, removed: 5 },
+			],
 		});
-		tiny.render(1);
-		const tinyRegions = tiny.getClickRegions();
-		expect(tinyRegions).toHaveLength(1);
-		expect(tinyRegions[0]?.width).toBeLessThanOrEqual(1);
+		expect(rows[1]?.endsWith("+3 −5")).toBe(true);
+		expect(rows[1]).toContain("…");
+		expect(visibleWidth(rows[1] ?? "")).toBeLessThanOrEqual(30);
 	});
 
 	it("recomputes on update() and falls back to the render width when cols is unset", () => {
 		const note = new TurnFootNote({ ...reference, cols: 120 });
-		expect(stripAnsi(note.render(120)[0] ?? "")).toBe(WIDE_LINE);
-		note.update({ steps: 2, thinkSegments: 0, commMessages: 0, durationMs: 165_000, cols: 120 });
-		expect(stripAnsi(note.render(120)[0] ?? "")).toBe(" 干了 2 分 45 秒 · 2 步 [O]");
-		// cols <= 0 defers to the protocol width: wide at 120, narrow at 80.
-		const fallback = new TurnFootNote({ ...reference, cols: 0 });
-		expect(stripAnsi(fallback.render(120)[0] ?? "")).toBe(WIDE_LINE);
-		const narrowFallback = new TurnFootNote({ ...reference, cols: 0 });
-		expect(stripAnsi(narrowFallback.render(80)[0] ?? "")).toBe(NARROW_LINE);
+		expect(stripAnsi(note.render(120)[0] ?? "")).toBe(` ${STATS}`);
+		note.update({ ...reference, steps: 3, cols: 120 });
+		expect(stripAnsi(note.render(120)[0] ?? "")).toBe(" 思考 · 3 步 · 1m05s · 通讯 2 条");
+		note.update({ ...reference, cols: 0 });
+		const line = stripAnsi(note.render(8)[0] ?? "");
+		expect(visibleWidth(line)).toBeLessThanOrEqual(8);
+	});
+
+	it("registers one click region per rendered stats segment at exact columns", () => {
+		const onSegmentClick = vi.fn();
+		const note = new TurnFootNote({ ...reference, cols: 120, onSegmentClick });
+		const line = stripAnsi(note.render(120)[0] ?? "");
+		const regions = note.getClickRegions();
+		expect(regions).toHaveLength(3);
+		const expected = [
+			{ text: "思考", segment: "think" },
+			{ text: "14 步", segment: "steps" },
+			{ text: "通讯 2 条", segment: "comm" },
+		];
+		for (const [index, entry] of expected.entries()) {
+			const region = regions[index];
+			expect(region?.line).toBe(0);
+			expect(region?.col).toBe(columnOf(line, entry.text));
+			expect(region?.width).toBe(visibleWidth(entry.text));
+			region?.onClick?.({ line: 0, col: region.col } as never);
+			expect(onSegmentClick).toHaveBeenLastCalledWith(entry.segment);
+		}
+	});
+
+	it("gives the caret its own click lane and offsets segments by the 3-column indent", () => {
+		const onCaretClick = vi.fn();
+		const onSegmentClick = vi.fn();
+		const note = new TurnFootNote({ ...reference, cols: 120, caret: "▸", onCaretClick, onSegmentClick });
+		const line = stripAnsi(note.render(120)[0] ?? "");
+		const [caret, think] = note.getClickRegions();
+		expect(caret).toMatchObject({ line: 0, col: 0, width: 2 });
+		caret?.onClick?.({ line: 0, col: 0 } as never);
+		expect(onCaretClick).toHaveBeenCalledTimes(1);
+		expect(think?.col).toBe(3);
+		expect(columnOf(line, "思考")).toBe(3);
+	});
+
+	it("registers no click regions without callbacks", () => {
+		const note = new TurnFootNote({ ...reference, cols: 120, caret: "▸" });
+		note.render(120);
+		expect(note.getClickRegions()).toEqual([]);
+	});
+
+	it("keeps the regions clipped to the budget when the stats overflow", () => {
+		const onSegmentClick = vi.fn();
+		const cols = 14;
+		const note = new TurnFootNote({ ...reference, cols, caret: "▸", onSegmentClick, onCaretClick: () => {} });
+		note.render(cols);
+		const regions = note.getClickRegions();
+		expect(regions.length).toBeGreaterThan(0);
+		for (const region of regions) {
+			expect(region.col + region.width).toBeLessThanOrEqual(cols);
+			expect(region.width).toBeGreaterThan(0);
+		}
+		// The comm segment sits past the budget, so it has no region.
+		expect(regions.some((region) => region.col >= cols)).toBe(false);
 	});
 });

@@ -1,5 +1,7 @@
 import { type ClickRegion, type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { theme } from "../theme/theme.js";
+import type { FileChangeSummary } from "./edit-summary.js";
+import { turnStepsSummary } from "./step-label.js";
 import { TurnFootNote } from "./turn-footnote.js";
 
 export type TurnStepStatus = "queued" | "running" | "done" | "error";
@@ -70,6 +72,28 @@ export class TurnActivityState {
 		this.startedAt = startedAt;
 	}
 
+	/** Files the turn changed, keyed by path; the collapsed process line lists them. */
+	private readonly changedFiles = new Map<string, FileChangeSummary>();
+
+	addFileChanges(changes: readonly FileChangeSummary[]): void {
+		for (const change of changes) {
+			if (change.added === 0 && change.removed === 0) {
+				continue;
+			}
+			const existing = this.changedFiles.get(change.path);
+			if (existing) {
+				existing.added += change.added;
+				existing.removed += change.removed;
+			} else {
+				this.changedFiles.set(change.path, { ...change });
+			}
+		}
+	}
+
+	get fileChanges(): readonly FileChangeSummary[] {
+		return [...this.changedFiles.values()];
+	}
+
 	get isCollapsed(): boolean {
 		return this.collapsed;
 	}
@@ -83,6 +107,16 @@ export class TurnActivityState {
 
 	addStep(step: TurnStep): void {
 		this.steps.push(step);
+	}
+
+	/** Streaming tool calls grow their arguments; the step labels read the latest ones. */
+	updateStepArgs(toolCallId: string, args: unknown): void {
+		for (let i = 0; i < this.steps.length; i++) {
+			const step = this.steps[i];
+			if (step?.toolCallId === toolCallId && step.args !== args) {
+				this.steps[i] = { ...step, args };
+			}
+		}
 	}
 
 	/** Thinking blocks of a settled assistant message land here (U6). */
@@ -200,7 +234,14 @@ export class TurnActivityState {
 	 * turn-end stamp.
 	 */
 	turnDurationMs(): number {
-		const end = this.steps.length > 0 ? (this.lastSettledAt ?? Date.now()) : (this.turnEndedAt ?? Date.now());
+		// A running turn's clock keeps ticking; a settled tool turn freezes on its
+		// last settled step, a thinking-only turn on the turn-end stamp.
+		const running = this.steps.length > 0 ? !this.isSettled : this.turnEndedAt === undefined;
+		const end = running
+			? Date.now()
+			: this.steps.length > 0
+				? (this.lastSettledAt ?? this.turnEndedAt ?? Date.now())
+				: (this.turnEndedAt ?? Date.now());
 		return Math.max(0, end - this.startedAt);
 	}
 
@@ -395,10 +436,10 @@ export class TurnSummaryComponent implements Component {
 	}
 
 	/**
-	 * TUI v4 quiet face: the two legacy lines collapse into the one-line
-	 * footnote - `干了 1 分 05 秒 · 14 步 [O] · 想 7 段 [T] · → 通讯 2 条 [P]` -
-	 * with the stats read live off the turn state (steps deduped by
-	 * toolCallId, thinking segments, the comm counter, the frozen duration).
+	 * Quiet face: the process line - `▸ 思考 · 14 步 · 1m05s   运行 npm check`
+	 * - with the stats read live off the turn state (steps deduped by
+	 * toolCallId, thinking segments, the comm counter, the frozen duration),
+	 * plus one row per changed file while the process block is closed.
 	 */
 	private renderFootNote(safeWidth: number): string[] {
 		this.footnote ??= new TurnFootNote({
@@ -433,7 +474,7 @@ export class TurnSummaryComponent implements Component {
 		const steps = new Set(this.turnState.steps.map((step) => step.toolCallId)).size;
 		const thinkSegments = this.turnState.totalThinkingSegments;
 		const commMessages = this.turnState.commMessageCount;
-		// R5-P2③: an all-zero turn still renders 想了想 - the model is always
+		// R5-P2③: an all-zero turn still renders 思考 - the model is always
 		// reasoning, so a turn with no explicit thinking block counts as one
 		// thought. The footnote component stays a pure props renderer; this
 		// policy belongs to the wiring.
@@ -444,6 +485,9 @@ export class TurnSummaryComponent implements Component {
 			commMessages,
 			durationMs: this.turnState.turnDurationMs(),
 			cols: safeWidth,
+			summary: turnStepsSummary(this.turnState.steps),
+			// An open process block shows every diff itself; the rows are the closed view's stand-in.
+			fileChanges: this.turnState.processBlockExpanded ? [] : this.turnState.fileChanges,
 			// P3-2: the caret glyph — ▸ while every detail block is collapsed,
 			// ▾ once any of the three blocks is open (the wiring owns the state).
 			caret:

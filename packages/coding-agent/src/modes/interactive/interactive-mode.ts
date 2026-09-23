@@ -150,7 +150,6 @@ import {
 	type TelemetryOnboardingOutcome,
 } from "../../core/telemetry.js";
 import { type TruncationResult, truncateTail } from "../../core/tools/truncate.js";
-import { PRIME_BUTTERFLY_LOGO } from "../../themes/prime-logo.js";
 import { getChangelogPath, parseChangelog } from "../../utils/changelog.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
 import { readClipboardImage } from "../../utils/clipboard-image.js";
@@ -216,8 +215,13 @@ import { CustomMessageComponent } from "./components/custom-message.js";
 import { DaxnutsComponent } from "./components/daxnuts.js";
 import { DynamicBorder } from "./components/dynamic-border.js";
 import { EarendilAnnouncementComponent } from "./components/earendil-announcement.js";
-import { type FileChangeSummary, formatTotalChangeSummary, mergeTurnFileChanges } from "./components/edit-summary.js";
-import { ExpandKeysHintLine } from "./components/expand-keys-hint.js";
+import {
+	type FileChangeSummary,
+	formatFileChangePath,
+	formatTotalChangeSummary,
+	getToolFileChanges,
+	mergeTurnFileChanges,
+} from "./components/edit-summary.js";
 import { ExtensionEditorComponent } from "./components/extension-editor.js";
 import { ExtensionInputComponent } from "./components/extension-input.js";
 import { ExtensionSelectorComponent } from "./components/extension-selector.js";
@@ -385,11 +389,11 @@ interface SharedContextTree {
 }
 
 export const START_HINTS = [
-	'Try "refactor @<filepath>"',
-	'Try "fix bugs in @<filepath>"',
-	'Try "add tests for @<filepath>"',
-	'Try "explain how @<filepath> works"',
-	'Try "improve performance in @<filepath>"',
+	"描述任务，@ 引用文件，/ 看命令",
+	"比如：重构 @文件，让它更好读",
+	"比如：修一下 @文件 里的 bug",
+	"比如：给 @文件 补上测试",
+	"比如：讲讲 @文件 是怎么工作的",
 ] as const;
 
 export function getRandomStartHint(random = Math.random): (typeof START_HINTS)[number] {
@@ -576,15 +580,11 @@ export interface BrandSplashHeaderOptions {
 	logo?: string;
 	topPadding?: boolean;
 	getExtraMetadata?: () => readonly BrandSplashMetadataLine[];
-	getHideStartHint?: () => boolean;
-	getStartHint?: () => string;
 }
 
 export class BrandSplashHeader implements Component {
 	private readonly logoRaw: string[];
-	private readonly logoCanvasWidth: number;
-	private readonly gutter = 4;
-	private readonly labelWidth = 9;
+	private readonly labelWidth = 8;
 
 	constructor(
 		private readonly version: string,
@@ -593,61 +593,50 @@ export class BrandSplashHeader implements Component {
 		private readonly verboseInstructions?: string,
 		private readonly options: BrandSplashHeaderOptions = {},
 	) {
-		this.logoRaw = (options.logo ?? PRIME_BUTTERFLY_LOGO).split("\n");
-		this.logoCanvasWidth = this.logoRaw.reduce((max, line) => Math.max(max, visibleWidth(line)), 0);
+		this.logoRaw = options.logo ? options.logo.split("\n") : [];
 	}
 
 	invalidate(): void {
 		// Render output is derived from current theme/session state.
 	}
 
+	/**
+	 * A compact header: the wordmark and version, then one labelled row per
+	 * fact (model, directory, extras). The logo mark only renders when a
+	 * caller passes one explicitly; the start hint lives in the prompt's
+	 * placeholder, not here.
+	 */
 	render(width: number): string[] {
 		const safeWidth = Math.max(1, width);
 		const paddingX = safeWidth > 1 ? 1 : 0;
 		const contentWidth = Math.max(1, safeWidth - paddingX * 2);
-		const metaWidth = contentWidth - this.logoCanvasWidth - this.gutter;
-		const showMeta = metaWidth >= this.labelWidth + 8;
-		const valueWidth = Math.max(1, metaWidth - this.labelWidth);
-		const labelled = (label: string, value: string) => {
-			const displayValue =
-				label === "cwd" ? truncatePathMiddle(value, valueWidth) : truncateToWidth(value, valueWidth);
-			return theme.fg("dim", label.padEnd(this.labelWidth)) + theme.fg("muted", displayValue);
+		const pad = (content: string) => {
+			const fitted = truncateToWidth(content, contentWidth, "");
+			return " ".repeat(paddingX) + fitted + " ".repeat(Math.max(0, safeWidth - paddingX - visibleWidth(fitted)));
 		};
-		const extraMetadata = this.options.getExtraMetadata?.() ?? [];
-		const hideStartHint = this.options.getHideStartHint?.() ?? false;
-		const startHint = this.options.getStartHint?.() ?? "type to search sessions";
-		const metaLines = showMeta
-			? [
-					labelled("version", `v${this.version}`),
-					labelled("model", this.getModelId() ?? "—"),
-					labelled("cwd", formatSplashCwd(this.getCwd())),
-					...extraMetadata.map((line) => labelled(line.label, line.value)),
-					...(hideStartHint ? [] : ["", theme.fg("dim", startHint)]),
-				]
-			: [];
-		const metaStart = Math.max(0, Math.floor((this.logoRaw.length - metaLines.length) / 2));
+		const valueWidth = Math.max(1, contentWidth - this.labelWidth);
+		const labelled = (label: string, value: string, isPath = false) =>
+			theme.fg("dim", label + " ".repeat(Math.max(2, this.labelWidth - visibleWidth(label)))) +
+			theme.fg("muted", isPath ? truncatePathMiddle(value, valueWidth) : truncateToWidth(value, valueWidth));
 		const lines = this.options.topPadding ? [""] : [];
-		lines.push(
-			...this.logoRaw.map((line, index) => {
-				const colored = theme.fg("text", line);
-				const meta = index >= metaStart && index < metaStart + metaLines.length ? metaLines[index - metaStart] : "";
-				const padding = showMeta
-					? " ".repeat(Math.max(0, this.logoCanvasWidth - visibleWidth(line) + this.gutter))
-					: "";
-				const content = truncateToWidth(colored + padding + meta, contentWidth, "");
-				return (
-					" ".repeat(paddingX) + content + " ".repeat(Math.max(0, safeWidth - paddingX - visibleWidth(content)))
-				);
-			}),
-		);
+		if (this.options.logo) {
+			for (const line of this.logoRaw) {
+				lines.push(pad(theme.fg("text", line)));
+			}
+			lines.push(pad(""));
+		}
+		lines.push(pad(`${theme.bold(theme.fg("accent", "prime-agent"))}  ${theme.fg("dim", `v${this.version}`)}`));
+		lines.push(pad(""));
+		lines.push(pad(labelled("模型", this.getModelId() ?? "—")));
+		lines.push(pad(labelled("目录", formatSplashCwd(this.getCwd()), true)));
+		for (const line of this.options.getExtraMetadata?.() ?? []) {
+			lines.push(pad(labelled(line.label, line.value)));
+		}
 
 		if (this.verboseInstructions) {
 			lines.push(" ".repeat(safeWidth));
 			for (const instruction of this.verboseInstructions.split("\n")) {
-				const content = truncateToWidth(instruction, contentWidth);
-				lines.push(
-					" ".repeat(paddingX) + content + " ".repeat(Math.max(0, safeWidth - paddingX - visibleWidth(content))),
-				);
+				lines.push(pad(instruction));
 			}
 		}
 
@@ -1283,7 +1272,6 @@ export class InteractiveMode {
 	// One summary line below the editor, backed by the existing child-status stream.
 	private subagentSummaryLine: SubagentSummaryLine;
 	private trayInfoLine: TrayInfoLine;
-	private expandKeysHintLine: ExpandKeysHintLine;
 	private subagentSnapshots = new Map<string, AgentConnectionRlmChildAgentSnapshot>();
 	private subagentCounts: SubagentSummaryCounts = { total: 0, running: 0, idle: 0, inactive: 0 };
 	private subagentSpendTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1493,10 +1481,6 @@ export class InteractiveMode {
 		this.promptDock = new Container();
 		this.footerSlot = new Container();
 		this.mainViewContainer.addChild(this.chatContainer);
-		// U6: the single global expand-hint line at the conversation's tail —
-		// the only place the Ctrl+T/O/P division is stated.
-		this.expandKeysHintLine = new ExpandKeysHintLine(() => this.chatContainer.children.length > 0);
-		this.mainViewContainer.addChild(this.expandKeysHintLine);
 		this.mainViewContainer.addChild(this.shortcutGuideContainer);
 		this.mainViewContainer.addChild(this.pendingMessagesContainer);
 		this.mainViewContainer.addChild(this.statusContainer);
@@ -1505,8 +1489,8 @@ export class InteractiveMode {
 		// U6 status area: ① tray info line (pure navigation), then the footer
 		// watermark (②), then the subagents line (③).
 		this.trayInfoLine = new TrayInfoLine(
-			() => this.getTrayLocationLabel(),
-			() => this.getTrayContextLabel(),
+			() => this.getTrayStatusLabel(),
+			() => this.getTrayHints(),
 			() => this.getTrayOverrideLabel(),
 		);
 		this.subagentSummaryLine = new SubagentSummaryLine();
@@ -1520,6 +1504,10 @@ export class InteractiveMode {
 		// U6 评审②: the watermark pulls its mode and snapshot from the memoized
 		// source below - same frame, same value as the tray fallback.
 		this.footer.setTelemetrySource(() => this.getFooterTelemetrySource());
+		this.footer.setLocationSource(() => ({
+			cwd: this.getCurrentCwd(),
+			branch: this.footerDataProvider.getGitBranch(),
+		}));
 		this.setGoalAnnouncementBaseline(emptyGoalState());
 
 		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
@@ -1798,8 +1786,6 @@ export class InteractiveMode {
 				verboseInstructions,
 				{
 					topPadding: true,
-					getHideStartHint: () => !this.isNewChat(),
-					getStartHint: () => this.startHint,
 				},
 			);
 			this.headerContainer.addChild(this.builtInHeader);
@@ -1817,8 +1803,8 @@ export class InteractiveMode {
 		for (const container of this.getPromptContextContainers()) {
 			this.mainContainer.addChild(container);
 		}
-		this.mainContainer.addChild(this.editorContainer);
 		this.mainContainer.addChild(this.trayInfoLine);
+		this.mainContainer.addChild(this.editorContainer);
 		this.footerSlot.addChild(this.footer);
 		this.mainContainer.addChild(this.footerSlot);
 		this.mainContainer.addChild(this.subagentSummaryLine);
@@ -3072,7 +3058,13 @@ export class InteractiveMode {
 	 * readouts can never disagree again.
 	 */
 	private getFooterTelemetrySource(): FooterTelemetrySource {
-		if (this.footerTelemetryDirty || this.footerTelemetryCached === undefined) {
+		// A snapshot taken before the session's model loaded has nothing to show;
+		// retry until it does so the status line appears before the first turn.
+		if (
+			this.footerTelemetryDirty ||
+			this.footerTelemetryCached === undefined ||
+			this.footerTelemetryCached.snapshot?.modelName === undefined
+		) {
 			this.footerTelemetryCached = this.computeFooterTelemetry();
 			this.footerTelemetryDirty = false;
 		}
@@ -3534,6 +3526,25 @@ export class InteractiveMode {
 		}
 	}
 
+	/** Files a settled step changed land on its turn, so the collapsed process line can list them. */
+	private recordTurnFileChanges(
+		state: TurnActivityState | undefined,
+		toolCallId: string,
+		result: { details?: unknown; isError: boolean },
+	): void {
+		const step = state?.steps.find((candidate) => candidate.toolCallId === toolCallId);
+		if (!state || !step) {
+			return;
+		}
+		const cwd = this.getCurrentCwd();
+		state.addFileChanges(
+			getToolFileChanges(step.toolName, step.args, result, cwd).map((change) => ({
+				...change,
+				path: formatFileChangePath(change.path, cwd),
+			})),
+		);
+	}
+
 	/** Create the run's turn-summary line once, before its first tool block. */
 	private ensureCurrentTurnSummary(): void {
 		if (this.currentTurnSummary) {
@@ -3555,6 +3566,7 @@ export class InteractiveMode {
 		const existingComponent = this.pendingTools.get(toolCall.id);
 		if (existingComponent) {
 			existingComponent.updateArgs(toolCall.arguments);
+			this.currentTurnState?.updateStepArgs(toolCall.id, toolCall.arguments);
 			return existingComponent;
 		}
 		if (this.pendingToolCreations.has(toolCall.id)) {
@@ -3573,6 +3585,7 @@ export class InteractiveMode {
 			const componentAfterLoad = this.pendingTools.get(latestToolCall.id);
 			if (componentAfterLoad) {
 				componentAfterLoad.updateArgs(latestToolCall.arguments);
+				this.currentTurnState?.updateStepArgs(latestToolCall.id, latestToolCall.arguments);
 				return componentAfterLoad;
 			}
 
@@ -3751,8 +3764,8 @@ export class InteractiveMode {
 		if (elapsed !== undefined) {
 			parts.push(elapsed);
 		}
-		if (status.tokens > 0) {
-			parts.push(`${status.direction === "down" ? "↓" : "↑"} ${formatTokenCount(status.tokens)} tokens`);
+		if (status.tokens > 0 && status.direction === "down") {
+			parts.push(`${formatTokenCount(status.tokens)} tok`);
 		}
 		return parts.join(" · ");
 	}
@@ -6286,6 +6299,8 @@ export class InteractiveMode {
 				if (component) {
 					component.markExecutionStarted();
 				}
+				// The start event carries the complete arguments; streaming may have left partial ones.
+				this.currentTurnState?.updateStepArgs(event.toolCallId, event.args);
 				this.currentTurnState?.markRunning(event.toolCallId);
 				this.ui.requestRender();
 				break;
@@ -6307,6 +6322,10 @@ export class InteractiveMode {
 					this.pendingTools.delete(event.toolCallId);
 					this.startedToolCalls.delete(event.toolCallId);
 					this.currentTurnState?.setStepStatus(event.toolCallId, event.isError ? "error" : "done");
+					this.recordTurnFileChanges(this.currentTurnState, event.toolCallId, {
+						details: event.result?.details,
+						isError: event.isError,
+					});
 				}
 				// U2: consecutive tool errors; a success resets the streak. Counted
 				// outside the component lookup: an unknown id still settled a tool.
@@ -7105,40 +7124,49 @@ export class InteractiveMode {
 	private getTrayOverrideLabel(): string | undefined {
 		if (this.isCtrlCExitHintVisible()) {
 			const clearKey = keyText("app.clear");
-			return clearKey ? `Press ${clearKey} again to exit` : "Press again to exit";
+			return clearKey ? `再按一次 ${clearKey} 退出` : "再按一次退出";
 		}
 		const text = this.editor.getExpandedText?.() ?? this.editor.getText();
 		if (!this.isAgentStreaming() || !text.trim()) {
 			return undefined;
 		}
-		return `${keyText("app.message.followUp")} to queue message`;
+		const followUp = keyText("app.message.followUp");
+		return followUp ? `${followUp} 排队，本轮结束后发送` : undefined;
 	}
 
-	private getTrayLocationLabel(): string | undefined {
-		// U6 ①: pure navigation - the model name and context figures moved to the
-		// footer watermark line; the new-chat shortcuts hint is gone with them.
+	/** Hint line left side: goal, heartbeats, agent depth, and the context figures when the footer's are off. */
+	private getTrayStatusLabel(): string | undefined {
 		const hasChildren = this.options.sessionHasChildren === true || (this.subagentSnapshots?.size ?? 0) > 0;
 		const depthLabel = formatAgentDepthLabel(this.options.sessionDepth, hasChildren);
-		const agentsHint = this.getAgentsViewTrayHint();
-		return [agentsHint, depthLabel].filter((label): label is string => label !== undefined).join(" · ");
+		return (
+			[this.getTrayGoalLabel(), this.getTrayHeartbeatLabel(), depthLabel, this.getTrayContextFallbackLabel()]
+				.filter((label): label is string => label !== undefined && label.length > 0)
+				.join(" · ") || undefined
+		);
+	}
+
+	/** The keys that work right now, most useful first; the hint line drops them from the end. */
+	private getTrayHints(): string[] {
+		const hint = (keybinding: AppKeybinding, label: string): string | undefined => {
+			const key = keyText(keybinding, { primaryOnly: true });
+			return key ? `${key} ${label}` : undefined;
+		};
+		const agentsBack = this.options.returnToAgentsView ? hint("app.agents.back", "会话列表") : undefined;
+		const hints = this.isAgentStreaming()
+			? [hint("app.input.clear", "中断"), hint("app.tools.expand", "过程"), hint("app.thinking.toggle", "思考")]
+			: !this.isNewChat()
+				? [
+						hint("app.tools.expand", "过程"),
+						hint("app.thinking.toggle", "思考"),
+						agentsBack,
+						hint("app.shortcuts", "快捷键"),
+					]
+				: ["/ 命令", "@ 文件", agentsBack, hint("app.shortcuts", "快捷键")];
+		return hints.filter((entry): entry is string => entry !== undefined);
 	}
 
 	private isNewChat(): boolean {
 		return (this.connectionState?.messageCount ?? 0) === 0 && this.connectionState?.isStreaming !== true;
-	}
-
-	private getAgentsViewTrayHint(): string | undefined {
-		if (!this.options.returnToAgentsView) {
-			return undefined;
-		}
-		return keyHint("app.agents.back", "agents/resume");
-	}
-
-	private getTrayContextLabel(): string | undefined {
-		const goalLabel = this.getTrayGoalLabel();
-		const heartbeatLabel = this.getTrayHeartbeatLabel();
-		const contextLabel = this.getTrayContextFallbackLabel();
-		return [goalLabel, heartbeatLabel, contextLabel].filter((label) => label !== undefined).join(" · ") || undefined;
 	}
 
 	/**
@@ -7682,6 +7710,7 @@ export class InteractiveMode {
 					message.isError ? "error" : "done",
 					Number(message.timestamp) || Date.now(),
 				);
+				this.recordTurnFileChanges(replayTurnState, message.toolCallId, message);
 				// TUI v4: sent agent messages riding this tool result count as comms.
 				const details =
 					typeof message.details === "object" && message.details !== null
@@ -8593,7 +8622,7 @@ export class InteractiveMode {
 
 	private getPromptDockComponents(): Component[] {
 		// U6: ① tray info line, ② footer watermark, ③ subagents line.
-		return [this.editorContainer, this.trayInfoLine, this.footerSlot, this.subagentSummaryLine];
+		return [this.trayInfoLine, this.editorContainer, this.footerSlot, this.subagentSummaryLine];
 	}
 
 	/** Enter or leave fullscreen rendering without touching the persisted setting. */

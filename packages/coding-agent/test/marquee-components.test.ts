@@ -91,8 +91,7 @@ describe("marquee TUI components", () => {
 		const component = new IPythonCellComponent(state);
 
 		const collapsed = await renderInVirtualTerminal(component);
-		expect(collapsed).toContain("bash");
-		expect(collapsed).toContain("echo hi");
+		expect(collapsed).toContain("运行 echo hi");
 		expect(collapsed).not.toContain("%%bash");
 		expect(collapsed).toContain("1.2s");
 		expect(collapsed).toContain("ValueError");
@@ -229,7 +228,7 @@ describe("marquee TUI components", () => {
 		const collapsed = stripAnsi(component.render(100).join("\n"));
 		expect(collapsed).toContain("line_0 = 0");
 		expect(collapsed).not.toContain("line_7 = 7");
-		expect(collapsed).toContain("↑ 8");
+		expect(collapsed).toContain("1 行输出");
 		// U6: no per-line expand hint.
 		expect(collapsed).not.toContain("展开");
 
@@ -253,7 +252,7 @@ describe("marquee TUI components", () => {
 
 		// U6: no per-line expand hint — the global tail line states the keys.
 		const collapsed = stripAnsi(component.render(100).join("\n"));
-		expect(collapsed).toContain("↑ 8 ↓ 8 lines");
+		expect(collapsed).toContain("8 行输出");
 		expect(collapsed).not.toContain("展开");
 		expect(collapsed).not.toContain("Ctrl+");
 	});
@@ -437,8 +436,8 @@ describe("marquee TUI components", () => {
 		component.setExpanded(true);
 		const expandedLines = component.render(100);
 		const expanded = stripAnsi(expandedLines.join("\n"));
-		const expandedStatus = expandedLines.map(stripAnsi).find((line) => line.includes("python · print(55)"));
-		expect(expandedStatus).toContain("↑ 1 ↓ 1 lines · 12ms");
+		const expandedStatus = expandedLines.map(stripAnsi).find((line) => line.includes("python print(55)"));
+		expect(expandedStatus).toContain("1 行输出 · 12ms");
 		// U6: no per-line expand hint, expanded or collapsed.
 		expect(expanded).not.toContain("Ctrl+O");
 		expect(expanded).toContain("print(55)");

@@ -103,11 +103,11 @@ export async function checkTmuxKeyboardSetup(): Promise<string | undefined> {
 	if (extendedKeys === undefined) return undefined;
 
 	if (extendedKeys !== "on" && extendedKeys !== "always") {
-		return "tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to ~/.tmux.conf and restart tmux.";
+		return "tmux 没开 extended-keys，Shift+Enter 换行可能不灵。在 ~/.tmux.conf 加一行 `set -g extended-keys on` 再重启 tmux。";
 	}
 
 	if (extendedKeysFormat === "xterm") {
-		return "tmux extended-keys-format is xterm. Pi works best with csi-u. Add `set -g extended-keys-format csi-u` to ~/.tmux.conf and restart tmux.";
+		return "tmux 的 extended-keys-format 是 xterm，建议在 ~/.tmux.conf 加一行 `set -g extended-keys-format csi-u` 再重启 tmux。";
 	}
 
 	return undefined;

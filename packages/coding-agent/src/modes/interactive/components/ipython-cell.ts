@@ -16,6 +16,7 @@ import { agentMessageBodyLines, agentMessagePreview, agentMessageSummaryLine } f
 import { normalizeErrorDetails, summarizeErrorDetails } from "./collapsible-error.js";
 import { renderDiffSeparator, renderRichDiff } from "./diff.js";
 import { countChangedLines, FILE_CHANGE_DIFF_INDENT, formatFileChangeSummaryLine } from "./edit-summary.js";
+import { turnStepLabel } from "./step-label.js";
 import { QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES, quietConversationBudget, toolOutputFull } from "./tool-output-budget.js";
 
 export interface IPythonCellContentBlock {
@@ -389,22 +390,25 @@ export class IPythonCellComponent implements Component {
 		return this.renderCache.set(safeWidth, cacheVersion, lines);
 	}
 
+	/**
+	 * The cell's fixed top line, in plain words: `✓ 运行 npm check · 12 行输出 · 1.2s`.
+	 * A cell without a recognizable effect shows its most telling code line.
+	 */
 	private collapsedLine(details: IpythonDetails): string {
 		const code = this.state.code.trimEnd();
-		const isBashCell = parseIpythonBashCell(code) !== undefined;
 		const preview = previewIpythonCode(code);
-		const languageLabel = isBashCell && preview.language !== "bash" ? `bash · ${preview.language}` : preview.language;
-		const parts = [`${this.marker(details)} ${theme.fg("muted", languageLabel)}`];
+		const label = code ? turnStepLabel({ toolName: "ipython", args: { code } }) : "python";
+		const parts = [`${this.marker(details)} ${theme.fg("text", label)}`];
 
-		if (preview.text) {
-			parts.push(this.highlightInputLine(preview.text, preview.language === "bash"));
-		} else if (!this.state.executionStarted) {
-			parts.push(theme.fg("muted", "waiting for code"));
+		if (label === "python" && preview.text) {
+			parts[0] += ` ${this.highlightInputLine(preview.text, preview.language === "bash")}`;
+		} else if (!code && !this.state.executionStarted) {
+			parts.push(theme.fg("muted", "等待代码"));
 		}
 
-		const counts = this.lineCounts(details);
-		if (counts) {
-			parts.push(theme.fg("muted", counts));
+		const outputLines = this.outputLineCount(details);
+		if (outputLines > 0) {
+			parts.push(theme.fg("muted", `${outputLines} 行输出`));
 		}
 
 		const duration = formatDuration(details.durationMs);
@@ -436,13 +440,8 @@ export class IPythonCellComponent implements Component {
 		}
 	}
 
-	// `↑in ↓out lines` — the "lines" unit disambiguates from the token counts on
-	// the activity line. Output is omitted for edits (the diff shows on expand).
-	private lineCounts(details: IpythonDetails): string | undefined {
-		const bashCell = parseIpythonBashCell(this.state.code);
-		const body = (bashCell?.body ?? this.state.code).split(/\r?\n/);
-		const input = body.filter((line) => line.trim().length > 0).length;
-
+	// Output is omitted for edits (the diff shows on expand).
+	private outputLineCount(details: IpythonDetails): number {
 		const hasDiffs = (details.diffs?.length ?? 0) > 0;
 		const sentMessages = details.sentAgentMessages ?? [];
 		const result = isAgentMessageReceipt(details.result, sentMessages) ? undefined : details.result;
@@ -452,16 +451,7 @@ export class IPythonCellComponent implements Component {
 		const blocksText = textFromBlocks(this.state.content);
 		const fallback = isAgentMessageReceipt(blocksText, sentMessages) ? "" : blocksText;
 		const outputText = (structured || fallback).trim();
-		const output = hasDiffs || !outputText ? 0 : outputText.split("\n").length;
-
-		const segments: string[] = [];
-		if (input > 0) {
-			segments.push(`↑ ${input}`);
-		}
-		if (output > 0) {
-			segments.push(`↓ ${output}`);
-		}
-		return segments.length > 0 ? `${segments.join(" ")} lines` : undefined;
+		return hasDiffs || !outputText ? 0 : outputText.split("\n").length;
 	}
 
 	private statusKind(details: IpythonDetails): "error" | "aborted" | "running" | "queued" | "done" {

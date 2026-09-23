@@ -399,10 +399,9 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 		const collapsed = renderQuiet(messages);
 		const nonEmpty = collapsed.split("\n").filter((line) => line.trim().length > 0);
 
-		// One footnote line at the turn head: duration, steps, the [O] hint.
-		expect(nonEmpty[1]).toContain("干了");
-		expect(nonEmpty[1]).toContain("6 步");
-		expect(nonEmpty[1]).toContain("[O]");
+		// One process line at the turn head: caret, steps, duration, plain-words summary.
+		expect(nonEmpty[1]?.startsWith(" ▸ 6 步 · 0.6s   编辑 file-1.ts · 运行 npm test --grep 2")).toBe(true);
+		expect(nonEmpty[1]).not.toMatch(/\[[OTP]\]/);
 		// The very next line is the final prose: no second mechanical line.
 		expect(nonEmpty[2]).toContain("All six checks passed");
 		expect(nonEmpty.filter((line) => line.includes("步"))).toHaveLength(1);
@@ -411,7 +410,7 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 		expect(collapsed).not.toContain("思考 ");
 	});
 
-	it("renders a thinking-only quiet turn as 想了想, and a bare turn as nothing", () => {
+	it("renders a thinking-only quiet turn as 思考 with its duration, and a bare turn the same way", () => {
 		const messages: AgentMessage[] = [
 			{ role: "user", content: "just think", timestamp: 900 },
 			assistant(
@@ -427,27 +426,24 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 		];
 		const collapsed = renderQuiet(messages);
 		const nonEmpty = collapsed.split("\n").filter((line) => line.trim().length > 0);
-		// The empty-state turn: only 想了想, no counts, no keys, no duration.
-		expect(nonEmpty[1]).toBe("▸想了想");
+		// The thinking-only turn: 思考 plus the frozen duration, no step count.
+		expect(nonEmpty[1]).toBe(" ▸ 思考 · 2.0s");
 		expect(collapsed).toContain("Concluded.");
-		// R5-P2③: the thinking-less turn renders 想了想 too - the model is
-		// always reasoning, so every turn carries the footnote.
-		expect(collapsed.split("\n").filter((line) => line.includes("想了想"))).toHaveLength(2);
+		// R5-P2③: the thinking-less turn renders 思考 too - the model is
+		// always reasoning, so every turn carries the process line.
+		const heads = collapsed.split("\n").filter((line) => line.startsWith(" ▸ 思考"));
+		expect(heads).toHaveLength(2);
+		expect(collapsed).not.toContain("想了想");
 	});
 
-	it("renders 想了想 for an all-zero turn (R5-P2③: every turn carries the footnote)", () => {
+	it("renders 思考 for an all-zero turn (R5-P2③: every turn carries the footnote)", () => {
 		const state = new TurnActivityState(1_000);
 		state.markTurnEnded(1_500);
 		const summary = new TurnSummaryComponent(state);
 		summary.setQuiet(true);
-		// No steps, no thinking, no comms: still one 想了想 line, not nothing.
-		const line = summary
-			.render(120)
-			.join("\n")
-			.replace(/\u001b\[[0-9;]*m/g, "");
-		expect(line).toContain("想了想");
-		expect(line).not.toContain("步");
-		expect(line).not.toContain("[");
+		// No steps, no thinking, no comms: still one 思考 line, not nothing.
+		const line = stripAnsi(summary.render(120).join("\n"));
+		expect(line).toBe(" ▸ 思考 · 0.5s");
 	});
 
 	it("counts comms from received agent rows plus sent agent messages in tool details", () => {
@@ -492,10 +488,10 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 		];
 		const collapsed = renderQuiet(messages);
 		// 1 step, 1 thinking segment, 3 comms (2 sent + 1 received).
-		expect(collapsed).toContain("1 步");
-		expect(collapsed).toContain("想 1 段");
-		expect(collapsed).toContain("→ 通讯 3 条");
-		expect(collapsed).toContain("[P]");
+		const head = collapsed.split("\n").find((line) => line.startsWith(" ▸ "));
+		expect(head?.startsWith(" ▸ 思考 · 1 步 · ")).toBe(true);
+		expect(head).toContain(" · 通讯 3 条");
+		expect(head).not.toContain("[P]");
 	});
 
 	it("counts steps deduped by toolCallId", () => {
@@ -519,7 +515,7 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 		summary.addCommMessage();
 		summary.addCommMessage();
 		const line = stripAnsi(summary.render(120).join("\n"));
-		expect(line).toContain("→ 通讯 2 条");
+		expect(line).toContain(" · 通讯 2 条");
 	});
 
 	it("setQuiet(false) restores the legacy two-line face", () => {
@@ -528,7 +524,7 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 		state.markTurnEnded(1_500);
 		const summary = new TurnSummaryComponent(state);
 		summary.setQuiet(true);
-		expect(stripAnsi(summary.render(120).join("\n"))).toContain("1 步 [O]");
+		expect(stripAnsi(summary.render(120).join("\n"))).toMatch(/^ ▸ 1 步 · /);
 		summary.setQuiet(false);
 		const legacy = stripAnsi(summary.render(120).join("\n"));
 		expect(legacy).toContain("⚙ 1 步");
@@ -662,11 +658,67 @@ describe("turn comm counter (TUI v4 T6)", () => {
 		summary.setQuiet(true);
 		// The component facade routes into the same counter.
 		summary.addCommMessage();
-		const line = summary
-			.render(120)
-			.join("\n")
-			.replace(/\u001b\[[0-9;]*m/g, "");
-		expect(line).toContain("→ 通讯 4 条");
+		const line = stripAnsi(summary.render(120).join("\n"));
+		expect(line).toContain(" · 通讯 4 条");
 		expect(state.commMessageCount).toBe(4);
+	});
+});
+
+describe("turn state for the process line", () => {
+	beforeAll(() => initTheme("dark"));
+
+	it("merges file changes by path and drops no-op changes", () => {
+		const state = new TurnActivityState(1_000);
+		state.addFileChanges([
+			{ path: "src/a.ts", added: 2, removed: 1 },
+			{ path: "src/b.ts", added: 0, removed: 0 },
+		]);
+		state.addFileChanges([{ path: "src/a.ts", added: 1, removed: 3 }]);
+		expect(state.fileChanges).toEqual([{ path: "src/a.ts", added: 3, removed: 4 }]);
+	});
+
+	it("lists changed files while collapsed and hides them once the process block opens", () => {
+		const state = new TurnActivityState(1_000);
+		state.addStep({ toolCallId: "e1", toolName: "edit", args: { path: "src/a.ts" }, status: "running" });
+		state.setStepStatus("e1", "done", 1_400);
+		state.addFileChanges([{ path: "src/a.ts", added: 3, removed: 5 }]);
+		state.markTurnEnded(1_500);
+		const summary = new TurnSummaryComponent(state);
+		summary.setQuiet(true);
+		expect(summary.render(120).map((line) => stripAnsi(line))).toEqual([
+			" ▸ 1 步 · 0.4s   编辑 a.ts",
+			"   改动  src/a.ts  +3 −5",
+		]);
+		summary.setExpanded(true);
+		expect(summary.render(120).map((line) => stripAnsi(line))).toEqual([" ▾ 1 步 · 0.4s   编辑 a.ts"]);
+	});
+
+	it("relabels a step when its streaming arguments complete", () => {
+		const state = new TurnActivityState(1_000);
+		state.addStep({ toolCallId: "p1", toolName: "ipython", args: {}, status: "queued" });
+		state.updateStepArgs("p1", { code: "%%bash\nnpm run check" });
+		state.setStepStatus("p1", "done", 1_200);
+		state.markTurnEnded(1_300);
+		const summary = new TurnSummaryComponent(state);
+		summary.setQuiet(true);
+		expect(stripAnsi(summary.render(120)[0] ?? "")).toBe(" ▸ 1 步 · 0.2s   运行 npm check");
+	});
+
+	it("keeps the clock ticking while a step is unsettled and freezes it on the last settled step", () => {
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(10_000);
+			const state = new TurnActivityState(10_000);
+			state.addStep({ toolCallId: "t1", toolName: "bash", args: {}, status: "running" });
+			vi.setSystemTime(13_000);
+			expect(state.turnDurationMs()).toBe(3_000);
+			vi.setSystemTime(15_000);
+			expect(state.turnDurationMs()).toBe(5_000);
+			state.setStepStatus("t1", "done", 15_500);
+			vi.setSystemTime(40_000);
+			expect(state.turnDurationMs()).toBe(5_500);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });

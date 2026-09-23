@@ -1,3 +1,4 @@
+import { homedir } from "node:os";
 import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provider.js";
 import { theme } from "../theme/theme.js";
@@ -11,14 +12,25 @@ export const TOOL_ERROR_WARN_THRESHOLD = 3;
 /** Cells of the watermark bar: `──────●───────│──` (● = level, │ = compaction notch). */
 const WATERMARK_BAR_CELLS = 16;
 
-/** Four-space gap between the line's groups (model, bar, figures, hint). */
-const GROUP_GAP = "    ";
+/** Gap between the line's groups (model, location, bar, figures). */
+const GROUP_GAP = "   ";
 
-/**
- * U6 layout discipline: below 80 columns the bar goes first, then the token
- * figures - the model name never truncates into a wrong number.
- */
-const WATERMARK_BAR_MIN_WIDTH = 80;
+/** The bar only appears once the context reaches this share of the compaction threshold. */
+const WATERMARK_BAR_MIN_LEVEL = 0.5;
+
+/** Where the session runs, for the status line's location group. */
+export interface FooterLocation {
+	cwd: string;
+	branch?: string | null;
+}
+
+function displayCwd(cwd: string): string {
+	const home = homedir();
+	if (home && (cwd === home || cwd.startsWith(`${home}/`))) {
+		return `~${cwd.slice(home.length)}`;
+	}
+	return cwd;
+}
 
 /** U6 评审②: the pull source behind the watermark line - mode and snapshot as one frame-consistent pair. */
 export interface FooterTelemetrySource {
@@ -118,6 +130,7 @@ export class FooterComponent implements Component {
 	private speedEnabled = false;
 	private speedText: string | undefined;
 	private telemetrySource: (() => FooterTelemetrySource) | undefined;
+	private locationSource: (() => FooterLocation | undefined) | undefined;
 	private toolErrorCount = 0;
 
 	constructor(private footerData: ReadonlyFooterDataProvider) {
@@ -150,18 +163,25 @@ export class FooterComponent implements Component {
 		this.telemetrySource = source;
 	}
 
+	/** The cwd and git branch shown between the model and the context figures. */
+	setLocationSource(source: () => FooterLocation | undefined): void {
+		this.locationSource = source;
+	}
+
 	/** U2: trailing consecutive tool errors; the badge renders from TOOL_ERROR_WARN_THRESHOLD. */
 	setToolErrorCount(count: number): void {
 		this.toolErrorCount = count;
 	}
 
 	/**
-	 * U6 watermark line: `glm-5.3-prime · max    ──────●───────│──    518k/1M · 49%`.
+	 * The status line: `glm-5.3-prime · max   ~/repo · main          21k/1M · 2%`.
 	 *
-	 * `●` marks the context level, `│` the auto-compaction notch; reaching the
-	 * notch is the only threshold state (the notch brightens and the line tail
-	 * reads 压缩在即). Degradation on narrow widths: bar first, then the token
-	 * figures; the model segment is never dropped.
+	 * Model and location on the left, the context figures right-aligned. The
+	 * watermark bar (`●` level, `│` compaction notch) joins the figures only
+	 * once the context reaches half the compaction threshold, and reaching the
+	 * threshold turns the figures warning-colored with `即将压缩`. Narrow
+	 * widths drop the location first, then the bar, then the figures; the
+	 * model never drops and segments never truncate into a wrong number.
 	 */
 	private telemetryText(safeWidth: number): string | undefined {
 		const source = this.telemetrySource?.();
@@ -174,45 +194,40 @@ export class FooterComponent implements Component {
 			return undefined;
 		}
 		const modelText = snapshot.thinkingLevel ? `${modelName} · ${snapshot.thinkingLevel}` : modelName;
-		const model = theme.fg("muted", modelText);
+		const model = ` ${theme.fg("muted", modelText)}`;
+		const location = this.locationSource?.();
+		const locationText = location
+			? [displayCwd(location.cwd), location.branch ?? undefined].filter((part) => part).join(" · ")
+			: "";
+		const locationGroup = locationText ? `${GROUP_GAP}${theme.fg("dim", locationText)}` : "";
 		const tokens = snapshot.contextTokens;
 		const windowTokens = snapshot.contextWindow ?? 0;
 		const knownContext = tokens !== undefined && tokens !== null && windowTokens > 0;
 		const threshold = snapshot.compactionThresholdTokens ?? 0;
-		// 评审③: the notch and the tail read the real threshold (settings-driven,
-		// reserve-capped); threshold compaction off means neither renders.
 		const imminent = knownContext && threshold > 0 && tokens >= threshold;
-		const tail = imminent ? `${GROUP_GAP}${theme.fg("warning", "压缩在即")}` : "";
-		const figures = knownContext
-			? theme.fg(
-					"muted",
-					`${formatContextTokens(tokens, windowTokens)} · ${Math.round((tokens / windowTokens) * 100)}%`,
-				)
+		const figuresText = knownContext
+			? `${formatContextTokens(tokens, windowTokens)} · ${Math.round((tokens / windowTokens) * 100)}%${imminent ? " · 即将压缩" : ""}`
 			: "";
+		const figures = figuresText ? theme.fg(imminent ? "warning" : "muted", `${figuresText} `) : "";
 		const bar =
-			knownContext && threshold > 0 && safeWidth >= WATERMARK_BAR_MIN_WIDTH
-				? watermarkBar(tokens, windowTokens, threshold, imminent)
+			knownContext && threshold > 0 && tokens >= threshold * WATERMARK_BAR_MIN_LEVEL
+				? `${watermarkBar(tokens, windowTokens, threshold, imminent)}  `
 				: "";
 
-		// Degradation ladder, richest first (F8, DS2 review): full form, then
-		// the figures WITHOUT the bar, then the model alone. The bar is the
-		// decoration - it drops before the numbers, never after; and the
-		// 压缩在即 tail only renders with the figures beside it, so a warning
-		// never stands without the numbers that justify it. A truncated figure
-		// would read as a wrong number, so segments drop whole.
-		const candidates = [
-			`${model}${bar ? `${GROUP_GAP}${bar}` : ""}${figures ? `${GROUP_GAP}${figures}` : ""}${tail}`,
+		const layouts: Array<[string, string]> = [
+			[`${model}${locationGroup}`, `${bar}${figures}`],
+			[model, `${bar}${figures}`],
+			[model, figures],
+			[model, ""],
 		];
-		if (figures) {
-			candidates.push(`${model}${GROUP_GAP}${figures}${tail}`);
-		}
-		candidates.push(`${model}`);
-		for (const candidate of candidates) {
-			if (visibleWidth(candidate) <= safeWidth) {
-				return candidate;
+		for (const [left, right] of layouts) {
+			const gap = right ? 2 : 0;
+			const used = visibleWidth(left) + gap + visibleWidth(right);
+			if (used <= safeWidth) {
+				return `${left}${" ".repeat(Math.max(0, safeWidth - visibleWidth(left) - visibleWidth(right)))}${right}`;
 			}
 		}
-		return truncateToWidth(`${model}`, safeWidth, "…");
+		return truncateToWidth(model, safeWidth, "…");
 	}
 
 	/**

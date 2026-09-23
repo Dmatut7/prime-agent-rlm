@@ -1,0 +1,1 @@
+- Fixed word wrapping of Chinese/Japanese/Korean text so embedded English words, paths, and file names wrap whole instead of being split mid-word, and closing punctuation never starts a line.

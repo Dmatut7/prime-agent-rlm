@@ -88,7 +88,7 @@ function formatChangeCounts(change: Pick<FileChangeSummary, "added" | "removed">
 	return `${theme.fg("toolDiffAdded", `+${change.added}`)} ${theme.fg("toolDiffRemoved", `-${change.removed}`)}`;
 }
 
-function formatFileChangePath(path: string, cwd: string): string {
+export function formatFileChangePath(path: string, cwd: string): string {
 	const resolvedPath = resolveToCwd(path, cwd);
 	const lexicalPath = formatPathRelativeToCwdOrAbsolute(resolvedPath, cwd);
 	if (!isAbsolute(lexicalPath)) return lexicalPath;

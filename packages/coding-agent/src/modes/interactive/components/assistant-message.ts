@@ -370,7 +370,9 @@ export class AssistantMessageComponent extends Container {
 		// no text at all keeps the pre-v4 single blank line).
 		if (
 			hasToolCalls &&
-			(hasVisibleContent || message.stopReason === "aborted" || (!this.precededByToolActivity && !hasFoldedText))
+			(hasVisibleContent ||
+				message.stopReason === "aborted" ||
+				(!this.quiet && !this.precededByToolActivity && !hasFoldedText))
 		) {
 			this.contentContainer.addChild(new Spacer(1));
 		}

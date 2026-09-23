@@ -10,11 +10,11 @@ export interface AgentActivityStatus {
 }
 
 export const AGENT_ACTIVITY_LABELS: Record<AgentActivity, string> = {
-	waiting: "Waiting",
-	thinking: "Thinking",
-	writing: "Writing",
-	"writing-code": "Writing code",
-	executing: "Executing",
+	waiting: "等待模型",
+	thinking: "思考中",
+	writing: "回答中",
+	"writing-code": "写代码",
+	executing: "执行中",
 };
 
 const CHARS_PER_TOKEN_ESTIMATE = 4;

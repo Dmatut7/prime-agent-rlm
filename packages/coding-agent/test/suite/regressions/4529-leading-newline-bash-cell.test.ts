@@ -67,7 +67,7 @@ describe("ENG-4529 leading newline before %%bash", () => {
 		component.updateResult({ content: [], details: { status: "ok" }, isError: false });
 
 		const rendered = stripAnsi(component.render(100).join("\n"));
-		expect(rendered).toContain("✓ bash · cd /tmp · ↑ 1 lines");
+		expect(rendered).toContain("✓ 运行 cd /tmp");
 		expect(rendered).not.toContain("✓ python");
 	});
 });

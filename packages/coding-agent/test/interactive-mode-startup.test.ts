@@ -24,6 +24,9 @@ describe("InteractiveMode startup hints", () => {
 		const mode = {
 			options: { returnToAgentsView },
 			editor: { getText: getEditorText },
+			uiServices: { settingsManager: { getFooterTelemetry: () => "on" } },
+			heartbeatCatalog: [],
+			subagentSnapshots: new Map(),
 			connectionState: {
 				model: { name: "test-model", reasoning: true },
 				thinkingLevel: "high",
@@ -35,7 +38,7 @@ describe("InteractiveMode startup hints", () => {
 		return mode;
 	}
 
-	it("keeps a blank row above the shared splash and limits its metadata", () => {
+	it("renders a compact splash: wordmark, then one labelled row per fact", () => {
 		const header = new BrandSplashHeader(
 			"0.0.0",
 			() => "test-model",
@@ -43,50 +46,71 @@ describe("InteractiveMode startup hints", () => {
 			undefined,
 			{
 				topPadding: true,
-				getStartHint: () => 'Try "refactor @<filepath>"',
+				getExtraMetadata: () => [{ label: "agents", value: "3 idle" }],
 			},
 		);
 
-		const lines = header.render(120);
-		const output = stripAnsi(lines.join("\n"));
+		const lines = header.render(120).map((line) => stripAnsi(line).trimEnd());
 
-		expect(lines[0]).toBe("");
-		expect(output).toContain("version  v0.0.0");
-		expect(output).toContain("model    test-model");
-		expect(output).toContain("cwd      /tmp/project");
-		expect(output).toContain('Try "refactor @<filepath>"');
-		expect(output).not.toContain("input");
-		expect(output).not.toContain("files");
-		expect(output).not.toContain("help");
+		expect(lines).toEqual([
+			"",
+			" prime-agent  v0.0.0",
+			"",
+			" 模型    test-model",
+			" 目录    /tmp/project",
+			" agents  3 idle",
+		]);
+		const output = lines.join("\n");
+		// No logo mark by default and no start hint (the prompt placeholder owns it).
+		expect(output).not.toContain("█");
+		expect(output).not.toContain("▀");
+		expect(output).not.toContain("Try");
 
 		const unpadded = new BrandSplashHeader(
 			"0.0.0",
 			() => "test-model",
 			() => "/tmp/project",
 		);
-		expect(unpadded.render(120)[0]).not.toBe("");
+		expect(stripAnsi(unpadded.render(120)[0] ?? "").trim()).toBe("prime-agent  v0.0.0");
 	});
 
-	it("randomly selects from five concise filepath prompts", () => {
+	it("renders an explicitly passed logo above the wordmark", () => {
+		const header = new BrandSplashHeader(
+			"0.0.0",
+			() => "m",
+			() => "/tmp",
+			undefined,
+			{ logo: "LOGO-1\nLOGO-2" },
+		);
+		const lines = header.render(80).map((line) => stripAnsi(line).trimEnd());
+		expect(lines.slice(0, 4)).toEqual([" LOGO-1", " LOGO-2", "", " prime-agent  v0.0.0"]);
+	});
+
+	it("randomly selects from five concise Chinese start hints", () => {
 		expect(START_HINTS).toHaveLength(5);
 		expect(new Set(START_HINTS).size).toBe(5);
 
 		for (const [index, hint] of START_HINTS.entries()) {
 			expect(getRandomStartHint(() => index / START_HINTS.length)).toBe(hint);
-			expect(hint).toMatch(/^Try ".*@<filepath>.*"$/);
+			expect(hint).toContain("@");
+			expect(hint).not.toContain("Try");
 		}
 	});
 
-	it("renders a pure navigation tray label without model or shortcuts", () => {
+	it("leaves the hint line's status side empty for a plain top-level session", () => {
 		const mode = createMode();
-		const label = Reflect.get(InteractiveMode.prototype, "getTrayLocationLabel").call(mode);
+		const label = Reflect.get(InteractiveMode.prototype, "getTrayStatusLabel").call(mode);
 
-		// U6 ①: the model name and fresh-chat shortcuts hint moved out; the
-		// label is navigation only.
-		expect(stripAnsi(label)).toBe("");
+		// No model, no shortcuts, no navigation on the status side.
+		expect(label).toBeUndefined();
 	});
 
-	it("keeps fresh-chat guidance hidden when a mid-turn snapshot still has no committed messages", () => {
+	it("shows the agent depth on the hint line's status side", () => {
+		const mode = Object.assign(createMode(), { options: { returnToAgentsView: false, sessionDepth: 2 } });
+		expect(Reflect.get(InteractiveMode.prototype, "getTrayStatusLabel").call(mode)).toBe("深度 2");
+	});
+
+	it("keeps fresh-chat guidance on the new-chat hints until the chat has messages", () => {
 		const mode = createMode();
 		const patchConnectionState = (patch: Record<string, unknown>) => Object.assign(mode.connectionState, patch);
 		Object.assign(mode, {
@@ -98,18 +122,21 @@ describe("InteractiveMode startup hints", () => {
 			InteractiveMode.prototype,
 			"updateConnectionStateFromEvent",
 		) as (event: unknown) => void;
-		const getLabel = () => stripAnsi(Reflect.get(InteractiveMode.prototype, "getTrayLocationLabel").call(mode));
+		const getHints = () => Reflect.get(InteractiveMode.prototype, "getTrayHints").call(mode) as string[];
 		const message = { role: "user", content: "hello", timestamp: 1 };
+
+		expect(getHints()).toEqual(["/ 命令", "@ 文件", "? 快捷键"]);
 
 		updateConnectionStateFromEvent.call(mode, { type: "agent_start" });
 		updateConnectionStateFromEvent.call(mode, { type: "message_start", message });
 		Object.assign(mode.connectionState, { messageCount: 0, isStreaming: true });
-
-		expect(getLabel()).not.toContain("for shortcuts");
+		// A running turn offers the interrupt, even before any message is committed.
+		expect(getHints()).toEqual(["Esc 中断", "Ctrl+O 过程", "Ctrl+T 思考"]);
 
 		updateConnectionStateFromEvent.call(mode, { type: "message_end", message });
 		updateConnectionStateFromEvent.call(mode, { type: "agent_end", messages: [message] });
-		expect(getLabel()).not.toContain("for shortcuts");
+		Object.assign(mode.connectionState, { messageCount: 1, isStreaming: false });
+		expect(getHints()).toEqual(["Ctrl+O 过程", "Ctrl+T 思考", "? 快捷键"]);
 	});
 
 	it("routes session-view requests through the existing agents-view return path", async () => {
@@ -230,44 +257,30 @@ describe("InteractiveMode startup hints", () => {
 		expect(shutdown).not.toHaveBeenCalled();
 	});
 
-	it("keeps the lowercase agents hint while typing", () => {
+	it("offers the session list on the hints only when the agents view is reachable", () => {
 		let editorText = "";
-		const mode = createMode(0, true, () => editorText);
-		const getLabel = () => Reflect.get(InteractiveMode.prototype, "getTrayLocationLabel").call(mode);
+		const daemonChat = createMode(1, true, () => editorText);
+		const getHints = (mode: object) => Reflect.get(InteractiveMode.prototype, "getTrayHints").call(mode) as string[];
 
-		// U6 ①: navigation only; the label no longer reacts to editor text
-		// (no shortcuts hint to hide) and carries no model segment.
-		expect(stripAnsi(getLabel())).toBe("← agents/resume");
-
+		expect(getHints(daemonChat)).toEqual(["Ctrl+O 过程", "Ctrl+T 思考", "← 会话列表", "? 快捷键"]);
+		// The hints do not react to editor text.
 		editorText = "draft prompt";
-		expect(stripAnsi(getLabel())).toBe("← agents/resume");
+		expect(getHints(daemonChat)).toEqual(["Ctrl+O 过程", "Ctrl+T 思考", "← 会话列表", "? 快捷键"]);
+
+		expect(getHints(createMode(0, true))).toEqual(["/ 命令", "@ 文件", "← 会话列表", "? 快捷键"]);
+		expect(getHints(createMode(1, false))).toEqual(["Ctrl+O 过程", "Ctrl+T 思考", "? 快捷键"]);
 	});
 
-	it("hides the fresh-chat shortcut hint while the prompt has text", () => {
+	it("keeps the status side empty through edits for a plain session", () => {
 		let editorText = "";
 		const mode = createMode(0, false, () => editorText);
-		const getLabel = () => Reflect.get(InteractiveMode.prototype, "getTrayLocationLabel").call(mode);
+		const getLabel = () => Reflect.get(InteractiveMode.prototype, "getTrayStatusLabel").call(mode);
 
-		// U6 ①: no model segment, no shortcuts hint — the label is empty for a
-		// plain session and stays empty through edits.
-		expect(stripAnsi(getLabel())).toBe("");
-
+		expect(getLabel()).toBeUndefined();
 		editorText = "draft prompt";
-		expect(stripAnsi(getLabel())).toBe("");
-
+		expect(getLabel()).toBeUndefined();
 		editorText = " ";
-		expect(stripAnsi(getLabel())).toBe("");
-
-		editorText = "";
-		expect(stripAnsi(getLabel())).toBe("");
-	});
-
-	it("hides the tray shortcut guidance for chats with history", () => {
-		const mode = createMode(1);
-		const label = Reflect.get(InteractiveMode.prototype, "getTrayLocationLabel").call(mode);
-
-		// U6 ①: navigation only — nothing renders for a plain session.
-		expect(stripAnsi(label)).toBe("");
+		expect(getLabel()).toBeUndefined();
 	});
 
 	it("keeps the question-mark shortcut guide compact", () => {

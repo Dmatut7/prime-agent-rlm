@@ -106,19 +106,23 @@ describe("component render caching", () => {
 	});
 
 	test("TrayInfoLine re-renders its getters on every frame (no cache)", () => {
-		let contextLabel: string | undefined = "518k/1M (49%)";
+		let statusLabel: string | undefined = "518k/1M (49%)";
+		let hints = ["Ctrl+O 过程"];
 		const line = new TrayInfoLine(
-			() => undefined,
-			() => contextLabel,
+			() => statusLabel,
+			() => hints,
 			() => undefined,
 		);
 		const first = line.render(120);
 		expect(first.join("")).toContain("518k/1M (49%)");
+		expect(first.join("")).toContain("Ctrl+O 过程");
 
-		// Labels come from getters and can drift without any setter call.
-		contextLabel = "530k/1M (51%)";
+		// Labels and hints come from getters and can drift without any setter call.
+		statusLabel = "530k/1M (51%)";
+		hints = ["Esc 中断"];
 		expect(line.render(120)[0]).not.toBe(first[0]);
 		expect(line.render(120).join("")).toContain("530k/1M (51%)");
+		expect(line.render(120).join("")).toContain("Esc 中断");
 	});
 
 	test("FooterComponent returns a stable empty array", () => {

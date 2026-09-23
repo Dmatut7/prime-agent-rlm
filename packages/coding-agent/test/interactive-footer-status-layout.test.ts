@@ -1,4 +1,4 @@
-import { setKeybindings } from "@earendil-works/pi-tui";
+import { setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, it } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
@@ -8,10 +8,11 @@ import { TopBar } from "../src/modes/interactive/components/top-bar.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
 /**
- * U6 status-area layout pins: the three lines under the editor are
- * ① `← agents/resume · 深度 0` (pure navigation, context fallback only while
- *    footer.telemetry=off, reading the footer's own snapshot),
- * ② the footer watermark `glm-5.3-prime · max    ──────●───────│──    518k/1M · 49%`,
+ * Status-area layout pins, top to bottom around the editor:
+ * ① the hint line above the editor - status on the left (`深度 0`, goal,
+ *    heartbeats, the context fallback only while footer.telemetry=off), the
+ *    keys that work right now on the right (`Ctrl+O 过程 · Ctrl+T 思考`),
+ * ② (under the editor) the status line `glm-5.3-prime · max   ~/repo · main   ──●──│──  518k/1M · 49%`,
  * ③ `  运行 1 · 空闲 0 · 收口 2    子代理 ¥961.72 · 592M tok ｜ 全部 ¥1235.16    ↓ 选择`.
  * One fact one home: the model lives only in ②, the context figures only in ②
  * (fallback in ① while ② is off), the sub-agents only in ③.
@@ -31,15 +32,15 @@ function statusStack(options: {
 	telemetry: "off" | "on";
 	counts?: { total: number; running: number; idle: number; inactive: number };
 	spend?: Parameters<SubagentSummaryLine["setSubagentSpend"]>[0];
-	locationLabel?: string;
-	contextLabel?: string;
+	statusLabel?: string;
+	hints?: string[];
 	width?: number;
 }): string[] {
 	const width = options.width ?? 110;
 	const topBar = new TopBar({ getChatName: () => "调试会话-003" });
 	const info = new TrayInfoLine(
-		() => options.locationLabel ?? "← agents/resume · 深度 0",
-		() => options.contextLabel,
+		() => options.statusLabel ?? "深度 0",
+		() => options.hints ?? ["Ctrl+O 过程", "Ctrl+T 思考", "← 会话列表", "? 快捷键"],
 		() => undefined,
 	);
 	const footer = new FooterComponent(provider);
@@ -65,7 +66,8 @@ describe("U6 status area layout", () => {
 		});
 		const nonEmpty = lines.map((line) => line.trimEnd()).filter((line) => line.trim().length > 0);
 		expect(nonEmpty).toHaveLength(4); // top bar, ①, ②, ③
-		expect(nonEmpty[1]).toBe("← agents/resume · 深度 0");
+		expect(nonEmpty[1]).toMatch(/^ 深度 0 +Ctrl\+O 过程 · Ctrl\+T 思考 · ← 会话列表 · \? 快捷键$/);
+		expect(visibleWidth(lines[1] ?? "")).toBe(110);
 		expect(nonEmpty[2]).toContain("glm-5.3-prime · max");
 		expect(nonEmpty[2]).toMatch(/●/);
 		expect(nonEmpty[2]).toContain("518k/1M · 49%");
@@ -141,10 +143,12 @@ describe("U6 status area layout", () => {
 	it("degrades gracefully: footer drops the bar first then the figures; ③ truncates", () => {
 		const footer = new FooterComponent(provider);
 		footer.setTelemetrySource(() => ({ mode: "on", snapshot: SNAPSHOT }));
-		expect(stripAnsi(footer.render(80).join(""))).toContain("●");
-		const below80 = stripAnsi(footer.render(79).join(""));
-		expect(below80).not.toContain("●");
-		expect(below80).toContain("518k/1M · 49%");
+		// ` bailian/glm-5.3-prime · max` (28) + gap (2) + bar (16+2) + `518k/1M · 49% ` (14).
+		expect(stripAnsi(footer.render(62).join(""))).toContain("●");
+		const noBar = stripAnsi(footer.render(61).join(""));
+		expect(noBar).not.toContain("●");
+		expect(noBar).toContain("518k/1M · 49%");
+		expect(stripAnsi(footer.render(43).join(""))).not.toContain("518k");
 
 		const subagents = new SubagentSummaryLine();
 		subagents.setSubagentCounts({ total: 3, running: 1, idle: 0, inactive: 2 });
@@ -156,16 +160,16 @@ describe("U6 status area layout", () => {
 		}
 	});
 
-	it("keeps the compaction state the only threshold: 压缩在仅 at the notch", () => {
+	it("keeps the compaction state the only threshold: 即将压缩 at the notch", () => {
 		const footer = new FooterComponent(provider);
 		let snapshot: FooterTelemetrySnapshot = { ...SNAPSHOT, contextTokens: 900_000 };
 		footer.setTelemetrySource(() => ({ mode: "on", snapshot }));
 		const imminent = stripAnsi(footer.render(110).join(""));
-		expect(imminent).toContain("压缩在即");
+		expect(imminent).toContain("即将压缩");
 		expect(imminent).toContain("86%");
 
 		snapshot = { ...SNAPSHOT, contextTokens: 200_000 };
-		expect(stripAnsi(footer.render(110).join(""))).not.toContain("压缩在即");
+		expect(stripAnsi(footer.render(110).join(""))).not.toContain("即将压缩");
 	});
 
 	it("pins the typographic discipline across the status lines", () => {
@@ -200,25 +204,44 @@ describe("U6 status area layout", () => {
 
 	it("relocates every signal to its home line and loses none when ③ hides (评审⑤)", () => {
 		// ① carries the transient override notices (Ctrl+C exit / queue hint) on
-		// its left even with no navigation, no goal, and no context fallback:
-		// the only content on the line.
+		// its left even with no status and no hints: the only content on the line.
 		const overrideOnly = new TrayInfoLine(
 			() => undefined,
-			() => undefined,
-			() => "Press Ctrl+C again to exit",
+			() => [],
+			() => "再按一次 Ctrl+C 退出",
 		);
 		const overrideLine = stripAnsi(overrideOnly.render(110).join("\n"));
-		expect(overrideLine).toContain("Press Ctrl+C again to exit");
+		expect(overrideLine.trim()).toBe("再按一次 Ctrl+C 退出");
 
-		// ①'s right side carries goal/heartbeat while they run (K3 S3).
+		// The override wins over the status label, and the hints stay on the right.
+		const overrideWithStatus = new TrayInfoLine(
+			() => "深度 1",
+			() => ["Esc 中断"],
+			() => "再按一次 Ctrl+C 退出",
+		);
+		const overrideWithStatusLine = stripAnsi(overrideWithStatus.render(110).join("\n"));
+		expect(overrideWithStatusLine).toContain("再按一次 Ctrl+C 退出");
+		expect(overrideWithStatusLine).not.toContain("深度 1");
+		expect(overrideWithStatusLine.endsWith("Esc 中断 ")).toBe(true);
+
+		// ①'s left side carries goal/heartbeat while they run (K3 S3).
 		const withGoal = new TrayInfoLine(
-			() => "← agents/resume · 深度 0",
-			() => "Pursuing goal (12m) · 2 heartbeats",
+			() => "Pursuing goal (12m) · 2 heartbeats · 深度 0",
+			() => ["Ctrl+O 过程"],
 			() => undefined,
 		);
 		const goalLine = stripAnsi(withGoal.render(110).join("\n"));
-		expect(goalLine).toContain("← agents/resume · 深度 0");
-		expect(goalLine).toContain("Pursuing goal (12m) · 2 heartbeats");
+		expect(goalLine.startsWith(" Pursuing goal (12m) · 2 heartbeats · 深度 0")).toBe(true);
+		expect(goalLine.endsWith("Ctrl+O 过程 ")).toBe(true);
+
+		// Nothing to say: the line renders nothing at all.
+		expect(
+			new TrayInfoLine(
+				() => undefined,
+				() => [],
+				() => undefined,
+			).render(110),
+		).toEqual([]);
 
 		// The U2 badge owns ②'s tail while telemetry is on and stands alone
 		// when it is off - either way the signal survives ③ hiding.
@@ -249,31 +272,23 @@ describe("U6 status area layout", () => {
 		expect(stallLines[1]).toContain("⚠ stalled 214s");
 	});
 
-	it("states the two-key division in one global hint line at the chat tail", async () => {
-		const { ExpandKeysHintLine } = await import("../src/modes/interactive/components/expand-keys-hint.js");
-		let hasContent = false;
-		const line = new ExpandKeysHintLine(() => hasContent);
-		expect(line.render(100)).toEqual([]);
-
-		hasContent = true;
-		const rendered = stripAnsi(line.render(100).join("\n"));
-		// `Ctrl+T 思考 · Ctrl+O 过程 · Ctrl+P 通讯` — one dim line, the only
-		// place the key division is stated (TUI v4: Ctrl+P owns comms).
-		expect(rendered).toContain("Ctrl+T 思考 · Ctrl+O 过程 · Ctrl+P 通讯");
-		expect(rendered).not.toContain("展开");
-		// It never grows beyond one line.
-		expect(line.render(100)).toHaveLength(1);
-
-		// F4 (DS2): the hint degrades by whole segments - no mid-key fragments.
-		const twoSegments = stripAnsi(line.render(30).join("\n"));
-		expect(twoSegments).toBe(" Ctrl+T 思考 · Ctrl+O 过程");
-		const oneSegment = stripAnsi(line.render(20).join("\n"));
-		expect(oneSegment).toBe(" Ctrl+T 思考");
-		// Below one full segment: nothing - no half keys.
-		expect(line.render(10)).toEqual([]);
-		for (const width of [40, 34, 30, 24, 20, 16, 12, 8]) {
-			const text = stripAnsi(line.render(width).join("\n"));
+	it("drops hints whole from the end when the hint line is too narrow", () => {
+		const line = new TrayInfoLine(
+			() => "深度 0",
+			() => ["Ctrl+O 过程", "Ctrl+T 思考", "? 快捷键"],
+			() => undefined,
+		);
+		const full = stripAnsi(line.render(60).join(""));
+		expect(full.endsWith("Ctrl+O 过程 · Ctrl+T 思考 · ? 快捷键 ")).toBe(true);
+		const two = stripAnsi(line.render(36).join(""));
+		expect(two.endsWith("Ctrl+O 过程 · Ctrl+T 思考 ")).toBe(true);
+		expect(two).not.toContain("快捷键");
+		const none = stripAnsi(line.render(10).join(""));
+		expect(none.trim()).toBe("深度 0");
+		for (const width of [60, 40, 34, 30, 24, 20, 16, 12, 8]) {
+			const text = stripAnsi(line.render(width).join(""));
 			expect(text).not.toMatch(/Ctrl\+$/);
+			expect(visibleWidth(text)).toBeLessThanOrEqual(width);
 		}
 	});
 

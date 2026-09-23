@@ -727,31 +727,64 @@ function updateTrackerFromText(text: string, tracker: AnsiCodeTracker): void {
 	}
 }
 
+// Ideographic scripts break between any two characters; Latin runs inside them
+// (paths, identifiers, file names) must still wrap as whole words.
+function isIdeographicBreakChar(codePoint: number): boolean {
+	return (
+		(codePoint >= 0x2e80 && codePoint <= 0x9fff) ||
+		(codePoint >= 0xac00 && codePoint <= 0xd7af) ||
+		(codePoint >= 0xf900 && codePoint <= 0xfaff) ||
+		(codePoint >= 0xfe30 && codePoint <= 0xfe4f) ||
+		// Halfwidth forms, minus the voiced sound marks U+FF9E/U+FF9F that ride on the previous cell.
+		(codePoint >= 0xff00 && codePoint <= 0xff9d) ||
+		(codePoint >= 0xffa0 && codePoint <= 0xffef) ||
+		(codePoint >= 0x20000 && codePoint <= 0x3ffff)
+	);
+}
+
+// Line-start-prohibited and line-end-prohibited punctuation (kinsoku).
+const NO_LINE_START = new Set(
+	"、。，．：；！？）］｝〕〉》」』】〙〗〟’”…‥ー々ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮヵヶ",
+);
+const NO_LINE_END = new Set("（［｛〔〈《「『【〘〖〝‘“");
+
 /**
  * Split text into words while keeping ANSI codes attached.
+ * Spaces separate words; each ideographic character is its own word so CJK
+ * prose can wrap anywhere without splitting embedded Latin words.
  */
 function splitIntoTokensWithAnsi(text: string): string[] {
 	const tokens: string[] = [];
 	let current = "";
 	let pendingAnsi = ""; // ANSI codes waiting to be attached to next visible content
 	let inWhitespace = false;
+	// The current token ends in an opening bracket and must keep the next char.
+	let holdForNext = false;
 	let i = 0;
 	const extractAnsi = createAnsiCodeExtractor(text);
 
-	while (i < text.length) {
-		const ansiResult = extractAnsi(i);
-		if (ansiResult) {
-			// Hold ANSI codes separately - they'll be attached to the next visible char
-			pendingAnsi += ansiResult.code;
-			i += ansiResult.length;
-			continue;
+	const takeGrapheme = (char: string) => {
+		const codePoint = char.codePointAt(0) ?? 0;
+		const charIsSpace = char === " ";
+		const ideographic = !charIsSpace && isIdeographicBreakChar(codePoint);
+
+		if (ideographic && NO_LINE_START.has(char)) {
+			const target = current || tokens.length === 0 || inWhitespace ? undefined : tokens.length - 1;
+			if (!current && target !== undefined) {
+				tokens[target] += pendingAnsi + char;
+			} else {
+				current += pendingAnsi + char;
+				tokens.push(current);
+				current = "";
+			}
+			pendingAnsi = "";
+			inWhitespace = false;
+			holdForNext = false;
+			return;
 		}
 
-		const char = text[i];
-		const charIsSpace = char === " ";
-
-		if (charIsSpace !== inWhitespace && current) {
-			// Switching between whitespace and non-whitespace, push current token
+		const breakBefore = current && !holdForNext && (charIsSpace !== inWhitespace || ideographic);
+		if (breakBefore) {
 			tokens.push(current);
 			current = "";
 		}
@@ -764,7 +797,35 @@ function splitIntoTokensWithAnsi(text: string): string[] {
 
 		inWhitespace = charIsSpace;
 		current += char;
-		i++;
+		holdForNext = ideographic && NO_LINE_END.has(char);
+
+		if (ideographic && !holdForNext) {
+			// Break opportunity after every ideograph.
+			tokens.push(current);
+			current = "";
+		}
+	};
+
+	while (i < text.length) {
+		const ansiResult = extractAnsi(i);
+		if (ansiResult) {
+			// Hold ANSI codes separately - they'll be attached to the next visible char
+			pendingAnsi += ansiResult.code;
+			i += ansiResult.length;
+			continue;
+		}
+		// Walk graphemes, not code points, so a base and its combining marks stay together.
+		let end = text.indexOf("\x1b", i + 1);
+		while (end !== -1 && !extractAnsi(end)) {
+			end = text.indexOf("\x1b", end + 1);
+		}
+		if (end === -1) {
+			end = text.length;
+		}
+		for (const { segment } of segmenter.segment(text.slice(i, end))) {
+			takeGrapheme(segment);
+		}
+		i = end;
 	}
 
 	// Handle any remaining pending ANSI codes (attach to last token)

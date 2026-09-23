@@ -357,7 +357,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 			.replace(/\u001b\[[0-9;]*m/g, "");
 		expect(line).toContain("2 步");
 		// 1000 (first assistant) -> 2000 (abort stamp): 1 second, a fixed value.
-		expect(line).toContain("干了 1 秒");
+		expect(line).toContain("2 步 · 1.0s");
 		// Frozen: repeated renders reuse the settled cache.
 		const first = summary!.render(120);
 		expect(summary!.render(120)).toBe(first);
@@ -4373,9 +4373,10 @@ describe("InteractiveMode tray goal label", () => {
 			mode: string;
 			snapshot?: { contextTokens?: number; contextWindow?: number; modelName?: string };
 		};
-		getTrayContextLabel(): string | undefined;
+		options: { sessionDepth?: number; sessionHasChildren?: boolean };
+		getTrayStatusLabel(): string | undefined;
 	};
-	const getTrayContextLabel = (InteractiveMode.prototype as unknown as TrayLabelHarness).getTrayContextLabel;
+	const getTrayStatusLabel = (InteractiveMode.prototype as unknown as TrayLabelHarness).getTrayStatusLabel;
 
 	function createHeartbeat(status: AgentCronJob["status"]): AgentCronJob {
 		return {
@@ -4395,8 +4396,9 @@ describe("InteractiveMode tray goal label", () => {
 		};
 	}
 
-	test("shows active goals in the lower tray without an objective", () => {
+	test("shows active goals on the hint line's status side without an objective", () => {
 		const fakeThis = Object.create(InteractiveMode.prototype) as TrayLabelHarness;
+		fakeThis.options = {};
 		fakeThis.heartbeatCatalog = [];
 		fakeThis.subagentSnapshots = new Map<string, never>();
 		fakeThis.connectionState = {
@@ -4417,11 +4419,12 @@ describe("InteractiveMode tray goal label", () => {
 			settingsManager: { getFooterTelemetry: () => "on" },
 		};
 
-		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s)");
+		expect(getTrayStatusLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s)");
 	});
 
 	test("keeps context figures off the tray label while the footer watermark is on", () => {
 		const fakeThis = Object.create(InteractiveMode.prototype) as TrayLabelHarness;
+		fakeThis.options = {};
 		fakeThis.heartbeatCatalog = [];
 		fakeThis.subagentSnapshots = new Map<string, never>();
 		fakeThis.connectionState = {
@@ -4448,11 +4451,12 @@ describe("InteractiveMode tray goal label", () => {
 		};
 
 		// U6 single source: the watermark line carries the figures, not the tray.
-		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s)");
+		expect(getTrayStatusLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s)");
 	});
 
-	test("combines goals, heartbeats, and the snapshot fallback while the watermark is off", () => {
+	test("combines goals, heartbeats, depth, and the snapshot fallback while the watermark is off", () => {
 		const fakeThis = Object.create(InteractiveMode.prototype) as TrayLabelHarness;
+		fakeThis.options = { sessionDepth: 1 };
 		fakeThis.heartbeatCatalog = [{ job: createHeartbeat("active") }];
 		fakeThis.subagentSnapshots = new Map<string, never>();
 		fakeThis.connectionState = {
@@ -4481,11 +4485,12 @@ describe("InteractiveMode tray goal label", () => {
 			snapshot: { modelName: "bailian/glm-5.3-prime", contextTokens: 75_000, contextWindow: 100_000 },
 		};
 
-		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s) · 1 heartbeat · 75k/100k (75%)");
+		expect(getTrayStatusLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s) · 1 heartbeat · 深度 1 · 75k/100k (75%)");
 	});
 
 	test("omits the usage segment when token count is unknown", () => {
 		const fakeThis = Object.create(InteractiveMode.prototype) as TrayLabelHarness;
+		fakeThis.options = {};
 		fakeThis.heartbeatCatalog = [];
 		fakeThis.subagentSnapshots = new Map<string, never>();
 		fakeThis.connectionState = {
@@ -4506,7 +4511,35 @@ describe("InteractiveMode tray goal label", () => {
 			settingsManager: { getFooterTelemetry: () => "on" },
 		};
 
-		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s)");
+		expect(getTrayStatusLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s)");
+	});
+});
+
+describe("InteractiveMode working loader message", () => {
+	function loaderMessage(status: { activity: string; direction: "down" | "up"; tokens: number }): string {
+		const mode = {
+			workingStartedAt: Date.now() - 12_400,
+			workingMessage: undefined,
+			activityTracker: { getStatus: () => status },
+			connectionState: { isStreaming: true },
+		};
+		Object.setPrototypeOf(mode, InteractiveMode.prototype);
+		return Reflect.get(InteractiveMode.prototype, "getWorkingLoaderMessage").call(mode) as string;
+	}
+
+	test("labels the activity in Chinese with the elapsed time", () => {
+		expect(loaderMessage({ activity: "executing", direction: "up", tokens: 0 })).toBe("执行中 · 12s");
+		expect(loaderMessage({ activity: "thinking", direction: "down", tokens: 0 })).toBe("思考中 · 12s");
+		expect(loaderMessage({ activity: "waiting", direction: "up", tokens: 0 })).toBe("等待模型 · 12s");
+		expect(loaderMessage({ activity: "writing", direction: "down", tokens: 0 })).toBe("回答中 · 12s");
+		expect(loaderMessage({ activity: "writing-code", direction: "down", tokens: 0 })).toBe("写代码 · 12s");
+	});
+
+	test("shows the token count only while output streams down", () => {
+		expect(loaderMessage({ activity: "writing", direction: "down", tokens: 1_234 })).toMatch(
+			/^回答中 · 12s · \S+ tok$/,
+		);
+		expect(loaderMessage({ activity: "executing", direction: "up", tokens: 388 })).toBe("执行中 · 12s");
 	});
 });
 

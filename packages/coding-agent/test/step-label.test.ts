@@ -1,0 +1,82 @@
+import { describe, expect, it } from "vitest";
+import { turnStepLabel, turnStepsSummary } from "../src/modes/interactive/components/step-label.js";
+
+const cell = (code: string) => ({ toolName: "ipython", args: { code } });
+
+describe("turnStepLabel", () => {
+	it("labels a %%bash cell with its simplified command", () => {
+		expect(turnStepLabel(cell("%%bash\nnpm run check"))).toBe("运行 npm check");
+		expect(turnStepLabel(cell("%%bash\nls -la /tmp"))).toBe("运行 ls -la /tmp");
+	});
+
+	it("joins bash() calls and file reads inside a python cell in source order", () => {
+		const code = [
+			"r = await bash('sleep 10 && echo ok')",
+			"print(r.output)",
+			"import json",
+			"print(json.load(open('packages/ai/package.json'))['version'])",
+		].join("\n");
+		expect(turnStepLabel(cell(code))).toBe("运行 echo ok，读取 package.json");
+	});
+
+	it("resolves Path variables for reads and writes", () => {
+		expect(turnStepLabel(cell("p = Path('x.md')\ntext = p.read_text()\np.write_text(text.upper())"))).toBe(
+			"读取 x.md，写入 x.md",
+		);
+		expect(turnStepLabel(cell("import pathlib\np = pathlib.Path('/tmp/x/demo.md')\np.write_text('a')"))).toBe(
+			"写入 demo.md",
+		);
+	});
+
+	it("falls back to a generic verb when the path variable is unknown", () => {
+		expect(turnStepLabel(cell("lines = p.read_text().splitlines()\np.write_text('\\n'.join(lines))"))).toBe(
+			"读取文件，写入文件",
+		);
+	});
+
+	it("labels open() writes, Path reads and directory listings", () => {
+		expect(turnStepLabel(cell("with open('out.txt', 'w') as f:\n    f.write('x')"))).toBe("写入 out.txt");
+		expect(turnStepLabel(cell("from pathlib import Path\nprint(Path('a/b.md').read_text())"))).toBe("读取 b.md");
+		expect(turnStepLabel(cell("import os\nentries = sorted(os.listdir('packages'))"))).toBe("列目录 packages");
+		expect(turnStepLabel(cell("for p in Path('src').rglob('*.ts'):\n    print(p)"))).toBe("列目录 src");
+	});
+
+	it("caps a cell at three effects", () => {
+		const code = "open('a.txt').read()\nopen('b.txt').read()\nopen('c.txt').read()\nopen('d.txt').read()";
+		expect(turnStepLabel(cell(code))).toBe("读取 a.txt，读取 b.txt，读取 c.txt");
+	});
+
+	it("reads an unrecognized python cell, or one without code, as python", () => {
+		expect(turnStepLabel(cell("x = 1 + 2\nprint(x)"))).toBe("python");
+		expect(turnStepLabel({ toolName: "ipython", args: {} })).toBe("python");
+		expect(turnStepLabel({ toolName: "ipython", args: undefined })).toBe("python");
+	});
+
+	it("labels the built-in tools by verb and path tail", () => {
+		expect(turnStepLabel({ toolName: "bash", args: { command: "npm test\necho done" } })).toBe("运行 npm test");
+		expect(turnStepLabel({ toolName: "bash", args: {} })).toBe("运行命令");
+		expect(turnStepLabel({ toolName: "read", args: { path: "src/core/footer.ts" } })).toBe("读取 footer.ts");
+		expect(turnStepLabel({ toolName: "write", args: { file_path: "docs/a.md" } })).toBe("写入 a.md");
+		expect(turnStepLabel({ toolName: "edit", args: { path: "src/b.ts" } })).toBe("编辑 b.ts");
+		expect(turnStepLabel({ toolName: "edit", args: {} })).toBe("编辑");
+		expect(turnStepLabel({ toolName: "grep", args: { pattern: "contextWindow" } })).toBe("搜索 contextWindow");
+		expect(turnStepLabel({ toolName: "ls", args: { path: "packages" } })).toBe("列目录 packages");
+		expect(turnStepLabel({ toolName: "custom_tool", args: {} })).toBe("custom_tool");
+	});
+});
+
+describe("turnStepsSummary", () => {
+	it("lists distinct labels in order with repeat counts, deduped by toolCallId", () => {
+		const steps = [
+			{ toolCallId: "a", toolName: "read", args: { path: "src/footer.ts" } },
+			{ toolCallId: "a", toolName: "read", args: { path: "src/footer.ts" } },
+			{ toolCallId: "b", toolName: "bash", args: { command: "npm test" } },
+			{ toolCallId: "c", toolName: "read", args: { path: "lib/footer.ts" } },
+		];
+		expect(turnStepsSummary(steps)).toBe("读取 footer.ts ×2 · 运行 npm test");
+	});
+
+	it("is empty for a turn without steps", () => {
+		expect(turnStepsSummary([])).toBe("");
+	});
+});

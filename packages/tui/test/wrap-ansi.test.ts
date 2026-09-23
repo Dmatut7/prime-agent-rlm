@@ -318,3 +318,76 @@ describe("ANSI sequence scanning", () => {
 		assert.strictEqual(visibleWidth(text), visibleWidth("Punterminatedx"));
 	});
 });
+
+describe("wrapTextWithAnsi with CJK prose", () => {
+	it("keeps Latin words embedded in CJK text whole", () => {
+		const text = "文件：AGENTS.md、CHANGELOG.md、biome.json、tsconfig.base.json、package-lock.json、prime-agent.sh";
+		const lines = wrapTextWithAnsi(text, 30);
+		assert.ok(lines.length > 1);
+		const words = [
+			"AGENTS.md",
+			"CHANGELOG.md",
+			"biome.json",
+			"tsconfig.base.json",
+			"package-lock.json",
+			"prime-agent.sh",
+		];
+		for (const word of words) {
+			assert.ok(
+				lines.some((line) => line.includes(word)),
+				`"${word}" was split across lines: ${JSON.stringify(lines)}`,
+			);
+		}
+		for (const line of lines) assert.ok(visibleWidth(line) <= 30);
+	});
+
+	it("still wraps pure CJK text at the width boundary", () => {
+		const text = "宽度缓存回归测试内容".repeat(3);
+		const lines = wrapTextWithAnsi(text, 10);
+		assert.deepStrictEqual(lines, [
+			"宽度缓存回",
+			"归测试内容",
+			"宽度缓存回",
+			"归测试内容",
+			"宽度缓存回",
+			"归测试内容",
+		]);
+	});
+
+	it("never starts a line with closing punctuation or ends one with an opening bracket", () => {
+		const text = "这是一个测试句子，用来检查标点（括号内容）不会落在行首。";
+		for (let width = 6; width <= 30; width++) {
+			const lines = wrapTextWithAnsi(text, width);
+			for (let i = 1; i < lines.length; i++) {
+				assert.ok(!/^[，。）]/.test(lines[i] as string), `width ${width}: ${JSON.stringify(lines)}`);
+				assert.ok(!/（$/.test(lines[i - 1] as string), `width ${width}: ${JSON.stringify(lines)}`);
+			}
+			for (const line of lines) assert.ok(visibleWidth(line) <= width, `width ${width}: ${JSON.stringify(lines)}`);
+		}
+	});
+
+	it("breaks a Latin word longer than the width", () => {
+		const lines = wrapTextWithAnsi("路径 packages/coding-agent/src/modes/interactive/components/footer.ts", 20);
+		for (const line of lines) assert.ok(visibleWidth(line) <= 20);
+		assert.strictEqual(
+			lines.join("").replace(/ /g, ""),
+			"路径packages/coding-agent/src/modes/interactive/components/footer.ts",
+		);
+	});
+
+	it("never separates a combining mark from its ideograph", () => {
+		const text = "字\u0301".repeat(12);
+		for (let width = 2; width <= 12; width++) {
+			for (const line of wrapTextWithAnsi(text, width)) {
+				assert.ok(!line.startsWith("\u0301"), `width ${width}: ${JSON.stringify(line)}`);
+			}
+		}
+	});
+
+	it("keeps styling across CJK break points", () => {
+		const text = `\x1b[31m${"红色文字".repeat(5)}\x1b[39m`;
+		const lines = wrapTextWithAnsi(text, 8);
+		assert.ok(lines.length > 1);
+		for (const line of lines.slice(1)) assert.ok(line.startsWith("\x1b[31m"), JSON.stringify(line));
+	});
+});

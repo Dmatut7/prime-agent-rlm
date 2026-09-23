@@ -1,0 +1,5 @@
+- Changed the per-turn process line to say what the turn did in plain words (`▸ 思考 · 3 步 · 14.8s   运行 npm check · 读取 footer.ts`) and to list changed files with +/− counts while collapsed.
+- Changed the expanded ipython step header to a plain-words label with output line count and duration instead of `↑ N ↓ M lines`.
+- Changed the status area: key hints now sit above the prompt and show only the keys usable right now; the footer line shows model, directory, branch, and right-aligned context figures, with the watermark bar only near the compaction threshold.
+- Changed the startup header to a compact wordmark with model and directory rows, and translated start hints, loader labels, and the tmux notice to Chinese.
+- Removed the chat-tail `Ctrl+T 思考 · Ctrl+O 过程 · Ctrl+P 通讯` hint line and the `[O]/[T]/[P]` bracket hints.

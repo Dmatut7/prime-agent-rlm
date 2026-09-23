@@ -1,5 +1,5 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { setKeybindings } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
@@ -53,27 +53,51 @@ describe("footer telemetry watermark (U6)", () => {
 		};
 	}
 
-	it("renders one persistent line: model · level, watermark bar, context figures", () => {
+	it("renders one persistent line: model · level left, context figures right-aligned", () => {
 		const footer = new FooterComponent(provider);
 		const telemetry = makeSource();
 		footer.setTelemetrySource(telemetry.source);
 		const lines = footer.render(120);
 		expect(lines).toHaveLength(1);
 		const line = stripAnsi(lines[0] ?? "");
-		expect(line).toContain("bailian/glm-5.3-prime · max");
-		expect(line).toContain("312k/1M · 31%");
-		expect(line).toMatch(/─+●─*│/);
+		expect(line.startsWith(" bailian/glm-5.3-prime · max")).toBe(true);
+		expect(line.endsWith("312k/1M · 31% ")).toBe(true);
+		expect(line).toHaveLength(120);
+		// Below half the compaction threshold the bar stays hidden.
+		expect(line).not.toContain("●");
+		expect(line).not.toContain("│");
 		expect(line).not.toContain("ctx");
-		// 2026-09-22 老板令: the storm zone (⚡/390k/已越风暴线) is deleted
-		// entirely from the status area - the compaction notch is the only
-		// threshold state left.
 		expect(line).not.toContain("⚡");
 		expect(line).not.toContain("风暴");
 		expect(line).not.toContain("390k");
-		expect(line).not.toContain("压缩线");
 	});
 
-	it("marks the compaction state: reaching the notch adds 压缩在即, below it stays quiet", () => {
+	it("shows the watermark bar before the figures from half the compaction threshold", () => {
+		const footer = new FooterComponent(provider);
+		const telemetry = makeSource();
+		footer.setTelemetrySource(telemetry.source);
+		telemetry.set({ ...SNAPSHOT, contextTokens: 399_000 });
+		expect(footerLine(footer)).not.toContain("●");
+		telemetry.set({ ...SNAPSHOT, contextTokens: 400_000 });
+		const line = footerLine(footer);
+		expect(line).toMatch(/─*●─*│─* {2}400k\/1M · 40% $/);
+	});
+
+	it("shows the cwd and branch between the model and the figures", () => {
+		const footer = new FooterComponent(provider);
+		const telemetry = makeSource();
+		footer.setTelemetrySource(telemetry.source);
+		footer.setLocationSource(() => ({ cwd: join(homedir(), "work", "repo"), branch: "main" }));
+		const line = footerLine(footer);
+		expect(line).toContain("bailian/glm-5.3-prime · max   ~/work/repo · main");
+		expect(line.endsWith("312k/1M · 31% ")).toBe(true);
+
+		footer.setLocationSource(() => ({ cwd: "/srv/app", branch: null }));
+		expect(footerLine(footer)).toContain("max   /srv/app ");
+		expect(footerLine(footer)).not.toContain("/srv/app ·");
+	});
+
+	it("marks the compaction state: reaching the notch adds 即将压缩, below it stays quiet", () => {
 		const footer = new FooterComponent(provider);
 		const telemetry = makeSource();
 		footer.setTelemetrySource(telemetry.source);
@@ -81,31 +105,39 @@ describe("footer telemetry watermark (U6)", () => {
 		telemetry.set({ ...SNAPSHOT, contextTokens: 850_000 });
 		const imminent = footerLine(footer);
 		expect(imminent).toContain("850k/1M · 85%");
-		expect(imminent).toContain("压缩在即");
+		expect(imminent).toContain("即将压缩");
 
 		telemetry.set({ ...SNAPSHOT, contextTokens: 790_000 });
 		const below = footerLine(footer);
 		expect(below).toContain("79%");
-		expect(below).not.toContain("压缩在即");
+		expect(below).not.toContain("即将压缩");
 	});
 
-	it("degrades below 80 columns: the bar goes first, then the token figures", () => {
+	it("degrades narrow widths: the location goes first, then the bar, then the figures", () => {
 		const footer = new FooterComponent(provider);
 		const telemetry = makeSource();
 		footer.setTelemetrySource(telemetry.source);
+		footer.setLocationSource(() => ({ cwd: "/srv/some/long/project/path", branch: "feature/branch" }));
+		telemetry.set({ ...SNAPSHOT, contextTokens: 500_000 });
 
-		const wide = footerLine(footer, 100);
+		const wide = footerLine(footer, 120);
+		expect(wide).toContain("/srv/some/long/project/path");
 		expect(wide).toContain("●");
-		expect(wide).toContain("312k/1M · 31%");
+		expect(wide).toContain("500k/1M · 50%");
 
-		const narrow = footerLine(footer, 79);
-		expect(narrow).not.toContain("●");
-		expect(narrow).toContain("312k/1M · 31%");
-		expect(narrow).toContain("bailian/glm-5.3-prime");
+		const noLocation = footerLine(footer, 70);
+		expect(noLocation).not.toContain("/srv");
+		expect(noLocation).toContain("●");
+		expect(noLocation).toContain("500k/1M · 50%");
+
+		const noBar = footerLine(footer, 50);
+		expect(noBar).not.toContain("●");
+		expect(noBar).toContain("500k/1M · 50%");
+		expect(noBar).toContain("bailian/glm-5.3-prime");
 
 		const veryNarrow = footerLine(footer, 24);
-		expect(veryNarrow).not.toContain("312k");
-		expect(veryNarrow).toContain("glm-5.3-prime");
+		expect(veryNarrow).not.toContain("500k");
+		expect(veryNarrow).toContain("glm-5.3");
 		expect(veryNarrow.length).toBeLessThanOrEqual(24);
 	});
 
@@ -185,20 +217,20 @@ describe("footer telemetry watermark (U6)", () => {
 			contextTokens: 620_000,
 		};
 		footer.setTelemetrySource(() => ({ mode: "on", snapshot }));
-		// A 0.6-configured threshold lights 压缩在即 at 62%, not only at 80%.
+		// A 0.6-configured threshold lights 即将压缩 at 62%, not only at 80%.
 		const ratioSix = footerLine(footer);
-		expect(ratioSix).toContain("压缩在即");
+		expect(ratioSix).toContain("即将压缩");
 		expect(ratioSix).toContain("620k/1M · 62%");
 
 		// Below that same threshold: quiet.
 		snapshot = { ...SNAPSHOT, compactionThresholdTokens: 600_000, contextTokens: 560_000 };
-		expect(footerLine(footer)).not.toContain("压缩在即");
+		expect(footerLine(footer)).not.toContain("即将压缩");
 
 		snapshot = { ...SNAPSHOT, compactionThresholdTokens: 0, contextTokens: 950_000 };
 		footer.setTelemetrySource(() => ({ mode: "on", snapshot }));
 		// Threshold compaction off: no notch, no tail - even at 95%.
 		const off = footerLine(footer, 100);
-		expect(off).not.toContain("压缩在即");
+		expect(off).not.toContain("即将压缩");
 		expect(off).not.toContain("│");
 		expect(off).toContain("950k/1M");
 	});
@@ -285,11 +317,11 @@ describe("footer telemetry watermark (U6)", () => {
 		footer.setTelemetrySource(() => ({ mode: "on", snapshot }));
 		const below = footerLine(footer, 100);
 		expect(below).toContain("940k/1M · 94%");
-		expect(below).not.toContain("压缩在即");
+		expect(below).not.toContain("即将压缩");
 
 		snapshot = { ...SNAPSHOT, contextTokens: 960_000, compactionThresholdTokens: 950_000 };
 		const imminent = footerLine(footer, 100);
-		expect(imminent).toContain("压缩在即");
+		expect(imminent).toContain("即将压缩");
 		// The level marker survives at the fused cell (plain-text ● present).
 		expect(imminent).toContain("●");
 
@@ -319,14 +351,14 @@ describe("footer telemetry watermark (U6)", () => {
 		}));
 		const line = footerLine(footer, 84);
 		expect(line).toContain("850k/1M · 81%");
-		expect(line).toContain("压缩在即");
+		expect(line).toContain("即将压缩");
 		expect(line).not.toContain("●");
 		expect(line).not.toContain("│");
 
-		// Narrower still: the model alone - no 压缩在即 and no figures at all
+		// Narrower still: the model alone - no 即将压缩 and no figures at all
 		// (the model id's digits are not usage numbers).
 		const bare = footerLine(footer, 30);
-		expect(bare).not.toContain("压缩在即");
+		expect(bare).not.toContain("即将压缩");
 		expect(bare).not.toContain("%");
 		expect(bare).not.toContain("/1M");
 	});
@@ -354,9 +386,9 @@ describe("footer telemetry watermark (U6)", () => {
 			const line = footerLine(footer, 100);
 			expect(line).toContain("│");
 			if (tokens >= 800_000) {
-				expect(line).toContain("压缩在即");
+				expect(line).toContain("即将压缩");
 			} else {
-				expect(line).not.toContain("压缩在即");
+				expect(line).not.toContain("即将压缩");
 			}
 		}
 	});

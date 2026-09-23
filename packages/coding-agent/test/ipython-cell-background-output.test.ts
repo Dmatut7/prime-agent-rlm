@@ -125,6 +125,6 @@ describe("IPythonCellComponent background output rendering", () => {
 			expanded: false,
 		});
 
-		expect(out).toContain("\u2193 2 lines");
+		expect(out).toContain("2 行输出");
 	});
 });
