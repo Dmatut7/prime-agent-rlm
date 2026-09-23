@@ -21,8 +21,32 @@
 export const EXPANDED_TOOL_OUTPUT_MAX_LINES = 40;
 /** Characters an expanded block renders before it holds the rest back. */
 export const EXPANDED_TOOL_OUTPUT_MAX_CHARS = 6000;
+/**
+ * TUI v4 T7 (R2.4): the quiet conversation pins the per-step window tighter -
+ * at most a dozen lines - so one expanded step cannot flood the quiet face.
+ * `app.tools.expandFull` (alt+shift+O) still lifts the whole budget.
+ */
+export const QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES = 12;
 
 let fullToolOutput = false;
+let quietConversation = false;
+
+/** Whether the quiet conversation's tighter per-step window is active. */
+export function quietConversationBudget(): boolean {
+	return quietConversation;
+}
+
+/**
+ * Switch the quiet budget on or off. Returns true when the mode actually
+ * changed, so callers only invalidate on a real flip.
+ */
+export function setQuietConversationBudget(quiet: boolean): boolean {
+	if (quietConversation === quiet) {
+		return false;
+	}
+	quietConversation = quiet;
+	return true;
+}
 
 /** Whether expanded tool blocks ignore their render budget and show everything. */
 export function toolOutputFull(): boolean {
@@ -62,11 +86,12 @@ export function expandedOutputWindow(lines: string[]): ExpandedOutputWindow {
 	if (fullToolOutput) {
 		return { lines, skippedLines: 0, skippedChars: 0, truncated: false };
 	}
+	const maxLines = quietConversation ? QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES : EXPANDED_TOOL_OUTPUT_MAX_LINES;
 	let chars = 0;
 	for (let index = 0; index < lines.length; index++) {
 		const line = lines[index]!;
 		const charRoom = EXPANDED_TOOL_OUTPUT_MAX_CHARS - chars;
-		if (index < EXPANDED_TOOL_OUTPUT_MAX_LINES && line.length <= charRoom) {
+		if (index < maxLines && line.length <= charRoom) {
 			chars += line.length;
 			continue;
 		}

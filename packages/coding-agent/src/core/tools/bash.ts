@@ -14,6 +14,7 @@ import { keyHint } from "../../modes/interactive/components/keybinding-hints.js"
 import {
 	expandedOutputSkippedDetail,
 	expandedOutputWindow,
+	quietConversationBudget,
 	toolOutputFull,
 } from "../../modes/interactive/components/tool-output-budget.js";
 import type { VisualTruncateResult } from "../../modes/interactive/components/visual-truncate.js";
@@ -674,6 +675,8 @@ type BashResultRenderState = {
 	cachedExpandedKeybindings: unknown;
 	cachedExpandedFull: boolean | undefined;
 	cachedExpandedHint: boolean | undefined;
+	/** TUI v4 T7: the quiet conversation's tighter window shapes the same lines. */
+	cachedQuietBudget: boolean | undefined;
 };
 
 class BashResultRenderComponent extends Container {
@@ -690,6 +693,7 @@ class BashResultRenderComponent extends Container {
 		cachedExpandedKeybindings: undefined,
 		cachedExpandedFull: undefined,
 		cachedExpandedHint: undefined,
+		cachedQuietBudget: undefined,
 	};
 }
 
@@ -777,7 +781,8 @@ function cachedExpandedLines(
 		state.cachedExpandedTheme === themeToken() &&
 		state.cachedExpandedKeybindings === getKeybindings() &&
 		state.cachedExpandedFull === toolOutputFull() &&
-		state.cachedExpandedHint === showExpandHint;
+		state.cachedExpandedHint === showExpandHint &&
+		state.cachedQuietBudget === quietConversationBudget();
 	return holds ? state.cachedExpandedLines : undefined;
 }
 
@@ -861,6 +866,7 @@ function rebuildBashResultRenderComponent(
 					state.cachedExpandedTheme = themeToken();
 					state.cachedExpandedKeybindings = getKeybindings();
 					state.cachedExpandedFull = toolOutputFull();
+					state.cachedQuietBudget = quietConversationBudget();
 					state.cachedExpandedHint = showExpandHint;
 					state.cachedExpandedLines = lines;
 					return lines;

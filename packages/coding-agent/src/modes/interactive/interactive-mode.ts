@@ -265,7 +265,7 @@ import {
 	ToolExecutionComponent,
 	type ToolExecutionDefinition,
 } from "./components/tool-execution.js";
-import { setToolOutputFull, toolOutputFull } from "./components/tool-output-budget.js";
+import { setQuietConversationBudget, setToolOutputFull, toolOutputFull } from "./components/tool-output-budget.js";
 import { TopBar } from "./components/top-bar.js";
 import { TreeSelectorComponent } from "./components/tree-selector.js";
 import { TurnActivityState, type TurnStep, TurnSummaryComponent } from "./components/turn-activity.js";
@@ -1523,6 +1523,8 @@ export class InteractiveMode {
 		this.setGoalAnnouncementBaseline(emptyGoalState());
 
 		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
+		// TUI v4 T7: the quiet conversation's tighter per-step output window.
+		setQuietConversationBudget(this.settingsManager.getProcessMode() === "quiet");
 
 		setRegisteredThemes(this.uiServices.getThemes());
 		initTheme(this.settingsManager.getTheme(), true);
@@ -9198,6 +9200,8 @@ export class InteractiveMode {
 					},
 					onProcessModeChange: (mode) => {
 						this.applySetting(() => this.settingsManager.setProcessMode(mode));
+						// TUI v4 T7: the tighter per-step window follows the mode.
+						setQuietConversationBudget(mode === "quiet");
 						// The gate lives in the assistant components' render, so
 						// the new face needs one rebuild (same as hide-thinking).
 						void this.rebuildChatFromMessages().catch((error) => {
