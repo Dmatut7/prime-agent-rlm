@@ -322,6 +322,47 @@ describe("InteractiveMode.renderSessionContext", () => {
 		initTheme("dark");
 	});
 
+	test("an aborted turn's replayed steps settle and the footnote duration freezes (P1-2)", async () => {
+		const { harness, chatContainer } = createRenderSessionContextHarness();
+
+		await renderMessages(harness, [
+			userMessage("run the checks", 900),
+			{
+				...toolCallMessage("tool-1", "bash"),
+				timestamp: 1_000,
+			},
+			{
+				...toolResultMessage("tool-1", "bash", [{ type: "text", text: "ok" }]),
+				timestamp: 1_500,
+			},
+			{
+				...toolCallMessage("tool-2", "bash"),
+				timestamp: 2_000,
+				stopReason: "aborted",
+			},
+		]);
+
+		const summary = chatContainer.children.find((component) => component instanceof TurnSummaryComponent) as
+			| TurnSummaryComponent
+			| undefined;
+		expect(summary).toBeDefined();
+
+		// The aborted step settled as error (like the live path), so the turn
+		// is settled and its clock froze on the abort stamp - not Date.now().
+		expect(summary!.state.steps.map((step) => step.status)).toEqual(["done", "error"]);
+		expect(summary!.state.isSettled).toBe(true);
+		const line = summary!
+			.render(120)
+			.join("\n")
+			.replace(/\u001b\[[0-9;]*m/g, "");
+		expect(line).toContain("2 步");
+		// 1000 (first assistant) -> 2000 (abort stamp): 1 second, a fixed value.
+		expect(line).toContain("干了 1 秒");
+		// Frozen: repeated renders reuse the settled cache.
+		const first = summary!.render(120);
+		expect(summary!.render(120)).toBe(first);
+	});
+
 	test("does not replay historical tool result image payloads", async () => {
 		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
 		try {

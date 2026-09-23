@@ -261,17 +261,23 @@ export class AssistantMessageComponent extends Container {
 		// message in the default collapsed view.
 		const hasToolCalls = message.content.some((c) => c?.type === "toolCall");
 		this.hasToolCalls = hasToolCalls;
-		// TUI v4 quiet gate: a message that carries tool calls is intermediate
-		// narration; quiet mode folds its text into the turn stats (the
-		// footnote owns the process surface). The turn's final output (no
-		// tool calls) and every error surface still render in full.
-		const foldsNarration = this.quiet && hasToolCalls;
+		// TUI v4 quiet gate, block-level (batch1 review P1-1): only the text
+		// BEFORE the first tool call is the "先说再做" preamble narration that
+		// folds into the turn stats. Text AFTER a tool call - the same
+		// message's closing narrative / conclusion - stays visible, exactly
+		// like the turn's final no-tool output. Error surfaces never fold.
+		const firstToolCallIndex = message.content.findIndex((c) => c?.type === "toolCall");
+		const foldsText = (index: number): boolean =>
+			this.quiet && firstToolCallIndex !== -1 && index < firstToolCallIndex;
+		const hasFoldedText = message.content.some(
+			(c, index) => c?.type === "text" && c.text.trim().length > 0 && foldsText(index),
+		);
 		const rendersThinking = (c: AssistantMessage["content"][number]) =>
 			c?.type === "thinking" && c.thinking.trim() && !this.hideThinkingBlock && this.thinkingExpanded;
 		const hasVisibleContent =
 			message.content.some(
-				(c) =>
-					(c?.type === "text" && c.text.trim() && !foldsNarration) ||
+				(c, index) =>
+					(c?.type === "text" && c.text.trim() && !foldsText(index)) ||
 					(c?.type === "thinking" && rendersThinking(c)),
 			) ||
 			// The error surfaces render in both lanes (aborted, or a
@@ -287,7 +293,7 @@ export class AssistantMessageComponent extends Container {
 		// Render content in order
 		for (let i = 0; i < message.content.length; i++) {
 			const content = message.content[i];
-			if (content?.type === "text" && content.text.trim() && !foldsNarration) {
+			if (content?.type === "text" && content.text.trim() && !foldsText(i)) {
 				// Assistant text messages with no background - trim the text
 				// Set paddingY=0 to avoid extra spacing before tool executions
 				const mermaidTransform = this.mermaidTransform;
@@ -310,8 +316,8 @@ export class AssistantMessageComponent extends Container {
 				const hasVisibleContentAfter = message.content
 					.slice(i + 1)
 					.some(
-						(c) =>
-							(c?.type === "text" && c.text.trim() && !foldsNarration) ||
+						(c, index) =>
+							(c?.type === "text" && c.text.trim() && !foldsText(i + 1 + index)) ||
 							(c?.type === "thinking" && rendersThinking(c)),
 					);
 
@@ -360,10 +366,11 @@ export class AssistantMessageComponent extends Container {
 
 		// A fully folded narration message renders no lines at all, so it must
 		// not earn this trailing Spacer either (the leading-separation clause
-		// only fires while the message still has a visible face).
+		// only fires while the message still has a visible face; a message with
+		// no text at all keeps the pre-v4 single blank line).
 		if (
 			hasToolCalls &&
-			(hasVisibleContent || message.stopReason === "aborted" || (!this.precededByToolActivity && !foldsNarration))
+			(hasVisibleContent || message.stopReason === "aborted" || (!this.precededByToolActivity && !hasFoldedText))
 		) {
 			this.contentContainer.addChild(new Spacer(1));
 		}

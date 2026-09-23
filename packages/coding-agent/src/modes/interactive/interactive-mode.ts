@@ -7651,6 +7651,11 @@ export class InteractiveMode {
 								errorMessage = message.errorMessage || "Error";
 							}
 							component.updateResult({ content: [{ type: "text", text: errorMessage }], isError: true });
+							// Batch1 review P1-2: settle the step like the live path
+							// (message_end) does - without this the aborted turn's
+							// steps stay "running" forever, the footnote's duration
+							// becomes Date.now()-startedAt and never freezes.
+							replayTurnState.setStepStatus(content.id, "error", Number(message.timestamp) || Date.now());
 						} else {
 							renderedPendingTools.set(content.id, component);
 						}
