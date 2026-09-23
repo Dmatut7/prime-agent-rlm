@@ -1,4 +1,4 @@
-import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { type ClickRegion, type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { theme } from "../theme/theme.js";
 import { TurnFootNote } from "./turn-footnote.js";
 
@@ -330,6 +330,16 @@ export class TurnSummaryComponent implements Component {
 		return this.turnState;
 	}
 
+	/** TUI v4 T12: forward the footnote's segment/caret click regions - the
+	 * quiet face renders the footnote lines at offset zero, so the regions
+	 * pass through unchanged. */
+	getClickRegions(): ReadonlyArray<ClickRegion> {
+		if (!this.quiet || !this.footnote) {
+			return [];
+		}
+		return this.footnote.getClickRegions();
+	}
+
 	/** TUI v4: switch this turn head between the footnote and the legacy two lines. */
 	setQuiet(quiet: boolean): void {
 		if (this.quiet === quiet) {
@@ -397,6 +407,28 @@ export class TurnSummaryComponent implements Component {
 			commMessages: 0,
 			durationMs: 0,
 			cols: safeWidth,
+			// TUI v4 T12: clicking a segment opens exactly that block (the
+			// three blocks stay independent); the caret flips all of them.
+			onSegmentClick: (segment) => {
+				if (segment === "think") {
+					this.turnState.thinkingExpanded = !this.turnState.thinkingExpanded;
+				} else if (segment === "steps") {
+					this.turnState.setCollapsed(this.turnState.processBlockExpanded);
+				} else {
+					this.turnState.agentMessagesExpanded = !this.turnState.agentMessagesExpanded;
+				}
+				this.invalidate();
+			},
+			onCaretClick: () => {
+				const anyOpen =
+					this.turnState.thinkingBlockExpanded ||
+					this.turnState.processBlockExpanded ||
+					this.turnState.commsBlockExpanded;
+				this.turnState.thinkingExpanded = false;
+				this.turnState.agentMessagesExpanded = false;
+				this.turnState.setCollapsed(anyOpen); // any open -> all closed; all closed -> all open
+				this.invalidate();
+			},
 		});
 		const steps = new Set(this.turnState.steps.map((step) => step.toolCallId)).size;
 		const thinkSegments = this.turnState.totalThinkingSegments;
