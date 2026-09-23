@@ -244,20 +244,68 @@ export function turnStepLabel(step: StepLabelInput): string {
 	}
 }
 
+/** How a verb counts several distinct objects: `读取 3 个文件`, `运行 5 条命令`. */
+const GROUP_COUNT_NOUN: Record<string, string> = {
+	读取: "个文件",
+	写入: "个文件",
+	编辑: "个文件",
+	删除: "个文件",
+	搜索: "处",
+	查找: "处",
+	列目录: "个目录",
+	运行: "条命令",
+};
+
+/** A command in a summary keeps its program and subcommand: `git status`, `npm run check`. */
+function shortCommand(command: string): string {
+	const words = command.split("|")[0]?.trim().split(/\s+/) ?? [];
+	const head = words
+		.slice(0, words[0] === "npm" && words[1] === "run" ? 3 : 2)
+		.filter((word) => !word.startsWith("-"));
+	return head.join(" ") || command;
+}
+
 /**
- * The process line's plain-words summary: each distinct step label once, in
- * order, with a repeat count - `运行 npm check · 读取 footer.ts ×2`.
+ * The process line's plain-words summary, grouped by verb in first-seen
+ * order: `读取 footer.ts`, `读取 footer.ts、top-bar.ts`, `读取 3 个文件`,
+ * `运行 npm run check`, `运行 5 条命令`. Steps without an effect count as `python ×N`.
  */
 export function turnStepsSummary(steps: readonly (StepLabelInput & { toolCallId: string })[]): string {
 	const seen = new Set<string>();
-	const counts = new Map<string, number>();
+	const groups = new Map<string, string[]>();
+	const bare = new Map<string, number>();
 	for (const step of steps) {
 		if (seen.has(step.toolCallId)) {
 			continue;
 		}
 		seen.add(step.toolCallId);
-		const label = turnStepLabel(step);
-		counts.set(label, (counts.get(label) ?? 0) + 1);
+		for (const effect of turnStepLabel(step).split("，")) {
+			const space = effect.indexOf(" ");
+			const verb = space === -1 ? effect : effect.slice(0, space);
+			if (space === -1 || !(verb in GROUP_COUNT_NOUN)) {
+				bare.set(effect, (bare.get(effect) ?? 0) + 1);
+				if (!groups.has(effect)) groups.set(effect, []);
+				continue;
+			}
+			const object = effect.slice(space + 1);
+			const objects = groups.get(verb) ?? [];
+			const key = verb === "运行" ? shortCommand(object) : object;
+			if (!objects.includes(key)) objects.push(key);
+			groups.set(verb, objects);
+		}
 	}
-	return [...counts.entries()].map(([label, count]) => (count > 1 ? `${label} ×${count}` : label)).join(" · ");
+	const parts: string[] = [];
+	for (const [verb, objects] of groups) {
+		if (bare.has(verb)) {
+			const count = bare.get(verb) ?? 1;
+			parts.push(count > 1 ? `${verb} ×${count}` : verb);
+		} else if (objects.length === 1) {
+			parts.push(`${verb} ${objects[0]}`);
+		} else if (objects.length === 2 && verb !== "运行") {
+			parts.push(`${verb} ${objects.join("、")}`);
+		} else {
+			parts.push(`${verb} ${objects.length} ${GROUP_COUNT_NOUN[verb]}`);
+		}
+	}
+	return parts.join(" · ");
 }

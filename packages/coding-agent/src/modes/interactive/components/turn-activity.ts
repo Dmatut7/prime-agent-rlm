@@ -170,9 +170,17 @@ export class TurnActivityState {
 		// closed block hides every settled step the pre-v4 way.
 		return this.processKeySteps && !this.collapsed && this.dedupedStepCount() > PROCESS_FOLD_THRESHOLD;
 	}
+	/** Whether the key-steps fold is armed (it only shows while the block is open and long). */
+	get processKeyStepsArmed(): boolean {
+		return this.processKeySteps;
+	}
 	/** Lift or re-arm the key-steps fold (the wiring owns the key cycle). */
 	setProcessKeySteps(keySteps: boolean): void {
 		this.processKeySteps = keySteps;
+	}
+	/** Distinct tool calls in the turn. */
+	get stepCount(): number {
+		return this.dedupedStepCount();
 	}
 	private dedupedStepCount(): number {
 		return new Set(this.steps.map((step) => step.toolCallId)).size;

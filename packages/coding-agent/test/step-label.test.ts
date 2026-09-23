@@ -66,14 +66,14 @@ describe("turnStepLabel", () => {
 });
 
 describe("turnStepsSummary", () => {
-	it("lists distinct labels in order with repeat counts, deduped by toolCallId", () => {
+	it("groups labels by verb in first-seen order, deduped by toolCallId", () => {
 		const steps = [
 			{ toolCallId: "a", toolName: "read", args: { path: "src/footer.ts" } },
 			{ toolCallId: "a", toolName: "read", args: { path: "src/footer.ts" } },
 			{ toolCallId: "b", toolName: "bash", args: { command: "npm test" } },
 			{ toolCallId: "c", toolName: "read", args: { path: "lib/footer.ts" } },
 		];
-		expect(turnStepsSummary(steps)).toBe("读取 footer.ts ×2 · 运行 npm test");
+		expect(turnStepsSummary(steps)).toBe("读取 footer.ts · 运行 npm test");
 	});
 
 	it("is empty for a turn without steps", () => {

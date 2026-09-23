@@ -400,7 +400,9 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 		const nonEmpty = collapsed.split("\n").filter((line) => line.trim().length > 0);
 
 		// One process line at the turn head: caret, steps, duration, plain-words summary.
-		expect(nonEmpty[1]?.startsWith(" ▸ 6 步 · 0.6s   编辑 file-1.ts · 运行 npm test --grep 2")).toBe(true);
+		expect(nonEmpty[1]?.startsWith(" ▸ 6 步 · 0.6s   ")).toBe(true);
+		expect(nonEmpty[1]).toContain("编辑 3 个文件");
+		expect(nonEmpty[1]).toContain("运行 npm test");
 		expect(nonEmpty[1]).not.toMatch(/\[[OTP]\]/);
 		// The very next line is the final prose: no second mechanical line.
 		expect(nonEmpty[2]).toContain("All six checks passed");

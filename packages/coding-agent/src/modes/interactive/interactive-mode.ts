@@ -272,7 +272,12 @@ import {
 import { setQuietConversationBudget, setToolOutputFull, toolOutputFull } from "./components/tool-output-budget.js";
 import { TopBar } from "./components/top-bar.js";
 import { TreeSelectorComponent } from "./components/tree-selector.js";
-import { TurnActivityState, type TurnStep, TurnSummaryComponent } from "./components/turn-activity.js";
+import {
+	PROCESS_FOLD_THRESHOLD,
+	TurnActivityState,
+	type TurnStep,
+	TurnSummaryComponent,
+} from "./components/turn-activity.js";
 import { UserMessageComponent } from "./components/user-message.js";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.js";
 import { FeatureHintDeck } from "./feature-hints.js";
@@ -3776,7 +3781,7 @@ export class InteractiveMode {
 	private createWorkingLoader(): Loader {
 		return new Loader(
 			this.ui,
-			(spinner) => theme.fg("accent", spinner),
+			(spinner) => ` ${theme.fg("accent", spinner)}`,
 			(text) => theme.fg("muted", text),
 			this.getWorkingLoaderMessage(),
 			this.workingIndicatorOptions,
@@ -7561,6 +7566,10 @@ export class InteractiveMode {
 			limitTranscript?: boolean;
 		} = {},
 	): Promise<void> {
+		// A rebuild (resync, cap trim, setting change) re-creates every turn;
+		// carry each turn's open blocks over, keyed by its first tool call.
+		const turnLanes = this.captureTurnLanes();
+		const restoredSummaries: TurnSummaryComponent[] = [];
 		// T8: a rebuild re-creates every summary component; the open order
 		// cannot reference the dead ones.
 		this.processBlockOpenOrder = [];
@@ -7657,6 +7666,14 @@ export class InteractiveMode {
 							args: content.arguments,
 							status: "running",
 						} satisfies TurnStep);
+						const lanes = replayTurnState.steps.length === 1 ? turnLanes.get(content.id) : undefined;
+						if (lanes && replayTurnSummary) {
+							replayTurnState.setProcessKeySteps(lanes.keySteps);
+							replayTurnState.thinkingExpanded = lanes.thinking;
+							replayTurnState.agentMessagesExpanded = lanes.comms;
+							replayTurnSummary.setExpanded(lanes.process);
+							restoredSummaries.push(replayTurnSummary);
+						}
 						const component = new ToolExecutionComponent(
 							content.name,
 							content.id,
@@ -7670,8 +7687,10 @@ export class InteractiveMode {
 							this.getCurrentCwd(),
 						);
 						component.setTurnActivity(replayTurnState);
-						component.setExpanded(this.toolOutputExpanded);
-						component.setAgentMessagesExpanded(this.agentMessagesExpanded);
+						component.setExpanded(this.toolOutputExpanded || !replayTurnState.isCollapsed);
+						component.setAgentMessagesExpanded(
+							this.agentMessagesExpanded || replayTurnState.agentMessagesExpanded,
+						);
 						component.setEditDiffsExpanded(this.editDiffsExpanded);
 						selectLatestToolExpandHint(this.chatContainer.children, component);
 						this.chatContainer.addChild(component);
@@ -7746,13 +7765,21 @@ export class InteractiveMode {
 			component.setIncludeImageDimensions(true);
 			this.pendingTools.set(toolCallId, component);
 		}
-		// The last replayed turn has no following user prompt; freeze its clock.
-		replayTurnState?.markTurnEnded(Number(messagesToRender.at(-1)?.timestamp) || Date.now());
 		if (replayTurnState && (renderedPendingTools.size > 0 || this.isAgentStreaming())) {
 			// Attaching mid-run: live tool and thinking events keep feeding this
-			// turn's group, so the replayed state stays the live one.
+			// turn's group, so the replayed state stays the live one - and stays
+			// running until agent_end stamps it.
 			this.currentTurnState = replayTurnState;
 			this.currentTurnSummary = replayTurnSummary;
+		} else {
+			// The last replayed turn has no following user prompt; freeze its clock.
+			replayTurnState?.markTurnEnded(Number(messagesToRender.at(-1)?.timestamp) || Date.now());
+		}
+		for (const summary of restoredSummaries) {
+			this.applyTurnLanes(summary);
+			if (summary.state.processBlockExpanded) this.recordProcessBlockOpen(summary, "process");
+			if (summary.state.thinkingBlockExpanded) this.recordProcessBlockOpen(summary, "thinking");
+			if (summary.state.commsBlockExpanded) this.recordProcessBlockOpen(summary, "comms");
 		}
 		// U2: seed the tool-error streak from the replayed transcript tail.
 		this.consecutiveToolErrors = consecutiveToolErrorsFromMessages(messagesToRender);
@@ -8743,6 +8770,25 @@ export class InteractiveMode {
 		lane: "thinking" | "process" | "comms";
 	}>;
 
+	/** Open blocks of every turn in the chat, keyed by the turn's first tool call id. */
+	private captureTurnLanes(): Map<string, { process: boolean; keySteps: boolean; thinking: boolean; comms: boolean }> {
+		const lanes = new Map<string, { process: boolean; keySteps: boolean; thinking: boolean; comms: boolean }>();
+		for (const child of this.chatContainer.children) {
+			if (!(child instanceof TurnSummaryComponent)) continue;
+			const state = child.state;
+			const firstStep = state.steps[0]?.toolCallId;
+			const open = state.processBlockExpanded || state.thinkingBlockExpanded || state.commsBlockExpanded;
+			if (!firstStep || !open) continue;
+			lanes.set(firstStep, {
+				process: state.processBlockExpanded,
+				keySteps: state.processKeyStepsArmed,
+				thinking: state.thinkingBlockExpanded,
+				comms: state.commsBlockExpanded,
+			});
+		}
+		return lanes;
+	}
+
 	private recordProcessBlockOpen(summary: TurnSummaryComponent, lane: "thinking" | "process" | "comms"): void {
 		if (!this.processBlockOpenOrder) {
 			this.processBlockOpenOrder = [];
@@ -8794,11 +8840,19 @@ export class InteractiveMode {
 	 * first summary) read the global lanes.
 	 */
 	private applyTurnExpansion(summary: TurnSummaryComponent): void {
+		if (!this.applyTurnLanes(summary)) {
+			this.applyChatExpansion();
+			return;
+		}
+		this.requestExpansionRender();
+	}
+
+	/** Push a turn's lanes onto its children; false when the summary is not in the chat. */
+	private applyTurnLanes(summary: TurnSummaryComponent): boolean {
 		const children = this.chatContainer.children;
 		const start = children.indexOf(summary);
 		if (start < 0) {
-			this.applyChatExpansion();
-			return;
+			return false;
 		}
 		const state = summary.state;
 		summary.setExpanded(!state.isCollapsed);
@@ -8814,7 +8868,7 @@ export class InteractiveMode {
 				editDiffs: !state.isCollapsed,
 			});
 		}
-		this.requestExpansionRender();
+		return true;
 	}
 
 	private toggleToolOutputExpansion(global = false): void {
@@ -8829,7 +8883,10 @@ export class InteractiveMode {
 					// 3 + ⋯ + last 3 while >8 steps) → all steps → closed.
 					// Legacy keeps the binary toggle.
 					if (summary.state.isCollapsed) {
-						summary.state.setProcessKeySteps(true);
+						// The key-steps fold only applies to a turn already long when
+						// opened; a turn that grows past the threshold while open stays
+						// fully open instead of folding under the reader.
+						summary.state.setProcessKeySteps(summary.state.stepCount > PROCESS_FOLD_THRESHOLD);
 						summary.setExpanded(true);
 						this.recordProcessBlockOpen(summary, "process");
 					} else if (summary.state.processKeyStepsView) {

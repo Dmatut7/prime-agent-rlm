@@ -51,7 +51,7 @@ import { BashExecutionComponent } from "../src/modes/interactive/components/bash
 import type { ConfigurationMenuComponent } from "../src/modes/interactive/components/configuration-menu.js";
 import { buildConversationComponents } from "../src/modes/interactive/components/conversation-components.js";
 import type { AuthSelectorProvider } from "../src/modes/interactive/components/oauth-selector.js";
-import type { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
+import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
 import { TurnActivityState, TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
 import { formatSplashCwd, InteractiveMode, truncatePathMiddle } from "../src/modes/interactive/interactive-mode.js";
 import { ClientPromptStashStore, type PromptStashState } from "../src/modes/interactive/prompt-stash-state.js";
@@ -361,6 +361,74 @@ describe("InteractiveMode.renderSessionContext", () => {
 		// Frozen: repeated renders reuse the settled cache.
 		const first = summary!.render(120);
 		expect(summary!.render(120)).toBe(first);
+	});
+
+	test("a turn replayed while the agent is still streaming stays running (attach mid-run)", async () => {
+		const { harness, chatContainer } = createRenderSessionContextHarness({
+			connectionState: createConnectionState({ isStreaming: true }),
+		});
+
+		await renderMessages(harness, [
+			userMessage("analyze the recent changes", 900),
+			{ ...toolCallMessage("tool-1", "bash"), timestamp: 1_000 },
+			{ ...toolResultMessage("tool-1", "bash", [{ type: "text", text: "ok" }]), timestamp: 1_500 },
+		]);
+
+		const summary = chatContainer.children.find((component) => component instanceof TurnSummaryComponent) as
+			| TurnSummaryComponent
+			| undefined;
+		expect(summary).toBeDefined();
+		expect(summary!.state.isTurnEnded).toBe(false);
+		const line = summary!
+			.render(120)
+			.join("\n")
+			.replace(/\u001b\[[0-9;]*m/g, "");
+		expect(line).toContain("▾ 进行中 · 第 1 步");
+	});
+
+	test("a rebuild keeps an opened turn open (resync mid-run must not fold Ctrl+O)", async () => {
+		const { harness, chatContainer } = createRenderSessionContextHarness({
+			connectionState: createConnectionState({ isStreaming: true }),
+		});
+		const messages: AgentMessage[] = [
+			userMessage("analyze the recent changes", 900),
+			{ ...toolCallMessage("tool-1", "bash"), timestamp: 1_000 },
+			{ ...toolResultMessage("tool-1", "bash", [{ type: "text", text: "ok" }]), timestamp: 1_500 },
+		];
+		await renderMessages(harness, messages);
+		const findSummary = () =>
+			chatContainer.children.find((component) => component instanceof TurnSummaryComponent) as
+				| TurnSummaryComponent
+				| undefined;
+		const before = findSummary();
+		expect(before).toBeDefined();
+		before!.setExpanded(true);
+		before!.state.thinkingExpanded = true;
+
+		await renderMessages(harness, [...messages, { ...toolCallMessage("tool-2", "bash"), timestamp: 2_000 }], {
+			clearChat: true,
+		});
+		const after = findSummary();
+		expect(after).toBeDefined();
+		expect(after).not.toBe(before);
+		expect(after!.state.processBlockExpanded).toBe(true);
+		expect(after!.state.thinkingBlockExpanded).toBe(true);
+		const tools = chatContainer.children.filter((component) => component instanceof ToolExecutionComponent);
+		expect(tools.length).toBe(2);
+	});
+
+	test("a finished replayed turn freezes as done", async () => {
+		const { harness, chatContainer } = createRenderSessionContextHarness();
+		await renderMessages(harness, [
+			userMessage("analyze the recent changes", 900),
+			{ ...toolCallMessage("tool-1", "bash"), timestamp: 1_000 },
+			{ ...toolResultMessage("tool-1", "bash", [{ type: "text", text: "ok" }]), timestamp: 1_500 },
+		]);
+		const summary = chatContainer.children.find((component) => component instanceof TurnSummaryComponent) as
+			| TurnSummaryComponent
+			| undefined;
+		expect(summary!.state.isTurnEnded).toBe(true);
+		expect(summary!.render(120).join("\n")).not.toContain("进行中");
 	});
 
 	test("does not replay historical tool result image payloads", async () => {
