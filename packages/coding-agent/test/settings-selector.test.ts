@@ -25,6 +25,7 @@ const config: SettingsConfig = {
 	availableThemes: ["dark"],
 	hideThinkingBlock: false,
 	mermaidRenderingMode: "streaming",
+	processMode: "quiet",
 	treeFilterMode: "user-only",
 	showHardwareCursor: false,
 	editorPaddingX: 0,
@@ -51,6 +52,7 @@ const callbacks: SettingsCallbacks = {
 	onThemeChange: () => {},
 	onHideThinkingBlockChange: () => {},
 	onMermaidRenderingModeChange: () => {},
+	onProcessModeChange: () => {},
 	onTreeFilterModeChange: () => {},
 	onShowHardwareCursorChange: () => {},
 	onEditorPaddingXChange: () => {},
@@ -81,6 +83,19 @@ describe("SettingsSelectorComponent", () => {
 		} finally {
 			resetCapabilitiesCache();
 		}
+	});
+
+	test("renders the process-mode row and cycles quiet to legacy", () => {
+		const onProcessModeChange = vi.fn();
+		const component = new SettingsSelectorComponent(config, { ...callbacks, onProcessModeChange });
+		const list = component.getSettingsList();
+		for (const character of "process") list.handleInput(character);
+
+		expect(stripAnsi(component.render(120).join("\n"))).toContain("Process mode");
+
+		list.handleInput("\r");
+
+		expect(onProcessModeChange).toHaveBeenCalledWith("legacy");
 	});
 
 	test("cycles a custom idle eviction value to the next numeric option", () => {

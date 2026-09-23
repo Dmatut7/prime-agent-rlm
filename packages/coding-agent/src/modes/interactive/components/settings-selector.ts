@@ -11,7 +11,7 @@ import {
 	Text,
 } from "@earendil-works/pi-tui";
 import type { IdleEvictionMinutes } from "../../../core/session-action-store.js";
-import type { MermaidRenderingMode, WarningSettings } from "../../../core/settings-manager.js";
+import type { MermaidRenderingMode, ProcessModeSetting, WarningSettings } from "../../../core/settings-manager.js";
 import { getSelectListTheme, getSettingsListTheme, theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
 
@@ -47,6 +47,7 @@ export interface SettingsConfig {
 	availableThemes: string[];
 	hideThinkingBlock: boolean;
 	mermaidRenderingMode: MermaidRenderingMode;
+	processMode: ProcessModeSetting;
 	treeFilterMode: "default" | "no-tools" | "user-only" | "labeled-only" | "all";
 	showHardwareCursor: boolean;
 	editorPaddingX: number;
@@ -74,6 +75,7 @@ export interface SettingsCallbacks {
 	onThemePreview?: (theme: string) => void;
 	onHideThinkingBlockChange: (hidden: boolean) => void;
 	onMermaidRenderingModeChange: (mode: MermaidRenderingMode) => void;
+	onProcessModeChange: (mode: ProcessModeSetting) => void;
 	onTreeFilterModeChange: (mode: "default" | "no-tools" | "user-only" | "labeled-only" | "all") => void;
 	onShowHardwareCursorChange: (enabled: boolean) => void;
 	onEditorPaddingXChange: (padding: number) => void;
@@ -250,6 +252,13 @@ export class SettingsSelectorComponent extends Container {
 				description: "Render Mermaid code blocks as Unicode diagrams",
 				currentValue: config.mermaidRenderingMode,
 				values: ["off", "final", "streaming"],
+			},
+			{
+				id: "process-mode",
+				label: "Process mode",
+				description: "Quiet folds turn narration into the footnote line; legacy shows the full transcript",
+				currentValue: config.processMode,
+				values: ["quiet", "legacy"],
 			},
 			{
 				id: "quiet-startup",
@@ -483,6 +492,9 @@ export class SettingsSelectorComponent extends Container {
 						break;
 					case "mermaid-rendering":
 						callbacks.onMermaidRenderingModeChange(newValue as MermaidRenderingMode);
+						break;
+					case "process-mode":
+						callbacks.onProcessModeChange(newValue as ProcessModeSetting);
 						break;
 					case "quiet-startup":
 						callbacks.onQuietStartupChange(newValue === "true");

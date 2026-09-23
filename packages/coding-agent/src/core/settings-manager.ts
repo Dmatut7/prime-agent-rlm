@@ -820,6 +820,9 @@ export interface SubagentSpendCellSettings {
 	priceOverrides?: Record<string, SpendPriceRateOverride>;
 }
 
+/** TUI v4 quiet-conversation switch (assistant-message.ts renders by it). */
+export type ProcessModeSetting = "quiet" | "legacy";
+
 /**
  * Behaviour of the interactive UI's own cells.
  */
@@ -833,6 +836,13 @@ export interface UiSettings {
 	 * cadence (see {@link SubagentSpendCellSettings}).
 	 */
 	subagentSpendCell?: boolean | SubagentSpendCellSettings;
+	/**
+	 * How the conversation renders an agent turn's process information
+	 * (TUI v4): `quiet` (default) folds intermediate narration behind the
+	 * turn footnote; `legacy` keeps the old full transcript. The switch
+	 * protects the U6 lane users, who can flip back one key.
+	 */
+	processMode?: ProcessModeSetting;
 }
 
 /** Default cadence of the spend cell's idle tick and its stale-figure catch-up. */
@@ -1052,7 +1062,7 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	showHardwareCursor: null,
 	markdown: ["codeBlockIndent", "mermaid"],
 	warnings: ["anthropicExtraUsage"],
-	ui: ["subagentSpendCell"],
+	ui: ["subagentSpendCell", "processMode"],
 	sessionDir: null,
 };
 
@@ -2275,6 +2285,20 @@ export class SettingsManager {
 
 	getTransport(): TransportSetting {
 		return this.settings.transport ?? "auto";
+	}
+
+	getProcessMode(): ProcessModeSetting {
+		// TUI v4: quiet is the new default face; `legacy` is the one-key escape
+		// hatch for the U6 lane users. Unknown values land on the default,
+		// never throw.
+		const value = this.settings.ui?.processMode;
+		return value === "legacy" ? "legacy" : "quiet";
+	}
+
+	setProcessMode(mode: ProcessModeSetting): void {
+		this.globalSettings.ui = { ...this.globalSettings.ui, processMode: mode };
+		this.markModified("ui", "processMode");
+		this.save();
 	}
 
 	getFooterTelemetry(): FooterTelemetrySetting {

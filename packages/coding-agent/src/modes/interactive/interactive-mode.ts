@@ -9031,6 +9031,7 @@ export class InteractiveMode {
 					availableThemes: getAvailableThemes(),
 					hideThinkingBlock: this.hideThinkingBlock,
 					mermaidRenderingMode: this.settingsManager.getMermaidRenderingMode(),
+					processMode: this.settingsManager.getProcessMode(),
 					treeFilterMode: this.settingsManager.getTreeFilterMode(),
 					showHardwareCursor: this.settingsManager.getShowHardwareCursor(),
 					editorPaddingX: this.settingsManager.getEditorPaddingX(),
@@ -9134,6 +9135,14 @@ export class InteractiveMode {
 						this.applySetting(() => this.settingsManager.setMermaidRenderingMode(mode));
 						this.chatContainer.invalidate();
 						this.ui.requestRender();
+					},
+					onProcessModeChange: (mode) => {
+						this.applySetting(() => this.settingsManager.setProcessMode(mode));
+						// The gate lives in the assistant components' render, so
+						// the new face needs one rebuild (same as hide-thinking).
+						void this.rebuildChatFromMessages().catch((error) => {
+							this.showError(error instanceof Error ? error.message : String(error));
+						});
 					},
 					onQuietStartupChange: (enabled) => {
 						this.applySetting(() => this.settingsManager.setQuietStartup(enabled));
