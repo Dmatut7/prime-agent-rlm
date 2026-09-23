@@ -194,7 +194,7 @@ describe("expanded tool output budget", () => {
 		expect(total).toBeLessThan(60 * 420);
 	});
 
-	test("the full-output toggle flips the budget, asks for a frame and says how to undo it", () => {
+	test("the full-output toggle flips the budget and asks for a frame without piling status rows", () => {
 		const { tui, requestRender } = createFakeTui();
 		const chatContainer = new Container();
 		chatContainer.addChild(bashComponent("toggle", bodyLines(420).join("\n"), tui));
@@ -221,10 +221,9 @@ describe("expanded tool output budget", () => {
 		proto.toggleToolOutputFull.call(mode);
 		expect(toolOutputFull()).toBe(true);
 		expect(requestRender).toHaveBeenCalled();
-		expect(stripAnsi(showStatus.mock.calls[0]![0] as string)).toContain(keyText("app.tools.expandFull"));
 
 		proto.toggleToolOutputFull.call(mode);
 		expect(toolOutputFull()).toBe(false);
-		expect(showStatus).toHaveBeenCalledTimes(2);
+		expect(showStatus).not.toHaveBeenCalled();
 	});
 });

@@ -8990,14 +8990,8 @@ export class InteractiveMode {
 		if (!setToolOutputFull(!toolOutputFull())) {
 			return;
 		}
-		const full = toolOutputFull();
+		// The held-back rows appearing or folding are the feedback.
 		this.applyChatExpansion();
-		const key = keyText("app.tools.expandFull");
-		this.showStatus(
-			full
-				? `Full tool output on - expanded blocks render everything (${key} restores the budget)`
-				: `Expanded tool output budget on - long blocks render a window (${key} for full output)`,
-		);
 	}
 
 	private toggleAgentMessageExpansion(global = false): void {
@@ -9115,15 +9109,15 @@ export class InteractiveMode {
 				} else {
 					this.forgetProcessBlock(summary, "thinking");
 				}
+				// The opened or folded trace is the feedback; a status row per
+				// press would pile up in the chat.
 				this.applyTurnExpansion(summary);
-				this.showStatus(`Thinking: ${next ? "展开" : "收起"}${next ? "（最近一轮）" : ""}`);
 				return;
 			}
 		}
 		this.thinkingExpanded = !this.thinkingExpanded;
 		this.syncAllTurnLanes(this.thinkingExpanded, "thinking");
 		this.applyChatExpansion();
-		this.showStatus(`Thinking: ${this.thinkingExpanded ? "全部展开" : "全部收起"}`);
 	}
 
 	private openExternalEditor(): void {

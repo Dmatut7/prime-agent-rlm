@@ -5237,7 +5237,11 @@ describe("InteractiveMode.setToolsExpanded", () => {
 		expect(fakeThis.agentMessagesExpanded).toBe(false);
 		expect(setThinkingExpanded).toHaveBeenCalledWith(true);
 		expect(child.setExpanded).toHaveBeenCalledWith(false);
-		expect(fakeThis.showStatus).toHaveBeenCalledWith("Thinking: 全部展开");
+		// The trace itself is the feedback: repeated presses must not pile status rows into the chat.
+		fakeThis.toggleThinkingBlockVisibility();
+		fakeThis.toggleThinkingBlockVisibility();
+		fakeThis.toggleThinkingBlockVisibility();
+		expect(fakeThis.showStatus).not.toHaveBeenCalled();
 	});
 });
 

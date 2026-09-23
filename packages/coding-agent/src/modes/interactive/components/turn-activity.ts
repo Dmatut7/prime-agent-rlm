@@ -533,7 +533,11 @@ export class TurnSummaryComponent implements Component {
 			summary: turnStepsSummary(this.turnState.steps),
 			running: !this.turnState.isTurnEnded,
 			thinkingMs: this.turnState.thinkingDurationMs(),
-			thinkingPreview: this.turnState.processBlockExpanded ? this.turnState.latestThinking : undefined,
+			// The preview stands in for the trace; with the trace open (Ctrl+T) it would repeat it.
+			thinkingPreview:
+				this.turnState.processBlockExpanded && !this.turnState.thinkingBlockExpanded
+					? this.turnState.latestThinking
+					: undefined,
 			// An open process block shows every diff itself; the rows are the closed view's stand-in.
 			fileChanges: this.turnState.processBlockExpanded ? [] : this.turnState.fileChanges,
 			// P3-2: the caret glyph — ▸ while every detail block is collapsed,

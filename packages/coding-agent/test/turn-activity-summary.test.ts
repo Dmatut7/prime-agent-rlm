@@ -773,4 +773,19 @@ describe("turn state for the process line", () => {
 		const open = summary.render(120).map(stripAnsi);
 		expect(open[1]).toContain("Thinking  Check both data sources");
 	});
+
+	it("drops the Thinking preview while the full trace is open", () => {
+		const state = new TurnActivityState(1_000);
+		state.addStep({ toolCallId: "t1", toolName: "bash", args: { command: "ls" }, status: "done" });
+		state.addThinkingSegments(1);
+		state.latestThinking = "weighing the two options";
+		state.markTurnEnded(2_000);
+		const summary = new TurnSummaryComponent(state);
+		summary.setQuiet(true);
+		summary.setExpanded(true);
+		expect(summary.render(120).map(stripAnsi).join("\n")).toContain("weighing the two options");
+		state.thinkingExpanded = true;
+		summary.invalidate();
+		expect(summary.render(120).map(stripAnsi).join("\n")).not.toContain("weighing the two options");
+	});
 });
