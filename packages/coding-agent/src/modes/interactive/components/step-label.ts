@@ -67,6 +67,15 @@ function shellWords(command: string): string[] {
 	return [...command.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map((match) => match[1] ?? match[2] ?? match[3] ?? "");
 }
 
+/** A search pattern as a reader sees it: regex escapes and anchors dropped (`\bText\b` → `Text`). */
+function searchPatternText(pattern: string): string {
+	return pattern
+		.replace(/\\[bB<>]/g, "")
+		.replace(/\\(.)/g, "$1")
+		.replace(/^\^|\$$/g, "")
+		.trim();
+}
+
 /**
  * A shell command in plain words: searches, listings and file reads say what
  * they look at (`搜索 wrapTextWithAnsi`, `列目录 packages`, `读取 text.ts`);
@@ -82,8 +91,10 @@ export function describeShellCommand(command: string): string {
 		case "grep":
 		case "rg":
 		case "ag":
-		case "ack":
-			return args[0] ? `搜索 ${args[0]}` : `运行 ${main}`;
+		case "ack": {
+			const pattern = searchPatternText(args[0] ?? "");
+			return pattern ? `搜索 ${pattern}` : "搜索";
+		}
 		case "ls":
 		case "tree":
 			return `列目录 ${pathTail(args.at(-1) ?? ".")}`;

@@ -72,6 +72,15 @@ describe("turnStepLabel template holes", () => {
 	});
 });
 
+describe("search labels", () => {
+	it("drop regex escapes and anchors from the pattern", () => {
+		const bash = (command: string) => turnStepLabel({ toolName: "bash", args: { command } });
+		expect(bash('grep -rn "\\bText\\b" packages')).toBe("搜索 Text");
+		expect(bash('grep -rn "^export" src')).toBe("搜索 export");
+		expect(bash("rg -n")).toBe("搜索");
+	});
+});
+
 describe("turnStepsSummary", () => {
 	it("groups labels by verb in first-seen order, deduped by toolCallId", () => {
 		const steps = [
