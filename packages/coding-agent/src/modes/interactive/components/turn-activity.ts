@@ -42,6 +42,21 @@ export class TurnActivityState {
 	/** U6 K3 ②: the turn's own Ctrl+P lane (agent message rows inside this turn's span). */
 	agentMessagesExpanded = false;
 
+	/**
+	 * TUI v4 T5: the 💭⚙✉ process blocks as first-class independent state.
+	 * Ctrl+T/O/P each flip exactly one of these; they stack freely and no
+	 * block's expansion ever closes another (三块独立,不互斥).
+	 */
+	get thinkingBlockExpanded(): boolean {
+		return this.thinkingExpanded;
+	}
+	get processBlockExpanded(): boolean {
+		return !this.collapsed;
+	}
+	get commsBlockExpanded(): boolean {
+		return this.agentMessagesExpanded;
+	}
+
 	constructor(startedAt = Date.now()) {
 		this.startedAt = startedAt;
 	}

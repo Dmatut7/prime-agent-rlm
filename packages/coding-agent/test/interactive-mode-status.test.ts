@@ -4829,6 +4829,73 @@ describe("InteractiveMode.setToolsExpanded", () => {
 		expect(rendered).toContain("thinking for rebuild");
 	});
 
+	test("quiet turns: Ctrl+T/O/P stack the three blocks independently (T5)", () => {
+		// A quiet turn (footnote face) built through the replay builder; the
+		// three keys must each flip their own block and never close another.
+		const chatContainer = new Container();
+		const built = buildConversationComponents(
+			[
+				{ role: "user", content: "stack the blocks", timestamp: 900 },
+				assistantThinking("stack"),
+				{
+					...toolCallMessage("stack-1", "bash"),
+					timestamp: 1_000,
+				},
+				{
+					...toolResultMessage("stack-1", "bash", [{ type: "text", text: "ok" }]),
+					timestamp: 1_100,
+				},
+				{
+					...toolCallMessage("stack-1", "bash"),
+					content: [{ type: "text", text: "Done." }],
+					stopReason: "stop",
+					timestamp: 1_200,
+				},
+			],
+			{
+				ui: { requestRender: vi.fn() } as never,
+				cwd: "/tmp",
+				toolOptions: {},
+				getToolDefinition: () => undefined,
+				processMode: "quiet",
+			},
+		);
+		for (const component of built) {
+			chatContainer.addChild(component);
+		}
+		const summary = built.find((c): c is TurnSummaryComponent => c instanceof TurnSummaryComponent);
+		expect(summary).toBeDefined();
+		expect(summary!.state.isCollapsed).toBe(true);
+		expect(summary!.state.thinkingBlockExpanded).toBe(false);
+		expect(summary!.state.commsBlockExpanded).toBe(false);
+
+		const fakeThis = createExpansionFakeThis(chatContainer.children);
+		fakeThis.showStatus = vi.fn();
+
+		// Ctrl+T opens the thinking block only.
+		fakeThis.toggleThinkingBlockVisibility();
+		expect(summary!.state.thinkingBlockExpanded).toBe(true);
+		expect(summary!.state.processBlockExpanded).toBe(false);
+		expect(summary!.state.commsBlockExpanded).toBe(false);
+
+		// Ctrl+O opens the process block on top; thinking stays open.
+		fakeThis.toggleToolOutputExpansion();
+		expect(summary!.state.processBlockExpanded).toBe(true);
+		expect(summary!.state.thinkingBlockExpanded).toBe(true);
+
+		// Ctrl+P opens the comms block on top of both.
+		fakeThis.toggleAgentMessageExpansion();
+		expect(summary!.state.commsBlockExpanded).toBe(true);
+		expect(summary!.state.processBlockExpanded).toBe(true);
+		expect(summary!.state.thinkingBlockExpanded).toBe(true);
+
+		// Closing one block leaves the other two open (不互斥).
+		fakeThis.toggleToolOutputExpansion();
+		expect(summary!.state.processBlockExpanded).toBe(false);
+		expect(summary!.state.thinkingBlockExpanded).toBe(true);
+		expect(summary!.state.commsBlockExpanded).toBe(true);
+	});
+
 	test("plain keys act on the latest turn only; Alt keys act globally (K3 ②)", () => {
 		// Three turns in a real container, each with an assistant message and a
 		// thinking block, plus the TurnSummaryComponent at each turn head.
