@@ -80,3 +80,27 @@ describe("turnStepsSummary", () => {
 		expect(turnStepsSummary([])).toBe("");
 	});
 });
+
+describe("turnStepLabel harness calls", () => {
+	it("resolves string path variables for open(), edit() and bash f-strings", () => {
+		expect(turnStepLabel(cell('path = "/tmp/x/shop.md"\nwith open(path) as f:\n    print(f.read())'))).toBe(
+			"读取 shop.md",
+		);
+		expect(turnStepLabel(cell('await edit(path="src/a.py", old_str="x", new_str="y")'))).toBe("编辑 a.py");
+		expect(turnStepLabel(cell('res = await edit(path=path, old_str="bread", new_str="milk")'))).toBe("编辑文件");
+		expect(turnStepLabel(cell('path = "/tmp/x/shop.md"\nr = await bash(f"wc -l {path}")'))).toBe(
+			"运行 wc -l shop.md",
+		);
+	});
+
+	it("names subagent, messaging, image, search and memory calls", () => {
+		expect(turnStepLabel(cell("h = await rlm('数文件', name='counter')\nrows = await rlm.list_subagents()"))).toBe(
+			"派子代理，查看子代理",
+		);
+		expect(turnStepLabel(cell("snaps = await rlm.collect(timeout_ms=0)"))).toBe("查看子代理");
+		expect(turnStepLabel(cell("await agent_message.send('done', receiver_role='parent')"))).toBe("发消息");
+		expect(turnStepLabel(cell("print(await attach_image('a.png'))"))).toBe("看图");
+		expect(turnStepLabel(cell("hits = await bailian_search.search('天气')"))).toBe("联网搜索");
+		expect(turnStepLabel(cell("rlm.harness.create_memory('t', 'c')"))).toBe("记笔记");
+	});
+});

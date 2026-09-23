@@ -38,6 +38,8 @@ export interface TurnFootNoteProps {
 	summary?: string;
 	/** Files the turn changed, with display paths; rendered as rows under the line. */
 	fileChanges?: readonly FileChangeSummary[];
+	/** The turn is still running: the line reads `进行中 · 第 N 步 · 9.4s` with an accent caret. */
+	running?: boolean;
 	/** Optional caret glyph (▸/▾) rendered in the line's indent column; the wiring owns the state. Default: none. */
 	caret?: string;
 	/** Fired with the lane id when a stats segment is clicked. Zero-value segments never render and so never fire. */
@@ -66,6 +68,23 @@ export function turnFootNoteDurationText(durationMs: number): string {
 		return `${totalMinutes}m${String(totalSeconds % 60).padStart(2, "0")}s`;
 	}
 	return `${Math.floor(totalMinutes / 60)}h${String(totalMinutes % 60).padStart(2, "0")}m`;
+}
+
+/** Keep a path's tail readable: `…/scratchpad/shop.md` beats a head cut mid-segment. */
+function shortenPath(path: string, width: number): string {
+	if (visibleWidth(path) <= width) {
+		return path;
+	}
+	const parts = path.split("/").filter((part) => part.length > 0);
+	// An absolute path outside the project reads best as its last two segments.
+	const maxKeep = path.startsWith("/") ? Math.min(2, parts.length - 1) : parts.length - 1;
+	for (let keep = maxKeep; keep >= 1; keep--) {
+		const candidate = `…/${parts.slice(-keep).join("/")}`;
+		if (visibleWidth(candidate) <= width) {
+			return candidate;
+		}
+	}
+	return truncateToWidth(parts.at(-1) ?? path, width, "…");
 }
 
 interface FootNoteSpan {
@@ -126,7 +145,7 @@ export class TurnFootNote implements Component {
 			this.clickRegions = [];
 			return [theme.fg("dim", truncateToWidth(indent, cols, ""))];
 		}
-		const styledIndent = caret !== "" ? ` ${theme.fg("dim", caret)} ` : " ";
+		const styledIndent = caret !== "" ? ` ${theme.fg(this.props.running ? "accent" : "dim", caret)} ` : " ";
 		const segments = this.buildSegments();
 		const statsPlain = segments.map((segment) => segment.text).join(JOINER);
 		const budget = cols - indentWidth;
@@ -151,6 +170,14 @@ export class TurnFootNote implements Component {
 	private buildSegments(): FootNoteSegment[] {
 		const { steps, thinkSegments, commMessages, durationMs } = this.props;
 		const segments: FootNoteSegment[] = [];
+		if (this.props.running) {
+			segments.push({ text: "进行中" });
+			if (steps > 0) {
+				segments.push({ text: `第 ${steps} 步`, clickTarget: "steps" });
+			}
+			segments.push({ text: turnFootNoteDurationText(durationMs) });
+			return segments;
+		}
 		if (thinkSegments > 0) {
 			segments.push({ text: "思考", clickTarget: "think" });
 		}
@@ -175,7 +202,7 @@ export class TurnFootNote implements Component {
 			const prefix = `   ${theme.fg("dim", "改动")}  `;
 			const counts = `  ${theme.fg("toolDiffAdded", `+${change.added}`)} ${theme.fg("toolDiffRemoved", `−${change.removed}`)}`;
 			const available = Math.max(1, cols - visibleWidth(prefix) - visibleWidth(counts));
-			const path = theme.fg("muted", truncateToWidth(change.path, available, "…"));
+			const path = theme.fg("muted", shortenPath(change.path, available));
 			rows.push(truncateToWidth(`${prefix}${path}${counts}`, cols, ""));
 		}
 		if (shown < changes.length) {

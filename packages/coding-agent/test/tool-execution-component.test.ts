@@ -18,6 +18,7 @@ import {
 import { createEditToolDefinition } from "../src/core/tools/edit.js";
 import { createAgentConnectionToolDefinition } from "../src/modes/agent-connection/tool-definition.js";
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
+import { setToolOutputFull, toolOutputFull } from "../src/modes/interactive/components/tool-output-budget.js";
 import { TurnActivityState } from "../src/modes/interactive/components/turn-activity.js";
 import {
 	truncateToVisualLines,
@@ -460,7 +461,7 @@ describe("ToolExecutionComponent parity", () => {
 
 		const collapsed = stripAnsi(component.render(120).join("\n"));
 		expect(collapsed).not.toContain("-1 before");
-		expect(collapsed).toContain("+1 -1");
+		expect(collapsed).toContain("+1 −1");
 		// The collapsed `╰─ path +N -M` summary line carries the ctrl+j hint —
 		// and it is the only carrier: the header must not duplicate it.
 		expect(collapsed.split("\n").find((line) => line.includes("╰─"))).not.toContain("展开");
@@ -469,7 +470,7 @@ describe("ToolExecutionComponent parity", () => {
 		component.setEditDiffsExpanded(true);
 		const withDiffLines = stripAnsi(component.render(120).join("\n")).split("\n");
 		// The summary line stays put; the diff renders under it, indented to its text column.
-		const summaryIndex = withDiffLines.findIndex((line) => line.includes("╰─ README.md +1 -1"));
+		const summaryIndex = withDiffLines.findIndex((line) => line.includes("╰─ README.md +1 −1"));
 		expect(summaryIndex).toBeGreaterThanOrEqual(0);
 		expect(withDiffLines[summaryIndex]).not.toContain("收起");
 		const textColumn = withDiffLines[summaryIndex].indexOf("README.md");
@@ -481,7 +482,7 @@ describe("ToolExecutionComponent parity", () => {
 		component.setEditDiffsExpanded(false);
 		const collapsedAgain = stripAnsi(component.render(120).join("\n"));
 		expect(collapsedAgain).not.toContain("-1 before");
-		expect(collapsedAgain).toContain("+1 -1");
+		expect(collapsedAgain).toContain("+1 −1");
 	});
 
 	test("suppresses the built-in edit summary and diff when execution fails", async () => {
@@ -502,11 +503,11 @@ describe("ToolExecutionComponent parity", () => {
 
 			component.setEditDiffsExpanded(true);
 			const deadline = Date.now() + 2000;
-			while (Date.now() < deadline && !stripAnsi(component.render(120).join("\n")).includes("+1 -1")) {
+			while (Date.now() < deadline && !stripAnsi(component.render(120).join("\n")).includes("+1 −1")) {
 				component.setArgsComplete();
 				await new Promise((resolve) => setTimeout(resolve, 5));
 			}
-			expect(stripAnsi(component.render(120).join("\n"))).toContain("+1 -1");
+			expect(stripAnsi(component.render(120).join("\n"))).toContain("+1 −1");
 
 			component.updateResult(
 				{ content: [{ type: "text", text: "Could not edit file: sample.txt." }], isError: true },
@@ -514,7 +515,7 @@ describe("ToolExecutionComponent parity", () => {
 			);
 			const rendered = stripAnsi(component.render(120).join("\n"));
 			expect(rendered).not.toContain("╰─");
-			expect(rendered).not.toContain("+1 -1");
+			expect(rendered).not.toContain("+1 −1");
 			expect(rendered).not.toContain("-1 before");
 			expect(rendered).not.toContain("+1 after");
 
@@ -547,7 +548,7 @@ describe("ToolExecutionComponent parity", () => {
 		const summaryLines = lines.filter((line) => line.includes("╰─"));
 		expect(summaryLines.length).toBe(1);
 		expect(summaryLines[0]).toContain("…");
-		expect(summaryLines[0]).toContain("+1 -1");
+		expect(summaryLines[0]).toContain("+1 −1");
 		expect(summaryLines[0]).not.toContain("展开");
 		for (const line of lines) {
 			expect(line.length).toBeLessThanOrEqual(40);
@@ -857,10 +858,10 @@ describe("ToolExecutionComponent parity", () => {
 
 		const rendered = stripAnsi(component.render(120).join("\n"));
 		expect(rendered).toContain("custom ipython");
-		expect(rendered).not.toContain("README.md +1 -1");
+		expect(rendered).not.toContain("README.md +1 −1");
 	});
 
-	test("globally expands built-in IPython source associated with diffs", () => {
+	test("shows built-in IPython source associated with diffs only in the full view", () => {
 		const component = new ToolExecutionComponent(
 			"ipython",
 			"tool-ipython-edit",
@@ -888,25 +889,36 @@ describe("ToolExecutionComponent parity", () => {
 
 		const collapsed = stripAnsi(component.render(120).join("\n"));
 		expect(collapsed).not.toContain("hidden_side_effect");
-		expect(collapsed).toContain("╰─ README.md +1 -1");
+		expect(collapsed).toContain("╰─ README.md +1 −1");
 		expect(collapsed).not.toMatch(/1 - before/);
 		expect(collapsed).not.toMatch(/1 \+ after/);
 
-		// Tool expansion shows the full source but never the diff; that belongs to ctrl+j.
+		// Tool expansion keeps a labelled cell's source out and never shows the diff; that belongs to ctrl+j.
 		component.setExpanded(true);
 		const expanded = stripAnsi(component.render(120).join("\n"));
-		expect(expanded).toContain('hidden_side_effect = "only in full source"');
-		expect(expanded).toContain("╰─ README.md +1 -1");
+		expect(expanded).not.toContain("hidden_side_effect");
+		expect(expanded).toContain("编辑 README.md");
+		expect(expanded).toContain("╰─ README.md +1 −1");
 		expect(expanded).not.toMatch(/1 - before/);
 
+		// The full view adds the source above the diff.
 		component.setEditDiffsExpanded(true);
-		const withDiffs = stripAnsi(component.render(120).join("\n"));
+		const previousFull = toolOutputFull();
+		setToolOutputFull(true);
+		component.invalidate();
+		let withDiffs: string;
+		try {
+			withDiffs = stripAnsi(component.render(120).join("\n"));
+		} finally {
+			setToolOutputFull(previousFull);
+			component.invalidate();
+		}
 		const withDiffLines = withDiffs.split("\n");
 		expect(withDiffLines.findIndex((line) => line.includes("hidden_side_effect ="))).toBeLessThan(
-			withDiffLines.findIndex((line) => line.includes("╰─ README.md +1 -1")),
+			withDiffLines.findIndex((line) => line.includes("╰─ README.md +1 −1")),
 		);
 		// Exactly one summary line — the cell owns the block; no extra component doubles it.
-		expect(withDiffLines.filter((line) => line.includes("╰─ README.md +1 -1")).length).toBe(1);
+		expect(withDiffLines.filter((line) => line.includes("╰─ README.md +1 −1")).length).toBe(1);
 		expect(withDiffs).toMatch(/1 - before/);
 		expect(withDiffs).toMatch(/1 \+ after/);
 	});

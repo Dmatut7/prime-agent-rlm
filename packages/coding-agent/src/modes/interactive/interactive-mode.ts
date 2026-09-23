@@ -1452,7 +1452,7 @@ export class InteractiveMode {
 		};
 		this.headerContainer = new Container();
 		this.topBar = new TopBar({
-			getChatName: () => this.getCurrentSessionName() ?? path.basename(this.getCurrentCwd()),
+			getChatName: () => this.getCurrentSessionName(),
 		});
 		this.chatContainer = new Container();
 		this.shortcutGuideContainer = new Container();
@@ -1474,6 +1474,7 @@ export class InteractiveMode {
 			isArgumentCommand: builtinSlashCommandTakesArgument,
 			placeholder: this.startHint,
 			placeholderColor: (text) => theme.fg("dim", text),
+			hintColor: (text) => theme.fg("dim", text),
 		});
 		this.editor = this.defaultEditor;
 		this.mainContainer = new Container();
@@ -1488,9 +1489,11 @@ export class InteractiveMode {
 		this.editorContainer.addChild(this.editor as Component);
 		// U6 status area: ① tray info line (pure navigation), then the footer
 		// watermark (②), then the subagents line (③).
+		// The key hints ride the prompt's top rule; the tray line keeps status only.
+		this.defaultEditor.getBorderHints = () => this.getTrayHints();
 		this.trayInfoLine = new TrayInfoLine(
 			() => this.getTrayStatusLabel(),
-			() => this.getTrayHints(),
+			() => [],
 			() => this.getTrayOverrideLabel(),
 		);
 		this.subagentSummaryLine = new SubagentSummaryLine();

@@ -16,6 +16,7 @@ import { agentMessageBodyLines, agentMessagePreview, agentMessageSummaryLine } f
 import { normalizeErrorDetails, summarizeErrorDetails } from "./collapsible-error.js";
 import { renderDiffSeparator, renderRichDiff } from "./diff.js";
 import { countChangedLines, FILE_CHANGE_DIFF_INDENT, formatFileChangeSummaryLine } from "./edit-summary.js";
+import { keyText } from "./keybinding-hints.js";
 import { turnStepLabel } from "./step-label.js";
 import { QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES, quietConversationBudget, toolOutputFull } from "./tool-output-budget.js";
 
@@ -372,9 +373,12 @@ export class IPythonCellComponent implements Component {
 		// counts, duration, and expand hint — so toggling never shifts the layout
 		// or indentation; expanding only attaches code and output below it.
 		// Cached by state version so unrelated repaints don't re-render (flicker).
-		const lines = [truncateToWidth(` ${this.collapsedLine(details)}`, safeWidth, "")];
+		const lines = [this.topLine(details, safeWidth)];
 
-		const hasCode = this.state.expanded ? this.renderCode(lines, safeWidth) : false;
+		// An expanded step shows what it produced; its code joins only in the full
+		// view, or when the label could not say what the cell does.
+		const showCode = this.state.expanded && (toolOutputFull() || this.stepLabel() === "python");
+		const hasCode = showCode ? this.renderCode(lines, safeWidth) : false;
 		if ((details.diffs?.length ?? 0) > 0) {
 			this.renderDiffs(lines, safeWidth, details.diffs ?? [], hasCode);
 		}
@@ -394,34 +398,47 @@ export class IPythonCellComponent implements Component {
 	 * The cell's fixed top line, in plain words: `✓ 运行 npm check · 12 行输出 · 1.2s`.
 	 * A cell without a recognizable effect shows its most telling code line.
 	 */
-	private collapsedLine(details: IpythonDetails): string {
+	/**
+	 * The cell's fixed top line, in plain words, with its facts right-aligned:
+	 * `✓ 运行 npm check                      12 行输出 · 1.2s`. A cell without a
+	 * recognizable effect shows its most telling code line after the label.
+	 */
+	private topLine(details: IpythonDetails, width: number): string {
 		const code = this.state.code.trimEnd();
 		const preview = previewIpythonCode(code);
-		const label = code ? turnStepLabel({ toolName: "ipython", args: { code } }) : "python";
-		const parts = [`${this.marker(details)} ${theme.fg("text", label)}`];
-
+		const label = this.stepLabel();
+		let left = ` ${this.marker(details)} ${theme.fg("text", label)}`;
 		if (label === "python" && preview.text) {
-			parts[0] += ` ${this.highlightInputLine(preview.text, preview.language === "bash")}`;
+			left += ` ${this.highlightInputLine(preview.text, preview.language === "bash")}`;
 		} else if (!code && !this.state.executionStarted) {
-			parts.push(theme.fg("muted", "等待代码"));
+			left += ` ${theme.fg("muted", "等待代码")}`;
 		}
 
+		const facts: string[] = [];
 		const outputLines = this.outputLineCount(details);
 		if (outputLines > 0) {
-			parts.push(theme.fg("muted", `${outputLines} 行输出`));
+			facts.push(theme.fg("muted", `${outputLines} 行输出`));
 		}
-
 		const duration = formatDuration(details.durationMs);
 		if (duration) {
-			parts.push(theme.fg("muted", duration));
+			facts.push(theme.fg("muted", duration));
 		}
-
 		const errorName = !this.state.isPartial ? (details.error?.ename ?? details.errorEname) : undefined;
 		if (errorName) {
-			parts.push(theme.fg("error", errorName));
+			facts.push(theme.fg("error", errorName));
 		}
+		const right = facts.length > 0 ? `${facts.join(theme.fg("dim", " · "))} ` : "";
+		const rightWidth = visibleWidth(right);
+		if (!right || visibleWidth(left) + 2 + rightWidth > width) {
+			const joined = right ? `${left}${theme.fg("dim", " · ")}${right.trimEnd()}` : left;
+			return truncateToWidth(joined, width, "");
+		}
+		return `${left}${" ".repeat(width - visibleWidth(left) - rightWidth)}${right}`;
+	}
 
-		return parts.join(theme.fg("dim", " · "));
+	private stepLabel(): string {
+		const code = this.state.code.trimEnd();
+		return code ? turnStepLabel({ toolName: "ipython", args: { code } }) : "python";
 	}
 
 	/** Status marker — color carries running/done/error; ✓/✗ once finished. */
@@ -738,7 +755,12 @@ export class IPythonCellComponent implements Component {
 			this.addWrapped(lines, OUTPUT_INDENT, theme.fg(color, line || " "), width);
 		}
 		if (heldBack > 0) {
-			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("muted", `还有 ${heldBack} 行(alt+shift+O 看全文)`), width);
+			this.addWrapped(
+				lines,
+				OUTPUT_INDENT,
+				theme.fg("dim", `… 还有 ${heldBack} 行  ${keyText("app.tools.expandFull") || "Alt+Shift+O"} 看全文`),
+				width,
+			);
 		}
 	}
 

@@ -85,7 +85,7 @@ const FILE_CHANGE_SUMMARY_PREFIX = "    ╰─ ";
 export const FILE_CHANGE_DIFF_INDENT = " ".repeat(visibleWidth(FILE_CHANGE_SUMMARY_PREFIX));
 
 function formatChangeCounts(change: Pick<FileChangeSummary, "added" | "removed">): string {
-	return `${theme.fg("toolDiffAdded", `+${change.added}`)} ${theme.fg("toolDiffRemoved", `-${change.removed}`)}`;
+	return `${theme.fg("toolDiffAdded", `+${change.added}`)} ${theme.fg("toolDiffRemoved", `−${change.removed}`)}`;
 }
 
 export function formatFileChangePath(path: string, cwd: string): string {
@@ -120,6 +120,6 @@ export function formatTotalChangeSummary(changes: readonly FileChangeSummary[]):
 		(sum, change) => ({ added: sum.added + change.added, removed: sum.removed + change.removed }),
 		{ added: 0, removed: 0 },
 	);
-	const files = `${changes.length} file${changes.length === 1 ? "" : "s"} changed`;
-	return `${theme.fg("muted", files)}${theme.fg("dim", " | ")}${formatChangeCounts(totals)}`;
+	const files = `改动 ${changes.length} 个文件`;
+	return `${theme.fg("muted", files)}${theme.fg("dim", " · ")}${formatChangeCounts(totals)}`;
 }

@@ -193,4 +193,25 @@ describe("turn footnote (process line)", () => {
 		// The comm segment sits past the budget, so it has no region.
 		expect(regions.some((region) => region.col >= cols)).toBe(false);
 	});
+
+	it("reads a running turn as 进行中 with the step reached so far", () => {
+		const line = renderLine({ ...reference, cols: 120, running: true, caret: TURN_FOOT_NOTE_CARETS.expanded });
+		expect(line).toBe(" ▾ 进行中 · 第 14 步 · 1m05s");
+		expect(
+			renderLine({ steps: 0, thinkSegments: 1, commMessages: 0, durationMs: 3_000, cols: 120, running: true }),
+		).toBe(" 进行中 · 3.0s");
+	});
+
+	it("keeps the tail of a long changed-file path readable", () => {
+		const path = "/private/tmp/claude-501/very-long-session-directory-name/scratchpad/shop.md";
+		const [, row] = new TurnFootNote({
+			...reference,
+			cols: 50,
+			fileChanges: [{ path, added: 1, removed: 1 }],
+		})
+			.render(50)
+			.map((line) => stripAnsi(line));
+		expect(row).toMatch(/^ {3}改动 {2}…\/.*shop\.md {2}\+1 −1$/);
+		expect(visibleWidth(row ?? "")).toBeLessThanOrEqual(50);
+	});
 });

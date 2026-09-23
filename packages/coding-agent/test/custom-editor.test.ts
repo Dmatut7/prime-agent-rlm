@@ -287,4 +287,47 @@ describe("CustomEditor", () => {
 
 		expect(editor.render(40)).toEqual(withoutCallback);
 	});
+
+	it("embeds key hints at the right end of the top rule", () => {
+		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager());
+		editor.getBorderHints = () => ["Ctrl+O 过程", "Ctrl+T 思考"];
+		const [top, , bottom] = editor.render(40);
+
+		expect(top).toBe(
+			`${"─".repeat(40 - 2 - visibleWidth(" Ctrl+O 过程 · Ctrl+T 思考 "))} Ctrl+O 过程 · Ctrl+T 思考 ──`,
+		);
+		expect(visibleWidth(top ?? "")).toBe(40);
+		expect(bottom).toBe("─".repeat(40));
+	});
+
+	it("drops hints whole from the end when the rule is too narrow", () => {
+		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager());
+		editor.getBorderHints = () => ["Ctrl+O 过程", "Ctrl+T 思考", "? 快捷键"];
+
+		const narrow = editor.render(24)[0] ?? "";
+		expect(narrow).toContain(" Ctrl+O 过程 ");
+		expect(narrow).not.toContain("思考");
+		expect(visibleWidth(narrow)).toBe(24);
+		expect(editor.render(10)[0]).toBe("─".repeat(10));
+	});
+
+	it("leaves a scroll indicator on the top rule instead of the hints", () => {
+		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager());
+		editor.getBorderHints = () => ["Ctrl+O 过程"];
+		editor.setText(Array.from({ length: 20 }, (_, index) => `line ${index}`).join("\n"));
+
+		const top = editor.render(40)[0] ?? "";
+		expect(top).toMatch(/^─── ↑ \d+ more/);
+		expect(top).not.toContain("Ctrl+O");
+	});
+
+	it("colors the default prompt prefix with the theme's command color", () => {
+		const editor = new CustomEditor(
+			fakeTui,
+			{ ...editorTheme, commandColor: (text) => `<accent>${text}</accent>` },
+			new KeybindingsManager(),
+		);
+		editor.setText("hi");
+		expect(editor.render(40)[1]).toContain("<accent> › </accent>hi");
+	});
 });

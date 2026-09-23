@@ -66,7 +66,7 @@ describe("edit summaries", () => {
 			{ path: "a.ts", added: 2, removed: 1 },
 			{ path: "b.ts", added: 3, removed: 4 },
 		]);
-		expect(stripAnsi(line)).toBe("2 files changed | +5 -5");
+		expect(stripAnsi(line)).toBe("改动 2 个文件 · +5 −5");
 	});
 
 	test("coalesces direct and IPython edits by file", () => {

@@ -40,7 +40,7 @@ export class TopBar implements Component {
 		// text on the terminal.
 		const nameWidth = visibleWidth(name);
 		const start = Math.max(0, Math.floor((safeWidth - nameWidth) / 2));
-		const line = `${" ".repeat(start)}${theme.fg("text", name)}`;
+		const line = `${" ".repeat(start)}${theme.fg("dim", name)}`;
 		return [truncateToWidth(line, safeWidth, "")];
 	}
 }

@@ -534,9 +534,9 @@ describe("ENG-4531 agent message UI", () => {
 
 		const rendered = stripAnsi(component.render(120).join("\n"));
 		const lines = rendered.split("\n").filter((line) => line.trim().length > 0);
+		// The step label names the send; its source stays out of the expanded view.
 		expect(lines).toEqual([
-			expect.stringContaining("python"),
-			expect.stringContaining("await agent_message.send"),
+			" ✓ 发消息",
 			expect.stringMatching(/^ ◆ Agent message sent · to parent Worker$/),
 			" ╰─ Continue with shard eight.",
 			"    Then report back.",

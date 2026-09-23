@@ -49,10 +49,14 @@ describe("adaptive TUI theme colors", () => {
 		}
 	});
 
+	it("frames the prompt with rules instead of a filled surface", () => {
+		expect(getEditorTheme().backgroundColor).toBeUndefined();
+	});
+
 	it("uses theme colors for editor chrome when the terminal background is unknown", () => {
 		const editorTheme = getEditorTheme();
 
-		expect(editorTheme.backgroundColor?.("x")).toBe(theme.bg("userMessageBg", "x"));
+		expect(theme.getEditorBackgroundColor()?.("x")).toBe(theme.bg("userMessageBg", "x"));
 		expect(editorTheme.borderColor("x")).toBe(theme.fg("borderMuted", "x"));
 	});
 
@@ -64,7 +68,7 @@ describe("adaptive TUI theme colors", () => {
 
 		const editorTheme = getEditorTheme();
 
-		expect(editorTheme.backgroundColor?.("x")).toBe(theme.bg("userMessageBg", "x"));
+		expect(theme.getEditorBackgroundColor()?.("x")).toBe(theme.bg("userMessageBg", "x"));
 		expect(editorTheme.borderColor("x")).toBe(theme.fg("borderMuted", "x"));
 	});
 
@@ -76,8 +80,8 @@ describe("adaptive TUI theme colors", () => {
 
 		const editorTheme = getEditorTheme();
 
-		expect(editorTheme.backgroundColor?.("x")).not.toBe(theme.bg("userMessageBg", "x"));
-		expect(editorTheme.backgroundColor?.("x")).toMatch(/\x1b\[48;2;\d+;\d+;\d+mx\x1b\[49m/);
+		expect(theme.getEditorBackgroundColor()?.("x")).not.toBe(theme.bg("userMessageBg", "x"));
+		expect(theme.getEditorBackgroundColor()?.("x")).toMatch(/\x1b\[48;2;\d+;\d+;\d+mx\x1b\[49m/);
 		expect(editorTheme.borderColor("x")).toBe(theme.fg("borderMuted", "x"));
 	});
 
@@ -89,7 +93,7 @@ describe("adaptive TUI theme colors", () => {
 
 		const editorTheme = getEditorTheme();
 
-		expect(editorTheme.backgroundColor?.("x")).toBe(theme.bg("userMessageBg", "x"));
+		expect(theme.getEditorBackgroundColor()?.("x")).toBe(theme.bg("userMessageBg", "x"));
 		expect(editorTheme.borderColor("x")).toBe(theme.fg("borderMuted", "x"));
 	});
 

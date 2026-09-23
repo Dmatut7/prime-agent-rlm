@@ -5,6 +5,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { renderRichDiff } from "../src/modes/interactive/components/diff.js";
 import { IPythonCellComponent } from "../src/modes/interactive/components/ipython-cell.js";
+import { setToolOutputFull, toolOutputFull } from "../src/modes/interactive/components/tool-output-budget.js";
 import { initTheme, preloadCodeHighlighter, theme } from "../src/modes/interactive/theme/theme.js";
 
 function stripAnsi(text: string): string {
@@ -58,12 +59,14 @@ describe("IPythonCellComponent diff rendering", () => {
 
 		expect(out).toContain("sample.py");
 		expect(out).not.toMatch(/edit sample\.py/);
-		expect(out).toMatch(/\+1\s+-1/);
+		expect(out).toMatch(/\+1\s+−1/);
 		expect(out).toMatch(/11 - .*gamma/);
 		expect(out).toMatch(/11 \+ .*GAMMA/);
 		expect(out).toMatch(/10 .*alpha/);
 		expect(out.split("\n").some((line) => /^\s*'?Edited sample\.py'?\s*$/.test(line.trim()))).toBe(false);
-		expect(out).toContain('await edit(path="sample.py", old_str="gamma", new_str="GAMMA")');
+		// The label names the edit; its source joins only in the full view.
+		expect(out.split("\n")[0]).toMatch(/^ ✓ 编辑 sample\.py\s+12ms $/);
+		expect(out).not.toContain('await edit(path="sample.py"');
 	});
 
 	it("shows diffs on collapsed cells when edit diffs are expanded", () => {
@@ -92,7 +95,8 @@ describe("IPythonCellComponent diff rendering", () => {
 
 		const expanded = renderCell({ ...state, expanded: true, editDiffsExpanded: false });
 		expect(expanded).not.toMatch(/11 - .*gamma/);
-		expect(expanded).toContain('print("edit-done-marker")');
+		expect(expanded).not.toContain('print("edit-done-marker")');
+		expect(expanded).toContain("unrelated stdout line");
 	});
 
 	it("renders diff rows as full-width colored blocks", () => {
@@ -125,15 +129,15 @@ describe("IPythonCellComponent diff rendering", () => {
 
 		const hidden = renderCell({ ...state, editDiffsExpanded: false }).split("\n");
 		const hiddenSummary = hidden.find((l) => l.includes("╰─ a.ts"));
-		expect(hiddenSummary).toBe("    ╰─ a.ts +1 -1");
+		expect(hiddenSummary).toBe("    ╰─ a.ts +1 −1");
 
 		const notLatest = renderCell({ ...state, editDiffsExpanded: false, showExpandHint: false }).split("\n");
-		expect(notLatest.find((l) => l.includes("╰─ a.ts"))).toBe("    ╰─ a.ts +1 -1");
+		expect(notLatest.find((l) => l.includes("╰─ a.ts"))).toBe("    ╰─ a.ts +1 −1");
 		expect(hidden.some((l) => /1 - .*x/.test(l))).toBe(false);
 
 		const shown = renderCell({ ...state, editDiffsExpanded: true }).split("\n");
 		const summary = shown.find((l) => l.includes("╰─ a.ts"));
-		expect(summary).toBe("    ╰─ a.ts +1 -1");
+		expect(summary).toBe("    ╰─ a.ts +1 −1");
 		const textColumn = (summary ?? "").indexOf("a.ts");
 		const removed = shown.find((l) => /1 - .*x/.test(l));
 		const added = shown.find((l) => /1 \+ .*X/.test(l));
@@ -191,7 +195,7 @@ describe("IPythonCellComponent diff rendering", () => {
 				expanded: false,
 				editDiffsExpanded: false,
 			});
-			expect(out).toContain("╰─ same.ts +1 -1");
+			expect(out).toContain("╰─ same.ts +1 −1");
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
@@ -230,7 +234,7 @@ describe("IPythonCellComponent diff rendering", () => {
 		expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
 		const summary = lines.map(stripAnsi).find((line) => line.includes("…"));
 		expect(summary).toBeDefined();
-		expect(summary).toMatch(/\+1 -1$/);
+		expect(summary).toMatch(/\+1 −1$/);
 	});
 
 	it("advertises the collapse key once per cell when diffs are expanded", () => {
@@ -326,14 +330,14 @@ describe("IPythonCellComponent diff rendering", () => {
 			argsComplete: true,
 			expanded: false,
 		});
-		expect(collapsed).toContain("╰─ big.py +1 -1");
+		expect(collapsed).toContain("╰─ big.py +1 −1");
 		// U6: no per-line expand hint.
 		expect(collapsed).not.toContain("展开");
 		expect(collapsed).not.toContain("old");
 		expect(collapsed).not.toContain("NEW");
 	});
 
-	it("hides edit source when collapsed and shows it when globally expanded", () => {
+	it("shows a labelled cell's source only in the full view, above its diff", () => {
 		const state = {
 			code: 'hidden_side_effect = "only in full source"\nawait edit(path="a.py", old_str="old", new_str="new")',
 			details: { status: "ok", diffs: [{ path: "a.py", oldStr: "old", newStr: "new", startLine: 1 }] },
@@ -342,15 +346,35 @@ describe("IPythonCellComponent diff rendering", () => {
 		};
 		const collapsed = renderCell({ ...state, expanded: false });
 		const expanded = renderCell({ ...state, expanded: true, editDiffsExpanded: true });
+		const previous = toolOutputFull();
+		setToolOutputFull(true);
+		let full: string;
+		try {
+			full = renderCell({ ...state, expanded: true, editDiffsExpanded: true });
+		} finally {
+			setToolOutputFull(previous);
+		}
 
 		expect(collapsed).not.toContain("hidden_side_effect");
-		expect(collapsed).toContain("a.py");
-		expect(expanded).toContain('hidden_side_effect = "only in full source"');
-		expect(expanded).toContain("a.py");
-		const expandedLines = expanded.split("\n");
-		expect(expandedLines.findIndex((line) => line.includes("hidden_side_effect ="))).toBeLessThan(
-			expandedLines.findIndex((line) => /╰─ a\.py \+1 -1/.test(line)),
+		expect(collapsed).toContain("编辑 a.py");
+		expect(expanded).not.toContain("hidden_side_effect");
+		expect(expanded).toMatch(/╰─ a\.py \+1 −1/);
+		expect(full).toContain('hidden_side_effect = "only in full source"');
+		const fullLines = full.split("\n");
+		expect(fullLines.findIndex((line) => line.includes("hidden_side_effect ="))).toBeLessThan(
+			fullLines.findIndex((line) => /╰─ a\.py \+1 −1/.test(line)),
 		);
+	});
+
+	it("shows the source of a cell its label cannot describe once expanded", () => {
+		const state = {
+			code: "total = sum(range(10))\nprint(total)",
+			details: { status: "ok", stdout: "45" },
+			executionStarted: true,
+			argsComplete: true,
+		};
+		expect(renderCell({ ...state, expanded: false })).not.toContain("sum(range(10))\n");
+		expect(renderCell({ ...state, expanded: true })).toContain("print(total)");
 	});
 
 	it("keeps non-edit cells collapsed to a single summary line", () => {
@@ -383,7 +407,7 @@ describe("IPythonCellComponent diff rendering", () => {
 			argsComplete: true,
 		});
 		expect(out.split("\n").filter((l) => l.includes("app.py")).length).toBe(1);
-		expect(out).toMatch(/app\.py\s+\+3\s+-3/);
+		expect(out).toMatch(/app\.py\s+\+3\s+−3/);
 		expect((out.match(/⋮/g) ?? []).length).toBe(2);
 	});
 
@@ -398,8 +422,9 @@ describe("IPythonCellComponent diff rendering", () => {
 		const collapsed = new IPythonCellComponent({ ...state, expanded: false }).render(80);
 		const expanded = new IPythonCellComponent({ ...state, expanded: true }).render(80);
 
-		expect(stripAnsi(collapsed[0])).toMatch(/^ ✓ python print\(55\) · 1 行输出 · 780\.0s$/);
-		expect(stripAnsi(expanded[0])).toMatch(/^ ✓ python print\(55\) · 1 行输出 · 780\.0s$/);
+		expect(stripAnsi(collapsed[0])).toMatch(/^ ✓ python print\(55\) {2,}1 行输出 · 780\.0s $/);
+		expect(visibleWidth(collapsed[0])).toBe(80);
+		expect(stripAnsi(expanded[0])).toBe(stripAnsi(collapsed[0]));
 		const upToHint = (line: string) => stripAnsi(line).replace(/· \([^·]*(展开|收起)\)$/, "");
 		expect(upToHint(expanded[0])).toBe(upToHint(collapsed[0]));
 

@@ -486,11 +486,13 @@ export class TurnSummaryComponent implements Component {
 			durationMs: this.turnState.turnDurationMs(),
 			cols: safeWidth,
 			summary: turnStepsSummary(this.turnState.steps),
+			running: !this.turnState.isTurnEnded,
 			// An open process block shows every diff itself; the rows are the closed view's stand-in.
 			fileChanges: this.turnState.processBlockExpanded ? [] : this.turnState.fileChanges,
 			// P3-2: the caret glyph — ▸ while every detail block is collapsed,
 			// ▾ once any of the three blocks is open (the wiring owns the state).
 			caret:
+				!this.turnState.isTurnEnded ||
 				this.turnState.thinkingBlockExpanded ||
 				this.turnState.processBlockExpanded ||
 				this.turnState.commsBlockExpanded

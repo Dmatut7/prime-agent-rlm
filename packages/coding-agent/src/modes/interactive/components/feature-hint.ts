@@ -2,7 +2,7 @@ import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/p
 import { theme } from "../theme/theme.js";
 
 // U6: the hint line starts with a chevron instead of a 提示： prefix.
-const LABEL = "›";
+const LABEL = "提示";
 const SHIMMER_RADIUS = 1;
 const SHIMMER_PAUSE_FRAMES = 14;
 

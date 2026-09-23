@@ -83,20 +83,21 @@ describe("UserMessageComponent", () => {
 			name: "wide and multi-code-point command graphemes",
 			message: "/命é令 arg **bold**",
 			commandName: "命é令",
-			expectedLines: ["", "/命é", "令", "arg", "bold", ""],
+			expectedLines: ["", "› /命é", "令", "arg", "bold", ""],
 		},
 		{
 			name: "width-three command graphemes atomically",
 			message: "/界ﾞx arg",
 			commandName: "界ﾞx",
-			expectedLines: ["", "/界ﾞ", "x", "arg", ""],
+			expectedLines: ["", "› /界ﾞ", "x", "arg", ""],
 		},
 	])("wraps $name at terminal width", ({ message, commandName, expectedLines }) => {
 		initTheme("dark");
-		const lines = new UserMessageComponent(message, undefined, (name) => name === commandName).render(8);
+		// 7 columns leave 4 for content beside the 3-column ` › ` marker.
+		const lines = new UserMessageComponent(message, undefined, (name) => name === commandName).render(7);
 		const plainLines = lines.map((line) => line.replace(/\x1b\[[0-9;]*m|\x1b\]133;[ABC]\x07/g, "").trim());
 
-		expect(lines.every((line) => visibleWidth(line) === 8)).toBe(true);
+		expect(lines.every((line) => visibleWidth(line) === 7)).toBe(true);
 		expect(plainLines).toEqual(expectedLines);
 	});
 

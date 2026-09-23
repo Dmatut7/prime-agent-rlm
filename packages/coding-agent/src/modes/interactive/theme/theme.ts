@@ -1361,8 +1361,8 @@ export function getSelectListTheme(): SelectListTheme {
 
 export function getEditorTheme(): EditorTheme {
 	return {
+		// The prompt is framed by two thin rules rather than a filled surface.
 		borderColor: (text: string) => theme.fg("borderMuted", text),
-		backgroundColor: theme.getEditorBackgroundColor(),
 		autocompleteBackgroundColor: (text: string) => theme.getPopupBackgroundColor()(text),
 		selectList: getSelectListTheme(),
 		commandColor: (text: string) => theme.fg("accent", text),

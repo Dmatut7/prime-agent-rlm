@@ -16,6 +16,8 @@ export interface CustomEditorOptions extends EditorOptions {
 	placeholder?: string;
 	placeholderColor?: (text: string) => string;
 	isArgumentCommand?: (name: string) => boolean;
+	/** Color of the key hints embedded in the top rule; defaults to the border color. */
+	hintColor?: (text: string) => string;
 }
 
 /**
@@ -28,6 +30,7 @@ export class CustomEditor extends Editor {
 	private placeholder: string | undefined;
 	private readonly placeholderColor: (text: string) => string;
 	private readonly isArgumentCommand: (name: string) => boolean;
+	private readonly hintColor: (text: string) => string;
 	private readonly argTokenHighlighter = new ArgTokenHighlighter();
 	public actionHandlers: Map<AppKeybinding, () => void> = new Map();
 
@@ -37,13 +40,15 @@ export class CustomEditor extends Editor {
 	public onPasteImage?: () => void;
 	public onMoveBelowPrompt?: () => boolean;
 	public onAgentsBack?: () => boolean;
+	/** Key hints embedded at the right end of the top rule; dropped whole from the end when they do not fit. */
+	public getBorderHints?: () => readonly string[];
 	/** When set, the returned line is rendered inside the top of the editor box. */
 	public getHeaderLine?: () => string | undefined;
 	/** Handler for extension-registered shortcuts. Returns true if handled. */
 	public onExtensionShortcut?: (data: string) => boolean;
 
 	constructor(tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager, options?: CustomEditorOptions) {
-		const promptPrefix = options?.promptPrefix ?? "> ";
+		const promptPrefix = options?.promptPrefix ?? " › ";
 		super(tui, theme, { ...options, promptPrefix });
 		this.keybindings = keybindings;
 		this.defaultPromptPrefix = promptPrefix;
@@ -51,6 +56,7 @@ export class CustomEditor extends Editor {
 		this.placeholder = options?.placeholder;
 		this.placeholderColor = options?.placeholderColor ?? ((text) => text);
 		this.isArgumentCommand = options?.isArgumentCommand ?? (() => false);
+		this.hintColor = options?.hintColor ?? ((text) => this.borderColor(text));
 	}
 
 	protected override getPromptPrefix(): string {
@@ -58,7 +64,10 @@ export class CustomEditor extends Editor {
 	}
 
 	protected override formatPromptPrefix(prefix: string): string {
-		return prefix.startsWith("!") ? this.borderColor(prefix) : prefix;
+		if (prefix.startsWith("!")) {
+			return this.borderColor(prefix);
+		}
+		return this.commandColor ? this.commandColor(prefix) : prefix;
 	}
 
 	protected override getHiddenTextPrefixLength(lineIndex: number, line: string): number {
@@ -154,6 +163,7 @@ export class CustomEditor extends Editor {
 		if (this.placeholder && this.getText().length === 0 && lines.length >= 2) {
 			lines = [lines[0]!, this.renderPlaceholderLine(width), ...lines.slice(2)];
 		}
+		lines = this.embedBorderHints(lines, width);
 		const headerLine = this.getHeaderLine?.();
 		if (headerLine !== undefined && lines.length >= 2) {
 			lines = [
@@ -162,6 +172,27 @@ export class CustomEditor extends Editor {
 				this.renderHeaderContentLine("", width),
 				...lines.slice(1),
 			];
+		}
+		return lines;
+	}
+
+	private embedBorderHints(lines: string[], width: number): string[] {
+		const top = lines[0];
+		const hints = this.getBorderHints?.() ?? [];
+		if (top === undefined || hints.length === 0 || this.backgroundColor !== undefined) {
+			return lines;
+		}
+		// Only a plain rule carries hints; a scroll indicator keeps the line.
+		if (!/^─+$/.test(top.replace(/\x1b\[[0-9;]*m/g, ""))) {
+			return lines;
+		}
+		for (let count = hints.length; count >= 1; count--) {
+			const label = ` ${hints.slice(0, count).join(" · ")} `;
+			const ruleWidth = width - visibleWidth(label) - 2;
+			if (ruleWidth >= 4) {
+				const line = `${this.borderColor("─".repeat(ruleWidth))}${this.hintColor(label)}${this.borderColor("──")}`;
+				return [line, ...lines.slice(1)];
+			}
 		}
 		return lines;
 	}

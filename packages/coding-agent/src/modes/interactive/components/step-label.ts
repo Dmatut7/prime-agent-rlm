@@ -40,6 +40,24 @@ const PYTHON_PATH_ASSIGN_PATTERN =
 const PYTHON_LIST_DIR_PATTERN = /\b(?:os\.listdir|os\.scandir|os\.walk|glob\.glob)\(\s*[rRfF]?["']([^"']*)["']/g;
 const PYTHON_PATH_LIST_PATTERN = /\bPath\(\s*[rRfF]?["']([^"']*)["']\s*\)\.(?:iterdir|glob|rglob)\(/g;
 const PYTHON_BASH_CALL_PATTERN = /\bbash\(\s*[rRfF]?("""|'''|"|')([\s\S]*?)\1/g;
+const PYTHON_STRING_ASSIGN_PATTERN = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[rRfF]?["']([^"'\n]+)["']\s*$/gm;
+const PYTHON_OPEN_VAR_PATTERN = /\bopen\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:,\s*(?:mode\s*=\s*)?["']([^"']*)["'])?/g;
+const PYTHON_EDIT_CALL_PATTERN =
+	/\bedit(?:\.run)?\(\s*(?:path\s*=\s*)?(?:[rRfF]?["']([^"']+)["']|([A-Za-z_][A-Za-z0-9_]*))/g;
+
+/** Harness calls a cell makes, in plain words. */
+const PYTHON_CALL_LABELS: ReadonlyArray<[RegExp, string]> = [
+	[/\bawait\s+rlm\(/g, "派子代理"],
+	[/\brlm\.(?:collect|list_subagents)\(/g, "查看子代理"],
+	[/\bagent_message\.send\(/g, "发消息"],
+	[/\battach_image(?:\.run)?\(/g, "看图"],
+	[/\b(?:bailian_search|websearch|exa_websearch)\.\w+\(/g, "联网搜索"],
+	[/\brlm\.harness\.(?:create|update)_memory\(/g, "记笔记"],
+];
+
+function looksLikePath(value: string): boolean {
+	return /[/\\]/.test(value) || /\.[A-Za-z0-9]{1,6}$/.test(value);
+}
 
 /** Effects a single step label joins at most. */
 const MAX_CELL_EFFECTS = 3;
@@ -56,9 +74,35 @@ interface PythonEffect {
 function pythonEffects(code: string): string[] {
 	const effects: PythonEffect[] = [];
 	const push = (index: number | undefined, label: string) => effects.push({ index: index ?? 0, label });
+	const stringVars = new Map<string, string>();
+	for (const match of code.matchAll(PYTHON_STRING_ASSIGN_PATTERN)) {
+		if (match[1] && match[2] && looksLikePath(match[2])) stringVars.set(match[1], match[2]);
+	}
+	const substituteVars = (text: string) =>
+		text.replace(/\{([^{}]+)\}/g, (_whole, expression: string) => {
+			for (const name of expression.match(/[A-Za-z_][A-Za-z0-9_]*/g) ?? []) {
+				const value = stringVars.get(name);
+				if (value) return pathTail(value);
+			}
+			return "…";
+		});
 	for (const match of code.matchAll(PYTHON_BASH_CALL_PATTERN)) {
-		const command = previewBashCommand(match[2] ?? "").text;
+		const command = previewBashCommand(substituteVars(match[2] ?? "")).text;
 		if (command) push(match.index, `运行 ${command}`);
+	}
+	for (const match of code.matchAll(PYTHON_OPEN_VAR_PATTERN)) {
+		const path = match[1] ? stringVars.get(match[1]) : undefined;
+		if (!path) continue;
+		push(match.index, `${/[wax+]/.test(match[2] ?? "") ? "写入" : "读取"} ${pathTail(path)}`);
+	}
+	for (const match of code.matchAll(PYTHON_EDIT_CALL_PATTERN)) {
+		const path = match[1] ?? (match[2] ? stringVars.get(match[2]) : undefined);
+		push(match.index, path ? `编辑 ${pathTail(path)}` : "编辑文件");
+	}
+	for (const [pattern, label] of PYTHON_CALL_LABELS) {
+		for (const match of code.matchAll(pattern)) {
+			push(match.index, label);
+		}
 	}
 	for (const match of code.matchAll(PYTHON_OPEN_PATTERN)) {
 		if (!match[1]) continue;
@@ -70,7 +114,7 @@ function pythonEffects(code: string): string[] {
 		pathIoAt.add((match.index ?? 0) + match[0].lastIndexOf("."));
 		push(match.index, `${match[2]?.startsWith("write") ? "写入" : "读取"} ${pathTail(match[1])}`);
 	}
-	const pathVars = new Map<string, string>();
+	const pathVars = new Map<string, string>(stringVars);
 	for (const match of code.matchAll(PYTHON_PATH_ASSIGN_PATTERN)) {
 		if (match[1] && match[2]) pathVars.set(match[1], match[2]);
 	}

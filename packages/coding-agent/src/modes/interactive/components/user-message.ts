@@ -5,6 +5,7 @@ import {
 	Markdown,
 	type MarkdownTheme,
 	type TableCellSelectionRegion,
+	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { builtinSlashCommandTakesArgument, parseSlashCommand } from "../../../core/slash-commands.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
@@ -41,6 +42,31 @@ class HighlightedMarkdown implements Component {
 	}
 }
 
+/** The user's turn marker: an accent `›` on the first line, a matching indent on the rest. */
+class MarkedLines implements Component {
+	constructor(private readonly child: HighlightedMarkdown) {}
+
+	render(width: number): string[] {
+		const marker = ` ${theme.fg("accent", "›")} `;
+		const indent = "   ";
+		const lines = this.child.render(Math.max(1, width - visibleWidth(indent)));
+		return lines.map((line, index) => `${index === 0 ? marker : indent}${line}`);
+	}
+
+	getSelectionRegions(): ReadonlyArray<TableCellSelectionRegion> {
+		return this.child.getSelectionRegions().map((region) => ({
+			...region,
+			col: region.col + 3,
+			tableLeft: region.tableLeft + 3,
+			tableRight: region.tableRight + 3,
+		}));
+	}
+
+	invalidate(): void {
+		this.child.invalidate();
+	}
+}
+
 export class UserMessageComponent extends Container {
 	private contentBox: Box;
 	private decoratedSource?: string[];
@@ -56,8 +82,10 @@ export class UserMessageComponent extends Container {
 		const commandEnd = command && isRecognizedSlashCommand(command.name) ? command.name.length + 1 : 0;
 		const includeBareSeparator =
 			command !== undefined && commandEnd > 0 && builtinSlashCommandTakesArgument(command.name);
-		this.contentBox = new Box(2, 1, (content: string) => theme.getUserMessageBackgroundColor()(content));
-		this.contentBox.addChild(new HighlightedMarkdown(text, markdownTheme, commandEnd, includeBareSeparator));
+		this.contentBox = new Box(0, 1, (content: string) => theme.getUserMessageBackgroundColor()(content));
+		this.contentBox.addChild(
+			new MarkedLines(new HighlightedMarkdown(text, markdownTheme, commandEnd, includeBareSeparator)),
+		);
 		this.addChild(this.contentBox);
 	}
 

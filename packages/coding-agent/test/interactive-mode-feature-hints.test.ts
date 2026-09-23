@@ -118,8 +118,8 @@ describe("InteractiveMode feature hints", () => {
 		expect(featureHintContainer.children).toHaveLength(1);
 		const lines = featureHintContainer.children[0]?.render(24) ?? [];
 		expect(lines).toHaveLength(2);
-		// U6: the hint line starts with a chevron, no 提示： prefix.
-		expect(stripAnsi(lines[0] ?? "")).toContain("›");
+		// The hint line starts with a 提示 label (the › chevron marks user turns), no 提示： colon.
+		expect(stripAnsi(lines[0] ?? "")).toContain("提示");
 		expect(stripAnsi(lines[0] ?? "")).not.toContain("提示：");
 		expect(lines[1]?.trim()).toBe("");
 		expect(visibleWidth(lines[0] ?? "")).toBeLessThanOrEqual(24);

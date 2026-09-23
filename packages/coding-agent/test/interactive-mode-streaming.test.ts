@@ -306,8 +306,8 @@ describe("InteractiveMode streaming events", () => {
 		await handleEvent.call(fakeThis, { type: "agent_end", messages: [] });
 		const recap = renderChat(fakeThis.recapContainer);
 		expect(recap).toContain("Recap: Updated files");
-		expect(recap).toContain("1 file changed | +1 -1");
-		expect(recap.indexOf("1 file changed")).toBeLessThan(recap.indexOf("Recap:"));
+		expect(recap).toContain("改动 1 个文件 · +1 −1");
+		expect(recap.indexOf("改动 1 个文件")).toBeLessThan(recap.indexOf("Recap:"));
 		expect(renderChat(fakeThis.chatContainer)).not.toContain("file changed");
 
 		const unchanged = createFakeInteractiveModeThis();
@@ -341,7 +341,7 @@ describe("InteractiveMode streaming events", () => {
 		fakeThis.agentRunFileChanges.set("/tmp/a.ts", { path: "a.ts", added: 1, removed: 1 });
 		const handleEvent = (InteractiveMode.prototype as unknown as { handleEvent: HandleEvent }).handleEvent;
 		await handleEvent.call(fakeThis, { type: "agent_end", messages: [] });
-		expect(renderChat(fakeThis.recapContainer)).toContain("1 file changed");
+		expect(renderChat(fakeThis.recapContainer)).toContain("改动 1 个文件");
 
 		await handleEvent.call(fakeThis, {
 			type: "message_start",

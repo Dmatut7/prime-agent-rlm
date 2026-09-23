@@ -80,8 +80,9 @@ describe("conversation click regions", () => {
 		expect(calls).toEqual([{ row: 0, col: 1 }]);
 	});
 
+	// Rule-framed prompt (no surface): no forced padding, so the text starts right after "! ".
 	test.each([
-		[8, 5],
+		[8, 7],
 		[0, 1],
 	])("editor col %i places the cursor at text col %i through header rows and hidden prefixes", (col, textCol) => {
 		const editor = new CustomEditor(mockTui, getEditorTheme(), new KeybindingsManager(), { promptPrefix: "> " });
