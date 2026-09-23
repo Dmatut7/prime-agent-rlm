@@ -723,4 +723,22 @@ describe("turn state for the process line", () => {
 			vi.useRealTimers();
 		}
 	});
+
+	it("keeps a live turn's clock ticking between settled steps until the turn ends", () => {
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(10_000);
+			const state = new TurnActivityState(10_000);
+			state.live = true;
+			state.addStep({ toolCallId: "t1", toolName: "bash", args: {}, status: "running" });
+			state.setStepStatus("t1", "done", 12_000);
+			vi.setSystemTime(30_000);
+			expect(state.turnDurationMs()).toBe(20_000);
+			state.markTurnEnded(31_000);
+			vi.setSystemTime(60_000);
+			expect(state.turnDurationMs()).toBe(21_000);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
 });

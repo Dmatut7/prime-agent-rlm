@@ -3559,6 +3559,7 @@ export class InteractiveMode {
 			return;
 		}
 		const state = new TurnActivityState(this.workingStartedAt ?? Date.now());
+		state.live = true;
 		const summary = new TurnSummaryComponent(state);
 		summary.setExpanded(this.toolOutputExpanded);
 		// TUI v4: the live turn head renders the one-line footnote in quiet mode.
@@ -3781,7 +3782,7 @@ export class InteractiveMode {
 	private createWorkingLoader(): Loader {
 		return new Loader(
 			this.ui,
-			(spinner) => ` ${theme.fg("accent", spinner)}`,
+			(spinner) => theme.fg("accent", spinner),
 			(text) => theme.fg("muted", text),
 			this.getWorkingLoaderMessage(),
 			this.workingIndicatorOptions,
@@ -7771,6 +7772,7 @@ export class InteractiveMode {
 			// running until agent_end stamps it.
 			this.currentTurnState = replayTurnState;
 			this.currentTurnSummary = replayTurnSummary;
+			replayTurnState.live = true;
 		} else {
 			// The last replayed turn has no following user prompt; freeze its clock.
 			replayTurnState?.markTurnEnded(Number(messagesToRender.at(-1)?.timestamp) || Date.now());

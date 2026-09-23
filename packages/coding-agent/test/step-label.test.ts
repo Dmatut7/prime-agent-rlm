@@ -65,6 +65,13 @@ describe("turnStepLabel", () => {
 	});
 });
 
+describe("turnStepLabel template holes", () => {
+	it("never shows raw f-string holes", () => {
+		const code = "for sha in shas:\n    open(f'/tmp/{sha}.diff', 'w').write(out)";
+		expect(turnStepLabel({ toolName: "ipython", args: { code } })).toBe("写入 ….diff");
+	});
+});
+
 describe("turnStepsSummary", () => {
 	it("groups labels by verb in first-seen order, deduped by toolCallId", () => {
 		const steps = [

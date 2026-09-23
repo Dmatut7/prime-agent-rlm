@@ -72,6 +72,9 @@ export class TurnActivityState {
 		this.startedAt = startedAt;
 	}
 
+	/** Set on the live run's turn: its clock ticks until agent_end stamps it. */
+	live = false;
+
 	/** Files the turn changed, keyed by path; the collapsed process line lists them. */
 	private readonly changedFiles = new Map<string, FileChangeSummary>();
 
@@ -244,12 +247,19 @@ export class TurnActivityState {
 	turnDurationMs(): number {
 		// A running turn's clock keeps ticking; a settled tool turn freezes on its
 		// last settled step, a thinking-only turn on the turn-end stamp.
-		const running = this.steps.length > 0 ? !this.isSettled : this.turnEndedAt === undefined;
+		// A live turn keeps ticking between steps too (the model thinks there);
+		// only the end stamp freezes it.
+		const running = this.turnEndedAt === undefined && (this.steps.length === 0 || !this.isSettled || this.live);
+		// A live turn ends on its real end stamp, so the clock never jumps back;
+		// a replayed one freezes on its last settled step (its end stamp is the
+		// next prompt's time, which includes idle).
 		const end = running
 			? Date.now()
-			: this.steps.length > 0
-				? (this.lastSettledAt ?? this.turnEndedAt ?? Date.now())
-				: (this.turnEndedAt ?? Date.now());
+			: this.live && this.turnEndedAt !== undefined
+				? this.turnEndedAt
+				: this.steps.length > 0
+					? (this.lastSettledAt ?? this.turnEndedAt ?? Date.now())
+					: (this.turnEndedAt ?? Date.now());
 		return Math.max(0, end - this.startedAt);
 	}
 

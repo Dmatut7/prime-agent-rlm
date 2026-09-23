@@ -200,7 +200,16 @@ function pathTail(path: string): string {
  * `读取 footer.ts`, `写入 footer.ts`. Python cells without a recognizable
  * effect read as `python`.
  */
+/** Unresolved f-string holes read as an ellipsis, never as raw `{expr}` code. */
+function withoutTemplateHoles(label: string): string {
+	return label.replace(/\{[^{}]*\}/g, "…");
+}
+
 export function turnStepLabel(step: StepLabelInput): string {
+	return withoutTemplateHoles(rawStepLabel(step));
+}
+
+function rawStepLabel(step: StepLabelInput): string {
 	if (step.toolName === "ipython") {
 		const code = argString(step.args, "code");
 		if (!code) {
