@@ -4899,6 +4899,92 @@ describe("InteractiveMode.setToolsExpanded", () => {
 		expect(summary!.state.commsBlockExpanded).toBe(true);
 	});
 
+	test("quiet Esc folds the last-opened block first, backwards (T8)", () => {
+		const state = new TurnActivityState(1_000);
+		for (let i = 1; i <= 3; i++) {
+			state.addStep({ toolCallId: `t${i}`, toolName: "bash", args: {}, status: "done" });
+		}
+		state.markTurnEnded(1_500);
+		const summary = new TurnSummaryComponent(state);
+		summary.setQuiet(true);
+		const chatContainer = new Container();
+		chatContainer.addChild(summary);
+		const fakeThis = createExpansionFakeThis(chatContainer.children);
+		fakeThis.uiServices = { settingsManager: { getProcessMode: () => "quiet" as const } };
+		fakeThis.showStatus = vi.fn();
+		fakeThis.editor = { getText: () => "", setText: vi.fn() };
+		fakeThis.hasInterruptibleWork = () => false;
+		fakeThis.interruptOrClearInput = vi.fn();
+		fakeThis.armEscapeRepeat = vi.fn();
+		fakeThis.clearEscapeRepeat = vi.fn();
+		fakeThis.takeEscapeRepeatAction = () => undefined;
+		fakeThis.escapeRepeatAction = undefined;
+		fakeThis.sideQuestionEvent = undefined;
+
+		// Open thinking, then process, then comms - the open order records them.
+		fakeThis.toggleThinkingBlockVisibility();
+		fakeThis.toggleToolOutputExpansion();
+		fakeThis.toggleAgentMessageExpansion();
+		expect(state.thinkingBlockExpanded).toBe(true);
+		expect(state.processBlockExpanded).toBe(true);
+		expect(state.commsBlockExpanded).toBe(true);
+
+		// Esc closes the LAST-opened block (comms) first; the others stay.
+		fakeThis.handleEscape();
+		expect(state.commsBlockExpanded).toBe(false);
+		expect(state.processBlockExpanded).toBe(true);
+		expect(state.thinkingBlockExpanded).toBe(true);
+
+		// Next Esc folds the process block, then the thinking block.
+		fakeThis.handleEscape();
+		expect(state.processBlockExpanded).toBe(false);
+		expect(state.thinkingBlockExpanded).toBe(true);
+		fakeThis.handleEscape();
+		expect(state.thinkingBlockExpanded).toBe(false);
+
+		// Nothing left to fold: Esc falls through to the pre-v4 behavior.
+		expect(fakeThis.interruptOrClearInput).not.toHaveBeenCalled();
+		fakeThis.handleEscape();
+		expect(fakeThis.interruptOrClearInput).toHaveBeenCalledOnce();
+	});
+
+	test("quiet Esc never hijacks a running turn or a non-empty editor (T8)", () => {
+		const state = new TurnActivityState(1_000);
+		state.addStep({ toolCallId: "t1", toolName: "bash", args: {}, status: "done" });
+		state.markTurnEnded(1_500);
+		const summary = new TurnSummaryComponent(state);
+		summary.setQuiet(true);
+		const chatContainer = new Container();
+		chatContainer.addChild(summary);
+		const fakeThis = createExpansionFakeThis(chatContainer.children);
+		fakeThis.uiServices = { settingsManager: { getProcessMode: () => "quiet" as const } };
+		fakeThis.showStatus = vi.fn();
+		fakeThis.interruptOrClearInput = vi.fn();
+		fakeThis.armEscapeRepeat = vi.fn();
+		fakeThis.clearEscapeRepeat = vi.fn();
+		fakeThis.takeEscapeRepeatAction = () => undefined;
+		fakeThis.escapeRepeatAction = undefined;
+		fakeThis.sideQuestionEvent = undefined;
+
+		fakeThis.toggleThinkingBlockVisibility();
+		expect(state.thinkingBlockExpanded).toBe(true);
+
+		// A non-empty editor: Esc keeps its clear semantics.
+		fakeThis.editor = { getText: () => "draft text", setText: vi.fn() };
+		fakeThis.hasInterruptibleWork = () => false;
+		fakeThis.handleEscape();
+		expect(state.thinkingBlockExpanded).toBe(true);
+		expect(fakeThis.interruptOrClearInput).toHaveBeenCalledOnce();
+
+		// Running work: Esc keeps its interrupt semantics.
+		fakeThis.editor = { getText: () => "", setText: vi.fn() };
+		fakeThis.hasInterruptibleWork = () => true;
+		fakeThis.interruptOrClearInput.mockClear();
+		fakeThis.handleEscape();
+		expect(state.thinkingBlockExpanded).toBe(true);
+		expect(fakeThis.interruptOrClearInput).toHaveBeenCalledOnce();
+	});
+
 	test("quiet Ctrl+O cycles closed → key steps → all steps (T6)", () => {
 		const state = new TurnActivityState(1_000);
 		for (let i = 1; i <= 14; i++) {

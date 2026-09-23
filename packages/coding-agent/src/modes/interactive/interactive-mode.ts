@@ -7526,6 +7526,9 @@ export class InteractiveMode {
 			limitTranscript?: boolean;
 		} = {},
 	): Promise<void> {
+		// T8: a rebuild re-creates every summary component; the open order
+		// cannot reference the dead ones.
+		this.processBlockOpenOrder = [];
 		this.resetPendingToolState();
 		const transcriptMessages = this.orderMessagesForTranscript(sessionContext.messages);
 		const messagesToRender = options.limitTranscript ? initialRenderMessages(transcriptMessages) : transcriptMessages;
@@ -7855,6 +7858,19 @@ export class InteractiveMode {
 		}
 		if (action === "clear") {
 			this.clearInputBar();
+			return;
+		}
+
+		// TUI v4 T8: in the quiet conversation, with an empty editor and no
+		// running work, Esc walks the open order backwards - the last-opened
+		// process block folds first. The interrupt/clear semantics stay ahead
+		// of this: a running turn or a non-empty editor never reaches here.
+		if (
+			this.settingsManager.getProcessMode() === "quiet" &&
+			this.editor.getText().length === 0 &&
+			!this.hasInterruptibleWork() &&
+			this.closeLastOpenedProcessBlock()
+		) {
 			return;
 		}
 
@@ -8681,6 +8697,50 @@ export class InteractiveMode {
 	 * viewport-bottom turn in the common case; a session with no turns yet
 	 * returns undefined and callers fall back to the global lanes).
 	 */
+	/**
+	 * TUI v4 T8: the open order of the quiet conversation's process blocks.
+	 * Esc (editor empty, nothing running) walks this backwards - the
+	 * last-opened block folds first, 块→尾注→turn 逐层收.
+	 */
+	private processBlockOpenOrder?: Array<{
+		summary: TurnSummaryComponent;
+		lane: "thinking" | "process" | "comms";
+	}>;
+
+	private recordProcessBlockOpen(summary: TurnSummaryComponent, lane: "thinking" | "process" | "comms"): void {
+		if (!this.processBlockOpenOrder) {
+			this.processBlockOpenOrder = [];
+		}
+		this.processBlockOpenOrder = this.processBlockOpenOrder.filter(
+			(entry) => !(entry.summary === summary && entry.lane === lane),
+		);
+		this.processBlockOpenOrder.push({ summary, lane });
+	}
+
+	private forgetProcessBlock(summary: TurnSummaryComponent, lane: "thinking" | "process" | "comms"): void {
+		this.processBlockOpenOrder = (this.processBlockOpenOrder ?? []).filter(
+			(entry) => !(entry.summary === summary && entry.lane === lane),
+		);
+	}
+
+	/** T8: fold the last-opened block; returns false when nothing is open. */
+	private closeLastOpenedProcessBlock(): boolean {
+		const entry = (this.processBlockOpenOrder ?? []).at(-1);
+		if (!entry || !this.processBlockOpenOrder) {
+			return false;
+		}
+		this.processBlockOpenOrder.pop();
+		if (entry.lane === "thinking") {
+			entry.summary.state.thinkingExpanded = false;
+		} else if (entry.lane === "process") {
+			entry.summary.setExpanded(false);
+		} else {
+			entry.summary.state.agentMessagesExpanded = false;
+		}
+		this.applyTurnExpansion(entry.summary);
+		return true;
+	}
+
 	private latestTurnSummary(): TurnSummaryComponent | undefined {
 		const children = this.chatContainer.children;
 		for (let i = children.length - 1; i >= 0; i--) {
@@ -8735,10 +8795,12 @@ export class InteractiveMode {
 					if (summary.state.isCollapsed) {
 						summary.state.setProcessKeySteps(true);
 						summary.setExpanded(true);
+						this.recordProcessBlockOpen(summary, "process");
 					} else if (summary.state.processKeyStepsView) {
 						summary.state.setProcessKeySteps(false);
 					} else {
 						summary.setExpanded(false);
+						this.forgetProcessBlock(summary, "process");
 					}
 				} else {
 					const next = summary.state.isCollapsed;
@@ -8781,6 +8843,12 @@ export class InteractiveMode {
 			if (summary) {
 				const next = !summary.state.agentMessagesExpanded;
 				summary.state.agentMessagesExpanded = next;
+				// T8: the open order records which block opened last.
+				if (next) {
+					this.recordProcessBlockOpen(summary, "comms");
+				} else {
+					this.forgetProcessBlock(summary, "comms");
+				}
 				this.applyTurnExpansion(summary);
 				return;
 			}
@@ -8876,6 +8944,12 @@ export class InteractiveMode {
 			if (summary) {
 				const next = !summary.state.thinkingExpanded;
 				summary.state.thinkingExpanded = next;
+				// T8: the open order records which block opened last.
+				if (next) {
+					this.recordProcessBlockOpen(summary, "thinking");
+				} else {
+					this.forgetProcessBlock(summary, "thinking");
+				}
 				this.applyTurnExpansion(summary);
 				this.showStatus(`思考块: ${next ? "展开" : "收起"}${next ? "（最近一轮）" : ""}`);
 				return;
