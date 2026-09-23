@@ -1,4 +1,10 @@
-import { type Component, type Keybinding, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import {
+	type ClickRegion,
+	type Component,
+	type Keybinding,
+	truncateToWidth,
+	visibleWidth,
+} from "@earendil-works/pi-tui";
 import { theme } from "../theme/theme.js";
 import { keyText } from "./keybinding-hints.js";
 
@@ -43,7 +49,18 @@ export interface TurnFootNoteProps {
 	showKeys?: boolean;
 	/** Optional caret glyph (▸/▾) rendered in the line's indent column; the wiring owns the state. Default: none. */
 	caret?: string;
+	/**
+	 * Optional segment-click handler (T12): fired with the lane id when a
+	 * stats segment (`14 步 [O]` etc., hints or not) is clicked. Zero-value
+	 * segments never render and so never fire.
+	 */
+	onSegmentClick?: (segment: TurnFootNoteSegment) => void;
+	/** Optional caret-click handler - the caret glyph's own click lane. */
+	onCaretClick?: () => void;
 }
+
+/** The footnote's clickable stats segments (T12 component side). */
+export type TurnFootNoteSegment = "steps" | "think" | "comm";
 
 /** One dot-separated piece of the footnote line. */
 interface FootNoteSegment {
@@ -51,6 +68,8 @@ interface FootNoteSegment {
 	text: string;
 	/** Key hint suffix (wide form only), e.g. ` [O]`. */
 	hint?: string;
+	/** Which stats lane the piece belongs to, when it is clickable. */
+	clickTarget?: TurnFootNoteSegment;
 }
 
 /** Which app keybinding opens each footnote detail block (R2.2: no hardcoded key letters). */
@@ -109,13 +128,28 @@ export function turnFootNoteDurationText(durationMs: number, narrow: boolean): s
 	return narrow ? `干了 ${hours}时${minutes}分` : `干了 ${hours} 时 ${minutes} 分`;
 }
 
+/** A clickable stats span within the body, in body coordinates (after the indent column). */
+interface FootNoteSpan {
+	segment: TurnFootNoteSegment;
+	/** Zero-based visible column of the span's left edge within the body. */
+	col: number;
+	/** Visible width in columns. */
+	width: number;
+}
+
 export class TurnFootNote implements Component {
 	private props: TurnFootNoteProps;
 	private cachedCols: number | undefined;
 	private cachedLines: string[] | undefined;
+	private clickRegions: ClickRegion[] = [];
 
 	constructor(props: TurnFootNoteProps) {
 		this.props = props;
+	}
+
+	/** Click regions from the last render() (T12): one per rendered stats segment, plus the caret. */
+	getClickRegions(): ReadonlyArray<ClickRegion> {
+		return this.clickRegions;
 	}
 
 	/** Replace the stats (and columns/key flags); the next render recomputes the line. */
@@ -145,6 +179,7 @@ export class TurnFootNote implements Component {
 	private renderLine(cols: number): string[] {
 		const { steps, thinkSegments, commMessages, durationMs } = this.props;
 		if (steps <= 0 && thinkSegments <= 0 && commMessages <= 0) {
+			this.clickRegions = [];
 			return [];
 		}
 		const narrow = cols < TURN_FOOT_NOTE_NARROW_COLS;
@@ -162,10 +197,39 @@ export class TurnFootNote implements Component {
 		if (indentWidth >= cols) {
 			// Degenerate terminal: the indent column alone fills the width -
 			// keep the line bounded instead of overflowing.
-			return [theme.fg("dim", truncateToWidth(indent, cols, "…"))];
+			const line = theme.fg("dim", truncateToWidth(indent, cols, "…"));
+			// visibleWidth counts ANSI as zero, so this is the truncated caret width.
+			this.clickRegions = this.caretRegions(visibleWidth(line), caret);
+			return [line];
 		}
 		const styledIndent = caret !== "" ? theme.fg("dim", caret) : " ";
-		return [styledIndent + this.fitSegments(segments, narrow, cols - indentWidth)];
+		const fitted = this.fitSegments(segments, narrow, cols - indentWidth);
+		this.clickRegions = [...this.caretRegions(indentWidth, caret), ...this.segmentRegions(fitted.spans, indentWidth)];
+		return [styledIndent + fitted.line];
+	}
+
+	/** The caret's click lane, when the wiring passed both a glyph and a handler. */
+	private caretRegions(width: number, caret: string): ClickRegion[] {
+		const onCaretClick = this.props.onCaretClick;
+		if (!onCaretClick || caret === "" || width <= 0) {
+			return [];
+		}
+		return [{ line: 0, col: 0, width, height: 1, onClick: () => onCaretClick() }];
+	}
+
+	/** One region per rendered (and not fully truncated-away) stats segment. */
+	private segmentRegions(spans: FootNoteSpan[], indentWidth: number): ClickRegion[] {
+		const onSegmentClick = this.props.onSegmentClick;
+		if (!onSegmentClick) {
+			return [];
+		}
+		return spans.map((span) => ({
+			line: 0,
+			col: indentWidth + span.col,
+			width: span.width,
+			height: 1,
+			onClick: () => onSegmentClick(span.segment),
+		}));
 	}
 
 	/**
@@ -182,18 +246,24 @@ export class TurnFootNote implements Component {
 	): FootNoteSegment[] {
 		const segments: FootNoteSegment[] = [{ text: turnFootNoteDurationText(durationMs, narrow) }];
 		if (steps > 0) {
-			segments.push({ text: narrow ? `${steps}步` : `${steps} 步`, hint: segmentHint(SEGMENT_KEYS.steps, " [O]") });
+			segments.push({
+				text: narrow ? `${steps}步` : `${steps} 步`,
+				hint: segmentHint(SEGMENT_KEYS.steps, " [O]"),
+				clickTarget: "steps",
+			});
 		}
 		if (thinkSegments > 0) {
 			segments.push({
 				text: narrow ? `${thinkSegments}想` : `想 ${thinkSegments} 段`,
 				hint: segmentHint(SEGMENT_KEYS.think, " [T]"),
+				clickTarget: "think",
 			});
 		}
 		if (commMessages > 0) {
 			segments.push({
 				text: narrow ? `${commMessages}讯` : `→ 通讯 ${commMessages} 条`,
 				hint: segmentHint(SEGMENT_KEYS.comm, " [P]"),
+				clickTarget: "comm",
 			});
 		}
 		return segments;
@@ -203,21 +273,60 @@ export class TurnFootNote implements Component {
 	 * Fit the segments into the budget: keep the key hints if the full line
 	 * fits, drop every hint if the bare line fits, otherwise truncate the bare
 	 * line from the right with an ellipsis. The width math is display columns
-	 * (CJK = 2), never character counts.
+	 * (CJK = 2), never character counts. Alongside the styled line the
+	 * clickable stats spans come back in body coordinates, clipped to the
+	 * budget - a segment cut away entirely has no span.
 	 */
-	private fitSegments(segments: FootNoteSegment[], narrow: boolean, budget: number): string {
+	private fitSegments(
+		segments: FootNoteSegment[],
+		narrow: boolean,
+		budget: number,
+	): { line: string; spans: FootNoteSpan[] } {
 		const joiner = " · ";
 		const showKeys = this.props.showKeys !== false && !narrow;
-		const plain = segments.map((s) => s.text + (showKeys && s.hint ? s.hint : "")).join(joiner);
+		const pieces = segments.map((s) => s.text + (showKeys && s.hint ? s.hint : ""));
+		const plain = pieces.join(joiner);
 		if (visibleWidth(plain) <= budget) {
-			return segments
+			const line = segments
 				.map((s) => theme.fg("dim", s.text) + (showKeys && s.hint ? keyHintFg(s.hint) : ""))
 				.join(theme.fg("dim", joiner));
+			return { line, spans: this.segmentSpans(segments, pieces, budget) };
 		}
-		const bare = segments.map((s) => s.text).join(joiner);
+		const barePieces = segments.map((s) => s.text);
+		const bare = barePieces.join(joiner);
 		if (visibleWidth(bare) > budget) {
-			return theme.fg("dim", truncateToWidth(bare, budget, "…"));
+			return {
+				line: theme.fg("dim", truncateToWidth(bare, budget, "…")),
+				spans: this.segmentSpans(segments, barePieces, budget),
+			};
 		}
-		return theme.fg("dim", bare);
+		return { line: theme.fg("dim", bare), spans: this.segmentSpans(segments, barePieces, budget) };
+	}
+
+	/**
+	 * Span math in plain-text coordinates (ANSI is zero-width, so plain
+	 * columns map 1:1 onto the styled line): walk the pieces with the joiner
+	 * widths, clip each clickable segment to the budget.
+	 */
+	private segmentSpans(segments: FootNoteSegment[], pieces: string[], budget: number): FootNoteSpan[] {
+		const joinerWidth = 3;
+		const spans: FootNoteSpan[] = [];
+		let cursor = 0;
+		for (let index = 0; index < segments.length; index++) {
+			if (index > 0) {
+				cursor += joinerWidth;
+			}
+			const segment = segments[index];
+			const width = visibleWidth(pieces[index] ?? "");
+			if (segment?.clickTarget && width > 0) {
+				const start = Math.min(cursor, budget);
+				const end = Math.min(cursor + width, budget);
+				if (end > start) {
+					spans.push({ segment: segment.clickTarget, col: start, width: end - start });
+				}
+			}
+			cursor += width;
+		}
+		return spans;
 	}
 }

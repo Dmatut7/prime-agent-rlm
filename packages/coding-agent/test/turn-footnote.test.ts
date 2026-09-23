@@ -1,6 +1,6 @@
 import { KeybindingsManager as PiKeybindingsManager, setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager as AppKeybindingsManager } from "../src/core/keybindings.js";
 import {
 	TURN_FOOT_NOTE_CARETS,
@@ -25,6 +25,11 @@ const NARROW_LINE = ` ${BODY_NARROW}`;
 function renderLine(props: TurnFootNoteProps): string {
 	const note = new TurnFootNote(props);
 	return note.render(200).map(stripAnsi).join("\n");
+}
+
+/** Visible-column offset of a substring within a (stripped) line. */
+function columnOf(line: string, substr: string): number {
+	return visibleWidth(line.slice(0, line.indexOf(substr)));
 }
 
 describe("turn footnote (TUI v4 T2b)", () => {
@@ -197,6 +202,136 @@ describe("turn footnote (TUI v4 T2b)", () => {
 		);
 		expect(line).toBe(" …");
 		expect(visibleWidth(line)).toBeLessThanOrEqual(3);
+	});
+
+	it("registers one click region per rendered stats segment, positions exact (T12)", () => {
+		const onSegmentClick = vi.fn();
+		const note = new TurnFootNote({ ...reference, cols: 120, onSegmentClick });
+		const lines = note.render(120);
+		const line = stripAnsi(lines[0] ?? "");
+		const regions = note.getClickRegions();
+		expect(regions).toHaveLength(3);
+		// Region order follows the line: steps, think, comm; each covers its
+		// stats text plus key hint, at the exact visible columns.
+		const pieces = ["14 步 [O]", "想 7 段 [T]", "→ 通讯 2 条 [P]"];
+		for (let index = 0; index < 3; index++) {
+			const region = regions[index];
+			expect(region?.line).toBe(0);
+			expect(region?.height).toBe(1);
+			expect(region?.col).toBe(columnOf(line, pieces[index]!));
+			expect(region?.width).toBe(visibleWidth(pieces[index]!));
+			region?.onClick({ row: 0, col: 0 });
+		}
+		expect(onSegmentClick.mock.calls.map((call) => call[0])).toEqual(["steps", "think", "comm"]);
+	});
+
+	it("registers no click regions without callbacks, and zero-value segments have none (T12)", () => {
+		const plain = new TurnFootNote({ ...reference, cols: 120 });
+		plain.render(120);
+		expect(plain.getClickRegions()).toEqual([]);
+		// Unrendered (zero-value) segments stay absent: a steps-less turn
+		// keeps only the thinking and comm lanes.
+		const onSegmentClick = vi.fn();
+		const partial = new TurnFootNote({
+			steps: 0,
+			thinkSegments: 7,
+			commMessages: 2,
+			durationMs: 45_000,
+			cols: 120,
+			onSegmentClick,
+		});
+		partial.render(120);
+		const regions = partial.getClickRegions();
+		expect(regions).toHaveLength(2);
+		expect(regions[0]?.width).toBe(visibleWidth("想 7 段 [T]"));
+		regions[0]?.onClick({ row: 0, col: 0 });
+		expect(onSegmentClick).toHaveBeenCalledWith("think");
+		regions[1]?.onClick({ row: 0, col: 0 });
+		expect(onSegmentClick).toHaveBeenLastCalledWith("comm");
+	});
+
+	it("gives the caret its own click lane and shifts the segment columns (T12)", () => {
+		const onCaretClick = vi.fn();
+		const onSegmentClick = vi.fn();
+		const note = new TurnFootNote({
+			...reference,
+			cols: 120,
+			caret: TURN_FOOT_NOTE_CARETS.collapsed,
+			onCaretClick,
+			onSegmentClick,
+		});
+		const line = stripAnsi(note.render(120)[0] ?? "");
+		const regions = note.getClickRegions();
+		// The caret region comes first, over the indent column.
+		expect(regions).toHaveLength(4);
+		expect(regions[0]?.col).toBe(0);
+		expect(regions[0]?.width).toBe(1);
+		regions[0]?.onClick({ row: 0, col: 0 });
+		expect(onCaretClick).toHaveBeenCalledTimes(1);
+		expect(onSegmentClick).not.toHaveBeenCalled();
+		// The segment columns shift right by the caret's column.
+		expect(regions[1]?.col).toBe(columnOf(line, "14 步 [O]"));
+		expect(regions[2]?.col).toBe(columnOf(line, "想 7 段 [T]"));
+		expect(regions[3]?.col).toBe(columnOf(line, "→ 通讯 2 条 [P]"));
+		// No caret, only a caret handler: nothing to click.
+		const noCaret = new TurnFootNote({ ...reference, cols: 120, onCaretClick: vi.fn() });
+		noCaret.render(120);
+		expect(noCaret.getClickRegions()).toEqual([]);
+	});
+
+	it("keeps the regions accurate through the overflow cascade (T12)", () => {
+		// Keys stripped (bare body): the regions follow the bare pieces.
+		const max = Number.MAX_SAFE_INTEGER;
+		const stripped = new TurnFootNote({
+			steps: max,
+			thinkSegments: max,
+			commMessages: max,
+			durationMs: 4_020_000,
+			cols: 102,
+			onSegmentClick: vi.fn(),
+		});
+		const strippedLine = stripAnsi(stripped.render(102)[0] ?? "");
+		const strippedRegions = stripped.getClickRegions();
+		expect(strippedRegions).toHaveLength(3);
+		expect(strippedRegions[0]?.col).toBe(columnOf(strippedLine, `${max} 步`));
+		expect(strippedRegions[0]?.width).toBe(visibleWidth(`${max} 步`));
+		expect(strippedRegions[2]?.col).toBe(columnOf(strippedLine, `→ 通讯 ${max} 条`));
+		// Hard truncation: the segment cut away entirely has no region, and
+		// every region stays inside the width budget.
+		const truncated = new TurnFootNote({ ...reference, cols: 27, onSegmentClick: vi.fn() });
+		const truncatedLine = stripAnsi(truncated.render(27)[0] ?? "");
+		const truncatedRegions = truncated.getClickRegions();
+		expect(truncatedRegions).toHaveLength(2);
+		expect(truncatedRegions[0]?.col).toBe(columnOf(truncatedLine, "14步"));
+		expect(truncatedRegions[0]?.width).toBe(visibleWidth("14步"));
+		expect(truncatedRegions[1]?.col).toBe(columnOf(truncatedLine, "7想"));
+		expect(truncatedRegions[1]?.width).toBe(visibleWidth("7想"));
+		for (const region of truncatedRegions) {
+			expect(region.col + region.width).toBeLessThanOrEqual(27);
+		}
+		// 空态: nothing clickable.
+		const empty = new TurnFootNote({
+			steps: 0,
+			thinkSegments: 2,
+			commMessages: 0,
+			durationMs: 0,
+			cols: 120,
+			onSegmentClick: vi.fn(),
+		});
+		empty.render(120);
+		expect(empty.getClickRegions()).toEqual([]);
+		// Degenerate width: the caret lane alone, bounded.
+		const tiny = new TurnFootNote({
+			...reference,
+			cols: 1,
+			caret: "▸",
+			onCaretClick: vi.fn(),
+			onSegmentClick: vi.fn(),
+		});
+		tiny.render(1);
+		const tinyRegions = tiny.getClickRegions();
+		expect(tinyRegions).toHaveLength(1);
+		expect(tinyRegions[0]?.width).toBeLessThanOrEqual(1);
 	});
 
 	it("recomputes on update() and falls back to the render width when cols is unset", () => {
