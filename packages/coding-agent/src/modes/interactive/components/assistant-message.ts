@@ -354,6 +354,9 @@ export class AssistantMessageComponent extends Container {
 			}
 		}
 
+		// The leading Spacer already separates the message from the turn head; the
+		// error surfaces add one only when rendered text sits above them.
+		const bodyAboveError = this.contentContainer.children.length > (hasVisibleContent ? 1 : 0);
 		if (message.stopReason === "aborted") {
 			const reason = message.errorMessage;
 			const plainInterrupt =
@@ -361,14 +364,14 @@ export class AssistantMessageComponent extends Container {
 				reason === "Request was aborted" ||
 				reason === "Operation aborted" ||
 				reason.startsWith("已中断");
-			this.contentContainer.addChild(new Spacer(1));
+			if (bodyAboveError) this.contentContainer.addChild(new Spacer(1));
 			// A plain interrupt is the user's own action: say so calmly.
 			this.contentContainer.addChild(
 				plainInterrupt ? new Text(theme.fg("dim", "已中断"), 1, 0) : this.createErrorComponent(reason),
 			);
 		} else if (!hasToolCalls && message.stopReason === "error") {
 			const errorMsg = message.errorMessage || "Unknown error";
-			this.contentContainer.addChild(new Spacer(1));
+			if (bodyAboveError) this.contentContainer.addChild(new Spacer(1));
 			this.contentContainer.addChild(this.createErrorComponent(errorMsg, "Error"));
 		}
 

@@ -5,7 +5,7 @@ import {
 	setQuietConversationBudget,
 	setToolOutputFull,
 } from "../src/modes/interactive/components/tool-output-budget.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 
 function stripAnsi(text: string): string {
 	return text.replace(/\x1b\[[0-9;]*m/g, "");
@@ -64,6 +64,52 @@ describe("IPythonCellComponent QA fixes", () => {
 		expect(stripAnsi(new IPythonCellComponent(state).render(100).join("\n"))).toContain(
 			"Traceback (most recent call last)",
 		);
+	});
+
+	it("an interrupt with nothing shown counts no output and says 已中断 once, calmly (M2 round 2)", () => {
+		const state = {
+			code: "%%bash\nsleep 25",
+			content: [
+				{
+					type: "text",
+					text: "<ipython_cell_aborted>\nThis cell was aborted while it was still running.\nKeyboardInterrupt",
+				},
+			],
+			details: { status: "aborted" as const, durationMs: 6_100 },
+			executionStarted: true,
+			argsComplete: true,
+			expanded: true,
+		};
+		const raw = new IPythonCellComponent(state).render(100);
+		const rendered = stripAnsi(raw.join("\n"));
+		const top = rendered.split("\n")[0] ?? "";
+		expect(top).toContain("已中断");
+		expect(top).not.toContain("行输出");
+		expect(rendered.match(/已中断/g)).toHaveLength(1);
+		expect(rendered).not.toContain("ipython_cell_aborted");
+		// The marker is the dim ✗, not the error or warning color.
+		expect(raw[0]).toContain(theme.fg("dim", "✗"));
+	});
+
+	it("reads a settled queued message as sent; queued only while the cell runs (New3)", () => {
+		const sent = {
+			id: "m1",
+			message: "hello",
+			deliveryStatus: "queued" as const,
+			receiverRole: "child" as const,
+			target: { activeSessionId: "c-active", sessionId: "c", sessionName: "Worker" },
+		};
+		const base = {
+			code: 'await agent_message.send("hello", receiver_role="child", receiver_name="Worker")',
+			executionStarted: true,
+			argsComplete: true,
+			details: { status: "ok" as const, sentAgentMessages: [sent] },
+		};
+		const settled = stripAnsi(new IPythonCellComponent(base).render(120).join("\n"));
+		expect(settled).toContain("已发消息");
+		expect(settled).not.toContain("消息排队中");
+		const live = stripAnsi(new IPythonCellComponent({ ...base, isPartial: true }).render(120).join("\n"));
+		expect(live).toContain("消息排队中");
 	});
 
 	it("keeps the right-aligned facts whole and shortens the label instead (M4)", () => {

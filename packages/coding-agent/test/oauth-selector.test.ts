@@ -63,7 +63,7 @@ describe("OAuthSelectorComponent", () => {
 	it("sorts Prime Inference first within every login auth-state group", () => {
 		const cases: Array<{ status: AuthStatus; configuredProviderLeads: boolean }> = [
 			{ status: { configured: true, source: "environment" }, configuredProviderLeads: false },
-			{ status: { configured: false, source: "stale", label: "expired" }, configuredProviderLeads: true },
+			{ status: { configured: false, source: "stale", label: "已过期" }, configuredProviderLeads: true },
 			{ status: { configured: false }, configuredProviderLeads: true },
 		];
 
@@ -159,7 +159,7 @@ describe("OAuthSelectorComponent", () => {
 		const output = stripAnsi(selector.render(120).join("\n"));
 
 		expect(output).toContain("Anthropic");
-		expect(output).toContain("subscription configured");
+		expect(output).toContain("已配置订阅");
 	});
 
 	it("shows environment API key auth as configured", () => {
@@ -177,7 +177,7 @@ describe("OAuthSelectorComponent", () => {
 
 		expect(output).toContain("OpenAI");
 		expect(output).toContain("env: OPENAI_API_KEY");
-		expect(output).not.toContain("unconfigured");
+		expect(output).not.toContain("未配置");
 	});
 
 	it("shows stale auth as expired instead of configured", () => {
@@ -201,8 +201,8 @@ describe("OAuthSelectorComponent", () => {
 		const output = stripAnsi(selector.render(120).join("\n"));
 
 		expect(output).toContain("Anthropic");
-		expect(output).toContain("expired");
-		expect(output).not.toContain("configured");
+		expect(output).toContain("已过期");
+		expect(output).not.toContain("已配置");
 	});
 
 	it("does not sort stale auth ahead of configured providers", () => {
@@ -230,7 +230,7 @@ describe("OAuthSelectorComponent", () => {
 		const output = stripAnsi(selector.render(120).join("\n"));
 
 		expect(output.indexOf("OpenAI")).toBeLessThan(output.indexOf("Anthropic"));
-		expect(output).toContain("expired");
+		expect(output).toContain("已过期");
 	});
 
 	it("sorts stale auth ahead of unconfigured providers", () => {
@@ -260,7 +260,7 @@ describe("OAuthSelectorComponent", () => {
 		expect(output.indexOf("OpenAI")).toBeLessThan(output.indexOf("Prime Inference"));
 		expect(output.indexOf("Prime Inference")).toBeLessThan(output.indexOf("GitHub Copilot"));
 		expect(output.indexOf("Prime Inference")).toBeLessThan(output.indexOf("Amazon Bedrock"));
-		expect(output).toContain("expired");
+		expect(output).toContain("已过期");
 	});
 
 	it("shows models.json auth instead of stale stored auth on API key rows", () => {
@@ -285,9 +285,9 @@ describe("OAuthSelectorComponent", () => {
 		const output = stripAnsi(selector.render(120).join("\n"));
 
 		expect(output).toContain("Anthropic");
-		expect(output).toContain("key in models.json");
-		expect(output).not.toContain("subscription configured");
-		expect(output).not.toContain("expired");
+		expect(output).toContain("models.json 中的 key");
+		expect(output).not.toContain("已配置订阅");
+		expect(output).not.toContain("已过期");
 	});
 
 	it("shows stale stored auth as expired when models.json auth is active for the provider", () => {
@@ -312,8 +312,8 @@ describe("OAuthSelectorComponent", () => {
 		const output = stripAnsi(selector.render(120).join("\n"));
 
 		expect(output).toContain("Anthropic");
-		expect(output).toContain("expired");
-		expect(output).not.toContain("configured");
+		expect(output).toContain("已过期");
+		expect(output).not.toContain("已配置");
 	});
 
 	it("shows custom provider environment API key auth from status resolver", () => {
@@ -331,7 +331,7 @@ describe("OAuthSelectorComponent", () => {
 
 		expect(output).toContain("ollama");
 		expect(output).toContain("env: OLLAMA_API_KEY");
-		expect(output).not.toContain("unconfigured");
+		expect(output).not.toContain("未配置");
 	});
 
 	it("shows models.json API key auth as configured", () => {
@@ -348,8 +348,8 @@ describe("OAuthSelectorComponent", () => {
 		const output = stripAnsi(selector.render(120).join("\n"));
 
 		expect(output).toContain("local-proxy");
-		expect(output).toContain("key in models.json");
-		expect(output).not.toContain("unconfigured");
+		expect(output).toContain("models.json 中的 key");
+		expect(output).not.toContain("未配置");
 	});
 
 	it("shows models.json command auth as configured", () => {
@@ -366,8 +366,8 @@ describe("OAuthSelectorComponent", () => {
 		const output = stripAnsi(selector.render(120).join("\n"));
 
 		expect(output).toContain("op-proxy");
-		expect(output).toContain("command in models.json");
-		expect(output).not.toContain("unconfigured");
+		expect(output).toContain("models.json 中的命令");
+		expect(output).not.toContain("未配置");
 	});
 
 	it("keeps the provider menu within a short terminal viewport", () => {
@@ -411,8 +411,8 @@ describe("OAuthSelectorComponent", () => {
 		);
 
 		let output = stripAnsi(selector.render(120).join("\n"));
-		expect(output).toContain("Providers");
-		expect(output).toContain("MCP Connections");
+		expect(output).toContain("模型服务");
+		expect(output).toContain("MCP 连接");
 		expect(output).toContain("Anthropic");
 		expect(output).not.toContain("Serper");
 
@@ -485,6 +485,6 @@ describe("OAuthSelectorComponent", () => {
 		);
 
 		const output = stripAnsi(selector.render(120).join("\n"));
-		expect(output).not.toContain("←/→ switch");
+		expect(output).not.toContain("←/→ 切换");
 	});
 });

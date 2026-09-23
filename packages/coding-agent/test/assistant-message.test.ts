@@ -88,6 +88,26 @@ describe("AssistantMessageComponent", () => {
 		expect(rendered.includes(OSC133_ZONE_FINAL)).toBe(false);
 	});
 
+	test("an interrupted reply without text gets exactly one blank line before 已中断 (QA L1)", () => {
+		initTheme("dark");
+		const bare = { ...createAssistantMessage([]), stopReason: "aborted" as const, errorMessage: "已中断 · 6s" };
+		const lines = new AssistantMessageComponent(bare).render(80).map(stripAnsi);
+		const at = lines.findIndex((line) => line.includes("已中断"));
+		expect(at).toBeGreaterThan(0);
+		expect(lines.slice(0, at).every((line) => line.trim() === "")).toBe(true);
+		expect(at).toBe(1);
+
+		const withText = {
+			...createAssistantMessage([{ type: "text" as const, text: "partial answer" }]),
+			stopReason: "aborted" as const,
+			errorMessage: "已中断 · 6s",
+		};
+		const textLines = new AssistantMessageComponent(withText).render(80).map(stripAnsi);
+		const textAt = textLines.findIndex((line) => line.includes("partial answer"));
+		const interruptAt = textLines.findIndex((line) => line.includes("已中断"));
+		expect(interruptAt - textAt).toBe(2);
+	});
+
 	test("renders an abort status for messages with tool calls", () => {
 		initTheme("dark");
 

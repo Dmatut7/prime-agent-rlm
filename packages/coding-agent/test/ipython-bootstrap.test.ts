@@ -147,6 +147,19 @@ describeIfKernel("RLM bootstrap skill wrapping (RT-5)", { tags: ["kernel-heavy"]
 		}
 	}
 
+	it("keeps its own skills on a second bootstrap instead of reporting them unavailable", async () => {
+		const out = await withSkillKernel(
+			[state],
+			[
+				buildRlmBootstrapCode([state.info]),
+				"print('wrapper:', type(skill_state).__name__ == '_PrimeAgentCallableSkillModule')\nprint('call:', await skill_state())",
+			],
+		);
+		expect(out[0]).not.toContain(PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER);
+		expect(out[1]).toContain("wrapper: True");
+		expect(out[1]).toContain("call: 1");
+	}, 60_000);
+
 	it("gives cross-skill module references the callable wrapper too (F1)", async () => {
 		const out = await withSkillKernel(
 			[alpha, beta],

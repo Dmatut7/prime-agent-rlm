@@ -80,18 +80,18 @@ describe("ConfigurationMenuComponent", () => {
 		const menu = await createMenu({ requestRender, onSelectProvider: selectProvider });
 
 		let output = stripAnsi(menu.render(120).join("\n"));
-		expect(output).toContain("Tabs:");
-		expect(output).toContain("[▶ Providers]");
-		expect(output).toContain("[  Models]");
-		expect(output).toContain("[  MCP Connections]");
+		expect(output).toContain("分类：");
+		expect(output).toContain("[▶ 模型服务]");
+		expect(output).toContain("[  模型]");
+		expect(output).toContain("[  MCP 连接]");
 		expect(output).toContain("Anthropic");
 		expect(output).not.toContain("Serper (web search)");
 
 		menu.handleInput("a");
 		menu.setActiveTab("models");
 		output = stripAnsi(menu.render(120).join("\n"));
-		expect(output).toContain("[  Providers]");
-		expect(output).toContain("[▶ Models]");
+		expect(output).toContain("[  模型服务]");
+		expect(output).toContain("[▶ 模型]");
 		expect(output).toContain("Faux One");
 
 		menu.setActiveTab("providers");
@@ -105,7 +105,7 @@ describe("ConfigurationMenuComponent", () => {
 
 		menu.setActiveTab("mcp-connections");
 		output = stripAnsi(menu.render(120).join("\n"));
-		expect(output).toContain("[▶ MCP Connections]");
+		expect(output).toContain("[▶ MCP 连接]");
 		expect(output).toContain("Serper (web search)");
 		expect(output).not.toContain("Anthropic");
 	});
@@ -114,10 +114,10 @@ describe("ConfigurationMenuComponent", () => {
 		const menu = await createMenu();
 		menu.focused = true;
 		const lines = stripAnsi(menu.render(120).join("\n")).split("\n");
-		const tabsLine = lines.findIndex((line) => line.includes("[▶ Providers]"));
-		const shortcutsLine = lines.findIndex((line) => line.includes("Tab/Shift+Tab switch tabs"));
+		const tabsLine = lines.findIndex((line) => line.includes("[▶ 模型服务]"));
+		const shortcutsLine = lines.findIndex((line) => line.includes("Tab/Shift+Tab 切换分类"));
 		expect(shortcutsLine).toBeGreaterThan(tabsLine);
-		expect(lines[shortcutsLine]).toContain("Esc close");
+		expect(lines[shortcutsLine]).toContain("Esc 关闭");
 
 		menu.handleInput("\t");
 		expect(menu.getActiveTab()).toBe("models");
@@ -203,9 +203,9 @@ describe("ConfigurationMenuComponent", () => {
 			menu.setActiveTab(tab);
 			const lines = menu.render(24);
 			const output = stripAnsi(lines.join("\n"));
-			expect(output).toContain("Providers");
-			expect(output).toContain("Models");
-			expect(output).toContain("MCP Connections");
+			expect(output).toContain("模型服务");
+			expect(output).toContain("模型");
+			expect(output).toContain("MCP 连接");
 			expect(lines.length).toBeLessThanOrEqual(24);
 			for (const line of lines) {
 				expect(visibleWidth(line)).toBe(24);
@@ -219,7 +219,7 @@ describe("ConfigurationMenuComponent", () => {
 		for (const themeName of ["dark", "light", "prime"] as const) {
 			initTheme(themeName);
 			const rendered = menu.render(120).join("\n");
-			expect(stripAnsi(rendered)).toContain("[▶ Providers]");
+			expect(stripAnsi(rendered)).toContain("[▶ 模型服务]");
 			expect(rendered).not.toBe(stripAnsi(rendered));
 		}
 	});

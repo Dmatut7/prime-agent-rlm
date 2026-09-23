@@ -8,3 +8,5 @@
 - Changed the interface text to Chinese across status messages, the shortcut panel, session list, session tree, model picker, heartbeats, queue rows, agent-message rows and the exit hint (Thinking stays English).
 - Fixed the turn caret not flipping on Ctrl+T/Ctrl+P, the full-output toggle not repainting, a single Ctrl+C during a run arming exit, the shortcut panel not closing, and interrupted steps showing raw KeyboardInterrupt tracebacks.
 - Fixed tests writing fake sessions into the real agent directory.
+- Fixed Python skills being reported unavailable (and so avoided by the model) after a kernel re-bootstrap or restored state.
+- Changed the settings menu, login dialog, model and provider pickers, slash-command descriptions and list scroll indicators to Chinese.

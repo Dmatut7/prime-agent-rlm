@@ -251,6 +251,7 @@ describe("TUI fullscreen mode", () => {
 		assert.strictEqual(viewport[8], "> prompt", "dock still visible");
 		assert.strictEqual(tui.getScrollInfo()?.linesBelow, 21);
 		assert.ok(viewport[7]?.includes("Ctrl+Shift+↓ 回到底部"), "follow hint composited above the dock");
+		assert.ok(!viewport[7]?.includes("─"), "the follow hint row draws no rule of its own");
 
 		tui.stop();
 	});

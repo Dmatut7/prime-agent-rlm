@@ -7230,13 +7230,13 @@ export class InteractiveMode {
 		return hints.filter((entry): entry is string => entry !== undefined);
 	}
 
-	/** The splash's `继续` row: the last session in this directory, while the chat is still empty. */
+	/** The splash's `上次` row: the last session in this directory, while the chat is still empty. */
 	private getContinueMetadata(): BrandSplashMetadataLine[] {
 		const recent = this.recentSession;
 		if (!recent || !this.isNewChat()) return [];
 		const open = this.options.returnToAgentsView ? keyText("app.agents.back", { primaryOnly: true }) : "";
-		const how = open ? `${open} 会话列表继续` : "prime-agent --resume 继续";
-		return [{ label: "继续", value: `「${recent.title}」 ${formatAgo(recent.modified)} · ${how}` }];
+		const how = open ? `${open} 打开会话列表` : "prime-agent --resume";
+		return [{ label: "上次", value: `「${recent.title}」 ${formatAgo(recent.modified)} · ${how}` }];
 	}
 
 	private async loadRecentSession(): Promise<void> {

@@ -180,8 +180,8 @@ export class SelectList implements Component {
 
 	private formatDirectionalScrollInfo(hiddenAbove: number, hiddenBelow: number): string {
 		const indicators = [
-			hiddenAbove > 0 ? `↑ ${hiddenAbove} more` : undefined,
-			hiddenBelow > 0 ? `↓ ${hiddenBelow} more` : undefined,
+			hiddenAbove > 0 ? `↑ 还有 ${hiddenAbove} 项` : undefined,
+			hiddenBelow > 0 ? `↓ 还有 ${hiddenBelow} 项` : undefined,
 		].filter((indicator): indicator is string => indicator !== undefined);
 		return `  ${indicators.join("  ")}`;
 	}

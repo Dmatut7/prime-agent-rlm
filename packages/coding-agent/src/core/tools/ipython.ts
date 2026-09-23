@@ -260,7 +260,21 @@ _prime_agent_reserved_skill_names = (
     | frozenset(_prime_agent_sys.builtin_module_names)
 )
 
+def _prime_agent_loaded_skill_wrapper(name):
+    """The wrapper an earlier bootstrap of this kernel (or a restored state) already bound."""
+    for candidate in (globals().get(name), _prime_agent_sys.modules.get(name)):
+        if type(candidate).__name__ == "_PrimeAgentCallableSkillModule":
+            return candidate
+    return None
+
 for _prime_agent_skill_name in ${JSON.stringify(importNames)}:
+    _prime_agent_existing_wrapper = _prime_agent_loaded_skill_wrapper(_prime_agent_skill_name)
+    if _prime_agent_existing_wrapper is not None:
+        # A re-bootstrap (kernel restart, restored state) finds the skill it loaded
+        # itself: keep it, it is not a foreign module shadowing the name.
+        globals()[_prime_agent_skill_name] = _prime_agent_existing_wrapper
+        _prime_agent_sys.modules[_prime_agent_skill_name] = _prime_agent_existing_wrapper
+        continue
     if _prime_agent_skill_name in _prime_agent_reserved_skill_names:
         _PRIME_AGENT_SKILL_IMPORT_ERRORS[_prime_agent_skill_name] = (
             "refused: this import name is already provided by the kernel "

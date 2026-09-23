@@ -30,6 +30,9 @@ function argString(args: unknown, ...keys: string[]): string | undefined {
 	return undefined;
 }
 
+/** The label of a cell whose only effect is printing or slicing a value it already has. */
+const VIEW_OUTPUT_LABEL = "查看输出";
+
 const PYTHON_OPEN_PATTERN = /\bopen\(\s*[rRbBfF]?["']([^"']+)["'](?:\s*,\s*(?:mode\s*=\s*)?["']([^"']*)["'])?/g;
 const PYTHON_PATH_IO_PATTERN =
 	/\bPath\(\s*[rRfF]?["']([^"']+)["']\s*\)\.(read_text|read_bytes|write_text|write_bytes)\s*\(/g;
@@ -252,7 +255,7 @@ function pythonEffects(code: string): string[] {
 		}
 	}
 	for (const match of code.matchAll(PYTHON_SLICE_PRINT_PATTERN)) {
-		push(match.index, "查看输出");
+		push(match.index, VIEW_OUTPUT_LABEL);
 		break;
 	}
 	for (const match of code.matchAll(PYTHON_OPEN_PATTERN)) {
@@ -285,11 +288,13 @@ function pythonEffects(code: string): string[] {
 	for (const effect of effects.sort((a, b) => a.index - b.index)) {
 		if (!labels.includes(effect.label)) labels.push(effect.label);
 	}
-	// A named read or write makes the generic one for the same verb redundant.
+	// A named read or write makes the generic one for the same verb redundant;
+	// 查看输出 only names a cell that does nothing else.
 	return labels.filter(
 		(label) =>
-			!(label === "读取文件" || label === "写入文件") ||
-			!labels.some((other) => other !== label && other.startsWith(label.slice(0, 2))),
+			(!(label === "读取文件" || label === "写入文件") ||
+				!labels.some((other) => other !== label && other.startsWith(label.slice(0, 2)))) &&
+			(label !== VIEW_OUTPUT_LABEL || labels.length === 1),
 	);
 }
 
@@ -388,7 +393,8 @@ function shortCommand(command: string): string {
  */
 export function turnStepsSummary(steps: readonly (StepLabelInput & { toolCallId: string })[]): string {
 	const seen = new Set<string>();
-	const groups = new Map<string, string[]>();
+	// Per verb: distinct objects (commands deduped by program + subcommand), each with its full text.
+	const groups = new Map<string, { key: string; full: string }[]>();
 	const bare = new Map<string, number>();
 	for (const step of steps) {
 		if (seen.has(step.toolCallId)) {
@@ -406,19 +412,22 @@ export function turnStepsSummary(steps: readonly (StepLabelInput & { toolCallId:
 			const object = effect.slice(space + 1);
 			const objects = groups.get(verb) ?? [];
 			const key = verb === "运行" ? shortCommand(object) : object;
-			if (!objects.includes(key)) objects.push(key);
+			if (!objects.some((entry) => entry.key === key)) objects.push({ key, full: object });
 			groups.set(verb, objects);
 		}
 	}
 	const parts: string[] = [];
+	const hasOtherVerbs = [...groups.keys()].some((verb) => verb !== VIEW_OUTPUT_LABEL);
 	for (const [verb, objects] of groups) {
 		if (bare.has(verb)) {
+			if (verb === VIEW_OUTPUT_LABEL && hasOtherVerbs) continue;
 			const count = bare.get(verb) ?? 1;
 			parts.push(count > 1 ? `${verb} ×${count}` : verb);
 		} else if (objects.length === 1) {
-			parts.push(`${verb} ${objects[0]}`);
+			// A single object keeps its whole text; the line's width truncation cuts only at the end.
+			parts.push(`${verb} ${objects[0]?.full}`);
 		} else if (objects.length === 2 && verb !== "运行") {
-			parts.push(`${verb} ${objects.join("、")}`);
+			parts.push(`${verb} ${objects.map((entry) => entry.full).join("、")}`);
 		} else {
 			parts.push(`${verb} ${objects.length} ${GROUP_COUNT_NOUN[verb]}`);
 		}

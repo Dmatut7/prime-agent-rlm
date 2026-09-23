@@ -75,7 +75,7 @@ describe("RefinementOutcomeMessageComponent", () => {
 		const component = new RefinementOutcomeMessageComponent(message);
 
 		const collapsed = rendered(component);
-		expect(collapsed).toContain("[refinement]");
+		expect(collapsed).toContain("[沉淀]");
 		expect(collapsed).toContain("Added local guidance to make conversational responses rhyme.");
 		expect(collapsed).toContain("已应用 1 处修改");
 		// U6: no per-line expand hint — the global tail line owns the keys.

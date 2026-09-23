@@ -499,8 +499,14 @@ export class IPythonCellComponent implements Component {
 		// A traceback in the fallback text is not output: count what ran before it.
 		const traceback = structured ? undefined : splitTraceback(fallback, details.errorEname);
 		if (traceback) fallback = traceback.output;
+		else if (!structured && this.isQuietInterrupt(details, blocksText)) fallback = "";
 		const outputText = (structured || fallback).trim();
 		return hasDiffs || !outputText ? 0 : outputText.split("\n").length;
+	}
+
+	/** An interrupt in the normal (not full) view: its kernel text is plumbing, not output. */
+	private isQuietInterrupt(details: IpythonDetails, text: string): boolean {
+		return !this.state.isPartial && !toolOutputFull() && isInterruptedCell(details, text);
 	}
 
 	private statusKind(details: IpythonDetails): "error" | "aborted" | "running" | "queued" | "done" {
@@ -625,7 +631,7 @@ export class IPythonCellComponent implements Component {
 				renderedTextOutput = true;
 				this.renderOutputText(lines, width, traceback.output, "out");
 			}
-		} else if (text.trim() && !isAgentMessageReceipt(text, sentMessages)) {
+		} else if (text.trim() && !isAgentMessageReceipt(text, sentMessages) && !this.isQuietInterrupt(details, text)) {
 			startOutput();
 			renderedTextOutput = true;
 			// The model-facing background marker reads in the UI's language here.
@@ -651,6 +657,7 @@ export class IPythonCellComponent implements Component {
 			!renderedTextOutput &&
 			!traceback &&
 			!details.error &&
+			!isInterruptedCell(details, text) &&
 			diffs.length === 0 &&
 			(details.sentAgentMessages?.length ?? 0) === 0 &&
 			this.state.executionStarted &&
@@ -662,9 +669,7 @@ export class IPythonCellComponent implements Component {
 
 		if (isInterruptedCell(details, text) && !toolOutputFull()) {
 			// An interrupt's traceback is the kernel's plumbing, not the step's
-			// result; the full view still has it.
-			startOutput();
-			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("dim", "已中断"), width);
+			// result; the step row already says 已中断 and the full view keeps it.
 		} else if (details.error) {
 			startOutput();
 			this.renderTraceback(
@@ -695,7 +700,8 @@ export class IPythonCellComponent implements Component {
 	// instead of the collapsed preview, matching received agent-message UI.
 	private renderSentAgentMessages(lines: string[], width: number, messages: readonly SentAgentMessageDisplay[]): void {
 		for (const message of messages) {
-			const label = message.deliveryStatus === "delivered" ? "已发消息" : "消息排队中";
+			// Queued only means something while the cell runs; a settled cell's message went out.
+			const label = message.deliveryStatus === "queued" && this.state.isPartial ? "消息排队中" : "已发消息";
 			const recipient = formatAgentMessageParticipant("sent", message.receiverRole, message.target);
 			// U6: no per-line expand hint — the global tail line states the keys.
 			if (this.state.agentMessagesExpanded) {

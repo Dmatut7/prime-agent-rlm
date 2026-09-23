@@ -53,12 +53,12 @@ describe("LoginDialogComponent", () => {
 		dialog.showAuth("https://example.com/oauth?client_id=test", "Complete login in your browser.");
 		const output = stripAnsi(dialog.render(88).join("\n"));
 
-		expect(output).toContain("Login to Anthropic");
-		expect(output).toContain("Browser sign-in");
-		expect(output).toContain("Sign-in link");
+		expect(output).toContain("登录 Anthropic");
+		expect(output).toContain("浏览器登录");
+		expect(output).toContain("登录链接");
 		expect(output).toContain("https://example.com/oauth?client_id=test");
 		expect(output).toContain("C copy");
-		expect(output).toContain("Next step");
+		expect(output).toContain("下一步");
 		expect(output).toContain("Complete login in your browser.");
 		expect(output).not.toContain("click to open");
 		expect(output).not.toContain("─");
@@ -73,7 +73,7 @@ describe("LoginDialogComponent", () => {
 		dialog.handleInput("c");
 
 		await vi.waitFor(() => expect(mocks.copyToClipboard).toHaveBeenCalledWith(url));
-		expect(stripAnsi(dialog.render(48).join("\n"))).toContain("Copied sign-in link");
+		expect(stripAnsi(dialog.render(48).join("\n"))).toContain("已复制登录链接");
 	});
 
 	it("honors a customized login URL copy shortcut", async () => {
@@ -146,9 +146,9 @@ describe("LoginDialogComponent", () => {
 		const output = stripAnsi(dialog.render(88).join("\n"));
 		const firstLogoLine = PRIME_BUTTERFLY_LOGO.split("\n")[0]?.trim() ?? "";
 
-		expect(output).toContain("Login to Prime Inference");
+		expect(output).toContain("登录 Prime Inference");
 		expect(output).toContain(firstLogoLine);
-		expect(output).toContain("Verification code");
+		expect(output).toContain("验证码");
 		expect(output).toContain("abc-123");
 		expect(output).not.toContain("click to open");
 		expect(output).not.toContain("Code: abc-123");
@@ -171,12 +171,12 @@ describe("LoginDialogComponent", () => {
 		dialog.showProgress("Checking existing Prime CLI credentials...");
 		const lines = dialog.render(88);
 		const output = stripAnsi(lines.join("\n"));
-		const titleLine = output.split("\n").find((line) => line.includes("Login to Prime Inference"));
-		const titleOffset = titleLine?.indexOf("Login to Prime Inference") ?? -1;
+		const titleLine = output.split("\n").find((line) => line.includes("登录 Prime Inference"));
+		const titleOffset = titleLine?.indexOf("登录 Prime Inference") ?? -1;
 
 		expect(titleOffset).toBeGreaterThan(20);
-		expect(output).toContain("Connect your Prime Intellect account to enable Prime Inference models.");
-		expect(output).toContain("Preparing authentication");
+		expect(output).toContain("连接你的 Prime Intellect 账号，启用 Prime Inference 模型。");
+		expect(output).toContain("正在准备登录");
 		for (const line of lines) {
 			expect(visibleWidth(line)).toBe(88);
 		}
@@ -212,7 +212,7 @@ describe("LoginDialogComponent", () => {
 		void dialog.showPrompt("Enter API key:");
 		const output = stripAnsi(dialog.render(88).join("\n"));
 
-		expect(output).toContain("Login to OpenAI");
+		expect(output).toContain("登录 OpenAI");
 		expect(output).toContain("Enter API key:");
 		expect(output).not.toContain("─");
 		expect(output).not.toContain("> ");

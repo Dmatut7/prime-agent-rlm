@@ -23,8 +23,7 @@ describe("built-in slash commands", () => {
 
 	test("describes the fine-grained /rlm-max-depth semantics", () => {
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "rlm-max-depth")).toMatchObject({
-			description:
-				"Set/view the per-chat persistent RLM max depth immediately; never interrupts or queues the running turn",
+			description: "设置或查看本会话的子代理最大层数（立即生效，不打断当前任务）",
 			argumentHint: "[<int> [--global]]",
 			takesArgument: true,
 		});
@@ -32,8 +31,7 @@ describe("built-in slash commands", () => {
 
 	test("exposes heartbeat syntax guidance", () => {
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "heartbeat")).toMatchObject({
-			description:
-				"Set or view a persistent heartbeat; delivery defaults to steer, use --follow-up to queue; supports pause, resume, stop, and clear",
+			description: "设置或查看定时任务；默认插话投递，--follow-up 改为排队；可暂停、继续、停止、清除",
 			argumentHint: "[status|pause|resume|stop|[every <duration>] [--steer|--follow-up] <instruction>]",
 			takesArgument: true,
 		});
@@ -41,7 +39,7 @@ describe("built-in slash commands", () => {
 
 	test("exposes /effort for selecting the thinking level", () => {
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "effort")).toMatchObject({
-			description: "Select reasoning/thinking level (opens selector UI)",
+			description: "选择 Thinking 强度",
 			argumentHint: "[level]",
 			aliases: ["thinking"],
 		});
@@ -59,7 +57,7 @@ describe("built-in slash commands", () => {
 
 	test("describes /mcp as the MCP Connections menu entry point", () => {
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "mcp")).toMatchObject({
-			description: "Open MCP Connections or manage MCP integrations",
+			description: "打开或管理 MCP 连接",
 			argumentHint: "[add|list|get|remove|login|logout]",
 			takesArgument: true,
 		});
@@ -67,7 +65,7 @@ describe("built-in slash commands", () => {
 
 	test("exposes trace preview and backfill syntax", () => {
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "traces")).toMatchObject({
-			description: "Preview, upload, or configure Prime Agent traces",
+			description: "预览、上传或设置 Prime Agent traces",
 			argumentHint: "[status|on|off|preview|upload|upload-current|upload-all|login]",
 		});
 	});
@@ -103,16 +101,16 @@ describe("slash command aliases", () => {
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "usage")).toBeUndefined();
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "rename")).toBeUndefined();
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "new")).toMatchObject({
-			description: "Start a new session, optionally named and/or with an initial prompt",
+			description: "开新会话，可带名称或第一条消息",
 			argumentHint: '[--name "session name" --] [prompt]',
 			aliases: ["clear"],
 		});
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "context")).toMatchObject({
-			description: "Show token, cost, and context usage for agent and sub-agents",
+			description: "查看 token、费用和上下文用量（含子代理）",
 			aliases: ["usage"],
 		});
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "name")).toMatchObject({
-			description: "Set or show the session display name",
+			description: "设置或查看会话名称",
 			argumentHint: "[name]",
 			takesArgument: true,
 			aliases: ["rename"],

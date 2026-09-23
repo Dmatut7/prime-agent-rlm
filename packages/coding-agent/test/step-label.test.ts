@@ -81,6 +81,29 @@ describe("search labels", () => {
 	});
 });
 
+describe("QA round 2 labels", () => {
+	const bash = (id: string, command: string) => ({ toolCallId: id, toolName: "bash", args: { command } });
+	const cell = (id: string, code: string) => ({ toolCallId: id, toolName: "ipython", args: { code } });
+
+	it("keeps a single command's whole text in the summary (M3)", () => {
+		expect(turnStepsSummary([bash("a", "seq 1 30")])).toBe("运行 seq 1 30");
+		expect(turnStepsSummary([bash("a", "git status --short"), bash("b", "git status")])).toBe(
+			"运行 git status --short",
+		);
+		expect(turnStepsSummary([bash("a", "git log -3"), bash("b", "npm test"), bash("c", "ls")])).toContain(
+			"运行 2 条命令",
+		);
+	});
+
+	it("names 查看输出 only for a cell that does nothing else (New1)", () => {
+		expect(turnStepLabel(cell("a", "print(out[0:200])"))).toBe("查看输出");
+		expect(turnStepLabel(cell("a", "text = open('bash.py').read()\nprint(text[:500])"))).toBe("读取 bash.py");
+		expect(turnStepsSummary([cell("a", "text = open('a.ts').read()"), cell("b", "print(text[0:9])")])).toBe(
+			"读取 a.ts",
+		);
+	});
+});
+
 describe("turnStepsSummary", () => {
 	it("groups labels by verb in first-seen order, deduped by toolCallId", () => {
 		const steps = [

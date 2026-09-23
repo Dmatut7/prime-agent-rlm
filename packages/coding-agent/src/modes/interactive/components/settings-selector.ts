@@ -21,13 +21,13 @@ const SETTINGS_SUBMENU_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
 };
 
 const THINKING_DESCRIPTIONS: Record<ThinkingLevel, string> = {
-	off: "No reasoning",
-	minimal: "Very brief reasoning",
-	low: "Light reasoning",
-	medium: "Moderate reasoning",
-	high: "Deep reasoning",
-	xhigh: "Very deep reasoning",
-	max: "Maximum reasoning",
+	off: "不思考",
+	minimal: "极简思考",
+	low: "浅度思考",
+	medium: "中等思考",
+	high: "深度思考",
+	xhigh: "很深的思考",
+	max: "最深思考",
 };
 
 export interface SettingsConfig {
@@ -100,8 +100,8 @@ class WarningSettingsSubmenu extends Container {
 		const items: SettingItem[] = [
 			{
 				id: "anthropic-extra-usage",
-				label: "Anthropic extra usage",
-				description: "Warn when Anthropic subscription auth may use paid extra usage",
+				label: "Anthropic 额外用量",
+				description: "Anthropic 订阅可能产生付费额外用量时提醒",
 				currentValue: (this.state.anthropicExtraUsage ?? true) ? "true" : "false",
 				values: ["true", "false"],
 			},
@@ -204,80 +204,78 @@ export class SettingsSelectorComponent extends Container {
 		const items: SettingItem[] = [
 			{
 				id: "autocompact",
-				label: "Auto-compact",
-				description: "Automatically compact context when it gets too large",
+				label: "自动压缩",
+				description: "上下文太长时自动压缩",
 				currentValue: config.autoCompact ? "true" : "false",
 				values: ["true", "false"],
 			},
 			{
 				id: "idle-eviction-minutes",
-				label: "Idle worker eviction",
-				description: "Stop fully idle agent trees after this many minutes (global daemon policy)",
+				label: "空闲回收",
+				description: "代理完全空闲这么多分钟后停掉（全局后台策略）",
 				currentValue: String(config.idleEvictionMinutes),
 				values: ["off", ...idleEvictionValues.map(String)],
 			},
 			{
 				id: "steering-mode",
-				label: "Steering mode",
-				description:
-					"Enter while streaming queues steering messages. 'one-at-a-time': deliver one, wait for response. 'all': deliver all at once.",
+				label: "插话方式",
+				description: "运行中按 Enter 插话。one-at-a-time：一次送一条，等回应再送下一条；all：一次全部送达。",
 				currentValue: config.steeringMode,
 				values: ["one-at-a-time", "all"],
 			},
 			{
 				id: "follow-up-mode",
-				label: "Follow-up mode",
-				description:
-					"Alt+Enter queues follow-up messages until agent stops. 'one-at-a-time': deliver one, wait for response. 'all': deliver all at once.",
+				label: "排队方式",
+				description: "Alt+Enter 排队的消息在本轮结束后发送。one-at-a-time：一次一条；all：一次全部。",
 				currentValue: config.followUpMode,
 				values: ["one-at-a-time", "all"],
 			},
 			{
 				id: "transport",
-				label: "Transport",
-				description: "Preferred transport for providers that support multiple transports",
+				label: "传输方式",
+				description: "支持多种传输的模型服务优先用哪种",
 				currentValue: config.transport,
 				values: ["sse", "websocket", "websocket-cached", "auto"],
 			},
 			{
 				id: "hide-thinking",
-				label: "Hide thinking",
-				description: "Hide thinking blocks in assistant responses",
+				label: "隐藏 Thinking",
+				description: "不显示 AI 回答里的 Thinking 内容",
 				currentValue: config.hideThinkingBlock ? "true" : "false",
 				values: ["true", "false"],
 			},
 			{
 				id: "mermaid-rendering",
-				label: "Mermaid diagrams",
-				description: "Render Mermaid code blocks as Unicode diagrams",
+				label: "Mermaid 图",
+				description: "把 Mermaid 代码块画成字符图",
 				currentValue: config.mermaidRenderingMode,
 				values: ["off", "final", "streaming"],
 			},
 			{
 				id: "process-mode",
-				label: "Process mode",
-				description: "Quiet folds turn narration into the footnote line; legacy shows the full transcript",
+				label: "过程显示",
+				description: "quiet：每轮收成一行过程；legacy：显示完整过程",
 				currentValue: config.processMode,
 				values: ["quiet", "legacy"],
 			},
 			{
 				id: "quiet-startup",
-				label: "Quiet startup",
-				description: "Disable verbose printing at startup",
+				label: "安静启动",
+				description: "启动时不打印详细信息",
 				currentValue: config.quietStartup ? "true" : "false",
 				values: ["true", "false"],
 			},
 			{
 				id: "tree-filter-mode",
-				label: "Tree filter mode",
-				description: "Default filter when opening /tree",
+				label: "会话树过滤",
+				description: "打开 /tree 时默认的过滤方式",
 				currentValue: config.treeFilterMode,
 				values: ["default", "no-tools", "user-only", "labeled-only", "all"],
 			},
 			{
 				id: "warnings",
-				label: "Warnings",
-				description: "Enable or disable individual warnings",
+				label: "提醒",
+				description: "开关各类提醒",
 				currentValue: "configure",
 				submenu: (_currentValue, done) =>
 					new WarningSettingsSubmenu(
@@ -291,13 +289,13 @@ export class SettingsSelectorComponent extends Container {
 			},
 			{
 				id: "thinking",
-				label: "Thinking level",
-				description: "Reasoning depth for thinking-capable models",
+				label: "Thinking 强度",
+				description: "支持 Thinking 的模型要想多深",
 				currentValue: config.thinkingLevel,
 				submenu: (currentValue, done) =>
 					new SelectSubmenu(
-						"Thinking Level",
-						"Select reasoning depth for thinking-capable models",
+						"Thinking 强度",
+						"选择模型的思考深度",
 						config.availableThinkingLevels.map((level) => ({
 							value: level,
 							label: level,
@@ -313,13 +311,13 @@ export class SettingsSelectorComponent extends Container {
 			},
 			{
 				id: "theme",
-				label: "Theme",
-				description: "Color theme for the interface",
+				label: "主题",
+				description: "界面配色",
 				currentValue: config.currentTheme,
 				submenu: (currentValue, done) =>
 					new SelectSubmenu(
-						"Theme",
-						"Select color theme",
+						"主题",
+						"选择配色",
 						config.availableThemes.map((t) => ({
 							value: t,
 							label: t,
@@ -344,8 +342,8 @@ export class SettingsSelectorComponent extends Container {
 
 		items.splice(1, 0, {
 			id: "show-images",
-			label: "Show image metadata",
-			description: "Show image type and dimensions in terminal",
+			label: "显示图片信息",
+			description: "在终端里显示图片类型和尺寸",
 			currentValue: config.showImages ? "true" : "false",
 			values: ["true", "false"],
 		});
@@ -353,8 +351,8 @@ export class SettingsSelectorComponent extends Container {
 		// Image auto-resize toggle (always available, affects both attached and read images)
 		items.splice(2, 0, {
 			id: "auto-resize-images",
-			label: "Auto-resize images",
-			description: "Resize large images to 2000x2000 max for better model compatibility",
+			label: "自动缩小图片",
+			description: "把大图缩到 2000x2000 以内，模型更容易处理",
 			currentValue: config.autoResizeImages ? "true" : "false",
 			values: ["true", "false"],
 		});
@@ -363,8 +361,8 @@ export class SettingsSelectorComponent extends Container {
 		const autoResizeIndex = items.findIndex((item) => item.id === "auto-resize-images");
 		items.splice(autoResizeIndex + 1, 0, {
 			id: "block-images",
-			label: "Block images",
-			description: "Prevent images from being sent to LLM providers",
+			label: "禁止发送图片",
+			description: "不把图片发给模型服务",
 			currentValue: config.blockImages ? "true" : "false",
 			values: ["true", "false"],
 		});
@@ -373,8 +371,8 @@ export class SettingsSelectorComponent extends Container {
 		const blockImagesIndex = items.findIndex((item) => item.id === "block-images");
 		items.splice(blockImagesIndex + 1, 0, {
 			id: "skill-commands",
-			label: "Skill commands",
-			description: "Register skills as /skill:name commands",
+			label: "技能命令",
+			description: "把技能注册成 /skill:名称 命令",
 			currentValue: config.enableSkillCommands ? "true" : "false",
 			values: ["true", "false"],
 		});
@@ -383,8 +381,8 @@ export class SettingsSelectorComponent extends Container {
 		const skillCommandsItemIndex = items.findIndex((item) => item.id === "skill-commands");
 		items.splice(skillCommandsItemIndex + 1, 0, {
 			id: "builtin-skills",
-			label: "Built-in skills",
-			description: "Load built-in skills shipped with prime-agent (takes effect after reload)",
+			label: "内置技能",
+			description: "加载 prime-agent 自带的技能（重新加载后生效）",
 			currentValue: config.enableBuiltinSkills ? "true" : "false",
 			values: ["true", "false"],
 		});
@@ -393,8 +391,8 @@ export class SettingsSelectorComponent extends Container {
 		const skillCommandsIndex = items.findIndex((item) => item.id === "builtin-skills");
 		items.splice(skillCommandsIndex + 1, 0, {
 			id: "show-hardware-cursor",
-			label: "Show hardware cursor",
-			description: "Show the terminal cursor while still positioning it for IME support",
+			label: "显示终端光标",
+			description: "显示终端自带光标（便于输入法定位）",
 			currentValue: config.showHardwareCursor ? "true" : "false",
 			values: ["true", "false"],
 		});
@@ -403,8 +401,8 @@ export class SettingsSelectorComponent extends Container {
 		const hardwareCursorIndex = items.findIndex((item) => item.id === "show-hardware-cursor");
 		items.splice(hardwareCursorIndex + 1, 0, {
 			id: "editor-padding",
-			label: "Editor padding",
-			description: "Horizontal padding for input editor (0-3)",
+			label: "输入框边距",
+			description: "输入框左右留白（0-3）",
 			currentValue: String(config.editorPaddingX),
 			values: ["0", "1", "2", "3"],
 		});
@@ -413,8 +411,8 @@ export class SettingsSelectorComponent extends Container {
 		const editorPaddingIndex = items.findIndex((item) => item.id === "editor-padding");
 		items.splice(editorPaddingIndex + 1, 0, {
 			id: "autocomplete-max-visible",
-			label: "Autocomplete max items",
-			description: "Max visible items in autocomplete dropdown (3-20)",
+			label: "补全列表长度",
+			description: "自动补全最多显示几项（3-20）",
 			currentValue: String(config.autocompleteMaxVisible),
 			values: ["3", "5", "7", "10", "15", "20"],
 		});
@@ -423,8 +421,8 @@ export class SettingsSelectorComponent extends Container {
 		const autocompleteIndex = items.findIndex((item) => item.id === "autocomplete-max-visible");
 		items.splice(autocompleteIndex + 1, 0, {
 			id: "clear-on-shrink",
-			label: "Clear on shrink",
-			description: "Clear empty rows when content shrinks (may cause flicker)",
+			label: "收缩时清屏",
+			description: "内容变短时清掉空行（可能闪烁）",
 			currentValue: config.clearOnShrink ? "true" : "false",
 			values: ["true", "false"],
 		});
@@ -433,8 +431,8 @@ export class SettingsSelectorComponent extends Container {
 		const clearOnShrinkIndex = items.findIndex((item) => item.id === "clear-on-shrink");
 		items.splice(clearOnShrinkIndex + 1, 0, {
 			id: "terminal-progress",
-			label: "Terminal progress",
-			description: "Show OSC 9;4 progress indicators in the terminal tab bar",
+			label: "终端进度条",
+			description: "在终端标签栏显示 OSC 9;4 进度",
 			currentValue: config.showTerminalProgress ? "true" : "false",
 			values: ["true", "false"],
 		});
@@ -443,8 +441,8 @@ export class SettingsSelectorComponent extends Container {
 		const terminalProgressIndex = items.findIndex((item) => item.id === "terminal-progress");
 		items.splice(terminalProgressIndex + 1, 0, {
 			id: "fullscreen",
-			label: "Fullscreen rendering",
-			description: "Alternate-screen UI with scrollable transcript and pinned prompt",
+			label: "全屏模式",
+			description: "全屏界面，可滚动查看全部对话，输入框固定在底部",
 			currentValue: config.fullscreen ? "true" : "false",
 			values: ["true", "false"],
 		});

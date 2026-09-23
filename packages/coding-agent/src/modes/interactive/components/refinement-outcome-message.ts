@@ -97,7 +97,7 @@ export class RefinementOutcomeMessageComponent extends ExpandableCustomMessageBo
 
 		const { summary, edits, scope } = this.message.details;
 		const toggle = () => this.setExpanded(!this.expanded);
-		this.addChild(new Clickable(new Text(customMessageLabel("refinement"), 0, 0), toggle));
+		this.addChild(new Clickable(new Text(customMessageLabel("沉淀"), 0, 0), toggle));
 		this.addChild(new Spacer(1));
 		if (!this.expanded) {
 			// U6: no per-line expand hint — the global tail line states the keys.

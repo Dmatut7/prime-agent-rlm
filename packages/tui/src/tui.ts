@@ -1798,15 +1798,16 @@ export class TUI extends Container {
 		const scrollInfo = fullscreen.viewport.scrollInfo();
 		if (fullscreen.viewportControls && !scrollInfo.following) {
 			// Follow hint on the bottom row of the transcript window, just above
-			// the dock: a dim rule with the key at the right edge, replacing the
-			// row instead of painting over the middle of a text line.
+			// the dock: dim text at the right edge, replacing the row instead of
+			// painting over a text line, and without a rule of its own so it does
+			// not stack on the prompt's top rule.
 			const followKey = getKeybindings().getKeys("tui.viewport.follow")[0] ?? "ctrl+shift+down";
 			const label = ` ${formatFollowKey(followKey)} 回到底部 `;
 			const labelWidth = visibleWidth(label);
 			const row = fullscreen.viewport.headerHeight() + fullscreen.viewport.windowHeight() - 1;
 			if (row >= 0 && row < frame.length && labelWidth + 2 <= width) {
-				const ruleWidth = width - labelWidth - 1;
-				frame[row] = `\x1b[2m${"─".repeat(ruleWidth)}\x1b[22m\x1b[7m${label}\x1b[27m `;
+				const padWidth = width - labelWidth - 1;
+				frame[row] = `${" ".repeat(padWidth)}\x1b[2m${label}\x1b[22m `;
 				fullscreen.viewport.subtractFrameClickCoverage(row, 0, width);
 			}
 		}

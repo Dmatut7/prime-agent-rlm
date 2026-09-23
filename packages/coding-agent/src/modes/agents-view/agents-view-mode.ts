@@ -3305,7 +3305,7 @@ interface AgentsViewUsageParts {
 // usage columns, so the trailing layout every existing pin expects (…$total ·
 // age) keeps its columns and the new facts read as the row's state, not its bill.
 const AGENTS_VIEW_USAGE_LABELS: AgentsViewUsageParts = {
-	set: "完成",
+	set: "状态",
 	dur: "时长",
 	inTokens: "↑入",
 	outTokens: "↓出",

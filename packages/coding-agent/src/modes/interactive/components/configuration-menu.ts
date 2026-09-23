@@ -46,9 +46,9 @@ export interface ConfigurationMenuOptions {
 }
 
 const TAB_LABELS: Record<ConfigurationMenuTab, string> = {
-	providers: "Providers",
-	models: "Models",
-	"mcp-connections": "MCP Connections",
+	providers: "模型服务",
+	models: "模型",
+	"mcp-connections": "MCP 连接",
 };
 
 class ConfigurationMenuTabBar implements Component {
@@ -70,14 +70,14 @@ class ConfigurationMenuTabBar implements Component {
 			return tab === activeTab ? theme.bold(theme.fg("accent", label)) : theme.fg("text", label);
 		});
 		const lines = this.wrapItems(
-			[theme.bold(theme.fg("muted", "Tabs:")), ...labels],
+			[theme.bold(theme.fg("muted", "分类：")), ...labels],
 			theme.fg("muted", "  "),
 			safeWidth,
 		);
 		const tabKey = keyText("tui.input.tab", { primaryOnly: true });
 		const shiftTabKey = keyText("app.configuration.previousTab", { primaryOnly: true });
 		const closeKey = keyText("tui.select.cancel", { primaryOnly: true });
-		const hint = `${theme.fg("dim", `${tabKey}/${shiftTabKey}`)}${theme.fg("muted", " switch tabs · ")}${theme.fg("dim", closeKey)}${theme.fg("muted", " close")}`;
+		const hint = `${theme.fg("dim", `${tabKey}/${shiftTabKey}`)}${theme.fg("muted", " 切换分类 · ")}${theme.fg("dim", closeKey)}${theme.fg("muted", " 关闭")}`;
 		return [...lines, ...wrapTextWithAnsi(hint, safeWidth)];
 	}
 
@@ -133,9 +133,9 @@ export class ConfigurationMenuComponent extends Container implements Focusable {
 				getRows: options.getRows,
 				header: tabBar,
 				getHeaderRows,
-				title: "Providers",
-				subtitle: "Connect with a subscription or API key.",
-				searchPlaceholder: "Search providers",
+				title: "模型服务",
+				subtitle: "用订阅账号或 API key 连接。",
+				searchPlaceholder: "搜索模型服务",
 			},
 		);
 		const models = new ModelSelectorComponent(
@@ -166,9 +166,9 @@ export class ConfigurationMenuComponent extends Container implements Focusable {
 				getRows: options.getRows,
 				header: tabBar,
 				getHeaderRows,
-				title: "MCP Connections",
-				subtitle: "Connect MCP integrations and service credentials.",
-				searchPlaceholder: "Search MCP connections",
+				title: "MCP 连接",
+				subtitle: "连接 MCP 集成和服务凭据。",
+				searchPlaceholder: "搜索 MCP 连接",
 			},
 		);
 

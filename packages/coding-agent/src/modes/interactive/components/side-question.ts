@@ -136,9 +136,9 @@ export class SideQuestionComponent implements Component {
 			return lines;
 		}
 		if (turn.event.status === "cancelled") {
-			return new Text(theme.fg("userMessageText", "Cancelled"), this.paddingX, 0).render(width);
+			return new Text(theme.fg("userMessageText", "已取消"), this.paddingX, 0).render(width);
 		}
-		const message = turn.event.status === "complete" ? "No response" : "Thinking…";
+		const message = turn.event.status === "complete" ? "没有回复" : "Thinking…";
 		return new Text(theme.fg("userMessageText", message), this.paddingX, 0).render(width);
 	}
 

@@ -339,13 +339,13 @@ describe("TreeSelectorComponent", () => {
 			let render = list.render(200).join("\n");
 			expect(render).toContain("[checkpoint]");
 			expect(render).not.toContain("3/28 14:32");
-			expect(render).not.toContain("[+label time]");
+			expect(render).not.toContain("[+标记时间]");
 
 			selector.handleInput("T");
 
 			render = list.render(200).join("\n");
 			expect(render).toContain("3/28 14:32");
-			expect(render).toContain("[+label time]");
+			expect(render).toContain("[+标记时间]");
 		});
 	});
 

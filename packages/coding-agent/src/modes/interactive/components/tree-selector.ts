@@ -628,20 +628,20 @@ class TreeList implements Component {
 		let labels = "";
 		switch (this.filterMode) {
 			case "no-tools":
-				labels += " [no-tools]";
+				labels += " [不含工具]";
 				break;
 			case "user-only":
-				labels += " [user]";
+				labels += " [只看你的消息]";
 				break;
 			case "labeled-only":
-				labels += " [labeled]";
+				labels += " [已标记]";
 				break;
 			case "all":
-				labels += " [all]";
+				labels += " [全部]";
 				break;
 		}
 		if (this.showLabelTimestamps) {
-			labels += " [+label time]";
+			labels += " [+标记时间]";
 		}
 		return labels;
 	}

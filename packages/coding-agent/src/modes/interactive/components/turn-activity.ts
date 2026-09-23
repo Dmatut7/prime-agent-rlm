@@ -487,6 +487,7 @@ export class TurnSummaryComponent implements Component {
 			this.state.processBlockExpanded,
 			this.state.commsBlockExpanded,
 			this.state.processKeyStepsArmed,
+			this.state.commMessageCount,
 		].join(",");
 		if (this.cachedLines && this.cachedWidth === width && settled && this.cachedLaneKey === laneKey) {
 			return this.cachedLines;
@@ -555,7 +556,8 @@ export class TurnSummaryComponent implements Component {
 			commMessages,
 			durationMs: this.turnState.turnDurationMs(),
 			cols: safeWidth,
-			summary: turnStepsSummary(this.turnState.steps),
+			// While running, the live step rows below already say what runs.
+			summary: this.turnState.isTurnEnded ? turnStepsSummary(this.turnState.steps) : undefined,
 			running: !this.turnState.isTurnEnded,
 			thinkingMs: this.turnState.thinkingDurationMs(),
 			// The preview stands in for the trace; with the trace open (Ctrl+T) it would repeat it.
@@ -571,7 +573,8 @@ export class TurnSummaryComponent implements Component {
 				!this.turnState.isTurnEnded ||
 				this.turnState.thinkingBlockExpanded ||
 				this.turnState.processBlockExpanded ||
-				this.turnState.commsBlockExpanded
+				// The comms lane opens nothing in a turn without comms.
+				(this.turnState.commsBlockExpanded && commMessages > 0)
 					? "▾"
 					: "▸",
 		});

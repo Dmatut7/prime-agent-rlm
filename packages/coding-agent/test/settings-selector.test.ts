@@ -76,10 +76,10 @@ describe("SettingsSelectorComponent", () => {
 			const component = new SettingsSelectorComponent(config, callbacks);
 			const rendered = stripAnsi(component.render(120).join("\n"));
 
-			expect(rendered).toContain("Show image metadata");
-			expect(rendered).toContain("Auto-resize images");
+			expect(rendered).toContain("显示图片信息");
+			expect(rendered).toContain("自动缩小图片");
 			for (const character of "idle") component.getSettingsList().handleInput(character);
-			expect(stripAnsi(component.render(120).join("\n"))).toContain("Idle worker eviction");
+			expect(stripAnsi(component.render(120).join("\n"))).toContain("空闲回收");
 		} finally {
 			resetCapabilitiesCache();
 		}
@@ -91,7 +91,7 @@ describe("SettingsSelectorComponent", () => {
 		const list = component.getSettingsList();
 		for (const character of "process") list.handleInput(character);
 
-		expect(stripAnsi(component.render(120).join("\n"))).toContain("Process mode");
+		expect(stripAnsi(component.render(120).join("\n"))).toContain("过程显示");
 
 		list.handleInput("\r");
 

@@ -811,8 +811,25 @@ describe("turn state for the process line", () => {
 		expect(caret()).toBe(" ▾ ");
 		state.thinkingExpanded = false;
 		expect(caret()).toBe(" ▸ ");
+		// Ctrl+P opens nothing in a turn without comms, so the caret stays put.
 		state.agentMessagesExpanded = true;
+		expect(caret()).toBe(" ▸ ");
+		state.addCommMessage();
 		expect(caret()).toBe(" ▾ ");
+	});
+
+	it("drops the plain-words summary from the header while the turn runs (QA L2)", () => {
+		const state = new TurnActivityState(1_000);
+		state.addStep({ toolCallId: "t1", toolName: "bash", args: { command: "sleep 30" }, status: "running" });
+		const summary = new TurnSummaryComponent(state);
+		summary.setQuiet(true);
+		const running = stripAnsi(summary.render(120)[0] ?? "");
+		expect(running).toContain("运行中 · 第 1 步");
+		expect(running).not.toContain("sleep 30");
+		state.setStepStatus("t1", "done", 1_500);
+		state.markTurnEnded(1_600);
+		summary.invalidate();
+		expect(stripAnsi(summary.render(120)[0] ?? "")).toContain("运行 sleep 30");
 	});
 
 	it("previews the turn's first thinking trace, following it while it streams", () => {

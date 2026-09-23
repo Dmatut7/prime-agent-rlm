@@ -57,11 +57,8 @@ class PrimeLoginHeader implements Component {
 		return [
 			...logoLines,
 			centeredLine("", safeWidth),
-			centeredLine(theme.bold(theme.fg("text", "Login to Prime Inference")), safeWidth),
-			centeredLine(
-				theme.fg("muted", "Connect your Prime Intellect account to enable Prime Inference models."),
-				safeWidth,
-			),
+			centeredLine(theme.bold(theme.fg("text", "登录 Prime Inference")), safeWidth),
+			centeredLine(theme.fg("muted", "连接你的 Prime Intellect 账号，启用 Prime Inference 模型。"), safeWidth),
 		];
 	}
 }
@@ -109,11 +106,11 @@ export class LoginDialogComponent extends Container implements Focusable {
 		const providerInfo = getOAuthProviders().find((p) => p.id === providerId);
 		const providerName = providerNameOverride || providerInfo?.name || providerId;
 		this.isPrimeInference = providerId === PRIME_INFERENCE_PROVIDER_ID;
-		const title = titleOverride ?? `Login to ${providerName}`;
+		const title = titleOverride ?? `登录 ${providerName}`;
 
 		const panel = new MenuPanel({
 			title: this.isPrimeInference ? "" : title,
-			subtitle: this.isPrimeInference ? undefined : "Complete this step to continue setup.",
+			subtitle: this.isPrimeInference ? undefined : "完成这一步才能继续设置。",
 		});
 		this.addChild(panel);
 
@@ -122,7 +119,7 @@ export class LoginDialogComponent extends Container implements Focusable {
 		panel.addChild(this.contentContainer);
 
 		// Input (always present, used when needed)
-		this.input = new MenuSearchInput("Paste value");
+		this.input = new MenuSearchInput("粘贴到这里");
 		this.input.onSubmit = () => {
 			if (this.inputResolver) {
 				this.inputResolver(this.input.getValue());
@@ -157,10 +154,10 @@ export class LoginDialogComponent extends Container implements Focusable {
 	showAuth(url: string, instructions?: string): void {
 		this.startContent();
 		this.authUrl = url;
-		this.addSectionTitle("Browser sign-in");
-		this.addMutedText("The sign-in page should already be opening. If it did not open, use the link below.");
+		this.addSectionTitle("浏览器登录");
+		this.addMutedText("登录页面应该已经打开了；没打开的话，用下面的链接。");
 		this.contentContainer.addChild(new Spacer(1));
-		this.addLabel("Sign-in link");
+		this.addLabel("登录链接");
 		const linkedUrl = getCapabilities().hyperlinks ? `\x1b]8;;${url}\x07${url}\x1b]8;;\x07` : url;
 		this.contentContainer.addChild(new Text(theme.fg("text", linkedUrl), 0, 0));
 		this.authActions = new Text(this.getAuthActionsText(), 0, 0);
@@ -192,12 +189,12 @@ export class LoginDialogComponent extends Container implements Focusable {
 	 */
 	showManualInput(prompt: string): Promise<string> {
 		this.addSectionSpacer();
-		this.addSectionTitle("Manual fallback");
+		this.addSectionTitle("手动方式");
 		this.addMutedText(prompt);
 		this.contentContainer.addChild(this.input);
 		this.inputVisible = true;
 		this.authActions?.setText(this.getAuthActionsText());
-		this.contentContainer.addChild(new Text(theme.fg("muted", keyHint("tui.select.cancel", "cancel")), 0, 0));
+		this.contentContainer.addChild(new Text(theme.fg("muted", keyHint("tui.select.cancel", "取消")), 0, 0));
 		this.tui.requestRender();
 
 		return this.waitForInput();
@@ -221,14 +218,14 @@ export class LoginDialogComponent extends Container implements Focusable {
 		this.addSectionSpacer();
 		this.addSectionTitle(message);
 		if (placeholder) {
-			this.contentContainer.addChild(new Text(theme.fg("muted", `e.g., ${placeholder}`), 0, 0));
+			this.contentContainer.addChild(new Text(theme.fg("muted", `例如：${placeholder}`), 0, 0));
 		}
 		this.contentContainer.addChild(this.input);
 		this.inputVisible = true;
 		this.authActions?.setText(this.getAuthActionsText());
 		this.contentContainer.addChild(
 			new Text(
-				theme.fg("muted", `${keyHint("tui.select.confirm", "submit")}  ${keyHint("tui.select.cancel", "cancel")}`),
+				theme.fg("muted", `${keyHint("tui.select.confirm", "提交")}  ${keyHint("tui.select.cancel", "取消")}`),
 				0,
 			),
 		);
@@ -248,7 +245,7 @@ export class LoginDialogComponent extends Container implements Focusable {
 			this.contentContainer.addChild(new Text(line, 0, 0));
 		}
 		this.contentContainer.addChild(new Spacer(1));
-		this.contentContainer.addChild(new Text(theme.fg("muted", keyHint("tui.select.cancel", "close")), 0, 0));
+		this.contentContainer.addChild(new Text(theme.fg("muted", keyHint("tui.select.cancel", "关闭")), 0, 0));
 		this.tui.requestRender();
 	}
 
@@ -260,10 +257,7 @@ export class LoginDialogComponent extends Container implements Focusable {
 		this.contentContainer.addChild(new Spacer(1));
 		this.contentContainer.addChild(
 			new Text(
-				theme.fg(
-					"muted",
-					`${keyHint("tui.select.confirm", "continue")}  ${keyHint("tui.select.cancel", "cancel")}`,
-				),
+				theme.fg("muted", `${keyHint("tui.select.confirm", "继续")}  ${keyHint("tui.select.cancel", "取消")}`),
 				0,
 				0,
 			),
@@ -282,7 +276,7 @@ export class LoginDialogComponent extends Container implements Focusable {
 	showWaiting(message: string): void {
 		this.addSectionSpacer();
 		this.contentContainer.addChild(new Text(theme.fg("accent", message), 0, 0));
-		this.contentContainer.addChild(new Text(theme.fg("muted", keyHint("tui.select.cancel", "cancel")), 0, 0));
+		this.contentContainer.addChild(new Text(theme.fg("muted", keyHint("tui.select.cancel", "取消")), 0, 0));
 		this.tui.requestRender();
 	}
 
@@ -292,7 +286,7 @@ export class LoginDialogComponent extends Container implements Focusable {
 	showProgress(message: string): void {
 		if (this.contentContainer.children.length === 0) {
 			this.startContent();
-			this.addSectionTitle("Preparing authentication");
+			this.addSectionTitle("正在准备登录");
 		}
 		this.contentContainer.addChild(new Text(theme.fg("muted", message), 0, 0));
 		this.tui.requestRender();
@@ -323,11 +317,11 @@ export class LoginDialogComponent extends Container implements Focusable {
 	private addInstructions(instructions: string): void {
 		const codeMatch = /^(?:Code|Enter code):\s*(.+)$/i.exec(instructions.trim());
 		if (codeMatch?.[1]) {
-			this.addLabel("Verification code");
+			this.addLabel("验证码");
 			this.contentContainer.addChild(new Text(theme.bold(theme.fg("text", codeMatch[1])), 0, 0));
 			return;
 		}
-		this.addLabel("Next step");
+		this.addLabel("下一步");
 		this.contentContainer.addChild(new Text(theme.fg("text", instructions), 0, 0));
 	}
 
@@ -355,11 +349,11 @@ export class LoginDialogComponent extends Container implements Focusable {
 				: undefined;
 		const statusText =
 			status === "copied"
-				? theme.fg("success", "Copied sign-in link")
+				? theme.fg("success", "已复制登录链接")
 				: status === "failed"
-					? theme.fg("error", "Failed to copy sign-in link")
+					? theme.fg("error", "复制登录链接失败")
 					: undefined;
-		return [statusText, copyHint, keyHint("tui.select.cancel", "cancel")]
+		return [statusText, copyHint, keyHint("tui.select.cancel", "取消")]
 			.filter((part): part is string => part !== undefined)
 			.join("  ");
 	}

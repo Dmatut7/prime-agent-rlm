@@ -93,7 +93,7 @@ export class SettingsList implements Component {
 		}
 
 		if (this.items.length === 0) {
-			lines.push(this.theme.hint("  No settings available"));
+			lines.push(this.theme.hint("  没有可设置的项"));
 			if (this.searchEnabled) {
 				this.addHintLine(lines, width);
 			}
@@ -102,7 +102,7 @@ export class SettingsList implements Component {
 
 		const displayItems = this.searchEnabled ? this.filteredItems : this.items;
 		if (displayItems.length === 0) {
-			lines.push(truncateToWidth(this.theme.hint("  No matching settings"), width));
+			lines.push(truncateToWidth(this.theme.hint("  没有匹配的设置"), width));
 			this.addHintLine(lines, width);
 			return lines;
 		}
@@ -215,7 +215,8 @@ export class SettingsList implements Component {
 	}
 
 	private applyFilter(query: string): void {
-		this.filteredItems = fuzzyFilter(this.items, query, (item) => item.label);
+		// The id keeps search working in English when labels are translated.
+		this.filteredItems = fuzzyFilter(this.items, query, (item) => `${item.label} ${item.id}`);
 		this.selectedIndex = 0;
 	}
 
@@ -224,9 +225,7 @@ export class SettingsList implements Component {
 		lines.push(
 			truncateToWidth(
 				this.theme.hint(
-					this.searchEnabled
-						? "  Type to search · Enter/Space to change · Esc to cancel"
-						: "  Enter/Space to change · Esc to cancel",
+					this.searchEnabled ? "  输入可搜索 · Enter/空格 修改 · Esc 取消" : "  Enter/空格 修改 · Esc 取消",
 				),
 				width,
 			),

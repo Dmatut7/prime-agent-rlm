@@ -98,7 +98,7 @@ describe("agents view settled/duration/answer columns (U3)", () => {
 			expect(busyLine).not.toContain("✓");
 			// The legend names both new columns, leading the block it always had.
 			const legend = stripAnsi(layout.legends.get("idle")!);
-			expect(legend).toMatch(/^完成 · +时长 · +↑入 +↓出 · +自身 · +子代理 · +合计 · +更新$/);
+			expect(legend).toMatch(/^状态 · +时长 · +↑入 +↓出 · +自身 · +子代理 · +合计 · +更新$/);
 			// The ` · ` separators sit in the same terminal columns for the legend
 			// and every row of its section, new columns included.
 			// Display columns, not string indexes: the CJK labels are two columns wide.
@@ -306,7 +306,7 @@ describe("agents view settled/duration/answer columns (U3)", () => {
 		});
 		const factsRows = buildAgentsViewRows([factsRow]);
 		const expanded = buildAgentsViewUsageLayout(factsRows);
-		expect(stripAnsi(expanded.legends.get("idle")!)).toMatch(/^完成 · +时长 · +↑入/);
+		expect(stripAnsi(expanded.legends.get("idle")!)).toMatch(/^状态 · +时长 · +↑入/);
 		const expandedDetail = stripAnsi(expanded.details.get(factsRows[0]!.identity)!);
 		expect(visibleWidth(expandedDetail)).toBeGreaterThan(visibleWidth(detail));
 	});
@@ -334,7 +334,7 @@ describe("agents view settled/duration/answer columns (U3)", () => {
 		const bareRow = rows.find((row) => row.summary.sessionId === "bare-session")!;
 		const layout = buildAgentsViewUsageLayout(rows);
 		const legend = stripAnsi(layout.legends.get("idle")!);
-		expect(legend).toMatch(/^完成 · +时长 · +↑入/);
+		expect(legend).toMatch(/^状态 · +时长 · +↑入/);
 		const factsDetail = stripAnsi(layout.details.get(factsRow.identity)!);
 		expect(factsDetail).toContain("✓");
 		expect(factsDetail).toContain("2h");

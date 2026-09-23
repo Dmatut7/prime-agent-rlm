@@ -317,7 +317,7 @@ describe("CustomEditor", () => {
 		editor.setText(Array.from({ length: 20 }, (_, index) => `line ${index}`).join("\n"));
 
 		const top = editor.render(40)[0] ?? "";
-		expect(top).toMatch(/^─── ↑ \d+ more/);
+		expect(top).toMatch(/^─── ↑ 还有 \d+ 行/);
 		expect(top).not.toContain("Ctrl+O");
 	});
 

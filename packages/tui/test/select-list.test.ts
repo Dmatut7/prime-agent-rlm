@@ -188,11 +188,11 @@ describe("SelectList", () => {
 		}));
 		const list = new SelectList(items, 5, testTheme, { showDirectionalScrollInfo: true });
 
-		assert.equal(list.render(80).at(-1)?.trim(), "↓ 7 more");
+		assert.equal(list.render(80).at(-1)?.trim(), "↓ 还有 7 项");
 		list.setSelectedIndex(6);
-		assert.equal(list.render(80).at(-1)?.trim(), "↑ 4 more  ↓ 3 more");
+		assert.equal(list.render(80).at(-1)?.trim(), "↑ 还有 4 项  ↓ 还有 3 项");
 		list.setSelectedIndex(11);
-		assert.equal(list.render(80).at(-1)?.trim(), "↑ 7 more");
+		assert.equal(list.render(80).at(-1)?.trim(), "↑ 还有 7 项");
 	});
 
 	it("keeps descriptions aligned when the primary text is truncated", () => {

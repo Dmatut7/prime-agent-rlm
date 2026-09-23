@@ -679,7 +679,7 @@ export class Editor implements Component, Focusable {
 
 		if (!useBackgroundSurface) {
 			if (this.scrollOffset > 0) {
-				const indicator = `─── ↑ ${this.scrollOffset} more `;
+				const indicator = `─── ↑ 还有 ${this.scrollOffset} 行 `;
 				const remaining = width - visibleWidth(indicator);
 				if (remaining >= 0) {
 					result.push(this.borderColor(indicator + "─".repeat(remaining)));
@@ -690,7 +690,7 @@ export class Editor implements Component, Focusable {
 				result.push(horizontal.repeat(width));
 			}
 		} else {
-			const line = this.scrollOffset > 0 ? this.borderColor(` ↑ ${this.scrollOffset} more`) : "";
+			const line = this.scrollOffset > 0 ? this.borderColor(` ↑ 还有 ${this.scrollOffset} 行`) : "";
 			result.push(renderSurfaceLine(truncateToWidth(line, width)));
 		}
 		// Emit hardware cursor marker only when focused and not showing autocomplete
@@ -748,14 +748,14 @@ export class Editor implements Component, Focusable {
 		const linesBelow = layoutLines.length - (this.scrollOffset + visibleLines.length);
 		if (!useBackgroundSurface) {
 			if (linesBelow > 0) {
-				const indicator = `─── ↓ ${linesBelow} more `;
+				const indicator = `─── ↓ 还有 ${linesBelow} 行 `;
 				const remaining = width - visibleWidth(indicator);
 				result.push(this.borderColor(indicator + "─".repeat(Math.max(0, remaining))));
 			} else {
 				result.push(horizontal.repeat(width));
 			}
 		} else {
-			const line = linesBelow > 0 ? this.borderColor(` ↓ ${linesBelow} more`) : "";
+			const line = linesBelow > 0 ? this.borderColor(` ↓ 还有 ${linesBelow} 行`) : "";
 			result.push(renderSurfaceLine(truncateToWidth(line, width)));
 		}
 

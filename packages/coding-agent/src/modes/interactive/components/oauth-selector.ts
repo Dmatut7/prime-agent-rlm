@@ -116,10 +116,8 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 				: (this.categories[0] ?? "provider");
 
 		const panel = new MenuPanel({
-			title: options.title ?? (mode === "login" ? "Providers" : "Saved Credentials"),
-			subtitle:
-				options.subtitle ??
-				(mode === "login" ? "Connect with a subscription or API key." : "Choose a credential to remove."),
+			title: options.title ?? (mode === "login" ? "模型服务" : "已保存的凭据"),
+			subtitle: options.subtitle ?? (mode === "login" ? "用订阅账号或 API key 连接。" : "选择要移除的凭据。"),
 		});
 		this.addChild(panel);
 		if (options.header) {
@@ -133,7 +131,7 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 			panel.addChild(new Spacer(1));
 		}
 
-		this.searchInput = new MenuSearchInput(options.searchPlaceholder ?? "Search providers");
+		this.searchInput = new MenuSearchInput(options.searchPlaceholder ?? "搜索模型服务");
 		this.searchInput.onSubmit = () => {
 			const selectedProvider = this.filteredProviders[this.selectedIndex];
 			if (selectedProvider) {
@@ -166,8 +164,8 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 	private updateTabBar(): void {
 		if (!this.tabBar) return;
 		const labels: Record<AuthSelectorCategory, string> = {
-			provider: "Providers",
-			service: "MCP Connections",
+			provider: "模型服务",
+			service: "MCP 连接",
 		};
 		const rendered = this.categories
 			.map((category) =>
@@ -176,7 +174,7 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 					: theme.fg("muted", labels[category]),
 			)
 			.join(theme.fg("muted", "  ·  "));
-		this.tabBar.setText(`${rendered}   ${theme.fg("muted", "←/→ switch")}`);
+		this.tabBar.setText(`${rendered}   ${theme.fg("muted", "←/→ 切换")}`);
 	}
 
 	private filterProviders(query: string): void {
@@ -311,9 +309,9 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 			const message =
 				this.allProviders.length === 0
 					? this.mode === "login"
-						? "No providers available"
-						: "No providers logged in. Use /login first."
-					: "No matching providers";
+						? "没有可用的模型服务"
+						: "还没有登录任何模型服务，先用 /login"
+					: "没有匹配的模型服务";
 			this.listContainer.addChild(new TruncatedText(theme.fg("muted", message), 1, 0));
 		}
 	}
@@ -322,21 +320,21 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 		const status = this.getAuthStatus(provider.id);
 		const credential = this.authStorage.get(provider.id);
 		if (this.isProviderStale(provider)) {
-			return theme.fg("warning", status.label ?? "expired");
+			return theme.fg("warning", !status.label || status.label === "expired" ? "已过期" : status.label);
 		}
 
 		if (status.source && status.source !== "stored") {
 			return provider.authType === "api_key"
 				? this.formatApiKeyStatusIndicator(status)
-				: theme.fg("muted", "unconfigured");
+				: theme.fg("muted", "未配置");
 		}
 
-		if (credential?.type === provider.authType) return theme.fg("success", "configured");
+		if (credential?.type === provider.authType) return theme.fg("success", "已配置");
 		if (credential) {
-			const label = credential.type === "oauth" ? "subscription configured" : "API key configured";
+			const label = credential.type === "oauth" ? "已配置订阅" : "已配置 API key";
 			return theme.fg("warning", label);
 		}
-		if (provider.authType !== "api_key") return theme.fg("muted", "unconfigured");
+		if (provider.authType !== "api_key") return theme.fg("muted", "未配置");
 
 		return this.formatApiKeyStatusIndicator(status);
 	}
@@ -348,15 +346,15 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 			case "prime_cli":
 				return theme.fg("success", status.label ?? "Prime CLI");
 			case "runtime":
-				return theme.fg("success", "runtime API key");
+				return theme.fg("success", "运行时 API key");
 			case "fallback":
-				return theme.fg("success", "custom API key");
+				return theme.fg("success", "自定义 API key");
 			case "models_json_key":
-				return theme.fg("success", "key in models.json");
+				return theme.fg("success", "models.json 中的 key");
 			case "models_json_command":
-				return theme.fg("success", "command in models.json");
+				return theme.fg("success", "models.json 中的命令");
 			default:
-				return theme.fg("muted", "unconfigured");
+				return theme.fg("muted", "未配置");
 		}
 	}
 
