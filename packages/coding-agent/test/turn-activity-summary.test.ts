@@ -3,6 +3,7 @@ import type { AssistantMessage, ToolResultMessage } from "@earendil-works/pi-ai"
 import type { TUI } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, it, vi } from "vitest";
+import { AGENT_MESSAGE_SOURCE, createAgentSessionMessage } from "../src/core/agent-messages.js";
 import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
 import { buildConversationComponents } from "../src/modes/interactive/components/conversation-components.js";
 import {
@@ -369,5 +370,166 @@ describe("turn activity summary (U4)", () => {
 		expect(turnStepVerb("ipython")).toBe("python");
 		expect(turnStepVerb("edit")).toBe("edit");
 		expect(turnStepVerb("agent")).toBe("agent");
+	});
+});
+
+describe("turn head footnote (TUI v4 quiet)", () => {
+	beforeAll(() => initTheme("dark"));
+
+	function renderQuiet(messages: readonly AgentMessage[]): string {
+		const components = buildConversationComponents(messages, {
+			ui,
+			cwd: "/tmp",
+			toolOptions: {},
+			getToolDefinition: () => undefined,
+			processMode: "quiet",
+		});
+		return components
+			.flatMap((component) => component.render(120))
+			.map(stripAnsi)
+			.join("\n");
+	}
+
+	it("collapses the turn head to one footnote line and drops the legacy pair", () => {
+		const messages: AgentMessage[] = [
+			{ role: "user", content: "run the checks", timestamp: 900 },
+			...toolHeavyTurn(),
+		];
+		const collapsed = renderQuiet(messages);
+		const nonEmpty = collapsed.split("\n").filter((line) => line.trim().length > 0);
+
+		// One footnote line at the turn head: duration, steps, the [O] hint.
+		expect(nonEmpty[1]).toContain("干了");
+		expect(nonEmpty[1]).toContain("6 步");
+		expect(nonEmpty[1]).toContain("[O]");
+		// The very next line is the final prose: no second mechanical line.
+		expect(nonEmpty[2]).toContain("All six checks passed");
+		expect(nonEmpty.filter((line) => line.includes("步"))).toHaveLength(1);
+		// The legacy two-line surface is gone.
+		expect(collapsed).not.toContain("⚙");
+		expect(collapsed).not.toContain("思考 ");
+	});
+
+	it("renders a thinking-only quiet turn as 想了想, and a bare turn as nothing", () => {
+		const messages: AgentMessage[] = [
+			{ role: "user", content: "just think", timestamp: 900 },
+			assistant(
+				[
+					{ type: "thinking", thinking: "First segment." },
+					{ type: "thinking", thinking: "Second segment." },
+					{ type: "text", text: "Concluded." },
+				],
+				1_000,
+			),
+			{ role: "user", content: "next", timestamp: 3_000 },
+			assistant([{ type: "text", text: "No thinking here." }], 3_500),
+		];
+		const collapsed = renderQuiet(messages);
+		const nonEmpty = collapsed.split("\n").filter((line) => line.trim().length > 0);
+		// The empty-state turn: only 想了想, no counts, no keys, no duration.
+		expect(nonEmpty[1]).toBe("想了想");
+		expect(collapsed).toContain("Concluded.");
+		// A turn with neither steps, thinking, nor comms renders no footnote.
+		expect(collapsed.split("\n").filter((line) => line.includes("想了想"))).toHaveLength(1);
+	});
+
+	it("counts comms from received agent rows plus sent agent messages in tool details", () => {
+		const messages: AgentMessage[] = [
+			{ role: "user", content: "delegate and report", timestamp: 900 },
+			assistant(
+				[
+					{ type: "thinking", thinking: "One segment." },
+					{ type: "toolCall", id: "py-1", name: "ipython", arguments: { code: "send()" } },
+				],
+				1_000,
+			),
+			{
+				...toolResult("py-1", "ipython", "ok", 1_100),
+				details: {
+					sentAgentMessages: [
+						{
+							id: "agentmsg_sent_1",
+							message: "sent one",
+							deliveryStatus: "delivered",
+							target: { activeSessionId: "t1", sessionId: "t1" },
+						},
+						{
+							id: "agentmsg_sent_2",
+							message: "sent two",
+							deliveryStatus: "delivered",
+							target: { activeSessionId: "t1", sessionId: "t1" },
+						},
+					],
+				},
+			},
+			createAgentSessionMessage(
+				{
+					id: "agentmsg_recv_1",
+					source: AGENT_MESSAGE_SOURCE,
+					message: "received one",
+					target: { activeSessionId: "a1", sessionId: "a1" },
+				},
+				1_200,
+			),
+			assistant([{ type: "text", text: "Reported." }], 1_300),
+		];
+		const collapsed = renderQuiet(messages);
+		// 1 step, 1 thinking segment, 3 comms (2 sent + 1 received).
+		expect(collapsed).toContain("1 步");
+		expect(collapsed).toContain("想 1 段");
+		expect(collapsed).toContain("→ 通讯 3 条");
+		expect(collapsed).toContain("[P]");
+	});
+
+	it("counts steps deduped by toolCallId", () => {
+		const state = new TurnActivityState(1_000);
+		state.addStep({ toolCallId: "dup", toolName: "bash", args: {}, status: "done" });
+		state.addStep({ toolCallId: "dup", toolName: "bash", args: {}, status: "done" });
+		state.markTurnEnded(2_000);
+		const summary = new TurnSummaryComponent(state);
+		summary.setQuiet(true);
+		const line = stripAnsi(summary.render(120).join("\n"));
+		expect(line).toContain("1 步");
+		expect(line).not.toContain("2 步");
+	});
+
+	it("addCommMessage feeds the footnote count", () => {
+		const state = new TurnActivityState(1_000);
+		state.addStep({ toolCallId: "t1", toolName: "bash", args: {}, status: "done" });
+		state.markTurnEnded(1_500);
+		const summary = new TurnSummaryComponent(state);
+		summary.setQuiet(true);
+		summary.addCommMessage();
+		summary.addCommMessage();
+		const line = stripAnsi(summary.render(120).join("\n"));
+		expect(line).toContain("→ 通讯 2 条");
+	});
+
+	it("setQuiet(false) restores the legacy two-line face", () => {
+		const state = new TurnActivityState(1_000);
+		state.addStep({ toolCallId: "t1", toolName: "bash", args: {}, status: "done" });
+		state.markTurnEnded(1_500);
+		const summary = new TurnSummaryComponent(state);
+		summary.setQuiet(true);
+		expect(stripAnsi(summary.render(120).join("\n"))).toContain("1 步 [O]");
+		summary.setQuiet(false);
+		const legacy = stripAnsi(summary.render(120).join("\n"));
+		expect(legacy).toContain("⚙ 1 步");
+		expect(legacy).not.toContain("[O]");
+	});
+
+	it("freezes the settled footnote line: repeated renders reuse one array", () => {
+		const state = new TurnActivityState(1_000);
+		state.addStep({ toolCallId: "t1", toolName: "bash", args: {}, status: "done" });
+		// Live turn (no end stamp): every render recomputes - fresh arrays.
+		const summary = new TurnSummaryComponent(state);
+		summary.setQuiet(true);
+		const firstLive = summary.render(120);
+		const secondLive = summary.render(120);
+		expect(secondLive).not.toBe(firstLive);
+		// Settled + ended: the line freezes (O(this line) redraw contract).
+		state.markTurnEnded(2_000);
+		const firstSettled = summary.render(120);
+		expect(summary.render(120)).toBe(firstSettled);
 	});
 });

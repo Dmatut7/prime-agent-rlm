@@ -92,6 +92,9 @@ export function buildConversationComponents(
 	// no rows of their own while collapsed.
 	let turnState: TurnActivityState | undefined;
 	let turnSummary: TurnSummaryComponent | undefined;
+	// TUI v4: comms counted per turn (received agent-message rows + sent
+	// agent messages inside ipython tool details), deduped by message id.
+	const sentCommIds = new Set<string>();
 
 	const ensureTurn = (startedAt: number): TurnActivityState => {
 		if (!turnState) {
@@ -108,6 +111,7 @@ export function buildConversationComponents(
 			turnState?.markTurnEnded(Number(message.timestamp) || Date.now());
 			turnState = undefined;
 			turnSummary = undefined;
+			sentCommIds.clear();
 		}
 		if (message.role === "assistant") {
 			// The turn summary is created at the turn head, before the first
@@ -118,6 +122,8 @@ export function buildConversationComponents(
 			if (!turnSummary) {
 				turnSummary = new TurnSummaryComponent(state);
 				turnSummary.setExpanded(expanded);
+				// TUI v4: quiet turns carry the one-line footnote at their head.
+				turnSummary.setQuiet(options.processMode === "quiet");
 				components.push(turnSummary);
 			}
 			components.push(
@@ -185,6 +191,24 @@ export function buildConversationComponents(
 				message.isError ? "error" : "done",
 				Number(message.timestamp) || Date.now(),
 			);
+			// TUI v4: sent agent messages riding this tool result count as comms.
+			const details =
+				typeof message.details === "object" && message.details !== null
+					? (message.details as Record<string, unknown>)
+					: {};
+			if (Array.isArray(details.sentAgentMessages)) {
+				for (const entry of details.sentAgentMessages) {
+					const id =
+						typeof entry === "object" && entry !== null && "id" in entry
+							? String((entry as Record<string, unknown>).id)
+							: undefined;
+					if (id === undefined || sentCommIds.has(id)) {
+						continue;
+					}
+					sentCommIds.add(id);
+					turnSummary?.addCommMessage();
+				}
+			}
 		} else if (
 			message.role === "custom" &&
 			(message.customType === SESSION_SLASH_COMMAND_CUSTOM_TYPE ||
@@ -213,6 +237,8 @@ export function buildConversationComponents(
 			component.setExpanded(expanded);
 			components.push(component);
 		} else if (isAgentSessionMessage(message) && message.display) {
+			// TUI v4: a received agent-message row is one comm in this turn.
+			turnSummary?.addCommMessage();
 			const component = new AgentMessageComponent(message, options.markdownTheme, {
 				suppressLeadingSpace: isCompactAgentMessageNeighbor(components.at(-1)),
 			});

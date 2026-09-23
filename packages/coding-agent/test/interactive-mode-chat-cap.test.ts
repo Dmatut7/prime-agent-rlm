@@ -47,6 +47,7 @@ type CapHarness = {
 		setShowImages: (enabled: boolean) => void;
 		setFullscreen: (enabled: boolean) => void;
 		getFullscreenMouse: () => boolean;
+		getProcessMode: () => "quiet" | "legacy";
 	};
 	preloadToolDefinitions: (names: string[]) => Promise<void>;
 	getCachedToolDefinition: () => undefined;
@@ -178,6 +179,7 @@ function createCapHarness(overrides: Partial<CapHarness> = {}): CapHarness {
 			setShowImages: vi.fn(),
 			setFullscreen: vi.fn(),
 			getFullscreenMouse: () => false,
+			getProcessMode: () => "quiet" as const,
 		},
 		preloadToolDefinitions: vi.fn(async () => {}),
 		getCachedToolDefinition: () => undefined,

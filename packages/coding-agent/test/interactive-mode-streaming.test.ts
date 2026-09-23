@@ -83,7 +83,9 @@ type HandleSubagentSummaryChatAction = (
 function createFakeInteractiveModeThis(): HandleEventThis {
 	const fakeThis = {
 		isInitialized: true,
-		settingsManager: { getShowTerminalProgress: () => false, getProcessMode: () => "quiet" as const },
+		// TUI v4: this suite pins the streaming mechanics on the legacy face;
+		// the quiet footnote face is pinned in turn-activity-summary.test.ts.
+		settingsManager: { getShowTerminalProgress: () => false, getProcessMode: () => "legacy" as const },
 		// message_end/agent_end feed the subagent spend cell; with zero children the
 		// schedule path clears the cell and never arms a timer.
 		subagentCounts: { total: 0, running: 0, idle: 0, inactive: 0 } satisfies SubagentSummaryCounts,

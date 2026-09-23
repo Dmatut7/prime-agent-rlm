@@ -257,9 +257,9 @@ describe("U6 status area layout", () => {
 
 		hasContent = true;
 		const rendered = stripAnsi(line.render(100).join("\n"));
-		// `Ctrl+T 思考 · Ctrl+O 过程 · Ctrl+P 消息` — one dim line, the only
-		// place the key division is stated.
-		expect(rendered).toContain("Ctrl+T 思考 · Ctrl+O 过程 · Ctrl+P 消息");
+		// `Ctrl+T 思考 · Ctrl+O 过程 · Ctrl+P 通讯` — one dim line, the only
+		// place the key division is stated (TUI v4: Ctrl+P owns comms).
+		expect(rendered).toContain("Ctrl+T 思考 · Ctrl+O 过程 · Ctrl+P 通讯");
 		expect(rendered).not.toContain("展开");
 		// It never grows beyond one line.
 		expect(line.render(100)).toHaveLength(1);

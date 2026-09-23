@@ -220,7 +220,7 @@ type RenderSessionContextHarness = {
 	updateEditorBorderColor: () => void;
 	resetPendingToolState: () => void;
 	preloadToolDefinitions: (toolNames: string[]) => Promise<void>;
-	settingsManager: { getShowImages: () => boolean };
+	settingsManager: { getShowImages: () => boolean; getProcessMode: () => "quiet" | "legacy" };
 	getCachedToolDefinition: () => undefined;
 	getCurrentCwd: () => string;
 	getRetryAttempt: () => number;
@@ -268,7 +268,7 @@ function createRenderSessionContextHarness(overrides: Partial<RenderSessionConte
 		updateEditorBorderColor: vi.fn(),
 		resetPendingToolState: vi.fn(),
 		preloadToolDefinitions: vi.fn(async () => {}),
-		settingsManager: { getShowImages: () => true },
+		settingsManager: { getShowImages: () => true, getProcessMode: () => "quiet" as const },
 		getCachedToolDefinition: () => undefined,
 		getCurrentCwd: () => process.cwd(),
 		getRetryAttempt: () => 0,
@@ -340,6 +340,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 				preloadToolDefinitions: vi.fn(async () => {}),
 				settingsManager: {
 					getShowImages: () => true,
+					getProcessMode: () => "quiet" as const,
 				},
 				getCachedToolDefinition: () => undefined,
 				getCurrentCwd: () => process.cwd(),
@@ -394,6 +395,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 				preloadToolDefinitions: vi.fn(async () => {}),
 				settingsManager: {
 					getShowImages: () => true,
+					getProcessMode: () => "quiet" as const,
 				},
 				getCachedToolDefinition: () => undefined,
 				getCurrentCwd: () => process.cwd(),
@@ -2108,6 +2110,7 @@ describe("InteractiveMode tool event rendering", () => {
 			uiServices: {
 				settingsManager: {
 					getShowImages: () => true,
+					getProcessMode: () => "quiet" as const,
 				},
 			},
 			toolOutputExpanded: false,

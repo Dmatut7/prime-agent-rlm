@@ -3540,6 +3540,8 @@ export class InteractiveMode {
 		const state = new TurnActivityState(this.workingStartedAt ?? Date.now());
 		const summary = new TurnSummaryComponent(state);
 		summary.setExpanded(this.toolOutputExpanded);
+		// TUI v4: the live turn head renders the one-line footnote in quiet mode.
+		summary.setQuiet(this.settingsManager.getProcessMode() === "quiet");
 		this.currentTurnState = state;
 		this.currentTurnSummary = summary;
 		this.chatContainer.addChild(summary);
@@ -6165,6 +6167,10 @@ export class InteractiveMode {
 					) {
 						this.stopRefineLoader();
 					}
+					// TUI v4: a received agent-message row is one comm in this turn.
+					if (isAgentSessionMessage(event.message) && event.message.display) {
+						this.currentTurnSummary?.addCommMessage();
+					}
 					this.addMessageToChat(event.message);
 					this.ui.requestRender();
 				} else if (event.message.role === "user") {
@@ -6309,6 +6315,8 @@ export class InteractiveMode {
 				if (!messages.some((message) => message.id === event.message.id)) {
 					messages.push(event.message);
 					this.lateIpythonSentAgentMessages.set(event.toolCallId, messages);
+					// TUI v4: a newly sent agent message is one comm in this turn.
+					this.currentTurnSummary?.addCommMessage();
 				}
 				this.ipythonToolComponents.get(event.toolCallId)?.appendSentAgentMessage(event.message);
 				this.ui.requestRender();
@@ -7529,6 +7537,10 @@ export class InteractiveMode {
 		// one aggregate line per agent turn, settled tools hidden while collapsed.
 		let replayTurnState: TurnActivityState | undefined;
 		let replayTurnSummary: TurnSummaryComponent | undefined;
+		// TUI v4: comms counted per replayed turn (received agent-message rows +
+		// sent agent messages inside ipython tool details), deduped by id.
+		const replaySentCommIds = new Set<string>();
+		const replayQuiet = this.settingsManager.getProcessMode() === "quiet";
 		const toolNames: string[] = [];
 		for (const message of messagesToRender) {
 			if (message.role !== "assistant") {
@@ -7580,6 +7592,7 @@ export class InteractiveMode {
 				replayTurnState?.markTurnEnded(Number(message.timestamp) || Date.now());
 				replayTurnState = undefined;
 				replayTurnSummary = undefined;
+				replaySentCommIds.clear();
 			}
 			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
@@ -7589,6 +7602,8 @@ export class InteractiveMode {
 					replayTurnState = new TurnActivityState(Number(message.timestamp) || Date.now());
 					replayTurnSummary = new TurnSummaryComponent(replayTurnState);
 					replayTurnSummary.setExpanded(this.toolOutputExpanded);
+					// TUI v4: quiet turns carry the one-line footnote at their head.
+					replayTurnSummary.setQuiet(replayQuiet);
 					this.chatContainer.addChild(replayTurnSummary);
 				}
 				replayTurnState.addThinkingSegments(countThinkingSegments(message));
@@ -7653,7 +7668,29 @@ export class InteractiveMode {
 					message.isError ? "error" : "done",
 					Number(message.timestamp) || Date.now(),
 				);
+				// TUI v4: sent agent messages riding this tool result count as comms.
+				const details =
+					typeof message.details === "object" && message.details !== null
+						? (message.details as Record<string, unknown>)
+						: {};
+				if (Array.isArray(details.sentAgentMessages)) {
+					for (const entry of details.sentAgentMessages) {
+						const id =
+							typeof entry === "object" && entry !== null && "id" in entry
+								? String((entry as Record<string, unknown>).id)
+								: undefined;
+						if (id === undefined || replaySentCommIds.has(id)) {
+							continue;
+						}
+						replaySentCommIds.add(id);
+						replayTurnSummary?.addCommMessage();
+					}
+				}
 			} else {
+				// TUI v4: a received agent-message row is one comm in this turn.
+				if (isAgentSessionMessage(message) && message.display) {
+					replayTurnSummary?.addCommMessage();
+				}
 				// All other messages use standard rendering
 				this.addMessageToChat(message, renderOptions);
 			}

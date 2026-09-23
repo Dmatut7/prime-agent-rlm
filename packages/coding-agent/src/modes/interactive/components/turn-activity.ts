@@ -1,5 +1,6 @@
 import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { theme } from "../theme/theme.js";
+import { TurnFootNote } from "./turn-footnote.js";
 
 export type TurnStepStatus = "queued" | "running" | "done" | "error";
 
@@ -86,6 +87,22 @@ export class TurnActivityState {
 		return this.thinkingSegments + this.liveThinkingSegments;
 	}
 
+	/**
+	 * TUI v4: the turn's wall-clock span in milliseconds, for the quiet-mode
+	 * footnote. Same freeze rules as the legacy duration text: a tool turn
+	 * freezes on its last settled step, a thinking-only turn on the
+	 * turn-end stamp.
+	 */
+	turnDurationMs(): number {
+		const end = this.steps.length > 0 ? (this.lastSettledAt ?? Date.now()) : (this.turnEndedAt ?? Date.now());
+		return Math.max(0, end - this.startedAt);
+	}
+
+	/** TUI v4: whether the turn's end stamp landed (agent_end / replay boundary). */
+	get isTurnEnded(): boolean {
+		return this.turnEndedAt !== undefined;
+	}
+
 	markRunning(toolCallId: string, timestamp = Date.now()): void {
 		this.setStepStatus(toolCallId, "running", timestamp);
 	}
@@ -150,8 +167,7 @@ export class TurnActivityState {
 	private durationSeconds(): string {
 		// A tool turn freezes on its last settled step; a thinking-only turn
 		// freezes on markTurnEnded (agent_end / replay turn boundary).
-		const end = this.steps.length > 0 ? (this.lastSettledAt ?? Date.now()) : (this.turnEndedAt ?? Date.now());
-		return `${(Math.max(0, end - this.startedAt) / 1000).toFixed(1)}s`;
+		return `${(this.turnDurationMs() / 1000).toFixed(1)}s`;
 	}
 
 	/**
@@ -197,12 +213,36 @@ export class TurnSummaryComponent implements Component {
 	private expanded = false;
 	private cachedWidth?: number;
 	private cachedLines?: string[];
+	/** TUI v4: render the one-line footnote instead of the legacy two-line surface. */
+	private quiet = false;
+	/** TUI v4: agent-to-agent comms inside the turn (received rows + sent). */
+	private commMessages = 0;
+	private footnote?: TurnFootNote;
 
 	constructor(private readonly turnState: TurnActivityState) {}
 
 	/** The turn's state - the per-turn lanes (K3 ②) live on it. */
 	get state(): TurnActivityState {
 		return this.turnState;
+	}
+
+	/** TUI v4: switch this turn head between the footnote and the legacy two lines. */
+	setQuiet(quiet: boolean): void {
+		if (this.quiet === quiet) {
+			return;
+		}
+		this.quiet = quiet;
+		this.invalidate();
+	}
+
+	/**
+	 * TUI v4: one more agent-to-agent comm inside the turn (a received
+	 * agent-message row or a sent agent message). The count only feeds the
+	 * quiet-mode footnote.
+	 */
+	addCommMessage(): void {
+		this.commMessages += 1;
+		this.invalidate();
 	}
 
 	setExpanded(expanded: boolean): void {
@@ -220,23 +260,17 @@ export class TurnSummaryComponent implements Component {
 	}
 
 	render(width: number): string[] {
-		if (this.cachedLines && this.cachedWidth === width && this.state.isSettled) {
+		// TUI v4: freeze only a fully settled turn - every step done AND the
+		// end stamp landed. Comms and thinking can still grow between the last
+		// settled step and the turn end, so `isSettled` alone would freeze the
+		// quiet footnote too early.
+		const settled = this.state.isSettled && this.state.isTurnEnded;
+		if (this.cachedLines && this.cachedWidth === width && settled) {
 			return this.cachedLines;
 		}
 		const safeWidth = Math.max(1, width);
-		// U6 two-line mechanical surface, both pinned at the turn head: the
-		// thinking block header (①, always visible while the turn has thinking)
-		// above the process line (②). No per-line expand hints — the single
-		// global hint line at the chat tail carries the key division.
-		const textLines = [this.state.thinkingHeaderText(), this.state.summaryText()].filter((text) => text.length > 0);
-		// F2 (DS2 review): one blank line between the two text lines, none
-		// trailing each - the turn head is 3 lines for a full turn, 1 for a
-		// thinking-only one, and the following content carries its own spacing.
-		const lines = textLines.flatMap((text, index) => {
-			const rendered = [theme.fg("muted", truncateToWidth(` ${text}`, safeWidth, ""))];
-			return index < textLines.length - 1 ? [...rendered, " ".repeat(safeWidth)] : rendered;
-		});
-		if (this.state.isSettled) {
+		const lines = this.quiet ? this.renderFootNote(safeWidth) : this.renderLegacy(safeWidth);
+		if (settled) {
 			this.cachedWidth = width;
 			this.cachedLines = lines;
 		} else {
@@ -245,6 +279,48 @@ export class TurnSummaryComponent implements Component {
 			this.cachedLines = undefined;
 		}
 		return lines;
+	}
+
+	/**
+	 * TUI v4 quiet face: the two legacy lines collapse into the one-line
+	 * footnote - `干了 1 分 05 秒 · 14 步 [O] · 想 7 段 [T] · → 通讯 2 条 [P]` -
+	 * with the stats read live off the turn state (steps deduped by
+	 * toolCallId, thinking segments, the comm counter, the frozen duration).
+	 */
+	private renderFootNote(safeWidth: number): string[] {
+		this.footnote ??= new TurnFootNote({
+			steps: 0,
+			thinkSegments: 0,
+			commMessages: 0,
+			durationMs: 0,
+			cols: safeWidth,
+		});
+		const steps = new Set(this.turnState.steps.map((step) => step.toolCallId)).size;
+		this.footnote.update({
+			steps,
+			thinkSegments: this.turnState.totalThinkingSegments,
+			commMessages: this.commMessages,
+			durationMs: this.turnState.turnDurationMs(),
+			cols: safeWidth,
+		});
+		return this.footnote.render(safeWidth);
+	}
+
+	/**
+	 * U6 two-line mechanical surface, both pinned at the turn head: the
+	 * thinking block header (①, always visible while the turn has thinking)
+	 * above the process line (②). No per-line expand hints — the single
+	 * global hint line at the chat tail carries the key division.
+	 */
+	private renderLegacy(safeWidth: number): string[] {
+		const textLines = [this.state.thinkingHeaderText(), this.state.summaryText()].filter((text) => text.length > 0);
+		// F2 (DS2 review): one blank line between the two text lines, none
+		// trailing each - the turn head is 3 lines for a full turn, 1 for a
+		// thinking-only one, and the following content carries its own spacing.
+		return textLines.flatMap((text, index) => {
+			const rendered = [theme.fg("muted", truncateToWidth(` ${text}`, safeWidth, ""))];
+			return index < textLines.length - 1 ? [...rendered, " ".repeat(safeWidth)] : rendered;
+		});
 	}
 }
 

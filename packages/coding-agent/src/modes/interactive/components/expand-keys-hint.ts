@@ -5,7 +5,8 @@ import { keyText } from "./keybinding-hints.js";
 /**
  * U6: the single global expand-hint line at the conversation's tail. Every
  * per-line `(Ctrl+O 展开)` suffix is gone; this one dim line states the
- * boss's two-key division instead: `Ctrl+T 思考 · Ctrl+O 过程 · Ctrl+P 消息`.
+ * key division instead: `Ctrl+T 思考 · Ctrl+O 过程 · Ctrl+P 通讯` (TUI v4:
+ * the Ctrl+P lane owns agent comms, matching the footnote's [P] segment).
  */
 export class ExpandKeysHintLine implements Component {
 	constructor(private readonly hasChatContent: () => boolean = () => true) {}
@@ -27,7 +28,7 @@ export class ExpandKeysHintLine implements Component {
 		const parts = [
 			thinking ? `${thinking} 思考` : undefined,
 			process ? `${process} 过程` : undefined,
-			messages ? `${messages} 消息` : undefined,
+			messages ? `${messages} 通讯` : undefined,
 		].filter((part): part is string => part !== undefined);
 		// F4 (DS2 review): this line is the only statement of the T/O/P
 		// division, so it degrades by whole segments - never a mid-key
