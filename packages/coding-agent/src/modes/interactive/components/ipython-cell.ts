@@ -16,6 +16,7 @@ import { agentMessageBodyLines, agentMessagePreview, agentMessageSummaryLine } f
 import { normalizeErrorDetails, summarizeErrorDetails } from "./collapsible-error.js";
 import { renderDiffSeparator, renderRichDiff } from "./diff.js";
 import { countChangedLines, FILE_CHANGE_DIFF_INDENT, formatFileChangeSummaryLine } from "./edit-summary.js";
+import { QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES, quietConversationBudget, toolOutputFull } from "./tool-output-budget.js";
 
 export interface IPythonCellContentBlock {
 	type: string;
@@ -733,8 +734,21 @@ export class IPythonCellComponent implements Component {
 
 	private renderOutputText(lines: string[], width: number, text: string, label: "out" | "err"): void {
 		const color = label === "err" ? "muted" : "toolOutput";
-		for (const line of text.split("\n")) {
+		const all = text.split("\n");
+		// TUI v4 T7: quiet 模式 pins a per-step window (same dozen-line budget as
+		// the bash blocks); alt+shift+O lifts it. Without this the ipython lane
+		// floods the quiet face with full output.
+		let shown = all;
+		let heldBack = 0;
+		if (quietConversationBudget() && !toolOutputFull() && all.length > QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES) {
+			shown = all.slice(0, QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES);
+			heldBack = all.length - QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES;
+		}
+		for (const line of shown) {
 			this.addWrapped(lines, OUTPUT_INDENT, theme.fg(color, line || " "), width);
+		}
+		if (heldBack > 0) {
+			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("muted", `还有 ${heldBack} 行(alt+shift+O 看全文)`), width);
 		}
 	}
 
