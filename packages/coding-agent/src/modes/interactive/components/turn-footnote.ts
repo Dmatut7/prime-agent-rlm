@@ -52,7 +52,7 @@ export interface TurnFootNoteProps {
 	thinkingMs?: number;
 	/** The latest thinking trace, shown as a two-row preview under the line while the block is open. */
 	thinkingPreview?: string;
-	/** The turn is still running: the line reads `进行中 · 第 N 步 · 9.4s` with an accent caret. */
+	/** The turn is still running: the line reads `运行中 · 第 N 步 · 16s` with an accent caret. */
 	running?: boolean;
 	/** Optional caret glyph (▸/▾) rendered in the line's indent column; the wiring owns the state. Default: none. */
 	caret?: string;
@@ -99,6 +99,19 @@ function shortenPath(path: string, width: number): string {
 		}
 	}
 	return truncateToWidth(parts.at(-1) ?? path, width, "…");
+}
+
+/** A running turn's clock in whole seconds: `16s`, `1m 05s` (matches the status line). */
+export function turnRunningClockText(durationMs: number): string {
+	const totalSeconds = Math.max(0, Math.floor(durationMs / 1000));
+	if (totalSeconds < 60) {
+		return `${totalSeconds}s`;
+	}
+	const minutes = Math.floor(totalSeconds / 60);
+	if (minutes < 60) {
+		return `${minutes}m ${String(totalSeconds % 60).padStart(2, "0")}s`;
+	}
+	return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m`;
 }
 
 interface FootNoteSpan {
@@ -185,11 +198,12 @@ export class TurnFootNote implements Component {
 		const { steps, thinkSegments, commMessages, durationMs } = this.props;
 		const segments: FootNoteSegment[] = [];
 		if (this.props.running) {
-			segments.push({ text: "进行中" });
+			segments.push({ text: "运行中" });
 			if (steps > 0) {
 				segments.push({ text: `第 ${steps} 步`, clickTarget: "steps" });
 			}
-			segments.push({ text: turnFootNoteDurationText(durationMs) });
+			// Whole seconds, the same clock the status line shows.
+			segments.push({ text: turnRunningClockText(durationMs) });
 			return segments;
 		}
 		const thinkingMs = this.props.thinkingMs;
@@ -207,7 +221,10 @@ export class TurnFootNote implements Component {
 		if (steps > 0) {
 			segments.push({ text: `${steps} 步`, clickTarget: "steps" });
 		}
-		segments.push({ text: turnFootNoteDurationText(durationMs) });
+		// The last figure is the turn's total, not more thinking time.
+		segments.push({
+			text: steps > 0 ? `共 ${turnFootNoteDurationText(durationMs)}` : turnFootNoteDurationText(durationMs),
+		});
 		if (commMessages > 0) {
 			segments.push({ text: `通讯 ${commMessages} 条`, clickTarget: "comm" });
 		}

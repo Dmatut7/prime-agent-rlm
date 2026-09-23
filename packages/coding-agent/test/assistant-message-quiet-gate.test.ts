@@ -117,7 +117,7 @@ describe("assistant message quiet gate", () => {
 		const message = narration();
 		message.stopReason = "aborted";
 		const component = new AssistantMessageComponent(message, false, undefined, "思考", { quiet: true });
-		expect(render(component)).toContain("Operation aborted");
+		expect(render(component)).toContain("已中断");
 	});
 
 	test("a streaming message folds once a tool call arrives", () => {

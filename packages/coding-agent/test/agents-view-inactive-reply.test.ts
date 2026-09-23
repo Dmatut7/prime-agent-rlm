@@ -493,19 +493,19 @@ describe("agents view reply on inactive sessions", () => {
 		};
 
 		const idleHints = stripAnsi(invoke("renderReplyComposerHints", self) as string);
-		expect(idleHints).toContain("steer");
-		expect(idleHints).toContain("cancel");
-		expect(idleHints).not.toContain("queue");
+		expect(idleHints).toContain("插话");
+		expect(idleHints).toContain("取消");
+		expect(idleHints).not.toContain("排队");
 
 		self.editor = editorWithText("some reply");
 		const typedHints = stripAnsi(invoke("renderReplyComposerHints", self) as string);
-		expect(typedHints).toContain("queue");
+		expect(typedHints).toContain("排队");
 
 		const saved = summary({ sessionFile: "/tmp/sessions/saved-1.jsonl" });
 		self.replyTarget = { key: "saved-1", summary: saved };
 		self.findSummaryByActiveSessionId = () => undefined;
 		const savedHints = stripAnsi(invoke("renderReplyComposerHints", self) as string);
-		expect(savedHints).toContain("resume & send");
+		expect(savedHints).toContain("继续并发送");
 	});
 });
 

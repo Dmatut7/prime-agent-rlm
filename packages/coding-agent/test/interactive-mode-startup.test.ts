@@ -253,7 +253,7 @@ describe("InteractiveMode startup hints", () => {
 
 		await Reflect.get(InteractiveMode.prototype, "requestAgentsView").call(mode);
 
-		expect(showStatus).toHaveBeenCalledWith(expect.stringContaining("needs the daemon"));
+		expect(showStatus).toHaveBeenCalledWith(expect.stringContaining("需要后台服务"));
 		expect(shutdown).not.toHaveBeenCalled();
 	});
 
@@ -263,9 +263,10 @@ describe("InteractiveMode startup hints", () => {
 		const getHints = (mode: object) => Reflect.get(InteractiveMode.prototype, "getTrayHints").call(mode) as string[];
 
 		expect(getHints(daemonChat)).toEqual(["Ctrl+O 过程", "Ctrl+T Thinking", "← 会话列表", "? 快捷键"]);
-		// The hints do not react to editor text.
+		// With text in the prompt ← moves the cursor, so the session-list hint steps aside.
 		editorText = "draft prompt";
-		expect(getHints(daemonChat)).toEqual(["Ctrl+O 过程", "Ctrl+T Thinking", "← 会话列表", "? 快捷键"]);
+		expect(getHints(daemonChat)).toEqual(["Ctrl+O 过程", "Ctrl+T Thinking", "? 快捷键"]);
+		editorText = "";
 
 		expect(getHints(createMode(0, true))).toEqual(["/ 命令", "@ 文件", "← 会话列表", "? 快捷键"]);
 		expect(getHints(createMode(1, false))).toEqual(["Ctrl+O 过程", "Ctrl+T Thinking", "? 快捷键"]);
@@ -286,13 +287,13 @@ describe("InteractiveMode startup hints", () => {
 	it("keeps the question-mark shortcut guide compact", () => {
 		const guide = Reflect.get(InteractiveMode.prototype, "getShortcutGuide").call(createMode());
 
-		expect(guide).toContain("`!` shell mode · `/` commands · `@` file paths");
-		expect(guide).toContain("stash prompt");
-		expect(guide).toContain("`/hotkeys` full reference");
+		expect(guide).toContain("`!` 运行 shell 命令 · `/` 命令 · `@` 引用文件");
+		expect(guide).toContain("暂存输入");
+		expect(guide).toContain("`/hotkeys` 完整列表");
 		expect(guide).not.toContain("Ctrl+Z");
-		expect(guide).not.toContain("suspend");
-		expect(guide).not.toContain("**Navigation**");
-		expect(guide).not.toContain("**Extensions**");
+		expect(guide).not.toContain("挂到后台");
+		expect(guide).not.toContain("**移动**");
+		expect(guide).not.toContain("**扩展**");
 	});
 
 	it("renders question-mark shortcut help ephemerally without appending to chat history", () => {
@@ -306,25 +307,77 @@ describe("InteractiveMode startup hints", () => {
 		});
 
 		Reflect.get(InteractiveMode.prototype, "showShortcutGuide").call(mode);
-		Reflect.get(InteractiveMode.prototype, "showShortcutGuide").call(mode);
 
 		expect(chatContainer.children).toHaveLength(0);
 		expect(shortcutGuideContainer.children).toHaveLength(2);
 
+		// The same key closes the panel it opened.
+		Reflect.get(InteractiveMode.prototype, "showShortcutGuide").call(mode);
+		expect(shortcutGuideContainer.children).toHaveLength(0);
+
+		Reflect.get(InteractiveMode.prototype, "showShortcutGuide").call(mode);
 		Reflect.get(InteractiveMode.prototype, "clearShortcutGuide").call(mode);
+		expect(shortcutGuideContainer.children).toHaveLength(0);
+	});
+
+	it("closes the shortcut panel on Esc before any other Esc behavior", () => {
+		const shortcutGuideContainer = new Container();
+		const clearEscapeRepeat = vi.fn();
+		const mode = Object.assign(createMode(), {
+			shortcutGuideContainer,
+			chatContainer: new Container(),
+			ui: { requestRender: vi.fn() },
+			getMarkdownThemeWithSettings: () => getMarkdownTheme(),
+			clearCtrlCExitHint: vi.fn(),
+			clearEscapeRepeat,
+			takeEscapeRepeatAction: vi.fn(),
+		});
+		Reflect.get(InteractiveMode.prototype, "showShortcutGuide").call(mode);
+		expect(shortcutGuideContainer.children.length).toBeGreaterThan(0);
+
+		Reflect.get(InteractiveMode.prototype, "handleEscape").call(mode);
 
 		expect(shortcutGuideContainer.children).toHaveLength(0);
+		expect(mode.takeEscapeRepeatAction).not.toHaveBeenCalled();
+	});
+
+	it("says what a second Esc would do on an idle empty prompt, and nothing otherwise", () => {
+		let editorText = "";
+		const mode = Object.assign(
+			createMode(1, false, () => editorText),
+			{
+				escapeRepeatAction: "tree" as "tree" | "clear" | undefined,
+				isCtrlCExitHintVisible: () => false,
+				hasInterruptibleWork: () => false,
+			},
+		);
+		const label = () => Reflect.get(InteractiveMode.prototype, "getTrayOverrideLabel").call(mode);
+		expect(label()).toMatch(/^再按一次 .+ 回退到之前的消息$/);
+		editorText = "draft";
+		expect(label()).toBeUndefined();
+		editorText = "";
+		mode.escapeRepeatAction = undefined;
+		expect(label()).toBeUndefined();
+	});
+
+	it("starts the chat without a blank row when the first block is a notice", () => {
+		const chatContainer = new Container();
+		const mode = Object.assign(createMode(), { chatContainer, ui: { requestRender: vi.fn() } });
+		Reflect.get(InteractiveMode.prototype, "showWarning").call(mode, "first notice");
+		expect(chatContainer.children).toHaveLength(1);
+		Reflect.get(InteractiveMode.prototype, "showWarning").call(mode, "second notice");
+		expect(chatContainer.children).toHaveLength(3);
 	});
 
 	it("keeps /hotkeys comprehensive without Ctrl+Z", () => {
 		const guide = Reflect.get(InteractiveMode.prototype, "getHotkeysGuide").call(createMode());
 
-		expect(guide).toContain("**Navigation**");
-		expect(guide).toContain("**Editing**");
-		expect(guide).toContain("**Fullscreen mode (`/fullscreen`)**");
-		expect(guide).toContain("Queue follow-up message");
+		expect(guide).toContain("**移动**");
+		expect(guide).toContain("**编辑**");
+		expect(guide).toContain("**全屏模式（`/fullscreen`）**");
+		expect(guide).toContain("排一条稍后发送的消息");
 		expect(guide).not.toContain("Ctrl+Z");
-		expect(guide).not.toContain("Suspend to background");
+		expect(guide).not.toContain("挂到后台");
 	});
 
 	it("renders /hotkeys in chat history instead of the temporary guide", () => {

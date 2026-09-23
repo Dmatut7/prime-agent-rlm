@@ -44,7 +44,7 @@ describe("InteractiveMode /clone", () => {
 		expect(fork).toHaveBeenCalledWith("leaf-123", { position: "at" });
 		expect(renderCurrentSessionState).toHaveBeenCalled();
 		expect(setText).toHaveBeenCalledWith("");
-		expect(showStatus).toHaveBeenCalledWith("Cloned to new session");
+		expect(showStatus).toHaveBeenCalledWith("已复制到新会话");
 		expect(showError).not.toHaveBeenCalled();
 		expect(requestRender).not.toHaveBeenCalled();
 	});
@@ -68,7 +68,7 @@ describe("InteractiveMode /clone", () => {
 
 		expect(getSessionTree).toHaveBeenCalledWith();
 		expect(fork).not.toHaveBeenCalled();
-		expect(showStatus).toHaveBeenCalledWith("Nothing to clone yet");
+		expect(showStatus).toHaveBeenCalledWith("还没有可复制的内容");
 		expect(showError).not.toHaveBeenCalled();
 	});
 });

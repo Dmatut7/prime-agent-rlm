@@ -70,18 +70,18 @@ describe("HeartbeatManagerComponent", () => {
 		}
 		const rendered = component.render(100).map(stripAnsi);
 		const output = rendered.join("\n");
-		expect(output).toContain("2 heartbeats · 1 paused");
+		expect(output).toContain("2 个定时任务 · 1 个已暂停");
 		expect(output).toContain("Primary session");
-		expect(output).toContain("Created by you");
-		expect(output).toContain("Created by agent");
+		expect(output).toContain("你创建的");
+		expect(output).toContain("AI 创建的");
 		expect(output).toContain("previous delivery failed");
-		expect(output).toContain("Esc close");
-		expect(output).not.toContain("← close");
+		expect(output).toContain("Esc 关闭");
+		expect(output).not.toContain("← 关闭");
 		expect(output).not.toContain("›");
 		expect(output).not.toContain("─");
-		const titleColumn = rendered.find((line) => line.includes("Heartbeats"))?.indexOf("Heartbeats");
+		const titleColumn = rendered.find((line) => line.includes("定时任务"))?.indexOf("定时任务");
 		expect(titleColumn).toBeGreaterThan(2);
-		expect(rendered.find((line) => line.includes("Esc close"))?.indexOf("Esc close")).toBe(titleColumn);
+		expect(rendered.find((line) => line.includes("Esc 关闭"))?.indexOf("Esc 关闭")).toBe(titleColumn);
 	});
 
 	it("reads the current heartbeat list when rendered", () => {
@@ -94,9 +94,9 @@ describe("HeartbeatManagerComponent", () => {
 			requestRender: () => {},
 		});
 
-		expect(stripAnsi(component.render(80).join("\n"))).toContain("1 heartbeat.");
+		expect(stripAnsi(component.render(80).join("\n"))).toContain("1 个定时任务。");
 		heartbeats = [heartbeat("user", { source: "heartbeat" }), heartbeat("agent", { source: "rlm_heartbeat" })];
-		expect(stripAnsi(component.render(80).join("\n"))).toContain("2 heartbeats.");
+		expect(stripAnsi(component.render(80).join("\n"))).toContain("2 个定时任务。");
 	});
 
 	it("uses arrows to open and go back, and closes with escape or the toggle shortcut", () => {
@@ -114,14 +114,14 @@ describe("HeartbeatManagerComponent", () => {
 
 		component.handleInput("\x1b[C");
 		const detailLines = component.render(80).map(stripAnsi);
-		const titleColumn = detailLines.find((line) => line.includes("Your heartbeat"))?.indexOf("Your heartbeat");
+		const titleColumn = detailLines.find((line) => line.includes("你的定时任务"))?.indexOf("你的定时任务");
 		expect(detailLines.join("\n")).not.toContain("Return to all heartbeats");
-		expect(detailLines.find((line) => line.includes("Created by you"))?.indexOf("Created by you")).toBe(titleColumn);
-		expect(detailLines.find((line) => line.includes("← back"))?.indexOf("← back")).toBe(titleColumn);
+		expect(detailLines.find((line) => line.includes("你创建的"))?.indexOf("你创建的")).toBe(titleColumn);
+		expect(detailLines.find((line) => line.includes("← 返回"))?.indexOf("← 返回")).toBe(titleColumn);
 
 		component.handleInput("\x1b[D");
 		expect(closeCount).toBe(1);
-		expect(stripAnsi(component.render(80).join("\n"))).toContain("Select a heartbeat to manage");
+		expect(stripAnsi(component.render(80).join("\n"))).toContain("选一个来管理");
 
 		component.handleInput("\r");
 		component.handleInput("\x1b");

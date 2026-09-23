@@ -15,6 +15,14 @@ import { defineConfig } from "vitest/config";
  */
 const testSupervisorRegistryDir = mkdtempSync(join(tmpdir(), "prime-agent-test-supervisor-registry-"));
 
+/**
+ * The agent dir (`~/.prime/agent`: sessions, logs, settings, auth) gets the same
+ * treatment. A test that creates a session without its own session dir otherwise
+ * writes the transcript into the developer's real session list, where it shows up
+ * as a `(no messages)` row. Tests that need a specific agent dir still set their own.
+ */
+const testAgentDir = mkdtempSync(join(tmpdir(), "prime-agent-test-agent-dir-"));
+
 const aiSrcIndex = fileURLToPath(new URL("../ai/src/index.ts", import.meta.url));
 const aiSrcOAuth = fileURLToPath(new URL("../ai/src/oauth.ts", import.meta.url));
 const aiSrcMcp = fileURLToPath(new URL("../ai/src/mcp.ts", import.meta.url));
@@ -29,6 +37,8 @@ export default defineConfig({
 		env: {
 			DO_NOT_TRACK: "1",
 			PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR: testSupervisorRegistryDir,
+			PRIME_AGENT_CODING_AGENT_DIR: testAgentDir,
+			PI_CODING_AGENT_DIR: testAgentDir,
 		},
 		tags: [
 			{

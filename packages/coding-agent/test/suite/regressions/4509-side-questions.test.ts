@@ -402,7 +402,7 @@ describe("ENG-4509 side questions", () => {
 		// put the rejected draft back rather than merely skip clearing it.
 		expect(setText).toHaveBeenCalledWith("Queued follow-up?");
 		expect(addToHistory).not.toHaveBeenCalled();
-		expect(showWarning).toHaveBeenCalledWith("Wait for the current side question to finish or cancel it first.");
+		expect(showWarning).toHaveBeenCalledWith("请先等旁路提问结束，或先取消它。");
 	});
 
 	it("keeps path-like replies in the side conversation", async () => {
@@ -653,7 +653,7 @@ describe("ENG-4509 side questions", () => {
 		await defaultEditor.onSubmit?.("!ls");
 
 		expect(setText).toHaveBeenCalledWith("!ls");
-		expect(showWarning).toHaveBeenCalledWith("Wait for the current side question to finish or cancel it first.");
+		expect(showWarning).toHaveBeenCalledWith("请先等旁路提问结束，或先取消它。");
 		expect(executeBash).not.toHaveBeenCalled();
 		expect(addTurn).not.toHaveBeenCalled();
 		expect(fakeThis.sideQuestionBash).toBeUndefined();
@@ -684,7 +684,7 @@ describe("ENG-4509 side questions", () => {
 		await defaultEditor.onSubmit?.("what are those files?");
 
 		expect(setText).toHaveBeenCalledWith("what are those files?");
-		expect(showWarning).toHaveBeenCalledWith("Wait for the running command to finish or cancel it first.");
+		expect(showWarning).toHaveBeenCalledWith("请先等命令跑完，或先取消它。");
 		expect(handleSideQuestion).not.toHaveBeenCalled();
 	});
 
@@ -1204,7 +1204,7 @@ describe("ENG-4509 side questions", () => {
 
 		await handleSideQuestion.call(fakeThis, "Can this overlap?");
 
-		expect(showWarning).toHaveBeenCalledWith("Wait for the current side question to finish or cancel it first.");
+		expect(showWarning).toHaveBeenCalledWith("请先等旁路提问结束，或先取消它。");
 	});
 
 	it("reports side-question abort failures without rejecting the interrupt path", async () => {

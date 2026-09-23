@@ -201,7 +201,7 @@ describe("agents view state", () => {
 			makeSummary({ activity: "working", hasActiveHeartbeat: true, isStreaming: true, isRunningTools: true }),
 		]);
 		expect(busyRow).toMatchObject({ section: "running", statusLabel: "running tools" });
-		expect(sectionTitle("idle")).toBe("Idle");
+		expect(sectionTitle("idle")).toBe("空闲");
 	});
 
 	test("flags busy sessions that went quiet for a long time", () => {
@@ -1356,7 +1356,7 @@ describe("agents view state", () => {
 			activeSessionId: "active-runtime",
 			sessionId: "saved-active",
 			sessionFile: "/tmp/sessions/active.jsonl",
-			sessionName: "Running",
+			sessionName: "运行中",
 		});
 		const inactiveSummary = makeSummary({
 			id: "inactive",

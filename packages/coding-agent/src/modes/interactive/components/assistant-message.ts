@@ -325,15 +325,18 @@ export class AssistantMessageComponent extends Container {
 				if (this.hideThinkingBlock) {
 					// Hidden: nothing at all, not even in the expanded view.
 				} else if (!this.thinkingExpanded) {
-					// Collapsed: no rows here - the turn's 思考 block header at the
+					// Collapsed: no rows here - the turn's Thinking block header at the
 					// turn head owns the summary and the Ctrl+T affordance.
 				} else {
 					// Expanded: the label line, then the trace. Thinking traces keep
 					// Markdown structure but stay visually quiet.
-					this.contentContainer.addChild(new Text(`${thinkingLabel}`, 1, 0));
+					// Quiet turns indent their traces under the process line; the
+					// answer text keeps column 1.
+					const traceIndent = this.quiet ? 3 : 1;
+					this.contentContainer.addChild(new Text(`${thinkingLabel}`, traceIndent, 0));
 					const markdown = new Markdown(
 						content.thinking.trim(),
-						1,
+						traceIndent,
 						0,
 						getThinkingMarkdownTheme(this.markdownTheme),
 						{
@@ -352,12 +355,17 @@ export class AssistantMessageComponent extends Container {
 		}
 
 		if (message.stopReason === "aborted") {
-			const abortMessage =
-				message.errorMessage && message.errorMessage !== "Request was aborted"
-					? message.errorMessage
-					: "Operation aborted";
+			const reason = message.errorMessage;
+			const plainInterrupt =
+				!reason ||
+				reason === "Request was aborted" ||
+				reason === "Operation aborted" ||
+				reason.startsWith("已中断");
 			this.contentContainer.addChild(new Spacer(1));
-			this.contentContainer.addChild(this.createErrorComponent(abortMessage));
+			// A plain interrupt is the user's own action: say so calmly.
+			this.contentContainer.addChild(
+				plainInterrupt ? new Text(theme.fg("dim", "已中断"), 1, 0) : this.createErrorComponent(reason),
+			);
 		} else if (!hasToolCalls && message.stopReason === "error") {
 			const errorMsg = message.errorMessage || "Unknown error";
 			this.contentContainer.addChild(new Spacer(1));

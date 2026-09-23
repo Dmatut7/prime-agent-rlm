@@ -446,7 +446,7 @@ describe("IPythonCellComponent diff rendering", () => {
 			editDiffsExpanded: true,
 		});
 		expect(out).toContain("a.ts");
-		expect(out).not.toContain("no output");
+		expect(out).not.toContain("没有输出");
 	});
 
 	it("never emits a line wider than the viewport, even in a very narrow pane", () => {

@@ -64,13 +64,13 @@ function collapseText(text: string): string {
 function goalLabel(details: GoalContextDetails | undefined): string {
 	switch (details?.kind) {
 		case "continuation":
-			return "Goal continuation";
+			return "继续目标";
 		case "budget_limit":
-			return "Goal budget limit";
+			return "目标预算用尽";
 		case "objective_updated":
-			return "Goal updated";
+			return "目标已更新";
 		default:
-			return "Goal context";
+			return "目标";
 	}
 }
 
@@ -79,9 +79,9 @@ function rlmChildFailureLabel(message: InjectedPromptMessage): string | undefine
 	if (message.customType !== RLM_CHILD_FAILURE_CUSTOM_TYPE) return undefined;
 	const details = message.details as RlmChildFailureDetails | undefined;
 	const kind = details?.kind;
-	if (!kind) return "RLM child failed";
-	const label = kind === "stall_killed" ? "killed by stall watchdog" : kind.replace("_", " ");
-	return `RLM child failed (${label})`;
+	if (!kind) return "子代理失败";
+	const label = kind === "stall_killed" ? "长时间没动静，被自动终止" : kind === "aborted" ? "已中止" : "出错";
+	return `子代理失败（${label}）`;
 }
 
 function compactHeartbeatSchedule(schedule: string | undefined): string {
@@ -94,7 +94,7 @@ function compactHeartbeatSchedule(schedule: string | undefined): string {
 
 function heartbeatPromptSchedule(schedule: string | undefined): string {
 	const compact = compactHeartbeatSchedule(schedule);
-	return compact === "prompt" ? "scheduled" : `every ${compact}`;
+	return compact === "prompt" ? "定时" : `每 ${compact}`;
 }
 
 export class InjectedPromptMessageComponent extends Container {
@@ -145,20 +145,20 @@ export class InjectedPromptMessageComponent extends Container {
 		}
 		if (this.message.customType === IPYTHON_STATE_RESTORED_CUSTOM_TYPE) {
 			const details = this.message.details as IpythonStateRestoredDetails | undefined;
-			const label = details?.restored === false ? "Started fresh Python kernel" : "Restored Python kernel state";
+			const label = details?.restored === false ? "已启动新的 Python 内核" : "已恢复 Python 内核状态";
 			return `${theme.fg("accent", "◆")} ${theme.fg("muted", label)}`;
 		}
 		if (this.message.customType === RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE) {
 			// Not an error: the silence may be healthy long work. The label says what is
 			// known ("still running"), and the expanded body carries the facts.
-			return theme.fg("muted", "RLM child still running");
+			return theme.fg("muted", "子代理仍在运行");
 		}
 		if (this.message.customType === PYTHON_SKILLS_UNAVAILABLE_CUSTOM_TYPE) {
 			const details = this.message.details as PythonSkillsUnavailableDetails | undefined;
 			const skills = details?.skills?.length
-				? ` · ${truncateToWidth(details.skills.join(", "), Math.max(20, 90 - "Python skills unavailable · ".length))}`
+				? ` · ${truncateToWidth(details.skills.join(", "), Math.max(20, 90 - visibleWidth("部分 Python 技能不可用 · ")))}`
 				: "";
-			return theme.fg("muted", "Python skills unavailable") + theme.fg("dim", skills);
+			return theme.fg("muted", "部分 Python 技能不可用") + theme.fg("dim", skills);
 		}
 		if (
 			this.message.customType === RLM_CHILD_FAILURE_CUSTOM_TYPE ||
@@ -169,7 +169,7 @@ export class InjectedPromptMessageComponent extends Container {
 			// that a child died; rendering them in the same muted color as a routine
 			// "completed without reply" notice hides exactly the case that matters.
 			if (failure) return theme.fg("error", failure);
-			return theme.fg("muted", "RLM child status");
+			return theme.fg("muted", "子代理状态");
 		}
 
 		const details = this.message.details;
@@ -182,7 +182,7 @@ export class InjectedPromptMessageComponent extends Container {
 		const details = this.message.details as HeartbeatPromptDetails | undefined;
 		const pulse = theme.fg("error", "♥");
 		const schedule = theme.fg("muted", heartbeatPromptSchedule(details?.schedule));
-		return `${pulse} ${theme.fg("muted", "Heartbeat prompt")}${theme.fg("dim", " · ")}${schedule}`;
+		return `${pulse} ${theme.fg("muted", "定时任务")}${theme.fg("dim", " · ")}${schedule}`;
 	}
 
 	private metaText(): string {
@@ -191,7 +191,7 @@ export class InjectedPromptMessageComponent extends Container {
 		if (!goal?.objective) {
 			return "";
 		}
-		const prefixWidth = visibleWidth("Goal continuation · ");
+		const prefixWidth = visibleWidth("继续目标 · ");
 		return theme.fg("muted", ` · ${truncateToWidth(collapseText(goal.objective), Math.max(20, 90 - prefixWidth))}`);
 	}
 }

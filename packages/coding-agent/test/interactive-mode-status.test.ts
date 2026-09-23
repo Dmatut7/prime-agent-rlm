@@ -357,7 +357,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 			.replace(/\u001b\[[0-9;]*m/g, "");
 		expect(line).toContain("2 步");
 		// 1000 (first assistant) -> 2000 (abort stamp): 1 second, a fixed value.
-		expect(line).toContain("2 步 · 1.0s");
+		expect(line).toContain("2 步 · 共 1.0s");
 		// Frozen: repeated renders reuse the settled cache.
 		const first = summary!.render(120);
 		expect(summary!.render(120)).toBe(first);
@@ -383,7 +383,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 			.render(120)
 			.join("\n")
 			.replace(/\u001b\[[0-9;]*m/g, "");
-		expect(line).toContain("▾ 进行中 · 第 1 步");
+		expect(line).toContain("▾ 运行中 · 第 1 步");
 	});
 
 	test("a rebuild keeps an opened turn open (resync mid-run must not fold Ctrl+O)", async () => {
@@ -428,7 +428,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 			| TurnSummaryComponent
 			| undefined;
 		expect(summary!.state.isTurnEnded).toBe(true);
-		expect(summary!.render(120).join("\n")).not.toContain("进行中");
+		expect(summary!.render(120).join("\n")).not.toContain("运行中");
 	});
 
 	test("does not replay historical tool result image payloads", async () => {
@@ -917,7 +917,7 @@ describe("InteractiveMode working timer", () => {
 			defaultEditor: { setPlaceholder: ReturnType<typeof vi.fn> };
 		};
 		expect(probe.statusContainer.addChild).not.toHaveBeenCalled();
-		expect(probe.defaultEditor.setPlaceholder).toHaveBeenCalledWith("随时补充或纠正，Enter 立即告诉 AI");
+		expect(probe.defaultEditor.setPlaceholder).toHaveBeenCalledWith("随时补充或纠正，Enter 发给 AI");
 	});
 });
 
@@ -1305,8 +1305,7 @@ describe("InteractiveMode MCP command", () => {
 
 		const rendered = normalizeRenderedOutput(fakeThis.chatContainer);
 		expect(rendered).toContain("Reload failed: broken resource");
-		expect(rendered).toContain("change remains saved");
-		expect(rendered).toContain("not active in this session");
+		expect(rendered).toContain("已保存，但本会话里还没生效");
 		expect(rendered).not.toContain("Available next turn through mcp");
 		expect(manager.getGlobalMcpServers()).toHaveProperty("fetch");
 	});
@@ -1325,7 +1324,7 @@ describe("InteractiveMode MCP command", () => {
 		expect(events[0]).toBe("refresh");
 		expect(fakeThis.handleReloadCommand).not.toHaveBeenCalled();
 		expect(events.join("\n")).toContain("Run /mcp login remote to connect.");
-		expect(events.join("\n")).toContain("Run /reload after the current turn to activate it.");
+		expect(events.join("\n")).toContain("当前这轮结束后运行 /reload 生效。");
 	});
 
 	test("guides OAuth server additions to explicit login after refresh", async () => {
@@ -1445,16 +1444,16 @@ describe("InteractiveMode pending bash components", () => {
 		expect(raw).toContain(theme.fg("accent", "/compact"));
 		expect(raw).not.toContain(theme.fg("accent", "/unknown"));
 		expect(rendered).toContain("Heartbeat prompt: check steering");
-		expect(rendered).not.toContain("Steering: Heartbeat prompt");
+		expect(rendered).not.toContain("插话：定时任务");
 		expect(rendered).toContain("Goal context: steer goal");
-		expect(rendered).not.toContain("Steering: Goal context");
-		expect(rendered).toContain("Steering: plain steering");
+		expect(rendered).not.toContain("插话：Goal context");
+		expect(rendered).toContain("插话：plain steering");
 		expect(rendered).toContain("Heartbeat prompt: check status");
-		expect(rendered).not.toContain("Follow-up: Heartbeat prompt");
+		expect(rendered).not.toContain("稍后发送：定时任务");
 		expect(rendered).toContain("Goal context: continue goal");
-		expect(rendered).not.toContain("Follow-up: Goal context");
-		expect(rendered).toContain("Follow-up: plain follow-up");
-		expect(rendered).toContain("enter to send · Ctrl+Q to browse and edit queued messages");
+		expect(rendered).not.toContain("稍后发送：Goal context");
+		expect(rendered).toContain("稍后发送：plain follow-up");
+		expect(rendered).toContain("Enter 发送 · Ctrl+Q 查看或修改排队消息");
 	});
 
 	test("omits the enter-to-send hint while streaming", () => {
@@ -1478,7 +1477,7 @@ describe("InteractiveMode pending bash components", () => {
 
 		const rendered = normalizeRenderedOutput(queuedMessagesContainer);
 		expect(rendered).not.toContain("enter to send");
-		expect(rendered).toContain("Ctrl+Q to browse and edit queued messages");
+		expect(rendered).toContain("Ctrl+Q 查看或修改排队消息");
 	});
 
 	test("flushes pending bash components from the pending area to chat", () => {
@@ -2811,7 +2810,7 @@ describe("InteractiveMode model selection persistence", () => {
 			serviceTier: "default",
 			availableThinkingLevels: ["off"],
 		});
-		expect(fakeThis.showStatus).toHaveBeenCalledWith("Model: gpt-5.5");
+		expect(fakeThis.showStatus).toHaveBeenCalledWith("模型：gpt-5.5");
 		expect(fakeThis.showError).not.toHaveBeenCalled();
 	});
 
@@ -3003,14 +3002,14 @@ describe("InteractiveMode model selection persistence", () => {
 
 		expect(setHidden).toHaveBeenCalledWith(true);
 		expect(hide).not.toHaveBeenCalled();
-		expect(fakeThis.showStatus).toHaveBeenCalledWith("Switching model: gpt-5.5");
+		expect(fakeThis.showStatus).toHaveBeenCalledWith("正在切换模型：gpt-5.5");
 		expect(resolved).toBe(false);
 
 		apply.resolve();
 
 		await expect(result).resolves.toBeUndefined();
 		expect(hide).toHaveBeenCalledTimes(1);
-		expect(fakeThis.showStatus).toHaveBeenCalledWith("Model: gpt-5.5");
+		expect(fakeThis.showStatus).toHaveBeenCalledWith("模型：gpt-5.5");
 	});
 
 	test("reopens the model selector when the selected model fails to apply", async () => {
@@ -3607,7 +3606,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 				["transient failure 2"],
 				["admission failure 1"],
 				["admission failure 2"],
-				["Skipping startup prompt after 3 failed attempts: admission failure 3"],
+				["启动时的提示连续 3 次失败，已跳过：admission failure 3"],
 			]);
 
 			// Delivery settled: the retry cadence stops instead of re-prompting.

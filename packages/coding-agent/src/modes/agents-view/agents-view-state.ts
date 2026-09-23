@@ -130,11 +130,11 @@ export function isEmptyAgentsViewSession(summary: SessionSummary): boolean {
 export function sectionTitle(section: AgentsViewSection): string {
 	switch (section) {
 		case "running":
-			return "Running";
+			return "运行中";
 		case "idle":
-			return "Idle";
+			return "空闲";
 		case "inactive":
-			return "Inactive";
+			return "历史";
 		default: {
 			const _exhaustive: never = section;
 			return _exhaustive;

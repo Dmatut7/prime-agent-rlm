@@ -105,7 +105,7 @@ describe("handleShareCommand scans the exported bytes", () => {
 		// The dialog fired, so the scanner saw the export bytes. Scanning the proxy would
 		// have found nothing and never asked.
 		expect(confirmMessages).toHaveLength(1);
-		expect(fakeThis.showStatus).toHaveBeenCalledWith("Share cancelled");
+		expect(fakeThis.showStatus).toHaveBeenCalledWith("已取消分享");
 		// Cancelling after the export exists has to remove it. Compared as a name set rather
 		// than a count: another suite creating and removing a directory with the same prefix
 		// concurrently would move the count without this test having leaked anything.

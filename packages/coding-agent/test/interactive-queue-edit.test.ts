@@ -170,14 +170,14 @@ describe("interactive queued-message editing", () => {
 		harness.editor.setText(""); // Editor.submitValue clears before onSubmit runs.
 		await harness.applyQueueSelection("s1 edited", "steering");
 		expect(harness.editor.getText()).toBe("s1 edited");
-		expect(harness.showStatus).toHaveBeenCalledWith("Queue changed; edit kept in the editor");
+		expect(harness.showStatus).toHaveBeenCalledWith("排队消息已变化，修改保留在输入框里");
 	});
 
 	it("reports when the daemon does not support queue editing", async () => {
 		const harness = createHarness({ steering: ["s1"], followUp: [] }, "unsupported");
 		harness.browseQueueSelection(-1);
 		await harness.applyQueueSelection("s1 edited", "steering");
-		expect(harness.showStatus).toHaveBeenCalledWith("Queue editing requires a newer daemon");
+		expect(harness.showStatus).toHaveBeenCalledWith("修改排队消息需要更新后台服务");
 	});
 
 	it("does not consume submissions when nothing is selected", async () => {
@@ -433,7 +433,7 @@ describe("interactive queued-message editing", () => {
 
 		expect(harness.agentConnection.mutateQueuedMessage).toHaveBeenCalledOnce();
 		expect(harness.editor.getText()).toBe("s2 edited");
-		expect(harness.showStatus).toHaveBeenCalledWith("Queue changed; edit kept in the editor");
+		expect(harness.showStatus).toHaveBeenCalledWith("排队消息已变化，修改保留在输入框里");
 	});
 
 	it("uses canonical post-move positions for consecutive moves and an edit", async () => {

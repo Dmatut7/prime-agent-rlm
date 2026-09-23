@@ -90,7 +90,10 @@ interface TracebackParts {
 
 const MAGIC_LINE_PATTERN = /^\s*!/;
 
-// Two columns, matching the code body's "› "/"  " gutter so output aligns under it.
+/** The marker the host appends to model-facing text before unattributed background output. */
+const BACKGROUND_OUTPUT_MARKER = "[background output (unattributed)]";
+
+// Two columns, matching the code body's "│ " gutter so output aligns under it.
 const OUTPUT_INDENT = "  ";
 
 const SGR_PATTERN = /\x1b\[([0-9;]*)m/g;
@@ -324,6 +327,16 @@ function splitTraceback(text: string, errorName: string | undefined): TracebackP
 	return { output, traceback, preview: preview === "Error" && errorName ? errorName : preview };
 }
 
+/** The user (or the host) stopped the cell: a calm `已中断`, not an error. */
+function isInterruptedCell(details: IpythonDetails, text: string): boolean {
+	const ename = details.error?.ename ?? details.errorEname;
+	return (
+		details.status === "aborted" ||
+		ename === "KeyboardInterrupt" ||
+		(details.error === undefined && /^KeyboardInterrupt\b/m.test(normalizeErrorDetails(text)))
+	);
+}
+
 function formatIpythonErrorSummary(error: IpythonErrorDetails): string {
 	const normalizedValue = normalizeErrorDetails(error.evalue);
 	if (!normalizedValue.trim()) {
@@ -360,10 +373,13 @@ export class IPythonCellComponent implements Component {
 		// Fold the animation frame into the cache key while running (offset within
 		// a stateVersion slot so it never collides with another version).
 		const frames = WORKING_ICON_FRAMES.length;
-		const cacheVersion =
+		const baseVersion =
 			this.statusKind(details) === "running"
 				? this.stateVersion * frames + (getWorkingPulseFrame() % frames)
 				: this.stateVersion * frames;
+		// The output budget modes change what an expanded cell shows, so they
+		// are part of the cache key: toggling full output repaints at once.
+		const cacheVersion = baseVersion * 4 + (toolOutputFull() ? 2 : 0) + (quietConversationBudget() ? 1 : 0);
 		const cached = this.renderCache.get(safeWidth, cacheVersion);
 		if (cached) {
 			return cached;
@@ -424,14 +440,24 @@ export class IPythonCellComponent implements Component {
 			facts.push(theme.fg("muted", duration));
 		}
 		const errorName = !this.state.isPartial ? (details.error?.ename ?? details.errorEname) : undefined;
-		if (errorName) {
+		if (!this.state.isPartial && isInterruptedCell(details, textFromBlocks(this.state.content))) {
+			facts.push(theme.fg("dim", "已中断"));
+		} else if (errorName) {
 			facts.push(theme.fg("error", errorName));
 		}
 		const right = facts.length > 0 ? `${facts.join(theme.fg("dim", " · "))} ` : "";
 		const rightWidth = visibleWidth(right);
-		if (!right || visibleWidth(left) + 2 + rightWidth > width) {
-			const joined = right ? `${left}${theme.fg("dim", " · ")}${right.trimEnd()}` : left;
-			return truncateToWidth(joined, width, "");
+		if (!right) {
+			return truncateToWidth(left, width, "");
+		}
+		if (visibleWidth(left) + 2 + rightWidth > width) {
+			// The facts are figures: they stay whole and right-aligned; the label gives way.
+			const leftBudget = width - rightWidth - 2;
+			if (leftBudget < 6) {
+				return truncateToWidth(left, width, "…");
+			}
+			const clipped = truncateToWidth(left, leftBudget, "…");
+			return `${clipped}${" ".repeat(Math.max(0, width - visibleWidth(clipped) - rightWidth))}${right}`;
 		}
 		return `${left}${" ".repeat(width - visibleWidth(left) - rightWidth)}${right}`;
 	}
@@ -443,6 +469,9 @@ export class IPythonCellComponent implements Component {
 
 	/** Status marker — color carries running/done/error; ✓/✗ once finished. */
 	private marker(details: IpythonDetails): string {
+		if (!this.state.isPartial && isInterruptedCell(details, textFromBlocks(this.state.content))) {
+			return theme.fg("dim", "✗");
+		}
 		switch (this.statusKind(details)) {
 			case "error":
 				return theme.fg("error", "✗");
@@ -466,7 +495,10 @@ export class IPythonCellComponent implements Component {
 			.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
 			.join("\n");
 		const blocksText = textFromBlocks(this.state.content);
-		const fallback = isAgentMessageReceipt(blocksText, sentMessages) ? "" : blocksText;
+		let fallback = isAgentMessageReceipt(blocksText, sentMessages) ? "" : blocksText;
+		// A traceback in the fallback text is not output: count what ran before it.
+		const traceback = structured ? undefined : splitTraceback(fallback, details.errorEname);
+		if (traceback) fallback = traceback.output;
 		const outputText = (structured || fallback).trim();
 		return hasDiffs || !outputText ? 0 : outputText.split("\n").length;
 	}
@@ -507,7 +539,7 @@ export class IPythonCellComponent implements Component {
 		const code = this.state.code.trimEnd();
 		if (!code) {
 			this.addBlank(lines, width);
-			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("muted", "waiting for code"), width);
+			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("muted", "等待代码"), width);
 			return false;
 		}
 
@@ -517,7 +549,8 @@ export class IPythonCellComponent implements Component {
 		// Highlight the whole cell at once so multi-line strings keep their color.
 		const highlightedLines = isBashCell ? [] : highlightCode(code, "python");
 		for (const [index, rawLine] of rawLines.entries()) {
-			const prefix = index === 0 ? theme.fg("dim", "› ") : theme.fg("dim", "  ");
+			// A plain gutter: `›` is the user's turn marker.
+			const prefix = theme.fg("dim", "│ ");
 			const highlighted =
 				isBashCell || MAGIC_LINE_PATTERN.test(rawLine) || parseIpythonBashCell(rawLine) !== undefined
 					? theme.fg("bashMode", rawLine)
@@ -595,7 +628,9 @@ export class IPythonCellComponent implements Component {
 		} else if (text.trim() && !isAgentMessageReceipt(text, sentMessages)) {
 			startOutput();
 			renderedTextOutput = true;
-			this.renderOutputText(lines, width, normalizeErrorDetails(text), this.state.isError ? "err" : "out");
+			// The model-facing background marker reads in the UI's language here.
+			const shown = normalizeErrorDetails(text).replaceAll(BACKGROUND_OUTPUT_MARKER, "[后台输出（来源未知）]");
+			this.renderOutputText(lines, width, shown, this.state.isError ? "err" : "out");
 		}
 
 		// Without structured fields the fallback content text above already contains the appended background block.
@@ -608,10 +643,10 @@ export class IPythonCellComponent implements Component {
 
 		if (!renderedTextOutput && this.state.isPartial) {
 			startOutput();
-			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("muted", "waiting for output..."), width);
+			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("muted", "等待输出…"), width);
 		} else if (!renderedTextOutput && this.state.executionStarted && !this.state.argsComplete) {
 			startOutput();
-			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("muted", "waiting for output..."), width);
+			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("muted", "等待输出…"), width);
 		} else if (
 			!renderedTextOutput &&
 			!traceback &&
@@ -622,10 +657,15 @@ export class IPythonCellComponent implements Component {
 			imageCount === 0
 		) {
 			startOutput();
-			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("muted", "no output"), width);
+			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("muted", "没有输出"), width);
 		}
 
-		if (details.error) {
+		if (isInterruptedCell(details, text) && !toolOutputFull()) {
+			// An interrupt's traceback is the kernel's plumbing, not the step's
+			// result; the full view still has it.
+			startOutput();
+			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("dim", "已中断"), width);
+		} else if (details.error) {
 			startOutput();
 			this.renderTraceback(
 				lines,
@@ -639,16 +679,14 @@ export class IPythonCellComponent implements Component {
 
 		if (backgroundOutput) {
 			startOutput();
-			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("muted", "background output (unattributed)"), width);
+			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("muted", "后台输出（来源未知）"), width);
 			this.renderOutputText(lines, width, normalizeErrorDetails(backgroundOutput), "err");
 		}
 
 		if (imageCount > 0) {
 			startOutput();
 			const canRenderImages = this.state.showImages && !!getCapabilities().images;
-			const text = canRenderImages
-				? `${imageCount} image${imageCount === 1 ? "" : "s"} rendered below`
-				: `${imageCount} image${imageCount === 1 ? "" : "s"} not rendered in this terminal`;
+			const text = canRenderImages ? `${imageCount} 张图片，见下方` : `${imageCount} 张图片（这个终端无法显示）`;
 			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("muted", text), width);
 		}
 	}
@@ -657,7 +695,7 @@ export class IPythonCellComponent implements Component {
 	// instead of the collapsed preview, matching received agent-message UI.
 	private renderSentAgentMessages(lines: string[], width: number, messages: readonly SentAgentMessageDisplay[]): void {
 		for (const message of messages) {
-			const label = message.deliveryStatus === "delivered" ? "Agent message sent" : "Agent message queued";
+			const label = message.deliveryStatus === "delivered" ? "已发消息" : "消息排队中";
 			const recipient = formatAgentMessageParticipant("sent", message.receiverRole, message.target);
 			// U6: no per-line expand hint — the global tail line states the keys.
 			if (this.state.agentMessagesExpanded) {

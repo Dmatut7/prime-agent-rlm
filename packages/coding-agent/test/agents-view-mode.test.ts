@@ -1,4 +1,4 @@
-import { setKeybindings } from "@earendil-works/pi-tui";
+import { setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
@@ -1004,7 +1004,7 @@ describe("AgentsViewMode", () => {
 			expanded: false,
 			section: "idle",
 		} as unknown as AgentsViewRow);
-		expect(collapsedSummary).toContain("Enter/→ expand");
+		expect(collapsedSummary).toContain("Enter/→ 展开");
 		// The old shape printed a second `→ open` hint on every other row kind; on a
 		// summary line Right also collapses/expands, so the merged hint replaces it.
 		expect(collapsedSummary).not.toContain("→ open");
@@ -1014,10 +1014,10 @@ describe("AgentsViewMode", () => {
 			expanded: true,
 			section: "idle",
 		} as unknown as AgentsViewRow);
-		expect(expandedSummary).toContain("Enter/→ collapse");
+		expect(expandedSummary).toContain("Enter/→ 收起");
 
 		const agentRow = renderHintsFor({ kind: "agent", section: "idle" } as unknown as AgentsViewRow);
-		expect(agentRow).toContain("Enter/→ open");
+		expect(agentRow).toContain("Enter/→ 打开");
 	});
 
 	it("keeps the destructive-action gate on live work when the section reads Idle", () => {
@@ -1041,19 +1041,19 @@ describe("AgentsViewMode", () => {
 		// would kill that background work, which is exactly what r44 forbids - so the legend keeps
 		// offering "stop", gated on the residency axis instead of on the section.
 		const hostingOnly = subagentRow("idle", { isSessionActive: true });
-		expect(renderHintsFor(hostingOnly)).toContain("stop");
-		expect(renderHintsFor(hostingOnly)).not.toContain("delete");
+		expect(renderHintsFor(hostingOnly)).toContain("停止");
+		expect(renderHintsFor(hostingOnly)).not.toContain("删除");
 
 		// Same shape through the host-side bash term, which the kernel journal cannot see.
 		const bashOnly = subagentRow("idle", { isSessionActive: false, isBashRunning: true });
-		expect(renderHintsFor(bashOnly)).toContain("stop");
+		expect(renderHintsFor(bashOnly)).toContain("停止");
 
 		// Positive control 1: a genuinely finished child with nothing live anywhere offers delete.
 		const finished = subagentRow("idle", { isSessionActive: false });
-		expect(renderHintsFor(finished)).toContain("delete");
-		expect(renderHintsFor(finished)).not.toContain("stop");
+		expect(renderHintsFor(finished)).toContain("删除");
+		expect(renderHintsFor(finished)).not.toContain("停止");
 		// Positive control 2: the mid-turn row is unchanged.
-		expect(renderHintsFor(subagentRow("running", { isSessionActive: true }))).toContain("stop");
+		expect(renderHintsFor(subagentRow("running", { isSessionActive: true }))).toContain("停止");
 	});
 
 	it("renders roster recovery and stale-worker status labels", () => {
@@ -1126,14 +1126,23 @@ describe("AgentsViewMode", () => {
 
 			// Shared per-section layout: every column right-aligned to
 			// max(widest section value, legend label width).
-			expect(line(byId("spender-session"))).toContain("↑12k ↓1.2k ·  $0.42 ·    1 ·  $1.10 ·");
-			expect(line(byId("spender-child-session", "subagent"))).toContain("↑500   ↓50 ·  $0.68 ·    0 ·  $0.68 ·");
+			expect(line(byId("spender-session"))).toContain("↑12k ↓1.2k · $0.42 ·      1 · $1.10 ·");
+			expect(line(byId("spender-child-session", "subagent"))).toContain("↑500   ↓50 · $0.68 ·      0 · $0.68 ·");
 			const inactiveLine = line(byId("saved-only-session"));
-			expect(inactiveLine).toContain("↑0   ↓0 ·  $0.00 ·    0 ·  $0.00 ·");
+			expect(inactiveLine).toContain("↑0  ↓0 · $0.00 ·      0 · $0.00 ·");
 			expect(inactiveLine).not.toContain("7 ·");
 			// The ` · ` separators land in the same column for the legend and every
 			// row of its section.
-			const dotColumns = (text: string) => [...text].flatMap((ch, index) => (ch === "·" ? [index] : []));
+			// Display columns, not string indexes: the CJK labels are two columns wide.
+			const dotColumns = (text: string) => {
+				const columns: number[] = [];
+				let column = 0;
+				for (const ch of text) {
+					if (ch === "·") columns.push(column);
+					column += visibleWidth(ch);
+				}
+				return columns;
+			};
 			for (const [section, sessionId] of [
 				["idle", "spender-session"],
 				["idle", "spender-child-session"],
@@ -1150,7 +1159,7 @@ describe("AgentsViewMode", () => {
 			// Without a shared layout the row pads only against its own section of one.
 			const bare = { ...byId("spender-session")!, summary: { ...parent, usage: undefined } };
 			expect(stripAnsi(invoke("renderRow", view, bare, 200) as string)).toContain(
-				" ↑0   ↓0 ·  $0.00 ·    1 ·  $1.10 ·",
+				" ↑0  ↓0 · $0.00 ·      1 · $1.10 ·",
 			);
 		} finally {
 			stopThemeWatcher();
@@ -1240,10 +1249,10 @@ describe("AgentsViewMode", () => {
 			Reflect.set(view, "ui", { terminal: { rows: 60 }, requestRender: () => {} });
 			const rendered = invoke("renderSessionRows", view, 120, 40) as string[];
 			const lines = rendered.map(stripAnsi);
-			const headings = lines.filter((line) => /^(Running|Idle|Inactive) \(\d+\)/.test(line));
+			const headings = lines.filter((line) => /^(运行中|空闲|历史) \(\d+\)/.test(line));
 			expect(headings).toHaveLength(3);
 			for (const heading of headings) {
-				expect(heading).toMatch(/↑in\s+↓out ·\s+\$agent ·\s+#sub ·\s+\$total ·\s+age$/);
+				expect(heading).toMatch(/↑入\s+↓出 ·\s+自身 ·\s+子代理 ·\s+合计 ·\s+更新$/);
 			}
 			// Same bold weight for title and legend.
 			const runningLegend = buildAgentsViewUsageLayout(rows).legends.get("running")!;
@@ -1367,10 +1376,10 @@ describe("AgentsViewMode", () => {
 
 		try {
 			const [armedRow] = buildAgentsViewRows([summary({ hasActiveHeartbeat: true })]);
-			expect(confirmLine(armedRow!)).toContain("has an armed heartbeat — ");
+			expect(confirmLine(armedRow!)).toContain("有定时任务 — ");
 			const [plainRow] = buildAgentsViewRows([summary()]);
 			expect(confirmLine(plainRow!)).not.toContain("armed heartbeat");
-			expect(confirmLine(plainRow!)).toContain("again to remove");
+			expect(confirmLine(plainRow!)).toContain("移除");
 		} finally {
 			stopThemeWatcher();
 		}
@@ -1772,7 +1781,7 @@ describe("agents view session-switch handoff", () => {
 
 		invoke("finish", self, { type: "open", summary: summary({ sessionName: "worker-a" }) });
 
-		expect(frames).toEqual(["paint:Opening worker-a…", "stop:Opening worker-a…"]);
+		expect(frames).toEqual(["paint:正在打开 worker-a…", "stop:正在打开 worker-a…"]);
 		expect(self.stopped).toBe(true);
 		expect(resolveRun).toHaveBeenCalledWith(
 			expect.objectContaining({ type: "open", summary: expect.objectContaining({ sessionName: "worker-a" }) }),
@@ -1792,7 +1801,7 @@ describe("agents view session-switch handoff", () => {
 			hasChildren: false,
 		});
 
-		expect(frames).toEqual(["paint:Opening child-chat…", "stop:Opening child-chat…"]);
+		expect(frames).toEqual(["paint:正在打开 child-chat…", "stop:正在打开 child-chat…"]);
 	});
 
 	it("still hands the terminal over when the placeholder cannot paint", () => {
@@ -1804,7 +1813,7 @@ describe("agents view session-switch handoff", () => {
 
 		invoke("finish", self, { type: "open", summary: summary({ sessionName: "worker-a" }) });
 
-		expect(frames).toEqual(["stop:Opening worker-a…"]);
+		expect(frames).toEqual(["stop:正在打开 worker-a…"]);
 		expect(resolveRun).toHaveBeenCalledOnce();
 	});
 

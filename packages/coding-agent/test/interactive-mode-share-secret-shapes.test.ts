@@ -135,7 +135,7 @@ describe("handleShareCommand blocks an upload the preflight flagged", () => {
 		expect(message).not.toContain(DASHSCOPE_KEY);
 		// The upload itself must not have been spawned at all.
 		expect(vi.mocked(spawn)).not.toHaveBeenCalled();
-		expect(fakeThis.showStatus).toHaveBeenCalledWith("Share cancelled");
+		expect(fakeThis.showStatus).toHaveBeenCalledWith("已取消分享");
 		expect([...shareDirNames()].filter((name) => !before.has(name))).toEqual([]);
 	});
 

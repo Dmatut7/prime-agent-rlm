@@ -105,10 +105,10 @@ export class HeartbeatManagerComponent implements Component, Focusable {
 	private createHeartbeatListPanel(): MenuPanel {
 		const active = this.heartbeats.filter((heartbeat) => heartbeat.job.status === "active").length;
 		const paused = this.heartbeats.length - active;
-		const countLabel = `${this.heartbeats.length} heartbeat${this.heartbeats.length === 1 ? "" : "s"}${paused ? ` · ${paused} paused` : ""}`;
+		const countLabel = `${this.heartbeats.length} 个定时任务${paused ? ` · ${paused} 个已暂停` : ""}`;
 		const panel = new MenuPanel({
-			title: "Heartbeats",
-			subtitle: `${countLabel}. Select a heartbeat to manage.`,
+			title: "定时任务",
+			subtitle: `${countLabel}。选一个来管理。`,
 		});
 		const list = new MenuList({ compact: this.getListLayout().compact });
 		this.populateHeartbeatList(list);
@@ -116,13 +116,11 @@ export class HeartbeatManagerComponent implements Component, Focusable {
 		const fetchError = this.options.getFetchError?.();
 		if (fetchError) {
 			panel.addChild(new Spacer(1));
-			panel.addChild(
-				new TruncatedText(theme.fg("warning", `Heartbeat refresh failed: ${this.singleLine(fetchError)}`)),
-			);
+			panel.addChild(new TruncatedText(theme.fg("warning", `定时任务刷新失败：${this.singleLine(fetchError)}`)));
 		}
 		if (this.error) {
 			panel.addChild(new Spacer(1));
-			panel.addChild(new TruncatedText(theme.fg("error", `Error: ${this.error}`)));
+			panel.addChild(new TruncatedText(theme.fg("error", `出错：${this.error}`)));
 		}
 		panel.addChild(new Spacer(1));
 		panel.addChild(new TruncatedText(this.closeHint()));
@@ -132,7 +130,7 @@ export class HeartbeatManagerComponent implements Component, Focusable {
 	private populateHeartbeatList(list: MenuList): void {
 		const heartbeats = this.heartbeats;
 		if (heartbeats.length === 0) {
-			list.addChild(new TruncatedText(theme.fg("muted", "No running or paused heartbeats"), 1, 0));
+			list.addChild(new TruncatedText(theme.fg("muted", "没有进行中或已暂停的定时任务"), 1, 0));
 			return;
 		}
 		const selectedIndex = this.getSelectedIndex(heartbeats);
@@ -170,7 +168,7 @@ export class HeartbeatManagerComponent implements Component, Focusable {
 	private createActionPanel(mode: Exclude<HeartbeatManagerMode, { type: "list" }>): MenuPanel {
 		const heartbeat = this.findHeartbeat(mode.heartbeatId);
 		if (!heartbeat) {
-			return new MenuPanel({ title: "Heartbeats", subtitle: "This heartbeat is no longer available." });
+			return new MenuPanel({ title: "定时任务", subtitle: "这个定时任务已不存在。" });
 		}
 		const name = heartbeat.job.label?.trim() || this.defaultHeartbeatName(heartbeat);
 		const panel = new MenuPanel({
@@ -180,7 +178,7 @@ export class HeartbeatManagerComponent implements Component, Focusable {
 		panel.addChild(new TruncatedText(theme.fg("muted", this.formatHeartbeatDetails(heartbeat))));
 		panel.addChild(new Spacer(1));
 		if (this.error) {
-			panel.addChild(new TruncatedText(theme.fg("error", `Error: ${this.error}`)));
+			panel.addChild(new TruncatedText(theme.fg("error", `出错：${this.error}`)));
 			panel.addChild(new Spacer(1));
 		}
 		const list = new MenuList();
@@ -254,10 +252,8 @@ export class HeartbeatManagerComponent implements Component, Focusable {
 	): Array<{ label: string; action: AgentHeartbeatManagementAction }> {
 		if (!heartbeat) return [];
 		return [
-			heartbeat.job.status === "paused"
-				? { label: "Resume heartbeat", action: "resume" }
-				: { label: "Pause heartbeat", action: "pause" },
-			{ label: "Stop heartbeat", action: "stop" },
+			heartbeat.job.status === "paused" ? { label: "恢复", action: "resume" } : { label: "暂停", action: "pause" },
+			{ label: "停止", action: "stop" },
 		];
 	}
 
@@ -287,7 +283,7 @@ export class HeartbeatManagerComponent implements Component, Focusable {
 	}
 
 	private formatStatus(heartbeat: AgentConnectionHeartbeat): string {
-		return heartbeat.job.status === "active" ? theme.fg("success", "active") : theme.fg("warning", "paused");
+		return heartbeat.job.status === "active" ? theme.fg("success", "运行中") : theme.fg("warning", "已暂停");
 	}
 
 	private formatHeartbeatDetails(heartbeat: AgentConnectionHeartbeat): string {
@@ -297,29 +293,29 @@ export class HeartbeatManagerComponent implements Component, Focusable {
 	}
 
 	private sourceLabel(heartbeat: AgentConnectionHeartbeat): string {
-		return heartbeat.job.source === "heartbeat" ? "Created by you" : "Created by agent";
+		return heartbeat.job.source === "heartbeat" ? "你创建的" : "AI 创建的";
 	}
 
 	private defaultHeartbeatName(heartbeat: AgentConnectionHeartbeat): string {
-		return heartbeat.job.source === "heartbeat" ? "Your heartbeat" : "Agent-created heartbeat";
+		return heartbeat.job.source === "heartbeat" ? "你的定时任务" : "AI 创建的定时任务";
 	}
 
 	private closeHint(): string {
-		return keyHint("tui.select.cancel", "close", { primaryOnly: true });
+		return keyHint("tui.select.cancel", "关闭", { primaryOnly: true });
 	}
 
 	private detailHint(): string {
-		return `${keyHint("app.modal.back", "back")}  ${keyHint("tui.select.cancel", "close", { primaryOnly: true })}`;
+		return `${keyHint("app.modal.back", "返回")}  ${keyHint("tui.select.cancel", "关闭", { primaryOnly: true })}`;
 	}
 
 	private actionDescription(action: AgentHeartbeatManagementAction): string {
 		switch (action) {
 			case "pause":
-				return "Stop deliveries until resumed";
+				return "暂停执行，直到恢复";
 			case "resume":
-				return "Continue scheduled deliveries";
+				return "继续按计划执行";
 			case "stop":
-				return "Permanently remove this heartbeat";
+				return "永久删除这个定时任务";
 		}
 	}
 

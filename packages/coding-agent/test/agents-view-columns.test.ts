@@ -90,7 +90,7 @@ describe("agents view settled/duration/answer columns (U3)", () => {
 			expect(doneLine).toContain("✓");
 			expect(doneLine).toContain("1h10m");
 			// The usage columns keep landing where they always did.
-			expect(doneLine).toContain("↑12k ↓1.2k ·  $0.42 ·    0 ·  $0.42 ·");
+			expect(doneLine).toContain("↑12k ↓1.2k · $0.42 ·      0 · $0.42 ·");
 			const busyLine = render(rows.find((row) => row.summary.sessionId === "busy-session")!);
 			// Explicitly not settled reads as in flight, never as a settled check.
 			expect(busyLine).toContain("…");
@@ -98,10 +98,19 @@ describe("agents view settled/duration/answer columns (U3)", () => {
 			expect(busyLine).not.toContain("✓");
 			// The legend names both new columns, leading the block it always had.
 			const legend = stripAnsi(layout.legends.get("idle")!);
-			expect(legend).toMatch(/^set · +dur · +↑in +↓out · +\$agent · +#sub · +\$total · +age$/);
+			expect(legend).toMatch(/^完成 · +时长 · +↑入 +↓出 · +自身 · +子代理 · +合计 · +更新$/);
 			// The ` · ` separators sit in the same terminal columns for the legend
 			// and every row of its section, new columns included.
-			const dotColumns = (text: string) => [...text].flatMap((ch, index) => (ch === "·" ? [index] : []));
+			// Display columns, not string indexes: the CJK labels are two columns wide.
+			const dotColumns = (text: string) => {
+				const columns: number[] = [];
+				let column = 0;
+				for (const ch of text) {
+					if (ch === "·") columns.push(column);
+					column += visibleWidth(ch);
+				}
+				return columns;
+			};
 			for (const [section, sessionId] of [
 				["idle", "done-session"],
 				["running", "busy-session"],
@@ -269,10 +278,19 @@ describe("agents view settled/duration/answer columns (U3)", () => {
 		const layout = buildAgentsViewUsageLayout(rows);
 		const legend = stripAnsi(layout.legends.get("idle")!);
 		// The legend leads with the usage block: no set/dur labels, no blank cells.
-		expect(legend).toMatch(/^↑in +↓out · +\$agent · +#sub · +\$total · +age$/);
+		expect(legend).toMatch(/^↑入 +↓出 · +自身 · +子代理 · +合计 · +更新$/);
 		const detail = stripAnsi(layout.details.get(rows[0]!.identity)!);
 		expect(detail).toMatch(/^ +↑0 +↓0 · +\$0\.00 · +0 · +\$0\.00 · *$/);
-		const dotColumns = (text: string) => [...text].flatMap((ch, index) => (ch === "·" ? [index] : []));
+		// Display columns, not string indexes: the CJK labels are two columns wide.
+		const dotColumns = (text: string) => {
+			const columns: number[] = [];
+			let column = 0;
+			for (const ch of text) {
+				if (ch === "·") columns.push(column);
+				column += visibleWidth(ch);
+			}
+			return columns;
+		};
 		expect(dotColumns(detail)).toEqual(dotColumns(legend));
 		expect(dotColumns(stripAnsi(layout.details.get(rows[1]!.identity)!))).toEqual(dotColumns(legend));
 
@@ -288,7 +306,7 @@ describe("agents view settled/duration/answer columns (U3)", () => {
 		});
 		const factsRows = buildAgentsViewRows([factsRow]);
 		const expanded = buildAgentsViewUsageLayout(factsRows);
-		expect(stripAnsi(expanded.legends.get("idle")!)).toMatch(/^set · +dur · +↑in/);
+		expect(stripAnsi(expanded.legends.get("idle")!)).toMatch(/^完成 · +时长 · +↑入/);
 		const expandedDetail = stripAnsi(expanded.details.get(factsRows[0]!.identity)!);
 		expect(visibleWidth(expandedDetail)).toBeGreaterThan(visibleWidth(detail));
 	});
@@ -316,7 +334,7 @@ describe("agents view settled/duration/answer columns (U3)", () => {
 		const bareRow = rows.find((row) => row.summary.sessionId === "bare-session")!;
 		const layout = buildAgentsViewUsageLayout(rows);
 		const legend = stripAnsi(layout.legends.get("idle")!);
-		expect(legend).toMatch(/^set · +dur · +↑in/);
+		expect(legend).toMatch(/^完成 · +时长 · +↑入/);
 		const factsDetail = stripAnsi(layout.details.get(factsRow.identity)!);
 		expect(factsDetail).toContain("✓");
 		expect(factsDetail).toContain("2h");
@@ -325,7 +343,16 @@ describe("agents view settled/duration/answer columns (U3)", () => {
 		expect(bareDetail).not.toContain("…");
 		// The blank state cells still occupy the section's columns: the separators
 		// land in the same terminal columns for the legend and both rows.
-		const dotColumns = (text: string) => [...text].flatMap((ch, index) => (ch === "·" ? [index] : []));
+		// Display columns, not string indexes: the CJK labels are two columns wide.
+		const dotColumns = (text: string) => {
+			const columns: number[] = [];
+			let column = 0;
+			for (const ch of text) {
+				if (ch === "·") columns.push(column);
+				column += visibleWidth(ch);
+			}
+			return columns;
+		};
 		expect(dotColumns(bareDetail)).toEqual(dotColumns(legend));
 		expect(dotColumns(factsDetail)).toEqual(dotColumns(legend));
 	});

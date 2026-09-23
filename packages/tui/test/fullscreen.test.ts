@@ -250,7 +250,7 @@ describe("TUI fullscreen mode", () => {
 		assert.strictEqual(viewport[0], "Line 11", "appended content does not move the window");
 		assert.strictEqual(viewport[8], "> prompt", "dock still visible");
 		assert.strictEqual(tui.getScrollInfo()?.linesBelow, 21);
-		assert.ok(viewport[7]?.includes("ctrl+shift+down to follow"), "follow hint composited above the dock");
+		assert.ok(viewport[7]?.includes("Ctrl+Shift+↓ 回到底部"), "follow hint composited above the dock");
 
 		tui.stop();
 	});
@@ -260,15 +260,15 @@ describe("TUI fullscreen mode", () => {
 		tui.enterFullscreen({ scroll: [chat], dock });
 		await terminal.waitForRender();
 
-		assert.ok(!terminal.getViewport().join("\n").includes("to follow"));
+		assert.ok(!terminal.getViewport().join("\n").includes("回到底部"));
 
 		terminal.sendInput(WHEEL_UP);
 		await terminal.waitForRender();
-		assert.ok(terminal.getViewport().join("\n").includes("to follow"));
+		assert.ok(terminal.getViewport().join("\n").includes("回到底部"));
 
 		terminal.sendInput(FOLLOW);
 		await terminal.waitForRender();
-		assert.ok(!terminal.getViewport().join("\n").includes("to follow"));
+		assert.ok(!terminal.getViewport().join("\n").includes("回到底部"));
 
 		tui.stop();
 	});

@@ -55,16 +55,16 @@ describe("InteractiveMode queue compaction header", () => {
 		const text = renderQueue(createContext(queued, true));
 		const assertionLines = [queued.steering, queued.followUp].flat();
 		expect(assertionLines.length).toBeGreaterThan(0);
-		expect(text).toContain("compacting context");
-		expect(text).toContain(`${assertionLines.length} queued`);
+		expect(text).toContain("正在压缩上下文");
+		expect(text).toContain(`${assertionLines.length} 条排队`);
 		// The header sits above the message previews that describe what is waiting.
-		expect(text.indexOf("compacting context")).toBeLessThan(text.indexOf("steer one"));
+		expect(text.indexOf("正在压缩上下文")).toBeLessThan(text.indexOf("steer one"));
 	});
 
 	test("omits the compaction header when not compacting", () => {
 		const text = renderQueue(createContext(queued, false));
 		expect(queued.steering.length).toBeGreaterThan(0);
-		expect(text).not.toContain("compacting context");
+		expect(text).not.toContain("正在压缩上下文");
 		// The previews still render, so the only difference is the missing header.
 		expect(text).toContain("steer one");
 	});
@@ -73,13 +73,13 @@ describe("InteractiveMode queue compaction header", () => {
 		const empty = createContext({ steering: [], followUp: [] }, true);
 		const text = renderQueue(empty);
 		// No queued messages means the whole queue block (header included) is absent.
-		expect(text).not.toContain("compacting context");
+		expect(text).not.toContain("正在压缩上下文");
 		expect(empty.queuedMessagesContainer.children).toHaveLength(0);
 	});
 
 	test("counts steering and follow-up messages together in the header", () => {
 		const mixed = createContext({ steering: ["a"], followUp: ["b", "c"] }, true);
 		const text = renderQueue(mixed);
-		expect(text).toContain("3 queued");
+		expect(text).toContain("3 条排队");
 	});
 });

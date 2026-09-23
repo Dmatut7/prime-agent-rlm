@@ -11,5 +11,5 @@ export function formatResumeHint(stats: ResumeHintStats | undefined): string | u
 	// Persistence is lazy: nothing is written until the first assistant message
 	// arrives, so exiting before then leaves no file to resume from.
 	if (!existsSync(stats.sessionFile)) return undefined;
-	return chalk.dim(`Resume this session with: ${APP_NAME} --resume ${stats.sessionId}`);
+	return chalk.dim(`下次继续：${APP_NAME} --resume ${stats.sessionId}`);
 }

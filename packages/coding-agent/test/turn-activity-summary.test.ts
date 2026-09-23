@@ -7,6 +7,7 @@ import { AGENT_MESSAGE_SOURCE, createAgentSessionMessage } from "../src/core/age
 import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
 import { buildConversationComponents } from "../src/modes/interactive/components/conversation-components.js";
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
+import { setQuietConversationBudget } from "../src/modes/interactive/components/tool-output-budget.js";
 import {
 	TurnActivityState,
 	TurnSummaryComponent,
@@ -401,7 +402,7 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 		const nonEmpty = collapsed.split("\n").filter((line) => line.trim().length > 0);
 
 		// One process line at the turn head: caret, steps, duration, plain-words summary.
-		expect(nonEmpty[1]?.startsWith(" ▸ 6 步 · 0.6s   ")).toBe(true);
+		expect(nonEmpty[1]?.startsWith(" ▸ 6 步 · 共 0.6s   ")).toBe(true);
 		expect(nonEmpty[1]).toContain("编辑 3 个文件");
 		expect(nonEmpty[1]).toContain("运行 npm test");
 		expect(nonEmpty[1]).not.toMatch(/\[[OTP]\]/);
@@ -622,6 +623,14 @@ describe("process block key-steps fold (TUI v4 T6)", () => {
 			.join("\n")
 			.replace(/\u001b\[[0-9;]*m/g, "");
 		expect(rendered).toContain("⋯ 中间 8 步");
+		setQuietConversationBudget(true);
+		try {
+			const quietRow = stripAnsi(tool.render(120).join("\n"));
+			// Level with the step markers under the process line (column 3).
+			expect(quietRow.startsWith("   ⋯ 中间 8 步")).toBe(true);
+		} finally {
+			setQuietConversationBudget(false);
+		}
 
 		const middle = new ToolExecutionComponent(
 			"bash",
@@ -690,11 +699,11 @@ describe("turn state for the process line", () => {
 		const summary = new TurnSummaryComponent(state);
 		summary.setQuiet(true);
 		expect(summary.render(120).map((line) => stripAnsi(line))).toEqual([
-			" ▸ 1 步 · 0.4s   编辑 a.ts",
+			" ▸ 1 步 · 共 0.4s   编辑 a.ts",
 			"   改动  src/a.ts  +3 −5",
 		]);
 		summary.setExpanded(true);
-		expect(summary.render(120).map((line) => stripAnsi(line))).toEqual([" ▾ 1 步 · 0.4s   编辑 a.ts"]);
+		expect(summary.render(120).map((line) => stripAnsi(line))).toEqual([" ▾ 1 步 · 共 0.4s   编辑 a.ts"]);
 	});
 
 	it("relabels a step when its streaming arguments complete", () => {
@@ -705,7 +714,7 @@ describe("turn state for the process line", () => {
 		state.markTurnEnded(1_300);
 		const summary = new TurnSummaryComponent(state);
 		summary.setQuiet(true);
-		expect(stripAnsi(summary.render(120)[0] ?? "")).toBe(" ▸ 1 步 · 0.2s   运行 npm check");
+		expect(stripAnsi(summary.render(120)[0] ?? "")).toBe(" ▸ 1 步 · 共 0.2s   运行 npm run check");
 	});
 
 	it("keeps the clock ticking while a step is unsettled and freezes it on the last settled step", () => {
@@ -787,5 +796,30 @@ describe("turn state for the process line", () => {
 		state.thinkingExpanded = true;
 		summary.invalidate();
 		expect(summary.render(120).map(stripAnsi).join("\n")).not.toContain("weighing the two options");
+	});
+
+	it("refreshes a frozen turn's caret the moment any lane flips (QA H1)", () => {
+		const state = new TurnActivityState(1_000);
+		state.addStep({ toolCallId: "t1", toolName: "bash", args: { command: "ls" }, status: "done" });
+		state.addThinkingSegments(1);
+		state.markTurnEnded(2_000);
+		const summary = new TurnSummaryComponent(state);
+		summary.setQuiet(true);
+		const caret = () => stripAnsi(summary.render(120)[0] ?? "").slice(0, 3);
+		expect(caret()).toBe(" ▸ ");
+		state.thinkingExpanded = true;
+		expect(caret()).toBe(" ▾ ");
+		state.thinkingExpanded = false;
+		expect(caret()).toBe(" ▸ ");
+		state.agentMessagesExpanded = true;
+		expect(caret()).toBe(" ▾ ");
+	});
+
+	it("previews the turn's first thinking trace, following it while it streams", () => {
+		const state = new TurnActivityState(1_000);
+		state.latestThinking = "plan: read";
+		state.latestThinking = "plan: read the file first";
+		state.latestThinking = "done, now answer";
+		expect(state.latestThinking).toBe("plan: read the file first");
 	});
 });

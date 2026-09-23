@@ -123,7 +123,7 @@ export class AgentMessageComponent extends Container {
 	}
 
 	private headerText(): string {
-		const label = "Agent message received";
+		const label = "收到消息";
 		const participant = formatAgentMessageParticipant(
 			"received",
 			this.message.details.fromRelationship,

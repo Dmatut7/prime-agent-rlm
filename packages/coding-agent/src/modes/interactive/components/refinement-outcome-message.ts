@@ -54,9 +54,7 @@ function editLabel(edit: AppliedRefinementEdit, fallbackScope: "local" | "global
 
 function editCount(edits: AppliedRefinementEdit[]): string {
 	const applied = edits.filter((edit) => edit.applied).length;
-	return edits.length === applied
-		? `${applied} edit${applied === 1 ? "" : "s"} applied`
-		: `${applied}/${edits.length} edits applied`;
+	return edits.length === applied ? `已应用 ${applied} 处修改` : `已应用 ${applied}/${edits.length} 处修改`;
 }
 
 /** Width-aware collapsed line: truncates the summary so the line never wraps. */

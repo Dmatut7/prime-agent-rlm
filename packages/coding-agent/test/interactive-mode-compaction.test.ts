@@ -96,9 +96,7 @@ describe("InteractiveMode compaction events", () => {
 		expect(fakeThis.rebuildChatFromMessages).toHaveBeenCalledOnce();
 		expect(fakeThis.addMessageToChat).not.toHaveBeenCalled();
 		if (refresh === "fails") {
-			expect(fakeThis.showError).toHaveBeenCalledWith(
-				"Compaction succeeded, but the transcript could not be refreshed: context unavailable",
-			);
+			expect(fakeThis.showError).toHaveBeenCalledWith("压缩完成，但对话没能刷新：context unavailable");
 		} else {
 			expect(fakeThis.showError).not.toHaveBeenCalled();
 		}

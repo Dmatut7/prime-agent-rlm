@@ -60,7 +60,7 @@ describe("/export reports identity data embedded in the written file", () => {
 		expect(fakeThis.showError).not.toHaveBeenCalled();
 		expect(fakeThis.showStatus).toHaveBeenCalledTimes(1);
 		const message = vi.mocked(fakeThis.showStatus).mock.calls[0][0] as string;
-		expect(message).toContain("Session exported to:");
+		expect(message).toContain("会话已导出到：");
 		expect(message).toContain("absolute path");
 		expect(message).toContain("/Users/alice");
 	});
@@ -72,7 +72,7 @@ describe("/export reports identity data embedded in the written file", () => {
 
 		expect(fakeThis.showError).not.toHaveBeenCalled();
 		const message = vi.mocked(fakeThis.showStatus).mock.calls[0][0] as string;
-		expect(message).toContain("Session exported to:");
+		expect(message).toContain("会话已导出到：");
 		expect(message).not.toContain("absolute path");
 		expect(message).not.toContain("identifies");
 	});

@@ -173,7 +173,7 @@ describe("ConfigurationMenuComponent", () => {
 		menu.updateModels(postLoginModel, [firstModel, postLoginModel]);
 		output = stripAnsi(menu.render(120).join("\n"));
 		const postLoginRow = output.split("\n").find((line) => line.includes("faux-2"));
-		expect(postLoginRow).toContain("current");
+		expect(postLoginRow).toContain("当前");
 	});
 
 	it("keeps arrow keys in the active search field and uses Escape to close", async () => {

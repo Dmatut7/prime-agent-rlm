@@ -377,6 +377,15 @@ export class Container implements Component {
 /**
  * TUI - Main class for managing terminal UI with differential rendering
  */
+/** `ctrl+shift+down` → `Ctrl+Shift+↓`, for the follow hint. */
+function formatFollowKey(key: string): string {
+	const arrows: Record<string, string> = { up: "↑", down: "↓", left: "←", right: "→" };
+	return key
+		.split("+")
+		.map((part) => arrows[part] ?? (part.length > 0 ? part[0]!.toUpperCase() + part.slice(1) : part))
+		.join("+");
+}
+
 export class TUI extends Container {
 	public terminal: Terminal;
 	private previousLines: string[] = [];
@@ -1788,16 +1797,17 @@ export class TUI extends Container {
 		);
 		const scrollInfo = fullscreen.viewport.scrollInfo();
 		if (fullscreen.viewportControls && !scrollInfo.following) {
-			// Follow hint composited over the bottom of the transcript window,
-			// just above the dock. Overlays still paint on top of it.
+			// Follow hint on the bottom row of the transcript window, just above
+			// the dock: a dim rule with the key at the right edge, replacing the
+			// row instead of painting over the middle of a text line.
 			const followKey = getKeybindings().getKeys("tui.viewport.follow")[0] ?? "ctrl+shift+down";
-			const label = ` ${followKey} to follow `;
+			const label = ` ${formatFollowKey(followKey)} 回到底部 `;
 			const labelWidth = visibleWidth(label);
 			const row = fullscreen.viewport.headerHeight() + fullscreen.viewport.windowHeight() - 1;
-			if (row >= 0 && row < frame.length && labelWidth <= width) {
-				const col = Math.floor((width - labelWidth) / 2);
-				frame[row] = this.compositeLineAt(frame[row], `\x1b[7m${label}\x1b[27m`, col, labelWidth, width);
-				fullscreen.viewport.subtractFrameClickCoverage(row, col, col + labelWidth);
+			if (row >= 0 && row < frame.length && labelWidth + 2 <= width) {
+				const ruleWidth = width - labelWidth - 1;
+				frame[row] = `\x1b[2m${"─".repeat(ruleWidth)}\x1b[22m\x1b[7m${label}\x1b[27m `;
+				fullscreen.viewport.subtractFrameClickCoverage(row, 0, width);
 			}
 		}
 		if (this.overlayStack.length > 0) {

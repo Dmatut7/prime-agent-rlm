@@ -406,7 +406,7 @@ interface SharedContextTree {
 }
 
 /** The prompt's placeholder while a turn runs: Enter steers the running turn. */
-const WORKING_PROMPT_PLACEHOLDER = "随时补充或纠正，Enter 立即告诉 AI";
+const WORKING_PROMPT_PLACEHOLDER = "随时补充或纠正，Enter 发给 AI";
 
 export const START_HINTS = [
 	"描述任务，@ 引用文件，/ 看命令",
@@ -428,8 +428,11 @@ function isLabeledQueuedPreview(message: string): boolean {
 	);
 }
 
+/** The queued-message row labels: a steer lands in the running turn, a follow-up after it. */
+const QUEUED_MESSAGE_LABELS = { Steering: "插话", "Follow-up": "稍后发送" } as const;
+
 export function formatQueuedMessagePreview(message: string, label: "Steering" | "Follow-up"): string {
-	return isLabeledQueuedPreview(message) ? message : `${label}: ${message}`;
+	return isLabeledQueuedPreview(message) ? message : `${QUEUED_MESSAGE_LABELS[label]}：${message}`;
 }
 
 export function styleQueuedMessagePreview(
@@ -1793,25 +1796,25 @@ export class InteractiveMode {
 			const hint = (keybinding: AppKeybinding, description: string) => keyHint(keybinding, description);
 			const verboseInstructions = this.options.verbose
 				? [
-						hint("app.clear", "to interrupt"),
-						rawKeyHint(`${keyText("app.clear")} twice`, "to exit"),
-						hint("app.input.clear", "to clear input"),
-						hint("app.exit", "to exit (empty)"),
-						hint("app.suspend", "to suspend"),
-						keyHint("tui.editor.deleteToLineEnd", "to delete to end"),
-						rawKeyHint("/effort", "to set thinking level"),
-						hint("app.model.select", "to select model"),
-						hint("app.tools.expand", "to expand tool calls, outputs and edit diffs"),
-						hint("app.thinking.toggle", "to expand thinking"),
-						hint("app.messages.expand", "to expand agent messages"),
-						hint("app.subagents.focus", "to inspect subagents"),
-						hint("app.editor.external", "for external editor"),
-						hint("app.prompt.stash", "to stash prompt"),
-						rawKeyHint("/", "for commands"),
-						hint("app.message.followUp", "to queue follow-up"),
-						hint("app.message.navigateOlder", "to browse queued messages"),
-						hint("app.clipboard.pasteImage", "to paste image"),
-						rawKeyHint("drop files", "to attach"),
+						hint("app.clear", "中断"),
+						rawKeyHint(`${keyText("app.clear")} 按两次`, "退出"),
+						hint("app.input.clear", "清空输入"),
+						hint("app.exit", "退出（输入为空时）"),
+						hint("app.suspend", "挂到后台"),
+						keyHint("tui.editor.deleteToLineEnd", "删到行尾"),
+						rawKeyHint("/effort", "调推理强度"),
+						hint("app.model.select", "选模型"),
+						hint("app.tools.expand", "展开过程（工具调用、输出和改动）"),
+						hint("app.thinking.toggle", "展开 Thinking"),
+						hint("app.messages.expand", "展开代理消息"),
+						hint("app.subagents.focus", "查看子代理"),
+						hint("app.editor.external", "外部编辑器"),
+						hint("app.prompt.stash", "暂存输入"),
+						rawKeyHint("/", "命令"),
+						hint("app.message.followUp", "排一条稍后发送"),
+						hint("app.message.navigateOlder", "查看排队消息"),
+						hint("app.clipboard.pasteImage", "粘贴图片"),
+						rawKeyHint("拖入文件", "附加"),
 					].join("\n")
 				: undefined;
 			this.builtInHeader = new BrandSplashHeader(
@@ -1966,7 +1969,7 @@ export class InteractiveMode {
 		} = this.options;
 
 		if (migratedProviders && migratedProviders.length > 0) {
-			this.showWarning(`Migrated credentials to auth.json: ${migratedProviders.join(", ")}`);
+			this.showWarning(`已把凭据迁移到 auth.json：${migratedProviders.join(", ")}`);
 		}
 
 		if (this.options.startupNotice) {
@@ -1975,7 +1978,7 @@ export class InteractiveMode {
 
 		const modelsJsonError = this.modelRegistry.getError();
 		if (modelsJsonError) {
-			this.showError(`models.json error: ${modelsJsonError}`);
+			this.showError(`models.json 有错：${modelsJsonError}`);
 		}
 
 		const startupPrompts: InteractiveInitialPrompt[] = [
@@ -2052,7 +2055,7 @@ export class InteractiveMode {
 						if (!(await startupRetryDelay())) return;
 						continue;
 					}
-					this.showError(`Skipping startup prompt after 3 failed attempts: ${errorMessage}`);
+					this.showError(`启动时的提示连续 3 次失败，已跳过：${errorMessage}`);
 					failures = 0;
 					next++;
 				}
@@ -2907,7 +2910,7 @@ export class InteractiveMode {
 						if (!result.cancelled) {
 							await this.renderCurrentSessionState();
 							this.editor.setText("selectedText" in result ? (result.selectedText ?? "") : "");
-							this.showStatus("Forked to new session");
+							this.showStatus("已分叉到新会话");
 						}
 						return { cancelled: result.cancelled };
 					} catch (error: unknown) {
@@ -3769,7 +3772,7 @@ export class InteractiveMode {
 			for (const [shortcutStr, shortcut] of shortcuts) {
 				if (matchesKey(data, shortcutStr as KeyId)) {
 					Promise.resolve(shortcut.handler(createContext())).catch((err) => {
-						this.showError(`Shortcut handler error: ${err instanceof Error ? err.message : String(err)}`);
+						this.showError(`快捷键处理出错：${err instanceof Error ? err.message : String(err)}`);
 					});
 					return true;
 				}
@@ -4922,17 +4925,17 @@ export class InteractiveMode {
 		const text = this.editor.getText();
 		if (!text.trim()) {
 			if (!this.restorePromptStashIfEditorEmpty()) {
-				this.showStatus("No prompt to stash");
+				this.showStatus("没有可暂存的输入");
 			}
 			return;
 		}
 		if (this.promptStash !== undefined) {
-			this.showStatus("Prompt stash already has a draft");
+			this.showStatus("暂存区已有一份草稿");
 			return;
 		}
 		this.promptStash = this.snapshotPromptStash(text);
 		this.editor.setText("");
-		this.showStatus("Stashed prompt");
+		this.showStatus("已暂存输入");
 	}
 
 	private restorePromptStashIfEditorEmpty(stash = this.promptStash): boolean {
@@ -4951,7 +4954,7 @@ export class InteractiveMode {
 			this.editor.restorePasteSnapshot(stash.pasteSnapshot);
 		}
 		this.latestEditorPromptStash = this.snapshotPromptStash(this.editor.getText());
-		this.showStatus("Restored stashed prompt");
+		this.showStatus("已恢复暂存的输入");
 		return true;
 	}
 
@@ -5147,11 +5150,11 @@ export class InteractiveMode {
 
 	private async handleSideQuestion(question: string): Promise<void> {
 		if (!question) {
-			this.showWarning("Usage: /btw <question>");
+			this.showWarning("用法：/btw <问题>");
 			return;
 		}
 		if (this.activeSideQuestionId) {
-			this.showWarning("Wait for the current side question to finish or cancel it first.");
+			this.showWarning("请先等旁路提问结束，或先取消它。");
 			return;
 		}
 
@@ -5294,7 +5297,7 @@ export class InteractiveMode {
 		if (result.editorText && !this.editor.getText().trim()) {
 			this.editor.setText(result.editorText);
 		}
-		this.showStatus("Navigated to selected point");
+		this.showStatus("已回到选中的位置");
 	}
 
 	private setupEditorSubmitHandler(): void {
@@ -5395,7 +5398,7 @@ export class InteractiveMode {
 				if (commandName === "fast") {
 					this.editor.setText("");
 					if (commandArgs) {
-						this.showError("Usage: /fast");
+						this.showError("用法：/fast");
 					} else {
 						this.handleFastCommand();
 					}
@@ -5516,7 +5519,7 @@ export class InteractiveMode {
 				if (slashCommand?.name === "clear") {
 					if (commandArgs) {
 						this.editor.setText(text);
-						this.showError("Usage: /clear");
+						this.showError("用法：/clear");
 					} else {
 						this.editor.setText("");
 						await this.handleClearCommand();
@@ -5553,7 +5556,7 @@ export class InteractiveMode {
 						!updateArgsIncludeSelf(updateArgs) &&
 						(this.isAgentCompacting() || this.isAgentStreaming() || this.isBashRunning())
 					) {
-						this.showWarning("Wait for the current work to finish before updating.");
+						this.showWarning("请等当前任务结束后再更新。");
 						return;
 					}
 					await this.handleUpdateCommand(commandArgs);
@@ -5563,7 +5566,7 @@ export class InteractiveMode {
 					this.editor.setText("");
 					const arg = commandArgs?.trim().toLowerCase();
 					if (arg && arg !== "on" && arg !== "off") {
-						this.showError("Usage: /fullscreen [on|off]");
+						this.showError("用法：/fullscreen [on|off]");
 						return;
 					}
 					const enable = arg === "on" ? true : arg === "off" ? false : !this.fullscreenEnabled;
@@ -5574,7 +5577,7 @@ export class InteractiveMode {
 					this.editor.setText("");
 					const arg = commandArgs?.trim().toLowerCase();
 					if (arg && arg !== "on" && arg !== "off") {
-						this.showError("Usage: /speed [on|off]");
+						this.showError("用法：/speed [on|off]");
 						return;
 					}
 					const enable = arg === "on" ? true : arg === "off" ? false : !this.speedDisplayEnabled;
@@ -5620,7 +5623,7 @@ export class InteractiveMode {
 					// replies: overlapping pane turns would seed out of order.
 					if (this.sideQuestionComponent && this.activeSideQuestionId) {
 						this.editor.setText(text);
-						this.showWarning("Wait for the current side question to finish or cancel it first.");
+						this.showWarning("请先等旁路提问结束，或先取消它。");
 						return;
 					}
 					// Inside a side conversation the command runs inside the pane (its
@@ -5677,7 +5680,7 @@ export class InteractiveMode {
 					// paths put the draft back rather than merely skip clearing it.
 					if (this.sideQuestionBash) {
 						this.editor.setText(text);
-						this.showWarning("Wait for the running command to finish or cancel it first.");
+						this.showWarning("请先等命令跑完，或先取消它。");
 						return;
 					}
 					if (this.activeSideQuestionId) {
@@ -5855,7 +5858,7 @@ export class InteractiveMode {
 							"warning",
 						);
 					} else {
-						this.showStatus("Daemon connection lost; reconnecting…", "warning");
+						this.showStatus("和后台的连接断开了，正在重连…", "warning");
 					}
 					if (event.status === "connected") {
 						await this.refreshHeartbeatCatalog();
@@ -6041,7 +6044,7 @@ export class InteractiveMode {
 				return undefined;
 			}
 			default:
-				this.showStatus(`Unsupported extension UI request: ${request.method}`);
+				this.showStatus(`扩展请求了不支持的界面操作：${request.method}`);
 				return undefined;
 		}
 	}
@@ -6194,7 +6197,7 @@ export class InteractiveMode {
 					this.activeBashComponent = undefined;
 				} else if (event.errorMessage && !event.transient) {
 					// Transient failures surface in the owning client's pane, not here.
-					this.showError(`Bash command failed: ${event.errorMessage}`);
+					this.showError(`命令执行失败：${event.errorMessage}`);
 				}
 				// Seed the side transcript only when our own pane-mounted run ended.
 				if (component !== undefined && component === this.sideQuestionBashComponent) {
@@ -6295,9 +6298,7 @@ export class InteractiveMode {
 								? ""
 								: ` · ${this.formatWorkingElapsed(Date.now() - this.workingStartedAt)}`;
 						errorMessage =
-							retryAttempt > 0
-								? `Aborted after ${retryAttempt} retry attempt${retryAttempt > 1 ? "s" : ""}${elapsedSuffix}`
-								: `Operation aborted${elapsedSuffix}`;
+							retryAttempt > 0 ? `重试 ${retryAttempt} 次后已中断${elapsedSuffix}` : `已中断${elapsedSuffix}`;
 						this.streamingMessage.errorMessage = errorMessage;
 					}
 					this.ensureAssistantStreamingComponent(event.message).updateContent(this.streamingMessage, false);
@@ -6483,13 +6484,13 @@ export class InteractiveMode {
 				// Restore the working loader if streaming/subagents still warrant it.
 				this.syncWorkingLoader();
 				if (event.aborted) {
-					if (event.reason === "manual") this.showError("Compaction cancelled");
+					if (event.reason === "manual") this.showError("已取消压缩");
 				} else if (event.result) {
 					try {
 						await this.rebuildChatFromMessages();
 					} catch (error) {
 						const message = error instanceof Error ? error.message : String(error);
-						this.showError(`Compaction succeeded, but the transcript could not be refreshed: ${message}`);
+						this.showError(`压缩完成，但对话没能刷新：${message}`);
 					}
 					await this.refreshConnectionContextUsage();
 					this.footer.invalidate();
@@ -6544,7 +6545,7 @@ export class InteractiveMode {
 				this.syncWorkingLoader();
 				// Show error only on final failure (success shows normal response)
 				if (!event.success) {
-					this.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
+					this.showError(`重试 ${event.attempt} 次后仍失败：${event.finalError || "未知错误"}`);
 				}
 				this.ui.requestRender();
 				break;
@@ -6566,11 +6567,11 @@ export class InteractiveMode {
 
 			case "refine_failed":
 				// This event has no request identity; the matching command result settles its loader.
-				this.showError(`Refinement failed: ${event.error}`);
+				this.showError(`经验沉淀失败：${event.error}`);
 				break;
 
 			case "session_persist_failed":
-				this.showError(`Session persistence failed: ${event.error}`);
+				this.showError(`会话保存失败：${event.error}`);
 				break;
 
 			case "rlm_terminal_notice_abandoned":
@@ -7133,7 +7134,7 @@ export class InteractiveMode {
 	private async openScopedAgentsView(): Promise<void> {
 		if (!this.options.returnToAgentsView) {
 			this.focusEditor();
-			this.showStatus("The agents view needs the daemon; start without --no-daemon to browse sessions");
+			this.showStatus("会话列表需要后台服务；不带 --no-daemon 启动才能浏览会话");
 			return;
 		}
 		await this.returnToAgentsView("scoped_agents_view");
@@ -7182,6 +7183,11 @@ export class InteractiveMode {
 			const clearKey = keyText("app.clear");
 			return clearKey ? `再按一次 ${clearKey} 退出` : "再按一次退出";
 		}
+		// The first Esc on an idle empty prompt says what a second one would do.
+		if (this.escapeRepeatAction === "tree" && !this.hasInterruptibleWork() && this.editor.getText().length === 0) {
+			const escKey = keyText("app.input.clear", { primaryOnly: true });
+			return `再按一次 ${escKey || "Esc"} 回退到之前的消息`;
+		}
 		const text = this.editor.getExpandedText?.() ?? this.editor.getText();
 		if (!this.isAgentStreaming() || !text.trim()) {
 			return undefined;
@@ -7207,7 +7213,10 @@ export class InteractiveMode {
 			const key = keyText(keybinding, { primaryOnly: true });
 			return key ? `${key} ${label}` : undefined;
 		};
-		const agentsBack = this.options.returnToAgentsView ? hint("app.agents.back", "会话列表") : undefined;
+		// ← only reaches the session list from an empty prompt; with text it moves the cursor.
+		const promptEmpty = (this.editor.getExpandedText?.() ?? this.editor.getText()).length === 0;
+		const agentsBack =
+			this.options.returnToAgentsView && promptEmpty ? hint("app.agents.back", "会话列表") : undefined;
 		const hints = this.isAgentStreaming()
 			? [hint("app.input.clear", "中断"), hint("app.tools.expand", "过程"), hint("app.thinking.toggle", "Thinking")]
 			: !this.isNewChat()
@@ -7391,7 +7400,7 @@ export class InteractiveMode {
 			return;
 		}
 
-		const spacer = new Spacer(1);
+		const spacer = new Spacer(children.length > 0 ? 1 : 0);
 		const text = new Text(theme.fg(tone, message), 1, 0);
 		this.chatContainer.addChild(spacer);
 		this.chatContainer.addChild(text);
@@ -7403,9 +7412,9 @@ export class InteractiveMode {
 	private async copyFullscreenSelection(text: string): Promise<void> {
 		try {
 			await copyToClipboard(text);
-			this.showStatus("Copied selection to clipboard");
+			this.showStatus("已复制选中内容");
 		} catch (error) {
-			this.showError(`Failed to copy selection: ${error instanceof Error ? error.message : String(error)}`);
+			this.showError(`复制失败：${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 
@@ -7773,10 +7782,12 @@ export class InteractiveMode {
 								const retryAttempt = this.getRetryAttempt();
 								errorMessage =
 									retryAttempt > 0
-										? `Aborted after ${retryAttempt} retry attempt${retryAttempt > 1 ? "s" : ""}`
-										: message.errorMessage && message.errorMessage !== "Request was aborted"
+										? `重试 ${retryAttempt} 次后已中断`
+										: message.errorMessage &&
+												message.errorMessage !== "Request was aborted" &&
+												message.errorMessage !== "Operation aborted"
 											? message.errorMessage
-											: "Operation aborted";
+											: "已中断";
 							} else {
 								errorMessage = message.errorMessage || "Error";
 							}
@@ -7879,7 +7890,7 @@ export class InteractiveMode {
 		const compactionCount = state.compactionCount;
 		if (compactionCount > 0) {
 			const times = compactionCount === 1 ? "1 time" : `${compactionCount} times`;
-			this.showStatus(`Session compacted ${times}`);
+			this.showStatus(`会话已压缩 ${times}`);
 		}
 	}
 
@@ -7981,6 +7992,11 @@ export class InteractiveMode {
 
 	private handleEscape(): void {
 		this.clearCtrlCExitHint();
+		// An open shortcut panel is the first thing Esc closes.
+		if ((this.shortcutGuideContainer?.children.length ?? 0) > 0) {
+			this.clearShortcutGuide();
+			return;
+		}
 		if (this.sideQuestionEvent) {
 			this.clearEscapeRepeat();
 			this.clearSideQuestion({ abort: true });
@@ -8019,8 +8035,10 @@ export class InteractiveMode {
 		this.escapeRepeatExpiresAt = Date.now() + InteractiveMode.ESCAPE_REPEAT_WINDOW_MS;
 		this.escapeRepeatTimer = setTimeout(() => {
 			this.clearEscapeRepeat();
+			this.ui.requestRender();
 		}, InteractiveMode.ESCAPE_REPEAT_WINDOW_MS);
 		this.escapeRepeatTimer.unref?.();
+		this.ui.requestRender();
 	}
 
 	private takeEscapeRepeatAction(): "tree" | "clear" | undefined {
@@ -8053,8 +8071,14 @@ export class InteractiveMode {
 
 	private handleInterruptKey(): void {
 		this.clearEscapeRepeat();
+		// A press that stops running work only stops it; arming "press again to
+		// exit" in the same press would make the usual double press to stop a
+		// task quit the app instead.
+		const stoppedWork = this.hasInterruptibleWork();
 		this.interruptOrClearInput();
-		this.showCtrlCExitHint();
+		if (!stoppedWork) {
+			this.showCtrlCExitHint();
+		}
 	}
 
 	private interruptOrClearInput(): void {
@@ -8328,7 +8352,7 @@ export class InteractiveMode {
 
 	private async requestAgentsView(): Promise<void> {
 		if (!this.options.returnToAgentsView) {
-			this.showStatus("The agents view needs the daemon; start without --no-daemon to browse sessions");
+			this.showStatus("会话列表需要后台服务；不带 --no-daemon 启动才能浏览会话");
 			return;
 		}
 		await this.returnToAgentsView();
@@ -8417,7 +8441,7 @@ export class InteractiveMode {
 
 	private handleCtrlZ(): void {
 		if (process.platform === "win32") {
-			this.showStatus("Suspend to background is not supported on Windows");
+			this.showStatus("Windows 不支持挂到后台");
 			return;
 		}
 
@@ -8568,8 +8592,8 @@ export class InteractiveMode {
 					status === "applied" ? selected.index + direction : selected.index,
 				);
 				if (status === "applied") this.ui.requestRender();
-				else if (status === "unsupported") this.showStatus("Queue editing requires a newer daemon");
-				else this.showStatus("Queue changed; reorder not applied");
+				else if (status === "unsupported") this.showStatus("修改排队消息需要更新后台服务");
+				else this.showStatus("排队消息已变化，没有调整顺序");
 			} finally {
 				this.pendingQueueMove = false;
 			}
@@ -8657,10 +8681,9 @@ export class InteractiveMode {
 				if (!this.queueSelection.isBrowsing) {
 					this.queueSelection.replaceDraft(editorUntouched ? text : this.editor.getText());
 				}
-				if (status === "invalid")
-					this.showStatus("Edited command is not a valid session command; edit kept in the editor");
-				else if (status === "unsupported") this.showStatus("Queue editing requires a newer daemon");
-				else this.showStatus("Queue changed; edit kept in the editor");
+				if (status === "invalid") this.showStatus("改后的内容不是有效命令，已保留在输入框里");
+				else if (status === "unsupported") this.showStatus("修改排队消息需要更新后台服务");
+				else this.showStatus("排队消息已变化，修改保留在输入框里");
 			}
 			this.updatePendingMessagesDisplay();
 			this.ui.requestRender();
@@ -8752,7 +8775,7 @@ export class InteractiveMode {
 		this.settingsManager.setFullscreen(enabled);
 		if (enabled && !process.stdout.isTTY) {
 			this.fullscreenEnabled = false;
-			this.showStatus("Fullscreen rendering requires an interactive terminal");
+			this.showStatus("全屏模式需要在交互式终端里使用");
 			return;
 		}
 		this.fullscreenEnabled = enabled;
@@ -9124,7 +9147,7 @@ export class InteractiveMode {
 		// Determine editor (respect $VISUAL, then $EDITOR)
 		const editorCmd = process.env.VISUAL || process.env.EDITOR;
 		if (!editorCmd) {
-			this.showWarning("No editor configured. Set $VISUAL or $EDITOR environment variable.");
+			this.showWarning("没有配置编辑器。请设置 $VISUAL 或 $EDITOR 环境变量。");
 			return;
 		}
 
@@ -9178,13 +9201,14 @@ export class InteractiveMode {
 	}
 
 	showError(errorMessage: string): void {
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(theme.fg("error", `Error: ${errorMessage}`), 1, 0));
+		// One blank line between chat blocks; the first block follows the header's own spacing.
+		if (this.chatContainer.children.length > 0) this.chatContainer.addChild(new Spacer(1));
+		this.chatContainer.addChild(new Text(theme.fg("error", `出错：${errorMessage}`), 1, 0));
 		this.ui.requestRender();
 	}
 
 	showWarning(warningMessage: string): void {
-		this.chatContainer.addChild(new Spacer(1));
+		if (this.chatContainer.children.length > 0) this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new Text(theme.fg("warning", `⚠ ${warningMessage}`), 1, 0));
 		this.ui.requestRender();
 	}
@@ -9226,7 +9250,7 @@ export class InteractiveMode {
 				const queuedCount = steeringMessages.length + followUpMessages.length;
 				const compactionText = theme.fg(
 					"dim",
-					`╭─ compacting context · ${queuedCount} queued (agent messages wait for compaction)`,
+					`╭─ 正在压缩上下文 · ${queuedCount} 条排队（代理消息等压缩完成后送达）`,
 				);
 				this.queuedMessagesContainer.addChild(new TruncatedText(compactionText, 1, 0));
 			}
@@ -9240,8 +9264,8 @@ export class InteractiveMode {
 			}
 			const dequeueHint = this.getAppKeyDisplay("app.message.navigateOlder");
 			// While idle the queue is parked (an interrupt suspended it); tell the user Enter sends it.
-			const sendHint = this.isAgentStreaming() ? "" : "enter to send · ";
-			const hintText = theme.fg("dim", `╰─ ${sendHint}${dequeueHint} to browse and edit queued messages`);
+			const sendHint = this.isAgentStreaming() ? "" : "Enter 发送 · ";
+			const hintText = theme.fg("dim", `╰─ ${sendHint}${dequeueHint} 查看或修改排队消息`);
 			this.queuedMessagesContainer.addChild(new TruncatedText(hintText, 1, 0));
 		}
 		if (hasQueuedMessages && !this.featureHintSuppressedByQueue) {
@@ -9404,7 +9428,7 @@ export class InteractiveMode {
 						this.applySetting(() => this.settingsManager.setTheme(themeName));
 						this.ui.invalidate();
 						if (!result.success) {
-							this.showError(`Failed to load theme "${themeName}": ${result.error}\nFell back to dark theme.`);
+							this.showError(`主题 "${themeName}" 加载失败：${result.error}\n已换回深色主题。`);
 						}
 					},
 					onThemePreview: (themeName) => {
@@ -9576,9 +9600,9 @@ export class InteractiveMode {
 	}
 
 	private async completeModelSelection(model: AgentConnectionModel): Promise<void> {
-		this.showStatus(`Switching model: ${model.id}`);
+		this.showStatus(`正在切换模型：${model.id}`);
 		await this.applySelectedModel(model);
-		this.showStatus(`Model: ${model.id}`);
+		this.showStatus(`模型：${model.id}`);
 		void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
 		this.checkDaxnutsEasterEgg(model);
 	}
@@ -9594,7 +9618,7 @@ export class InteractiveMode {
 			(option) => option.id === model.provider && (option.category ?? "provider") === "provider",
 		);
 		if (!provider) {
-			this.showError(`Authentication for ${model.provider} must be configured externally.`);
+			this.showError(`${model.provider} 的登录需要在外部配置。`);
 			return false;
 		}
 
@@ -9605,7 +9629,7 @@ export class InteractiveMode {
 		await this.getConnectionAvailableModels();
 		if (this.isModelProviderConfigured(model)) return true;
 
-		this.showError(`Authentication completed, but ${model.provider} is still unavailable.`);
+		this.showError(`已登录，但 ${model.provider} 仍不可用。`);
 		return false;
 	}
 
@@ -9835,7 +9859,7 @@ export class InteractiveMode {
 				}
 				this.patchConnectionState({ serviceTier: state.serviceTier });
 				this.footer.invalidate();
-				this.showStatus(`Fast mode: ${state.serviceTier === "priority" ? "on" : "off"}`);
+				this.showStatus(`快速模式：${state.serviceTier === "priority" ? "开" : "关"}`);
 			})
 			.catch((error) => {
 				this.showError(error instanceof Error ? error.message : String(error));
@@ -9845,7 +9869,7 @@ export class InteractiveMode {
 	private handleEffortCommand(arg: string): void {
 		const levels = this.getAvailableThinkingLevels();
 		if (levels.length === 0) {
-			this.showStatus("Current model does not support thinking");
+			this.showStatus("当前模型不支持 Thinking");
 			return;
 		}
 		const requested = arg.trim().toLowerCase();
@@ -9854,7 +9878,7 @@ export class InteractiveMode {
 			return;
 		}
 		if (!levels.includes(requested as ThinkingLevel)) {
-			this.showError(`Unknown thinking level '${requested}'. Available: ${levels.join(", ")}`);
+			this.showError(`没有 '${requested}' 这个推理强度，可选：${levels.join(", ")}`);
 			return;
 		}
 		this.applyThinkingLevel(requested as ThinkingLevel);
@@ -9863,7 +9887,7 @@ export class InteractiveMode {
 	private showThinkingSelector(levels: ThinkingLevel[] = this.getAvailableThinkingLevels()): void {
 		const currentLevel = this.connectionState?.thinkingLevel ?? levels[0];
 		if (!currentLevel) {
-			this.showStatus("Current model does not support thinking");
+			this.showStatus("当前模型不支持 Thinking");
 			return;
 		}
 		this.showSelector((done) => {
@@ -9890,7 +9914,7 @@ export class InteractiveMode {
 				this.patchConnectionState({ thinkingLevel: level });
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
-				this.showStatus(`Thinking level: ${level}`);
+				this.showStatus(`推理强度：${level}`);
 			})
 			.catch((error) => {
 				this.showError(error instanceof Error ? error.message : String(error));
@@ -9911,7 +9935,7 @@ export class InteractiveMode {
 			.then(async (result) => {
 				// Also the singleton scope and single-model cases: nothing else to cycle to.
 				if (!result) {
-					this.showStatus("No other models available to cycle");
+					this.showStatus("没有其他可切换的模型");
 					return;
 				}
 				const state = await connection.getState();
@@ -9923,7 +9947,7 @@ export class InteractiveMode {
 					return;
 				}
 				this.applyModelSwitchUiState(state, result.model);
-				this.showStatus(`Model: ${result.model.provider}/${result.model.id}`);
+				this.showStatus(`模型：${result.model.provider}/${result.model.id}`);
 			})
 			.catch((error) => {
 				this.showError(error instanceof Error ? error.message : String(error));
@@ -9995,7 +10019,7 @@ export class InteractiveMode {
 						if (tab === "mcp-connections") {
 							if (!authResult.providerId.startsWith("mcp:")) return;
 							if (this.isAgentStreaming() || this.isAgentCompacting()) {
-								this.showStatus("Connected. Run /reload (after the current turn) to activate the integration.");
+								this.showStatus("已连接。当前这轮结束后运行 /reload 启用。");
 								return;
 							}
 							finish();
@@ -10075,7 +10099,7 @@ export class InteractiveMode {
 		}
 
 		if (allModels.length === 0) {
-			this.showStatus("No models available");
+			this.showStatus("没有可用的模型");
 			return;
 		}
 
@@ -10139,7 +10163,7 @@ export class InteractiveMode {
 							);
 							return;
 						}
-						this.showStatus("Model selection saved to settings");
+						this.showStatus("模型选择已保存");
 					},
 					onCancel: () => {
 						done();
@@ -10161,7 +10185,7 @@ export class InteractiveMode {
 		}
 
 		if (userMessages.length === 0) {
-			this.showStatus("No messages to fork from");
+			this.showStatus("没有可分叉的消息");
 			return;
 		}
 
@@ -10182,7 +10206,7 @@ export class InteractiveMode {
 						await this.renderCurrentSessionState();
 						this.editor.setText(result.selectedText ?? "");
 						done();
-						this.showStatus("Forked to new session");
+						this.showStatus("已分叉到新会话");
 					} catch (error: unknown) {
 						done();
 						this.showError(error instanceof Error ? error.message : String(error));
@@ -10202,7 +10226,7 @@ export class InteractiveMode {
 		try {
 			const { leafId } = await this.agentConnection.getSessionTree();
 			if (!leafId) {
-				this.showStatus("Nothing to clone yet");
+				this.showStatus("还没有可复制的内容");
 				return;
 			}
 
@@ -10214,7 +10238,7 @@ export class InteractiveMode {
 
 			await this.renderCurrentSessionState();
 			this.editor.setText("");
-			this.showStatus("Cloned to new session");
+			this.showStatus("已复制到新会话");
 		} catch (error: unknown) {
 			this.showError(error instanceof Error ? error.message : String(error));
 		}
@@ -10242,7 +10266,7 @@ export class InteractiveMode {
 		const initialFilterMode = this.settingsManager.getTreeFilterMode();
 
 		if (tree.length === 0) {
-			this.showStatus("No entries in session");
+			this.showStatus("会话里还没有内容");
 			return;
 		}
 
@@ -10255,7 +10279,7 @@ export class InteractiveMode {
 					// Selecting the current leaf is a no-op (already there)
 					if (entryId === realLeafId) {
 						done();
-						this.showStatus("Already at this point");
+						this.showStatus("已经在这个位置了");
 						return;
 					}
 
@@ -10318,12 +10342,12 @@ export class InteractiveMode {
 
 						if (result.aborted) {
 							// Summarization aborted - re-show tree selector with same selection
-							this.showStatus("Branch summarization cancelled");
+							this.showStatus("已取消分支总结");
 							void this.showTreeSelector(entryId);
 							return;
 						}
 						if (result.cancelled) {
-							this.showStatus("Navigation cancelled");
+							this.showStatus("已取消");
 							return;
 						}
 
@@ -10398,13 +10422,13 @@ export class InteractiveMode {
 				return result;
 			}
 			await this.renderCurrentSessionState();
-			this.showStatus("Resumed session");
+			this.showStatus("已继续会话");
 			return result;
 		} catch (error: unknown) {
 			if (error instanceof MissingSessionCwdError) {
 				const selectedCwd = await this.promptForMissingSessionCwd(error);
 				if (!selectedCwd) {
-					this.showStatus("Resume cancelled");
+					this.showStatus("已取消继续");
 					return { cancelled: true };
 				}
 				const result = options?.withSession
@@ -10417,7 +10441,7 @@ export class InteractiveMode {
 					return result;
 				}
 				await this.renderCurrentSessionState();
-				this.showStatus("Resumed session in current cwd");
+				this.showStatus("已在当前目录继续会话");
 				return result;
 			}
 			return this.handleFatalRuntimeError("Failed to resume session", error);
@@ -10525,7 +10549,7 @@ export class InteractiveMode {
 				);
 			}
 		} else if (!selectedModel) {
-			this.showError("Prime Inference login succeeded, but the default GLM 5.2 model is unavailable.");
+			this.showError("Prime Inference 已登录，但默认的 GLM 5.2 模型不可用。");
 		}
 
 		return true;
@@ -10543,7 +10567,7 @@ export class InteractiveMode {
 		const isAuthed = (name: string) => authStorage.get(`mcp:${name}`) !== undefined;
 		if (sub === "login") {
 			if (!server || argv.length !== 2) {
-				this.showError("Usage: /mcp login <name> (e.g. /mcp login linear)");
+				this.showError("用法：/mcp login <名称>（例如 /mcp login linear）");
 				return;
 			}
 			const result = await this.createAuthFlows().runMcpLogin(server);
@@ -10553,17 +10577,17 @@ export class InteractiveMode {
 
 		if (sub === "logout") {
 			if (!server || argv.length !== 2) {
-				this.showError("Usage: /mcp logout <name>");
+				this.showError("用法：/mcp logout <名称>");
 				return;
 			}
 			if (!isAuthed(server)) {
-				this.showStatus(`${server} is not connected.`);
+				this.showStatus(`${server} 未连接。`);
 				return;
 			}
 			try {
 				authStorage.logout(`mcp:${server}`);
 			} catch (error) {
-				this.showError(`Logout failed: ${error instanceof Error ? error.message : String(error)}`);
+				this.showError(`退出登录失败：${error instanceof Error ? error.message : String(error)}`);
 				return;
 			}
 			await this.reloadAfterMcpChange(`Disconnected ${server}.`);
@@ -10600,14 +10624,14 @@ export class InteractiveMode {
 
 	private async reloadAfterMcpChange(message: string, successMessage = message): Promise<void> {
 		if (this.isAgentStreaming() || this.isAgentCompacting()) {
-			this.showStatus(`${message} The change was saved. Run /reload after the current turn to activate it.`);
+			this.showStatus(`${message} 已保存。当前这轮结束后运行 /reload 生效。`);
 			return;
 		}
 		const reloaded = await this.handleReloadCommand();
 		if (reloaded) {
 			this.showStatus(successMessage);
 		} else {
-			this.showWarning(`${message} The change remains saved, but it is not active in this session.`);
+			this.showWarning(`${message} 已保存，但本会话里还没生效。`);
 		}
 	}
 
@@ -10623,7 +10647,7 @@ export class InteractiveMode {
 	private async handleUpdateCommand(args: string): Promise<void> {
 		const entrypoint = process.argv[1];
 		if (!entrypoint) {
-			this.showError("Cannot determine current CLI entrypoint for update");
+			this.showError("找不到当前程序入口，无法更新");
 			return;
 		}
 
@@ -10656,7 +10680,7 @@ export class InteractiveMode {
 		if (includesSelf && !selfUpdateNotAttempted) {
 			const relaunchArgs = buildUpdateRelaunchArgs(process.argv.slice(2), this.connectionState?.sessionFile);
 			if (updateResult.error) {
-				console.error(`Update failed: ${updateResult.error.message}`);
+				console.error(`更新失败：${updateResult.error.message}`);
 				console.error(`Relaunching ${APP_NAME}...`);
 			} else if (updateExitCode !== 0) {
 				console.error(
@@ -10734,12 +10758,12 @@ export class InteractiveMode {
 		this.ui.requestRender(true);
 
 		if (selfUpdateNotAttempted) {
-			this.showStatus(`Update did not change ${APP_NAME}. Reloading resources...`);
+			this.showStatus(`${APP_NAME} 没有变化，正在重新加载…`);
 			await this.handleReloadCommand();
 			return;
 		}
 		if (updateResult.error) {
-			this.showError(`Update failed: ${updateResult.error.message}`);
+			this.showError(`更新失败：${updateResult.error.message}`);
 			return;
 		}
 		if (updateExitCode !== 0) {
@@ -10750,17 +10774,17 @@ export class InteractiveMode {
 			);
 			return;
 		}
-		this.showStatus("Packages updated. Reloading resources...");
+		this.showStatus("已更新，正在重新加载…");
 		await this.handleReloadCommand();
 	}
 
 	private async handleReloadCommand(): Promise<boolean> {
 		if (this.isAgentStreaming()) {
-			this.showWarning("Wait for the current response to finish before reloading.");
+			this.showWarning("请等当前回复结束后再重新加载。");
 			return false;
 		}
 		if (this.isAgentCompacting()) {
-			this.showWarning("Wait for compaction to finish before reloading.");
+			this.showWarning("请等压缩结束后再重新加载。");
 			return false;
 		}
 
@@ -10803,7 +10827,7 @@ export class InteractiveMode {
 			const themeName = this.settingsManager.getTheme();
 			const themeResult = themeName ? setTheme(themeName, true) : { success: true };
 			if (!themeResult.success) {
-				this.showError(`Failed to load theme "${themeName}": ${themeResult.error}\nFell back to dark theme.`);
+				this.showError(`主题 "${themeName}" 加载失败：${themeResult.error}\n已换回深色主题。`);
 			}
 			const editorPaddingX = this.settingsManager.getEditorPaddingX();
 			const autocompleteMaxVisible = this.settingsManager.getAutocompleteMaxVisible();
@@ -10829,13 +10853,13 @@ export class InteractiveMode {
 			});
 			const modelsJsonError = this.modelRegistry.getError();
 			if (modelsJsonError) {
-				this.showError(`models.json error: ${modelsJsonError}`);
+				this.showError(`models.json 有错：${modelsJsonError}`);
 			}
-			this.showStatus("Reloaded keybindings, extensions, skills, prompts, themes");
+			this.showStatus("已重新加载快捷键、扩展、技能、提示词和主题");
 			return true;
 		} catch (error) {
 			dismissReloadBox(previousEditor as Component);
-			this.showError(`Reload failed: ${error instanceof Error ? error.message : String(error)}`);
+			this.showError(`重新加载失败：${error instanceof Error ? error.message : String(error)}`);
 			return false;
 		}
 	}
@@ -10846,7 +10870,7 @@ export class InteractiveMode {
 		try {
 			if (outputPath?.endsWith(".jsonl")) {
 				const filePath = await this.agentConnection.exportToJsonl(outputPath);
-				this.showStatus(`Session exported to: ${filePath}`);
+				this.showStatus(`会话已导出到：${filePath}`);
 			} else {
 				const filePath = await this.agentConnection.exportToHtml(outputPath);
 				// The HTML export embeds the full session (cwd, usernames, emails) as
@@ -10855,13 +10879,13 @@ export class InteractiveMode {
 				// invalidate the export, it just drops the notice.
 				const identityHint = shareExportIdentityHintFromFile(filePath);
 				if (identityHint !== undefined) {
-					this.showStatus(`Session exported to: ${filePath}\n${identityHint}`, "warning");
+					this.showStatus(`会话已导出到：${filePath}\n${identityHint}`, "warning");
 				} else {
-					this.showStatus(`Session exported to: ${filePath}`);
+					this.showStatus(`会话已导出到：${filePath}`);
 				}
 			}
 		} catch (error: unknown) {
-			this.showError(`Failed to export session: ${error instanceof Error ? error.message : "Unknown error"}`);
+			this.showError(`导出会话失败：${error instanceof Error ? error.message : "未知错误"}`);
 		}
 	}
 
@@ -10897,13 +10921,13 @@ export class InteractiveMode {
 	private async handleImportCommand(text: string): Promise<void> {
 		const inputPath = this.getPathCommandArgument(text, "/import");
 		if (!inputPath) {
-			this.showError("Usage: /import <path.jsonl>");
+			this.showError("用法：/import <文件.jsonl>");
 			return;
 		}
 
 		const confirmed = await this.showExtensionConfirm("Import session", `Replace current session with ${inputPath}?`);
 		if (!confirmed) {
-			this.showStatus("Import cancelled");
+			this.showStatus("已取消导入");
 			return;
 		}
 
@@ -10911,29 +10935,29 @@ export class InteractiveMode {
 			this.stopWorkingLoader();
 			const result = await this.agentConnection.importFromJsonl(inputPath);
 			if (result.cancelled) {
-				this.showStatus("Import cancelled");
+				this.showStatus("已取消导入");
 				return;
 			}
 			await this.renderCurrentSessionState();
-			this.showStatus(`Session imported from: ${inputPath}`);
+			this.showStatus(`已从 ${inputPath} 导入会话`);
 		} catch (error: unknown) {
 			if (error instanceof MissingSessionCwdError) {
 				const selectedCwd = await this.promptForMissingSessionCwd(error);
 				if (!selectedCwd) {
-					this.showStatus("Import cancelled");
+					this.showStatus("已取消导入");
 					return;
 				}
 				const result = await this.agentConnection.importFromJsonl(inputPath, selectedCwd);
 				if (result.cancelled) {
-					this.showStatus("Import cancelled");
+					this.showStatus("已取消导入");
 					return;
 				}
 				await this.renderCurrentSessionState();
-				this.showStatus(`Session imported from: ${inputPath}`);
+				this.showStatus(`已从 ${inputPath} 导入会话`);
 				return;
 			}
 			if (error instanceof SessionImportFileNotFoundError) {
-				this.showError(`Failed to import session: ${error.message}`);
+				this.showError(`导入会话失败：${error.message}`);
 				return;
 			}
 			await this.handleFatalRuntimeError("Failed to import session", error);
@@ -10945,11 +10969,11 @@ export class InteractiveMode {
 		try {
 			const authResult = spawnSync("gh", ["auth", "status"], { encoding: "utf-8" });
 			if (authResult.status !== 0) {
-				this.showError("GitHub CLI is not logged in. Run 'gh auth login' first.");
+				this.showError("GitHub CLI 还没登录，请先运行 'gh auth login'。");
 				return;
 			}
 		} catch {
-			this.showError("GitHub CLI (gh) is not installed. Install it from https://cli.github.com/");
+			this.showError("没装 GitHub CLI（gh），请到 https://cli.github.com/ 安装");
 			return;
 		}
 
@@ -10959,7 +10983,7 @@ export class InteractiveMode {
 			await this.agentConnection.exportToHtml(tmpFile);
 		} catch (error: unknown) {
 			fs.rmSync(temp.directory, { recursive: true, force: true });
-			this.showError(`Failed to export session: ${error instanceof Error ? error.message : "Unknown error"}`);
+			this.showError(`导出会话失败：${error instanceof Error ? error.message : "未知错误"}`);
 			return;
 		}
 
@@ -11000,7 +11024,7 @@ export class InteractiveMode {
 		if (!confirmed) {
 			// The export already exists at this point, so cancelling must remove it.
 			fs.rmSync(temp.directory, { recursive: true, force: true });
-			this.showStatus("Share cancelled");
+			this.showStatus("已取消分享");
 			return;
 		}
 
@@ -11049,7 +11073,7 @@ export class InteractiveMode {
 		loader.onAbort = () => {
 			proc?.kill();
 			restoreEditor();
-			this.showStatus("Share cancelled");
+			this.showStatus("已取消分享");
 		};
 
 		try {
@@ -11089,7 +11113,7 @@ export class InteractiveMode {
 
 			if (result.code !== 0) {
 				const errorMsg = result.stderr?.trim() || "Unknown error";
-				this.showError(`Failed to create gist: ${errorMsg}`);
+				this.showError(`创建 gist 失败：${errorMsg}`);
 				return;
 			}
 
@@ -11098,17 +11122,17 @@ export class InteractiveMode {
 			const gistUrl = result.stdout?.trim();
 			const gistId = gistUrl?.split("/").pop();
 			if (!gistId) {
-				this.showError("Failed to parse gist ID from gh output");
+				this.showError("没能从 gh 的输出里读到 gist ID");
 				return;
 			}
 
 			// Create the preview URL
 			const previewUrl = getShareViewerUrl(gistId);
-			this.showStatus(`Share URL: ${previewUrl}\nGist: ${gistUrl}`);
+			this.showStatus(`分享链接：${previewUrl}\nGist：${gistUrl}`);
 		} catch (error: unknown) {
 			if (!loader.signal.aborted) {
 				restoreEditor();
-				this.showError(`Failed to create gist: ${error instanceof Error ? error.message : "Unknown error"}`);
+				this.showError(`创建 gist 失败：${error instanceof Error ? error.message : "未知错误"}`);
 			}
 		}
 	}
@@ -11116,13 +11140,13 @@ export class InteractiveMode {
 	private async handleCopyCommand(): Promise<void> {
 		const text = await this.agentConnection.getLastAssistantText();
 		if (!text) {
-			this.showError("No agent messages to copy yet.");
+			this.showError("还没有可复制的回复。");
 			return;
 		}
 
 		try {
 			await copyToClipboard(text);
-			this.showStatus("Copied last agent message to clipboard");
+			this.showStatus("已复制最后一条回复");
 		} catch (error) {
 			this.showError(error instanceof Error ? error.message : String(error));
 		}
@@ -11136,7 +11160,7 @@ export class InteractiveMode {
 				this.chatContainer.addChild(new Spacer(1));
 				this.chatContainer.addChild(new Text(theme.fg("dim", `Session name: ${currentName}`), 1, 0));
 			} else {
-				this.showWarning("Usage: /name <name>");
+				this.showWarning("用法：/name <名称>");
 			}
 			this.ui.requestRender();
 			return;
@@ -11166,12 +11190,12 @@ export class InteractiveMode {
 
 		const global = tokens[1] === "--global";
 		if (tokens.length > (global ? 2 : 1) || !/^\d+$/.test(tokens[0] ?? "")) {
-			this.showWarning("Usage: /rlm-max-depth [<non-negative integer> [--global]]");
+			this.showWarning("用法：/rlm-max-depth [<非负整数> [--global]]");
 			return;
 		}
 		const maxDepth = Number(tokens[0]);
 		if (!Number.isSafeInteger(maxDepth)) {
-			this.showWarning("RLM max depth must be a non-negative integer.");
+			this.showWarning("RLM 最大深度必须是非负整数。");
 			return;
 		}
 
@@ -11275,7 +11299,7 @@ export class InteractiveMode {
 			case "unchanged":
 				return "Trace is already uploaded; no new content since the last upload.";
 			case "missing_credentials":
-				return "Trace sharing needs a Prime API key. Run /traces login.";
+				return "trace 分享需要 Prime API key，请运行 /traces login。";
 			case "no_session_file":
 				return "Current session has no persisted trace yet.";
 			case "empty_session":
@@ -11423,7 +11447,7 @@ export class InteractiveMode {
 				);
 				return;
 			}
-			this.showStatus("Trace sharing disabled.");
+			this.showStatus("已关闭 trace 分享。");
 			return;
 		}
 
@@ -11447,7 +11471,7 @@ export class InteractiveMode {
 				credential = await getPrimeAgentTraceCredential(this.modelRegistry.authStorage);
 			}
 			if (!credential) {
-				this.showError("Trace sharing needs a Prime API key.");
+				this.showError("trace 分享需要 Prime API key。");
 				return;
 			}
 
@@ -11466,14 +11490,14 @@ export class InteractiveMode {
 				);
 				return;
 			}
-			this.showStatus(`Trace sharing enabled. ${uploadMessage}`);
+			this.showStatus(`已开启 trace 分享。${uploadMessage}`);
 			return;
 		}
 
 		if (command === "upload" || command === "upload-current") {
 			const credential = await getPrimeAgentTraceCredential(this.modelRegistry.authStorage);
 			if (!credential) {
-				this.showError("Trace sharing needs a Prime API key. Run /traces login.");
+				this.showError("trace 分享需要 Prime API key，请运行 /traces login。");
 				return;
 			}
 			const uploadResult = await this.uploadCurrentTraceOnce();
@@ -11489,11 +11513,11 @@ export class InteractiveMode {
 		if (command === "upload-all") {
 			const credential = await getPrimeAgentTraceCredential(this.modelRegistry.authStorage);
 			if (!credential) {
-				this.showError("Trace sharing needs a Prime API key. Run /traces login.");
+				this.showError("trace 分享需要 Prime API key，请运行 /traces login。");
 				return;
 			}
 			if (this.traceUploadAllAbortController) {
-				this.showWarning("A trace upload is already running. Cancel it before starting another.");
+				this.showWarning("已有一个 trace 在上传，请先取消再开始新的。");
 				return;
 			}
 			const state = await this.agentConnection.getState();
@@ -11508,11 +11532,11 @@ export class InteractiveMode {
 				}
 			}
 			if (abortController.signal.aborted) {
-				this.showStatus("Trace upload cancelled.");
+				this.showStatus("已取消 trace 上传。");
 				return;
 			}
 			if (result.total === 0) {
-				this.showStatus("No persisted traces were found.");
+				this.showStatus("没有找到保存的 trace。");
 				return;
 			}
 			const summary = [
@@ -11524,14 +11548,14 @@ export class InteractiveMode {
 				.filter((part): part is string => part !== undefined)
 				.join("; ");
 			if (result.failed > 0) {
-				this.showWarning(`${summary}. See ${getAgentTracesLogPath()} for details.`);
+				this.showWarning(`${summary}。详情见 ${getAgentTracesLogPath()}`);
 			} else {
 				this.showStatus(`${summary}.`);
 			}
 			return;
 		}
 
-		this.showWarning("Usage: /traces [status|on|off|preview|upload|upload-current|upload-all|login]");
+		this.showWarning("用法：/traces [status|on|off|preview|upload|upload-current|upload-all|login]");
 	}
 
 	private async handleContextCommand(): Promise<void> {
@@ -11577,34 +11601,34 @@ export class InteractiveMode {
 				case "pause": {
 					const heartbeat = await this.agentConnection.updateHeartbeat("pause");
 					if (!heartbeat) {
-						this.showStatus("No active heartbeat");
+						this.showStatus("没有进行中的定时任务");
 						return;
 					}
 					this.patchConnectionState({ heartbeat });
 					await this.refreshHeartbeatCatalog();
-					this.showStatus("Heartbeat paused");
+					this.showStatus("定时任务已暂停");
 					return;
 				}
 				case "resume": {
 					const heartbeat = await this.agentConnection.updateHeartbeat("resume");
 					if (!heartbeat) {
-						this.showStatus("No active heartbeat");
+						this.showStatus("没有进行中的定时任务");
 						return;
 					}
 					this.patchConnectionState({ heartbeat });
 					await this.refreshHeartbeatCatalog();
-					this.showStatus(`Heartbeat resumed\nNext run: ${heartbeat.nextRunAt ?? "-"}`);
+					this.showStatus(`定时任务已恢复\n下次运行：${heartbeat.nextRunAt ?? "-"}`);
 					return;
 				}
 				case "clear": {
 					const heartbeat = await this.agentConnection.updateHeartbeat("clear");
 					if (!heartbeat) {
-						this.showStatus("No active heartbeat");
+						this.showStatus("没有进行中的定时任务");
 						return;
 					}
 					this.patchConnectionState({ heartbeat: null });
 					await this.refreshHeartbeatCatalog();
-					this.showStatus("Heartbeat cleared");
+					this.showStatus("定时任务已清除");
 					return;
 				}
 			}
@@ -11718,7 +11742,7 @@ export class InteractiveMode {
 
 	private showHeartbeat(job: AgentCronJob | undefined): void {
 		if (!job) {
-			this.showStatus("No active heartbeat");
+			this.showStatus("没有进行中的定时任务");
 			return;
 		}
 		const next = job.nextRunAt ? new Date(job.nextRunAt).toLocaleString() : "-";
@@ -11799,18 +11823,18 @@ export class InteractiveMode {
 		const pasteImage = this.getAppKeyDisplay("app.clipboard.pasteImage");
 
 		return `
-**Prompt**
-\`!\` shell mode · \`/\` commands · \`@\` file paths
-\`${tab}\` complete paths · \`${newLine}\` new line
-\`${clearInput}\` interrupt · press twice to rewind or clear the prompt
+**输入**
+\`!\` 运行 shell 命令 · \`/\` 命令 · \`@\` 引用文件
+\`${tab}\` 补全路径 · \`${newLine}\` 换行
+\`${clearInput}\` 中断 · 连按两次回退或清空输入
 
-**Controls**
-\`${selectModel}\` select model · \`/effort\` set reasoning · \`${expandTools}\` tool output${expandToolsFull ? ` · \`${expandToolsFull}\` full output` : ""}
-\`${expandMessages}\` agent messages · \`${expandEdits}\` edit diffs · \`${toggleThinking}\` thinking blocks · \`${promptStash}\` stash prompt · \`${externalEditor}\` edit in \`$EDITOR\`
-\`${pasteImage}\` paste image
+**查看与控制**
+\`${selectModel}\` 选模型 · \`/effort\` 调推理强度 · \`${expandTools}\` 过程${expandToolsFull ? ` · \`${expandToolsFull}\` 看全文` : ""}
+\`${expandMessages}\` 代理消息 · \`${expandEdits}\` 改动详情 · \`${toggleThinking}\` Thinking · \`${promptStash}\` 暂存输入 · \`${externalEditor}\` 用 \`$EDITOR\` 编辑
+\`${pasteImage}\` 粘贴图片
 
-**Help**
-${shortcutsKey ? `\`${shortcutsKey}\` quick shortcuts · ` : ""}\`/hotkeys\` full reference
+**帮助**
+${shortcutsKey ? `\`${shortcutsKey}\` 快捷键（再按一次关闭） · ` : ""}\`/hotkeys\` 完整列表
 `;
 	}
 
@@ -11862,61 +11886,61 @@ ${shortcutsKey ? `\`${shortcutsKey}\` quick shortcuts · ` : ""}\`/hotkeys\` ful
 		const viewportFollow = this.getEditorKeyDisplay("tui.viewport.follow");
 
 		let hotkeys = `
-**Navigation**
-| Key | Action |
+**移动**
+| 按键 | 作用 |
 |-----|--------|
-| \`${cursorUp}\` / \`${cursorDown}\` / \`${cursorLeft}\` / \`${cursorRight}\` | Move cursor / browse history (Up when empty) |
-| \`${cursorWordLeft}\` / \`${cursorWordRight}\` | Move by word |
-| \`${cursorLineStart}\` | Start of line |
-| \`${cursorLineEnd}\` | End of line |
-| \`${jumpForward}\` | Jump forward to character |
-| \`${jumpBackward}\` | Jump backward to character |
-| \`${pageUp}\` / \`${pageDown}\` | Scroll by page |
+| \`${cursorUp}\` / \`${cursorDown}\` / \`${cursorLeft}\` / \`${cursorRight}\` | 移动光标 / 翻历史（输入为空时按上） |
+| \`${cursorWordLeft}\` / \`${cursorWordRight}\` | 按词移动 |
+| \`${cursorLineStart}\` | 行首 |
+| \`${cursorLineEnd}\` | 行尾 |
+| \`${jumpForward}\` | 向后跳到字符 |
+| \`${jumpBackward}\` | 向前跳到字符 |
+| \`${pageUp}\` / \`${pageDown}\` | 翻页 |
 
-**Editing**
-| Key | Action |
+**编辑**
+| 按键 | 作用 |
 |-----|--------|
-| \`${submit}\` | Send message |
-| \`${newLine}\` | New line${process.platform === "win32" ? " (Ctrl+Enter on Windows Terminal)" : ""} |
-| \`${deleteWordBackward}\` | Delete word backwards |
-| \`${deleteWordForward}\` | Delete word forwards |
-| \`${deleteToLineStart}\` | Delete to start of line |
-| \`${deleteToLineEnd}\` | Delete to end of line |
-| \`${yank}\` | Paste the most-recently-deleted text |
-| \`${yankPop}\` | Cycle through the deleted text after pasting |
-| \`${undo}\` | Undo |
+| \`${submit}\` | 发送 |
+| \`${newLine}\` | 换行${process.platform === "win32" ? "（Windows Terminal 用 Ctrl+Enter）" : ""} |
+| \`${deleteWordBackward}\` | 向前删一个词 |
+| \`${deleteWordForward}\` | 向后删一个词 |
+| \`${deleteToLineStart}\` | 删到行首 |
+| \`${deleteToLineEnd}\` | 删到行尾 |
+| \`${yank}\` | 粘贴最近删除的文字 |
+| \`${yankPop}\` | 粘贴后切换更早删除的文字 |
+| \`${undo}\` | 撤销 |
 
-**Other**
-| Key | Action |
+**其他**
+| 按键 | 作用 |
 |-----|--------|
-| \`${tab}\` | Path completion / accept autocomplete |
-| \`${clearInput}\` | Clear input / cancel autocomplete |
-| \`${clear}\` | Interrupt current operation (first) / exit (second) |
-${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shortcutsKey ? `| \`${shortcutsKey}\` | Show quick shortcuts |\n` : ""}| \`${exit}\` | Exit (when editor is empty) |
-| \`${selectModel}\` | Open model selector |
-| \`${expandTools}\` | Toggle tool output expansion |
-${expandToolsFull ? `| \`${expandToolsFull}\` | Show tool output in full, ignoring the expanded render budget |\n` : ""}| \`${expandMessages}\` | Toggle agent message expansion |
-| \`${expandEdits}\` | Toggle edit diff expansion |
-| \`${toggleThinking}\` | Toggle thinking block visibility |
-| \`${focusSubagents}\` | Focus the subagent summary / open the scoped agents view |
-| \`${manageHeartbeats}\` | Manage heartbeats |
-| \`${externalEditor}\` | Edit message in external editor |
-| \`${promptStash}\` | Stash or restore draft prompt |
-| \`${followUp}\` | Queue follow-up message |
-| \`${browseQueue}\` | Browse and edit queued messages |
-| \`${reorderQueue}\` | Reorder the selected queued message |
-| \`${pasteImage}\` | Paste image from clipboard |
-| \`/\` | Slash commands |
+| \`${tab}\` | 补全路径 / 接受补全 |
+| \`${clearInput}\` | 清空输入 / 取消补全 |
+| \`${clear}\` | 中断当前操作（空闲时再按一次退出） |
+${interrupt ? `| \`${interrupt}\` | 中断当前操作 |\n` : ""}${shortcutsKey ? `| \`${shortcutsKey}\` | 快捷键面板 |\n` : ""}| \`${exit}\` | 退出（输入为空时） |
+| \`${selectModel}\` | 选模型 |
+| \`${expandTools}\` | 展开 / 收起过程 |
+${expandToolsFull ? `| \`${expandToolsFull}\` | 看全文（不限行数） |\n` : ""}| \`${expandMessages}\` | 展开 / 收起代理消息 |
+| \`${expandEdits}\` | 展开 / 收起改动详情 |
+| \`${toggleThinking}\` | 展开 / 收起 Thinking |
+| \`${focusSubagents}\` | 进入子代理面板 / 打开子代理列表 |
+| \`${manageHeartbeats}\` | 管理定时任务 |
+| \`${externalEditor}\` | 用外部编辑器写消息 |
+| \`${promptStash}\` | 暂存 / 恢复草稿 |
+| \`${followUp}\` | 排一条稍后发送的消息 |
+| \`${browseQueue}\` | 查看或修改排队消息 |
+| \`${reorderQueue}\` | 调整排队消息顺序 |
+| \`${pasteImage}\` | 从剪贴板粘贴图片 |
+| \`/\` | 命令 |
 
-**Fullscreen mode (\`/fullscreen\`)**
-| Key | Action |
+**全屏模式（\`/fullscreen\`）**
+| 按键 | 作用 |
 |-----|--------|
-| \`${viewportPageUp}\` / \`${viewportPageDown}\` | Scroll transcript by page |
-| \`${viewportTop}\` | Scroll to top |
-| \`${viewportFollow}\` | Scroll to bottom and follow output |
-| mouse wheel | Scroll transcript |
-| mouse drag | Select and copy text |
-| mouse click on link | Open link in browser |
+| \`${viewportPageUp}\` / \`${viewportPageDown}\` | 对话翻页 |
+| \`${viewportTop}\` | 滚到顶部 |
+| \`${viewportFollow}\` | 回到底部并跟随输出 |
+| 鼠标滚轮 | 滚动对话 |
+| 鼠标拖动 | 选中并复制 |
+| 点击链接 | 在浏览器打开 |
 `;
 
 		const shortcuts = this.bindLocalSessionExtensions
@@ -11924,8 +11948,8 @@ ${expandToolsFull ? `| \`${expandToolsFull}\` | Show tool output in full, ignori
 			: undefined;
 		if (shortcuts && shortcuts.size > 0) {
 			hotkeys += `
-**Extensions**
-| Key | Action |
+**扩展**
+| 按键 | 作用 |
 |-----|--------|
 `;
 			for (const [key, shortcut] of shortcuts) {
@@ -11938,6 +11962,11 @@ ${expandToolsFull ? `| \`${expandToolsFull}\` | Show tool output in full, ignori
 	}
 
 	private showShortcutGuide(): void {
+		// The same key closes the panel it opened.
+		if (this.shortcutGuideContainer.children.length > 0) {
+			this.clearShortcutGuide();
+			return;
+		}
 		const hotkeys = this.getShortcutGuide();
 
 		this.shortcutGuideContainer.clear();
@@ -12031,7 +12060,7 @@ ${expandToolsFull ? `| \`${expandToolsFull}\` | Show tool output in full, ignori
 			);
 			this.ui.requestRender();
 		} catch (error: unknown) {
-			this.showError(`Failed to write debug log: ${error instanceof Error ? error.message : String(error)}`);
+			this.showError(`写调试日志失败：${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 

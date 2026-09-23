@@ -1,4 +1,4 @@
-import { previewBashCommand, previewIpythonCode } from "../../../core/tools/code-preview.js";
+import { previewIpythonCode } from "../../../core/tools/code-preview.js";
 import { parseIpythonBashCell } from "../../../core/tools/ipython-cell-code.js";
 
 /** What a step label needs: the tool and its (possibly still streaming) arguments. */
@@ -49,11 +49,26 @@ const PYTHON_EDIT_CALL_PATTERN =
 const PYTHON_CALL_LABELS: ReadonlyArray<[RegExp, string]> = [
 	[/\bawait\s+rlm\(/g, "派子代理"],
 	[/\brlm\.(?:collect|list_subagents)\(/g, "查看子代理"],
-	[/\bagent_message\.send\(/g, "发消息"],
 	[/\battach_image(?:\.run)?\(/g, "看图"],
 	[/\b(?:bailian_search|websearch|exa_websearch)\.\w+\(/g, "联网搜索"],
 	[/\brlm\.harness\.(?:create|update)_memory\(/g, "记笔记"],
 ];
+
+/** Calls whose label names their target: `查看子代理 X`, `发消息给 X`. */
+const PYTHON_TARGETED_CALLS: ReadonlyArray<[RegExp, (target: string | undefined) => string]> = [
+	[
+		/\bagent_observe\.\w+\(\s*(?:[A-Za-z_]+\s*=\s*)?(?:[rRfF]?["']([^"']+)["'])?/g,
+		(target) => (target ? `查看子代理 ${target}` : "查看子代理"),
+	],
+	[
+		/\bagent_message\.send\((?:[^()]|\([^()]*\))*?receiver_name\s*=\s*[rRfF]?["']([^"']+)["']/g,
+		(target) => (target ? `发消息给 ${target}` : "发消息"),
+	],
+];
+const PYTHON_MESSAGE_SEND_PATTERN = /\bagent_message\.send\(/g;
+const PYTHON_HANDLE_WAIT_PATTERN =
+	/(?:^|\n)\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?await\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:$|\n)|\b[A-Za-z_][A-Za-z0-9_]*\.(?:poll|tail|output)\(/g;
+const PYTHON_SLICE_PRINT_PATTERN = /\bprint\(\s*[A-Za-z_][A-Za-z0-9_.]*\s*\[[^\]]*:[^\]]*\]\s*\)/g;
 
 function looksLikePath(value: string): boolean {
 	return /[/\\]/.test(value) || /\.[A-Za-z0-9]{1,6}$/.test(value);
@@ -76,14 +91,64 @@ function searchPatternText(pattern: string): string {
 		.trim();
 }
 
+/** Width budget for a command shown inside a label. */
+const COMMAND_LABEL_MAX = 44;
+
+/** Commands that only report or wait; a chain names them with the step before. */
+const QUIET_COMMANDS = new Set(["echo", "printf", "true", ":", "sleep", "wait"]);
+
+/**
+ * Shorten a command to the budget at a word boundary, never inside quotes:
+ * `git log --format=… --date=iso` rather than `git log --format="%H`.
+ */
+export function shortenCommand(command: string, max = COMMAND_LABEL_MAX): string {
+	const text = command.replace(/\s+/g, " ").trim();
+	if (text.length <= max) {
+		return text;
+	}
+	const cuts: number[] = [];
+	let quote: string | undefined;
+	for (let index = 0; index < text.length && index <= max; index++) {
+		const char = text[index];
+		if (quote) {
+			if (char === quote) quote = undefined;
+		} else if (char === '"' || char === "'") {
+			quote = char;
+		} else if (char === " ") {
+			cuts.push(index);
+		}
+	}
+	const cut = cuts.at(-1);
+	return cut !== undefined && cut > 0 ? `${text.slice(0, cut)} …` : `${(text.split(" ")[0] ?? text).slice(0, max)} …`;
+}
+
+function commandToolName(segment: string): string {
+	const words = shellWords(segment.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, ""));
+	return pathTail(words[0] ?? "");
+}
+
 /**
  * A shell command in plain words: searches, listings and file reads say what
  * they look at (`搜索 wrapTextWithAnsi`, `列目录 packages`, `读取 text.ts`);
- * anything else reads `运行 <command>`.
+ * anything else reads `运行 <command>`, shortened at a word boundary. A chain
+ * skips its setup (`cd`, `export`); a quiet tail keeps its lead
+ * (`sleep 8 → echo ok`).
  */
 export function describeShellCommand(command: string): string {
-	const segments = command.split(/&&|;|\|\|/).map((segment) => segment.trim());
-	const main = segments.find((segment) => segment && !/^(?:cd|export|set|source)\b/.test(segment)) ?? command.trim();
+	const firstLine = command
+		.split("\n")
+		.map((line) => line.trim())
+		.find((line) => line && !line.startsWith("#") && !/^set\s+[-+]/.test(line));
+	const source = firstLine ?? command.trim();
+	const segments = source
+		.split(/&&|;|\|\|/)
+		.map((segment) => segment.trim())
+		.filter((segment) => segment && !/^(?:cd|export|source)\b/.test(segment));
+	if (segments.length === 0) {
+		return `运行 ${shortenCommand(source)}`;
+	}
+	const informative = segments.filter((segment) => !QUIET_COMMANDS.has(commandToolName(segment)));
+	const main = informative[0] ?? segments.at(-1) ?? source;
 	const words = shellWords(main.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, ""));
 	const tool = pathTail(words[0] ?? "");
 	const args = words.slice(1).filter((word) => !word.startsWith("-") && word !== "|");
@@ -105,10 +170,15 @@ export function describeShellCommand(command: string): string {
 		case "head":
 		case "tail":
 		case "less":
-			return args.length > 0 ? `读取 ${pathTail(args.at(-1) ?? "")}` : `运行 ${main}`;
+			if (args.length > 0) return `读取 ${pathTail(args.at(-1) ?? "")}`;
+			break;
 		default:
-			return `运行 ${main}`;
+			break;
 	}
+	if (informative.length === 0 && segments.length > 1) {
+		return `运行 ${shortenCommand(segments.map((segment) => shortenCommand(segment, 20)).join(" → "))}`;
+	}
+	return `运行 ${shortenCommand(main)}`;
 }
 
 /** Effects a single step label joins at most. */
@@ -139,7 +209,7 @@ function pythonEffects(code: string): string[] {
 			return "…";
 		});
 	for (const match of code.matchAll(PYTHON_BASH_CALL_PATTERN)) {
-		const command = previewBashCommand(substituteVars(match[2] ?? "")).text;
+		const command = substituteVars(match[2] ?? "").trim();
 		if (command) push(match.index, describeShellCommand(command));
 	}
 	for (const match of code.matchAll(PYTHON_SUBPROCESS_LIST_PATTERN)) {
@@ -162,6 +232,28 @@ function pythonEffects(code: string): string[] {
 		for (const match of code.matchAll(pattern)) {
 			push(match.index, label);
 		}
+	}
+	const targetedAt = new Set<number>();
+	for (const [pattern, label] of PYTHON_TARGETED_CALLS) {
+		for (const match of code.matchAll(pattern)) {
+			targetedAt.add(match.index ?? 0);
+			push(match.index, label(match[1]));
+		}
+	}
+	for (const match of code.matchAll(PYTHON_MESSAGE_SEND_PATTERN)) {
+		if (!targetedAt.has(match.index ?? -1)) push(match.index, "发消息");
+	}
+	const runsCommand = PYTHON_BASH_CALL_PATTERN.test(code);
+	PYTHON_BASH_CALL_PATTERN.lastIndex = 0;
+	if (!runsCommand) {
+		for (const match of code.matchAll(PYTHON_HANDLE_WAIT_PATTERN)) {
+			push(match.index, "等待命令结果");
+			break;
+		}
+	}
+	for (const match of code.matchAll(PYTHON_SLICE_PRINT_PATTERN)) {
+		push(match.index, "查看输出");
+		break;
 	}
 	for (const match of code.matchAll(PYTHON_OPEN_PATTERN)) {
 		if (!match[1]) continue;
@@ -226,8 +318,12 @@ function rawStepLabel(step: StepLabelInput): string {
 		if (!code) {
 			return "python";
 		}
+		const bashCell = parseIpythonBashCell(code);
+		if (bashCell) {
+			return bashCell.body.trim() ? describeShellCommand(bashCell.body) : "运行命令";
+		}
 		const preview = previewIpythonCode(code);
-		const effects = parseIpythonBashCell(code) ? [] : pythonEffects(code);
+		const effects = pythonEffects(code);
 		if (effects.length > 0) {
 			return effects.slice(0, MAX_CELL_EFFECTS).join("，");
 		}

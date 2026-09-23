@@ -116,7 +116,7 @@ describe("InteractiveMode /debug", () => {
 
 		await interactiveModePrototype.handleDebugCommand.call(context);
 
-		expect(context.showError).toHaveBeenCalledWith("Failed to write debug log: connection unavailable");
+		expect(context.showError).toHaveBeenCalledWith("写调试日志失败：connection unavailable");
 		expect(existsSync(getDebugLogPath())).toBe(false);
 		expect(context.ui.requestRender).not.toHaveBeenCalled();
 	});

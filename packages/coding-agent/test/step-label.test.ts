@@ -5,7 +5,7 @@ const cell = (code: string) => ({ toolName: "ipython", args: { code } });
 
 describe("turnStepLabel", () => {
 	it("labels a %%bash cell with its simplified command", () => {
-		expect(turnStepLabel(cell("%%bash\nnpm run check"))).toBe("运行 npm check");
+		expect(turnStepLabel(cell("%%bash\nnpm run check"))).toBe("运行 npm run check");
 		expect(turnStepLabel(cell("%%bash\nls -la /tmp"))).toBe("列目录 tmp");
 	});
 
@@ -16,7 +16,7 @@ describe("turnStepLabel", () => {
 			"import json",
 			"print(json.load(open('packages/ai/package.json'))['version'])",
 		].join("\n");
-		expect(turnStepLabel(cell(code))).toBe("运行 echo ok，读取 package.json");
+		expect(turnStepLabel(cell(code))).toBe("运行 sleep 10 → echo ok，读取 package.json");
 	});
 
 	it("resolves Path variables for reads and writes", () => {
@@ -118,5 +118,34 @@ describe("turnStepLabel harness calls", () => {
 		expect(turnStepLabel(cell("print(await attach_image('a.png'))"))).toBe("看图");
 		expect(turnStepLabel(cell("hits = await bailian_search.search('天气')"))).toBe("联网搜索");
 		expect(turnStepLabel(cell("rlm.harness.create_memory('t', 'c')"))).toBe("记笔记");
+	});
+});
+
+describe("shell and helper labels (QA M3)", () => {
+	const cell = (code: string) => turnStepLabel({ toolName: "ipython", args: { code } });
+
+	it("never cuts a command mid-argument or leaves a quote open", () => {
+		expect(cell("%%bash\nseq 1 60")).toBe("运行 seq 1 60");
+		expect(cell('%%bash\ndate "+%Y-%m-%d %H:%M:%S"')).toBe('运行 date "+%Y-%m-%d %H:%M:%S"');
+		const long = cell("%%bash\ngit log -5 --format='%H %ad %an %s' --date=iso --stat --no-merges");
+		expect(long.endsWith(" …")).toBe(true);
+		expect((long.match(/'/g) ?? []).length % 2).toBe(0);
+	});
+
+	it("keeps a quiet chain's lead and skips it before an informative command", () => {
+		expect(cell("%%bash\nsleep 8 && echo ok")).toBe("运行 sleep 8 → echo ok");
+		expect(cell("%%bash\nsleep 8 && npm test")).toBe("运行 npm test");
+		expect(cell("%%bash\ncd packages && ls")).toBe("列目录 .");
+	});
+
+	it("names kernel helper calls", () => {
+		expect(cell("r = await h")).toBe("等待命令结果");
+		expect(cell("print(tui[79900:81300])")).toBe("查看输出");
+		expect(cell("obs = await agent_observe.get_agent('tui-v5-reviewer')")).toBe("查看子代理 tui-v5-reviewer");
+		expect(cell("await agent_message.send('done', receiver_role='child', receiver_name='docs')")).toBe(
+			"发消息给 docs",
+		);
+		expect(cell("await agent_message.send('hi', receiver_role='parent')")).toBe("发消息");
+		expect(cell("h = bash('npm run check')\nprint(h.tail(20))")).toBe("运行 npm run check");
 	});
 });

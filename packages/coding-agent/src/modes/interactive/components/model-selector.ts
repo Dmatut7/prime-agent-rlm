@@ -199,8 +199,8 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		this.getHeaderRows = options.header ? (options.getHeaderRows ?? (() => 2)) : () => 0;
 
 		this.panel = new MenuPanel({
-			title: "Models",
-			subtitle: options.subtitle ?? "All models across supported providers.",
+			title: "模型",
+			subtitle: options.subtitle ?? "所有已支持服务商的模型。",
 		});
 		this.addChild(this.panel);
 		if (options.header) {
@@ -213,14 +213,14 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			this.scopeText = new Text(this.getScopeText(), 0, 0);
 			this.scopeHintText = new Text(this.getScopeHintText(), 0, 0);
 		} else {
-			const hintText = "Signed-in providers first. Other models prompt sign-in.";
+			const hintText = "已登录的服务商排在前面，其余模型选中后会提示登录。";
 			this.warningText = new Text(theme.fg("muted", hintText), 0, 0);
 		}
 		this.headerHelpContainer = new Container();
 		this.panel.addChild(this.headerHelpContainer);
 
 		// Create search input
-		this.searchInput = new MenuSearchInput("Search models");
+		this.searchInput = new MenuSearchInput("搜索模型");
 		if (initialSearchInput) {
 			this.searchInput.setValue(initialSearchInput);
 		}
@@ -367,13 +367,13 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	}
 
 	private getScopeText(): string {
-		const allText = this.scope === "all" ? theme.fg("accent", "all") : theme.fg("muted", "all");
-		const scopedText = this.scope === "scoped" ? theme.fg("accent", "scoped") : theme.fg("muted", "scoped");
-		return `${theme.fg("muted", "Scope: ")}${allText}${theme.fg("muted", " | ")}${scopedText}`;
+		const allText = this.scope === "all" ? theme.fg("accent", "全部") : theme.fg("muted", "全部");
+		const scopedText = this.scope === "scoped" ? theme.fg("accent", "常用") : theme.fg("muted", "常用");
+		return `${theme.fg("muted", "范围：")}${allText}${theme.fg("muted", " | ")}${scopedText}`;
 	}
 
 	private getScopeHintText(): string {
-		return keyHint("app.model.toggleScope", "scope") + theme.fg("muted", " (all/scoped)");
+		return keyHint("app.model.toggleScope", "范围") + theme.fg("muted", "（全部/常用）");
 	}
 
 	private setScope(scope: ModelScope): void {
@@ -445,9 +445,9 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			const isConfigured = this.isProviderConfigured(item);
 			const meta = isConfigured
 				? isCurrent
-					? theme.fg("success", "current")
+					? theme.fg("success", "当前")
 					: undefined
-				: theme.fg("warning", isCurrent ? "current · sign in" : "sign in");
+				: theme.fg("warning", isCurrent ? "当前 · 需登录" : "需登录");
 
 			this.listContainer.addChild(
 				new MenuRow({
@@ -473,7 +473,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 				this.listContainer.addChild(new Text(theme.fg("error", line), 0, 0));
 			}
 		} else if (this.filteredModels.length === 0) {
-			this.listContainer.addChild(new Text(theme.fg("muted", "No matching models"), 0, 0));
+			this.listContainer.addChild(new Text(theme.fg("muted", "没有匹配的模型"), 0, 0));
 		} else {
 			const selected = this.filteredModels[this.selectedIndex];
 			if (selected && this.shouldShowSelectedDetails()) {

@@ -67,7 +67,7 @@ function createHeartbeat(): AgentCronJob {
 		sessionFile: "/tmp/session.jsonl",
 		cwd: "/tmp/project",
 		prompt: "Check whether the long-running task needs another step.",
-		schedule: { kind: "interval", expression: "every 5m", intervalMs: 300_000 },
+		schedule: { kind: "interval", expression: "每 5m", intervalMs: 300_000 },
 		createdAt: "2026-01-01T00:00:00.000Z",
 		updatedAt: "2026-01-01T00:00:00.000Z",
 		nextRunAt: "2026-01-01T00:05:00.000Z",
@@ -494,15 +494,15 @@ describe("ENG-4482 heartbeat injected prompt UI", () => {
 		const collapsed = render(component);
 
 		expect(collapsed).toContain("♥");
-		expect(collapsed).toContain("Heartbeat prompt");
-		expect(collapsed).toContain("every 5m");
+		expect(collapsed).toContain("定时任务");
+		expect(collapsed).toContain("每 5m");
 		// U6: no per-line expand hint — the global tail line owns the keys.
 		expect(collapsed).not.toContain("展开");
 		expect(collapsed).not.toContain("Check whether the long-running task needs another step.");
 
 		component.setExpanded(true);
 		const expanded = render(component);
-		expect(expanded).toContain("Heartbeat prompt");
+		expect(expanded).toContain("定时任务");
 		expect(expanded).toContain("Check whether the long-running task needs another step.");
 	});
 
@@ -577,8 +577,8 @@ describe("ENG-4482 heartbeat injected prompt UI", () => {
 			});
 
 			const rendered = stripAnsi(chatContainer.render(120).join("\n"));
-			expect(rendered).toContain("Heartbeat prompt");
-			expect(rendered).toContain("every 5m");
+			expect(rendered).toContain("定时任务");
+			expect(rendered).toContain("每 5m");
 			expect(rendered).not.toContain("Check whether the long-running task needs another step.");
 			expect(addToHistory).not.toHaveBeenCalled();
 		},
@@ -602,7 +602,7 @@ describe("ENG-4482 heartbeat injected prompt UI", () => {
 		(InteractiveMode.prototype as unknown as AddMessageToChatHost).addMessageToChat.call(mode, message);
 
 		const rendered = stripAnsi(chatContainer.render(120).join("\n"));
-		expect(rendered).not.toContain("Heartbeat prompt");
+		expect(rendered).not.toContain("定时任务");
 		expect(rendered).toContain("Check whether the long-running task needs another step.");
 	});
 
@@ -621,7 +621,7 @@ describe("ENG-4482 heartbeat injected prompt UI", () => {
 
 		expect(message.display).toBe(true);
 		expect(isInjectedPromptMessage(message)).toBe(true);
-		expect(render(component)).toContain("Goal continuation");
+		expect(render(component)).toContain("继续目标");
 
 		component.setExpanded(true);
 		expect(render(component)).toContain("<goal_context>");

@@ -30,8 +30,8 @@ describe("IPythonCellComponent background output rendering", () => {
 		});
 
 		expect(countOccurrences(out, "orphan-line")).toBe(1);
-		expect(out).toContain("background output (unattributed)");
-		expect(out).not.toContain("no output");
+		expect(out).toContain("后台输出（来源未知）");
+		expect(out).not.toContain("没有输出");
 	});
 
 	it("renders stdout before background output, each exactly once", () => {
@@ -48,7 +48,7 @@ describe("IPythonCellComponent background output rendering", () => {
 		expect(countOccurrences(out, "bg-line")).toBe(1);
 		const lines = out.split("\n");
 		const stdoutIndex = lines.findIndex((line) => line.includes("main-line"));
-		const labelIndex = lines.findIndex((line) => line.includes("background output (unattributed)"));
+		const labelIndex = lines.findIndex((line) => line.includes("后台输出（来源未知）"));
 		expect(stdoutIndex).toBeGreaterThanOrEqual(0);
 		expect(labelIndex).toBeGreaterThan(stdoutIndex);
 	});
@@ -79,7 +79,7 @@ describe("IPythonCellComponent background output rendering", () => {
 
 		expect(countOccurrences(out, "main-line")).toBe(1);
 		expect(countOccurrences(out, "bg-line")).toBe(1);
-		expect(countOccurrences(out, "background output (unattributed)")).toBe(1);
+		expect(countOccurrences(out, "后台输出（来源未知）")).toBe(1);
 	});
 
 	it("renders the traceback before background output on error cells, each exactly once", () => {
@@ -106,11 +106,11 @@ describe("IPythonCellComponent background output rendering", () => {
 		});
 
 		expect(countOccurrences(out, "bg-line")).toBe(1);
-		expect(countOccurrences(out, "background output (unattributed)")).toBe(1);
+		expect(countOccurrences(out, "后台输出（来源未知）")).toBe(1);
 		expect(countOccurrences(out, "NameError: boom")).toBe(1);
 		const lines = out.split("\n");
 		const tracebackIndex = lines.findIndex((line) => line.includes("NameError: boom"));
-		const labelIndex = lines.findIndex((line) => line.includes("background output (unattributed)"));
+		const labelIndex = lines.findIndex((line) => line.includes("后台输出（来源未知）"));
 		expect(tracebackIndex).toBeGreaterThanOrEqual(0);
 		expect(labelIndex).toBeGreaterThan(tracebackIndex);
 	});

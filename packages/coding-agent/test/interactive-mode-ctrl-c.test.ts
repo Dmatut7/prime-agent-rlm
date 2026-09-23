@@ -139,7 +139,7 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		vi.useRealTimers();
 	});
 
-	it("interrupts streaming and shows the exit hint on first Ctrl+C", () => {
+	it("interrupts streaming on first Ctrl+C without arming exit", () => {
 		const mode = createInteractiveFake({ streaming: true });
 
 		Reflect.get(InteractiveMode.prototype, "handleCtrlC").call(mode);
@@ -147,7 +147,8 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		expect(mode.agentConnection.abortAndSendQueued).toHaveBeenCalledTimes(1);
 		expect(mode.agentConnection.abort).not.toHaveBeenCalled();
 		expect(mode.shutdown).not.toHaveBeenCalled();
-		expect(Reflect.get(InteractiveMode.prototype, "getTrayOverrideLabel").call(mode)).toBe("再按一次 Ctrl+C 退出");
+		// Stopping work only stops it: the usual double press to stop a task must not quit.
+		expect(Reflect.get(InteractiveMode.prototype, "getTrayOverrideLabel").call(mode)).toBeUndefined();
 	});
 
 	it("interrupts bash and streaming on the same Ctrl+C", () => {
@@ -195,13 +196,17 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		});
 	});
 
-	it("exits on the second Ctrl+C while the hint is visible", () => {
+	it("a double Ctrl+C during a run stops it without quitting; an idle double press exits", () => {
 		const mode = createInteractiveFake({ streaming: true });
 		const handleCtrlC = Reflect.get(InteractiveMode.prototype, "handleCtrlC");
 
 		handleCtrlC.call(mode);
+		mode.connectionState.isStreaming = false;
 		handleCtrlC.call(mode);
+		expect(mode.shutdown).not.toHaveBeenCalled();
+		expect(Reflect.get(InteractiveMode.prototype, "getTrayOverrideLabel").call(mode)).toBe("再按一次 Ctrl+C 退出");
 
+		handleCtrlC.call(mode);
 		expect(mode.agentConnection.abortAndSendQueued).toHaveBeenCalledTimes(1);
 		expect(mode.shutdown).toHaveBeenCalledTimes(1);
 	});

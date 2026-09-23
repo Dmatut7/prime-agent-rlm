@@ -106,12 +106,12 @@ describe("InteractiveMode /traces", () => {
 
 			expect(context.settingsManager.setAgentTracesEnabled).toHaveBeenCalledWith(true);
 			expect(context.showStatus).toHaveBeenCalledWith(
-				"Trace sharing enabled. Current session will upload after the first assistant response.",
+				"已开启 trace 分享。Current session will upload after the first assistant response.",
 			);
 		},
 	);
 
-	// H-2: the write is queued and its failure recorded, so "Trace sharing disabled." used to be
+	// H-2: the write is queued and its failure recorded, so "已关闭 trace 分享。" used to be
 	// printed over a settings.json nobody had changed - which means sharing turns back on at the
 	// next start. The failure and that consequence have to be visible.
 	describe("when the setting cannot be persisted", () => {
@@ -125,7 +125,7 @@ describe("InteractiveMode /traces", () => {
 
 			expect(context.showError).toHaveBeenCalledWith(expect.stringContaining("EACCES: permission denied"));
 			expect(context.showError).toHaveBeenCalledWith(expect.stringContaining("not saved"));
-			expect(context.showStatus).not.toHaveBeenCalledWith("Trace sharing disabled.");
+			expect(context.showStatus).not.toHaveBeenCalledWith("已关闭 trace 分享。");
 		});
 
 		it("reports the reason instead of claiming trace sharing was enabled", async () => {
@@ -159,7 +159,7 @@ describe("InteractiveMode /traces", () => {
 				await prototype.handleTracesCommand.call(context, "/traces off");
 
 				expect(readFileSync(settingsPath, "utf-8")).toBe(before);
-				expect(context.showStatus).not.toHaveBeenCalledWith("Trace sharing disabled.");
+				expect(context.showStatus).not.toHaveBeenCalledWith("已关闭 trace 分享。");
 				expect(context.showError).toHaveBeenCalledWith(expect.stringContaining("failed to parse"));
 			} finally {
 				rmSync(root, { recursive: true, force: true });
@@ -202,7 +202,7 @@ describe("InteractiveMode /traces", () => {
 		context.traceUploadAllAbortController?.abort();
 		await command;
 
-		expect(context.showStatus).toHaveBeenCalledWith("Trace upload cancelled.");
+		expect(context.showStatus).toHaveBeenCalledWith("已取消 trace 上传。");
 		expect(context.showStatus).not.toHaveBeenCalledWith(expect.stringContaining("Uploaded 0 of 2"));
 		expect(context.traceUploadAllAbortController).toBeUndefined();
 	});

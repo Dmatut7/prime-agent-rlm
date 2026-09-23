@@ -51,6 +51,13 @@ export interface AgentSessionMessageSender extends Partial<AgentSessionMessageEn
 export type AgentMessageDirection = "received" | "sent";
 
 /** Format the directional role/name segment shared by received and sent agent-message UI. */
+/** How the UI names a family member. Display only: never part of model-facing text. */
+const AGENT_ROLE_LABELS: Record<AgentFamilyRelationship, string> = {
+	parent: "父代理",
+	child: "子代理",
+	sibling: "同级代理",
+};
+
 export function formatAgentMessageParticipant(
 	direction: AgentMessageDirection,
 	role: AgentFamilyRelationship | undefined,
@@ -63,8 +70,9 @@ export function formatAgentMessageParticipant(
 		normalizedEndpoint.clientId?.trim() ||
 		normalizedEndpoint.sessionId?.trim() ||
 		"unknown";
-	const participant = role ? `${role} ${nameOrId}` : nameOrId;
-	return `${direction === "received" ? "from" : "to"} ${participant}`;
+	const roleLabel = role ? AGENT_ROLE_LABELS[role] : undefined;
+	const participant = roleLabel ? `${roleLabel} ${nameOrId}` : nameOrId;
+	return `${direction === "received" ? "来自" : "发给"} ${participant}`;
 }
 
 export interface AgentSessionMessageAgentSummary extends AgentSessionMessageEndpoint {

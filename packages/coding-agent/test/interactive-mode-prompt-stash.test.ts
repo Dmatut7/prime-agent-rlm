@@ -449,7 +449,7 @@ describe("InteractiveMode prompt stash", () => {
 			pasteSnapshot,
 		});
 		expect(mode.editor.getText()).toBe("");
-		expect(mode.showStatus).toHaveBeenCalledWith("Stashed prompt");
+		expect(mode.showStatus).toHaveBeenCalledWith("已暂存输入");
 
 		interactiveModeMethods.restorePromptStashIfEditorEmpty.call(mode);
 
@@ -485,7 +485,7 @@ describe("InteractiveMode prompt stash", () => {
 
 		expect(mode.promptStash).toBeUndefined();
 		expect(mode.editor.getText()).toBe("half-written draft");
-		expect(mode.showStatus).toHaveBeenCalledWith("Restored stashed prompt");
+		expect(mode.showStatus).toHaveBeenCalledWith("已恢复暂存的输入");
 	});
 
 	it("does not restore an older captured stash after a newer stash is created", () => {
@@ -499,7 +499,7 @@ describe("InteractiveMode prompt stash", () => {
 		expect(restored).toBe(false);
 		expect(mode.promptStash).toBe(newerStash);
 		expect(mode.editor.getText()).toBe("");
-		expect(mode.showStatus).not.toHaveBeenCalledWith("Restored stashed prompt");
+		expect(mode.showStatus).not.toHaveBeenCalledWith("已恢复暂存的输入");
 	});
 
 	it("restores both rich lifecycle-retained drafts in submission order", () => {
@@ -539,7 +539,7 @@ describe("InteractiveMode prompt stash", () => {
 
 		expect(mode.promptStash?.text).toBe("first draft");
 		expect(mode.editor.getText()).toBe("second draft");
-		expect(mode.showStatus).toHaveBeenCalledWith("Prompt stash already has a draft");
+		expect(mode.showStatus).toHaveBeenCalledWith("暂存区已有一份草稿");
 	});
 
 	it("restores a stashed prompt after normal message submission clears the editor", async () => {

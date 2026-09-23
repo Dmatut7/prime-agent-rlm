@@ -109,7 +109,7 @@ describe("InteractiveMode no-argument command usage", () => {
 		expect(footer.setSpeedEnabled).toHaveBeenLastCalledWith(false);
 		expect(footer.setSpeedText).toHaveBeenCalledWith(undefined);
 		await context.defaultEditor.onSubmit?.("/speed banana");
-		expect(context.showError).toHaveBeenCalledWith("Usage: /speed [on|off]");
+		expect(context.showError).toHaveBeenCalledWith("用法：/speed [on|off]");
 		expect((context.agentConnection as { prompt: ReturnType<typeof vi.fn> }).prompt).not.toHaveBeenCalled();
 	});
 });

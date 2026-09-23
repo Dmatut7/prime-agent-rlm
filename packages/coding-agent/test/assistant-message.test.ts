@@ -100,7 +100,16 @@ describe("AssistantMessageComponent", () => {
 		};
 		const rendered = stripAnsi(new AssistantMessageComponent(message).render(80).join("\n"));
 
-		expect(rendered).toContain("Operation aborted");
+		// A plain interrupt reads as the user's own calm action.
+		expect(rendered).toContain("已中断");
+		expect(rendered).not.toContain("Operation aborted");
+
+		const withReason = stripAnsi(
+			new AssistantMessageComponent({ ...message, errorMessage: "Aborted after 2 retry attempts" })
+				.render(80)
+				.join("\n"),
+		);
+		expect(withReason).toContain("Aborted after 2 retry attempts");
 	});
 
 	test("honors initial expansion for multiline assistant errors", () => {
@@ -349,5 +358,21 @@ describe("AssistantMessageComponent streaming identity", () => {
 			component.updateContent(message);
 			expectIdentity(component, message, widths[i % widths.length]);
 		}
+	});
+
+	test("quiet turns indent opened thinking traces under the process line; the answer keeps column 1", () => {
+		initTheme("dark");
+		const message = createAssistantMessage([
+			{ type: "thinking" as const, thinking: "weighing options" },
+			{ type: "text" as const, text: "the answer" },
+		]);
+		const lines = new AssistantMessageComponent(message, false, undefined, "Thinking", {
+			quiet: true,
+			thinkingExpanded: true,
+		})
+			.render(80)
+			.map((line) => stripAnsi(line));
+		expect(lines.find((line) => line.includes("weighing options"))?.startsWith("   weighing")).toBe(true);
+		expect(lines.find((line) => line.includes("the answer"))?.startsWith(" the answer")).toBe(true);
 	});
 });

@@ -80,7 +80,7 @@ describe("InteractiveMode /import parsing", () => {
 		);
 		expect(importFromJsonl).toHaveBeenCalledWith("path/to/session.jsonl");
 		expect(showError).not.toHaveBeenCalled();
-		expect(showStatus).toHaveBeenCalledWith("Session imported from: path/to/session.jsonl");
+		expect(showStatus).toHaveBeenCalledWith("已从 path/to/session.jsonl 导入会话");
 	});
 
 	it("passes unquoted apostrophe path to agentConnection.importFromJsonl unchanged", async () => {
@@ -108,7 +108,7 @@ describe("InteractiveMode /import parsing", () => {
 
 		expect(importFromJsonl).toHaveBeenCalledWith("john's/session.jsonl");
 		expect(showError).not.toHaveBeenCalled();
-		expect(showStatus).toHaveBeenCalledWith("Session imported from: john's/session.jsonl");
+		expect(showStatus).toHaveBeenCalledWith("已从 john's/session.jsonl 导入会话");
 	});
 
 	it("shows a non-fatal error when /import path does not exist", async () => {
@@ -137,7 +137,7 @@ describe("InteractiveMode /import parsing", () => {
 
 		await interactiveModePrototype.handleImportCommand.call(context, "/import /tmp/missing-session.jsonl");
 
-		expect(showError).toHaveBeenCalledWith("Failed to import session: File not found: /tmp/missing-session.jsonl");
+		expect(showError).toHaveBeenCalledWith("导入会话失败：File not found: /tmp/missing-session.jsonl");
 		expect(showStatus).not.toHaveBeenCalled();
 		expect(handleFatalRuntimeError).not.toHaveBeenCalled();
 	});

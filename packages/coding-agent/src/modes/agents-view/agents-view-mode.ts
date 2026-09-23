@@ -128,9 +128,9 @@ const RECONNECT_RETRY_MS = 1000;
 const EXIT_HINT_DURATION_MS = 2000;
 const DELETE_CONFIRM_DURATION_MS = 2000;
 const STATUS_MESSAGE_DURATION_MS = 4500;
-const SEARCH_PROMPT_PLACEHOLDER = "Search sessions";
-const REPLY_PROMPT_FALLBACK_PLACEHOLDER = "Write a reply to this agent";
-const RESUME_PROMPT_PLACEHOLDER = "Write a prompt to resume this session";
+const SEARCH_PROMPT_PLACEHOLDER = "搜索会话";
+const REPLY_PROMPT_FALLBACK_PLACEHOLDER = "回复这个会话";
+const RESUME_PROMPT_PLACEHOLDER = "写点什么继续这个会话";
 const COMPLETED_ROW_ICON = "✓";
 const NEEDS_INPUT_ROW_ICON = "●";
 const SELECTED_ROW_MARKER = "\0agents-view-selected-row\0";
@@ -287,7 +287,7 @@ export function agentsViewHandoffStatusMessage(result: AgentsViewRunResult): str
 	if (!opening) {
 		return undefined;
 	}
-	return `Opening ${getAgentsViewSessionTitle(opening)}…`;
+	return `正在打开 ${getAgentsViewSessionTitle(opening)}…`;
 }
 
 export function shouldReconnectAgentsViewDaemon(reason: DaemonClosingReason | undefined): boolean {
@@ -797,8 +797,8 @@ export function getReplyComposerCommandRejection(text: string): string | undefin
 
 const AGENTS_VIEW_COMMAND_DESCRIPTIONS: Record<AgentsViewCommandName, { description: string; argumentHint?: string }> =
 	{
-		name: { description: "Set session display name", argumentHint: "<name>" },
-		kill: { description: "Stop this agent's runtime (session stays resumable)" },
+		name: { description: "设置会话名称", argumentHint: "<name>" },
+		kill: { description: "停止这个会话的运行（之后仍可继续）" },
 	};
 
 function agentsViewSlashCommands(): {
@@ -1084,9 +1084,9 @@ export class AgentsViewMode implements Component, Focusable {
 				getExtraMetadata: () => {
 					const root = this.scopeRootSummary;
 					return [
-						{ label: "agents", value: this.getAgentCountsText() },
-						{ label: "scope", value: root ? getAgentsViewSessionTitle(root) : "global" },
-						{ label: "depth", value: String(getAgentsViewDepth(root)) },
+						{ label: "会话", value: this.getAgentCountsText() },
+						{ label: "范围", value: root ? getAgentsViewSessionTitle(root) : "全部" },
+						{ label: "深度", value: String(getAgentsViewDepth(root)) },
 					];
 				},
 			},
@@ -1703,7 +1703,7 @@ export class AgentsViewMode implements Component, Focusable {
 			return;
 		}
 		if (!this.targetHasSpawnCode(target)) {
-			this.setStatusMessage("No program recorded for these subagents");
+			this.setStatusMessage("这些子代理没有记录程序");
 			return;
 		}
 		// Code only renders inside an expanded subagent list, so reveal it too.
@@ -1842,7 +1842,7 @@ export class AgentsViewMode implements Component, Focusable {
 		} catch (error) {
 			if (this.replyTarget?.key === key) {
 				this.replyLastAssistantTextLoading = false;
-				this.setStatusMessage(formatError("Failed to load latest response", error));
+				this.setStatusMessage(formatError("最新回复加载失败", error));
 			}
 		}
 	}
@@ -1884,7 +1884,7 @@ export class AgentsViewMode implements Component, Focusable {
 		const activeSessionId = row.summary.activeSessionId;
 		const sessionFile = row.summary.sessionFile;
 		if (!activeSessionId && !sessionFile) {
-			this.setStatusMessage("This session cannot be renamed");
+			this.setStatusMessage("这个会话不能重命名");
 			return;
 		}
 		this.setReplyTarget(undefined);
@@ -1892,7 +1892,7 @@ export class AgentsViewMode implements Component, Focusable {
 		this.pendingDeleteAgent = undefined;
 		this.pendingKillSubagent = undefined;
 		this.renameTarget = { activeSessionId, sessionFile, summary: row.summary };
-		this.editor.setPlaceholder("Name this agent session");
+		this.editor.setPlaceholder("给这个会话起个名字");
 		this.editor.setText(row.summary.sessionName ?? "");
 		this.ui.requestRender();
 	}
@@ -1936,7 +1936,7 @@ export class AgentsViewMode implements Component, Focusable {
 					name,
 				);
 			} else {
-				this.setStatusMessage("This session cannot be renamed", { tone: "warning" });
+				this.setStatusMessage("这个会话不能重命名", { tone: "warning" });
 				return false;
 			}
 			await this.refreshSessions();
@@ -2875,7 +2875,7 @@ export class AgentsViewMode implements Component, Focusable {
 
 	private getAgentCountsText(): string {
 		const counts = countRowsBySection(this.rows);
-		return `${counts.running} running, ${counts.idle} idle, ${counts.inactive} inactive`;
+		return `运行 ${counts.running} · 空闲 ${counts.idle} · 历史 ${counts.inactive}`;
 	}
 
 	private renderSessionRows(width: number, maxRows: number): string[] {
@@ -2884,10 +2884,10 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 		if (this.rows.length === 0) {
 			const emptyLegend = buildAgentsViewUsageLayout([]).legends.get("running") ?? "";
-			return [
-				this.renderSectionHeading("running", width, emptyLegend),
-				theme.fg("dim", "  No sessions match your search."),
-			].slice(0, maxRows);
+			return [this.renderSectionHeading("running", width, emptyLegend), theme.fg("dim", "  没有匹配的会话。")].slice(
+				0,
+				maxRows,
+			);
 		}
 
 		const displayItems = buildDisplayItems(this.rows);
@@ -2923,7 +2923,7 @@ export class AgentsViewMode implements Component, Focusable {
 				return this.renderSectionHeading(item.section, width, usageLayout.legends.get(item.section) ?? "");
 			}
 			if (item.type === "empty") {
-				return theme.fg("dim", "  No agents");
+				return theme.fg("dim", "  （无）");
 			}
 			return this.renderRow(item.row, width, usageLayout.details);
 		});
@@ -2978,11 +2978,11 @@ export class AgentsViewMode implements Component, Focusable {
 				(heartbeatWidth > 0 ? heartbeatWidth + 1 : 0),
 		);
 		const armedHeartbeat = row.summary.hasActiveHeartbeat === true || (row.heartbeat?.activeCount ?? 0) > 0;
-		const heartbeatWarning = armedHeartbeat ? "has an armed heartbeat — " : "";
+		const heartbeatWarning = armedHeartbeat ? "有定时任务 — " : "";
 		const title = pendingDelete
 			? `${heartbeatWarning}${this.getPendingDeleteTitle()}`
 			: pendingKill
-				? `${heartbeatWarning}${keyText("app.agents.delete")} again to ${hasLiveWork(row) ? "stop" : "delete"}`
+				? `${heartbeatWarning}再按一次 ${keyText("app.agents.delete")} ${hasLiveWork(row) ? "停止" : "删除"}`
 				: styleRowTitle(row);
 		// Keep stable model information ahead of the variable summary so narrow rows truncate the summary first.
 		const summaryText = !pendingDelete && !pendingKill ? row.summary.summary : undefined;
@@ -3042,7 +3042,8 @@ export class AgentsViewMode implements Component, Focusable {
 	// shared line finalizer truncates it to the terminal width.
 	private renderAnswerRow(row: AgentsViewRow): string {
 		const indent = "  ".repeat(row.depth);
-		return `${indent}${theme.fg("muted", `↳ ${row.title}`)}`;
+		// Previews are plain text: markdown code ticks read as noise here.
+		return `${indent}${theme.fg("muted", `↳ ${row.title.replace(/`/g, "")}`)}`;
 	}
 
 	private finalizeRenderedLine(line: string, width: number): string {
@@ -3085,9 +3086,7 @@ export class AgentsViewMode implements Component, Focusable {
 
 	private getPendingDeleteTitle(): string {
 		const deleteKey = keyText("app.agents.delete");
-		return this.pendingDeleteAgent?.stopped
-			? `stopped - ${deleteKey} again to remove`
-			: `${deleteKey} again to remove`;
+		return this.pendingDeleteAgent?.stopped ? `已停止 · 再按一次 ${deleteKey} 移除` : `再按一次 ${deleteKey} 移除`;
 	}
 
 	private renderPrompt(width: number): string[] {
@@ -3109,7 +3108,7 @@ export class AgentsViewMode implements Component, Focusable {
 			return truncateToWidth(theme.fg(this.statusMessageTone, this.statusMessage), width);
 		}
 		if (this.renameTarget) {
-			const hint = `${keyText("tui.select.confirm")} save   ${keyText("tui.select.cancel")} cancel`;
+			const hint = `${keyText("tui.select.confirm")} 保存   ${keyText("tui.select.cancel")} 取消`;
 			return truncateToWidth(theme.fg("muted", hint), width);
 		}
 		if (this.replyTarget) {
@@ -3121,28 +3120,26 @@ export class AgentsViewMode implements Component, Focusable {
 		const selectedSubagent = selectedRow?.kind === "subagent";
 		const selectedSummary = selectedRow?.kind === "subagent-summary";
 		const hints = [
-			`${keyText("tui.select.up")}/${keyText("tui.select.down")} move`,
+			`${keyText("tui.select.up")}/${keyText("tui.select.down")} 移动`,
 			// Enter and Right run the same action on the selected row (`openSelected`):
 			// collapse/expand on a summary line, open on every other row kind. One merged
 			// hint says both keys - the old shape printed Right only on the rows where it
 			// was not Enter's twin, which read as "Right does nothing here".
 			`${keyText("tui.select.confirm")}/${keyText("app.agents.open")} ${
-				selectedSummary ? (selectedRow?.expanded ? "collapse" : "expand") : "open"
+				selectedSummary ? (selectedRow?.expanded ? "收起" : "展开") : "打开"
 			}`,
 			selectedAgent
-				? `${keyText("app.agents.reply")} ${selectedRow?.section === "inactive" ? "resume" : "reply"}`
+				? `${keyText("app.agents.reply")} ${selectedRow?.section === "inactive" ? "继续" : "回复"}`
 				: undefined,
-			`${keyText("app.agents.new")} new`,
-			selectedAgent ? `${keyText("app.agents.rename")} rename` : undefined,
+			`${keyText("app.agents.new")} 新建`,
+			selectedAgent ? `${keyText("app.agents.rename")} 重命名` : undefined,
 			selectedAgent
-				? `${keyText("app.agents.delete")} ${selectedRow?.section === "inactive" ? "delete" : "stop/deactivate"}`
+				? `${keyText("app.agents.delete")} ${selectedRow?.section === "inactive" ? "删除" : "停止"}`
 				: undefined,
 			// Same gate as the action itself: the legend must not offer "delete" for a row that reads
 			// Idle on the display axis while its kernel still hosts live work.
-			selectedSubagent
-				? `${keyText("app.agents.delete")} ${hasLiveWork(selectedRow) ? "stop" : "delete"}`
-				: undefined,
-			this.selectedRowCanShowProgram() ? `${keyText("app.agents.program")} program` : undefined,
+			selectedSubagent ? `${keyText("app.agents.delete")} ${hasLiveWork(selectedRow) ? "停止" : "删除"}` : undefined,
+			this.selectedRowCanShowProgram() ? `${keyText("app.agents.program")} 程序` : undefined,
 		]
 			.filter((hint): hint is string => hint !== undefined)
 			.join("   ");
@@ -3157,9 +3154,9 @@ export class AgentsViewMode implements Component, Focusable {
 		const streaming = current.activeSessionId !== undefined && current.isStreaming;
 		const hasText = this.editor.getText().trim().length > 0;
 		return [
-			`${keyText("tui.select.confirm")} ${streaming ? "steer" : current.activeSessionId ? "send" : "resume & send"}`,
-			hasText ? `${keyText("app.message.followUp")} queue` : undefined,
-			`${keyText("tui.select.cancel")} cancel`,
+			`${keyText("tui.select.confirm")} ${streaming ? "插话" : current.activeSessionId ? "发送" : "继续并发送"}`,
+			hasText ? `${keyText("app.message.followUp")} 排队` : undefined,
+			`${keyText("tui.select.cancel")} 取消`,
 		]
 			.filter((hint): hint is string => hint !== undefined)
 			.join("   ");
@@ -3183,8 +3180,9 @@ export class AgentsViewMode implements Component, Focusable {
 		return (selected ? rowSessionModel(selected)?.modelId : undefined) ?? this.options.startupModelId;
 	}
 
+	// The header names where the app was started; each row carries its own directory.
 	private getSplashCwd(): string {
-		return this.rows[this.selectedIndex]?.summary.cwd ?? this.options.uiServices.getInitialCwd();
+		return this.options.uiServices.getInitialCwd();
 	}
 
 	private getRowIcon(section: AgentsViewSection): string {
@@ -3307,14 +3305,14 @@ interface AgentsViewUsageParts {
 // usage columns, so the trailing layout every existing pin expects (…$total ·
 // age) keeps its columns and the new facts read as the row's state, not its bill.
 const AGENTS_VIEW_USAGE_LABELS: AgentsViewUsageParts = {
-	set: "set",
-	dur: "dur",
-	inTokens: "↑in",
-	outTokens: "↓out",
-	agentCost: "$agent",
-	count: "#sub",
-	totalCost: "$total",
-	age: "age",
+	set: "完成",
+	dur: "时长",
+	inTokens: "↑入",
+	outTokens: "↓出",
+	agentCost: "自身",
+	count: "子代理",
+	totalCost: "合计",
+	age: "更新",
 };
 
 const AGENTS_VIEW_USAGE_COLUMNS = Object.keys(AGENTS_VIEW_USAGE_LABELS) as (keyof AgentsViewUsageParts)[];
@@ -3347,6 +3345,15 @@ export function buildAgentsViewUsageLayout(rows: readonly AgentsViewRow[]): Agen
 	}
 	const legends = new Map<AgentsViewSection, string>();
 	const details = new Map<string, string>();
+	// One column set for every section, so the headers read the same down the list.
+	const hasStateColumns = [...rowsBySection.values()].some((sectionRows) =>
+		sectionRows.some(
+			(row) =>
+				!isEmptyAgentsViewSession(row.summary) &&
+				(formatAgentsViewSettledCell(resolveAgentsViewSettled(row.summary)) !== "" ||
+					formatAgentsViewDurationMs(resolveAgentsViewSessionDurationMs(row.summary)) !== ""),
+		),
+	);
 	for (const section of ["running", "idle", "inactive"] as const) {
 		const entries = (rowsBySection.get(section) ?? []).map((row) => {
 			const usage = row.summary.usage;
@@ -3367,9 +3374,6 @@ export function buildAgentsViewUsageLayout(rows: readonly AgentsViewRow[]): Agen
 		// columns collapse entirely instead of spending width on blank cells - the
 		// responsive tail (model/effort ahead of summaries, age last) keeps the
 		// column budget the 502 pins expect.
-		const hasStateColumns = entries.some(
-			(entry) => !entry.empty && (entry.parts.set !== "" || entry.parts.dur !== ""),
-		);
 		const widths = {} as Record<keyof AgentsViewUsageParts, number>;
 		for (const column of AGENTS_VIEW_USAGE_COLUMNS) {
 			if (!hasStateColumns && (column === "set" || column === "dur")) continue;
@@ -3411,7 +3415,7 @@ function styleRowTitle(row: AgentsViewRow): string {
 		return theme.bold(row.title);
 	}
 	if (row.title === "(no messages)") {
-		return theme.italic(row.title);
+		return theme.italic("（无消息）");
 	}
 	return row.title;
 }

@@ -163,7 +163,7 @@ describe("ENG-4531 agent message UI", () => {
 			"Agent message received: Use shard seven.",
 		);
 		expect(formatQueuedMessagePreview("Run the remaining checks.", "Steering")).toBe(
-			"Steering: Run the remaining checks.",
+			"插话：Run the remaining checks.",
 		);
 	});
 
@@ -296,20 +296,20 @@ describe("ENG-4531 agent message UI", () => {
 	});
 
 	it.each([
-		["received", "parent", { sessionName: "Planner" }, "from parent Planner"],
-		["received", "parent", {}, "from parent unknown"],
-		["sent", "parent", { activeSessionId: "parent-active" }, "to parent parent-active"],
-		["sent", "parent", {}, "to parent unknown"],
-		["received", "sibling", { clientId: "sibling-client" }, "from sibling sibling-client"],
-		["received", "sibling", {}, "from sibling unknown"],
-		["sent", "sibling", { sessionId: "sibling-session" }, "to sibling sibling-session"],
-		["sent", "sibling", {}, "to sibling unknown"],
-		["received", "child", { sessionName: "Worker" }, "from child Worker"],
-		["received", "child", {}, "from child unknown"],
-		["sent", "child", { sessionName: "Worker" }, "to child Worker"],
-		["sent", "child", {}, "to child unknown"],
-		["received", undefined, { sessionName: "Legacy" }, "from Legacy"],
-		["sent", undefined, {}, "to unknown"],
+		["received", "parent", { sessionName: "Planner" }, "来自 父代理 Planner"],
+		["received", "parent", {}, "来自 父代理 unknown"],
+		["sent", "parent", { activeSessionId: "parent-active" }, "发给 父代理 parent-active"],
+		["sent", "parent", {}, "发给 父代理 unknown"],
+		["received", "sibling", { clientId: "sibling-client" }, "来自 同级代理 sibling-client"],
+		["received", "sibling", {}, "来自 同级代理 unknown"],
+		["sent", "sibling", { sessionId: "sibling-session" }, "发给 同级代理 sibling-session"],
+		["sent", "sibling", {}, "发给 同级代理 unknown"],
+		["received", "child", { sessionName: "Worker" }, "来自 子代理 Worker"],
+		["received", "child", {}, "来自 子代理 unknown"],
+		["sent", "child", { sessionName: "Worker" }, "发给 子代理 Worker"],
+		["sent", "child", {}, "发给 子代理 unknown"],
+		["received", undefined, { sessionName: "Legacy" }, "来自 Legacy"],
+		["sent", undefined, {}, "发给 unknown"],
 	] as const)("formats %s %s agent-message participants", (direction, role, endpoint, expected) => {
 		expect(formatAgentMessageParticipant(direction, role as AgentFamilyRelationship | undefined, endpoint)).toBe(
 			expected,
@@ -340,7 +340,7 @@ describe("ENG-4531 agent message UI", () => {
 
 		expect(components).toHaveLength(1);
 		expect(components[0]).toBeInstanceOf(AgentMessageComponent);
-		expect(render(components[0] as AgentMessageComponent)).toContain("Agent message received · from parent Planner");
+		expect(render(components[0] as AgentMessageComponent)).toContain("收到消息 · 来自 父代理 Planner");
 	});
 
 	it("uses compact rebuilt spacing for agent messages next to messages and tool cells", () => {
@@ -443,7 +443,7 @@ describe("ENG-4531 agent message UI", () => {
 
 		expect(isAgentSessionMessage(persistedMessage)).toBe(true);
 		if (!isAgentSessionMessage(persistedMessage)) throw new Error("Expected an agent session message");
-		expect(render(new AgentMessageComponent(persistedMessage))).toContain("Agent message received · from unknown");
+		expect(render(new AgentMessageComponent(persistedMessage))).toContain("收到消息 · 来自 unknown");
 	});
 
 	it("renders relationship-aware sender labels with identifier fallbacks", () => {
@@ -463,17 +463,13 @@ describe("ENG-4531 agent message UI", () => {
 			from: { sessionId: "legacy-session" },
 		});
 
-		expect(render(new AgentMessageComponent(parent))).toContain("Agent message received · from parent Planner");
-		expect(render(new AgentMessageComponent(sibling))).toContain("Agent message received · from sibling Peer");
-		expect(render(new AgentMessageComponent(childById))).toContain(
-			"Agent message received · from child child-session",
-		);
-		expect(render(new AgentMessageComponent(unknownRelationship))).toContain(
-			"Agent message received · from legacy-session",
-		);
+		expect(render(new AgentMessageComponent(parent))).toContain("收到消息 · 来自 父代理 Planner");
+		expect(render(new AgentMessageComponent(sibling))).toContain("收到消息 · 来自 同级代理 Peer");
+		expect(render(new AgentMessageComponent(childById))).toContain("收到消息 · 来自 子代理 child-session");
+		expect(render(new AgentMessageComponent(unknownRelationship))).toContain("收到消息 · 来自 legacy-session");
 		const expanded = new AgentMessageComponent(sibling);
 		expanded.setExpanded(true);
-		expect(render(expanded)).toContain("Agent message received · from sibling Peer");
+		expect(render(expanded)).toContain("收到消息 · 来自 同级代理 Peer");
 	});
 
 	it("renders a compact row and an aligned multiline gutter when expanded", () => {
@@ -481,16 +477,17 @@ describe("ENG-4531 agent message UI", () => {
 		const component = new AgentMessageComponent(createAgentSessionMessage(createPayload(body)));
 		const collapsed = render(component);
 
-		expect(collapsed).toContain("◆ Agent message received · from Planner");
+		expect(collapsed).toContain("◆ 收到消息 · 来自 Planner");
 		// U6: no per-line expand hint — the global tail line owns the keys.
 		expect(collapsed).not.toContain("展开");
-		expect(collapsed).not.toContain("Then wait for more work.");
+		// Collapsed is one row: the body's second line never gets a row of its own.
+		expect(collapsed.split("\n").filter((line) => line.trim().length > 0)).toHaveLength(1);
 
 		component.setExpanded(true);
 		const expanded = render(component);
 		expect(expanded).not.toContain("收起");
 		const expandedLines = expanded.split("\n");
-		expect(expandedLines[1]?.trimEnd()).toMatch(/^ ◆ Agent message received · from Planner$/);
+		expect(expandedLines[1]?.trimEnd()).toMatch(/^ ◆ 收到消息 · 来自 Planner$/);
 		expect(expandedLines.slice(2)).toEqual([
 			" ╰─ Reply to your parent with exactly: hi",
 			"    Then wait for more work.",
@@ -537,7 +534,7 @@ describe("ENG-4531 agent message UI", () => {
 		// The step label names the send; its source stays out of the expanded view.
 		expect(lines).toEqual([
 			" ✓ 发消息",
-			expect.stringMatching(/^ ◆ Agent message sent · to parent Worker$/),
+			expect.stringMatching(/^ ◆ 已发消息 · 发给 父代理 Worker$/),
 			" ╰─ Continue with shard eight.",
 			"    Then report back.",
 		]);
@@ -578,7 +575,7 @@ describe("ENG-4531 agent message UI", () => {
 		});
 
 		const rendered = stripAnsi(component.render(120).join("\n"));
-		expect(rendered).toContain(" ◆ Agent message sent · to child Worker");
+		expect(rendered).toContain(" ◆ 已发消息 · 发给 子代理 Worker");
 		expect(rendered).toContain("'error': 'session is inactive'");
 	});
 
@@ -639,7 +636,7 @@ describe("ENG-4531 agent message UI", () => {
 		});
 
 		const rendered = stripAnsi(component.render(120).join("\n"));
-		expect(rendered).toContain(" ◆ Agent message sent · to parent Worker");
+		expect(rendered).toContain(" ◆ 已发消息 · 发给 父代理 Worker");
 		expect(rendered).toContain(" ╰─ Ping.");
 		expect(rendered).toContain("done");
 	});
@@ -668,7 +665,7 @@ describe("ENG-4531 agent message UI", () => {
 				.render(120)
 				.join("\n"),
 		);
-		expect(agentExpanded).toContain(" ◆ Agent message sent · to parent Worker");
+		expect(agentExpanded).toContain(" ◆ 已发消息 · 发给 父代理 Worker");
 		expect(agentExpanded).toContain(" ╰─ Decouple me.");
 		expect(agentExpanded).not.toContain("· Decouple me.");
 
@@ -677,7 +674,7 @@ describe("ENG-4531 agent message UI", () => {
 				.render(120)
 				.join("\n"),
 		);
-		expect(toolExpanded).toContain(" ◆ Agent message sent · to parent Worker · Decouple me.");
+		expect(toolExpanded).toContain(" ◆ 已发消息 · 发给 父代理 Worker · Decouple me.");
 		expect(toolExpanded).not.toContain("╰─");
 	});
 });

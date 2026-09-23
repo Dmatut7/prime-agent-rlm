@@ -63,7 +63,7 @@ describe("ModelSelectorComponent", () => {
 
 		const output = stripAnsi(selector.render(120).join("\n"));
 		expect(output).toContain("Choose a Prime model, or add another provider.");
-		expect(output).toContain("Signed-in providers first.");
+		expect(output).toContain("已登录的服务商排在前面");
 		expect(output).not.toContain("opens providers");
 
 		selector.handleInput("\r");
@@ -164,7 +164,7 @@ describe("ModelSelectorComponent", () => {
 
 		const output = stripAnsi(selector.render(120).join("\n"));
 		expect(output).not.toContain("Alpha");
-		expect(output).toContain("No matching models");
+		expect(output).toContain("没有匹配的模型");
 	});
 
 	it("keeps the model menu within a short terminal viewport", async () => {
@@ -373,9 +373,9 @@ describe("ModelSelectorComponent", () => {
 		let output = stripAnsi(lines.join("\n"));
 
 		expect(lines.length).toBeLessThanOrEqual(16);
-		expect(output).toContain("Scope: ");
-		expect(output).toContain(`${process.platform === "darwin" ? "Option" : "Alt"}+S scope`);
-		expect(output).toContain("(all/scoped)");
+		expect(output).toContain("范围：");
+		expect(output).toContain(`${process.platform === "darwin" ? "Option" : "Alt"}+S 范围`);
+		expect(output).toContain("（全部/常用）");
 		expect(output).not.toContain("(1/12)");
 
 		selector.handleInput("\x1bs");

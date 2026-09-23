@@ -5,3 +5,6 @@
 - Removed the chat-tail `Ctrl+T 思考 · Ctrl+O 过程 · Ctrl+P 通讯` hint line and the `[O]/[T]/[P]` bracket hints.
 - Changed the quiet running face to match the design: the live activity (`◈ 运行中 12s`) moved into the status line, the prompt reads 随时补充或纠正 while a turn runs, and the process line shows measured Thinking time.
 - Added a two-row Thinking preview at the top of an opened process block, a 继续 row on the startup header for the last session in this directory, and a per-child subagent panel.
+- Changed the interface text to Chinese across status messages, the shortcut panel, session list, session tree, model picker, heartbeats, queue rows, agent-message rows and the exit hint (Thinking stays English).
+- Fixed the turn caret not flipping on Ctrl+T/Ctrl+P, the full-output toggle not repainting, a single Ctrl+C during a run arming exit, the shortcut panel not closing, and interrupted steps showing raw KeyboardInterrupt tracebacks.
+- Fixed tests writing fake sessions into the real agent directory.

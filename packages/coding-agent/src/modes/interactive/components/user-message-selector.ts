@@ -52,7 +52,7 @@ class UserMessageList implements Component {
 			lines.push(messageLine);
 
 			const position = i + 1;
-			const metadata = `  Message ${position} of ${this.messages.length}`;
+			const metadata = `  第 ${position} / ${this.messages.length} 条`;
 			const metadataLine = theme.fg("muted", metadata);
 			lines.push(metadataLine);
 			lines.push("");
@@ -97,14 +97,8 @@ export class UserMessageSelectorComponent extends Container {
 		super();
 
 		this.addChild(new Spacer(1));
-		this.addChild(new Text(theme.bold("Fork from Message"), 1, 0));
-		this.addChild(
-			new Text(
-				theme.fg("muted", "Select a user message to copy the active path up to that point into a new session"),
-				1,
-				0,
-			),
-		);
+		this.addChild(new Text(theme.bold("从这条消息分叉"), 1, 0));
+		this.addChild(new Text(theme.fg("muted", "选一条你的消息，把到那里为止的对话复制成新会话"), 1, 0));
 		this.addChild(new Spacer(1));
 		this.addChild(new DynamicBorder());
 		this.addChild(new Spacer(1));

@@ -182,7 +182,7 @@ describe("marquee TUI components", () => {
 
 		const collapsed = stripAnsi(component.render(100).join("\n"));
 		expect(collapsed).toContain("RuntimeError");
-		expect(collapsed).not.toContain("no output");
+		expect(collapsed).not.toContain("没有输出");
 		expect(collapsed).not.toContain("/tmp/internal.py");
 		expect(collapsed).not.toContain("line 12");
 	});

@@ -432,7 +432,9 @@ export class ToolExecutionComponent extends Container {
 			// hiding outright, so the key-steps view stays self-describing.
 			const state = this.turnActivity;
 			if (state?.isProcessFoldRowCarrier(this.toolCallId)) {
-				return [theme.fg("dim", ` ⋯ 中间 ${state.processFoldHiddenCount()} 步`)];
+				// Level with the step markers under the process line.
+				const indent = quietConversationBudget() ? " ".repeat(STEP_INSET + 1) : " ";
+				return [theme.fg("dim", `${indent}⋯ 中间 ${state.processFoldHiddenCount()} 步`)];
 			}
 			return this.hiddenLines;
 		}

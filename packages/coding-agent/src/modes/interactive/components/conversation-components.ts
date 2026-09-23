@@ -176,7 +176,15 @@ export function buildConversationComponents(
 				components.push(tool);
 				if (message.stopReason === "aborted" || message.stopReason === "error") {
 					tool.updateResult({
-						content: [{ type: "text", text: message.errorMessage || "Operation aborted" }],
+						content: [
+							{
+								type: "text",
+								text:
+									message.errorMessage && message.errorMessage !== "Operation aborted"
+										? message.errorMessage
+										: "已中断",
+							},
+						],
 						isError: true,
 					});
 					state.setStepStatus(content.id, "error");

@@ -75,8 +75,22 @@ export class TurnActivityState {
 	/** Set on the live run's turn: its clock ticks until agent_end stamps it. */
 	live = false;
 
-	/** The latest non-empty thinking trace, for the open process block's preview. */
-	latestThinking = "";
+	private previewThinking = "";
+	/**
+	 * The turn's first thinking trace (what the model planned), for the open
+	 * process block's preview. Assignments keep the first trace: a value that
+	 * extends it (the same trace still streaming) replaces it, anything else is
+	 * a later trace and is ignored.
+	 */
+	get latestThinking(): string {
+		return this.previewThinking;
+	}
+	set latestThinking(text: string) {
+		if (!text) return;
+		if (!this.previewThinking || text.startsWith(this.previewThinking)) {
+			this.previewThinking = text;
+		}
+	}
 	private thinkingMs = 0;
 	private thinkingStartedAt: number | undefined;
 	private thinkingMeasured = false;
@@ -405,6 +419,7 @@ export class TurnSummaryComponent implements Component {
 	private expanded = false;
 	private cachedWidth?: number;
 	private cachedLines?: string[];
+	private cachedLaneKey?: string;
 	/** TUI v4: render the one-line footnote instead of the legacy two-line surface. */
 	private quiet = false;
 	private footnote?: TurnFootNote;
@@ -464,7 +479,16 @@ export class TurnSummaryComponent implements Component {
 		// settled step and the turn end, so `isSettled` alone would freeze the
 		// quiet footnote too early.
 		const settled = this.state.isSettled && this.state.isTurnEnded;
-		if (this.cachedLines && this.cachedWidth === width && settled) {
+		// The caret, preview and file rows follow the lanes, so a lane flip
+		// must rebuild even a frozen turn.
+		const laneKey = [
+			this.quiet,
+			this.state.thinkingBlockExpanded,
+			this.state.processBlockExpanded,
+			this.state.commsBlockExpanded,
+			this.state.processKeyStepsArmed,
+		].join(",");
+		if (this.cachedLines && this.cachedWidth === width && settled && this.cachedLaneKey === laneKey) {
 			return this.cachedLines;
 		}
 		const safeWidth = Math.max(1, width);
@@ -472,6 +496,7 @@ export class TurnSummaryComponent implements Component {
 		if (settled) {
 			this.cachedWidth = width;
 			this.cachedLines = lines;
+			this.cachedLaneKey = laneKey;
 		} else {
 			// A live run keeps mutating; only the settled lines are cacheable.
 			this.cachedWidth = undefined;
