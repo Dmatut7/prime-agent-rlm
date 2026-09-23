@@ -1,6 +1,7 @@
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { KeybindingsManager as PiKeybindingsManager, setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, it } from "vitest";
+import { KeybindingsManager as AppKeybindingsManager } from "../src/core/keybindings.js";
 import {
 	TURN_FOOT_NOTE_NARROW_COLS,
 	TurnFootNote,
@@ -47,13 +48,12 @@ describe("turn footnote (TUI v4 T2b)", () => {
 		expect(turnFootNoteDurationText(0, false)).toBe("干了 0 秒");
 	});
 
-	it("switches to the compressed narrow form at or below 100 columns, same stats", () => {
-		expect(renderLine({ ...reference, cols: TURN_FOOT_NOTE_NARROW_COLS })).toBe(NARROW_LINE);
+	it("switches to the compressed narrow form below 100 columns, same stats (R2.1)", () => {
+		// 99 compressed / 100 full / 101 full: the boundary column itself
+		// belongs to the wide form (R2.1, matches the prototype's 100ch chat).
 		expect(renderLine({ ...reference, cols: TURN_FOOT_NOTE_NARROW_COLS - 1 })).toBe(NARROW_LINE);
-		// One column above the threshold: the wide form with key hints.
-		expect(renderLine({ ...reference, cols: TURN_FOOT_NOTE_NARROW_COLS + 1 })).toBe(
-			"干了 1 分 05 秒 · 14 步 [O] · 想 7 段 [T] · → 通讯 2 条 [P]",
-		);
+		expect(renderLine({ ...reference, cols: TURN_FOOT_NOTE_NARROW_COLS })).toBe(WIDE_LINE);
+		expect(renderLine({ ...reference, cols: TURN_FOOT_NOTE_NARROW_COLS + 1 })).toBe(WIDE_LINE);
 	});
 
 	it("omits zero-value segments instead of rendering zero counts", () => {
@@ -131,6 +131,29 @@ describe("turn footnote (TUI v4 T2b)", () => {
 		expect(line.endsWith("…")).toBe(true);
 		expect(line.startsWith("干了")).toBe(true);
 		expect(visibleWidth(line)).toBeLessThanOrEqual(27);
+	});
+
+	it("derives the bracket hints from the live keybindings, with a literal fallback (R2.2)", () => {
+		const line = () => stripAnsi(new TurnFootNote({ ...reference, cols: 120 }).render(120)[0] ?? "");
+		// No app keybindings installed: the shipped defaults' literal letters.
+		setKeybindings(new PiKeybindingsManager({}));
+		expect(line()).toBe(WIDE_LINE);
+		// The app defaults (ctrl+o/t/p) derive the same letters - no hardcoding.
+		setKeybindings(new AppKeybindingsManager({}));
+		expect(line()).toBe(WIDE_LINE);
+		// A rebind shows the real letter: ctrl+k → [K].
+		setKeybindings(new AppKeybindingsManager({ "app.tools.expand": "ctrl+k" }));
+		const rebound = line();
+		expect(rebound).toContain("14 步 [K]");
+		expect(rebound).not.toContain("[O]");
+		expect(rebound).toContain("想 7 段 [T]");
+		expect(rebound).toContain("→ 通讯 2 条 [P]");
+		// A modifier-less binding renders its bare key in the brackets.
+		setKeybindings(new AppKeybindingsManager({ "app.thinking.toggle": "f2" }));
+		expect(line()).toContain("想 7 段 [F2]");
+		// Restore the bare manager so the remaining tests exercise the fallback.
+		setKeybindings(new PiKeybindingsManager({}));
+		expect(line()).toBe(WIDE_LINE);
 	});
 
 	it("respects showKeys=false by never rendering hints", () => {

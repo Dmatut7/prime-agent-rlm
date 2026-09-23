@@ -1,18 +1,20 @@
-import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { type Component, type Keybinding, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { theme } from "../theme/theme.js";
+import { keyText } from "./keybinding-hints.js";
 
 /**
  * TUI v4 quiet conversation (T2b): the per-turn footnote. One line under the
  * turn's final answer that carries all process stats the v4 conversation flow
  * removed - `干了 1 分 05 秒 · 14 步 [O] · 想 7 段 [T] · → 通讯 2 条 [P]` - with
- * the key hints in accent and the rest dim. Narrow screens (≤100 columns)
- * switch to the compressed form `干了 1分05秒 · 14步 · 7想 · 2讯`; a
- * thinking-only turn shows `想了想`; an all-zero turn renders nothing. When
- * the line overflows, the key hints go first, then the text truncates at the
- * right edge by display columns (CJK = 2 columns).
+ * the key hints in accent and the rest dim. Narrow screens (<100 columns,
+ * R2.1: 100 exactly keeps the full form) switch to the compressed form
+ * `干了 1分05秒 · 14步 · 7想 · 2讯`; a thinking-only turn shows `想了想`; an
+ * all-zero turn renders nothing. When the line overflows, the key hints go
+ * first, then the text truncates at the right edge by display columns
+ * (CJK = 2 columns).
  */
 
-/** At or below this column count the footnote switches to the compressed narrow form. */
+/** Below this column count the footnote switches to the compressed narrow form (R2.1: the boundary itself stays wide). */
 export const TURN_FOOT_NOTE_NARROW_COLS = 100;
 
 /** Turn statistics the footnote summarizes; counts are non-negative, duration in ms. */
@@ -39,6 +41,26 @@ interface FootNoteSegment {
 	text: string;
 	/** Key hint suffix (wide form only), e.g. ` [O]`. */
 	hint?: string;
+}
+
+/** Which app keybinding opens each footnote detail block (R2.2: no hardcoded key letters). */
+const SEGMENT_KEYS = {
+	steps: "app.tools.expand",
+	think: "app.thinking.toggle",
+	comm: "app.messages.expand",
+} as const satisfies Record<string, Keybinding>;
+
+/**
+ * The bracket hint for one detail block: the final key part of the binding's
+ * display name (`Ctrl+O` → ` [O]`), so a rebound key shows its real letter
+ * instead of the shipped default. When keyText() resolves to nothing - the
+ * keybindings manager is not installed yet (bare test environments) or the
+ * key is unbound - the shipped default's literal letter is the fallback.
+ */
+function segmentHint(appKey: Keybinding, fallback: string): string {
+	const display = keyText(appKey, { primaryOnly: true });
+	const last = display.split("+").pop()?.trim() ?? "";
+	return last ? ` [${last}]` : fallback;
 }
 
 /**
@@ -99,7 +121,7 @@ export class TurnFootNote implements Component {
 		if (steps <= 0 && thinkSegments <= 0 && commMessages <= 0) {
 			return [];
 		}
-		const narrow = cols <= TURN_FOOT_NOTE_NARROW_COLS;
+		const narrow = cols < TURN_FOOT_NOTE_NARROW_COLS;
 		// 空态: thinking only - no counts, no keys, no duration, just 想了想.
 		const segments: FootNoteSegment[] =
 			steps <= 0 && commMessages <= 0
@@ -124,13 +146,19 @@ export class TurnFootNote implements Component {
 	): FootNoteSegment[] {
 		const segments: FootNoteSegment[] = [{ text: turnFootNoteDurationText(durationMs, narrow) }];
 		if (steps > 0) {
-			segments.push({ text: narrow ? `${steps}步` : `${steps} 步`, hint: " [O]" });
+			segments.push({ text: narrow ? `${steps}步` : `${steps} 步`, hint: segmentHint(SEGMENT_KEYS.steps, " [O]") });
 		}
 		if (thinkSegments > 0) {
-			segments.push({ text: narrow ? `${thinkSegments}想` : `想 ${thinkSegments} 段`, hint: " [T]" });
+			segments.push({
+				text: narrow ? `${thinkSegments}想` : `想 ${thinkSegments} 段`,
+				hint: segmentHint(SEGMENT_KEYS.think, " [T]"),
+			});
 		}
 		if (commMessages > 0) {
-			segments.push({ text: narrow ? `${commMessages}讯` : `→ 通讯 ${commMessages} 条`, hint: " [P]" });
+			segments.push({
+				text: narrow ? `${commMessages}讯` : `→ 通讯 ${commMessages} 条`,
+				hint: segmentHint(SEGMENT_KEYS.comm, " [P]"),
+			});
 		}
 		return segments;
 	}
