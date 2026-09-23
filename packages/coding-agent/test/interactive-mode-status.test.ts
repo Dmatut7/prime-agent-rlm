@@ -52,7 +52,7 @@ import type { ConfigurationMenuComponent } from "../src/modes/interactive/compon
 import { buildConversationComponents } from "../src/modes/interactive/components/conversation-components.js";
 import type { AuthSelectorProvider } from "../src/modes/interactive/components/oauth-selector.js";
 import type { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
-import { TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
+import { TurnActivityState, TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
 import { formatSplashCwd, InteractiveMode, truncatePathMiddle } from "../src/modes/interactive/interactive-mode.js";
 import { ClientPromptStashStore, type PromptStashState } from "../src/modes/interactive/prompt-stash-state.js";
 import { QueueSelection } from "../src/modes/interactive/queue-selection.js";
@@ -4702,6 +4702,9 @@ describe("InteractiveMode.setToolsExpanded", () => {
 			editDiffsExpanded: false,
 			customHeader: undefined,
 			builtInHeader: { setExpanded: vi.fn() },
+			// TUI v4: the process keys read the mode; the legacy face is the
+			// default for these lane-mechanics tests (quiet gets its own tests).
+			uiServices: { settingsManager: { getProcessMode: () => "legacy" as const } },
 			chatContainer: { children: chatChildren },
 			ui: {
 				requestRender: vi.fn(),
@@ -4894,6 +4897,53 @@ describe("InteractiveMode.setToolsExpanded", () => {
 		expect(summary!.state.processBlockExpanded).toBe(false);
 		expect(summary!.state.thinkingBlockExpanded).toBe(true);
 		expect(summary!.state.commsBlockExpanded).toBe(true);
+	});
+
+	test("quiet Ctrl+O cycles closed → key steps → all steps (T6)", () => {
+		const state = new TurnActivityState(1_000);
+		for (let i = 1; i <= 14; i++) {
+			state.addStep({ toolCallId: `t${i}`, toolName: "bash", args: {}, status: "done" });
+		}
+		state.markTurnEnded(2_000);
+		const summary = new TurnSummaryComponent(state);
+		summary.setQuiet(true);
+		const chatContainer = new Container();
+		chatContainer.addChild(summary);
+		const fakeThis = createExpansionFakeThis(chatContainer.children);
+		fakeThis.uiServices = { settingsManager: { getProcessMode: () => "quiet" as const } };
+
+		expect(summary.state.isCollapsed).toBe(true);
+		// Closed → key steps: the >8 fold arms.
+		fakeThis.toggleToolOutputExpansion();
+		expect(summary.state.processBlockExpanded).toBe(true);
+		expect(summary.state.processKeyStepsView).toBe(true);
+		// Key steps → all steps.
+		fakeThis.toggleToolOutputExpansion();
+		expect(summary.state.processKeyStepsView).toBe(false);
+		expect(summary.state.processBlockExpanded).toBe(true);
+		// All steps → closed.
+		fakeThis.toggleToolOutputExpansion();
+		expect(summary.state.processBlockExpanded).toBe(false);
+	});
+
+	test("legacy Ctrl+O stays binary (T6)", () => {
+		const state = new TurnActivityState(1_000);
+		for (let i = 1; i <= 14; i++) {
+			state.addStep({ toolCallId: `t${i}`, toolName: "bash", args: {}, status: "done" });
+		}
+		state.markTurnEnded(2_000);
+		const summary = new TurnSummaryComponent(state);
+		const chatContainer = new Container();
+		chatContainer.addChild(summary);
+		const fakeThis = createExpansionFakeThis(chatContainer.children);
+		fakeThis.uiServices = { settingsManager: { getProcessMode: () => "legacy" as const } };
+
+		fakeThis.toggleToolOutputExpansion();
+		expect(summary.state.processBlockExpanded).toBe(true);
+		// Legacy never arms the key-steps view: every step renders.
+		expect(summary.state.processKeyStepsView).toBe(false);
+		fakeThis.toggleToolOutputExpansion();
+		expect(summary.state.processBlockExpanded).toBe(false);
 	});
 
 	test("plain keys act on the latest turn only; Alt keys act globally (K3 ②)", () => {

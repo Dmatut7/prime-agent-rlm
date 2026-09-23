@@ -6,6 +6,7 @@ import { beforeAll, describe, expect, it, vi } from "vitest";
 import { AGENT_MESSAGE_SOURCE, createAgentSessionMessage } from "../src/core/agent-messages.js";
 import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
 import { buildConversationComponents } from "../src/modes/interactive/components/conversation-components.js";
+import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
 import {
 	TurnActivityState,
 	TurnSummaryComponent,
@@ -427,7 +428,7 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 		const collapsed = renderQuiet(messages);
 		const nonEmpty = collapsed.split("\n").filter((line) => line.trim().length > 0);
 		// The empty-state turn: only 想了想, no counts, no keys, no duration.
-		expect(nonEmpty[1]).toBe("想了想");
+		expect(nonEmpty[1]).toBe("▸想了想");
 		expect(collapsed).toContain("Concluded.");
 		// R5-P2③: the thinking-less turn renders 想了想 too - the model is
 		// always reasoning, so every turn carries the footnote.
@@ -547,5 +548,125 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 		state.markTurnEnded(2_000);
 		const firstSettled = summary.render(120);
 		expect(summary.render(120)).toBe(firstSettled);
+	});
+});
+
+describe("process block key-steps fold (TUI v4 T6)", () => {
+	beforeAll(() => initTheme("dark"));
+
+	function foldableState(count: number, errorAt?: number): TurnActivityState {
+		const state = new TurnActivityState(1_000);
+		for (let i = 1; i <= count; i++) {
+			state.addStep({
+				toolCallId: `t${i}`,
+				toolName: "bash",
+				args: {},
+				status: i === errorAt ? "error" : "done",
+			});
+		}
+		state.markTurnEnded(2_000);
+		// The fold only arms through the quiet Ctrl+O cycle (legacy never
+		// folds); these state tests arm it directly.
+		state.setProcessKeySteps(true);
+		return state;
+	}
+
+	it("folds the middle of a >8 step turn while edges and errors stay", () => {
+		const state = foldableState(14, 7);
+		state.setCollapsed(false); // the process block is open
+		for (const id of ["t1", "t2", "t3", "t12", "t13", "t14"]) {
+			expect(state.isStepFolded(id)).toBe(false);
+		}
+		// The settled middle folds; the failed step never folds (✗ 永保留).
+		for (const id of ["t4", "t5", "t6", "t8", "t9", "t10", "t11"]) {
+			expect(state.isStepFolded(id)).toBe(true);
+		}
+		expect(state.isStepFolded("t7")).toBe(false);
+		// The first folded step carries the fold row; 7 steps fold away.
+		expect(state.isProcessFoldRowCarrier("t4")).toBe(true);
+		expect(state.isProcessFoldRowCarrier("t5")).toBe(false);
+		expect(state.processFoldHiddenCount()).toBe(7);
+	});
+
+	it("does not arm below the threshold, and lifts on request", () => {
+		const small = foldableState(8);
+		small.setCollapsed(false);
+		expect(small.processKeyStepsView).toBe(false);
+		expect(small.isStepFolded("t4")).toBe(false);
+
+		const big = foldableState(14);
+		big.setCollapsed(false);
+		expect(big.processKeyStepsView).toBe(true);
+		big.setProcessKeySteps(false);
+		expect(big.processKeyStepsView).toBe(false);
+		expect(big.isStepFolded("t5")).toBe(false);
+		expect(big.processFoldHiddenCount()).toBe(0);
+	});
+
+	it("the fold row renders from the carrying tool component", () => {
+		const state = foldableState(14);
+		state.setCollapsed(false);
+		const tool = new ToolExecutionComponent(
+			"bash",
+			"t4",
+			{},
+			{},
+			undefined,
+			{ requestRender: vi.fn() } as unknown as TUI,
+			"/tmp",
+		);
+		tool.setTurnActivity(state);
+		tool.setExpanded(false);
+		const rendered = tool
+			.render(120)
+			.join("\n")
+			.replace(/\u001b\[[0-9;]*m/g, "");
+		expect(rendered).toContain("⋯ 中间 8 步");
+
+		const middle = new ToolExecutionComponent(
+			"bash",
+			"t5",
+			{},
+			{},
+			undefined,
+			{ requestRender: vi.fn() } as unknown as TUI,
+			"/tmp",
+		);
+		middle.setTurnActivity(state);
+		middle.setExpanded(false);
+		expect(middle.render(120)).toEqual([]);
+	});
+
+	it("re-arming the key-steps view after lifting works", () => {
+		const state = foldableState(14);
+		state.setCollapsed(false);
+		state.setProcessKeySteps(false);
+		state.setProcessKeySteps(true);
+		expect(state.processKeyStepsView).toBe(true);
+		expect(state.isStepFolded("t5")).toBe(true);
+	});
+});
+
+describe("turn comm counter (TUI v4 T6)", () => {
+	beforeAll(() => initTheme("dark"));
+
+	it("lives on the turn state and feeds the quiet footnote", () => {
+		const state = new TurnActivityState(1_000);
+		state.addStep({ toolCallId: "t1", toolName: "bash", args: {}, status: "done" });
+		state.markTurnEnded(1_500);
+		state.addCommMessage();
+		state.addCommMessage();
+		state.addCommMessage();
+
+		const summary = new TurnSummaryComponent(state);
+		summary.setQuiet(true);
+		// The component facade routes into the same counter.
+		summary.addCommMessage();
+		const line = summary
+			.render(120)
+			.join("\n")
+			.replace(/\u001b\[[0-9;]*m/g, "");
+		expect(line).toContain("→ 通讯 4 条");
+		expect(state.commMessageCount).toBe(4);
 	});
 });

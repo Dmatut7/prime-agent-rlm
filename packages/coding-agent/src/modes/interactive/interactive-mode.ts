@@ -8726,8 +8726,22 @@ export class InteractiveMode {
 		if (!global) {
 			const summary = this.latestTurnSummary();
 			if (summary) {
-				const next = summary.state.isCollapsed;
-				summary.setExpanded(next);
+				if (this.settingsManager.getProcessMode() === "quiet") {
+					// TUI v4 T6: a three-state cycle - closed → key steps (first
+					// 3 + ⋯ + last 3 while >8 steps) → all steps → closed.
+					// Legacy keeps the binary toggle.
+					if (summary.state.isCollapsed) {
+						summary.state.setProcessKeySteps(true);
+						summary.setExpanded(true);
+					} else if (summary.state.processKeyStepsView) {
+						summary.state.setProcessKeySteps(false);
+					} else {
+						summary.setExpanded(false);
+					}
+				} else {
+					const next = summary.state.isCollapsed;
+					summary.setExpanded(next);
+				}
 				this.applyTurnExpansion(summary);
 				return;
 			}

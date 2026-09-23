@@ -355,13 +355,19 @@ export class ToolExecutionComponent extends Container {
 
 	private isHiddenByTurnSummary(): boolean {
 		const state = this.turnActivity;
-		if (!state || !state.isCollapsed || this.expanded) {
+		if (!state || this.expanded) {
 			return false;
 		}
-		// Hide only SUCCEEDED steps (第五批: errors never fold). A failed tool's
-		// collapsed ✗ row keeps its readable error on screen, exactly as
-		// pre-U4; a running block also stays live even with a partial result.
-		return state.isStepDone(this.toolCallId);
+		// The block closed: hide only SUCCEEDED steps (第五批: errors never
+		// fold). A failed tool's collapsed ✗ row keeps its readable error on
+		// screen, exactly as pre-U4; a running block also stays live even with
+		// a partial result.
+		if (state.isCollapsed) {
+			return state.isStepDone(this.toolCallId);
+		}
+		// TUI v4 T6: the block is open in the key-steps view (>8 steps) - the
+		// middle settled steps fold behind the ⋯ row; errors never fold.
+		return state.isStepFolded(this.toolCallId);
 	}
 
 	setAgentMessagesExpanded(expanded: boolean): void {
@@ -404,8 +410,18 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	override render(width: number): string[] {
-		if (this.hideComponent || this.isHiddenByTurnSummary()) {
+		if (this.hideComponent) {
 			this.clickRegions = [];
+			return this.hiddenLines;
+		}
+		if (this.isHiddenByTurnSummary()) {
+			this.clickRegions = [];
+			// TUI v4 T6: the first folded step carries the fold row instead of
+			// hiding outright, so the key-steps view stays self-describing.
+			const state = this.turnActivity;
+			if (state?.isProcessFoldRowCarrier(this.toolCallId)) {
+				return [theme.fg("dim", ` ⋯ 中间 ${state.processFoldHiddenCount()} 步`)];
+			}
 			return this.hiddenLines;
 		}
 		// Refresh the animated glyph without rebuilding the whole panel, for as long

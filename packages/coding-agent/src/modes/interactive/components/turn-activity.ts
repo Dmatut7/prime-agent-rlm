@@ -17,6 +17,15 @@ export function turnStepVerb(toolName: string): string {
 }
 
 /**
+ * TUI v4 T6: while the process block is open, turns with MORE than this many
+ * steps render the key-steps view - first 3 + a fold row + last 3 - instead of
+ * every row. Failed and running steps never fold (✗ 永保留).
+ */
+export const PROCESS_FOLD_THRESHOLD = 8;
+/** TUI v4 T6: how many steps each edge of the key-steps window keeps. */
+export const PROCESS_FOLD_EDGE = 3;
+
+/**
  * U4/U6 turn aggregation: one agent turn (every tool call between two user
  * prompts) renders a two-line mechanical surface at the turn head — ① the
  * thinking block header `思考 12.3s` / `思考 5 段 · 96.3s` (one header for the
@@ -100,6 +109,88 @@ export class TurnActivityState {
 	/** Thinking segments counted so far: settled messages plus the streaming one. */
 	get totalThinkingSegments(): number {
 		return this.thinkingSegments + this.liveThinkingSegments;
+	}
+
+	/**
+	 * TUI v4 T6: the turn's agent-to-agent comm count (received agent-message
+	 * rows plus sent agent messages), the one counter both the live and the
+	 * replay paths feed - the footnote reads it off the state, so the two
+	 * paths cannot drift apart (R5-P2②).
+	 */
+	private commMessages = 0;
+	get commMessageCount(): number {
+		return this.commMessages;
+	}
+	addCommMessage(): void {
+		this.commMessages += 1;
+	}
+
+	/**
+	 * TUI v4 T6: the key-steps view of the process block. Armed only while the
+	 * block is open and the turn has more steps than
+	 * {@link PROCESS_FOLD_THRESHOLD}; Ctrl+O's second press lifts it.
+	 */
+	private processKeySteps = false;
+	get processKeyStepsView(): boolean {
+		// The key-steps view only exists while the process block is OPEN; a
+		// closed block hides every settled step the pre-v4 way.
+		return this.processKeySteps && !this.collapsed && this.dedupedStepCount() > PROCESS_FOLD_THRESHOLD;
+	}
+	/** Lift or re-arm the key-steps fold (the wiring owns the key cycle). */
+	setProcessKeySteps(keySteps: boolean): void {
+		this.processKeySteps = keySteps;
+	}
+	private dedupedStepCount(): number {
+		return new Set(this.steps.map((step) => step.toolCallId)).size;
+	}
+	private stepIndexOf(toolCallId: string): number {
+		return this.steps.findIndex((step) => step.toolCallId === toolCallId);
+	}
+	/**
+	 * Whether the step folds away in the key-steps view: middle range, settled
+	 * successfully, and past the threshold. Errors and running steps never
+	 * fold; the first/last {@link PROCESS_FOLD_EDGE} steps stay.
+	 */
+	isStepFolded(toolCallId: string): boolean {
+		if (!this.processKeyStepsView) {
+			return false;
+		}
+		const index = this.stepIndexOf(toolCallId);
+		if (index < PROCESS_FOLD_EDGE || index >= this.steps.length - PROCESS_FOLD_EDGE) {
+			return false;
+		}
+		return this.steps[index]?.status === "done";
+	}
+	/** The first folded step carries the `⋯ 中间 N 步` fold row. */
+	isProcessFoldRowCarrier(toolCallId: string): boolean {
+		if (!this.processKeyStepsView) {
+			return false;
+		}
+		for (let index = 0; index < this.steps.length; index++) {
+			if (this.isStepFoldedAtIndex(index)) {
+				return this.steps[index]?.toolCallId === toolCallId;
+			}
+		}
+		return false;
+	}
+	private isStepFoldedAtIndex(index: number): boolean {
+		if (index < PROCESS_FOLD_EDGE || index >= this.steps.length - PROCESS_FOLD_EDGE) {
+			return false;
+		}
+		return this.steps[index]?.status === "done";
+	}
+	/** How many steps the key-steps view folds away. */
+	processFoldHiddenCount(): number {
+		if (!this.processKeyStepsView) {
+			return 0;
+		}
+		let count = 0;
+		for (let index = 0; index < this.steps.length; index++) {
+			if (this.isStepFoldedAtIndex(index)) {
+				count += 1;
+			}
+		}
+		return count;
 	}
 
 	/**
@@ -230,8 +321,6 @@ export class TurnSummaryComponent implements Component {
 	private cachedLines?: string[];
 	/** TUI v4: render the one-line footnote instead of the legacy two-line surface. */
 	private quiet = false;
-	/** TUI v4: agent-to-agent comms inside the turn (received rows + sent). */
-	private commMessages = 0;
 	private footnote?: TurnFootNote;
 
 	constructor(private readonly turnState: TurnActivityState) {}
@@ -251,12 +340,11 @@ export class TurnSummaryComponent implements Component {
 	}
 
 	/**
-	 * TUI v4: one more agent-to-agent comm inside the turn (a received
-	 * agent-message row or a sent agent message). The count only feeds the
-	 * quiet-mode footnote.
+	 * TUI v4 T6: one more agent-to-agent comm inside the turn; the counter now
+	 * lives on the turn state (both the live and replay paths feed it there).
 	 */
 	addCommMessage(): void {
-		this.commMessages += 1;
+		this.turnState.addCommMessage();
 		this.invalidate();
 	}
 
@@ -312,7 +400,7 @@ export class TurnSummaryComponent implements Component {
 		});
 		const steps = new Set(this.turnState.steps.map((step) => step.toolCallId)).size;
 		const thinkSegments = this.turnState.totalThinkingSegments;
-		const commMessages = this.commMessages;
+		const commMessages = this.turnState.commMessageCount;
 		// R5-P2③: an all-zero turn still renders 想了想 - the model is always
 		// reasoning, so a turn with no explicit thinking block counts as one
 		// thought. The footnote component stays a pure props renderer; this
@@ -324,6 +412,14 @@ export class TurnSummaryComponent implements Component {
 			commMessages,
 			durationMs: this.turnState.turnDurationMs(),
 			cols: safeWidth,
+			// P3-2: the caret glyph — ▸ while every detail block is collapsed,
+			// ▾ once any of the three blocks is open (the wiring owns the state).
+			caret:
+				this.turnState.thinkingBlockExpanded ||
+				this.turnState.processBlockExpanded ||
+				this.turnState.commsBlockExpanded
+					? "▾"
+					: "▸",
 		});
 		return this.footnote.render(safeWidth);
 	}
