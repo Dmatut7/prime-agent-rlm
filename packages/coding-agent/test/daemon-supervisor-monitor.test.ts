@@ -9,7 +9,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as orphanProcessModule from "../src/core/orphan-process-journal.js";
 import { getProcessStartId } from "../src/core/session-lease.js";
-import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
+import { DAEMON_CLIENT_STALL_BYTES, type DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import { CommandRecoveryJournal } from "../src/modes/daemon/command-recovery-journal.js";
 import { DaemonCatalogClient } from "../src/modes/daemon/daemon-catalog-process.js";
 import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
@@ -4099,7 +4099,8 @@ describe("daemon worker supervisor monitoring", () => {
 		});
 		const client = {
 			id: "client-1",
-			socket: { destroyed: false, write },
+			// A genuinely stalled client: the queue is past the stall cap, not merely above highWaterMark.
+			socket: { destroyed: false, write, writableLength: DAEMON_CLIENT_STALL_BYTES + 1 },
 			attachedActiveSessionIds: new Set([activeSessionId]),
 			catchupActiveSessionIds: new Set<string>(),
 			backpressured: false,

@@ -159,6 +159,7 @@ import {
 	createActiveSessionId,
 	type DaemonSocketClient,
 	resolveActiveSessionState,
+	writeDaemonClientSocket,
 } from "./active-session-state.js";
 import {
 	passivatedWorkerRosterEntry,
@@ -8923,6 +8924,11 @@ export class AgentDaemon {
 		);
 	}
 
+	/**
+	 * Live frames report false only when the socket is gone or the client is stalled
+	 * past DAEMON_CLIENT_STALL_BYTES. Snapshot frames (a `snapshotPurpose`) report the
+	 * raw write() result so a chunked snapshot paces on "drain" at highWaterMark.
+	 */
 	private writeSerialized(
 		client: DaemonSocketClient,
 		line: string | Buffer,
@@ -8951,11 +8957,8 @@ export class AgentDaemon {
 						typeof line === "string" ? Buffer.from(line) : line,
 					)
 				: line;
-		const accepted = client.socket.write(wireData);
-		if (!accepted) {
-			client.backpressured = true;
-		}
-		return accepted;
+		const accepted = writeDaemonClientSocket(client, wireData);
+		return accepted || (snapshotPurpose === undefined && client.backpressured !== true);
 	}
 
 	private abortSideQuestionsFor(client: DaemonSocketClient, activeSessionId: string): void {

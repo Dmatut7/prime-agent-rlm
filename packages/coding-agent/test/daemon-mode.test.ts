@@ -55,7 +55,11 @@ import {
 	SessionManager,
 } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
-import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
+import {
+	type ActiveSessionState,
+	DAEMON_CLIENT_STALL_BYTES,
+	type DaemonSocketClient,
+} from "../src/modes/daemon/active-session-state.js";
 import {
 	AgentDaemon,
 	cancelPendingExtensionUiRequests,
@@ -3727,7 +3731,12 @@ describe("daemon mode helpers", () => {
 			writes.push(String(data));
 			return writes.length === 1;
 		});
-		const socket = Object.assign(new EventEmitter(), { destroyed: false, write }) as unknown as Socket;
+		// A genuinely stalled client: the queue is past the stall cap, not merely above highWaterMark.
+		const socket = Object.assign(new EventEmitter(), {
+			destroyed: false,
+			write,
+			writableLength: DAEMON_CLIENT_STALL_BYTES + 1,
+		}) as unknown as Socket;
 		const internals = daemon as unknown as {
 			clients: Set<DaemonSocketClient>;
 			sessions: Map<string, ActiveSessionState>;

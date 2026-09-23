@@ -9,19 +9,18 @@ import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
  * and no leaked abort listener. Data chunks stay unbounded (backpressure is real).
  */
 
-type FakeSocket = EventEmitter & { destroyed: boolean };
+type FakeSocket = EventEmitter & { destroyed: boolean; writableLength: number; write: () => boolean };
 
+// write() reports backpressure: the frame never leaves the kernel buffer. Snapshot
+// chunks pace on that raw result even while the queue is far below the stall cap.
 function fakeSocket(): FakeSocket {
-	return Object.assign(new EventEmitter(), { destroyed: false });
+	return Object.assign(new EventEmitter(), { destroyed: false, writableLength: 128 * 1024, write: () => false });
 }
 
 function supervisorWithDeadSocket() {
 	const socket = fakeSocket();
 	const client = { id: "client-1", socket };
-	// writeSerialized reports backpressure: the frame never leaves the kernel buffer.
-	const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
-		writeSerialized: () => false,
-	}) as {
+	const supervisor = Object.create(DaemonSupervisor.prototype) as {
 		writeSnapshotBuffer(
 			client: unknown,
 			buffer: Uint8Array,

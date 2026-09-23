@@ -65,6 +65,28 @@ export interface DaemonSocketClient {
 	capabilitiesByActiveSessionId?: Map<string, Set<DaemonClientCapability>>;
 }
 
+/**
+ * Bytes a client socket may hold queued before the daemon treats the client as
+ * stalled. `socket.write()` returning false only means the queue passed its
+ * highWaterMark (64 KiB), which one large tool result crosses on macOS' 8 KiB
+ * unix-socket buffer; Node still delivers those bytes in order. Only a queue past
+ * this cap switches the client to dropping live events for a catch-up snapshot.
+ */
+export const DAEMON_CLIENT_STALL_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Write to a client socket and return the raw `write()` result, which snapshot
+ * streams use to pace chunks on "drain". Marks the client `backpressured` only
+ * when the queued bytes exceed {@link DAEMON_CLIENT_STALL_BYTES}.
+ */
+export function writeDaemonClientSocket(client: DaemonSocketClient, data: string | Uint8Array): boolean {
+	const accepted = client.socket.write(data);
+	if (!accepted && client.socket.writableLength > DAEMON_CLIENT_STALL_BYTES) {
+		client.backpressured = true;
+	}
+	return accepted;
+}
+
 /** One client's bounded retry budget for catching up one session (C10). */
 export interface ClientCatchupRetryState {
 	/** Consecutive transient catch-up failures; the budget gives up at the policy attempt cap. */

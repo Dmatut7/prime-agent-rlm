@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { describe, expect, it, vi } from "vitest";
-import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
+import { DAEMON_CLIENT_STALL_BYTES, type DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import {
 	DAEMON_PROTOCOL_INFO,
 	type DaemonAttachResult,
@@ -482,7 +482,14 @@ describe("deferred session frames during snapshot streams", () => {
 		const socket = new PassThrough();
 		const client = socketClient(socket, {
 			deferredSessionPayloads: new Map([
-				[activeSessionId, { payloads: [Buffer.alloc(128 * 1024), Buffer.from("later")], bytes: 128 * 1024 + 5 }],
+				[
+					activeSessionId,
+					{
+						// Past the stall cap: the socket is genuinely stalled, not merely above highWaterMark.
+						payloads: [Buffer.alloc(DAEMON_CLIENT_STALL_BYTES + 1), Buffer.from("later")],
+						bytes: DAEMON_CLIENT_STALL_BYTES + 6,
+					},
+				],
 			]),
 		});
 		const internals = supervisor as unknown as {

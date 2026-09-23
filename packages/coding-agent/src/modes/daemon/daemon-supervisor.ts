@@ -81,7 +81,12 @@ import {
 import type { AgentConnectionHeartbeat } from "../agent-connection/types.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import type { PrivateFrame } from "../session-worker/private-framing.js";
-import { createActiveSessionId, type DaemonSocketClient } from "./active-session-state.js";
+import {
+	createActiveSessionId,
+	DAEMON_CLIENT_STALL_BYTES,
+	type DaemonSocketClient,
+	writeDaemonClientSocket,
+} from "./active-session-state.js";
 import {
 	AgentRoster,
 	type AgentRosterEntry,
@@ -348,7 +353,7 @@ const WORKER_RETRY_DELAYS_MS = [250, 1000, 5000] as const;
  * catch-up snapshot instead of buffering without limit.
  */
 const MAX_DEFERRED_SESSION_PAYLOADS = 256;
-const MAX_DEFERRED_SESSION_BYTES = 8 * 1024 * 1024;
+const MAX_DEFERRED_SESSION_BYTES = DAEMON_CLIENT_STALL_BYTES;
 const DEFERRED_RECOVERY_RECHECK_MS = 5000;
 // POSIX: ~2.5 minutes of probing — each round is one 5s defer recheck plus a
 // ~11s three-delay probe pass (3 x (delay + a 1.5s connect probe)). Windows gives
@@ -358,10 +363,10 @@ const MAX_DEFERRED_RECOVERY_ROUNDS = 10;
  * How long a stream-ending snapshot frame waits for a suspended client's socket to
  * drain before the stream gives up and releases what it holds. Mirrors the worker
  * side's WORKER_SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS; data chunks are never bounded.
- * A timeout leaves `client.backpressured` set: the socket genuinely still holds
- * undrained bytes, and the queued resync runs from the `"drain"` handler the
- * moment the client resumes. Do not clear it here — that would let the next
- * write pile onto a stalled socket past the deferred-payload caps.
+ * A timeout leaves `client.backpressured` as the write left it: set once the
+ * queue exceeds DAEMON_CLIENT_STALL_BYTES, and the queued resync runs from the
+ * `"drain"` handler the moment the client resumes. Do not clear it here — that
+ * would let the next write pile onto a stalled socket past the stall cap.
  */
 const SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS = 1_000;
 const STOP_FINALIZATION_RECHECK_MS = 250;
@@ -8236,7 +8241,7 @@ export class DaemonSupervisor {
 		if (client.socket.destroyed || signal?.aborted) {
 			return false;
 		}
-		if (this.writeSerialized(client, buffer)) {
+		if (this.writeSerialized(client, buffer, "snapshot")) {
 			return true;
 		}
 		if (signal?.aborted) return false;
@@ -10017,15 +10022,21 @@ export class DaemonSupervisor {
 		}
 	}
 
-	private writeSerialized(client: DaemonSocketClient, line: string | Uint8Array): boolean {
+	/**
+	 * Live frames report false only when the socket is gone or the client is stalled
+	 * past DAEMON_CLIENT_STALL_BYTES. Snapshot frames report the raw write() result so
+	 * a chunked snapshot paces on "drain" at highWaterMark.
+	 */
+	private writeSerialized(
+		client: DaemonSocketClient,
+		line: string | Uint8Array,
+		pacing: "live" | "snapshot" = "live",
+	): boolean {
 		if (client.socket.destroyed) {
 			return false;
 		}
-		const accepted = client.socket.write(line);
-		if (!accepted) {
-			client.backpressured = true;
-		}
-		return accepted;
+		const accepted = writeDaemonClientSocket(client, line);
+		return accepted || (pacing === "live" && client.backpressured !== true);
 	}
 
 	private registerSignalHandlers(): void {
