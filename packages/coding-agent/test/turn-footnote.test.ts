@@ -3,20 +3,24 @@ import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, it } from "vitest";
 import { KeybindingsManager as AppKeybindingsManager } from "../src/core/keybindings.js";
 import {
+	TURN_FOOT_NOTE_CARETS,
 	TURN_FOOT_NOTE_NARROW_COLS,
 	TurnFootNote,
 	type TurnFootNoteProps,
 	turnFootNoteDurationText,
 } from "../src/modes/interactive/components/turn-footnote.js";
-import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
+import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
 /** The v4 prototype's reference turn: 1m05s, 14 steps, 7 thinking segments, 2 comms. */
 const reference = { steps: 14, thinkSegments: 7, commMessages: 2, durationMs: 65_000 };
 
-const WIDE_LINE = "干了 1 分 05 秒 · 14 步 [O] · 想 7 段 [T] · → 通讯 2 条 [P]";
-const NARROW_LINE = "干了 1分05秒 · 14步 · 7想 · 2讯";
-/** The reference line with every key hint stripped (the overwide fallback body). */
-const BARE_LINE = "干了 1 分 05 秒 · 14 步 · 想 7 段 · → 通讯 2 条";
+const BODY_WIDE = "干了 1 分 05 秒 · 14 步 [O] · 想 7 段 [T] · → 通讯 2 条 [P]";
+const BODY_NARROW = "干了 1分05秒 · 14步 · 7想 · 2讯";
+/** The reference body with every key hint stripped (the overwide fallback). */
+const BODY_BARE = "干了 1 分 05 秒 · 14 步 · 想 7 段 · → 通讯 2 条";
+/** Indent-aligned lines: the body starts one column in (P3), caret-less. */
+const WIDE_LINE = ` ${BODY_WIDE}`;
+const NARROW_LINE = ` ${BODY_NARROW}`;
 
 function renderLine(props: TurnFootNoteProps): string {
 	const note = new TurnFootNote(props);
@@ -31,8 +35,9 @@ describe("turn footnote (TUI v4 T2b)", () => {
 		const lines = note.render(120);
 		expect(lines).toHaveLength(1);
 		expect(stripAnsi(lines[0] ?? "")).toBe(WIDE_LINE);
-		// Key hints carry the accent color (the terminal stand-in for 小号高亮).
-		expect(lines[0]).toContain(theme.fg("accent", " [O]"));
+		// Key hints carry the prototype accent blue #6ba7ff (P3), in the
+		// theme's active color depth: truecolor RGB, or xterm 75 in 256-color.
+		expect(lines[0]).toMatch(/\x1b\[38;2;107;167;255m \[O\]\x1b\[39m|\x1b\[38;5;75m \[O\]\x1b\[39m/);
 	});
 
 	it("formats the three duration tiers, wide and narrow", () => {
@@ -58,17 +63,17 @@ describe("turn footnote (TUI v4 T2b)", () => {
 
 	it("omits zero-value segments instead of rendering zero counts", () => {
 		expect(renderLine({ steps: 14, thinkSegments: 0, commMessages: 0, durationMs: 45_000, cols: 120 })).toBe(
-			"干了 45 秒 · 14 步 [O]",
+			" 干了 45 秒 · 14 步 [O]",
 		);
 		expect(renderLine({ steps: 0, thinkSegments: 7, commMessages: 2, durationMs: 45_000, cols: 120 })).toBe(
-			"干了 45 秒 · 想 7 段 [T] · → 通讯 2 条 [P]",
+			" 干了 45 秒 · 想 7 段 [T] · → 通讯 2 条 [P]",
 		);
 		expect(renderLine({ steps: 0, thinkSegments: 0, commMessages: 2, durationMs: 45_000, cols: 120 })).toBe(
-			"干了 45 秒 · → 通讯 2 条 [P]",
+			" 干了 45 秒 · → 通讯 2 条 [P]",
 		);
 		// The narrow form omits the same way.
 		expect(renderLine({ steps: 14, thinkSegments: 0, commMessages: 0, durationMs: 45_000, cols: 80 })).toBe(
-			"干了 45秒 · 14步",
+			" 干了 45秒 · 14步",
 		);
 	});
 
@@ -79,8 +84,8 @@ describe("turn footnote (TUI v4 T2b)", () => {
 
 	it("renders 想了想 for a thinking-only turn, both widths", () => {
 		const thinkingOnly = { steps: 0, thinkSegments: 3, commMessages: 0, durationMs: 36_300 };
-		expect(renderLine({ ...thinkingOnly, cols: 120 })).toBe("想了想");
-		expect(renderLine({ ...thinkingOnly, cols: 80 })).toBe("想了想");
+		expect(renderLine({ ...thinkingOnly, cols: 120 })).toBe(" 想了想");
+		expect(renderLine({ ...thinkingOnly, cols: 80 })).toBe(" 想了想");
 	});
 
 	it("drops every key hint first when the line overflows, without an ellipsis", () => {
@@ -101,25 +106,25 @@ describe("turn footnote (TUI v4 T2b)", () => {
 		}).render(102);
 		expect(lines).toHaveLength(1);
 		const line = stripAnsi(lines[0] ?? "");
-		const bare = `干了 1 时 07 分 · ${max} 步 · 想 ${max} 段 · → 通讯 ${max} 条`;
+		const bare = ` 干了 1 时 07 分 · ${max} 步 · 想 ${max} 段 · → 通讯 ${max} 条`;
 		expect(line).toBe(bare);
-		expect(visibleWidth(line)).toBe(91);
+		expect(visibleWidth(line)).toBe(92);
 		expect(line).not.toContain("[O]");
 		expect(line).not.toContain("[T]");
 		expect(line).not.toContain("[P]");
 		expect(line).not.toContain("…");
-		// One column wider and the hints come back.
+		// Two columns wider (the indent column costs one) and the hints come back.
 		const withKeys = stripAnsi(
 			new TurnFootNote({
 				steps: max,
 				thinkSegments: max,
 				commMessages: max,
 				durationMs: 4_020_000,
-				cols: 103,
-			}).render(103)[0] ?? "",
+				cols: 104,
+			}).render(104)[0] ?? "",
 		);
-		expect(withKeys).toBe(`干了 1 时 07 分 · ${max} 步 [O] · 想 ${max} 段 [T] · → 通讯 ${max} 条 [P]`);
-		expect(visibleWidth(withKeys)).toBe(103);
+		expect(withKeys).toBe(` 干了 1 时 07 分 · ${max} 步 [O] · 想 ${max} 段 [T] · → 通讯 ${max} 条 [P]`);
+		expect(visibleWidth(withKeys)).toBe(104);
 	});
 
 	it("truncates at display columns (CJK = 2), not character counts", () => {
@@ -129,7 +134,7 @@ describe("turn footnote (TUI v4 T2b)", () => {
 		const lines = new TurnFootNote({ ...reference, cols: 27 }).render(27);
 		const line = stripAnsi(lines[0] ?? "");
 		expect(line.endsWith("…")).toBe(true);
-		expect(line.startsWith("干了")).toBe(true);
+		expect(line.startsWith(" 干了")).toBe(true);
 		expect(visibleWidth(line)).toBeLessThanOrEqual(27);
 	});
 
@@ -158,30 +163,39 @@ describe("turn footnote (TUI v4 T2b)", () => {
 
 	it("respects showKeys=false by never rendering hints", () => {
 		const line = renderLine({ ...reference, cols: 120, showKeys: false });
-		expect(line).toBe(BARE_LINE);
+		expect(line).toBe(` ${BODY_BARE}`);
 		expect(renderLine({ ...reference, cols: 120, showKeys: true })).toBe(WIDE_LINE);
 	});
 
-	it("prepends the optional caret and counts it against the column budget", () => {
-		const line = renderLine({ ...reference, cols: 120, caret: "▸" });
-		expect(line).toBe(`▸${WIDE_LINE}`);
-		// The caret consumes a column: at 59 columns the full line no longer
-		// fits even though a caretless footnote would.
+	it("renders the caret in the indent column and counts it against the budget (P3)", () => {
+		// The canonical glyphs: ▸ while every block is collapsed, ▾ once any
+		// of the three detail blocks is open (the wiring owns the flip).
+		expect(TURN_FOOT_NOTE_CARETS.collapsed).toBe("▸");
+		expect(TURN_FOOT_NOTE_CARETS.expanded).toBe("▾");
+		// The caret occupies the indent column - the body column does not move.
+		expect(renderLine({ ...reference, cols: 120, caret: TURN_FOOT_NOTE_CARETS.collapsed })).toBe(`▸${BODY_WIDE}`);
+		expect(renderLine({ ...reference, cols: 120, caret: TURN_FOOT_NOTE_CARETS.expanded })).toBe(`▾${BODY_WIDE}`);
+		// The caret consumes its column: at 59 columns the full line no longer
+		// fits even though a caretless footnote would (body bare at 47+1=48).
 		const withCaret = stripAnsi(new TurnFootNote({ ...reference, cols: 59, caret: "▸" }).render(59)[0] ?? "");
 		expect(visibleWidth(withCaret)).toBeLessThanOrEqual(59);
 		expect(withCaret.startsWith("▸")).toBe(true);
-		// Default: no caret.
-		expect(renderLine({ ...reference, cols: 120 })).toBe(WIDE_LINE);
+		// Default: no caret, a plain space keeps the indent column.
+		expect(renderLine({ ...reference, cols: 120 })).toBe(` ${BODY_WIDE}`);
+		// Degenerate terminal: the caret column alone fills the width - the
+		// line stays bounded instead of overflowing.
+		const tiny = stripAnsi(new TurnFootNote({ ...reference, cols: 1, caret: "▸" }).render(1)[0] ?? "");
+		expect(visibleWidth(tiny)).toBeLessThanOrEqual(1);
 	});
 
 	it("truncates the 空态 line when the terminal is narrower than 想了想", () => {
-		// 想了想 is 3 characters but 6 display columns: at 3 columns only the
-		// first wide character plus the ellipsis survive.
+		// 想了想 is 3 characters but 6 display columns: at 3 columns (one
+		// spent on the indent) only the ellipsis survives beside the indent.
 		const line = stripAnsi(
 			new TurnFootNote({ steps: 0, thinkSegments: 2, commMessages: 0, durationMs: 1_000, cols: 3 }).render(3)[0] ??
 				"",
 		);
-		expect(line).toBe("想…");
+		expect(line).toBe(" …");
 		expect(visibleWidth(line)).toBeLessThanOrEqual(3);
 	});
 
@@ -189,7 +203,7 @@ describe("turn footnote (TUI v4 T2b)", () => {
 		const note = new TurnFootNote({ ...reference, cols: 120 });
 		expect(stripAnsi(note.render(120)[0] ?? "")).toBe(WIDE_LINE);
 		note.update({ steps: 2, thinkSegments: 0, commMessages: 0, durationMs: 165_000, cols: 120 });
-		expect(stripAnsi(note.render(120)[0] ?? "")).toBe("干了 2 分 45 秒 · 2 步 [O]");
+		expect(stripAnsi(note.render(120)[0] ?? "")).toBe(" 干了 2 分 45 秒 · 2 步 [O]");
 		// cols <= 0 defers to the protocol width: wide at 120, narrow at 80.
 		const fallback = new TurnFootNote({ ...reference, cols: 0 });
 		expect(stripAnsi(fallback.render(120)[0] ?? "")).toBe(WIDE_LINE);

@@ -6,16 +6,26 @@ import { keyText } from "./keybinding-hints.js";
  * TUI v4 quiet conversation (T2b): the per-turn footnote. One line under the
  * turn's final answer that carries all process stats the v4 conversation flow
  * removed - `干了 1 分 05 秒 · 14 步 [O] · 想 7 段 [T] · → 通讯 2 条 [P]` - with
- * the key hints in accent and the rest dim. Narrow screens (<100 columns,
- * R2.1: 100 exactly keeps the full form) switch to the compressed form
- * `干了 1分05秒 · 14步 · 7想 · 2讯`; a thinking-only turn shows `想了想`; an
- * all-zero turn renders nothing. When the line overflows, the key hints go
- * first, then the text truncates at the right edge by display columns
- * (CJK = 2 columns).
+ * the key hints in the prototype's accent blue and the rest dim. Narrow
+ * screens (<100 columns, R2.1: 100 exactly keeps the full form) switch to the
+ * compressed form `干了 1分05秒 · 14步 · 7想 · 2讯`; a thinking-only turn shows
+ * `想了想`; an all-zero turn renders nothing. When the line overflows, the key
+ * hints go first, then the text truncates at the right edge by display
+ * columns (CJK = 2 columns). The body starts one column in, aligned with the
+ * turn-head aggregate lines; a caret glyph (P3: ▸ collapsed / ▾ once any
+ * detail block is open, passed by the wiring) occupies that column.
  */
 
 /** Below this column count the footnote switches to the compressed narrow form (R2.1: the boundary itself stays wide). */
 export const TURN_FOOT_NOTE_NARROW_COLS = 100;
+
+/**
+ * The canonical caret glyphs (P3): ▸ while every detail block is collapsed,
+ * ▾ once any of the three blocks is open. The wiring owns the state and
+ * passes the glyph via `props.caret`; the component never renders a caret by
+ * default.
+ */
+export const TURN_FOOT_NOTE_CARETS = { collapsed: "▸", expanded: "▾" } as const;
 
 /** Turn statistics the footnote summarizes; counts are non-negative, duration in ms. */
 export interface TurnFootNoteProps {
@@ -31,7 +41,7 @@ export interface TurnFootNoteProps {
 	cols: number;
 	/** Whether to render the [O]/[T]/[P] key hints (default true). Overwide lines drop them first. */
 	showKeys?: boolean;
-	/** Optional caret glyph (e.g. `▸`) prepended to the line; the wiring owns it. Default: none. */
+	/** Optional caret glyph (▸/▾) rendered in the line's indent column; the wiring owns the state. Default: none. */
 	caret?: string;
 }
 
@@ -61,6 +71,22 @@ function segmentHint(appKey: Keybinding, fallback: string): string {
 	const display = keyText(appKey, { primaryOnly: true });
 	const last = display.split("+").pop()?.trim() ?? "";
 	return last ? ` [${last}]` : fallback;
+}
+
+/**
+ * The key-hint highlight (P3): the v4 prototype's --accent blue, #6ba7ff. No
+ * terminal theme variable carries that exact color (the dark theme's accent
+ * slot is #8abeb7 and adaptively blends toward purple), so the literal from
+ * the prototype applies, in the theme's active color depth; 256-color
+ * terminals approximate it as xterm cube index 75.
+ */
+const KEY_HINT_COLOR = { rgb: { r: 107, g: 167, b: 255 }, ansi256: 75 } as const;
+
+function keyHintFg(text: string): string {
+	if (theme.colorMode === "truecolor") {
+		return `\x1b[38;2;${KEY_HINT_COLOR.rgb.r};${KEY_HINT_COLOR.rgb.g};${KEY_HINT_COLOR.rgb.b}m${text}\x1b[39m`;
+	}
+	return `\x1b[38;5;${KEY_HINT_COLOR.ansi256}m${text}\x1b[39m`;
 }
 
 /**
@@ -127,9 +153,19 @@ export class TurnFootNote implements Component {
 			steps <= 0 && commMessages <= 0
 				? [{ text: "想了想" }]
 				: this.buildSegments(steps, thinkSegments, commMessages, durationMs, narrow);
+		// P3 indent alignment: the body starts one column in, level with the
+		// turn-head aggregate lines (` ⚙ N 步`); the caret glyph occupies that
+		// column when the wiring passes one, a plain space otherwise.
 		const caret = this.props.caret ?? "";
-		const budget = Math.max(1, cols - visibleWidth(caret));
-		return [caret + this.fitSegments(segments, narrow, budget)];
+		const indent = caret !== "" ? caret : " ";
+		const indentWidth = visibleWidth(indent);
+		if (indentWidth >= cols) {
+			// Degenerate terminal: the indent column alone fills the width -
+			// keep the line bounded instead of overflowing.
+			return [theme.fg("dim", truncateToWidth(indent, cols, "…"))];
+		}
+		const styledIndent = caret !== "" ? theme.fg("dim", caret) : " ";
+		return [styledIndent + this.fitSegments(segments, narrow, cols - indentWidth)];
 	}
 
 	/**
@@ -175,7 +211,7 @@ export class TurnFootNote implements Component {
 		const plain = segments.map((s) => s.text + (showKeys && s.hint ? s.hint : "")).join(joiner);
 		if (visibleWidth(plain) <= budget) {
 			return segments
-				.map((s) => theme.fg("dim", s.text) + (showKeys && s.hint ? theme.fg("accent", s.hint) : ""))
+				.map((s) => theme.fg("dim", s.text) + (showKeys && s.hint ? keyHintFg(s.hint) : ""))
 				.join(theme.fg("dim", joiner));
 		}
 		const bare = segments.map((s) => s.text).join(joiner);
