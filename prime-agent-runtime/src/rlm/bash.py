@@ -57,11 +57,39 @@ _current_cell: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 _cell_handles: dict[str, set["BashHandle"]] = {}
 
 
+class OutputText(str):
+    """Command output that also answers ``r.output()``, the handle's spelling."""
+
+    def __call__(self) -> str:
+        return str(self)
+
+
+async def _resolved(value: Any) -> Any:
+    return value
+
+
 @dataclass(frozen=True)
 class BashResult:
+    """A finished command. Tolerates the handle's spellings the model reaches for.
+
+    ``r.output()`` works like ``r.output``, ``r.duration_ms`` mirrors ``duration``
+    in milliseconds, and awaiting a result again returns it unchanged.
+    """
+
     exit_code: int
     output: str
     duration: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.output, OutputText):
+            object.__setattr__(self, "output", OutputText(self.output))
+
+    @property
+    def duration_ms(self) -> int:
+        return round(self.duration * 1000)
+
+    def __await__(self) -> Generator[Any, None, "BashResult"]:
+        return _resolved(self).__await__()
 
 
 class _BoundedBuffer:
@@ -274,6 +302,22 @@ class BashHandle:
     def output(self) -> str:
         self._released = True
         return self._buffer.text()
+
+    @property
+    def exit_code(self) -> int | None:
+        """The exit code once the command finished, None while it runs."""
+        self._released = True
+        return self._result.exit_code if self._done.is_set() and self._result else None
+
+    @property
+    def duration(self) -> float | None:
+        self._released = True
+        return self._result.duration if self._done.is_set() and self._result else None
+
+    @property
+    def duration_ms(self) -> int | None:
+        duration = self.duration
+        return None if duration is None else round(duration * 1000)
 
     def tail(self, n: int = 50) -> str:
         self._released = True

@@ -325,4 +325,17 @@ describeIfKernel("RLM bootstrap (real kernel)", () => {
 			await manager.shutdown({ snapshot: true, drainHostRequests: true });
 		}
 	}, 60_000);
+	it("binds the standard modules the prompt teaches before the first cell", () => {
+		const code = buildRlmBootstrapCode();
+		for (const statement of [
+			"import json",
+			"import os",
+			"import re",
+			"import shlex",
+			"import sys",
+			"from pathlib import Path",
+		]) {
+			expect(code).toContain(statement);
+		}
+	});
 });

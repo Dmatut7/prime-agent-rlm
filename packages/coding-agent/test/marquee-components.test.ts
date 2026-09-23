@@ -145,7 +145,7 @@ describe("marquee TUI components", () => {
 		const component = new IPythonCellComponent(state);
 
 		const collapsed = stripAnsi(component.render(100).join("\n"));
-		expect(collapsed).toContain("cat /tmp/missing-file");
+		expect(collapsed).toContain("读取 missing-file");
 		expect(collapsed).toContain("CalledProcessError");
 		expect(collapsed).not.toContain("No such file or directory");
 		expect(collapsed).not.toContain("returned non-zero exit status 1.");

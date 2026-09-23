@@ -10,8 +10,12 @@ import type { AgentConnectionToolDefinition } from "../../agent-connection/index
 import { type Theme, theme } from "../theme/theme.js";
 import { getWorkingPulseFrame, workingIconFrame } from "../theme/working-icon.js";
 import { getIpythonCodeFromArgs, IPythonCellComponent } from "./ipython-cell.js";
+import { quietConversationBudget } from "./tool-output-budget.js";
 import { ToolPanel } from "./tool-panel.js";
 import type { TurnActivityState } from "./turn-activity.js";
+
+/** Columns a quiet turn's steps are indented under its process line. */
+const STEP_INSET = 2;
 
 export interface ToolExecutionOptions {
 	shouldAddLeadingSpace?: () => boolean;
@@ -437,7 +441,9 @@ export class ToolExecutionComponent extends Container {
 		if (this.isStatusAnimating() && !this.usesSelfRenderShell()) {
 			this.contentPanel.setHeader(this.panelHeader());
 		}
-		const lines = super.render(width);
+		// Steps of a quiet turn sit indented under the turn's process line.
+		const inset = this.turnActivity && quietConversationBudget() && width > STEP_INSET + 8 ? STEP_INSET : 0;
+		const lines = this.insetLines(super.render(width - inset), inset);
 		// The header row toggles only this component: panel header line for the
 		// default shell, the fixed summary line for self-rendered ipython cells.
 		// That ipython shell prepends a blank row, so aggregated child regions
@@ -446,11 +452,32 @@ export class ToolExecutionComponent extends Container {
 		this.clickRegions =
 			lines.length > 0
 				? [
-						...this.clickRegions.map((region) => ({ ...region, line: region.line + leadingBlank })),
+						...this.clickRegions.map((region) => ({
+							...region,
+							line: region.line + leadingBlank,
+							col: region.col + inset,
+						})),
 						{ line: leadingBlank, col: 0, width, height: 1, onClick: () => this.setExpanded(!this.expanded) },
 					]
 				: [];
 		return leadingBlank ? ["", ...lines] : lines;
+	}
+
+	private insetSource?: string[];
+	private insetResult?: string[];
+
+	private insetLines(lines: string[], inset: number): string[] {
+		if (inset === 0 || lines.length === 0) {
+			return lines;
+		}
+		// Memoized on the child array's identity so an unchanged step keeps
+		// handing the parent the same array.
+		if (this.insetSource !== lines || !this.insetResult) {
+			const pad = " ".repeat(inset);
+			this.insetSource = lines;
+			this.insetResult = lines.map((line) => pad + line);
+		}
+		return this.insetResult;
 	}
 
 	private isStatusAnimating(): boolean {

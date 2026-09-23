@@ -23,10 +23,10 @@ export const EXPANDED_TOOL_OUTPUT_MAX_LINES = 40;
 export const EXPANDED_TOOL_OUTPUT_MAX_CHARS = 6000;
 /**
  * TUI v4 T7 (R2.4): the quiet conversation pins the per-step window tighter -
- * at most a dozen lines - so one expanded step cannot flood the quiet face.
+ * at most six lines - so one expanded step cannot flood the quiet face.
  * `app.tools.expandFull` (alt+shift+O) still lifts the whole budget.
  */
-export const QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES = 12;
+export const QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES = 6;
 
 let fullToolOutput = false;
 let quietConversation = false;

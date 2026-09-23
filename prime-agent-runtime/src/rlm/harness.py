@@ -18,6 +18,7 @@ import unicodedata
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import Generator
 from typing import Any, Literal, Mapping, NamedTuple, Sequence
 
 HarnessKind = Literal["prompt", "memory", "skill", "subagent"]
@@ -361,8 +362,26 @@ def _write_private_json_atomic(path: Path, data: dict[str, Any]) -> None:
             pass
 
 
+async def _resolved(value: Any) -> Any:
+    return value
+
+
+class _AwaitableResult:
+    """Harness calls are synchronous; awaiting one anyway returns the same value."""
+
+    def __await__(self) -> Generator[Any, None, Any]:
+        return _resolved(self).__await__()
+
+
+class AwaitableText(str):
+    """A synchronous harness string result that also tolerates ``await``."""
+
+    def __await__(self) -> Generator[Any, None, "AwaitableText"]:
+        return _resolved(self).__await__()
+
+
 @dataclass
-class HarnessEntry:
+class HarnessEntry(_AwaitableResult):
     """A reusable prompt, memory, skill, or subagent record."""
 
     id: str
@@ -381,7 +400,7 @@ class HarnessEntry:
 
 
 @dataclass
-class RefinementEvent:
+class RefinementEvent(_AwaitableResult):
     """A recorded online harness-refinement pass."""
 
     id: str
@@ -1245,7 +1264,7 @@ class HarnessState:
                 lines.append(f"  - [{event.id}] {event.trigger}: {', '.join(event.changes)}")
         else:
             lines.append("refinements: 0")
-        return "\n".join(lines)
+        return AwaitableText("\n".join(lines))
 
     def search(
         self,

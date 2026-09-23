@@ -751,8 +751,14 @@ export class IPythonCellComponent implements Component {
 			shown = all.slice(0, QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES);
 			heldBack = all.length - QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES;
 		}
+		// The quiet window shows each output line on one row; the full view wraps.
+		const clip = quietConversationBudget() && !toolOutputFull();
 		for (const line of shown) {
-			this.addWrapped(lines, OUTPUT_INDENT, theme.fg(color, line || " "), width);
+			if (clip) {
+				lines.push(truncateToWidth(` ${OUTPUT_INDENT}${theme.fg(color, line || " ")}`, width, "…"));
+			} else {
+				this.addWrapped(lines, OUTPUT_INDENT, theme.fg(color, line || " "), width);
+			}
 		}
 		if (heldBack > 0) {
 			this.addWrapped(

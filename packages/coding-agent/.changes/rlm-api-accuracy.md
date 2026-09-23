@@ -1,0 +1,4 @@
+- Fixed the RLM prompt teaching Python API that does not exist (BashResult vs handle fields, synchronous harness calls, subagent row fields, skill call forms), with a test that checks every taught name against the runtime.
+- Changed the kernel to pre-import `json`, `os`, `re`, `shlex`, `sys` and `Path`, which the prompt tells the model to use.
+- Changed the kernel runtime to accept the spellings models reach for most (`r.duration_ms`, `r.output()`, `h.exit_code`, awaiting harness calls, `.get()`/`.name` on subagent records).
+- Changed expanded quiet-mode steps to show at most six output lines, one row each, indented under the turn's process line.

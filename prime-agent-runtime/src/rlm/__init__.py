@@ -11,8 +11,21 @@ from typing import Any
 from .bash import BashHandle, BashResult, bash
 from .harness import HarnessEntry, HarnessScope, HarnessState, RefinementEvent, get_harness_state
 
+class _RecordAccess:
+    """Dict-style reads on the frozen records, which models often reach for."""
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+    def __getitem__(self, key: str) -> Any:
+        try:
+            return getattr(self, key)
+        except AttributeError:
+            raise KeyError(key) from None
+
+
 @dataclass(frozen=True)
-class RLMSpawnHandle:
+class RLMSpawnHandle(_RecordAccess):
     rlm_child_id: str
     name: str
     session_dir: Path
@@ -20,7 +33,7 @@ class RLMSpawnHandle:
 
 
 @dataclass(frozen=True)
-class RLMModel:
+class RLMModel(_RecordAccess):
     provider: str
     id: str
     name: str
@@ -28,13 +41,18 @@ class RLMModel:
 
 
 @dataclass(frozen=True)
-class RLMSubagent:
+class RLMSubagent(_RecordAccess):
     rlm_child_id: str
     active_session_id: str | None
     session_id: str | None
     session_name: str
     session_dir: Path
     status: str
+
+    @property
+    def name(self) -> str:
+        """The spawn handle's spelling of ``session_name``."""
+        return self.session_name
 
 
 @dataclass(frozen=True)
@@ -53,7 +71,7 @@ class RLMChildStallAbort:
 
 
 @dataclass(frozen=True)
-class RLMChildResult:
+class RLMChildResult(_RecordAccess):
     """Terminal or in-progress state of one direct child, from `collect()`.
 
     ``status`` is the raw run status and reads "done" for a child the stall
@@ -77,6 +95,11 @@ class RLMChildResult:
     terminal_kind: str | None
     terminal_reason: str | None
     stall_abort: RLMChildStallAbort | None
+
+    @property
+    def name(self) -> str | None:
+        """The spawn handle's spelling of ``session_name``."""
+        return self.session_name
 
 
 def _spawn_handle_from_payload(payload: Any) -> RLMSpawnHandle:

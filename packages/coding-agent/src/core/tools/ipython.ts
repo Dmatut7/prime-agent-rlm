@@ -27,8 +27,16 @@ import { manifestPathIn, type RestoreResult, type SnapshotResult, snapshotPathIn
 import type { PythonSkillRuntimeInfo } from "../skills.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 
+// The standard modules the prompt teaches (\`shlex.quote\`, \`json.dumps\`, \`os.chdir\`, Path)
+// are bound up front, so following the prompt never starts with a NameError.
 const RLM_BOOTSTRAP_HEADER_CODE = `
 import asyncio
+import json
+import os
+import re
+import shlex
+import sys
+from pathlib import Path
 import os as _prime_agent_os
 
 _prime_agent_os.environ["NO_COLOR"] = "1"

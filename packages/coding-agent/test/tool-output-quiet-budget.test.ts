@@ -8,7 +8,7 @@ import {
 
 /**
  * TUI v4 batch 2 / T7 (R2.4): the quiet conversation pins the per-step
- * expanded output window to a dozen lines with an "N more lines" tail;
+ * expanded output window to six lines with an "N more lines" tail;
  * `app.tools.expandFull` (alt+shift+O) still lifts the whole budget.
  */
 describe("quiet per-step output window (TUI v4 T7)", () => {
@@ -16,14 +16,14 @@ describe("quiet per-step output window (TUI v4 T7)", () => {
 		setQuietConversationBudget(false);
 	});
 
-	it("caps the expanded window at 12 lines in quiet mode and reports the holdback", () => {
+	it("caps the expanded window at the quiet line budget and reports the holdback", () => {
 		const lines = Array.from({ length: 40 }, (_, index) => `line ${index + 1}`);
 		setQuietConversationBudget(true);
 		const window = expandedOutputWindow(lines);
 		expect(window.lines).toHaveLength(QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES);
-		expect(window.skippedLines).toBe(28);
+		expect(window.skippedLines).toBe(40 - QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES);
 		expect(window.truncated).toBe(true);
-		expect(expandedOutputSkippedDetail(window)).toBe("28 more lines");
+		expect(expandedOutputSkippedDetail(window)).toBe(`${40 - QUIET_EXPANDED_TOOL_OUTPUT_MAX_LINES} more lines`);
 	});
 
 	it("keeps the legacy 40-line window when quiet mode is off", () => {

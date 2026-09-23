@@ -59,6 +59,47 @@ function looksLikePath(value: string): boolean {
 	return /[/\\]/.test(value) || /\.[A-Za-z0-9]{1,6}$/.test(value);
 }
 
+const PYTHON_SUBPROCESS_LIST_PATTERN = /\bsubprocess\.(?:run|check_output|check_call|call|Popen)\(\s*\[([^\]]*)\]/g;
+const PYTHON_SUBPROCESS_STRING_PATTERN =
+	/\b(?:subprocess\.(?:run|check_output|check_call|call|Popen)|os\.system)\(\s*[rRfF]?("""|'''|"|')([\s\S]*?)\1/g;
+
+function shellWords(command: string): string[] {
+	return [...command.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map((match) => match[1] ?? match[2] ?? match[3] ?? "");
+}
+
+/**
+ * A shell command in plain words: searches, listings and file reads say what
+ * they look at (`搜索 wrapTextWithAnsi`, `列目录 packages`, `读取 text.ts`);
+ * anything else reads `运行 <command>`.
+ */
+export function describeShellCommand(command: string): string {
+	const segments = command.split(/&&|;|\|\|/).map((segment) => segment.trim());
+	const main = segments.find((segment) => segment && !/^(?:cd|export|set|source)\b/.test(segment)) ?? command.trim();
+	const words = shellWords(main.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, ""));
+	const tool = pathTail(words[0] ?? "");
+	const args = words.slice(1).filter((word) => !word.startsWith("-") && word !== "|");
+	switch (tool) {
+		case "grep":
+		case "rg":
+		case "ag":
+		case "ack":
+			return args[0] ? `搜索 ${args[0]}` : `运行 ${main}`;
+		case "ls":
+		case "tree":
+			return `列目录 ${pathTail(args.at(-1) ?? ".")}`;
+		case "find":
+		case "fd":
+			return `查找 ${pathTail(args[0] ?? ".")}`;
+		case "cat":
+		case "head":
+		case "tail":
+		case "less":
+			return args.length > 0 ? `读取 ${pathTail(args.at(-1) ?? "")}` : `运行 ${main}`;
+		default:
+			return `运行 ${main}`;
+	}
+}
+
 /** Effects a single step label joins at most. */
 const MAX_CELL_EFFECTS = 3;
 
@@ -88,7 +129,14 @@ function pythonEffects(code: string): string[] {
 		});
 	for (const match of code.matchAll(PYTHON_BASH_CALL_PATTERN)) {
 		const command = previewBashCommand(substituteVars(match[2] ?? "")).text;
-		if (command) push(match.index, `运行 ${command}`);
+		if (command) push(match.index, describeShellCommand(command));
+	}
+	for (const match of code.matchAll(PYTHON_SUBPROCESS_LIST_PATTERN)) {
+		const words = [...(match[1] ?? "").matchAll(/["']([^"']*)["']/g)].map((word) => word[1] ?? "");
+		if (words.length > 0) push(match.index, describeShellCommand(words.join(" ")));
+	}
+	for (const match of code.matchAll(PYTHON_SUBPROCESS_STRING_PATTERN)) {
+		if (match[2]) push(match.index, describeShellCommand(substituteVars(match[2])));
 	}
 	for (const match of code.matchAll(PYTHON_OPEN_VAR_PATTERN)) {
 		const path = match[1] ? stringVars.get(match[1]) : undefined;
@@ -164,7 +212,7 @@ export function turnStepLabel(step: StepLabelInput): string {
 			return effects.slice(0, MAX_CELL_EFFECTS).join("，");
 		}
 		if (preview.language === "bash") {
-			return preview.text ? `运行 ${preview.text}` : "运行命令";
+			return preview.text ? describeShellCommand(preview.text) : "运行命令";
 		}
 		const fileOp = /^(read|write|delete|mkdir|rename|replace|touch) (\S+)$/.exec(preview.text);
 		if (fileOp?.[1] && fileOp[2]) {
@@ -176,7 +224,7 @@ export function turnStepLabel(step: StepLabelInput): string {
 	switch (step.toolName) {
 		case "bash": {
 			const command = argString(step.args, "command");
-			return command ? `运行 ${command.split("\n")[0]}` : "运行命令";
+			return command ? describeShellCommand(command.split("\n")[0] ?? command) : "运行命令";
 		}
 		case "read":
 			return path ? `读取 ${pathTail(path)}` : "读取";

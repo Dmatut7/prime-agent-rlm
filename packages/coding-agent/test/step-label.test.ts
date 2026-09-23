@@ -6,7 +6,7 @@ const cell = (code: string) => ({ toolName: "ipython", args: { code } });
 describe("turnStepLabel", () => {
 	it("labels a %%bash cell with its simplified command", () => {
 		expect(turnStepLabel(cell("%%bash\nnpm run check"))).toBe("运行 npm check");
-		expect(turnStepLabel(cell("%%bash\nls -la /tmp"))).toBe("运行 ls -la /tmp");
+		expect(turnStepLabel(cell("%%bash\nls -la /tmp"))).toBe("列目录 tmp");
 	});
 
 	it("joins bash() calls and file reads inside a python cell in source order", () => {
