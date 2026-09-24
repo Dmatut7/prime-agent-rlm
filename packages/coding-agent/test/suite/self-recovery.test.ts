@@ -112,11 +112,15 @@ describe("self-recovery: silent steps", () => {
 		while (harnesses.length > 0) harnesses.pop()?.cleanup();
 	});
 
-	async function stuckHarness(tool: AgentTool): Promise<Harness> {
+	async function stuckHarness(
+		tool: AgentTool,
+		stepCpuProbe: () => number | undefined = () => 1_000,
+	): Promise<Harness> {
 		const harness = await createHarness({
 			tools: [tool],
 			settings: { tools: { timeout: { silentStuckSeconds: 1 } } },
 			stallKernelLivenessFacts: () => wedgedKernelFacts(),
+			stepCpuProbe,
 		});
 		harnesses.push(harness);
 		return harness;
@@ -185,6 +189,47 @@ describe("self-recovery: silent steps", () => {
 			fauxAssistantMessage("构建完成。"),
 		]);
 		await harness.session.promptAndWait("build it");
+
+		expect(toolResultTexts(harness)[0]).toContain("command finished");
+	});
+
+	it("never stops a silent step whose process tree keeps burning CPU", async () => {
+		let cpu = 0;
+		const harness = await stuckHarness(commandTool(2_500), () => {
+			cpu += 1_500;
+			return cpu;
+		});
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("run_command", { command: "pytest -q" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("测试跑完了。"),
+		]);
+		await harness.session.promptAndWait("run the tests quietly");
+
+		expect(toolResultTexts(harness)[0]).toContain("command finished");
+		expect(readSelfRecoveryRecords(harness.sessionManager.getBranch())).toHaveLength(0);
+	});
+
+	it("stops a silent step with flat CPU, and falls back to output alone when CPU is unknown", async () => {
+		for (const probe of [() => 5_000, () => undefined]) {
+			const harness = await stuckHarness(commandTool(5_000), probe);
+			harness.setResponses([
+				fauxAssistantMessage(fauxToolCall("run_command", { command: "sleep 999" }), { stopReason: "toolUse" }),
+				fauxAssistantMessage("换了个办法。"),
+			]);
+			await harness.session.promptAndWait("run it");
+			expect(toolResultTexts(harness)[0]).toContain("Stuck step: `sleep 999`");
+		}
+	}, 15_000);
+
+	it("honours a longer timeout the model gave the call", async () => {
+		const harness = await stuckHarness(commandTool(2_500));
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("run_command", { command: "timeout 4 ./long-quiet-job" }), {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage("完成。"),
+		]);
+		await harness.session.promptAndWait("run the job");
 
 		expect(toolResultTexts(harness)[0]).toContain("command finished");
 	});

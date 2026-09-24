@@ -646,6 +646,11 @@ export interface ToolTimeoutSettings {
 	 * is stopped; a call whose output keeps flowing is never stopped by this.
 	 */
 	silentStuckSeconds?: number;
+	/**
+	 * Default 1000. CPU time (ms) the step's process tree must burn between two checks
+	 * to count as busy: a command that prints nothing but keeps computing is never stuck.
+	 */
+	silentStuckCpuMs?: number;
 }
 
 /** Self-recovery for unattended runs. */
@@ -1112,7 +1117,7 @@ const KNOWN_NESTED_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 		"recovery",
 	],
 	"retry.emptyTurn.recovery": ["enabled", "maxContinuations", "useBackupModel"],
-	"tools.timeout": ["enabled", "afterMs", "perTool", "silentStuckSeconds"],
+	"tools.timeout": ["enabled", "afterMs", "perTool", "silentStuckSeconds", "silentStuckCpuMs"],
 	"subagents.stallRecovery": ["enabled", "graceSeconds", "maxPerSession"],
 	"stallWatchdog.rootRecovery": ["enabled", "humanWindowSeconds", "maxPerSession"],
 };
@@ -2635,6 +2640,12 @@ export class SettingsManager {
 		const raw = Number(this.settings.tools?.timeout?.silentStuckSeconds ?? DEFAULT_SILENT_STUCK_SECONDS);
 		const seconds = Number.isFinite(raw) ? raw : DEFAULT_SILENT_STUCK_SECONDS;
 		return Math.min(SILENT_STUCK_MAX_SECONDS, Math.max(SILENT_STUCK_MIN_SECONDS, seconds)) * 1000;
+	}
+
+	/** CPU (ms) a step's process tree must burn between checks to count as busy; NaN-safe, at least 1. */
+	getSilentStuckCpuMs(): number {
+		const raw = Number(this.settings.tools?.timeout?.silentStuckCpuMs ?? 1000);
+		return Number.isFinite(raw) && raw >= 1 ? raw : 1000;
 	}
 
 	getSelfRecoverySettings(): { autoContinue: boolean; childReplyNudge: boolean } {

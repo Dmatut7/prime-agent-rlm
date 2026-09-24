@@ -282,6 +282,8 @@ import {
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { findExactModelReferenceMatch } from "./model-resolver.js";
+import { ORPHAN_PROCESS_JOURNAL_ENV, readActiveOrphanProcesses } from "./orphan-process-journal.js";
+import { explicitTimeoutMs, readProcessTreeCpuMs } from "./process-tree-cpu.js";
 import {
 	SessionInputAdmissionPausedError,
 	SessionInputCoalescingError,
@@ -865,6 +867,11 @@ export interface AgentSessionConfig {
 	 * journal, at most once per stall stage.
 	 */
 	stallJournaledBashHandles?: (kernelPid: number | undefined) => JournaledBashFacts | undefined;
+	/**
+	 * Cumulative CPU (ms) of the running step's process tree, for the silent-step rule.
+	 * Tests inject it; the default sums the kernel and its journaled bash handles with `ps`.
+	 */
+	stepCpuProbe?: () => number | undefined;
 	/**
 	 * Kernel residency facts behind the eviction-facing activity term of this session: a cell
 	 * executing right now, and live bash() handles the kernel's newest heartbeat attests.
@@ -2697,6 +2704,7 @@ export class AgentSession {
 	private readonly _stallJournaledBashHandles:
 		| ((kernelPid: number | undefined) => JournaledBashFacts | undefined)
 		| undefined;
+	private readonly _stepCpuProbe: (() => number | undefined) | undefined;
 	/** Kernel residency facts override for the eviction-facing activity term; defaults to the kernel client. */
 	private readonly _kernelResidencyFacts: (() => KernelResidencyFacts | undefined) | undefined;
 	/** Predicate names that already logged a failure this turn (one line per turn, not per sample). */
@@ -2716,7 +2724,14 @@ export class AgentSession {
 	/** Per in-flight call: its arguments and when it last produced output, for the silent-step rule. */
 	private readonly _stepOutputWatch = new Map<
 		string,
-		{ toolName: string; args: unknown; startedAt: number; lastOutputAt: number; movementToken?: string }
+		{
+			toolName: string;
+			args: unknown;
+			startedAt: number;
+			lastOutputAt: number;
+			movementToken?: string;
+			cpuMs?: number;
+		}
 	>();
 	/** Steps stopped as stuck in this run, keyed by their description. */
 	private readonly _stuckStepsThisRun = new Map<string, number>();
@@ -2793,6 +2808,7 @@ export class AgentSession {
 		this._stallWatchdogTimers = config.stallWatchdogTimers;
 		this._stallKernelLivenessFacts = config.stallKernelLivenessFacts;
 		this._stallJournaledBashHandles = config.stallJournaledBashHandles;
+		this._stepCpuProbe = config.stepCpuProbe;
 		this._kernelResidencyFacts = config.kernelResidencyFacts;
 		this._rlmTerminalNoticeAbandonAfterMs =
 			config.rlmTerminalNoticeAbandonAfterMs ?? RLM_TERMINAL_NOTICE_ABANDON_AFTER_MS;
@@ -6231,7 +6247,7 @@ export class AgentSession {
 	 * output-counter token that changed since the previous check counts as output too;
 	 * the first token seen is only the baseline.
 	 */
-	private _stepSilentMs(info: ToolTimeoutVouchInfo, movementToken?: string): number {
+	private _stepSilentMs(info: ToolTimeoutVouchInfo, movementToken?: string, sampleCpu = false): number {
 		const watch = this._stepOutputWatch.get(info.toolCallId);
 		if (!watch) return info.elapsedMs;
 		const now = Date.now();
@@ -6239,7 +6255,51 @@ export class AgentSession {
 			if (watch.movementToken !== undefined && watch.movementToken !== movementToken) watch.lastOutputAt = now;
 			watch.movementToken = movementToken;
 		}
+		// CPU of the step's process tree is work too: a quiet compile or test run that keeps
+		// computing is busy. Sampled only at a deadline recheck, never on the hot path.
+		if (sampleCpu) {
+			const cpuMs = this._sampleStepCpuMs();
+			if (cpuMs !== undefined) {
+				if (watch.cpuMs !== undefined && cpuMs - watch.cpuMs >= this.settingsManager.getSilentStuckCpuMs()) {
+					watch.lastOutputAt = now;
+				}
+				// Keep the baseline where output was last seen, so slow CPU accumulates across checks.
+				if (watch.cpuMs === undefined || watch.lastOutputAt === now) watch.cpuMs = cpuMs;
+			}
+		}
 		return Math.max(0, now - watch.lastOutputAt);
+	}
+
+	/** The silent-step threshold for one call: the setting, or the call's own explicit timeout if longer. */
+	private _stuckAfterMs(toolCallId: string): number {
+		const configured = this.settingsManager.getSilentStuckMs();
+		const explicit = explicitTimeoutMs(this._stepOutputWatch.get(toolCallId)?.args);
+		return explicit === undefined ? configured : Math.max(configured, explicit);
+	}
+
+	/**
+	 * Cumulative CPU (ms) of the kernel and its bash handles' process trees, or the kernel's
+	 * own heartbeat CPU when `ps` is unavailable. Undefined means no CPU evidence: the rule
+	 * then falls back to output alone.
+	 */
+	private _sampleStepCpuMs(): number | undefined {
+		try {
+			if (this._stepCpuProbe) return this._stepCpuProbe();
+			const facts = this._stallKernelLivenessFacts
+				? this._stallKernelLivenessFacts()
+				: this._kernelLivenessFactsFromClient();
+			const kernelPid = facts?.kernelPid;
+			const roots = kernelPid === undefined ? [] : [kernelPid];
+			const journal = process.env[ORPHAN_PROCESS_JOURNAL_ENV];
+			if (journal && kernelPid !== undefined) {
+				for (const record of readActiveOrphanProcesses(journal, process.pid, { maxBytes: 256 * 1024 })) {
+					if (record.kernelPid === kernelPid && record.pid !== kernelPid) roots.push(record.pid);
+				}
+			}
+			return readProcessTreeCpuMs(roots) ?? facts?.latest?.cpuMs;
+		} catch {
+			return undefined;
+		}
 	}
 
 	/** A plain description of a step for the model and the duty log: the command or cell preview. */
@@ -6334,8 +6394,8 @@ export class AgentSession {
 			// updates, or the kernel's output counters moving) and stuck once it has produced
 			// none for the silent-step threshold - a quiet `await bash(...)` included, which the
 			// liveness tiers alone would excuse for as long as the process exists.
-			const stuckAfterMs = this.settingsManager.getSilentStuckMs();
-			const silentMs = this._stepSilentMs(info, this._sampleStallVouch()?.movementToken);
+			const stuckAfterMs = this._stuckAfterMs(info.toolCallId);
+			const silentMs = this._stepSilentMs(info, this._sampleStallVouch()?.movementToken, true);
 			if (silentMs >= stuckAfterMs) return { action: "fail" };
 			const recheckMs = exemption.tier === "progress" ? info.timeoutMs : Math.round(info.timeoutMs / 2);
 			return {

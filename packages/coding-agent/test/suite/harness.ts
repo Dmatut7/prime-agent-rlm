@@ -104,6 +104,7 @@ export interface HarnessOptions {
 	stallKernelLivenessFacts?: () => TurnLivenessKernelFacts | undefined;
 	/** Degraded fact source used when the kernel heartbeat is stale or absent. */
 	stallJournaledBashHandles?: (kernelPid: number | undefined) => JournaledBashFacts | undefined;
+	stepCpuProbe?: () => number | undefined;
 	/** Kernel residency facts behind the eviction-facing activity term (see agent-session.ts). */
 	kernelResidencyFacts?: () => KernelResidencyFacts | undefined;
 	rlmTerminalNoticeAbandonAfterMs?: number;
@@ -245,6 +246,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		stallWatchdogTimers: options.stallWatchdogTimers,
 		stallKernelLivenessFacts: options.stallKernelLivenessFacts,
 		stallJournaledBashHandles: options.stallJournaledBashHandles,
+		stepCpuProbe: options.stepCpuProbe,
 		kernelResidencyFacts: options.kernelResidencyFacts,
 		rlmTerminalNoticeAbandonAfterMs: options.rlmTerminalNoticeAbandonAfterMs,
 		failureWakeQuietWindowMs: options.failureWakeQuietWindowMs,

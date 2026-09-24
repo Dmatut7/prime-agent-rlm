@@ -3,3 +3,4 @@
 - Added a one-time reminder for a subagent that finishes its task without replying to its parent (`selfRecovery.childReplyNudge`).
 - Changed the busy-kernel wait/restart prompt to restart the kernel automatically when nobody answers within 60 seconds, and stopped telling the model to kill the kernel itself.
 - Added self-recovery and duty-log entries to the session transcript for every automatic stop, continue and reminder.
+- Changed the silent-step rule to count CPU burned by the step's process tree (`tools.timeout.silentStuckCpuMs`, default 1000) as activity, and to honour a longer timeout the model gave the call, so quiet test runs, installs and compiles are never stopped.
