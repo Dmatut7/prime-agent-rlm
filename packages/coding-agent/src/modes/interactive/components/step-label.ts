@@ -334,7 +334,20 @@ function withoutTemplateHoles(label: string): string {
 	return label.replace(/\{[^{}]*\}/g, "…");
 }
 
+/**
+ * A tool name no tool could have: markup or argument text leaked into the name
+ * (GLM's `ipythone_code</arg_key><arg_value>None</arg_value>`). The call only
+ * returns "Tool … not found"; its text is noise to a reader.
+ */
+export function isMalformedToolName(name: string): boolean {
+	return !/^[A-Za-z_][A-Za-z0-9_.:-]{0,63}$/.test(name);
+}
+
+/** How a malformed call reads anywhere a step is named. */
+export const MALFORMED_TOOL_CALL_LABEL = "写错的工具调用";
+
 export function turnStepLabel(step: StepLabelInput): string {
+	if (isMalformedToolName(step.toolName)) return MALFORMED_TOOL_CALL_LABEL;
 	return withoutTemplateHoles(rawStepLabel(step));
 }
 

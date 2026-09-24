@@ -1,5 +1,5 @@
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import { type Component, Container, Image, Text, type TUI } from "@earendil-works/pi-tui";
+import { type Component, Container, Image, Text, type TUI, truncateToWidth } from "@earendil-works/pi-tui";
 import type { ToolDefinition, ToolRenderContext, ToolRenderResultOptions } from "../../../core/extensions/types.js";
 import type { KernelSentAgentMessage } from "../../../core/kernel/index.js";
 import { createBashToolDefinition } from "../../../core/tools/bash.js";
@@ -11,6 +11,7 @@ import { type Theme, theme } from "../theme/theme.js";
 import { getWorkingPulseFrame, workingIconFrame } from "../theme/working-icon.js";
 import { type BlockFocusState, decorateFocusedBlock, type FocusableBlock } from "./block-focus.js";
 import { getIpythonCodeFromArgs, IPythonCellComponent } from "./ipython-cell.js";
+import { isMalformedToolName } from "./step-label.js";
 import { quietConversationBudget } from "./tool-output-budget.js";
 import { ToolPanel } from "./tool-panel.js";
 import type { TurnActivityState } from "./turn-activity.js";
@@ -464,6 +465,19 @@ export class ToolExecutionComponent extends Container implements FocusableBlock 
 				return [theme.fg("dim", `${indent}⋯ 中间 ${state.processFoldHiddenCount()} 步`)];
 			}
 			return this.hiddenLines;
+		}
+		// A garbled tool name (markup leaked into it) is the model's slip, already
+		// answered with "not found" and retried: one dim line, details on expand.
+		if (isMalformedToolName(this.toolName) && !this.expanded) {
+			this.clickRegions = [];
+			const inset = this.turnActivity && quietConversationBudget() && width > STEP_INSET + 8 ? STEP_INSET : 0;
+			return [
+				truncateToWidth(
+					`${" ".repeat(inset + 1)}${theme.fg("dim", "✗ 模型写错了一次工具调用（已跳过，它会重试）")}`,
+					width,
+					"…",
+				),
+			];
 		}
 		// Refresh the animated glyph without rebuilding the whole panel, for as long
 		// as panelStatus() is still animating (including partial streaming results).

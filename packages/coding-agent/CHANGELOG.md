@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.11.12] - 2026-09-24
+
+- Changed a tool call with a garbled name (markup leaked into it, a known GLM slip) to render as one dim line and read as 写错的工具调用 in the process line and running card, instead of showing the raw name, `{}` and the not-found text; the details stay on expand.
+
 ## [0.11.11] - 2026-09-24
 
 - Fixed the `◆ prime` header, the AI gutter and the running card starting at column 0, which terminals that clip their first column cut off; they now keep the same one-column margin as every other chat row.
