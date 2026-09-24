@@ -1780,6 +1780,14 @@ async function executePreparedToolCall(
 				return;
 			}
 			timeoutAbortCause = formatToolTimeoutAbortCause(info.toolName, info.elapsedMs, timeoutMs!);
+			let detail: string | undefined;
+			try {
+				detail = config?.toolTimeout?.describeCancellation?.(info)?.trim();
+			} catch {
+				// A broken describer must not keep the cancellation from landing.
+				detail = undefined;
+			}
+			if (detail) timeoutAbortCause = `${timeoutAbortCause} ${detail}`;
 			timeoutController.abort(timeoutAbortCause);
 		}, delayMs);
 	};

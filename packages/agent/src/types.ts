@@ -390,6 +390,12 @@ export interface ToolTimeoutConfig {
 	 * sentence (K3 asymmetry; the turn-level watchdog still guards the call).
 	 */
 	vouch?: (info: ToolTimeoutVouchInfo) => ToolTimeoutVerdict | undefined;
+	/**
+	 * Host-side detail appended to the cancellation the model receives (which
+	 * command was stuck, for how long, what to do instead). Called once, when the
+	 * deadline stands; a throwing or empty answer leaves the generic cause alone.
+	 */
+	describeCancellation?: (info: ToolTimeoutVouchInfo) => string | undefined;
 }
 
 /**
