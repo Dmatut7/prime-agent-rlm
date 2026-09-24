@@ -3,6 +3,12 @@ import { afterEach, describe, it } from "node:test";
 import { formatStallActionLines, type StallActionEvent, StallActions } from "../src/components/stall-actions.js";
 import { type KeybindingDefinition, KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "../src/keybindings.js";
 import { matchesKey } from "../src/keys.js";
+import { visibleWidth } from "../src/utils.js";
+
+/** Pad to a display width: a CJK character takes two cells. */
+function padCells(text: string, width: number): string {
+	return text + " ".repeat(Math.max(0, width - visibleWidth(text)));
+}
 
 const CTRL_Y = "\x19";
 const CTRL_G = "\x07";
@@ -34,10 +40,10 @@ describe("formatStallActionLines", () => {
 		const lines = formatStallActionLines(actionableEvent, { interrupt: interruptKeyLabel, diagnostics: "ctrl+y" });
 
 		assert.deepStrictEqual(lines, [
-			"\u26a0 stall: silent 312s (threshold 300s)",
-			"  Esc = interrupt this turn",
-			"  ctrl+y = show stall diagnostics",
-			"  any other key = dismiss (the turn keeps running)",
+			"\u26a0 已经 5 分钟没有动静",
+			"  Esc 中断这一轮",
+			"  ctrl+y 看诊断详情",
+			"  其它键关掉提示（这一轮继续跑）",
 		]);
 	});
 
@@ -48,18 +54,18 @@ describe("formatStallActionLines", () => {
 		);
 
 		assert.deepStrictEqual(lines, [
-			"\u26a0 stall: silent 312s (threshold 300s)",
-			"  ctrl+y = show stall diagnostics",
-			"  any other key = dismiss (the turn keeps running)",
+			"\u26a0 已经 5 分钟没有动静",
+			"  ctrl+y 看诊断详情",
+			"  其它键关掉提示（这一轮继续跑）",
 		]);
 	});
 
-	it("degrades to plain text (summary plus message) when the event carries no actions field", () => {
+	it("degrades to the headline plus the emitter message when the event carries no actions field", () => {
 		const lines = formatStallActionLines(legacyEvent, { interrupt: interruptKeyLabel, diagnostics: "ctrl+y" });
 
 		// Degraded direction: no action hints, no dismiss note.
 		assert.deepStrictEqual(lines, [
-			"\u26a0 stall: silent 312s (threshold 300s)",
+			"\u26a0 已经 5 分钟没有动静",
 			"Possible stall: no session activity for 312s while a turn is running.",
 		]);
 	});
@@ -71,16 +77,30 @@ describe("formatStallActionLines", () => {
 		);
 
 		assert.deepStrictEqual(lines, [
-			"\u26a0 stall: silent 312s (threshold 300s)",
+			"\u26a0 已经 5 分钟没有动静",
 			"Possible stall: no session activity for 312s while a turn is running.",
 		]);
+	});
+
+	it("shows the host's plain-language summary in place of the generic headline", () => {
+		const lines = formatStallActionLines(
+			{
+				...actionableEvent,
+				summary: "\u26a0 已经 5 分钟没有动静：正在等 ipython 这一步（已 5 分钟），后台还有 2 个命令在跑",
+			},
+			{ interrupt: interruptKeyLabel, diagnostics: "ctrl+y" },
+		);
+		assert.strictEqual(
+			lines[0],
+			"\u26a0 已经 5 分钟没有动静：正在等 ipython 这一步（已 5 分钟），后台还有 2 个命令在跑",
+		);
 	});
 
 	it("uses the caller-provided key labels verbatim (no hardcoded key)", () => {
 		const lines = formatStallActionLines(actionableEvent, { interrupt: "alt+x", diagnostics: "ctrl+g" });
 
-		assert.ok(lines.some((line) => line.includes("alt+x = interrupt this turn")));
-		assert.ok(lines.some((line) => line.includes("ctrl+g = show stall diagnostics")));
+		assert.ok(lines.some((line) => line.includes("alt+x 中断这一轮")));
+		assert.ok(lines.some((line) => line.includes("ctrl+g 看诊断详情")));
 		assert.ok(!lines.some((line) => line.includes("Esc")));
 	});
 
@@ -106,11 +126,11 @@ describe("formatStallActionLines", () => {
 		const pad = (value: number): string => String(value).padStart(2, "0");
 		const clock = `${pad(expectedClock.getHours())}:${pad(expectedClock.getMinutes())}:${pad(expectedClock.getSeconds())}`;
 		assert.deepStrictEqual(lines, [
-			"\u26a0 stall: silent 312s (threshold 300s)",
-			"  Esc = interrupt this turn",
-			"  ctrl+y = show stall diagnostics",
-			`  auto-recovery (daemon): machine will act at ${clock} (in 90s)`,
-			"  any other key = dismiss (the turn keeps running)",
+			"\u26a0 已经 5 分钟没有动静",
+			"  Esc 中断这一轮",
+			"  ctrl+y 看诊断详情",
+			`  ${clock} 将自动处理（还有 90 秒）`,
+			"  其它键关掉提示（这一轮继续跑）",
 		]);
 	});
 
@@ -124,9 +144,7 @@ describe("formatStallActionLines", () => {
 			1_000_000_000,
 		);
 
-		assert.ok(
-			lines.some((line) => line.includes("auto-recovery: machine will act at") && line.includes("(due now)")),
-		);
+		assert.ok(lines.some((line) => line.includes("将自动处理") && line.includes("（马上）")));
 	});
 
 	it("F3: an unarmed or moment-less actions field renders no auto-recovery line", () => {
@@ -149,7 +167,7 @@ describe("formatStallActionLines", () => {
 		);
 
 		for (const lines of [unarmed, disarmed, momentless]) {
-			assert.ok(!lines.some((line) => line.includes("auto-recovery")));
+			assert.ok(!lines.some((line) => line.includes("将自动处理")));
 			// Line-count pin: without the armed facts the render is exactly the
 			// pre-F3 shape - summary, one hint per offered action, dismiss note.
 			assert.strictEqual(lines.length, 4);
@@ -205,10 +223,10 @@ describe("StallActions component", () => {
 		const lines = bar.render(80);
 
 		assert.strictEqual(lines.length, 4);
-		assert.ok(lines[0]!.startsWith("\u26a0 stall: silent 312s (threshold 300s)"));
-		assert.strictEqual(lines[1], `  ${interruptKeyLabel} = interrupt this turn`.padEnd(80));
-		assert.strictEqual(lines[2], "  ctrl+y = show stall diagnostics".padEnd(80));
-		assert.strictEqual(lines[3], "  any other key = dismiss (the turn keeps running)".padEnd(80));
+		assert.ok(lines[0]!.startsWith("\u26a0 已经 5 分钟没有动静"));
+		assert.strictEqual(lines[1], padCells(`  ${interruptKeyLabel} 中断这一轮`, 80));
+		assert.strictEqual(lines[2], padCells("  ctrl+y 看诊断详情", 80));
+		assert.strictEqual(lines[3], padCells("  其它键关掉提示（这一轮继续跑）", 80));
 	});
 
 	it("exposes one click region per offered action and dispatches their clicks", () => {
@@ -222,8 +240,8 @@ describe("StallActions component", () => {
 		const lines = bar.render(80);
 		const regions = bar.getClickRegions();
 		assert.strictEqual(regions.length, 2);
-		const interruptHint = `${interruptKeyLabel} = interrupt this turn`;
-		const diagnosticsHint = "ctrl+y = show stall diagnostics";
+		const interruptHint = `${interruptKeyLabel} 中断这一轮`;
+		const diagnosticsHint = "ctrl+y 看诊断详情";
 		const interruptLine = lines.findIndex((line) => line.includes(interruptHint));
 		const diagnosticsLine = lines.findIndex((line) => line.includes(diagnosticsHint));
 		assert.strictEqual(regions[0]!.line, interruptLine);
@@ -278,8 +296,8 @@ describe("StallActions component", () => {
 		});
 
 		const lines = bar.render(80);
-		assert.ok(lines.some((line) => line.includes("ctrl+g = show stall diagnostics")));
-		assert.ok(!lines.some((line) => line.includes("ctrl+y = show stall diagnostics")));
+		assert.ok(lines.some((line) => line.includes("ctrl+g 看诊断详情")));
+		assert.ok(!lines.some((line) => line.includes("ctrl+y 看诊断详情")));
 
 		assert.strictEqual(bar.handleInput(CTRL_G), true);
 		assert.strictEqual(bar.handleInput(CTRL_Y), false);
@@ -302,14 +320,11 @@ describe("StallActions component", () => {
 			interrupt: interruptKeyLabel,
 			diagnostics: "ctrl+y",
 		});
-		assert.ok(actionableLines.some((line) => line.includes("interrupt this turn")));
+		assert.ok(actionableLines.some((line) => line.includes("中断这一轮")));
 
 		assert.deepStrictEqual(
 			lines.map((line) => line.trimEnd()),
-			[
-				"\u26a0 stall: silent 312s (threshold 300s)",
-				"Possible stall: no session activity for 312s while a turn is running.",
-			],
+			["\u26a0 已经 5 分钟没有动静", "Possible stall: no session activity for 312s while a turn is running."],
 		);
 		assert.deepStrictEqual(bar.getClickRegions(), []);
 		assert.strictEqual(bar.handleInput(CTRL_Y), false);
@@ -341,8 +356,8 @@ describe("StallActions component", () => {
 
 		assert.strictEqual(lines.length, 5);
 		const countdownLine = lines[3]!;
-		assert.ok(countdownLine.includes("auto-recovery (daemon): machine will act at"), countdownLine);
-		assert.ok(countdownLine.includes("(in 90s)"), countdownLine);
+		assert.ok(countdownLine.includes("将自动处理"), countdownLine);
+		assert.ok(countdownLine.includes("还有 90 秒"), countdownLine);
 		assert.strictEqual(bar.getClickRegions().length, 2);
 	});
 
@@ -366,12 +381,8 @@ describe("StallActions component", () => {
 
 		const lines = bar.render(80);
 
-		assert.ok(!lines.some((line) => line.includes("interrupt this turn")));
-		assert.ok(
-			lines.some(
-				(line) => line.includes("auto-recovery (daemon): machine will act at") && line.includes("(in 45s)"),
-			),
-		);
+		assert.ok(!lines.some((line) => line.includes("中断这一轮")));
+		assert.ok(lines.some((line) => line.includes("将自动处理") && line.includes("还有 45 秒")));
 		assert.strictEqual(bar.getClickRegions().length, 1);
 	});
 
@@ -402,16 +413,16 @@ describe("StallActions component", () => {
 			onDiagnostics: () => {},
 		});
 
-		// Width 30 keeps the interrupt hint on one line but wraps the
-		// diagnostics hint across two, so only the interrupt region survives.
-		// The key path is unaffected by the loss of the click target.
-		const lines = bar.render(30);
-		assert.ok(lines.some((line) => line.trimEnd() === `  ${interruptKeyLabel} = interrupt this turn`));
-		assert.ok(!lines.some((line) => line.includes("ctrl+y = show stall diagnostics")));
+		// Width 18 keeps the interrupt hint (16 cells) on one line but wraps the
+		// diagnostics hint (19 cells) across two, so only the interrupt region
+		// survives. The key path is unaffected by the loss of the click target.
+		const lines = bar.render(18);
+		assert.ok(lines.some((line) => line.trimEnd() === `  ${interruptKeyLabel} 中断这一轮`));
+		assert.ok(!lines.some((line) => line.includes("ctrl+y 看诊断详情")));
 
 		const regions = bar.getClickRegions();
 		assert.strictEqual(regions.length, 1);
-		const interruptHint = `${interruptKeyLabel} = interrupt this turn`;
+		const interruptHint = `${interruptKeyLabel} 中断这一轮`;
 		const regionLine = lines[regions[0]!.line]!;
 		assert.strictEqual(regionLine.indexOf(interruptHint), regions[0]!.col);
 	});
@@ -427,10 +438,7 @@ describe("StallActions component", () => {
 		const lines = bar.render(80);
 		assert.deepStrictEqual(
 			lines.map((line) => line.trimEnd()),
-			[
-				"\u26a0 stall: silent 312s (threshold 300s)",
-				"Possible stall: no session activity for 312s while a turn is running.",
-			],
+			["\u26a0 已经 5 分钟没有动静", "Possible stall: no session activity for 312s while a turn is running."],
 		);
 		assert.deepStrictEqual(bar.getClickRegions(), []);
 		assert.strictEqual(bar.handleInput(ESCAPE), false);
@@ -444,8 +452,8 @@ describe("StallActions component", () => {
 		});
 
 		const lines = bar.render(80);
-		assert.ok(lines.some((line) => line.includes("ctrl+y = show stall diagnostics")));
-		assert.ok(!lines.some((line) => line.includes("interrupt this turn")));
+		assert.ok(lines.some((line) => line.includes("ctrl+y 看诊断详情")));
+		assert.ok(!lines.some((line) => line.includes("中断这一轮")));
 		// The unhandled action's key is not consumed: the host's own interrupt
 		// binding stays the only trigger for it.
 		assert.strictEqual(bar.handleInput(ESCAPE), false);
@@ -471,11 +479,11 @@ describe("StallActions component", () => {
 		});
 
 		const lines = bar.render(80);
-		assert.ok(lines.some((line) => line.includes("unbound = show stall diagnostics")));
+		assert.ok(lines.some((line) => line.includes("unbound 看诊断详情")));
 		const regions = bar.getClickRegions();
 		// Only the interrupt region survives: the unbound action has no click target.
 		assert.strictEqual(regions.length, 1);
-		const interruptHint = `${interruptKeyLabel} = interrupt this turn`;
+		const interruptHint = `${interruptKeyLabel} 中断这一轮`;
 		assert.ok(lines[regions[0]!.line]!.includes(interruptHint));
 	});
 
@@ -487,7 +495,7 @@ describe("StallActions component", () => {
 
 		assert.ok(lines.length > 2);
 		for (const line of lines) {
-			assert.strictEqual(line.length, 20);
+			assert.strictEqual(visibleWidth(line), 20);
 		}
 	});
 });

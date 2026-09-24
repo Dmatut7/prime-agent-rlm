@@ -44,6 +44,8 @@ export interface StallActionEvent {
 	message: string;
 	silentMs: number;
 	thresholdMs: number;
+	/** One plain-language line the host built from the diagnostics; replaces the generic headline. */
+	summary?: string | undefined;
 	/** Which actions the emitter offers. Absent on older emitters; degrades the render to plain text. */
 	actions?: StallActionsView | undefined;
 }
@@ -61,8 +63,10 @@ export interface StallActionKeyHints {
 	diagnostics: string;
 }
 
-function secondsOf(ms: number): string {
-	return `${Math.max(1, Math.round(ms / 1000))}s`;
+/** `45 秒`, `5 分钟`: silence reads in the unit a person thinks in. */
+function durationOf(ms: number): string {
+	const seconds = Math.max(1, Math.round(ms / 1000));
+	return seconds < 90 ? `${seconds} 秒` : `${Math.round(seconds / 60)} 分钟`;
 }
 
 /** Locale-independent wall-clock rendering (HH:MM:SS) of an epoch-ms moment. */
@@ -87,10 +91,9 @@ function autoRecoveryLine(actions: StallActionsView, nowMs: number): string | un
 	if (actions.autoRecoveryArmed !== true) return undefined;
 	const atMs = actions.autoRecoveryAtMs;
 	if (typeof atMs !== "number" || !Number.isFinite(atMs)) return undefined;
-	const who = actions.executor === undefined ? "auto-recovery" : `auto-recovery (${actions.executor})`;
 	const remainingMs = atMs - nowMs;
-	const countdown = remainingMs <= 0 ? "due now" : `in ${Math.max(1, Math.round(remainingMs / 1000))}s`;
-	return `  ${who}: machine will act at ${clockOf(atMs)} (${countdown})`;
+	const countdown = remainingMs <= 0 ? "马上" : `还有 ${Math.max(1, Math.round(remainingMs / 1000))} 秒`;
+	return `  ${clockOf(atMs)} 将自动处理（${countdown}）`;
 }
 
 function isActionable(actions: StallActionsView | undefined): actions is StallActionsView {
@@ -150,22 +153,23 @@ export function formatStallActionLines(
 	keys: StallActionKeyHints,
 	nowMs: number = Date.now(),
 ): string[] {
-	const summary = `\u26a0 stall: silent ${secondsOf(event.silentMs)} (threshold ${secondsOf(event.thresholdMs)})`;
+	const summary = event.summary ?? `\u26a0 已经 ${durationOf(event.silentMs)}没有动静`;
 	if (!isActionable(event.actions)) {
-		return [summary, event.message];
+		// An older emitter gives no host summary: keep its own message as the detail.
+		return event.summary === undefined ? [summary, event.message] : [summary];
 	}
 	const lines = [summary];
 	if (event.actions.canAbort) {
-		lines.push(`  ${keys.interrupt} = interrupt this turn`);
+		lines.push(`  ${keys.interrupt} 中断这一轮`);
 	}
 	if (event.actions.canDiagnose) {
-		lines.push(`  ${keys.diagnostics} = show stall diagnostics`);
+		lines.push(`  ${keys.diagnostics} 看诊断详情`);
 	}
 	const autoRecovery = autoRecoveryLine(event.actions, nowMs);
 	if (autoRecovery !== undefined) {
 		lines.push(autoRecovery);
 	}
-	lines.push("  any other key = dismiss (the turn keeps running)");
+	lines.push("  其它键关掉提示（这一轮继续跑）");
 	return lines;
 }
 
@@ -308,7 +312,7 @@ export class StallActions implements Component {
 		if (!actions) return [];
 		const regions: ClickRegion[] = [];
 		if (actions.canAbort) {
-			this.addHintRegion(regions, lines, `${hints.interrupt} = interrupt this turn`, () => {
+			this.addHintRegion(regions, lines, `${hints.interrupt} 中断这一轮`, () => {
 				this.options.onInterrupt?.();
 			});
 		}
@@ -317,7 +321,7 @@ export class StallActions implements Component {
 		// affordance for an action with no key behind it invites a dead click.
 		const diagnosticsKeys = getKeybindings().getKeys("app.stall.diagnostics");
 		if (actions.canDiagnose && diagnosticsKeys.some((key) => key.trim().length > 0)) {
-			this.addHintRegion(regions, lines, `${hints.diagnostics} = show stall diagnostics`, () => {
+			this.addHintRegion(regions, lines, `${hints.diagnostics} 看诊断详情`, () => {
 				this.options.onDiagnostics?.();
 			});
 		}

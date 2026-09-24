@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.11.9] - 2026-09-24
+
+- Changed the stall action bar text to Chinese and let the host supply a one-line summary for its headline.
+
 ## [0.11.3] - 2026-09-24
 
 - Fixed word wrapping of Chinese/Japanese/Korean text so embedded English words, paths, and file names wrap whole instead of being split mid-word, and closing punctuation never starts a line.

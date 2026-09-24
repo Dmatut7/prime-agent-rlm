@@ -59,7 +59,7 @@ function countdownLine(rendered: string): string | undefined {
 	return rendered
 		.split("\n")
 		.map((line) => line.trimEnd())
-		.find((line) => line.includes("auto-recovery"));
+		.find((line) => line.includes("将自动处理"));
 }
 
 describe("InteractiveMode stall action bar lifecycle", () => {
@@ -194,7 +194,7 @@ describe("InteractiveMode stall action bar lifecycle", () => {
 		expect(removeInputListener).toHaveBeenCalledTimes(1);
 		// The mounted bar is the NEW event's, not the torn-down one's: the
 		// summary line carries this warning's own silence reading.
-		expect(renderChat(chatOf(mode))).toContain("silent 420s");
+		expect(renderChat(chatOf(mode))).toContain("已经 7 分钟没有动静");
 	});
 
 	it("F3: the daemon-armed deadline reaches the bar as a static countdown line", async () => {
@@ -205,7 +205,7 @@ describe("InteractiveMode stall action bar lifecycle", () => {
 		await handleEvent.call(mode, stallWarning({ actions: armedActions(t0 + 120_000) }));
 
 		const rendered = renderChat(chatOf(mode));
-		expect(rendered).toMatch(/auto-recovery \(daemon\): machine will act at \d{2}:\d{2}:\d{2} \(in 120s\)/);
+		expect(rendered).toMatch(/\d{2}:\d{2}:\d{2} 将自动处理（还有 120 秒）/);
 		// The countdown is the daemon's fact, not a host promise about input:
 		// until the daemon lane's F1 input accounting lands, no "input keeps this
 		// turn alive" claim may ship.
@@ -218,7 +218,7 @@ describe("InteractiveMode stall action bar lifecycle", () => {
 		// own clock: the countdown moves, and still no timer was created.
 		vi.setSystemTime(t0 + 60_000);
 		const ticked = countdownLine(renderChat(chatOf(mode)));
-		expect(ticked).toMatch(/\(in 60s\)/);
+		expect(ticked).toMatch(/还有 60 秒/);
 		expect(vi.getTimerCount()).toBe(0);
 	});
 
@@ -230,7 +230,7 @@ describe("InteractiveMode stall action bar lifecycle", () => {
 
 		expect(mode.stallActionBar).toBeDefined();
 		const rendered = renderChat(chatOf(mode));
-		expect(rendered).toContain("Esc = interrupt this turn");
+		expect(rendered).toContain("Esc 中断这一轮");
 		expect(countdownLine(rendered)).toBeUndefined();
 		expect(vi.getTimerCount()).toBe(0);
 	});

@@ -159,6 +159,43 @@ export function formatStallDiagnosticsLines(diagnostics: StallDiagnostics | unde
 }
 
 /** Message first (so existing renderers keep their one-line behaviour), then the diagnostics. */
+/** Where a terminal stall left its evidence, as one short line. */
+export function stallEvidenceHint(): string {
+	return `诊断记录：${resolveStallDiagnosticsPointer().evidencePath}`;
+}
+
+/** `45 秒`, `5 分钟`. */
+function durationText(ms: number): string {
+	const secondsValue = Math.max(1, Math.round(ms / 1000));
+	return secondsValue < 90 ? `${secondsValue} 秒` : `${Math.round(secondsValue / 60)} 分钟`;
+}
+
+/**
+ * The stall event as one line a person can act on: how long it has been quiet,
+ * what it is waiting for, and what is still running. The forensic lines
+ * ({@link formatStallEventLines}) stay one key away (stall diagnostics).
+ */
+export function formatStallSummary(event: StallEventView): string {
+	const payload = isSegment(event.diagnostics) ? (event.diagnostics as Record<string, unknown>) : undefined;
+	const quiet = durationText(event.silentMs);
+	if (event.type === "stall_abort") return `\u2717 已经 ${quiet}没有动静，这一轮被自动中断了`;
+	if (event.type === "stall_unsettled") return "\u2717 这一轮已经中断，但还有工作没停下来";
+	const calls = Array.isArray(payload?.inFlightToolCalls) ? payload.inFlightToolCalls.filter(isSegment) : [];
+	const first = calls[0];
+	const kernel = isSegment(payload?.kernel) ? payload.kernel : undefined;
+	const handles = typeof kernel?.liveBashHandles === "number" ? kernel.liveBashHandles : 0;
+	const background = handles > 0 ? `，后台还有 ${handles} 个命令在跑` : "";
+	if (first) {
+		const tool = typeof first.toolName === "string" ? first.toolName : "工具";
+		const elapsed = typeof first.elapsedMs === "number" ? `（已 ${durationText(first.elapsedMs)}）` : "";
+		const more = calls.length > 1 ? `等 ${calls.length} 步` : "这一步";
+		return `\u26a0 已经 ${quiet}没有动静：正在等 ${tool} ${more}${elapsed}${background}`;
+	}
+	const busy = isSegment(payload?.busy) ? payload.busy : undefined;
+	if (busy?.streaming === true) return `\u26a0 已经 ${quiet}没有动静：正在等模型回复${background}`;
+	return `\u26a0 已经 ${quiet}没有动静${background}`;
+}
+
 export function formatStallEventLines(event: StallEventView): string[] {
 	return [
 		event.message,

@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.11.9] - 2026-09-24
+
+- Changed the stall warning to one plain-language line on the action bar (what it is waiting on, for how long, what still runs in the background) instead of printing the forensic snapshot as an error; the snapshot stays on the diagnostics key.
+- Added prompt guidance that a program meant to keep running is started without awaiting its handle.
+
 ## [0.11.8] - 2026-09-24
 
 - Changed the bailian web search to turn the search model's reasoning off by default (`thinking=True` opts back in): the same news query took 18-21s instead of 91s.

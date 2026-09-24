@@ -145,7 +145,13 @@ import {
 } from "../../core/slash-commands.js";
 import { createSpendPricing, type SpendPricing } from "../../core/spend-pricing.js";
 import type { StallEventActions } from "../../core/stall-diagnostics.js";
-import { formatStallEventLines, type StallEventView, stallActionBarView } from "../../core/stall-diagnostics-render.js";
+import {
+	formatStallEventLines,
+	formatStallSummary,
+	type StallEventView,
+	stallActionBarView,
+	stallEvidenceHint,
+} from "../../core/stall-diagnostics-render.js";
 import {
 	captureAgentCommandUsed,
 	captureOnboardingCompleted,
@@ -6657,8 +6663,10 @@ export class InteractiveMode {
 				// recovery-shell) adds the actionable strip on top of it - it never
 				// re-reports the message text, so the two channels cannot double-report
 				// (B3), and a bar that cannot mount leaves exactly the old behavior.
-				this.showError(formatStallEventLines(event).join("\n"));
-				this.mountStallActionBar(event);
+				// The action bar is the notice: one plain line plus the keys. The forensic
+				// lines stay one key away (stall diagnostics); only a host where the bar
+				// cannot mount prints the summary line into the chat instead.
+				if (!this.mountStallActionBar(event)) this.showWarning(formatStallSummary(event));
 				break;
 			}
 
@@ -6667,14 +6675,14 @@ export class InteractiveMode {
 				// bar, and any live one is torn down so it stops promising an
 				// interrupt that can no longer happen.
 				this.removeStallActionBar();
-				this.showError(formatStallEventLines(event).join("\n"));
+				this.showError(`${formatStallSummary(event)}\n  ${stallEvidenceHint()}`);
 				break;
 
 			case "stall_unsettled":
 				// "Killed but still running" is a different failure than "looks
 				// stuck": it needs the same loud channel, not a warning color.
 				this.removeStallActionBar();
-				this.showError(formatStallEventLines(event).join("\n"));
+				this.showError(`${formatStallSummary(event)}\n  ${stallEvidenceHint()}`);
 				break;
 
 			case "refine_complete":
@@ -8254,7 +8262,7 @@ export class InteractiveMode {
 	 * re-derives the countdown from its own clock on every repaint (this host
 	 * owns no countdown timer).
 	 */
-	private mountStallActionBar(event: StallEventView & { actions?: StallEventActions }): void {
+	private mountStallActionBar(event: StallEventView & { actions?: StallEventActions }): boolean {
 		const interruptKeyLabel = keyText("app.input.clear");
 		const daemonActions = event.actions;
 		const view = stallActionBarView(event, {
@@ -8267,12 +8275,13 @@ export class InteractiveMode {
 			// B3: no usable action means the plain error channel is the whole
 			// report; mounting a degraded bar here would double-report the same
 			// text through two channels.
-			return;
+			return false;
 		}
 		this.removeStallActionBar();
 		const bar = new StallActions(
 			{
 				...event,
+				summary: formatStallSummary(event),
 				actions: {
 					...view,
 					...(daemonActions?.autoRecoveryArmed === true
@@ -8308,6 +8317,7 @@ export class InteractiveMode {
 			this.removeStallActionInputListener = this.ui.addInputListener(this.stallActionInputRoute);
 		}
 		this.ui.requestRender();
+		return true;
 	}
 
 	/** Tear the live stall action bar down (if any). Safe when no bar is live. */
