@@ -1,0 +1,29 @@
+[project]
+name = "prime-agent-skill-web-research"
+version = "0.1.0"
+description = "Web research skill for Prime Agent: SearXNG search, tiered page fetch, headless browsing, free academic APIs."
+requires-python = ">=3.10"
+# Pinned like the kernel's default packages: an unpinned name re-resolves to whatever is newest at
+# every reinstall. Each pin was older than the repo's 7-day release-age rule when chosen (2026-09-25).
+dependencies = [
+    "httpx>=0.27,<1",
+    "curl_cffi==0.16.3",
+    "trafilatura==2.2.0",
+    "playwright==1.63.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/web_research"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "I"]
+# Long lines left are embedded JS and HTML fixtures; the formatter owns Python line length.
+ignore = ["E501"]
