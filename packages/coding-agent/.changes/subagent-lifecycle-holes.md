@@ -1,0 +1,7 @@
+- Fixed `rlm.collect()` losing a finished subagent after the daemon closed it for idling: it now reports the child's saved status and last answer, including children closed before the parent itself restarted.
+- Fixed a parent waiting forever on a follow-up it sent to a finished subagent: when the follow-up turn ends without a reply (or errors, or is stopped), the parent now gets a notice with the child's last answer.
+- Fixed the subagent panel after an idle close: the row reads 完成 instead of 空闲, the fold line no longer promises an automatic close that already happened, and Enter reopens the closed child from its saved record.
+- Fixed a window attached to a subagent that was deleted, stopped or finished: it now returns to the parent with a Chinese notice instead of an English daemon error, and a child that died on an error is not described as finished.
+- Added a stop-all-subagents key (`app.subagents.stopAll`, default Alt+X) in the chat's subagent panel and the agents view, confirmed by a second press that names how many; stopping a finished subagent now also stops the follow-up turn it is running.
+- Fixed an old failed subagent row pinning the subagent panel open after the parent already received its failure.
+- Changed the agents view's subagent stop/delete status messages to Chinese.

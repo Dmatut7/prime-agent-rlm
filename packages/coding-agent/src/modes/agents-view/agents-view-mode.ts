@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { resolve as resolvePath } from "node:path";
+import { dirname, resolve as resolvePath } from "node:path";
 import {
 	type AutocompleteProvider,
 	CombinedAutocompleteProvider,
@@ -77,6 +77,7 @@ import {
 	type AgentsViewSelectionKey,
 	buildAgentsViewRows,
 	buildUnifiedSessionIndex,
+	collectSubagentDescendantSummaries,
 	computeRecursiveRollups,
 	createUnattachableChildOpenResult,
 	filterUnifiedSessions,
@@ -127,6 +128,8 @@ const RECONNECT_TIMEOUT_MS = 120000;
 const RECONNECT_RETRY_MS = 1000;
 const EXIT_HINT_DURATION_MS = 2000;
 const DELETE_CONFIRM_DURATION_MS = 2000;
+/** How long the first stop-all-subagents press stays armed for the confirming second press. */
+const STOP_ALL_SUBAGENTS_CONFIRM_WINDOW_MS = 5000;
 const STATUS_MESSAGE_DURATION_MS = 4500;
 const SEARCH_PROMPT_PLACEHOLDER = "搜索会话";
 const REPLY_PROMPT_FALLBACK_PLACEHOLDER = "回复这个会话";
@@ -153,6 +156,10 @@ export interface AgentsViewModeOptions {
 	initialScopeKey?: AgentsViewScopeKey;
 	/** A child picked in the chat's subagent panel: opened as soon as the roster lists it. */
 	initialOpenActiveSessionId?: string;
+	/** The same pick by child identity, for a child the daemon already closed. */
+	initialOpenChild?: AgentsViewPendingChildOpen;
+	/** A line to show when the view opens (why the chat that launched it ended). */
+	initialStatusMessage?: string;
 }
 
 export type AgentsViewRunResult =
@@ -200,7 +207,45 @@ export type AgentsViewPersistentState = {
 	heartbeats?: AgentConnectionHeartbeat[];
 	/** Open this live session instead of showing the list, once (see takePendingOpen). */
 	pendingOpenActiveSessionId?: string;
+	/** The same pick by child identity, for a child that is no longer resident (see takePendingOpen). */
+	pendingOpenChild?: AgentsViewPendingChildOpen;
 };
+
+export interface AgentsViewPendingChildOpen {
+	childId: string;
+	/** The child's session directory; its saved transcript lives directly in it. */
+	sessionDir?: string;
+}
+
+/**
+ * The session to open for a child picked in the chat's subagent panel: its live
+ * session when it has one, else its saved transcript - opening that one reopens
+ * (rehydrates) the child the daemon closed after it sat idle. Grandchildren keep
+ * their transcripts in nested directories, so only a file directly in the child's
+ * own directory counts.
+ */
+export function resolvePendingChildOpenSummary(
+	pending: AgentsViewPendingChildOpen,
+	liveSummaries: readonly SessionSummary[],
+	savedSessions: readonly AgentConnectionSavedSessionInfo[],
+): SessionSummary | undefined {
+	const dir = pending.sessionDir ? resolvePath(canonicalizePath(pending.sessionDir)) : undefined;
+	const inChildDir = (file: string | undefined): boolean =>
+		dir !== undefined && file !== undefined && resolvePath(dirname(canonicalizePath(file))) === dir;
+	const live = liveSummaries.find(
+		(summary) =>
+			summary.activeSessionId !== undefined &&
+			summary.rlmChildId === pending.childId &&
+			(dir === undefined || inChildDir(summary.sessionFile)),
+	);
+	if (live) return live;
+	const saved = savedSessions
+		.filter((session) => inChildDir(session.path))
+		.sort((a, b) => b.modified.getTime() - a.modified.getTime())[0];
+	return saved
+		? summaryForUnifiedRecord({ saved, identity: "", identityAliases: [], section: "inactive" })
+		: undefined;
+}
 
 type PromptCommand = Extract<DaemonCommand, { type: "prompt" }>;
 type PendingDeleteAgent = {
@@ -323,11 +368,16 @@ export function createInitialAgentsViewScopeFrames(
 }
 
 export function createInitialAgentsViewPersistentState(
-	options: Pick<AgentsViewModeOptions, "initialScopeKey" | "initialSession" | "initialOpenActiveSessionId">,
+	options: Pick<
+		AgentsViewModeOptions,
+		"initialScopeKey" | "initialSession" | "initialOpenActiveSessionId" | "initialOpenChild" | "initialStatusMessage"
+	>,
 ): AgentsViewPersistentState {
 	const initialSession = options.initialSession;
 	return {
 		...(options.initialOpenActiveSessionId ? { pendingOpenActiveSessionId: options.initialOpenActiveSessionId } : {}),
+		...(options.initialOpenChild ? { pendingOpenChild: options.initialOpenChild } : {}),
+		...(options.initialStatusMessage ? { statusMessage: options.initialStatusMessage } : {}),
 		...(initialSession
 			? {
 					selectedRowIdentity: getSummaryIdentity(initialSession),
@@ -733,6 +783,15 @@ async function runAgentsViewLoop(
 				if (interactiveResult.openChildActiveSessionId) {
 					persistentState.pendingOpenActiveSessionId = interactiveResult.openChildActiveSessionId;
 				}
+				if (interactiveResult.openChild) {
+					persistentState.pendingOpenChild = interactiveResult.openChild;
+				}
+				if (interactiveResult.returnToParentNotice) {
+					// The child this window showed is gone: go back to the chat it came from.
+					persistentState.statusMessage = interactiveResult.returnToParentNotice;
+					const parentActiveSessionId = opened.summary.parentActiveSessionId;
+					if (parentActiveSessionId) persistentState.pendingOpenActiveSessionId = parentActiveSessionId;
+				}
 				if (interactiveResult.type === "scoped_agents_view") {
 					const nextScope = { sessionId: source.sessionId, activeSessionId: source.activeSessionId };
 					persistentState.scopeFrames = transitionAgentsViewScope(persistentState.scopeFrames ?? [], {
@@ -895,6 +954,10 @@ export class AgentsViewMode implements Component, Focusable {
 	private scopeKey: AgentsViewScopeKey | undefined;
 	private scopeRootSummary: SessionSummary | undefined;
 	private savedCatalogReady = false;
+	/** A closed child to reopen once the saved catalog lists it (see resolveDeferredChildOpen). */
+	private deferredChildOpen: AgentsViewPendingChildOpen | undefined;
+	/** Armed by the first stop-all press: which family, how many, and until when. */
+	private stopAllArmed: { rootActiveSessionId: string; childIds: string[]; until: number } | undefined;
 	private savedCatalogGeneration = 0;
 	private heartbeatCatalogGeneration = 0;
 	private savedCatalogRefreshPending = false;
@@ -1183,14 +1246,47 @@ export class AgentsViewMode implements Component, Focusable {
 	 */
 	private takePendingOpen(): Extract<AgentsViewRunResult, { type: "open" }> | undefined {
 		const activeSessionId = this.persistentState.pendingOpenActiveSessionId;
-		if (!activeSessionId) return undefined;
+		const pendingChild = this.persistentState.pendingOpenChild;
+		if (!activeSessionId && !pendingChild) return undefined;
 		this.persistentState.pendingOpenActiveSessionId = undefined;
-		const summary = this.rosterStore?.summaries().find((entry) => entry.activeSessionId === activeSessionId);
-		if (!summary) {
-			this.persistentState.statusMessage ??= "那个子代理已经不在运行了，没法直接打开；它在下面的列表里";
+		this.persistentState.pendingOpenChild = undefined;
+		const liveSummaries = this.rosterStore?.summaries() ?? [];
+		const summary = activeSessionId
+			? liveSummaries.find((entry) => entry.activeSessionId === activeSessionId)
+			: undefined;
+		if (summary) return { type: "open", summary, hasChildren: summary.hasRunningRlmChildren === true };
+		if (pendingChild) {
+			// Closed after it sat idle: its saved transcript reopens it.
+			const reopened = resolvePendingChildOpenSummary(pendingChild, liveSummaries, this.savedSessions);
+			if (reopened) return { type: "open", summary: reopened, hasChildren: false };
+			if (!this.savedCatalogReady) {
+				this.deferredChildOpen = pendingChild;
+				this.persistentState.statusMessage ??= "那个子代理已经自动关闭了，正在找它的记录重新打开…";
+				return undefined;
+			}
+			this.persistentState.statusMessage ??= "那个子代理已经关闭了，也没找到它的记录（可能已被删除）";
 			return undefined;
 		}
-		return { type: "open", summary, hasChildren: summary.hasRunningRlmChildren === true };
+		this.persistentState.statusMessage ??= "那个子代理已经不在运行了，没法直接打开；它在下面的列表里";
+		return undefined;
+	}
+
+	/**
+	 * A child picked in the chat's panel whose saved transcript had not loaded yet
+	 * when the view opened: open it as soon as the catalog has it.
+	 */
+	private resolveDeferredChildOpen(): void {
+		const pending = this.deferredChildOpen;
+		if (!pending || this.stopped) return;
+		const summary = resolvePendingChildOpenSummary(pending, this.rosterStore?.summaries() ?? [], this.savedSessions);
+		if (summary) {
+			this.deferredChildOpen = undefined;
+			this.finish({ type: "open", summary, hasChildren: false });
+			return;
+		}
+		if (!this.savedCatalogReady) return;
+		this.deferredChildOpen = undefined;
+		this.setStatusMessage("那个子代理已经关闭了，也没找到它的记录（可能已被删除）", { tone: "warning" });
 	}
 
 	handleInput(data: string): void {
@@ -1219,6 +1315,11 @@ export class AgentsViewMode implements Component, Focusable {
 		if (this.editor.getText().length === 0 && this.keybindings.matches(data, "app.agents.delete")) {
 			this.clearCtrlCExitHint({ render: false });
 			void this.handleDeleteSelected();
+			return;
+		}
+		if (this.editor.getText().length === 0 && this.keybindings.matches(data, "app.subagents.stopAll")) {
+			this.clearCtrlCExitHint({ render: false });
+			void this.handleStopAllSubagents();
 			return;
 		}
 		this.clearCtrlCExitHint({ render: false });
@@ -2243,6 +2344,74 @@ export class AgentsViewMode implements Component, Focusable {
 		await this.stopAgentForDeletion(row);
 	}
 
+	/**
+	 * The stop-all-subagents key: stops every working subagent in the selected
+	 * agent's family (or the scoped family). The first press names how many, a second
+	 * press within the window stops them - children keep spending while the owner is
+	 * away, and one key is how they stop without walking every row.
+	 */
+	private async handleStopAllSubagents(): Promise<void> {
+		const root = this.stopAllSubagentsRoot();
+		const rootActiveSessionId = root?.activeSessionId;
+		if (!root || !rootActiveSessionId) {
+			this.stopAllArmed = undefined;
+			this.setStatusMessage("先选中一个正在运行的会话，才能停止它的子代理");
+			return;
+		}
+		const childIds = collectSubagentDescendantSummaries(this.lastListedSummaries, root)
+			.filter((summary) => summary.isSessionActive === true || summary.statusLabel === "queued")
+			.map((summary) => summary.rlmChildId)
+			.filter((childId): childId is string => childId !== undefined);
+		if (childIds.length === 0) {
+			this.stopAllArmed = undefined;
+			this.setStatusMessage(`${getAgentsViewSessionTitle(root)} 现在没有在跑的子代理`);
+			return;
+		}
+		const now = Date.now();
+		const armed = this.stopAllArmed;
+		if (!armed || armed.rootActiveSessionId !== rootActiveSessionId || now > armed.until) {
+			this.stopAllArmed = { rootActiveSessionId, childIds, until: now + STOP_ALL_SUBAGENTS_CONFIRM_WINDOW_MS };
+			this.setStatusMessage(
+				`再按一次 ${keyText("app.subagents.stopAll")} 停止 ${getAgentsViewSessionTitle(root)} 的全部 ${childIds.length} 个在跑的子代理（做到一半的会停下，记录保留）`,
+				{ tone: "warning" },
+			);
+			return;
+		}
+		this.stopAllArmed = undefined;
+		const client = this.requireClient();
+		this.setStatusMessage(`正在停止 ${armed.childIds.length} 个子代理…`);
+		const results = await Promise.allSettled(
+			armed.childIds.map((childId) =>
+				client.request({ type: "cancel_rlm_child", activeSessionId: rootActiveSessionId, childId }),
+			),
+		);
+		const failures = results.filter((result) => result.status === "rejected");
+		if (failures.length > 0) {
+			const first = failures[0];
+			const error = first?.status === "rejected" ? first.reason : undefined;
+			this.setStatusMessage(
+				isUnknownDaemonCommandError(error, "cancel_rlm_child")
+					? "后台服务是旧版本，停不了子代理；重启后台服务后再试"
+					: formatError(`有 ${failures.length} 个子代理没停下`, error),
+				{ tone: "warning" },
+			);
+		} else {
+			this.setStatusMessage(`已停止 ${armed.childIds.length} 个子代理`);
+		}
+		await this.refreshSessions();
+	}
+
+	/** The live agent whose subagents the stop-all key acts on: the selected family, else the scope. */
+	private stopAllSubagentsRoot(): SessionSummary | undefined {
+		const row = this.rows[this.selectedIndex];
+		if (row?.kind === "agent" && row.summary.activeSessionId) return row.summary;
+		if (row && row.kind !== "agent") {
+			const rootRow = this.findSubagentRootRow(row);
+			if (rootRow?.summary.activeSessionId) return rootRow.summary;
+		}
+		return this.scopeRootSummary?.activeSessionId ? this.scopeRootSummary : undefined;
+	}
+
 	private async handleKillSubagentSelected(row: AgentsViewRow): Promise<void> {
 		const identity = getSummaryIdentity(row.summary);
 		if (this.pendingKillSubagent?.identity === identity && this.isDeleteConfirmationVisible()) {
@@ -2254,7 +2423,7 @@ export class AgentsViewMode implements Component, Focusable {
 		const childId = row.summary.rlmChildId;
 		const rootActiveSessionId = this.findSubagentRootRow(row)?.summary.activeSessionId;
 		if (!childId || !rootActiveSessionId) {
-			this.setStatusMessage("Cannot stop subagent without its parent agent");
+			this.setStatusMessage("找不到这个子代理的父代理，没法停止它");
 			return;
 		}
 		this.pendingKillSubagent = { identity, rootActiveSessionId, childId };
@@ -2264,7 +2433,7 @@ export class AgentsViewMode implements Component, Focusable {
 	private async killSubagent(pending: PendingKillSubagent, currentRow: AgentsViewRow): Promise<void> {
 		const running = hasLiveWork(currentRow);
 		const client = this.requireClient();
-		this.setStatusMessage(running ? "Stopping subagent..." : "Deleting subagent...");
+		this.setStatusMessage(running ? "正在停止子代理…" : "正在删除子代理…");
 		try {
 			if (!running && client.supportsServerCapability("delete_rlm_subagent")) {
 				const data = requireDaemonData(
@@ -2277,11 +2446,7 @@ export class AgentsViewMode implements Component, Focusable {
 				const deleted = isRecord(data) && data.deleted === true;
 				const stillRunning = isRecord(data) && data.reason === "running";
 				this.setStatusMessage(
-					deleted
-						? "Subagent deleted"
-						: stillRunning
-							? "Subagent is running; stop it first"
-							: "Subagent already removed",
+					deleted ? "子代理已删除" : stillRunning ? "子代理还在运行，先停止它再删除" : "子代理已经删掉了",
 					{ render: false },
 				);
 			} else {
@@ -2294,11 +2459,7 @@ export class AgentsViewMode implements Component, Focusable {
 				);
 				const cancelled = isRecord(data) && data.cancelled === true;
 				this.setStatusMessage(
-					running
-						? cancelled
-							? "Subagent stopped"
-							: "Subagent already finished"
-						: "The daemon cannot delete subagents; it was left unchanged",
+					running ? (cancelled ? "子代理已停止" : "子代理已经结束了") : "后台服务不支持删除子代理，没有改动",
 					{ render: false, ...(running ? {} : { tone: "warning" as const }) },
 				);
 			}
@@ -2307,8 +2468,8 @@ export class AgentsViewMode implements Component, Focusable {
 			const command = running ? "cancel_rlm_child" : "delete_rlm_subagent";
 			this.setStatusMessage(
 				isUnknownDaemonCommandError(error, command)
-					? "Failed to update subagent: the daemon is running an older build; restart the daemon and try again"
-					: formatError("Failed to update subagent", error),
+					? "操作子代理失败：后台服务是旧版本，重启后台服务后再试"
+					: formatError("操作子代理失败", error),
 			);
 		}
 	}
@@ -2638,6 +2799,7 @@ export class AgentsViewMode implements Component, Focusable {
 			if (generation === this.savedCatalogGeneration) {
 				this.savedCatalogRefreshPending = false;
 				this.resolveMissingSelectionAnchor();
+				if (this.deferredChildOpen) this.resolveDeferredChildOpen();
 			}
 		}
 	}
@@ -3173,6 +3335,10 @@ export class AgentsViewMode implements Component, Focusable {
 			// Idle on the display axis while its kernel still hosts live work.
 			selectedSubagent ? `${keyText("app.agents.delete")} ${hasLiveWork(selectedRow) ? "停止" : "删除"}` : undefined,
 			this.selectedRowCanShowProgram() ? `${keyText("app.agents.program")} 程序` : undefined,
+			selectedRow &&
+			((selectedRow.runningSubagentCount ?? 0) > 0 || selectedRow.summary?.hasRunningRlmChildren === true)
+				? `${keyText("app.subagents.stopAll")} 停全部子代理`
+				: undefined,
 		]
 			.filter((hint): hint is string => hint !== undefined)
 			.join("   ");

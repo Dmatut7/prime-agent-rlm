@@ -118,6 +118,7 @@ import {
 	isSessionSlashCommandMessage,
 	isSessionSlashCommandResultMessage,
 	REFINEMENT_OUTCOME_CUSTOM_TYPE,
+	RLM_CHILD_FAILURE_CUSTOM_TYPE,
 	SESSION_SLASH_COMMAND_CUSTOM_TYPE,
 	SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
 } from "../../core/messages.js";
@@ -184,6 +185,7 @@ import type {
 	AgentConnectionResourceDiagnostic,
 	AgentConnectionResourceSnapshot,
 	AgentConnectionRlmChildAgentSnapshot,
+	AgentConnectionSessionClosedReason,
 	AgentConnectionSessionContext,
 	AgentConnectionSessionEvent,
 	AgentConnectionSessionTreeNode,
@@ -282,10 +284,12 @@ import {
 import { SlashCommandResultMessageComponent } from "./components/slash-command-result-message.js";
 import {
 	buildSubagentPanelRows,
+	classifySubagentSnapshotStatus,
 	collectSubtreeSubagentSnapshots,
 	countRosterSubagentStatuses,
 	countSubtreeSubagentStatuses,
 	formatSubagentStallMarker,
+	type SubagentPanelRow,
 	type SubagentSummaryCounts,
 	SubagentSummaryLine,
 	summarizeSubagentSpend,
@@ -406,6 +410,8 @@ const SUBAGENT_SPEND_HEAVY_INTERVAL_MS = 15_000;
  * quiet family costs one scan per tick instead of one per update.
  */
 const SUBAGENT_SPEND_IDLE_TICK_MS = 15_000;
+/** How long the first stop-all-subagents press stays armed for the confirming second press. */
+const STOP_ALL_SUBAGENTS_CONFIRM_WINDOW_MS = 5_000;
 
 /**
  * One context-tree scan and who it belongs to. The spend cell and the fullscreen top
@@ -1162,6 +1168,16 @@ export interface InteractiveModeRunResult {
 	type: "agents_view" | "scoped_agents_view";
 	/** A subagent picked in the chat's panel: the agents view opens it straight away. */
 	openChildActiveSessionId?: string;
+	/**
+	 * The same pick by child identity, for a child that is no longer resident (the
+	 * daemon closed it after it sat idle): the agents view reopens its saved session.
+	 */
+	openChild?: { childId: string; sessionDir?: string };
+	/**
+	 * This subagent's session was closed under the viewer (deleted, stopped, or
+	 * finished): the agents view returns to its parent and shows this line.
+	 */
+	returnToParentNotice?: string;
 	source: Pick<AgentConnectionState, "activeSessionId" | "sessionFile" | "sessionId" | "sessionName" | "cwd">;
 }
 
@@ -1231,6 +1247,7 @@ export class InteractiveMode {
 	private admitPendingStartupPrompts: (() => Promise<StartupPromptBarrierOutcome>) | undefined;
 	private agentsViewRequest: InteractiveModeRunResult["type"] | undefined;
 	private openChildActiveSessionId: string | undefined;
+	private agentsViewHandoff: Pick<InteractiveModeRunResult, "openChild" | "returnToParentNotice"> = {};
 	private loadingAnimation: Loader | undefined = undefined;
 	private workingMessage: string | undefined = undefined;
 	/** Block navigation (Alt+Up): the invisible focus owner and the focused block. */
@@ -1357,6 +1374,12 @@ export class InteractiveMode {
 	private subagentSummaryLine: SubagentSummaryLine;
 	private trayInfoLine: TrayInfoLine;
 	private subagentSnapshots = new Map<string, AgentConnectionRlmChildAgentSnapshot>();
+	/** Children whose failure notice this chat has shown: the parent already knows. */
+	private readonly seenSubagentFailureIds = new Set<string>();
+	/** Armed by the first stop-all press; a second press within the window stops them. */
+	private stopAllSubagentsArmedUntil: number | undefined;
+	/** How this session's latest assistant message ended; tells a failed close from a finished one. */
+	private lastAssistantStopReason: AssistantMessage["stopReason"] | undefined;
 	private subagentCounts: SubagentSummaryCounts = { total: 0, running: 0, idle: 0, inactive: 0 };
 	private subagentSpendTimer: ReturnType<typeof setTimeout> | undefined;
 	/** When the pending spend-refresh timer fires (epoch ms); 0 with no timer. */
@@ -1592,7 +1615,8 @@ export class InteractiveMode {
 		);
 		this.subagentSummaryLine = new SubagentSummaryLine();
 		this.subagentSummaryLine.setOpenable(this.options.returnToAgentsView === true);
-		this.subagentSummaryLine.onOpen = (row) => void this.openScopedAgentsView(row?.activeSessionId);
+		this.subagentSummaryLine.onOpen = (row) => void this.openScopedAgentsView(row?.activeSessionId, row);
+		this.subagentSummaryLine.onStopAll = () => void this.requestStopAllSubagents();
 		this.subagentSummaryLine.onCancel = () => this.focusEditor();
 		this.subagentSummaryLine.onChatAction = (data) => this.handleSubagentSummaryChatAction(data);
 		this.footerDataProvider = new FooterDataProvider(this.uiServices.getInitialCwd());
@@ -2223,6 +2247,7 @@ export class InteractiveMode {
 			...(this.agentsViewRequest === "scoped_agents_view" && this.openChildActiveSessionId
 				? { openChildActiveSessionId: this.openChildActiveSessionId }
 				: {}),
+			...this.agentsViewHandoff,
 			source: {
 				activeSessionId: state?.activeSessionId,
 				sessionFile: state?.sessionFile,
@@ -4934,6 +4959,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
 		this.defaultEditor.onAction("app.thinking.toggleAll", () => this.toggleThinkingBlockVisibility(true));
 		this.defaultEditor.onAction("app.subagents.focus", () => this.focusSubagentSummary());
+		this.defaultEditor.onAction("app.subagents.stopAll", () => void this.requestStopAllSubagents());
 		this.defaultEditor.onAction("app.heartbeats.open", () => {
 			void this.showHeartbeatManager();
 		});
@@ -5988,6 +6014,9 @@ export class InteractiveMode {
 		this.unsubscribe = this.agentConnection.subscribe(async (event) => {
 			try {
 				if (event.type === "session_event") {
+					if (event.event.type === "message_end" && event.event.message.role === "assistant") {
+						this.lastAssistantStopReason = event.event.message.stopReason;
+					}
 					// Connection adapters dispatch without awaiting, so serialize events.
 					// Replacement advances the generation before entering this queue, which
 					// prevents already-queued source events from mutating the target UI.
@@ -6048,7 +6077,9 @@ export class InteractiveMode {
 				} else if (event.type === "heartbeats_changed") {
 					await this.refreshHeartbeatCatalog();
 				} else if (event.type === "closed") {
-					this.showError(event.error ?? "Agent connection closed");
+					if (!this.returnToParentAfterSubagentClosed(event.sessionClosedReason)) {
+						this.showError(event.error ?? "Agent connection closed");
+					}
 				}
 			} catch (error) {
 				this.showError(error instanceof Error ? error.message : String(error));
@@ -7105,7 +7136,9 @@ export class InteractiveMode {
 			if (marker) stallMarkers.push(`${child.sessionName ?? child.label}: ${marker}`);
 		}
 		this.subagentSummaryLine.setStallMarkers(stallMarkers);
-		this.subagentSummaryLine.setSubagentRows(buildSubagentPanelRows(this.subagentSnapshots.values(), this.rlmNodeId));
+		this.subagentSummaryLine.setSubagentRows(
+			buildSubagentPanelRows(this.subagentSnapshots.values(), this.rlmNodeId, this.seenSubagentFailureIds),
+		);
 		if (!this.subagentSummaryLine.isSelectable() && this.subagentSummaryLine.focused) this.focusEditor();
 	}
 
@@ -7371,13 +7404,90 @@ export class InteractiveMode {
 	 * Enter on the subagent panel: straight into the selected child when it has a
 	 * daemon session to attach to, else this session's children list.
 	 */
-	private async openScopedAgentsView(childActiveSessionId?: string): Promise<void> {
+	private async openScopedAgentsView(childActiveSessionId?: string, row?: SubagentPanelRow): Promise<void> {
 		if (!this.options.returnToAgentsView) {
 			this.focusEditor();
 			this.showStatus("会话列表需要后台服务；不带 --no-daemon 启动才能浏览会话");
 			return;
 		}
-		await this.returnToAgentsView("scoped_agents_view", childActiveSessionId);
+		// The row's child identity rides along: a child the daemon closed after it sat
+		// idle has no live session to attach to, and the agents view reopens it by it.
+		const reopenable = row !== undefined && row.state !== "running" && row.state !== "stalled";
+		await this.returnToAgentsView("scoped_agents_view", childActiveSessionId, {
+			...(reopenable
+				? { openChild: { childId: row.id, ...(row.sessionDir ? { sessionDir: row.sessionDir } : {}) } }
+				: {}),
+		});
+	}
+
+	/**
+	 * The stop-all-subagents key: the first press names how many children it would
+	 * stop, a second press within the window stops them. Esc is left alone on
+	 * purpose - it interrupts this session's own turn, and a child the owner still
+	 * wants keeps working.
+	 */
+	private async requestStopAllSubagents(): Promise<void> {
+		const working = collectSubtreeSubagentSnapshots(this.subagentSnapshots.values(), this.rlmNodeId).filter(
+			(child) => classifySubagentSnapshotStatus(child) === "running",
+		);
+		if (working.length === 0) {
+			this.stopAllSubagentsArmedUntil = undefined;
+			this.showStatus("现在没有在跑的子代理");
+			return;
+		}
+		const now = Date.now();
+		if (this.stopAllSubagentsArmedUntil === undefined || now > this.stopAllSubagentsArmedUntil) {
+			this.stopAllSubagentsArmedUntil = now + STOP_ALL_SUBAGENTS_CONFIRM_WINDOW_MS;
+			this.showStatus(
+				`再按一次 ${keyText("app.subagents.stopAll")} 停止全部 ${working.length} 个在跑的子代理（做到一半的会停下，记录保留）`,
+				"warning",
+			);
+			return;
+		}
+		this.stopAllSubagentsArmedUntil = undefined;
+		const results = await Promise.allSettled(working.map((child) => this.agentConnection.cancelRlmChild(child.id)));
+		const failures = results.filter((result) => result.status === "rejected");
+		if (failures.length > 0) {
+			const first = failures[0];
+			const reason =
+				first?.status === "rejected" && first.reason instanceof Error ? first.reason.message : "未知错误";
+			this.showStatus(`有 ${failures.length} 个子代理没停下：${reason}`, "warning");
+			return;
+		}
+		this.showStatus(`已停止全部 ${working.length} 个在跑的子代理`);
+	}
+
+	/**
+	 * The daemon closed the subagent this window is attached to - its parent deleted
+	 * it, it was stopped, or it finished and was closed. The window would otherwise
+	 * sit on a dead session with an English daemon error; instead it goes back to the
+	 * parent with a line saying what happened. Returns false when this is not that
+	 * case, and the caller shows the connection's own error.
+	 */
+	private returnToParentAfterSubagentClosed(reason: AgentConnectionSessionClosedReason | undefined): boolean {
+		if (!this.options.returnToAgentsView || (this.options.sessionDepth ?? 0) < 1) return false;
+		let notice: string;
+		if (reason === "killed") {
+			notice = "刚才看的子代理已被停止或删除（记录还在），已回到父代理";
+		} else if (reason === "completed") {
+			notice =
+				this.lastAssistantStopReason === "error"
+					? "刚才看的子代理出错停下了，已关闭（记录还在），已回到父代理"
+					: "刚才看的子代理已做完并关闭（记录还在），已回到父代理";
+		} else {
+			return false;
+		}
+		void this.returnToAgentsView("agents_view", undefined, { returnToParentNotice: notice });
+		return true;
+	}
+
+	/** A failure notice this chat shows is one the parent has received: its row stops holding the panel open. */
+	private noteSubagentFailureSeen(message: CustomMessage): void {
+		if (message.customType !== RLM_CHILD_FAILURE_CUSTOM_TYPE) return;
+		const childId = (message.details as { childId?: unknown } | undefined)?.childId;
+		if (typeof childId !== "string" || this.seenSubagentFailureIds.has(childId)) return;
+		this.seenSubagentFailureIds.add(childId);
+		this.updateSubagentSummaryLine();
 	}
 
 	private handleSubagentSummaryChatAction(data: string): void {
@@ -7742,6 +7852,7 @@ export class InteractiveMode {
 	}
 
 	private addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void {
+		if (message.role === "assistant") this.lastAssistantStopReason = message.stopReason;
 		switch (message.role) {
 			case "bashExecution": {
 				const component = new BashExecutionComponent(message.command, this.ui, message.excludeFromContext, {
@@ -7760,6 +7871,7 @@ export class InteractiveMode {
 				break;
 			}
 			case "custom": {
+				this.noteSubagentFailureSeen(message);
 				if (message.display) {
 					const component = this.createDisplayedCustomMessageComponent(message);
 					applyExpansionLanes(component, {
@@ -7921,6 +8033,10 @@ export class InteractiveMode {
 		this.resetPendingToolState();
 		const transcriptMessages = this.orderMessagesForTranscript(sessionContext.messages);
 		const messagesToRender = options.limitTranscript ? initialRenderMessages(transcriptMessages) : transcriptMessages;
+		// A failure notice older than the render window was still received by this session.
+		for (const message of transcriptMessages) {
+			if (message.role === "custom") this.noteSubagentFailureSeen(message);
+		}
 		this.chatTranscriptTrimmed = messagesToRender.length < transcriptMessages.length;
 		// A full (unwindowed) render resets the cap-rebuild floor.
 		if (!options.limitTranscript) this.chatCapRebuildFloor = 0;
@@ -8774,11 +8890,13 @@ export class InteractiveMode {
 	private async returnToAgentsView(
 		request: InteractiveModeRunResult["type"] = "agents_view",
 		openChildActiveSessionId?: string,
+		handoff: Pick<InteractiveModeRunResult, "openChild" | "returnToParentNotice"> = {},
 	): Promise<void> {
 		if (this.isShuttingDown || this.agentsViewRequest) return;
 		this.stashDraftForAgentsView();
 		this.agentsViewRequest = request;
 		this.openChildActiveSessionId = openChildActiveSessionId;
+		this.agentsViewHandoff = handoff;
 		this.isShuttingDown = true;
 		this.unregisterSignalHandlers();
 

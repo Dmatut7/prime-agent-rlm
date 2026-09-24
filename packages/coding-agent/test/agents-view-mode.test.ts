@@ -12,6 +12,7 @@ import {
 	buildAgentsViewUsageLayout,
 	combineAgentsViewStartupNotices,
 	createInitialAgentsViewPersistentState,
+	resolvePendingChildOpenSummary,
 	runAgentsViewMode,
 	waitThroughDaemonUpdateRestart,
 } from "../src/modes/agents-view/agents-view-mode.js";
@@ -258,7 +259,7 @@ describe("AgentsViewMode", () => {
 			childId: "passive-child",
 		});
 		expect(request).not.toHaveBeenCalledWith(expect.objectContaining({ type: "cancel_rlm_child" }));
-		expect(self.setStatusMessage).toHaveBeenCalledWith("Subagent deleted", { render: false });
+		expect(self.setStatusMessage).toHaveBeenCalledWith("子代理已删除", { render: false });
 	});
 
 	it("uses cancel when an inactive subagent starts running during confirmation", async () => {
@@ -300,7 +301,7 @@ describe("AgentsViewMode", () => {
 			activeSessionId: "root-active",
 			childId: "passive-child",
 		});
-		expect(self.setStatusMessage).toHaveBeenCalledWith("The daemon cannot delete subagents; it was left unchanged", {
+		expect(self.setStatusMessage).toHaveBeenCalledWith("后台服务不支持删除子代理，没有改动", {
 			render: false,
 			tone: "warning",
 		});
@@ -2423,5 +2424,122 @@ describe("waitThroughDaemonUpdateRestart", () => {
 		} finally {
 			vi.useRealTimers();
 		}
+	});
+});
+
+describe("agents view: closed subagents and stop-all", () => {
+	function saved(
+		path: string,
+		overrides: Partial<AgentConnectionSavedSessionInfo> = {},
+	): AgentConnectionSavedSessionInfo {
+		return {
+			path,
+			id: `id-${path}`,
+			cwd: "/tmp",
+			parentSessionPath: "/tmp/root.jsonl",
+			created: new Date(1_000),
+			modified: new Date(2_000),
+			messageCount: 2,
+			firstMessage: "task",
+			allMessagesText: "task",
+			...overrides,
+		};
+	}
+
+	it("finds a closed child's own saved transcript, not a grandchild's", () => {
+		const pending = { childId: "sub-1", sessionDir: "/tmp/rlm/sub-1" };
+		const opened = resolvePendingChildOpenSummary(
+			pending,
+			[],
+			[
+				saved("/tmp/rlm/sub-1/sub-9/grandchild.jsonl", { modified: new Date(9_000) }),
+				saved("/tmp/rlm/sub-1/child.jsonl"),
+			],
+		);
+		expect(opened?.sessionFile).toBe("/tmp/rlm/sub-1/child.jsonl");
+		// No activeSessionId: opening it resumes (rehydrates) the saved child.
+		expect(opened?.activeSessionId).toBeUndefined();
+		// A child that is live again opens live.
+		const live = summary({
+			activeSessionId: "live-1",
+			rlmChildId: "sub-1",
+			sessionFile: "/tmp/rlm/sub-1/child.jsonl",
+		});
+		expect(resolvePendingChildOpenSummary(pending, [live], [])).toBe(live);
+		expect(resolvePendingChildOpenSummary({ childId: "sub-2", sessionDir: "/tmp/rlm/sub-2" }, [live], [])).toBe(
+			undefined,
+		);
+	});
+
+	it("opens a closed child picked in the chat panel instead of saying it is gone", () => {
+		const persistentState: AgentsViewPersistentState = {
+			pendingOpenChild: { childId: "sub-1", sessionDir: "/tmp/rlm/sub-1" },
+		};
+		const self: Record<string, unknown> = {
+			persistentState,
+			rosterStore: { summaries: () => [] },
+			savedSessions: [saved("/tmp/rlm/sub-1/child.jsonl")],
+			savedCatalogReady: true,
+		};
+		const result = invoke("takePendingOpen", self) as { type: string; summary: SessionSummary } | undefined;
+		expect(result?.type).toBe("open");
+		expect(result?.summary.sessionFile).toBe("/tmp/rlm/sub-1/child.jsonl");
+		expect(persistentState.statusMessage).toBeUndefined();
+
+		// The catalog has not loaded yet: wait for it instead of giving up.
+		const waiting: Record<string, unknown> = {
+			persistentState: { pendingOpenChild: { childId: "sub-1", sessionDir: "/tmp/rlm/sub-1" } },
+			rosterStore: { summaries: () => [] },
+			savedSessions: [],
+			savedCatalogReady: false,
+		};
+		expect(invoke("takePendingOpen", waiting)).toBeUndefined();
+		expect(waiting.deferredChildOpen).toEqual({ childId: "sub-1", sessionDir: "/tmp/rlm/sub-1" });
+	});
+
+	it("stops every working subagent of the selected family after a confirming second press", async () => {
+		const root = summary({ activeSessionId: "root-active", sessionId: "root-session", sessionName: "boss" });
+		const running = summary({
+			activeSessionId: "child-a",
+			sessionId: "child-a-session",
+			runtimeKind: "subagent",
+			parentActiveSessionId: "root-active",
+			rlmChildId: "sub-a",
+			isSessionActive: true,
+		});
+		const idle = summary({
+			activeSessionId: "child-b",
+			sessionId: "child-b-session",
+			runtimeKind: "subagent",
+			parentActiveSessionId: "root-active",
+			rlmChildId: "sub-b",
+		});
+		const request = vi.fn(async () => ({ success: true as const, data: { cancelled: true } }));
+		const self: Record<string, unknown> = {
+			rows: [{ kind: "agent", identity: "root", summary: root, runningSubagentCount: 1 }],
+			selectedIndex: 0,
+			lastListedSummaries: [root, running, idle],
+			requireClient: () => ({ request }),
+			setStatusMessage: vi.fn(),
+			refreshSessions: vi.fn(async () => true),
+			stopAllSubagentsRoot() {
+				return invoke("stopAllSubagentsRoot", self);
+			},
+		};
+
+		await invoke("handleStopAllSubagents", self);
+		expect(request).not.toHaveBeenCalled();
+		expect(self.setStatusMessage).toHaveBeenLastCalledWith(expect.stringContaining("全部 1 个在跑的子代理"), {
+			tone: "warning",
+		});
+
+		await invoke("handleStopAllSubagents", self);
+		expect(request).toHaveBeenCalledTimes(1);
+		expect(request).toHaveBeenCalledWith({
+			type: "cancel_rlm_child",
+			activeSessionId: "root-active",
+			childId: "sub-a",
+		});
+		expect(self.setStatusMessage).toHaveBeenLastCalledWith("已停止 1 个子代理");
 	});
 });

@@ -50,6 +50,7 @@ export type {
 	AgentConnectionSavedSessionState,
 	AgentConnectionSavedSessionStateStatus,
 	AgentConnectionScopedModel,
+	AgentConnectionSessionClosedReason,
 	AgentConnectionSessionContext,
 	AgentConnectionSessionEntry,
 	AgentConnectionSessionEntryBase,

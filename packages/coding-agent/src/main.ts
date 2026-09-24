@@ -99,6 +99,7 @@ import {
 } from "./modes/daemon/daemon-worker-protocol.js";
 import {
 	type AgentConnection,
+	type AgentsViewModeOptions,
 	type AgentsViewScopeKey,
 	ClientPromptStashStore,
 	createInteractiveModeLocalSessionHost,
@@ -1619,6 +1620,7 @@ export async function main(args: string[], options?: MainOptions) {
 			initialSession?: SessionSummary,
 			initialScopeKey?: AgentsViewScopeKey,
 			initialOpenActiveSessionId?: string,
+			handoff: Pick<AgentsViewModeOptions, "initialOpenChild" | "initialStatusMessage"> = {},
 		) => {
 			await runAgentsViewMode({
 				socketPath: daemonSocketPath,
@@ -1651,6 +1653,7 @@ export async function main(args: string[], options?: MainOptions) {
 				initialSession,
 				initialScopeKey,
 				initialOpenActiveSessionId,
+				...handoff,
 				verbose: parsed.verbose,
 			});
 		};
@@ -1749,7 +1752,18 @@ export async function main(args: string[], options?: MainOptions) {
 						activeSessionId: interactiveResult.source.activeSessionId,
 					}
 				: undefined;
-		await launchAgentsView(returnedSummary, initialScopeKey, interactiveResult.openChildActiveSessionId);
+		// A closed subagent hands the viewer back to its parent; a closed child picked in
+		// the panel is reopened by identity.
+		const returnToParent = interactiveResult.returnToParentNotice !== undefined;
+		await launchAgentsView(
+			returnedSummary,
+			initialScopeKey,
+			returnToParent ? summary.parentActiveSessionId : interactiveResult.openChildActiveSessionId,
+			{
+				...(interactiveResult.openChild ? { initialOpenChild: interactiveResult.openChild } : {}),
+				...(returnToParent ? { initialStatusMessage: interactiveResult.returnToParentNotice } : {}),
+			},
+		);
 		return;
 	}
 	if (useDaemonClient) {
