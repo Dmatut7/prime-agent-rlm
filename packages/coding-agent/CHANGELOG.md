@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.11.5] - 2026-09-24
+
+- Fixed a settings file that appeared right as a session started watching being missed until the next restart.
+
 ## [0.11.4] - 2026-09-24
 
 - Fixed automatic continue pushing past a step the model had stopped to get approval for ("once you approve", "你确认后"), and changed its notice to say an approval-gated step is never taken on a continue.
