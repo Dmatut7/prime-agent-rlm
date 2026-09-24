@@ -11,7 +11,11 @@ import {
 	type KernelClient,
 	ReplKernelManager,
 } from "../src/core/kernel/index.js";
-import { createIpythonToolDefinition, IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
+import {
+	BUSY_KERNEL_CHOICE_TIMEOUT_MS,
+	createIpythonToolDefinition,
+	IpythonKernelProvisioner,
+} from "../src/core/tools/ipython.js";
 
 let tempDir = "";
 
@@ -417,6 +421,7 @@ describe("IpythonKernelProvisioner", () => {
 			["Wait and preserve state", "Kill kernel and restart"],
 			{
 				signal: undefined,
+				timeout: BUSY_KERNEL_CHOICE_TIMEOUT_MS,
 			},
 		);
 		expect(setWorkingMessage).toHaveBeenCalledWith("Waiting for Python kernel...");

@@ -321,10 +321,17 @@ const ipythonSchema = Type.Object({
 
 const BUSY_KERNEL_WAIT_CHOICE = "Wait and preserve state";
 const BUSY_KERNEL_KILL_CHOICE = "Kill kernel and restart";
+/**
+ * How long the wait/kill choice waits for a person. With nobody at the keyboard (an
+ * unattended run) the question would otherwise block the session forever, so an
+ * unanswered prompt restarts the kernel, the same answer a headless session gets.
+ */
+export const BUSY_KERNEL_CHOICE_TIMEOUT_MS = 60_000;
 const BUSY_KERNEL_PROMPT = [
 	"Interrupted Python cell is still running",
 	"Ctrl+C sent an interrupt, but the previous cell has not stopped yet. A new command cannot start until it finishes.",
 	"Waiting preserves the current kernel state. Killing restarts the kernel and loses in-memory variables, imports, and running tasks.",
+	`With no answer in ${Math.round(BUSY_KERNEL_CHOICE_TIMEOUT_MS / 1000)}s the kernel is restarted automatically.`,
 ].join("\n");
 /**
  * Appended to an aborted cell's result: the output above it is partial, and the
@@ -332,7 +339,7 @@ const BUSY_KERNEL_PROMPT = [
  */
 export const IPYTHON_ABORTED_CELL_NOTICE = [
 	"<ipython_cell_aborted>",
-	'This cell was aborted while it was still running, so any output above is partial. The kernel may still be executing it: the next cell can report "The Python kernel is still running the previously interrupted cell" — wait for it to settle, or kill the kernel to start fresh.',
+	'This cell was aborted while it was still running, so any output above is partial. The kernel may still be executing it: the next cell can report "The Python kernel is still running the previously interrupted cell" — retry after a moment; a kernel that stays busy is restarted automatically and its saved state restored.',
 	"</ipython_cell_aborted>",
 ].join("\n");
 const KERNEL_RESTART_NOTICE = [
@@ -859,9 +866,16 @@ async function chooseBusyKernelAction(
 		// the next cell provisions a replacement and may restore the last saved snapshot.
 		return "kill";
 	}
+	const askedAt = Date.now();
 	const choice = await ctx.ui.select(BUSY_KERNEL_PROMPT, [BUSY_KERNEL_WAIT_CHOICE, BUSY_KERNEL_KILL_CHOICE], {
 		signal,
+		timeout: BUSY_KERNEL_CHOICE_TIMEOUT_MS,
 	});
+	// Unanswered until the timeout: nobody is there to choose, so do what a headless
+	// session does instead of leaving every later cell blocked on this kernel.
+	if (choice === undefined && !signal?.aborted && Date.now() - askedAt >= BUSY_KERNEL_CHOICE_TIMEOUT_MS - 250) {
+		return "kill";
+	}
 	if (choice === BUSY_KERNEL_WAIT_CHOICE) {
 		return "wait";
 	}

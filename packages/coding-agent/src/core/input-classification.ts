@@ -43,6 +43,7 @@ import { AGENT_MESSAGE_CUSTOM_TYPE } from "./agent-messages.js";
 import { GOAL_CONTEXT_CUSTOM_TYPE, GOAL_STATE_CUSTOM_TYPE } from "./goals.js";
 import {
 	ASYNC_BASH_COMPLETION_CUSTOM_TYPE,
+	AUTO_CONTINUE_CUSTOM_TYPE,
 	COMPACTION_OUTCOME_CUSTOM_TYPE,
 	type CustomMessage,
 	EMPTY_RESPONSE_RECOVERY_CUSTOM_TYPE,
@@ -161,6 +162,8 @@ const CUSTOM_TYPE_INPUT_CLASSES: ReadonlyMap<string, InputClass> = new Map<strin
 	// One-shot recovery continuation for an exhausted empty-response ladder: machine
 	// bookkeeping that wakes the session, never a human turn.
 	[EMPTY_RESPONSE_RECOVERY_CUSTOM_TYPE, "internal_continuation"],
+	// Self-recovery continue after an announced-but-undone step or a missing child reply.
+	[AUTO_CONTINUE_CUSTOM_TYPE, "internal_continuation"],
 	// r4 recovery-shell: the stall-recovery executor's system interruption is the
 	// queued input of the recovery turn - machine-generated, never a human turn.
 	[SYSTEM_INTERRUPTION_CUSTOM_TYPE, "internal_continuation"],

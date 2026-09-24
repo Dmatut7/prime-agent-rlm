@@ -18,7 +18,7 @@ export const KERNEL_BUSY_REUSE_WAIT_MS = 5000;
 export const KERNEL_BUSY_INTERRUPT_INTERVAL_MS = 500;
 export const MAX_LATE_SENT_AGENT_MESSAGE_HANDLERS = 256;
 const KERNEL_BUSY_AFTER_INTERRUPT_MESSAGE =
-	"The Python kernel is still running the previously interrupted cell. Wait and try again, or kill the kernel to start fresh.";
+	"The Python kernel is still running the previously interrupted cell. Retry in a moment: a kernel that stays busy is restarted automatically and its saved state restored.";
 
 export class KernelBusyAfterInterruptError extends Error {
 	constructor() {
