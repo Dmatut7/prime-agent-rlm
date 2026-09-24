@@ -14,6 +14,7 @@ export type StreamFailureKind =
 	| "safety"
 	| "overloaded"
 	| "rate_limit"
+	| "quota"
 	| "server_error"
 	| "auth"
 	| "permission"
@@ -48,6 +49,7 @@ const KIND_MESSAGES: Record<StreamFailureKind, string> = {
 	safety: "Response blocked by provider safety filters",
 	overloaded: "Provider overloaded",
 	rate_limit: "Provider rate limit exceeded",
+	quota: "Provider quota or account balance exhausted",
 	server_error: "Provider server error",
 	auth: "Provider authentication failed",
 	permission: "Provider denied access to the requested resource",
@@ -68,12 +70,32 @@ export function streamFailureMessage(info: StreamFailureInfo, detail?: string): 
 	return message;
 }
 
+/**
+ * Account-level exhaustion: an unpaid balance, a spent free tier, a quota the plan
+ * no longer covers. Providers send these with 400/402/403 as often as 429 (Bailian
+ * `Arrearage` is a 400, `AllocationQuota.FreeTierOnly` a 403), and read by status
+ * alone they look like a bad request or a permission denial - a verdict that ends
+ * the task, when moving to another model or waiting for a top-up is what helps.
+ */
+const QUOTA_EXHAUSTED_PATTERN =
+	/arrearage|insufficient[_ ]?(?:quota|balance|credits?|funds)|free[_ .-]?tier|allocationquota|exceeded[^.]{0,30}quota|exceeded_current_quota|quota[^.]{0,15}(?:exceeded|exhausted|used up)|credit balance is too low|billing[_ ](?:hard[_ ]limit|not[_ ]active)|(?:account|bill)[_ ]?overdue|payment[_ ]required|余额不足|欠费|额度(?:已)?(?:用完|用尽|耗尽)/i;
+
+/** Whether provider error text names an exhausted quota or balance rather than a malformed request. */
+export function isProviderQuotaExhaustedText(text: string | undefined): boolean {
+	return text !== undefined && QUOTA_EXHAUSTED_PATTERN.test(text);
+}
+
 export function classifyStreamFailure(providerErrorType?: string, status?: number): StreamFailureKind {
 	const type = providerErrorType?.toLowerCase() ?? "";
 	if (type === "refusal") return "refusal";
-	if (/sensitive|safety|prohibited_content|blocklist|spii|recitation|content.?filter|guardrail|flagged/.test(type)) {
+	if (
+		/sensitive|safety|prohibited_content|blocklist|spii|recitation|content.?filter|guardrail|flagged|data.?inspection/.test(
+			type,
+		)
+	) {
 		return "safety";
 	}
+	if (status === 402 || isProviderQuotaExhaustedText(type)) return "quota";
 	if (type.includes("overloaded") || status === 529) return "overloaded";
 	// usage_not_included is Codex's plan-entitlement rejection, not bad credentials.
 	if (/rate_limit|usage_limit|usage_not_included|throttl/.test(type) || status === 429) {

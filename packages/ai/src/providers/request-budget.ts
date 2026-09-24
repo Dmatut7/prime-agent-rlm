@@ -16,6 +16,11 @@ import { getLogger } from "../log.js";
  * agentic turn. When the budget runs out, the SDK layer stops retrying (see retry-cap.ts),
  * the loop stops resending empty turns, and the session stops resending the turn - each on
  * its own, and each with a notice.
+ *
+ * A chain is one model's attempt ladder. A session that deliberately starts a new ladder
+ * (a switch to another model, a return to the primary, a recovery ping after a bounded
+ * wait) resets the chain: those requests are the recovery design, not amplification, and
+ * counting them into one pool ended an unattended task long before its waits ran.
  */
 
 /**
@@ -57,10 +62,10 @@ const log = getLogger("ai.provider");
  */
 export class ProviderRequestBudget {
 	private _used = 0;
-	private readonly _maxRequests: number | undefined;
+	private _maxRequests: number | undefined;
 
 	constructor(maxRequests?: number) {
-		this._maxRequests = maxRequests === undefined ? undefined : Math.max(1, Math.floor(maxRequests));
+		this._maxRequests = normalizeCeiling(maxRequests);
 	}
 
 	/** Requests spent in this chain. */
@@ -97,9 +102,14 @@ export class ProviderRequestBudget {
 		};
 	}
 
-	/** Start a new chain: the previous one ended with a successful response. */
+	/** Start a new chain: the previous one ended with a successful response, or a new ladder began. */
 	reset(): void {
 		this._used = 0;
+	}
+
+	/** Move the ceiling: the layer that owns the chain's retry policy knows its real envelope. */
+	setMaxRequests(maxRequests: number | undefined): void {
+		this._maxRequests = normalizeCeiling(maxRequests);
 	}
 
 	/** A short human-readable summary for messages and diagnostics. */
@@ -109,22 +119,51 @@ export class ProviderRequestBudget {
 	}
 }
 
+function normalizeCeiling(maxRequests: number | undefined): number | undefined {
+	return maxRequests === undefined ? undefined : Math.max(1, Math.floor(maxRequests));
+}
+
 const budgetsByChain = new Map<string, ProviderRequestBudget>();
+const ceilingsByChain = new Map<string, number>();
 
 /**
  * The budget shared by every layer working on one request chain.
  *
  * The chain id is the session id: the agent loop, the provider fetch wrapper and the
- * session all see the same session, so they all count into the same pool.
+ * session all see the same session, so they all count into the same pool. Whichever
+ * layer creates the chain first, its ceiling is the one configured for the chain (see
+ * {@link configureProviderRequestBudget}), so the loop creating it before the session
+ * looks cannot pin the chain to the default. An explicit `maxRequests` also moves an
+ * existing chain's ceiling.
  */
 export function getProviderRequestBudget(chainId: string, maxRequests?: number): ProviderRequestBudget {
 	const existing = budgetsByChain.get(chainId);
 	if (existing) {
+		if (maxRequests !== undefined && existing.maxRequests !== normalizeCeiling(maxRequests)) {
+			existing.setMaxRequests(maxRequests);
+		}
 		return existing;
 	}
-	const budget = new ProviderRequestBudget(maxRequests ?? DEFAULT_MAX_TOTAL_PROVIDER_REQUESTS);
+	const budget = new ProviderRequestBudget(
+		maxRequests ?? ceilingsByChain.get(chainId) ?? DEFAULT_MAX_TOTAL_PROVIDER_REQUESTS,
+	);
 	budgetsByChain.set(chainId, budget);
 	return budget;
+}
+
+/**
+ * Set the ceiling every future budget of a chain starts with, and move a live one. The
+ * layer that owns the retry policy (the session) calls this before handing a turn to the
+ * loop, because the loop - not the session - creates the chain on the first request.
+ */
+export function configureProviderRequestBudget(chainId: string, maxRequests: number): void {
+	ceilingsByChain.set(chainId, Math.max(1, Math.floor(maxRequests)));
+	budgetsByChain.get(chainId)?.setMaxRequests(maxRequests);
+}
+
+/** Drop a chain's configured ceiling (its owner went away). */
+export function clearProviderRequestBudgetCeiling(chainId: string): void {
+	ceilingsByChain.delete(chainId);
 }
 
 /** The budget for a chain, if any layer already started counting one. */

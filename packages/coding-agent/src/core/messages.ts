@@ -8,6 +8,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
 import type { AgentCronJob } from "./cron-jobs.js";
+import { PROVIDER_FALLBACK_NOTICE_CUSTOM_TYPE } from "./provider-fallback.js";
 import {
 	type AppliedRefinementEdit,
 	formatRefinementNoticeBody,
@@ -1517,7 +1518,8 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						m.customType === SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE ||
 						m.customType === COMPACTION_OUTCOME_CUSTOM_TYPE ||
 						m.customType === MCP_CONNECTION_OUTCOME_CUSTOM_TYPE ||
-						m.customType === REFINEMENT_OUTCOME_CUSTOM_TYPE
+						m.customType === REFINEMENT_OUTCOME_CUSTOM_TYPE ||
+						m.customType === PROVIDER_FALLBACK_NOTICE_CUSTOM_TYPE
 					) {
 						return undefined;
 					}

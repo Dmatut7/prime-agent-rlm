@@ -34,12 +34,15 @@ import type {
 	Model,
 	ServiceTier,
 	TextContent,
+	ToolResultMessage,
 	Usage,
 	UserMessage,
 } from "@earendil-works/pi-ai";
 import {
 	clampThinkingLevel,
 	cleanupSessionResources,
+	clearProviderRequestBudgetCeiling,
+	configureProviderRequestBudget,
 	forgetProviderRequestBudget,
 	getLogger,
 	getProviderRequestBudget,
@@ -47,6 +50,7 @@ import {
 	isContextOverflow,
 	modelsAreEqual,
 	type ProviderRequestBudget,
+	peekProviderRequestBudget,
 	resetApiProviders,
 	resetProviderRequestBudget,
 	supportsFastMode,
@@ -294,14 +298,26 @@ import {
 import { expandPromptTemplate, type PromptTemplate, parseCommandArgs } from "./prompt-templates.js";
 import {
 	BAD_TOOL_CALL_STORM_THRESHOLD,
+	CONTENT_INSPECTION_WITHHOLD_STEPS,
 	contextHasImages,
+	createImageUnreadNoticeText,
 	describeProviderFailureCause,
 	isBadToolCall,
+	isInputContentInspectionRejection,
+	isWithheldToolResult,
 	PROVIDER_FALLBACK_ENTRY_TYPE,
+	PROVIDER_FALLBACK_NOTICE_CUSTOM_TYPE,
 	PROVIDER_FALLBACK_RETURN_AFTER_MS,
+	PROVIDER_IMAGE_UNREAD_CUSTOM_TYPE,
+	PROVIDER_INSPECTION_WITHHELD_ENTRY_TYPE,
+	PROVIDER_LONG_WAIT_RESUME_MARKER_TEXT,
+	PROVIDER_LONG_WAIT_WAKE_GRACE_MS,
 	type ProviderFallbackEntryData,
 	providerLongWaitDelayMs,
+	readPersistedFallbackEpisode,
+	readPersistedLongWait,
 	toolResultText,
+	withheldToolResult,
 } from "./provider-fallback.js";
 import {
 	isAgentLifecycleFailure,
@@ -312,6 +328,7 @@ import {
 	providerParkDecision,
 	providerRetryDelay,
 	providerRetryPolicy,
+	providerStreamFailureDetails,
 	providerStreamFailureKind,
 	providerStreamFailureRetryAfterMs,
 	providerStreamFailureStatus,
@@ -1897,6 +1914,20 @@ const QUOTA_WAKE_RETRY_DELAY_MS = 60_000;
 /** Cap on those retries: a park that can never wake is dropped instead of parked forever. */
 const QUOTA_WAKE_MAX_RETRIES = 3;
 
+/** Label for the durable one-shot wake that backs a fallback long wait across a restart. */
+const PROVIDER_LONG_WAIT_RESUME_CRON_LABEL = "provider-long-wait-resume";
+/** Service tiers a persisted fallback switch may name (anything else keeps the current tier). */
+const PERSISTED_SERVICE_TIERS: readonly ServiceTier[] = ["auto", "default", "flex", "scale", "priority"];
+
+/** One run's routed image model moved along the fallback chain. */
+interface ImageFallbackEpisode {
+	/** The image model routing picked for the run. */
+	original: Model<any>;
+	/** The override now serving the run. */
+	override: AgentModelOverride;
+	tried: string[];
+}
+
 /** Data carried by a persisted provider_quota_park entry, used to restore a park after a restart. */
 interface PersistedQuotaParkData {
 	resumeAt: string;
@@ -2521,15 +2552,27 @@ export class AgentSession {
 				primary: Model<any>;
 				thinkingLevel: ThinkingLevel;
 				serviceTier: ServiceTier;
-				routedOverride?: AgentModelOverride;
 				current: Model<any>;
 				switchedAtMs: number;
 				/** `provider/id` of every model this episode already moved to. */
 				tried: string[];
 		  }
 		| undefined = undefined;
+	/**
+	 * Set while one run's routed image model was moved along the fallback chain. Only
+	 * the run's override moves: the session model the owner chose never failed. The
+	 * next dispatch routes afresh, which makes this stale (its override is no longer
+	 * the agent's).
+	 */
+	private _imageFallback: ImageFallbackEpisode | undefined = undefined;
 	/** Long-wait rounds spent after every model of the chain failed (reset on success). */
 	private _fallbackLongWaitRound = 0;
+	/** Durable wake of the long wait in progress, cancelled once the in-process wait ends. */
+	private _fallbackLongWaitJobId: string | undefined = undefined;
+	/** Chain entries already reported as unusable, so each is reported once per session. */
+	private readonly _reportedUnusableFallbackReferences = new Set<string>();
+	/** Content-inspection recovery steps spent on the current failure (reset on success). */
+	private _inspectionRecoverySteps = 0;
 	/** Consecutive invalid tool calls from the serving model in the current run. */
 	private _badToolCallStreak = 0;
 	/** Arguments of in-flight tool calls, for the empty-argument half of the storm check. */
@@ -2917,6 +2960,7 @@ export class AgentSession {
 			);
 		}
 		this._restoreQuotaPark();
+		this._restoreFallbackEpisode();
 		if (this._goalState.status === "active") {
 			this._goalAccountingStartedAt = Date.now();
 		}
@@ -3173,6 +3217,7 @@ export class AgentSession {
 	private _refreshAgentLoopRuntimeSettings(): void {
 		this.agent.emptyTurnRetry = this.settingsManager.getEmptyTurnRetrySettings();
 		this.agent.toolTimeout = this._resolvedToolTimeoutConfig();
+		this._configureCrossLayerRequestBudget();
 	}
 
 	private _installAgentTurnHook(): void {
@@ -7006,6 +7051,8 @@ export class AgentSession {
 				}
 				if (assistantMsg.stopReason !== "error") {
 					this._fallbackLongWaitRound = 0;
+					this._inspectionRecoverySteps = 0;
+					this._cancelFallbackLongWaitWake();
 				}
 				if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) {
 					const restoredModel = this._restorePrimaryModelAfterBackup();
@@ -7592,6 +7639,8 @@ export class AgentSession {
 				if (this._quotaPark.timer) clearTimeout(this._quotaPark.timer);
 				this._quotaPark = undefined;
 			}
+			// A long wait's durable wake stays for the same reason.
+			clearProviderRequestBudgetCeiling(this.sessionId);
 			this._serializedPlanInFlight = undefined;
 			this._serializedExplicitRefineOptions = undefined;
 			this._pendingRequestedRefine = undefined;
@@ -7778,6 +7827,9 @@ export class AgentSession {
 			}
 			messages.splice(insertAt, 0, outcome);
 		}
+		// Every context rebuild passes here: tool output a provider's content
+		// inspection refused must stay withheld, or the rebuilt context is refused again.
+		this._reapplyInspectionWithholding(messages);
 	}
 
 	get steeringMode(): "all" | "one-at-a-time" {
@@ -12487,6 +12539,8 @@ export class AgentSession {
 		const thinkingLevel = this._getThinkingLevelForModelSwitch(next.thinkingLevel);
 		const serviceTier = this._getServiceTierForModelSwitch();
 
+		// A cycled pick is as explicit as setModel: never switch the owner back.
+		this._fallback = undefined;
 		this.agent.state.model = next.model;
 		this._clearModelOverrideWhenIdle();
 		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
@@ -12527,6 +12581,8 @@ export class AgentSession {
 
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		const serviceTier = this._getServiceTierForModelSwitch();
+		// A cycled pick is as explicit as setModel: never switch the owner back.
+		this._fallback = undefined;
 		this.agent.state.model = nextModel;
 		this._clearModelOverrideWhenIdle();
 		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
@@ -18165,6 +18221,7 @@ export class AgentSession {
 				const child = childRuntime.session;
 				if (run.status === "cancelled") throw new Error(run.error ?? "RLM child cancelled");
 				if (child.sessionName !== sessionName) child.setSessionName(sessionName);
+				this._shareFallbackEpisodeWith(child);
 				publishChildSession(child);
 				throwIfCancelled();
 				run.status = "running";
@@ -18553,6 +18610,14 @@ export class AgentSession {
 			return false;
 		}
 
+		// Content inspection refusing the request's input is never cured by resending
+		// the same bytes, but it is by different ones: the recovery below withholds the
+		// tool output that tripped the filter, or moves to another provider.
+		if (this._isInputInspectionRejection(message)) return true;
+		// An expired or revoked key stays rejected on its provider, yet a fallback
+		// model on another provider can carry the task.
+		if (this._permanentAuthFallbackModel(message) !== undefined) return true;
+
 		// The provider answered that the request itself is unacceptable (refusal,
 		// invalid request, auth). Resending the same bytes asks the same question and
 		// bills a second full-context request for the same answer: a retry only helps
@@ -18564,13 +18629,69 @@ export class AgentSession {
 		// the bounded wait loop and backup routing get to handle it.
 		if (
 			this._isStructuredPermanentProviderFailure(message) &&
-			providerWaitClass(this._getProviderStreamFailureKind(message), providerStreamFailureStatus(message)) ===
-				"permanent"
+			providerWaitClass(
+				this._getProviderStreamFailureKind(message),
+				providerStreamFailureStatus(message),
+				message.errorMessage,
+			) === "permanent"
 		) {
 			return false;
 		}
 
 		return true;
+	}
+
+	/**
+	 * The fallback model for a failure that stays permanent on its provider (an
+	 * expired or revoked key): one on a different provider, once the single auth
+	 * retry has run. Undefined when the failure is not that shape or no model of
+	 * the chain qualifies.
+	 */
+	private _permanentAuthFallbackModel(message: AssistantMessage): Model<any> | undefined {
+		if (message.stopReason !== "error" || this._retryAttempt === 0) return undefined;
+		const kind = this._getProviderStreamFailureKind(message);
+		const status = providerStreamFailureStatus(message);
+		if (providerWaitClass(kind, status, message.errorMessage) !== "permanent") return undefined;
+		if (kind !== "auth" && kind !== "permission" && !this._isConcreteProviderAuthFailure(message)) return undefined;
+		return this._resolveNextFallbackModel({ otherProviderThan: message.provider });
+	}
+
+	/**
+	 * Whether the provider's content inspection refused this request's input. The
+	 * code survives in different places depending on the provider path: the raw
+	 * error text (openai-completions keeps the body verbatim), the structured
+	 * provider type, or the diagnostic's own error.
+	 */
+	private _isInputInspectionRejection(message: AssistantMessage): boolean {
+		if (message.stopReason !== "error") return false;
+		const failure = message.diagnostics?.find((diagnostic) => diagnostic.type === "provider_stream_failure");
+		const providerErrorType = providerStreamFailureDetails(message)?.providerErrorType;
+		const diagnosticError = (failure?.error as { message?: unknown } | undefined)?.message;
+		return [message.errorMessage, providerErrorType, diagnosticError].some(
+			(text) => typeof text === "string" && isInputContentInspectionRejection(text),
+		);
+	}
+
+	/** The next model's ladder starts with a clean request pool: switching models is recovery, not amplification. */
+	private _startFreshRequestLadder(): void {
+		peekProviderRequestBudget(this.sessionId)?.reset();
+	}
+
+	/** Hand the session's retry envelope to the loop before it creates the chain on its first request. */
+	private _configureCrossLayerRequestBudget(): void {
+		configureProviderRequestBudget(this.sessionId, this._crossLayerRequestCeiling());
+	}
+
+	private _crossLayerRequestCeiling(): number {
+		const policy = providerRetryPolicy(this.settingsManager);
+		const sessionAttempts = (policy.enabled ? policy.maxRetries : 0) + 1;
+		// The ceiling covers the whole in-place ladder, slow tier included: a deeper
+		// ladder buys a proportionally higher ceiling instead of silently tripping it.
+		const emptyTurnSettings = this.settingsManager.getEmptyTurnRetrySettings();
+		const emptyTurnAttempts =
+			(emptyTurnSettings.maxAttempts ?? EMPTY_TURN_RETRY_DEFAULTS.maxAttempts) +
+			(emptyTurnSettings.escalatedAttempts ?? ESCALATED_EMPTY_TURN_RETRY_DEFAULTS.escalatedAttempts);
+		return sessionAttempts * Math.max(1, emptyTurnAttempts);
 	}
 
 	/**
@@ -18585,15 +18706,9 @@ export class AgentSession {
 	 * longer retries - a number that bounded a multiplication that cannot happen any more.
 	 */
 	private _crossLayerRequestBudget(): ProviderRequestBudget {
-		const policy = providerRetryPolicy(this.settingsManager);
-		const sessionAttempts = (policy.enabled ? policy.maxRetries : 0) + 1;
-		// The ceiling covers the whole in-place ladder, slow tier included: a deeper
-		// ladder buys a proportionally higher ceiling instead of silently tripping it.
-		const emptyTurnSettings = this.settingsManager.getEmptyTurnRetrySettings();
-		const emptyTurnAttempts =
-			(emptyTurnSettings.maxAttempts ?? EMPTY_TURN_RETRY_DEFAULTS.maxAttempts) +
-			(emptyTurnSettings.escalatedAttempts ?? ESCALATED_EMPTY_TURN_RETRY_DEFAULTS.escalatedAttempts);
-		return getProviderRequestBudget(this.sessionId, sessionAttempts * Math.max(1, emptyTurnAttempts));
+		// The loop usually created the chain first; the explicit ceiling moves it to this
+		// session's envelope instead of leaving it at the loop's default.
+		return getProviderRequestBudget(this.sessionId, this._crossLayerRequestCeiling());
 	}
 
 	private _isFauxProviderQueueExhausted(message: AssistantMessage): boolean {
@@ -19034,7 +19149,23 @@ export class AgentSession {
 			});
 		}
 
-		const waitClass = providerWaitClass(providerStreamFailureKind(message), providerStreamFailureStatus(message));
+		if (this._isInputInspectionRejection(message)) {
+			return this._handleContentInspectionRejection(message, options);
+		}
+
+		const waitClass = providerWaitClass(
+			providerStreamFailureKind(message),
+			providerStreamFailureStatus(message),
+			message.errorMessage,
+		);
+
+		// An expired or revoked key after its one retry: another provider's model of the
+		// chain takes the task instead of the session dying on a key nobody can renew
+		// while the owner is away.
+		if (waitClass === "permanent") {
+			const next = this._permanentAuthFallbackModel(message);
+			if (next) return this._handleFallbackRetry(message, options, next, waitClass, { deadKey: true });
+		}
 
 		// User-defined backup model (settings.providerBackupModel, default none):
 		// route the failed turn to the backup instead of waiting while the
@@ -19054,6 +19185,9 @@ export class AgentSession {
 		if (waitClass === "quota") {
 			const next = this._resolveNextFallbackModel();
 			if (next) return this._handleFallbackRetry(message, options, next, waitClass);
+			// The routed image model ran out, not the session model: the task must not
+			// park on the image model's credit.
+			if (this._isImageRoutedRun()) return this._handBackFailedImageAttempt(message, options, waitClass);
 		}
 
 		this._retryAttempt++;
@@ -19072,6 +19206,7 @@ export class AgentSession {
 			if (waitClass === "transient") {
 				const next = this._resolveNextFallbackModel();
 				if (next) return this._handleFallbackRetry(message, options, next, waitClass);
+				if (this._isImageRoutedRun()) return this._handBackFailedImageAttempt(message, options, waitClass);
 			}
 			// Otherwise keep pinging with bounded exponential backoff instead of giving up.
 			if (waitClass === "transient" && waitPolicy.enabled) {
@@ -19278,6 +19413,7 @@ export class AgentSession {
 		}
 		// Session-log the switch so primary->backup->primary transitions stay debuggable.
 		this.sessionManager.appendModelChange(backupModel.provider, backupModel.id);
+		this._startFreshRequestLadder();
 		this._backupModel = {
 			backup: backupModel,
 			primary: previousModel,
@@ -19308,18 +19444,28 @@ export class AgentSession {
 	 * The next model of the fallback chain that can serve this turn: configured
 	 * auth, not already tried this episode, not the serving model or the
 	 * primary, image-capable when the run is routed for images or its context
-	 * holds images the serving model reads, and with a
-	 * context window that holds the current context (so a switch never needs
-	 * to drop history).
+	 * holds images the serving model reads, and with a context window that holds
+	 * the current context (so a switch never needs to drop history). A routed
+	 * image model walks its own ladder (the run's image episode), since the
+	 * session model it serves beside never failed. `otherProviderThan` keeps a
+	 * failure bound to one provider (a dead key, a content filter) off that
+	 * provider's other models.
 	 */
-	private _resolveNextFallbackModel(): Model<any> | undefined {
+	private _resolveNextFallbackModel(options: { otherProviderThan?: string } = {}): Model<any> | undefined {
 		const references = this.settingsManager.getProviderFallbackModels();
 		if (references.length === 0) return undefined;
 		const key = (model: Model<any>) => `${model.provider}/${model.id}`;
-		const excluded = new Set(this._fallback?.tried ?? []);
+		const excluded = new Set<string>();
+		if (this._isImageRoutedRun()) {
+			const imageFallback = this._liveImageFallback();
+			for (const tried of imageFallback?.tried ?? []) excluded.add(tried);
+			if (imageFallback) excluded.add(key(imageFallback.original));
+		} else {
+			for (const tried of this._fallback?.tried ?? []) excluded.add(tried);
+			if (this._fallback) excluded.add(key(this._fallback.primary));
+		}
 		const serving = this._runModel();
 		if (serving) excluded.add(key(serving));
-		if (this._fallback) excluded.add(key(this._fallback.primary));
 		const contextTokens = this.getContextUsage()?.tokens ?? 0;
 		const available = this._modelRegistry.getAvailable();
 		// A run routed for images, or a vision model already reading images in this
@@ -19329,13 +19475,88 @@ export class AgentSession {
 			(serving?.input.includes("image") === true && contextHasImages(this.agent.state.messages));
 		for (const reference of references) {
 			const candidate = findExactModelReferenceMatch(reference, available);
-			if (!candidate || excluded.has(key(candidate))) continue;
-			if (!this._modelRegistry.hasConfiguredAuth(candidate)) continue;
+			if (!candidate) {
+				this._reportUnusableFallbackReference(reference);
+				continue;
+			}
+			if (excluded.has(key(candidate))) continue;
+			if (!this._modelRegistry.hasConfiguredAuth(candidate)) {
+				this._reportUnusableFallbackReference(reference);
+				continue;
+			}
+			if (options.otherProviderThan !== undefined && candidate.provider === options.otherProviderThan) continue;
 			if (needsImages && !candidate.input.includes("image")) continue;
 			if (candidate.contextWindow > 0 && contextTokens > candidate.contextWindow * 0.9) continue;
 			return candidate;
 		}
 		return undefined;
+	}
+
+	/**
+	 * A chain entry that can never serve (a typo, a provider that is not logged in,
+	 * a missing key) used to be skipped without a word, so the owner believed a
+	 * backup stood ready that did not exist. Reported once per session: in the chat,
+	 * in the duty log's to-do list, and in the log.
+	 */
+	private _reportUnusableFallbackReference(reference: string): void {
+		if (this._reportedUnusableFallbackReferences.has(reference)) return;
+		this._reportedUnusableFallbackReferences.add(reference);
+		const known = findExactModelReferenceMatch(reference, this._modelRegistry.getAll()) !== undefined;
+		const reason = known ? "没有可用的 API key 或登录已失效" : "找不到这个模型，名字可能写错了";
+		sessionLog.warn("provider fallback: chain entry cannot be used", {
+			sessionId: this.sessionId,
+			reference,
+			reason: known ? "no_auth" : "unknown_model",
+		});
+		this._recordDutyEvent({
+			kind: "decision_needed",
+			question: `备用模型「${reference}」用不了（${reason}），已跳过；请检查设置里的 providerFallbackModels`,
+		});
+		this._emitFallbackNotice(
+			`备用模型「${reference}」用不了（${reason}），已跳过。请检查设置里的 providerFallbackModels。`,
+			{
+				kind: "unusable_entry",
+				reference,
+			},
+		);
+	}
+
+	/**
+	 * Owner-facing notice of a fallback transition: shown in the chat, kept in the
+	 * transcript for an owner who comes back later, never part of the model's
+	 * context (convertToLlm drops the type). It is not pushed onto the live context
+	 * either, so a retry still finds its failed assistant message last.
+	 */
+	private _emitFallbackNotice(text: string, details: Record<string, unknown>): void {
+		const message: CustomMessage = {
+			role: "custom",
+			customType: PROVIDER_FALLBACK_NOTICE_CUSTOM_TYPE,
+			content: text,
+			display: true,
+			details,
+			timestamp: Date.now(),
+		};
+		try {
+			this.sessionManager.appendCustomMessageEntry(message.customType, message.content, true, message.details);
+		} catch (error) {
+			this._reportSessionPersistFailure(error);
+		}
+		this._emit({ type: "message_start", message });
+		this._emit({ type: "message_end", message });
+	}
+
+	/** Whether the run is served by a routed image model rather than the session model. */
+	private _isImageRoutedRun(): boolean {
+		const override = this.agent.modelOverride;
+		return override !== undefined && !modelsAreEqual(override.model, this.agent.state.model);
+	}
+
+	/** The image episode of the current run, or undefined once a new dispatch routed afresh. */
+	private _liveImageFallback(): ImageFallbackEpisode | undefined {
+		if (this._imageFallback && this._imageFallback.override !== this.agent.modelOverride) {
+			this._imageFallback = undefined;
+		}
+		return this._imageFallback;
 	}
 
 	private _canFallbackLongWait(): boolean {
@@ -19361,30 +19582,47 @@ export class AgentSession {
 		}
 	}
 
-	/** Move the session onto `next`, remembering the primary to come back to. */
+	/**
+	 * Move the serving model onto `next`, remembering the primary to come back to.
+	 * When the failing model is a routed image model, only the run's override moves:
+	 * the session model the owner chose never failed and must not be replaced.
+	 */
 	private _applyFallbackModel(
 		next: Model<any>,
 		cause: string,
 		errorMessage: string | undefined,
 		reason: "provider_errors" | "bad_tool_calls",
 	): void {
+		this._startFreshRequestLadder();
+		if (this._isImageRoutedRun()) {
+			this._applyImageFallbackModel(next, cause, errorMessage, reason);
+			return;
+		}
+		const key = (model: Model<any>) => `${model.provider}/${model.id}`;
 		const from = this.agent.state.model;
 		if (!this._fallback) {
+			// A backup-model retry already moved the session: the episode returns to the
+			// model before it, never to the backup.
+			const backup =
+				this._backupModel && modelsAreEqual(this._backupModel.backup, from) ? this._backupModel : undefined;
+			if (backup) this._backupModel = undefined;
 			this._fallback = {
-				primary: from,
-				thinkingLevel: this.agent.state.thinkingLevel,
-				serviceTier: this.agent.state.serviceTier,
-				routedOverride: this.agent.modelOverride,
+				primary: backup?.primary ?? from,
+				thinkingLevel: backup?.thinkingLevel ?? this.agent.state.thinkingLevel,
+				serviceTier: backup?.serviceTier ?? this.agent.state.serviceTier,
 				current: next,
 				switchedAtMs: Date.now(),
-				tried: [],
+				tried: backup ? [key(backup.backup)] : [],
 			};
 		}
 		const primaryThinking = this._fallback.thinkingLevel;
+		const previousOverride = this.agent.modelOverride;
 		this.agent.state.model = next;
 		this.agent.state.thinkingLevel = clampThinkingLevel(next, primaryThinking) as ThinkingLevel;
 		this._clampServiceTierForModel();
-		if (this.agent.modelOverride) {
+		// An override that is the session model itself (a backup retry that took a
+		// routed run) moves with it; a routed image model is a different model.
+		if (previousOverride && modelsAreEqual(previousOverride.model, from)) {
 			this.agent.modelOverride = {
 				model: next,
 				thinkingLevel: this.agent.state.thinkingLevel,
@@ -19393,24 +19631,142 @@ export class AgentSession {
 		}
 		this._fallback.current = next;
 		this._fallback.switchedAtMs = Date.now();
-		this._fallback.tried.push(`${next.provider}/${next.id}`);
+		this._fallback.tried.push(key(next));
 		this.sessionManager.appendModelChange(next.provider, next.id);
-		const fromReference = `${from.provider}/${from.id}`;
+		const fromReference = key(from);
 		this._recordFallbackEntry({
 			kind: "switch",
 			at: Date.now(),
 			from: fromReference,
-			to: `${next.provider}/${next.id}`,
+			to: key(next),
 			cause,
 			...(errorMessage ? { errorMessage } : {}),
+			primary: key(this._fallback.primary),
+			thinkingLevel: this._fallback.thinkingLevel,
+			...(this._fallback.serviceTier ? { serviceTier: this._fallback.serviceTier } : {}),
 		});
-		this._recordDutyEvent({ kind: "model_fallback", from: fromReference, to: `${next.provider}/${next.id}`, reason });
+		this._recordDutyEvent({ kind: "model_fallback", from: fromReference, to: key(next), reason });
 		sessionLog.warn("provider fallback: switched model", {
 			sessionId: this.sessionId,
 			from: fromReference,
-			to: `${next.provider}/${next.id}`,
+			to: key(next),
 			cause,
 		});
+	}
+
+	/** Move one run's routed image model to an image-capable model of the chain. */
+	private _applyImageFallbackModel(
+		next: Model<any>,
+		cause: string,
+		errorMessage: string | undefined,
+		reason: "provider_errors" | "bad_tool_calls",
+	): void {
+		const key = (model: Model<any>) => `${model.provider}/${model.id}`;
+		const override = this.agent.modelOverride;
+		if (!override) return;
+		const episode = this._liveImageFallback() ?? { original: override.model, override, tried: [] };
+		const moved: AgentModelOverride = {
+			model: next,
+			thinkingLevel: clampThinkingLevel(next, this.thinkingLevel) as ThinkingLevel,
+			serviceTier: this.serviceTier === "priority" && !supportsFastMode(next) ? "default" : this.serviceTier,
+		};
+		this.agent.modelOverride = moved;
+		// The run's image route follows the override, so the handback to the session
+		// model after the image is described still happens on the moved model.
+		if (this._imageRoute?.override === override) this._imageRoute.override = moved;
+		episode.override = moved;
+		episode.tried.push(key(next));
+		this._imageFallback = episode;
+		this._recordFallbackEntry({
+			kind: "switch",
+			scope: "image",
+			at: Date.now(),
+			from: key(override.model),
+			to: key(next),
+			cause,
+			...(errorMessage ? { errorMessage } : {}),
+		});
+		this._recordDutyEvent({ kind: "model_fallback", from: key(override.model), to: key(next), reason });
+		sessionLog.warn("provider fallback: moved the routed image model", {
+			sessionId: this.sessionId,
+			from: key(override.model),
+			to: key(next),
+			cause,
+		});
+	}
+
+	/**
+	 * The routed image model failed and no model of the chain can take images: end
+	 * the image attempt and hand the turn back to the session model, which never
+	 * failed, with a notice (for the model and the owner) that the image went unread.
+	 * Waiting on the image model instead would park the whole task on its credit.
+	 */
+	private _handBackFailedImageAttempt(
+		message: AssistantMessage,
+		options:
+			| {
+					markAuthStaleOnFailure?: boolean;
+					authSourceTokens?: readonly AuthSourceToken[];
+			  }
+			| undefined,
+		waitClass: "quota" | "transient",
+	): Promise<boolean> {
+		const key = (model: Model<any>) => `${model.provider}/${model.id}`;
+		const override = this.agent.modelOverride;
+		const sessionModel = this.agent.state.model;
+		const imageModel = override?.model ?? sessionModel;
+		const cause = describeProviderFailureCause(message.provider, message.errorMessage, waitClass);
+		this._imageFallback = undefined;
+		this.agent.modelOverride = undefined;
+		if (override && this.agent.pendingTurnModel === override) this.agent.pendingTurnModel = undefined;
+		const messages = this.agent.state.messages;
+		if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
+			this.agent.state.messages = messages.slice(0, -1);
+		}
+		this._appendCustomMessageToTranscript({
+			role: "custom",
+			customType: PROVIDER_IMAGE_UNREAD_CUSTOM_TYPE,
+			content: createImageUnreadNoticeText(key(imageModel), key(sessionModel), message.errorMessage ?? cause),
+			display: false,
+			details: { imageModel: key(imageModel), sessionModel: key(sessionModel), cause },
+			timestamp: Date.now(),
+		});
+		this._emitFallbackNotice(
+			`看图模型 ${imageModel.id} 暂时用不了（${cause}），备用模型里也没有能看图的，所以这一轮改由 ${sessionModel.id} 接着做——图片没能读取。`,
+			{ kind: "image_unread", imageModel: key(imageModel), sessionModel: key(sessionModel) },
+		);
+		this._recordFallbackEntry({
+			kind: "switch",
+			scope: "image",
+			at: Date.now(),
+			from: key(imageModel),
+			to: key(sessionModel),
+			cause,
+			...(message.errorMessage ? { errorMessage: message.errorMessage } : {}),
+		});
+		this._recordDutyEvent({
+			kind: "model_fallback",
+			from: key(imageModel),
+			to: key(sessionModel),
+			reason: "image_model_unavailable",
+		});
+		this._startFreshRequestLadder();
+		this._retryAttempt = 1;
+		this._providerWait = undefined;
+		return this._retryAfterDelay(
+			message,
+			options,
+			{
+				type: "auto_retry_start",
+				attempt: this._retryAttempt,
+				maxAttempts: providerRetryPolicy(this.settingsManager).maxRetries,
+				delayMs: 0,
+				errorMessage: `${cause}，图片没能读取`,
+				reason: "backup",
+				backupModel: key(sessionModel),
+			},
+			0,
+		);
 	}
 
 	/** Re-issue the failed turn on the next fallback model, with its own quick retries. */
@@ -19423,9 +19779,16 @@ export class AgentSession {
 			  }
 			| undefined,
 		next: Model<any>,
-		waitClass: "quota" | "transient",
+		waitClass: "quota" | "transient" | "permanent",
+		failure: { deadKey?: boolean } = {},
 	): Promise<boolean> {
 		const cause = describeProviderFailureCause(message.provider, message.errorMessage, waitClass);
+		if (failure.deadKey) {
+			// A dead key must still reach the owner: mark it stale (the login prompt
+			// appears) even though the task goes on elsewhere.
+			this._markProviderAuthStaleForRetryFailure(message, options);
+			this._retryAuthFailureSources = [];
+		}
 		this._applyFallbackModel(next, cause, message.errorMessage, "provider_errors");
 		this._retryAttempt = 1;
 		this._providerWait = undefined;
@@ -19446,11 +19809,133 @@ export class AgentSession {
 	}
 
 	/**
+	 * The provider's content inspection refused the request's input (Bailian
+	 * `data_inspection_failed`). Resending the same history is refused forever, so
+	 * each step changes the bytes instead: withhold the most recent batch of tool
+	 * output (up to three batches, walking back), then move to a model on another
+	 * provider, and only then stop - telling the owner what happened in every case.
+	 */
+	private _handleContentInspectionRejection(
+		message: AssistantMessage,
+		options:
+			| {
+					markAuthStaleOnFailure?: boolean;
+					authSourceTokens?: readonly AuthSourceToken[];
+			  }
+			| undefined,
+	): Promise<boolean> | boolean {
+		const name = message.provider ?? "服务商";
+		this._inspectionRecoverySteps += 1;
+		const step = this._inspectionRecoverySteps;
+		sessionLog.warn("provider content inspection rejected the request", {
+			sessionId: this.sessionId,
+			provider: message.provider,
+			model: message.model,
+			step,
+		});
+		if (step <= CONTENT_INSPECTION_WITHHOLD_STEPS) {
+			const withheld = this._withholdMostRecentToolOutputs();
+			if (withheld > 0) {
+				this._emitFallbackNotice(
+					`${name} 的内容审核拒绝了这次请求（多半是工具输出里有「攻击」「防火墙」这类词）。已把最近 ${withheld} 条工具输出从对话里隐去，并提示模型换个方式重新获取，正在自动重试。`,
+					{ kind: "content_inspection", step, withheld },
+				);
+				this._startFreshRequestLadder();
+				this._retryAttempt += 1;
+				this._providerWait = undefined;
+				return this._retryAfterDelay(
+					message,
+					options,
+					{
+						type: "auto_retry_start",
+						attempt: this._retryAttempt,
+						maxAttempts: CONTENT_INSPECTION_WITHHOLD_STEPS,
+						delayMs: 0,
+						errorMessage: `${name} 内容审核拒绝了请求，已隐去最近的工具输出后重试`,
+					},
+					0,
+				);
+			}
+		}
+		const next = this._resolveNextFallbackModel({ otherProviderThan: message.provider });
+		if (next) {
+			this._emitFallbackNotice(`${name} 的内容审核一直拒绝这段对话，改用另一家服务商的模型 ${next.id} 继续。`, {
+				kind: "content_inspection",
+				step,
+				to: `${next.provider}/${next.id}`,
+			});
+			return this._handleFallbackRetry(message, options, next, "permanent");
+		}
+		const finalError =
+			step > 1
+				? `${name} 的内容审核拒绝了这次请求（data_inspection_failed），隐去最近的工具输出后仍被拒绝，也没有其他服务商的备用模型可换。请换个说法重发，或在设置里加一个其他服务商的备用模型。`
+				: `${name} 的内容审核拒绝了这次请求（data_inspection_failed），对话里没有可以隐去的工具输出，也没有其他服务商的备用模型可换。请换个说法重发，或在设置里加一个其他服务商的备用模型。`;
+		this._emitFallbackNotice(finalError, { kind: "content_inspection", step, terminal: true });
+		const attempt = this._retryAttempt;
+		// A retry that never started has no retry to end: the notice alone reports it.
+		if (attempt > 0) this._emit({ type: "auto_retry_end", success: false, attempt, finalError });
+		this._terminalFailureAttemptCount = attempt;
+		this._retryAttempt = 0;
+		this._providerWait = undefined;
+		this._retryAuthFailureSources = [];
+		// The next owner message starts a fresh recovery: it may bring new tool output.
+		this._inspectionRecoverySteps = 0;
+		this._resolveRetry();
+		return false;
+	}
+
+	/**
+	 * Replace the most recent batch of not-yet-withheld tool results with a short
+	 * placeholder, in the live context, and record their ids so a restart or a
+	 * context rebuild withholds them again. Returns how many were withheld.
+	 */
+	private _withholdMostRecentToolOutputs(): number {
+		const messages = [...this.agent.state.messages];
+		let index = messages.length - 1;
+		if (index >= 0 && messages[index].role === "assistant") index -= 1;
+		while (index >= 0 && !(messages[index].role === "toolResult" && !isWithheldToolResult(messages[index]))) {
+			index -= 1;
+		}
+		const toolCallIds: string[] = [];
+		while (index >= 0 && messages[index].role === "toolResult") {
+			const result = messages[index] as ToolResultMessage;
+			if (!isWithheldToolResult(result)) {
+				messages[index] = withheldToolResult(result);
+				toolCallIds.push(result.toolCallId);
+			}
+			index -= 1;
+		}
+		if (toolCallIds.length === 0) return 0;
+		this.agent.state.messages = messages;
+		this._appendRecoveryEntry(PROVIDER_INSPECTION_WITHHELD_ENTRY_TYPE, { at: Date.now(), toolCallIds });
+		return toolCallIds.length;
+	}
+
+	/** Re-apply recorded withholdings after the context was rebuilt from the transcript. */
+	private _reapplyInspectionWithholding(messages: AgentMessage[]): void {
+		const ids = new Set<string>();
+		for (const entry of this.sessionManager.getBranch()) {
+			if (entry.type !== "custom" || entry.customType !== PROVIDER_INSPECTION_WITHHELD_ENTRY_TYPE) continue;
+			const recorded = (entry.data as { toolCallIds?: unknown } | undefined)?.toolCallIds;
+			if (!Array.isArray(recorded)) continue;
+			for (const id of recorded) if (typeof id === "string") ids.add(id);
+		}
+		if (ids.size === 0) return;
+		for (let index = 0; index < messages.length; index += 1) {
+			const message = messages[index];
+			if (message.role !== "toolResult" || !ids.has(message.toolCallId) || isWithheldToolResult(message)) continue;
+			messages[index] = withheldToolResult(message);
+		}
+	}
+
+	/**
 	 * Every model of the chain failed and the bounded wait ran out: wait a long
 	 * round (5, 10, 20, 20 ... minutes), return to the primary and start the
-	 * chain over, instead of ending a task nobody is watching.
+	 * chain over, instead of ending a task nobody is watching. The in-process wait
+	 * dies with the process, so a durable wake job backs it: a restart during the
+	 * wait still resumes the task, a live process cancels the job when it wakes.
 	 */
-	private _handleFallbackLongWait(
+	private async _handleFallbackLongWait(
 		message: AssistantMessage,
 		options:
 			| {
@@ -19464,8 +19949,17 @@ export class AgentSession {
 		const longWait = this.settingsManager.getProviderFallbackLongWait();
 		const delayMs = providerLongWaitDelayMs(round, longWait.baseDelayMs, longWait.maxDelayMs);
 		this._returnToPrimaryModel("long_wait");
+		this._startFreshRequestLadder();
 		this._providerWait = undefined;
 		this._retryAttempt = 1;
+		this._cancelFallbackLongWaitWake();
+		const resumeAtMs = Date.now() + delayMs + PROVIDER_LONG_WAIT_WAKE_GRACE_MS;
+		const jobId = this._createQuotaResumeJob(
+			resumeAtMs,
+			PROVIDER_LONG_WAIT_RESUME_CRON_LABEL,
+			PROVIDER_LONG_WAIT_RESUME_MARKER_TEXT,
+		);
+		this._fallbackLongWaitJobId = jobId;
 		this._recordFallbackEntry({
 			kind: "long_wait",
 			at: Date.now(),
@@ -19473,8 +19967,9 @@ export class AgentSession {
 			delayMs,
 			cause: describeProviderFailureCause(message.provider, message.errorMessage, "transient"),
 			...(message.errorMessage ? { errorMessage: message.errorMessage } : {}),
+			...(jobId !== undefined ? { jobId, resumeAt: new Date(resumeAtMs).toISOString() } : {}),
 		});
-		return this._retryAfterDelay(
+		const retried = await this._retryAfterDelay(
 			message,
 			options,
 			{
@@ -19487,39 +19982,139 @@ export class AgentSession {
 			},
 			delayMs,
 		);
+		// The in-process wait is over (resumed or cancelled). A dispose is the one exit
+		// that must keep the job: the process is going away and the job is the resume.
+		if (!this._disposed && !this._disposing) this._cancelFallbackLongWaitWake();
+		return retried;
+	}
+
+	private _cancelFallbackLongWaitWake(): void {
+		const jobId = this._fallbackLongWaitJobId;
+		this._fallbackLongWaitJobId = undefined;
+		if (jobId !== undefined) this._resolveQuotaResumeJob(jobId);
 	}
 
 	/**
-	 * Leave the fallback for the primary. `pendingTurnModel` moves a run that is
-	 * already going at its next request; `state.model` covers the runs after it.
-	 * A model the user picked meanwhile is left alone.
+	 * Leave the fallback for the primary. Only the session model moves: the run's
+	 * image routing is this run's own decision (made at dispatch, after the episode
+	 * began), so it is kept. `pendingTurnModel` moves a run the session model is
+	 * serving at its next request; `state.model` covers the runs after it. A model
+	 * the user picked meanwhile is left alone.
 	 */
 	private _returnToPrimaryModel(why: "cooldown" | "long_wait"): boolean {
 		const fallback = this._fallback;
 		this._fallback = undefined;
 		if (!fallback) return false;
 		if (!modelsAreEqual(this.agent.state.model, fallback.current)) return false;
+		if (!this._modelRegistry.hasConfiguredAuth(fallback.primary)) {
+			// The primary's key went stale meanwhile: it cannot serve. Stay, and probe
+			// again after another cooldown.
+			this._fallback = { ...fallback, switchedAtMs: Date.now(), ...(why === "long_wait" ? { tried: [] } : {}) };
+			return false;
+		}
+		const previousOverride = this.agent.modelOverride;
 		this.agent.state.model = fallback.primary;
 		this.agent.state.thinkingLevel = fallback.thinkingLevel;
-		this.agent.modelOverride = fallback.routedOverride;
 		this._clampServiceTierForModel(fallback.serviceTier);
-		if (this.agent.state.isStreaming) {
+		// An override that was the fallback model itself (a backup retry took a routed
+		// run) leaves with it; the next dispatch routes afresh.
+		if (previousOverride && modelsAreEqual(previousOverride.model, fallback.current)) {
+			this.agent.modelOverride = undefined;
+		}
+		if (this.agent.state.isStreaming && this.agent.modelOverride === undefined) {
 			this.agent.pendingTurnModel = {
-				model: fallback.routedOverride?.model ?? fallback.primary,
-				thinkingLevel: fallback.routedOverride?.thinkingLevel ?? fallback.thinkingLevel,
-				serviceTier: fallback.routedOverride?.serviceTier ?? this.agent.state.serviceTier,
+				model: fallback.primary,
+				thinkingLevel: this.agent.state.thinkingLevel,
+				serviceTier: this.agent.state.serviceTier,
 			};
 		}
+		this._startFreshRequestLadder();
+		const primary = `${fallback.primary.provider}/${fallback.primary.id}`;
 		this.sessionManager.appendModelChange(fallback.primary.provider, fallback.primary.id);
-		this._recordDutyEvent({ kind: "model_restored", to: `${fallback.primary.provider}/${fallback.primary.id}` });
+		this._recordDutyEvent({ kind: "model_restored", to: primary });
 		this._recordFallbackEntry({
 			kind: "return",
 			at: Date.now(),
 			from: `${fallback.current.provider}/${fallback.current.id}`,
-			to: `${fallback.primary.provider}/${fallback.primary.id}`,
+			to: primary,
 			cause: why === "cooldown" ? "冷却期已过，试回原模型" : "所有模型都失败，等待后从原模型重试",
 		});
+		if (why === "cooldown") {
+			const minutes = Math.max(1, Math.round((Date.now() - fallback.switchedAtMs) / 60_000));
+			this._emitFallbackNotice(
+				`已切回原模型 ${fallback.primary.id}（在备用模型 ${fallback.current.id} 上跑了约 ${minutes} 分钟，冷却期已过，先试试原模型好了没有）`,
+				{ kind: "return", from: `${fallback.current.provider}/${fallback.current.id}`, to: primary },
+			);
+		}
 		return true;
+	}
+
+	/**
+	 * Rebuild the fallback episode the branch ended in (restart, resume, tree
+	 * navigation). Without it a restart mid-episode kept the backup forever: the
+	 * switch's model change is restored, but the memory of the primary was not.
+	 */
+	private _restoreFallbackEpisode(): void {
+		this._fallback = undefined;
+		const branch = this.sessionManager.getBranch();
+		const longWait = readPersistedLongWait(branch);
+		this._fallbackLongWaitRound = longWait.round;
+		// A wait the restart interrupted is resumed by its durable job; remember the job
+		// so an earlier success (the owner writing first) cancels it instead of letting
+		// it deliver a stale resume.
+		if (longWait.round > 0 && longWait.jobId !== undefined && this._fallbackLongWaitJobId === undefined) {
+			this._fallbackLongWaitJobId = longWait.jobId;
+		}
+		this._reapplyInspectionWithholding(this.agent.state.messages);
+		const episode = readPersistedFallbackEpisode(branch);
+		const current = this.agent.state.model;
+		if (!episode || !current || `${current.provider}/${current.id}` !== episode.current) return;
+		const separator = episode.primary.indexOf("/");
+		if (separator <= 0) return;
+		const primary = this._modelRegistry.find(
+			episode.primary.slice(0, separator),
+			episode.primary.slice(separator + 1),
+		);
+		if (!primary) return;
+		const thinkingLevel = THINKING_LEVELS.find((level) => level === episode.thinkingLevel);
+		const serviceTier = PERSISTED_SERVICE_TIERS.find((tier) => tier === episode.serviceTier);
+		this._fallback = {
+			primary,
+			thinkingLevel: thinkingLevel ?? this.agent.state.thinkingLevel,
+			serviceTier: serviceTier ?? this.agent.state.serviceTier,
+			current,
+			switchedAtMs: episode.switchedAtMs,
+			tried: [...episode.tried],
+		};
+	}
+
+	/**
+	 * A child spawned while this session runs on a fallback starts on the same
+	 * fallback (the primary is failing right now), but knows the primary, so it
+	 * returns after the same cooldown instead of treating the backup as home.
+	 */
+	private _shareFallbackEpisodeWith(child: AgentSession): void {
+		const fallback = this._fallback;
+		if (!fallback || child._fallback || !modelsAreEqual(child.agent.state.model, fallback.current)) return;
+		child._fallback = {
+			primary: fallback.primary,
+			thinkingLevel: clampThinkingLevel(fallback.primary, child.agent.state.thinkingLevel) as ThinkingLevel,
+			serviceTier: fallback.serviceTier,
+			current: child.agent.state.model,
+			switchedAtMs: fallback.switchedAtMs,
+			tried: [...fallback.tried],
+		};
+		const key = (model: Model<any>) => `${model.provider}/${model.id}`;
+		child._recordFallbackEntry({
+			kind: "switch",
+			at: fallback.switchedAtMs,
+			from: key(fallback.primary),
+			to: key(fallback.current),
+			cause: "父会话正在用备用模型",
+			primary: key(fallback.primary),
+			thinkingLevel: child._fallback.thinkingLevel,
+			...(fallback.serviceTier ? { serviceTier: fallback.serviceTier } : {}),
+		});
 	}
 
 	/**
@@ -19559,8 +20154,9 @@ export class AgentSession {
 		if (!next) return;
 		const cause = `连续 ${streak} 次无效工具调用`;
 		this._applyFallbackModel(next, cause, text, "bad_tool_calls");
-		// The running loop takes the new model before its next request.
-		this.agent.pendingTurnModel = {
+		// The running loop takes the new model before its next request: the moved
+		// image override when the storm came from a routed image model.
+		this.agent.pendingTurnModel = this.agent.modelOverride ?? {
 			model: next,
 			thinkingLevel: this.agent.state.thinkingLevel,
 			serviceTier: this.agent.state.serviceTier,
@@ -19637,6 +20233,10 @@ export class AgentSession {
 			return false;
 		}
 
+		// Each recovery ping after a wait is a fresh probe, bounded by the wait's own
+		// attempt and duration limits; counting pings into the failed ladder's pool
+		// ended the wait long before either limit.
+		this._startFreshRequestLadder();
 		return this._retryAfterDelay(
 			message,
 			options,
@@ -19735,7 +20335,11 @@ export class AgentSession {
 	 * resume marker at the reset time. Best-effort: the in-process timer covers
 	 * live sessions when this cannot be persisted (e.g. in-memory sessions).
 	 */
-	private _createQuotaResumeJob(resumeAtMs: number): string | undefined {
+	private _createQuotaResumeJob(
+		resumeAtMs: number,
+		label = QUOTA_RESUME_CRON_LABEL,
+		prompt = QUOTA_RESUME_MARKER_TEXT,
+	): string | undefined {
 		const sessionFile = this.sessionFile;
 		const store = this._quotaResumeStore();
 		if (!sessionFile || !store) {
@@ -19747,8 +20351,8 @@ export class AgentSession {
 				sessionId: this.sessionId,
 				sessionFile,
 				cwd: this.sessionManager.getCwd(),
-				label: QUOTA_RESUME_CRON_LABEL,
-				prompt: QUOTA_RESUME_MARKER_TEXT,
+				label,
+				prompt,
 				scheduleText: `at ${new Date(resumeAtMs).toISOString()}`,
 				runtimeKind: this._rlmDepth > 0 ? "subagent" : "top-level",
 			});
@@ -20728,6 +21332,7 @@ export class AgentSession {
 			this._reloadGoalStateFromBranch({ monotonicTokens: Boolean(summaryText) });
 			this._reloadRlmMaxDepthFromBranch();
 			this._reloadQuotaParkFromBranch();
+			this._restoreFallbackEpisode();
 			this._invalidateQueuedPromptPreparation();
 
 			await this._extensionRunner.emit({

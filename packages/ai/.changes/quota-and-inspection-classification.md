@@ -1,0 +1,2 @@
+- Added a `quota` stream failure kind for account-level exhaustion (unpaid balance, spent free tier, HTTP 402) that providers send as 400/403, and classified content inspection rejections (`data_inspection_failed`) as `safety` instead of an invalid request.
+- Added `configureProviderRequestBudget` so the layer that owns the retry policy sets a chain's ceiling even when another layer creates the chain first.

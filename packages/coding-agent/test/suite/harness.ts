@@ -90,6 +90,16 @@ export interface HarnessOptions {
 	persistSession?: boolean;
 	/** Resume over an existing session file, mirroring production rehydration. */
 	existingSessionFile?: string;
+	/**
+	 * With `existingSessionFile`: start the agent on the model the session last
+	 * recorded, as production rehydration (sdk.ts) does, instead of the first faux model.
+	 */
+	restoreSessionModel?: boolean;
+	/**
+	 * Give the agent the session id, as sdk.ts does, so the agent loop and the session
+	 * count provider requests into one shared budget (the production accounting).
+	 */
+	shareRequestBudget?: boolean;
 	rlmDepth?: number;
 	rlmMaxDepth?: number;
 	includeGoals?: boolean;
@@ -144,7 +154,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		models: options.models,
 	});
 	fauxProvider.setResponses([]);
-	const model = fauxProvider.getModel();
+	const defaultModel = fauxProvider.getModel();
 	const toolMap = options.tools ? Object.fromEntries(options.tools.map((tool) => [tool.name, tool])) : undefined;
 	const withConfiguredAuth = options.withConfiguredAuth ?? true;
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
@@ -154,6 +164,14 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		: options.persistSession
 			? SessionManager.create(tempDir, join(tempDir, "sessions"))
 			: SessionManager.inMemory();
+	const savedModel =
+		options.existingSessionFile && options.restoreSessionModel
+			? sessionManager.buildSessionContext().model
+			: undefined;
+	const model =
+		(savedModel && savedModel.provider === defaultModel.provider
+			? fauxProvider.getModel(savedModel.modelId)
+			: undefined) ?? defaultModel;
 	const settingsManager = SettingsManager.inMemory(options.settings);
 
 	const authStorage = AuthStorage.inMemory();
@@ -181,6 +199,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 	}
 
 	const agent = new Agent({
+		...(options.shareRequestBudget ? { sessionId: sessionManager.getSessionId() } : {}),
 		getApiKey: () => (withConfiguredAuth ? "faux-key" : undefined),
 		initialState: {
 			model,

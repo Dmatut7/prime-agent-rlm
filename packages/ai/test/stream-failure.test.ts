@@ -50,6 +50,15 @@ describe("classifyStreamFailure", () => {
 		["api_error", undefined, "server_error"],
 		[undefined, 503, "server_error"],
 		["something_else", undefined, "unknown"],
+		// Account-level exhaustion arrives as 400/402/403 as often as 429; read by
+		// status alone it looked like a bad request and ended the task.
+		["Arrearage", 400, "quota"],
+		["AllocationQuota.FreeTierOnly", 403, "quota"],
+		["insufficient_quota", 429, "quota"],
+		[undefined, 402, "quota"],
+		["usage_limit_reached", 429, "rate_limit"],
+		// Bailian content inspection is a filter verdict, not a malformed request.
+		["data_inspection_failed", 400, "safety"],
 	])("classifies %s / %s as %s", (type, status, expected) => {
 		expect(classifyStreamFailure(type, status)).toBe(expected);
 	});
@@ -105,6 +114,16 @@ describe("extractStreamFailureInfo", () => {
 	test("falls back to classifying the message text", () => {
 		expect(extractStreamFailureInfo(new Error("provider overloaded, retry later")).kind).toBe("overloaded");
 		expect(extractStreamFailureInfo("not an error").kind).toBe("unknown");
+	});
+
+	test("reads an unpaid balance out of an unparsed 400 body", () => {
+		const error = Object.assign(
+			new Error(
+				'400 data: {"error":{"code":"Arrearage","message":"Access denied, please make sure your account is in good standing."}}',
+			),
+			{ status: 400 },
+		);
+		expect(extractStreamFailureInfo(error)).toMatchObject({ kind: "quota", status: 400 });
 	});
 });
 
