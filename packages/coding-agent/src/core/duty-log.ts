@@ -1,4 +1,5 @@
 import { open, stat } from "node:fs/promises";
+import { DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT } from "./autonomous.js";
 import { textAnnouncesNextStep } from "./self-recovery.js";
 
 /**
@@ -25,8 +26,19 @@ export type DutyEvent =
 	| { kind: "model_fallback"; from?: string; to: string; reason?: "provider_errors" | "bad_tool_calls" | string }
 	/** The primary model answers again and the run moved back to it. */
 	| { kind: "model_restored"; to: string }
-	/** A tool step made no progress and was stopped so the model could continue differently. */
-	| { kind: "step_stuck_stopped"; tool?: string; silentMs?: number }
+	/**
+	 * A tool step was stopped so the model could continue differently: it made no progress
+	 * (`cause` "silent", the default), or it outran the stall watchdog's exemption budget the
+	 * owner opted into with `stallWatchdog.abortAfterSeconds` (`cause` "time_limit").
+	 */
+	| { kind: "step_stuck_stopped"; tool?: string; silentMs?: number; cause?: "silent" | "time_limit" }
+	/** The stall watchdog saw a turn go quiet with no evidence of work (an excused silence is not recorded). */
+	| { kind: "stall_warning"; silentMs?: number }
+	/**
+	 * /autonomous sent its continuation prompt. That prompt reaches the transcript as a user
+	 * message, so `prompt` (its first characters) is what tells it apart from the owner typing.
+	 */
+	| { kind: "autonomous_continue"; prompt?: string }
 	/** The model ended a turn before finishing and was nudged to continue. */
 	| { kind: "auto_continue"; reason?: string }
 	/** A child finished without replying and its result was handed to the parent. */
@@ -39,10 +51,30 @@ const EVENT_KINDS = new Set([
 	"model_fallback",
 	"model_restored",
 	"step_stuck_stopped",
+	"stall_warning",
+	"autonomous_continue",
 	"auto_continue",
 	"child_auto_delivered",
 	"decision_needed",
 ]);
+
+/** Characters of an autonomous continuation prompt a duty event keeps to recognize it later. */
+export const AUTONOMOUS_PROMPT_FINGERPRINT_CHARS = 80;
+
+/** The fingerprint an `autonomous_continue` event carries for one continuation prompt. */
+export function autonomousPromptFingerprint(text: string): string {
+	return text.trim().slice(0, AUTONOMOUS_PROMPT_FINGERPRINT_CHARS);
+}
+
+/**
+ * Continuation prompts the host writes as user messages, recognized even without a duty event
+ * (sessions from before the event existed): the labelled keep-alive and gate-failure prompts, and
+ * the default continuation prompt.
+ */
+const AUTONOMOUS_PROMPT_PREFIXES = [
+	"[autonomous-continuation",
+	autonomousPromptFingerprint(DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT),
+];
 
 /** A duty event from custom entry data, or undefined when it is not one. */
 export function parseDutyEvent(data: unknown): DutyEvent | undefined {
@@ -68,6 +100,7 @@ export type DutyIncidentKind =
 	| "quota"
 	| "empty"
 	| "stuck"
+	| "step_limit"
 	| "bad_calls"
 	| "stall"
 	| "early_stop"
@@ -188,10 +221,41 @@ function decisionSentence(text: string): string | undefined {
 	return preview(asking.replace(/^[-*•\s]+/, ""));
 }
 
-function isOwnerMessage(entry: Json): boolean {
+/**
+ * A user-role message the owner wrote. /autonomous continuations are user-role messages too, and
+ * counting them as the owner made two unattended days read as "离开 3 分钟".
+ */
+function isOwnerMessage(entry: Json, autonomousPrompts: ReadonlySet<string>): boolean {
 	const message = asRecord(entry.message);
-	return entry.type === "message" && message?.role === "user";
+	if (entry.type !== "message" || message?.role !== "user") return false;
+	const text = textOf(message.content).trim();
+	if (AUTONOMOUS_PROMPT_PREFIXES.some((prefix) => text.startsWith(prefix))) return false;
+	return !autonomousPrompts.has(autonomousPromptFingerprint(text));
 }
+
+/** Fingerprints of every continuation prompt /autonomous recorded sending on this transcript. */
+function autonomousPromptsOf(entries: readonly Json[]): Set<string> {
+	const prompts = new Set<string>();
+	for (const entry of entries) {
+		if (entry.type !== "custom" || entry.customType !== DUTY_EVENT_CUSTOM_TYPE) continue;
+		const event = parseDutyEvent(entry.data);
+		if (event?.kind === "autonomous_continue" && typeof event.prompt === "string" && event.prompt.trim()) {
+			prompts.add(autonomousPromptFingerprint(event.prompt));
+		}
+	}
+	return prompts;
+}
+
+/** Whether a `tool_timeout:` result reports a step stopped for outrunning the watchdog budget. */
+function isTimeLimitStop(text: string): boolean {
+	return text.includes(STEP_TIME_LIMIT_MARKER);
+}
+
+/**
+ * The phrase a time-limit stop's cancellation text carries (agent-session writes it), so a
+ * transcript read can tell the two stop causes apart even when no duty event landed.
+ */
+export const STEP_TIME_LIMIT_MARKER = "stall watchdog's exemption budget";
 
 class IncidentLedger {
 	private readonly byKind = new Map<DutyIncidentKind, DutyIncident>();
@@ -208,6 +272,22 @@ class IncidentLedger {
 		return this.byKind.get(kind);
 	}
 
+	/** Take back one handled count of `kind` (it turned out to be a different kind of incident). */
+	retract(kind: DutyIncidentKind): void {
+		const incident = this.byKind.get(kind);
+		if (!incident) return;
+		incident.count -= 1;
+		incident.handled = Math.min(incident.handled, incident.count);
+		if (incident.count <= 0) this.byKind.delete(kind);
+	}
+
+	set(kind: DutyIncidentKind, count: number, handled: number): void {
+		const incident = this.byKind.get(kind) ?? { kind, count: 0, handled: 0 };
+		incident.count = count;
+		incident.handled = handled;
+		this.byKind.set(kind, incident);
+	}
+
 	list(): DutyIncident[] {
 		return [...this.byKind.values()];
 	}
@@ -219,10 +299,11 @@ class IncidentLedger {
  */
 export function summarizeDutyLog(input: DutyLogInput): DutyLogSummary | undefined {
 	const entries = input.entries.map(asRecord).filter((entry): entry is Json => entry !== undefined);
+	const autonomousPrompts = autonomousPromptsOf(entries);
 	let start = 0;
 	for (let index = entries.length - 1; index >= 0; index--) {
 		const entry = entries[index];
-		if (entry && isOwnerMessage(entry)) {
+		if (entry && isOwnerMessage(entry, autonomousPrompts)) {
 			start = index + 1;
 			break;
 		}
@@ -250,7 +331,50 @@ export function summarizeDutyLog(input: DutyLogInput): DutyLogSummary | undefine
 	let lastStatus: string | undefined;
 	let goalStatus: string | undefined;
 	let lastModelBeforeError: string | undefined;
-	let lastStuckAt: number | undefined;
+	// One stopped step usually leaves two traces - the duty event written at the kill and the
+	// `tool_timeout:` result after it - in either order. Each trace pairs with one unpaired trace of
+	// the other source, so one stop counts once and two separate stops still count twice.
+	const unpairedStops: Array<{ source: "event" | "result"; at: number; kind: "stuck" | "step_limit" }> = [];
+	const noteStop = (source: "event" | "result", at: number, kind: "stuck" | "step_limit") => {
+		// A warning for the same silence is explained by the stop: one incident, not two.
+		if (openStall && !openStall.handled) {
+			stallEpisodes.splice(stallEpisodes.indexOf(openStall), 1);
+			openStall = undefined;
+		}
+		const index = unpairedStops.findIndex(
+			(stop) => stop.source !== source && Math.abs(at - stop.at) <= STUCK_DEDUP_MS,
+		);
+		if (index >= 0) {
+			const [paired] = unpairedStops.splice(index, 1);
+			// The event names the cause; a result read without it may have guessed wrong.
+			if (paired && source === "event" && paired.kind !== kind) {
+				incidents.retract(paired.kind);
+				incidents.add(kind, true);
+			}
+			return;
+		}
+		incidents.add(kind, true);
+		unpairedStops.push({ source, at, kind });
+	};
+	// Stall episodes: a warning opens one; the automatic abort or interruption handles it; the
+	// daemon's "still stuck after the automatic action" escalation reopens it; any later progress
+	// (a successful reply, a tool result) ends it as recovered. One episode counts once however
+	// many of those traces it left.
+	const stallEpisodes: Array<{ handled: boolean }> = [];
+	let openStall: { handled: boolean } | undefined;
+	const noteStall = (handled?: boolean) => {
+		if (!openStall) {
+			openStall = { handled: handled ?? false };
+			stallEpisodes.push(openStall);
+			return;
+		}
+		if (handled !== undefined) openStall.handled = handled;
+	};
+	const noteProgress = () => {
+		if (!openStall) return;
+		openStall.handled = true;
+		openStall = undefined;
+	};
 
 	const closeOutage = (at: number) => {
 		if (outageStart === undefined) return;
@@ -280,10 +404,11 @@ export function summarizeDutyLog(input: DutyLogInput): DutyLogSummary | undefine
 				continue;
 			}
 			if (stopReason === "aborted") {
-				if (STALL_ABORT.test(errorMessage)) incidents.add("stall", true);
+				if (STALL_ABORT.test(errorMessage)) noteStall(true);
 				lastEventWasFinal = false;
 				continue;
 			}
+			noteProgress();
 			// A successful answer ends an outage; the errors before it were recovered.
 			if (outageStart !== undefined) {
 				for (const kind of ["provider", "quota"] as const) {
@@ -315,10 +440,8 @@ export function summarizeDutyLog(input: DutyLogInput): DutyLogSummary | undefine
 
 		if (entry.type === "message" && message?.role === "toolResult") {
 			const text = textOf(message.content);
-			if (text.startsWith("tool_timeout:")) {
-				incidents.add("stuck", true);
-				lastStuckAt = at;
-			}
+			if (text.startsWith("tool_timeout:")) noteStop("result", at, isTimeLimitStop(text) ? "step_limit" : "stuck");
+			noteProgress();
 			lastEventWasFinal = false;
 			continue;
 		}
@@ -331,8 +454,12 @@ export function summarizeDutyLog(input: DutyLogInput): DutyLogSummary | undefine
 					incidents.add("empty", true);
 					break;
 				case "system_interruption":
+					noteStall(true);
+					break;
 				case "stall_recovery_escalation":
-					incidents.add("stall", true);
+					// Still silent after the automatic action, and automatic help stops here: the
+					// owner has to look, so it must not read as handled.
+					noteStall(false);
 					break;
 				case "rlm_child_stall_notice":
 					if (child && !stalledChildren.has(child)) {
@@ -390,9 +517,12 @@ export function summarizeDutyLog(input: DutyLogInput): DutyLogSummary | undefine
 					}
 					break;
 				case "step_stuck_stopped":
-					// The stop usually also lands as a `tool_timeout:` result: one stall, one count.
-					if (lastStuckAt === undefined || at - lastStuckAt > STUCK_DEDUP_MS) incidents.add("stuck", true);
-					lastStuckAt = at;
+					noteStop("event", at, event.cause === "time_limit" ? "step_limit" : "stuck");
+					break;
+				case "stall_warning":
+					noteStall();
+					break;
+				case "autonomous_continue":
 					break;
 				case "auto_continue":
 					incidents.add("early_stop", true);
@@ -411,6 +541,10 @@ export function summarizeDutyLog(input: DutyLogInput): DutyLogSummary | undefine
 			const status = asRecord(entry.status);
 			if (typeof status?.summary === "string" && status.summary.trim()) lastStatus = status.summary.trim();
 		}
+	}
+
+	if (stallEpisodes.length > 0) {
+		incidents.set("stall", stallEpisodes.length, stallEpisodes.filter((episode) => episode.handled).length);
 	}
 
 	if (!sawAssistant && incidents.list().length === 0) return undefined;
@@ -499,6 +633,7 @@ const INCIDENT_ORDER: readonly DutyIncidentKind[] = [
 	"quota",
 	"empty",
 	"stuck",
+	"step_limit",
 	"bad_calls",
 	"stall",
 	"early_stop",
@@ -529,10 +664,12 @@ function incidentText(incident: DutyIncident): string {
 			return `空回复 ${n} 次（已重试）`;
 		case "stuck":
 			return `命令卡住 ${n} 次（已停掉，AI 换了办法）`;
+		case "step_limit":
+			return `命令跑太久被停 ${n} 次（超过了自动中断的时长，AI 换了办法）`;
 		case "bad_calls":
 			return `工具调用连续出错 ${n} 次（${incident.fallbackTo ? fallbackText(incident) : "已处理"}）`;
 		case "stall":
-			return `会话卡住 ${n} 次（已自动处理）`;
+			return `会话卡住 ${n} 次（${outcome("已处理", "还卡着，需要你看一下")}）`;
 		case "early_stop":
 			return `提早停下 ${n} 次（已自动继续）`;
 		case "child_silent":

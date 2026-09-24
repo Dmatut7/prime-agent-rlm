@@ -58,6 +58,32 @@ describe("announcedNextStep", () => {
 		expect(announcedNextStep(reply(text))).toBeUndefined();
 	});
 
+	// Each misfire costs the owner a paid turn and a false "提早停下" duty-log line; each miss leaves
+	// an unattended run parked on a plan it never carried out.
+	it.each([
+		["a past-tense report after 我先/然后我", "我先检查了日志，然后我修改了配置文件。"],
+		["a finished answer that says 现在我已经", "全部完成。现在我已经把所有测试跑通了。"],
+		["a summary that follows 让我总结一下", "所有步骤都完成了。让我总结一下：改了三个文件。"],
+		["the owner's own to-do list", "- [ ] 配置 API key"],
+		["an owner to-do list with its intro", "代码已经改好。你需要自己完成：\n- [ ] 配置 API key\n- [ ] 重启服务"],
+		["a step the owner takes next", "迁移脚本写好了。接下来你需要在服务器上执行它。"],
+		["a future tense that promises no work", "I will keep this in mind."],
+		["an English summary", "All done. Let me summarize: three files changed."],
+		["the owner's next step in English", "The patch is in. Next step is for you to run the migration."],
+	])("does not misfire on %s", (_name, text) => {
+		expect(announcedNextStep(reply(text))).toBeUndefined();
+	});
+
+	it.each([
+		["a plan with a self-check", "我先跑一下测试，看看是否需要进一步修改。"],
+		["a plan with no pronoun", "开始修复这个问题。"],
+		["an English next step", "Next step is updating the docs."],
+		["a plan whose steps follow a colon", "定位好了。接下来我会：\n1. 改 footer.ts\n2. 跑测试"],
+		["a plan that mentions an earlier past step", "日志看完了，接下来我去改配置。"],
+	])("catches %s", (_name, text) => {
+		expect(announcedNextStep(reply(text))).toBeDefined();
+	});
+
 	it("only looks at a clean stop", () => {
 		expect(announcedNextStep(reply("接下来我去改第二个文件", "length"))).toBeUndefined();
 		expect(announcedNextStep(reply("接下来我去改第二个文件", "aborted"))).toBeUndefined();

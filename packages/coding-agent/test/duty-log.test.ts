@@ -212,6 +212,93 @@ describe("summarizeDutyLog", () => {
 		expect(lines[2]).toContain("提早停下 1 次（已自动继续）");
 	});
 
+	it("counts one stopped step once in the order the session writes it (duty event at the kill, result after)", () => {
+		const entries = [
+			user(0),
+			assistant(60_000, { tool: true }),
+			dutyEvent(360_000, { kind: "step_stuck_stopped", tool: "sleep 999", silentMs: 300_000 }),
+			toolResult(360_050, "tool_timeout: ipython made no progress. Stuck step: `sleep 999` produced no output"),
+			assistant(400_000, { tool: true }),
+			// A second, separate stop a minute later is its own incident.
+			dutyEvent(460_000, { kind: "step_stuck_stopped", tool: "curl x", silentMs: 300_000 }),
+			toolResult(460_050, "tool_timeout: ipython made no progress."),
+			assistant(500_000, { text: "换了办法，做完了。" }),
+		];
+		const stuck = summarizeDutyLog({ entries, now: T0 + HOUR })?.incidents.find((i) => i.kind === "stuck");
+		expect(stuck).toMatchObject({ count: 2, handled: 2 });
+	});
+
+	it("names a step stopped for outrunning the watchdog budget instead of calling it stuck", () => {
+		const entries = [
+			user(0),
+			assistant(60_000, { tool: true }),
+			dutyEvent(3_000_000, {
+				kind: "step_stuck_stopped",
+				tool: "cargo build",
+				silentMs: 20_000,
+				cause: "time_limit",
+			}),
+			toolResult(3_000_050, "tool_timeout: ipython. The stall watchdog's exemption budget for this turn is spent"),
+			assistant(3_100_000, { text: "构建拆小了。" }),
+		];
+		const summary = summarizeDutyLog({ entries, now: T0 + 2 * HOUR });
+		expect(summary?.incidents).toEqual([{ kind: "step_limit", count: 1, handled: 1 }]);
+		expect(formatDutyLog(summary!, T0 + 2 * HOUR)[2]).toContain("命令跑太久被停 1 次");
+	});
+
+	it("does not take /autonomous continuation prompts for the owner coming back", () => {
+		const custom = "Keep going on the migration until the verifier passes.";
+		const entries = [
+			user(0, "把迁移做完"),
+			assistant(60_000, { text: "第一段做完了。" }),
+			dutyEvent(2 * HOUR, { kind: "autonomous_continue", prompt: custom }),
+			user(2 * HOUR + 10, custom),
+			assistant(2 * HOUR + 60_000, { text: "第二段做完了。" }),
+			// A held continuation with the built-in default prompt, and a labelled keep-alive.
+			user(
+				30 * HOUR,
+				"No human input is available in autonomous mode. Continue working until the host evaluator stops the run.",
+			),
+			assistant(30 * HOUR + 60_000, { text: "第三段做完了。" }),
+			user(47 * HOUR, "[autonomous-continuation: subagent-keep-alive]\n\nSubagents have been running."),
+			assistant(47 * HOUR + 60_000, { text: "全部做完了。" }),
+		];
+		const summary = summarizeDutyLog({ entries, now: T0 + 48 * HOUR });
+		expect(summary?.awayMs).toBe(48 * HOUR);
+		expect(summary?.finishedTurns).toBe(4);
+		expect(formatDutyLog(summary!, T0 + 48 * HOUR)[0]).toBe("值班记录 · 离开 2 天");
+	});
+
+	it("keeps a stall open when the daemon reports it still stuck after its automatic action", () => {
+		const entries = [
+			user(0),
+			assistant(60_000, { tool: true }),
+			customMessage(20 * 60_000, "system_interruption", {}),
+			customMessage(35 * 60_000, "stall_recovery_escalation", { action: "abort_and_send", count: 1 }),
+		];
+		const summary = summarizeDutyLog({ entries, now: T0 + 10 * HOUR });
+		expect(summary?.incidents).toEqual([{ kind: "stall", count: 1, handled: 0 }]);
+		const line = formatDutyLog(summary!, T0 + 10 * HOUR)[2];
+		expect(line).toContain("有 1 类还没处理");
+		expect(line).toContain("会话卡住 1 次（还卡着，需要你看一下）");
+	});
+
+	it("reports a turn that went quiet and never came back, and a quiet spell it recovered from", () => {
+		const hung = [
+			user(0),
+			assistant(60_000, { tool: true }),
+			dutyEvent(6 * 60_000, { kind: "stall_warning", silentMs: 300_000 }),
+		];
+		const hungSummary = summarizeDutyLog({ entries: hung, now: T0 + 48 * HOUR });
+		expect(hungSummary?.incidents).toEqual([{ kind: "stall", count: 1, handled: 0 }]);
+		expect(formatDutyLog(hungSummary!, T0 + 48 * HOUR)).not.toContain("没出问题");
+
+		const recovered = [...hung, toolResult(9 * 60_000, "ok"), assistant(10 * 60_000, { text: "跑完了。" })];
+		expect(summarizeDutyLog({ entries: recovered, now: T0 + HOUR })?.incidents).toEqual([
+			{ kind: "stall", count: 1, handled: 1 },
+		]);
+	});
+
 	it("lists an unanswered question as a decision for the owner", () => {
 		const entries = [
 			user(0),

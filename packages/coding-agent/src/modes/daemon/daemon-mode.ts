@@ -6898,6 +6898,8 @@ export class AgentDaemon {
 	 * notifyParentOfAgentStall. Bounded like agentMessageQueuedRuns.
 	 */
 	private readonly childStallNoticeAt = new Map<string, number>();
+	/** Pending re-checks of child stalls held back because they were excused, by child active session id. */
+	private readonly childStallRechecks = new Map<string, ReturnType<typeof setTimeout>>();
 
 	/**
 	 * r4 recovery-shell: the 15s stall-recovery sweep timer. Unref'd like the
@@ -7748,6 +7750,14 @@ export class AgentDaemon {
 			// The parent's in-process run subscription is armed and delivers its own notice.
 			return;
 		}
+		// Excused silence is healthy long work: a notice would only start a paid parent turn to say
+		// "still working". The parent hears about it once the excuse lapses while the child is
+		// still silent.
+		const excuse = event.diagnostics?.exemption;
+		if (excuse?.reason !== undefined && excuse.exhausted !== true) {
+			this.recheckExcusedChildStall(state, event);
+			return;
+		}
 		const now = Date.now();
 		const previous = this.childStallNoticeAt.get(rlmChildId);
 		if (previous !== undefined && now - previous < DAEMON_CHILD_STALL_NOTICE_MIN_INTERVAL_MS) return;
@@ -7761,8 +7771,6 @@ export class AgentDaemon {
 		const inFlightTools = (diagnostics?.inFlightToolCalls ?? []).map((call) =>
 			call.elapsedMs > 0 ? `${call.toolName} (${Math.max(1, Math.round(call.elapsedMs / 1000))}s)` : call.toolName,
 		);
-		const exemption = diagnostics?.exemption;
-		const workEvidence = exemption !== undefined && exemption.exhausted !== true ? [...exemption.reasons] : [];
 		// The deadline that matters is whichever can abort this child's turn first: its own
 		// watchdog's abort stage, or this daemon's stall-recovery sweep (the warn threshold
 		// plus the grace window) when that is enabled. It describes the child's
@@ -7778,7 +7786,6 @@ export class AgentDaemon {
 			silentMs: event.silentMs,
 			thresholdMs: event.thresholdMs,
 			inFlightTools,
-			...(workEvidence.length > 0 ? { workEvidence } : {}),
 			...(abortAfterMs > 0 ? { abortAfterMs } : {}),
 			// This daemon build serves agent_message.abort; the in-process emitter does
 			// not set the field, so its notice keeps the delete-only lever text.
@@ -7793,6 +7800,43 @@ export class AgentDaemon {
 				`could not deliver stall notice to parent ${parentState.activeSessionId} for child ${rlmChildId}: ${String(error)}`,
 			);
 		});
+	}
+
+	/**
+	 * Re-check a child whose excused stall was held back from its parent, once per child warn
+	 * window: the child's watchdog warns once per silence episode, so a lapsed excuse would
+	 * otherwise never reach the parent.
+	 */
+	private recheckExcusedChildStall(
+		state: ActiveSessionState,
+		event: Extract<DaemonOutbound, { type: "session_event" }>["event"] & { type: "stall_warning" },
+	): void {
+		const key = state.activeSessionId;
+		if (this.childStallRechecks.has(key)) return;
+		const session = state.runtime.session;
+		const warnedAt = Date.now();
+		const lastEventAtWarn = session.lastAgentEventAt;
+		const recheck = () => {
+			this.childStallRechecks.delete(key);
+			if (this.shuttingDown || this.sessions.get(key) !== state || session.stallState === undefined) return;
+			if (session.lastAgentEventAt !== lastEventAtWarn) return;
+			if (session.excusedNow) {
+				schedule();
+				return;
+			}
+			const lapsed = { ...event, silentMs: event.silentMs + (Date.now() - warnedAt) };
+			if (event.diagnostics) {
+				const { exemption: _lapsedExemption, ...diagnostics } = event.diagnostics;
+				lapsed.diagnostics = diagnostics;
+			}
+			this.notifyParentOfAgentStall(state, lapsed);
+		};
+		const schedule = () => {
+			const timer = setTimeout(recheck, Math.max(1_000, event.thresholdMs));
+			timer.unref?.();
+			this.childStallRechecks.set(key, timer);
+		};
+		schedule();
 	}
 
 	/**
@@ -8253,7 +8297,17 @@ export class AgentDaemon {
 		const policy = this.stallRecoveryPolicyFor(state);
 		const notice = this.stallRecoveryNoticedAt.get(state.activeSessionId);
 		const keptAlive = notice?.keptAlive === true;
-		const armed = policy.enabled && !keptAlive;
+		// Armed only when the sweep would actually act: the same holds it applies (a live host-owned
+		// phase, excused silence, the stop line) would otherwise leave the bar counting down to an
+		// action that never comes, and then reading "马上" forever.
+		const session = state.runtime.session;
+		const holdsBack =
+			session.isBashRunning ||
+			session.isRetrying ||
+			session.isCompacting ||
+			session.excusedNow ||
+			(this.stallRecoveryActionCounts.get(state.activeSessionId) ?? 0) >= policy.maxPerSession;
+		const armed = policy.enabled && !keptAlive && !holdsBack;
 		return {
 			canAbort: true,
 			canDiagnose: true,

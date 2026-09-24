@@ -138,13 +138,40 @@ describe("formatStallActionLines", () => {
 		const lines = formatStallActionLines(
 			{
 				...actionableEvent,
-				actions: { canAbort: true, canDiagnose: true, autoRecoveryArmed: true, autoRecoveryAtMs: 999_000 },
+				actions: { canAbort: true, canDiagnose: true, autoRecoveryArmed: true, autoRecoveryAtMs: 999_990_000 },
 			},
 			{ interrupt: interruptKeyLabel, diagnostics: "ctrl+y" },
 			1_000_000_000,
 		);
 
 		assert.ok(lines.some((line) => line.includes("将自动处理") && line.includes("（马上）")));
+	});
+
+	it("F3: drops the countdown once the daemon has evidently held back past its deadline", () => {
+		// The daemon holds back when the silence turns out excused or its stop line is reached; a
+		// bar that kept saying "马上" for hours would promise an action that never comes.
+		const armed = (atMs: number) => ({
+			...actionableEvent,
+			actions: { canAbort: true, canDiagnose: true, autoRecoveryArmed: true, autoRecoveryAtMs: atMs },
+		});
+		const keys = { interrupt: interruptKeyLabel, diagnostics: "ctrl+y" };
+		const now = 1_000_000_000;
+		assert.ok(formatStallActionLines(armed(now - 20_000), keys, now).some((line) => line.includes("（马上）")));
+		const overdue = formatStallActionLines(armed(now - 31_000), keys, now);
+		assert.ok(!overdue.some((line) => line.includes("将自动处理")));
+		assert.ok(overdue.some((line) => line.includes("中断这一轮")));
+	});
+
+	it("rebuilds a live summary on every paint so the quiet time keeps counting", () => {
+		const mountedAt = 1_000_000_000;
+		const event: StallActionEvent = {
+			...actionableEvent,
+			summary: "⚠ 已经 5 分钟没有动静",
+			summaryAt: (nowMs) => `⚠ 已经 ${Math.round((300_000 + nowMs - mountedAt) / 60_000)} 分钟没有动静`,
+		};
+		const keys = { interrupt: interruptKeyLabel, diagnostics: "ctrl+y" };
+		assert.strictEqual(formatStallActionLines(event, keys, mountedAt)[0], "⚠ 已经 5 分钟没有动静");
+		assert.strictEqual(formatStallActionLines(event, keys, mountedAt + 3 * 3_600_000)[0], "⚠ 已经 185 分钟没有动静");
 	});
 
 	it("F3: an unarmed or moment-less actions field renders no auto-recovery line", () => {

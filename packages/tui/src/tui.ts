@@ -617,6 +617,14 @@ export class TUI extends Container {
 		return this.overlayStack.some((o) => this.isOverlayVisible(o));
 	}
 
+	/**
+	 * The component keyboard input goes to after the input listeners. Lets a listener that sits in
+	 * front of the editor stand aside while a dialog, selector or overlay has the keyboard.
+	 */
+	getFocusedComponent(): Component | null {
+		return this.focusedComponent;
+	}
+
 	/** Check if an overlay entry is currently visible */
 	private isOverlayVisible(entry: (typeof this.overlayStack)[number]): boolean {
 		if (entry.hidden) return false;

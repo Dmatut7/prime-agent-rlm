@@ -45,6 +45,7 @@ function makeDaemon(sessions: Map<string, ActiveSessionState>): NoticeFixture["d
 		options: {},
 		sessions,
 		childStallNoticeAt: new Map<string, number>(),
+		childStallRechecks: new Map(),
 		// r4 recovery-shell: the sweep's tracking maps the doubles must carry so
 		// broadcastToSession's observation hook can run.
 		stallRecoveryNoticedAt: new Map(),
@@ -243,6 +244,47 @@ describe("daemon-level stall notice to the parent session", () => {
 				event: stallWarning(45_000, 30_000),
 			});
 			expect(fixture.parentSendCustomMessage).not.toHaveBeenCalled();
+		}
+	});
+
+	it("holds an excused child stall back from the parent until the excuse lapses", () => {
+		// A notice is a paid parent turn; for healthy long work it only says "still working".
+		vi.useFakeTimers({ now: 1_000_000 });
+		try {
+			const fixture = makeFixture(() => []);
+			const childSession = fixture.child.runtime.session as unknown as {
+				stallState?: object;
+				excusedNow?: boolean;
+				lastAgentEventAt?: number;
+			};
+			childSession.stallState = { silentMs: 45_000, thresholdMs: 30_000, inFlightTools: ["hang_forever"] };
+			childSession.excusedNow = true;
+			childSession.lastAgentEventAt = 900_000;
+			const excused = stallWarning(45_000, 30_000);
+			excused.diagnostics = {
+				...excused.diagnostics!,
+				exemption: { reason: "vouched", reasons: ["live_bash_handles"], exhausted: false },
+			};
+			fixture.daemon.broadcastToSession(fixture.child, {
+				type: "session_event",
+				activeSessionId: "child-active",
+				event: excused,
+			});
+			expect(fixture.parentSendCustomMessage).not.toHaveBeenCalled();
+			vi.advanceTimersByTime(30_000);
+			expect(fixture.parentSendCustomMessage).not.toHaveBeenCalled();
+
+			// Still silent, and the work evidence is gone: a real stall the parent must hear about.
+			childSession.excusedNow = false;
+			vi.advanceTimersByTime(30_000);
+			expect(fixture.parentSendCustomMessage).toHaveBeenCalledTimes(1);
+			const [notice] = fixture.parentSendCustomMessage.mock.calls[0] as unknown as [
+				{ details: Record<string, unknown> },
+			];
+			expect(notice.details).not.toHaveProperty("workEvidence");
+			expect(notice.details.silentMs).toBe(45_000 + 60_000);
+		} finally {
+			vi.useRealTimers();
 		}
 	});
 

@@ -46,6 +46,11 @@ export interface StallActionEvent {
 	thresholdMs: number;
 	/** One plain-language line the host built from the diagnostics; replaces the generic headline. */
 	summary?: string | undefined;
+	/**
+	 * The same line rebuilt for one paint's clock, so a bar left up for hours says how long it has
+	 * really been quiet instead of the silence at the moment it was mounted. Wins over `summary`.
+	 */
+	summaryAt?: ((nowMs: number) => string) | undefined;
 	/** Which actions the emitter offers. Absent on older emitters; degrades the render to plain text. */
 	actions?: StallActionsView | undefined;
 }
@@ -87,11 +92,18 @@ function clockOf(ms: number): string {
  * keeps this turn alive": that second claim belongs to the daemon's input
  * accounting (blind1 F1) and cannot ship from here before it exists.
  */
+/** How long past its deadline an auto-recovery countdown may say "马上" before it is dropped. */
+export const AUTO_RECOVERY_OVERDUE_MS = 30_000;
+
 function autoRecoveryLine(actions: StallActionsView, nowMs: number): string | undefined {
 	if (actions.autoRecoveryArmed !== true) return undefined;
 	const atMs = actions.autoRecoveryAtMs;
 	if (typeof atMs !== "number" || !Number.isFinite(atMs)) return undefined;
 	const remainingMs = atMs - nowMs;
+	// Past the deadline by more than a sweep or two, the daemon evidently held back (the turn moved,
+	// its silence became excused, the stop line was reached): a "马上" that never comes is a false
+	// promise, so the line goes.
+	if (remainingMs < -AUTO_RECOVERY_OVERDUE_MS) return undefined;
 	const countdown = remainingMs <= 0 ? "马上" : `还有 ${Math.max(1, Math.round(remainingMs / 1000))} 秒`;
 	return `  ${clockOf(atMs)} 将自动处理（${countdown}）`;
 }
@@ -153,7 +165,7 @@ export function formatStallActionLines(
 	keys: StallActionKeyHints,
 	nowMs: number = Date.now(),
 ): string[] {
-	const summary = event.summary ?? `\u26a0 已经 ${durationOf(event.silentMs)}没有动静`;
+	const summary = event.summaryAt?.(nowMs) ?? event.summary ?? `\u26a0 已经 ${durationOf(event.silentMs)}没有动静`;
 	if (!isActionable(event.actions)) {
 		// An older emitter gives no host summary: keep its own message as the detail.
 		return event.summary === undefined ? [summary, event.message] : [summary];
@@ -269,8 +281,10 @@ export class StallActions implements Component {
 		// both run), and inventing a second ticker would only duplicate them.
 		// Without an armed countdown the key is constant, so the cache behaves
 		// exactly as it did before this feature.
+		// A live summary is keyed the same way: its elapsed time moves with the clock.
 		const countdownKey =
-			actions?.autoRecoveryArmed === true && typeof actions.autoRecoveryAtMs === "number"
+			(actions?.autoRecoveryArmed === true && typeof actions.autoRecoveryAtMs === "number") ||
+			this.event.summaryAt !== undefined
 				? String(Math.floor(Date.now() / 1000))
 				: "";
 		const cache = this.cache;

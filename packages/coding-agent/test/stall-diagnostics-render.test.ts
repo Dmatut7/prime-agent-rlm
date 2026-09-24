@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { StallDiagnostics } from "../src/core/stall-diagnostics.js";
-import { formatStallDiagnosticsLines, formatStallEventLines } from "../src/core/stall-diagnostics-render.js";
+import {
+	formatStallDiagnosticsLines,
+	formatStallEventLines,
+	formatStallExplanation,
+} from "../src/core/stall-diagnostics-render.js";
 
 function diagnostics(overrides?: Partial<StallDiagnostics>): StallDiagnostics {
 	return {
@@ -152,5 +156,43 @@ describe("cross-version stall events (K3X-1)", () => {
 		const pointerLine = lines.find((line) => line.startsWith("diagnostics file"));
 		expect(pointerLine).toBeDefined();
 		expect(pointerLine).toContain("resolved locally in this client");
+	});
+});
+
+describe("stall explanation for the owner", () => {
+	const warn = (overrides?: Partial<StallDiagnostics>) => ({
+		type: "stall_warning",
+		message: "Possible stall: no session activity for 312s while a turn is running.",
+		silentMs: 312_000,
+		thresholdMs: 300_000,
+		diagnostics: diagnostics(overrides),
+	});
+
+	it("says what was happening, what it means and what to do, in plain Chinese", () => {
+		const lines = formatStallExplanation(warn(), { interruptKey: "Esc" });
+		expect(lines).toEqual([
+			"发生了什么：这一轮已经 5 分钟没有任何动静，一直在等「bash」这一步（这一步已经跑了 5 分钟）。",
+			"这意味着：看不出它在干活：可能是在做一件不出声的长任务，也可能卡住了。",
+			"你可以：想等就不用管，它会接着跑；觉得不对就按 Esc 中断这一轮，再告诉它换个办法。",
+		]);
+		// No machine vocabulary leaks into the owner's part.
+		expect(lines.join("")).not.toMatch(/pump|suspended|exemption|stall_warning/);
+	});
+
+	it("reads vouched silence as long work and a stalled kernel loop as a likely hang", () => {
+		const excused = formatStallExplanation(
+			warn({ exemption: { reason: "vouched", reasons: ["live_bash_handles"], exhausted: false } }),
+		);
+		expect(excused[1]).toBe("这意味着：有证据表明它还在干活（后台命令还在跑），多半是一个不出声的长任务，不是卡死。");
+		const wedged = formatStallExplanation(
+			warn({ kernel: { protocol: 4, hostRequestCount: 0, reasons: ["loop_stalled"] } }),
+		);
+		expect(wedged[1]).toContain("很可能真的卡住了");
+	});
+
+	it("keeps counting the quiet time a line was left on screen for", () => {
+		const lines = formatStallExplanation(warn(), { sinceEventMs: 3 * 3_600_000 });
+		expect(lines[0]).toContain("已经 3 小时 5 分没有任何动静");
+		expect(lines[2]).toContain("发一句话告诉它换个办法");
 	});
 });
