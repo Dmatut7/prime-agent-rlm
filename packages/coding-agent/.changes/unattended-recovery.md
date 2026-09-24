@@ -1,0 +1,6 @@
+- Added silent-step detection: a tool call that produces no output for `tools.timeout.silentStuckSeconds` (default 300) is stopped even when its process is still alive, while a call whose output keeps flowing is never stopped; the model is told which step was stuck and warned when the same step gets stuck twice.
+- Added automatic continue: when a turn stops right after tool work with a reply that only announces the next step, the session continues on its own (at most twice per request, never for final answers, questions or waiting on subagents; `selfRecovery.autoContinue`).
+- Added a one-time reminder for a subagent that finishes its task without replying to its parent (`selfRecovery.childReplyNudge`).
+- Changed the busy-kernel wait/restart prompt to restart the kernel automatically when nobody answers within 60 seconds, and stopped telling the model to kill the kernel itself.
+- Added self-recovery and duty-log entries to the session transcript for every automatic stop, continue and reminder.
+- Changed the silent-step rule to count CPU burned by the step's process tree (`tools.timeout.silentStuckCpuMs`, default 1000) as activity, and to honour a longer timeout the model gave the call, so quiet test runs, installs and compiles are never stopped.

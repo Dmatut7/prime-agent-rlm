@@ -1,0 +1,1 @@
+- Added `ToolTimeoutConfig.describeCancellation` so a host can append which call was stuck and what to do instead to the per-call deadline's cancellation.

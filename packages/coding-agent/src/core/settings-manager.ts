@@ -62,6 +62,11 @@ export const DEFAULT_TOOL_TIMEOUT_AFTER_MS = 180_000;
 export const TOOL_TIMEOUT_MIN_AFTER_MS = 60_000;
 /** Soft ceiling for `tools.timeout.afterMs` (ten minutes): beyond this, the stall watchdog owns the call. */
 export const TOOL_TIMEOUT_MAX_AFTER_MS = 600_000;
+/** Default silence after which a call with no output and no progress is stuck (five minutes). */
+export const DEFAULT_SILENT_STUCK_SECONDS = 300;
+/** Floor for `silentStuckSeconds`; in practice the per-call deadline (at least a minute) is asked first. */
+export const SILENT_STUCK_MIN_SECONDS = 1;
+export const SILENT_STUCK_MAX_SECONDS = 3600;
 
 /** Session stall watchdog: warn after this long without any session activity. */
 export const DEFAULT_STALL_WARN_AFTER_SECONDS = 300;
@@ -648,6 +653,28 @@ export interface ToolTimeoutSettings {
 	 * Still gated by the master handles: with the deadline disabled, these do nothing.
 	 */
 	perTool?: Record<string, number>;
+	/**
+	 * Default 300 (5 minutes), configurable within 1s-3600s. A call that has produced
+	 * no output and shows no progress (only a live process) for this long is stuck and
+	 * is stopped; a call whose output keeps flowing is never stopped by this.
+	 */
+	silentStuckSeconds?: number;
+	/**
+	 * Default 1000. CPU time (ms) the step's process tree must burn between two checks
+	 * to count as busy: a command that prints nothing but keeps computing is never stuck.
+	 */
+	silentStuckCpuMs?: number;
+}
+
+/** Self-recovery for unattended runs. */
+export interface SelfRecoverySettings {
+	/**
+	 * Default true. When a main-session turn ends right after tool work with a reply that
+	 * only announces the next step, send one automatic "continue" (at most two per prompt).
+	 */
+	autoContinue?: boolean;
+	/** Default true. A subagent that finishes its task without replying is asked once to send its result. */
+	childReplyNudge?: boolean;
 }
 
 export interface WarningSettings {
@@ -781,6 +808,7 @@ export interface Settings {
 	 */
 	imageModel?: string;
 	autonomous?: AutonomousSettings;
+	selfRecovery?: SelfRecoverySettings;
 	shellPath?: string; // Custom shell path (e.g., for Cygwin users on Windows)
 	quietStartup?: boolean;
 	shellCommandPrefix?: string; // Prefix prepended to every bash command (e.g., "shopt -s expand_aliases" for alias support)
@@ -1069,6 +1097,7 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	providerBackupModel: null,
 	providerFallbackModels: null,
 	autonomous: null,
+	selfRecovery: ["autoContinue", "childReplyNudge"],
 	shellPath: null,
 	quietStartup: null,
 	shellCommandPrefix: null,
@@ -1128,7 +1157,7 @@ const KNOWN_NESTED_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 		"recovery",
 	],
 	"retry.emptyTurn.recovery": ["enabled", "maxContinuations", "useBackupModel"],
-	"tools.timeout": ["enabled", "afterMs", "perTool"],
+	"tools.timeout": ["enabled", "afterMs", "perTool", "silentStuckSeconds", "silentStuckCpuMs"],
 	"subagents.stallRecovery": ["enabled", "graceSeconds", "maxPerSession"],
 	"stallWatchdog.rootRecovery": ["enabled", "humanWindowSeconds", "maxPerSession"],
 };
@@ -2652,6 +2681,27 @@ export class SettingsManager {
 	}
 
 	/** Wake policy for agent messages queued into a session whose pump is suspended. */
+	/** Silence (ms) after which a call with no output and no progress is stuck; clamped, NaN-safe. */
+	getSilentStuckMs(): number {
+		const raw = Number(this.settings.tools?.timeout?.silentStuckSeconds ?? DEFAULT_SILENT_STUCK_SECONDS);
+		const seconds = Number.isFinite(raw) ? raw : DEFAULT_SILENT_STUCK_SECONDS;
+		return Math.min(SILENT_STUCK_MAX_SECONDS, Math.max(SILENT_STUCK_MIN_SECONDS, seconds)) * 1000;
+	}
+
+	/** CPU (ms) a step's process tree must burn between checks to count as busy; NaN-safe, at least 1. */
+	getSilentStuckCpuMs(): number {
+		const raw = Number(this.settings.tools?.timeout?.silentStuckCpuMs ?? 1000);
+		return Number.isFinite(raw) && raw >= 1 ? raw : 1000;
+	}
+
+	getSelfRecoverySettings(): { autoContinue: boolean; childReplyNudge: boolean } {
+		const settings = this.settings.selfRecovery;
+		return {
+			autoContinue: settings?.autoContinue !== false,
+			childReplyNudge: settings?.childReplyNudge !== false,
+		};
+	}
+
 	getSubagentWakePolicy(): SubagentWakePolicy {
 		const policy = this.settings.subagentWake?.policy;
 		return policy === "never" || policy === "always" ? policy : "failure_aggregated";

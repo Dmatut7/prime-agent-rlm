@@ -255,6 +255,7 @@ import {
 	type CustomMessage,
 	convertToLlm,
 	createAsyncBashCompletionMessage,
+	createAutoContinueMessage,
 	createCompactionOutcomeMessage,
 	createEmptyResponseRecoveryMessage,
 	createHarnessDigestMessage,
@@ -281,6 +282,8 @@ import {
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { findExactModelReferenceMatch } from "./model-resolver.js";
+import { ORPHAN_PROCESS_JOURNAL_ENV, readActiveOrphanProcesses } from "./orphan-process-journal.js";
+import { explicitTimeoutMs, readProcessTreeCpuMs } from "./process-tree-cpu.js";
 import {
 	SessionInputAdmissionPausedError,
 	SessionInputCoalescingError,
@@ -391,6 +394,17 @@ import {
 	type SubagentRuntimeHost,
 } from "./rlm-runtime.js";
 import {
+	announcedNextStep,
+	autoContinuesInRun,
+	DUTY_EVENT_CUSTOM_ENTRY,
+	type DutyEvent,
+	dutyEventFor,
+	MAX_AUTO_CONTINUES_PER_PROMPT,
+	ranToolsSinceLastPrompt,
+	SELF_RECOVERY_CUSTOM_ENTRY,
+	type SelfRecoveryRecord,
+} from "./self-recovery.js";
+import {
 	modelRequestHeaders,
 	SemanticEdgeRecorder,
 	semanticEdgeLedgerPath,
@@ -460,6 +474,7 @@ import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-promp
 import { THINKING_LEVELS } from "./thinking-levels.js";
 import { acpMcpToolNames, createAcpMcpToolDefinitions } from "./tools/acp-mcp.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
+import { previewIpythonCode } from "./tools/code-preview.js";
 import { createAllToolDefinitions } from "./tools/index.js";
 import {
 	formatIpythonAbortCause,
@@ -864,6 +879,11 @@ export interface AgentSessionConfig {
 	 * journal, at most once per stall stage.
 	 */
 	stallJournaledBashHandles?: (kernelPid: number | undefined) => JournaledBashFacts | undefined;
+	/**
+	 * Cumulative CPU (ms) of the running step's process tree, for the silent-step rule.
+	 * Tests inject it; the default sums the kernel and its journaled bash handles with `ps`.
+	 */
+	stepCpuProbe?: () => number | undefined;
 	/**
 	 * Kernel residency facts behind the eviction-facing activity term of this session: a cell
 	 * executing right now, and live bash() handles the kernel's newest heartbeat attests.
@@ -2719,6 +2739,7 @@ export class AgentSession {
 	private readonly _stallJournaledBashHandles:
 		| ((kernelPid: number | undefined) => JournaledBashFacts | undefined)
 		| undefined;
+	private readonly _stepCpuProbe: (() => number | undefined) | undefined;
 	/** Kernel residency facts override for the eviction-facing activity term; defaults to the kernel client. */
 	private readonly _kernelResidencyFacts: (() => KernelResidencyFacts | undefined) | undefined;
 	/** Predicate names that already logged a failure this turn (one line per turn, not per sample). */
@@ -2735,6 +2756,20 @@ export class AgentSession {
 	private readonly _failureWakeQuietWindowMs: number;
 	private _stallLastEvent: { type: string; at: number } | undefined;
 	private readonly _stallInFlightTools = new Map<string, { toolName: string; startedAt: number }>();
+	/** Per in-flight call: its arguments and when it last produced output, for the silent-step rule. */
+	private readonly _stepOutputWatch = new Map<
+		string,
+		{
+			toolName: string;
+			args: unknown;
+			startedAt: number;
+			lastOutputAt: number;
+			movementToken?: string;
+			cpuMs?: number;
+		}
+	>();
+	/** Steps stopped as stuck in this run, keyed by their description. */
+	private readonly _stuckStepsThisRun = new Map<string, number>();
 	private _compactAutoRefinePending = false;
 	private _turnIntervalAutoRefinePending = false;
 	private _postCompactionContinuationScheduled = false;
@@ -2808,6 +2843,7 @@ export class AgentSession {
 		this._stallWatchdogTimers = config.stallWatchdogTimers;
 		this._stallKernelLivenessFacts = config.stallKernelLivenessFacts;
 		this._stallJournaledBashHandles = config.stallJournaledBashHandles;
+		this._stepCpuProbe = config.stepCpuProbe;
 		this._kernelResidencyFacts = config.kernelResidencyFacts;
 		this._rlmTerminalNoticeAbandonAfterMs =
 			config.rlmTerminalNoticeAbandonAfterMs ?? RLM_TERMINAL_NOTICE_ABANDON_AFTER_MS;
@@ -5685,7 +5721,40 @@ export class AgentSession {
 			this._restoreAutonomousRuntimeSnapshot(autonomousSnapshot);
 			return [];
 		}
-		return autonomousMessage ? [autonomousMessage] : [];
+		if (autonomousMessage) return [autonomousMessage];
+		if (signal?.aborted || this._sessionInputArrivalEpoch !== arrivalEpoch) return [];
+		const selfRecovery = this._selfRecoveryContinuation(context);
+		return selfRecovery ? [selfRecovery] : [];
+	}
+
+	/**
+	 * Self-recovery for unattended runs, after goal and autonomous continuations had
+	 * nothing to say. A main session whose turn stopped right after tool work with a
+	 * reply that only announces the next step gets one automatic continue (at most
+	 * {@link MAX_AUTO_CONTINUES_PER_PROMPT} per prompt); a subagent that finished its
+	 * task without replying is asked once to send its result. Anything that reads as a
+	 * final answer, a question, or waiting on children is left alone.
+	 */
+	private _selfRecoveryContinuation(context: GetContinuationMessagesContext): AgentMessage | undefined {
+		const settings = this.settingsManager.getSelfRecoverySettings();
+		const message = context.message;
+		if (message.stopReason !== "stop") return undefined;
+		if (this._goalState.status === "active") return undefined;
+		if (this._hasUnsettledRlmQuiescenceWork()) return undefined;
+		const used = autoContinuesInRun(context.newMessages);
+		if (this._rlmDepth > 0) {
+			if (!settings.childReplyNudge || this._repliedToParentSinceTask !== false || used > 0) return undefined;
+			if (!ranToolsSinceLastPrompt(context.newMessages)) return undefined;
+			this._recordSelfRecovery({ kind: "child_reply_nudge", at: Date.now() });
+			return createAutoContinueMessage({ reason: "child_reply_missing", ordinal: 1 });
+		}
+		if (!settings.autoContinue || used >= MAX_AUTO_CONTINUES_PER_PROMPT) return undefined;
+		if (!ranToolsSinceLastPrompt(context.newMessages)) return undefined;
+		const excerpt = announcedNextStep(message);
+		if (!excerpt) return undefined;
+		const ordinal = used + 1;
+		this._recordSelfRecovery({ kind: "auto_continue", excerpt, ordinal, at: Date.now() });
+		return createAutoContinueMessage({ reason: "announced_next_step", excerpt, ordinal });
 	}
 
 	private _lastAssistantMessage: AssistantMessage | undefined = undefined;
@@ -5893,6 +5962,7 @@ export class AgentSession {
 	}
 
 	private _handleAgentEvent = (event: AgentEvent): void => {
+		this._trackStepOutput(event);
 		this._recordStallWatchdogActivity(event);
 		this._recordFallbackActivity(event);
 		this._createRetryPromiseForAgentEnd(event);
@@ -6183,15 +6253,168 @@ export class AgentSession {
 			afterMs: settings.afterMs,
 			...(settings.perTool === undefined ? {} : { perTool: settings.perTool }),
 			vouch: (info) => this._toolTimeoutVouch(info),
+			describeCancellation: (info) => this._describeStuckStep(info),
 		};
 	}
 
+	/** Output bookkeeping behind the silent-step rule: start, last output, end. */
+	private _trackStepOutput(event: AgentEvent): void {
+		const now = Date.now();
+		if (event.type === "agent_start") {
+			this._stepOutputWatch.clear();
+			this._stuckStepsThisRun.clear();
+		} else if (event.type === "tool_execution_start") {
+			this._stepOutputWatch.set(event.toolCallId, {
+				toolName: event.toolName,
+				args: event.args,
+				startedAt: now,
+				lastOutputAt: now,
+			});
+		} else if (event.type === "tool_execution_update") {
+			const watch = this._stepOutputWatch.get(event.toolCallId);
+			if (watch) watch.lastOutputAt = now;
+		} else if (event.type === "tool_execution_end") {
+			this._stepOutputWatch.delete(event.toolCallId);
+		}
+	}
+
 	/**
-	 * Three-bucket verdict for a fired per-call deadline, with the stall watchdog as
-	 * the single arbiter (r4 recovery): the extension consumes the same exemption
-	 * budget the abort stage defers by - never a second pool. Progress evidence buys a
-	 * full window, liveness half of one, a paused turn boundary defers like the abort
-	 * stage does, and no evidence cancels the call.
+	 * How long a call has produced no output (its elapsed time when untracked). A kernel
+	 * output-counter token that changed since the previous check counts as output too;
+	 * the first token seen is only the baseline.
+	 */
+	private _stepSilentMs(info: ToolTimeoutVouchInfo, movementToken?: string, sampleCpu = false): number {
+		const watch = this._stepOutputWatch.get(info.toolCallId);
+		if (!watch) return info.elapsedMs;
+		const now = Date.now();
+		if (movementToken !== undefined) {
+			if (watch.movementToken !== undefined && watch.movementToken !== movementToken) watch.lastOutputAt = now;
+			watch.movementToken = movementToken;
+		}
+		// CPU of the step's process tree is work too: a quiet compile or test run that keeps
+		// computing is busy. Sampled only at a deadline recheck, never on the hot path.
+		if (sampleCpu) {
+			const cpuMs = this._sampleStepCpuMs();
+			if (cpuMs !== undefined) {
+				if (watch.cpuMs !== undefined && cpuMs - watch.cpuMs >= this.settingsManager.getSilentStuckCpuMs()) {
+					watch.lastOutputAt = now;
+				}
+				// Keep the baseline where output was last seen, so slow CPU accumulates across checks.
+				if (watch.cpuMs === undefined || watch.lastOutputAt === now) watch.cpuMs = cpuMs;
+			}
+		}
+		return Math.max(0, now - watch.lastOutputAt);
+	}
+
+	/** The silent-step threshold for one call: the setting, or the call's own explicit timeout if longer. */
+	private _stuckAfterMs(toolCallId: string): number {
+		const configured = this.settingsManager.getSilentStuckMs();
+		const explicit = explicitTimeoutMs(this._stepOutputWatch.get(toolCallId)?.args);
+		return explicit === undefined ? configured : Math.max(configured, explicit);
+	}
+
+	/**
+	 * Cumulative CPU (ms) of the kernel and its bash handles' process trees, or the kernel's
+	 * own heartbeat CPU when `ps` is unavailable. Undefined means no CPU evidence: the rule
+	 * then falls back to output alone.
+	 */
+	private _sampleStepCpuMs(): number | undefined {
+		try {
+			if (this._stepCpuProbe) return this._stepCpuProbe();
+			const facts = this._stallKernelLivenessFacts
+				? this._stallKernelLivenessFacts()
+				: this._kernelLivenessFactsFromClient();
+			const kernelPid = facts?.kernelPid;
+			const roots = kernelPid === undefined ? [] : [kernelPid];
+			const journal = process.env[ORPHAN_PROCESS_JOURNAL_ENV];
+			if (journal && kernelPid !== undefined) {
+				for (const record of readActiveOrphanProcesses(journal, process.pid, { maxBytes: 256 * 1024 })) {
+					if (record.kernelPid === kernelPid && record.pid !== kernelPid) roots.push(record.pid);
+				}
+			}
+			return readProcessTreeCpuMs(roots) ?? facts?.latest?.cpuMs;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/** A plain description of a step for the model and the duty log: the command or cell preview. */
+	private _describeStepForRecovery(toolCallId: string, toolName: string): string {
+		const args = this._stepOutputWatch.get(toolCallId)?.args as Record<string, unknown> | undefined;
+		const pick = (key: string): string | undefined =>
+			typeof args?.[key] === "string" && (args[key] as string).trim() ? (args[key] as string).trim() : undefined;
+		const code = pick("code");
+		const text =
+			code !== undefined
+				? previewIpythonCode(code).text || code.split("\n")[0] || toolName
+				: (pick("command") ?? pick("path") ?? pick("file_path") ?? toolName);
+		const single = text.replace(/\s+/g, " ").trim();
+		return single.length > 120 ? `${single.slice(0, 119)}…` : single;
+	}
+
+	/** Append one self-recovery action (and its duty-log event); bookkeeping must never break the turn. */
+	private _recordSelfRecovery(record: SelfRecoveryRecord): void {
+		try {
+			this.sessionManager.appendCustomEntry(SELF_RECOVERY_CUSTOM_ENTRY, record);
+		} catch (error) {
+			sessionLog.warn("could not record a self-recovery action", {
+				sessionId: this.sessionId,
+				kind: record.kind,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+		this._recordDutyEvent(dutyEventFor(record));
+	}
+
+	/** Append one duty-log event for the "while you were away" summary. */
+	private _recordDutyEvent(event: DutyEvent): void {
+		try {
+			this.sessionManager.appendCustomEntry(DUTY_EVENT_CUSTOM_ENTRY, event);
+		} catch (error) {
+			sessionLog.warn("could not record a duty event", {
+				sessionId: this.sessionId,
+				kind: event.kind,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	/**
+	 * The detail a stopped call's cancellation carries: which step, how long it was
+	 * silent, that it was stopped, and what to do instead. A step stuck twice in one
+	 * run is called out so the model stops retrying the same path.
+	 */
+	private _describeStuckStep(info: ToolTimeoutVouchInfo): string {
+		const step = this._describeStepForRecovery(info.toolCallId, info.toolName);
+		const silentMs = this._stepSilentMs(info);
+		const seen = (this._stuckStepsThisRun.get(step) ?? 0) + 1;
+		this._stuckStepsThisRun.set(step, seen);
+		this._recordSelfRecovery({
+			kind: "stuck_step_stopped",
+			toolCallId: info.toolCallId,
+			toolName: info.toolName,
+			step,
+			silentMs,
+			repeated: seen > 1,
+			at: Date.now(),
+		});
+		const lines = [
+			`Stuck step: \`${step}\` produced no output for ${Math.round(silentMs / 1000)}s and showed no progress, so it was stopped.`,
+			seen > 1
+				? "This same step got stuck before in this run: do not run it again; take a different path (a smaller input, an explicit timeout, a background handle you poll, or a different tool)."
+				: "Try a different approach rather than repeating it unchanged.",
+			"If the next cell reports that the kernel is still busy, retry once: a kernel that stays busy is restarted automatically and its saved state restored.",
+		];
+		return lines.join(" ");
+	}
+
+	/**
+	 * Verdict for a fired per-call deadline, with the stall watchdog as the single
+	 * arbiter (r4 recovery): the extension consumes the same exemption budget the abort
+	 * stage defers by - never a second pool. No evidence cancels the call; a paused turn
+	 * boundary defers like the abort stage does. With evidence the call is extended
+	 * (progress a full window, liveness half of one) until it has produced no output for
+	 * the silent-step threshold (`tools.timeout.silentStuckSeconds`), when it is stuck.
 	 */
 	private _toolTimeoutVouch(info: ToolTimeoutVouchInfo): ToolTimeoutVerdict | undefined {
 		try {
@@ -6203,19 +6426,21 @@ export class AgentSession {
 					recheckMs: this._boundToolTimeoutRecheck(info.timeoutMs, exemption.remainingMs),
 				};
 			}
-			if (exemption.tier === "progress") {
-				return {
-					action: "extend",
-					recheckMs: this._boundToolTimeoutRecheck(info.timeoutMs, exemption.remainingMs),
-				};
-			}
-			if (exemption.tier === "liveness") {
-				// Mere existence is weaker evidence: half a window, and never past the
-				// budget the watchdog still has.
-				const halfWindow = Math.max(1_000, Math.round(info.timeoutMs / 2));
-				return { action: "extend", recheckMs: this._boundToolTimeoutRecheck(halfWindow, exemption.remainingMs) };
-			}
-			return { action: "fail" };
+			// Evidence says the call is alive. It is busy while it produces output (its own
+			// updates, or the kernel's output counters moving) and stuck once it has produced
+			// none for the silent-step threshold - a quiet `await bash(...)` included, which the
+			// liveness tiers alone would excuse for as long as the process exists.
+			const stuckAfterMs = this._stuckAfterMs(info.toolCallId);
+			const silentMs = this._stepSilentMs(info, this._sampleStallVouch()?.movementToken, true);
+			if (silentMs >= stuckAfterMs) return { action: "fail" };
+			const recheckMs = exemption.tier === "progress" ? info.timeoutMs : Math.round(info.timeoutMs / 2);
+			return {
+				action: "extend",
+				recheckMs: this._boundToolTimeoutRecheck(
+					Math.max(1_000, Math.min(recheckMs, stuckAfterMs - silentMs)),
+					exemption.remainingMs,
+				),
+			};
 		} catch (error) {
 			this._reportStallPredicateFailure("toolTimeout", error);
 			// K3 asymmetry: the deadline's judge failing fails towards NOT killing
@@ -17027,6 +17252,8 @@ export class AgentSession {
 				lastAssistantTextPreview: lastAssistantText ? compactRlmText(lastAssistantText) : undefined,
 			}),
 		);
+		// The parent gets the child's last answer without waiting for a reply that never came.
+		this._recordDutyEvent({ kind: "child_auto_delivered", child: sessionName });
 	}
 
 	private _rlmChildSnapshotForRun(

@@ -57,6 +57,8 @@ export const ASYNC_BASH_COMPLETION_CUSTOM_TYPE = "async_bash_completion";
  * gets a turn to be recovered instead of ending in a silent stop.
  */
 export const EMPTY_RESPONSE_RECOVERY_CUSTOM_TYPE = "empty_response_recovery";
+/** Self-recovery continue: the session nudges itself after an announced-but-undone step or a missing child reply. */
+export const AUTO_CONTINUE_CUSTOM_TYPE = "auto_continue";
 export const ASYNC_BASH_COMPLETION_PREVIEW_LABEL = "Background command finished";
 
 export const THINKING_LEVEL_CLAMPED_CUSTOM_TYPE = "thinking_level_clamped";
@@ -446,6 +448,44 @@ export function createEmptyResponseRecoveryMessage(
 				? `This is an automatic continuation (generation ${details.recoveryGeneration} of at most ${details.maxContinuations}); a further one may follow only if this turn itself exhausts the ladder.`
 				: `This is an automatic one-shot continuation (generation ${details.recoveryGeneration}); the system will not send another for this episode.`,
 		].join("\n"),
+		display: true,
+		details,
+		timestamp,
+	};
+}
+
+/** Details of an automatic continue (see self-recovery.ts). */
+export interface AutoContinueMessageDetails {
+	reason: "announced_next_step" | "child_reply_missing";
+	excerpt?: string;
+	ordinal: number;
+}
+
+/**
+ * The session's own continue after a turn that stopped right after announcing its
+ * next step (or a subagent that finished without replying): the model is told plainly
+ * what happened and that nobody is waiting to approve it. `display: true` keeps it
+ * visible and auditable.
+ */
+export function createAutoContinueMessage(
+	details: AutoContinueMessageDetails,
+	timestamp = Date.now(),
+): CustomMessage<AutoContinueMessageDetails> {
+	const content =
+		details.reason === "child_reply_missing"
+			? [
+					"[auto-continue] You ended your run without sending your result to your parent agent, which is waiting for it.",
+					'If your task calls for an answer, send it now with `await agent_message.send(<your result>, receiver_role="parent")`, then stop. If no answer is needed, reply with one short line saying so.',
+				].join("\n")
+			: [
+					`[auto-continue] Your last reply ended by announcing a next step (${JSON.stringify(details.excerpt ?? "")}) but the turn stopped before doing it. Nobody is waiting to approve it.`,
+					"Continue and do that step now. If the work is actually finished, give the final result instead; if you are blocked or need a decision from the user, say exactly what and stop.",
+					`This is an automatic continue (${details.ordinal} of at most 2 for this request).`,
+				].join("\n");
+	return {
+		role: "custom",
+		customType: AUTO_CONTINUE_CUSTOM_TYPE,
+		content,
 		display: true,
 		details,
 		timestamp,

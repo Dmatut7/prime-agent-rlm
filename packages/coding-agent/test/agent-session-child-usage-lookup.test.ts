@@ -106,7 +106,9 @@ describe("AgentSession child usage attribution cost", () => {
 		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		const sessionManager = SessionManager.create(tempDir, join(tempDir, "sessions"));
-		const settingsManager = SettingsManager.create(tempDir, tempDir);
+		// The child-reply reminder would add one more child turn; this file counts
+		// attribution per turn, so it pins the subject with the reminder off.
+		const settingsManager = SettingsManager.inMemory({ selfRecovery: { childReplyNudge: false } });
 		const tool = {
 			name: "echo",
 			description: "Echo a value",
