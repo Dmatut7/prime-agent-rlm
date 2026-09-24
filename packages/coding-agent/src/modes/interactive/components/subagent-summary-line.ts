@@ -572,7 +572,13 @@ export class SubagentSummaryLine implements Component, Focusable {
 		const safeWidth = Math.max(1, width);
 		const lines = [this.renderHeader(safeWidth)];
 		if (this.openable) {
-			this.clickRegions.push({ line: 0, col: 0, width: safeWidth, height: 1, onClick: () => this.onOpen?.() });
+			this.clickRegions.push({
+				line: 0,
+				col: 0,
+				width: safeWidth,
+				height: 1,
+				onClick: () => this.onOpen?.(undefined),
+			});
 		}
 		if (
 			!this.focused &&
