@@ -46,8 +46,13 @@ gray background. Extremely large images are rejected by pixel count before full
 processing. The original file is left untouched.
 
 Supported formats: PNG, JPEG, GIF, WebP. The skill errors if a file is not a
-supported image, or if neither the current model nor a configured image model
-can see images.
+supported image, if images are turned off in the settings, or if neither the
+current model nor a configured image model can see images.
+
+An image the owner pasted shows up in their message as `[image #N](path)`: the
+host saved the pasted image at that path, so `attach_image(path)` brings it back
+when you need to look at it again later (after a restart, or when an earlier
+description does not answer a new question about it).
 
 If you cannot see images yourself, call it anyway rather than handing the file
 to a subagent: the next reply comes from the owner's image model, which puts

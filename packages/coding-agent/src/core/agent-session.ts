@@ -223,7 +223,20 @@ import {
 	validateGoalBudget,
 	validateGoalObjective,
 } from "./goals.js";
-import { type ImageModelRoutingInputs, resolveImageModelOverride } from "./image-model-routing.js";
+import {
+	findImageNeedingLook,
+	IMAGE_LOOK_MAX_ATTEMPTS,
+	IMAGE_ROUTE_BRIEF,
+	IMAGE_ROUTE_MAX_REQUESTS,
+	IMAGE_ROUTE_TRIMMED_NOTE,
+	type ImageModelRoutingInputs,
+	isImageDescription,
+	messageHasImage,
+	resolveImageModelOverride,
+	resolveImageModelRoute,
+	trimContextForImageModel,
+	withRequestNote,
+} from "./image-model-routing.js";
 import {
 	classifyIncomingInput,
 	type InputClass,
@@ -1289,6 +1302,15 @@ function batchCarriesImages(turns: SessionAction<PreparedTurnPayload>[], extraMe
 		extraMessages.some((message) => messageCarriesImages(message)) ||
 		turns.some((action) => action.payload.records.some((record) => messageCarriesImages(record.message)))
 	);
+}
+
+/** Image routing for a dispatched batch: the image model, the image it reads, and why. */
+interface ImageRouteDecision {
+	override: AgentModelOverride;
+	/** Latest image message the route is for; the routed request brief keys off it. */
+	anchor: AgentMessage | undefined;
+	/** The batch attaches no image: the route is for a recent image already in context. */
+	contextOnly: boolean;
 }
 
 function queuedAgentMessagePreview(action: QueuedSessionAction): string {
@@ -2925,6 +2947,7 @@ export class AgentSession {
 		this._installAgentToolHooks();
 		this._installAgentTurnHook();
 		this._installAgentContinuationHook();
+		this._installImageRouteContextHook();
 		this._refreshAgentLoopRuntimeSettings();
 
 		this._buildRuntime({
@@ -3934,24 +3957,61 @@ export class AgentSession {
 	private _imageDeliverySuspicionNotified = false;
 
 	/**
-	 * Routing decision for a dispatched turn batch: when any delivered message
-	 * attaches images and the session model has no image input, serve the turn
-	 * on the user-configured imageModel (settings.imageModel) instead.
+	 * Routing decision for a dispatched turn batch, for a session model without image
+	 * input: serve the turn on the user-configured imageModel (settings.imageModel) when
+	 * a delivered message attaches images, and also when the context holds a recent image
+	 * that still needs a look - one no image-capable model has put into words (the image
+	 * turn was interrupted, failed, or the session restarted), or one the owner asks
+	 * about again. Without that second case the session model answers from a placeholder
+	 * and guesses. A batch that attaches images cannot be served honestly without an
+	 * image model, so that case throws with setup guidance; the context-only case just
+	 * stays on the session model when no image model is usable, and a picture is retried
+	 * this way only a few times, so a broken image model cannot hold every later turn.
 	 *
 	 * The override is stored on the agent, so retries and post-compaction
 	 * continuations of the routed turn keep serving it; the next dispatch
-	 * re-evaluates it, so later image-free turns return to the session model.
-	 * A missing session model is reported by _validateCanStartAgentRun.
+	 * re-evaluates it. A missing session model is reported by _validateCanStartAgentRun.
 	 */
-	private _imageModelOverrideForTurns(
+	private _imageRouteForTurns(
 		turns: SessionAction<PreparedTurnPayload>[],
 		extraMessages: AgentMessage[] = [],
-	): AgentModelOverride | undefined {
+	): ImageRouteDecision | undefined {
 		const sessionModel = this.model;
-		if (!sessionModel) return undefined;
-		if (!batchCarriesImages(turns, extraMessages)) return undefined;
-		return resolveImageModelOverride(this._imageModelRoutingInputs(sessionModel));
+		if (!sessionModel || sessionModel.input.includes("image")) return undefined;
+		if (batchCarriesImages(turns, extraMessages)) {
+			const override = resolveImageModelOverride(this._imageModelRoutingInputs(sessionModel));
+			if (!override) return undefined;
+			const batchMessages: AgentMessage[] = [
+				...turns.flatMap((action) => action.payload.records.map((record) => record.message)),
+				...extraMessages,
+			];
+			return {
+				override,
+				anchor: batchMessages.filter((message) => messageHasImage(message)).at(-1),
+				contextOnly: false,
+			};
+		}
+		const look = findImageNeedingLook({
+			messages: this.agent.state.messages,
+			promptText: turns.map((action) => action.payload.text ?? "").join("\n"),
+			couldSeeImages: (message) => this._assistantCouldSeeImages(message),
+		});
+		if (!look || (this._imageLookAttempts.get(look.anchor) ?? 0) >= IMAGE_LOOK_MAX_ATTEMPTS) return undefined;
+		const route = resolveImageModelRoute(this._imageModelRoutingInputs(sessionModel));
+		return route.kind === "routed" ? { override: route.override, anchor: look.anchor, contextOnly: true } : undefined;
 	}
+
+	/** Context-only image routes already spent on a picture, so a failing image model gives up. */
+	private _imageLookAttempts = new WeakMap<AgentMessage, number>();
+
+	/** Whether the model that wrote `message` took image input (it saw the images before it). */
+	private _assistantCouldSeeImages(message: AssistantMessage): boolean {
+		if (this._imageDescriptions.has(message)) return true;
+		return this._modelRegistry.find(message.provider, message.model)?.input.includes("image") === true;
+	}
+
+	/** Replies a routed image model gave that put the images into words (the handback trigger). */
+	private _imageDescriptions = new WeakSet<AssistantMessage>();
 
 	private _imageModelRoutingInputs(sessionModel: Model<any>): ImageModelRoutingInputs {
 		return {
@@ -3966,27 +4026,51 @@ export class AgentSession {
 	}
 
 	/**
-	 * The image routing of the current run: the override it was dispatched with, and
-	 * whether the run has already been handed back to the session model.
+	 * The image routing of the current run: the override it was dispatched with, the
+	 * image message it was routed for, how many requests the image model served since,
+	 * and whether the run has already been handed back to the session model.
 	 */
 	private _imageRoute:
-		| { override: AgentModelOverride; handedBack: boolean; handback?: AgentModelOverride }
+		| {
+				override: AgentModelOverride;
+				handedBack: boolean;
+				handback?: AgentModelOverride;
+				anchor: AgentMessage | undefined;
+				requests: number;
+		  }
 		| undefined;
+
+	/** Start the current run's image route (dispatch) or clear it for an image-free run. */
+	private _beginImageRoute(route: ImageRouteDecision | undefined): void {
+		this.agent.modelOverride = route?.override;
+		this._imageRoute = route
+			? { override: route.override, handedBack: false, anchor: route.anchor, requests: 0 }
+			: undefined;
+		if (route?.contextOnly && route.anchor) {
+			this._imageLookAttempts.set(route.anchor, (this._imageLookAttempts.get(route.anchor) ?? 0) + 1);
+		}
+	}
 
 	/**
 	 * An image-routed run exists so the image model can read the images, not so it does
 	 * the whole task: once it has put what it saw into words, the rest of the run goes
 	 * back to the session model the owner chose (a screenshot must not move a long task
-	 * onto the cheaper image model). A response that is only a tool call leaves nothing
-	 * for the session model to continue from, so the handback waits for text. A fallback
-	 * episode owns the serving model and is left alone.
+	 * onto the cheaper image model). A short preamble in front of a tool call ("我来看看")
+	 * describes nothing, so the handback waits for a real description; an image model
+	 * that only calls tools still hands back after a few requests. During a fallback
+	 * episode the session model is the fallback model serving the session
+	 * (agent.state.model), and the run goes back to that. Runs synchronously on the
+	 * message_end event, before the loop takes the next request's model.
 	 */
 	private _maybeHandBackFromImageModel(message: AssistantMessage): void {
 		const route = this._imageRoute;
 		const sessionModel = this.model;
-		if (!route || route.handedBack || !sessionModel) return;
-		if (this.agent.modelOverride !== route.override || this._fallback) return;
-		if (!message.content.some((block) => block.type === "text" && block.text.trim().length > 0)) return;
+		if (!route || route.handedBack || !sessionModel || !this.agent.modelOverride) return;
+		if (message.stopReason === "error" || message.stopReason === "aborted") return;
+		route.requests += 1;
+		const described = isImageDescription(message);
+		if (!described && route.requests < IMAGE_ROUTE_MAX_REQUESTS) return;
+		if (described) this._imageDescriptions.add(message);
 		route.handedBack = true;
 		route.handback = {
 			model: sessionModel,
@@ -4001,46 +4085,95 @@ export class AgentSession {
 	 * The image model a run that started image-free would switch to once a tool result
 	 * brings in images, or undefined when the session model sees images itself or no
 	 * usable imageModel is configured (attach_image then rejects with its own guidance).
+	 * During a fallback episode the session model is the fallback model now serving.
 	 */
 	private _midRunImageModelOverride(): AgentModelOverride | undefined {
 		const sessionModel = this.model;
-		if (!sessionModel || this._fallback) return undefined;
-		try {
-			return resolveImageModelOverride(this._imageModelRoutingInputs(sessionModel));
-		} catch {
-			return undefined;
-		}
+		if (!sessionModel) return undefined;
+		const route = resolveImageModelRoute(this._imageModelRoutingInputs(sessionModel));
+		return route.kind === "routed" ? route.override : undefined;
 	}
 
 	/**
 	 * A tool result delivered new images the session model cannot read, so the next
 	 * request goes to the image model. That covers a run handed back after an image
 	 * turn, and a run that started image-free: the owner pasted a file path as text and
-	 * the session model loaded it with attach_image.
+	 * the session model loaded it with attach_image. Runs synchronously on the
+	 * tool result's message_end: the loop takes the next request's model right after
+	 * that event, without waiting for the session's event queue.
 	 */
-	private _rerouteToImageModelForNewImages(): void {
-		if (this._fallback) return;
+	private _rerouteToImageModelForNewImages(message: AgentMessage): void {
 		const route = this._imageRoute;
-		if (route) {
-			if (!route.handedBack || this.model?.input.includes("image")) return;
-			route.handedBack = false;
-			this.agent.modelOverride = route.override;
-			this.agent.pendingTurnModel = route.override;
+		if (route && !route.handedBack) {
+			route.anchor = message;
 			return;
 		}
 		const override = this._midRunImageModelOverride();
 		if (!override) return;
-		this._imageRoute = { override, handedBack: false };
+		this._imageRoute = { override, handedBack: false, anchor: message, requests: 0 };
 		this.agent.modelOverride = override;
 		this.agent.pendingTurnModel = override;
 	}
 
 	/**
+	 * The request context of a routed image-model request: the stored context plus a
+	 * brief that tells the image model why it got this request (never persisted), cut
+	 * to the image model's context window when the owner's session is larger than it.
+	 * Only this session's own loop is touched: a side question or subagent that shares
+	 * the hook sees a context without the routed image message and passes through.
+	 */
+	private _imageRouteRequestContext(messages: AgentMessage[]): AgentMessage[] {
+		const route = this._imageRoute;
+		const serving = this.agent.modelOverride?.model;
+		if (!route || route.handedBack || !serving || !route.anchor || !messages.includes(route.anchor)) {
+			return messages;
+		}
+		const trimmed = trimContextForImageModel(messages, route.anchor, serving.contextWindow);
+		const brief = trimmed ? `${IMAGE_ROUTE_BRIEF}\n${IMAGE_ROUTE_TRIMMED_NOTE}` : IMAGE_ROUTE_BRIEF;
+		return withRequestNote(trimmed ?? messages, brief);
+	}
+
+	private _installImageRouteContextHook(): void {
+		const inner = this.agent.transformContext;
+		// Before the inner hook: the routed image message is recognized by identity, and an
+		// extension's context hook may hand back copies.
+		this.agent.transformContext = async (messages, signal) => {
+			const routed = this._imageRouteRequestContext(messages);
+			return inner ? inner(routed, signal) : routed;
+		};
+	}
+
+	/**
+	 * Image routing on the agent's event stream, decided synchronously: the loop takes
+	 * the next request's model right after a message_end, and the session's event queue
+	 * may still be working through earlier events, so a decision made there can come too
+	 * late and send the request after attach_image to the text-only model.
+	 */
+	private _routeImagesOnAgentEvent(event: AgentEvent): void {
+		if (event.type !== "message_start" && event.type !== "message_end") return;
+		const message = event.message;
+		const deliversImages =
+			(message.role === "toolResult" || message.role === "user" || message.role === "custom") &&
+			messageHasImage(message);
+		if (deliversImages) {
+			// Mid-run tool results (attach_image through the kernel) and steering messages
+			// (a Ctrl+V image sent while the run goes on) attach image blocks to this run's
+			// continuation requests without a dispatch deciding the route; the suspicion
+			// check counts them as carried images even when the committed batch had none.
+			this._runToolResultsCarriedImages = true;
+			if (event.type === "message_end") this._rerouteToImageModelForNewImages(message);
+		} else if (message.role === "assistant" && event.type === "message_end") {
+			this._maybeHandBackFromImageModel(message);
+		}
+	}
+
+	/**
 	 * Model serving the current run: the routed image model while a routed
 	 * turn (or its retries/continuations) is active, the session model
-	 * otherwise. Compaction decisions compare context against the model that
-	 * actually serves the requests, so a routed run uses the routed model's
-	 * context window and accepts its assistant messages as its own.
+	 * otherwise. Overflow recovery compares against the model that actually
+	 * serves the requests, so a routed run accepts its assistant messages as its
+	 * own. Threshold compaction does not: it sizes the owner's session, which the
+	 * session model carries on with (see _sessionContextWindow).
 	 */
 	private _runModel(): Model<any> | undefined {
 		return this.agent.modelOverride?.model ?? this.model;
@@ -5099,7 +5232,7 @@ export class AgentSession {
 		const settings = this.settingsManager.getCompactionSettings();
 		if (!settings.enabled) return false;
 
-		const contextWindow = this._runModel()?.contextWindow ?? 0;
+		const contextWindow = this._sessionContextWindow();
 		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
 		const compactionTimestamp = compactionEntry ? new Date(compactionEntry.timestamp).getTime() : undefined;
 		if (compactionTimestamp !== undefined && context.message.timestamp <= compactionTimestamp) {
@@ -6068,6 +6201,7 @@ export class AgentSession {
 		this._recordStallWatchdogActivity(event);
 		this._recordFallbackActivity(event);
 		this._createRetryPromiseForAgentEnd(event);
+		this._routeImagesOnAgentEvent(event);
 		if (event.type === "message_start" || event.type === "message_end") {
 			for (const action of this._actionStore.ownedActions()) {
 				if (
@@ -6887,13 +7021,6 @@ export class AgentSession {
 		let clearedDispatchEnded = false;
 		if ((event.type === "message_start" || event.type === "message_end") && event.message.role === "toolResult") {
 			this._applyLateIpythonSentAgentMessages(event.message);
-			// Mid-run tool results (attach_image through the kernel) attach image
-			// blocks to this run's continuation requests; the suspicion check counts
-			// them as carried images even when the committed batch had none.
-			if (messageCarriesImages(event.message)) {
-				this._runToolResultsCarriedImages = true;
-				if (event.type === "message_end") this._rerouteToImageModelForNewImages();
-			}
 		}
 		if (event.type === "message_start" || event.type === "message_end") {
 			const cleared = this._capturingCancelledAction(event.message);
@@ -7025,7 +7152,6 @@ export class AgentSession {
 					// its usage frame says nothing about whether images were counted.
 				} else {
 					this._maybeNoticeImageDeliverySuspicion(assistantMsg);
-					this._maybeHandBackFromImageModel(assistantMsg);
 				}
 				if (assistantMsg.stopReason === "aborted") {
 					this._handleAbortedQuotaPark();
@@ -10853,7 +10979,7 @@ export class AgentSession {
 					// turn's override. Retries and post-compaction continuations of a routed
 					// turn re-read the override, so they keep serving it; the next dispatch
 					// overwrites it with its fresh decision.
-					this.agent.modelOverride = this._imageModelOverrideForTurns(activeTurns());
+					this.agent.modelOverride = this._imageRouteForTurns(activeTurns())?.override;
 				},
 				prepare: async () => {
 					if (executionPolicy.nextTurnContextTiming === "preparation") {
@@ -10966,20 +11092,20 @@ export class AgentSession {
 					// Re-evaluate image routing for the exact message set being sent:
 					// before_agent_start injections land after the earlier per-turn
 					// decision and may carry images the session model cannot serve.
-					this.agent.modelOverride = this._imageModelOverrideForTurns(turns, preparedMessages);
+					const imageRoute = this._imageRouteForTurns(turns, preparedMessages);
 					// A handback the previous run set after its last request must not be taken by
 					// this run's first request: this dispatch made its own routing decision.
 					if (this._imageRoute?.handback && this.agent.pendingTurnModel === this._imageRoute.handback) {
 						this.agent.pendingTurnModel = undefined;
 					}
-					this._imageRoute = this.agent.modelOverride
-						? { override: this.agent.modelOverride, handedBack: false }
-						: undefined;
+					this._beginImageRoute(imageRoute);
 					// Same batch, same authority: the image-delivery suspicion check
 					// reads at message_end whether the request this run actually sends
 					// carries images (the committed batch plus image blocks tool results
 					// deliver mid-run), and re-arms its one-notice-per-batch budget.
-					this._dispatchedBatchCarriedImages = batchCarriesImages(turns, preparedMessages);
+					// A route for an image already in context sends that image too.
+					this._dispatchedBatchCarriedImages =
+						batchCarriesImages(turns, preparedMessages) || imageRoute?.contextOnly === true;
 					this._runToolResultsCarriedImages = false;
 					this._imageDeliverySuspicionNotified = false;
 					return turns.some((action) => action.suppressAutonomousContinuation)
@@ -14695,6 +14821,30 @@ export class AgentSession {
 	}
 
 	/**
+	 * A routed image model overflowed although the owner's session is within the session
+	 * model's threshold. Its request was already cut to its window
+	 * (_imageRouteRequestContext), so what is left is the image turn itself, and
+	 * compacting the owner's session would lose history without making that turn fit.
+	 */
+	private _routedOverflowFitsSession(compactionTimestamp: number | undefined, settings: CompactionSettings): boolean {
+		const routed = this.agent.modelOverride?.model;
+		if (!routed || !this.model || modelsAreEqual(routed, this.model)) return false;
+		const contextTokens = this._estimateThresholdContextTokens(compactionTimestamp);
+		if (contextTokens === undefined) return false;
+		return !shouldCompact(contextTokens, this._sessionContextWindow(), settings, this._compactionWindowLimits());
+	}
+
+	/**
+	 * Context window threshold compaction sizes the session against: the session
+	 * model's, never a routed image model's. A smaller-window image model reading one
+	 * screenshot must not compact the owner's whole session; its request is trimmed to
+	 * its window instead (_imageRouteRequestContext).
+	 */
+	private _sessionContextWindow(): number {
+		return this.model?.contextWindow ?? 0;
+	}
+
+	/**
 	 * Model identity for the compaction trigger: the declared window clamped to the
 	 * provider's measured input limit, so a catalog entry that over-declares (1048576
 	 * declared, 1000000 accepted) cannot push the trigger past the wall.
@@ -14759,7 +14909,8 @@ export class AgentSession {
 			!assistantIsFromBeforeCompaction &&
 			(settings.enabled || this._pendingRequestedCompaction !== undefined) &&
 			sameModel &&
-			isContextOverflow(assistantMessage, contextWindow)
+			isContextOverflow(assistantMessage, contextWindow) &&
+			!this._routedOverflowFitsSession(compactionTimestamp, settings)
 		) {
 			if (this._overflowRecovery !== "idle") {
 				if (this._overflowRecovery === "attempted") {
@@ -14791,11 +14942,14 @@ export class AgentSession {
 
 		// Case 3: Threshold - context is getting large.
 		// Use the full-session estimate so messages appended after the last successful
-		// assistant usage are included, matching the /usage context display.
+		// assistant usage are included, matching the /usage context display. The window
+		// is the session model's even on a routed image turn: the owner's session is what
+		// gets compacted, and the image model reads a trimmed copy when it is smaller.
 		const contextTokens = this._getThresholdContextTokens(assistantMessage, compactionTimestamp);
 		if (contextTokens === undefined) return false;
-		if (shouldCompact(contextTokens, contextWindow, settings, this._compactionWindowLimits())) {
-			if (this._isThresholdCompactionCoolingDown(contextWindow)) return false;
+		const sessionWindow = this._sessionContextWindow();
+		if (shouldCompact(contextTokens, sessionWindow, settings, this._compactionWindowLimits())) {
+			if (this._isThresholdCompactionCoolingDown(sessionWindow)) return false;
 			if (queueAutonomousContinuation && this._queueGoalContinuationForThresholdCompaction(assistantMessage)) {
 				this._continueAfterThresholdCompaction = true;
 			} else if (
@@ -15831,14 +15985,22 @@ export class AgentSession {
 				// model: a routed image turn serves on settings.imageModel, and on an
 				// image-free turn of a text-only session model an attached image moves
 				// the next request there, so attach_image's vision check judges that model.
+				// blockImages and imageModelProblem let the skill name the actual reason an
+				// image cannot be seen instead of always asking for an imageModel.
 				const runModel = this._runModel();
-				const servingModel = runModel?.input.includes("image")
-					? runModel
-					: (this._midRunImageModelOverride()?.model ?? runModel);
+				const blockImages = this.settingsManager.getBlockImages();
+				const route = this.model ? resolveImageModelRoute(this._imageModelRoutingInputs(this.model)) : undefined;
+				const servingModel =
+					runModel?.input.includes("image") || route?.kind !== "routed" ? runModel : route.override.model;
+				const imageModelProblem = route?.kind === "missing" || route?.kind === "unusable" ? route.kind : undefined;
 				return {
 					id: servingModel?.id ?? null,
 					provider: servingModel?.provider ?? null,
 					input: servingModel?.input ?? [],
+					blockImages,
+					...(imageModelProblem
+						? { imageModelProblem, imageModel: this.settingsManager.getImageModel() ?? null }
+						: {}),
 				};
 			},
 		};

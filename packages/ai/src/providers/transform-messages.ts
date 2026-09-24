@@ -13,9 +13,12 @@ import type {
 // A conversation can hand a turn with images to an image-capable model and the rest
 // back to a text-only one. Read bare, "omitted" made the text-only model conclude that
 // nobody had seen the image and disown the reply that described it, so the placeholder
-// says who did.
+// says who did. It also says how to get another look: a text-only model that only
+// knows the image is gone guesses at details the description left out.
 const SEEN_BY_OTHER_MODEL_NOTE =
-	"If the next assistant reply describes it, an image-capable model that did see it wrote that reply.";
+	"If the next assistant reply describes it, an image-capable model that did see it wrote that reply. " +
+	"If a detail you need is not in that description and the conversation gives the image's file path, " +
+	"loading that file again as an image lets an image-capable model look at it.";
 const NON_VISION_USER_IMAGE_PLACEHOLDER = `(image not shown to this model, which does not take image input. ${SEEN_BY_OTHER_MODEL_NOTE})`;
 const NON_VISION_TOOL_IMAGE_PLACEHOLDER = `(tool image not shown to this model, which does not take image input. ${SEEN_BY_OTHER_MODEL_NOTE})`;
 

@@ -444,6 +444,30 @@ describe("model.info over a session's kernel host bridge", () => {
 		}
 	});
 
+	// [name, settings, expected rejection]: the skill names the real reason no model sees the image.
+	it.each([
+		[
+			"images are turned off",
+			{ imageModel: "claude-haiku-4-5", images: { blockImages: true } },
+			"Images are turned off",
+		],
+		["imageModel cannot be used", { imageModel: "openai/gpt-5.4" }, "'openai/gpt-5.4' cannot be used"],
+	])("rejects attach when %s, naming that reason", async (_name, settings, reason) => {
+		const fixture = createAttachSession(settings);
+		try {
+			await fixture.session.prompt("describe");
+			const results = ipythonToolResults(fixture.session);
+			expect(results).toHaveLength(1);
+			const text = results[0].content[0]?.type === "text" ? results[0].content[0].text : "";
+			expect(text).toContain(reason);
+			expect(text).not.toContain("set imageModel");
+			expect(results[0].content.some((block) => block.type === "image")).toBe(false);
+		} finally {
+			fixture.session.dispose();
+			cleanupSessionDir(fixture.dir);
+		}
+	});
+
 	it("rejects attach on a text-only session model without a usable imageModel", async () => {
 		const fixture = createAttachSession({});
 		try {
