@@ -1,0 +1,1 @@
+- Fixed a settings file that appeared right as a session started watching being missed until the next restart.

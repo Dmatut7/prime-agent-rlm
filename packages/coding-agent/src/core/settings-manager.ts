@@ -1506,6 +1506,7 @@ export class SettingsManager {
 	 */
 	private ancestorStamps = new Map<string, string | undefined>();
 	private externalWatchers: Array<{ path: string; listener: () => void }> = [];
+	private externalWatchSettleTimer: ReturnType<typeof setTimeout> | undefined;
 	private externalEditReload: Promise<void> | undefined;
 
 	private constructor(
@@ -1867,6 +1868,16 @@ export class SettingsManager {
 			watcher.unref();
 			this.externalWatchers.push({ path, listener });
 		}
+		// A polling watcher takes its baseline with an asynchronous first stat. A file
+		// written between the stamps captured above and that stat is already in the
+		// watcher's baseline, so it never reports the change. One explicit check after
+		// the first polls closes that window; the listeners compare against the
+		// captured stamps, so a check that finds nothing new does nothing.
+		this.externalWatchSettleTimer = setTimeout(() => {
+			this.externalWatchSettleTimer = undefined;
+			for (const { listener } of this.externalWatchers) listener();
+		}, intervalMs * 2);
+		this.externalWatchSettleTimer.unref();
 		return true;
 	}
 
@@ -1877,6 +1888,10 @@ export class SettingsManager {
 
 	/** Stop watching for external settings edits. Safe to call when not watching. */
 	stopWatchingExternalSettings(): void {
+		if (this.externalWatchSettleTimer !== undefined) {
+			clearTimeout(this.externalWatchSettleTimer);
+			this.externalWatchSettleTimer = undefined;
+		}
 		for (const { path, listener } of this.externalWatchers) {
 			unwatchFile(path, listener);
 		}
