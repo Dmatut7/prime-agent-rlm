@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.11.6] - 2026-09-24
+
+- Fixed the bailian web search losing its answer when the model awaited it: the returned text is now also awaitable.
+
 ## [0.11.5] - 2026-09-24
 
 - Fixed a settings file that appeared right as a session started watching being missed until the next restart.

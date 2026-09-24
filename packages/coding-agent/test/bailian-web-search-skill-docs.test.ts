@@ -14,17 +14,27 @@ describe("bailian-web-search SKILL.md", () => {
 		expect(skillDoc).not.toMatch(/(^|[^_])bailian_search\.search\(/m);
 	});
 
-	it("never awaits the synchronous search function directly", () => {
-		expect(skillDoc).not.toMatch(/await\s+bailian_web_search\.search\(/);
+	it("returns an answer that works both awaited and as a plain str", () => {
+		// Every other kernel skill is awaited, so models await this one too; the
+		// answer must survive that instead of raising and losing a 15-90s search.
 		const probe = execFileSync(
 			"python3",
 			[
 				"-c",
-				"import inspect, sys; sys.path.insert(0, sys.argv[1]); import bailian_web_search as m; print(inspect.iscoroutinefunction(m.search))",
+				[
+					"import asyncio, json, sys",
+					"sys.path.insert(0, sys.argv[1])",
+					"from bailian_web_search.bailian_search import SearchAnswer",
+					"a = SearchAnswer('answer text')",
+					"async def main():",
+					"    return await a",
+					"r = asyncio.run(main())",
+					"print(type(r).__name__, r == 'answer text', isinstance(a, str), json.dumps(a))",
+				].join("\n"),
 				join(skillDir, "src"),
 			],
 			{ encoding: "utf8" },
 		).trim();
-		expect(probe).toBe("False");
+		expect(probe).toBe('str True True "answer text"');
 	});
 });

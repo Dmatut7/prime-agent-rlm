@@ -12,9 +12,9 @@ returns the answer text as a `str`:
 
     answer = bailian_web_search.search("your query")
 
-A search takes 15-90s and blocks the kernel while it runs. To keep the turn
-responsive, run it in a worker thread instead (`search` itself is not a
-coroutine, so do not `await` it directly):
+The returned value is also awaitable, so `answer = await bailian_web_search.search("your query")`
+works the same way. A search takes 15-90s and blocks the kernel while it runs;
+to keep the turn responsive, run it in a worker thread:
 
     answer = await asyncio.to_thread(bailian_web_search.search, "your query")
 

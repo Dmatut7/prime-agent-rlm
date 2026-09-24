@@ -59,6 +59,19 @@ def _resolve_api_key() -> str:
     return ""
 
 
+class SearchAnswer(str):
+    """The answer text, usable as a plain str and also awaitable.
+
+    Every other kernel skill is called with `await`, so models await this one
+    too. The search has already finished when the value comes back, so awaiting
+    it just hands back the text instead of raising and losing a 15-90s result.
+    """
+
+    def __await__(self):
+        return str(self)
+        yield  # pragma: no cover - makes this a generator; never reached
+
+
 def search(
     query: str,
     model: str = "qwen3.8-flash",
@@ -121,4 +134,4 @@ def search(
         body = e.read().decode(errors="replace")[:300]
         raise RuntimeError(f"bailian search HTTP {e.code}: {body}") from e
     content = (data.get("choices") or [{}])[0].get("message", {}).get("content")
-    return content or ""
+    return SearchAnswer(content or "")
