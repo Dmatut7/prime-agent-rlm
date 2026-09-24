@@ -1,1 +1,0 @@
-- Changed the text-only image placeholder to say the image can be loaded again from its file path when a detail is missing from the earlier description.

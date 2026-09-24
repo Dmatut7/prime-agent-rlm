@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.11.14] - 2026-09-25
+
+- Changed the text-only image placeholder to say the image can be loaded again from its file path when a detail is missing from the earlier description.
+- Added a `quota` stream failure kind for account-level exhaustion (unpaid balance, spent free tier, HTTP 402) that providers send as 400/403, and classified content inspection rejections (`data_inspection_failed`) as `safety` instead of an invalid request.
+- Added `configureProviderRequestBudget` so the layer that owns the retry policy sets a chain's ceiling even when another layer creates the chain first.
+
 ## [0.11.13] - 2026-09-25
 
 - Changed the placeholder a text-only model sees in place of an image to say the image was not shown to it and that a reply describing it came from an image-capable model, so a continued conversation no longer disowns a correct image answer.

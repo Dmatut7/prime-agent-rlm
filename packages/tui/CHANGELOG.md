@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.11.14] - 2026-09-25
+
+- Added an Editor `transformPaste` hook that rewrites a bracketed paste before it is inserted.
+- Added a live summary to the stall action bar and `TUI.getFocusedComponent()`; an auto-recovery countdown more than 30 seconds overdue is no longer shown.
+- Changed the fullscreen reveal marker to scroll its row into view once per `setRevealMarker` call instead of every frame, and added `windowHeight` to `ScrollInfo`.
+
 ## [0.11.9] - 2026-09-24
 
 - Changed the stall action bar text to Chinese and let the host supply a one-line summary for its headline.

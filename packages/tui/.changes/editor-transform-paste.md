@@ -1,1 +1,0 @@
-- Added an Editor `transformPaste` hook that rewrites a bracketed paste before it is inserted.

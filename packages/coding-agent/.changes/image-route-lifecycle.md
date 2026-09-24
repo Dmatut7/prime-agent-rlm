@@ -1,6 +1,0 @@
-- Fixed images on a text-only session model getting lost after an interrupted, failed or resumed image turn: the next turn ("继续") goes to the configured image model while the picture is still undescribed, and a question about a recent picture ("图里右下角那个数字是多少？") is answered by the image model too.
-- Fixed the request right after attach_image sometimes going to the text-only model when the session was busy, and image routing being off during a provider fallback.
-- Changed the image model hand-back: it now waits for a real description instead of a short "我来看看" preamble, tells the image model its words are all the main model gets, and hands back after a few tool-only requests.
-- Fixed a small-window image model compacting the owner's whole session: its request is trimmed to fit instead.
-- Added: Ctrl+V images are saved under the session and their path is sent next to the marker, a pasted or Finder-dropped image file path is attached as an image, the transcript says which model reads a routed picture, and paste warnings (in Chinese) also cover a mistyped or logged-out imageModel and turned-off images.
-- Fixed attach_image asking to set imageModel when images are turned off or the configured imageModel is unusable; it now names the actual reason.

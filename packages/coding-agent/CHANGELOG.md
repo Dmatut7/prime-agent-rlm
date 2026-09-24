@@ -1,5 +1,59 @@
 # Changelog
 
+## [0.11.14] - 2026-09-25
+
+- Fixed a pasted image file path on a text-only model: attach_image now loads it, the configured image model reads it, and the task hands back to the session model instead of the model delegating the image to a subagent.
+- Fixed images on a text-only session model getting lost after an interrupted, failed or resumed image turn: the next turn ("继续") goes to the configured image model while the picture is still undescribed, and a question about a recent picture ("图里右下角那个数字是多少？") is answered by the image model too.
+- Fixed the request right after attach_image sometimes going to the text-only model when the session was busy, and image routing being off during a provider fallback.
+- Changed the image model hand-back: it now waits for a real description instead of a short "我来看看" preamble, tells the image model its words are all the main model gets, and hands back after a few tool-only requests.
+- Fixed a small-window image model compacting the owner's whole session: its request is trimmed to fit instead.
+- Added: Ctrl+V images are saved under the session and their path is sent next to the marker, a pasted or Finder-dropped image file path is attached as an image, the transcript says which model reads a routed picture, and paste warnings (in Chinese) also cover a mistyped or logged-out imageModel and turned-off images.
+- Fixed attach_image asking to set imageModel when images are turned off or the configured imageModel is unusable; it now names the actual reason.
+- Fixed the fallback chain ending an unattended task after about 12 requests: each model switch, recovery ping and long-wait round now starts a fresh request budget, and the session's own retry ceiling applies instead of the default.
+- Fixed a restart during a fallback leaving the session on the backup model forever: the episode is rebuilt from the transcript, so the cooldown still returns to the primary, and a long wait now has a durable wake that resumes the task after a restart.
+- Fixed image turns during a fallback: a failing image model moves along the chain on its own without replacing the owner's session model, an image model out of quota hands the turn back to the session model with a notice that the image went unread instead of parking the task, and a return to the primary keeps the current run's image routing.
+- Fixed Ctrl+P model cycling not ending a fallback episode, a backup model being remembered as the primary, and subagents spawned during a fallback treating the backup as their primary.
+- Added a one-time notice (chat and duty log) for a fallback chain entry that cannot be used, and a visible notice when the session switches back to the primary; the footer now shows the model actually serving after automatic switches.
+- Fixed out-of-balance and free-tier-exhausted errors (Bailian `Arrearage`, `AllocationQuota.FreeTierOnly`, HTTP 402) ending the task instead of moving to the next model, and an expired key now hands the task to a fallback model on another provider.
+- Fixed a Bailian `data_inspection_failed` rejection killing the session: the tool output that tripped the filter is withheld (also after a restart) and the turn retried, then another provider is tried, and the owner is told what happened.
+- Fixed `rlm.collect()` losing a finished subagent after the daemon closed it for idling: it now reports the child's saved status and last answer, including children closed before the parent itself restarted.
+- Fixed a parent waiting forever on a follow-up it sent to a finished subagent: when the follow-up turn ends without a reply (or errors, or is stopped), the parent now gets a notice with the child's last answer.
+- Fixed the subagent panel after an idle close: the row reads 完成 instead of 空闲, the fold line no longer promises an automatic close that already happened, and Enter reopens the closed child from its saved record.
+- Fixed a window attached to a subagent that was deleted, stopped or finished: it now returns to the parent with a Chinese notice instead of an English daemon error, and a child that died on an error is not described as finished.
+- Added a stop-all-subagents key (`app.subagents.stopAll`, default Alt+X) in the chat's subagent panel and the agents view, confirmed by a second press that names how many; stopping a finished subagent now also stops the follow-up turn it is running.
+- Fixed an old failed subagent row pinning the subagent panel open after the parent already received its failure.
+- Changed the agents view's subagent stop/delete status messages to Chinese.
+- Fixed a quiet but busy long job (a build or training run that prints little) being stopped at about 50 minutes, or 20 with a background handle, in the default warn-only watchdog; with an automatic interrupt configured, the stop message now says the time budget ran out instead of claiming the step was silent.
+- Fixed the early-stop auto-continue firing on finished answers (past-tense reports, summaries, the owner's own to-do list, "I will keep this in mind") and missing real early stops ("开始修复这个问题。", "Next step is updating the docs.").
+- Added the duty log (值班记录) on the first key pressed after the TUI sat idle longer than the duty-log setting, so an owner who left it attached for days still sees it.
+- Fixed duty log counts: a stopped step no longer counts twice, /autonomous continuations no longer count as the owner coming back, a stall still stuck after the automatic action shows as not handled, and a warn-only stall that never recovered is no longer reported as 没出问题.
+- Fixed the stall bar and the diagnostics block taking Esc/Ctrl+Y away from a focused dialog, selector, autocomplete list or block navigation.
+- Changed the stall bar to keep counting how long the turn has been quiet, and to drop the auto-recovery countdown when the daemon will not act.
+- Fixed an excused (healthy long-running) subagent stall waking the parent for a paid turn every ten minutes; the parent is told once the excuse lapses while the child is still silent.
+- Fixed a cell waiting on a live subagent through rlm.collect being stopped as a stuck step.
+- Changed the stall diagnostics block to open with a plain Chinese explanation of what happened, what it means and what to do, with the raw lines kept below.
+- Fixed Ctrl+Y silently removing an old diagnostics block far up the chat: the close key only applies while the block is the newest thing in the chat.
+- Fixed the stall diagnostics block opened with Ctrl+Y having no way to close: it now ends with a "Ctrl+Y 收起" hint and the same key closes it.
+- Fixed web research losing prices on long pages: `page.content`, `save()` and the key lines now cover the whole page, printed views put amounts first and always mark what was left out.
+- Fixed fetching a PDF returning binary garbage as a successful read; PDFs now come back as text, and other binary files are reported instead of decoded.
+- Fixed a failed headless-browser download stalling every later fetch for up to 30 minutes; the failure is remembered, stalled downloads stop sooner, and Esc stops them.
+- Fixed web search returning an empty list when Docker, SearXNG or the VPN is down; it now says which one and points to Bailian search as the fallback.
+- Fixed Bailian search ignoring `!command` and environment-variable API keys from models.json and auth.json, and returning an empty answer without saying so; added `bailian_web_search.asearch`, which keeps the kernel responsive during a search.
+- Fixed web research ignoring the macOS system proxy, so it keeps working when Clash switches from TUN to system-proxy mode; Chinese sites are now asked for Chinese first.
+- Fixed running-card labels for multi-cell browser sessions and for Stack Exchange and GitHub lookups.
+- Fixed block navigation (Alt+Up) getting stuck after a dialog opened while navigating: losing focus, /new, /resume and reattach now end it, and Esc afterwards reaches the prompt instead of interrupting the turn.
+- Fixed fullscreen block navigation pulling the view back to the focused block on every frame: PageUp/PageDown and the wheel now read a long block freely, and leaving returns to following the output when it was following before.
+- Changed Alt+Up in a scrolled-up fullscreen view to start at the block on screen instead of jumping to the newest one.
+- Fixed Enter on a focused block: it now runs the same Ctrl+O / Ctrl+T paths (quiet mode's three-step cycle, the Esc close order), and the hint only offers Enter where it does something.
+- Fixed clicking a turn's `◆ prime` header or footnote only flipping the caret: the tool rows and Thinking traces now open and close with it, and the next Ctrl+O agrees with the caret.
+- Fixed `Y` on a failed answer saying there was nothing to copy; `出错：`/warning rows and system notices can now be focused and copied.
+- Changed message times to show `昨天 HH:MM` or `M月D日 HH:MM` when not sent today.
+- Changed a partly failed memory update notice to Chinese in the error colour.
+- Changed the queue-edit header, the old-daemon interrupt warning and the unsaved-setting error to Chinese, with key names taken from the live bindings.
+- Fixed Esc while editing a queued message during a running turn interrupting the AI and sending the queue unedited; it now leaves the edit first.
+- Fixed the running card's "N 分钟没有新输出" warning being cut off by a long step label at 80 columns.
+- Fixed a folded repeat step on the running card (`等待命令结果 ×3`) hiding an earlier failure.
+
 ## [0.11.13] - 2026-09-25
 
 - Added the bundled web-research skill: SearXNG search, tiered page fetch (HTTP, headless browser, archive copy), headless click-through to a vendor's cart price that stops before payment, and keyless arXiv/Crossref/OpenAlex/Stack Exchange/GitHub lookups.

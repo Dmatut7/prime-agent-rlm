@@ -1,7 +1,0 @@
-- Fixed web research losing prices on long pages: `page.content`, `save()` and the key lines now cover the whole page, printed views put amounts first and always mark what was left out.
-- Fixed fetching a PDF returning binary garbage as a successful read; PDFs now come back as text, and other binary files are reported instead of decoded.
-- Fixed a failed headless-browser download stalling every later fetch for up to 30 minutes; the failure is remembered, stalled downloads stop sooner, and Esc stops them.
-- Fixed web search returning an empty list when Docker, SearXNG or the VPN is down; it now says which one and points to Bailian search as the fallback.
-- Fixed Bailian search ignoring `!command` and environment-variable API keys from models.json and auth.json, and returning an empty answer without saying so; added `bailian_web_search.asearch`, which keeps the kernel responsive during a search.
-- Fixed web research ignoring the macOS system proxy, so it keeps working when Clash switches from TUN to system-proxy mode; Chinese sites are now asked for Chinese first.
-- Fixed running-card labels for multi-cell browser sessions and for Stack Exchange and GitHub lookups.
