@@ -564,14 +564,16 @@ describe("SubagentSummaryLine", () => {
 		line.setSubagentCounts({ total: 2, running: 1, idle: 0, inactive: 1 });
 		line.setSubagentRows([
 			{ id: "worker", name: "worker", state: "running" },
-			{ id: "review", name: "review", state: "failed" },
+			{ id: "调研-云厂商", name: "调研-云厂商", state: "failed" },
 		]);
 		line.focused = true;
 		line.render(100);
+		// A Chinese name renders in the row (naming guidance) and is clickable.
+		expect(line.render(100).map(stripAnsi).join("\n")).toContain("调研-云厂商");
 
-		const reviewRegion = line.getClickRegions()[1];
-		reviewRegion?.onClick({ row: 0, col: 5 });
-		expect(activated).toEqual(["review"]);
+		const cjkRegion = line.getClickRegions()[1];
+		cjkRegion?.onClick({ row: 0, col: 5 });
+		expect(activated).toEqual(["调研-云厂商"]);
 
 		// The pointer selection is the keyboard selector: › moved to the clicked row.
 		const rendered = line.render(100).map(stripAnsi);
