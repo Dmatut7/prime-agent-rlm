@@ -141,6 +141,20 @@ describe("running card: what the AI is doing right now", () => {
 		for (const row of rows) expect(row).toContain("\x1b[48;");
 	});
 
+	it("folds consecutive steps with the same label into one cell with a count", () => {
+		const state = liveState();
+		const wait = { code: "r = await h\nprint(r.output)" };
+		for (const id of ["1", "2", "3"]) {
+			state.addStep({ toolCallId: id, toolName: "ipython", args: wait, status: "queued" });
+			state.setStepStatus(id, "running", T0 + Number(id) * 1_000);
+			if (id !== "3") state.setStepStatus(id, "done", T0 + Number(id) * 1_000 + 500);
+		}
+		const recentRow = plain(renderRunningCard(state, 100, 3, T0 + 20_000))[2] ?? "";
+		const label = turnStepLabel({ toolName: "ipython", args: wait });
+		expect(recentRow).toContain(`${label} ×3`);
+		expect(recentRow.split(label)).toHaveLength(2);
+	});
+
 	it("turns amber after a quiet minute and says for how long", () => {
 		const state = liveState();
 		state.addStep({ toolCallId: "srv", toolName: "bash", args: { command: "node server.js" }, status: "queued" });

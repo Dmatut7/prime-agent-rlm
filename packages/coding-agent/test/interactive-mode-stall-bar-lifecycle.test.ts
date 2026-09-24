@@ -167,7 +167,10 @@ describe("InteractiveMode stall action bar lifecycle", () => {
 
 		// Ctrl+Y on the settled bar shows the forensic lines and takes the bar down.
 		expect(settled?.handleInput("\x19")).toBe(true);
-		expect(mode.showError).toHaveBeenCalledTimes(1);
+		// A dim, titled reference block - nothing failed, so never the error channel.
+		expect(mode.showError).not.toHaveBeenCalled();
+		expect(renderChat(chatOf(mode))).toContain("诊断详情");
+		expect(renderChat(chatOf(mode))).toContain("stage: stall_warning");
 		expect(mode.stallActionBar).toBeUndefined();
 		expect(chatOf(mode).children).not.toContain(settled);
 	});

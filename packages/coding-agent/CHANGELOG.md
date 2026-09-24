@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.11.10] - 2026-09-24
+
+- Changed the conversation into layers: your messages sit in a tinted, indented `you` bubble with the send time; each AI turn opens with a `◆ prime` header (model and time, or a spinner while working) and runs down a faint gutter, with its settled process line in English.
+- Added a live running card under the working turn: what the AI is doing right now (thinking, running a command, searching, waiting on a subagent or the model, writing), the step count and time, and the last three steps; it turns amber with `N 分钟没有新输出` after a quiet minute.
+- Changed routine system notices (memory updates, python kernel restored, heartbeat, auto-continue) to one faint centered line; a memory update names the entries it changed and opens its diff with Ctrl+O.
+- Changed the footer to show a `working` chip while a turn runs, and moved "copied", "stashed", fast-mode and thinking-level confirmations to a two-second footer toast instead of chat rows.
+- Fixed Ctrl+Y doing nothing after a stall warning: when the stalled call is stopped, the stall bar stays with its diagnostics key instead of vanishing.
+- Fixed `find` steps reading as `查找 .`; they now name what they look for.
+- Fixed a heartbeat scheduled as `每 5m` reading `每 每 5m`.
+- Changed the running card to fold consecutive steps with the same label into one cell with a count, and to show the tally row only once a step exists.
+- Changed the stall diagnostics key to show the forensic lines as a dim 诊断详情 block instead of an error.
+- Fixed `os.listdir()` of the current directory reading as 设置 files instead of 列目录.
+
 ## [0.11.9] - 2026-09-24
 
 - Changed the stall warning to one plain-language line on the action bar (what it is waiting on, for how long, what still runs in the background) instead of printing the forensic snapshot as an error; the snapshot stays on the diagnostics key.

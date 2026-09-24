@@ -138,17 +138,34 @@ export function renderRunningCard(state: TurnActivityState, width: number, tick:
 		turnRunningClockText(state.turnDurationMs(now)),
 		...(summary ? [summary] : []),
 	].join(" · ");
-	rows.push(cardRow(`   ${theme.fg("muted", tally)}`, width, warn));
-	const recent = dedupeSteps(state.steps).slice(-RECENT_STEPS);
+	// Before the first step the tally would only repeat line 1's clock.
+	if (state.stepCount > 0) rows.push(cardRow(`   ${theme.fg("muted", tally)}`, width, warn));
+	const recent = collapseRepeats(dedupeSteps(state.steps)).slice(-RECENT_STEPS);
 	if (recent.length > 0) {
-		const cells = recent.map((step) => {
-			const label = truncateToWidth(turnStepLabel(step), 28, "…");
+		const cells = recent.map(({ step, count }) => {
+			const label = truncateToWidth(`${turnStepLabel(step)}${count > 1 ? ` ×${count}` : ""}`, 28, "…");
 			const text = step.status === "running" ? theme.fg("runCardBar", label) : theme.fg("dim", label);
 			return `${stepMark(step, tick)} ${text}`;
 		});
 		rows.push(cardRow(`   ${cells.join("   ")}`, width, warn));
 	}
 	return rows;
+}
+
+/** Consecutive steps with the same label read as one (`等待命令结果 ×2`), marked by the latest. */
+function collapseRepeats(steps: readonly TurnStep[]): Array<{ step: TurnStep; count: number }> {
+	const out: Array<{ step: TurnStep; count: number; label: string }> = [];
+	for (const step of steps) {
+		const label = turnStepLabel(step);
+		const last = out.at(-1);
+		if (last && last.label === label) {
+			last.step = step;
+			last.count += 1;
+		} else {
+			out.push({ step, count: 1, label });
+		}
+	}
+	return out;
 }
 
 function dedupeSteps(steps: readonly TurnStep[]): TurnStep[] {

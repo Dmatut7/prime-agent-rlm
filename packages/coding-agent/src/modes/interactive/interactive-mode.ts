@@ -8364,10 +8364,9 @@ export class InteractiveMode {
 				},
 				onDiagnostics: () => {
 					this.removeStallActionBar();
-					// Re-show the full forensic text: the original error lines may
-					// have scrolled away, and the diagnostics pointer inside them is
-					// where the evidence lives.
-					this.showError(formatStallEventLines(event).join("\n"));
+					// The forensic text on request: a dim reference block, not an error -
+					// nothing failed, the reader asked to look.
+					this.showStallDiagnostics(event);
 				},
 			},
 		);
@@ -8407,7 +8406,7 @@ export class InteractiveMode {
 				interruptKeyLabel: keyText("app.input.clear"),
 				onDiagnostics: () => {
 					this.removeStallActionBar();
-					this.showError(formatStallEventLines(event).join("\n"));
+					this.showStallDiagnostics(event);
 				},
 			},
 		);
@@ -9548,6 +9547,16 @@ export class InteractiveMode {
 		// One blank line between chat blocks; the first block follows the header's own spacing.
 		if (this.chatContainer.children.length > 0) this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new Text(theme.fg("error", `出错：${errorMessage}`), 1, 0));
+		this.ui.requestRender();
+	}
+
+	/** The stall's forensic lines, asked for with the diagnostics key: dim, titled, never an error. */
+	private showStallDiagnostics(event: StallEventView): void {
+		if (this.chatContainer.children.length > 0) this.chatContainer.addChild(new Spacer(1));
+		const lines = formatStallEventLines(event);
+		this.chatContainer.addChild(
+			new Text([theme.fg("muted", "诊断详情"), ...lines.map((line) => theme.fg("dim", line))].join("\n"), 1, 0),
+		);
 		this.ui.requestRender();
 	}
 

@@ -140,6 +140,10 @@ describe("turnStepLabel harness calls", () => {
 		expect(turnStepLabel(cell("await agent_message.send('done', receiver_role='parent')"))).toBe("发消息");
 		expect(turnStepLabel(cell("print(await attach_image('a.png'))"))).toBe("看图");
 		expect(turnStepLabel(cell("hits = await bailian_search.search('天气')"))).toBe("联网搜索");
+		expect(turnStepLabel(cell("import os\nfiles = sorted(os.listdir(os.getcwd()))\nprint(files)"))).toBe(
+			turnStepLabel(cell("print(os.listdir('.'))")),
+		);
+		expect(turnStepLabel(cell("files = os.listdir()"))).not.toContain("设置");
 		expect(turnStepLabel(cell("answer = bailian_web_search.search('今天的新闻')\nprint(answer)"))).toBe("联网搜索");
 		expect(
 			turnStepLabel(

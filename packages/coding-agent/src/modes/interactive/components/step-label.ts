@@ -41,6 +41,8 @@ const PYTHON_VAR_IO_PATTERN =
 const PYTHON_PATH_ASSIGN_PATTERN =
 	/\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:pathlib\.)?Path\(\s*[rRfF]?["']([^"']+)["']\s*\)/g;
 const PYTHON_LIST_DIR_PATTERN = /\b(?:os\.listdir|os\.scandir|os\.walk|glob\.glob)\(\s*[rRfF]?["']([^"']*)["']/g;
+/** `os.listdir()` and `os.listdir(os.getcwd())`: the current directory, no path literal. */
+const PYTHON_LIST_CWD_PATTERN = /\b(?:os\.listdir|os\.scandir|os\.walk)\(\s*(?:os\.getcwd\(\)|Path\.cwd\(\))?\s*\)/g;
 const PYTHON_PATH_LIST_PATTERN = /\bPath\(\s*[rRfF]?["']([^"']*)["']\s*\)\.(?:iterdir|glob|rglob)\(/g;
 const PYTHON_BASH_CALL_PATTERN = /\bbash\(\s*[rRfF]?("""|'''|"|')([\s\S]*?)\1/g;
 const PYTHON_STRING_ASSIGN_PATTERN = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[rRfF]?["']([^"'\n]+)["']\s*$/gm;
@@ -293,6 +295,9 @@ function pythonEffects(code: string): string[] {
 		for (const match of code.matchAll(pattern)) {
 			push(match.index, `列目录 ${dirTail(match[1] || ".")}`);
 		}
+	}
+	for (const match of code.matchAll(PYTHON_LIST_CWD_PATTERN)) {
+		push(match.index, `列目录 ${dirTail(".")}`);
 	}
 	const labels: string[] = [];
 	for (const effect of effects.sort((a, b) => a.index - b.index)) {

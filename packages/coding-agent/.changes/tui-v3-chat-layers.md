@@ -1,7 +1,0 @@
-- Changed the conversation into layers: your messages sit in a tinted, indented `you` bubble with the send time; each AI turn opens with a `◆ prime` header (model and time, or a spinner while working) and runs down a faint gutter, with its settled process line in English.
-- Added a live running card under the working turn: what the AI is doing right now (thinking, running a command, searching, waiting on a subagent or the model, writing), the step count and time, and the last three steps; it turns amber with `N 分钟没有新输出` after a quiet minute.
-- Changed routine system notices (memory updates, python kernel restored, heartbeat, auto-continue) to one faint centered line; a memory update names the entries it changed and opens its diff with Ctrl+O.
-- Changed the footer to show a `working` chip while a turn runs, and moved "copied", "stashed", fast-mode and thinking-level confirmations to a two-second footer toast instead of chat rows.
-- Fixed Ctrl+Y doing nothing after a stall warning: when the stalled call is stopped, the stall bar stays with its diagnostics key instead of vanishing.
-- Fixed `find` steps reading as `查找 .`; they now name what they look for.
-- Fixed a heartbeat scheduled as `每 5m` reading `每 每 5m`.
