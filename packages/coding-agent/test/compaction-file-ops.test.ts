@@ -7,6 +7,7 @@ import {
 	extractFileOpsFromMessage,
 	formatFileOperations,
 } from "../src/core/compaction/index.js";
+import { buildSummarizationPromptText } from "../src/core/compaction/summarization-budget.js";
 
 function createMockUsage(input: number, output: number): Usage {
 	return {
@@ -110,6 +111,19 @@ describe("extractFileOpsFromMessage write-tool coverage (scan2 C5)", () => {
 		expect(summary).not.toContain("pkg/file-249.ts");
 	});
 
+	it("keeps every modified file when the character budget is spent, trimming read-only files instead", () => {
+		const ops = createFileOps();
+		const pad = (kind: string, i: number) =>
+			`packages/some-long-directory-name/src/${kind}-${String(i).padStart(3, "0")}-component-file.ts`;
+		for (let i = 0; i < 120; i++) ops.edited.add(pad("edited", i));
+		for (let i = 0; i < 80; i++) ops.read.add(pad("read", i));
+		const { readFiles, modifiedFiles } = computeFileLists(ops);
+		// A wide refactor must not lose files it changed: the model re-verifies and
+		// reports from this list after the compaction.
+		expect(modifiedFiles).toHaveLength(120);
+		expect(readFiles.length).toBeLessThan(80);
+	});
+
 	it("renders kernel edits in the <modified-files> summary block", () => {
 		const ops = createFileOps();
 		extractFileOpsFromMessage(
@@ -122,5 +136,18 @@ describe("extractFileOpsFromMessage write-tool coverage (scan2 C5)", () => {
 		expect(formatFileOperations(readFiles, modifiedFiles)).toContain(
 			"<modified-files>\nsrc/kernel-edit.ts\n</modified-files>",
 		);
+	});
+});
+
+describe("summarization prompt anchor", () => {
+	it("keeps open tasks, errors and user constraints in scope when anchoring to the newest kept state", () => {
+		const text = buildSummarizationPromptText({
+			conversationText: "user: never touch prod\nassistant: Done with X.",
+			elided: 0,
+			style: "history",
+			instructions: "Summarize.",
+			recentStateAnchor: "Done with X.",
+		});
+		expect(text).toContain("Still list the open tasks, errors, and user constraints from the conversation");
 	});
 });

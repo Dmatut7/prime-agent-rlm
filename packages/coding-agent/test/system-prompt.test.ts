@@ -257,6 +257,29 @@ describe("buildSystemPrompt", () => {
 		expect(child).not.toContain(USER_COMMUNICATION_REMINDER);
 	});
 
+	test("claims a single tool only when ipython is the whole tool list", () => {
+		const alone = buildSystemPrompt({ selectedTools: ["ipython"], contextFiles: [], skills: [], cwd: "/repo" });
+		expect(alone).toContain("exactly one tool: ipython");
+
+		const withMcp = buildSystemPrompt({
+			selectedTools: ["ipython", "mcp_call_github", "my_ext_tool"],
+			contextFiles: [],
+			skills: [],
+			cwd: "/repo",
+		});
+		expect(withMcp).not.toContain("exactly one tool");
+		expect(withMcp).not.toContain("any other name fails");
+		expect(withMcp).toContain("this session's tool list has other tools too");
+		expect(withMcp).not.toContain("my_ext_tool");
+		expect(withMcp).toContain("There is no separate bash, edit, read, write, rlm, skill tool");
+	});
+
+	test("teaches that a silent call is stopped and how to declare a long one", () => {
+		const prompt = buildSystemPrompt({ selectedTools: ["ipython"], contextFiles: [], skills: [], cwd: "/repo" });
+		expect(prompt).toContain("silent for about 5 minutes");
+		expect(prompt).toContain("`timeout <secs>`");
+	});
+
 	test("adds generic MCP guidance to default and custom IPython prompts", () => {
 		for (const customPrompt of [undefined, "custom body"]) {
 			const prompt = buildSystemPrompt({

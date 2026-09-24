@@ -28,15 +28,17 @@ import type { PythonSkillRuntimeInfo } from "../skills.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 
 // The standard modules the prompt teaches (\`shlex.quote\`, \`json.dumps\`, \`os.chdir\`, Path)
-// are bound up front, so following the prompt never starts with a NameError.
+// are bound up front, so following the prompt never starts with a NameError. The bootstrap
+// runs after a state restore, so each is bound only when the name is still free: a restored
+// user variable called \`json\` or \`re\` keeps its value.
 const RLM_BOOTSTRAP_HEADER_CODE = `
 import asyncio
-import json
-import os
-import re
-import shlex
-import sys
-from pathlib import Path
+import importlib as _prime_agent_header_importlib
+for _prime_agent_header_name in ("json", "os", "re", "shlex", "sys"):
+    if _prime_agent_header_name not in globals():
+        globals()[_prime_agent_header_name] = _prime_agent_header_importlib.import_module(_prime_agent_header_name)
+if "Path" not in globals():
+    from pathlib import Path
 import os as _prime_agent_os
 
 _prime_agent_os.environ["NO_COLOR"] = "1"
@@ -282,10 +284,37 @@ def _prime_agent_restored_skill_module(name):
         if not isinstance(candidate, _prime_agent_types.ModuleType):
             return None
         origin = getattr(candidate, "__file__", None)
-        if not origin or not _prime_agent_os.path.realpath(origin).startswith(root):
+        if not origin:
+            return None
+        if not (
+            _prime_agent_os.path.realpath(origin).startswith(root)
+            or _prime_agent_same_skill_source(root, name, origin)
+        ):
             return None
         found = candidate
     return found
+
+def _prime_agent_same_skill_source(root, name, origin):
+    """Whether origin is this skill's own source file, installed from another checkout.
+
+    The shared kernel venv installs skills by content, so the editable install can point
+    at a sibling worktree (or differ only in path case) while holding the very same code.
+    Comparing bytes with the declared package's file accepts exactly that case; a
+    same-named module from anywhere else has different contents and stays refused.
+    """
+    base = _prime_agent_os.path.basename(origin)
+    for expected in (
+        _prime_agent_os.path.join(root, "src", name, base),
+        _prime_agent_os.path.join(root, name, base),
+        _prime_agent_os.path.join(root, "src", base),
+        _prime_agent_os.path.join(root, base),
+    ):
+        try:
+            with open(expected, "rb") as want, open(origin, "rb") as got:
+                return want.read() == got.read()
+        except OSError:
+            continue
+    return False
 
 def _prime_agent_loaded_skill_wrapper(name):
     """The wrapper an earlier bootstrap of this kernel (or a restored state) already bound."""
@@ -1071,7 +1100,7 @@ export function createIpythonToolDefinition(
 		name: "ipython",
 		label: "ipython",
 		description:
-			"Execute Python code in a persistent Python REPL - the only model-facing tool; run shell commands inside it with `bash('cmd')`. Top-level `await` is supported. Variables, imports, and loaded data persist across calls, and are revived on a best-effort basis when a session is resumed (objects that cannot be serialized are dropped and reported). Run shell commands with `bash('cmd')` / `await bash('cmd')`. Project imports, tests, scripts, CLIs, and dependency checks should run through the target project's own environment.",
+			"Execute Python code in a persistent Python REPL; run shell commands inside it with `bash('cmd')`, not through a separate shell tool. Top-level `await` is supported. Variables, imports, and loaded data persist across calls, and are revived on a best-effort basis when a session is resumed (objects that cannot be serialized are dropped and reported). Run shell commands with `bash('cmd')` / `await bash('cmd')`. Project imports, tests, scripts, CLIs, and dependency checks should run through the target project's own environment.",
 		promptSnippet: "ipython - persistent Python REPL for code, state, and bash() orchestration",
 		// The kernel is single-threaded — pi must not run two ipython calls in parallel within a batch.
 		executionMode: "sequential",

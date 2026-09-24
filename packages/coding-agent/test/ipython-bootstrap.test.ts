@@ -195,6 +195,45 @@ describeIfKernel("RLM bootstrap skill wrapping (RT-5)", { tags: ["kernel-heavy"]
 		}
 	}, 90_000);
 
+	it("keeps a restored skill whose install points at another checkout with the same source", async () => {
+		// The shared kernel venv installs skills by content, so the import can resolve to a
+		// sibling worktree while this session declares its own copy of the same package.
+		const sameCopy = writeSkill(
+			"skill-state-sibling",
+			"skill_state",
+			"MARK = None\n\n\nasync def run():\n    return 1\n\n\nasync def read_mark():\n    return MARK\n",
+		);
+		const otherCode = writeSkill("skill-state-other", "skill_state", "async def run():\n    return 'other'\n");
+		for (const [declared, expectWrapped] of [
+			[sameCopy, true],
+			[otherCode, false],
+		] as const) {
+			const manager = new ReplKernelManager({
+				python: python as string,
+				cwd: kernelDir,
+				env: { PYTHONPATH: state.srcDir },
+			});
+			try {
+				await manager.start();
+				expect((await manager.execute("import skill_state")).status).toBe("ok");
+				const bootstrap = await manager.execute(buildRlmBootstrapCode([declared.info]));
+				expect(bootstrap.status).toBe("ok");
+				const probe = await manager.execute(
+					"print('wrapper:', type(skill_state).__name__ == '_PrimeAgentCallableSkillModule')",
+				);
+				expect(probe.stdout).toContain(`wrapper: ${expectWrapped ? "True" : "False"}`);
+				if (expectWrapped) {
+					expect(bootstrap.stdout).not.toContain(PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER);
+				} else {
+					// Different code under the same name is still a foreign module.
+					expect(bootstrap.stdout).toContain(PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER);
+				}
+			} finally {
+				await manager.shutdown({ snapshot: false, drainHostRequests: true });
+			}
+		}
+	}, 90_000);
+
 	it("gives cross-skill module references the callable wrapper too (F1)", async () => {
 		const out = await withSkillKernel(
 			[alpha, beta],
@@ -373,17 +412,25 @@ describeIfKernel("RLM bootstrap (real kernel)", () => {
 			await manager.shutdown({ snapshot: true, drainHostRequests: true });
 		}
 	}, 60_000);
-	it("binds the standard modules the prompt teaches before the first cell", () => {
-		const code = buildRlmBootstrapCode();
-		for (const statement of [
-			"import json",
-			"import os",
-			"import re",
-			"import shlex",
-			"import sys",
-			"from pathlib import Path",
-		]) {
-			expect(code).toContain(statement);
+	it("binds the standard modules the prompt teaches, without overwriting restored user variables", async () => {
+		const manager = new ReplKernelManager({ python: python as string, cwd: dir });
+		try {
+			await manager.start();
+			// A state restore runs before the bootstrap; these two stand in for restored values.
+			expect((await manager.execute("json = {'k': 1}\nre = 'user value'")).status).toBe("ok");
+			expect((await manager.execute(buildRlmBootstrapCode())).status).toBe("ok");
+			const probe = await manager.execute(
+				"import types\nprint('json:', json)\nprint('re:', re)\nfor _n in ('os', 'shlex', 'sys'):\n    print(_n, isinstance(globals()[_n], types.ModuleType))\nprint('Path:', Path.__name__)",
+			);
+			expect(probe.status).toBe("ok");
+			expect(probe.stdout).toContain("json: {'k': 1}");
+			expect(probe.stdout).toContain("re: user value");
+			expect(probe.stdout).toContain("os True");
+			expect(probe.stdout).toContain("shlex True");
+			expect(probe.stdout).toContain("sys True");
+			expect(probe.stdout).toContain("Path: Path");
+		} finally {
+			await manager.shutdown({ snapshot: false, drainHostRequests: true });
 		}
-	});
+	}, 60_000);
 });

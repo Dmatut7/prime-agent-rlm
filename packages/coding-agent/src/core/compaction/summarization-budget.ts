@@ -77,7 +77,7 @@ export function buildSummarizationPromptText(options: {
 		text += `<previous-summary>\n${options.previousSummary}\n</previous-summary>\n\n`;
 	}
 	if (options.recentStateAnchor) {
-		text += `<recent-state-anchor>\nNewest assistant message that stays retained below the summary. The conversation to summarize is older than this anchor; the retained messages below are authoritative, so treat this anchor, not the conversation above, as the current state.\n\n${options.recentStateAnchor}\n</recent-state-anchor>\n\n`;
+		text += `<recent-state-anchor>\nNewest assistant message that stays retained below the summary. The conversation to summarize is older than this anchor; the retained messages below are authoritative, so treat this anchor, not the conversation above, as the current state. Still list the open tasks, errors, and user constraints from the conversation: the anchor shows where the work stopped, not everything that is still owed.\n\n${options.recentStateAnchor}\n</recent-state-anchor>\n\n`;
 	}
 	return `${text}${options.instructions}`;
 }

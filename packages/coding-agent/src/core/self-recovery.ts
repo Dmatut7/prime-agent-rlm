@@ -65,6 +65,9 @@ const FINAL_REPLY_PATTERNS: readonly RegExp[] = [
 	// Offers, not commitments: "接下来我可以……" / "如需要我再……" after a finished answer.
 	/(?:我|也|还)(?:可以|能)(?:帮|再|继续|进一步|顺便)|如(?:果)?(?:你)?(?:需要|愿意|想)|如需|若需要|有需要|需要的话/u,
 	/\b(?:if you(?:'d)? (?:like|want|need)|i can also|i could|happy to|feel free)\b/i,
+	// Waiting on the owner's approval: the step is gated on purpose, never nudged past it.
+	/你批准后|你确认后|等你(?:批准|确认|同意|点头)|经你同意|你同意后|你说可以/u,
+	/\b(?:once you approve|after your (?:go-ahead|approval|confirmation|ok)|with your permission|until you (?:say|confirm|approve)|i'?ll wait for your)\b/i,
 	/[?？]\s*$/u,
 ];
 

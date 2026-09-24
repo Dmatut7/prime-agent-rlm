@@ -6,14 +6,17 @@ description: Search the web via the Alibaba Bailian (DashScope) public endpoint 
 # Bailian Web Search
 
 Searches the web by asking a Bailian chat model with `enable_search` to
-retrieve pages and synthesize an answer. Works from the kernel:
+retrieve pages and synthesize an answer. The kernel already has the module
+bound as `bailian_web_search`; `search` is a plain synchronous function that
+returns the answer text as a `str`:
 
-    import bailian_web_search
-    bailian_search.search("your query")
+    answer = bailian_web_search.search("your query")
 
-Or async:
+A search takes 15-90s and blocks the kernel while it runs. To keep the turn
+responsive, run it in a worker thread instead (`search` itself is not a
+coroutine, so do not `await` it directly):
 
-    await bailian_search.search("your query")
+    answer = await asyncio.to_thread(bailian_web_search.search, "your query")
 
 Key resolution (never stored in this repo): `DASHSCOPE_API_KEY` env var wins,
 then `bailian.apiKey` in `~/.prime/agent/models.json`, then `bailian` in

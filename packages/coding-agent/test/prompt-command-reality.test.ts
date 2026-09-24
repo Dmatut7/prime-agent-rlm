@@ -137,6 +137,13 @@ describe("package-install doctrine: every taught command must run", () => {
 		expect(commands.length).toBeGreaterThan(0);
 	});
 
+	it("names the uv prime-agent installs, for a kernel shell whose PATH lacks it", () => {
+		// ensureUv resolves uv from PATH or ~/.local/bin (and installs it there), so a daemon
+		// whose PATH misses ~/.local/bin still has a working install command to follow.
+		const commands = taughtInstallCommands(replPrompt());
+		expect(commands.some((command) => command.startsWith("~/.local/bin/uv pip install"))).toBe(true);
+	});
+
 	const kernelPython = installedKernelPython();
 	const canProbe = kernelPython !== undefined && hasUvOnPath();
 	const shell = process.platform === "win32" ? "cmd.exe" : "/bin/bash";

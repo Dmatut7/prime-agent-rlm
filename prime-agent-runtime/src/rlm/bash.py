@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from . import _winjob
+from ._yaml_compat import register_plain_str
 
 # Boot-lean imports: asyncio, secrets, shutil, datetime, selectors, struct,
 # fcntl/termios, and atexit load on first use below so `import rlm` (and with
@@ -62,6 +63,9 @@ class OutputText(str):
 
     def __call__(self) -> str:
         return str(self)
+
+
+register_plain_str(OutputText)
 
 
 async def _resolved(value: Any) -> Any:

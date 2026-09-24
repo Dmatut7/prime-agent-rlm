@@ -21,6 +21,8 @@ from pathlib import Path
 from collections.abc import Generator
 from typing import Any, Literal, Mapping, NamedTuple, Sequence
 
+from ._yaml_compat import register_plain_str
+
 HarnessKind = Literal["prompt", "memory", "skill", "subagent"]
 HarnessScope = Literal["local", "global"]
 
@@ -378,6 +380,9 @@ class AwaitableText(str):
 
     def __await__(self) -> Generator[Any, None, "AwaitableText"]:
         return _resolved(self).__await__()
+
+
+register_plain_str(AwaitableText)
 
 
 @dataclass

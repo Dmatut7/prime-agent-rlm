@@ -116,9 +116,11 @@ function extractFileOpsFromToolResult(message: ToolResultMessage, fileOps: FileO
 const FILE_LIST_MAX_ENTRIES = 200;
 
 /**
- * Maximum combined characters the two file blocks may add to a summary.
- * Repeated compactions merge lists carried in the previous entry's details,
- * so without a character cap the appended block grows without bound.
+ * Character budget for the read-only file block. Repeated compactions merge lists
+ * carried in the previous entry's details, so without a cap the appended block
+ * grows without bound. Modified files are not held to it: they are what the
+ * model has to re-verify and report, and they stay bounded by
+ * FILE_LIST_MAX_ENTRIES alone.
  */
 const FILE_LIST_MAX_COMBINED_CHARS = 6000;
 
@@ -132,10 +134,9 @@ function fileListChars(readFiles: string[], modifiedFiles: string[]): number {
 /**
  * Compute final file lists from file operations.
  * Returns readFiles (files only read, not modified) and modifiedFiles.
- * Both lists are capped at FILE_LIST_MAX_ENTRIES (sorted, then truncated) and
- * at FILE_LIST_MAX_COMBINED_CHARS combined characters: read-only entries are
- * least valuable and drop first (from the alphabetical end), then modified
- * entries drop only after the read-only list is empty.
+ * Both lists are capped at FILE_LIST_MAX_ENTRIES (sorted, then truncated). The
+ * FILE_LIST_MAX_COMBINED_CHARS budget trims only read-only entries (from the
+ * alphabetical end); modified entries are never dropped for characters.
  */
 export function computeFileLists(fileOps: FileOperations): { readFiles: string[]; modifiedFiles: string[] } {
 	const modified = new Set([...fileOps.edited, ...fileOps.written]);
@@ -147,13 +148,6 @@ export function computeFileLists(fileOps: FileOperations): { readFiles: string[]
 	const readFiles = readOnly.slice();
 	while (readFiles.length > 0 && fileListChars(readFiles, modifiedFiles) > FILE_LIST_MAX_COMBINED_CHARS) {
 		readFiles.pop();
-	}
-	while (
-		modifiedFiles.length > 0 &&
-		readFiles.length === 0 &&
-		fileListChars(readFiles, modifiedFiles) > FILE_LIST_MAX_COMBINED_CHARS
-	) {
-		modifiedFiles.pop();
 	}
 	return { readFiles, modifiedFiles };
 }

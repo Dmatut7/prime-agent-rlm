@@ -474,8 +474,8 @@ export function createAutoContinueMessage(
 					'If your task calls for an answer, send it now with `await agent_message.send(<your result>, receiver_role="parent")`, then stop. If no answer is needed, reply with one short line saying so.',
 				].join("\n")
 			: [
-					`[auto-continue] Your last reply ended by announcing a next step (${JSON.stringify(details.excerpt ?? "")}) but the turn stopped before doing it. Nobody is waiting to approve it: the owner left this running, and a stop here leaves the work half done until they come back.`,
-					"Judge what that sentence was. A step you meant to take: take it now. An offer after work that is actually finished: give the final result in a line and stop. Blocked, or a decision only the owner can make: say exactly what and stop.",
+					`[auto-continue] Your last reply ended by announcing a next step (${JSON.stringify(details.excerpt ?? "")}) but the turn stopped before doing it. If the owner left this running, a stop here leaves the work half done until they come back.`,
+					"Judge what that sentence was. A step you meant to take: take it now. An offer after work that is actually finished: give the final result in a line and stop. A step that needs the owner's approval (irreversible, spending money, or sending anything outside this machine): do not take it, because a continue is not their consent; ask and stop. Blocked, or any other decision only the owner can make: say exactly what and stop.",
 					`This is an automatic continue (${details.ordinal} of at most 2 for this request).`,
 				].join("\n");
 	return {

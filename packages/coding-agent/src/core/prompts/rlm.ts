@@ -9,11 +9,14 @@ export interface RlmPromptOptions {
 	depth?: number;
 	parentAgent?: string;
 	activeTools?: string[];
+	/** Model-facing tools besides the REPL (MCP, extension tools), so the prompt never denies they exist. */
+	otherTools?: string[];
 }
 
 const LONG_RUNNING_WORK_PROMPT = [
 	"For slow or independently completing work, use a nonblocking control loop: start the work, record its handle or output location, then end your turn. Read the result on a later turn or when a reply arrives. A turn held open by `time.sleep()`, shell `sleep`, or a long blocking `await` shows the owner nothing, cannot react to a reply or a correction, and looks exactly like a hang; await only the short operation that starts work or reads a result that is already there.",
 	"When delegation is available and useful, give independent substantive tasks to separate workers and start them together: they run in parallel, and waiting on each before starting the next throws that away.",
+	"A call that stays silent for about 5 minutes with no CPU activity is treated as stuck and stopped, because from outside a quiet wait looks the same as a hang. So run long quiet work (a remote job, a big download, a wait) as a background `bash()` handle that you poll, or prefix the command with `timeout <secs>` to declare the longer budget it really needs.",
 ].join("\n");
 
 const WORKING_WITH_USER_PROMPT = [
@@ -55,11 +58,31 @@ const DOING_THE_WORK_PROMPT = [
 	"Change what the task needs and nothing else. Every unrelated edit is one more thing the owner has to review and one more place a bug can hide. Match the surrounding code's naming and patterns: a reader assumes a different style means a different reason, and stops to look for it.",
 ].join("\n");
 
+const TOOL_SURFACE_PLACEHOLDER = "<tool-surface>";
+const BUILT_IN_CALLABLE_NAMES = ["bash", "edit", "read", "write", "rlm", "skill"];
+
+/**
+ * What the tool list holds. With ipython alone a call to any other name fails, so the prompt says
+ * so; when MCP or extension tools are also listed they are real, and "exactly one tool" would
+ * talk the model out of using them. The other tools are not named here: a tool that brings no
+ * prompt guidance stays out of the system prompt, and the model sees it in its tool list anyway.
+ */
+function toolSurfaceLine(otherTools: readonly string[]): string {
+	const callables =
+		"`bash(...)`, `rlm(...)`, and installed skills are Python callables you use inside an ipython cell; shell commands run via `bash('cmd')`, and file work is Python in the same REPL.";
+	if (otherTools.length === 0) {
+		return `The model-facing tool surface is exactly one tool: ipython. There is no bash, edit, read, write, rlm, or skill tool to call - a tool call for any other name fails with "Tool not found". ${callables}`;
+	}
+	const missing = BUILT_IN_CALLABLE_NAMES.filter((name) => !otherTools.includes(name));
+	const denied = missing.length > 0 ? `There is no separate ${missing.join(", ")} tool: ` : "";
+	return `Besides ipython, this session's tool list has other tools too. Those are real; call them directly when they fit. ${denied}${callables}`;
+}
+
 const REPL_CONTROL_PROMPT = [
 	"The `ipython` tool is a persistent Python REPL — the agent's long-lived control environment for reasoning, context management, state, tool orchestration, and recursive subcalls. Top-level `await` works directly. Use it to keep intermediate variables, inspect and transform outputs, and write small helper functions. Compaction removes individual variables whose serialized form exceeds 16 MiB; keep large source data on disk and reload it when needed.",
 	"",
 	"Python is the orchestration language: use Python for loops, conditionals, parsing, and state. Use `bash()` to invoke programs, not to write shell programs — no shell loops or heredocs; do those in Python.",
-	"The model-facing tool surface is exactly one tool: ipython. There is no bash, edit, read, write, rlm, or skill tool to call - a tool call for any other name fails with \"Tool not found\". `bash(...)`, `rlm(...)`, and installed skills are Python callables you use inside an ipython cell; shell commands run via `bash('cmd')`, and file work is Python in the same REPL.",
+	TOOL_SURFACE_PLACEHOLDER,
 	"String payloads that contain quotes (shell commands, generated code, commit messages) use triple-quoted delimiters, `shlex.quote(...)`, and `json.dumps(...)` instead of hand-escaped quotes, and never combine f-strings with backslash-escaped quotes - nested quoting is the most common syntax failure.",
 	"",
 	"Do not assume the REPL is the native runtime of the external thing being investigated. A repository, package, service, dataset, paper, website, benchmark, or API may have its own environment and normal interface. Evaluate external systems through their own interface, then use the REPL to coordinate the process and analyze what comes back.",
@@ -114,7 +137,7 @@ export function buildChildAgentDoctrine(options: ChildAgentDoctrineOptions): str
  * run the result, so this string cannot drift back into a command that fails.
  */
 export const KERNEL_PACKAGE_INSTALL_PROMPT =
-	"Install additional packages into the kernel environment by naming its interpreter: `uv pip install --python \"<kernel-python>\" <pkg>`. `<kernel-python>` is the interpreter running this REPL, so pass `sys.executable`. The kernel venv is created unseeded, so it has no pip of its own; `uv pip install` with no interpreter finds no activated environment and exits, and building a `.venv` to work around that puts the package where the kernel cannot import it. To satisfy an external project's imports, use that project's own environment instead.";
+	'Install additional packages into the kernel environment by naming its interpreter: `uv pip install --python "<kernel-python>" <pkg>`. `<kernel-python>` is the interpreter running this REPL, so pass `sys.executable`. If the shell answers `uv: command not found`, uv is still installed where prime-agent keeps it: `~/.local/bin/uv pip install --python "<kernel-python>" <pkg>`. The kernel venv is created unseeded, so it has no pip of its own; `uv pip install` with no interpreter finds no activated environment and exits, and building a `.venv` to work around that puts the package where the kernel cannot import it. To satisfy an external project\'s imports, use that project\'s own environment instead.';
 
 export function buildRlmPrompt(options: RlmPromptOptions): string {
 	const { cwd, skillsDir, messagesPath } = options;
@@ -223,7 +246,7 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 	}
 
 	if (hasIpython) {
-		parts.push("", REPL_CONTROL_PROMPT);
+		parts.push("", REPL_CONTROL_PROMPT.replace(TOOL_SURFACE_PLACEHOLDER, toolSurfaceLine(options.otherTools ?? [])));
 		if (installedSkills.includes("refine")) {
 			parts.push(
 				"",

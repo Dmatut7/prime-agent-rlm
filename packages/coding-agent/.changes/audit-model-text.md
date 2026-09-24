@@ -1,0 +1,9 @@
+- Fixed automatic continue pushing past a step the model had stopped to get approval for ("once you approve", "你确认后"), and changed its notice to say an approval-gated step is never taken on a continue.
+- Fixed the system prompt claiming ipython is the only tool when MCP or extension tools are also listed.
+- Added a prompt note that a call silent for about 5 minutes is stopped, and how to run long quiet work as a polled handle or with `timeout <secs>`.
+- Fixed compaction dropping modified-file entries to fit the file-list character budget; only read-only entries are trimmed now, and the summarizer is told to keep open tasks, errors and user constraints when anchoring to the newest kept state.
+- Fixed the bailian-web-search skill docs, which called a module name the kernel does not bind and awaited a synchronous function.
+- Fixed a restored Python skill being reported unavailable when the shared kernel venv installs it from another checkout with the same source.
+- Fixed the kernel bootstrap overwriting restored user variables named `json`, `os`, `re`, `shlex`, `sys` or `Path`.
+- Fixed `yaml.safe_dump` failing on bash output and harness overview strings.
+- Added the `~/.local/bin/uv` form of the kernel package install command for shells whose PATH lacks uv.
