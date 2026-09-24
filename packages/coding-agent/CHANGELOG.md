@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.11.4] - 2026-09-24
+
+- Fixed automatic continue pushing past a step the model had stopped to get approval for ("once you approve", "你确认后"), and changed its notice to say an approval-gated step is never taken on a continue.
+- Fixed the system prompt claiming ipython is the only tool when MCP or extension tools are also listed.
+- Added a prompt note that a call silent for about 5 minutes is stopped, and how to run long quiet work as a polled handle or with `timeout <secs>`.
+- Fixed compaction dropping modified-file entries to fit the file-list character budget; only read-only entries are trimmed now, and the summarizer is told to keep open tasks, errors and user constraints when anchoring to the newest kept state.
+- Fixed the bailian-web-search skill docs, which called a module name the kernel does not bind and awaited a synchronous function.
+- Fixed a restored Python skill being reported unavailable when the shared kernel venv installs it from another checkout with the same source.
+- Fixed the kernel bootstrap overwriting restored user variables named `json`, `os`, `re`, `shlex`, `sys` or `Path`.
+- Fixed `yaml.safe_dump` failing on bash output and harness overview strings.
+- Added the `~/.local/bin/uv` form of the kernel package install command for shells whose PATH lacks uv.
+- Changed the stall-recovery receipt so a parent deletes the original child before pasting the re-dispatch line, instead of running two workers on the same files.
+- Fixed the per-call tool deadline cancelling legitimate long work the kernel could not vouch for (synchronous cells, downloads, compute, sleep polling, or any call with the watchdog off); the silent-step rule now decides, and `timeout_ms=` in cell code counts as the call's own timeout.
+- Fixed cells silently awaiting a host request (for example `rlm.collect` on a child) being stopped as stuck after 5 minutes.
+- Changed the daemon's automatic stall recovery for main sessions and subagents to be off unless `stallWatchdog.abortAfterSeconds` is positive or its `enabled` is set, and made it re-check the watchdog's exemption live; the child stall notice now states the real kill deadline.
+- Changed image-routed runs to hand the rest of the run back to the session model once the image model has described the images, instead of doing the whole task on the image model.
+- Changed the unavailable-Python-skill notice to explain how to reload a skill after installing its dependency, and dropped its claim about shell command forms.
+
 ## [0.11.3] - 2026-09-24
 
 - Added a `bailian-web-search` kernel skill: web search through Bailian with `enable_search`, defaulting to the `max` search strategy and always using the public compatible endpoint, with the API key resolved from `DASHSCOPE_API_KEY` or `~/.prime/agent/models.json`.

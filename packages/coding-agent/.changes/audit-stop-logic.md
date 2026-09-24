@@ -1,5 +1,0 @@
-- Fixed the per-call tool deadline cancelling legitimate long work the kernel could not vouch for (synchronous cells, downloads, compute, sleep polling, or any call with the watchdog off); the silent-step rule now decides, and `timeout_ms=` in cell code counts as the call's own timeout.
-- Fixed cells silently awaiting a host request (for example `rlm.collect` on a child) being stopped as stuck after 5 minutes.
-- Changed the daemon's automatic stall recovery for main sessions and subagents to be off unless `stallWatchdog.abortAfterSeconds` is positive or its `enabled` is set, and made it re-check the watchdog's exemption live; the child stall notice now states the real kill deadline.
-- Changed image-routed runs to hand the rest of the run back to the session model once the image model has described the images, instead of doing the whole task on the image model.
-- Changed the unavailable-Python-skill notice to explain how to reload a skill after installing its dependency, and dropped its claim about shell command forms.
