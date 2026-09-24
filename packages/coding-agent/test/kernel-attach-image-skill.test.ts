@@ -228,6 +228,63 @@ except ValueError as error:
 			pythonSkills: [bundledAttachImageSkill()],
 			hostHandlers: {
 				"model.info": async () => ({ id: "openai/gpt-oss-120b", input: ["text"] }),
+				"image_route.info": async () => ({
+					available: false,
+					imageModel: null,
+					message:
+						"This turn attaches images, but the selected model (openai/gpt-oss-120b) does not accept image input.",
+				}),
+			},
+		});
+
+		const manager = await provisioner.ensure();
+		const result = await manager.execute(`
+try:
+    await attach_image(${JSON.stringify(imagePath)})
+except RuntimeError as error:
+    print(f"RuntimeError: {error}")
+`);
+
+		expect(result.status).toBe("ok");
+		expect(result.stdout.trim()).toBe(
+			"RuntimeError: This turn attaches images, but the selected model (openai/gpt-oss-120b) does not accept image input.",
+		);
+		expect(result.attachments).toBeUndefined();
+	});
+
+	it("attaches when the serving model is text-only but the harness can route the image turn", async () => {
+		const imagePath = join(tempDir, "sample.png");
+		writeFileSync(imagePath, Buffer.from(PNG_BASE64, "base64"));
+
+		provisioner = new IpythonKernelProvisioner(tempDir, {
+			pythonSkills: [bundledAttachImageSkill()],
+			hostHandlers: {
+				"model.info": async () => ({ id: "openai/gpt-oss-120b", input: ["text"] }),
+				"image_route.info": async () => ({
+					available: true,
+					imageModel: { id: "anthropic/claude-haiku-4.5", input: ["text", "image"] },
+				}),
+			},
+		});
+
+		const manager = await provisioner.ensure();
+		const result = await manager.execute(`print(await attach_image(${JSON.stringify(imagePath)}))`);
+
+		expect(result.status).toBe("ok");
+		expect(result.stdout.trim()).toContain("Loaded 1 image(s) into context");
+		expect(result.attachments).toHaveLength(1);
+		expect(result.attachments?.[0]?.mimeType).toBe("image/png");
+		expect(result.attachments?.[0]?.data).toBe(PNG_BASE64);
+	});
+
+	it("falls back to the switch-model refusal when the host cannot answer image_route.info", async () => {
+		const imagePath = join(tempDir, "sample.png");
+		writeFileSync(imagePath, Buffer.from(PNG_BASE64, "base64"));
+
+		provisioner = new IpythonKernelProvisioner(tempDir, {
+			pythonSkills: [bundledAttachImageSkill()],
+			hostHandlers: {
+				"model.info": async () => ({ id: "openai/gpt-oss-120b", input: ["text"] }),
 			},
 		});
 
@@ -310,8 +367,11 @@ describe("model.info over a session's kernel host bridge", () => {
 	// attach_image's preflight asks the host for model.info and rejects when the
 	// reported model has no image input. The handler must answer with the model
 	// serving the current run: a routed image turn serves on settings.imageModel,
-	// so an in-turn attach is allowed there, while an image-free turn of a
-	// text-only session model still reports that model and still rejects.
+	// so an in-turn attach is allowed there. An image-free turn of a text-only
+	// session model reports that model, but the preflight then asks
+	// image_route.info: when the harness can route an image-carrying continuation
+	// (settings.imageModel), the attach is allowed and the continuation is served
+	// by the image model; without a route the rejection names the fix.
 	interface SessionFixture {
 		session: AgentSession;
 		servedIds: string[];
@@ -409,18 +469,43 @@ describe("model.info over a session's kernel host bridge", () => {
 		}
 	});
 
-	it("still rejects attach on an image-free turn of a text-only session model", async () => {
+	it("attaches on an image-free turn of a text-only session model and routes the continuation", async () => {
 		const fixture = createAttachSession({ imageModel: "claude-haiku-4-5" });
+		try {
+			await fixture.session.prompt("describe");
+			// The attach is allowed (image_route.info reports the route), the image
+			// rides the tool result, and the mid-run bootstrap serves the
+			// continuation on the image model.
+			expect(fixture.servedIds).toEqual(["claude-opus-4-7-text-only", "claude-haiku-4-5"]);
+			const results = ipythonToolResults(fixture.session);
+			expect(results).toHaveLength(1);
+			expect(results[0].isError).toBe(false);
+			expect(results[0].content).toEqual([
+				{ type: "text", text: expect.stringContaining("Loaded 1 image(s) into context") },
+				{ type: "image", data: PNG_BASE64, mimeType: "image/png" },
+			]);
+		} finally {
+			fixture.session.dispose();
+			cleanupSessionDir(fixture.dir);
+		}
+	});
+
+	it("refuses attach with the imageModel guidance when no route exists", async () => {
+		const fixture = createAttachSession({});
 		try {
 			await fixture.session.prompt("describe");
 			expect(fixture.servedIds).toEqual(["claude-opus-4-7-text-only", "claude-opus-4-7-text-only"]);
 			const results = ipythonToolResults(fixture.session);
 			expect(results).toHaveLength(1);
-			// A failed cell reports its traceback in the result text: the vision
-			// rejection must be there, and no image block may ride along.
+			// A failed cell reports its traceback in the result text: the routing
+			// refusal must name the settings fix, and no image block may ride along.
 			expect(results[0].content[0]).toMatchObject({
 				type: "text",
-				text: expect.stringContaining("claude-opus-4-7-text-only does not support vision"),
+				text: expect.stringContaining("does not accept image input"),
+			});
+			expect(results[0].content[0]).toMatchObject({
+				type: "text",
+				text: expect.stringContaining("Set imageModel in settings.json"),
 			});
 			expect(results[0].content.some((block) => block.type === "image")).toBe(false);
 			expect((results[0].details as { status?: string }).status).toBe("error");

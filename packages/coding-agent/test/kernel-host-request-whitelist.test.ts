@@ -21,6 +21,7 @@ describe("cancellable kernel host request whitelist (P1-2a)", () => {
 			"rlm.list_subagents",
 			"rlm.collect", // bounded read-only wait; cancelling it cancels no child
 			"model.info",
+			"image_route.info", // reads whether an image-carrying request can be routed
 			"agent_message.list_agents",
 			"agent_observe.list",
 			"agent_observe.get",

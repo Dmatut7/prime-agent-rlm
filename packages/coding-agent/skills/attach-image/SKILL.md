@@ -1,6 +1,6 @@
 ---
 name: attach-image
-description: Load an on-disk image (PNG, JPEG, GIF, WebP) into the model's context as a viewable attachment so the model can directly SEE it — for screenshots, diagrams, charts, photos, or scanned pages. Use this when you need to perceive an image's visual contents. Requires a vision-capable model; errors clearly otherwise.
+description: Load an on-disk image (PNG, JPEG, GIF, WebP) into the model's context as a viewable attachment so the model can directly SEE it — for screenshots, diagrams, charts, photos, or scanned pages. Use this when you need to perceive an image's visual contents. Works on vision-capable models and on text-only models when the harness can route image turns to settings.imageModel; errors clearly otherwise.
 ---
 
 # Attach Image
@@ -46,4 +46,6 @@ gray background. Extremely large images are rejected by pixel count before full
 processing. The original file is left untouched.
 
 Supported formats: PNG, JPEG, GIF, WebP. The skill errors if a file is not a
-supported image, or if the current model is not vision-capable.
+supported image. On a text-only serving model it still works when the harness
+can route the next image-carrying request to `settings.imageModel`; without a
+route it errors with the setting to fix.
