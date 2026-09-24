@@ -773,6 +773,12 @@ export interface Settings {
 	// keeps their different prompt prefixes from evicting the session's provider
 	// prefix-cache entry.
 	auxiliaryModel?: string;
+	// Auto-naming of session threads: "llm" derives a name from the first inbound
+	// message and refines it once with a background title call; "first-message"
+	// keeps only the deterministic name; "off" leaves sessions unnamed unless a
+	// human names them. Default: "first-message" (the one-shot LLM title pass is
+	// opt-in until it moves into the daemon idle sweep).
+	autoSessionName?: "off" | "first-message" | "llm";
 	defaultThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	defaultServiceTier?: ServiceTier;
 	rlmMaxDepth?: number; // default for new sessions; unset falls through to RLM_MAX_DEPTH, then 2
@@ -1048,6 +1054,7 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	updateChannel: null,
 	recentModels: null,
 	auxiliaryModel: null,
+	autoSessionName: null,
 	defaultThinkingLevel: null,
 	defaultServiceTier: null,
 	rlmMaxDepth: null,
@@ -2283,6 +2290,13 @@ export class SettingsManager {
 		// anything malformed as unset so refinement falls back to the session model.
 		const value = this.settings.auxiliaryModel;
 		return typeof value === "string" ? value : undefined;
+	}
+
+	getAutoSessionName(): "off" | "first-message" | "llm" {
+		// Hand-edited settings can persist anything; only the three known modes
+		// count, everything else falls back to the default.
+		const value = this.settings.autoSessionName;
+		return value === "off" || value === "first-message" || value === "llm" ? value : "first-message";
 	}
 
 	getRecentModels(): string[] {
