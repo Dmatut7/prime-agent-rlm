@@ -60,6 +60,10 @@ const PYTHON_CALL_LABELS: ReadonlyArray<[RegExp, string]> = [
 		/\b(?:bailian_web_search|bailian_search|websearch|exa_websearch)\.search\b|\b(?:websearch|exa_websearch)\.\w+\(/g,
 		"联网搜索",
 	],
+	[/\bweb_research\.search\(/g, "联网搜索"],
+	[/\bweb_research\.fetch(?:_many)?\(/g, "读网页"],
+	[/\bweb_research\.(?:BrowserSession|browse)\(/g, "后台浏览器"],
+	[/\bweb_research\.(?:arxiv|crossref|openalex|stackexchange|github)\(/g, "查论文资料"],
 	[/\brlm\.harness\.(?:create|update)_memory\(/g, "记笔记"],
 ];
 

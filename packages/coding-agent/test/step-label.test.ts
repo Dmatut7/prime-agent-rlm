@@ -154,6 +154,26 @@ describe("turnStepLabel harness calls", () => {
 		).toBe("联网搜索");
 		expect(turnStepLabel(cell("rlm.harness.create_memory('t', 'c')"))).toBe("记笔记");
 	});
+
+	it("names web-research calls by what they do", () => {
+		expect(turnStepLabel(cell("r = await web_research.search('香港 CN2 GIA VPS')\nprint(r)"))).toBe("联网搜索");
+		expect(turnStepLabel(cell("page = await web_research.fetch('https://docs.python.org/3/')"))).toBe("读网页");
+		expect(turnStepLabel(cell("pages = await web_research.fetch_many(urls)"))).toBe("读网页");
+		expect(
+			turnStepLabel(
+				cell(
+					"async with web_research.BrowserSession() as b:\n    await b.open(url)\n    await b.click('ORDER NOW')",
+				),
+			),
+		).toBe("后台浏览器");
+		expect(turnStepLabel(cell("runs = await asyncio.gather(*(web_research.browse(u, s) for u, s in V))"))).toBe(
+			"后台浏览器",
+		);
+		expect(turnStepLabel(cell("await web_research.arxiv('rag survey', max_results=5)"))).toBe("查论文资料");
+		expect(
+			turnStepLabel(cell("r = await web_research.search('x')\np = await web_research.fetch(r.results[0]['url'])")),
+		).toBe("联网搜索，读网页");
+	});
 });
 
 describe("shell and helper labels (QA M3)", () => {
