@@ -10,8 +10,14 @@ import type {
 	ToolResultMessage,
 } from "../types.js";
 
-const NON_VISION_USER_IMAGE_PLACEHOLDER = "(image omitted: model does not support images)";
-const NON_VISION_TOOL_IMAGE_PLACEHOLDER = "(tool image omitted: model does not support images)";
+// A conversation can hand a turn with images to an image-capable model and the rest
+// back to a text-only one. Read bare, "omitted" made the text-only model conclude that
+// nobody had seen the image and disown the reply that described it, so the placeholder
+// says who did.
+const SEEN_BY_OTHER_MODEL_NOTE =
+	"If the next assistant reply describes it, an image-capable model that did see it wrote that reply.";
+const NON_VISION_USER_IMAGE_PLACEHOLDER = `(image not shown to this model, which does not take image input. ${SEEN_BY_OTHER_MODEL_NOTE})`;
+const NON_VISION_TOOL_IMAGE_PLACEHOLDER = `(tool image not shown to this model, which does not take image input. ${SEEN_BY_OTHER_MODEL_NOTE})`;
 
 const logger = getLogger("transform-messages");
 

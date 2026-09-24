@@ -1,0 +1,1 @@
+- Changed the placeholder a text-only model sees in place of an image to say the image was not shown to it and that a reply describing it came from an image-capable model, so a continued conversation no longer disowns a correct image answer.

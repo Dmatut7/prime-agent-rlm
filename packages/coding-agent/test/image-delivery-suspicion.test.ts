@@ -167,17 +167,36 @@ it("does not notice on APIs whose usage schema has no image token count", async 
 	}
 });
 
-it("does not notice for providers that never report the count (bailian, stepfun)", async () => {
-	for (const provider of ["bailian", "stepfun"]) {
-		const fixture = createSuspicionSession([{ usage: {} }], { firstResponse: { provider } });
-		try {
-			await fixture.session.prompt("describe", { images: [IMAGE] });
+it("does not notice after the image model confirmed delivery and the text-only model took over", async () => {
+	// The routed image model answers with a count and a tool call; the run goes on
+	// with the session model, which is sent placeholders and reports no count.
+	const fixture = createSuspicionSession([{ usage: { imageTokens: 392 } }, { usage: {} }], {
+		firstResponse: {
+			stopReason: "toolUse",
+			content: [{ type: "toolCall", id: "call-1", name: "noop", arguments: {} }],
+		},
+	});
+	try {
+		await fixture.session.prompt("describe", { images: [IMAGE] });
+		expect(fixture.streamCalls()).toBe(2);
+		expect(suspicionNotices(fixture.session)).toHaveLength(0);
+	} finally {
+		fixture.session.dispose();
+		rmSync(fixture.dir, { recursive: true, force: true });
+	}
+});
 
-			expect(suspicionNotices(fixture.session)).toHaveLength(0);
-		} finally {
-			fixture.session.dispose();
-			rmSync(fixture.dir, { recursive: true, force: true });
-		}
+it("does not notice when the answering model takes no image input", async () => {
+	// A text-only model is sent placeholders, never images: it has nothing to count.
+	const fixture = createSuspicionSession([{ usage: {} }], {
+		firstResponse: { provider: "amazon-bedrock", model: "amazon.nova-micro-v1:0" },
+	});
+	try {
+		await fixture.session.prompt("describe", { images: [IMAGE] });
+		expect(suspicionNotices(fixture.session)).toHaveLength(0);
+	} finally {
+		fixture.session.dispose();
+		rmSync(fixture.dir, { recursive: true, force: true });
 	}
 });
 

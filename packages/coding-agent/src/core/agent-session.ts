@@ -2338,13 +2338,6 @@ function joinCompactionInstructions(manual: string | undefined, pending: string 
 	return parts.length > 0 ? parts.join("\n\n") : undefined;
 }
 
-/**
- * Providers observed to answer image turns correctly while never reporting
- * `prompt_tokens_details.image_tokens` (bailian: deepseek-v4.1-flash described a
- * pasted product card exactly, 2026-09-25; stepfun: see the suspicion check).
- */
-const PROVIDERS_WITHOUT_IMAGE_TOKEN_COUNTS: ReadonlySet<string> = new Set(["bailian", "stepfun"]);
-
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -4046,11 +4039,16 @@ export class AgentSession {
 		// request, so the provider truthfully counts no image tokens.
 		if (this.settingsManager.getBlockImages()) return;
 		if (message.api !== "openai-completions") return;
-		if (message.usage.imageTokens !== undefined) return;
-		// Providers whose usage frame never carries the count: the absence says
-		// nothing there, and the notice (read by the model too) made a correct
-		// image answer doubt itself.
-		if (PROVIDERS_WITHOUT_IMAGE_TOKEN_COUNTS.has(message.provider)) return;
+		if (message.usage.imageTokens !== undefined) {
+			// Delivery confirmed for this batch: a later response in the same run
+			// (the text-only session model after the image model hands back) was
+			// never sent the images, so its missing count is not evidence.
+			this._imageDeliverySuspicionNotified = true;
+			return;
+		}
+		// A model without image input gets placeholders, never images; it has no
+		// image tokens to count.
+		if (this._modelRegistry.find(message.provider, message.model)?.input.includes("image") === false) return;
 		this._imageDeliverySuspicionNotified = true;
 		try {
 			this._appendCustomMessageToTranscript(
