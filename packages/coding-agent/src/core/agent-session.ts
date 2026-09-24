@@ -289,6 +289,18 @@ import {
 } from "./prompt-admission.js";
 import { expandPromptTemplate, type PromptTemplate, parseCommandArgs } from "./prompt-templates.js";
 import {
+	BAD_TOOL_CALL_STORM_THRESHOLD,
+	DUTY_EVENT_ENTRY_TYPE,
+	describeProviderFailureCause,
+	isBadToolCall,
+	PROVIDER_FALLBACK_ENTRY_TYPE,
+	PROVIDER_FALLBACK_RETURN_AFTER_MS,
+	type ProviderDutyEvent,
+	type ProviderFallbackEntryData,
+	providerLongWaitDelayMs,
+	toolResultText,
+} from "./provider-fallback.js";
+import {
 	isAgentLifecycleFailure,
 	isFauxProviderQueueExhausted,
 	isPermanentProviderFailureKind,
@@ -2467,6 +2479,29 @@ export class AgentSession {
 				routedOverride?: AgentModelOverride;
 		  }
 		| undefined = undefined;
+	/**
+	 * Set while the session runs on a fallback-chain model. Unlike the backup
+	 * model it stays after a success; the primary is probed again once
+	 * PROVIDER_FALLBACK_RETURN_AFTER_MS has passed.
+	 */
+	private _fallback:
+		| {
+				primary: Model<any>;
+				thinkingLevel: ThinkingLevel;
+				serviceTier: ServiceTier;
+				routedOverride?: AgentModelOverride;
+				current: Model<any>;
+				switchedAtMs: number;
+				/** `provider/id` of every model this episode already moved to. */
+				tried: string[];
+		  }
+		| undefined = undefined;
+	/** Long-wait rounds spent after every model of the chain failed (reset on success). */
+	private _fallbackLongWaitRound = 0;
+	/** Consecutive invalid tool calls from the serving model in the current run. */
+	private _badToolCallStreak = 0;
+	/** Arguments of in-flight tool calls, for the empty-argument half of the storm check. */
+	private readonly _toolCallArgs = new Map<string, unknown>();
 	private _agentMessageClearEpoch = 0;
 	private _agentMessageOutcomes = new Map<string, AgentMessageOutcome>();
 	/**
@@ -5859,6 +5894,7 @@ export class AgentSession {
 
 	private _handleAgentEvent = (event: AgentEvent): void => {
 		this._recordStallWatchdogActivity(event);
+		this._recordFallbackActivity(event);
 		this._createRetryPromiseForAgentEnd(event);
 		if (event.type === "message_start" || event.type === "message_end") {
 			for (const action of this._actionStore.ownedActions()) {
@@ -6626,6 +6662,9 @@ export class AgentSession {
 					// It also ends the empty-response failure episode: the recovery
 					// continuation budget is per-episode, so a fresh ladder starts fresh.
 					this._emptyTurnRecoveryUsed = 0;
+				}
+				if (assistantMsg.stopReason !== "error") {
+					this._fallbackLongWaitRound = 0;
 				}
 				if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) {
 					const restoredModel = this._restorePrimaryModelAfterBackup();
@@ -12025,6 +12064,8 @@ export class AgentSession {
 			}
 		}
 
+		// An explicit pick ends any automatic fallback: never switch the user back.
+		this._fallback = undefined;
 		const previousModel = this.model;
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		const serviceTier = this._getServiceTierForModelSwitch();
@@ -18615,6 +18656,13 @@ export class AgentSession {
 			}
 		}
 
+		// Fallback chain: quota exhaustion moves to the next model at once; a wait
+		// on this model buys nothing for an owner who is away.
+		if (waitClass === "quota") {
+			const next = this._resolveNextFallbackModel();
+			if (next) return this._handleFallbackRetry(message, options, next, waitClass);
+		}
+
 		this._retryAttempt++;
 
 		const waitPolicy = this.settingsManager.getProviderWaitSettings();
@@ -18626,8 +18674,13 @@ export class AgentSession {
 		}
 
 		if (this._retryAttempt > retryPolicy.maxRetries) {
-			// Quick retries exhausted on an unavailable provider: keep pinging
-			// with bounded exponential backoff instead of giving up.
+			// Quick retries exhausted on an unavailable provider: try the next model
+			// of the fallback chain before waiting on this one.
+			if (waitClass === "transient") {
+				const next = this._resolveNextFallbackModel();
+				if (next) return this._handleFallbackRetry(message, options, next, waitClass);
+			}
+			// Otherwise keep pinging with bounded exponential backoff instead of giving up.
 			if (waitClass === "transient" && waitPolicy.enabled) {
 				return this._handleProviderWait(message, options, waitPolicy, "unavailable");
 			}
@@ -18712,6 +18765,13 @@ export class AgentSession {
 		}
 
 		this._emit(emitStart);
+		this._recordDutyEvent({
+			kind: "provider_retry",
+			...(message.provider ? { provider: message.provider } : {}),
+			...(message.model ? { model: message.model } : {}),
+			...(message.errorMessage ? { error: message.errorMessage } : {}),
+			waitMs: delayMs,
+		});
 
 		const messages = this.agent.state.messages;
 		if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
@@ -18852,6 +18912,279 @@ export class AgentSession {
 	}
 
 	/**
+	 * The next model of the fallback chain that can serve this turn: configured
+	 * auth, not already tried this episode, not the serving model or the
+	 * primary, image-capable when the run is routed for images, and with a
+	 * context window that holds the current context (so a switch never needs
+	 * to drop history).
+	 */
+	private _resolveNextFallbackModel(): Model<any> | undefined {
+		const references = this.settingsManager.getProviderFallbackModels();
+		if (references.length === 0) return undefined;
+		const key = (model: Model<any>) => `${model.provider}/${model.id}`;
+		const excluded = new Set(this._fallback?.tried ?? []);
+		const serving = this._runModel();
+		if (serving) excluded.add(key(serving));
+		if (this._fallback) excluded.add(key(this._fallback.primary));
+		const contextTokens = this.getContextUsage()?.tokens ?? 0;
+		const available = this._modelRegistry.getAvailable();
+		for (const reference of references) {
+			const candidate = findExactModelReferenceMatch(reference, available);
+			if (!candidate || excluded.has(key(candidate))) continue;
+			if (!this._modelRegistry.hasConfiguredAuth(candidate)) continue;
+			if (this.agent.modelOverride && !candidate.input.includes("image")) continue;
+			if (candidate.contextWindow > 0 && contextTokens > candidate.contextWindow * 0.9) continue;
+			return candidate;
+		}
+		return undefined;
+	}
+
+	private _canFallbackLongWait(): boolean {
+		return (
+			this.settingsManager.getProviderFallbackModels().length > 0 &&
+			this._fallbackLongWaitRound < this.settingsManager.getProviderFallbackLongWait().maxRounds
+		);
+	}
+
+	private _recordFallbackEntry(data: ProviderFallbackEntryData): void {
+		this._appendRecoveryEntry(PROVIDER_FALLBACK_ENTRY_TYPE, data);
+	}
+
+	/** One provider-recovery event for the duty log (see DUTY_EVENT_ENTRY_TYPE). */
+	private _recordDutyEvent(event: ProviderDutyEvent): void {
+		this._appendRecoveryEntry(DUTY_EVENT_ENTRY_TYPE, event);
+	}
+
+	private _appendRecoveryEntry(customType: string, data: unknown): void {
+		try {
+			this.sessionManager.appendCustomEntry(customType, data);
+		} catch (error) {
+			sessionLog.warn("could not record a provider recovery entry", {
+				sessionId: this.sessionId,
+				customType,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	/** Move the session onto `next`, remembering the primary to come back to. */
+	private _applyFallbackModel(
+		next: Model<any>,
+		cause: string,
+		errorMessage: string | undefined,
+		reason: "provider_errors" | "bad_tool_calls",
+	): void {
+		const from = this.agent.state.model;
+		if (!this._fallback) {
+			this._fallback = {
+				primary: from,
+				thinkingLevel: this.agent.state.thinkingLevel,
+				serviceTier: this.agent.state.serviceTier,
+				routedOverride: this.agent.modelOverride,
+				current: next,
+				switchedAtMs: Date.now(),
+				tried: [],
+			};
+		}
+		const primaryThinking = this._fallback.thinkingLevel;
+		this.agent.state.model = next;
+		this.agent.state.thinkingLevel = clampThinkingLevel(next, primaryThinking) as ThinkingLevel;
+		this._clampServiceTierForModel();
+		if (this.agent.modelOverride) {
+			this.agent.modelOverride = {
+				model: next,
+				thinkingLevel: this.agent.state.thinkingLevel,
+				serviceTier: this.agent.state.serviceTier,
+			};
+		}
+		this._fallback.current = next;
+		this._fallback.switchedAtMs = Date.now();
+		this._fallback.tried.push(`${next.provider}/${next.id}`);
+		this.sessionManager.appendModelChange(next.provider, next.id);
+		const fromReference = `${from.provider}/${from.id}`;
+		this._recordFallbackEntry({
+			kind: "switch",
+			at: Date.now(),
+			from: fromReference,
+			to: `${next.provider}/${next.id}`,
+			cause,
+			...(errorMessage ? { errorMessage } : {}),
+		});
+		this._recordDutyEvent({ kind: "model_fallback", from: fromReference, to: `${next.provider}/${next.id}`, reason });
+		sessionLog.warn("provider fallback: switched model", {
+			sessionId: this.sessionId,
+			from: fromReference,
+			to: `${next.provider}/${next.id}`,
+			cause,
+		});
+	}
+
+	/** Re-issue the failed turn on the next fallback model, with its own quick retries. */
+	private _handleFallbackRetry(
+		message: AssistantMessage,
+		options:
+			| {
+					markAuthStaleOnFailure?: boolean;
+					authSourceTokens?: readonly AuthSourceToken[];
+			  }
+			| undefined,
+		next: Model<any>,
+		waitClass: "quota" | "transient",
+	): Promise<boolean> {
+		const cause = describeProviderFailureCause(message.provider, message.errorMessage, waitClass);
+		this._applyFallbackModel(next, cause, message.errorMessage, "provider_errors");
+		this._retryAttempt = 1;
+		this._providerWait = undefined;
+		return this._retryAfterDelay(
+			message,
+			options,
+			{
+				type: "auto_retry_start",
+				attempt: this._retryAttempt,
+				maxAttempts: providerRetryPolicy(this.settingsManager).maxRetries,
+				delayMs: 0,
+				errorMessage: cause,
+				reason: "backup",
+				backupModel: `${next.provider}/${next.id}`,
+			},
+			0,
+		);
+	}
+
+	/**
+	 * Every model of the chain failed and the bounded wait ran out: wait a long
+	 * round (5, 10, 20, 20 ... minutes), return to the primary and start the
+	 * chain over, instead of ending a task nobody is watching.
+	 */
+	private _handleFallbackLongWait(
+		message: AssistantMessage,
+		options:
+			| {
+					markAuthStaleOnFailure?: boolean;
+					authSourceTokens?: readonly AuthSourceToken[];
+			  }
+			| undefined,
+	): Promise<boolean> {
+		this._fallbackLongWaitRound += 1;
+		const round = this._fallbackLongWaitRound;
+		const longWait = this.settingsManager.getProviderFallbackLongWait();
+		const delayMs = providerLongWaitDelayMs(round, longWait.baseDelayMs, longWait.maxDelayMs);
+		this._returnToPrimaryModel("long_wait");
+		this._providerWait = undefined;
+		this._retryAttempt = 1;
+		this._recordFallbackEntry({
+			kind: "long_wait",
+			at: Date.now(),
+			round,
+			delayMs,
+			cause: describeProviderFailureCause(message.provider, message.errorMessage, "transient"),
+			...(message.errorMessage ? { errorMessage: message.errorMessage } : {}),
+		});
+		return this._retryAfterDelay(
+			message,
+			options,
+			{
+				type: "auto_retry_start",
+				attempt: round,
+				maxAttempts: longWait.maxRounds,
+				delayMs,
+				errorMessage: message.errorMessage || "Unknown error",
+				reason: "unavailable",
+			},
+			delayMs,
+		);
+	}
+
+	/**
+	 * Leave the fallback for the primary. `pendingTurnModel` moves a run that is
+	 * already going at its next request; `state.model` covers the runs after it.
+	 * A model the user picked meanwhile is left alone.
+	 */
+	private _returnToPrimaryModel(why: "cooldown" | "long_wait"): boolean {
+		const fallback = this._fallback;
+		this._fallback = undefined;
+		if (!fallback) return false;
+		if (!modelsAreEqual(this.agent.state.model, fallback.current)) return false;
+		this.agent.state.model = fallback.primary;
+		this.agent.state.thinkingLevel = fallback.thinkingLevel;
+		this.agent.modelOverride = fallback.routedOverride;
+		this._clampServiceTierForModel(fallback.serviceTier);
+		if (this.agent.state.isStreaming) {
+			this.agent.pendingTurnModel = {
+				model: fallback.routedOverride?.model ?? fallback.primary,
+				thinkingLevel: fallback.routedOverride?.thinkingLevel ?? fallback.thinkingLevel,
+				serviceTier: fallback.routedOverride?.serviceTier ?? this.agent.state.serviceTier,
+			};
+		}
+		this.sessionManager.appendModelChange(fallback.primary.provider, fallback.primary.id);
+		this._recordDutyEvent({ kind: "model_restored", to: `${fallback.primary.provider}/${fallback.primary.id}` });
+		this._recordFallbackEntry({
+			kind: "return",
+			at: Date.now(),
+			from: `${fallback.current.provider}/${fallback.current.id}`,
+			to: `${fallback.primary.provider}/${fallback.primary.id}`,
+			cause: why === "cooldown" ? "冷却期已过，试回原模型" : "所有模型都失败，等待后从原模型重试",
+		});
+		return true;
+	}
+
+	/**
+	 * Fallback bookkeeping on the agent's event stream: probe the primary again
+	 * at a turn boundary once the cooldown passed, and move off a model that
+	 * keeps emitting invalid tool calls (garbage names, empty arguments).
+	 */
+	private _recordFallbackActivity(event: AgentEvent): void {
+		if (event.type === "agent_start") {
+			this._badToolCallStreak = 0;
+			this._toolCallArgs.clear();
+		}
+		if (event.type === "agent_start" || event.type === "turn_start") {
+			const fallback = this._fallback;
+			if (fallback && Date.now() - fallback.switchedAtMs >= PROVIDER_FALLBACK_RETURN_AFTER_MS) {
+				this._returnToPrimaryModel("cooldown");
+			}
+			return;
+		}
+		if (event.type === "tool_execution_start") {
+			this._toolCallArgs.set(event.toolCallId, event.args);
+			return;
+		}
+		if (event.type !== "tool_execution_end") return;
+		const args = this._toolCallArgs.get(event.toolCallId);
+		this._toolCallArgs.delete(event.toolCallId);
+		const text = toolResultText(event.result);
+		if (!isBadToolCall({ isError: event.isError, text, args })) {
+			if (!event.isError) this._badToolCallStreak = 0;
+			return;
+		}
+		this._badToolCallStreak += 1;
+		if (this._badToolCallStreak < BAD_TOOL_CALL_STORM_THRESHOLD) return;
+		const streak = this._badToolCallStreak;
+		this._badToolCallStreak = 0;
+		const next = this._resolveNextFallbackModel();
+		if (!next) return;
+		const cause = `连续 ${streak} 次无效工具调用`;
+		this._applyFallbackModel(next, cause, text, "bad_tool_calls");
+		// The running loop takes the new model before its next request.
+		this.agent.pendingTurnModel = {
+			model: next,
+			thinkingLevel: this.agent.state.thinkingLevel,
+			serviceTier: this.agent.state.serviceTier,
+		};
+		// Same event pair a retry-path switch produces, so every client shows it.
+		this._emit({
+			type: "auto_retry_start",
+			attempt: 1,
+			maxAttempts: 1,
+			delayMs: 0,
+			errorMessage: cause,
+			reason: "backup",
+			backupModel: `${next.provider}/${next.id}`,
+		});
+		this._emit({ type: "auto_retry_end", success: true, attempt: 1 });
+	}
+
+	/**
 	 * One bounded wait-for-recovery ping: exponential backoff with jitter, a
 	 * scheduled resume when the provider reports a reset time, and hard abort
 	 * bounds so the wait can never hang.
@@ -18874,6 +19207,9 @@ export class AgentSession {
 
 		const resetMs = providerStreamFailureRetryAfterMs(message) ?? parseProviderResetMs(message.errorMessage);
 		const decision = providerWaitDecision(pingAttempt, Date.now() - startedAtMs, resetMs, policy);
+		if (decision.kind === "abort" && reason === "unavailable" && this._canFallbackLongWait()) {
+			return this._handleFallbackLongWait(message, options);
+		}
 		if (decision.kind === "abort") {
 			// A quota reset beyond the bounded wait parks the session instead of
 			// dying mid-task: end the turn cleanly and resume at the reset time.

@@ -681,6 +681,12 @@ async function runLoop(
 				pendingMessages = [];
 			}
 
+			const nextModel = config.takeNextTurnModel?.();
+			if (nextModel) {
+				config.model = nextModel.model;
+				config.reasoning = nextModel.reasoning;
+				config.serviceTier = nextModel.serviceTier;
+			}
 			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
 			newMessages.push(message);
 

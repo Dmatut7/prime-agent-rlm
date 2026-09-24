@@ -241,6 +241,12 @@ export class Agent {
 	 * that served the routed turn.
 	 */
 	modelOverride?: AgentModelOverride;
+	/**
+	 * One-shot mid-run switch: the running loop takes this model before its next
+	 * LLM request and keeps it for the rest of the run (a new run reads
+	 * `state.model` / `modelOverride` as usual). Cleared once taken.
+	 */
+	pendingTurnModel?: AgentModelOverride;
 	private activeRun?: ActiveRun;
 	public sessionId?: string;
 	public thinkingBudgets?: ThinkingBudgets;
@@ -533,6 +539,13 @@ export class Agent {
 			},
 			getFollowUpMessages: async () => this.followUpQueue.drain(),
 			getContinuationMessages: async (context, signal) => this.getContinuationMessages?.(context, signal) ?? [],
+			takeNextTurnModel: () => {
+				const pending = this.pendingTurnModel;
+				if (!pending) return undefined;
+				this.pendingTurnModel = undefined;
+				if (this.activeRun) this.activeRun.model = pending.model;
+				return { model: pending.model, reasoning: pending.thinkingLevel, serviceTier: pending.serviceTier };
+			},
 		};
 	}
 

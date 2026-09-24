@@ -1390,6 +1390,8 @@ export class InteractiveMode {
 	private refineLoader: Loader | undefined = undefined;
 
 	private retryLoader: Loader | undefined = undefined;
+	/** The `已自动切换到 …` row a backup/fallback retry shows once it succeeds. */
+	private pendingModelFallbackNotice: string | undefined = undefined;
 	private retryCountdown: CountdownTimer | undefined = undefined;
 	private traceUploadAllAbortController: AbortController | undefined = undefined;
 
@@ -6550,8 +6552,24 @@ export class InteractiveMode {
 				this.stopWorkingLoader();
 				this.statusContainer.clear();
 				this.retryCountdown?.dispose();
-				const retryMessage = (seconds: number) =>
-					`Retrying (${event.attempt}/${event.maxAttempts}) in ${seconds}s... (${keyText("app.clear")} to cancel)`;
+				this.pendingModelFallbackNotice =
+					event.reason === "backup" && event.backupModel
+						? `已自动切换到 ${event.backupModel.split("/").pop()}（原因：${event.errorMessage}）`
+						: undefined;
+				const cancelKey = keyText("app.clear");
+				const retryMessage = (seconds: number) => {
+					const cancel = cancelKey ? `（${cancelKey} 取消）` : "";
+					if (event.reason === "backup" && event.backupModel) {
+						return `已自动切换到 ${event.backupModel.split("/").pop()}，马上重试${cancel}`;
+					}
+					if (event.reason === "unavailable" && event.delayMs >= 60_000) {
+						return `所有模型暂时不可用，${Math.ceil(seconds / 60)} 分钟后再试（第 ${event.attempt} 轮）${cancel}`;
+					}
+					if (event.reason === "usage") {
+						return `额度用完或被限流，${seconds} 秒后再试（第 ${event.attempt} 次）${cancel}`;
+					}
+					return `服务器出错，第 ${event.attempt} 次重试，等 ${seconds} 秒${cancel}`;
+				};
 				this.retryLoader = new Loader(
 					this.ui,
 					(spinner) => theme.fg("muted", spinner),
@@ -6585,6 +6603,12 @@ export class InteractiveMode {
 				}
 				// Restore the working loader if streaming/subagents still warrant it.
 				this.syncWorkingLoader();
+				// A model switch stays visible as one dim row once the turn goes on.
+				const fallbackNotice = this.pendingModelFallbackNotice;
+				this.pendingModelFallbackNotice = undefined;
+				if (event.success && fallbackNotice) {
+					this.showStatus(fallbackNotice);
+				}
 				// Show error only on final failure (success shows normal response)
 				if (!event.success) {
 					this.showError(`重试 ${event.attempt} 次后仍失败：${event.finalError || "未知错误"}`);
