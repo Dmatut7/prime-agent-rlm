@@ -133,7 +133,7 @@ describe("a silent child is reported to its parent, not killed for it", () => {
 		);
 		const notice = messagesOfType(parent.session.messages, RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE)[0]!;
 		expect((notice.details as RlmChildStallNoticeDetails).abortAfterMs).toBeGreaterThan(0);
-		expect(notice.content).toContain("abort the turn after");
+		expect(notice.content).toContain("interrupted after");
 
 		await vi.waitFor(
 			() => {

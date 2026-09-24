@@ -120,13 +120,15 @@ describe("stall recovery settings resolution", () => {
 	it("resolves the documented defaults", () => {
 		const manager = SettingsManager.inMemory({});
 
+		// Warn-only by default (silence is normal for long work): the automatic
+		// actions are off unless the owner opts into silence kills.
 		expect(manager.getSubagentStallRecoverySettings()).toEqual({
-			enabled: true,
+			enabled: false,
 			graceSeconds: 300,
 			maxPerSession: 3,
 		});
 		expect(manager.getRootStallRecoverySettings()).toEqual({
-			enabled: true,
+			enabled: false,
 			humanWindowSeconds: 120,
 			maxPerSession: 3,
 		});
