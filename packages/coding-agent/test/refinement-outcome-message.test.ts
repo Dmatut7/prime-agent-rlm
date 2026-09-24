@@ -92,6 +92,32 @@ describe("RefinementOutcomeMessageComponent", () => {
 		expect(expanded).toContain('"path": "prompts/rhyme-response-guidance.md"');
 	});
 
+	test("says a partly failed memory update in Chinese and in the error colour, not the routine faint one", () => {
+		const partial = result();
+		partial.appliedEdits = [
+			...partial.appliedEdits,
+			{ ...partial.appliedEdits[0]!, id: "second", applied: false, error: "disk full" },
+		];
+		const failed = new RefinementOutcomeMessageComponent(createRefinementOutcomeMessage(partial));
+		const failedRow = failed.render(120).find((line) => stripAnsi(line).trim()) ?? "";
+		expect(stripAnsi(failedRow)).toContain("✦ 记忆更新部分失败");
+		const ok = new RefinementOutcomeMessageComponent(createRefinementOutcomeMessage(result()));
+		const okRow = ok.render(120).find((line) => stripAnsi(line).trim()) ?? "";
+		const colour = (row: string) => /\x1b\[38;[0-9;]*m/.exec(row)?.[0];
+		expect(colour(failedRow)).toBeDefined();
+		expect(colour(failedRow)).not.toBe(colour(okRow));
+
+		// Block navigation can focus the notice, copy its text, and open it with Enter.
+		failed.setBlockFocus({ reveal: false, toggleLabel: "展开" });
+		expect(stripAnsi(failed.render(160).join("\n"))).toContain("Enter 展开");
+		failed.setBlockFocus(undefined);
+		expect(failed.getBlockCopyText()).toContain("✦ 记忆更新部分失败");
+		expect(failed.isBlockExpanded()).toBe(false);
+		failed.setExpanded(true);
+		expect(failed.isBlockExpanded()).toBe(true);
+		expect(failed.getBlockCopyText()).toContain("disk full");
+	});
+
 	test("truncates the collapsed notice so the line never wraps", () => {
 		const long = result();
 		const title =

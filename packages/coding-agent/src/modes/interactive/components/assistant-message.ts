@@ -54,6 +54,11 @@ function getThinkingMarkdownTheme(baseTheme: MarkdownTheme): MarkdownTheme {
 	};
 }
 
+/** An abort reason that only says the user interrupted: shown as a calm `已中断`. */
+function isPlainInterrupt(reason: string): boolean {
+	return reason === "Request was aborted" || reason === "Operation aborted" || reason.startsWith("已中断");
+}
+
 function formatInlineLoginRecoveryMessage(message: string): string | undefined {
 	const normalized = normalizeErrorDetails(message);
 	if (!normalized.endsWith(LOGIN_RECOVERY_SUFFIX)) {
@@ -185,12 +190,25 @@ export class AssistantMessageComponent extends Container implements FocusableBlo
 		this.blockFocus = state;
 	}
 
-	/** The answer's own Markdown source (text blocks only). */
+	/** The answer's own Markdown source (text blocks), then the error it ended on, as shown. */
 	getBlockCopyText(): string {
-		return (this.lastMessage?.content ?? [])
+		const message = this.lastMessage;
+		const parts = (message?.content ?? [])
 			.map((block) => (block?.type === "text" ? block.text.trim() : ""))
-			.filter((text) => text.length > 0)
-			.join("\n\n");
+			.filter((text) => text.length > 0);
+		const error = message?.errorMessage?.trim();
+		const hasToolCalls = (message?.content ?? []).some((block) => block?.type === "toolCall");
+		if (message?.stopReason === "error" && !hasToolCalls) {
+			parts.push(`Error: ${error || "Unknown error"}`);
+		} else if (message?.stopReason === "aborted" && error && !isPlainInterrupt(error)) {
+			parts.push(error);
+		}
+		return parts.join("\n\n");
+	}
+
+	/** Whether the message carries a thinking trace the Thinking lane can open. */
+	hasThinkingTrace(): boolean {
+		return (this.lastMessage?.content ?? []).some((block) => block?.type === "thinking" && block.thinking.trim());
 	}
 
 	private renderMessage(width: number): string[] {
@@ -398,11 +416,7 @@ export class AssistantMessageComponent extends Container implements FocusableBlo
 		const bodyAboveError = this.contentContainer.children.length > (hasVisibleContent ? 1 : 0);
 		if (message.stopReason === "aborted") {
 			const reason = message.errorMessage;
-			const plainInterrupt =
-				!reason ||
-				reason === "Request was aborted" ||
-				reason === "Operation aborted" ||
-				reason.startsWith("已中断");
+			const plainInterrupt = !reason || isPlainInterrupt(reason);
 			if (bodyAboveError) this.contentContainer.addChild(new Spacer(1));
 			// A plain interrupt is the user's own action: say so calmly.
 			this.contentContainer.addChild(

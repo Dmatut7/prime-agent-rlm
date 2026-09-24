@@ -1324,6 +1324,38 @@ describe("FullscreenViewport reveal marker", () => {
 		assert.ok(!viewport.isFollowing());
 	});
 
+	it("reveals once per request, so a manual scroll afterwards is not pulled back", () => {
+		const viewport = new FullscreenViewport();
+		const transcript = Array.from({ length: 60 }, (_, index) => `row ${index}`);
+		transcript[5] = `${marker}row 5`;
+		viewport.composeFrame(transcript, ["dock"], 11);
+		viewport.setRevealMarker(marker);
+		viewport.composeFrame(transcript, ["dock"], 11);
+		assert.strictEqual(viewport.scrollInfo().linesAbove, 3);
+		// A long focused block read further down with the page keys.
+		viewport.scrollBy(viewport.pageSize());
+		const paged = viewport.composeFrame(transcript, ["dock"], 11);
+		assert.strictEqual(viewport.scrollInfo().linesAbove, 12);
+		assert.ok(paged.some((line) => line === "row 12"));
+		assert.ok(!paged.some((line) => line.includes(marker)));
+		// The next move asks again and the row comes back into view.
+		viewport.setRevealMarker(marker);
+		viewport.composeFrame(transcript, ["dock"], 11);
+		assert.strictEqual(viewport.scrollInfo().linesAbove, 3);
+		assert.strictEqual(viewport.scrollInfo().windowHeight, 10);
+	});
+
+	it("keeps a reveal armed until a frame carries the marked row", () => {
+		const viewport = new FullscreenViewport();
+		const transcript = Array.from({ length: 40 }, (_, index) => `row ${index}`);
+		viewport.setRevealMarker(marker);
+		viewport.composeFrame(transcript, ["dock"], 11);
+		assert.ok(viewport.isFollowing());
+		transcript[4] = `${marker}row 4`;
+		viewport.composeFrame(transcript, ["dock"], 11);
+		assert.strictEqual(viewport.scrollInfo().linesAbove, 2);
+	});
+
 	it("leaves the window alone when the marked row is already visible", () => {
 		const viewport = new FullscreenViewport();
 		const transcript = Array.from({ length: 40 }, (_, index) => `row ${index}`);

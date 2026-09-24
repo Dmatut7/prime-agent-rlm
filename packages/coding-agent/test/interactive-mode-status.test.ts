@@ -385,7 +385,8 @@ describe("InteractiveMode.renderSessionContext", () => {
 			.join("\n")
 			.replace(/\u001b\[[0-9;]*m/g, "");
 		// Still running: the header says working and the running card counts the step.
-		expect(line).toMatch(/^◆ prime .* working /);
+		// Column 1: the header keeps the one-column margin every chat row keeps.
+		expect(line).toMatch(/^ ◆ prime .* working /);
 		expect(line).toContain("step 1");
 	});
 
@@ -1590,6 +1591,13 @@ describe("InteractiveMode pending bash components", () => {
 				(
 					InteractiveMode.prototype as unknown as { disposeTransientStatusOverlays(this: unknown): void }
 				).disposeTransientStatusOverlays.call(this);
+			},
+			// No block navigation is running, so the real reset of it is a no-op here.
+			blockNavigation: undefined,
+			resetBlockNavigation(this: unknown): void {
+				(
+					InteractiveMode.prototype as unknown as { resetBlockNavigation(this: unknown): void }
+				).resetBlockNavigation.call(this);
 			},
 		} as unknown as InteractiveMode;
 

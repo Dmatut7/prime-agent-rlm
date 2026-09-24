@@ -24,6 +24,8 @@ export interface ScrollInfo {
 	following: boolean;
 	linesBelow: number;
 	linesAbove: number;
+	/** Transcript rows the window shows. */
+	windowHeight: number;
 }
 
 export type SelectionScrollDirection = -1 | 1;
@@ -102,8 +104,10 @@ type SelectionMode = "transcript" | "table" | "frame";
 export class FullscreenViewport {
 	private scrollTop = 0;
 	private following = true;
-	/** A zero-width marker whose row the next frame scrolls into view, then strips. */
+	/** A zero-width marker every frame strips; its row is scrolled into view once per request. */
 	private revealMarker: string | undefined;
+	/** Set by {@link setRevealMarker}; cleared once a frame has placed the marked row. */
+	private revealPending = false;
 	private prevFrame: string[] = [];
 	private prevWidth = 0;
 	private prevHeight = 0;
@@ -164,10 +168,15 @@ export class FullscreenViewport {
 		const marker = this.revealMarker;
 		if (marker) {
 			const row = transcript.findIndex((line) => line.includes(marker));
-			if (row !== -1 && (row < this.scrollTop || row >= this.scrollTop + windowHeight)) {
-				// Leave a little context above the revealed row.
-				this.scrollTop = Math.max(0, Math.min(row - 2, maxScroll));
-				this.following = this.scrollTop >= maxScroll;
+			// One scroll per request: afterwards wheel and page keys move the window
+			// freely instead of being pulled back to the marked row every frame.
+			if (row !== -1 && this.revealPending) {
+				this.revealPending = false;
+				if (row < this.scrollTop || row >= this.scrollTop + windowHeight) {
+					// Leave a little context above the revealed row.
+					this.scrollTop = Math.max(0, Math.min(row - 2, maxScroll));
+					this.following = this.scrollTop >= maxScroll;
+				}
 			}
 			transcript = transcript.map((line) => (line.includes(marker) ? line.split(marker).join("") : line));
 		}
@@ -832,9 +841,14 @@ export class FullscreenViewport {
 		this.prevFrame = [];
 	}
 
-	/** Keep the transcript row carrying `marker` in view (until cleared with undefined). */
+	/**
+	 * Scroll the transcript row carrying `marker` into view on the next frame
+	 * that has it; the marker stays stripped from every frame until cleared
+	 * with undefined. Call again to reveal the row once more.
+	 */
 	setRevealMarker(marker: string | undefined): void {
 		this.revealMarker = marker;
+		this.revealPending = marker !== undefined;
 	}
 
 	/** Scrolling up pauses following; reaching the bottom resumes it. */
@@ -876,6 +890,7 @@ export class FullscreenViewport {
 			following: this.following,
 			linesBelow: Math.max(0, this.lastMaxScroll - this.scrollTop),
 			linesAbove: this.scrollTop,
+			windowHeight: this.lastWindowHeight,
 		};
 	}
 }

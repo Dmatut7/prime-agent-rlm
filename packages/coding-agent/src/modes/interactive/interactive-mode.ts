@@ -209,7 +209,11 @@ import { BashExecutionComponent } from "./components/bash-execution.js";
 import {
 	BLOCK_REVEAL_MARKER,
 	BlockNavigator,
+	blockNavigationKeysText,
+	componentRowOffset,
 	type FocusableBlock,
+	FocusableTextBlock,
+	isExpandableBlock,
 	isFocusableBlock,
 	isVisibleRow,
 } from "./components/block-focus.js";
@@ -1215,7 +1219,14 @@ export class InteractiveMode {
 	private loadingAnimation: Loader | undefined = undefined;
 	private workingMessage: string | undefined = undefined;
 	/** Block navigation (Alt+Up): the invisible focus owner and the focused block. */
-	private blockNavigation: { navigator: BlockNavigator; focused: FocusableBlock & Component } | undefined;
+	private blockNavigation:
+		| {
+				navigator: BlockNavigator;
+				focused: FocusableBlock & Component;
+				/** Following the tail when navigation began: leaving it follows again. */
+				resumeFollow: boolean;
+		  }
+		| undefined;
 	private recentSession: RecentSession | undefined;
 	/** When the current agent run started (agent_start), the floor for its turn clock. */
 	private agentRunStartedAt: number | undefined;
@@ -3462,6 +3473,7 @@ export class InteractiveMode {
 
 	private resetCurrentSessionRenderState(options?: { clearPromptStash?: boolean }): void {
 		this.endFeatureHintRun();
+		this.resetBlockNavigation();
 		this.chatContainer.clear();
 		this.shortcutGuideContainer.clear();
 		this.pendingMessagesContainer.clear();
@@ -3642,7 +3654,7 @@ export class InteractiveMode {
 		}
 		const state = new TurnActivityState(this.workingStartedAt ?? Date.now());
 		state.live = true;
-		const summary = new TurnSummaryComponent(state);
+		const summary = this.createTurnSummary(state);
 		summary.setExpanded(this.toolOutputExpanded);
 		// TUI v4: the live turn head renders the one-line footnote in quiet mode.
 		summary.setQuiet(this.settingsManager.getProcessMode() === "quiet");
@@ -5348,6 +5360,7 @@ export class InteractiveMode {
 
 	private async renderTreeNavigation(result: { editorText?: string }): Promise<void> {
 		this.clearSideQuestion({ abort: true });
+		this.resetBlockNavigation();
 		this.chatContainer.clear();
 		await this.renderInitialMessages();
 		if (result.editorText && !this.editor.getText().trim()) {
@@ -7829,6 +7842,7 @@ export class InteractiveMode {
 		await this.preloadToolDefinitions(toolNames);
 
 		if (options.clearChat) {
+			this.resetBlockNavigation();
 			this.chatContainer.clear();
 		}
 
@@ -7874,7 +7888,7 @@ export class InteractiveMode {
 				// first assistant component, and counts this message's thinking.
 				if (!replayTurnState) {
 					replayTurnState = new TurnActivityState(Number(message.timestamp) || Date.now());
-					replayTurnSummary = new TurnSummaryComponent(replayTurnState);
+					replayTurnSummary = this.createTurnSummary(replayTurnState);
 					replayTurnSummary.setExpanded(this.toolOutputExpanded);
 					// TUI v4: quiet turns carry the one-line footnote at their head.
 					replayTurnSummary.setQuiet(replayQuiet);
@@ -8189,6 +8203,15 @@ export class InteractiveMode {
 			this.clearSideQuestion({ abort: true });
 			return;
 		}
+		// Editing a queued message: Esc backs out of the edit (the draft comes
+		// back, the message stays queued as it was) instead of interrupting the
+		// turn, which would send the queue unedited.
+		if (this.queueSelection?.isBrowsing && !this.pendingQueueEdit) {
+			this.clearEscapeRepeat();
+			this.setEditorTextFromQueueSelection(this.queueSelection.reset());
+			this.ui.requestRender();
+			return;
+		}
 		const action = this.takeEscapeRepeatAction();
 		if (action === "tree") {
 			void this.showTreeSelector();
@@ -8300,9 +8323,7 @@ export class InteractiveMode {
 				.abortAndSendQueued()
 				.then((result) => {
 					if (result.degraded !== undefined) {
-						this.showWarning(
-							"The daemon is running an older build without abort_and_send_queued: interrupted, and the queued messages stay queued until the next submit.",
-						);
+						this.showWarning("后台服务版本较旧：已中断，但排队消息没有跟着发出，会在你下次发送时一起发出。");
 					}
 				})
 				.catch((error) => {
@@ -8781,34 +8802,74 @@ export class InteractiveMode {
 		);
 	}
 
-	/** Enter block navigation on the newest block (Alt+Up from the prompt). */
+	/**
+	 * Enter block navigation (Alt+Up from the prompt) on the newest block in
+	 * view: the bottom block while following, otherwise the lowest block whose
+	 * top row is on screen, so a scrolled-up fullscreen view stays put.
+	 */
 	private startBlockNavigation(direction: -1 | 1): void {
 		if (this.blockNavigation) {
 			this.moveBlockFocus(direction);
 			return;
 		}
 		const blocks = this.navigableBlocks();
-		const last = blocks.at(-1);
-		if (!last) return;
+		const start = this.blockNearestView(blocks);
+		if (!start) return;
+		const navigator: BlockNavigator = new BlockNavigator({
+			move: (step) => this.moveBlockFocus(step),
+			toggle: () => this.toggleFocusedBlock(),
+			copy: () => void this.copyFocusedBlock(),
+			exit: (passThrough) => this.exitBlockNavigation(passThrough),
+			blur: () => this.endBlockNavigation(navigator),
+		});
 		this.blockNavigation = {
-			navigator: new BlockNavigator({
-				move: (step) => this.moveBlockFocus(step),
-				toggle: () => this.toggleFocusedBlock(),
-				copy: () => void this.copyFocusedBlock(),
-				exit: (passThrough) => this.exitBlockNavigation(passThrough),
-			}),
-			focused: last,
+			navigator,
+			focused: start,
+			resumeFollow: this.ui.isFullscreen() && !this.ui.isFullscreenReviewing(),
 		};
 		this.applyBlockFocus();
-		this.ui.setFocus(this.blockNavigation.navigator);
+		this.ui.setFocus(navigator);
 		this.ui.setFullscreenRevealMarker(BLOCK_REVEAL_MARKER);
 		this.ui.requestRender();
 	}
 
+	private blockNearestView(blocks: readonly (FocusableBlock & Component)[]): (FocusableBlock & Component) | undefined {
+		const last = blocks.at(-1);
+		const scroll = this.ui.isFullscreenReviewing() ? this.ui.getScrollInfo() : null;
+		if (!scroll) return last;
+		const width = Math.max(1, this.ui.terminal.columns);
+		const chatTop = componentRowOffset(this.getFullscreenScrollComponents(), this.chatContainer, width);
+		if (chatTop === undefined) return last;
+		const viewTop = scroll.linesAbove;
+		// While reviewing, the window's bottom row carries the "back to bottom" hint.
+		const viewBottom = viewTop + Math.max(1, scroll.windowHeight - 1);
+		let row = chatTop;
+		let covering: (FocusableBlock & Component) | undefined;
+		let inView: (FocusableBlock & Component) | undefined;
+		for (const child of this.chatContainer.children) {
+			const lines = child.render(width);
+			if (blocks.includes(child as FocusableBlock & Component)) {
+				const block = child as FocusableBlock & Component;
+				const top = row + Math.max(0, lines.findIndex(isVisibleRow));
+				if (top >= viewTop && top < viewBottom) inView = block;
+				else if (top < viewTop && row + lines.length > viewTop) covering = block;
+			}
+			row += lines.length;
+			if (row >= viewBottom && inView) break;
+		}
+		return inView ?? covering ?? last;
+	}
+
 	private applyBlockFocus(): void {
-		const focused = this.blockNavigation?.focused;
+		const navigation = this.blockNavigation;
+		const focused = navigation?.focused;
 		for (const block of this.navigableBlocks()) {
-			block.setBlockFocus(block === focused ? { reveal: this.ui.isFullscreen() } : undefined);
+			if (block !== focused) {
+				block.setBlockFocus(undefined);
+				continue;
+			}
+			const toggleLabel = this.focusedBlockToggle(block)?.label;
+			block.setBlockFocus({ reveal: this.ui.isFullscreen(), ...(toggleLabel ? { toggleLabel } : {}) });
 		}
 	}
 
@@ -8821,6 +8882,8 @@ export class InteractiveMode {
 		if (!next) return;
 		navigation.focused = next;
 		this.applyBlockFocus();
+		// One scroll per move: between moves the wheel and page keys read freely.
+		this.ui.setFullscreenRevealMarker(BLOCK_REVEAL_MARKER);
 		this.ui.requestRender();
 	}
 
@@ -8836,19 +8899,48 @@ export class InteractiveMode {
 		return undefined;
 	}
 
-	/** Enter/Space: a process line or step opens its turn's steps; an answer opens its Thinking. */
+	/**
+	 * What Enter does to a block, or undefined where it does nothing: a process
+	 * line or step runs the turn's Ctrl+O cycle, an answer with a trace flips its
+	 * Thinking, a notice card opens or closes itself. The same paths as the
+	 * keys, so the Esc close order and quiet mode's three-step cycle hold.
+	 */
+	private focusedBlockToggle(block: FocusableBlock & Component): { label: string; run: () => void } | undefined {
+		if (block instanceof UserMessageComponent) return undefined;
+		if (isExpandableBlock(block)) {
+			const expanded = block.isBlockExpanded();
+			return {
+				label: expanded ? "收起" : "展开",
+				run: () => {
+					block.setExpanded(!expanded);
+					this.requestExpansionRender();
+				},
+			};
+		}
+		const summary = this.turnSummaryFor(block);
+		if (!summary) return undefined;
+		if (block instanceof AssistantMessageComponent) {
+			if (this.hideThinkingBlock || !block.hasThinkingTrace()) return undefined;
+			return {
+				label: summary.state.thinkingExpanded ? "收起 Thinking" : "展开 Thinking",
+				run: () => this.toggleTurnThinking(summary),
+			};
+		}
+		if (summary.state.stepCount === 0) return undefined;
+		const state = summary.state;
+		const label = state.isCollapsed ? "展开" : state.processKeyStepsView ? "展开全部" : "收起";
+		return { label, run: () => this.cycleTurnProcess(summary) };
+	}
+
+	/** Enter/Space on the focused block. */
 	private toggleFocusedBlock(): void {
 		const focused = this.blockNavigation?.focused;
 		if (!focused) return;
-		const summary = this.turnSummaryFor(focused);
-		if (!summary) return;
-		if (focused instanceof AssistantMessageComponent) {
-			summary.state.thinkingExpanded = !summary.state.thinkingExpanded;
-		} else {
-			summary.setExpanded(summary.state.isCollapsed);
-		}
-		this.applyTurnExpansion(summary);
+		const toggle = this.focusedBlockToggle(focused);
+		if (!toggle) return;
+		toggle.run();
 		this.applyBlockFocus();
+		this.ui.requestRender();
 	}
 
 	private async copyFocusedBlock(): Promise<void> {
@@ -8865,13 +8957,37 @@ export class InteractiveMode {
 		}
 	}
 
-	private exitBlockNavigation(passThrough?: string): void {
-		if (!this.blockNavigation) return;
+	/**
+	 * Tear block navigation down without touching focus: the highlight, the
+	 * reveal marker, and - when the owner was following the tail when it began
+	 * - back to following the output.
+	 */
+	private endBlockNavigation(navigator?: BlockNavigator): void {
+		const navigation = this.blockNavigation;
+		if (!navigation || (navigator && navigation.navigator !== navigator)) return;
 		this.blockNavigation = undefined;
+		navigation.navigator.deactivate();
+		navigation.focused.setBlockFocus(undefined);
 		this.applyBlockFocus();
 		this.ui.setFullscreenRevealMarker(undefined);
+		if (navigation.resumeFollow) this.ui.scrollToBottom();
+		this.ui.requestRender();
+	}
+
+	private exitBlockNavigation(passThrough?: string): void {
+		this.endBlockNavigation();
 		this.focusEditor();
 		if (passThrough !== undefined) this.editor.handleInput(passThrough);
+		this.ui.requestRender();
+	}
+
+	/** The chat is being replaced (/new, /resume, a tree jump, reattach): its blocks are gone. */
+	private resetBlockNavigation(): void {
+		const navigation = this.blockNavigation;
+		if (!navigation) return;
+		const hadFocus = navigation.navigator.focused;
+		this.endBlockNavigation();
+		if (hadFocus) this.focusEditor();
 	}
 
 	private browseQueueSelection(direction: -1 | 1): void {
@@ -9063,16 +9179,24 @@ export class InteractiveMode {
 	private getQueueSelectionHeader(): string | undefined {
 		const selected = this.queueSelection.selected;
 		if (!selected) return undefined;
-		const lane = selected.lane === "steering" ? "steering" : "follow-up";
+		const lane = selected.lane === "steering" ? "插话" : "稍后发送";
 		const older = this.getAppKeyDisplay("app.message.navigateOlder");
 		const newer = this.getAppKeyDisplay("app.message.navigateNewer");
 		const earlier = this.getAppKeyDisplay("app.message.moveEarlier");
 		const later = this.getAppKeyDisplay("app.message.moveLater");
 		const queue = this.getAppKeyDisplay("app.message.followUp");
-		return theme.fg(
-			"dim",
-			`${lane} ${selected.index + 1} · ${older}/${newer} browse · ${earlier}/${later} reorder · enter steers · ${queue} queues · empty deletes`,
-		);
+		const submit = this.getEditorKeyDisplay("tui.input.submit");
+		const cancel = this.getAppKeyDisplay("app.input.clear");
+		const parts = [
+			`正在改排队消息（${lane} 第 ${selected.index + 1} 条）`,
+			older && newer ? `${older}/${newer} 切换` : "",
+			earlier && later ? `${earlier}/${later} 调顺序` : "",
+			submit ? `${submit} 改后插话` : "",
+			queue ? `${queue} 改后稍后发送` : "",
+			"清空后发送即删除",
+			cancel ? `${cancel} 不改了` : "",
+		];
+		return theme.fg("dim", parts.filter((part) => part.length > 0).join(" · "));
 	}
 
 	private updateEditorBorderColor(): void {
@@ -9097,18 +9221,23 @@ export class InteractiveMode {
 		return [this.trayInfoLine, this.editorContainer, this.footerSlot, this.subagentSummaryLine];
 	}
 
+	/** What the fullscreen transcript window scrolls over, top to bottom. */
+	private getFullscreenScrollComponents(): Component[] {
+		return [
+			this.headerContainer,
+			this.mainViewContainer,
+			this.widgetContainerAbove,
+			...this.getPromptContextContainers(),
+			this.widgetContainerBelow,
+		];
+	}
+
 	/** Enter or leave fullscreen rendering without touching the persisted setting. */
 	private applyFullscreen(enabled: boolean): void {
 		if (enabled) {
 			if (!process.stdout.isTTY) return;
 			this.ui.enterFullscreen({
-				scroll: [
-					this.headerContainer,
-					this.mainViewContainer,
-					this.widgetContainerAbove,
-					...this.getPromptContextContainers(),
-					this.widgetContainerBelow,
-				],
+				scroll: this.getFullscreenScrollComponents(),
 				dock: this.promptDock,
 				pin: this.topBar,
 				mouse: this.settingsManager.getFullscreenMouse(),
@@ -9332,34 +9461,84 @@ export class InteractiveMode {
 		if (!global) {
 			const summary = this.latestTurnSummary();
 			if (summary) {
-				if (this.settingsManager.getProcessMode() === "quiet") {
-					// TUI v4 T6: a three-state cycle - closed → key steps (first
-					// 3 + ⋯ + last 3 while >8 steps) → all steps → closed.
-					// Legacy keeps the binary toggle.
-					if (summary.state.isCollapsed) {
-						// The key-steps fold only applies to a turn already long when
-						// opened; a turn that grows past the threshold while open stays
-						// fully open instead of folding under the reader.
-						summary.state.setProcessKeySteps(summary.state.stepCount > PROCESS_FOLD_THRESHOLD);
-						summary.setExpanded(true);
-						this.recordProcessBlockOpen(summary, "process");
-					} else if (summary.state.processKeyStepsView) {
-						summary.state.setProcessKeySteps(false);
-					} else {
-						summary.setExpanded(false);
-						this.forgetProcessBlock(summary, "process");
-					}
-				} else {
-					const next = summary.state.isCollapsed;
-					summary.setExpanded(next);
-				}
-				this.applyTurnExpansion(summary);
+				this.cycleTurnProcess(summary);
 				return;
 			}
 		}
 		this.editDiffsExpanded = !this.toolOutputExpanded;
 		this.syncAllTurnLanes(!this.toolOutputExpanded, "tools");
 		this.setToolsExpanded(!this.toolOutputExpanded);
+	}
+
+	/** One Ctrl+O press on one turn's process block (also Enter on a focused process line). */
+	private cycleTurnProcess(summary: TurnSummaryComponent): void {
+		if (this.settingsManager.getProcessMode() === "quiet") {
+			// TUI v4 T6: a three-state cycle - closed → key steps (first
+			// 3 + ⋯ + last 3 while >8 steps) → all steps → closed.
+			// Legacy keeps the binary toggle.
+			if (summary.state.isCollapsed) {
+				// The key-steps fold only applies to a turn already long when
+				// opened; a turn that grows past the threshold while open stays
+				// fully open instead of folding under the reader.
+				summary.state.setProcessKeySteps(summary.state.stepCount > PROCESS_FOLD_THRESHOLD);
+				summary.setExpanded(true);
+				this.recordProcessBlockOpen(summary, "process");
+			} else if (summary.state.processKeyStepsView) {
+				summary.state.setProcessKeySteps(false);
+			} else {
+				summary.setExpanded(false);
+				this.forgetProcessBlock(summary, "process");
+			}
+		} else {
+			const next = summary.state.isCollapsed;
+			summary.setExpanded(next);
+		}
+		this.applyTurnExpansion(summary);
+	}
+
+	/** One Ctrl+T press on one turn's traces (also Enter on a focused answer). */
+	private toggleTurnThinking(summary: TurnSummaryComponent): void {
+		const next = !summary.state.thinkingExpanded;
+		summary.state.thinkingExpanded = next;
+		// T8: the open order records which block opened last.
+		if (next) {
+			this.recordProcessBlockOpen(summary, "thinking");
+		} else {
+			this.forgetProcessBlock(summary, "thinking");
+		}
+		// The opened or folded trace is the feedback; a status row per
+		// press would pile up in the chat.
+		this.applyTurnExpansion(summary);
+	}
+
+	/**
+	 * A click on a turn's `◆ prime` header or footnote changed its lanes: record
+	 * them in the Esc close order and push them onto the turn's rows, exactly as
+	 * the keys would.
+	 */
+	private handleTurnLanesClicked(summary: TurnSummaryComponent): void {
+		const state = summary.state;
+		const lanes = [
+			["thinking", state.thinkingBlockExpanded],
+			["process", state.processBlockExpanded],
+			["comms", state.commsBlockExpanded],
+		] as const;
+		for (const [lane, open] of lanes) {
+			const recorded = (this.processBlockOpenOrder ?? []).some(
+				(entry) => entry.summary === summary && entry.lane === lane,
+			);
+			if (open && !recorded) this.recordProcessBlockOpen(summary, lane);
+			if (!open && recorded) this.forgetProcessBlock(summary, lane);
+		}
+		this.applyTurnExpansion(summary);
+		if (this.blockNavigation) this.applyBlockFocus();
+	}
+
+	/** A new turn head, wired so its own clicks apply like the keys. */
+	private createTurnSummary(state: TurnActivityState): TurnSummaryComponent {
+		const summary = new TurnSummaryComponent(state);
+		summary.setOnLanesChange(() => this.handleTurnLanesClicked(summary));
+		return summary;
 	}
 
 	/**
@@ -9483,17 +9662,7 @@ export class InteractiveMode {
 		if (!global) {
 			const summary = this.latestTurnSummary();
 			if (summary) {
-				const next = !summary.state.thinkingExpanded;
-				summary.state.thinkingExpanded = next;
-				// T8: the open order records which block opened last.
-				if (next) {
-					this.recordProcessBlockOpen(summary, "thinking");
-				} else {
-					this.forgetProcessBlock(summary, "thinking");
-				}
-				// The opened or folded trace is the feedback; a status row per
-				// press would pile up in the chat.
-				this.applyTurnExpansion(summary);
+				this.toggleTurnThinking(summary);
 				return;
 			}
 		}
@@ -9562,7 +9731,9 @@ export class InteractiveMode {
 	showError(errorMessage: string): void {
 		// One blank line between chat blocks; the first block follows the header's own spacing.
 		if (this.chatContainer.children.length > 0) this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(theme.fg("error", `出错：${errorMessage}`), 1, 0));
+		this.chatContainer.addChild(
+			new FocusableTextBlock(theme.fg("error", `出错：${errorMessage}`), `出错：${errorMessage}`),
+		);
 		this.ui.requestRender();
 	}
 
@@ -9608,7 +9779,9 @@ export class InteractiveMode {
 
 	showWarning(warningMessage: string): void {
 		if (this.chatContainer.children.length > 0) this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(theme.fg("warning", `⚠ ${warningMessage}`), 1, 0));
+		this.chatContainer.addChild(
+			new FocusableTextBlock(theme.fg("warning", `⚠ ${warningMessage}`), `⚠ ${warningMessage}`),
+		);
 		this.ui.requestRender();
 	}
 
@@ -9663,7 +9836,8 @@ export class InteractiveMode {
 			}
 			const dequeueHint = this.getAppKeyDisplay("app.message.navigateOlder");
 			// While idle the queue is parked (an interrupt suspended it); tell the user Enter sends it.
-			const sendHint = this.isAgentStreaming() ? "" : "Enter 发送 · ";
+			const submitKey = keyText("tui.input.submit");
+			const sendHint = this.isAgentStreaming() || !submitKey ? "" : `${submitKey} 发送 · `;
 			const hintText = theme.fg("dim", `╰─ ${sendHint}${dequeueHint} 查看或修改排队消息`);
 			this.queuedMessagesContainer.addChild(new TruncatedText(hintText, 1, 0));
 		}
@@ -9714,9 +9888,7 @@ export class InteractiveMode {
 		mutate();
 		void this.settingsManager.persistenceFailure().then((reason) => {
 			if (reason) {
-				this.showError(
-					`Setting not saved: ${reason} It applies to this session only and is lost when the session ends.`,
-				);
+				this.showError(`设置没有保存：${reason} 这次改动只在本次会话里有效，会话结束就恢复原样。`);
 			}
 		});
 	}
@@ -12233,7 +12405,7 @@ export class InteractiveMode {
 \`${selectModel}\` 选模型 · \`/effort\` 调推理强度 · \`${expandTools}\` 过程${expandToolsFull ? ` · \`${expandToolsFull}\` 看全文` : ""}
 \`${expandMessages}\` 代理消息 · \`${expandEdits}\` 改动详情 · \`${toggleThinking}\` Thinking · \`${promptStash}\` 暂存输入 · \`${externalEditor}\` 用 \`$EDITOR\` 编辑
 \`${pasteImage}\` 粘贴图片
-${blocksPrev ? `\`${blocksPrev}\`${blocksNext ? ` / \`${blocksNext}\`` : ""} 逐块浏览对话（Enter 展开 · y 复制 · Esc 返回）` : ""}
+${blocksPrev ? `\`${blocksPrev}\`${blocksNext ? ` / \`${blocksNext}\`` : ""} 逐块浏览对话（${blockNavigationKeysText()}）` : ""}
 
 **帮助**
 ${shortcutsKey ? `\`${shortcutsKey}\` 快捷键（再按一次关闭） · ` : ""}\`/hotkeys\` 完整列表
@@ -12332,7 +12504,7 @@ ${expandToolsFull ? `| \`${expandToolsFull}\` | 看全文（不限行数） |\n`
 | \`${promptStash}\` | 暂存 / 恢复草稿 |
 | \`${followUp}\` | 排一条稍后发送的消息 |
 | \`${browseQueue}\` | 查看或修改排队消息 |
-${blocksPrev ? `| \`${blocksPrev}\`${blocksNext ? ` / \`${blocksNext}\`` : ""} | 逐块浏览对话（没有排队消息时；Enter 展开 · y 复制 · Esc 返回） |\n` : ""}
+${blocksPrev ? `| \`${blocksPrev}\`${blocksNext ? ` / \`${blocksNext}\`` : ""} | 逐块浏览对话（没有排队消息时；${blockNavigationKeysText()}） |\n` : ""}
 | \`${reorderQueue}\` | 调整排队消息顺序 |
 | \`${pasteImage}\` | 从剪贴板粘贴图片 |
 | \`/\` | 命令 |

@@ -127,11 +127,16 @@ export function renderRunningCard(state: TurnActivityState, width: number, tick:
 	const action = currentRunningAction(state, now);
 	const warn = action.quietMs >= RUNNING_CARD_QUIET_MS;
 	const spinner = theme.bold(theme.fg(warn ? "runCardWarn" : "runCardBar", spinnerFrame(tick, warn)));
-	let first = ` ${spinner} ${theme.bold(action.text)}${theme.fg("dim", ` · ${turnRunningClockText(action.elapsedMs)}`)}`;
+	const clock = theme.fg("dim", ` · ${turnRunningClockText(action.elapsedMs)}`);
+	let first: string;
 	if (warn) {
-		first += `${theme.fg("dim", " · ")}${theme.bold(theme.fg("runCardWarn", quietMinutesText(action.quietMs)))}`;
-	} else if (action.detail) {
-		first += `   ${theme.italic(theme.fg("muted", action.detail))}`;
+		// The warning leads: a long step label truncates at the row's end, and
+		// the one fact a quiet card exists to say must never be what gets cut.
+		const quiet = theme.bold(theme.fg("runCardWarn", quietMinutesText(action.quietMs)));
+		first = ` ${spinner} ${quiet}${theme.fg("dim", " · ")}${theme.bold(action.text)}${clock}`;
+	} else {
+		first = ` ${spinner} ${theme.bold(action.text)}${clock}`;
+		if (action.detail) first += `   ${theme.italic(theme.fg("muted", action.detail))}`;
 	}
 	const rows = [cardRow(first, width, warn)];
 	const settled = state.steps.filter((step) => step.status === "done" || step.status === "error");
@@ -145,27 +150,35 @@ export function renderRunningCard(state: TurnActivityState, width: number, tick:
 	if (state.stepCount > 0) rows.push(cardRow(`   ${theme.fg("muted", tally)}`, width, warn));
 	const recent = collapseRepeats(dedupeSteps(state.steps)).slice(-RECENT_STEPS);
 	if (recent.length > 0) {
-		const cells = recent.map(({ step, count }) => {
+		const cells = recent.map(({ step, count, failed }) => {
 			const label = truncateToWidth(`${turnStepLabel(step)}${count > 1 ? ` ×${count}` : ""}`, 28, "…");
 			const text = step.status === "running" ? theme.fg("runCardBar", label) : theme.fg("dim", label);
-			return `${stepMark(step, tick)} ${text}`;
+			// A fold that hides a failure says so: ✗ once settled, a ✗N tail while the latest still runs.
+			if (failed > 0 && step.status === "done") return `${theme.fg("error", "✗")} ${text}`;
+			const tail = failed > 0 && step.status === "running" ? ` ${theme.fg("error", `✗${failed}`)}` : "";
+			return `${stepMark(step, tick)} ${text}${tail}`;
 		});
 		rows.push(cardRow(`   ${cells.join("   ")}`, width, warn));
 	}
 	return rows;
 }
 
-/** Consecutive steps with the same label read as one (`等待命令结果 ×2`), marked by the latest. */
-function collapseRepeats(steps: readonly TurnStep[]): Array<{ step: TurnStep; count: number }> {
-	const out: Array<{ step: TurnStep; count: number; label: string }> = [];
+/**
+ * Consecutive steps with the same label read as one (`等待命令结果 ×2`), marked
+ * by the latest; `failed` counts the folded steps that ended in an error.
+ */
+function collapseRepeats(steps: readonly TurnStep[]): Array<{ step: TurnStep; count: number; failed: number }> {
+	const out: Array<{ step: TurnStep; count: number; failed: number; label: string }> = [];
 	for (const step of steps) {
 		const label = turnStepLabel(step);
+		const failed = step.status === "error" ? 1 : 0;
 		const last = out.at(-1);
 		if (last && last.label === label) {
 			last.step = step;
 			last.count += 1;
+			last.failed += failed;
 		} else {
-			out.push({ step, count: 1, label });
+			out.push({ step, count: 1, failed, label });
 		}
 	}
 	return out;

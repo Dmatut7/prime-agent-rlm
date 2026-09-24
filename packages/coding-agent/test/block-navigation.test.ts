@@ -21,10 +21,10 @@ beforeAll(() => {
 	setKeybindings(new KeybindingsManager());
 });
 
-function assistant(text: string): AssistantMessageComponent {
+function assistant(text: string, thinking?: string): AssistantMessageComponent {
 	return new AssistantMessageComponent({
 		role: "assistant",
-		content: [{ type: "text", text }],
+		content: [...(thinking ? [{ type: "thinking" as const, thinking }] : []), { type: "text", text }],
 		api: "openai-responses",
 		provider: "openai",
 		model: "m",
@@ -56,15 +56,20 @@ describe("block focus decoration", () => {
 		const plain = decorateFocusedBlock(lines, 60, { reveal: false });
 		expect(plain).toHaveLength(3);
 		expect(strip(plain[1] ?? "")).toContain(blockFocusHint());
+		expect(strip(decorateFocusedBlock(lines, 60, { reveal: false, toggleLabel: "展开" })[1] ?? "")).toContain(
+			"Enter 展开 · Y 复制",
+		);
 		expect(strip(plain[2] ?? "")).not.toContain("复制");
 		expect(plain.join("")).not.toContain(BLOCK_REVEAL_MARKER);
 		const revealed = decorateFocusedBlock(lines, 60, { reveal: true });
 		expect(revealed[1]?.startsWith(BLOCK_REVEAL_MARKER)).toBe(true);
-		expect(blockFocusHint()).toBe("Enter 展开 · Y 复制 · Esc 返回");
+		// Enter is only offered where it does something.
+		expect(blockFocusHint()).toBe("Y 复制 · Esc 返回");
+		expect(blockFocusHint("展开")).toBe("Enter 展开 · Y 复制 · Esc 返回");
 	});
 
 	it("routes navigator keys and hands every other key back to the prompt", () => {
-		const handlers = { move: vi.fn(), toggle: vi.fn(), copy: vi.fn(), exit: vi.fn() };
+		const handlers = { move: vi.fn(), toggle: vi.fn(), copy: vi.fn(), exit: vi.fn(), blur: vi.fn() };
 		const navigator = new BlockNavigator(handlers);
 		navigator.handleInput("\x1b[1;3A");
 		navigator.handleInput("\x1b[1;3B");
@@ -91,6 +96,8 @@ describe("InteractiveMode block navigation", () => {
 			connectionState: { sessionActions: { steering: [], followUps: [] } },
 			queueSelection: { isBrowsing: false },
 			uiServices: { settingsManager: { getProcessMode: () => "quiet" as const } },
+			settingsManager: { getProcessMode: () => "quiet" as const },
+			hideThinkingBlock: false,
 			toolOutputExpanded: false,
 			thinkingExpanded: false,
 			agentMessagesExpanded: false,
@@ -101,6 +108,9 @@ describe("InteractiveMode block navigation", () => {
 				requestRender: vi.fn(),
 				requestRenderPreservingViewport: vi.fn(),
 				isFullscreen: () => false,
+				isFullscreenReviewing: () => false,
+				getScrollInfo: () => null,
+				scrollToBottom: vi.fn(),
 				setFullscreenRevealMarker: vi.fn(),
 			},
 			focusEditor: vi.fn(),
@@ -153,7 +163,7 @@ describe("InteractiveMode block navigation", () => {
 
 	it("toggles an answer's Thinking and copies its markdown source", async () => {
 		const summary = turn();
-		const answer = assistant("**结论**：没问题。");
+		const answer = assistant("**结论**：没问题。", "先核对一遍");
 		const mode = createMode([new UserMessageComponent("查一下"), summary, answer]);
 		mode.startBlockNavigation(-1);
 		mode.toggleFocusedBlock();

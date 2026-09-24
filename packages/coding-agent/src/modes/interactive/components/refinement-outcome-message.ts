@@ -100,9 +100,10 @@ export class RefinementOutcomeMessageComponent extends ExpandableCustomMessageBo
 			const failed = edits.some((edit) => !edit.applied);
 			const hintKey = keyText("app.tools.expand", { primaryOnly: true });
 			const line = new SystemNoticeLine(
-				failed ? "✦ memory update partly failed" : "✦ memory updated",
+				failed ? "✦ 记忆更新部分失败" : "✦ memory updated",
 				memoryNoticeDetail(summary, edits),
 				hintKey ? `${hintKey} diff` : "",
+				failed ? "error" : "notice",
 			);
 			this.addChild(new Clickable(line, toggle));
 			return;

@@ -1,0 +1,1 @@
+- Changed the fullscreen reveal marker to scroll its row into view once per `setRevealMarker` call instead of every frame, and added `windowHeight` to `ScrollInfo`.

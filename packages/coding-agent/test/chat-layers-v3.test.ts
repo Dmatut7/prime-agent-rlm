@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { createRefinementOutcomeMessage, IPYTHON_STATE_RESTORED_CUSTOM_TYPE } from "../src/core/messages.js";
 import type { HarnessEntry, RefinementResult } from "../src/core/refinement/refinement.js";
@@ -20,7 +20,11 @@ import {
 import { turnStepLabel } from "../src/modes/interactive/components/step-label.js";
 import { SystemNoticeLine } from "../src/modes/interactive/components/system-notice.js";
 import { TurnActivityState, TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
-import { UserMessageComponent, userBubbleIndent } from "../src/modes/interactive/components/user-message.js";
+import {
+	sentAtText,
+	UserMessageComponent,
+	userBubbleIndent,
+} from "../src/modes/interactive/components/user-message.js";
 import { initTheme, loadThemeFromPath } from "../src/modes/interactive/theme/theme.js";
 import {
 	getSpinnerTick,
@@ -167,6 +171,40 @@ describe("running card: what the AI is doing right now", () => {
 		const busy = plain(renderRunningCard(state, 100, 0, T0 + RUNNING_CARD_QUIET_MS + 140_000))[0] ?? "";
 		expect(busy).not.toContain("没有新输出");
 	});
+
+	it("keeps the quiet warning on the first row at 80 columns behind a long step label", () => {
+		const state = liveState();
+		const command = "python scripts/benchmarks/run_every_model_against_the_whole_suite.py --rounds 100 --verbose";
+		state.addStep({ toolCallId: "long", toolName: "bash", args: { command }, status: "queued" });
+		state.setStepStatus("long", "running", T0);
+		const first = plain(renderRunningCard(state, 80, 0, T0 + RUNNING_CARD_QUIET_MS + 140_000))[0] ?? "";
+		expect(visibleWidth(first)).toBe(80);
+		expect(first).toContain("3 分钟没有新输出");
+		expect(first.indexOf("没有新输出")).toBeLessThan(first.indexOf("正在运行"));
+	});
+
+	it("shows a failure hidden inside a folded repeat", () => {
+		const state = liveState();
+		const wait = { code: "r = await h\nprint(r.output)" };
+		for (const [id, status] of [
+			["1", "error"],
+			["2", "done"],
+			["3", "done"],
+		] as const) {
+			state.addStep({ toolCallId: id, toolName: "ipython", args: wait, status: "queued" });
+			state.setStepStatus(id, "running", T0 + Number(id) * 1_000);
+			state.setStepStatus(id, status, T0 + Number(id) * 1_000 + 500);
+		}
+		const label = turnStepLabel({ toolName: "ipython", args: wait });
+		const settled = plain(renderRunningCard(state, 100, 3, T0 + 20_000))[2] ?? "";
+		expect(settled).toContain(`✗ ${label} ×3`);
+		expect(settled).not.toContain("✓");
+
+		state.addStep({ toolCallId: "4", toolName: "ipython", args: wait, status: "queued" });
+		state.setStepStatus("4", "running", T0 + 30_000);
+		const running = plain(renderRunningCard(state, 100, 3, T0 + 31_000))[2] ?? "";
+		expect(running).toContain(`${label} ×4 ✗1`);
+	});
 });
 
 describe("the ◆ prime header and the gutter", () => {
@@ -243,7 +281,13 @@ describe("the ◆ prime header and the gutter", () => {
 });
 
 describe("the user bubble", () => {
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
 	it("sits on the one-column margin with a you label and the send time", () => {
+		vi.useFakeTimers({ toFake: ["Date"] });
+		vi.setSystemTime(new Date(2026, 8, 24, 21, 0));
 		const at = new Date(2026, 8, 24, 20, 14).getTime();
 		const lines = new UserMessageComponent("你先看一下这个", undefined, () => false, at).render(120);
 		const text = plain(lines).map((line) => line.replace(/\x1b\][^\x07]*\x07/g, ""));
@@ -253,6 +297,31 @@ describe("the user bubble", () => {
 		// The bubble is tinted from column 1 to the right edge; only the margin column is not.
 		const raw = lines[1]?.replace(/\x1b\][^\x07]*\x07/g, "") ?? "";
 		expect(raw.startsWith(" \x1b[48;")).toBe(true);
+	});
+
+	it("says which day a message is from once it is not today's", () => {
+		const now = new Date(2026, 8, 25, 9, 30).getTime();
+		expect(sentAtText(new Date(2026, 8, 25, 0, 5).getTime(), now)).toBe("00:05");
+		expect(sentAtText(new Date(2026, 8, 24, 23, 59).getTime(), now)).toBe("昨天 23:59");
+		expect(sentAtText(new Date(2026, 8, 24, 0, 0).getTime(), now)).toBe("昨天 00:00");
+		expect(sentAtText(new Date(2026, 8, 23, 20, 14).getTime(), now)).toBe("9月23日 20:14");
+		expect(sentAtText(new Date(2025, 11, 31, 8, 3).getTime(), now)).toBe("2025年12月31日 08:03");
+		expect(sentAtText(undefined, now)).toBe("");
+	});
+
+	it("moves a rendered bubble's label on when the day turns over", () => {
+		vi.useFakeTimers({ toFake: ["Date"] });
+		vi.setSystemTime(new Date(2026, 8, 24, 23, 58));
+		const bubble = new UserMessageComponent(
+			"晚上好",
+			undefined,
+			() => false,
+			new Date(2026, 8, 24, 20, 14).getTime(),
+		);
+		const header = () => plain(bubble.render(80))[0]?.replace(/\x1b\][^\x07]*\x07/g, "") ?? "";
+		expect(header()).toMatch(/you {2}20:14 +$/);
+		vi.setSystemTime(new Date(2026, 8, 25, 0, 1));
+		expect(header()).toMatch(/you {2}昨天 20:14 +$/);
 	});
 
 	it("keeps the same margin at every width, lined up with the AI header, and wraps inside the bubble", () => {

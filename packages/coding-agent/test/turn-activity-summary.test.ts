@@ -91,7 +91,8 @@ function renderAllWith(
 		.join("\n");
 }
 
-const USER_BUBBLE_HEADER = /^\s*you {2}\d\d:\d\d\s*$/;
+// The send time carries a date prefix for anything not sent today (the fixtures sit at the epoch).
+const USER_BUBBLE_HEADER = /^\s*you {2}(?:\S+ )?\d\d:\d\d\s*$/;
 
 /** The rendered lines past the user bubble (its `you` row and its text). */
 function turnLines(nonEmpty: string[]): string[] {

@@ -1,10 +1,14 @@
-import { describe, expect, it, vi } from "vitest";
+import { setKeybindings } from "@earendil-works/pi-tui";
+import stripAnsi from "strip-ansi";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { KeybindingsManager } from "../src/core/keybindings.js";
 import type { QueuedMessageMutation } from "../src/core/session-action-store.js";
 import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
 import type { AgentConnectionSessionEvent } from "../src/modes/agent-connection/index.js";
 import type { DaemonTransportClient } from "../src/modes/daemon/daemon-client.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { QueueSelection } from "../src/modes/interactive/queue-selection.js";
+import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
 type QueueState = { steering: string[]; followUp: string[] };
 
@@ -126,6 +130,69 @@ function emitQueueUpdate(harness: Harness, queue: QueueState): void {
 }
 
 describe("interactive queued-message editing", () => {
+	afterEach(() => {
+		setKeybindings(new KeybindingsManager());
+	});
+
+	it("explains the queue edit in Chinese with the real key names, rebinds included", () => {
+		initTheme("dark");
+		setKeybindings(new KeybindingsManager());
+		const harness = createHarness({ steering: ["s1"], followUp: ["f1"] });
+		const header = () =>
+			stripAnsi(
+				String(
+					proto.getQueueSelectionHeader.call(
+						Object.assign(harness, {
+							getAppKeyDisplay: proto.getAppKeyDisplay,
+							getEditorKeyDisplay: proto.getEditorKeyDisplay,
+							capitalizeKey: proto.capitalizeKey,
+						}),
+					),
+				),
+			);
+		harness.browseQueueSelection(-1);
+		expect(header()).toContain("正在改排队消息（稍后发送 第 1 条）");
+		expect(header()).toContain("Enter 改后插话");
+		expect(header()).toMatch(/[\u4e00-\u9fff]/);
+		expect(header()).not.toMatch(/browse|reorder|steers|queues|deletes/);
+		setKeybindings(new KeybindingsManager({ "tui.input.submit": "ctrl+s" }));
+		expect(header()).toContain("Ctrl+S 改后插话");
+		harness.browseQueueSelection(-1);
+		expect(header()).toContain("插话 第 1 条");
+	});
+
+	it("Esc while editing a queued message backs out of the edit instead of interrupting the turn", () => {
+		const harness = createHarness({ steering: ["s1"], followUp: [] });
+		harness.editor.setText("draft");
+		harness.browseQueueSelection(-1);
+		harness.editor.setText("s1 half edited");
+		const interruptOrClearInput = vi.fn();
+		const armEscapeRepeat = vi.fn();
+		const escapeHost = Object.assign(harness, {
+			clearCtrlCExitHint: vi.fn(),
+			shortcutGuideContainer: { children: [] },
+			sideQuestionEvent: undefined,
+			escapeRepeatTimer: undefined,
+			escapeRepeatAction: undefined,
+			escapeRepeatExpiresAt: 0,
+			clearEscapeRepeat: proto.clearEscapeRepeat,
+			takeEscapeRepeatAction: proto.takeEscapeRepeatAction,
+			armEscapeRepeat,
+			interruptOrClearInput,
+			// A turn is running: before the fix this Esc interrupted it and sent the queue unedited.
+			hasInterruptibleWork: () => true,
+			settingsManager: { getProcessMode: () => "quiet" },
+		});
+		proto.handleEscape.call(escapeHost);
+		expect(interruptOrClearInput).not.toHaveBeenCalled();
+		expect(harness.queueSelection.isBrowsing).toBe(false);
+		expect(harness.editor.getText()).toBe("draft");
+		expect(harness.agentConnection.mutateQueuedMessage).not.toHaveBeenCalled();
+		// The next Esc is the ordinary one again.
+		proto.handleEscape.call(escapeHost);
+		expect(interruptOrClearInput).toHaveBeenCalledOnce();
+	});
+
 	it("browses into the queue and applies an enter edit as steering", async () => {
 		const harness = createHarness({ steering: ["s1"], followUp: ["f1"] });
 		harness.editor.setText("draft");
@@ -689,7 +756,7 @@ describe("interactive interrupt sends the queued messages", () => {
 		interrupt(harness);
 		await vi.waitFor(() => expect(requests).toEqual(["abort"]));
 		await vi.waitFor(() => expect(harness.showWarning).toHaveBeenCalledOnce());
-		expect(harness.showWarning.mock.calls[0]?.[0]).toContain("queued messages stay queued");
+		expect(harness.showWarning.mock.calls[0]?.[0]).toContain("排队消息没有跟着发出");
 		expect(harness.showError).not.toHaveBeenCalled();
 	});
 

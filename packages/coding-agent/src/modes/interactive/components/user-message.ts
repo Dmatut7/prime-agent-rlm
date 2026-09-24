@@ -74,11 +74,22 @@ export function userBubbleIndent(width: number): number {
 /** Columns of padding inside the bubble, left and right. */
 const BUBBLE_PAD = 2;
 
-/** `20:14`: when the message was sent. */
-function sentAtText(sentAt: number | undefined): string {
+/**
+ * When the message was sent: `20:14` today, `昨天 20:14`, `9月23日 20:14`
+ * earlier this year, `2025年9月23日 20:14` before that - a session left
+ * running for days still says which day each message is from.
+ */
+export function sentAtText(sentAt: number | undefined, now = Date.now()): string {
 	if (sentAt === undefined || !Number.isFinite(sentAt)) return "";
 	const date = new Date(sentAt);
-	return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+	const time = `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+	const today = new Date(now);
+	const dayStart = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
+	if (sentAt >= dayStart) return time;
+	const yesterdayStart = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1).getTime();
+	if (sentAt >= yesterdayStart) return `昨天 ${time}`;
+	const day = `${date.getMonth() + 1}月${date.getDate()}日`;
+	return date.getFullYear() === today.getFullYear() ? `${day} ${time}` : `${date.getFullYear()}年${day} ${time}`;
 }
 
 /**
@@ -89,6 +100,7 @@ function sentAtText(sentAt: number | undefined): string {
 class UserBubble implements Component {
 	private lastIndent = 0;
 	private cachedWidth?: number;
+	private cachedTime?: string;
 	private cachedLines?: string[];
 
 	constructor(
@@ -97,7 +109,9 @@ class UserBubble implements Component {
 	) {}
 
 	render(width: number): string[] {
-		if (this.cachedLines && this.cachedWidth === width) {
+		// The label moves on at midnight (`20:14` becomes `昨天 20:14`), so it is part of the cache key.
+		const time = sentAtText(this.sentAt);
+		if (this.cachedLines && this.cachedWidth === width && this.cachedTime === time) {
 			return this.cachedLines;
 		}
 		const indent = userBubbleIndent(width);
@@ -111,9 +125,9 @@ class UserBubble implements Component {
 			const body = truncateToWidth(`${pad}${content}`, bubbleWidth, "");
 			return lead + paint(body + " ".repeat(Math.max(0, bubbleWidth - visibleWidth(body))));
 		};
-		const time = sentAtText(this.sentAt);
 		const header = `${theme.bold(theme.fg("userLabel", "you"))}${time ? theme.fg("dim", `  ${time}`) : ""}`;
 		this.cachedWidth = width;
+		this.cachedTime = time;
 		this.cachedLines = [row(header), ...this.child.render(innerWidth).map((line) => row(line)), row("")];
 		return this.cachedLines;
 	}

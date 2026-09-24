@@ -11,10 +11,12 @@ export class SystemNoticeLine implements Component {
 	private cachedWidth?: number;
 	private cachedLines?: string[];
 
+	/** `error`: something went wrong (a memory write that failed) - it must not read as routine. */
 	constructor(
 		private readonly label: string,
 		private readonly detail = "",
 		private readonly hint = "",
+		private readonly tone: "notice" | "error" = "notice",
 	) {}
 
 	render(width: number): string[] {
@@ -29,7 +31,7 @@ export class SystemNoticeLine implements Component {
 		const detail = this.detail && room >= 8 ? `  ${truncateToWidth(this.detail, room, "…")}` : "";
 		const plain = truncateToWidth(`${frame}${this.label}${detail}${tail}`, safeWidth, "…");
 		const left = Math.max(0, Math.floor((safeWidth - visibleWidth(plain)) / 2));
-		const lines = [" ".repeat(left) + theme.fg("systemNotice", plain)];
+		const lines = [" ".repeat(left) + theme.fg(this.tone === "error" ? "error" : "systemNotice", plain)];
 		this.cachedWidth = width;
 		this.cachedLines = lines;
 		return lines;

@@ -1,0 +1,12 @@
+- Fixed block navigation (Alt+Up) getting stuck after a dialog opened while navigating: losing focus, /new, /resume and reattach now end it, and Esc afterwards reaches the prompt instead of interrupting the turn.
+- Fixed fullscreen block navigation pulling the view back to the focused block on every frame: PageUp/PageDown and the wheel now read a long block freely, and leaving returns to following the output when it was following before.
+- Changed Alt+Up in a scrolled-up fullscreen view to start at the block on screen instead of jumping to the newest one.
+- Fixed Enter on a focused block: it now runs the same Ctrl+O / Ctrl+T paths (quiet mode's three-step cycle, the Esc close order), and the hint only offers Enter where it does something.
+- Fixed clicking a turn's `◆ prime` header or footnote only flipping the caret: the tool rows and Thinking traces now open and close with it, and the next Ctrl+O agrees with the caret.
+- Fixed `Y` on a failed answer saying there was nothing to copy; `出错：`/warning rows and system notices can now be focused and copied.
+- Changed message times to show `昨天 HH:MM` or `M月D日 HH:MM` when not sent today.
+- Changed a partly failed memory update notice to Chinese in the error colour.
+- Changed the queue-edit header, the old-daemon interrupt warning and the unsaved-setting error to Chinese, with key names taken from the live bindings.
+- Fixed Esc while editing a queued message during a running turn interrupting the AI and sending the queue unedited; it now leaves the edit first.
+- Fixed the running card's "N 分钟没有新输出" warning being cut off by a long step label at 80 columns.
+- Fixed a folded repeat step on the running card (`等待命令结果 ×3`) hiding an earlier failure.

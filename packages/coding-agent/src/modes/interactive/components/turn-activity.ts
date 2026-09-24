@@ -486,15 +486,20 @@ export class TurnActivityState {
 
 export class TurnSummaryComponent implements Component, FocusableBlock {
 	private blockFocus?: BlockFocusState;
-	private expanded = false;
 	private cachedWidth?: number;
 	private cachedLines?: string[];
 	private cachedLaneKey?: string;
 	/** TUI v4: render the one-line footnote instead of the legacy two-line surface. */
 	private quiet = false;
 	private footnote?: TurnFootNote;
+	/** Told after a click flipped a lane, so the host applies it to the turn's rows. */
+	private onLanesChange?: () => void;
 
 	constructor(private readonly turnState: TurnActivityState) {}
+
+	setOnLanesChange(callback: (() => void) | undefined): void {
+		this.onLanesChange = callback;
+	}
 
 	/** The turn's state - the per-turn lanes (K3 ②) live on it. */
 	get state(): TurnActivityState {
@@ -540,6 +545,7 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		this.turnState.agentMessagesExpanded = false;
 		this.turnState.setCollapsed(anyOpen);
 		this.invalidate();
+		this.onLanesChange?.();
 	}
 
 	/** TUI v4: switch this turn head between the footnote and the legacy two lines. */
@@ -560,11 +566,11 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 		this.invalidate();
 	}
 
+	/** The process block's open state lives on the turn state alone, so a click and Ctrl+O never disagree. */
 	setExpanded(expanded: boolean): void {
-		if (this.expanded === expanded) {
+		if (this.state.processBlockExpanded === expanded) {
 			return;
 		}
-		this.expanded = expanded;
 		this.state.setCollapsed(!expanded);
 		this.invalidate();
 	}
@@ -648,6 +654,7 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 					this.turnState.agentMessagesExpanded = !this.turnState.agentMessagesExpanded;
 				}
 				this.invalidate();
+				this.onLanesChange?.();
 			},
 			onCaretClick: () => this.toggleAllBlocks(),
 		});
