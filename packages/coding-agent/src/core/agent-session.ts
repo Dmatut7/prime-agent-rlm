@@ -174,7 +174,12 @@ import {
 } from "./cron-jobs.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import type { ResourceDiagnostic } from "./diagnostics.js";
-import { DUTY_EVENT_CUSTOM_TYPE, type DutyEvent } from "./duty-log.js";
+import {
+	autonomousPromptFingerprint,
+	DUTY_EVENT_CUSTOM_TYPE,
+	type DutyEvent,
+	STEP_TIME_LIMIT_MARKER,
+} from "./duty-log.js";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.js";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.js";
 import {
@@ -1624,6 +1629,12 @@ interface RlmChildRun {
 	 */
 	lastStallNoticeAt?: number;
 	/**
+	 * Re-check armed after an excused stall warning was held back from the parent. The child's
+	 * watchdog warns once per silence episode, so if the excuse lapses while the child stays silent
+	 * nothing else would ever tell the parent.
+	 */
+	stallRecheckTimer?: ReturnType<typeof setTimeout>;
+	/**
 	 * Terminal classification recorded by the run's own terminal path, with the
 	 * reason text that went with it. Read-only forensics for `collectRlmChildren`:
 	 * a fan-in reader has to tell a watchdog kill from a child that finished
@@ -2811,6 +2822,16 @@ export class AgentSession {
 	>();
 	/** Steps stopped as stuck in this run, keyed by their description. */
 	private readonly _stuckStepsThisRun = new Map<string, number>();
+	/**
+	 * Why the deadline verdict just stopped a call, read once by the cancellation text: a silent
+	 * step, or a busy one that outran the exemption budget of an owner-armed watchdog abort.
+	 */
+	private readonly _stepStopCauses = new Map<
+		string,
+		{ kind: "silent" } | { kind: "time_limit"; budgetMs: number; usedMs: number }
+	>();
+	/** Direct child runs an in-flight `collectRlmChildren` wait is blocked on, with a count per wait. */
+	private readonly _rlmCollectWaits = new Map<RlmChildRun, number>();
 	private _compactAutoRefinePending = false;
 	private _turnIntervalAutoRefinePending = false;
 	private _postCompactionContinuationScheduled = false;
@@ -4481,7 +4502,17 @@ export class AgentSession {
 				resumeIfIdle: true,
 			}),
 		);
+		this._recordAutonomousContinuationDutyEvent(message);
 		this._clearAutonomousContinuationAwait();
+	}
+
+	/**
+	 * Mark a continuation prompt /autonomous sent. It lands in the transcript as a user message, and
+	 * the duty log would otherwise read it as the owner coming back.
+	 */
+	private _recordAutonomousContinuationDutyEvent(message: UserMessage): void {
+		const text = normalizeMessageContent(message.content).text;
+		this._recordDutyEvent({ kind: "autonomous_continue", prompt: autonomousPromptFingerprint(text) });
 	}
 
 	/**
@@ -5956,7 +5987,10 @@ export class AgentSession {
 			this._restoreAutonomousRuntimeSnapshot(autonomousSnapshot);
 			return [];
 		}
-		if (autonomousMessage) return [autonomousMessage];
+		if (autonomousMessage) {
+			this._recordAutonomousContinuationDutyEvent(autonomousMessage);
+			return [autonomousMessage];
+		}
 		if (signal?.aborted || this._sessionInputArrivalEpoch !== arrivalEpoch) return [];
 		const selfRecovery = this._selfRecoveryContinuation(context);
 		return selfRecovery ? [selfRecovery] : [];
@@ -6498,6 +6532,7 @@ export class AgentSession {
 		if (event.type === "agent_start") {
 			this._stepOutputWatch.clear();
 			this._stuckStepsThisRun.clear();
+			this._stepStopCauses.clear();
 		} else if (event.type === "tool_execution_start") {
 			this._stepOutputWatch.set(event.toolCallId, {
 				toolName: event.toolName,
@@ -6510,6 +6545,7 @@ export class AgentSession {
 			if (watch) watch.lastOutputAt = now;
 		} else if (event.type === "tool_execution_end") {
 			this._stepOutputWatch.delete(event.toolCallId);
+			this._stepStopCauses.delete(event.toolCallId);
 		}
 	}
 
@@ -6547,6 +6583,30 @@ export class AgentSession {
 			}
 		}
 		return Math.max(0, now - watch.lastOutputAt);
+	}
+
+	/**
+	 * Whether an in-flight collect wait is blocked on a child that is still alive. Such a cell is
+	 * silent by design for as long as the child works, which is longer than the host-request age
+	 * bound when the wait is unbounded, and the parent was killed about twenty minutes into a
+	 * healthy child's job. "Alive" is the child's own evidence: an agent event inside the
+	 * silent-step window, or its watchdog excusing the silence. A child that went quiet with no
+	 * excuse stops protecting the wait, so a wedged child cannot hold its parent's step forever.
+	 */
+	private _rlmCollectWaitsOnLiveChild(): boolean {
+		if (this._rlmCollectWaits.size === 0) return false;
+		const now = Date.now();
+		const quietMs = this.settingsManager.getSilentStuckMs();
+		for (const run of this._rlmCollectWaits.keys()) {
+			if (run.settled || (run.status !== "running" && run.status !== "queued")) continue;
+			const child = run.session;
+			// Still starting up: admission and runtime construction are the host's own work.
+			if (!child) return true;
+			const lastEventAt = child.lastAgentEventAt ?? run.lastActivityAt;
+			if (lastEventAt !== undefined && now - lastEventAt < quietMs) return true;
+			if (child.excusedNow) return true;
+		}
+		return false;
 	}
 
 	/** The silent-step threshold for one call: the setting, or the call's own explicit timeout if longer. */
@@ -6630,6 +6690,8 @@ export class AgentSession {
 	private _describeStuckStep(info: ToolTimeoutVouchInfo): string {
 		const step = this._describeStepForRecovery(info.toolCallId, info.toolName);
 		const silentMs = this._stepSilentMs(info);
+		const cause = this._stepStopCauses.get(info.toolCallId);
+		this._stepStopCauses.delete(info.toolCallId);
 		const seen = (this._stuckStepsThisRun.get(step) ?? 0) + 1;
 		this._stuckStepsThisRun.set(step, seen);
 		this._recordSelfRecovery({
@@ -6639,8 +6701,18 @@ export class AgentSession {
 			step,
 			silentMs,
 			repeated: seen > 1,
+			...(cause?.kind === "time_limit" ? { cause: "time_limit" as const } : {}),
 			at: Date.now(),
 		});
+		if (cause?.kind === "time_limit") {
+			// Not a hang: the call may have been busy the whole time. Saying "no output" here would
+			// send the model hunting for a bug that does not exist.
+			const minutes = (ms: number) => Math.max(1, Math.round(ms / 60_000));
+			return [
+				`Step \`${step}\` was stopped after ${minutes(info.elapsedMs)} min: the ${STEP_TIME_LIMIT_MARKER} for this turn (${minutes(cause.budgetMs)} min, armed because stallWatchdog.abortAfterSeconds is set) is spent. Its last output was ${Math.round(silentMs / 1000)}s ago, so it was not necessarily hung.`,
+				"Output that reaches the session is what keeps a long step inside the budget, so rerunning it unchanged will be stopped at the same point: make it report progress as it goes, split it into shorter steps, or run it as a background handle and poll it.",
+			].join(" ");
+		}
 		const lines = [
 			`Stuck step: \`${step}\` produced no output for ${Math.round(silentMs / 1000)}s and showed no progress, so it was stopped.`,
 			seen > 1
@@ -6655,7 +6727,8 @@ export class AgentSession {
 	 * Verdict for a fired per-call deadline, with the stall watchdog as the single
 	 * arbiter (r4 recovery): the extension consumes the same exemption budget the abort
 	 * stage defers by - never a second pool. A paused turn boundary defers like the abort
-	 * stage does, and an exhausted budget cancels. Otherwise the silent-step rule decides,
+	 * stage does, and an exhausted budget cancels when the owner armed the abort stage
+	 * (`stallWatchdog.abortAfterSeconds` > 0). Otherwise the silent-step rule decides,
 	 * with or without liveness evidence: the call is busy while it produces output (its own
 	 * updates, the kernel's output counters, its process tree's CPU, an in-flight host
 	 * request) and stuck once it has produced none for the silent-step threshold
@@ -6668,24 +6741,43 @@ export class AgentSession {
 	private _toolTimeoutVouch(info: ToolTimeoutVouchInfo): ToolTimeoutVerdict | undefined {
 		try {
 			const exemption = this._stallWatchdog?.deferToolTimeout(info.toolCallId);
-			if (exemption?.exhausted === true) return { action: "fail" };
+			// A spent budget is a kill only when the owner armed the watchdog's abort: that budget is
+			// what the abort stage defers by, and the per-call deadline must not outlive it. In the
+			// default warn-only mode nothing else is ever killed for spending it, so a quiet but busy
+			// build (CPU moving, or its own longer explicit timeout) stays with the silent-step rule
+			// below instead of dying at the budget's wall-clock mark.
+			const abortArmed = this.settingsManager.getStallWatchdogSettings().abortAfterSeconds > 0;
+			if (exemption?.exhausted === true && abortArmed) {
+				this._stepStopCauses.set(info.toolCallId, {
+					kind: "time_limit",
+					budgetMs: exemption.budgetMs,
+					usedMs: exemption.usedMs,
+				});
+				return { action: "fail" };
+			}
+			const remainingMs = exemption?.exhausted === true ? undefined : exemption?.remainingMs;
 			if (exemption?.reason === "paused") {
 				return {
 					action: "extend",
-					recheckMs: this._boundToolTimeoutRecheck(info.timeoutMs, exemption.remainingMs),
+					recheckMs: this._boundToolTimeoutRecheck(info.timeoutMs, remainingMs),
 				};
 			}
 			const stuckAfterMs = this._stuckAfterMs(info.toolCallId);
 			const vouch = this._sampleStallVouch();
-			const hostRequestInFlight = vouch?.reasons?.includes(STALL_VOUCH_REASONS.hostRequestInFlight) === true;
+			const hostRequestInFlight =
+				vouch?.reasons?.includes(STALL_VOUCH_REASONS.hostRequestInFlight) === true ||
+				this._rlmCollectWaitsOnLiveChild();
 			const silentMs = this._stepSilentMs(info, vouch?.movementToken, true, hostRequestInFlight);
-			if (silentMs >= stuckAfterMs) return { action: "fail" };
+			if (silentMs >= stuckAfterMs) {
+				this._stepStopCauses.set(info.toolCallId, { kind: "silent" });
+				return { action: "fail" };
+			}
 			const recheckMs = exemption?.tier === "progress" ? info.timeoutMs : Math.round(info.timeoutMs / 2);
 			return {
 				action: "extend",
 				recheckMs: this._boundToolTimeoutRecheck(
 					Math.max(1_000, Math.min(recheckMs, stuckAfterMs - silentMs)),
-					exemption?.remainingMs,
+					remainingMs,
 				),
 			};
 		} catch (error) {
@@ -6911,6 +7003,10 @@ export class AgentSession {
 		if (info.stage === "warn") {
 			const message = buildStallWarnMessage(messageContext);
 			sessionLog.warn("stall watchdog: no activity while turn running", { ...logFields, ...exemptionFields });
+			// The warning is the only trace a warn-only watchdog leaves: without it a turn that hung for
+			// two days reads as "没出问题" in the duty log. Excused silence is healthy long work, not an
+			// incident, so it stays out.
+			if (!excused) this._recordDutyEvent({ kind: "stall_warning", silentMs: info.silentMs });
 			this._emit({
 				type: "stall_warning",
 				message,
@@ -9224,6 +9320,15 @@ export class AgentSession {
 		// being deleted (detachedDeletion) or whose notices are suppressed must not be
 		// pinged - the parent itself asked for this child to go away.
 		if (this._disposed || this._disposing || run.detachedDeletion || run.suppressTerminalNotice) return;
+		const exemption = event.diagnostics.exemption;
+		if (exemption?.reason !== undefined && exemption.exhausted !== true) {
+			// Excused silence is healthy long work (a live build, a host-owned phase): the notice would
+			// start a paid parent turn only to say "still working", up to every ten minutes per child
+			// for the whole job. The roster already shows it as long-running. The parent is told once
+			// the excuse lapses while the child is still silent.
+			this._armRlmChildStallRecheck(run, child, sessionName, event);
+			return;
+		}
 		const now = Date.now();
 		if (run.lastStallNoticeAt !== undefined && now - run.lastStallNoticeAt < RLM_CHILD_STALL_NOTICE_MIN_INTERVAL_MS) {
 			return;
@@ -9232,8 +9337,6 @@ export class AgentSession {
 		const inFlightTools = event.diagnostics.inFlightToolCalls.map((call) =>
 			call.elapsedMs > 0 ? `${call.toolName} (${Math.max(1, Math.round(call.elapsedMs / 1000))}s)` : call.toolName,
 		);
-		const exemption = event.diagnostics.exemption;
-		const workEvidence = exemption !== undefined && exemption.exhausted !== true ? [...exemption.reasons] : [];
 		// The deadline that matters is the child's own watchdog - it is the one that can
 		// abort the turn - so the notice describes the child's configuration, not the
 		// parent's. The two differ whenever a project-scope settings file overrides the
@@ -9245,7 +9348,6 @@ export class AgentSession {
 			silentMs: event.silentMs,
 			thresholdMs: event.thresholdMs,
 			inFlightTools,
-			...(workEvidence.length > 0 ? { workEvidence } : {}),
 			...(abortAfterMs > 0 ? { abortAfterMs } : {}),
 		});
 		try {
@@ -9261,6 +9363,44 @@ export class AgentSession {
 				message: this._asError(error).message,
 			});
 		}
+	}
+
+	/**
+	 * Watch a child whose stall notice was held back because its silence was excused. Re-checked
+	 * every child warn window: a child that moved again is back under its own watchdog (the next
+	 * silence warns afresh), one still excused keeps waiting, and one still silent after the excuse
+	 * lapsed is a real stall the parent must hear about.
+	 */
+	private _armRlmChildStallRecheck(
+		run: RlmChildRun,
+		child: AgentSession,
+		sessionName: string,
+		event: { silentMs: number; thresholdMs: number; diagnostics: StallDiagnostics },
+	): void {
+		if (run.stallRecheckTimer !== undefined) return;
+		const warnedAt = Date.now();
+		const lastEventAtWarn = child.lastAgentEventAt;
+		const recheck = () => {
+			run.stallRecheckTimer = undefined;
+			if (this._disposed || this._disposing || run.settled || run.stall === undefined) return;
+			if (child.lastAgentEventAt !== lastEventAtWarn) return;
+			if (child.excusedNow) {
+				schedule();
+				return;
+			}
+			const { exemption: _lapsedExemption, ...diagnostics } = event.diagnostics;
+			this._notifyRlmChildStall(run, child, sessionName, {
+				...event,
+				silentMs: event.silentMs + (Date.now() - warnedAt),
+				diagnostics,
+			});
+		};
+		const schedule = () => {
+			const timer = setTimeout(recheck, Math.max(1_000, event.thresholdMs));
+			timer.unref?.();
+			run.stallRecheckTimer = timer;
+		};
+		schedule();
 	}
 
 	private _flushDeferredRlmTerminalNotices(): void {
@@ -16806,14 +16946,24 @@ export class AgentSession {
 		const selected = this._selectRlmChildrenForCollect(targets);
 		if (timeoutMs > 0) {
 			const deadlineAt = Date.now() + timeoutMs;
-			// allSettled on purpose: one run's timeout or abort must not strand the
-			// other waits, and a settlement rejection is terminal state to report,
-			// not a collect error.
-			await Promise.allSettled(
-				selected.runs
-					.filter((run) => !run.settled)
-					.map((run) => this._awaitRlmChildSettlementForCollect(run, deadlineAt, signal)),
-			);
+			const awaited = selected.runs.filter((run) => !run.settled);
+			// The cell blocked on this wait is silent by design while the child works; the
+			// silent-step rule reads these to tell that from a hang (see _rlmCollectWaitsOnLiveChild).
+			for (const run of awaited) this._rlmCollectWaits.set(run, (this._rlmCollectWaits.get(run) ?? 0) + 1);
+			try {
+				// allSettled on purpose: one run's timeout or abort must not strand the
+				// other waits, and a settlement rejection is terminal state to report,
+				// not a collect error.
+				await Promise.allSettled(
+					awaited.map((run) => this._awaitRlmChildSettlementForCollect(run, deadlineAt, signal)),
+				);
+			} finally {
+				for (const run of awaited) {
+					const count = (this._rlmCollectWaits.get(run) ?? 1) - 1;
+					if (count > 0) this._rlmCollectWaits.set(run, count);
+					else this._rlmCollectWaits.delete(run);
+				}
+			}
 		}
 		return {
 			results: [

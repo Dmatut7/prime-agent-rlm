@@ -1,5 +1,5 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { Container, StallActions, setKeybindings } from "@earendil-works/pi-tui";
+import { Container, StallActions, setKeybindings, Text } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
@@ -66,6 +66,8 @@ describe("InteractiveMode stall action bar lifecycle", () => {
 	let removeInputListener: ReturnType<typeof vi.fn>;
 	let addInputListener: ReturnType<typeof vi.fn>;
 	let requestRender: ReturnType<typeof vi.fn>;
+	const editor = { isShowingAutocomplete: () => false, render: () => [], invalidate: () => {} };
+	const focused: { current: unknown } = { current: editor };
 
 	function createModeFake(): ModeFake {
 		const fake: ModeFake = {
@@ -80,7 +82,16 @@ describe("InteractiveMode stall action bar lifecycle", () => {
 			refreshConnectionContextUsage: vi.fn(async () => {}),
 			checkShutdownRequested: vi.fn(async () => {}),
 			showError: vi.fn(),
-			ui: { requestRender, addInputListener },
+			ui: { requestRender, addInputListener, getFocusedComponent: () => focused.current },
+			// The plain editor has the keyboard unless a test hands it to a dialog.
+			editor,
+			defaultEditor: editor,
+			blockNavigation: undefined,
+			interruptOrClearInput: vi.fn(),
+			// tool_execution_end with an unknown call id settles nothing but still counts.
+			pendingTools: new Map(),
+			startedToolCalls: new Set(),
+			consecutiveToolErrors: 0,
 			// turn_end merges the turn's file changes, which resolves paths
 			// against the session cwd.
 			uiServices: { getInitialCwd: () => "/tmp" },
@@ -129,6 +140,7 @@ describe("InteractiveMode stall action bar lifecycle", () => {
 		removeInputListener = vi.fn();
 		addInputListener = vi.fn(() => removeInputListener);
 		requestRender = vi.fn();
+		focused.current = editor;
 	});
 
 	afterEach(() => {
@@ -244,6 +256,101 @@ describe("InteractiveMode stall action bar lifecycle", () => {
 		// summary line carries this warning's own silence reading.
 		expect(renderChat(chatOf(mode))).toContain("已经 7 分钟没有动静");
 		expect(renderChat(chatOf(mode))).toContain("中断这一轮");
+	});
+
+	it("leaves keys to a focused dialog, selector or block navigation instead of interrupting the turn", async () => {
+		const mode = createModeFake();
+		await handleEvent.call(mode, stallWarning());
+		const bar = mode.stallActionBar as StallActions;
+		const route = addInputListener.mock.calls[0]?.[0] as (data: string) => { consume?: boolean } | undefined;
+		expect(route).toBeTypeOf("function");
+
+		// A dialog has the keyboard: Esc is the dialog's cancel, not "interrupt this turn", and it
+		// must not dismiss the bar on the way either.
+		focused.current = { render: () => [], invalidate: () => {} };
+		expect(route("\x1b")).toBeUndefined();
+		expect(mode.interruptOrClearInput).not.toHaveBeenCalled();
+		expect(mode.stallActionBar).toBe(bar);
+		expect(bar.isDismissed).toBe(false);
+
+		// Block navigation took the keyboard (it focuses its navigator).
+		focused.current = editor;
+		mode.blockNavigation = { navigator: {}, focused: {} };
+		expect(route("\x1b")).toBeUndefined();
+		expect(mode.interruptOrClearInput).not.toHaveBeenCalled();
+		mode.blockNavigation = undefined;
+
+		// Back on the plain editor, the bar's interrupt key works again.
+		expect(route("\x1b")).toEqual({ consume: true });
+		expect(mode.interruptOrClearInput).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps counting the quiet time on a bar left up for hours, and stops at the first activity", async () => {
+		const t0 = 1_700_000_000_000;
+		vi.useFakeTimers({ now: t0 });
+		const mode = createModeFake();
+		await handleEvent.call(mode, stallWarning());
+		expect(renderChat(chatOf(mode))).toContain("已经 5 分钟没有动静");
+
+		vi.setSystemTime(t0 + 3 * 3_600_000);
+		expect(renderChat(chatOf(mode))).toContain("已经 3 小时 5 分没有动静");
+
+		// The tool settled: the quiet spell is over, so the reading freezes where it ended.
+		await handleEvent.call(mode, {
+			type: "tool_execution_end",
+			toolCallId: "t-unknown",
+			toolName: "ipython",
+			result: { content: [], details: {} },
+			isError: false,
+		} as AgentConnectionSessionEvent);
+		vi.setSystemTime(t0 + 5 * 3_600_000);
+		expect(renderChat(chatOf(mode))).toContain("已经 3 小时 5 分没有动静");
+	});
+
+	it("opens the diagnostics with a plain Chinese explanation above the raw lines", async () => {
+		const mode = createModeFake();
+		await handleEvent.call(mode, stallWarning());
+		(mode.stallActionBar as StallActions).handleInput("\x19");
+		const rendered = renderChat(chatOf(mode));
+		expect(rendered).toContain("发生了什么：这一轮已经 5 分钟没有任何动静");
+		expect(rendered).toContain("这意味着：");
+		expect(rendered).toContain("你可以：想等就不用管，它会接着跑；觉得不对就按 Esc 中断这一轮");
+		expect(rendered).toContain("下面是给开发者看的原始记录，可以不看");
+		// The raw record stays, below the explanation.
+		expect(rendered.indexOf("你可以：")).toBeLessThan(rendered.indexOf("stage: stall_warning"));
+	});
+
+	it("gives Ctrl+Y back to the editor once anything follows the diagnostics block", async () => {
+		const mode = createModeFake();
+		await handleEvent.call(mode, stallWarning());
+		(mode.stallActionBar as StallActions).handleInput("\x19");
+		const closeRoute = addInputListener.mock.calls.at(-1)?.[0] as (data: string) => { consume?: boolean } | undefined;
+		expect(renderChat(chatOf(mode))).toMatch(/ctrl\+y 收起/i);
+
+		// The reply goes on: the block is history now, possibly far off screen.
+		chatOf(mode).addChild(new Text("接着做完了。", 1, 0));
+		const rendered = renderChat(chatOf(mode));
+		expect(rendered).not.toMatch(/ctrl\+y 收起/i);
+
+		const removedBefore = removeInputListener.mock.calls.length;
+		// Ctrl+Y is yank again: not consumed, and it does not silently remove the old block.
+		expect(closeRoute("\x19")).toBeUndefined();
+		expect(renderChat(chatOf(mode))).toContain("诊断详情");
+		expect(removeInputListener.mock.calls.length).toBe(removedBefore + 1);
+		expect(closeRoute("\x19")).toBeUndefined();
+	});
+
+	it("does not close the diagnostics block with a key a focused dialog owns", async () => {
+		const mode = createModeFake();
+		await handleEvent.call(mode, stallWarning());
+		(mode.stallActionBar as StallActions).handleInput("\x19");
+		const closeRoute = addInputListener.mock.calls.at(-1)?.[0] as (data: string) => { consume?: boolean } | undefined;
+		focused.current = { render: () => [], invalidate: () => {} };
+		expect(closeRoute("\x19")).toBeUndefined();
+		expect(renderChat(chatOf(mode))).toContain("诊断详情");
+		focused.current = editor;
+		expect(closeRoute("\x19")).toEqual({ consume: true });
+		expect(renderChat(chatOf(mode))).not.toContain("诊断详情");
 	});
 
 	it("F3: the daemon-armed deadline reaches the bar as a static countdown line", async () => {

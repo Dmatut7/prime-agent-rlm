@@ -1092,6 +1092,24 @@ describe("stall event enrichment and S1", () => {
 		expect(event.actions?.autoRecoveryAtMs).toBeUndefined();
 	});
 
+	it("stall_warning is not armed when the sweep would hold back, so the bar never counts down to nothing", () => {
+		// The sweep stands aside for excused silence and a live host-owned phase; a countdown for an
+		// action that never comes ends up reading "马上" forever.
+		for (const hold of ["excusedNow", "isBashRunning"] as const) {
+			const root = makeSessionDouble({ activeSessionId: "root-active", clients: 1 });
+			root.runtime.session[hold] = true;
+			const fixture = makeBroadcastFixture(root);
+			fixture.daemon.broadcastToSession(root, {
+				type: "session_event",
+				activeSessionId: "root-active",
+				event: stallWarning(45_000, 30_000),
+			});
+			const event = (fixture.captured[0] as { event: StallWarningEvent }).event;
+			expect(event.actions, hold).toMatchObject({ canAbort: true, autoRecoveryArmed: false });
+			expect(event.actions?.autoRecoveryAtMs, hold).toBeUndefined();
+		}
+	});
+
 	it("S1: terminal stall stages never carry actions - the branch only enriches stall_warning", () => {
 		const root = makeSessionDouble({ activeSessionId: "root-active" });
 		const fixture = makeBroadcastFixture(root);

@@ -19,6 +19,8 @@ type DutyLogHarness = {
 	showStatus: ReturnType<typeof vi.fn>;
 	showError: ReturnType<typeof vi.fn>;
 	showDutyLog(options: { automatic: boolean }): Promise<void>;
+	lastOwnerKeyAt: number;
+	dutyLogReturnRoute(data: string): undefined;
 };
 
 function transcript(lastOwnerAt: number): string {
@@ -69,6 +71,7 @@ describe("InteractiveMode duty log", () => {
 			ui: { requestRender: vi.fn() },
 			showStatus: vi.fn(),
 			showError: vi.fn(),
+			lastOwnerKeyAt: Date.now(),
 		};
 		Object.setPrototypeOf(fake, InteractiveMode.prototype);
 		return fake as unknown as DutyLogHarness;
@@ -84,6 +87,29 @@ describe("InteractiveMode duty log", () => {
 		expect(away.dutyLogContainer.children).toHaveLength(1);
 		const rows = away.dutyLogContainer.render(100).map((row) => row.replace(/\x1b\[[0-9;]*m/g, ""));
 		expect(rows[0]).toMatch(/^ 值班记录 · 离开 5 小时/);
+	});
+
+	it("shows itself on the first key after the owner left the TUI attached and idle past the setting", async () => {
+		// Attached for two days: no start, attach or resume ever happens, so the first key after
+		// the idle gap is the moment the owner came back.
+		const mode = harness(2 * 24 * HOUR);
+		mode.lastOwnerKeyAt = Date.now() - 2 * 24 * HOUR;
+		// A terminal cell-size reply and a mouse report are not the owner pressing a key.
+		expect(mode.dutyLogReturnRoute("\x1b[6;18;9t")).toBeUndefined();
+		expect(mode.dutyLogReturnRoute("\x1b[<35;10;5M")).toBeUndefined();
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(mode.dutyLogContainer.children).toHaveLength(0);
+
+		expect(mode.dutyLogReturnRoute("a")).toBeUndefined();
+		await vi.waitFor(() => expect(mode.dutyLogContainer.children).toHaveLength(1));
+		const rows = mode.dutyLogContainer.render(100).map((row) => row.replace(/\x1b\[[0-9;]*m/g, ""));
+		expect(rows[0]).toMatch(/^ 值班记录 · 离开 2 天/);
+
+		// The next keys are typing, not another return.
+		mode.dutyLogContainer.clear();
+		mode.dutyLogReturnRoute("b");
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(mode.dutyLogContainer.children).toHaveLength(0);
 	});
 
 	it("stays off automatically when the setting is 0, but answers /dutylog", async () => {

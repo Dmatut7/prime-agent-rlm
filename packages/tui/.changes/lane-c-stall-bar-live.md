@@ -1,0 +1,1 @@
+- Added a live summary to the stall action bar and `TUI.getFocusedComponent()`; an auto-recovery countdown more than 30 seconds overdue is no longer shown.

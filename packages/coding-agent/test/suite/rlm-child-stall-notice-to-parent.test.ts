@@ -8,16 +8,19 @@
  * the notice carries the facts (silent seconds, in-flight tool) plus the parent's own
  * lever for the wedge case.
  */
-import type { AgentTool } from "@earendil-works/pi-agent-core";
+import { type AgentTool, TOOL_TIMEOUT_CAUSE_PREFIX } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { AgentSession } from "../../src/core/agent-session.js";
+import type { KernelLivenessSample } from "../../src/core/kernel/shared.js";
 import {
 	type CustomMessage,
 	RLM_CHILD_FAILURE_CUSTOM_TYPE,
 	RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE,
 	type RlmChildStallNoticeDetails,
 } from "../../src/core/messages.js";
+import type { TurnLivenessKernelFacts } from "../../src/core/turn-liveness.js";
 import { createHarness, type Harness } from "./harness.js";
 
 function hangTool(): AgentTool {
@@ -142,5 +145,192 @@ describe("a silent child is reported to its parent, not killed for it", () => {
 			{ timeout: 15_000, interval: 20 },
 		);
 		expect(child.eventsOfType("stall_abort")).toHaveLength(1);
+	});
+});
+
+describe("a parent step waiting on a live child is not a stuck step", () => {
+	const harnesses: Harness[] = [];
+
+	afterEach(() => {
+		while (harnesses.length > 0) {
+			harnesses.pop()?.cleanup();
+		}
+	});
+
+	/** A child tool that keeps reporting progress for `runMs`, or never returns and never speaks. */
+	function childTool(runMs: number | "forever"): AgentTool {
+		return {
+			name: "child_job",
+			label: "Child Job",
+			description: "A child's long job",
+			parameters: Type.Object({}),
+			execute: async (_id, _args, _signal, onUpdate) => {
+				if (runMs === "forever") return new Promise<never>(() => {});
+				const endAt = Date.now() + runMs;
+				while (Date.now() < endAt) {
+					onUpdate?.({ content: [{ type: "text", text: "progress" }], details: {} });
+					await new Promise((resolve) => setTimeout(resolve, 150));
+				}
+				return { content: [{ type: "text", text: "child job done" }], details: {} };
+			},
+		};
+	}
+
+	async function parentWaitingOn(runMs: number | "forever"): Promise<{ parent: Harness; child: Harness }> {
+		const child = await createHarness({ tools: [childTool(runMs)], settings: { retry: { enabled: false } } });
+		harnesses.push(child);
+		child.setResponses([
+			fauxAssistantMessage(fauxToolCall("child_job", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("child finished"),
+		]);
+		let parentSession: AgentSession | undefined;
+		// The cell that blocks on rlm.collect: silent by design while the child works.
+		const waitTool: AgentTool = {
+			name: "wait_child",
+			label: "Wait Child",
+			description: "Blocks on rlm.collect",
+			parameters: Type.Object({}),
+			executionTimeoutMs: 30,
+			execute: async (_id, _args, signal) => {
+				const collected = await parentSession?.collectRlmChildren([], 20_000, signal);
+				return {
+					content: [{ type: "text", text: `collected ${collected?.results.length ?? 0}` }],
+					details: {},
+				};
+			},
+		};
+		const parent = await createHarness({
+			rlmDepth: 0,
+			rlmMaxDepth: 1,
+			tools: [waitTool],
+			settings: { tools: { timeout: { silentStuckSeconds: 1 } } },
+			stepCpuProbe: () => undefined,
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: child.session }),
+				deleteRlmSubagentRuntime: async () => {},
+			},
+		});
+		harnesses.push(parent);
+		parentSession = parent.session;
+		await parent.session.runRlmChild("do the long job", { name: "worker" });
+		parent.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait_child", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("parent done"),
+		]);
+		await parent.session.promptAndWait("wait for the worker");
+		return { parent, child };
+	}
+
+	function lastToolResultText(harness: Harness): string {
+		const results = harness.session.messages.filter((message) => message.role === "toolResult");
+		const last = results.at(-1) as { content: Array<{ type: string; text?: string }> } | undefined;
+		return (last?.content ?? []).map((block) => block.text ?? "").join("\n");
+	}
+
+	it("keeps the waiting cell while the child keeps working past the silent-step window", async () => {
+		const { parent } = await parentWaitingOn(3_000);
+		expect(lastToolResultText(parent)).toContain("collected 1");
+		expect(lastToolResultText(parent)).not.toContain(TOOL_TIMEOUT_CAUSE_PREFIX);
+	});
+
+	it("still stops the waiting cell once the child itself went silent with no excuse", async () => {
+		const { parent } = await parentWaitingOn("forever");
+		expect(lastToolResultText(parent)).toContain(TOOL_TIMEOUT_CAUSE_PREFIX);
+	});
+});
+
+function sample(overrides: Partial<KernelLivenessSample> = {}): KernelLivenessSample {
+	return {
+		receivedAt: Date.now(),
+		tick: 10,
+		intervalMs: 5_000,
+		cellId: "cell-1",
+		cpuMs: 1_000,
+		streamBytes: 0,
+		cellsDone: 0,
+		hostRequests: 0,
+		bashHandles: 0,
+		bashCellHandles: 0,
+		bashBufferedBytes: 0,
+		bashPipePending: 0,
+		...overrides,
+	};
+}
+
+/** A kernel running a live bash handle the cell awaits: the watchdog excuses the silence. */
+function busyKernelFacts(): TurnLivenessKernelFacts {
+	return {
+		protocol: 4,
+		previous: sample({ receivedAt: Date.now() - 5_000, tick: 10, bashHandles: 1, bashCellHandles: 1 }),
+		latest: sample({ tick: 40, bashHandles: 1, bashCellHandles: 1 }),
+		rejectedFrames: 0,
+		consecutiveRejectedFrames: 0,
+		hostRequestCount: 0,
+		kernelPid: 4242,
+		hasActiveExecution: true,
+	};
+}
+
+describe("an excused child stall does not wake the parent", () => {
+	const harnesses: Harness[] = [];
+
+	afterEach(() => {
+		while (harnesses.length > 0) {
+			harnesses.pop()?.cleanup();
+		}
+	});
+
+	it("holds the notice while the child's work is vouched for, and sends it once the excuse lapses", async () => {
+		// Each notice starts a paid parent turn. Healthy long work (a live build) used to cost one
+		// every ten minutes per child for the whole job, only to say "still working".
+		let childBusy = true;
+		const child = await createHarness({
+			tools: [hangTool()],
+			settings: {
+				stallWatchdog: { enabled: true, warnAfterSeconds: 0.05, abortAfterSeconds: 0 },
+				retry: { enabled: false },
+			},
+			stallKernelLivenessFacts: () => (childBusy ? busyKernelFacts() : undefined),
+			agentMessageController: {
+				listAgents: () => ({ agents: [] }),
+				sendAgentMessage: vi.fn(async () => {
+					throw new Error("synthesized stall notices must not use agent_message");
+				}),
+			},
+		});
+		harnesses.push(child);
+		child.setResponses([fauxAssistantMessage(fauxToolCall("hang_forever", {}), { stopReason: "toolUse" })]);
+		const parent = await createHarness({
+			rlmDepth: 0,
+			rlmMaxDepth: 1,
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: child.session }),
+				deleteRlmSubagentRuntime: async () => {},
+			},
+		});
+		harnesses.push(parent);
+		parent.setResponses([fauxAssistantMessage("子代理卡住了，我去看一下。")]);
+		await parent.session.runRlmChild("build the whole thing", { name: "long-build" });
+
+		await vi.waitFor(() => expect(child.eventsOfType("stall_warning").length).toBeGreaterThan(0), {
+			timeout: 15_000,
+			interval: 20,
+		});
+		expect(child.eventsOfType("stall_warning")[0]?.diagnostics.exemption?.reason).toBe("vouched");
+		// At least one re-check window passes with the work still vouched for.
+		await new Promise((resolve) => setTimeout(resolve, 1_300));
+		expect(messagesOfType(parent.session.messages, RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE)).toEqual([]);
+		expect(parent.faux.state.callCount).toBe(0);
+
+		// The build's evidence disappears while the child stays silent: now it is a real stall.
+		childBusy = false;
+		await vi.waitFor(
+			() => expect(messagesOfType(parent.session.messages, RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE)).toHaveLength(1),
+			{ timeout: 15_000, interval: 20 },
+		);
+		const details = messagesOfType(parent.session.messages, RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE)[0]
+			?.details as RlmChildStallNoticeDetails;
+		expect(details.workEvidence).toBeUndefined();
+		expect(details.silentMs).toBeGreaterThan(1_000);
 	});
 });

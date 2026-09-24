@@ -164,20 +164,29 @@ export function stallEvidenceHint(): string {
 	return `诊断记录：${resolveStallDiagnosticsPointer().evidencePath}`;
 }
 
-/** `45 秒`, `5 分钟`. */
+/** `45 秒`, `5 分钟`, `3 小时 5 分`: a bar left up overnight reads in hours. */
 function durationText(ms: number): string {
 	const secondsValue = Math.max(1, Math.round(ms / 1000));
-	return secondsValue < 90 ? `${secondsValue} 秒` : `${Math.round(secondsValue / 60)} 分钟`;
+	if (secondsValue < 90) return `${secondsValue} 秒`;
+	const minutes = Math.round(secondsValue / 60);
+	if (minutes < 90) return `${minutes} 分钟`;
+	const hours = Math.floor(minutes / 60);
+	const rest = minutes % 60;
+	return rest > 0 ? `${hours} 小时 ${rest} 分` : `${hours} 小时`;
 }
 
 /**
  * The stall event as one line a person can act on: how long it has been quiet,
  * what it is waiting for, and what is still running. The forensic lines
  * ({@link formatStallEventLines}) stay one key away (stall diagnostics).
+ *
+ * `sinceEventMs` is how much longer the quiet has lasted since the event was measured, so a line
+ * kept on screen keeps telling the truth.
  */
-export function formatStallSummary(event: StallEventView): string {
+export function formatStallSummary(event: StallEventView, sinceEventMs = 0): string {
 	const payload = isSegment(event.diagnostics) ? (event.diagnostics as Record<string, unknown>) : undefined;
-	const quiet = durationText(event.silentMs);
+	const extraMs = Math.max(0, sinceEventMs);
+	const quiet = durationText(event.silentMs + extraMs);
 	if (event.type === "stall_abort") return `\u2717 已经 ${quiet}没有动静，这一轮被自动中断了`;
 	if (event.type === "stall_unsettled") return "\u2717 这一轮已经中断，但还有工作没停下来";
 	const calls = Array.isArray(payload?.inFlightToolCalls) ? payload.inFlightToolCalls.filter(isSegment) : [];
@@ -187,13 +196,97 @@ export function formatStallSummary(event: StallEventView): string {
 	const background = handles > 0 ? `，后台还有 ${handles} 个命令在跑` : "";
 	if (first) {
 		const tool = typeof first.toolName === "string" ? first.toolName : "工具";
-		const elapsed = typeof first.elapsedMs === "number" ? `（已 ${durationText(first.elapsedMs)}）` : "";
+		const elapsed = typeof first.elapsedMs === "number" ? `（已 ${durationText(first.elapsedMs + extraMs)}）` : "";
 		const more = calls.length > 1 ? `等 ${calls.length} 步` : "这一步";
 		return `\u26a0 已经 ${quiet}没有动静：正在等 ${tool} ${more}${elapsed}${background}`;
 	}
 	const busy = isSegment(payload?.busy) ? payload.busy : undefined;
 	if (busy?.streaming === true) return `\u26a0 已经 ${quiet}没有动静：正在等模型回复${background}`;
 	return `\u26a0 已经 ${quiet}没有动静${background}`;
+}
+
+/** What an exemption reason means to the owner, in the words they would use. */
+const EXCUSE_TEXT: Record<string, string> = {
+	live_bash_handles: "后台命令还在跑",
+	host_request_in_flight: "程序在等主机把一件事办完（比如等子代理）",
+	kernel_loop_awaiting_cell: "Python 还在正常运行",
+	kernel_reviving: "Python 内核正在重启恢复",
+	kernel_finishing_result: "Python 正在整理这一步的结果",
+	degraded_journal: "记录里还有后台命令在跑",
+};
+
+function stringsOf(value: unknown): string[] {
+	return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+/**
+ * The opening of the diagnostics block, for the owner rather than a developer: what was
+ * happening and for how long, what it most likely means, and what they can do about it. The raw
+ * lines ({@link formatStallEventLines}) follow it as reference.
+ */
+export function formatStallExplanation(
+	event: StallEventView,
+	options: { interruptKey?: string; sinceEventMs?: number } = {},
+): string[] {
+	const payload = isSegment(event.diagnostics) ? (event.diagnostics as Record<string, unknown>) : undefined;
+	const extraMs = Math.max(0, options.sinceEventMs ?? 0);
+	const quiet = durationText(event.silentMs + extraMs);
+	const calls = Array.isArray(payload?.inFlightToolCalls) ? payload.inFlightToolCalls.filter(isSegment) : [];
+	const first = calls[0];
+	const busy = isSegment(payload?.busy) ? payload.busy : undefined;
+	const exemption = isSegment(payload?.exemption) ? payload.exemption : undefined;
+	const kernel = isSegment(payload?.kernel) ? payload.kernel : undefined;
+	const key = options.interruptKey?.trim() ?? "";
+
+	let happened: string;
+	if (event.type === "stall_abort") {
+		happened = `这一轮已经 ${quiet}没有任何动静，被自动中断了。`;
+	} else if (event.type === "stall_unsettled") {
+		happened = "这一轮已经被中断，但还有工作没有停下来。";
+	} else if (first) {
+		const tool = typeof first.toolName === "string" ? first.toolName : "工具";
+		const ran =
+			typeof first.elapsedMs === "number" ? `（这一步已经跑了 ${durationText(first.elapsedMs + extraMs)}）` : "";
+		happened = `这一轮已经 ${quiet}没有任何动静，一直在等「${tool}」这一步${ran}。`;
+	} else if (busy?.streaming === true) {
+		happened = `这一轮已经 ${quiet}没有任何动静，一直在等模型回复。`;
+	} else {
+		happened = `这一轮已经 ${quiet}没有任何动静。`;
+	}
+
+	const excuses = stringsOf(exemption?.reasons)
+		.map((reason) => EXCUSE_TEXT[reason])
+		.filter((text): text is string => text !== undefined);
+	const kernelReasons = stringsOf(kernel?.reasons);
+	let meaning: string;
+	if (exemption?.reason === "paused") {
+		meaning = "它在等一件正常要花时间的事（比如你还没处理的弹窗，或正在整理上下文），不是卡死。";
+	} else if (exemption?.reason !== undefined && exemption.exhausted !== true) {
+		const why = excuses.length > 0 ? `（${excuses.join("，")}）` : "";
+		meaning = `有证据表明它还在干活${why}，多半是一个不出声的长任务，不是卡死。`;
+	} else if (kernelReasons.includes("loop_stalled")) {
+		meaning = "Python 内核没有反应，很可能真的卡住了（比如在等一个不会结束的命令）。";
+	} else if (kernelReasons.includes("heartbeat_stale")) {
+		meaning = "Python 内核很久没有报平安，可能卡住了。";
+	} else if (!first && busy?.streaming === true) {
+		meaning = "模型那边一直没有回音，通常是网络或服务器慢，也可能是请求卡住了。";
+	} else if (busy?.retrying === true) {
+		meaning = "它在重试一个失败的请求，等服务器恢复。";
+	} else {
+		meaning = "看不出它在干活：可能是在做一件不出声的长任务，也可能卡住了。";
+	}
+
+	let canDo: string;
+	if (event.type === "stall_abort") {
+		canDo = "发一句话让它接着做就行，它会看到被中断的原因，换个办法继续。";
+	} else if (event.type === "stall_unsettled") {
+		canDo = key ? `可以按 ${key} 再中断一次；还不行就关掉这个会话重新开。` : "可以关掉这个会话重新开。";
+	} else {
+		canDo = key
+			? `想等就不用管，它会接着跑；觉得不对就按 ${key} 中断这一轮，再告诉它换个办法。`
+			: "想等就不用管，它会接着跑；觉得不对就发一句话告诉它换个办法。";
+	}
+	return [`发生了什么：${happened}`, `这意味着：${meaning}`, `你可以：${canDo}`];
 }
 
 export function formatStallEventLines(event: StallEventView): string[] {

@@ -149,6 +149,7 @@ import { createSpendPricing, type SpendPricing } from "../../core/spend-pricing.
 import type { StallEventActions } from "../../core/stall-diagnostics.js";
 import {
 	formatStallEventLines,
+	formatStallExplanation,
 	formatStallSummary,
 	type StallEventView,
 	stallActionBarView,
@@ -427,6 +428,16 @@ interface SharedContextTree {
 const WORKING_PROMPT_PLACEHOLDER = "随时补充或纠正，Enter 发给 AI";
 /** How long a transient footer notice (`✓ copied`) stays lit. */
 const FOOTER_TOAST_MS = 2000;
+/** Session events that end a quiet spell: the stall bar stops counting its silence at the first one. */
+const STALL_QUIET_ENDING_EVENTS: ReadonlySet<string> = new Set([
+	"message_start",
+	"message_update",
+	"tool_execution_start",
+	"tool_execution_update",
+	"tool_execution_end",
+]);
+/** The terminal's reply to a cell-size query: input on the wire, but not the owner pressing a key. */
+const TERMINAL_CELL_SIZE_REPORT = /^\x1b\[6;\d+;\d+t$/;
 
 export const START_HINTS = [
 	"描述任务，@ 引用文件，/ 看命令",
@@ -1285,6 +1296,10 @@ export class InteractiveMode {
 	private stallActionBarEvent: (StallEventView & { actions?: StallEventActions }) | undefined;
 	/** The live bar is the settled one (the turn went on; diagnostics only). */
 	private stallActionBarSettled = false;
+	/** When the live bar was mounted: its quiet time keeps counting from the event's reading. */
+	private stallActionBarMountedAt: number | undefined;
+	/** The first sign of activity after the bar mounted; the quiet ended there. */
+	private stallActionBarActivityAt: number | undefined;
 	/** B1: the stall bar's input route, registered once and unregistered on teardown. */
 	private removeStallActionInputListener: (() => void) | undefined = undefined;
 	/** The open stall diagnostics block; the diagnostics key pressed again closes it. */
@@ -1924,6 +1939,7 @@ export class InteractiveMode {
 
 		this.setupKeyHandlers();
 		this.setupEditorSubmitHandler();
+		this.ui.addInputListener((data) => this.dutyLogReturnRoute(data));
 
 		this.ui.start();
 		this.fullscreenEnabled =
@@ -6235,6 +6251,9 @@ export class InteractiveMode {
 		}
 		this.activityTracker.handleEvent(event);
 		this.updateWorkingLoaderMessage();
+		if (this.stallActionBar !== undefined && STALL_QUIET_ENDING_EVENTS.has(event.type)) {
+			this.stallActionBarActivityAt ??= Date.now();
+		}
 
 		switch (event.type) {
 			case "agent_start":
@@ -8144,6 +8163,24 @@ export class InteractiveMode {
 		void this.showDutyLog({ automatic: true });
 	}
 
+	/** When the owner last pressed a key in this TUI; the duty log's "came back" clock. */
+	private lastOwnerKeyAt = Date.now();
+
+	/**
+	 * An owner who leaves the TUI attached for days never starts, attaches or resumes, so the
+	 * automatic duty log would never show. The first key after an idle gap longer than the
+	 * duty-log threshold is the moment they came back. Never consumes the key.
+	 */
+	private dutyLogReturnRoute(data: string): undefined {
+		if (isMouseSequence(data) || isKeyRelease(data) || TERMINAL_CELL_SIZE_REPORT.test(data)) return undefined;
+		const now = Date.now();
+		const idleMs = now - this.lastOwnerKeyAt;
+		this.lastOwnerKeyAt = now;
+		const thresholdMinutes = this.settingsManager.getDutyLogAfterMinutes();
+		if (thresholdMinutes > 0 && idleMs >= thresholdMinutes * 60_000) void this.showDutyLog({ automatic: true });
+		return undefined;
+	}
+
 	/**
 	 * The duty log for the current session. Automatic calls only show it when
 	 * the owner has been away longer than the setting and something happened;
@@ -8458,11 +8495,23 @@ export class InteractiveMode {
 			return false;
 		}
 		this.removeStallActionBar();
+		const mountedAt = Date.now();
+		this.stallActionBarMountedAt = mountedAt;
+		this.stallActionBarActivityAt = undefined;
 		const bar = new StallActions(
 			{
 				...event,
 				// Amber like the running card it belongs to (quiet past a minute already).
 				summary: theme.bold(theme.fg("runCardWarn", formatStallSummary(event))),
+				// Live: a bar left up for hours says how long it has really been quiet. The count
+				// stops at the first sign of activity after the warning, which ends the quiet.
+				summaryAt: (nowMs) =>
+					theme.bold(
+						theme.fg(
+							"runCardWarn",
+							formatStallSummary(event, (this.stallActionBarActivityAt ?? nowMs) - mountedAt),
+						),
+					),
 				actions: {
 					...view,
 					...(daemonActions?.autoRecoveryArmed === true
@@ -8495,7 +8544,7 @@ export class InteractiveMode {
 		this.stallActionBarEvent = event;
 		this.chatContainer.addChild(bar);
 		if (this.removeStallActionInputListener === undefined) {
-			this.removeStallActionInputListener = this.ui.addInputListener(this.stallActionInputRoute);
+			this.removeStallActionInputListener = this.ui.addInputListener((data) => this.stallActionInputRoute(data));
 		}
 		this.ui.requestRender();
 		return true;
@@ -8516,11 +8565,12 @@ export class InteractiveMode {
 		if (bar === undefined || event === undefined || this.stallActionBarSettled) {
 			return;
 		}
+		const quietSinceEventMs = this.stallQuietSinceEventMs();
 		this.removeStallActionBar({ render: false });
 		const settled = new StallActions(
 			{
 				...event,
-				summary: `${theme.fg("success", "✓")} ${formatStallSummary(event).replace(/^⚠\s*/, "")}，现在已经接着往下走了`,
+				summary: `${theme.fg("success", "✓")} ${formatStallSummary(event, quietSinceEventMs).replace(/^⚠\s*/, "")}，现在已经接着往下走了`,
 				actions: { canAbort: false, canDiagnose: true },
 			},
 			{
@@ -8535,8 +8585,28 @@ export class InteractiveMode {
 		this.stallActionBarEvent = event;
 		this.stallActionBarSettled = true;
 		this.chatContainer.addChild(settled);
-		this.removeStallActionInputListener ??= this.ui.addInputListener(this.stallActionInputRoute);
+		this.removeStallActionInputListener ??= this.ui.addInputListener((data) => this.stallActionInputRoute(data));
 		if (options.render !== false) this.ui.requestRender();
+	}
+
+	/**
+	 * Whether the stall routes (the action bar, the diagnostics close key) may read keys: only
+	 * while the plain editor has the keyboard. A dialog, selector or overlay with focus, an open
+	 * autocomplete list, or block navigation owns Esc, Ctrl+Y and every other key instead.
+	 */
+	private stallRoutesOwnKeyboard(): boolean {
+		if (this.blockNavigation !== undefined) return false;
+		// A capturing overlay, a selector or a dialog takes focus; a non-capturing overlay does not
+		// read keys, so it leaves the bar working.
+		if (this.ui.getFocusedComponent() !== this.editor) return false;
+		return !(this.editor === this.defaultEditor && this.defaultEditor.isShowingAutocomplete());
+	}
+
+	/** How much longer than the event's own reading the bar's quiet spell lasted (0 without a bar). */
+	private stallQuietSinceEventMs(): number {
+		const mountedAt = this.stallActionBarMountedAt;
+		if (mountedAt === undefined) return 0;
+		return Math.max(0, (this.stallActionBarActivityAt ?? Date.now()) - mountedAt);
 	}
 
 	/** Tear the live stall action bar down (if any). Safe when no bar is live. */
@@ -8563,14 +8633,18 @@ export class InteractiveMode {
 	 * key-release frames are not "any other key": clicks must reach the bar's
 	 * click regions, and a release must not re-trigger an action.
 	 */
-	private readonly stallActionInputRoute = (data: string): { consume?: boolean } | undefined => {
+	private stallActionInputRoute(data: string): { consume?: boolean } | undefined {
 		const bar = this.stallActionBar;
 		if (bar === undefined || bar.isDismissed) return undefined;
 		if (isMouseSequence(data) || isKeyRelease(data)) return undefined;
+		// Input listeners run before the focused component, so an Esc meant for a dialog would
+		// otherwise interrupt the turn. The bar neither acts nor dismisses while something else
+		// has the keyboard.
+		if (!this.stallRoutesOwnKeyboard()) return undefined;
 		if (bar.handleInput(data)) return { consume: true };
 		this.removeStallActionBar();
 		return undefined;
-	};
+	}
 
 	private showCtrlCExitHint(): void {
 		if (this.ctrlCExitHintTimer) {
@@ -9835,25 +9909,59 @@ export class InteractiveMode {
 		const components: Component[] = [];
 		if (this.chatContainer.children.length > 0) components.push(new Spacer(1));
 		const closeKey = keyText("app.stall.diagnostics");
-		const lines = [
+		// The owner reads the plain explanation; the machine lines below it are for a developer.
+		const body = [
 			theme.fg("muted", "诊断详情"),
+			...formatStallExplanation(event, {
+				interruptKey: keyText("app.input.clear"),
+				sinceEventMs: this.stallQuietSinceEventMs(),
+			}),
+			theme.fg("muted", "下面是给开发者看的原始记录，可以不看："),
 			...formatStallEventLines(event).map((line) => theme.fg("dim", line)),
-			...(closeKey.trim().length > 0 ? [theme.fg("muted", `${closeKey} 收起`)] : []),
 		];
-		components.push(new Text(lines.join("\n"), 1, 0));
+		const withHint = new Text(
+			[...body, ...(closeKey.trim().length > 0 ? [theme.fg("muted", `${closeKey} 收起`)] : [])].join("\n"),
+			1,
+			0,
+		);
+		const plain = new Text(body.join("\n"), 1, 0);
+		// The close key only belongs to the block while it is the newest thing in the chat. Once
+		// anything follows it (a reply, the next message, a notice) it is history, possibly far off
+		// screen, and the key goes back to its editor meaning (yank); the hint goes with it.
+		const isNewest = (): boolean => this.chatContainer.children.at(-1) === block;
+		const block: Component = {
+			render: (width) => (isNewest() ? withHint : plain).render(width),
+			invalidate: () => {
+				withHint.invalidate();
+				plain.invalidate();
+			},
+		};
+		components.push(block);
 		for (const component of components) this.chatContainer.addChild(component);
 		const removeInputListener = this.ui.addInputListener((data) => {
 			if (isMouseSequence(data) || isKeyRelease(data)) return undefined;
 			if (!this.keybindings.matches(data, "app.stall.diagnostics")) return undefined;
 			if (this.stallActionBar !== undefined && !this.stallActionBar.isDismissed) return undefined;
-			// The chat was cleared under the block (/new, resume): nothing left to close, so the
-			// key goes back to its editor meaning.
-			const open = components.every((component) => this.chatContainer.children.includes(component));
+			if (!this.stallRoutesOwnKeyboard()) return undefined;
+			if (!isNewest()) {
+				// Released, not removed: the block stays in history as a reference. Cleared chat
+				// (/new, resume) lands here too, with nothing left to close.
+				this.releaseStallDiagnostics();
+				return undefined;
+			}
 			this.closeStallDiagnostics();
-			return open ? { consume: true } : undefined;
+			return { consume: true };
 		});
 		this.stallDiagnosticsPanel = { components, removeInputListener };
 		this.ui.requestRender();
+	}
+
+	/** Stop the close key from reaching the diagnostics block; the block itself stays. */
+	private releaseStallDiagnostics(): void {
+		const panel = this.stallDiagnosticsPanel;
+		if (panel === undefined) return;
+		this.stallDiagnosticsPanel = undefined;
+		panel.removeInputListener();
 	}
 
 	private closeStallDiagnostics(options: { render?: boolean } = {}): void {

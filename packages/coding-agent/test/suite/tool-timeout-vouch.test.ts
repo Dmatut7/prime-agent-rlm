@@ -3,7 +3,9 @@ import { TOOL_TIMEOUT_CAUSE_PREFIX } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
+import { DUTY_EVENT_CUSTOM_TYPE, STEP_TIME_LIMIT_MARKER } from "../../src/core/duty-log.js";
 import type { KernelLivenessSample } from "../../src/core/kernel/shared.js";
+import type { StallWatchdogTimers } from "../../src/core/stall-watchdog.js";
 import type { TurnLivenessKernelFacts } from "../../src/core/turn-liveness.js";
 import { createHarness, type Harness } from "./harness.js";
 
@@ -145,6 +147,96 @@ describe("per-tool-call deadline vouch wiring", () => {
 		// windows instead of firing, so the call completes within the test window.
 		expect(textOfLastToolResult(harness)).toContain("slow tool completed");
 		expect(harness.faux.state.callCount).toBe(2);
+	});
+
+	/**
+	 * The watchdog's clock, jumped forward on demand: the exemption budget (50 minutes of silence
+	 * with no output) is spent in one step while the session's own clock - which the silent-step
+	 * rule reads - keeps real time.
+	 */
+	function jumpableWatchdogClock(): { timers: StallWatchdogTimers; jump(ms: number): void } {
+		let offset = 0;
+		return {
+			timers: {
+				setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+				clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+				now: () => Date.now() + offset,
+				monotonicNow: () => performance.now() + offset,
+			},
+			jump: (ms) => {
+				offset += ms;
+			},
+		};
+	}
+
+	/** A quiet long job: vouched by the kernel, no output of its own, and the budget spent midway. */
+	function quietLongJob(clock: { jump(ms: number): void }): AgentTool {
+		return {
+			name: "slow_cell",
+			label: "Slow Cell",
+			description: "A long build that prints nothing",
+			parameters: Type.Object({}),
+			executionTimeoutMs: 30,
+			execute: async () => {
+				await new Promise((resolve) => setTimeout(resolve, 200));
+				clock.jump(2 * 60 * 60 * 1000);
+				await new Promise((resolve) => setTimeout(resolve, 1_600));
+				return { content: [{ type: "text", text: "build finished" }], details: {} };
+			},
+		};
+	}
+
+	function stepStopEvents(harness: Harness): Array<{ kind: string; cause?: string }> {
+		return harness.sessionManager
+			.getBranch()
+			.filter((entry) => entry.type === "custom" && entry.customType === DUTY_EVENT_CUSTOM_TYPE)
+			.map((entry) => (entry as { data: { kind: string; cause?: string } }).data)
+			.filter((event) => event.kind === "step_stuck_stopped");
+	}
+
+	it("warn-only: a spent exemption budget does not kill a busy step the silent-step rule keeps", async () => {
+		// The default configuration kills nothing for spending the budget, so the per-call deadline
+		// must not either: a quiet build or training run used to die at the budget's mark.
+		const clock = jumpableWatchdogClock();
+		let cpuMs = 0;
+		const harness = await createHarness({
+			tools: [quietLongJob(clock)],
+			stallWatchdogTimers: clock.timers,
+			stallKernelLivenessFacts: () => workingKernelFacts(),
+			stepCpuProbe: () => {
+				cpuMs += 5_000;
+				return cpuMs;
+			},
+		});
+		harnesses.push(harness);
+
+		await runSlowToolTurn(harness);
+
+		expect(textOfLastToolResult(harness)).toContain("build finished");
+		expect(textOfLastToolResult(harness)).not.toContain(TOOL_TIMEOUT_CAUSE_PREFIX);
+		expect(stepStopEvents(harness)).toEqual([]);
+	});
+
+	it("abort armed: a spent budget stops the step and says so, instead of claiming it was silent", async () => {
+		const clock = jumpableWatchdogClock();
+		const harness = await createHarness({
+			tools: [quietLongJob(clock)],
+			settings: { stallWatchdog: { enabled: true, warnAfterSeconds: 300, abortAfterSeconds: 900 } },
+			stallWatchdogTimers: clock.timers,
+			stallKernelLivenessFacts: () => workingKernelFacts(),
+			stepCpuProbe: () => undefined,
+		});
+		harnesses.push(harness);
+
+		await runSlowToolTurn(harness);
+
+		const resultText = textOfLastToolResult(harness);
+		expect(resultText).toContain(TOOL_TIMEOUT_CAUSE_PREFIX);
+		expect(resultText).toContain(STEP_TIME_LIMIT_MARKER);
+		expect(resultText).toContain("not necessarily hung");
+		// The old text claimed seconds of silence for a step whose output had just been judged.
+		expect(resultText).not.toContain("produced no output for");
+		expect(stepStopEvents(harness)).toEqual([expect.objectContaining({ cause: "time_limit" })]);
 	});
 
 	it("no evidence and no output: the silent-step rule cancels the call and the turn continues", async () => {
