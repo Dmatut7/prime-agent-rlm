@@ -843,7 +843,16 @@ export interface UiSettings {
 	 * protects the U6 lane users, who can flip back one key.
 	 */
 	processMode?: ProcessModeSetting;
+	/**
+	 * Minutes the owner must have been away (since their last own message) before
+	 * opening a session shows the duty log above the prompt. `0` turns the
+	 * automatic block off; `/dutylog` still shows it on demand.
+	 */
+	dutyLogAfterMinutes?: number;
 }
+
+/** Default away time before the duty log appears on its own. */
+export const DEFAULT_DUTY_LOG_AFTER_MINUTES = 120;
 
 /** Default cadence of the spend cell's idle tick and its stale-figure catch-up. */
 export const DEFAULT_SUBAGENT_SPEND_CELL_INTERVAL_MS = 15_000;
@@ -1062,7 +1071,7 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	showHardwareCursor: null,
 	markdown: ["codeBlockIndent", "mermaid"],
 	warnings: ["anthropicExtraUsage"],
-	ui: ["subagentSpendCell", "processMode"],
+	ui: ["subagentSpendCell", "processMode", "dutyLogAfterMinutes"],
 	sessionDir: null,
 };
 
@@ -2299,6 +2308,12 @@ export class SettingsManager {
 		this.globalSettings.ui = { ...this.globalSettings.ui, processMode: mode };
 		this.markModified("ui", "processMode");
 		this.save();
+	}
+
+	/** Away minutes before the duty log shows itself; 0 = never automatically. Bad values land on the default. */
+	getDutyLogAfterMinutes(): number {
+		const value = this.settings.ui?.dutyLogAfterMinutes;
+		return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : DEFAULT_DUTY_LOG_AFTER_MINUTES;
 	}
 
 	getFooterTelemetry(): FooterTelemetrySetting {

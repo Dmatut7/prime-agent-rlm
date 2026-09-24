@@ -89,6 +89,7 @@ import {
 	DEFAULT_HEARTBEAT_DELIVERY_MODE,
 	parseHeartbeatCommand,
 } from "../../core/cron-jobs.js";
+import { formatDutyLog, readDutyLogEntries, summarizeDutyLog } from "../../core/duty-log.js";
 import type {
 	AutocompleteProviderFactory,
 	ContextUsage,
@@ -218,6 +219,7 @@ import { CountdownTimer } from "./components/countdown-timer.js";
 import { CustomEditor } from "./components/custom-editor.js";
 import { CustomMessageComponent } from "./components/custom-message.js";
 import { DaxnutsComponent } from "./components/daxnuts.js";
+import { DutyLogBlock } from "./components/duty-log-block.js";
 import { DynamicBorder } from "./components/dynamic-border.js";
 import { EarendilAnnouncementComponent } from "./components/earendil-announcement.js";
 import {
@@ -1399,6 +1401,8 @@ export class InteractiveMode {
 
 	// One-line recap of the agent's recent work, rendered just above the editor.
 	private recapContainer!: Container;
+	/** The duty log (值班记录) above the prompt; cleared on the next submitted input. */
+	private dutyLogContainer!: Container;
 	private sessionRecap: string | undefined;
 
 	private customFooter: (Component & { dispose?(): void }) | undefined = undefined;
@@ -1490,6 +1494,7 @@ export class InteractiveMode {
 		this.widgetContainerAbove = new Container();
 		this.widgetContainerBelow = new Container();
 		this.recapContainer = new Container();
+		this.dutyLogContainer = new Container();
 		this.keybindings = KeybindingsManager.create();
 		setKeybindings(this.keybindings);
 		const editorPaddingX = this.settingsManager.getEditorPaddingX();
@@ -5323,6 +5328,11 @@ export class InteractiveMode {
 			const submissionGeneration = ++this.inputSubmissionGeneration;
 			this.inputSubmissionsPending++;
 			this.clearShortcutGuide();
+			// The duty log answered "what happened while I was away"; the next input moves on.
+			if (this.dutyLogContainer?.children.length) {
+				this.dutyLogContainer.clear();
+				this.ui.requestRender();
+			}
 			// A barrier wait can resume after /new repointed the live session fields.
 			const submissionStashState = this.promptStashState;
 			const submissionSessionId = this.promptStashSessionId;
@@ -5573,6 +5583,11 @@ export class InteractiveMode {
 					}
 					const enable = arg === "on" ? true : arg === "off" ? false : !this.fullscreenEnabled;
 					this.setFullscreenMode(enable);
+					return;
+				}
+				if (commandName === "dutylog") {
+					this.editor.setText("");
+					await this.showDutyLog({ automatic: false });
 					return;
 				}
 				if (commandName === "speed") {
@@ -7895,8 +7910,48 @@ export class InteractiveMode {
 		// Show compaction info if session was compacted
 		const compactionCount = state.compactionCount;
 		if (compactionCount > 0) {
-			const times = compactionCount === 1 ? "1 time" : `${compactionCount} times`;
-			this.showStatus(`会话已压缩 ${times}`);
+			this.showStatus(`会话已压缩 ${compactionCount} 次`);
+		}
+		// Coming back after a while: say what happened meanwhile.
+		void this.showDutyLog({ automatic: true });
+	}
+
+	/**
+	 * The duty log for the current session. Automatic calls only show it when
+	 * the owner has been away longer than the setting and something happened;
+	 * `/dutylog` always answers.
+	 */
+	private async showDutyLog(options: { automatic: boolean }): Promise<void> {
+		// Runs fire-and-forget after every initial render: nothing here may throw out.
+		try {
+			const sessionFile = this.connectionState?.sessionFile;
+			const thresholdMinutes = this.settingsManager.getDutyLogAfterMinutes();
+			if (options.automatic && thresholdMinutes <= 0) return;
+			if (!sessionFile) {
+				if (!options.automatic) this.showStatus("这个会话没有记录文件，没有值班记录可看");
+				return;
+			}
+			const now = Date.now();
+			const summary = summarizeDutyLog({
+				entries: await readDutyLogEntries(sessionFile),
+				now,
+				children: buildSubagentPanelRows(this.subagentSnapshots.values(), this.rlmNodeId).map((row) => ({
+					name: row.name,
+					state: row.state,
+				})),
+			});
+			if (!summary) {
+				if (!options.automatic) this.showStatus("你离开之后这个会话没有新的动静");
+				return;
+			}
+			if (options.automatic && summary.awayMs < thresholdMinutes * 60_000) return;
+			this.dutyLogContainer.clear();
+			this.dutyLogContainer.addChild(new DutyLogBlock(formatDutyLog(summary, now)));
+			this.ui.requestRender();
+		} catch (error) {
+			if (!options.automatic) {
+				this.showError(`读取值班记录失败：${error instanceof Error ? error.message : String(error)}`);
+			}
 		}
 	}
 
@@ -8748,7 +8803,13 @@ export class InteractiveMode {
 	}
 
 	private getPromptContextContainers(): Container[] {
-		return [this.recapContainer, this.featureHintContainer, this.queuedMessagesContainer, this.sideQuestionContainer];
+		return [
+			this.dutyLogContainer,
+			this.recapContainer,
+			this.featureHintContainer,
+			this.queuedMessagesContainer,
+			this.sideQuestionContainer,
+		];
 	}
 
 	private getPromptDockComponents(): Component[] {

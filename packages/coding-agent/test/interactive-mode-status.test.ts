@@ -1688,6 +1688,7 @@ describe("InteractiveMode connection events", () => {
 			restoreStreamingMessageFromSnapshot,
 			restoreTurnStartFromMessages: vi.fn(),
 			showStatus: vi.fn(),
+			showDutyLog: vi.fn(async () => {}),
 		} as unknown as InteractiveMode;
 
 		const renderInitialMessages = (

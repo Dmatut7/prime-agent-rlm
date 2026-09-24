@@ -206,6 +206,7 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 		argumentHint: "[on|off]",
 		takesArgument: true,
 	},
+	{ name: "dutylog", description: "看值班记录：你离开期间做了什么、出过什么问题、哪件事要你拍板" },
 	{ name: "quit", description: `退出 ${APP_NAME}` },
 ];
 
@@ -215,6 +216,7 @@ const BUILTIN_SLASH_COMMAND_ALIASES: ReadonlyArray<BuiltinSlashCommandAlias> = [
 	{ name: "thinking", aliasFor: "effort" },
 	{ name: "rename", aliasFor: "name" },
 	{ name: "side", aliasFor: "btw" },
+	{ name: "值班", aliasFor: "dutylog" },
 ];
 
 function buildBuiltinSlashCommands(): ReadonlyArray<BuiltinSlashCommand> {
