@@ -558,7 +558,7 @@ export function createRlmChildStallNoticeMessage(
 			: "No evidence of progress was observed.";
 	const deadline =
 		details.abortAfterMs !== undefined && details.abortAfterMs > 0
-			? ` The watchdog will abort the turn after ${Math.max(1, Math.round(details.abortAfterMs / 1000))}s of silence unless the work resumes or you cancel it first.`
+			? ` The turn will be interrupted after ${Math.max(1, Math.round(details.abortAfterMs / 1000))}s of silence unless the work resumes or you cancel it first.`
 			: " No turn is killed for silence while the watchdog is warn-only, so letting it run is a valid answer.";
 	// Both levers interpolate the name into quoted call sites, so it carries the same
 	// header sanitization the terminal notice applies.
@@ -771,12 +771,14 @@ export function createRlmChildRecoveryActionMessage(
 			"Automatic intervention stops here: there will be no further interrupts and no automatic re-dispatch. The child's session, context, and transcript are intact.",
 		);
 		if (details.sessionDir) lines.push(`Session dir: ${details.sessionDir}`);
-		lines.push("Your move - inspect it, steer it, re-dispatch the task yourself, or delete it:");
+		lines.push(
+			"Your move - inspect it, steer it, or delete it and re-dispatch the task. Delete it before re-dispatching: a child that is only slow keeps working, and two workers on the same files overwrite each other.",
+		);
 		lines.push(`  await agent_observe.get_agent("${childName}")`);
+		lines.push(`  await rlm.delete_subagent("${childName}")`);
 		lines.push(
 			reDispatchLine ? `  ${reDispatchLine}` : `  await rlm(<restate the original task>, name="${childName}-retry")`,
 		);
-		lines.push(`  await rlm.delete_subagent("${childName}")`);
 	} else {
 		lines.push(
 			`RLM child ${childName} (${details.childId}): automatic stall recovery acted (executor: ${details.executor}; action: ${details.action}).`,
@@ -786,11 +788,14 @@ export function createRlmChildRecoveryActionMessage(
 			`If the child is still silent ~${escalateSeconds}s after the action you will receive one escalation notice. No automatic re-dispatch will happen - that decision stays with you.`,
 		);
 		if (reDispatchLine) {
-			lines.push("If you would rather re-dispatch it yourself now, this line is ready to paste:");
+			lines.push(
+				"If you would rather re-dispatch it yourself now, delete the original first (it may still be working, and two workers on the same files overwrite each other), then paste this line:",
+			);
+			lines.push(`  await rlm.delete_subagent("${childName}")`);
 			lines.push(`  ${reDispatchLine}`);
 		} else {
 			lines.push(
-				`If you would rather re-dispatch it yourself now: await rlm(<restate the original task>, name="${childName}-retry")`,
+				`If you would rather re-dispatch it yourself now, delete the original first (it may still be working): await rlm.delete_subagent("${childName}"), then await rlm(<restate the original task>, name="${childName}-retry")`,
 			);
 		}
 	}

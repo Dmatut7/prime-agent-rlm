@@ -7,3 +7,4 @@
 - Fixed the kernel bootstrap overwriting restored user variables named `json`, `os`, `re`, `shlex`, `sys` or `Path`.
 - Fixed `yaml.safe_dump` failing on bash output and harness overview strings.
 - Added the `~/.local/bin/uv` form of the kernel package install command for shells whose PATH lacks uv.
+- Changed the stall-recovery receipt so a parent deletes the original child before pasting the re-dispatch line, instead of running two workers on the same files.

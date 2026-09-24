@@ -64,6 +64,24 @@ describe("the child recovery receipt's escalation variant", () => {
 		expect(receipt.details?.action).toBe("abort");
 	});
 
+	it.each([
+		["the action receipt", {}],
+		["the escalation", { escalated: true, silentSinceActionMs: 901_000 }],
+	])("has the parent delete the original before re-dispatching in %s", (_name, overrides) => {
+		for (const reDispatch of [
+			undefined,
+			{ prompt: "audit the parser", model: "faux/faux-1", sessionName: "silent-worker" },
+		]) {
+			const content = String(
+				createRlmChildRecoveryActionMessage(childRecoveryDetails({ ...overrides, reDispatch })).content,
+			);
+			const deleteAt = content.indexOf('rlm.delete_subagent("silent-worker")');
+			const dispatchAt = content.indexOf("await rlm(");
+			expect(deleteAt).toBeGreaterThanOrEqual(0);
+			expect(dispatchAt).toBeGreaterThan(deleteAt);
+		}
+	});
+
 	it("quotes the measured silence since the action, not the escalation window", () => {
 		const receipt = createRlmChildRecoveryActionMessage(
 			childRecoveryDetails({ action: "abort", escalated: true, silentSinceActionMs: 901_000 }),
