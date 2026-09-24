@@ -30,6 +30,20 @@ export function remapImageMarkers(text: string, remaps: ReadonlyMap<number, numb
 }
 
 /**
+ * Write the saved file of each pasted image next to its marker, as `[image #N](path)`,
+ * so the sent message tells any model where the image lives: a text-only model, or one
+ * resumed after the image bytes left its context, can load it again from there. A
+ * marker already followed by a path (a resent or edited message) is left as is.
+ */
+export function annotateImageMarkerPaths(text: string, paths: ReadonlyMap<number, string>): string {
+	if (paths.size === 0) return text;
+	return text.replace(/\[image #(\d+)\](?!\()/g, (marker, id: string) => {
+		const path = paths.get(Number(id));
+		return path === undefined ? marker : `${marker}(${path})`;
+	});
+}
+
+/**
  * Images from `pending` whose marker still appears in `text`, in paste order
  * (the map's insertion order). Each image is returned at most once even if its
  * marker is duplicated in the text.

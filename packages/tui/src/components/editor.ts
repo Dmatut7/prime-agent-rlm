@@ -340,6 +340,12 @@ export class Editor implements Component, Focusable {
 	public backgroundColor: ((str: string) => string) | undefined;
 	public autocompleteBackgroundColor: ((str: string) => string) | undefined;
 	public commandColor: ((str: string) => string) | undefined;
+	/**
+	 * Rewrites a bracketed paste before it is inserted (control characters already
+	 * dropped). The result is inserted as one undo unit, like the paste itself; the
+	 * host uses it to attach a pasted or dragged image file path as an image.
+	 */
+	public transformPaste: ((text: string) => string) | undefined;
 
 	private autocompleteProvider?: AutocompleteProvider;
 	private autocompleteList?: SelectList;
@@ -1458,6 +1464,7 @@ export class Editor implements Component, Focusable {
 		const cleanText = this.normalizeText(decodedText);
 
 		let filteredText = filterPasteControlChars(cleanText);
+		if (this.transformPaste) filteredText = this.transformPaste(filteredText);
 
 		// If pasting a file path (starts with /, ~, or .) and the character before
 		// the cursor is a word character, prepend a space for better readability

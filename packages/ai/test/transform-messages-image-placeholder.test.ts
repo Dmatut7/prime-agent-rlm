@@ -35,6 +35,8 @@ describe("image placeholder for a text-only model", () => {
 		const text = placeholder?.type === "text" ? placeholder.text : "";
 		expect(text).toContain("not shown to this model");
 		expect(text).toContain("an image-capable model that did see it wrote that reply");
+		// A detail the description left out is not a dead end: the file can be looked at again.
+		expect(text).toContain("the conversation gives the image's file path");
 		expect(text).not.toContain("omitted");
 	});
 

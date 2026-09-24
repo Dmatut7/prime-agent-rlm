@@ -236,8 +236,22 @@ async def run(*paths: str) -> str:
     from rlm import host_request
 
     info = await host_request("model.info")
+    if info.get("blockImages"):
+        # Every image is replaced by a placeholder before any request, so loading one
+        # would only pretend the model looked at it.
+        raise RuntimeError(
+            "Images are turned off for this session (images.blockImages in settings.json), so no "
+            "model would see this image. Tell the user; they can turn images back on there."
+        )
     if "image" not in info.get("input", []):
         model_id = info.get("id") or "the current model"
+        if info.get("imageModelProblem") == "unusable":
+            raise RuntimeError(
+                f"{model_id} does not support vision, and the configured imageModel "
+                f"{info.get('imageModel')!r} cannot be used (unknown model, no image input, or not "
+                "logged in). Tell the user to fix imageModel in settings.json or log in to its "
+                "provider, or to switch to a vision-capable model."
+            )
         raise RuntimeError(
             f"{model_id} does not support vision. "
             "Tell the user to set imageModel in settings.json to a vision model (it reads images "

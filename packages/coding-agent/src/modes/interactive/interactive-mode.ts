@@ -103,6 +103,7 @@ import type {
 } from "../../core/extensions/index.js";
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.js";
 import { emptyGoalState, formatGoalUsage, GOAL_CONTEXT_PREVIEW_LABEL, type GoalState } from "../../core/goals.js";
+import { resolveImageModelRoute } from "../../core/image-model-routing.js";
 import type { KernelSentAgentMessage } from "../../core/kernel/index.js";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.js";
 import { runMcpManagementCommand } from "../../core/mcp/mcp-command.js";
@@ -127,6 +128,7 @@ import { resolvePrimeInferencePostLoginModelAction } from "../../core/prime-infe
 import { parseCommandArgs } from "../../core/prompt-templates.js";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.js";
 import { SessionImportFileNotFoundError } from "../../core/session-import-errors.js";
+import { getSessionArtifactPathForFile } from "../../core/session-manager.js";
 import { resolveSessionPath, SessionSelectorError, SessionSelectorNotFoundError } from "../../core/session-resolver.js";
 import { consecutiveToolErrorsFromMessages } from "../../core/session-stats.js";
 import {
@@ -321,6 +323,8 @@ import {
 	shouldRunOnboarding,
 	shouldRunPrimeCliOnboardingSplash,
 } from "./onboarding.js";
+import { PastedImageFiles, pastedImageProblemNotice } from "./pasted-image-files.js";
+import { imageFilesInPaste } from "./pasted-image-paths.js";
 import type { ClientPromptStashStore, PromptStash, PromptStashState } from "./prompt-stash-state.js";
 import { QueueSelection, type QueueSelectionItem } from "./queue-selection.js";
 import { findRecentSession, formatAgo, type RecentSession } from "./recent-session.js";
@@ -1395,6 +1399,11 @@ export class InteractiveMode {
 	// attaches only the images whose markers are present in the sent text.
 	private pastedImages = new Map<number, ImageContent>();
 	private nextImageMarkerId = 1;
+	// Files behind pasted images: Ctrl+V images saved under the session, pasted image
+	// paths being loaded. The sent text names each saved file next to its marker.
+	private pastedImageFilesStore: PastedImageFiles | undefined;
+	// `provider/model` of the image model last announced as reading this turn's images.
+	private imageModelServingNotice: string | undefined;
 
 	private unsubscribe?: () => void;
 	private signalCleanupHandlers: Array<() => void> = [];
@@ -4943,6 +4952,7 @@ export class InteractiveMode {
 		this.defaultEditor.onPasteImage = () => {
 			this.handleClipboardImagePaste();
 		};
+		this.defaultEditor.transformPaste = (text) => this.attachPastedImageFiles(text);
 	}
 
 	private snapshotPromptStashFrom(editor: EditorComponent, text: string): PromptStash {
@@ -5122,27 +5132,102 @@ export class InteractiveMode {
 				: raw;
 
 			// Register the image and insert a visible marker. The image is attached to
-			// the prompt as multimodal content rather than written to disk, so a vision
-			// model receives it directly.
+			// the prompt as multimodal content, so a vision model receives it directly;
+			// a copy saved under the session lets a model look at it again later.
 			const markerId = this.nextImageMarkerId++;
 			this.rememberPastedImage(markerId, attachment);
+			this.pastedImageFiles.save(markerId, attachment, this.pastedImageDir());
 			this.editor.insertTextAtCursor?.(formatImageMarker(markerId));
 			this.ui.requestRender();
-
-			const model = this.getCurrentModel();
-			if (
-				model &&
-				!model.input.includes("image") &&
-				!this.settingsManager.getImageModel() &&
-				!this.settingsManager.getBlockImages()
-			) {
-				this.showStatus(
-					"Current model does not support images; set imageModel in settings.json or the turn will fail with setup guidance.",
-				);
-			}
+			await this.warnIfPastedImageUnseen();
 		} catch {
 			// Silently ignore clipboard errors (may not have permission, etc.)
 		}
+	}
+
+	/**
+	 * A paste that is exactly one or more image file paths (typed, copied, or dropped
+	 * from Finder) attaches each file as an image like Ctrl+V, keeping the path visible;
+	 * anything else is left as the text it was.
+	 */
+	private attachPastedImageFiles(text: string): string {
+		const files = imageFilesInPaste(text, this.getCurrentCwd());
+		if (!files) return text;
+		const markers = files.map((file) => {
+			const markerId = this.nextImageMarkerId++;
+			this.pastedImageFiles.load(markerId, file);
+			return formatImageMarker(markerId);
+		});
+		void this.warnIfPastedImageUnseen();
+		return `${text.trimEnd()} ${markers.join(" ")}`;
+	}
+
+	private get pastedImageFiles(): PastedImageFiles {
+		this.pastedImageFilesStore ??= new PastedImageFiles({
+			remember: (markerId, image) => this.rememberPastedImage(markerId, image),
+			warn: (message) => this.showStatus(message, "warning"),
+		});
+		return this.pastedImageFilesStore;
+	}
+
+	/** Where this session keeps pasted images, or undefined for an unsaved session. */
+	private pastedImageDir(): string | undefined {
+		const state = this.connectionState;
+		if (!state?.sessionFile) return undefined;
+		try {
+			return path.join(getSessionArtifactPathForFile(state.sessionFile, state.sessionId), "pasted-images");
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * Warn at paste time, in Chinese, when no model will see the image: the session model
+	 * has no image input and imageModel is unset, unusable (unknown, not image-capable,
+	 * not logged in), or images are turned off. Same checks the dispatch applies.
+	 */
+	private async warnIfPastedImageUnseen(): Promise<void> {
+		const model = this.getCurrentModel();
+		const state = this.connectionState;
+		if (!model || !state || model.input.includes("image")) return;
+		const availableModels = await this.getConnectionAvailableModels().catch(() =>
+			this.getAvailableConnectionModels(),
+		);
+		const route = resolveImageModelRoute({
+			sessionModel: model,
+			thinkingLevel: state.thinkingLevel,
+			serviceTier: state.serviceTier,
+			imageModelReference: this.settingsManager.getImageModel(),
+			availableModels,
+			hasConfiguredAuth: (candidate) => this.isModelProviderConfigured(candidate),
+			blockImages: this.settingsManager.getBlockImages(),
+		});
+		const notice = pastedImageProblemNotice(route, `${model.provider}/${model.id}`);
+		if (notice) this.showStatus(notice, "warning");
+	}
+
+	/**
+	 * Say which model reads the images when a turn of a text-only session model is
+	 * served by an image-capable one, once per routed stretch.
+	 */
+	private noticeImageModelServing(message: AssistantMessage): void {
+		const sessionModel = this.getCurrentModel();
+		const served = `${message.provider}/${message.model}`;
+		if (
+			!sessionModel ||
+			sessionModel.input.includes("image") ||
+			(message.provider === sessionModel.provider && message.model === sessionModel.id)
+		) {
+			this.imageModelServingNotice = undefined;
+			return;
+		}
+		const servingModel =
+			this.connectionModelCatalog.find(
+				(model) => model.provider === message.provider && model.id === message.model,
+			) ?? this.modelRegistry.find(message.provider, message.model);
+		if (!servingModel?.input.includes("image") || this.imageModelServingNotice === served) return;
+		this.imageModelServingNotice = served;
+		this.showStatus(`这张图交给 ${served} 看`);
 	}
 
 	/**
@@ -5774,6 +5859,8 @@ export class InteractiveMode {
 
 				this.clearSideQuestion({ abort: true });
 				this.flushPendingBashComponents();
+				// A pasted image path is still being read: send its image, not a bare marker.
+				if (this.pastedImageFiles.hasPending(text)) await this.pastedImageFiles.settle(text);
 				const images = this.collectImagesFor(text);
 				this.editor.addToHistory?.(text);
 				this.editor.setText("");
@@ -5802,7 +5889,7 @@ export class InteractiveMode {
 					return;
 				}
 				try {
-					await this.agentConnection.prompt(text, {
+					await this.agentConnection.prompt(this.pastedImageFiles.annotate(text), {
 						streamingBehavior,
 						queueIfBusy: true,
 						images,
@@ -6313,6 +6400,7 @@ export class InteractiveMode {
 					this.addMessageToChat(event.message);
 					this.ui.requestRender();
 				} else if (event.message.role === "assistant") {
+					this.noticeImageModelServing(event.message);
 					// U6: the turn's aggregate line is created at the turn head,
 					// before the first streaming assistant component.
 					this.ensureCurrentTurnSummary();
@@ -12421,7 +12509,7 @@ ${blocksPrev ? `| \`${blocksPrev}\`${blocksNext ? ` / \`${blocksNext}\`` : ""} |
 			if (options.name) await this.agentConnection.setSessionName(options.name);
 			if (options.prompt) {
 				this.editor.addToHistory?.(options.prompt);
-				await this.agentConnection.prompt(options.prompt, { images });
+				await this.agentConnection.prompt(this.pastedImageFiles.annotate(options.prompt), { images });
 			}
 		} catch (error: unknown) {
 			if (!created) {

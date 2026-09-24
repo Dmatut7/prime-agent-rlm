@@ -26,6 +26,20 @@ describe("Editor paste filtering (r33 FR-3)", () => {
 		assert.deepStrictEqual(editor.getText(), "one\ntwo\nthree");
 	});
 
+	it("lets the host rewrite a paste, inserted as one undo unit", () => {
+		const editor = new Editor(createTestTUI(), defaultEditorTheme);
+		const seen: string[] = [];
+		editor.transformPaste = (text) => {
+			seen.push(text);
+			return `${text} [image #1]`;
+		};
+		editor.handleInput(`${PASTE_START}/tmp/shot\u0007.png${PASTE_END}`);
+		assert.deepStrictEqual(seen, ["/tmp/shot.png"]);
+		assert.strictEqual(editor.getText(), "/tmp/shot.png [image #1]");
+		editor.handleInput("\x1f");
+		assert.strictEqual(editor.getText(), "");
+	});
+
 	it("does not freeze the editor on an 8MB paste", () => {
 		const editor = new Editor(createTestTUI(), defaultEditorTheme);
 		const big = "a".repeat(8 * 1024 * 1024);

@@ -54,6 +54,7 @@ import type { AuthSelectorProvider } from "../src/modes/interactive/components/o
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
 import { TurnActivityState, TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
 import { formatSplashCwd, InteractiveMode, truncatePathMiddle } from "../src/modes/interactive/interactive-mode.js";
+import { PastedImageFiles } from "../src/modes/interactive/pasted-image-files.js";
 import { ClientPromptStashStore, type PromptStashState } from "../src/modes/interactive/prompt-stash-state.js";
 import { QueueSelection } from "../src/modes/interactive/queue-selection.js";
 import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
@@ -716,6 +717,7 @@ type SubmitHandlerHarness = {
 	promptStash?: { text: string };
 	promptStashState: PromptStashState;
 	pastedImages: Map<number, unknown>;
+	pastedImageFiles: PastedImageFiles;
 	getPromptStashImages: (text: string) => readonly (readonly [number, unknown])[];
 	retainStartupPromptDrafts?: (prompts: readonly { text: string; images?: readonly unknown[] }[]) => void;
 	nextImageMarkerId?: number;
@@ -766,6 +768,7 @@ function createSubmitHandlerHarness(overrides: Partial<SubmitHandlerHarness> = {
 		handleResumeCommand: vi.fn(async () => {}),
 		promptStash: undefined,
 		pastedImages: new Map(),
+		pastedImageFiles: new PastedImageFiles({ remember: vi.fn(), warn: vi.fn() }),
 		getPromptStashImages: vi.fn(() => []),
 		snapshotPromptStash: vi.fn((text) => ({ text })),
 		retainSubmittedDraft: (
