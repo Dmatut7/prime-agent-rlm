@@ -12,7 +12,7 @@ import {
 	SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
 } from "../../../core/messages.js";
 import type { ProcessModeSetting } from "../../../core/settings-manager.js";
-import { AgentMessageComponent } from "./agent-message.js";
+import { AGENT_MESSAGE_TURN_INSET, AgentMessageComponent } from "./agent-message.js";
 import { AssistantMessageComponent } from "./assistant-message.js";
 import { BashExecutionComponent } from "./bash-execution.js";
 import {
@@ -250,6 +250,8 @@ export function buildConversationComponents(
 			turnSummary?.addCommMessage();
 			const component = new AgentMessageComponent(message, options.markdownTheme, {
 				suppressLeadingSpace: isCompactAgentMessageNeighbor(components.at(-1)),
+				// Inside a quiet turn the row lines up with the turn's steps.
+				inset: options.processMode === "quiet" && turnSummary ? AGENT_MESSAGE_TURN_INSET : 0,
 			});
 			component.setExpanded(agentMessagesExpanded);
 			components.push(component);

@@ -195,7 +195,7 @@ import {
 } from "../shared/startup-notices.js";
 import { AGENT_ACTIVITY_LABELS, AgentActivityTracker, formatTokenCount } from "./agent-activity.js";
 import { type AuthenticationResult, getAnthropicSubscriptionAuthWarning, ProviderAuthFlows } from "./auth-flows.js";
-import { AgentMessageComponent } from "./components/agent-message.js";
+import { AGENT_MESSAGE_TURN_INSET, AgentMessageComponent } from "./components/agent-message.js";
 import { ArminComponent } from "./components/armin.js";
 import { AssistantMessageComponent } from "./components/assistant-message.js";
 import { BashExecutionComponent } from "./components/bash-execution.js";
@@ -420,19 +420,24 @@ export function getRandomStartHint(random = Math.random): (typeof START_HINTS)[n
 	return START_HINTS[Math.floor(random() * START_HINTS.length)] ?? START_HINTS[0];
 }
 
-function isLabeledQueuedPreview(message: string): boolean {
-	return (
-		message.startsWith(`${HEARTBEAT_PROMPT_PREVIEW_LABEL}: `) ||
-		message.startsWith(`${GOAL_CONTEXT_PREVIEW_LABEL}: `) ||
-		message.startsWith(`${AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL}: `)
-	);
-}
+/**
+ * Queue previews the session already labels (the English labels double as
+ * detection keys in core), mapped to their display wording.
+ */
+const LABELED_QUEUED_PREVIEWS: ReadonlyArray<[prefix: string, display: string]> = [
+	[`${HEARTBEAT_PROMPT_PREVIEW_LABEL}: `, "定时任务："],
+	[`${GOAL_CONTEXT_PREVIEW_LABEL}: `, "目标："],
+	[`${AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL}: `, "收到消息："],
+];
 
 /** The queued-message row labels: a steer lands in the running turn, a follow-up after it. */
 const QUEUED_MESSAGE_LABELS = { Steering: "插话", "Follow-up": "稍后发送" } as const;
 
 export function formatQueuedMessagePreview(message: string, label: "Steering" | "Follow-up"): string {
-	return isLabeledQueuedPreview(message) ? message : `${QUEUED_MESSAGE_LABELS[label]}：${message}`;
+	for (const [prefix, display] of LABELED_QUEUED_PREVIEWS) {
+		if (message.startsWith(prefix)) return `${display}${message.slice(prefix.length)}`;
+	}
+	return `${QUEUED_MESSAGE_LABELS[label]}：${message}`;
 }
 
 export function styleQueuedMessagePreview(
@@ -7469,6 +7474,7 @@ export class InteractiveMode {
 		if (isAgentSessionMessage(message)) {
 			return new AgentMessageComponent(message, this.getMarkdownThemeWithSettings(), {
 				suppressLeadingSpace: isCompactAgentMessageNeighbor(this.chatContainer.children.at(-1)),
+				inset: this.isInsideQuietTurn() ? AGENT_MESSAGE_TURN_INSET : 0,
 			});
 		}
 		if (isInjectedPromptMessage(message)) {
@@ -8922,6 +8928,18 @@ export class InteractiveMode {
 		}
 		this.applyTurnExpansion(entry.summary);
 		return true;
+	}
+
+	/** Whether the chat's tail is a quiet turn (its summary comes after the latest user message). */
+	private isInsideQuietTurn(): boolean {
+		if (this.settingsManager.getProcessMode() !== "quiet") return false;
+		const children = this.chatContainer.children;
+		for (let i = children.length - 1; i >= 0; i--) {
+			const child = children[i];
+			if (child instanceof TurnSummaryComponent) return true;
+			if (child instanceof UserMessageComponent) return false;
+		}
+		return false;
 	}
 
 	private latestTurnSummary(): TurnSummaryComponent | undefined {

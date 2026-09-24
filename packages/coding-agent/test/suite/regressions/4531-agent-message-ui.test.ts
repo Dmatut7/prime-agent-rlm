@@ -160,7 +160,7 @@ describe("ENG-4531 agent message UI", () => {
 
 	it("does not add a second queue label to agent message previews", () => {
 		expect(formatQueuedMessagePreview("Agent message received: Use shard seven.", "Follow-up")).toBe(
-			"Agent message received: Use shard seven.",
+			"收到消息：Use shard seven.",
 		);
 		expect(formatQueuedMessagePreview("Run the remaining checks.", "Steering")).toBe(
 			"插话：Run the remaining checks.",
@@ -381,6 +381,38 @@ describe("ENG-4531 agent message UI", () => {
 		// U6: the turn summary line rides at the turn head (index 0), so the
 		// agent message follows the assistant component at index 2.
 		expect(assistantThenMessage[2]?.render(120)[0]).toBe("");
+	});
+
+	it("insets agent-message rows under a quiet turn so they line up with its steps", () => {
+		const second = createAgentSessionMessage(createPayload("Use shard seven."));
+		const options = {
+			ui: { requestRender: () => {} } as unknown as TUI,
+			cwd: "/tmp",
+			toolOptions: {},
+			getToolDefinition: () => undefined,
+		};
+		const quiet = buildConversationComponents([fauxAssistantMessage("working"), second], {
+			...options,
+			processMode: "quiet",
+		});
+		const row = stripAnsi(
+			quiet
+				.at(-1)
+				?.render(120)
+				.find((line) => line.includes("收到消息")) ?? "",
+		);
+		expect(row.startsWith("   ◆ 收到消息")).toBe(true);
+		const legacy = buildConversationComponents([fauxAssistantMessage("working"), second], {
+			...options,
+			processMode: "legacy",
+		});
+		const legacyRow = stripAnsi(
+			legacy
+				.at(-1)
+				?.render(120)
+				.find((line) => line.includes("收到消息")) ?? "",
+		);
+		expect(legacyRow.startsWith(" ◆ 收到消息")).toBe(true);
 	});
 
 	it("suppresses live spacing between agent messages and following tool activity", () => {
