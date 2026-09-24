@@ -1,0 +1,3 @@
+- Added block navigation: Alt+↑/Alt+↓ (when no messages are queued) walk the conversation blocks with a highlight; Enter or Space opens the block's steps or Thinking, y copies it, Esc returns to the prompt; fullscreen scrolls the focused block into view.
+- Changed agent-message rows inside a quiet turn to line up with the turn's steps, and queue previews to read 定时任务 / 目标 / 收到消息.
+- Fixed three long-failing test suites (git config leak, harness gaps) and translated the new-session messages.

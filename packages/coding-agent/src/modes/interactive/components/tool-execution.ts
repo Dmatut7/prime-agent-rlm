@@ -9,6 +9,7 @@ import { getTextOutput as getRenderedTextOutput } from "../../../core/tools/rend
 import type { AgentConnectionToolDefinition } from "../../agent-connection/index.js";
 import { type Theme, theme } from "../theme/theme.js";
 import { getWorkingPulseFrame, workingIconFrame } from "../theme/working-icon.js";
+import { type BlockFocusState, decorateFocusedBlock, type FocusableBlock } from "./block-focus.js";
 import { getIpythonCodeFromArgs, IPythonCellComponent } from "./ipython-cell.js";
 import { quietConversationBudget } from "./tool-output-budget.js";
 import { ToolPanel } from "./tool-panel.js";
@@ -91,7 +92,8 @@ function argsComparable(args: unknown): boolean {
 	}
 }
 
-export class ToolExecutionComponent extends Container {
+export class ToolExecutionComponent extends Container implements FocusableBlock {
+	private blockFocus?: BlockFocusState;
 	private contentPanel: ToolPanel;
 	private selfRenderContainer: Container;
 	private callRendererComponent?: Component;
@@ -422,6 +424,28 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	override render(width: number): string[] {
+		const lines = this.renderTool(width);
+		return this.blockFocus && lines.length > 0 ? decorateFocusedBlock(lines, width, this.blockFocus) : lines;
+	}
+
+	setBlockFocus(state: BlockFocusState | undefined): void {
+		this.blockFocus = state;
+	}
+
+	/** The step's text output (what it printed), not its rendered decoration. */
+	getBlockCopyText(): string {
+		const details = this.result?.details as { stdout?: unknown; stderr?: unknown; result?: unknown } | undefined;
+		const structured = [details?.stdout, details?.stderr, details?.result].filter(
+			(value): value is string => typeof value === "string" && value.trim().length > 0,
+		);
+		if (structured.length > 0) return structured.join("\n");
+		return (this.result?.content ?? [])
+			.map((block) => (block.type === "text" ? (block.text ?? "") : ""))
+			.filter((text) => text.length > 0)
+			.join("\n");
+	}
+
+	private renderTool(width: number): string[] {
 		if (this.hideComponent) {
 			this.clickRegions = [];
 			return this.hiddenLines;

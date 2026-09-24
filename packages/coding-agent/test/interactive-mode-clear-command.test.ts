@@ -77,7 +77,7 @@ describe("InteractiveMode /clear", () => {
 		expect(prompt).toHaveBeenCalledWith("-- exact\n  text [image #7]  ", { images: [image] });
 		expect(setSessionName.mock.invocationCallOrder[0]).toBeLessThan(prompt.mock.invocationCallOrder[0]);
 		expect(requestRender).toHaveBeenCalledWith();
-		expect(renderAll(context.chatContainer)).toContain("New session started");
+		expect(renderAll(context.chatContainer)).toContain("已开新会话");
 	});
 
 	it("does not rerender when the connection reports cancellation", async () => {

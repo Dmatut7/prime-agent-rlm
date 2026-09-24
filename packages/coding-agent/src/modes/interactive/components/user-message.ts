@@ -9,6 +9,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { builtinSlashCommandTakesArgument, parseSlashCommand } from "../../../core/slash-commands.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
+import { type BlockFocusState, decorateFocusedBlock, type FocusableBlock } from "./block-focus.js";
 import { PromptTokenMask } from "./prompt-highlight.js";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
@@ -85,13 +86,14 @@ class MarkedLines implements Component {
 	}
 }
 
-export class UserMessageComponent extends Container {
+export class UserMessageComponent extends Container implements FocusableBlock {
 	private contentBox: Box;
 	private decoratedSource?: string[];
 	private decoratedLines?: string[];
+	private blockFocus?: BlockFocusState;
 
 	constructor(
-		text: string,
+		private readonly text: string,
 		_markdownTheme: MarkdownTheme = getMarkdownTheme(),
 		isRecognizedSlashCommand: (name: string) => boolean = () => false,
 	) {
@@ -116,13 +118,23 @@ export class UserMessageComponent extends Container {
 		// identity: decorating in place would stack markers on every frame, and
 		// returning a fresh array every frame would defeat the parent's identity cache.
 		if (this.decoratedSource === lines && this.decoratedLines) {
-			return this.decoratedLines;
+			return this.blockFocus
+				? decorateFocusedBlock(this.decoratedLines, width, this.blockFocus)
+				: this.decoratedLines;
 		}
 		const decorated = lines.slice();
 		decorated[0] = OSC133_ZONE_START + decorated[0];
 		decorated[decorated.length - 1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + decorated[decorated.length - 1];
 		this.decoratedSource = lines;
 		this.decoratedLines = decorated;
-		return decorated;
+		return this.blockFocus ? decorateFocusedBlock(decorated, width, this.blockFocus) : decorated;
+	}
+
+	setBlockFocus(state: BlockFocusState | undefined): void {
+		this.blockFocus = state;
+	}
+
+	getBlockCopyText(): string {
+		return this.text;
 	}
 }

@@ -1,5 +1,6 @@
 import { type ClickRegion, type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { theme } from "../theme/theme.js";
+import { type BlockFocusState, decorateFocusedBlock, type FocusableBlock } from "./block-focus.js";
 import type { FileChangeSummary } from "./edit-summary.js";
 import { turnStepsSummary } from "./step-label.js";
 import { TurnFootNote } from "./turn-footnote.js";
@@ -415,7 +416,8 @@ export class TurnActivityState {
 	}
 }
 
-export class TurnSummaryComponent implements Component {
+export class TurnSummaryComponent implements Component, FocusableBlock {
+	private blockFocus?: BlockFocusState;
 	private expanded = false;
 	private cachedWidth?: number;
 	private cachedLines?: string[];
@@ -474,6 +476,23 @@ export class TurnSummaryComponent implements Component {
 	}
 
 	render(width: number): string[] {
+		const lines = this.renderTurnHead(width);
+		return this.blockFocus && lines.length > 0 ? decorateFocusedBlock(lines, width, this.blockFocus) : lines;
+	}
+
+	setBlockFocus(state: BlockFocusState | undefined): void {
+		this.blockFocus = state;
+	}
+
+	/** The process line and its rows as plain text. */
+	getBlockCopyText(): string {
+		return this.renderTurnHead(120)
+			.map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd())
+			.filter((line) => line.trim().length > 0)
+			.join("\n");
+	}
+
+	private renderTurnHead(width: number): string[] {
 		// TUI v4: freeze only a fully settled turn - every step done AND the
 		// end stamp landed. Comms and thinking can still grow between the last
 		// settled step and the turn end, so `isSettled` alone would freeze the

@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import { Box } from "../src/components/box.js";
 import { Image } from "../src/components/image.js";
 import { Markdown } from "../src/components/markdown.js";
+import { FullscreenViewport } from "../src/fullscreen.js";
 import type { TerminalStopOptions } from "../src/terminal.js";
 import { resetCapabilitiesCache, setCapabilities, setCellDimensions } from "../src/terminal-image.js";
 import { type Component, Container, TUI } from "../src/tui.js";
@@ -1302,5 +1303,34 @@ describe("TUI fullscreen mode", () => {
 		assert.deepStrictEqual(game.inputs, ["\x1b[5;1:3~"]);
 
 		tui.stop();
+	});
+});
+
+describe("FullscreenViewport reveal marker", () => {
+	const marker = "\x1b_pi:block-focus\x07";
+
+	it("scrolls a marked row above the window into view and strips the marker", () => {
+		const viewport = new FullscreenViewport();
+		const transcript = Array.from({ length: 40 }, (_, index) => `row ${index}`);
+		viewport.composeFrame(transcript, ["dock"], 11);
+		transcript[5] = `${marker}row 5`;
+		viewport.setRevealMarker(marker);
+		const frame = viewport.composeFrame(transcript, ["dock"], 11);
+		assert.ok(
+			frame.some((line) => line.includes("row 5")),
+			JSON.stringify(frame),
+		);
+		assert.ok(!frame.some((line) => line.includes(marker)));
+		assert.ok(!viewport.isFollowing());
+	});
+
+	it("leaves the window alone when the marked row is already visible", () => {
+		const viewport = new FullscreenViewport();
+		const transcript = Array.from({ length: 40 }, (_, index) => `row ${index}`);
+		transcript[38] = `${marker}row 38`;
+		viewport.setRevealMarker(marker);
+		const frame = viewport.composeFrame(transcript, ["dock"], 11);
+		assert.ok(frame.some((line) => line.includes("row 39")));
+		assert.ok(viewport.isFollowing());
 	});
 });

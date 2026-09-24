@@ -4,6 +4,7 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { type Component, Container, Markdown, type MarkdownTheme, Spacer, Text } from "@earendil-works/pi-tui";
 import { LOGIN_RECOVERY_MESSAGE } from "../../../core/auth-guidance.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
+import { type BlockFocusState, decorateFocusedBlock, type FocusableBlock } from "./block-focus.js";
 import {
 	CollapsibleErrorComponent,
 	normalizeErrorDetails,
@@ -72,7 +73,8 @@ function formatInlineLoginRecoveryMessage(message: string): string | undefined {
  * structure is unchanged, only the text of changed blocks is updated in place,
  * preserving each Markdown child's render cache instead of rebuilding the tree.
  */
-export class AssistantMessageComponent extends Container {
+export class AssistantMessageComponent extends Container implements FocusableBlock {
+	private blockFocus?: BlockFocusState;
 	private contentContainer: Container;
 	private hideThinkingBlock: boolean;
 	private markdownTheme: MarkdownTheme;
@@ -155,6 +157,23 @@ export class AssistantMessageComponent extends Container {
 	}
 
 	override render(width: number): string[] {
+		const lines = this.renderMessage(width);
+		return this.blockFocus && lines.length > 0 ? decorateFocusedBlock(lines, width, this.blockFocus) : lines;
+	}
+
+	setBlockFocus(state: BlockFocusState | undefined): void {
+		this.blockFocus = state;
+	}
+
+	/** The answer's own Markdown source (text blocks only). */
+	getBlockCopyText(): string {
+		return (this.lastMessage?.content ?? [])
+			.map((block) => (block?.type === "text" ? block.text.trim() : ""))
+			.filter((text) => text.length > 0)
+			.join("\n\n");
+	}
+
+	private renderMessage(width: number): string[] {
 		if (this.dirty) {
 			if (this.lastMessage) {
 				this.reconcile(this.lastMessage);

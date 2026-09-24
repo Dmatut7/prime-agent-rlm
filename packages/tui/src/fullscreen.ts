@@ -102,6 +102,8 @@ type SelectionMode = "transcript" | "table" | "frame";
 export class FullscreenViewport {
 	private scrollTop = 0;
 	private following = true;
+	/** A zero-width marker whose row the next frame scrolls into view, then strips. */
+	private revealMarker: string | undefined;
 	private prevFrame: string[] = [];
 	private prevWidth = 0;
 	private prevHeight = 0;
@@ -158,6 +160,16 @@ export class FullscreenViewport {
 			this.scrollTop = maxScroll;
 		} else {
 			this.scrollTop = Math.max(0, Math.min(this.scrollTop, maxScroll));
+		}
+		const marker = this.revealMarker;
+		if (marker) {
+			const row = transcript.findIndex((line) => line.includes(marker));
+			if (row !== -1 && (row < this.scrollTop || row >= this.scrollTop + windowHeight)) {
+				// Leave a little context above the revealed row.
+				this.scrollTop = Math.max(0, Math.min(row - 2, maxScroll));
+				this.following = this.scrollTop >= maxScroll;
+			}
+			transcript = transcript.map((line) => (line.includes(marker) ? line.split(marker).join("") : line));
 		}
 		this.lastMaxScroll = maxScroll;
 		this.lastWindowHeight = windowHeight;
@@ -818,6 +830,11 @@ export class FullscreenViewport {
 	/** Force the next paint to clear and repaint the whole screen. */
 	reset(): void {
 		this.prevFrame = [];
+	}
+
+	/** Keep the transcript row carrying `marker` in view (until cleared with undefined). */
+	setRevealMarker(marker: string | undefined): void {
+		this.revealMarker = marker;
 	}
 
 	/** Scrolling up pauses following; reaching the bottom resumes it. */
