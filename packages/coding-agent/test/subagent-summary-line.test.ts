@@ -644,6 +644,53 @@ describe("SubagentSummaryLine", () => {
 		expect(onClosed.call(mode, "killed")).toBe(false);
 		expect(returnToAgentsView).toHaveBeenCalledTimes(2);
 	});
+
+	it("exposes one click region per shown row plus the header only when openable", () => {
+		const empty = new SubagentSummaryLine();
+		expect(empty.render(100)).toEqual([]);
+		expect(empty.getClickRegions()).toHaveLength(0);
+
+		const line = new SubagentSummaryLine();
+		line.setSubagentCounts({ total: 2, running: 1, idle: 0, inactive: 1 });
+		line.setSubagentRows([
+			{ id: "worker", name: "worker", state: "running" },
+			{ id: "review", name: "review", state: "failed" },
+		]);
+		// Rows stay clickable even in a no-daemon session: the detail card is rendered locally.
+		line.render(100);
+		let regions = [...line.getClickRegions()];
+		expect(regions.map((region) => region.line)).toEqual([1, 2]);
+		for (const region of regions) {
+			expect(region).toMatchObject({ col: 0, width: 100, height: 1 });
+		}
+
+		line.setOpenable(true);
+		line.render(100);
+		regions = [...line.getClickRegions()];
+		expect(regions.map((region) => region.line)).toEqual([0, 1, 2]);
+	});
+
+	it("a row click selects that row and fires onRowActivate with it", () => {
+		const line = new SubagentSummaryLine();
+		const activated: string[] = [];
+		line.onRowActivate = (row) => activated.push(row.id);
+		line.setSubagentCounts({ total: 2, running: 1, idle: 0, inactive: 1 });
+		line.setSubagentRows([
+			{ id: "worker", name: "worker", state: "running" },
+			{ id: "review", name: "review", state: "failed" },
+		]);
+		line.focused = true;
+		line.render(100);
+
+		const reviewRegion = line.getClickRegions()[1];
+		reviewRegion?.onClick({ row: 0, col: 5 });
+		expect(activated).toEqual(["review"]);
+
+		// The pointer selection is the keyboard selector: › moved to the clicked row.
+		const rendered = line.render(100).map(stripAnsi);
+		expect(rendered[1]).not.toContain("›");
+		expect(rendered[2]).toContain("›");
+	});
 });
 
 function usage(input: number, output: number, cost: number): Usage {

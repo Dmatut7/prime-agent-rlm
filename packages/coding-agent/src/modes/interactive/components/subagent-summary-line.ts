@@ -1,4 +1,11 @@
-import { type Component, type Focusable, getKeybindings, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import {
+	type ClickRegion,
+	type Component,
+	type Focusable,
+	getKeybindings,
+	truncateToWidth,
+	visibleWidth,
+} from "@earendil-works/pi-tui";
 import type { ContextTreeNode } from "../../../core/context-tree.js";
 import { nodeSpendMoney, type SpendPricing, spendRelevantTokens } from "../../../core/spend-pricing.js";
 import type { AgentConnectionRlmChildAgentSnapshot } from "../../agent-connection/index.js";
@@ -31,7 +38,7 @@ const ROW_NAME_MAX_WIDTH = 16;
 /** Narrowest activity column worth showing; below it the column drops. */
 const ROW_ACTIVITY_MIN_WIDTH = 8;
 
-const ROW_STATE_WORDS: Record<SubagentPanelRowState, string> = {
+export const ROW_STATE_WORDS: Record<SubagentPanelRowState, string> = {
 	running: "运行",
 	idle: "空闲",
 	done: "完成",
@@ -419,6 +426,8 @@ export class SubagentSummaryLine implements Component, Focusable {
 	private cachedWidth?: number;
 	private cachedKey?: string;
 	private cachedLines?: string[];
+	/** Click regions from the last render(): the header when openable, one per shown row. */
+	private clickRegions: ClickRegion[] = [];
 
 	/** Enter/open: the selected row, when the panel lists rows. */
 	onOpen?: (row: SubagentPanelRow | undefined) => void;
@@ -426,6 +435,8 @@ export class SubagentSummaryLine implements Component, Focusable {
 	onStopAll?: () => void;
 	onCancel?: () => void;
 	onChatAction?: (data: string) => void;
+	/** Fired when a row is clicked: opens that subagent's detail card (see SubagentDetailOverlay). */
+	onRowActivate?: (row: SubagentPanelRow) => void;
 
 	setSubagentCounts(counts: SubagentSummaryCounts): void {
 		this.counts = counts;
@@ -516,6 +527,17 @@ export class SubagentSummaryLine implements Component, Focusable {
 		return lines;
 	}
 
+	/**
+	 * Click regions from the last render(), in this component's own coordinates
+	 * (containers offset them). One per shown row - clicking opens that
+	 * subagent's detail card - plus the header when openable, matching the
+	 * `打开` hint. Render cache hits reuse them: a cached frame has the same
+	 * row layout the regions were built for.
+	 */
+	getClickRegions(): ReadonlyArray<ClickRegion> {
+		return this.clickRegions;
+	}
+
 	private cacheKey(): string {
 		return [
 			this.counts.total,
@@ -572,9 +594,13 @@ export class SubagentSummaryLine implements Component, Focusable {
 	 * over the rows. No children hides the panel.
 	 */
 	private renderLines(width: number): string[] {
+		this.clickRegions = [];
 		if (this.counts.total === 0) return [];
 		const safeWidth = Math.max(1, width);
 		const lines = [this.renderHeader(safeWidth)];
+		if (this.openable) {
+			this.clickRegions.push({ line: 0, col: 0, width: safeWidth, height: 1, onClick: () => this.onOpen?.() });
+		}
 		if (!this.focused && this.rows.length > 0 && this.rows.every(isSettledPanelRow)) {
 			// Nothing in flight: finished children would otherwise sit there as a
 			// block of rows until they close. One line says so; the header's ↓ still lists them.
@@ -587,6 +613,19 @@ export class SubagentSummaryLine implements Component, Focusable {
 		}
 		shown.forEach((row, index) => {
 			lines.push(this.renderRow(row, safeWidth, this.focused && start + index === this.selectedRow));
+			this.clickRegions.push({
+				line: lines.length - 1,
+				col: 0,
+				width: safeWidth,
+				height: 1,
+				onClick: () => {
+					// A click selects the row it lands on, so the keyboard selector
+					// and the pointer agree on which child is active.
+					this.selectedRow = start + index;
+					this.invalidate();
+					this.onRowActivate?.(row);
+				},
+			});
 		});
 		const below = this.rows.length - start - shown.length;
 		if (below > 0) {

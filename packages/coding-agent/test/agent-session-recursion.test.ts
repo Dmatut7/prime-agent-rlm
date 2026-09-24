@@ -370,6 +370,14 @@ describe("AgentSession rlm recursion", () => {
 			createDefaultRlmSubagentSessionName("same task", "sub-AbCdEfGh"),
 		);
 		expect(createDefaultRlmSubagentSessionName("x".repeat(200), "sub-a1b2c3d4")).toHaveLength(64);
+		// A CJK prompt keeps its characters instead of collapsing to "worker".
+		expect(createDefaultRlmSubagentSessionName("调研成都本地厂商", "sub-a1b2c3d4")).toBe(
+			"subagent-调研成都本地厂商-a1b2c3d4",
+		);
+		expect(createDefaultRlmSubagentSessionName("调研，成都 本地厂商！", "sub-a1b2c3d4")).toBe(
+			"subagent-调研-成都-本地厂商-a1b2c3d4",
+		);
+		expect(createDefaultRlmSubagentSessionName("调".repeat(200), "sub-a1b2c3d4")).toHaveLength(64);
 	});
 
 	it("denies goal.create inside a spawned subagent session (goals are depth-0 only)", async () => {
