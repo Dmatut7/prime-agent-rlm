@@ -140,6 +140,14 @@ describe("turnStepLabel harness calls", () => {
 		expect(turnStepLabel(cell("await agent_message.send('done', receiver_role='parent')"))).toBe("发消息");
 		expect(turnStepLabel(cell("print(await attach_image('a.png'))"))).toBe("看图");
 		expect(turnStepLabel(cell("hits = await bailian_search.search('天气')"))).toBe("联网搜索");
+		expect(turnStepLabel(cell("answer = bailian_web_search.search('今天的新闻')\nprint(answer)"))).toBe("联网搜索");
+		expect(
+			turnStepLabel(
+				cell(
+					"res1, res2 = await asyncio.gather(\n    asyncio.to_thread(bailian_web_search.search, '头条'),\n    asyncio.to_thread(bailian_web_search.search, '科技'),\n)\nprint(res1[:2000])",
+				),
+			),
+		).toBe("联网搜索");
 		expect(turnStepLabel(cell("rlm.harness.create_memory('t', 'c')"))).toBe("记笔记");
 	});
 });

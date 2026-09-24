@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.11.7] - 2026-09-24
+
+- Changed the bailian web search default timeout from 90s to 240s; broad queries such as today's news regularly took longer and timed out.
+- Fixed a web search handed to asyncio.to_thread showing as 查看输出 instead of 联网搜索 in the process line.
+
 ## [0.11.6] - 2026-09-24
 
 - Fixed the bailian web search losing its answer when the model awaited it: the returned text is now also awaitable.

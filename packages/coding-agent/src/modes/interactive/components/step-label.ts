@@ -53,7 +53,11 @@ const PYTHON_CALL_LABELS: ReadonlyArray<[RegExp, string]> = [
 	[/\bawait\s+rlm\(/g, "派子代理"],
 	[/\brlm\.(?:collect|list_subagents)\(/g, "查看子代理"],
 	[/\battach_image(?:\.run)?\(/g, "看图"],
-	[/\b(?:bailian_search|websearch|exa_websearch)\.\w+\(/g, "联网搜索"],
+	// Called directly or handed to asyncio.to_thread (no parenthesis after the name).
+	[
+		/\b(?:bailian_web_search|bailian_search|websearch|exa_websearch)\.search\b|\b(?:websearch|exa_websearch)\.\w+\(/g,
+		"联网搜索",
+	],
 	[/\brlm\.harness\.(?:create|update)_memory\(/g, "记笔记"],
 ];
 

@@ -77,7 +77,7 @@ def search(
     model: str = "qwen3.8-flash",
     strategy: str = "max",
     max_tokens: int = 1500,
-    timeout: int = 90,
+    timeout: int = 240,
 ) -> str:
     """Search the web and return the synthesized answer text.
 
@@ -88,7 +88,8 @@ def search(
             pro_ultra/max/image (default "max"; pro family and max return
             structured, citation-numbered answers at the same latency).
         max_tokens: answer length cap.
-        timeout: per-call timeout in seconds; real searches take 15-90s.
+        timeout: per-call timeout in seconds. Short lookups take 15-90s; broad
+            ones (news, long answers) can take 2-4 minutes, so the default is 240.
 
     Returns the answer text. Raises RuntimeError when no API key is found and
     urllib.error.HTTPError on API errors (400 with the valid tier list means a
