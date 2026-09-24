@@ -6,6 +6,12 @@
 - 0.11.14 推送后 CI 红 3 个测试：界面直接引用了会话管理模块（粘贴图片存盘时取目录），两个老测试的替身缺粘贴图片部件。目录改由界面服务提供，替身补齐；本地按 CI 分三片全量跑 8900+ 测试全绿。用户无感知。
 - 其它：「没做完就停」的中文误判修正；值班记录不重复计数、自动模式不再只算几分钟、长时间挂着回来按键会弹出；诊断详情开头有中文说明；查价长网页不丢价格行、PDF 读出文字、SearXNG/Docker/VPN 挂了明确说搜索不可用；翻看模式（Alt+↑）不再卡死、全屏能滚动、消息时间带日期、若干英文提示改中文。
 
+## 2026-09-24（午）0.11.14 预备：会话线程自动命名
+
+- 老板实拍发火：83 个平级会话 65 个是纯 UUID 名，线程找不到。根因：名字只存在转录的 session_info 条目里，而写口只有 /name、rlm spawn 的 name=、daemon rename 三条手动路径——根会话和 agent-message 触发的会话从无自动命名。
+- 改法：首条入站内容（人话或广播正文）持久化且首回复落地后，自动写一个 `auto: true` 标记的名字（首行有意义句、路径/URL 收成 basename/host、32 码点截断、「继续/ok/好」这类低信息句拒名）；session_info 带 provenance 字段，人工 /name 永远不被自动路径覆盖，精修完成时重读 provenance 防竞态。子代理（rlmDepth>0）不碰。设置 `autoSessionName`：off / first-message（默认）/ llm（首回合后一次性后台精修标题，走 auxiliaryModel、thinking 阶梯按 daemon summarizer 实测 sizing、20s 超时、失败静默保留确定性名）。
+- 新命令 `prime-agent autoname`：默认 dry-run 列出待命名会话与拟用名，`--apply` 走写租约（appendOwnedFastEntryAsync，与 daemon rename 同纪律）落盘；无 assistant 回复的空草稿跳过（不破坏 daemon 的空草稿丢弃），legacy 版本文件跳过不迁移，重名自动加「 2」后缀（agent-message 按名路由对重名抛 ambiguous）。
+- 审查：设计审 A（deepseek-v4-pro）/B（glm-5.3-prime）+ 交叉审 C（qwen3.8-max）三轮，.pipeline/auto-session-name/ 留计划与三份报告；C 的 6 项阻塞核实后 5 项成立已修（撤谱系继承、空草稿闸、legacy 跳过、重名后缀、子代理闸），1 项（报告不存在）实证不成立。测试 25 条新 + 定向回归 145 条绿。
 ## 2026-09-25（凌晨）0.11.13 本地联网搜索、子代理面板、看图交接
 
 - 新增内置技能 `web_research`：本机 SearXNG 搜索（引擎重调，8 条测试查询 0/8→8/8 有结果）、分层读网页（指纹 HTTP→无头浏览器→网页存档）、无头点到下单/购物车页读实际价（付款、下单、个人信息一律拒绝）、arXiv/Crossref/OpenAlex/Stack Exchange/GitHub。实测 RackNerd、搬瓦工、LisaHost 三家走到购物车，均停在付款前；全程不弹窗、无残留进程。打印结果先给价格/配置行、正文限长，避开百炼内容审核 400。老板全局规则搜索段把它列为要准确内容时的主通道。
