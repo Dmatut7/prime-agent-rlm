@@ -1,6 +1,6 @@
 ---
 name: web-research
-description: Research the live web from the kernel - SearXNG search, reading exact page content (docs, pricing tables), headless click-through to a vendor's real cart/order price (stops before payment), and free paper/Q&A APIs (arXiv, Crossref, OpenAlex, Stack Exchange, GitHub). Use for VPS/cloud price comparisons, docs lookups and technical research. No API key needed.
+description: Research the live web from the kernel - search through the owner's local SearXNG container, reading exact page content (docs, pricing tables, PDFs), headless click-through to a vendor's real cart/order price (stops before payment), and free paper/Q&A APIs (arXiv, Crossref, OpenAlex, Stack Exchange, GitHub). Use for VPS/cloud price comparisons, docs lookups and technical research. No API key needed; search() needs Docker and the SearXNG container running (bailian_web_search is the fallback when it is not), everything else only needs the network.
 ---
 
 # Web Research
@@ -15,15 +15,17 @@ Printing any result gives a compact view; the objects also carry structured fiel
 
 ## Keep page text out of the conversation
 
-`print(page)` and `print(snapshot)` show the price, spec, route and stock lines first, then only
-the first ~1500 characters of the page. The full text stays in `page.content` / `snap.text`, and
-`page.save()` / `snap.save()` write it to a file and return the path. Keep it that way: a full
-vendor page costs thousands of tokens, and on Bailian models it can end the turn. Measured
-2026-09-25 in six parallel VPS research subagents: raw vendor text (full of DDoS, firewall and
-protection wording) made the provider answer `400 data_inspection_failed`, the turn could not be
-retried and the subagent died. When you need more than the key lines, save the page and pull out
-just the lines you need with Python (`page.key_lines`, a regex over `page.content`), printing a
-few hundred characters rather than the page.
+`print(page)` and `print(snapshot)` show the price, spec, route and stock lines first (amounts of
+money first when a page has more than fit), then only the first ~1500 characters of the page with a
+`[TRUNCATED: ...]` marker saying how much is left. The whole page stays in `page.content` /
+`snap.text`, however long it is, and `page.save()` / `snap.save()` write it all to a file and return
+the path; `page.key_lines` / `snap.price_lines` list every matching line of the whole page. Keep
+the printing that way: a full vendor page costs thousands of tokens, and on Bailian models it can
+end the turn. Measured 2026-09-25 in six parallel VPS research subagents: raw vendor text (full of
+DDoS, firewall and protection wording) made the provider answer `400 data_inspection_failed`, the
+turn could not be retried and the subagent died. When you need more than the key lines, save the
+page and pull out just the lines you need with Python (`page.key_lines`, a regex over
+`page.content`), printing a few hundred characters rather than the page.
 
 ## Which tool, and why
 
@@ -36,7 +38,7 @@ few hundred characters rather than the page.
 
 ### `search(query, *, categories=None, engines=None, max_results=10, language=None, time_range=None)`
 
-Runs through the local SearXNG container, which merges Google, Yahoo, Yandex and Brave (plus
+Runs through the local SearXNG container (`prime-searxng` on port 18888), which merges Google, Yahoo, Yandex and Brave (plus
 Naver and Wikipedia). Each result is a dict with `title`, `url`, `domain`, `snippet`, `engine`,
 `engines`, `published`. `categories="it"` searches GitHub, Stack Overflow, MDN, PyPI and npm;
 `"science"` searches arXiv, Crossref, OpenAlex and Google Scholar; `"news"` is thin (Yahoo News only).
@@ -51,10 +53,23 @@ few hundred test queries on 2026-09-25 Google answered with a CAPTCHA and SearXN
 hour (Brave rate-limits sooner), while Yahoo and Yandex kept answering. So search with purpose,
 a handful of well-chosen queries rather than a loop over dozens of variants.
 
-If SearXNG is down, `search` raises `web_research.SearchUnavailable` whose message says what to
-do: start it from the bash tool with `docker start prime-searxng`, wait a few seconds, retry.
+That container was set up by hand on the owner's Mac; nothing in prime-agent creates or starts
+it, and its engines are all foreign sites. So search can be down in two ways, and both raise
+`web_research.SearchUnavailable` (message starts `搜索服务不可用`) instead of returning an empty list:
 
-### `fetch(url, *, render="auto", max_chars=20000, mode="auto", wait_for=None, expect=None, archive=True)`
+- SearXNG does not answer. The message has already checked Docker and says which case it is:
+  Docker not running (usual after a reboot: `open -a Docker`, wait until `docker info` answers,
+  then `docker start prime-searxng`), the container stopped (`docker start prime-searxng`), or
+  the container missing (tell the owner search needs it set up).
+- SearXNG answers but every engine failed and nothing came back: the VPN/proxy is off or the
+  network is down (or the engines rate-limited this machine). Rewording the query cannot fix
+  that, so do not loop over variants.
+
+Either way, `await bailian_web_search.asearch(query)` still works from mainland China without a
+VPN, so use it for this turn (its answer has no source URLs; confirm what matters with `fetch` on
+the source page), and say in your report that SearXNG search was unavailable.
+
+### `fetch(url, *, render="auto", max_chars=None, mode="auto", wait_for=None, expect=None, archive=True)`
 
 Reads one page as markdown (tables kept as `| a | b |` rows). It tries the cheapest way first
 and escalates only when that did not really get the page; `result.tier` says which worked and
@@ -80,7 +95,19 @@ for login, captcha and blocking. Report that to the owner instead of guessing wh
 `render="never"` stays on HTTP; `render="always"` goes straight to the browser. `mode="full"`
 returns all visible text; the default switches to it by itself when main-content extraction
 dropped most of a large page (pricing grids often look like boilerplate to it).
-`fetch_many(urls, concurrency=4)` fetches several pages at once.
+`fetch_many(urls, concurrency=4)` fetches several pages at once. `max_chars=` cuts `content` only;
+`key_lines` and `save()` still cover the whole page.
+
+A PDF URL returns the PDF's text (`content_mode == "pdf"`, first 150 pages). When the PDF has no
+text layer, or the kernel lacks the PDF reader, `ok` is False and `reason` starts with `pdf` and
+names the page to read instead (for arXiv: `arxiv.org/abs/<id>` or `arxiv.org/html/<id>`); other
+binary files (images, archives) come back `ok=False` with `binary file`. Decoded as text they would
+be pages of garbage that look like a successful read.
+
+Sites for a Chinese audience (`.cn`, Aliyun, Tencent Cloud, Huawei Cloud...) are asked for Chinese
+first so they show the mainland offer in CNY; other sites are asked for English first. Pass
+`BrowserSession(locale="zh-CN")` / `browse(..., locale="zh-CN")` to override for a vendor that
+switches currency by language.
 
 ### `BrowserSession` - clicking through to the real price
 
@@ -109,6 +136,12 @@ choosing the options, so walk there:
   Vendor quote and stock APIs often live there and are more exact than the rendered text.
 - `fill(field, value)` only types into quantity, coupon/promo code, hostname and search fields.
 - Also: `open(url, wait_for=None)`, `wait(seconds, selector=None, text=None)`, `back()`, `html()`, `close()`.
+- The first browser use on a machine downloads Chrome Headless Shell (~95 MB, usually under a
+  minute; it gives up after ~7 minutes or sooner when the download stalls, and Esc stops it). If
+  that fails, the failure is remembered for 2 hours so later fetches do not wait again: the
+  browser tier reports `BrowserUnavailable` at once, `fetch` still answers from HTTP and the
+  archive, and the message gives the one bash command that installs it by hand (the next call
+  then uses it). A missing browser usually means the VPN/proxy was off during the download.
 - The browser starts on first use; a session closes itself after 5 minutes idle (`idle_timeout=`),
   and the shared browser exits ~20 s after the last session. `web_research.shutdown_browser()`
   closes it at once; `web_research.browser_running()` reports whether it is up.

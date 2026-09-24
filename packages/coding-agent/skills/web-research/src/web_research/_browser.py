@@ -14,15 +14,34 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from typing import Any
 
-from . import _net
+from . import _net, _proc
 
 HEADLESS = True
 # How long the shared browser stays up after its last user leaves, so a burst of fetches does not
 # pay the ~1s launch each time. After that nothing is left running.
 LINGER_SECONDS = 20.0
-_INSTALL_TIMEOUT = 900.0
+# The one-time Chrome Headless Shell download (~95 MB). curl gives up on a stalled transfer
+# (under 20 KB/s for 45 s) and after 7 minutes in all; the Playwright fallback gets 4 minutes and
+# is stopped after 90 s without output. A failure is remembered (see _INSTALL_FAILURE), so an
+# unattended run pays that wait once, not on every fetch; it is tried again after
+# _INSTALL_RETRY_AFTER, so a run that outlives a VPN outage still gets its browser back.
+_CURL_TIMEOUT = 420.0
+_PLAYWRIGHT_INSTALL_TIMEOUT = 240.0
+_PLAYWRIGHT_INSTALL_IDLE = 90.0
+_INSTALL_RETRY_AFTER = 2 * 3600.0
+# (monotonic time of the failure, why), or None.
+_INSTALL_FAILURE: tuple[float, str] | None = None
+
+
+class BrowserUnavailable(RuntimeError):
+    """The headless browser cannot start (Chrome Headless Shell missing and its install failed)."""
+
+
+def _manual_install_command() -> str:
+    return f"{sys.executable} -m playwright install --only-shell chromium"
 
 
 def launch_options(**requested: Any) -> dict[str, Any]:
@@ -51,18 +70,6 @@ def _scrub_headed_env() -> None:
         os.environ.pop(name, None)
 
 
-async def _run(args: list[str], timeout: float) -> tuple[int, str]:
-    proc = await asyncio.create_subprocess_exec(
-        *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=dict(os.environ)
-    )
-    try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        return -1, f"timed out after {timeout:.0f}s"
-    return proc.returncode or 0, out.decode(errors="replace")
-
-
 async def _download_with_curl() -> str | None:
     """Fetch the headless shell zip with curl (resumable, retried) into the path Playwright expects.
 
@@ -73,7 +80,9 @@ async def _download_with_curl() -> str | None:
     curl, unzip = shutil.which("curl"), shutil.which("unzip")
     if not curl or not unzip:
         return "curl/unzip not found"
-    code, out = await _run([sys.executable, "-m", "playwright", "install", "--dry-run", "--only-shell", "chromium"], 60)
+    code, out = await _proc.run(
+        [sys.executable, "-m", "playwright", "install", "--dry-run", "--only-shell", "chromium"], 30
+    )
     if code != 0:
         return f"dry-run failed: {out[-200:]}"
     location = url = None
@@ -87,12 +96,14 @@ async def _download_with_curl() -> str | None:
         return "could not read the download URL from playwright"
     os.makedirs(location, exist_ok=True)
     archive = os.path.join(location, "download.zip")
-    code, out = await _run(
-        [curl, "-fsSL", "--retry", "5", "--retry-all-errors", "-C", "-", "-o", archive, url], _INSTALL_TIMEOUT
-    )
+    args = [curl, "-fsSL", "--connect-timeout", "20", "--speed-limit", "20480", "--speed-time", "45"]
+    args += ["--retry", "3", "--retry-all-errors", "--retry-max-time", str(int(_CURL_TIMEOUT) - 20)]
+    proxy = _net.proxy_for(url)
+    args += ["-x", proxy] if proxy else ["--noproxy", "*"]
+    code, out = await _proc.run([*args, "-C", "-", "-o", archive, url], _CURL_TIMEOUT)
     if code != 0:
         return f"curl failed ({code}): {out[-200:]}"
-    code, out = await _run([unzip, "-q", "-o", archive, "-d", location], 300)
+    code, out = await _proc.run([unzip, "-q", "-o", archive, "-d", location], 120)
     if code != 0:
         return f"unzip failed: {out[-200:]}"
     os.remove(archive)
@@ -101,24 +112,51 @@ async def _download_with_curl() -> str | None:
 
 
 async def _install_headless_shell() -> None:
+    """Download Chrome Headless Shell once; raises BrowserUnavailable with the reason when it cannot."""
     print(
         "web_research: first headless-browser use on this machine - downloading Chrome Headless Shell "
-        "(about 95 MB, one time, usually under a minute)...",
+        f"(about 95 MB, one time, usually under a minute; gives up after {_CURL_TIMEOUT / 60:.0f} min "
+        "or sooner if the download stalls)...",
         flush=True,
     )
-    why = await _download_with_curl()
+    try:
+        why = await _download_with_curl()
+    except Exception as exc:  # noqa: BLE001 - the Playwright downloader is the second way in
+        why = f"{type(exc).__name__}: {exc}"
     if why is None:
         print("web_research: Chrome Headless Shell installed.", flush=True)
         return
-    code, out = await _run(
-        [sys.executable, "-m", "playwright", "install", "--only-shell", "chromium"], _INSTALL_TIMEOUT
-    )
-    if code != 0:
-        raise RuntimeError(
-            f"web_research: installing Chrome Headless Shell failed (curl path: {why}; playwright install exit {code}). "
-            f"Manual command: {sys.executable} -m playwright install --only-shell chromium\n{out[-600:]}"
+    env = dict(os.environ)
+    proxy = _net.proxy_url()
+    if proxy and not _env_has_proxy(env):
+        env["HTTPS_PROXY"] = env["HTTP_PROXY"] = proxy
+    try:
+        code, out = await _proc.run(
+            [sys.executable, "-m", "playwright", "install", "--only-shell", "chromium"],
+            _PLAYWRIGHT_INSTALL_TIMEOUT,
+            idle_timeout=_PLAYWRIGHT_INSTALL_IDLE,
+            env=env,
         )
+    except OSError as exc:
+        code, out = -1, f"{type(exc).__name__}: {exc}"
+    if code != 0:
+        last = out.strip().splitlines()[-1][:200] if out.strip() else f"exit {code}"
+        raise BrowserUnavailable(f"curl: {why.strip().splitlines()[0][:200]}; playwright install: {last}")
     print("web_research: Chrome Headless Shell installed.", flush=True)
+
+
+def _env_has_proxy(env: dict[str, str]) -> bool:
+    return any(env.get(k) for k in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"))
+
+
+def _unavailable_message(why: str) -> str:
+    return (
+        f"headless browser unavailable: installing Chrome Headless Shell failed ({why}). The download is "
+        f"tried again only after {_INSTALL_RETRY_AFTER / 3600:.0f} hours, so until then the plain HTTP tier "
+        "and the archive answer without waiting on it. Usual cause: no network to the download CDN "
+        "(VPN/proxy off, or very slow). To retry now, run from the bash tool: "
+        f"`{_manual_install_command()}` - the next fetch/BrowserSession then uses it at once."
+    )
 
 
 class _Pool:
@@ -156,6 +194,7 @@ class _Pool:
             return self._browser
 
     async def _start(self) -> None:
+        global _INSTALL_FAILURE
         from playwright.async_api import Error as PlaywrightError
         from playwright.async_api import async_playwright
 
@@ -167,8 +206,19 @@ class _Pool:
         except PlaywrightError as exc:
             if "Executable doesn't exist" not in str(exc) and "playwright install" not in str(exc):
                 raise
-            await _install_headless_shell()
+            # Launching is cheap and is tried every time, so a manual install is picked up at
+            # once; only the slow download is skipped after it failed once in this kernel.
+            if _INSTALL_FAILURE is None or time.monotonic() - _INSTALL_FAILURE[0] >= _INSTALL_RETRY_AFTER:
+                _INSTALL_FAILURE = None
+                try:
+                    await _install_headless_shell()
+                except BrowserUnavailable as failed:
+                    _INSTALL_FAILURE = (time.monotonic(), str(failed))
+            if _INSTALL_FAILURE is not None:
+                await self._stop()  # no Playwright driver left idling after a failed start
+                raise BrowserUnavailable(_unavailable_message(_INSTALL_FAILURE[1])) from None
             self._browser = await self._pw.chromium.launch(**launch_options())
+        _INSTALL_FAILURE = None
         self.launches += 1
 
     async def release(self, linger: float | None = None) -> None:
@@ -268,8 +318,11 @@ class Context:
         self.blocked: list[str] = []
 
 
-async def new_context(**kwargs: Any) -> Context:
-    """A fresh, isolated context (own cookies/cart) on the shared browser. Caller must close_context()."""
+async def new_context(url: str = "", **kwargs: Any) -> Context:
+    """A fresh, isolated context (own cookies/cart) on the shared browser. Caller must close_context().
+
+    The locale follows the first URL (zh-CN for Chinese sites, else en-US) unless one is passed.
+    """
     from ._guard import PAYMENT_HOST_PATTERN
 
     browser = await POOL.acquire()
@@ -278,7 +331,7 @@ async def new_context(**kwargs: Any) -> Context:
         ua = _net.USER_AGENT.replace(f"Chrome/{_net.CHROME_MAJOR}.", f"Chrome/{major}.")
         ctx = await browser.new_context(
             user_agent=kwargs.get("user_agent") or ua,
-            locale=kwargs.get("locale") or "en-US",
+            locale=kwargs.get("locale") or _net.browser_locale(url),
             viewport=kwargs.get("viewport") or {"width": 1366, "height": 900},
             timezone_id=kwargs.get("timezone_id"),
             ignore_https_errors=False,

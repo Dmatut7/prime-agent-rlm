@@ -57,13 +57,21 @@ const PYTHON_CALL_LABELS: ReadonlyArray<[RegExp, string]> = [
 	[/\battach_image(?:\.run)?\(/g, "看图"],
 	// Called directly or handed to asyncio.to_thread (no parenthesis after the name).
 	[
-		/\b(?:bailian_web_search|bailian_search|websearch|exa_websearch)\.search\b|\b(?:websearch|exa_websearch)\.\w+\(/g,
+		/\b(?:bailian_web_search|bailian_search|websearch|exa_websearch)\.a?search\b|\b(?:websearch|exa_websearch)\.\w+\(/g,
 		"联网搜索",
 	],
 	[/\bweb_research\.search\(/g, "联网搜索"],
 	[/\bweb_research\.fetch(?:_many)?\(/g, "读网页"],
-	[/\bweb_research\.(?:BrowserSession|browse)\(/g, "后台浏览器"],
-	[/\bweb_research\.(?:arxiv|crossref|openalex|stackexchange|github)\(/g, "查论文资料"],
+	[/\bweb_research\.(?:BrowserSession|browse|shutdown_browser)\(/g, "后台浏览器"],
+	// A session opened in an earlier cell is driven by its methods alone (`await b.click(...)`);
+	// only calls a BrowserSession or a Playwright page makes are matched, never a bare `.wait(`.
+	[
+		/\bawait\s+[A-Za-z_][A-Za-z0-9_]*\.(?:open|click|select|fill|snapshot|screenshot|back|goto)\(|\b[A-Za-z_][A-Za-z0-9_]*\.json_responses\(/g,
+		"后台浏览器",
+	],
+	[/\bweb_research\.(?:arxiv|crossref|openalex)\(/g, "查论文资料"],
+	[/\bweb_research\.stackexchange\(/g, "查技术问答"],
+	[/\bweb_research\.github\(/g, "查 GitHub"],
 	[/\brlm\.harness\.(?:create|update)_memory\(/g, "记笔记"],
 ];
 

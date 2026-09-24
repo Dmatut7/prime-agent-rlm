@@ -31,13 +31,25 @@ ROUTE = re.compile(
 )
 STOCK = re.compile(r"(out of stock|sold out|in stock|unavailable|缺货|售罄|无货|有货|库存|补货)", re.IGNORECASE)
 _AMOUNT_ONLY = re.compile(r"^[\s$€£¥￥]*\d[\d,.]*\s*(usd|cny|rmb|eur|hkd|元|円)?\s*(/\S+)?$", re.IGNORECASE)
+# A line that states an amount of money, as opposed to one that only talks about billing.
+MONEY = re.compile(
+    r"([$€£¥￥]\s?\d|\d[\d,.]*\s?(usd|cny|rmb|eur|hkd|jpy|gbp)\b|\d[\d,.]*\s?[元円]|\b(usd|cny|rmb|eur|hkd|gbp)\s?\d)",
+    re.IGNORECASE,
+)
 
 PREVIEW_CHARS = 1500
+# How many key lines a printed result shows. The price lines come first when a page has more:
+# a spec-heavy plan grid used to fill the quota with "2 GB RAM" rows before its first price.
+PRINTED_KEY_LINES = 40
 
 
-def key_lines(text: str, *, limit: int = 40, max_len: int = 160) -> list[str]:
+def key_lines(text: str, *, limit: int | None = None, max_len: int = 160) -> list[str]:
     """Price/spec/route/stock lines in page order. A bare amount is joined to the label line above it
-    ("每年 (8折优惠) | 845.00元"), because pages often put the two in separate blocks."""
+    ("每年 (8折优惠) | 845.00元"), because pages often put the two in separate blocks.
+
+    With `limit`, lines are kept by importance (amounts of money, other price wording, stock,
+    route, spec) and returned in page order.
+    """
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     out: list[str] = []
     seen: set[str] = set()
@@ -52,9 +64,49 @@ def key_lines(text: str, *, limit: int = 40, max_len: int = 160) -> list[str]:
             continue
         seen.add(ln)
         out.append(ln)
-        if len(out) >= limit:
-            break
-    return out
+    return out if limit is None else prioritized(out, limit)
+
+
+def _rank(line: str) -> int:
+    if MONEY.search(line):
+        return 0
+    if PRICE.search(line):
+        return 1
+    if STOCK.search(line):
+        return 2
+    if ROUTE.search(line):
+        return 3
+    return 4
+
+
+def prioritized(lines: list[str], limit: int) -> list[str]:
+    """At most `limit` of `lines`, the most important first to be kept, in their original order."""
+    if len(lines) <= limit:
+        return list(lines)
+    keep = sorted(range(len(lines)), key=lambda i: (_rank(lines[i]), i))[: max(0, limit)]
+    return [lines[i] for i in sorted(keep)]
+
+
+def preview(text: str, name: str, full_chars: int | None = None) -> str:
+    """The start of `text`, with an explicit TRUNCATED marker saying how much is left and where it is.
+
+    name: the variable the caller holds ("page" or "snap"). full_chars: the whole page's size when
+    `text` itself was already cut (max_chars), so the marker still counts what save() will write.
+    """
+    attr = "content" if name == "page" else "text"
+    shown = text[:PREVIEW_CHARS]
+    total = full_chars if full_chars is not None else len(text)
+    if total <= len(shown):
+        return shown
+    held = (
+        f"{name}.{attr} holds all of it"
+        if full_chars is None or full_chars == len(text)
+        else f"{name}.{attr} was cut at max_chars={len(text):,}"
+    )
+    return (
+        f"{shown}\n[TRUNCATED: showing {len(shown):,} of {total:,} chars. {held}; {name}.save() writes all "
+        f"{total:,} to a file. Pull the lines you need with a regex over {name}.{attr} instead of printing it all.]"
+    )
 
 
 def save_text(text: str, path: str | None, stem: str) -> str:
