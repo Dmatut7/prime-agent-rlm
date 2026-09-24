@@ -12,6 +12,7 @@ import {
 	type FooterTelemetrySource,
 } from "../src/modes/interactive/components/footer.js";
 import { TopBar } from "../src/modes/interactive/components/top-bar.js";
+import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
 const provider = { getGitBranch: () => null } as never;
@@ -70,6 +71,49 @@ describe("footer telemetry watermark (U6)", () => {
 		expect(line).not.toContain("⚡");
 		expect(line).not.toContain("风暴");
 		expect(line).not.toContain("390k");
+	});
+
+	it("names the real server while the fallback chain answers with another model", () => {
+		const footer = new FooterComponent(provider);
+		const telemetry = makeSource();
+		footer.setTelemetrySource(telemetry.source);
+
+		telemetry.set({ ...SNAPSHOT, servingModelName: "kimi-k3" });
+		const line = footerLine(footer);
+		expect(line).toContain("bailian/glm-5.3-prime · max");
+		expect(line).toContain("实际:kimi-k3");
+
+		// Serving model equals the configured one: nothing to call out.
+		telemetry.set({ ...SNAPSHOT, servingModelName: "bailian/glm-5.3-prime" });
+		expect(footerLine(footer)).not.toContain("实际:");
+
+		// No serving info at all (older daemon): the line stays as it was.
+		telemetry.set(SNAPSHOT);
+		expect(footerLine(footer)).not.toContain("实际:");
+	});
+
+	it("noteServingModel refreshes the footer only when the serving model changes", () => {
+		const invalidate = vi.fn();
+		const mode = {
+			lastServingModelId: undefined,
+			invalidateFooterTelemetry: invalidate,
+		} as unknown as InteractiveMode;
+		const note = Reflect.get(InteractiveMode.prototype, "noteServingModel") as (
+			this: InteractiveMode,
+			modelId: string | undefined,
+		) => void;
+
+		note.call(mode, "kimi-k3");
+		expect((mode as unknown as { lastServingModelId: string | undefined }).lastServingModelId).toBe("kimi-k3");
+		expect(invalidate).toHaveBeenCalledTimes(1);
+
+		// Same server again: no churn. Missing model id: ignored.
+		note.call(mode, "kimi-k3");
+		note.call(mode, undefined);
+		expect(invalidate).toHaveBeenCalledTimes(1);
+
+		note.call(mode, "bailian/glm-5.3-prime");
+		expect(invalidate).toHaveBeenCalledTimes(2);
 	});
 
 	it("puts the live activity right-aligned just before the context figures", () => {

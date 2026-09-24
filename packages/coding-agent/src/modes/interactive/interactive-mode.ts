@@ -1350,6 +1350,8 @@ export class InteractiveMode {
 	 */
 	private footerTelemetryDirty = true;
 	private footerTelemetryCached: FooterTelemetrySource | undefined;
+	/** Model id that served the latest assistant message; the footer names it when it differs from the configured one. */
+	private lastServingModelId: string | undefined;
 	private streamingMessage: AssistantMessage | undefined = undefined;
 	private sideQuestionComponent: SideQuestionComponent | undefined;
 	private sideQuestionEvent: AgentConnectionSideQuestionEvent | undefined;
@@ -3270,12 +3272,20 @@ export class InteractiveMode {
 				: 0;
 		const snapshot: FooterTelemetrySnapshot = {
 			modelName: model?.id,
+			servingModelName: this.lastServingModelId,
 			thinkingLevel,
 			contextTokens: usage?.tokens ?? undefined,
 			contextWindow: usage?.contextWindow,
 			compactionThresholdTokens: thresholdTokens,
 		};
 		return { mode, snapshot };
+	}
+
+	/** The footer must never show a model that is not answering: remember who served each assistant message. */
+	private noteServingModel(modelId: string | undefined): void {
+		if (!modelId || modelId === this.lastServingModelId) return;
+		this.lastServingModelId = modelId;
+		this.invalidateFooterTelemetry();
 	}
 
 	private async refreshConnectionContextUsage(): Promise<void> {
@@ -6501,6 +6511,7 @@ export class InteractiveMode {
 						this.currentTurnState.modelId = event.message.model || this.currentTurnState.modelId;
 						this.currentTurnState.notePhase("waiting");
 					}
+					this.noteServingModel(event.message.model);
 					this.startAssistantStreamingMessage(event.message);
 					this.ui.requestRender();
 				}
@@ -6509,6 +6520,7 @@ export class InteractiveMode {
 			case "message_update":
 				if (event.message.role === "assistant") {
 					this.streamingMessage = event.message;
+					this.noteServingModel(event.message.model);
 					this.ensureAssistantStreamingComponent(event.message).updateContent(this.streamingMessage, true);
 					this.currentTurnState?.setLiveThinkingSegments(countThinkingSegments(event.message));
 					if (this.currentTurnState) {

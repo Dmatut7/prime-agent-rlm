@@ -43,6 +43,13 @@ export interface FooterTelemetrySnapshot {
 	modelName?: string;
 	/** Current thinking level (e.g. "max"), rendered after the model id. */
 	thinkingLevel?: string;
+	/**
+	 * The model that actually served the latest assistant message. While the
+	 * provider fallback chain answers with someone other than the configured
+	 * model, the status line names the real server - a footer that shows the
+	 * configured id during a fallback episode quietly lies about who answers.
+	 */
+	servingModelName?: string;
 	contextTokens?: number | null;
 	contextWindow?: number;
 	/**
@@ -200,7 +207,9 @@ export class FooterComponent implements Component {
 			return undefined;
 		}
 		const modelText = snapshot.thinkingLevel ? `${modelName} · ${snapshot.thinkingLevel}` : modelName;
-		const model = ` ${theme.fg("muted", modelText)}`;
+		const serving = snapshot.servingModelName;
+		const servingNote = serving && serving !== modelName ? theme.fg("warning", ` 实际:${serving}`) : "";
+		const model = ` ${theme.fg("muted", modelText)}${servingNote}`;
 		const location = this.locationSource?.();
 		const locationText = location
 			? [displayCwd(location.cwd), location.branch ?? undefined].filter((part) => part).join(" · ")
