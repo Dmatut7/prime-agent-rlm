@@ -1,1 +1,0 @@
-- Fixed the daemon resending the whole conversation every few seconds after large tool results; it now only falls back to a full resync when a client has stopped reading.

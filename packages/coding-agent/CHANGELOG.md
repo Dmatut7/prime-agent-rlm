@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.11.3] - 2026-09-24
+
+- Added a `bailian-web-search` kernel skill: web search through Bailian with `enable_search`, defaulting to the `max` search strategy and always using the public compatible endpoint, with the API key resolved from `DASHSCOPE_API_KEY` or `~/.prime/agent/models.json`.
+- Fixed the daemon resending the whole conversation every few seconds after large tool results; it now only falls back to a full resync when a client has stopped reading.
+- Added the duty log (值班记录): opening a session after being away (default 2 hours, `ui.dutyLogAfterMinutes`) shows what the agent did, what went wrong and was handled, and what needs your decision; `/dutylog` or `/值班` shows it on demand.
+- Changed the model-facing prompt and recovery notices to explain the reason behind each rule (verify before saying done, find the cause before fixing, plain words instead of internal shorthand), and removed duplicated delegation guidance.
+- Fixed the unavailable-skill notice suggesting a bare `uv pip install`, which exits in the unseeded kernel venv; it now names the kernel interpreter.
+- Added an automatic model fallback chain (`providerFallbackModels`, default bailian glm-5.3-prime → kimi-k3 → qwen3.8-max-0902 when configured): quota exhaustion, spent quick retries on an unavailable provider, or three invalid tool calls in a row move the task to the next model with the same context, the primary is probed again after 30 minutes, and when every model fails the turn waits in long rounds (`retry.provider.fallbackLongWait`) instead of ending.
+- Changed retry status lines to Chinese and show a one-line notice when a turn moves to another model.
+- Changed the provider fallback chain to be off unless `providerFallbackModels` is set, and to skip models without image input when the context holds images the serving model reads.
+- Fixed Python skills (agent_message, agent_observe, goal and others) being reported unavailable after a session worker restarted and restored a saved kernel state that held them as plain modules.
+- Fixed the RLM prompt teaching Python API that does not exist (BashResult vs handle fields, synchronous harness calls, subagent row fields, skill call forms), with a test that checks every taught name against the runtime.
+- Changed the kernel to pre-import `json`, `os`, `re`, `shlex`, `sys` and `Path`, which the prompt tells the model to use.
+- Changed the kernel runtime to accept the spellings models reach for most (`r.duration_ms`, `r.output()`, `h.exit_code`, awaiting harness calls, `.get()`/`.name` on subagent records).
+- Changed expanded quiet-mode steps to show at most six output lines, one row each, indented under the turn's process line.
+- Added a quiet conversation mode (`ui.processMode`, default `quiet`): each agent turn collapses its process noise into a single footnote line at the turn head - `干了 1 分 05 秒 · 14 步 [O] · 想 7 段 [T] · → 通讯 2 条 [P]` - with mid-turn narration folded behind it and text-only turns reading `想了想`; `ui.processMode: "legacy"` restores the old fully expanded view.
+- Changed Ctrl+O/T/P to expand the process, thinking, and comms blocks independently (all three can stay open together), with long step lists auto-folded to key steps, failed steps always visible, bounded per-step output height, and Esc closing the last-opened block first.
+- Added narrow-terminal and mouse handling to the footnote: under 100 columns it switches to the compressed form `干了 1分05秒 · 14步 · 7想 · 2讯` (dropping key hints before truncating), and clicking a stats segment jumps straight to its detail block.
+- Changed the per-turn process line to say what the turn did in plain words (`▸ 思考 · 3 步 · 14.8s   运行 npm check · 读取 footer.ts`) and to list changed files with +/− counts while collapsed.
+- Changed the expanded ipython step header to a plain-words label with output line count and duration instead of `↑ N ↓ M lines`.
+- Changed the status area: key hints now sit above the prompt and show only the keys usable right now; the footer line shows model, directory, branch, and right-aligned context figures, with the watermark bar only near the compaction threshold.
+- Changed the startup header to a compact wordmark with model and directory rows, and translated start hints, loader labels, and the tmux notice to Chinese.
+- Removed the chat-tail `Ctrl+T 思考 · Ctrl+O 过程 · Ctrl+P 通讯` hint line and the `[O]/[T]/[P]` bracket hints.
+- Changed the quiet running face to match the design: the live activity (`◈ 运行中 12s`) moved into the status line, the prompt reads 随时补充或纠正 while a turn runs, and the process line shows measured Thinking time.
+- Added a two-row Thinking preview at the top of an opened process block, a 继续 row on the startup header for the last session in this directory, and a per-child subagent panel.
+- Changed the interface text to Chinese across status messages, the shortcut panel, session list, session tree, model picker, heartbeats, queue rows, agent-message rows and the exit hint (Thinking stays English).
+- Fixed the turn caret not flipping on Ctrl+T/Ctrl+P, the full-output toggle not repainting, a single Ctrl+C during a run arming exit, the shortcut panel not closing, and interrupted steps showing raw KeyboardInterrupt tracebacks.
+- Fixed tests writing fake sessions into the real agent directory.
+- Fixed Python skills being reported unavailable (and so avoided by the model) after a kernel re-bootstrap or restored state.
+- Changed the settings menu, login dialog, model and provider pickers, slash-command descriptions and list scroll indicators to Chinese.
+- Changed user messages to render verbatim instead of as Markdown.
+- Changed setting values, provider subtitles and remaining login-dialog text to Chinese, and unrecognised Python steps to short labels such as 设置 x / 查看 x.
+- Added block navigation: Alt+↑/Alt+↓ (when no messages are queued) walk the conversation blocks with a highlight; Enter or Space opens the block's steps or Thinking, y copies it, Esc returns to the prompt; fullscreen scrolls the focused block into view.
+- Changed agent-message rows inside a quiet turn to line up with the turn's steps, and queue previews to read 定时任务 / 目标 / 收到消息.
+- Fixed three long-failing test suites (git config leak, harness gaps) and translated the new-session messages.
+- Added silent-step detection: a tool call that produces no output for `tools.timeout.silentStuckSeconds` (default 300) is stopped even when its process is still alive, while a call whose output keeps flowing is never stopped; the model is told which step was stuck and warned when the same step gets stuck twice.
+- Added automatic continue: when a turn stops right after tool work with a reply that only announces the next step, the session continues on its own (at most twice per request, never for final answers, questions or waiting on subagents; `selfRecovery.autoContinue`).
+- Added an opt-in, one-time reminder for a subagent that finishes its task without replying to its parent (`selfRecovery.childReplyNudge`, off by default).
+- Changed the busy-kernel wait/restart prompt to restart the kernel automatically when nobody answers within 60 seconds, and stopped telling the model to kill the kernel itself.
+- Added self-recovery and duty-log entries to the session transcript for every automatic stop, continue and reminder.
+- Changed the silent-step rule to count CPU burned by the step's process tree (`tools.timeout.silentStuckCpuMs`, default 1000) as activity, and to honour a longer timeout the model gave the call, so quiet test runs, installs and compiles are never stopped.
+- Fixed a false "completed without a reply" notice that woke the parent after it deleted or released a subagent whose reply had been queued.
+- Fixed automatic continue treating a closing offer ("接下来我可以……", "If you want, I can also…") as an unfinished next step.
+
 ## [0.11.0] - 2026-09-22
 
 - Added an empty-response recovery continuation: when the retry ladder is exhausted, the session queues one custom message per failure episode so the model gets a turn to recover the task instead of a silent stop, and a terminal `empty_response_exhausted` event reports the real attempt counts.

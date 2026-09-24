@@ -1,1 +1,0 @@
-- Added the duty log (值班记录): opening a session after being away (default 2 hours, `ui.dutyLogAfterMinutes`) shows what the agent did, what went wrong and was handled, and what needs your decision; `/dutylog` or `/值班` shows it on demand.

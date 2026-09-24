@@ -1,2 +1,0 @@
-- Changed the model-facing prompt and recovery notices to explain the reason behind each rule (verify before saying done, find the cause before fixing, plain words instead of internal shorthand), and removed duplicated delegation guidance.
-- Fixed the unavailable-skill notice suggesting a bare `uv pip install`, which exits in the unseeded kernel venv; it now names the kernel interpreter.

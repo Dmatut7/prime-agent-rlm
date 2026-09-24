@@ -1,1 +1,0 @@
-- Fixed Python skills (agent_message, agent_observe, goal and others) being reported unavailable after a session worker restarted and restored a saved kernel state that held them as plain modules.

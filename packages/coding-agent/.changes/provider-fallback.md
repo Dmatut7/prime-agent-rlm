@@ -1,3 +1,0 @@
-- Added an automatic model fallback chain (`providerFallbackModels`, default bailian glm-5.3-prime → kimi-k3 → qwen3.8-max-0902 when configured): quota exhaustion, spent quick retries on an unavailable provider, or three invalid tool calls in a row move the task to the next model with the same context, the primary is probed again after 30 minutes, and when every model fails the turn waits in long rounds (`retry.provider.fallbackLongWait`) instead of ending.
-- Changed retry status lines to Chinese and show a one-line notice when a turn moves to another model.
-- Changed the provider fallback chain to be off unless `providerFallbackModels` is set, and to skip models without image input when the context holds images the serving model reads.

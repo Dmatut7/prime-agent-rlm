@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.11.3] - 2026-09-24
+
+- Added `Agent.pendingTurnModel`, a one-shot switch that moves a running loop to another model at its next request.
+- Added `ToolTimeoutConfig.describeCancellation` so a host can append which call was stuck and what to do instead to the per-call deadline's cancellation.
+
 ## [0.11.2] - 2026-09-23
 
 - Added an escalated slow tier to the in-place empty-turn retry ladder: after the fast attempts are spent, up to three more resends wait 30s/60s/120s, with per-tier wait budgets and tier-split exhaustion diagnostics.
