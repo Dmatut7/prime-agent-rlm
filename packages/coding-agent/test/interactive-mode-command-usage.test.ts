@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
+import { PastedImageFiles } from "../src/modes/interactive/pasted-image-files.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
 type SubmitContext = {
@@ -26,6 +27,7 @@ function makeSubmitContext() {
 			},
 		},
 		agentConnection: { prompt },
+		pastedImageFiles: new PastedImageFiles({ remember: vi.fn(), warn: vi.fn() }),
 		showError: vi.fn(),
 		showStatus: vi.fn(),
 		echoLocalCommand: vi.fn(),

@@ -1,6 +1,7 @@
 import { Container } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
+import { PastedImageFiles } from "../src/modes/interactive/pasted-image-files.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
 type ClearCommandContext = {
@@ -14,6 +15,7 @@ type ClearCommandContext = {
 	collectImagesFor?: (text: string) => unknown[] | undefined;
 	getPromptStashImages?: (text: string) => readonly (readonly [number, unknown])[];
 	pastedImages?: Map<number, unknown>;
+	pastedImageFiles: PastedImageFiles;
 	showError?: (message: string) => void;
 	renderCurrentSessionState: () => Promise<void>;
 	chatContainer: Container;
@@ -50,6 +52,7 @@ describe("InteractiveMode /clear", () => {
 		const collectImagesFor = vi.fn(() => [...pastedImages.values()]);
 		const addToHistory = vi.fn();
 		const context: ClearCommandContext = {
+			pastedImageFiles: new PastedImageFiles({ remember: vi.fn(), warn: vi.fn() }),
 			stopWorkingLoader: vi.fn(),
 			agentConnection: { newSession, setSessionName, prompt },
 			editor: { setText: vi.fn(), addToHistory },
@@ -84,6 +87,7 @@ describe("InteractiveMode /clear", () => {
 		const newSession = vi.fn(async () => ({ cancelled: true }));
 		const setText = vi.fn();
 		const context: ClearCommandContext = {
+			pastedImageFiles: new PastedImageFiles({ remember: vi.fn(), warn: vi.fn() }),
 			stopWorkingLoader: vi.fn(),
 			agentConnection: { newSession },
 			editor: { setText },

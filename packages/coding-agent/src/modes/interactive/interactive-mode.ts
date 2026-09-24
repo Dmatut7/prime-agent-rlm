@@ -131,7 +131,6 @@ import { parseCommandArgs } from "../../core/prompt-templates.js";
 import { PROVIDER_FALLBACK_NOTICE_CUSTOM_TYPE } from "../../core/provider-fallback.js";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.js";
 import { SessionImportFileNotFoundError } from "../../core/session-import-errors.js";
-import { getSessionArtifactPathForFile } from "../../core/session-manager.js";
 import { resolveSessionPath, SessionSelectorError, SessionSelectorNotFoundError } from "../../core/session-resolver.js";
 import { consecutiveToolErrorsFromMessages } from "../../core/session-stats.js";
 import {
@@ -5248,9 +5247,10 @@ export class InteractiveMode {
 	/** Where this session keeps pasted images, or undefined for an unsaved session. */
 	private pastedImageDir(): string | undefined {
 		const state = this.connectionState;
-		if (!state?.sessionFile) return undefined;
+		const artifactDir = this.uiServices.getSessionArtifactDir;
+		if (!state?.sessionFile || !artifactDir) return undefined;
 		try {
-			return path.join(getSessionArtifactPathForFile(state.sessionFile, state.sessionId), "pasted-images");
+			return path.join(artifactDir(state.sessionFile, state.sessionId), "pasted-images");
 		} catch {
 			return undefined;
 		}

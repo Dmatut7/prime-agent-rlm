@@ -4,7 +4,7 @@ import type { AgentSessionServices } from "../../core/agent-session-services.js"
 import type { ResourceDiagnostic } from "../../core/diagnostics.js";
 import type { ExtensionCommandContext, ExtensionRunner, ToolDefinition } from "../../core/extensions/index.js";
 import type { ModelRegistry } from "../../core/model-registry.js";
-import type { SessionManager } from "../../core/session-manager.js";
+import { getSessionArtifactPathForFile, type SessionManager } from "../../core/session-manager.js";
 import type { SettingsManager } from "../../core/settings-manager.js";
 import type { Theme } from "./theme/theme.js";
 
@@ -23,6 +23,8 @@ export interface InteractiveModeUiServices {
 	getThemes(): Theme[];
 	/** Refreshes MCP providers after a client-side MCP settings mutation. */
 	refreshMcpProviders?(): void;
+	/** The artifact directory of a session transcript (the client and daemon share the disk). */
+	getSessionArtifactDir?(sessionFile: string, sessionId?: string): string;
 }
 
 type LocalExtensionNewSessionOptions = Parameters<ExtensionCommandContext["newSession"]>[0];
@@ -66,6 +68,7 @@ export function createInteractiveModeUiServices(session: AgentSession): Interact
 		getInitialSessionName: () => session.sessionManager.getSessionName(),
 		getThemes: () => session.resourceLoader.getThemes().themes,
 		refreshMcpProviders: () => session.refreshMcpProviders(),
+		getSessionArtifactDir: getSessionArtifactPathForFile,
 	};
 }
 
@@ -82,6 +85,7 @@ export function createInteractiveModeUiServicesFromServices(options: {
 		getInitialSessionName: () => sessionManager.getSessionName(),
 		getThemes: () => services.resourceLoader.getThemes().themes,
 		refreshMcpProviders: () => services.mcpManager.refresh(),
+		getSessionArtifactDir: getSessionArtifactPathForFile,
 	};
 }
 
