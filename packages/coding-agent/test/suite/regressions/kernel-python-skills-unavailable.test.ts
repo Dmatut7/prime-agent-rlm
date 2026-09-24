@@ -30,6 +30,10 @@ describe("Python skills unavailable message", () => {
 			expect(delivered).toMatchObject({ display: true, details: { skills: ["websearch", "edit"] } });
 			expect(getMessageText(delivered!)).toContain("- websearch: No module named 'websearch'");
 			expect(getMessageText(delivered!)).toContain("- edit: boom");
+			// An install alone leaves the failed placeholder bound: the notice says how to reload.
+			expect(getMessageText(delivered!)).toContain('sys.modules.pop("<name>", None)');
+			// Skills have no shell command form, so the notice must not claim one fails.
+			expect(getMessageText(delivered!)).not.toContain("shell command forms");
 			expect(providerSawUnavailableSkills).toBe(true);
 		} finally {
 			harness.cleanup();

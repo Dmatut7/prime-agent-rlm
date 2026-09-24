@@ -95,9 +95,10 @@ it.each([
 		if (cycleMidStream) expect(session.model?.id).not.toBe(sessionModel.id);
 		else expect(session.model?.id).toBe(sessionModel.id);
 		if (!cycleAfter) return;
-		// The routed turn leaves its override behind; cycling must clear it so
-		// the selection wins over later continues, retries, and compaction.
-		expect(session.agent.modelOverride?.model.id).toBe(served);
+		// The image model answered in words, so the run already handed back to the
+		// session model: no routed override lingers for later continues, retries, and
+		// compaction, and cycling still lands on the new selection.
+		expect(session.agent.modelOverride).toBeUndefined();
 		await session.cycleModel("forward", { waitForExtensions: false });
 		expect(session.agent.modelOverride).toBeUndefined();
 		expect(session.model?.id).not.toBe(sessionModel.id);

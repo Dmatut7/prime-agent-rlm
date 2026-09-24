@@ -436,6 +436,23 @@ notice, which is the only signal a parent gets when the abort is what ended the 
 
 To disable entirely: `{ "stallWatchdog": { "enabled": false } }`.
 
+The daemon's stall-recovery sweep (the automatic interrupt of a silent main session
+or subagent after the warning, `stallWatchdog.rootRecovery` and
+`subagents.stallRecovery`) follows the same opt-in: with `enabled` unset it is on
+only when `abortAfterSeconds` is positive, so a warn-only watchdog never gets its
+silence kill back through the sweep. Set `enabled: true` on either block to arm it
+independently, or `enabled: false` to keep it off even with an abort stage. When it
+is armed, the sweep re-checks the watchdog's exemption live on every pass, so a job
+that keeps producing stays excused.
+
+The per-call tool deadline (`tools.timeout`) never cancels a call just because the
+kernel cannot vouch for it (a synchronous cell freezes the kernel loop). At the
+deadline the silent-step rule decides: a call that produced output, advanced its
+process tree's CPU by `tools.timeout.silentStuckCpuMs`, or had a host request in
+flight within the last `tools.timeout.silentStuckSeconds` (default 300) keeps
+running; a longer timeout the call itself declares (`timeout=`, `timeout_ms=`, a
+`timeout N` prefix) raises that threshold for the call.
+
 A kernel revival vouches the same way: while a replacement kernel is being
 spawned, restored and bootstrapped after an unexpected death, the host is
 demonstrably busy on the turn's behalf, so the abort is deferred. That vouch is

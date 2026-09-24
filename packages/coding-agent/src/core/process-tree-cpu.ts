@@ -107,6 +107,7 @@ export function explicitTimeoutMs(args: unknown): number | undefined {
 		const text = record?.[key];
 		if (typeof text !== "string") continue;
 		for (const match of text.matchAll(/\btimeout\s*=\s*(\d+(?:\.\d+)?)/g)) found.push(Number(match[1]) * 1000);
+		for (const match of text.matchAll(/\btimeout_ms\s*=\s*(\d+(?:\.\d+)?)/g)) found.push(Number(match[1]));
 		for (const match of text.matchAll(
 			/(?:^|[\s;&|'"(])timeout\s+(?:(?:-[ks]|--kill-after|--signal)[= ]?\S+\s+|-\S+\s+)*(\d+(?:\.\d+)?)([smhd]?)\b/g,
 		)) {

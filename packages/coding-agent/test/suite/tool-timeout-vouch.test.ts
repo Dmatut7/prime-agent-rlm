@@ -11,8 +11,9 @@ import { createHarness, type Harness } from "./harness.js";
  * r4 recovery, mechanism ② at the session wiring level: the per-tool-call deadline
  * resolves from `tools.timeout` settings, and a fired deadline asks the stall
  * watchdog for the exemption verdict - the single arbiter, whose budget the
- * extension consumes. Progress evidence defers, liveness defers, no evidence or no
- * watchdog cancels the call while the turn continues, and the two rollback handles
+ * extension consumes. Progress evidence defers, liveness defers; with no evidence or no
+ * watchdog the silent-step rule decides (a silent call is cancelled while the turn
+ * continues, one still producing output is kept), and the two rollback handles
  * disarm the deadline everywhere (per-tool budgets included).
  */
 
@@ -146,8 +147,14 @@ describe("per-tool-call deadline vouch wiring", () => {
 		expect(harness.faux.state.callCount).toBe(2);
 	});
 
-	it("no evidence cancels the call and the turn continues", async () => {
-		const harness = await createHarness({ tools: [slowVouchedTool(3_000)] });
+	it("no evidence and no output: the silent-step rule cancels the call and the turn continues", async () => {
+		// Missing evidence alone is not a hang (a synchronous cell cannot be vouched for);
+		// a call that also produces nothing for the silent threshold is.
+		const harness = await createHarness({
+			tools: [slowVouchedTool(3_000)],
+			settings: { tools: { timeout: { silentStuckSeconds: 1 } } },
+			stepCpuProbe: () => undefined,
+		});
 		harnesses.push(harness);
 
 		// The turn must settle (via the deadline) while the tool itself is still slow:
@@ -163,18 +170,19 @@ describe("per-tool-call deadline vouch wiring", () => {
 		expect(harness.faux.state.callCount).toBe(2);
 	});
 
-	it("a disabled watchdog is a disabled arbiter: no exemption, the deadline stands", async () => {
+	it("a disabled watchdog grants no exemption: a silent call is still stopped by the silent-step rule", async () => {
 		const harness = await createHarness({
 			tools: [slowVouchedTool(3_000)],
-			settings: { stallWatchdog: { enabled: false } },
+			settings: { stallWatchdog: { enabled: false }, tools: { timeout: { silentStuckSeconds: 1 } } },
 			stallKernelLivenessFacts: () => workingKernelFacts(),
+			stepCpuProbe: () => undefined,
 		});
 		harnesses.push(harness);
 
 		await runSlowToolTurn(harness);
 
-		// The watchdog is the single arbiter (r4 ruling): turning it off turns off the
-		// exemption channel with it, even when the facts would vouch.
+		// The watchdog is the single arbiter of the exemption budget (r4 ruling): turning it
+		// off turns off that channel. The silent-step rule still runs, and this call is silent.
 		expect(textOfLastToolResult(harness)).toContain(TOOL_TIMEOUT_CAUSE_PREFIX);
 		expect(harness.faux.state.callCount).toBe(2);
 	});
@@ -197,8 +205,9 @@ describe("per-tool-call deadline vouch wiring", () => {
 		const harness = await createHarness({
 			tools: [unbudgetedTool(3_000)],
 			// The shared default (180s) would never fire in the test window; only the
-			// operator's per-tool budget can cancel this call.
-			settings: { tools: { timeout: { perTool: { plain_cell: 25 } } } },
+			// operator's per-tool budget can arm a check for this call, and it is silent.
+			settings: { tools: { timeout: { perTool: { plain_cell: 25 }, silentStuckSeconds: 1 } } },
+			stepCpuProbe: () => undefined,
 		});
 		harnesses.push(harness);
 

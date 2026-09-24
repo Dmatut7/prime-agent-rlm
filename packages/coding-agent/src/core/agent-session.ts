@@ -459,6 +459,7 @@ import {
 	buildStallWarnMessage,
 	formatStallExemptionEventLog,
 	normalizeStallKernelFacts,
+	STALL_VOUCH_REASONS,
 	type StallExemptionEvent,
 	type StallKernelDiagnostics,
 	type StallMessageContext,
@@ -1322,7 +1323,7 @@ function visibleSessionActionProjection(actions: readonly QueuedSessionAction[])
  */
 const WAIT_FOR_IDLE_POLL_MS = 50;
 /** Deleted or released child runs kept for re-validating their late terminal notices. */
-const RETIRED_RLM_CHILD_RUNS_MAX = 64;
+const RETIRED_RLM_CHILD_RUNS_MAX = 1024;
 
 /** The verdict fields of a child run that its late terminal notices are re-validated against. */
 type RetiredRlmChildRun = Pick<
@@ -3961,6 +3962,51 @@ export class AgentSession {
 	}
 
 	/**
+	 * The image routing of the current run: the override it was dispatched with, and
+	 * whether the run has already been handed back to the session model.
+	 */
+	private _imageRoute:
+		| { override: AgentModelOverride; handedBack: boolean; handback?: AgentModelOverride }
+		| undefined;
+
+	/**
+	 * An image-routed run exists so the image model can read the images, not so it does
+	 * the whole task: once it has put what it saw into words, the rest of the run goes
+	 * back to the session model the owner chose (a screenshot must not move a long task
+	 * onto the cheaper image model). A response that is only a tool call leaves nothing
+	 * for the session model to continue from, so the handback waits for text. A fallback
+	 * episode owns the serving model and is left alone.
+	 */
+	private _maybeHandBackFromImageModel(message: AssistantMessage): void {
+		const route = this._imageRoute;
+		const sessionModel = this.model;
+		if (!route || route.handedBack || !sessionModel) return;
+		if (this.agent.modelOverride !== route.override || this._fallback) return;
+		if (!message.content.some((block) => block.type === "text" && block.text.trim().length > 0)) return;
+		route.handedBack = true;
+		route.handback = {
+			model: sessionModel,
+			thinkingLevel: this.thinkingLevel,
+			serviceTier: this.agent.state.serviceTier,
+		};
+		this.agent.pendingTurnModel = route.handback;
+		this.agent.modelOverride = undefined;
+	}
+
+	/**
+	 * A tool result delivered new images after the run was handed back: the next request
+	 * carries images the session model cannot read, so it goes to the image model again.
+	 */
+	private _rerouteToImageModelForNewImages(): void {
+		const route = this._imageRoute;
+		if (!route?.handedBack || this._fallback) return;
+		if (this.model?.input.includes("image")) return;
+		route.handedBack = false;
+		this.agent.modelOverride = route.override;
+		this.agent.pendingTurnModel = route.override;
+	}
+
+	/**
 	 * Model serving the current run: the routed image model while a routed
 	 * turn (or its retries/continuations) is active, the session model
 	 * otherwise. Compaction decisions compare context against the model that
@@ -6087,8 +6133,7 @@ export class AgentSession {
 	 * excuse. Undefined/disarmed watchdog or no exemption: false.
 	 */
 	get excusedNow(): boolean {
-		const exemption = this._stallWatchdog?.exemption;
-		return exemption !== undefined && !exemption.exhausted;
+		return this._stallWatchdog?.isExcusedNow() === true;
 	}
 
 	/**
@@ -6301,10 +6346,18 @@ export class AgentSession {
 	 * output-counter token that changed since the previous check counts as output too;
 	 * the first token seen is only the baseline.
 	 */
-	private _stepSilentMs(info: ToolTimeoutVouchInfo, movementToken?: string, sampleCpu = false): number {
+	private _stepSilentMs(
+		info: ToolTimeoutVouchInfo,
+		movementToken?: string,
+		sampleCpu = false,
+		hostRequestInFlight = false,
+	): number {
 		const watch = this._stepOutputWatch.get(info.toolCallId);
 		if (!watch) return info.elapsedMs;
 		const now = Date.now();
+		// The host executing a request for this cell (rlm.collect, an agent_message wait) is
+		// work in motion; the host-request age bound already stops a wedged handler excusing it.
+		if (hostRequestInFlight) watch.lastOutputAt = now;
 		if (movementToken !== undefined) {
 			if (watch.movementToken !== undefined && watch.movementToken !== movementToken) watch.lastOutputAt = now;
 			watch.movementToken = movementToken;
@@ -6429,34 +6482,38 @@ export class AgentSession {
 	/**
 	 * Verdict for a fired per-call deadline, with the stall watchdog as the single
 	 * arbiter (r4 recovery): the extension consumes the same exemption budget the abort
-	 * stage defers by - never a second pool. No evidence cancels the call; a paused turn
-	 * boundary defers like the abort stage does. With evidence the call is extended
-	 * (progress a full window, liveness half of one) until it has produced no output for
-	 * the silent-step threshold (`tools.timeout.silentStuckSeconds`), when it is stuck.
+	 * stage defers by - never a second pool. A paused turn boundary defers like the abort
+	 * stage does, and an exhausted budget cancels. Otherwise the silent-step rule decides,
+	 * with or without liveness evidence: the call is busy while it produces output (its own
+	 * updates, the kernel's output counters, its process tree's CPU, an in-flight host
+	 * request) and stuck once it has produced none for the silent-step threshold
+	 * (`tools.timeout.silentStuckSeconds`, or the call's own longer explicit timeout).
+	 *
+	 * Missing evidence is not proof of a hang: a synchronous cell (subprocess.run, a
+	 * download, numpy compute) freezes the kernel loop so the kernel cannot vouch for it,
+	 * and cancelling on missing evidence killed legitimate long work at the first deadline.
 	 */
 	private _toolTimeoutVouch(info: ToolTimeoutVouchInfo): ToolTimeoutVerdict | undefined {
 		try {
 			const exemption = this._stallWatchdog?.deferToolTimeout(info.toolCallId);
-			if (exemption === undefined || exemption.exhausted === true) return { action: "fail" };
-			if (exemption.reason === "paused") {
+			if (exemption?.exhausted === true) return { action: "fail" };
+			if (exemption?.reason === "paused") {
 				return {
 					action: "extend",
 					recheckMs: this._boundToolTimeoutRecheck(info.timeoutMs, exemption.remainingMs),
 				};
 			}
-			// Evidence says the call is alive. It is busy while it produces output (its own
-			// updates, or the kernel's output counters moving) and stuck once it has produced
-			// none for the silent-step threshold - a quiet `await bash(...)` included, which the
-			// liveness tiers alone would excuse for as long as the process exists.
 			const stuckAfterMs = this._stuckAfterMs(info.toolCallId);
-			const silentMs = this._stepSilentMs(info, this._sampleStallVouch()?.movementToken, true);
+			const vouch = this._sampleStallVouch();
+			const hostRequestInFlight = vouch?.reasons?.includes(STALL_VOUCH_REASONS.hostRequestInFlight) === true;
+			const silentMs = this._stepSilentMs(info, vouch?.movementToken, true, hostRequestInFlight);
 			if (silentMs >= stuckAfterMs) return { action: "fail" };
-			const recheckMs = exemption.tier === "progress" ? info.timeoutMs : Math.round(info.timeoutMs / 2);
+			const recheckMs = exemption?.tier === "progress" ? info.timeoutMs : Math.round(info.timeoutMs / 2);
 			return {
 				action: "extend",
 				recheckMs: this._boundToolTimeoutRecheck(
 					Math.max(1_000, Math.min(recheckMs, stuckAfterMs - silentMs)),
-					exemption.remainingMs,
+					exemption?.remainingMs,
 				),
 			};
 		} catch (error) {
@@ -6795,7 +6852,10 @@ export class AgentSession {
 			// Mid-run tool results (attach_image through the kernel) attach image
 			// blocks to this run's continuation requests; the suspicion check counts
 			// them as carried images even when the committed batch had none.
-			if (messageCarriesImages(event.message)) this._runToolResultsCarriedImages = true;
+			if (messageCarriesImages(event.message)) {
+				this._runToolResultsCarriedImages = true;
+				if (event.type === "message_end") this._rerouteToImageModelForNewImages();
+			}
 		}
 		if (event.type === "message_start" || event.type === "message_end") {
 			const cleared = this._capturingCancelledAction(event.message);
@@ -6927,6 +6987,7 @@ export class AgentSession {
 					// its usage frame says nothing about whether images were counted.
 				} else {
 					this._maybeNoticeImageDeliverySuspicion(assistantMsg);
+					this._maybeHandBackFromImageModel(assistantMsg);
 				}
 				if (assistantMsg.stopReason === "aborted") {
 					this._handleAbortedQuotaPark();
@@ -10868,6 +10929,14 @@ export class AgentSession {
 					// before_agent_start injections land after the earlier per-turn
 					// decision and may carry images the session model cannot serve.
 					this.agent.modelOverride = this._imageModelOverrideForTurns(turns, preparedMessages);
+					// A handback the previous run set after its last request must not be taken by
+					// this run's first request: this dispatch made its own routing decision.
+					if (this._imageRoute?.handback && this.agent.pendingTurnModel === this._imageRoute.handback) {
+						this.agent.pendingTurnModel = undefined;
+					}
+					this._imageRoute = this.agent.modelOverride
+						? { override: this.agent.modelOverride, handedBack: false }
+						: undefined;
 					// Same batch, same authority: the image-delivery suspicion check
 					// reads at message_end whether the request this run actually sends
 					// carries images (the committed batch plus image blocks tool results
@@ -12781,7 +12850,7 @@ export class AgentSession {
 		}
 		lines.push(
 			"",
-			'Their shell command forms fail the same way, so plan around them: a call raises the error above instead of doing the work. If the fix is in reach, make it (a missing dependency installs into the kernel interpreter with `uv pip install --python "<kernel-python>" <pkg>`, passing `sys.executable`); otherwise use another approach, and tell the owner which capability was missing when it limits the result.',
+			'Plan around them: a call raises the error above instead of doing the work. If the fix is in reach, make it (a missing dependency installs into the kernel interpreter with `uv pip install --python "<kernel-python>" <pkg>`, passing `sys.executable`). The kernel keeps the failed placeholder under the skill name, so an install alone changes nothing until the module is loaded again: `import sys, importlib; sys.modules.pop("<name>", None); <name> = importlib.import_module("<name>")` (a kernel restart also picks it up). Otherwise use another approach, and tell the owner which capability was missing when it limits the result.',
 		);
 		void this.sendCustomMessage(
 			{

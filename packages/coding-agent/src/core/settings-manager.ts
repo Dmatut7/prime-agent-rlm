@@ -355,7 +355,12 @@ export interface ResolvedStallWatchdogSettings {
  * that returns to "notify only".
  */
 export interface SubagentStallRecoverySettings {
-	/** Default true. Off means the daemon never acts on a silent child - notice only, exactly as before. */
+	/**
+	 * Unset: on only when `stallWatchdog.abortAfterSeconds` > 0 (the owner opted into
+	 * silence kills). Silence is the normal state of long work, and an unattended owner
+	 * loses real work to an interrupt, so the automatic action is opt-in. Off means the
+	 * daemon never acts on a silent child - notice only.
+	 */
 	enabled?: boolean;
 	/**
 	 * How long the sweep waits after first observing the stall before acting, in seconds.
@@ -389,7 +394,11 @@ export interface ResolvedSubagentStallRecoverySettings {
  * session to warn-only.
  */
 export interface RootStallRecoverySettings {
-	/** Default true. Off means the daemon never acts on a silent main session - warn only, exactly as before. */
+	/**
+	 * Unset: on only when `stallWatchdog.abortAfterSeconds` > 0, for the same reason as
+	 * `subagents.stallRecovery.enabled`. Off means the daemon never acts on a silent main
+	 * session - warn only.
+	 */
 	enabled?: boolean;
 	/** Human window while a client is attached, in seconds; 0 means act as soon as the evidence confirms. Default 120. */
 	humanWindowSeconds?: number;
@@ -2599,17 +2608,26 @@ export class SettingsManager {
 	getSubagentStallRecoverySettings(): ResolvedSubagentStallRecoverySettings {
 		const settings = this.settings.subagents?.stallRecovery ?? {};
 		return {
-			enabled: settings.enabled ?? true,
+			enabled: settings.enabled ?? this.stallAutoAbortOptedIn(),
 			graceSeconds: nonNegativeFinite(settings.graceSeconds, DEFAULT_SUBAGENT_STALL_RECOVERY_GRACE_SECONDS),
 			maxPerSession: nonNegativeFinite(settings.maxPerSession, DEFAULT_STALL_RECOVERY_MAX_PER_SESSION),
 		};
+	}
+
+	/**
+	 * Whether the owner opted into killing silent turns (a positive watchdog abort stage).
+	 * The daemon's automatic stall actions default to this: warn-only watchdogs (the
+	 * default, 9ada6d83b) must not get their silence kill back through the sweep.
+	 */
+	private stallAutoAbortOptedIn(): boolean {
+		return this.getStallWatchdogSettings().abortAfterSeconds > 0;
 	}
 
 	/** Depth-0 stall-recovery policy (r4 recovery-shell ④-B), with defaults. */
 	getRootStallRecoverySettings(): RootStallRecoverySettingsResolved {
 		const settings = this.settings.stallWatchdog?.rootRecovery ?? {};
 		return {
-			enabled: settings.enabled ?? true,
+			enabled: settings.enabled ?? this.stallAutoAbortOptedIn(),
 			humanWindowSeconds: nonNegativeFinite(
 				settings.humanWindowSeconds,
 				DEFAULT_ROOT_STALL_RECOVERY_HUMAN_WINDOW_SECONDS,
