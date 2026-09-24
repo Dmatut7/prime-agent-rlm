@@ -472,12 +472,12 @@ import {
 	AUTO_TITLE_SYSTEM_PROMPT,
 	AUTO_TITLE_TIMEOUT_MS,
 	type AutoSessionNameMode,
-	autoNameForInbound,
 	buildAutoTitlePrompt,
-	firstInboundSourceFromMessages,
-	inboundNameSource,
+	firstDerivableInboundSource,
+	readSessionNameBounded,
+	readSiblingSessionNames,
 	sanitizeRefinedTitle,
-	scanFirstInboundSource,
+	uniquifyAutoName,
 } from "./session-auto-name.js";
 import type { BranchSummaryEntry, CompactionEntry, SessionContext, SessionMessageEntry } from "./session-manager.js";
 import {
@@ -21866,6 +21866,7 @@ export class AgentSession {
 	private _autoTitleFirstInbound: string | undefined;
 	private _autoTitleRefineAttempted = false;
 	private _firstAssistantEntryThisProcess = false;
+	private _autoNameMissMessageCount = -1;
 
 	private _autoSessionNameMode(): AutoSessionNameMode {
 		return this.settingsManager.getAutoSessionName();
@@ -21885,17 +21886,21 @@ export class AgentSession {
 			if (this.sessionManager.getSessionName() !== undefined) return;
 			const sessionFile = this.sessionFile;
 			if (!sessionFile) return;
-			const diskSource =
-				scanFirstInboundSource(sessionFile) ?? firstInboundSourceFromMessages(this.agent.state.messages);
-			const decision = autoNameForInbound({
-				mode,
-				currentName: this.sessionManager.getSessionName(),
-				message,
-				diskSource,
-			});
-			if (!decision) return;
-			this._autoTitleFirstInbound = diskSource ?? inboundNameSource(message);
-			this.setSessionName(decision.name, { auto: decision.auto });
+			// Negative cache: a full re-scan per message_end measured ~0.5s on a
+			// 33 MB transcript; rescan only when new messages arrived since the
+			// last miss.
+			const messageCount = this.agent.state.messages.length;
+			if (this._autoNameMissMessageCount === messageCount) return;
+			const derivable = firstDerivableInboundSource(sessionFile, this.agent.state.messages);
+			if (!derivable) {
+				this._autoNameMissMessageCount = messageCount;
+				return;
+			}
+			// Twins break name-based agent-message routing: uniquify against the
+			// settled names of sibling transcripts before writing.
+			const name = uniquifyAutoName(derivable.name, readSiblingSessionNames(dirname(sessionFile), sessionFile));
+			this._autoTitleFirstInbound = derivable.source;
+			this.setSessionName(name, { auto: true });
 		} catch {
 			// Auto-naming is cosmetic: never let it break persistence or the turn.
 		}
@@ -21917,8 +21922,10 @@ export class AgentSession {
 
 	private async _refineAutoSessionNameAsync(): Promise<void> {
 		const sessionFile = this.sessionFile;
-		const inbound = this._autoTitleFirstInbound ?? (sessionFile ? scanFirstInboundSource(sessionFile) : undefined);
-		if (!inbound) return;
+		const inbound =
+			this._autoTitleFirstInbound ??
+			(sessionFile ? firstDerivableInboundSource(sessionFile, this.agent.state.messages)?.source : undefined);
+		if (!inbound || !sessionFile) return;
 		const assistantText =
 			this._lastAssistantMessage?.content
 				.filter((block): block is { type: "text"; text: string } => block.type === "text")
@@ -21959,7 +21966,9 @@ export class AgentSession {
 			// Re-read provenance at write time: a /name that landed while the call
 			// was in flight outranks the model's title.
 			if (this._disposed) return;
-			const current = this.sessionManager.getSessionNameInfo();
+			// Re-read provenance from disk, not the in-memory cache: a rename that
+			// bypassed this process must still outrank the model's title.
+			const current = readSessionNameBounded(sessionFile);
 			if (!current || !current.auto || current.name === title) return;
 			this.setSessionName(title, { auto: true });
 		} finally {

@@ -777,7 +777,9 @@ export interface Settings {
 	// message and refines it once with a background title call; "first-message"
 	// keeps only the deterministic name; "off" leaves sessions unnamed unless a
 	// human names them. Default: "first-message" (the one-shot LLM title pass is
-	// opt-in until it moves into the daemon idle sweep).
+	// opt-in until it moves into the daemon idle sweep). The refinement is
+	// one-shot per process and only fires on the transcript's first assistant
+	// entry, so resumed sessions keep their settled title (no drift).
 	autoSessionName?: "off" | "first-message" | "llm";
 	defaultThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	defaultServiceTier?: ServiceTier;

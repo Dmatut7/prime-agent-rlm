@@ -11,7 +11,8 @@
  * every rule; the AgentSession hook and the `autotitle` backfill command are
  * thin callers.
  */
-import { readFileSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readdirSync, readFileSync, readSync } from "node:fs";
+import { join } from "node:path";
 
 import { AGENT_MESSAGE_CUSTOM_TYPE } from "./agent-messages.js";
 
@@ -70,24 +71,27 @@ function firstMeaningfulLine(text: string): string | undefined {
  * a human recognizes: the basename, or host plus last path segment.
  */
 function relocatePathOrUrl(line: string): string | undefined {
-	// A pasted path or URL often arrives with trailing prose or a second token;
-	// judge the first whitespace-separated token, not the whole line.
-	const token = line.split(/\s+/)[0] ?? "";
+	// A pasted path or URL often arrives inside prose ("看看 /Users/…"); take the
+	// first whitespace-separated token that looks like one, anywhere in the line.
+	const token = line
+		.split(/\s+/)
+		.find((part) => URL_LINE.test(part) || (ABS_PATH_LINE.test(part) && part.split("/").length >= 3));
+	if (!token) return undefined;
 	if (URL_LINE.test(token)) {
 		try {
 			const url = new URL(token);
 			const segments = url.pathname.split("/").filter((part) => part.length > 0);
-			const last = segments[segments.length - 1];
-			return last ? `${url.host}/${last}` : url.host;
+			// github.com/4603 names nothing: on code hosts keep owner/repo,
+			// elsewhere the last two path segments.
+			const isCodeHost = /(^|\.)(github|gitlab|bitbucket|codeberg)\./i.test(url.host);
+			const tail = isCodeHost ? segments.slice(0, 2) : segments.slice(-2);
+			return tail.length > 0 ? `${url.host}/${tail.join("/")}` : url.host;
 		} catch {
 			return undefined;
 		}
 	}
-	if (ABS_PATH_LINE.test(token) && token.split("/").length >= 3) {
-		const segments = token.split("/").filter((part) => part.length > 0);
-		return segments[segments.length - 1];
-	}
-	return undefined;
+	const segments = token.split("/").filter((part) => part.length > 0);
+	return segments[segments.length - 1];
 }
 
 /**
@@ -198,6 +202,166 @@ export function firstInboundSourceFromMessages(messages: readonly AutoNameInboun
 	return undefined;
 }
 
+const HEAD_WINDOW_BYTES = 512 * 1024;
+const TAIL_WINDOW_BYTES = 256 * 1024;
+
+function readWindow(sessionFile: string, kind: "head" | "tail"): string {
+	let fd: number | undefined;
+	try {
+		fd = openSync(sessionFile, "r");
+		const size = fstatSync(fd).size;
+		const offset = kind === "head" ? 0 : Math.max(0, size - TAIL_WINDOW_BYTES);
+		const length = kind === "head" ? Math.min(size, HEAD_WINDOW_BYTES) : Math.min(size, TAIL_WINDOW_BYTES);
+		const buffer = Buffer.alloc(length);
+		const read = readSync(fd, buffer, 0, length, offset);
+		return buffer.toString("utf8", 0, read);
+	} catch {
+		return "";
+	} finally {
+		if (fd !== undefined) {
+			try {
+				closeSync(fd);
+			} catch {
+				// fd already gone; nothing to release
+			}
+		}
+	}
+}
+
+function inboundSourcesInText(text: string): string[] {
+	const sources: string[] = [];
+	for (const line of text.split("\n")) {
+		const trimmed = line.trim();
+		if (!trimmed) continue;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(trimmed);
+		} catch {
+			continue;
+		}
+		if (!parsed || typeof parsed !== "object") continue;
+		const record = parsed as {
+			type?: unknown;
+			message?: AutoNameInboundMessage;
+			customType?: string;
+			content?: unknown;
+			details?: unknown;
+		};
+		if (record.type !== "message" && record.type !== "custom_message") continue;
+		const message: AutoNameInboundMessage =
+			record.type === "message"
+				? (record.message as AutoNameInboundMessage)
+				: { role: "custom", customType: record.customType, content: record.content, details: record.details };
+		if (!message) continue;
+		const source = inboundNameSource(message);
+		if (source !== undefined && source.trim()) sources.push(source);
+	}
+	return sources;
+}
+
+/**
+ * The last `session_info` name visible in bounded head/tail windows: the cheap
+ * provenance re-check for writers (a full-file scan on the persist hot path
+ * measured half a second on a 33 MB transcript). Names written early sit in the
+ * head window; renames land in the tail; a name outside both windows is older
+ * than any decision this check protects.
+ */
+export function readSessionNameBounded(sessionFile: string): SessionLineageName | undefined {
+	const tail = inboundLastSessionInfoInText(readWindow(sessionFile, "tail"));
+	if (tail) return tail;
+	return inboundLastSessionInfoInText(readWindow(sessionFile, "head"));
+}
+
+function inboundLastSessionInfoInText(text: string): SessionLineageName | undefined {
+	const lines = text.split("\n");
+	for (let i = lines.length - 1; i >= 0; i--) {
+		const line = lines[i]?.trim();
+		if (!line) continue;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (!parsed || typeof parsed !== "object") continue;
+		const entry = parsed as { type?: unknown; name?: unknown; auto?: unknown };
+		if (entry.type !== "session_info") continue;
+		if (typeof entry.name === "string" && entry.name.trim()) {
+			return { name: entry.name.trim(), auto: entry.auto === true };
+		}
+		return undefined;
+	}
+	return undefined;
+}
+
+/**
+ * The first inbound source that actually derives a name, in-memory first (the
+ * live transcript already holds broadcasts that persistence still suppresses),
+ * then the bounded head window of the file (the first inbound always lives near
+ * the top). Low-information openers ("继续") are skipped, so a session is named
+ * by its first substantive message instead of staying unnamed forever.
+ */
+export function firstDerivableInboundSource(
+	sessionFile: string | undefined,
+	messages: readonly AutoNameInboundMessage[],
+): { source: string; name: string } | undefined {
+	for (const message of messages) {
+		const source = inboundNameSource(message);
+		if (source === undefined || !source.trim()) continue;
+		const name = deriveAutoSessionName(source);
+		if (name) return { source, name };
+	}
+	if (sessionFile) {
+		for (const source of inboundSourcesInText(readWindow(sessionFile, "head"))) {
+			const name = deriveAutoSessionName(source);
+			if (name) return { source, name };
+		}
+	}
+	return undefined;
+}
+
+const siblingNameMemo = new Map<string, { mtimeMs: number; name: string | undefined }>();
+
+/**
+ * Settled names of sibling transcripts in one directory, via bounded windows and
+ * an mtime memo: auto names must never create twins, because name-based
+ * agent-message routing throws on ambiguity.
+ */
+export function readSiblingSessionNames(sessionsDir: string, excludeFile: string): Set<string> {
+	const taken = new Set<string>();
+	let entries: string[];
+	try {
+		entries = readdirSync(sessionsDir);
+	} catch {
+		return taken;
+	}
+	for (const entry of entries) {
+		if (!entry.endsWith(".jsonl")) continue;
+		const file = join(sessionsDir, entry);
+		if (file === excludeFile) continue;
+		let mtimeMs: number;
+		try {
+			const fd = openSync(file, "r");
+			try {
+				mtimeMs = fstatSync(fd).mtimeMs;
+			} finally {
+				closeSync(fd);
+			}
+		} catch {
+			continue;
+		}
+		const memo = siblingNameMemo.get(file);
+		if (memo && memo.mtimeMs === mtimeMs) {
+			if (memo.name) taken.add(memo.name);
+			continue;
+		}
+		const name = readSessionNameBounded(file)?.name;
+		siblingNameMemo.set(file, { mtimeMs, name });
+		if (name) taken.add(name);
+	}
+	return taken;
+}
+
 /**
  * The first inbound naming source already on disk for a transcript: the first
  * user message text, or the first agent-to-agent broadcast payload. A resumed
@@ -243,8 +407,8 @@ export function scanFirstInboundSource(sessionFile: string): string | undefined 
 /**
  * The single decision point the AgentSession hook and tests share: never name
  * when disabled or when a name already exists (manual names are sacred),
- * prefer the derived first-inbound name (disk origin first, then the live
- * message), fall back to lineage inheritance.
+ * prefer the first derivable inbound name the caller resolved (in-memory
+ * messages first, then the transcript head window).
  */
 export function autoNameForInbound(options: {
 	mode: AutoSessionNameMode;
@@ -276,6 +440,8 @@ export function uniquifyAutoName(name: string, taken: ReadonlySet<string>): stri
 export interface SessionNamingFacts {
 	nameInfo: SessionLineageName | undefined;
 	firstInbound: string | undefined;
+	/** The first inbound source that actually derives a name (low-info openers skipped). */
+	derivedName: string | undefined;
 	hasAssistant: boolean;
 	headerVersion: number | undefined;
 }
@@ -290,6 +456,7 @@ export function scanSessionNamingFacts(sessionFile: string): SessionNamingFacts 
 	const facts: SessionNamingFacts = {
 		nameInfo: undefined,
 		firstInbound: undefined,
+		derivedName: undefined,
 		hasAssistant: false,
 		headerVersion: undefined,
 	};
@@ -336,6 +503,13 @@ export function scanSessionNamingFacts(sessionFile: string): SessionNamingFacts 
 		}
 	}
 	facts.firstInbound = scanFirstInboundSource(sessionFile);
+	for (const source of inboundSourcesInText(text)) {
+		const name = deriveAutoSessionName(source);
+		if (name) {
+			facts.derivedName = name;
+			break;
+		}
+	}
 	return facts;
 }
 
