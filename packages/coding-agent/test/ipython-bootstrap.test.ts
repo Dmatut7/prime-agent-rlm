@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { ReplKernelManager } from "../src/core/kernel/index.js";
+import { manifestPathIn, snapshotPathIn } from "../src/core/kernel/state-snapshot.js";
 import {
 	buildRlmBootstrapCode,
 	PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER,
@@ -159,6 +160,40 @@ describeIfKernel("RLM bootstrap skill wrapping (RT-5)", { tags: ["kernel-heavy"]
 		expect(out[1]).toContain("wrapper: True");
 		expect(out[1]).toContain("call: 1");
 	}, 60_000);
+
+	it("keeps its own skills when a restored state bound them before the bootstrap", async () => {
+		// Live shape: a saved namespace held a skill as its plain module (the wrapper
+		// itself cannot be pickled, the module can), so every resumed kernel restored the
+		// module first and the bootstrap then refused the skill as "already provided by
+		// the kernel". Refused, the name kept the plain module, which was saved again, so
+		// the state never healed. The restore runs before the bootstrap, as in production.
+		const snapshotDir = mkdtempSync(join(kernelDir, "restore-"));
+		const env = { PYTHONPATH: state.srcDir };
+		const snapshot = { path: snapshotPathIn(snapshotDir), manifestPath: manifestPathIn(snapshotDir) };
+		const first = new ReplKernelManager({ python: python as string, cwd: kernelDir, env, snapshot });
+		try {
+			await first.start();
+			expect((await first.execute("import skill_state")).status).toBe("ok");
+			expect((await first.snapshotState())?.saved).toContain("skill_state");
+		} finally {
+			await first.shutdown({ snapshot: false, drainHostRequests: true });
+		}
+		const second = new ReplKernelManager({ python: python as string, cwd: kernelDir, env, snapshot });
+		try {
+			await second.start();
+			expect((await second.restoreState())?.restored).toContain("skill_state");
+			const bootstrap = await second.execute(buildRlmBootstrapCode([state.info]));
+			expect(bootstrap.status).toBe("ok");
+			expect(bootstrap.stdout).not.toContain(PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER);
+			const probe = await second.execute(
+				"print('wrapper:', type(skill_state).__name__ == '_PrimeAgentCallableSkillModule')\nprint('call:', await skill_state())",
+			);
+			expect(probe.stdout).toContain("wrapper: True");
+			expect(probe.stdout).toContain("call: 1");
+		} finally {
+			await second.shutdown({ snapshot: false, drainHostRequests: true });
+		}
+	}, 90_000);
 
 	it("gives cross-skill module references the callable wrapper too (F1)", async () => {
 		const out = await withSkillKernel(

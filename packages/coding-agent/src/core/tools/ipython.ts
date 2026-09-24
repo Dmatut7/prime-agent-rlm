@@ -116,6 +116,7 @@ export function parseUnavailablePythonSkills(stdout: string): UnavailablePythonS
 export function buildRlmBootstrapCode(pythonSkills: readonly PythonSkillRuntimeInfo[] = []): string {
 	const baseCode = [RLM_BOOTSTRAP_HEADER_CODE, RLM_BOOTSTRAP_RUNTIME_CODE].join("\n\n");
 	const importNames = [...new Set(pythonSkills.map((skill) => skill.importName))];
+	const packagePaths = Object.fromEntries(pythonSkills.map((skill) => [skill.importName, skill.packagePath]));
 	if (importNames.length === 0) {
 		return baseCode;
 	}
@@ -260,6 +261,32 @@ _prime_agent_reserved_skill_names = (
     | frozenset(_prime_agent_sys.builtin_module_names)
 )
 
+_PRIME_AGENT_SKILL_PACKAGE_PATHS = ${JSON.stringify(packagePaths)}
+
+def _prime_agent_restored_skill_module(name):
+    """The skill's own module, bound by a state restore that ran before this bootstrap.
+
+    A saved namespace revives a skill by re-importing it, so the name arrives here as
+    the plain module from the skill's own package. That is not a foreign module
+    shadowing the name, so it is wrapped like a fresh import. Anything bound to the
+    name that lives outside the skill's package is still refused.
+    """
+    root = _PRIME_AGENT_SKILL_PACKAGE_PATHS.get(name)
+    if not root:
+        return None
+    root = _prime_agent_os.path.realpath(root) + _prime_agent_os.sep
+    found = None
+    for candidate in (globals().get(name), _prime_agent_sys.modules.get(name)):
+        if candidate is None:
+            continue
+        if not isinstance(candidate, _prime_agent_types.ModuleType):
+            return None
+        origin = getattr(candidate, "__file__", None)
+        if not origin or not _prime_agent_os.path.realpath(origin).startswith(root):
+            return None
+        found = candidate
+    return found
+
 def _prime_agent_loaded_skill_wrapper(name):
     """The wrapper an earlier bootstrap of this kernel (or a restored state) already bound."""
     for candidate in (globals().get(name), _prime_agent_sys.modules.get(name)):
@@ -274,6 +301,10 @@ for _prime_agent_skill_name in ${JSON.stringify(importNames)}:
         # itself: keep it, it is not a foreign module shadowing the name.
         globals()[_prime_agent_skill_name] = _prime_agent_existing_wrapper
         _prime_agent_sys.modules[_prime_agent_skill_name] = _prime_agent_existing_wrapper
+        continue
+    _prime_agent_restored_module = _prime_agent_restored_skill_module(_prime_agent_skill_name)
+    if _prime_agent_restored_module is not None:
+        globals()[_prime_agent_skill_name] = _prime_agent_wrap_skill_module(_prime_agent_restored_module)
         continue
     if _prime_agent_skill_name in _prime_agent_reserved_skill_names:
         _PRIME_AGENT_SKILL_IMPORT_ERRORS[_prime_agent_skill_name] = (
