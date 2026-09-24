@@ -9,8 +9,11 @@ import { ENV_AGENT_DIR, getSessionsDir } from "../src/config.js";
 import {
 	autoNameForInbound,
 	deriveAutoSessionName,
+	firstDerivableInboundSource,
 	firstInboundSourceFromMessages,
 	inboundNameSource,
+	readSessionNameBounded,
+	readSiblingSessionNames,
 	sanitizeRefinedTitle,
 	scanFirstInboundSource,
 	scanLastSessionInfoEntry,
@@ -57,7 +60,9 @@ describe("deriveAutoSessionName", () => {
 	});
 
 	it("relocates a bare URL to host plus last segment", () => {
-		expect(deriveAutoSessionName("https://github.com/badlogic/pi-mono/issues/4603")).toBe("github.com/4603");
+		expect(deriveAutoSessionName("https://github.com/badlogic/pi-mono/issues/4603")).toBe(
+			"github.com/badlogic/pi-mono",
+		);
 	});
 
 	it("refuses uuid-like and empty input", () => {
@@ -214,6 +219,65 @@ describe("firstInboundSourceFromMessages", () => {
 	});
 });
 
+describe("bounded readers and sibling dedupe", () => {
+	it("readSessionNameBounded sees names in the head and the tail window", () => {
+		const dir = mkdtempSync(join(tmpdir(), "prime-autoname-bounded-"));
+		const head = join(dir, "head.jsonl");
+		writeFileSync(
+			head,
+			`${JSON.stringify({ type: "session", version: 3, id: "h", timestamp: "t", cwd: dir })}\n${JSON.stringify({
+				type: "session_info",
+				id: "n1",
+				parentId: null,
+				timestamp: "t",
+				name: "头部名",
+				auto: true,
+			})}\n`,
+		);
+		expect(readSessionNameBounded(head)).toEqual({ name: "头部名", auto: true });
+		const tail = join(dir, "tail.jsonl");
+		writeFileSync(
+			tail,
+			`${JSON.stringify({ type: "session", version: 3, id: "t", timestamp: "t", cwd: dir })}\n${JSON.stringify({
+				type: "session_info",
+				id: "n2",
+				parentId: null,
+				timestamp: "t",
+				name: "尾部名",
+			})}\n`,
+		);
+		expect(readSessionNameBounded(tail)).toEqual({ name: "尾部名", auto: false });
+	});
+
+	it("readSiblingSessionNames collects settled sibling names for dedupe", () => {
+		const dir = mkdtempSync(join(tmpdir(), "prime-autoname-sib-"));
+		const a = join(dir, "a.jsonl");
+		const b = join(dir, "b.jsonl");
+		writeFileSync(
+			a,
+			`${JSON.stringify({ type: "session", version: 3, id: "a", timestamp: "t", cwd: dir })}\n${JSON.stringify({
+				type: "session_info",
+				id: "n1",
+				parentId: null,
+				timestamp: "t",
+				name: "修复水务公告越权",
+				auto: true,
+			})}\n`,
+		);
+		writeFileSync(b, `${JSON.stringify({ type: "session", version: 3, id: "b", timestamp: "t", cwd: dir })}\n`);
+		expect(readSiblingSessionNames(dir, b)).toEqual(new Set(["修复水务公告越权"]));
+	});
+
+	it("firstDerivableInboundSource skips low-info openers in memory", () => {
+		expect(
+			firstDerivableInboundSource(undefined, [
+				{ role: "user", content: "继续" },
+				{ role: "user", content: "修复水务公告越权读取" },
+			]),
+		).toEqual({ source: "修复水务公告越权读取", name: "修复水务公告越权读取" });
+	});
+});
+
 describe("uniquifyAutoName", () => {
 	it("suffixes collisions so sibling names stay addressable", () => {
 		const taken = new Set(["修复水务公告越权"]);
@@ -286,11 +350,24 @@ describe("autoname backfill command", () => {
 			const legacyRun = await runAutonameCommand([]);
 			expect(legacyRun).toBe(0);
 			expect(scanLastSessionInfoEntry(legacy)).toBeUndefined();
-			// --json is report-only even when combined with --apply.
-			const draftBefore = scanLastSessionInfoEntry(draft);
+			// --json is report-only even when combined with --apply: a fresh
+			// nameable session must still be unnamed afterwards.
+			const fresh = join(sessionsDir, "eeee1111-2222-3333-4444-555566667777.jsonl");
+			writeFileSync(
+				fresh,
+				`${JSON.stringify({ type: "session", version: 3, id: "eeee1111", timestamp: "t", cwd: agentDir })}\n${JSON.stringify(
+					{
+						type: "message",
+						message: { role: "user", content: "json 报告不该写盘" },
+					},
+				)}\n${JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "x" }] } })}\n`,
+			);
 			const jsonRun = await runAutonameCommand(["--json", "--apply"]);
 			expect(jsonRun).toBe(0);
-			expect(scanLastSessionInfoEntry(draft)).toEqual(draftBefore);
+			expect(scanLastSessionInfoEntry(fresh)).toBeUndefined();
+			const appliedAfterJson = await runAutonameCommand(["--apply"]);
+			expect(appliedAfterJson).toBe(0);
+			expect(scanLastSessionInfoEntry(fresh)).toEqual({ name: "json 报告不该写盘", auto: true });
 		} finally {
 			if (previous === undefined) delete process.env[ENV_AGENT_DIR];
 			else process.env[ENV_AGENT_DIR] = previous;

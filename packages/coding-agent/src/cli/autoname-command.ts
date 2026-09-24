@@ -79,7 +79,7 @@ function planAutonameForFileWithFacts(
 	if (facts.headerVersion !== CURRENT_SESSION_VERSION) {
 		return { sessionId, file, source: "skipped", reason: "legacy-version" };
 	}
-	const derived = facts.firstInbound === undefined ? undefined : deriveAutoSessionName(facts.firstInbound);
+	const derived = facts.derivedName;
 	if (!derived) {
 		return { sessionId, file, source: "skipped", reason: "no-source" };
 	}
@@ -127,7 +127,7 @@ export async function runAutonameCommand(args: string[]): Promise<number> {
 		}
 	}
 	if (!apply) {
-		if (!json && planned.length > 0) console.log("Dry run: re-run with --apply to write these names.");
+		if (planned.length > 0) console.log("Dry run: re-run with --apply to write these names.");
 		return 0;
 	}
 	const agentDir = getAgentDir();
