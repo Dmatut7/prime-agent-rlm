@@ -27,6 +27,7 @@ describe("announcedNextStep", () => {
 		"第一个文件看完了，接下来我去改第二个文件",
 		"已经定位到原因。下一步：修改 footer.ts 并跑测试",
 		"现在我来跑一遍测试",
+		"测试都过了。接下来我把文档也更新一下。",
 		"Found it. Let me fix the parser next.",
 		"Done with step one. I'll now update the tests:",
 		"进度：\n- [x] 读代码\n- [ ] 改代码\n- [ ] 跑测试",
@@ -40,6 +41,7 @@ describe("announcedNextStep", () => {
 		"要不要我接下来把测试也补上？",
 		"子代理已派出，等待子代理回复。",
 		"待命。",
+		"- self-recovery.ts：检测三类故障（工具步骤卡死、刚宣布还有下一步就停轮、子代理干完活不回话），每个动作落成会话条目供 duty-log 事后汇报。",
 		"Should I also update the docs?",
 		"I checked the plan; everything below is done and verified.",
 	])("leaves %j alone", (text) => {

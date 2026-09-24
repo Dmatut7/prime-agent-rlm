@@ -236,6 +236,13 @@ describe("summarizeDutyLog", () => {
 		);
 	});
 
+	it("does not flag a finished answer that merely mentions a next step", () => {
+		const text =
+			"两个文件加起来 746 行。\n\n- self-recovery.ts：检测三类故障（工具步骤卡死、刚宣布还有下一步就停轮、子代理干完活不回话），每个动作落成会话条目供 duty-log 事后汇报。";
+		const summary = summarizeDutyLog({ entries: [user(0), assistant(60_000, { text })], now: T0 + HOUR });
+		expect(summary?.unfinished).toBeUndefined();
+	});
+
 	it("turns a stopped long-running goal into a decision", () => {
 		const entries = [
 			user(0),

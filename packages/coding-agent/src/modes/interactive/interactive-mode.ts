@@ -205,6 +205,7 @@ import {
 	BlockNavigator,
 	type FocusableBlock,
 	isFocusableBlock,
+	isVisibleRow,
 } from "./components/block-focus.js";
 import { BorderedLoader } from "./components/bordered-loader.js";
 import { BranchSummaryMessageComponent } from "./components/branch-summary-message.js";
@@ -8650,7 +8651,7 @@ export class InteractiveMode {
 		const width = Math.max(1, this.ui.terminal.columns);
 		return this.chatContainer.children.filter(
 			(child): child is FocusableBlock & Component =>
-				isFocusableBlock(child) && child.render(width).some((line) => line.trim().length > 0),
+				isFocusableBlock(child) && child.render(width).some(isVisibleRow),
 		);
 	}
 

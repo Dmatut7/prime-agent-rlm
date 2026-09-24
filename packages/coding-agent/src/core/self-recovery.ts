@@ -50,7 +50,7 @@ export type SelfRecoveryRecord =
 // Phrases that announce work still to come. Matched only in the reply's tail, so an
 // answer that merely mentions a plan somewhere in the middle is left alone.
 const NEXT_STEP_PATTERNS: readonly RegExp[] = [
-	/(?:^|[\s，。；：、（(])(?:接下来|下一步|然后我|现在我|我(?:这就|马上|先|将|会|来|去)|让我(?:先|再|来|去)?)[^。！？\n]{0,80}$/u,
+	/(?:^|[\s，。；：、（(])(?:接下来|下一步|然后我|现在我|我(?:这就|马上|先|将|会|来|去)|让我(?:先|再|来|去)?)[^。！？\n]{0,80}[。…：:]?\s*$/u,
 	/\b(?:let me|i(?:'ll| will| am going to|'m going to)|next,? i(?:'ll| will)|now i(?:'ll| will))\b[^.!?\n]{0,120}[:.…]?\s*$/i,
 ];
 
@@ -91,12 +91,19 @@ export function announcedNextStep(message: AssistantMessage): string | undefined
 	if (message.stopReason !== "stop") return undefined;
 	if (message.content.some((block) => block.type === "toolCall")) return undefined;
 	const text = assistantText(message);
-	if (!text) return undefined;
+	return textAnnouncesNextStep(text) ? excerptOf(text) : undefined;
+}
+
+/**
+ * Whether a reply's text ends by announcing work it has not done: a next-step
+ * phrase in its tail or an unchecked checklist item, and not a final answer, a
+ * question or a wait. Shared by auto-continue and the duty log's "可能没做完".
+ */
+export function textAnnouncesNextStep(text: string): boolean {
+	if (!text) return false;
 	const tail = text.slice(-240);
-	if (FINAL_REPLY_PATTERNS.some((pattern) => pattern.test(tail))) return undefined;
-	const announces =
-		NEXT_STEP_PATTERNS.some((pattern) => pattern.test(tail)) || OPEN_CHECKLIST_PATTERN.test(text.slice(-600));
-	return announces ? excerptOf(text) : undefined;
+	if (FINAL_REPLY_PATTERNS.some((pattern) => pattern.test(tail))) return false;
+	return NEXT_STEP_PATTERNS.some((pattern) => pattern.test(tail)) || OPEN_CHECKLIST_PATTERN.test(text.slice(-600));
 }
 
 /** Whether this run did tool work after its last user prompt (a pure chat answer is never nudged). */

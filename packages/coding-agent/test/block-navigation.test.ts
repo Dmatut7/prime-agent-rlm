@@ -7,6 +7,7 @@ import {
 	BlockNavigator,
 	blockFocusHint,
 	decorateFocusedBlock,
+	isVisibleRow,
 } from "../src/modes/interactive/components/block-focus.js";
 import { TurnActivityState, TurnSummaryComponent } from "../src/modes/interactive/components/turn-activity.js";
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.js";
@@ -119,7 +120,8 @@ describe("InteractiveMode block navigation", () => {
 		mode.startBlockNavigation(-1);
 		expect(mode.blockNavigation.focused).toBe(answer);
 		expect(mode.ui.setFocus).toHaveBeenCalledWith(mode.blockNavigation.navigator);
-		expect(strip(answer.render(100).join("\n"))).toContain("复制");
+		const focusedRows = answer.render(100).map(strip);
+		expect(focusedRows.find((row) => row.includes("复制"))).toContain("目录里有 4 个包。");
 
 		mode.moveBlockFocus(-1);
 		expect(mode.blockNavigation.focused).toBe(summary);
@@ -137,6 +139,16 @@ describe("InteractiveMode block navigation", () => {
 		expect(mode.focusEditor).toHaveBeenCalled();
 		expect(mode.editor.handleInput).toHaveBeenCalledWith("x");
 		expect(strip(user.render(100).join("\n"))).not.toContain("复制");
+	});
+
+	it("skips blocks that draw only blank rows (a tool-call-only reply)", () => {
+		const summary = turn();
+		const toolOnly = assistant("");
+		const answer = assistant("数完了。");
+		expect(toolOnly.render(100).some(isVisibleRow)).toBe(false);
+		const mode = createMode([new UserMessageComponent("数一下"), summary, answer, toolOnly]);
+		mode.startBlockNavigation(-1);
+		expect(mode.blockNavigation.focused).toBe(answer);
 	});
 
 	it("toggles an answer's Thinking and copies its markdown source", async () => {

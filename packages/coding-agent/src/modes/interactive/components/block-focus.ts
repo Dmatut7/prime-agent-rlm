@@ -1,4 +1,5 @@
 import { type Component, type Focusable, getKeybindings, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import stripAnsi from "strip-ansi";
 import { theme } from "../theme/theme.js";
 import { keyText } from "./keybinding-hints.js";
 
@@ -43,6 +44,9 @@ export function blockFocusHint(): string {
 	return parts.join(" · ");
 }
 
+/** Trailing spaces, with any styling escapes that follow them kept. */
+const TRAILING_PADDING = / +((?:\x1b\[[0-9;]*m)*)$/;
+
 /**
  * The focused look: every row on the selection background, the key hint
  * right-aligned on the first non-empty row, and the reveal marker in front.
@@ -50,10 +54,12 @@ export function blockFocusHint(): string {
 export function decorateFocusedBlock(lines: readonly string[], width: number, state: BlockFocusState): string[] {
 	const paint = theme.getSelectionBackgroundColor();
 	const hint = blockFocusHint();
-	const firstContent = lines.findIndex((line) => line.trim().length > 0);
+	const firstContent = lines.findIndex(isVisibleRow);
 	return lines.map((line, index) => {
 		let row = truncateToWidth(line, width, "");
 		if (index === firstContent && hint) {
+			// Rows often arrive padded to full width; the hint takes the padding's place.
+			row = row.replace(TRAILING_PADDING, "$1");
 			const room = width - visibleWidth(row) - visibleWidth(hint) - 1;
 			if (room >= 2) {
 				row = `${row}${" ".repeat(room)}${theme.fg("dim", hint)} `;
@@ -63,6 +69,11 @@ export function decorateFocusedBlock(lines: readonly string[], width: number, st
 		const painted = paint(padded);
 		return index === Math.max(0, firstContent) && state.reveal ? `${BLOCK_REVEAL_MARKER}${painted}` : painted;
 	});
+}
+
+/** Whether a rendered row shows anything: styling escapes and spaces alone do not count. */
+export function isVisibleRow(line: string): boolean {
+	return stripAnsi(line).trim().length > 0;
 }
 
 export interface BlockNavigatorHandlers {

@@ -1,4 +1,5 @@
 import { open, stat } from "node:fs/promises";
+import { textAnnouncesNextStep } from "./self-recovery.js";
 
 /**
  * The duty log (值班记录): what happened in a session while its owner was
@@ -165,8 +166,6 @@ function customOf(entry: Json): { customType: string; details: Json | undefined 
 
 const QUOTA_ERROR = /quota|余额|额度|insufficient.?balance|billing|usage limit/i;
 const STALL_ABORT = /stall|watchdog|卡住|无响应/i;
-const PLAN_ENDING =
-	/(?:让我|我(?:先|再|来|将|会|去)|接下来|下一步|然后我|let me|i(?:'ll| will)|next,? i)[^。.!！?？]{0,80}[:：…。.]?\s*$/i;
 const DECISION_ASK = /[?？]\s*$|需要你|请(?:你)?确认|要不要|是否(?:要|需要|同意)|你(?:来)?(?:定|决定|选)|请告诉我|等你/;
 
 function preview(text: string, chars = TEXT_PREVIEW_CHARS): string {
@@ -429,7 +428,12 @@ export function summarizeDutyLog(input: DutyLogInput): DutyLogSummary | undefine
 		incidents: incidents.list(),
 		pending,
 	};
-	if (lastEventWasFinal && lastFinalText && PLAN_ENDING.test(lastFinalText) && !decisionSentence(lastFinalText)) {
+	if (
+		lastEventWasFinal &&
+		lastFinalText &&
+		textAnnouncesNextStep(lastFinalText.trim()) &&
+		!decisionSentence(lastFinalText)
+	) {
 		summary.unfinished = preview(
 			lastFinalText
 				.split(/\n/)
