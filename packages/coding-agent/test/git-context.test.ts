@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { captureGitContext, gitContextsEqual } from "../src/utils/git.js";
 
 function git(cwd: string, ...args: string[]): string {
@@ -27,9 +27,16 @@ describe("captureGitContext", () => {
 
 	beforeEach(() => {
 		dir = mkdtempSync(join(tmpdir(), "git-context-"));
+		// The developer's global git config (e.g. a url.insteadOf rewrite) must not
+		// change what these repos report; point git at an empty global config.
+		const emptyConfig = join(dir, ".gitconfig-empty");
+		writeFileSync(emptyConfig, "");
+		vi.stubEnv("GIT_CONFIG_GLOBAL", emptyConfig);
+		vi.stubEnv("GIT_CONFIG_NOSYSTEM", "1");
 	});
 
 	afterEach(() => {
+		vi.unstubAllEnvs();
 		rmSync(dir, { recursive: true, force: true });
 	});
 

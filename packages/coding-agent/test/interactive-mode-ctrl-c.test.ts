@@ -57,6 +57,7 @@ type FakeInteractiveMode = {
 	keybindings?: KeybindingsManager;
 	handleDebugCommand?: Mock;
 	showShortcutGuide?: Mock;
+	uiServices: { settingsManager: { getProcessMode(): "quiet" | "legacy" } };
 };
 
 function createEditor(text = ""): FakeEditor {
@@ -123,6 +124,8 @@ function createInteractiveFake(options: {
 		shutdown: vi.fn().mockResolvedValue(undefined),
 		updateEditorBorderColor: vi.fn(),
 		showShortcutGuide: vi.fn(),
+		// handleEscape reads the process mode (T8 quiet Esc walk) through the settings service.
+		uiServices: { settingsManager: { getProcessMode: () => "quiet" } },
 	};
 	Object.setPrototypeOf(fake, InteractiveMode.prototype);
 	return fake;

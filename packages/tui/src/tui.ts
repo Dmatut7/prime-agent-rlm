@@ -892,6 +892,17 @@ export class TUI extends Container {
 		this.requestRender();
 	}
 
+	/**
+	 * Keep the fullscreen transcript row that carries `marker` (a zero-width
+	 * string the row's component renders) in view; undefined stops tracking.
+	 * Inline mode has no viewport to move, so it is a no-op there.
+	 */
+	setFullscreenRevealMarker(marker: string | undefined): void {
+		if (!this.fullscreen) return;
+		this.fullscreen.viewport.setRevealMarker(marker);
+		this.requestRender();
+	}
+
 	/** Scroll state of the fullscreen window, or null when not fullscreen. */
 	getScrollInfo(): ScrollInfo | null {
 		return this.fullscreen?.viewport.scrollInfo() ?? null;

@@ -42,6 +42,7 @@ type RenderSessionContextThis = {
 	ui: TUI;
 	settingsManager: {
 		getShowImages(): boolean;
+		getProcessMode(): "quiet" | "legacy";
 	};
 	toolOutputExpanded: boolean;
 	isInitialized: boolean;
@@ -85,6 +86,7 @@ function createFakeInteractiveModeThis(): RenderSessionContextThis {
 		ui: { requestRender: vi.fn() } as unknown as TUI,
 		settingsManager: {
 			getShowImages: () => false,
+			getProcessMode: () => "quiet",
 		},
 		toolOutputExpanded: false,
 		isInitialized: true,

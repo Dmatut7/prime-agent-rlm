@@ -65,26 +65,34 @@ class AgentMessageBodyComponent implements Component {
 	}
 }
 
+/** Columns an agent-message row is inset inside a quiet turn, matching the turn's step rows. */
+export const AGENT_MESSAGE_TURN_INSET = 2;
+
 export class AgentMessageComponent extends Container {
 	private readonly content = new Container();
 	private readonly header = new Text("", 1, 0);
 	private readonly suppressLeadingSpace: boolean;
+	/** Columns the row sits in, so it lines up with the steps of the turn it belongs to. */
+	private readonly inset: number;
+	private insetSource?: string[];
+	private insetLines?: string[];
 	private expanded = false;
 
 	constructor(
 		private readonly message: AgentSessionMessage,
 		_markdownTheme: MarkdownTheme = getMarkdownTheme(),
-		options: { suppressLeadingSpace?: boolean } = {},
+		options: { suppressLeadingSpace?: boolean; inset?: number } = {},
 	) {
 		super();
 		this.suppressLeadingSpace = options.suppressLeadingSpace ?? false;
+		this.inset = Math.max(0, options.inset ?? 0);
 		if (!this.suppressLeadingSpace) this.addChild(new Spacer(1));
 		this.addChild(this.content);
 		this.updateDisplay();
 	}
 
 	override render(width: number): string[] {
-		const lines = super.render(width);
+		const lines = this.withInset(super.render(Math.max(1, width - this.inset)));
 		const leadingSpace = !this.suppressLeadingSpace;
 		this.clickRegions =
 			lines.length > 0
@@ -100,6 +108,16 @@ export class AgentMessageComponent extends Container {
 				: [];
 		return lines;
 	}
+	private withInset(lines: string[]): string[] {
+		if (this.inset === 0) return lines;
+		if (this.insetSource !== lines || !this.insetLines) {
+			const pad = " ".repeat(this.inset);
+			this.insetSource = lines;
+			this.insetLines = lines.map((line) => (line.trim().length > 0 ? pad + line : line));
+		}
+		return this.insetLines;
+	}
+
 	setExpanded(expanded: boolean): void {
 		if (this.expanded === expanded) {
 			return;

@@ -48,6 +48,11 @@ export interface AppKeybindings {
 	"app.session.fork": true;
 	"app.session.resume": true;
 	"app.agents.back": true;
+	"app.blocks.prev": true;
+	"app.blocks.next": true;
+	"app.blocks.toggle": true;
+	"app.blocks.copy": true;
+	"app.blocks.exit": true;
 	"app.agents.open": true;
 	"app.modal.back": true;
 	"app.agents.reply": true;
@@ -191,6 +196,13 @@ export const KEYBINDINGS = {
 	"app.session.fork": { defaultKeys: [], description: "Fork current session" },
 	"app.session.resume": { defaultKeys: [], description: "Resume a session" },
 	"app.agents.back": { defaultKeys: "left", description: "Return to parent agent scope" },
+	// Block navigation shares Alt+Up/Down with the pending-message browser: with a
+	// queue the keys browse it, without one they walk the conversation blocks.
+	"app.blocks.prev": { defaultKeys: "alt+up", description: "Focus the previous conversation block" },
+	"app.blocks.next": { defaultKeys: "alt+down", description: "Focus the next conversation block" },
+	"app.blocks.toggle": { defaultKeys: ["enter", "space"], description: "Open or close the focused block" },
+	"app.blocks.copy": { defaultKeys: "y", description: "Copy the focused block" },
+	"app.blocks.exit": { defaultKeys: "escape", description: "Leave block navigation" },
 	"app.agents.open": { defaultKeys: "right", description: "Drill into selected agent" },
 	"app.modal.back": { defaultKeys: "left", description: "Go back / close the current dialog" },
 	"app.agents.reply": { defaultKeys: "space", description: "Reply to selected agent" },

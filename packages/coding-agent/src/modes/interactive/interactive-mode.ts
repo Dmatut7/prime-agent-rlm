@@ -196,10 +196,16 @@ import {
 } from "../shared/startup-notices.js";
 import { AGENT_ACTIVITY_LABELS, AgentActivityTracker, formatTokenCount } from "./agent-activity.js";
 import { type AuthenticationResult, getAnthropicSubscriptionAuthWarning, ProviderAuthFlows } from "./auth-flows.js";
-import { AgentMessageComponent } from "./components/agent-message.js";
+import { AGENT_MESSAGE_TURN_INSET, AgentMessageComponent } from "./components/agent-message.js";
 import { ArminComponent } from "./components/armin.js";
 import { AssistantMessageComponent } from "./components/assistant-message.js";
 import { BashExecutionComponent } from "./components/bash-execution.js";
+import {
+	BLOCK_REVEAL_MARKER,
+	BlockNavigator,
+	type FocusableBlock,
+	isFocusableBlock,
+} from "./components/block-focus.js";
 import { BorderedLoader } from "./components/bordered-loader.js";
 import { BranchSummaryMessageComponent } from "./components/branch-summary-message.js";
 import { type FullPaneOverlayOptions, showFullPaneOverlay } from "./components/centered-overlay.js";
@@ -422,19 +428,24 @@ export function getRandomStartHint(random = Math.random): (typeof START_HINTS)[n
 	return START_HINTS[Math.floor(random() * START_HINTS.length)] ?? START_HINTS[0];
 }
 
-function isLabeledQueuedPreview(message: string): boolean {
-	return (
-		message.startsWith(`${HEARTBEAT_PROMPT_PREVIEW_LABEL}: `) ||
-		message.startsWith(`${GOAL_CONTEXT_PREVIEW_LABEL}: `) ||
-		message.startsWith(`${AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL}: `)
-	);
-}
+/**
+ * Queue previews the session already labels (the English labels double as
+ * detection keys in core), mapped to their display wording.
+ */
+const LABELED_QUEUED_PREVIEWS: ReadonlyArray<[prefix: string, display: string]> = [
+	[`${HEARTBEAT_PROMPT_PREVIEW_LABEL}: `, "定时任务："],
+	[`${GOAL_CONTEXT_PREVIEW_LABEL}: `, "目标："],
+	[`${AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL}: `, "收到消息："],
+];
 
 /** The queued-message row labels: a steer lands in the running turn, a follow-up after it. */
 const QUEUED_MESSAGE_LABELS = { Steering: "插话", "Follow-up": "稍后发送" } as const;
 
 export function formatQueuedMessagePreview(message: string, label: "Steering" | "Follow-up"): string {
-	return isLabeledQueuedPreview(message) ? message : `${QUEUED_MESSAGE_LABELS[label]}：${message}`;
+	for (const [prefix, display] of LABELED_QUEUED_PREVIEWS) {
+		if (message.startsWith(prefix)) return `${display}${message.slice(prefix.length)}`;
+	}
+	return `${QUEUED_MESSAGE_LABELS[label]}：${message}`;
 }
 
 export function styleQueuedMessagePreview(
@@ -1196,6 +1207,8 @@ export class InteractiveMode {
 	private agentsViewRequest: InteractiveModeRunResult["type"] | undefined;
 	private loadingAnimation: Loader | undefined = undefined;
 	private workingMessage: string | undefined = undefined;
+	/** Block navigation (Alt+Up): the invisible focus owner and the focused block. */
+	private blockNavigation: { navigator: BlockNavigator; focused: FocusableBlock & Component } | undefined;
 	private recentSession: RecentSession | undefined;
 	/** When the current agent run started (agent_start), the floor for its turn clock. */
 	private agentRunStartedAt: number | undefined;
@@ -4858,8 +4871,16 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.editor.external", () => this.openExternalEditor());
 		this.defaultEditor.onAction("app.prompt.stash", () => this.handlePromptStash());
 		this.defaultEditor.onAction("app.message.followUp", () => this.handleFollowUp());
-		this.defaultEditor.onAction("app.message.navigateOlder", () => this.browseQueueSelection(-1));
-		this.defaultEditor.onAction("app.message.navigateNewer", () => this.browseQueueSelection(1));
+		// Alt+Up/Down browse the pending messages when there are any; otherwise they
+		// walk the conversation blocks (the two share their default keys).
+		this.defaultEditor.onAction("app.message.navigateOlder", () => {
+			if (this.hasBrowsableQueue()) this.browseQueueSelection(-1);
+			else this.startBlockNavigation(-1);
+		});
+		this.defaultEditor.onAction("app.message.navigateNewer", () => {
+			if (this.hasBrowsableQueue()) this.browseQueueSelection(1);
+		});
+		this.defaultEditor.onAction("app.blocks.prev", () => this.startBlockNavigation(-1));
 		this.defaultEditor.onAction("app.message.moveEarlier", () => this.moveQueueSelection(-1));
 		this.defaultEditor.onAction("app.message.moveLater", () => this.moveQueueSelection(1));
 		this.defaultEditor.onAction("app.session.new", () => this.handleClearCommand());
@@ -7484,6 +7505,7 @@ export class InteractiveMode {
 		if (isAgentSessionMessage(message)) {
 			return new AgentMessageComponent(message, this.getMarkdownThemeWithSettings(), {
 				suppressLeadingSpace: isCompactAgentMessageNeighbor(this.chatContainer.children.at(-1)),
+				inset: this.isInsideQuietTurn() ? AGENT_MESSAGE_TURN_INSET : 0,
 			});
 		}
 		if (isInjectedPromptMessage(message)) {
@@ -8594,6 +8616,113 @@ export class InteractiveMode {
 		}
 	}
 
+	private hasBrowsableQueue(): boolean {
+		const queue = this.getConnectionQueue();
+		return this.queueSelection.isBrowsing || queue.steering.length > 0 || queue.followUp.length > 0;
+	}
+
+	/** The conversation blocks block navigation walks, top to bottom. */
+	private navigableBlocks(): (FocusableBlock & Component)[] {
+		const width = Math.max(1, this.ui.terminal.columns);
+		return this.chatContainer.children.filter(
+			(child): child is FocusableBlock & Component =>
+				isFocusableBlock(child) && child.render(width).some((line) => line.trim().length > 0),
+		);
+	}
+
+	/** Enter block navigation on the newest block (Alt+Up from the prompt). */
+	private startBlockNavigation(direction: -1 | 1): void {
+		if (this.blockNavigation) {
+			this.moveBlockFocus(direction);
+			return;
+		}
+		const blocks = this.navigableBlocks();
+		const last = blocks.at(-1);
+		if (!last) return;
+		this.blockNavigation = {
+			navigator: new BlockNavigator({
+				move: (step) => this.moveBlockFocus(step),
+				toggle: () => this.toggleFocusedBlock(),
+				copy: () => void this.copyFocusedBlock(),
+				exit: (passThrough) => this.exitBlockNavigation(passThrough),
+			}),
+			focused: last,
+		};
+		this.applyBlockFocus();
+		this.ui.setFocus(this.blockNavigation.navigator);
+		this.ui.setFullscreenRevealMarker(BLOCK_REVEAL_MARKER);
+		this.ui.requestRender();
+	}
+
+	private applyBlockFocus(): void {
+		const focused = this.blockNavigation?.focused;
+		for (const block of this.navigableBlocks()) {
+			block.setBlockFocus(block === focused ? { reveal: this.ui.isFullscreen() } : undefined);
+		}
+	}
+
+	private moveBlockFocus(direction: -1 | 1): void {
+		const navigation = this.blockNavigation;
+		if (!navigation) return;
+		const blocks = this.navigableBlocks();
+		const index = blocks.indexOf(navigation.focused);
+		const next = blocks[Math.max(0, Math.min(blocks.length - 1, (index === -1 ? blocks.length : index) + direction))];
+		if (!next) return;
+		navigation.focused = next;
+		this.applyBlockFocus();
+		this.ui.requestRender();
+	}
+
+	/** The turn a block belongs to: the nearest turn summary at or above it. */
+	private turnSummaryFor(block: Component): TurnSummaryComponent | undefined {
+		if (block instanceof TurnSummaryComponent) return block;
+		const children = this.chatContainer.children;
+		for (let i = children.indexOf(block); i >= 0; i--) {
+			const child = children[i];
+			if (child instanceof TurnSummaryComponent) return child;
+			if (child instanceof UserMessageComponent) return undefined;
+		}
+		return undefined;
+	}
+
+	/** Enter/Space: a process line or step opens its turn's steps; an answer opens its Thinking. */
+	private toggleFocusedBlock(): void {
+		const focused = this.blockNavigation?.focused;
+		if (!focused) return;
+		const summary = this.turnSummaryFor(focused);
+		if (!summary) return;
+		if (focused instanceof AssistantMessageComponent) {
+			summary.state.thinkingExpanded = !summary.state.thinkingExpanded;
+		} else {
+			summary.setExpanded(summary.state.isCollapsed);
+		}
+		this.applyTurnExpansion(summary);
+		this.applyBlockFocus();
+	}
+
+	private async copyFocusedBlock(): Promise<void> {
+		const text = this.blockNavigation?.focused.getBlockCopyText().trim();
+		if (!text) {
+			this.showStatus("这一块没有可复制的文字");
+			return;
+		}
+		try {
+			await copyToClipboard(text);
+			this.showStatus("已复制到剪贴板");
+		} catch (error) {
+			this.showError(`复制失败：${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
+	private exitBlockNavigation(passThrough?: string): void {
+		if (!this.blockNavigation) return;
+		this.blockNavigation = undefined;
+		this.applyBlockFocus();
+		this.ui.setFullscreenRevealMarker(undefined);
+		this.focusEditor();
+		if (passThrough !== undefined) this.editor.handleInput(passThrough);
+	}
+
 	private browseQueueSelection(direction: -1 | 1): void {
 		if (this.pendingQueueEdit || this.pendingQueueMove) return;
 		const text = this.queueSelection.move(this.getConnectionQueue(), this.editor.getText(), direction);
@@ -8983,6 +9112,18 @@ export class InteractiveMode {
 		}
 		this.applyTurnExpansion(entry.summary);
 		return true;
+	}
+
+	/** Whether the chat's tail is a quiet turn (its summary comes after the latest user message). */
+	private isInsideQuietTurn(): boolean {
+		if (this.settingsManager.getProcessMode() !== "quiet") return false;
+		const children = this.chatContainer.children;
+		for (let i = children.length - 1; i >= 0; i--) {
+			const child = children[i];
+			if (child instanceof TurnSummaryComponent) return true;
+			if (child instanceof UserMessageComponent) return false;
+		}
+		return false;
 	}
 
 	private latestTurnSummary(): TurnSummaryComponent | undefined {
@@ -11888,6 +12029,8 @@ export class InteractiveMode {
 		const externalEditor = this.getAppKeyDisplay("app.editor.external");
 		const promptStash = this.getAppKeyDisplay("app.prompt.stash");
 		const pasteImage = this.getAppKeyDisplay("app.clipboard.pasteImage");
+		const blocksPrev = this.getAppKeyDisplay("app.blocks.prev");
+		const blocksNext = this.getAppKeyDisplay("app.blocks.next");
 
 		return `
 **输入**
@@ -11899,6 +12042,7 @@ export class InteractiveMode {
 \`${selectModel}\` 选模型 · \`/effort\` 调推理强度 · \`${expandTools}\` 过程${expandToolsFull ? ` · \`${expandToolsFull}\` 看全文` : ""}
 \`${expandMessages}\` 代理消息 · \`${expandEdits}\` 改动详情 · \`${toggleThinking}\` Thinking · \`${promptStash}\` 暂存输入 · \`${externalEditor}\` 用 \`$EDITOR\` 编辑
 \`${pasteImage}\` 粘贴图片
+${blocksPrev ? `\`${blocksPrev}\`${blocksNext ? ` / \`${blocksNext}\`` : ""} 逐块浏览对话（Enter 展开 · y 复制 · Esc 返回）` : ""}
 
 **帮助**
 ${shortcutsKey ? `\`${shortcutsKey}\` 快捷键（再按一次关闭） · ` : ""}\`/hotkeys\` 完整列表
@@ -11945,6 +12089,8 @@ ${shortcutsKey ? `\`${shortcutsKey}\` 快捷键（再按一次关闭） · ` : "
 		const promptStash = this.getAppKeyDisplay("app.prompt.stash");
 		const followUp = this.getAppKeyDisplay("app.message.followUp");
 		const browseQueue = this.getAppKeyDisplay("app.message.navigateOlder");
+		const blocksPrev = this.getAppKeyDisplay("app.blocks.prev");
+		const blocksNext = this.getAppKeyDisplay("app.blocks.next");
 		const reorderQueue = `${this.getAppKeyDisplay("app.message.moveEarlier")} / ${this.getAppKeyDisplay("app.message.moveLater")}`;
 		const pasteImage = this.getAppKeyDisplay("app.clipboard.pasteImage");
 		const viewportPageUp = this.getEditorKeyDisplay("tui.viewport.pageUp");
@@ -11995,6 +12141,7 @@ ${expandToolsFull ? `| \`${expandToolsFull}\` | 看全文（不限行数） |\n`
 | \`${promptStash}\` | 暂存 / 恢复草稿 |
 | \`${followUp}\` | 排一条稍后发送的消息 |
 | \`${browseQueue}\` | 查看或修改排队消息 |
+${blocksPrev ? `| \`${blocksPrev}\`${blocksNext ? ` / \`${blocksNext}\`` : ""} | 逐块浏览对话（没有排队消息时；Enter 展开 · y 复制 · Esc 返回） |\n` : ""}
 | \`${reorderQueue}\` | 调整排队消息顺序 |
 | \`${pasteImage}\` | 从剪贴板粘贴图片 |
 | \`/\` | 命令 |
@@ -12077,7 +12224,7 @@ ${expandToolsFull ? `| \`${expandToolsFull}\` | 看全文（不限行数） |\n`
 			await this.renderCurrentSessionState();
 			for (const [id, image] of retainedImages) this.pastedImages.set(id, image);
 			this.chatContainer.addChild(new Spacer(1));
-			this.chatContainer.addChild(new Text(`${theme.fg("accent", "✓ New session started")}`, 1, 1));
+			this.chatContainer.addChild(new Text(`${theme.fg("accent", "✓ 已开新会话")}`, 1, 1));
 			this.ui.requestRender();
 			const images = options.prompt ? this.collectImagesFor(options.prompt) : undefined;
 			if (options.name) await this.agentConnection.setSessionName(options.name);
@@ -12087,7 +12234,7 @@ ${expandToolsFull ? `| \`${expandToolsFull}\` | 看全文（不限行数） |\n`
 			}
 		} catch (error: unknown) {
 			if (!created) {
-				await this.handleFatalRuntimeError("Failed to create session", error);
+				await this.handleFatalRuntimeError("新建会话失败", error);
 				return;
 			}
 			restorePrompt();
