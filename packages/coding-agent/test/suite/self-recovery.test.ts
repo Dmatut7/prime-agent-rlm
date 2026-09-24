@@ -3,9 +3,10 @@ import { TOOL_TIMEOUT_CAUSE_PREFIX } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
+import { DUTY_EVENT_CUSTOM_TYPE } from "../../src/core/duty-log.js";
 import type { KernelLivenessSample } from "../../src/core/kernel/shared.js";
 import { AUTO_CONTINUE_CUSTOM_TYPE } from "../../src/core/messages.js";
-import { DUTY_EVENT_CUSTOM_ENTRY, readSelfRecoveryRecords } from "../../src/core/self-recovery.js";
+import { readSelfRecoveryRecords } from "../../src/core/self-recovery.js";
 import type { TurnLivenessKernelFacts } from "../../src/core/turn-liveness.js";
 import { createHarness, type Harness } from "./harness.js";
 
@@ -102,7 +103,7 @@ function autoContinues(harness: Harness) {
 function dutyEvents(harness: Harness): Array<{ kind: string; [key: string]: unknown }> {
 	return harness.sessionManager
 		.getBranch()
-		.filter((entry) => entry.type === "custom" && entry.customType === DUTY_EVENT_CUSTOM_ENTRY)
+		.filter((entry) => entry.type === "custom" && entry.customType === DUTY_EVENT_CUSTOM_TYPE)
 		.map((entry) => (entry as { data: { kind: string } }).data);
 }
 

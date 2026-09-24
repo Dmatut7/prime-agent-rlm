@@ -174,6 +174,7 @@ import {
 } from "./cron-jobs.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import type { ResourceDiagnostic } from "./diagnostics.js";
+import { DUTY_EVENT_CUSTOM_TYPE, type DutyEvent } from "./duty-log.js";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.js";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.js";
 import {
@@ -293,12 +294,10 @@ import {
 import { expandPromptTemplate, type PromptTemplate, parseCommandArgs } from "./prompt-templates.js";
 import {
 	BAD_TOOL_CALL_STORM_THRESHOLD,
-	DUTY_EVENT_ENTRY_TYPE,
 	describeProviderFailureCause,
 	isBadToolCall,
 	PROVIDER_FALLBACK_ENTRY_TYPE,
 	PROVIDER_FALLBACK_RETURN_AFTER_MS,
-	type ProviderDutyEvent,
 	type ProviderFallbackEntryData,
 	providerLongWaitDelayMs,
 	toolResultText,
@@ -396,8 +395,6 @@ import {
 import {
 	announcedNextStep,
 	autoContinuesInRun,
-	DUTY_EVENT_CUSTOM_ENTRY,
-	type DutyEvent,
 	dutyEventFor,
 	MAX_AUTO_CONTINUES_PER_PROMPT,
 	ranToolsSinceLastPrompt,
@@ -6369,7 +6366,7 @@ export class AgentSession {
 	/** Append one duty-log event for the "while you were away" summary. */
 	private _recordDutyEvent(event: DutyEvent): void {
 		try {
-			this.sessionManager.appendCustomEntry(DUTY_EVENT_CUSTOM_ENTRY, event);
+			this.sessionManager.appendCustomEntry(DUTY_EVENT_CUSTOM_TYPE, event);
 		} catch (error) {
 			sessionLog.warn("could not record a duty event", {
 				sessionId: this.sessionId,
@@ -19175,11 +19172,6 @@ export class AgentSession {
 
 	private _recordFallbackEntry(data: ProviderFallbackEntryData): void {
 		this._appendRecoveryEntry(PROVIDER_FALLBACK_ENTRY_TYPE, data);
-	}
-
-	/** One provider-recovery event for the duty log (see DUTY_EVENT_ENTRY_TYPE). */
-	private _recordDutyEvent(event: ProviderDutyEvent): void {
-		this._appendRecoveryEntry(DUTY_EVENT_ENTRY_TYPE, event);
 	}
 
 	private _appendRecoveryEntry(customType: string, data: unknown): void {

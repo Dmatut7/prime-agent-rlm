@@ -65,17 +65,6 @@ export interface ProviderFallbackEntryData {
 	delayMs?: number;
 }
 
-/**
- * The duty log's shared event entry (owned by the duty-log lane; this module
- * only writes the provider-recovery kinds). Plain data, reconciled at merge.
- */
-export const DUTY_EVENT_ENTRY_TYPE = "duty_event";
-
-export type ProviderDutyEvent =
-	| { kind: "provider_retry"; provider?: string; model?: string; error?: string; waitMs?: number }
-	| { kind: "model_fallback"; from?: string; to: string; reason?: "provider_errors" | "bad_tool_calls" }
-	| { kind: "model_restored"; to: string };
-
 export function isProviderFallbackEntryData(value: unknown): value is ProviderFallbackEntryData {
 	if (!value || typeof value !== "object") return false;
 	const data = value as Record<string, unknown>;

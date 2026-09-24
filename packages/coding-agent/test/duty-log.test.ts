@@ -150,6 +150,25 @@ describe("summarizeDutyLog", () => {
 		);
 	});
 
+	it("says the run moved back when the primary model answered again", () => {
+		const entries = [
+			user(0),
+			assistant(60_000, { stopReason: "error", errorMessage: "500 internal_server_error" }),
+			dutyEvent(2 * 60_000, {
+				kind: "model_fallback",
+				from: "bailian/glm-5.3-prime",
+				to: "bailian/kimi-k3",
+				reason: "provider_errors",
+			}),
+			assistant(3 * 60_000, { stopReason: "error", errorMessage: "500 internal_server_error", model: "kimi-k3" }),
+			dutyEvent(30 * 60_000, { kind: "model_restored", to: "bailian/glm-5.3-prime" }),
+			assistant(31 * 60_000, { text: "恢复后做完了。" }),
+		];
+		const line = formatDutyLog(summarizeDutyLog({ entries, now: T0 + HOUR })!, T0 + HOUR)[2];
+		expect(line).toContain("中途换过 kimi-k3，已换回 glm-5.3-prime");
+		expect(line).toContain("都已自动处理");
+	});
+
 	it("reports an outage still going on as not handled", () => {
 		const entries = [user(0), assistant(60_000, { stopReason: "error", errorMessage: "429 rate limit" })];
 		const summary = summarizeDutyLog({ entries, now: T0 + HOUR });

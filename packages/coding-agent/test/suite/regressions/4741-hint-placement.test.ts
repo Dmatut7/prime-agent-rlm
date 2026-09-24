@@ -63,6 +63,7 @@ describe("ENG-4741 hint placement", () => {
 	});
 
 	it("orders hints below the recap and above queued messages and side questions", () => {
+		const dutyLogContainer = new Container();
 		const recapContainer = new Container();
 		const featureHintContainer = new Container();
 		const queuedMessagesContainer = new Container();
@@ -72,6 +73,7 @@ describe("ENG-4741 hint placement", () => {
 		const subagentSummaryLine = new Container();
 		const footerSlot = new Container();
 		const mode = Object.assign(Object.create(InteractiveMode.prototype), {
+			dutyLogContainer,
 			recapContainer,
 			featureHintContainer,
 			queuedMessagesContainer,
@@ -83,6 +85,7 @@ describe("ENG-4741 hint placement", () => {
 		});
 
 		expect(callPrivate(mode, "getPromptContextContainers")).toEqual([
+			dutyLogContainer,
 			recapContainer,
 			featureHintContainer,
 			queuedMessagesContainer,
@@ -104,6 +107,7 @@ describe("ENG-4741 hint placement", () => {
 			const headerContainer = new Container();
 			const mainViewContainer = new Container();
 			const widgetContainerAbove = new Container();
+			const dutyLogContainer = new Container();
 			const recapContainer = new Container();
 			const featureHintContainer = new Container();
 			const queuedMessagesContainer = new Container();
@@ -115,6 +119,7 @@ describe("ENG-4741 hint placement", () => {
 				headerContainer,
 				mainViewContainer,
 				widgetContainerAbove,
+				dutyLogContainer,
 				recapContainer,
 				featureHintContainer,
 				queuedMessagesContainer,
@@ -132,6 +137,7 @@ describe("ENG-4741 hint placement", () => {
 					headerContainer,
 					mainViewContainer,
 					widgetContainerAbove,
+					dutyLogContainer,
 					recapContainer,
 					featureHintContainer,
 					queuedMessagesContainer,

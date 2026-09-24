@@ -1,5 +1,6 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { DutyEvent } from "./duty-log.js";
 import { AUTO_CONTINUE_CUSTOM_TYPE } from "./messages.js";
 import type { SessionEntry } from "./session-manager.js";
 
@@ -12,18 +13,6 @@ import type { SessionEntry } from "./session-manager.js";
 
 /** Session custom-entry type for one self-recovery action. Not a message: the model never sees it. */
 export const SELF_RECOVERY_CUSTOM_ENTRY = "prime-agent.self-recovery";
-
-/**
- * The duty log's shared event entry (the unattended "while you were away" summary).
- * Emitted in addition to {@link SELF_RECOVERY_CUSTOM_ENTRY}; its shape is owned by the
- * duty log and mirrored here as plain data.
- */
-export const DUTY_EVENT_CUSTOM_ENTRY = "duty_event";
-
-export type DutyEvent =
-	| { kind: "step_stuck_stopped"; tool?: string; silentMs?: number }
-	| { kind: "auto_continue"; reason?: string }
-	| { kind: "child_auto_delivered"; child?: string };
 
 /** The duty-log event a self-recovery action maps to. */
 export function dutyEventFor(record: SelfRecoveryRecord): DutyEvent {

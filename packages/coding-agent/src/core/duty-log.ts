@@ -83,6 +83,8 @@ export interface DutyIncident {
 	downtimeMs?: number;
 	/** Backup model the run moved to, when it did. */
 	fallbackTo?: string;
+	/** Model the run moved back to after a fallback. */
+	restoredTo?: string;
 }
 
 export interface DutyLogPending {
@@ -379,9 +381,14 @@ export function summarizeDutyLog(input: DutyLogInput): DutyLogSummary | undefine
 					const kind = event.reason === "bad_tool_calls" ? "bad_calls" : "provider";
 					const incident = incidents.get(kind) ?? incidents.add(kind, true);
 					incident.fallbackTo = event.to;
+					incident.restoredTo = undefined;
 					break;
 				}
 				case "model_restored":
+					for (const kind of ["provider", "bad_calls"] as const) {
+						const incident = incidents.get(kind);
+						if (incident?.fallbackTo) incident.restoredTo = event.to;
+					}
 					break;
 				case "step_stuck_stopped":
 					// The stop usually also lands as a `tool_timeout:` result: one stall, one count.
@@ -507,7 +514,7 @@ function incidentText(incident: DutyIncident): string {
 			const facts: string[] = [];
 			if (incident.downtimeMs && incident.downtimeMs >= 60_000)
 				facts.push(`停了 ${formatDutyDuration(incident.downtimeMs)}`);
-			if (incident.fallbackTo) facts.push(`自动换到 ${incident.fallbackTo}`);
+			if (incident.fallbackTo) facts.push(fallbackText(incident));
 			if (facts.length === 0) facts.push(outcome("已自动重试成功", "还没恢复"));
 			else if (!all) facts.push("还没恢复");
 			return `服务器报错 ${n} 次（${facts.join("，")}）`;
@@ -519,7 +526,7 @@ function incidentText(incident: DutyIncident): string {
 		case "stuck":
 			return `命令卡住 ${n} 次（已停掉，AI 换了办法）`;
 		case "bad_calls":
-			return `工具调用连续出错 ${n} 次（${incident.fallbackTo ? `自动换到 ${incident.fallbackTo}` : "已处理"}）`;
+			return `工具调用连续出错 ${n} 次（${incident.fallbackTo ? fallbackText(incident) : "已处理"}）`;
 		case "stall":
 			return `会话卡住 ${n} 次（已自动处理）`;
 		case "early_stop":
@@ -535,6 +542,16 @@ function incidentText(incident: DutyIncident): string {
 
 function isOpen(incident: DutyIncident): boolean {
 	return incident.kind === "child_failed" || incident.handled < incident.count;
+}
+
+/** `bailian/kimi-k3` reads as `kimi-k3`: the owner knows models by name. */
+function modelName(reference: string): string {
+	return reference.slice(reference.indexOf("/") + 1);
+}
+
+function fallbackText(incident: DutyIncident): string {
+	const to = modelName(incident.fallbackTo ?? "");
+	return incident.restoredTo ? `中途换过 ${to}，已换回 ${modelName(incident.restoredTo)}` : `自动换到 ${to}`;
 }
 
 const CHILD_STATE_LABELS: Record<DutyLogChildState, string> = {

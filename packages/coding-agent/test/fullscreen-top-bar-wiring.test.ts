@@ -36,6 +36,7 @@ describe("fullscreen top bar wiring", () => {
 		const headerContainer = new Container();
 		const mainViewContainer = new Container();
 		const widgetContainerAbove = new Container();
+		const dutyLogContainer = new Container();
 		const recapContainer = new Container();
 		const featureHintContainer = new Container();
 		const queuedMessagesContainer = new Container();
@@ -49,6 +50,7 @@ describe("fullscreen top bar wiring", () => {
 			headerContainer,
 			mainViewContainer,
 			widgetContainerAbove,
+			dutyLogContainer,
 			recapContainer,
 			featureHintContainer,
 			queuedMessagesContainer,
@@ -67,6 +69,7 @@ describe("fullscreen top bar wiring", () => {
 				headerContainer,
 				mainViewContainer,
 				widgetContainerAbove,
+				dutyLogContainer,
 				recapContainer,
 				featureHintContainer,
 				queuedMessagesContainer,
