@@ -1975,7 +1975,8 @@ export class DaemonSupervisor {
 
 	private scheduleIdleEvictionSweep(): void {
 		if (this.shuttingDown || this.idleEvictionTimer || this.idleEvictionSweep) return;
-		const delayMs = idleEvictionSweepIntervalMs(this.settingsManager.getIdleEvictionMinutes());
+		// The child clock is the shorter one, so it sets the cadence.
+		const delayMs = idleEvictionSweepIntervalMs(this.settingsManager.getChildIdleEvictionMinutes());
 		this.idleEvictionTimer = setTimeout(() => {
 			this.idleEvictionTimer = undefined;
 			const sweep = this.runIdleEvictionSweep()
@@ -2051,6 +2052,7 @@ export class DaemonSupervisor {
 		if (this.shuttingDown || this.updateRestartPhase !== undefined) return;
 		const idleEvictionMinutes = this.settingsManager.getIdleEvictionMinutes();
 		if (idleEvictionMinutes === "off") return;
+		const childIdleEvictionMinutes = this.settingsManager.getChildIdleEvictionMinutes();
 
 		const refreshed = new Set<ResidentWorker>();
 		await Promise.all(
@@ -2076,7 +2078,7 @@ export class DaemonSupervisor {
 						const response = await worker.client?.requestWorker(
 							{
 								type: "worker_passivate_idle_children",
-								idleEvictionMinutes,
+								idleEvictionMinutes: childIdleEvictionMinutes,
 								now,
 								limit: CHILD_PASSIVATION_PER_WORKER_CAP,
 							},

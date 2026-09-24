@@ -167,6 +167,20 @@ it("does not notice on APIs whose usage schema has no image token count", async 
 	}
 });
 
+it("does not notice for providers that never report the count (bailian, stepfun)", async () => {
+	for (const provider of ["bailian", "stepfun"]) {
+		const fixture = createSuspicionSession([{ usage: {} }], { firstResponse: { provider } });
+		try {
+			await fixture.session.prompt("describe", { images: [IMAGE] });
+
+			expect(suspicionNotices(fixture.session)).toHaveLength(0);
+		} finally {
+			fixture.session.dispose();
+			rmSync(fixture.dir, { recursive: true, force: true });
+		}
+	}
+});
+
 it("does not notice on image-free turns or on responses that did not complete cleanly", async () => {
 	// Image-free batch: nothing image-carrying was requested.
 	const noImages = createSuspicionSession([{ usage: {} }]);

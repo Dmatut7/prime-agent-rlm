@@ -548,6 +548,16 @@ export class SubagentSummaryLine implements Component, Focusable {
 		if (this.counts.total === 0) return [];
 		const safeWidth = Math.max(1, width);
 		const lines = [this.renderHeader(safeWidth)];
+		if (
+			!this.focused &&
+			this.rows.length > 0 &&
+			this.rows.every((row) => row.state === "idle" || row.state === "done")
+		) {
+			// Nothing in flight: finished children would otherwise sit there as a
+			// block of rows until they close. One line says so; the header's ↓ still lists them.
+			lines.push(theme.fg("dim", truncateToWidth("   都做完了，闲置一阵后会自动关闭（记录保留）", safeWidth, "…")));
+			return lines;
+		}
 		const { start, rows: shown } = this.visibleWindow();
 		if (start > 0) {
 			lines.push(theme.fg("dim", truncateToWidth(`   ↑ 上面还有 ${start} 个`, safeWidth, "")));

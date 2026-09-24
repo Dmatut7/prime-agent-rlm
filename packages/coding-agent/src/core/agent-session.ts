@@ -2338,6 +2338,13 @@ function joinCompactionInstructions(manual: string | undefined, pending: string 
 	return parts.length > 0 ? parts.join("\n\n") : undefined;
 }
 
+/**
+ * Providers observed to answer image turns correctly while never reporting
+ * `prompt_tokens_details.image_tokens` (bailian: deepseek-v4.1-flash described a
+ * pasted product card exactly, 2026-09-25; stepfun: see the suspicion check).
+ */
+const PROVIDERS_WITHOUT_IMAGE_TOKEN_COUNTS: ReadonlySet<string> = new Set(["bailian", "stepfun"]);
+
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -4040,6 +4047,10 @@ export class AgentSession {
 		if (this.settingsManager.getBlockImages()) return;
 		if (message.api !== "openai-completions") return;
 		if (message.usage.imageTokens !== undefined) return;
+		// Providers whose usage frame never carries the count: the absence says
+		// nothing there, and the notice (read by the model too) made a correct
+		// image answer doubt itself.
+		if (PROVIDERS_WITHOUT_IMAGE_TOKEN_COUNTS.has(message.provider)) return;
 		this._imageDeliverySuspicionNotified = true;
 		try {
 			this._appendCustomMessageToTranscript(

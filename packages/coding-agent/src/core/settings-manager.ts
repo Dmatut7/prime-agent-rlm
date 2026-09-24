@@ -39,6 +39,7 @@ import {
 
 const RECENT_MODELS_LIMIT = 20;
 export const DEFAULT_IDLE_EVICTION_MINUTES = 90;
+export const DEFAULT_CHILD_IDLE_EVICTION_MINUTES = 20;
 
 /**
  * Poll interval for noticing a direct edit of `settings.json` (CD-5). One second
@@ -776,6 +777,7 @@ export interface Settings {
 	defaultServiceTier?: ServiceTier;
 	rlmMaxDepth?: number; // default for new sessions; unset falls through to RLM_MAX_DEPTH, then 2
 	idleEvictionMinutes?: number | "off"; // global daemon policy; default: 90
+	childIdleEvictionMinutes?: number | "off"; // idle subagents close sooner; default: 20, capped by idleEvictionMinutes
 	transport?: TransportSetting; // default: "auto"
 	steeringMode?: "all" | "one-at-a-time";
 	followUpMode?: "all" | "one-at-a-time";
@@ -1050,6 +1052,7 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	defaultServiceTier: null,
 	rlmMaxDepth: null,
 	idleEvictionMinutes: null,
+	childIdleEvictionMinutes: null,
 	transport: null,
 	steeringMode: null,
 	followUpMode: null,
@@ -2368,6 +2371,23 @@ export class SettingsManager {
 		const value: unknown = this.globalSettings.idleEvictionMinutes;
 		if (value === "off" || value === "none") return "off";
 		return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : DEFAULT_IDLE_EVICTION_MINUTES;
+	}
+
+	/**
+	 * How long an idle subagent stays resident before it is closed (its transcript is
+	 * kept and a message wakes it). A finished subagent sitting in the panel for an
+	 * hour and a half was clutter and a held worker slot for nothing, so children use
+	 * their own shorter clock. Never longer than the global policy; `off` there
+	 * turns this off too, and `off` here falls back to the global value.
+	 */
+	getChildIdleEvictionMinutes(): number | "off" {
+		const global = this.getIdleEvictionMinutes();
+		if (global === "off") return "off";
+		const value: unknown = this.globalSettings.childIdleEvictionMinutes;
+		if (value === "off" || value === "none") return global;
+		const child =
+			typeof value === "number" && Number.isFinite(value) && value > 0 ? value : DEFAULT_CHILD_IDLE_EVICTION_MINUTES;
+		return Math.min(child, global);
 	}
 
 	setIdleEvictionMinutes(value: number | "off"): void {

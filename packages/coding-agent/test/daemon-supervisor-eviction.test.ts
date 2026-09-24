@@ -242,7 +242,8 @@ describe("daemon supervisor whole-tree eviction", () => {
 		expect(active.client?.requestWorker).toHaveBeenCalledWith(
 			{
 				type: "worker_passivate_idle_children",
-				idleEvictionMinutes: 90,
+				// Children run on their own shorter clock (childIdleEvictionMinutes, default 20).
+				idleEvictionMinutes: 20,
 				now,
 				limit: 2,
 			},

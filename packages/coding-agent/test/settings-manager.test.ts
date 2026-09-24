@@ -544,6 +544,20 @@ describe("SettingsManager", () => {
 			await manager.flush();
 			expect(JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf8")).idleEvictionMinutes).toBe("off");
 		});
+
+		it("closes idle subagents on a shorter clock, never longer than the global one", () => {
+			const read = (settings: object) => {
+				writeFileSync(join(agentDir, "settings.json"), JSON.stringify(settings));
+				return SettingsManager.create(projectDir, agentDir).getChildIdleEvictionMinutes();
+			};
+			expect(read({})).toBe(20);
+			expect(read({ childIdleEvictionMinutes: 5 })).toBe(5);
+			expect(read({ idleEvictionMinutes: 10 })).toBe(10);
+			expect(read({ childIdleEvictionMinutes: 45, idleEvictionMinutes: 30 })).toBe(30);
+			expect(read({ childIdleEvictionMinutes: "off", idleEvictionMinutes: 60 })).toBe(60);
+			expect(read({ childIdleEvictionMinutes: 5, idleEvictionMinutes: "off" })).toBe("off");
+			expect(read({ childIdleEvictionMinutes: -3 })).toBe(20);
+		});
 	});
 
 	describe("telemetry privacy controls", () => {

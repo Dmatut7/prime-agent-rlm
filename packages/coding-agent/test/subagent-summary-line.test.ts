@@ -1314,6 +1314,36 @@ describe("subagent panel rows (design board 06)", () => {
 		expect(lines.at(-1)).toBe("   ↓ 下面还有 1 个");
 	});
 
+	it("folds an all-idle family to one line until the panel is focused", () => {
+		const line = new SubagentSummaryLine();
+		line.setSubagentCounts({ total: 6, running: 0, idle: 5, inactive: 1 });
+		line.setSubagentRows([
+			...Array.from({ length: 5 }, (_, index) => ({
+				id: `i${index}`,
+				name: `vps-${index}`,
+				state: "idle" as const,
+			})),
+			{ id: "d", name: "vps-done", state: "done" as const },
+		]);
+		line.setOpenable(true);
+		let lines = line.render(100).map(stripAnsi);
+		expect(lines).toHaveLength(2);
+		expect(lines[0]).toContain("↓ 选择");
+		expect(lines[1]).toBe("   都做完了，闲置一阵后会自动关闭（记录保留）");
+		// Focused, every child is listed again and reachable.
+		line.focused = true;
+		lines = line.render(100).map(stripAnsi);
+		expect(lines[1]?.startsWith(" › ○ vps-0")).toBe(true);
+		expect(lines.at(-1)).toBe("   ↓ 下面还有 2 个");
+		// One child still working keeps the rows up.
+		line.focused = false;
+		line.setSubagentRows([
+			{ id: "r", name: "vps-run", state: "running" as const },
+			{ id: "i0", name: "vps-0", state: "idle" as const },
+		]);
+		expect(line.render(100).map(stripAnsi)[1]).toContain("vps-run");
+	});
+
 	it("keeps the selection on the same child when the rows reorder", () => {
 		const line = new SubagentSummaryLine();
 		line.setSubagentCounts({ total: 3, running: 3, idle: 0, inactive: 0 });
