@@ -2611,8 +2611,6 @@ describe("AgentSession rlm recursion", () => {
 		};
 		const root = createSession({
 			customTools: [tool],
-			// Counts turns per task; the child-reply reminder would add one.
-			settingsManager: SettingsManager.inMemory({ selfRecovery: { childReplyNudge: false } }),
 			streamFn: (_model, context) => {
 				const toolResultCount = context.messages.filter((message) => message.role === "toolResult").length;
 				const stream = createAssistantMessageEventStream();

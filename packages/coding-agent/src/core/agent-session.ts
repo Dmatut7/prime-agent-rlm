@@ -1320,6 +1320,8 @@ function visibleSessionActionProjection(actions: readonly QueuedSessionAction[])
  * bounded poll rather than a hot loop.
  */
 const WAIT_FOR_IDLE_POLL_MS = 50;
+/** Deleted or released child runs kept for re-validating their late terminal notices. */
+const RETIRED_RLM_CHILD_RUNS_MAX = 64;
 
 /**
  * Consecutive progress-free cycles after which waitForIdle stops waiting and reports the
@@ -2684,6 +2686,13 @@ export class AgentSession {
 	private _terminalFailureAttemptCount = 0;
 	private _subagentRuntimeHost?: SubagentRuntimeHost;
 	private _activeRlmChildRuns = new Map<string, RlmChildRun>();
+	/**
+	 * Runs whose child was deleted or released, newest last. A terminal notice about
+	 * such a child is still published after it is gone (the queue drains later), and
+	 * re-validating it needs the run's delivery record: without it a reply that did
+	 * land reads as missing and the parent is woken by a false "no reply" notice.
+	 */
+	private readonly _retiredRlmChildRuns = new Map<string, RlmChildRun>();
 	/** Wall-clock ms of the last accepted progress note; throttles rlm.progress.note. */
 	private _lastRlmProgressNoteAt: number | undefined;
 	private _unsettledRlmChildRuns = new Set<RlmChildRun>();
@@ -5884,7 +5893,7 @@ export class AgentSession {
 	 * suppressed by an older message.
 	 */
 	private _markTerminalVerdictsSupersededByDelivery(messageId: string): void {
-		for (const run of this._knownRlmChildRuns()) {
+		for (const run of new Set([...this._knownRlmChildRuns(), ...this._retiredRlmChildRuns.values()])) {
 			if (run.noReplyVerdictSupersededBy === undefined && run.provisionalNoReplyReplyIds?.includes(messageId)) {
 				run.noReplyVerdictSupersededBy = messageId;
 				// Countable: this is the moment a no-reply verdict becomes known-stale,
@@ -8405,7 +8414,7 @@ export class AgentSession {
 		const details = message.details as { kind?: string; childId?: string } | undefined;
 		const childId = details?.childId;
 		if (typeof childId !== "string" || childId.length === 0) return undefined;
-		const run = this._activeRlmChildRuns.get(childId) ?? this._rlmChildSessions.get(childId)?.run;
+		const run = this._rlmChildRunForNotice(childId);
 		if (message.customType === RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE) {
 			if (details?.kind !== "completed_without_reply") return undefined;
 			const supersededBy = run?.noReplyVerdictSupersededBy;
@@ -8451,7 +8460,7 @@ export class AgentSession {
 			reason,
 		});
 		if (details?.kind !== "completed_without_reply" || typeof details.childId !== "string") return;
-		const run = this._activeRlmChildRuns.get(details.childId) ?? this._rlmChildSessions.get(details.childId)?.run;
+		const run = this._rlmChildRunForNotice(details.childId);
 		if (run) run.noReplyNoticeSuperseded = true;
 	}
 
@@ -16927,7 +16936,32 @@ export class AgentSession {
 			.catch(() => undefined);
 	}
 
+	/** Keep a removed child's run for notice re-validation; bounded, oldest dropped first. */
+	private _retireRlmChildRun(childId: string, run: RlmChildRun | undefined): void {
+		if (!run) return;
+		this._retiredRlmChildRuns.delete(childId);
+		this._retiredRlmChildRuns.set(childId, run);
+		while (this._retiredRlmChildRuns.size > RETIRED_RLM_CHILD_RUNS_MAX) {
+			const oldest = this._retiredRlmChildRuns.keys().next().value;
+			if (oldest === undefined) break;
+			this._retiredRlmChildRuns.delete(oldest);
+		}
+	}
+
+	/** A child's run, including one whose child was already deleted or released. */
+	private _rlmChildRunForNotice(childId: string): RlmChildRun | undefined {
+		return (
+			this._activeRlmChildRuns.get(childId) ??
+			this._rlmChildSessions.get(childId)?.run ??
+			this._retiredRlmChildRuns.get(childId)
+		);
+	}
+
 	private _removeRlmSubagentTracking(childId: string, run?: RlmChildRun): void {
+		this._retireRlmChildRun(
+			childId,
+			run ?? this._activeRlmChildRuns.get(childId) ?? this._rlmChildSessions.get(childId)?.run,
+		);
 		run?.unsubscribe?.();
 		this._rlmChildUnsubscribes.get(childId)?.();
 		this._rlmChildUnsubscribes.delete(childId);
@@ -17051,6 +17085,7 @@ export class AgentSession {
 			const unsubscribe = run.unsubscribe ?? noopRlmChildEventUnsubscribe;
 			return () => {
 				run.unsubscribe = undefined;
+				this._retireRlmChildRun(childId, run);
 				this._activeRlmChildRuns.delete(childId);
 				unsubscribe();
 			};
@@ -17058,6 +17093,7 @@ export class AgentSession {
 		if (this._rlmChildSessions.get(childId)?.session !== session) return false;
 		const unsubscribe = this._rlmChildUnsubscribes.get(childId) ?? noopRlmChildEventUnsubscribe;
 		return () => {
+			this._retireRlmChildRun(childId, this._rlmChildSessions.get(childId)?.run);
 			this._rlmChildUnsubscribes.delete(childId);
 			this._rlmChildSessions.delete(childId);
 			unsubscribe();

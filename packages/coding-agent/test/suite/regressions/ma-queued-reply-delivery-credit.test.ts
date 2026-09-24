@@ -281,6 +281,37 @@ describe("queued child reply delivered later", () => {
 		expect(terminalNotices(family.parent.session.messages)).toEqual([]);
 	});
 
+	it("drops the no-reply notice when the child run is gone before the queued reply lands", async () => {
+		// The live shape: the parent waits in a busy tool while the child replies (so the
+		// reply queues and the verdict is completed_without_reply), then deletes the child
+		// in the same turn. The notice publishes after the child's run is gone, and used
+		// to publish unverified and wake the parent for a reply it had already read.
+		const family = await makeFamily({ waitForDelivery: false });
+		const handle = await family.parent.session.runRlmChild("audit and reply", { name: "deleted-reply-worker" });
+
+		await vi.waitFor(() => expect(family.deliveryStatuses).toEqual(["queued"]), { timeout: 15_000, interval: 20 });
+		const collected = await family.parent.session.collectRlmChildren([handle.rlm_child_id], 20_000);
+		expect(collected.results[0]?.terminal_kind).toBe("completed_without_reply");
+		// The daemon host drops a finished child's run when the child is deleted or
+		// released; this is the release leg, the same removal the delete leg does.
+		const release = family.parent.session.releaseRlmChildSession(handle.rlm_child_id, family.child.session);
+		expect(release).toBeTypeOf("function");
+		if (release) release();
+
+		family.releaseParent();
+		await family.parentTurn;
+		await vi.waitFor(() => expect(deliveredReplyIds(family.parent.session.messages)).toContain(family.replyIds[0]!), {
+			timeout: 15_000,
+			interval: 20,
+		});
+		await vi.waitFor(() => {
+			expect(family.parent.session.isStreaming).toBe(false);
+			expect(family.parent.session.unfinishedActionCount).toBe(0);
+		});
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(terminalNotices(family.parent.session.messages)).toEqual([]);
+	});
+
 	it("credits a reply queued into a suspended parent once the queue resumes", async () => {
 		// The Esc shape (P0-3a): a suspended pump queues the reply through
 		// queueAgentMessagePrompt with reason target_suspended, so this is the second

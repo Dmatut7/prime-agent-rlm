@@ -219,24 +219,6 @@ describe("unattended exam", () => {
 		expect(text).toContain("已换回 faux-1");
 	}, 20_000);
 
-	it("a subagent that finishes without reporting back is asked once, then the run ends", async () => {
-		const harness = await examHarness({}, 1);
-		harness.setResponses([
-			fauxAssistantMessage(fauxToolCall("run_command", { command: "ls" }), { stopReason: "toolUse" }),
-			fauxAssistantMessage("数好了，共 3 个文件。"),
-			fauxAssistantMessage("结果已发回。"),
-		]);
-
-		await harness.session.promptAndWait("[task from parent] 数一下文件");
-
-		const nudges = harness.session.messages.filter(
-			(message) => message.role === "custom" && message.customType === AUTO_CONTINUE_CUSTOM_TYPE,
-		);
-		expect(nudges).toHaveLength(1);
-		expect(String((nudges[0] as { content: unknown }).content)).toContain("agent_message.send");
-		expect(harness.faux.state.callCount).toBe(3);
-	}, 20_000);
-
 	it("an empty reply is not the end of the task", async () => {
 		const harness = await examHarness();
 		harness.setResponses([

@@ -360,7 +360,11 @@ describe("self-recovery: subagent finished without replying", () => {
 	}
 
 	it("asks a child once to send its result, and never again in the same run", async () => {
-		const harness = await createHarness({ tools: [quickTool()], rlmDepth: 1 });
+		const harness = await createHarness({
+			tools: [quickTool()],
+			rlmDepth: 1,
+			settings: { selfRecovery: { childReplyNudge: true } },
+		});
 		harnesses.push(harness);
 		harness.setResponses([
 			fauxAssistantMessage(fauxToolCall("read_file", { path: "a.ts" }), { stopReason: "toolUse" }),
@@ -378,12 +382,8 @@ describe("self-recovery: subagent finished without replying", () => {
 		]);
 	});
 
-	it("is off when selfRecovery.childReplyNudge is false", async () => {
-		const harness = await createHarness({
-			tools: [quickTool()],
-			rlmDepth: 1,
-			settings: { selfRecovery: { childReplyNudge: false } },
-		});
+	it("is off by default: the parent already gets the child's answer with its completion notice", async () => {
+		const harness = await createHarness({ tools: [quickTool()], rlmDepth: 1 });
 		harnesses.push(harness);
 		harness.setResponses([
 			fauxAssistantMessage(fauxToolCall("read_file", { path: "a.ts" }), { stopReason: "toolUse" }),

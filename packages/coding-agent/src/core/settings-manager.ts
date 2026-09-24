@@ -673,7 +673,12 @@ export interface SelfRecoverySettings {
 	 * only announces the next step, send one automatic "continue" (at most two per prompt).
 	 */
 	autoContinue?: boolean;
-	/** Default true. A subagent that finishes its task without replying is asked once to send its result. */
+	/**
+	 * Default false. A subagent that finishes its task without replying is asked once to send
+	 * its result. Off by default: the reply lands after the parent has already been told the
+	 * child completed (with its answer preview), so it arrives as a duplicate and costs the
+	 * parent an extra turn.
+	 */
 	childReplyNudge?: boolean;
 }
 
@@ -2698,7 +2703,7 @@ export class SettingsManager {
 		const settings = this.settings.selfRecovery;
 		return {
 			autoContinue: settings?.autoContinue !== false,
-			childReplyNudge: settings?.childReplyNudge !== false,
+			childReplyNudge: settings?.childReplyNudge === true,
 		};
 	}
 
