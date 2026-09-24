@@ -96,6 +96,46 @@ describe("Agent", () => {
 		expect(reasoning).toBe("off");
 	});
 
+	it("moves a running loop to pendingTurnModel at the next request, once", async () => {
+		const first = getModel("openai", "gpt-4o-mini");
+		const second = getModel("openai", "gpt-4o");
+		const served: string[] = [];
+		let calls = 0;
+		const agent = new Agent({
+			initialState: {
+				model: first,
+				tools: [
+					{
+						name: "noop",
+						label: "noop",
+						description: "noop",
+						parameters: Type.Object({}),
+						execute: async () => {
+							agent.pendingTurnModel = { model: second, thinkingLevel: "off", serviceTier: "default" };
+							return { content: [{ type: "text", text: "ok" }], details: {} };
+						},
+					},
+				],
+			},
+			streamFn: (model) => {
+				served.push(model.id);
+				calls += 1;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					const message = calls === 1 ? createToolUseMessage("noop") : createAssistantMessage("done");
+					stream.push({ type: "done", reason: message.stopReason === "toolUse" ? "toolUse" : "stop", message });
+				});
+				return stream;
+			},
+		});
+
+		await agent.prompt("hello");
+		expect(served).toEqual([first.id, second.id]);
+		expect(agent.pendingTurnModel).toBeUndefined();
+		// The session model is the owner's to change; the one-shot does not touch it.
+		expect(agent.state.model).toBe(first);
+	});
+
 	it("should create an agent instance with custom initial state", () => {
 		const customModel = getModel("openai", "gpt-4o-mini");
 		const agent = new Agent({

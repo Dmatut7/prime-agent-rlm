@@ -706,7 +706,20 @@ export type AgentConnectionSessionEvent =
 			errorSeverity?: "warning" | "error";
 			customInstructions?: string;
 	  }
-	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
+	| {
+			type: "auto_retry_start";
+			attempt: number;
+			maxAttempts: number;
+			delayMs: number;
+			errorMessage: string;
+			/**
+			 * Forwarded verbatim from the session event; optional because an older
+			 * daemon or session may not set it (the UI then shows the plain retry line).
+			 */
+			reason?: "usage" | "unavailable" | "backup";
+			/** "provider/model-id" the turn moved to when reason is "backup". */
+			backupModel?: string;
+	  }
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
 	| { type: "auth_stale"; provider: string; sourceTokens?: readonly AuthSourceToken[] }
 	| { type: "rlm_child_update"; child: AgentConnectionRlmChildAgentSnapshot }

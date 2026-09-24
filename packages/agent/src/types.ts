@@ -119,6 +119,21 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model<any>;
 
 	/**
+	 * Polled before each LLM request of the run. A returned model replaces
+	 * `model` (with its reasoning level and service tier) for this and every
+	 * later request of the run; `undefined` keeps the current one. Lets the
+	 * owner move a running task to another model at a turn boundary without
+	 * ending the run.
+	 */
+	takeNextTurnModel?: () =>
+		| {
+				model: Model<any>;
+				reasoning?: SimpleStreamOptions["reasoning"];
+				serviceTier?: SimpleStreamOptions["serviceTier"];
+		  }
+		| undefined;
+
+	/**
 	 * Converts AgentMessage[] to LLM-compatible Message[] before each LLM call.
 	 *
 	 * Each AgentMessage must be converted to a UserMessage, AssistantMessage, or ToolResultMessage

@@ -22,6 +22,12 @@ import { sleepSync } from "../utils/sleep.js";
 import { clampCompactionTriggerRatio } from "./compaction/compaction.js";
 import { DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS } from "./extensions/timeout.js";
 import { RETIRED_VENV_RETENTION } from "./kernel/venv-in-use.js";
+import {
+	DEFAULT_PROVIDER_FALLBACK_MODELS,
+	PROVIDER_LONG_WAIT_BASE_MS,
+	PROVIDER_LONG_WAIT_MAX_MS,
+	PROVIDER_LONG_WAIT_MAX_ROUNDS,
+} from "./provider-fallback.js";
 import { MAX_PROVIDER_PAUSE_MS, type ProviderWaitPolicy } from "./provider-retry.js";
 import type { ResolvedRetentionSettings } from "./retention/types.js";
 import {
@@ -223,6 +229,13 @@ export interface ProviderRetrySettings {
 	streamStallTimeoutMs?: number; // default: 300000 (5 min with zero stream events => abort + retryable error); 0 disables
 	/** Bounded wait-for-recovery loop for quota exhaustion and provider unavailability. */
 	waitForUsage?: ProviderWaitSettings;
+	/**
+	 * Long waits once every fallback-chain model failed and the bounded wait ran
+	 * out: the delay doubles per round from `baseDelayMs` (default 5 min) up to
+	 * `maxDelayMs` (default 20 min), for at most `maxRounds` rounds (default 72,
+	 * about a day) before the turn ends.
+	 */
+	fallbackLongWait?: { baseDelayMs?: number; maxDelayMs?: number; maxRounds?: number };
 }
 
 export interface EmptyTurnRetrySettings {
@@ -751,6 +764,16 @@ export interface Settings {
 	 */
 	providerBackupModel?: string;
 	/**
+	 * Models ("provider/model-id") the session moves to, in order, when the
+	 * serving model keeps failing: quick retries exhausted on an unavailable
+	 * provider, quota exhaustion, or a storm of invalid tool calls. The session
+	 * stays on the fallback, probes the primary again after 30 minutes, and when
+	 * every model fails waits in long rounds instead of ending the task.
+	 * Unset: the built-in chain (bailian glm-5.3-prime → kimi-k3 →
+	 * qwen3.8-max-0902), filtered to models with configured auth. `[]`: off.
+	 */
+	providerFallbackModels?: string[];
+	/**
 	 * Model ("provider/model-id" or a bare model id) that serves turns
 	 * attaching images when the session model does not accept image input.
 	 * Default: none - image turns on a text-only model fail with a
@@ -1035,6 +1058,7 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 	retry: ["enabled", "maxRetries", "baseDelayMs", "emptyTurn", "provider"],
 	hideThinkingBlock: null,
 	providerBackupModel: null,
+	providerFallbackModels: null,
 	autonomous: null,
 	shellPath: null,
 	quietStartup: null,
@@ -1068,7 +1092,14 @@ const KNOWN_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
 
 /** Deeper-than-one-level blocks, keyed by their full dotted path. */
 const KNOWN_NESTED_SETTINGS_KEYS: Record<string, readonly string[] | null> = {
-	"retry.provider": ["timeoutMs", "maxRetries", "maxRetryDelayMs", "streamStallTimeoutMs", "waitForUsage"],
+	"retry.provider": [
+		"timeoutMs",
+		"maxRetries",
+		"maxRetryDelayMs",
+		"streamStallTimeoutMs",
+		"waitForUsage",
+		"fallbackLongWait",
+	],
 	// The cell's cadence block: `ui.subagentSpendCell` is either a boolean or this object.
 	"ui.subagentSpendCell": ["intervalMs", "priceOverrides"],
 	// The correction map is free-form in its own keys (`"<provider>/<model-id>"`), so only
@@ -2749,6 +2780,30 @@ export class SettingsManager {
 		const reference = this.settings.providerBackupModel;
 		if (typeof reference !== "string") return undefined;
 		return reference.trim() ? reference.trim() : undefined;
+	}
+
+	getProviderFallbackLongWait(): { baseDelayMs: number; maxDelayMs: number; maxRounds: number } {
+		const wait = this.settings.retry?.provider?.fallbackLongWait;
+		const bound = (value: number | undefined, fallback: number): number =>
+			typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : fallback;
+		const baseDelayMs = bound(wait?.baseDelayMs, PROVIDER_LONG_WAIT_BASE_MS);
+		return {
+			baseDelayMs,
+			maxDelayMs: Math.max(baseDelayMs, bound(wait?.maxDelayMs, PROVIDER_LONG_WAIT_MAX_MS)),
+			maxRounds: bound(wait?.maxRounds, PROVIDER_LONG_WAIT_MAX_ROUNDS),
+		};
+	}
+
+	/** The fallback chain references, in order; `[]` when switched off. */
+	getProviderFallbackModels(): string[] {
+		const references = this.settings.providerFallbackModels;
+		if (references === undefined || references === null) return [...DEFAULT_PROVIDER_FALLBACK_MODELS];
+		// A malformed value behaves as off rather than as the default chain: the
+		// owner wrote something, and an unexpected switch is the worse surprise.
+		if (!Array.isArray(references)) return [];
+		return references
+			.filter((reference): reference is string => typeof reference === "string" && reference.trim().length > 0)
+			.map((reference) => reference.trim());
 	}
 
 	getHideThinkingBlock(): boolean {
