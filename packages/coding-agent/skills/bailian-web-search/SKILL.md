@@ -13,8 +13,9 @@ returns the answer text as a `str`:
     answer = bailian_web_search.search("your query")
 
 The returned value is also awaitable, so `answer = await bailian_web_search.search("your query")`
-works the same way. A search takes 15-90s (broad queries such as today's news, 2-4 minutes; the
-default `timeout` is 240s) and blocks the kernel while it runs;
+works the same way. A search usually takes 10-30s (the search model's reasoning is off by default;
+turning it on with `thinking=True` made the same news query take 91s instead of
+21s) and blocks the kernel while it runs;
 to keep the turn responsive, run it in a worker thread:
 
     answer = await asyncio.to_thread(bailian_web_search.search, "your query")

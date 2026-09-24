@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.11.8] - 2026-09-24
+
+- Changed the bailian web search to turn the search model's reasoning off by default (`thinking=True` opts back in): the same news query took 18-21s instead of 91s.
+
 ## [0.11.7] - 2026-09-24
 
 - Changed the bailian web search default timeout from 90s to 240s; broad queries such as today's news regularly took longer and timed out.

@@ -78,6 +78,7 @@ def search(
     strategy: str = "max",
     max_tokens: int = 1500,
     timeout: int = 240,
+    thinking: bool = False,
 ) -> str:
     """Search the web and return the synthesized answer text.
 
@@ -88,8 +89,12 @@ def search(
             pro_ultra/max/image (default "max"; pro family and max return
             structured, citation-numbered answers at the same latency).
         max_tokens: answer length cap.
-        timeout: per-call timeout in seconds. Short lookups take 15-90s; broad
-            ones (news, long answers) can take 2-4 minutes, so the default is 240.
+        timeout: per-call timeout in seconds; a search usually answers in
+            10-30s, the default leaves room for slow broad queries.
+        thinking: let the search model reason before answering (default off).
+            Measured 2026-09-24 on a news query: with thinking on, qwen3.8-flash
+            spent ~4.7k reasoning tokens and 91s for the same answer it gives in
+            21s without, so it only costs time and money here.
 
     Returns the answer text. Raises RuntimeError when no API key is found and
     urllib.error.HTTPError on API errors (400 with the valid tier list means a
@@ -119,6 +124,7 @@ def search(
         },
         "stream": False,
         "max_tokens": max_tokens,
+        "enable_thinking": thinking,
     }
     req = urllib.request.Request(
         PUBLIC_BASE + "/chat/completions",

@@ -37,4 +37,33 @@ describe("bailian-web-search SKILL.md", () => {
 		).trim();
 		expect(probe).toBe('str True True "answer text"');
 	});
+	it("keeps the search model's reasoning off by default", () => {
+		// Measured 2026-09-24: with reasoning on, a news query spent ~4.7k reasoning
+		// tokens and 91s for the answer it gives in 21s without.
+		const probe = execFileSync(
+			"python3",
+			[
+				"-c",
+				[
+					"import io, json, sys, urllib.request",
+					"sys.path.insert(0, sys.argv[1])",
+					"from bailian_web_search import bailian_search as bs",
+					"bs._resolve_api_key = lambda: 'test-key'",
+					"sent = {}",
+					"class R(io.BytesIO):",
+					"    def __enter__(self): return self",
+					"    def __exit__(self, *a): return False",
+					"def fake(req, timeout=None):",
+					"    sent.update(json.loads(req.data)); sent['timeout'] = timeout",
+					"    return R(json.dumps({'choices': [{'message': {'content': 'ok'}}]}).encode())",
+					"urllib.request.urlopen = fake",
+					"bs.search('q')",
+					"print(sent['enable_thinking'], sent['timeout'])",
+				].join("\n"),
+				join(skillDir, "src"),
+			],
+			{ encoding: "utf8" },
+		).trim();
+		expect(probe).toBe("False 240");
+	});
 });
