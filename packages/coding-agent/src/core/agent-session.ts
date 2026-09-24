@@ -223,7 +223,7 @@ import {
 	validateGoalBudget,
 	validateGoalObjective,
 } from "./goals.js";
-import { resolveImageModelOverride } from "./image-model-routing.js";
+import { type ImageModelRoutingInputs, resolveImageModelOverride } from "./image-model-routing.js";
 import {
 	classifyIncomingInput,
 	type InputClass,
@@ -1769,6 +1769,7 @@ export const CANCELLABLE_KERNEL_HOST_REQUEST_TYPES: readonly string[] = [
 	"rlm.collect", // bounded read-only wait for this session's own children; cancelling it cancels no child
 	"agent_observe.*", // list/get/recent: reads transcripts and status
 	"model.info", // reads the model serving the current run (routed image turns included)
+	"image_route.info", // reads whether an image-carrying request can be routed to a vision model
 	"agent_message.list_agents", // reads the family roster
 ];
 const SESSION_PERSIST_FAILURE_REPORT_BASE_MS = 30_000;
@@ -3947,10 +3948,21 @@ export class AgentSession {
 		turns: SessionAction<PreparedTurnPayload>[],
 		extraMessages: AgentMessage[] = [],
 	): AgentModelOverride | undefined {
+		const inputs = this._imageRouteResolverInputs();
+		if (!inputs) return undefined;
+		if (!batchCarriesImages(turns, extraMessages)) return undefined;
+		return resolveImageModelOverride(inputs);
+	}
+
+	/**
+	 * The inputs every image-route decision reads: dispatch-time routing, the
+	 * mid-run bootstrap, and the image_route.info kernel host request must not be
+	 * able to disagree about which model serves image-carrying requests.
+	 */
+	private _imageRouteResolverInputs(): ImageModelRoutingInputs | undefined {
 		const sessionModel = this.model;
 		if (!sessionModel) return undefined;
-		if (!batchCarriesImages(turns, extraMessages)) return undefined;
-		return resolveImageModelOverride({
+		return {
 			sessionModel,
 			thinkingLevel: this.thinkingLevel,
 			serviceTier: this.serviceTier,
@@ -3958,7 +3970,7 @@ export class AgentSession {
 			availableModels: this._modelRegistry.getAvailable(),
 			hasConfiguredAuth: (model) => this._modelRegistry.hasConfiguredAuth(model),
 			blockImages: this.settingsManager.getBlockImages(),
-		});
+		};
 	}
 
 	/**
@@ -3996,14 +4008,46 @@ export class AgentSession {
 	/**
 	 * A tool result delivered new images after the run was handed back: the next request
 	 * carries images the session model cannot read, so it goes to the image model again.
+	 * A run dispatched without images can meet its first image the same way (attach_image
+	 * over the kernel): no route exists to re-enter, so one is bootstrapped the same
+	 * instant, and the continuation request goes to the image model instead of being
+	 * answered blind by a provider that drops the images.
 	 */
 	private _rerouteToImageModelForNewImages(): void {
 		const route = this._imageRoute;
-		if (!route?.handedBack || this._fallback) return;
+		if (this._fallback) return;
 		if (this.model?.input.includes("image")) return;
+		if (!route) {
+			this._bootstrapImageRouteForNewImages();
+			return;
+		}
+		if (!route.handedBack) return;
 		route.handedBack = false;
 		this.agent.modelOverride = route.override;
 		this.agent.pendingTurnModel = route.override;
+	}
+
+	/**
+	 * The dispatch path raises the resolver's errors to the owner (committed images
+	 * are user input); a tool result's images are the tool's choice, so an
+	 * unresolvable route leaves the run on the session model and the image-delivery
+	 * suspicion notice stays the only user-facing signal.
+	 */
+	private _bootstrapImageRouteForNewImages(): void {
+		const inputs = this._imageRouteResolverInputs();
+		if (!inputs) return;
+		try {
+			const override = resolveImageModelOverride(inputs);
+			if (!override) return;
+			this._imageRoute = { override, handedBack: false };
+			this.agent.modelOverride = override;
+			this.agent.pendingTurnModel = override;
+		} catch (error) {
+			sessionLog.warn("mid-run image route unavailable; images ride the session model", {
+				sessionId: this.sessionId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 	}
 
 	/**
@@ -15799,6 +15843,55 @@ export class AgentSession {
 					provider: servingModel?.provider ?? null,
 					input: servingModel?.input ?? [],
 				};
+			},
+			"image_route.info": async () => {
+				// attach_image's preflight asks this when the serving model has no
+				// image input: can the next image-carrying request be served by a
+				// vision model? Purely informational - the route itself is decided
+				// at dispatch, or by the mid-run hook when the carrying tool result
+				// lands, so this handler never installs an override.
+				const servingModel = this._runModel();
+				if (servingModel?.input.includes("image")) {
+					return {
+						available: true,
+						imageModel: {
+							id: servingModel.id,
+							provider: servingModel.provider,
+							input: servingModel.input,
+						},
+					};
+				}
+				if (this._fallback) {
+					return {
+						available: false,
+						imageModel: null,
+						message:
+							"A provider fallback episode owns the serving model; retry attaching the image once it ends.",
+					};
+				}
+				const inputs = this._imageRouteResolverInputs();
+				if (!inputs) return { available: false, imageModel: null };
+				try {
+					const override = resolveImageModelOverride(inputs);
+					if (!override) {
+						return {
+							available: false,
+							imageModel: null,
+							message: "Images are blocked for this session (blockImages); no image reaches any provider.",
+						};
+					}
+					const model = override.model;
+					return {
+						available: true,
+						imageModel: { id: model.id, provider: model.provider, input: model.input },
+					};
+				} catch (error) {
+					return {
+						available: false,
+						imageModel: null,
+						message: error instanceof Error ? error.message : String(error),
+					};
+				}
 			},
 		};
 		if (this._includeGoals) {

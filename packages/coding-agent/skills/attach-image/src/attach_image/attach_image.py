@@ -227,7 +227,8 @@ async def run(*paths: str) -> str:
         FileNotFoundError: If a path does not exist or is not a regular file.
         ValueError: If a file is not a supported image, is too large, or cannot
             be compressed enough for safe inline rendering and replay.
-        RuntimeError: If the current model cannot accept images.
+        RuntimeError: If neither the serving model nor a harness image route
+            (settings.imageModel) can accept images.
     """
     if not paths:
         raise ValueError("attach_image requires at least one image path")
@@ -236,11 +237,23 @@ async def run(*paths: str) -> str:
 
     info = await host_request("model.info")
     if "image" not in info.get("input", []):
-        model_id = info.get("id") or "the current model"
-        raise RuntimeError(
-            f"{model_id} does not support vision. "
-            "Tell the user to switch to a vision-capable model to load images into context."
-        )
+        # The serving model has no image input, but the harness may still route
+        # the next image-carrying request to a vision model (settings.imageModel).
+        # Hosts that predate image_route.info cannot route, so the switch-model
+        # refusal stays the fallback.
+        try:
+            route = await host_request("image_route.info")
+        except Exception:
+            route = None
+        if not isinstance(route, dict) or not route.get("available"):
+            detail = route.get("message") if isinstance(route, dict) else None
+            if isinstance(detail, str) and detail:
+                raise RuntimeError(detail)
+            model_id = info.get("id") or "the current model"
+            raise RuntimeError(
+                f"{model_id} does not support vision. "
+                "Tell the user to switch to a vision-capable model to load images into context."
+            )
 
     # Validate every path before emitting anything, so a later failure never
     # leaves a partial subset injected.

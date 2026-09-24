@@ -131,4 +131,64 @@ describe("image-routed runs hand back to the session model", () => {
 
 		expect(served).toEqual(["faux-vision", "faux-vision"]);
 	});
+
+	it("bootstraps a route when the run's first image arrives in a tool result", async () => {
+		const h = await harness();
+		const served: string[] = [];
+		const script = [
+			fauxAssistantMessage(fauxToolCall("take_screenshot", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage([fauxText("截图里是登录页。"), fauxToolCall("run_step", {})], {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage("处理完了。"),
+		];
+		const step = recorded(script, served);
+		h.setResponses([step, step, step]);
+
+		await h.session.prompt("看一下截图里有什么");
+
+		expect(served).toEqual(["faux-1", "faux-vision", "faux-1"]);
+		expect(h.session.agent.modelOverride).toBeUndefined();
+	});
+
+	it("keeps the session model when a mid-run image has no route to an image model", async () => {
+		const created = await createHarness({
+			models: MODELS,
+			settings: {},
+			tools: [tool("run_step"), tool("take_screenshot", true)],
+		});
+		harnesses.push(created);
+		const served: string[] = [];
+		const script = [
+			fauxAssistantMessage(fauxToolCall("take_screenshot", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("截图我看不到：没有配置图像模型。"),
+		];
+		const step = recorded(script, served);
+		created.setResponses([step, step]);
+
+		await created.session.prompt("看一下截图里有什么");
+
+		expect(served).toEqual(["faux-1", "faux-1"]);
+		expect(created.session.agent.modelOverride).toBeUndefined();
+	});
+
+	it("keeps the session model when images are blocked for every provider", async () => {
+		const created = await createHarness({
+			models: MODELS,
+			settings: { imageModel: "faux/faux-vision", images: { blockImages: true } },
+			tools: [tool("run_step"), tool("take_screenshot", true)],
+		});
+		harnesses.push(created);
+		const served: string[] = [];
+		const script = [
+			fauxAssistantMessage(fauxToolCall("take_screenshot", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("截图被屏蔽了，读不到。"),
+		];
+		const step = recorded(script, served);
+		created.setResponses([step, step]);
+
+		await created.session.prompt("看一下截图里有什么");
+
+		expect(served).toEqual(["faux-1", "faux-1"]);
+	});
 });
