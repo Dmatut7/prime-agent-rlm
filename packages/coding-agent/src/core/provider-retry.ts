@@ -1,4 +1,4 @@
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import { type AssistantMessage, isProviderQuotaExhaustedText } from "@earendil-works/pi-ai";
 import { sleep } from "../utils/sleep.js";
 import type { SettingsManager } from "./settings-manager.js";
 
@@ -204,15 +204,25 @@ export type ProviderWaitClass = "quota" | "transient" | "permanent";
 /**
  * Classify a structured provider failure for wait-for-recovery routing.
  *
- * - quota: subscription/rate-limit exhaustion (429, usage limits, throttling).
- *   Waiting can help: usage windows reset.
+ * - quota: subscription/rate-limit exhaustion (429, usage limits, throttling),
+ *   and account-level exhaustion (unpaid balance, spent free tier) whatever the
+ *   status. Waiting can help (usage windows reset, balances get topped up), and
+ *   another model can serve the task meanwhile.
  * - transient: provider unavailability. 404 counts: a live model briefly
  *   404s on routing blips (observed killing active sessions), and the same
  *   shape can also mean a genuinely missing model, so waits stay bounded.
  * - permanent: auth/permission/refusal/invalid requests. Waiting cannot help.
  */
-export function providerWaitClass(kind: string | undefined, status: number | undefined): ProviderWaitClass {
+export function providerWaitClass(
+	kind: string | undefined,
+	status: number | undefined,
+	errorText?: string,
+): ProviderWaitClass {
 	if (kind === "rate_limit" || kind === "quota") return "quota";
+	// The structured kind can predate the quota classification (a transcript
+	// written by an older build) or come from a stream-level error with no
+	// structured body: the provider's own words still say the balance ran out.
+	if (kind !== "auth" && isProviderQuotaExhaustedText(errorText)) return "quota";
 	if (kind === "server_error" || kind === "overloaded" || kind === "unknown") return "transient";
 	if (kind === "invalid_request" && status === 404) return "transient";
 	return "permanent";

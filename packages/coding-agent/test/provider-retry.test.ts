@@ -110,6 +110,30 @@ describe("providerWaitClass", () => {
 		expect(providerWaitClass("malformed_response", undefined)).toBe("permanent");
 		expect(providerWaitClass(undefined, undefined)).toBe("permanent");
 	});
+
+	it("reads an exhausted balance from the provider's words when the kind predates it", () => {
+		// Transcripts written before the quota kind: invalid_request/permission by status only.
+		expect(
+			providerWaitClass(
+				"invalid_request",
+				400,
+				'400 {"code":"Arrearage","message":"Access denied, please make sure your account is in good standing."}',
+			),
+		).toBe("quota");
+		expect(
+			providerWaitClass(
+				"permission",
+				403,
+				"AllocationQuota.FreeTierOnly: The free tier of the model has been exhausted.",
+			),
+		).toBe("quota");
+		expect(providerWaitClass(undefined, 402, "Insufficient Balance")).toBe("quota");
+		// A dead key stays a dead key, whatever its message mentions.
+		expect(providerWaitClass("auth", 401, "invalid api key; check your billing_not_active account")).toBe(
+			"permanent",
+		);
+		expect(providerWaitClass("invalid_request", 400, "messages: field required")).toBe("permanent");
+	});
 });
 
 describe("providerWaitPingDelay", () => {

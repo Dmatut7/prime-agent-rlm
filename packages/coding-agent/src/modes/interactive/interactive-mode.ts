@@ -11,6 +11,7 @@ import {
 	type Model,
 	type ServiceTier,
 	supportsFastMode,
+	type TextContent,
 	type ToolCall,
 } from "@earendil-works/pi-ai";
 import { BUILTIN_MCP_CATALOG } from "@earendil-works/pi-ai/mcp";
@@ -127,6 +128,7 @@ import { parseNewSessionCommand } from "../../core/new-session-command.js";
 import { resolvePrimeAgentTracesBaseUrl } from "../../core/prime-inference-auth.js";
 import { resolvePrimeInferencePostLoginModelAction } from "../../core/prime-inference-model-selection.js";
 import { parseCommandArgs } from "../../core/prompt-templates.js";
+import { PROVIDER_FALLBACK_NOTICE_CUSTOM_TYPE } from "../../core/provider-fallback.js";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.js";
 import { SessionImportFileNotFoundError } from "../../core/session-import-errors.js";
 import { getSessionArtifactPathForFile } from "../../core/session-manager.js";
@@ -489,6 +491,25 @@ export function styleQueuedMessagePreview(
 	return `${theme.fg("dim", prefix)}${styleSlashCommandText(message, (rest, includeBareSeparator) =>
 		styleArgumentTokens(rest, styleDim, includeBareSeparator),
 	)}`;
+}
+
+/**
+ * A fallback-chain notice as one status row, like the live switch notice, so a
+ * return to the primary or an unread image reads the same live and on replay.
+ */
+function createProviderFallbackNoticeRow(message: CustomMessage): Component {
+	const text =
+		typeof message.content === "string"
+			? message.content
+			: message.content
+					.filter((block): block is TextContent => block.type === "text")
+					.map((block) => block.text)
+					.join("\n");
+	const kind = (message.details as { kind?: unknown } | undefined)?.kind;
+	const row = new Container();
+	row.addChild(new Spacer(1));
+	row.addChild(new Text(theme.fg(kind === "return" ? "dim" : "warning", text), 1, 0));
+	return row;
 }
 
 function isExpandable(obj: unknown): obj is Expandable {
@@ -6441,6 +6462,9 @@ export class InteractiveMode {
 					if (isSessionSlashCommandMessage(event.message) && event.message.details.command.name === "refine") {
 						this.startRefineLoader();
 					}
+					// A fallback transition (a return to the primary, a routed image handed
+					// back) moved the serving model without a model_select: repaint the footer.
+					if (event.message.customType === PROVIDER_FALLBACK_NOTICE_CUSTOM_TYPE) void this.refreshServingModel();
 					// The /refine result row is the user refine's settle edge; refine_complete
 					// alone can belong to an agent/auto refinement the queued /refine waited on.
 					if (
@@ -6755,6 +6779,8 @@ export class InteractiveMode {
 					event.reason === "backup" && event.backupModel
 						? `已自动切换到 ${event.backupModel.split("/").pop()}（原因：${event.errorMessage}）`
 						: undefined;
+				// The switch already happened on the session: the footer names the model now serving.
+				if (event.reason === "backup") void this.refreshServingModel();
 				const cancelKey = keyText("app.clear");
 				const retryMessage = (seconds: number) => {
 					const cancel = cancelKey ? `（${cancelKey} 取消）` : "";
@@ -6808,6 +6834,9 @@ export class InteractiveMode {
 				if (event.success && fallbackNotice) {
 					this.showStatus(fallbackNotice);
 				}
+				// A retry can end on another model (a backup restored, a chain switch that
+				// failed over again): the footer follows whatever serves now.
+				void this.refreshServingModel();
 				// Show error only on final failure (success shows normal response)
 				if (!event.success) {
 					this.showError(`重试 ${event.attempt} 次后仍失败：${event.finalError || "未知错误"}`);
@@ -7817,6 +7846,7 @@ export class InteractiveMode {
 	}
 
 	private createDisplayedCustomMessageComponent(message: CustomMessage): Component {
+		if (message.customType === PROVIDER_FALLBACK_NOTICE_CUSTOM_TYPE) return createProviderFallbackNoticeRow(message);
 		if (isSessionSlashCommandMessage(message)) return new SlashCommandMessageComponent(message.content);
 		if (isSessionSlashCommandResultMessage(message)) return new SlashCommandResultMessageComponent(message);
 		if (
@@ -10459,6 +10489,22 @@ export class InteractiveMode {
 			);
 		}
 		this.applyModelSwitchUiState(state, model);
+	}
+
+	/**
+	 * Re-read the session's model after an automatic switch (fallback chain, backup
+	 * model, return to the primary). Those never go through model selection, so the
+	 * footer kept naming the model that had stopped serving, in daemon mode too.
+	 */
+	private async refreshServingModel(): Promise<void> {
+		const connection = this.agentConnection;
+		const sessionId = this.connectionState?.sessionId;
+		if (!connection || sessionId === undefined) return;
+		const state = await connection.getState().catch(() => undefined);
+		if (!state?.model || this.agentConnection !== connection || this.connectionState?.sessionId !== sessionId) return;
+		const current = this.connectionState?.model;
+		if (current && current.provider === state.model.provider && current.id === state.model.id) return;
+		this.applyModelSwitchUiState(state, state.model);
 	}
 
 	/**
