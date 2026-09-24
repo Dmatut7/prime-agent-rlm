@@ -9,6 +9,7 @@ import { ENV_AGENT_DIR, getSessionsDir } from "../src/config.js";
 import {
 	autoNameForInbound,
 	deriveAutoSessionName,
+	firstInboundSourceFromMessages,
 	inboundNameSource,
 	sanitizeRefinedTitle,
 	scanFirstInboundSource,
@@ -201,6 +202,18 @@ describe("disk scans", () => {
 	});
 });
 
+describe("firstInboundSourceFromMessages", () => {
+	it("names a broadcast turn from in-memory messages while persistence still suppresses them", () => {
+		expect(
+			firstInboundSourceFromMessages([
+				{ role: "custom", customType: "harness_digest", content: "noise" },
+				{ role: "custom", customType: "agent_message", content: "env", details: { message: "广播正文" } },
+				{ role: "assistant", content: [{ type: "text", text: "收到" }] },
+			]),
+		).toBe("广播正文");
+	});
+});
+
 describe("uniquifyAutoName", () => {
 	it("suffixes collisions so sibling names stay addressable", () => {
 		const taken = new Set(["修复水务公告越权"]);
@@ -273,6 +286,11 @@ describe("autoname backfill command", () => {
 			const legacyRun = await runAutonameCommand([]);
 			expect(legacyRun).toBe(0);
 			expect(scanLastSessionInfoEntry(legacy)).toBeUndefined();
+			// --json is report-only even when combined with --apply.
+			const draftBefore = scanLastSessionInfoEntry(draft);
+			const jsonRun = await runAutonameCommand(["--json", "--apply"]);
+			expect(jsonRun).toBe(0);
+			expect(scanLastSessionInfoEntry(draft)).toEqual(draftBefore);
 		} finally {
 			if (previous === undefined) delete process.env[ENV_AGENT_DIR];
 			else process.env[ENV_AGENT_DIR] = previous;

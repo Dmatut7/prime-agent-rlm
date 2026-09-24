@@ -474,6 +474,7 @@ import {
 	type AutoSessionNameMode,
 	autoNameForInbound,
 	buildAutoTitlePrompt,
+	firstInboundSourceFromMessages,
 	inboundNameSource,
 	sanitizeRefinedTitle,
 	scanFirstInboundSource,
@@ -21884,7 +21885,8 @@ export class AgentSession {
 			if (this.sessionManager.getSessionName() !== undefined) return;
 			const sessionFile = this.sessionFile;
 			if (!sessionFile) return;
-			const diskSource = scanFirstInboundSource(sessionFile);
+			const diskSource =
+				scanFirstInboundSource(sessionFile) ?? firstInboundSourceFromMessages(this.agent.state.messages);
 			const decision = autoNameForInbound({
 				mode,
 				currentName: this.sessionManager.getSessionName(),

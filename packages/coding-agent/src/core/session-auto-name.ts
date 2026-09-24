@@ -184,6 +184,21 @@ export function inboundNameSource(message: AutoNameInboundMessage): string | und
 }
 
 /**
+ * The first naming source among in-memory messages. Live persistence suppresses
+ * custom entries until the first assistant reply lands, so at the assistant tick
+ * the broadcast that triggered the turn can still be disk-absent; the in-memory
+ * transcript already holds it and names the session without waiting for a
+ * second inbound.
+ */
+export function firstInboundSourceFromMessages(messages: readonly AutoNameInboundMessage[]): string | undefined {
+	for (const message of messages) {
+		const source = inboundNameSource(message);
+		if (source !== undefined && source.trim()) return source;
+	}
+	return undefined;
+}
+
+/**
  * The first inbound naming source already on disk for a transcript: the first
  * user message text, or the first agent-to-agent broadcast payload. A resumed
  * session names the thread by its origin, not by whatever message happened to
