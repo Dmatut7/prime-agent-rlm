@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.11.13] - 2026-09-25
+
+- Added the bundled web-research skill: SearXNG search, tiered page fetch (HTTP, headless browser, archive copy), headless click-through to a vendor's cart price that stops before payment, and keyless arXiv/Crossref/OpenAlex/Stack Exchange/GitHub lookups.
+- Added running-card step names for web-research calls (联网搜索, 读网页, 后台浏览器, 查论文资料).
+- Fixed Enter on a subagent row in the chat's subagent panel opening the session list instead of that subagent; it now opens the selected subagent directly.
+- Fixed the subagent panel hiding every child past the fourth; the selection now scrolls through all of them, with `↑ 上面还有 N 个` / `↓ 下面还有 N 个` folds.
+- Changed the user message bubble to sit on the same one-column margin as the AI header and running card instead of a wide left indent.
+- Changed idle subagents to close after 20 idle minutes instead of 90 while the parent stays open (`childIdleEvictionMinutes`, capped by `idleEvictionMinutes`); the transcript is kept and a message wakes the subagent.
+- Changed the subagent panel to fold a family with nothing in flight into one line until it is focused.
+- Fixed a false "image may not have been received" notice after an image turn that the image model answered and the text-only session model continued; it now fires only for a response from an image-capable model that reported no image token count.
+
 ## [0.11.12] - 2026-09-24
 
 - Changed a tool call with a garbled name (markup leaked into it, a known GLM slip) to render as one dim line and read as 写错的工具调用 in the process line and running card, instead of showing the raw name, `{}` and the not-found text; the details stay on expand.

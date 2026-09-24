@@ -1,2 +1,0 @@
-- Added the bundled web-research skill: SearXNG search, tiered page fetch (HTTP, headless browser, archive copy), headless click-through to a vendor's cart price that stops before payment, and keyless arXiv/Crossref/OpenAlex/Stack Exchange/GitHub lookups.
-- Added running-card step names for web-research calls (联网搜索, 读网页, 后台浏览器, 查论文资料).

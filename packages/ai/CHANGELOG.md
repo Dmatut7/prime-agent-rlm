@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.11.13] - 2026-09-25
+
+- Changed the placeholder a text-only model sees in place of an image to say the image was not shown to it and that a reply describing it came from an image-capable model, so a continued conversation no longer disowns a correct image answer.
+
 ## [0.11.1] - 2026-09-22
 
 - Added `imageTokens` to usage: OpenAI-completions now surfaces the provider-reported `prompt_tokens_details.image_tokens` count (absent when the provider does not report one), so callers can tell a counted image turn from an uncounted one.
