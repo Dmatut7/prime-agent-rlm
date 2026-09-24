@@ -100,22 +100,29 @@ export async function runAutonameCommand(args: string[]): Promise<number> {
 	const rows = planAutonameForDir(sessionsDir);
 	const planned = rows.filter((row) => row.source === "first-inbound" && row.name);
 	const skipped = rows.filter((row) => row.source === "skipped");
+	const skippedByReason: Record<string, number> = {};
+	for (const row of skipped) {
+		if (row.reason === "named") continue;
+		const reason = row.reason ?? "other";
+		skippedByReason[reason] = (skippedByReason[reason] ?? 0) + 1;
+	}
 	if (json) {
-		console.log(JSON.stringify({ planned, skipped }, null, 2));
-	} else if (planned.length === 0) {
+		// Report-only on purpose: a machine-readable plan must never write as a
+		// side effect of asking for JSON.
+		console.log(JSON.stringify({ sessionsDir, planned, skipped, skippedByReason }, null, 2));
+		return 0;
+	}
+	if (planned.length === 0) {
 		console.log("No unnamed session transcript needs a name; nothing to do.");
 	} else {
 		console.log(`${planned.length} unnamed session(s) in ${sessionsDir} would be named:`);
 		for (const row of planned) {
 			console.log(`  ${row.sessionId.slice(0, 8)}  ${row.name}`);
 		}
-		const byReason = new Map<string, number>();
-		for (const row of skipped) {
-			if (row.reason === "named") continue;
-			byReason.set(row.reason ?? "other", (byReason.get(row.reason ?? "other") ?? 0) + 1);
-		}
-		if (byReason.size > 0) {
-			const detail = [...byReason.entries()].map(([reason, count]) => `${reason}: ${count}`).join(", ");
+		if (Object.keys(skippedByReason).length > 0) {
+			const detail = Object.entries(skippedByReason)
+				.map(([reason, count]) => `${reason}: ${count}`)
+				.join(", ");
 			console.log(`Skipped (${detail}) - see "prime-agent autoname --json" for the list.`);
 		}
 	}
