@@ -59,12 +59,18 @@ function editCount(edits: AppliedRefinementEdit[]): string {
 	return edits.length === applied ? `已应用 ${applied} 处修改` : `已应用 ${applied}/${edits.length} 处修改`;
 }
 
+function readableTitle(title: string | undefined): string | undefined {
+	const text = title?.replace(/_+/g, " · ").replace(/\s+/g, " ").trim();
+	return text || undefined;
+}
+
 /**
  * What the collapsed notice says changed: the entries' own titles (`百轮评估进度`),
  * joined, when every edit has one; otherwise the refinement's summary.
  */
 function memoryNoticeDetail(summary: string, edits: readonly AppliedRefinementEdit[]): string {
-	const titles = edits.map((edit) => (edit.after?.title ?? edit.title ?? edit.before?.title)?.trim());
+	// Titles are often written as id-like slugs (`a_b_c`); the notice reads them as words.
+	const titles = edits.map((edit) => readableTitle(edit.after?.title ?? edit.title ?? edit.before?.title));
 	const named = titles.filter((title): title is string => Boolean(title));
 	const count = edits.length > 1 ? ` · ${edits.length} 条` : "";
 	if (named.length > 0 && named.length === edits.length) {

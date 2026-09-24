@@ -414,9 +414,9 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 		// The `◆ prime` header carries the model and the time; one process line
 		// sits under it on the gutter rail: caret, steps, plain-words summary.
 		// A bare `│` is the rail running through a blank row of the AI block.
-		const turn = turnLines(nonEmpty).filter((line) => line !== "│");
-		expect(turn[0]).toBe("◆ prime  test-model · 0.6s");
-		expect(turn[1]?.startsWith("│ ▸ 6 steps   ")).toBe(true);
+		const turn = turnLines(nonEmpty).filter((line) => line !== " │");
+		expect(turn[0]).toBe(" ◆ prime  test-model · 0.6s");
+		expect(turn[1]?.startsWith(" │ ▸ 6 steps   ")).toBe(true);
 		expect(turn[1]).toContain("编辑 3 个文件");
 		expect(turn[1]).toContain("运行 npm test");
 		expect(turn[1]).not.toMatch(/\[[OTP]\]/);
@@ -445,12 +445,12 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 		const collapsed = renderQuiet(messages);
 		const nonEmpty = collapsed.split("\n").filter((line) => line.trim().length > 0);
 		// The thinking-only turn: Thinking under the header, no step count.
-		expect(turnLines(nonEmpty)[0]).toBe("◆ prime  test-model · 2.0s");
-		expect(turnLines(nonEmpty)[1]).toBe("│ ▸ Thinking");
+		expect(turnLines(nonEmpty)[0]).toBe(" ◆ prime  test-model · 2.0s");
+		expect(turnLines(nonEmpty)[1]).toBe(" │ ▸ Thinking");
 		expect(collapsed).toContain("Concluded.");
 		// R5-P2③: the thinking-less turn renders 思考 too - the model is
 		// always reasoning, so every turn carries the process line.
-		const heads = collapsed.split("\n").filter((line) => line.startsWith("│ ▸ Thinking"));
+		const heads = collapsed.split("\n").filter((line) => line.startsWith(" │ ▸ Thinking"));
 		expect(heads).toHaveLength(2);
 		expect(collapsed).not.toContain("想了想");
 	});
@@ -462,7 +462,7 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 		summary.setQuiet(true);
 		// No steps, no thinking, no comms: still one 思考 line, not nothing.
 		const line = stripAnsi(summary.render(120).join("\n"));
-		expect(line).toBe("◆ prime  0.5s\n│ ▸ Thinking");
+		expect(line).toBe(" ◆ prime  0.5s\n │ ▸ Thinking");
 	});
 
 	it("counts comms from received agent rows plus sent agent messages in tool details", () => {
@@ -508,8 +508,8 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 		const collapsed = renderQuiet(messages);
 		// 1 step, 1 thinking segment, 3 comms (2 sent + 1 received). A replay never
 		// measured the thinking time, so the 思考 segment stays out.
-		const head = collapsed.split("\n").find((line) => line.startsWith("│ ▸ "));
-		expect(head?.startsWith("│ ▸ 1 step · ")).toBe(true);
+		const head = collapsed.split("\n").find((line) => line.startsWith(" │ ▸ "));
+		expect(head?.startsWith(" │ ▸ 1 step · ")).toBe(true);
 		expect(head).toContain(" · 3 msgs");
 		expect(head).not.toContain("[P]");
 	});
@@ -544,7 +544,7 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 		state.markTurnEnded(1_500);
 		const summary = new TurnSummaryComponent(state);
 		summary.setQuiet(true);
-		expect(stripAnsi(summary.render(120).join("\n"))).toMatch(/^◆ prime {2}\S+\n│ ▸ 1 step {3}/);
+		expect(stripAnsi(summary.render(120).join("\n"))).toMatch(/^ ◆ prime {2}\S+\n │ ▸ 1 step {3}/);
 		summary.setQuiet(false);
 		const legacy = stripAnsi(summary.render(120).join("\n"));
 		expect(legacy).toContain("⚙ 1 步");
@@ -714,12 +714,12 @@ describe("turn state for the process line", () => {
 		const summary = new TurnSummaryComponent(state);
 		summary.setQuiet(true);
 		expect(summary.render(120).map((line) => stripAnsi(line))).toEqual([
-			"◆ prime  0.4s",
-			"│ ▸ 1 step   编辑 a.ts",
-			"│   改动  src/a.ts  +3 −5",
+			" ◆ prime  0.4s",
+			" │ ▸ 1 step   编辑 a.ts",
+			" │   改动  src/a.ts  +3 −5",
 		]);
 		summary.setExpanded(true);
-		expect(summary.render(120).map((line) => stripAnsi(line))).toEqual(["◆ prime  0.4s", "│ ▾ 1 step   编辑 a.ts"]);
+		expect(summary.render(120).map((line) => stripAnsi(line))).toEqual([" ◆ prime  0.4s", " │ ▾ 1 step   编辑 a.ts"]);
 	});
 
 	it("relabels a step when its streaming arguments complete", () => {
@@ -730,7 +730,7 @@ describe("turn state for the process line", () => {
 		state.markTurnEnded(1_300);
 		const summary = new TurnSummaryComponent(state);
 		summary.setQuiet(true);
-		expect(stripAnsi(summary.render(120)[1] ?? "")).toBe("│ ▸ 1 step   运行 npm run check");
+		expect(stripAnsi(summary.render(120)[1] ?? "")).toBe(" │ ▸ 1 step   运行 npm run check");
 	});
 
 	it("keeps the clock ticking while a step is unsettled and freezes it on the last settled step", () => {
@@ -821,17 +821,17 @@ describe("turn state for the process line", () => {
 		state.markTurnEnded(2_000);
 		const summary = new TurnSummaryComponent(state);
 		summary.setQuiet(true);
-		const caret = () => stripAnsi(summary.render(120)[1] ?? "").slice(0, 4);
-		expect(caret()).toBe("│ ▸ ");
+		const caret = () => stripAnsi(summary.render(120)[1] ?? "").slice(0, 5);
+		expect(caret()).toBe(" │ ▸ ");
 		state.thinkingExpanded = true;
-		expect(caret()).toBe("│ ▾ ");
+		expect(caret()).toBe(" │ ▾ ");
 		state.thinkingExpanded = false;
-		expect(caret()).toBe("│ ▸ ");
+		expect(caret()).toBe(" │ ▸ ");
 		// Ctrl+P opens nothing in a turn without comms, so the caret stays put.
 		state.agentMessagesExpanded = true;
-		expect(caret()).toBe("│ ▸ ");
+		expect(caret()).toBe(" │ ▸ ");
 		state.addCommMessage();
-		expect(caret()).toBe("│ ▾ ");
+		expect(caret()).toBe(" │ ▾ ");
 	});
 
 	it("shows the running card while the turn runs and the settled line once it ends (QA L2)", () => {

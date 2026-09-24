@@ -130,7 +130,7 @@ describe("running card: what the AI is doing right now", () => {
 		const rows = renderRunningCard(state, 100, 3, T0 + 20_000);
 		const text = plain(rows);
 		expect(text).toHaveLength(3);
-		expect(text[0]?.trimEnd()).toBe("▌ ⠸ 正在运行 npm test · 16s");
+		expect(text[0]?.trimEnd()).toBe(" ▌ ⠸ 正在运行 npm test · 16s");
 		expect(text[1]).toContain("step 4 · 20s · 读取 package.json · 列目录 src · 运行 npm install");
 		// The last three steps only: the first one scrolled off the row.
 		expect(text[2]).toContain("✓ 列目录 src");
@@ -175,12 +175,12 @@ describe("the ◆ prime header and the gutter", () => {
 			stripAnsi(
 				renderAssistantHeader({ modelId: "glm-5.3-prime", durationMs: 79_000, live: false, tick: 0, width: 80 }),
 			),
-		).toBe("◆ prime  glm-5.3-prime · 1m19s");
+		).toBe(" ◆ prime  glm-5.3-prime · 1m19s");
 		expect(
 			stripAnsi(
 				renderAssistantHeader({ modelId: "glm-5.3-prime", durationMs: 568_000, live: true, tick: 3, width: 80 }),
 			),
-		).toBe("◆ prime  glm-5.3-prime · ⠸ working 9m 28s");
+		).toBe(" ◆ prime  glm-5.3-prime · ⠸ working 9m 28s");
 	});
 
 	it("puts the settled process line inside the AI block, on the gutter, in English", () => {
@@ -193,12 +193,12 @@ describe("the ◆ prime header and the gutter", () => {
 		const summary = new TurnSummaryComponent(state);
 		summary.setQuiet(true);
 		const lines = plain(summary.render(100));
-		expect(lines[0]).toBe("◆ prime  glm-5.3-prime · 4.0s");
-		expect(lines[1]).toMatch(/^│ ▸ 1 step {3}运行 npm test$/);
+		expect(lines[0]).toBe(" ◆ prime  glm-5.3-prime · 4.0s");
+		expect(lines[1]).toMatch(/^ │ ▸ 1 step {3}运行 npm test$/);
 		// The footnote's click regions moved one row down and past the rail.
 		const regions = summary.getClickRegions();
 		expect(regions[0]).toMatchObject({ line: 0, col: 0 });
-		expect(regions.slice(1).every((region) => region.line === 1 && region.col >= 1)).toBe(true);
+		expect(regions.slice(1).every((region) => region.line === 1 && region.col >= 2)).toBe(true);
 	});
 
 	it("renders the live turn as the header plus the running card", () => {
@@ -207,7 +207,7 @@ describe("the ◆ prime header and the gutter", () => {
 		const summary = new TurnSummaryComponent(state);
 		summary.setQuiet(true);
 		const lines = plain(summary.render(100));
-		expect(lines[0]).toMatch(/^◆ prime {2}glm-5\.3-prime · \S working /);
+		expect(lines[0]).toMatch(/^ ◆ prime {2}glm-5\.3-prime · \S working /);
 		expect(lines[1]).toContain("正在等模型回复");
 	});
 
@@ -237,8 +237,8 @@ describe("the ◆ prime header and the gutter", () => {
 		);
 		const lines = plain(answer.render(80)).map((line) => line.replace(/\x1b\][^\x07]*\x07/g, ""));
 		expect(lines.length).toBeGreaterThan(1);
-		for (const line of lines) expect(line.startsWith("│")).toBe(true);
-		expect(lines.some((line) => line.startsWith("│ 两个文件加起来 746 行。"))).toBe(true);
+		for (const line of lines) expect(line.startsWith(" │")).toBe(true);
+		expect(lines.some((line) => line.startsWith(" │ 两个文件加起来 746 行。"))).toBe(true);
 	});
 });
 
@@ -315,6 +315,17 @@ describe("system notices", () => {
 		expect(collapsed[0]).toContain("·  ✦ memory updated  百轮评估进度  ·  Ctrl+O diff  ·");
 		// The entry's title names it; the summary's shorthand stays out of the line.
 		expect(collapsed[0]).not.toContain("老板令");
+		// A slug-like title (seen live: `eval100_0924百轮评估场_运行状态_评估后删`) reads as words.
+		const slug = structuredClone(result);
+		for (const edit of slug.appliedEdits) {
+			edit.title = "eval100_0924百轮评估场_运行状态_评估后删";
+			if (edit.after) edit.after.title = edit.title;
+		}
+		const slugLine = plain(new RefinementOutcomeMessageComponent(createRefinementOutcomeMessage(slug)).render(120))
+			.filter((line) => line.trim())
+			.join("");
+		expect(slugLine).toContain("eval100 · 0924百轮评估场 · 运行状态 · 评估后删");
+		expect(slugLine).not.toContain("_");
 		component.setExpanded(true);
 		const expanded = plain(component.render(100)).join("\n");
 		expect(expanded).toContain("把协调记忆改写为");

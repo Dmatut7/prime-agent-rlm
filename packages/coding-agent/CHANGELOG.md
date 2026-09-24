@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.11.11] - 2026-09-24
+
+- Fixed the `◆ prime` header, the AI gutter and the running card starting at column 0, which terminals that clip their first column cut off; they now keep the same one-column margin as every other chat row.
+- Changed the memory-updated notice to read slug-like entry titles (`a_b_c`) as words.
+
 ## [0.11.10] - 2026-09-24
 
 - Changed the conversation into layers: your messages sit in a tinted, indented `you` bubble with the send time; each AI turn opens with a `◆ prime` header (model and time, or a spinner while working) and runs down a faint gutter, with its settled process line in English.

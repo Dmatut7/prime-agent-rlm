@@ -12,6 +12,7 @@ import {
 	summarizeErrorDetails,
 } from "./collapsible-error.js";
 import type { MermaidMarkdownTransform } from "./mermaid.js";
+import { ASSISTANT_GUTTER_WIDTH, assistantGutter } from "./running-card.js";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
@@ -161,7 +162,7 @@ export class AssistantMessageComponent extends Container implements FocusableBlo
 		// header. The body keeps its own one-column padding, so the rail takes
 		// exactly one column.
 		const gutter = this.quiet && width > 8;
-		const body = this.renderMessage(gutter ? width - 1 : width);
+		const body = this.renderMessage(gutter ? width - ASSISTANT_GUTTER_WIDTH : width);
 		const lines = gutter ? this.withGutter(body) : body;
 		return this.blockFocus && lines.length > 0 ? decorateFocusedBlock(lines, width, this.blockFocus) : lines;
 	}
@@ -174,7 +175,7 @@ export class AssistantMessageComponent extends Container implements FocusableBlo
 		if (this.gutterSource === body && this.gutterLines) {
 			return this.gutterLines;
 		}
-		const rail = theme.fg("assistantGutter", "│");
+		const rail = assistantGutter();
 		this.gutterSource = body;
 		this.gutterLines = body.map((line) => `${rail}${line}`);
 		return this.gutterLines;

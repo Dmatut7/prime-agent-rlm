@@ -24,10 +24,11 @@ const RECENT_STEPS = 3;
  * their own leading space, so text reads `│ text`.
  */
 export function assistantGutter(): string {
-	return theme.fg("assistantGutter", "│");
+	return ` ${theme.fg("assistantGutter", "│")}`;
 }
 
-export const ASSISTANT_GUTTER_WIDTH = 1;
+/** Margin column plus the rail: column 0 stays blank like every other chat row. */
+export const ASSISTANT_GUTTER_WIDTH = 2;
 
 /** The action the card's first row names, with the clocks behind it. */
 export interface RunningAction {
@@ -111,9 +112,11 @@ function quietMinutesText(quietMs: number): string {
 /** One card row: tinted to the full width, the left bar first. */
 function cardRow(content: string, width: number, warn: boolean): string {
 	const bar = theme.fg(warn ? "runCardWarn" : "runCardBar", "▌");
-	const body = truncateToWidth(`${bar}${content}`, width, "…");
-	const padded = body + " ".repeat(Math.max(0, width - visibleWidth(body)));
-	return theme.bg(warn ? "runCardWarnBg" : "runCardBg", padded);
+	// A blank margin column, then the tinted card: some terminals clip column 0.
+	const inner = Math.max(1, width - 1);
+	const body = truncateToWidth(`${bar}${content}`, inner, "…");
+	const padded = body + " ".repeat(Math.max(0, inner - visibleWidth(body)));
+	return ` ${theme.bg(warn ? "runCardWarnBg" : "runCardBg", padded)}`;
 }
 
 /**
@@ -185,7 +188,8 @@ export function renderAssistantHeader(options: {
 	tick: number;
 	width: number;
 }): string {
-	const parts = [theme.bold(theme.fg("assistantLabel", "◆ prime"))];
+	// Column 1, the margin every chat row keeps: some terminals clip column 0.
+	const parts = [` ${theme.bold(theme.fg("assistantLabel", "◆ prime"))}`];
 	const facts: string[] = [];
 	if (options.modelId) facts.push(theme.fg("dim", options.modelId));
 	if (options.live) {
@@ -195,7 +199,6 @@ export function renderAssistantHeader(options: {
 	} else {
 		facts.push(theme.fg("dim", turnFootNoteDurationText(options.durationMs)));
 	}
-	// Column 0, so the gutter rail below runs straight down from the ◆.
 	const line = `${parts.join("")}  ${facts.join(theme.fg("dim", " · "))}`;
 	return truncateToWidth(line, Math.max(1, options.width), "…");
 }

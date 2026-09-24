@@ -392,7 +392,7 @@ describe("AssistantMessageComponent streaming identity", () => {
 		})
 			.render(80)
 			.map((line) => stripAnsi(line));
-		expect(lines.find((line) => line.includes("weighing options"))?.startsWith("│   weighing")).toBe(true);
-		expect(lines.find((line) => line.includes("the answer"))?.startsWith("│ the answer")).toBe(true);
+		expect(lines.find((line) => line.includes("weighing options"))?.startsWith(" │   weighing")).toBe(true);
+		expect(lines.find((line) => line.includes("the answer"))?.startsWith(" │ the answer")).toBe(true);
 	});
 });
