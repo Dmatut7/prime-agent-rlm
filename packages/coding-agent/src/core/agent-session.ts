@@ -6419,8 +6419,8 @@ export class AgentSession {
 		const lines = [
 			`Stuck step: \`${step}\` produced no output for ${Math.round(silentMs / 1000)}s and showed no progress, so it was stopped.`,
 			seen > 1
-				? "This same step got stuck before in this run: do not run it again; take a different path (a smaller input, an explicit timeout, a background handle you poll, or a different tool)."
-				: "Try a different approach rather than repeating it unchanged.",
+				? "This same step got stuck before in this run: do not run it again. Two identical hangs mean the approach is the problem, not bad luck; take a different path (a smaller input, an explicit timeout, a background handle you poll, or a different tool)."
+				: "Running it again unchanged will most likely hang the same way; change what makes it hang first (a smaller input, an explicit timeout, a background handle you poll, or a different tool).",
 			"If the next cell reports that the kernel is still busy, retry once: a kernel that stays busy is restarted automatically and its saved state restored.",
 		];
 		return lines.join(" ");
@@ -12781,7 +12781,7 @@ export class AgentSession {
 		}
 		lines.push(
 			"",
-			"Their shell command forms fail the same way. Fix the import error first (for example install the missing dependency with `uv pip install <pkg>` or reinstall the skill into the kernel venv), or use another approach.",
+			'Their shell command forms fail the same way, so plan around them: a call raises the error above instead of doing the work. If the fix is in reach, make it (a missing dependency installs into the kernel interpreter with `uv pip install --python "<kernel-python>" <pkg>`, passing `sys.executable`); otherwise use another approach, and tell the owner which capability was missing when it limits the result.',
 		);
 		void this.sendCustomMessage(
 			{

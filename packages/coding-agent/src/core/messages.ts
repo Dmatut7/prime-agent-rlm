@@ -439,11 +439,7 @@ export function createEmptyResponseRecoveryMessage(
 		content: [
 			`[empty-response recovery] The previous request chain returned empty model turns until the retry ladder was exhausted (${facts.join("; ")}).`,
 			"The context is intact and the task is still open. This is not a user instruction and not a connection failure: the provider answered with clean but empty turns.",
-			"Continue the task yourself:",
-			"1. Do not assume the last intended action or tool call happened; verify the current state before redoing anything.",
-			"2. Save any in-progress work now (files, notes) so a later failure does not lose it.",
-			"3. Continue the task. If the provider still answers empty, say what is blocking you in your reply instead of ending the turn silently.",
-			"4. If you are a subagent, report this state to your parent with one short status line.",
+			"Pick the work back up yourself; nobody else will. The action you meant to take last may or may not have happened, and repeating a half-done edit or commit can do damage, so look at the current state before redoing anything. Save in-progress work to files now, so another failure does not lose it. If the provider keeps answering empty, say in your reply what is blocking you: a silent end reads to the owner as a finished task. A subagent sends its parent one short status line, because the parent cannot see this notice.",
 			Number.isFinite(details.maxContinuations) && (details.maxContinuations ?? 1) > details.recoveryGeneration
 				? `This is an automatic continuation (generation ${details.recoveryGeneration} of at most ${details.maxContinuations}); a further one may follow only if this turn itself exhausts the ladder.`
 				: `This is an automatic one-shot continuation (generation ${details.recoveryGeneration}); the system will not send another for this episode.`,
@@ -474,12 +470,12 @@ export function createAutoContinueMessage(
 	const content =
 		details.reason === "child_reply_missing"
 			? [
-					"[auto-continue] You ended your run without sending your result to your parent agent, which is waiting for it.",
+					"[auto-continue] You ended your run without sending your result to your parent agent, which is waiting for it. The parent sees only what you send; your final text stays in your own transcript.",
 					'If your task calls for an answer, send it now with `await agent_message.send(<your result>, receiver_role="parent")`, then stop. If no answer is needed, reply with one short line saying so.',
 				].join("\n")
 			: [
-					`[auto-continue] Your last reply ended by announcing a next step (${JSON.stringify(details.excerpt ?? "")}) but the turn stopped before doing it. Nobody is waiting to approve it.`,
-					"Continue and do that step now. If the work is actually finished, give the final result instead; if you are blocked or need a decision from the user, say exactly what and stop.",
+					`[auto-continue] Your last reply ended by announcing a next step (${JSON.stringify(details.excerpt ?? "")}) but the turn stopped before doing it. Nobody is waiting to approve it: the owner left this running, and a stop here leaves the work half done until they come back.`,
+					"Judge what that sentence was. A step you meant to take: take it now. An offer after work that is actually finished: give the final result in a line and stop. Blocked, or a decision only the owner can make: say exactly what and stop.",
 					`This is an automatic continue (${details.ordinal} of at most 2 for this request).`,
 				].join("\n");
 	return {
@@ -880,8 +876,8 @@ export function createRlmChildTerminalNoticeMessage(
 			? `RLM child ${childName} (${details.childId}) was cancelled${details.reason ? `: ${details.reason}` : ""}`
 			: `RLM child ${childName} (${details.childId}) completed without sending a reply${
 					details.lastAssistantTextPreview
-						? `. Its last assistant text (written to its own transcript, never sent to you): ${details.lastAssistantTextPreview}`
-						: ""
+						? `. Its last assistant text (written to its own transcript, never sent to you): ${details.lastAssistantTextPreview}. If that text answers the task, use it; if it is cut off or unclear, read the child's files or transcript before re-dispatching, since the work is usually already done`
+						: ". Read the child's files or transcript before re-dispatching: finishing without a reply usually means the work is done and only the report is missing"
 				}`;
 	return {
 		role: "custom",
