@@ -222,7 +222,7 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 			"",
 			"A callable `rlm` is already in your global namespace. `await rlm('sub-task')` spawns a child and returns immediately after task admission with `rlm_child_id`, `name`, `session_dir`, and `model`; it never waits for or returns the child's answer.",
 			"Spawn handles and `await rlm.list_subagents()` rows are frozen dataclasses, not dicts: read fields by attribute, never `.get()`. A row's fields are `rlm_child_id`, `session_name` (not `name`), `session_dir`, `status`, `active_session_id`, and `session_id`.",
-			"Choose a stable child name with `await rlm('sub-task', name='api-reviewer')`; names must be unique among siblings. If omitted, the host generates a readable unique name.",
+			"Choose a stable child name with `await rlm('sub-task', name='调研-云厂商')`: the name is what the owner reads in the subagent panel, so write it in the user's language - short, role-first, readable at a glance (`name='调研-云厂商'` for a Chinese user, `name='api-reviewer'` for an English one). Names must be unique among siblings. If omitted, the host generates a readable unique name from the task prompt.",
 			"A child inherits your model. If a different model is explicitly requested, use `await rlm.find_models(...)` and an exact returned selector. An unavailable requested model fails spawn; decide whether to retry or omit `model`. Children also inherit your thinking level; the `thinking` option overrides it with any level the resolved child model supports, and an unsupported level fails spawn.",
 		);
 		if (hasAgentMessage) {

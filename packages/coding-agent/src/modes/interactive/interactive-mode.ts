@@ -273,6 +273,7 @@ import {
 	styleSlashCommandText,
 } from "./components/slash-command-message.js";
 import { SlashCommandResultMessageComponent } from "./components/slash-command-result-message.js";
+import { SubagentDetailOverlay } from "./components/subagent-detail-overlay.js";
 import {
 	buildSubagentPanelRows,
 	collectSubtreeSubagentSnapshots,
@@ -1325,6 +1326,7 @@ export class InteractiveMode {
 	private subagentSummaryLine: SubagentSummaryLine;
 	private trayInfoLine: TrayInfoLine;
 	private subagentSnapshots = new Map<string, AgentConnectionRlmChildAgentSnapshot>();
+	private subagentDetailHandle: OverlayHandle | undefined;
 	private subagentCounts: SubagentSummaryCounts = { total: 0, running: 0, idle: 0, inactive: 0 };
 	private subagentSpendTimer: ReturnType<typeof setTimeout> | undefined;
 	/** When the pending spend-refresh timer fires (epoch ms); 0 with no timer. */
@@ -1558,6 +1560,7 @@ export class InteractiveMode {
 		this.subagentSummaryLine.onOpen = (row) => void this.openScopedAgentsView(row?.activeSessionId);
 		this.subagentSummaryLine.onCancel = () => this.focusEditor();
 		this.subagentSummaryLine.onChatAction = (data) => this.handleSubagentSummaryChatAction(data);
+		this.subagentSummaryLine.onRowActivate = (row) => this.showSubagentDetail(row.id);
 		this.footerDataProvider = new FooterDataProvider(this.uiServices.getInitialCwd());
 		this.footer = new FooterComponent(this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(this.settingsManager.getCompactionEnabled());
@@ -7256,6 +7259,24 @@ export class InteractiveMode {
 			return;
 		}
 		await this.returnToAgentsView("scoped_agents_view", childActiveSessionId);
+	}
+
+	/**
+	 * Clicking a row in the subagent panel opens a read-only detail card instead of
+	 * the full agents view: the card renders from the live snapshot map, so it
+	 * refreshes on its own while the overlay is up; keyboard Enter keeps its
+	 * existing behavior.
+	 */
+	private showSubagentDetail(id: string): void {
+		this.subagentDetailHandle?.hide();
+		const overlay = new SubagentDetailOverlay({
+			getChild: () => this.subagentSnapshots.get(id),
+			onDismiss: () => this.subagentDetailHandle?.hide(),
+		});
+		this.subagentDetailHandle = this.showFullPaneOverlay(overlay, {
+			maxContentWidth: 72,
+			suspendFullscreenMouse: true,
+		});
 	}
 
 	private handleSubagentSummaryChatAction(data: string): void {
