@@ -253,6 +253,135 @@ describe("self-recovery: silent steps", () => {
 	}, 15_000);
 });
 
+/**
+ * A synchronous cell freezes the kernel loop, so the kernel cannot vouch for it; the
+ * watchdog may be off, or give no evidence at all. Missing evidence is not a hang: the
+ * silent-step rule still decides, so a call that keeps working survives the per-call
+ * deadline and only a call silent past the threshold is stopped.
+ */
+describe("self-recovery: calls the kernel cannot vouch for", () => {
+	const harnesses: Harness[] = [];
+	afterEach(() => {
+		while (harnesses.length > 0) harnesses.pop()?.cleanup();
+	});
+
+	let streamBytes = 0;
+	/** A synchronous cell: frames arrive, the loop tick is frozen, stream bytes grow. */
+	function syncCellFacts(): TurnLivenessKernelFacts {
+		streamBytes += 1000;
+		return {
+			protocol: 4,
+			previous: sample({ receivedAt: Date.now() - 5_000, tick: 10, streamBytes: streamBytes - 1000 }),
+			latest: sample({ tick: 10, streamBytes }),
+			rejectedFrames: 0,
+			consecutiveRejectedFrames: 0,
+			hostRequestCount: 0,
+			kernelPid: 4242,
+			hasActiveExecution: true,
+		};
+	}
+
+	/** A cell awaiting a host request (rlm.collect on a child): loop alive, nothing printed. */
+	function awaitingHostRequestFacts(): TurnLivenessKernelFacts {
+		return {
+			protocol: 4,
+			previous: sample({ receivedAt: Date.now() - 5_000, tick: 10 }),
+			latest: sample({ tick: 40 }),
+			rejectedFrames: 0,
+			consecutiveRejectedFrames: 0,
+			hostRequestCount: 1,
+			hostRequestOldestAgeMs: 1_000,
+			kernelPid: 4242,
+			hasActiveExecution: true,
+		};
+	}
+
+	async function runOne(
+		options: Parameters<typeof createHarness>[0],
+		tool: AgentTool,
+		command = "python train.py",
+	): Promise<string> {
+		const harness = await createHarness({ tools: [tool], ...options });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("run_command", { command }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+		]);
+		await harness.session.promptAndWait("go");
+		return toolResultTexts(harness)[0] ?? "";
+	}
+
+	const quick = { tools: { timeout: { silentStuckSeconds: 1 } } };
+
+	it("keeps a synchronous cell that prints and burns CPU", async () => {
+		let cpu = 0;
+		const result = await runOne(
+			{ settings: quick, stallKernelLivenessFacts: syncCellFacts, stepCpuProbe: () => (cpu += 5_000) },
+			commandTool(2_500, 100),
+		);
+		expect(result).toContain("command finished");
+	});
+
+	it("keeps a call that streams output when the kernel gives no facts at all", async () => {
+		const result = await runOne(
+			{ settings: quick, stallKernelLivenessFacts: () => undefined, stepCpuProbe: () => undefined },
+			commandTool(2_500, 100),
+		);
+		expect(result).toContain("command finished");
+	});
+
+	it("keeps a call that streams output with the stall watchdog disabled", async () => {
+		const result = await runOne(
+			{
+				settings: { ...quick, stallWatchdog: { enabled: false } },
+				stallKernelLivenessFacts: syncCellFacts,
+				stepCpuProbe: () => undefined,
+			},
+			commandTool(2_500, 100),
+		);
+		expect(result).toContain("command finished");
+	});
+
+	it("keeps a quiet cell whose process tree keeps burning CPU and cannot be vouched for", async () => {
+		let cpu = 0;
+		const result = await runOne(
+			{ settings: quick, stallKernelLivenessFacts: () => undefined, stepCpuProbe: () => (cpu += 5_000) },
+			commandTool(2_500),
+		);
+		expect(result).toContain("command finished");
+	});
+
+	it("keeps a cell silently awaiting a host request", async () => {
+		const result = await runOne(
+			{ settings: quick, stallKernelLivenessFacts: awaitingHostRequestFacts, stepCpuProbe: () => 1_000 },
+			commandTool(3_000),
+		);
+		expect(result).toContain("command finished");
+	});
+
+	it("honours the call's own explicit timeout without evidence", async () => {
+		const result = await runOne(
+			{ settings: quick, stallKernelLivenessFacts: () => undefined, stepCpuProbe: () => 1_000 },
+			commandTool(2_500),
+			"subprocess.run(['npm', 'run', 'build'], timeout=900)",
+		);
+		expect(result).toContain("command finished");
+	});
+
+	it("still stops a call with no output and flat CPU at the silent threshold, not at the deadline", async () => {
+		const started = Date.now();
+		const result = await runOne(
+			{ settings: quick, stallKernelLivenessFacts: () => undefined, stepCpuProbe: () => 1_000 },
+			commandTool(8_000),
+			"sleep 999",
+		);
+		expect(result).toContain(TOOL_TIMEOUT_CAUSE_PREFIX);
+		expect(result).toContain("Stuck step: `sleep 999`");
+		expect(Date.now() - started).toBeGreaterThanOrEqual(900);
+		expect(Date.now() - started).toBeLessThan(6_000);
+	}, 15_000);
+});
+
 describe("self-recovery: announced-but-undone steps", () => {
 	const harnesses: Harness[] = [];
 	afterEach(() => {

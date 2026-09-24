@@ -205,6 +205,35 @@ describe("daemon-level stall notice to the parent session", () => {
 		expect(fixture.childSendCustomMessage).not.toHaveBeenCalled();
 	});
 
+	it("tells the parent the real kill deadline: none when warn-only, the sweep's when it is armed", () => {
+		const deliveredAbortAfterMs = (sweepEnabled: boolean): unknown => {
+			const fixture = makeFixture(() => [settledChildSnapshot("done")]);
+			const settings = fixture.child.runtime.session.settingsManager as unknown as Record<string, unknown>;
+			settings.getStallWatchdogSettings = () => ({
+				enabled: true,
+				warnAfterSeconds: 30,
+				abortAfterSeconds: 0,
+				toolLivenessExemption: true,
+			});
+			settings.getSubagentStallRecoverySettings = () => ({
+				enabled: sweepEnabled,
+				graceSeconds: 300,
+				maxPerSession: 3,
+			});
+			fixture.daemon.broadcastToSession(fixture.child, {
+				type: "session_event",
+				activeSessionId: "child-active",
+				event: stallWarning(45_000, 30_000),
+			});
+			const [notice] = fixture.parentSendCustomMessage.mock.calls[0]!;
+			return (notice.details as { abortAfterMs?: number }).abortAfterMs;
+		};
+		// Warn-only watchdog and no sweep: nothing kills the turn, so no deadline is claimed.
+		expect(deliveredAbortAfterMs(false)).toBeUndefined();
+		// The sweep acts after the warn threshold plus its grace window.
+		expect(deliveredAbortAfterMs(true)).toBe(330_000);
+	});
+
 	it("does not duplicate the notice while the parent tracks a live run for the child", () => {
 		for (const status of ["running", "queued"] as const) {
 			const fixture = makeFixture(() => [settledChildSnapshot(status)]);

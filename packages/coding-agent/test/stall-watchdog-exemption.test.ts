@@ -705,3 +705,43 @@ describe("StallWatchdog exemption budget charges exempt silence (P1)", () => {
 		expect(h.watchdog.exemption?.settledByMovementMs).toBeUndefined();
 	});
 });
+
+describe("StallWatchdog.isExcusedNow (live re-check for the daemon sweep)", () => {
+	it("keeps excusing a warn-only job that keeps moving at the sweep's cadence, where the stored record ages out", () => {
+		// Warn-only (abortAfterMs 0): no stage runs after the warning, so the stored exemption
+		// is charged by the wall clock alone (50min cap at a 5min warn). The sweep re-checks
+		// live on every pass, and each re-check settles the movement it sees.
+		let token = 0;
+		const moving = (): StallVouchFacts => ({
+			active: true,
+			tier: "progress",
+			reasons: ["live_bash_handles"],
+			movementToken: String(++token),
+		});
+		const unchecked = createHarness({ warnAfterMs: 5 * MINUTE_MS, abortAfterMs: 0, vouch: moving });
+		const swept = createHarness({ warnAfterMs: 5 * MINUTE_MS, abortAfterMs: 0, vouch: moving });
+		for (const h of [unchecked, swept]) {
+			h.watchdog.arm();
+			h.watchdog.touch();
+		}
+		for (let minute = 1; minute <= 60; minute++) {
+			unchecked.clock.advance(MINUTE_MS);
+			swept.clock.advance(MINUTE_MS);
+			expect(swept.watchdog.isExcusedNow()).toBe(true);
+		}
+		expect(unchecked.stageNames()).toEqual(["warn"]);
+		expect(unchecked.watchdog.exemption?.exhausted).toBe(true);
+		expect(swept.watchdog.exemption?.exhausted).toBe(false);
+	});
+
+	it("stops excusing once the evidence is gone, and never excuses a disarmed watchdog", () => {
+		const active = { value: true };
+		const h = createHarness({ warnAfterMs: 5 * MINUTE_MS, abortAfterMs: 0, vouch: progressVouch(active) });
+		expect(h.watchdog.isExcusedNow()).toBe(false);
+		h.watchdog.arm();
+		h.clock.advance(6 * MINUTE_MS);
+		expect(h.watchdog.isExcusedNow()).toBe(true);
+		active.value = false;
+		expect(h.watchdog.isExcusedNow()).toBe(false);
+	});
+});

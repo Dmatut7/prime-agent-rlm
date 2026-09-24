@@ -7763,9 +7763,15 @@ export class AgentDaemon {
 		);
 		const exemption = diagnostics?.exemption;
 		const workEvidence = exemption !== undefined && exemption.exhausted !== true ? [...exemption.reasons] : [];
-		// The deadline that matters is the child's own watchdog - the one that can abort
-		// this turn - so the notice describes the child's configuration, not the parent's.
-		const abortAfterMs = state.runtime.session.settingsManager.getStallWatchdogSettings().abortAfterSeconds * 1000;
+		// The deadline that matters is whichever can abort this child's turn first: its own
+		// watchdog's abort stage, or this daemon's stall-recovery sweep (the warn threshold
+		// plus the grace window) when that is enabled. It describes the child's
+		// configuration, not the parent's; with neither armed, nothing kills the turn.
+		const watchdogAbortMs = state.runtime.session.settingsManager.getStallWatchdogSettings().abortAfterSeconds * 1000;
+		const sweepPolicy = this.stallRecoveryPolicyFor(state);
+		const sweepAbortMs = sweepPolicy.enabled ? event.thresholdMs + sweepPolicy.windowMs : 0;
+		const armed = [watchdogAbortMs, sweepAbortMs].filter((ms) => ms > 0);
+		const abortAfterMs = armed.length > 0 ? Math.min(...armed) : 0;
 		const notice = createRlmChildStallNoticeMessage({
 			childId: rlmChildId,
 			sessionName: state.runtime.session.sessionName ?? state.activeSessionId,

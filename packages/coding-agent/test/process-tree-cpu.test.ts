@@ -84,6 +84,7 @@ describe("explicitTimeoutMs", () => {
 		[{ command: "timeout -k 5 10m ./job" }, 600_000],
 		[{ command: "pytest --timeout=300" }, 300_000],
 		[{ command: "ls", timeout: 120 }, 120_000],
+		[{ code: "snap = await rlm.collect(timeout_ms=600000)" }, 600_000],
 	])("reads %j", (args, ms) => {
 		expect(explicitTimeoutMs(args)).toBe(ms);
 	});

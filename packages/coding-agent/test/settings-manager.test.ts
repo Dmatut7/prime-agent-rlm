@@ -1220,15 +1220,41 @@ describe("SettingsManager", () => {
 			});
 
 			expect(manager.getSubagentStallRecoverySettings()).toEqual({
-				enabled: true,
+				enabled: false,
 				graceSeconds: 0,
 				maxPerSession: 0,
 			});
 			expect(manager.getRootStallRecoverySettings()).toEqual({
-				enabled: true,
+				enabled: false,
 				humanWindowSeconds: 0,
 				maxPerSession: 0,
 			});
+		});
+
+		it("keeps the automatic stall actions off unless the owner opted into silence kills", () => {
+			// Warn-only is the watchdog default because silence is normal for long work;
+			// the daemon sweep must not bring the kill back behind it.
+			const defaults = SettingsManager.inMemory({});
+			expect(defaults.getSubagentStallRecoverySettings().enabled).toBe(false);
+			expect(defaults.getRootStallRecoverySettings().enabled).toBe(false);
+
+			const abortStage = SettingsManager.inMemory({ stallWatchdog: { abortAfterSeconds: 600 } });
+			expect(abortStage.getSubagentStallRecoverySettings().enabled).toBe(true);
+			expect(abortStage.getRootStallRecoverySettings().enabled).toBe(true);
+
+			const explicit = SettingsManager.inMemory({
+				subagents: { stallRecovery: { enabled: true } },
+				stallWatchdog: { rootRecovery: { enabled: true } },
+			});
+			expect(explicit.getSubagentStallRecoverySettings().enabled).toBe(true);
+			expect(explicit.getRootStallRecoverySettings().enabled).toBe(true);
+
+			const explicitOff = SettingsManager.inMemory({
+				subagents: { stallRecovery: { enabled: false } },
+				stallWatchdog: { abortAfterSeconds: 600, rootRecovery: { enabled: false } },
+			});
+			expect(explicitOff.getSubagentStallRecoverySettings().enabled).toBe(false);
+			expect(explicitOff.getRootStallRecoverySettings().enabled).toBe(false);
 		});
 
 		it("round-trips an explicit 0 through the on-disk settings file", () => {

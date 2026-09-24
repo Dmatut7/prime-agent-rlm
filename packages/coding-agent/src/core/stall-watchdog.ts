@@ -533,6 +533,18 @@ export class StallWatchdog {
 		return this.evaluateExemption(now, false);
 	}
 
+	/**
+	 * Whether the current silence is excused right now, re-sampling the vouch the way a
+	 * timer fire does. The stored {@link exemption} is only as fresh as the last stage
+	 * check; in warn-only mode no stage runs after the warning, so a job that kept
+	 * producing would read as spent from wall-clock time alone.
+	 */
+	isExcusedNow(): boolean {
+		if (!this.active || this.state === "idle") return false;
+		const exemption = this.evaluateExemption(this.stepNow(), false);
+		return exemption !== undefined && !exemption.exhausted;
+	}
+
 	/** Exemption + kernel segment for a stall diagnostics payload. */
 	collectExemptionDiagnostics(): StallExemptionDiagnostics {
 		const kernel = this.lastKernelFacts ? normalizeStallKernelFacts(this.lastKernelFacts) : undefined;
