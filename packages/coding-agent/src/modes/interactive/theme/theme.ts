@@ -98,6 +98,20 @@ const ThemeJsonSchema = Type.Object({
 		thinkingXhigh: ColorValueSchema,
 		// Bash Mode (1 color)
 		bashMode: ColorValueSchema,
+		// Conversation layers (optional; fall back to the core colors above)
+		userLabel: Type.Optional(ColorValueSchema),
+		assistantLabel: Type.Optional(ColorValueSchema),
+		assistantGutter: Type.Optional(ColorValueSchema),
+		runCardBar: Type.Optional(ColorValueSchema),
+		runCardWarn: Type.Optional(ColorValueSchema),
+		systemNotice: Type.Optional(ColorValueSchema),
+		chipText: Type.Optional(ColorValueSchema),
+		toastText: Type.Optional(ColorValueSchema),
+		userBubbleBg: Type.Optional(ColorValueSchema),
+		runCardBg: Type.Optional(ColorValueSchema),
+		runCardWarnBg: Type.Optional(ColorValueSchema),
+		chipBg: Type.Optional(ColorValueSchema),
+		toastBg: Type.Optional(ColorValueSchema),
 	}),
 	export: Type.Optional(
 		Type.Object({
@@ -170,7 +184,15 @@ export type ThemeColor =
 	| "thinkingMedium"
 	| "thinkingHigh"
 	| "thinkingXhigh"
-	| "bashMode";
+	| "bashMode"
+	| "userLabel"
+	| "assistantLabel"
+	| "assistantGutter"
+	| "runCardBar"
+	| "runCardWarn"
+	| "systemNotice"
+	| "chipText"
+	| "toastText";
 
 export type ThemeBg =
 	| "selectedBg"
@@ -181,7 +203,12 @@ export type ThemeBg =
 	| "toolErrorBg"
 	| "toolDiffAddedBg"
 	| "toolDiffRemovedBg"
-	| "toolPanelBg";
+	| "toolPanelBg"
+	| "userBubbleBg"
+	| "runCardBg"
+	| "runCardWarnBg"
+	| "chipBg"
+	| "toastBg";
 
 type ColorMode = "truecolor" | "256color";
 
@@ -418,6 +445,11 @@ export class Theme {
 
 	getUserMessageBackgroundColor(): (str: string) => string {
 		return this.surfaceBackgroundColor("userMessageBg");
+	}
+
+	/** The user message bubble (v3 chat layers). */
+	getUserBubbleBackgroundColor(): (str: string) => string {
+		return this.surfaceBackgroundColor("userBubbleBg");
 	}
 
 	getPopupBackgroundColor(): (str: string) => string {
@@ -755,6 +787,23 @@ function loadThemeJson(name: string): ThemeJson {
 	return parseThemeJsonContent(name, content);
 }
 
+/** Optional conversation-layer colors and the core color each falls back to. */
+const CONVERSATION_LAYER_FALLBACKS: Record<string, string> = {
+	userLabel: "accent",
+	assistantLabel: "success",
+	assistantGutter: "borderMuted",
+	runCardBar: "accent",
+	runCardWarn: "warning",
+	systemNotice: "dim",
+	chipText: "accent",
+	toastText: "success",
+	userBubbleBg: "userMessageBg",
+	runCardBg: "customMessageBg",
+	runCardWarnBg: "customMessageBg",
+	chipBg: "selectedBg",
+	toastBg: "toolSuccessBg",
+};
+
 function createTheme(themeJson: ThemeJson, mode?: ColorMode, sourcePath?: string): Theme {
 	const colorMode = mode ?? detectColorMode();
 	const resolvedColors = resolveThemeColors(themeJson.colors, themeJson.vars);
@@ -770,7 +819,20 @@ function createTheme(themeJson: ThemeJson, mode?: ColorMode, sourcePath?: string
 		"toolDiffAddedBg",
 		"toolDiffRemovedBg",
 		"toolPanelBg",
+		"userBubbleBg",
+		"runCardBg",
+		"runCardWarnBg",
+		"chipBg",
+		"toastBg",
 	]);
+	// A theme written before the conversation layers existed still renders them:
+	// each missing layer color borrows the closest core color.
+	const layered = resolvedColors as Record<string, string | number | undefined>;
+	for (const [key, fallback] of Object.entries(CONVERSATION_LAYER_FALLBACKS)) {
+		if (layered[key] === undefined) {
+			layered[key] = layered[fallback] ?? "";
+		}
+	}
 	for (const [key, value] of Object.entries(resolvedColors)) {
 		if (bgColorKeys.has(key)) {
 			bgColors[key as ThemeBg] = value;

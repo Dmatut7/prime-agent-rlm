@@ -1,5 +1,5 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { Container, setKeybindings } from "@earendil-works/pi-tui";
+import { Container, StallActions, setKeybindings } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
@@ -137,7 +137,7 @@ describe("InteractiveMode stall action bar lifecycle", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("blind2-F6/blind3-7: a warn mounts the bar; agent_end tears it down with its input route", async () => {
+	it("blind2-F6/blind3-7: agent_end settles the bar: no interrupt left, the diagnostics key still works", async () => {
 		const mode = createModeFake();
 
 		await handleEvent.call(mode, stallWarning({ actions: armedActions(Date.now() + 120_000) }));
@@ -148,28 +148,48 @@ describe("InteractiveMode stall action bar lifecycle", () => {
 		expect(addInputListener).toHaveBeenCalledTimes(1);
 		expect(removeInputListener).not.toHaveBeenCalled();
 
-		// The run ends - no terminal stall stage fires (the default watchdog
-		// config never emits one; the daemon's recovery abort does not either):
-		// agent_end is the teardown the bar actually depends on.
+		// The run ends - no terminal stall stage fires. The bar can no longer
+		// interrupt the turn, but the stall's diagnostics are still worth a key:
+		// the quiet-step rule stops a silent call right as the warning fires, so
+		// removing the bar here made Ctrl+Y dead a moment after it was offered.
 		await handleEvent.call(mode, { type: "agent_end", messages: [] });
 
-		expect(mode.stallActionBar).toBeUndefined();
+		const settled = mode.stallActionBar as StallActions | undefined;
+		expect(settled).toBeInstanceOf(StallActions);
+		expect(settled).not.toBe(bar);
 		expect(chatOf(mode).children).not.toContain(bar);
-		expect(removeInputListener).toHaveBeenCalledTimes(1);
+		expect(chatOf(mode).children).toContain(settled);
+		const rendered = renderChat(chatOf(mode));
+		expect(rendered).toContain("现在已经接着往下走了");
+		expect(rendered).toContain("看诊断详情");
+		expect(rendered).not.toContain("中断这一轮");
+		expect(countdownLine(rendered)).toBeUndefined();
+
+		// Ctrl+Y on the settled bar shows the forensic lines and takes the bar down.
+		expect(settled?.handleInput("\x19")).toBe(true);
+		expect(mode.showError).toHaveBeenCalledTimes(1);
+		expect(mode.stallActionBar).toBeUndefined();
+		expect(chatOf(mode).children).not.toContain(settled);
 	});
 
-	it("blind3-7: turn_end mid-run tears the stale bar down too", async () => {
+	it("blind3-7: turn_end mid-run settles the stale bar too", async () => {
 		const mode = createModeFake();
 		// A stalled turn emits no turn_end, so a live bar at a turn_end means the
-		// warning's turn finished (recovered). The bar's promise and its captured
-		// diagnostics both belong to that finished turn.
+		// warning's turn went on (recovered). Its interrupt promise goes; its
+		// diagnostics stay one key away.
 		await handleEvent.call(mode, stallWarning({ actions: armedActions(Date.now() + 120_000) }));
-		expect(mode.stallActionBar).toBeDefined();
+		const bar = mode.stallActionBar;
+		expect(bar).toBeDefined();
 
 		await handleEvent.call(mode, { type: "turn_end", message: fauxAssistantMessage("recovered"), toolResults: [] });
 
-		expect(mode.stallActionBar).toBeUndefined();
-		expect(removeInputListener).toHaveBeenCalledTimes(1);
+		expect(mode.stallActionBar).toBeDefined();
+		expect(mode.stallActionBar).not.toBe(bar);
+		expect(renderChat(chatOf(mode))).not.toContain("中断这一轮");
+		// Settling twice (turn_end, then agent_end) keeps the one settled bar.
+		const settled = mode.stallActionBar;
+		await handleEvent.call(mode, { type: "agent_end", messages: [] });
+		expect(mode.stallActionBar).toBe(settled);
 	});
 
 	it("the teardown is not a latch: the next warn re-mounts a fresh bar and re-registers the route", async () => {
@@ -179,22 +199,24 @@ describe("InteractiveMode stall action bar lifecycle", () => {
 		expect(firstBar).toBeDefined();
 
 		await handleEvent.call(mode, { type: "agent_end", messages: [] });
-		expect(mode.stallActionBar).toBeUndefined();
+		const settled = mode.stallActionBar;
+		expect(settled).toBeDefined();
 
-		// A stale bar must not linger, but a NEW turn that warns again must get
-		// a NEW bar: teardown-on-turn-end is recovery, not disarming.
+		// A NEW turn that warns again must get a NEW live bar: settling on turn
+		// end is recovery, not disarming.
 		await handleEvent.call(mode, stallWarning({ silentMs: 420_000 }));
 
 		const secondBar = mode.stallActionBar;
 		expect(secondBar).toBeDefined();
 		expect(secondBar).not.toBe(firstBar);
+		expect(secondBar).not.toBe(settled);
 		expect(chatOf(mode).children).toContain(secondBar);
 		expect(chatOf(mode).children).not.toContain(firstBar);
-		expect(addInputListener).toHaveBeenCalledTimes(2);
-		expect(removeInputListener).toHaveBeenCalledTimes(1);
+		expect(chatOf(mode).children).not.toContain(settled);
 		// The mounted bar is the NEW event's, not the torn-down one's: the
 		// summary line carries this warning's own silence reading.
 		expect(renderChat(chatOf(mode))).toContain("已经 7 分钟没有动静");
+		expect(renderChat(chatOf(mode))).toContain("中断这一轮");
 	});
 
 	it("F3: the daemon-armed deadline reaches the bar as a static countdown line", async () => {

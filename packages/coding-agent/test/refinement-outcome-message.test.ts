@@ -70,38 +70,41 @@ describe("RefinementOutcomeMessageComponent", () => {
 		setKeybindings(new KeybindingsManager());
 	});
 
-	test("collapses to a labeled one-liner and expands through the shared tool toggle", () => {
+	test("collapses to one centered notice naming the entry and expands through the shared tool toggle", () => {
 		const message = createRefinementOutcomeMessage(result());
 		const component = new RefinementOutcomeMessageComponent(message);
 
+		// v3: a faint centered system line - the entry's own title, not the
+		// summary's wording - with the key that opens the diff.
 		const collapsed = rendered(component);
-		expect(collapsed).toContain("[沉淀]");
-		expect(collapsed).toContain("Added local guidance to make conversational responses rhyme.");
-		expect(collapsed).toContain("已应用 1 处修改");
-		// U6: no per-line expand hint — the global tail line owns the keys.
-		expect(collapsed).not.toContain("Ctrl+");
+		const lines = collapsed.split("\n").filter((line) => line.trim());
+		expect(lines).toHaveLength(1);
+		expect(lines[0]?.trim()).toBe("·  ✦ memory updated  Rhyme response guidance  ·  Ctrl+O diff  ·");
+		expect(collapsed).not.toContain("[沉淀]");
 		expect(collapsed).not.toContain("Created local prompt");
 		expect(collapsed).not.toContain('Make conversational responses rhyme."');
 
 		component.setExpanded(true);
 		const expanded = rendered(component);
+		expect(expanded).toContain("Added local guidance to make conversational responses rhyme.");
 		expect(expanded).toContain("Created local prompt `rhyme-response-guidance`");
 		expect(expanded).toContain('"content": "Make conversational responses rhyme."');
 		expect(expanded).toContain('"path": "prompts/rhyme-response-guidance.md"');
 	});
 
-	test("truncates the collapsed summary so the line never wraps", () => {
+	test("truncates the collapsed notice so the line never wraps", () => {
 		const long = result();
-		long.summary =
-			"Created local memory entries for the verifiers project context and running subagent tracking, plus a reusable subagent spec for parallel codebase exploration.";
+		const title =
+			"Local memory entries for the verifiers project context and running subagent tracking, plus a subagent spec";
+		const after = entry({ title });
+		long.appliedEdits = [{ ...long.appliedEdits[0]!, title, after }];
 		const component = new RefinementOutcomeMessageComponent(createRefinementOutcomeMessage(long));
 
 		const lines = component.render(80).map((line) => stripAnsi(line));
 		const content = lines.filter((line) => line.trim().length > 0);
-		expect(content).toHaveLength(2);
-		expect(content[1]).toContain("…");
-		expect(content[1]).toContain("已应用 1 处修改");
-		expect(content[1]).not.toContain("Ctrl+");
+		expect(content).toHaveLength(1);
+		expect(content[0]).toContain("✦ memory updated");
+		expect(content[0]).toContain("…");
 		for (const line of lines) {
 			expect(visibleWidth(line)).toBeLessThanOrEqual(80);
 		}

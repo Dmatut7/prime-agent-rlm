@@ -14,6 +14,7 @@ type EffortCommandContext = {
 	agentConnection: { setThinkingLevel: (level: ThinkingLevel) => Promise<void> };
 	footer: { invalidate: () => void };
 	showStatus: (message: string) => void;
+	showToast: (text: string) => void;
 	showError: (message: string) => void;
 	patchConnectionState: (patch: Record<string, unknown>) => void;
 	updateEditorBorderColor: () => void;
@@ -69,6 +70,7 @@ type FastCommandContext = {
 	footer: { invalidate: () => void };
 	subagentSummaryLine: { invalidate: () => void };
 	showStatus: (message: string) => void;
+	showToast: (text: string) => void;
 	showError: (message: string) => void;
 	patchConnectionState: (patch: Record<string, unknown>) => void;
 	getCurrentModel: () => Model<Api> | undefined;
@@ -105,6 +107,7 @@ function makeFastContext(model: Model<Api> = testModel("openai-codex", "gpt-5.5"
 		footer: { invalidate: vi.fn() },
 		subagentSummaryLine: { invalidate: vi.fn() },
 		showStatus: vi.fn(),
+		showToast: vi.fn(),
 		showError: vi.fn(),
 		patchConnectionState: vi.fn((patch: Record<string, unknown>) => {
 			context.connectionState = { ...context.connectionState, ...patch } as FastCommandContext["connectionState"];
@@ -133,6 +136,7 @@ function makeContext(overrides: Partial<EffortCommandContext> = {}): EffortComma
 		agentConnection: { setThinkingLevel: vi.fn(async () => {}) },
 		footer: { invalidate: vi.fn() },
 		showStatus: vi.fn(),
+		showToast: vi.fn(),
 		showError: vi.fn(),
 		patchConnectionState: vi.fn(),
 		updateEditorBorderColor: vi.fn(),
@@ -184,7 +188,7 @@ describe("InteractiveMode /effort", () => {
 			const context = makeContext({ agentConnection: { setThinkingLevel } });
 
 			interactiveModePrototype.handleEffortCommand.call(context, "high");
-			await vi.waitFor(() => expect(context.showStatus).toHaveBeenCalledWith("推理强度：high"));
+			await vi.waitFor(() => expect(context.showToast).toHaveBeenCalledWith("thinking high"));
 
 			expect(setThinkingLevel).toHaveBeenCalledWith("high");
 			expect(context.patchConnectionState).toHaveBeenCalledWith({ thinkingLevel: "high" });
@@ -438,7 +442,7 @@ describe("InteractiveMode /effort", () => {
 			const context = makeFastContext();
 
 			fastInteractiveModePrototype.handleFastCommand.call(context);
-			await vi.waitFor(() => expect(context.showStatus).toHaveBeenCalledWith("快速模式：开"));
+			await vi.waitFor(() => expect(context.showToast).toHaveBeenCalledWith("fast on"));
 
 			expect(context.agentConnection.setServiceTier).toHaveBeenCalledWith("priority");
 			expect(context.patchConnectionState).toHaveBeenCalledWith({ serviceTier: "priority" });
@@ -450,7 +454,7 @@ describe("InteractiveMode /effort", () => {
 			context.connectionState = { sessionId: "session-1", serviceTier: "priority", thinkingLevel: "high" };
 
 			fastInteractiveModePrototype.handleFastCommand.call(context);
-			await vi.waitFor(() => expect(context.showStatus).toHaveBeenCalledWith("快速模式：关"));
+			await vi.waitFor(() => expect(context.showToast).toHaveBeenCalledWith("fast off"));
 
 			expect(context.agentConnection.setServiceTier).toHaveBeenCalledWith("default");
 			expect(context.patchConnectionState).toHaveBeenCalledWith({ serviceTier: "default" });
@@ -477,7 +481,7 @@ describe("InteractiveMode /effort", () => {
 			);
 
 			fastInteractiveModePrototype.handleFastCommand.call(context);
-			await vi.waitFor(() => expect(context.showStatus).toHaveBeenCalledWith("快速模式：关"));
+			await vi.waitFor(() => expect(context.showToast).toHaveBeenCalledWith("fast off"));
 
 			expect(context.agentConnection.setServiceTier).toHaveBeenCalledWith("priority");
 			expect(context.patchConnectionState).toHaveBeenCalledWith({ serviceTier: "default" });

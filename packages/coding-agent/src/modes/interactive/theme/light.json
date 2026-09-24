@@ -80,7 +80,20 @@
 		"thinkingHigh": "#875f87",
 		"thinkingXhigh": "#8b008b",
 
-		"bashMode": "green"
+		"bashMode": "green",
+		"userLabel": "#5b47c8",
+		"assistantLabel": "#1e8a74",
+		"assistantGutter": "#b5ddd4",
+		"runCardBar": "#6e5bd1",
+		"runCardWarn": "#b36b00",
+		"systemNotice": "#7a9b93",
+		"chipText": "#4b3aa8",
+		"toastText": "#1e7a52",
+		"userBubbleBg": "#ece8fb",
+		"runCardBg": "#f1eefb",
+		"runCardWarnBg": "#fbf1df",
+		"chipBg": "#e3ddfb",
+		"toastBg": "#ddf3e8"
 	},
 	"export": {
 		"pageBg": "#f8f8f8",

@@ -28,6 +28,7 @@ import {
 	type RlmChildTerminalNoticeDetails,
 } from "../../../core/messages.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
+import { SystemNoticeLine } from "./system-notice.js";
 
 type InjectedPromptDetails =
 	| AutoContinueMessageDetails
@@ -93,7 +94,7 @@ function compactHeartbeatSchedule(schedule: string | undefined): string {
 	if (!trimmed) {
 		return "prompt";
 	}
-	return trimmed.replace(/^every\s+/i, "");
+	return trimmed.replace(/^(?:every\s+|每\s*)/i, "");
 }
 
 function heartbeatPromptSchedule(schedule: string | undefined): string {
@@ -131,8 +132,16 @@ export class InjectedPromptMessageComponent extends Container {
 
 	private updateDisplay(): void {
 		this.content.clear();
+		const toggle = () => this.setExpanded(!this.expanded);
+		// v3: a routine notice is one centered faint line while collapsed. A child
+		// failure keeps its loud header: it is the parent's only sign a child died.
+		const notice = this.expanded ? undefined : this.noticeParts();
+		if (notice) {
+			this.content.addChild(new Clickable(new SystemNoticeLine(notice.label, notice.detail), toggle));
+			return;
+		}
 		this.header.setText(this.headerText());
-		this.content.addChild(new Clickable(this.header, () => this.setExpanded(!this.expanded)));
+		this.content.addChild(new Clickable(this.header, toggle));
 		if (this.expanded && this.message.customType !== IPYTHON_STATE_RESTORED_CUSTOM_TYPE) {
 			this.content.addChild(
 				new Markdown(readCustomText(this.message), 1, 0, this.markdownTheme, {
@@ -140,6 +149,47 @@ export class InjectedPromptMessageComponent extends Container {
 				}),
 			);
 			return;
+		}
+	}
+
+	/** The collapsed one-liner of a routine notice; undefined for a failure (loud header). */
+	private noticeParts(): { label: string; detail: string } | undefined {
+		switch (this.message.customType) {
+			case AUTO_CONTINUE_CUSTOM_TYPE: {
+				const details = this.message.details as AutoContinueMessageDetails | undefined;
+				if (details?.reason === "child_reply_missing") {
+					return { label: "↻ auto-continue", detail: "提醒把结果发给父代理" };
+				}
+				const detail = details?.excerpt ? `刚才说要「${collapseText(details.excerpt)}」` : "上一步没做完";
+				return { label: "↻ auto-continue", detail };
+			}
+			case HEARTBEAT_PROMPT_CUSTOM_TYPE: {
+				const details = this.message.details as HeartbeatPromptDetails | undefined;
+				return { label: "♥ heartbeat", detail: heartbeatPromptSchedule(details?.schedule) };
+			}
+			case IPYTHON_STATE_RESTORED_CUSTOM_TYPE: {
+				const details = this.message.details as IpythonStateRestoredDetails | undefined;
+				return {
+					label: details?.restored === false ? "◆ new python kernel" : "◆ python kernel restored",
+					detail: "",
+				};
+			}
+			case RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE:
+				return { label: "◇ subagent still running", detail: "" };
+			case PYTHON_SKILLS_UNAVAILABLE_CUSTOM_TYPE: {
+				const details = this.message.details as PythonSkillsUnavailableDetails | undefined;
+				return { label: "⚠ python skills unavailable", detail: details?.skills?.join(", ") ?? "" };
+			}
+			case RLM_CHILD_FAILURE_CUSTOM_TYPE:
+			case RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE:
+				return rlmChildFailureLabel(this.message) ? undefined : { label: "◇ subagent status", detail: "" };
+			default: {
+				const goal = this.message.details as GoalContextDetails | undefined;
+				return {
+					label: `◎ ${goalLabel(goal)}`,
+					detail: goal?.objective ? collapseText(goal.objective) : "",
+				};
+			}
 		}
 	}
 
@@ -156,7 +206,7 @@ export class InjectedPromptMessageComponent extends Container {
 		}
 		if (this.message.customType === IPYTHON_STATE_RESTORED_CUSTOM_TYPE) {
 			const details = this.message.details as IpythonStateRestoredDetails | undefined;
-			const label = details?.restored === false ? "已启动新的 Python 内核" : "已恢复 Python 内核状态";
+			const label = details?.restored === false ? "new python kernel" : "python kernel restored";
 			return `${theme.fg("accent", "◆")} ${theme.fg("muted", label)}`;
 		}
 		if (this.message.customType === RLM_CHILD_STALL_NOTICE_CUSTOM_TYPE) {
@@ -193,7 +243,7 @@ export class InjectedPromptMessageComponent extends Container {
 		const details = this.message.details as HeartbeatPromptDetails | undefined;
 		const pulse = theme.fg("error", "♥");
 		const schedule = theme.fg("muted", heartbeatPromptSchedule(details?.schedule));
-		return `${pulse} ${theme.fg("muted", "定时任务")}${theme.fg("dim", " · ")}${schedule}`;
+		return `${pulse} ${theme.fg("muted", "heartbeat")}${theme.fg("dim", " · ")}${schedule}`;
 	}
 
 	private metaText(): string {

@@ -12,7 +12,7 @@ import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
 /** Reference turn: 1m05s, 14 steps, 7 thinking segments measured at 6.2s, 2 comms. */
 const reference = { steps: 14, thinkSegments: 7, commMessages: 2, durationMs: 65_000, thinkingMs: 6_200 };
-const STATS = "Thinking 6.2s · 14 步 · 共 1m05s · 通讯 2 条";
+const STATS = "Thinking 6.2s · 14 steps · 1m05s · 2 msgs";
 
 function render(props: TurnFootNoteProps): string[] {
 	return new TurnFootNote(props).render(200).map((line) => stripAnsi(line));
@@ -52,10 +52,10 @@ describe("turn footnote (process line)", () => {
 
 	it("omits zero-value segments instead of rendering zero counts", () => {
 		expect(renderLine({ steps: 14, thinkSegments: 0, commMessages: 0, durationMs: 14_800, cols: 120 })).toBe(
-			" 14 步 · 共 14.8s",
+			" 14 steps · 14.8s",
 		);
 		expect(renderLine({ steps: 0, thinkSegments: 7, commMessages: 2, durationMs: 3_200, cols: 120 })).toBe(
-			" 3.2s · 通讯 2 条",
+			" 3.2s · 2 msgs",
 		);
 		expect(renderLine({ steps: 0, thinkSegments: 3, commMessages: 0, durationMs: 3_200, cols: 120 })).toBe(
 			" Thinking 3.2s",
@@ -79,7 +79,7 @@ describe("turn footnote (process line)", () => {
 	it("truncates the summary with an ellipsis and drops it below 12 columns", () => {
 		const summary = "运行 npm run check · 读取 src/modes/interactive/components/footer.ts";
 		const base = { steps: 2, thinkSegments: 0, commMessages: 0, durationMs: 1_000, summary, caret: "▸" };
-		const stats = " ▸ 2 步 · 共 1.0s";
+		const stats = " ▸ 2 steps · 1.0s";
 		const statsWidth = visibleWidth(stats);
 		// Exactly 12 columns of summary room: it renders, truncated.
 		const fit = renderLine({ ...base, cols: statsWidth + 3 + 12 });
@@ -133,7 +133,7 @@ describe("turn footnote (process line)", () => {
 		const note = new TurnFootNote({ ...reference, cols: 120 });
 		expect(stripAnsi(note.render(120)[0] ?? "")).toBe(` ${STATS}`);
 		note.update({ ...reference, steps: 3, cols: 120 });
-		expect(stripAnsi(note.render(120)[0] ?? "")).toBe(" Thinking 6.2s · 3 步 · 共 1m05s · 通讯 2 条");
+		expect(stripAnsi(note.render(120)[0] ?? "")).toBe(" Thinking 6.2s · 3 steps · 1m05s · 2 msgs");
 		note.update({ ...reference, cols: 0 });
 		const line = stripAnsi(note.render(8)[0] ?? "");
 		expect(visibleWidth(line)).toBeLessThanOrEqual(8);
@@ -147,8 +147,8 @@ describe("turn footnote (process line)", () => {
 		expect(regions).toHaveLength(3);
 		const expected = [
 			{ text: "Thinking 6.2s", segment: "think" },
-			{ text: "14 步", segment: "steps" },
-			{ text: "通讯 2 条", segment: "comm" },
+			{ text: "14 steps", segment: "steps" },
+			{ text: "2 msgs", segment: "comm" },
 		];
 		for (const [index, entry] of expected.entries()) {
 			const region = regions[index];
@@ -217,17 +217,17 @@ describe("turn footnote (process line)", () => {
 
 	it("names thinking only when it was measured, and an answer-only turn by its thinking time", () => {
 		expect(renderLine({ steps: 2, thinkSegments: 1, commMessages: 0, durationMs: 4_000, cols: 120 })).toBe(
-			" 2 步 · 共 4.0s",
+			" 2 steps · 4.0s",
 		);
 		expect(
 			renderLine({ steps: 2, thinkSegments: 1, commMessages: 0, durationMs: 4_000, thinkingMs: 20, cols: 120 }),
-		).toBe(" 2 步 · 共 4.0s");
+		).toBe(" 2 steps · 4.0s");
 		expect(
 			renderLine({ steps: 2, thinkSegments: 0, commMessages: 0, durationMs: 4_000, thinkingMs: 900, cols: 120 }),
-		).toBe(" 2 步 · 共 4.0s");
+		).toBe(" 2 steps · 4.0s");
 		expect(
 			renderLine({ steps: 2, thinkSegments: 1, commMessages: 0, durationMs: 4_000, thinkingMs: 900, cols: 120 }),
-		).toBe(" Thinking 0.9s · 2 步 · 共 4.0s");
+		).toBe(" Thinking 0.9s · 2 steps · 4.0s");
 		expect(
 			renderLine({ steps: 0, thinkSegments: 1, commMessages: 0, durationMs: 4_000, thinkingMs: 1_500, cols: 120 }),
 		).toBe(" Thinking 1.5s");

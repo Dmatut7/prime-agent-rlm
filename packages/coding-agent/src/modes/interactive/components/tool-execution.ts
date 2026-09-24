@@ -379,7 +379,10 @@ export class ToolExecutionComponent extends Container implements FocusableBlock 
 		// screen, exactly as pre-U4; a running block also stays live even with
 		// a partial result.
 		if (state.isCollapsed) {
-			return state.isStepDone(this.toolCallId);
+			// v3: in a quiet live turn the running card names the current step, so
+			// its own row stays folded too until Ctrl+O opens the list.
+			const liveInCard = quietConversationBudget() && !state.isTurnEnded && !state.isStepSettled(this.toolCallId);
+			return state.isStepDone(this.toolCallId) || liveInCard;
 		}
 		return false;
 	}

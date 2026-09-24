@@ -157,8 +157,27 @@ export class AssistantMessageComponent extends Container implements FocusableBlo
 	}
 
 	override render(width: number): string[] {
-		const lines = this.renderMessage(width);
+		// v3: a quiet turn's answer runs down the AI gutter under its `◆ prime`
+		// header. The body keeps its own one-column padding, so the rail takes
+		// exactly one column.
+		const gutter = this.quiet && width > 8;
+		const body = this.renderMessage(gutter ? width - 1 : width);
+		const lines = gutter ? this.withGutter(body) : body;
 		return this.blockFocus && lines.length > 0 ? decorateFocusedBlock(lines, width, this.blockFocus) : lines;
+	}
+
+	private gutterSource?: string[];
+	private gutterLines?: string[];
+
+	/** Memoized against the body array's identity, like the OSC markers below. */
+	private withGutter(body: string[]): string[] {
+		if (this.gutterSource === body && this.gutterLines) {
+			return this.gutterLines;
+		}
+		const rail = theme.fg("assistantGutter", "│");
+		this.gutterSource = body;
+		this.gutterLines = body.map((line) => `${rail}${line}`);
+		return this.gutterLines;
 	}
 
 	setBlockFocus(state: BlockFocusState | undefined): void {

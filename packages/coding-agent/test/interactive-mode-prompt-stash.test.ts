@@ -40,6 +40,7 @@ type PromptStashHarness = {
 	promptStashState: PromptStashState;
 	editor: FakeEditor;
 	showStatus: Mock;
+	showToast: Mock;
 	clearShortcutGuide: Mock;
 };
 
@@ -182,6 +183,7 @@ function createPromptStashHarness(
 			pasteSnapshot: options.pasteSnapshot,
 		}),
 		showStatus: vi.fn(),
+		showToast: vi.fn(),
 		clearShortcutGuide: vi.fn(),
 	};
 	Object.setPrototypeOf(harness, InteractiveMode.prototype);
@@ -234,6 +236,7 @@ function createSharedPromptStashHarness(
 		pendingPromptStashReleases: [],
 		editor: createEditor(options),
 		showStatus: vi.fn(),
+		showToast: vi.fn(),
 		clearShortcutGuide: vi.fn(),
 		pastedImages: new Map(options.pastedImages),
 		nextImageMarkerId: 1,
@@ -355,23 +358,18 @@ describe("InteractiveMode prompt stash", () => {
 		expect(reopenedMode.promptStashState.stash).toBeUndefined();
 	});
 
-	it("lands the on-open restore notice in a fresh status block", () => {
+	it("confirms the on-open restore in the footer, leaving the last status line alone", () => {
 		const store = new ClientPromptStashStore();
 		const mode = createSharedPromptStashHarness(store, "session-a", { text: "draft" });
 		interactiveModeMethods.stashDraftForAgentsView.call(mode);
 
 		const reopenedMode = createSharedPromptStashHarness(store, "session-a");
-		// init() may have just posted a status (e.g. a compaction notice); showStatus
-		// replaces the anchored last status, so the restore must drop the anchor first.
-		const priorStatus = { setText: vi.fn() };
-		(reopenedMode as { lastStatusText?: unknown }).lastStatusText = priorStatus;
-		(reopenedMode as { lastStatusSpacer?: unknown }).lastStatusSpacer = { spacer: true };
 		interactiveModeMethods.restorePromptStashOnOpen.call(reopenedMode);
 
 		expect(reopenedMode.editor.getText()).toBe("draft");
-		expect((reopenedMode as { lastStatusText?: unknown }).lastStatusText).toBeUndefined();
-		expect((reopenedMode as { lastStatusSpacer?: unknown }).lastStatusSpacer).toBeUndefined();
-		expect(priorStatus.setText).not.toHaveBeenCalled();
+		expect(reopenedMode.showToast).toHaveBeenCalledWith("✓ draft restored");
+		// A notice about the user's own action never lands in the conversation.
+		expect(reopenedMode.showStatus).not.toHaveBeenCalled();
 	});
 
 	it("queues an existing manual stash behind the agents-view auto-stash", () => {
@@ -449,7 +447,7 @@ describe("InteractiveMode prompt stash", () => {
 			pasteSnapshot,
 		});
 		expect(mode.editor.getText()).toBe("");
-		expect(mode.showStatus).toHaveBeenCalledWith("已暂存输入");
+		expect(mode.showToast).toHaveBeenCalledWith("✓ stashed");
 
 		interactiveModeMethods.restorePromptStashIfEditorEmpty.call(mode);
 
@@ -485,7 +483,7 @@ describe("InteractiveMode prompt stash", () => {
 
 		expect(mode.promptStash).toBeUndefined();
 		expect(mode.editor.getText()).toBe("half-written draft");
-		expect(mode.showStatus).toHaveBeenCalledWith("已恢复暂存的输入");
+		expect(mode.showToast).toHaveBeenCalledWith("✓ draft restored");
 	});
 
 	it("does not restore an older captured stash after a newer stash is created", () => {
@@ -499,7 +497,7 @@ describe("InteractiveMode prompt stash", () => {
 		expect(restored).toBe(false);
 		expect(mode.promptStash).toBe(newerStash);
 		expect(mode.editor.getText()).toBe("");
-		expect(mode.showStatus).not.toHaveBeenCalledWith("已恢复暂存的输入");
+		expect(mode.showToast).not.toHaveBeenCalled();
 	});
 
 	it("restores both rich lifecycle-retained drafts in submission order", () => {

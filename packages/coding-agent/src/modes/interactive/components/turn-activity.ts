@@ -1,11 +1,16 @@
 import { type ClickRegion, type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { theme } from "../theme/theme.js";
+import { getSpinnerTick } from "../theme/working-icon.js";
 import { type BlockFocusState, decorateFocusedBlock, type FocusableBlock } from "./block-focus.js";
 import type { FileChangeSummary } from "./edit-summary.js";
+import { ASSISTANT_GUTTER_WIDTH, assistantGutter, renderAssistantHeader, renderRunningCard } from "./running-card.js";
 import { turnStepsSummary } from "./step-label.js";
 import { TurnFootNote } from "./turn-footnote.js";
 
 export type TurnStepStatus = "queued" | "running" | "done" | "error";
+
+/** What the model is doing between tool steps. */
+export type TurnPhase = "waiting" | "thinking" | "writing";
 
 export interface TurnStep {
 	toolCallId: string;
@@ -71,10 +76,64 @@ export class TurnActivityState {
 
 	constructor(startedAt = Date.now()) {
 		this.startedAt = startedAt;
+		this.phaseSince = startedAt;
+		this.lastActivityAt = startedAt;
 	}
 
 	/** Set on the live run's turn: its clock ticks until agent_end stamps it. */
 	live = false;
+
+	/** The model answering this turn (`glm-5.3-prime`), for the `◆ prime` header. */
+	modelId: string | undefined;
+
+	private phase: TurnPhase = "waiting";
+	private phaseSince: number;
+	private lastActivityAt: number;
+	private readonly stepStartedAt = new Map<string, number>();
+	private currentThinkingText = "";
+
+	/**
+	 * What the model itself is doing between steps: waiting for the reply to
+	 * start, thinking, or writing. A change restarts the phase clock; any call
+	 * counts as fresh output for the quiet-step warning.
+	 */
+	notePhase(phase: TurnPhase, now = Date.now()): void {
+		if (phase !== this.phase) {
+			this.phase = phase;
+			this.phaseSince = now;
+		}
+		this.lastActivityAt = now;
+	}
+
+	/** Something new came out (a tool update, a stream delta): the quiet clock restarts. */
+	noteActivity(now = Date.now()): void {
+		this.lastActivityAt = now;
+	}
+
+	get currentPhase(): TurnPhase {
+		return this.phase;
+	}
+
+	get phaseStartedAt(): number {
+		return this.phaseSince;
+	}
+
+	get lastActivity(): number {
+		return this.lastActivityAt;
+	}
+
+	/** When the step started running (undefined until it does). */
+	stepStartTime(toolCallId: string): number | undefined {
+		return this.stepStartedAt.get(toolCallId);
+	}
+
+	/** The thinking trace streaming right now (the latest, unlike {@link latestThinking}). */
+	get currentThinking(): string {
+		return this.currentThinkingText;
+	}
+	set currentThinking(text: string) {
+		if (text) this.currentThinkingText = text;
+	}
 
 	private previewThinking = "";
 	/**
@@ -286,7 +345,7 @@ export class TurnActivityState {
 	 * freezes on its last settled step, a thinking-only turn on the
 	 * turn-end stamp.
 	 */
-	turnDurationMs(): number {
+	turnDurationMs(now = Date.now()): number {
 		// A running turn's clock keeps ticking; a settled tool turn freezes on its
 		// last settled step, a thinking-only turn on the turn-end stamp.
 		// A live turn keeps ticking between steps too (the model thinks there);
@@ -296,12 +355,12 @@ export class TurnActivityState {
 		// a replayed one freezes on its last settled step (its end stamp is the
 		// next prompt's time, which includes idle).
 		const end = running
-			? Date.now()
+			? now
 			: this.live && this.turnEndedAt !== undefined
 				? this.turnEndedAt
 				: this.steps.length > 0
-					? (this.lastSettledAt ?? this.turnEndedAt ?? Date.now())
-					: (this.turnEndedAt ?? Date.now());
+					? (this.lastSettledAt ?? this.turnEndedAt ?? now)
+					: (this.turnEndedAt ?? now);
 		return Math.max(0, end - this.startedAt);
 	}
 
@@ -315,6 +374,12 @@ export class TurnActivityState {
 	}
 
 	setStepStatus(toolCallId: string, status: TurnStepStatus, timestamp = Date.now()): void {
+		if (status === "running" && !this.stepStartedAt.has(toolCallId)) {
+			this.stepStartedAt.set(toolCallId, timestamp);
+		}
+		if (status !== "queued") {
+			this.lastActivityAt = Math.max(this.lastActivityAt, timestamp);
+		}
 		let settledNow = false;
 		for (let i = 0; i < this.steps.length; i++) {
 			const step = this.steps[i];
@@ -328,6 +393,9 @@ export class TurnActivityState {
 		}
 		if (settledNow) {
 			this.lastSettledAt = Math.max(this.lastSettledAt ?? 0, timestamp);
+			// The wait for the model's reply starts when the step hands back, not
+			// when the model asked for the step.
+			if (this.phase === "waiting") this.phaseSince = Math.max(this.phaseSince, timestamp);
 		}
 	}
 
@@ -437,10 +505,41 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 	 * quiet face renders the footnote lines at offset zero, so the regions
 	 * pass through unchanged. */
 	getClickRegions(): ReadonlyArray<ClickRegion> {
-		if (!this.quiet || !this.footnote) {
+		if (!this.quiet) {
 			return [];
 		}
-		return this.footnote.getClickRegions();
+		// v3: the `◆ prime` header opens or closes the turn's process; the
+		// footnote's own regions sit one row down, after the gutter.
+		const header: ClickRegion = {
+			line: 0,
+			col: 0,
+			width: 9,
+			height: 1,
+			onClick: () => this.toggleAllBlocks(),
+		};
+		if (!this.turnState.isTurnEnded || !this.footnote) {
+			return [header];
+		}
+		return [
+			header,
+			...this.footnote.getClickRegions().map((region) => ({
+				...region,
+				line: region.line + 1,
+				col: region.col + ASSISTANT_GUTTER_WIDTH,
+			})),
+		];
+	}
+
+	/** Any block open -> all closed; all closed -> the process block open. */
+	private toggleAllBlocks(): void {
+		const anyOpen =
+			this.turnState.thinkingBlockExpanded ||
+			this.turnState.processBlockExpanded ||
+			this.turnState.commsBlockExpanded;
+		this.turnState.thinkingExpanded = false;
+		this.turnState.agentMessagesExpanded = false;
+		this.turnState.setCollapsed(anyOpen);
+		this.invalidate();
 	}
 
 	/** TUI v4: switch this turn head between the footnote and the legacy two lines. */
@@ -550,17 +649,22 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 				}
 				this.invalidate();
 			},
-			onCaretClick: () => {
-				const anyOpen =
-					this.turnState.thinkingBlockExpanded ||
-					this.turnState.processBlockExpanded ||
-					this.turnState.commsBlockExpanded;
-				this.turnState.thinkingExpanded = false;
-				this.turnState.agentMessagesExpanded = false;
-				this.turnState.setCollapsed(anyOpen); // any open -> all closed; all closed -> all open
-				this.invalidate();
-			},
+			onCaretClick: () => this.toggleAllBlocks(),
 		});
+		const live = !this.turnState.isTurnEnded;
+		const header = renderAssistantHeader({
+			...(this.turnState.modelId ? { modelId: this.turnState.modelId } : {}),
+			durationMs: this.turnState.turnDurationMs(),
+			live,
+			tick: getSpinnerTick(),
+			width: safeWidth,
+		});
+		// v3: a live turn is the running card under the header - what the AI is
+		// doing now; the step list stays one Ctrl+O away, exactly as before.
+		if (live) {
+			return [header, ...renderRunningCard(this.turnState, safeWidth, getSpinnerTick())];
+		}
+		const bodyWidth = Math.max(1, safeWidth - ASSISTANT_GUTTER_WIDTH);
 		const steps = new Set(this.turnState.steps.map((step) => step.toolCallId)).size;
 		const thinkSegments = this.turnState.totalThinkingSegments;
 		const commMessages = this.turnState.commMessageCount;
@@ -574,10 +678,9 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 			thinkSegments: effectiveThinkSegments,
 			commMessages,
 			durationMs: this.turnState.turnDurationMs(),
-			cols: safeWidth,
-			// While running, the live step rows below already say what runs.
-			summary: this.turnState.isTurnEnded ? turnStepsSummary(this.turnState.steps) : undefined,
-			running: !this.turnState.isTurnEnded,
+			cols: bodyWidth,
+			summary: turnStepsSummary(this.turnState.steps),
+			headerCarriesDuration: true,
 			thinkingMs: this.turnState.thinkingDurationMs(),
 			// The preview stands in for the trace; with the trace open (Ctrl+T) it would repeat it.
 			thinkingPreview:
@@ -589,7 +692,6 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 			// P3-2: the caret glyph — ▸ while every detail block is collapsed,
 			// ▾ once any of the three blocks is open (the wiring owns the state).
 			caret:
-				!this.turnState.isTurnEnded ||
 				this.turnState.thinkingBlockExpanded ||
 				this.turnState.processBlockExpanded ||
 				// The comms lane opens nothing in a turn without comms.
@@ -597,7 +699,8 @@ export class TurnSummaryComponent implements Component, FocusableBlock {
 					? "▾"
 					: "▸",
 		});
-		return this.footnote.render(safeWidth);
+		const gutter = assistantGutter();
+		return [header, ...this.footnote.render(bodyWidth).map((line) => `${gutter}${line}`)];
 	}
 
 	/**

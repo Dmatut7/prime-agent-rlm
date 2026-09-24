@@ -120,6 +120,7 @@ export function buildConversationComponents(
 			const state = ensureTurn(Number(message.timestamp) || Date.now());
 			state.addThinkingSegments(countThinkingSegments(message));
 			state.latestThinking = latestThinkingText(message) || state.latestThinking;
+			state.modelId = message.model || state.modelId;
 			if (!turnSummary) {
 				turnSummary = new TurnSummaryComponent(state);
 				turnSummary.setExpanded(expanded);
@@ -266,7 +267,14 @@ export function buildConversationComponents(
 			// An image-only prompt has no text; show a placeholder rather than dropping it.
 			const display = text || (hasContent ? "[image]" : "");
 			if (display) {
-				components.push(new UserMessageComponent(display, options.markdownTheme, options.isRecognizedSlashCommand));
+				components.push(
+					new UserMessageComponent(
+						display,
+						options.markdownTheme,
+						options.isRecognizedSlashCommand,
+						Number(message.timestamp) || undefined,
+					),
+				);
 			}
 		}
 		// Non-conversational messages (bash/branch-summary/compaction/other custom) aren't shown.

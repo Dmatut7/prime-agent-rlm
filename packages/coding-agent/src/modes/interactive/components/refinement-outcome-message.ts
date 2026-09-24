@@ -1,10 +1,12 @@
-import { Clickable, type Component, Spacer, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Clickable, Spacer, Text } from "@earendil-works/pi-tui";
 import type { RefinementOutcomeMessage } from "../../../core/messages.js";
 import type { AppliedRefinementEdit, HarnessEntry } from "../../../core/refinement/refinement.js";
 import { generateDiffString } from "../../../core/tools/edit-diff.js";
 import { theme } from "../theme/theme.js";
 import { renderDiff } from "./diff.js";
 import { customMessageLabel, ExpandableCustomMessageBox } from "./expandable-custom-message.js";
+import { keyText } from "./keybinding-hints.js";
+import { SystemNoticeLine } from "./system-notice.js";
 
 function editableEntry(entry: HarnessEntry): Record<string, unknown> {
 	return {
@@ -57,32 +59,18 @@ function editCount(edits: AppliedRefinementEdit[]): string {
 	return edits.length === applied ? `已应用 ${applied} 处修改` : `已应用 ${applied}/${edits.length} 处修改`;
 }
 
-/** Width-aware collapsed line: truncates the summary so the line never wraps. */
-class CollapsedOutcomeLine implements Component {
-	private cachedWidth?: number;
-	private cachedLines?: string[];
-
-	constructor(
-		private readonly summary: string,
-		private readonly suffix: string,
-	) {}
-
-	render(width: number): string[] {
-		if (this.cachedLines && this.cachedWidth === width) {
-			return this.cachedLines;
-		}
-		const room = Math.max(20, width - visibleWidth(this.suffix) - 1);
-		const line = `${theme.fg("customMessageText", truncateToWidth(this.summary, room, "…"))} ${this.suffix}`;
-		const lines = [truncateToWidth(line, Math.max(1, width), "")];
-		this.cachedWidth = width;
-		this.cachedLines = lines;
-		return lines;
+/**
+ * What the collapsed notice says changed: the entries' own titles (`百轮评估进度`),
+ * joined, when every edit has one; otherwise the refinement's summary.
+ */
+function memoryNoticeDetail(summary: string, edits: readonly AppliedRefinementEdit[]): string {
+	const titles = edits.map((edit) => (edit.after?.title ?? edit.title ?? edit.before?.title)?.trim());
+	const named = titles.filter((title): title is string => Boolean(title));
+	const count = edits.length > 1 ? ` · ${edits.length} 条` : "";
+	if (named.length > 0 && named.length === edits.length) {
+		return `${[...new Set(named)].join("、")}${count}`;
 	}
-
-	invalidate(): void {
-		this.cachedWidth = undefined;
-		this.cachedLines = undefined;
-	}
+	return `${summary.replace(/\s+/g, " ").trim()}${count}`;
 }
 
 /** Durable refinement outcome card: per-edit rows with before/after diffs when expanded. */
@@ -97,15 +85,25 @@ export class RefinementOutcomeMessageComponent extends ExpandableCustomMessageBo
 
 		const { summary, edits, scope } = this.message.details;
 		const toggle = () => this.setExpanded(!this.expanded);
-		this.addChild(new Clickable(new Text(customMessageLabel("沉淀"), 0, 0), toggle));
-		this.addChild(new Spacer(1));
+		// Collapsed it is a plain notice line, not a card: no tinted block around it.
+		this.setBgFn(this.expanded ? (text) => theme.bg("customMessageBg", text) : undefined);
 		if (!this.expanded) {
-			// U6: no per-line expand hint — the global tail line states the keys.
-			const suffix = theme.fg("customMessageText", `· ${editCount(edits)}`);
-			this.addChild(new Clickable(new CollapsedOutcomeLine(summary, suffix), toggle));
+			// v3: one centered faint line. The entries' own titles name what changed in
+			// plain words; the summary (the model's note, which may carry its shorthand)
+			// is the fallback.
+			const failed = edits.some((edit) => !edit.applied);
+			const hintKey = keyText("app.tools.expand", { primaryOnly: true });
+			const line = new SystemNoticeLine(
+				failed ? "✦ memory update partly failed" : "✦ memory updated",
+				memoryNoticeDetail(summary, edits),
+				hintKey ? `${hintKey} diff` : "",
+			);
+			this.addChild(new Clickable(line, toggle));
 			return;
 		}
 
+		this.addChild(new Clickable(new Text(customMessageLabel("memory"), 0, 0), toggle));
+		this.addChild(new Spacer(1));
 		this.addChild(new Text(theme.fg("customMessageText", `${summary} · ${editCount(edits)}`), 0, 0));
 		for (const edit of edits) {
 			this.addChild(new Text(`${theme.fg("dim", "  ╰─ ")}${editLabel(edit, scope)}`, 0, 0));

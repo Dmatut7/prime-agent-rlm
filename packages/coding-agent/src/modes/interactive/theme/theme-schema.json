@@ -3,7 +3,10 @@
 	"title": "Pi Coding Agent Theme",
 	"description": "Theme schema for Pi coding agent",
 	"type": "object",
-	"required": ["name", "colors"],
+	"required": [
+		"name",
+		"colors"
+	],
 	"properties": {
 		"$schema": {
 			"type": "string",
@@ -311,6 +314,58 @@
 				"bashMode": {
 					"$ref": "#/$defs/colorValue",
 					"description": "Editor border color in bash mode"
+				},
+				"userLabel": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Label on the user message bubble (`you`) (optional)"
+				},
+				"assistantLabel": {
+					"$ref": "#/$defs/colorValue",
+					"description": "The `◆ prime` header of an assistant turn (optional)"
+				},
+				"assistantGutter": {
+					"$ref": "#/$defs/colorValue",
+					"description": "The gutter rail beside an assistant turn's lines (optional)"
+				},
+				"runCardBar": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Left bar and spinner of the live running card (optional)"
+				},
+				"runCardWarn": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Running card accent once the step has been quiet for over a minute (optional)"
+				},
+				"systemNotice": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Centered one-line system notices (optional)"
+				},
+				"chipText": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Text of the footer running chip (optional)"
+				},
+				"toastText": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Text of the footer transient notice chip (optional)"
+				},
+				"userBubbleBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Background of the user message bubble (optional)"
+				},
+				"runCardBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Background of the live running card (optional)"
+				},
+				"runCardWarnBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Background of the running card once quiet for over a minute (optional)"
+				},
+				"chipBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Background of the footer running chip (optional)"
+				},
+				"toastBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Background of the footer transient notice chip (optional)"
 				}
 			},
 			"additionalProperties": false

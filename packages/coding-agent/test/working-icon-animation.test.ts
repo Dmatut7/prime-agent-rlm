@@ -2,7 +2,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { IPythonCellComponent } from "../src/modes/interactive/components/ipython-cell.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 import {
-	setWorkingPulseFrame,
+	setWorkingPulseTick,
 	WORKING_ICON_FRAMES,
 	workingIconFrame,
 } from "../src/modes/interactive/theme/working-icon.js";
@@ -28,9 +28,10 @@ describe("IPythonCellComponent running marker", () => {
 
 	it("animates the marker while running and stays static once done", () => {
 		const running = new IPythonCellComponent({ code: "print(1)", executionStarted: true, isPartial: true });
-		setWorkingPulseFrame(0);
+		// The ticker counts 100ms spinner ticks; the marker moves every 250ms.
+		setWorkingPulseTick(0);
 		const frame0 = stripAnsi(running.render(80).join("\n"));
-		setWorkingPulseFrame(1);
+		setWorkingPulseTick(3);
 		const frame1 = stripAnsi(running.render(80).join("\n"));
 		expect(frame0).toContain(workingIconFrame(0));
 		expect(frame1).toContain(workingIconFrame(1));
@@ -42,9 +43,9 @@ describe("IPythonCellComponent running marker", () => {
 			isPartial: false,
 			details: { status: "ok", result: "1" },
 		});
-		setWorkingPulseFrame(0);
+		setWorkingPulseTick(0);
 		const doneFrame0 = stripAnsi(done.render(80).join("\n"));
-		setWorkingPulseFrame(1);
+		setWorkingPulseTick(3);
 		const doneFrame1 = stripAnsi(done.render(80).join("\n"));
 		expect(doneFrame0).toBe(doneFrame1);
 		expect(doneFrame0).toContain("✓");

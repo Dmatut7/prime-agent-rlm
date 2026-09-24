@@ -493,16 +493,15 @@ describe("ENG-4482 heartbeat injected prompt UI", () => {
 		const component = new InjectedPromptMessageComponent(createHeartbeatPromptMessage(createHeartbeat()));
 		const collapsed = render(component);
 
-		expect(collapsed).toContain("♥");
-		expect(collapsed).toContain("定时任务");
-		expect(collapsed).toContain("每 5m");
+		// v3: one faint centered notice line while collapsed.
+		expect(collapsed.trim()).toBe("·  ♥ heartbeat  每 5m  ·");
 		// U6: no per-line expand hint — the global tail line owns the keys.
 		expect(collapsed).not.toContain("展开");
 		expect(collapsed).not.toContain("Check whether the long-running task needs another step.");
 
 		component.setExpanded(true);
 		const expanded = render(component);
-		expect(expanded).toContain("定时任务");
+		expect(expanded).toContain("♥ heartbeat · 每 5m");
 		expect(expanded).toContain("Check whether the long-running task needs another step.");
 	});
 
@@ -577,8 +576,7 @@ describe("ENG-4482 heartbeat injected prompt UI", () => {
 			});
 
 			const rendered = stripAnsi(chatContainer.render(120).join("\n"));
-			expect(rendered).toContain("定时任务");
-			expect(rendered).toContain("每 5m");
+			expect(rendered).toContain("♥ heartbeat  每 5m");
 			expect(rendered).not.toContain("Check whether the long-running task needs another step.");
 			expect(addToHistory).not.toHaveBeenCalled();
 		},

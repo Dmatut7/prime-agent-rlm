@@ -1,9 +1,9 @@
 import {
-	Box,
 	type Component,
 	Container,
 	type MarkdownTheme,
 	type TableCellSelectionRegion,
+	truncateToWidth,
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
@@ -61,33 +61,80 @@ class HighlightedText implements Component {
 	}
 }
 
-/** The user's turn marker: an accent `›` on the first line, a matching indent on the rest. */
-class MarkedLines implements Component {
-	constructor(private readonly child: HighlightedText) {}
+/** How far the bubble sits in from the left: like the other side of a chat, less on narrow screens. */
+export function userBubbleIndent(width: number): number {
+	if (width >= 100) return 8;
+	if (width >= 70) return 4;
+	return width >= 30 ? 2 : 0;
+}
+
+/** Columns of padding inside the bubble, left and right. */
+const BUBBLE_PAD = 2;
+
+/** `20:14`: when the message was sent. */
+function sentAtText(sentAt: number | undefined): string {
+	if (sentAt === undefined || !Number.isFinite(sentAt)) return "";
+	const date = new Date(sentAt);
+	return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+}
+
+/**
+ * v3 chat layers: the user's words in a tinted bubble set in from the left,
+ * with a `you` label and the send time on top - so a screen of text shows at
+ * a glance which lines are the user's.
+ */
+class UserBubble implements Component {
+	private lastIndent = 0;
+	private cachedWidth?: number;
+	private cachedLines?: string[];
+
+	constructor(
+		private readonly child: HighlightedText,
+		private readonly sentAt: number | undefined,
+	) {}
 
 	render(width: number): string[] {
-		const marker = ` ${theme.fg("accent", "›")} `;
-		const indent = "   ";
-		const lines = this.child.render(Math.max(1, width - visibleWidth(indent)));
-		return lines.map((line, index) => `${index === 0 ? marker : indent}${line}`);
+		if (this.cachedLines && this.cachedWidth === width) {
+			return this.cachedLines;
+		}
+		const indent = userBubbleIndent(width);
+		this.lastIndent = indent;
+		const bubbleWidth = Math.max(1, width - indent);
+		const innerWidth = Math.max(1, bubbleWidth - BUBBLE_PAD * 2);
+		const paint = theme.getUserBubbleBackgroundColor();
+		const lead = " ".repeat(indent);
+		const pad = " ".repeat(BUBBLE_PAD);
+		const row = (content: string): string => {
+			const body = truncateToWidth(`${pad}${content}`, bubbleWidth, "");
+			return lead + paint(body + " ".repeat(Math.max(0, bubbleWidth - visibleWidth(body))));
+		};
+		const time = sentAtText(this.sentAt);
+		const header = `${theme.bold(theme.fg("userLabel", "you"))}${time ? theme.fg("dim", `  ${time}`) : ""}`;
+		this.cachedWidth = width;
+		this.cachedLines = [row(header), ...this.child.render(innerWidth).map((line) => row(line)), row("")];
+		return this.cachedLines;
 	}
 
 	getSelectionRegions(): ReadonlyArray<TableCellSelectionRegion> {
+		// The text sits one row under the label, after the indent and the padding.
+		const shift = this.lastIndent + BUBBLE_PAD;
 		return this.child.getSelectionRegions().map((region) => ({
 			...region,
-			col: region.col + 3,
-			tableLeft: region.tableLeft + 3,
-			tableRight: region.tableRight + 3,
+			line: region.line + 1,
+			col: region.col + shift,
+			tableLeft: region.tableLeft + shift,
+			tableRight: region.tableRight + shift,
 		}));
 	}
 
 	invalidate(): void {
+		this.cachedWidth = undefined;
+		this.cachedLines = undefined;
 		this.child.invalidate();
 	}
 }
 
 export class UserMessageComponent extends Container implements FocusableBlock {
-	private contentBox: Box;
 	private decoratedSource?: string[];
 	private decoratedLines?: string[];
 	private blockFocus?: BlockFocusState;
@@ -96,15 +143,14 @@ export class UserMessageComponent extends Container implements FocusableBlock {
 		private readonly text: string,
 		_markdownTheme: MarkdownTheme = getMarkdownTheme(),
 		isRecognizedSlashCommand: (name: string) => boolean = () => false,
+		sentAt?: number,
 	) {
 		super();
 		const command = parseSlashCommand(text);
 		const commandEnd = command && isRecognizedSlashCommand(command.name) ? command.name.length + 1 : 0;
 		const includeBareSeparator =
 			command !== undefined && commandEnd > 0 && builtinSlashCommandTakesArgument(command.name);
-		this.contentBox = new Box(0, 1, (content: string) => theme.getUserMessageBackgroundColor()(content));
-		this.contentBox.addChild(new MarkedLines(new HighlightedText(text, commandEnd, includeBareSeparator)));
-		this.addChild(this.contentBox);
+		this.addChild(new UserBubble(new HighlightedText(text, commandEnd, includeBareSeparator), sentAt));
 	}
 
 	override render(width: number): string[] {

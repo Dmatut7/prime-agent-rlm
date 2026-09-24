@@ -60,6 +60,8 @@ export interface TurnFootNoteProps {
 	onSegmentClick?: (segment: TurnFootNoteSegment) => void;
 	/** Optional caret-click handler - the caret glyph's own click lane. */
 	onCaretClick?: () => void;
+	/** The `◆ prime` header above already shows the turn's total time: drop it from the stats. */
+	headerCarriesDuration?: boolean;
 }
 
 /** The footnote's clickable stats segments. */
@@ -209,8 +211,11 @@ export class TurnFootNote implements Component {
 		const thinkingMs = this.props.thinkingMs;
 		if (steps <= 0 && commMessages <= 0) {
 			// An answer-only turn: its whole span is the model thinking and writing.
+			// With the header showing the turn's time, only a measured thinking
+			// time is new information.
+			const ms = this.props.headerCarriesDuration ? thinkingMs : (thinkingMs ?? durationMs);
 			segments.push({
-				text: `Thinking ${turnFootNoteDurationText(thinkingMs ?? durationMs)}`,
+				text: ms === undefined ? "Thinking" : `Thinking ${turnFootNoteDurationText(ms)}`,
 				clickTarget: "think",
 			});
 			return segments;
@@ -219,14 +224,15 @@ export class TurnFootNote implements Component {
 			segments.push({ text: `Thinking ${turnFootNoteDurationText(thinkingMs)}`, clickTarget: "think" });
 		}
 		if (steps > 0) {
-			segments.push({ text: `${steps} 步`, clickTarget: "steps" });
+			segments.push({ text: `${steps} ${steps === 1 ? "step" : "steps"}`, clickTarget: "steps" });
 		}
-		// The last figure is the turn's total, not more thinking time.
-		segments.push({
-			text: steps > 0 ? `共 ${turnFootNoteDurationText(durationMs)}` : turnFootNoteDurationText(durationMs),
-		});
+		// The last figure is the turn's total, not more thinking time - unless the
+		// header above already shows it.
+		if (!this.props.headerCarriesDuration) {
+			segments.push({ text: turnFootNoteDurationText(durationMs) });
+		}
 		if (commMessages > 0) {
-			segments.push({ text: `通讯 ${commMessages} 条`, clickTarget: "comm" });
+			segments.push({ text: `${commMessages} ${commMessages === 1 ? "msg" : "msgs"}`, clickTarget: "comm" });
 		}
 		return segments;
 	}

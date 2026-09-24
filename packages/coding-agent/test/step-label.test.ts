@@ -166,7 +166,7 @@ describe("shell and helper labels (QA M3)", () => {
 	it("keeps a quiet chain's lead and skips it before an informative command", () => {
 		expect(cell("%%bash\nsleep 8 && echo ok")).toBe("运行 sleep 8 → echo ok");
 		expect(cell("%%bash\nsleep 8 && npm test")).toBe("运行 npm test");
-		expect(cell("%%bash\ncd packages && ls")).toBe("列目录 .");
+		expect(cell("%%bash\ncd packages && ls")).toBe("列目录 当前目录");
 	});
 
 	it("names kernel helper calls", () => {

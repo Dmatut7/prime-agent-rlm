@@ -169,10 +169,16 @@ export function describeShellCommand(command: string): string {
 		}
 		case "ls":
 		case "tree":
-			return `列目录 ${pathTail(args.at(-1) ?? ".")}`;
+			return `列目录 ${dirTail(args.filter((arg) => !arg.startsWith("-")).at(-1) ?? ".")}`;
 		case "find":
-		case "fd":
-			return `查找 ${pathTail(args[0] ?? ".")}`;
+		case "fd": {
+			// What it looks for reads better than where: `查找 *.ts`, never a bare `查找 .`.
+			const nameAt = words.findIndex((word) => word === "-name" || word === "-iname");
+			const name = nameAt >= 0 ? words[nameAt + 1] : tool === "fd" ? args[0] : undefined;
+			if (name) return `查找 ${name}`;
+			const where = args[0];
+			return where && where !== "." && where !== "./" ? `查找 ${pathTail(where)} 里的文件` : "查找文件";
+		}
 		case "cat":
 		case "head":
 		case "tail":
@@ -285,7 +291,7 @@ function pythonEffects(code: string): string[] {
 	}
 	for (const pattern of [PYTHON_LIST_DIR_PATTERN, PYTHON_PATH_LIST_PATTERN]) {
 		for (const match of code.matchAll(pattern)) {
-			push(match.index, `列目录 ${pathTail(match[1] || ".")}`);
+			push(match.index, `列目录 ${dirTail(match[1] || ".")}`);
 		}
 	}
 	const labels: string[] = [];
@@ -305,6 +311,12 @@ function pythonEffects(code: string): string[] {
 function pathTail(path: string): string {
 	const parts = path.split("/").filter((part) => part.length > 0);
 	return parts[parts.length - 1] ?? path;
+}
+
+/** A listed directory's name; the working directory reads `当前目录`, never a bare `.`. */
+function dirTail(path: string): string {
+	const tail = pathTail(path);
+	return tail === "." || tail === "./" || tail === "" ? "当前目录" : tail;
 }
 
 /**
@@ -426,7 +438,7 @@ function rawStepLabel(step: StepLabelInput): string {
 			return pattern ? `搜索 ${pattern}` : "搜索";
 		}
 		case "ls":
-			return path ? `列目录 ${pathTail(path)}` : "列目录";
+			return path ? `列目录 ${dirTail(path)}` : "列目录";
 		default:
 			return step.toolName;
 	}

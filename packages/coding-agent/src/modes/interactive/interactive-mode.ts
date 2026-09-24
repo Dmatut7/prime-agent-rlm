@@ -341,12 +341,7 @@ import {
 	type ThemeColor,
 	theme,
 } from "./theme/theme.js";
-import {
-	getWorkingPulseFrame,
-	setWorkingPulseFrame,
-	WORKING_ICON_INTERVAL_MS,
-	workingIconFrame,
-} from "./theme/working-icon.js";
+import { getSpinnerTick, SPINNER_INTERVAL_MS, setWorkingPulseTick, spinnerFrame } from "./theme/working-icon.js";
 
 interface Expandable {
 	setExpanded(expanded: boolean): void;
@@ -422,6 +417,8 @@ interface SharedContextTree {
 
 /** The prompt's placeholder while a turn runs: Enter steers the running turn. */
 const WORKING_PROMPT_PLACEHOLDER = "随时补充或纠正，Enter 发给 AI";
+/** How long a transient footer notice (`✓ copied`) stays lit. */
+const FOOTER_TOAST_MS = 2000;
 
 export const START_HINTS = [
 	"描述任务，@ 引用文件，/ 看命令",
@@ -1266,6 +1263,10 @@ export class InteractiveMode {
 	 * outlive the turn it speaks for.
 	 */
 	private stallActionBar: StallActions | undefined;
+	/** The stall event the live bar was mounted for (its diagnostics outlive the stall). */
+	private stallActionBarEvent: (StallEventView & { actions?: StallEventActions }) | undefined;
+	/** The live bar is the settled one (the turn went on; diagnostics only). */
+	private stallActionBarSettled = false;
 	/** B1: the stall bar's input route, registered once and unregistered on teardown. */
 	private removeStallActionInputListener: (() => void) | undefined = undefined;
 	/**
@@ -1563,13 +1564,25 @@ export class InteractiveMode {
 		// The status line carries the run's liveness: `● 运行中 12s` (an
 		// extension's own working message wins over the plain label).
 		this.footer.setActivitySource(() => {
-			const started = this.workingStartedAt;
-			if (!this.loadingAnimation || started === undefined || this.settingsManager.getProcessMode() !== "quiet") {
-				return undefined;
+			// v3: a transient notice (`✓ copied`) lights up for a moment as a green
+			// chip; the running turn is an accent chip with the spinner.
+			const chips: string[] = [];
+			const toast = this.footerToast;
+			if (toast && toast.until > Date.now()) {
+				chips.push(theme.bg("toastBg", theme.fg("toastText", ` ${toast.text} `)));
 			}
-			const label = this.workingMessage ?? "运行中";
-			const spinner = theme.fg("accent", workingIconFrame(getWorkingPulseFrame()));
-			return `${spinner} ${theme.fg("muted", `${label} ${this.formatWorkingElapsed(Date.now() - started)}`)}`;
+			const started = this.workingStartedAt;
+			if (this.loadingAnimation && started !== undefined && this.settingsManager.getProcessMode() === "quiet") {
+				const label = this.workingMessage ?? "working";
+				const elapsed = this.formatWorkingElapsed(Date.now() - started);
+				chips.push(
+					theme.bg(
+						"chipBg",
+						`${theme.fg("chipText", ` ${spinnerFrame(getSpinnerTick())} `)}${theme.fg("chipText", `${label} ${elapsed} `)}`,
+					),
+				);
+			}
+			return chips.length > 0 ? chips.join(" ") : undefined;
 		});
 		this.footer.setLocationSource(() => ({
 			cwd: this.getCurrentCwd(),
@@ -4042,14 +4055,16 @@ export class InteractiveMode {
 			return;
 		}
 		if (!this.pulseTimer) {
-			this.pulseTimer = setInterval(() => this.tickWorkingPulse(), WORKING_ICON_INTERVAL_MS);
+			// One ticker for both animations: the braille spinner advances every tick,
+			// the ◇◈◆ markers derive their slower frame from the same count.
+			this.pulseTimer = setInterval(() => this.tickWorkingPulse(), SPINNER_INTERVAL_MS);
 			this.pulseTimer.unref?.();
 		}
 	}
 
 	private tickWorkingPulse(): void {
 		this.pulseFrame += 1;
-		setWorkingPulseFrame(this.pulseFrame);
+		setWorkingPulseTick(this.pulseFrame);
 		this.ui.requestRender();
 	}
 
@@ -4939,10 +4954,6 @@ export class InteractiveMode {
 
 	private restorePromptStashOnOpen(): void {
 		if (!this.promptStash?.restoreOnOpen) return;
-		// Land the restore notice in its own status block: init may have just posted
-		// a notice (e.g. compaction) that showStatus would otherwise replace.
-		this.lastStatusText = undefined;
-		this.lastStatusSpacer = undefined;
 		this.restorePromptStashIfEditorEmpty();
 	}
 
@@ -4972,7 +4983,7 @@ export class InteractiveMode {
 		}
 		this.promptStash = this.snapshotPromptStash(text);
 		this.editor.setText("");
-		this.showStatus("已暂存输入");
+		this.showToast("✓ stashed");
 	}
 
 	private restorePromptStashIfEditorEmpty(stash = this.promptStash): boolean {
@@ -4991,7 +5002,7 @@ export class InteractiveMode {
 			this.editor.restorePasteSnapshot(stash.pasteSnapshot);
 		}
 		this.latestEditorPromptStash = this.snapshotPromptStash(this.editor.getText());
-		this.showStatus("已恢复暂存的输入");
+		this.showToast("✓ draft restored");
 		return true;
 	}
 
@@ -6298,6 +6309,12 @@ export class InteractiveMode {
 					// before the first streaming assistant component.
 					this.ensureCurrentTurnSummary();
 					this.currentTurnState?.setLiveThinkingSegments(countThinkingSegments(event.message));
+					if (this.currentTurnState) {
+						// v3: the header names the model; until the first token arrives the
+						// card says it is waiting for the reply.
+						this.currentTurnState.modelId = event.message.model || this.currentTurnState.modelId;
+						this.currentTurnState.notePhase("waiting");
+					}
 					this.startAssistantStreamingMessage(event.message);
 					this.ui.requestRender();
 				}
@@ -6315,8 +6332,19 @@ export class InteractiveMode {
 						} else if (kind === "thinking_end" || kind === "text_start" || kind === "toolcall_start") {
 							this.currentTurnState.noteThinking(false);
 						}
-						this.currentTurnState.latestThinking =
-							latestThinkingText(event.message) || this.currentTurnState.latestThinking;
+						// v3: the running card names the model's phase.
+						if (kind === "thinking_start" || kind === "thinking_delta") {
+							this.currentTurnState.notePhase("thinking");
+						} else if (kind === "text_start" || kind === "text_delta") {
+							this.currentTurnState.notePhase("writing");
+						} else if (kind === "toolcall_start" || kind === "toolcall_delta") {
+							this.currentTurnState.notePhase("waiting");
+						} else {
+							this.currentTurnState.noteActivity();
+						}
+						const thinking = latestThinkingText(event.message);
+						this.currentTurnState.latestThinking = thinking || this.currentTurnState.latestThinking;
+						this.currentTurnState.currentThinking = thinking;
 					}
 
 					for (const content of this.streamingMessage.content) {
@@ -6339,6 +6367,7 @@ export class InteractiveMode {
 						this.currentTurnState.addThinkingSegments(countThinkingSegments(event.message));
 						this.currentTurnState.setLiveThinkingSegments(0);
 						this.currentTurnState.noteThinking(false);
+						this.currentTurnState.notePhase("waiting");
 					}
 					this.streamingMessage = event.message;
 					let errorMessage: string | undefined;
@@ -6414,6 +6443,8 @@ export class InteractiveMode {
 			}
 
 			case "tool_execution_update": {
+				// Fresh output: the running card's quiet clock restarts.
+				this.currentTurnState?.noteActivity();
 				const component = this.pendingTools.get(event.toolCallId);
 				if (component) {
 					component.updateResult({ ...event.partialResult, isError: false }, true);
@@ -6464,7 +6495,8 @@ export class InteractiveMode {
 				// with the turn - the same reasoning as agent_end below (blind3 7 / the
 				// joint fix draft's N4, which takes both teardown points). The next
 				// turn that stalls mounts a fresh bar: teardown is not a latch.
-				this.removeStallActionBar();
+				// v3: it settles instead of vanishing, so its diagnostics key keeps working.
+				this.settleStallActionBar();
 				break;
 
 			case "agent_end":
@@ -6493,7 +6525,8 @@ export class InteractiveMode {
 				// the bar actually depends on (blind2 F6 / blind3 7). The bar's
 				// input route goes with it. A render is already requested at the
 				// end of this case, so the teardown skips its own.
-				this.removeStallActionBar({ render: false });
+				// v3: settled, not removed - the diagnostics key keeps working.
+				this.settleStallActionBar({ render: false });
 				this.flushPendingBashComponents();
 				this.resetPendingToolState();
 				this.renderRecap();
@@ -7458,6 +7491,26 @@ export class InteractiveMode {
 		);
 	}
 
+	/** The transient footer notice and when it goes out. */
+	private footerToast: { text: string; until: number } | undefined;
+	private footerToastTimer: ReturnType<typeof setTimeout> | undefined;
+
+	/**
+	 * A notice that only confirms what the user just did (`✓ copied`): it lights
+	 * up in the footer for two seconds and never lands in the conversation.
+	 */
+	private showToast(text: string): void {
+		this.footerToast = { text, until: Date.now() + FOOTER_TOAST_MS };
+		if (this.footerToastTimer) clearTimeout(this.footerToastTimer);
+		this.footerToastTimer = setTimeout(() => {
+			this.footerToastTimer = undefined;
+			this.footerToast = undefined;
+			this.ui.requestRender();
+		}, FOOTER_TOAST_MS);
+		this.footerToastTimer.unref?.();
+		this.ui.requestRender();
+	}
+
 	/**
 	 * Show a status message in the chat.
 	 *
@@ -7487,7 +7540,7 @@ export class InteractiveMode {
 	private async copyFullscreenSelection(text: string): Promise<void> {
 		try {
 			await copyToClipboard(text);
-			this.showStatus("已复制选中内容");
+			this.showToast("✓ copied");
 		} catch (error) {
 			this.showError(`复制失败：${error instanceof Error ? error.message : String(error)}`);
 		}
@@ -7502,8 +7555,11 @@ export class InteractiveMode {
 			this.chatContainer.addChild(new Spacer(1));
 		}
 		this.chatContainer.addChild(
-			new UserMessageComponent(text, this.getMarkdownThemeWithSettings(), (name) =>
-				this.isRecognizedSlashCommand(name),
+			new UserMessageComponent(
+				text,
+				this.getMarkdownThemeWithSettings(),
+				(name) => this.isRecognizedSlashCommand(name),
+				Date.now(),
 			),
 		);
 	}
@@ -7634,6 +7690,7 @@ export class InteractiveMode {
 								skillBlock.userMessage,
 								this.getMarkdownThemeWithSettings(),
 								(name) => this.isRecognizedSlashCommand(name),
+								Number(message.timestamp) || undefined,
 							);
 							this.chatContainer.addChild(userComponent);
 						}
@@ -7642,6 +7699,7 @@ export class InteractiveMode {
 							textContent,
 							this.getMarkdownThemeWithSettings(),
 							(name) => this.isRecognizedSlashCommand(name),
+							Number(message.timestamp) || undefined,
 						);
 						this.chatContainer.addChild(userComponent);
 					}
@@ -7810,6 +7868,7 @@ export class InteractiveMode {
 					replayTurnSummary.setQuiet(replayQuiet);
 					this.chatContainer.addChild(replayTurnSummary);
 				}
+				replayTurnState.modelId = message.model || replayTurnState.modelId;
 				replayTurnState.addThinkingSegments(countThinkingSegments(message));
 				replayTurnState.latestThinking = latestThinkingText(message) || replayTurnState.latestThinking;
 				this.addMessageToChat(message);
@@ -8281,7 +8340,8 @@ export class InteractiveMode {
 		const bar = new StallActions(
 			{
 				...event,
-				summary: formatStallSummary(event),
+				// Amber like the running card it belongs to (quiet past a minute already).
+				summary: theme.bold(theme.fg("runCardWarn", formatStallSummary(event))),
 				actions: {
 					...view,
 					...(daemonActions?.autoRecoveryArmed === true
@@ -8312,6 +8372,7 @@ export class InteractiveMode {
 			},
 		);
 		this.stallActionBar = bar;
+		this.stallActionBarEvent = event;
 		this.chatContainer.addChild(bar);
 		if (this.removeStallActionInputListener === undefined) {
 			this.removeStallActionInputListener = this.ui.addInputListener(this.stallActionInputRoute);
@@ -8320,8 +8381,48 @@ export class InteractiveMode {
 		return true;
 	}
 
+	/**
+	 * The stalled turn went on (turn_end / agent_end): the bar can no longer
+	 * interrupt it, but its diagnostics are still what the user may want to
+	 * read. The quiet-step rule stops a silent call right as the warning fires,
+	 * so tearing the bar down there made Ctrl+Y land on the editor (yank) a
+	 * fraction of a second after the bar promised it. The bar stays, says the
+	 * turn went on, and keeps only the diagnostics key; any other key
+	 * dismisses it as before.
+	 */
+	private settleStallActionBar(options: { render?: boolean } = {}): void {
+		const bar = this.stallActionBar;
+		const event = this.stallActionBarEvent;
+		if (bar === undefined || event === undefined || this.stallActionBarSettled) {
+			return;
+		}
+		this.removeStallActionBar({ render: false });
+		const settled = new StallActions(
+			{
+				...event,
+				summary: `${theme.fg("success", "✓")} ${formatStallSummary(event).replace(/^⚠\s*/, "")}，现在已经接着往下走了`,
+				actions: { canAbort: false, canDiagnose: true },
+			},
+			{
+				interruptKeyLabel: keyText("app.input.clear"),
+				onDiagnostics: () => {
+					this.removeStallActionBar();
+					this.showError(formatStallEventLines(event).join("\n"));
+				},
+			},
+		);
+		this.stallActionBar = settled;
+		this.stallActionBarEvent = event;
+		this.stallActionBarSettled = true;
+		this.chatContainer.addChild(settled);
+		this.removeStallActionInputListener ??= this.ui.addInputListener(this.stallActionInputRoute);
+		if (options.render !== false) this.ui.requestRender();
+	}
+
 	/** Tear the live stall action bar down (if any). Safe when no bar is live. */
 	private removeStallActionBar(options: { render?: boolean } = {}): void {
+		this.stallActionBarEvent = undefined;
+		this.stallActionBarSettled = false;
 		const bar = this.stallActionBar;
 		if (bar === undefined) return;
 		this.stallActionBar = undefined;
@@ -8743,7 +8844,7 @@ export class InteractiveMode {
 		}
 		try {
 			await copyToClipboard(text);
-			this.showStatus("已复制到剪贴板");
+			this.showToast("✓ copied");
 		} catch (error) {
 			this.showError(`复制失败：${error instanceof Error ? error.message : String(error)}`);
 		}
@@ -10102,7 +10203,7 @@ export class InteractiveMode {
 				}
 				this.patchConnectionState({ serviceTier: state.serviceTier });
 				this.footer.invalidate();
-				this.showStatus(`快速模式：${state.serviceTier === "priority" ? "开" : "关"}`);
+				this.showToast(`fast ${state.serviceTier === "priority" ? "on" : "off"}`);
 			})
 			.catch((error) => {
 				this.showError(error instanceof Error ? error.message : String(error));
@@ -10157,7 +10258,7 @@ export class InteractiveMode {
 				this.patchConnectionState({ thinkingLevel: level });
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
-				this.showStatus(`推理强度：${level}`);
+				this.showToast(`thinking ${level}`);
 			})
 			.catch((error) => {
 				this.showError(error instanceof Error ? error.message : String(error));
@@ -11389,7 +11490,7 @@ export class InteractiveMode {
 
 		try {
 			await copyToClipboard(text);
-			this.showStatus("已复制最后一条回复");
+			this.showToast("✓ copied");
 		} catch (error) {
 			this.showError(error instanceof Error ? error.message : String(error));
 		}

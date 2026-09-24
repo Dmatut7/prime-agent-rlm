@@ -66,9 +66,10 @@ describe("UserMessageComponent", () => {
 		const plain = new UserMessageComponent(text)
 			.render(60)
 			.map((line) => line.replace(/\x1b\[[0-9;]*m|\x1b\]133;[ABC]\x07/g, "").trimEnd());
-		expect(plain).toContain(" › print(type(agent_message).__name__)");
-		expect(plain).toContain("     - not a list");
-		expect(plain).toContain("   # not a heading");
+		// 60 columns: a 2-column indent, then the bubble's 2-column padding.
+		expect(plain).toContain("    print(type(agent_message).__name__)");
+		expect(plain).toContain("      - not a list");
+		expect(plain).toContain("    # not a heading");
 	});
 
 	test("colors only recognized leading slash commands", () => {
@@ -95,17 +96,17 @@ describe("UserMessageComponent", () => {
 			name: "wide and multi-code-point command graphemes",
 			message: "/命é令 arg **bold**",
 			commandName: "命é令",
-			expectedLines: ["", "› /命é", "令", "arg", "**bo", "ld**", ""],
+			expectedLines: ["you", "/命", "é令", "arg", "**b", "old", "**", ""],
 		},
 		{
 			name: "width-three command graphemes atomically",
 			message: "/界ﾞx arg",
 			commandName: "界ﾞx",
-			expectedLines: ["", "› /界ﾞ", "x", "arg", ""],
+			expectedLines: ["you", "/", "界ﾞ", "x", "arg", ""],
 		},
 	])("wraps $name at terminal width", ({ message, commandName, expectedLines }) => {
 		initTheme("dark");
-		// 7 columns leave 4 for content beside the 3-column ` › ` marker.
+		// 7 columns (no indent this narrow) leave 3 inside the bubble's 2-column padding.
 		const lines = new UserMessageComponent(message, undefined, (name) => name === commandName).render(7);
 		const plainLines = lines.map((line) => line.replace(/\x1b\[[0-9;]*m|\x1b\]133;[ABC]\x07/g, "").trim());
 

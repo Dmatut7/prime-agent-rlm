@@ -82,7 +82,20 @@
 		"thinkingMedium": "primarySoft",
 		"thinkingHigh": "primary",
 		"thinkingXhigh": "primary",
-		"bashMode": "success"
+		"bashMode": "success",
+		"userLabel": "#bdb0ff",
+		"assistantLabel": "#79d3bf",
+		"assistantGutter": "#2e4b45",
+		"runCardBar": "#a99bf0",
+		"runCardWarn": "#f0b85a",
+		"systemNotice": "#56756e",
+		"chipText": "#d8d0ff",
+		"toastText": "#9fe0c2",
+		"userBubbleBg": "#2a2442",
+		"runCardBg": "#201c33",
+		"runCardWarnBg": "#2a2216",
+		"chipBg": "#2e2750",
+		"toastBg": "#173a2f"
 	},
 	"export": {
 		"pageBg": "bg",

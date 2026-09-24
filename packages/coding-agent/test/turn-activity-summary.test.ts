@@ -91,8 +91,16 @@ function renderAllWith(
 		.join("\n");
 }
 
+const USER_BUBBLE_HEADER = /^\s*you {2}\d\d:\d\d\s*$/;
+
+/** The rendered lines past the user bubble (its `you` row and its text). */
+function turnLines(nonEmpty: string[]): string[] {
+	const header = nonEmpty.findIndex((line) => USER_BUBBLE_HEADER.test(line));
+	return header < 0 ? nonEmpty : nonEmpty.slice(header + 2);
+}
+
 function collapsedLinesWithoutUserLine(nonEmpty: string[]): number {
-	return nonEmpty.filter((line) => !line.includes("fix the CI reds")).length;
+	return nonEmpty.filter((line) => !line.includes("fix the CI reds") && !USER_BUBBLE_HEADER.test(line)).length;
 }
 
 function renderAll(messages: readonly AgentMessage[], expanded: boolean): string {
@@ -148,9 +156,10 @@ describe("turn activity summary (U4)", () => {
 		];
 		const collapsed = renderAll(messages, false);
 		const nonEmpty = collapsed.split("\n").filter((line) => line.trim().length > 0);
-		// Line 0 is the user prompt; the ⚙ line is the very next line.
-		expect(nonEmpty[0]).toContain("run the checks");
-		expect(nonEmpty[1]).toContain("⚙ 6 步");
+		// The user bubble (its `you` row, then the prompt); the ⚙ line is the very next line.
+		expect(nonEmpty[0]).toMatch(USER_BUBBLE_HEADER);
+		expect(nonEmpty[1]).toContain("run the checks");
+		expect(nonEmpty[2]).toContain("⚙ 6 步");
 	});
 
 	it("failed steps never fold: the ✗ row stays visible and the aggregate counts it (第五批)", () => {
@@ -215,11 +224,12 @@ describe("turn activity summary (U4)", () => {
 		const empty = total - nonEmpty;
 		// The DS2 review's same fixture measured 29 total / 25 blank before F2
 		// (the collapsed thinking blocks still earned their spacers). Now: nine
-		// total, five structural blanks (user padding, the turn head's inner
-		// blank, the final message's leading spacer).
+		// total, four structural blanks (the user bubble's bottom row, the turn
+		// head's inner blank, the final message's leading spacer); the bubble's
+		// `you` row took the place of its old top padding.
 		expect(total).toBe(9);
-		expect(nonEmpty).toBe(4);
-		expect(empty).toBe(5);
+		expect(nonEmpty).toBe(5);
+		expect(empty).toBe(4);
 
 		// The same message renders zero lines while fully collapsed (thinking
 		// hidden, no text) - and still zero under hideThinkingBlock.
@@ -252,8 +262,8 @@ describe("turn activity summary (U4)", () => {
 		// Two mechanical lines at the turn head: the thinking block header (①)
 		// above the process line (②). 评审短账: the duration lives on the ⚙ line
 		// only - the header carries the segment count.
-		expect(nonEmpty[1]).toBe(" Thinking ×10");
-		expect(nonEmpty[2]).toBe(" ⚙ 10 步 · 1.0s · python×10");
+		expect(turnLines(nonEmpty)[0]).toBe(" Thinking ×10");
+		expect(turnLines(nonEmpty)[1]).toBe(" ⚙ 10 步 · 1.0s · python×10");
 		// Zero per-block thinking rows anywhere in the collapsed view: the
 		// header is the only line that names the thinking.
 		expect(collapsed.split("\n").filter((line) => line.includes("Thinking"))).toHaveLength(1);
@@ -294,8 +304,8 @@ describe("turn activity summary (U4)", () => {
 		];
 		const collapsed = renderAll(messages, false);
 		const nonEmpty = collapsed.split("\n").filter((line) => line.trim().length > 0);
-		expect(nonEmpty[1]).toBe(" Thinking ×2");
-		expect(nonEmpty[2]).toBe(" ⚙ 2 步 · 0.4s · python×2");
+		expect(turnLines(nonEmpty)[0]).toBe(" Thinking ×2");
+		expect(turnLines(nonEmpty)[1]).toBe(" ⚙ 2 步 · 0.4s · python×2");
 		// The mid-turn prose renders in place, between the mechanical lines and
 		// the final answer - K3 ①: content is never collapsed away.
 		expect(collapsed).toContain("红了，三个断言的 pin 需要贴契约改。先改第一个。");
@@ -319,7 +329,7 @@ describe("turn activity summary (U4)", () => {
 		const collapsed = renderAll(messages, false);
 		const nonEmpty = collapsed.split("\n").filter((line) => line.trim().length > 0);
 		// A single segment renders without the count; several render `Thinking ×N`.
-		expect(nonEmpty[1]).toBe(" Thinking ×2 · 2.0s");
+		expect(turnLines(nonEmpty)[0]).toBe(" Thinking ×2 · 2.0s");
 		expect(collapsed).toContain("Concluded.");
 		expect(collapsed).not.toContain("First segment");
 		// The second turn has neither steps nor thinking: no mechanical line.
@@ -334,7 +344,7 @@ describe("turn activity summary (U4)", () => {
 			false,
 		);
 		const singleNonEmpty = single.split("\n").filter((line) => line.trim().length > 0);
-		expect(singleNonEmpty[1]).toBe(" Thinking 2.0s");
+		expect(turnLines(singleNonEmpty)[0]).toBe(" Thinking 2.0s");
 	});
 
 	it("hides a live tool's body only after it settles, and the verb summary keeps one fragment per verb", () => {
@@ -401,14 +411,18 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 		const collapsed = renderQuiet(messages);
 		const nonEmpty = collapsed.split("\n").filter((line) => line.trim().length > 0);
 
-		// One process line at the turn head: caret, steps, duration, plain-words summary.
-		expect(nonEmpty[1]?.startsWith(" ▸ 6 步 · 共 0.6s   ")).toBe(true);
-		expect(nonEmpty[1]).toContain("编辑 3 个文件");
-		expect(nonEmpty[1]).toContain("运行 npm test");
-		expect(nonEmpty[1]).not.toMatch(/\[[OTP]\]/);
+		// The `◆ prime` header carries the model and the time; one process line
+		// sits under it on the gutter rail: caret, steps, plain-words summary.
+		// A bare `│` is the rail running through a blank row of the AI block.
+		const turn = turnLines(nonEmpty).filter((line) => line !== "│");
+		expect(turn[0]).toBe("◆ prime  test-model · 0.6s");
+		expect(turn[1]?.startsWith("│ ▸ 6 steps   ")).toBe(true);
+		expect(turn[1]).toContain("编辑 3 个文件");
+		expect(turn[1]).toContain("运行 npm test");
+		expect(turn[1]).not.toMatch(/\[[OTP]\]/);
 		// The very next line is the final prose: no second mechanical line.
-		expect(nonEmpty[2]).toContain("All six checks passed");
-		expect(nonEmpty.filter((line) => line.includes("步"))).toHaveLength(1);
+		expect(turn[2]).toContain("All six checks passed");
+		expect(nonEmpty.filter((line) => line.includes("steps"))).toHaveLength(1);
 		// The legacy two-line surface is gone.
 		expect(collapsed).not.toContain("⚙");
 		expect(collapsed).not.toContain("Thinking ×");
@@ -430,12 +444,13 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 		];
 		const collapsed = renderQuiet(messages);
 		const nonEmpty = collapsed.split("\n").filter((line) => line.trim().length > 0);
-		// The thinking-only turn: 思考 plus the frozen duration, no step count.
-		expect(nonEmpty[1]).toBe(" ▸ Thinking 2.0s");
+		// The thinking-only turn: Thinking under the header, no step count.
+		expect(turnLines(nonEmpty)[0]).toBe("◆ prime  test-model · 2.0s");
+		expect(turnLines(nonEmpty)[1]).toBe("│ ▸ Thinking");
 		expect(collapsed).toContain("Concluded.");
 		// R5-P2③: the thinking-less turn renders 思考 too - the model is
 		// always reasoning, so every turn carries the process line.
-		const heads = collapsed.split("\n").filter((line) => line.startsWith(" ▸ Thinking"));
+		const heads = collapsed.split("\n").filter((line) => line.startsWith("│ ▸ Thinking"));
 		expect(heads).toHaveLength(2);
 		expect(collapsed).not.toContain("想了想");
 	});
@@ -447,7 +462,7 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 		summary.setQuiet(true);
 		// No steps, no thinking, no comms: still one 思考 line, not nothing.
 		const line = stripAnsi(summary.render(120).join("\n"));
-		expect(line).toBe(" ▸ Thinking 0.5s");
+		expect(line).toBe("◆ prime  0.5s\n│ ▸ Thinking");
 	});
 
 	it("counts comms from received agent rows plus sent agent messages in tool details", () => {
@@ -493,9 +508,9 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 		const collapsed = renderQuiet(messages);
 		// 1 step, 1 thinking segment, 3 comms (2 sent + 1 received). A replay never
 		// measured the thinking time, so the 思考 segment stays out.
-		const head = collapsed.split("\n").find((line) => line.startsWith(" ▸ "));
-		expect(head?.startsWith(" ▸ 1 步 · ")).toBe(true);
-		expect(head).toContain(" · 通讯 3 条");
+		const head = collapsed.split("\n").find((line) => line.startsWith("│ ▸ "));
+		expect(head?.startsWith("│ ▸ 1 step · ")).toBe(true);
+		expect(head).toContain(" · 3 msgs");
 		expect(head).not.toContain("[P]");
 	});
 
@@ -507,8 +522,8 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 		const summary = new TurnSummaryComponent(state);
 		summary.setQuiet(true);
 		const line = stripAnsi(summary.render(120).join("\n"));
-		expect(line).toContain("1 步");
-		expect(line).not.toContain("2 步");
+		expect(line).toContain("1 step");
+		expect(line).not.toContain("2 steps");
 	});
 
 	it("addCommMessage feeds the footnote count", () => {
@@ -520,7 +535,7 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 		summary.addCommMessage();
 		summary.addCommMessage();
 		const line = stripAnsi(summary.render(120).join("\n"));
-		expect(line).toContain(" · 通讯 2 条");
+		expect(line).toContain(" · 2 msgs");
 	});
 
 	it("setQuiet(false) restores the legacy two-line face", () => {
@@ -529,7 +544,7 @@ describe("turn head footnote (TUI v4 quiet)", () => {
 		state.markTurnEnded(1_500);
 		const summary = new TurnSummaryComponent(state);
 		summary.setQuiet(true);
-		expect(stripAnsi(summary.render(120).join("\n"))).toMatch(/^ ▸ 1 步 · /);
+		expect(stripAnsi(summary.render(120).join("\n"))).toMatch(/^◆ prime {2}\S+\n│ ▸ 1 step {3}/);
 		summary.setQuiet(false);
 		const legacy = stripAnsi(summary.render(120).join("\n"));
 		expect(legacy).toContain("⚙ 1 步");
@@ -672,7 +687,7 @@ describe("turn comm counter (TUI v4 T6)", () => {
 		// The component facade routes into the same counter.
 		summary.addCommMessage();
 		const line = stripAnsi(summary.render(120).join("\n"));
-		expect(line).toContain(" · 通讯 4 条");
+		expect(line).toContain(" · 4 msgs");
 		expect(state.commMessageCount).toBe(4);
 	});
 });
@@ -699,11 +714,12 @@ describe("turn state for the process line", () => {
 		const summary = new TurnSummaryComponent(state);
 		summary.setQuiet(true);
 		expect(summary.render(120).map((line) => stripAnsi(line))).toEqual([
-			" ▸ 1 步 · 共 0.4s   编辑 a.ts",
-			"   改动  src/a.ts  +3 −5",
+			"◆ prime  0.4s",
+			"│ ▸ 1 step   编辑 a.ts",
+			"│   改动  src/a.ts  +3 −5",
 		]);
 		summary.setExpanded(true);
-		expect(summary.render(120).map((line) => stripAnsi(line))).toEqual([" ▾ 1 步 · 共 0.4s   编辑 a.ts"]);
+		expect(summary.render(120).map((line) => stripAnsi(line))).toEqual(["◆ prime  0.4s", "│ ▾ 1 step   编辑 a.ts"]);
 	});
 
 	it("relabels a step when its streaming arguments complete", () => {
@@ -714,7 +730,7 @@ describe("turn state for the process line", () => {
 		state.markTurnEnded(1_300);
 		const summary = new TurnSummaryComponent(state);
 		summary.setQuiet(true);
-		expect(stripAnsi(summary.render(120)[0] ?? "")).toBe(" ▸ 1 步 · 共 0.2s   运行 npm run check");
+		expect(stripAnsi(summary.render(120)[1] ?? "")).toBe("│ ▸ 1 step   运行 npm run check");
 	});
 
 	it("keeps the clock ticking while a step is unsettled and freezes it on the last settled step", () => {
@@ -780,7 +796,7 @@ describe("turn state for the process line", () => {
 		expect(summary.render(120).map(stripAnsi).join("\n")).not.toContain("Check both data sources");
 		summary.setExpanded(true);
 		const open = summary.render(120).map(stripAnsi);
-		expect(open[1]).toContain("Thinking  Check both data sources");
+		expect(open[2]).toContain("Thinking  Check both data sources");
 	});
 
 	it("drops the Thinking preview while the full trace is open", () => {
@@ -805,31 +821,35 @@ describe("turn state for the process line", () => {
 		state.markTurnEnded(2_000);
 		const summary = new TurnSummaryComponent(state);
 		summary.setQuiet(true);
-		const caret = () => stripAnsi(summary.render(120)[0] ?? "").slice(0, 3);
-		expect(caret()).toBe(" ▸ ");
+		const caret = () => stripAnsi(summary.render(120)[1] ?? "").slice(0, 4);
+		expect(caret()).toBe("│ ▸ ");
 		state.thinkingExpanded = true;
-		expect(caret()).toBe(" ▾ ");
+		expect(caret()).toBe("│ ▾ ");
 		state.thinkingExpanded = false;
-		expect(caret()).toBe(" ▸ ");
+		expect(caret()).toBe("│ ▸ ");
 		// Ctrl+P opens nothing in a turn without comms, so the caret stays put.
 		state.agentMessagesExpanded = true;
-		expect(caret()).toBe(" ▸ ");
+		expect(caret()).toBe("│ ▸ ");
 		state.addCommMessage();
-		expect(caret()).toBe(" ▾ ");
+		expect(caret()).toBe("│ ▾ ");
 	});
 
-	it("drops the plain-words summary from the header while the turn runs (QA L2)", () => {
+	it("shows the running card while the turn runs and the settled line once it ends (QA L2)", () => {
 		const state = new TurnActivityState(1_000);
 		state.addStep({ toolCallId: "t1", toolName: "bash", args: { command: "sleep 30" }, status: "running" });
 		const summary = new TurnSummaryComponent(state);
 		summary.setQuiet(true);
-		const running = stripAnsi(summary.render(120)[0] ?? "");
-		expect(running).toContain("运行中 · 第 1 步");
-		expect(running).not.toContain("sleep 30");
+		const running = summary.render(120).map(stripAnsi);
+		// The header says working; the card names the running step once, as an
+		// action, and the settled summary (nothing settled yet) stays out.
+		expect(running[0]).toContain("working");
+		expect(running[1]).toContain("正在运行 sleep 30");
+		expect(running[2]).toContain("step 1");
+		expect(running[2]).not.toContain("sleep 30");
 		state.setStepStatus("t1", "done", 1_500);
 		state.markTurnEnded(1_600);
 		summary.invalidate();
-		expect(stripAnsi(summary.render(120)[0] ?? "")).toContain("运行 sleep 30");
+		expect(stripAnsi(summary.render(120)[1] ?? "")).toContain("运行 sleep 30");
 	});
 
 	it("previews the turn's first thinking trace, following it while it streams", () => {

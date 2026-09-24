@@ -355,9 +355,10 @@ describe("InteractiveMode.renderSessionContext", () => {
 			.render(120)
 			.join("\n")
 			.replace(/\u001b\[[0-9;]*m/g, "");
-		expect(line).toContain("2 步");
-		// 1000 (first assistant) -> 2000 (abort stamp): 1 second, a fixed value.
-		expect(line).toContain("2 步 · 共 1.0s");
+		expect(line).toContain("│ ▸ 2 steps");
+		// 1000 (first assistant) -> 2000 (abort stamp): 1 second, a fixed value,
+		// on the `◆ prime` header.
+		expect(line).toContain("◆ prime  test-model · 1.0s");
 		// Frozen: repeated renders reuse the settled cache.
 		const first = summary!.render(120);
 		expect(summary!.render(120)).toBe(first);
@@ -383,7 +384,9 @@ describe("InteractiveMode.renderSessionContext", () => {
 			.render(120)
 			.join("\n")
 			.replace(/\u001b\[[0-9;]*m/g, "");
-		expect(line).toContain("▾ 运行中 · 第 1 步");
+		// Still running: the header says working and the running card counts the step.
+		expect(line).toMatch(/^◆ prime .* working /);
+		expect(line).toContain("step 1");
 	});
 
 	test("a rebuild keeps an opened turn open (resync mid-run must not fold Ctrl+O)", async () => {
@@ -1027,6 +1030,7 @@ describe("InteractiveMode submit handling", () => {
 				keybindings: {},
 				autocompleteProvider: undefined,
 				showStatus: vi.fn(),
+				showToast: vi.fn(),
 			});
 			Object.defineProperty(fakeThis, "promptStash", {
 				configurable: true,
