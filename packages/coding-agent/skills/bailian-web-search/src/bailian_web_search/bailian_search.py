@@ -2,16 +2,24 @@
 
 Searches the web via a Bailian chat model with enable_search, always against
 the public compatible endpoint. Key resolution: DASHSCOPE_API_KEY env var,
-then ~/.prime/agent/models.json (bailian provider), then auth.json.
+then ~/.prime/agent/models.json (bailian provider), then auth.json. Config
+values take the same forms the host accepts (resolve-config-value.ts): a
+literal key, the name of an environment variable, or `!command` whose stdout
+is the key.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import subprocess
+import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 PUBLIC_BASE = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
@@ -38,25 +46,79 @@ def _agent_dir() -> Path:
     return Path(raw).expanduser()
 
 
-def _resolve_api_key() -> str:
+_COMMAND_TIMEOUT = 10
+_command_cache: dict[str, str] = {}
+
+
+def _resolve_config_value(raw: str) -> tuple[str, str]:
+    """(value, problem) for a config value, resolved like the host's resolveConfigValue.
+
+    `!command` runs through /bin/sh and its trimmed stdout is the value (cached once it
+    succeeds, as the host does); a name that is set in the environment resolves to that
+    variable (set-but-empty is a missing key, never the name); anything else is the literal.
+    """
+    if raw.startswith("!"):
+        # Only the program is named in a problem: the rest of the command may hold a secret.
+        shown = f"`!{(raw[1:].split() or [''])[0]} ...`"
+        cached = _command_cache.get(raw)
+        if cached:
+            return cached, ""
+        try:
+            done = subprocess.run(
+                raw[1:],
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=_COMMAND_TIMEOUT,
+                stdin=subprocess.DEVNULL,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return "", f"command {shown} timed out after {_COMMAND_TIMEOUT}s"
+        except OSError as exc:
+            return "", f"command {shown} could not run ({type(exc).__name__})"
+        value = done.stdout.strip()
+        if done.returncode != 0 or not value:
+            return "", f"command {shown} exited {done.returncode} with no key on stdout"
+        _command_cache[raw] = value
+        return value, ""
+    if raw in os.environ:
+        value = os.environ[raw].strip()
+        return value, "" if value else f"environment variable {raw} is empty"
+    return raw.strip(), ""
+
+
+def _find_api_key() -> tuple[str, list[str]]:
+    """(key, problems met on the way) from the env var, models.json, then auth.json."""
+    problems: list[str] = []
     env_key = os.environ.get("DASHSCOPE_API_KEY", "").strip()
     if env_key:
-        return env_key
+        return env_key, problems
     try:
         cfg = json.loads((_agent_dir() / "models.json").read_text())
-        key = cfg["providers"]["bailian"]["apiKey"]
-        if isinstance(key, str) and key.strip():
-            return key.strip()
+        raw = cfg["providers"]["bailian"]["apiKey"]
+        if isinstance(raw, str) and raw.strip():
+            key, problem = _resolve_config_value(raw.strip())
+            if key:
+                return key, problems
+            problems.append(f"models.json providers.bailian.apiKey: {problem}")
     except (OSError, ValueError, KeyError, TypeError):
         pass
     try:
         auth = json.loads((_agent_dir() / "auth.json").read_text())
         cred = auth.get("bailian") if isinstance(auth, dict) else None
-        if isinstance(cred, dict) and isinstance(cred.get("key"), str):
-            return cred["key"].strip()
+        if isinstance(cred, dict) and isinstance(cred.get("key"), str) and cred["key"].strip():
+            key, problem = _resolve_config_value(cred["key"].strip())
+            if key:
+                return key, problems
+            problems.append(f"auth.json bailian.key: {problem}")
     except (OSError, ValueError):
         pass
-    return ""
+    return "", problems
+
+
+def _resolve_api_key() -> str:
+    return _find_api_key()[0]
 
 
 class SearchAnswer(str):
@@ -96,9 +158,13 @@ def search(
             spent ~4.7k reasoning tokens and 91s for the same answer it gives in
             21s without, so it only costs time and money here.
 
-    Returns the answer text. Raises RuntimeError when no API key is found and
-    urllib.error.HTTPError on API errors (400 with the valid tier list means a
-    bad strategy value).
+    Returns the answer text; an empty answer comes back as a sentence that says
+    so. Raises RuntimeError when no API key is found and on API errors (400 with
+    the valid tier list means a bad strategy value).
+
+    This call blocks its thread for the whole search. Inside the kernel use
+    `await asearch(...)`, which runs it in a worker thread so the kernel's other
+    tasks (subagents, browser sessions, heartbeats) keep running meanwhile.
     """
     if strategy and strategy not in _TIERS:
         raise ValueError(
@@ -106,9 +172,11 @@ def search(
         )
     key = _resolve_api_key()
     if not key:
+        problems = _find_api_key()[1]
+        detail = f" ({'; '.join(problems)})" if problems else ""
         raise RuntimeError(
             "no Bailian API key found: set DASHSCOPE_API_KEY or configure "
-            "providers.bailian.apiKey in ~/.prime/agent/models.json"
+            f"providers.bailian.apiKey in ~/.prime/agent/models.json{detail}"
         )
     payload = {
         "model": model,
@@ -134,11 +202,45 @@ def search(
             "Content-Type": "application/json",
         },
     )
+    started = time.monotonic()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")[:300]
         raise RuntimeError(f"bailian search HTTP {e.code}: {body}") from e
-    content = (data.get("choices") or [{}])[0].get("message", {}).get("content")
-    return SearchAnswer(content or "")
+    finally:
+        _note_if_blocked_loop(time.monotonic() - started)
+    choice = (data.get("choices") or [{}])[0] or {}
+    content = (choice.get("message") or {}).get("content")
+    if not isinstance(content, str) or not content.strip():
+        # An empty string reads like "the web has nothing on this", which is rarely true: the
+        # usual causes are a filtered answer or a question too broad for the search tier.
+        return SearchAnswer(
+            f"(bailian_web_search found no answer for {query!r}: the search model returned empty text, "
+            f"finish_reason={choice.get('finish_reason')!r}. Usually the answer was filtered or the "
+            "question was too broad; ask a narrower question, or read primary pages with "
+            "web_research.search / web_research.fetch.)"
+        )
+    return SearchAnswer(content)
+
+
+def _note_if_blocked_loop(seconds: float) -> None:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return  # a worker thread or a plain script: nothing else was waiting on this thread
+    print(
+        f"bailian_web_search: search() held the kernel's event loop for {seconds:.0f}s, pausing every "
+        "background task meanwhile; `await bailian_web_search.asearch(...)` runs it in a worker thread.",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+async def asearch(query: str, **kwargs: Any) -> str:
+    """search() in a worker thread: same arguments and answer, and the kernel keeps running meanwhile.
+
+    Interrupting the cell stops the wait at once; the request itself ends on its own within `timeout`.
+    """
+    return await asyncio.to_thread(search, query, **kwargs)

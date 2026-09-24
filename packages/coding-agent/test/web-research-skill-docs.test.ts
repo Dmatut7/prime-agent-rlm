@@ -63,6 +63,28 @@ describe("web-research SKILL.md", () => {
 		expect(out).toBe("[true, true, true]");
 	});
 
+	it("keeps price lines when a spec grid fills the printed key lines, and marks every cut", () => {
+		// A plan grid used to fill the 40-line quota with "2 GB RAM" rows before the first price.
+		const out = execFileSync(
+			"python3",
+			[
+				"-c",
+				[
+					"import importlib.util, json, sys",
+					"spec = importlib.util.spec_from_file_location('l', sys.argv[1])",
+					"l = importlib.util.module_from_spec(spec); spec.loader.exec_module(l)",
+					"text = '\\n'.join(f'Plan {i}: {i} vCPU, {i * 2} GB RAM' for i in range(1, 91)) + '\\nPlan 90 monthly: $123.45/mo'",
+					"shown = l.key_lines(text, limit=40)",
+					"marker = l.preview('x' * 5000, 'page')",
+					"print(json.dumps([len(shown), 'Plan 90 monthly: $123.45/mo' in shown, 'TRUNCATED: showing 1,500 of 5,000' in marker]))",
+				].join("\n"),
+				join(pkgDir, "_lines.py"),
+			],
+			{ encoding: "utf8" },
+		).trim();
+		expect(out).toBe("[40, true, true]");
+	});
+
 	it("forces a headless browser in code", () => {
 		const browserSource = readFileSync(join(pkgDir, "_browser.py"), "utf8");
 		expect(browserSource).toMatch(/^HEADLESS = True$/m);

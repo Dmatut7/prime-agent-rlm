@@ -171,6 +171,8 @@ class Snapshot:
     blocked: list[str] = field(default_factory=list)
     truncated: bool = False
     key_lines: list[str] = field(default_factory=list)
+    # The whole page text when `text` was cut with max_chars; save() always writes it.
+    full_text: str | None = field(default=None, repr=False)
 
     def outline_text(self) -> str:
         lines: list[str] = []
@@ -203,13 +205,19 @@ class Snapshot:
         parts = [f"URL: {self.url}", f"title: {self.title}"]
         if self.blocked:
             parts.append(f"payment-provider requests blocked: {len(self.blocked)}")
-        if self.price_lines:
-            parts.append("price lines:\n  " + "\n  ".join(self.price_lines[:30]))
-        other = [ln for ln in self.key_lines if ln not in self.price_lines]
-        if other:
-            parts.append("spec/route lines:\n  " + "\n  ".join(other[:15]))
-        if self.stock_lines:
-            parts.append("stock lines:\n  " + "\n  ".join(self.stock_lines[:10]))
+        for name, lines, limit, attr in (
+            ("price lines", self.price_lines, 30, "price_lines"),
+            ("spec/route lines", [ln for ln in self.key_lines if ln not in self.price_lines], 15, "key_lines"),
+            ("stock lines", self.stock_lines, 10, "stock_lines"),
+        ):
+            shown = _lines.prioritized(lines, limit)
+            if shown:
+                more = (
+                    f" ({len(shown)} of {len(lines)}, amounts first - snap.{attr} has all)"
+                    if len(lines) > limit
+                    else ""
+                )
+                parts.append(f"{name}{more}:\n  " + "\n  ".join(shown))
         parts.append(f"captured JSON responses: {self.json_count} (session.json_responses())")
         outline = self.outline_text().splitlines()
         more = (
@@ -222,16 +230,16 @@ class Snapshot:
             + "\n".join(outline[:OUTLINE_PREVIEW])
             + more
         )
-        preview = self.text[: _lines.PREVIEW_CHARS]
-        rest = len(self.text) - len(preview)
-        tail = f"\n[... {rest} more chars: print(snap.text), or snap.save() for a file]" if rest > 0 else ""
-        parts.append("page text (start):\n" + preview + tail)
+        full = self.text if self.full_text is None else self.full_text
+        preview = _lines.preview(self.text, "snap", len(full) if self.truncated else None)
+        parts.append("page text (start):\n" + preview)
         return "\n\n".join(parts)
 
     def save(self, path: str | None = None) -> str:
-        """Write URL, key lines, full outline and full text to a file; returns the path."""
+        """Write URL, key lines, full outline and the whole page text to a file; returns the path."""
+        full = self.text if self.full_text is None else self.full_text
         body = "\n\n".join(
-            [f"URL: {self.url}\ntitle: {self.title}", "\n".join(self.key_lines), self.outline_text(), self.text]
+            [f"URL: {self.url}\ntitle: {self.title}", "\n".join(self.key_lines), self.outline_text(), full]
         )
         return _lines.save_text(body, path, "snapshot")
 
@@ -310,15 +318,23 @@ class BrowserSession:
             )
         self._last_used = time.monotonic()
 
-    async def _ensure(self) -> None:
+    async def _ensure(self, url: str = "") -> None:
         self._touch()
         if self._wrapped is not None:
             return
-        self._wrapped = await _browser.new_context(**self._ctx_opts)
-        self._wrapped.ctx.on("page", self._on_new_page)
-        self._page = await self._wrapped.ctx.new_page()
-        self._attach(self._page)
-        self._watchdog = asyncio.get_running_loop().create_task(self._idle_watch())
+        wrapped = await _browser.new_context(url, **self._ctx_opts)
+        try:
+            wrapped.ctx.on("page", self._on_new_page)
+            page = await wrapped.ctx.new_page()
+        except BaseException:
+            # The context holds the shared browser; without this release a failed tab would keep
+            # Chromium running for the rest of the kernel's life.
+            await _browser.close_context(wrapped)
+            raise
+        self._wrapped, self._page = wrapped, page
+        self._attach(page)
+        if self._watchdog is None or self._watchdog.done():
+            self._watchdog = asyncio.get_running_loop().create_task(self._idle_watch())
 
     def _on_new_page(self, page: Any) -> None:
         self._attach(page)
@@ -382,7 +398,7 @@ class BrowserSession:
 
     async def open(self, url: str, *, wait_for: str | None = None, wait_ms: int = 8000) -> ActionResult:
         """Go to url and wait for the page to settle (network idle, or `wait_for` selector)."""
-        await self._ensure()
+        await self._ensure(url)
         resp = await self._page.goto(url, wait_until="domcontentloaded", timeout=45_000)
         await _settle(self._page, wait_for, wait_ms)
         self._touch()
@@ -580,14 +596,18 @@ class BrowserSession:
         self._touch()
         return ActionResult("back", "", self._page.url, await self._title(), True)
 
-    async def snapshot(self, *, max_chars: int = 12_000, max_items: int = 250) -> Snapshot:
-        """What the page shows now: price and stock lines, a clickable outline with [ref]s, and the text."""
+    async def snapshot(self, *, max_chars: int | None = None, max_items: int = 250) -> Snapshot:
+        """What the page shows now: price and stock lines, a clickable outline with [ref]s, and the text.
+
+        Price, stock and key lines come from the whole page. max_chars cuts `snap.text` only;
+        snap.save() still writes everything.
+        """
         await self._ensure()
         outline = await self._page.evaluate(_OUTLINE_JS, max_items)
         text = await _inner_text(self._page)
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         clean = "\n".join(lines)
-        keys = _lines.key_lines(clean, limit=80)
+        keys = _lines.key_lines(clean)
         prices = [ln for ln in keys if _lines.PRICE.search(ln)]
         stock = [ln for ln in keys if _lines.STOCK.search(ln)]
         await asyncio.sleep(0)  # let queued response captures land
@@ -596,13 +616,14 @@ class BrowserSession:
             url=self._page.url,
             title=await self._title(),
             outline=outline,
-            text=clean[:max_chars],
+            text=clean if max_chars is None else clean[:max_chars],
             price_lines=prices,
             stock_lines=stock,
             json_count=len(self._captured),
             blocked=list(self._wrapped.blocked) if self._wrapped else [],
-            truncated=len(clean) > max_chars,
+            truncated=max_chars is not None and len(clean) > max_chars,
             key_lines=keys,
+            full_text=clean if max_chars is not None and len(clean) > max_chars else None,
         )
 
     def json_responses(
@@ -726,13 +747,16 @@ async def browse(
             stopped = str(exc)
         except Exception as exc:  # noqa: BLE001 - reported with the snapshot of where it failed
             error = f"{type(exc).__name__}: {exc}"
-        try:
-            snap = await s.snapshot()
-            captured = s.json_responses(json_contains)
-            if screenshot:
-                shot = await s.screenshot(screenshot if isinstance(screenshot, str) else None)
-        except Exception as exc:  # noqa: BLE001
-            error = error or f"{type(exc).__name__}: {exc}"
+        # No tab means the browser never started (e.g. its install failed): a snapshot would only
+        # start it again and fail the same way, possibly after another long wait.
+        if s.page is not None:
+            try:
+                snap = await s.snapshot()
+                captured = s.json_responses(json_contains)
+                if screenshot:
+                    shot = await s.screenshot(screenshot if isinstance(screenshot, str) else None)
+            except Exception as exc:  # noqa: BLE001
+                error = error or f"{type(exc).__name__}: {exc}"
     return BrowseResult(url=url, steps=log, snapshot=snap, json=captured, screenshot=shot, stopped=stopped, error=error)
 
 

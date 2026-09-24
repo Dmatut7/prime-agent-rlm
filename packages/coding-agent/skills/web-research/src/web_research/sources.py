@@ -234,7 +234,12 @@ async def _gh_api(path: str, params: dict[str, Any]) -> Any:
     for k, v in params.items():
         args += ["-f", f"{k}={v}"]
     proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    out, err = await asyncio.wait_for(proc.communicate(), timeout=API_TIMEOUT)
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=API_TIMEOUT)
+    except BaseException:
+        if proc.returncode is None:
+            proc.kill()  # timeout or Esc: gh must not keep running unread
+        raise
     if proc.returncode != 0:
         raise RuntimeError(f"gh api failed: {err.decode(errors='replace').strip()[:200]}")
     return json.loads(out)

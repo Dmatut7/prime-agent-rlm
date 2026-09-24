@@ -9,6 +9,7 @@ See the skill's SKILL.md for when to use which.
 """
 
 from ._browser import POOL as _POOL
+from ._browser import BrowserUnavailable
 from .browser import (
     BrowseResult,
     BrowserSession,
@@ -36,6 +37,7 @@ def browser_running() -> bool:
 __all__ = [
     "BrowseResult",
     "BrowserSession",
+    "BrowserUnavailable",
     "CapturedResponse",
     "FetchResult",
     "PaymentGuardRefused",

@@ -174,6 +174,34 @@ describe("turnStepLabel harness calls", () => {
 			turnStepLabel(cell("r = await web_research.search('x')\np = await web_research.fetch(r.results[0]['url'])")),
 		).toBe("联网搜索，读网页");
 	});
+
+	it("keeps naming a browser session driven over several cells", () => {
+		// The session is created in the first cell; later cells only call its methods.
+		expect(turnStepLabel(cell("b = web_research.BrowserSession()\nawait b.open(url)"))).toBe("后台浏览器");
+		expect(turnStepLabel(cell("await b.click('ORDER NOW')"))).toBe("后台浏览器");
+		expect(turnStepLabel(cell("snap = await b.snapshot()\nprint(snap)"))).toBe("后台浏览器");
+		expect(turnStepLabel(cell("await b.select('Billing Cycle', 'Annually')\nawait b.click('Continue')"))).toBe(
+			"后台浏览器",
+		);
+		expect(turnStepLabel(cell("print((await b.snapshot()).price_lines)"))).toBe("后台浏览器");
+		expect(turnStepLabel(cell("print(b.json_responses('price'))"))).toBe("后台浏览器");
+		expect(turnStepLabel(cell("await web_research.shutdown_browser()"))).toBe("后台浏览器");
+		// An asyncio event's wait is not a browser.
+		expect(turnStepLabel(cell("await done.wait()"))).not.toBe("后台浏览器");
+	});
+
+	it("tells papers, technical Q&A and GitHub apart", () => {
+		expect(turnStepLabel(cell("await web_research.crossref('asyncio', rows=5)"))).toBe("查论文资料");
+		expect(turnStepLabel(cell("await web_research.openalex('llm agents')"))).toBe("查论文资料");
+		expect(turnStepLabel(cell("await web_research.stackexchange('asyncio TaskGroup cancel')"))).toBe("查技术问答");
+		expect(turnStepLabel(cell("await web_research.github('playwright python', kind='repositories')"))).toBe(
+			"查 GitHub",
+		);
+	});
+
+	it("names the async Bailian search", () => {
+		expect(turnStepLabel(cell("answer = await bailian_web_search.asearch('今天的新闻')"))).toBe("联网搜索");
+	});
 });
 
 describe("shell and helper labels (QA M3)", () => {
