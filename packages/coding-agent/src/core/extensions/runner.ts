@@ -84,6 +84,7 @@ const RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS = [
 	"app.thinking.toggle",
 	"app.thinking.toggleAll",
 	"app.subagents.focus",
+	"app.subagents.stopAll",
 	"app.editor.external",
 	"app.message.followUp",
 	"tui.input.submit",

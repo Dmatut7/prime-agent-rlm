@@ -2381,7 +2381,11 @@ export class DaemonAgentConnection implements AgentConnection {
 				return;
 			}
 			this.terminalCloseEmitted = true;
-			await this.emit({ type: "closed", error: this.formatDaemonSessionClosedError(message.reason) });
+			await this.emit({
+				type: "closed",
+				error: this.formatDaemonSessionClosedError(message.reason),
+				sessionClosedReason: message.reason,
+			});
 		}
 	}
 

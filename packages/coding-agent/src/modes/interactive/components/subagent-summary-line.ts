@@ -203,6 +203,13 @@ export interface SubagentPanelRow {
 	elapsedMs?: number;
 	/** What the child is doing or how it ended, in plain words. */
 	activity?: string;
+	/** The child's session directory: how a closed child is found again to reopen it. */
+	sessionDir?: string;
+	/**
+	 * A failed row whose failure notice already reached the parent: it has been
+	 * seen, so it no longer holds the panel open the way a fresh failure does.
+	 */
+	acknowledged?: boolean;
 }
 
 /** Rows shown at once; the rest scroll into view as the selection moves. */
@@ -246,11 +253,14 @@ function rowActivity(child: AgentConnectionRlmChildAgentSnapshot, state: Subagen
 
 /**
  * The panel rows for this session's subtree (see collectSubtreeSubagentSnapshots),
- * most relevant first: stalled, failed, running, idle, finished.
+ * most relevant first: stalled, failed, running, idle, finished. A failure the
+ * parent was already told about (`seenFailureChildIds`) ranks with the finished
+ * rows: it is history, and it must not pin the panel open forever.
  */
 export function buildSubagentPanelRows(
 	children: Iterable<AgentConnectionRlmChildAgentSnapshot>,
 	parentId: string | undefined,
+	seenFailureChildIds: ReadonlySet<string> = new Set(),
 ): SubagentPanelRow[] {
 	const rows = collectSubtreeSubagentSnapshots(children, parentId).map((child) => {
 		const roster = classifySubagentSnapshotStatus(child);
@@ -265,12 +275,23 @@ export function buildSubagentPanelRows(
 						: "done";
 		const row: SubagentPanelRow = { id: child.id, name: child.sessionName ?? child.label, state };
 		if (child.activeSessionId) row.activeSessionId = child.activeSessionId;
+		if (child.sessionDir) row.sessionDir = child.sessionDir;
 		if (child.durationMs !== undefined) row.elapsedMs = child.durationMs;
+		if (state === "failed" && seenFailureChildIds.has(child.id)) row.acknowledged = true;
 		const activity = rowActivity(child, state);
 		if (activity) row.activity = activity;
 		return row;
 	});
-	return rows.sort((a, b) => ROW_STATE_ORDER[a.state] - ROW_STATE_ORDER[b.state]);
+	return rows.sort((a, b) => rowOrder(a) - rowOrder(b));
+}
+
+function rowOrder(row: SubagentPanelRow): number {
+	return row.acknowledged ? ROW_STATE_ORDER.done : ROW_STATE_ORDER[row.state];
+}
+
+/** A row with nothing left to watch: finished, idle, or a failure the parent has seen. */
+function isSettledPanelRow(row: SubagentPanelRow): boolean {
+	return row.state === "idle" || row.state === "done" || (row.state === "failed" && row.acknowledged === true);
 }
 
 /** The session a stall marker names: the text before its first `: `. */
@@ -401,6 +422,8 @@ export class SubagentSummaryLine implements Component, Focusable {
 
 	/** Enter/open: the selected row, when the panel lists rows. */
 	onOpen?: (row: SubagentPanelRow | undefined) => void;
+	/** The configurable stop-all-subagents key, pressed while the panel has focus. */
+	onStopAll?: () => void;
 	onCancel?: () => void;
 	onChatAction?: (data: string) => void;
 
@@ -452,6 +475,10 @@ export class SubagentSummaryLine implements Component, Focusable {
 		const keybindings = getKeybindings();
 		if (keybindings.matches(data, "tui.select.confirm") || keybindings.matches(data, "app.agents.open")) {
 			if (this.isSelectable()) this.onOpen?.(this.rows[this.selectedRow]);
+			return;
+		}
+		if (keybindings.matches(data, "app.subagents.stopAll")) {
+			this.onStopAll?.();
 			return;
 		}
 		if (keybindings.matches(data, "tui.select.up") && this.selectedRow > 0) {
@@ -548,14 +575,10 @@ export class SubagentSummaryLine implements Component, Focusable {
 		if (this.counts.total === 0) return [];
 		const safeWidth = Math.max(1, width);
 		const lines = [this.renderHeader(safeWidth)];
-		if (
-			!this.focused &&
-			this.rows.length > 0 &&
-			this.rows.every((row) => row.state === "idle" || row.state === "done")
-		) {
+		if (!this.focused && this.rows.length > 0 && this.rows.every(isSettledPanelRow)) {
 			// Nothing in flight: finished children would otherwise sit there as a
 			// block of rows until they close. One line says so; the header's ↓ still lists them.
-			lines.push(theme.fg("dim", truncateToWidth("   都做完了，闲置一阵后会自动关闭（记录保留）", safeWidth, "…")));
+			lines.push(theme.fg("dim", truncateToWidth(`   ${this.settledFoldText()}`, safeWidth, "…")));
 			return lines;
 		}
 		const { start, rows: shown } = this.visibleWindow();
@@ -582,17 +605,31 @@ export class SubagentSummaryLine implements Component, Focusable {
 		return lines;
 	}
 
+	/**
+	 * The fold line. "闲置一阵后会自动关闭" is only promised while some child is still
+	 * resident (idle); once they are all closed the line says so instead.
+	 */
+	private settledFoldText(): string {
+		const seenFailures = this.rows.filter((row) => row.state === "failed").length;
+		const head = seenFailures > 0 ? `都结束了（${seenFailures} 个出错，父代理已收到）` : "都做完了";
+		return this.rows.some((row) => row.state === "idle")
+			? `${head}，闲置一阵后会自动关闭（记录保留）`
+			: `${head}，已自动关闭（记录保留）`;
+	}
+
 	private renderHeader(safeWidth: number): string {
 		const counts = this.renderCounts();
 		const left = `${LINE_INDENT}${theme.fg("muted", `子代理 ${this.counts.total}`)}${counts ? `  ${counts}` : ""}`;
 		const rowsSelectable = this.rows.length > 0;
+		const anyWorking = this.rows.some((row) => row.state === "running" || row.state === "stalled");
+		const stopHint = this.focused && anyWorking ? `${keyText("app.subagents.stopAll")} 全部停止` : "";
 		const openHint = this.openable
 			? this.focused
 				? rowsSelectable
-					? ""
+					? stopHint
 					: `${keyText("tui.select.confirm")}/${keyText("app.agents.open")} 打开`
 				: `${keyText("tui.editor.cursorDown", { primaryOnly: true })} 选择`
-			: "";
+			: stopHint;
 		// F5 (DS2 review): the open hint never participates in truncation; the
 		// spend cell degrades (whole rungs) inside what the hint leaves, and a
 		// truncated money figure is never shown.

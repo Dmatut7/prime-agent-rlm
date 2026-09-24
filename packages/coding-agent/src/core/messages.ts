@@ -346,6 +346,8 @@ export interface RlmChildFailureDetails {
 		/** The abort fired but the run never settled. */
 		unsettled?: boolean;
 	};
+	/** Reports a follow-up turn the parent started, not the child's spawn task. */
+	followUp?: true;
 }
 
 export type RlmChildTerminalNoticeDetails =
@@ -354,11 +356,15 @@ export type RlmChildTerminalNoticeDetails =
 			childId: string;
 			sessionName: string;
 			reason?: string;
+			/** Reports a follow-up turn the parent started, not the child's spawn task. */
+			followUp?: true;
 	  }
 	| {
 			kind: "completed_without_reply";
 			childId: string;
 			sessionName: string;
+			/** Reports a follow-up turn the parent started, not the child's spawn task. */
+			followUp?: true;
 			/**
 			 * The child's last assistant text, quoted from its own transcript. Not a
 			 * message it sent: a child that wrote its answer instead of calling
@@ -501,7 +507,7 @@ export function createRlmChildFailureMessage(
 	return {
 		role: "custom",
 		customType: RLM_CHILD_FAILURE_CUSTOM_TYPE,
-		content: `RLM child ${details.sessionName} (${details.childId}) failed: ${details.error}${stallSuffix}`,
+		content: `RLM child ${details.sessionName} (${details.childId}) failed${details.followUp ? " while handling your follow-up message" : ""}: ${details.error}${stallSuffix}`,
 		display: true,
 		details,
 		timestamp,
@@ -879,11 +885,17 @@ export function createRlmChildTerminalNoticeMessage(
 	const content =
 		details.kind === "cancelled"
 			? `RLM child ${childName} (${details.childId}) was cancelled${details.reason ? `: ${details.reason}` : ""}`
-			: `RLM child ${childName} (${details.childId}) completed without sending a reply${
-					details.lastAssistantTextPreview
-						? `. Its last assistant text (written to its own transcript, never sent to you): ${details.lastAssistantTextPreview}. If that text answers the task, use it; if it is cut off or unclear, read the child's files or transcript before re-dispatching, since the work is usually already done`
-						: ". Read the child's files or transcript before re-dispatching: finishing without a reply usually means the work is done and only the report is missing"
-				}`;
+			: details.followUp
+				? `RLM child ${childName} (${details.childId}) finished the turn your follow-up message started without sending a reply, so no answer to it is on its way${
+						details.lastAssistantTextPreview
+							? `. Its last assistant text (written to its own transcript, never sent to you): ${details.lastAssistantTextPreview}. If that answers your follow-up, use it; otherwise ask again or read its transcript, since waiting longer will not bring a reply`
+							: ". Ask again or read its transcript: waiting longer will not bring a reply"
+					}`
+				: `RLM child ${childName} (${details.childId}) completed without sending a reply${
+						details.lastAssistantTextPreview
+							? `. Its last assistant text (written to its own transcript, never sent to you): ${details.lastAssistantTextPreview}. If that text answers the task, use it; if it is cut off or unclear, read the child's files or transcript before re-dispatching, since the work is usually already done`
+							: ". Read the child's files or transcript before re-dispatching: finishing without a reply usually means the work is done and only the report is missing"
+					}`;
 	return {
 		role: "custom",
 		customType: RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,

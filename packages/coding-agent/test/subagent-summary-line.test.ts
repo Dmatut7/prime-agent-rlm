@@ -529,7 +529,7 @@ describe("SubagentSummaryLine", () => {
 		line.onOpen = () => void open.call(mode);
 
 		line.handleInput("\r");
-		await vi.waitFor(() => expect(returnToAgentsView).toHaveBeenCalledWith("scoped_agents_view", undefined));
+		await vi.waitFor(() => expect(returnToAgentsView).toHaveBeenCalledWith("scoped_agents_view", undefined, {}));
 	});
 
 	it("opens the selected child itself when its row carries a daemon session", async () => {
@@ -557,7 +557,92 @@ describe("SubagentSummaryLine", () => {
 
 		line.handleInput("\x1b[B");
 		line.handleInput("\r");
-		await vi.waitFor(() => expect(returnToAgentsView).toHaveBeenCalledWith("scoped_agents_view", "active-b"));
+		await vi.waitFor(() => expect(returnToAgentsView).toHaveBeenCalledWith("scoped_agents_view", "active-b", {}));
+	});
+
+	it("reopens a child the daemon closed by its identity, not a dead session id", async () => {
+		const returnToAgentsView = vi.fn(async () => undefined);
+		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
+		Object.assign(mode, { editor: { getText: () => "" }, options: { returnToAgentsView: true }, returnToAgentsView });
+		const open = Reflect.get(InteractiveMode.prototype, "openScopedAgentsView") as (
+			this: typeof mode,
+			childActiveSessionId?: string,
+			row?: unknown,
+		) => Promise<void>;
+		const line = new SubagentSummaryLine();
+		line.setSubagentCounts({ total: 1, running: 0, idle: 0, inactive: 1 });
+		// A closed child's row: terminal and without a daemon session.
+		line.setSubagentRows(buildSubagentPanelRows([child("closed", "done")], undefined));
+		line.setOpenable(true);
+		line.focused = true;
+		line.onOpen = (row) => void open.call(mode, row?.activeSessionId, row);
+
+		line.handleInput("\r");
+		await vi.waitFor(() =>
+			expect(returnToAgentsView).toHaveBeenCalledWith("scoped_agents_view", undefined, {
+				openChild: { childId: "closed", sessionDir: "/tmp/closed" },
+			}),
+		);
+	});
+
+	it("stops every working subagent only after a confirming second press", async () => {
+		const cancelRlmChild = vi.fn(async (_childId: string) => true);
+		const showStatus = vi.fn();
+		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
+		Object.assign(mode, {
+			subagentSnapshots: new Map(
+				[
+					child("a", "running", { activeSessionId: "active-a" }),
+					// A finished child busy with a follow-up counts: its turn is the spend.
+					child("b", "done", { activeSessionId: "active-b", activity: { kind: "writing" } }),
+					child("c", "done"),
+				].map((snapshot) => [snapshot.id, snapshot]),
+			),
+			rlmNodeId: undefined,
+			agentConnection: { cancelRlmChild },
+			showStatus,
+		});
+		const request = Reflect.get(InteractiveMode.prototype, "requestStopAllSubagents") as (
+			this: typeof mode,
+		) => Promise<void>;
+		const line = new SubagentSummaryLine();
+		line.onStopAll = () => void request.call(mode);
+
+		line.handleInput("\x1bx");
+		await vi.waitFor(() => expect(showStatus).toHaveBeenCalledTimes(1));
+		expect(showStatus.mock.calls[0]?.[0]).toContain("停止全部 2 个在跑的子代理");
+		expect(cancelRlmChild).not.toHaveBeenCalled();
+
+		line.handleInput("\x1bx");
+		await vi.waitFor(() => expect(showStatus).toHaveBeenCalledTimes(2));
+		expect(cancelRlmChild.mock.calls.map(([id]) => id).sort()).toEqual(["a", "b"]);
+		expect(showStatus.mock.calls[1]?.[0]).toBe("已停止全部 2 个在跑的子代理");
+	});
+
+	it("sends the viewer of a closed subagent back to its parent with a Chinese notice", () => {
+		const returnToAgentsView = vi.fn(async () => undefined);
+		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
+		Object.assign(mode, { options: { returnToAgentsView: true, sessionDepth: 1 }, returnToAgentsView });
+		const onClosed = Reflect.get(InteractiveMode.prototype, "returnToParentAfterSubagentClosed") as (
+			this: typeof mode,
+			reason: string | undefined,
+		) => boolean;
+
+		expect(onClosed.call(mode, "killed")).toBe(true);
+		expect(returnToAgentsView).toHaveBeenLastCalledWith("agents_view", undefined, {
+			returnToParentNotice: expect.stringContaining("已回到父代理"),
+		});
+		// A child that died on an error is not reported as finished.
+		Object.assign(mode, { lastAssistantStopReason: "error" });
+		expect(onClosed.call(mode, "completed")).toBe(true);
+		expect(returnToAgentsView).toHaveBeenLastCalledWith("agents_view", undefined, {
+			returnToParentNotice: expect.stringContaining("出错停下了"),
+		});
+		// A daemon restart, or a top-level session, keeps the connection's own handling.
+		expect(onClosed.call(mode, "update")).toBe(false);
+		Object.assign(mode, { options: { returnToAgentsView: true, sessionDepth: 0 } });
+		expect(onClosed.call(mode, "killed")).toBe(false);
+		expect(returnToAgentsView).toHaveBeenCalledTimes(2);
 	});
 });
 
@@ -1342,6 +1427,37 @@ describe("subagent panel rows (design board 06)", () => {
 			{ id: "i0", name: "vps-0", state: "idle" as const },
 		]);
 		expect(line.render(100).map(stripAnsi)[1]).toContain("vps-run");
+	});
+
+	it("stops promising an idle close once every child is closed", () => {
+		const line = new SubagentSummaryLine();
+		line.setSubagentCounts({ total: 2, running: 0, idle: 0, inactive: 2 });
+		line.setSubagentRows(buildSubagentPanelRows([child("a", "done"), child("b", "done")], undefined));
+		line.setOpenable(true);
+		expect(line.render(100).map(stripAnsi)[1]).toBe("   都做完了，已自动关闭（记录保留）");
+	});
+
+	it("lets a failure the parent already received fold with the finished rows", () => {
+		const children = [
+			child("old", "error", { error: "provider down" }),
+			child("retry", "done"),
+			child("other", "done", { activeSessionId: "active-other" }),
+		];
+		const line = new SubagentSummaryLine();
+		line.setSubagentCounts({ total: 3, running: 0, idle: 1, inactive: 2 });
+		line.setOpenable(true);
+		// Not seen yet: the failure holds the panel open, at the top.
+		line.setSubagentRows(buildSubagentPanelRows(children, undefined));
+		expect(line.render(100).map(stripAnsi)[1]).toContain("old");
+		// Its failure notice reached the parent: it no longer blocks the fold.
+		const rows = buildSubagentPanelRows(children, undefined, new Set(["old"]));
+		expect(rows.find((row) => row.id === "old")).toMatchObject({ state: "failed", acknowledged: true });
+		// It no longer ranks above a live child either.
+		expect(rows[0]?.id).toBe("other");
+		line.setSubagentRows(rows);
+		expect(line.render(100).map(stripAnsi)[1]).toBe(
+			"   都结束了（1 个出错，父代理已收到），闲置一阵后会自动关闭（记录保留）",
+		);
 	});
 
 	it("keeps the selection on the same child when the rows reorder", () => {

@@ -840,7 +840,15 @@ export type AgentConnectionEvent =
 			daemonVersion?: string;
 	  }
 	| { type: "heartbeats_changed" }
-	| { type: "closed"; error?: string };
+	| {
+			type: "closed";
+			error?: string;
+			/** Why the daemon closed the attached session, when it said so (not set for a lost connection). */
+			sessionClosedReason?: AgentConnectionSessionClosedReason;
+	  };
+
+/** The daemon's session-close reasons, as the connection contract carries them. */
+export type AgentConnectionSessionClosedReason = "killed" | "shutdown" | "completed" | "replaced" | "update";
 
 export type AgentConnectionEventListener = (event: AgentConnectionEvent) => void | Promise<void>;
 export type AgentConnectionBeforeSessionInvalidateListener = () => void;

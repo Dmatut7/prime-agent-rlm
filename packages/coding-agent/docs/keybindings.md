@@ -108,6 +108,7 @@ Modifier combinations: `ctrl+shift+x`, `alt+ctrl+x`, `ctrl+shift+alt+x`, `ctrl+1
 | `app.prompt.stash` | `ctrl+s` | Stash or restore draft prompt |
 | `app.modal.back` | `left` | Go back / close the current dialog |
 | `app.subagents.focus` | `alt+a` | Open child agents |
+| `app.subagents.stopAll` | `alt+x` | Stop every running subagent of this session (press again to confirm); also works in the agents view for the selected agent's family |
 
 ### Sessions
 
