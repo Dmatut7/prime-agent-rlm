@@ -1,0 +1,3 @@
+- Fixed Enter on a subagent row in the chat's subagent panel opening the session list instead of that subagent; it now opens the selected subagent directly.
+- Fixed the subagent panel hiding every child past the fourth; the selection now scrolls through all of them, with `↑ 上面还有 N 个` / `↓ 下面还有 N 个` folds.
+- Changed the user message bubble to sit on the same one-column margin as the AI header and running card instead of a wide left indent.

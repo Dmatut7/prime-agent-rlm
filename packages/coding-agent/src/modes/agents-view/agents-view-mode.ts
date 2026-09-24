@@ -151,6 +151,8 @@ export interface AgentsViewModeOptions {
 	initialSession?: SessionSummary;
 	/** When set, the first view is rooted at this session's direct children. */
 	initialScopeKey?: AgentsViewScopeKey;
+	/** A child picked in the chat's subagent panel: opened as soon as the roster lists it. */
+	initialOpenActiveSessionId?: string;
 }
 
 export type AgentsViewRunResult =
@@ -196,6 +198,8 @@ export type AgentsViewPersistentState = {
 	lastSuccessfulLiveSummaries?: SessionSummary[];
 	savedCatalogGeneration?: number;
 	heartbeats?: AgentConnectionHeartbeat[];
+	/** Open this live session instead of showing the list, once (see takePendingOpen). */
+	pendingOpenActiveSessionId?: string;
 };
 
 type PromptCommand = Extract<DaemonCommand, { type: "prompt" }>;
@@ -319,10 +323,11 @@ export function createInitialAgentsViewScopeFrames(
 }
 
 export function createInitialAgentsViewPersistentState(
-	options: Pick<AgentsViewModeOptions, "initialScopeKey" | "initialSession">,
+	options: Pick<AgentsViewModeOptions, "initialScopeKey" | "initialSession" | "initialOpenActiveSessionId">,
 ): AgentsViewPersistentState {
 	const initialSession = options.initialSession;
 	return {
+		...(options.initialOpenActiveSessionId ? { pendingOpenActiveSessionId: options.initialOpenActiveSessionId } : {}),
 		...(initialSession
 			? {
 					selectedRowIdentity: getSummaryIdentity(initialSession),
@@ -725,6 +730,9 @@ async function runAgentsViewLoop(
 					persistentState.selectedRowIdentity = getSummaryIdentity(returnedSession);
 					persistentState.selectedSessionKey = getAgentsViewSelectionKey(returnedSession);
 				}
+				if (interactiveResult.openChildActiveSessionId) {
+					persistentState.pendingOpenActiveSessionId = interactiveResult.openChildActiveSessionId;
+				}
 				if (interactiveResult.type === "scoped_agents_view") {
 					const nextScope = { sessionId: source.sessionId, activeSessionId: source.activeSessionId };
 					persistentState.scopeFrames = transitionAgentsViewScope(persistentState.scopeFrames ?? [], {
@@ -1108,6 +1116,14 @@ export class AgentsViewMode implements Component, Focusable {
 		if (!(await this.rosterStore.attach(client))) {
 			throw new Error(STALE_ROSTER_DAEMON_MESSAGE);
 		}
+		const pendingOpen = this.takePendingOpen();
+		if (pendingOpen) {
+			// Straight through to the picked child: the list never paints.
+			this.unsubscribeClientMessage?.();
+			this.unsubscribeClientMessage = undefined;
+			this.client = undefined;
+			return pendingOpen;
+		}
 		this.subscribeToClientClose(client);
 
 		this.ui.addChild(this);
@@ -1158,6 +1174,23 @@ export class AgentsViewMode implements Component, Focusable {
 		this.animationTimer.unref?.();
 
 		return runPromise;
+	}
+
+	/**
+	 * The child picked in the chat's subagent panel, resolved against the fresh
+	 * roster. Consumed once; a child that is no longer live falls back to the
+	 * list (already scoped to its parent's children) with a note saying why.
+	 */
+	private takePendingOpen(): Extract<AgentsViewRunResult, { type: "open" }> | undefined {
+		const activeSessionId = this.persistentState.pendingOpenActiveSessionId;
+		if (!activeSessionId) return undefined;
+		this.persistentState.pendingOpenActiveSessionId = undefined;
+		const summary = this.rosterStore?.summaries().find((entry) => entry.activeSessionId === activeSessionId);
+		if (!summary) {
+			this.persistentState.statusMessage ??= "那个子代理已经不在运行了，没法直接打开；它在下面的列表里";
+			return undefined;
+		}
+		return { type: "open", summary, hasChildren: summary.hasRunningRlmChildren === true };
 	}
 
 	handleInput(data: string): void {

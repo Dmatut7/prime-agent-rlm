@@ -1141,6 +1141,8 @@ export interface InteractiveModeOptions {
 
 export interface InteractiveModeRunResult {
 	type: "agents_view" | "scoped_agents_view";
+	/** A subagent picked in the chat's panel: the agents view opens it straight away. */
+	openChildActiveSessionId?: string;
 	source: Pick<AgentConnectionState, "activeSessionId" | "sessionFile" | "sessionId" | "sessionName" | "cwd">;
 }
 
@@ -1209,6 +1211,7 @@ export class InteractiveMode {
 	private readonly retainedSubmissionGenerations = new WeakMap<PromptStash, number>();
 	private admitPendingStartupPrompts: (() => Promise<StartupPromptBarrierOutcome>) | undefined;
 	private agentsViewRequest: InteractiveModeRunResult["type"] | undefined;
+	private openChildActiveSessionId: string | undefined;
 	private loadingAnimation: Loader | undefined = undefined;
 	private workingMessage: string | undefined = undefined;
 	/** Block navigation (Alt+Up): the invisible focus owner and the focused block. */
@@ -1552,7 +1555,7 @@ export class InteractiveMode {
 		);
 		this.subagentSummaryLine = new SubagentSummaryLine();
 		this.subagentSummaryLine.setOpenable(this.options.returnToAgentsView === true);
-		this.subagentSummaryLine.onOpen = () => void this.openScopedAgentsView();
+		this.subagentSummaryLine.onOpen = (row) => void this.openScopedAgentsView(row?.activeSessionId);
 		this.subagentSummaryLine.onCancel = () => this.focusEditor();
 		this.subagentSummaryLine.onChatAction = (data) => this.handleSubagentSummaryChatAction(data);
 		this.footerDataProvider = new FooterDataProvider(this.uiServices.getInitialCwd());
@@ -2179,6 +2182,9 @@ export class InteractiveMode {
 		const state = this.connectionState;
 		return {
 			type: this.agentsViewRequest ?? "agents_view",
+			...(this.agentsViewRequest === "scoped_agents_view" && this.openChildActiveSessionId
+				? { openChildActiveSessionId: this.openChildActiveSessionId }
+				: {}),
 			source: {
 				activeSessionId: state?.activeSessionId,
 				sessionFile: state?.sessionFile,
@@ -7239,13 +7245,17 @@ export class InteractiveMode {
 		return true;
 	}
 
-	private async openScopedAgentsView(): Promise<void> {
+	/**
+	 * Enter on the subagent panel: straight into the selected child when it has a
+	 * daemon session to attach to, else this session's children list.
+	 */
+	private async openScopedAgentsView(childActiveSessionId?: string): Promise<void> {
 		if (!this.options.returnToAgentsView) {
 			this.focusEditor();
 			this.showStatus("会话列表需要后台服务；不带 --no-daemon 启动才能浏览会话");
 			return;
 		}
-		await this.returnToAgentsView("scoped_agents_view");
+		await this.returnToAgentsView("scoped_agents_view", childActiveSessionId);
 	}
 
 	private handleSubagentSummaryChatAction(data: string): void {
@@ -8576,10 +8586,14 @@ export class InteractiveMode {
 		await this.returnToAgentsView();
 	}
 
-	private async returnToAgentsView(request: InteractiveModeRunResult["type"] = "agents_view"): Promise<void> {
+	private async returnToAgentsView(
+		request: InteractiveModeRunResult["type"] = "agents_view",
+		openChildActiveSessionId?: string,
+	): Promise<void> {
 		if (this.isShuttingDown || this.agentsViewRequest) return;
 		this.stashDraftForAgentsView();
 		this.agentsViewRequest = request;
+		this.openChildActiveSessionId = openChildActiveSessionId;
 		this.isShuttingDown = true;
 		this.unregisterSignalHandlers();
 

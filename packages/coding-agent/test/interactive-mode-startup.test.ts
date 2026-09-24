@@ -172,7 +172,7 @@ describe("InteractiveMode startup hints", () => {
 
 		await Reflect.get(InteractiveMode.prototype, "openScopedAgentsView").call(mode);
 
-		expect(returnToAgentsView).toHaveBeenCalledWith("scoped_agents_view");
+		expect(returnToAgentsView).toHaveBeenCalledWith("scoped_agents_view", undefined);
 		expect(showStatus).not.toHaveBeenCalled();
 	});
 

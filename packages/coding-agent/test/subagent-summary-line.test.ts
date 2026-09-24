@@ -529,7 +529,35 @@ describe("SubagentSummaryLine", () => {
 		line.onOpen = () => void open.call(mode);
 
 		line.handleInput("\r");
-		await vi.waitFor(() => expect(returnToAgentsView).toHaveBeenCalledWith("scoped_agents_view"));
+		await vi.waitFor(() => expect(returnToAgentsView).toHaveBeenCalledWith("scoped_agents_view", undefined));
+	});
+
+	it("opens the selected child itself when its row carries a daemon session", async () => {
+		const returnToAgentsView = vi.fn(async () => undefined);
+		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
+		Object.assign(mode, { editor: { getText: () => "" }, options: { returnToAgentsView: true }, returnToAgentsView });
+		const open = Reflect.get(InteractiveMode.prototype, "openScopedAgentsView") as (
+			this: typeof mode,
+			childActiveSessionId?: string,
+		) => Promise<void>;
+		const line = new SubagentSummaryLine();
+		line.setSubagentCounts({ total: 2, running: 2, idle: 0, inactive: 0 });
+		line.setSubagentRows(
+			buildSubagentPanelRows(
+				[
+					child("a", "running", { activeSessionId: "active-a" }),
+					child("b", "running", { activeSessionId: "active-b" }),
+				],
+				undefined,
+			),
+		);
+		line.setOpenable(true);
+		line.focused = true;
+		line.onOpen = (row) => void open.call(mode, row?.activeSessionId);
+
+		line.handleInput("\x1b[B");
+		line.handleInput("\r");
+		await vi.waitFor(() => expect(returnToAgentsView).toHaveBeenCalledWith("scoped_agents_view", "active-b"));
 	});
 });
 
@@ -1245,6 +1273,61 @@ describe("subagent panel rows (design board 06)", () => {
 		expect(lines).toHaveLength(6);
 		expect(lines[5]).toBe("   … 还有 2 个");
 		expect(lines.join("\n")).not.toContain("⚠");
+	});
+
+	it("scrolls the focused selection through every row past the fold and opens the one selected", () => {
+		const line = new SubagentSummaryLine();
+		line.setSubagentCounts({ total: 6, running: 6, idle: 0, inactive: 0 });
+		line.setSubagentRows(
+			Array.from({ length: 6 }, (_, index) => ({ id: `c${index}`, name: `w${index}`, state: "running" as const })),
+		);
+		line.setOpenable(true);
+		const onOpen = vi.fn();
+		line.onOpen = onOpen;
+		line.focused = true;
+		let lines = line.render(80).map(stripAnsi);
+		expect(lines.at(-1)).toBe("   ↓ 下面还有 2 个");
+
+		for (let press = 0; press < 5; press++) line.handleInput("\x1b[B");
+		lines = line.render(80).map(stripAnsi);
+		// Header, the fold above, then the last four rows with w5 selected; nothing below.
+		expect(lines).toHaveLength(6);
+		expect(lines[1]).toBe("   ↑ 上面还有 2 个");
+		expect(lines.slice(2).map((text) => text.match(/w\d/)?.[0])).toEqual(["w2", "w3", "w4", "w5"]);
+		expect(lines[5]?.startsWith(" › ● w5")).toBe(true);
+		expect(lines.join("\n")).not.toContain("下面还有");
+		// The last row is the floor: another ↓ stays on it.
+		line.handleInput("\x1b[B");
+		line.handleInput("\r");
+		expect(onOpen).toHaveBeenCalledWith(expect.objectContaining({ id: "c5", name: "w5" }));
+
+		// Moving up inside the window leaves it where it is.
+		for (let press = 0; press < 3; press++) line.handleInput("\x1b[A");
+		lines = line.render(80).map(stripAnsi);
+		expect(lines[1]).toBe("   ↑ 上面还有 2 个");
+		expect(lines[2]?.startsWith(" › ● w2")).toBe(true);
+		// Past its top edge, the window follows.
+		line.handleInput("\x1b[A");
+		lines = line.render(80).map(stripAnsi);
+		expect(lines[1]).toBe("   ↑ 上面还有 1 个");
+		expect(lines[2]?.startsWith(" › ● w1")).toBe(true);
+		expect(lines.at(-1)).toBe("   ↓ 下面还有 1 个");
+	});
+
+	it("keeps the selection on the same child when the rows reorder", () => {
+		const line = new SubagentSummaryLine();
+		line.setSubagentCounts({ total: 3, running: 3, idle: 0, inactive: 0 });
+		const running = (id: string) => ({ id, name: id, state: "running" as const });
+		line.setSubagentRows([running("x"), running("y"), running("z")]);
+		line.setOpenable(true);
+		line.focused = true;
+		line.handleInput("\x1b[B");
+		// y finishes and sorts to the bottom: the selector goes with it.
+		line.setSubagentRows([running("x"), running("z"), { id: "y", name: "y", state: "done" as const }]);
+		const onOpen = vi.fn();
+		line.onOpen = onOpen;
+		line.handleInput("\r");
+		expect(onOpen).toHaveBeenCalledWith(expect.objectContaining({ id: "y" }));
 	});
 
 	it("never exceeds the width and drops the activity column before anything else", () => {

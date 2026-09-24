@@ -243,24 +243,23 @@ describe("the ◆ prime header and the gutter", () => {
 });
 
 describe("the user bubble", () => {
-	it("sits in from the left with a you label and the send time", () => {
+	it("sits on the one-column margin with a you label and the send time", () => {
 		const at = new Date(2026, 8, 24, 20, 14).getTime();
 		const lines = new UserMessageComponent("你先看一下这个", undefined, () => false, at).render(120);
 		const text = plain(lines).map((line) => line.replace(/\x1b\][^\x07]*\x07/g, ""));
-		expect(text[0]).toMatch(/^ {8} {2}you {2}20:14 +$/);
-		expect(text[1]).toMatch(/^ {8} {2}你先看一下这个 +$/);
+		expect(text[0]).toMatch(/^ {1} {2}you {2}20:14 +$/);
+		expect(text[1]).toMatch(/^ {1} {2}你先看一下这个 +$/);
 		for (const line of lines) expect(visibleWidth(line)).toBe(120);
-		// The bubble is tinted; the indent is not.
-		expect(lines[1]?.replace(/\x1b\][^\x07]*\x07/g, "").startsWith(" ".repeat(8))).toBe(true);
-		expect(lines[1]).toContain("\x1b[48;");
+		// The bubble is tinted from column 1 to the right edge; only the margin column is not.
+		const raw = lines[1]?.replace(/\x1b\][^\x07]*\x07/g, "") ?? "";
+		expect(raw.startsWith(" \x1b[48;")).toBe(true);
 	});
 
-	it("shrinks the indent on narrow screens and wraps inside the bubble", () => {
-		expect(userBubbleIndent(120)).toBe(8);
-		expect(userBubbleIndent(80)).toBe(4);
-		expect(userBubbleIndent(40)).toBe(2);
+	it("keeps the same margin at every width, lined up with the AI header, and wraps inside the bubble", () => {
+		for (const width of [120, 80, 40, 20]) expect(userBubbleIndent(width)).toBe(1);
+		expect(userBubbleIndent(7)).toBe(0);
 		const lines = plain(new UserMessageComponent("字".repeat(60), undefined, () => false).render(80));
-		// 80 - 4 indent - 2×2 padding = 72 cells of text = 36 CJK characters per row.
+		// 80 - 1 margin - 2×2 padding = 75 cells of text = 37 CJK characters per row.
 		expect(lines.filter((line) => line.includes("字"))).toHaveLength(2);
 		for (const line of lines) expect(visibleWidth(line)).toBe(80);
 	});

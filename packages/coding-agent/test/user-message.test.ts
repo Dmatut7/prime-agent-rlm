@@ -66,10 +66,10 @@ describe("UserMessageComponent", () => {
 		const plain = new UserMessageComponent(text)
 			.render(60)
 			.map((line) => line.replace(/\x1b\[[0-9;]*m|\x1b\]133;[ABC]\x07/g, "").trimEnd());
-		// 60 columns: a 2-column indent, then the bubble's 2-column padding.
-		expect(plain).toContain("    print(type(agent_message).__name__)");
-		expect(plain).toContain("      - not a list");
-		expect(plain).toContain("    # not a heading");
+		// 60 columns: the 1-column margin, then the bubble's 2-column padding.
+		expect(plain).toContain("   print(type(agent_message).__name__)");
+		expect(plain).toContain("     - not a list");
+		expect(plain).toContain("   # not a heading");
 	});
 
 	test("colors only recognized leading slash commands", () => {

@@ -61,11 +61,14 @@ class HighlightedText implements Component {
 	}
 }
 
-/** How far the bubble sits in from the left: like the other side of a chat, less on narrow screens. */
+/**
+ * How far the bubble sits in from the left: the same one-column margin as the
+ * AI header, gutter and running card (some terminals clip column 0), so both
+ * edges line up with everything else; the tint alone marks the user's words.
+ * Below 10 columns every cell goes to the text.
+ */
 export function userBubbleIndent(width: number): number {
-	if (width >= 100) return 8;
-	if (width >= 70) return 4;
-	return width >= 30 ? 2 : 0;
+	return width >= 10 ? 1 : 0;
 }
 
 /** Columns of padding inside the bubble, left and right. */
@@ -79,7 +82,7 @@ function sentAtText(sentAt: number | undefined): string {
 }
 
 /**
- * v3 chat layers: the user's words in a tinted bubble set in from the left,
+ * v3 chat layers: the user's words in a tinted bubble on the one-column margin,
  * with a `you` label and the send time on top - so a screen of text shows at
  * a glance which lines are the user's.
  */

@@ -1419,6 +1419,28 @@ describe("AgentsViewMode roster client wiring", () => {
 		}
 	});
 
+	it("opens a child picked in the chat's subagent panel without painting the list", async () => {
+		const parent = summary({ id: "parent", activeSessionId: "parent", sessionId: "parent" });
+		const picked = summary({ id: "child", activeSessionId: "child", sessionId: "child", parentSessionId: "parent" });
+		const persistentState = createInitialAgentsViewPersistentState({ initialOpenActiveSessionId: "child" });
+		persistentState.rosterStore = {
+			attach: vi.fn(async () => true),
+			summaries: () => [parent, picked],
+		} as unknown as AgentsViewRosterStore;
+		const view = new AgentsViewMode(
+			{ config: {}, socketPath: "/tmp/agents-view.sock", uiServices: createUiServices() },
+			persistentState,
+		);
+
+		try {
+			await expect(view.run()).resolves.toMatchObject({ type: "open", summary: { activeSessionId: "child" } });
+			// One shot: the next view is the ordinary list.
+			expect(persistentState.pendingOpenActiveSessionId).toBeUndefined();
+		} finally {
+			stopThemeWatcher();
+		}
+	});
+
 	it("reconnects a stale roster client before handing it to the roster store", async () => {
 		modeMocks.clientConstructions.length = 0;
 		const attached: unknown[] = [];

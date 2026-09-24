@@ -194,6 +194,8 @@ export type SubagentPanelRowState = "running" | "idle" | "done" | "failed" | "st
 
 export interface SubagentPanelRow {
 	id: string;
+	/** The child's daemon session, when it has one: Enter opens it directly. */
+	activeSessionId?: string;
 	/** Display name (session name, else label). */
 	name: string;
 	state: SubagentPanelRowState;
@@ -203,7 +205,7 @@ export interface SubagentPanelRow {
 	activity?: string;
 }
 
-/** Rows shown before the rest fold into `… 还有 N 个`. */
+/** Rows shown at once; the rest scroll into view as the selection moves. */
 export const SUBAGENT_PANEL_MAX_ROWS = 4;
 
 const ROW_STATE_ORDER: Record<SubagentPanelRowState, number> = {
@@ -262,6 +264,7 @@ export function buildSubagentPanelRows(
 						? "idle"
 						: "done";
 		const row: SubagentPanelRow = { id: child.id, name: child.sessionName ?? child.label, state };
+		if (child.activeSessionId) row.activeSessionId = child.activeSessionId;
 		if (child.durationMs !== undefined) row.elapsedMs = child.durationMs;
 		const activity = rowActivity(child, state);
 		if (activity) row.activity = activity;
@@ -390,12 +393,14 @@ export class SubagentSummaryLine implements Component, Focusable {
 	private stallMarkers: readonly string[] = [];
 	private rows: readonly SubagentPanelRow[] = [];
 	private selectedRow = 0;
+	private windowStart = 0;
 	private openable = false;
 	private cachedWidth?: number;
 	private cachedKey?: string;
 	private cachedLines?: string[];
 
-	onOpen?: () => void;
+	/** Enter/open: the selected row, when the panel lists rows. */
+	onOpen?: (row: SubagentPanelRow | undefined) => void;
 	onCancel?: () => void;
 	onChatAction?: (data: string) => void;
 
@@ -427,8 +432,12 @@ export class SubagentSummaryLine implements Component, Focusable {
 	 * family) the header stands alone and stall markers keep their own lines.
 	 */
 	setSubagentRows(rows: readonly SubagentPanelRow[]): void {
+		// Keep the selection on the same child when the rows reorder (a child
+		// finishing moves down the list), else clamp it into range.
+		const selectedId = this.rows[this.selectedRow]?.id;
 		this.rows = rows;
-		this.selectedRow = Math.min(this.selectedRow, Math.max(0, this.visibleRowCount() - 1));
+		const kept = selectedId === undefined ? -1 : rows.findIndex((row) => row.id === selectedId);
+		this.selectedRow = kept !== -1 ? kept : Math.min(this.selectedRow, Math.max(0, rows.length - 1));
 	}
 
 	setOpenable(openable: boolean): void {
@@ -442,7 +451,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 	handleInput(data: string): void {
 		const keybindings = getKeybindings();
 		if (keybindings.matches(data, "tui.select.confirm") || keybindings.matches(data, "app.agents.open")) {
-			if (this.isSelectable()) this.onOpen?.();
+			if (this.isSelectable()) this.onOpen?.(this.rows[this.selectedRow]);
 			return;
 		}
 		if (keybindings.matches(data, "tui.select.up") && this.selectedRow > 0) {
@@ -450,7 +459,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 			this.invalidate();
 			return;
 		}
-		if (keybindings.matches(data, "tui.select.down") && this.selectedRow < this.visibleRowCount() - 1) {
+		if (keybindings.matches(data, "tui.select.down") && this.selectedRow < this.rows.length - 1) {
 			this.selectedRow += 1;
 			this.invalidate();
 			return;
@@ -461,6 +470,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 			keybindings.matches(data, "app.agents.back")
 		) {
 			this.selectedRow = 0;
+			this.windowStart = 0;
 			this.onCancel?.();
 			return;
 		}
@@ -510,8 +520,20 @@ export class SubagentSummaryLine implements Component, Focusable {
 		].join("\u0002");
 	}
 
-	private visibleRowCount(): number {
-		return Math.min(this.rows.length, SUBAGENT_PANEL_MAX_ROWS);
+	/**
+	 * The rows on screen: a window of SUBAGENT_PANEL_MAX_ROWS that follows the
+	 * selection while the panel has focus, so every child is reachable with the
+	 * arrow keys; unfocused it shows the most relevant rows from the top.
+	 */
+	private visibleWindow(): { start: number; rows: readonly SubagentPanelRow[] } {
+		const size = Math.min(this.rows.length, SUBAGENT_PANEL_MAX_ROWS);
+		if (!this.focused) return { start: 0, rows: this.rows.slice(0, size) };
+		// The window moves only when the selection would leave it, like any list.
+		let start = Math.min(this.windowStart, this.rows.length - size);
+		if (this.selectedRow < start) start = this.selectedRow;
+		if (this.selectedRow >= start + size) start = this.selectedRow - size + 1;
+		this.windowStart = Math.max(0, start);
+		return { start: this.windowStart, rows: this.rows.slice(this.windowStart, this.windowStart + size) };
 	}
 
 	/**
@@ -526,12 +548,18 @@ export class SubagentSummaryLine implements Component, Focusable {
 		if (this.counts.total === 0) return [];
 		const safeWidth = Math.max(1, width);
 		const lines = [this.renderHeader(safeWidth)];
-		const shown = this.rows.slice(0, SUBAGENT_PANEL_MAX_ROWS);
+		const { start, rows: shown } = this.visibleWindow();
+		if (start > 0) {
+			lines.push(theme.fg("dim", truncateToWidth(`   ↑ 上面还有 ${start} 个`, safeWidth, "")));
+		}
 		shown.forEach((row, index) => {
-			lines.push(this.renderRow(row, safeWidth, this.focused && index === this.selectedRow));
+			lines.push(this.renderRow(row, safeWidth, this.focused && start + index === this.selectedRow));
 		});
-		if (this.rows.length > shown.length) {
-			lines.push(theme.fg("dim", truncateToWidth(`   … 还有 ${this.rows.length - shown.length} 个`, safeWidth, "")));
+		const below = this.rows.length - start - shown.length;
+		if (below > 0) {
+			// Unfocused, the header's `↓ 选择` is the way in; focused, the arrow scrolls on.
+			const fold = this.focused ? `   ↓ 下面还有 ${below} 个` : `   … 还有 ${below} 个`;
+			lines.push(theme.fg("dim", truncateToWidth(fold, safeWidth, "")));
 		}
 		// A stalled session with a row already reads 卡住 there; one without a row
 		// (roster-only, or folded past the row cap) keeps its marker line, so a
@@ -594,7 +622,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 		const prefix = selected ? ` ${theme.fg("accent", "›")} ` : "   ";
 		const nameWidth = Math.min(
 			ROW_NAME_MAX_WIDTH,
-			Math.max(...this.rows.slice(0, SUBAGENT_PANEL_MAX_ROWS).map((entry) => visibleWidth(entry.name)), 4),
+			Math.max(...this.rows.map((entry) => visibleWidth(entry.name)), 4),
 		);
 		const name = truncateToWidth(row.name, nameWidth, "…");
 		const namePadded = name + " ".repeat(Math.max(0, nameWidth - visibleWidth(name)));
