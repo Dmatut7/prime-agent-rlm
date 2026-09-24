@@ -5,3 +5,4 @@
 - Added self-recovery and duty-log entries to the session transcript for every automatic stop, continue and reminder.
 - Changed the silent-step rule to count CPU burned by the step's process tree (`tools.timeout.silentStuckCpuMs`, default 1000) as activity, and to honour a longer timeout the model gave the call, so quiet test runs, installs and compiles are never stopped.
 - Fixed a false "completed without a reply" notice that woke the parent after it deleted or released a subagent whose reply had been queued.
+- Fixed automatic continue treating a closing offer ("接下来我可以……", "If you want, I can also…") as an unfinished next step.

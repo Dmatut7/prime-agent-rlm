@@ -62,6 +62,9 @@ const OPEN_CHECKLIST_PATTERN = /^\s*[-*]\s*\[ \]\s+\S/m;
 const FINAL_REPLY_PATTERNS: readonly RegExp[] = [
 	/待命|等待(?:子代理|回复|结果|你的)|等你|请确认|需要你|你来决定|是否需要|要不要/u,
 	/\b(?:waiting for|standing by|let me know|should i|do you want)\b/i,
+	// Offers, not commitments: "接下来我可以……" / "如需要我再……" after a finished answer.
+	/(?:我|也|还)(?:可以|能)(?:帮|再|继续|进一步|顺便)|如(?:果)?(?:你)?(?:需要|愿意|想)|如需|若需要|有需要|需要的话/u,
+	/\b(?:if you(?:'d)? (?:like|want|need)|i can also|i could|happy to|feel free)\b/i,
 	/[?？]\s*$/u,
 ];
 

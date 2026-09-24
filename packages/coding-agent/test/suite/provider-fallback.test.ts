@@ -321,6 +321,45 @@ describe("provider fallback chain (unattended self-recovery)", () => {
 		expect(harness.eventsOfType("auto_retry_start").some((event) => event.reason === "backup")).toBe(false);
 	});
 
+	it("is off when providerFallbackModels is unset: no model fleet is built in", async () => {
+		const harness = await createHarness({
+			models: MODELS,
+			settings: { ...settings(), providerFallbackModels: undefined },
+		});
+		harnesses.push(harness);
+		const served: string[] = [];
+		const step = perModel({ "faux-1": [quotaFailure(), fauxAssistantMessage("waited it out")] }, served);
+		harness.setResponses([step, step]);
+
+		await harness.session.prompt("do the work");
+
+		expect(served).toEqual(["faux-1", "faux-1"]);
+	});
+
+	it("skips a model that cannot see images when the context holds images the serving model reads", async () => {
+		const harness = await createHarness({
+			models: [
+				{ id: "faux-1", input: ["text", "image"] },
+				{ id: "faux-kimi", input: ["text"] },
+				{ id: "faux-qwen", input: ["text", "image"] },
+			],
+			settings: settings(),
+		});
+		harnesses.push(harness);
+		const served: string[] = [];
+		const step = perModel(
+			{ "faux-1": [quotaFailure()], "faux-qwen": [fauxAssistantMessage("qwen saw the picture")] },
+			served,
+		);
+		harness.setResponses([step, step]);
+
+		await harness.session.prompt("what is in this picture?", {
+			images: [{ type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" }],
+		});
+
+		expect(served).toEqual(["faux-1", "faux-qwen"]);
+	});
+
 	it("gives explicit user model choices precedence over a running fallback", async () => {
 		const harness = await harnessWith();
 		const served: string[] = [];

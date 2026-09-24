@@ -144,6 +144,14 @@ function makeSupervisor(idleEvictionMinutes: number | "off" = 90): SupervisorInt
 	return supervisor;
 }
 
+/** The long tier budget of a first dispatch, less the few ms the delivery deadline aged before it. */
+function freshLongTierBudget() {
+	return expect.toSatisfy(
+		(timeoutMs: number) =>
+			timeoutMs <= WORKER_REQUEST_TIMEOUT_TIERS.long && timeoutMs > WORKER_REQUEST_TIMEOUT_TIERS.long - 1_000,
+	);
+}
+
 describe("daemon supervisor whole-tree eviction", () => {
 	it("derives a bounded sweep interval from the live threshold", () => {
 		expect(idleEvictionSweepIntervalMs("off")).toBe(5 * 60_000);
@@ -527,17 +535,16 @@ describe("daemon supervisor whole-tree eviction", () => {
 			"sender",
 			expect.objectContaining({ type: "create", sessionPath: "/tmp/target.jsonl", continueRecent: false }),
 		);
-		// First dispatch on a fresh entry: the long tier budget, not clamped by the
-		// (barely aged) delivery deadline. The same literal assertion in the
-		// same-worker test below stayed green through every run, so the number is
-		// deterministic in this harness.
+		// First dispatch on a fresh entry: the long tier budget. The delivery deadline
+		// already aged by the time the dispatch is computed, so a slow runner can see it
+		// a few milliseconds short of the full tier (CI saw 86399999).
 		expect(target.client?.requestWorker).toHaveBeenCalledWith(
 			expect.objectContaining({
 				type: "worker_deliver_message",
 				targetActiveSessionId: "target-active",
 				message: "wake up",
 			}),
-			WORKER_REQUEST_TIMEOUT_TIERS.long,
+			freshLongTierBudget(),
 			// The delivery reports how far the frame got towards the wire, so a
 			// transport that was already gone is never receipted as "may have arrived".
 			expect.objectContaining({ onDispatch: expect.any(Function) }),
@@ -578,7 +585,7 @@ describe("daemon supervisor whole-tree eviction", () => {
 				targetActiveSessionId: "target-active",
 				message: "continue",
 			}),
-			WORKER_REQUEST_TIMEOUT_TIERS.long,
+			freshLongTierBudget(),
 			expect.objectContaining({ onDispatch: expect.any(Function) }),
 		);
 		expect(worker.client?.request).not.toHaveBeenCalled();

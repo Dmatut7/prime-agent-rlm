@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.11.2] - 2026-09-23
+
+- Added an escalated slow tier to the in-place empty-turn retry ladder: after the fast attempts are spent, up to three more resends wait 30s/60s/120s, with per-tier wait budgets and tier-split exhaustion diagnostics.
+- Added a per-tool-call deadline (`AgentLoopConfig.toolTimeout`, refinable per tool via `AgentTool.executionTimeoutMs`): a call that settles nothing before the deadline is cancelled through the abort harvest, the model receives a `tool_timeout:` tool result, and the turn continues.
+
 ## [0.11.0] - 2026-09-22
 
 - Added optional stream stall detection to the agent loop: `AgentLoopConfig.streamStallTimeoutMs` aborts a provider stream that produces no events for the configured duration and settles the turn with a retryable `stopReason: "error"` message instead of hanging on a dead connection.

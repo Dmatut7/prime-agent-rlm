@@ -23,7 +23,6 @@ import { clampCompactionTriggerRatio } from "./compaction/compaction.js";
 import { DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS } from "./extensions/timeout.js";
 import { RETIRED_VENV_RETENTION } from "./kernel/venv-in-use.js";
 import {
-	DEFAULT_PROVIDER_FALLBACK_MODELS,
 	PROVIDER_LONG_WAIT_BASE_MS,
 	PROVIDER_LONG_WAIT_MAX_MS,
 	PROVIDER_LONG_WAIT_MAX_ROUNDS,
@@ -801,8 +800,7 @@ export interface Settings {
 	 * provider, quota exhaustion, or a storm of invalid tool calls. The session
 	 * stays on the fallback, probes the primary again after 30 minutes, and when
 	 * every model fails waits in long rounds instead of ending the task.
-	 * Unset: the built-in chain (bailian glm-5.3-prime → kimi-k3 →
-	 * qwen3.8-max-0902), filtered to models with configured auth. `[]`: off.
+	 * Entries without configured auth are skipped. Unset or `[]`: off.
 	 */
 	providerFallbackModels?: string[];
 	/**
@@ -2867,7 +2865,9 @@ export class SettingsManager {
 	/** The fallback chain references, in order; `[]` when switched off. */
 	getProviderFallbackModels(): string[] {
 		const references = this.settings.providerFallbackModels;
-		if (references === undefined || references === null) return [...DEFAULT_PROVIDER_FALLBACK_MODELS];
+		// Unset means no chain: which models a machine may fall back to is the owner's
+		// choice, kept in their settings, not a fleet baked into the source.
+		if (references === undefined || references === null) return [];
 		// A malformed value behaves as off rather than as the default chain: the
 		// owner wrote something, and an unexpected switch is the worse surprise.
 		if (!Array.isArray(references)) return [];

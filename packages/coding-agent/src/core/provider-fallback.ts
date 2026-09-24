@@ -1,3 +1,5 @@
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+
 /**
  * Unattended self-recovery across models (the fallback chain).
  *
@@ -8,17 +10,6 @@
  * module holds the policy constants, the storm detector, and the persisted
  * record of every switch, return and long wait (the duty log reads it).
  */
-
-/**
- * Chain tried in order when `providerFallbackModels` is unset. Only entries the
- * registry can serve with configured auth are used, so on a machine without
- * these models the chain is simply empty.
- */
-export const DEFAULT_PROVIDER_FALLBACK_MODELS: readonly string[] = [
-	"bailian/glm-5.3-prime",
-	"bailian/kimi-k3",
-	"bailian/qwen3.8-max-0902",
-];
 
 /** How long a session stays on a fallback before the next turn probes the primary again. */
 export const PROVIDER_FALLBACK_RETURN_AFTER_MS = 30 * 60_000;
@@ -141,5 +132,15 @@ export function isBadToolCall(result: { isError: boolean; text: string; args?: u
 	return (
 		result.args === undefined ||
 		(typeof result.args === "object" && result.args !== null && Object.keys(result.args).length === 0)
+	);
+}
+
+/** Whether any message in a context carries an image block. */
+export function contextHasImages(messages: readonly AgentMessage[]): boolean {
+	return messages.some(
+		(message) =>
+			"content" in message &&
+			Array.isArray(message.content) &&
+			message.content.some((block) => typeof block === "object" && block !== null && block.type === "image"),
 	);
 }

@@ -294,6 +294,7 @@ import {
 import { expandPromptTemplate, type PromptTemplate, parseCommandArgs } from "./prompt-templates.js";
 import {
 	BAD_TOOL_CALL_STORM_THRESHOLD,
+	contextHasImages,
 	describeProviderFailureCause,
 	isBadToolCall,
 	PROVIDER_FALLBACK_ENTRY_TYPE,
@@ -1322,6 +1323,17 @@ function visibleSessionActionProjection(actions: readonly QueuedSessionAction[])
 const WAIT_FOR_IDLE_POLL_MS = 50;
 /** Deleted or released child runs kept for re-validating their late terminal notices. */
 const RETIRED_RLM_CHILD_RUNS_MAX = 64;
+
+/** The verdict fields of a child run that its late terminal notices are re-validated against. */
+type RetiredRlmChildRun = Pick<
+	RlmChildRun,
+	| "id"
+	| "provisionalNoReplyReplyIds"
+	| "noReplyVerdictSupersededBy"
+	| "noReplyNoticeSuperseded"
+	| "provisionalFailureNoticeReplyId"
+	| "failureVerdictSupersededBy"
+>;
 
 /**
  * Consecutive progress-free cycles after which waitForIdle stops waiting and reports the
@@ -2692,7 +2704,7 @@ export class AgentSession {
 	 * re-validating it needs the run's delivery record: without it a reply that did
 	 * land reads as missing and the parent is woken by a false "no reply" notice.
 	 */
-	private readonly _retiredRlmChildRuns = new Map<string, RlmChildRun>();
+	private readonly _retiredRlmChildRuns = new Map<string, RetiredRlmChildRun>();
 	/** Wall-clock ms of the last accepted progress note; throttles rlm.progress.note. */
 	private _lastRlmProgressNoteAt: number | undefined;
 	private _unsettledRlmChildRuns = new Set<RlmChildRun>();
@@ -16936,11 +16948,22 @@ export class AgentSession {
 			.catch(() => undefined);
 	}
 
-	/** Keep a removed child's run for notice re-validation; bounded, oldest dropped first. */
+	/**
+	 * Keep a removed child's delivery record for notice re-validation. Only the
+	 * verdict fields are copied: holding the run itself would pin its child session
+	 * and transcript in memory. Bounded, oldest dropped first.
+	 */
 	private _retireRlmChildRun(childId: string, run: RlmChildRun | undefined): void {
 		if (!run) return;
 		this._retiredRlmChildRuns.delete(childId);
-		this._retiredRlmChildRuns.set(childId, run);
+		this._retiredRlmChildRuns.set(childId, {
+			id: run.id,
+			provisionalNoReplyReplyIds: run.provisionalNoReplyReplyIds,
+			noReplyVerdictSupersededBy: run.noReplyVerdictSupersededBy,
+			noReplyNoticeSuperseded: run.noReplyNoticeSuperseded,
+			provisionalFailureNoticeReplyId: run.provisionalFailureNoticeReplyId,
+			failureVerdictSupersededBy: run.failureVerdictSupersededBy,
+		});
 		while (this._retiredRlmChildRuns.size > RETIRED_RLM_CHILD_RUNS_MAX) {
 			const oldest = this._retiredRlmChildRuns.keys().next().value;
 			if (oldest === undefined) break;
@@ -16948,8 +16971,8 @@ export class AgentSession {
 		}
 	}
 
-	/** A child's run, including one whose child was already deleted or released. */
-	private _rlmChildRunForNotice(childId: string): RlmChildRun | undefined {
+	/** A child's run, or the delivery record of one whose child was already deleted or released. */
+	private _rlmChildRunForNotice(childId: string): RetiredRlmChildRun | undefined {
 		return (
 			this._activeRlmChildRuns.get(childId) ??
 			this._rlmChildSessions.get(childId)?.run ??
@@ -19174,7 +19197,8 @@ export class AgentSession {
 	/**
 	 * The next model of the fallback chain that can serve this turn: configured
 	 * auth, not already tried this episode, not the serving model or the
-	 * primary, image-capable when the run is routed for images, and with a
+	 * primary, image-capable when the run is routed for images or its context
+	 * holds images the serving model reads, and with a
 	 * context window that holds the current context (so a switch never needs
 	 * to drop history).
 	 */
@@ -19188,11 +19212,16 @@ export class AgentSession {
 		if (this._fallback) excluded.add(key(this._fallback.primary));
 		const contextTokens = this.getContextUsage()?.tokens ?? 0;
 		const available = this._modelRegistry.getAvailable();
+		// A run routed for images, or a vision model already reading images in this
+		// context, must not move to a model that would silently drop them.
+		const needsImages =
+			this.agent.modelOverride !== undefined ||
+			(serving?.input.includes("image") === true && contextHasImages(this.agent.state.messages));
 		for (const reference of references) {
 			const candidate = findExactModelReferenceMatch(reference, available);
 			if (!candidate || excluded.has(key(candidate))) continue;
 			if (!this._modelRegistry.hasConfiguredAuth(candidate)) continue;
-			if (this.agent.modelOverride && !candidate.input.includes("image")) continue;
+			if (needsImages && !candidate.input.includes("image")) continue;
 			if (candidate.contextWindow > 0 && contextTokens > candidate.contextWindow * 0.9) continue;
 			return candidate;
 		}
