@@ -1,0 +1,1 @@
+- Fixed a pasted image file path on a text-only model: attach_image now loads it, the configured image model reads it, and the task hands back to the session model instead of the model delegating the image to a subagent.

@@ -1,0 +1,1 @@
+- Fixed the stall diagnostics block opened with Ctrl+Y having no way to close: it now ends with a "Ctrl+Y 收起" hint and the same key closes it.

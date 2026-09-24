@@ -1272,6 +1272,8 @@ export class InteractiveMode {
 	private stallActionBarSettled = false;
 	/** B1: the stall bar's input route, registered once and unregistered on teardown. */
 	private removeStallActionInputListener: (() => void) | undefined = undefined;
+	/** The open stall diagnostics block; the diagnostics key pressed again closes it. */
+	private stallDiagnosticsPanel: { components: Component[]; removeInputListener: () => void } | undefined;
 	/**
 	 * U6 评审②: the memoized watermark pair. One frame, one value: the footer
 	 * and the tray fallback both read this, and it only recomputes after an
@@ -9564,14 +9566,44 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	/** The stall's forensic lines, asked for with the diagnostics key: dim, titled, never an error. */
+	/**
+	 * The stall's forensic lines, asked for with the diagnostics key: dim, titled, never an
+	 * error. The block is long and only worth a look, so the same key closes it again; a
+	 * live stall bar keeps that key for itself (it opens the newer stall's lines instead).
+	 */
 	private showStallDiagnostics(event: StallEventView): void {
-		if (this.chatContainer.children.length > 0) this.chatContainer.addChild(new Spacer(1));
-		const lines = formatStallEventLines(event);
-		this.chatContainer.addChild(
-			new Text([theme.fg("muted", "诊断详情"), ...lines.map((line) => theme.fg("dim", line))].join("\n"), 1, 0),
-		);
+		this.closeStallDiagnostics({ render: false });
+		const components: Component[] = [];
+		if (this.chatContainer.children.length > 0) components.push(new Spacer(1));
+		const closeKey = keyText("app.stall.diagnostics");
+		const lines = [
+			theme.fg("muted", "诊断详情"),
+			...formatStallEventLines(event).map((line) => theme.fg("dim", line)),
+			...(closeKey.trim().length > 0 ? [theme.fg("muted", `${closeKey} 收起`)] : []),
+		];
+		components.push(new Text(lines.join("\n"), 1, 0));
+		for (const component of components) this.chatContainer.addChild(component);
+		const removeInputListener = this.ui.addInputListener((data) => {
+			if (isMouseSequence(data) || isKeyRelease(data)) return undefined;
+			if (!this.keybindings.matches(data, "app.stall.diagnostics")) return undefined;
+			if (this.stallActionBar !== undefined && !this.stallActionBar.isDismissed) return undefined;
+			// The chat was cleared under the block (/new, resume): nothing left to close, so the
+			// key goes back to its editor meaning.
+			const open = components.every((component) => this.chatContainer.children.includes(component));
+			this.closeStallDiagnostics();
+			return open ? { consume: true } : undefined;
+		});
+		this.stallDiagnosticsPanel = { components, removeInputListener };
 		this.ui.requestRender();
+	}
+
+	private closeStallDiagnostics(options: { render?: boolean } = {}): void {
+		const panel = this.stallDiagnosticsPanel;
+		if (panel === undefined) return;
+		this.stallDiagnosticsPanel = undefined;
+		panel.removeInputListener();
+		for (const component of panel.components) this.chatContainer.removeChild(component);
+		if (options.render !== false) this.ui.requestRender();
 	}
 
 	showWarning(warningMessage: string): void {

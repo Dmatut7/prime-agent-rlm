@@ -223,7 +223,7 @@ import {
 	validateGoalBudget,
 	validateGoalObjective,
 } from "./goals.js";
-import { resolveImageModelOverride } from "./image-model-routing.js";
+import { type ImageModelRoutingInputs, resolveImageModelOverride } from "./image-model-routing.js";
 import {
 	classifyIncomingInput,
 	type InputClass,
@@ -3950,7 +3950,11 @@ export class AgentSession {
 		const sessionModel = this.model;
 		if (!sessionModel) return undefined;
 		if (!batchCarriesImages(turns, extraMessages)) return undefined;
-		return resolveImageModelOverride({
+		return resolveImageModelOverride(this._imageModelRoutingInputs(sessionModel));
+	}
+
+	private _imageModelRoutingInputs(sessionModel: Model<any>): ImageModelRoutingInputs {
+		return {
 			sessionModel,
 			thinkingLevel: this.thinkingLevel,
 			serviceTier: this.serviceTier,
@@ -3958,7 +3962,7 @@ export class AgentSession {
 			availableModels: this._modelRegistry.getAvailable(),
 			hasConfiguredAuth: (model) => this._modelRegistry.hasConfiguredAuth(model),
 			blockImages: this.settingsManager.getBlockImages(),
-		});
+		};
 	}
 
 	/**
@@ -3994,16 +3998,41 @@ export class AgentSession {
 	}
 
 	/**
-	 * A tool result delivered new images after the run was handed back: the next request
-	 * carries images the session model cannot read, so it goes to the image model again.
+	 * The image model a run that started image-free would switch to once a tool result
+	 * brings in images, or undefined when the session model sees images itself or no
+	 * usable imageModel is configured (attach_image then rejects with its own guidance).
+	 */
+	private _midRunImageModelOverride(): AgentModelOverride | undefined {
+		const sessionModel = this.model;
+		if (!sessionModel || this._fallback) return undefined;
+		try {
+			return resolveImageModelOverride(this._imageModelRoutingInputs(sessionModel));
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * A tool result delivered new images the session model cannot read, so the next
+	 * request goes to the image model. That covers a run handed back after an image
+	 * turn, and a run that started image-free: the owner pasted a file path as text and
+	 * the session model loaded it with attach_image.
 	 */
 	private _rerouteToImageModelForNewImages(): void {
+		if (this._fallback) return;
 		const route = this._imageRoute;
-		if (!route?.handedBack || this._fallback) return;
-		if (this.model?.input.includes("image")) return;
-		route.handedBack = false;
-		this.agent.modelOverride = route.override;
-		this.agent.pendingTurnModel = route.override;
+		if (route) {
+			if (!route.handedBack || this.model?.input.includes("image")) return;
+			route.handedBack = false;
+			this.agent.modelOverride = route.override;
+			this.agent.pendingTurnModel = route.override;
+			return;
+		}
+		const override = this._midRunImageModelOverride();
+		if (!override) return;
+		this._imageRoute = { override, handedBack: false };
+		this.agent.modelOverride = override;
+		this.agent.pendingTurnModel = override;
 	}
 
 	/**
@@ -15798,11 +15827,14 @@ export class AgentSession {
 			"rlm.progress.note": createRlmProgressNoteHostHandler((message) => this.noteRlmProgress(message)),
 			"rlm.delete_subagent": createRlmDeleteSubagentHostHandler((target) => this.deleteRlmSubagent(target)),
 			"model.info": async () => {
-				// Report the model serving the current run, not the session model:
-				// a routed image turn serves on settings.imageModel, and kernel
-				// preflights (attach_image's vision check) must judge the model that
-				// will receive the messages submitted while the override is in force.
-				const servingModel = this._runModel();
+				// Report the model that will read what the cell submits, not the session
+				// model: a routed image turn serves on settings.imageModel, and on an
+				// image-free turn of a text-only session model an attached image moves
+				// the next request there, so attach_image's vision check judges that model.
+				const runModel = this._runModel();
+				const servingModel = runModel?.input.includes("image")
+					? runModel
+					: (this._midRunImageModelOverride()?.model ?? runModel);
 				return {
 					id: servingModel?.id ?? null,
 					provider: servingModel?.provider ?? null,

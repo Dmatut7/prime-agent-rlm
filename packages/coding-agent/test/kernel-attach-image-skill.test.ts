@@ -242,7 +242,8 @@ except RuntimeError as error:
 		expect(result.status).toBe("ok");
 		expect(result.stdout.trim()).toBe(
 			"RuntimeError: openai/gpt-oss-120b does not support vision. " +
-				"Tell the user to switch to a vision-capable model to load images into context.",
+				"Tell the user to set imageModel in settings.json to a vision model (it reads images " +
+				"for this one), or to switch to a vision-capable model.",
 		);
 		expect(result.attachments).toBeUndefined();
 	});
@@ -309,16 +310,21 @@ function attachToolCallMessage(id: string, code: string): AssistantMessage {
 describe("model.info over a session's kernel host bridge", () => {
 	// attach_image's preflight asks the host for model.info and rejects when the
 	// reported model has no image input. The handler must answer with the model
-	// serving the current run: a routed image turn serves on settings.imageModel,
-	// so an in-turn attach is allowed there, while an image-free turn of a
-	// text-only session model still reports that model and still rejects.
+	// that will read the attached image: a routed image turn serves on
+	// settings.imageModel, and so does the request after an attach on an
+	// image-free turn of a text-only session model (the owner pasted a file path
+	// as text). Only without a usable imageModel does the attach reject.
 	interface SessionFixture {
 		session: AgentSession;
 		servedIds: string[];
 		dir: string;
 	}
 
-	function createAttachSession(settings: Record<string, unknown>): SessionFixture {
+	function createAttachSession(
+		settings: Record<string, unknown>,
+		reply: (call: number, attachCode: string) => AssistantMessage = (call, attachCode) =>
+			call === 1 ? attachToolCallMessage("call-1", attachCode) : assistantMsg("ok"),
+	): SessionFixture {
 		const dir = mkdtempSync(join(tmpdir(), "pi-attach-image-session-"));
 		writeFileSync(join(dir, "settings.json"), JSON.stringify(settings));
 		writeFileSync(join(dir, "sample.png"), Buffer.from(PNG_BASE64, "base64"));
@@ -353,7 +359,7 @@ describe("model.info over a session's kernel host bridge", () => {
 					(e) => e.type === "done",
 					(e: any) => e.message,
 				);
-				const message = call === 1 ? attachToolCallMessage("call-1", attachCode) : assistantMsg("ok");
+				const message = reply(call, attachCode);
 				stream.push({ type: "done", reason: message.stopReason as "stop" | "toolUse", message });
 				return stream;
 			},
@@ -409,8 +415,37 @@ describe("model.info over a session's kernel host bridge", () => {
 		}
 	});
 
-	it("still rejects attach on an image-free turn of a text-only session model", async () => {
-		const fixture = createAttachSession({ imageModel: "claude-haiku-4-5" });
+	it("routes an attach on an image-free turn to imageModel, then hands the task back", async () => {
+		const fixture = createAttachSession({ imageModel: "claude-haiku-4-5" }, (call, attachCode) => {
+			if (call === 1) return attachToolCallMessage("call-1", attachCode);
+			if (call === 2) {
+				const next = attachToolCallMessage("call-2", 'print("next")');
+				return { ...next, content: [{ type: "text", text: "A single gray pixel." }, ...next.content] };
+			}
+			return assistantMsg("ok");
+		});
+		try {
+			await fixture.session.prompt(`describe ${join(fixture.dir, "sample.png")}`);
+			expect(fixture.servedIds).toEqual([
+				"claude-opus-4-7-text-only",
+				"claude-haiku-4-5",
+				"claude-opus-4-7-text-only",
+			]);
+			const results = ipythonToolResults(fixture.session);
+			expect(results).toHaveLength(2);
+			expect(results[0].isError).toBe(false);
+			expect(results[0].content).toEqual([
+				{ type: "text", text: expect.stringContaining("Loaded 1 image(s) into context") },
+				{ type: "image", data: PNG_BASE64, mimeType: "image/png" },
+			]);
+		} finally {
+			fixture.session.dispose();
+			cleanupSessionDir(fixture.dir);
+		}
+	});
+
+	it("rejects attach on a text-only session model without a usable imageModel", async () => {
+		const fixture = createAttachSession({});
 		try {
 			await fixture.session.prompt("describe");
 			expect(fixture.servedIds).toEqual(["claude-opus-4-7-text-only", "claude-opus-4-7-text-only"]);

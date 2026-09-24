@@ -175,6 +175,30 @@ describe("InteractiveMode stall action bar lifecycle", () => {
 		expect(chatOf(mode).children).not.toContain(settled);
 	});
 
+	it("the diagnostics key closes the diagnostics block it opened; other keys pass through", async () => {
+		const mode = createModeFake();
+		await handleEvent.call(mode, stallWarning());
+		const bar = mode.stallActionBar as StallActions;
+		const before = chatOf(mode).children.length;
+
+		expect(bar.handleInput("\x19")).toBe(true);
+		const opened = renderChat(chatOf(mode));
+		expect(opened).toContain("stage: stall_warning");
+		expect(opened).toMatch(/ctrl\+y 收起/i);
+		const closeRoute = addInputListener.mock.calls.at(-1)?.[0] as (data: string) => { consume?: boolean } | undefined;
+		expect(closeRoute).toBeTypeOf("function");
+
+		// Typing goes on to the editor and leaves the block open.
+		expect(closeRoute("a")).toBeUndefined();
+		expect(renderChat(chatOf(mode))).toContain("stage: stall_warning");
+
+		const removedBefore = removeInputListener.mock.calls.length;
+		expect(closeRoute("\x19")).toEqual({ consume: true });
+		expect(renderChat(chatOf(mode))).not.toContain("诊断详情");
+		expect(chatOf(mode).children.length).toBe(before - 1);
+		expect(removeInputListener.mock.calls.length).toBe(removedBefore + 1);
+	});
+
 	it("blind3-7: turn_end mid-run settles the stale bar too", async () => {
 		const mode = createModeFake();
 		// A stalled turn emits no turn_end, so a live bar at a turn_end means the

@@ -190,12 +190,13 @@ export const TUI_KEYBINDINGS = {
 	"tui.debug.dump": { defaultKeys: "shift+ctrl+d", description: "Dump TUI debug information" },
 	// Deliberately no defaultKeyScope: the stall action bar is up while a turn
 	// is streaming and the editor is not necessarily focused, so the host
-	// matches this globally (only while the bar is visible; when no bar is up,
-	// the app does not route the key here and ctrl+y keeps its editor-scope
-	// yank meaning). See components/stall-actions.ts for the full contract.
+	// matches this globally (only while the bar or the diagnostics block it
+	// opened is visible, where the key closes the block again; otherwise the app
+	// does not route the key here and ctrl+y keeps its editor-scope yank
+	// meaning). See components/stall-actions.ts for the full contract.
 	"app.stall.diagnostics": {
 		defaultKeys: "ctrl+y",
-		description: "Show the stall diagnostics for the current turn",
+		description: "Show or close the stall diagnostics for the current turn",
 	},
 } as const satisfies KeybindingDefinitions;
 

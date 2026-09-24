@@ -227,7 +227,8 @@ async def run(*paths: str) -> str:
         FileNotFoundError: If a path does not exist or is not a regular file.
         ValueError: If a file is not a supported image, is too large, or cannot
             be compressed enough for safe inline rendering and replay.
-        RuntimeError: If the current model cannot accept images.
+        RuntimeError: If neither the current model nor the configured image
+            model can accept images.
     """
     if not paths:
         raise ValueError("attach_image requires at least one image path")
@@ -239,7 +240,8 @@ async def run(*paths: str) -> str:
         model_id = info.get("id") or "the current model"
         raise RuntimeError(
             f"{model_id} does not support vision. "
-            "Tell the user to switch to a vision-capable model to load images into context."
+            "Tell the user to set imageModel in settings.json to a vision model (it reads images "
+            "for this one), or to switch to a vision-capable model."
         )
 
     # Validate every path before emitting anything, so a later failure never

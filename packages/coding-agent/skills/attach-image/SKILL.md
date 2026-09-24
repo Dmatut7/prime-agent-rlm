@@ -1,6 +1,6 @@
 ---
 name: attach-image
-description: Load an on-disk image (PNG, JPEG, GIF, WebP) into the model's context as a viewable attachment so the model can directly SEE it — for screenshots, diagrams, charts, photos, or scanned pages. Use this when you need to perceive an image's visual contents. Requires a vision-capable model; errors clearly otherwise.
+description: Load an on-disk image (PNG, JPEG, GIF, WebP) into the model's context as a viewable attachment so the model can directly SEE it — for screenshots, diagrams, charts, photos, or scanned pages. Use this when you need to perceive an image's visual contents, including when the user pastes an image file path. On a model without vision the host hands the image to the owner's configured image model, which describes it for you; it errors with setup guidance only when no model can see it.
 ---
 
 # Attach Image
@@ -46,4 +46,9 @@ gray background. Extremely large images are rejected by pixel count before full
 processing. The original file is left untouched.
 
 Supported formats: PNG, JPEG, GIF, WebP. The skill errors if a file is not a
-supported image, or if the current model is not vision-capable.
+supported image, or if neither the current model nor a configured image model
+can see images.
+
+If you cannot see images yourself, call it anyway rather than handing the file
+to a subagent: the next reply comes from the owner's image model, which puts
+what it saw into words, and the task then continues with you.
