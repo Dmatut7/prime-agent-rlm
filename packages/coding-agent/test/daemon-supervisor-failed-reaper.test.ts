@@ -1,7 +1,8 @@
 import { chmodSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { vi } from "vitest";
 import { getProcessStartId } from "../src/core/session-lease.js";
+import { DaemonCatalogClient } from "../src/modes/daemon/daemon-catalog-process.js";
 import { getProcessStartIdAsync, isProcessIdentityConfirmedDead } from "../src/modes/daemon/daemon-supervisor.js";
 import { processIdExists } from "../src/utils/child-process.js";
 import { disposeSupervisorHarnesses, startSupervisorHarness } from "./fixtures/supervisor-harness.js";
@@ -184,4 +185,39 @@ describe("T3-6 failed worker reaper", () => {
 		},
 		40_000,
 	);
+	it("marks the crashed root session when it reaps an abnormally dead worker", async () => {
+		const markCrashed = vi.spyOn(DaemonCatalogClient.prototype, "markCrashed").mockResolvedValue(true);
+		const harness = await startSupervisorHarness({
+			prefix: "ma-t3-6-crash-",
+			deadWorkerPid: true,
+			descriptorOverrides: reapableOverrides(25),
+			supervisorOptions: { failedWorkerReapIntervalMs: 200 },
+		});
+		await harness.waitForDescriptorLifecycle("failed", 15_000);
+
+		const log = await waitForLogLine(harness, "Reaped failed worker worker-fixture");
+		expect(log).toContain(`rootSessionId ${harness.session.sessionId}`);
+		// The session died with the worker, so the root session file is marked
+		// crashed and the agents view parks the row in Idle instead of History.
+		await waitForLogLine(harness, "Marked crashed root session");
+		expect(markCrashed).toHaveBeenCalledWith(harness.session.sessionFile, harness.session.sessionId);
+	}, 40_000);
+
+	it("never marks a crash while a stop was requested, even past the threshold", async () => {
+		const markCrashed = vi.spyOn(DaemonCatalogClient.prototype, "markCrashed").mockResolvedValue(true);
+		const harness = await startSupervisorHarness({
+			prefix: "ma-t3-6-stopreq-",
+			deadWorkerPid: true,
+			descriptorOverrides: { ...reapableOverrides(25), stopRequestedAt: new Date().toISOString() },
+			supervisorOptions: { failedWorkerReapIntervalMs: 200 },
+		});
+		// A stop request routes the dead worker through the stop finalizer, not the
+		// failed-worker reaper, so the descriptor never parks in lifecycle "failed".
+		await harness.settle(3_000);
+		// An intentional stop owns the registration: neither the reap nor a crash
+		// marker may run, so the session keeps its clean History placement.
+		expect(harness.logText()).not.toContain("Reaped failed worker");
+		expect(harness.logText()).not.toContain("Marked crashed root session");
+		expect(markCrashed).not.toHaveBeenCalled();
+	}, 40_000);
 });
