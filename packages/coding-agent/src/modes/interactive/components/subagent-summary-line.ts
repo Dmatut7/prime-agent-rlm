@@ -331,7 +331,11 @@ export interface SubagentPanelSelection {
 	folded: SubagentPanelRow[];
 }
 
-/** A row no longer doing anything: done or failed. Busy and idle rows are never folded. */
+/**
+ * A row whose work is over: state done/failed, or `finished` (a terminal source status
+ * whose session still renders as idle because it stays resident after finishing).
+ * Busy rows never fold; an idle-but-finished row folds on the retention/turn clocks.
+ */
 export function isSettledSubagentPanelRow(row: SubagentPanelRow): boolean {
 	return row.finished === true || row.state === "done" || row.state === "failed";
 }
@@ -385,7 +389,8 @@ export function selectSubagentPanelRows(
 
 /**
  * The panel rows for this session's subtree (see collectSubtreeSubagentSnapshots),
- * most relevant first: stalled, failed, running, idle, finished.
+ * most relevant first: busy (stalled, running), then idle, then settled (done, failed).
+ * See compareSubagentPanelRows for the exact group order and the recency tiebreak.
  */
 export function buildSubagentPanelRows(
 	children: Iterable<AgentConnectionRlmChildAgentSnapshot>,
