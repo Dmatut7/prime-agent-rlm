@@ -2195,6 +2195,61 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(workers.has(worker.descriptor.workerId)).toBe(false);
 	});
 
+	it("marks the root session crashed when reclaiming a dead failed resident", async () => {
+		const worker = {
+			descriptor: {
+				workerId: "crashed-resident",
+				pid: 42,
+				lifecycle: "failed" as const,
+				sessionFile: "/tmp/crashed-resident.jsonl",
+				rootSessionId: "crashed-resident-session",
+			},
+			intentionalStop: false,
+		};
+		const markCrashed = vi.fn(async () => true);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			sessionInputPauses: new Map(),
+			processIdentity: vi.fn(() => "gone"),
+			recoverUncertainWorkerOperations: vi.fn(async () => {}),
+			invalidateWorkerSessionInputPauses: vi.fn(),
+			flipWorkerRosterEntriesInactive: vi.fn(),
+			deleteWorkerDescriptor: vi.fn(),
+			log: vi.fn(),
+			catalog: { markCrashed },
+		}) as unknown as {
+			reclaimStaleWorkerRegistration(target: typeof worker): Promise<boolean>;
+		};
+
+		await expect(supervisor.reclaimStaleWorkerRegistration(worker)).resolves.toBe(true);
+		expect(markCrashed).toHaveBeenCalledTimes(1);
+		expect(markCrashed).toHaveBeenCalledWith("/tmp/crashed-resident.jsonl", "crashed-resident-session");
+	});
+
+	it("does not mark a crash when the dead resident lacks a root session to mark", async () => {
+		const worker = {
+			descriptor: { workerId: "sessionless-resident", pid: 42, lifecycle: "failed" as const },
+			intentionalStop: false,
+		};
+		const markCrashed = vi.fn(async () => true);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			sessionInputPauses: new Map(),
+			processIdentity: vi.fn(() => "gone"),
+			recoverUncertainWorkerOperations: vi.fn(async () => {}),
+			invalidateWorkerSessionInputPauses: vi.fn(),
+			flipWorkerRosterEntriesInactive: vi.fn(),
+			deleteWorkerDescriptor: vi.fn(),
+			log: vi.fn(),
+			catalog: { markCrashed },
+		}) as unknown as {
+			reclaimStaleWorkerRegistration(target: typeof worker): Promise<boolean>;
+		};
+
+		await expect(supervisor.reclaimStaleWorkerRegistration(worker)).resolves.toBe(true);
+		expect(markCrashed).not.toHaveBeenCalled();
+	});
+
 	it("stops only an identity-verified failed resident when a fresh create arrives", async () => {
 		const worker = {
 			descriptor: {
