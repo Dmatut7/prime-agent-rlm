@@ -215,7 +215,7 @@ describe("buildSummarizationPrompt", () => {
 		expect(prompt).toContain("## Key Decisions");
 		// The note still carries the rule the sections have to obey.
 		expect(prompt).toContain("Machine-generated blocks are appended after your summary");
-		expect(prompt).toContain("rather than writing the same sentence out again");
+		expect(prompt).toContain("carry what the block cannot");
 	});
 });
 
