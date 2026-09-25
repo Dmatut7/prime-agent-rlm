@@ -362,6 +362,10 @@ describe("supervisor roster subscription", () => {
 					setSubagentCounts,
 					setStallMarkers,
 					setSubagentRows: vi.fn(),
+					// The panel also reports how many settled rows the fold rule keeps
+					// off the list; the stub has to answer it like the real component.
+					setSubagentFoldedCount: vi.fn(),
+					setSubagentHistoryExpanded: vi.fn(),
 					// The spend cell is switched off for this fixture: it watches the counts.
 					setSubagentSpend: vi.fn(),
 					isSelectable: () => false,

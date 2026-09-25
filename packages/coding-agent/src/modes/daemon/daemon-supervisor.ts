@@ -4351,6 +4351,10 @@ export class DaemonSupervisor {
 			worker.intentionalStop = true;
 			await this.recoverUncertainWorkerOperations(worker);
 			this.invalidateWorkerSessionInputPauses(worker, "Session worker stopped while input was paused");
+			// Failed lifecycle plus a dead process and no stop request means an
+			// abnormal death: mark the root session crashed before the
+			// registration goes, so the row recovers as Idle instead of History.
+			await this.markCrashedRootSession(worker);
 			this.workers.delete(worker.descriptor.workerId);
 			this.flipWorkerRosterEntriesInactive(worker);
 			this.deleteWorkerDescriptor(worker);
@@ -5161,7 +5165,7 @@ export class DaemonSupervisor {
 				this.flipWorkerRosterEntriesInactive(worker);
 				continue;
 			}
-			this.archiveAndReapFailedWorker(worker, now);
+			await this.archiveAndReapFailedWorker(worker, now);
 			await new Promise<void>((resolveYield) => setImmediate(resolveYield));
 		}
 	}
@@ -5213,7 +5217,7 @@ export class DaemonSupervisor {
 	}
 
 	/** C17: the failed descriptor is the only on-disk evidence of an OOM-class accident, so it is archived before deletion. */
-	private archiveAndReapFailedWorker(worker: ResidentWorker, now: number): void {
+	private async archiveAndReapFailedWorker(worker: ResidentWorker, now: number): Promise<void> {
 		const descriptor = worker.descriptor;
 		const failedAt = Date.parse(descriptor.lastFailureAt ?? descriptor.updatedAt);
 		const failedForMinutes = Number.isFinite(failedAt) ? Math.round((now - failedAt) / 60_000) : undefined;
@@ -5229,6 +5233,11 @@ export class DaemonSupervisor {
 				`descriptorPath ${worker.descriptorPath}, ` +
 				`consecutiveFailures ${descriptor.consecutiveFailures})`,
 		);
+		// The process is confirmed dead and no stop was ever requested, so this
+		// is the terminal proof of an abnormal death: park the root session in
+		// the agents view's Idle (recoverable) section with a crash marker
+		// instead of letting it fall into History with normally-evicted ones.
+		await this.markCrashedRootSession(worker);
 		this.workers.delete(descriptor.workerId);
 		this.flipWorkerRosterEntriesInactive(worker);
 		// L9F-1 / audit F2: this path used to delete the orphan journal without
@@ -5239,6 +5248,42 @@ export class DaemonSupervisor {
 		this.deleteWorkerDescriptor(worker);
 		if (!this.shuttingDown) {
 			this.broadcastHeartbeatsChanged();
+		}
+	}
+
+	/**
+	 * Death-cause marker for an abnormally dead worker's root session: writes
+	 * {status:"crash"} via the catalog so the agents view parks the row in Idle
+	 * (recoverable) instead of History. Guards:
+	 * - only the root session gets marked; subagent children follow their parent;
+	 * - a stop request on the descriptor means the death was intentional, so the
+	 *   clean History placement must be preserved;
+	 * - a missing file/root id (adoption never completed) is skipped silently;
+	 * - the catalog refusing (manual archive already on disk, session id
+	 *   replaced, lease held by a live worker) is logged, never fatal: the reap
+	 *   must still proceed.
+	 */
+	private async markCrashedRootSession(worker: ResidentWorker): Promise<void> {
+		const descriptor = worker.descriptor;
+		const sessionFile = descriptor.sessionFile;
+		const rootSessionId = descriptor.rootSessionId;
+		if (!sessionFile || !rootSessionId) {
+			return;
+		}
+		if (descriptor.stopRequestedAt !== undefined) {
+			return;
+		}
+		try {
+			const crashed = await this.catalog.markCrashed(sessionFile, rootSessionId);
+			if (crashed) {
+				this.log(
+					`Marked crashed root session ${rootSessionId} of dead worker ${descriptor.workerId} (${sessionFile})`,
+				);
+			}
+		} catch (error) {
+			this.log(
+				`Could not mark crashed root session ${rootSessionId} of dead worker ${descriptor.workerId}: ${String(error)}`,
+			);
 		}
 	}
 

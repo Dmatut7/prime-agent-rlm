@@ -222,7 +222,7 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 			"",
 			"A callable `rlm` is already in your global namespace. `await rlm('sub-task')` spawns a child and returns immediately after task admission with `rlm_child_id`, `name`, `session_dir`, and `model`; it never waits for or returns the child's answer.",
 			"Spawn handles and `await rlm.list_subagents()` rows are frozen dataclasses, not dicts: read fields by attribute, never `.get()`. A row's fields are `rlm_child_id`, `session_name` (not `name`), `session_dir`, `status`, `active_session_id`, and `session_id`.",
-			"Choose a stable child name with `await rlm('sub-task', name='api-reviewer')`; names must be unique among siblings. If omitted, the host generates a readable unique name.",
+			"Choose a stable child name with `await rlm('sub-task', name='调研-云厂商')`: the name is what the owner reads in the subagent panel, so write it in the user's language - short, role-first, readable at a glance (`name='调研-云厂商'` for a Chinese user, `name='api-reviewer'` for an English one). Names must be unique among siblings. If omitted, the host generates a readable unique name from the task prompt.",
 			"A child inherits your model. If a different model is explicitly requested, use `await rlm.find_models(...)` and an exact returned selector. An unavailable requested model fails spawn; decide whether to retry or omit `model`. Children also inherit your thinking level; the `thinking` option overrides it with any level the resolved child model supports, and an unsupported level fails spawn.",
 		);
 		if (hasAgentMessage) {
@@ -274,7 +274,7 @@ export function buildSubagentGuidance(
 		"# Delegating to sub-agents",
 		"",
 		"Delegate work that is independent and context-heavy: parallel research, a separate implementation, a long review. Each child keeps its own context clean and the pieces run at the same time. A single known lookup, edit, or command is faster inline; a child costs a spawn, a brief, and a report to read.",
-		"Spawn independent, self-contained work with `handle = await rlm('task', name='worker')`. This returns at admission, not completion; keep the handle to stop or inspect the child later.",
+		"Spawn independent, self-contained work with `handle = await rlm('task', name='调研-云厂商')`. The name is what the owner reads in the subagent panel: keep it short and role-first, written in the user's language. This returns at admission, not completion; keep the handle to stop or inspect the child later.",
 		"Brief a child the way you would brief a colleague who cannot see your screen: the goal, what done looks like, where the relevant files are, and what to send back. A vague brief comes back as a vague answer, or as the child redoing work you already did.",
 	];
 	if (options.hasAgentMessage) {

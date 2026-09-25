@@ -87,6 +87,41 @@ describe("SessionManager session state", () => {
 		}
 	});
 
+	it("folds the newest state entry: resume clears crash, archive overrides it", async () => {
+		// Death-cause markers are ordered facts: a crash written by the reaper is
+		// cleared by the resume path's {status:"active"} append (daemon-mode), and
+		// a later manual archive still wins over both.
+		const tempDir = mkdtempSync(join(tmpdir(), "session-state-crash-clear-"));
+		try {
+			const cwd = join(tempDir, "project");
+			const sessionDir = join(tempDir, "sessions");
+			const session = SessionManager.create(cwd, sessionDir);
+			session.appendMessage(userMsg("hello"));
+			session.appendMessage(assistantMsg("hi"));
+			session.appendSessionState({ status: "crash" });
+			const sessionFile = session.getSessionFile()!;
+
+			// The crashed row is recoverable, not archived.
+			let sessions = await SessionManager.list(cwd, sessionDir);
+			expect(sessions[0]!.state).toEqual({ status: "crash" });
+			expect(inactiveLifecycleForSession(sessions[0]!)).toBe("live");
+
+			// Resume: the daemon appends {status:"active"} while binding the runtime.
+			SessionManager.open(sessionFile, sessionDir).appendSessionState({ status: "active" });
+			sessions = await SessionManager.list(cwd, sessionDir);
+			expect(sessions[0]!.state).toEqual({ status: "active" });
+			expect(inactiveLifecycleForSession(sessions[0]!)).toBe("live");
+
+			// A manual archive after the crash still has the final word.
+			SessionManager.open(sessionFile, sessionDir).appendSessionState({ status: "archived" });
+			sessions = await SessionManager.list(cwd, sessionDir);
+			expect(sessions[0]!.state).toEqual({ status: "archived" });
+			expect(inactiveLifecycleForSession(sessions[0]!)).toBe("archived");
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("archives a deactivated session that has no prior state entry", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "session-state-deactivate-"));
 		try {

@@ -6,6 +6,7 @@ import { getSessionsDir } from "../src/config.js";
 import { type AgentCronJob, AgentCronJobStore, SESSION_SCHEDULED_JOBS_FILENAME } from "../src/core/cron-jobs.js";
 import { getSessionArtifactPathForFile, type SessionInfo } from "../src/core/session-manager.js";
 import { workerRosterEntryFromSummary } from "../src/modes/daemon/agent-roster.js";
+import { DaemonCatalogClient } from "../src/modes/daemon/daemon-catalog-process.js";
 import { success } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor, idleEvictionSweepIntervalMs } from "../src/modes/daemon/daemon-supervisor.js";
@@ -158,6 +159,26 @@ describe("daemon supervisor whole-tree eviction", () => {
 		expect(idleEvictionSweepIntervalMs(90)).toBe(5 * 60_000);
 		expect(idleEvictionSweepIntervalMs(6)).toBe(2 * 60_000);
 		expect(idleEvictionSweepIntervalMs(1)).toBe(60_000);
+	});
+
+	it("does not write a crash marker when evicting an idle worker", async () => {
+		// Normal idle eviction is an intentional stop: the session keeps its clean
+		// History placement instead of being marked as an abnormal death.
+		const markCrashed = vi.spyOn(DaemonCatalogClient.prototype, "markCrashed").mockResolvedValue(true);
+		try {
+			const now = Date.parse("2026-08-01T12:00:00.000Z");
+			const supervisor = makeSupervisor();
+			const idle = makeWorker("idle", [makeSummary("idle-root", now)]);
+			supervisor.workers.set("idle", idle);
+			seedSupervisorRoster(supervisor, idle);
+
+			await supervisor.runIdleEvictionSweep(now);
+
+			expect(supervisor.stopWorker).toHaveBeenCalledWith(idle, true);
+			expect(markCrashed).not.toHaveBeenCalled();
+		} finally {
+			markCrashed.mockRestore();
+		}
 	});
 
 	it("stops a fully idle worker and leaves pinned workers resident", async () => {

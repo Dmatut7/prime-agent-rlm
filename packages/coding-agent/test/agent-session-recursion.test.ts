@@ -370,6 +370,14 @@ describe("AgentSession rlm recursion", () => {
 			createDefaultRlmSubagentSessionName("same task", "sub-AbCdEfGh"),
 		);
 		expect(createDefaultRlmSubagentSessionName("x".repeat(200), "sub-a1b2c3d4")).toHaveLength(64);
+		// A CJK prompt keeps its characters instead of collapsing to "worker".
+		expect(createDefaultRlmSubagentSessionName("调研成都本地厂商", "sub-a1b2c3d4")).toBe(
+			"subagent-调研成都本地厂商-a1b2c3d4",
+		);
+		expect(createDefaultRlmSubagentSessionName("调研，成都 本地厂商！", "sub-a1b2c3d4")).toBe(
+			"subagent-调研-成都-本地厂商-a1b2c3d4",
+		);
+		expect(createDefaultRlmSubagentSessionName("调".repeat(200), "sub-a1b2c3d4")).toHaveLength(64);
 	});
 
 	it("denies goal.create inside a spawned subagent session (goals are depth-0 only)", async () => {
@@ -436,6 +444,27 @@ describe("AgentSession rlm recursion", () => {
 		await expect(root.runRlmChild("invalid name", { name: "   " })).rejects.toThrow("rlm.run name must not be empty");
 		await expect(root.runRlmChild("reserved name", { name: "all" })).rejects.toThrow(
 			"Broadcast agent messaging is not supported",
+		);
+	});
+
+	it("keeps CJK characters in both a chosen name and the generated default name", async () => {
+		const root = createSession();
+		const named = await root.runRlmChild("调研成都本地GPU厂商情况", { name: "  调研-云厂商  " });
+		if (!named.session_dir) {
+			throw new Error("Missing named child session directory");
+		}
+		const namedSession = root.getRlmChildSession(basename(named.session_dir));
+		if (!namedSession) {
+			throw new Error("Missing retained named child session");
+		}
+		expect(namedSession.sessionName).toBe("调研-云厂商");
+		const listed = await root.listRlmSubagents();
+		expect(listed.subagents.find((row) => row.rlm_child_id === named.rlm_child_id)?.session_name).toBe("调研-云厂商");
+
+		const unnamed = await root.runRlmChild("调研成都本地厂商");
+		const defaultListed = await root.listRlmSubagents();
+		expect(defaultListed.subagents.find((row) => row.rlm_child_id === unnamed.rlm_child_id)?.session_name).toMatch(
+			/^subagent-调研成都本地厂商-[a-z0-9]{8}$/,
 		);
 	});
 

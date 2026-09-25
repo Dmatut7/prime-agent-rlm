@@ -84,7 +84,7 @@ export interface SessionSummary {
 	/** Completion verdict for an idle session; absent while working or unjudged. */
 	taskState?: AgentTaskState;
 	rosterStatus?: AgentRosterStatus;
-	statusLabel?: "queued" | "recovering" | "failed";
+	statusLabel?: "queued" | "recovering" | "failed" | "crashed";
 	/** Set while the owning worker has been silent past the staleness threshold. */
 	lastHeardFromAt?: string;
 	/**
@@ -1014,14 +1014,18 @@ export function activeActivityForSession(activeSession: ActiveSessionState): Ses
 
 /**
  * Lifecycle for an on-disk session not resident in the daemon. Explicitly
- * archived/crashed records stay out of the view; everything else is classified
+ * archived records stay out of the view; everything else is classified
  * by message count (live once a message exists, draft otherwise). A missing
  * session_state is treated as not-archived, so older sessions that never wrote a
  * lifecycle entry still surface. Message-based to match activeLifecycleForSession.
+ *
+ * A crash marker is an abnormal death, not a user deletion: the session stays
+ * live so the agents view can park it in Idle (recoverable) instead of hiding it
+ * with the manually archived rows.
  */
 export function inactiveLifecycleForSession(session: SessionInfo): SessionLifecycle {
 	const status = session.state?.status;
-	if (status === "archived" || status === "crash") {
+	if (status === "archived") {
 		return "archived";
 	}
 	return session.messageCount > 0 ? "live" : "draft";

@@ -39,15 +39,18 @@ import type {
 	UserMessage,
 } from "@earendil-works/pi-ai";
 import {
+	adjustMaxTokensForThinking,
 	clampThinkingLevel,
 	cleanupSessionResources,
 	clearProviderRequestBudgetCeiling,
+	completeSimple,
 	configureProviderRequestBudget,
 	forgetProviderRequestBudget,
 	getLogger,
 	getProviderRequestBudget,
 	getSupportedThinkingLevels,
 	isContextOverflow,
+	modelCannotDisableThinking,
 	modelsAreEqual,
 	type ProviderRequestBudget,
 	peekProviderRequestBudget,
@@ -464,6 +467,18 @@ import {
 	transitionSessionAction,
 	type WakePolicy,
 } from "./session-action-store.js";
+import {
+	AUTO_TITLE_BASE_MAX_TOKENS,
+	AUTO_TITLE_SYSTEM_PROMPT,
+	AUTO_TITLE_TIMEOUT_MS,
+	type AutoSessionNameMode,
+	buildAutoTitlePrompt,
+	firstDerivableInboundSource,
+	readSessionNameBounded,
+	readSiblingSessionNames,
+	sanitizeRefinedTitle,
+	uniquifyAutoName,
+} from "./session-auto-name.js";
 import type { BranchSummaryEntry, CompactionEntry, SessionContext, SessionMessageEntry } from "./session-manager.js";
 import {
 	CURRENT_SESSION_VERSION,
@@ -6369,6 +6384,7 @@ export class AgentSession {
 				}
 			}
 		} else if (event.type === "agent_end") {
+			this._maybeRefineAutoSessionName();
 			const captured = new Set<AgentMessage>();
 			for (const action of this._actionStore.ownedActions()) {
 				if (action.payload.kind === "turn" && action.payload.captureRunMessages) {
@@ -7288,6 +7304,11 @@ export class AgentSession {
 		this._emit(event);
 
 		if (event.type === "message_end") {
+			// Observed before the append: hasAssistantEntry flips inside it, and the
+			// flip is the durable gate that keeps title refinement one-shot per
+			// transcript even when a daemon worker restarts mid-session.
+			const isFirstAssistantEntry =
+				event.message.role === "assistant" && !this.sessionManager.hasAssistantEntryInTranscript();
 			try {
 				if (event.message.role === "custom") {
 					this.sessionManager.appendCustomMessageEntry(
@@ -7302,6 +7323,18 @@ export class AgentSession {
 					event.message.role === "toolResult"
 				) {
 					this.sessionManager.appendMessage(event.message);
+				}
+				if (isFirstAssistantEntry) this._firstAssistantEntryThisProcess = true;
+				// Inside the persist try: a failed transcript write must not leave a
+				// name pointing at content that never landed. The assistant case names
+				// the thread as soon as its first reply lands; earlier inbound alone
+				// must not name it (see the draft-discard gate in the hook).
+				if (
+					event.message.role === "user" ||
+					event.message.role === "custom" ||
+					event.message.role === "assistant"
+				) {
+					this._maybeAutoNameFromInbound(event.message);
 				}
 			} catch (error) {
 				// A failed transcript write must surface and must not stall the event
@@ -21815,12 +21848,132 @@ export class AgentSession {
 		};
 	}
 
-	setSessionName(name: string): void {
-		this.sessionManager.appendSessionInfo(name);
+	setSessionName(name: string, options?: { auto?: boolean }): void {
+		this.sessionManager.appendSessionInfo(name, options);
 		this._emit({
 			type: "session_info_changed",
 			name: this.sessionManager.getSessionName(),
 		});
+	}
+
+	// --- Auto session naming -------------------------------------------------
+	// Root and message-triggered sessions never carried a name, so every roster,
+	// tab and list surface fell back to UUIDs. The hook below names a session
+	// from its first inbound content (provenance `auto`), and one best-effort
+	// refinement pass may replace an auto name with a model-written title.
+	// Human names are never touched: see getSessionNameInfo provenance checks.
+
+	private _autoTitleFirstInbound: string | undefined;
+	private _autoTitleRefineAttempted = false;
+	private _firstAssistantEntryThisProcess = false;
+	private _autoNameMissMessageCount = -1;
+
+	private _autoSessionNameMode(): AutoSessionNameMode {
+		return this.settingsManager.getAutoSessionName();
+	}
+
+	private _maybeAutoNameFromInbound(_message: AgentMessage): void {
+		try {
+			const mode = this._autoSessionNameMode();
+			if (mode === "off") return;
+			// Subagent sessions always carry a spawn name; the gate is belt and
+			// braces so a nameless child can never self-name behind its parent.
+			if (this.rlmDepth > 0) return;
+			// Draft-discard gate: session_info counts as user content, so naming a
+			// transcript before any assistant reply lands would pin empty drafts
+			// that the daemon today deletes. Name only once a reply exists.
+			if (!this.sessionManager.hasAssistantEntryInTranscript()) return;
+			if (this.sessionManager.getSessionName() !== undefined) return;
+			const sessionFile = this.sessionFile;
+			if (!sessionFile) return;
+			// Negative cache: a full re-scan per message_end measured ~0.5s on a
+			// 33 MB transcript; rescan only when new messages arrived since the
+			// last miss.
+			const messageCount = this.agent.state.messages.length;
+			if (this._autoNameMissMessageCount === messageCount) return;
+			const derivable = firstDerivableInboundSource(sessionFile, this.agent.state.messages);
+			if (!derivable) {
+				this._autoNameMissMessageCount = messageCount;
+				return;
+			}
+			// Twins break name-based agent-message routing: uniquify against the
+			// settled names of sibling transcripts before writing.
+			const name = uniquifyAutoName(derivable.name, readSiblingSessionNames(dirname(sessionFile), sessionFile));
+			this._autoTitleFirstInbound = derivable.source;
+			this.setSessionName(name, { auto: true });
+		} catch {
+			// Auto-naming is cosmetic: never let it break persistence or the turn.
+		}
+	}
+
+	private _maybeRefineAutoSessionName(): void {
+		try {
+			if (this._autoSessionNameMode() !== "llm") return;
+			if (this._autoTitleRefineAttempted) return;
+			if (!this._firstAssistantEntryThisProcess) return;
+			this._autoTitleRefineAttempted = true;
+			const info = this.sessionManager.getSessionNameInfo();
+			if (!info || !info.auto) return;
+			void this._refineAutoSessionNameAsync().catch(() => undefined);
+		} catch {
+			// Same rule as the naming hook: cosmetic only.
+		}
+	}
+
+	private async _refineAutoSessionNameAsync(): Promise<void> {
+		const sessionFile = this.sessionFile;
+		const inbound =
+			this._autoTitleFirstInbound ??
+			(sessionFile ? firstDerivableInboundSource(sessionFile, this.agent.state.messages)?.source : undefined);
+		if (!inbound || !sessionFile) return;
+		const assistantText =
+			this._lastAssistantMessage?.content
+				.filter((block): block is { type: "text"; text: string } => block.type === "text")
+				.map((block) => block.text)
+				.join(" ") ?? "";
+		const refinementModel = await this._resolveRefinementModel();
+		if (!refinementModel) return;
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), AUTO_TITLE_TIMEOUT_MS);
+		try {
+			// Same wire shape as compaction's completeSimple call: thinking reserve
+			// sized for models that cannot disable thinking, else a plain cap.
+			const maxTokens = modelCannotDisableThinking(refinementModel.model)
+				? adjustMaxTokensForThinking(AUTO_TITLE_BASE_MAX_TOKENS, refinementModel.model.maxTokens, "medium")
+						.maxTokens
+				: AUTO_TITLE_BASE_MAX_TOKENS;
+			const response = await completeSimple(
+				refinementModel.model,
+				{
+					systemPrompt: AUTO_TITLE_SYSTEM_PROMPT,
+					messages: [
+						{
+							role: "user" as const,
+							content: [{ type: "text" as const, text: buildAutoTitlePrompt(inbound, assistantText) }],
+							timestamp: Date.now(),
+						},
+					],
+				},
+				{ maxTokens, signal: controller.signal, apiKey: refinementModel.apiKey, headers: refinementModel.headers },
+			);
+			if (response.stopReason === "error") return;
+			const raw = response.content
+				.filter((block): block is { type: "text"; text: string } => block.type === "text")
+				.map((block) => block.text)
+				.join(" ");
+			const title = sanitizeRefinedTitle(raw);
+			if (!title) return;
+			// Re-read provenance at write time: a /name that landed while the call
+			// was in flight outranks the model's title.
+			if (this._disposed) return;
+			// Re-read provenance from disk, not the in-memory cache: a rename that
+			// bypassed this process must still outrank the model's title.
+			const current = readSessionNameBounded(sessionFile);
+			if (!current || !current.auto || current.name === title) return;
+			this.setSessionName(title, { auto: true });
+		} finally {
+			clearTimeout(timer);
+		}
 	}
 
 	/**

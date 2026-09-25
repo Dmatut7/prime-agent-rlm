@@ -21,6 +21,7 @@ import {
 	resolveAgentsViewSessionUiServices,
 	shouldReconnectAgentsViewDaemon,
 } from "../src/modes/agents-view/agents-view-mode.js";
+import { summaryForUnifiedRecord } from "../src/modes/agents-view/agents-view-state.js";
 import { isSessionSummaryBusy } from "../src/modes/daemon/agent-roster.js";
 import {
 	type AgentsViewScopeFrame,
@@ -2082,6 +2083,85 @@ describe("agents view state", () => {
 			expect(formatAgentDepthLabel(1, false)).toBe("深度 1");
 			expect(formatAgentDepthLabel(3, false)).toBe("深度 3");
 		});
+	});
+
+	test("sections saved rows by death cause: crash parks in Idle, archives stay in History", () => {
+		const crashed = makeSessionInfo({
+			path: "/tmp/sessions/crashed.jsonl",
+			id: "crashed",
+			state: { status: "crash" },
+		});
+		const [crashRecord] = reconcileUnifiedSessions([], [crashed]);
+		expect(crashRecord?.section).toBe("idle");
+		// The row must be visible and say how it died, not read as a manual archive.
+		const crashRow = buildAgentsViewRows([crashRecord!]).find((row) => row.section === "idle");
+		expect(crashRow).toBeDefined();
+		expect(summaryForUnifiedRecord(crashRecord!)).toMatchObject({ statusLabel: "crashed" });
+
+		const archived = makeSessionInfo({
+			path: "/tmp/sessions/archived.jsonl",
+			id: "archived",
+			state: { status: "archived" },
+		});
+		const [archiveRecord] = reconcileUnifiedSessions([], [archived]);
+		expect(archiveRecord?.section).toBe("inactive");
+		expect(buildAgentsViewRows([archiveRecord!]).some((row) => row.section === "inactive")).toBe(true);
+
+		const plain = makeSessionInfo({ path: "/tmp/sessions/plain.jsonl", id: "plain" });
+		const [plainRecord] = reconcileUnifiedSessions([], [plain]);
+		expect(plainRecord?.section).toBe("inactive");
+	});
+
+	test("a crash marker rescues a passivated roster row into Idle while clean eviction stays in History", () => {
+		const passivated = makeSummary({
+			id: "leftover",
+			activeSessionId: undefined,
+			lifecycle: "archived",
+			rosterStatus: "inactive",
+			sessionId: "leftover-session",
+			sessionFile: "/tmp/sessions/leftover.jsonl",
+		});
+
+		// Clean idle eviction: no crash marker on disk, so the row lands in History.
+		const [cleanRecord] = reconcileUnifiedSessions(
+			[passivated],
+			[makeSessionInfo({ path: "/tmp/sessions/leftover.jsonl", id: "leftover-session" })],
+		);
+		expect(cleanRecord?.section).toBe("inactive");
+
+		// Same passivated row, but the worker died abnormally and the reaper wrote crash.
+		const [crashRecord] = reconcileUnifiedSessions(
+			[passivated],
+			[
+				makeSessionInfo({
+					path: "/tmp/sessions/leftover.jsonl",
+					id: "leftover-session",
+					state: { status: "crash" },
+				}),
+			],
+		);
+		expect(crashRecord?.section).toBe("idle");
+	});
+
+	test("a crash marker never overrides a resident daemon row", () => {
+		const resident = makeSummary({
+			id: "resident",
+			activeSessionId: "resident",
+			sessionId: "resident-session",
+			sessionFile: "/tmp/sessions/resident.jsonl",
+		});
+		const [record] = reconcileUnifiedSessions(
+			[resident],
+			[
+				makeSessionInfo({
+					path: "/tmp/sessions/resident.jsonl",
+					id: "resident-session",
+					state: { status: "crash" },
+				}),
+			],
+		);
+		// The session was resumed after the crash marker landed: the live worker wins.
+		expect(record?.section).toBe("idle");
 	});
 });
 

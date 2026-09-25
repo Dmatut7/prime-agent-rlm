@@ -43,6 +43,22 @@ export interface FooterTelemetrySnapshot {
 	modelName?: string;
 	/** Current thinking level (e.g. "max"), rendered after the model id. */
 	thinkingLevel?: string;
+	/**
+	 * The model that actually served the latest assistant message. While the
+	 * provider fallback chain answers with someone other than the configured
+	 * model, the status line names the real server - a footer that shows the
+	 * configured id during a fallback episode quietly lies about who answers.
+	 */
+	servingModelName?: string;
+	/**
+	 * The effort the serving model actually runs at, after its own
+	 * thinkingLevelMap. The session level is shared across models, but each
+	 * model maps it differently - qwen3.8-max turns "high" into "xhigh" while
+	 * deepseek-v4-pro keeps "high" - so during a fallback the same setting can
+	 * mean a much heavier tier. Naming the served model without its effort left
+	 * the slowdown invisible.
+	 */
+	servingThinkingLevel?: string;
 	contextTokens?: number | null;
 	contextWindow?: number;
 	/**
@@ -200,7 +216,14 @@ export class FooterComponent implements Component {
 			return undefined;
 		}
 		const modelText = snapshot.thinkingLevel ? `${modelName} · ${snapshot.thinkingLevel}` : modelName;
-		const model = ` ${theme.fg("muted", modelText)}`;
+		const serving = snapshot.servingModelName;
+		// During a fallback the same session level means a different tier per model
+		// (qwen3.8-max turns "high" into "xhigh" while deepseek-v4-pro keeps it), so
+		// the served model's name alone hides why the reply suddenly got slower.
+		const servingEffort = snapshot.servingThinkingLevel;
+		const servingLabel = serving ? `${serving}${servingEffort ? ` · ${servingEffort}` : ""}` : undefined;
+		const servingNote = servingLabel && serving !== modelName ? theme.fg("warning", ` 实际:${servingLabel}`) : "";
+		const model = ` ${theme.fg("muted", modelText)}${servingNote}`;
 		const location = this.locationSource?.();
 		const locationText = location
 			? [displayCwd(location.cwd), location.branch ?? undefined].filter((part) => part).join(" · ")

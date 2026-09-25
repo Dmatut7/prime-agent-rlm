@@ -116,7 +116,13 @@ describe("InteractiveMode startup hints", () => {
 		Object.assign(mode, {
 			patchConnectionState,
 			builtInHeader: { invalidate: vi.fn() },
-			subagentSummaryLine: { invalidate: vi.fn() },
+			// The v2 panel replay (a96ee41f2/7247816e6) refreshes the folded row set
+			// from updateConnectionStateFromEvent; the stub needs the panel API it calls.
+			subagentSummaryLine: {
+				invalidate: vi.fn(),
+				setSubagentFoldedCount: vi.fn(),
+				setSubagentRows: vi.fn(),
+			},
 		});
 		const updateConnectionStateFromEvent = Reflect.get(
 			InteractiveMode.prototype,

@@ -210,13 +210,20 @@ export function normalizeRequestedRlmSubagentModel(value: unknown, operation = "
 	return model;
 }
 
-/** Create a readable, collision-resistant default name usable as an agent-message selector. */
+/**
+ * Create a readable, collision-resistant default name usable as an agent-message selector.
+ *
+ * The prompt slug keeps letters and digits in any script, not just ASCII: a task prompt
+ * written in the user's language then yields a default name readable in that language
+ * (the subagent panel shows the name verbatim), instead of collapsing every CJK prompt
+ * to "worker".
+ */
 export function createDefaultRlmSubagentSessionName(prompt: string, childId: string): string {
 	const promptSlug = prompt
 		.normalize("NFKD")
 		.replace(/[\u0300-\u036f]/g, "")
 		.toLowerCase()
-		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/[^\p{L}\p{N}]+/gu, "-")
 		.replace(/^-+|-+$/g, "");
 	const idSuffix =
 		childId

@@ -22,6 +22,15 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 		summary: "Search and open sessions",
 	},
 	{
+		path: ["autoname"],
+		usage: "autoname [--apply]",
+		summary: "Name unnamed session threads from their first message",
+		options: [
+			"--apply  Write the planned names (default: dry run)",
+			"--json    Print the plan as JSON (report only, never writes)",
+		],
+	},
+	{
 		path: ["list"],
 		usage: "list [--all] [--json]",
 		summary: "List agents",

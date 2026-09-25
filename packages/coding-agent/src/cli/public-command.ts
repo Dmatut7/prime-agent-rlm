@@ -13,6 +13,7 @@ import { runRetentionSweepOnce } from "../core/retention/runner.js";
 import { SettingsManager } from "../core/settings-manager.js";
 import { handlePackageCommand, isSelfUpdateSource } from "../package-manager-cli.js";
 import { INTERNAL_RUNTIME_COMMAND_MARKER, parseArgs } from "./args.js";
+import { runAutonameCommand } from "./autoname-command.js";
 import {
 	findCommandSuggestion,
 	formatCommandHelp,
@@ -85,6 +86,12 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 	switch (command) {
 		case "agents":
 			return { handled: false, args: args.slice(1), explicitAgentsView: true };
+		case "autoname": {
+			// Pure transcript scan plus leased appends: no daemon, no runtime.
+			const exitCode = await runAutonameCommand(args.slice(1));
+			if (exitCode !== 0) process.exitCode = exitCode;
+			return HANDLED;
+		}
 		case "list":
 			return runInternalAgentCommand("list", args.slice(1));
 		case "attach": {

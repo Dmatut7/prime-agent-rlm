@@ -316,6 +316,8 @@ export interface LabelEntry extends SessionEntryBase {
 export interface SessionInfoEntry extends SessionEntryBase {
 	type: "session_info";
 	name?: string;
+	/** True when the name was derived by auto-naming, not chosen by a human. Old readers ignore it. */
+	auto?: boolean;
 }
 
 export type SessionStateStatus = "active" | "archived" | "crash";
@@ -1710,13 +1712,14 @@ interface AppendEntrySeed {
 	timestamp: string;
 }
 
-function buildSessionInfoEntry(name: string, seed: AppendEntrySeed): SessionInfoEntry {
+function buildSessionInfoEntry(name: string, seed: AppendEntrySeed, auto?: boolean): SessionInfoEntry {
 	return {
 		type: "session_info",
 		id: seed.newId(),
 		parentId: seed.leafId,
 		timestamp: seed.timestamp,
 		name: name.trim(),
+		...(auto === true ? { auto: true } : {}),
 	};
 }
 
@@ -1860,9 +1863,13 @@ function appendEntryToExistingFile(
  * full transcript parse; falls back to opening a SessionManager when only a
  * full open can place the entry.
  */
-export function appendSessionInfoToExistingFile(sessionFile: string, name: string): string {
-	const fastId = appendEntryToExistingFile(sessionFile, (seed) => buildSessionInfoEntry(name, seed));
-	return fastId ?? SessionManager.open(sessionFile).appendSessionInfo(name);
+export function appendSessionInfoToExistingFile(
+	sessionFile: string,
+	name: string,
+	options?: { auto?: boolean },
+): string {
+	const fastId = appendEntryToExistingFile(sessionFile, (seed) => buildSessionInfoEntry(name, seed, options?.auto));
+	return fastId ?? SessionManager.open(sessionFile).appendSessionInfo(name, options);
 }
 
 /**
@@ -2825,7 +2832,7 @@ export class SessionManager {
 	 * whole transcript. Undefined-dirty is tracked separately: a nameless
 	 * transcript also resolves to a cached answer.
 	 */
-	private sessionNameCache: string | undefined;
+	private sessionNameCache: SessionInfoEntry | undefined;
 	private sessionNameDirty = true;
 	private byId: Map<string, SessionEntry> = new Map();
 	private labelsById: Map<string, string> = new Map();
@@ -3726,8 +3733,8 @@ export class SessionManager {
 		}
 	}
 
-	appendSessionInfo(name: string): string {
-		const entry = buildSessionInfoEntry(name, this.appendEntrySeed());
+	appendSessionInfo(name: string, options?: { auto?: boolean }): string {
+		const entry = buildSessionInfoEntry(name, this.appendEntrySeed(), options?.auto);
 		this._appendEntry(entry);
 		return entry.id;
 	}
@@ -3739,23 +3746,39 @@ export class SessionManager {
 	}
 
 	getSessionName(): string | undefined {
-		if (this.sessionNameDirty) {
-			this.sessionNameCache = this._scanSessionName();
-			this.sessionNameDirty = false;
-		}
-		return this.sessionNameCache;
+		return this.getSessionNameInfo()?.name;
 	}
 
 	/**
-	 * The value getSessionName() caches: the last session_info entry wins. Walks
-	 * fileEntries directly (skipping the header) so the one scan a write pays does
-	 * not also allocate the getEntries() copy.
+	 * The settled name plus its provenance: auto-named entries carry `auto`,
+	 * human renames do not. Background passes (title refinement) use this to
+	 * avoid ever overwriting a name a person chose, even across restarts.
 	 */
-	private _scanSessionName(): string | undefined {
+	getSessionNameInfo(): { name: string; auto: boolean } | undefined {
+		if (this.sessionNameDirty) {
+			this.sessionNameCache = this._scanSessionInfoEntry();
+			this.sessionNameDirty = false;
+		}
+		const entry = this.sessionNameCache;
+		const name = entry?.name?.trim();
+		return name ? { name, auto: entry?.auto === true } : undefined;
+	}
+
+	/** Whether the transcript already holds an assistant entry: the durable gate for one-shot background passes. */
+	hasAssistantEntryInTranscript(): boolean {
+		return this.hasAssistantEntry;
+	}
+
+	/**
+	 * The value getSessionNameInfo() caches: the last session_info entry wins.
+	 * Walks fileEntries directly (skipping the header) so the one scan a write
+	 * pays does not also allocate the getEntries() copy.
+	 */
+	private _scanSessionInfoEntry(): SessionInfoEntry | undefined {
 		for (let i = this.fileEntries.length - 1; i >= 0; i--) {
 			const entry = this.fileEntries[i];
 			if (entry.type === "session_info") {
-				return entry.name?.trim() || undefined;
+				return entry.name?.trim() ? entry : undefined;
 			}
 		}
 		return undefined;

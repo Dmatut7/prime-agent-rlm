@@ -3,7 +3,7 @@ import { setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import type { ContextTreeNode } from "../src/core/context-tree.js";
-import { KeybindingsManager } from "../src/core/keybindings.js";
+import { KEYBINDINGS, KeybindingsManager } from "../src/core/keybindings.js";
 import { createSpendPricing, type SpendPriceRates } from "../src/core/spend-pricing.js";
 import type { AgentConnectionRlmChildAgentSnapshot } from "../src/modes/agent-connection/types.js";
 import { buildAgentsViewRows, collectSubagentDescendantSummaries } from "../src/modes/agents-view/agents-view-state.js";
@@ -14,8 +14,12 @@ import {
 	countRosterSubagentStatuses,
 	countSubtreeSubagentStatuses,
 	formatSubagentElapsed,
+	isSettledSubagentPanelRow,
+	isSubagentPanelRowFolded,
+	SUBAGENT_PANEL_SETTLED_RETENTION_MS,
 	type SubagentSpendSummary,
 	SubagentSummaryLine,
+	selectSubagentPanelRows,
 	summarizeSubagentSpend,
 } from "../src/modes/interactive/components/subagent-summary-line.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
@@ -643,6 +647,81 @@ describe("SubagentSummaryLine", () => {
 		Object.assign(mode, { options: { returnToAgentsView: true, sessionDepth: 0 } });
 		expect(onClosed.call(mode, "killed")).toBe(false);
 		expect(returnToAgentsView).toHaveBeenCalledTimes(2);
+	});
+
+	it("exposes one click region per shown row plus the header only when openable", () => {
+		const empty = new SubagentSummaryLine();
+		expect(empty.render(100)).toEqual([]);
+		expect(empty.getClickRegions()).toHaveLength(0);
+
+		const line = new SubagentSummaryLine();
+		line.setSubagentCounts({ total: 2, running: 1, idle: 0, inactive: 1 });
+		line.setSubagentRows([
+			{ id: "worker", name: "worker", state: "running" },
+			{ id: "review", name: "review", state: "failed" },
+		]);
+		// Rows stay clickable even in a no-daemon session: the detail card is rendered locally.
+		line.render(100);
+		let regions = [...line.getClickRegions()];
+		expect(regions.map((region) => region.line)).toEqual([1, 2]);
+		for (const region of regions) {
+			expect(region).toMatchObject({ col: 0, width: 100, height: 1 });
+		}
+
+		line.setOpenable(true);
+		line.render(100);
+		regions = [...line.getClickRegions()];
+		expect(regions.map((region) => region.line)).toEqual([0, 1, 2]);
+	});
+
+	it("a row click selects that row and fires onRowActivate with it", () => {
+		const line = new SubagentSummaryLine();
+		const activated: string[] = [];
+		line.onRowActivate = (row) => activated.push(row.id);
+		line.setSubagentCounts({ total: 2, running: 1, idle: 0, inactive: 1 });
+		line.setSubagentRows([
+			{ id: "worker", name: "worker", state: "running" },
+			{ id: "调研-云厂商", name: "调研-云厂商", state: "failed" },
+		]);
+		line.focused = true;
+		line.render(100);
+		// A Chinese name renders in the row (naming guidance) and is clickable.
+		expect(line.render(100).map(stripAnsi).join("\n")).toContain("调研-云厂商");
+
+		const cjkRegion = line.getClickRegions()[1];
+		cjkRegion?.onClick({ row: 0, col: 5 });
+		expect(activated).toEqual(["调研-云厂商"]);
+
+		// The pointer selection is the keyboard selector: › moved to the clicked row.
+		const rendered = line.render(100).map(stripAnsi);
+		expect(rendered[1]).not.toContain("›");
+		expect(rendered[2]).toContain("›");
+	});
+
+	it("scrolls every child into view while focused, not just the first four", () => {
+		const line = new SubagentSummaryLine();
+		const rows = Array.from({ length: 7 }, (_, i) => ({
+			id: `child-${i}`,
+			name: `child-${i}`,
+			state: "running" as const,
+		}));
+		line.setSubagentCounts({ total: 7, running: 7, idle: 0, inactive: 0 });
+		line.setSubagentRows(rows);
+		line.focused = true;
+
+		const shown = () => line.render(100).map(stripAnsi).join("\n");
+		expect(shown()).toContain("child-0");
+		expect(shown()).not.toContain("child-6");
+		// Focused, the fold line promises more rows below instead of hiding them.
+		expect(shown()).toContain("下面还有");
+
+		// Six downs walk the selection to the last child and the window follows it.
+		for (let i = 0; i < 6; i += 1) line.handleInput("\x1b[B");
+		expect(shown()).toContain("child-6");
+		expect(shown()).not.toContain("child-0");
+
+		for (let i = 0; i < 6; i += 1) line.handleInput("\x1b[A");
+		expect(shown()).toContain("child-0");
 	});
 });
 
@@ -1446,9 +1525,14 @@ describe("subagent panel rows (design board 06)", () => {
 		const line = new SubagentSummaryLine();
 		line.setSubagentCounts({ total: 3, running: 0, idle: 1, inactive: 2 });
 		line.setOpenable(true);
-		// Not seen yet: the failure holds the panel open, at the top.
+		// Not seen yet: the failure holds the panel open. The v2 recency order
+		// (5c717491c, PM 2026-09-25 最新工作流要提前) groups the fresh failure with
+		// the settled rows instead of the top, so pin visibility (the row is
+		// rendered, the panel did not fold) rather than rank.
 		line.setSubagentRows(buildSubagentPanelRows(children, undefined));
-		expect(line.render(100).map(stripAnsi)[1]).toContain("old");
+		const unseen = line.render(100).map(stripAnsi).join("\n");
+		expect(unseen).toContain("old");
+		expect(unseen).not.toContain("都结束了");
 		// Its failure notice reached the parent: it no longer blocks the fold.
 		const rows = buildSubagentPanelRows(children, undefined, new Set(["old"]));
 		expect(rows.find((row) => row.id === "old")).toMatchObject({ state: "failed", acknowledged: true });
@@ -1507,16 +1591,347 @@ describe("subagent panel rows (design board 06)", () => {
 			],
 			undefined,
 		);
+		// Newest work first: busy children (stalled, then running), then idle, then
+		// the settled ones. A finished child no longer outranks a live one.
 		expect(built.map((row) => [row.name, row.state])).toEqual([
 			["stuck", "stalled"],
-			["broken", "failed"],
 			["review", "running"],
+			["broken", "failed"],
 			["lint", "done"],
 		]);
 		expect(built[0]?.activity).toBe("95s 没有动静 · 在跑 ipython");
-		expect(built[1]?.activity).toBe("boom");
-		expect(built[2]?.activity).toBe("执行 ipython");
+		expect(built[1]?.activity).toBe("执行 ipython");
+		expect(built[2]?.activity).toBe("boom");
 		expect(built[3]?.activity).toBe("无问题");
+	});
+
+	it("orders rows by recency inside a status group, newest first", () => {
+		const built = buildSubagentPanelRows(
+			[
+				child("old-run", "running", { sessionName: "old", lastActivityAt: 1_000 }),
+				child("new-run", "running", { sessionName: "new", lastActivityAt: 5_000 }),
+				child("mid-run", "running", { sessionName: "mid", lastActivityAt: 3_000 }),
+				child("old-done", "done", { sessionName: "done-old", lastActivityAt: 2_000 }),
+				child("new-done", "done", { sessionName: "done-new", lastActivityAt: 9_000 }),
+				child("old-err", "error", { sessionName: "err-old", lastActivityAt: 4_000 }),
+			],
+			undefined,
+		);
+		expect(built.map((row) => row.name)).toEqual(["new", "mid", "old", "done-new", "err-old", "done-old"]);
+	});
+
+	it("keeps source order for rows without a timestamp", () => {
+		const built = buildSubagentPanelRows(
+			[child("a", "done", { sessionName: "a" }), child("b", "done", { sessionName: "b" })],
+			undefined,
+		);
+		expect(built.map((row) => row.name)).toEqual(["a", "b"]);
+	});
+
+	it("gives the history toggle its own key and keeps it off every other action", () => {
+		// Alt+H reaches the panel's toggle from the editor and from the panel itself
+		// (see handleInput / onToggleSettled); sharing the key would make one of the two
+		// paths silently unreachable.
+		expect(KEYBINDINGS["app.subagents.history"].defaultKeys).toBe("alt+h");
+		const users = Object.entries(KEYBINDINGS).filter(([, binding]) => binding.defaultKeys === "alt+h");
+		expect(users.map(([id]) => id)).toEqual(["app.subagents.history"]);
+	});
+
+	it("folds settled rows out once they leave the retention window, keeping busy ones", () => {
+		const now = 10_000_000;
+		const rows = buildSubagentPanelRows(
+			[
+				child("run", "running", { sessionName: "run", lastActivityAt: now - 40 * 60_000 }),
+				child("idle", "running", { sessionName: "idle", lastActivityAt: now - 40 * 60_000 }),
+				child("old-done", "done", { sessionName: "old-done", lastActivityAt: now - 33 * 60_000 }),
+				child("old-err", "error", { sessionName: "old-err", lastActivityAt: now - 31 * 60_000 }),
+				child("fresh-done", "done", { sessionName: "fresh-done", lastActivityAt: now - 5 * 60_000 }),
+			],
+			undefined,
+		);
+		const selection = selectSubagentPanelRows(rows, { now });
+		// Both lists keep panel order (newest activity first), so the failure at 31
+		// minutes ago outranks the completion at 33 - the fold never reorders anything.
+		// A failed row never folds (P5): a broken child is the one fact the reader must
+		// not have to scroll for, so it stays on the list past the retention window.
+		expect(selection.rows.map((row) => row.name)).toEqual(["run", "idle", "fresh-done", "old-err"]);
+		expect(selection.folded.map((row) => row.name)).toEqual(["old-done"]);
+	});
+
+	it("folds settled rows at the parent's turn boundary, whatever their age", () => {
+		const now = 10_000_000;
+		const rows = buildSubagentPanelRows(
+			[
+				child("before", "done", { sessionName: "before", lastActivityAt: now - 2_000 }),
+				child("during", "done", { sessionName: "during", lastActivityAt: now - 1_000 }),
+				child("live", "running", { sessionName: "live", lastActivityAt: now - 1_000 }),
+			],
+			undefined,
+		);
+		const selection = selectSubagentPanelRows(rows, { now, parentTurnEndedAt: now - 1_500 });
+		expect(selection.rows.map((row) => row.name)).toEqual(["live", "during"]);
+		expect(selection.folded.map((row) => row.name)).toEqual(["before"]);
+	});
+
+	it("holds folded rows open while the history toggle is on", () => {
+		const now = 10_000_000;
+		const rows = buildSubagentPanelRows(
+			[child("old-done", "done", { sessionName: "old-done", lastActivityAt: now - 60 * 60_000 })],
+			undefined,
+		);
+		const selection = selectSubagentPanelRows(rows, { now, showSettled: true });
+		expect(selection.rows.map((row) => row.name)).toEqual(["old-done"]);
+		expect(selection.folded).toEqual([]);
+	});
+
+	it("pins a settled row whose reply has not been read, past the turn boundary", () => {
+		const now = 10_000_000;
+		const rows = buildSubagentPanelRows(
+			[child("answered", "done", { sessionName: "answered", lastActivityAt: now - 60_000 })],
+			undefined,
+		);
+		// Without the pin the turn boundary folds it; with the pin it stays visible.
+		const folded = selectSubagentPanelRows(rows, { now, parentTurnEndedAt: now });
+		expect(folded.rows).toEqual([]);
+		const pinned = selectSubagentPanelRows(rows, {
+			now,
+			parentTurnEndedAt: now,
+			pinnedRowIds: new Set(["answered"]),
+		});
+		expect(pinned.rows.map((row) => row.name)).toEqual(["answered"]);
+		expect(pinned.folded).toEqual([]);
+	});
+
+	it("keeps a settled row whose age cannot be judged, and honours a custom retention", () => {
+		const now = 10_000_000;
+		const rows = buildSubagentPanelRows([child("no-clock", "done", { sessionName: "no-clock" })], undefined);
+		expect(selectSubagentPanelRows(rows, { now }).rows.map((row) => row.name)).toEqual(["no-clock"]);
+
+		const aged = buildSubagentPanelRows(
+			[child("aged", "done", { sessionName: "aged", lastActivityAt: now - 60_000 })],
+			undefined,
+		);
+		const selection = selectSubagentPanelRows(aged, { now, retentionMs: 30_000 });
+		expect(selection.folded.map((row) => row.name)).toEqual(["aged"]);
+	});
+
+	it("folds at the retention edge; a resident finished child folds, a busy or stalled one never does", () => {
+		const now = 10_000_000;
+		const atEdge = SUBAGENT_PANEL_SETTLED_RETENTION_MS;
+		const settled = (id: string, lastActivityAt: number) =>
+			buildSubagentPanelRows([child(id, "done", { sessionName: id, lastActivityAt })], undefined)[0]!;
+
+		// The edge belongs to the past: exactly `retentionMs` of quiet folds the row,
+		// one millisecond less keeps it on the list.
+		expect(isSubagentPanelRowFolded(settled("at-edge", now - atEdge), { now })).toBe(true);
+		expect(isSubagentPanelRowFolded(settled("just-under", now - atEdge + 1), { now })).toBe(false);
+
+		// A resident done child reads as idle on the roster but is finished work, so the
+		// retention clock folds it (P4: 已经结束的工作流要及时删除). A busy row and a stall
+		// are live work and never fold, however long they have been quiet.
+		const ancient = now - 12 * 60 * 60_000;
+		const busy = buildSubagentPanelRows(
+			[
+				child("running", "running", { sessionName: "running", lastActivityAt: ancient }),
+				child("idle", "done", { sessionName: "idle", activeSessionId: "idle-active", lastActivityAt: ancient }),
+				child("stalled", "running", {
+					sessionName: "stalled",
+					activity: { kind: "stalled" },
+					stall: { silentMs: 95_000, thresholdMs: 60_000, inFlightTools: [] },
+					lastActivityAt: ancient,
+				}),
+			],
+			undefined,
+		);
+		expect(busy.map((row) => row.state)).toEqual(["stalled", "running", "idle"]);
+		expect(selectSubagentPanelRows(busy, { now }).rows.map((row) => row.name)).toEqual(["stalled", "running"]);
+		expect(selectSubagentPanelRows(busy, { now }).folded.map((row) => row.name)).toEqual(["idle"]);
+
+		const failed = buildSubagentPanelRows(
+			[child("boom", "error", { sessionName: "boom", error: "boom", lastActivityAt: ancient })],
+			undefined,
+		)[0]!;
+		expect(isSettledSubagentPanelRow(failed)).toBe(true);
+		// P5: a failure is settled but never auto-folded - it stays visible.
+		expect(isSubagentPanelRowFolded(failed, { now })).toBe(false);
+	});
+
+	it("keeps panel order through the fold: partition, not reorder", () => {
+		const now = 10_000_000;
+		const minutesAgo = (minutes: number) => now - minutes * 60_000;
+		const built = buildSubagentPanelRows(
+			[
+				child("live-old", "running", { sessionName: "live-old", lastActivityAt: minutesAgo(90) }),
+				child("live-new", "running", { sessionName: "live-new", lastActivityAt: minutesAgo(2) }),
+				child("stuck", "running", {
+					sessionName: "stuck",
+					activity: { kind: "stalled" },
+					stall: { silentMs: 95_000, thresholdMs: 60_000, inFlightTools: [] },
+					lastActivityAt: minutesAgo(5),
+				}),
+				child("idle-done", "done", {
+					sessionName: "idle-done",
+					activeSessionId: "idle-active",
+					lastActivityAt: minutesAgo(120),
+				}),
+				child("done-fresh", "done", { sessionName: "done-fresh", lastActivityAt: minutesAgo(10) }),
+				child("err-old", "error", { sessionName: "err-old", error: "boom", lastActivityAt: minutesAgo(45) }),
+				child("done-old", "done", { sessionName: "done-old", lastActivityAt: minutesAgo(60) }),
+			],
+			undefined,
+		);
+		// The committed sort: busy group, then idle, then settled; newest activity
+		// first inside each group (the stall's own rank only breaks a timestamp tie).
+		expect(built.map((row) => row.name)).toEqual([
+			"live-new",
+			"stuck",
+			"live-old",
+			"idle-done",
+			"done-fresh",
+			"err-old",
+			"done-old",
+		]);
+
+		const selection = selectSubagentPanelRows(built, { now });
+		// Folding drops the two settled rows that aged out and leaves the rest
+		// exactly where the sort put them - the fold is a filter over panel order.
+		// idle-done is finished work that aged out (P4) so it folds; err-old is a failure
+		// and never folds (P5), so it stays on the list in settled-group order.
+		expect(selection.rows.map((row) => row.name)).toEqual(["live-new", "stuck", "live-old", "done-fresh", "err-old"]);
+		expect(selection.folded.map((row) => row.name)).toEqual(["idle-done", "done-old"]);
+		expect([...selection.rows, ...selection.folded].map((row) => row.name).sort()).toEqual(
+			built.map((row) => row.name).sort(),
+		);
+
+		// The history toggle holds the same order, folded rows back in place.
+		const expanded = selectSubagentPanelRows(built, { now, showSettled: true });
+		expect(expanded.rows.map((row) => row.name)).toEqual(built.map((row) => row.name));
+		expect(expanded.folded).toEqual([]);
+	});
+
+	it("folds a settled child out of the live panel and brings it back with the toggle", () => {
+		const line = new SubagentSummaryLine();
+		line.setOpenable(true);
+		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
+		const requestRender = vi.fn();
+		Object.assign(mode, {
+			subagentSnapshots: new Map<string, AgentConnectionRlmChildAgentSnapshot>(),
+			rlmNodeId: undefined,
+			heartbeatCatalog: [],
+			subagentSummaryLine: line,
+			uiServices: spendCellOffUiServices,
+			subagentHistoryExpanded: false,
+			updateWorkingPulse: vi.fn(),
+			syncWorkingLoader: vi.fn(),
+			updateWorkingLoaderMessage: vi.fn(),
+			ui: { requestRender },
+		});
+		const update = Reflect.get(InteractiveMode.prototype, "updateSubagentSummary") as (
+			this: typeof mode,
+			value: AgentConnectionRlmChildAgentSnapshot,
+		) => void;
+		const toggle = Reflect.get(InteractiveMode.prototype, "toggleSubagentHistory") as (this: typeof mode) => void;
+
+		// One child finished 40 minutes ago, one is still working: the finished row
+		// leaves the list while the header's 收口 count keeps carrying it.
+		update.call(mode, child("long-ago", "done", { lastActivityAt: Date.now() - 40 * 60_000 }));
+		update.call(mode, child("working", "running", { activity: { kind: "executing", toolName: "ipython" } }));
+		let rendered = line.render(120).map(stripAnsi);
+		expect(rendered.some((text) => text.includes("long-ago"))).toBe(false);
+		expect(rendered.some((text) => text.includes("working"))).toBe(true);
+		expect(rendered.some((text) => text.includes("已收起 1 个已结束的子代理"))).toBe(true);
+
+		// The history toggle (Alt+H, the panel's own key, /subagents) shows it again.
+		toggle.call(mode);
+		rendered = line.render(120).map(stripAnsi);
+		expect(rendered.some((text) => text.includes("long-ago"))).toBe(true);
+		expect(rendered.some((text) => text.includes("已展开 1 个已结束的子代理"))).toBe(true);
+
+		toggle.call(mode);
+		rendered = line.render(120).map(stripAnsi);
+		expect(rendered.some((text) => text.includes("long-ago"))).toBe(false);
+		expect(requestRender).toHaveBeenCalled();
+	});
+
+	it("folds on its own when the retention deadline passes, without waiting for an event", () => {
+		vi.useFakeTimers();
+		try {
+			const base = 1_000_000_000;
+			vi.setSystemTime(base);
+			const line = new SubagentSummaryLine();
+			// Focused, so the panel lists its rows instead of collapsing a lone finished
+			// child into the "都做完了" line - the fold has to be visible to be asserted.
+			line.focused = true;
+			line.setOpenable(true);
+			const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
+			Object.assign(mode, {
+				subagentSnapshots: new Map<string, AgentConnectionRlmChildAgentSnapshot>(),
+				rlmNodeId: undefined,
+				heartbeatCatalog: [],
+				subagentSummaryLine: line,
+				uiServices: spendCellOffUiServices,
+				subagentHistoryExpanded: false,
+				updateWorkingPulse: vi.fn(),
+				syncWorkingLoader: vi.fn(),
+				updateWorkingLoaderMessage: vi.fn(),
+				scheduleHeartbeatManagerRefresh: vi.fn(),
+				ui: { requestRender: vi.fn() },
+			});
+			const update = Reflect.get(InteractiveMode.prototype, "updateSubagentSummary") as (
+				this: typeof mode,
+				value: AgentConnectionRlmChildAgentSnapshot,
+			) => void;
+
+			// Settled 29 minutes ago: inside the window, so it is still on the list.
+			update.call(mode, child("aged", "done", { lastActivityAt: base - 29 * 60_000 }));
+			expect(
+				line
+					.render(120)
+					.map(stripAnsi)
+					.some((text) => text.includes("aged")),
+			).toBe(true);
+
+			// One more minute of quiet and the armed deadline folds it out on its own.
+			vi.advanceTimersByTime(60_000);
+			const rendered = line.render(120).map(stripAnsi);
+			expect(rendered.some((text) => text.includes("aged"))).toBe(false);
+			expect(rendered.some((text) => text.includes("已收起 1 个已结束的子代理"))).toBe(true);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("reports folded settled rows on the panel and names the toggle key", () => {
+		const line = new SubagentSummaryLine();
+		line.setSubagentCounts({ total: 1, running: 0, idle: 0, inactive: 1 });
+		line.setSubagentRows([{ id: "w", name: "worker", state: "running" }]);
+		line.setSubagentFoldedCount(2);
+		const rendered = line.render(120).map(stripAnsi);
+		expect(rendered.some((text) => text.includes("已收起 2 个已结束的子代理"))).toBe(true);
+		expect(rendered.some((text) => text.includes("展开"))).toBe(true);
+
+		// With nothing left but folded rows the hint still stands in for them.
+		line.setSubagentRows([]);
+		const empty = line.render(120).map(stripAnsi);
+		expect(empty).toHaveLength(2);
+		expect(empty[1]).toContain("已收起 2 个已结束的子代理");
+	});
+
+	it("renders the expand state and fires its toggle callback on the history key", () => {
+		let toggled = 0;
+		const line = new SubagentSummaryLine();
+		line.onToggleSettled = () => {
+			toggled += 1;
+		};
+		line.setSubagentCounts({ total: 1, running: 0, idle: 0, inactive: 1 });
+		line.setSubagentRows([{ id: "d", name: "done", state: "done" }]);
+		line.setSubagentHistoryExpanded(true);
+		const rendered = line.render(120).map(stripAnsi);
+		expect(rendered.some((text) => text.includes("已展开 1 个已结束的子代理"))).toBe(true);
+
+		line.handleInput("\x1bh"); // alt+h
+		line.handleInput("\x1bh");
+		expect(toggled).toBeGreaterThan(0);
 	});
 
 	it("formats elapsed time as m:ss and h:mm:ss", () => {

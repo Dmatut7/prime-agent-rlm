@@ -6,6 +6,7 @@ import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core"
 import {
 	type Api,
 	type AssistantMessage,
+	clampThinkingLevel,
 	type ImageContent,
 	type Message,
 	type Model,
@@ -283,6 +284,7 @@ import {
 	styleSlashCommandText,
 } from "./components/slash-command-message.js";
 import { SlashCommandResultMessageComponent } from "./components/slash-command-result-message.js";
+import { SubagentDetailOverlay } from "./components/subagent-detail-overlay.js";
 import {
 	buildSubagentPanelRows,
 	classifySubagentSnapshotStatus,
@@ -290,9 +292,11 @@ import {
 	countRosterSubagentStatuses,
 	countSubtreeSubagentStatuses,
 	formatSubagentStallMarker,
+	SUBAGENT_PANEL_SETTLED_RETENTION_MS,
 	type SubagentPanelRow,
 	type SubagentSummaryCounts,
 	SubagentSummaryLine,
+	selectSubagentPanelRows,
 	summarizeSubagentSpend,
 	TrayInfoLine,
 } from "./components/subagent-summary-line.js";
@@ -413,6 +417,13 @@ const SUBAGENT_SPEND_HEAVY_INTERVAL_MS = 15_000;
 const SUBAGENT_SPEND_IDLE_TICK_MS = 15_000;
 /** How long the first stop-all-subagents press stays armed for the confirming second press. */
 const STOP_ALL_SUBAGENTS_CONFIRM_WINDOW_MS = 5_000;
+
+/**
+ * Cap on the panel's fold timeout. A retention deadline further out is re-armed
+ * when it fires, so one timer never has to outlive a day (`setTimeout` saturates
+ * near 24.8 days and would otherwise fire early).
+ */
+const SUBAGENT_FOLD_TIMER_MAX_MS = 12 * 60 * 60_000;
 
 /**
  * One context-tree scan and who it belongs to. The spend cell and the fullscreen top
@@ -1349,6 +1360,8 @@ export class InteractiveMode {
 	 */
 	private footerTelemetryDirty = true;
 	private footerTelemetryCached: FooterTelemetrySource | undefined;
+	/** Model id that served the latest assistant message; the footer names it when it differs from the configured one. */
+	private lastServingModelId: string | undefined;
 	private streamingMessage: AssistantMessage | undefined = undefined;
 	private sideQuestionComponent: SideQuestionComponent | undefined;
 	private sideQuestionEvent: AgentConnectionSideQuestionEvent | undefined;
@@ -1400,6 +1413,17 @@ export class InteractiveMode {
 	private stopAllSubagentsArmedUntil: number | undefined;
 	/** How this session's latest assistant message ended; tells a failed close from a finished one. */
 	private lastAssistantStopReason: AssistantMessage["stopReason"] | undefined;
+	/**
+	 * Epoch ms at which this session's last turn ended. A settled child whose last
+	 * activity predates it belongs to work the parent has already moved past, so its
+	 * row folds out of the panel at once (PM 2026-09-25: 已经结束的工作流要及时删除).
+	 */
+	private subagentParentTurnEndedAt: number | undefined;
+	/** The panel's history toggle: hold every folded settled row on the list. */
+	private subagentHistoryExpanded = false;
+	/** The one timeout that re-applies the fold when the retention window runs out. */
+	private subagentFoldTimer: ReturnType<typeof setTimeout> | undefined;
+	private subagentDetailHandle: OverlayHandle | undefined;
 	private subagentCounts: SubagentSummaryCounts = { total: 0, running: 0, idle: 0, inactive: 0 };
 	private subagentSpendTimer: ReturnType<typeof setTimeout> | undefined;
 	/** When the pending spend-refresh timer fires (epoch ms); 0 with no timer. */
@@ -1637,8 +1661,13 @@ export class InteractiveMode {
 		this.subagentSummaryLine.setOpenable(this.options.returnToAgentsView === true);
 		this.subagentSummaryLine.onOpen = (row) => void this.openScopedAgentsView(row?.activeSessionId, row);
 		this.subagentSummaryLine.onStopAll = () => void this.requestStopAllSubagents();
-		this.subagentSummaryLine.onCancel = () => this.focusEditor();
+		this.subagentSummaryLine.onCancel = () => {
+			this.subagentSummaryLine.focused = false;
+			this.focusEditor();
+		};
 		this.subagentSummaryLine.onChatAction = (data) => this.handleSubagentSummaryChatAction(data);
+		this.subagentSummaryLine.onRowActivate = (row) => this.showSubagentDetail(row.id);
+		this.subagentSummaryLine.onToggleSettled = () => this.toggleSubagentHistory();
 		this.footerDataProvider = new FooterDataProvider(this.uiServices.getInitialCwd());
 		this.footer = new FooterComponent(this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(this.settingsManager.getCompactionEnabled());
@@ -3267,12 +3296,44 @@ export class InteractiveMode {
 				: 0;
 		const snapshot: FooterTelemetrySnapshot = {
 			modelName: model?.id,
+			servingModelName: this.lastServingModelId,
+			servingThinkingLevel: this.servingThinkingLevel(thinkingLevel),
 			thinkingLevel,
 			contextTokens: usage?.tokens ?? undefined,
 			contextWindow: usage?.contextWindow,
 			compactionThresholdTokens: thresholdTokens,
 		};
 		return { mode, snapshot };
+	}
+
+	/**
+	 * The effort the served model actually runs at, after its own thinkingLevelMap.
+	 *
+	 * The session level is one value shared by every model, but each model maps it
+	 * differently - qwen3.8-max turns "high" into "xhigh" while deepseek-v4-pro keeps
+	 * "high" - so during a fallback the footer must resolve the level against the
+	 * model that answered, not the configured one. Undefined when the served model is
+	 * the configured one (the left-hand readout already covers that case) or when the
+	 * catalog has not loaded the model yet.
+	 */
+	private servingThinkingLevel(level: ThinkingLevel | undefined): string | undefined {
+		const servingId = this.lastServingModelId;
+		if (!servingId || level === undefined || servingId === this.getCurrentModelId()) {
+			return undefined;
+		}
+		const served = this.connectionModelCatalog.find((candidate) => candidate.id === servingId);
+		if (!served) {
+			return undefined;
+		}
+		const clamped = clampThinkingLevel(served, level);
+		return served.thinkingLevelMap?.[clamped] ?? clamped;
+	}
+
+	/** The footer must never show a model that is not answering: remember who served each assistant message. */
+	private noteServingModel(modelId: string | undefined): void {
+		if (!modelId || modelId === this.lastServingModelId) return;
+		this.lastServingModelId = modelId;
+		this.invalidateFooterTelemetry();
 	}
 
 	private async refreshConnectionContextUsage(): Promise<void> {
@@ -3338,6 +3399,14 @@ export class InteractiveMode {
 			}
 			case "agent_end":
 				this.patchConnectionState({ isStreaming: false, activeToolNames: [] });
+				// The turn boundary the panel's fold rule reads: a child that settled
+				// during this turn is work the parent has moved past. Stamping the
+				// boundary is not enough on its own: nothing else re-runs the fold for
+				// a settled child (rlm_child_update stops arriving once it settled), so
+				// the rows are recomputed here too - otherwise "the turn ended" would
+				// only take effect on the next child event or the 30-minute timer.
+				this.subagentParentTurnEndedAt = Date.now();
+				this.applySubagentPanelRows();
 				break;
 			case "session_action_update":
 				this.patchConnectionState({ sessionActions: event.actions });
@@ -4980,6 +5049,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.thinking.toggleAll", () => this.toggleThinkingBlockVisibility(true));
 		this.defaultEditor.onAction("app.subagents.focus", () => this.focusSubagentSummary());
 		this.defaultEditor.onAction("app.subagents.stopAll", () => void this.requestStopAllSubagents());
+		this.defaultEditor.onAction("app.subagents.history", () => this.toggleSubagentHistory());
 		this.defaultEditor.onAction("app.heartbeats.open", () => {
 			void this.showHeartbeatManager();
 		});
@@ -5800,6 +5870,20 @@ export class InteractiveMode {
 					await this.showDutyLog({ automatic: false });
 					return;
 				}
+				if (commandName === "subagents") {
+					this.editor.setText("");
+					// No argument toggles (the prompt's own switch); `all`/`off` pin the state.
+					const arg = commandArgs?.trim().toLowerCase();
+					if (arg && arg !== "all" && arg !== "off") {
+						this.showError("用法：/subagents [all|off] —— 展开或收起已结束的子代理行");
+						return;
+					}
+					this.setSubagentHistoryExpanded(arg ? arg === "all" : !this.subagentHistoryExpanded);
+					this.showStatus(
+						this.subagentHistoryExpanded ? "已展开全部子代理行（含已结束）" : "已收起已结束的子代理行",
+					);
+					return;
+				}
 				if (commandName === "speed") {
 					this.editor.setText("");
 					const arg = commandArgs?.trim().toLowerCase();
@@ -6498,6 +6582,7 @@ export class InteractiveMode {
 						this.currentTurnState.modelId = event.message.model || this.currentTurnState.modelId;
 						this.currentTurnState.notePhase("waiting");
 					}
+					this.noteServingModel(event.message.model);
 					this.startAssistantStreamingMessage(event.message);
 					this.ui.requestRender();
 				}
@@ -6506,6 +6591,7 @@ export class InteractiveMode {
 			case "message_update":
 				if (event.message.role === "assistant") {
 					this.streamingMessage = event.message;
+					this.noteServingModel(event.message.model);
 					this.ensureAssistantStreamingComponent(event.message).updateContent(this.streamingMessage, true);
 					this.currentTurnState?.setLiveThinkingSegments(countThinkingSegments(event.message));
 					if (this.currentTurnState) {
@@ -7165,10 +7251,97 @@ export class InteractiveMode {
 			if (marker) stallMarkers.push(`${child.sessionName ?? child.label}: ${marker}`);
 		}
 		this.subagentSummaryLine.setStallMarkers(stallMarkers);
-		this.subagentSummaryLine.setSubagentRows(
-			buildSubagentPanelRows(this.subagentSnapshots.values(), this.rlmNodeId, this.seenSubagentFailureIds),
-		);
+		this.applySubagentPanelRows();
 		if (!this.subagentSummaryLine.isSelectable() && this.subagentSummaryLine.focused) this.focusEditor();
+	}
+
+	/**
+	 * The panel's rows: built from the snapshots, then folded down to the ones this
+	 * panel shows right now (see selectSubagentPanelRows). The fold is a pure rule
+	 * over the roster and the clock, so the panel needs no purge timer of its own;
+	 * the history toggle flips it, and the header's 收口 count keeps carrying the
+	 * folded rows either way.
+	 */
+	private applySubagentPanelRows(): void {
+		// A settled child whose reply arrived and has not been read is pinned: folding
+		// it would drop the only marker that an answer is waiting for the parent.
+		const pinnedRowIds = new Set(
+			[...this.subagentSnapshots.values()]
+				.filter((child) => child.repliedSinceTask === true)
+				.map((child) => child.id),
+		);
+		const visibility = {
+			now: Date.now(),
+			parentTurnEndedAt: this.subagentParentTurnEndedAt,
+			showSettled: this.subagentHistoryExpanded,
+			pinnedRowIds,
+		};
+		const built = buildSubagentPanelRows(
+			this.subagentSnapshots.values(),
+			this.rlmNodeId,
+			this.seenSubagentFailureIds,
+		);
+		const selected = selectSubagentPanelRows(built, visibility);
+		this.subagentSummaryLine.setSubagentFoldedCount(selected.folded.length);
+		this.subagentSummaryLine.setSubagentRows(selected.rows);
+		this.syncSubagentFoldTimer(selected.rows);
+	}
+
+	/**
+	 * Re-apply the fold when the retention window runs out.
+	 *
+	 * Without a timer the 30-minute rule would only bite on the next child event,
+	 * and a quiet family that finished long ago would keep its rows on screen
+	 * indefinitely. One timeout is armed for the earliest deadline still ahead;
+	 * nothing else ticks, and nothing is armed while the history toggle holds the
+	 * rows open or while no settled row is on the list.
+	 */
+	private syncSubagentFoldTimer(rows: readonly SubagentPanelRow[]): void {
+		this.clearSubagentFoldTimer();
+		if (this.subagentHistoryExpanded) return;
+		const now = Date.now();
+		let deadline = Number.POSITIVE_INFINITY;
+		for (const row of rows) {
+			if (row.state !== "done" && row.state !== "failed") continue;
+			if (row.lastActivityAt === undefined) continue;
+			deadline = Math.min(deadline, row.lastActivityAt + SUBAGENT_PANEL_SETTLED_RETENTION_MS);
+		}
+		if (!Number.isFinite(deadline)) return;
+		this.subagentFoldTimer = setTimeout(
+			() => {
+				this.subagentFoldTimer = undefined;
+				this.applySubagentPanelRows();
+				this.ui.requestRender();
+			},
+			Math.max(0, Math.min(deadline - now, SUBAGENT_FOLD_TIMER_MAX_MS)),
+		);
+		this.subagentFoldTimer.unref?.();
+	}
+
+	/**
+	 * Disarm the fold timeout. stop() calls this too: a timer that outlives the session
+	 * would re-apply the fold and request a render on a UI that is already torn down.
+	 */
+	private clearSubagentFoldTimer(): void {
+		if (this.subagentFoldTimer === undefined) return;
+		clearTimeout(this.subagentFoldTimer);
+		this.subagentFoldTimer = undefined;
+	}
+
+	/**
+	 * Hold folded settled rows open (or fold them back): the panel's history toggle,
+	 * driven by Alt+H, by the panel's own key, and by `/subagents`.
+	 */
+	private setSubagentHistoryExpanded(expanded: boolean): void {
+		this.subagentHistoryExpanded = expanded;
+		this.subagentSummaryLine.setSubagentHistoryExpanded(expanded);
+		this.applySubagentPanelRows();
+		this.ui.requestRender();
+	}
+
+	/** Alt+H and the panel's own key: hold folded settled rows open, or fold them back. */
+	private toggleSubagentHistory(): void {
+		this.setSubagentHistoryExpanded(!this.subagentHistoryExpanded);
 	}
 
 	/**
@@ -7424,6 +7597,10 @@ export class InteractiveMode {
 
 	private focusSubagentSummary(): boolean {
 		if (!this.subagentSummaryLine.isSelectable() || this.getTrayOverrideLabel()) return false;
+		// UI focus alone left the panel rendering its unfocused top-N window, so the
+		// arrow keys moved an invisible selection and every child past the first rows
+		// stayed unreachable. Engaging the scroll window is what makes ↓ actually browse.
+		this.subagentSummaryLine.focused = true;
 		this.ui.setFocus(this.subagentSummaryLine);
 		this.ui.requestRender();
 		return true;
@@ -7519,6 +7696,24 @@ export class InteractiveMode {
 		this.updateSubagentSummaryLine();
 	}
 
+	/**
+	 * Clicking a row in the subagent panel opens a read-only detail card instead of
+	 * the full agents view: the card renders from the live snapshot map, so it
+	 * refreshes on its own while the overlay is up; keyboard Enter keeps its
+	 * existing behavior.
+	 */
+	private showSubagentDetail(id: string): void {
+		this.subagentDetailHandle?.hide();
+		const overlay = new SubagentDetailOverlay({
+			getChild: () => this.subagentSnapshots.get(id),
+			onDismiss: () => this.subagentDetailHandle?.hide(),
+		});
+		this.subagentDetailHandle = this.showFullPaneOverlay(overlay, {
+			maxContentWidth: 72,
+			suspendFullscreenMouse: true,
+		});
+	}
+
 	private handleSubagentSummaryChatAction(data: string): void {
 		if (this.keybindings.matches(data, "app.tools.expand")) {
 			this.toggleToolOutputExpansion();
@@ -7553,6 +7748,11 @@ export class InteractiveMode {
 			this.toggleThinkingBlockVisibility(true);
 			return;
 		}
+		// Leaving the panel by any non-panel key drops its focus too, so the list
+		// returns to its compact top-N form instead of staying in scroll mode.
+		// (Defensive for the partial-mode harness stubs that call this method with a
+		// fake `this` that has no panel; the focus drop is best-effort there.)
+		if (this.subagentSummaryLine) this.subagentSummaryLine.focused = false;
 		this.focusEditor();
 		this.editor.handleInput(data);
 	}
@@ -13041,6 +13241,7 @@ ${blocksPrev ? `| \`${blocksPrev}\`${blocksNext ? ` / \`${blocksNext}\`` : ""} |
 		this.stopGoalTrayTimer();
 		this.stopSubagentSpendIdleTick();
 		this.clearSubagentSpendRefresh();
+		this.clearSubagentFoldTimer();
 		this.closeHeartbeatManager();
 		this.clearExtensionTerminalInputListeners();
 		this.footer.dispose();
