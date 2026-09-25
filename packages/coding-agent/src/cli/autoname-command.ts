@@ -16,7 +16,7 @@ import { readdirSync } from "node:fs";
 import { join } from "node:path";
 
 import { getAgentDir, getSessionsDir } from "../config.js";
-import { deriveAutoSessionName, scanSessionNamingFacts, uniquifyAutoName } from "../core/session-auto-name.js";
+import { scanSessionNamingFacts, uniquifyAutoName } from "../core/session-auto-name.js";
 import {
 	appendOwnedFastEntryAsync,
 	appendSessionInfoToExistingFile,

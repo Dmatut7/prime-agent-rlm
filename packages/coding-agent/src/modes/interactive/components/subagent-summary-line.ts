@@ -778,12 +778,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 				onClick: () => this.onOpen?.(undefined),
 			});
 		}
-		if (
-			!this.focused &&
-			!this.historyExpanded &&
-			this.rows.length > 0 &&
-			this.rows.every(isSettledPanelRow)
-		) {
+		if (!this.focused && !this.historyExpanded && this.rows.length > 0 && this.rows.every(isSettledPanelRow)) {
 			// Nothing in flight: finished children would otherwise sit there as a
 			// block of rows until they close. One line says so; the header's ↓ still lists them.
 			// (Upstream 48a61f7b9's isSettledPanelRow keeps an acknowledged failure in

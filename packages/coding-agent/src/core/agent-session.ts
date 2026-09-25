@@ -21872,7 +21872,7 @@ export class AgentSession {
 		return this.settingsManager.getAutoSessionName();
 	}
 
-	private _maybeAutoNameFromInbound(message: AgentMessage): void {
+	private _maybeAutoNameFromInbound(_message: AgentMessage): void {
 		try {
 			const mode = this._autoSessionNameMode();
 			if (mode === "off") return;

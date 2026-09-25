@@ -68,7 +68,7 @@ describe("daemon catalog mark_crashed", () => {
 			timestamp: new Date().toISOString(),
 			cwd: sessionDir,
 		});
-		writeFileSync(sessionFile, [header, ...extraLines].join("\n") + "\n");
+		writeFileSync(sessionFile, `${[header, ...extraLines].join("\n")}\n`);
 		return sessionFile;
 	}
 

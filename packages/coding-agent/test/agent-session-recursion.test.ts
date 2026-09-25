@@ -459,9 +459,7 @@ describe("AgentSession rlm recursion", () => {
 		}
 		expect(namedSession.sessionName).toBe("调研-云厂商");
 		const listed = await root.listRlmSubagents();
-		expect(listed.subagents.find((row) => row.rlm_child_id === named.rlm_child_id)?.session_name).toBe(
-			"调研-云厂商",
-		);
+		expect(listed.subagents.find((row) => row.rlm_child_id === named.rlm_child_id)?.session_name).toBe("调研-云厂商");
 
 		const unnamed = await root.runRlmChild("调研成都本地厂商");
 		const defaultListed = await root.listRlmSubagents();
