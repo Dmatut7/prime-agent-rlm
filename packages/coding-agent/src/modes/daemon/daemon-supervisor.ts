@@ -169,10 +169,18 @@ import {
 } from "./daemon-socket.js";
 import {
 	acquireDaemonSupervisorOwnership,
+	DaemonAgentDirAlreadyRunningError,
+	DaemonSupervisorAlreadyRunningError,
 	isDaemonShutdownAdmissionActive,
 	waitForDaemonStartupFence,
 	writeJsonAtomically,
 } from "./daemon-supervisor-ownership.js";
+import {
+	isDaemonSingleInstanceConflict,
+	judgeDaemonSocketOccupancy,
+	runDaemonStandby,
+	type DaemonStandbyOwner,
+} from "./daemon-single-instance.js";
 import {
 	DAEMON_ADOPTION_REQUEST_TIMEOUT_MS,
 	WORKER_REQUEST_TIMEOUT_TIERS,
@@ -1405,11 +1413,58 @@ function normalizeCapabilities(
 	return normalized;
 }
 
+/**
+ * W2 single-instance takeover protocol for supervisor mode:
+ *
+ * 1. Probe the socket first (cheap, 3 x 250ms). Another daemon listening
+ *    means we downgrade to standby *before* entering the 15s socket-lease
+ *    wait — the old failure path ("Lock file is already being held" throw →
+ *    exit 1 → service-manager relaunch → same collision, forever) was the
+ *    launchd idle-retry spin.
+ * 2. Otherwise start normally; a startup failure that is a single-instance
+ *    conflict (socket in use / supervisor already running / agent dir owned)
+ *    downgrades to standby instead of propagating. The standby process never
+ *    binds, never writes the roster snapshot, and exits for relaunch once
+ *    the owner is gone, so the service manager's next attempt binds.
+ * 3. Any other failure propagates unchanged.
+ */
 export async function runDaemonSupervisorMode(options: DaemonSupervisorOptions): Promise<never> {
 	const socketPath = normalizeSocketPath(options.socketPath ?? defaultDaemonSocketPath());
+	const occupancy = await judgeDaemonSocketOccupancy(socketPath);
+	if (occupancy.kind === "listening") {
+		await runDaemonStandby({ socketPath });
+		return new Promise(() => {});
+	}
 	const supervisor = new DaemonSupervisor(socketPath, options);
-	await supervisor.start();
+	try {
+		await supervisor.start();
+	} catch (error) {
+		if (!isDaemonSingleInstanceConflict(error)) {
+			throw error;
+		}
+		const owner = daemonStandbyOwnerFromError(error);
+		await runDaemonStandby({ socketPath, owner });
+		return new Promise(() => {});
+	}
 	return new Promise(() => {});
+}
+
+function daemonStandbyOwnerFromError(error: unknown): DaemonStandbyOwner | undefined {
+	if (error instanceof DaemonSupervisorAlreadyRunningError) {
+		return {
+			socketPath: normalizeSocketPath(error.owner.socketPath),
+			pid: error.owner.pid,
+			generation: error.owner.generation,
+		};
+	}
+	if (error instanceof DaemonAgentDirAlreadyRunningError) {
+		return {
+			socketPath: normalizeSocketPath(error.owner.socketPath),
+			pid: error.owner.pid,
+			generation: error.owner.generation,
+		};
+	}
+	return undefined;
 }
 
 export class DaemonSupervisor {
