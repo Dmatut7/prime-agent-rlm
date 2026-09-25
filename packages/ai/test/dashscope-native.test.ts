@@ -300,6 +300,9 @@ describe("response parsing", () => {
 		expect(mapDashScopeFinishReason("length")).toEqual({ stopReason: "length" });
 		expect(mapDashScopeFinishReason("tool_calls")).toEqual({ stopReason: "toolUse" });
 		expect(mapDashScopeFinishReason(null)).toEqual({ stopReason: "stop" });
+		// The gateway sends the *string* "null" on every unfinished frame (probe 08-native-sse-probe.txt).
+		expect(mapDashScopeFinishReason("null")).toEqual({ stopReason: "stop" });
+		expect(mapDashScopeFinishReason("")).toEqual({ stopReason: "stop" });
 	});
 
 	it("parses multimodal array content [{text}] (05 返回结果示例)", () => {
@@ -554,6 +557,50 @@ describe("streamDashScope wire behaviour", () => {
 		expect(message.errorMessage).toContain("400");
 		expect(message.errorMessage).toContain("InvalidParameter");
 		expect(message.errorMessage).toContain("spot the problem");
+	});
+
+	it("treats the string finish_reason \"null\" on intermediate frames as unfinished, not as an error", async () => {
+		// Regression: Bailian native SSE emits `"finish_reason":"null"` in every frame
+		// before the last one. A truthiness check mapped that string into the error
+		// branch, so 1118 of 1118 recorded native-path responses carried
+		// `Provider finish_reason: null` even though their text arrived intact.
+		// Evidence: .pipeline/night-20260925/08-native-sse-probe.txt (16 intermediate
+		// frames with the string "null", final frame "stop").
+		stubFetch(
+			sseResponse([
+				{
+					output: {
+						choices: [
+							{ finish_reason: "null", message: { role: "assistant", content: [], reasoning_content: "想一下" } },
+						],
+					},
+					usage: { input_tokens: 35, output_tokens: 1, total_tokens: 36 },
+				},
+				{
+					output: {
+						choices: [
+							{ finish_reason: "null", message: { role: "assistant", content: [{ text: "好" }] } },
+						],
+					},
+					usage: { input_tokens: 35, output_tokens: 49, total_tokens: 84 },
+				},
+				{
+					output: { choices: [{ finish_reason: "stop", message: { role: "assistant", content: [] } }] },
+					usage: { input_tokens: 35, output_tokens: 49, total_tokens: 84 },
+				},
+			]),
+		);
+
+		const message = await streamDashScope(
+			dsModel("deepseek-v4.1-flash"),
+			{ messages: [{ role: "user", content: "说\"好\"一个字", timestamp: 1 }] },
+			{ apiKey: "sk-test" },
+		).result();
+
+		expect(message.stopReason).toBe("stop");
+		expect(message.errorMessage).toBeUndefined();
+		expect(message.stopReasonRaw).toBeUndefined();
+		expect(message.content.some((block) => block.type === "text" && block.text === "好")).toBe(true);
 	});
 
 	it("fails the stream when no finish_reason ever arrives (truncated upstream)", async () => {

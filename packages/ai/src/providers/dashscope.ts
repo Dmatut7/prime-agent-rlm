@@ -480,7 +480,15 @@ export function mapDashScopeFinishReason(reason: string | null | undefined): {
 	stopReasonRaw?: string;
 	errorMessage?: string;
 } {
-	if (reason === null || reason === undefined) return { stopReason: "stop" };
+	// Bailian's native SSE sends the *string* "null" in every unfinished frame
+	// (`"finish_reason":"null"`), and only the last frame carries a real verdict
+	// ("stop" / "tool_calls"). A truthiness check treats that string as a reason,
+	// so every intermediate frame used to label the response an error -
+	// 1118 of 1118 recorded native-path responses carried
+	// `Provider finish_reason: null` while their text arrived intact
+	// (probe 2026-09-26, .pipeline/night-20260925/08-native-sse-probe.txt).
+	// Absent means "not finished yet", never "failed".
+	if (reason === null || reason === undefined || reason === "null" || reason === "") return { stopReason: "stop" };
 	switch (reason) {
 		case "stop":
 			return { stopReason: "stop" };
@@ -833,7 +841,10 @@ export const streamDashScope: StreamFunction<"dashscope", DashScopeOptions> = (
 				if (!choice) continue;
 				sawChoices = true;
 
-				if (choice.finish_reason) {
+				// Skip the string "null" the gateway sends on every unfinished frame:
+				// only a real verdict ends the stream, and a stream that never carried one
+				// is reported by the truncation check below instead of being called an error.
+				if (choice.finish_reason && choice.finish_reason !== "null") {
 					sawFinishReason = true;
 					const mapped = mapDashScopeFinishReason(choice.finish_reason);
 					output.stopReason = mapped.stopReason;
