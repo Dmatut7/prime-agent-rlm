@@ -259,22 +259,23 @@ So the values that must be exact no longer go through the model. Compaction appe
 | Block | Source | Contents |
 |-------|--------|----------|
 | `<read-files>`, `<modified-files>` | tool calls + previous `details` | cumulative file lists |
-| `<fact-appendix>` | regex over the summarized slice | error signatures, commit SHAs, paths, threshold numbers, issue refs |
+| `<fact-appendix>` | regex over the summarized slice | error signatures, commit SHAs, paths, threshold numbers, issue refs, stated decisions/conclusions |
 | `<user-requests>` | user messages and `!commands` | the user's own words, verbatim |
 
 ### Fact appendix
 
-[`fact-appendix.ts`](../src/core/compaction/fact-appendix.ts) extracts five kinds of fact from every message leaving the context:
+[`fact-appendix.ts`](../src/core/compaction/fact-appendix.ts) extracts six kinds of fact from every message leaving the context:
 
 - **sha** — 40-hex anywhere; 7-10 hex only on a line with git context, or in prose somebody wrote (a user or assistant message), where a hex-shaped word like `feedback` is the only real false positive. An abbreviated SHA is folded into the full one it prefixes so one anchor keeps one slot and one weight.
 - **path** — absolute, `~/`, and repo-relative paths. Relative paths need an extension or three segments, so branch names are not paths; URLs, `node_modules`, `.git` and `.venv` are excluded. Extracted by a linear scan rather than a `segment(?:/segment)+` regex, which backtracks quadratically on a long run without a slash and hung a compaction for minutes on an 800k-character tool result.
 - **number** — `identifier: 123` (including quoted JSON keys, which is how settings reach a transcript), keyword pairs written as prose (`exit code 2`, `line 22`), and unit numbers (`900s`, `523MB`, `1.41x`). Each carries a verbatim snippet of the line it came from, because a bare number is not a fact.
 - **error** — lines that report a failure rather than mention one. Source lines, diff hunks and serialized tool calls are filtered out; re-runs of one failure collapse by signature with digits normalized, so `bad JSON at position 1871` and `... 2044` are one recurring error.
 - **issue** — `#4603` and `issues/4603` / `pull/4603` spellings.
+- **decision** — the sentences in which the agent stated a decision or a conclusion (`结论是…`, `决定/拍板/敲定…`, `采用/改用/放弃…`, `根因是…`, `we decided…`, `the fix is…`, `root cause is…`). Only authored assistant prose is scanned: the user's own words already ride verbatim in `<user-requests>`, and re-extracting them here would book one sentence into two authoritative blocks. The markers are deliberately narrow, because a false positive injects a wrong instruction into every later generation, so bare connectives like `因为` / `because` are not markers. A sentence past the 300-character value cap is clipped head-and-tail with the elision stated inside the value (`[…N characters elided…]`) rather than dropped: the block is declared authoritative, so a clipped value has to say in its own text that it is clipped, and the longest decisions are the ones carrying the most reasoning.
 
 Each record carries `n` (the weight of the distinct messages that mentioned it — one message counts once, so a value printed 500 times in one log does not outvote a value the user typed once; user and assistant prose weigh 3, tool calls and custom messages 2, tool output and thinking 1) and `g` (the first and last compaction generation that carried it). Records are JSON lines, so a value containing a quote, a newline or CJK round-trips byte-exactly.
 
-Facts never expire by age. The ledger is folded forward structurally, and eviction happens only when the block has to fit its budget: per-kind caps, then a minimum representation per kind (so a transcript full of paths cannot wipe out its SHAs), then a global ranking by weight with a boost for the current generation. Whatever is dropped is counted in the block's `elided` attribute, so a bounded appendix is never a silent one.
+Facts never expire by age. The ledger is folded forward structurally, and eviction happens only when the block has to fit its budget: per-kind caps, then a minimum representation per kind (so a transcript full of paths cannot wipe out its SHAs), then a global ranking by weight with a boost for the current generation. Whatever the pruning drops is counted in the block's `elided` attribute, so a bounded appendix is never a silent one.
 
 The budget is derived, not configured: `factAppendixTokenBudget(keepRecentTokens, summarizedTokens)` takes 3% of what the appendix stands in for and 25% of what the compaction retains, whichever is larger, clamped to `[400, min(20000, keepRecentTokens)]`. A slice can never exceed the model's window, so the share is window-proportionate on its own — a 490k-token slice gets ~14.7k tokens of appendix, a 90k slice gets the 5k floor.
 
@@ -338,6 +339,7 @@ path/to/changed.ts
 
 <fact-appendix generation="3" facts="41" elided="12" elidedDetail="path:9,number:3">
 Machine-extracted from the transcript by regex, no model involved: ...
+{"k":"decision","v":"结论是回滚到上一个 tag，理由是主分支已经带了那次修复。","n":3,"g":"1-3"}
 {"k":"error","v":"Error: Failed to resolve API key for provider \"bailian\"","n":3,"g":"1-3"}
 {"k":"sha","v":"4871d9223bac88ac6da9796f4b0c4d33b7566178","n":6,"g":"2-3"}
 {"k":"path","v":"/tmp/ma_audit/rollback-anchor.md","n":3,"g":"1-3"}

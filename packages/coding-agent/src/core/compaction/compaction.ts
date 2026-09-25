@@ -1382,8 +1382,16 @@ Keep each section concise. Preserve exact file paths, function names, and error 
  * generation then reads. The blocks are appended after the narrative and rebuilt
  * from the transcript every compaction, so the only thing the narrative has to carry
  * is what a fact means and whether the work around it is done.
+ *
+ * The inventory of what each block holds has to match what the renderer actually
+ * puts in it, or the model is told the appendix keeps five kinds while it is reading
+ * six: the kind the note omits is the one the model concludes it is still responsible
+ * for writing out by hand, which is the restatement this note exists to prevent. That
+ * is what happened to `decision` when the fact ledger grew the kind - the block's own
+ * header was updated and this note was not, so the summarizer kept rewriting decisions
+ * into `## Key Decisions` prose that a later generation would then read as the record.
  */
-const MACHINE_BLOCKS_NOTE = `Machine-generated blocks are appended after your summary and are not part of it: <read-files> and <modified-files>, <fact-appendix> (commit SHAs, paths, threshold numbers, error signatures and issue references, extracted from the transcript by regex) and <user-requests> (the user's own words, verbatim). They are rebuilt every compaction and never pass through you, so do not restate, renumber, re-spell or "correct" their contents anywhere in your sections - a restated SHA or threshold is a second, unreliable copy of a value that is already preserved exactly. Where one of them matters to the plan, refer to it and record its status (done, in progress, blocked, or still owed to the user) instead.`;
+const MACHINE_BLOCKS_NOTE = `Machine-generated blocks are appended after your summary and are not part of it: <read-files> and <modified-files>, <fact-appendix> (commit SHAs, paths, threshold numbers, error signatures, issue references and stated decisions or conclusions, extracted from the transcript by regex) and <user-requests> (the user's own words, verbatim). They are rebuilt every compaction and never pass through you, so do not restate, renumber, re-spell or "correct" their contents anywhere in your sections - a restated SHA or threshold is a second, unreliable copy of a value that is already preserved exactly, and a retold decision is a paraphrase standing in for a sentence that is already kept verbatim. Where one of them matters to the plan, refer to it and record its status (done, in progress, blocked, or still owed to the user) instead: in Key Decisions, name the decision and say whether it still stands, rather than writing the same sentence out again in your own words.`;
 
 /**
  * Build the instruction portion of the summarization prompt: the initial or
