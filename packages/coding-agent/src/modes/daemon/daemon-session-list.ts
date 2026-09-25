@@ -84,7 +84,7 @@ export interface SessionSummary {
 	/** Completion verdict for an idle session; absent while working or unjudged. */
 	taskState?: AgentTaskState;
 	rosterStatus?: AgentRosterStatus;
-	statusLabel?: "queued" | "recovering" | "failed";
+	statusLabel?: "queued" | "recovering" | "failed" | "crashed";
 	/** Set while the owning worker has been silent past the staleness threshold. */
 	lastHeardFromAt?: string;
 	/**

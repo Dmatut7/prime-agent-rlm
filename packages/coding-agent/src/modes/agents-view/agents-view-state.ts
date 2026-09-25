@@ -107,11 +107,24 @@ export function classifyAgentsViewSession(summary: SessionSummary): AgentsViewSe
 	return summary.rosterStatus ?? classifySessionRosterStatus(summary);
 }
 
-export function classifyUnifiedSession(record: Pick<UnifiedSessionRecord, "daemon">): AgentsViewSection {
+export function classifyUnifiedSession(record: Pick<UnifiedSessionRecord, "daemon" | "saved">): AgentsViewSection {
 	if (!record.daemon) {
-		return "inactive";
+		return classifySavedOnlySession(record.saved);
 	}
-	return classifyAgentsViewSession(record.daemon);
+	const section = classifyAgentsViewSession(record.daemon);
+	// A non-resident daemon row (a passivated roster row the failed-worker reap
+	// left behind) still merges with its saved half, and a crash marker there
+	// means the death was abnormal: the row parks in Idle, recoverable, instead
+	// of dropping into History with the normally-evicted sessions.
+	if (section === "inactive" && record.saved?.state?.status === "crash") {
+		return "idle";
+	}
+	return section;
+}
+
+function classifySavedOnlySession(saved: UnifiedSessionRecord["saved"]): AgentsViewSection {
+	// A saved row without a crash marker is a normally closed session: History.
+	return saved?.state?.status === "crash" ? "idle" : "inactive";
 }
 
 export function shouldShowAgentsViewSession(summary: SessionSummary, manuallyInactive = false): boolean {
@@ -419,6 +432,9 @@ export function reconcileUnifiedSessions(
 		if (record) {
 			record.saved = saved;
 			record.identityAliases = [...new Set([...record.identityAliases, ...aliases])];
+			// The saved half decides the death cause of a non-resident daemon row:
+			// a crash marker parks the row in Idle instead of History.
+			record.section = classifyUnifiedSession(record);
 			for (const alias of aliases) recordByAlias.set(alias, record);
 			continue;
 		}
@@ -426,7 +442,7 @@ export function reconcileUnifiedSessions(
 			saved,
 			identity: aliases[0]!,
 			identityAliases: aliases,
-			section: "inactive",
+			section: classifySavedOnlySession(saved),
 		};
 		records.push(inactive);
 		for (const alias of aliases) recordByAlias.set(alias, inactive);
@@ -478,6 +494,9 @@ export function summaryForUnifiedRecord(record: UnifiedSessionRecord): SessionSu
 		summary: saved.agentStatus?.summary,
 		taskState: saved.agentStatus?.taskState,
 		usage: saved.usage,
+		// A crashed row sits in the Idle section, so its label must say why:
+		// "archived" would read as a manual close that never happened.
+		...(saved.state?.status === "crash" ? { statusLabel: "crashed" } : {}),
 	};
 }
 
