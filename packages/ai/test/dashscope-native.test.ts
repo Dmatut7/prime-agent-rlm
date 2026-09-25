@@ -67,14 +67,7 @@ afterEach(() => {
 
 describe("endpoint routing by model class", () => {
 	it("routes text-class models to text-generation (07 请求地址表)", () => {
-		for (const id of [
-			"qwen-plus",
-			"qwen3.7-max",
-			"qwen3.6-max-preview",
-			"deepseek-v4-pro",
-			"glm-5.3-prime",
-			"kimi-k2.7-code",
-		]) {
+		for (const id of ["qwen-plus", "qwen3.7-max", "qwen3.6-max-preview", "deepseek-v4-pro", "glm-5.3-prime"]) {
 			expect(resolveDashScopeEndpoint(BASE_URL, id)).toBe(TEXT_ENDPOINT);
 		}
 	});
@@ -87,6 +80,7 @@ describe("endpoint routing by model class", () => {
 			"qwen3.8-omni-flash",
 			"deepseek-v4.1-flash",
 			"kimi-k3",
+			"kimi-k2.7-code",
 			"qwen3-vl-plus",
 		]) {
 			expect(resolveDashScopeEndpoint(BASE_URL, id)).toBe(MULTIMODAL_ENDPOINT);

@@ -73,6 +73,7 @@ const DEFAULT_MULTIMODAL_MODEL_IDS = new Set([
 	"qwen3.8-omni-flash",
 	"deepseek-v4.1-flash",
 	"kimi-k3",
+	"kimi-k2.7-code",
 ]);
 
 const MULTIMODAL_MODEL_PREFIXES = ["qwen3.8-", "qwen3-vl-", "qwen3.7-plus", "qwen3.5-"];
