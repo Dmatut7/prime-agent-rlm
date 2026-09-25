@@ -32,6 +32,7 @@ export interface AppKeybindings {
 	"app.thinking.toggle": true;
 	"app.thinking.toggleAll": true;
 	"app.subagents.focus": true;
+	"app.subagents.history": true;
 	"app.heartbeats.open": true;
 	"app.heartbeats.openSelected": true;
 	"app.editor.external": true;
@@ -146,6 +147,10 @@ export const KEYBINDINGS = {
 	"app.subagents.focus": {
 		defaultKeys: "alt+a",
 		description: "Open child agents",
+	},
+	"app.subagents.history": {
+		defaultKeys: "alt+h",
+		description: "展开或收起已结束的子代理",
 	},
 	"app.heartbeats.open": {
 		defaultKeys: "ctrl+r",
