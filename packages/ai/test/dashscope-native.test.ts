@@ -163,6 +163,9 @@ describe("request mapping", () => {
 				{
 					role: "assistant",
 					content: [{ type: "toolCall", id: "call-1", name: "get_weather", arguments: { city: "北京" } }],
+					api: "dashscope" as const,
+					provider: "aliyun-dashscope",
+					model: "qwen-plus",
 					usage: {
 						input: 0,
 						output: 0,
