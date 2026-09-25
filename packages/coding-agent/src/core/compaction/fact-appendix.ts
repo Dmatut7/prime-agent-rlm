@@ -80,8 +80,15 @@ export const FACT_KIND_LIMITS: Readonly<Record<FactKind, number>> = {
 /** Records every kind keeps before the remaining budget is ranked across kinds. */
 export const FACT_KIND_MINIMUM = 4;
 
-/** Order the kinds render in: what a continuation needs first. */
-const KIND_RENDER_ORDER: readonly FactKind[] = ["error", "sha", "path", "number", "issue"];
+/**
+ * Order the kinds render in: what a continuation needs first, grouped by kind.
+ *
+ * `decision` is listed explicitly rather than left to `indexOf` returning -1. It did
+ * sort first that way, so this declares the existing behaviour instead of changing
+ * it - but an unlisted kind is an accident of the comparator, and the next kind
+ * somebody adds would land in the same undeclared slot.
+ */
+const KIND_RENDER_ORDER: readonly FactKind[] = ["decision", "error", "sha", "path", "number", "issue"];
 
 /** Tie-break priority across kinds when two facts have the same weight: most load-bearing first. */
 const KIND_PRIORITY: readonly FactKind[] = ["sha", "decision", "error", "path", "issue", "number"];
@@ -502,8 +509,37 @@ const DECISION_MARKERS: readonly RegExp[] = [
 /** Shortest decision sentence worth carrying; below this the value is a fragment, not a statement. */
 const DECISION_MIN_CHARS = 10;
 
+/** How much of a clipped decision stays at the front: the statement itself ("we decided X"). */
+const DECISION_CLIP_HEAD_CHARS = 200;
+/** How much stays at the end: the rationale a long sentence usually trails with ("...because Y"). */
+const DECISION_CLIP_TAIL_CHARS = 70;
+
 /** Sentence terminators that end a decision statement without cutting into it. */
 const DECISION_SENTENCE_SPLIT = /(?<=[。！？!?；;])|\n+/;
+
+/**
+ * Clip an over-long decision sentence instead of dropping it.
+ *
+ * The block declares itself authoritative ("quote exactly"), so a clipped value has
+ * to say in its own text that it is clipped: a reader that quotes it verbatim is
+ * quoting the head and the tail of a statement, not the statement. Dropping the whole
+ * sentence was the previous behaviour and was silent - records stayed 0 and `elided`
+ * stayed empty, because the elided counter counts what pruning dropped from a ledger,
+ * not what extraction refused. A long decision is the one carrying the most reasoning
+ * ("...理由是..."), so losing it entirely to a character cap is the worst available
+ * outcome. Head plus tail keeps the statement and its trailing rationale.
+ */
+function clipDecision(sentence: string, maxChars: number): string {
+	if (sentence.length <= maxChars) return sentence;
+	const marker = (dropped: number) => `[…${dropped} characters elided…]`;
+	const widest = marker(sentence.length).length;
+	const tail = Math.min(DECISION_CLIP_TAIL_CHARS, Math.floor((maxChars - widest) / 3));
+	const head = Math.min(DECISION_CLIP_HEAD_CHARS, maxChars - widest - tail);
+	if (head + tail <= 0) return sentence.slice(0, maxChars - 1) + "…";
+	const dropped = sentence.length - head - tail;
+	if (dropped <= 0) return sentence;
+	return `${sentence.slice(0, head)}${marker(dropped)}${sentence.slice(sentence.length - tail)}`;
+}
 
 /**
  * Verbatim decision and conclusion sentences from authored prose.
@@ -514,15 +550,23 @@ const DECISION_SENTENCE_SPLIT = /(?<=[。！？!?；;])|\n+/;
  * model a paraphrase of a decision instead of the decision itself. Only authored prose
  * is scanned (see extractFacts), and the value is the sentence as written: whitespace
  * normalised, never reworded, because the block instructs every later generation to
- * quote it exactly.
+ * quote it exactly. A sentence past the value cap is clipped head-and-tail with the
+ * elision stated inside the value, not dropped - see clipDecision.
  */
 function extractDecisions(text: string, out: RawFact[], enabled: boolean): void {
 	if (!enabled || !text) return;
 	for (const raw of text.split(DECISION_SENTENCE_SPLIT)) {
 		const sentence = raw.trim().replace(/\s+/g, " ");
-		if (sentence.length < DECISION_MIN_CHARS || sentence.length > MAX_VALUE_CHARS.decision) continue;
+		if (sentence.length < DECISION_MIN_CHARS) continue;
 		if (!DECISION_MARKERS.some((pattern) => pattern.test(sentence))) continue;
-		out.push({ kind: "decision", value: sentence, key: factKey("decision", sentence) });
+		// The marker is matched on the full sentence and the value is clipped
+		// afterwards: a long statement whose verdict sits past the cap still counts,
+		// and the clip is what the block carries. The key follows the clipped value,
+		// exactly as the error extractor keys the line it clipped - two statements
+		// whose head and tail agree are one anchor, so the block cannot render the
+		// same line twice and split its weight across two slots.
+		const clipped = clipDecision(sentence, MAX_VALUE_CHARS.decision);
+		out.push({ kind: "decision", value: clipped, key: factKey("decision", clipped) });
 	}
 }
 
