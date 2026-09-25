@@ -115,7 +115,7 @@ describe("isDaemonSingleInstanceConflict (downgrade classification)", () => {
 			descriptorDir: "/tmp/w2-workers",
 			agentDir: "/tmp/w2-agent",
 			appVersion: "test",
-			phase: "running" as const,
+			phase: "owner" as const,
 			createdAt: new Date().toISOString(),
 			updatedAt: new Date().toISOString(),
 			pid: 123,
@@ -127,7 +127,7 @@ describe("isDaemonSingleInstanceConflict (downgrade classification)", () => {
 			pid: 123,
 			socketPath: "/tmp/w2.sock",
 			agentDir: "/tmp/w2-agent",
-			phase: "running" as const,
+			phase: "owner" as const,
 			createdAt: new Date().toISOString(),
 		};
 		expect(isDaemonSingleInstanceConflict(new DaemonAgentDirAlreadyRunningError(summary, "/tmp/w2-agent"))).toBe(true);
