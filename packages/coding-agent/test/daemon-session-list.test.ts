@@ -11,6 +11,7 @@ import { passivatedWorkerRosterEntry, workerRosterEntryFromSummary } from "../sr
 import {
 	buildRlmChildSnapshots,
 	buildSessionList,
+	inactiveLifecycleForSession,
 	latestMessageActivityAt,
 	type MessageActivityMemo,
 	resolveAttachModelFallbackMessage,
@@ -353,7 +354,9 @@ describe("buildSessionList", () => {
 		expect(entries.map((entry) => [entry.id, entry.sessionId, entry.lifecycle, entry.activity])).toEqual([
 			["active-1", "saved-active", "live", "idle"],
 			["saved-sleeping", "saved-sleeping", "archived", "idle"],
-			["saved-crashed", "saved-crashed", "archived", "idle"],
+			// A crash marker is an abnormal death, not a manual archive: the row
+			// stays live so it surfaces as recoverable instead of being hidden.
+			["saved-crashed", "saved-crashed", "live", "idle"],
 		]);
 		expect(entries[0]!.sessionName).toBe("session active-1");
 	});
@@ -1081,3 +1084,26 @@ function makeCronJob(overrides: Pick<AgentCronJob, "id" | "activeSessionId"> & P
 		runCount: 0,
 	};
 }
+
+describe("inactiveLifecycleForSession", () => {
+	it("keeps a crash marker visible while an archived marker hides the session", () => {
+		// A crashed session is an abnormal death the user can still reopen, so it
+		// must not inherit the manual-archive hiding rule.
+		const crashed = makeSessionInfo({ path: "/tmp/crashed.jsonl", id: "crashed", state: { status: "crash" } });
+		expect(inactiveLifecycleForSession(crashed)).toBe("live");
+
+		const archived = makeSessionInfo({ path: "/tmp/archived.jsonl", id: "archived", state: { status: "archived" } });
+		expect(inactiveLifecycleForSession(archived)).toBe("archived");
+
+		const plain = makeSessionInfo({ path: "/tmp/plain.jsonl", id: "plain" });
+		expect(inactiveLifecycleForSession(plain)).toBe("live");
+
+		const emptyCrash = makeSessionInfo({
+			path: "/tmp/empty-crash.jsonl",
+			id: "empty-crash",
+			messageCount: 0,
+			state: { status: "crash" },
+		});
+		expect(inactiveLifecycleForSession(emptyCrash)).toBe("draft");
+	});
+});
