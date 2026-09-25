@@ -87,6 +87,14 @@ describe("W1 threshold matrix: pro@581k triggers / qwen@581k does not / no-field
 		expect(shouldCompact(CONTEXT_581K, 1_000_000, SETTINGS, undefined)).toBe(false);
 	});
 
+	it("absent field + measured entry: the measured limit still wins, unchanged (zero-breakage pin)", () => {
+		// bailian/qwen3.8-max-0902 declares 1,000,000, measured 983,616: with no
+		// usageWindowTokens the trigger base must stay exactly the pre-PR value.
+		const limits = { provider: "bailian", modelId: "qwen3.8-max-0902" };
+		expect(compactionTriggerBaseTokens(1_000_000, limits)).toBe(983_616);
+		expect(effectiveInputLimitTokens(1_000_000, "bailian", "qwen3.8-max-0902", undefined)).toBe(983_616);
+	});
+
 	it("a cap above the declared window cannot widen it", () => {
 		// Hand-built Model objects bypass registry validation; the clamp holds anyway.
 		expect(effectiveInputLimitTokens(1_000_000, undefined, undefined, 2_000_000)).toBe(1_000_000);
