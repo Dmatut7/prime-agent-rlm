@@ -50,6 +50,7 @@ type CatalogRequest =
 	| { type: "request"; id: string; command: "rename"; sessionPath: string; name: string }
 	| { type: "request"; id: string; command: "delete"; sessionPath: string }
 	| { type: "request"; id: string; command: "archive"; sessionPath: string; sessionId: string }
+	| { type: "request"; id: string; command: "mark_crashed"; sessionPath: string; sessionId: string }
 	| {
 			type: "request";
 			id: string;
@@ -131,6 +132,7 @@ function isCatalogRequest(value: unknown): value is CatalogRequest {
 			candidate.command === "rename" ||
 			candidate.command === "delete" ||
 			candidate.command === "archive" ||
+			candidate.command === "mark_crashed" ||
 			candidate.command === "mark_interrupted" ||
 			candidate.command === "shutdown")
 	);
@@ -278,6 +280,45 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 				});
 				return;
 			}
+			case "mark_crashed": {
+				// A crash marker records an abnormal death (power loss, kill, dead
+				// worker) so the agents view can park the row in Idle as recoverable.
+				// It must never overwrite a manual archive, and must stay idempotent
+				// while the file is in any other state.
+				const session = await readSessionInfo(request.sessionPath);
+				if (!session || session.id !== request.sessionId) {
+					sendCatalogMessage({
+						type: "response",
+						id: request.id,
+						success: true,
+						data: { crashed: false },
+					});
+					return;
+				}
+				if (session.state?.status === "archived") {
+					sendCatalogMessage({
+						type: "response",
+						id: request.id,
+						success: true,
+						data: { crashed: false },
+					});
+					return;
+				}
+				if (session.state?.status !== "crash") {
+					await appendOwnedFastEntry(
+						request.sessionPath,
+						() => appendSessionStateToExistingFile(request.sessionPath, { status: "crash" }),
+						(manager) => manager.appendSessionState({ status: "crash" }),
+					);
+				}
+				sendCatalogMessage({
+					type: "response",
+					id: request.id,
+					success: true,
+					data: { crashed: true },
+				});
+				return;
+			}
 			case "mark_interrupted":
 				await appendOwnedFastEntry(
 					request.sessionPath,
@@ -385,6 +426,17 @@ export class DaemonCatalogClient {
 			sessionId,
 		});
 		return data.archived;
+	}
+
+	async markCrashed(sessionPath: string, sessionId: string): Promise<boolean> {
+		const data = await this.request<{ crashed: boolean }>({
+			type: "request",
+			id: randomUUID(),
+			command: "mark_crashed",
+			sessionPath,
+			sessionId,
+		});
+		return data.crashed;
 	}
 
 	async markInterrupted(sessionPath: string, activeSessionId: string, operations: string[]): Promise<void> {
