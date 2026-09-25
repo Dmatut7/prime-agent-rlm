@@ -22,6 +22,16 @@ const testSupervisorRegistryDir = mkdtempSync(join(tmpdir(), "prime-agent-test-s
  * as a `(no messages)` row. Tests that need a specific agent dir still set their own.
  */
 const testAgentDir = mkdtempSync(join(tmpdir(), "prime-agent-test-agent-dir-"));
+/**
+ * The default daemon socket moved out of `$TMPDIR` into `$HOME/.prime/daemon`
+ * (W2), so a test that resolves the default path must never bind the developer's
+ * real one. Same pattern as the agent dir and supervisor registry above.
+ */
+// Keep the prefix short: macOS caps a Unix socket path (sun_path) at 104 bytes,
+// and worker sockets append `worker-<12hex>-<12hex>.sock` (37 bytes) to this dir.
+const testDaemonSocketDir = mkdtempSync(
+	join(process.platform === "win32" ? tmpdir() : "/tmp", "pa-sd-"),
+);
 
 const aiSrcIndex = fileURLToPath(new URL("../ai/src/index.ts", import.meta.url));
 const aiSrcOAuth = fileURLToPath(new URL("../ai/src/oauth.ts", import.meta.url));
@@ -37,6 +47,7 @@ export default defineConfig({
 		env: {
 			DO_NOT_TRACK: "1",
 			PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR: testSupervisorRegistryDir,
+			PRIME_AGENT_INTERNAL_DAEMON_SOCKET_DIR: testDaemonSocketDir,
 			PRIME_AGENT_CODING_AGENT_DIR: testAgentDir,
 			PI_CODING_AGENT_DIR: testAgentDir,
 		},

@@ -154,6 +154,12 @@ import {
 	summaryWithoutStreamingMessage,
 } from "./daemon-session-list.js";
 import {
+	type DaemonStandbyOwner,
+	isDaemonSingleInstanceConflict,
+	judgeDaemonSocketOccupancy,
+	runDaemonStandby,
+} from "./daemon-single-instance.js";
+import {
 	acquireDaemonSocketPathLease,
 	cleanupDaemonSocketPath,
 	type DaemonSocketIdentity,
@@ -175,12 +181,6 @@ import {
 	waitForDaemonStartupFence,
 	writeJsonAtomically,
 } from "./daemon-supervisor-ownership.js";
-import {
-	isDaemonSingleInstanceConflict,
-	judgeDaemonSocketOccupancy,
-	runDaemonStandby,
-	type DaemonStandbyOwner,
-} from "./daemon-single-instance.js";
 import {
 	DAEMON_ADOPTION_REQUEST_TIMEOUT_MS,
 	WORKER_REQUEST_TIMEOUT_TIERS,
@@ -221,6 +221,7 @@ import {
 import {
 	LIVE_THREADS_SNAPSHOT_FILE_NAME,
 	type LiveThreadSnapshotEntry,
+	liveThreadsSnapshotWriteGate,
 	writeLiveThreadsSnapshotIfChanged,
 } from "./live-threads-snapshot.js";
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
@@ -1560,6 +1561,13 @@ export class DaemonSupervisor {
 	private readonly adoptionRetryDelaysMs: readonly number[];
 	/** Workers still being adopted; published as daemon_hello.adopting so a partial startup is visible. */
 	private adoptionPendingCount = 0;
+	/**
+	 * Roster-snapshot writes skipped by the W2 single-writer gate (not the socket
+	 * owner, or the lease was compromised). Counted so a degraded supervisor that
+	 * keeps skipping is visible in telemetry instead of silently never refreshing
+	 * the boot roster.
+	 */
+	private liveThreadsSnapshotSkippedWrites = 0;
 	/** The workers the startup count was opened for, so a runtime re-adoption cannot skew it. */
 	private readonly adoptionCountedWorkers = new Set<ResidentWorker>();
 	private readonly adoptionRetryTimers = new Map<ResidentWorker, NodeJS.Timeout>();
@@ -2597,6 +2605,22 @@ export class DaemonSupervisor {
 	 * refreshed yet (rename).
 	 */
 	private syncLiveThreadsSnapshot(reason: string): void {
+		// W2: exactly one writer for the whole-machine roster snapshot — the
+		// supervisor that owns the daemon socket. A downgraded (standby) process
+		// never reaches this method (it never constructs a supervisor), and a
+		// compromised lease stops writing before the next owner can start.
+		const gate = liveThreadsSnapshotWriteGate({
+			ownsSocketPath: this.ownsSocketPath,
+			leaseCompromised: this.socketLeaseCompromise !== undefined,
+		});
+		if (!gate.allowed) {
+			this.liveThreadsSnapshotSkippedWrites++;
+			this.logDegraded(
+				"live-threads-snapshot-gate",
+				`Skipped live threads snapshot write (${reason}): not the socket owner (${gate.reason})`,
+			);
+			return;
+		}
 		const threads: LiveThreadSnapshotEntry[] = [];
 		for (const worker of this.workers.values()) {
 			// Resident sessions only: a client-owned worker dies with its client and

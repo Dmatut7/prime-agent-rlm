@@ -1,12 +1,22 @@
 import { chmodSync, existsSync, lstatSync, mkdirSync, unlinkSync } from "node:fs";
 import { createConnection } from "node:net";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import lockfile from "proper-lockfile";
 import { queryWindowsUserSid, restrictWindowsNamedPipeAccess, windowsDaemonPipePath } from "./windows-named-pipe.js";
 
 export { normalizeSocketPath } from "../../utils/daemon-socket-path.js";
 export { daemonIpcListenOptions } from "./windows-named-pipe.js";
+
+/**
+ * Test/operator override for the default daemon socket directory. Internal, and
+ * the same shape as `PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR`: the
+ * stable default now lives under `$HOME`, so a test that spawns real daemons
+ * must be able to pin the directory instead of writing into the developer's
+ * `~/.prime/daemon`. Read on every call (never cached) so a test can set it
+ * after import.
+ */
+export const DAEMON_SOCKET_DIR_ENV = "PRIME_AGENT_INTERNAL_DAEMON_SOCKET_DIR";
 
 const DAEMON_SOCKET_MODE = 0o600;
 const DAEMON_SOCKET_DIR_MODE = 0o700;
@@ -310,6 +320,10 @@ function assertSocketLeaseHeld(socketPath: string, lease: DaemonSocketPathLease)
  * reasons (`~/.prime/supervisor-owners`).
  */
 export function defaultDaemonSocketDir(): string {
+	const override = process.env[DAEMON_SOCKET_DIR_ENV];
+	if (override) {
+		return resolve(override);
+	}
 	if (process.platform === "win32") {
 		// Windows named pipes never touch the filesystem; keep a stable answer anyway.
 		return join(homedir(), ".prime", "daemon");

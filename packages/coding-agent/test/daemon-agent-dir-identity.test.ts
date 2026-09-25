@@ -7,20 +7,28 @@ import { afterEach, describe, expect, it } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
 
 /**
- * The daemon's identity is the agent dir it owns, not the `$TMPDIR` the client
- * happens to resolve. Two things follow, and both are checked here with real
- * processes:
+ * The daemon's identity is the agent dir it owns, not the socket path the
+ * client happens to resolve. Two things follow, and both are checked here with
+ * real processes:
  *
- * 1. `prime-agent list` from a shell with a different `$TMPDIR` still reaches the
- *    daemon that owns this agent dir;
- * 2. a second daemon on the same agent dir is refused, so two processes never
- *    co-write one agent dir's sessions, harness state and leases.
+ * 1. `prime-agent list` whose own default socket is somewhere else still reaches
+ *    the daemon that owns this agent dir (registry discovery);
+ * 2. a second daemon on the same agent dir never becomes a second writer: it
+ *    does not bind, does not write the agent dir, and steps down to standby
+ *    instead of exiting non-zero (W2 single-instance protocol), so two
+ *    processes never co-write one agent dir's sessions, harness state and
+ *    leases.
+ *
+ * The default daemon socket is stable (`$HOME/.prime/daemon`) rather than
+ * `$TMPDIR`-derived, so these fixtures pin the directory with
+ * `PRIME_AGENT_INTERNAL_DAEMON_SOCKET_DIR` instead of relying on `$TMPDIR`.
  */
 
 const CLI_PATH = resolve(__dirname, "../src/cli.ts");
 const TSX_PATH = resolve(__dirname, "../../../node_modules/tsx/dist/cli.mjs");
 const TSCONFIG_PATH = resolve(__dirname, "../../../tsconfig.json");
 const SUPERVISOR_REGISTRY_DIR_ENV = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR";
+const DAEMON_SOCKET_DIR_ENV = "PRIME_AGENT_INTERNAL_DAEMON_SOCKET_DIR";
 
 interface SpawnedCli {
 	child: ChildProcess;
@@ -182,10 +190,18 @@ function spawnCli(args: string[], env: NodeJS.ProcessEnv): SpawnedCli {
 	};
 }
 
-/** The socket a client in this $TMPDIR resolves by default (uid-scoped, as the daemon resolves it). */
-function defaultSocketIn(tmpDir: string): string {
-	const uid = typeof process.getuid === "function" ? String(process.getuid()) : "user";
-	return join(tmpDir, `prime-agent-${uid}`, "daemon.sock");
+/**
+ * The socket a process resolves as its default: the daemon socket dir override
+ * when pinned (`PRIME_AGENT_INTERNAL_DAEMON_SOCKET_DIR`), else the stable
+ * per-user directory. Fixtures pin it so a test daemon can never bind the
+ * developer's real `~/.prime/daemon/daemon.sock`.
+ */
+function socketDirIn(tmpDir: string): string {
+	return join(tmpDir, "daemon-sockets");
+}
+
+function socketPathIn(tmpDir: string): string {
+	return join(socketDirIn(tmpDir), "daemon.sock");
 }
 
 function canConnect(socketPath: string, timeoutMs = 1000): Promise<boolean> {
@@ -211,6 +227,20 @@ function canConnect(socketPath: string, timeoutMs = 1000): Promise<boolean> {
 	});
 }
 
+/** Waits for a line the daemon logged (stdout/stderr arrive on their own schedule). */
+async function waitForLoggedLine(handle: SpawnedCli, needle: string, timeoutMs = 30_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (handle.stdout().includes(needle) || handle.stderr().includes(needle)) {
+			return;
+		}
+		await delay(50);
+	}
+	throw new Error(
+		`Timed out waiting for ${JSON.stringify(needle)} in daemon output:\n${handle.stdout()}\n${handle.stderr()}`,
+	);
+}
+
 async function waitForDaemon(socketPath: string, timeoutMs = 60_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
@@ -225,50 +255,57 @@ async function waitForDaemon(socketPath: string, timeoutMs = 60_000): Promise<vo
 function spawnDaemon(paths: Paths, tmpDir: string): SpawnedCli {
 	return spawnCli(["--mode", "daemon", "--offline"], {
 		TMPDIR: tmpDir,
+		[DAEMON_SOCKET_DIR_ENV]: socketDirIn(tmpDir),
 		[ENV_AGENT_DIR]: paths.agentDir,
 		[SUPERVISOR_REGISTRY_DIR_ENV]: paths.registryDir,
 	});
 }
 
 describe("daemon identity is the agent dir", () => {
-	it("reaches the agent dir's daemon from a foreign $TMPDIR", async () => {
+	it("reaches the agent dir's daemon from a client with a different default socket", async () => {
 		const paths = createPaths();
 		const daemon = spawnDaemon(paths, paths.tmpA);
-		await waitForDaemon(defaultSocketIn(paths.tmpA));
+		await waitForDaemon(socketPathIn(paths.tmpA));
 
 		const listing = spawnCli(["list", "--json"], {
 			TMPDIR: paths.tmpB,
+			[DAEMON_SOCKET_DIR_ENV]: socketDirIn(paths.tmpB),
 			[ENV_AGENT_DIR]: paths.agentDir,
 			[SUPERVISOR_REGISTRY_DIR_ENV]: paths.registryDir,
 		});
 		const outcome = await listing.exited(45_000);
-		expect(outcome, `list in a foreign $TMPDIR never exited; stderr: ${listing.stderr()}`).toBeDefined();
+		expect(outcome, `list with a foreign default socket never exited; stderr: ${listing.stderr()}`).toBeDefined();
 		expect(outcome?.code, `stderr: ${listing.stderr()}`).toBe(0);
 		expect(JSON.parse(listing.stdout())).toMatchObject({ sessions: [] });
-		// The listing came from the running daemon: nothing was started in this $TMPDIR.
-		expect(existsSync(defaultSocketIn(paths.tmpB))).toBe(false);
+		// The listing came from the running daemon: nothing was started on this
+		// client's own socket path.
+		expect(existsSync(socketPathIn(paths.tmpB))).toBe(false);
 		expect(daemon.child.exitCode).toBeNull();
 	}, 120_000);
 
-	it("refuses a second daemon on the same agent dir", async () => {
+	it("never lets a second daemon on the same agent dir become a writer (it stands by)", async () => {
 		const paths = createPaths();
 		const first = spawnDaemon(paths, paths.tmpA);
-		await waitForDaemon(defaultSocketIn(paths.tmpA));
+		await waitForDaemon(socketPathIn(paths.tmpA));
 
 		const second = spawnDaemon(paths, paths.tmpB);
-		const outcome = await second.exited(30_000);
-		const secondIsListening = await canConnect(defaultSocketIn(paths.tmpB), 500);
+		// W2: the second daemon steps down to standby instead of exiting non-zero
+		// (a service manager's KeepAlive would otherwise relaunch it into the same
+		// collision forever). It must still never bind or write.
+		await waitForLoggedLine(second, "standing by", 45_000);
+		const secondIsListening = await canConnect(socketPathIn(paths.tmpB), 500);
 		expect(
-			{ exited: outcome !== undefined, secondIsListening },
-			`second daemon exit=${outcome ? outcome.code : "still running"}; ` +
-				`socket ${defaultSocketIn(paths.tmpB)} listening=${secondIsListening}; stderr: ${second.stderr()}`,
-		).toEqual({ exited: true, secondIsListening: false });
-		expect(outcome?.code, `stderr: ${second.stderr()}`).not.toBe(0);
+			{ exited: second.child.exitCode !== null, secondIsListening },
+			`second daemon exit=${second.child.exitCode ?? "still running"}; ` +
+				`socket ${socketPathIn(paths.tmpB)} listening=${secondIsListening}; stderr: ${second.stderr()}`,
+		).toEqual({ exited: false, secondIsListening: false });
+		expect(second.child.exitCode).toBeNull();
 		expect(`${second.stdout()}${second.stderr()}`).toContain("already owns agent dir");
 
 		// The first daemon still owns the agent dir and still answers.
 		const listing = spawnCli(["list", "--json"], {
 			TMPDIR: paths.tmpA,
+			[DAEMON_SOCKET_DIR_ENV]: socketDirIn(paths.tmpA),
 			[ENV_AGENT_DIR]: paths.agentDir,
 			[SUPERVISOR_REGISTRY_DIR_ENV]: paths.registryDir,
 		});

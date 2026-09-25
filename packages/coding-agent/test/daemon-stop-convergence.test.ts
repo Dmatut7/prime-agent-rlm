@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runShutdownSelection, type ShutdownTargetEntry, type StopSelection } from "../src/cli/daemon-ps.js";
 import { ENV_AGENT_DIR } from "../src/config.js";
@@ -394,7 +394,9 @@ describe("stop target identity and convergence", () => {
 		const workerSocket = join(defaultDaemonSocketDir(), "worker-12f042ee5718-46490fc846bf.sock");
 		const worker = spawnListener(workerSocket);
 		await waitForSocketFile(workerSocket);
-		expect(basename(defaultDaemonSocketDir())).toBe("daemon");
+		// The load-bearing part is that the worker lives in the directory the
+		// stop scan reads (whatever the shipped default or a test override is).
+		expect(resolve(workerSocket, "..")).toBe(resolve(defaultDaemonSocketDir()));
 
 		const agentDir = process.env[ENV_AGENT_DIR]!;
 		const descriptorDirectory = join(agentDir, "daemon-workers", "r17-worker");

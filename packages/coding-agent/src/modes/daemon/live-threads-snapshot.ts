@@ -108,3 +108,30 @@ export function writeLiveThreadsSnapshotIfChanged(
 	});
 	return { changed: true, signature, snapshot };
 }
+
+/**
+ * W2 roster-snapshot single-writer gate.
+ *
+ * `<agentDir>/live-threads.json` is a whole-machine claim about which root
+ * sessions are resident, so exactly one process may write it: the supervisor
+ * that owns the daemon socket. A standby (downgraded) supervisor is a client,
+ * not an owner, and a supervisor whose socket lease was compromised is no
+ * longer the single instance — either one writing here is how the roster
+ * fragment (2 threads vs 4 real sessions) reaches the boot restore.
+ *
+ * Pure so the policy is testable without booting a supervisor.
+ */
+export function liveThreadsSnapshotWriteGate(state: {
+	/** The supervisor bound its socket and has not cleaned it up. */
+	ownsSocketPath: boolean;
+	/** The socket lease was compromised (another holder took the path over). */
+	leaseCompromised: boolean;
+}): { allowed: boolean; reason: "owner" | "does-not-own-socket" | "lease-compromised" } {
+	if (state.leaseCompromised) {
+		return { allowed: false, reason: "lease-compromised" };
+	}
+	if (!state.ownsSocketPath) {
+		return { allowed: false, reason: "does-not-own-socket" };
+	}
+	return { allowed: true, reason: "owner" };
+}
