@@ -201,6 +201,14 @@ export type SubagentPanelRowState = "running" | "idle" | "done" | "failed" | "st
 
 export interface SubagentPanelRow {
 	id: string;
+	/**
+	 * The child's own source status was terminal (`done`/`error`/`cancelled`), even
+	 * when the row still renders as `idle` because its session stays resident for a
+	 * while after finishing. Folding keys off this, not off `state`: PM's rule is
+	 * that finished work leaves the panel (2026-09-25 已经结束的工作流要及时删除), and
+	 * a finished child that hosts a resident session is still finished work.
+	 */
+	finished?: boolean;
 	/** The child's daemon session, when it has one: Enter opens it directly. */
 	activeSessionId?: string;
 	/** Display name (session name, else label). */
@@ -304,6 +312,12 @@ export const SUBAGENT_PANEL_SETTLED_RETENTION_MS = 30 * 60_000;
 
 /** How the panel decides which of its rows to show right now. */
 export interface SubagentPanelVisibility {
+	/**
+	 * Rows that must not fold even when settled: children whose reply landed after
+	 * their task ended and has not been read yet (`repliedSinceTask`). The parent
+	 * would otherwise lose the only marker that an answer is waiting.
+	 */
+	pinnedRowIds?: ReadonlySet<string>;
 	/** Now, epoch ms. */
 	now: number;
 	/** A settled row folds away once it has been quiet this long. */
@@ -326,7 +340,7 @@ export interface SubagentPanelSelection {
 
 /** A row no longer doing anything: done or failed. Busy and idle rows are never folded. */
 export function isSettledSubagentPanelRow(row: SubagentPanelRow): boolean {
-	return row.state === "done" || row.state === "failed";
+	return row.finished === true || row.state === "done" || row.state === "failed";
 }
 
 /**
@@ -341,6 +355,12 @@ export function isSettledSubagentPanelRow(row: SubagentPanelRow): boolean {
 export function isSubagentPanelRowFolded(row: SubagentPanelRow, visibility: SubagentPanelVisibility): boolean {
 	if (!isSettledSubagentPanelRow(row)) return false;
 	if (visibility.showSettled === true) return false;
+	// A failed child stays on the list: the panel orders it to the top precisely so a
+	// wedged or broken child is the one fact the reader never has to scroll for, and
+	// folding it would hide that fact behind the toggle. Same for a settled child whose
+	// reply arrived after its task ended and the parent has not read it yet.
+	if (row.state === "failed") return false;
+	if (visibility.pinnedRowIds?.has(row.id) === true) return false;
 	const retentionMs = visibility.retentionMs ?? SUBAGENT_PANEL_SETTLED_RETENTION_MS;
 	const lastActivityAt = row.lastActivityAt;
 	if (lastActivityAt === undefined) return false;
@@ -393,6 +413,9 @@ export function buildSubagentPanelRows(
 						? "idle"
 						: "done";
 		const row: SubagentPanelRow = { id: child.id, name: child.sessionName ?? child.label, state };
+		// Terminal source status, independent of the roster projection: `done` with a
+		// resident session projects to `idle` above, yet nothing will ever run in it again.
+		if (child.status === "done" || child.status === "error" || child.status === "cancelled") row.finished = true;
 		if (child.activeSessionId) row.activeSessionId = child.activeSessionId;
 		if (child.sessionDir) row.sessionDir = child.sessionDir;
 		if (child.durationMs !== undefined) row.elapsedMs = child.durationMs;
@@ -576,12 +599,6 @@ export class SubagentSummaryLine implements Component, Focusable {
 	}
 
 	/**
-	 * Per-child rows (see buildSubagentPanelRows), already folded down to the ones
-	 * this panel shows (see selectSubagentPanelRows). With rows the panel lists each
-	 * child and a stall shows as the row's state; without them (a roster-only
-	 * family) the header stands alone and stall markers keep their own lines.
-	 */
-	/**
 	 * How many settled rows the fold-out rule is keeping off the list. The header's
 	 * 收口 count still carries them, so this is only what the hint line reports.
 	 */
@@ -598,6 +615,12 @@ export class SubagentSummaryLine implements Component, Focusable {
 		this.invalidate();
 	}
 
+	/**
+	 * Per-child rows (see buildSubagentPanelRows), already folded down to the ones
+	 * this panel shows (see selectSubagentPanelRows). With rows the panel lists each
+	 * child and a stall shows as the row's state; without them (a roster-only
+	 * family) the header stands alone and stall markers keep their own lines.
+	 */
 	setSubagentRows(rows: readonly SubagentPanelRow[]): void {
 		// Keep the selection on the same child when the rows reorder (a child
 		// finishing moves down the list), else clamp it into range.
@@ -838,7 +861,9 @@ export class SubagentSummaryLine implements Component, Focusable {
 		if (this.historyExpanded && shownSettled > 0) {
 			return `   已展开 ${shownSettled} 个已结束的子代理${key ? ` · ${key} 收起` : ""}`;
 		}
-		return `   已收起 ${this.foldedSettledCount} 个已结束的子代理${key ? ` · ${key} 展开` : ""}`;
+		const failed = this.rows.filter((row) => row.state === "failed").length;
+		const failedSuffix = failed > 0 ? `（含 ${failed} 个失败，仍在上方）` : "";
+		return `   已收起 ${this.foldedSettledCount} 个已结束的子代理${failedSuffix}${key ? ` · ${key} 展开` : ""}`;
 	}
 
 	private renderHeader(safeWidth: number): string {
