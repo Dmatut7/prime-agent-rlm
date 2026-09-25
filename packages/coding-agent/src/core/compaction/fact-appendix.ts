@@ -506,6 +506,22 @@ const DECISION_MARKERS: readonly RegExp[] = [
 	/\b(?:we (?:decided|chose|choose|settled)|the fix is|root cause is|decision:)/i,
 ];
 
+/**
+ * Negated or still-open phrasing that makes a marker hit a non-decision.
+ *
+ * A marker sentence is quoted verbatim and treated as authoritative downstream ("quote
+ * exactly, never restate or correct"), so "we have not decided yet which cache to use"
+ * landing in the block hands the continuation an instruction the author never gave - the
+ * highest-frequency false-positive shape (R1 follow-up). Matched against the sentence, not
+ * the marker span, so a real decision that merely mentions an unknown still counts.
+ */
+const DECISION_NEGATION_MARKERS: readonly RegExp[] = [
+	/(?:还没|尚未|仍未|没有|未曾)(?:决定|定|确定|查|找到|想好)/,
+	/(?:是否|要不要|该不该)(?:决定|采用|选|用)/,
+	/(?:再看|再看看|待定|存疑|不确定)/,
+	/\b(?:not yet|still (?:unknown|unclear|open)|undecided|tbd|unclear|have not decided|haven't decided)\b/i,
+];
+
 /** Shortest decision sentence worth carrying; below this the value is a fragment, not a statement. */
 const DECISION_MIN_CHARS = 10;
 
@@ -514,8 +530,15 @@ const DECISION_CLIP_HEAD_CHARS = 200;
 /** How much stays at the end: the rationale a long sentence usually trails with ("...because Y"). */
 const DECISION_CLIP_TAIL_CHARS = 70;
 
-/** Sentence terminators that end a decision statement without cutting into it. */
-const DECISION_SENTENCE_SPLIT = /(?<=[。！？!?；;])|\n+/;
+/**
+ * Sentence terminators that end a decision statement without cutting into it.
+ *
+ * English `.` is included with a guard rather than bare: the repo's assistant prose is
+ * mostly English, and a paragraph holding two decisions used to merge into one value that
+ * the 200-char clip then cut in half (R1 follow-up). The guard keeps decimals and version
+ * strings (`0.5`, `v1.2`) intact: a `.` only ends a sentence when whitespace follows it.
+ */
+const DECISION_SENTENCE_SPLIT = /(?<=[。！？!?；;])|(?<=\.)\s+|\n+/;
 
 /**
  * Clip an over-long decision sentence instead of dropping it.
@@ -559,6 +582,8 @@ function extractDecisions(text: string, out: RawFact[], enabled: boolean): void 
 		const sentence = raw.trim().replace(/\s+/g, " ");
 		if (sentence.length < DECISION_MIN_CHARS) continue;
 		if (!DECISION_MARKERS.some((pattern) => pattern.test(sentence))) continue;
+		// A marker hit inside a negated or still-open sentence is not a decision.
+		if (DECISION_NEGATION_MARKERS.some((pattern) => pattern.test(sentence))) continue;
 		// The marker is matched on the full sentence and the value is clipped
 		// afterwards: a long statement whose verdict sits past the cap still counts,
 		// and the clip is what the block carries. The key follows the clipped value,

@@ -498,6 +498,42 @@ describe("fact extraction: stated decisions", () => {
 		expect(ledger.elided.decision ?? 0).toBe(0);
 		expect(renderFactAppendix(emptyFactLedger(1))).toBe("");
 	});
+
+	it("splits two English decisions in one paragraph instead of clipping a merged value (R1 follow-up 1)", () => {
+		// `.` used to be missing from the sentence split, so a two-decision paragraph became
+		// one value that the 200-char clip then cut in half - the middle statement was lost.
+		// Two marker-bearing statements: before the fix the missing `.` merge made this one
+		// value, and the 200-char clip then cut the second statement out of it.
+		const prose = "We decided to use Redis for the queue. We chose to drop the retry loop.";
+		const values = valuesOf([assistantMessage(prose)], "decision");
+		expect(values).toHaveLength(2);
+		expect(values).toContain("We decided to use Redis for the queue.");
+		expect(values).toContain("We chose to drop the retry loop.");
+	});
+
+	it("does not split a decimal or a version string into a sentence (R1 follow-up 1 guard)", () => {
+		const values = valuesOf([assistantMessage("We decided to pin v1.2 and keep 0.5 as the timeout.")], "decision");
+		expect(values).toHaveLength(1);
+		expect(values[0]).toContain("v1.2");
+		expect(values[0]).toContain("0.5");
+	});
+
+	it("keeps negated and still-open sentences out of the authoritative block (R1 follow-up 2)", () => {
+		const samples = [
+			"我还没决定用哪个数据库，先继续调研。",
+			"是否决定采用方案 B 还要看测试结果。",
+			"这个 bug 的根因还没查出来。",
+			"root cause is still unknown. the fix is not yet clear.",
+			"We have not decided yet which cache to use.",
+		];
+		for (const sample of samples) {
+			expect(valuesOf([assistantMessage(sample)], "decision"), sample).toHaveLength(0);
+		}
+		// A real decision that merely mentions an unknown is still a decision.
+		expect(
+			valuesOf([assistantMessage("We decided to use Redis because the cache size is unknown.")], "decision"),
+		).toHaveLength(1);
+	});
 });
 
 describe("fact weighting", () => {
