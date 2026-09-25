@@ -1684,6 +1684,24 @@ describe("subagent panel rows (design board 06)", () => {
 		expect(selection.folded).toEqual([]);
 	});
 
+	it("pins a settled row whose reply has not been read, past the turn boundary", () => {
+		const now = 10_000_000;
+		const rows = buildSubagentPanelRows(
+			[child("answered", "done", { sessionName: "answered", lastActivityAt: now - 60_000 })],
+			undefined,
+		);
+		// Without the pin the turn boundary folds it; with the pin it stays visible.
+		const folded = selectSubagentPanelRows(rows, { now, parentTurnEndedAt: now });
+		expect(folded.rows).toEqual([]);
+		const pinned = selectSubagentPanelRows(rows, {
+			now,
+			parentTurnEndedAt: now,
+			pinnedRowIds: new Set(["answered"]),
+		});
+		expect(pinned.rows.map((row) => row.name)).toEqual(["answered"]);
+		expect(pinned.folded).toEqual([]);
+	});
+
 	it("keeps a settled row whose age cannot be judged, and honours a custom retention", () => {
 		const now = 10_000_000;
 		const rows = buildSubagentPanelRows([child("no-clock", "done", { sessionName: "no-clock" })], undefined);
