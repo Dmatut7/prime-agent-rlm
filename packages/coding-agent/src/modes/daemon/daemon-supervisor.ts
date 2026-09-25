@@ -162,6 +162,7 @@ import {
 	defaultDaemonSocketDir,
 	defaultDaemonSocketPath,
 	getDaemonSocketIdentity,
+	legacyDefaultDaemonSocketPath,
 	normalizeSocketPath,
 	prepareDaemonSocketPath,
 	restrictDaemonSocketPath,
@@ -1186,6 +1187,67 @@ function defaultWorkerDescriptorDir(agentDir: string, socketPath: string): strin
 	return join(agentDir, "daemon-workers", descriptorKey(socketPath));
 }
 
+export type LegacyDescriptorDirMigration = {
+	migrated: boolean;
+	legacyDir: string;
+	descriptorDir: string;
+	reason: "not-default-socket" | "no-legacy-dir" | "target-not-empty" | "already-migrated" | "renamed";
+};
+
+/**
+ * Migrate the worker descriptor dir keyed on the legacy (pre-stable) default
+ * socket path to the dir keyed on the new stable path, so the first
+ * stable-path supervisor still adopts its predecessor's worker descriptors
+ * instead of starting from an empty roster (the 2-vs-4 fragmentation shape).
+ *
+ * Safe by construction: runs after ownership acquisition (a second starter for
+ * the same agent dir is already rejected), only when the supervisor binds the
+ * *default* socket (an explicit --daemon-socket keeps its own descriptor dir
+ * forever), only when the target dir is absent or empty, and the rename itself
+ * is atomic. Failure is best-effort: logged and skipped, never fatal.
+ */
+export function migrateLegacyWorkerDescriptorDirOnDisk(options: {
+	agentDir: string;
+	socketPath: string;
+	rename?: (from: string, to: string) => void;
+	readEntries?: (dir: string) => string[];
+}): LegacyDescriptorDirMigration | undefined {
+	if (process.platform === "win32") {
+		return undefined;
+	}
+	const normalized = normalizeSocketPath(options.socketPath);
+	const stableDefault = normalizeSocketPath(defaultDaemonSocketPath());
+	if (normalized !== stableDefault) {
+		return { migrated: false, legacyDir: "", descriptorDir: "", reason: "not-default-socket" };
+	}
+	const descriptorDir = defaultWorkerDescriptorDir(options.agentDir, normalized);
+	const legacyDir = defaultWorkerDescriptorDir(options.agentDir, legacyDefaultDaemonSocketPath());
+	if (legacyDir === descriptorDir) {
+		return { migrated: false, legacyDir, descriptorDir, reason: "already-migrated" };
+	}
+	const readEntries = options.readEntries ?? ((dir: string) => readdirSync(dir));
+	try {
+		readEntries(legacyDir);
+	} catch {
+		return { migrated: false, legacyDir, descriptorDir, reason: "no-legacy-dir" };
+	}
+	try {
+		const existing = readEntries(descriptorDir);
+		if (existing.length > 0) {
+			return { migrated: false, legacyDir, descriptorDir, reason: "target-not-empty" };
+		}
+	} catch {
+		// Absent target dir is the expected migration case.
+	}
+	try {
+		(options.rename ?? ((from: string, to: string) => renameSync(from, to)))(legacyDir, descriptorDir);
+	} catch {
+		// Best-effort: a failed rename leaves adoption degraded but startup sound.
+		return { migrated: false, legacyDir, descriptorDir, reason: "no-legacy-dir" };
+	}
+	return { migrated: true, legacyDir, descriptorDir, reason: "renamed" };
+}
+
 export function idleEvictionSweepIntervalMs(idleEvictionMinutes: IdleEvictionMinutes): number {
 	if (idleEvictionMinutes === "off") return IDLE_EVICTION_MAX_SWEEP_INTERVAL_MS;
 	return Math.max(
@@ -1514,6 +1576,7 @@ export class DaemonSupervisor {
 			});
 			this.assertSocketLeaseHeld();
 			await prepareDaemonSocketPath(this.socketPath, this.socketLease);
+			this.migrateLegacyWorkerDescriptorDir();
 
 			mkdirSync(this.descriptorDir, { recursive: true, mode: 0o700 });
 			chmodSync(this.descriptorDir, 0o700);
@@ -1641,6 +1704,30 @@ export class DaemonSupervisor {
 	}
 
 	/** Degraded lines are throttled per cause so a stuck disk cannot drown the log. */
+	/**
+	 * W2: one-shot legacy descriptor dir migration on the default socket. See
+	 * {@link migrateLegacyWorkerDescriptorDirOnDisk}; failures are logged and
+	 * non-fatal (adoption degrades to the current generation only).
+	 */
+	private migrateLegacyWorkerDescriptorDir(): void {
+		const agentDir = this.defaultSessionConfig.agentDir;
+		if (!agentDir || process.platform === "win32") {
+			return;
+		}
+		try {
+			const result = migrateLegacyWorkerDescriptorDirOnDisk({ agentDir, socketPath: this.socketPath });
+			if (result?.reason === "renamed") {
+				this.log(
+					`Migrated legacy worker descriptor dir for the stable socket path: ${result.legacyDir} -> ${result.descriptorDir}`,
+				);
+			}
+		} catch (error) {
+			this.log(
+				`Legacy worker descriptor dir migration failed (continuing with current generation): ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
 	private logDegraded(cause: string, message: string): void {
 		const now = Date.now();
 		const state = this.degradedLogState.get(cause);
