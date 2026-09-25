@@ -207,6 +207,12 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 		takesArgument: true,
 	},
 	{ name: "dutylog", description: "看值班记录：你离开期间做了什么、出过什么问题、哪件事要你拍板" },
+	{
+		name: "subagents",
+		description: "子代理面板：展开或收起已结束的子代理行",
+		argumentHint: "[all|off]",
+		takesArgument: true,
+	},
 	{ name: "quit", description: `退出 ${APP_NAME}` },
 ];
 

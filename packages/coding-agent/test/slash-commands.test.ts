@@ -55,6 +55,24 @@ describe("built-in slash commands", () => {
 		expect(builtinSlashCommandTakesArgument("side")).toBe(true);
 	});
 
+	test("exposes /subagents as the panel's history toggle", () => {
+		// The panel folds settled rows away after 30 minutes; this command is the way
+		// back to them, so its registration is the contract a reader types against.
+		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "subagents")).toMatchObject({
+			description: "子代理面板：展开或收起已结束的子代理行",
+			argumentHint: "[all|off]",
+			takesArgument: true,
+		});
+		expect(builtinSlashCommandTakesArgument("subagents")).toBe(true);
+		expect(isBuiltinSlashCommandName("subagents")).toBe(true);
+		expect(resolveSlashCommand(parseSlashCommand("/subagents all")!)).toEqual({
+			name: "subagents",
+			args: "all",
+			originalName: "subagents",
+			isAlias: false,
+		});
+	});
+
 	test("describes /mcp as the MCP Connections menu entry point", () => {
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "mcp")).toMatchObject({
 			description: "打开或管理 MCP 连接",

@@ -296,6 +296,81 @@ function rowActivity(child: AgentConnectionRlmChildAgentSnapshot, state: Subagen
 }
 
 /**
+ * How long a settled row keeps its place in the panel (PM 2026-09-25: 已经结束的
+ * 工作流要及时删除). Past this the row is hidden from the list - the snapshot
+ * itself is kept, and the header's 收口 count still carries it.
+ */
+export const SUBAGENT_PANEL_SETTLED_RETENTION_MS = 30 * 60_000;
+
+/** How the panel decides which of its rows to show right now. */
+export interface SubagentPanelVisibility {
+	/** Now, epoch ms. */
+	now: number;
+	/** A settled row folds away once it has been quiet this long. */
+	retentionMs?: number;
+	/**
+	 * Epoch ms at which the parent's earlier turn ended. A child that settled
+	 * during that turn belongs to work the parent has already moved past, so its
+	 * row folds as soon as the turn is over (PM: 父会话该轮结束).
+	 */
+	parentTurnEndedAt?: number;
+	/** The panel's own toggle: show every folded row again until it is switched back. */
+	showSettled?: boolean;
+}
+
+/** The rows the panel shows, and the settled ones it folded out of the list. */
+export interface SubagentPanelSelection {
+	rows: SubagentPanelRow[];
+	folded: SubagentPanelRow[];
+}
+
+/** A row no longer doing anything: done or failed. Busy and idle rows are never folded. */
+export function isSettledSubagentPanelRow(row: SubagentPanelRow): boolean {
+	return row.state === "done" || row.state === "failed";
+}
+
+/**
+ * Whether a settled row has left the panel's recency window.
+ *
+ * Two independent clocks, either one enough: the retention window since the row's
+ * last activity, and the parent's turn boundary. Fail-open on a missing timestamp
+ * (a client that predates `lastActivityAt`): a row whose age cannot be judged is
+ * kept rather than hidden, because hiding work the reader never saw is worse than
+ * one stale line.
+ */
+export function isSubagentPanelRowFolded(row: SubagentPanelRow, visibility: SubagentPanelVisibility): boolean {
+	if (!isSettledSubagentPanelRow(row)) return false;
+	if (visibility.showSettled === true) return false;
+	const retentionMs = visibility.retentionMs ?? SUBAGENT_PANEL_SETTLED_RETENTION_MS;
+	const lastActivityAt = row.lastActivityAt;
+	if (lastActivityAt === undefined) return false;
+	if (visibility.now - lastActivityAt >= retentionMs) return true;
+	if (visibility.parentTurnEndedAt !== undefined && lastActivityAt <= visibility.parentTurnEndedAt) return true;
+	return false;
+}
+
+/**
+ * The panel's visible rows: fold the settled rows that fell out of the window,
+ * keep the rest in panel order (see {@link compareSubagentPanelRows}).
+ *
+ * Pure on purpose - roster plus clock in, visible row order out - so the rule is
+ * unit-testable without a live session, and so the header's counts (which read the
+ * roster, not this list) stay the whole story while rows fold away.
+ */
+export function selectSubagentPanelRows(
+	rows: readonly SubagentPanelRow[],
+	visibility: SubagentPanelVisibility,
+): SubagentPanelSelection {
+	const visible: SubagentPanelRow[] = [];
+	const folded: SubagentPanelRow[] = [];
+	for (const row of rows) {
+		if (isSubagentPanelRowFolded(row, visibility)) folded.push(row);
+		else visible.push(row);
+	}
+	return { rows: visible, folded };
+}
+
+/**
  * The panel rows for this session's subtree (see collectSubtreeSubagentSnapshots),
  * most relevant first: stalled, failed, running, idle, finished. A failure the
  * parent was already told about (`seenFailureChildIds`) ranks with the finished
@@ -454,6 +529,10 @@ export class SubagentSummaryLine implements Component, Focusable {
 	private spend: SubagentSpendSummary | undefined;
 	private stallMarkers: readonly string[] = [];
 	private rows: readonly SubagentPanelRow[] = [];
+	/** Settled rows the fold-out rule kept off the list (see selectSubagentPanelRows). */
+	private foldedSettledCount = 0;
+	/** The history toggle: while on, folded rows are listed again until it is switched back. */
+	private historyExpanded = false;
 	private selectedRow = 0;
 	private windowStart = 0;
 	private openable = false;
@@ -469,6 +548,8 @@ export class SubagentSummaryLine implements Component, Focusable {
 	onStopAll?: () => void;
 	onCancel?: () => void;
 	onChatAction?: (data: string) => void;
+	/** Fired by the history key: the panel's host flips the展开 of folded settled rows. */
+	onToggleSettled?: () => void;
 	/** Fired when a row is clicked: opens that subagent's detail card (see SubagentDetailOverlay). */
 	onRowActivate?: (row: SubagentPanelRow) => void;
 
@@ -495,10 +576,28 @@ export class SubagentSummaryLine implements Component, Focusable {
 	}
 
 	/**
-	 * Per-child rows (see buildSubagentPanelRows). With rows the panel lists each
+	 * Per-child rows (see buildSubagentPanelRows), already folded down to the ones
+	 * this panel shows (see selectSubagentPanelRows). With rows the panel lists each
 	 * child and a stall shows as the row's state; without them (a roster-only
 	 * family) the header stands alone and stall markers keep their own lines.
 	 */
+	/**
+	 * How many settled rows the fold-out rule is keeping off the list. The header's
+	 * 收口 count still carries them, so this is only what the hint line reports.
+	 */
+	setSubagentFoldedCount(count: number): void {
+		if (this.foldedSettledCount === count) return;
+		this.foldedSettledCount = count;
+		this.invalidate();
+	}
+
+	/** Whether the history toggle is holding the folded rows open. */
+	setSubagentHistoryExpanded(expanded: boolean): void {
+		if (this.historyExpanded === expanded) return;
+		this.historyExpanded = expanded;
+		this.invalidate();
+	}
+
 	setSubagentRows(rows: readonly SubagentPanelRow[]): void {
 		// Keep the selection on the same child when the rows reorder (a child
 		// finishing moves down the list), else clamp it into range.
@@ -518,6 +617,10 @@ export class SubagentSummaryLine implements Component, Focusable {
 
 	handleInput(data: string): void {
 		const keybindings = getKeybindings();
+		if (keybindings.matches(data, "app.subagents.history")) {
+			this.onToggleSettled?.();
+			return;
+		}
 		if (keybindings.matches(data, "tui.select.confirm") || keybindings.matches(data, "app.agents.open")) {
 			if (this.isSelectable()) this.onOpen?.(this.rows[this.selectedRow]);
 			return;
@@ -579,6 +682,8 @@ export class SubagentSummaryLine implements Component, Focusable {
 			this.counts.idle,
 			this.counts.inactive,
 			this.spendKey(),
+			this.foldedSettledCount,
+			this.historyExpanded ? 1 : 0,
 			this.openable ? 1 : 0,
 			this.focused ? 1 : 0,
 			this.stallMarkers.join("\u0000"),
@@ -645,10 +750,27 @@ export class SubagentSummaryLine implements Component, Focusable {
 				onClick: () => this.onOpen?.(undefined),
 			});
 		}
-		if (!this.focused && this.rows.length > 0 && this.rows.every(isSettledPanelRow)) {
+		if (
+			!this.focused &&
+			!this.historyExpanded &&
+			this.rows.length > 0 &&
+			this.rows.every(isSettledPanelRow)
+		) {
 			// Nothing in flight: finished children would otherwise sit there as a
 			// block of rows until they close. One line says so; the header's ↓ still lists them.
-			lines.push(theme.fg("dim", truncateToWidth(`   ${this.settledFoldText()}`, safeWidth, "…")));
+			// (Upstream 48a61f7b9's isSettledPanelRow keeps an acknowledged failure in
+			// the fold; our history toggle can still hold every settled row on the list.)
+			const idleText =
+				this.foldedSettledCount > 0
+					? `   都做完了，已收起 ${this.foldedSettledCount} 个已结束的子代理（记录保留）`
+					: `   ${this.settledFoldText()}`;
+			lines.push(theme.fg("dim", truncateToWidth(idleText, safeWidth, "…")));
+			return lines;
+		}
+		if (this.rows.length === 0 && this.foldedSettledCount > 0) {
+			// Everything the list had is settled and folded: say so, and name the key
+			// that brings the history back - an empty panel would read as "no children".
+			lines.push(theme.fg("dim", truncateToWidth(this.foldedHintText(), safeWidth, "…")));
 			return lines;
 		}
 		const { start, rows: shown } = this.visibleWindow();
@@ -677,6 +799,9 @@ export class SubagentSummaryLine implements Component, Focusable {
 			const fold = this.focused ? `   ↓ 下面还有 ${below} 个` : `   … 还有 ${below} 个`;
 			lines.push(theme.fg("dim", truncateToWidth(fold, safeWidth, "")));
 		}
+		if (this.foldedSettledCount > 0 || (this.historyExpanded && this.rows.some(isSettledSubagentPanelRow))) {
+			lines.push(theme.fg("dim", truncateToWidth(this.foldedHintText(), safeWidth, "…")));
+		}
 		// A stalled session with a row already reads 卡住 there; one without a row
 		// (roster-only, or folded past the row cap) keeps its marker line, so a
 		// wedged descendant is never invisible.
@@ -689,6 +814,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 	}
 
 	/**
+/**
 	 * The fold line. "闲置一阵后会自动关闭" is only promised while some child is still
 	 * resident (idle); once they are all closed the line says so instead.
 	 */
@@ -698,6 +824,21 @@ export class SubagentSummaryLine implements Component, Focusable {
 		return this.rows.some((row) => row.state === "idle")
 			? `${head}，闲置一阵后会自动关闭（记录保留）`
 			: `${head}，已自动关闭（记录保留）`;
+	}
+
+	/**
+	 * `   已收起 2 个已结束的子代理 · Alt+H 展开` - settled rows the list is keeping
+	 * out of the way, and the way back to them. While the toggle holds them open the
+	 * same line reports what is on screen and how to fold it again, so the state is
+	 * never only in the reader's head.
+	 */
+	private foldedHintText(): string {
+		const key = keyText("app.subagents.history");
+		const shownSettled = this.rows.filter((row) => isSettledSubagentPanelRow(row)).length;
+		if (this.historyExpanded && shownSettled > 0) {
+			return `   已展开 ${shownSettled} 个已结束的子代理${key ? ` · ${key} 收起` : ""}`;
+		}
+		return `   已收起 ${this.foldedSettledCount} 个已结束的子代理${key ? ` · ${key} 展开` : ""}`;
 	}
 
 	private renderHeader(safeWidth: number): string {

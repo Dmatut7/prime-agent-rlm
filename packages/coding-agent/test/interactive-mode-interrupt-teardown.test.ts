@@ -256,6 +256,21 @@ describe("transient status overlays on teardown and session replacement", () => 
 		expect(fixture.statusContainer.children).toEqual([]);
 	}
 
+	it("stop() clears the panel's fold timer, so nothing repaints a stopped session", () => {
+		// The panel arms one timeout to re-apply the 30-minute fold (see
+		// syncSubagentFoldTimer). A stopped session has no panel: the timer has to go
+		// with the overlays, or it fires later and renders through a torn-down UI.
+		const fired = vi.fn();
+		const mode = stopFake(overlayFixture());
+		mode.subagentFoldTimer = setTimeout(fired, 30 * 60_000);
+
+		Reflect.get(InteractiveMode.prototype, "stop").call(mode);
+
+		expect(mode.subagentFoldTimer).toBeUndefined();
+		vi.advanceTimersByTime(60 * 60_000);
+		expect(fired).not.toHaveBeenCalled();
+	});
+
 	it("stop() disposes the retry countdown, the retry loader and the compaction loader", () => {
 		const fixture = overlayFixture();
 		// The fixture is live: without this the disposal assertions below could pass on a

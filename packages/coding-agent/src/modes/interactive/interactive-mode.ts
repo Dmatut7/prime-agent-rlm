@@ -292,9 +292,11 @@ import {
 	countRosterSubagentStatuses,
 	countSubtreeSubagentStatuses,
 	formatSubagentStallMarker,
+	SUBAGENT_PANEL_SETTLED_RETENTION_MS,
 	type SubagentPanelRow,
 	type SubagentSummaryCounts,
 	SubagentSummaryLine,
+	selectSubagentPanelRows,
 	summarizeSubagentSpend,
 	TrayInfoLine,
 } from "./components/subagent-summary-line.js";
@@ -415,6 +417,13 @@ const SUBAGENT_SPEND_HEAVY_INTERVAL_MS = 15_000;
 const SUBAGENT_SPEND_IDLE_TICK_MS = 15_000;
 /** How long the first stop-all-subagents press stays armed for the confirming second press. */
 const STOP_ALL_SUBAGENTS_CONFIRM_WINDOW_MS = 5_000;
+
+/**
+ * Cap on the panel's fold timeout. A retention deadline further out is re-armed
+ * when it fires, so one timer never has to outlive a day (`setTimeout` saturates
+ * near 24.8 days and would otherwise fire early).
+ */
+const SUBAGENT_FOLD_TIMER_MAX_MS = 12 * 60 * 60_000;
 
 /**
  * One context-tree scan and who it belongs to. The spend cell and the fullscreen top
@@ -1404,6 +1413,16 @@ export class InteractiveMode {
 	private stopAllSubagentsArmedUntil: number | undefined;
 	/** How this session's latest assistant message ended; tells a failed close from a finished one. */
 	private lastAssistantStopReason: AssistantMessage["stopReason"] | undefined;
+	/**
+	 * Epoch ms at which this session's last turn ended. A settled child whose last
+	 * activity predates it belongs to work the parent has already moved past, so its
+	 * row folds out of the panel at once (PM 2026-09-25: 已经结束的工作流要及时删除).
+	 */
+	private subagentParentTurnEndedAt: number | undefined;
+	/** The panel's history toggle: hold every folded settled row on the list. */
+	private subagentHistoryExpanded = false;
+	/** The one timeout that re-applies the fold when the retention window runs out. */
+	private subagentFoldTimer: ReturnType<typeof setTimeout> | undefined;
 	private subagentDetailHandle: OverlayHandle | undefined;
 	private subagentCounts: SubagentSummaryCounts = { total: 0, running: 0, idle: 0, inactive: 0 };
 	private subagentSpendTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1648,6 +1667,7 @@ export class InteractiveMode {
 		};
 		this.subagentSummaryLine.onChatAction = (data) => this.handleSubagentSummaryChatAction(data);
 		this.subagentSummaryLine.onRowActivate = (row) => this.showSubagentDetail(row.id);
+		this.subagentSummaryLine.onToggleSettled = () => this.toggleSubagentHistory();
 		this.footerDataProvider = new FooterDataProvider(this.uiServices.getInitialCwd());
 		this.footer = new FooterComponent(this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(this.settingsManager.getCompactionEnabled());
@@ -3379,6 +3399,9 @@ export class InteractiveMode {
 			}
 			case "agent_end":
 				this.patchConnectionState({ isStreaming: false, activeToolNames: [] });
+				// The turn boundary the panel's fold rule reads: a child that settled
+				// during this turn is work the parent has moved past.
+				this.subagentParentTurnEndedAt = Date.now();
 				break;
 			case "session_action_update":
 				this.patchConnectionState({ sessionActions: event.actions });
@@ -5021,6 +5044,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.thinking.toggleAll", () => this.toggleThinkingBlockVisibility(true));
 		this.defaultEditor.onAction("app.subagents.focus", () => this.focusSubagentSummary());
 		this.defaultEditor.onAction("app.subagents.stopAll", () => void this.requestStopAllSubagents());
+		this.defaultEditor.onAction("app.subagents.history", () => this.toggleSubagentHistory());
 		this.defaultEditor.onAction("app.heartbeats.open", () => {
 			void this.showHeartbeatManager();
 		});
@@ -5839,6 +5863,20 @@ export class InteractiveMode {
 				if (commandName === "dutylog") {
 					this.editor.setText("");
 					await this.showDutyLog({ automatic: false });
+					return;
+				}
+				if (commandName === "subagents") {
+					this.editor.setText("");
+					// No argument toggles (the prompt's own switch); `all`/`off` pin the state.
+					const arg = commandArgs?.trim().toLowerCase();
+					if (arg && arg !== "all" && arg !== "off") {
+						this.showError("用法：/subagents [all|off] —— 展开或收起已结束的子代理行");
+						return;
+					}
+					this.setSubagentHistoryExpanded(arg ? arg === "all" : !this.subagentHistoryExpanded);
+					this.showStatus(
+						this.subagentHistoryExpanded ? "已展开全部子代理行（含已结束）" : "已收起已结束的子代理行",
+					);
 					return;
 				}
 				if (commandName === "speed") {
@@ -7208,10 +7246,89 @@ export class InteractiveMode {
 			if (marker) stallMarkers.push(`${child.sessionName ?? child.label}: ${marker}`);
 		}
 		this.subagentSummaryLine.setStallMarkers(stallMarkers);
-		this.subagentSummaryLine.setSubagentRows(
-			buildSubagentPanelRows(this.subagentSnapshots.values(), this.rlmNodeId, this.seenSubagentFailureIds),
-		);
+		this.applySubagentPanelRows();
 		if (!this.subagentSummaryLine.isSelectable() && this.subagentSummaryLine.focused) this.focusEditor();
+	}
+
+	/**
+	 * The panel's rows: built from the snapshots, then folded down to the ones this
+	 * panel shows right now (see selectSubagentPanelRows). The fold is a pure rule
+	 * over the roster and the clock, so the panel needs no purge timer of its own;
+	 * the history toggle flips it, and the header's 收口 count keeps carrying the
+	 * folded rows either way.
+	 */
+	private applySubagentPanelRows(): void {
+		const visibility = {
+			now: Date.now(),
+			parentTurnEndedAt: this.subagentParentTurnEndedAt,
+			showSettled: this.subagentHistoryExpanded,
+		};
+		const built = buildSubagentPanelRows(
+			this.subagentSnapshots.values(),
+			this.rlmNodeId,
+			this.seenSubagentFailureIds,
+		);
+		const selected = selectSubagentPanelRows(built, visibility);
+		this.subagentSummaryLine.setSubagentFoldedCount(selected.folded.length);
+		this.subagentSummaryLine.setSubagentRows(selected.rows);
+		this.syncSubagentFoldTimer(selected.rows);
+	}
+
+	/**
+	 * Re-apply the fold when the retention window runs out.
+	 *
+	 * Without a timer the 30-minute rule would only bite on the next child event,
+	 * and a quiet family that finished long ago would keep its rows on screen
+	 * indefinitely. One timeout is armed for the earliest deadline still ahead;
+	 * nothing else ticks, and nothing is armed while the history toggle holds the
+	 * rows open or while no settled row is on the list.
+	 */
+	private syncSubagentFoldTimer(rows: readonly SubagentPanelRow[]): void {
+		this.clearSubagentFoldTimer();
+		if (this.subagentHistoryExpanded) return;
+		const now = Date.now();
+		let deadline = Number.POSITIVE_INFINITY;
+		for (const row of rows) {
+			if (row.state !== "done" && row.state !== "failed") continue;
+			if (row.lastActivityAt === undefined) continue;
+			deadline = Math.min(deadline, row.lastActivityAt + SUBAGENT_PANEL_SETTLED_RETENTION_MS);
+		}
+		if (!Number.isFinite(deadline)) return;
+		this.subagentFoldTimer = setTimeout(
+			() => {
+				this.subagentFoldTimer = undefined;
+				this.applySubagentPanelRows();
+				this.ui.requestRender();
+			},
+			Math.max(0, Math.min(deadline - now, SUBAGENT_FOLD_TIMER_MAX_MS)),
+		);
+		this.subagentFoldTimer.unref?.();
+	}
+
+	/**
+	 * Disarm the fold timeout. stop() calls this too: a timer that outlives the session
+	 * would re-apply the fold and request a render on a UI that is already torn down.
+	 */
+	private clearSubagentFoldTimer(): void {
+		if (this.subagentFoldTimer === undefined) return;
+		clearTimeout(this.subagentFoldTimer);
+		this.subagentFoldTimer = undefined;
+	}
+
+	/**
+	 * Hold folded settled rows open (or fold them back): the panel's history toggle,
+	 * driven by Alt+H, by the panel's own key, and by `/subagents`.
+	 */
+	private setSubagentHistoryExpanded(expanded: boolean): void {
+		this.subagentHistoryExpanded = expanded;
+		this.subagentSummaryLine.setSubagentHistoryExpanded(expanded);
+		this.applySubagentPanelRows();
+		this.ui.requestRender();
+	}
+
+	/** Alt+H and the panel's own key: hold folded settled rows open, or fold them back. */
+	private toggleSubagentHistory(): void {
+		this.setSubagentHistoryExpanded(!this.subagentHistoryExpanded);
 	}
 
 	/**
@@ -13109,6 +13226,7 @@ ${blocksPrev ? `| \`${blocksPrev}\`${blocksNext ? ` / \`${blocksNext}\`` : ""} |
 		this.stopGoalTrayTimer();
 		this.stopSubagentSpendIdleTick();
 		this.clearSubagentSpendRefresh();
+		this.clearSubagentFoldTimer();
 		this.closeHeartbeatManager();
 		this.clearExtensionTerminalInputListeners();
 		this.footer.dispose();
