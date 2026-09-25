@@ -598,3 +598,25 @@ describe("streamSimpleDashScope", () => {
 		expect(fetchState.calls[0].url).toBe(MULTIMODAL_ENDPOINT);
 	});
 });
+
+describe("R1 审查处置钉桩（2026-09-25）", () => {
+	const ctx = { systemPrompt: "s", messages: [{ role: "user", content: "ping", timestamp: 1 }] } as Context;
+	it("omits reasoning_effort when the model has no thinkingLevelMap entry (glm 400 反例)", () => {
+		const bare = dsModel("glm-5.3-prime", { thinkingLevelMap: undefined });
+		const body = buildDashScopeRequest(bare, ctx, { reasoningLevel: "medium" });
+		expect(body.parameters.reasoning_effort).toBeUndefined();
+		const mappedModel = dsModel("deepseek-v4-pro", {
+			thinkingLevelMap: { low: "low", medium: "high", high: "max", max: "max", off: null },
+		} as any);
+		const body2 = buildDashScopeRequest(mappedModel, ctx, { reasoningLevel: "medium" });
+		expect(body2.parameters.reasoning_effort).toBe("high");
+	});
+	it("routes official-doc exceptions against prefix defaults (R1-M3)", () => {
+		expect(isMultimodalModelClass("qwen3.8-2.4t-a95b")).toBe(false);
+		expect(isMultimodalModelClass("qwen3.6-max-preview")).toBe(false);
+		expect(isMultimodalModelClass("qwen3.7-max")).toBe(false);
+		expect(isMultimodalModelClass("qwen3.7-max-2026-06-08")).toBe(false);
+		expect(isMultimodalModelClass("qwen3.6-plus")).toBe(true);
+		expect(isMultimodalModelClass("qwen3.8-max")).toBe(true);
+	});
+});

@@ -76,7 +76,18 @@ const DEFAULT_MULTIMODAL_MODEL_IDS = new Set([
 	"kimi-k2.7-code",
 ]);
 
-const MULTIMODAL_MODEL_PREFIXES = ["qwen3.8-", "qwen3-vl-", "qwen3.7-plus", "qwen3.5-"];
+const MULTIMODAL_MODEL_PREFIXES = ["qwen3.8-", "qwen3-vl-", "qwen3.7-plus", "qwen3.6-", "qwen3.5-"];
+
+/** Official-doc exceptions that must not follow their prefix/class default
+ *  (02-text-generation-overview, R1-M3): qwen3.8-2.4t-a95b is text-only despite the
+ *  qwen3.8- prefix; qwen3.6-max-preview is text-only although qwen3.6- is multimodal;
+ *  qwen3.7-max and its dated snapshots are text-only. */
+const DEFAULT_TEXT_MODEL_IDS = new Set([
+	"qwen3.8-2.4t-a95b",
+	"qwen3.6-max-preview",
+	"qwen3.7-max",
+	"qwen3.7-max-2026-06-08",
+]);
 
 function envList(name: string): string[] {
 	const raw = process.env[name];
@@ -91,6 +102,7 @@ function envList(name: string): string[] {
 export function isMultimodalModelClass(modelId: string): boolean {
 	const forcedText = envList("PRIME_DASHSCOPE_TEXT_MODELS");
 	if (forcedText.includes(modelId)) return false;
+	if (DEFAULT_TEXT_MODEL_IDS.has(modelId)) return false;
 	const override = envList("PRIME_DASHSCOPE_MULTIMODAL_MODELS");
 	if (override.length > 0) return override.includes(modelId);
 	return DEFAULT_MULTIMODAL_MODEL_IDS.has(modelId) || MULTIMODAL_MODEL_PREFIXES.some((p) => modelId.startsWith(p));
@@ -409,7 +421,14 @@ export function buildDashScopeParameters(
 		// parameters.reasoning_effort (deepseek/glm/kimi: high/max/low; qwen3.8:
 		// xhigh/medium/low — 07 "reasoning_effort").
 		const mapped = model.thinkingLevelMap?.[level];
-		parameters.reasoning_effort = typeof mapped === "string" && mapped.length > 0 ? mapped : level;
+		// No raw-level fallback: glm-5.3-prime answers 400 InvalidParameter
+		// "Invalid value for parameter reasoning_effort" to unmapped levels such as
+		// "medium" (production-shape probe 2026-09-25, evidence in
+		// .pipeline/dashscope-native/05-probe-production-stream.txt). Models without a
+		// thinkingLevelMap entry omit the parameter and keep the server default.
+		if (typeof mapped === "string" && mapped.length > 0) {
+			parameters.reasoning_effort = mapped;
+		}
 	}
 
 	if (model.reasoning) {
