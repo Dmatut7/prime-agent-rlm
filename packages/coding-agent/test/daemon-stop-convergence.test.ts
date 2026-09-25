@@ -394,7 +394,7 @@ describe("stop target identity and convergence", () => {
 		const workerSocket = join(defaultDaemonSocketDir(), "worker-12f042ee5718-46490fc846bf.sock");
 		const worker = spawnListener(workerSocket);
 		await waitForSocketFile(workerSocket);
-		expect(basename(defaultDaemonSocketDir())).toMatch(/^prime-agent-(?:\d+|user)$/);
+		expect(basename(defaultDaemonSocketDir())).toBe("daemon");
 
 		const agentDir = process.env[ENV_AGENT_DIR]!;
 		const descriptorDirectory = join(agentDir, "daemon-workers", "r17-worker");

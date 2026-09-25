@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import lockfile from "proper-lockfile";
 import { describe, expect, it } from "vitest";
@@ -10,6 +10,7 @@ import {
 	DaemonSocketPathLease,
 	defaultDaemonSocketPath,
 	getDaemonSocketIdentity,
+	legacyDefaultDaemonSocketPath,
 	normalizeSocketPath,
 	prepareDaemonSocketPath,
 } from "../src/modes/daemon/daemon-socket.js";
@@ -33,16 +34,31 @@ describe("defaultDaemonSocketPath", () => {
 		expect(socketPath).toContain("prime-agent-S-");
 	});
 
-	it("uses a per-user Unix socket directory", () => {
+	it("uses a stable per-user Unix socket directory under the home", () => {
+		if (process.platform === "win32") {
+			return;
+		}
+
+		const socketPath = defaultDaemonSocketPath();
+		const home = homedir();
+		if (home && home !== "/") {
+			// The stable default lives outside $TMPDIR: launchd shells, manual
+			// shells and TMPDIR-injecting tools each resolve a different temp
+			// root, which split supervisor generations across sockets.
+			expect(dirname(socketPath)).toBe(join(home, ".prime", "daemon"));
+		}
+		expect(basename(socketPath)).toBe("daemon.sock");
+		expect(dirname(socketPath)).not.toBe(join(tmpdir(), "prime-agent-501"));
+	});
+
+	it("still exposes the legacy $TMPDIR socket path for discovery", () => {
 		if (process.platform === "win32") {
 			return;
 		}
 
 		const suffix = typeof process.getuid === "function" ? String(process.getuid()) : "user";
-		const socketPath = defaultDaemonSocketPath();
-
-		expect(dirname(socketPath)).toBe(join(tmpdir(), `prime-agent-${suffix}`));
-		expect(basename(socketPath)).toBe("daemon.sock");
+		expect(dirname(legacyDefaultDaemonSocketPath())).toBe(join(tmpdir(), `prime-agent-${suffix}`));
+		expect(basename(legacyDefaultDaemonSocketPath())).toBe("daemon.sock");
 	});
 
 	it("checks a live daemon before acquiring the socket path lock", async () => {
