@@ -3318,8 +3318,13 @@ export class InteractiveMode {
 			case "agent_end":
 				this.patchConnectionState({ isStreaming: false, activeToolNames: [] });
 				// The turn boundary the panel's fold rule reads: a child that settled
-				// during this turn is work the parent has moved past.
+				// during this turn is work the parent has moved past. Stamping the
+				// boundary is not enough on its own: nothing else re-runs the fold for
+				// a settled child (rlm_child_update stops arriving once it settled), so
+				// the rows are recomputed here too - otherwise "the turn ended" would
+				// only take effect on the next child event or the 30-minute timer.
 				this.subagentParentTurnEndedAt = Date.now();
+				this.applySubagentPanelRows();
 				break;
 			case "session_action_update":
 				this.patchConnectionState({ sessionActions: event.actions });
@@ -7077,10 +7082,18 @@ export class InteractiveMode {
 	 * folded rows either way.
 	 */
 	private applySubagentPanelRows(): void {
+		// A settled child whose reply arrived and has not been read is pinned: folding
+		// it would drop the only marker that an answer is waiting for the parent.
+		const pinnedRowIds = new Set(
+			[...this.subagentSnapshots.values()]
+				.filter((child) => child.repliedSinceTask === true)
+				.map((child) => child.id),
+		);
 		const visibility = {
 			now: Date.now(),
 			parentTurnEndedAt: this.subagentParentTurnEndedAt,
 			showSettled: this.subagentHistoryExpanded,
+			pinnedRowIds,
 		};
 		const built = buildSubagentPanelRows(this.subagentSnapshots.values(), this.rlmNodeId);
 		const selected = selectSubagentPanelRows(built, visibility);
